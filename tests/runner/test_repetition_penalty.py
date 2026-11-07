@@ -11,8 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""``repetition_penalty`` on the TPU sampler: request tracking, scaling math,
-sync decode integration, and TPU compilation."""
+"""``repetition_penalty`` on the TPU sampler: request tracking, packed bitmask
+scaling math, sync decode integration, and TPU compilation."""
 
 from __future__ import annotations
 
@@ -36,6 +36,22 @@ from vllm_torchtpu.runner.tpu_runner_async_output import AsyncTPUCopyState
 NEG_INF = float("-inf")
 
 
+def _unpack_bits(bitmask: np.ndarray, vocab_size: int) -> list[int]:
+    shifts = np.arange(32, dtype=np.uint32)
+    bits = ((bitmask.view(np.uint32)[:, None] >> shifts[None, :]) & 1) != 0
+    return np.where(bits.reshape(-1)[:vocab_size])[0].tolist()
+
+
+def _pack_bool_mask(seen_bool: np.ndarray) -> np.ndarray:
+    num_rows, vocab_size = seen_bool.shape
+    num_words = rep_pen.num_bitmask_words(vocab_size)
+    out = np.zeros((num_rows, num_words), dtype=np.int32)
+    for r in range(num_rows):
+        for tok in np.where(seen_bool[r])[0]:
+            out[r, int(tok) >> 5] |= rep_pen._BIT_MASKS[int(tok) & 31]
+    return out
+
+
 @pytest.fixture
 def eager():
     with torch.compiler.set_stance("force_eager"):
@@ -43,41 +59,48 @@ def eager():
 
 
 class TestTracker:
-    def test_tracks_only_non_unit_repetition_penalty(self):
+    def test_tracks_only_non_unit_repetition_penalty_and_accepts_ndarray_prompt(self):
         tracker = rep_pen.RepetitionPenaltyTracker()
-        tracker.add("a", SamplingParams(repetition_penalty=1.05), [1, 3])
+        tracker.add(
+            "a",
+            SamplingParams(repetition_penalty=1.05),
+            np.array([1, 3, 31], dtype=np.int32),
+        )
         tracker.add("b", SamplingParams(repetition_penalty=1.0), [2])
         tracker.add("c", None, [4])
         assert list(tracker.requests) == ["a"]
         assert tracker.requests["a"].penalty == pytest.approx(1.05)
+        assert tracker.requests["a"].prompt_ids.tolist() == [1, 3, 31]
 
-    def test_incremental_seen_mask_and_rollback_and_out_of_range_ids(self):
+    def test_incremental_seen_bitmask_and_rollback_and_out_of_range_ids(self):
         tracker = rep_pen.RepetitionPenaltyTracker()
-        # Includes -1 (MM placeholder) and 151645 (text token above codec head).
+        # Includes -1 (MM placeholder), 31 (sign bit of word 0), and 151645 (OOB).
         tracker.add(
             "a",
             SamplingParams(repetition_penalty=1.2),
-            [-1, 2, 5, 151645],
+            [-1, 2, 5, 31, 151645],
         )
         entry = tracker.requests["a"]
 
-        # Prefill: only in-range prompt ids [2, 5] marked.
-        m0 = entry.seen_mask([], vocab_size=8)
-        assert np.where(m0)[0].tolist() == [2, 5]
+        # Prefill: only in-range prompt ids [2, 5, 31] marked.
+        m0 = entry.seen_bitmask([], vocab_size=64)
+        assert _unpack_bits(m0, 64) == [2, 5, 31]
 
-        # Incremental single-token decode update (+ out-of-range ignored).
-        m1 = entry.seen_mask([6, 999], vocab_size=8)
-        assert np.where(m1)[0].tolist() == [2, 5, 6]
+        # Incremental decode update (+ out-of-range ignored + bit 63 sign bit).
+        m1 = entry.seen_bitmask([6, 63, 999], vocab_size=64)
+        assert _unpack_bits(m1, 64) == [2, 5, 6, 31, 63]
 
-        # Large delta (>8 tokens) takes the vectorized numpy branch.
-        m2 = entry.seen_mask([6, 999] + [1] * 10, vocab_size=8)
-        assert np.where(m2)[0].tolist() == [1, 2, 5, 6]
+        # Additional output tokens update in place without reallocating.
+        m2 = entry.seen_bitmask([6, 63, 999] + [1] * 10, vocab_size=64)
+        assert m2 is m1
+        assert _unpack_bits(m2, 64) == [1, 2, 5, 6, 31, 63]
 
-        # Shrunk output (e.g. rollback) rebuilds cleanly from prompt + output.
-        m3 = entry.seen_mask([7], vocab_size=8)
-        assert np.where(m3)[0].tolist() == [2, 5, 7]
+        # Shrunk output (rollback) zeroes and rebuilds in place from prompt + output.
+        m3 = entry.seen_bitmask([7], vocab_size=64)
+        assert m3 is m1
+        assert _unpack_bits(m3, 64) == [2, 5, 7, 31]
 
-    def test_preempted_kept_and_gone_evicted_and_empty_sentinel_immutable(self):
+    def test_preempted_kept_and_gone_evicted_and_staging_buffer_reused(self):
         tracker = rep_pen.RepetitionPenaltyTracker()
         tracker.add("keep", SamplingParams(repetition_penalty=1.1), [1])
         tracker.add("gone", SamplingParams(repetition_penalty=1.1), [2])
@@ -91,27 +114,45 @@ class TestTracker:
         state = tracker.batch_state({"keep": 1}, lookup)
         assert list(state) == [1]
 
-        assert not rep_pen.EMPTY_TRACKER
-        assert not rep_pen.EMPTY_TRACKER.any_in({"keep": 0})
-        with pytest.raises(RuntimeError, match="EMPTY_TRACKER"):
-            rep_pen.EMPTY_TRACKER.add("x", SamplingParams(repetition_penalty=1.1))
+        inputs1 = tracker.build_plain_inputs(
+            state, start=0, end=2, num_rows=4, vocab_size=64
+        )
+        assert inputs1 is not None
+        bm1, pen1 = inputs1
+        assert _unpack_bits(bm1[1], 64) == [1, 3]
+        assert pen1[1, 0] == pytest.approx(1.1)
+        assert pen1[0, 0] == pytest.approx(1.0)
+
+        # Next step moves "keep" to row 0: row 1 is cleaned in the reused buffer.
+        state2 = tracker.batch_state({"keep": 0}, lookup)
+        inputs2 = tracker.build_plain_inputs(
+            state2, start=0, end=2, num_rows=4, vocab_size=64
+        )
+        assert inputs2 is not None
+        bm2, pen2 = inputs2
+        assert bm2 is bm1 and pen2 is pen1
+        assert _unpack_bits(bm2[0], 64) == [1, 3]
+        assert _unpack_bits(bm2[1], 64) == []
+        assert pen2[0, 0] == pytest.approx(1.1)
+        assert pen2[1, 0] == pytest.approx(1.0)
 
 
 @pytest.mark.usefixtures("eager")
 class TestScalingMath:
     @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-    def test_matches_upstream_vllm_reference(self, dtype):
+    @pytest.mark.parametrize("vocab_size", [64, 70])
+    def test_matches_upstream_vllm_reference(self, dtype, vocab_size):
         from vllm._custom_ops import apply_repetition_penalties
 
         gen = torch.Generator().manual_seed(42)
-        num_rows, vocab_size = 6, 64
+        num_rows = 6
         logits = torch.randn((num_rows, vocab_size), generator=gen).to(dtype)
         logits[0, 0] = 0.0
         logits[1, 5] = NEG_INF
 
         prompt_mask = torch.zeros((num_rows, vocab_size), dtype=torch.bool)
         output_mask = torch.zeros((num_rows, vocab_size), dtype=torch.bool)
-        prompt_mask[0, [0, 3, 12]] = True
+        prompt_mask[0, [0, 3, 12, 31]] = True
         output_mask[0, [7, 12]] = True
         prompt_mask[1, [5, 9]] = True
         output_mask[3, [1, 2, 63]] = True
@@ -124,9 +165,9 @@ class TestScalingMath:
         ref = logits.clone()
         apply_repetition_penalties(ref, prompt_mask, output_mask, penalties_1d)
 
-        seen_np = (prompt_mask | output_mask).numpy()
+        seen_bitmask_np = _pack_bool_mask((prompt_mask | output_mask).numpy())
         pen_np = penalties_1d.view(-1, 1).numpy()
-        got = rep_pen.apply_penalties_table(logits, seen_np, pen_np)
+        got = rep_pen.apply_penalties_table(logits, seen_bitmask_np, pen_np)
 
         assert got.dtype == dtype
         assert torch.isneginf(got[1, 5])
@@ -204,6 +245,7 @@ def _plain_runner(logits: torch.Tensor, async_scheduling: bool = False, spec=Non
         "_repetition_penalty_batch_state",
         "_repetition_penalty_supported",
         "_settle_draft_placeholders_for_min_tokens",
+        "_warn_repetition_penalty_unsupported",
         "get_finished_kv_transfers",
         "maybe_wait_for_kv_save",
     ):
@@ -256,19 +298,21 @@ class TestRunnerIntegration:
         assert out.sampled_token_ids == [[2]]
         assert seen_logprob_logits[0][0, 4].item() == pytest.approx(3.0)
 
-    @pytest.mark.parametrize(
-        ("async_scheduling", "spec"), [(True, None), (False, object())]
-    )
-    def test_unsupported_modes_skip_penalty_with_warning(self, async_scheduling, spec):
+    def test_intermediate_chunked_prefill_skipped_in_batch_state(self):
         logits = torch.zeros(1, 8)
-        runner = _plain_runner(logits, async_scheduling=async_scheduling, spec=spec)
+        runner = _plain_runner(logits)
         runner._repetition_penalty.add(
-            "r0", SamplingParams(repetition_penalty=1.5), [4]
+            "r0", SamplingParams(repetition_penalty=1.5), [4, 5, 6, 7]
         )
-        with patch("vllm_torchtpu.runner.tpu_runner.logger") as log:
-            assert runner._repetition_penalty_batch_state() == {}
-        log.warning_once.assert_called_once()
-        assert "async_scheduling=False" in log.warning_once.call_args.args[0]
+        # 4 prompt tokens, 1 computed, 1 scheduled -> intermediate chunk.
+        runner.requests["r0"].num_computed_tokens = 1
+        runner.requests["r0"].num_tokens = 4
+        so = SimpleNamespace(num_scheduled_tokens={"r0": 1})
+        assert runner._repetition_penalty_batch_state(so) == {}
+
+        # Final prefill chunk (3 computed + 1 scheduled == 4 tokens) is included.
+        runner.requests["r0"].num_computed_tokens = 3
+        assert list(runner._repetition_penalty_batch_state(so)) == [0]
 
     def test_batch_reorder_and_top_tokens_gate(self):
         batch = InputBatch(
@@ -328,18 +372,24 @@ class TestRunnerIntegration:
         assert out[1, 5].item() == pytest.approx(1.0)
         assert out[1, 0].item() == pytest.approx(2.0)
 
-    def test_update_states_tracks_and_discards_requests(self):
+    @pytest.mark.parametrize(
+        ("async_scheduling", "spec"), [(True, None), (False, object())]
+    )
+    def test_update_states_tracks_supported_and_skips_unsupported_requests(
+        self, async_scheduling, spec
+    ):
         runner = object.__new__(TPUModelRunner)
         runner._min_tokens = min_tokens.MinTokensTracker()
+        runner._repetition_penalty = rep_pen.RepetitionPenaltyTracker()
         runner._mamba_state_pos, runner._mamba_slot_by_req_id = {}, {}
         runner._free_mamba_slots, runner._mamba_offset_seeded = [], set()
         runner._pre_async_results = None
+        runner.scheduler_config = SimpleNamespace(async_scheduling=False)
+        runner.speculative_config = None
         runner.requests = {
             "new": SimpleNamespace(prompt_token_ids=[2, 4]),
         }
         runner._install_spec_token_room_guard = lambda: None
-        # Starts from class-level EMPTY_TRACKER and upgrades automatically.
-        assert runner._repetition_penalty is rep_pen.EMPTY_TRACKER
         new_req = SimpleNamespace(
             req_id="new",
             sampling_params=SamplingParams(repetition_penalty=1.1),
@@ -360,10 +410,29 @@ class TestRunnerIntegration:
             TPUModelRunner._update_states(runner, so)
         assert not runner._repetition_penalty
 
+        # An unsupported mode logs warning_once and does not track the request,
+        # so the greedy top-tokens fast path stays open.
+        runner.scheduler_config = SimpleNamespace(async_scheduling=async_scheduling)
+        runner.speculative_config = spec
+        so.finished_req_ids = set()
+        so.scheduled_new_reqs = [new_req]
+        with (
+            patch.object(GPUModelRunner, "_update_states", return_value=None),
+            patch("vllm_torchtpu.runner.tpu_runner.logger") as log,
+        ):
+            TPUModelRunner._update_states(runner, so)
+        assert not runner._repetition_penalty
+        log.warning_once.assert_called_once()
+        assert "async_scheduling=False" in log.warning_once.call_args.args[0]
+
     @pytest.mark.parametrize(
         ("async_scheduling", "spec", "expected"),
         [
-            (False, None, [(8, 12), (16, 12)]),
+            (
+                False,
+                None,
+                [(8, 12, torch.bfloat16, (8, 1)), (16, 12, torch.bfloat16, (16, 1))],
+            ),
             (True, None, []),
             (False, object(), []),
         ],
@@ -378,17 +447,25 @@ class TestRunnerIntegration:
         runner.device = torch.device("cpu")
         runner._dummy_logits = lambda n: torch.zeros(n, 12, dtype=torch.bfloat16)
         runner._precompile_timed = MagicMock()
-        apply_shapes: list[tuple[int, int]] = []
+        apply_calls: list[tuple[int, int, torch.dtype, tuple[int, int]]] = []
         orig_apply = rep_pen.apply_repetition_penalty
 
-        def spy_apply(logits, seen_mask, penalties):
-            apply_shapes.append(tuple(logits.shape))
-            return orig_apply(logits, seen_mask, penalties)
+        def spy_apply(logits, seen_bitmask, penalties):
+            assert seen_bitmask.dtype == torch.int32
+            apply_calls.append(
+                (
+                    logits.shape[0],
+                    logits.shape[1],
+                    logits.dtype,
+                    tuple(seen_bitmask.shape),
+                )
+            )
+            return orig_apply(logits, seen_bitmask, penalties)
 
         with patch.object(rep_pen, "apply_repetition_penalty", side_effect=spy_apply):
             runner._precompile_repetition_penalty()
 
-        assert apply_shapes == expected
+        assert apply_calls == expected
 
 
 @pytest.mark.tpu_test
@@ -400,18 +477,19 @@ def test_compiled_repetition_penalty_on_tpu():
     logits_cpu = torch.randn((8, 512), generator=gen, dtype=torch.bfloat16)
     logits_cpu[0, 10] = NEG_INF
 
-    seen_np = np.zeros((8, 512), dtype=np.bool_)
-    seen_np[0, [3, 10, 42]] = True
-    seen_np[2, [100]] = True
+    seen_bool = np.zeros((8, 512), dtype=np.bool_)
+    seen_bool[0, [3, 10, 31, 42]] = True
+    seen_bool[2, [100, 511]] = True
+    seen_bitmask_np = _pack_bool_mask(seen_bool)
     penalties_np = np.ones((8, 1), dtype=np.float32)
     penalties_np[0, 0] = 1.05
     penalties_np[2, 0] = 1.5
 
     with torch.compiler.set_stance("force_eager"):
-        ref = rep_pen.apply_penalties_table(logits_cpu, seen_np, penalties_np)
+        ref = rep_pen.apply_penalties_table(logits_cpu, seen_bitmask_np, penalties_np)
 
     got = rep_pen.apply_penalties_table(
-        logits_cpu.to(device), seen_np, penalties_np
+        logits_cpu.to(device), seen_bitmask_np, penalties_np
     ).cpu()
 
     assert got.dtype == torch.bfloat16

@@ -18,12 +18,13 @@ penalties pass. Requests with ``repetition_penalty != 1.0`` are tracked by
 request id (``RepetitionPenaltyTracker``) so batch condensing and RPA request
 reordering never misalign a request's token history with its logits row.
 
-For each tracked request, ``seen_mask`` marks every in-range vocabulary id
-``[0, vocab_size)`` present in ``prompt_token_ids`` or generated
-``output_token_ids`` (out-of-range ids such as multimodal placeholders or text
-tokens wider than a codec head are ignored). Positive logits on seen tokens are
-divided by ``penalty`` and non-positive logits are multiplied by ``penalty`` in
-``float32`` before casting back to ``logits.dtype``.
+For each tracked request, ``seen_bitmask`` packs presence bits over vocabulary
+ids ``[0, vocab_size)`` from ``prompt_token_ids`` and generated
+``output_token_ids`` into ``cdiv(vocab_size, 32)`` ``int32`` words (out-of-range
+ids such as multimodal placeholders or text tokens wider than a codec head are
+ignored). On device, the bitmask is unpacked and seen positions are scaled in
+``float32`` by ``1 / penalty`` where ``logits > 0`` and ``penalty`` otherwise
+before casting back to ``logits.dtype``.
 """
 
 from __future__ import annotations
@@ -38,66 +39,60 @@ import torch
 if TYPE_CHECKING:
     from vllm import SamplingParams
 
+_BIT_MASKS: np.ndarray = (np.uint32(1) << np.arange(32, dtype=np.uint32)).view(np.int32)
+
+
+def num_bitmask_words(vocab_size: int) -> int:
+    """Number of 32-bit words needed to pack ``vocab_size`` token presence bits."""
+    return (vocab_size + 31) >> 5
+
 
 @dataclass
 class RepetitionPenaltyRequest:
-    """Per-request repetition penalty config and incremental token mask."""
+    """Per-request repetition penalty config and incremental packed bitmask."""
 
     penalty: float
     prompt_ids: np.ndarray
     _vocab_size: int = field(default=0, init=False, repr=False)
-    _prompt_mask: np.ndarray | None = field(default=None, init=False, repr=False)
-    _seen_mask: np.ndarray | None = field(default=None, init=False, repr=False)
+    _bitmask: np.ndarray | None = field(default=None, init=False, repr=False)
     _committed_len: int = field(default=0, init=False, repr=False)
 
-    def seen_mask(self, committed_output: Sequence[int], vocab_size: int) -> np.ndarray:
-        """Return the boolean ``[vocab_size]`` presence mask over prompt and
-        committed output tokens, updating incrementally as outputs grow."""
-        if self._prompt_mask is None or self._vocab_size != vocab_size:
-            prompt_mask = np.zeros((vocab_size,), dtype=np.bool_)
+    def seen_bitmask(
+        self, committed_output: Sequence[int], vocab_size: int
+    ) -> np.ndarray:
+        """Return the ``int32`` ``[cdiv(vocab_size, 32)]`` presence bitmask over
+        prompt and committed output tokens, updating incrementally as outputs grow."""
+        num_words = num_bitmask_words(vocab_size)
+        cur_len = len(committed_output)
+        if (
+            self._bitmask is None
+            or self._vocab_size != vocab_size
+            or cur_len < self._committed_len
+        ):
+            if self._bitmask is None or self._bitmask.shape[0] != num_words:
+                self._bitmask = np.zeros((num_words,), dtype=np.int32)
+            else:
+                self._bitmask.fill(0)
             if self.prompt_ids.size > 0:
                 valid = self.prompt_ids[
                     (self.prompt_ids >= 0) & (self.prompt_ids < vocab_size)
                 ]
-                prompt_mask[valid] = True
+                np.bitwise_or.at(self._bitmask, valid >> 5, _BIT_MASKS[valid & 31])
             self._vocab_size = vocab_size
-            self._prompt_mask = prompt_mask
-            self._seen_mask = prompt_mask.copy()
             self._committed_len = 0
 
-        cur_len = len(committed_output)
-        if cur_len < self._committed_len:
-            assert self._prompt_mask is not None
-            self._seen_mask = self._prompt_mask.copy()
-            self._committed_len = 0
-
-        assert self._seen_mask is not None
         if cur_len > self._committed_len:
-            delta = committed_output[self._committed_len : cur_len]
-            if len(delta) <= 8:
-                for tok in delta:
-                    if 0 <= tok < vocab_size:
-                        self._seen_mask[tok] = True
-            else:
-                arr = np.asarray(delta, dtype=np.int64)
-                valid = arr[(arr >= 0) & (arr < vocab_size)]
-                self._seen_mask[valid] = True
+            bitmask = self._bitmask
+            for tok in committed_output[self._committed_len : cur_len]:
+                if 0 <= tok < vocab_size:
+                    bitmask[tok >> 5] |= _BIT_MASKS[tok & 31]
             self._committed_len = cur_len
 
-        return self._seen_mask
+        return self._bitmask
 
 
-@dataclass(frozen=True)
-class RepetitionPenaltyRowState:
-    """Resolved batch-row state for one step."""
-
-    penalty: float
-    entry: RepetitionPenaltyRequest
-    committed_output: Sequence[int]
-
-
-# persistent-batch index -> resolved repetition penalty state for this step.
-RepetitionPenaltyState = dict[int, RepetitionPenaltyRowState]
+# persistent-batch index -> (request entry, committed output token ids).
+RepetitionPenaltyState = dict[int, tuple[RepetitionPenaltyRequest, Sequence[int]]]
 
 
 class RepetitionPenaltyTracker:
@@ -105,6 +100,9 @@ class RepetitionPenaltyTracker:
 
     def __init__(self) -> None:
         self.requests: dict[str, RepetitionPenaltyRequest] = {}
+        self._bitmask_buf: np.ndarray | None = None
+        self._penalties_buf: np.ndarray | None = None
+        self._dirty_rows: list[int] = []
 
     def __bool__(self) -> bool:
         return bool(self.requests)
@@ -120,7 +118,7 @@ class RepetitionPenaltyTracker:
             return
         prompt_arr = (
             np.asarray(prompt_token_ids, dtype=np.int64)
-            if prompt_token_ids
+            if prompt_token_ids is not None and len(prompt_token_ids) > 0
             else np.empty((0,), dtype=np.int64)
         )
         self.requests[req_id] = RepetitionPenaltyRequest(
@@ -148,95 +146,105 @@ class RepetitionPenaltyTracker:
         absent from ``req_id_to_index`` (e.g. preempted) remain tracked.
         """
         state: RepetitionPenaltyState = {}
-        for req_id, req in list(self.requests.items()):
+        stale: list[str] | None = None
+        for req_id, req in self.requests.items():
             committed_output = lookup_output(req_id)
             if committed_output is None:
-                del self.requests[req_id]
+                if stale is None:
+                    stale = []
+                stale.append(req_id)
                 continue
             index = req_id_to_index.get(req_id)
             if index is not None:
-                state[index] = RepetitionPenaltyRowState(
-                    penalty=req.penalty,
-                    entry=req,
-                    committed_output=committed_output,
-                )
+                state[index] = (req, committed_output)
+        if stale:
+            for req_id in stale:
+                del self.requests[req_id]
         return state
 
-
-class _EmptyRepetitionPenaltyTracker(RepetitionPenaltyTracker):
-    """Immutable empty sentinel used as a class-level default on runners."""
-
-    def add(
+    def build_plain_inputs(
         self,
-        req_id: str,
-        params: SamplingParams | None,
-        prompt_token_ids: Sequence[int] | None = None,
-    ) -> None:
-        raise RuntimeError(
-            "Cannot mutate EMPTY_TRACKER; instantiate RepetitionPenaltyTracker"
-        )
+        state: RepetitionPenaltyState,
+        start: int,
+        end: int,
+        num_rows: int,
+        vocab_size: int,
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        """Stage ``(seen_bitmask, penalties)`` for a plain 1-row/req chunk into
+        reusable host buffers, or return ``None`` when no row in ``[start, end)``
+        is tracked."""
+        indices = _in_chunk(state, start, end)
+        if not indices or vocab_size <= 0:
+            return None
+        num_words = num_bitmask_words(vocab_size)
+        if (
+            self._bitmask_buf is None
+            or self._penalties_buf is None
+            or self._bitmask_buf.shape[0] < num_rows
+            or self._bitmask_buf.shape[1] != num_words
+        ):
+            self._bitmask_buf = np.zeros((num_rows, num_words), dtype=np.int32)
+            self._penalties_buf = np.ones((num_rows, 1), dtype=np.float32)
+            self._dirty_rows.clear()
+        else:
+            for prev_row in self._dirty_rows:
+                self._bitmask_buf[prev_row].fill(0)
+                self._penalties_buf[prev_row, 0] = 1.0
+            self._dirty_rows.clear()
 
-
-EMPTY_TRACKER: RepetitionPenaltyTracker = _EmptyRepetitionPenaltyTracker()
+        for batch_idx in indices:
+            row = batch_idx - start
+            entry, committed_output = state[batch_idx]
+            self._bitmask_buf[row] = entry.seen_bitmask(committed_output, vocab_size)
+            self._penalties_buf[row, 0] = entry.penalty
+            self._dirty_rows.append(row)
+        if self._bitmask_buf.shape[0] == num_rows:
+            return self._bitmask_buf, self._penalties_buf
+        return self._bitmask_buf[:num_rows], self._penalties_buf[:num_rows]
 
 
 def _in_chunk(state: RepetitionPenaltyState, start: int, end: int) -> list[int]:
     return [i for i in state if start <= i < end]
 
 
-def build_plain_inputs(
-    state: RepetitionPenaltyState,
-    start: int,
-    end: int,
-    num_rows: int,
-    vocab_size: int,
-) -> tuple[np.ndarray, np.ndarray] | None:
-    """Host-side ``(seen_mask, penalties)`` for a plain 1-row/req logits chunk,
-    or ``None`` when no request in ``[start, end)`` is tracked."""
-    indices = _in_chunk(state, start, end)
-    if not indices or vocab_size <= 0:
-        return None
-    seen_mask = np.zeros((num_rows, vocab_size), dtype=np.bool_)
-    penalties = np.ones((num_rows, 1), dtype=np.float32)
-    for batch_idx in indices:
-        row = batch_idx - start
-        row_state = state[batch_idx]
-        seen_mask[row] = row_state.entry.seen_mask(
-            row_state.committed_output, vocab_size
-        )
-        penalties[row, 0] = row_state.penalty
-    return seen_mask, penalties
-
-
 def apply_penalties_table(
     logits: torch.Tensor,
-    seen_mask_np: np.ndarray,
+    seen_bitmask_np: np.ndarray,
     penalties_np: np.ndarray,
 ) -> torch.Tensor:
-    """Stage host penalty tables to ``logits.device`` and apply scaling."""
+    """Stage host packed bitmask and penalty tables to ``logits.device`` and apply
+    scaling."""
     device = logits.device
-    seen_mask = torch.from_numpy(seen_mask_np).to(device)
+    seen_bitmask = torch.from_numpy(seen_bitmask_np).to(device)
     penalties = torch.from_numpy(penalties_np).to(device)
-    return apply_repetition_penalty(logits, seen_mask, penalties)
+    return apply_repetition_penalty(logits, seen_bitmask, penalties)
 
 
 @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
 def apply_repetition_penalty(
     logits: torch.Tensor,
-    seen_mask: torch.Tensor,
+    seen_bitmask: torch.Tensor,
     penalties: torch.Tensor,
 ) -> torch.Tensor:
-    return _apply_repetition_penalty(logits, seen_mask, penalties)
+    return _apply_repetition_penalty(logits, seen_bitmask, penalties)
 
 
 def _apply_repetition_penalty(
     logits: torch.Tensor,
-    seen_mask: torch.Tensor,
+    seen_bitmask: torch.Tensor,
     penalties: torch.Tensor,
 ) -> torch.Tensor:
-    """Scale ``logits`` in ``float32`` by ``1 / penalties`` where ``logits > 0``
-    and ``penalties`` otherwise on ``seen_mask`` positions, preserving dtype."""
+    """Unpack ``seen_bitmask`` (``[rows, cdiv(vocab_size, 32)]`` ``int32``) and
+    scale ``logits`` in ``float32`` by ``1 / penalties`` where ``logits > 0`` and
+    ``penalties`` otherwise on seen positions, preserving ``logits.dtype``."""
+    target_dim = logits.shape[-1]
+    shifts = torch.arange(32, dtype=torch.int32, device=seen_bitmask.device)
+    seen_mask = (
+        torch.bitwise_right_shift(seen_bitmask[:, :, None], shifts[None, None, :]) & 1
+    ) != 0
+    seen_mask = seen_mask.reshape(logits.shape[0], -1)[:, :target_dim]
     logits_f32 = logits.to(torch.float32)
-    row_penalties = torch.where(seen_mask, penalties, 1.0)
-    scaling = torch.where(logits_f32 > 0, 1.0 / row_penalties, row_penalties)
+    inv_penalties = 1.0 / penalties
+    pos_scale = torch.where(logits_f32 > 0, inv_penalties, penalties)
+    scaling = torch.where(seen_mask, pos_scale, 1.0)
     return (logits_f32 * scaling).to(logits.dtype)
