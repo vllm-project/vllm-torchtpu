@@ -279,8 +279,8 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/layers/adapter/fused_moe_ep.py",
     # Same for the TP decode MoE op, whose body this module builds.
     "vllm_torchtpu/layers/adapter/moe_tp_decode.py",
-    # Still listed: on this base `pp_shift.py` is a second caller, so the
-    # module stays even though the fused EP op no longer needs it.
+    # The fused EP op no longer uses it, but K3's prefill collectives
+    # (`models/vllm/kimi_k3/collective_ops.py`) still build their ops with it.
     "vllm_torchtpu/distributed/sharded_jax_op.py",
     # And the mesh they export with: `build_ep_mesh` decides the axis, the
     # shape and the device order (the DeviceAssignment) the kernel runs on.
