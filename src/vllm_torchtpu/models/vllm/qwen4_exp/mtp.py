@@ -23,7 +23,7 @@ forward-context metadata, which the runner's MTP proposer builds for step 0
 import copy
 import re
 from collections.abc import Iterable
-from typing import cast
+from typing import ClassVar, Literal, cast
 
 import torch
 from torch import nn
@@ -283,6 +283,19 @@ class Qwen4ExpMTP(nn.Module):
     supports_draft_rows = True
     # Identical to the target's: vLLM writes this onto the shared quant config.
     packed_modules_mapping = Qwen4ExpForCausalLM.packed_modules_mapping
+    # q38 F2 (config.pd_prefill_mtp_producer): a pipeline producer runs this draft
+    # (prefill-only, K = 1) on its last stage. vLLM's config check requires every
+    # model under a pipeline to satisfy `SupportsPP`, which `supports_pp` tests by
+    # attribute and by `forward` taking `intermediate_tensors` (as upstream's
+    # Qwen3_5MTP, db1494576). The pipeline never splits this draft: the last stage
+    # builds and runs it whole, so no stage ever makes its intermediate tensors.
+    supports_pp: ClassVar[Literal[True]] = True
+
+    def make_empty_intermediate_tensors(self, batch_size, dtype, device):
+        raise NotImplementedError(
+            "the Qwen4Exp MTP draft runs whole on the last pipeline stage; it has "
+            "no intermediate tensors"
+        )
 
     def __init__(self, *, vllm_config, prefix=""):
         super().__init__()

@@ -462,3 +462,16 @@ def test_producer_draft_specs_are_non_prefix_cacheable_on_both_legs(monkeypatch)
     # The decode's own draft keeps its prefix cache.
     _, decode_own = pooled_cache_specs(decode)
     assert decode_own[draft].prefix_cacheable and decode_own[draft + ".compressed_k"].prefix_cacheable
+
+
+def test_the_mtp_draft_satisfies_supports_pp():
+    """F2's pipeline producer runs Qwen4ExpMTP on its last stage. vLLM requires every model under a
+    pipeline to satisfy `SupportsPP` (q38 F2-1 CPU job j-ea7903ad probe: `supports_pp(Qwen4ExpMTP)`
+    was False); the draft declares it by attribute and never makes intermediate tensors."""
+    from vllm.model_executor.models.interfaces import supports_pp
+
+    from vllm_torchtpu.models.vllm.qwen4_exp.mtp import Qwen4ExpMTP
+
+    assert supports_pp(Qwen4ExpMTP)
+    with pytest.raises(NotImplementedError, match="runs whole on the last pipeline stage"):
+        Qwen4ExpMTP.make_empty_intermediate_tensors(object(), 1, None, None)
