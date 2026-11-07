@@ -227,14 +227,19 @@ def merge_candidates(candidates: jax.Array, topk: int) -> jax.Array:
     blocks = candidates[..., topk:].astype(jnp.int32)
     s = scores.transpose(1, 0, 2).reshape(num_tokens, dcp * topk)
     b = blocks.transpose(1, 0, 2).reshape(num_tokens, dcp * topk)
-    no_block = jnp.iinfo(jnp.int32).max
-    picked = []
-    for _ in range(topk):
-        best_score = jnp.max(s, axis=1, keepdims=True)
-        best = jnp.min(jnp.where(s == best_score, b, no_block), axis=1, keepdims=True)
-        picked.append(jnp.where(best_score > _NEG_INF, best, -1))
-        s = jnp.where(b == best, _NEG_INF, s)
-    return jnp.concatenate(picked, axis=1)
+    # The real candidates (score > -inf) are distinct blocks: a rank picks
+    # distinct columns and ranks hold disjoint blocks. So each one's place in
+    # the order is the number of real candidates ahead of it, and the merge
+    # is two dense compare-reduce fusions instead of topk dependent steps.
+    # Their [rows, dcp * topk, dcp * topk] operands stay fused into the
+    # reductions (dcp * topk <= 128 lanes per row at the served shapes).
+    real = s > _NEG_INF
+    s_i, b_i = s[:, :, None], b[:, :, None]
+    s_j, b_j = s[:, None, :], b[:, None, :]
+    ahead = real[:, None, :] & ((s_j > s_i) | ((s_j == s_i) & (b_j < b_i)))
+    place = jnp.where(real, jnp.sum(ahead, axis=2, dtype=jnp.int32), topk)
+    slot = jnp.arange(topk, dtype=jnp.int32)[None, None, :]
+    return jnp.max(jnp.where(place[:, :, None] == slot, b_i, -1), axis=1)
 
 
 def merge_head_candidates(candidates: jax.Array, topk: int) -> jax.Array:
