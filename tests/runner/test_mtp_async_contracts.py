@@ -397,3 +397,97 @@ def test_proposed_drafts_reach_next_inputs(device, k, mode):
     assert actual == expected, (
         "a non-verify chunk must carry its real proposals into the next step"
     )
+
+
+@pytest.mark.parametrize("num_groups", [1, 2])
+@pytest.mark.parametrize(
+    "width,rows,num_reqs",
+    [(4, 2, 2), (4, 4, 4), (4, 6, 3)],
+)
+def test_update_read_offsets_compiled_matches_eager(
+    device, num_groups, width, rows, num_reqs
+):
+    """_update_read_offsets_compiled scatters identical offsets to the CPU
+    reference across 1 vs 2 groups, rows < / == / > width, and padded tails."""
+    from vllm_torchtpu.runner import tpu_runner
+    from vllm_torchtpu.runner.tpu_runner_async_output import INVALID_TOKEN_ID
+
+    num_blocks = 24
+    raw_slots = [[2, 5, 8, 11], [14, 17, 19, 22]]
+    groups_cpu = [
+        torch.tensor(
+            [raw_slots[g][i] if i < num_reqs else 0 for i in range(width)],
+            dtype=torch.int32,
+        )
+        for g in range(num_groups)
+    ]
+    token_rows = [
+        [10, 11, 12, 13],
+        [20, INVALID_TOKEN_ID, INVALID_TOKEN_ID, INVALID_TOKEN_ID],
+        [30, 31, INVALID_TOKEN_ID, INVALID_TOKEN_ID],
+        [40, 41, 42, INVALID_TOKEN_ID],
+        [50, 51, 52, 53],
+        [INVALID_TOKEN_ID] * 4,
+    ]
+    next_tokens_cpu = torch.tensor(token_rows[:rows], dtype=torch.int32)
+
+    expected = torch.full((num_blocks,), 7, dtype=torch.int32)
+    expected[0] = 0
+    tpu_runner._update_read_offsets_impl(
+        expected,
+        groups_cpu,
+        next_tokens_cpu,
+        torch.tensor(num_reqs, dtype=torch.int64),
+    )
+
+    actual = torch.full((num_blocks,), 7, dtype=torch.int32, device=device)
+    actual[0] = 0
+    assert tpu_runner._use_fused_read_offset_update(actual, next_tokens_cpu)
+    assert not tpu_runner._use_fused_read_offset_update(actual, None)
+    tpu_runner._update_read_offsets_compiled(
+        actual,
+        [g.to(device) for g in groups_cpu],
+        next_tokens_cpu.to(device),
+        torch.tensor(num_reqs, dtype=torch.int64, device=device),
+    )
+    assert actual.cpu().tolist() == expected.tolist()
+
+
+@pytest.mark.parametrize("draft_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("width,num_reqs,qsl_len", [(4, 4, 5), (8, 3, 9), (8, 5, 6)])
+def test_async_draft_seed_compiled_matches_eager(
+    device, width, num_reqs, qsl_len, draft_dtype
+):
+    """_async_draft_seed_compiled on TPU matches the CPU eager path, and the
+    dispatch picks it only for override-free chunks on TPU."""
+    from vllm_torchtpu.spec_decode import eagle3
+
+    k = 3
+    next_tokens = torch.tensor(
+        [
+            [
+                100 + 10 * i + j if j < i % (k + 2) else eagle3.INVALID_TOKEN_ID
+                for j in range(k + 1)
+            ]
+            for i in range(width)
+        ],
+        dtype=torch.int32,
+    )
+    num_draft = torch.tensor([i % (k + 1) for i in range(width + 2)], dtype=draft_dtype)
+    query_start_loc = torch.arange(qsl_len, dtype=torch.int32) * (k + 1)
+    expected = eagle3._async_draft_seed_eager(
+        next_tokens, num_draft, query_start_loc, num_reqs, {}
+    )
+
+    next_tokens_dev = next_tokens.to(device)
+    assert eagle3._use_fused_async_draft_seed(next_tokens_dev, {})
+    assert not eagle3._use_fused_async_draft_seed(next_tokens_dev, {0: 7})
+    actual = eagle3._async_draft_seed_compiled(
+        next_tokens_dev,
+        num_draft.to(device),
+        query_start_loc.to(device),
+        torch.tensor(num_reqs, dtype=torch.int64, device=device),
+    )
+    for a, e in zip(actual, expected, strict=True):
+        assert a.dtype == e.dtype
+        assert a.cpu().tolist() == e.tolist()
