@@ -187,6 +187,7 @@ def test_batcher_net_and_topk_rows_on_lanes():
     key = lax.bitcast_convert_type((kb & ~em) | (em - lane_e8), F32)
 
     ids, sel = topk.topk_rows_on_lanes(key, k_top, em, need_ids=True)
+    assert ids is not None
     ids_none, sel2 = topk.topk_rows_on_lanes(key, k_top, em, need_ids=False)
     assert ids_none is None
     np.testing.assert_array_equal(sel, sel2)
@@ -307,6 +308,74 @@ class _FakeMoEStream:
 
     def eview(self, kind: str, bank: Any) -> Any:
         return self._ebuf[kind].at[bank]
+
+
+def _numpy_po2c_rank0(
+    uniq_picks: list[int],
+    ecopy_row: np.ndarray,
+    R: int,
+    ER: int,
+    EXTRA: int,
+    route_vec: bool,
+    *,
+    mode: str = "exact",
+) -> tuple[list[int], list[int]]:
+    """NumPy reference for rank-0 Po2C `elist`/`wlist` placement."""
+    n_tot = len(uniq_picks)
+    rload = [sum(1 for e in uniq_picks if (e // ER) == r) for r in range(R)]
+    if route_vec:
+        uniq_set = set(uniq_picks)
+        elist_out = [s for s in range(ER) if s in uniq_set and int(ecopy_row[s]) == 0]
+        wlist_out = list(elist_out)
+        code_to_e = {int(ecopy_row[e]): e for e in uniq_picks if int(ecopy_row[e]) > 0}
+        cplist = [code_to_e[j + 1] for j in range(R * EXTRA) if (j + 1) in code_to_e]
+    else:
+        elist_out = [e for e in uniq_picks if (e // ER) == 0 and int(ecopy_row[e]) == 0]
+        wlist_out = [e % ER for e in elist_out]
+        cplist = [e for e in uniq_picks if int(ecopy_row[e]) > 0]
+
+    if mode == "no_move":
+        for e in cplist:
+            if (e // ER) == 0:
+                elist_out.append(e)
+                wlist_out.append(e % ER)
+        return elist_out, wlist_out
+
+    cpchoice: list[bool] = []
+    for e in cplist:
+        r0 = e // ER
+        c0 = int(ecopy_row[e]) - 1
+        r1 = c0 // EXTRA
+        l0, l1 = rload[r0], rload[r1]
+        use_c = (l1 + 1 < l0) or (l1 < l0 and (l0 * R > n_tot or l1 * R < n_tot))
+        if use_c:
+            rload[r0] -= 1
+            rload[r1] += 1
+        cpchoice.append(use_c)
+
+    for e, use_c in zip(cplist, cpchoice):
+        r0 = e // ER
+        s0 = e - r0 * ER
+        c0 = int(ecopy_row[e]) - 1
+        r1 = c0 // EXTRA
+        s1 = ER + (c0 - r1 * EXTRA)
+        cur, alt = (r1, r0) if use_c else (r0, r1)
+        l_cur, l_alt = rload[cur], rload[alt]
+        flip = (l_alt + 1 < l_cur) or (
+            l_alt < l_cur and l_cur * R > n_tot and l_alt * R < n_tot
+        )
+        if mode == "invert_flip":
+            flip = not flip
+        if flip:
+            rload[cur] -= 1
+            rload[alt] += 1
+        final_c = use_c ^ flip
+        pick_r = r1 if final_c else r0
+        pick_w = s1 if final_c else s0
+        if pick_r == 0:
+            elist_out.append(e)
+            wlist_out.append(pick_w)
+    return elist_out, wlist_out
 
 
 def _run_moe_route_and_ring_pallas(
@@ -585,19 +654,20 @@ def _run_moe_route_and_ring_pallas(
         expected_r0 = [e for e in uniq_picks if (e // ER) == 0]
         assert elist == expected_r0
     else:
-        # Fixed rank-0 experts must always appear in `elist`, and every entry in
-        # `wlist` must match either primary slot `e` (`e < ER`) or replica slot
-        # `ER + (c0 - 0 * EXTRA)` for rank 0.
-        fixed_r0 = {e for e in uniq_picks if (e // ER) == 0 and ecopy_np[0, e] == 0.0}
-        assert fixed_r0.issubset(set(elist))
-        for e_id, w_slot in zip(elist, wlist):
-            assert e_id in uniq_picks
-            if e_id < ER and ecopy_np[0, e_id] == 0.0 or e_id < ER:
-                assert w_slot == e_id
-            else:
-                c0 = int(ecopy_np[0, e_id]) - 1
-                assert c0 // mp.EXTRA == 0
-                assert w_slot == ER + (c0 % mp.EXTRA)
+        exp_elist, exp_wlist = _numpy_po2c_rank0(
+            uniq_picks, ecopy_np[0], R, ER, mp.EXTRA, route_vec, mode="exact"
+        )
+        assert elist == exp_elist
+        assert wlist == exp_wlist
+        # Must-fail controls: a no-move Po2C and an inverted-flip Po2C both differ
+        no_move_elist, no_move_wlist = _numpy_po2c_rank0(
+            uniq_picks, ecopy_np[0], R, ER, mp.EXTRA, route_vec, mode="no_move"
+        )
+        assert (elist, wlist) != (no_move_elist, no_move_wlist)
+        inv_elist, inv_wlist = _numpy_po2c_rank0(
+            uniq_picks, ecopy_np[0], R, ER, mp.EXTRA, route_vec, mode="invert_flip"
+        )
+        assert (elist, wlist) != (inv_elist, inv_wlist)
 
     # 3. Verify `ring.etake` / `ring.es_wait` fetched slot `w0` for expert 0
     assert n_hit > 0
