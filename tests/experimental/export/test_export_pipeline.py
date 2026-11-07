@@ -2185,6 +2185,41 @@ def test_layer_state_specs_declare_the_mla_latent_cache(
     assert kv.shape == (16, 1024 // packing, packing, 640)
 
 
+def test_layer_state_specs_take_the_kv_shape_of_the_layers_backend() -> None:
+    """The KV state is the shape the runner allocates: the layer's backend's,
+    read under the model's config, which names the KV cache layout (the
+    batched RPA backend lays out `VLLM_KV_CACHE_LAYOUT=HND` differently)."""
+    from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
+
+    vllm_config = object()
+    seen: list[str] = []
+
+    class _LayoutBackend(PallasAttentionBackend):
+        @staticmethod
+        def get_kv_cache_shape(num_blocks, block_size, num_kv_heads, head_size, dt):
+            seen.append("shape")
+            return (num_blocks, num_kv_heads, block_size, head_size)
+
+    layer = SimpleNamespace(impl=_pallas_impl(None), attn_backend=_LayoutBackend)
+    adapter = _adapter_without_model(
+        api.TextOnlyLLMExportConfig(model_name="tiny", num_blocks=7, block_size=16)
+    )
+    with mock.patch("vllm.config.set_current_vllm_config") as set_config:
+        set_config.return_value.__enter__.side_effect = lambda: seen.append("set")
+        adapter._vllm_config = vllm_config
+        kv = adapter._layer_state_specs([layer])[0][0]
+    assert kv.shape == (7, 2, 16, 128)
+    set_config.assert_called_once_with(vllm_config)
+    assert seen == ["set", "shape"]
+    # A layer without a Pallas backend of its own keeps the base layout.
+    adapter._vllm_config = None
+    plain = SimpleNamespace(impl=_pallas_impl(None))
+    base = adapter._layer_state_specs([plain])[0][0]
+    assert base.shape == tuple(
+        PallasAttentionBackend.get_kv_cache_shape(7, 16, 2, 128, torch.bfloat16)
+    )
+
+
 def test_layer_state_specs_reject_sparse_mla() -> None:
     from vllm_torchtpu.layers.adapter.attention import PallasMLAttentionBackendImpl
 
