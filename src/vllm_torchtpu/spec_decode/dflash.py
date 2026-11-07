@@ -289,11 +289,21 @@ class DFlashProposer:
         """Whether this draft layer keeps its KV DCP-sharded like the target's
         (`cp_draft_attention`): drafters opt in (`shards_draft_kv_over_dcp`),
         for causal sliding-window layers."""
-        return (
-            getattr(self.draft_model, "shards_draft_kv_over_dcp", False)
+        opted_in = getattr(self.draft_model, "shards_draft_kv_over_dcp", False)
+        shard = (
+            opted_in
             and attn_impl.sliding_window is not None
             and attn_impl.use_causal_mask
         )
+        logger.info_once(
+            "Draft KV under DCP: %s (opt-in=%s, draft=%s, sliding_window=%s, causal=%s)",
+            "sharded" if shard else "replicated",
+            opted_in,
+            type(self.draft_model).__name__,
+            attn_impl.sliding_window,
+            attn_impl.use_causal_mask,
+        )
+        return shard
 
     def _draft_kv_head_replicas(self) -> int:
         """Tensor-parallel ranks per draft KV head."""
