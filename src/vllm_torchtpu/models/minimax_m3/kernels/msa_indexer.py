@@ -23,7 +23,8 @@ once per tile. The cache packs consecutive tokens into 32-bit words
 mind.
 
 Scores are produced transposed, ``[pages, tiles * block_q]``, so each output
-block is lane-aligned, and gathered back to ``[tokens, pages]``.
+block is lane-aligned, and gathered back to ``[tokens, pages]``; a decode
+batch's 128-page groups are lane-aligned either way and come out token-major.
 """
 
 import functools
@@ -131,8 +132,9 @@ def _kernel_v2(
     o_ref[...] = maxima[0] if len(maxima) == 1 else jnp.concatenate(maxima, axis=0)
 
 
-def _scores_v3(q, page_refs, o_ref):
-    """`_kernel_v2`'s scoring over pages already in VMEM."""
+def _scores_v3(q, page_refs, o_ref, transposed):
+    """`_kernel_v2`'s scoring over pages already in VMEM; a `transposed`
+    output block is ``[Bq, G]``."""
     block_q = q.shape[0]
     pages_per_step = len(page_refs)
     rows, packing, _ = page_refs[0].shape
@@ -152,7 +154,8 @@ def _scores_v3(q, page_refs, o_ref):
             keys, q, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
         )
         maxima.append(jnp.max(s.reshape(len(group), page_size, block_q), axis=1))
-    o_ref[...] = maxima[0] if len(maxima) == 1 else jnp.concatenate(maxima, axis=0)
+    out = maxima[0] if len(maxima) == 1 else jnp.concatenate(maxima, axis=0)
+    o_ref[...] = out.T if transposed else out
 
 
 def _kernel_v3(
@@ -170,6 +173,8 @@ def _kernel_v3(
     buf0,  # [G, S / p, p, D] pages of even steps
     buf1,  # [G, S / p, p, D] pages of odd steps
     sems,  # DMA semaphores [2, G]
+    *,
+    transposed=False,
 ):
     """`_kernel_v2` with the pages fetched by a hand-written double-buffered
     DMA ring: one scalar address per page and no copy for pages past the
@@ -227,12 +232,12 @@ def _kernel_v3(
     @pl.when(even)
     def _():
         wait(step, buf0, 0)
-        _scores_v3(q, [buf0.at[g] for g in range(pages_per_step)], o_ref)
+        _scores_v3(q, [buf0.at[g] for g in range(pages_per_step)], o_ref, transposed)
 
     @pl.when(jnp.logical_not(even))
     def _():
         wait(step, buf1, 1)
-        _scores_v3(q, [buf1.at[g] for g in range(pages_per_step)], o_ref)
+        _scores_v3(q, [buf1.at[g] for g in range(pages_per_step)], o_ref, transposed)
 
 
 _KERNELS = {"v1": _kernel_v1, "v2": _kernel_v2}
@@ -276,9 +281,11 @@ def _class_scores(
     pages_per_step,
     kernel,
     interpret,
+    token_major=False,
 ):
     """Transposed scores ``[P, tiles * block_q]`` of one tile class, and the
-    column of each token."""
+    column of each token; `token_major` (kernel v3) returns them as
+    ``[tiles * block_q, P]`` instead, so a token's scores are one row."""
     num_tokens, _, head_dim = index_q.shape
     _, rows_per_page, packing, _ = index_cache.shape
     page_size = rows_per_page * packing
@@ -355,15 +362,26 @@ def _class_scores(
         ),
     )
     out_shape = jax.ShapeDtypeStruct((padded_pages, max_tiles * block_q), jnp.float32)
+    out_specs = grid_spec.out_specs
+    if token_major:
+        if kernel != "v3":
+            raise NotImplementedError(
+                f"token-major scores need kernel v3, got {kernel}"
+            )
+        out_shape = jax.ShapeDtypeStruct(out_shape.shape[::-1], jnp.float32)
+        out_specs = pl.BlockSpec(
+            (block_q, pages_per_step),
+            lambda w, work, *_: (work[w] >> _TILE_SHIFT, work[w] & _GROUP_MASK),
+        )
     params = pltpu.CompilerParams(dimension_semantics=("arbitrary",))
     if kernel == "v3":
         scores_t = pl.pallas_call(
-            _kernel_v3,
+            functools.partial(_kernel_v3, transposed=token_major),
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=4,
                 grid=grid_spec.grid,
                 in_specs=[grid_spec.in_specs[0], pl.BlockSpec(memory_space=pl.ANY)],
-                out_specs=grid_spec.out_specs,
+                out_specs=out_specs,
                 scratch_shapes=[
                     pltpu.VMEM(
                         (pages_per_step, rows_per_page, packing, head_dim),
@@ -473,6 +491,13 @@ def block_scores(
         cu_q_lens,
         interpret=interpret,
     )
+    # Large requests have more than block_q tokens each.
+    max_large = min(max_num_seqs, num_tokens // (block_q + 1))
+    # With one tile class (decode), token-major scores make the gather back to
+    # token order a row gather; a column gather first relayouts the whole
+    # padded [P, tiles * block_q] f32 block (4 us per layer in the b1 decode
+    # twin, j-b312f26a). Needs lane-aligned [block_q, pages_per_step] blocks.
+    token_major = max_large == 0 and kernel == "v3" and small_pages_per_step % 128 == 0
     small, small_col = score(
         active & ~is_large,
         block_q=block_q,
@@ -481,9 +506,10 @@ def block_scores(
         max_tiles=min(2 * max_num_seqs, num_tokens + max_num_seqs),
         pages_per_step=small_pages_per_step,
         kernel=kernel,
+        token_major=token_major,
     )
-    # Large requests have more than block_q tokens each.
-    max_large = min(max_num_seqs, num_tokens // (block_q + 1))
+    if token_major:
+        return small[small_col][:, None, :]
     if max_large == 0:
         return small[:, small_col].T[:, None, :]
     large, large_col = score(

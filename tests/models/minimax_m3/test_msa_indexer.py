@@ -39,6 +39,7 @@ NUM_PAGES = 40
         # small (decode, 3 tokens) and large (130 tokens: 3 large tiles)
         ([1, 130, 3], [300, 200, 0], 64, 48, 4),
         ([1, 1], [1000, 5], 128, 512, 2),  # small class only, page groups
+        ([1, 3], [1000, 5], 128, 512, 128),  # small class only, token-major (v3)
     ],
 )
 def test_matches_reference(
