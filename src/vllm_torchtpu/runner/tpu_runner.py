@@ -91,7 +91,7 @@ from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorOutput
 
-from vllm_torchtpu import envs, utils
+from vllm_torchtpu import envs, megakernel_runtime, utils
 from vllm_torchtpu.block_major_pool import BlockMajorPoolLayout
 from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.distributed import utils as dist_utils
@@ -1141,6 +1141,7 @@ class TPUModelRunner(GPUModelRunner):
         # multi-engine DP, so this per-worker mesh only has a model axis.
         self.mesh = self._create_mesh_for_parallelism()
         self.batch_counter = 0
+        self._megakernel: Any = None
 
         # Hand-off between stages (TPU_PP_HANDOFF); built in capture_model,
         # where every stage reaches the same point.
@@ -4389,6 +4390,15 @@ class TPUModelRunner(GPUModelRunner):
                 chunk_mm_inputs = (chunk_embeds, is_mm_chunk)
 
             self._record_input_staging_fence()
+            # The megakernel serves from token ids: hand them over when a
+            # multimodal-capable model embeds this chunk's text tokens alone.
+            mk_token_ids = None
+            if (
+                self._megakernel is not None
+                and self.supports_mm_inputs
+                and not (chunk_mm_inputs is not None and chunk_mm_inputs[0])
+            ):
+                mk_token_ids = input_ids
             if self._pp_is_first:
                 input_ids, inputs_embeds = self._get_model_inputs(
                     input_ids, chunk_mm_inputs
@@ -4473,6 +4483,7 @@ class TPUModelRunner(GPUModelRunner):
                     positions=self.position_ids,
                     inputs_embeds=inputs_embeds,
                     intermediate_tensors=intermediate_tensors,
+                    megakernel_token_ids=mk_token_ids,
                 )
 
             if nan_check is not None:
@@ -5865,6 +5876,7 @@ class TPUModelRunner(GPUModelRunner):
 
         # Ensure attention custom ops exist before any compile/inference path,
         self._initialize_pallas_kernels()
+        self._megakernel = megakernel_runtime.maybe_create(self)
 
         from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4 import (  # noqa: E501
             VllmCompressedTensorsW4ANMxfp4MoEMethod,
@@ -6319,6 +6331,9 @@ class TPUModelRunner(GPUModelRunner):
                 vllm_config=self.vllm_config,
                 kv_cache_bundle=self._kv_cache_bundle,
             ),
+            # Dummy, precompile and profile forwards always run (and so
+            # compile) the stock model, even where the megakernel would serve.
+            megakernel_runtime.suppressed(self),
         ):
             if self.supports_mm_inputs and self._pp_is_first:
                 input_ids, inputs_embeds = self._get_model_inputs(input_ids, None)
@@ -7269,6 +7284,8 @@ class TPUModelRunner(GPUModelRunner):
                     self.device, self.max_num_tokens, self._pp_intermediate_template
                 )
             self._pp_wave.warmup()
+        if self._megakernel is not None:
+            self._megakernel.bind_and_warmup(self)
         if self.enforce_eager:
             return
         if self.lora_config is not None:
@@ -8639,19 +8656,43 @@ class TPUModelRunner(GPUModelRunner):
         padding_state.update(num_valid_tokens, num_tokens_padded)
 
     def forward_model(
-        self, input_ids, positions, inputs_embeds=None, intermediate_tensors=None
+        self,
+        input_ids,
+        positions,
+        inputs_embeds=None,
+        intermediate_tensors=None,
+        model_kwargs=None,
+        megakernel_token_ids=None,
     ):
-        # @support_torch_compile annotations will be put on the vLLM model if it
-        # supports torch.compile
-        kwargs = {}
-        if intermediate_tensors is not None:
-            kwargs["intermediate_tensors"] = intermediate_tensors
-        out = self.model(
-            input_ids=input_ids,
-            positions=positions,
-            inputs_embeds=inputs_embeds,
-            **kwargs,
-        )
+        hit, out = False, None
+        if self._megakernel is not None:
+            # A megakernel step returns what the stock model would; both go
+            # through the normalization below.
+            hit, out = self._megakernel.try_forward(
+                self,
+                megakernel_runtime.StepContext(
+                    input_ids=input_ids,
+                    positions=positions,
+                    inputs_embeds=inputs_embeds,
+                    intermediate_tensors=intermediate_tensors,
+                    model_kwargs=model_kwargs,
+                    token_ids=megakernel_token_ids,
+                ),
+            )
+
+        if not hit:
+            # @support_torch_compile annotations will be put on the vLLM model
+            # if it supports torch.compile
+            kwargs = dict(model_kwargs) if model_kwargs else {}
+            if intermediate_tensors is not None:
+                kwargs["intermediate_tensors"] = intermediate_tensors
+            out = self.model(
+                input_ids=input_ids,
+                positions=positions,
+                inputs_embeds=inputs_embeds,
+                **kwargs,
+            )
+        assert out is not None
         # A stage before the last returns the tensors the next stage
         # consumes rather than hidden states to sample from.
         if isinstance(out, IntermediateTensors):
