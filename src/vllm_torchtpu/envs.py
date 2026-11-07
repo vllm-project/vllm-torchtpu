@@ -115,6 +115,7 @@ if TYPE_CHECKING:
     TPU_MOE_A2A_ROUTE_CAPACITY: float = 3.0
     TPU_MOE_A2A_DIRECT_COMBINE: bool = False
     TPU_MOE_A2A_OWNER_COMBINE: bool = False
+    TPU_MOE_A2A_SORTED_PLAN: bool = False
     TPU_MOE_EXPERT_PLACEMENT: str = ""
     PCP_FA_KERNEL_BLOCK_SIZE: int | None = None
     PCP_GDN_COMM_CHUNK_SIZE: int | None = None
@@ -848,6 +849,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # expert's partials; the owner sums them and the engine all-gathers, so the
     # MoE output needs no TP all-reduce.
     "TPU_MOE_A2A_OWNER_COMBINE": env_bool("TPU_MOE_A2A_OWNER_COMBINE"),
+    # Ragged all-to-all exchange with the direct or owner combine: the expert
+    # side orders its local routes with one sort over the DP group's gathered
+    # routing, carrying each route's destination, instead of reading,
+    # sorting and looking up the received rows' routes.
+    "TPU_MOE_A2A_SORTED_PLAN": env_bool("TPU_MOE_A2A_SORTED_PLAN"),
     # Place each named MoE layer's experts by this .npz (logical expert ->
     # physical slot, e.g. balanced on routing counts; see
     # layers/core/expert_permutation.py). Unset = linear placement.

@@ -116,6 +116,7 @@ def _get_op(*, topk, activation, rhs_quant_dtype, skip_padded_tokens, shared=Fal
         route_factor=envs.TPU_MOE_A2A_ROUTE_CAPACITY,
         direct_combine=envs.TPU_MOE_A2A_DIRECT_COMBINE,
         owner_combine=envs.TPU_MOE_A2A_OWNER_COMBINE,
+        sorted_plan=envs.TPU_MOE_A2A_SORTED_PLAN,
     )
 
     # torch_tpu infers static argnums from annotations: every operand is jax.Array.

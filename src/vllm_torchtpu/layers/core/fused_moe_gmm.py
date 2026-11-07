@@ -770,6 +770,51 @@ def scatter_moe_supported(
     )
 
 
+def scatter_route_plan(
+    topk_weights: jax.Array,
+    topk_ids: jax.Array,
+    experts_start: jax.Array,
+    row_member: jax.Array,
+    row_dest: jax.Array,
+    *,
+    local_num_experts: int,
+    topk: int,
+    skip_padded_tokens: bool,
+    max_local_routes: int,
+    dtype,
+):
+    """The local routes of `fused_moe_scatter`'s rows in expert order: per
+    sorted route, its row and destination (member, row), and the routes per
+    local expert. Sorted entries past the local routes are never computed."""
+    topk_weights = topk_weights.astype(dtype)
+    topk_weights = jnp.where(jnp.isfinite(topk_weights), topk_weights, 0)
+    local_ids = topk_ids - experts_start
+    valid = (local_ids >= 0) & (local_ids < local_num_experts)
+    topk_weights = jnp.where(valid, topk_weights, jnp.zeros_like(topk_weights))
+    topk_ids = jnp.where(valid, local_ids, jnp.full_like(local_ids, -1))
+
+    # onehot_moe_local_routes up to the GMM.
+    num_routes = topk_ids.shape[0] * topk
+    ids = topk_ids.reshape(-1)
+    weights = topk_weights.reshape(-1)
+    valid = (ids >= 0) & (weights != 0) if skip_padded_tokens else ids >= 0
+    keys = jnp.where(valid, ids, local_num_experts)
+    route_bits = max(1, (num_routes - 1).bit_length())
+    assert local_num_experts.bit_length() + route_bits < 32
+    route = jnp.arange(num_routes, dtype=jnp.int32)
+    packed = jax.lax.sort(jnp.left_shift(keys, route_bits) | route)
+    packed = packed[:max_local_routes]
+    route_sorted = jnp.bitwise_and(packed, (1 << route_bits) - 1)
+    token_sorted = route_sorted // topk
+    group_sizes = jax.nn.one_hot(
+        jnp.where(valid, ids, 0), local_num_experts, dtype=jnp.int32
+    ) * valid[:, None].astype(jnp.int32)
+    group_sizes = group_sizes.sum(axis=0)
+    dest_member = row_member[token_sorted]
+    dest_row = row_dest.reshape(-1)[route_sorted]
+    return token_sorted, group_sizes, dest_member, dest_row
+
+
 @functools.partial(
     jax.jit,
     static_argnames=(
@@ -821,42 +866,89 @@ def fused_moe_scatter(
     rows other members send here. Expert outputs are the ones `fused_moe_func`
     combines (same permute, same GMM rows).
     """
+    token_sorted, group_sizes, dest_member, dest_row = scatter_route_plan(
+        topk_weights,
+        topk_ids,
+        experts_start,
+        row_member,
+        row_dest,
+        local_num_experts=w1.shape[0],
+        topk=topk,
+        skip_padded_tokens=skip_padded_tokens,
+        max_local_routes=max_local_routes,
+        dtype=hidden_states.dtype,
+    )
+    return fused_moe_scatter_planned(
+        hidden_states,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        token_sorted,
+        group_sizes,
+        dest_member,
+        dest_row,
+        me,
+        expected,
+        extra,
+        activation=activation,
+        rhs_quant_dtype=rhs_quant_dtype,
+        num_recv_rows=num_recv_rows,
+        num_extra_recv_rows=num_extra_recv_rows,
+        axis=axis,
+        num_members=num_members,
+        collective_id=collective_id,
+    )
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=(
+        "activation",
+        "rhs_quant_dtype",
+        "num_recv_rows",
+        "num_extra_recv_rows",
+        "axis",
+        "num_members",
+        "collective_id",
+    ),
+)
+def fused_moe_scatter_planned(
+    hidden_states: jax.Array,
+    w1: jax.Array,
+    w2: jax.Array,
+    w1_scale: jax.Array,
+    w2_scale: jax.Array,
+    token_sorted: jax.Array,
+    group_sizes: jax.Array,
+    dest_member: jax.Array,
+    dest_row: jax.Array,
+    me: jax.Array,
+    expected: jax.Array,
+    extra=None,
+    *,
+    activation: str,
+    rhs_quant_dtype=None,
+    num_recv_rows: int,
+    num_extra_recv_rows: int = 0,
+    axis,
+    num_members,
+    collective_id: int,
+):
+    """`fused_moe_scatter` from its route plan (see `scatter_route_plan`):
+    sorted route ``j`` computes row ``token_sorted[j]`` of ``hidden_states``
+    (out of range: a zero row) with the expert its position in
+    ``group_sizes`` names, and its output goes to row ``dest_row[j]`` of
+    member ``dest_member[j]``."""
     if w1_scale.ndim == 3:
         w1_scale = jnp.expand_dims(w1_scale, 2)
     if w2_scale.ndim == 3:
         w2_scale = jnp.expand_dims(w2_scale, 2)
     num_tokens = hidden_states.shape[0]
-    local_num_experts = w1.shape[0]
-    topk_weights = topk_weights.astype(hidden_states.dtype)
     # As fused_moe_func's one-hot paths: non-finite values stay with their token.
     hidden_states = jnp.where(jnp.isfinite(hidden_states), hidden_states, 0)
-    topk_weights = jnp.where(jnp.isfinite(topk_weights), topk_weights, 0)
-    local_ids = topk_ids - experts_start
-    valid = (local_ids >= 0) & (local_ids < local_num_experts)
-    topk_weights = jnp.where(valid, topk_weights, jnp.zeros_like(topk_weights))
-    topk_ids = jnp.where(valid, local_ids, jnp.full_like(local_ids, -1))
-
-    # onehot_moe_local_routes up to the GMM.
-    num_routes = num_tokens * topk
-    ids = topk_ids.reshape(-1)
-    weights = topk_weights.reshape(-1)
-    valid = (ids >= 0) & (weights != 0) if skip_padded_tokens else ids >= 0
-    keys = jnp.where(valid, ids, local_num_experts)
-    route_bits = max(1, (num_routes - 1).bit_length())
-    assert local_num_experts.bit_length() + route_bits < 32
-    route = jnp.arange(num_routes, dtype=jnp.int32)
-    packed = jax.lax.sort(jnp.left_shift(keys, route_bits) | route)
-    packed = packed[:max_local_routes]
-    route_sorted = jnp.bitwise_and(packed, (1 << route_bits) - 1)
-    token_sorted = route_sorted // topk
-    group_sizes = jax.nn.one_hot(
-        jnp.where(valid, ids, 0), local_num_experts, dtype=jnp.int32
-    ) * valid[:, None].astype(jnp.int32)
-    group_sizes = group_sizes.sum(axis=0)
     onehot = jax.nn.one_hot(token_sorted, num_tokens, dtype=hidden_states.dtype)
     x = onehot @ hidden_states
-    dest_member = row_member[token_sorted]
-    dest_row = row_dest.reshape(-1)[route_sorted]
     return gmm_v2_mlp_scatter(
         x,
         w1,
