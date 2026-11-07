@@ -52,9 +52,9 @@ def pool_tag(group_index: int, name: str, *, pcp_rank: int = 0, split: bool = Fa
 
     A PCP producer is one transfer unit per PCP rank of a stage. Its main-KV
     owners hold different tokens on every rank (``split``), so their tags
-    carry the rank; the other owners are identical on every rank, and only
-    rank 0's keep the plain tag a consumer pulls (the others' ``.pcp{r}`` tags
-    are never requested)."""
+    carry the rank; the other owners are identical on every rank, so only
+    rank 0 lists them, under the plain tag (``build_transfer_manifest`` drops
+    them from the other ranks' manifests)."""
     tag = f"qwen4.g{group_index}.{name}"
     if split or pcp_rank > 0:
         tag += f".pcp{pcp_rank}"
@@ -123,6 +123,11 @@ def build_transfer_manifest(
         ].kv_cache_spec.page_size_bytes
         used = set()
         for name in group.layer_names:
+            if pcp_rank > 0 and name not in split_owners:
+                # A PCP rank past 0 holds the same pages as rank 0 for every
+                # owner but the split main KV; the transport pushes every pool
+                # a unit lists, and the decode registers only rank 0's copy.
+                continue
             index = placements[name]
             if index < 0 or index >= len(storages):
                 raise ManifestError(f"Qwen PD owner {name} has no raw carrier")
@@ -160,7 +165,7 @@ def build_transfer_manifest(
                     dtype_tag="qwen4-whole-fp8-page-v1",
                 )
             )
-    if referenced != set(range(len(storages))):
+    if pcp_rank == 0 and referenced != set(range(len(storages))):
         raise ManifestError("Qwen PD contains an unreferenced raw carrier")
     manifest = PoolManifest(BINDING_ALIASED_RAW, list(storages), pools)
     verify_storage_binding(manifest, materialized.kv_caches, storages)
