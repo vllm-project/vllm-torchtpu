@@ -21,12 +21,11 @@ shares one device assignment), checks that every rank armed with a distinct
 mesh index, and runs the kernel once on inputs whose sums are exact. After
 that, TpuDeviceCommunicator.all_reduce of the TP group sends every 2-D bf16
 tensor through one torch op. Inside it the token count is static (torch_tpu
-exports one program per count): the kernel serves views up to the byte cap.
-A size over the cap keeps the usual torch path when it is static in torch;
-when it is symbolic there, the op takes a psum over the same mesh instead,
-which XLA lowers on its own (the kernel's output bits can also differ from
-XLA's all-reduce: it sums in f32 in rank order and rounds once; every rank
-gets the same bits).
+exports one program per count): the kernel serves views up to the byte cap,
+and a larger tensor (a prefill chunk) takes a psum over the same mesh, which
+XLA lowers as it lowers the usual all-reduce. The kernel's output bits can
+differ from XLA's all-reduce: it sums in f32 in rank order and rounds once;
+every rank gets the same bits.
 """
 
 import dataclasses
@@ -57,8 +56,6 @@ _SELFTEST_ROWS = (8, 24)
 @dataclasses.dataclass(frozen=True)
 class _Armed:
     ranks: tuple[int, ...]
-    n: int
-    max_bytes: int
     op: Any
     rank: torch.Tensor  # this rank's mesh index, int32 [1, 1]
 
@@ -180,13 +177,7 @@ def arm(hidden: int, device: torch.device) -> bool:
         raise RuntimeError(
             f"tp_all_reduce: self-test failed (rows per rank): {failures}"
         )
-    _ARMED = _Armed(
-        ranks=tuple(int(r) for r in tp.ranks),
-        n=n,
-        max_bytes=max_bytes,
-        op=op,
-        rank=rank,
-    )
+    _ARMED = _Armed(ranks=tuple(int(r) for r in tp.ranks), op=op, rank=rank)
     logger.info(
         "tp_all_reduce: armed over %d ranks (mesh index %d), Pallas up to %d B views",
         n,
@@ -204,12 +195,7 @@ def all_reduce(ranks, x: torch.Tensor) -> torch.Tensor | None:
         return None
     if x.dtype != torch.bfloat16 or x.dim() != 2:
         return None
-    rows, hidden = x.shape
-    # A static size too big for the kernel keeps the usual path; a symbolic one
-    # goes to the op, which decides on the static size inside.
-    if (
-        isinstance(rows, int)
-        and not 0 < kernel.view_bytes(rows, hidden, armed.n) <= armed.max_bytes
-    ):
-        return None
+    # Every size goes to the op, which decides on the static size inside: a
+    # branch here would give the model's Dynamo traces different graphs (and
+    # inputs) per bucket, which shape_variants refuses to hand buckets between.
     return armed.op(x, armed.rank)

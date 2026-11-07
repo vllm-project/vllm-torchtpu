@@ -61,7 +61,7 @@ def view_shape(rows: int, hidden: int, n: int) -> tuple[int, int, int]:
 
 
 def view_bytes(rows: int, hidden: int, n: int) -> int:
-    padded, m, w = view_shape(rows, hidden, n)
+    _, m, w = view_shape(rows, hidden, n)
     return m * w * jnp.dtype(BF16).itemsize
 
 

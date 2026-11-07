@@ -736,8 +736,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # all-reduce above it. Needs the EP group to span the TP group and the
     # world. 0 (default) keeps XLA's all-reduce everywhere; capped at 4 MiB
     # (VMEM). At 8 x 6144 bf16 on tpu7x TP8 the kernel takes 8.3 us against
-    # 14.6 us; 524288 covers decode buckets up to 42 rows of 6144, where the
-    # two still differ.
+    # 14.6 us; 524288 (the bytes of 42.7 rows of 6144) admits the decode
+    # buckets up to 40 rows of 6144, where the two still differ.
     "TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES": env_int(
         "TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES", 0
     ),
