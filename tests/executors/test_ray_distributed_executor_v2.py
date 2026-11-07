@@ -942,3 +942,35 @@ def test_ray_distributed_executor_bundle_expansion():
     # Too many bundle indices raises ValueError
     with pytest.raises(ValueError, match="less than or equal to world_size"):
         expand_bundles(list(range(17)), 16)
+
+
+def test_resolve_slicebuilder_host_uses_lws_leader_address(monkeypatch):
+    from vllm_torchtpu.executors.ray_distributed_executor_v2 import (
+        _TPU_WORKER_SPECIFIC_ENV_VARS,
+        _resolve_slicebuilder_host,
+    )
+
+    monkeypatch.delenv("LWS_LEADER_ADDRESS", raising=False)
+    assert _resolve_slicebuilder_host("10.0.0.1", 0) == "10.0.0.1"
+    assert _resolve_slicebuilder_host("10.0.0.2", 1) == "10.0.0.2"
+
+    leader_dns = "ubench-lws-0.ubench-lws.default.svc.cluster.local"
+    monkeypatch.setenv("LWS_LEADER_ADDRESS", leader_dns)
+    assert _resolve_slicebuilder_host("2001:db8::1", 0) == leader_dns
+    assert (
+        _resolve_slicebuilder_host("2001:db8::2", 1)
+        == "ubench-lws-0-1.ubench-lws.default.svc.cluster.local"
+    )
+    assert (
+        _resolve_slicebuilder_host("2001:db8::3", 2)
+        == "ubench-lws-0-2.ubench-lws.default.svc.cluster.local"
+    )
+    assert {
+        "TPU_VISIBLE_CHIPS",
+        "TPU_VISIBLE_DEVICE_PATHS",
+        "CLOUD_TPU_TASK_ID",
+        "TPU_CHIPS_PER_HOST_BOUNDS",
+        "TPU_HOST_BOUNDS",
+        "TPU_WORKER_ID",
+        "LWS_WORKER_INDEX",
+    }.issubset(_TPU_WORKER_SPECIFIC_ENV_VARS)

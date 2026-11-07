@@ -176,9 +176,15 @@ def get_node_name() -> str:
     return tpu_name
 
 
+TPU_PCI_VENDOR_ID = "0x1ae0"
+MAX_TPU_DEVICES_PER_HOST = 8
+
+
 def get_node_worker_id() -> int:
     """For multi-host TPU VM, this returns the worker id for the current node."""
     worker_id = envs.TPU_WORKER_ID
+    if worker_id is None:
+        worker_id = envs.LWS_WORKER_INDEX
     if worker_id is None:
         worker_id = get_tpu_metadata(key="agent-worker-number")
     if worker_id is None:
@@ -193,14 +199,36 @@ def get_num_cores_per_chip() -> int:
     return 2
 
 
+def _is_vfio_group_a_tpu(group: int) -> bool:
+    """Return True iff the VFIO group is backed by a Google TPU PCI device."""
+    iommu_root = "/sys/kernel/iommu_groups"
+    if not os.path.exists(iommu_root):
+        return True
+    sysfs_root = os.path.join(iommu_root, str(group), "devices")
+    try:
+        devices = os.listdir(sysfs_root)
+    except OSError:
+        return False
+    for device in devices:
+        vendor_path = os.path.join(sysfs_root, device, "vendor")
+        try:
+            with open(vendor_path, encoding="ascii") as f:
+                if f.read().strip().lower() == TPU_PCI_VENDOR_ID:
+                    return True
+        except (OSError, UnicodeDecodeError):
+            continue
+    return False
+
+
 def get_num_chips() -> int:
-    accel_files = glob.glob("/dev/accel*")
+    accel_files = [p for p in glob.glob("/dev/accel*") if not os.path.isdir(p)]
     if accel_files:
         return len(accel_files)
     try:
         vfio_entries = os.listdir("/dev/vfio")
         numeric_entries = [int(entry) for entry in vfio_entries if entry.isdigit()]
-        return len(numeric_entries)
+        tpu_count = sum(1 for group in numeric_entries if _is_vfio_group_a_tpu(group))
+        return min(tpu_count, MAX_TPU_DEVICES_PER_HOST)
     except FileNotFoundError as e:
         logger.warning("Failed to detect number of TPUs: %s", e)
         return 0

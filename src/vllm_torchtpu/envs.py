@@ -33,6 +33,8 @@ if TYPE_CHECKING:
     TPU_NAME: str | None = None
     TPU_LIBRARY_PATH: str | None = None
     TPU_WORKER_ID: str | None = None
+    LWS_WORKER_INDEX: str | None = None
+    LWS_LEADER_ADDRESS: str = ""
     TPU_MULTIHOST_BACKEND: str = ""
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     PYTHON_TRACER_LEVEL: int = 1
@@ -529,6 +531,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_LIBRARY_PATH": lambda: os.getenv("TPU_LIBRARY_PATH", None),
     # Worker ID for multi-host TPU setups
     "TPU_WORKER_ID": lambda: os.getenv("TPU_WORKER_ID", None),
+    # Worker index injected by Kubernetes LeaderWorkerSet (LWS)
+    "LWS_WORKER_INDEX": lambda: os.getenv("LWS_WORKER_INDEX", None),
+    # Leader pod DNS address injected by Kubernetes LeaderWorkerSet (LWS)
+    "LWS_LEADER_ADDRESS": env_str("LWS_LEADER_ADDRESS", ""),
     # Backend for multi-host communication on TPU. "" auto-detects: "mp" is
     # used whenever --nnodes > 1 and this isn't set to "ray"; set explicitly
     # to "mp" to force it (e.g. to silence the auto-detection log line).

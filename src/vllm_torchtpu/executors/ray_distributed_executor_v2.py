@@ -70,6 +70,38 @@ def get_tpu_bundles_for_indices(
 
 logger = init_logger(__name__)
 
+_TPU_WORKER_SPECIFIC_ENV_VARS: frozenset[str] = frozenset(
+    {
+        "TPU_VISIBLE_CHIPS",
+        "TPU_VISIBLE_DEVICES",
+        "TPU_VISIBLE_DEVICE_PATHS",
+        "CLOUD_TPU_TASK_ID",
+        "TPU_CHIPS_PER_HOST_BOUNDS",
+        "TPU_HOST_BOUNDS",
+        "TPU_WORKER_ID",
+        "LWS_WORKER_INDEX",
+    }
+)
+
+
+def _resolve_slicebuilder_host(ip: str, host_index: int) -> str:
+    """Resolve the hostname or IP to use in TORCH_TPU_SLICEBUILDER_ADDRESSES.
+
+    TorchTPU's C++ slicebuilder splits each ``<host>:<port>`` entry on ``:``
+    (``discovery.cc``) and rejects entries with more than one colon, so raw IPv6
+    node addresses fail validation. Under Kubernetes LeaderWorkerSet (LWS),
+    ``LWS_LEADER_ADDRESS`` provides the DNS name of host 0 (e.g.
+    ``<lws>-0.<lws>.<ns>.svc.cluster.local``), and worker host ``i > 0`` is
+    addressable at ``<lws>-0-<i>.<lws>.<ns>.svc.cluster.local``.
+    """
+    lws_leader_address = tpu_envs.LWS_LEADER_ADDRESS
+    if lws_leader_address:
+        if host_index == 0:
+            return lws_leader_address
+        if "-0." in lws_leader_address:
+            return lws_leader_address.replace("-0.", f"-0-{host_index}.", 1)
+    return ip
+
 
 class RayDistributedExecutorV2(RayExecutorV2):
     """Ray-based distributed executor V2 for TPU.
@@ -284,7 +316,8 @@ class RayDistributedExecutorV2(RayExecutorV2):
 
         # Collect driver env vars
         self.driver_env_vars = get_driver_env_vars(
-            worker_specific_vars=WORKER_SPECIFIC_ENV_VARS,
+            worker_specific_vars=WORKER_SPECIFIC_ENV_VARS
+            | _TPU_WORKER_SPECIFIC_ENV_VARS,
         )
 
         runtime_env = self._build_runtime_env()
@@ -386,8 +419,8 @@ class RayDistributedExecutorV2(RayExecutorV2):
 
         base_port = tpu_envs.TORCH_TPU_BASE_PORT
         sb_addresses = [
-            f"{ip}:{base_port + chip}"
-            for ip in host_order
+            f"{_resolve_slicebuilder_host(ip, host_idx)}:{base_port + chip}"
+            for host_idx, ip in enumerate(host_order)
             for chip in range(chips_per_host[ip])
         ]
         slicebuilder_addresses = ",".join(sb_addresses)
