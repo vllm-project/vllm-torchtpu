@@ -65,6 +65,20 @@ FP4_OUTPUT_CHUNK = 256
 # top rung is always tile_m, so a full tile is unchanged. Overridable per
 # process by MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE, read at BUILD time.
 HEIGHT_RUNGS = 4
+# The default ladder, in eighths of tile_m (48/96/128 at tile_m=128), used
+# unless the override above is set. Three rungs rather than four equally
+# spaced ones: every rung is a whole copy of the FFN body, and on TPU7x the
+# fourth copy costs more than the rows it saves (decode microbench at
+# ~36 routed rows per expert: 4 rungs 32/64/96/128 -> 308us, 3 rungs
+# 48/96/128 or 32/64/128 -> ~281-290us; 8 rungs -> ~1.9ms, the body no
+# longer fits the instruction memory). The low rung covers the mean decode
+# expert (rows/expert = tokens * topk / experts, 36 at DeepSeek-V4.1 decode).
+HEIGHT_RUNG_EIGHTHS = (3, 6, 8)
+# Move only the live gate/up columns of each expert's w1 slab when the
+# caller certifies a logical intermediate size: the padded columns are never
+# read (expert_ffn_blockscale skips those output chunks), so their DMA is
+# pure HBM traffic (1.3MB of 13.1MB per expert at DeepSeek-V4.1).
+TRIM_GATE_UP_DMA = True
 # DMA priority the weight refills take, so that they stay off the in-order
 # queue the token gather issues on.
 WEIGHT_DMA_PRIORITY = 1
@@ -156,6 +170,19 @@ def tile_height_rungs(tile_m, rows_alloc, g_local, ep):
     what a shard's `g_local` experts actually expect to hold.
 
     """
+    if (
+        rows_alloc <= ep * g_local * tile_m
+        and not envs.MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE
+    ):
+        ladder = tuple(tile_m * k // 8 for k in HEIGHT_RUNG_EIGHTHS)
+        if (
+            ladder
+            and ladder[-1] == tile_m
+            and all(tile_m * k % 8 == 0 for k in HEIGHT_RUNG_EIGHTHS)
+            and all(r % ROWBLK == 0 and r > 0 for r in ladder)
+            and list(ladder) == sorted(set(ladder))
+        ):
+            return ladder
     rungs = envs.MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE or HEIGHT_RUNGS
     step = tile_m // rungs
     if (
@@ -523,6 +550,21 @@ def _slot_copy(src, vm, sems, slot):
     return pltpu.make_async_copy(src, vm.at[slot], sems.at[slot])
 
 
+class _CopyPair:
+    """Two async copies started and waited as one."""
+
+    def __init__(self, first, second):
+        self.copies = (first, second)
+
+    def start(self, priority=0):
+        for copy in self.copies:
+            copy.start(priority=priority)
+
+    def wait(self):
+        for copy in self.copies:
+            copy.wait()
+
+
 def _rows_wait(sem, ref, rows):
     """Block until `rows` rows' worth of DMAs on `sem` have landed."""
     pltpu.make_async_copy(ref.at[pl.ds(0, rows)], ref.at[pl.ds(0, rows)], sem).wait()
@@ -622,6 +664,7 @@ def _build_fused_ep_moe_kernel(
         )
     # This is the last N column read, not the end of the physical allocation.
     w1_last_valid_column = inter + effective_inter
+    trim_w1_dma = TRIM_GATE_UP_DMA and rhs_packed4 and trim_gate_up_padding
 
     # The weight prefetch distance and the slot count it needs are chosen
     # below, once the shapes they are sized against have been checked: they
@@ -974,6 +1017,24 @@ def _build_fused_ep_moe_kernel(
 
         def w1_copy(expert, slot):
             """The gate/up weight slab of `expert`, into weight slot `slot`."""
+            if trim_w1_dma:
+                # Only the live gate and up column ranges; the padded columns
+                # between and after them are never read. Two descriptors on
+                # one semaphore: the wait counts the bytes of both.
+                return _CopyPair(
+                    *(
+                        pltpu.make_async_copy(
+                            w1_hbm.at[expert].at[
+                                pl.ds(0, hidden // PACK4), pl.ds(c0, effective_inter)
+                            ],
+                            w1_vm.at[slot].at[
+                                pl.ds(0, hidden // PACK4), pl.ds(c0, effective_inter)
+                            ],
+                            w1_sems.at[slot],
+                        )
+                        for c0 in (0, inter)
+                    )
+                )
             return _slot_copy(w1_hbm.at[expert], w1_vm, w1_sems, slot)
 
         def w2_copy(expert, slot):
