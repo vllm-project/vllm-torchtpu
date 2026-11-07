@@ -703,13 +703,11 @@ class TestTpuCompilerCache:
         monkeypatch.setattr(tpu_compiler, "_deserialize_entry", fake_deserialize)
         monkeypatch.setattr(tpu_compiler, "_PEER_POLL_S", 0.01)
 
-        def compile(compiler, graph=None):
+        def compile(compiler, graph=None, key="artifact_bucket"):
             current["rank"] = compiler.rank
             if graph is None:
                 graph = torch.fx.symbolic_trace(lambda x: x * 2 + 1)
-            return compiler.compile(
-                graph, [], {}, Range(start=1, end=4096), key="artifact_bucket"
-            )
+            return compiler.compile(graph, [], {}, Range(start=1, end=4096), key=key)
 
         return list(compilers()), compile, compiled, replayed
 
@@ -898,6 +896,179 @@ class TestTpuCompilerCache:
             compile(b)
         assert time.monotonic() - start >= 0.3
         assert compiled == [1]
+
+    @staticmethod
+    def _async_backend(
+        monkeypatch,
+        fail_async=False,
+        serializable=True,
+        resolve_error=None,
+    ):
+        """A backend that records the options of each call and, like
+        TpuBackend, returns a runnable with `serialize` whose first call under
+        `async_compile` raises `AsyncCompilationSubmitted`."""
+        from torch_tpu._internal.compile._backend import AsyncCompilationSubmitted
+
+        from vllm_torchtpu.compilation import tpu_compiler
+
+        options_seen = []
+        resolved = []
+
+        class Artifact:
+            def resolve(self):
+                resolved.append(True)
+                if resolve_error is not None:
+                    raise resolve_error
+
+        class FailingEntry:
+            def __reduce__(self):
+                raise resolve_error
+
+        class Compiled:
+            def __init__(self, is_async):
+                self._warmup = is_async
+                if serializable:
+                    self.serialize = lambda: (
+                        FailingEntry() if resolve_error is not None else "entry"
+                    )
+
+            def __call__(self, *args):
+                if self._warmup:
+                    self._warmup = False
+                    raise AsyncCompilationSubmitted(Artifact())
+                return ("ran",)
+
+        def backend(graph, example_inputs, options=None):
+            options_seen.append(options)
+            if fail_async and options:
+                raise RuntimeError("async submission failed")
+            return Compiled(bool(options and options.get("async_compile")))
+
+        monkeypatch.setattr(tpu_compiler, "_tpu_backend", backend)
+        return options_seen, resolved
+
+    def test_a_prebuilt_bucket_is_handed_over_by_compile(self, tmp_path, monkeypatch):
+        """prebuild runs the backend with async_compile; the later compile for
+        the same graph and key hands that result over without running the
+        backend again, resolves AsyncCompilationSubmitted on first call, and
+        persists the artifact a peer replays."""
+        import torch
+        from vllm.config.utils import Range
+
+        from vllm_torchtpu.compilation.tpu_compiler import artifact_key
+
+        (a, b), compile, compiled, replayed = self._peer_compilers(
+            tmp_path, monkeypatch
+        )
+        options_seen, resolved = self._async_backend(monkeypatch)
+        graph = torch.fx.symbolic_trace(lambda x: x * 2 + 1)
+        r = Range(start=1, end=4096)
+        key = artifact_key(r, 0)
+        assert key == "artifact_compile_range_1_4096_subgraph_0"
+
+        assert a.prebuild(graph, [], r, key)
+        assert options_seen == [{"async_compile": True}]
+        fn, handle = a.compile(graph, [], {}, r, key=key)
+
+        assert options_seen == [{"async_compile": True}]
+        assert handle is not None
+        assert os.path.exists(os.path.join(a.cache_dir, key))
+        assert resolved == []
+        assert fn() == "ran"
+        assert resolved == [True]
+        assert fn() == "ran"
+        assert resolved == [True]
+        # The peer replays the owner's artifact instead of compiling.
+        compile(b, graph=graph, key=key)
+        assert len(replayed) == 1
+        assert options_seen == [{"async_compile": True}]
+
+    def test_prebuilt_without_entry_waits_for_compile_before_handover(
+        self, tmp_path, monkeypatch
+    ):
+        """When the backend attaches no serialize (`entry is None`), `_finish_compile`
+        waits for the async compile before returning rather than leaving it
+        lowering in the background."""
+        import torch
+        from vllm.config.utils import Range
+
+        (a, _), _, _, _ = self._peer_compilers(tmp_path, monkeypatch)
+        _, resolved = self._async_backend(monkeypatch, serializable=False)
+        graph = torch.fx.symbolic_trace(lambda x: x * 2 + 1)
+        r = Range(start=1, end=4096)
+
+        assert a.prebuild(graph, [], r, "artifact_bucket")
+        assert resolved == []
+        fn, handle = a.compile(graph, [], {}, r, key="artifact_bucket")
+        assert handle is None
+        assert resolved == [True]
+        assert fn() == "ran"
+
+    def test_failed_async_compile_raises_from_compile_and_marks_failed(
+        self, tmp_path, monkeypatch
+    ):
+        """An async XLA compile failure surfaces from `compile` like the serial
+        path and leaves the `.failed` marker so waiting peers stop waiting."""
+        import torch
+        from vllm.config.utils import Range
+
+        (a, _), _, _, _ = self._peer_compilers(tmp_path, monkeypatch)
+        self._async_backend(
+            monkeypatch, resolve_error=RuntimeError("XLA compile failed")
+        )
+        graph = torch.fx.symbolic_trace(lambda x: x * 2 + 1)
+        r = Range(start=1, end=4096)
+
+        assert a.prebuild(graph, [], r, "artifact_bucket")
+        with pytest.raises(RuntimeError, match="XLA compile failed"):
+            a.compile(graph, [], {}, r, key="artifact_bucket")
+        assert os.path.exists(os.path.join(a.cache_dir, "artifact_bucket.failed"))
+
+    def test_a_failed_prebuild_is_compiled_serially(self, tmp_path, monkeypatch):
+        import torch
+        from vllm.config.utils import Range
+
+        (a, _), _, _, _ = self._peer_compilers(tmp_path, monkeypatch)
+        options_seen, _ = self._async_backend(monkeypatch, fail_async=True)
+        graph = torch.fx.symbolic_trace(lambda x: x * 2 + 1)
+        r = Range(start=1, end=4096)
+
+        assert not a.prebuild(graph, [], r, "artifact_bucket")
+        fn, handle = a.compile(graph, [], {}, r, key="artifact_bucket")
+
+        assert options_seen == [{"async_compile": True}, None]
+        assert handle is not None
+        assert fn() == "ran"
+
+    def test_discard_drops_unclaimed_prebuilt_buckets(self, tmp_path, monkeypatch):
+        import torch
+        from vllm.config.utils import Range
+
+        from vllm_torchtpu.compilation import tpu_compiler
+
+        warnings = []
+
+        class _Logger:
+            def warning_once(self, msg, *args):
+                warnings.append(msg % args if args else msg)
+
+            def __getattr__(self, name):
+                return lambda *args, **kwargs: None
+
+        monkeypatch.setattr(tpu_compiler, "logger", _Logger())
+        (a, _), _, _, _ = self._peer_compilers(tmp_path, monkeypatch)
+        options_seen, resolved = self._async_backend(monkeypatch)
+        graph = torch.fx.symbolic_trace(lambda x: x * 2 + 1)
+        r = Range(start=1, end=4096)
+
+        assert a.prebuild(graph, [], r, "artifact_bucket")
+        a.discard_prebuilt(graph)
+        assert resolved == [True]
+        assert any("artifact_bucket" in w for w in warnings)
+        a.compile(graph, [], {}, r, key="artifact_bucket")
+
+        # Nothing was handed over: compile ran the backend itself.
+        assert options_seen == [{"async_compile": True}, None]
 
     def test_a_saved_artifact_clears_an_old_marker(self, tmp_path, monkeypatch):
         (a, _), compile, compiled, replayed = self._peer_compilers(

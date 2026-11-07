@@ -79,6 +79,7 @@ def _compile(
     local_rank,
     ranks_per_host=8,
     disable_cache=False,
+    adaptor=None,
 ):
     """(range end, peer wait in seconds) per compile, in order."""
     _host(monkeypatch, ranks_per_host)
@@ -100,7 +101,7 @@ def _compile(
         },
         vllm_backend=SimpleNamespace(
             compiler_manager=SimpleNamespace(
-                compile=compile, disable_cache=disable_cache
+                compile=compile, disable_cache=disable_cache, compiler=adaptor, cache={}
             ),
             inductor_config={},
             is_encoder=False,
@@ -112,6 +113,30 @@ def _compile(
     )
     compile_all_ranges(backend)
     return calls
+
+
+def _prebuilding_adaptor(monkeypatch, events, fail_sizes=()):
+    """A TpuCompilerAdaptor whose prebuild records (range end, peer wait)."""
+
+    def prebuild(self, graph, args, compile_range, key):
+        r = compile_range
+        assert key == f"artifact_compile_range_{r.start}_{r.end}_subgraph_0"
+        events.append(
+            (
+                "prebuild",
+                compile_range.end,
+                getattr(tpu_compiler._peer_wait, "timeout_s", 0.0),
+            )
+        )
+        return compile_range.end not in fail_sizes
+
+    monkeypatch.setattr(tpu_compiler.TpuCompilerAdaptor, "prebuild", prebuild)
+    monkeypatch.setattr(
+        tpu_compiler.TpuCompilerAdaptor,
+        "discard_prebuilt",
+        lambda self, graph: events.append(("discard", None, None)),
+    )
+    return tpu_compiler.TpuCompilerAdaptor()
 
 
 def _owned(calls):
@@ -406,3 +431,54 @@ def test_deferred_falls_back_when_cache_disabled_or_host_unknown(
     calls_nocache, _, _ = _compile_deferred(monkeypatch, 1, disable_cache=True)
     assert all(wait == 0.0 for _, wait in calls_nocache[:9])
     assert sorted(end for end, _ in calls_nocache[:9]) == SIZES
+
+
+@pytest.mark.parametrize("local_rank", [7, 0])
+def test_async_prebuilds_the_buckets_a_rank_owns(
+    compile_all_ranges, monkeypatch, local_rank
+):
+    """With TPU_PRECOMPILE_ASYNC a rank owning several buckets submits them all
+    before installing any, so their XLA compiles overlap; a rank owning one
+    bucket has nothing to overlap. Buckets it replays are never prebuilt."""
+    monkeypatch.setenv("TPU_PRECOMPILE_ASYNC", "1")
+    events = []
+    adaptor = _prebuilding_adaptor(monkeypatch, events)
+
+    calls = _compile(compile_all_ranges, monkeypatch, local_rank, adaptor=adaptor)
+
+    prebuilt = [end for kind, end, wait in events if kind == "prebuild"]
+    if local_rank == 7:
+        # Rank 7 owns 32 and 16 (the snake gives it the 9th bucket).
+        assert prebuilt == [32, 16]
+        assert all(wait == 0.0 for kind, _, wait in events if kind == "prebuild")
+        assert events[-1] == ("discard", None, None)
+    else:
+        assert prebuilt == []
+    # Every bucket is still installed through vLLM's compile, as before.
+    assert sorted(end for end, _ in calls) == sorted(SIZES)
+
+
+def test_async_off_prebuilds_nothing(compile_all_ranges, monkeypatch):
+    monkeypatch.delenv("TPU_PRECOMPILE_ASYNC", raising=False)
+    events = []
+    adaptor = _prebuilding_adaptor(monkeypatch, events)
+    _compile(compile_all_ranges, monkeypatch, 7, adaptor=adaptor)
+    assert events == []
+
+
+def test_async_finishes_submitted_buckets_before_serial_fallbacks(
+    compile_all_ranges, monkeypatch
+):
+    """When a rank owns 3 buckets (4096, 32, 16 on a 4-rank host) and the first
+    prebuild fails, the 2 submitted buckets (32, 16) finish before the failed
+    one (4096) compiles serially."""
+    monkeypatch.setenv("TPU_PRECOMPILE_ASYNC", "1")
+    events = []
+    adaptor = _prebuilding_adaptor(monkeypatch, events, fail_sizes=(4096,))
+
+    calls = _compile(
+        compile_all_ranges, monkeypatch, 0, ranks_per_host=4, adaptor=adaptor
+    )
+
+    assert [end for kind, end, _ in events if kind == "prebuild"] == [4096, 32, 16]
+    assert [end for end, wait in calls if wait == 0.0] == [32, 16, 4096]
