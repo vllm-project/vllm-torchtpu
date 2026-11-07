@@ -23,10 +23,10 @@ from vllm_torchtpu.core.pp_chunk_scheduler import SCHEDULER_CLS
 from vllm_torchtpu.platforms import tpu_platform
 
 
-def _config(dp=1, cls=None, chunked=True):
+def _config(dp=1, cls=None, chunked=True, pp=8):
     return SimpleNamespace(
         parallel_config=SimpleNamespace(
-            pipeline_parallel_size=8, data_parallel_size=dp
+            pipeline_parallel_size=pp, data_parallel_size=dp
         ),
         scheduler_config=SimpleNamespace(
             scheduler_cls=cls, enable_chunked_prefill=chunked
@@ -34,8 +34,9 @@ def _config(dp=1, cls=None, chunked=True):
     )
 
 
-def _env(monkeypatch, dynamic=True, dp_sched=False, slack=0.1):
+def _env(monkeypatch, dynamic=True, dp_sched=False, slack=0.1, one_stage=False):
     monkeypatch.setattr(tpu_platform.envs, "TPU_PP_DYNAMIC_CHUNKS", dynamic)
+    monkeypatch.setattr(tpu_platform.envs, "TPU_DYNAMIC_CHUNKS", one_stage)
     monkeypatch.setattr(tpu_platform.envs, "DP_SCHED_ENABLED", dp_sched)
     monkeypatch.setattr(tpu_platform.envs, "TPU_PP_CHUNK_SLACK", slack)
 
@@ -104,3 +105,29 @@ def test_pipeline_knobs_do_not_change_the_compile_cache_key():
     assert "TPU_PP_DYNAMIC_CHUNKS" in tpu_compiler._TPU_COMPILE_ENV_IGNORED
     assert "TPU_PP_CHUNK_SLACK" in tpu_compiler._TPU_COMPILE_ENV_IGNORED
     assert "TPU_PP_LAZY_PUSH" in tpu_compiler._TPU_COMPILE_ENV_IGNORED
+
+
+@pytest.mark.parametrize(
+    "pp,pipeline_flag,one_stage_flag,installed",
+    [
+        (1, True, False, False),  # one stage stays on token budgets by default
+        (1, False, True, True),  # and opts in with its own flag alone
+        (8, False, True, False),  # a pipeline follows TPU_PP_DYNAMIC_CHUNKS
+    ],
+)
+def test_each_flag_gates_its_own_stage_count(
+    monkeypatch, pp, pipeline_flag, one_stage_flag, installed
+):
+    _env(monkeypatch, dynamic=pipeline_flag, one_stage=one_stage_flag)
+    config = _config(pp=pp)
+    hook = _configure(config)
+    assert (config.scheduler_config.scheduler_cls == SCHEDULER_CLS) == installed
+    assert hook.called == installed
+
+
+def test_one_stage_keeps_the_other_gates(monkeypatch):
+    _env(monkeypatch, one_stage=True)
+    config = _config(pp=1, chunked=False)
+    hook = _configure(config)
+    assert config.scheduler_config.scheduler_cls is None
+    hook.assert_not_called()
