@@ -52,8 +52,8 @@ PREFILL_CHECKPOINT_ALIGNMENT = 1
 def pin_upstream_block_pool(monkeypatch) -> None:
     """Restores the unpatched BlockPool lookups for one test.
 
-    The same-step-hit patch hides blocks hashed since the last schedule(),
-    which these tests never call.
+    The same-step-hit patch hides blocks hashed since the last
+    `KVCacheManager.new_step_starts()`.
     """
     for name in ("_insert_block_hash", "get_cached_block"):
         monkeypatch.setattr(BlockPool, name, inspect.unwrap(getattr(BlockPool, name)))

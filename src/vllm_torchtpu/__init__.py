@@ -1936,15 +1936,9 @@ def _patch_vllm_same_step_prefix_hits() -> None:
     tokens, never caches lookahead slots, and defers anything filled later
     under `delay_cache_blocks`.
 
-    The step boundary is `KVCacheManager.new_step_starts`. `Scheduler.schedule`
-    calls it once per step before it looks anything up or allocates, so `vllm
-    serve` sees no change; and vLLM's Mamba manager already relies on it to
-    keep same-step hits off blocks other requests are filling. Hooking it
-    there, rather than on `Scheduler.schedule`, keeps the guard working for an
-    engine that drives `KVCacheManager` without vLLM's scheduler: it must call
-    `new_step_starts()` each step anyway. Reset only from the scheduler, the
-    set would never be cleared for such an engine, and every block it
-    published would stay unhittable.
+    The set is cleared at `KVCacheManager.new_step_starts`, which
+    `Scheduler.schedule` calls once per step before any lookup or allocation,
+    and which an engine driving `KVCacheManager` directly calls each step too.
     """
     import functools
 

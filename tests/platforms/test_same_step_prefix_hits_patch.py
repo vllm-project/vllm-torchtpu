@@ -51,7 +51,9 @@ def patched(monkeypatch):
     upstream first so the test patches exactly once, and restore afterwards.
     The stub keeps the one thing the real `schedule()` does that matters here:
     it calls `kv_cache_manager.new_step_starts()` once per step, before it
-    looks anything up or allocates.
+    looks anything up or allocates. So the `[scheduler]` cases check the wiring
+    through `Scheduler.schedule`, not vLLM's scheduler itself; that the real
+    `schedule()` clears the set is covered in tests/test_abort_on_preemption.py.
     """
     for name in ("_insert_block_hash", "get_cached_block"):
         monkeypatch.setattr(BlockPool, name, inspect.unwrap(getattr(BlockPool, name)))
