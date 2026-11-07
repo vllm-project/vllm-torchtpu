@@ -521,3 +521,75 @@ def test_norm_env_reaches_builders(monkeypatch, fake_adapter):
     monkeypatch.setattr(envs, "TPU_QWEN4_HC_PREFILL_NORM", "gram64")
     GatedResidual(_module(3).config, prefill_full_tile=256)
     assert seen and seen[-1][-1] == "gram64", seen
+
+
+# ---- bf16 norm epilogue (TPU_QWEN4_HC_PREFILL_NORM=bf16ep): bitwise by argument
+
+
+def _bf16_rne(x64):
+    """Round exact float64 values to bf16 (round half to even) without an f32 detour."""
+    x = np.asarray(x64, np.float64)
+    out = np.zeros_like(x)
+    nz = x != 0
+    e = np.floor(np.log2(np.abs(x[nz])))
+    ulp = 2.0 ** (e - 7)  # bf16: 8 significant bits
+    q = x[nz] / ulp  # exact (power-of-two scaling)
+    out[nz] = np.round(q) * ulp  # numpy rounds halves to even
+    return out
+
+
+def _via_f32_bf16(x32):
+    return np.asarray(jnp.asarray(x32, jnp.float32).astype(jnp.bfloat16).astype(jnp.float32), np.float64)
+
+
+def test_bf16_epilogue_rounding_argument():
+    """The identities bf16ep relies on, against exact float64 arithmetic:
+    bf16(f32(n) * f32(w)) == RNE_bf16(n * w), and bf16(f32(n) + f32(s)) ==
+    RNE_bf16(n + s), including exponent gaps beyond 16 (where f32 itself
+    rounds the sum) — i.e. what a correctly rounded bf16 multiply and add give."""
+    rng = np.random.default_rng(7)
+    size = 200_000
+
+    def bf16_values():
+        v = rng.normal(size=size) * 2.0 ** rng.integers(-30, 30, size)
+        return np.asarray(jnp.asarray(v, jnp.float32).astype(jnp.bfloat16).astype(jnp.float32), np.float64)
+
+    n, w = bf16_values(), bf16_values()
+    prod = n * w  # exact: two 8-bit significands
+    assert np.array_equal(prod.astype(np.float32).astype(np.float64), prod)
+    s = _via_f32_bf16(prod.astype(np.float32))
+    assert np.array_equal(s, _bf16_rne(prod))  # product identity
+    sum_f32 = _via_f32_bf16(n.astype(np.float32) + s.astype(np.float32))
+    sum_exact = _bf16_rne(n + s)  # n + s is exact in float64 for these exponents
+    gap = np.abs(np.frexp(np.where(n == 0, 1, n))[1] - np.frexp(np.where(s == 0, 1, s))[1])
+    assert (gap > 16).sum() > 1000  # the large-gap case is exercised
+    assert np.array_equal(sum_f32, sum_exact)
+
+
+def _count_bf16_muls(jaxpr):
+    n = 0
+    for eqn in jaxpr.eqns:
+        if eqn.primitive.name == "mul" and all(v.aval.dtype == jnp.bfloat16 for v in eqn.outvars):
+            n += 1
+        for param in eqn.params.values():
+            for sub in (param if isinstance(param, (list, tuple)) else [param]):
+                inner = getattr(sub, "jaxpr", sub)
+                if hasattr(inner, "eqns"):
+                    n += _count_bf16_muls(inner)
+    return n
+
+
+@pytest.mark.parametrize("impl", ["bf16ep", "bf16ep64"])
+@pytest.mark.parametrize("rows", [4 * TILE, 3 * TILE + 64])
+def test_norm_bf16_epilogue_is_bitwise_and_engaged(impl, rows):
+    x, weight, down, up, inject = _arrays(4 * TILE, seed=47)
+    x = x[:rows]
+    part = dict(partial=True) if rows % TILE else {}
+    for kernel, args in ((full, (x, weight, down, up)), (fused, (x, weight, down, up, inject))):
+        base = kernel(*args, **part)
+        got = kernel(*args, norm_impl=impl, **part)
+        for a, b in zip(got, base):
+            np.testing.assert_array_equal(_bits(a), _bits(b))
+        jx = jax.make_jaxpr(functools.partial(kernel, norm_impl=impl, **part))(*args)
+        jv = jax.make_jaxpr(functools.partial(kernel, **part))(*args)
+        assert _count_bf16_muls(jx.jaxpr) > _count_bf16_muls(jv.jaxpr), impl

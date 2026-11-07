@@ -1092,9 +1092,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # qwen4_exp prefill fused HC mixes (hc_full, the fused mix): the per-branch
     # RMS norm's sum of squares and loop step. vpu (default, today); rows64
     # (64-row steps, bitwise); gram / gram64 (sum of squares as the diagonal of
-    # x x^T on the MXU; not bitwise, only the f32 summation order changes).
+    # x x^T on the MXU; not bitwise, only the f32 summation order changes);
+    # bf16ep / bf16ep64 (the epilogue n * w, n + . in bf16 arithmetic; bitwise).
     "TPU_QWEN4_HC_PREFILL_NORM": env_with_choices(
-        "TPU_QWEN4_HC_PREFILL_NORM", "vpu", ["vpu", "rows64", "gram", "gram64"],
+        "TPU_QWEN4_HC_PREFILL_NORM",
+        "vpu",
+        ["vpu", "rows64", "gram", "gram64", "bf16ep", "bf16ep64"],
         case_sensitive=False,
     ),
     # Pooled GDN: skip zero-filling the [T, n_v, d_v] output before the

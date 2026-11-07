@@ -48,7 +48,25 @@ _ROW_CHUNK = 32
 #           block (exact bf16 products, f32 accumulation), 32-row steps;
 #           NOT bitwise: only the f32 summation order differs
 #   gram64  gram in 64-row steps
-NORM_IMPLS = ("vpu", "rows64", "gram", "gram64")
+#   bf16ep  the norm's epilogue (n * w, then n + that) in bf16 arithmetic on
+#           the bf16 operands; bitwise equal to vpu: a bf16 x bf16 product is
+#           exact in f32, and f32 adds two bf16 values exactly unless their
+#           exponents differ by more than 16, where the smaller one is below
+#           half a bf16 ulp of the larger and both forms round to it
+#   bf16ep64  bf16ep in 64-row steps
+NORM_IMPLS = ("vpu", "rows64", "gram", "gram64", "bf16ep", "bf16ep64")
+
+
+def norm_epilogue(values, variance, weight_f32, weight_bf16, eps: float, norm_impl: str):
+    """bf16(n + bf16(n * w)), n = bf16(values * rsqrt(variance + eps)): the
+    prefill path's two-boundary RMS norm epilogue for one branch's rows.
+    weight_f32 / weight_bf16 are that branch's [1, hidden] weights."""
+    normalized = (values * jax.lax.rsqrt(variance + eps)).astype(jnp.bfloat16)
+    if norm_impl.startswith("bf16ep"):
+        return normalized + normalized * weight_bf16
+    n32 = normalized.astype(jnp.float32)
+    scaled = (n32 * weight_f32).astype(jnp.bfloat16).astype(jnp.float32)
+    return (n32 + scaled).astype(jnp.bfloat16)
 
 
 def norm_rows_per_step(norm_impl: str, rows: int) -> int:
@@ -147,6 +165,11 @@ def _kernel(*refs, branches, hidden, eps, lowrank, prologue, scopes=0, norm_impl
                 xb = x_ref[pl.ds(offset, rows), pl.ds(start, hidden)]
                 values = xb.astype(jnp.float32)
             variance = branch_variance(values, xb, hidden, norm_impl)
+            if norm_impl.startswith("bf16ep"):
+                norm_vm[pl.ds(offset, rows), pl.ds(start, hidden)] = norm_epilogue(
+                    values, variance, None, w_vm[pl.ds(start, hidden)][None, :], eps, norm_impl
+                )
+                continue
             normalized = (
                 (values * jax.lax.rsqrt(variance + eps))
                 .astype(jnp.bfloat16)

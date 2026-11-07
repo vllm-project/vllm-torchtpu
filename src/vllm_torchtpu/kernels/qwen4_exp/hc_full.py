@@ -16,6 +16,7 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu.kernels.qwen4_exp.hc_prefill_fused import (
     NORM_IMPLS,
     branch_variance,
+    norm_epilogue,
     norm_rows_per_step,
 )
 
@@ -113,6 +114,18 @@ def _kernel(
                     xb = x_vm[parity, pl.ds(offset, step_rows), pl.ds(start, hidden)]
                     values = xb.astype(jnp.float32)
                     variance = branch_variance(values, xb, hidden, norm_impl)
+                    if norm_impl.startswith("bf16ep"):
+                        norm_vm[
+                            parity, pl.ds(offset, step_rows), pl.ds(start, hidden)
+                        ] = norm_epilogue(
+                            values,
+                            variance,
+                            None,
+                            weight_vm[pl.ds(start, hidden)][None, :],
+                            eps,
+                            norm_impl,
+                        )
+                        continue
                     normalized = (
                         (values * jax.lax.rsqrt(variance + eps))
                         .astype(jnp.bfloat16)
