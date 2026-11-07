@@ -1633,7 +1633,7 @@ class TestBootstrapUnits(unittest.TestCase):
             ],
         )
         self.assertTrue(mq_pre.annotations[0][2].startswith("CI suite: pr+cpu-only: "))
-        self.assertEqual([u[0] for u in mq_pre.uploads], ["cpu", "build"])
+        self.assertEqual([u[0] for u in mq_pre.uploads], ["cpu", "build", "precommit"])
 
         # Merge queue fail-open: if base fetch or diff fails even when the queue
         # head commit is docs-only, never fall back to diff-tree on the head commit
@@ -1658,7 +1658,7 @@ class TestBootstrapUnits(unittest.TestCase):
                 )
                 self.assertEqual(
                     [u[0] for u in mq_fail_open.uploads],
-                    ["upload_stages", "cpu", "build"],
+                    ["upload_stages", "cpu", "build", "precommit"],
                 )
 
         # An unreadable /ci merge marker (API failure or >5000 comments) is retried,
@@ -1715,7 +1715,51 @@ class TestBootstrapUnits(unittest.TestCase):
                 )
             ],
         )
-        self.assertEqual(mq_docs.uploads, [])
+        # A docs-only queue build still runs pre-commit, and nothing else.
+        self.assertEqual([u[0] for u in mq_docs.uploads], ["precommit"])
+
+    def test_orchestration_precommit_lane(self) -> None:
+        def lanes(rec: _RunRecorder) -> list[str]:
+            return [u[0] for u in rec.uploads]
+
+        cutover = {"CI_PR_PUSH_CPU_ONLY": "1"}
+        pr = {"BUILDKITE_PULL_REQUEST": "42"}
+
+        # Before cutover nothing outside the queue runs it: PR pushes, /ci run,
+        # docs-only PRs and post-merge builds upload what they did before.
+        self.assertNotIn("precommit", lanes(self._run_bootstrap(pr)))
+        self.assertNotIn(
+            "precommit", lanes(self._run_bootstrap({**pr, "CI_RUN_TPU": "1"}))
+        )
+        self.assertEqual(self._run_bootstrap(pr, files=["README.md"]).uploads, [])
+        post_merge = {
+            "BUILDKITE_BRANCH": "main",
+            "BUILDKITE_SOURCE": "webhook",
+            "BUILDKITE_MESSAGE": "fix (#7)",
+        }
+        self.assertNotIn(
+            "precommit", lanes(self._run_bootstrap({**post_merge, **cutover}))
+        )
+
+        # After cutover a PR push runs it next to the CPU stage; a docs-only PR
+        # runs only it.
+        self.assertEqual(
+            lanes(self._run_bootstrap({**pr, **cutover})), ["cpu", "build", "precommit"]
+        )
+        docs = self._run_bootstrap({**pr, **cutover}, files=["README.md"])
+        self.assertEqual(lanes(docs), ["precommit"])
+
+        # /ci run puts it in stage 0, so the TPU stage waits for it too.
+        ci_run = self._run_bootstrap({**pr, **cutover, "CI_RUN_TPU": "1"})
+        self.assertEqual(lanes(ci_run), ["upload_stages", "cpu", "build", "precommit"])
+        self.assertNotIn("precommit", lanes(self._run_next_stage(ci_run)))
+
+        # The lane needs no image: it runs on a cpu agent with no depends_on.
+        doc = yaml.safe_load(docs.uploads[0][1])
+        step = doc["steps"][0]
+        self.assertEqual(step["key"], "pre_commit")
+        self.assertEqual(step["agents"], {"queue": "cpu"})
+        self.assertNotIn("depends_on", step)
 
     def test_scope_equivalence_across_channels(self) -> None:
         """All channels for a given scope choose the same Suite and upload the same
@@ -1725,8 +1769,10 @@ class TestBootstrapUnits(unittest.TestCase):
         def _normalize_lane_uploads(
             rec: _RunRecorder, stage1: _RunRecorder | None
         ) -> list[tuple[str, Any]]:
+            # The precommit lane follows the channel (queue, post-cutover PR), not
+            # the scope; test_orchestration_precommit_lane covers it.
             all_uploads = [
-                *(u for u in rec.uploads if u[0] != "upload_stages"),
+                *(u for u in rec.uploads if u[0] not in ("upload_stages", "precommit")),
                 *(stage1.uploads if stage1 is not None else ()),
             ]
             normalized: list[tuple[str, Any]] = []
