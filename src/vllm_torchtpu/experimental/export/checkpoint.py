@@ -97,8 +97,8 @@ def shard_shape(spec: Mapping[str, Any], axis_sizes: Mapping[str, int]) -> list[
 
 
 def local_tensors(model: Any) -> dict[str, Any]:
-    """The model's parameters and buffers by name, its MTP draft's own included
-    under their `mtp.` names.
+    """The model's parameters and buffers by name, its drafts' own included
+    under their `mtp.` (MTP draft) or `draft.` (separate draft model) names.
 
     A tied LM head (see `weight_mapper.tied_lm_head_alias`) is the embedding tensor.
     """
@@ -110,6 +110,7 @@ def local_tensors(model: Any) -> dict[str, Any]:
     if tied:
         tensors[tied[0]] = tensors[tied[1]]
     tensors.update(universal_adapter.mtp_draft_tensors(model))
+    tensors.update(universal_adapter.draft_model_tensors(model))
     return tensors
 
 
