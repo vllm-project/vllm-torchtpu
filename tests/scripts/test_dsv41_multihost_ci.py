@@ -157,6 +157,7 @@ _SHAPES = {
     "dsv41_swa_parity": _TPU_2,
     "dsv41_benchmark_scripts_cpu": "cpu",
     "dsv41_kernel_config_cpu": "cpu",
+    "dsv41_stage_model": "cpu",
     "dsv41_flash_dp8_ep_gsm8k": _TPU_8,
     "dsv41_decode_kernel_parity": _TPU_8,
     "dsv41_flash_dp8_c8_cached_extend": _TPU_8,
@@ -202,7 +203,16 @@ def test_pipeline_keeps_checks_and_order():
         "dsv41_flash_dp8_c8_cached_extend": "DeepSeek-V4.1 DP8 Prefill throughput",
     }
     decode = steps["dsv41_flash_dp16_c768_decode"]
-    assert decode["depends_on"] == "dsv41_decode_kernel_parity"
+    assert sorted(decode["depends_on"]) == [
+        "dsv41_decode_kernel_parity",
+        "dsv41_stage_model",
+    ]
+    # Every serving benchmark streams the staged checkpoint.
+    for key in ("dsv41_flash_dp8_ep_gsm8k", "dsv41_flash_dp8_c8_cached_extend"):
+        assert steps[key]["depends_on"] == "dsv41_stage_model", key
+    for key in checks:
+        command = " ".join(steps[key]["commands"])
+        assert "wdhongtw-hf-flat" not in command, key
     assert decode["commands"] == [
         ".buildkite/kubernetes/run_multihost.sh --manifest dsv41-dp16-decode.yaml"
     ]

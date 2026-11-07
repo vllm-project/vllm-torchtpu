@@ -71,7 +71,7 @@ spec:
                   args:
                     - >-
                       exec bash /workspace/vllm-torchtpu/.buildkite/scripts/run_dsv41_dp16_pod.sh
-                      gs://wdhongtw-hf-flat/deepseek-ai/DeepSeek-V4.1-Flash
+                      gs://tpu-commons-ci/models/deepseek-ai/DeepSeek-V4.1-Flash
                       perf_eval_results/deepseek-v41-flash-dp16-96k-c768-decode
                   env:
                     - name: HEAD_HOST

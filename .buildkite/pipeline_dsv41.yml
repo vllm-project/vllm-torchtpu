@@ -194,11 +194,34 @@ steps:
   - group: "DeepSeek-V4.1-Flash on TPU"
     depends_on: "build_docker"
     steps:
+      # The serving benchmarks stream the checkpoint from tpu-commons-ci, which
+      # the fleet reads. This copies it there from Hugging Face the first time
+      # and is a no-op once the prefix holds its .staged marker.
+      - label: "DeepSeek-V4.1-Flash: stage the checkpoint in GCS"
+        key: "dsv41_stage_model"
+        <<: *cpu_step
+        # The first copy moves the whole checkpoint; later runs only read the
+        # marker. The launcher's TPU_MAX_RUNTIME_SECONDS bounds the pod.
+        timeout_in_minutes: 1440
+        env:
+          SHAPE: "cpu"
+          JAX_PLATFORMS: "cpu"
+          TPU_MAX_RUNTIME_SECONDS: *serving_runtime
+        plugins:
+          - *kube_plugin
+        commands:
+          - >-
+            .buildkite/kubernetes/run.sh
+            bash .buildkite/scripts/stage_dsv41_model.sh
+            deepseek-ai/DeepSeek-V4.1-Flash
+            gs://tpu-commons-ci/models/deepseek-ai/DeepSeek-V4.1-Flash
+
       # The server pulls config, tokenizer and custom code from MODEL_URI
       # itself, so this step needs no local copy of the checkpoint.
       - label: "DeepSeek-V4.1-Flash: DP8 C384 DSpark + full GSM8K"
         key: "dsv41_flash_dp8_ep_gsm8k"
         <<: *tpu_step
+        depends_on: "dsv41_stage_model"
         notify:
           - github_check:
               name: "DeepSeek-V4.1 DP8 GSM8K eval"
@@ -216,7 +239,7 @@ steps:
         commands:
           - >-
             .buildkite/kubernetes/run.sh
-            env MODEL_URI=gs://wdhongtw-hf-flat/deepseek-ai/DeepSeek-V4.1-Flash
+            env MODEL_URI=gs://tpu-commons-ci/models/deepseek-ai/DeepSeek-V4.1-Flash
             bash ./scripts/vllm/benchmarking/run_eval_flow.sh
             --config deepseek-v41-flash-dp8-ep
             --run-lm-eval --lm-eval-limit none --skip-perf-check
@@ -242,7 +265,9 @@ steps:
       - label: "DeepSeek-V4.1-Flash: DP16 C768 steady DSpark decode (8 chips, EPLB)"
         key: "dsv41_flash_dp16_c768_decode"
         <<: *tpu_step
-        depends_on: "dsv41_decode_kernel_parity"
+        depends_on:
+          - "dsv41_decode_kernel_parity"
+          - "dsv41_stage_model"
         notify:
           - github_check:
               name: "DeepSeek-V4.1 DP16 Decode throughput"
@@ -257,6 +282,7 @@ steps:
       - label: "DeepSeek-V4.1-Flash: DP8 C8 cached 96K + 16K extend"
         key: "dsv41_flash_dp8_c8_cached_extend"
         <<: *tpu_step
+        depends_on: "dsv41_stage_model"
         # Exercise halfplane Index-K in the TP1/DP8 benchmark path.
         notify:
           - github_check:
@@ -282,5 +308,5 @@ steps:
             perf_eval_results/deepseek-v41-flash-dp8-96k-c8-cached-extend/benchmark
             bash .buildkite/scripts/run_dsv41_benchmark.sh
             encoder_extend
-            gs://wdhongtw-hf-flat/deepseek-ai/DeepSeek-V4.1-Flash
+            gs://tpu-commons-ci/models/deepseek-ai/DeepSeek-V4.1-Flash
             perf_eval_results/deepseek-v41-flash-dp8-96k-c8-cached-extend
