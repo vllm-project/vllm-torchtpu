@@ -39,7 +39,7 @@ from vllm_torchtpu.megakernel.exec_spec import ExecSpec
 from vllm_torchtpu.megakernel.modules.norm import EmbeddingModule, NormModule
 from vllm_torchtpu.megakernel.ops import BF16, F32, FP8, I32
 from vllm_torchtpu.megakernel.planner import plan, weight_shapes
-from vllm_torchtpu.megakernel.spec import LayerType, ModelSpec, SwitchSlot
+from vllm_torchtpu.megakernel.spec import LayerType, ModelSpec, SwitchSlot, WeightDecl
 from vllm_torchtpu.megakernel.weights.eplb import (
     default_eplb_cores,
     encode_eplb_ecopy,
@@ -589,6 +589,84 @@ def test_switch_branch_and_pack_spec_logical_weights(stack_e: bool):
         merged_tiles=True,
     )
     assert packed_merged["es"].shape == (R, g.L, g.EW(R), 2 * g.I + g.H)
+
+    # R=1 with 2 layers and an HBM `per_layer` weight whose input carries the R axis
+    # `(1, 2, *lead_dims, K, N)`: element count equals `n_layers * per_layer_elems`,
+    # so rank-based detection must slice along the layer axis `[:, i]` not `[i]`.
+    class _PerLayerHBMFFN(FakeFFNModule):
+        def weights(self, g: FakeGeometry, ex: ExecSpec) -> list[WeightDecl]:
+            return [
+                dataclasses.replace(wd, layout="per_layer") if wd.name == "es" else wd
+                for wd in super().weights(g, ex)
+            ]
+
+    r1 = 1
+    g_r1 = FakeGeometry(
+        L=2,
+        att_every=2,
+        H=256,
+        NH=2,
+        NKV=2,
+        KH=1,
+        VH=1,
+        I=128,
+        IS=128,
+        E=16,
+        TOPK=2,
+        e_slots=16,
+    )
+    ex_r1 = ExecSpec(R=r1, B=4, T=1, stack_e=stack_e, tiles=TINY_TILES)
+    ms_r1 = ModelSpec(
+        "pack_test_r1",
+        config=g_r1,
+        layer_type=LayerType("lt", slots=(sw, _PerLayerHBMFFN())),
+    )
+    nh1, hd1 = g_r1.NH // r1, g_r1.HD
+    nai1 = (2 * nh1 + 2) * hd1
+    kh1, vh1 = g_r1.KH // r1, g_r1.VH // r1
+    qkv1, z1 = 2 * kh1 * g_r1.KD + vh1 * g_r1.VD, vh1 * g_r1.VD
+    nli1 = qkv1 + z1 + 128
+    isr1 = g_r1.IS // r1
+    in_s_w1 = max(nai1, nli1)
+    ew1 = g_r1.EW(r1)
+    es_r1 = jnp.arange(r1 * g_r1.L * ew1 * (2 * g_r1.I + g_r1.H), dtype=F32).reshape(
+        r1, g_r1.L, ew1, 1, 2 * g_r1.I + g_r1.H
+    )
+    logical_r1: dict[str, Any] = {
+        "in_norm": jnp.ones((g_r1.L, g_r1.H), dtype=F32),
+        "post_norm": jnp.ones((r1, g_r1.L, g_r1.H), dtype=F32),
+        "final_norm": jnp.ones((g_r1.H,), dtype=F32),
+        "in_s": jnp.ones((r1, g_r1.L, in_s_w1), dtype=F32),
+        "out_s": jnp.ones((g_r1.L, g_r1.H), dtype=F32),
+        "qn": jnp.ones((1, hd1), dtype=F32),
+        "kn": jnp.ones((r1, 1, hd1), dtype=F32),
+        "conv": jnp.ones((r1, 1, 4 * qkv1), dtype=F32),
+        "gnorm": jnp.ones((1, g_r1.VD), dtype=F32),
+        "sh13_s": jnp.ones((r1, g_r1.L, 2 * isr1), dtype=F32),
+        "sh2_s": jnp.ones((r1, g_r1.L, g_r1.H), dtype=F32),
+        "sh_gate": jnp.ones((g_r1.L, g_r1.H), dtype=F32),
+        "att_in": jnp.zeros((1, g_r1.H, nai1), dtype=FP8),
+        "att_out": jnp.zeros((r1, 1, nh1 * hd1, g_r1.H), dtype=FP8),
+        "lin_in": jnp.zeros((r1, 1, g_r1.H, nli1), dtype=FP8),
+        "lin_out": jnp.zeros((r1, 1, z1, g_r1.H), dtype=FP8),
+        "router": jnp.zeros((r1, g_r1.L, g_r1.H, g_r1.E), dtype=BF16),
+        "sh13": jnp.zeros((r1, g_r1.L, g_r1.H, 2 * isr1), dtype=FP8),
+        "sh2": jnp.zeros((r1, g_r1.L, isr1, g_r1.H), dtype=FP8),
+        "e13": jnp.zeros((r1, g_r1.L, ew1, g_r1.H, 2 * g_r1.I), dtype=FP8),
+        "e2": jnp.zeros((r1, g_r1.L, ew1, g_r1.I, g_r1.H), dtype=FP8),
+        "es": es_r1,
+    }
+    packed_r1 = pack_spec_logical_weights(
+        ms_r1,
+        ex_r1,
+        logical_r1,
+        pre_norm=pre_norm,
+        post_norm=post_norm,
+        final_norm=final_norm,
+    )
+    assert isinstance(packed_r1["es"], tuple) and len(packed_r1["es"]) == g_r1.L
+    for lyr in range(g_r1.L):
+        np.testing.assert_array_equal(packed_r1["es"][lyr], es_r1[:, lyr])
 
     bad_logical = dict(logical)
     bad_logical.pop("sh_gate")

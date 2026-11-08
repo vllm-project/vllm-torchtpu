@@ -15,7 +15,6 @@
 
 from __future__ import annotations
 
-import math
 from collections.abc import Mapping
 from typing import Any
 
@@ -29,6 +28,20 @@ from ..modules.norm import NormModule
 from ..ops import F32
 from ..spec import ModelSpec, SwitchSlot
 from .eplb import resolve_mapping_ecopy
+
+
+def _hbm_tail_ndim(sh: tuple[int, ...], wd: Any) -> int:
+    if len(sh) >= len(wd.lead_dims) + 2 and (
+        sh[-(len(wd.lead_dims) + 2) :] == (*wd.lead_dims, wd.K, wd.N)
+    ):
+        return 2
+    if (
+        wd.K == 1
+        and len(sh) >= len(wd.lead_dims) + 1
+        and sh[-(len(wd.lead_dims) + 1) :] == (*wd.lead_dims, wd.N)
+    ):
+        return 1
+    return 2
 
 
 def switch_branch_for_layer(slot: SwitchSlot, lyr: int) -> tuple[Module, int]:
@@ -183,17 +196,18 @@ def pack_spec_logical_weights(
                     if (merged_tiles and wd.K == 1 and len(wd.lead_dims) >= 1)
                     else (wd.K, wd.N)
                 )
-                per_layer_elems = math.prod(wd.lead_dims) * wd.K * wd.N
                 if wd.layout == "per_layer":
                     if isinstance(raw, (tuple, list)):
                         src = list(raw)
-                    elif math.prod(raw.shape) == n_layers * per_layer_elems:
+                    elif raw.ndim == 1 + len(wd.lead_dims) + _hbm_tail_ndim(
+                        raw.shape, wd
+                    ):
                         src = [raw[i] for i in range(n_layers)]
                     else:
                         src = [raw[:, i] for i in range(n_layers)]
                     per_l = []
                     for x in src:
-                        if math.prod(x.shape) == per_layer_elems:
+                        if x.ndim == len(wd.lead_dims) + _hbm_tail_ndim(x.shape, wd):
                             x = jnp.broadcast_to(x[None, ...], (R, *x.shape))
                         per_l.append(
                             x.reshape((R, *wd.lead_dims, *tail_sh)).astype(wd.dtype)
@@ -201,11 +215,17 @@ def pack_spec_logical_weights(
                     weights_mk[wd.name] = tuple(per_l)
                 else:
                     if isinstance(raw, (tuple, list)):
+                        r0_sh = raw[0].shape
                         raw = jnp.stack(
                             raw,
-                            axis=0 if math.prod(raw[0].shape) == per_layer_elems else 1,
+                            axis=0
+                            if raw[0].ndim
+                            == len(wd.lead_dims) + _hbm_tail_ndim(r0_sh, wd)
+                            else 1,
                         )
-                    if math.prod(raw.shape) == n_layers * per_layer_elems:
+                    if raw.ndim == 1 + len(wd.lead_dims) + _hbm_tail_ndim(
+                        raw.shape, wd
+                    ):
                         raw = jnp.broadcast_to(raw[None, ...], (R, *raw.shape))
                     sh = (R, n_layers, *wd.lead_dims, *tail_sh)
                     weights_mk[wd.name] = raw.reshape(sh).astype(wd.dtype)
