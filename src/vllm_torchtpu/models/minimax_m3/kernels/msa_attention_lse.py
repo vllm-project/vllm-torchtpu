@@ -40,29 +40,70 @@ def _kernel(
     # Scalar prefetch
     work_page_ref,  # tile page key unions (`msa_attention._work_list`)
     work_meta_ref,  # [groups] union row << _ROW_SHIFT | last and first bits
-    page_table_ref,  # page key -> physical page (read by the index maps only)
-    head_ref,  # [1] KV head of the cache rows (read by the index maps only)
+    page_table_ref,  # page key -> physical page
+    head_ref,  # [1] KV head of the cache rows
     tile_offset_ref,  # [1] the call's first tile (read by the index maps only)
     # In
     q_ref,  # [H, Bq, D]
     selected_ref,  # [Bq, K] page keys, -1 padded
     local_page_ref,  # [Bq, 1]
     local_limit_ref,  # [Bq, 1] visible slots of the local page
-    *refs,  # G x [1, S / p, p, 2D] KV pages, [aliased out, lse], out, lse, scratch
+    kv_hbm_ref,  # [pages, S / p, p, G * 2D] the whole cache, in HBM
+    *refs,  # [aliased out, lse], out, lse, m, l, acc, page buffers, semaphores
     sm_scale: float,
     aliased: bool = False,
 ):
     """`msa_attention._kernel_v2` that also writes ``lse = m + log(l)``
     (``-inf`` for a row that sees no slot; its output is 0). The running
-    max ``m`` is kept in log2 units."""
-    pages_per_step = len(refs) - (7 if aliased else 5)
-    kv_refs = refs[:pages_per_step]
-    o_ref, lse_ref, m_ref, l_ref, acc_ref = refs[len(refs) - 5 :]
+    max ``m`` is kept in log2 units.
+
+    Each step copies the next group's pages into the other half of a
+    double buffer itself, only the slots that hold pages: per-slot pipelined
+    page inputs cost every step their index arithmetic and DMA bookkeeping
+    for all slots, ~1 us of scalar work that bound the narrow steps (LLO of
+    the step, j-999b8f92)."""
+    o_ref, lse_ref, m_ref, l_ref, acc_ref, buf_ref, sem_ref = refs[len(refs) - 7 :]
+    pages_per_step = buf_ref.shape[1]
     w = pl.program_id(0)
     meta = work_meta_ref[w]
     num_heads, block_q, head_dim = q_ref.shape
-    rows_per_page, packing = kv_refs[0].shape[1:3]
+    rows_per_page, packing, row_width = buf_ref.shape[3:]
     page_size = rows_per_page * packing
+    half = w % 2
+
+    def page_copy(group, half, g, page):
+        src = kv_hbm_ref.at[
+            pl.ds(page, 1), :, :, pl.ds(head_ref[0] * row_width, row_width)
+        ]
+        return pltpu.make_async_copy(src, buf_ref.at[half, g], sem_ref.at[half, g])
+
+    def group_page(group, g):
+        meta_g = work_meta_ref[group]
+        return work_page_ref[msa_attention._slot(meta_g, pages_per_step, g)]
+
+    def start_group(group, half):
+        for g in range(pages_per_step):
+            page = group_page(group, g)
+
+            @pl.when(page >= 0)
+            def _start():
+                page_copy(group, half, g, page_table_ref[page]).start()
+
+    @pl.when(w == 0)
+    def _first():
+        start_group(0, 0)
+
+    @pl.when(w + 1 < pl.num_programs(0))
+    def _next():
+        start_group(w + 1, 1 - half)
+
+    for g in range(pages_per_step):
+
+        @pl.when(group_page(w, g) >= 0)
+        def _wait():
+            page_copy(w, half, g, 0).wait()
+
+    kv_refs = [buf_ref.at[half, g] for g in range(pages_per_step)]
 
     @pl.when((meta & msa_attention._FIRST_BIT) != 0)
     def _init():
@@ -119,6 +160,8 @@ def _kernel(
         )
         m_ref[...] = m_new
 
+    # Slots past the group's pages hold stale bytes: their limits are 0, so
+    # their scores are masked and their value rows zeroed.
     # Run at the narrowest width holding the group's pages: unions are
     # ascending with -1 at the end, so slot `n` is empty iff at most n pages
     # remain. A step costs per score column, filled or not (~2.3 us at 16
@@ -190,14 +233,6 @@ def _attention_call(
     def head_major_block(*args):
         return (0, *tile_block(*args))
 
-    def page_block(g):
-        def index_map(w, pages, meta, table, head_idx, offset):
-            slot = msa_attention._slot(meta[w], pages_per_step, g)
-            page = table[jnp.maximum(pages[slot], 0)]
-            return (page, 0, 0, head_idx[0])
-
-        return pl.BlockSpec((1, rows_per_page, packing, row_width), index_map)
-
     aliased = out is not None
     in_place = (pl.BlockSpec(memory_space=pl.ANY),) * 2 if aliased else ()
     grid_spec = pltpu.PrefetchScalarGridSpec(
@@ -208,7 +243,7 @@ def _attention_call(
             pl.BlockSpec((block_q, topk), call_tile_block),
             pl.BlockSpec((block_q, 1), tile_block),
             pl.BlockSpec((block_q, 1), tile_block),
-            *(page_block(g) for g in range(pages_per_step)),
+            pl.BlockSpec(memory_space=pl.ANY),
             *in_place,
         ],
         out_specs=[
@@ -219,9 +254,14 @@ def _attention_call(
             pltpu.VMEM((num_heads * block_q, 1), jnp.float32),
             pltpu.VMEM((num_heads * block_q, 1), jnp.float32),
             pltpu.VMEM((num_heads * block_q, head_dim), jnp.float32),
+            pltpu.VMEM(
+                (2, pages_per_step, 1, rows_per_page, packing, row_width),
+                kv_cache.dtype,
+            ),
+            pltpu.SemaphoreType.DMA((2, pages_per_step)),
         ],
     )
-    num_inputs = 5 + 4 + pages_per_step
+    num_inputs = 5 + 5
     return pl.pallas_call(
         functools.partial(_kernel, sm_scale=sm_scale, aliased=aliased),
         grid_spec=grid_spec,
@@ -248,7 +288,7 @@ def _attention_call(
         selected,
         local_page,
         local_limit,
-        *([kv_cache] * pages_per_step),
+        kv_cache,
         *(out if aliased else ()),
     )
 
