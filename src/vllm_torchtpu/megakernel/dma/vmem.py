@@ -59,12 +59,12 @@ def _vmem_storage_bytes(
 ) -> int:
     """Return `(8 * packing, 128)`-tiled VMEM storage bytes for `shape`/`dtype`.
 
-    When `packed=True` (set for `_PACKED_FP8_PAGE_BUFFERS` or specs with
-    `packed=True`), sublane-packed 32-bit word layouts `(..., rows_u32, packing, cols)`
-    (such as paged KV `(..., HD // 4, 4, BLK)` fp8) already pack `packing`
-    elements per 32-bit sublane word along `shape[-3]`, so their physical row
-    extent is `rows_u32 * packing`. Unmarked buffers are never guessed packed
-    from their shape.
+    When `packed=True` (set for `_PACKED_FP8_PAGE_BUFFERS`), sublane-packed
+    32-bit word layouts `(..., rows_u32, packing, cols)` (such as paged KV
+    `(..., HD // 4, 4, BLK)` fp8) already pack `packing` elements per 32-bit
+    sublane word along `shape[-3]`, so their physical row extent is
+    `rows_u32 * packing`. Unmarked buffers are never guessed packed from their
+    shape.
     """
     dt = jnp.dtype(dtype)
     packing = 32 // (dt.itemsize * 8)
@@ -77,6 +77,11 @@ def _vmem_storage_bytes(
     else:
         sh2 = shape
     return pool_alias.storage_size(sh2, dt)
+
+
+def _vmem_buffer_bytes(name: str, shape: tuple[int, ...], dtype: Any) -> int:
+    """Return VMEM storage bytes for named scratch buffer `name`."""
+    return _vmem_storage_bytes(shape, dtype, packed=(name in _PACKED_FP8_PAGE_BUFFERS))
 
 
 @dataclass(frozen=True)
@@ -349,10 +354,7 @@ def build_scratch(
         ms = getattr(v, "memory_space", None)
         if ms == pltpu.MemorySpace.VMEM:
             sh = tuple(v.shape)
-            is_packed = k in _PACKED_FP8_PAGE_BUFFERS or bool(
-                getattr(v, "packed", False)
-            )
-            vmem_bytes += _vmem_storage_bytes(sh, v.dtype, packed=is_packed)
+            vmem_bytes += _vmem_buffer_bytes(k, sh, v.dtype)
             vmem_shapes[k] = (sh, v.dtype)
         elif ms == pltpu.MemorySpace.SMEM:
             sh = tuple(v.shape)
@@ -368,7 +370,7 @@ def build_scratch(
         breakdown = sorted(
             (
                 (
-                    _vmem_storage_bytes(sh, dt, packed=(k in _PACKED_FP8_PAGE_BUFFERS)),
+                    _vmem_buffer_bytes(k, sh, dt),
                     k,
                     sh,
                     dt,
@@ -471,7 +473,7 @@ def _ring_bytes(core_plan: CorePlan) -> tuple[int, int]:
     """Allocated `(dense, expert)` weight-ring VMEM bytes of `core_plan`."""
     dense = expert = 0
     for k, (sh, dt) in core_plan.vmem_shapes.items():
-        nbytes = _vmem_storage_bytes(sh, dt, packed=(k in _PACKED_FP8_PAGE_BUFFERS))
+        nbytes = _vmem_buffer_bytes(k, sh, dt)
         if k == "dpool" or k.startswith("dring_"):
             dense += nbytes
         elif k == "epool" or k.startswith("ering_"):

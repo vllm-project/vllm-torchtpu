@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+from typing import Any
 
 import jax.numpy as jnp
 import pytest
@@ -24,6 +25,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 from tests.megakernel.megakernel_fakes import (
     TINY_TILES,
+    FakeFFNModule,
     FakeGeometry,
     FakeMixerModule,
     make_fake_model_spec,
@@ -53,7 +55,7 @@ def test_vmem_phase_overlay_and_conflict(fake_ex: ExecSpec):
     assert cp.phase_map["branch_tmp"] == "branch:gdn|branch:gqa"
 
     # Overlaying two SMEM phase buffers preserves SMEM memory space
-    smem_scratch: dict[str, object] = {}
+    smem_scratch: dict[str, Any] = {}
     smem_phases: dict[str, str] = {}
     vmem._merge_scratch(
         smem_scratch,
@@ -137,6 +139,72 @@ def test_vmem_phase_overlay_and_conflict(fake_ex: ExecSpec):
     assert vmem._vmem_storage_bytes((2, 64, 4, 128), FP8, packed=True) == 2 * 256 * 128
     with pytest.raises(MegakernelConfigError, match="Unsupported scratch spec"):
         vmem._merge_scratch({}, {}, [ScratchReq("bad", object(), phase="persistent")])
+
+
+def test_packed_buffer_counts_agree_in_vmem_bytes_breakdown_and_ring_bytes(
+    fake_ex: ExecSpec,
+):
+    """`vmem_bytes`, breakdown, and `_ring_bytes` agree on packed buffers."""
+    import types
+
+    class PackedKVModule(FakeMixerModule):
+        name = "packed_kv_gqa"
+
+        def plan_params(self, g: FakeGeometry, ex: ExecSpec, plan):
+            del g, ex, plan
+            return types.SimpleNamespace(KVE=True, BLK=1024)
+
+        def scratch(self, g: FakeGeometry, ex: ExecSpec, plan: Any) -> list[ScratchReq]:
+            del ex, plan
+            return [ScratchReq("kvbuf", pltpu.VMEM((2, 2, g.HD // 4, 4, 1024), FP8))]
+
+    kve_ms = ModelSpec(
+        name="packed_kv_model",
+        config=FakeGeometry(L=2, H=256),
+        layer_type=LayerType(
+            "packed_kv_layer", slots=(PackedKVModule(), FakeFFNModule())
+        ),
+    )
+    kve_tiles = dataclasses.replace(TINY_TILES, nbe=2, vmem_mib=32)
+    ex_kve = dataclasses.replace(fake_ex, interpret=True, tiles=kve_tiles)
+    cp_kve, _ = vmem.build_scratch(kve_ms, ex_kve)
+
+    packed_sh = (2, 2, 32, 4, 1024)
+    assert cp_kve.vmem_shapes["epool"] == (packed_sh, FP8)
+    assert cp_kve.vmem_shapes["kvbuf"] == (packed_sh, FP8)
+
+    packed_sz = 2 * 2 * (32 * 4) * 1024  # 524,288 B = 0.50 MiB
+    unpacked_sz = vmem._vmem_storage_bytes(packed_sh, FP8, packed=False)  # 4,194,304 B
+    assert vmem._vmem_buffer_bytes("epool", packed_sh, FP8) == packed_sz
+    assert vmem._vmem_buffer_bytes("kvbuf", packed_sh, FP8) == packed_sz
+    assert unpacked_sz == 8 * packed_sz
+
+    # 1. `vmem_bytes` uses the packed size for both `epool` and `kvbuf`.
+    other_bytes = sum(
+        vmem._vmem_buffer_bytes(k, sh, dt)
+        for k, (sh, dt) in cp_kve.vmem_shapes.items()
+        if k not in ("epool", "kvbuf")
+    )
+    assert cp_kve.vmem_bytes == other_bytes + 2 * packed_sz
+
+    # 2. `_ring_bytes` uses the same packed size for `epool`.
+    _, expert_bytes = vmem._ring_bytes(cp_kve)
+    ering_bytes = sum(
+        vmem._vmem_buffer_bytes(k, sh, dt)
+        for k, (sh, dt) in cp_kve.vmem_shapes.items()
+        if k.startswith("ering_")
+    )
+    assert expert_bytes - ering_bytes == packed_sz
+
+    # 3. Over-budget breakdown reports 0.50 MiB (not 4.00 MiB unpacked) for both.
+    ex_tight = dataclasses.replace(
+        ex_kve, tiles=dataclasses.replace(kve_tiles, vmem_mib=1)
+    )
+    with pytest.raises(MegakernelConfigError) as exc_info:
+        vmem.build_scratch(kve_ms, ex_tight)
+    msg = str(exc_info.value)
+    assert "epool=0.50MiB (2, 2, 32, 4, 1024) float8_e4m3fn" in msg
+    assert "kvbuf=0.50MiB (2, 2, 32, 4, 1024) float8_e4m3fn" in msg
 
 
 def test_fit_default_tiles_on_fake_model_spec(monkeypatch, caplog):
