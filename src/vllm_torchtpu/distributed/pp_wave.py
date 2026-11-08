@@ -90,8 +90,9 @@ never reads the result.
 A stage that spans more than one chip drains its device and waits for every
 worker of the slice before each hand-off: with a stage program and a hand-off
 running at the same time, a core of the stage stops inside a stage collective
-and the runtime halts the device. A one-chip stage never showed this and
-launches the hand-off without waiting.
+and the runtime halts the device. A context-parallel stage drains too, even
+on one chip: its cores run stage collectives of their own. A one-device stage
+never showed this and launches the hand-off without waiting.
 
 Stage 0 launches its hand-off in end_forward, after its forward. A first
 stage that must drain before each hand-off drains on a helper thread:
@@ -238,8 +239,11 @@ class PPWave:
         self.carried = (HIDDEN_STATES, *extras)
         self.max_rows = int(max_rows)
         self.op = pp_permute_op(get_or_create_pp_mesh(), num_tensors=len(self.carried))
-        # See the module docstring.
-        self.drain_before_handoff = stage_chips() > 1
+        # See the module docstring. A context-parallel stage on one chip has
+        # the same hazard: its two cores run stage collectives (PCP gathers,
+        # the EP MoE exchange) and a hand-off beside them halts the chip's
+        # SparseCore (PP4 x PCP2 prefill, stage 1, j-85b8464a-d0c6-472b-843b).
+        self.drain_before_handoff = stage_chips() > 1 or self.columns > 1
         self.async_handoff = (
             self.rank == 0 and self.size > 1 and self.drain_before_handoff
         )
