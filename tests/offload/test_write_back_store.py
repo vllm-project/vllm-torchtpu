@@ -32,8 +32,9 @@ class _Block(SimpleNamespace):
     pass
 
 
-def _pool(free_order):
-    """A block pool whose free queue hands out ``free_order`` first."""
+def _pool(free_order, hashes=None):
+    """A block pool whose free queue hands out ``free_order`` first. With
+    ``hashes`` (block id -> pool hash) it also exposes ``blocks``."""
     head, tail = _Block(block_id=-1), _Block(block_id=-1)
     prev = head
     for bid in free_order:
@@ -43,7 +44,10 @@ def _pool(free_order):
     prev.next_free_block = tail
     tail.next_free_block = None
     queue = SimpleNamespace(fake_free_list_head=head, fake_free_list_tail=tail)
-    return SimpleNamespace(free_block_queue=queue)
+    if hashes is None:
+        return SimpleNamespace(free_block_queue=queue)
+    blocks = [_Block(block_id=i, block_hash=hashes.get(i)) for i in range(32)]
+    return SimpleNamespace(free_block_queue=queue, blocks=blocks)
 
 
 def _output(finished=(), new_blocks=None):
@@ -94,6 +98,8 @@ class TestWriteBackScheduling(unittest.TestCase):
 
         sched._wb_owners = {}
         sched._wb_blocks = OrderedDict()
+        sched._wb_hash = {}
+        sched._wb_hits = set()
         sched.wb_counters = Counter()
         self.helper = helper
         return sched
@@ -187,6 +193,126 @@ class TestWriteBackScheduling(unittest.TestCase):
         self.assertEqual(len(first), 1)
         self.assertEqual(first | second, {"a", "bb"})
         self.assertEqual(sched._wb_owners, {})
+
+
+class TestWriteBackPrefixHits(unittest.TestCase):
+    """A held block that a new request takes as a prefix-cache hit keeps its
+    bytes; only a block handed out with other content drops its holders."""
+
+    TPC = TestWriteBackScheduling.TPC
+    _sched = TestWriteBackScheduling._sched
+    _finished = TestWriteBackScheduling._finished
+
+    H = {5: b"h5", 6: b"h6", 1: b"h1"}
+
+    def _held(self, sched, free_order=(1, 2, 3)):
+        keys = self._finished(sched, "a", [5, 6])
+        sched.attach_block_pool(_pool(list(free_order), self.H))
+        out = sched._write_back_output(_output(finished={"a"}))
+        self.assertEqual(out.finished_req_ids, set())
+        self.assertEqual(sched._wb_hash, {5: b"h5", 6: b"h6"})
+        return keys
+
+    def test_prefix_hit_keeps_the_hold_and_stores_later(self):
+        sched = self._sched()
+        keys = self._held(sched)
+        # The next turn hits blocks 5 and 6: same hashes, bytes intact.
+        out = sched._write_back_output(_output(new_blocks=[5, 6, 9]))
+        self.assertEqual(out.finished_req_ids, set())
+        self.assertIn("a", sched._wb_blocks)
+        self.assertEqual(sched._wb_hits, {5, 6})
+        self.assertEqual(sched.wb_counters["dropped_requests"], 0)
+        self.assertEqual(sched.wb_counters["hit_blocks"], 2)
+        # Later its blocks near eviction: stored from the same blocks.
+        sched.attach_block_pool(_pool([6, 5], self.H))
+        out = sched._write_back_output(_output())
+        self.assertEqual(out.finished_req_ids, {"a"})
+        (job,) = sched._build_store_jobs(out).values()
+        self.assertEqual(job.dst_spec.keys, keys)
+        self.assertEqual(job.src_spec.block_ids.tolist(), [5, 6])
+
+    def test_overwritten_block_still_drops_the_request(self):
+        """Stale-KV guard: the pool handed block 6 out with other content."""
+        sched = self._sched()
+        self._held(sched)
+        sched.attach_block_pool(_pool([1, 2], {5: b"h5", 6: b"other"}))
+        out = sched._write_back_output(_output(new_blocks=[6]))
+        self.assertEqual(out.finished_req_ids, set())
+        self.assertNotIn("a", sched._req_status)
+        self.assertEqual(sched._wb_owners, {})
+        self.assertEqual(sched.wb_counters["dropped_requests"], 1)
+        self.assertNotIn(6, sched._wb_hash)
+
+    def test_evicted_block_has_no_hash_and_drops(self):
+        sched = self._sched()
+        self._held(sched)
+        sched.attach_block_pool(_pool([1, 2], {5: b"h5"}))  # 6 evicted
+        sched._write_back_output(_output(new_blocks=[6]))
+        self.assertNotIn("a", sched._req_status)
+
+    def test_hit_then_eviction_drops(self):
+        sched = self._sched()
+        self._held(sched)
+        sched._write_back_output(_output(new_blocks=[5]))  # hit: kept
+        self.assertIn("a", sched._wb_blocks)
+        sched.attach_block_pool(_pool([1, 2], {6: b"h6"}))
+        sched._write_back_output(_output(new_blocks=[5]))  # now overwritten
+        self.assertNotIn("a", sched._req_status)
+
+    def test_block_given_to_an_async_load_drops(self):
+        """Load destinations are allocated during scheduling for a request
+        that is not scheduled yet; only the base's set has them."""
+        sched = self._sched()
+        self._held(sched)
+        sched.attach_block_pool(_pool([1, 2], {5: b"h5", 6: b"loaded"}))
+        sched._current_batch_allocated_block_ids = {6}
+        sched._write_back_output(_output())
+        self.assertNotIn("a", sched._req_status)
+        self.assertEqual(sched.wb_counters["dropped_requests"], 1)
+
+    def test_same_step_reuse_without_a_snapshot_drops(self):
+        """The 68111dee9a case: the pool already shows the new owner's hash
+        for a block reused in the finishing step, so it cannot be trusted."""
+        sched = self._sched()
+        self._finished(sched, "a", [5, 6])
+        sched.attach_block_pool(_pool([5, 6], self.H))
+        out = sched._write_back_output(_output(finished={"a"}, new_blocks=[5]))
+        self.assertEqual(out.finished_req_ids, set())
+        self.assertNotIn("a", sched._req_status)
+        self.assertEqual(sched._wb_owners, {})
+
+    def test_pool_without_blocks_keeps_the_conservative_drop(self):
+        sched = self._sched()
+        self._finished(sched, "a", [5, 6])
+        sched.attach_block_pool(_pool([1, 2]))
+        sched._write_back_output(_output(finished={"a"}))
+        sched._write_back_output(_output(new_blocks=[5]))
+        self.assertNotIn("a", sched._req_status)
+
+    def test_hits_are_not_reallocations_for_store_job_flushes(self):
+        """A store job whose source block gets a prefix hit is neither
+        cancelled nor drained; an overwrite still flushes it."""
+        from vllm.v1.core.sched.output import SchedulerOutput
+
+        sched = self._sched()
+        self._held(sched)
+        sched._write_back_output(_output(new_blocks=[5, 9]))
+        sched._current_batch_allocated_block_ids = {5, 9}
+        sched._update_req_states(SchedulerOutput.make_empty())
+        self.assertEqual(sched._current_batch_allocated_block_ids, {9})
+        sched.attach_block_pool(_pool([1], {6: b"h6"}))
+        sched._write_back_output(_output(new_blocks=[5]))
+        sched._current_batch_allocated_block_ids = {5}
+        sched._update_req_states(SchedulerOutput.make_empty())
+        self.assertEqual(sched._current_batch_allocated_block_ids, {5})
+
+    def test_snapshots_of_unwatched_blocks_are_collected(self):
+        sched = self._sched()
+        sched._block_id_to_pending_jobs = {}
+        sched._wb_hash = {bid: b"x" for bid in range(2000)}
+        sched._wb_owners = {7: {"a"}}
+        sched._wb_gc_hashes()
+        self.assertEqual(sched._wb_hash, {7: b"x"})
 
 
 class TestEvictionAwareConnector(unittest.TestCase):
