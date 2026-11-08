@@ -28,6 +28,12 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.models.minimax_m3.kernels import msa_attention, msa_fp4
 
+# Page counts below pages_per_step a grid step may compute over instead of all
+# its slots. A group's pages are a sorted prefix with -1 after it, so a step
+# runs the smallest count covering that prefix; the slots it skips would only
+# add fully masked columns (p = 0) to the step's sums.
+COMPUTE_PAGES = (4, 8)
+
 
 def _kernel(
     # Scalar prefetch
@@ -51,7 +57,13 @@ def _kernel(
     With `slots_per_tile` the grid is ``(tile, group)`` and the work list is
     each tile's padded page union (`_work_tiles`): ``work_page_ref`` holds
     `slots_per_tile` pages per tile and ``work_meta_ref`` each tile's group
-    count; steps past a tile's last group do nothing."""
+    count; steps past a tile's last group do nothing.
+
+    A step computes over only the first `COMPUTE_PAGES` (or all) of its slots
+    that cover the group's valid pages, so every work list must hold each
+    group's pages as a prefix with -1 after it (`_work_tiles` and
+    `msa_attention._work_list` cut groups from a sorted union): a page after
+    a -1 may be skipped."""
     pages_per_step = len(refs) - 5
     kv_refs = refs[:pages_per_step]
     o_ref, lse_ref, m_ref, l_ref, acc_ref = refs[pages_per_step:]
@@ -84,7 +96,7 @@ def _kernel(
         l_ref[...] = jnp.zeros_like(l_ref)
         acc_ref[...] = jnp.zeros_like(acc_ref)
 
-    def _step():
+    def _step(num_pages):
         row_slots = (
             jax.lax.broadcasted_iota(jnp.int32, (page_size, 1), 0)  # int4: slot order
             if fp4
@@ -95,7 +107,7 @@ def _kernel(
         local_page = local_page_ref[...]
         local_limit = local_limit_ref[...]
         keys, values, masks, k_scales, v_scales = [], [], [], [], []
-        for g, kv_ref in enumerate(kv_refs):
+        for g, kv_ref in enumerate(kv_refs[:num_pages]):
             page = work_page_ref[base + g]
             is_selected = jnp.max(
                 (selected == page).astype(jnp.int32), axis=1, keepdims=True
@@ -143,10 +155,27 @@ def _kernel(
         )
         m_ref[...] = m_new
 
+    def _sized_step():
+        sizes = [n for n in COMPUTE_PAGES if n < pages_per_step]
+
+        def run(i):
+            if i == len(sizes):
+                _step(pages_per_step)
+                return
+            n = sizes[i]
+            # Slot n is empty: the group's pages fit in its first n slots.
+            jax.lax.cond(
+                work_page_ref[base + n] < 0,
+                functools.partial(_step, n),
+                functools.partial(run, i + 1),
+            )
+
+        run(0)
+
     if active is None:
-        _step()
+        _sized_step()
     else:
-        pl.when(active)(_step)
+        pl.when(active)(_sized_step)
 
     @pl.when((meta & msa_attention._LAST_BIT) != 0)
     def _finalize():

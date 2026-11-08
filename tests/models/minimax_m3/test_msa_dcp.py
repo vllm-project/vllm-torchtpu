@@ -28,6 +28,7 @@ from vllm_torchtpu.models.minimax_m3.kernels import (
     msa_attention,
     msa_attention_lse,
     msa_dcp,
+    msa_fp4,
     msa_select,
     msa_write,
 )
@@ -256,6 +257,50 @@ def test_attention_lse_matches_kernel_v2():
         m = s.max(-1)
         dense = m + np.log(np.exp(s - m[:, None]).sum(-1))
         np.testing.assert_allclose(np.asarray(lse[t]), dense, rtol=1e-5, atol=1e-4)
+
+
+@pytest.mark.parametrize("dtype", [*CACHE_DTYPES, jnp.uint8])
+@pytest.mark.parametrize("tiles", [False, True])
+def test_attention_lse_compute_pages_match_all_slots(monkeypatch, tiles, dtype):
+    """Steps that compute over only the slots covering their pages
+    (`COMPUTE_PAGES`) give the same bits as computing over every slot, for
+    tiles whose unions fill each step size and spill into a second group.
+    uint8 is a 4-bit cache with its K / V scales folded into the pages."""
+    rng = np.random.default_rng(5)
+    block_q = msa_attention.DEFAULT_BLOCK_Q
+    page_union = (3, 7, 12, 40, 1, 16)  # pages each tile selects from
+    num_tokens, pages, topk = block_q * len(page_union), 48, 8
+    assert num_tokens > msa_attention_lse.DECODE_TOKENS  # the tiled kernel
+    q = jnp.asarray(rng.standard_normal((num_tokens, HEADS, HEAD_DIM)))
+    q = q.astype(jnp.bfloat16)
+    if dtype == jnp.uint8:
+        nibbles = rng.integers(0, 16, (pages, PAGE, 2 * HEAD_DIM))
+        scales = rng.uniform(0.01, 0.1, (pages, 2 * PAGE))
+        kv = msa_fp4.pack_rows(jnp.asarray(nibbles), scales=jnp.asarray(scales))
+    else:
+        rows = rounded(rng.standard_normal((pages, PAGE, 2 * HEAD_DIM)), dtype)
+        kv = pack(rows, dtype)
+    pools = [rng.choice(pages, n, replace=False) for n in page_union]
+    selected = np.full((num_tokens, topk), -1, np.int32)
+    for t in range(num_tokens):
+        pool = pools[t // block_q]
+        count = rng.integers(0, min(topk, len(pool)) + 1)
+        selected[t, :count] = rng.choice(pool, count, replace=False)
+    local_page = jnp.asarray(np.where(selected[:, 0] >= 0, selected[:, 0], -1))
+    local_limit = jnp.asarray(rng.integers(1, PAGE + 1, num_tokens), jnp.int32)
+    table = jnp.arange(pages, dtype=jnp.int32)
+    args = (jnp.asarray(selected), local_page, local_limit, table)
+    call = functools.partial(
+        msa_attention_lse.msa_sparse_attention_lse.__wrapped__,
+        sm_scale=SCALE,
+        tiles=tiles,
+        interpret=True,
+    )
+    sized = call(q, kv, *args)
+    monkeypatch.setattr(msa_attention_lse, "COMPUTE_PAGES", ())
+    full = call(q, kv, *args)
+    for got, expected in zip(sized, full):
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(expected))
 
 
 def test_merge_candidates_breaks_ties_to_lower_block():
