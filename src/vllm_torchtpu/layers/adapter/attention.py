@@ -66,7 +66,7 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
     pcp_streaming_jax_op,
 )
 from vllm_torchtpu.kernels.mla import kv_cache_utils
-from vllm_torchtpu.kernels.mla.absorb_q import absorb_q
+from vllm_torchtpu.kernels.mla.absorb_q import absorb_q, absorb_q_full
 from vllm_torchtpu.kernels.mla.kv_cache_utils import (
     KVCacheLayout,
     KVCacheType,
@@ -115,6 +115,15 @@ def _fake_absorb_q(q_nope: torch.Tensor, w_uk_t: torch.Tensor) -> torch.Tensor:
 # Registered at import: Dynamo cannot trace a lock-guarded registration.
 _absorb_q = pallas.jax_op("pallas::mla_absorb_q", absorb_q)
 _absorb_q.register_fake(_fake_absorb_q)
+
+
+def _fake_absorb_q_full(q: torch.Tensor, w_uk_t: torch.Tensor) -> torch.Tensor:
+    return q.new_empty((q.shape[0], w_uk_t.shape[0], w_uk_t.shape[2]))
+
+
+# TPU_MLA_ABSORB_FULL_Q: absorb_q on the q_b output [T, H * qk_head_dim].
+_absorb_q_full = pallas.jax_op("pallas::mla_absorb_q_full", absorb_q_full)
+_absorb_q_full.register_fake(_fake_absorb_q_full)
 
 
 def _uv_before_merge_applies(num_tokens: int, is_backbone: bool) -> bool:
@@ -2886,7 +2895,16 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         # Evaluate projection matrices directly across input precision
         # (`bfloat16`/`float16`/`fp8`) without dynamic `.to(torch.float32)` casting
         # right before `torch.bmm`.
-        if q_nope.device.type == "tpu" and w_uk_t_scale is None:
+        use_kernel = q_nope.device.type == "tpu" and w_uk_t_scale is None
+        # TPU_MLA_ABSORB_FULL_Q hands the whole q, [T, H * head_dim], each
+        # head's nope channels first; only the kernel reads it that way.
+        if q_nope.dim() == 2 and not use_kernel:
+            q_nope = q_nope.view(q_nope.shape[0], attn_heads, -1)
+            q_nope = q_nope[..., : w_uk_t_src.shape[1]]
+        if q_nope.dim() == 2:
+            ql_nope = _absorb_q_full(q_nope, w_uk_t_src.to(q_nope.dtype))
+            ql_nope = ql_nope.to(input_dtype)
+        elif use_kernel:
             ql_nope = _absorb_q(q_nope, w_uk_t_src.to(q_nope.dtype)).to(input_dtype)
         else:
             q_nope_t = q_nope.transpose(0, 1)

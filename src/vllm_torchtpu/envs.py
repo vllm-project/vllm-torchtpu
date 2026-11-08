@@ -204,6 +204,7 @@ if TYPE_CHECKING:
     TPU_SPARSE_MLA_ROPE_LAYOUT: str = "sparsecore"
     TPU_MLA_TC_KV_WRITER: bool = False
     TPU_MLA_DECODE_PROLOGUE: bool = False
+    TPU_MLA_ABSORB_FULL_Q: bool = False
     TPU_MLA_KV_WRITE_IN_GATHER: bool = False
     TPU_INDEXER_QB_OVERLAP: bool = False
     TPU_SPARSE_MLA_PACKED_ROPE: bool = False
@@ -920,6 +921,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # XLA-initialised aliased lse). Needs TPU_MLA_SPARSE_SPLIT_Q and
     # TPU_MLA_ROPE_NEOX_PERMUTE.
     "TPU_MLA_DECODE_PROLOGUE": env_bool("TPU_MLA_DECODE_PROLOGUE", default=False),
+    # DCP sparse MLA with query replication, buckets the Pallas absorb_q takes
+    # (T >= absorb_q.MIN_TOKENS): absorb_q reads the q_b output [T, H * 256]
+    # as written, so XLA no longer relayouts all of q to [T, H, 256] ahead of
+    # it. q_pe is then roped by `rope_half_split` (TPU_MLA_DECODE_PROLOGUE's
+    # raw q head would need that relayout again); decode buckets unchanged.
+    "TPU_MLA_ABSORB_FULL_Q": env_bool("TPU_MLA_ABSORB_FULL_Q", default=False),
     # DCP sparse MLA, fused-prep decode buckets (TPU_DCP_MLA_FUSED_PREP): the
     # SparseCore gather feeding the attention kernel writes the step's KV rows
     # into both caches itself (then fences), instead of a separate cache

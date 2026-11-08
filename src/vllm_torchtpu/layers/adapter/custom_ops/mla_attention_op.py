@@ -22,6 +22,7 @@ import jax.numpy as jnp
 import torch
 from torch.nn import Parameter
 from torch_tpu._internal import pallas
+from vllm.compilation import backends as vllm_compilation_backends
 from vllm.config import CacheConfig, get_current_vllm_config_or_none
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention import mla_attention
@@ -70,6 +71,7 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.config import (
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
     pcp_streaming_jax_op,
 )
+from vllm_torchtpu.kernels.mla.absorb_q import MIN_TOKENS as ABSORB_Q_MIN_TOKENS
 from vllm_torchtpu.kernels.mla.kv_cache_utils import OOB_PAGE, _row_positions
 from vllm_torchtpu.kernels.quantized_matmul import fp8_skinny
 from vllm_torchtpu.layers.adapter import small_all_reduce_op
@@ -2201,6 +2203,22 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
 
         # `dcp_group_size` is 1 unless query replication is on, in which case
         # the projection already returned the whole DCP group's heads.
+        # TPU_MLA_ABSORB_FULL_Q: the replicated sparse path's absorb_q reads q
+        # as q_b wrote it, [T, H * qk_head_dim]; viewing it [T, H, qk_head_dim]
+        # for the kernel is a relayout of all of q. Fixed at trace time on the
+        # bucket size: decode buckets keep XLA's einsum and the prologue. The
+        # backbone only: it is traced per bucket, so the comparison is static;
+        # the MTP drafter has one graph for every bucket and never compares.
+        absorb_full_q = (
+            envs.TPU_MLA_ABSORB_FULL_Q
+            and self.dcp_q_replicate
+            and self.is_sparse
+            and llama_4_scaling is None
+            and self.qk_head_dim % 128 == 0
+            and vllm_compilation_backends.model_tag == "backbone"
+            and q.shape[0] > envs.bucket_gate_edge(ABSORB_Q_MIN_TOKENS)
+        )
+        q_flat = q.reshape(q.shape[0], -1) if absorb_full_q else None
         q = q.view(-1, self.num_heads * self.dcp_group_size, self.qk_head_dim)
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
@@ -2208,10 +2226,13 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         k_pe = k_pe.unsqueeze(1)
 
         q_rope_table = None
+        # Not with TPU_MLA_ABSORB_FULL_Q: the prologue kernel reads the raw q
+        # head [T, H, qk_head_dim], which would bring the relayout back.
         fold_q_rope = (
             getattr(self, "decode_prologue", False)
             and getattr(self, "_rope_neox_permuted", False)
             and llama_4_scaling is None
+            and not absorb_full_q
         )
         if fold_q_rope:
             # k_pe exactly as below (the unused q half is dead code to XLA);
@@ -2262,7 +2283,8 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                 # The raw q head view (q_pe un-roped) + the rope table.
                 q_dcp_replicated = (q_nope, q, q_rope_table)
             elif self.is_sparse:
-                q_dcp_replicated = (q_nope, q_pe)
+                # A 2-D first element is the whole q (TPU_MLA_ABSORB_FULL_Q).
+                q_dcp_replicated = (q_flat if absorb_full_q else q_nope, q_pe)
             q_proj_layer = cast(DCPGroupColumnParallelLinear, self._q_proj_layer())
             if q_dcp_replicated is not None and topk_indices is not None:
                 # The sparse DCP path reads only q_dcp_replicated, so this
