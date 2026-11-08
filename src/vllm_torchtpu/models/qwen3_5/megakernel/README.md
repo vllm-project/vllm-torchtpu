@@ -14,7 +14,7 @@ to copy for a new model.
 | `hf_oracle.py` | the Hugging Face `transformers` reference used by verification |
 | `profiles/` | `qwen35-baseline` (`baseline.py`), `qwen35-candidate30[-fused]` (`candidate30.py`); `PROFILES`, `DEFAULT_PROFILE` |
 | `tests/` | the CPU end-to-end test (fake runner, no TPU) |
-| `serving/` | `serve.sh`, `run_real_ckpt_smoke.py`, `mk-real-ckpt-smoke.yml`, `acceptance_benchmark.py`, `BENCH.md` |
+| `serving/` | `serve.sh`, `run_real_ckpt_smoke.py`, `acceptance_benchmark.py`, `BENCH.md` |
 
 Importing the folder registers nothing; `model.register()` adds `Qwen35` and
 its profiles to the library registries for by-name lookups, and `create`
@@ -122,29 +122,12 @@ in the step mix, no decline). It serves the checkout it runs from (its `src/`
 first on `PYTHONPATH`), fails up front if the image's installed
 `vllm_torchtpu` would shadow it, and writes nothing outside `/tmp`.
 
-On the cloud-devkit cluster, the recipe `nanwei-mk-real-ckpt-smoke` runs it on
-a v7x 2x2x1 host with the shared checkpoint cache: it runs
-`cd /root/cloud-devkit/vllm-torchtpu && python3 -u ${TEST_PATH}`, where that
-directory is an NFS export of a checkout of this repository and `TEST_PATH` is
-any repo-relative path whose basename matches `run_real_ckpt_smoke*.py`:
-
-```bash
-# Stage a checkout on the shared NFS (example).
-git -C /mnt/nfs_test/agentx-cache/<you>_mk_smoke checkout <sha>
-cdk job create nanwei-mk-real-ckpt-smoke \
-  NFS_SRC_PATH=/share/agentx-cache/<you>_mk_smoke \
-  TEST_PATH=src/vllm_torchtpu/models/qwen3_5/megakernel/serving/run_real_ckpt_smoke.py \
-  -t mk-smoke
-cdk job log <job-id>
-```
-
-The recipe name comes from the cloud-devkit change under review;
-`serving/mk-real-ckpt-smoke.yml` is the same JobSet, for a cloud-devkit
-checkout that registers it locally. Optional recipe variables: `IMAGE`, `CPU`,
-`MEMORY`, `DSHM_SIZE`, `NFS_SERVER_IP`.
-
-`MK_SMOKE_MODE=decode|mtp|both`, `MK_SMOKE_CKPT`, and `MK_SMOKE_MEGAKERNEL`
-(e.g. `profile=qwen35-baseline`) adjust a run.
+Run it on a v7x host (2x2x1, TP=8) that has the checkpoint in its Hugging
+Face cache. `--mode decode|mtp|both` (default `both`), `--ckpt <dir>`,
+`--megakernel <settings>` (e.g. `profile=qwen35-baseline`) and `--port`
+adjust a run; it prints a JSON summary between
+`=== MK_REAL_CKPT_SMOKE_SUMMARY_BEGIN/END ===` and exits non-zero on a
+failure.
 
 ### 5. Benchmark
 

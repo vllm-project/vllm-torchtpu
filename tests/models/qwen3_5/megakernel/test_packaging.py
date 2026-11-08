@@ -13,8 +13,8 @@
 # limitations under the License.
 """The model folder's non-Python files ship in the wheel: setuptools includes
 every git-tracked file under a package (`include-package-data`, with
-setuptools_scm's file finder), so the README, the serving scripts and the
-recipe go with the code."""
+setuptools_scm's file finder), so the README and the serving scripts go with
+the code."""
 
 from __future__ import annotations
 
@@ -33,7 +33,6 @@ _DATA = (
     "README.md",
     "serving/serve.sh",
     "serving/run_real_ckpt_smoke.py",
-    "serving/mk-real-ckpt-smoke.yml",
     "serving/acceptance_benchmark.py",
     "serving/BENCH.md",
 )
