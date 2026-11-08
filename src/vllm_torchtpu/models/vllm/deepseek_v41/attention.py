@@ -101,6 +101,7 @@ from vllm_torchtpu.utils import synchronize_tensors
 BATCH_AXIS = _dsv4_attn_op.BATCH_AXIS
 _FLASHMLA_TP8: bool = bool(envs.VLLM_DSV41_FLASHMLA_TP8)
 _CSA_UNION: bool = bool(envs.VLLM_DSV41_CSA_UNION)
+_CSA_FUSED_MAX_TOKENS: int = int(envs.VLLM_DSV41_CSA_FUSED_MAX_TOKENS)
 _CSA_UNION_M: int = int(envs.VLLM_DSV41_CSA_UNION_M)
 _CSA_UNION_BQ: int = int(envs.VLLM_DSV41_CSA_UNION_BQ)
 _TPU_ROPE_CACHE_TRUNCATE: bool = bool(envs.TPU_ROPE_CACHE_TRUNCATE)
@@ -2412,10 +2413,10 @@ class VllmDeepseekV41MLAAttention(
                 tp_rank = get_tensor_model_parallel_rank()
                 positions_local = tp_shard_slice(positions, tp_size, tp_rank, rank_idx)
             use_csa_fused = (
-                hasattr(self, "_fused_csa_w_decode") and hidden_states.shape[0] <= 384
+                hasattr(self, "_fused_csa_w_decode") and hidden_states.shape[0] <= _CSA_FUSED_MAX_TOKENS
             )
             if use_csa_fused:
-                use_dec_align = hidden_states.shape[0] <= 384
+                use_dec_align = hidden_states.shape[0] <= _CSA_FUSED_MAX_TOKENS
                 w_in = (
                     self._fused_csa_w_decode
                     if use_dec_align
@@ -2627,11 +2628,11 @@ class VllmDeepseekV41MLAAttention(
                 hidden_states_scale = None
             use_csa_fused = (
                 hasattr(self, "_fused_csa_w_decode")
-                and hidden_states.shape[0] <= 384
+                and hidden_states.shape[0] <= _CSA_FUSED_MAX_TOKENS
                 and not input_is_token_sharded
             )
             if use_csa_fused:
-                use_dec_align = hidden_states.shape[0] <= 384
+                use_dec_align = hidden_states.shape[0] <= _CSA_FUSED_MAX_TOKENS
                 w_in = (
                     self._fused_csa_w_decode
                     if use_dec_align

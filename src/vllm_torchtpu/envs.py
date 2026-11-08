@@ -173,6 +173,7 @@ if TYPE_CHECKING:
     VLLM_DSV41_SC_UNION_MAX_BLK_SHIFT: int | None = None
     VLLM_DSV41_CSA_UNION_VERIFY_BQ: int = 0
     VLLM_DSV41_CSA_UNION_MAX_TOKENS: int = 16384
+    VLLM_DSV41_CSA_FUSED_MAX_TOKENS: int = 384
     VLLM_DSV41_FAST_GROUPED_ATTN: bool = True
     VLLM_DSV41_MOE_V2_MAX_PREFETCH: int = 2
     VLLM_DSV41_MOE_V2_VMEM_MB: float | None = None
@@ -983,6 +984,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DSV41_CSA_UNION_MAX_TOKENS": env_int(
         "VLLM_DSV41_CSA_UNION_MAX_TOKENS", 16384
     ),
+    # Largest token bucket that projects through the fused CSA (w_qkv_a ‖ w_p)
+    # decode weights. Buckets above it fall back to the plain w_qkv_a weights,
+    # which changes the backbone graph's placeholder set; the shape-variants
+    # warmup cannot hand buckets across such a boundary, so a decode role with
+    # max-num-batched-tokens above 384 must raise this to (at least) that value.
+    "VLLM_DSV41_CSA_FUSED_MAX_TOKENS": env_int("VLLM_DSV41_CSA_FUSED_MAX_TOKENS", 384),
     "VLLM_DSV41_FAST_GROUPED_ATTN": env_bool("VLLM_DSV41_FAST_GROUPED_ATTN", True),
     "VLLM_DSV41_MOE_V2_MAX_PREFETCH": env_int("VLLM_DSV41_MOE_V2_MAX_PREFETCH", 2),
     "VLLM_DSV41_MOE_V2_VMEM_MB": lambda: (
