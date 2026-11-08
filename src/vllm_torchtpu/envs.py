@@ -1036,6 +1036,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DCP_MLA_MIXED_FUSED_PREP": env_bool(
         "TPU_DCP_MLA_MIXED_FUSED_PREP", default=False
     ),
+    # With TPU_DCP_MLA_MIXED_FUSED_PREP and TPU_DCP_MLA_MIXED_BODY: deduplicate
+    # each 16-token group's physical KV indices on SparseCore into a single
+    # union atom block and attend the group with a 16-token batched MXU QK + PV
+    # body ("union" lever).
+    "TPU_DCP_MLA_MIXED_UNION_DEDUP": env_bool(
+        "TPU_DCP_MLA_MIXED_UNION_DEDUP", default=True
+    ),
     # QK pair-blocked pooled GDN conv layout: full-width states interleave
     # Q and K row-pairs per tap so a TP-rank shard's first conv token maps
     # to one whole destination pool token (2 contiguous transfer spans per

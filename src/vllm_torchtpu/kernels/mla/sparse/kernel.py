@@ -22,12 +22,14 @@ import numpy as np
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
+from jax.experimental.pallas import tpu_sc as plsc
 
 from vllm_torchtpu.kernels.experimental.small_collectives import (
     all_to_all as small_all_to_all,
 )
 from vllm_torchtpu.kernels.mla import kv_cache_utils
 from vllm_torchtpu.kernels.mla.sparse import dsa_gather, native_sc_gather
+from vllm_torchtpu.kernels.sparse_core import core_map_helper
 
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 TENSORCORE_CACHE_LAYOUT = "tensorcore"
@@ -804,6 +806,7 @@ def _capped_window_live_fused_kernel(
     num_chunks: int,
     fault: str | None,
     window_cache: bool = False,
+    union_dedup: bool = False,
 ):
     """kv_lens + `live_group_table` + `prepare_capped_window_live`, one chunk
     per grid step, reading the top-k in its 128-lane row form.
@@ -848,10 +851,10 @@ def _capped_window_live_fused_kernel(
     token_end = token_end_ref[0]
     meta_rows = native_sc_gather.WINDOW_META_ROWS
 
-    def region_copy(chunk_out, w, slot_, sem):
+    def region_copy(chunk_out, w, slot_, sem, dst_off=0):
         return pltpu.make_async_copy(
             stage_ref.at[slot_, pl.ds(w * region_rows, region_rows)],
-            chunk_out.at[pl.ds(w * region_rows, region_rows)],
+            chunk_out.at[pl.ds(dst_off + w * region_rows, region_rows)],
             sems.at[sem],
         )
 
@@ -1012,11 +1015,16 @@ def _capped_window_live_fused_kernel(
                 ] = translate(w, jj)
 
     # 4. This chunk's own output: start its live windows' DMAs.
+    w0_dst_off = (
+        jnp.where(chunk_windows == 1, jnp.int32(gpc * tile_rows), jnp.int32(0))
+        if union_dedup
+        else 0
+    )
     for cc in range(num_chunks):
 
         @pl.when(c == cc)
         def _flush(*, cc=cc):
-            region_copy(outs[cc], 0, slot, slot * num_windows).start()
+            region_copy(outs[cc], 0, slot, slot * num_windows, w0_dst_off).start()
             if window_cache:
                 meta_copy(outs[cc], slot).start()
             for w in range(1, num_windows):
@@ -1032,6 +1040,422 @@ def _capped_window_live_fused_kernel(
             wait_chunk(c - 1, 1 - slot)
 
 
+def _sc_dedup_chunk_kernel(
+    meta_in_hbm: Any,
+    outs_hbm: Any,
+    umask_hbm: Any,
+    dedup_hbm: Any,
+    meta_in_vmem: Any,
+    meta_out_vmem: Any,
+    in_vmem: Any,
+    bitmask_vmem: Any,
+    u_flat_vmem: Any,
+    umask_flat_vmem: Any,
+    sem_ref: Any,
+    *,
+    core_axis_name: str,
+    subcore_axis_name: str,
+    num_owners: int,
+    gpc: int,
+    atoms_per_tok: int,
+    total_kv_slots: int,
+    scatter_mask: int,
+):
+    owner = lax.axis_index((core_axis_name, subcore_axis_name))
+    waves = cdiv(gpc, num_owners)
+    iota_16 = jnp.arange(16, dtype=jnp.int32)
+    zero_vec = jnp.zeros((16,), jnp.int32)
+    one_vec = jnp.ones((16,), jnp.int32)
+    neg_one_vec = jnp.full((16,), -1, jnp.int32)
+
+    for w in range(waves):
+        tb = jnp.int32(w * num_owners) + owner
+
+        @pl.when(tb < gpc)
+        def _run_group(tb=tb):
+            cp_meta = pltpu.make_async_copy(
+                meta_in_hbm.at[pl.ds(pl.multiple_of(tb * 320, 16), 320)],
+                meta_in_vmem,
+                sem_ref.at[0],
+            )
+            cp_meta.start()
+            cp_meta.wait()
+
+            a_live = meta_in_vmem[pl.ds(0, 16)][0]
+            orig_off = meta_in_vmem[pl.ds(16, 16)][0]
+            can_dedup = meta_in_vmem[pl.ds(32, 16)][0]
+            raw_off = meta_in_vmem[pl.ds(48, 16)][0]
+            meta_out_vmem[pl.ds(32, 16)] = zero_vec
+            meta_out_vmem[pl.ds(48, 16)] = zero_vec
+
+            @pl.when(can_dedup != 0)
+            def _do_dedup():
+                cp_in = pltpu.make_async_copy(
+                    outs_hbm.at[
+                        pl.ds(
+                            pl.multiple_of(raw_off * 1024, 16),
+                            pl.multiple_of(a_live * 1024, 16),
+                        )
+                    ],
+                    in_vmem.at[pl.ds(0, pl.multiple_of(a_live * 1024, 16))],
+                    sem_ref.at[0],
+                )
+                cp_in.start()
+                cp_in.wait()
+
+                # Pre-clear bitmask_vmem at all physical slots touched by this group.
+                bitmask_vmem[pl.ds(0, 16)] = zero_vec
+
+                def pre_clear_tok(b, _):
+                    kv_b_vec = meta_in_vmem[
+                        pl.ds(pl.multiple_of((4 + b) * 16, 16), 16)
+                    ]
+                    b_vecs = lax.shift_right_logical(kv_b_vec[0] + 15, 4)
+
+                    def pre_clear_b(v, _):
+                        vec_idx = lax.select(
+                            a_live == atoms_per_tok,
+                            32 * b + v,
+                            lax.shift_right_logical(v, 2) * 64 + 4 * b + (v & 3),
+                        )
+                        p = in_vmem[pl.ds(pl.multiple_of(vec_idx * 16, 16), 16)]
+                        valid = (
+                            (v * 16 + iota_16 < kv_b_vec)
+                            & (p >= 0)
+                            & (p < total_kv_slots)
+                        )
+                        safe_p = jnp.where(valid, p, 0)
+                        plsc.store_scatter(
+                            bitmask_vmem,
+                            [lax.shift_right_logical(safe_p, 5)],
+                            zero_vec,
+                            mask=valid,
+                        )
+                        return jnp.int32(0)
+
+                    return lax.fori_loop(0, b_vecs, pre_clear_b, jnp.int32(0))
+
+                lax.fori_loop(0, 16, pre_clear_tok, jnp.int32(0))
+
+                # Pass 1: discover unique physical keys and compact into u_flat_vmem.
+                def pass1_tok(b, u_acc):
+                    kv_b_vec = meta_in_vmem[
+                        pl.ds(pl.multiple_of((4 + b) * 16, 16), 16)
+                    ]
+                    b_vecs = lax.shift_right_logical(kv_b_vec[0] + 15, 4)
+
+                    def pass1_b(v, cur_u):
+                        vec_idx = lax.select(
+                            a_live == atoms_per_tok,
+                            32 * b + v,
+                            lax.shift_right_logical(v, 2) * 64 + 4 * b + (v & 3),
+                        )
+                        p = in_vmem[pl.ds(pl.multiple_of(vec_idx * 16, 16), 16)]
+                        valid = (
+                            (v * 16 + iota_16 < kv_b_vec)
+                            & (p >= 0)
+                            & (p < total_kv_slots)
+                        )
+                        safe_p = jnp.where(valid, p, 0)
+                        _, first_in_vec = plsc.scan_count(safe_p, mask=valid)
+                        word_idx = lax.shift_right_logical(safe_p, 5)
+                        bit_mask = lax.shift_left(one_vec, safe_p & 31)
+                        old_w = plsc.load_gather(
+                            bitmask_vmem, [word_idx], mask=first_in_vec
+                        )
+                        is_new = first_in_vec & ((old_w & bit_mask) == 0)
+                        plsc.addupdate_scatter(
+                            bitmask_vmem, [word_idx], bit_mask, mask=is_new
+                        )
+                        n_new = plsc.all_reduce_population_count(is_new)[0]
+                        write_pos = jnp.minimum(cur_u, 1024)
+                        can_write = jnp.broadcast_to(cur_u < 1024, (16,))
+                        plsc.store_compressed(
+                            u_flat_vmem.at[pl.ds(write_pos, 16)],
+                            safe_p,
+                            mask=is_new & can_write,
+                        )
+                        return cur_u + n_new
+
+                    return lax.fori_loop(0, b_vecs, pass1_b, u_acc)
+
+                u_count = lax.fori_loop(0, 16, pass1_tok, jnp.int32(0))
+                u_count_vec = jnp.broadcast_to(u_count, (16,))
+                meta_out_vmem[pl.ds(32, 16)] = u_count_vec
+
+                @pl.when((u_count > 0) & (u_count <= 1024))
+                def _pass2():
+                    u_chunks = lax.shift_right_logical(u_count + 15, 4)
+
+                    def clear_union(c, _):
+                        in_u = (c * 16 + iota_16) < u_count_vec
+                        u_p = jnp.where(
+                            in_u,
+                            u_flat_vmem[pl.ds(pl.multiple_of(c * 16, 16), 16)],
+                            0,
+                        )
+                        plsc.store_scatter(
+                            bitmask_vmem,
+                            [lax.shift_right_logical(u_p, 5)],
+                            zero_vec,
+                            mask=in_u,
+                        )
+                        return jnp.int32(0)
+
+                    lax.fori_loop(0, u_chunks, clear_union, jnp.int32(0))
+
+                    def init_umask_and_pad(c, _):
+                        u_idx = c * 16 + iota_16
+                        pad_p = ((tb * 1024 + u_idx) * 104729) & scatter_mask
+                        off_c = pl.multiple_of(c * 16, 16)
+                        cur_u = u_flat_vmem[pl.ds(off_c, 16)]
+                        u_flat_vmem[pl.ds(off_c, 16)] = jnp.where(
+                            u_idx < u_count_vec, cur_u, pad_p
+                        )
+                        umask_flat_vmem[pl.ds(off_c, 16)] = zero_vec
+                        return jnp.int32(0)
+
+                    lax.fori_loop(0, 64, init_umask_and_pad, jnp.int32(0))
+
+                    def pass2_tok(b, _):
+                        kv_b_vec = meta_in_vmem[
+                            pl.ds(pl.multiple_of((4 + b) * 16, 16), 16)
+                        ]
+                        b_vecs = lax.shift_right_logical(kv_b_vec[0] + 15, 4)
+                        b_bit_vec = lax.shift_left(
+                            one_vec, jnp.broadcast_to(b, (16,))
+                        )
+
+                        def set_b(v, _):
+                            vec_idx = lax.select(
+                                a_live == atoms_per_tok,
+                                32 * b + v,
+                                lax.shift_right_logical(v, 2) * 64 + 4 * b + (v & 3),
+                            )
+                            p = in_vmem[pl.ds(pl.multiple_of(vec_idx * 16, 16), 16)]
+                            valid = (
+                                (v * 16 + iota_16 < kv_b_vec)
+                                & (p >= 0)
+                                & (p < total_kv_slots)
+                            )
+                            safe_p = jnp.where(valid, p, 0)
+                            _, first_b = plsc.scan_count(safe_p, mask=valid)
+                            plsc.addupdate_scatter(
+                                bitmask_vmem,
+                                [lax.shift_right_logical(safe_p, 5)],
+                                lax.shift_left(one_vec, safe_p & 31),
+                                mask=first_b,
+                            )
+                            return jnp.int32(0)
+
+                        lax.fori_loop(0, b_vecs, set_b, jnp.int32(0))
+
+                        def test_u(c, _):
+                            off_c = pl.multiple_of(c * 16, 16)
+                            in_u = (c * 16 + iota_16) < u_count_vec
+                            u_p = jnp.where(in_u, u_flat_vmem[pl.ds(off_c, 16)], 0)
+                            w_val = plsc.load_gather(
+                                bitmask_vmem,
+                                [lax.shift_right_logical(u_p, 5)],
+                                mask=in_u,
+                            )
+                            hit = (
+                                (w_val & lax.shift_left(one_vec, u_p & 31)) != 0
+                            ) & in_u
+                            cur_m = umask_flat_vmem[pl.ds(off_c, 16)]
+                            umask_flat_vmem[pl.ds(off_c, 16)] = jnp.where(
+                                hit, cur_m | b_bit_vec, cur_m
+                            )
+                            return jnp.int32(0)
+
+                        lax.fori_loop(
+                            0,
+                            lax.select(b_vecs > 0, u_chunks, jnp.int32(0)),
+                            test_u,
+                            jnp.int32(0),
+                        )
+
+                        def clr_b(v, _):
+                            vec_idx = lax.select(
+                                a_live == atoms_per_tok,
+                                32 * b + v,
+                                lax.shift_right_logical(v, 2) * 64 + 4 * b + (v & 3),
+                            )
+                            p = in_vmem[pl.ds(pl.multiple_of(vec_idx * 16, 16), 16)]
+                            valid = (
+                                (v * 16 + iota_16 < kv_b_vec)
+                                & (p >= 0)
+                                & (p < total_kv_slots)
+                            )
+                            safe_p = jnp.where(valid, p, 0)
+                            plsc.store_scatter(
+                                bitmask_vmem,
+                                [lax.shift_right_logical(safe_p, 5)],
+                                zero_vec,
+                                mask=valid,
+                            )
+                            return jnp.int32(0)
+
+                        return lax.fori_loop(0, b_vecs, clr_b, jnp.int32(0))
+
+                    lax.fori_loop(0, 16, pass2_tok, jnp.int32(0))
+
+                    cp_u = pltpu.make_async_copy(
+                        u_flat_vmem.at[pl.ds(0, 1024)],
+                        outs_hbm.at[pl.ds(pl.multiple_of(tb * 1024, 16), 1024)],
+                        sem_ref.at[0],
+                    )
+                    cp_m = pltpu.make_async_copy(
+                        umask_flat_vmem,
+                        umask_hbm.at[pl.ds(pl.multiple_of(tb * 1024, 16), 1024)],
+                        sem_ref.at[1],
+                    )
+                    cp_u.start()
+                    cp_m.start()
+                    cp_u.wait()
+                    cp_m.wait()
+
+            u_count_final = meta_out_vmem[pl.ds(32, 16)][0]
+            dedup_ok = (can_dedup != 0) & (u_count_final > 0) & (u_count_final <= 1024)
+
+            @pl.when(jnp.logical_not(dedup_ok) & (raw_off > orig_off))
+            def _mark_skip_slot():
+                u_flat_vmem[pl.ds(0, 16)] = neg_one_vec
+                u_flat_vmem[pl.ds(16, 16)] = neg_one_vec
+                cp_skip = pltpu.make_async_copy(
+                    u_flat_vmem.at[pl.ds(0, 32)],
+                    outs_hbm.at[pl.ds(pl.multiple_of(tb * 1024, 16), 32)],
+                    sem_ref.at[0],
+                )
+                cp_skip.start()
+                cp_skip.wait()
+
+            out_live = jnp.where(dedup_ok, jnp.int32(1), a_live)
+            out_off = jnp.where(
+                dedup_ok | ((a_live == 0) & (raw_off > orig_off)), tb, raw_off
+            )
+            u_count_out = jnp.where(dedup_ok, u_count_final, jnp.int32(0))
+            meta_out_vmem[pl.ds(0, 16)] = jnp.broadcast_to(out_live, (16,))
+            meta_out_vmem[pl.ds(16, 16)] = jnp.broadcast_to(out_off, (16,))
+            meta_out_vmem[pl.ds(32, 16)] = jnp.broadcast_to(u_count_out, (16,))
+            cp_dedup = pltpu.make_async_copy(
+                meta_out_vmem,
+                dedup_hbm.at[pl.ds(pl.multiple_of(tb * 64, 16), 64)],
+                sem_ref.at[2],
+            )
+            cp_dedup.start()
+            cp_dedup.wait()
+
+
+def sc_dedup_chunk(
+    outs_c: jax.Array,
+    chunk_kv_lens: jax.Array,
+    a_live_c: jax.Array,
+    orig_off_c: jax.Array,
+    orig_num_live_c: jax.Array,
+    *,
+    chunk_size: int,
+    bz: int,
+    topk_cap: int,
+    page_size: int,
+    total_num_pages: int,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Deduplicates Window-0 physical KV indices per 16-token group on SparseCore."""
+    gpc = chunk_size // bz
+    atoms_per_tok = topk_cap // GATHER_ATOM_ROWS
+    total_kv_slots = max(1, total_num_pages * page_size)
+    scatter_mask = (1 << max(1, total_kv_slots.bit_length() - 1)) - 1
+    bitmask_words = align_to(cdiv(total_kv_slots, 32), 128)
+
+    is_single_win = orig_num_live_c <= chunk_size * topk_cap
+    kv_grouped = chunk_kv_lens.reshape(gpc, bz)
+    kv_max_c = jnp.max(kv_grouped, axis=1)
+    can_dedup_c = (
+        is_single_win & (a_live_c > 0) & (kv_max_c <= topk_cap)
+    ).astype(jnp.int32)
+    raw_off_c = jnp.where(is_single_win, orig_off_c + gpc, orig_off_c).astype(
+        jnp.int32
+    )
+    kv_capped = jnp.clip(kv_grouped, 0, topk_cap).astype(jnp.int32)
+    meta_cols = jnp.concatenate(
+        [
+            a_live_c[:, None],
+            orig_off_c[:, None],
+            can_dedup_c[:, None],
+            raw_off_c[:, None],
+            kv_capped,
+        ],
+        axis=1,
+    )
+    meta_in = jnp.broadcast_to(meta_cols[:, :, None], (gpc, 20, 16)).reshape(-1)
+
+    tpu_info = pltpu.get_tpu_info()
+    sc = tpu_info.sparse_core
+    assert sc is not None, "SparseCore is required for sc_dedup_chunk"
+    num_owners = sc.num_cores * sc.num_subcores
+    mesh = plsc.VectorSubcoreMesh(
+        num_cores=sc.num_cores,
+        num_subcores=sc.num_subcores,
+        core_axis_name="core",
+        subcore_axis_name="subcore",
+    )
+
+    outs_ref = jax.new_ref(outs_c.reshape(-1))
+    umask_ref = jax.new_ref(jnp.zeros((gpc * 1024,), jnp.int32))
+    dedup_ref = jax.new_ref(jnp.zeros((gpc * 64,), jnp.int32))
+
+    scratch_types = {
+        "meta_in_vmem": pltpu.VMEM((320,), jnp.int32),
+        "meta_out_vmem": pltpu.VMEM((64,), jnp.int32),
+        "in_vmem": pltpu.VMEM((atoms_per_tok * 1024,), jnp.int32),
+        "bitmask_vmem": pltpu.VMEM((bitmask_words,), jnp.int32),
+        "u_flat_vmem": pltpu.VMEM((1024 + 16,), jnp.int32),
+        "umask_flat_vmem": pltpu.VMEM((1024,), jnp.int32),
+        "sem_ref": pltpu.SemaphoreType.DMA((3,)),
+    }
+
+    inner = functools.partial(
+        _sc_dedup_chunk_kernel,
+        core_axis_name=mesh.core_axis_name,
+        subcore_axis_name=mesh.subcore_axis_name,
+        num_owners=num_owners,
+        gpc=gpc,
+        atoms_per_tok=atoms_per_tok,
+        total_kv_slots=total_kv_slots,
+        scatter_mask=scatter_mask,
+    )
+
+    def body(meta_hbm_ref, o_ref, u_ref, d_ref, **scr):
+        return inner(meta_hbm_ref, o_ref, u_ref, d_ref, **scr)
+
+    core_map_helper.kernel(
+        body,
+        out_type=(),
+        compiler_params=pltpu.CompilerParams(
+            use_tc_tiling_on_sc=False,
+            needs_layout_passes=False,
+            disable_bounds_checks=True,
+        ),
+        scratch_types=scratch_types,
+        mesh=mesh,
+        name=f"sc_dedup_chunk_g{gpc}_cap{topk_cap}",
+    )(meta_in, outs_ref, umask_ref, dedup_ref)
+
+    new_outs_c = jax.freeze(outs_ref).reshape(outs_c.shape)
+    umask_c = jax.freeze(umask_ref).reshape(gpc, 8, 128)
+    dedup_c = jax.freeze(dedup_ref).reshape(gpc, 4, 16)[:, :3, 0]
+    out_live = dedup_c[:, 0]
+    out_off = dedup_c[:, 1]
+    u_count_out = dedup_c[:, 2]
+    max_blk = jnp.max(jnp.where(out_live > 0, out_off + out_live, 0))
+    num_live_c = jnp.where(
+        is_single_win,
+        max_blk * (bz * GATHER_ATOM_ROWS),
+        orig_num_live_c,
+    ).astype(jnp.int32)
+    return new_outs_c, umask_c, (out_live, out_off, u_count_out), num_live_c
+
+
 def prepare_capped_window_live_fused(
     topk_indices: jax.Array,  # i32[num_tokens, topk], -1 = empty slot
     page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
@@ -1045,7 +1469,8 @@ def prepare_capped_window_live_fused(
     total_num_pages: int,
     _fault: str | None = None,
     window_cache: bool = False,
-) -> tuple[tuple[jax.Array, ...], jax.Array, jax.Array, jax.Array]:
+    union_dedup: bool = False,
+) -> tuple[jax.Array | tuple[jax.Array, ...], ...]:
     """kv_lens, `live_group_table` and `prepare_capped_window_live` in one call.
 
     Reads the top-k as 128-lane rows (a bitcast of the SparseCore top-k's flat
@@ -1101,6 +1526,7 @@ def prepare_capped_window_live_fused(
         total_num_pages=total_num_pages,
         num_chunks=num_chunks,
         fault=_fault,
+        union_dedup=union_dedup,
         **({"window_cache": True} if window_cache else {}),
     )
     chunk_rows = num_windows * region_rows + (
@@ -1152,7 +1578,44 @@ def prepare_capped_window_live_fused(
     )
     rows = tuple(outs[:num_chunks])
     kv_lens, tab, num_live = outs[num_chunks:]
-    return rows, kv_lens.reshape(num_tokens), tab, num_live
+    kv_lens_flat = kv_lens.reshape(num_tokens)
+    if not union_dedup:
+        return rows, kv_lens_flat, tab, num_live
+    num_groups = num_tokens // bz
+    dedup_rows = []
+    dedup_umasks = []
+    live_list = []
+    off_list = []
+    ucount_list = []
+    num_live_list = []
+    for c in range(num_chunks):
+        new_r, umask_c, (l_c, o_c, u_c), nl_c = sc_dedup_chunk(
+            rows[c],
+            kv_lens_flat[c * chunk_size : (c + 1) * chunk_size],
+            tab[c * gpc : (c + 1) * gpc],
+            tab[num_groups + c * gpc : num_groups + (c + 1) * gpc],
+            num_live[c],
+            chunk_size=chunk_size,
+            bz=bz,
+            topk_cap=topk_cap,
+            page_size=page_size,
+            total_num_pages=total_num_pages,
+        )
+        dedup_rows.append(new_r)
+        dedup_umasks.append(umask_c)
+        live_list.append(l_c)
+        off_list.append(o_c)
+        ucount_list.append(u_c)
+        num_live_list.append(nl_c)
+    dedup_tab = jnp.concatenate(live_list + off_list + ucount_list, axis=0)
+    dedup_num_live = jnp.stack(num_live_list, axis=0)
+    return (
+        tuple(dedup_rows),
+        kv_lens_flat,
+        dedup_tab,
+        dedup_num_live,
+        tuple(dedup_umasks),
+    )
 
 
 # Decode buckets the fused window prep serves (one chunk, whole top-k block in
@@ -1604,6 +2067,7 @@ MIXED_BODY_LEVERS = (
     "q128",
     "pair",
     "xqk",
+    "union",
 )
 # The exact (bitwise) default set for TPU_DCP_MLA_MIXED_BODY=1.
 MIXED_BODY_DEFAULT = ("tr", "zu", "pv512", "noinf")
@@ -1909,6 +2373,11 @@ def _attention_kernel(
         # [W, SEND_SLAB_ROW0 + T * L, o_dim] int16: the last scratch ref.
         recv_v_ref = refs[-1]
         refs = refs[:-1]
+    bumask_x2_ref = None
+    if "union" in body_levers:
+        # [2, 8, 128] int32 double-buffered union bitmask in VMEM.
+        bumask_x2_ref = refs[-1]
+        refs = refs[:-1]
     kv_stage_ref = None
     if "pair" in body_levers or "quad" in body_levers:
         assert "xqk" not in body_levers
@@ -1976,11 +2445,16 @@ def _attention_kernel(
     # is stale and is zeroed / masked exactly like the `-1` tail.
     live_nope_hbm_ref = None
     live_rope_hbm_ref = None
+    umask_hbm_ref = None
     if group_tab_ref is not None:
         assert capped_windows is not None
         live_nope_hbm_ref = refs[0]  # [blocks, bsz, 64, 128]
         live_rope_hbm_ref = refs[1]  # [blocks, bsz, 16, 128]
-        refs = refs[2:]
+        if "union" in body_levers:
+            umask_hbm_ref = refs[2]  # [gpc, 8, 128]
+            refs = refs[3:]
+        else:
+            refs = refs[2:]
     # Live widths (`live_widths`, live-group mode only): ascending static row
     # counts (multiples of 128 below bkv_sz). A grid step whose live rows
     # (A(g) * 64) fit width w runs its whole 16-token body on the first w rows
@@ -2331,6 +2805,7 @@ def _attention_kernel(
                     sems.at[0, bkv_sem_idx],
                     sems.at[3, bkv_sem_idx],
                     wait,
+                    bkv_sem_idx=bkv_sem_idx,
                 )
                 return
             if (
@@ -2402,6 +2877,7 @@ def _attention_kernel(
                     sem_nope,
                     sem_rope,
                     wait,
+                    bkv_sem_idx=bkv_sem_idx,
                 )
                 return
             if not wait:
@@ -2423,21 +2899,105 @@ def _attention_kernel(
                 dst_rope = bkv_rope_vmem_ref
                 _async_copy(src=dst_rope, dst=dst_rope, sem=sem_rope, wait=True)
 
-    def _fetch_live_blocks(seq_idx_start, nope_dst, rope_dst, sem_nope, sem_rope, wait):
+    def _fetch_live_blocks(
+        seq_idx_start, nope_dst, rope_dst, sem_nope, sem_rope, wait, bkv_sem_idx=0
+    ):
         assert group_tab_ref is not None
         assert live_nope_hbm_ref is not None and live_rope_hbm_ref is not None
-        num_groups = group_tab_ref.shape[0] // 2
+        num_groups = group_tab_ref.shape[0] // (3 if umask_hbm_ref is not None else 2)
         atom_rows = live_nope_hbm_ref.shape[2]
         rope_atom_rows = live_rope_hbm_ref.shape[2]
         g = seq_idx_start // batch_size
         live = group_tab_ref[g]
         off = group_tab_ref[num_groups + g]
+        u_count = (
+            group_tab_ref[2 * num_groups + g]
+            if umask_hbm_ref is not None
+            else jnp.int32(0)
+        )
         num_atoms = bkv_sz // atom_rows
         # A whole group (every atom live) sits token-major at block `off`:
         # the incumbent's one DMA per cache from its first token row.
         whole_row = off * (batch_size * atom_rows // bkv_sz)
 
-        @pl.when(live == num_atoms)
+        if umask_hbm_ref is not None:
+            assert bumask_x2_ref is not None
+            local_g = (seq_idx_start - start_seq_idx) // batch_size
+            umask_dst = bumask_x2_ref.at[bkv_sem_idx]
+
+            @pl.when((u_count > 0) & (u_count <= bkv_sz))
+            def _copy_union_1():
+                if wait:
+                    _async_copy(
+                        nope_dst.at[pl.ds(0, 1)],
+                        nope_dst.at[pl.ds(0, 1)],
+                        sem_nope,
+                        True,
+                    )
+                    _async_copy(
+                        rope_dst.at[pl.ds(0, 1)],
+                        rope_dst.at[pl.ds(0, 1)],
+                        sem_rope,
+                        True,
+                    )
+                    _async_copy(umask_dst, umask_dst, sem_nope, True)
+                else:
+                    _async_copy(
+                        cache_kv_nope_hbm_ref.at[pl.ds(whole_row, 1)],
+                        nope_dst.at[pl.ds(0, 1)],
+                        sem_nope,
+                        False,
+                    )
+                    _async_copy(
+                        cache_kv_rope_hbm_ref.at[pl.ds(whole_row, 1)],
+                        rope_dst.at[pl.ds(0, 1)],
+                        sem_rope,
+                        False,
+                    )
+                    _async_copy(
+                        umask_hbm_ref.at[local_g],
+                        umask_dst,
+                        sem_nope,
+                        False,
+                    )
+
+            @pl.when(u_count > bkv_sz)
+            def _copy_union_2():
+                if wait:
+                    _async_copy(
+                        nope_dst.at[pl.ds(0, 2)],
+                        nope_dst.at[pl.ds(0, 2)],
+                        sem_nope,
+                        True,
+                    )
+                    _async_copy(
+                        rope_dst.at[pl.ds(0, 2)],
+                        rope_dst.at[pl.ds(0, 2)],
+                        sem_rope,
+                        True,
+                    )
+                    _async_copy(umask_dst, umask_dst, sem_nope, True)
+                else:
+                    _async_copy(
+                        cache_kv_nope_hbm_ref.at[pl.ds(whole_row, 2)],
+                        nope_dst.at[pl.ds(0, 2)],
+                        sem_nope,
+                        False,
+                    )
+                    _async_copy(
+                        cache_kv_rope_hbm_ref.at[pl.ds(whole_row, 2)],
+                        rope_dst.at[pl.ds(0, 2)],
+                        sem_rope,
+                        False,
+                    )
+                    _async_copy(
+                        umask_hbm_ref.at[local_g],
+                        umask_dst,
+                        sem_nope,
+                        False,
+                    )
+
+        @pl.when((u_count == 0) & (live == num_atoms))
         def _copy_whole():
             if wait:
                 _async_copy(nope_dst, nope_dst, sem_nope, True)
@@ -2458,7 +3018,7 @@ def _attention_kernel(
 
         for a in range(num_atoms):
 
-            @pl.when((a < live) & (live < num_atoms))
+            @pl.when((u_count == 0) & (a < live) & (live < num_atoms))
             def _copy_block():
                 nope_slot = nope_dst.at[:, pl.ds(a * atom_rows, atom_rows)]
                 rope_slot = rope_dst.at[:, pl.ds(a * rope_atom_rows, rope_atom_rows)]
@@ -3151,6 +3711,52 @@ def _attention_kernel(
         keys = pltpu.bitcast(words, jnp.uint8).reshape(rows, 128)
         return pltpu.bitcast(keys, jnp.float8_e4m3fn)
 
+    def load_bkv_union(bkv_sem_idx, slot, rows, valid_len, levers):
+        """Unpack `rows` of union KV from `bkv_*_x2_ref[bkv_sem_idx, slot]`, zeroing past `valid_len`."""
+        nope_ref = bkv_nope_x2_ref.at[bkv_sem_idx, slot]
+        rope_ref = bkv_rope_x2_ref.at[bkv_sem_idx, slot]
+        rope_ref = rope_ref.at[pl.ds(0, rows * rope_ref.shape[0] // bkv_sz)]
+        zu = "zu" in levers
+        if "tr" in levers:
+            quarter = rows // 4
+            xs = [nope_ref[pl.ds(j, quarter, stride=4), :] for j in range(4)]
+            if zu:
+                key4 = lax.broadcasted_iota(jnp.int32, xs[0].shape, 0) * 4
+                xs = [
+                    jnp.where(key4 < valid_len - j, x, jnp.uint32(0))
+                    for j, x in enumerate(xs)
+                ]
+            lo16, hi16 = jnp.uint32(0x0000FFFF), jnp.uint32(0xFFFF0000)
+            ev8, od8 = jnp.uint32(0x00FF00FF), jnp.uint32(0xFF00FF00)
+            a0 = (xs[0] & lo16) | (xs[2] << 16)
+            a2 = (xs[0] >> 16) | (xs[2] & hi16)
+            a1 = (xs[1] & lo16) | (xs[3] << 16)
+            a3 = (xs[1] >> 16) | (xs[3] & hi16)
+            cols = [
+                (a0 & ev8) | ((a1 & ev8) << 8),
+                ((a0 >> 8) & ev8) | (a1 & od8),
+                (a2 & ev8) | ((a3 & ev8) << 8),
+                ((a2 >> 8) & ev8) | (a3 & od8),
+            ]
+            bkv_nope = jnp.concatenate(
+                [pltpu.bitcast(c, jnp.float8_e4m3fn) for c in cols], axis=-1
+            )
+        else:
+            words = nope_ref[pl.ds(0, rows)]
+            if zu:
+                key = lax.broadcasted_iota(jnp.int32, words.shape, 0)
+                words = jnp.where(key < valid_len, words, jnp.uint32(0))
+            bkv_nope = pltpu.bitcast(words, jnp.uint8).reshape(rows, nope_dim)
+            bkv_nope = pltpu.bitcast(bkv_nope, jnp.float8_e4m3fn)
+        bkv_rope = rope_keys(rope_ref[...], rows)
+        bkv = jnp.concatenate([bkv_nope, bkv_rope], axis=-1)
+        if bkv.shape[-1] < head_dim:
+            bkv = jnp.pad(bkv, ((0, 0), (0, head_dim - bkv.shape[-1])))
+        if not zu:
+            k_span = lax.broadcasted_iota(jnp.int32, bkv.shape, 0)
+            bkv = jnp.where(k_span < valid_len, bkv, 0)
+        return bkv
+
     def load_bkv(bkv_sem_idx, batch_idx, rows=None, levers=()):
         # `rows` None = the whole bkv_sz tile (kv rungs / row widths narrow it).
         slice_sz = bkv_sz if rows is None else rows
@@ -3476,6 +4082,133 @@ def _attention_kernel(
                 store_out(bo_sem_idx, t, out)
                 write_blse(t, m[t * h : (t + 1) * h], l_sum[t * h : (t + 1) * h])
 
+        def run_union(rows, u_count, levers):
+            """Batched union attention over `rows <= bkv_sz` deduplicated keys."""
+            assert bumask_x2_ref is not None
+            h = num_q_heads
+            kv_u = load_bkv_union(bi_sem_idx, 0, rows, u_count, levers)
+            qs = [load_bq(bi_sem_idx, t) for t in range(batch_size)]
+            q_stacked = jnp.concatenate(qs, axis=0)
+            s = jnp.einsum(
+                "nd,md->nm", q_stacked, kv_u, preferred_element_type=jnp.float32
+            )
+            s *= sm_scale
+            if k_scale != 1.0:
+                s *= k_scale
+
+            um_full = bumask_x2_ref.at[bi_sem_idx][...]
+            n_umask_rows = rows // 128
+            um = jnp.concatenate(
+                [um_full[r : r + 1, :] for r in range(n_umask_rows)], axis=1
+            )
+            row_idx = lax.broadcasted_iota(jnp.int32, s.shape, 0)
+            tok_idx = (
+                lax.shift_right_logical(
+                    row_idx, jnp.int32(h.bit_length() - 1)
+                )
+                if (h & (h - 1)) == 0
+                else row_idx // h
+            )
+            bit = lax.shift_left(jnp.int32(1), tok_idx)
+            u_span = lax.broadcasted_iota(jnp.int32, s.shape, 1)
+            mask = ((jnp.broadcast_to(um, s.shape) & bit) != 0) & (u_span < u_count)
+            f32_min = jnp.finfo(jnp.float32).min
+            s = jnp.where(mask, s, f32_min)
+
+            m = jnp.max(s, axis=1, keepdims=True)
+            m_safe = jnp.where(m == f32_min, 0.0, m)
+            p = jnp.exp(s - m_safe)
+            l_sum = jnp.sum(p, axis=1, keepdims=True)
+            l_safe = jnp.where(l_sum == 0.0, 1.0, l_sum)
+
+            kv_v = kv_u[:, :o_dim] if ("pv512" in levers and split_q) else kv_u
+            p_in = p.astype(q_dtype) if "pbf16" in levers else p
+            pv = jnp.einsum(
+                "nm,md->nd", p_in, kv_v, preferred_element_type=jnp.float32
+            )
+            if k_scale != 1.0:
+                pv *= k_scale
+            out_stacked = (
+                lax.div(pv, l_safe)
+                if q_dtype == jnp.float32
+                else (pv * pl.reciprocal(l_safe, approx=True)).astype(q_dtype)
+            )
+            for t in range(batch_size):
+                store_out(bo_sem_idx, t, out_stacked[t * h : (t + 1) * h])
+                write_blse(
+                    t, m[t * h : (t + 1) * h], l_sum[t * h : (t + 1) * h]
+                )
+
+        def run_union_1024(u_count, levers):
+            """Batched union attention over `bkv_sz < u_count <= 2 * bkv_sz` deduplicated keys."""
+            assert bumask_x2_ref is not None
+            h = num_q_heads
+            kv_u0 = load_bkv_union(bi_sem_idx, 0, bkv_sz, bkv_sz, levers)
+            kv_u1 = load_bkv_union(
+                bi_sem_idx, 1, bkv_sz, u_count - bkv_sz, levers
+            )
+            qs = [load_bq(bi_sem_idx, t) for t in range(batch_size)]
+            q_stacked = jnp.concatenate(qs, axis=0)
+            s0 = jnp.einsum(
+                "nd,md->nm", q_stacked, kv_u0, preferred_element_type=jnp.float32
+            )
+            s1 = jnp.einsum(
+                "nd,md->nm", q_stacked, kv_u1, preferred_element_type=jnp.float32
+            )
+            s = jnp.concatenate([s0, s1], axis=1)
+            s *= sm_scale
+            if k_scale != 1.0:
+                s *= k_scale
+
+            um_full = bumask_x2_ref.at[bi_sem_idx][...]
+            um = jnp.concatenate(
+                [um_full[r : r + 1, :] for r in range(8)], axis=1
+            )
+            row_idx = lax.broadcasted_iota(jnp.int32, s.shape, 0)
+            tok_idx = (
+                lax.shift_right_logical(
+                    row_idx, jnp.int32(h.bit_length() - 1)
+                )
+                if (h & (h - 1)) == 0
+                else row_idx // h
+            )
+            bit = lax.shift_left(jnp.int32(1), tok_idx)
+            u_span = lax.broadcasted_iota(jnp.int32, s.shape, 1)
+            mask = ((jnp.broadcast_to(um, s.shape) & bit) != 0) & (u_span < u_count)
+            f32_min = jnp.finfo(jnp.float32).min
+            s = jnp.where(mask, s, f32_min)
+
+            m = jnp.max(s, axis=1, keepdims=True)
+            m_safe = jnp.where(m == f32_min, 0.0, m)
+            p = jnp.exp(s - m_safe)
+            l_sum = jnp.sum(p, axis=1, keepdims=True)
+            l_safe = jnp.where(l_sum == 0.0, 1.0, l_sum)
+
+            kv_v0 = kv_u0[:, :o_dim] if ("pv512" in levers and split_q) else kv_u0
+            kv_v1 = kv_u1[:, :o_dim] if ("pv512" in levers and split_q) else kv_u1
+            p0 = p[:, :bkv_sz]
+            p1 = p[:, bkv_sz:]
+            if "pbf16" in levers:
+                p0 = p0.astype(q_dtype)
+                p1 = p1.astype(q_dtype)
+            pv = jnp.einsum(
+                "nm,md->nd", p0, kv_v0, preferred_element_type=jnp.float32
+            ) + jnp.einsum(
+                "nm,md->nd", p1, kv_v1, preferred_element_type=jnp.float32
+            )
+            if k_scale != 1.0:
+                pv *= k_scale
+            out_stacked = (
+                lax.div(pv, l_safe)
+                if q_dtype == jnp.float32
+                else (pv * pl.reciprocal(l_safe, approx=True)).astype(q_dtype)
+            )
+            for t in range(batch_size):
+                store_out(bo_sem_idx, t, out_stacked[t * h : (t + 1) * h])
+                write_blse(
+                    t, m[t * h : (t + 1) * h], l_sum[t * h : (t + 1) * h]
+                )
+
         def xqk_row_to_col(row):
             """[1, heads] -> [heads, 1] exactly (one live entry per row)."""
             h = num_q_heads
@@ -3596,7 +4329,66 @@ def _attention_kernel(
             # the body (`live_widths`) and `body_levers` pick its form. Rows
             # past each token's kv_len are zeroed / masked, and an all-empty
             # step's lse is -inf (`is_dcp_mode` / `lse_mask_empty`).
-            if live_widths:
+            if "union" in body_levers and umask_hbm_ref is not None:
+                assert live_nope_hbm_ref is not None
+                num_groups = group_tab_ref.shape[0] // 3
+                g = batch_start_seq_idx // batch_size
+                need = group_tab_ref[g] * live_nope_hbm_ref.shape[2]
+                u_count = group_tab_ref[2 * num_groups + g]
+                levers_tup = tuple(body_levers)
+                widths_all = tuple(live_widths) + (bkv_sz,)
+
+                @pl.when(u_count > 0)
+                def _run_u():
+                    lower_u = None
+                    for width in widths_all:
+                        fits_u = (
+                            u_count <= width
+                            if lower_u is None
+                            else (u_count > lower_u) & (u_count <= width)
+                        )
+                        pl.when(fits_u)(
+                            functools.partial(
+                                run_union, width, u_count, levers_tup
+                            )
+                        )
+                        lower_u = width
+                    pl.when(u_count > bkv_sz)(
+                        functools.partial(run_union_1024, u_count, levers_tup)
+                    )
+
+                @pl.when((u_count == 0) & (need == 0))
+                def _zero_group():
+                    zero_out = jnp.zeros((num_q_heads, o_dim), dtype=q_dtype)
+                    neg_inf_lse = jnp.full(
+                        (num_q_heads, 1),
+                        -jnp.inf
+                        if (is_dcp_mode or lse_mask_empty)
+                        else jnp.finfo(jnp.float32).min,
+                        dtype=jnp.float32,
+                    )
+                    for batch_idx in range(batch_size):
+                        store_out(bo_sem_idx, batch_idx, zero_out)
+                        if return_lse:
+                            store_blse(bo_sem_idx, batch_idx, neg_inf_lse)
+
+                @pl.when((u_count == 0) & (need > 0))
+                def _run_fallback():
+                    if live_widths:
+                        lower = None
+                        for width in widths_all:
+                            fits = (
+                                need <= width
+                                if lower is None
+                                else (need > lower) & (need <= width)
+                            )
+                            pl.when(fits)(
+                                functools.partial(run_steps, width, levers_tup)
+                            )
+                            lower = width
+                    else:
+                        run_steps(bkv_sz, levers_tup)
+            elif live_widths:
                 assert live_nope_hbm_ref is not None
                 atom_rows = live_nope_hbm_ref.shape[2]
                 need = group_tab_ref[batch_start_seq_idx // batch_size] * atom_rows
@@ -4341,6 +5133,7 @@ def sparse_ragged_paged_attention(
         and q.shape[0] % uniform_chunk == 0
     )
     window_indices_all: Any = None  # one array, or one per chunk
+    window_umasks_all: Any = None
     chunk_window_rows = 0  # rows of `window_indices_all` per chunk
     window_cache = False
     group_tab = None
@@ -4429,8 +5222,13 @@ def sparse_ragged_paged_attention(
         if mixed_fused_prep and mixed_fused_prep_supported(
             q.shape[0], topk, uniform_chunk, prep_batch, topk_cap
         ):
+            use_union_dedup = (
+                "union" in mixed_body_levers
+                and q.shape[0] > MIXED_BODY_MAX_SKIP_TOKENS
+            )
             window_cache = (
                 gather_window_cache
+                and not use_union_dedup
                 and kv_write is None
                 and gather_window_cache_supported(page_size, sparsecore_atoms_per_batch)
                 and not _chunk_kernel_batch_size(
@@ -4440,8 +5238,14 @@ def sparse_ragged_paged_attention(
                     small_chunk_batch_size,
                 )[0]
             )
-            window_indices_all, kv_lens, group_tab, group_num_live = (
-                prepare_capped_window_live_fused(
+            if use_union_dedup:
+                (
+                    window_indices_all,
+                    kv_lens,
+                    group_tab,
+                    group_num_live,
+                    window_umasks_all,
+                ) = prepare_capped_window_live_fused(
                     topk_indices,
                     page_indices,
                     cu_q_lens,
@@ -4451,9 +5255,23 @@ def sparse_ragged_paged_attention(
                     topk_cap=topk_cap,
                     page_size=page_size,
                     total_num_pages=cache_kv_nope.shape[0],
-                    window_cache=window_cache,
+                    union_dedup=True,
                 )
-            )
+            else:
+                window_indices_all, kv_lens, group_tab, group_num_live = (
+                    prepare_capped_window_live_fused(
+                        topk_indices,
+                        page_indices,
+                        cu_q_lens,
+                        token_end,
+                        chunk_size=uniform_chunk,
+                        kernel_batch_size=prep_batch,
+                        topk_cap=topk_cap,
+                        page_size=page_size,
+                        total_num_pages=cache_kv_nope.shape[0],
+                        window_cache=window_cache,
+                    )
+                )
         else:
             live_windows = capped_live_windows(
                 kv_lens,
@@ -4648,9 +5466,16 @@ def sparse_ragged_paged_attention(
             group_levers=(
                 ()
                 if group_tab is None
-                else mixed_body_levers
+                else (
+                    mixed_body_levers
+                    if window_umasks_all is not None
+                    else tuple(v for v in mixed_body_levers if v != "union")
+                )
                 if q.shape[0] > MIXED_BODY_MAX_SKIP_TOKENS
                 else mixed_body_small_levers
+            ),
+            chunk_umask=(
+                None if window_umasks_all is None else window_umasks_all[i]
             ),
             row_levers=(
                 decode_body_levers
@@ -4872,6 +5697,7 @@ def sparse_attention_chunk(
     packed_gather: bool = False,
     out_vmem: int = 0,
     gather_window_cache: bool = False,
+    chunk_umask: jax.Array | None = None,
 ):
     """Gathers and attends query rows `[start_pos, min(end_pos, token_end))`.
 
@@ -4985,7 +5811,7 @@ def sparse_attention_chunk(
         kernel_batch_size: int,
         lse: jax.Array | None = None,  # f32[max_num_tokens, num_q_heads, 1]
         is_dcp_mode: bool = False,
-        live_views: tuple[jax.Array, jax.Array] | None = None,
+        live_views: tuple[jax.Array, ...] | None = None,
     ):
         batch_size = kernel_batch_size
         out_rows, out_offset, out_carried = (
@@ -5031,7 +5857,7 @@ def sparse_attention_chunk(
         if q_rope:
             in_specs.append(pl.BlockSpec(memory_space=pltpu.HBM))  # rope table
         if live_views is not None:
-            in_specs += [pl.BlockSpec(memory_space=pltpu.HBM)] * 2  # block views
+            in_specs += [pl.BlockSpec(memory_space=pltpu.HBM)] * len(live_views)
 
         out_specs = pl.BlockSpec(memory_space=pltpu.HBM)  # o
         # Each chunk writes only its own token rows, so -- exactly like `q` --
@@ -5171,6 +5997,8 @@ def sparse_attention_chunk(
                     jnp.float8_e4m3fn,
                 )
             )
+        if "union" in stage_levers:
+            scratch_shapes.append(pltpu.VMEM((2, 8, 128), jnp.int32))
 
         if xchg_steps:
             # The merge weights, the merged rows and the receive scratch (the
@@ -5270,7 +6098,7 @@ def sparse_attention_chunk(
             + 3
             + int(split_q)
             + int(q_rope)
-            + 2 * int(live_views is not None)
+            + (len(live_views) if live_views is not None else 0)
         )
         piece_aliases = {lse_operand: 1}
         if out_carried is not None:
@@ -5372,7 +6200,7 @@ def sparse_attention_chunk(
                         + 3
                         + int(split_q)
                         + int(q_rope)
-                        + 2 * int(live_views is not None): 1,
+                        + (len(live_views) if live_views is not None else 0): 1,
                     }
                     if return_lse
                     else {
@@ -5573,6 +6401,7 @@ def sparse_attention_chunk(
                 write_fault=kv_write_fault,
                 packed_rope=packed_rope,
                 **({"packed_out": True} if packed_gather else {}),
+                **({"is_dcp_mode": True} if chunk_umask is not None else {}),
                 **live_kwargs,
             )
             gathered_nope_buffer, gathered_rope_buffer = gathered[:2]
@@ -5601,6 +6430,7 @@ def sparse_attention_chunk(
                         GATHER_ATOM_ROWS // gathered_rope_keys_per_row,
                         128,
                     ),
+                    *((chunk_umask,) if chunk_umask is not None else ()),
                 )
         elif sparsecore_layout:
             live_kwargs = {}

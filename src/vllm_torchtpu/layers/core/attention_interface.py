@@ -1066,7 +1066,9 @@ def dcp_small_chunk_gather_atoms(num_tokens: int) -> int:
     return 1
 
 
-def _mixed_body_levers(value: str, kernel_v2: bool = False) -> tuple[str, ...]:
+def _mixed_body_levers(
+    value: str, kernel_v2: bool = False, union_dedup: bool = False
+) -> tuple[str, ...]:
     """TPU_DCP_MLA_MIXED_BODY -> the live body's lever tuple ("1" = default set),
     plus the stage-A levers with TPU_DCP_MLA_MIXED_KERNEL_V2."""
     if not value or value == "0":
@@ -1079,6 +1081,8 @@ def _mixed_body_levers(value: str, kernel_v2: bool = False) -> tuple[str, ...]:
         levers += tuple(
             v for v in sparse_mla_kernel.MIXED_KERNEL_V2_LEVERS if v not in levers
         )
+    if union_dedup and "union" not in levers:
+        levers += ("union",)
     return levers
 
 
@@ -1651,11 +1655,25 @@ def sparse_mla_attention_dcp(
             lse_mask_empty=mask_in_kernel,
             fused_window_prep=fused_prep,
             mixed_live_gather=envs.TPU_DCP_MLA_MIXED_LIVE,
-            mixed_live_widths=tuple(
-                int(w) for w in envs.TPU_DCP_MLA_MIXED_LIVE_WIDTHS.split(",") if w
+            mixed_live_widths=(
+                (128,)
+                + tuple(
+                    int(w)
+                    for w in envs.TPU_DCP_MLA_MIXED_LIVE_WIDTHS.split(",")
+                    if w and int(w) != 128
+                )
+                if envs.TPU_DCP_MLA_MIXED_UNION_DEDUP
+                and envs.TPU_DCP_MLA_MIXED_LIVE_WIDTHS
+                and topk_idx.shape[0] > sparse_mla_kernel.MIXED_BODY_MAX_SKIP_TOKENS
+                else tuple(
+                    int(w) for w in envs.TPU_DCP_MLA_MIXED_LIVE_WIDTHS.split(",") if w
+                )
             ),
             mixed_body_levers=_mixed_body_levers(
-                envs.TPU_DCP_MLA_MIXED_BODY, envs.TPU_DCP_MLA_MIXED_KERNEL_V2
+                envs.TPU_DCP_MLA_MIXED_BODY,
+                envs.TPU_DCP_MLA_MIXED_KERNEL_V2,
+                envs.TPU_DCP_MLA_MIXED_UNION_DEDUP
+                and envs.TPU_DCP_MLA_MIXED_FUSED_PREP,
             ),
             mixed_body_small_levers=_mixed_body_small_levers(
                 envs.TPU_DCP_MLA_MIXED_BODY_SMALL
