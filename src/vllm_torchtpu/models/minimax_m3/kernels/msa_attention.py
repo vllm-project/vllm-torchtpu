@@ -397,7 +397,8 @@ def _work_list(selected: jax.Array, block_q: int, pages_per_step: int):
 
     Returns the unions as ``[tiles * groups_per_tile * pages_per_step]``
     (``-1`` past a tile's union; see `_slot`), one meta word per group (see
-    `_ROW_SHIFT`) and the number of groups. The kernel reads its group's pages in
+    `_ROW_SHIFT`), the number of groups, and each group's page count (its
+    present slots are the first ones). The kernel reads its group's pages in
     the unions directly, so no [groups, pages_per_step] gather builds a
     per-group list (a SparseCore offload of ~65 us per 2,048-token call in
     the c4 prefill twin, j-3c651507).
@@ -424,8 +425,13 @@ def _work_list(selected: jax.Array, block_q: int, pages_per_step: int):
     tile = jnp.sum(starts[None, 1:] <= w, axis=1, dtype=jnp.int32)
     start = jnp.max(jnp.where(starts[None, :] <= w, starts[None, :], 0), axis=1)
     end = jnp.min(jnp.where(ends[None, :] > w, ends[None, :], ends[-1]), axis=1)
+    tile_pages = jnp.max(
+        jnp.where((starts[None, :] <= w) & (ends[None, :] > w), pages_in_tile, 0),
+        axis=1,
+    )
     w = w[:, 0]
     group = jnp.clip(w - start, 0, groups_per_tile - 1)
+    count = jnp.clip(tile_pages - group * pages_per_step, 0, pages_per_step)
     meta = (
         ((tile * groups_per_tile + group) << _ROW_SHIFT)
         | jnp.where(w == start, _FIRST_BIT, 0)
@@ -436,7 +442,7 @@ def _work_list(selected: jax.Array, block_q: int, pages_per_step: int):
         ((0, 0), (0, groups_per_tile * pages_per_step - union_size)),
         constant_values=-1,
     )
-    return union.reshape(-1), meta.astype(jnp.int32), ends[-1]
+    return union.reshape(-1), meta.astype(jnp.int32), ends[-1], count
 
 
 def _attention_call(
@@ -459,7 +465,7 @@ def _attention_call(
     num_tokens, num_heads, head_dim = q.shape
     _, rows_per_page, packing, row_width = kv_cache.shape
     topk = selected.shape[1]
-    pages, meta, num_groups = _work_list(selected, block_q, pages_per_step)
+    pages, meta, num_groups, _ = _work_list(selected, block_q, pages_per_step)
     prefetch = [pages, meta]
     if kernel == "v2":
         prefetch.append(

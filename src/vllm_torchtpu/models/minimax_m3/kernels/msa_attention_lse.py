@@ -39,30 +39,35 @@ def _kernel(
     # Scalar prefetch
     work_page_ref,  # tile page key unions (`msa_attention._work_list`)
     work_meta_ref,  # [groups] union row << _ROW_SHIFT | last and first bits
+    work_count_ref,  # [groups] pages in the group (its first slots)
     page_table_ref,  # page key -> physical page
     head_ref,  # [2] KV head of the cache rows, block of query heads
     tile_offset_ref,  # [1] the call's first tile (read by the index maps only)
     # In
-    q_ref,  # [H, Bq, D]
+    q_ref,  # [H, Bq, D], pre-scaled by sm_scale * log2(e)
     selected_ref,  # [Bq, K] page keys, -1 padded
     local_page_ref,  # [Bq, 1]
     local_limit_ref,  # [Bq, 1] visible slots of the local page
     kv_hbm_ref,  # [pages, S / p, p, G * 2D] the whole cache, in HBM
     *refs,  # [scale pages (4-bit)], [aliased out, lse], out, lse, m, l, acc,
     # page buffers, semaphores, [scale buffers, semaphores (4-bit)]
-    sm_scale: float,
     aliased: bool = False,
     fp4_rows: tuple[int, int] | str | None = None,
 ):
     """`msa_attention._kernel_v2` that also writes ``lse = m + log(l)``
-    (``-inf`` for a row that sees no slot; its output is 0). The running
-    max ``m`` is kept in log2 units.
+    (``-inf`` for a row that sees no slot; its output is 0). Scores, the
+    running max ``m`` and ``l`` are in log2 units: the queries come scaled by
+    ``sm_scale * log2(e)``.
 
     Each step copies the next group's pages into the other half of a
-    double buffer itself, only the slots that hold pages: per-slot pipelined
-    page inputs cost every step their index arithmetic and DMA bookkeeping
-    for all slots, ~1 us of scalar work that bound the narrow steps (LLO of
-    the step, j-999b8f92).
+    double buffer itself, one loop iteration per page it holds: unrolled
+    per-slot copies run predicated, so every step paid all slots' address
+    arithmetic and checks (~800 scalar bundles of a ~2,200-bundle 4-page
+    step in the LLO).
+
+    A tile of one group (its first and last) runs a plain softmax that
+    keeps nothing in the m / l / acc scratch, and a tile with no page only
+    writes its zero output.
 
     A 4-bit cache (`fp4_rows`: static K / V scale-page rows, or ``"head"``
     for rows ``2k, 2k + 1`` of the cache-row KV head ``k``) copies each
@@ -75,10 +80,13 @@ def _kernel(
     pages_per_step = buf_ref.shape[1]
     w = pl.program_id(0)
     meta = work_meta_ref[w]
+    count = work_count_ref[w]
     num_heads, block_q, head_dim = q_ref.shape
     rows_per_page, packing, row_width = buf_ref.shape[3:]
     page_size = rows_per_page * (msa_fp4.TOKENS_PER_WORD if fp4 else packing)
     half = w % 2
+    first = (meta & msa_attention._FIRST_BIT) != 0
+    last = (meta & msa_attention._LAST_BIT) != 0
 
     def page_copies(half, g, page):
         src = kv_hbm_ref.at[
@@ -95,18 +103,15 @@ def _kernel(
             )
         return copies
 
-    def group_page(group, g):
-        meta_g = work_meta_ref[group]
-        return work_page_ref[msa_attention._slot(meta_g, pages_per_step, g)]
-
     def start_group(group, half):
-        for g in range(pages_per_step):
-            page = group_page(group, g)
+        base = msa_attention._slot(work_meta_ref[group], pages_per_step, 0)
 
-            @pl.when(page >= 0)
-            def _start(g=g, page=page):
-                for copy in page_copies(half, g, page_table_ref[page]):
-                    copy.start()
+        def start(g, carry):
+            for copy in page_copies(half, g, page_table_ref[work_page_ref[base + g]]):
+                copy.start()
+            return carry
+
+        jax.lax.fori_loop(0, work_count_ref[group], start, 0)
 
     @pl.when(w == 0)
     def _first():
@@ -116,23 +121,37 @@ def _kernel(
     def _next():
         start_group(w + 1, 1 - half)
 
-    for g in range(pages_per_step):
+    def wait(g, carry):
+        for copy in page_copies(half, g, 0):  # the source only sizes the wait
+            copy.wait()
+        return carry
 
-        @pl.when(group_page(w, g) >= 0)
-        def _wait(g=g):
-            for copy in page_copies(half, g, 0):  # the source only sizes the wait
-                copy.wait()
+    jax.lax.fori_loop(0, count, wait, 0)
 
     kv_refs = [buf_ref.at[half, g] for g in range(pages_per_step)]
 
-    @pl.when((meta & msa_attention._FIRST_BIT) != 0)
+    @pl.when(first & jnp.logical_not(last))
     def _init():
         m_ref[...] = jnp.full_like(m_ref, msa_attention._MASK_VALUE)
         l_ref[...] = jnp.zeros_like(l_ref)
         acc_ref[...] = jnp.zeros_like(acc_ref)
 
-    def attend(width):
-        """One online-softmax update over the group's first `width` slots."""
+    def write(out, lse):
+        o_ref[...] = out.reshape(num_heads, block_q, head_dim).astype(o_ref.dtype)
+        lse_ref[...] = lse.reshape(num_heads, block_q, 1)
+
+    def finish(m, l, acc):
+        """Output and lse from a tile's softmax state (log2 units)."""
+        seen_any = l > 0
+        safe = jnp.where(seen_any, l, 1.0)
+        write(
+            jnp.where(seen_any, acc * (1.0 / safe), 0.0),
+            jnp.where(seen_any, m * _LN_2 + jnp.log(safe), -jnp.inf),
+        )
+
+    def attend(width, single):
+        """One softmax update over the group's first `width` slots; a
+        `single` group (the tile's only one) needs no carried state."""
         row_slots = (
             jax.lax.broadcasted_iota(jnp.int32, (page_size, 1), 0)  # int4: slot order
             if fp4
@@ -185,48 +204,62 @@ def _kernel(
         )
         if fp4:  # x = int4 * scale: K scales the score columns, V scales p
             s = s * jnp.concatenate(k_scales, axis=1)
-        # Scores in log2 units (m and l too): exp2 needs no multiply per score.
-        s = jnp.where(mask, s * (sm_scale * _LOG2_E), -jnp.inf)
+        s = jnp.where(mask, s, -jnp.inf)
 
-        m_prev = m_ref[...]
-        m_new = jnp.maximum(m_prev, jnp.max(s, axis=1, keepdims=True))
-        alpha = jnp.exp2(m_prev - m_new)
-        p = jnp.exp2(s - m_new)
-        l_ref[...] = alpha * l_ref[...] + jnp.sum(p, axis=1, keepdims=True)
+        m_new = jnp.max(s, axis=1, keepdims=True)
+        if not single:
+            m_prev = m_ref[...]
+            m_new = jnp.maximum(m_prev, m_new)
+        # A row with no visible slot keeps m = -inf in a single group; its
+        # p must still be 0, not exp2(nan).
+        m_safe = jnp.where(m_new > -jnp.inf, m_new, 0.0) if single else m_new
+        p = jnp.exp2(s - m_safe)
+        l_cur = jnp.sum(p, axis=1, keepdims=True)
         p_v = p * jnp.concatenate(v_scales, axis=1) if fp4 else p
-        acc_ref[...] = alpha * acc_ref[...] + jax.lax.dot_general(
+        pv = jax.lax.dot_general(
             p_v.astype(v.dtype),
             v,
             (((1,), (0,)), ((), ())),
             preferred_element_type=jnp.float32,
         )
-        m_ref[...] = m_new
+        if single:
+            finish(m_safe, l_cur, pv)
+            return
+        alpha = jnp.exp2(m_prev - m_new)
+        l_new = alpha * l_ref[...] + l_cur
+        acc_new = alpha * acc_ref[...] + pv
+
+        @pl.when(last)
+        def _finalize():
+            finish(m_new, l_new, acc_new)
+
+        @pl.when(jnp.logical_not(last))
+        def _carry():
+            m_ref[...] = m_new
+            l_ref[...] = l_new
+            acc_ref[...] = acc_new
 
     # Slots past the group's pages hold stale bytes: their limits are 0, so
     # their scores are masked and their value rows zeroed.
-    # Run at the narrowest width holding the group's pages: unions are
-    # ascending with -1 at the end, so slot `n` is empty iff at most n pages
-    # remain. A step costs per score column, filled or not (~2.3 us at 16
-    # pages, ~1.1 us at 4, twin standalone j-952e8a64), and a 16-token
-    # tile's union is ~8-12 of its rank's pages at DCP 2, ~2-8 at DCP 8.
-    def present(g):
-        return work_page_ref[msa_attention._slot(meta, pages_per_step, g)] >= 0
-
+    # Run at the narrowest width holding the group's pages. A step costs per
+    # score column, filled or not (~2.3 us at 16 pages, ~1.1 us at 4, twin
+    # standalone j-952e8a64), and a 16-token tile's union is ~8-12 of its
+    # rank's pages at DCP 2, ~2-8 at DCP 8.
+    single = first & last
     widths = [n for n in _STEP_WIDTHS if n < pages_per_step] + [pages_per_step]
     for i, width in enumerate(widths):
-        wider = present(widths[i - 1]) if i else True
-        fits = jnp.logical_not(present(width)) if width < pages_per_step else True
-        pl.when(jnp.logical_and(wider, fits))(functools.partial(attend, width))
+        fits = count > (widths[i - 1] if i else 0)
+        if width < pages_per_step:
+            fits = fits & (count <= width)
+        pl.when(fits & single)(functools.partial(attend, width, True))
+        pl.when(fits & jnp.logical_not(single))(functools.partial(attend, width, False))
 
-    @pl.when((meta & msa_attention._LAST_BIT) != 0)
-    def _finalize():
-        denom = l_ref[...]
-        seen_any = denom > 0
-        safe = jnp.where(seen_any, denom, 1.0)
-        out = jnp.where(seen_any, acc_ref[...] / safe, 0.0)
-        o_ref[...] = out.reshape(num_heads, block_q, head_dim).astype(o_ref.dtype)
-        lse = jnp.where(seen_any, m_ref[...] * _LN_2 + jnp.log(safe), -jnp.inf)
-        lse_ref[...] = lse.reshape(num_heads, block_q, 1)
+    @pl.when(count == 0)
+    def _empty():  # a tile of padding tokens: its only group holds no page
+        write(
+            jnp.zeros((num_heads * block_q, head_dim), jnp.float32),
+            jnp.full((num_heads * block_q, 1), -jnp.inf, jnp.float32),
+        )
 
 
 def _attention_call(
@@ -241,7 +274,6 @@ def _attention_call(
     out,
     *,
     q_per_head,
-    sm_scale,
     block_q,
     pages_per_step,
     interpret,
@@ -250,7 +282,8 @@ def _attention_call(
 ):
     """One kernel call over the tokens of `selected` (a multiple of block_q),
     which start at tile ``tile_offset`` (``int32[1]``) of the head-major
-    ``q [G * Hg, T, D]``, ``local_page`` and ``local_limit [T, 1]``, for
+    ``q [G * Hg, T, D]`` (scaled by ``sm_scale * log2(e)``), ``local_page``
+    and ``local_limit [T, 1]``, for
     query heads ``[b * Hg, (b + 1) * Hg)`` attending cache-row KV head ``k``,
     ``head = (k, b)`` (``int32[2]``: a scalar-prefetch input, not a static,
     so one kernel serves every head).
@@ -266,7 +299,7 @@ def _attention_call(
     # One KV head's [K | V] slice of each row.
     row_width = 2 * head_dim
     topk = selected.shape[1]
-    pages, meta, num_groups = msa_attention._work_list(
+    pages, meta, num_groups, counts = msa_attention._work_list(
         selected, block_q, pages_per_step
     )
 
@@ -275,12 +308,12 @@ def _attention_call(
     def call_tile_block(w, pages, meta, *_):
         return (msa_attention._meta_tile(meta[w], groups_per_tile), 0)
 
-    def tile_block(w, pages, meta, table, head_idx, offset):
+    def tile_block(w, pages, meta, counts, table, head_idx, offset):
         tile = offset[0] + msa_attention._meta_tile(meta[w], groups_per_tile)
         return (tile, 0)
 
-    def head_major_block(w, pages, meta, table, heads, offset):
-        return (heads[1], *tile_block(w, pages, meta, table, heads, offset))
+    def head_major_block(w, pages, meta, counts, table, heads, offset):
+        return (heads[1], *tile_block(w, pages, meta, counts, table, heads, offset))
 
     aliased = out is not None
     in_place = (pl.BlockSpec(memory_space=pl.ANY),) * 2 if aliased else ()
@@ -295,7 +328,7 @@ def _attention_call(
         else ()
     )
     grid_spec = pltpu.PrefetchScalarGridSpec(
-        num_scalar_prefetch=5,
+        num_scalar_prefetch=6,
         grid=(num_groups,),
         in_specs=[
             pl.BlockSpec((num_heads, block_q, head_dim), head_major_block),
@@ -322,11 +355,10 @@ def _attention_call(
             *scale_scratch,
         ],
     )
-    num_inputs = 5 + 5 + len(scale_inputs)
+    num_inputs = 6 + 5 + len(scale_inputs)
     return pl.pallas_call(
         functools.partial(
             _kernel,
-            sm_scale=sm_scale,
             aliased=aliased,
             **({"fp4_rows": scale_rows} if fp4 else {}),
         ),
@@ -339,12 +371,17 @@ def _attention_call(
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("arbitrary",),
             vmem_limit_bytes=msa_attention._VMEM_LIMIT_BYTES,
+            # Every copy's page comes from the page table, so the checks only
+            # add scalar work to each step (as the ragged paged attention).
+            disable_bounds_checks=True,
+            disable_semaphore_checks=True,
         ),
         interpret=interpret,
         name="minimax_m3_msa_sparse_attention_lse",
     )(
         pages,
         meta,
+        counts,
         page_table,
         head,
         tile_offset,
@@ -393,7 +430,6 @@ def _chunked_call(
     call = functools.partial(
         _attention_call,
         q_per_head=num_q_heads // num_heads,
-        sm_scale=sm_scale,
         block_q=block_q,
         pages_per_step=pages_per_step,
         interpret=interpret,
@@ -404,6 +440,8 @@ def _chunked_call(
     step = min(num_tokens, max(block_q, limit - limit % block_q))
     num_chunks = -(-num_tokens // step)
     pad = num_chunks * step - num_tokens
+    # Scores in log2 units: exp2 then needs no multiply per score.
+    q = (q.astype(jnp.float32) * (sm_scale * _LOG2_E)).astype(q.dtype)
     q = jnp.pad(q, ((0, pad), (0, 0), (0, 0))).transpose(1, 0, 2)
     selected = jnp.pad(
         selected, ((0, pad), (0, 0), (0, 0)), constant_values=-1
