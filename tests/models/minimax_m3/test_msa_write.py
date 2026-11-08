@@ -296,3 +296,54 @@ def test_fp4_lowers_for_tpu(width, scale_lanes, tokens):
     with use_abstract_mesh(tpu7x):
         text = jax.jit(fn).trace(*args).lower(lowering_platforms=("tpu",)).as_text()
     assert "minimax_m3_msa_write_rows" in text
+
+
+@pytest.mark.parametrize(
+    "cache_shape,dtype,scale_lanes",
+    [
+        ((2048, 17, 4, 128), jnp.uint8, 1),  # fp4 index
+        ((2048, 17, 4, 1024), jnp.uint8, 8),  # fp4 K/V, G = 4
+        ((2048, 32, 4, 1024), jnp.float8_e4m3fn, 0),  # fp8 K/V, G = 4
+        ((2048, 64, 2, 256), jnp.bfloat16, 0),
+    ],
+)
+def test_compiles_for_tpu7x_without_a_device(cache_shape, dtype, scale_lanes):
+    """Mosaic compiles the kernel (deviceless tpu7x AOT through libtpu), which
+    lowering alone does not prove: a strided load from a W-lane buffer passed
+    lowering and failed Mosaic for W != 128 (j-1044b660)."""
+    from jax.experimental import topologies
+    from jax.sharding import SingleDeviceSharding
+
+    from vllm_torchtpu.models.minimax_m3.kernels import msa_write
+
+    try:
+        topology = topologies.get_topology_desc("tpu7x:2x2x1", "tpu")
+    except Exception as e:  # no libtpu
+        pytest.skip(f"no deviceless tpu7x topology: {e}")
+    sharding = SingleDeviceSharding(topology.devices[0])
+    tokens, width = 256, cache_shape[-1]
+    fp4 = dtype == jnp.uint8
+
+    def spec(shape, dt):
+        return jax.ShapeDtypeStruct(shape, dt, sharding=sharding)
+
+    args = [
+        spec(cache_shape, dtype),
+        spec((tokens, width), dtype),
+        spec((tokens,), jnp.int32),
+        spec((tokens,), jnp.int32),
+    ]
+    if scale_lanes:
+        args.append(spec((tokens, scale_lanes), jnp.float32))
+
+    def fn(cache, rows, pages, slots, scales=None):
+        return msa_write.write_rows(
+            cache, rows, pages, slots,
+            max_runs=msa_write.max_write_runs(tokens, 64, PAGE),
+            bits=4 if fp4 else None, scales=scales,
+        )
+
+    tpu7x = AbstractMesh((), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu"))
+    with use_abstract_mesh(tpu7x):
+        lowered = jax.jit(fn, donate_argnums=0).lower(*args)
+    lowered.compile()

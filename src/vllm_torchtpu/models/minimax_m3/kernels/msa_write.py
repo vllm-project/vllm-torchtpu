@@ -104,6 +104,8 @@ def _merge_scales(words_row, scale_row, lo, hi, page_size, scale_lanes):
     return jnp.where(take, scale_row, words_row)
 
 
+_LANES = 128
+
 # Slots per DMA of `_kernel_chunked`: a decode run of up to 8 tokens moves one
 # or two chunks rather than a page of rows.
 _CHUNK = 8
@@ -117,7 +119,7 @@ def _kernel_chunked(
     run_hi_ref,  # [R] one past the last slot
     run_src_ref,  # [R] row of `rows_hbm` that slot 0 of the run's page maps to
     # In
-    rows_hbm,  # [T + 2C, 4, W] uint8: each token's slot words, left in HBM
+    rows_hbm,  # [W / 128, T + 2C, 4, 128] uint8: each token's slot words by lane tile, in HBM
     page_ref,  # [1, S / p, p, W] the page before the write
     *refs,
     bits: int,
@@ -125,12 +127,14 @@ def _kernel_chunked(
 ):
     """`_kernel` that fetches each run's rows itself: the `_CHUNK`-slot chunks
     covering the run's slots, copied from the batch's rows into a page of rows
-    ``[S, 4, W]`` (slot order), double-buffered across runs.
+    ``[W / 128, S, 4, 128]`` (lane tile, slot order), double-buffered across
+    runs. Lane tiles lead so that each strided slot load reads a 128-lane
+    memref (Mosaic's strided load needs a 128-lane base).
 
     refs: without folded scales ``o_ref``, then scratch ``buf0``, ``buf1`` and
     DMA semaphores ``[2, 2]``. With folded scales the scale lanes
-    ``[T + 2C, 4, 128]`` (in HBM, u32 lane ``j`` = scale ``j``) come first and
-    the scratch adds their ``[S, 4, 128]`` buffers ``sbuf0``, ``sbuf1``.
+    ``[1, T + 2C, 4, 128]`` (in HBM, u32 lane ``j`` = scale ``j``) come first
+    and the scratch adds their ``[1, S, 4, 128]`` buffers ``sbuf0``, ``sbuf1``.
     """
     if scale_lanes:
         scale_hbm, o_ref, buf0, buf1, sbuf0, sbuf1, sems = refs
@@ -150,16 +154,16 @@ def _kernel_chunked(
             first = b * _CHUNK
             copies = [
                 pltpu.make_async_copy(
-                    rows_hbm.at[pl.ds(src + first, _CHUNK)],
-                    buf.at[pl.ds(first, _CHUNK)],
+                    rows_hbm.at[:, pl.ds(src + first, _CHUNK)],
+                    buf.at[:, pl.ds(first, _CHUNK)],
                     sems.at[slot, 0],
                 )
             ]
             if sbuf is not None:
                 copies.append(
                     pltpu.make_async_copy(
-                        scale_hbm.at[pl.ds(src + first, _CHUNK)],
-                        sbuf.at[pl.ds(first, _CHUNK)],
+                        scale_hbm.at[:, pl.ds(src + first, _CHUNK)],
+                        sbuf.at[:, pl.ds(first, _CHUNK)],
                         sems.at[slot, 1],
                     )
                 )
@@ -188,25 +192,27 @@ def _kernel_chunked(
         data_rows = rows - 1 if scale_lanes else rows
         page_size = data_rows * packing
         lo, hi = run_lo_ref[run], run_hi_ref[run]
-        new = buf.bitcast(jnp.uint32).reshape(page_size, width)
         page = page_ref.bitcast(jnp.uint32)
-        words = page[0, :data_rows, 0, :]
-        row = jax.lax.broadcasted_iota(jnp.int32, (data_rows, width), 0)
-        for j in range(packing):
-            # Slot r * p + j of word row r is row r * p + j of the buffer.
-            slot = row * packing + j
-            take = (slot >= lo) & (slot < hi)
-            keep = jnp.uint32(~(((1 << bits) - 1) << (bits * j)) & 0xFFFFFFFF)
-            new_j = new[pl.ds(j, data_rows, stride=packing), :]
-            merged = (words & keep) | (new_j << jnp.uint32(bits * j))
-            words = jnp.where(take, merged, words)
         out = o_ref.bitcast(jnp.uint32)
-        out[0, :data_rows, 0, :] = words
+        row = jax.lax.broadcasted_iota(jnp.int32, (data_rows, _LANES), 0)
+        for c in range(width // _LANES):
+            lanes = pl.ds(c * _LANES, _LANES)
+            new = buf.at[c].bitcast(jnp.uint32).reshape(page_size, _LANES)
+            words = page[0, :data_rows, 0, lanes]
+            for j in range(packing):
+                # Slot r * p + j of word row r is row r * p + j of the buffer.
+                slot = row * packing + j
+                take = (slot >= lo) & (slot < hi)
+                keep = jnp.uint32(~(((1 << bits) - 1) << (bits * j)) & 0xFFFFFFFF)
+                new_j = new[pl.ds(j, data_rows, stride=packing), :]
+                merged = (words & keep) | (new_j << jnp.uint32(bits * j))
+                words = jnp.where(take, merged, words)
+            out[0, :data_rows, 0, lanes] = words
         if scale_lanes:
             # [S, 128] lanes (scale j at lane j) -> [128, S]: row j holds
             # scale j of every slot. Moved as f32 bits, no arithmetic.
-            lanes = sbuf.bitcast(jnp.uint32).reshape(page_size, msa_fp4.SCALE_LANES)
-            by_scale = pltpu.bitcast(lanes[...], jnp.float32).T
+            by_slot = sbuf.at[0].bitcast(jnp.uint32).reshape(page_size, _LANES)
+            by_scale = pltpu.bitcast(by_slot[...], jnp.float32).T
             by_scale = pltpu.bitcast(by_scale, jnp.uint32)
             parts = [by_scale[j : j + 1] for j in range(scale_lanes)]
             if scale_lanes * page_size < width:
@@ -365,11 +371,14 @@ def _word_bits(rows: jax.Array, bits: int) -> jax.Array:
 
 
 def _token_words(words: jax.Array) -> jax.Array:
-    """uint32 ``[T, W]`` -> uint8 ``[T + 2C, 4, W]``: each token's words in the
-    cache's byte layout, so a token is a leading-axis index (any row offset
-    can be copied), with `_CHUNK` zero rows before and after."""
+    """uint32 ``[T, W]`` -> uint8 ``[W / 128, T + 2C, 4, 128]``: each token's
+    words by 128-lane tile in the cache's byte layout, so a token is an
+    untiled index (any row offset can be copied), with `_CHUNK` zero rows
+    before and after."""
+    num_tokens, width = words.shape
     words = jnp.pad(words, ((_CHUNK, _CHUNK), (0, 0)))
-    return jax.lax.bitcast_convert_type(words, jnp.uint8).transpose(0, 2, 1)
+    words = words.reshape(num_tokens + 2 * _CHUNK, width // _LANES, _LANES)
+    return jax.lax.bitcast_convert_type(words, jnp.uint8).transpose(1, 0, 3, 2)
 
 
 @functools.partial(jax.jit, static_argnames=("max_runs", "bits", "interpret"))
@@ -410,8 +419,8 @@ def write_rows(
         )
     data_rows = rows_per_page - 1 if folded else rows_per_page
     page_size = data_rows * packing
-    if page_size % _CHUNK:
-        raise NotImplementedError(f"pages of {page_size} slots")
+    if page_size % _CHUNK or width % _LANES:
+        raise NotImplementedError(f"pages of {page_size} slots, {width} lanes")
     num_runs, run_page, run_lo, run_hi, run_tok0 = _runs(
         pages, slots, num_pages, max_runs
     )
@@ -419,7 +428,7 @@ def write_rows(
     # padded rows; the chunks covering [lo, hi) stay inside the padding.
     run_src = run_tok0 - run_lo + _CHUNK
     token_words = _token_words(_word_bits(rows, bits))
-    scratch = [pltpu.VMEM((page_size, 4, width), jnp.uint8)] * 2
+    scratch = [pltpu.VMEM((width // _LANES, page_size, 4, _LANES), jnp.uint8)] * 2
     extra = []
     scale_lanes = 0
     if folded:
@@ -438,7 +447,7 @@ def write_rows(
             scale_bits, ((0, 0), (0, msa_fp4.SCALE_LANES - scale_lanes))
         )
         extra = [_token_words(scale_bits)]
-        scratch += [pltpu.VMEM((page_size, 4, msa_fp4.SCALE_LANES), jnp.uint8)] * 2
+        scratch += [pltpu.VMEM((1, page_size, 4, _LANES), jnp.uint8)] * 2
     scratch.append(pltpu.SemaphoreType.DMA((2, 2)))
 
     page_block = pl.BlockSpec(

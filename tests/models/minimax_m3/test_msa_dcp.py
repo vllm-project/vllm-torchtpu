@@ -28,9 +28,15 @@ from vllm_torchtpu.models.minimax_m3.kernels import (
     msa_attention,
     msa_attention_lse,
     msa_dcp,
+    msa_indexer,
     msa_select,
     msa_write,
 )
+
+# The in-place write kernel and the block scores, captured before the
+# fixtures replace them.
+_KERNEL_WRITE_ROWS = msa_write.write_rows
+_BLOCK_SCORES = msa_indexer.block_scores
 
 PAGE = 128
 HEAD_DIM = 128
@@ -580,3 +586,105 @@ def test_dcp_op_name_has_no_rank():
     assert "rank" not in params
     src = inspect.getsource(msa_ops.get_msa_dcp_op)
     assert "_r{rank}" not in src and "dcp_rank" in src
+
+
+def test_dcp8_fp4_selection_matches_staged_writes_and_full_scores(monkeypatch):
+    """The served path (DCP8, G = 4 KV heads per rank, folded fp4 caches)
+    over a prefill step and a decode step of requests far shorter than
+    topk * dcp blocks, where most candidates are -inf ties: the in-kernel
+    write fetch and `skip_dead` block scores give the same caches, the same
+    per-rank candidates and the same merged selected blocks as the staged
+    writes with every page group scored (a consumer reading the -inf pages
+    of skipped groups would show here)."""
+    from vllm_torchtpu.models.minimax_m3.kernels import msa_fp4, msa_indexer
+
+    dcp, g, topk = 8, 4, 16
+    config = dict(topk=topk, init_blocks=1, local_blocks=1)
+    rng = np.random.default_rng(88)
+    steps = [([300, 40, 129], [0, 0, 0]), ([1, 8, 8], [300, 40, 129])]
+    logical_pages = 1  # every request fits one logical DCP block of 8 pages
+    tables = np.zeros((MAX_SEQS, logical_pages), np.int32)
+    tables[:3, 0] = rng.permutation(np.arange(1, PAGES))[:3]
+
+    def empty_caches():
+        kv = msa_fp4.pack_rows(
+            jnp.zeros((PAGES, PAGE, 2 * HEAD_DIM * g), jnp.uint8),
+            scales=jnp.zeros((PAGES, 2 * HEAD_DIM * g), jnp.float32),
+        )
+        index = msa_fp4.pack_rows(
+            jnp.zeros((PAGES, PAGE, HEAD_DIM), jnp.uint8),
+            scales=jnp.zeros((PAGES, HEAD_DIM), jnp.float32),
+        )
+        return [(kv, index)] * dcp
+
+    inputs = []
+    for q_lens, ctx_lens in steps:
+        num_real = sum(q_lens)
+        num_tokens = num_real + 3
+        seq_lens = np.zeros(MAX_SEQS, np.int32)
+        seq_lens[:3] = np.add(q_lens, ctx_lens)
+        cu_q = np.full(MAX_SEQS + 1, num_real, np.int32)
+        cu_q[:4] = np.concatenate([[0], np.cumsum(q_lens)])
+
+        def bf16(*shape):
+            return jnp.asarray(rng.standard_normal(shape)).astype(jnp.bfloat16)
+
+        inputs.append(
+            (
+                num_real,
+                (
+                    bf16(num_tokens, g, HEAD_DIM),
+                    bf16(num_tokens, g, HEAD_DIM),
+                    bf16(num_tokens, g, HEAD_DIM),
+                    bf16(num_tokens, HEAD_DIM),
+                ),
+                (
+                    jnp.asarray(seq_lens),
+                    jnp.asarray(tables.reshape(-1)),
+                    jnp.asarray(cu_q),
+                    jnp.asarray([0, 0, 3], jnp.int32),
+                ),
+            )
+        )
+
+    def run(write_rows, skip_dead):
+        monkeypatch.setattr(msa_write, "write_rows", write_rows)
+        monkeypatch.setattr(
+            msa_indexer,
+            "block_scores",
+            functools.partial(_BLOCK_SCORES, skip_dead=skip_dead),
+        )
+        caches, history = empty_caches(), []
+        for num_real, tensors, meta in inputs:
+            candidates = []
+            for rank in range(dcp):
+                kv, index, cand = msa_dcp.msa_write_and_candidates_dcp(
+                    *tensors,
+                    *caches[rank],
+                    *meta,
+                    rank=rank,
+                    dcp=dcp,
+                    interpret=True,
+                    **config,
+                )
+                caches[rank] = (kv, index)
+                candidates.append(cand)
+            candidates = jnp.stack(candidates)
+            selected = msa_dcp.merge_candidates(candidates, topk)
+            history.append(
+                (
+                    [np.asarray(jax.lax.bitcast_convert_type(c, jnp.uint8)) for kv_ix in caches for c in kv_ix],
+                    np.asarray(candidates).view(np.uint32),
+                    np.asarray(selected)[:num_real],
+                )
+            )
+        return history
+
+    got = run(_KERNEL_WRITE_ROWS, True)
+    expected = run(msa_write.write_rows_staged, False)
+    for (g_caches, g_cand, g_sel), (e_caches, e_cand, e_sel) in zip(got, expected):
+        for a, b in zip(g_caches, e_caches):
+            np.testing.assert_array_equal(a, b)
+        np.testing.assert_array_equal(g_cand, e_cand)
+        np.testing.assert_array_equal(g_sel, e_sel)
+        assert (g_sel >= 0).any() and (g_sel < 0).any()  # real picks and -inf ties
