@@ -3322,7 +3322,8 @@ class TPUModelRunner(GPUModelRunner):
         local_padded_total_num_scheduled_tokens = layout_plan.local_padded_num_tokens
         if (bucket_stats := getattr(self, "_bucket_stats", None)) is not None:
             bucket_stats.record(
-                local_padded_total_num_scheduled_tokens, local_total_num_scheduled_tokens
+                local_padded_total_num_scheduled_tokens,
+                local_total_num_scheduled_tokens,
             )
         local_token_slice = layout_plan.token_slice
         if layout_plan.kind is SequenceLayoutKind.ALL:
@@ -5777,10 +5778,32 @@ class TPUModelRunner(GPUModelRunner):
         with KV blocks.
         """
         return utils.HbmReserves(
-            kv_connector=utils.estimate_kv_connector_hbm_reserve(self.vllm_config),
+            kv_connector=utils.estimate_kv_connector_hbm_reserve(self.vllm_config)
+            + self._raiden_staging_hbm_reserve_bytes(),
             lora_slot_write=self.lora_slot_write_hbm_bytes(),
             pp_handoff=self.pp_handoff_hbm_reserve_bytes(),
         )
+
+    def _raiden_staging_hbm_reserve_bytes(self) -> int:
+        """The Raiden offload staging rows (`offload.raiden_staging`), which
+        its connector allocates in register_kv_caches, after the profile."""
+        from vllm_torchtpu.offload.raiden_staging import (
+            staging_extra_config,
+            staging_hbm_reserve_bytes,
+        )
+
+        if staging_extra_config(self.vllm_config) is None:
+            return 0
+        from vllm_torchtpu.offload.raiden_store import iter_leaf_kv_cache_specs
+
+        leaves = {}
+        for name, spec in self.get_kv_cache_spec().items():
+            nested = getattr(spec, "kv_cache_specs", None)
+            if nested:
+                leaves.update(nested)
+            else:
+                leaves[name] = next(iter_leaf_kv_cache_specs(spec))
+        return staging_hbm_reserve_bytes(self.vllm_config, leaves)
 
     def _initialize_pallas_kernels(self):
         self._initialize_attention_kernels()
