@@ -1624,6 +1624,7 @@ def _attention_kernel(
     # (nope 192 | rope 64) and a second input `tab_hbm_ref` f32[tokens, 2, 128]
     # holds per-token C = [cos, cos, cos, cos], S = [-sin, sin, -sin, sin]
     # (each with its own VMEM double buffer, the scratch ref before q_pe's).
+    # (Or only lanes 128:256 of it, `[tokens, heads, 128]`: TPU_MLA_ABSORB_FULL_Q.)
     # `load_bq` takes lanes 128:256 of each head (q_nope[128:192] | q_pe),
     # rotates the NeoX halves of q_pe with lane rolls, forms x*C + rot(x)*S
     # in f32 (bf16 products are exact there; one add, one RNE rounding) and
@@ -2226,7 +2227,7 @@ def _attention_kernel(
                     q_pe_hbm_ref.at[
                         pl.ds(seq_idx_start, batch_size),
                         :,
-                        pl.ds(Q_ROPE_HEAD_DIM - 128, 128),
+                        pl.ds(q_pe_hbm_ref.shape[-1] - 128, 128),
                     ],
                     bq_pe_x2_ref.at[bq_sem_idx, :],
                     sem,
@@ -2362,7 +2363,9 @@ def _attention_kernel(
         if q_rope:
             # The caller's rope + concat + zero pad, rebuilt in VMEM: lanes
             # 128:256 of the raw head are one aligned vreg column.
-            if q128:
+            if q128 or bq_pe_x2_ref.shape[-1] == 128:
+                # (A 128-lane q_pe is already those lanes: absorb_q_full's
+                # tail, TPU_MLA_ABSORB_FULL_Q.)
                 raw = bq_pe_x2_ref.at[bq_sem_idx, batch_idx][...]
             else:
                 raw = bq_pe_x2_ref.at[bq_sem_idx, batch_idx][:, 128:Q_ROPE_HEAD_DIM]
@@ -3738,10 +3741,11 @@ def sparse_ragged_paged_attention(
             "(int32 [2]: rank, lane)"
         )
     if q_rope_table is not None:
-        if q_pe is None or q_pe.shape[-1] != Q_ROPE_HEAD_DIM:
+        # The raw head, or only its last 128 lanes (TPU_MLA_ABSORB_FULL_Q).
+        if q_pe is None or q_pe.shape[-1] not in (Q_ROPE_HEAD_DIM, 128):
             raise ValueError(
                 "q_rope_table needs the raw q head view as q_pe, "
-                f"[tokens, heads, {Q_ROPE_HEAD_DIM}]"
+                f"[tokens, heads, {Q_ROPE_HEAD_DIM}], or its last 128 lanes"
             )
         if q_rope_table.shape != (q.shape[0], 2, 128) or (
             q_rope_table.dtype != jnp.float32

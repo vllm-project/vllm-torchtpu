@@ -22,7 +22,9 @@ q_nope and writes the absorbed q token-major.
 `[T, H * head_dim]`, in the layout q_b wrote it (tokens on sublanes). Viewing
 that as `[T, H, head_dim]` for `absorb_q` makes XLA relayout the whole of q
 (heads on sublanes) ahead of the kernel; here each head's nope lanes are a
-128-aligned lane slice of the block, so no relayout runs anywhere.
+128-aligned lane slice of the block, so no relayout runs anywhere. It also
+writes each head's last 128 lanes (raw q_pe and the nope lanes beside it) for
+the TPU_MLA_DECODE_PROLOGUE attention kernel, the other reader of q.
 """
 
 import functools
@@ -38,6 +40,8 @@ MAX_BLOCK_TOKENS = 128
 # Below this, XLA's matmul is as fast: it prefetches W_UK into VMEM under the
 # previous op, while the kernel has to read it itself (measured at decode).
 MIN_TOKENS = 256
+# `absorb_q_full`'s second output: each head's last 128 lanes.
+TAIL_LANES = 128
 
 
 def _kernel(q_ref, w_ref, o_ref):
@@ -49,7 +53,7 @@ def _kernel(q_ref, w_ref, o_ref):
     o_ref[...] = pltpu.einshape("htd->thd", jnp.stack(out).astype(o_ref.dtype))
 
 
-def _full_q_kernel(q_ref, w_ref, o_ref, *, head_dim):
+def _full_q_kernel(q_ref, w_ref, o_ref, tail_ref, *, head_dim):
     heads, nope = w_ref.shape[0], w_ref.shape[1]
     # Head h's nope lanes, [h * head_dim, h * head_dim + nope): a static slice
     # starting on a 128-lane boundary. The same (block, nope) @ (nope, R)
@@ -63,13 +67,20 @@ def _full_q_kernel(q_ref, w_ref, o_ref, *, head_dim):
         for h in range(heads)
     ]
     o_ref[...] = pltpu.einshape("htd->thd", jnp.stack(out).astype(o_ref.dtype))
+    # Each head's last 128 lanes, as they are (one aligned vreg column): the
+    # raw q_pe and the nope lanes beside it, what the prologue kernel ropes.
+    tail = [
+        q_ref[:, (h + 1) * head_dim - TAIL_LANES : (h + 1) * head_dim]
+        for h in range(heads)
+    ]
+    tail_ref[...] = pltpu.einshape("htd->thd", jnp.stack(tail))
 
 
 def absorb_q_full(
     q: jax.Array, w_uk_t: jax.Array, *, interpret: bool = False
-) -> jax.Array:
-    """`absorb_q(q.reshape(T, H, head_dim)[..., :nope], w_uk_t)`, read from q
-    as the q_b projection wrote it.
+) -> tuple[jax.Array, jax.Array]:
+    """`absorb_q(q.reshape(T, H, head_dim)[..., :nope], w_uk_t)` and the raw
+    rope lanes, both read in one pass over q as the q_b projection wrote it.
 
     Args:
       q: `[T, H * head_dim]`, each head's nope channels first.
@@ -77,7 +88,11 @@ def absorb_q_full(
       interpret: run the Pallas kernel in interpret mode (CPU tests).
 
     Returns:
-      `[T, H, R]` in `q.dtype`, bit-identical to `absorb_q` on the slice.
+      `[T, H, R]` in `q.dtype`, bit-identical to `absorb_q` on the slice, and
+      `q.reshape(T, H, head_dim)[..., -128:]` (`[T, H, 128]`, un-roped: q_pe
+      in its last `head_dim - nope` lanes) -- the lanes of the raw q head the
+      TPU_MLA_DECODE_PROLOGUE kernel reads, without the `[T, H, head_dim]`
+      relayout of q.
     """
     tokens, width = q.shape
     heads, nope, rank = w_uk_t.shape
@@ -88,7 +103,8 @@ def absorb_q_full(
             f"head_dim >= nope ({nope})"
         )
     if tokens < MIN_TOKENS:
-        return absorb_q(q.reshape(tokens, heads, head_dim)[..., :nope], w_uk_t)
+        q3 = q.reshape(tokens, heads, head_dim)
+        return absorb_q(q3[..., :nope], w_uk_t), q3[..., -TAIL_LANES:]
     block = min(tokens, MAX_BLOCK_TOKENS)
     if interpret:
         vmem_limit = None
@@ -105,8 +121,14 @@ def absorb_q_full(
                 w_uk_t.shape, lambda i: (0, 0, 0), pipeline_mode=pl.Buffered(1)
             ),
         ],
-        out_specs=pl.BlockSpec((block, heads, rank), lambda i: (i, 0, 0)),
-        out_shape=jax.ShapeDtypeStruct((tokens, heads, rank), q.dtype),
+        out_specs=[
+            pl.BlockSpec((block, heads, rank), lambda i: (i, 0, 0)),
+            pl.BlockSpec((block, heads, TAIL_LANES), lambda i: (i, 0, 0)),
+        ],
+        out_shape=[
+            jax.ShapeDtypeStruct((tokens, heads, rank), q.dtype),
+            jax.ShapeDtypeStruct((tokens, heads, TAIL_LANES), q.dtype),
+        ],
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel",),
             vmem_limit_bytes=vmem_limit,

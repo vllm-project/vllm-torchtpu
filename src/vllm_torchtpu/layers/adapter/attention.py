@@ -66,6 +66,7 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
     pcp_streaming_jax_op,
 )
 from vllm_torchtpu.kernels.mla import kv_cache_utils
+from vllm_torchtpu.kernels.mla.absorb_q import TAIL_LANES as ABSORB_Q_TAIL_LANES
 from vllm_torchtpu.kernels.mla.absorb_q import absorb_q, absorb_q_full
 from vllm_torchtpu.kernels.mla.kv_cache_utils import (
     KVCacheLayout,
@@ -117,11 +118,18 @@ _absorb_q = pallas.jax_op("pallas::mla_absorb_q", absorb_q)
 _absorb_q.register_fake(_fake_absorb_q)
 
 
-def _fake_absorb_q_full(q: torch.Tensor, w_uk_t: torch.Tensor) -> torch.Tensor:
-    return q.new_empty((q.shape[0], w_uk_t.shape[0], w_uk_t.shape[2]))
+def _fake_absorb_q_full(
+    q: torch.Tensor, w_uk_t: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    tokens, heads = q.shape[0], w_uk_t.shape[0]
+    return (
+        q.new_empty((tokens, heads, w_uk_t.shape[2])),
+        q.new_empty((tokens, heads, ABSORB_Q_TAIL_LANES)),
+    )
 
 
-# TPU_MLA_ABSORB_FULL_Q: absorb_q on the q_b output [T, H * qk_head_dim].
+# TPU_MLA_ABSORB_FULL_Q: absorb_q on the q_b output [T, H * qk_head_dim], plus
+# each head's last 128 lanes for the prologue kernel.
 _absorb_q_full = pallas.jax_op("pallas::mla_absorb_q_full", absorb_q_full)
 _absorb_q_full.register_fake(_fake_absorb_q_full)
 
@@ -2890,19 +2898,20 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 q_nope.shape[0], vllm_compilation_backends.model_tag == "backbone"
             )
         )
-        pe_dim = q_pe.shape[-1] if q_rope_table else layer.qk_rope_head_dim
 
         # Evaluate projection matrices directly across input precision
         # (`bfloat16`/`float16`/`fp8`) without dynamic `.to(torch.float32)` casting
         # right before `torch.bmm`.
         use_kernel = q_nope.device.type == "tpu" and w_uk_t_scale is None
-        # TPU_MLA_ABSORB_FULL_Q hands the whole q, [T, H * head_dim], each
-        # head's nope channels first; only the kernel reads it that way.
+        # TPU_MLA_ABSORB_FULL_Q hands the whole q, [T, H * head_dim], as both
+        # q_nope and q_pe (prologue on). The kernel returns the absorbed q and
+        # each head's last 128 lanes, the raw head lanes the prologue ropes;
+        # off the kernel, view q per head (the raw q head view, as before).
         if q_nope.dim() == 2 and not use_kernel:
-            q_nope = q_nope.view(q_nope.shape[0], attn_heads, -1)
-            q_nope = q_nope[..., : w_uk_t_src.shape[1]]
+            q_pe = q_nope.view(q_nope.shape[0], attn_heads, -1)
+            q_nope = q_pe[..., : w_uk_t_src.shape[1]]
         if q_nope.dim() == 2:
-            ql_nope = _absorb_q_full(q_nope, w_uk_t_src.to(q_nope.dtype))
+            ql_nope, q_pe = _absorb_q_full(q_nope, w_uk_t_src.to(q_nope.dtype))
             ql_nope = ql_nope.to(input_dtype)
         elif use_kernel:
             ql_nope = _absorb_q(q_nope, w_uk_t_src.to(q_nope.dtype)).to(input_dtype)
@@ -2912,6 +2921,8 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             if w_uk_t_scale is not None:
                 ql_nope = ql_nope * w_uk_t_scale
             ql_nope = ql_nope.transpose(0, 1).to(input_dtype)
+
+        pe_dim = q_pe.shape[-1] if q_rope_table else layer.qk_rope_head_dim
 
         q_scale, k_scale, v_scale = self._get_kv_scales(layer)
 

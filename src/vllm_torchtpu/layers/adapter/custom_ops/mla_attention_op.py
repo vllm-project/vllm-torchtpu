@@ -2203,42 +2203,48 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
 
         # `dcp_group_size` is 1 unless query replication is on, in which case
         # the projection already returned the whole DCP group's heads.
-        # TPU_MLA_ABSORB_FULL_Q: the replicated sparse path's absorb_q reads q
-        # as q_b wrote it, [T, H * qk_head_dim]; viewing it [T, H, qk_head_dim]
-        # for the kernel is a relayout of all of q. Fixed at trace time on the
-        # bucket size: decode buckets keep XLA's einsum and the prologue. The
-        # backbone only: it is traced per bucket, so the comparison is static;
-        # the MTP drafter has one graph for every bucket and never compares.
-        absorb_full_q = (
-            envs.TPU_MLA_ABSORB_FULL_Q
-            and self.dcp_q_replicate
-            and self.is_sparse
-            and llama_4_scaling is None
-            and self.qk_head_dim % 128 == 0
-            and vllm_compilation_backends.model_tag == "backbone"
-            and q.shape[0] > envs.bucket_gate_edge(ABSORB_Q_MIN_TOKENS)
-        )
-        q_flat = q.reshape(q.shape[0], -1) if absorb_full_q else None
-        q = q.view(-1, self.num_heads * self.dcp_group_size, self.qk_head_dim)
-        q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-
-        # Add head dim of 1 to k_pe
-        k_pe = k_pe.unsqueeze(1)
-
         q_rope_table = None
-        # Not with TPU_MLA_ABSORB_FULL_Q: the prologue kernel reads the raw q
-        # head [T, H, qk_head_dim], which would bring the relayout back.
         fold_q_rope = (
             getattr(self, "decode_prologue", False)
             and getattr(self, "_rope_neox_permuted", False)
             and llama_4_scaling is None
-            and not absorb_full_q
         )
+        # TPU_MLA_ABSORB_FULL_Q (with the prologue): q stays [T, H * 256] as
+        # q_b wrote it. Viewing it [T, H, 256] is a relayout of all of q, which
+        # XLA runs for whichever op reads that view; here none does: absorb_q
+        # reads q itself and hands the prologue kernel each head's last 128
+        # lanes. Fixed at trace time on the bucket size: decode buckets keep
+        # XLA's einsum. The backbone only: it is traced per bucket, so the
+        # comparison is static; the MTP drafter has one graph for every bucket.
+        absorb_full_q = (
+            envs.TPU_MLA_ABSORB_FULL_Q
+            and fold_q_rope
+            and self.qk_head_dim % 128 == 0
+            and vllm_compilation_backends.model_tag == "backbone"
+            and q.shape[0] > envs.bucket_gate_edge(ABSORB_Q_MIN_TOKENS)
+        )
+        if absorb_full_q:
+            q = q.reshape(q.shape[0], -1)
+            # Only dtype and token count are read from these (the sparse DCP
+            # path takes q_dcp_replicated); no per-head view of q exists.
+            q_nope = q_pe = q
+        else:
+            q = q.view(-1, self.num_heads * self.dcp_group_size, self.qk_head_dim)
+            q_nope, q_pe = q.split(
+                [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+            )
+
+        # Add head dim of 1 to k_pe
+        k_pe = k_pe.unsqueeze(1)
+
         if fold_q_rope:
-            # k_pe exactly as below (the unused q half is dead code to XLA);
+            # k_pe exactly as below (the unused q half is dead code to XLA;
+            # under TPU_MLA_ABSORB_FULL_Q it is k_pe's own, so q is not read);
             # q_pe is roped in the attention kernel from the raw q head.
             k_pe_dtype = k_pe.dtype
-            _, k_pe = rope_half_split(self.rotary_emb, positions, q_pe, k_pe)
+            _, k_pe = rope_half_split(
+                self.rotary_emb, positions, k_pe if absorb_full_q else q_pe, k_pe
+            )
             assert k_pe is not None
             k_pe = k_pe.to(dtype=k_pe_dtype)
             q_rope_table = mla_q_rope_table(self.rotary_emb, positions, q)
@@ -2280,13 +2286,15 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         q_dcp_replicated = None
         if self.dcp_q_replicate:
             if q_rope_table is not None:
-                # The raw q head view (q_pe un-roped) + the rope table.
+                # The raw q head view (q_pe un-roped) + the rope table; under
+                # TPU_MLA_ABSORB_FULL_Q, q [T, H * 256] twice (2-D marks it).
                 q_dcp_replicated = (q_nope, q, q_rope_table)
             elif self.is_sparse:
-                # A 2-D first element is the whole q (TPU_MLA_ABSORB_FULL_Q).
-                q_dcp_replicated = (q_flat if absorb_full_q else q_nope, q_pe)
+                q_dcp_replicated = (q_nope, q_pe)
             q_proj_layer = cast(DCPGroupColumnParallelLinear, self._q_proj_layer())
-            if q_dcp_replicated is not None and topk_indices is not None:
+            if absorb_full_q:
+                pass  # this rank's shard is dead and never sliced
+            elif q_dcp_replicated is not None and topk_indices is not None:
                 # The sparse DCP path reads only q_dcp_replicated, so this
                 # rank's shard is dead. Slice the same heads on every rank: a
                 # rank-dependent slice makes every rank trace a different graph,
