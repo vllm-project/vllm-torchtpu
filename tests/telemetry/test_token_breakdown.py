@@ -165,6 +165,31 @@ def test_routing_loss_and_subagent_fork_inheritance():
     )
     assert hop_res.total_tokens == len(hop_prompt)
 
+    # Server hop with multiple trailing user messages after the last assistant turn:
+    # [sys .. 151645, user_1 .. 151645, <|im_start|>assistant (151644, 77091) .. 151645,
+    #  user_2_tool_output .. 151645, user_2_extra_msg .. 151645]
+    # Last completed assistant reply ends at index 14 -> [0..14) is prior history (4 cache_hit + 10 routing_loss),
+    # and both trailing user messages [14..26) are new_input (12 tokens).
+    hop_multi_user_prompt = [
+        10, 11, 12, 151645,
+        20, 21, 22, 151645,
+        151644, 77091, 30, 31, 32, 151645,
+        40, 41, 42, 43, 44, 151645,
+        50, 51, 52, 53, 54, 151645,
+    ]
+    hop_multi_res = tracker.classify_prefill(
+        hop_multi_user_prompt,
+        num_cached_tokens=4,
+        session_id="hopped-multi-user-sess",
+        turn_id=2,
+    )
+    assert hop_multi_res == TokenBreakdown(
+        cache_hit=4,
+        routing_loss=10,
+        new_input=12,
+    )
+    assert hop_multi_res.total_tokens == len(hop_multi_user_prompt)
+
 
 def test_tier1_to_tier2_demotion_preserves_attribution():
     tracker = SessionTurnTracker(block_size=4, tier1_maxsize=1, tier2_maxsize=10)

@@ -5,6 +5,7 @@ import pytest
 
 from vllm_torchtpu.telemetry.eviction_tracker import (
     BlockEvictionTracker,
+    TpuPaddingCounterTracker,
     compute_request_padding_tokens,
     compute_tpu_bucket_padding_tokens,
     extract_hardware_span_attributes,
@@ -94,12 +95,38 @@ def test_extract_hardware_span_attributes():
 def test_session_eviction_and_lru_horizon_for_joiner():
     tracker = BlockEvictionTracker()
     tracker.register_session_blocks("sess-A", ["blk-1", "blk-2"])
+    tracker.register_session_blocks("sess-B", ["blk-3", "blk-4"])
     assert tracker.session_evicted_at_ms("sess-A") is None
-    assert tracker.lru_horizon_ms(now=50.0) is None
+    assert tracker.lru_horizon_ms(now=50.0, session_id="sess-A") is None
 
     tracker.record_eviction("blk-1", now=40.0, wall_time_ms=1700000040000)
+    tracker.record_eviction("blk-3", now=52.0, wall_time_ms=1700000052000)
+
     assert tracker.session_evicted_at_ms("sess-A") == 1700000040000
-    assert tracker.lru_horizon_ms(now=54.0) == pytest.approx(14000.0)
+    assert tracker.session_evicted_at_ms("sess-B") == 1700000052000
+    assert tracker.lru_horizon_ms(now=54.0, session_id="sess-A") == pytest.approx(
+        14000.0
+    )
+    assert tracker.lru_horizon_ms(now=54.0, session_id="sess-B") == pytest.approx(
+        2000.0
+    )
+    assert tracker.lru_horizon_ms(now=54.0, session_id="sess-C") is None
+
+
+def test_tpu_padding_counter_tracker():
+    pad = TpuPaddingCounterTracker()
+    pad.record_round(430, 512, is_prompt_round=True)
+    pad.record_round(1, 16, is_prompt_round=False)
+    pad.record_round(1, 16, is_prompt_round=False)
+
+    assert pad.as_dict() == {
+        "prompt_rounds": 1,
+        "prompt_real_tokens": 430,
+        "prompt_filler_tokens": 82,
+        "reply_rounds": 2,
+        "reply_real_tokens": 2,
+        "reply_filler_tokens": 30,
+    }
 
 
 @pytest.mark.parametrize(

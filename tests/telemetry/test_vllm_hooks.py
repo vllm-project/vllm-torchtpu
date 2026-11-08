@@ -265,7 +265,109 @@ def test_vllm_v1_prefill_stats_weight_version_and_contextvar_headers(tmp_path) -
     assert logged["gen_ai.usage.input_tokens.cache_hit"] == 4
     assert logged["gen_ai.usage.input_tokens.new_input"] == 4
     assert logged["vllm.kv_cache.dram_tokens"] == 4
-    assert logged["vllm.tpu.shape_padding_tokens"] == 12
+    assert "vllm.tpu.shape_padding_tokens" not in logged
+
+
+def test_batch_eviction_sync_and_server_padding_hook(monkeypatch) -> None:
+    """Verify once-per-step batch eviction sync and TPU round padding counter hook."""
+    from vllm_torchtpu.telemetry.vllm_hooks import patch_tpu_padding_metrics
+
+    monkeypatch.setattr(envs, "VLLM_TPU_AGENTIC_TELEMETRY", True)
+    svc = AgenticTelemetryService(block_size=4, replica_id="test-rep-batch")
+
+    class FakeBatchBlockPool:
+        def __init__(self) -> None:
+            self.blocks = [
+                SimpleNamespace(block_hash=111, is_null=False),
+                SimpleNamespace(block_hash=222, is_null=False),
+            ]
+
+        def cache_full_blocks(
+            self,
+            request: Any,
+            blocks: list[Any],
+            num_cached_blocks: int,
+            num_full_blocks: int,
+            block_size: int,
+            *args: Any,
+            **kwargs: Any,
+        ) -> None:
+            pass
+
+        def _maybe_evict_cached_block(self, block: Any) -> bool:
+            if block.block_hash is None:
+                return False
+            block.block_hash = None
+            return True
+
+        def get_new_blocks(self, num_blocks: int) -> list[Any]:
+            for b in self.blocks[:num_blocks]:
+                self._maybe_evict_cached_block(b)
+            return self.blocks[:num_blocks]
+
+    patch_block_pool(FakeBatchBlockPool, service=svc)
+    pool = FakeBatchBlockPool()
+    req_a = SimpleNamespace(
+        trace_headers={"x-agent-session-id": "sess-batch-a"},
+        all_token_ids=[1, 2, 3, 4, 5, 6, 7, 8],
+    )
+    pool.cache_full_blocks(req_a, pool.blocks, 0, 2, 4)
+    assert pool.blocks[0]._cuj2_session_id == "sess-batch-a"
+    assert pool.blocks[1]._cuj2_session_id == "sess-batch-a"
+
+    flush_calls = []
+    orig_flush = svc.flush_eviction_sync
+    monkeypatch.setattr(
+        svc,
+        "flush_eviction_sync",
+        lambda: (flush_calls.append(1), orig_flush()),
+    )
+    pool.get_new_blocks(2)
+    assert len(flush_calls) == 1
+    assert svc.eviction_tracker.session_evicted_at_ms("sess-batch-a") is not None
+
+    class FakeRunner:
+        def __init__(self) -> None:
+            self._last_sequence_layout_plan = SimpleNamespace(
+                global_num_tokens=430,
+                global_padded_num_tokens=512,
+            )
+
+        def _prepare_inputs(
+            self, scheduler_output: Any, start_index: int
+        ) -> tuple[Any, ...]:
+            return (None, None, 1, 1)
+
+    patch_tpu_padding_metrics(FakeRunner, service=svc)
+    runner = FakeRunner()
+    runner._prepare_inputs(SimpleNamespace(total_num_scheduled_tokens=430), 0)
+    runner._last_sequence_layout_plan = SimpleNamespace(
+        global_num_tokens=1,
+        global_padded_num_tokens=16,
+    )
+    runner._prepare_inputs(SimpleNamespace(total_num_scheduled_tokens=1), 0)
+
+    counts = svc.sync_padding_state()
+    assert counts["prompt_rounds"] == 1
+    assert counts["prompt_real_tokens"] == 430
+    assert counts["prompt_filler_tokens"] == 82
+    assert counts["reply_rounds"] == 1
+    assert counts["reply_real_tokens"] == 1
+    assert counts["reply_filler_tokens"] == 15
+
+
+def test_installer_fails_loudly_on_missing_anchor(tmp_path) -> None:
+    """`install_into_tree` raises `RuntimeError` if target files or anchors are missing."""
+    import pytest
+    from vllm_torchtpu.telemetry.install import install_into_tree
+
+    pkg_dir = tmp_path / "vllm_torchtpu"
+    pkg_dir.mkdir()
+    (pkg_dir / "envs.py").write_text("environment_variables = {}\n", encoding="utf-8")
+    (pkg_dir / "patch_registry.py").write_text("def foo(): pass\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="Failed to locate"):
+        install_into_tree(pkg_dir)
 
 
 def test_golden_fixtures_match_schema_contract() -> None:

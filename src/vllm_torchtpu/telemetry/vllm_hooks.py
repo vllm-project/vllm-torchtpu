@@ -7,12 +7,14 @@ import logging
 import os
 import socket
 import sys
+import time
 from collections.abc import Mapping
 from typing import Any
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.telemetry.eviction_tracker import (
     BlockEvictionTracker,
+    TpuPaddingCounterTracker,
     compute_tpu_bucket_padding_tokens,
     extract_hardware_span_attributes,
 )
@@ -63,8 +65,17 @@ SPAN_ATTRIBUTE_KEYS: tuple[str, ...] = (
 _ACTIVE_TRACE_HEADERS: contextvars.ContextVar[dict[str, str] | None] = (
     contextvars.ContextVar("_ACTIVE_TRACE_HEADERS", default=None)
 )
-_BLOCK_SIZE_SYNC_PATH = "/tmp/.vllm_tpu_agentic_block_size"
-_EVICTION_SYNC_PATH = "/tmp/.vllm_tpu_agentic_eviction_state"
+
+
+def _ipc_base_dir() -> str:
+    if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK):
+        return "/dev/shm"
+    return "/tmp"
+
+
+_BLOCK_SIZE_SYNC_PATH = f"{_ipc_base_dir()}/.vllm_tpu_agentic_block_size"
+_EVICTION_SYNC_PATH = f"{_ipc_base_dir()}/.vllm_tpu_agentic_eviction_state"
+_PADDING_SYNC_PATH = f"{_ipc_base_dir()}/.vllm_tpu_agentic_padding_state"
 
 
 def _resolve_trace_headers(
@@ -130,7 +141,7 @@ def extract_agent_headers(
 
 
 class AgenticTelemetryService:
-    """Coordinates session turn tracking, block eviction age, and span emission."""
+    """Coordinates session turn tracking, block eviction age, padding metrics, and span emission."""
 
     def __init__(
         self,
@@ -140,6 +151,7 @@ class AgenticTelemetryService:
         span_log_path: str | None = None,
         session_tracker: SessionTurnTracker | None = None,
         eviction_tracker: BlockEvictionTracker | None = None,
+        padding_tracker: TpuPaddingCounterTracker | None = None,
     ) -> None:
         self.replica_id = (
             replica_id
@@ -158,6 +170,7 @@ class AgenticTelemetryService:
             or session_tracker is not None
             or bool(env_bs)
         )
+        self._block_size_checked = self._explicit_block_size
         resolved_block_size = (
             block_size
             if block_size is not None
@@ -167,39 +180,122 @@ class AgenticTelemetryService:
             block_size=resolved_block_size
         )
         self.eviction_tracker = eviction_tracker or BlockEvictionTracker()
+        self.padding_tracker = padding_tracker or TpuPaddingCounterTracker()
         self.category_totals: dict[str, int] = {cat: 0 for cat in CATEGORIES}
         self._req_breakdowns: dict[str, TokenBreakdown] = {}
         self._req_external_tokens: dict[str, int] = {}
+        self._req_prefill_ts: dict[str, float] = {}
+        self._eviction_sync_dirty: bool = False
 
-    def _eviction_sync_path(self) -> str:
-        safe_rep = "".join(
+    def _safe_replica_id(self) -> str:
+        return "".join(
             c if c.isalnum() or c in ("-", "_", ".") else "_"
             for c in str(self.replica_id)
         )
-        return f"{_EVICTION_SYNC_PATH}_{safe_rep}"
+
+    def _eviction_sync_path(self) -> str:
+        return f"{_EVICTION_SYNC_PATH}_{self._safe_replica_id()}"
+
+    def _padding_sync_path(self) -> str:
+        return f"{_PADDING_SYNC_PATH}_{self._safe_replica_id()}"
+
+    def on_tpu_round_padded(
+        self,
+        scheduled_tokens: int,
+        padded_tokens: int,
+        *,
+        is_prompt_round: bool,
+        sync_ipc: bool = True,
+    ) -> None:
+        """Record one TPU round's real vs filler tokens and sync to shared memory."""
+        self.padding_tracker.record_round(
+            scheduled_tokens,
+            padded_tokens,
+            is_prompt_round=is_prompt_round,
+        )
+        if sync_ipc and envs.VLLM_TPU_AGENTIC_TELEMETRY:
+            try:
+                with open(self._padding_sync_path(), "w", encoding="utf-8") as f:
+                    json.dump(self.padding_tracker.as_dict(), f)
+            except OSError:
+                pass
+
+    def sync_padding_state(self) -> dict[str, int]:
+        """Sync TPU round padding counters from EngineCore shared memory."""
+        sync_path = self._padding_sync_path()
+        if envs.VLLM_TPU_AGENTIC_TELEMETRY and os.path.exists(sync_path):
+            try:
+                with open(sync_path, encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, Mapping):
+                    self.padding_tracker.update_from_dict(data)
+            except (OSError, ValueError):
+                pass
+        return self.padding_tracker.as_dict()
+
+    def flush_eviction_sync(self) -> None:
+        """Flush pending per-session eviction timestamps once per step to shared memory."""
+        if not self._eviction_sync_dirty or not envs.VLLM_TPU_AGENTIC_TELEMETRY:
+            return
+        self._eviction_sync_dirty = False
+        payload = {
+            "sessions": self.eviction_tracker.export_session_state(),
+            "last": [
+                self.eviction_tracker._last_evicted_ts,
+                self.eviction_tracker._last_evicted_wall_ms,
+            ],
+        }
+        try:
+            with open(self._eviction_sync_path(), "w", encoding="utf-8") as f:
+                json.dump(payload, f)
+        except OSError:
+            pass
 
     def _maybe_sync_eviction_state(self) -> None:
-        """Sync recent HBM eviction timestamps from EngineCore child process."""
+        """Sync per-session HBM eviction timestamps from EngineCore child process."""
         sync_path = self._eviction_sync_path()
         if not envs.VLLM_TPU_AGENTIC_TELEMETRY or not os.path.exists(sync_path):
             return
         try:
             with open(sync_path, encoding="utf-8") as f:
-                parts = f.read().strip().split()
-            if len(parts) >= 2:
-                ts = float(parts[0])
-                wall_ms = int(parts[1])
-                cur_ts = self.eviction_tracker._last_evicted_ts
-                if cur_ts is None or ts > cur_ts:
-                    self.eviction_tracker._last_evicted_ts = ts
-                    self.eviction_tracker._last_evicted_wall_ms = wall_ms
+                raw = f.read().strip()
+            if not raw:
+                return
+            if raw.startswith("{"):
+                data = json.loads(raw)
+                sessions = data.get("sessions")
+                if isinstance(sessions, Mapping):
+                    self.eviction_tracker.import_session_state(sessions)
+                last = data.get("last")
+                if (
+                    isinstance(last, list)
+                    and len(last) >= 2
+                    and last[0] is not None
+                    and last[1] is not None
+                ):
+                    ts = float(last[0])
+                    wall_ms = int(last[1])
+                    cur_ts = self.eviction_tracker._last_evicted_ts
+                    if cur_ts is None or ts > cur_ts:
+                        self.eviction_tracker._last_evicted_ts = ts
+                        self.eviction_tracker._last_evicted_wall_ms = wall_ms
+            else:
+                parts = raw.split()
+                if len(parts) >= 2:
+                    ts = float(parts[0])
+                    wall_ms = int(parts[1])
+                    cur_ts = self.eviction_tracker._last_evicted_ts
+                    if cur_ts is None or ts > cur_ts:
+                        self.eviction_tracker._last_evicted_ts = ts
+                        self.eviction_tracker._last_evicted_wall_ms = wall_ms
         except (OSError, ValueError):
             pass
 
     def _maybe_sync_vllm_block_size(self) -> None:
         """Auto-detect `cache_config.block_size` (e.g. 64/128 on TPU) once if not explicitly set."""
-        if self._explicit_block_size:
+        if self._explicit_block_size or self._block_size_checked:
             return
+        self._block_size_checked = True
         env_bs = os.environ.get("VLLM_TPU_AGENTIC_BLOCK_SIZE")
         if env_bs:
             try:
@@ -231,22 +327,21 @@ class AgenticTelemetryService:
         except Exception:
             pass
 
-    def on_block_evicted(self, block_hash: Any, now: float | None = None) -> None:
-        """Record an HBM block eviction event."""
-        self.eviction_tracker.record_eviction(block_hash, now=now)
-        if (
-            envs.VLLM_TPU_AGENTIC_TELEMETRY
-            and self.eviction_tracker._last_evicted_ts is not None
-            and self.eviction_tracker._last_evicted_wall_ms is not None
-        ):
-            try:
-                with open(self._eviction_sync_path(), "w", encoding="utf-8") as f:
-                    f.write(
-                        f"{self.eviction_tracker._last_evicted_ts} "
-                        f"{self.eviction_tracker._last_evicted_wall_ms}"
-                    )
-            except OSError:
-                pass
+    def on_block_evicted(
+        self,
+        block_hash: Any,
+        now: float | None = None,
+        *,
+        session_id: str | None = None,
+        defer_sync: bool = False,
+    ) -> None:
+        """Record an HBM block eviction event (with optional deferred batch IPC flush)."""
+        self.eviction_tracker.record_eviction(
+            block_hash, now=now, session_id=session_id
+        )
+        self._eviction_sync_dirty = True
+        if not defer_sync:
+            self.flush_eviction_sync()
 
     def on_prefill_output(
         self, req_state: Any, engine_core_output: Any
@@ -269,6 +364,10 @@ class AgenticTelemetryService:
             return self._req_breakdowns[req_id]
 
         self._maybe_sync_vllm_block_size()
+        self._maybe_sync_eviction_state()
+        if req_id:
+            self._req_prefill_ts[req_id] = time.monotonic()
+
         session_id, parent_session_id, turn_id = extract_agent_headers(
             _resolve_trace_headers(req_state, engine_core_output)
         )
@@ -311,19 +410,16 @@ class AgenticTelemetryService:
             if detok is not None
             else getattr(engine_core_output, "new_token_ids", None)
         ) or ()
-        self.session_tracker.record_turn_completion(
+        full_hashes, reused_blocks = self.session_tracker.record_turn_completion(
             session_id,
             prompt_token_ids,
             output_token_ids,
             turn_id=turn_id if turn_id is not None else 1,
         )
-        if session_id:
-            full_tokens = (*prompt_token_ids, *output_token_ids)
+        if session_id and full_hashes:
             self.eviction_tracker.register_session_blocks(
                 session_id,
-                compute_rolling_block_hashes(
-                    full_tokens, self.session_tracker.block_size
-                ),
+                full_hashes[reused_blocks:],
             )
         return breakdown
 
@@ -347,6 +443,9 @@ class AgenticTelemetryService:
             )
 
         breakdown = self.on_request_finished(req_state, engine_core_output)
+        prefill_ts = self._req_prefill_ts.pop(req_id, None) if req_id else None
+        eval_now = now if now is not None else prefill_ts
+
         attrs = breakdown.to_span_attributes()
         attrs["gen_ai.server.replica_id"] = self.replica_id
 
@@ -365,35 +464,39 @@ class AgenticTelemetryService:
         if breakdown.affinity_honored_eviction > 0:
             prompt_token_ids = getattr(req_state, "prompt_token_ids", None) or ()
             block_size = self.session_tracker.block_size
-            all_hashes = compute_rolling_block_hashes(prompt_token_ids, block_size)
+            num_prompt_blocks = len(prompt_token_ids) // block_size
+            t1_state = (
+                self.session_tracker.tier1.peek(session_id)
+                if session_id
+                else None
+            )
+            if t1_state is not None and len(t1_state.block_hashes) >= num_prompt_blocks:
+                all_hashes = t1_state.block_hashes[:num_prompt_blocks]
+            else:
+                all_hashes = compute_rolling_block_hashes(
+                    prompt_token_ids, block_size
+                )
             start_blk = breakdown.cache_hit // block_size
             missed_hashes = all_hashes[start_blk:]
             eviction_age_ms = self.eviction_tracker.time_since_eviction_ms(
-                missed_hashes, now=now
+                missed_hashes, now=eval_now, session_id=session_id
             )
-            if eviction_age_ms is None:
-                eviction_age_ms = self.eviction_tracker.last_eviction_age_ms(now=now)
-            if (
-                session_id
-                and self.eviction_tracker.session_evicted_at_ms(session_id) is None
-                and self.eviction_tracker._last_evicted_wall_ms is not None
-            ):
-                self.eviction_tracker._session_evicted_wall_ms.put(
-                    session_id, self.eviction_tracker._last_evicted_wall_ms
-                )
 
-        scheduled_tokens = max(0, breakdown.total_tokens - breakdown.cache_hit)
+        lru_horizon_ms = self.eviction_tracker.lru_horizon_ms(
+            now=eval_now, session_id=session_id
+        )
+        if lru_horizon_ms is None and eviction_age_ms is not None:
+            lru_horizon_ms = eviction_age_ms
+
         hw_attrs = extract_hardware_span_attributes(
             kv_transfer_params=getattr(engine_core_output, "kv_transfer_params", None),
             num_external_computed_tokens=ext_computed,
             time_since_eviction_ms=eviction_age_ms,
-            lru_horizon_ms=self.eviction_tracker.lru_horizon_ms(now=now),
+            lru_horizon_ms=lru_horizon_ms,
             session_evicted_at_ms=self.eviction_tracker.session_evicted_at_ms(
                 session_id
             ),
-            tpu_shape_padding_tokens=compute_tpu_bucket_padding_tokens(
-                scheduled_tokens
-            ),
+            tpu_shape_padding_tokens=None,
         )
         attrs.update(hw_attrs)
         if self.span_log_path:
@@ -531,7 +634,7 @@ def patch_block_pool(
     block_pool_cls: Any = None,
     service: AgenticTelemetryService | None = None,
 ) -> None:
-    """Wrap `BlockPool._maybe_evict_cached_block` to record eviction timestamps."""
+    """Wrap `BlockPool` to track per-session block ownership and batch eviction sync."""
     if block_pool_cls is None:
         from vllm.v1.core.block_pool import BlockPool as block_pool_cls
 
@@ -539,17 +642,315 @@ def patch_block_pool(
         return
 
     orig_evict = block_pool_cls._maybe_evict_cached_block
+    orig_cache_full = getattr(block_pool_cls, "cache_full_blocks", None)
+    orig_get_new_blocks = getattr(block_pool_cls, "get_new_blocks", None)
+    orig_evict_blocks = getattr(block_pool_cls, "evict_blocks", None)
+
+    if orig_cache_full is not None:
+
+        def _wrapped_cache_full_blocks(
+            self: Any,
+            request: Any,
+            blocks: list[Any],
+            num_cached_blocks: int,
+            num_full_blocks: int,
+            block_size: int,
+            *args: Any,
+            **kwargs: Any,
+        ) -> Any:
+            res = orig_cache_full(
+                self,
+                request,
+                blocks,
+                num_cached_blocks,
+                num_full_blocks,
+                block_size,
+                *args,
+                **kwargs,
+            )
+            sid, _, _ = extract_agent_headers(getattr(request, "trace_headers", None))
+            if not sid:
+                sid = getattr(request, "session_id", None)
+            all_tokens = (
+                getattr(request, "all_token_ids", None)
+                or getattr(request, "prompt_token_ids", None)
+                or ()
+            )
+            prev_hash = 0
+            if num_cached_blocks > 0 and num_cached_blocks - 1 < len(blocks):
+                prev_hash = (
+                    getattr(blocks[num_cached_blocks - 1], "_cuj2_rolling_hash", 0)
+                    or 0
+                )
+            if sid:
+                for i in range(min(num_cached_blocks, len(blocks))):
+                    blk = blocks[i]
+                    if not getattr(blk, "is_null", False):
+                        try:
+                            blk._cuj2_session_id = sid
+                        except AttributeError:
+                            pass
+            for i in range(num_cached_blocks, min(num_full_blocks, len(blocks))):
+                blk = blocks[i]
+                if getattr(blk, "is_null", False):
+                    continue
+                if all_tokens and (i + 1) * block_size <= len(all_tokens):
+                    chunk = tuple(all_tokens[i * block_size : (i + 1) * block_size])
+                    prev_hash = hash((prev_hash, chunk))
+                    try:
+                        blk._cuj2_rolling_hash = prev_hash
+                    except AttributeError:
+                        pass
+                if sid:
+                    try:
+                        blk._cuj2_session_id = sid
+                    except AttributeError:
+                        pass
+            return res
+
+        block_pool_cls.cache_full_blocks = _wrapped_cache_full_blocks
 
     def _wrapped_maybe_evict_cached_block(self: Any, block: Any) -> bool:
         raw_hash = getattr(block, "block_hash", None)
+        rolling_hash = getattr(block, "_cuj2_rolling_hash", None)
+        evicted_sid = getattr(block, "_cuj2_session_id", None)
         evicted = orig_evict(self, block)
         if evicted and raw_hash is not None:
+            for attr in ("_cuj2_rolling_hash", "_cuj2_session_id"):
+                if hasattr(block, attr):
+                    try:
+                        setattr(block, attr, None)
+                    except AttributeError:
+                        pass
+            alloc_sid = getattr(self, "_cuj2_allocating_session_id", None)
+            record_sid = (
+                None
+                if (evicted_sid is not None and evicted_sid == alloc_sid)
+                else evicted_sid
+            )
+            in_batch = bool(getattr(self, "_cuj2_in_batch_evict", False))
             svc = service or get_telemetry_service()
-            svc.on_block_evicted(raw_hash)
+            svc.on_block_evicted(
+                rolling_hash if rolling_hash is not None else raw_hash,
+                session_id=record_sid,
+                defer_sync=in_batch,
+            )
         return evicted
 
     block_pool_cls._maybe_evict_cached_block = _wrapped_maybe_evict_cached_block
+
+    if orig_get_new_blocks is not None:
+
+        def _wrapped_get_new_blocks(
+            self: Any, num_blocks: int, *args: Any, **kwargs: Any
+        ) -> Any:
+            self._cuj2_in_batch_evict = True
+            try:
+                return orig_get_new_blocks(self, num_blocks, *args, **kwargs)
+            finally:
+                self._cuj2_in_batch_evict = False
+                svc = service or get_telemetry_service()
+                svc.flush_eviction_sync()
+
+        block_pool_cls.get_new_blocks = _wrapped_get_new_blocks
+
+    if orig_evict_blocks is not None:
+
+        def _wrapped_evict_blocks(
+            self: Any, block_ids: Any, *args: Any, **kwargs: Any
+        ) -> Any:
+            self._cuj2_in_batch_evict = True
+            try:
+                return orig_evict_blocks(self, block_ids, *args, **kwargs)
+            finally:
+                self._cuj2_in_batch_evict = False
+                svc = service or get_telemetry_service()
+                svc.flush_eviction_sync()
+
+        block_pool_cls.evict_blocks = _wrapped_evict_blocks
+
+    try:
+        from vllm.v1.core.kv_cache_manager import KVCacheManager
+
+        if not KVCacheManager.__dict__.get("_tpu_agentic_alloc_patch", False):
+            orig_allocate_slots = KVCacheManager.allocate_slots
+
+            def _wrapped_allocate_slots(
+                self: Any, request: Any, *args: Any, **kwargs: Any
+            ) -> Any:
+                sid, _, _ = extract_agent_headers(
+                    getattr(request, "trace_headers", None)
+                )
+                if not sid:
+                    sid = getattr(request, "session_id", None)
+                bp = getattr(self, "block_pool", None)
+                if bp is not None:
+                    bp._cuj2_allocating_session_id = sid
+                try:
+                    return orig_allocate_slots(self, request, *args, **kwargs)
+                finally:
+                    if bp is not None:
+                        bp._cuj2_allocating_session_id = None
+
+            KVCacheManager.allocate_slots = _wrapped_allocate_slots
+            KVCacheManager._tpu_agentic_alloc_patch = True
+    except Exception:
+        pass
+
     block_pool_cls._tpu_agentic_eviction_patch = True
+
+
+class _Cuj2TpuPaddingCollector:
+    """Prometheus collector exposing server-level TPU round padding counters."""
+
+    _name = "vllm:tpu_padding"
+
+    def __init__(self, service: AgenticTelemetryService | None = None) -> None:
+        self._service = service
+
+    def collect(self) -> Any:
+        from prometheus_client.core import CounterMetricFamily
+
+        svc = self._service or get_telemetry_service()
+        counts = svc.sync_padding_state()
+        rep = str(svc.replica_id)
+
+        rounds_metric = CounterMetricFamily(
+            "vllm:tpu_padding_rounds_total",
+            "Total TPU model execution rounds by phase (prompt vs reply)",
+            labels=["phase", "replica_id"],
+        )
+        rounds_metric.add_metric(["prompt", rep], float(counts["prompt_rounds"]))
+        rounds_metric.add_metric(["reply", rep], float(counts["reply_rounds"]))
+        yield rounds_metric
+
+        tokens_metric = CounterMetricFamily(
+            "vllm:tpu_padding_tokens_total",
+            "Total TPU scheduled real vs static bucket filler tokens by phase",
+            labels=["phase", "kind", "replica_id"],
+        )
+        tokens_metric.add_metric(
+            ["prompt", "real", rep], float(counts["prompt_real_tokens"])
+        )
+        tokens_metric.add_metric(
+            ["prompt", "filler", rep], float(counts["prompt_filler_tokens"])
+        )
+        tokens_metric.add_metric(
+            ["reply", "real", rep], float(counts["reply_real_tokens"])
+        )
+        tokens_metric.add_metric(
+            ["reply", "filler", rep], float(counts["reply_filler_tokens"])
+        )
+        yield tokens_metric
+
+
+def _register_padding_collector_on_registry(
+    registry: Any, service: AgenticTelemetryService | None = None
+) -> None:
+    if getattr(registry, "_cuj2_padding_collector_registered", False):
+        return
+    try:
+        registry.register(_Cuj2TpuPaddingCollector(service=service))
+        registry._cuj2_padding_collector_registered = True
+    except ValueError:
+        pass
+
+
+def patch_tpu_padding_metrics(
+    runner_cls: Any = None,
+    service: AgenticTelemetryService | None = None,
+) -> None:
+    """Hook `TPUModelRunner._prepare_inputs` and Prometheus `/metrics` for server-level padding."""
+    if runner_cls is None:
+        try:
+            from vllm_torchtpu.runner.tpu_runner import TPUModelRunner as runner_cls
+        except Exception:
+            runner_cls = None
+
+    if runner_cls is not None and not runner_cls.__dict__.get(
+        "_tpu_agentic_padding_patch", False
+    ):
+        orig_prepare_inputs = getattr(runner_cls, "_prepare_inputs", None)
+        if orig_prepare_inputs is not None:
+
+            def _wrapped_prepare_inputs(
+                self: Any,
+                scheduler_output: Any,
+                start_index: int,
+                *args: Any,
+                **kwargs: Any,
+            ) -> Any:
+                res = orig_prepare_inputs(
+                    self, scheduler_output, start_index, *args, **kwargs
+                )
+                try:
+                    layout_plan = getattr(self, "_last_sequence_layout_plan", None)
+                    if layout_plan is not None:
+                        real_tokens = int(
+                            getattr(layout_plan, "global_num_tokens", 0) or 0
+                        )
+                        padded_tokens = int(
+                            getattr(layout_plan, "global_padded_num_tokens", 0) or 0
+                        )
+                    else:
+                        real_tokens = int(
+                            getattr(scheduler_output, "total_num_scheduled_tokens", 0)
+                            or 0
+                        )
+                        padded_tokens = real_tokens + compute_tpu_bucket_padding_tokens(
+                            real_tokens
+                        )
+                    if (
+                        isinstance(res, tuple)
+                        and len(res) >= 4
+                        and isinstance(res[3], int)
+                    ):
+                        chunk_num_reqs = res[3]
+                    else:
+                        chunk_num_reqs = int(
+                            getattr(getattr(self, "input_batch", None), "num_reqs", 1)
+                            or 1
+                        )
+                    svc = service or get_telemetry_service()
+                    svc.on_tpu_round_padded(
+                        real_tokens,
+                        padded_tokens,
+                        is_prompt_round=(real_tokens > chunk_num_reqs),
+                    )
+                except Exception:
+                    pass
+                return res
+
+            runner_cls._prepare_inputs = _wrapped_prepare_inputs
+            runner_cls._tpu_agentic_padding_patch = True
+
+    try:
+        from prometheus_client import REGISTRY
+
+        _register_padding_collector_on_registry(REGISTRY, service=service)
+    except Exception:
+        pass
+
+    try:
+        import vllm.v1.metrics.prometheus as prom_mod
+
+        if not getattr(prom_mod, "_tpu_agentic_prom_patch", False):
+            orig_get_reg = prom_mod.get_prometheus_registry
+
+            def _wrapped_get_prometheus_registry(*args: Any, **kwargs: Any) -> Any:
+                reg = orig_get_reg(*args, **kwargs)
+                _register_padding_collector_on_registry(reg, service=service)
+                return reg
+
+            prom_mod.get_prometheus_registry = _wrapped_get_prometheus_registry
+            prom_mod._tpu_agentic_prom_patch = True
+            inst_mod = sys.modules.get(
+                "vllm.entrypoints.serve.instrumentator.metrics"
+            )
+            if inst_mod is not None and hasattr(inst_mod, "get_prometheus_registry"):
+                inst_mod.get_prometheus_registry = _wrapped_get_prometheus_registry
+    except Exception:
+        pass
 
 
 def patch_output_processor(
@@ -686,6 +1087,7 @@ def _sync_block_size_from_config(vllm_config: Any) -> None:
         if _SERVICE is not None and not _SERVICE._explicit_block_size:
             _SERVICE.session_tracker.block_size = bs
             _SERVICE._explicit_block_size = True
+            _SERVICE._block_size_checked = True
 
 
 def patch_tpu_block_size() -> None:
@@ -716,6 +1118,7 @@ def install_agentic_telemetry_patches() -> None:
 
     patch_trace_headers()
     patch_tpu_block_size()
+    patch_tpu_padding_metrics()
     try:
         patch_block_pool()
     except ImportError:
