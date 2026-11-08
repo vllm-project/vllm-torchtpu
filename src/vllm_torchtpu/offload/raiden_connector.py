@@ -100,7 +100,9 @@ from vllm_torchtpu.offload.raiden_staging import (
     StagedStepOutput,
     StagedTransferScheduler,
     StagingBuffer,
+    kv_cache_config_leaves,
     layout_from_tensors,
+    padded_row_bytes,
     staging_hbm_reserve_bytes,
 )
 from vllm_torchtpu.offload.raiden_store import (
@@ -322,8 +324,25 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         # Staged multi-shape offload: the scheduler owns the staging rows.
         staging_blocks = getattr(spec, "staging_blocks", 0)
         if staging_blocks:
+            # The scheduler's KV cache config is flattened (no per-array
+            # pages), so the row size for the stats is the mean per-rank
+            # payload the host pool was sized with.
+            row_bytes = padded_row_bytes(
+                spec.bytes_per_block_all_ranks // spec.world_size
+            )
             self._staged = StagedTransferScheduler(
-                self._raiden_manager, staging_blocks, self.config.num_workers
+                self._raiden_manager,
+                staging_blocks,
+                self.config.num_workers,
+                row_bytes=row_bytes,
+            )
+            logger.info(
+                "TPURaidenOffloadingConnector: staged offload on (scheduler): "
+                "%d staging rows of ~%d bytes per rank, parts of <= %d blocks; "
+                "transfer stats every 60 s",
+                staging_blocks,
+                row_bytes,
+                self._staged.max_part_rows,
             )
 
     def attach_block_pool(self, block_pool) -> None:
@@ -974,12 +993,7 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         # reserve would be uncounted HBM, so refuse them before allocating.
         layout = layout_from_tensors(pools, num_blocks, self._staging_blocks)
         assert self.connector_worker is not None
-        leaves = {}
-        for group in self.connector_worker.kv_cache_config.kv_cache_groups:
-            nested = getattr(group.kv_cache_spec, "kv_cache_specs", None)
-            leaves.update(
-                nested or dict.fromkeys(group.layer_names, group.kv_cache_spec)
-            )
+        leaves = kv_cache_config_leaves(self.connector_worker.kv_cache_config)
         reserved = staging_hbm_reserve_bytes(self._vllm_config, leaves)
         allocated = layout.rows * layout.row_bytes
         if allocated > reserved:
@@ -1002,14 +1016,17 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         synchronize_tensors([staging.tensor, *pools])
         self._staging = staging
         logger.info(
-            "TPURaidenOffloadingConnector: staged offload: %d KV arrays per "
-            "block in one %d-byte row (%d payload), %d staging rows (%.1f MiB "
-            "HBM), layout %s",
-            len(pools),
+            "TPURaidenOffloadingConnector: staged offload on: %d staging rows "
+            "x %d bytes (%d payload), %.1f MiB HBM of %.1f MiB reserved in the "
+            "KV cache budget; %d KV arrays coalesced per block (1 DMA instead "
+            "of %d); layout %s",
+            layout.rows,
             layout.row_bytes,
             layout.payload_bytes,
-            layout.rows,
-            layout.rows * layout.row_bytes / (1 << 20),
+            allocated / (1 << 20),
+            reserved / (1 << 20),
+            len(pools),
+            len(pools),
             layout.signature(),
         )
         return CanonicalKVCacheTensor(

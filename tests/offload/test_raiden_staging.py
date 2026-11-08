@@ -998,3 +998,85 @@ def test_worker_refuses_rows_the_budget_did_not_reserve():
     ):
         conn._init_staging(pools, num_blocks)
     buf.assert_not_called()
+
+
+# -- logging: proof in the server log that the staged path ran -----------------
+
+
+def test_init_log_reports_rows_bytes_reserve_and_arrays():
+    from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
+
+    from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingConnector
+
+    num_blocks = 6
+    specs = dict(_SPECS)
+    pools = [
+        torch.zeros((num_blocks, s.page_size_bytes), dtype=torch.int8)
+        for s in specs.values()
+    ]
+    conn = object.__new__(TPURaidenOffloadingConnector)
+    conn._staging_blocks = 16
+    group = SimpleNamespace(
+        kv_cache_spec=UniformTypeKVCacheSpecs(block_size=64, kv_cache_specs=specs),
+        layer_names=list(specs),
+    )
+    conn.connector_worker = SimpleNamespace(
+        kv_cache_config=SimpleNamespace(kv_cache_groups=[group])
+    )
+    conn._vllm_config = _offload_config({"staging_blocks": 16})
+    real = rs.StagingBuffer
+
+    def cpu_buffer(*args, **kwargs):
+        return real(*args, programs=_torch_programs, **kwargs)
+
+    with (
+        patch("vllm_torchtpu.offload.raiden_connector.StagingBuffer", cpu_buffer),
+        patch("vllm_torchtpu.utils.synchronize_tensors"),
+        patch("vllm_torchtpu.offload.raiden_connector.logger") as log,
+    ):
+        canonical = conn._init_staging(pools, num_blocks)
+    payload = sum(s.page_size_bytes for s in specs.values())
+    row = rs.padded_row_bytes(payload)
+    assert canonical.page_size_bytes == row
+    (call,) = [c for c in log.info.call_args_list if "staged offload on" in c.args[0]]
+    rows, row_bytes, payload_bytes, alloc_mib, reserved_mib, arrays, _, _ = call.args[
+        1:
+    ]
+    assert (rows, row_bytes, payload_bytes, arrays) == (16, row, payload, len(pools))
+    assert alloc_mib == reserved_mib == 16 * row / (1 << 20)
+
+
+def test_periodic_stats_log():
+    now = [0.0]
+    store, manager, _ = _staged(rows=4)
+    staged = rs.StagedTransferScheduler(
+        manager, 4, 2, row_bytes=1 << 20, log_interval_s=60.0, clock=lambda: now[0]
+    )
+    keys = [_key(i) for i in range(2)]
+    for k in keys:
+        seed_host_entries(store, k, 1)
+    manager.prepare_load(keys, SimpleNamespace(req_id="r"))
+    staged.add_load_job(1, keys, [30, 31], "r")
+    skeys = [_key(10)]
+    manager.prepare_store(skeys, SimpleNamespace(req_id="s"))
+    staged.add_store_job(2, skeys, [40])
+    with patch("vllm_torchtpu.offload.raiden_staging.logger") as log:
+        out = _step(staged)
+        (part_id,) = out.packs
+        staged.on_fenced({part_id: 2})
+        (load,) = store.calls_named("load")
+        now[0] = 0.5
+        store.complete_load(load.args[0])
+        _step(staged)
+        log.info.assert_not_called()  # within the interval
+        now[0] = 61.0
+        _step(staged)
+        (call,) = log.info.call_args_list
+        args = call.args[1:]
+        assert args[1:6] == (1, 2, 2.0, 0, 2 * (1 << 20) / 0.5 / 1e9)
+        assert args[6:9] == (1, 1, 1.0)
+        assert args[9] == 0
+        # Nothing moved in the next interval: no line.
+        now[0] = 130.0
+        _step(staged)
+        assert len(log.info.call_args_list) == 1

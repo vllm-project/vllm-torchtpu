@@ -44,10 +44,12 @@ from __future__ import annotations
 import functools
 import hashlib
 import math
-from collections import deque
+import time
+from collections import Counter, deque
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
+
 import jax
 
 from vllm_torchtpu.logger import init_logger
@@ -144,6 +146,15 @@ def staged_layer_page_bytes(
             continue
         out[name] = int(spec.page_size_bytes)
     return out
+
+
+def kv_cache_config_leaves(kv_cache_config: Any) -> dict[str, Any]:
+    """Layer name -> leaf spec over every KV cache group."""
+    leaves: dict[str, Any] = {}
+    for group in kv_cache_config.kv_cache_groups:
+        nested = getattr(group.kv_cache_spec, "kv_cache_specs", None)
+        leaves.update(nested or dict.fromkeys(group.layer_names, group.kv_cache_spec))
+    return leaves
 
 
 def staging_hbm_reserve_bytes(
@@ -374,7 +385,6 @@ def layout_from_tensors(
 @functools.cache
 def _device_programs(layout: StagingLayout):
     """The compiled pack and unpack of one layout (torch_tpu only)."""
-    import jax
     import torch
     from torch_tpu._internal import pallas
 
@@ -539,6 +549,8 @@ class _Part:
     keys: list[OffloadKey]
     device_block_ids: list[int]
     rows: list[int] | None = None
+    # Loads: time.monotonic() at launch (for the load rate in the stats).
+    launched_at: float = 0.0
     # store: queued -> fencing -> launched; cancelled while fencing.
     # load: queued -> launched -> unpacking.
     state: str = "queued"
@@ -581,8 +593,24 @@ class StagedTransferScheduler:
     `abandon_load` are used).
     """
 
-    def __init__(self, manager: Any, num_rows: int, num_workers: int):
+    def __init__(
+        self,
+        manager: Any,
+        num_rows: int,
+        num_workers: int,
+        *,
+        row_bytes: int = 0,
+        log_interval_s: float = 60.0,
+        clock: Callable[[], float] = time.monotonic,
+    ):
         self._manager = manager
+        # Bytes of one row on one rank (stats only; 0 leaves bytes out).
+        self.row_bytes = row_bytes
+        self._log_interval_s = log_interval_s
+        self._clock = clock
+        self._last_log = clock()
+        # Per interval, reset by `maybe_log`.
+        self.stats: Counter[str] = Counter()
         self.rows = StagingRows(num_rows)
         self._num_workers = num_workers
         # Half the rows at most, so a load can always start while stores hold
@@ -688,6 +716,7 @@ class StagedTransferScheduler:
                     del self._parts[part_id]
                 elif part.state == "fencing":
                     part.state = "cancelled"
+                    self.stats["store_cancelled_parts"] += 1
                 else:
                     continue
                 self._manager.on_store_job_cancelled(part.keys)
@@ -703,6 +732,47 @@ class StagedTransferScheduler:
             self._on_part_finished(finished, out)
         # Rows freed by failures above may let more start this step.
         self._pump(out)
+        self.maybe_log()
+
+    def maybe_log(self) -> bool:
+        """One INFO line per `log_interval_s` with transfers in it.
+
+        The load rate is per rank, from launch to the step that saw it land,
+        so it is a lower bound on the DMA rate (step-granular)."""
+        now = self._clock()
+        if now - self._last_log < self._log_interval_s:
+            return False
+        c = self.stats
+        elapsed = now - self._last_log
+        self._last_log = now
+        if not (c["load_parts"] or c["store_parts"] or c["store_cancelled_parts"]):
+            return False
+        mib = self.row_bytes / (1 << 20)
+        rate = (
+            c["load_landed_blocks"] * self.row_bytes / c["load_seconds"] / 1e9
+            if c["load_seconds"] > 0 and self.row_bytes
+            else 0.0
+        )
+        logger.info(
+            "Raiden staged offload (%.0f s): loads %d parts, %d blocks "
+            "(%.1f MiB/rank), %d failed parts, load %.2f GB/s/rank "
+            "launch-to-landed; stores %d parts, %d blocks (%.1f MiB/rank), "
+            "%d cancelled parts; %d/%d staging rows free",
+            elapsed,
+            c["load_parts"],
+            c["load_blocks"],
+            c["load_blocks"] * mib,
+            c["load_failed_parts"],
+            rate,
+            c["store_parts"],
+            c["store_blocks"],
+            c["store_blocks"] * mib,
+            c["store_cancelled_parts"],
+            self.rows.num_free,
+            self.rows.num_rows,
+        )
+        c.clear()
+        return True
 
     def _pump(self, out: StagedStepOutput) -> None:
         while self._load_queue:
@@ -714,6 +784,9 @@ class StagedTransferScheduler:
             self._load_queue.popleft()
             part.rows = rows
             part.state = "launched"
+            part.launched_at = self._clock()
+            self.stats["load_parts"] += 1
+            self.stats["load_blocks"] += len(part.keys)
             job = self._jobs[part.base_job_id]
             self._manager.submit_load_job(part.part_id, part.keys, rows, job.req_id)
         while self._store_queue:
@@ -735,6 +808,8 @@ class StagedTransferScheduler:
             # The save no longer reads the rows, success or not.
             self._release(part)
         elif finished.success and not job.failed:
+            self.stats["load_landed_blocks"] += len(part.keys)
+            self.stats["load_seconds"] += self._clock() - part.launched_at
             part.state = "unpacking"
             assert part.rows is not None
             out.unpacks[part.part_id] = (list(part.rows), list(part.device_block_ids))
@@ -743,6 +818,7 @@ class StagedTransferScheduler:
             # resolved before the manager reported it.
             self._release(part)
             if not finished.success:
+                self.stats["load_failed_parts"] += 1
                 job.failed = True
                 self._abandon_queued(job)
         self._maybe_finish(job, out)
@@ -794,6 +870,8 @@ class StagedTransferScheduler:
                 continue
             part.state = "launched"
             part.acks = 0
+            self.stats["store_parts"] += 1
+            self.stats["store_blocks"] += len(part.keys)
             assert part.rows is not None
             self._manager.submit_store_job(part.part_id, part.keys, list(part.rows))
 

@@ -2778,6 +2778,7 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                 )
             bytes_per_block_all_ranks -= draft_bytes
         assert bytes_per_block_all_ranks > 0
+        self.bytes_per_block_all_ranks = bytes_per_block_all_ranks
         self.offload_logical_blocks_capacity = int(
             int(cpu_bytes_to_use) // bytes_per_block_all_ranks
         )
