@@ -199,6 +199,9 @@ def make_lookup(
         # topology MoE preprocess needs it), which offloads this all-gather to
         # SparseCore; with that offload EP16 decode degenerates on multi-rank
         # replays, and the all-to-all form does not.
+        # TODO(wenqin): find out why the SparseCore-offloaded all-gather breaks
+        # decode here. This all-to-all should not be needed: check whether the
+        # diagnosis is wrong or XLA's SparseCore all-gather offload has a bug.
         copies = jnp.broadcast_to(h[None], (node_size, *h.shape))
         hashes = jax.lax.all_to_all(
             copies.reshape(node_size * num_tokens, h.shape[1]),
