@@ -180,6 +180,9 @@ force-exclude = true
 # protoc writes this file; see scripts/update_xplane_proto.sh. Reformatting it
 # would make every regeneration produce a spurious diff.
 exclude = ["src/vllm_torchtpu/tools/xplane_pb2.py"]
+# transformers_compat vendors upstream transformers modules; they keep
+# upstream's formatting.
+extend-exclude = ["src/vllm_torchtpu/transformers_compat/minicpm_ocr/*_minicpm_ocr.py"]
 
 [tool.ruff.lint]
 # E pycodestyle, F pyflakes, I import sorting, UP outdated syntax, B likely
@@ -241,6 +244,8 @@ plugins.md007.enabled = false
 
 [tool.pyrefly]
 project-includes = ["src"]
+# Vendored upstream transformers modules (see transformers_compat/__init__.py).
+project-excludes = ["src/vllm_torchtpu/transformers_compat/minicpm_ocr/*_minicpm_ocr.py"]
 
 # Errors listed in the baseline file do not fail the check; any error not
 # listed does. To retire an entry, fix the code and delete the entry, or

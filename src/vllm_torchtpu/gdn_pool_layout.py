@@ -45,6 +45,10 @@ QWEN_GDN_ARCHITECTURES = frozenset(
         "Qwen3_5MoeForConditionalGeneration",
         "Qwen4ExpForCausalLM",
         "Qwen4ExpForConditionalGeneration",
+        # Upstream MiniCPM-OCR subclasses MiniCPM-V 4.6, whose __init__ builds a
+        # Qwen3_5ForCausalLM language model, so its GDN layers are the same
+        # pooled-capable layers.
+        "MiniCPMOcrForConditionalGeneration",
     }
 )
 POOLED_GDN_ARCHITECTURES = QWEN_GDN_ARCHITECTURES | frozenset(

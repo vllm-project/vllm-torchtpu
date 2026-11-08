@@ -18,8 +18,11 @@ from vllm_torchtpu.layers.adapter import attention as attention
 from vllm_torchtpu.layers.adapter import linear as linear
 from vllm_torchtpu.models.vllm import register_models
 from vllm_torchtpu.tokenizers import register_tokenizers
+from vllm_torchtpu.transformers_compat import register_transformers_compat
 
 
 def register_layers() -> None:
     register_models()
     register_tokenizers()
+    # before any ModelConfig: vLLM parses the checkpoint config through AutoConfig
+    register_transformers_compat()
