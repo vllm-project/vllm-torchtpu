@@ -127,6 +127,17 @@ and drafts the first token at each request's `last_token_indices` row; each
 further token comes from one more pass over one row per request, as vLLM's MTP
 proposer chains them.
 
+An MTP draft from a separate checkpoint takes `"model": "<draft checkpoint>"`
+(and optionally `draft_tensor_parallel_size`, which must equal the target's).
+Gemma 4's assistant (`google/gemma-4-31B-it-assistant`, `Gemma4MTP`) is such a
+draft: it is fed the target's last hidden state like an MTP layer, keeps its
+own LM head, and its Q-only attention reads the target's KV (each draft layer
+the last target layer of its attention type, as the TPU runner wires it). Its
+`draft` therefore takes those target KV states, under their forward names and
+indices, instead of KV of its own, writes none, and keeps every further pass at
+the first pass's last position and KV length (`advance_draft_positions` is
+false for it in the runner). The record stays `method: mtp`.
+
 A model outside vLLM lists its MTP layer's weights among `abstract_params()`
 under `mtp.` names and implements `mtp_abstract_states()` and `mtp_draft()`.
 The export finds the target weights the draft shares by lowering it once, as
