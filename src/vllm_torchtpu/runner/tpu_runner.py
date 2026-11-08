@@ -16,7 +16,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from importlib import metadata as importlib_metadata
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 # TODO: Remove this after jax dependency is removed
 import jax
@@ -179,6 +179,22 @@ if TYPE_CHECKING:
     from vllm_torchtpu.runner.kv_cache_nan_flags import KVCacheNaNDetector
 
 
+class SpecBoundaryPlan(NamedTuple):
+    """One chunk's verify rows whose accepted tokens may reach a mamba block
+    boundary (`TPUModelRunner._plan_spec_boundary_copies`)."""
+
+    # Device `(row, boundary, num_scheduled, blocks...)` per candidate.
+    entries: torch.Tensor
+    # Device `entries[:, 0]` as row indices.
+    rows: torch.Tensor
+    # The candidates' device sequence lengths this step.
+    seq_lens: torch.Tensor
+    # Logical tokens per mamba block-table column.
+    block_size: int
+    # Host source of `entries`, kept until the upload has been consumed.
+    host_entries: torch.Tensor
+
+
 @dataclass
 class ExecuteModelState:
     scheduler_output: "SchedulerOutput"
@@ -200,6 +216,9 @@ class ExecuteModelState:
     mamba_state_indices_list: list[list[torch.Tensor] | None] = field(
         default_factory=list
     )
+    # Per chunk, the verify rows that may complete a mamba block this step,
+    # for the boundary-state copy after sampling; None when no row can.
+    mamba_boundary_plans: list[SpecBoundaryPlan | None] = field(default_factory=list)
     kv_save_nan_check: KVSaveNanCheck | None = None
 
 
@@ -239,10 +258,46 @@ def _rollback_offsets_migrate_impl(
     read_offsets.index_put_((dst_t,), read_offsets[src_t])
 
 
+def _spec_boundary_pairs_impl(
+    entries: torch.Tensor,
+    seq_lens: torch.Tensor,
+    num_valid: torch.Tensor,
+    block_size: int,
+    width: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """`[num_groups, n]` source and destination state blocks of the boundary
+    copies (see `TPUModelRunner._plan_spec_boundary_copies`); the null block
+    where a candidate's accepted tokens stop short of its boundary.
+
+    `entries` rows are `(row, boundary, num_scheduled, blocks...)`, with
+    `width` block ids per mamba group starting at the boundary's own column.
+    `seq_lens` and `num_valid` are the rows' sequence lengths this step and
+    accepted drafts + 1.
+    """
+    boundary = entries[:, 1]
+    start = seq_lens - entries[:, 2]
+    reached = (start < boundary) & (boundary <= start + num_valid)
+    # Checkpoint t, the state after t + 1 window tokens, lies t columns past
+    # the column of the window's last token.
+    col = (
+        (seq_lens - 1) // block_size
+        + (boundary - 1 - start)
+        - (boundary // block_size - 1)
+    )
+    blocks = entries[:, 3:].reshape(entries.shape[0], -1, width).transpose(0, 1)
+    index = col.clamp(0, width - 1).view(1, -1, 1).expand(blocks.shape[0], -1, 1)
+    src = blocks.gather(2, index).squeeze(2)
+    dst = blocks[:, :, 0]
+    copy = reached & (col >= 0) & (col < width) & (src != 0) & (dst != 0) & (src != dst)
+    null = torch.zeros_like(src)
+    return torch.where(copy, src, null), torch.where(copy, dst, null)
+
+
 _tpu_compile = torch.compile(backend="tpu", fullgraph=True, dynamic=False)
 _reset_read_offsets_compiled = _tpu_compile(_reset_read_offsets_impl)
 _rollback_offsets_seed_compiled = _tpu_compile(_rollback_offsets_seed_impl)
 _rollback_offsets_migrate_compiled = _tpu_compile(_rollback_offsets_migrate_impl)
+_spec_boundary_pairs_compiled = _tpu_compile(_spec_boundary_pairs_impl)
 
 
 def _reset_read_offsets(
@@ -277,6 +332,21 @@ def _rollback_offsets_migrate(
         else _rollback_offsets_migrate_impl
     )
     fn(read_offsets, src_t, dst_t)
+
+
+def _spec_boundary_pairs(
+    entries: torch.Tensor,
+    seq_lens: torch.Tensor,
+    num_valid: torch.Tensor,
+    block_size: int,
+    width: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    fn = (
+        _spec_boundary_pairs_compiled
+        if entries.device.type == "tpu"
+        else _spec_boundary_pairs_impl
+    )
+    return fn(entries, seq_lens, num_valid, block_size, width)
 
 
 def _spec_logprob_row_tokens(
@@ -2070,6 +2140,147 @@ class TPUModelRunner(GPUModelRunner):
         off = torch.where(new_owner_t, 0, off)
         return ckpt_t.gather(1, off.unsqueeze(1)).squeeze(1)
 
+    def _copies_spec_boundary_states(self) -> bool:
+        """Whether verify steps write boundary states into the blocks they
+        complete: speculative decoding on the unified pool in align mode,
+        with block hashes (prefix caching or a KV connector) to reuse them.
+        """
+        return (
+            self._mamba_ckpt_window > 1
+            and self.mamba_slot_read_offsets is not None
+            and bool(self._mamba_copy_plan)
+            and (
+                self.cache_config.enable_prefix_caching
+                or self.vllm_config.kv_transfer_config is not None
+            )
+        )
+
+    def _mamba_column_stride(self) -> int:
+        """Logical tokens per mamba block-table column, the allocator's stride
+        (see `_collect_mamba_state_seed_copies`)."""
+        try:
+            cp_world_size = get_pcp_group().world_size
+        except Exception:
+            cp_world_size = 1
+        assert self._mamba_state_block_size is not None
+        return self._mamba_state_block_size * cp_world_size
+
+    def _plan_spec_boundary_copies(
+        self,
+        scheduler_output,
+        start_index: int,
+        num_reqs: int,
+        seq_lens: torch.Tensor,
+    ) -> SpecBoundaryPlan | None:
+        """Stage this chunk's candidates for `_copy_spec_boundary_states`.
+
+        A verify window starting at `start` writes checkpoint t, the state
+        after `start + t + 1` tokens, to the block t columns past its state
+        block. The block a boundary T completes therefore holds checkpoint 0
+        of the last window that ended inside it, a few tokens short of T, yet
+        the scheduler hashes it once T tokens are confirmed and prefix hits
+        resume from it. After sampling, checkpoint `T - 1 - start` is copied
+        into it instead.
+
+        Whether a row reaches T depends on its accepted count, known only on
+        device, so every verify row whose window can reach a boundary is
+        staged: its boundary, the block ids from the boundary's column on,
+        and its device sequence length (under async scheduling the host count
+        runs ahead by up to num_speculative_tokens rejected drafts).
+        """
+        if not self._copies_spec_boundary_states():
+            return None
+        spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+        if not spec_tokens:
+            return None
+        block_size = self._mamba_column_stride()
+        slack = 0
+        if self.scheduler_config.async_scheduling:
+            assert self.speculative_config is not None
+            slack = self.speculative_config.num_speculative_tokens
+        num_computed = self.input_batch.num_computed_tokens_cpu
+        req_ids = self.input_batch.req_ids
+        candidates: list[tuple[int, int, int]] = []
+        for i in range(num_reqs):
+            req_id = req_ids[start_index + i]
+            if not spec_tokens.get(req_id):
+                continue
+            computed = int(num_computed[start_index + i])
+            scheduled = scheduler_output.num_scheduled_tokens[req_id]
+            boundary = (max(computed - slack, 0) // block_size + 1) * block_size
+            while boundary <= computed + scheduled:
+                candidates.append((i, boundary, scheduled))
+                boundary += block_size
+        if not candidates:
+            return None
+
+        width = self._mamba_ckpt_window + 1
+        n = len(candidates)
+        # Bounded by max_num_reqs so the copies stay on the precompiled ladder.
+        padded = min(self._bucket_len(n), max(n, self.max_num_reqs))
+        host = torch.zeros(
+            (padded, 3 + len(self._mamba_copy_plan) * width), dtype=torch.int32
+        )
+        host[:n, :3] = torch.tensor(candidates, dtype=torch.int32)
+        for g, (gid, _) in enumerate(self._mamba_copy_plan):
+            bt = self.input_batch.block_table[gid].get_cpu_tensor()
+            row_width = bt.shape[1]
+            base = 3 + g * width
+            for e, (i, boundary, _) in enumerate(candidates):
+                first = boundary // block_size - 1
+                last = min(first + width, row_width)
+                host[e, base : base + last - first] = bt[start_index + i, first:last]
+        entries = host.to(self.device, non_blocking=True)
+        rows = entries[:, 0].long()
+        return SpecBoundaryPlan(
+            entries=entries,
+            rows=rows,
+            seq_lens=seq_lens.index_select(0, rows).to(torch.int32),
+            block_size=block_size,
+            host_entries=host,
+        )
+
+    def _copy_spec_boundary_states(
+        self, plan: SpecBoundaryPlan | None, next_tokens: torch.Tensor
+    ) -> None:
+        """Copy each boundary state this verify chunk reached into the block
+        that boundary completes (the counterpart of upstream vLLM's align-mode
+        ``postprocess_mamba``).
+
+        Runs right after sampling, before any later step can hash, free or
+        reuse the block; the request still owns it, since the manager frees
+        a state block only once later tokens are processed.
+        """
+        if plan is None:
+            return
+        num_valid = (
+            (next_tokens.index_select(0, plan.rows) != INVALID_TOKEN_ID)
+            .sum(dim=1)
+            .to(torch.int32)
+        )
+        src, dst = _spec_boundary_pairs(
+            plan.entries,
+            plan.seq_lens,
+            num_valid,
+            plan.block_size,
+            self._mamba_ckpt_window + 1,
+        )
+        per_raw: dict[
+            tuple[int, ...],
+            tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]],
+        ] = {}
+        for g, (_, raws) in enumerate(self._mamba_copy_plan):
+            src_g, dst_g = self._expand_pool_split(src[g], dst[g])
+            entry = per_raw.setdefault(tuple(id(raw) for raw in raws), (raws, [], []))
+            entry[1].append(src_g)
+            entry[2].append(dst_g)
+        for raws, srcs, dsts in per_raw.values():
+            self._copy_mamba_state_blocks(
+                raws,
+                self._pad_dev_to_bucket(torch.cat(srcs)),
+                self._pad_dev_to_bucket(torch.cat(dsts)),
+            )
+
     def _flush_mamba_state_seed_copies(self) -> None:
         if not self._pending_mamba_state_copies:
             return
@@ -3665,6 +3876,7 @@ class TPUModelRunner(GPUModelRunner):
         num_reqs_list = []
         spec_decode_metadata_list = []
         mamba_state_indices_list: list[list[torch.Tensor] | None] = []
+        mamba_boundary_plans: list[SpecBoundaryPlan | None] = []
         draft_chunks: list[DraftChunkInputs] = []
         is_draft_model = self._is_async_drafter
         greedy_token_ids = self._samples_greedy_token_ids(scheduler_output)
@@ -3986,6 +4198,11 @@ class TPUModelRunner(GPUModelRunner):
                 # Unified pool: one state block per request per mamba group,
                 # captured by the group builders during metadata build.
                 mamba_state_indices_list.append(ctx.unified_mamba_state_indices)
+            mamba_boundary_plans.append(
+                self._plan_spec_boundary_copies(
+                    scheduler_output, start_index, num_reqs, ctx.seq_lens
+                )
+            )
             if is_draft_model:
                 assert isinstance(hidden_states, torch.Tensor)
                 # Capture this chunk's draft inputs while they are valid.
@@ -4034,6 +4251,7 @@ class TPUModelRunner(GPUModelRunner):
             spec_decode_metadata_list=spec_decode_metadata_list,
             draft_chunks=draft_chunks,
             mamba_state_indices_list=mamba_state_indices_list,
+            mamba_boundary_plans=mamba_boundary_plans,
             kv_save_nan_check=nan_check,
         )
 
@@ -4490,6 +4708,7 @@ class TPUModelRunner(GPUModelRunner):
         mamba_idx_list = state.mamba_state_indices_list or [None] * len(
             state.logits_list
         )
+        boundary_plans = state.mamba_boundary_plans or [None] * len(state.logits_list)
         # Per-chunk device rejection outputs, kept for the async-spec
         # producer below.
         next_tokens_per_chunk: list[torch.Tensor] = []
@@ -4500,11 +4719,12 @@ class TPUModelRunner(GPUModelRunner):
         elif is_spec_step:
             cur_start_idx = 0
             all_greedy = self.input_batch.all_greedy
-            for logits, num_reqs, md, mamba_indices in zip(
+            for logits, num_reqs, md, mamba_indices, boundary_plan in zip(
                 state.logits_list,
                 state.num_reqs_list,
                 state.spec_decode_metadata_list,
                 mamba_idx_list,
+                boundary_plans,
             ):
                 cur_end_idx = cur_start_idx + num_reqs
                 if md is not None:
@@ -4525,6 +4745,7 @@ class TPUModelRunner(GPUModelRunner):
                     self._update_mamba_slot_read_offsets(
                         mamba_indices, next_tokens, num_reqs
                     )
+                    self._copy_spec_boundary_states(boundary_plan, next_tokens)
                     if needs_logprobs:
                         # Raw verify logits, one row per draft slot and bonus
                         # slot; each row paired with the token its slot chose.
@@ -6293,6 +6514,7 @@ class TPUModelRunner(GPUModelRunner):
 
             self._precompile_sampling_subgraphs()
             self._precompile_mamba_rollback_helpers()
+            self._precompile_spec_boundary_pairs()
 
             # Precompile multimodal vision encoder graphs
             self.encoder_cudagraph_manager = maybe_create_mm_encoder_manager(
@@ -6600,6 +6822,28 @@ class TPUModelRunner(GPUModelRunner):
                 _rollback_offsets_seed_compiled(offsets, dst)
                 _rollback_offsets_migrate_compiled(offsets, src, dst)
                 n *= 4
+
+    def _precompile_spec_boundary_pairs(self) -> None:
+        """Warm the boundary-copy pair program at every candidate count
+        `_plan_spec_boundary_copies` pads to; the copies themselves reuse
+        the precompiled seed-copy lengths. All-zero entries name no copy.
+        """
+        if not self._copies_spec_boundary_states():
+            return
+        width = self._mamba_ckpt_window + 1
+        num_cols = 3 + len(self._mamba_copy_plan) * width
+        sizes = {
+            min(self._bucket_len(n), max(n, self.max_num_reqs))
+            for n in range(1, self.max_num_reqs + 1)
+        }
+        with self._precompile_timed("mamba boundary-state pairs"):
+            for n in sorted(sizes):
+                entries = torch.zeros((n, num_cols), dtype=torch.int32).to(self.device)
+                seq_lens = torch.zeros(n, dtype=torch.int32).to(self.device)
+                num_valid = torch.zeros(n, dtype=torch.int32).to(self.device)
+                _spec_boundary_pairs_compiled(
+                    entries, seq_lens, num_valid, self._mamba_column_stride(), width
+                )
 
     def _warmup_spec_decode(self) -> None:
         """Warm the real spec-decode dispatch so the first request doesn't recompile.
