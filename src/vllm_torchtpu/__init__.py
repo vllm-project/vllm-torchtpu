@@ -158,8 +158,16 @@ def _patch_vllm_mamba_split_scheduler_block_size() -> None:
 
     @wraps(original_split)
     def split_with_scheduler_block_size(self, *args, **kwargs):
+        from vllm_torchtpu.distributed.pcp import pcp_splits_tokens
+
         physical_cache_config = self.cache_config
-        if physical_cache_config.block_size == self.block_size:
+        if physical_cache_config.block_size == self.block_size or not pcp_splits_tokens(
+            self.vllm_config
+        ):
+            # A model that keeps whole steps under PCP (qwen4_exp) caches its
+            # Mamba states at the physical block, as without PCP; aligning to
+            # the logical PCP block (its split main KV's) would clip every
+            # chunk shorter than that block to zero tokens.
             return original_split(self, *args, **kwargs)
 
         scheduler_cache_config = copy.copy(physical_cache_config)
