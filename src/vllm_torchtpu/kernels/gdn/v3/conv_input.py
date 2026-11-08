@@ -40,7 +40,6 @@ def cast_conv_input(
         raise ValueError("padded_tokens must cover every input token")
     info = pltpu.get_tpu_info()
     tile_rows = info.num_lanes
-    padded_rows = pl.cdiv(padded_tokens, tile_rows) * tile_rows
     padded_width = pl.cdiv(width, info.num_lanes) * info.num_lanes
     window_bytes = 2 * tile_rows * padded_width * (qkv.dtype.itemsize + 4)
     if (
@@ -56,6 +55,17 @@ def cast_conv_input(
         return jnp.pad(
             qkv[:, :width].astype(jnp.float32), ((0, padded_tokens - tokens), (0, 0))
         ).reshape(padded_tokens, 1, width)
+    # Small BF16 batches need only a sublane-aligned DMA row tile. FP32
+    # retains its lane-sized tile; the resource check above is conservative.
+    if qkv.dtype == jnp.bfloat16:
+        tile_rows = min(
+            tile_rows,
+            max(
+                info.num_sublanes,
+                pl.cdiv(padded_tokens, info.num_sublanes) * info.num_sublanes,
+            ),
+        )
+    padded_rows = pl.cdiv(padded_tokens, tile_rows) * tile_rows
     # Zero physical padding makes every DMA window complete, including tails.
     qkv = jnp.pad(
         qkv, ((0, padded_rows - tokens), (0, max(0, padded_width - input_width)))
