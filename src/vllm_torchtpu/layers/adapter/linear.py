@@ -20,6 +20,11 @@ from vllm.distributed import (
 )
 from vllm.model_executor.layers.linear import RowParallelLinear
 
+from vllm_torchtpu.layers.adapter.tp_all_reduce import (
+    tp4_hier_all_reduce,
+    tp4_hier_all_reduce_op,
+)
+
 
 @RowParallelLinear.register_oot
 class TpuRowParallelLinear(RowParallelLinear):
@@ -31,9 +36,20 @@ class TpuRowParallelLinear(RowParallelLinear):
     so adding it afterwards sums the same terms in a different order and keeps
     the graphs identical.
 
-    Only the deferred case is overridden; everything else delegates to
+    With ``TPU_TP4_HIER_ALL_REDUCE`` on a four-core TP group on two chips,
+    the reduction runs through the hierarchical all-reduce kernel instead.
+
+    Only those cases are overridden; everything else delegates to
     ``super().forward()``.
     """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._tp4_all_reduce = (
+            tp4_hier_all_reduce_op()
+            if self.reduce_results and self.tp_size == 4
+            else None
+        )
 
     def forward(
         self,
@@ -45,7 +61,8 @@ class TpuRowParallelLinear(RowParallelLinear):
             and not self.skip_bias_add
             and self.bias is not None
         )
-        if not defer_bias:
+        hier_op = self._tp4_all_reduce
+        if not defer_bias and hier_op is None:
             return super().forward(input_)
 
         if self.input_is_parallel:
@@ -57,10 +74,16 @@ class TpuRowParallelLinear(RowParallelLinear):
             input_parallel = split_input[self.tp_rank].contiguous()
 
         output_parallel = self.quant_method.apply(self, input_parallel, None)
-        output = tensor_model_parallel_all_reduce(output_parallel)
-        output = output + self.bias
+        if hier_op is not None:
+            output = tp4_hier_all_reduce(hier_op, output_parallel)
+        else:
+            output = tensor_model_parallel_all_reduce(output_parallel)
+        if defer_bias:
+            output = output + self.bias
+            output_bias = None
+        else:
+            output_bias = self.bias if self.skip_bias_add else None
 
-        # skip_bias_add is False here, so there is no bias left to return.
         if not self.return_bias:
             return output
-        return output, None
+        return output, output_bias

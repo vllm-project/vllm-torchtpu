@@ -5058,6 +5058,16 @@ class TPUModelRunner(GPUModelRunner):
                 vllm_config=self.vllm_config, model_config=self.model_config
             )
         validate_online_fp8(model, self.vllm_config.quant_config)
+        if envs.TPU_EMBED_EP_SHARD:
+            from vllm_torchtpu.layers.adapter.ep_sharded_embedding import (
+                prebuild_ep_embedding,
+                restore_tp_dummy_rows,
+            )
+
+            load_format = self.load_config.load_format
+            if getattr(load_format, "value", load_format) == "dummy":
+                restore_tp_dummy_rows(model)
+            prebuild_ep_embedding()
         self.model = model
         self._greedy_head = _vocab_parallel_greedy_head(
             model, self.lora_config is not None
