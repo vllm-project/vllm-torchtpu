@@ -74,6 +74,7 @@ def _make_runner(
     req_ids = [f"r{r}" for r in range(num_reqs)]
     ns = SimpleNamespace(
         _mamba_ckpt_window=window,
+        _two_slot_ckpts=False,
         mamba_slot_read_offsets=torch.zeros(num_blocks, dtype=torch.int32),
         _mamba_copy_plan=[(g + 1, [raws[g]]) for g in range(num_groups)],
         _mamba_state_block_size=BLOCK,
@@ -205,6 +206,50 @@ def test_no_copies_without_block_hashes():
     assert runner._plan_spec_boundary_copies(sched, 0, 1, seq_lens) is None
     runner.vllm_config.kv_transfer_config = object()
     assert runner._plan_spec_boundary_copies(sched, 0, 1, seq_lens) is not None
+
+
+@pytest.mark.parametrize("prefix_caching", [False, True])
+def test_no_copies_under_two_slot_checkpoints(prefix_caching):
+    # Two-slot checkpoints hold no per-position states to copy; their verify
+    # windows write the boundary states themselves.
+    runner, _ = _make_runner(prefix_caching=prefix_caching, window=2)
+    runner.vllm_config.kv_transfer_config = object()
+    runner._two_slot_ckpts = True
+    sched = SimpleNamespace(
+        scheduled_spec_decode_tokens={"r0": [0] * NUM_SPEC},
+        num_scheduled_tokens={"r0": NUM_SPEC + 1},
+    )
+    runner.input_batch.num_computed_tokens_cpu[0] = BLOCK - 1
+    seq_lens = torch.tensor([BLOCK + NUM_SPEC], dtype=torch.int32)
+    assert runner._plan_spec_boundary_copies(sched, 0, 1, seq_lens) is None
+
+
+@pytest.mark.parametrize(
+    "unified,prefix_caching,connector,allowed",
+    [
+        (True, False, None, True),
+        (True, False, "DecodeBenchConnector", True),
+        (True, True, None, True),
+        (True, False, "TPUConnector", True),
+        (True, True, "TPURaidenConnector", True),
+        (False, False, None, False),
+    ],
+)
+def test_two_slot_checkpoints_need_only_the_unified_pool(
+    monkeypatch, unified, prefix_caching, connector, allowed
+):
+    monkeypatch.setattr(runner_mod, "unified_kv_layout_enabled", lambda _: unified)
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(enable_prefix_caching=prefix_caching),
+        kv_transfer_config=(
+            None if connector is None else SimpleNamespace(kv_connector=connector)
+        ),
+    )
+    if allowed:
+        runner_mod._check_two_slot_ckpts_supported(vllm_config)
+    else:
+        with pytest.raises(ValueError, match="TPU_GDN_TWO_SLOT_CKPT"):
+            runner_mod._check_two_slot_ckpts_supported(vllm_config)
 
 
 def test_no_copies_without_a_checkpoint_window():

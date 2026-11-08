@@ -206,7 +206,11 @@ def test_stage3_transfer_groups_rejects_a_plan_it_cannot_serve(
         _stage3_transfer_groups(groups(), multi_group=multi_group)
 
 
-@pytest.mark.parametrize(("num_speculative_blocks", "expected"), ((0, 14), (3, 11)))
+# 1: two-slot GDN checkpoints, whose committed state at a hand-off is the
+# pair's first block.
+@pytest.mark.parametrize(
+    ("num_speculative_blocks", "expected"), ((0, 14), (1, 13), (3, 11))
+)
 def test_select_committed_mamba_blocks(num_speculative_blocks, expected):
     assert _select_committed_mamba_blocks(
         [[10, 11, 12, 13, 14]],
