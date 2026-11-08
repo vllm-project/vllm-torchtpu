@@ -268,6 +268,20 @@ class SessionTurnTracker:
 
         # No prior state on this replica for session_id or parent_session_id.
         if session_id and turn_id is not None and turn_id > 1:
+            im_end_positions = [
+                idx
+                for idx, tok in enumerate(prompt_token_ids)
+                if tok == _IM_END_TOKEN_ID
+            ]
+            if len(im_end_positions) >= 3:
+                last_reply_end = im_end_positions[-2] + 1
+                if hit < last_reply_end <= total:
+                    return TokenBreakdown(
+                        cache_hit=hit,
+                        routing_loss=last_reply_end - hit,
+                        new_input=total - last_reply_end,
+                        parent_session_id=parent_session_id,
+                    )
             return TokenBreakdown(
                 cache_hit=hit,
                 routing_loss=total - hit,

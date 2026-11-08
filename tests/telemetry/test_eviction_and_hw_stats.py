@@ -6,6 +6,7 @@ import pytest
 from vllm_torchtpu.telemetry.eviction_tracker import (
     BlockEvictionTracker,
     compute_request_padding_tokens,
+    compute_tpu_bucket_padding_tokens,
     extract_hardware_span_attributes,
 )
 
@@ -99,3 +100,19 @@ def test_session_eviction_and_lru_horizon_for_joiner():
     tracker.record_eviction("blk-1", now=40.0, wall_time_ms=1700000040000)
     assert tracker.session_evicted_at_ms("sess-A") == 1700000040000
     assert tracker.lru_horizon_ms(now=54.0) == pytest.approx(14000.0)
+
+
+@pytest.mark.parametrize(
+    ("scheduled_tokens", "expected_padding"),
+    [
+        (0, 0),
+        (32, 0),
+        (157, 99),
+        (345, 167),
+        (430, 82),
+        (902, 122),
+    ],
+)
+def test_compute_tpu_bucket_padding_tokens(scheduled_tokens, expected_padding):
+    assert compute_tpu_bucket_padding_tokens(scheduled_tokens) == expected_padding
+

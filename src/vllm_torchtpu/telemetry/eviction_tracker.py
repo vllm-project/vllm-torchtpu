@@ -18,6 +18,7 @@ class BlockEvictionTracker:
             session_maxsize
         )
         self._last_evicted_ts: float | None = None
+        self._last_evicted_wall_ms: int | None = None
 
     def register_session_blocks(
         self, session_id: str | None, block_hashes: Iterable[Any]
@@ -38,14 +39,15 @@ class BlockEvictionTracker:
         if block_hash is None:
             return
         ts = time.monotonic() if now is None else now
+        evict_wall = (
+            int(time.time() * 1000) if wall_time_ms is None else int(wall_time_ms)
+        )
         self._evicted_at.put(block_hash, ts)
         self._last_evicted_ts = ts
+        self._last_evicted_wall_ms = evict_wall
 
         owner = self._block_owner.peek(block_hash)
         if owner is not None:
-            evict_wall = (
-                int(time.time() * 1000) if wall_time_ms is None else int(wall_time_ms)
-            )
             self._session_evicted_wall_ms.put(owner, evict_wall)
 
     def last_eviction_age_ms(self, now: float | None = None) -> float | None:
@@ -86,9 +88,18 @@ class BlockEvictionTracker:
         self._block_owner.clear()
         self._session_evicted_wall_ms.clear()
         self._last_evicted_ts = None
+        self._last_evicted_wall_ms = None
 
     def __len__(self) -> int:
         return len(self._evicted_at)
+
+
+def compute_tpu_bucket_padding_tokens(scheduled_tokens: int) -> int:
+    """Return static TPU power-of-2 bucket padding tokens (min bucket 16) for `scheduled_tokens`."""
+    if scheduled_tokens <= 0:
+        return 0
+    padded = max(16, 1 << (scheduled_tokens - 1).bit_length())
+    return max(0, padded - scheduled_tokens)
 
 
 def compute_request_padding_tokens(
@@ -132,6 +143,9 @@ def extract_hardware_span_attributes(
     if num_external_computed_tokens > 0:
         attrs["vllm.kv_cache.external_computed_tokens"] = int(
             num_external_computed_tokens
+        )
+        attrs.setdefault(
+            "vllm.kv_cache.dram_tokens", int(num_external_computed_tokens)
         )
     if kv_transfer_params:
         for src_key, attr_key in (
