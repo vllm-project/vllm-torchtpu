@@ -29,6 +29,7 @@ from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2_mlp_scatter
+from vllm_torchtpu.layers.core import expert_placement
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
     quantize_to_native_fp4_kmajor,
     resolve_onehot_permute_threshold,
@@ -219,6 +220,45 @@ def test_owner_tail_runs_both_branches():
         base = np.asarray(base_run(*args, **kwargs)).view(np.uint16)
         got = np.asarray(run(*args, **kwargs)).view(np.uint16)
         np.testing.assert_array_equal(got, base)
+
+
+def _in_slots(args):
+    """The inputs with the experts in the slots of a count-balanced placement."""
+    x, w1, w2, s1, s2, weights, ids, es = args
+    num_experts, ranks = w1.shape[0], es.shape[0]
+    counts = np.bincount(np.asarray(ids).ravel(), minlength=num_experts)
+    slots = expert_placement.balance(counts, ranks)
+    expert = np.argsort(slots)
+    placed = slots[np.asarray(ids)]
+    w1, w2, s1, s2 = (a[jnp.asarray(expert)] for a in (w1, w2, s1, s2))
+    return x, w1, w2, s1, s2, weights, jnp.asarray(placed, jnp.int32), es
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize("dp_size,tp_size,factor", [(4, 2, 1.15), (2, 4, 0.0)])
+def test_owner_tail_in_slot_space(dp_size, tp_size, factor):
+    """Skewed top-10 routing placed by a count-balanced table."""
+    devices = _require_eight_tpu_devices()
+    mesh = Mesh(np.asarray(devices).reshape(dp_size, tp_size), (DP_AXIS, TP_AXIS))
+    num_tokens, topk = 48, 10
+    args = _in_slots(_inputs(8, tp_size, num_tokens, 64, topk=topk, skew=True))
+    stacked = tuple(a.reshape(dp_size, tp_size, -1, *a.shape[1:]) for a in args)
+    common = dict(
+        mesh=mesh,
+        topk=topk,
+        activation="silu",
+        use_sparse_core=True,
+        onehot_moe_permute_threshold=resolve_onehot_permute_threshold(
+            dp_size * num_tokens * topk
+        ),
+        capacity_factor=factor,
+        route_factor=2.0,
+        row_gather=True,
+        row_scatter=True,
+        owner_combine=True,
+        sorted_plan=True,
+    )
+    _check_tail(common, stacked, {"shared": _shared(dp_size, tp_size, num_tokens)})
 
 
 @pytest.mark.multichip
