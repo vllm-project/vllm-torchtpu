@@ -11,7 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests for `megakernel_runtime.exported_bridge`: HLO donation and pointer identity."""
+"""Model-free tests for `megakernel_runtime.exported_bridge` on `SynthHybrid`.
+
+HLO donation, pool pointer identity and bit-exactness of the torch custom op
+against the pure-JAX pooled step, built on the library's synthetic hybrid
+(`GDN` + `GQA` + `MoE`) `ModelSpec` rather than a model template.
+"""
 
 from __future__ import annotations
 
@@ -26,20 +31,25 @@ import torch
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
-import vllm_torchtpu.megakernel as mk
-from vllm_torchtpu.megakernel import planner
+from tests.megakernel.megakernel_fakes import TINY_TILES
+from tests.megakernel.megakernel_synth import synth_hybrid_spec
+from vllm_torchtpu.megakernel import cache, planner
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec
+from vllm_torchtpu.megakernel.pool.config import CacheExec, cache_exec
 from vllm_torchtpu.megakernel.runtime import (
     verify_compiled_step_ir,
     verify_pooled_step_hlo,
+)
+from vllm_torchtpu.megakernel.spec import ModelSpec
+from vllm_torchtpu.megakernel.weights.spec_inputs import (
+    pack_spec_inputs,
+    random_spec_inputs,
 )
 from vllm_torchtpu.megakernel_runtime.exported_bridge import (
     build_pooled_step_op,
     execute_pooled_step_inplace,
     export_pooled_step,
 )
-from vllm_torchtpu.models.qwen3_5.megakernel import model as qwen35
-from vllm_torchtpu.models.qwen3_5.megakernel.profiles.baseline import TINY_TILES
 
 
 def _cpu_mesh(r: int) -> Mesh:
@@ -47,26 +57,8 @@ def _cpu_mesh(r: int) -> Mesh:
     return Mesh(devices, ("tp",))
 
 
-def _tiny_geom(L: int = 4, att_every: int = 4) -> qwen35.Qwen35Geometry:
-    return qwen35.Qwen35Geometry(
-        L=L,
-        att_every=att_every,
-        H=256,
-        NH=4,
-        NKV=1,
-        HD=256,
-        ROT=64,
-        KH=2,
-        VH=4,
-        KD=128,
-        VD=128,
-        E=128,
-        TOPK=2,
-        I=256,
-        IS=256,
-        moe_tp=False,
-        e_slots=0,
-    )
+def _tiny_spec(R: int, L: int = 4, att_every: int = 4) -> ModelSpec:
+    return synth_hybrid_spec(L=L, att_every=att_every, R=R)
 
 
 def _tiny_exec(
@@ -88,8 +80,16 @@ def _tiny_exec(
         stack_e=stack_e,
         tiles=tiles,
         interpret=True,
-        cache=mk.CacheExec(paged_kv=True, num_pages=num_pages, max_pages_per_seq=2),
+        cache=CacheExec(paged_kv=True, num_pages=num_pages, max_pages_per_seq=2),
     )
+
+
+def _torch_dtype(dt: Any) -> torch.dtype:
+    if dt == jnp.float8_e4m3fn:
+        return torch.float8_e4m3fn
+    if dt == jnp.bfloat16:
+        return torch.bfloat16
+    return torch.float32
 
 
 def _jax_to_torch(a: jax.Array) -> torch.Tensor:
@@ -119,19 +119,16 @@ def test_exported_bridge_raiden_pointer_identity_and_bit_exact(T: int, B: int) -
     """Verify `execute_pooled_step_inplace` preserves pool `data_ptr()` and parity."""
     mesh = _cpu_mesh(1)
     tp = NamedSharding(mesh, P("tp"))
-    g = _tiny_geom(L=4, att_every=4)
     ex = _tiny_exec(R=1, B=B, T=T, ctx=256, num_pages=96, stack_e=False)
-    spec = qwen35.qwen35_spec(g)
+    spec = _tiny_spec(R=ex.R)
     plan = planner.plan(spec, ex)
 
-    pos_j, hid_l, w_l, st_l = mk.random_logical_inputs(jax.random.key(500 + T), g, ex)
-    _, hid_mk, w_mk, _ = mk.pack_inputs(
-        pos_j, hid_l, w_l, st_l, g, ex, mesh=mesh, build_default_pool=True
-    )
-    pt_j, ckpt_j, roff_j, _ = mk.default_pool_layout(g, ex)
+    pos_j, hid_l, w_l, st_l = random_spec_inputs(jax.random.key(500 + T), spec, ex)
+    _, hid_mk, w_mk, _ = pack_spec_inputs(pos_j, hid_l, w_l, st_l, spec, ex, mesh=mesh)
+    pt_j, ckpt_j, roff_j, _ = cache.default_pool_layout(spec, ex)
     raw_pools_j = tuple(
         jax.device_put(r, tp)
-        for r in mk.states_to_pool(g, ex, st_l, pt_j, ckpt_j, roff_j)
+        for r in cache.states_to_pool(spec, ex, st_l, pt_j, ckpt_j, read_offsets=roff_j)
     )
     unsh = NamedSharding(mesh, P())
     ckpt_step_j = jax.device_put(ckpt_j, unsh)
@@ -140,7 +137,7 @@ def test_exported_bridge_raiden_pointer_identity_and_bit_exact(T: int, B: int) -
     pos_step_j = jax.device_put(pos_j, unsh)
 
     # 1. Pure-JAX reference pooled step
-    step_jax, _ = qwen35.make_pooled_step(mesh, g, ex, donate_pools=False)
+    step_jax = cache.make_pooled_step(mesh, spec, ex, donate_pools=False)
     hid_ref_j, raw_ref_j = step_jax(
         pos_step_j, hid_mk, w_mk, raw_pools_j, pt_step_j, ckpt_step_j, roff_step_j
     )
@@ -195,9 +192,10 @@ def test_exported_bridge_raiden_pointer_identity_and_bit_exact(T: int, B: int) -
 def test_verify_and_export_pooled_step_hlo() -> None:
     """Verify `verify_pooled_step_hlo` and `export_pooled_step` on a sharded step."""
     mesh = _cpu_mesh(2)
-    g = replace(_tiny_geom(L=4, att_every=4), NKV=2)
     ex = _tiny_exec(R=2, B=2, T=1, ctx=256, num_pages=64, stack_e=False)
-    spec = qwen35.qwen35_spec(g)
+    spec = _tiny_spec(R=ex.R)
+    g = spec.config
+    assert g.NKV == 2
     plan = planner.plan(spec, ex)
     w_shapes = planner.weight_shapes(spec, ex, plan)
 
@@ -206,35 +204,30 @@ def test_verify_and_export_pooled_step_hlo() -> None:
     for k in plan.w_names:
         w_spec = w_shapes[k]
         if k in plan.dynamic_kinds and not ex.stack_e:
-            dt = w_spec[0].dtype
-            t_dt = (
-                torch.float8_e4m3fn
-                if dt == jnp.float8_e4m3fn
-                else torch.bfloat16
-                if dt == jnp.bfloat16
-                else torch.float32
-            )
+            # One `(EW, K, N)` expert tensor per MoE layer
+            assert len(w_spec) == g.L
             ew = g.EW(ex.R)
-            k_dim = g.H if k == "e13" else g.IR(ex.R)
-            n_dim = 2 * g.IR(ex.R) if k == "e13" else g.H
-            for _ in range(g.L):
+            for layer_spec in w_spec:
+                k_dim, n_dim = layer_spec.shape[-2:]
+                t_dt = _torch_dtype(layer_spec.dtype)
                 w_flat_local.append(torch.zeros((ew, k_dim, n_dim), dtype=t_dt))
         else:
             sh, dt = w_spec
-            t_dt = (
-                torch.float8_e4m3fn
-                if dt == jnp.float8_e4m3fn
-                else torch.bfloat16
-                if dt == jnp.bfloat16
-                else torch.float32
-            )
-            w_flat_local.append(torch.zeros(sh, dtype=t_dt))
+            w_flat_local.append(torch.zeros(sh, dtype=_torch_dtype(dt)))
 
+    pb = spec.cache_backend
+    assert pb is not None
+    lay = pb.layout
+    pool_shape = (
+        cache_exec(ex).num_pages,
+        2 * lay.kvh,
+        lay.hd // 4,
+        4,
+        lay.page_size,
+    )
+    assert pool_shape == (64, 2, 64, 4, 128)
     pools_local = [
-        torch.zeros(
-            (mk.cache_exec(ex).num_pages, 2, 64, 4, 128), dtype=torch.float8_e4m3fn
-        )
-        for _ in range(g.NATT)
+        torch.zeros(pool_shape, dtype=torch.float8_e4m3fn) for _ in range(pb.num_pools)
     ]
 
     ok, msg = verify_pooled_step_hlo(
@@ -243,7 +236,7 @@ def test_verify_and_export_pooled_step_hlo() -> None:
         ex,
         w_flat_local,
         pools_local,
-        max_pages_per_seq=mk.cache_exec(ex).max_pages_per_seq,
+        max_pages_per_seq=cache_exec(ex).max_pages_per_seq,
         compile_hlo=True,
     )
     assert ok, f"verify_pooled_step_hlo failed: {msg}"
@@ -254,7 +247,7 @@ def test_verify_and_export_pooled_step_hlo() -> None:
         ex,
         w_flat_local,
         pools_local,
-        max_pages_per_seq=mk.cache_exec(ex).max_pages_per_seq,
+        max_pages_per_seq=cache_exec(ex).max_pages_per_seq,
         compile_hlo=True,
         ckpt_cols=2,
     )
@@ -266,7 +259,7 @@ def test_verify_and_export_pooled_step_hlo() -> None:
         ex,
         w_flat_local,
         pools_local,
-        max_pages_per_seq=mk.cache_exec(ex).max_pages_per_seq,
+        max_pages_per_seq=cache_exec(ex).max_pages_per_seq,
         platforms=("cpu",),
         ckpt_cols=2,
     )
@@ -405,9 +398,8 @@ def test_build_pooled_step_op_without_torch_tpu(
     from vllm_torchtpu.megakernel_runtime import exported_bridge
 
     mesh = _cpu_mesh(1)
-    g = _tiny_geom(L=4, att_every=4)
     ex = _tiny_exec(R=1, B=2, T=1, ctx=256, num_pages=96)
-    spec = qwen35.qwen35_spec(g)
+    spec = _tiny_spec(R=ex.R)
 
     def _missing(name: str) -> Any:
         def _raise(*_args: Any, **_kwargs: Any) -> Any:
