@@ -2148,6 +2148,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 k_scale=k_scale,
                 v_scale=v_scale,
                 use_causal_mask=not self.non_causal_multi_token_decode,
+                skip_kv_update=layer.kv_sharing_target_layer_name is not None,
             )
             # mla_attention returns (kv_cache, out), and more with return_lse.
             return results[0], results[1]
@@ -2237,6 +2238,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 sm_scale=layer.scale,
                 k_scale=k_scale,
                 allow_masked_dense=allow_masked_dense,
+                skip_kv_update=layer.kv_sharing_target_layer_name is not None,
             )
 
         op_name = f"pallas::sparse_mla_attention_{layer.layer_name.replace('.', '_')}"
@@ -2355,6 +2357,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 k_scale=k_scale,
                 dcp_size=dcp_size,
                 interleave_size=interleave_size,
+                skip_kv_update=layer.kv_sharing_target_layer_name is not None,
             )
 
         op_name = (
