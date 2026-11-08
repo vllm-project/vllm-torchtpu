@@ -334,15 +334,19 @@ def artifact_model_name(model: str | None, served_model_name: Any = None) -> str
 
 
 # Speculative methods the artifact can declare, with the fields each takes: ngram
-# drafts on the host from the sequence itself; mtp drafts with the model's MTP
-# layer (the adapter's `mtp_draft()`) and dspark with a separate DSpark draft
-# model (`model`, the adapter's `dspark_draft()`), which the export lowers as
-# the drafter `draft` / `draft_bucket{B}`.
+# drafts on the host from the sequence itself; mtp drafts with an MTP draft fed
+# the target's last hidden state (the adapter's `mtp_draft()`): the model's own
+# MTP layer, or a separate checkpoint (`model`) such as Gemma 4's assistant;
+# dspark with a separate DSpark draft model (`model`, the adapter's
+# `dspark_draft()`). The export lowers either drafter as `draft` /
+# `draft_bucket{B}`.
 _SPECULATIVE_FIELDS = {
     "ngram": frozenset(
         {"method", "num_speculative_tokens", "prompt_lookup_max", "prompt_lookup_min"}
     ),
-    "mtp": frozenset({"method", "num_speculative_tokens"}),
+    "mtp": frozenset(
+        {"method", "num_speculative_tokens", "model", "draft_tensor_parallel_size"}
+    ),
     "dspark": frozenset(
         {"method", "num_speculative_tokens", "model", "draft_tensor_parallel_size"}
     ),
@@ -402,12 +406,14 @@ def export_speculative_config(
         cfg.setdefault("prompt_lookup_min", lookup_max)
         out["prompt_lookup_max"] = lookup_max
         out["prompt_lookup_min"] = positive("prompt_lookup_min")
-    if method in ("dspark", "dflash"):
-        if not isinstance(cfg.get("model"), str) or not cfg["model"]:
-            raise ValueError(
-                f"--speculative-config method {method!r} needs the draft model's "
-                "checkpoint as 'model'"
-            )
+    if method in ("dspark", "dflash") and (
+        not isinstance(cfg.get("model"), str) or not cfg["model"]
+    ):
+        raise ValueError(
+            f"--speculative-config method {method!r} needs the draft model's "
+            "checkpoint as 'model'"
+        )
+    if method in ("mtp", "dspark", "dflash"):
         draft_tp = cfg.get("draft_tensor_parallel_size", tensor_parallel_size)
         if draft_tp != tensor_parallel_size:
             raise ValueError(
