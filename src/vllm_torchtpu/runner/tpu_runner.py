@@ -4670,6 +4670,15 @@ class TPUModelRunner(GPUModelRunner):
                 device=target_logits.device,
                 generator=sampling_generator,
             )
+        if (
+            self.rejection_sampler.synthetic_mode
+            and os.environ.get("TPU_SYNTH_ACCEPT_BY_POSITION") == "1"
+        ):
+            # Test-only: synthetic acceptance decided by a hash of each draft's
+            # request position (prompt length, computed tokens, draft index)
+            # instead of the step's random stream, so the acceptance pattern
+            # does not depend on how requests share steps.
+            accept_u = self._position_hash_uniforms(md, cur_start_idx, accept_u)
         if all_greedy:
             return self.rejection_sampler(
                 draft_token_ids=md.draft_token_ids,
@@ -4704,6 +4713,25 @@ class TPUModelRunner(GPUModelRunner):
             recover_u=recover_u,
             do_sampling=True,
         )
+
+    def _position_hash_uniforms(self, md, start: int, like: torch.Tensor):
+        lengths = np.asarray(md.draft_lengths_cpu, dtype=np.int64)
+        computed = self.input_batch.num_computed_tokens_cpu[
+            start : start + len(lengths)
+        ].astype(np.int64)
+        prompt = self.input_batch.num_prompt_tokens[start : start + len(lengths)]
+        values = np.ones(like.shape[0], dtype=np.float32)
+        i = 0
+        for r, n in enumerate(lengths):
+            for g in range(int(n)):
+                h = int(computed[r]) * 1000003 + g * 7919 + int(prompt[r]) * 104729
+                h &= 0xFFFFFFFF
+                h = ((h ^ (h >> 16)) * 0x45D9F3B) & 0xFFFFFFFF
+                h = ((h ^ (h >> 16)) * 0x45D9F3B) & 0xFFFFFFFF
+                h ^= h >> 16
+                values[i] = h / 4294967296.0
+                i += 1
+        return torch.from_numpy(values).to(like.device)
 
     def _sample_spec_verify_candidates(
         self,
