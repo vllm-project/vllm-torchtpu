@@ -45,6 +45,7 @@ from .verify_metrics import (
     CheckResult,
     ToleranceSpec,
     VerificationReport,
+    _safe_run,
 )
 from .verify_module import ModuleOracle, verify_module
 
@@ -61,13 +62,6 @@ class ResolvedModel:
     plan: Any
     pool_layout: pool.PoolLayout
     pool_backend: pool.PoolBackend
-
-
-def _safe_run(name: str, fn: Callable[[], CheckResult]) -> CheckResult:
-    try:
-        return fn()
-    except Exception as exc:
-        return CheckResult(name, "failed", reason=f"{type(exc).__name__}: {exc}")
 
 
 def auto_model(

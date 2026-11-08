@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Callable, Mapping, Sequence
-from typing import TYPE_CHECKING, Any, Literal
+from typing import Any, Literal
 
 import jax
 import jax.numpy as jnp
@@ -47,9 +47,13 @@ from .verify_checks import (
     _stat_result,
     err_metrics,
 )
-
-if TYPE_CHECKING:
-    from .verify import CheckResult, ToleranceSpec, VerificationReport
+from .verify_metrics import (
+    DEFAULT_TOLERANCES,
+    CheckResult,
+    ToleranceSpec,
+    VerificationReport,
+    _safe_run,
+)
 
 ModuleOracle = Callable[..., tuple[jax.Array, Mapping[str, Any]]]
 """Oracle `(params, x, state, *, g, ex, layer_idx=0, pos=pos, **kw) -> (out, states)`:
@@ -303,8 +307,6 @@ def verify_module(
     or `module_oracle(params, x, state, *, g=g1, ex=ex_d, layer_idx=0, pos=pos)`.
     See `ModuleOracle` for the input/output composition and rounding contract.
     """
-    from .verify import DEFAULT_TOLERANCES, CheckResult, VerificationReport, _safe_run
-
     tol = DEFAULT_TOLERANCES if tolerances is None else tolerances
     m_name = str(getattr(module, "name", getattr(module, "prefix", "module")))
     mod: Any = None
@@ -315,8 +317,7 @@ def verify_module(
 
     def _run_setup() -> CheckResult:
         nonlocal m_name, mod, g1, spec
-        # `ModelGeometry.check` requires `L % att_every == 0`, so reducing `L`
-        # to `1` for single-layer module verification also sets `att_every=1`.
+        # `ModelGeometry.check` requires `L % att_every == 0` (`att_every=1` for `L=1`).
         g1_kw = {"L": 1, **({"att_every": 1} if hasattr(g, "att_every") else {})}
         g1 = dataclasses.replace(g, **g1_kw)
         mod = _resolve_verify_module(module, g1)

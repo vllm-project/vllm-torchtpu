@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -252,3 +252,10 @@ def _compare_state_dict(
                 failed.append(f"{tag} {sk} abs={s_ab:.4g} > {satol}")
             elif s_min_cos is not None and s_cs < s_min_cos:
                 failed.append(f"{tag} {sk} cos={s_cs:.6f} < {s_min_cos}")
+
+
+def _safe_run(name: str, fn: Callable[[], CheckResult]) -> CheckResult:
+    try:
+        return fn()
+    except Exception as exc:
+        return CheckResult(name, "failed", reason=f"{type(exc).__name__}: {exc}")

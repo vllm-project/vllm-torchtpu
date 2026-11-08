@@ -15,7 +15,6 @@
 
 from __future__ import annotations
 
-import math
 from collections.abc import Mapping
 from typing import Any
 
@@ -31,6 +30,7 @@ from ..modules.transforms import _validate_decl_and_array, apply_hf_transforms
 from ..ops import I32
 from ..spec import ModelSpec
 from .eplb import default_eplb_cores, encode_eplb_ecopy
+from .spec_inputs import _coerce_canonical_hf_entry, coerce_canonical_hf_entry
 from .spec_pack import pack_spec_logical_weights, switch_branch_for_layer
 
 
@@ -91,97 +91,6 @@ def resolve_spec_and_norms(
     )
     final_n = _resolve_norm_mod(model_def.final_norm, geom, default_small_field=None)
     return ms, geom, pre_n, post_n, final_n
-
-
-def _transpose_with_lead(
-    arr: jax.Array, lead: tuple[int, ...], perm: tuple[int, ...]
-) -> jax.Array:
-    full_perm = (0, *(ax + 1 for ax in perm)) if lead else perm
-    return jnp.transpose(arr, full_perm)
-
-
-def _coerce_canonical_hf_entry(
-    d: HFParamDecl,
-    hf: Mapping[str, Any],
-    fuse_members: Mapping[str, list[HFParamDecl]],
-    *,
-    has_layer_dim: bool = True,
-) -> jax.Array:
-    """Resolve `d` from `hf` (supporting pre-fused keys and declared HF shapes)."""
-    if d.name in hf:
-        arr = jnp.asarray(hf[d.name])
-    elif d.transform.fuse_into and d.transform.fuse_into in hf:
-        f_arr = jnp.asarray(hf[d.transform.fuse_into])
-        ax = d.transform.fuse_axis % f_arr.ndim
-        off = 0
-        arr = f_arr
-        for m in fuse_members[d.transform.fuse_into]:
-            w = int(m.shape[d.transform.fuse_axis % len(m.shape)])
-            if m.name == d.name:
-                sl = [slice(None)] * f_arr.ndim
-                sl[ax] = slice(off, off + w)
-                arr = f_arr[tuple(sl)]
-                break
-            off += w
-    else:
-        raise KeyError(f"Missing parameter {d.name!r} in HF weight mapping")
-
-    rank = len(d.shape)
-    if not has_layer_dim:
-        lead, trail = (), arr.shape
-    elif arr.ndim >= 2:
-        lead, trail = (arr.shape[0],), arr.shape[1:]
-    else:
-        raise ValueError(
-            f"HF parameter {d.name!r} has invalid shape {arr.shape}, "
-            f"expected shape={d.shape} or hf_shape={d.hf_shape}"
-        )
-
-    if trail == d.hf_shape:
-        if d.transform.split_slice is not None:
-            s0, s1 = d.transform.split_slice
-            sl = [slice(None)] * arr.ndim
-            sl[len(lead)] = slice(s0, s1)
-            arr = arr[tuple(sl)]
-            trail = arr.shape[len(lead) :]
-        tp = d.transform.transpose
-        if len(trail) == rank:
-            if tp is not None:
-                arr = _transpose_with_lead(arr, lead, tp)
-            if arr.shape[len(lead) :] == d.shape:
-                return arr
-        elif len(trail) < rank:
-            if math.prod(trail) == math.prod(d.shape):
-                if rank == 3 and len(trail) == 2 and tp == (0, 2, 1):
-                    arr_3d = arr.reshape((*lead, d.shape[0], d.shape[2], d.shape[1]))
-                    return _transpose_with_lead(arr_3d, lead, (0, 2, 1))
-                return arr.reshape((*lead, *d.shape))
-            if len(trail) == 1 and rank == 2 and trail[0] == d.shape[-1]:
-                return jnp.broadcast_to(
-                    arr.reshape((*lead, 1, trail[0])), (*lead, *d.shape)
-                )
-        elif math.prod(trail) == math.prod(d.shape):
-            if (
-                d.transform.flatten_tail
-                and rank == 2
-                and trail == (d.shape[1], 1, d.shape[0])
-            ):
-                arr_2d = arr.reshape((*lead, d.shape[1], d.shape[0]))
-                return _transpose_with_lead(arr_2d, lead, (1, 0))
-            if tp is not None and len(tp) == len(trail):
-                arr = _transpose_with_lead(arr, lead, tp)
-            return arr.reshape((*lead, *d.shape))
-    if trail == d.shape:
-        return arr
-
-    raise ValueError(
-        f"HF parameter {d.name!r} has trailing shape {trail}, "
-        f"expected shape={d.shape} or hf_shape={d.hf_shape}"
-    )
-
-
-# Public name for model folders' HF oracles (`hf_oracle.py`).
-coerce_canonical_hf_entry = _coerce_canonical_hf_entry
 
 
 def load_logical_weights(
