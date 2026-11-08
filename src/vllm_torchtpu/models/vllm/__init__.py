@@ -25,6 +25,7 @@ _DSV4_DSPARK_MODEL = (
 _QWEN35_MTP_MODEL = "vllm_torchtpu.models.vllm.qwen3_5_mtp:Qwen3_5MTP"
 _QWEN35_MOE_MTP_MODEL = "vllm_torchtpu.models.vllm.qwen3_5_mtp:Qwen3_5MoeMTP"
 _QWEN4_EXP_MODEL = "vllm_torchtpu.models.vllm.qwen4_exp.model:Qwen4ExpForCausalLM"
+_YOUTU_VITA_MODEL = "vllm_torchtpu.models.vllm.youtu_vita:YoutuVITAForCausalLM"
 
 
 class _TPUKimiK3Config(VerifyAndUpdateConfig):
@@ -45,8 +46,14 @@ class _TPUQwen2Config(VerifyAndUpdateConfig):
 def register_models() -> None:
     from vllm.model_executor.models import ModelRegistry
     from vllm.model_executor.models.config import MODELS_CONFIG_MAP
+    from vllm.transformers_utils.model_arch_config_convertor import (
+        MODEL_ARCH_CONFIG_CONVERTORS,
+    )
 
     from vllm_torchtpu.models.vllm.qwen4_exp.config import TPUQwen4ExpConfig
+    from vllm_torchtpu.models.vllm.youtu_vita import (
+        YoutuVITAModelArchConfigConvertor,
+    )
 
     ModelRegistry.register_model("KimiLinearForCausalLM", _KIMI_MODEL)
     ModelRegistry.register_model("KimiK3ForConditionalGeneration", _KIMI_K3_MODEL)
@@ -60,6 +67,12 @@ def register_models() -> None:
     # The released checkpoint declares the vision-language arch; serve it with
     # the text-only model.
     ModelRegistry.register_model("Qwen4ExpForConditionalGeneration", _QWEN4_EXP_MODEL)
+    # vLLM has no Youtu-VITA model (remote-code checkpoints, e.g.
+    # tencent/Youtu-Parsing-Omni); its text model is MLA, which vLLM detects by
+    # model type, so the outer and the text config types get the MLA convertor.
+    ModelRegistry.register_model("YoutuVITAForCausalLM", _YOUTU_VITA_MODEL)
+    MODEL_ARCH_CONFIG_CONVERTORS["youtu_vita"] = YoutuVITAModelArchConfigConvertor
+    MODEL_ARCH_CONFIG_CONVERTORS["youtu_vita_text"] = YoutuVITAModelArchConfigConvertor
     MODELS_CONFIG_MAP["KimiK3ForConditionalGeneration"] = _TPUKimiK3Config
     MODELS_CONFIG_MAP["Qwen4ExpForCausalLM"] = TPUQwen4ExpConfig
     MODELS_CONFIG_MAP["Qwen4ExpForConditionalGeneration"] = TPUQwen4ExpConfig
