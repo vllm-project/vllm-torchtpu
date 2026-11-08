@@ -51,7 +51,8 @@ from vllm.model_executor.layers.quantization.base_config import (
 )
 from vllm.model_executor.utils import replace_parameter
 
-from vllm_torchtpu.layers.adapter import moe_routing
+import vllm_torchtpu.envs as envs
+from vllm_torchtpu.layers.adapter import moe_routing, token_padding
 from vllm_torchtpu.layers.adapter.fused_moe import (
     TpuMoEActivationMixin,
     fused_moe_gmm,
@@ -68,6 +69,11 @@ from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
 from vllm_torchtpu.layers.adapter.quantization.configs import (
     VllmQuantConfig,
     should_quantize_on_load,
+)
+from vllm_torchtpu.layers.adapter.ragged_a2a_moe import (
+    prebuild_ragged_a2a_moe,
+    ragged_a2a_enabled,
+    ragged_a2a_fused_moe_gmm,
 )
 from vllm_torchtpu.layers.core.quant_methods import UNQUANTIZED, get_tpu_quant_method
 from vllm_torchtpu.logger import init_logger
@@ -211,6 +217,16 @@ class VllmUnquantizedConfig(QuantizationConfig, VllmQuantConfig):
         return None
 
 
+def _uses_ragged_a2a(method) -> bool:
+    """Whether the method's layer exchanges its tokens with the ragged
+    all-to-all (TPU_MOE_RAGGED_A2A with TPU_MOE_A2A_UNQUANTIZED, under EP)."""
+    return (
+        ragged_a2a_enabled()
+        and envs.TPU_MOE_A2A_UNQUANTIZED
+        and method.moe.moe_parallel_config.use_ep
+    )
+
+
 class VllmUnquantizedFusedMoEMethod(TpuMoEActivationMixin, UnquantizedFusedMoEMethod):
     """
     TPU-native implementation of unquantized RoutedExperts.
@@ -234,7 +250,7 @@ class VllmUnquantizedFusedMoEMethod(TpuMoEActivationMixin, UnquantizedFusedMoEMe
     def supports_internal_mk(self) -> bool:
         # We need to take control of collective communication (AllGather/ReduceScatter)
         # to pipeline them with MoE computation when chunking is enabled.
-        return enable_pipelined_collective_and_compute()
+        return enable_pipelined_collective_and_compute() or _uses_ragged_a2a(self)
 
     def _select_monolithic(self):
         return self._forward_monolithic_tpu
@@ -319,7 +335,25 @@ class VllmUnquantizedFusedMoEMethod(TpuMoEActivationMixin, UnquantizedFusedMoEMe
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
             use_ep=layer.moe_config.moe_parallel_config.use_ep,
+            # Padded tokens are left unrouted instead (see
+            # _forward_monolithic_tpu), so the kernel never skips by weight.
+            skip_padded_tokens=False,
         )
+        if _uses_ragged_a2a(self):
+            if self.moe.has_bias:
+                raise NotImplementedError(
+                    "TPU_MOE_A2A_UNQUANTIZED: the ragged exchange takes no biases"
+                )
+            if enable_pipelined_collective_and_compute():
+                raise NotImplementedError(
+                    "TPU_MOE_A2A_UNQUANTIZED and TPU_MOE_COLLECTION_CHUNK_SIZE both "
+                    "own the EP exchange; set one"
+                )
+            prebuild_ragged_a2a_moe(
+                topk=layer.moe_config.experts_per_token,
+                activation=activation_str,
+                scaled=False,
+            )
 
     def _forward_monolithic_tpu(
         self,
@@ -338,6 +372,10 @@ class VllmUnquantizedFusedMoEMethod(TpuMoEActivationMixin, UnquantizedFusedMoEMe
         # custom_routing_function -> select_experts); shared across all TPU MoE
         # methods so the routing-simulation hook lives in exactly one place.
         topk_weights, topk_ids = moe_routing.route(layer, x, router_logits)
+        if envs.TPU_MOE_SKIP_PADDED_TOKENS:
+            topk_ids, topk_weights = token_padding.drop_padded_routes(
+                topk_ids, topk_weights, is_local_tensor=self.supports_internal_mk
+            )
 
         kwargs = {
             "hidden_states": x,
@@ -353,6 +391,14 @@ class VllmUnquantizedFusedMoEMethod(TpuMoEActivationMixin, UnquantizedFusedMoEMe
             "topk": layer.moe_config.experts_per_token,
             "activation": activation_str,
         }
+        if _uses_ragged_a2a(self):
+            # Set by the MoE runner when the owner combine takes the shared
+            # expert's partial into the routed op.
+            shared_output = getattr(layer, "_tpu_owner_shared_output", None)
+            if shared_output is not None:
+                kwargs["shared_output"] = shared_output
+            return ragged_a2a_fused_moe_gmm(**kwargs)
+        kwargs["skip_padded_tokens"] = False
         if enable_pipelined_collective_and_compute():
             return pipelined_fused_moe_gmm(**kwargs)
 
