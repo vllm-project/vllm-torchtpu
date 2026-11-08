@@ -237,3 +237,74 @@ def test_fp4_lowers_for_tpu(kernel):
     with use_abstract_mesh(tpu7x):
         lowered = jax.jit(f).trace(*args).lower(lowering_platforms=("tpu",))
     assert "tpu_custom_call" in lowered.as_text()
+
+
+@pytest.mark.parametrize("layout", ["bf16", "fp8", "fp4_folded"])
+@pytest.mark.parametrize(
+    "q_lens,ctx_lens",
+    [
+        # decode / verify only: no large request (the large class is skipped)
+        ([1, 8, 8, 1], [0, 129, 600, 1015]),
+        # a large request too: both classes run
+        ([8, 40, 1], [250, 300, 777]),
+        ([1], [0]),  # one page, every other group of the step dead
+    ],
+)
+def test_skip_dead_matches_reference_arm(q_lens, ctx_lens, layout, monkeypatch):
+    """`skip_dead` (v3 skips dot groups past a request's last page; the large
+    class runs only with a large request) gives the reference arm's scores
+    bit for bit on every page of every request."""
+    from vllm_torchtpu.models.minimax_m3.kernels import msa_fp4, msa_indexer
+
+    # Two pages per dot, so a step of 8 pages has 4 groups to skip.
+    block_q = 16
+    monkeypatch.setattr(msa_indexer, "_MAX_SCORE_ELEMS", 2 * PAGE * block_q)
+    jax.clear_caches()
+    rng = np.random.default_rng(sum(ctx_lens) + len(layout))
+    num_seqs = len(q_lens)
+    num_real = sum(q_lens)
+    num_tokens = max(num_real + 3, block_q + 8)
+    seq_lens = np.zeros(MAX_SEQS, np.int32)
+    seq_lens[:num_seqs] = np.array(ctx_lens) + np.array(q_lens)
+    cu_q = np.full(MAX_SEQS + 1, num_real, np.int32)
+    cu_q[: num_seqs + 1] = np.concatenate([[0], np.cumsum(q_lens)])
+    tables = np.zeros((MAX_SEQS, PAGES_PER_SEQ), np.int32)
+    tables[:num_seqs] = rng.permutation(np.arange(1, NUM_PAGES))[
+        : num_seqs * PAGES_PER_SEQ
+    ].reshape(num_seqs, PAGES_PER_SEQ)
+    raw = rng.standard_normal((NUM_PAGES, PAGE, HEAD_DIM))
+    if layout == "fp4_folded":
+        nib, scale = msa_fp4.quantize(msa_fp4.rotate_keys(jnp.asarray(raw, jnp.float32)))
+        cache = msa_fp4.pack_rows(nib, scales=scale)
+    else:
+        dtype = jnp.bfloat16 if layout == "bf16" else jnp.float8_e4m3fn
+        cache = pack(rounded(raw, dtype), dtype)
+    index_q = jnp.asarray(rng.standard_normal((num_tokens, 1, HEAD_DIM))).astype(
+        jnp.bfloat16
+    )
+    args = (
+        index_q,
+        cache,
+        jnp.asarray(seq_lens),
+        jnp.asarray(tables.reshape(-1)),
+        jnp.asarray(cu_q),
+        jnp.int32(num_seqs),
+    )
+    kw = dict(
+        block_q=block_q,
+        large_block_q=32,
+        pages_per_step=4,
+        small_pages_per_step=PAGES_PER_SEQ,
+        kernel="v3",
+        large_kernel="v2",
+        interpret=True,
+    )
+    got = np.asarray(block_scores(*args, skip_dead=True, **kw))[:, 0]
+    ref = np.asarray(block_scores(*args, skip_dead=False, **kw))[:, 0]
+    assert got.shape == ref.shape
+    for r in range(num_seqs):
+        num_pages = -(-seq_lens[r] // PAGE)
+        rows = slice(cu_q[r], cu_q[r + 1])
+        np.testing.assert_array_equal(
+            got[rows, :num_pages].view(np.uint32), ref[rows, :num_pages].view(np.uint32)
+        )

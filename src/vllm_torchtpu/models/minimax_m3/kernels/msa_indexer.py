@@ -199,8 +199,10 @@ def _page_tokens(rows_per_page: int, dtype) -> int:
     return rows_per_page * (4 // jnp.dtype(dtype).itemsize)
 
 
-def _scores_v3(q, page_refs, o_ref, scale_refs=None, scale_row=None):
-    """`_kernel_v2`'s scoring over pages already in VMEM."""
+def _scores_v3(q, page_refs, o_ref, scale_refs=None, scale_row=None, live=None):
+    """`_kernel_v2`'s scoring over pages already in VMEM. With `live` (the
+    step's pages up to the request's last), a dot group of pages all past it
+    is not scored: its scores are never read, and it is stored as -inf."""
     block_q = q.shape[0]
     pages_per_step = len(page_refs)
     rows = page_refs[0].shape[0]
@@ -208,9 +210,10 @@ def _scores_v3(q, page_refs, o_ref, scale_refs=None, scale_row=None):
     pages_per_dot = max(
         1, min(pages_per_step, _MAX_SCORE_ELEMS // (page_size * block_q))
     )
-    maxima = []
     folded = msa_fp4.scales_in_page(rows, page_refs[0].dtype)
-    for first in range(0, pages_per_step, pages_per_dot):
+    groups = range(0, pages_per_step, pages_per_dot)
+
+    def group_scores(first):
         group = page_refs[first : first + pages_per_dot]
         keys, cols = [], []
         for r in group:
@@ -236,8 +239,27 @@ def _scores_v3(q, page_refs, o_ref, scale_refs=None, scale_row=None):
                 for r in scale_refs[first : first + pages_per_dot]
             ]
             s = s * (cols[0] if len(cols) == 1 else jnp.concatenate(cols, axis=0))
-        maxima.append(jnp.max(s.reshape(len(group), page_size, block_q), axis=1))
-    o_ref[...] = maxima[0] if len(maxima) == 1 else jnp.concatenate(maxima, axis=0)
+        return jnp.max(s.reshape(len(group), page_size, block_q), axis=1)
+
+    if live is None:
+        maxima = [group_scores(first) for first in groups]
+        o_ref[...] = maxima[0] if len(maxima) == 1 else jnp.concatenate(maxima, axis=0)
+        return
+    for first in groups:
+        size = min(pages_per_dot, pages_per_step - first)
+        rows_out = pl.ds(first, size)
+
+        def store(first=first, rows_out=rows_out):
+            o_ref[rows_out, :] = group_scores(first)
+
+        if first == 0:  # every step has a live page
+            store()
+            continue
+        pl.when(first < live)(store)
+
+        @pl.when(first >= live)
+        def _(rows_out=rows_out, size=size):
+            o_ref[rows_out, :] = jnp.full((size, block_q), -jnp.inf, jnp.float32)
 
 
 def _kernel_v3(
@@ -251,10 +273,14 @@ def _kernel_v3(
     cache_ref,  # [pages, S / p, p, D] index cache, left in HBM
     *refs,
     scale_row: int | None = None,
+    skip_dead: bool = True,
 ):
     """`_kernel_v2` with the pages fetched by a hand-written double-buffered
     DMA ring: one scalar address per page and no copy for pages past the
-    request's end (their scores are never read).
+    request's end (their scores are never read). With `skip_dead`, dot groups
+    of such pages are not scored either (`_scores_v3`): a request's last
+    group of 128 pages is mostly empty (34% of the slots at 64-request decode,
+    j-5cc99100).
 
     refs: without `scale_row`, ``o_ref [G, Bq]``, then scratch ``buf0``,
     ``buf1`` (``[G, S / p, p, D]`` pages of even / odd steps) and DMA
@@ -271,11 +297,15 @@ def _kernel_v3(
     pages_per_seq = block_tables_ref.shape[0] // seq_pages_ref.shape[0]
     step, num_steps = pl.program_id(0), pl.num_programs(0)
 
-    def copies(w, buf, slot, sbuf=None):
+    def live_pages(w):
+        """Request, first page and live pages (at least 1) of work item `w`."""
         entry = work_ref[w]
         seq = tile_seq_ref[entry >> _TILE_SHIFT] & _SEQ_MASK
         first = (entry & _GROUP_MASK) * pages_per_step
-        live = jnp.maximum(seq_pages_ref[seq] - first, 1)
+        return seq, first, jnp.maximum(seq_pages_ref[seq] - first, 1)
+
+    def copies(w, buf, slot, sbuf=None):
+        seq, first, live = live_pages(w)
         base = seq * pages_per_seq + first
         out = []
         for g in range(pages_per_step):
@@ -337,6 +367,7 @@ def _kernel_v3(
             o_ref,
             None if sbuf is None else [sbuf.at[g] for g in range(pages_per_step)],
             scale_row,
+            live_pages(step)[2] if skip_dead else None,
         )
 
     pl.when(even)(lambda: score(0))
@@ -386,6 +417,7 @@ def _class_scores(
     interpret,
     scale_cache=None,
     scale_row=None,
+    skip_dead=True,
 ):
     """Transposed scores ``[P, tiles * block_q]`` of one tile class, and the
     column of each token."""
@@ -496,7 +528,7 @@ def _class_scores(
             hbm.append(pl.BlockSpec(memory_space=pl.ANY))
             operands.append(scale_cache)
         scores_t = pl.pallas_call(
-            functools.partial(_kernel_v3, scale_row=scale_row),
+            functools.partial(_kernel_v3, scale_row=scale_row, skip_dead=skip_dead),
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=4,
                 grid=grid_spec.grid,
@@ -553,6 +585,7 @@ def _class_scores(
         "kernel",
         "large_kernel",
         "scale_row",
+        "skip_dead",
         "interpret",
     ),
 )
@@ -572,6 +605,7 @@ def block_scores(
     large_kernel: str = DEFAULT_LARGE_KERNEL,
     scale_cache: jax.Array | None = None,
     scale_row: int | None = None,
+    skip_dead: bool = True,
     interpret: bool = False,
 ) -> jax.Array:
     """Block-max index scores ``[T, 1, P]`` (``P`` padded to the page group).
@@ -595,6 +629,10 @@ def block_scores(
         scales (`msa_fp4.scales_in_page`),
         the ``[pages, 8, 128]`` f32 scale cache and the row of the index-key
         scales. `index_q` must then be rotated (`msa_fp4.rotate_queries`).
+      skip_dead: v3 skips scoring page groups past a request's last page,
+        and the large tile class runs only when some request is large
+        (``False``: the reference arm for benchmarks; same scores on every
+        page a token can see).
     Pages past a token's own page hold scores of keys it must not see, and
     pages past its request's last page are not written; callers mask both.
     """
@@ -628,6 +666,7 @@ def block_scores(
         interpret=interpret,
         scale_cache=scale_cache,
         scale_row=scale_row,
+        skip_dead=skip_dead,
     )
     small, small_col = score(
         active & ~is_large,
@@ -642,31 +681,50 @@ def block_scores(
     max_large = min(max_num_seqs, num_tokens // (block_q + 1))
     if max_large == 0:
         return small[:, small_col].T[:, None, :]
-    large, large_col = score(
-        is_large,
-        block_q=large_block_q,
-        # +1 per request for the partial last tile, plus the up-to-7 rows each
-        # aligned start adds.
-        max_tiles=num_tokens // large_block_q
-        + max_large
-        + -(-(_ROW_ALIGN - 1) * max_large // large_block_q)
-        + 1,
-        pages_per_step=pages_per_step,
-        kernel=large_kernel,
-    )
-    tok = jnp.arange(num_tokens, dtype=jnp.int32)
-    seq = jnp.minimum(
-        jnp.searchsorted(cu_q_lens[1:], tok, side="right", method="compare_all").astype(
-            jnp.int32
-        ),
-        max_num_seqs - 1,
-    )
-    # One gather over both classes' columns (XLA fuses the concatenate into
-    # it) instead of a transposing gather per class and a select.
-    col = jnp.where(is_large[seq], small.shape[1] + large_col, small_col)
-    # The classes may pad pages to different group multiples; pad to the wider.
-    pages = max(small.shape[0], large.shape[0])
-    small, large = (
-        jnp.pad(x, ((0, pages - x.shape[0]), (0, 0))) for x in (small, large)
-    )
-    return jnp.concatenate([small, large], axis=1)[:, col].T[:, None, :]
+
+    def with_large(small):
+        large, large_col = score(
+            is_large,
+            block_q=large_block_q,
+            # +1 per request for the partial last tile, plus the up-to-7 rows
+            # each aligned start adds.
+            max_tiles=num_tokens // large_block_q
+            + max_large
+            + -(-(_ROW_ALIGN - 1) * max_large // large_block_q)
+            + 1,
+            pages_per_step=pages_per_step,
+            kernel=large_kernel,
+        )
+        tok = jnp.arange(num_tokens, dtype=jnp.int32)
+        seq = jnp.minimum(
+            jnp.searchsorted(
+                cu_q_lens[1:], tok, side="right", method="compare_all"
+            ).astype(jnp.int32),
+            max_num_seqs - 1,
+        )
+        # One gather over both classes' columns (XLA fuses the concatenate
+        # into it) instead of a transposing gather per class and a select.
+        col = jnp.where(is_large[seq], small.shape[1] + large_col, small_col)
+        # The classes may pad pages to different group multiples; pad to the
+        # wider.
+        pages = max(small.shape[0], large.shape[0])
+        small, large = (
+            jnp.pad(x, ((0, pages - x.shape[0]), (0, 0))) for x in (small, large)
+        )
+        return jnp.concatenate([small, large], axis=1)[:, col].T[:, None, :]
+
+    if not skip_dead:
+        return with_large(small)
+    pages_per_seq = block_tables.shape[0] // max_num_seqs
+    pages = max(small.shape[0], -(-pages_per_seq // pages_per_step) * pages_per_step)
+
+    def small_only(small):
+        # No large request: every token's column is in the small class, so
+        # this is the gather above without the (empty) large class.
+        small = jnp.pad(small, ((0, pages - small.shape[0]), (0, 0)))
+        return small[:, small_col].T[:, None, :]
+
+    # Decode batches have no large request; the large class's 1-step launch,
+    # its work list and the concatenate cost ~20 us per layer at 64-request
+    # decode (j-5cc99100).
+    return jax.lax.cond(jnp.any(is_large), with_large, small_only, small)
