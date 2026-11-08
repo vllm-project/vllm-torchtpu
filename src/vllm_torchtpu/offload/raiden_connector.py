@@ -52,7 +52,7 @@ import dataclasses
 import os
 import time
 from collections import Counter, OrderedDict
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Set
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -211,6 +211,10 @@ class WriteBackPolicy:
     chunks only when they near eviction: once one of their blocks is within
     ``window_blocks`` of the head of the free queue (the next blocks to be
     reused), at most ``max_requests_per_step`` requests per step.
+
+    A held block that a new request takes as a prefix-cache hit keeps its
+    bytes: the hold (and any store job reading it) survives. Only a block
+    the pool hands out again with other content drops its holders.
     """
 
     window_blocks: int = 1024
@@ -262,6 +266,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
     # (class defaults also cover instances built without __init__).
     _write_back: WriteBackPolicy | None = None
     _block_pool = None
+    _wb_hits: Set[int] = frozenset()
 
     def __init__(
         self,
@@ -282,6 +287,14 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         self._block_pool = None
         self._wb_blocks: OrderedDict[str, set[int]] = OrderedDict()
         self._wb_owners: dict[int, set[str]] = {}
+        # Pool hash of each watched block (held, or read by a write-back
+        # store job), taken while it still held the bytes it is keyed for.
+        # A block allocated again with this same hash is a prefix-cache hit
+        # whose bytes are unchanged; see `_wb_classify_allocated`.
+        self._wb_hash: dict[int, bytes] = {}
+        # Blocks of this step's allocation that are such hits; the base must
+        # not treat them as reallocated (no flush of their store jobs).
+        self._wb_hits: set[int] = set()
         self.wb_counters: Counter[str] = Counter()
 
     def attach_block_pool(self, block_pool) -> None:
@@ -297,6 +310,58 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 if not owners:
                     del self._wb_owners[bid]
 
+    def _pool_block_hash(self, block_id: int) -> bytes | None:
+        """The block pool's current hash of ``block_id``; None if the pool
+        exposes no blocks (then no allocation counts as a hit)."""
+        blocks = getattr(self._block_pool, "blocks", None)
+        if blocks is None or not 0 <= block_id < len(blocks):
+            return None
+        return blocks[block_id].block_hash
+
+    def _wb_classify_allocated(self, allocated: set[int]) -> set[int]:
+        """The blocks of ``allocated`` that are prefix-cache hits on a
+        watched block: the pool still has the hash snapshotted while the
+        block held the bytes it is keyed for.
+
+        The pool drops a block's hash when it evicts the block for reuse
+        (`BlockPool._maybe_evict_cached_block`), and the new owner cannot
+        carry the same hash (its prefix lookup would have hit the cached
+        block instead). So a matching hash means the bytes were never
+        rewritten. Every other allocated block is overwritten, and its
+        snapshot goes.
+        """
+        hits: set[int] = set()
+        for bid in allocated:
+            snapshot = self._wb_hash.get(bid)
+            if snapshot is None:
+                continue
+            if self._pool_block_hash(bid) == snapshot:
+                hits.add(bid)
+            else:
+                del self._wb_hash[bid]
+        return hits
+
+    def _wb_gc_hashes(self) -> None:
+        """Forget the snapshots of blocks nobody watches any more (no holder
+        and no pending store job). Amortized: runs when the map has grown
+        well past the watched set."""
+        pending = getattr(self, "_block_id_to_pending_jobs", {})
+        if len(self._wb_hash) <= 2 * (len(self._wb_owners) + len(pending)) + 1024:
+            return
+        self._wb_hash = {
+            bid: block_hash
+            for bid, block_hash in self._wb_hash.items()
+            if bid in self._wb_owners or bid in pending
+        }
+
+    def _update_req_states(self, scheduler_output: SchedulerOutput) -> None:
+        super()._update_req_states(scheduler_output)
+        # Prefix-cache hits on watched blocks are not reallocations: their
+        # store jobs need neither a cancel (which would lose the store) nor
+        # a synchronous drain.
+        if self._wb_hits:
+            self._current_batch_allocated_block_ids -= self._wb_hits
+
     def _wb_drop(self, req_id: str) -> None:
         """Finish a held request without storing it (a block was reused)."""
         self._wb_unregister(req_id)
@@ -309,9 +374,11 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         if not req_status.transfer_jobs:
             del self._req_status[req_id]
 
-    def _wb_register(self, req_id: str) -> bool:
+    def _wb_register(self, req_id: str, allocated: Set[int] = frozenset()) -> bool:
         """Hold a finished request for write-back; False if it has nothing
-        left to store."""
+        left to store. ``allocated`` is this step's allocation. It ran after
+        the request freed its blocks, so the pool's hash of such a block may
+        already be its new owner's, and it is not snapshotted."""
         req_status = self._req_status.get(req_id)
         if req_status is None:
             return False
@@ -328,6 +395,14 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         self._wb_blocks[req_id] = blocks
         for bid in blocks:
             self._wb_owners.setdefault(bid, set()).add(req_id)
+            if bid in allocated:
+                # Decided by a snapshot from before this step, if one exists.
+                continue
+            block_hash = self._pool_block_hash(bid)
+            if block_hash is None:
+                self._wb_hash.pop(bid, None)
+            else:
+                self._wb_hash[bid] = block_hash
         return True
 
     def _wb_near_eviction(self) -> list[str]:
@@ -368,12 +443,14 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             return
         c = self.wb_counters
         logger.info(
-            "KV write-back: %d steps, %.1f blocks allocated/step, %d requests "
+            "KV write-back: %d steps, %.1f blocks allocated/step, %.1f prefix "
+            "hits/step on watched blocks (kept), %d requests "
             "stored, %d dropped (blocks reused before the flush), %d held "
             "(%d blocks; free and still cached: holding defers only the "
             "connector's finish, never the blocks)",
             c["steps"],
             c["allocated_blocks"] / max(c["steps"], 1),
+            c["hit_blocks"] / max(c["steps"], 1),
             c["flushed_requests"],
             c["dropped_requests"],
             c["held_requests"],
@@ -389,16 +466,28 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         request stores (no write-through), newly finished requests are held
         (their finish deferred), and held requests near eviction finish now,
         so the base stores them through its normal finish path."""
-        allocated = _allocated_block_ids(scheduler_output)
+        # Blocks given to async loads this step reach only the base's set
+        # (update_state_after_alloc): their requests are not scheduled yet.
+        allocated = (
+            _allocated_block_ids(scheduler_output)
+            | self._current_batch_allocated_block_ids
+        )
+        # Prefix-cache hits on watched blocks (snapshots from before this
+        # step): their bytes are intact, so they drop and flush nothing.
+        hits = self._wb_classify_allocated(allocated)
+        self._wb_hits = hits
         self.wb_counters["steps"] += 1
-        self.wb_counters["allocated_blocks"] += len(allocated)
+        self.wb_counters["allocated_blocks"] += len(allocated) - len(hits)
+        self.wb_counters["hit_blocks"] += len(hits)
         finished = set(scheduler_output.finished_req_ids or ())
-        passed = {r for r in finished if not self._wb_register(r)}
+        passed = {r for r in finished if not self._wb_register(r, allocated)}
         # After registering: a request that finished last step may already
-        # have a block reused by this step's allocation.
-        reused = allocated & self._wb_owners.keys()
+        # have a block reused by this step's allocation. Without a snapshot
+        # from before this step, such a block counts as overwritten.
+        reused = (allocated - hits) & self._wb_owners.keys()
         for req_id in {r for bid in reused for r in self._wb_owners.get(bid, ())}:
             self._wb_drop(req_id)
+        self._wb_gc_hashes()
         flush = self._wb_near_eviction()
         for req_id in flush:
             self._wb_unregister(req_id)
