@@ -238,6 +238,19 @@ class Dimensions:
     size_lhs_sublane: int
 
 
+# Unquantized-lhs calls of at most this many rows (decode) scale each
+# `quant_block_size`-deep matmul partial ([m, tn]) instead of dequantizing the
+# weight tile ([tk, tn]) before one deep matmul. Below the MXU column size
+# the before-matmul path keeps the MXU deep, which matters at large m; at
+# skinny m it spends the step on the VPU converting and scaling every weight
+# element (NVFP4 block 128 on tpu7x, gate_up + down per MoE layer: 124 -> 86
+# us at 32 rows / 4 active experts, 210 -> 171 at 64 / 8, 410 -> 343 at
+# 256 / 16).
+SKINNY_DEQUANT_AFTER_MATMUL_M = 256
+# Blocks shallower than this make the per-block matmuls too small.
+MIN_DEQUANT_AFTER_MATMUL_BLOCK = 128
+
+
 @dataclasses.dataclass(frozen=True)
 class InputConfigs:
     quant_dtype: jnp.dtype | None
@@ -245,6 +258,9 @@ class InputConfigs:
     dtype: jnp.dtype
     has_bias: bool = False
     has_scale: bool = False
+    # Scale each block's matmul partial instead of the dequantized weights
+    # (see `SKINNY_DEQUANT_AFTER_MATMUL_M`).
+    dequantize_after_matmul: bool = False
 
     @property
     def should_unpack(self) -> bool:
@@ -255,7 +271,7 @@ class InputConfigs:
     @property
     def should_dequantize_before_matmul(self) -> bool:
         """Dequantize rhs before matmul if block size limits MXU utilization."""
-        if not self.has_scale:
+        if not self.has_scale or self.dequantize_after_matmul:
             return False
         assert self.quant_block_size is not None
         mxu_size = pltpu.get_tpu_info().mxu_column_size
@@ -1194,6 +1210,12 @@ def make_gmm_configs(
         dtype=rhs.dtype,
         has_bias=rhs_bias is not None,
         has_scale=has_scale,
+        dequantize_after_matmul=(
+            has_scale
+            and not maybe_quantize_lhs
+            and block_size >= MIN_DEQUANT_AFTER_MATMUL_BLOCK
+            and dims.size_m <= SKINNY_DEQUANT_AFTER_MATMUL_M
+        ),
     )
 
     lhs_q_dtype = None
