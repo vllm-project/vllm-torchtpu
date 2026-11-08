@@ -402,18 +402,26 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
     def update_state_after_alloc(
         self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int
     ):
+        req_status = self._req_status.get(request.request_id)
+        # The base method clears partial_tail_boundary, so read it first.
+        loaded_tail = (
+            self._mixed_partial_tail
+            and req_status is not None
+            and req_status.partial_tail_boundary is not None
+        )
         super().update_state_after_alloc(request, blocks, num_external_tokens)
-        if not self._mixed_partial_tail or not num_external_tokens:
+        if not loaded_tail or not num_external_tokens:
             return
-        req_status = self._req_status[request.request_id]
+        assert req_status is not None
         if req_status.offloading_context.policy != OffloadPolicy.CHUNK_LEVEL:
             return
         cached_tokens = req_status.num_locally_computed_tokens + num_external_tokens
         for group, group_state in zip(
             self.config.kv_group_configs, req_status.group_states
         ):
-            # A loaded tail must still be stored under its full-block key
-            # once the request fills the rest of the attention block.
+            # The base method rounds up, which counts the loaded tail's
+            # attention block as stored. Round down, so the block is still
+            # stored under its full-block key once the request fills it.
             group_state.next_stored_chunk_idx = cached_tokens // group.tokens_per_chunk
 
     def _build_partial_tail_store_jobs(

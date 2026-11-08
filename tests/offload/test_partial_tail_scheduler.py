@@ -234,6 +234,43 @@ def test_hash_aligned_prompt_tail_uses_its_final_states_without_a_handoff(dcp):
     assert job.src_spec.block_indices == [1 if dcp == 4 else 0, 6, 6]
 
 
+def test_full_block_state_handoff_takes_the_aligned_store():
+    scheduler, request = make_scheduler()
+    request.num_computed_tokens = 4
+    # A hand-off at a full attention block boundary is stored by the base
+    # class's aligned path, per recurrent group, and is not held as a tail.
+    jobs = scheduler._build_partial_tail_store_jobs(
+        step([(1, 81, 16), (2, 82, 16)], scheduled=12)
+    )
+    stored = sorted(
+        (job.dst_spec.keys, job.src_spec.block_ids.tolist(), job.src_spec.block_indices)
+        for job in jobs.values()
+    )
+    assert stored == [
+        ([keys(scheduler, request, 16)[1]], [81], [0, 3, 0]),
+        ([keys(scheduler, request, 16)[2]], [82], [0, 0, 3]),
+    ]
+    assert not scheduler._deferred_tail_states
+
+
+def test_complete_chunk_load_keeps_the_base_store_index():
+    # Only a loaded tail rounds next_stored_chunk_idx down.
+    scheduler, request = make_scheduler()
+    serve(scheduler, set(keys(scheduler, request, 16)))
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (16, True)
+    null = KVCacheBlock(0, is_null=True)
+    blocks = KVCacheBlocks(
+        (
+            [KVCacheBlock(31)],
+            [null] * 3 + [KVCacheBlock(41)],
+            [null] * 3 + [KVCacheBlock(42)],
+        )
+    )
+    scheduler.update_state_after_alloc(request, blocks, 16)
+    state = scheduler._req_status[request.request_id]
+    assert [g.next_stored_chunk_idx for g in state.group_states] == [1, 4, 4]
+
+
 def test_a_live_decode_state_cannot_replace_a_boundary_handoff():
     scheduler, request = make_scheduler(prompt_tokens=28)
     request.sampling_params.max_tokens = 2
