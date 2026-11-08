@@ -533,6 +533,14 @@ def _spec_warmup_num_output_tokens(
     return [len(requests[req_id].output_token_ids) for req_id in req_ids]
 
 
+@functools.lru_cache(maxsize=1024)
+def _live_row_mask(num_reqs: int, rows: int, device: torch.device) -> torch.Tensor:
+    """`[rows]` int32 device mask, 1 for the first `num_reqs` rows. Uploaded,
+    not computed on device, so the live count never enters a program's
+    shape or constants. Cached: one upload per (count, bucket)."""
+    return (torch.arange(rows) < num_reqs).to(torch.int32).to(device)
+
+
 @contextmanager
 def _serving_compile_state() -> Iterator[None]:
     """Compile under the global state serving runs with: grad off and the
@@ -4576,18 +4584,22 @@ class TPUModelRunner(GPUModelRunner):
         """
         if self.mamba_slot_read_offsets is None or not indices_per_group:
             return
-        offsets = torch.zeros(
-            indices_per_group[0].shape[0],
-            dtype=torch.int32,
-            device=indices_per_group[0].device,
-        )
-        if next_tokens is not None:
+        rows = indices_per_group[0].shape[0]
+        device = indices_per_group[0].device
+        if next_tokens is None:
+            offsets = torch.zeros(rows, dtype=torch.int32, device=device)
+        else:
             # num_valid = accepted drafts + 1 (bonus); the checkpoint of the
-            # last accepted token is at offset num_valid - 1.
-            num_valid = (
-                (next_tokens[:num_reqs] != INVALID_TOKEN_ID).sum(dim=1).to(torch.int32)
+            # last accepted token is at offset num_valid - 1. Rows past the
+            # live count are zeroed by a mask rather than by slicing to it:
+            # torch-tpu compiles a program per shape, and an exact-count
+            # slice write compiled one per request count mid-serving
+            # (tt_jit_copy__as_strided_inverse).
+            next_tokens = fit_rows(next_tokens, rows, INVALID_TOKEN_ID)
+            num_valid = (next_tokens != INVALID_TOKEN_ID).sum(dim=1).to(torch.int32)
+            offsets = (num_valid - 1).clamp(min=0) * _live_row_mask(
+                num_reqs, rows, device
             )
-            offsets[:num_reqs] = (num_valid - 1).clamp(min=0)
         if len(indices_per_group) == 1:
             self.mamba_slot_read_offsets.index_put_(
                 (indices_per_group[0].long(),), offsets
@@ -4949,6 +4961,9 @@ class TPUModelRunner(GPUModelRunner):
             apply_top_k=self._sampler_applies_top_k(),
         )
 
+    # Under no_grad like execute_model: dynamo guards every compiled graph on
+    # grad mode, and the precompile traces the sampling graphs without grad.
+    @torch.no_grad()
     @_pp_step
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
@@ -6463,21 +6478,37 @@ class TPUModelRunner(GPUModelRunner):
 
     def _precompile_compute_selected_logits(self) -> None:
         hsize = self.model_config.get_hidden_size()
+        spec_lens = self._spec_logits_lengths()
         with self._precompile_timed("compute_selected_logits"):
             for num_tokens in self.num_tokens_paddings:
                 dummy_hidden = torch.zeros(
                     (num_tokens, hsize),
                     dtype=self._hidden_states_dtype,
                 ).to(self.device)
+                lengths = []
                 for num_reqs in self.num_reqs_paddings:
-                    indices = torch.zeros(num_reqs, dtype=torch.int32).to(self.device)
+                    lengths.append(num_reqs)
+                    if num_reqs >= min(num_tokens, self.max_num_reqs):
+                        break
+                # A verify step selects one row per verified token.
+                lengths += [n for n in spec_lens if n <= num_tokens]
+                for num_rows in sorted(set(lengths)):
+                    indices = torch.zeros(num_rows, dtype=torch.int32).to(self.device)
                     out = self.compute_selected_logits(dummy_hidden, indices)
                     synchronize_tensors(out)
                     logger.info(
-                        "  -- num_tokens: %d, num_seqs: %d", num_tokens, num_reqs
+                        "  -- num_tokens: %d, num_seqs: %d", num_tokens, num_rows
                     )
-                    if num_reqs >= min(num_tokens, self.max_num_reqs):
-                        break
+
+    def _spec_logits_lengths(self) -> list[int]:
+        """Verify-logits row counts a spec step selects (`padded_logits_length`):
+        the token buckets up to a full batch of 1 + K verify windows."""
+        if self.speculative_config is None:
+            return []
+        K = self.speculative_config.num_speculative_tokens
+        pads = list(self.num_tokens_paddings)
+        most = _get_padded_token_len(pads, min(self.max_num_reqs * (1 + K), pads[-1]))
+        return [n for n in pads if n <= most]
 
     def _precompile_compute_logits_from_hidden_states(self) -> None:
         hsize = self.model_config.get_hidden_size()
