@@ -41,7 +41,7 @@ def _kernel(
     work_page_ref,  # tile page key unions (`msa_attention._work_list`)
     work_meta_ref,  # [groups] union row << _ROW_SHIFT | last and first bits
     page_table_ref,  # page key -> physical page
-    head_ref,  # [1] KV head of the cache rows
+    head_ref,  # [2] KV head of the cache rows, block of query heads
     tile_offset_ref,  # [1] the call's first tile (read by the index maps only)
     # In
     q_ref,  # [H, Bq, D]
@@ -198,6 +198,7 @@ def _attention_call(
     tile_offset,
     out,
     *,
+    q_per_head,
     sm_scale,
     block_q,
     pages_per_step,
@@ -205,14 +206,16 @@ def _attention_call(
 ):
     """One kernel call over the tokens of `selected` (a multiple of block_q),
     which start at tile ``tile_offset`` (``int32[1]``) of the head-major
-    ``q [H, T, D]``, ``local_page`` and ``local_limit [T, 1]``.
+    ``q [G * Hg, T, D]``, ``local_page`` and ``local_limit [T, 1]``, for
+    query heads ``[b * Hg, (b + 1) * Hg)`` attending cache-row KV head ``k``,
+    ``head = (k, b)`` (``int32[2]``: a scalar-prefetch input, not a static,
+    so one kernel serves every head).
 
-    Writes those tokens' rows of ``(out [H, T, D], lse [H, T, 1])``: into
-    `out` in place when given (an earlier call's result), else into new
-    arrays whose other rows are unset. ``head`` (``int32[1]``) is a
-    scalar-prefetch input, not a static, so one kernel serves every KV head
-    of the cache rows."""
-    num_heads, num_tokens, head_dim = q.shape
+    Writes those heads' and tokens' rows of ``(out [G * Hg, T, D], lse
+    [G * Hg, T, 1])``: into `out` in place when given (an earlier call's
+    result), else into new arrays whose other rows are unset."""
+    num_q_heads, num_tokens, head_dim = q.shape
+    num_heads = q_per_head
     _, rows_per_page, packing, _ = kv_cache.shape
     # One KV head's [K | V] slice of each row.
     row_width = 2 * head_dim
@@ -230,8 +233,8 @@ def _attention_call(
         tile = offset[0] + msa_attention._meta_tile(meta[w], groups_per_tile)
         return (tile, 0)
 
-    def head_major_block(*args):
-        return (0, *tile_block(*args))
+    def head_major_block(w, pages, meta, table, heads, offset):
+        return (heads[1], *tile_block(w, pages, meta, table, heads, offset))
 
     aliased = out is not None
     in_place = (pl.BlockSpec(memory_space=pl.ANY),) * 2 if aliased else ()
@@ -266,8 +269,8 @@ def _attention_call(
         functools.partial(_kernel, sm_scale=sm_scale, aliased=aliased),
         grid_spec=grid_spec,
         out_shape=[
-            jax.ShapeDtypeStruct((num_heads, num_tokens, head_dim), q.dtype),
-            jax.ShapeDtypeStruct((num_heads, num_tokens, 1), jnp.float32),
+            jax.ShapeDtypeStruct((num_q_heads, num_tokens, head_dim), q.dtype),
+            jax.ShapeDtypeStruct((num_q_heads, num_tokens, 1), jnp.float32),
         ],
         input_output_aliases=(
             {num_inputs: 0, num_inputs + 1: 1} if aliased else {}
@@ -300,51 +303,62 @@ def _chunked_call(
     local_page,
     local_limit,
     page_table,
-    head,
+    first_head,
     *,
     sm_scale,
     block_q,
     pages_per_step,
     interpret,
 ):
-    """`_attention_call` over chunks of at most `MAX_TOKENS_PER_CALL` tokens
-    (the work list lives in SMEM).
+    """`_attention_call` per KV head and chunk of at most
+    `MAX_TOKENS_PER_CALL` tokens (the work list lives in SMEM).
 
-    Every call reads the whole head-major query and writes its chunk's rows
-    of one output in place, so the chunks need no per-chunk slices,
-    transposes or stacking (~47 us per 2,048-token chunk under the former
-    `lax.map` in the c4 prefill twin, j-3c651507). The chunks after the
-    first run as one `fori_loop`, so the kernel is emitted twice per call
-    site (the first call creates the output) rather than once per chunk."""
-    num_tokens = q.shape[0]
+    ``q [T, G * Hg, D]``: cache-row KV head ``first_head + h`` owns query
+    heads ``[h * Hg, (h + 1) * Hg)``; ``selected [T, G, K]``. Every call
+    reads the whole head-major query and writes its head's and chunk's rows
+    of one output in place, so no call needs a slice, transpose or stacking
+    of its own (~47 us per 2,048-token chunk under the former `lax.map` in
+    the c4 prefill twin, j-3c651507, and ~43 us more per head at DCP 8).
+    The calls after the first run as one `fori_loop`, so the kernel is
+    emitted twice per call site (the first call creates the output) rather
+    than once per head and chunk."""
+    num_tokens, num_q_heads, _ = q.shape
+    num_heads = selected.shape[1]
+    if num_tokens == 0:
+        return q, jnp.zeros(q.shape[:2], jnp.float32)
     call = functools.partial(
         _attention_call,
+        q_per_head=num_q_heads // num_heads,
         sm_scale=sm_scale,
         block_q=block_q,
         pages_per_step=pages_per_step,
         interpret=interpret,
     )
     limit = msa_attention.MAX_TOKENS_PER_CALL
-    if num_tokens == 0:
-        return q, jnp.zeros(q.shape[:2], jnp.float32)
     step = min(num_tokens, max(block_q, limit - limit % block_q))
     num_chunks = -(-num_tokens // step)
     pad = num_chunks * step - num_tokens
     q = jnp.pad(q, ((0, pad), (0, 0), (0, 0))).transpose(1, 0, 2)
-    selected = jnp.pad(selected, ((0, pad), (0, 0)), constant_values=-1)
+    selected = jnp.pad(
+        selected, ((0, pad), (0, 0), (0, 0)), constant_values=-1
+    ).transpose(1, 0, 2)
     local_page = jnp.pad(local_page, (0, pad), constant_values=-1)[:, None]
     local_limit = jnp.pad(local_limit, (0, pad))[:, None]
 
-    def chunk(c, out):
+    def head_chunk(i, out):
+        h, c = i // num_chunks, i % num_chunks
         offset = jnp.full((1,), c * (step // block_q), jnp.int32)
-        sel_c = jax.lax.dynamic_slice_in_dim(selected, c * step, step)
+        sel = jax.lax.dynamic_slice(
+            selected, (h, c * step, 0), (1, step, selected.shape[2])
+        )[0]
+        heads = jnp.stack([first_head + h, h]).astype(jnp.int32)
         return call(
-            q, kv_cache, sel_c, local_page, local_limit, page_table, head, offset, out
+            q, kv_cache, sel, local_page, local_limit, page_table, heads, offset, out
         )
 
-    out = chunk(0, None)
-    if num_chunks > 1:
-        out = jax.lax.fori_loop(1, num_chunks, chunk, out)
+    out = head_chunk(0, None)
+    if num_heads * num_chunks > 1:
+        out = jax.lax.fori_loop(1, num_heads * num_chunks, head_chunk, out)
     out, lse = out
     return out.transpose(1, 0, 2)[:num_tokens], lse[:, :, 0].T[:num_tokens]
 
@@ -408,11 +422,11 @@ def msa_sparse_attention_lse(
     out, lse = _chunked_call(
         q,
         kv_cache,
-        selected,
+        selected[:, None],
         local_page,
         local_limit,
         page_table,
-        jnp.full((1,), head, jnp.int32),
+        head,
         sm_scale=sm_scale,
         block_q=block_q,
         pages_per_step=pages_per_step,
@@ -440,9 +454,9 @@ def msa_sparse_attention_lse_heads(
     """`msa_sparse_attention_lse` for every KV head of the cache rows at once.
 
     ``q [T, G * Hg, D]`` (KV head ``h`` owns query heads ``[h * Hg,
-    (h + 1) * Hg)``), ``selected [T, G, K]``. The heads run as one `lax.map`
-    over a single kernel whose KV head is an input, so the program carries
-    one copy of the kernel instead of one per head. Returns ``(out
+    (h + 1) * Hg)``), ``selected [T, G, K]``. The heads run in one loop over
+    a single kernel whose KV head is an input, so the program carries one
+    copy of the kernel instead of one per head. Returns ``(out
     [T, G * Hg, D], lse [T, G * Hg] f32)``.
     """
     num_tokens, num_q_heads, head_dim = q.shape
@@ -456,30 +470,17 @@ def msa_sparse_attention_lse_heads(
     q, selected, local_page, local_limit = _pad_tokens(
         q, selected, local_page, local_limit, block_q
     )
-    padded = q.shape[0]
-    q_per_head = num_q_heads // num_heads
-    q_heads = q.reshape(padded, num_heads, q_per_head, head_dim).transpose(1, 0, 2, 3)
-
-    def one_head(xs):
-        q_h, sel_h, h = xs
-        return _chunked_call(
-            q_h,
-            kv_cache,
-            sel_h,
-            local_page,
-            local_limit,
-            page_table,
-            h.reshape(1),
-            sm_scale=sm_scale,
-            block_q=block_q,
-            pages_per_step=pages_per_step,
-            interpret=interpret,
-        )
-
-    out, lse = jax.lax.map(
-        one_head,
-        (q_heads, selected.transpose(1, 0, 2), jnp.arange(num_heads, dtype=jnp.int32)),
-    )  # [G, T, Hg, D], [G, T, Hg]
-    out = out.transpose(1, 0, 2, 3).reshape(padded, num_q_heads, head_dim)
-    lse = lse.transpose(1, 0, 2).reshape(padded, num_q_heads)
+    out, lse = _chunked_call(
+        q,
+        kv_cache,
+        selected,
+        local_page,
+        local_limit,
+        page_table,
+        0,
+        sm_scale=sm_scale,
+        block_q=block_q,
+        pages_per_step=pages_per_step,
+        interpret=interpret,
+    )
     return out[:num_tokens], lse[:num_tokens]
