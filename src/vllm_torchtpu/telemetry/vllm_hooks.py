@@ -171,14 +171,20 @@ class AgenticTelemetryService:
         self._req_breakdowns: dict[str, TokenBreakdown] = {}
         self._req_external_tokens: dict[str, int] = {}
 
+    def _eviction_sync_path(self) -> str:
+        safe_rep = "".join(
+            c if c.isalnum() or c in ("-", "_", ".") else "_"
+            for c in str(self.replica_id)
+        )
+        return f"{_EVICTION_SYNC_PATH}_{safe_rep}"
+
     def _maybe_sync_eviction_state(self) -> None:
         """Sync recent HBM eviction timestamps from EngineCore child process."""
-        if not envs.VLLM_TPU_AGENTIC_TELEMETRY or not os.path.exists(
-            _EVICTION_SYNC_PATH
-        ):
+        sync_path = self._eviction_sync_path()
+        if not envs.VLLM_TPU_AGENTIC_TELEMETRY or not os.path.exists(sync_path):
             return
         try:
-            with open(_EVICTION_SYNC_PATH, encoding="utf-8") as f:
+            with open(sync_path, encoding="utf-8") as f:
                 parts = f.read().strip().split()
             if len(parts) >= 2:
                 ts = float(parts[0])
@@ -234,7 +240,7 @@ class AgenticTelemetryService:
             and self.eviction_tracker._last_evicted_wall_ms is not None
         ):
             try:
-                with open(_EVICTION_SYNC_PATH, "w", encoding="utf-8") as f:
+                with open(self._eviction_sync_path(), "w", encoding="utf-8") as f:
                     f.write(
                         f"{self.eviction_tracker._last_evicted_ts} "
                         f"{self.eviction_tracker._last_evicted_wall_ms}"
