@@ -5,6 +5,7 @@ This describes logical byte extents. Admission must still measure the TPU
 layout and compare peer fingerprints before registering these descriptors.
 """
 
+import dataclasses
 import importlib.metadata
 import math
 import os
@@ -168,7 +169,21 @@ def build_transfer_manifest(
             )
     if pcp_rank == 0 and referenced != set(range(len(storages))):
         raise ManifestError("Qwen PD contains an unreferenced raw carrier")
-    manifest = PoolManifest(BINDING_ALIASED_RAW, list(storages), pools)
+    unit_storages = list(storages)
+    if pcp_rank > 0:
+        # Only the split owners' carriers, in the order the pools first use
+        # them, so pool order and storage order agree: a tpu_sync sender that
+        # resolves a pool's host buffer by position (builds before tpu-raiden
+        # 4e61045) otherwise copies from another carrier's buffer, and the
+        # device DMA faults.
+        order = list(dict.fromkeys(pool.storage_index for pool in pools))
+        position = {index: i for i, index in enumerate(order)}
+        unit_storages = [storages[index] for index in order]
+        pools = [
+            dataclasses.replace(pool, storage_index=position[pool.storage_index])
+            for pool in pools
+        ]
+    manifest = PoolManifest(BINDING_ALIASED_RAW, unit_storages, pools)
     verify_storage_binding(manifest, materialized.kv_caches, storages)
     return manifest
 
