@@ -25,14 +25,6 @@ from typing import Any
 
 import torch
 
-try:
-    from vllm.forward_context import get_forward_context
-except ImportError:
-
-    def get_forward_context() -> Any:  # type: ignore[misc]
-        raise RuntimeError("vllm.forward_context is unavailable")
-
-
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.megakernel.runtime import stats as _stats
 from vllm_torchtpu.megakernel.runtime.contract import Bucket, RunnerShape, StepFn
@@ -41,6 +33,14 @@ from vllm_torchtpu.megakernel_runtime.hooks import StepContext, is_suppressed
 from vllm_torchtpu.megakernel_runtime.plugin import ForwardView
 
 logger = init_logger(__name__)
+
+
+def get_forward_context() -> Any:
+    """vLLM's forward context for the current step. vLLM is imported here, on
+    first use, as in the sibling modules."""
+    from vllm.forward_context import get_forward_context as current
+
+    return current()
 
 
 def _inspect_step_detail(

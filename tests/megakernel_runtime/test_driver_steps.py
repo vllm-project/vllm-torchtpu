@@ -12,8 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Step routing: the batch shape a step is inspected as, `try_forward`
-(suppression, the step context, unconsumed model inputs) and the runner
-shapes a bucket is warmed up with."""
+(suppression, the step context, unconsumed model inputs), the routing
+decision with its declines, the `can_run` / `__call__` hand-off, the
+text-token promotion, the A/B calibrator's arms, and the runner shapes a
+bucket is warmed up with."""
 
 from __future__ import annotations
 
@@ -24,9 +26,14 @@ import numpy as np
 import pytest
 import torch
 
-from vllm_torchtpu.megakernel.runtime.contract import Bucket, RunnerShape
-from vllm_torchtpu.megakernel.runtime.stats import BatchShape
+from vllm_torchtpu.megakernel.runtime.contract import Bucket, RunnerShape, StepDecision
+from vllm_torchtpu.megakernel.runtime.stats import (
+    BatchShape,
+    MKABCalibrator,
+    StepMixTracker,
+)
 from vllm_torchtpu.megakernel_runtime import stepping
+from vllm_torchtpu.megakernel_runtime.hooks import StepContext
 
 
 def _step_runner(
@@ -267,3 +274,226 @@ def test_runner_shapes_without_paddings() -> None:
         Bucket(1, 64), (16, 32), ((4, 2), (1, 8)), ckpt_window=3, max_pages_per_seq=9
     )
     assert shapes == [RunnerShape(32, 4, 2, 3), RunnerShape(32, 1, 8, 3)]
+
+
+# --- routing through a stub program ---------------------------------------------
+
+_MK = StepDecision(True, "mk_t1_b4", 3, 1, 4)
+_INELIGIBLE = StepDecision(False, "stock_big", 3, 1)
+
+
+class _Program:
+    """Records `decide` / `forward`; `decide` returns `decision`."""
+
+    def __init__(self, decision: StepDecision | None) -> None:
+        self.decision, self.calls = decision, []
+
+    def decide(self, ctx: StepContext, fwd: Any) -> StepDecision | None:
+        self.calls.append(("decide", ctx))
+        return self.decision
+
+    def forward(self, decision: Any, ctx: StepContext, fwd: Any) -> torch.Tensor:
+        self.calls.append(("forward", decision, fwd.num_tokens))
+        return ctx.input_ids.float() * 10
+
+
+class _Driver(stepping.StepRouting):
+    """The state a driver sets for `StepRouting`, around a stub program."""
+
+    def __init__(
+        self,
+        program: _Program,
+        *,
+        ab: bool = False,
+        bound: bool = True,
+        backbone: Any = None,
+        text_embeds: bool = False,
+    ) -> None:
+        self.program, self.tp_rank, self._display_name = program, 0, "Stub"
+        self._backbone, self._text_embeds = backbone, text_embeds
+        self._steps, self._bound = {(1, 4): lambda x: x}, bound
+        self._pending = self._inspect = self._inspect_runner = None
+        self.step_mix_tracker = StepMixTracker(period_s=3600.0)
+        self.ab_calibrator = MKABCalibrator(enabled=ab, period_s=3600.0)
+
+
+def _stock_runner(**kw: Any) -> Any:
+    """A runner whose stock model returns `-input_ids` and records its calls."""
+    calls: list[dict[str, Any]] = []
+
+    def model(**k: Any) -> torch.Tensor:
+        calls.append(k)
+        return -k["input_ids"].float()
+
+    return SimpleNamespace(
+        model=model, stock_calls=calls, device=torch.device("cpu"), **kw
+    )
+
+
+@pytest.fixture
+def fwd_ctx(monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = SimpleNamespace(attn_metadata={})
+    monkeypatch.setattr(stepping, "get_forward_context", lambda: ctx)
+
+
+_IDS = torch.tensor([5, 6, 7], dtype=torch.int32)
+_POS = torch.zeros(3, dtype=torch.int32)
+
+
+@pytest.mark.parametrize("ab", [False, True])
+@pytest.mark.parametrize(
+    "case",
+    [
+        "not_bound",
+        "no_input_ids",
+        "inputs_embeds",
+        "intermediate_tensors",
+        "aux_hidden_state_layers",
+        "position_ids_override",
+    ],
+)
+def test_route_declines_before_decide(fwd_ctx: None, case: str, ab: bool) -> None:
+    """Each early decline: stock, no `decide`, nothing pending or counted, and
+    no A/B timing (`last_decision` stays `stock_early`)."""
+    prog = _Program(_MK)
+    drv = _Driver(
+        prog,
+        ab=ab,
+        bound=case != "not_bound",
+        backbone=(
+            SimpleNamespace(aux_hidden_state_layers=(2,))
+            if case == "aux_hidden_state_layers"
+            else None
+        ),
+    )
+    bctx = SimpleNamespace(
+        position_ids_override=_POS if case == "position_ids_override" else None
+    )
+    runner = _stock_runner(_attn_metadata_builder_ctx=bctx)
+    ctx = StepContext(
+        None if case in ("no_input_ids", "inputs_embeds") else _IDS,
+        _POS,
+        inputs_embeds=torch.zeros(3, 2) if case == "inputs_embeds" else None,
+        intermediate_tensors=object() if case == "intermediate_tensors" else None,
+    )
+    drv._pending = ("stale",)
+    assert drv.try_forward(runner, ctx) == (False, None)
+    assert drv._pending is None
+    assert drv.ab_calibrator.last_decision == ("stock_early", "stock")
+    assert prog.calls == [] and runner.stock_calls == []
+    assert drv.step_mix_tracker.counts == {}
+
+
+@pytest.mark.parametrize("ab", [False, True])
+def test_route_decide_none_is_stock_and_uncounted(fwd_ctx: None, ab: bool) -> None:
+    prog = _Program(None)
+    drv = _Driver(prog, ab=ab)
+    runner = _stock_runner()
+    assert drv.try_forward(runner, StepContext(_IDS, _POS)) == (False, None)
+    assert [c[0] for c in prog.calls] == ["decide"]
+    assert drv._pending is None and runner.stock_calls == []
+    assert drv.ab_calibrator.last_decision == ("stock_early", "stock")
+    assert drv.step_mix_tracker.counts == {}
+
+
+@pytest.mark.parametrize("ab", [False, True])
+def test_route_ineligible_is_counted_and_timed_on_the_stock_arm(
+    fwd_ctx: None, ab: bool
+) -> None:
+    """An ineligible step counts under its reason. With A/B on, `try_forward`
+    runs and times the stock model itself."""
+    prog = _Program(_INELIGIBLE)
+    drv = _Driver(prog, ab=ab)
+    runner = _stock_runner()
+    hit, out = drv.try_forward(runner, StepContext(_IDS, _POS))
+    assert [c[0] for c in prog.calls] == ["decide"]
+    assert drv._pending is None
+    assert drv.ab_calibrator.last_decision == ("stock_big", "stock")
+    assert drv.step_mix_tracker.counts == {"stock_big": 1}
+    if ab:
+        assert hit and torch.equal(out, -_IDS.float())
+        assert runner.stock_calls == [
+            dict(input_ids=_IDS, positions=_POS, inputs_embeds=None)
+        ]
+        assert set(drv.ab_calibrator._cumulative["stock_big_p3"]) == {"stock"}
+    else:
+        assert (hit, out) == (False, None) and runner.stock_calls == []
+
+
+def test_eligible_step_serves_on_the_program(fwd_ctx: None) -> None:
+    prog = _Program(_MK)
+    drv = _Driver(prog)
+    runner = _stock_runner()
+    hit, out = drv.try_forward(runner, StepContext(_IDS, _POS))
+    assert hit and torch.equal(out, _IDS.float() * 10)
+    assert [c[0] for c in prog.calls] == ["decide", "forward"]
+    assert prog.calls[1][1:] == (_MK, 3)
+    # `__call__` consumed the step `_route` left pending.
+    assert drv._pending is None and runner.stock_calls == []
+    assert drv.ab_calibrator.last_decision == ("mk_t1_b4", "mk")
+    assert drv.step_mix_tracker.counts == {"mk_t1_b4": 1}
+
+
+def test_can_run_leaves_the_step_pending_for_call(fwd_ctx: None) -> None:
+    prog = _Program(_MK)
+    drv = _Driver(prog)
+    runner = _stock_runner()
+    assert drv.can_run(_IDS, _POS, runner=runner)
+    decision, fwd, ctx = drv._pending
+    assert decision is _MK and ctx.input_ids is _IDS and fwd.num_tokens is None
+    out = drv(_IDS, _POS, num_tokens=2, runner=runner)
+    assert torch.equal(out, _IDS.float() * 10)
+    assert prog.calls[-1] == ("forward", _MK, 2) and drv._pending is None
+    # Without a pending step, `__call__` runs the program with no decision.
+    drv(_IDS, _POS, runner=runner)
+    assert prog.calls[-1] == ("forward", None, 3)
+    # A later decline drops a step left pending.
+    assert drv.can_run(_IDS, _POS, runner=runner)
+    assert not drv.can_run(_IDS, _POS, inputs_embeds=torch.zeros(3, 2), runner=runner)
+    assert drv._pending is None
+
+
+def test_ab_alternates_the_arms_of_an_eligible_key(fwd_ctx: None) -> None:
+    """A/B on: the first eligible step runs the program (`mk` arm), the next
+    one the stock model (`stock` arm); both are timed under the key."""
+    prog = _Program(_MK)
+    drv = _Driver(prog, ab=True)
+    runner = _stock_runner()
+    hit, out = drv.try_forward(runner, StepContext(_IDS, _POS))
+    assert hit and torch.equal(out, _IDS.float() * 10)
+    assert drv.ab_calibrator.last_decision == ("mk_t1_b4", "mk")
+    hit, out = drv.try_forward(runner, StepContext(_IDS, _POS))
+    assert hit and torch.equal(out, -_IDS.float())
+    assert drv.ab_calibrator.last_decision == ("mk_t1_b4", "stock")
+    assert drv._pending is None
+    assert [c[0] for c in prog.calls] == ["decide", "forward", "decide"]
+    assert len(runner.stock_calls) == 1
+    assert drv.step_mix_tracker.counts == {"mk_t1_b4_ab_mk": 1, "mk_t1_b4_ab_stock": 1}
+    assert set(drv.ab_calibrator._cumulative["mk_t1_b4_p3"]) == {"mk", "stock"}
+
+
+@pytest.mark.parametrize(
+    ("text_embeds", "token_ids", "served"),
+    [(True, True, True), (False, True, False), (True, False, False)],
+)
+def test_text_embeds_step_is_served_from_its_token_ids(
+    fwd_ctx: None, text_embeds: bool, token_ids: bool, served: bool
+) -> None:
+    """With `_text_embeds`, a step the runner embedded from text tokens alone
+    is served from `ctx.token_ids`; otherwise `inputs_embeds` sends it to the
+    stock model."""
+    prog = _Program(_MK)
+    drv = _Driver(prog, text_embeds=text_embeds)
+    ctx = StepContext(
+        None,
+        _POS,
+        inputs_embeds=torch.zeros(3, 2),
+        token_ids=_IDS if token_ids else None,
+    )
+    hit, out = drv.try_forward(_stock_runner(), ctx)
+    if served:
+        assert hit and torch.equal(out, _IDS.float() * 10)
+        seen = prog.calls[0][1]
+        assert seen.input_ids is _IDS and seen.inputs_embeds is None
+    else:
+        assert (hit, out) == (False, None) and prog.calls == []
