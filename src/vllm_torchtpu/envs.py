@@ -1883,10 +1883,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     #   "sc"           the SparseCore ragged_gather_v2 kernel.
     #   "sc_padded"    the same, keeping the kernel's padded row blocks (no
     #                  trimming copy; the extra rows are never read).
+    #   "sc_fp8"       sc_padded on rows quantized once to fp8 by gmm_v2's own
+    #                  lhs quantizer and packed with their scales (3,072 bytes
+    #                  per routed row instead of 5,120), gathered DMA-only;
+    #                  the GMM reads them pre-quantized. Same output bits.
+    #                  Falls back to sc_padded where it does not apply.
     "TPU_MOE_NONEP_GATHER": env_with_choices(
         "TPU_MOE_NONEP_GATHER",
         "xla",
-        ["xla", "xla_colchunk", "xla_chunked", "sc", "sc_padded"],
+        ["xla", "xla_colchunk", "xla_chunked", "sc", "sc_padded", "sc_fp8"],
         case_sensitive=False,
     ),
     # Columns per block for "xla_colchunk". 0 picks the widest block (a

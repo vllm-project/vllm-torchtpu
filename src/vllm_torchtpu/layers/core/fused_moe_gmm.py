@@ -25,10 +25,12 @@ from vllm_torchtpu.kernels.experimental.moe_dense_expert import (
     dense_expert_moe,
 )
 from vllm_torchtpu.kernels.megablox.gmm_v2 import (
+    LHS_QUANT_BLOCK,
     calculate_tiling,
     get_packing_factor,
     gmm_mlp_v2,
     gmm_v2,
+    pack_fp8_rows,
 )
 from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
     blockwise_onehot_unpermute,
@@ -260,6 +262,7 @@ def gmm_wrapper(
     experts_per_visit=1,
     pack_out=False,
     bucket=0,
+    lhs_packed_dtype=None,
 ):
     # fp4 weights: keep bf16 activations. Quantizing activations to fp8 collapses
     # fp4 accuracy (error compounds across MoE layers) with no decode speedup
@@ -287,6 +290,7 @@ def gmm_wrapper(
         **({"rhs_split": rhs_split} if rhs_split > 1 else {}),
         **({"experts_per_visit": experts_per_visit} if experts_per_visit > 1 else {}),
         **({"pack_out": True} if pack_out else {}),
+        **({"lhs_packed_dtype": lhs_packed_dtype} if lhs_packed_dtype is not None else {}),
     )
 
 
@@ -304,6 +308,7 @@ def mlp_wrapper(
     bucket=0,
     experts_per_visit=1,
     pack_out=False,
+    lhs_packed_dtype=None,
 ):
     """Both non-EP GMMs as one fused expert-MLP kernel (gmm_v2.gmm_mlp_v2,
     TPU_MOE_NONEP_FUSED_MLP): bit-identical to gmm_wrapper(gmm_wrapper(x, w1,
@@ -321,6 +326,32 @@ def mlp_wrapper(
         rhs_quant_dtype=rhs_quant_dtype,
         pack_out=pack_out,
         experts_per_visit=experts_per_visit,
+        **({"lhs_packed_dtype": lhs_packed_dtype} if lhs_packed_dtype is not None else {}),
+    )
+
+
+def nonep_fp8_dispatch_ok(
+    hidden_states, w1, w1_scale, w1_bias, w2_bias, *, activation, use_ep, use_sparse_core,
+    rhs_quant_dtype, padded_hidden_size,
+) -> bool:
+    """Whether TPU_MOE_NONEP_GATHER=sc_fp8 can serve this call: the non-EP
+    SparseCore path with fp8 E4M3 weights carrying scales (so gmm_v2 quantizes
+    its lhs to fp8 per LHS_QUANT_BLOCK columns), bf16 activations whose width
+    needs no padding, and no biases. Otherwise the caller uses sc_padded (the
+    same routed rows, bf16)."""
+    return (
+        not use_ep
+        and use_sparse_core
+        and activation is not None
+        and w1_bias is None
+        and w2_bias is None
+        and w1_scale is not None
+        and hidden_states.dtype == jnp.bfloat16
+        and w1.dtype == jnp.float8_e4m3fn
+        and get_packing_factor(w1.dtype, rhs_quant_dtype) == 1
+        and hidden_states.shape[1] == padded_hidden_size
+        and hidden_states.shape[1] % LHS_QUANT_BLOCK == 0
+        and pltpu.get_tpu_info().fp8_ops_per_second > 0
     )
 
 
@@ -543,6 +574,23 @@ def prepare_routed_gmm_inputs(
                 jnp.array([0], dtype=jnp.int32),
                 valid_count[None],
             )
+    elif not use_ep and nonep_gather == "sc_fp8":
+        # The routed rows already quantized: each token row is quantized once
+        # (pack_fp8_rows, gmm_v2's own lhs quantizer) into a packed f32
+        # carrier of 768 words (fp8 bytes + block scales), and the SparseCore
+        # gathers those rows DMA-only, 3,072 bytes per routed row instead of
+        # 5,120. The GMM reads them with lhs_packed_dtype and multiplies the
+        # same values and scales it would compute from the bf16 rows. Padded
+        # row blocks are kept as in sc_padded. The caller checks
+        # nonep_fp8_dispatch_ok first.
+        x = ragged_gather_v2(
+            pack_fp8_rows(hidden_states_local),
+            token_indices_sorted,
+            jnp.array([0], dtype=jnp.int32),
+            jnp.array([token_indices_sorted.shape[0]], dtype=jnp.int32),
+            trim_rows=False,
+            copy_mode="dma",
+        )
     elif not use_ep and nonep_gather in ("sc", "sc_padded"):
         # "sc_padded" keeps the kernel's whole row blocks (64,000 routed rows
         # come back as 65,536): the GMMs visit only rows inside expert groups
@@ -699,8 +747,12 @@ def moe_gmm(
     nonep_gmm_bucket: int = 0,
     nonep_gmm2_experts_per_visit: int = 0,
     nonep_fused_mlp: bool = False,
+    nonep_lhs_packed_dtype: jnp.dtype | None = None,
 ) -> jax.Array:
     """Run grouped GEMM for routed tokens and reduce back to tokens.
+
+    ``nonep_lhs_packed_dtype`` set: ``x`` is the packed fp8 carrier of routed
+    rows of that dtype (``TPU_MOE_NONEP_GATHER=sc_fp8``); gmm1 reads it as is.
 
     ``nonep_combine_split`` > 1 (``TPU_MOE_NONEP_COMBINE_SPLIT``) runs the
     second GMM and the SparseCore combine per block of output columns, so each
@@ -712,6 +764,9 @@ def moe_gmm(
     EP uses SparseCore ragged_gather + ragged_gather_reduce for token movement.
     """
     group_offset = jnp.array([0], dtype=jnp.int32)
+    # The routed rows' activation dtype (x may be their packed fp8 carrier).
+    act_dtype = x.dtype if nonep_lhs_packed_dtype is None else jnp.dtype(nonep_lhs_packed_dtype)
+    lp = nonep_lhs_packed_dtype
     # m-tile override of the non-EP GMMs (TPU_MOE_NONEP_GMM_TILE_M); 0 = default.
     tile_m = 0 if use_ep else nonep_gmm_tile_m
     hoist = nonep_gmm_hoist_quant and not use_ep
@@ -741,11 +796,11 @@ def moe_gmm(
         and epv2 == epv
         and get_packing_factor(w1.dtype, rhs_quant_dtype) == 1
         and get_packing_factor(w2.dtype, rhs_quant_dtype) == 1
-        and jax.dtypes.itemsize_bits(w1.dtype) == 8
+        and jaact_dtypes.itemsize_bits(w1.dtype) == 8
     )
     if fused_mlp:
         # shapes only; gmm2 below runs both GMMs from x
-        gmm1_res = jax.ShapeDtypeStruct((x.shape[0], w2.shape[1]), x.dtype)
+        gmm1_res = jax.ShapeDtypeStruct((x.shape[0], w2.shape[1]), act_dtype)
     else:
         gmm1_res = gmm_wrapper(
             x,
@@ -761,6 +816,7 @@ def moe_gmm(
             hoist_lhs_quant=hoist,
             experts_per_visit=epv,
             bucket=bucket,
+            lhs_packed_dtype=lp,
         )
         packing_factor = get_packing_factor(w2.dtype, rhs_quant_dtype)
         gmm1_res = gmm1_res[:, : w2.shape[1] * packing_factor]
@@ -784,7 +840,7 @@ def moe_gmm(
         and w2_bias is None
         and get_packing_factor(w2.dtype, rhs_quant_dtype) == 1
         and _local_ragged_combine_eligible(
-            gmm1_res.shape[0], split_width, x.dtype, **combine_kw
+            gmm1_res.shape[0], split_width, act_dtype, **combine_kw
         )
     ):
         blocks = []
@@ -797,7 +853,7 @@ def moe_gmm(
                 group_sizes,
                 group_offset,
                 zero_initialize=False,
-                preferred_element_type=x.dtype,
+                preferred_element_type=act_dtype,
                 rhs_quant_dtype=rhs_quant_dtype,
                 n_window=(start, split_width),
                 tile_m=tile_m,
@@ -813,7 +869,7 @@ def moe_gmm(
                     topk_weights_flat,
                     valid_mask_flat,
                     reduce_group_size=topk,
-                ).astype(x.dtype)
+                ).astype(act_dtype)
             )
         return jnp.concatenate(blocks, axis=1)
 
@@ -826,11 +882,11 @@ def moe_gmm(
         and not use_ep
         and w2_bias is None
         and rhs_split == 1
-        and x.dtype == jnp.bfloat16
+        and act_dtype == jnp.bfloat16
         and get_packing_factor(w2.dtype, rhs_quant_dtype) == 1
         and (size_n // 2) % 128 == 0
         and _local_ragged_combine_eligible(
-            gmm1_res.shape[0], size_n, x.dtype, packed=True, **combine_kw
+            gmm1_res.shape[0], size_n, act_dtype, packed=True, **combine_kw
         )
     )
     gmm2_res = None
@@ -844,6 +900,7 @@ def moe_gmm(
                 bucket=bucket,
                 experts_per_visit=epv,
                 pack_out=packed,
+                lhs_packed_dtype=lp,
             )
             logger.info_once("MoE expert GMMs run as one fused expert-MLP kernel.")
         except ValueError as e:
@@ -853,6 +910,7 @@ def moe_gmm(
                 x, w1, w1_scale, w1_bias, group_sizes, group_offset,
                 zero_initialize=False, fuse_act=activation, rhs_quant_dtype=rhs_quant_dtype,
                 tile_m=tile_m, hoist_lhs_quant=hoist, experts_per_visit=epv, bucket=bucket,
+                lhs_packed_dtype=lp,
             )[:, : w2.shape[1] * get_packing_factor(w2.dtype, rhs_quant_dtype)]
     if gmm2_res is None:
         gmm2_res = gmm_wrapper(
@@ -863,7 +921,7 @@ def moe_gmm(
             group_sizes,
             group_offset,
             zero_initialize=False,
-            preferred_element_type=x.dtype,
+            preferred_element_type=act_dtype,
             rhs_quant_dtype=rhs_quant_dtype,
             tile_m=tile_m,
             hoist_lhs_quant=hoist,
@@ -880,7 +938,7 @@ def moe_gmm(
             valid_mask_flat,
             reduce_group_size=topk,
             x_packed=True,
-        ).astype(x.dtype)
+        ).astype(act_dtype)
     # The destination-major kernel packs source indices into 20 bits and
     # processes 16-lane SparseCore tiles.
     if _local_ragged_combine_eligible(
@@ -892,7 +950,7 @@ def moe_gmm(
             topk_weights_flat,
             valid_mask_flat,
             reduce_group_size=topk,
-        ).astype(x.dtype)
+        ).astype(act_dtype)
     if use_ep and use_sparse_core:
         if argsort_revert_indices.size <= onehot_moe_permute_threshold:
             # Use onehot + matmul for unpermutation, which can be faster
@@ -928,7 +986,7 @@ def moe_gmm(
                     topk_weights_sorted,
                     valid_count,
                     num_tokens=num_tokens,
-                ).astype(x.dtype)
+                ).astype(act_dtype)
             # Rows past the computed prefix (non-local experts under EP,
             # skipped padded tokens) are never written by the GMM; zero them
             # so stale NaNs cannot spread through the matmul (0 * NaN == NaN).
@@ -943,21 +1001,21 @@ def moe_gmm(
             combine = (onehot * topk_weights[..., None] * valid_mask[..., None]).sum(
                 axis=1
             )
-            return (combine @ gmm2_res).astype(x.dtype)
+            return (combine @ gmm2_res).astype(act_dtype)
         return ragged_gather_reduce(
             gmm2_res,
             argsort_revert_indices,
             topk_weights_flat,
             valid_mask_flat,
             reduce_group_size=topk,
-        ).astype(x.dtype)
+        ).astype(act_dtype)
 
     token_hidden = gmm2_res[argsort_revert_indices]
     token_topk_hidden = token_hidden.reshape((num_tokens, topk, gmm2_res.shape[-1]))
     token_topk_hidden = token_topk_hidden * jnp.expand_dims(topk_weights, axis=-1)
     token_topk_hidden = jnp.where(valid_mask[:, :, None], token_topk_hidden, 0)
     # FP32 top-k weights can promote BF16 outputs; keep the custom-op dtype.
-    return token_topk_hidden.sum(axis=1).astype(x.dtype)
+    return token_topk_hidden.sum(axis=1).astype(act_dtype)
 
 
 @functools.partial(
@@ -1094,6 +1152,21 @@ def fused_moe_func(
             hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids
         )
 
+    # TPU_MOE_NONEP_GATHER=sc_fp8 where it applies; elsewhere sc_padded, which
+    # gathers the same routed rows in bf16.
+    lhs_packed_dtype = None
+    if nonep_gather == "sc_fp8":
+        if nonep_fp8_dispatch_ok(
+            hidden_states, w1, w1_scale, w1_bias, w2_bias, activation=activation,
+            use_ep=use_ep, use_sparse_core=use_sparse_core,
+            rhs_quant_dtype=rhs_quant_dtype, padded_hidden_size=padded_hidden_size,
+        ):
+            lhs_packed_dtype = hidden_states.dtype
+            logger.info_once("MoE dispatch gathers packed fp8 rows (sc_fp8).")
+        else:
+            nonep_gather = "sc_padded"
+            logger.info_once("MoE sc_fp8 dispatch not applicable here; sc_padded.")
+
     (
         x,
         group_sizes,
@@ -1116,7 +1189,8 @@ def fused_moe_func(
         nonep_gather_cols=nonep_gather_cols,
         nonep_gather_chunk=nonep_gather_chunk,
     )
-    x = jnp.pad(x, ((0, 0), (0, padded_hidden_size - hidden_size)))
+    if lhs_packed_dtype is None:
+        x = jnp.pad(x, ((0, 0), (0, padded_hidden_size - hidden_size)))
     x = moe_gmm(
         x,
         w1,
@@ -1146,5 +1220,6 @@ def fused_moe_func(
         nonep_gmm_bucket=nonep_gmm_bucket,
         nonep_gmm2_experts_per_visit=nonep_gmm2_experts_per_visit,
         nonep_fused_mlp=nonep_fused_mlp,
+        nonep_lhs_packed_dtype=lhs_packed_dtype,
     )
     return x[:num_tokens, :hidden_size]
