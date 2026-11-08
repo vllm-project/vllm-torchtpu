@@ -53,8 +53,10 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
 
+from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2_mlp_exchange
 from vllm_torchtpu.kernels.megablox.row_copy import copy_send_rows
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
+    _is_fp4_weight,
     fused_moe_func,
     fused_moe_scatter,
     fused_moe_scatter_planned,
@@ -69,6 +71,11 @@ _ROUTE_TILE = 128
 # Largest factor used where the full-size exchange stays on the one-hot path:
 # its rerun is cheap there, so larger buffers cost more than they save.
 _ONEHOT_FALLBACK_FACTOR = 2.0
+# Schedule of the in-kernel dispatch (``expert_arrival``): sends start four
+# local experts ahead of the expert being waited for, and each expert's first
+# tile is copied in before its weights.
+ARRIVAL_WINDOW = 4
+ARRIVAL_PREFETCH = 2
 
 
 def _member_index(
@@ -1249,6 +1256,89 @@ def owner_tp_sum(partial: jax.Array, *, tp_size: int) -> jax.Array:
     return jax.lax.all_gather(owned, TP_AXIS, tiled=True)[:num_tokens]
 
 
+def _owner_targets(
+    x,
+    topk_ids,
+    topk_weights,
+    experts_start,
+    dp_pos,
+    fits,
+    *,
+    skip_padded_tokens,
+    shared,
+    **mesh,
+):
+    """Where the owner combine's output rows go, for this rank: its member
+    index over (dp, tp), the ids and weights of the tokens it owns, the output
+    rows the other ranks send it, and the ``extra`` rows of its shared-expert
+    partial (None without ``shared``)."""
+    num_tokens = x.shape[0]
+    local = mesh["local_num_experts"]
+    tp_size = mesh["tp_size"]
+    blk = -(-num_tokens // tp_size)
+    ep_rank = experts_start[0] // local
+    my_tp = ep_rank % tp_size
+    me = dp_pos * tp_size + my_tp
+    pad = blk * tp_size - num_tokens
+    ids = jnp.pad(topk_ids, ((0, pad), (0, 0)), constant_values=-1)
+    weights = jnp.pad(topk_weights, ((0, pad), (0, 0)))
+    owned_ids = jax.lax.dynamic_slice_in_dim(ids, my_tp * blk, blk)
+    owned_weights = jax.lax.dynamic_slice_in_dim(weights, my_tp * blk, blk)
+    valid, _, _, _ = owner_route_key(owned_ids, **mesh)
+    w = owned_weights.astype(x.dtype)
+    w = jnp.where(jnp.isfinite(w), w, 0)
+    if skip_padded_tokens:
+        valid = valid & (w != 0)
+    remote = valid & (owned_ids // local != ep_rank)
+    expected = jnp.where(fits, remote.sum(dtype=jnp.int32), 0)
+    extra = None
+    if shared is not None:
+        # This rank's shared-expert partial of every engine token goes to the
+        # token's owner (row my_tp * blk + t % blk there), during the experts.
+        t = jnp.arange(blk * tp_size, dtype=jnp.int32)
+        rows = jnp.pad(shared, ((0, pad), (0, 0)))
+        rows = rows.reshape(blk * tp_size, 16, -1)
+        extra = (
+            rows,
+            dp_pos * tp_size + t // blk,
+            my_tp * blk + t % blk,
+            # An overflowing step sends and expects nothing (the caller runs
+            # the full-size exchange).
+            jnp.where(fits, jnp.array([(tp_size - 1) * blk, blk * tp_size]), 0).astype(
+                jnp.int32
+            ),
+        )
+    return me, owned_ids, owned_weights, expected, extra
+
+
+def _owner_result(
+    recv,
+    owned_ids,
+    owned_weights,
+    *,
+    num_tokens,
+    skip_padded_tokens,
+    dtype,
+    shared,
+    **mesh,
+):
+    """The engine's tokens summed over TP from the owner combine's receive
+    buffers (``recv``: the pair (routes, shared-expert rows) when ``shared``)."""
+    shared_recv = None
+    if shared:
+        recv, shared_recv = recv
+    owned = owner_sum_kernel(
+        recv,
+        owned_ids,
+        owned_weights,
+        skip_padded_tokens=skip_padded_tokens,
+        dtype=dtype,
+        shared=shared_recv,
+        **mesh,
+    )
+    return jax.lax.all_gather(owned, TP_AXIS, tiled=True)[:num_tokens]
+
+
 def _owner_combine(
     received,
     recv_weights,
@@ -1291,38 +1381,17 @@ def _owner_combine(
     local = w1.shape[0]
     mesh = dict(dp_size=dp_size, tp_size=tp_size, local_num_experts=local)
     blk = -(-num_tokens // tp_size)
-    ep_rank = experts_start[0] // local
-    my_tp = ep_rank % tp_size
-    me = dp_pos * tp_size + my_tp
-    pad = blk * tp_size - num_tokens
-    ids = jnp.pad(topk_ids, ((0, pad), (0, 0)), constant_values=-1)
-    weights = jnp.pad(topk_weights, ((0, pad), (0, 0)))
-    owned_ids = jax.lax.dynamic_slice_in_dim(ids, my_tp * blk, blk)
-    owned_weights = jax.lax.dynamic_slice_in_dim(weights, my_tp * blk, blk)
-    valid, _, _, _ = owner_route_key(owned_ids, **mesh)
-    w = owned_weights.astype(x.dtype)
-    w = jnp.where(jnp.isfinite(w), w, 0)
-    if skip_padded_tokens:
-        valid = valid & (w != 0)
-    remote = valid & (owned_ids // local != ep_rank)
-    expected = jnp.where(fits, remote.sum(dtype=jnp.int32), 0)
-    extra = None
-    if shared is not None:
-        # This rank's shared-expert partial of every engine token goes to the
-        # token's owner (row my_tp * blk + t % blk there), during the experts.
-        t = jnp.arange(blk * tp_size, dtype=jnp.int32)
-        rows = jnp.pad(shared, ((0, pad), (0, 0)))
-        rows = rows.reshape(blk * tp_size, 16, -1)
-        extra = (
-            rows,
-            dp_pos * tp_size + t // blk,
-            my_tp * blk + t % blk,
-            # An overflowing step sends and expects nothing (the caller runs
-            # the full-size exchange).
-            jnp.where(fits, jnp.array([(tp_size - 1) * blk, blk * tp_size]), 0).astype(
-                jnp.int32
-            ),
-        )
+    me, owned_ids, owned_weights, expected, extra = _owner_targets(
+        x,
+        topk_ids,
+        topk_weights,
+        experts_start,
+        dp_pos,
+        fits,
+        skip_padded_tokens=skip_padded_tokens,
+        shared=shared,
+        **mesh,
+    )
     if plan is not None:
         recv = fused_moe_scatter_planned(
             received,
@@ -1372,19 +1441,285 @@ def _owner_combine(
             num_members=(dp_size, tp_size),
             collective_id=collective_id,
         )
-    shared_recv = None
-    if shared is not None:
-        recv, shared_recv = recv
-    owned = owner_sum_kernel(
+    return _owner_result(
         recv,
         owned_ids,
         owned_weights,
+        num_tokens=num_tokens,
         skip_padded_tokens=skip_padded_tokens,
         dtype=x.dtype,
-        shared=shared_recv,
+        shared=shared is not None,
         **mesh,
     )
-    return jax.lax.all_gather(owned, TP_AXIS, tiled=True)[:num_tokens]
+
+
+def _permuted_values(x: jax.Array) -> jax.Array:
+    """The values the expert side's one-hot permute and row gather give each
+    row: +0 for zeros, subnormals, infinities and NaNs (the permute's
+    finite-value select and its matmul), every other value unchanged."""
+    info = jnp.finfo(x.dtype)
+    bits = jax.lax.bitcast_convert_type(x, jnp.dtype(f"uint{8 * x.dtype.itemsize}"))
+    field = jnp.right_shift(bits, info.nmant) & ((1 << info.nexp) - 1)
+    keep = (field != 0) & (field != (1 << info.nexp) - 1)
+    return jnp.where(keep, x, jnp.zeros_like(x))
+
+
+def _routes_fit(gathered_ids, gathered_weights, *, tp_size, local_num_experts, routes):
+    """Whether no rank of the mesh sees more than ``routes`` routes to its
+    experts (with ``gathered_weights``, routes of weight 0 do not count).
+
+    Every rank holds the routing of every engine, so all ranks compute the same
+    answer and take the same branch around their collectives."""
+    dp_size = gathered_ids.shape[0]
+    num_ranks = dp_size * tp_size
+    rank = gathered_ids // local_num_experts
+    routed = (gathered_ids >= 0) & (rank < num_ranks)
+    if gathered_weights is not None:
+        w = jnp.where(jnp.isfinite(gathered_weights), gathered_weights, 0)
+        routed = routed & (w != 0)
+    rank = jnp.where(routed, rank, num_ranks)
+    hit = rank[..., None] == jnp.arange(num_ranks, dtype=jnp.int32)
+    return hit.sum(axis=(0, 1, 2), dtype=jnp.int32).max() <= routes
+
+
+def _arrival_sends(group, dp_pos, *, num_groups, local, routes):
+    """This member's row sends to the sorted lhs of its DP group's members.
+
+    ``group`` [D, S, K]: member * local + local expert of each route of the DP
+    group (``num_groups``: not sent). A member's lhs holds its routes by local
+    expert, then source member, then token (`route_plan`'s order). Returns
+    (token, member, row, local expert) per send, in (local expert, member,
+    route) order, the number of sends and the first send of each local expert
+    [local + 1]."""
+    dp_size, num_tokens, topk = group.shape
+    g = jnp.arange(num_groups, dtype=jnp.int32)
+    hit = (group[..., None] == g).any(axis=2)  # [D, S, G]: one route at most
+    counts = hit.sum(axis=1, dtype=jnp.int32)  # [D, G]: by source member
+    total = counts.sum(axis=0).reshape(-1, local)
+    start = _exclusive_cumsum(total, 1).reshape(-1)
+    earlier = jnp.arange(dp_size, dtype=jnp.int32)[:, None] < dp_pos
+    first = start + jnp.where(earlier, counts, 0).sum(axis=0)  # [G]
+    mine = jax.lax.dynamic_index_in_dim(hit, dp_pos, keepdims=False)  # [S, G]
+    before = _exclusive_cumsum(mine.astype(jnp.int32), 0)  # [S, G]
+    my_group = jax.lax.dynamic_index_in_dim(group, dp_pos, keepdims=False)  # [S, K]
+    # Selects instead of gathers: XLA gathers of a few thousand indices are slow.
+    row = jnp.where(
+        my_group[..., None] == g, first[None, None] + before[:, None, :], 0
+    ).sum(axis=-1)
+    sent = my_group < num_groups
+    expert = my_group % local
+    member = my_group // local
+    route = jnp.arange(num_tokens * topk, dtype=jnp.int32).reshape(num_tokens, topk)
+    order = expert * dp_size + member
+    order_bits = max(1, (num_groups - 1).bit_length())
+    route_bits = max(1, (num_tokens * topk - 1).bit_length())
+    row_bits = max(1, (routes - 1).bit_length())
+    if order_bits + route_bits + row_bits < 32:
+        # One int32 per send; unsent routes sort last.
+        key = (
+            jnp.left_shift(order, route_bits + row_bits)
+            | jnp.left_shift(route, row_bits)
+            | row
+        )
+        key = jax.lax.sort(jnp.where(sent, key, jnp.iinfo(jnp.int32).max).reshape(-1))
+        order_s = jnp.right_shift(key, route_bits + row_bits)
+        route_s = jnp.right_shift(key, row_bits) & ((1 << route_bits) - 1)
+        row_s = key & ((1 << row_bits) - 1)
+    else:
+        key = jnp.where(sent, order, num_groups)
+        _, route_s, order_s, row_s = jax.lax.sort(
+            tuple(a.reshape(-1) for a in (key, route, order, row)), num_keys=2
+        )
+    num_sends = sent.sum(dtype=jnp.int32)[None]
+    per_expert = (
+        (expert[..., None] == jnp.arange(local, dtype=jnp.int32)) & sent[..., None]
+    ).sum(axis=(0, 1), dtype=jnp.int32)
+    offsets = jnp.concatenate(
+        [jnp.zeros((1,), jnp.int32), jnp.cumsum(per_expert, dtype=jnp.int32)]
+    )
+    return (
+        route_s // topk,
+        order_s % dp_size,
+        row_s,
+        order_s // dp_size,
+        num_sends,
+        offsets,
+    )
+
+
+def _arrival_exchange(
+    x,
+    w1,
+    w2,
+    w1_scale,
+    w2_scale,
+    topk_ids,
+    topk_weights,
+    gathered_ids,
+    read_routes,
+    experts_start,
+    *,
+    member_index,
+    tp_size,
+    dp_size,
+    topk,
+    activation,
+    rhs_quant_dtype,
+    skip_padded_tokens,
+    routes,
+    collective_id,
+    window,
+    prefetch,
+    owner,
+    shared=None,
+):
+    """Dispatch, expert MLP and combine in one kernel: each routed token row
+    goes straight to its row of the sorted lhs of its expert's member, and a
+    member starts an expert as soon as that expert's rows have landed; outputs
+    return as in ``_streamed_combine`` (``owner``: as in ``_owner_combine``,
+    already summed over TP, with ``shared``). Only the routes bound the
+    buffers (no token rows are gathered); returns (out, fits): with fits false
+    nothing was sent and the caller takes the full-size exchange. ``window``
+    and ``prefetch`` as in ``gmm_v2_mlp_exchange``.
+    """
+    num_tokens = x.shape[0]
+    local = w1.shape[0]
+    ep_rank = experts_start[0] // local
+    dp_pos = ep_rank // tp_size
+    num_groups = dp_size * local
+    gathered_weights = None
+    if skip_padded_tokens:
+        flat = jnp.arange(dp_size * num_tokens, dtype=jnp.int32)
+        gathered_weights = (
+            read_routes(flat)[1].astype(x.dtype).reshape(gathered_ids.shape)
+        )
+    # The outputs may cross TP columns (owner) and the barrier spans every
+    # core of the kernel: one branch on every rank of the mesh.
+    fits = _routes_fit(
+        gathered_ids,
+        gathered_weights,
+        tp_size=tp_size,
+        local_num_experts=local,
+        routes=routes,
+    )
+
+    member = member_index(gathered_ids)  # [D, S, K]
+    valid = (member < dp_size) & fits
+    if gathered_weights is not None:
+        w = jnp.where(jnp.isfinite(gathered_weights), gathered_weights, 0)
+        valid = valid & (w != 0)
+    group = jnp.where(valid, member * local + gathered_ids % local, num_groups)
+    send_token, send_member, send_row, send_group, num_sends, send_offsets = (
+        _arrival_sends(group, dp_pos, num_groups=num_groups, local=local, routes=routes)
+    )
+
+    # This member's lhs rows in the same order, with their outputs' destinations.
+    mesh = dict(dp_size=dp_size, tp_size=tp_size, local_num_experts=local)
+    if owner:
+        dests = functools.partial(owner_dests, **mesh)
+    else:
+        dests = functools.partial(
+            streamed_dests, member_index=member_index, dp_size=dp_size
+        )
+    in_row = jnp.arange(dp_size * num_tokens, dtype=jnp.int32).reshape(
+        dp_size, num_tokens
+    )
+    _, group_sizes, dest_member, dest_row = route_plan(
+        gathered_ids,
+        in_row,
+        fits,
+        experts_start,
+        dests,
+        local_num_experts=local,
+        routes=routes,
+        rows=dp_size * num_tokens,
+        gathered_weights=gathered_weights,
+    )
+
+    extra = owned_ids = owned_weights = None
+    if owner:
+        blk = -(-num_tokens // tp_size)
+        me, owned_ids, owned_weights, expected, extra = _owner_targets(
+            x,
+            topk_ids,
+            topk_weights,
+            experts_start,
+            dp_pos,
+            fits,
+            skip_padded_tokens=skip_padded_tokens,
+            shared=shared,
+            **mesh,
+        )
+        # Members are numbered over (dp, tp); the rows stay in this TP column.
+        send_member = send_member * tp_size + ep_rank % tp_size
+        axis, num_members, num_recv_rows = (DP_AXIS, TP_AXIS), (dp_size, tp_size), blk
+    else:
+        own = member_index(topk_ids)
+        weights = topk_weights.astype(x.dtype)
+        weights = jnp.where(jnp.isfinite(weights), weights, 0)
+        remote = (own < dp_size) & (own != dp_pos)
+        if skip_padded_tokens:
+            remote = remote & (weights != 0)
+        expected = jnp.where(fits, remote.sum(dtype=jnp.int32), 0)
+        me, axis, num_members, num_recv_rows = dp_pos, DP_AXIS, dp_size, num_tokens
+
+    if w1_scale.ndim == 3:
+        w1_scale = jnp.expand_dims(w1_scale, 2)
+    if w2_scale.ndim == 3:
+        w2_scale = jnp.expand_dims(w2_scale, 2)
+    recv = gmm_v2_mlp_exchange(
+        _permuted_values(x),
+        w1,
+        w2,
+        group_sizes,
+        w1_scale,
+        w2_scale,
+        jnp.array([0], dtype=jnp.int32),
+        dest_member,
+        dest_row,
+        jnp.asarray(me, jnp.int32)[None],
+        expected[None],
+        send_token,
+        send_member,
+        send_row,
+        send_group,
+        num_sends,
+        send_offsets,
+        extra,
+        size_m=routes,
+        num_recv_rows=num_recv_rows * topk,
+        num_extra_recv_rows=num_recv_rows * tp_size if extra is not None else 0,
+        axis=axis,
+        num_members=num_members,
+        collective_id=collective_id,
+        fuse_act=activation,
+        maybe_quantize_lhs=not _is_fp4_weight(w1),
+        rhs_quant_dtype=rhs_quant_dtype,
+        window=window,
+        prefetch=prefetch,
+    )
+    if owned_ids is not None:
+        out = _owner_result(
+            recv,
+            owned_ids,
+            owned_weights,
+            num_tokens=num_tokens,
+            skip_padded_tokens=skip_padded_tokens,
+            dtype=x.dtype,
+            shared=extra is not None,
+            **mesh,
+        )
+        return out, fits
+    out = sender_sum_kernel(
+        recv,
+        topk_ids,
+        topk_weights,
+        member_index=member_index,
+        dp_size=dp_size,
+        skip_padded_tokens=skip_padded_tokens,
+        dtype=x.dtype,
+    )
+    return out, fits
 
 
 def ragged_a2a_moe_local(
@@ -1413,6 +1748,9 @@ def ragged_a2a_moe_local(
     streamed_combine: bool = False,
     owner_combine: bool = False,
     sorted_plan: bool = False,
+    expert_arrival: bool = False,
+    arrival_window: int = 0,
+    arrival_prefetch: int = 0,
     shared: jax.Array | None = None,
 ) -> jax.Array:
     """Per-rank body (inside shard_map over the (dp, tp) mesh).
@@ -1454,6 +1792,16 @@ def ragged_a2a_moe_local(
     kernel that relayouts the tokens once and copies their rows in VMEM,
     instead of an XLA gather of the send rows and their relayout (same rows
     below the send sizes).
+
+    ``expert_arrival`` (with the streamed or owner combine, where the capacity
+    exchange takes the fused kernel): that kernel also dispatches the token
+    rows, each straight to its row of its expert's member's sorted lhs, and
+    starts each expert once its rows have landed (`_arrival_exchange`; window
+    and prefetch as in `gmm_v2_mlp_exchange`), instead of the ragged
+    all-to-all and the permute or row gather before it; there the row copies
+    have no buffers to fill. Only the routes bound it; a step whose routes
+    exceed them on some rank runs the full-size exchange. The kernel gets the
+    same rows in the same order.
     """
     assert shared is None or owner_combine
     num_tokens = x.shape[0]
@@ -1619,6 +1967,34 @@ def ragged_a2a_moe_local(
         # (the full exchange already runs the local-routes path over all routes).
         return full()
 
+    if expert_arrival and streamed(rows, routes, 2) is not None:
+        out, fits = _arrival_exchange(
+            x,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            topk_ids,
+            topk_weights,
+            gathered_ids,
+            read_routes,
+            experts_start,
+            member_index=member_index,
+            tp_size=tp_size,
+            dp_size=dp_size,
+            topk=topk,
+            activation=activation,
+            rhs_quant_dtype=rhs_quant_dtype,
+            skip_padded_tokens=skip_padded_tokens,
+            routes=routes,
+            collective_id=3,
+            window=arrival_window,
+            prefetch=arrival_prefetch,
+            owner=owner_combine,
+            shared=shared,
+        )
+        return jax.lax.cond(fits, lambda: out, full)
+
     overflow = _capacity_overflow(
         gathered_ids,
         tp_size=tp_size,
@@ -1677,6 +2053,9 @@ def ragged_a2a_moe(
     streamed_combine: bool = False,
     owner_combine: bool = False,
     sorted_plan: bool = False,
+    expert_arrival: bool = False,
+    arrival_window: int = 0,
+    arrival_prefetch: int = 0,
     shared: jax.Array | None = None,
 ) -> jax.Array:
     """Global-view entry: every operand is the ranks' local arrays stacked on
@@ -1702,6 +2081,9 @@ def ragged_a2a_moe(
         streamed_combine=streamed_combine,
         owner_combine=owner_combine,
         sorted_plan=sorted_plan,
+        expert_arrival=expert_arrival,
+        arrival_window=arrival_window,
+        arrival_prefetch=arrival_prefetch,
     )
 
     scaled = w1_scale is not None

@@ -1673,6 +1673,35 @@ class ScatterRefs:
     extra: ExtraRowRefs | None = None
 
 
+@dataclasses.dataclass(frozen=True)
+class ArrivalRefs:
+    """Refs of `gmm_v2_mlp_exchange`'s row dispatch (see there)."""
+
+    send_token: jax.Array  # SMEM int32[num_sends]
+    send_member: jax.Array  # SMEM int32[num_sends]
+    send_row: jax.Array  # SMEM int32[num_sends]
+    send_group: jax.Array  # SMEM int32[num_sends]
+    num_sends: jax.Array  # SMEM int32[1]
+    send_offsets: jax.Array  # SMEM int32[size_group + 1]: first send of each group
+    tokens: jax.Array  # HBM [num_tokens, row_sublanes, size_k / row_sublanes]
+    landing: jax.Array  # HBM [size_m + tile_m, row_sublanes, size_k / row_sublanes]
+    lhs: jax.Array  # VMEM [2, tile_m, row_sublanes, size_k / row_sublanes]
+    lhs_rows: jax.Array  # VMEM [tile_m, size_k]: the tile in the matmul layout
+    lhs_sems: jax.Array  # DMA[2]
+    arrive_sems: jax.Array  # DMA[size_group]
+    send_sem: jax.Array  # DMA[1]
+    sent: jax.Array  # SMEM int32[1]: remote rows sent
+    issued: jax.Array  # SMEM int32[1]: sends started
+    extra_sent: jax.Array  # SMEM int32[1]: the `extra` rows have been sent
+    # Groups whose sends start before the member waits for a group's rows:
+    # the sends of groups below `group + window` (0: every send at entry).
+    window: int = 0
+    # A group's first tile is copied in during the previous group's last tile:
+    # 0 no, 1 after that tile's gate/up projection, 2 before it (ahead of the
+    # group's weight copies, which start during the projection).
+    prefetch: int = 0
+
+
 def _axes(axis, num_members):
     if isinstance(axis, str):
         return (axis,), (num_members,)
@@ -1758,6 +1787,7 @@ def _mlp_kernel(
     out_ref,
     partial_out_ref,
     scatter: ScatterRefs | None,
+    arrival: ArrivalRefs | None = None,
 ):
     up, down = cfgs.up, cfgs.down
     dims = up.dims
@@ -1812,6 +1842,112 @@ def _mlp_kernel(
         for c in copies:
             c.wait()
 
+    def send_extra_rows(sc: ScatterRefs, ex: ExtraRowRefs):
+        """Send every `extra` row to its member's second receive buffer now;
+        the transfers overlap the expert compute."""
+        me = sc.me[0]
+
+        def send(i, counts):
+            member = ex.member[i]
+            src = ex.rows.at[pl.ds(i, 1)]
+            dst = ex.recv.at[pl.ds(ex.row[i], 1)]
+            is_local = member == me
+
+            @pl.when(is_local)
+            def _():
+                pltpu.make_async_copy(src, dst, ex.sems.at[1]).start()
+
+            @pl.when(jnp.logical_not(is_local))
+            def _():
+                pltpu.make_async_remote_copy(
+                    src,
+                    dst,
+                    ex.sems.at[0],
+                    ex.sems.at[2],
+                    device_id=member_device(member, sc.axis, sc.num_members),
+                    device_id_type=pl.DeviceIdType.MESH,
+                ).start()
+
+            local = is_local.astype(jnp.int32)
+            return counts[0] + 1 - local, counts[1] + local
+
+        remote, local = lax.fori_loop(
+            0, ex.expected[1], send, (jnp.int32(0), jnp.int32(0))
+        )
+        ex.counts[0] = remote
+        ex.counts[1] = local
+
+    def dispatch_rows(lo, hi):
+        """Send this member's routed token rows `lo..hi` (send order) to the
+        row each owner's sorted lhs reserves for them; the owner counts
+        arrivals per local group."""
+        ar = arrival
+        sc = scatter
+        assert ar is not None and sc is not None
+        me = sc.me[0]
+
+        def send(i, remote):
+            member = ar.send_member[i]
+            src = ar.tokens.at[pl.ds(ar.send_token[i], 1)]
+            dst = ar.landing.at[pl.ds(ar.send_row[i], 1)]
+            sem = ar.arrive_sems.at[ar.send_group[i]]
+            is_local = member == me
+
+            @pl.when(is_local)
+            def _():
+                pltpu.make_async_copy(src, dst, sem).start()
+
+            @pl.when(jnp.logical_not(is_local))
+            def _():
+                pltpu.make_async_remote_copy(
+                    src,
+                    dst,
+                    ar.send_sem.at[0],
+                    sem,
+                    device_id=member_device(member, sc.axis, sc.num_members),
+                    device_id_type=pl.DeviceIdType.MESH,
+                ).start()
+
+            return remote + 1 - is_local.astype(jnp.int32)
+
+        ar.sent[0] = lax.fori_loop(lo, hi, send, ar.sent[0])
+
+    def issue_sends(group_id):
+        """Start the sends of the owner groups below `group_id + window` that
+        have not started (every send with window 0). Sends are in group order,
+        so a member that waits for group g's rows has started its own sends of
+        every group up to g, and the waits cannot deadlock."""
+        ar = arrival
+        assert ar is not None
+        if ar.window:
+            hi = ar.send_offsets[jnp.minimum(group_id + ar.window, dims.size_group)]
+        else:
+            hi = ar.num_sends[0]
+        lo = ar.issued[0]
+
+        @pl.when(hi > lo)
+        def _():
+            with jax.named_scope("mlp_issue"):
+                dispatch_rows(lo, hi)
+            ar.issued[0] = hi
+
+        sc = scatter
+        assert sc is not None
+        ex = sc.extra
+        if ex is not None:
+            # The extra rows go out once every dispatch row has been started,
+            # so no dispatch row queues behind them.
+            @pl.when(jnp.logical_and(hi == ar.num_sends[0], ar.extra_sent[0] == 0))
+            def _():
+                send_extra_rows(sc, ex)
+                ar.extra_sent[0] = 1
+
+    def wait_arrival(group_id):
+        ar = arrival
+        assert ar is not None
+        size = lhs_group_sizes_ref[group_offset + group_id]
+        wait_rows(ar.arrive_sems.at[group_id], ar.landing, size)
+
     # The first tile's weights start copying before the metadata loop: the
     # first local group with rows, which fill_metadata assigns to tile 0.
     group_offset = group_offset_ref[0]
@@ -1837,6 +1973,11 @@ def _mlp_kernel(
         member_barrier(scatter.axis, scatter.num_members)
         for i in range(4):
             scatter.in_flight[i] = 0
+    if arrival is not None:
+        arrival.sent[0] = 0
+        arrival.issued[0] = 0
+        arrival.extra_sent[0] = 0
+        issue_sends(jnp.int32(0))
 
     tiled = dataclasses.replace(up, tiles=dataclasses.replace(up.tiles, tile_m=tile_m))
     num_gm = fill_metadata(
@@ -1872,41 +2013,6 @@ def _mlp_kernel(
                 acc_n += block_acc
             acc_list.append(acc_n)
         return jnp.concatenate(acc_list, axis=1)
-
-    def send_extra_rows(sc: ScatterRefs, ex: ExtraRowRefs):
-        """Send every `extra` row to its member's second receive buffer now;
-        the transfers overlap the expert compute."""
-        me = sc.me[0]
-
-        def send(i, counts):
-            member = ex.member[i]
-            src = ex.rows.at[pl.ds(i, 1)]
-            dst = ex.recv.at[pl.ds(ex.row[i], 1)]
-            is_local = member == me
-
-            @pl.when(is_local)
-            def _():
-                pltpu.make_async_copy(src, dst, ex.sems.at[1]).start()
-
-            @pl.when(jnp.logical_not(is_local))
-            def _():
-                pltpu.make_async_remote_copy(
-                    src,
-                    dst,
-                    ex.sems.at[0],
-                    ex.sems.at[2],
-                    device_id=member_device(member, sc.axis, sc.num_members),
-                    device_id_type=pl.DeviceIdType.MESH,
-                ).start()
-
-            local = is_local.astype(jnp.int32)
-            return counts[0] + 1 - local, counts[1] + local
-
-        remote, local = lax.fori_loop(
-            0, ex.expected[1], send, (jnp.int32(0), jnp.int32(0))
-        )
-        ex.counts[0] = remote
-        ex.counts[1] = local
 
     def send_tile_rows(slot, m_offset, m_start_local, m_end_local):
         """Send the tile's rows from stage `slot`: row `i` of the block is row
@@ -1947,8 +2053,65 @@ def _mlp_kernel(
         sc.in_flight[slot] = remote
         sc.in_flight[2 + slot] = local
 
-    def body(tiled_lhs_ref, tiled_out_ref=None):
-        gm_id = pl.program_id(0)
+    def tile_bucket(gm_id):
+        """Index in `cfgs.bucket_ms` of the rows tile `gm_id` computes: from
+        its first sublane block to its last row, as the matmul picks it."""
+        m_start = metadata_ref.gm_id_to_m_offset[gm_id]
+        m_end = metadata_ref.gm_id_to_m_offset[gm_id + 1]
+        m_end_local = m_end - (m_start - m_start % sub)
+        return sum(
+            (m_end_local > b).astype(jnp.int32) for b in cfgs.bucket_ms[:-1]
+        ) + jnp.int32(0)
+
+    def lhs_copy(m_offset, slot, bucket, op):
+        """Start (`op` "start") or wait for ("wait") the copy of a tile's
+        rows into lhs `slot`: only the rows of its bucket."""
+        ar = arrival
+        assert ar is not None
+        for i, rows in enumerate(cfgs.bucket_ms):
+
+            @pl.when(bucket == i)
+            def _(rows=rows):
+                copy = pltpu.make_async_copy(
+                    ar.landing.at[pl.ds(m_offset, rows)],
+                    ar.lhs.at[slot, pl.ds(0, rows)],
+                    ar.lhs_sems.at[slot],
+                )
+                if op == "start":
+                    copy.start()
+                else:
+                    copy.wait()
+
+    def load_lhs(gm_id, slot, group_id, is_new_group, m_offset, bucket):
+        """The tile's rows in VMEM: a group's first tile waits for all of the
+        group's rows to land, then copies (with `prefetch`, only the first
+        tile of all); later tiles were prefetched."""
+        ar = arrival
+        assert ar is not None
+        copy_here = is_new_group
+        if ar.prefetch:
+            copy_here = gm_id == 0
+
+        @pl.when(copy_here)
+        def _():
+            issue_sends(group_id)
+            with jax.named_scope("mlp_wait_arrival"):
+                wait_arrival(group_id)
+            lhs_copy(m_offset, slot, bucket, "start")
+
+        with jax.named_scope("mlp_wait_lhs"):
+            lhs_copy(m_offset, slot, bucket, "wait")
+        # One relayout per tile to the matmul layout, shared by the parts.
+        with jax.named_scope("mlp_relayout"):
+            for i, rows in enumerate(cfgs.bucket_ms):
+
+                @pl.when(bucket == i)
+                def _(rows=rows):
+                    ar.lhs_rows[:rows] = ar.lhs[slot, :rows].reshape(rows, size_k)
+
+    def body(tiled_lhs_ref, tiled_out_ref=None, *, gm_id=None):
+        if gm_id is None:
+            gm_id = pl.program_id(0)
         slot = lax.rem(gm_id, 2) if scatter is not None else None
         group_id = metadata_ref.gm_id_to_group_id[gm_id]
         prev_group_id = metadata_ref.gm_id_to_group_id[jnp.maximum(gm_id - 1, 0)]
@@ -1970,7 +2133,10 @@ def _mlp_kernel(
             return jnp.logical_and(m_start_local <= iota, iota < m_end_local)
 
         def up_part(p: int, bucket_m: int):
-            tiled_lhs = tiled_lhs_ref.reshape(-1, size_k)[:bucket_m]
+            if arrival is not None:
+                tiled_lhs = arrival.lhs_rows[:bucket_m]
+            else:
+                tiled_lhs = tiled_lhs_ref.reshape(-1, size_k)[:bucket_m]
             gate = WeightsRef(
                 weight=w1_gate_slots.at[p], scale=s1_gate_slots.at[p], bias=None
             )
@@ -2011,6 +2177,26 @@ def _mlp_kernel(
             (m_end_local > b).astype(jnp.int32) for b in bucket_ms[:-1]
         ) + jnp.int32(0)
 
+        def prefetch_next_group():
+            # The next group's first tile, once all of its rows have landed:
+            # the copy overlaps this tile's compute and sends.
+            @pl.when(fetch_next)
+            def _():
+                issue_sends(next_group_id)
+                with jax.named_scope("mlp_wait_arrival_next"):
+                    wait_arrival(next_group_id)
+                lhs_copy(next_offset, next_slot, next_bucket, "start")
+
+        if arrival is not None:
+            assert slot is not None
+            next_slot = 1 - slot
+            next_offset = metadata_ref.gm_id_to_m_offset[jnp.minimum(gm_id + 1, num_gm)]
+            next_offset = next_offset - next_offset % sub
+            next_bucket = tile_bucket(jnp.minimum(gm_id + 1, num_gm - 1))
+            load_lhs(gm_id, slot, group_id, is_new_group, m_offset, bucket_idx)
+            if arrival.prefetch == 2:
+                prefetch_next_group()
+
         for p in range(cfgs.num_parts):
             with jax.named_scope(f"mlp_wait_up{p}"):
 
@@ -2027,6 +2213,15 @@ def _mlp_kernel(
             @pl.when(fetch_next)
             def _(p=p):
                 start(up_copies(p, next_group_id))
+
+        if arrival is not None:
+            # The next tile of the same group: its rows have all landed.
+            @pl.when(jnp.logical_and(has_next, next_group_id == group_id))
+            def _():
+                lhs_copy(next_offset, next_slot, next_bucket, "start")
+
+            if arrival.prefetch == 1:
+                prefetch_next_group()
 
         # The gate/up kernel stores its rows with `out[0] += partial` in each of
         # its gm tiles, and the next tile adds this tile's last partial sublane
@@ -2099,12 +2294,25 @@ def _mlp_kernel(
     index_maps = MlpIndexMaps(metadata_ref, sub)
     bounded = pl.BoundedSlice(tile_m // sub)
     lhs_spec = pl.BlockSpec((bounded, sub, size_k), index_maps.lhs_index_map)
-    lhs_in = lhs_ref.reshape(-1, sub, lhs_ref.shape[-1])
     if scatter is not None:
-        if scatter.extra is not None:
+        if scatter.extra is not None and arrival is None:
             send_extra_rows(scatter, scatter.extra)
-        pipeline_fn = pltpu.emit_pipeline(body, grid=(num_gm,), in_specs=(lhs_spec,))
-        pipeline_fn(lhs_in)
+        if arrival is not None:
+
+            def tile(gm_id, carry):
+                body(None, gm_id=gm_id)
+                return carry
+
+            lax.fori_loop(0, num_gm, tile, 0)
+            # Sends of the groups no tile here waited for.
+            issue_sends(jnp.int32(dims.size_group))
+            with jax.named_scope("mlp_tail"):
+                wait_rows(arrival.send_sem.at[0], arrival.landing, arrival.sent[0])
+        else:
+            pipeline_fn = pltpu.emit_pipeline(
+                body, grid=(num_gm,), in_specs=(lhs_spec,)
+            )
+            pipeline_fn(lhs_ref.reshape(-1, sub, lhs_ref.shape[-1]))
         # Every row sent from here has left, and every row bound here has landed.
         for i in range(2):
             wait_rows(scatter.send_sems.at[i], scatter.recv, scatter.in_flight[i])
@@ -2121,7 +2329,7 @@ def _mlp_kernel(
         body, grid=(num_gm,), in_specs=(lhs_spec,), out_specs=out_spec
     )
     out_in = out_ref.reshape(-1, sub, out_ref.shape[-1])
-    pipeline_fn(lhs_in, out_in)
+    pipeline_fn(lhs_ref.reshape(-1, sub, lhs_ref.shape[-1]), out_in)
 
 
 def mlp_supported(
@@ -2608,3 +2816,339 @@ def gmm_v2_mlp_scatter(
         name=name,
         cost_estimate=cost,
     )(*prefetch, *inputs)
+
+
+def mlp_exchange_kernel_main(
+    *refs,
+    cfgs: MlpConfigs,
+    axis,
+    num_members,
+    extra: bool,
+    window: int,
+    prefetch: int,
+):
+    """Entry point of `gmm_v2_mlp_exchange` (refs: scalar prefetch, inputs,
+    outputs, scratch; the `extra` ones present when `extra`)."""
+    refs = list(refs)
+
+    def take(n):
+        out = refs[:n]
+        del refs[:n]
+        return out
+
+    group_sizes, group_offset, dest_member, dest_row, me, expected = take(6)
+    extra_prefetch = take(3) if extra else []
+    send_token, send_member, send_row, send_group, num_sends, send_offsets = take(6)
+    tokens, w1, s1, w2, s2 = take(5)
+    extra_inputs = take(1) if extra else []
+    recv = take(1)[0]
+    extra_outputs = take(1) if extra else []
+    landing = take(1)[0]
+    (
+        w1_gate_slots,
+        w1_up_slots,
+        s1_gate_slots,
+        s1_up_slots,
+        w2_slots,
+        s2_slots,
+        inter_ref,
+        metadata_ref,
+        group_start_ref,
+        sems,
+        stage_ref,
+        send_sems,
+        local_sems,
+        recv_sem,
+        in_flight_ref,
+    ) = take(15)
+    extra_scratch = take(2) if extra else []
+    lhs_buf, lhs_rows, lhs_sems, arrive_sems, dispatch_sem, sent, issued, extra_sent = (
+        take(8)
+    )
+    assert not refs
+    extra_refs = None
+    if extra:
+        extra_member, extra_row, extra_expected = extra_prefetch
+        (extra_rows,) = extra_inputs
+        (extra_recv,) = extra_outputs
+        extra_sems, extra_counts = extra_scratch
+        extra_refs = ExtraRowRefs(
+            rows=extra_rows,
+            member=extra_member,
+            row=extra_row,
+            expected=extra_expected,
+            recv=extra_recv,
+            sems=extra_sems,
+            counts=extra_counts,
+        )
+    _mlp_kernel(
+        group_sizes,
+        group_offset,
+        None,
+        w1,
+        s1,
+        w2,
+        s2,
+        w1_gate_slots,
+        w1_up_slots,
+        s1_gate_slots,
+        s1_up_slots,
+        w2_slots,
+        s2_slots,
+        inter_ref,
+        metadata_ref,
+        group_start_ref,
+        sems,
+        cfgs=cfgs,
+        out_ref=None,
+        partial_out_ref=None,
+        scatter=ScatterRefs(
+            dest_member=dest_member,
+            dest_row=dest_row,
+            me=me,
+            expected=expected,
+            recv=recv,
+            stage=stage_ref,
+            send_sems=send_sems,
+            local_sems=local_sems,
+            recv_sem=recv_sem,
+            in_flight=in_flight_ref,
+            axis=axis,
+            num_members=num_members,
+            extra=extra_refs,
+        ),
+        arrival=ArrivalRefs(
+            send_token=send_token,
+            send_member=send_member,
+            send_row=send_row,
+            send_group=send_group,
+            num_sends=num_sends,
+            send_offsets=send_offsets,
+            tokens=tokens,
+            landing=landing,
+            lhs=lhs_buf,
+            lhs_rows=lhs_rows,
+            lhs_sems=lhs_sems,
+            arrive_sems=arrive_sems,
+            send_sem=dispatch_sem,
+            sent=sent,
+            issued=issued,
+            extra_sent=extra_sent,
+            window=window,
+            prefetch=prefetch,
+        ),
+    )
+
+
+@jax.jit(
+    static_argnames=[
+        "size_m",
+        "num_recv_rows",
+        "num_extra_recv_rows",
+        "axis",
+        "num_members",
+        "collective_id",
+        "fuse_act",
+        "num_parts",
+        "buckets",
+        "tile_rows",
+        "vmem_limit_bytes",
+        "maybe_quantize_lhs",
+        "rhs_quant_dtype",
+        "window",
+        "prefetch",
+    ]
+)
+def gmm_v2_mlp_exchange(
+    tokens: jax.Array,  # [num_tokens, size_k] this member's token rows
+    w1: jax.Array,  # [size_group, size_k, 2 * size_inter]
+    w2: jax.Array,  # [size_group, size_inter, size_n]
+    group_sizes: jax.Array,  # int32[size_group] rows each local group receives
+    w1_scale: jax.Array,  # [size_group, num_blocks, 1, 2 * size_inter]
+    w2_scale: jax.Array,  # [size_group, num_blocks, 1, size_n]
+    group_offset: jax.Array,  # int32[1]
+    dest_member: jax.Array,  # int32[size_m] member each lhs row's output goes to
+    dest_row: jax.Array,  # int32[size_m]
+    me: jax.Array,  # int32[1]
+    expected: jax.Array,  # int32[1] output rows other members send here
+    send_token: jax.Array,  # int32[num_sends]
+    send_member: jax.Array,  # int32[num_sends]
+    send_row: jax.Array,  # int32[num_sends]
+    send_group: jax.Array,  # int32[num_sends]
+    num_sends: jax.Array,  # int32[1]
+    send_offsets: jax.Array,  # int32[size_group + 1]
+    extra: tuple[jax.Array, ...] | None = None,
+    *,
+    size_m: int,
+    num_recv_rows: int,
+    num_extra_recv_rows: int = 0,
+    axis: str | tuple[str, ...],
+    num_members: int | tuple[int, ...],
+    collective_id: int,
+    fuse_act: str,
+    num_parts: int = 2,
+    buckets: tuple[int, ...] | None = None,
+    tile_rows: int | None = None,
+    vmem_limit_bytes: int | None = None,
+    maybe_quantize_lhs: bool = True,
+    rhs_quant_dtype: jnp.dtype | None = None,
+    window: int = 0,
+    prefetch: int = 0,
+) -> jax.Array:
+    """`gmm_v2_mlp_scatter` that also receives its lhs from the members.
+
+    Send `j < num_sends[0]` copies token row `send_token[j]` to lhs row
+    `send_row[j]` of member `send_member[j]`, counted on that member's local
+    group `send_group[j]`. Each member computes a group's tiles as soon as all
+    `group_sizes` rows of that group have landed, instead of after the whole
+    exchange. lhs rows are routed rows sorted by group as in `gmm_v2_mlp`
+    (`size_m` of them); outputs go out as in `gmm_v2_mlp_scatter`, which also
+    gives the result, and the `extra` rows once this member has started its
+    last row send.
+
+    Sends are in group order; `send_offsets[g]` is the first send of group g
+    (`send_offsets[size_group] == num_sends[0]`). With `window` w > 0 a member
+    starts the sends of groups below w at entry and those below g + w just
+    before it waits for group g's rows; with 0, all at entry. With `prefetch`
+    each group's first tile is copied in during the previous group's last
+    tile: 1 after that tile's gate/up projection, 2 before it, so the copy is
+    queued ahead of the group's weight copies.
+    """
+
+    size_k = tokens.shape[1]
+    size_lhs_sublane = _get_lhs_sublane_size(tokens.dtype, size_m)
+    if size_m % size_lhs_sublane:
+        raise ValueError("size_m must be a multiple of the lhs sublane tile")
+    if vmem_limit_bytes is None:
+        vmem_limit_bytes = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.96)
+    shape = jax.ShapeDtypeStruct((size_m, size_k), tokens.dtype)
+    cfgs = make_mlp_configs(
+        shape,
+        w1,
+        w1_scale,
+        w2,
+        w2_scale,
+        group_sizes,
+        group_offset,
+        fuse_act=fuse_act,
+        num_parts=num_parts,
+        down_parts=1,
+        buckets=buckets,
+        tile_rows=tile_rows,
+        maybe_quantize_lhs=maybe_quantize_lhs,
+        rhs_quant_dtype=rhs_quant_dtype,
+    )
+    if (
+        cfgs is None
+        or not scatter_rows_supported(tokens.dtype, cfgs.down.dims.size_n)
+        or not scatter_rows_supported(tokens.dtype, size_k)
+    ):
+        raise ValueError("gmm_v2_mlp_exchange does not support these inputs")
+    up, down = cfgs.up, cfgs.down
+    dims = up.dims
+    sub = dims.size_lhs_sublane
+    part = cfgs.part_size
+    size_n = down.dims.size_n
+    row_sub = SCATTER_ROW_SUBLANES
+
+    w1_scale = w1_scale.astype(jnp.float32)
+    w2_scale = w2_scale.astype(jnp.float32)
+    nb1 = w1_scale.shape[1]
+    nb2 = w2_scale.shape[1]
+
+    max_num_gm = dims.size_group + pl.cdiv(dims.size_m, cfgs.tile_m) - 1
+    scratch_shapes = [
+        pltpu.VMEM((num_parts, dims.size_k, part), w1.dtype),
+        pltpu.VMEM((num_parts, dims.size_k, part), w1.dtype),
+        pltpu.VMEM((num_parts, nb1, 1, part), jnp.float32),
+        pltpu.VMEM((num_parts, nb1, 1, part), jnp.float32),
+        pltpu.VMEM((1, cfgs.size_inter, size_n), w2.dtype),
+        pltpu.VMEM((1, nb2, 1, size_n), jnp.float32),
+        pltpu.VMEM((cfgs.tile_m // sub, sub, cfgs.size_inter), up.out_dtype),
+        MetadataRef(
+            gm_id_to_group_id=pltpu.SMEM((max_num_gm,), jnp.int32),
+            gm_id_to_m_offset=pltpu.SMEM((max_num_gm + 1,), jnp.int32),
+        ),
+        pltpu.SMEM((1,), jnp.int32),
+        pltpu.SemaphoreType.DMA((num_parts + 1,)),
+        pltpu.VMEM((2, cfgs.tile_m, row_sub, size_n // row_sub), tokens.dtype),
+        pltpu.SemaphoreType.DMA((2,)),
+        pltpu.SemaphoreType.DMA((2,)),
+        pltpu.SemaphoreType.DMA((1,)),
+        pltpu.SMEM((4,), jnp.int32),
+    ]
+    if extra is not None:
+        scratch_shapes += [pltpu.SemaphoreType.DMA((3,)), pltpu.SMEM((2,), jnp.int32)]
+    scratch_shapes += [
+        pltpu.VMEM((2, cfgs.tile_m, row_sub, size_k // row_sub), tokens.dtype),
+        pltpu.VMEM((cfgs.tile_m, size_k), tokens.dtype),
+        pltpu.SemaphoreType.DMA((2,)),
+        pltpu.SemaphoreType.DMA((dims.size_group,)),
+        pltpu.SemaphoreType.DMA((1,)),
+        pltpu.SMEM((1,), jnp.int32),
+        pltpu.SMEM((1,), jnp.int32),
+        pltpu.SMEM((1,), jnp.int32),
+    ]
+    cost_up = get_cost_estimate(up)
+    cost_down = get_cost_estimate(down)
+    cost = pl.CostEstimate(
+        flops=cost_up.flops + cost_down.flops,
+        bytes_accessed=cost_up.bytes_accessed + cost_down.bytes_accessed,
+        transcendentals=0,
+    )
+    name = (
+        f"gmm_v2_mlp_exchange-g_{dims.size_group}-m_{dims.size_m}-k_{dims.size_k}"
+        f"-act_{fuse_act}-n_{dims.size_n}-n2_{size_n}-tm_{cfgs.tile_m}"
+        f"-bm_{'_'.join(map(str, cfgs.bucket_ms))}-p_{num_parts}-c{collective_id}"
+        f"-w_{window}{f'p{prefetch}' if prefetch else ''}"
+    )
+    hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+    row_view = tokens.reshape(tokens.shape[0], row_sub, size_k // row_sub)
+    recv_shape = pltpu.HBM((num_recv_rows, row_sub, size_n // row_sub), tokens.dtype)
+    landing_shape = pltpu.HBM(
+        (size_m + cfgs.tile_m, row_sub, size_k // row_sub), tokens.dtype
+    )
+    prefetch_args = [group_sizes, group_offset, dest_member, dest_row, me, expected]
+    inputs = [pltpu.with_memory_space_constraint(row_view, pltpu.HBM)]
+    inputs += [w1, w1_scale, w2, w2_scale]
+    out_shape = [recv_shape]
+    if extra is not None:
+        extra_rows, extra_member, extra_row, extra_expected = extra
+        prefetch_args += [extra_member, extra_row, extra_expected]
+        inputs += [pltpu.with_memory_space_constraint(extra_rows, pltpu.HBM)]
+        out_shape.append(
+            pltpu.HBM((num_extra_recv_rows,) + extra_rows.shape[1:], extra_rows.dtype)
+        )
+        name += "-x"
+    out_shape.append(landing_shape)
+    prefetch_args += [send_token, send_member, send_row, send_group, num_sends]
+    prefetch_args += [send_offsets]
+    # Every output is pinned to HBM: other members write into them.
+    out = pl.pallas_call(
+        functools.partial(
+            mlp_exchange_kernel_main,
+            cfgs=cfgs,
+            axis=axis,
+            num_members=num_members,
+            extra=extra is not None,
+            window=window,
+            prefetch=prefetch,
+        ),
+        out_shape=tuple(out_shape),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=len(prefetch_args),
+            in_specs=[hbm] * len(inputs),
+            out_specs=(hbm,) * len(out_shape),
+            scratch_shapes=scratch_shapes,
+        ),
+        compiler_params=pltpu.CompilerParams(
+            vmem_limit_bytes=vmem_limit_bytes,
+            disable_bounds_checks=True,
+            collective_id=collective_id,
+        ),
+        name=name,
+        cost_estimate=cost,
+    )(*prefetch_args, *inputs)
+    if extra is not None:
+        return out[0], out[1]
+    return out[0]

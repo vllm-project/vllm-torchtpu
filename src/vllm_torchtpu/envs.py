@@ -125,6 +125,7 @@ if TYPE_CHECKING:
     TPU_MOE_A2A_STREAMED_COMBINE: bool = False
     TPU_MOE_A2A_OWNER_COMBINE: bool = False
     TPU_MOE_A2A_SORTED_PLAN: bool = False
+    TPU_MOE_A2A_EXPERT_ARRIVAL: bool = False
     TPU_MOE_EXPERT_PLACEMENT: str = ""
     TPU_MOE_ROUTING_REPLAY: str = ""
     PCP_FA_KERNEL_BLOCK_SIZE: int | None = None
@@ -903,6 +904,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # routing, carrying each route's destination, instead of reading,
     # sorting and looking up the received rows' routes.
     "TPU_MOE_A2A_SORTED_PLAN": env_bool("TPU_MOE_A2A_SORTED_PLAN"),
+    # Ragged all-to-all exchange with the streamed or owner combine: where the
+    # capacity exchange takes the fused expert kernel, that kernel also sends
+    # each routed token row straight to its expert's member and starts each
+    # expert as soon as its rows have landed, instead of a ragged all-to-all
+    # and a reorder of the received rows before it (same outputs, bitwise).
+    "TPU_MOE_A2A_EXPERT_ARRIVAL": env_bool("TPU_MOE_A2A_EXPERT_ARRIVAL"),
     # Place each named MoE layer's experts by this .npz (logical expert ->
     # physical slot, e.g. balanced on routing counts; see
     # layers/core/expert_placement.py). Unset = linear placement.
