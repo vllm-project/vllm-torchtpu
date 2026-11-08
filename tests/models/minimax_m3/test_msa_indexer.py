@@ -241,8 +241,8 @@ def test_fp4_folded_matches_reference(q_lens, ctx_lens, pages_per_step):
         for t in range(cu_q[r], cu_q[r + 1]):
             for b in range(num_pages):
                 expected = (keys[tables[r, b]] @ queries[t]).max()
-                # Keys are scaled in bf16 before the dot (msa_indexer.SCALE_KEYS).
-                np.testing.assert_allclose(scores[t, b], expected, rtol=2e-2, atol=5e-2)
+                # Kernel v3 scales the f32 scores (both classes here).
+                np.testing.assert_allclose(scores[t, b], expected, rtol=1e-4, atol=1e-3)
 
 
 @pytest.mark.parametrize("tokens", [8, 256])

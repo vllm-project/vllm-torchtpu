@@ -705,7 +705,8 @@ def block_scores(
       seq_lens, block_tables, cu_q_lens, num_seqs: ragged batch metadata.
       kernel: ``"v2"`` (bitcast unpack, query latched across pages), ``"v3"``
         (v2 with a hand-written DMA ring for the pages) or the original
-        ``"v1"``, kept as the reference arm for benchmarks.
+        ``"v1"``, kept as the reference arm for benchmarks. A 4-bit cache
+        without folded scales runs v2 where v3 is asked for.
       large_kernel: the same choice for the `large_block_q` tiles.
       pages_per_step / small_pages_per_step: pages per grid step of the large
         and the block_q tile classes.
@@ -750,7 +751,10 @@ def block_scores(
     # Large requests have more than block_q tokens each.
     max_large = min(max_num_seqs, num_tokens // (block_q + 1))
     # Kernel v3 reads 4-bit pages with folded scales only.
-    small_kernel = "v2" if kernel == "v3" and scale_row is not None else kernel
+    small_kernel, large_kernel = (
+        "v2" if k == "v3" and scale_row is not None else k
+        for k in (kernel, large_kernel)
+    )
     # Token-major scores make the gather back to token order a row gather; a
     # column gather first relayouts the whole padded [P, tiles * block_q] f32
     # block (36 us per layer in the c48 decode twin, j-a281ffb0). Needs
@@ -783,9 +787,19 @@ def block_scores(
         kernel=small_kernel,
         token_major=token_major,
     )
-    small = small[small_col] if token_major else small[:, small_col].T
+    # The classes may pad pages to different group multiples; pad to the wider.
+    pages_per_seq = block_tables.shape[0] // max_num_seqs
+    pages = max(
+        small.shape[1 if token_major else 0],
+        -(-pages_per_seq // pages_per_step) * pages_per_step,
+    )
+
+    def small_only():
+        rows = small[small_col] if token_major else small[:, small_col].T
+        return jnp.pad(rows, ((0, 0), (0, pages - rows.shape[1])))
+
     if max_large == 0:
-        return small[:, None, :]
+        return small_only()[:, None, :]
 
     def with_large():
         large, large_col = score(
@@ -800,8 +814,7 @@ def block_scores(
             pages_per_step=pages_per_step,
             kernel=large_kernel,
         )
-        large = large[:, large_col].T
-        large = jnp.pad(large, ((0, 0), (0, pages - large.shape[1])))
+        small_t = small.T if token_major else small
         tok = jnp.arange(num_tokens, dtype=jnp.int32)
         seq = jnp.minimum(
             jnp.searchsorted(
@@ -809,13 +822,13 @@ def block_scores(
             ).astype(jnp.int32),
             max_num_seqs - 1,
         )
-        return jnp.where(is_large[seq][:, None], large, small)
+        # One gather over both classes' columns (XLA fuses the concatenate
+        # into it) instead of a transposing gather per class and a select.
+        col = jnp.where(is_large[seq], small_t.shape[1] + large_col, small_col)
+        small_t, large = (
+            jnp.pad(x, ((0, pages - x.shape[0]), (0, 0))) for x in (small_t, large)
+        )
+        return jnp.concatenate([small_t, large], axis=1)[:, col].T
 
-    # The classes may pad pages to different group multiples; pad to the wider.
-    pages = max(
-        small.shape[1],
-        -(-block_tables.shape[0] // max_num_seqs // pages_per_step) * pages_per_step,
-    )
-    small = jnp.pad(small, ((0, 0), (0, pages - small.shape[1])))
     # Decode steps have no large request: skip its kernel call and gather.
-    return jax.lax.cond(jnp.any(is_large), with_large, lambda: small)[:, None, :]
+    return jax.lax.cond(jnp.any(is_large), with_large, small_only)[:, None, :]
