@@ -100,6 +100,8 @@ from vllm_torchtpu.offload.raiden_staging import (
     StagedStepOutput,
     StagedTransferScheduler,
     StagingBuffer,
+    layout_from_tensors,
+    staging_hbm_reserve_bytes,
 )
 from vllm_torchtpu.offload.raiden_store import (
     AdmissionOp,
@@ -967,13 +969,32 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
                 f"own its storage; got shape {tuple(pool.shape)} over "
                 f"{storage_bytes} bytes"
             )
+        # The KV cache budget reserved these rows before the pool was sized
+        # (`TPUModelRunner.post_profile_hbm_reserves`); rows bigger than the
+        # reserve would be uncounted HBM, so refuse them before allocating.
+        layout = layout_from_tensors(pools, num_blocks, self._staging_blocks)
+        assert self.connector_worker is not None
+        leaves = {}
+        for group in self.connector_worker.kv_cache_config.kv_cache_groups:
+            nested = getattr(group.kv_cache_spec, "kv_cache_specs", None)
+            leaves.update(
+                nested or dict.fromkeys(group.layer_names, group.kv_cache_spec)
+            )
+        reserved = staging_hbm_reserve_bytes(self._vllm_config, leaves)
+        allocated = layout.rows * layout.row_bytes
+        if allocated > reserved:
+            raise RuntimeError(
+                "TPURaidenOffloadingConnector: staging rows take "
+                f"{allocated} bytes of HBM but the KV cache budget reserved "
+                f"{reserved}; the rows would be uncounted"
+            )
         staging = StagingBuffer(
             pools,
             num_blocks=num_blocks,
             rows=self._staging_blocks,
             device=pools[0].device,
         )
-        layout = staging.layout
+
         from vllm_torchtpu.utils import synchronize_tensors
 
         with torch.no_grad():

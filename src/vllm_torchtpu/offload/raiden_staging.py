@@ -96,6 +96,81 @@ def parse_staging_blocks(extra_config: Mapping[str, Any]) -> int:
     return rows
 
 
+def padded_row_bytes(payload_bytes: int) -> int:
+    """A staging row holding `payload_bytes` of pages, tile-padded."""
+    return -(-payload_bytes // _ROW_ALIGN_BYTES) * _ROW_ALIGN_BYTES
+
+
+_CONNECTOR_NAME = "TPURaidenOffloadingConnector"
+
+
+def staging_extra_config(vllm_config: Any) -> Mapping[str, Any] | None:
+    """The extra config of the Raiden offload connector, top level or a child
+    of a multi-connector; None without one."""
+    kv_tc = getattr(vllm_config, "kv_transfer_config", None)
+    if kv_tc is None:
+        return None
+    extra = kv_tc.kv_connector_extra_config or {}
+    if kv_tc.kv_connector == _CONNECTOR_NAME:
+        return extra
+    for child in extra.get("connectors", None) or ():
+        if isinstance(child, Mapping) and child.get("kv_connector") == _CONNECTOR_NAME:
+            return child.get("kv_connector_extra_config") or {}
+    return None
+
+
+def staged_layer_page_bytes(
+    kv_cache_specs: Mapping[str, Any], skip_draft_kv: bool
+) -> dict[str, int]:
+    """Per offloaded layer, its page bytes: what one staging row holds.
+
+    `kv_cache_specs` maps layer names to leaf specs. The drafter's layers
+    (non-MLA attention with a sliding window next to MLA caches, see
+    `raiden_store.draft_kv_layer_names`) are left out with `skip_draft_kv`.
+    """
+    from vllm.v1.kv_cache_interface import AttentionSpec, MLAAttentionSpec
+
+    has_mla = any(isinstance(s, MLAAttentionSpec) for s in kv_cache_specs.values())
+    out: dict[str, int] = {}
+    for name, spec in kv_cache_specs.items():
+        if (
+            skip_draft_kv
+            and has_mla
+            and isinstance(spec, AttentionSpec)
+            and not isinstance(spec, MLAAttentionSpec)
+            and getattr(spec, "sliding_window", None) is not None
+        ):
+            continue
+        out[name] = int(spec.page_size_bytes)
+    return out
+
+
+def staging_hbm_reserve_bytes(
+    vllm_config: Any, kv_cache_specs: Mapping[str, Any]
+) -> int:
+    """HBM the staging rows take on this worker: 0 when staging is off.
+
+    The rows are allocated after the memory profile, so the KV cache budget
+    must leave them free (`TPUModelRunner.post_profile_hbm_reserves`).
+    `kv_cache_specs` is the runner's per-layer spec map; the worker checks
+    the rows it allocates against the same figure.
+    """
+    extra = staging_extra_config(vllm_config)
+    if extra is None:
+        return 0
+    rows = parse_staging_blocks(extra)
+    if not rows:
+        return 0
+    skip = str(extra.get("skip_draft_kv", "")).strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    pages = staged_layer_page_bytes(kv_cache_specs, skip)
+    return rows * padded_row_bytes(sum(pages.values()))
+
+
 def bucket_len(n: int) -> int:
     """Smallest compiled pair count >= n."""
     assert n > 0
@@ -181,7 +256,7 @@ class StagingLayout:
     @property
     def row_bytes(self) -> int:
         """Bytes of one staging row: the pages plus tile padding."""
-        return -(-self.payload_bytes // _ROW_ALIGN_BYTES) * _ROW_ALIGN_BYTES
+        return padded_row_bytes(self.payload_bytes)
 
     @property
     def staging_shape(self) -> tuple[int, int, int]:

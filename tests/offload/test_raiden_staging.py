@@ -34,6 +34,7 @@ import jax
 import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
+import pytest
 import torch
 
 from tests.offload import test_raiden_store_offload as base
@@ -806,3 +807,194 @@ class TestStagedNamespaceAndSpec(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# -- HBM budget: the staging rows are reserved before the KV pool is sized -----
+
+
+def _mla(page_width: int, dtype=torch.uint8):
+    from vllm.v1.kv_cache_interface import MLAAttentionSpec
+
+    return MLAAttentionSpec(
+        block_size=64, num_kv_heads=1, head_size=page_width, dtype=dtype
+    )
+
+
+def _draft():
+    from vllm.v1.kv_cache_interface import SlidingWindowSpec
+
+    return SlidingWindowSpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.float8_e4m3fn,
+        sliding_window=128,
+    )
+
+
+_SPECS = {
+    "l0.kv": _mla(640),
+    "l0.index": _mla(80),
+    "l1.kv": _mla(640),
+    "l1.index": _mla(80),
+    "draft.attn": _draft(),
+}
+
+
+def _offload_config(extra, connector="TPURaidenOffloadingConnector"):
+    return SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(
+            kv_connector=connector, kv_connector_extra_config=extra
+        )
+    )
+
+
+class TestStagingHbmReserve(unittest.TestCase):
+    def test_exact_bytes(self):
+        payload = sum(s.page_size_bytes for s in _SPECS.values())
+        row = rs.padded_row_bytes(payload)
+        self.assertGreaterEqual(row, payload)
+        self.assertEqual(row % (32 * 128), 0)
+        cfg = _offload_config({"staging_blocks": 128})
+        self.assertEqual(rs.staging_hbm_reserve_bytes(cfg, _SPECS), 128 * row)
+
+    def test_skip_draft_kv_leaves_drafter_out(self):
+        payload = sum(s.page_size_bytes for n, s in _SPECS.items() if n != "draft.attn")
+        cfg = _offload_config({"staging_blocks": 8, "skip_draft_kv": True})
+        self.assertEqual(
+            rs.staging_hbm_reserve_bytes(cfg, _SPECS), 8 * rs.padded_row_bytes(payload)
+        )
+
+    def test_child_of_multi_connector(self):
+        cfg = _offload_config(
+            {
+                "connectors": [
+                    {"kv_connector": "Other"},
+                    {
+                        "kv_connector": "TPURaidenOffloadingConnector",
+                        "kv_connector_extra_config": {"staging_blocks": 4},
+                    },
+                ]
+            },
+            connector="TPUMultiConnector",
+        )
+        payload = sum(s.page_size_bytes for s in _SPECS.values())
+        self.assertEqual(
+            rs.staging_hbm_reserve_bytes(cfg, _SPECS), 4 * rs.padded_row_bytes(payload)
+        )
+
+    def test_zero_when_off(self):
+        for cfg in (
+            SimpleNamespace(kv_transfer_config=None),
+            _offload_config({}),
+            _offload_config({"staging_blocks": 0}),
+            _offload_config({"staging_blocks": 64}, connector="OffloadingConnector"),
+        ):
+            self.assertEqual(rs.staging_hbm_reserve_bytes(cfg, _SPECS), 0)
+
+    def test_matches_the_rows_the_worker_allocates(self):
+        """The reserve is the bytes of the staging buffer built from arrays
+        of these specs' pages."""
+        num_blocks = 6
+        pools = [
+            torch.zeros((num_blocks, s.page_size_bytes), dtype=torch.int8)
+            for s in _SPECS.values()
+        ]
+        layout = rs.layout_from_tensors(pools, num_blocks, 32)
+        cfg = _offload_config({"staging_blocks": 32})
+        self.assertEqual(
+            rs.staging_hbm_reserve_bytes(cfg, _SPECS), layout.rows * layout.row_bytes
+        )
+
+
+def _runner(extra):
+    from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+    runner = object.__new__(TPUModelRunner)
+    runner.vllm_config = (
+        _offload_config(extra)
+        if extra is not None
+        else (SimpleNamespace(kv_transfer_config=None))
+    )
+    runner.get_kv_cache_spec = lambda: dict(_SPECS)
+    runner.lora_slot_write_hbm_bytes = lambda: 0
+    runner.pp_handoff_hbm_reserve_bytes = lambda: 0
+    return runner
+
+
+def _reserves(extra):
+    with patch(
+        "vllm_torchtpu.utils.estimate_kv_connector_hbm_reserve", return_value=1000
+    ):
+        return _runner(extra).post_profile_hbm_reserves()
+
+
+def test_runner_reserves_staging_bytes_exactly():
+    staged = _reserves({"staging_blocks": 128})
+    plain = _reserves({})
+    payload = sum(s.page_size_bytes for s in _SPECS.values())
+    assert staged.kv_connector - plain.kv_connector == 128 * rs.padded_row_bytes(
+        payload
+    )
+    assert plain.kv_connector == 1000
+    assert _reserves(None).kv_connector == 1000
+
+
+def test_kv_pool_shrinks_by_exactly_the_staging_bytes(monkeypatch):
+    from tests.worker import test_tpu_worker as tw
+    from vllm_torchtpu import utils
+
+    def available(extra):
+        worker = tw._ep_dp_worker(
+            monkeypatch,
+            dp_size=1,
+            expert_parallel=False,
+            local=40 * utils.GBYTES,
+            peer=40 * utils.GBYTES,
+        )
+        runner = _runner(extra)
+        worker.model_runner.post_profile_hbm_reserves.side_effect = (
+            runner.post_profile_hbm_reserves
+        )
+        with patch(
+            "vllm_torchtpu.utils.estimate_kv_connector_hbm_reserve", return_value=0
+        ):
+            return worker.determine_available_memory()
+
+    payload = sum(s.page_size_bytes for s in _SPECS.values())
+    staging_bytes = 128 * rs.padded_row_bytes(payload)
+    unset = available({})
+    assert unset == 40 * utils.GBYTES
+    assert available(None) == unset
+    assert available({"staging_blocks": 0}) == unset
+    assert unset - available({"staging_blocks": 128}) == staging_bytes
+
+
+def test_worker_refuses_rows_the_budget_did_not_reserve():
+    from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
+
+    from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingConnector
+
+    num_blocks = 6
+    specs = dict(_SPECS)
+    pools = [
+        torch.zeros((num_blocks, s.page_size_bytes), dtype=torch.int8)
+        for s in specs.values()
+    ]
+    conn = object.__new__(TPURaidenOffloadingConnector)
+    conn._staging_blocks = 16
+    group = SimpleNamespace(
+        kv_cache_spec=UniformTypeKVCacheSpecs(block_size=64, kv_cache_specs=specs),
+        layer_names=list(specs),
+    )
+    conn.connector_worker = SimpleNamespace(
+        kv_cache_config=SimpleNamespace(kv_cache_groups=[group])
+    )
+    # Reserved for fewer rows than the worker is about to allocate.
+    conn._vllm_config = _offload_config({"staging_blocks": 8})
+    with (
+        patch("vllm_torchtpu.offload.raiden_connector.StagingBuffer") as buf,
+        pytest.raises(RuntimeError, match="uncounted"),
+    ):
+        conn._init_staging(pools, num_blocks)
+    buf.assert_not_called()
