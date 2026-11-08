@@ -32,7 +32,7 @@ _INIT = '''
 """A plugin package."""
 from vllm_torchtpu.megakernel.runtime.contract import TpuMonoSpec
 {extra}
-SPEC = TpuMonoSpec("pkg", "1", create={create!r})
+SPEC = TpuMonoSpec("pkg", "1", create={create!r}{spec_kw})
 '''
 _ADAPTER = "def create(view, options):\n    return None\n"
 
@@ -45,12 +45,17 @@ def make_pkg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
     monkeypatch.syspath_prepend(str(tmp_path))
     made: list[str] = []
 
-    def make(name: str, *, create: str = ".adapter:create", extra: str = "") -> str:
+    def make(
+        name: str,
+        *,
+        create: str = ".adapter:create",
+        extra: str = "",
+        spec_kw: str = "",
+    ) -> str:
         pkg = tmp_path / name
         pkg.mkdir()
-        (pkg / "__init__.py").write_text(
-            _INIT.format(extra=extra, create=create), encoding="utf-8"
-        )
+        init = _INIT.format(extra=extra, create=create, spec_kw=spec_kw)
+        (pkg / "__init__.py").write_text(init, encoding="utf-8")
         (pkg / "adapter.py").write_text(_ADAPTER, encoding="utf-8")
         importlib.invalidate_caches()
         made.append(name)
@@ -82,6 +87,24 @@ def test_check_plugin_spec_rejects_eager_create_heavy_imports_and_bad_refs(
         testkit.check_plugin_spec(make_pkg("mk_bad_ref_pkg", create=".adapter:nope"))
     with pytest.raises(MegakernelConfigError, match="not a TpuMonoSpec"):
         testkit.check_plugin_spec(f"{TOY_MODULE}:ToyProgram")
+
+
+@pytest.mark.parametrize(
+    ("spec_kw", "error", "match"),
+    [
+        ('decline_codes=("other",)', AssertionError, "bad decline_codes"),
+        ('decline_codes=("a", "a")', AssertionError, "duplicate decline_codes"),
+        ('decline_codes=("",)', AssertionError, "bad decline_codes"),
+        ('layout_request=".adapter:nope"', MegakernelConfigError, "layout_request"),
+    ],
+    ids=["reserved_other", "duplicate", "empty", "unresolved_layout_request"],
+)
+def test_check_plugin_spec_rejects_bad_decline_codes_and_layout_request(
+    make_pkg: Any, spec_kw: str, error: type[Exception], match: str
+) -> None:
+    pkg = make_pkg("mk_bad_spec_pkg", spec_kw=f", {spec_kw}")
+    with pytest.raises(error, match=match):
+        testkit.check_plugin_spec(pkg)
 
 
 def test_run_cpu_e2e_serves_the_toy(mk_toy_plugin: Path, mk_fake_runner: Any) -> None:
@@ -152,7 +175,8 @@ def test_two_rank_gloo_agreement(tmp_path: Path, scenario: str) -> None:
     else:
         r0, r1 = testkit.assert_rank_uniform_declines(tmp_path, plugin=TOY_MODULE, **kw)
     if scenario == "serve":
-        assert r0 == r1 == {"type": "ProgramDriver", "code": None, "warmed": 2}
+        buckets = [[1, 4], [1, 8]]
+        assert r0 == r1 == {"type": "ProgramDriver", "code": None, "buckets": buckets}
     elif scenario == "decline":
         assert r0 == {"type": "DeclinedDriver", "code": "peer_declined:toy_declined"}
         assert r1 == {"type": "DeclinedDriver", "code": "toy_declined"}

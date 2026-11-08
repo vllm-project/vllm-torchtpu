@@ -275,9 +275,8 @@ try:
         cur = runner._megakernel
         res["type"] = type(cur).__name__
         res["code"] = getattr(getattr(cur, "decline", None), "code", None)
-        warmed = getattr(drv.program, "warmed", None)
-        if res["type"] == "ProgramDriver" and warmed is not None:
-            res["warmed"] = len(warmed)
+        if res["type"] == "ProgramDriver":
+            res["buckets"] = sorted([list(k) for k in drv._steps])
 except Exception as exc:
     res["raised"] = f"{type(exc).__name__}: {exc}"
 json.dump(res, open(out, "w"))
@@ -303,7 +302,9 @@ def run_two_ranks(
     timeout: float = 240,
 ) -> list[dict[str, Any]]:
     """Start `plugin` on two gloo ranks (a TP=2 fake runner each) and return
-    each rank's outcome: `{"type", "code"[, "warmed"]}` or `{"raised"}`.
+    each rank's outcome: `{"type", "code"[, "buckets"]}` or `{"raised"}`.
+    `buckets` (the driver's compiled bucket keys, `[T, B]`) is there when the
+    rank still serves after `bind_and_warmup`.
 
     `sources` (one per rank) write the single-file plugin module `plugin`
     into a per-rank directory first, e.g. to skew it on one rank;
