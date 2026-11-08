@@ -240,11 +240,22 @@ def topp_mask(
 
 
 def apply_top_k_top_p(
-    logits: torch.Tensor, top_k: torch.Tensor, top_p: torch.Tensor
+    logits: torch.Tensor,
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
+    use_top_k: bool = True,
 ) -> torch.Tensor:
-    should_apply_topk = (top_k > 0).expand(-1, logits.shape[-1])
-    topk_masked = topk_mask(logits, top_k, MASKED_LOGIT_VALUE)
-    masked_logits = torch.where(should_apply_topk, topk_masked, logits)
+    """Mask logits by per-row top-k (k > 0) and top-p (p < 1).
+
+    ``use_top_k=False`` is a static promise that every row has k == 0, so
+    the 32 vocab-wide reductions of the top-k search are not traced; the
+    result is unchanged. Callers pass it from the batch's sampling params.
+    """
+    masked_logits = logits
+    if use_top_k:
+        should_apply_topk = (top_k > 0).expand(-1, logits.shape[-1])
+        topk_masked = topk_mask(logits, top_k, MASKED_LOGIT_VALUE)
+        masked_logits = torch.where(should_apply_topk, topk_masked, logits)
 
     should_apply_topp = (top_p < 1.0).expand(-1, masked_logits.shape[-1])
     topp_masked = topp_mask(masked_logits, top_p, MASKED_LOGIT_VALUE)

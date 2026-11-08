@@ -351,6 +351,11 @@ def _substitute_placeholder_token(
 logger = init_logger(__name__)
 
 
+# (greedy, top_k) per real spec-decode warmup pass. Samplers with and without
+# top-k are distinct programs; any 0 < top_k < vocab routes the top-k one.
+_SPEC_WARMUP_SAMPLING = ((True, 0), (False, 0), (False, 20))
+
+
 def _spec_warmup_all_token_ids(
     req_ids: list[str], num_computed_tokens: list[int]
 ) -> dict[str, list[int]]:
@@ -4477,6 +4482,7 @@ class TPUModelRunner(GPUModelRunner):
                     )
                 )
                 bonus_u = torch.rand_like(bonus_logits, generator=sampling_generator)
+                use_top_k = self._uses_top_k(cur_start_idx, cur_end_idx)
                 bonus_token_ids = self.sample_from_logits_func(
                     bonus_logits,
                     req_temperatures,
@@ -4484,6 +4490,7 @@ class TPUModelRunner(GPUModelRunner):
                     req_top_k,
                     req_top_p,
                     all_greedy=False,
+                    use_top_k=use_top_k,
                 ).view(-1)
         accept_u = None
         assert self.rejection_sampler is not None
@@ -4527,6 +4534,7 @@ class TPUModelRunner(GPUModelRunner):
             accept_u=accept_u,
             recover_u=recover_u,
             do_sampling=True,
+            use_top_k=self._uses_top_k(cur_start_idx, cur_end_idx),
         )
 
     def sample_tokens(
@@ -4665,6 +4673,7 @@ class TPUModelRunner(GPUModelRunner):
                                 top_k_tpu,
                                 top_p_tpu,
                                 all_greedy=False,
+                                use_top_k=self._uses_top_k(cur_start_idx, cur_end_idx),
                             )
                     assert self.speculative_config is not None
                     padded = torch.full(
@@ -4727,6 +4736,7 @@ class TPUModelRunner(GPUModelRunner):
                             top_k_tpu,
                             top_p_tpu,
                             all_greedy=all_greedy,
+                            use_top_k=self._uses_top_k(cur_start_idx, cur_end_idx),
                         )
                 # NOTE (NickLucche) Use the original logits (before any penalties or
                 # temperature scaling) for the top-k logprobs. We can't enforce it
@@ -5935,7 +5945,12 @@ class TPUModelRunner(GPUModelRunner):
                 dummy_top_p = torch.ones((num_reqs, 1), dtype=torch.float32).to(
                     self.device
                 )
-                for all_greedy in [False, True]:
+                # Batches with and without top-k trace distinct samplers.
+                for all_greedy, use_top_k in (
+                    (False, True),
+                    (False, False),
+                    (True, True),
+                ):
                     out = self.sample_from_logits_func(
                         dummy_logits,
                         dummy_temperatures,
@@ -5943,6 +5958,7 @@ class TPUModelRunner(GPUModelRunner):
                         dummy_top_k,
                         dummy_top_p,
                         all_greedy=all_greedy,
+                        use_top_k=use_top_k,
                     )
                     synchronize_tensors(out)
                 logger.info("  -- num_seqs: %d", num_reqs)
@@ -6205,22 +6221,25 @@ class TPUModelRunner(GPUModelRunner):
                         num_tokens,
                         num_reqs,
                     )
-                    out = self.rejection_sampler(
-                        draft_token_ids=draft_token_ids,
-                        num_draft_tokens=draft_lengths,
-                        target_logits=target_logits_ng,
-                        bonus_token_ids=bonus_token_ids,
-                        segment_ids=segment_ids,
-                        group_indices=group_indices,
-                        max_draft_tokens=k,
-                        temperatures=warm_temps,
-                        top_k=warm_top_k,
-                        top_p=warm_top_p,
-                        accept_u=warm_accept_u,
-                        recover_u=warm_recover_u,
-                        do_sampling=True,
-                    )
-                    synchronize_tensors(out)
+                    # Batches with and without top-k trace distinct samplers.
+                    for use_top_k in (True, False):
+                        out = self.rejection_sampler(
+                            draft_token_ids=draft_token_ids,
+                            num_draft_tokens=draft_lengths,
+                            target_logits=target_logits_ng,
+                            bonus_token_ids=bonus_token_ids,
+                            segment_ids=segment_ids,
+                            group_indices=group_indices,
+                            max_draft_tokens=k,
+                            temperatures=warm_temps,
+                            top_k=warm_top_k,
+                            top_p=warm_top_p,
+                            accept_u=warm_accept_u,
+                            recover_u=warm_recover_u,
+                            do_sampling=True,
+                            use_top_k=use_top_k,
+                        )
+                        synchronize_tensors(out)
                     logger.info(
                         "  -- padded_logits_length: %d, num_seqs: %d",
                         num_tokens,
@@ -6603,9 +6622,9 @@ class TPUModelRunner(GPUModelRunner):
                     continue
                 # Greedy and non-greedy (do_sampling=True) verify+sample are
                 # DISTINCT fused programs, so sweep both at every prompt bucket.
-                for greedy in (True, False):
+                for greedy, top_k in _SPEC_WARMUP_SAMPLING:
                     if not self._warmup_one_spec_request(
-                        int(P), idx=i, quiet=True, greedy=greedy
+                        int(P), idx=i, quiet=True, greedy=greedy, top_k=top_k
                     ):
                         # First attempt cold-compiles the draft forward; a
                         # SymInt from that cold compile can leak into the
@@ -6613,7 +6632,9 @@ class TPUModelRunner(GPUModelRunner):
                         # once now that the forward is compiled and returns
                         # concrete-shaped tensors (this attempt logs loudly if it
                         # also fails).
-                        self._warmup_one_spec_request(int(P), idx=i, greedy=greedy)
+                        self._warmup_one_spec_request(
+                            int(P), idx=i, greedy=greedy, top_k=top_k
+                        )
             # (2) Batched spec steps. A bucketed-draft proposer depends on no
             # exact request count, so one count per program-bucket combination
             # (`_spec_warmup_bucket_grid`), each with a short decode run and a
@@ -6630,18 +6651,23 @@ class TPUModelRunner(GPUModelRunner):
                     sweep,
                 )
                 for R in sweep:
-                    self._warmup_spec_batch(
-                        int(R), P_small, greedy=True, short=True, mixed=True
-                    )
-                    self._warmup_spec_batch(
-                        int(R), P_small, greedy=False, short=True, mixed=True
-                    )
+                    for greedy, top_k in _SPEC_WARMUP_SAMPLING:
+                        self._warmup_spec_batch(
+                            int(R),
+                            P_small,
+                            greedy=greedy,
+                            top_k=top_k,
+                            short=True,
+                            mixed=True,
+                        )
             elif self.scheduler_config.max_num_seqs > 1:
                 P_small = int(self.num_tokens_paddings[0])
                 for R in self.num_reqs_paddings:
                     if int(R) > 1:
-                        self._warmup_spec_batch(int(R), P_small, greedy=True)
-                        self._warmup_spec_batch(int(R), P_small, greedy=False)
+                        for greedy, top_k in _SPEC_WARMUP_SAMPLING:
+                            self._warmup_spec_batch(
+                                int(R), P_small, greedy=greedy, top_k=top_k
+                            )
         logger.info("spec-decode warmup compiled %d graphs", self.num_xla_graphs - n0)
 
     def _spec_warmup_bucket_grid(self, mixed: bool) -> list[int]:
@@ -6695,6 +6721,7 @@ class TPUModelRunner(GPUModelRunner):
         P: int,
         greedy: bool = True,
         *,
+        top_k: int = 0,
         short: bool = False,
         mixed: bool = False,
     ) -> None:
@@ -6702,7 +6729,8 @@ class TPUModelRunner(GPUModelRunner):
         them together so the multi-request fused programs are compiled.
 
         greedy=False routes the non-greedy (do_sampling=True) verify+sample
-        fusion, which is a distinct set of programs from the greedy path."""
+        fusion, which is a distinct set of programs from the greedy path;
+        a non-greedy top_k > 0 routes the samplers that trace top-k."""
         from vllm.sampling_params import SamplingParams
         from vllm.v1.core.sched.output import (
             CachedRequestData,
@@ -6731,8 +6759,14 @@ class TPUModelRunner(GPUModelRunner):
         rids = [f"__spec_warmup_b{R}_{j}__" for j in range(R)]
         mix_rid = f"__spec_warmup_b{R}_mix"
         mix_ids: list[str] = []
-        sp = SamplingParams(temperature=0.0 if greedy else 1.0)
-        logger.info("spec-decode warmup batch: R=%d P=%d greedy=%s", R, P, greedy)
+        sp = SamplingParams(temperature=0.0 if greedy else 1.0, top_k=top_k)
+        logger.info(
+            "spec-decode warmup batch: R=%d P=%d greedy=%s top_k=%d",
+            R,
+            P,
+            greedy,
+            top_k,
+        )
         try:
             # Match the low-block working set used by the LIFO BlockPool
             # workaround. High physical block ids can trigger the v7x SC2
@@ -6882,7 +6916,12 @@ class TPUModelRunner(GPUModelRunner):
             self._warmup_spec_decode_cleanup(rids + mix_ids)
 
     def _warmup_one_spec_request(
-        self, P: int, idx: int, quiet: bool = False, greedy: bool = True
+        self,
+        P: int,
+        idx: int,
+        quiet: bool = False,
+        greedy: bool = True,
+        top_k: int = 0,
     ) -> bool:
         """Run one synthetic spec-decode request (prefill P + decodes).
 
@@ -6931,7 +6970,7 @@ class TPUModelRunner(GPUModelRunner):
             logger.warning("skip spec-decode warmup P=%d: not enough kv blocks", P)
             return False
         block_ids = tuple(block_ids_per_group)
-        sp = SamplingParams(temperature=0.0 if greedy else 1.0)
+        sp = SamplingParams(temperature=0.0 if greedy else 1.0, top_k=top_k)
         try:
             # ---- prefill ----
             new_req = NewRequestData(
@@ -7361,6 +7400,16 @@ class TPUModelRunner(GPUModelRunner):
         )
         return output
 
+    def _uses_top_k(self, cur_start_idx: int, cur_end_idx: int) -> bool:
+        """Whether any request in the chunk applies top-k.
+
+        Mirrors ``_build_padded_sampling_params``: top_k >= vocab maps to 0
+        and padding rows carry 0, so False means every sampled row has
+        top_k 0 and the top-k search can be skipped without changing results.
+        """
+        top_k = self.input_batch.top_k_cpu_tensor[cur_start_idx:cur_end_idx]
+        return bool(((top_k > 0) & (top_k < self.vocab_size)).any())
+
     def _build_padded_sampling_params(
         self,
         cur_start_idx: int,
@@ -7552,16 +7601,20 @@ class TPUModelRunner(GPUModelRunner):
         top_k: torch.Tensor,
         top_p: torch.Tensor,
         all_greedy: bool = False,
+        use_top_k: bool = True,
     ) -> torch.Tensor:
         """
         Sample with xla-friendly function. This function is to be traced
         separately from `forward` for lighter compilation overhead.
+
+        ``use_top_k=False`` (from ``_uses_top_k``) skips tracing the top-k
+        search when every row's top_k is 0; the result is unchanged.
         """
         if all_greedy:
             return torch.argmax(logits, dim=-1, keepdim=True)
         is_greedy = temperatures <= SAMPLING_EPS
         scaled_logits = self._apply_temperature(logits, temperatures)
-        masked_logits = apply_top_k_top_p(scaled_logits, top_k, top_p)
+        masked_logits = apply_top_k_top_p(scaled_logits, top_k, top_p, use_top_k)
         u_clamped = torch.clamp(
             u, min=torch.finfo(u.dtype).tiny, max=1.0 - torch.finfo(u.dtype).eps
         )

@@ -79,3 +79,12 @@ def test_apply_top_k_top_p_per_request():
     result = sampling.apply_top_k_top_p(logits, top_k, top_p)
     torch.testing.assert_close(result, expected)
     torch.testing.assert_close(logits, original)
+
+
+def test_skipping_top_k_matches_when_no_row_applies_it():
+    logits = torch.randn(6, 257, generator=torch.Generator().manual_seed(3))
+    top_k = torch.zeros(6, 1, dtype=torch.int32)
+    top_p = torch.tensor([[1.0], [0.95], [0.5], [0.1], [1.0], [0.8]])
+    expected = sampling.apply_top_k_top_p(logits, top_k, top_p)
+    result = sampling.apply_top_k_top_p(logits, top_k, top_p, use_top_k=False)
+    torch.testing.assert_close(result, expected, rtol=0, atol=0)

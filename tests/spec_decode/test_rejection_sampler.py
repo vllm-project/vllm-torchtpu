@@ -697,6 +697,35 @@ def test_rejection_sampler_random_top_k_forces_recovery(device):
     assert torch.equal(output, expected)
 
 
+def test_rejection_sampler_random_skipping_top_k_matches(device):
+    """use_top_k=False drops the top-k search; with every top_k 0 it is a no-op."""
+    sampler = RejectionSampler()
+    generator = torch.Generator().manual_seed(11)
+    target_logits = torch.randn(5, 64, generator=generator).to(device)
+    common = dict(
+        draft_token_ids=torch.argmax(target_logits, dim=-1).to(torch.int32),
+        num_draft_tokens=torch.tensor([3, 2], dtype=torch.int32, device=device),
+        target_logits=target_logits,
+        bonus_token_ids=torch.tensor([7, 9], dtype=torch.int32, device=device),
+        segment_ids=torch.tensor([0, 0, 0, 1, 1], dtype=torch.int64, device=device),
+        group_indices=torch.tensor([0, 1, 2, 0, 1], dtype=torch.int64, device=device),
+        max_draft_tokens=3,
+        temperatures=torch.ones((5, 1), dtype=torch.float32, device=device),
+        top_k=torch.zeros((5, 1), dtype=torch.int32, device=device),
+        top_p=torch.tensor(
+            [[0.95], [0.95], [0.95], [0.5], [0.5]], dtype=torch.float32, device=device
+        ),
+        accept_u=torch.rand(5, generator=generator).to(device),
+        recover_u=torch.rand(5, 64, generator=generator).to(device),
+        do_sampling=True,
+    )
+
+    expected = sampler(**common)
+    actual = sampler(**common, use_top_k=False)
+
+    assert torch.equal(actual.cpu(), expected.cpu())
+
+
 def test_rejection_sampler_random_greedy_row_accepts_argmax(device):
     # A temperature-0 (greedy) request routed through the random path must
     # accept the draft token deterministically iff it equals the target argmax,

@@ -70,6 +70,7 @@ class RejectionSampler:
         accept_u: torch.Tensor | None = None,
         recover_u: torch.Tensor | None = None,
         do_sampling: bool = False,
+        use_top_k: bool = True,
     ) -> torch.Tensor:
         return self.forward(
             draft_token_ids=draft_token_ids,
@@ -85,6 +86,7 @@ class RejectionSampler:
             accept_u=accept_u,
             recover_u=recover_u,
             do_sampling=do_sampling,
+            use_top_k=use_top_k,
         )
 
     def forward(
@@ -102,6 +104,7 @@ class RejectionSampler:
         accept_u: torch.Tensor | None = None,
         recover_u: torch.Tensor | None = None,
         do_sampling: bool = False,
+        use_top_k: bool = True,
     ) -> torch.Tensor:
         """Performs rejection sampling for speculative decoding.
 
@@ -123,6 +126,8 @@ class RejectionSampler:
           recover_u: Uniform random values used to sample recovered tokens.
           do_sampling: Whether to use probabilistic rejection sampling. False
             keeps the existing greedy rejection path.
+          use_top_k: False promises that every row's top_k is 0, so the
+            top-k search is not traced. Only read when do_sampling is True.
 
         Returns:
           A tensor of shape [batch_size, max_draft_tokens + 1] containing the
@@ -155,6 +160,7 @@ class RejectionSampler:
                 recover_u,
                 self.synthetic_conditional_rates,
                 self.synthetic_mode,
+                use_top_k,
             )
         if self.synthetic_mode and accept_u is None:
             raise ValueError("Synthetic rejection sampling requires accept_u.")
@@ -409,6 +415,7 @@ def _random_rejection_sample_with_segment(
     recover_u: torch.Tensor,
     synthetic_conditional_rates: torch.Tensor | None,
     synthetic_mode: bool,
+    use_top_k: bool = True,
 ) -> torch.Tensor:
     """Vectorized non-greedy speculative decoding validation in Torch."""
     total_tokens = draft_token_ids.shape[0]
@@ -426,7 +433,7 @@ def _random_rejection_sample_with_segment(
     scaled_logits = target_logits.to(torch.float32) / (
         temperatures.to(torch.float32) + TEMPERATURE_EPS
     )
-    masked_logits = apply_top_k_top_p(scaled_logits, top_k, top_p)
+    masked_logits = apply_top_k_top_p(scaled_logits, top_k, top_p, use_top_k)
     target_probs = torch.softmax(masked_logits, dim=-1)
 
     # Accept test is the Leviathan ratio min(1, p(x) / q(x))
