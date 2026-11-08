@@ -199,6 +199,8 @@ def test_prefill_sized_dispatch_gathers_each_tensor(
 ):
     group = Mock(world_size=2)
     monkeypatch.setattr(comm, "get_dp_group", lambda: group)
+    # Without the DP pair exchange, which takes every size when built.
+    monkeypatch.setattr(comm, "dp_pair_exchange_ready", lambda: False)
     group.all_gather.side_effect = _two_rank_gather
     tensors = _dispatch_tensors(method, comm.PACKED_DISPATCH_MAX_TOKENS + 1)
     getattr(communicator, method)(*tensors)
@@ -213,6 +215,8 @@ def test_prefill_sized_dispatch_gathers_each_tensor(
 def test_drafter_dispatch_gathers_each_tensor(monkeypatch, communicator, method, count):
     group = Mock(world_size=2)
     monkeypatch.setattr(comm, "get_dp_group", lambda: group)
+    # Without the DP pair exchange, which takes every size when built.
+    monkeypatch.setattr(comm, "dp_pair_exchange_ready", lambda: False)
     monkeypatch.setattr(comm.vllm_compilation_backends, "model_tag", "eagle_head")
     group.all_gather.side_effect = _two_rank_gather
     tensors = _dispatch_tensors(method, 8)
@@ -221,13 +225,18 @@ def test_drafter_dispatch_gathers_each_tensor(monkeypatch, communicator, method,
 
 
 @pytest.mark.parametrize("method", ["dispatch", "dispatch_router_logits"])
-def test_decode_sized_dispatch_exchanges_dp_pair(monkeypatch, communicator, method):
+@pytest.mark.parametrize("num_tokens", [1, 64, 8192])
+@pytest.mark.parametrize("model_tag", ["backbone", "eagle_head"])
+def test_dispatch_exchanges_dp_pair(
+    monkeypatch, communicator, method, num_tokens, model_tag
+):
     group = Mock(world_size=2)
     monkeypatch.setattr(comm, "get_dp_group", lambda: group)
     monkeypatch.setattr(comm, "dp_pair_exchange_ready", lambda: True)
+    monkeypatch.setattr(comm.vllm_compilation_backends, "model_tag", model_tag)
     exchange = Mock(side_effect=lambda t: _two_rank_gather(t, 0))
     monkeypatch.setattr(comm, "dp_pair_all_gather", exchange)
-    tensors = _dispatch_tensors(method, comm.DP_PAIR_EXCHANGE_MAX_TOKENS)
+    tensors = _dispatch_tensors(method, num_tokens)
     result = getattr(communicator, method)(*tensors)
     group.all_gather.assert_not_called()
     calls = exchange.call_args_list
@@ -238,9 +247,7 @@ def test_decode_sized_dispatch_exchanges_dp_pair(monkeypatch, communicator, meth
 
 
 @pytest.mark.parametrize("method", ["dispatch", "dispatch_router_logits"])
-@pytest.mark.parametrize(
-    "case", ["prefill_sized", "drafter", "sequence_parallel", "not_built"]
-)
+@pytest.mark.parametrize("case", ["sequence_parallel", "not_built"])
 def test_dispatch_keeps_gathers_without_dp_pair_exchange(
     monkeypatch, communicator, method, case
 ):
@@ -250,11 +257,8 @@ def test_dispatch_keeps_gathers_without_dp_pair_exchange(
     monkeypatch.setattr(comm, "dp_pair_exchange_ready", lambda: case != "not_built")
     exchange = Mock()
     monkeypatch.setattr(comm, "dp_pair_all_gather", exchange)
-    if case == "drafter":
-        monkeypatch.setattr(comm.vllm_compilation_backends, "model_tag", "eagle_head")
     group.all_gather.side_effect = _two_rank_gather
-    num_tokens = comm.DP_PAIR_EXCHANGE_MAX_TOKENS + (case == "prefill_sized")
-    tensors = _dispatch_tensors(method, num_tokens)
+    tensors = _dispatch_tensors(method, 64)
     getattr(communicator, method)(
         *tensors, is_sequence_parallel=case == "sequence_parallel"
     )

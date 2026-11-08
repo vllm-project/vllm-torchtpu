@@ -33,12 +33,6 @@ from vllm_torchtpu.distributed.dp_exchange import (
     dp_pair_exchange_ready,
 )
 
-# A DP pair exchanges dispatch tensors by async collective-permute up to this
-# many tokens per rank, so decode overlaps the exchange with routing and the
-# shared expert; prefill-sized dispatch keeps the all-gathers. Like
-# PACKED_DISPATCH_MAX_TOKENS below, it is compared per traced backbone bucket.
-DP_PAIR_EXCHANGE_MAX_TOKENS = 256
-
 # Dispatch gathers its tensors as one collective up to this many tokens per
 # rank. At 256 tokens of hidden size 6144 the pack and split copies move about
 # 20 MB of HBM (~5 us), under the ~10 us fixed latency of the saved all-gather.
@@ -103,12 +97,12 @@ def _exchanges_dp_pair(
     tensors: tuple[torch.Tensor, ...], is_sequence_parallel: bool
 ) -> bool:
     # The op is built only when the DP group is a pair (see
-    # prepare_dp_pair_exchange). The tag guards the token count as above.
+    # prepare_dp_pair_exchange). It takes any nonempty batch, so the choice
+    # holds for every token bucket and for drafter graphs alike.
     return (
         not is_sequence_parallel
         and dp_pair_exchange_ready()
-        and vllm_compilation_backends.model_tag == "backbone"
-        and 0 < tensors[0].shape[0] <= DP_PAIR_EXCHANGE_MAX_TOKENS
+        and tensors[0].shape[0] > 0
         and all(t.element_size() in (2, 4) for t in tensors)
     )
 
