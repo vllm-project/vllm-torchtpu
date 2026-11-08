@@ -111,7 +111,9 @@ def test_lowers_for_tpu(dtype):
         ([300], [70], 0),
     ],
 )
-def test_fp4_matches_page_writes(q_lens, ctx_lens, pad_tokens, folded, monkeypatch):
+def test_fp4_matches_page_writes(
+    q_lens, ctx_lens, pad_tokens, folded, monkeypatch, request
+):
     """4-bit writes, token by token (small batches) and page by page, land the
     same nibbles and folded scales."""
     rng = np.random.default_rng(sum(q_lens))
@@ -136,6 +138,8 @@ def test_fp4_matches_page_writes(q_lens, ctx_lens, pad_tokens, folded, monkeypat
 
     got = write()
     monkeypatch.setattr(msa_write, "_BY_TOKEN_MAX_TOKENS", 0)
+    jax.clear_caches()  # the writes read the threshold when traced
+    request.addfinalizer(jax.clear_caches)  # no page-path trace outlives the test
     expected = write()
     np.testing.assert_array_equal(np.asarray(got), np.asarray(expected))
     # The page writes are v24's; check them against the logical scatter too.
@@ -183,7 +187,7 @@ def test_fp4_by_token_lowers_for_tpu(folded, tokens):
     ],
 )
 def test_slot_scales_match_xla_scatter(
-    q_lens, ctx_lens, pad_tokens, num_values, monkeypatch
+    q_lens, ctx_lens, pad_tokens, num_values, monkeypatch, request
 ):
     """Per-slot scale writes token by token equal the XLA scatter they replace."""
     rng = np.random.default_rng(sum(q_lens) + num_values)
@@ -200,6 +204,8 @@ def test_slot_scales_match_xla_scatter(
 
     got = write()
     monkeypatch.setattr(msa_write, "_BY_TOKEN_MAX_TOKENS", 0)
+    jax.clear_caches()  # the writes read the threshold when traced
+    request.addfinalizer(jax.clear_caches)  # no page-path trace outlives the test
     expected = write()
     np.testing.assert_array_equal(np.asarray(got), np.asarray(expected))
 
