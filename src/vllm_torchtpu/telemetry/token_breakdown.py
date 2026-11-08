@@ -333,11 +333,12 @@ class SessionTurnTracker:
         # No prior state on this replica for session_id or parent_session_id.
         if session_id and turn_id is not None and turn_id > 1:
             last_reply_end = _find_server_hop_reply_end(prompt_token_ids)
-            if last_reply_end is not None and hit < last_reply_end <= total:
+            if last_reply_end is not None and 0 < last_reply_end <= total:
+                rloss = max(0, last_reply_end - hit)
                 return TokenBreakdown(
                     cache_hit=hit,
-                    routing_loss=last_reply_end - hit,
-                    new_input=total - last_reply_end,
+                    routing_loss=rloss,
+                    new_input=total - hit - rloss,
                     parent_session_id=parent_session_id,
                 )
             return TokenBreakdown(

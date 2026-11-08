@@ -275,11 +275,19 @@ def test_batch_eviction_sync_and_server_padding_hook(monkeypatch) -> None:
     monkeypatch.setattr(envs, "VLLM_TPU_AGENTIC_TELEMETRY", True)
     svc = AgenticTelemetryService(block_size=4, replica_id="test-rep-batch")
 
+    class _SlottedBlock:
+        __slots__ = ("block_id", "block_hash", "is_null")
+
+        def __init__(self, block_id: int, block_hash: int) -> None:
+            self.block_id = block_id
+            self.block_hash: int | None = block_hash
+            self.is_null = False
+
     class FakeBatchBlockPool:
         def __init__(self) -> None:
             self.blocks = [
-                SimpleNamespace(block_hash=111, is_null=False),
-                SimpleNamespace(block_hash=222, is_null=False),
+                _SlottedBlock(0, 111),
+                _SlottedBlock(1, 222),
             ]
 
         def cache_full_blocks(
@@ -312,8 +320,8 @@ def test_batch_eviction_sync_and_server_padding_hook(monkeypatch) -> None:
         all_token_ids=[1, 2, 3, 4, 5, 6, 7, 8],
     )
     pool.cache_full_blocks(req_a, pool.blocks, 0, 2, 4)
-    assert pool.blocks[0]._cuj2_session_id == "sess-batch-a"
-    assert pool.blocks[1]._cuj2_session_id == "sess-batch-a"
+    assert pool._cuj2_block_session[0] == "sess-batch-a"
+    assert pool._cuj2_block_session[1] == "sess-batch-a"
 
     flush_calls = []
     orig_flush = svc.flush_eviction_sync

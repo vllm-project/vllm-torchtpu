@@ -185,6 +185,9 @@ class AgenticTelemetryService:
         self._req_breakdowns: dict[str, TokenBreakdown] = {}
         self._req_external_tokens: dict[str, int] = {}
         self._req_prefill_ts: dict[str, float] = {}
+        self._req_eviction_metrics: dict[
+            str, tuple[float | None, float | None, int | None]
+        ] = {}
         self._eviction_sync_dirty: bool = False
 
     def _safe_replica_id(self) -> str:
@@ -365,8 +368,9 @@ class AgenticTelemetryService:
 
         self._maybe_sync_vllm_block_size()
         self._maybe_sync_eviction_state()
+        prefill_now = time.monotonic()
         if req_id:
-            self._req_prefill_ts[req_id] = time.monotonic()
+            self._req_prefill_ts[req_id] = prefill_now
 
         session_id, parent_session_id, turn_id = extract_agent_headers(
             _resolve_trace_headers(req_state, engine_core_output)
@@ -385,7 +389,52 @@ class AgenticTelemetryService:
             self.category_totals[cat] += count
         if req_id:
             self._req_breakdowns[req_id] = breakdown
+            evict_age, lru_hor, evict_wall = self._compute_eviction_snapshot(
+                req_state,
+                breakdown,
+                session_id=session_id,
+                eval_now=prefill_now,
+            )
+            self._req_eviction_metrics[req_id] = (evict_age, lru_hor, evict_wall)
         return breakdown
+
+    def _compute_eviction_snapshot(
+        self,
+        req_state: Any,
+        breakdown: TokenBreakdown,
+        *,
+        session_id: str | None,
+        eval_now: float | None,
+    ) -> tuple[float | None, float | None, int | None]:
+        eviction_age_ms: float | None = None
+        if breakdown.affinity_honored_eviction > 0:
+            prompt_token_ids = getattr(req_state, "prompt_token_ids", None) or ()
+            block_size = self.session_tracker.block_size
+            num_prompt_blocks = len(prompt_token_ids) // block_size
+            t1_state = (
+                self.session_tracker.tier1.peek(session_id)
+                if session_id
+                else None
+            )
+            if t1_state is not None and len(t1_state.block_hashes) >= num_prompt_blocks:
+                all_hashes = t1_state.block_hashes[:num_prompt_blocks]
+            else:
+                all_hashes = compute_rolling_block_hashes(
+                    prompt_token_ids, block_size
+                )
+            start_blk = breakdown.cache_hit // block_size
+            missed_hashes = all_hashes[start_blk:]
+            eviction_age_ms = self.eviction_tracker.time_since_eviction_ms(
+                missed_hashes, now=eval_now, session_id=session_id
+            )
+
+        lru_horizon_ms = self.eviction_tracker.lru_horizon_ms(
+            now=eval_now, session_id=session_id
+        )
+        if lru_horizon_ms is None and eviction_age_ms is not None:
+            lru_horizon_ms = eviction_age_ms
+        session_evicted_wall = self.eviction_tracker.session_evicted_at_ms(session_id)
+        return eviction_age_ms, lru_horizon_ms, session_evicted_wall
 
     def on_request_finished(
         self, req_state: Any, engine_core_output: Any
@@ -442,7 +491,12 @@ class AgenticTelemetryService:
                 req_state, engine_core_output
             )
 
+        snap_evict = (
+            self._req_eviction_metrics.pop(req_id, None) if req_id else None
+        )
         breakdown = self.on_request_finished(req_state, engine_core_output)
+        if snap_evict is None and req_id:
+            snap_evict = self._req_eviction_metrics.pop(req_id, None)
         prefill_ts = self._req_prefill_ts.pop(req_id, None) if req_id else None
         eval_now = now if now is not None else prefill_ts
 
@@ -459,43 +513,25 @@ class AgenticTelemetryService:
         if parent_session_id and "gen_ai.session.parent_id" not in attrs:
             attrs["gen_ai.session.parent_id"] = parent_session_id
 
-        self._maybe_sync_eviction_state()
-        eviction_age_ms: float | None = None
-        if breakdown.affinity_honored_eviction > 0:
-            prompt_token_ids = getattr(req_state, "prompt_token_ids", None) or ()
-            block_size = self.session_tracker.block_size
-            num_prompt_blocks = len(prompt_token_ids) // block_size
-            t1_state = (
-                self.session_tracker.tier1.peek(session_id)
-                if session_id
-                else None
-            )
-            if t1_state is not None and len(t1_state.block_hashes) >= num_prompt_blocks:
-                all_hashes = t1_state.block_hashes[:num_prompt_blocks]
-            else:
-                all_hashes = compute_rolling_block_hashes(
-                    prompt_token_ids, block_size
+        if snap_evict is not None and now is None:
+            eviction_age_ms, lru_horizon_ms, session_evicted_wall = snap_evict
+        else:
+            self._maybe_sync_eviction_state()
+            eviction_age_ms, lru_horizon_ms, session_evicted_wall = (
+                self._compute_eviction_snapshot(
+                    req_state,
+                    breakdown,
+                    session_id=session_id,
+                    eval_now=eval_now,
                 )
-            start_blk = breakdown.cache_hit // block_size
-            missed_hashes = all_hashes[start_blk:]
-            eviction_age_ms = self.eviction_tracker.time_since_eviction_ms(
-                missed_hashes, now=eval_now, session_id=session_id
             )
-
-        lru_horizon_ms = self.eviction_tracker.lru_horizon_ms(
-            now=eval_now, session_id=session_id
-        )
-        if lru_horizon_ms is None and eviction_age_ms is not None:
-            lru_horizon_ms = eviction_age_ms
 
         hw_attrs = extract_hardware_span_attributes(
             kv_transfer_params=getattr(engine_core_output, "kv_transfer_params", None),
             num_external_computed_tokens=ext_computed,
             time_since_eviction_ms=eviction_age_ms,
             lru_horizon_ms=lru_horizon_ms,
-            session_evicted_at_ms=self.eviction_tracker.session_evicted_at_ms(
-                session_id
-            ),
+            session_evicted_at_ms=session_evicted_wall,
             tpu_shape_padding_tokens=None,
         )
         attrs.update(hw_attrs)
@@ -676,16 +712,31 @@ def patch_block_pool(
                 or getattr(request, "prompt_token_ids", None)
                 or ()
             )
+            blk_sessions = getattr(self, "_cuj2_block_session", None)
+            if blk_sessions is None:
+                blk_sessions = {}
+                self._cuj2_block_session = blk_sessions
+            blk_hashes = getattr(self, "_cuj2_block_rolling_hash", None)
+            if blk_hashes is None:
+                blk_hashes = {}
+                self._cuj2_block_rolling_hash = blk_hashes
+
             prev_hash = 0
             if num_cached_blocks > 0 and num_cached_blocks - 1 < len(blocks):
+                prev_blk = blocks[num_cached_blocks - 1]
+                prev_id = getattr(prev_blk, "block_id", None)
                 prev_hash = (
-                    getattr(blocks[num_cached_blocks - 1], "_cuj2_rolling_hash", 0)
-                    or 0
-                )
+                    blk_hashes.get(prev_id)
+                    if prev_id is not None and prev_id in blk_hashes
+                    else getattr(prev_blk, "_cuj2_rolling_hash", 0)
+                ) or 0
             if sid:
                 for i in range(min(num_cached_blocks, len(blocks))):
                     blk = blocks[i]
                     if not getattr(blk, "is_null", False):
+                        blk_id = getattr(blk, "block_id", None)
+                        if blk_id is not None:
+                            blk_sessions[blk_id] = sid
                         try:
                             blk._cuj2_session_id = sid
                         except AttributeError:
@@ -694,14 +745,19 @@ def patch_block_pool(
                 blk = blocks[i]
                 if getattr(blk, "is_null", False):
                     continue
+                blk_id = getattr(blk, "block_id", None)
                 if all_tokens and (i + 1) * block_size <= len(all_tokens):
                     chunk = tuple(all_tokens[i * block_size : (i + 1) * block_size])
                     prev_hash = hash((prev_hash, chunk))
+                    if blk_id is not None:
+                        blk_hashes[blk_id] = prev_hash
                     try:
                         blk._cuj2_rolling_hash = prev_hash
                     except AttributeError:
                         pass
                 if sid:
+                    if blk_id is not None:
+                        blk_sessions[blk_id] = sid
                     try:
                         blk._cuj2_session_id = sid
                     except AttributeError:
@@ -712,10 +768,27 @@ def patch_block_pool(
 
     def _wrapped_maybe_evict_cached_block(self: Any, block: Any) -> bool:
         raw_hash = getattr(block, "block_hash", None)
-        rolling_hash = getattr(block, "_cuj2_rolling_hash", None)
-        evicted_sid = getattr(block, "_cuj2_session_id", None)
+        blk_id = getattr(block, "block_id", None)
+        blk_sessions = getattr(self, "_cuj2_block_session", None)
+        blk_hashes = getattr(self, "_cuj2_block_rolling_hash", None)
+        rolling_hash = (
+            blk_hashes.get(blk_id)
+            if blk_hashes is not None and blk_id is not None and blk_id in blk_hashes
+            else getattr(block, "_cuj2_rolling_hash", None)
+        )
+        evicted_sid = (
+            blk_sessions.get(blk_id)
+            if blk_sessions is not None
+            and blk_id is not None
+            and blk_id in blk_sessions
+            else getattr(block, "_cuj2_session_id", None)
+        )
         evicted = orig_evict(self, block)
         if evicted and raw_hash is not None:
+            if blk_sessions is not None and blk_id is not None:
+                blk_sessions.pop(blk_id, None)
+            if blk_hashes is not None and blk_id is not None:
+                blk_hashes.pop(blk_id, None)
             for attr in ("_cuj2_rolling_hash", "_cuj2_session_id"):
                 if hasattr(block, attr):
                     try:
@@ -803,7 +876,7 @@ def patch_block_pool(
 class _Cuj2TpuPaddingCollector:
     """Prometheus collector exposing server-level TPU round padding counters."""
 
-    _name = "vllm:tpu_padding"
+    _name = "cuj2_tpu_padding"
 
     def __init__(self, service: AgenticTelemetryService | None = None) -> None:
         self._service = service
@@ -925,9 +998,19 @@ def patch_tpu_padding_metrics(
             runner_cls._tpu_agentic_padding_patch = True
 
     try:
-        from prometheus_client import REGISTRY
+        from prometheus_client import REGISTRY, multiprocess
 
         _register_padding_collector_on_registry(REGISTRY, service=service)
+        mp_cls = multiprocess.MultiProcessCollector
+        if not getattr(mp_cls, "_tpu_agentic_mp_patch", False):
+            orig_mp_collect = mp_cls.collect
+
+            def _wrapped_mp_collect(self: Any) -> Any:
+                yield from orig_mp_collect(self)
+                yield from _Cuj2TpuPaddingCollector(service=service).collect()
+
+            mp_cls.collect = _wrapped_mp_collect
+            mp_cls._tpu_agentic_mp_patch = True
     except Exception:
         pass
 
@@ -939,7 +1022,8 @@ def patch_tpu_padding_metrics(
 
             def _wrapped_get_prometheus_registry(*args: Any, **kwargs: Any) -> Any:
                 reg = orig_get_reg(*args, **kwargs)
-                _register_padding_collector_on_registry(reg, service=service)
+                if os.getenv("PROMETHEUS_MULTIPROC_DIR") is None:
+                    _register_padding_collector_on_registry(reg, service=service)
                 return reg
 
             prom_mod.get_prometheus_registry = _wrapped_get_prometheus_registry
@@ -985,6 +1069,14 @@ def patch_output_processor(
                     request.trace_headers = dict(active_hdrs)
                 except AttributeError:
                     pass
+            if not getattr(request, "session_id", None):
+                hdrs = getattr(request, "trace_headers", None) or active_hdrs
+                sid, _, _ = extract_agent_headers(hdrs)
+                if sid:
+                    try:
+                        request.session_id = sid
+                    except AttributeError:
+                        pass
             res = orig_add_request(self, request, *args, **kwargs)
             req_states = getattr(self, "request_states", {})
             req_state = req_states.get(getattr(request, "request_id", None))
