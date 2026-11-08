@@ -22,6 +22,8 @@ every row that lands on this shard. The TensorCore kernel can therefore
 compute its first experts with no dispatch wait.
 """
 
+import functools
+
 import jax
 import jax.numpy as jnp
 from jax import lax
@@ -50,27 +52,36 @@ def rank_operand(rank):
 
 
 def _sc_barrier(me, ep):
-    """All-to-all barrier on the collective's barrier semaphore, signalling
-    peers in rank-staggered order (me, me + 1, ...): every peer must have
-    entered (allocated its output slab) before any remote row lands.
+    """Two-phase all-to-all barrier on the collective's barrier semaphore,
+    signalling peers in rank-staggered order (me, me + 1, ...): at entry,
+    every peer must have entered (allocated its output slab) before any remote
+    row lands; at exit, every peer must have drained its incoming/outgoing DMAs
+    before any fast peer (e.g. with n_in == 0 and n_out == 0) exits and
+    re-enters the next collective.
 
-    Per core: Mosaic gives each SparseCore core its own barrier semaphore,
-    and a remote signal without a core axis lands on the same core index of
-    the destination chip, so this is one barrier per core index. Core c only
-    pushes to and waits on core c of its peers (receive counts are per core),
-    and both cores are one kernel launch, so a peer's slab is live once its
-    same-index core has entered."""
+    Per core: Mosaic gives each SparseCore subcore its own barrier semaphore
+    and its own `run_scoped` REGULAR semaphore, and a remote signal without a
+    core axis lands on the same subcore index of the destination chip, so both
+    phases synchronize per core index. Using `run_scoped` for the second phase
+    gives the entry and exit barriers distinct REGULAR semaphores."""
     bsem = pltpu.get_barrier_semaphore()
 
-    def _sig_b(i, c):
-        p = lax.rem(i + me, ep)
-        pl.semaphore_signal(
-            bsem, 1, device_id=(p,), device_id_type=pl.DeviceIdType.MESH
-        )
-        return c
+    def _sig_and_wait(sem):
+        def _sig_b(i, c):
+            p = lax.rem(i + me, ep)
+            pl.semaphore_signal(
+                sem, 1, device_id=(p,), device_id_type=pl.DeviceIdType.MESH
+            )
+            return c
 
-    lax.fori_loop(0, ep, _sig_b, jnp.int32(0))
-    pl.semaphore_wait(bsem, ep)
+        lax.fori_loop(0, ep, _sig_b, jnp.int32(0))
+        pl.semaphore_wait(sem, ep)
+
+    _sig_and_wait(bsem)
+
+    @functools.partial(pl.run_scoped, bsem2=pltpu.SemaphoreType.REGULAR)
+    def _(bsem2):
+        _sig_and_wait(bsem2)
 
 
 def sc_dispatch_chunk_2core(
@@ -155,6 +166,11 @@ def sc_dispatch_chunk_2core(
             pltpu.make_async_copy(
                 q_hbm.at[pl.ds(0, n_out)], q_hbm.at[pl.ds(0, n_out)], send_sem
             ).wait()
+
+        # Exit barrier: prevent shards with n_in == 0 and n_out == 0 from
+        # finishing early and re-entering the next launch while peers are
+        # still draining DMAs on this launch.
+        _sc_barrier(me, ep)
 
     return pl.kernel(
         kernel,

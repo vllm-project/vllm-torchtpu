@@ -25,9 +25,10 @@ for the ep - 1 incoming rows. Bit-exact with
 * whole-tile slabs only: a row is [R, 128] i32 with R a multiple of 8 on an
   untiled leading axis, so each DMA moves complete (8, 128) tiles (a
   partial-tile remote DMA has crashed a slice);
-* a two-phase entry barrier (barrier semaphore, then a scoped REGULAR
+* two-phase entry and exit barriers (barrier semaphore, then a scoped REGULAR
   semaphore), so every peer is inside this call -- output allocated, the
-  previous call's exchange consumed -- before any row lands;
+  previous call's exchange consumed -- before any row lands, and no peer exits
+  or tears down its scratch DMA semaphores until all peers have completed;
 * its own collective id: the TensorCore MoE kernel uses 0 and the SparseCore
   kernels 1.
 """
@@ -119,6 +120,9 @@ def _build_tc_exchange_all_gather(*, ep, width):
             blk = out_hbm.at[pl.ds(0, ep - 1)]
             pltpu.make_async_copy(blk, blk, recv_sem).wait()
             pltpu.make_async_copy(blk, blk, send_sem).wait()
+        # Exit barrier: ensure all peers have drained incoming and outgoing
+        # remote DMAs before any peer exits and reuses its buffers on the next call.
+        _double_barrier(ep, me)
 
     hbm = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
     call = pl.pallas_call(

@@ -316,3 +316,144 @@ def test_tc_exchange_all_gather_equals_lax_all_gather(width):
     )(jax.device_put(data, NamedSharding(mesh, P(AXIS))))
     np.testing.assert_array_equal(np.asarray(tc), np.asarray(xla))
     np.testing.assert_array_equal(np.asarray(tc)[0], np.asarray(data).reshape(-1))
+
+
+def test_sc_dispatch_and_tc_exchange_back_to_back_skewed_ranks():
+    """Back-to-back launches where ranks 0..EP-2 have zero rows in two
+    consecutive dispatches while rank EP-1 copies full slabs, followed by
+    all ranks 0..EP-2 pushing into rank EP-1. Verifies that fast zero-row
+    ranks cannot race past the entry/exit barriers into subsequent launches."""
+    from vllm_torchtpu.kernels.experimental.push_fused_moe.sc_dispatch import (
+        sc_dispatch_chunk_2core,
+    )
+
+    mesh = _mesh()
+    g_local = 2
+    n_segs = EP * g_local
+    slab_rows = 512
+    lanes, width = 8, 128
+    exch_fn = build_tc_exchange_all_gather(ep=EP, width=384)
+
+    def local(rank_l):
+        me = rank_l[0, 0]
+        is_last = me == jnp.int32(EP - 1)
+        is_sender = me < jnp.int32(EP - 1)
+
+        q_a = jnp.broadcast_to(
+            (jnp.int32(100) + me).reshape(1, 1, 1), (slab_rows, lanes, width)
+        )
+        q_b = jnp.broadcast_to(
+            (jnp.int32(500) + me).reshape(1, 1, 1), (slab_rows, lanes, width)
+        )
+        q_c = jnp.broadcast_to(
+            (jnp.int32(900) + me).reshape(1, 1, 1), (slab_rows, lanes, width)
+        )
+
+        word_ab = jnp.where(
+            is_last, jnp.left_shift(jnp.int32(EP - 1), 24) | jnp.int32(256), 0
+        )
+        seg_ab = (
+            jnp.zeros((3 * n_segs,), jnp.int32)
+            .at[0]
+            .set(word_ab)
+            .at[EP]
+            .set(word_ab)
+            .at[n_segs + EP]
+            .set(jnp.where(is_last, 256, 0))
+            .at[2 * n_segs + EP]
+            .set(jnp.where(is_last, 256, 0))
+        )
+        cnt_ab = jnp.where(
+            is_last,
+            jnp.array([256, 256, 0, 0], jnp.int32),
+            jnp.zeros((4,), jnp.int32),
+        )
+
+        word_c = jnp.where(
+            is_sender, jnp.left_shift(jnp.int32(EP - 1), 24) | jnp.int32(32), 0
+        )
+        seg_c = (
+            jnp.zeros((3 * n_segs,), jnp.int32)
+            .at[0]
+            .set(word_c)
+            .at[EP]
+            .set(word_c)
+            .at[n_segs + EP]
+            .set(jnp.where(is_sender, 32, 0))
+            .at[2 * n_segs]
+            .set(jnp.where(is_sender, me * 32, 0))
+            .at[2 * n_segs + EP]
+            .set(jnp.where(is_sender, 256 + me * 32, 0))
+        )
+        n_send = EP - 1
+        cnt_c = jnp.where(
+            is_sender,
+            jnp.array([0, 0, 32, 32], jnp.int32),
+            jnp.array([n_send * 32, n_send * 32, 0, 0], jnp.int32),
+        )
+
+        z = jnp.int32(0)
+        for r in range(4):
+            ex = exch_fn(jnp.full((384,), me + r + z, jnp.int32), me)
+            z = jnp.bitwise_and(ex[0], jnp.int32(0))
+            sa = sc_dispatch_chunk_2core(
+                q_a,
+                seg_ab.at[0].add(z),
+                cnt_ab,
+                ep=EP,
+                g_local=g_local,
+                v0=0,
+                v1=2,
+                slab_rows=slab_rows,
+                name=f"test_sc_a_{r}",
+                rank=me,
+            )
+            z = jnp.bitwise_and(sa[0, 0, 0], jnp.int32(0))
+            sb = sc_dispatch_chunk_2core(
+                q_b,
+                seg_ab.at[0].add(z),
+                cnt_ab,
+                ep=EP,
+                g_local=g_local,
+                v0=0,
+                v1=2,
+                slab_rows=slab_rows,
+                name=f"test_sc_b_{r}",
+                rank=me,
+            )
+            z = jnp.bitwise_and(sb[0, 0, 0], jnp.int32(0))
+            sc = sc_dispatch_chunk_2core(
+                q_c,
+                seg_c.at[0].add(z),
+                cnt_c,
+                ep=EP,
+                g_local=g_local,
+                v0=0,
+                v1=2,
+                slab_rows=slab_rows,
+                name=f"test_sc_c_{r}",
+                rank=me,
+            )
+            z = jnp.bitwise_and(sc[0, 0, 0], jnp.int32(0))
+        return (
+            sb[: n_send * 32, 0, 0].reshape(1, -1),
+            sc[: n_send * 32, 0, 0].reshape(1, -1),
+        )
+
+    ranks = jax.device_put(
+        jnp.arange(EP, dtype=jnp.int32).reshape(EP, 1),
+        NamedSharding(mesh, P(AXIS)),
+    )
+    got_b, got_c = jax.jit(
+        jax.shard_map(
+            local,
+            mesh=mesh,
+            in_specs=P(AXIS),
+            out_specs=(P(AXIS), P(AXIS)),
+            check_vma=False,
+        )
+    )(ranks)
+    want_b = np.full((EP - 1) * 32, 500 + EP - 1, np.int32)
+    np.testing.assert_array_equal(np.asarray(got_b)[-1], want_b)
+    expected_c = np.repeat(900 + np.arange(EP - 1, dtype=np.int32), 32)
+    np.testing.assert_array_equal(np.asarray(got_c)[-1], expected_c)
