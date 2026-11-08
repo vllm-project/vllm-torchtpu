@@ -64,8 +64,10 @@ EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--prefill-schedule-inte
 EVAL_TOLERANCE="0.025"
 LM_EVAL_TASKS="gsm8k"
 
-# The recipe's LIBTPU_INIT_ARGS and environment, verbatim; compile-cache paths
-# and log verbosity are left to the defaults.
+# The recipe's LIBTPU_INIT_ARGS and environment as the job set them; compile-cache
+# paths and log verbosity are left to the defaults. Some of these variables are
+# read by no code in this tree (the job served this same tree), so they change
+# nothing; they are kept so the server's environment matches the job's.
 export LIBTPU_INIT_ARGS=" --xla_tpu_use_minor_sharding_for_major_trivial_input=true --xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=false --xla_tpu_ars_combiner_threshold_in_bytes=0 --xla_tpu_enable_async_collective_merger=false --xla_tpu_enable_sparse_core_hierarchical_all_reduce=true --xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes=798720 --xla_tpu_dvfs_p_state=7 --xla_tpu_use_enhanced_launch_barrier=true --xla_enable_async_all_gather=true --xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=true --xla_tpu_enable_sparse_core_collective_offload_all_gather=false"
 export DP_SCHED_BATCH_PREFILL=1
 export FUSED_MOE_DECODE_KERNEL=1

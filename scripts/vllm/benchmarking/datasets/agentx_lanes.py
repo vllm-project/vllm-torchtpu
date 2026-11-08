@@ -28,6 +28,7 @@ sweep's prompts are cached from an earlier one.
 
 import argparse
 import json
+import os
 import random
 
 HASH_STRIDE = 10**7
@@ -79,25 +80,22 @@ def build(args):
     }
     with open(args.out, "w") as f:
         json.dump(doc, f, separators=(",", ":"))
+        f.write("\n")
 
 
 def expand(args):
     with open(args.lanes) as f:
         doc = json.load(f)
-    with open(args.out, "w") as f:
+    # Written aside and renamed, so a client reading the dataset never sees a
+    # partial file while another sourcing of the config rewrites it.
+    tmp = f"{args.out}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
         for r in doc["requests"]:
             ids = [h for start, n in r["runs"] for h in range(start, start + n)]
-            f.write(
-                json.dumps(
-                    {
-                        "timestamp": 0,
-                        "input_length": r["in"],
-                        "output_length": r["out"],
-                        "hash_ids": ids,
-                    }
-                )
-                + "\n"
-            )
+            row = {"timestamp": 0, "input_length": r["in"]}
+            row.update({"output_length": r["out"], "hash_ids": ids})
+            f.write(json.dumps(row) + "\n")
+    os.replace(tmp, args.out)
 
 
 def main():
