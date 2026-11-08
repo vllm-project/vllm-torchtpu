@@ -97,7 +97,7 @@ from vllm_torchtpu.distributed.pp_wave import PPWave, pp_rank_flags
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs as rpa_configs
 from vllm_torchtpu.kernels.experimental.batched_rpa import wrapper as rpa_batched
 from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
-from vllm_torchtpu.layers.adapter import token_padding
+from vllm_torchtpu.layers.adapter import expert_placement, token_padding
 from vllm_torchtpu.layers.adapter.attention import (
     KV_LAYOUT_BY_VLLM_LAYOUT,
     TPU_STR_DTYPE_TO_TORCH_DTYPE,
@@ -3548,6 +3548,8 @@ class TPUModelRunner(GPUModelRunner):
             # safe to do for a zero-token step since no collectives are
             # triggered.
             return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
+        # TPU_MOE_ROUTING_COUNTS_DIR: at most one device read a minute.
+        expert_placement.write_counts()
         if envs.TPU_MTP_PREFILL_ONLY:
             from vllm_torchtpu.spec_decode.prefill_only import validate_prefill_span
 
@@ -5122,7 +5124,13 @@ class TPUModelRunner(GPUModelRunner):
             )
             for module in self.model.modules()
         )
-        if envs.TPU_MOE_SKIP_PADDED_TOKENS or uses_mxfp4_moe:
+        # Routing counts (TPU_MOE_ROUTING_COUNTS_DIR) leave padded rows out by
+        # the same mask.
+        if (
+            envs.TPU_MOE_SKIP_PADDED_TOKENS
+            or uses_mxfp4_moe
+            or expert_placement.counting_routes()
+        ):
             self._token_padding_state = token_padding.TokenPaddingState.create(
                 self.max_num_tokens, self.device
             )
