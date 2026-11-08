@@ -897,9 +897,11 @@ class TpuPlatform(Platform):
         else:
             backend = PallasAttentionBackend
         supported = [layout.name for layout in backend.supported_kv_cache_layouts()]
-        if (
-            vllm_config.model_config is not None
-            and "DeepseekV4ForCausalLM" in vllm_config.model_config.architectures
+        # ERNIE 5.5 mixes DSv4 HCA and MLA-DSA page sizes, which vLLM packs
+        # only block-outermost: DSv4's layout.
+        if vllm_config.model_config is not None and any(
+            a in vllm_config.model_config.architectures
+            for a in ("DeepseekV4ForCausalLM", "Ernie5_5_MoeForCausalLM")
         ):
             supported = ["BLHNC"]
         layout = resolve_kv_cache_layout(vllm_config, [supported])
@@ -1328,7 +1330,12 @@ class TpuPlatform(Platform):
                 )
                 or []
             )
-            is_ds_v4 = any("DeepseekV4ForCausalLM" in a for a in architectures)
+            # ERNIE 5.5 too: its HCA layers are DSv4 attention (first non-SSM
+            # backend: the DSv4 SWA one, no get_page_size), its DSA layers MLA.
+            is_ds_v4 = any(
+                "DeepseekV4ForCausalLM" in a or a == "Ernie5_5_MoeForCausalLM"
+                for a in architectures
+            )
 
             if is_ds_v4 and not cache_config.user_specified_block_size:
                 # DSv4 pages hold compressed rows. Its backend's

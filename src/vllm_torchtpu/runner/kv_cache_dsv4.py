@@ -23,6 +23,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import torch
+from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheSpec,
@@ -34,7 +35,12 @@ from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
 from vllm_torchtpu.kernels.deepseek_v4.compress_and_store import (
     config as compressor_config,
 )
-from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
+from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
+from vllm_torchtpu.layers.adapter.attention import (
+    PallasAttentionBackend,
+    PallasMLAttentionBackend,
+    VllmTPUDeepseekV32IndexerBackend,
+)
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor import (
     RunLocalStateSpec,
 )
@@ -177,6 +183,10 @@ class DsV4KVCacheAllocator:
             indexer k_cache   uint8 `(N, T/4, 4, 256)`   256B/token
             HCA `*.attn`      uint8 `(N, T*2, 4, 128)`  1024B/token (raw bf16)
 
+        GLM-family DSA layers next to DSv4 ones (ERNIE 5.5) keep the non-DSv4
+        path's arrays: the sparse-MLA (nope, rope) pair and the uncompressed
+        `DeepseekV32IndexerCache`, which hosts no compressor state.
+
         The CSA arrays are int32 so the SparseCore gather can fetch a token's
         own 128 RoPE bytes; the TensorCore kernels view them as the uint8
         slabs they hold (see `csa_cache_layout`).
@@ -193,6 +203,8 @@ class DsV4KVCacheAllocator:
           never collide.
         - The i-th HCA compressor state cache maps onto the i-th CSA NoPE
           array.
+        - Without a CSA layer, those hosts are standalone arrays of the CSA
+          NoPE page shape, which the specs must budget for themselves.
 
         Overlays are planned before allocating: allocating an array and
         aliasing it afterwards still counts against peak HBM.
@@ -219,10 +231,40 @@ class DsV4KVCacheAllocator:
         # their state cache.
         hca_layer_names: set[str] = set()
 
+        forward_context = (
+            self.runner.vllm_config.compilation_config.static_forward_context
+        )
         for layer_name in mla_layer_names:
             spec = per_layer_spec(layer_name)
             page_size = spec.num_states
-            if layer_name.endswith(self._DS_V4_INDEXER_CACHE_SUFFIX):
+            attn_module = forward_context.get(layer_name)
+            if isinstance(attn_module, DeepseekV32IndexerCache):
+                # A GLM-family DSA indexer (ERNIE's MLA-DSA layers) keeps every
+                # token, not compress-4 records, and hosts no compressor state:
+                # its own backend's layout, as the non-DSv4 path allocates it.
+                shape = VllmTPUDeepseekV32IndexerBackend.get_kv_cache_shape(
+                    num_blocks,
+                    spec.block_size,
+                    spec.num_kv_heads,
+                    spec.head_size,
+                    spec.dtype,
+                )
+                kv_caches[layer_name] = _create_cache(shape, layer_name, spec.dtype)
+            elif getattr(attn_module, "use_sparse", False) is True:
+                # A GLM-family sparse-MLA latent cache: the split (nope, rope)
+                # arrays its kernel reads, as the non-DSv4 path allocates them.
+                specs = PallasMLAttentionBackend.get_sparse_kv_cache_specs(
+                    num_blocks, spec.block_size, spec.head_size, spec.dtype
+                )
+                mla_dispatch.admit_layer(
+                    self.runner, attn_module, specs, spec.block_size
+                )
+                attn_module.mla_kv_spec = specs
+                kv_caches[layer_name] = tuple(
+                    _create_cache(tuple(s.shape), layer_name, s.torch_dtype)
+                    for s in specs
+                )
+            elif layer_name.endswith(self._DS_V4_INDEXER_CACHE_SUFFIX):
                 # SEQ_ALONG_LANE: token t is lane t of 32 fp8 groups + 1
                 # e8m0 scale group (132B/token of key traffic); the
                 # compressor state still addresses the page as
@@ -260,11 +302,29 @@ class DsV4KVCacheAllocator:
                 kv_caches[layer_name] = _create_cache(shape, layer_name)
                 hca_layer_names.add(layer_name)
 
-        if not csa_nope_hosts:
+        if csa_nope_hosts:
+            host_shape = tuple(csa_nope_hosts[0].shape)
+            host_dtype = csa_nope_hosts[0].dtype
+        elif hca_layer_names:
+            # No CSA layer (ERNIE: HCA + GLM-family DSA): standalone hosts with
+            # the CSA NoPE page of the same KV block, which is the page the SWA
+            # cache and the HCA compressor state are sized to address.
+            hca_spec = per_layer_spec(min(hca_layer_names))
+            host_shape = (
+                num_blocks,
+                compressor_config.state_host_page_size(
+                    compressor_config.Mode.HCA,
+                    hca_spec.block_size,
+                    hca_spec.tokens_per_state,
+                ),
+                csa_cache_layout.ROW_WORDS,
+            )
+            host_dtype = torch.int32
+        else:
             raise ValueError(
-                "DeepSeek-V4 model has no CSA layer (compress_ratio "
-                f"{self._DS_V4_CSA_COMPRESS_RATIO}) to host the SWA and HCA "
-                f"state caches. MLA layers={mla_layer_names}"
+                "DeepSeek-V4 model has neither a CSA layer (compress_ratio "
+                f"{self._DS_V4_CSA_COMPRESS_RATIO}) nor an HCA layer to size the "
+                f"SWA and HCA state caches' hosts. MLA layers={mla_layer_names}"
             )
 
         def _host_at(hosts: list[torch.Tensor], position: int) -> torch.Tensor:
@@ -277,9 +337,7 @@ class DsV4KVCacheAllocator:
             while position >= len(hosts):
                 hosts.append(
                     _create_cache(
-                        tuple(csa_nope_hosts[0].shape),
-                        f"ds_v4_overflow.{len(hosts)}",
-                        csa_nope_hosts[0].dtype,
+                        host_shape, f"ds_v4_overflow.{len(hosts)}", host_dtype
                     )
                 )
             return hosts[position]

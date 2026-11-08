@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import functools
+import inspect
 import math
 from collections.abc import Callable
 from typing import Any, cast
@@ -47,6 +48,7 @@ from vllm_torchtpu.kernels.mla.kv_cache_utils import (
     update_sparse_mla_kv_cache,
     update_sparse_mla_kv_cache_dcp,
 )
+from vllm_torchtpu.kernels.mla.sparse import native_sc_gather
 from vllm_torchtpu.kernels.mla.v2.tuned_params import TuningKey, get_tuned_params
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.logger import init_logger
@@ -91,6 +93,39 @@ def sparse_mla_chunk_kwargs() -> dict[str, int]:
             f"sparse MLA attention kernel batch size ({batch})."
         )
     return {"gather_and_attention_chunk_size": chunk}
+
+
+def _sparse_mla_gather_kwargs(
+    num_tokens: int, topk: int, chunk_kwargs: dict[str, int]
+) -> dict[str, int]:
+    """`sparsecore_atoms_per_batch` for a top-k width the default does not split.
+
+    The SparseCore gather takes each chunk's `chunk * topk` indices in whole
+    owner batches (cores x subcores x atoms x occurrences per atom: 32,768 at
+    the default 16 atoms on TPU7x). GLM's 2048-wide rows fill them at every
+    chunk; ERNIE's 2048 + 128-window rows (2176) need 2 atoms at a 32-token
+    chunk and 4 at 64. Empty (the kernel's default) whenever the default
+    divides; the small-chunk path uses its own `small_chunk_gather_atoms`.
+    """
+    params = inspect.signature(
+        sparse_mla_kernel.sparse_ragged_paged_attention
+    ).parameters
+    chunk = chunk_kwargs.get(
+        "gather_and_attention_chunk_size",
+        params["gather_and_attention_chunk_size"].default,
+    )
+    chunk = min(chunk, num_tokens)
+    if chunk <= params["small_chunk_tokens"].default:
+        return {}
+    default = atoms = params["sparsecore_atoms_per_batch"].default
+    unit = (
+        native_sc_gather.NUM_CORES
+        * native_sc_gather.NUM_SUBCORES
+        * native_sc_gather.OCCURRENCES_PER_ATOM
+    )
+    while atoms > 1 and (chunk * topk) % (unit * atoms):
+        atoms //= 2
+    return {} if atoms == default else {"sparsecore_atoms_per_batch": atoms}
 
 
 def _resolve_sparse_mla_split_q(ql_nope: jax.Array, q_pe: jax.Array) -> bool:
@@ -901,6 +936,7 @@ def sparse_mla_attention(
     k_scale: float | None = None,
     *,
     allow_masked_dense: bool = False,
+    sinks: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Sharded wrapper for the GLM-5.2 sparse (DSA) MLA Pallas kernel.
 
@@ -927,6 +963,10 @@ def sparse_mla_attention(
       allow_masked_dense: Whether masked-dense routing admitted this layer
         (`kernels.mla.dispatch.admit_layer`). A static Python bool; when false
         the layer compiles only the original sparse call.
+      sinks: Optional per-head attention-sink logits (`[num_heads]`, f32). The
+        kernel returns its log-sum-exp and the output is rescaled by
+        `sigmoid(lse - sink)`, which adds `exp(sink)` to every softmax
+        denominator (a sink logit with no value), as ERNIE 5.5's DSA layers use.
 
     Returns:
       A tuple containing:
@@ -975,7 +1015,7 @@ def sparse_mla_attention(
         P(None),  # block_tables
         P(None),  # query_start_loc
         P(None),  # request_distribution
-    )
+    ) + ((P(None),) if sinks is not None else ())  # sinks
     out_specs = (
         P(None, None, None),  # attn output (T, N, D)
         P(None),  # updated nope cache
@@ -1004,6 +1044,7 @@ def sparse_mla_attention(
         block_tables_,
         query_start_loc_,
         request_distribution_,
+        sinks_=None,
     ):
         kv_cache_nope, kv_cache_rope = update_sparse_mla_kv_cache(
             kv_cache_nope,
@@ -1017,9 +1058,14 @@ def sparse_mla_attention(
             rope_spec=rope_spec,
         )
 
-        # Opt-in masked-dense routing builds Q inside each device branch.
-        if allow_masked_dense and mla_dispatch.applies(
-            ql_nope, q_pe, kv_cache_nope, kv_cache_rope, topk_idx, cache_layout
+        # Opt-in masked-dense routing builds Q inside each device branch (no sink
+        # support there).
+        if (
+            sinks_ is None
+            and allow_masked_dense
+            and mla_dispatch.applies(
+                ql_nope, q_pe, kv_cache_nope, kv_cache_rope, topk_idx, cache_layout
+            )
         ):
             output = mla_dispatch.attention_from_parts(
                 ql_nope,
@@ -1051,9 +1097,20 @@ def sparse_mla_attention(
             sm_scale=sm_scale or 1.0,
             k_scale=dequant_scale,
             cache_layout=cache_layout,
+            # only the sink path asks for the lse, so the GLM call stays as it was
+            **({"return_lse": True} if sinks_ is not None else {}),
             **chunk_kwargs,
             **split_kwargs,
+            **_sparse_mla_gather_kwargs(q.shape[0], topk_idx.shape[-1], chunk_kwargs),
         )
+        if sinks_ is not None:
+            # Fold the sink into the softmax denominator:
+            # out * l / (l + e^sink) = out * sigmoid(lse - sink).
+            # lse is f32[tokens, heads], the output [tokens, heads, dim].
+            output, lse = output
+            lse = lse.astype(jnp.float32)
+            scale = jax.nn.sigmoid(lse - sinks_.astype(jnp.float32)[None, :])[..., None]
+            output = (output.astype(jnp.float32) * scale).astype(output.dtype)
 
         lkv_dim = ql_nope.shape[-1]
         # On the concat path, the kernel's output is lkv_dim + rope_dim wide
@@ -1081,6 +1138,7 @@ def sparse_mla_attention(
         block_tables,
         query_start_loc,
         request_distribution,
+        *(() if sinks is None else (sinks,)),
     )
     return new_kv_cache_nope, new_kv_cache_rope, output
 

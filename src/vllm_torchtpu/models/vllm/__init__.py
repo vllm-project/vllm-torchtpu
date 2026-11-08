@@ -25,6 +25,7 @@ _DSV4_DSPARK_MODEL = (
 _QWEN35_MTP_MODEL = "vllm_torchtpu.models.vllm.qwen3_5_mtp:Qwen3_5MTP"
 _QWEN35_MOE_MTP_MODEL = "vllm_torchtpu.models.vllm.qwen3_5_mtp:Qwen3_5MoeMTP"
 _QWEN4_EXP_MODEL = "vllm_torchtpu.models.vllm.qwen4_exp.model:Qwen4ExpForCausalLM"
+_ERNIE5_5_MODEL = "vllm_torchtpu.models.vllm.ernie5_5:Ernie5_5ForCausalLM"
 
 
 class _TPUKimiK3Config(VerifyAndUpdateConfig):
@@ -64,3 +65,28 @@ def register_models() -> None:
     MODELS_CONFIG_MAP["Qwen4ExpForCausalLM"] = TPUQwen4ExpConfig
     MODELS_CONFIG_MAP["Qwen4ExpForConditionalGeneration"] = TPUQwen4ExpConfig
     MODELS_CONFIG_MAP["Qwen2ForCausalLM"] = _TPUQwen2Config
+    _register_ernie5_5()
+
+
+def _register_ernie5_5() -> None:
+    """ERNIE 5.5: no transformers config class and no remote code in the checkpoint, so
+    register the config (vLLM-ERNIE's own registration, patches.py) and mark it
+    DeepSeek-MLA for vLLM's arch-config conversion."""
+    from vllm.model_executor.models import ModelRegistry
+    from vllm.transformers_utils.config import _CONFIG_REGISTRY
+    from vllm.transformers_utils.model_arch_config_convertor import (
+        MODEL_ARCH_CONFIG_CONVERTORS,
+        ModelArchConfigConvertorBase,
+    )
+
+    from vllm_torchtpu.models.vllm.ernie5_5.config import Ernie5_5Config
+
+    class _Ernie5_5ArchConfigConvertor(ModelArchConfigConvertorBase):
+        def is_deepseek_mla(self) -> bool:
+            return True
+
+    _CONFIG_REGISTRY.setdefault(Ernie5_5Config.model_type, Ernie5_5Config)
+    MODEL_ARCH_CONFIG_CONVERTORS.setdefault(
+        Ernie5_5Config.model_type, _Ernie5_5ArchConfigConvertor
+    )
+    ModelRegistry.register_model("Ernie5_5_MoeForCausalLM", _ERNIE5_5_MODEL)

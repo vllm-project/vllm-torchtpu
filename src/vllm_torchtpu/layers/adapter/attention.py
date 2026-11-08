@@ -2239,9 +2239,51 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 allow_masked_dense=allow_masked_dense,
             )
 
+        def sparse_mla_attention_sinks_core_tpu(
+            kv_cache_nope: jax.Array,
+            kv_cache_rope: jax.Array,
+            ql_nope: jax.Array,
+            q_pe: jax.Array,
+            kv_c_normed: jax.Array,
+            k_pe: jax.Array,
+            topk_indices: jax.Array,
+            seq_lens: jax.Array,
+            block_tables: jax.Array,
+            query_start_loc: jax.Array,
+            request_distribution: jax.Array,
+            sinks: jax.Array,
+        ) -> tuple[jax.Array, jax.Array, jax.Array]:
+            nope_spec, rope_spec = layer.mla_kv_spec
+            return sparse_mla_attention(
+                ql_nope,
+                q_pe,
+                kv_c_normed,
+                k_pe,
+                kv_cache_nope,
+                kv_cache_rope,
+                topk_indices,
+                seq_lens,
+                block_tables,
+                query_start_loc,
+                request_distribution,
+                vllm_context.mesh,
+                nope_spec,
+                rope_spec,
+                sm_scale=layer.scale,
+                k_scale=k_scale,
+                sinks=sinks,
+            )
+
+        # Per-head sink logits (ERNIE 5.5 DSA, f32 [num_heads]) set by the model on the
+        # attention layer; the wrapper folds them in through the kernel's log-sum-exp.
+        sinks_param = getattr(layer, "attn_sinks", None)
         op_name = f"pallas::sparse_mla_attention_{layer.layer_name.replace('.', '_')}"
         sparse_mla_jax_op = pallas.jax_op(
-            op_name, sparse_mla_attention_core_tpu, donate_argnums=(0, 1)
+            op_name,
+            sparse_mla_attention_core_tpu
+            if sinks_param is None
+            else sparse_mla_attention_sinks_core_tpu,
+            donate_argnums=(0, 1),
         )
 
         def _fake_sparse_mla(
@@ -2290,6 +2332,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 block_tables,
                 query_start_loc,
                 request_distribution,
+                *(() if sinks_param is None else (sinks_param,)),
             )
             nope_cache.copy_(new_nope)
             rope_cache.copy_(new_rope)
