@@ -83,6 +83,9 @@ if TYPE_CHECKING:
     TPU_MLA_MASKED_DENSE_MAX_KV_LEN: int | None = None
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
+    TPU_GDN_PACKED_TOKENS: bool = False
+    TPU_GDN_SINGLE_LAUNCH: bool = False
+    TPU_GDN_TWO_SLOT_CKPT: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_PACKED_DISPATCH: bool = False
@@ -464,6 +467,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_GDN_CONV_QK_PAIR_LAYOUT": env_bool(
         "TPU_GDN_CONV_QK_PAIR_LAYOUT", default=False
     ),
+    # Pooled GDN verify windows: hand qkv, b and a to the kernels as one
+    # [tokens, dim / 128 + 2, 128] array instead of one [tokens, 1, width]
+    # array each, so no per-layer relayout pads every token row to 8.
+    "TPU_GDN_PACKED_TOKENS": env_bool("TPU_GDN_PACKED_TOKENS", default=False),
+    # Pooled GDN: run the batched (decode / verify) and the per-sequence
+    # (prefill) segments in one kernel, so decode steps launch no empty
+    # per-sequence kernel.
+    "TPU_GDN_SINGLE_LAUNCH": env_bool("TPU_GDN_SINGLE_LAUNCH", default=False),
+    # Speculative decoding on the unified pool: keep two GDN state blocks per
+    # request (the verify window's start state and its last state) instead of
+    # one per window position; a partially accepted window is recomputed from
+    # the start state at the next step (kernels/gdn/v3/window_tile.py). Same
+    # outputs, num_speculative_tokens - 1 fewer blocks per GDN group.
+    "TPU_GDN_TWO_SLOT_CKPT": env_bool("TPU_GDN_TWO_SLOT_CKPT", default=False),
     # Register the DeepSeek-V4 tokenizer that honors continue_final_message.
     # Off by default so tokenizer behavior matches stock vLLM; the DSv4
     # eval config turns it on, since a prefilled assistant turn needs it.
