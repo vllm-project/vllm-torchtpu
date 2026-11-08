@@ -122,6 +122,7 @@ if TYPE_CHECKING:
     TPU_MOE_A2A_STREAMED_COMBINE: bool = False
     TPU_MOE_A2A_OWNER_COMBINE: bool = False
     TPU_MOE_A2A_SORTED_PLAN: bool = False
+    TPU_MOE_EXPERT_PLACEMENT: str = ""
     PCP_FA_KERNEL_BLOCK_SIZE: int | None = None
     PCP_GDN_COMM_CHUNK_SIZE: int | None = None
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
@@ -312,6 +313,14 @@ def env_float(env_name: str, default: float) -> Callable[[], float]:
             ) from exc
 
     return _get_float_env
+
+
+def _a2a_capacity(env_name: str, default: float) -> float:
+    """A ragged all-to-all capacity factor: 2 by default when an expert
+    placement file is set, else ``default``."""
+    if os.getenv("TPU_MOE_EXPERT_PLACEMENT", "").strip():
+        default = 2.0
+    return env_float(env_name, default)()
 
 
 def env_str(env_name: str, default: str) -> Callable[[], str]:
@@ -838,12 +847,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_A2A_UNQUANTIZED": env_bool("TPU_MOE_A2A_UNQUANTIZED"),
     # Ragged all-to-all exchange: size the per-rank token rows and local routes
     # at this many times their uniform-routing mean (exact: a step that does
-    # not fit runs the full-size exchange). 0 = always full size.
-    "TPU_MOE_A2A_CAPACITY": env_float("TPU_MOE_A2A_CAPACITY", 2.5),
+    # not fit runs the full-size exchange). 0 = always full size. Default 2.5,
+    # or 2 with TPU_MOE_EXPERT_PLACEMENT (a placement balanced on routing
+    # counts keeps the busiest rank near the mean).
+    "TPU_MOE_A2A_CAPACITY": lambda: _a2a_capacity("TPU_MOE_A2A_CAPACITY", 2.5),
     # The local routes' factor (0 = TPU_MOE_A2A_CAPACITY): real routing skews
     # routes more than rows. Both factors are capped at 2 where the full-size
-    # exchange stays on the one-hot path (its rerun is cheap there).
-    "TPU_MOE_A2A_ROUTE_CAPACITY": env_float("TPU_MOE_A2A_ROUTE_CAPACITY", 3.0),
+    # exchange stays on the one-hot path (its rerun is cheap there). Default 3,
+    # or 2 with TPU_MOE_EXPERT_PLACEMENT.
+    "TPU_MOE_A2A_ROUTE_CAPACITY": lambda: _a2a_capacity(
+        "TPU_MOE_A2A_ROUTE_CAPACITY", 3.0
+    ),
     # Ragged all-to-all exchange: the capacity rows grow in tiles of this many
     # rows (16 or 32; at 32 ranks and 96 tokens per engine, x2 gives 432 rows
     # in 16-row tiles and 448 in 32-row tiles, whose relayouts cost less).
@@ -871,6 +885,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # routing, carrying each route's destination, instead of reading,
     # sorting and looking up the received rows' routes.
     "TPU_MOE_A2A_SORTED_PLAN": env_bool("TPU_MOE_A2A_SORTED_PLAN"),
+    # Place each named MoE layer's experts by this .npz (logical expert ->
+    # physical slot, e.g. balanced on routing counts; see
+    # layers/core/expert_placement.py). Unset = linear placement.
+    "TPU_MOE_EXPERT_PLACEMENT": lambda: os.getenv("TPU_MOE_EXPERT_PLACEMENT", ""),
     # Override the PCP full-attention kernel page without changing KV manager pages.
     "PCP_FA_KERNEL_BLOCK_SIZE": env_positive_int_or_none("PCP_FA_KERNEL_BLOCK_SIZE"),
     # GDN stage/projection budget; token ownership still follows PCP interleave.
