@@ -106,6 +106,9 @@ if TYPE_CHECKING:
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
+    TPU_MOE_RAGGED_A2A: bool = False
+    TPU_MOE_A2A_CAPACITY: float = 2.5
+    TPU_MOE_A2A_ROUTE_CAPACITY: float = 3.0
     TPU_DECODE_FAST_PATHS: bool = False
     TPU_DECODE_FAST_PATHS_OFF: str = ""
     PCP_FA_KERNEL_BLOCK_SIZE: int | None = None
@@ -689,8 +692,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     if (val := os.getenv("VLLM_TPU_MOST_MODEL_LEN")) is not None
     else None,
     # Skip padded tokens from MoE, otherwise they will route like
-    # real tokens and activate experts whose output is thrown away.
-    "TPU_MOE_SKIP_PADDED_TOKENS": env_bool("TPU_MOE_SKIP_PADDED_TOKENS"),
+    # real tokens and activate experts whose output is thrown away. On by
+    # default with TPU_MOE_RAGGED_A2A, whose exchange would otherwise carry the
+    # padded tokens; an explicit 0 or 1 is honored with or without it.
+    "TPU_MOE_SKIP_PADDED_TOKENS": lambda: env_bool(
+        "TPU_MOE_SKIP_PADDED_TOKENS", default=env_bool("TPU_MOE_RAGGED_A2A")()
+    )(),
     # Hierarchical MoE parallelism: expert-parallel between chips,
     # tensor-parallel between the two chiplets of a chip. Off by
     # default; it helps only at low concurrency, where the MoE is
@@ -794,6 +801,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_COLLECTION_CHUNK_SIZE": lambda: int(
         os.getenv("TPU_MOE_COLLECTION_CHUNK_SIZE") or "0"
     ),
+    # Grouped-matmul MoE under DP + EP: exchange tokens with a ragged
+    # all-to-all inside each DP group (each token once to each member hosting
+    # one of its experts) instead of an all-gather and a reduce-scatter.
+    # Unquantized (bf16) layers without expert biases, such as an MTP draft
+    # layer, take the exchange too. The exchange's bitwise paths are on with
+    # it; decode_switches.PATHS lists them and TPU_DECODE_FAST_PATHS_OFF
+    # turns single ones off. Where the layer allows it, each token's owner TP
+    # rank sums the expert and shared-expert outputs in f32 and the engine
+    # all-gathers the sums, so the MoE output needs no TP all-reduce; the
+    # expert kernel's tail can do that sum itself (a2a_owner_tail).
+    "TPU_MOE_RAGGED_A2A": env_bool("TPU_MOE_RAGGED_A2A"),
+    # Ragged all-to-all exchange: size the per-rank token rows and local routes
+    # at this many times their uniform-routing mean (exact: a step that does
+    # not fit runs the full-size exchange). 0 = always full size.
+    "TPU_MOE_A2A_CAPACITY": env_float("TPU_MOE_A2A_CAPACITY", 2.5),
+    # The local routes' factor (0 = TPU_MOE_A2A_CAPACITY): real routing skews
+    # routes more than rows. Both factors are capped at 2 where the full-size
+    # exchange stays on the one-hot path (its rerun is cheap there).
+    "TPU_MOE_A2A_ROUTE_CAPACITY": env_float("TPU_MOE_A2A_ROUTE_CAPACITY", 3.0),
     # Bitwise decode paths of kernels other models share (decode_switches.PATHS:
     # xla_schedule).
     "TPU_DECODE_FAST_PATHS": env_bool("TPU_DECODE_FAST_PATHS"),

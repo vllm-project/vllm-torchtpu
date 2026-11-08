@@ -7114,13 +7114,19 @@ class TPUModelRunner(GPUModelRunner):
                 )
         self._refresh_request_caps(kv_cache_config)
 
-    def _token_padding_update(self, num_tokens_padded: int) -> None:
-        """Record which of this step's token rows are padding."""
+    def _token_padding_update(
+        self, num_tokens_padded: int, num_valid_tokens: int | None = None
+    ) -> None:
+        """Record which of this step's token rows are padding: rows from
+        ``num_valid_tokens`` on (a draft forward's count), else past the last
+        target plan's tokens."""
         padding_state = getattr(self, "_token_padding_state", None)
         if padding_state is None:
             return
         plan = self._last_sequence_layout_plan
-        if plan is not None and plan.kind is SequenceLayoutKind.ALL:
+        if num_valid_tokens is not None:
+            num_valid_tokens = min(num_valid_tokens, num_tokens_padded)
+        elif plan is not None and plan.kind is SequenceLayoutKind.ALL:
             num_valid_tokens = min(plan.local_num_tokens, num_tokens_padded)
         else:
             # Padding-mask support is currently limited to the ALL layout.
