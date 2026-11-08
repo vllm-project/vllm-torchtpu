@@ -206,17 +206,20 @@ def bind_raw_pools(
     kda = [
         (layer, name, cache) for layer, name, cache in layers if not is_mla_layer(layer)
     ]
-    if len(mla) != MLA_LAYERS or len(kda) != KDA_LAYERS:
+    valid_counts = (len(mla) == MLA_LAYERS and len(kda) == KDA_LAYERS) or (
+        1 <= len(mla) <= MLA_LAYERS and len(kda) == len(mla) * CONV_CHANNEL_GROUPS
+    )
+    if not valid_counts:
         msg = (
             f"expected {MLA_LAYERS} MLA and {KDA_LAYERS} KDA layers, "
             f"found {len(mla)} and {len(kda)}"
         )
         raise RuntimeError(msg)
-    mla_raw, mla_names = [0] * MLA_LAYERS, [""] * MLA_LAYERS
+    mla_raw, mla_names = [0] * len(mla), [""] * len(mla)
     for layer, name, cache in mla:
         mla_raw[mla_state_index(layer)] = index_of(_raw_tensor(cache))
         mla_names[mla_state_index(layer)] = name
-    kda_raw, kda_names = [0] * KDA_LAYERS, [""] * KDA_LAYERS
+    kda_raw, kda_names = [0] * len(kda), [""] * len(kda)
     for layer, name, cache in kda:
         kda_raw[kda_state_index(layer)] = index_of(_raw_tensor(cache))
         kda_names[kda_state_index(layer)] = name
@@ -224,7 +227,14 @@ def bind_raw_pools(
         shapes = [tuple(t.shape) for t in raw_pools]
         msg = f"the unified pools differ in shape: {shapes}"
         raise NotImplementedError(msg)
-    cache_layout(kv_cache_dtype or str(raw_pools[0].dtype)).check(raw_pools)
+    layout = cache_layout(kv_cache_dtype or str(raw_pools[0].dtype))
+    if len(mla) < MLA_LAYERS:
+        layout = dataclasses.replace(
+            layout,
+            attention_layers=layout.attention_layers[: len(mla)],
+            state_layers=layout.state_layers[: len(kda)],
+        )
+    layout.check(raw_pools)
     return raw_pools, mla_raw, kda_raw, mla_names, kda_names
 
 
@@ -369,20 +379,82 @@ def read_kda_states(
     kda_raw: Sequence[int],
     kda_blocks: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Unpack all 69 KDA ``(conv, recurrent)`` states from unified pools."""
+    """Unpack all KDA ``(conv, recurrent)`` states from unified pools."""
+    num_kda = len(kda_raw) or KDA_LAYERS
     blocks_list = [
         int(x) for x in kda_blocks.detach().to(device="cpu").reshape(-1).tolist()
     ]
-    if len(blocks_list) != KDA_LAYERS:
-        msg = f"expected {KDA_LAYERS} KDA block ids, got {len(blocks_list)}"
+    if len(blocks_list) != num_kda:
+        msg = f"expected {num_kda} KDA block ids, got {len(blocks_list)}"
         raise ValueError(msg)
     conv_rows: list[torch.Tensor] = []
     rec_rows: list[torch.Tensor] = []
-    for k_idx in range(KDA_LAYERS):
+    for k_idx in range(num_kda):
         c_row, r_row = unpack_kda_state(raw_pools[kda_raw[k_idx]], blocks_list[k_idx])
         conv_rows.append(c_row)
         rec_rows.append(r_row)
     return torch.stack(conv_rows, dim=0), torch.stack(rec_rows, dim=0)
+
+
+def pack_kda_state(
+    raw_pool: torch.Tensor,
+    block_id: int,
+    conv: torch.Tensor,
+    recurrent: torch.Tensor,
+) -> None:
+    """Pack one KDA layer's ``(conv, recurrent)`` state into ``raw_pool``."""
+    if block_id <= 0:
+        return
+    block_u8 = raw_pool[block_id].contiguous().view(torch.uint8)
+    ssm_u8 = block_u8[:SSM_ROWS].contiguous().view(torch.float32).reshape(-1, HEAD_DIM)
+    ssm_u8[: KDA_HEADS * HEAD_DIM] = recurrent.to(
+        dtype=torch.float32, device=raw_pool.device
+    ).reshape(KDA_HEADS * HEAD_DIM, HEAD_DIM)
+    block_u8[:SSM_ROWS] = ssm_u8.view(torch.uint8).reshape(block_u8[:SSM_ROWS].shape)
+    conv_u8 = (
+        block_u8[SSM_ROWS : SSM_ROWS + CONV_ROWS]
+        .contiguous()
+        .view(torch.bfloat16)
+        .reshape(-1)
+    )
+    active_elems = CONV_TAPS * CONV_CHANNEL_GROUPS * KDA_HEADS * HEAD_DIM
+    conv_active = (
+        conv[:, :, :KDA_HEADS, :]
+        .to(dtype=torch.bfloat16, device=raw_pool.device)
+        .contiguous()
+        .reshape(-1)
+    )
+    conv_u8[:active_elems] = conv_active[:active_elems]
+    block_u8[SSM_ROWS : SSM_ROWS + CONV_ROWS] = conv_u8.view(torch.uint8).reshape(
+        block_u8[SSM_ROWS : SSM_ROWS + CONV_ROWS].shape
+    )
+    raw_pool[block_id].copy_(
+        block_u8.view(raw_pool.dtype).reshape(raw_pool[block_id].shape)
+    )
+
+
+def write_kda_states(
+    raw_pools: Sequence[torch.Tensor],
+    kda_raw: Sequence[int],
+    kda_blocks: torch.Tensor,
+    conv: torch.Tensor,
+    recurrent: torch.Tensor,
+) -> None:
+    """Pack all KDA ``(conv, recurrent)`` states back into unified pools."""
+    num_kda = len(kda_raw) or KDA_LAYERS
+    blocks_list = [
+        int(x) for x in kda_blocks.detach().to(device="cpu").reshape(-1).tolist()
+    ]
+    if len(blocks_list) != num_kda:
+        msg = f"expected {num_kda} KDA block ids, got {len(blocks_list)}"
+        raise ValueError(msg)
+    for k_idx in range(num_kda):
+        pack_kda_state(
+            raw_pools[kda_raw[k_idx]],
+            blocks_list[k_idx],
+            conv[k_idx],
+            recurrent[k_idx],
+        )
 
 
 class KdaImporter:
@@ -401,6 +473,7 @@ class KdaImporter:
             if state_perm is None
             else tuple((int(a), int(b)) for a, b in state_perm)
         )
+        self.state_perm = self._state_perm
         self._mesh = mesh
         self._attention_dp = int(attention_dp)
         self._num_slots = int(num_slots)
@@ -410,6 +483,7 @@ class KdaImporter:
         self.mla_layer_names: list[str] = []
         self.kda_layer_names: list[str] = []
         self._op: Callable[..., tuple[torch.Tensor, torch.Tensor]] | None = None
+        self._export_op: Callable[..., tuple[torch.Tensor, ...]] | None = None
         self._ring_op: Callable[..., tuple[torch.Tensor, torch.Tensor]] | None = None
 
     def bind(
@@ -435,10 +509,10 @@ class KdaImporter:
         conv_dtype: jax.typing.DTypeLike,
         recurrent_dtype: jax.typing.DTypeLike,
     ) -> tuple[jax.Array, jax.Array]:
-        """Gather all 69 KDA conv and recurrent states from ``raws``."""
+        """Gather all KDA conv and recurrent states from ``raws``."""
         conv_rows: list[jax.Array] = []
         recurrent_rows: list[jax.Array] = []
-        for k in range(KDA_LAYERS):
+        for k in range(len(kda_raw)):
             raw, ids = raws[kda_raw[k]], kda_blocks[k : k + 1]
             ssm = pool_adapters.gather_region(
                 raw,
@@ -624,6 +698,205 @@ class KdaImporter:
             sync_mod = importlib.import_module("torch_tpu._internal.sync")
             sync_mod.synchronize([conv_out, rec_out], wait=False)
         return conv_out, rec_out
+
+    @staticmethod
+    def _scatter_states(
+        raws: Sequence[jax.Array],
+        kda_raw: Sequence[int],
+        kda_blocks: jax.Array,
+        conv_state: jax.Array,
+        recurrent_state: jax.Array,
+    ) -> list[jax.Array]:
+        """Scatter all KDA conv and recurrent states back into ``raws``."""
+        out_raws = list(raws)
+        for k in range(len(kda_raw)):
+            pool_idx = kda_raw[k]
+            raw, ids = out_raws[pool_idx], kda_blocks[k : k + 1]
+            ssm_shape = jax.eval_shape(
+                lambda r=raw, i=ids: pool_adapters.gather_region(
+                    r,
+                    i,
+                    tok0=0,
+                    ntok=SSM_ROWS,
+                    out_dtype=jnp.float32,
+                    out_lanes=HEAD_DIM,
+                )
+            ).shape
+            ssm_prev = pool_adapters.gather_region(
+                raw,
+                ids,
+                tok0=0,
+                ntok=SSM_ROWS,
+                out_dtype=jnp.float32,
+                out_lanes=HEAD_DIM,
+            )
+            rec_flat = (
+                recurrent_state[k]
+                .astype(jnp.float32)
+                .reshape(1, KDA_HEADS * HEAD_DIM, HEAD_DIM)
+            )
+            ssm_updated = ssm_prev.at[:, : KDA_HEADS * HEAD_DIM, :].set(rec_flat)
+            raw = pool_adapters.scatter_region(
+                raw,
+                ssm_updated.reshape(ssm_shape),
+                ids,
+                tok0=0,
+                ntok=SSM_ROWS,
+            )
+            taps_shape = jax.eval_shape(
+                lambda r=raw, i=ids: pool_adapters.gather_region(
+                    r,
+                    i,
+                    tok0=SSM_ROWS,
+                    ntok=CONV_ROWS,
+                    out_dtype=jnp.bfloat16,
+                )
+            ).shape
+            taps_prev = pool_adapters.gather_region(
+                raw,
+                ids,
+                tok0=SSM_ROWS,
+                ntok=CONV_ROWS,
+                out_dtype=jnp.bfloat16,
+            ).reshape(-1)
+            active_elems = CONV_TAPS * CONV_CHANNEL_GROUPS * KDA_HEADS * HEAD_DIM
+            conv_active = (
+                conv_state[k, :, :, :KDA_HEADS, :]
+                .astype(jnp.bfloat16)
+                .reshape(active_elems)
+            )
+            taps_updated = (
+                taps_prev.at[:active_elems].set(conv_active).reshape(taps_shape)
+            )
+            out_raws[pool_idx] = pool_adapters.scatter_region(
+                raw,
+                taps_updated,
+                ids,
+                tok0=SSM_ROWS,
+                ntok=CONV_ROWS,
+            )
+        return out_raws
+
+    def _build_export(self) -> Callable[..., tuple[torch.Tensor, ...]]:
+        """Register and return the TPU custom op for KDA state export."""
+        if self._export_op is not None:
+            return self._export_op
+        bridge = importlib.import_module(".runtime_shim.bridge", __package__)
+        register_op: Callable[..., Callable[..., tuple[torch.Tensor, ...]]] = (
+            bridge.register_op
+        )
+        num_raw, kda_raw, perm = (
+            len(self.raw_pools),
+            tuple(self.kda_raw),
+            self._state_perm,
+        )
+        inv_perm = None if perm is None else tuple((dst, src) for src, dst in perm)
+        dp, num_slots = self._attention_dp, self._num_slots
+        share = group_slots(num_slots, dp) - 1
+        world = self._mesh.size
+        group = world // dp
+
+        def body(
+            conv_in: jax.Array,
+            recurrent_in: jax.Array,
+            *args: jax.Array,
+        ) -> tuple[jax.Array, ...]:
+            """Export ``slot`` from ``conv_in`` and ``recurrent_in`` into ``raws``."""
+            conv, recurrent = conv_in[0], recurrent_in[0]
+            raws, (kda_blocks, slot) = args[:num_raw], args[num_raw:]
+            local = slot[0]
+            if dp > 1:
+                owner = (slot[0] - 1) // share
+                rank = jax.lax.axis_index(MESH_AXIS)
+                k = (owner - rank // group) % dp
+                local = (slot[0] - owner * share) + k * (share + 1)
+            conv_state = conv[local]
+            recurrent_state = recurrent[local]
+            if inv_perm is not None:
+                conv_state = jax.lax.ppermute(conv_state, MESH_AXIS, inv_perm)
+                recurrent_state = jax.lax.ppermute(recurrent_state, MESH_AXIS, inv_perm)
+            updated = KdaImporter._scatter_states(
+                raws,
+                kda_raw,
+                kda_blocks,
+                conv_state,
+                recurrent_state,
+            )
+            return tuple(r[None] for r in updated)
+
+        self._export_op = register_op(
+            f"pallas::k3_decode_export_kda_r{num_raw}",
+            self._mesh,
+            body,
+            bridge.OpRegistrationSpec(
+                in_specs=(P(MESH_AXIS),) * (2 + num_raw) + (P(), P()),
+                out_specs=(P(MESH_AXIS),) * num_raw,
+                donate_argnums=tuple(range(2, 2 + num_raw)),
+                export_key=repr(("export_kda", kda_raw, perm, dp, num_slots)),
+            ),
+        )
+        return self._export_op
+
+    def _export_state_cpu(
+        self,
+        conv: torch.Tensor,
+        recurrent: torch.Tensor,
+        kda_blocks: torch.Tensor,
+        slot: int,
+    ) -> list[torch.Tensor]:
+        """Export 69 KDA states from ``slot`` back into ``kda_blocks`` on CPU."""
+        if slot <= 0:
+            return list(self.raw_pools)
+        local_idx = slot
+        if self._attention_dp > 1:
+            share = group_slots(self._num_slots, self._attention_dp) - 1
+            owner = (slot - 1) // share
+            if owner != 0:
+                return list(self.raw_pools)
+            local_idx = slot - owner * share
+        if conv.ndim == BATCHED_CONV_BANK_NDIM:
+            conv_slot = conv[0, local_idx]
+            rec_slot = recurrent[0, local_idx]
+        else:
+            conv_slot = conv[local_idx]
+            rec_slot = recurrent[local_idx]
+        write_kda_states(
+            self.raw_pools,
+            self.kda_raw,
+            kda_blocks,
+            conv_slot,
+            rec_slot,
+        )
+        return list(self.raw_pools)
+
+    def export_state(
+        self,
+        conv: torch.Tensor,
+        recurrent: torch.Tensor,
+        kda_blocks: torch.Tensor,
+        slot: int | torch.Tensor,
+    ) -> list[torch.Tensor]:
+        """Copy ``slot`` of ``(conv, recurrent)`` back into ``kda_blocks``."""
+        slot_val = int(slot.item()) if isinstance(slot, torch.Tensor) else int(slot)
+        if conv.device.type == "cpu":
+            return self._export_state_cpu(conv, recurrent, kda_blocks, slot_val)
+        blocks_t = kda_blocks.to(device=conv.device, dtype=torch.int32).contiguous()
+        slot_tensor = torch.tensor([slot_val], dtype=torch.int32, device=conv.device)
+        if conv.device.type == "tpu":
+            sync_mod = importlib.import_module("torch_tpu._internal.sync")
+            sync_mod.synchronize([blocks_t, slot_tensor], wait=False)
+        out = self._build_export()(
+            conv,
+            recurrent,
+            *self.raw_pools,
+            blocks_t,
+            slot_tensor,
+        )
+        out_list = list(out)
+        if conv.device.type == "tpu":
+            sync_mod = importlib.import_module("torch_tpu._internal.sync")
+            sync_mod.synchronize(out_list, wait=False)
+        return out_list
 
     def import_ring(
         self,

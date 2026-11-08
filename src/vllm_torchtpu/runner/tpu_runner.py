@@ -25,7 +25,7 @@ import dataclasses
 import math
 import os
 import time
-from collections.abc import Callable, Collection, Iterator, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -3738,7 +3738,11 @@ class TPUModelRunner(GPUModelRunner):
             # read-offset scatter.
             unified_mamba_state_indices=(
                 []
-                if self._unified_kv_layout and self.mamba_slot_read_offsets is not None
+                if self._unified_kv_layout
+                and (
+                    self.mamba_slot_read_offsets is not None
+                    or self._megakernel is not None
+                )
                 else None
             ),
             sequence_layout_descriptor=layout_plan.descriptor,
@@ -4782,6 +4786,15 @@ class TPUModelRunner(GPUModelRunner):
                 (next_tokens[:num_reqs] != INVALID_TOKEN_ID).sum(dim=1).to(torch.int32)
             )
             offsets[:num_reqs] = (num_valid - 1).clamp(min=0)
+            if getattr(self, "_megakernel", None) is not None:
+                on_verify_fn = getattr(self._megakernel, "on_verify_accepted", None)
+                if callable(on_verify_fn):
+                    batch_obj = getattr(self, "input_batch", None)
+                    batch_reqs = getattr(batch_obj, "req_ids", None)
+                    active_req_ids = (
+                        list(batch_reqs[:num_reqs]) if batch_reqs is not None else None
+                    )
+                    on_verify_fn(active_req_ids, num_valid)
         if len(indices_per_group) == 1:
             self.mamba_slot_read_offsets.index_put_(
                 (indices_per_group[0].long(),), offsets
@@ -6347,12 +6360,19 @@ class TPUModelRunner(GPUModelRunner):
                     inputs.append(self._pp_topk_buffer)
                 synchronize_tensors(inputs)
             started = time.perf_counter()
-            out, _ = self.forward_model(
-                input_ids=input_ids,
-                positions=position_ids,
-                inputs_embeds=inputs_embeds,
-                intermediate_tensors=intermediate_tensors,
-            )
+            if bool(vars(self).get("_megakernel_reclaimed_routed_experts", False)):
+                out = torch.zeros(
+                    (num_tokens, self.model_config.get_hidden_size()),
+                    dtype=self.dtype,
+                    device=self.device,
+                )
+            else:
+                out, _ = self.forward_model(
+                    input_ids=input_ids,
+                    positions=position_ids,
+                    inputs_embeds=inputs_embeds,
+                    intermediate_tensors=intermediate_tensors,
+                )
             if isinstance(out, IntermediateTensors):
                 if through_handoff:
                     # The output leaves padded to the hand-off buffer; it is
@@ -7285,9 +7305,9 @@ class TPUModelRunner(GPUModelRunner):
                     self.device, self.max_num_tokens, self._pp_intermediate_template
                 )
             self._pp_wave.warmup()
-        if self._megakernel is not None:
-            self._megakernel.bind_and_warmup(self)
         if self.enforce_eager:
+            if self._megakernel is not None:
+                self._megakernel.bind_and_warmup(self)
             return
         if self.lora_config is not None:
             lora_manager = self.lora_manager
@@ -7338,6 +7358,8 @@ class TPUModelRunner(GPUModelRunner):
                 self._warmup_spec_decode()
                 if self._adaptive_verification is not None:
                     self._init_adaptive_verification()
+        if self._megakernel is not None:
+            self._megakernel.bind_and_warmup(self)
 
     def _check_draft_buckets(self) -> None:
         """Refuses to start a producer whose draft lacks a target bucket.
@@ -8656,6 +8678,92 @@ class TPUModelRunner(GPUModelRunner):
             num_valid_tokens = num_tokens_padded
         padding_state.update(num_valid_tokens, num_tokens_padded)
 
+    def _resolve_megakernel_kda_tables(
+        self, n_active: int
+    ) -> torch.Tensor | dict[str, torch.Tensor] | None:
+        """Resolve per-request KDA state block tables for the active step."""
+        kda_tables = getattr(self, "_megakernel_kda_block_tables", None)
+        if kda_tables is not None or n_active <= 0:
+            return kda_tables
+        ctx = getattr(self, "_attn_metadata_builder_ctx", None)
+        u_idx = getattr(ctx, "unified_mamba_state_indices", None)
+        if not isinstance(u_idx, Sequence) or not u_idx:
+            return None
+        if not all(
+            isinstance(t, torch.Tensor) and int(t.shape[0]) >= n_active for t in u_idx
+        ):
+            return None
+        mamba_groups = [
+            group
+            for group_list in (getattr(self, "attn_groups", None) or ())
+            for group in group_list
+            if getattr(
+                (getattr(group, "metadata_builders", None) or (None,))[0],
+                "is_mamba_group",
+                False,
+            )
+        ]
+        if len(mamba_groups) == len(u_idx) and mamba_groups:
+            by_layer: list[tuple[int, torch.Tensor]] = []
+            for group, grp_tensor in zip(mamba_groups, u_idx, strict=True):
+                sliced = grp_tensor[:n_active]
+                for l_name in getattr(group, "layer_names", ()):
+                    parts = [p for p in str(l_name).split(".") if p.isdigit()]
+                    if parts:
+                        by_layer.append((int(parts[0]), sliced))
+            if by_layer:
+                by_layer.sort(key=lambda item: item[0])
+                return torch.stack([t for _, t in by_layer], dim=1)
+        return torch.stack([t[:n_active] for t in u_idx], dim=1)
+
+    def _build_megakernel_step_context(
+        self,
+        base_ctx: megakernel_runtime.StepContext,
+    ) -> megakernel_runtime.StepContext:
+        """Populate active/finished request IDs and KDA tables on `base_ctx`."""
+        batch_obj = getattr(self, "input_batch", None)
+        batch_reqs = getattr(batch_obj, "req_ids", None)
+        num_reqs = getattr(batch_obj, "num_reqs", None)
+        all_reqs = (
+            list(batch_reqs[:num_reqs])
+            if batch_reqs is not None and isinstance(num_reqs, int)
+            else (list(batch_reqs) if batch_reqs is not None else None)
+        )
+        b_ctx = getattr(self, "_attn_metadata_builder_ctx", None)
+        c_start = int(getattr(b_ctx, "start_index", 0) or 0)
+        c_num = getattr(b_ctx, "num_reqs", None)
+        step_req_ids = (
+            all_reqs[c_start : c_start + int(c_num)]
+            if all_reqs is not None and isinstance(c_num, int) and c_num > 0
+            else all_reqs
+        )
+        seen = getattr(self, "_megakernel_seen_reqs", None)
+        if not isinstance(seen, set):
+            seen = set()
+            self._megakernel_seen_reqs = seen
+        finished_ids: list[str] = [
+            str(r) for r in (getattr(self, "_megakernel_finished_req_ids", None) or ())
+        ]
+        active_map = getattr(self, "requests", None)
+        if isinstance(active_map, Mapping):
+            finished_ids.extend(
+                r_id
+                for r_id in list(seen)
+                if r_id not in active_map and r_id not in finished_ids
+            )
+        seen.difference_update(finished_ids)
+        if step_req_ids:
+            seen.update(str(r_id) for r_id in step_req_ids)
+        kda_tables = self._resolve_megakernel_kda_tables(
+            len(step_req_ids) if step_req_ids else 0
+        )
+        return dataclasses.replace(
+            base_ctx,
+            req_ids=step_req_ids,
+            finished_req_ids=tuple(finished_ids) if finished_ids else None,
+            kda_block_tables=kda_tables,
+        )
+
     def forward_model(
         self,
         input_ids,
@@ -8669,17 +8777,17 @@ class TPUModelRunner(GPUModelRunner):
         if self._megakernel is not None:
             # A megakernel step returns what the stock model would; both go
             # through the normalization below.
-            hit, out = self._megakernel.try_forward(
-                self,
-                megakernel_runtime.StepContext(
-                    input_ids=input_ids,
-                    positions=positions,
-                    inputs_embeds=inputs_embeds,
-                    intermediate_tensors=intermediate_tensors,
-                    model_kwargs=model_kwargs,
-                    token_ids=megakernel_token_ids,
-                ),
+            step_ctx = megakernel_runtime.StepContext(
+                input_ids=input_ids,
+                positions=positions,
+                inputs_embeds=inputs_embeds,
+                intermediate_tensors=intermediate_tensors,
+                model_kwargs=model_kwargs,
+                token_ids=megakernel_token_ids,
             )
+            if hasattr(self, "_build_megakernel_step_context"):
+                step_ctx = self._build_megakernel_step_context(step_ctx)
+            hit, out = self._megakernel.try_forward(self, step_ctx)
 
         if not hit:
             # @support_torch_compile annotations will be put on the vLLM model

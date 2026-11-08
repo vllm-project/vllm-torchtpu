@@ -20,12 +20,15 @@ KimiDecoder, DsparkDraft, and MlaDsparkDraft on CPU.
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Callable, Generator
+import functools
+import gc
+from collections.abc import Callable, Generator, Sequence
 from unittest.mock import MagicMock, patch
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 import torch
 
 from vllm_torchtpu.kernels import pool_adapters
@@ -44,12 +47,19 @@ from vllm_torchtpu.models.kimi_k3.megakernel.kernels import (
 from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim import bridge
 
 
+@pytest.fixture(autouse=True)
+def _cleanup_memory_after_test() -> Generator[None, None, None]:
+    yield
+    jax.clear_caches()
+    gc.collect()
+
+
 def _torch_to_jax(tensor_or_val: object) -> object:
-    """Convert torch.Tensor to jax.Array safely on CPU."""
+    """Convert torch.Tensor to jax.Array safely without float32 copy."""
     if not isinstance(tensor_or_val, torch.Tensor):
         return tensor_or_val
     if tensor_or_val.dtype == torch.bfloat16:
-        return jnp.asarray(tensor_or_val.float().numpy(), dtype=jnp.bfloat16)
+        return jnp.asarray(tensor_or_val.view(torch.uint16).numpy()).view(jnp.bfloat16)
     return jnp.asarray(tensor_or_val.numpy())
 
 
@@ -77,73 +87,132 @@ def _mock_mesh_32() -> MagicMock:
     return mesh
 
 
-def _mock_kda(*_args: object, **_kwargs: object) -> Callable[..., object]:
-    """Mock leaf KDA SPMD kernel builder."""
+def _mock_kda(
+    captured_calls: list[dict[str, object]],
+) -> Callable[..., Callable[..., list[object]]]:
+    """Mock leaf KDA SPMD kernel builder with argument capture and type assertions."""
 
-    def kda_fn(
-        prefix: jax.Array,
+    def kda_builder(
+        *unused_args: object, **unused_kwargs: object
+    ) -> Callable[..., list[object]]:
+        def kda_fn(
+            prefix: jax.Array,
+            blocks: jax.Array,
+            attn_res: jax.Array,
+            attn_norm: jax.Array,
+            families: object,
+            recurrent: jax.Array,
+            conv: jax.Array,
+            active: jax.Array,
+            length: jax.Array,
+            slot: object,
+            segment_desc: jax.Array,
+            arena: object = None,
+        ) -> list[object]:
+            assert hasattr(segment_desc, "ndim") and segment_desc.ndim == 1, (
+                "segment_desc must be a 1D array"
+            )
+            assert segment_desc.dtype == jnp.int32, (
+                f"segment_desc must be int32, got {segment_desc.dtype}"
+            )
+            assert segment_desc.shape == (10,), (
+                f"segment_desc shape must be (10,), got {segment_desc.shape}"
+            )
+            if arena is not None:
+                assert hasattr(arena, "active") or hasattr(arena, "split"), (
+                    "arena must be an arena object"
+                )
+            captured_calls.append(
+                {"op": "kda", "segment_desc": segment_desc, "arena": arena}
+            )
+            return [
+                prefix,
+                prefix,
+                prefix,
+                recurrent[:, 0],
+                conv[:, 0],
+                prefix,
+                recurrent[:, 0],
+                conv[:, 0],
+            ]
+
+        return kda_fn
+
+    return kda_builder
+
+
+def _mock_mla(
+    captured_calls: list[dict[str, object]],
+) -> Callable[..., Callable[..., tuple[jax.Array, jax.Array]]]:
+    """Mock leaf MLA SPMD kernel builder with argument capture and type assertions."""
+
+    def mla_builder(
+        *unused_args: object, **unused_kwargs: object
+    ) -> Callable[..., tuple[jax.Array, jax.Array]]:
+        def mla_fn(
+            gathered: jax.Array,
+            prefix: jax.Array,
+            families: object,
+            segment_desc: jax.Array,
+            length: jax.Array,
+            slot: object,
+            arena: object,
+        ) -> tuple[jax.Array, jax.Array]:
+            assert hasattr(segment_desc, "ndim") and segment_desc.ndim == 1, (
+                "segment_desc must be a 1D array"
+            )
+            assert segment_desc.dtype == jnp.int32, (
+                f"segment_desc must be int32, got {segment_desc.dtype}"
+            )
+            assert segment_desc.shape == (10,), (
+                f"segment_desc shape must be (10,), got {segment_desc.shape}"
+            )
+            assert hasattr(arena, "active") or hasattr(arena, "split"), (
+                "arena must be an arena object"
+            )
+            captured_calls.append(
+                {"op": "mla", "segment_desc": segment_desc, "arena": arena}
+            )
+            return (prefix, jnp.zeros_like(prefix))
+
+        return mla_fn
+
+    return mla_builder
+
+
+def _mock_logits_sp(
+    *unused_args: object, **unused_kwargs: object
+) -> Callable[..., jax.Array]:
+    """Mock prefill logits SPMD kernel builder with segment_desc assertion."""
+
+    def logits_op(
+        _prefix: jax.Array,
         _blocks: jax.Array,
-        _attn_res: jax.Array,
-        _attn_norm: jax.Array,
-        _families: object,
-        rec: jax.Array,
-        hist: jax.Array,
-        _active: jax.Array,
-        _length: jax.Array,
-        _slot: object,
-        _seg: object,
-    ) -> list[object]:
-        """Mock leaf KDA kernel implementation."""
-        return [
-            prefix,
-            prefix,
-            prefix,
-            rec[:, 0],
-            hist[:, 0],
-            prefix,
-            rec[:, 0],
-            hist[:, 0],
-        ]
+        _output_res: jax.Array,
+        _final_norm: jax.Array,
+        _lm_head: jax.Array,
+        segment_desc: jax.Array,
+    ) -> jax.Array:
+        assert hasattr(segment_desc, "ndim") and segment_desc.ndim == 1, (
+            "segment_desc must be a 1D array"
+        )
+        assert segment_desc.dtype == jnp.int32, (
+            f"segment_desc must be int32, got {segment_desc.dtype}"
+        )
+        return jnp.zeros((32, 10, 16), dtype=jnp.float32)
 
-    return kda_fn
-
-
-def _mock_mla(*_args: object, **_kwargs: object) -> Callable[..., object]:
-    """Mock leaf MLA SPMD kernel builder."""
-    return lambda _gathered, prefix, _families, _seg, _length, _slot, _arena: (
-        prefix,
-        jnp.zeros((32, 64, 576), jnp.bfloat16),
-    )
-
-
-def _mock_group4(*_args: object, **_kwargs: object) -> Callable[..., object]:
-    """Mock group4 SPMD kernel builder."""
-
-    def _group4_fn(
-        prefix: jax.Array,
-        blocks: jax.Array,
-        _common: object,
-        _kda_f: object,
-        _mla_f: object,
-        _moe_f: object,
-        kda_s: object,
-        mla_s: object,
-        _length: object,
-        _group: object,
-        _seg: object,
-        _arena: object,
-    ) -> tuple[object, ...]:
-        """Mock group4 SPMD kernel implementation."""
-        return prefix, blocks, kda_s, mla_s, prefix
-
-    return _group4_fn
+    return logits_op
 
 
 @contextlib.contextmanager
 def _mock_execution_environment(
     mesh: MagicMock,
-) -> Generator[None, None, None]:
+    captured_calls: list[dict[str, object]] | None = None,
+) -> Generator[list[dict[str, object]], None, None]:
     """Provide scoped CPU mocks for megakernel execution without global leakage."""
+    if captured_calls is None:
+        captured_calls = []
+
     original_to = torch.Tensor.to
 
     def _safe_to(
@@ -171,33 +240,160 @@ def _mock_execution_environment(
 
         return op_wrapper
 
+    def _mock_commit_kda(
+        conv_state: jax.Array,
+        recurrent_state: jax.Array,
+        *unused_args: object,
+        **unused_kwargs: object,
+    ) -> tuple[jax.Array, jax.Array]:
+        return (conv_state, recurrent_state)
+
+    def _mock_decode_paged(*args: object, **kwargs: object) -> tuple[object, ...]:
+        return (jnp.zeros((1, 16)), args[1], args[2], ())
+
+    def _mock_embedding_sp(
+        *unused_args: object, **unused_kwargs: object
+    ) -> Callable[..., jax.Array]:
+        def embed_fn(tokens: object, embedding: object, length: object) -> jax.Array:
+            del tokens, embedding, length
+            return jnp.zeros((32, 64, 7168), jnp.bfloat16)
+
+        return embed_fn
+
+    def _mock_mixture_norm_sp(
+        *unused_args: object, **unused_kwargs: object
+    ) -> Callable[..., jax.Array]:
+        def mixture_fn(
+            after_attention: jax.Array,
+            blocks: object,
+            mlp_residual: object,
+            ffn_norm: object,
+            active_mask: object,
+        ) -> jax.Array:
+            del blocks, mlp_residual, ffn_norm, active_mask
+            return after_attention
+
+        return mixture_fn
+
+    def _mock_dense_ffn_sp(
+        *unused_args: object, **unused_kwargs: object
+    ) -> Callable[..., jax.Array]:
+        def dense_fn(
+            families: object,
+            after_norm: jax.Array,
+            dense_gu: object,
+            dense_down: object,
+            length: object,
+        ) -> jax.Array:
+            del families, dense_gu, dense_down, length
+            return after_norm
+
+        return dense_fn
+
+    def _mock_norm_gather_sp(
+        *unused_args: object, **unused_kwargs: object
+    ) -> Callable[..., tuple[jax.Array, jax.Array]]:
+        def norm_gather_fn(
+            prefix: jax.Array,
+            blocks: object,
+            attn_res: object,
+            attn_norm: object,
+            active_mask: object,
+        ) -> tuple[jax.Array, jax.Array]:
+            del blocks, attn_res, attn_norm, active_mask
+            return (prefix, prefix)
+
+        return norm_gather_fn
+
+    def _mock_indexed_moe_sp_ring(
+        *unused_args: object, **unused_kwargs: object
+    ) -> Callable[..., jax.Array]:
+        def moe_fn(
+            families: object,
+            after_norm: jax.Array,
+            moe_weights: object,
+            length: object,
+            active_mask: object,
+        ) -> jax.Array:
+            del families, moe_weights, length, active_mask
+            return after_norm
+
+        return moe_fn
+
+    def _noop_pass_through(
+        target_fn: Callable[..., object], *unused_args: object, **unused_kwargs: object
+    ) -> Callable[..., object]:
+        return target_fn
+
+    def _noop_pool_pass(
+        pool: object, *unused_args: object, **unused_kwargs: object
+    ) -> object:
+        return pool
+
+    def _mock_axis_idx(_axis_name: object) -> jnp.ndarray:
+        return jnp.int32(0)
+
+    def _mock_identity_op(
+        operand: object, *unused_args: object, **unused_kwargs: object
+    ) -> object:
+        return operand
+
+    def _mock_dynamic_update_slice_fn(
+        operand: object, update: object, *indices: object
+    ) -> object:
+        del update, indices
+        return operand
+
+    def _mock_dynamic_index_in_dim_fn(
+        operand: jnp.ndarray,
+        index: object,
+        axis: int = 0,
+        keepdims: bool = False,
+    ) -> jnp.ndarray:
+        del index, keepdims
+        return jnp.take(operand, 0, axis=axis)
+
+    def _mock_fori_loop(
+        lower: int,
+        upper: int,
+        body: Callable[[jax.Array, object], object],
+        init: object,
+        **unused_kwargs: object,
+    ) -> object:
+        del upper, unused_kwargs
+        idx = jnp.int32(lower)
+        jax.make_jaxpr(body)(idx, init)
+        return body(idx, init)
+
+    def _mock_kernel_mesh(
+        _axis: object, size: int | None = None
+    ) -> tuple[MagicMock, int]:
+        del size
+        return (mesh, 0)
+
+    def _mock_named_sharding(_mesh: object, _spec: object) -> MagicMock:
+        return MagicMock()
+
+    def _mock_zeros_sharded(
+        _self: object, shape: Sequence[int], dtype: object
+    ) -> jnp.ndarray:
+        return jnp.zeros(shape, dtype)
+
     patches = [
         patch.object(torch.Tensor, "to", _safe_to),
-        patch.object(jax, "jit", lambda fn, **_kw: fn),
-        patch.object(jax, "shard_map", lambda fn, *_a, **_kw: fn),
-        patch.object(pool_adapters, "scatter_region", lambda pool, *_a, **_kw: pool),
-        patch.object(
-            paged,
-            "_commit_kda_states",
-            lambda conv, rec, *_a, **_kw: (conv, rec),
-        ),
-        patch.object(
-            paged,
-            "decode_paged",
-            lambda *_a, **_kw: (jnp.zeros((1, 16)), _a[1], _a[2], ()),
-        ),
-        patch.object(jax.lax, "axis_index", lambda _axis: jnp.int32(0)),
-        patch.object(jax.lax, "psum", lambda x, *_a, **_kw: x),
-        patch.object(jax.lax, "all_gather", lambda x, *_a, **_kw: x),
-        patch.object(jax.lax, "dynamic_update_slice", lambda op, _up, *_idx: op),
-        patch.object(
-            jax.lax,
-            "dynamic_index_in_dim",
-            lambda op, _idx, axis=0, keepdims=False: jnp.take(op, 0, axis=axis),
-        ),
-        patch.object(jax.lax, "fori_loop", lambda _l, _u, _body, init, **_kw: init),
-        patch.object(bridge, "kernel_mesh", lambda _axis, size=None: (mesh, 0)),
-        patch.object(prefill, "kernel_mesh", lambda _axis, size=None: (mesh, 0)),
+        patch.object(jax, "jit", _noop_pass_through),
+        patch.object(jax, "shard_map", _noop_pass_through),
+        patch.object(pool_adapters, "scatter_region", _noop_pool_pass),
+        patch.object(paged, "_commit_kda_states", _mock_commit_kda),
+        patch.object(paged, "decode_paged", _mock_decode_paged),
+        patch.object(jax.lax, "axis_index", _mock_axis_idx),
+        patch.object(jax.lax, "psum", _mock_identity_op),
+        patch.object(jax.lax, "all_gather", _mock_identity_op),
+        patch.object(jax.lax, "dynamic_update_slice", _mock_dynamic_update_slice_fn),
+        patch.object(jax.lax, "dynamic_index_in_dim", _mock_dynamic_index_in_dim_fn),
+        patch.object(jax.lax, "fori_loop", _mock_fori_loop),
+        patch.object(bridge, "kernel_mesh", _mock_kernel_mesh),
+        patch.object(prefill, "kernel_mesh", _mock_kernel_mesh),
         patch.object(bridge, "register_global_op", _intercept_register_op),
         patch.object(bridge, "register_op", _intercept_register_op),
         patch.object(prefill, "register_global_op", _intercept_register_op),
@@ -205,53 +401,32 @@ def _mock_execution_environment(
         patch.object(decode_ops, "register_op", _intercept_register_op),
         patch.object(decode, "register_global_op", _intercept_register_op),
         patch.object(draft, "register_global_op", _intercept_register_op),
-        patch.object(prefill_megakernel, "NamedSharding", lambda _m, _p: MagicMock()),
+        patch.object(prefill_megakernel, "NamedSharding", _mock_named_sharding),
+        patch.object(prefill.PrefillProgram, "_zeros_sharded", _mock_zeros_sharded),
+        patch.object(prefill_megakernel, "make_embedding_sp", _mock_embedding_sp),
         patch.object(
-            prefill.PrefillProgram,
-            "_zeros_sharded",
-            lambda _self, shape, dtype: jnp.zeros(shape, dtype),
+            prefill_megakernel, "make_norm_gather_kda_sp", _mock_kda(captured_calls)
         ),
-        patch.object(
-            prefill_megakernel,
-            "make_embedding_sp",
-            lambda _m, **_kw: lambda _tokens, _emb, _length: jnp.zeros(
-                (32, 64, 7168), jnp.bfloat16
-            ),
-        ),
-        patch.object(prefill_megakernel, "make_norm_gather_kda_sp", _mock_kda),
+        patch.object(prefill_megakernel, "make_mixture_norm_sp", _mock_mixture_norm_sp),
+        patch.object(prefill_megakernel, "make_dense_ffn_sp", _mock_dense_ffn_sp),
+        patch.object(prefill_megakernel, "make_norm_gather_sp", _mock_norm_gather_sp),
         patch.object(
             prefill_megakernel,
-            "make_mixture_norm_sp",
-            lambda *_a, **_kw: lambda after, _b, _m, _f, _act: after,
+            "make_indexed_mla_layer_sp_ring",
+            _mock_mla(captured_calls),
         ),
-        patch.object(
-            prefill_megakernel,
-            "make_dense_ffn_sp",
-            lambda *_a, **_kw: lambda _f, after, _gu, _d, _l: after,
-        ),
-        patch.object(
-            prefill_megakernel,
-            "make_norm_gather_sp",
-            lambda *_a, **_kw: lambda prefix, _b, _r, _n, _act: (
-                prefix,
-                prefix,
-            ),
-        ),
-        patch.object(prefill_megakernel, "make_indexed_mla_layer_sp_ring", _mock_mla),
         patch.object(
             prefill_megakernel,
             "make_indexed_moe_sp_ring",
-            lambda *_a, **_kw: lambda _f, after, _fam, _l, _act: after,
+            _mock_indexed_moe_sp_ring,
         ),
-        patch.object(
-            prefill_megakernel, "make_regular_group4_sp_indexed", _mock_group4
-        ),
+        patch.object(prefill_megakernel, "make_prefill_logits_sp", _mock_logits_sp),
     ]
 
     for patch_item in patches:
         patch_item.start()
     try:
-        yield
+        yield captured_calls
     finally:
         for patch_item in reversed(patches):
             patch_item.stop()
@@ -260,7 +435,8 @@ def _mock_execution_environment(
 def test_prefill_program_window_ops_and_state_closures() -> None:
     """Verify PrefillProgram first, group, final, stack, and split closures."""
     mesh = _mock_mesh_32()
-    with _mock_execution_environment(mesh):
+    captured_calls: list[dict[str, object]] = []
+    with _mock_execution_environment(mesh, captured_calls=captured_calls):
         program = prefill.PrefillProgram(windows=(2048,), capacity=0, slots=1)
         window_ops = program.build_window_ops(2048)
 
@@ -274,17 +450,17 @@ def test_prefill_program_window_ops_and_state_closures() -> None:
                 "embedding": torch.zeros((128, 7168), dtype=torch.bfloat16),
                 "output_res": torch.zeros((32, 7168), dtype=torch.bfloat16),
                 "final_norm": torch.zeros((7168,), dtype=torch.bfloat16),
-                "lm_head": torch.zeros((32, 7168, 4096), dtype=torch.bfloat16),
+                "lm_head": torch.zeros((32, 1, 1), dtype=torch.bfloat16),
             }
         )
         program.weights["common"].update(
             {
-                "attn_res": torch.zeros((32, 93, 64, 7168), dtype=torch.bfloat16),
-                "attn_norm": torch.zeros((32, 93, 7168), dtype=torch.bfloat16),
-                "mlp_res": torch.zeros((32, 93, 64, 7168), dtype=torch.bfloat16),
-                "ffn_norm": torch.zeros((32, 93, 7168), dtype=torch.bfloat16),
-                "dense_gu": torch.zeros((32, 7168, 2048), dtype=torch.bfloat16),
-                "dense_down": torch.zeros((32, 2048, 7168), dtype=torch.bfloat16),
+                "attn_res": torch.zeros((32, 93, 1, 1), dtype=torch.bfloat16),
+                "attn_norm": torch.zeros((32, 93, 1), dtype=torch.bfloat16),
+                "mlp_res": torch.zeros((32, 93, 1, 1), dtype=torch.bfloat16),
+                "ffn_norm": torch.zeros((32, 93, 1), dtype=torch.bfloat16),
+                "dense_gu": torch.zeros((32, 1, 1), dtype=torch.bfloat16),
+                "dense_down": torch.zeros((32, 1, 1), dtype=torch.bfloat16),
             }
         )
 
@@ -296,6 +472,7 @@ def test_prefill_program_window_ops_and_state_closures() -> None:
         pool = torch.zeros((1, 1), dtype=torch.bfloat16)
         ids = torch.zeros((64,), dtype=torch.int32)
         local_ids = torch.zeros((64,), dtype=torch.int32)
+        blocks_tensor = torch.zeros((32, 8, 64, 7168), dtype=torch.bfloat16)
 
         first_args = (
             hidden,
@@ -313,7 +490,7 @@ def test_prefill_program_window_ops_and_state_closures() -> None:
 
         group_args = (
             hidden,
-            hidden,
+            blocks_tensor,
             recurrent,
             conv,
             recurrent,
@@ -331,7 +508,6 @@ def test_prefill_program_window_ops_and_state_closures() -> None:
         group_outputs = window_ops["group"](*group_args)
         assert len(group_outputs) == 9
 
-        blocks_tensor = torch.zeros((32, 8, 64, 7168), dtype=torch.bfloat16)
         final_args = (
             hidden,
             blocks_tensor,
@@ -346,8 +522,23 @@ def test_prefill_program_window_ops_and_state_closures() -> None:
         final_outputs = window_ops["final"](*final_args)
         assert len(final_outputs) == 2
 
+        assert len(captured_calls) > 0
+        for call_record in captured_calls:
+            assert call_record["segment_desc"].shape == (10,), (
+                f"Expected segment_desc shape (10,), got "
+                f"{call_record['segment_desc'].shape}"
+            )
+            assert call_record["segment_desc"].dtype == jnp.int32, (
+                f"Expected segment_desc int32, got {call_record['segment_desc'].dtype}"
+            )
+            arena_obj = call_record["arena"]
+            if arena_obj is not None:
+                assert hasattr(arena_obj, "active") or hasattr(arena_obj, "split"), (
+                    "arena object must not be swapped with segment_desc"
+                )
+
         stack_op = program.state_op("stack", count=2)
-        states_in = [jnp.zeros((69, 16, 128, 128), jnp.float32) for _ in range(4)]
+        states_in = [jnp.zeros((69, 2, 4, 4), jnp.float32) for _ in range(4)]
         stacked_states = stack_op(*states_in)
         assert len(stacked_states) == 2
 
@@ -356,8 +547,8 @@ def test_prefill_program_window_ops_and_state_closures() -> None:
         assert len(split_states) == 4
 
 
-def test_prefill_megakernel_closures_support_positional_and_keyword_args() -> None:
-    """Verify prefill megakernel closures accept segment_desc and arena both ways."""
+def test_prefill_stack_and_factory_closures() -> None:
+    """Verify prefill megakernel stack and factories support arguments and tapping."""
     mesh = _mock_mesh_32()
     mock_arena = MagicMock()
     mock_arena.split.return_value = (mock_arena, mock_arena)
@@ -367,30 +558,33 @@ def test_prefill_megakernel_closures_support_positional_and_keyword_args() -> No
     prefix = jnp.zeros((32, 64, 7168), jnp.bfloat16)
     blocks = jnp.zeros((32, 8, 64, 7168), jnp.bfloat16)
     common = {
-        "attn_res": jnp.zeros((32, 93, 64, 7168), jnp.bfloat16),
-        "attn_norm": jnp.zeros((32, 93, 7168), jnp.bfloat16),
-        "mlp_res": jnp.zeros((32, 93, 64, 7168), jnp.bfloat16),
-        "ffn_norm": jnp.zeros((32, 93, 7168), jnp.bfloat16),
-        "dense_gu": jnp.zeros((32, 7168, 2048), jnp.bfloat16),
-        "dense_down": jnp.zeros((32, 2048, 7168), jnp.bfloat16),
+        "attn_res": jnp.zeros((32, 93, 1, 1), jnp.bfloat16),
+        "attn_norm": jnp.zeros((32, 93, 1), jnp.bfloat16),
+        "mlp_res": jnp.zeros((32, 93, 1, 1), jnp.bfloat16),
+        "ffn_norm": jnp.zeros((32, 93, 1), jnp.bfloat16),
+        "dense_gu": jnp.zeros((32, 1, 1), jnp.bfloat16),
+        "dense_down": jnp.zeros((32, 1, 1), jnp.bfloat16),
     }
     families = MagicMock()
     kda_state = (
-        jnp.zeros((32, 16, 128, 128), jnp.float32),
-        jnp.zeros((32, 4, 16, 16, 128), jnp.bfloat16),
-        jnp.zeros((32, 16, 128, 128), jnp.float32),
-        jnp.zeros((32, 4, 16, 16, 128), jnp.bfloat16),
+        jnp.zeros((32, 69, 2, 4, 4), jnp.float32),
+        jnp.zeros((32, 69, 4, 2, 4, 4), jnp.bfloat16),
+        jnp.zeros((32, 69, 2, 4, 4), jnp.float32),
+        jnp.zeros((32, 69, 4, 2, 4, 4), jnp.bfloat16),
     )
     mla_state = (jnp.zeros((32, 24, 64, 576), jnp.bfloat16),)
     length = jnp.asarray([64], jnp.int32)
     segment_desc = jnp.zeros((10,), jnp.int32)
     pair = jnp.asarray([0], jnp.int32)
+    group = jnp.asarray([0], jnp.int32)
 
-    with _mock_execution_environment(mesh):
-        stack_fn = prefill_megakernel.make_prefill_stack_sp_indexed(
-            mesh, segments=10, seq_len=2048, prefix_capacity=2048
+    captured_calls: list[dict[str, object]] = []
+    with _mock_execution_environment(mesh, captured_calls=captured_calls):
+        # 1. Test make_prefill_stack_sp_indexed with tap_layer=None
+        stack_fn_none = prefill_megakernel.make_prefill_stack_sp_indexed(
+            mesh, segments=10, seq_len=2048, prefix_capacity=2048, tap_layer=None
         )
-        out_pos = stack_fn(
+        stack_none_pos = stack_fn_none(
             prefix,
             common,
             families,
@@ -402,9 +596,9 @@ def test_prefill_megakernel_closures_support_positional_and_keyword_args() -> No
             segment_desc,
             mock_arena,
         )
-        assert len(out_pos) == 4
+        assert len(stack_none_pos) == 4
 
-        out_kw = stack_fn(
+        stack_none_kw = stack_fn_none(
             prefix,
             common,
             families,
@@ -416,12 +610,68 @@ def test_prefill_megakernel_closures_support_positional_and_keyword_args() -> No
             segment_desc=segment_desc,
             arena=mock_arena,
         )
-        assert len(out_kw) == 4
+        assert len(stack_none_kw) == 4
 
+        # Single keyword segment_desc, arena positional (tests arena fallback)
+        stack_none_single_kw = stack_fn_none(
+            prefix,
+            common,
+            families,
+            families,
+            families,
+            kda_state,
+            mla_state,
+            length,
+            mock_arena,
+            segment_desc=segment_desc,
+        )
+        assert len(stack_none_single_kw) == 4
+        del stack_fn_none, stack_none_pos, stack_none_kw, stack_none_single_kw
+        gc.collect()
+
+        # 2. Test make_prefill_stack_sp_indexed with tap_layer=18
+        stack_fn_18 = prefill_megakernel.make_prefill_stack_sp_indexed(
+            mesh, segments=10, seq_len=2048, prefix_capacity=2048, tap_layer=18
+        )
+        # Negative probe: missing arena raises IndexError (kills _args[-1] mutant)
+        with pytest.raises(IndexError):
+            stack_fn_18(
+                prefix,
+                common,
+                families,
+                families,
+                families,
+                kda_state,
+                mla_state,
+                length,
+                segment_desc=segment_desc,
+            )
+
+        stack_18_outputs = stack_fn_18(
+            prefix,
+            common,
+            families,
+            families,
+            families,
+            kda_state,
+            mla_state,
+            length,
+            segment_desc=segment_desc,
+            arena=mock_arena,
+        )
+        assert len(stack_18_outputs) == 5
+        tap = stack_18_outputs[4]
+        assert isinstance(tap, jax.Array)
+        assert tap.shape == (32, 64, 7168)
+        assert not isinstance(tap, tuple)
+        del stack_fn_18, stack_18_outputs, tap
+        gc.collect()
+
+        # 3. Test make_regular_group8_sp_indexed
         group8_fn = prefill_megakernel.make_regular_group8_sp_indexed(
             mesh, segments=10, seq_len=2048, prefix_capacity=2048
         )
-        out_grp_pos = group8_fn(
+        group8_pos = group8_fn(
             prefix,
             blocks,
             common,
@@ -435,9 +685,9 @@ def test_prefill_megakernel_closures_support_positional_and_keyword_args() -> No
             segment_desc,
             mock_arena,
         )
-        assert len(out_grp_pos) == 6
+        assert len(group8_pos) == 6
 
-        out_grp_kw = group8_fn(
+        group8_kw = group8_fn(
             prefix,
             blocks,
             common,
@@ -451,12 +701,87 @@ def test_prefill_megakernel_closures_support_positional_and_keyword_args() -> No
             segment_desc=segment_desc,
             arena=mock_arena,
         )
-        assert len(out_grp_kw) == 6
+        assert len(group8_kw) == 6
 
+        # Single keyword segment_desc, arena positional
+        group8_single_kw = group8_fn(
+            prefix,
+            blocks,
+            common,
+            families,
+            families,
+            families,
+            kda_state,
+            mla_state,
+            length,
+            pair,
+            mock_arena,
+            segment_desc=segment_desc,
+        )
+        assert len(group8_single_kw) == 6
+        del group8_fn, group8_pos, group8_kw, group8_single_kw
+        gc.collect()
+
+        # 4. Test make_regular_group4_sp_indexed directly (unpatched)
+        group4_fn = prefill_megakernel.make_regular_group4_sp_indexed(
+            mesh, segments=10, seq_len=2048, prefix_capacity=2048
+        )
+        group4_pos = group4_fn(
+            prefix,
+            blocks,
+            common,
+            families,
+            families,
+            families,
+            kda_state,
+            mla_state,
+            length,
+            group,
+            segment_desc,
+            mock_arena,
+        )
+        assert len(group4_pos) == 5
+
+        group4_kw = group4_fn(
+            prefix,
+            blocks,
+            common,
+            families,
+            families,
+            families,
+            kda_state,
+            mla_state,
+            length,
+            group,
+            segment_desc=segment_desc,
+            arena=mock_arena,
+        )
+        assert len(group4_kw) == 5
+
+        # Single keyword segment_desc, arena positional
+        group4_single_kw = group4_fn(
+            prefix,
+            blocks,
+            common,
+            families,
+            families,
+            families,
+            kda_state,
+            mla_state,
+            length,
+            group,
+            mock_arena,
+            segment_desc=segment_desc,
+        )
+        assert len(group4_single_kw) == 5
+        del group4_fn, group4_pos, group4_kw, group4_single_kw
+        gc.collect()
+
+        # 5. Test make_final_mla_sp_indexed
         final_fn = prefill_megakernel.make_final_mla_sp_indexed(
             mesh, segments=10, seq_len=2048, prefix_capacity=2048
         )
-        out_fin_pos = final_fn(
+        final_pos = final_fn(
             prefix,
             blocks,
             common,
@@ -467,9 +792,9 @@ def test_prefill_megakernel_closures_support_positional_and_keyword_args() -> No
             segment_desc,
             mock_arena,
         )
-        assert len(out_fin_pos) == 3
+        assert len(final_pos) == 3
 
-        out_fin_kw = final_fn(
+        final_kw = final_fn(
             prefix,
             blocks,
             common,
@@ -480,7 +805,53 @@ def test_prefill_megakernel_closures_support_positional_and_keyword_args() -> No
             segment_desc=segment_desc,
             arena=mock_arena,
         )
-        assert len(out_fin_kw) == 3
+        assert len(final_kw) == 3
+
+        # Single keyword segment_desc, arena positional
+        final_single_kw = final_fn(
+            prefix,
+            blocks,
+            common,
+            families,
+            families,
+            mla_state,
+            length,
+            mock_arena,
+            segment_desc=segment_desc,
+        )
+        assert len(final_single_kw) == 3
+        del final_fn, final_pos, final_kw, final_single_kw
+        gc.collect()
+
+        assert len(captured_calls) > 0
+        for call_record in captured_calls:
+            assert call_record["segment_desc"].shape == (10,), (
+                f"Expected segment_desc shape (10,), got "
+                f"{call_record['segment_desc'].shape}"
+            )
+            assert call_record["segment_desc"].dtype == jnp.int32, (
+                f"Expected segment_desc int32, got {call_record['segment_desc'].dtype}"
+            )
+            arena_obj = call_record["arena"]
+            if arena_obj is not None:
+                assert hasattr(arena_obj, "active") or hasattr(arena_obj, "split"), (
+                    "arena object must not be swapped with segment_desc"
+                )
+
+    del (
+        prefix,
+        blocks,
+        common,
+        families,
+        kda_state,
+        mla_state,
+        length,
+        segment_desc,
+        pair,
+        group,
+        captured_calls,
+    )
+    gc.collect()
 
 
 def test_pool_writer_closures() -> None:
@@ -503,8 +874,8 @@ def test_pool_writer_closures() -> None:
         )
 
         copy_fn = writer.copy_op()
-        copy_res = copy_fn(raw_pools[0], torch.tensor(0), torch.tensor(1))
-        assert len(copy_res) == 1
+        copy_results = copy_fn(raw_pools[0], torch.tensor(0), torch.tensor(1))
+        assert len(copy_results) == 1
 
         write_fn = writer.write_op(window=2048, slots=1, count=1)
         latents_tensor = torch.zeros((1, 24, 2048, 576), dtype=torch.bfloat16)
@@ -512,7 +883,7 @@ def test_pool_writer_closures() -> None:
         conv_tensor = torch.zeros((1, 69, 1, 3, 3, 3, 128), dtype=torch.bfloat16)
         table_tensor = torch.zeros((1, 16), dtype=torch.int32)
         kda_blocks_tensor = torch.zeros((69,), dtype=torch.int32)
-        write_res = write_fn(
+        write_results = write_fn(
             latents_tensor,
             recurrent_tensor,
             conv_tensor,
@@ -523,59 +894,63 @@ def test_pool_writer_closures() -> None:
             kda_blocks_tensor,
             kda_blocks_tensor,
         )
-        assert len(write_res) == 1
+        assert len(write_results) == 1
+
+        def _mock_pack_ring(*unused_args: object, **unused_kwargs: object) -> jax.Array:
+            return jnp.zeros((1, 69, 30, 640))
 
         rings_fn = writer.rings_op(count=1)
-        with patch.object(
-            dspark,
-            "pack_ring",
-            lambda _caches, _metas, _layers: jnp.zeros((1, 69, 30, 640)),
-        ):
-            rings_res = rings_fn(
+        with patch.object(dspark, "pack_ring", _mock_pack_ring):
+            rings_results = rings_fn(
                 raw_pools[0],
                 torch.zeros((69,), dtype=torch.int32),
                 torch.zeros((1, 16), dtype=torch.bfloat16),
                 torch.zeros((1,), dtype=torch.int32),
             )
-        assert len(rings_res) == 1
+        assert len(rings_results) == 1
+
+        def _mock_read_draft_rings(
+            *unused_args: object, **unused_kwargs: object
+        ) -> list[jax.Array]:
+            return [jnp.zeros((69, 16))]
+
+        def _mock_unpack_ring(
+            *unused_args: object, **unused_kwargs: object
+        ) -> tuple[jax.Array, jax.Array]:
+            return (
+                jnp.zeros((1, 16)),
+                jnp.zeros((1,)),
+            )
 
         read_rings_fn = writer.read_rings_op(draft_config=MagicMock(), sequences=1)
         with (
-            patch.object(
-                prefill,
-                "read_draft_rings",
-                lambda _raws, _kda, _blk, _lanes: [jnp.zeros((69, 16))],
-            ),
-            patch.object(
-                dspark,
-                "unpack_ring",
-                lambda _cfg, _packed, _length: (
-                    jnp.zeros((1, 16)),
-                    jnp.zeros((1,)),
-                ),
-            ),
+            patch.object(prefill, "read_draft_rings", _mock_read_draft_rings),
+            patch.object(dspark, "unpack_ring", _mock_unpack_ring),
         ):
-            read_rings_res = read_rings_fn(
+            read_rings_results = read_rings_fn(
                 raw_pools[0],
                 torch.zeros((69,), dtype=torch.int32),
                 torch.tensor([10], dtype=torch.int32),
             )
-        assert len(read_rings_res) == 2
+        assert len(read_rings_results) == 2
 
         read_states_fn = writer.read_states_op(sequences=1)
-        with patch.object(
-            prefill.pool_adapters,
-            "gather_region",
-            lambda _raw, ids, tok0=0, **_kw: (
-                jnp.zeros((ids.shape[0], 385, 128), dtype=jnp.float32)
-                if tok0 == 0
-                else jnp.zeros((ids.shape[0], 8, 640), dtype=jnp.bfloat16)
-            ),
-        ):
-            read_states_res = read_states_fn(
+
+        def _mock_gather_region(
+            _raw_pool: object,
+            token_ids: jax.Array,
+            tok0: int = 0,
+            **unused_kwargs: object,
+        ) -> jax.Array:
+            if tok0 == 0:
+                return jnp.zeros((token_ids.shape[0], 385, 128), dtype=jnp.float32)
+            return jnp.zeros((token_ids.shape[0], 8, 640), dtype=jnp.bfloat16)
+
+        with patch.object(prefill.pool_adapters, "gather_region", _mock_gather_region):
+            read_states_results = read_states_fn(
                 raw_pools[0], torch.zeros((69,), dtype=torch.int32)
             )
-        assert len(read_states_res) == 2
+        assert len(read_states_results) == 2
 
 
 def test_decode_ops_and_decoder_closures() -> None:
@@ -598,32 +973,48 @@ def test_decode_ops_and_decoder_closures() -> None:
     decode_instance.attention_dp = 1
     decode_instance.VERIFY_ROWS = 8
     decode_instance.paged = MagicMock()
-    decode_instance.paged.decode_paged = lambda *_a, **kw: (
-        (
-            jnp.zeros((kw.get("batch_size", 2), 4096), jnp.float32),
-            [jnp.zeros((kw.get("batch_size", 2), 7168))],
-            _a[1],
-            _a[2],
-            _a[3],
+
+    def _mock_paged_decode(*args: object, **kwargs: object) -> tuple[object, ...]:
+        batch_size = int(kwargs.get("batch_size", 2))
+        if "aux_hidden_layers" in kwargs:
+            return (
+                jnp.zeros((batch_size, 16), jnp.float32),
+                [jnp.zeros((batch_size, 16))],
+                args[1],
+                args[2],
+                args[3],
+            )
+        return (
+            jnp.zeros((batch_size, 16), jnp.float32),
+            args[1],
+            args[2],
+            args[3],
         )
-        if "aux_hidden_layers" in kw
-        else (
-            jnp.zeros((kw.get("batch_size", 2), 4096), jnp.float32),
-            _a[1],
-            _a[2],
-            _a[3],
+
+    def _mock_unpack_verify(
+        _packet: jax.Array, _ctrl: object, requests_count: int
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        return (
+            jnp.zeros((8 * requests_count,), dtype=jnp.int32),
+            jnp.zeros((requests_count, 8), dtype=jnp.int32),
+            jnp.zeros((requests_count,), dtype=jnp.int32),
         )
-    )
-    decode_instance._unpack_verify_metadata = lambda _packet, _ctrl, reqs: (
-        jnp.zeros((8 * reqs,), dtype=jnp.int32),
-        jnp.zeros((reqs, 8), dtype=jnp.int32),
-        jnp.zeros((reqs,), dtype=jnp.int32),
-    )
-    decode_instance._finish_verify = lambda _ctrl, states, _results, _configs: (
-        jnp.zeros((2,), dtype=jnp.int32),
-        states[2],
-        states[3],
-    )
+
+    def _mock_finish_verify(
+        _ctrl: object,
+        states: tuple[object, ...],
+        _results: object,
+        _configs: object,
+    ) -> tuple[jax.Array, object, object]:
+        return (
+            jnp.zeros((2,), dtype=jnp.int32),
+            states[2],
+            states[3],
+        )
+
+    decode_instance.paged.decode_paged = _mock_paged_decode
+    decode_instance._unpack_verify_metadata = _mock_unpack_verify
+    decode_instance._finish_verify = _mock_finish_verify
 
     with _mock_execution_environment(mesh):
         plain_op = decode_instance._build_plain(
@@ -718,11 +1109,20 @@ def test_dspark_draft_closures() -> None:
     draft_instance.dspark.OUT_BONUS = 7
     draft_instance.dspark.OUT_COUNT = 0
     draft_instance.dspark.OUT_DRAFTS = 1
-    draft_instance.dspark.make_fused_draft = lambda *_a, **_kw: lambda *args: (
-        jnp.zeros((1, 16), dtype=jnp.int32),
-        args[1],
-        args[2],
-    )
+
+    def _mock_make_fused_draft(
+        *unused_builder_args: object, **unused_builder_kwargs: object
+    ) -> Callable[..., tuple[jax.Array, object, object]]:
+        def fused_fn(*call_args: object) -> tuple[jax.Array, object, object]:
+            return (
+                jnp.zeros((1, 16), dtype=jnp.int32),
+                call_args[1],
+                call_args[2],
+            )
+
+        return fused_fn
+
+    draft_instance.dspark.make_fused_draft = _mock_make_fused_draft
 
     mla_draft_instance = object.__new__(draft_mla.MlaDsparkDraft)
     mla_draft_instance.config = draft_config
@@ -735,25 +1135,42 @@ def test_dspark_draft_closures() -> None:
     mla_draft_instance.attention_dp = 1
     mla_draft_instance.owner_table = None
     mla_draft_instance.kernel = MagicMock()
-    mla_draft_instance.kernel.fused_draft_local = lambda *_a, **_kw: lambda *_args: (
-        jnp.zeros((1, 32), dtype=jnp.int32),
-        jnp.zeros((1, 8, 128), dtype=jnp.bfloat16),
-    )
+
+    def _mock_fused_draft_local(
+        *unused_builder_args: object, **unused_builder_kwargs: object
+    ) -> Callable[..., tuple[jax.Array, jax.Array]]:
+        def draft_local_fn(*unused_call_args: object) -> tuple[jax.Array, jax.Array]:
+            return (
+                jnp.zeros((1, 32), dtype=jnp.int32),
+                jnp.zeros((1, 8, 16), dtype=jnp.bfloat16),
+            )
+
+        return draft_local_fn
+
+    def _mock_commit_latent_rows(
+        pools: object, *unused_args: object, **unused_kwargs: object
+    ) -> object:
+        del unused_args, unused_kwargs
+        return pools
+
+    def _mock_register_op(
+        _name: str, _mesh: object, body: Callable[..., object], _spec: object
+    ) -> Callable[..., object]:
+        del _name, _mesh, _spec
+        return body
+
+    mla_draft_instance.kernel.fused_draft_local = _mock_fused_draft_local
     mla_draft_instance.paged = MagicMock()
-    mla_draft_instance.paged.commit_latent_rows = lambda pools, *_a, **_kw: pools
+    mla_draft_instance.paged.commit_latent_rows = _mock_commit_latent_rows
     mla_draft_instance._bridge = MagicMock()
-    mla_draft_instance._bridge.register_op = lambda _name, _mesh, body, _spec: body
+    mla_draft_instance._bridge.register_op = _mock_register_op
     mla_draft_instance._bridge.OpRegistrationSpec = MagicMock()
     mla_draft_instance.dspark = MagicMock()
     mla_draft_instance.dspark.ROWS = 8
     mla_draft_instance.dspark.OUT_BONUS = 7
     mla_draft_instance.dspark.OUT_COUNT = 0
     mla_draft_instance.dspark.OUT_DRAFTS = 1
-    mla_draft_instance.dspark.make_fused_draft = lambda *_a, **_kw: lambda *args: (
-        jnp.zeros((1, 16), dtype=jnp.int32),
-        args[1],
-        args[2],
-    )
+    mla_draft_instance.dspark.make_fused_draft = _mock_make_fused_draft
 
     with _mock_execution_environment(mesh):
         single_op = draft_instance._build_single(control_layout)
@@ -785,3 +1202,95 @@ def test_dspark_draft_closures() -> None:
             decisions,
         )
         assert len(mla_single_outputs) == 9
+
+
+def test_mla_flash_prefill_packed_unmocked_pallas_trace() -> None:
+    """Unmocked jax.eval_shape trace for mla_flash_prefill_packed."""
+    tokens = 256
+    query = jnp.zeros((3, tokens, 256), dtype=jnp.bfloat16)
+    key = jnp.zeros((3, tokens, 256), dtype=jnp.bfloat16)
+    value = jnp.zeros((3, tokens, 128), dtype=jnp.bfloat16)
+    length = jnp.array([tokens], dtype=jnp.int32)
+
+    # 1. Unmocked trace with arena=None (segments shape (3,))
+    segments_no_arena = jnp.zeros((3,), dtype=jnp.int32)
+    fn_no_arena = functools.partial(
+        prefill_megakernel.mla_flash_prefill_packed, count=1, arena=None
+    )
+    out_no_arena = jax.eval_shape(
+        fn_no_arena,
+        query,
+        key,
+        value,
+        length,
+        segments_no_arena,
+    )
+    assert out_no_arena.shape == (3, 256, 128)
+    assert out_no_arena.dtype == jnp.bfloat16
+
+    # 2. Unmocked trace with arena=(arena_keys, arena_values) (segments shape (5,))
+    arena_keys = jnp.zeros((1, 3, 128, 256), dtype=jnp.bfloat16)
+    arena_values = jnp.zeros((1, 3, 128, 128), dtype=jnp.bfloat16)
+    segments_arena = jnp.zeros((5,), dtype=jnp.int32)
+    fn_arena = functools.partial(
+        prefill_megakernel.mla_flash_prefill_packed,
+        count=1,
+        arena=(arena_keys, arena_values),
+    )
+    out_arena = jax.eval_shape(
+        fn_arena,
+        query,
+        key,
+        value,
+        length,
+        segments_arena,
+    )
+    assert out_arena.shape == (3, 256, 128)
+    assert out_arena.dtype == jnp.bfloat16
+
+    # 3. Direct unit check on _load_kv_block with partial keyword args
+    class _MockCopy:
+        def wait(self) -> None:
+            pass
+
+        def start(self) -> None:
+            pass
+
+    def _mock_copies(
+        _key_block: int | jax.Array, _slot: int | jax.Array
+    ) -> tuple[_MockCopy, _MockCopy]:
+        return _MockCopy(), _MockCopy()
+
+    k_buf = jnp.zeros((2, 128, 256), dtype=jnp.bfloat16)
+    v_buf = jnp.zeros((2, 128, 128), dtype=jnp.bfloat16)
+
+    load_fn = functools.partial(
+        prefill_megakernel._load_kv_block,
+        hi=4,
+        copies_fn=_mock_copies,
+        k_buf=k_buf,
+        v_buf=v_buf,
+        tile=128,
+        value_mask=None,
+    )
+    k_res, v_res = load_fn(0)
+    assert k_res.shape == (128, 256)
+    assert v_res.shape == (136, 128)
+
+    del (
+        query,
+        key,
+        value,
+        length,
+        segments_no_arena,
+        out_no_arena,
+        arena_keys,
+        arena_values,
+        segments_arena,
+        out_arena,
+        k_buf,
+        v_buf,
+        k_res,
+        v_res,
+    )
+    gc.collect()

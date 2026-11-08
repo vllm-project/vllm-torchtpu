@@ -49,7 +49,13 @@ class Shorthand(NamedTuple):
 
 # Built-in templates by shorthand name. Imported by string only, so the
 # runtime never imports a template at module load.
-SHORTHANDS: Mapping[str, Shorthand] = {}
+SHORTHANDS: Mapping[str, Shorthand] = {
+    "kimi_k3": Shorthand(
+        module="vllm_torchtpu.models.kimi_k3.megakernel",
+        architectures=("KimiK3ForConditionalGeneration",),
+        model_types=("kimi_k3",),
+    ),
+}
 
 
 class RunnerView:
