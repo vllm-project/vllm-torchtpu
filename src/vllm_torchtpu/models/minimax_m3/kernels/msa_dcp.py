@@ -56,6 +56,8 @@ from vllm_torchtpu.models.minimax_m3.kernels import (
 )
 
 _NEG_INF = float("-inf")
+# The narrowest column count `local_candidates` scans (a vreg's lanes).
+_MIN_CANDIDATE_WIDTH = 128
 
 # Up to this many tokens (`msa_attention.SMALL_BATCH_TOKENS` is the non-DCP
 # limit) an 8-token verify group fills an attention tile alone
@@ -105,6 +107,7 @@ def local_seq_lens(
 
 def _candidates_kernel(
     rank_ref,
+    widths_ref,
     scores_ref,
     pos_ref,
     score_out_ref,
@@ -115,35 +118,51 @@ def _candidates_kernel(
     init_blocks,
     local_blocks,
     dcp,
+    widths,
 ):
     """`msa_select._kernel` over this rank's columns (column ``c`` is block
     ``c * dcp + rank``), also returning the picked scores. The rank is read
-    from SMEM so that every rank runs the same program."""
+    from SMEM so that every rank runs the same program.
+
+    Row block ``i`` scans only its first ``widths_ref[i]`` columns (one of
+    the static `widths`, covering every block its rows see): the scores span
+    the whole max-model-len width, mostly past every row's context (c4
+    prefill twin, j-3c651507: ~240 of 1,024 columns visible)."""
     rank = rank_ref[0]
-    s = scores_ref[...]
-    rows, num_cols = s.shape
-    cols = jax.lax.broadcasted_iota(jnp.int32, (rows, num_cols), 1)
-    blocks = cols * dcp + rank
+    width_now = widths_ref[pl.program_id(0)]
+    rows = scores_ref.shape[0]
     num_visible = pos_ref[...] // block_size + 1
-    visible = blocks < num_visible
-    s = jnp.where(visible, s, _NEG_INF)
-    s = jnp.where(
-        visible & (blocks >= num_visible - local_blocks),
-        msa_select._FORCED_LOCAL_SCORE,
-        s,
-    )
-    s = jnp.where(visible & (blocks < init_blocks), msa_select._FORCED_INIT_SCORE, s)
-    picked_scores, picked_blocks = [], []
-    for _ in range(topk):
-        best_score = jnp.max(s, axis=1, keepdims=True)
-        best = jnp.min(
-            jnp.where(s == best_score, cols, num_cols), axis=1, keepdims=True
+
+    def select(width):
+        s = scores_ref[:, :width]
+        cols = jax.lax.broadcasted_iota(jnp.int32, (rows, width), 1)
+        blocks = cols * dcp + rank
+        visible = blocks < num_visible
+        s = jnp.where(visible, s, _NEG_INF)
+        s = jnp.where(
+            visible & (blocks >= num_visible - local_blocks),
+            msa_select._FORCED_LOCAL_SCORE,
+            s,
         )
-        picked_scores.append(best_score)
-        picked_blocks.append(jnp.where(best_score > _NEG_INF, best * dcp + rank, -1))
-        s = jnp.where(cols == best, _NEG_INF, s)
-    score_out_ref[...] = jnp.concatenate(picked_scores, axis=1)
-    block_out_ref[...] = jnp.concatenate(picked_blocks, axis=1)
+        s = jnp.where(
+            visible & (blocks < init_blocks), msa_select._FORCED_INIT_SCORE, s
+        )
+        picked_scores, picked_blocks = [], []
+        for _ in range(topk):
+            best_score = jnp.max(s, axis=1, keepdims=True)
+            best = jnp.min(
+                jnp.where(s == best_score, cols, width), axis=1, keepdims=True
+            )
+            picked_scores.append(best_score)
+            picked_blocks.append(
+                jnp.where(best_score > _NEG_INF, best * dcp + rank, -1)
+            )
+            s = jnp.where(cols == best, _NEG_INF, s)
+        score_out_ref[...] = jnp.concatenate(picked_scores, axis=1)
+        block_out_ref[...] = jnp.concatenate(picked_blocks, axis=1)
+
+    for width in widths:
+        pl.when(width_now == width)(functools.partial(select, width))
 
 
 @functools.partial(
@@ -189,6 +208,16 @@ def local_candidates(
     pad = -num_tokens % block_rows
     s = jnp.pad(scores[:, 0], ((0, pad), (0, 0)))
     p = jnp.pad(pos, (0, pad))[:, None]
+    # Static scan widths: powers of two times 128 up to the full width (one
+    # kernel body each); each row block takes the narrowest one holding every
+    # block its rows see (a rank's blocks below n are among its first
+    # ceil(n / dcp) columns).
+    widths = [num_cols]
+    while widths[0] % 2 == 0 and widths[0] // 2 >= _MIN_CANDIDATE_WIDTH:
+        widths.insert(0, widths[0] // 2)
+    needed = -(-(jnp.max(p.reshape(-1, block_rows), axis=1) // block_size + 1) // dcp)
+    w = jnp.asarray(widths, jnp.int32)
+    row_widths = jnp.min(jnp.where(w >= needed[:, None], w, num_cols), axis=1)
     out_spec = pl.BlockSpec((block_rows, topk), lambda i: (i, 0))
     picked_scores, picked_blocks = pl.pallas_call(
         functools.partial(
@@ -198,9 +227,11 @@ def local_candidates(
             init_blocks=init_blocks,
             local_blocks=local_blocks,
             dcp=dcp,
+            widths=tuple(widths),
         ),
         grid=((num_tokens + pad) // block_rows,),
         in_specs=[
+            pl.BlockSpec(memory_space=pltpu.SMEM),
             pl.BlockSpec(memory_space=pltpu.SMEM),
             pl.BlockSpec((block_rows, num_cols), lambda i: (i, 0)),
             pl.BlockSpec((block_rows, 1), lambda i: (i, 0)),
@@ -216,7 +247,7 @@ def local_candidates(
         ),
         interpret=interpret,
         name="minimax_m3_msa_dcp_candidates",
-    )(rank_array(rank), s, p)
+    )(rank_array(rank), row_widths, s, p)
     return picked_scores[:num_tokens], picked_blocks[:num_tokens]
 
 
