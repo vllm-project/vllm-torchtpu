@@ -834,6 +834,11 @@ def test_gathered_dispatch(kernels, monkeypatch):
 COMPACT = dict(group=64, listed="reference", gathered="reference", gather_chunks=2)
 
 
+def _host_bytes(x):
+    """An FP8 array's bytes, exactly: device -> host transfer, then a host view (no XLA FP8 conversion)."""
+    return np.asarray(jax.device_get(x)).view(np.uint8)
+
+
 def _record_compact_copies(monkeypatch):
     """Runtime record of the compact copies that ran (count of pages per run): a lax.cond branch's copy shows up only
     when that branch executes."""
@@ -916,7 +921,9 @@ def test_compact_copy_methods_are_byte_exact(kernels, method, count):
     src = rng.permutation(pages)[:7]
     pairs = np.stack([np.concatenate([src, np.zeros(1, np.int64)]), np.concatenate([rng.permutation(7), [7]])], 1)
     out = ud.compact_copy(pool, jnp.asarray(pairs, jnp.int32), jnp.int32(count), method=method)
-    got = np.asarray(jax.lax.bitcast_convert_type(out, jnp.uint8))
+    # Read back by an exact device -> host transfer and view the FP8 bytes on the host: an XLA FP8 -> uint8 bitcast
+    # canonicalizes 0xFF to 0x7F on TPU (i2c j-8637ad69: 965 of 262,144 bytes off by 128 for every method, as XFER saw).
+    got = _host_bytes(out)
     for i in range(count):
         np.testing.assert_array_equal(got[pairs[i, 1]], raw[pairs[i, 0]])
     with pytest.raises(ValueError, match="compact copy method"):
@@ -938,8 +945,7 @@ def test_compact_copy_moves_whole_pages(kernels):
     pairs, count, _, _ = ud.compact_plan(lengths, table, starts, group=1, reqs=8, tokens_per_entry=PAGE)
     out = ud.compact_copy(pool, pairs, count, inflight=2)
     p, n = np.asarray(pairs), int(count)
-    raw = lambda x: np.asarray(jax.lax.bitcast_convert_type(x, jnp.uint8))  # noqa: E731
-    np.testing.assert_array_equal(raw(out)[p[:n, 1]], raw(pool)[p[:n, 0]])
+    np.testing.assert_array_equal(_host_bytes(out)[p[:n, 1]], _host_bytes(pool)[p[:n, 0]])
 
 
 def _sc_operand_bytes(jaxpr, out):
