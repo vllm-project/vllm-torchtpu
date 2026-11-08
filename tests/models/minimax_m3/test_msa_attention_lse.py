@@ -189,3 +189,47 @@ def test_lse_empty_batch():
         interpret=True,
     )
     assert out.shape == (0, Q_PER_KV, HEAD_DIM) and lse.shape == (0, Q_PER_KV)
+
+
+@pytest.mark.parametrize("dtype", CACHE_DTYPES)
+def test_lse_unselected_nan_pages_do_not_leak(dtype):
+    """Bytes no token may see hold NaN (pages nobody selects, slots past a
+    local page's newest token): masked scores and zeroed value rows keep
+    them out, as they must for page-buffer slots past a group's pages."""
+    rng = np.random.default_rng(9)
+    q, kv_rows, _, table, keys, local_key, local_limit = _inputs(rng, 70, 66, 1, dtype)
+    # Keys 0..4 are selected whole; key 5 is every real token's local page,
+    # whose slots past its newest token no token sees; keys 6..11 nobody
+    # selects.
+    keys = np.where(keys >= 0, keys % 5, -1)
+    for row in keys[:, 0]:  # a page counts once per token
+        _, first = np.unique(row, return_index=True)
+        row[np.setdiff1d(np.arange(row.size), first)] = -1
+    real = local_key >= 0
+    keys[real, 0, -1] = 5
+    local_key[real] = 5
+    local_limit[real] = rng.integers(1, PAGE // 2, real.sum())
+    poisoned = kv_rows.copy()
+    poisoned[table[6:]] = np.nan
+    poisoned[table[5], local_limit.max() :] = np.nan
+    got = msa_sparse_attention_lse(
+        q,
+        pack(poisoned, dtype),
+        jnp.asarray(keys[:, 0]),
+        jnp.asarray(local_key),
+        jnp.asarray(local_limit),
+        jnp.asarray(table),
+        sm_scale=SCALE,
+        interpret=True,
+    )
+    assert np.isfinite(np.asarray(got[0].astype(jnp.float32))).all()
+    want = _reference(
+        np.asarray(q.astype(jnp.float32)),
+        kv_rows,
+        keys[:, 0],
+        local_key,
+        local_limit,
+        table,
+        0,
+    )
+    _check(got, want)

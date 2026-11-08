@@ -71,7 +71,7 @@ def _kernel(
     page_size = rows_per_page * packing
     half = w % 2
 
-    def page_copy(group, half, g, page):
+    def page_copy(half, g, page):
         src = kv_hbm_ref.at[
             pl.ds(page, 1), :, :, pl.ds(head_ref[0] * row_width, row_width)
         ]
@@ -87,7 +87,7 @@ def _kernel(
 
             @pl.when(page >= 0)
             def _start():
-                page_copy(group, half, g, page_table_ref[page]).start()
+                page_copy(half, g, page_table_ref[page]).start()
 
     @pl.when(w == 0)
     def _first():
@@ -101,7 +101,7 @@ def _kernel(
 
         @pl.when(group_page(w, g) >= 0)
         def _wait():
-            page_copy(w, half, g, 0).wait()
+            page_copy(half, g, 0).wait()  # the source only sizes the wait
 
     kv_refs = [buf_ref.at[half, g] for g in range(pages_per_step)]
 
