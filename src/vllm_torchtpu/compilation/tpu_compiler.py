@@ -162,6 +162,9 @@ _TPU_COMPILE_ENV_IGNORED = {
     "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT",
     # Only changes LIBTPU_INIT_ARGS, which is hashed on its own.
     "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES",
+    # Where routing counts are written; whether they are counted is hashed in
+    # compute_tpu_compilation_hash.
+    "TPU_MOE_ROUTING_COUNTS_DIR",
 }
 
 _NATIVE_TPU_COMPILE_ENV_VARS = (
@@ -287,6 +290,8 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
         "libtpu": importlib_metadata.version("libtpu"),
         "env": _tpu_compile_env_factors(),
         "native_env": {name: os.getenv(name) for name in _NATIVE_TPU_COMPILE_ENV_VARS},
+        # Counting routes adds buffers to the program; the directory does not.
+        "moe_routing_counts": bool(envs.TPU_MOE_ROUTING_COUNTS_DIR),
         "parallel": {
             "effective_data_parallel_size": utils.get_dp_size(
                 vllm_config.parallel_config

@@ -77,6 +77,12 @@ def _padding_rows(num_rows: int, is_local_tensor: bool) -> torch.Tensor | None:
     return _padding_state.get_local_padding_mask(num_rows)
 
 
+def local_padding_rows(num_rows: int) -> torch.Tensor | None:
+    """Which of this rank's first ``num_rows`` token rows are padding, or None
+    without a padding state."""
+    return _padding_rows(num_rows, is_local_tensor=True)
+
+
 def zero_routing_weights_for_padding(
     topk_ids: torch.Tensor, topk_weights: torch.Tensor, is_local_tensor: bool = False
 ) -> tuple[torch.Tensor, torch.Tensor]:

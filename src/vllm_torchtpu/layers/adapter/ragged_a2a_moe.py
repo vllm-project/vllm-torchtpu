@@ -91,6 +91,29 @@ def get_dp_tp_mesh(knob: str = "TPU_MOE_RAGGED_A2A"):
     return _MESH
 
 
+def capacity_factors(dp_size: int, *, placed: bool) -> tuple[float, float]:
+    """The ``(rows, routes)`` capacity factors of a MoE layer's exchange: the
+    env knobs where set, else the defaults for ``dp_size`` DP members.
+
+    Up to 8 members: x2.5 / x3, or x2 / x2 with TPU_MOE_EXPERT_PLACEMENT.
+    Larger groups hold fewer experts per rank, so real routing loads the
+    busiest rank further above the mean: a layer the file places
+    (``placed``) takes x4 / x4 up to 16 members and x7 / x7 above, a layer in
+    linear placement x4 / x5 and x7 / x8.5.
+    """
+    if dp_size <= 8:
+        rows, routes = (2.0, 2.0) if envs.TPU_MOE_EXPERT_PLACEMENT else (2.5, 3.0)
+    elif dp_size <= 16:
+        rows, routes = (4.0, 4.0) if placed else (4.0, 5.0)
+    else:
+        rows, routes = (7.0, 7.0) if placed else (7.0, 8.5)
+    if envs.TPU_MOE_A2A_CAPACITY is not None:
+        rows = envs.TPU_MOE_A2A_CAPACITY
+    if envs.TPU_MOE_A2A_ROUTE_CAPACITY is not None:
+        routes = envs.TPU_MOE_A2A_ROUTE_CAPACITY
+    return rows, routes
+
+
 def _get_op(
     *,
     topk,
@@ -99,6 +122,7 @@ def _get_op(
     skip_padded_tokens,
     shared=False,
     scaled=True,
+    placed=False,
     owner_combine=False,
 ):
     key = (
@@ -108,6 +132,7 @@ def _get_op(
         skip_padded_tokens,
         shared,
         scaled,
+        placed,
         owner_combine,
     )
     op = _OPS.get(key)
@@ -122,7 +147,7 @@ def _get_op(
     # path's rows, so the threshold follows the full decode step.
     step_routed_rows = _routed_rows_per_decode_step(topk)
     onehot_threshold = resolve_onehot_permute_threshold(step_routed_rows)
-    capacity_factor = envs.TPU_MOE_A2A_CAPACITY
+    capacity_factor, route_factor = capacity_factors(mesh.shape[DP_AXIS], placed=placed)
     run = functools.partial(
         ragged_a2a_moe,
         mesh=mesh,
@@ -133,7 +158,7 @@ def _get_op(
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
         capacity_factor=capacity_factor,
-        route_factor=envs.TPU_MOE_A2A_ROUTE_CAPACITY,
+        route_factor=route_factor,
         **keywords,
     )
 
@@ -242,11 +267,15 @@ def _get_op(
         "on" if keywords["routing_dma"] else "off",
         "on" if keywords["send_index_rows_minor"] else "off",
     )
-    _log_capacity(mesh, topk, onehot_threshold, step_routed_rows)
+    _log_capacity(
+        mesh, topk, onehot_threshold, step_routed_rows, capacity_factor, route_factor
+    )
     return op
 
 
-def _log_capacity(mesh, topk, onehot_threshold, step_routed_rows) -> None:
+def _log_capacity(
+    mesh, topk, onehot_threshold, step_routed_rows, factor, route_factor
+) -> None:
     """Log the capacity sizes of a full decode step (at op build, untraced)."""
     from vllm.config import get_current_vllm_config_or_none
 
@@ -265,17 +294,17 @@ def _log_capacity(mesh, topk, onehot_threshold, step_routed_rows) -> None:
         num_tokens=decode_tokens,
         topk=topk,
         local_num_experts=num_experts // (dp_size * tp_size),
-        factor=envs.TPU_MOE_A2A_CAPACITY,
+        factor=factor,
         onehot_moe_permute_threshold=onehot_threshold,
         use_sparse_core=envs.USE_MOE_SPARSE_CORE,
-        route_factor=envs.TPU_MOE_A2A_ROUTE_CAPACITY or None,
+        route_factor=route_factor or None,
         row_tile=decode_switches.A2A_ROW_TILE,
     )
     if rows >= dp_size * decode_tokens:
         logger.info(
             "Ragged A2A MoE capacity x%g | decode step: full-size exchange "
             "(capacity %d rows >= %d group tokens)",
-            envs.TPU_MOE_A2A_CAPACITY,
+            factor,
             rows,
             dp_size * decode_tokens,
         )
@@ -283,8 +312,8 @@ def _log_capacity(mesh, topk, onehot_threshold, step_routed_rows) -> None:
     logger.info(
         "Ragged A2A MoE capacity x%g (routes x%g) | decode step: %d of %d rows, "
         "%d of %d routes per rank",
-        envs.TPU_MOE_A2A_CAPACITY,
-        envs.TPU_MOE_A2A_ROUTE_CAPACITY or envs.TPU_MOE_A2A_CAPACITY,
+        factor,
+        route_factor or factor,
         rows,
         dp_size * decode_tokens,
         routes,
@@ -293,11 +322,18 @@ def _log_capacity(mesh, topk, onehot_threshold, step_routed_rows) -> None:
 
 
 def prebuild_ragged_a2a_moe(
-    *, topk, activation, rhs_quant_dtype=None, scaled=True, owner_combine=False
+    *,
+    topk,
+    activation,
+    rhs_quant_dtype=None,
+    scaled=True,
+    placed=False,
+    owner_combine=False,
 ) -> None:
     """Build the mesh and op at weight load, outside the traced forward.
-    ``scaled=False``: the op for unscaled (bf16) experts; ``owner_combine``: for
-    a layer whose owner combine is armed (``decode_switches.arm_owner_combine``).
+    ``scaled=False``: the op for unscaled (bf16) experts; ``placed``: for a
+    layer TPU_MOE_EXPERT_PLACEMENT places; ``owner_combine``: for a layer
+    whose owner combine is armed (``decode_switches.arm_owner_combine``).
 
     Padded tokens reach the op unrouted (TPU_MOE_SKIP_PADDED_TOKENS
     drops their routes at top-k), so the op never skips routes by weight."""
@@ -309,6 +345,7 @@ def prebuild_ragged_a2a_moe(
             skip_padded_tokens=False,
             shared=shared,
             scaled=scaled,
+            placed=placed,
             owner_combine=owner_combine,
         )
 
@@ -328,6 +365,7 @@ def ragged_a2a_fused_moe_gmm(
     activation: str,
     rhs_quant_dtype=None,
     shared_output: torch.Tensor | None = None,
+    placed: bool = False,
     owner_combine: bool = False,
 ) -> torch.Tensor:
     """Same contract as ``fused_moe_gmm`` with local tokens in and out; the
@@ -335,7 +373,8 @@ def ragged_a2a_fused_moe_gmm(
     (the owner combine armed for the layer), where it is already
     summed over TP and includes ``shared_output`` (this rank's shared-expert
     partial) when given. Unscaled (bf16) experts pass ``None`` for both
-    scales."""
+    scales; ``placed``: the layer's experts are placed by
+    TPU_MOE_EXPERT_PLACEMENT."""
     if w1_bias is not None or w2_bias is not None:
         raise NotImplementedError("TPU_MOE_RAGGED_A2A does not take expert biases")
     if experts_start is None:
@@ -352,6 +391,7 @@ def ragged_a2a_fused_moe_gmm(
         skip_padded_tokens=False,
         shared=shared_output is not None,
         scaled=scaled,
+        placed=placed,
         owner_combine=owner_combine,
     )
     scales = (w1_scale, w2_scale) if scaled else ()

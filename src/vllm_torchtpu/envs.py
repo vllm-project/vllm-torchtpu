@@ -109,10 +109,12 @@ if TYPE_CHECKING:
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_MOE_RAGGED_A2A: bool = False
-    TPU_MOE_A2A_CAPACITY: float = 2.5
-    TPU_MOE_A2A_ROUTE_CAPACITY: float = 3.0
+    TPU_MOE_A2A_CAPACITY: float | None = None
+    TPU_MOE_A2A_ROUTE_CAPACITY: float | None = None
     TPU_DECODE_FAST_PATHS: bool = False
     TPU_DECODE_FAST_PATHS_OFF: str = ""
+    TPU_MOE_EXPERT_PLACEMENT: str = ""
+    TPU_MOE_ROUTING_COUNTS_DIR: str = ""
     PCP_FA_KERNEL_BLOCK_SIZE: int | None = None
     PCP_GDN_COMM_CHUNK_SIZE: int | None = None
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
@@ -303,6 +305,20 @@ def env_float(env_name: str, default: float) -> Callable[[], float]:
             ) from exc
 
     return _get_float_env
+
+
+def env_optional_float(env_name: str) -> Callable[[], float | None]:
+    """Same parsing as ``env_float``, but an unset or empty variable reads as
+    ``None`` so callers can tell "explicitly set" from "not configured"."""
+    parse_float = env_float(env_name, 0.0)
+
+    def _get_optional_float_env() -> float | None:
+        value = os.getenv(env_name)
+        if value is None or value.strip() == "":
+            return None
+        return parse_float()
+
+    return _get_optional_float_env
 
 
 def env_str(env_name: str, default: str) -> Callable[[], str]:
@@ -830,18 +846,33 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_RAGGED_A2A": env_bool("TPU_MOE_RAGGED_A2A"),
     # Ragged all-to-all exchange: size the per-rank token rows and local routes
     # at this many times their uniform-routing mean (exact: a step that does
-    # not fit runs the full-size exchange). 0 = always full size.
-    "TPU_MOE_A2A_CAPACITY": env_float("TPU_MOE_A2A_CAPACITY", 2.5),
+    # not fit runs the full-size exchange). 0 = always full size. Unset = by the
+    # DP group size: 2.5 up to 8 members (2 with TPU_MOE_EXPERT_PLACEMENT), 4 up
+    # to 16, 7 above (layers.adapter.ragged_a2a_moe.capacity_factors).
+    "TPU_MOE_A2A_CAPACITY": env_optional_float("TPU_MOE_A2A_CAPACITY"),
     # The local routes' factor (0 = TPU_MOE_A2A_CAPACITY): real routing skews
     # routes more than rows. Both factors are capped at 2 where the full-size
-    # exchange stays on the one-hot path (its rerun is cheap there).
-    "TPU_MOE_A2A_ROUTE_CAPACITY": env_float("TPU_MOE_A2A_ROUTE_CAPACITY", 3.0),
+    # exchange stays on the one-hot path (its rerun is cheap there). Unset = by
+    # the DP group size and placement (see capacity_factors).
+    "TPU_MOE_A2A_ROUTE_CAPACITY": env_optional_float("TPU_MOE_A2A_ROUTE_CAPACITY"),
     # Bitwise decode paths of kernels other models share (decode_switches.PATHS:
     # xla_schedule).
     "TPU_DECODE_FAST_PATHS": env_bool("TPU_DECODE_FAST_PATHS"),
     # Comma-separated paths of decode_switches.PATHS to leave off although their
     # parent switch is on. Unknown names refuse to start.
     "TPU_DECODE_FAST_PATHS_OFF": env_str("TPU_DECODE_FAST_PATHS_OFF", ""),
+    # Place each named MoE layer's experts by this .npz (logical expert ->
+    # physical slot, e.g. balanced on routing counts; see
+    # layers/core/expert_placement.py). Unset = linear placement.
+    "TPU_MOE_EXPERT_PLACEMENT": lambda: os.getenv("TPU_MOE_EXPERT_PLACEMENT", ""),
+    # Count each MoE layer's routes per logical expert, for the layers
+    # TPU_MOE_EXPERT_PLACEMENT can place (real tokens only), and rewrite
+    # <dir>/routing-counts-*.npz with them, one file per engine and pipeline
+    # stage, at most once a minute and at a clean shutdown: counts and layer
+    # names only, the input of layers/core/expert_placement.py. Outputs do not
+    # change. For a capture window of representative traffic, with <dir> on
+    # local disk. Unset = no counting.
+    "TPU_MOE_ROUTING_COUNTS_DIR": env_str("TPU_MOE_ROUTING_COUNTS_DIR", ""),
     # Override the PCP full-attention kernel page without changing KV manager pages.
     "PCP_FA_KERNEL_BLOCK_SIZE": env_positive_int_or_none("PCP_FA_KERNEL_BLOCK_SIZE"),
     # GDN stage/projection budget; token ownership still follows PCP interleave.

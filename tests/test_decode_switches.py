@@ -23,6 +23,7 @@ pytestmark = pytest.mark.cpu_test
 
 NEW_LINE = {
     "TPU_MOE_RAGGED_A2A": "1",
+    "TPU_MOE_EXPERT_PLACEMENT": "/x/placement.npz",
     "TPU_BATCHED_RPA_DECODE_BLOCK": "8192,4,2",
     "TPU_BATCHED_RPA_VERIFY_BLOCK": "window",
     "TPU_BATCHED_RPA_KV_PAGE_RUNS": "1",
