@@ -61,22 +61,26 @@ DRAFT_KV_OVER_DCP_KEY = "draft_kv_over_dcp"
 
 @contextlib.contextmanager
 def _without_layerwise_kv_transfer():
-    """Run a draft forward with the KV connector's step metadata unbound.
+    """Run a draft forward with the KV connector's step metadata unbound,
+    when the connector keeps the draft K/V out of its store.
 
     vLLM's attention wrapper (`maybe_transfer_kv_layer`) calls the
     connector's per-layer load/save hooks only while step metadata is bound,
     and dynamo guards the traced draft forward on that. The precompile runs
     with no metadata bound, but serving proposes while the step's metadata
-    still is, so every draft bucket was traced again mid-serving. The draft
-    layers take no part in layer-wise transfer (the TPU connectors' hooks
-    are no-ops), so unbinding the metadata for the draft forward keeps the
-    outputs and lets it hit the precompiled programs.
+    still is, so every draft bucket was traced again mid-serving.
+
+    With `skip_draft_kv` the draft layers take no part in the transfer, so
+    unbinding the metadata keeps the outputs and the forward hits the
+    precompiled programs. Without it (or with a connector that does not say)
+    the draft layers need their hooks on host hits: keep the binding, and
+    accept the retrace.
     """
     from vllm.distributed.kv_transfer import kv_transfer_state
 
     connector = kv_transfer_state._KV_CONNECTOR_AGENT
     metadata = getattr(connector, "_connector_metadata", None)
-    if metadata is None:
+    if metadata is None or not getattr(connector, "_skip_draft_kv", False):
         yield
         return
     connector._connector_metadata = None
