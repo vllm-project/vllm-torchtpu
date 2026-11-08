@@ -172,3 +172,48 @@ def test_fp4_by_token_lowers_for_tpu(folded, tokens):
         lowered = jax.jit(write).trace(*args).lower(lowering_platforms=("tpu",))
     assert "tpu_custom_call" in lowered.as_text()
 
+
+@pytest.mark.parametrize("num_values", [2, 8])
+@pytest.mark.parametrize(
+    "q_lens,ctx_lens,pad_tokens",
+    [
+        ([1, 1, 1], [5, 130, 255], 2),
+        ([8, 8, 8], [124, 40, 250], 8),
+        ([300], [70], 0),
+    ],
+)
+def test_slot_scales_match_xla_scatter(
+    q_lens, ctx_lens, pad_tokens, num_values, monkeypatch
+):
+    """Per-slot scale writes token by token equal the XLA scatter they replace."""
+    rng = np.random.default_rng(sum(q_lens) + num_values)
+    num_tokens = sum(q_lens) + pad_tokens
+    cache = jnp.asarray(rng.random((NUM_PAGES, 8, PAGE)), jnp.float32)
+    values = jnp.asarray(rng.random((num_tokens, num_values)), jnp.float32)
+    pages, pos = _batch(q_lens, ctx_lens, rng, pad_tokens)
+    max_runs = msa_write.max_write_runs(num_tokens, len(q_lens), PAGE)
+
+    def write():
+        return msa_write.write_slot_scales(
+            cache, values, pages, pos % PAGE, max_runs=max_runs, interpret=True
+        )
+
+    got = write()
+    monkeypatch.setattr(msa_write, "_BY_TOKEN_MAX_TOKENS", 0)
+    expected = write()
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(expected))
+
+
+def test_slot_scales_lower_for_tpu():
+    tokens = 384
+    args = (
+        jax.ShapeDtypeStruct((4096, 8, PAGE), jnp.float32),
+        jax.ShapeDtypeStruct((tokens, 2), jnp.float32),
+        jax.ShapeDtypeStruct((tokens,), jnp.int32),
+        jax.ShapeDtypeStruct((tokens,), jnp.int32),
+    )
+    write = functools.partial(msa_write.write_slot_scales, max_runs=99)
+    tpu7x = AbstractMesh((), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu"))
+    with use_abstract_mesh(tpu7x):
+        lowered = jax.jit(write).trace(*args).lower(lowering_platforms=("tpu",))
+    assert "tpu_custom_call" in lowered.as_text()

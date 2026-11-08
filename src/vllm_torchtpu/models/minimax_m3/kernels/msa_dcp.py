@@ -325,7 +325,17 @@ def msa_write_and_candidates_dcp(
     scale_row = msa_fp4.index_scale_row(num_heads) if fp4 else None
     if fp4:
         kv_cache, index_cache, scale_cache = msa.write_fp4(
-            kv_cache, index_cache, scale_cache, k, v, index_k, write, pages, pos
+            kv_cache,
+            index_cache,
+            scale_cache,
+            k,
+            v,
+            index_k,
+            write,
+            pages,
+            pos,
+            max_num_seqs=max_num_seqs,
+            interpret=interpret,
         )
         index_q = msa_fp4.rotate_queries(index_q)
     else:

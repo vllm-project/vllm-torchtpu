@@ -143,6 +143,94 @@ def _kernel_by_token(
 _BY_TOKEN_MAX_TOKENS = 512
 
 
+def _kernel_slot_scales(
+    # Scalar prefetch
+    num_runs_ref,  # [1]
+    run_page_ref,  # [R] page of each run (padding runs repeat the last one)
+    run_lo_ref,  # [R] first slot of each run within its page
+    run_hi_ref,  # [R] one past the last slot
+    run_tok0_ref,  # [R] first token of each run
+    # In
+    values_ref,  # [T, rows, S] f32: every token's values, broadcast over lanes
+    page_ref,  # [1, rows, S] the scale page before the write
+    # Out
+    o_ref,  # [1, rows, S] aliased with the scale cache
+    *,
+    num_values: int,
+):
+    """Per-slot values (lane = slot) of a run's tokens, one by one, into rows
+    ``[0, num_values)`` of its scale page."""
+    run = pl.program_id(0)
+    active = run < num_runs_ref[0]
+
+    @pl.when(active)
+    def _():
+        shape = page_ref.shape[1:]
+        lo, tok0 = run_lo_ref[run], run_tok0_ref[run]
+        row = jax.lax.broadcasted_iota(jnp.int32, shape, 0)
+        lane = jax.lax.broadcasted_iota(jnp.int32, shape, 1)
+
+        def put(i, page):
+            take = (lane == lo + i) & (row < num_values)
+            return jnp.where(take, values_ref[tok0 + i], page)
+
+        o_ref[0] = jax.lax.fori_loop(0, run_hi_ref[run] - lo, put, page_ref[0])
+
+    @pl.when(jnp.logical_and(jnp.logical_not(active), run == 0))
+    def _():
+        o_ref[...] = page_ref[...]
+
+
+@functools.partial(jax.jit, static_argnames=("max_runs", "interpret"))
+def write_slot_scales(
+    scale_cache: jax.Array,
+    values: jax.Array,
+    pages: jax.Array,
+    slots: jax.Array,
+    *,
+    max_runs: int,
+    interpret: bool = False,
+) -> jax.Array:
+    """Write f32 ``values [T, n]`` into rows ``[0, n)`` of the ``[pages, rows,
+    S]`` scale cache at ``(pages[t], lane slots[t])``; runs as `write_rows`.
+
+    Small batches go token by token through an aliased kernel: XLA's scatter
+    cost 0.1 ms per layer for a c48 decode batch (j-fd793d3b).
+    """
+    num_tokens, num_values = values.shape
+    num_pages, rows, lanes = scale_cache.shape
+    if num_tokens > _BY_TOKEN_MAX_TOKENS:
+        return scale_cache.at[
+            pages[:, None], jnp.arange(num_values)[None, :], slots[:, None]
+        ].set(values.astype(scale_cache.dtype), mode="drop")
+    num_runs, run_page, run_lo, run_hi, run_tok0 = _runs(
+        pages, slots, num_pages, max_runs
+    )
+    padded = jnp.pad(values.astype(jnp.float32), ((0, 0), (0, rows - num_values)))
+    broadcast = jnp.broadcast_to(padded[:, :, None], (num_tokens, rows, lanes))
+    page_block = pl.BlockSpec(
+        (1, rows, lanes), lambda r, n, run_page, *_: (run_page[r], 0, 0)
+    )
+    return pl.pallas_call(
+        functools.partial(_kernel_slot_scales, num_values=num_values),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=5,
+            grid=(max_runs,),
+            in_specs=[
+                pl.BlockSpec((num_tokens, rows, lanes), lambda r, *_: (0, 0, 0)),
+                page_block,
+            ],
+            out_specs=page_block,
+        ),
+        out_shape=jax.ShapeDtypeStruct(scale_cache.shape, scale_cache.dtype),
+        # Operand 6 = the scale cache (after 5 scalar-prefetch operands and values).
+        input_output_aliases={6: 0},
+        compiler_params=pltpu.CompilerParams(dimension_semantics=("arbitrary",)),
+        interpret=interpret,
+        name="minimax_m3_msa_write_slot_scales",
+    )(num_runs[None], run_page, run_lo, run_hi, run_tok0, broadcast, scale_cache)
+
+
 def _runs(pages: jax.Array, slots: jax.Array, num_pages: int, max_runs: int):
     """Token runs: maximal spans of consecutive tokens writing one page."""
     num_tokens = pages.shape[0]

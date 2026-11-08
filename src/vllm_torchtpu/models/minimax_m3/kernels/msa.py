@@ -138,6 +138,9 @@ def write_fp4(
     write: Callable[[jax.Array, jax.Array], jax.Array],
     pages: jax.Array,
     pos: jax.Array,
+    *,
+    max_num_seqs: int | None = None,
+    interpret: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Rotate, quantize and write one step's K/V (``[T, G, D]``) and index keys
     (``[T, D]``) into 4-bit caches and their scale page (`msa_fp4`).
@@ -156,10 +159,18 @@ def write_fp4(
     )
     index_cache = write(index_cache, i_nib, scales=i_scale)
     scales = jnp.stack([k_scale, v_scale], axis=-1).reshape(num_tokens, -1)  # [T, 2G]
-    slot = pos % page_size(kv_cache)
-    scale_cache = scale_cache.at[
-        pages[:, None], jnp.arange(2 * num_heads)[None, :], slot[:, None]
-    ].set(scales, mode="drop")
+    block_size = page_size(kv_cache)
+    max_runs = msa_write.max_write_runs(
+        num_tokens, num_tokens if max_num_seqs is None else max_num_seqs, block_size
+    )
+    scale_cache = msa_write.write_slot_scales(
+        scale_cache,
+        scales,
+        pages,
+        pos % block_size,
+        max_runs=max_runs,
+        interpret=interpret,
+    )
     return kv_cache, index_cache, scale_cache
 
 
@@ -337,7 +348,17 @@ def msa_forward(
     scale_row = None
     if fp4:
         kv_cache, index_cache, scale_cache = write_fp4(
-            kv_cache, index_cache, scale_cache, k, v, index_k, write, pages, pos
+            kv_cache,
+            index_cache,
+            scale_cache,
+            k,
+            v,
+            index_k,
+            write,
+            pages,
+            pos,
+            max_num_seqs=max_num_seqs,
+            interpret=interpret,
         )
         scale_row = msa_fp4.index_scale_row(k.shape[1])
         q = msa_fp4.rotate_queries(q)
