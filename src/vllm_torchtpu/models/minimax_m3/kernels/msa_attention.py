@@ -33,6 +33,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.models.minimax_m3.kernels import msa_fp4
 from vllm_torchtpu.models.minimax_m3.kernels.packed_page import (
     check_page_dtype,
     slot_ids,
@@ -187,20 +188,17 @@ def _bitcast_slots(rows_per_page: int, packing: int) -> jax.Array:
     return slots[:, :1]  # [S, 1]
 
 
-def _fp4_page(kv_ref, scale_ref, k_row, v_row):
-    """4-bit page (uint8 ``[1, S / 8, 4, 2D]``, `msa_fp4`) -> unscaled bf16
-    rows ``[S, 2D]`` in slot order, and its K / V scales (scale-page rows
-    `k_row` / `v_row`, static ints or run-time scalars) as ``[1, S]`` lane
-    vectors. An unwritten slot's scale may be any bits: non-finite reads 0
-    (int4 data itself has no NaN code)."""
+def _fp4_page(kv_ref):
+    """One KV head's block of a folded 4-bit page (uint8 ``[1, S / 8 + 1, 4,
+    2D]``, `msa_fp4`) -> unscaled bf16 rows ``[S, 2D]`` in slot order, and its
+    K / V scales as ``[1, S]`` lane vectors: lanes ``[0, S)`` / ``[S, 2S)`` of
+    the block's last word row (`msa_fp4.kv_scales`). An unwritten slot's
+    scale may be any bits: non-finite reads 0 (int4 data has no NaN code)."""
     words = kv_ref.bitcast(jnp.uint32)[0, :, 0, :]
-    rows = pltpu.bitcast(words, jnp.int4).astype(jnp.bfloat16)
-    if isinstance(k_row, int):  # static rows
-        page = scale_ref[0]  # [R, S]
-        sk, sv = page[k_row : k_row + 1], page[v_row : v_row + 1]
-    else:  # rows picked at run time (one kernel for every KV head)
-        sk = scale_ref[0, pl.ds(k_row, 1), :]
-        sv = scale_ref[0, pl.ds(v_row, 1), :]
+    rows = pltpu.bitcast(words[:-1], jnp.int4).astype(jnp.bfloat16)
+    scales = pltpu.bitcast(words[-1:], jnp.float32)  # [1, 2D]
+    page_size = rows.shape[0]
+    sk, sv = scales[:, :page_size], scales[:, page_size : 2 * page_size]
     return (
         rows,
         jnp.where(jnp.isfinite(sk), sk, 0.0),
@@ -210,21 +208,35 @@ def _fp4_page(kv_ref, scale_ref, k_row, v_row):
 
 def page_tokens(kv_cache) -> int:
     """Tokens per page of a packed cache (4-bit uint8 caches: 8 per word)."""
-    rows, word = kv_cache.shape[1:3]
-    return rows * (8 if kv_cache.dtype == jnp.uint8 else word)
-
-
-def check_cache(kv_cache, scale_cache) -> None:
-    """A 4-bit (uint8) cache needs its scale cache; others must not have one."""
     if kv_cache.dtype == jnp.uint8:
-        if scale_cache is None or kv_cache.shape[2] != 4:
+        return msa_fp4.page_tokens(kv_cache)
+    return kv_cache.shape[1] * kv_cache.shape[2]
+
+
+def check_cache(kv_cache) -> None:
+    """A 4-bit (uint8) cache must carry its K/V scales in its pages
+    (`msa_fp4.scales_in_page`)."""
+    if kv_cache.dtype == jnp.uint8:
+        if kv_cache.shape[2] != 4 or not msa_fp4.scales_in_page(
+            kv_cache.shape[1], kv_cache.dtype
+        ):
             raise NotImplementedError(
-                "4-bit MSA caches are uint8 [pages, S / 8, 4, W] with a scale cache."
+                "4-bit MSA caches are uint8 [pages, S / 8 + 1, 4, W] with the "
+                "K/V scales folded into the last word row."
             )
         return
-    if scale_cache is not None:
-        raise ValueError("scale_cache is only for 4-bit (uint8) caches.")
     check_page_dtype(kv_cache.shape[2], kv_cache.dtype)
+
+
+def check_fp4_rows(kv_cache, head_dim) -> None:
+    """A folded 4-bit page keeps head ``h``'s K / V scales at lanes ``2hS`` /
+    ``(2h + 1)S`` of its last row, inside the head's ``2D``-wide column block
+    only when ``D == S``."""
+    if kv_cache.dtype == jnp.uint8 and page_tokens(kv_cache) != head_dim:
+        raise NotImplementedError(
+            f"4-bit pages of {page_tokens(kv_cache)} tokens need head dim "
+            f"{page_tokens(kv_cache)}, got {head_dim}."
+        )
 
 
 def _kernel_v2(
@@ -237,24 +249,25 @@ def _kernel_v2(
     selected_ref,  # [Bq, K] physical pages, -1 padded
     local_page_ref,  # [Bq, 1]
     local_limit_ref,  # [Bq, 1] visible slots of the local page
-    *refs,  # G KV pages, [G scale pages (4-bit)], then out and scratch
+    *refs,  # G KV pages (4-bit: scales folded in), then out and scratch
     sm_scale: float,
-    fp4_rows: tuple[int, int] | None = None,
+    fp4: bool = False,
 ):
     """`_kernel_v1` with pages unpacked by one bitcast each, and one mask
     select per score: masked scores are -inf against a finite running max,
     so their exp is already 0."""
-    fp4 = fp4_rows is not None
-    pages_per_step = (len(refs) - 4) // (2 if fp4 else 1)
+    pages_per_step = len(refs) - 4
     kv_refs = refs[:pages_per_step]
-    scale_refs = refs[pages_per_step : 2 * pages_per_step] if fp4 else ()
-    refs = refs[len(refs) - 4 :]
-    o_ref, m_ref, l_ref, acc_ref = refs
+    o_ref, m_ref, l_ref, acc_ref = refs[pages_per_step:]
     w = pl.program_id(0)
     meta = work_meta_ref[w]
     num_heads, block_q, head_dim = q_ref.shape
     rows_per_page, packing = kv_refs[0].shape[1:3]
-    page_size = rows_per_page * (8 if fp4 else packing)
+    page_size = (
+        msa_fp4.data_rows(rows_per_page) * msa_fp4.TOKENS_PER_WORD
+        if fp4
+        else rows_per_page * packing
+    )
 
     @pl.when((meta & _FIRST_BIT) != 0)
     def _init():
@@ -285,7 +298,7 @@ def _kernel_v2(
         # fp8 value rows; an AND on the packed bf16 words.
         seen = jnp.max(limit)
         if fp4:
-            rows, sk, sv = _fp4_page(kv_ref, scale_refs[g], *fp4_rows)
+            rows, sk, sv = _fp4_page(kv_ref)
             values.append(rows[:, head_dim:])
             k_scales.append(sk)
             v_scales.append(sv)
@@ -389,8 +402,6 @@ def _attention_call(
     kernel,
     page_table,
     interpret,
-    scale_cache=None,
-    scale_rows=None,
 ):
     """One kernel call over a token count that is a multiple of block_q."""
     num_tokens, num_heads, head_dim = q.shape
@@ -420,13 +431,7 @@ def _attention_call(
 
         return pl.BlockSpec((1, rows_per_page, packing, row_width), index_map)
 
-    def scale_block(g):  # the page's scale page, same page index
-        def index_map(*args):
-            return page_block(g).index_map(*args)[:3]
-
-        return pl.BlockSpec((1,) + scale_cache.shape[1:], index_map)
-
-    fp4 = scale_rows is not None
+    fp4 = kv_cache.dtype == jnp.uint8
     if fp4 and kernel != "v2":
         raise NotImplementedError("4-bit caches need kernel v2")
 
@@ -439,7 +444,6 @@ def _attention_call(
             pl.BlockSpec((block_q, 1), tile_block),
             pl.BlockSpec((block_q, 1), tile_block),
             *(page_block(g) for g in range(pages_per_step)),
-            *(scale_block(g) for g in range(pages_per_step) if fp4),
         ],
         out_specs=pl.BlockSpec((num_heads, block_q, head_dim), head_major_block),
         scratch_shapes=[
@@ -452,7 +456,7 @@ def _attention_call(
         functools.partial(
             _KERNELS[kernel],
             sm_scale=sm_scale,
-            **({"fp4_rows": scale_rows} if fp4 else {}),
+            **({"fp4": True} if fp4 else {}),
         ),
         grid_spec=grid_spec,
         out_shape=jax.ShapeDtypeStruct((num_heads, num_tokens, head_dim), q.dtype),
@@ -468,7 +472,6 @@ def _attention_call(
         local_page[:, None],
         local_limit[:, None],
         *([kv_cache] * pages_per_step),
-        *([scale_cache] * (pages_per_step if fp4 else 0)),
     )
     return out.transpose(1, 0, 2)
 
@@ -480,8 +483,6 @@ def _attention_call(
         "block_q",
         "pages_per_step",
         "kernel",
-        "k_scale_row",
-        "v_scale_row",
         "interpret",
     ),
 )
@@ -497,16 +498,16 @@ def msa_sparse_attention(
     pages_per_step: int = DEFAULT_PAGES_PER_STEP,
     kernel: str = DEFAULT_KERNEL,
     page_table: jax.Array | None = None,
-    scale_cache: jax.Array | None = None,
-    k_scale_row: int = 0,
-    v_scale_row: int = 1,
     interpret: bool = False,
 ) -> jax.Array:
     """Attention of each token over its selected pages.
 
     Args:
       q: ``[T, H, D]`` queries of one KV head's query heads.
-      kv_cache: ``[pages, S / p, p, 2D]`` packed ``[K | V]`` rows (bf16 or fp8).
+      kv_cache: ``[pages, S / p, p, 2D]`` packed ``[K | V]`` rows (bf16 or
+        fp8), or a 4-bit uint8 cache (`msa_fp4`) ``[pages, S / 8 + 1, 4, 2D]``
+        whose last word row holds each slot's K / V scale (x = int4 * scale);
+        `q` is then in the rotated basis and so is the output.
       selected: ``[T, K]`` physical pages each token attends, ``-1`` padded.
       local_page: ``[T]`` the page holding the token itself (``-1`` for
         padding tokens).
@@ -517,15 +518,12 @@ def msa_sparse_attention(
         it, `selected` and `local_page` hold keys (any ids unique per page,
         e.g. ``seq * pages_per_seq + block``) and only the kernel's page
         fetch translates them, so no [T, K] gather runs in XLA (v2 only).
-      scale_cache: with a 4-bit uint8 `kv_cache` (`msa_fp4`), its scale cache
-        ``[pages, 8, S]`` f32; rows `k_scale_row` / `v_scale_row` hold the
-        K / V scale of each slot (x = int4 * scale). `q` is then in the
-        rotated basis and so is the output.
     Returns:
       ``[T, H, D]`` outputs; padding tokens get zeros.
     """
     num_tokens, _, head_dim = q.shape
-    check_cache(kv_cache, scale_cache)
+    check_cache(kv_cache)
+    check_fp4_rows(kv_cache, head_dim)
     if kv_cache.shape[3] != 2 * head_dim:
         raise ValueError(
             f"Cache rows hold [K | V] of width {2 * head_dim}, got {kv_cache.shape}."
@@ -544,8 +542,6 @@ def msa_sparse_attention(
         kernel=kernel,
         page_table=page_table,
         interpret=interpret,
-        scale_cache=scale_cache,
-        scale_rows=None if scale_cache is None else (k_scale_row, v_scale_row),
     )
     step = max(block_q, MAX_TOKENS_PER_CALL - MAX_TOKENS_PER_CALL % block_q)
     outputs = [

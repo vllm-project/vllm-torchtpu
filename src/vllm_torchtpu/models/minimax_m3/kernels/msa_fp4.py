@@ -20,12 +20,15 @@ row ``r``; a width-changing bitcast of the words to int4 on v7x yields the
 page's ``S`` rows in slot order. A value is a signed int4 ``q`` in
 ``[-7, 7]``, read as ``q * scale``.
 
-Scales. One f32 scale per token per head vector, in a per-layer scale page
-``[pages, R, 128]`` f32 (`scale_rows`: R = 8, or 16 past three KV heads per
-rank) whose lanes are the page's slots: row ``2h`` holds
-the K scales of KV head ``h``, row ``2h + 1`` its V scales, row
-`index_scale_row` the index-key scales. With one scale per vector the
-kernels fold it out of the dot products: a K scale multiplies a score
+Scales. One f32 scale per token per head vector, folded into the page as
+one extra 32-bit word row (`scales_in_page`): ``[pages, S / 8 + 1, 4, W]``,
+the last row read as ``W`` f32 lanes, scale ``j`` of slot ``s`` at lane
+``j * S + s``. Index pages (``W = S``) hold one scale per slot; K/V pages of
+``G`` KV heads (``W = 2 D G``, ``D = S = 128``) hold ``2G``: ``j = 2h`` the
+K and ``j = 2h + 1`` the V scales of head ``h``, so head ``h``'s
+``2D``-wide column block carries its own K scales in its first ``S`` lanes
+and its V scales in the next ``S`` (`kv_scales`). With one scale per vector
+the kernels fold it out of the dot products: a K scale multiplies a score
 column, a V scale the probability before ``p @ v``, an index scale the
 index score before the block max.
 
@@ -45,7 +48,6 @@ import jax.numpy as jnp
 
 TOKENS_PER_WORD = 8
 INT4_MAX = 7
-SCALE_ROWS = 8
 SCALE_LANES = 128
 
 
@@ -134,23 +136,24 @@ def page_tokens(cache: jax.Array) -> int:
     return data_rows(cache.shape[1]) * TOKENS_PER_WORD
 
 
-def scale_rows(kv_heads: int) -> int:
-    """Rows of the scale page for `kv_heads` KV heads per rank: K and V rows of
-    every head, rounded up to the 8-row f32 tile (the index-key scales live
-    in the index pages, `scales_in_page`)."""
-    return -(-(2 * kv_heads) // SCALE_ROWS) * SCALE_ROWS
-
-
-def index_scale_row(kv_heads: int) -> int:
-    """Scale-page row of the index-key scales, after the K and V rows of every head."""
-    return 2 * kv_heads
-
-
 def folded_scales(cache: jax.Array) -> jax.Array:
     """``[pages, S / 8 + 1, 4, W]`` folded page -> f32 ``[pages, W]`` slot
     scales of its last word row (XLA reference)."""
     words = jax.lax.bitcast_convert_type(cache[:, -1].transpose(0, 2, 1), jnp.uint32)
     return jax.lax.bitcast_convert_type(words, jnp.float32)
+
+
+def kv_scales(cache: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """Folded 4-bit K/V pages ``[pages, S / 8 + 1, 4, 2 D G]`` -> f32 K and V
+    scales ``[pages, G, S]`` of every head and slot (XLA reference)."""
+    pages, rows, _, width = cache.shape
+    tokens = data_rows(rows) * TOKENS_PER_WORD
+    heads = width // (2 * tokens) if width % (2 * tokens) == 0 else 0
+    if not scales_in_page(rows, cache.dtype) or heads == 0:
+        raise ValueError(f"not a folded 4-bit K/V cache: {cache.shape} {cache.dtype}")
+    lanes = folded_scales(cache)[:, : 2 * heads * tokens]
+    lanes = lanes.reshape(pages, heads, 2, tokens)
+    return lanes[:, :, 0], lanes[:, :, 1]
 
 
 def unpack_rows(cache: jax.Array) -> jax.Array:

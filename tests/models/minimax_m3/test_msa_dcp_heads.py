@@ -478,18 +478,17 @@ def test_lse_heads_tile_grid_lowers_for_tpu():
     tpu7x = AbstractMesh((), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu"))
     args = (
         jax.ShapeDtypeStruct((2048, 64, 128), jnp.bfloat16),
-        jax.ShapeDtypeStruct((4096, PAGE // 8, 4, 4 * 2 * 128), jnp.uint8),
+        jax.ShapeDtypeStruct((4096, PAGE // 8 + 1, 4, 4 * 2 * 128), jnp.uint8),
         jax.ShapeDtypeStruct((2048, 4, 16), jnp.int32),
         jax.ShapeDtypeStruct((2048,), jnp.int32),
         jax.ShapeDtypeStruct((2048,), jnp.int32),
         jax.ShapeDtypeStruct((4096,), jnp.int32),
-        jax.ShapeDtypeStruct((4096, 16, PAGE), jnp.float32),
     )
 
-    def f(q, kv, sel, lp, ll, table, sc):
+    def f(q, kv, sel, lp, ll, table):
         return msa_attention_lse.msa_sparse_attention_lse_heads(
             q, kv, sel, lp, ll, table, sm_scale=0.088, block_q=64, pages_per_step=8,
-            scale_cache=sc, tiles=True,
+            tiles=True,
         )
 
     with use_abstract_mesh(tpu7x):

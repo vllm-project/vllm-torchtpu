@@ -45,8 +45,9 @@ def _kernel(
     page_ref,  # [1, S / p, p, W] the page before the write
     # Out
     o_ref,  # [1, S / p, p, W] aliased with the cache
-    *refs,  # with folded scales: [1, 1, W] uint32 scale bits by slot, then o_ref
+    *refs,  # with folded scales: [1, 1, W] uint32 scale bits, then o_ref
     bits: int,
+    scale_lanes: int = 0,
 ):
     scale_ref = None
     if refs:  # folded scales: the scale input precedes the output
@@ -67,9 +68,14 @@ def _kernel(
             keep = jnp.uint32(~(((1 << bits) - 1) << (bits * j)) & 0xFFFFFFFF)
             merged = (words & keep) | (new_ref[0, j] << jnp.uint32(bits * j))
             words = jnp.where(take, merged, words)
-        if scale_ref is not None:  # last word row: one f32 scale per slot (lane)
+        if scale_ref is not None:  # last word row: scale j of slot s at lane j * S + s
+            page_size = (rows - 1) * packing
             lane = jax.lax.broadcasted_iota(jnp.int32, (rows, width), 1)
-            take = (row == rows - 1) & (lane >= lo) & (lane < hi)
+            slot = lane % page_size
+            take = (
+                (row == rows - 1) & (slot >= lo) & (slot < hi)
+                & (lane < scale_lanes * page_size)
+            )
             words = jnp.where(take, scale_ref[0], words)
         o_ref.bitcast(jnp.uint32)[0, :, 0, :] = words
 
@@ -127,8 +133,9 @@ def write_rows(
 
     `bits` per slot defaults to the cache dtype's width. With ``bits=4`` (the
     uint8 4-bit caches of `msa_fp4`) `rows` are uint8 values below 16, and
-    each 32-bit word holds 8 slots. `scales` (f32 ``[T]``) go to the last word
-    row of a page with folded scales (`msa_fp4.scales_in_page`), lane = slot.
+    each 32-bit word holds 8 slots. `scales` (f32 ``[T]`` or ``[T, L]``) go to
+    the last word row of a page with folded scales (`msa_fp4.scales_in_page`):
+    scale ``j`` of slot ``s`` at lane ``j * S + s`` (``L * S <= W``).
     """
     num_pages, rows_per_page, word_bytes, width = cache.shape
     if bits is None:
@@ -160,19 +167,29 @@ def write_rows(
     new = word_bits[src]
     new = new.reshape(max_runs, data_rows, packing, width).transpose(0, 2, 1, 3)
     extra = []
+    scale_lanes = 0
     if folded:
         new = jnp.pad(new, ((0, 0), (0, 0), (0, rows_per_page - data_rows), (0, 0)))
+        scales2 = scales.reshape(num_tokens, -1)
+        scale_lanes = scales2.shape[1]
+        if scale_lanes * page_size > width:
+            raise ValueError(f"{scale_lanes} scales per slot do not fit {width} lanes")
         bits_by_slot = jax.lax.bitcast_convert_type(
-            scales.astype(jnp.float32), jnp.uint32
-        )[src]  # [runs, S]
-        extra = [jnp.pad(bits_by_slot, ((0, 0), (0, width - page_size)))[:, None, :]]
+            scales2.astype(jnp.float32), jnp.uint32
+        )[src]  # [runs, S, L]
+        bits_by_slot = bits_by_slot.transpose(0, 2, 1).reshape(max_runs, -1)
+        extra = [
+            jnp.pad(bits_by_slot, ((0, 0), (0, width - scale_lanes * page_size)))[
+                :, None, :
+            ]
+        ]
 
     page_block = pl.BlockSpec(
         (1, rows_per_page, word_bytes, width),
         lambda r, n, run_page, *_: (run_page[r], 0, 0, 0),
     )
     return pl.pallas_call(
-        functools.partial(_kernel, bits=bits),
+        functools.partial(_kernel, bits=bits, scale_lanes=scale_lanes),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=4,
             grid=(max_runs,),

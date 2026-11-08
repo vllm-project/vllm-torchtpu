@@ -452,14 +452,11 @@ def msa_write_and_candidates_dcp(
     local_blocks: int,
     rank: int | jax.Array,
     dcp: int,
-    scale_cache: jax.Array | None = None,
     interpret: bool = False,
-) -> tuple[jax.Array, ...]:
+) -> tuple[jax.Array, jax.Array, jax.Array]:
     """First half of the DCP forward: write this rank's tokens, score its
-    blocks and pick its candidates.
-
-    With 4-bit caches (`msa_fp4`, one KV head per rank) pass `scale_cache`;
-    it is returned updated after `index_cache`.
+    blocks and pick its candidates. 4-bit (uint8) caches (`msa_fp4`) carry
+    their scales in their pages.
 
     Shapes as `msa.msa_forward`, except that a rank may hold ``G >= 1`` KV
     heads (DCP wider than a KV head's replicas): ``k``/``v``/``index_q
@@ -491,11 +488,9 @@ def msa_write_and_candidates_dcp(
         max_num_seqs=max_num_seqs,
         interpret=interpret,
     )
-    fp4 = scale_cache is not None
-    scale_row = msa_fp4.index_scale_row(num_heads) if fp4 else None
-    if fp4:
-        kv_cache, index_cache, scale_cache = msa.write_fp4(
-            kv_cache, index_cache, scale_cache, k, v, index_k, write, pages, pos
+    if msa_fp4.is_fp4(kv_cache):
+        kv_cache, index_cache = msa.write_fp4(
+            kv_cache, index_cache, k, v, index_k, write
         )
         index_q = msa_fp4.rotate_queries(index_q)
     else:
@@ -512,8 +507,6 @@ def msa_write_and_candidates_dcp(
             cu_q_lens,
             distribution[2],
             interpret,
-            scale_cache,
-            scale_row,
         )
     else:
         # All heads in one pass over this rank's index pages: [G, T, P],
@@ -527,8 +520,6 @@ def msa_write_and_candidates_dcp(
             distribution[2],
             shards=1,
             interpret=interpret,
-            scale_cache=scale_cache,
-            scale_row=scale_row,
         ).reshape(num_heads * num_tokens, 1, -1)
     cand_scores, cand_blocks = local_candidates(
         scores,
@@ -543,8 +534,6 @@ def msa_write_and_candidates_dcp(
     )
     packed = pack_candidates(cand_scores, cand_blocks)  # [G * T, 2 * topk]
     packed = packed.reshape(num_heads, num_tokens, -1).transpose(1, 0, 2)
-    if fp4:
-        return kv_cache, index_cache, scale_cache, packed.reshape(num_tokens, -1)
     return kv_cache, index_cache, packed.reshape(num_tokens, -1)
 
 
@@ -560,13 +549,12 @@ def msa_attend_dcp(
     topk: int,
     rank: int | jax.Array,
     dcp: int,
-    scale_cache: jax.Array | None = None,
     interpret: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Second half of the DCP forward: attend over the selected blocks this
     rank holds.
 
-    With a 4-bit `kv_cache` pass its `scale_cache`: queries are rotated here
+    With a 4-bit `kv_cache` (scales in its pages) queries are rotated here
     and the partial output rotated back, so callers see plain heads.
 
     ``q [T, G * Hg, D]`` holds every query head of the group's ``G`` KV heads
@@ -604,29 +592,19 @@ def msa_attend_dcp(
         interpret=interpret,
     )
     args = (local_key, pos % block_size + 1, block_tables.reshape(-1))
-    if scale_cache is not None:
+    fp4 = msa_fp4.is_fp4(kv_cache)
+    if fp4:
         q = msa_fp4.rotate_queries(q)
-        if num_heads == 1:
-            out, lse = msa_attention_lse.msa_sparse_attention_lse(
-                q,
-                kv_cache,
-                keys[:, 0],
-                *args,
-                head=0,
-                **common,
-                **msa._fp4_attention_kwargs(scale_cache),
-            )
-        else:
-            # KV head h's K / V scales are scale-page rows 2h / 2h + 1.
-            out, lse = msa_attention_lse.msa_sparse_attention_lse_heads(
-                q, kv_cache, keys, *args, **common, scale_cache=scale_cache
-            )
-        return msa_fp4.unrotate_output(out), lse
     if num_heads == 1:
-        return msa_attention_lse.msa_sparse_attention_lse(
+        out, lse = msa_attention_lse.msa_sparse_attention_lse(
             q, kv_cache, keys[:, 0], *args, head=0, **common
         )
-    # One kernel for all the group's KV heads (the head is a kernel input).
-    return msa_attention_lse.msa_sparse_attention_lse_heads(
-        q, kv_cache, keys, *args, **common
-    )
+    else:
+        # One kernel for all the group's KV heads (the head is a kernel input;
+        # a 4-bit head's block carries its own K / V scales).
+        out, lse = msa_attention_lse.msa_sparse_attention_lse_heads(
+            q, kv_cache, keys, *args, **common
+        )
+    if fp4:
+        out = msa_fp4.unrotate_output(out)
+    return out, lse

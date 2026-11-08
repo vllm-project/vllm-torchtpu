@@ -131,36 +131,32 @@ def write_rows(
 def write_fp4(
     kv_cache: jax.Array,
     index_cache: jax.Array,
-    scale_cache: jax.Array,
     k: jax.Array,
     v: jax.Array,
     index_k: jax.Array,
-    write: Callable[[jax.Array, jax.Array], jax.Array],
-    pages: jax.Array,
-    pos: jax.Array,
-) -> tuple[jax.Array, jax.Array, jax.Array]:
+    write: Callable[..., jax.Array],
+) -> tuple[jax.Array, jax.Array]:
     """Rotate, quantize and write one step's K/V (``[T, G, D]``) and index keys
-    (``[T, D]``) into 4-bit caches and their scale page (`msa_fp4`).
+    (``[T, D]``) into 4-bit caches with folded scales (`msa_fp4`).
 
     `write(cache, nibble_rows, scales=None)` writes 4-bit rows at the step's
-    slots (`write_rows` bound to `pages` and `pos`). Scale-page rows ``2h`` /
-    ``2h + 1`` hold the K / V scales of head ``h``; the index-key scales are
-    folded into the index pages' last word row (`msa_fp4.scales_in_page`).
+    slots (`write_rows` bound to the step's pages and positions). Both caches
+    carry their scales in the pages' last word row (`msa_fp4.scales_in_page`):
+    ``2G`` per K/V slot, ordered ``(K_0, V_0, K_1, V_1, ...)`` so head ``h``'s
+    sit in its own column block (`msa_fp4.kv_scales`); one per index slot.
     """
-    num_tokens, num_heads, _ = k.shape
+    num_tokens = k.shape[0]
     k_nib, k_scale = msa_fp4.quantize(msa_fp4.rotate_keys(k))
     v_nib, v_scale = msa_fp4.quantize(msa_fp4.rotate_keys(v))
     i_nib, i_scale = msa_fp4.quantize(msa_fp4.rotate_keys(index_k))
+    scales = jnp.stack([k_scale, v_scale], axis=-1).reshape(num_tokens, -1)  # [T, 2G]
     kv_cache = write(
-        kv_cache, jnp.concatenate([k_nib, v_nib], axis=-1).reshape(num_tokens, -1)
+        kv_cache,
+        jnp.concatenate([k_nib, v_nib], axis=-1).reshape(num_tokens, -1),
+        scales=scales,
     )
     index_cache = write(index_cache, i_nib, scales=i_scale)
-    scales = jnp.stack([k_scale, v_scale], axis=-1).reshape(num_tokens, -1)  # [T, 2G]
-    slot = pos % page_size(kv_cache)
-    scale_cache = scale_cache.at[
-        pages[:, None], jnp.arange(2 * num_heads)[None, :], slot[:, None]
-    ].set(scales, mode="drop")
-    return kv_cache, index_cache, scale_cache
+    return kv_cache, index_cache
 
 
 def sparse_attention(
@@ -174,7 +170,6 @@ def sparse_attention(
     valid: jax.Array,
     *,
     sm_scale: float,
-    scale_cache: jax.Array | None = None,
     interpret: bool = False,
 ) -> jax.Array:
     """GQA attention of every token over its selected blocks.
@@ -212,16 +207,7 @@ def sparse_attention(
         pages_per_step=msa_attention.DEFAULT_PAGES_PER_STEP,
         page_table=block_tables_2d.reshape(-1),
         interpret=interpret,
-        **_fp4_attention_kwargs(scale_cache),
     )
-
-
-def _fp4_attention_kwargs(scale_cache: jax.Array | None) -> dict:
-    """Scale-page inputs of the attention kernels for a 4-bit KV cache: one KV
-    head per call, its K / V scales in scale-page rows 0 / 1."""
-    if scale_cache is None:
-        return {}
-    return dict(scale_cache=scale_cache, k_scale_row=0, v_scale_row=1)
 
 
 def _select_and_attend(
@@ -239,7 +225,6 @@ def _select_and_attend(
     init_blocks: int,
     local_blocks: int,
     interpret: bool,
-    scale_cache: jax.Array | None = None,
 ) -> jax.Array:
     selected = msa_select.select_blocks(
         scores,
@@ -260,7 +245,6 @@ def _select_and_attend(
         pages,
         valid,
         sm_scale=sm_scale,
-        scale_cache=scale_cache,
         interpret=interpret,
     )
 
@@ -311,17 +295,15 @@ def msa_forward(
     topk: int,
     init_blocks: int,
     local_blocks: int,
-    scale_cache: jax.Array | None = None,
     interpret: bool = False,
-) -> tuple[jax.Array, ...]:
+) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Write this step's K/V and index keys, select blocks, attend.
 
     Shapes: ``q [T, Hq, D]``, ``k``/``v [T, 1, D]``, ``index_q [T, 1, D]``,
     ``index_k [T, D]``; caches in the packed layout ``[pages, S / p, p, W]``
     with rows ``[K | V]`` (``W = 2D``) and index keys (``W = D``). Returns
-    ``(kv_cache, index_cache, out [T, Hq, D])``. With 4-bit caches
-    (`msa_fp4`) pass their `scale_cache`; it is returned updated after
-    `index_cache`.
+    ``(kv_cache, index_cache, out [T, Hq, D])``. 4-bit (uint8) caches
+    (`msa_fp4`) carry their scales in their pages.
     """
     num_tokens = q.shape[0]
     block_size = page_size(kv_cache)
@@ -333,13 +315,9 @@ def msa_forward(
     write = functools.partial(
         write_rows, pages=pages, pos=pos, max_num_seqs=max_num_seqs, interpret=interpret
     )
-    fp4 = scale_cache is not None
-    scale_row = None
+    fp4 = msa_fp4.is_fp4(kv_cache)
     if fp4:
-        kv_cache, index_cache, scale_cache = write_fp4(
-            kv_cache, index_cache, scale_cache, k, v, index_k, write, pages, pos
-        )
-        scale_row = msa_fp4.index_scale_row(k.shape[1])
+        kv_cache, index_cache = write_fp4(kv_cache, index_cache, k, v, index_k, write)
         q = msa_fp4.rotate_queries(q)
         index_q = msa_fp4.rotate_queries(index_q)
     else:
@@ -354,8 +332,6 @@ def msa_forward(
         cu_q_lens,
         distribution[2],
         interpret,
-        scale_cache,
-        scale_row,
     )
     out = _select_and_attend(
         q,
@@ -371,10 +347,9 @@ def msa_forward(
         init_blocks=init_blocks,
         local_blocks=local_blocks,
         interpret=interpret,
-        scale_cache=scale_cache,
     )
     if fp4:
-        return kv_cache, index_cache, scale_cache, msa_fp4.unrotate_output(out)
+        out = msa_fp4.unrotate_output(out)
     return kv_cache, index_cache, out
 
 

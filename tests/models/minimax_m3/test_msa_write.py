@@ -123,3 +123,36 @@ def test_fp4_rows_land_in_their_nibbles():
         if p < num_pages:
             expected[p, s] = np.asarray(rows[t])
     np.testing.assert_array_equal(msa_fp4.unpack_rows(out), expected)
+
+
+def test_fp4_folded_scales_land_at_their_lanes():
+    """Folded 4-bit pages with L scales per slot (K/V of G heads: L = 2G):
+    scale j of slot s lands at lane j * S + s of the last word row; other
+    lanes and every nibble outside the written slots stay as they were."""
+    from vllm_torchtpu.models.minimax_m3.kernels import msa_fp4, msa_write
+
+    rng = np.random.default_rng(7)
+    num_pages, page, g = 4, 128, 2
+    width = 2 * page * g
+    before = jnp.asarray(rng.integers(0, 16, (num_pages, page, width)), jnp.uint8)
+    lanes_before = rng.standard_normal((num_pages, width)).astype(np.float32)
+    cache = msa_fp4.pack_rows(before, scales=jnp.asarray(lanes_before))
+    # Slots 124..131 over pages 1 -> 3, 3 tokens in page 0, one dropped token.
+    pages = np.array([1] * 4 + [3] * 4 + [0] * 3 + [99], np.int32)
+    slots = np.array([124, 125, 126, 127, 0, 1, 2, 3, 60, 61, 62, 0], np.int32)
+    rows = jnp.asarray(rng.integers(0, 16, (len(pages), width)), jnp.uint8)
+    scales = rng.standard_normal((len(pages), 2 * g)).astype(np.float32)
+    out = msa_write.write_rows(
+        cache, rows, jnp.asarray(pages), jnp.asarray(slots),
+        max_runs=msa_write.max_write_runs(len(pages), 3, page), bits=4,
+        scales=jnp.asarray(scales), interpret=True,
+    )
+    expected = np.asarray(before).copy()
+    lanes = lanes_before.copy()
+    for t, (p, s) in enumerate(zip(pages, slots)):
+        if p < num_pages:
+            expected[p, s] = np.asarray(rows[t])
+            for j in range(2 * g):
+                lanes[p, j * page + s] = scales[t, j]
+    np.testing.assert_array_equal(msa_fp4.unpack_rows(out), expected)
+    np.testing.assert_array_equal(np.asarray(msa_fp4.folded_scales(out)), lanes)
