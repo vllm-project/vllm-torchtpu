@@ -1301,7 +1301,40 @@ class TpuPlatform(Platform):
         lists every distinct backend; the TPU callers need the first one.
         """
         backends = cls._find_non_ssm_backends(vllm_config)
-        return backends[0] if backends else None
+        if backends:
+            return backends[0]
+        return cls._all_mamba_pool_backend(vllm_config)
+
+    @classmethod
+    def _all_mamba_pool_backend(
+        cls, vllm_config: VllmConfig
+    ) -> "type[AttentionBackend] | None":
+        """Backend that shapes the unified pool of a model with Mamba layers only.
+
+        The pool stays attention-shaped without an attention layer (its rows
+        hold the GDN state regions, e.g. a Qwen3.5 checkpoint whose layer_types
+        are all linear_attention), so size it with the backend an attention
+        layer of this model would get. None unless the instantiated model has
+        Mamba layers and runs on the unified pool; before model init (engine
+        core) there are no layers, so this stays None there.
+        """
+        from vllm.config import set_current_vllm_config
+        from vllm.config.vllm import get_layers_from_vllm_config
+        from vllm.model_executor.layers.mamba.abstract import MambaBase
+        from vllm.v1.attention.selector import get_attn_backend
+
+        if not unified_kv_layout_enabled(vllm_config):
+            return None
+        if not get_layers_from_vllm_config(vllm_config, MambaBase):  # type: ignore[type-abstract]
+            return None
+        model_config = vllm_config.model_config
+        with set_current_vllm_config(vllm_config):
+            return get_attn_backend(
+                head_size=model_config.get_head_size(),
+                dtype=cast("torch.dtype", model_config.dtype),
+                kv_cache_dtype=vllm_config.cache_config.cache_dtype,
+                use_mla=model_config.use_mla,
+            )
 
     @classmethod
     def update_block_size_for_backend(cls, vllm_config: VllmConfig) -> None:

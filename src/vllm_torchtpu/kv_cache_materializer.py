@@ -20,6 +20,7 @@ import torch
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     EncoderOnlyAttentionSpec,
+    FullAttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
     MambaSpec,
@@ -159,6 +160,45 @@ def _pool_attention_geometry(
                 )
                 return spec, group.backend, kernel_block_size
     return None
+
+
+def _all_mamba_pool_geometry(
+    kv_cache_config: KVCacheConfig,
+    kernel_block_size_by_gid: dict[int, int],
+    cache_dtype: str | torch.dtype,
+) -> tuple[AttentionSpec, Any, int] | None:
+    """Pool geometry when every cache group is Mamba (no attention layer).
+
+    The pool keeps the attention-shaped rows the platform sized it with
+    (`TpuPlatform._all_mamba_pool_backend`): the spec an attention layer of
+    this model would have, at the Mamba groups' block size. Reads the model
+    from the current vLLM config, which TPUModelRunner.initialize_kv_cache
+    sets around KV-cache init; without one this returns None (still raises).
+    """
+    from vllm.config.vllm import get_current_vllm_config_or_none
+
+    vllm_config = get_current_vllm_config_or_none()
+    groups = kv_cache_config.kv_cache_groups
+    if vllm_config is None or not groups:
+        return None
+    if not all(isinstance(g.kv_cache_spec, MambaSpec) for g in groups):
+        return None
+    from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+
+    backend = TpuPlatform._find_non_ssm_backend(vllm_config)
+    if backend is None:
+        return None
+    model_config = vllm_config.model_config
+    block_size = groups[0].kv_cache_spec.block_size
+    dtype = cache_dtype if isinstance(cache_dtype, torch.dtype) else model_config.dtype
+    spec = FullAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=model_config.get_num_kv_heads(vllm_config.parallel_config),
+        head_size=model_config.get_head_size(),
+        dtype=dtype,
+    )
+    # Mamba groups never split blocks, so group 0 stands for all of them.
+    return spec, backend, kernel_block_size_by_gid.get(0, block_size)
 
 
 def layer_to_pool_index(kv_cache_config: KVCacheConfig) -> dict[str, int]:
@@ -530,6 +570,8 @@ def materialize_kv_cache_tensors(
 
     pool_geometry = _pool_attention_geometry(
         kv_cache_config, attn_groups, kernel_block_size_by_gid
+    ) or _all_mamba_pool_geometry(
+        kv_cache_config, kernel_block_size_by_gid, cache_dtype
     )
     if pool_geometry is None:
         raise ValueError("unified hybrid KV layout requires an attention pool")
