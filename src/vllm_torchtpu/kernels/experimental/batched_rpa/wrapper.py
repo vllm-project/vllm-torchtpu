@@ -43,8 +43,43 @@ from vllm_torchtpu.kernels.experimental.batched_rpa import (
     kernel,
     schedule,
     schedule_cp,
+    schedule_xla,
     utils,
 )
+
+# Skip the kernel of a mode (decode / mixed) that has no sequences in the
+# call. Module-level for tests.
+_SKIP_EMPTY_MODES = True
+
+
+def _generate_rpa_metadata(
+    cu_q_lens: jax.Array,
+    q_offsets: jax.Array,
+    kv_cache_lens: jax.Array,
+    kv_new_lens: jax.Array,
+    distribution: jax.Array,
+    *,
+    cfgs: configs.RpaConfigs,
+    computer_cls: type[schedule.BaseMetadataComputer],
+    extra_scalars=(),
+    xla_schedule: bool = False,
+) -> schedule.RpaSchedule:
+    """The schedule kernel's metadata; with `xla_schedule`, built with array
+    ops where `schedule_xla` reproduces the kernel's consumed entries."""
+    if xla_schedule and schedule_xla.supported(cfgs, computer_cls, extra_scalars):
+        return schedule_xla.generate_rpa_metadata(
+            cu_q_lens, q_offsets, kv_cache_lens, kv_new_lens, distribution, cfgs
+        )
+    return schedule.generate_rpa_metadata(
+        cu_q_lens,
+        q_offsets,
+        kv_cache_lens,
+        kv_new_lens,
+        distribution,
+        cfgs=cfgs,
+        computer_cls=computer_cls,
+        extra_scalars=extra_scalars,
+    )
 
 
 def prepare_inputs(
@@ -488,6 +523,7 @@ def _select_rpa_metadata(
     distribution: jax.Array,
     compact_cfgs: configs.RpaConfigs,
     streamed_cfgs: configs.RpaConfigs,
+    xla_schedule: bool = False,
 ) -> tuple[schedule.RpaSchedule, schedule.RpaSchedule]:
     """Select shared metadata without capturing per-layer Q/K/V or KV buffers."""
     computer_cls = schedule.BaseMetadataComputer
@@ -510,7 +546,7 @@ def _select_rpa_metadata(
     ]
 
     def generate(cfgs):
-        metadata = schedule.generate_rpa_metadata(
+        metadata = _generate_rpa_metadata(
             cu_q_lens,
             q_offsets,
             kv_cache_lens,
@@ -518,6 +554,7 @@ def _select_rpa_metadata(
             distribution,
             cfgs=cfgs,
             computer_cls=computer_cls,
+            xla_schedule=xla_schedule,
         )
         leaves = jax.tree.leaves(metadata)
         return tuple(
@@ -568,6 +605,7 @@ def _select_rpa_metadata(
         "attention_scope",
         "return_lse",
         "stream_page_indices",
+        "xla_decode_schedule",
     ),
     # Donation of transient inputs can fail for some runtime buffer layouts in
     # the experimental tuning path. Keep donation only for kv_cache, which is
@@ -610,6 +648,7 @@ def ragged_paged_attention(
     attention_scope: configs.AttentionScope = configs.AttentionScope.FULL,
     return_lse: bool = False,
     stream_page_indices: bool | None = None,
+    xla_decode_schedule: bool = False,
 ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
     """Perform batched ragged paged attention.
     Args:
@@ -660,6 +699,9 @@ def ragged_paged_attention(
             tokens. Defaults to FULL.
         return_lse: If True, return log-sum-exp (lse) values along with the
             output. Defaults to False.
+        xla_decode_schedule: Build the decode-mode schedule with array ops
+            (`schedule_xla`) instead of the scalar schedule kernel, where it
+            reproduces the kernel's entries. Defaults to False.
     Returns:
         out: [max_num_tokens, num_q_heads, head_dim]. Output of self attention.
         new_kv_cache: [num_pages, page_size, cdiv(num_kv_heads * 2, kv_packing),
@@ -943,21 +985,31 @@ def ragged_paged_attention(
                 distribution,
                 compact_cfgs,
                 cfgs,
+                xla_schedule=xla_decode_schedule,
             )
             # Only this conditional captures layer-specific data. Metadata's
             # conditional has identical operands across layers and can be CSE'd.
-            state = jax.lax.cond(
-                use_compact,
-                lambda args, cfg=compact_cfgs, meta=compact_metadata: run_rpa_kernel(
-                    cfg, meta, compact_indices, *args
-                ),
-                lambda args, cfg=cfgs, meta=streamed_metadata: run_rpa_kernel(
-                    cfg, meta, page_indices, *args
-                ),
+            # A mode without sequences schedules no step and leaves the state
+            # as it is, so its kernel is skipped.
+            lo, hi = mode.get_range(distribution)
+            branch = jnp.where(use_compact, 1, 2)
+            if _SKIP_EMPTY_MODES:
+                branch = jnp.where(hi > lo, branch, 0)
+            state = jax.lax.switch(
+                branch,
+                [
+                    lambda args: args,
+                    lambda args, cfg=compact_cfgs, meta=compact_metadata: (
+                        run_rpa_kernel(cfg, meta, compact_indices, *args)
+                    ),
+                    lambda args, cfg=cfgs, meta=streamed_metadata: run_rpa_kernel(
+                        cfg, meta, page_indices, *args
+                    ),
+                ],
                 state,
             )
         else:
-            metadata = schedule.generate_rpa_metadata(
+            metadata = _generate_rpa_metadata(
                 cu_q_lens,
                 q_offsets,
                 kv_cache_lens,
@@ -966,6 +1018,7 @@ def ragged_paged_attention(
                 cfgs=cfgs,
                 computer_cls=computer_cls,
                 extra_scalars=extra_scalars,
+                xla_schedule=xla_decode_schedule,
             )
             state = run_rpa_kernel(cfgs, metadata, page_indices, *state)
     o_hbm_alias_q_hbm, kv_cache, lse_hbm = state

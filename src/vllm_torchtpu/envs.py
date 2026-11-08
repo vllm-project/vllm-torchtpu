@@ -73,6 +73,10 @@ if TYPE_CHECKING:
     MIXED_Q_SPLIT: int | None = None
     MIXED_NUM_QUERIES_PER_BLOCK: int | None = None
     MIXED_NUM_KV_PAGES_PER_BLOCK: int | None = None
+    TPU_BATCHED_RPA_DECODE_BLOCK: tuple[int, int, int] | None = None
+    TPU_BATCHED_RPA_VERIFY_BLOCK: str | tuple[int, int, int] | None = None
+    TPU_BATCHED_RPA_DRAFT_ONE_QUERY: bool = False
+    TPU_BATCHED_RPA_XLA_SCHEDULE: bool = False
     TPU_MLA_MASKED_DENSE_ENABLED: bool = False
     TPU_MLA_MASKED_DENSE_ANALYTIC_MAX_KV_LEN: int | None = None
     TPU_MLA_MASKED_DENSE_MAX_KV_LEN: int | None = None
@@ -366,6 +370,38 @@ def env_positive_int_or_none(env_name: str) -> Callable[[], int | None]:
     return _get_positive_int_or_none_env
 
 
+def _get_batched_rpa_decode_block() -> tuple[int, int, int] | None:
+    """Parse TPU_BATCHED_RPA_DECODE_BLOCK as three positive integers."""
+    value = os.getenv("TPU_BATCHED_RPA_DECODE_BLOCK", "").strip()
+    if not value:
+        return None
+    parts = value.split(",")
+    if len(parts) != 3 or not all(p.strip().isdigit() and int(p) > 0 for p in parts):
+        raise ValueError(
+            f"Invalid value '{value}' for TPU_BATCHED_RPA_DECODE_BLOCK: "
+            "expected 'bkv,batch,buffers' with positive integers."
+        )
+    bkv, batch, buffers = (int(p) for p in parts)
+    return bkv, batch, buffers
+
+
+def _get_batched_rpa_verify_block() -> str | tuple[int, int, int] | None:
+    """Parse TPU_BATCHED_RPA_VERIFY_BLOCK as 'window' or three positive integers."""
+    value = os.getenv("TPU_BATCHED_RPA_VERIFY_BLOCK", "").strip()
+    if not value:
+        return None
+    if value == "window":
+        return value
+    parts = value.split(",")
+    if len(parts) != 3 or not all(p.strip().isdigit() and int(p) > 0 for p in parts):
+        raise ValueError(
+            f"Invalid value '{value}' for TPU_BATCHED_RPA_VERIFY_BLOCK: "
+            "expected 'window' or 'bkv,batch,buffers' with positive integers."
+        )
+    bkv, batch, buffers = (int(p) for p in parts)
+    return bkv, batch, buffers
+
+
 def _get_nan_log_level() -> NanLogLevel:
     value = os.getenv("TPU_NAN_LOG_LEVEL", "0")
     if value not in ("0", "1", "2", "3", "4"):
@@ -604,6 +640,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MIXED_Q_SPLIT": env_optional_int("MIXED_Q_SPLIT"),
     "MIXED_NUM_QUERIES_PER_BLOCK": env_optional_int("MIXED_NUM_QUERIES_PER_BLOCK"),
     "MIXED_NUM_KV_PAGES_PER_BLOCK": env_optional_int("MIXED_NUM_KV_PAGES_PER_BLOCK"),
+    # Decode block of the batched RPA kernel as "bkv,batch,buffers": KV tokens
+    # per block, sequences per block, buffers. Unset keeps the kernel default.
+    # 8192,4,2 is faster at >= 64K tokens per sequence, slower at 24 x 32K.
+    "TPU_BATCHED_RPA_DECODE_BLOCK": _get_batched_rpa_decode_block,
+    # Decode block of the batched RPA kernel for multi-token verify windows
+    # (speculative decoding), computing the whole window per KV block in one
+    # pass instead of the kernel's split into query chunks. "window" keeps the
+    # kernel's default block (bit-identical outputs); "bkv,batch,buffers" sets
+    # the block as well. Unset keeps the kernel default.
+    "TPU_BATCHED_RPA_VERIFY_BLOCK": _get_batched_rpa_verify_block,
+    # Speculative draft layers of the batched RPA kernel run passes in which
+    # every sequence carries one query (MTP draft steps after the first)
+    # through the one-query decode kernel at the KV block of the verify block,
+    # instead of the verify-window kernel. Needs TPU_BATCHED_RPA_VERIFY_BLOCK.
+    "TPU_BATCHED_RPA_DRAFT_ONE_QUERY": env_bool("TPU_BATCHED_RPA_DRAFT_ONE_QUERY"),
+    # Batched RPA builds each decode-mode schedule (one query block per
+    # sequence) with array ops instead of the scalar schedule kernel; the
+    # attention kernel reads identical entries.
+    "TPU_BATCHED_RPA_XLA_SCHEDULE": env_bool("TPU_BATCHED_RPA_XLA_SCHEDULE"),
     # Opt in to GLM-5.2's measured masked-dense sparse-MLA prefill routing.
     # Off by default until the model and hardware scope of the cost model is
     # broadened or selected automatically from an explicit model profile.

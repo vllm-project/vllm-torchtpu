@@ -595,3 +595,249 @@ def test_default_layout_accepts_a_layout_blind_kernel_entry(nhd, monkeypatch):
     impl._kernel_op_prefix = "pallas::rpa_kernel_local"
     bound = _build_rpa_kernel(impl, monkeypatch)
     assert "kv_layout" not in bound.keywords
+
+
+@pytest.mark.cpu_test
+def test_decode_block_env_binds_the_one_query_decode_block(monkeypatch):
+    """TPU_BATCHED_RPA_DECODE_BLOCK reaches the wrapper as decode_block_sizes."""
+    from vllm_torchtpu.layers.adapter import attention as adapter
+
+    entries = []
+
+    def impl(*args, rpa_func, **kwargs):
+        entries.append(rpa_func)
+
+    monkeypatch.setattr(adapter, "_pallas_rpa_kernel_impl", impl)
+    run = functools.partial(
+        adapter._pallas_rpa_kernel_batched,
+        *([None] * 12),
+        mesh=None,
+        sliding_window=None,
+        skip_kv_update=False,
+        kv_layout=KVLayout.SEQ_ALONG_LANE,
+    )
+
+    monkeypatch.delenv("TPU_BATCHED_RPA_DECODE_BLOCK", raising=False)
+    run()
+    assert entries[-1] is adapter.ragged_paged_attention_batched
+
+    monkeypatch.setenv("TPU_BATCHED_RPA_DECODE_BLOCK", "8192,4,2")
+    run()
+    assert entries[-1].func is adapter.ragged_paged_attention_batched
+    assert entries[-1].keywords == {
+        "decode_block_sizes": batched_rpa_configs.BlockSizes(
+            bq_sz=1, bq_c_sz=1, bkv_sz=8192, batch_size=4, n_buffer=2
+        )
+    }
+    # A multi-token decode keeps the kernel's own block for its query width.
+    run(decode_query_size=4)
+    assert entries[-1].keywords == {"decode_query_size": 4}
+
+    for value in ("8192,4", "8192,0,2", "8192,4,two"):
+        monkeypatch.setenv("TPU_BATCHED_RPA_DECODE_BLOCK", value)
+        with pytest.raises(ValueError, match="TPU_BATCHED_RPA_DECODE_BLOCK"):
+            run()
+
+
+@pytest.mark.cpu_test
+def test_verify_block_env_binds_the_verify_window_block(monkeypatch):
+    """TPU_BATCHED_RPA_VERIFY_BLOCK computes a verify window in one query chunk."""
+    import numpy as np
+
+    from vllm_torchtpu.layers.adapter import attention as adapter
+
+    entries = []
+
+    def impl(*args, rpa_func, **kwargs):
+        entries.append(rpa_func)
+
+    monkeypatch.setattr(adapter, "_pallas_rpa_kernel_impl", impl)
+    monkeypatch.delenv("TPU_BATCHED_RPA_DECODE_BLOCK", raising=False)
+    run = functools.partial(
+        adapter._pallas_rpa_kernel_batched,
+        *([None] * 12),
+        mesh=None,
+        sliding_window=None,
+        skip_kv_update=False,
+        kv_layout=KVLayout.SEQ_ALONG_LANE,
+    )
+
+    monkeypatch.delenv("TPU_BATCHED_RPA_VERIFY_BLOCK", raising=False)
+    run(decode_query_size=4)
+    assert entries[-1].func is adapter.ragged_paged_attention_batched
+    assert entries[-1].keywords == {"decode_query_size": 4}
+
+    monkeypatch.setenv("TPU_BATCHED_RPA_VERIFY_BLOCK", "8192,4,2")
+    run(decode_query_size=4)
+    assert entries[-1].func is adapter.ragged_paged_attention_batched
+    assert entries[-1].keywords == {
+        "decode_query_size": 4,
+        "decode_block_sizes": batched_rpa_configs.BlockSizes(
+            bq_sz=4, bq_c_sz=4, bkv_sz=8192, batch_size=4, n_buffer=2
+        ),
+    }
+    # One-query decodes keep the decode block path.
+    run()
+    assert entries[-1] is adapter.ragged_paged_attention_batched
+
+    # "window": the kernel's own block for this call, whole window per chunk.
+    monkeypatch.setenv("TPU_BATCHED_RPA_VERIFY_BLOCK", "window")
+    run(decode_query_size=4)
+    window_fn = entries[-1]
+    seen = {}
+    default = batched_rpa_configs.BlockSizes(
+        bq_sz=4, bq_c_sz=2, bkv_sz=3072, batch_size=8, n_buffer=3
+    )
+
+    def blocks(model_cfgs, serve_cfgs, vmem_limit_bytes, decode_query_size):
+        seen.update(model=model_cfgs, serve=serve_cfgs, vmem=vmem_limit_bytes)
+        assert decode_query_size == 4
+        return default, None
+
+    calls = []
+
+    def rpa(*args, **kwargs):
+        calls.append((args, kwargs))
+        return "out"
+
+    monkeypatch.setattr(adapter.rpa_batched_wrapper, "calculate_block_sizes", blocks)
+    fn = adapter._with_verify_block_override(
+        functools.partial(rpa, decode_query_size=4), 4
+    )
+    queries = np.empty((48, 16, 256), np.dtype("bfloat16"))
+    keys = np.empty((48, 1, 256), np.dtype("bfloat16"))
+    cache = np.empty((10, 1, 2, 64, 128), np.uint8)
+    kv_lens = np.zeros(12, np.int32)
+    table = np.zeros(12 * 8192, np.int32)
+    lane = KVLayout.SEQ_ALONG_LANE
+    out = fn(
+        queries, keys, "v", cache, kv_lens, table, "cu", "d",
+        kv_layout=lane, vmem_limit_bytes=1 << 26,
+    )  # fmt: skip
+    assert out == "out"
+    args, kwargs = calls[-1]
+    assert args == (queries, keys, "v", cache, kv_lens, table, "cu", "d")
+    assert kwargs["decode_block_sizes"] == batched_rpa_configs.BlockSizes(
+        bq_sz=4, bq_c_sz=4, bkv_sz=3072, batch_size=8, n_buffer=3
+    )
+    assert kwargs["decode_query_size"] == 4 and kwargs["kv_layout"] == lane
+    model, serve = seen["model"], seen["serve"]
+    assert (model.num_q_heads, model.num_kv_heads, model.head_dim) == (16, 1, 256)
+    assert (serve.num_seqs, serve.page_size, serve.num_page_indices) == (
+        12,
+        128,
+        12 * 8192,
+    )
+    assert serve.dtype_kv == np.uint8 and serve.kv_layout == lane
+    assert serve.decode_query_size == 4 and seen["vmem"] == 1 << 26
+    assert callable(window_fn) and not isinstance(window_fn, functools.partial)
+
+    for value in ("8192,4", "8192,0,2", "windows"):
+        monkeypatch.setenv("TPU_BATCHED_RPA_VERIFY_BLOCK", value)
+        with pytest.raises(ValueError, match="TPU_BATCHED_RPA_VERIFY_BLOCK"):
+            run(decode_query_size=4)
+
+
+@pytest.mark.cpu_test
+def test_max_model_len_bounds_the_batched_page_table():
+    """Only the columns a max_model_len sequence can address reach the kernel."""
+    import numpy as np
+
+    from vllm_torchtpu.layers.adapter import attention as adapter
+
+    calls = []
+
+    def rpa(q, k, v, kv_cache, kv_lens, page_indices, *args, **kwargs):
+        calls.append((page_indices, args, kwargs))
+        return "out"
+
+    num_seqs = 3
+    lane = KVLayout.SEQ_ALONG_LANE
+
+    def run(page_size, width, decode_query_size=1, **kwargs):
+        """Pages passed on for a num_seqs x width table of page_size pages."""
+        table = np.arange(num_seqs * width, dtype=np.int32)
+        if kwargs.get("kv_layout") == lane:
+            cache = np.empty((1, 1, 1, 1, page_size))
+        else:
+            cache = np.empty((1, page_size, 1, 1, 1))
+        bounded = adapter._with_addressable_page_table(rpa, 1048576, decode_query_size)
+        kv_lens = np.zeros(num_seqs, np.int32)
+        assert bounded(0, 1, 2, cache, kv_lens, table, "cu", "d", **kwargs) == "out"
+        pages, args, passed = calls[-1]
+        assert (args, passed) == (("cu", "d"), kwargs)
+        return table, pages
+
+    # 1M tokens in 2176-token blocks of 128-token pages: 8194 -> 8192 columns.
+    table, pages = run(128, 8194, kv_layout=lane)
+    np.testing.assert_array_equal(pages, table.reshape(3, 8194)[:, :8192].ravel())
+    # Without kv_layout the wrapper reads HEAD_ALONG_SUBLANE: page size on axis 1.
+    assert run(128, 8194)[1].shape == (num_seqs * 8192,)
+    # 2304-token blocks of 256-token pages: 4104 -> 4096 columns.
+    assert run(256, 4104, kv_layout=lane)[1].shape == (num_seqs * 4096,)
+    # A verify window reaches one page further; 8320 columns cover the table.
+    table, pages = run(128, 8194, decode_query_size=4, kv_layout=lane)
+    assert pages is table
+    # A table no wider than the addressable columns passes through unchanged.
+    table, pages = run(128, 1040, kv_layout=lane)
+    assert pages is table
+
+
+@pytest.mark.cpu_test
+def test_batched_entry_bounds_the_page_table_only_with_max_model_len(monkeypatch):
+    from vllm_torchtpu.layers.adapter import attention as adapter
+
+    entries = []
+
+    def impl(*args, rpa_func, **kwargs):
+        entries.append(rpa_func)
+
+    monkeypatch.setattr(adapter, "_pallas_rpa_kernel_impl", impl)
+    monkeypatch.delenv("TPU_BATCHED_RPA_DECODE_BLOCK", raising=False)
+    run = functools.partial(
+        adapter._pallas_rpa_kernel_batched,
+        *([None] * 12),
+        mesh=None,
+        sliding_window=None,
+        skip_kv_update=False,
+        kv_layout=KVLayout.SEQ_ALONG_LANE,
+    )
+    run()
+    assert entries[-1] is adapter.ragged_paged_attention_batched
+    run(max_model_len=1048576)
+    assert entries[-1] is not adapter.ragged_paged_attention_batched
+    assert entries[-1].__qualname__.startswith("_with_addressable_page_table")
+
+
+def test_build_rpa_kernel_binds_max_model_len(nhd, monkeypatch):
+    from types import SimpleNamespace
+
+    from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackendImpl
+    from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+        set_vllm_model_wrapper_context,
+    )
+
+    captured = {}
+
+    class FakeOp:
+        def register_fake(self, _fake_impl):
+            pass
+
+    def fake_jax_op(_name, wrapped_fn, **_kwargs):
+        captured["fn"] = wrapped_fn
+        return FakeOp()
+
+    monkeypatch.setattr(PallasAttentionBackendImpl, "_kernel_registry", {})
+    monkeypatch.setattr(
+        PallasAttentionBackendImpl,
+        "_select_kernel_mesh",
+        staticmethod(lambda _mesh, _pcp: (object(), object(), None)),
+    )
+    monkeypatch.setattr(
+        "vllm_torchtpu.layers.adapter.attention.pallas.jax_op", fake_jax_op
+    )
+    mesh = SimpleNamespace(shape={"attn_dp": 1, "expert": 1, "model": 1})
+    config = SimpleNamespace(model_config=SimpleNamespace(max_model_len=1048576))
+    with set_vllm_model_wrapper_context(mesh=mesh, vllm_config=config):
+        _batched_impl()._build_rpa_kernel(None, None, None)
+    assert captured["fn"].keywords["max_model_len"] == 1048576
