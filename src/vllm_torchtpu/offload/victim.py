@@ -152,6 +152,35 @@ def patch_block_pool_victims() -> None:
 
         BlockPool.unpin_blocks = unpin_blocks
     BlockPool._q38_victim_patch = True
+    _patch_free_queue_stamps()
+
+
+def _patch_free_queue_stamps() -> None:
+    """Stamp a block's free step where every free path ends: entering the free queue.
+
+    The free_blocks/unpin_blocks wrappers above are not enough on the served engine: there the victim hook is
+    installed at the engine_core stage, and the LIFO free patch (vllm_torchtpu._patch_vllm_block_pool_lifo_free,
+    platform_activation) replaces BlockPool.free_blocks seconds later in the same EngineCore process, so the
+    wrapper is dropped and every victim arrives unstamped (j-47fee8a1: 220,445 of 220,445). Any free path, the LIFO
+    one included, puts the block on FreeKVCacheBlockQueue, so stamping here survives later replacements. Idempotent;
+    inert unless a tap is active."""
+    from vllm.v1.core.kv_cache_utils import FreeKVCacheBlockQueue
+
+    if FreeKVCacheBlockQueue.__dict__.get("_q38_victim_stamp", False):
+        return
+    for name in ("append", "append_n", "prepend_n"):
+        orig = FreeKVCacheBlockQueue.__dict__.get(name)
+        if orig is None:
+            continue
+
+        def wrapped(self, arg, _orig=orig, _many=name != "append"):
+            out = _orig(self, arg)
+            if _TAP is not None:
+                _TAP.on_freed(b.block_id for b in (arg if _many else (arg,)) if not b.is_null)
+            return out
+
+        setattr(FreeKVCacheBlockQueue, name, wrapped)
+    FreeKVCacheBlockQueue._q38_victim_stamp = True
 
 
 def select_victims(

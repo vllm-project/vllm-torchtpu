@@ -188,3 +188,43 @@ def test_prepare_victim_store_skips_resident_and_in_flight_keys():
     seed_host_entries(store, resident, device_block_size_factor=1)
     assert manager.prepare_victim_store([resident, fresh]) == [fresh]
     assert manager.prepare_victim_store([fresh]) == []  # already in flight
+
+
+_SERVED_ORDER = r'''
+import json
+from vllm_torchtpu.offload import victim
+import vllm_torchtpu
+victim.patch_block_pool_victims()            # engine_core stage (and the connector's _enable_victim_policy)
+vllm_torchtpu._patch_vllm_block_pool_lifo_free()   # platform_activation, 4 s later in the same EngineCore process
+from vllm import SamplingParams
+from vllm.utils.hashing import sha256
+from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+from vllm.v1.request import Request
+init_none_hash(sha256)
+req = Request("r", prompt_token_ids=list(range(48)), sampling_params=SamplingParams(max_tokens=1), pooling_params=None,
+              block_hasher=get_request_block_hasher(16, sha256))
+tap = victim.VictimTap(); victim.activate(tap)
+pool = BlockPool(num_gpu_blocks=8, enable_caching=True, hash_block_size=16)
+blocks = pool.get_new_blocks(3); pool.cache_full_blocks(req, blocks, 0, 3, 16, 0)
+tap.step = 4; pool.free_blocks(blocks)
+tap.step = 9; pool.get_new_blocks(pool.get_num_free_blocks())
+print("Q38_SERVED " + json.dumps(sorted((v.block_id, v.freed_step) for v in tap.take())))
+'''
+
+
+def test_victims_are_stamped_when_the_lifo_patch_lands_after_the_hook():
+    """j-47fee8a1 (served, multi-process engine core): the victim hook was installed at the engine_core stage and the
+    LIFO free patch replaced BlockPool.free_blocks 4 s later at platform_activation, so all 220,445 victims arrived
+    unstamped and none was stored. Stamping must survive any later replacement of free_blocks (served order)."""
+    import os
+    import subprocess
+    import sys
+
+    r = subprocess.run([sys.executable, "-c", _SERVED_ORDER], capture_output=True, text=True, env=dict(os.environ))
+    line = next((l for l in r.stdout.splitlines() if l.startswith("Q38_SERVED ")), None)
+    assert line is not None, r.stderr[-2000:]
+    import json
+
+    got = json.loads(line[len("Q38_SERVED "):])
+    assert len(got) == 3 and all(step == 4 for _, step in got), got
