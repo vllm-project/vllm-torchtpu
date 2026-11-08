@@ -202,6 +202,12 @@ def install_kv_cache_nan_detector(runner: "TPUModelRunner") -> KVCacheNaNDetecto
             "KV cache NaN/Inf detection requires a causal LM, PP=PCP=DCP=1 "
             "and non-SPMD execution"
         )
+    if getattr(runner, "_two_slot_ckpts", False):
+        # The inspectors read the checkpoint a read offset names; two-slot
+        # checkpoints keep a read code instead.
+        raise ValueError(
+            "KV cache NaN/Inf detection does not support TPU_GDN_TWO_SLOT_CKPT"
+        )
     if (
         runner.scheduler_config.async_scheduling
         and parallel.tensor_parallel_size > 1

@@ -94,6 +94,7 @@ from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
     TpuKVConnectorStats,
 )
 from vllm_torchtpu.distributed.pp_wave import PPWave, pp_rank_flags
+from vllm_torchtpu.gdn_pool_layout import gdn_two_slot_ckpts
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs as rpa_configs
 from vllm_torchtpu.kernels.experimental.batched_rpa import wrapper as rpa_batched
 from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
@@ -219,6 +220,10 @@ class ExecuteModelState:
     # Per chunk, the verify rows that may complete a mamba block this step,
     # for the boundary-state copy after sampling; None when no row can.
     mamba_boundary_plans: list[SpecBoundaryPlan | None] = field(default_factory=list)
+    # Two-slot GDN checkpoints, per chunk: each request's window position
+    # whose state a mamba block boundary needs, or -1
+    # (`AttentionMetadataBuilderContext.mamba_window_boundary`).
+    mamba_window_boundaries: list[torch.Tensor | None] = field(default_factory=list)
     kv_save_nan_check: KVSaveNanCheck | None = None
 
 
@@ -347,6 +352,51 @@ def _spec_boundary_pairs(
         else _spec_boundary_pairs_impl
     )
     return fn(entries, seq_lens, num_valid, block_size, width)
+
+
+def _check_two_slot_ckpts_supported(vllm_config: VllmConfig) -> None:
+    """Refuse two-slot GDN checkpoints (TPU_GDN_TWO_SLOT_CKPT) where they
+    would be wrong: they need the unified KV pool.
+
+    With block hashes (prefix caching or a KV connector) the verify window
+    that completes a mamba block writes the exact boundary state into it
+    (gdn v3 `memory_ref.two_slot_boundary`), the state the one-block-per-
+    position mode copies there after sampling (`_copy_spec_boundary_states`).
+    """
+    if not unified_kv_layout_enabled(vllm_config):
+        raise ValueError(
+            "TPU_GDN_TWO_SLOT_CKPT=1 needs the unified KV pool; remove "
+            "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=0."
+        )
+
+
+def _two_slot_read_codes(
+    codes: torch.Tensor,
+    num_valid: torch.Tensor,
+    drafts: torch.Tensor,
+    window_boundary: torch.Tensor,
+) -> torch.Tensor:
+    """Next read code of each request under two-slot GDN checkpoints.
+
+    A code is `start + 2 * pending`: `start` (0 or 1) names the request's
+    block holding the next window's start state, `pending` how many leading
+    tokens of the last window were accepted but are not in it. A verify
+    window (drafts > 0) read its start state from block `codes & 1`; it
+    wrote its last state to the other block and kept the start one, so all
+    drafts accepted means the other block starts the next window, and
+    otherwise the start block does, with the `accepted + 1` committed tokens
+    pending. A window whose last token completes a mamba block (its
+    `window_boundary` position is `drafts`) wrote its last state to block 0,
+    which that block boundary reuses, and its start state to block 1. One-
+    token windows and prefill chunks wrote their final state to block 0 and
+    leave nothing pending. `codes` may carry a leading group axis;
+    `num_valid` (accepted drafts + 1), `drafts` and `window_boundary`
+    broadcast over it.
+    """
+    accepted = (num_valid - 1).clamp(min=0)
+    start = torch.where(window_boundary == drafts, 1, codes & 1)
+    resumed = torch.where(accepted >= drafts, 1 - start, start + 2 * (accepted + 1))
+    return torch.where(drafts > 0, resumed, torch.zeros_like(resumed))
 
 
 def _spec_logprob_row_tokens(
@@ -779,9 +829,20 @@ class TPUModelRunner(GPUModelRunner):
         #     sized for a single state; holding the whole group in one block
         #     instead would scale `block_size` with `num_spec` (Qwen3.5-397B
         #     at TP=1, K=4: 21760 tokens rather than 4352).
+        # With two-slot checkpoints (TPU_GDN_TWO_SLOT_CKPT) the unified pool
+        # keeps two blocks per request instead: the verify window's start
+        # state and the state after its last token, the read offset packing
+        # which one starts the next window and how many accepted tokens it
+        # must recompute (GDNConfig.two_slot_ckpts).
         num_ckpts = 1
+        num_spec = 0
         if self.vllm_config.speculative_config is not None:
-            num_ckpts = self.vllm_config.speculative_config.num_speculative_tokens + 1
+            num_spec = self.vllm_config.speculative_config.num_speculative_tokens
+            num_ckpts = num_spec + 1
+        self._two_slot_ckpts: bool = gdn_two_slot_ckpts(num_spec)
+        if self._two_slot_ckpts:
+            _check_two_slot_ckpts_supported(self.vllm_config)
+            num_ckpts = 2
         self._mamba_slot_stride: int = num_ckpts
         self._mamba_ckpt_window: int = (
             num_ckpts if unified_kv_layout_enabled(self.vllm_config) else 1
@@ -1813,6 +1874,17 @@ class TPUModelRunner(GPUModelRunner):
                 manager_page_bytes = group.kv_cache_spec.page_size_bytes
         self._mamba_state_block_size = state_block_size
         self._mamba_copy_plan = plan
+        if self._two_slot_ckpts and plan:
+            # A verify window must complete at most the one mamba block
+            # before its state column (gdn v3 memory_ref.two_slot_boundary).
+            assert self.speculative_config is not None
+            window = self.speculative_config.num_speculative_tokens + 1
+            if self._mamba_column_stride() < window:
+                raise ValueError(
+                    "TPU_GDN_TWO_SLOT_CKPT=1 needs mamba blocks of at least "
+                    f"{window} tokens (one verify window), got "
+                    f"{self._mamba_column_stride()}."
+                )
         if bm_pool_layout is not None:
             # Merged block-major pool rows correspond 1:1 to manager blocks, so
             # state seed copies index rows directly by manager block ID without
@@ -1968,6 +2040,8 @@ class TPUModelRunner(GPUModelRunner):
         # the request's new state block.
         offset_pairs: list[tuple[int, int]] = []
         spec_dsts: list[int] = []
+        # Two-slot checkpoints: the destination's read code per crossing.
+        spec_codes: list[torch.Tensor] = []
         for gid, raws in self._mamba_copy_plan:
             bt = self.input_batch.block_table[gid].get_cpu_tensor()
             row_width = bt.shape[1]
@@ -2001,7 +2075,10 @@ class TPUModelRunner(GPUModelRunner):
             if spec_seed:
                 dsts_g = [d for _, d in pairs]
                 spec_dsts.extend(dsts_g)
-                src_t = self._spec_seed_sources(state_srcs, ckpt_rows, new_owners)
+                src_t, code_t = self._spec_seed_sources(
+                    state_srcs, ckpt_rows, new_owners
+                )
+                spec_codes.append(code_t)
                 dst_t = torch.tensor(dsts_g, dtype=torch.int32).to(
                     self.device, non_blocking=True
                 )
@@ -2025,7 +2102,17 @@ class TPUModelRunner(GPUModelRunner):
             entry[1].extend(p[0] for p in pairs)
             entry[2].extend(p[1] for p in pairs)
 
-        if spec_seed and spec_dsts:
+        if spec_seed and spec_dsts and self._two_slot_ckpts:
+            # The seeded block is block 0 of the new pair; tokens still to
+            # recompute come along (they ride in the copied conv tile).
+            dst_t = torch.tensor(self._pad_to_bucket(spec_dsts), dtype=torch.long).to(
+                self.device, non_blocking=True
+            )
+            assert self.mamba_slot_read_offsets is not None
+            self.mamba_slot_read_offsets.index_put_(
+                (dst_t,), self._pad_dev_to_bucket(torch.cat(spec_codes))
+            )
+        elif spec_seed and spec_dsts:
             # The seeded checkpoint is checkpoint 0 of the new group.
             dst_t = torch.tensor(self._pad_to_bucket(spec_dsts), dtype=torch.long).to(
                 self.device, non_blocking=True
@@ -2112,13 +2199,16 @@ class TPUModelRunner(GPUModelRunner):
         state_srcs: list[int],
         ckpt_rows: list[list[int]],
         new_owners: list[bool],
-    ) -> torch.Tensor:
-        """Seed source per crossing: the checkpoint being resumed from.
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Seed source per crossing: the checkpoint being resumed from, and
+        the read code its destination takes (two-slot checkpoints; the
+        others reset the destination's offset to 0).
 
         `mamba_slot_read_offsets` is device-resident and indexed by block
         id, so which of the window's blocks holds the last accepted token's
         state is only known on device — the choice is a gather there rather
-        than a CPU lookup.
+        than a CPU lookup. Under two-slot checkpoints that block is the
+        start block, whose pending tokens the destination inherits.
         """
         offsets = self.mamba_slot_read_offsets
         assert offsets is not None
@@ -2128,7 +2218,11 @@ class TPUModelRunner(GPUModelRunner):
         ckpt_t = torch.tensor(ckpt_rows, dtype=torch.int32).to(
             self.device, non_blocking=True
         )
-        off = offsets[state_t].long().clamp_(0, ckpt_t.shape[1] - 1)
+        code = offsets[state_t]
+        if self._two_slot_ckpts:
+            off = (code & 1).long()
+        else:
+            off = code.long().clamp_(0, ckpt_t.shape[1] - 1)
         # PD and prefix-cache restores provide committed state in checkpoint 0.
         # A recycled source block can retain another request's MTP offset.
         # The first-forward reset clears the destination, after this source
@@ -2138,7 +2232,8 @@ class TPUModelRunner(GPUModelRunner):
             self.device, non_blocking=True
         )
         off = torch.where(new_owner_t, 0, off)
-        return ckpt_t.gather(1, off.unsqueeze(1)).squeeze(1)
+        dst_code = torch.where(new_owner_t, 0, code - (code & 1))
+        return ckpt_t.gather(1, off.unsqueeze(1)).squeeze(1), dst_code
 
     def _copies_spec_boundary_states(self) -> bool:
         """Whether verify steps write boundary states into the blocks they
@@ -2153,6 +2248,10 @@ class TPUModelRunner(GPUModelRunner):
                 self.cache_config.enable_prefix_caching
                 or self.vllm_config.kv_transfer_config is not None
             )
+            # Two-slot checkpoints have no per-position states to copy; their
+            # verify windows write the boundary states themselves (gdn v3
+            # `memory_ref.two_slot_boundary`).
+            and not self._two_slot_ckpts
         )
 
     def _mamba_column_stride(self) -> int:
@@ -3409,6 +3508,7 @@ class TPUModelRunner(GPUModelRunner):
             mamba_state_indices=mamba_state_indices,
             mamba_slot_read_offsets=self.mamba_slot_read_offsets,
             mamba_ckpt_window=self._mamba_ckpt_window,
+            mamba_two_slot_ckpts=self._two_slot_ckpts,
             mamba_request_distribution=mamba_request_distribution,
             # Unified pool + spec decode: the mamba group builders append
             # their per-request state block ids here for the post-sampling
@@ -3877,6 +3977,7 @@ class TPUModelRunner(GPUModelRunner):
         spec_decode_metadata_list = []
         mamba_state_indices_list: list[list[torch.Tensor] | None] = []
         mamba_boundary_plans: list[SpecBoundaryPlan | None] = []
+        mamba_window_boundaries: list[torch.Tensor | None] = []
         draft_chunks: list[DraftChunkInputs] = []
         is_draft_model = self._is_async_drafter
         greedy_token_ids = self._samples_greedy_token_ids(scheduler_output)
@@ -4203,6 +4304,7 @@ class TPUModelRunner(GPUModelRunner):
                     scheduler_output, start_index, num_reqs, ctx.seq_lens
                 )
             )
+            mamba_window_boundaries.append(ctx.mamba_window_boundary)
             if is_draft_model:
                 assert isinstance(hidden_states, torch.Tensor)
                 # Capture this chunk's draft inputs while they are valid.
@@ -4252,6 +4354,7 @@ class TPUModelRunner(GPUModelRunner):
             draft_chunks=draft_chunks,
             mamba_state_indices_list=mamba_state_indices_list,
             mamba_boundary_plans=mamba_boundary_plans,
+            mamba_window_boundaries=mamba_window_boundaries,
             kv_save_nan_check=nan_check,
         )
 
@@ -4288,6 +4391,8 @@ class TPUModelRunner(GPUModelRunner):
         indices_per_group: list[torch.Tensor] | None,
         next_tokens: torch.Tensor | None,
         num_reqs: int,
+        draft_lengths: torch.Tensor | None = None,
+        window_boundary: torch.Tensor | None = None,
     ) -> None:
         """Scatter this chunk's mamba read offsets into the slot-indexed buffer.
 
@@ -4303,8 +4408,19 @@ class TPUModelRunner(GPUModelRunner):
         decode) — which also resets a group's offset after prefill. The next
         step's GDN kernel resumes each request from checkpoint `offset` of
         its state block (the checkpoint of its last accepted token).
+
+        Two-slot checkpoints keep a code per request instead (see
+        `_two_slot_read_codes`), derived from the previous code, the chunk's
+        draft counts and its requests' window boundary positions, which
+        their callers pass as `draft_lengths` and `window_boundary`.
         """
         if self.mamba_slot_read_offsets is None or not indices_per_group:
+            return
+        if draft_lengths is not None and next_tokens is not None:
+            assert window_boundary is not None
+            self._update_two_slot_read_codes(
+                indices_per_group, next_tokens, num_reqs, draft_lengths, window_boundary
+            )
             return
         offsets = torch.zeros(
             indices_per_group[0].shape[0],
@@ -4326,6 +4442,35 @@ class TPUModelRunner(GPUModelRunner):
             all_indices = torch.cat(indices_per_group, dim=0).long()
             all_offsets = offsets.repeat(len(indices_per_group))
             self.mamba_slot_read_offsets.index_put_((all_indices,), all_offsets)
+
+    def _update_two_slot_read_codes(
+        self,
+        indices_per_group: list[torch.Tensor],
+        next_tokens: torch.Tensor,
+        num_reqs: int,
+        draft_lengths: torch.Tensor,
+        window_boundary: torch.Tensor,
+    ) -> None:
+        """Two-slot read codes after a verify chunk; see
+        `_two_slot_read_codes`."""
+        offsets = self.mamba_slot_read_offsets
+        assert offsets is not None
+        groups = len(indices_per_group)
+        width = indices_per_group[0].shape[0]
+        all_indices = torch.cat(indices_per_group, dim=0).long()
+        codes = offsets[all_indices].view(groups, width)
+        num_valid = (
+            (next_tokens[:num_reqs] != INVALID_TOKEN_ID).sum(dim=1).to(torch.int32)
+        )
+        new = _two_slot_read_codes(
+            codes[:, :num_reqs],
+            num_valid,
+            draft_lengths[:num_reqs].to(torch.int32),
+            window_boundary[:num_reqs].to(torch.int32),
+        )
+        codes = torch.zeros_like(codes)
+        codes[:, :num_reqs] = new
+        offsets.index_put_((all_indices,), codes.reshape(-1))
 
     def _mamba_state_index_groups(self) -> list[torch.Tensor] | None:
         """This chunk's mamba state slot/block ids, one tensor per group.
@@ -4709,6 +4854,9 @@ class TPUModelRunner(GPUModelRunner):
             state.logits_list
         )
         boundary_plans = state.mamba_boundary_plans or [None] * len(state.logits_list)
+        window_boundaries = state.mamba_window_boundaries or [None] * len(
+            state.logits_list
+        )
         # Per-chunk device rejection outputs, kept for the async-spec
         # producer below.
         next_tokens_per_chunk: list[torch.Tensor] = []
@@ -4719,12 +4867,20 @@ class TPUModelRunner(GPUModelRunner):
         elif is_spec_step:
             cur_start_idx = 0
             all_greedy = self.input_batch.all_greedy
-            for logits, num_reqs, md, mamba_indices, boundary_plan in zip(
+            for (
+                logits,
+                num_reqs,
+                md,
+                mamba_indices,
+                boundary_plan,
+                window_boundary,
+            ) in zip(
                 state.logits_list,
                 state.num_reqs_list,
                 state.spec_decode_metadata_list,
                 mamba_idx_list,
                 boundary_plans,
+                window_boundaries,
             ):
                 cur_end_idx = cur_start_idx + num_reqs
                 if md is not None:
@@ -4743,7 +4899,11 @@ class TPUModelRunner(GPUModelRunner):
                     combined_selected_tokens_real_lens.append(num_reqs)
                     next_tokens_per_chunk.append(next_tokens)
                     self._update_mamba_slot_read_offsets(
-                        mamba_indices, next_tokens, num_reqs
+                        mamba_indices,
+                        next_tokens,
+                        num_reqs,
+                        md.draft_lengths if self._two_slot_ckpts else None,
+                        window_boundary,
                     )
                     self._copy_spec_boundary_states(boundary_plan, next_tokens)
                     if needs_logprobs:
@@ -5624,6 +5784,7 @@ class TPUModelRunner(GPUModelRunner):
                 mamba_state_indices=dummy_mamba_state_indices,
                 mamba_slot_read_offsets=self.mamba_slot_read_offsets,
                 mamba_ckpt_window=self._mamba_ckpt_window,
+                mamba_two_slot_ckpts=self._two_slot_ckpts,
                 mamba_request_distribution=dummy_mamba_request_distribution,
                 sequence_layout_descriptor=dummy_layout_plan.descriptor,
             )
