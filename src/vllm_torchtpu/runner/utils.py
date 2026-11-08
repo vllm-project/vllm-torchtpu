@@ -11,6 +11,10 @@ import torch
 import torch.profiler
 from torch_tpu._internal.profiler import TpuProfilerConfig
 from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbeddingBase
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    UnquantizedEmbeddingMethod,
+)
 from vllm.v1.core.sched.output import SchedulerOutput as VllmSchedulerOutput
 
 from vllm_torchtpu import profiler_trace
@@ -481,6 +485,66 @@ def relayout_hash_tables(model: torch.nn.Module):
     if num_changed:
         _install_entry_layout_pin()
     logger.info("Row-major relayouted %d hash tables", num_changed)
+
+
+class HiddenMajorLMHeadMethod(UnquantizedEmbeddingMethod):
+    """LM head whose weight is stored [hidden, vocab shard] (see relayout_lm_head).
+
+    The projection becomes a plain `(m, k) @ (k, n)` matmul, which XLA streams
+    from HBM faster than the `(m, k) @ (n, k)^T` form of vLLM's
+    [vocab shard, hidden] layout. Same dtypes, but the compiler accumulates
+    the hidden dimension in a different order, so logits can differ in the
+    last bf16 bit.
+    """
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if bias is None:
+            return torch.matmul(x, layer.weight)
+        out_shape = (*x.shape[:-1], layer.weight.shape[-1])
+        return torch.addmm(bias, x.reshape(-1, x.shape[-1]), layer.weight).reshape(
+            out_shape
+        )
+
+    def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
+        raise RuntimeError("a [hidden, vocab] LM head is not an embedding table")
+
+
+def relayout_lm_head(model: torch.nn.Module) -> bool:
+    """Store an untied, unquantized LM head as [hidden, vocab shard], row-major.
+
+    Returns whether the head was changed. The weight keeps its own buffer, so
+    a draft model holding the same head module follows it.
+    """
+    language_model = (
+        model.get_language_model() if hasattr(model, "get_language_model") else model
+    )
+    head = getattr(language_model, "lm_head", None)
+    processor = getattr(language_model, "logits_processor", None)
+    embed = getattr(getattr(language_model, "model", None), "embed_tokens", None)
+    if (
+        not isinstance(head, ParallelLMHead)
+        or type(head.quant_method) is not UnquantizedEmbeddingMethod
+        or head.weight.ndim != 2
+        or (embed is not None and getattr(embed, "weight", None) is head.weight)
+        or processor is None
+        or processor.head_dtype not in (None, head.weight.dtype)
+    ):
+        logger.info("LM head kept in its [vocab, hidden] layout")
+        return False
+    head.weight = torch.nn.Parameter(
+        _to_row_major(head.weight.data.t().contiguous()), requires_grad=False
+    )
+    head.quant_method = HiddenMajorLMHeadMethod()
+    _install_entry_layout_pin()
+    logger.info(
+        "LM head stored [hidden, vocab shard] %s, row-major", tuple(head.weight.shape)
+    )
+    return True
 
 
 def _install_entry_layout_pin() -> None:

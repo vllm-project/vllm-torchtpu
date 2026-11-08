@@ -1837,16 +1837,22 @@ def _patch_vllm_vocab_parallel_embedding() -> None:
     def patched_init(self, *args, **kwargs):
         original_init(self, *args, **kwargs)
         if not hasattr(self, "org_vocab_start_index"):
+            # An LM head's bounds feed only the vocab-parallel argmax, whose
+            # index arithmetic is int32; an int64 scalar input would cost each
+            # program that reads it one 64-bit split op per word.
+            bound_dtype = (
+                torch.int32 if isinstance(self, vpe.ParallelLMHead) else torch.int64
+            )
             self.register_buffer(
                 "org_vocab_start_index",
                 torch.tensor(
-                    self.shard_indices.org_vocab_start_index, dtype=torch.int64
+                    self.shard_indices.org_vocab_start_index, dtype=bound_dtype
                 ),
                 persistent=False,
             )
             self.register_buffer(
                 "org_vocab_end_index",
-                torch.tensor(self.shard_indices.org_vocab_end_index, dtype=torch.int64),
+                torch.tensor(self.shard_indices.org_vocab_end_index, dtype=bound_dtype),
                 persistent=False,
             )
             self.register_buffer(
