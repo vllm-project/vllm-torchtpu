@@ -1194,8 +1194,20 @@ def sparse_mla_attention_dcp(
     fused_exchange: bool = False,
     dcp_lane_ids: jax.Array | None = None,
     fused_merge: bool = False,
+    merge_epilogue: Any = None,
+    merge_w_uv: jax.Array | None = None,
+    merge_w_uv_scale: jax.Array | None = None,
 ) -> tuple[jax.Array, ...]:
     """Sparse MLA attention over a DCP position-sharded latent cache.
+
+    `merge_epilogue` (TPU_DCP_MERGE_INTERLEAVE; a
+    `cp_mla_attention.MergePieceVspace`, with replicated `merge_w_uv`
+    `[H, C, V]` and `merge_w_uv_scale`, a `[1, 1, 1]` placeholder when the
+    epilogue is unscaled): the op also runs the V-space merge and returns
+    this rank's merged `[T, H / dcp, V]` in place of the partial (the lse
+    stays). On a bucket whose merge pieces are one merge chunk each the kernel
+    runs it piece by piece inside its loop (`out_pieces_epilogue`); otherwise
+    the same per-chunk merge runs after the attention.
 
     Args:
       ql_nope, q_pe: replicated queries, `[num_tokens, num_heads, *]`.
@@ -1304,6 +1316,12 @@ def sparse_mla_attention_dcp(
         P(None),  # request_distribution
     )
     q_rope = q_rope_table is not None
+    if merge_epilogue is not None and (
+        send_layout or fused_exchange or merge_w_uv is None or merge_w_uv_scale is None
+    ):
+        raise ValueError(
+            "merge_epilogue needs merge_w_uv(_scale) and no send_layout/exchange"
+        )
     if q_rope:
         if not envs.TPU_MLA_SPARSE_SPLIT_Q:
             raise ValueError("q_rope_table requires TPU_MLA_SPARSE_SPLIT_Q")
@@ -1543,6 +1561,26 @@ def sparse_mla_attention_dcp(
             from vllm_torchtpu.layers.adapter.cp_mla_attention import _merge_chunks
 
             merge_pieces = _merge_chunks(topk_idx.shape[0])
+        epilogue_kwargs = {}
+        merge_chunks = 0
+        if merge_epilogue is not None:
+            from vllm_torchtpu.layers.adapter.cp_mla_attention import _merge_chunks
+
+            merge_chunks = _merge_chunks(topk_idx.shape[0])
+            w_uv_, w_uv_scale_ = extra_[-2], extra_[-1]
+            chunk = chunk_kwargs.get("gather_and_attention_chunk_size")
+            if (
+                merge_pieces > 1
+                and merge_pieces == merge_chunks
+                and chunk
+                and topk_idx.shape[0] % merge_pieces == 0
+                and (topk_idx.shape[0] // merge_pieces) % chunk == 0
+            ):
+                epilogue_kwargs = dict(
+                    out_pieces_epilogue=merge_epilogue,
+                    out_pieces_epilogue_args=(w_uv_, w_uv_scale_),
+                    out_pieces_interleave=min(int(envs.TPU_DCP_MERGE_INTERLEAVE), 2),
+                )
         attn = sparse_mla_kernel.sparse_ragged_paged_attention(
             q,
             kv_cache_nope,
@@ -1588,6 +1626,7 @@ def sparse_mla_attention_dcp(
             out_pieces=merge_pieces,
             out_pieces_gather_first=envs.TPU_DCP_MLA_MERGE_PIECES >= 3,
             out_pieces_order=envs.TPU_DCP_MLA_PIECE_ORDER,
+            **epilogue_kwargs,
             **chunk_kwargs,
             **split_kwargs,
             **packed_rope_kwargs,
@@ -1651,6 +1690,25 @@ def sparse_mla_attention_dcp(
         if not mask_in_kernel:
             assert owns is not None
             lse = jnp.where(owns[:, None], lse, -jnp.inf)
+        if merge_epilogue is not None:
+            if not epilogue_kwargs:
+                # Not interleaved here: the same per-chunk merge, after the
+                # attention (`_merge_chunked`'s chunk order).
+                step = output.shape[0] // max(merge_chunks, 1)
+                output = jnp.concatenate(
+                    [
+                        merge_epilogue(
+                            output[c * step : (c + 1) * step],
+                            lse[c * step : (c + 1) * step],
+                            w_uv_,
+                            w_uv_scale_,
+                        )[0]
+                        for c in range(max(merge_chunks, 1))
+                    ],
+                    axis=0,
+                )
+            # `output` is this rank's merged [T, H / dcp, V].
+            return (kv_cache_nope, kv_cache_rope, output, lse)
         # Drop the rope tail: only the nope part is the MLA value (P @ latent).
         return (kv_cache_nope, kv_cache_rope, output[..., : ql_nope.shape[-1]], lse)
 
@@ -1660,6 +1718,9 @@ def sparse_mla_attention_dcp(
     if fused_exchange:
         rank_args = rank_args + (dcp_lane_ids,)
         in_specs = in_specs + (P(dcp_axis_name),)
+    if merge_epilogue is not None:
+        rank_args = rank_args + (merge_w_uv, merge_w_uv_scale)
+        in_specs = in_specs + (P(None, None, None), P(None, None, None))
     return jax.jit(
         shard_map.shard_map(
             _local, mesh=mesh, in_specs=in_specs, out_specs=out_specs, check_rep=False

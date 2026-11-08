@@ -1846,10 +1846,32 @@ class VllmTPUMLAAttention(MLAAttention):
         self.sparse_mla_dcp_rope_op = None
         self.sparse_mla_dcp_send_op = None
         self.sparse_mla_dcp_fused_op = None
+        self.sparse_mla_dcp_mil_op = None
+        self.sparse_mla_dcp_rope_mil_op = None
         if dcp_size > 1:
             self.sparse_mla_dcp_op = impl._build_sparse_mla_dcp_op(
                 self, dcp_size, impl.dcp_interleave_size
             )
+            # TPU_DCP_MERGE_INTERLEAVE: the variants that run the V-space merge
+            # piece by piece inside the attention loop.
+            mil = bool(
+                envs.TPU_DCP_MERGE_INTERLEAVE
+                and envs.TPU_DCP_MERGE_VSPACE_FUSED
+                and envs.TPU_DCP_RANK_OPERAND
+                and self.W_UV_dcp_qrep is not None
+            )
+            if mil:
+                self.sparse_mla_dcp_mil_op = impl._build_sparse_mla_dcp_op(
+                    self, dcp_size, impl.dcp_interleave_size, merge_interleave=True
+                )
+                if envs.TPU_MLA_DECODE_PROLOGUE and self.dcp_q_replicate:
+                    self.sparse_mla_dcp_rope_mil_op = impl._build_sparse_mla_dcp_op(
+                        self,
+                        dcp_size,
+                        impl.dcp_interleave_size,
+                        q_rope=True,
+                        merge_interleave=True,
+                    )
             # TPU_MLA_DECODE_PROLOGUE: the variant that takes the raw q head
             # and ropes q_pe in the attention kernel (query replication only).
             if envs.TPU_MLA_DECODE_PROLOGUE and self.dcp_q_replicate:

@@ -60,6 +60,7 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_MERGE_PIECES: int = 2
     TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS: int = 2048
     TPU_DCP_MLA_PIECE_ORDER: str = "barrier"
+    TPU_DCP_MERGE_INTERLEAVE: int = 0
     TPU_DCP_MERGE_WEIGHTED_HM: bool = True
     TPU_DCP_MERGE_WEIGHTED_HM_MIN_TOKENS: int = 2048
     TPU_MLA_DECODE_BODY_LEVERS: str = "1"
@@ -755,6 +756,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Merge-piece attention order (sparse_mla.PIECE_ORDERS); "edge" survives XLA.
     "TPU_DCP_MLA_PIECE_ORDER": env_str("TPU_DCP_MLA_PIECE_ORDER", "barrier"),
+    # Merge pieces with the V-space merge: run each piece's V-up + lse weight
+    # and issue its reduce-scatter inside the attention loop, right after the
+    # piece's last attention call (sparse_mla.sparse_ragged_paged_attention's
+    # `out_pieces_epilogue`). 0 off; 1 the next piece's attention waits for the
+    # reduce-scatter operand; 2 also holds chunk j's SparseCore gather behind
+    # piece j-2's operand, so the gathers do not queue ahead of the
+    # reduce-scatters on the SparseCore. Same values.
+    "TPU_DCP_MERGE_INTERLEAVE": env_int("TPU_DCP_MERGE_INTERLEAVE", 0),
     # The chunked reduce-scatter merge (TPU_DCP_MERGE_CHUNKED) builds each
     # chunk's weighted operand heads-major in one TensorCore Pallas kernel
     # (`kernels/lse_rescale.py`, as `cp_lse_ag_out_rs`) instead of a

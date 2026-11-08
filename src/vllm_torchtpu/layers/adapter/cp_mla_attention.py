@@ -33,6 +33,7 @@ Each DCP rank stores a shard of the KV cache, so it can only produce a
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Any
 
 import jax
@@ -326,6 +327,74 @@ def _merge_chunked(
         for c in range(chunks)
     ]
     return torch.cat(pieces, dim=0)
+
+
+def merge_interleave_applies(num_tokens: int, is_backbone: bool) -> bool:
+    """TPU_DCP_MERGE_INTERLEAVE: whether this bucket's V-space merge runs
+    inside the attention op, piece by piece (`MergePieceVspace`). Only the
+    per-chunk lse gather form of `_merge_chunked` (not
+    `_merge_chunked_lse_gathered`) with the vspace operand; the attention op
+    then also needs merge pieces of one merge chunk each (checked there)."""
+    return bool(
+        envs.TPU_DCP_MERGE_INTERLEAVE
+        and vspace_fused_applies(num_tokens, is_backbone)
+        and not _lse_gathered_once(num_tokens)
+    )
+
+
+def merge_wire_dtype(out_dtype: torch.dtype) -> torch.dtype:
+    """The reduce-scatter dtype `merge_lse_partials_scatter_heads_vspace`
+    sends for a partial of `out_dtype` (its `rs_dtype` and
+    `_weighted_reduce_scatter_vspace`'s `wire`)."""
+    if envs.TPU_DCP_MERGE_RS_BF16 == 1:
+        return torch.bfloat16
+    if envs.TPU_DCP_RS_OUT_PRECISION:
+        return out_dtype
+    return torch.float32
+
+
+@dataclasses.dataclass(frozen=True)
+class MergePieceVspace:
+    """TPU_DCP_MERGE_INTERLEAVE: one merge chunk of
+    `merge_lse_partials_scatter_heads_vspace`, op for op in JAX, as the sparse
+    MLA kernel's `out_pieces_epilogue` inside the DCP `shard_map`.
+
+    Called with one piece's `o` `[T, H, C + rope]` and f32 `lse` `[T, H]`
+    (this rank's partial over every head of the DCP group) and
+    `(w_uv [H, C, V], w_uv_scale)`; returns `([T, H / world, V], x)` -- this
+    rank's merged rows and the reduce-scatter operand `x` `[H, T, V]`, which
+    the kernel orders the next piece's attention after. Per chunk, as
+    `_merge_chunked` + `_weighted_reduce_scatter` +
+    `_weighted_reduce_scatter_vspace` (the torch forms `sized_merge_local`
+    also mirrors): lse all-gather, logsumexp over ranks, exp weight, the V-up
+    operand (`vspace_weighted_heads_major_jax`), reduce-scatter over heads.
+    Frozen, so the kernel's jit keys it by value."""
+
+    axis_name: str
+    latent_dim: int
+    wire_dtype: str
+    out_dtype: str
+    scaled: bool
+
+    def __call__(self, o, lse, w_uv, w_uv_scale):
+        from vllm_torchtpu.layers.adapter.dcp_vspace import (
+            vspace_weighted_heads_major_jax,
+        )
+
+        o = o[..., : self.latent_dim]
+        lse = lse.astype(jnp.float32)
+        lses = jax.lax.all_gather(lse, self.axis_name, axis=0)
+        merged_lse = jax.nn.logsumexp(lses, axis=0)
+        weight = jnp.exp(lse - merged_lse)
+        x = vspace_weighted_heads_major_jax(
+            o,
+            weight,
+            w_uv,
+            w_uv_scale if self.scaled else None,
+            out_dtype=jnp.dtype(self.wire_dtype),
+        )
+        rs = jax.lax.psum_scatter(x, self.axis_name, scatter_dimension=0, tiled=True)
+        return jnp.transpose(rs, (1, 0, 2)).astype(jnp.dtype(self.out_dtype)), x
 
 
 def _lse_gathered_once(num_tokens: int) -> bool:
