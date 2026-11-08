@@ -17,7 +17,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from vllm_torchtpu.models.minimax_m3.kernels import msa_select
+from vllm_torchtpu.models.minimax_m3.kernels import msa_dcp, msa_select
 from vllm_torchtpu.models.minimax_m3.kernels.msa_dcp import local_candidates
 
 BLOCK = 128
@@ -49,6 +49,7 @@ def _reference(scores, pos, rank, dcp, init_blocks, local_blocks):
     return out_s, out_b
 
 
+@pytest.mark.parametrize("pick_widths", [True, False])
 @pytest.mark.parametrize(
     "num_tokens,num_cols,dcp,rank,max_pos,init_blocks,local_blocks",
     [
@@ -60,8 +61,18 @@ def _reference(scores, pos, rank, dcp, init_blocks, local_blocks):
     ],
 )
 def test_candidates_match_reference(
-    num_tokens, num_cols, dcp, rank, max_pos, init_blocks, local_blocks
+    num_tokens,
+    num_cols,
+    dcp,
+    rank,
+    max_pos,
+    init_blocks,
+    local_blocks,
+    pick_widths,
+    monkeypatch,
 ):
+    if pick_widths:  # per-row-block widths, as for a prefill batch
+        monkeypatch.setattr(msa_dcp, "_MIN_CANDIDATE_TOKENS", 0)
     rng = np.random.default_rng(num_tokens + num_cols)
     # Few distinct values so ties are common.
     scores = rng.integers(0, 6, (num_tokens, num_cols)).astype(np.float32)

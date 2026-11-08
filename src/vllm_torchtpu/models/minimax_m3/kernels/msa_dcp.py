@@ -56,8 +56,10 @@ from vllm_torchtpu.models.minimax_m3.kernels import (
 )
 
 _NEG_INF = float("-inf")
-# The narrowest column count `local_candidates` scans (a vreg's lanes).
+# The narrowest column count `local_candidates` scans (a vreg's lanes), and
+# the fewest tokens for which it picks a width per row block.
 _MIN_CANDIDATE_WIDTH = 128
+_MIN_CANDIDATE_TOKENS = 1024
 
 # Up to this many tokens (`msa_attention.SMALL_BATCH_TOKENS` is the non-DCP
 # limit) an 8-token verify group fills an attention tile alone
@@ -211,13 +213,19 @@ def local_candidates(
     # Static scan widths: 128 x powers of two below the full width, and the
     # full width (one kernel body each); each row block takes the narrowest
     # one holding every block its rows see (a rank's blocks below n are among
-    # its first ceil(n / dcp) columns).
+    # its first ceil(n / dcp) columns). A decode batch scans the full width:
+    # its scan is a few us, and picking a width would cost more.
     widths = [num_cols]
-    while widths[0] > _MIN_CANDIDATE_WIDTH:
+    while widths[0] > _MIN_CANDIDATE_WIDTH and num_tokens > _MIN_CANDIDATE_TOKENS:
         widths.insert(0, max(_MIN_CANDIDATE_WIDTH, 1 << (widths[0] - 1).bit_length() - 1))
-    needed = -(-(jnp.max(p.reshape(-1, block_rows), axis=1) // block_size + 1) // dcp)
-    w = jnp.asarray(widths, jnp.int32)
-    row_widths = jnp.min(jnp.where(w >= needed[:, None], w, num_cols), axis=1)
+    num_blocks = (num_tokens + pad) // block_rows
+    if len(widths) == 1:
+        row_widths = jnp.full((num_blocks,), num_cols, jnp.int32)
+    else:
+        last_pos = jnp.max(p.reshape(num_blocks, block_rows), axis=1)
+        needed = -(-(last_pos // block_size + 1) // dcp)
+        w = jnp.asarray(widths, jnp.int32)
+        row_widths = jnp.min(jnp.where(w >= needed[:, None], w, num_cols), axis=1)
     out_spec = pl.BlockSpec((block_rows, topk), lambda i: (i, 0))
     picked_scores, picked_blocks = pl.pallas_call(
         functools.partial(
@@ -229,7 +237,7 @@ def local_candidates(
             dcp=dcp,
             widths=tuple(widths),
         ),
-        grid=((num_tokens + pad) // block_rows,),
+        grid=(num_blocks,),
         in_specs=[
             pl.BlockSpec(memory_space=pltpu.SMEM),
             pl.BlockSpec(memory_space=pltpu.SMEM),
