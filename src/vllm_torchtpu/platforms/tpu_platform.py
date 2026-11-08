@@ -18,7 +18,7 @@ from torch_tpu._internal import compile as _register_tpu_backend  # noqa: F401
 from torch_tpu._internal.utils import hardware
 from vllm.platforms.interface import Platform, PlatformEnum
 
-from vllm_torchtpu import envs, patch_registry
+from vllm_torchtpu import decode_switches, envs, patch_registry
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.pp_validation import validate_pipeline_parallel_config
@@ -616,6 +616,9 @@ class TpuPlatform(Platform):
                 "nothing. Unset it; the fused expert-parallel MoE kernel is "
                 "USE_MOE_FUSED_EP_KERNEL=1."
             )
+        # Resolve the decode switches now, so an unknown path name or a
+        # combination that cannot run refuses at start-up, not at weight load.
+        decode_switches.get()
         patch_registry.apply(
             "platform_activation", model_config=vllm_config.model_config
         )

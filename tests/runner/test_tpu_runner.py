@@ -2656,3 +2656,47 @@ def test_truncate_draft_yarn_preserves_forward(dtype, factor):
     actual = rope.forward_native(positions, query.clone(), key.clone())
     for x, y in zip(actual, expected):
         torch.testing.assert_close(x, y, rtol=0, atol=0)
+
+
+@pytest.mark.usefixtures("vllm_config_context")
+def test_relayout_rope_caches_reaches_untruncated_yarn_table():
+    """A YaRN table as long as max_model_len is re-laid out, not truncated."""
+    from vllm.model_executor.layers.rotary_embedding.yarn_scaling_rope import (
+        YaRNScalingRotaryEmbedding,
+    )
+
+    rope = YaRNScalingRotaryEmbedding(
+        head_size=256,
+        rotary_dim=64,
+        max_position_embeddings=256,
+        base=10000000,
+        is_neox_style=True,
+        scaling_factor=4.0,
+        dtype=torch.bfloat16,
+    )
+    model = torch.nn.Sequential(rope)
+    before = rope.cos_sin_cache.clone()
+    runner = SimpleNamespace(
+        model_config=SimpleNamespace(
+            is_multimodal_model=False,
+            multimodal_config=None,
+            max_model_len=1024,
+        )
+    )
+    TPUModelRunner._truncate_rope_caches(runner, model)
+    assert rope.cos_sin_cache.shape == (1024, 64)
+
+    relaid = []
+
+    def fake_to_row_major(tensor):
+        relaid.append((tensor.dtype, tuple(tensor.shape)))
+        return tensor.clone()
+
+    with (
+        patch.object(runner_utils_module, "_to_row_major", fake_to_row_major),
+        patch.object(runner_utils_module, "_install_entry_layout_pin") as pin,
+    ):
+        runner_utils_module.relayout_rope_caches(model)
+    assert relaid == [(torch.bfloat16, (1024, 64))]
+    pin.assert_called_once_with()
+    torch.testing.assert_close(rope.cos_sin_cache, before, rtol=0, atol=0)

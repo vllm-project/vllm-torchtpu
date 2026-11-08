@@ -17,7 +17,7 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
-from vllm_torchtpu import envs
+from vllm_torchtpu import decode_switches, envs
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadataBuilderContext
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
@@ -260,6 +260,8 @@ class Eagle3Proposer:
         )
         draft_attn_layer_names = set(all_attn_layers.keys()) - target_attn_layer_names
         self._draft_attn_layer_names = draft_attn_layer_names
+        if decode_switches.get().path("draft_one_query"):
+            self._mark_one_query_draft_layers(all_attn_layers, draft_attn_layer_names)
 
         if self.runner._pcp_enabled and self.runner._mtp_enabled:
             self._validate_pcp_draft_model(draft_attn_layer_names)
@@ -334,6 +336,29 @@ class Eagle3Proposer:
                 "advance per draft step, which cross-model KV sharing "
                 "freezes; the combination is unvalidated."
             )
+
+    @staticmethod
+    def _mark_one_query_draft_layers(layers: dict, names: set[str]) -> None:
+        """Give the draft's verify-window attention layers the one-query kernel.
+
+        Draft steps after the first carry one query per request; these layers
+        then pick the one-query decode kernel on device (`_with_one_query_steps`
+        in the attention adapter) instead of the verify-window kernel.
+        """
+        from vllm_torchtpu.layers.adapter.attention import (
+            PallasBatchedRPAAttentionBackendImpl,
+        )
+
+        marked = []
+        for name in sorted(names):
+            impl = getattr(layers[name], "impl", None)
+            if (
+                isinstance(impl, PallasBatchedRPAAttentionBackendImpl)
+                and impl.decode_query_size > 1
+            ):
+                impl.one_query_steps = True
+                marked.append(name)
+        logger.info("Batched RPA one-query draft steps on layers %s", marked)
 
     def _validate_mtp_layer_count(self) -> None:
         """One nextn layer only: the proposer's per-step wiring assumes it.
