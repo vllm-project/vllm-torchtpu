@@ -183,11 +183,16 @@ def _build_tp_rank_mesh(r_cnt: int, fallback_mesh: Any = None) -> Any:
 def _local_tp_rank() -> int:
     """This rank's TP rank (config-only, no collective)."""
     try:
-        from vllm.distributed import get_tensor_model_parallel_rank
+        from vllm.distributed import (
+            get_tensor_model_parallel_rank,
+            tensor_model_parallel_is_initialized,
+        )
     except ImportError:
         dist = torch.distributed
         ok = dist.is_available() and dist.is_initialized()
         return int(dist.get_rank()) if ok else 0
+    if not tensor_model_parallel_is_initialized():
+        return 0
     return int(get_tensor_model_parallel_rank())
 
 

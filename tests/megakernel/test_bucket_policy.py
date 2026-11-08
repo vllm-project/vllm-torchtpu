@@ -415,3 +415,54 @@ def test_startup_without_tp_size_skips_the_tp_and_mesh_checks() -> None:
     assert not res.eligible and res.code == MESH_SIZE_MISMATCH
     res = check_startup_eligibility(tp_size=4, supported_tp_sizes=(8,), **_STARTUP_OK)
     assert res.code == UNSUPPORTED_TP_SIZE
+
+
+def test_verify_tokens_custom_8_token_dspark() -> None:
+    """Verify BucketPolicy and check_step_eligibility with verify_tokens=(8,)."""
+    prof = Profile(name="t-dspark8", numerics="exact")
+    bp = BucketPolicy.resolve(
+        prof,
+        (8, 16),
+        (16, 32, 64),
+        verify_tokens=(8,),
+        speculative_tokens=7,
+    )
+    assert bp.verify_tokens == (8,)
+    assert bp.verify_buckets == (16, 32, 64)
+    assert bp.select(16, tokens_per_seq=8) == 16
+    assert (8, 16) in list(bp.iter_buckets())
+
+    ok = check_step_eligibility(
+        BatchShape(True, 2, 8, "ok"),
+        bp,
+        {(8, 16)},
+        {(8, 16): 16},
+        input_rows=16,
+    )
+    assert ok.eligible and ok.reason == "mk_t8_b16" and ok.bucket_t == 16
+
+    rejected_t4 = check_step_eligibility(
+        BatchShape(True, 2, 4, "ok"),
+        bp,
+        {(8, 16)},
+        {(8, 16): 16},
+        input_rows=16,
+    )
+    assert not rejected_t4.eligible and rejected_t4.reason == "stock_q4"
+
+    with pytest.raises(ValueError, match="verify_tokens"):
+        BucketPolicy.resolve(
+            prof,
+            (8,),
+            (16,),
+            verify_tokens=(1,),
+        )
+
+    with pytest.raises(ValueError, match="not divisible by verify_tokens"):
+        BucketPolicy.resolve(
+            prof,
+            (8,),
+            (12,),
+            verify_tokens=(8,),
+            speculative_tokens=7,
+        )

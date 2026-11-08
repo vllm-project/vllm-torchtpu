@@ -34,7 +34,7 @@ from .contract import (
     EligibilityResult,
     StepDecision,
 )
-from .policy import MTP_VERIFY_TOKENS, BucketPolicy
+from .policy import BucketPolicy
 from .stats import (
     BatchShape,
     MKABCalibrator,
@@ -186,11 +186,12 @@ def check_step_eligibility(
             batch_shape.tokens_per_req,
         )
     num_reqs, T = batch_shape.num_reqs, batch_shape.tokens_per_req
-    if T not in (1, MTP_VERIFY_TOKENS):
+    v_tokens = bucket_policy.verify_tokens
+    if T not in (1, *v_tokens):
         return StepDecision(False, f"stock_q{T}", num_reqs, T)
     if not mrope_ok:
         return StepDecision(False, "stock_mrope", num_reqs, T)
-    is_verify = T == MTP_VERIFY_TOKENS
+    is_verify = T in v_tokens
     b_list = bucket_policy.verify_buckets if is_verify else bucket_policy.buckets
     max_b = bucket_policy.max_verify_bucket if is_verify else bucket_policy.max_bucket
     active_rows = num_reqs * T
