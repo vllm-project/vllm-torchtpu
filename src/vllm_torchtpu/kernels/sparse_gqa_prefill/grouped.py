@@ -163,6 +163,7 @@ def _attention_block(
         def prefetch():
             start(tile + 1, 1 - buf)
 
+        live = None
         if not fully_live:
             token = lax.broadcasted_iota(jnp.int32, (width, dim), 0)
             live = jnp.zeros((width, dim), jnp.bool_)
@@ -186,12 +187,12 @@ def _attention_block(
                 else:
                     key_live = jnp.isfinite(key)
                 value_live = jnp.isfinite(value)
-                if not fully_live:
+                if live is not None:
                     key_live &= live
                     value_live &= live
                 key = jnp.where(key_live, key, 0)
                 value = jnp.where(value_live, value, 0)
-            elif not fully_live:
+            elif live is not None:
                 key = jnp.where(live, key, 0)
                 value = jnp.where(live, value, 0)
             # Batch by the actual KV-list owner; no cross-query scores.
@@ -209,6 +210,7 @@ def _attention_block(
                 dimension_numbers=(((2,), (2,)), ((0,), (0,))),
                 preferred_element_type=jnp.float32,
             ) * (dim**-0.5 * k_scale)
+            valid_batch = None
             if not fully_live:
                 lengths = row_lengths.reshape(head_group, query_group, 1).transpose(
                     1, 0, 2
@@ -230,7 +232,7 @@ def _attention_block(
             next_m = jnp.maximum(old_m, jnp.max(score, axis=2, keepdims=True))
             safe_m = jnp.where(jnp.isfinite(next_m), next_m, 0)
             prob = jnp.exp(score - safe_m)
-            if not fully_live:
+            if valid_batch is not None:
                 prob = jnp.where(valid_batch, prob, 0)
             alpha = jnp.exp(old_m - safe_m)
             weighted = lax.dot_general(
