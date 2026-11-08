@@ -577,17 +577,23 @@ def _load_mtp_draft(vllm_config: Any, target: nn.Module) -> nn.Module | None:
 
     Built as vLLM's MTP proposer builds it, from the speculative config's draft
     model config and the same loader, so it reads the checkpoint's `mtp.*`
-    weights. It then projects with the target's embedding and LM head, as the
-    serving runtime binds them, so the artifact stores those once.
+    weights, or the separate checkpoint the config names (Gemma 4's assistant).
+    It then shares the target's embedding and, unless it has its own, LM head,
+    as the serving runtime binds them, so the artifact stores those once; and
+    a draft whose attention reads the target's KV is wired to it.
     """
     import copy
 
-    from vllm.config import set_current_vllm_config
+    from vllm.config import get_layers_from_vllm_config, set_current_vllm_config
+    from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
     from vllm.model_executor.model_loader import get_model_loader
 
     spec = getattr(vllm_config, "speculative_config", None)
     if spec is None or getattr(spec, "method", None) != "mtp":
         return None
+    target_attn_layer_names = set(
+        get_layers_from_vllm_config(vllm_config, AttentionLayerBase)  # type: ignore[type-abstract]
+    )
     draft_vllm_config = copy.copy(vllm_config)
     draft_model_config = copy.copy(spec.draft_model_config)
     draft_model_config.runner_type = "draft"
@@ -598,36 +604,102 @@ def _load_mtp_draft(vllm_config: Any, target: nn.Module) -> nn.Module | None:
         )
         draft = loader(vllm_config=draft_vllm_config, model_config=draft_model_config)
     _share_embedding_and_lm_head(draft, target)
+    _share_target_kv_cache(draft, target, target_attn_layer_names)
     return draft
 
 
-def _module_ending(model: nn.Module, suffix: str, kind: type) -> tuple[str, nn.Module]:
-    """The one `kind` submodule of `model` whose name ends with `suffix`."""
-    found = [
-        (n, m)
-        for n, m in model.named_modules()
-        if isinstance(m, kind) and (n == suffix or n.endswith("." + suffix))
-    ]
-    if len(found) != 1:
-        raise ValueError(
-            f"expected one {kind.__name__} named *{suffix} in "
-            f"{type(model).__name__}, found {[n for n, _ in found]}"
-        )
-    return found[0]
-
-
 def _share_embedding_and_lm_head(draft: nn.Module, target: nn.Module) -> None:
-    """Points the draft's embedding and LM head at the target's modules."""
-    from vllm.model_executor.layers.vocab_parallel_embedding import (
-        ParallelLMHead,
-        VocabParallelEmbedding,
+    """Points the draft's embedding and LM head at the target's modules, as
+    the TPU runner's MTP proposer does (`maybe_share_embeddings`,
+    `maybe_share_lm_head`): a draft declaring `has_own_lm_head` (Gemma 4's
+    assistant) keeps its own head. The draft runs sharded on the target's
+    tensor-parallel ranks (the CLI requires it), so their layouts match and
+    the draft's logits processor gathers over the group it is sharded on.
+    """
+    from vllm_torchtpu.spec_decode.utils import (
+        maybe_share_embeddings,
+        maybe_share_lm_head,
     )
 
-    _, embed = _module_ending(target, "embed_tokens", VocabParallelEmbedding)
-    draft_embed_name, _ = _module_ending(draft, "embed_tokens", VocabParallelEmbedding)
-    draft.get_submodule(draft_embed_name.rpartition(".")[0]).embed_tokens = embed
-    _, lm_head = _module_ending(target, "lm_head", ParallelLMHead)
-    draft.lm_head = lm_head
+    maybe_share_embeddings(draft, target, tp_layout_matches=True)
+    maybe_share_lm_head(
+        draft,
+        target,
+        draft_replicated=False,
+        tp_layout_matches=True,
+        materialize_if_mismatched=False,
+    )
+
+
+def _share_target_kv_cache(
+    draft: Any, target: Any, target_attn_layer_names: set[str]
+) -> None:
+    """Wires the draft's Q-only attention layers to read the target's KV cache.
+
+    A copy of the TPU runner's `Eagle3Proposer._setup_gemma4_kv_sharing`,
+    which a parity test holds it to: each draft layer declaring
+    `is_kv_shared_layer` (Gemma 4's assistant) reads the last target layer of
+    its attention type among those keeping their own KV, and its kernel is
+    built without the KV write (`skip_kv_update`). A no-op for an MTP draft
+    that keeps its own KV.
+    """
+    from collections import defaultdict
+
+    if not (hasattr(draft, "model") and hasattr(draft.model, "layers")):
+        return
+    shared_layers = [
+        (idx, layer)
+        for idx, layer in enumerate(draft.model.layers)
+        if getattr(getattr(layer, "self_attn", None), "is_kv_shared_layer", False)
+    ]
+    if not shared_layers:
+        return
+
+    draft_text_config = draft.config.get_text_config()
+    target_text_config = target.config.get_text_config()
+    target_layer_types = getattr(target_text_config, "layer_types", [])
+    target_num_kv_shared = getattr(target_text_config, "num_kv_shared_layers", 0)
+    num_non_shared = len(target_layer_types) - target_num_kv_shared
+    type_to_target_indices: dict[str, list[int]] = defaultdict(list)
+    for idx, lt in enumerate(target_layer_types[:num_non_shared]):
+        type_to_target_indices[lt].append(idx)
+
+    target_prefix = "model.layers"
+    for name in sorted(target_attn_layer_names):
+        if ".layers." in name:
+            target_prefix = name.split(".layers.")[0] + ".layers"
+            break
+
+    draft_layer_types = getattr(draft_text_config, "layer_types", [])
+    for draft_idx, layer in shared_layers:
+        attn = getattr(layer.self_attn, "attn", None)
+        if attn is None:
+            raise RuntimeError(
+                f"Draft layer {draft_idx} declares is_kv_shared_layer but "
+                "exposes no self_attn.attn to wire; cannot guarantee it "
+                "will not write into the target's KV cache."
+            )
+        draft_layer_type = (
+            draft_layer_types[draft_idx]
+            if draft_idx < len(draft_layer_types)
+            else "full_attention"
+        )
+        candidates = type_to_target_indices.get(draft_layer_type, [])
+        if not candidates:
+            raise RuntimeError(
+                f"No target layer of type '{draft_layer_type}' to share KV "
+                f"with for draft layer {draft_idx}. Leaving it unwired "
+                "would let it write dummy K/V into the target's cache."
+            )
+        target_layer_name = f"{target_prefix}.{candidates[-1]}.self_attn.attn"
+        attn.kv_sharing_target_layer_name = target_layer_name
+        impl = getattr(attn, "impl", None)
+        if impl is None:
+            raise RuntimeError(
+                f"Draft attention layer {draft_idx} has no `impl`; cannot "
+                "enable skip_kv_update for cross-model KV sharing."
+            )
+        impl.kv_sharing_target_layer_name = target_layer_name
 
 
 def mtp_draft_names(model: nn.Module) -> dict[str, str]:
@@ -1074,7 +1146,8 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
         self._export_config = dataclasses.replace(saved, num_blocks=num_blocks)
         try:
             states = list(self.abstract_states())
-            if self._drafts_with_mtp():
+            # A draft reading the target's KV keeps none of its own.
+            if self._drafts_with_mtp() and self.mtp_state_indices() is None:
                 states += self.mtp_abstract_states()
             if self._drafts_with_draft_model():
                 states += self.dspark_abstract_states()
@@ -1544,9 +1617,64 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
             )
         return self._mtp_draft
 
+    def _mtp_kv_targets(self) -> list[str] | None:
+        """The target layer each MTP draft attention layer reads its KV from
+        (`_share_target_kv_cache`), in layer order; None for a draft keeping
+        its own KV."""
+        targets = [
+            getattr(m, "kv_sharing_target_layer_name", None)
+            for _, m in self._mtp_attention_layers()
+        ]
+        if not any(targets):
+            return None
+        if not all(targets):
+            raise ValueError(
+                "the MTP draft reads the target's KV in some attention layers "
+                f"and keeps its own in others ({targets}); export supports one "
+                "or the other"
+            )
+        return cast(list[str], targets)
+
+    def _target_state_indices(self) -> dict[str, int]:
+        """The `abstract_states()` index of each target attention layer's
+        first state."""
+        if self.kv_cache_groups():
+            raise NotImplementedError(
+                "a draft reading the target's KV needs every layer on one page "
+                "table, not KV cache groups"
+            )
+        named = self._named_attention_layers()
+        per_layer = self._layer_state_specs([m for _, m in named])
+        sizes = [1] * len(named) if per_layer is None else [len(s) for s in per_layer]
+        offsets = itertools.accumulate([0, *sizes])
+        return {name: offset for (name, _), offset in zip(named, offsets)}
+
+    def mtp_state_indices(self) -> list[int] | None:
+        """For an MTP draft reading the target's KV (Gemma 4's assistant), the
+        target states it reads, by `abstract_states()` index, in the order its
+        layers first read them: its states are those buffers. None for a draft
+        keeping its own KV, whose states are new ones."""
+        targets = self._mtp_kv_targets()
+        if targets is None:
+            return None
+        index = self._target_state_indices()
+        missing = sorted(set(targets) - set(index))
+        if missing:
+            raise ValueError(
+                f"the MTP draft reads the KV of {missing}, which are not target "
+                f"attention layers ({sorted(index)})"
+            )
+        return list(dict.fromkeys(index[t] for t in targets))
+
     def mtp_abstract_states(self) -> Sequence[api.ShapeDtypeStruct]:
-        """The paged KV of each attention layer of the MTP draft, in layer order."""
+        """The paged KV of each attention layer of the MTP draft, in layer
+        order; for a draft reading the target's KV, the target states it reads
+        (`mtp_state_indices()`)."""
         self._require_mtp_draft()
+        shared = self.mtp_state_indices()
+        if shared is not None:
+            states = list(self.abstract_states())
+            return [states[i] for i in shared]
         layers = [m for _, m in self._mtp_attention_layers()]
         specs = []
         for layer in layers:
@@ -1813,16 +1941,53 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
         `last_token_indices`. Each further pass feeds every request its last
         draft and the draft's own hidden state, one token per request at the
         next position, as vLLM's MTP proposer chains them.
+
+        A draft reading the target's KV (Gemma 4's assistant) takes the target
+        states it reads (`mtp_state_indices()`) and writes none, so each further
+        pass stays at the first pass's last position and KV length, as the TPU
+        runner's proposer does for it (`advance_draft_positions`). A draft
+        returning `(hidden, carry)` picks tokens from `hidden` and feeds `carry`
+        on (`Eagle3Proposer._unwrap_model_out`), and a draft with its own LM
+        head projects with it.
         """
+        from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
+
         draft = self._require_mtp_draft()
+        if getattr(draft, "masked_embedding", None) is not None:
+            raise NotImplementedError(
+                "an MTP draft with ordered embeddings (centroid-masked logits, "
+                "use_ordered_embeddings) is not supported by export"
+            )
+        if getattr(draft, "_suppress_idx", None) is not None:
+            raise NotImplementedError(
+                "an MTP draft suppressing tokens (generation_config "
+                "suppress_tokens) is not supported by export"
+            )
         cfg = self._export_config
         k = int(cfg.speculative_config["num_speculative_tokens"])  # type: ignore[index]
         names = mtp_draft_names(self._model)
         call_weights = {d: weights[e] for d, e in names.items() if e in weights}
-        lm_head = weights[self._lm_head_weight_name()]
+        if getattr(draft, "has_own_lm_head", False):
+            lm_head = weights[names["lm_head.weight"]]
+        else:
+            lm_head = weights[self._lm_head_weight_name()]
         layers = self._mtp_attention_layers()
-        for (_, layer), kv in zip(layers, kv_caches, strict=True):
-            layer.kv_cache = kv
+        shared = self.mtp_state_indices()
+        if shared is None:
+            layer_states = list(range(len(layers)))
+            if len(kv_caches) != len(layers):
+                raise ValueError(
+                    f"{len(kv_caches)} MTP KV states for {len(layers)} layers"
+                )
+        else:
+            index = self._target_state_indices()
+            targets = cast(list[str], self._mtp_kv_targets())
+            layer_states = [shared.index(index[t]) for t in targets]
+        for (_, layer), s_i in zip(layers, layer_states, strict=True):
+            layer.kv_cache = kv_caches[s_i]
+        # Whether each further pass moves one token on: not for a draft that
+        # writes no KV.
+        advance = int(shared is None)
 
         def run(ids: Any, pos: Any, hidden: Any, metadata: Any) -> Any:
             forward_metadata = {name: metadata for name, _ in layers}
@@ -1863,21 +2028,23 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
         def greedy(hidden: Any) -> Any:
             return self.greedy_tokens(hidden, lm_head)
 
-        hidden = run(
-            input_ids,
-            positions,
-            hidden_states,
-            make_attention_metadata(
-                input_positions=positions,
-                block_tables=block_tables,
-                seq_lens=kv_lens,
-                query_start_loc=query_start_loc,
-                request_distribution=_split_req_dist(req_dist)[0],
-            ),
+        last, hidden = Eagle3Proposer._unwrap_model_out(
+            run(
+                input_ids,
+                positions,
+                hidden_states,
+                make_attention_metadata(
+                    input_positions=positions,
+                    block_tables=block_tables,
+                    seq_lens=kv_lens,
+                    query_start_loc=query_start_loc,
+                    request_distribution=_split_req_dist(req_dist)[0],
+                ),
+            )
         )
         rows = last_token_indices.to(torch.int64)
-        hidden = hidden[rows]
-        drafts = [greedy(hidden)]
+        last, hidden = last[rows], hidden[rows]
+        drafts = [greedy(last)]
         if k > 1:
             num_seqs = req_dist[2]
             live = torch.arange(cfg.max_num_seqs, device=rows.device) < num_seqs
@@ -1890,19 +2057,30 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
             all_decode = torch.stack([num_seqs, num_seqs, num_seqs]).to(req_dist.dtype)
             last_pos = positions[..., rows]
             for step in range(1, k):
-                pos = last_pos + step
+                delta = step * advance
+                pos = last_pos + delta
                 metadata = make_attention_metadata(
                     input_positions=pos,
                     block_tables=block_tables,
-                    seq_lens=torch.where(live, last_kv + step + 1, 0).to(kv_lens.dtype),
+                    seq_lens=torch.where(live, last_kv + delta + 1, 0).to(
+                        kv_lens.dtype
+                    ),
                     query_start_loc=one_per_seq,
                     request_distribution=all_decode,
                 )
-                hidden = run(drafts[-1], pos, hidden, metadata)
-                drafts.append(greedy(hidden))
+                last, hidden = Eagle3Proposer._unwrap_model_out(
+                    run(drafts[-1], pos, hidden, metadata)
+                )
+                drafts.append(greedy(last))
+        # Each state as its first layer holds it after the passes.
+        holder: dict[int, Any] = {}
+        for (_, layer), s_i in zip(layers, layer_states):
+            holder.setdefault(s_i, layer)
         updated = [
-            layer.kv_cache[0] if isinstance(layer.kv_cache, list) else layer.kv_cache
-            for _, layer in layers
+            holder[s_i].kv_cache[0]
+            if isinstance(holder[s_i].kv_cache, list)
+            else holder[s_i].kv_cache
+            for s_i in range(len(kv_caches))
         ]
         return updated, torch.stack(drafts, dim=1)
 
