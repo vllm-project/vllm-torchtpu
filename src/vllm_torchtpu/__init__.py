@@ -1835,7 +1835,21 @@ def _patch_vllm_vocab_parallel_embedding() -> None:
     original_init = vpe.VocabParallelEmbedding.__init__
 
     def patched_init(self, *args, **kwargs):
-        original_init(self, *args, **kwargs)
+        from vllm_torchtpu import envs as tpu_envs
+
+        # Token embeddings only: LM heads subclass VocabParallelEmbedding, and
+        # model code builds embed_tokens without a prefix.
+        if tpu_envs.TPU_EMBED_EP_SHARD and type(self) is vpe.VocabParallelEmbedding:
+            from vllm_torchtpu.layers.adapter.ep_sharded_embedding import (
+                ep_group_as_tp,
+                mark_ep_sharded,
+            )
+
+            with ep_group_as_tp(vpe) as shard:
+                original_init(self, *args, **kwargs)
+            mark_ep_sharded(self, shard)
+        else:
+            original_init(self, *args, **kwargs)
         if not hasattr(self, "org_vocab_start_index"):
             # An LM head's bounds feed only the vocab-parallel argmax, whose
             # index arithmetic is int32; an int64 scalar input would cost each
@@ -1878,6 +1892,12 @@ def _patch_vllm_vocab_parallel_embedding() -> None:
             )
 
     def patched_forward(self, input_):
+        if getattr(self, "_tpu_ep_shard", None) is not None:
+            from vllm_torchtpu.layers.adapter.ep_sharded_embedding import (
+                ep_embedding_forward,
+            )
+
+            return ep_embedding_forward(self, input_)
         if self.tp_size > 1:
             masked_input, input_mask = vpe.get_masked_input_and_mask(
                 input_,
