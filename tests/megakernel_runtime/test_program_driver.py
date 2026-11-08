@@ -540,6 +540,52 @@ def test_unsupported_collective_domain_declines_before_any_collective(
     assert driver_mod.ProgramDriver.maybe_create(_runner()) is None
 
 
+_ENTRY_OFF = """
+import json, sys
+from vllm_torchtpu import megakernel_runtime as mkr
+from vllm_torchtpu.megakernel_runtime import testing
+out = [mkr.maybe_create(testing.fake_runner(megakernel=mk)) for mk in (None, False)]
+print(json.dumps({
+    "results": [repr(o) for o in out],
+    "driver_loaded": "vllm_torchtpu.megakernel_runtime.driver" in sys.modules,
+}))
+"""
+
+
+def test_package_maybe_create_is_off_without_config_and_skips_the_driver() -> None:
+    """`megakernel_runtime.maybe_create` with the megakernel off returns
+    `None` without importing the driver (or JAX through it)."""
+    import os
+    import subprocess
+    import sys
+
+    env = {k: v for k, v in os.environ.items() if k != "VLLM_TPU_MEGAKERNEL"}
+    env["PYTHONPATH"] = os.pathsep.join(
+        p for p in (str(_SRC), env.get("PYTHONPATH", "")) if p
+    )
+    res = subprocess.run(
+        [sys.executable, "-c", _ENTRY_OFF],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=120,
+    )
+    assert res.returncode == 0, res.stderr
+    got = json.loads(res.stdout.strip().splitlines()[-1])
+    assert got == {"results": ["None", "None"], "driver_loaded": False}
+
+
+def test_package_maybe_create_and_lazy_export_reach_the_driver(
+    toy: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With a plugin configured, `megakernel_runtime.maybe_create` returns the
+    driver's `ProgramDriver`; the package's lazy `ProgramDriver` is it."""
+    _no_group(monkeypatch)
+    drv = mkr.maybe_create(_runner())
+    assert isinstance(drv, driver_mod.ProgramDriver) and drv.serving
+    assert mkr.ProgramDriver is driver_mod.ProgramDriver
+
+
 def test_weight_update_guard() -> None:
     mkr.guard_weight_update(SimpleNamespace(_megakernel=None))
     mkr.guard_weight_update(SimpleNamespace())
