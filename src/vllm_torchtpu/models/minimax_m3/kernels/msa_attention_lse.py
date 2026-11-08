@@ -138,14 +138,14 @@ def _kernel(
 
     def write(out, lse):
         o_ref[...] = out.reshape(num_heads, block_q, head_dim).astype(o_ref.dtype)
-        lse_ref[...] = lse.reshape(num_heads, block_q, 1)
+        lse_ref[...] = lse.T.reshape(lse_ref.shape)  # lane-dense row
 
-    def finish(m, l, acc):
+    def finish(m, denom, acc):
         """Output and lse from a tile's softmax state (log2 units, ``m``
-        finite). A row that saw no slot has ``l = 0`` and ``acc = 0``: its
-        output is 0 and its lse ``m + log(0) = -inf`` with no select (a seen
-        row has ``l >= 1``)."""
-        write(acc * (1.0 / jnp.maximum(l, 1.0)), m * _LN_2 + jnp.log(l))
+        finite). A row that saw no slot has ``denom = 0`` and ``acc = 0``:
+        its output is 0 and its lse ``m + log(0) = -inf`` with no select (a
+        seen row has ``denom >= 1``)."""
+        write(acc * (1.0 / jnp.maximum(denom, 1.0)), m * _LN_2 + jnp.log(denom))
 
     def attend(width, single):
         """One softmax update over the group's first `width` slots; a
@@ -284,7 +284,8 @@ def _attention_call(
     so one kernel serves every head).
 
     Writes those heads' and tokens' rows of ``(out [G * Hg, T, D], lse
-    [G * Hg, T, 1])``: into `out` in place when given (an earlier call's
+    [G, T / Bq, 1, Hg * Bq])`` (a tile's lse a lane-dense row, ``h * Bq +
+    t``): into `out` in place when given (an earlier call's
     result), else into new arrays whose other rows are unset. A 4-bit
     `kv_cache` takes its `scale_cache` and `scale_rows` (`_kernel`'s
     `fp4_rows`)."""
@@ -309,6 +310,9 @@ def _attention_call(
 
     def head_major_block(w, pages, meta, counts, table, heads, offset):
         return (heads[1], *tile_block(w, pages, meta, counts, table, heads, offset))
+
+    def lse_block(w, *prefetch):
+        return (*head_major_block(w, *prefetch), 0)
 
     aliased = out is not None
     in_place = (pl.BlockSpec(memory_space=pl.ANY),) * 2 if aliased else ()
@@ -336,7 +340,7 @@ def _attention_call(
         ],
         out_specs=[
             pl.BlockSpec((num_heads, block_q, head_dim), head_major_block),
-            pl.BlockSpec((num_heads, block_q, 1), head_major_block),
+            pl.BlockSpec((1, 1, 1, num_heads * block_q), lse_block),
         ],
         scratch_shapes=[
             pltpu.VMEM((num_heads * block_q, 1), jnp.float32),
@@ -360,7 +364,15 @@ def _attention_call(
         grid_spec=grid_spec,
         out_shape=[
             jax.ShapeDtypeStruct((num_q_heads, num_tokens, head_dim), q.dtype),
-            jax.ShapeDtypeStruct((num_q_heads, num_tokens, 1), jnp.float32),
+            jax.ShapeDtypeStruct(
+                (
+                    num_q_heads // num_heads,
+                    num_tokens // block_q,
+                    1,
+                    num_heads * block_q,
+                ),
+                jnp.float32,
+            ),
         ],
         input_output_aliases=({num_inputs: 0, num_inputs + 1: 1} if aliased else {}),
         compiler_params=pltpu.CompilerParams(
@@ -459,7 +471,11 @@ def _chunked_call(
     if num_heads * num_chunks > 1:
         out = jax.lax.fori_loop(1, num_heads * num_chunks, head_chunk, out)
     out, lse = out
-    return out.transpose(1, 0, 2)[:num_tokens], lse[:, :, 0].T[:num_tokens]
+    # lse [head blocks, tiles, 1, Hg * Bq] -> [T, G * Hg]
+    num_blocks, num_tiles = lse.shape[:2]
+    lse = lse.reshape(num_blocks, num_tiles, -1, block_q).transpose(1, 3, 0, 2)
+    lse = lse.reshape(num_tiles * block_q, num_q_heads)
+    return out.transpose(1, 0, 2)[:num_tokens], lse[:num_tokens]
 
 
 def _pad_tokens(q, selected, local_page, local_limit, block_q):
