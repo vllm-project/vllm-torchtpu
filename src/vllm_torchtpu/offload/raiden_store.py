@@ -122,6 +122,10 @@ from vllm_torchtpu.offload.block_major_layout import (
     BlockMajorContract,
     resolve_block_major_contract,
 )
+from vllm_torchtpu.offload.raiden_staging import (
+    STAGING_BLOCKS_KEY,
+    parse_staging_blocks,
+)
 
 if TYPE_CHECKING:
     import torch
@@ -1329,6 +1333,21 @@ class RaidenOffloadingManager(OffloadingManager):
         for sub_hash in sub_hashes:
             self._hash_to_admission[sub_hash] = admission
 
+    def abandon_load(self, keys: list[OffloadKey]) -> None:
+        """Give back what `prepare_load` took for keys that will never load.
+
+        Staged loads launch in parts (`raiden_staging`); when one part fails,
+        the parts not yet launched are dropped. Their local sub-hashes still
+        hold the lookup pins and their peer or storage sub-hashes still have
+        stashed slices: release the one, forget the other.
+        """
+        local: list[bytes] = []
+        for sub_hash in self._expand_keys(list(keys)):
+            if self._pending_remote_slices.pop(sub_hash, None) is None:
+                local.append(sub_hash)
+        if local:
+            self._store.release(local)
+
     def on_store_job_cancelled(self, keys: list[OffloadKey]) -> None:
         """A fence-pending (never admitted) store job was cancelled."""
         self._inflight_store_keys.difference_update(keys)
@@ -1619,6 +1638,7 @@ def derive_offload_namespace(
     block_major_contract: BlockMajorContract | None = None,
     offloaded_group_ids: tuple[int, ...] | None = None,
     skip_draft_kv: bool = False,
+    staged_rows: bool = False,
 ) -> bytes:
     """Derive a deterministic compatibility namespace prefixed to every store and
     registry key.
@@ -1687,6 +1707,10 @@ def derive_offload_namespace(
     if skip_draft_kv:
         # Host blocks without the drafter's arrays are a different layout.
         material_fields += ("tpu-raiden-offload-ns4-skip-draft-kv",)
+    if staged_rows:
+        # Staged multi-shape offload (`raiden_staging`): a host block is one
+        # row of every page back to back, not one slot per array.
+        material_fields += ("tpu-raiden-offload-ns5-staged-rows",)
     material = repr(material_fields)
     return hashlib.sha256(material.encode()).digest()[:16]
 
@@ -2789,6 +2813,19 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
         # resolve this pool's spec.
         self.kv_pool_group = str(self.extra_config.get("kv_pool_group", ""))
 
+        # Block-major HBM staging for multi-shape KV (`raiden_staging`): each
+        # block moves as one DMA of a staging row instead of one per array.
+        self.staging_blocks = parse_staging_blocks(self.extra_config)
+        if self.staging_blocks:
+            if not is_multi_shapes_geometry(per_block_shape):
+                raise ValueError(
+                    f"TPURaidenOffloadingConnector: {STAGING_BLOCKS_KEY} is for "
+                    "multi-shape KV caches; this layout registers one array "
+                    "per block already (see VLLM_TPU_BLOCK_MAJOR_KV)"
+                )
+            assert self.block_major_contract is None
+            assert self.device_block_size_factor == 1, self.device_block_size_factor
+
         # Generate the compatibility namespace hash to isolate global registry
         # entries across incompatible engine configurations.
         self.key_namespace = derive_offload_namespace(
@@ -2804,6 +2841,7 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
             block_major_contract=self.block_major_contract,
             offloaded_group_ids=tuple(group.group_id for group in config.groups),
             skip_draft_kv=self.skip_draft_kv,
+            staged_rows=self.staging_blocks > 0,
         )
 
         # Shared-memory host pools (RAIDEN_SHM_KEY) are currently unsupported.

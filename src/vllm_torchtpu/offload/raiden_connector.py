@@ -96,6 +96,11 @@ from vllm.v1.request import Request
 
 from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.offload.raiden_staging import (
+    StagedStepOutput,
+    StagedTransferScheduler,
+    StagingBuffer,
+)
 from vllm_torchtpu.offload.raiden_store import (
     AdmissionOp,
     RaidenLoadStoreSpec,
@@ -166,6 +171,15 @@ class RaidenOffloadingConnectorMetadata(OffloadingConnectorMetadata):
     # reported as failed_recving; the scheduler recomputes or fails them per
     # kv_load_failure_policy.
     failed_load_req_ids: set[str] = field(default_factory=set)
+    # Staged offload (`raiden_staging`) only. Part id -> (device blocks,
+    # staging rows) to pack before recording the save fence of that part
+    # (its id is in fence_job_ids).
+    staging_packs: dict[int, tuple[list[int], list[int]]] = field(default_factory=dict)
+    # Part id -> (staging rows, device blocks) of landed loads to unpack;
+    # acknowledged as `unpacked_jobs` once retired.
+    staging_unpacks: dict[int, tuple[list[int], list[int]]] = field(
+        default_factory=dict
+    )
 
 
 @dataclass
@@ -174,6 +188,8 @@ class RaidenOffloadingWorkerMetadata(OffloadingWorkerMetadata):
     per-rank fence acks."""
 
     fenced_jobs: dict[int, int] = field(default_factory=dict)
+    # Staged offload: per-rank acks of retired unpacks, by part id.
+    unpacked_jobs: dict[int, int] = field(default_factory=dict)
 
     def aggregate(self, other):
         assert isinstance(other, RaidenOffloadingWorkerMetadata)
@@ -183,6 +199,9 @@ class RaidenOffloadingWorkerMetadata(OffloadingWorkerMetadata):
         merged_fenced = dict(self.fenced_jobs)
         for job_id, v in other.fenced_jobs.items():
             merged_fenced[job_id] = merged_fenced.get(job_id, 0) + v
+        merged_unpacked = dict(self.unpacked_jobs)
+        for job_id, v in other.unpacked_jobs.items():
+            merged_unpacked[job_id] = merged_unpacked.get(job_id, 0) + v
         # completed_jobs and transfer_stats are inherited from vLLM base dataclass.
         return RaidenOffloadingWorkerMetadata(
             # pyrefly: ignore[unexpected-keyword]
@@ -190,6 +209,7 @@ class RaidenOffloadingWorkerMetadata(OffloadingWorkerMetadata):
             # pyrefly: ignore[unexpected-keyword]
             transfer_stats=self.transfer_stats.aggregate(other.transfer_stats),
             fenced_jobs=merged_fenced,
+            unpacked_jobs=merged_unpacked,
         )
 
 
@@ -267,6 +287,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
     _write_back: WriteBackPolicy | None = None
     _block_pool = None
     _wb_hits: Set[int] = frozenset()
+    _staged: StagedTransferScheduler | None = None
 
     def __init__(
         self,
@@ -296,6 +317,12 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         # not treat them as reallocated (no flush of their store jobs).
         self._wb_hits: set[int] = set()
         self.wb_counters: Counter[str] = Counter()
+        # Staged multi-shape offload: the scheduler owns the staging rows.
+        staging_blocks = getattr(spec, "staging_blocks", 0)
+        if staging_blocks:
+            self._staged = StagedTransferScheduler(
+                self._raiden_manager, staging_blocks, self.config.num_workers
+            )
 
     def attach_block_pool(self, block_pool) -> None:
         """`EvictionAwareConnector`: the scheduler's block pool, whose free
@@ -507,6 +534,8 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             scheduler_output = self._write_back_output(scheduler_output)
         meta = super().build_connector_meta(scheduler_output)
         assert isinstance(meta, OffloadingConnectorMetadata)
+        if self._staged is not None:
+            return self._build_staged_meta(meta, self._staged)
 
         manager = self._raiden_manager
 
@@ -592,6 +621,49 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             failed_load_req_ids=failed_load_req_ids,
         )
 
+    def _build_staged_meta(
+        self, meta: OffloadingConnectorMetadata, staged: StagedTransferScheduler
+    ) -> RaidenOffloadingConnectorMetadata:
+        """`build_connector_meta` with staging rows between HBM and Raiden.
+
+        Store jobs wait for rows, then ship a pack and a fence; their saves
+        launch from the rows once every rank acknowledges. Load jobs launch
+        into rows as soon as rows are free, and ship an unpack in the step
+        that echoes them finished. A flushed store needs no drain: once
+        launched it reads its own rows, never the reused blocks.
+        """
+        out = StagedStepOutput()
+        for job_id, job in meta.store_jobs.items():
+            src_spec, dst_spec = job.src_spec, job.dst_spec
+            assert isinstance(src_spec, GPULoadStoreSpec)
+            assert isinstance(dst_spec, RaidenLoadStoreSpec)
+            staged.add_store_job(job_id, dst_spec.keys, src_spec.block_ids.tolist())
+        for job_id, job in meta.load_jobs.items():
+            src_spec, dst_spec = job.src_spec, job.dst_spec
+            assert isinstance(src_spec, RaidenLoadStoreSpec)
+            assert isinstance(dst_spec, GPULoadStoreSpec)
+            staged.add_load_job(
+                job_id,
+                src_spec.keys,
+                dst_spec.block_ids.tolist(),
+                job.req_id,
+                pinned=src_spec.pinned,
+            )
+        staged.flush(set(meta.jobs_to_flush or ()), out)
+        staged.step(out)
+        return RaidenOffloadingConnectorMetadata(
+            load_jobs={},  # pyrefly: ignore[unexpected-keyword]
+            store_jobs={},  # pyrefly: ignore[unexpected-keyword]
+            # pyrefly: ignore[unexpected-keyword]
+            jobs_to_flush=meta.jobs_to_flush,
+            fence_job_ids=set(out.packs),
+            finished_store_job_ids=out.finished_store_job_ids,
+            finished_load_jobs=out.finished_load_jobs,
+            failed_load_req_ids=out.failed_load_req_ids,
+            staging_packs=out.packs,
+            staging_unpacks=out.unpacks,
+        )
+
     def peek_external_prefix_tokens(
         self, request: Request, num_local_tokens: int
     ) -> int:
@@ -631,7 +703,12 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
 
     def update_connector_output(self, connector_output: KVConnectorOutput):
         meta = connector_output.kv_connector_worker_meta
-        if isinstance(meta, RaidenOffloadingWorkerMetadata) and meta.fenced_jobs:
+        if self._staged is not None and isinstance(
+            meta, RaidenOffloadingWorkerMetadata
+        ):
+            self._staged.on_unpacked(meta.unpacked_jobs)
+            self._staged.on_fenced(meta.fenced_jobs)
+        elif isinstance(meta, RaidenOffloadingWorkerMetadata) and meta.fenced_jobs:
             for job_id, count in meta.fenced_jobs.items():
                 parked = self._fence_pending.get(job_id)
                 if parked is None:
@@ -716,6 +793,7 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
             offloading_config, vllm_config, kv_cache_config
         )
         self._skip_draft_kv = spec.skip_draft_kv
+        self._staging_blocks = getattr(spec, "staging_blocks", 0)
 
         # pyrefly: ignore[bad-override-mutable-attribute]
         self.connector_scheduler: TPURaidenOffloadingScheduler | None = None
@@ -740,6 +818,11 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
             # In-flight fence events awaiting device retirement before acknowledging
             # store jobs, recorded as pairs of (fence_job_ids, event).
             self._pending_fences: list[tuple[set[int], torch.Event]] = []
+            # Staged offload: the staging rows, retired-unpack acks for the
+            # scheduler, and unpack events awaiting retirement.
+            self._staging: StagingBuffer | None = None
+            self._unpacked_jobs: dict[int, int] = {}
+            self._pending_unpacks: list[tuple[set[int], torch.Event]] = []
 
     # -- scheduler-side hooks ----------------------------------------------
     def reset_cache(self) -> bool | None:
@@ -797,6 +880,9 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         )
 
         pool_storages: dict[int, tuple[torch.UntypedStorage, torch.device]] = {}
+        # The first tensor seen on each storage, in its native shape and dtype
+        # (what the staging programs take).
+        pool_natives: dict[int, torch.Tensor] = {}
         skipped_storages: set[int] = set()
         for layer_name, layer_kv_cache in kv_caches.items():
             state_tensors = (
@@ -810,6 +896,7 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
                     skipped_storages.add(storage.data_ptr())
                     continue
                 pool_storages.setdefault(storage.data_ptr(), (storage, tensor.device))
+                pool_natives.setdefault(storage.data_ptr(), tensor)
         shared = skipped_storages & pool_storages.keys()
         assert not shared, (
             "TPURaidenOffloadingConnector: skip_draft_kv needs the drafter's K/V "
@@ -842,6 +929,10 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         # Retain pool tensor references to dispatch their writes during save fences.
         self._pool_sync_tensors = [pool_tensor.tensor for pool_tensor in pool_tensors]
 
+        if getattr(self, "_staging_blocks", 0):
+            # Raiden sees only the staging rows: one array, one DMA per block.
+            pool_tensors = [self._init_staging(list(pool_natives.values()), num_blocks)]
+
         # One ref list per offloaded group, as vLLM's own registration builds:
         # groups that are not prefix-cacheable are not offloaded.
         group_data_refs = [
@@ -859,6 +950,71 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         self.connector_worker._init_worker(
             CanonicalKVCaches(tensors=pool_tensors, group_data_refs=group_data_refs)
         )
+
+    def _init_staging(
+        self, pools: list[torch.Tensor], num_blocks: int
+    ) -> CanonicalKVCacheTensor:
+        """Allocates the staging rows, compiles their programs, and returns
+        them as the one canonical tensor Raiden registers."""
+        for pool in pools:
+            storage_bytes = pool.untyped_storage().nbytes()
+            assert (
+                pool.is_contiguous()
+                and pool.storage_offset() == 0
+                and pool.numel() * pool.element_size() == storage_bytes
+            ), (
+                "TPURaidenOffloadingConnector: staging needs each KV array to "
+                f"own its storage; got shape {tuple(pool.shape)} over "
+                f"{storage_bytes} bytes"
+            )
+        staging = StagingBuffer(
+            pools,
+            num_blocks=num_blocks,
+            rows=self._staging_blocks,
+            device=pools[0].device,
+        )
+        layout = staging.layout
+        from vllm_torchtpu.utils import synchronize_tensors
+
+        with torch.no_grad():
+            staging.precompile()
+        synchronize_tensors([staging.tensor, *pools])
+        self._staging = staging
+        logger.info(
+            "TPURaidenOffloadingConnector: staged offload: %d KV arrays per "
+            "block in one %d-byte row (%d payload), %d staging rows (%.1f MiB "
+            "HBM), layout %s",
+            len(pools),
+            layout.row_bytes,
+            layout.payload_bytes,
+            layout.rows,
+            layout.rows * layout.row_bytes / (1 << 20),
+            layout.signature(),
+        )
+        return CanonicalKVCacheTensor(
+            tensor=staging.tensor.view(layout.rows, layout.row_bytes),
+            page_size_bytes=layout.row_bytes,
+        )
+
+    def _run_staging(self, meta: RaidenOffloadingConnectorMetadata) -> None:
+        """Unpacks the staging rows of landed loads into their blocks.
+
+        Enqueued after this step's forward and before this step echoes the
+        loads finished, so each request's first forward, in a later step,
+        runs behind its unpack. The rows go back to the scheduler only once
+        the unpack's event retires on every rank.
+        """
+        if not meta.staging_unpacks:
+            return
+        assert self._staging is not None
+        rows: list[int] = []
+        blocks: list[int] = []
+        for part_rows, part_blocks in meta.staging_unpacks.values():
+            rows.extend(part_rows)
+            blocks.extend(part_blocks)
+        self._staging.unpack(rows, blocks)
+        _enqueue_pool_writes(self._staging.pools)
+        self._pending_unpacks.append((set(meta.staging_unpacks), _record_fence_event()))
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         # Load failures only travel in get_transfer_results().failed_recving.
@@ -880,6 +1036,8 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         meta = self._get_connector_metadata()
         assert isinstance(meta, RaidenOffloadingConnectorMetadata)
 
+        self._run_staging(meta)
+
         if meta.fence_job_ids:
             # Establish an asynchronous device fence before acknowledging store jobs:
             # 1. Dispatch any deferred pool writes so they precede the fence event.
@@ -888,9 +1046,30 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
                 "KV pool tensors must be registered before the save fence"
             )
             _enqueue_pool_writes(self._pool_sync_tensors)
+            if meta.staging_packs:
+                # Staged stores: copy the blocks into their rows; the saves
+                # read the rows once the fence below retires.
+                assert self._staging is not None
+                blocks: list[int] = []
+                rows: list[int] = []
+                for part_blocks, part_rows in meta.staging_packs.values():
+                    blocks.extend(part_blocks)
+                    rows.extend(part_rows)
+                self._staging.pack(blocks, rows)
+                _enqueue_pool_writes([self._staging.tensor])
             self._pending_fences.append(
                 (set(meta.fence_job_ids), _record_fence_event())
             )
+
+        if getattr(self, "_pending_unpacks", None):
+            still_unpacking: list[tuple[set[int], torch.Event]] = []
+            for part_ids, event in self._pending_unpacks:
+                if _event_is_retired(event):
+                    for part_id in part_ids:
+                        self._unpacked_jobs[part_id] = 1
+                else:
+                    still_unpacking.append((part_ids, event))
+            self._pending_unpacks = still_unpacking
 
         if self._pending_fences:
             # Non-blockingly drain retired events and acknowledge completed fences.
@@ -918,14 +1097,17 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         )
 
     def build_connector_worker_meta(self) -> OffloadingWorkerMetadata | None:
-        if not (self._fenced_jobs or self._completed_jobs):
+        unpacked_jobs = getattr(self, "_unpacked_jobs", {})
+        if not (self._fenced_jobs or self._completed_jobs or unpacked_jobs):
             return None
         # completed_jobs is inherited from vLLM base dataclass.
         meta = RaidenOffloadingWorkerMetadata(
             # pyrefly: ignore[unexpected-keyword]
             completed_jobs=self._completed_jobs,
             fenced_jobs=self._fenced_jobs,
+            unpacked_jobs=unpacked_jobs,
         )
         self._completed_jobs = {}
         self._fenced_jobs = {}
+        self._unpacked_jobs = {}
         return meta
