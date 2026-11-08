@@ -1595,6 +1595,16 @@ def get_default_block_sizes(
         case _:
             raise NotImplementedError(f"Unsupported {tpu_version=}.")
 
+    if (
+        case != RpaCase.DECODE
+        and jnp.dtype(q_dtype) == jnp.float32
+        and jnp.dtype(kv_dtype).itemsize < 4
+    ):
+        # An fp32 query over a narrower KV cache (fp32 logits) needs ~85 MiB of
+        # the 64 MiB VMEM at these q blocks with head_dim 256; cut them 4x.
+        bq_sz = max(8, bq_sz // 4)
+        bq_csz = max(8, bq_csz // 4)
+
     # The query compute block should never exceed the query fetch block.
     bq_csz = min(bq_csz, bq_sz)
 

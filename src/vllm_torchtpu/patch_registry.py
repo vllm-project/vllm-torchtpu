@@ -163,6 +163,11 @@ PATCHES = (
         ("platform_activation", "model_load"),
         model_config=True,
     ),
+    Patch(
+        "vllm_torchtpu.models.vllm.dory_patch:maybe_patch_dory",
+        ("platform_activation", "model_load"),
+        model_config=True,
+    ),
 )
 
 _applied: set[str] = set()
