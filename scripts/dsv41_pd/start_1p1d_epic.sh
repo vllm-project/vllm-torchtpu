@@ -8,7 +8,7 @@
 # 和基准不同的地方（PD 需要）：
 #   --kv-transfer-config TPURaidenConnector + Stage-3 环境变量；--swa-bounded-replay + TPU_RAIDEN_PREFIX_AWARE_LOAD=1
 #   （D 只拉本地前缀命中之后的部分，需要 apply_patches.py 第 4 节的 vLLM 调度器补丁）；
-#   ASYNC_SCHED 默认 0（--no-async-scheduling，和原 PD 配方一致；ASYNC_SCHED=1 改成 --async-scheduling）。
+#   ASYNC_SCHED 默认 1（--async-scheduling，P、D 都开）；ASYNC_SCHED=0 改成 --no-async-scheduling（2026-11-06 及之前的 P 结果用的是 0）。
 # 代码目录用 CODE_DIR 指定；PYTHONPATH 放在前面，盖过 venv 里 editable 安装的旧目录。
 set -euo pipefail
 ROLE="${1:?usage: start_1p1d_epic.sh <prefill|decode>}"
@@ -49,7 +49,8 @@ export OMP_NUM_THREADS=1 NEW_MODEL_DESIGN=1 MODEL_IMPL_TYPE=vllm VLLM_TARGET_DEV
 export VLLM_USE_BREAKABLE_CUDAGRAPH=0 VLLM_USE_AOT_COMPILE=0
 export RUNAI_STREAMER_MEMORY_LIMIT=34359738368 TPU_SHARDED_LOAD_SYNC_EVERY=512
 export VLLM_ENGINE_READY_TIMEOUT_S=7200 TORCHINDUCTOR_AUTOGRAD_CACHE=0 TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS=false
-export LIBTPU_INIT_ARGS='--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=0 --xla_tpu_dvfs_p_state=7'
+# DVFS_P_STATE：TPU 的 DVFS 性能档位（--xla_tpu_dvfs_p_state，默认 7，与 serve_cached_prefill.sh 一致）。
+export LIBTPU_INIT_ARGS="--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=0 --xla_tpu_dvfs_p_state=${DVFS_P_STATE:-7}"
 export MOE_FUSED_EP_PREPROCESS_BACKEND="${MOE_FUSED_EP_PREPROCESS_BACKEND:-native}"
 export VLLM_SERVER_DEV_MODE=1
 # 新 DP wave 开始时等几毫秒再走第一步，让几乎同时到达其他 rank 的请求（4P）赶上同一步，
@@ -88,7 +89,7 @@ else
 fi
 # API server 进程数：长 prompt 的请求要在 API server 里解析 ~10^6 个 token id 的 JSON（~0.1 s），
 # 1 个进程时并发的 4 条请求排队解析，到达引擎时相差 ~0.3 s，DP lockstep 下晚到的要多等一步。
-if [[ "${ASYNC_SCHED:-0}" == "1" ]]; then ASYNC_FLAG="--async-scheduling"; else ASYNC_FLAG="--no-async-scheduling"; fi
+if [[ "${ASYNC_SCHED:-1}" == "1" ]]; then ASYNC_FLAG="--async-scheduling"; else ASYNC_FLAG="--no-async-scheduling"; fi
 if [[ "${KV_BYTES:-auto}" == "auto" ]]; then KV_ARGS=(--gpu-memory-utilization 0.85); else KV_ARGS=(--kv-cache-memory-bytes "${KV_BYTES}"); fi
 echo "role=${ROLE} host=$(hostname) ip=${POD_IP} code=${CODE_DIR} commit=$(git rev-parse --short HEAD) dirty=$(git status --porcelain | wc -l) tp=${TP_SIZE:-1} dp=${DP_SIZE:-8} compile_sizes=${COMPILE_SIZES} async=${ASYNC_FLAG} kv=${KV_BYTES:-auto} max_model_len=${MAX_MODEL_LEN:-default} extra_args=${EXTRA_ARGS:-}"
 MML_ARGS=(); [[ -n "${MAX_MODEL_LEN:-}" ]] && MML_ARGS=(--max-model-len "${MAX_MODEL_LEN}")
