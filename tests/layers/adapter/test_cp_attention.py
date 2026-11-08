@@ -74,11 +74,19 @@ def _config():
     )
 
 
+@pytest.mark.parametrize("decode_block", [None, "8192,4,2"])
 @pytest.mark.parametrize("rank", [0, 1])
 @pytest.mark.parametrize("compiled", [False, True])
 def test_dcp_layout_survives_prebuild_forward_and_registry_reuse(
-    monkeypatch, rank, compiled, cpu_vllm_config_context
+    monkeypatch, rank, compiled, decode_block, cpu_vllm_config_context
 ):
+    if decode_block is None:
+        monkeypatch.delenv("TPU_BATCHED_RPA_DECODE_BLOCK", raising=False)
+    else:
+        monkeypatch.setenv("TPU_BATCHED_RPA_DECODE_BLOCK", decode_block)
+    # Each case compiles the same forward code for three layers; start from an
+    # empty Dynamo cache so the cases stay under its recompile limit.
+    torch._dynamo.reset()
     built, calls = [], []
 
     def build_op(_name, fn):
@@ -160,6 +168,12 @@ def test_dcp_layout_survives_prebuild_forward_and_registry_reuse(
         torch.testing.assert_close(output, torch.full_like(query, 5 / 3))
     assert len(built) == 4  # Forward must reuse the prebuilt ops for each layout.
     assert all(type(fn.keywords["kv_layout"]) is KVLayout for fn in built)
+    cache_blocks = [
+        fn.keywords["decode_block_sizes"]
+        for fn in built
+        if fn.keywords["attention_scope"] == AttentionScope.CACHE_ONLY
+    ]
+    assert all((b is None) == (decode_block is None) for b in cache_blocks)
 
 
 def test_dcp_kernel_default_layout_reuses_explicit_nhd(monkeypatch):
@@ -200,3 +214,123 @@ def test_dcp_hnd_rejects_backends_that_allocate_nhd(
         pytest.raises(NotImplementedError, match="DCP with HND requires"),
     ):
         impl.initialize_kernel(layer)
+
+
+@pytest.mark.parametrize(
+    "page_size,pages_per_seq,decode_query_size,columns",
+    [
+        (128, 4104, 1, 4096),  # 1M tokens, DCP2: 1152-token blocks round up
+        (128, 4104, 4, 4104),  # verify window may reach column 4096: keep all
+        (256, 2048, 1, 2048),  # already exact
+    ],
+)
+def test_dcp_block_table_keeps_the_rank_local_columns(
+    page_size, pages_per_seq, decode_query_size, columns
+):
+    import jax.numpy as jnp
+
+    num_seqs = 3
+    table = jnp.arange(num_seqs * pages_per_seq, dtype=jnp.int32)
+    local = cp_attention._rank_local_block_tables(
+        table,
+        num_seqs,
+        page_size,
+        max_model_len=1 << 20,
+        decode_query_size=decode_query_size,
+        cp_group_size=2,
+    )
+    expected = table.reshape(num_seqs, pages_per_seq)[:, :columns].reshape(-1)
+    assert local.shape == (num_seqs * columns,)
+    assert bool(jnp.all(local == expected))
+
+
+@pytest.mark.parametrize(
+    "scope,layout,decode_query_size,bkv",
+    [
+        (AttentionScope.NEW_TOKENS_ONLY, KVLayout.SEQ_ALONG_LANE, 1, 256),
+        (AttentionScope.NEW_TOKENS_ONLY, KVLayout.SEQ_ALONG_LANE, 4, None),
+        (AttentionScope.NEW_TOKENS_ONLY, KVLayout.HEAD_ALONG_SUBLANE, 1, None),
+        (AttentionScope.CACHE_ONLY, KVLayout.SEQ_ALONG_LANE, 1, None),
+    ],
+)
+def test_dcp_new_token_pass_uses_one_mxu_wide_decode_block(
+    monkeypatch, scope, layout, decode_query_size, bkv
+):
+    import jax.numpy as jnp
+
+    from vllm_torchtpu.kernels.experimental.batched_rpa.configs import BlockSizes
+
+    seen = {}
+
+    def fake_rpa(**kwargs):
+        seen.update(kwargs)
+        return kwargs["queries"], kwargs["kv_cache"], kwargs["queries"][..., 0]
+
+    monkeypatch.setattr(
+        cp_attention._batched_rpa_wrapper, "ragged_paged_attention", fake_rpa
+    )
+    monkeypatch.setattr(
+        cp_attention.pltpu, "get_tpu_info", lambda: SimpleNamespace(mxu_column_size=256)
+    )
+    kv_cache = jnp.zeros(
+        (4, 2, 1, 4, 128) if layout == KVLayout.SEQ_ALONG_LANE else (4, 128, 1, 4, 256)
+    )
+    query = jnp.zeros((2, 8, 256))
+    cp_attention._pallas_rpa_kernel_dcp(
+        kv_cache,
+        query,
+        query[:, :1],
+        query[:, :1],
+        jnp.array([5, 6], dtype=jnp.int32),
+        jnp.zeros((4,), dtype=jnp.int32),
+        jnp.array([0, 1, 2], dtype=jnp.int32),
+        jnp.array([2, 2, 2], dtype=jnp.int32),
+        None,
+        1.0,
+        1.0,
+        sliding_window=None,
+        cp_group_size=2,
+        cp_rank_val=0,
+        attention_scope=scope,
+        kv_layout=layout,
+        decode_query_size=decode_query_size,
+    )
+    expected = (
+        None
+        if bkv is None
+        else BlockSizes(bq_sz=1, bq_c_sz=1, bkv_sz=bkv, batch_size=8, n_buffer=2)
+    )
+    assert seen["decode_block_sizes"] == expected
+    assert seen["attention_scope"] == scope
+
+
+def test_dcp_cache_pass_takes_the_decode_block_env(monkeypatch):
+    from vllm_torchtpu.kernels.experimental.batched_rpa.configs import BlockSizes
+
+    monkeypatch.setattr(cp_attention, "_DCP_KERNEL_REGISTRY", {})
+    monkeypatch.setattr(cp_attention, "_build_dcp_kernel_op", lambda name, fn: fn)
+    kwargs = dict(
+        sliding_window=None,
+        sm_scale=0.0625,
+        logits_soft_cap=None,
+        q_scale=None,
+        k_scale=None,
+        v_scale=None,
+        cp_group_size=2,
+        cp_rank=0,
+        kv_layout=KVLayout.SEQ_ALONG_LANE,
+    )
+    monkeypatch.delenv("TPU_BATCHED_RPA_DECODE_BLOCK", raising=False)
+    assert cp_attention.dcp_cache_decode_block(1) is None
+    cache, new = cp_attention.build_dcp_kernels(**kwargs)
+    assert cache.keywords["decode_block_sizes"] is None
+    assert "decode_block_sizes" not in new.keywords
+
+    monkeypatch.setenv("TPU_BATCHED_RPA_DECODE_BLOCK", "8192,4,2")
+    block = BlockSizes(bq_sz=1, bq_c_sz=1, bkv_sz=8192, batch_size=4, n_buffer=2)
+    assert cp_attention.dcp_cache_decode_block(1) == block
+    # A multi-token verify pass keeps the kernel's own block.
+    assert cp_attention.dcp_cache_decode_block(4) is None
+    cache, new = cp_attention.build_dcp_kernels(**kwargs, cache_decode_block=block)
+    assert cache.keywords["decode_block_sizes"] == block
+    assert "decode_block_sizes" not in new.keywords
