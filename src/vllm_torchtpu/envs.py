@@ -51,6 +51,7 @@ if TYPE_CHECKING:
     MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
     TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: bool | None = None
     TPU_SKIP_MAMBA_SCHEDULER_BLOCKS: bool = True
+    TPU_MHC_GATES_PALLAS: bool = False
     TPU_USE_RAIDEN_KV_CACHE_MANAGER: bool = False
     TPU_RAIDEN_QWEN35_ADMISSION: bool = False
     TPU_RAIDEN_KIMIK3_ADMISSION: bool = False
@@ -136,6 +137,14 @@ if TYPE_CHECKING:
     VLLM_TPU_INDEXER_KV_CACHE_MODE: str = "sal"
     TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER: bool = True
     TPU_SPARSE_MLA_CHUNK_TOKENS: int | None = None
+    TPU_SPARSE_MLA_TOKEN_SHARD_MIN_TOKENS: int = 0
+    TPU_PREFILL_CHUNK_FLOOR: int = 1024
+    GLM53_SP_MIN_TOKENS: int = 0
+    GLM53_SP_ALL_HEADS: bool = True
+    GLM53_DENSE_DSA: bool = False
+    GLM53_INDEXER_V1: bool = False
+    GLM53_INDEX_SCORE_BUDGET: int = 128 * 1024 * 1024
+    GLM53_DEBUG_KEEP_TOPK: bool = False
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_MOE_FP8_ALL_GATHER: bool = False
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
@@ -444,6 +453,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_ATTN_MOE_OVERLAP": env_bool("TPU_ATTN_MOE_OVERLAP", default=False),
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL": env_bool("TPU_K3_SP_PREFILL", default=False),
+    # mHC gates (sigmoid / softmax / Sinkhorn) as one Pallas kernel instead of
+    # ~100 tiny XLA ops per call; 0 keeps the jnp reference. Off by default:
+    # the kernel is unreviewed prior art and DSv4 shares this dispatch.
+    "TPU_MHC_GATES_PALLAS": env_bool("TPU_MHC_GATES_PALLAS", default=False),
     # DCP sparse MLA (SparseCore cache layout): gather and attend this many
     # top-k slots per token instead of all `topk`; tokens owning more are
     # recomputed exactly in-kernel over all their windows
@@ -1016,6 +1029,36 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_SPARSE_MLA_CHUNK_TOKENS": env_positive_int_or_none(
         "TPU_SPARSE_MLA_CHUNK_TOKENS"
     ),
+    # Sparse MLA under TP (no DCP): batches of at least this many tokens
+    # exchange q from head shards to token shards so each rank gathers top-k
+    # rows for 1/tp of the tokens instead of all of them. 0 disables.
+    "TPU_SPARSE_MLA_TOKEN_SHARD_MIN_TOKENS": lambda: int(
+        os.getenv("TPU_SPARSE_MLA_TOKEN_SHARD_MIN_TOKENS") or "0"
+    ),
+    # SharedPrefillBudgetScheduler: smallest per-prompt chunk when the step's
+    # token budget is split among prefilling prompts (256-aligned).
+    "TPU_PREFILL_CHUNK_FLOOR": lambda: int(
+        os.getenv("TPU_PREFILL_CHUNK_FLOOR") or "1024"
+    ),
+    # GLM-5.3-Flash (glm5_next): smallest step run sequence-parallel under TP
+    # (residual stream token-sharded, see models/vllm/glm5_next/sp.py). 0 = off.
+    "GLM53_SP_MIN_TOKENS": lambda: int(os.getenv("GLM53_SP_MIN_TOKENS") or "0"),
+    # GLM-5.3-Flash, with SP on: DSA layers attend with every head from
+    # replicated q_b/o_proj (no all-to-all; decode reads the full weights).
+    "GLM53_SP_ALL_HEADS": env_bool("GLM53_SP_ALL_HEADS", True),
+    # GLM-5.3-Flash: build the DSA layers as plain dense MLA (A/B the indexer).
+    "GLM53_DENSE_DSA": env_bool("GLM53_DENSE_DSA", False),
+    # GLM-5.3-Flash: the XLA reference indexer (paged member cache) instead of
+    # the fp8 pool-key cache + streamindex_topk one.
+    "GLM53_INDEXER_V1": env_bool("GLM53_INDEXER_V1", False),
+    # GLM-5.3-Flash v1 indexer: largest scoring intermediate (bytes) before it
+    # falls back to narrower strategies; 0 forces them (tests).
+    "GLM53_INDEX_SCORE_BUDGET": lambda: int(
+        os.getenv("GLM53_INDEX_SCORE_BUDGET") or str(128 * 1024 * 1024)
+    ),
+    # GLM-5.3-Flash: keep each indexer's last selection on the module (eager
+    # measurement only).
+    "GLM53_DEBUG_KEEP_TOPK": env_bool("GLM53_DEBUG_KEEP_TOPK", False),
     # Post-gather MoE token chunk size for communication-computation pipelining.
     # When set to 0, chunking and communication pipelining are disabled.
     "TPU_MOE_COLLECTION_CHUNK_SIZE": lambda: int(

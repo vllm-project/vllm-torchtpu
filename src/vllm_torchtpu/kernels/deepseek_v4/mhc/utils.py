@@ -105,7 +105,30 @@ def mhc_pre_gates(
 
     Shared by the Pallas ``pre_kernel`` and the fused seam op.
     Returns (pre_mix (T, M), post_mix (T, M), comb_mix (T, M, M)).
+
+    Runs as one Pallas kernel (`gates_kernel`) unless
+    ``TPU_MHC_GATES_PALLAS=0``; the jnp form below is the reference.
     """
+    from vllm_torchtpu import envs
+
+    if envs.TPU_MHC_GATES_PALLAS:
+        from vllm_torchtpu.kernels.deepseek_v4.mhc.gates_kernel import (
+            mhc_pre_gates_pallas,
+        )
+
+        return mhc_pre_gates_pallas(
+            mixes,
+            sqrsum,
+            hc_mult,
+            hidden_size,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+        )
     num_tokens = mixes.shape[0]
 
     mixes = mixes * jax.lax.rsqrt(sqrsum / (hc_mult * hidden_size) + rms_eps)

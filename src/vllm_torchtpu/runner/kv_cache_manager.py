@@ -72,6 +72,7 @@ from vllm_torchtpu.core.runner_slot_mamba import (
 )
 from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
 from vllm_torchtpu.kv_cache_materializer import (
+    MaterializedKVCache,
     build_kernel_block_size_by_group_id,
     can_share_attention_cache,
     format_kv_cache_layout_summary,
@@ -82,7 +83,6 @@ from vllm_torchtpu.kv_cache_spec_normalizer import normalize_kv_cache_specs_for_
 from vllm_torchtpu.layers.adapter.attention import (
     PallasAttentionBackend,
     PallasMLAttentionBackend,
-    VllmTPUDeepseekV32IndexerBackend,
 )
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadataBuilder
 from vllm_torchtpu.logger import init_logger
@@ -235,6 +235,9 @@ class _CompactMambaSizing:
     num_mamba_groups: int
     group_size: int
     mamba_num_blocks: int
+    # DSA indexer bytes per attention block across one layer region; per-token
+    # state, so it scales with the attention block count (0 without indexers).
+    indexer_bytes_per_block: int = 0
 
     @property
     def mamba_per_tensor_bytes(self) -> int:
@@ -250,6 +253,7 @@ class _CompactMambaSizing:
         slots; zero or negative when none do."""
         return (avail // self.group_size - self.mamba_per_tensor_bytes) // (
             self.num_attn_groups * self.attn_page_size_bytes
+            + self.indexer_bytes_per_block
         )
 
 
@@ -311,6 +315,10 @@ class KVCacheManager:
         # Sparse MLA layers sized from their allocated (nope, rope) specs,
         # which the normalizer's dense MLA page formula does not model.
         sparse_mla_layers: set[str] = set()
+        # Layers whose cache dtype is fixed by the kernel that reads it, so
+        # the kv-dtype normalization below must leave them alone (see the
+        # `kv_dtype_is_fixed` handling in the indexer branch).
+        fixed_dtype_layers: set[str] = set()
         for layer_name, attn_module in layers.items():
             # Linear Attention path
             if isinstance(attn_module, MambaBase):
@@ -435,6 +443,18 @@ class KVCacheManager:
                     )
                 )
                 if sparse_page_size is not None:
+                    page_size_padded = sparse_page_size
+                    if self._glm5_unified_pool():
+                        from vllm_torchtpu.models.vllm.glm5_next.unified_pool import (
+                            page_bytes,
+                        )
+
+                        # GLM-5.3 unified pool: a block also holds the folded
+                        # pool-key cache, and vLLM cannot pad an MLA page to
+                        # the uniform page itself (see unified_pool.py).
+                        page_size_padded = page_bytes(
+                            self.runner.vllm_config, block_size
+                        )
                     # Published as `customize_spec` would, but from the
                     # (nope, rope) arrays actually allocated.
                     kv_cache_spec[layer_name] = MLAAttentionSpec(
@@ -443,7 +463,7 @@ class KVCacheManager:
                         head_size=attn_module.head_size,
                         dtype=self.runner.kv_cache_dtype,
                         cache_dtype_str=cache_dtype_str,
-                        page_size_padded=sparse_page_size,
+                        page_size_padded=page_size_padded,
                         num_head_slots=1,
                         state_content_bytes=sparse_page_size // block_size,
                     )
@@ -468,11 +488,62 @@ class KVCacheManager:
                     page_size_padded=page_size_padded,
                 )
             elif isinstance(attn_module, DeepseekV32IndexerCache):
-                # DSA indexer K cache: the module declares its own uint8 spec
-                # (head_dim fp8 bytes + 1 e8m0 scale byte per token).
-                kv_cache_spec[layer_name] = attn_module.get_kv_cache_spec(
-                    self.runner.vllm_config
-                )
+                if self._glm5_unified_pool() and getattr(
+                    attn_module, "kv_dtype_is_fixed", False
+                ):
+                    # GLM-5.3 pool-key cache: folded into the MLA group on
+                    # the unified pool (see glm5_next/unified_pool.py), so it
+                    # declares no group of its own.
+                    continue
+                # DSA indexer K cache: the module declares its own spec
+                # (DeepSeek: uint8, head_dim fp8 bytes + 1 e8m0 scale byte per
+                # token; GLM-5.3-Flash: bf16 `[k | gate]` rows).
+                spec = attn_module.get_kv_cache_spec(self.runner.vllm_config)
+                if getattr(attn_module, "kv_dtype_is_fixed", False):
+                    # The kernel reading this cache dictates its dtype, which
+                    # is not the model's KV dtype: GLM-5.3-Flash keeps bf16
+                    # `[k | gate]` indexer rows while its main MLA cache is
+                    # fp8 (the sparse MLA kernel requires fp8). Retyping the
+                    # spec would silently reallocate the indexer cache as fp8.
+                    # DeepSeek's own indexer spec is uint8 and is protected by
+                    # the non-floating-point check in the normalizer instead.
+                    fixed_dtype_layers.add(layer_name)
+                if (
+                    self.runner._hybrid_uniform_page_size_bytes is not None
+                    and isinstance(spec, AttentionSpec)
+                ):
+                    # Same reason as the attention branches above: on a hybrid
+                    # model every layer must report the *same* page size up
+                    # front. Otherwise `unify_kv_cache_spec_page_size` sees a
+                    # smaller indexer page that happens to divide the uniform
+                    # one and "unifies" by scaling this spec's block_size --
+                    # leaving the `page_size_padded` the normalizer already
+                    # pinned to the indexer's own page behind, which trips
+                    # `page_size_padded >= unpadded_page_size_bytes`.
+                    spec = dataclasses.replace(
+                        spec,
+                        page_size_padded=self.runner._hybrid_uniform_page_size_bytes,
+                    )
+                elif (
+                    layer_name in fixed_dtype_layers
+                    and isinstance(spec, AttentionSpec)
+                    and spec.page_size_padded is None
+                ):
+                    # Exempt specs skip the normalizer, which is what pins
+                    # `page_size_padded` to the TPU-actual page everywhere
+                    # else. vLLM sizes `num_blocks` off that value, so pin it
+                    # here with the formula the allocation uses: the layer's
+                    # own backend's.
+                    spec = dataclasses.replace(
+                        spec,
+                        page_size_padded=attn_module.get_attn_backend().get_kv_cache_page_size_bytes(
+                            spec.block_size,
+                            spec.num_kv_heads,
+                            spec.head_size,
+                            spec.dtype,
+                        ),
+                    )
+                kv_cache_spec[layer_name] = spec
             else:
                 continue
 
@@ -525,7 +596,7 @@ class KVCacheManager:
             kv_cache_spec,
             self.runner.kv_cache_dtype,
             enable_unified_kv_layout=self.runner._unified_kv_layout,
-            exempt_layers=ds_v4_layers | sparse_mla_layers,
+            exempt_layers=ds_v4_layers | sparse_mla_layers | fixed_dtype_layers,
             attention_backend=cast("type[PallasAttentionBackend] | None", backend_cls),
         )
         if (
@@ -832,10 +903,18 @@ class KVCacheManager:
             if isinstance(first_attn_module, Attention)
             else 1
         )
-        attention_backend = cast(
-            "type[_TpuKVCacheBackend] | None",
-            TpuPlatform._find_non_ssm_backend(self.runner.vllm_config),
-        )
+        # An MLA layer's page is the MLA backend's, the formula its spec and
+        # its allocation use. `_find_non_ssm_backend` returns the first
+        # non-SSM layer's backend, which on a sparse-MLA model is an indexer
+        # cache's (they register before their `mla_attn`), and an indexer
+        # backend need not size an MLA page.
+        if isinstance(first_attn_module, MLAAttention):
+            attention_backend = PallasMLAttentionBackend
+        else:
+            attention_backend = cast(
+                "type[_TpuKVCacheBackend] | None",
+                TpuPlatform._find_non_ssm_backend(self.runner.vllm_config),
+            )
         assert attention_backend is not None
         if block_size is None:
             block_size = self.runner.vllm_config.cache_config.block_size
@@ -855,6 +934,34 @@ class KVCacheManager:
             self.runner.kv_cache_dtype,
         )
 
+        # DSA indexer caches (GLM-5.3-Flash: 11 of them alongside 11 MLA and
+        # 34 KDA layers) are a third cache type. Their spec differs from the
+        # MLA spec (own head_dim/dtype), so vLLM buckets them into kv-cache
+        # groups of their own and each `KVCacheTensor` ends up backing
+        # `num_attn_groups + num_indexer_groups + num_mamba_groups` layers.
+        # Leaving them out of the accounting below makes the uniform page too
+        # small, and every layer then reports a page size that does not match
+        # what the TPU actually allocates.
+        # A model may carry more than one kind (GLM-5.3-Flash: a bf16 member
+        # cache and an fp8 pool-key cache per DSA layer); each kind is its own
+        # spec and so its own set of kv-cache groups. Every kind allocates
+        # through its layer's backend and keeps its declared dtype -- either
+        # non-floating (DeepSeek's packed uint8 rows) or pinned
+        # (`kv_dtype_is_fixed`) -- so ask that backend for the page.
+        indexer_kinds: dict[tuple, list] = {}
+        for m in layers.values():
+            if isinstance(m, DeepseekV32IndexerCache):
+                indexer_kinds.setdefault(
+                    (m.get_attn_backend(), m.head_dim, m.dtype), []
+                ).append(m)
+        indexer_page_sizes = [
+            backend.get_kv_cache_page_size_bytes(
+                self.runner.block_size, 1, head_dim, dtype
+            )
+            for backend, head_dim, dtype in indexer_kinds
+        ]
+        indexer_counts = [len(ms) for ms in indexer_kinds.values()]
+
         mamba_modules = [m for m in layers.values() if isinstance(m, MambaBase)]
         if not mamba_modules:
             # Not hybrid; set `mamba_page_size_padded` to the attention
@@ -864,13 +971,21 @@ class KVCacheManager:
             self.runner.cache_config.mamba_page_size_padded = attn_page_size_bytes
             return
 
-        # Compute the unpadded mamba page size from an actual mamba module's
-        # spec (shapes × dtype-size), ignoring any existing padding.
-        first_mamba_spec = mamba_modules[0].get_kv_cache_spec(self.runner.vllm_config)
-        assert isinstance(first_mamba_spec, MambaSpec)
-        unpadded_mamba_page_size = dataclasses.replace(
-            first_mamba_spec, page_size_padded=None
-        ).page_size_bytes
+        # Unpadded page (shapes × dtype-size) of every kind of mamba layer.
+        # A model may carry more than one kind (GLM-5.3-Flash: KDA recurrent
+        # state plus the k-pool indexer's per-request member state); like the
+        # indexer kinds above, each is its own spec and so its own groups.
+        mamba_kinds: dict[tuple, list] = {}
+        mamba_pages: dict[tuple, int] = {}
+        for m in mamba_modules:
+            spec = m.get_kv_cache_spec(self.runner.vllm_config)
+            assert isinstance(spec, MambaSpec)
+            key = (tuple(map(tuple, spec.shapes)), tuple(spec.dtypes))
+            mamba_kinds.setdefault(key, []).append(m)
+            mamba_pages[key] = dataclasses.replace(
+                spec, page_size_padded=None
+            ).page_size_bytes
+        mamba_counts = [len(ms) for ms in mamba_kinds.values()]
 
         # Derive vLLM's kv-cache group layout. vLLM splits each type into
         # equal-sized groups of `group_size` layers. Their native placements
@@ -897,33 +1012,57 @@ class KVCacheManager:
         # heuristic ever changes — it has been stable since the hybrid
         # allocator landed.
         num_attn = len(attn_modules)
-        num_mamba = len(mamba_modules)
-        min_count = min(num_attn, num_mamba)
-        max_count = max(num_attn, num_mamba)
+        # vLLM takes the min/max over *every* bucket of same-spec layers, so
+        # each mamba and indexer kind participates in the heuristic too.
+        counts = [num_attn] + mamba_counts + indexer_counts
+        min_count = min(counts)
+        max_count = max(counts)
 
         # Match vLLM exactly: float comparison, no int() truncation (matters
         # at e.g. min=3, max=4, where 4 < 4.5 but 4 < int(4.5)==4 differs).
         group_size = max_count if max_count < min_count * 1.5 else min_count
 
         num_attn_groups = (num_attn + group_size - 1) // group_size
-        num_mamba_groups = (num_mamba + group_size - 1) // group_size
+        num_mamba_groups = sum((n + group_size - 1) // group_size for n in mamba_counts)
+        # Bytes one recurrent slot costs across the mamba layers backed by a
+        # KVCacheTensor; with a single kind this is groups x page.
+        mamba_bytes_per_slot = sum(
+            (len(ms) + group_size - 1) // group_size * mamba_pages[key]
+            for key, ms in mamba_kinds.items()
+        )
+        # Indexer pages are per-token like attention pages, so they belong on
+        # the attention side of every block-count computation: below they are
+        # folded into one "indexer bytes per block" figure.
+        num_indexer_groups = sum(
+            (n + group_size - 1) // group_size for n in indexer_counts
+        )
+        indexer_bytes_per_block = sum(
+            (n + group_size - 1) // group_size * page
+            for n, page in zip(indexer_counts, indexer_page_sizes)
+        )
 
         uniform_page_size_bytes = (
             num_attn_groups * attn_page_size_bytes
-            + num_mamba_groups * unpadded_mamba_page_size
+            + indexer_bytes_per_block
+            + mamba_bytes_per_slot
         )
 
         logger.info(
             "Hybrid KV cache: padding every layer spec to %d bytes "
             "(num_attn_groups=%d × attn_page=%d + "
-            "num_mamba_groups=%d × mamba_unpadded=%d). This makes vLLM's "
+            "num_indexer_groups=%d (%d B per block, pages %s) + "
+            "num_mamba_groups=%d (%d B per slot, pages %s)). This makes vLLM's "
             "num_blocks match per-layer TPU allocation when mamba layers "
             "cannot be truly shared.",
             uniform_page_size_bytes,
             num_attn_groups,
             attn_page_size_bytes,
+            num_indexer_groups,
+            indexer_bytes_per_block,
+            indexer_page_sizes,
             num_mamba_groups,
-            unpadded_mamba_page_size,
+            mamba_bytes_per_slot,
+            list(mamba_pages.values()),
         )
 
         self.runner._hybrid_uniform_page_size_bytes = int(uniform_page_size_bytes)
@@ -938,10 +1077,13 @@ class KVCacheManager:
         # `size_compact_mamba_kv_cache`.
         self._maybe_select_compact_mamba_layout(
             attn_page_size_bytes,
-            int(unpadded_mamba_page_size),
+            # Every mamba kind's slot bytes folded into one figure: the sizing
+            # only ever uses `num_mamba_groups * unpadded_page`.
+            int(mamba_bytes_per_slot),
             num_attn_groups,
-            num_mamba_groups,
+            1,
             group_size,
+            indexer_bytes_per_block,
         )
 
         # Fallback (compact layout not selected, e.g. a KV connector or
@@ -986,6 +1128,7 @@ class KVCacheManager:
         num_attn_groups: int,
         num_mamba_groups: int,
         group_size: int,
+        indexer_bytes_per_block: int = 0,
     ) -> None:
         """Cap mamba layers at `max_num_reqs + 1` recurrent slots so the freed
         HBM grows the attention pool.
@@ -1043,6 +1186,10 @@ class KVCacheManager:
             group_size: # layer regions vLLM allocates (= layers per
                 kv-cache group); the same value passed to
                 `_maybe_set_num_blocks_override`.
+            indexer_bytes_per_block: TPU-actual bytes per block of all DSA
+                indexer layers backed by each KVCacheTensor (0 when the model
+                has none). Indexer state is per-token, so it scales with
+                `N_attn`, not with `N_mamba`.
 
         On success: sets `_mamba_num_blocks` and, unless the count is pinned,
         keeps the inputs for `size_compact_mamba_kv_cache`. Raises when the KV
@@ -1083,6 +1230,7 @@ class KVCacheManager:
             mamba_num_blocks=(
                 self.runner.max_num_reqs * self.runner._mamba_slot_stride + 1
             ),
+            indexer_bytes_per_block=indexer_bytes_per_block,
         )
         if pinned_blocks is not None:
             # The worker skips its profile run for a pinned count, and there
@@ -1139,16 +1287,20 @@ class KVCacheManager:
             * attn_num_blocks
             * sizing.attn_page_size_bytes
         )
+        indexer_bytes = (
+            sizing.group_size * attn_num_blocks * sizing.indexer_bytes_per_block
+        )
         mamba_bytes = sizing.group_size * sizing.mamba_per_tensor_bytes
         logger.info(
             "Compact-mamba KV cache: num_gpu_blocks_override=%d (attn), "
             "_mamba_num_blocks=%d. HBM split: attn=%.2f GiB; "
-            "mamba=%.2f GiB; total=%.2f GiB / avail=%.2f GiB.%s",
+            "indexer=%.2f GiB; mamba=%.2f GiB; total=%.2f GiB / avail=%.2f GiB.%s",
             attn_num_blocks,
             sizing.mamba_num_blocks,
             attn_bytes / (2**30),
+            indexer_bytes / (2**30),
             mamba_bytes / (2**30),
-            (attn_bytes + mamba_bytes) / (2**30),
+            (attn_bytes + indexer_bytes + mamba_bytes) / (2**30),
             avail / (2**30),
             " Attention blocks pinned by num_gpu_blocks_override." if pinned else "",
         )
@@ -1269,6 +1421,13 @@ class KVCacheManager:
         if cw is not None and hasattr(cw, "spec") and hasattr(cw.spec, "prewarm_shape"):
             cw.spec.prewarm_shape(p)
 
+    def _glm5_unified_pool(self) -> bool:
+        from vllm_torchtpu.models.vllm.glm5_next.unified_pool import (
+            glm5_unified_pool_enabled,
+        )
+
+        return glm5_unified_pool_enabled(self.runner.vllm_config)
+
     def _initialize_unified_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         self.runner.attn_groups = []
         for gid, group in enumerate(kv_cache_config.kv_cache_groups):
@@ -1295,6 +1454,25 @@ class KVCacheManager:
                     )
                 ]
             )
+
+        glm5_pool_keys: dict[str, str] = {}
+        if self._glm5_unified_pool():
+            from vllm_torchtpu.models.vllm.glm5_next.unified_pool import (
+                pool_key_pairs,
+            )
+
+            glm5_pool_keys = pool_key_pairs(
+                self.runner.vllm_config.compilation_config.static_forward_context
+            )
+            # The pool-key caches ride the MLA group's block table: listing
+            # them in its attention group gives them its metadata.
+            mla_groups = [
+                group_list[0]
+                for group_list in self.runner.attn_groups
+                if isinstance(group_list[0].kv_cache_spec, MLAAttentionSpec)
+            ]
+            assert len(mla_groups) == 1, [g.kv_cache_spec for g in mla_groups]
+            mla_groups[0].layer_names.extend(glm5_pool_keys)
 
         # The HND batched-RPA backend distinguishes its generic 128-token page
         # from the wider page sizes supported by PCP streaming via the active
@@ -1349,14 +1527,38 @@ class KVCacheManager:
         block_major = unified_block_major_enabled(self.runner.vllm_config)
         if block_major:
             self._check_block_major_pool_supported()
-        materialized = materialize_kv_cache_tensors(
-            kv_cache_config=kv_cache_config,
-            attn_groups=self.runner.attn_groups,
-            kernel_block_sizes=kernel_block_sizes,
-            device=self.runner.device,
-            cache_dtype=self.runner.kv_cache_dtype,
-            block_major=block_major,
-        )
+        if glm5_pool_keys:
+            from vllm_torchtpu.models.vllm.glm5_next import unified_pool
+
+            if block_major:
+                raise NotImplementedError(
+                    "GLM-5.3 unified pool does not support the block-major pool"
+                )
+            glm5_kv_caches, glm5_raw, glm5_layer_to_raw = unified_pool.materialize(
+                vllm_config=self.runner.vllm_config,
+                kv_cache_config=kv_cache_config,
+                attn_groups=self.runner.attn_groups,
+                pool_key_layers=glm5_pool_keys,
+                device=self.runner.device,
+                forward_context=(
+                    self.runner.vllm_config.compilation_config.static_forward_context
+                ),
+                runner=self.runner,
+            )
+            materialized = MaterializedKVCache(
+                kv_caches=glm5_kv_caches,
+                raw_tensors=glm5_raw,
+                layer_to_raw=glm5_layer_to_raw,
+            )
+        else:
+            materialized = materialize_kv_cache_tensors(
+                kv_cache_config=kv_cache_config,
+                attn_groups=self.runner.attn_groups,
+                kernel_block_sizes=kernel_block_sizes,
+                device=self.runner.device,
+                cache_dtype=self.runner.kv_cache_dtype,
+                block_major=block_major,
+            )
         kv_caches = materialized.kv_caches
         self.runner.kv_cache_raw_tensors = materialized.raw_tensors
         self.runner.bm_pool_layout = materialized.bm_pool_layout
@@ -1371,7 +1573,12 @@ class KVCacheManager:
             )
         if self.runner._unified_kv_layout:
             self.runner._build_mamba_copy_plan(
-                kv_cache_config, materialized.layer_to_raw, materialized.bm_pool_layout
+                kv_cache_config,
+                materialized.layer_to_raw,
+                materialized.bm_pool_layout,
+                # GLM-5.3's state tensors (nope) are one pool block per
+                # manager block, but hold only part of the manager page.
+                pool_block_split=1 if glm5_pool_keys else None,
             )
 
         for layer_name, target_layer_name in self.runner.shared_kv_cache_layers.items():
@@ -1879,8 +2086,10 @@ class KVCacheManager:
                     # Each device partition consistently retains a complete, unsliced
                     # replication of the compressed latent cache structure across
                     # multi-chip execution loops.
+                    # Indexer caches name their own backend: DeepSeek's packs
+                    # fp8 + scale into uint8 rows, GLM-5.3-Flash keeps bf16.
                     mla_backend_cls = (
-                        VllmTPUDeepseekV32IndexerBackend
+                        attn_module.get_attn_backend()
                         if isinstance(attn_module, DeepseekV32IndexerCache)
                         else PallasMLAttentionBackend
                     )

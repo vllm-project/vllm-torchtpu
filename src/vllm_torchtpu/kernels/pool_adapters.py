@@ -88,8 +88,17 @@ def gather_region(
     out_dtype,
     out_lanes: int | None = None,
     split: int = 1,
+    lead_rows: int = 0,
+    num_valid=None,
 ):
     """Per-request typed read of a pool token-range.
+
+    ``lead_rows`` prepends that many rows to the output (left unwritten:
+    caller scratch), so a caller that needs a leading slot does not pay a
+    concatenate over every request's state. ``num_valid`` (int32 scalar
+    array) is how many leading requests are real; the rest are padding
+    whose rows are left unwritten. A padded step revisits the last real
+    step's blocks, so it moves no data.
 
     ``split`` > 1 addresses a MANAGER-block token range on a pool born at
     kernel granularity (a manager block is `split` consecutive kernel
@@ -110,6 +119,20 @@ def gather_region(
     lane-preserving (free).
     """
     if split > 1:
+        if lead_rows:
+            # The window path has no lead-row support: pad outside.
+            out = gather_region(
+                pool,
+                state_indices,
+                tok0=tok0,
+                ntok=ntok,
+                out_dtype=out_dtype,
+                out_lanes=out_lanes,
+                split=split,
+            )
+            return jnp.concatenate(
+                [jnp.zeros((lead_rows,) + out.shape[1:], out.dtype), out], axis=0
+            )
         kernel_bs = pool.shape[1]
         if tok0 % kernel_bs == 0 and ntok % kernel_bs == 0:
             return _gather_window(
@@ -134,6 +157,7 @@ def gather_region(
             ntok=ntok,
             out_dtype=out_dtype,
             out_lanes=out_lanes,
+            num_valid=num_valid,
         )
 
     na = state_indices.shape[0]
@@ -164,26 +188,53 @@ def gather_region(
     o_lanes = lanes // lane_split
     pad = (0,) * (len(payload) + 1)
 
-    def _kernel(sidx_ref, pool_ref, o_ref):
-        o_ref[...] = typed_ldst.load_typed(
-            pool_ref.at[0], view_dtype=out_dtype, lane_split=lane_split
-        )[None]
+    nv = _num_valid_steps(num_valid, na, chunks)
+    lead = lead_rows * chunks
+
+    def _kernel(sidx_ref, nv_ref, pool_ref, o_ref):
+        @pl.when(pl.program_id(0) < nv_ref[0])
+        def _():
+            o_ref[...] = typed_ldst.load_typed(
+                pool_ref.at[0], view_dtype=out_dtype, lane_split=lane_split
+            )[None]
+
+    def _step(p, nv_ref):
+        return jnp.minimum(p, nv_ref[0] - 1)
 
     return pl.pallas_call(
         _kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=1,
+            num_scalar_prefetch=2,
             grid=(na * chunks,),
             in_specs=[
                 pl.BlockSpec(
                     (1, g) + payload + (lanes,),
-                    lambda p, s: (s[p // chunks], (tok0 + (p % chunks) * g) // g) + pad,
+                    lambda p, s, n: (
+                        s[_step(p, n) // chunks],
+                        (tok0 + (_step(p, n) % chunks) * g) // g,
+                    )
+                    + pad,
                 )
             ],
-            out_specs=pl.BlockSpec((1, out_rows, o_lanes), lambda p, s: (p, 0, 0)),
+            out_specs=pl.BlockSpec(
+                (1, out_rows, o_lanes), lambda p, s, n: (lead + _step(p, n), 0, 0)
+            ),
         ),
-        out_shape=jax.ShapeDtypeStruct((na * chunks, out_rows, o_lanes), out_dtype),
-    )(state_indices, pool).reshape(na, chunks * out_rows, o_lanes)
+        out_shape=jax.ShapeDtypeStruct(
+            (lead + na * chunks, out_rows, o_lanes), out_dtype
+        ),
+    )(state_indices, nv, pool).reshape(lead_rows + na, chunks * out_rows, o_lanes)
+
+
+def _num_valid_steps(num_valid, na: int, chunks: int):
+    """Grid steps of real requests as a (1,) int32 prefetch operand (all of
+    them when ``num_valid`` is None); never below one, so the clamped index
+    maps stay in range."""
+    if num_valid is None:
+        steps = jnp.int32(na * chunks)
+    else:
+        steps = jnp.clip(jnp.asarray(num_valid, jnp.int32), 1, na) * chunks
+    return jnp.reshape(steps, (1,)).astype(jnp.int32)
 
 
 def _gather_window(
@@ -313,9 +364,22 @@ def _scatter_window(pool, vals, mgr_indices, *, split: int, kb0: int, nblocks: i
     )(mgr_indices, vals, pool)
 
 
-def scatter_region(pool, vals, state_indices, *, tok0: int, ntok: int, split: int = 1):
+def scatter_region(
+    pool,
+    vals,
+    state_indices,
+    *,
+    tok0: int,
+    ntok: int,
+    split: int = 1,
+    lead_rows: int = 0,
+    num_valid=None,
+):
     """Per-request typed write of a pool token-range (in place); mirrors
     ``gather_region`` including the ``split`` manager-range routing.
+
+    ``lead_rows`` leading rows of ``vals`` are skipped (the gather's lead
+    rows), and only the first ``num_valid`` requests are written.
 
     pool: (num_blocks, block_size, heads2, lanes) KV dtype (aliased;
     unwritten bytes preserved).
@@ -323,6 +387,8 @@ def scatter_region(pool, vals, state_indices, *, tok0: int, ntok: int, split: in
     returns: the updated pool.
     """
     if split > 1:
+        if lead_rows:
+            vals = vals[lead_rows:]
         kernel_bs = pool.shape[1]
         if tok0 % kernel_bs == 0 and ntok % kernel_bs == 0:
             return _scatter_window(
@@ -340,7 +406,12 @@ def scatter_region(pool, vals, state_indices, *, tok0: int, ntok: int, split: in
                 f"tok0={tok0} ntok={ntok} kernel_block={kernel_bs}"
             )
         return scatter_region(
-            pool, vals, state_indices * split + kb, tok0=local0, ntok=ntok
+            pool,
+            vals,
+            state_indices * split + kb,
+            tok0=local0,
+            ntok=ntok,
+            num_valid=num_valid,
         )
 
     na = state_indices.shape[0]
@@ -365,36 +436,59 @@ def scatter_region(pool, vals, state_indices, *, tok0: int, ntok: int, split: in
         assert lanes % v_lanes == 0, (lanes, v_lanes)
         lane_split = lanes // v_lanes
     v_rows = out_rows * lane_split
-    assert vals.shape == (na, chunks * v_rows, v_lanes), (
+    assert vals.shape == (lead_rows + na, chunks * v_rows, v_lanes), (
         vals.shape,
+        lead_rows + na,
         chunks * v_rows,
         v_lanes,
     )
     pad = (0,) * (len(payload) + 1)
+    nv = _num_valid_steps(num_valid, na, chunks)
+    lead = lead_rows * chunks
 
-    def _kernel(sidx_ref, val_ref, pool_in_ref, pool_out_ref):
+    def _kernel(sidx_ref, nv_ref, val_ref, pool_in_ref, pool_out_ref):
         # The output block covers exactly the region chunk and is fully
-        # written; the complement is preserved via the HBM alias.
-        typed_ldst.store_typed(pool_out_ref.at[0], val_ref[0], lane_split=lane_split)
+        # written; the complement is preserved via the HBM alias. A padded
+        # step revisits the last real step's output block, which still holds
+        # what that step stored.
+        @pl.when(pl.program_id(0) < nv_ref[0])
+        def _():
+            typed_ldst.store_typed(
+                pool_out_ref.at[0], val_ref[0], lane_split=lane_split
+            )
+
+    def _step(p, nv_ref):
+        return jnp.minimum(p, nv_ref[0] - 1)
 
     return pl.pallas_call(
         _kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=1,
+            num_scalar_prefetch=2,
             grid=(na * chunks,),
             in_specs=[
-                pl.BlockSpec((1, v_rows, v_lanes), lambda p, s: (p, 0, 0)),
+                pl.BlockSpec(
+                    (1, v_rows, v_lanes), lambda p, s, n: (lead + _step(p, n), 0, 0)
+                ),
                 # Aliased with the output; never read, so leave it in HBM.
                 pl.BlockSpec(memory_space=pltpu.HBM),
             ],
             out_specs=pl.BlockSpec(
                 (1, g) + payload + (lanes,),
-                lambda p, s: (s[p // chunks], (tok0 + (p % chunks) * g) // g) + pad,
+                lambda p, s, n: (
+                    s[_step(p, n) // chunks],
+                    (tok0 + (_step(p, n) % chunks) * g) // g,
+                )
+                + pad,
             ),
         ),
         out_shape=jax.ShapeDtypeStruct(pool.shape, pool.dtype),
-        input_output_aliases={2: 0},
-    )(state_indices, vals.reshape(na * chunks, v_rows, v_lanes), pool)
+        input_output_aliases={3: 0},
+    )(
+        state_indices,
+        nv,
+        vals.reshape((lead_rows + na) * chunks, v_rows, v_lanes),
+        pool,
+    )
 
 
 def copy_blocks(pool, src_indices, dst_indices):

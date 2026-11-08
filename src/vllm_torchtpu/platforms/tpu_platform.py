@@ -1348,7 +1348,18 @@ class TpuPlatform(Platform):
                     cache_config.block_size = (  # type: ignore[assignment]
                         backend_cls.get_preferred_block_size(default)
                     )
-            if unified_kv_layout_enabled(vllm_config):
+            from vllm_torchtpu.models.vllm.glm5_next.unified_pool import (
+                glm5_unified_pool_enabled,
+                update_block_config,
+            )
+
+            if glm5_unified_pool_enabled(vllm_config):
+                # GLM-5.3's pool regions are its native sparse-MLA and
+                # pool-key caches, not one attention-shaped tensor, so the
+                # generic derivation (which sizes against a single backend's
+                # page) does not apply. See glm5_next/unified_pool.py.
+                update_block_config(vllm_config)
+            elif unified_kv_layout_enabled(vllm_config):
                 update_tpu_block_size_and_slot_config(vllm_config, backend_cls)
 
             min_page_size = backend_cls.get_min_page_size(vllm_config)

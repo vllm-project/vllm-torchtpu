@@ -464,6 +464,7 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         config: KimiLinearConfig,
         vllm_config: VllmConfig,
         prefix: str,
+        pool_tokens_per_row: int | None = None,
     ) -> None:
         super().__init__()
         kda_config = config.linear_attn_config
@@ -594,12 +595,15 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         # block-size derivation for the pool runs after model construction
         # (hybrid layers are built before the adjusted value exists), so the
         # op reads cache_config.block_size per call, not here.
+        # `pool_tokens_per_row`: see `_pooled_kda_core`. GLM-5.3 keeps its
+        # state in the sparse-MLA nope cache, one token per row.
         self.pooled_kda_op = build_kimi_pooled_kda_op(
             prefix,
             lower_bound=self.gate_lower_bound,
             eps=config.rms_norm_eps,
             vllm_config=vllm_config,
             num_spec_tokens=self.num_spec_tokens,
+            pool_tokens_per_row=pool_tokens_per_row,
         )
 
         context = vllm_config.compilation_config.static_forward_context

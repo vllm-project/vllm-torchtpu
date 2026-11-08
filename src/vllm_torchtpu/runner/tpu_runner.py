@@ -2020,9 +2020,14 @@ class TPUModelRunner(GPUModelRunner):
         kv_cache_config: KVCacheConfig,
         layer_to_raw: dict[str, torch.Tensor],
         bm_pool_layout: BlockMajorPoolLayout | None,
+        pool_block_split: int | None = None,
     ) -> None:
         """Map each mamba kv-cache group to the raw pool buffers hosting its
         layers, for the per-step state-block seed copies.
+
+        ``pool_block_split`` (pool blocks per manager block) is given by
+        layouts whose state tensors hold only part of the manager page
+        (GLM-5.3), where it cannot be derived from page bytes.
 
         Seed copies only exist in mamba align mode, where the state block
         follows the request's last token through the block table. In any
@@ -2058,6 +2063,9 @@ class TPUModelRunner(GPUModelRunner):
             # state seed copies index rows directly by manager block ID without
             # kernel-block fan-out.
             self._pool_block_split = 1
+            return
+        if pool_block_split is not None:
+            self._pool_block_split = pool_block_split
             return
         for raw in dict.fromkeys(layer_to_raw.values()):
             if raw.dim() > 1:

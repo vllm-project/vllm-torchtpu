@@ -878,6 +878,15 @@ class Eagle3Proposer:
         draft_compilation_config.inductor_compile_config["_vllm_model_tag"] = (
             "eagle_head"
         )
+        # The draft is traced once for every token bucket (only the backbone
+        # is re-traced per bucket group, `_precompile_backbone`), and a trace
+        # taken at one token specializes away every larger bucket while a
+        # trace at two or more specializes away one -- the size-1 contiguity
+        # guards of the MLA projections (e.g. GLM-5.3's sparse MLA). Never
+        # compile or call the draft at one token; `_loop_bucket` pads to two.
+        sizes = draft_compilation_config.compile_sizes
+        if sizes and any(int(x) > 1 for x in sizes):
+            draft_compilation_config.compile_sizes = [x for x in sizes if int(x) > 1]
         self.draft_vllm_config.compilation_config = draft_compilation_config
         with (
             set_model_tag("eagle_head"),
@@ -1082,8 +1091,20 @@ class Eagle3Proposer:
             )
 
         kv_cache_specs = self.runner.get_kv_cache_spec()
+        from vllm_torchtpu.models.vllm.glm5_next.unified_pool import (
+            glm5_unified_pool_enabled,
+        )
+
+        # GLM-5.3's unified pool folds its pool-key caches into the MLA group
+        # (glm5_next/unified_pool.py): they get their cache there, not a spec.
+        folded = glm5_unified_pool_enabled(self.vllm_config)
         unregistered = [
-            name for name in (*mla_names, *indexer_names) if name not in kv_cache_specs
+            name
+            for name in (*mla_names, *indexer_names)
+            if name not in kv_cache_specs
+            and not (
+                folded and getattr(all_attn_layers[name], "kv_dtype_is_fixed", False)
+            )
         ]
         if unregistered:
             missing_types = sorted(
@@ -2236,7 +2257,9 @@ class Eagle3Proposer:
         runner = self.runner
         if self._dp_lockstep_sharded():
             num_reqs = dp_lockstep_num_reqs(runner._dp_step_max_reqs, num_reqs)
-        return _get_padded_token_len(runner.num_tokens_paddings, num_reqs)
+        # At least two rows: the draft is never compiled at one token (see
+        # `_load_draft_model`).
+        return _get_padded_token_len(runner.num_tokens_paddings, max(num_reqs, 2))
 
     def _precompile_combine_hidden_states(self) -> None:
         if self.speculative_config.method == "mtp":
