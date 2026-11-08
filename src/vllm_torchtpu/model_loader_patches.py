@@ -48,11 +48,14 @@ tensors (ModelOpt NVFP4, needed globally by FlashInfer backends) are not
 in the allowlist and stay unfiltered.
 """
 
+import contextlib
 import functools
 import gc
+import importlib
 import json
 import os
 import struct
+import sys
 import threading
 import time
 import typing
@@ -109,14 +112,90 @@ def _should_skip_weight_tpu(
     return _should_skip(weight_name, local_expert_ids)
 
 
-def _compute_local_expert_ids() -> set[int] | None:
+_K3_TOTAL_EXPERTS = 896
+_K3_EP_WORLD_SIZE = 32
+_K3_ETP_GROUP_SIZE = 4
+
+
+def _is_k3_megakernel_ep8_active(num_total_experts: int, ep_size: int) -> bool:
+    """Return True when Kimi-K3 TP32 megakernel requires EP8 (112 experts/rank)."""
+    if (
+        num_total_experts != _K3_TOTAL_EXPERTS
+        or ep_size != _K3_EP_WORLD_SIZE
+        or ep_size % _K3_ETP_GROUP_SIZE != 0
+    ):
+        return False
+    raw = str(envs.VLLM_TPU_MEGAKERNEL).strip().lower()
+    return raw not in ("", "0", "false", "no", "off")
+
+
+def _k3_ep8_local_expert_ids(
+    num_total_experts: int, ep_rank: int, ep_size: int
+) -> set[int]:
+    """Return the 112 local expert IDs for `ep_rank`'s EP8 group (`ep_rank // 4`)."""
+    ep_groups = ep_size // _K3_ETP_GROUP_SIZE
+    experts_per_group = num_total_experts // ep_groups
+    group_idx = ep_rank // _K3_ETP_GROUP_SIZE
+    return set(
+        range(
+            group_idx * experts_per_group,
+            (group_idx + 1) * experts_per_group,
+        )
+    )
+
+
+def _resolve_k3_kernel_position_for_ep(ep_rank: int, ep_size: int) -> int:
+    """Resolve ascending-`device.id` kernel mesh position `p` for `ep_rank`."""
+    with contextlib.suppress(Exception):
+        ep_mesh = importlib.import_module("vllm_torchtpu.distributed.ep_mesh")
+        ids = ep_mesh.ep_device_ids()
+        if (
+            ids is not None
+            and len(ids) == ep_size
+            and 0 <= ep_rank < ep_size
+            and len(set(ids)) == ep_size
+        ):
+            return sorted(ids).index(ids[ep_rank])
+    jax_mod = sys.modules.get("jax")
+    if jax_mod is not None:
+        with contextlib.suppress(Exception):
+            default_backend = getattr(jax_mod, "default_backend", None)
+            if callable(default_backend) and default_backend() == "tpu":
+                adapter_mod = importlib.import_module(
+                    "vllm_torchtpu.models.kimi_k3.megakernel.adapter"
+                )
+                return int(adapter_mod.resolve_kernel_position({}, default_pos=ep_rank))
+    return ep_rank
+
+
+def _compute_local_expert_ids(
+    num_total_experts: int | None = None,
+    ep_rank: int | None = None,
+    ep_size: int | None = None,
+) -> set[int] | None:
     """Local expert ids for this rank, or None when filtering is off.
 
     Mirrors ``DefaultModelLoader._init_ep_weight_filter`` (vLLM 0.26) so the
     fetch-time filter and the FusedMoE expert map agree by construction.
+    When Kimi-K3 megakernel is active (`896` experts across `ep_size == 32`),
+    widens the filter from EP32 (`28` experts) to the union of the TP rank's
+    EP8 group and the ascending-`device.id` kernel position's EP8 group so both
+    the runner's FusedMoE map and `RankWeightStreamer` receive their local experts.
     """
     from vllm.config import get_current_vllm_config
     from vllm.model_executor.model_loader import default_loader
+
+    if num_total_experts is not None and ep_rank is not None and ep_size is not None:
+        if _is_k3_megakernel_ep8_active(num_total_experts, ep_size):
+            kernel_pos = _resolve_k3_kernel_position_for_ep(ep_rank, ep_size)
+            return _k3_ep8_local_expert_ids(
+                num_total_experts, ep_rank, ep_size
+            ) | _k3_ep8_local_expert_ids(num_total_experts, kernel_pos, ep_size)
+        return default_loader.compute_local_expert_ids(
+            num_total_experts,
+            ep_size,
+            ep_rank,
+        )
 
     vllm_config = get_current_vllm_config()
     model_config = vllm_config.model_config
@@ -132,7 +211,7 @@ def _compute_local_expert_ids() -> set[int] | None:
     if parallel_config.enable_eplb:
         return None
     num_experts = model_config.get_num_experts()
-    if num_experts <= 0:
+    if num_experts is None or num_experts <= 0:
         return None
 
     from vllm.distributed import (
@@ -147,18 +226,26 @@ def _compute_local_expert_ids() -> set[int] | None:
     dp_rank = get_dp_group().rank_in_group if dp_size > 1 else 0
     tp_rank = get_tensor_model_parallel_rank() if tp_size > 1 else 0
     pcp_rank = get_pcp_group().rank_in_group if pcp_size > 1 else 0
-    ep_size = dp_size * pcp_size * tp_size
-    ep_rank = dp_rank * pcp_size * tp_size + pcp_rank * tp_size + tp_rank
+    total_ep_size = int(dp_size * pcp_size * tp_size)
+    curr_ep_rank = int(dp_rank * pcp_size * tp_size + pcp_rank * tp_size + tp_rank)
+    ep_size = total_ep_size
+    ep_rank = curr_ep_rank
 
-    # Use the loader's symbol instead of importing the base helper directly.
-    # Hierarchical EP replaces this symbol with its chip-aware ownership map,
-    # and the streaming path must fetch the same replicated expert set.
-    local_ids = default_loader.compute_local_expert_ids(
-        num_experts,
-        ep_size,
-        ep_rank,
-        placement=parallel_config.expert_placement_strategy,
-    )
+    if _is_k3_megakernel_ep8_active(num_experts, total_ep_size):
+        kernel_pos = _resolve_k3_kernel_position_for_ep(curr_ep_rank, total_ep_size)
+        local_ids: set[int] | None = _k3_ep8_local_expert_ids(
+            num_experts, curr_ep_rank, total_ep_size
+        ) | _k3_ep8_local_expert_ids(num_experts, kernel_pos, total_ep_size)
+    else:
+        # Use the loader's symbol instead of importing the base helper directly.
+        # Hierarchical EP replaces this symbol with its chip-aware ownership map,
+        # and the streaming path must fetch the same replicated expert set.
+        local_ids = default_loader.compute_local_expert_ids(
+            num_experts,
+            ep_size,
+            ep_rank,
+            placement=parallel_config.expert_placement_strategy,
+        )
     if local_ids is not None:
         logger.info(
             "[sharded-ep-load] ep_size=%d ep_rank=%d placement=%s: "

@@ -76,7 +76,7 @@ environment_variables: dict[str, Callable[[], object]] = {
     "JOBID": env_str("JOBID", ""),
     # Python environment the launched workers run; defaults to this one.
     "K3_VENV_DIR": env_str("K3_VENV_DIR", sys.prefix),
-    # libtpu flags the profile command extends with its LLO dump flags.
+    # Default libtpu initialization flags for standalone tool workers.
     "LIBTPU_INIT_ARGS": env_str("LIBTPU_INIT_ARGS", ""),
     # "1" in a process the harness launched as a worker.
     "MEGAKERNEL_TOOL_WORKER": env_str("MEGAKERNEL_TOOL_WORKER", ""),
