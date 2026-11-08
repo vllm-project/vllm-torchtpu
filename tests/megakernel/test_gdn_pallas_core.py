@@ -235,8 +235,8 @@ def _run_gdn_pallas_case(
     class _GDNSmallMixer(FakeMixerModule):
         input_norm = None
 
-        def smalls(self, geom: Any, ex_spec: ExecSpec) -> list[SmallField]:
-            del geom, ex_spec
+        def smalls(self, g: Any, ex: ExecSpec) -> list[SmallField]:
+            del ex
             qkv = 2 * g.KH * g.KD + g.VH * g.VD
             return [
                 SmallField("conv", 4 * qkv),
@@ -250,7 +250,10 @@ def _run_gdn_pallas_case(
         config=g,
         layer_type=LayerType("lt", slots=(_GDNSmallMixer(), FakeFFNModule())),
         cache_backend=(
-            PoolBackend(layout=pl_layout, kernel_names=("kv_pool_0",))
+            PoolBackend(
+                layout=pl_layout,
+                kernel_names=("gather_pool_states", "scatter_pool_states"),
+            )
             if pl_layout is not None
             else None
         ),
@@ -569,12 +572,36 @@ def test_gdn_pallas_core_gpr_gather_matches_reference(conv_dtype: Any):
 
 @pytest.mark.tpu_test
 @pytest.mark.parametrize(
-    ("gpr", "conv_dtype"),
-    [(False, F32), (True, BF16), (True, F32)],
-    ids=["tpu_chunked_hbm", "tpu_gpr_bf16_conv", "tpu_gpr_f32_conv"],
+    ("T", "B", "chunked", "head_major", "gdn_bufs", "gpr", "conv_dtype"),
+    [
+        (1, 4, False, False, 1, False, F32),
+        (4, 4, False, False, 1, False, F32),
+        (1, 16, True, False, 2, False, F32),
+        (4, 8, True, True, 2, False, F32),
+        (4, 16, True, False, 2, False, F32),
+        (4, 16, True, False, 2, True, BF16),
+        (4, 16, True, False, 2, True, F32),
+    ],
+    ids=[
+        "tpu_decode_t1_rec",
+        "tpu_verify_t4_rec",
+        "tpu_decode_t1_wide_chunked",
+        "tpu_verify_t4_chunked_head_major",
+        "tpu_chunked_hbm",
+        "tpu_gpr_bf16_conv",
+        "tpu_gpr_f32_conv",
+    ],
 )
-def test_gdn_pallas_core_on_tpu(gpr: bool, conv_dtype: Any):
-    """Run GDN Pallas conv and chunked recurrence on TPU (`interpret=False`)."""
+def test_gdn_pallas_core_on_tpu(
+    T: int,
+    B: int,
+    chunked: bool,
+    head_major: bool,
+    gdn_bufs: int,
+    gpr: bool,
+    conv_dtype: Any,
+):
+    """Run GDN Pallas conv and recurrence paths on TPU (`interpret=False`)."""
     try:
         tpu_devs = jax.devices("tpu")
     except RuntimeError:
@@ -583,11 +610,11 @@ def test_gdn_pallas_core_on_tpu(gpr: bool, conv_dtype: Any):
         pytest.skip("TPU device required for interpret=False Pallas execution")
     with jax.default_device(tpu_devs[0]):
         _run_gdn_pallas_case(
-            T=4,
-            B=16,
-            chunked=True,
-            head_major=False,
-            gdn_bufs=2,
+            T=T,
+            B=B,
+            chunked=chunked,
+            head_major=head_major,
+            gdn_bufs=gdn_bufs,
             gpr=gpr,
             conv_dtype=conv_dtype,
             interpret=False,
