@@ -16,7 +16,6 @@ speculative slots."""
 
 from __future__ import annotations
 
-import json
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
@@ -43,16 +42,12 @@ from vllm_torchtpu.megakernel.runtime import (
     DEFAULT_BUCKETS,
     DEFAULT_VERIFY_BUCKETS,
     BatchShape,
-    JaxStepMetaOps,
-    MKABCalibrator,
     check_post_mesh_eligibility,
     check_query_start_loc_uniform,
     explicit_profile_settings,
     facts_from_pool_layout,
     ir_required_buckets,
     pack_step_meta,
-    parse_mk_buckets,
-    parse_mk_verify_buckets,
     parse_runtime_config,
     resolve_driver_profile,
     resolve_step_positions,
@@ -461,20 +456,8 @@ def _make_backbone_from_logical_weights(
 
 
 def test_bucket_parsing_and_selection() -> None:
-    """Verify decode/verify bucket parsing, sorting, config parsing, and selection."""
-    assert parse_mk_buckets("16, 4, 8, 4") == (4, 8, 16)
-    assert parse_mk_buckets("16:4:8") == (4, 8, 16)
-    assert parse_mk_buckets("0") == ()
-    assert parse_mk_buckets("off") == ()
-    with pytest.raises(ValueError, match="invalid decode buckets"):
-        parse_mk_buckets("128")
-
-    assert parse_mk_verify_buckets("16, 4, 8") == (4, 8, 16)
-    assert parse_mk_verify_buckets("16:4:8") == (4, 8, 16)
-    assert parse_mk_verify_buckets("none") == ()
-    with pytest.raises(ValueError, match="invalid verify_buckets"):
-        parse_mk_verify_buckets("6")
-
+    """Runtime config parsing with the template's profiles, and the adapter's
+    options (the bucket-list parsers are tested in `test_bucket_policy.py`)."""
     # Single VLLM_TPU_MEGAKERNEL string forms + additional_config["megakernel"]
     assert not parse_runtime_config("")["enabled"]
     assert not parse_runtime_config("0")["enabled"]
@@ -663,29 +646,6 @@ def test_resolve_driver_profile_and_fused_ir_rule() -> None:
     assert ir_required_buckets(warmed, fused_io, is_eager=True) == [(1, 16)]
 
 
-def test_ab_calibrator() -> None:
-    """Verify `MKABCalibrator` alternation and latency summary formatting."""
-    off = MKABCalibrator(enabled=False, period_s=0.0)
-    assert off.choose("mk_t1_b2", True) == (True, "mk_t1_b2", "mk")
-    assert off.choose("stock_mixed", False) == (False, "stock_mixed", "stock")
-    assert off.record(1.5, padded_tokens=2) is None
-
-    ab = MKABCalibrator(enabled=True, period_s=0.0)
-    assert ab.choose("mk_t1_b2", True) == (True, "mk_t1_b2_ab_mk", "mk")
-    res1 = ab.record(1.2, padded_tokens=2)
-    assert res1 is not None
-
-    assert ab.choose("mk_t1_b2", True) == (False, "mk_t1_b2_ab_stock", "stock")
-    res2 = ab.record(2.2, padded_tokens=2)
-    assert res2 is not None
-    _, _, cum_json = res2
-    parsed = json.loads(cum_json)
-    entry = parsed["mk_t1_b2_p2"]
-    assert entry["mk"][0] == 1
-    assert entry["stock"][0] == 1
-    assert entry["d_mean_ms"] == pytest.approx(-1.0)
-
-
 def test_prepare_step_metadata_decode_and_verify() -> None:
     """Verify `prepare_step_metadata` for `T=1` decode, `T=4` verify, and `roff`."""
     attn_md = SimpleNamespace(
@@ -872,125 +832,14 @@ def test_block_tables_1d_reshape_most_model_len() -> None:
     assert pt_b[1].tolist() == [102, 103, 0, 0]
 
 
-def _ref_prepare_step_inputs_eager(
-    input_ids: torch.Tensor,
-    positions: torch.Tensor,
-    block_tables: torch.Tensor,
-    s0: torch.Tensor,
-    c0: torch.Tensor,
-    r0: torch.Tensor,
-    s1: torch.Tensor,
-    c1: torch.Tensor,
-    r1: torch.Tensor,
-    s2: torch.Tensor,
-    c2: torch.Tensor,
-    r2: torch.Tensor,
-    bucket_t: int,
-    tokens_per_seq: int,
-    max_pages_per_seq: int,
-    has_roff: bool,
-    use_ckpt_2d: bool,
-) -> tuple[
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-]:
-    """Reference pre-B6 `prepare_step_inputs_eager` implementation for parity tests."""
-
-    def _sp_1d(x: torch.Tensor, target_len: int) -> torch.Tensor:
-        x1 = x.reshape(-1)
-        n = int(x1.shape[0])
-        if n >= target_len:
-            return x1[:target_len]
-        return torch.nn.functional.pad(x1, (0, target_len - n), value=0)
-
-    def _sp_2d(x: torch.Tensor, target_rows: int, target_cols: int) -> torch.Tensor:
-        r, c = int(x.shape[0]), int(x.shape[1])
-        out = x[: min(r, target_rows), : min(c, target_cols)]
-        pad_r = max(0, target_rows - r)
-        pad_c = max(0, target_cols - c)
-        if pad_r > 0 or pad_c > 0:
-            out = torch.nn.functional.pad(out, (0, pad_c, 0, pad_r), value=0)
-        return out
-
-    T = tokens_per_seq
-    B = bucket_t
-    nseq_bkt = B // T
-
-    bt = block_tables
-    if bt.ndim == 1:
-        n_rows_bt = int(s0.shape[0])
-        if n_rows_bt > 0 and bt.numel() % n_rows_bt == 0:
-            bt = bt.reshape(n_rows_bt, bt.numel() // n_rows_bt)
-        elif max_pages_per_seq > 0 and bt.numel() % max_pages_per_seq == 0:
-            bt = bt.reshape(-1, max_pages_per_seq)
-        else:
-            raise ValueError("invalid 1-D block_tables")
-    pt_b = _sp_2d(bt, nseq_bkt, max_pages_per_seq).to(torch.int32)
-
-    ckpt_rows: list[torch.Tensor] = []
-    roff_rows: list[torch.Tensor] = []
-    for s_raw, c_raw, r_raw in ((s0, c0, r0), (s1, c1, r1), (s2, c2, r2)):
-        s_b = (
-            _sp_1d(s_raw[:, 0], nseq_bkt).to(torch.int32)
-            if s_raw.ndim == 2
-            else _sp_1d(s_raw, nseq_bkt).to(torch.int32)
-        )
-        if has_roff:
-            s_idx = s_b.to(torch.long).clamp(min=0, max=r_raw.numel() - 1)
-            roff_g = r_raw.reshape(-1)[s_idx].to(torch.int32)
-        else:
-            roff_g = torch.zeros_like(s_b)
-
-        if T > 1:
-            if use_ckpt_2d and c_raw.ndim == 2 and c_raw.shape[1] >= T:
-                ckpt_g = _sp_2d(c_raw, nseq_bkt, T).to(torch.int32)
-            else:
-                src_1d = c_raw[:, 0] if c_raw.ndim == 2 else c_raw.reshape(-1)
-                ckpt_1d = _sp_1d(src_1d, nseq_bkt).to(torch.int32)
-                ckpt_g = ckpt_1d.unsqueeze(1).expand(nseq_bkt, T).contiguous()
-                roff_g = torch.where(roff_g < 0, roff_g, torch.zeros_like(roff_g))
-        else:
-            if use_ckpt_2d and has_roff and c_raw.ndim == 2 and c_raw.shape[1] > 1:
-                c_b = _sp_2d(c_raw, nseq_bkt, int(c_raw.shape[1])).to(torch.int32)
-                r_idx = roff_g.to(torch.long).clamp(min=0, max=c_raw.shape[1] - 1)
-                read_col = c_b.gather(1, r_idx.unsqueeze(1))
-            else:
-                read_col = s_b.unsqueeze(1)
-            write_col = s_b.unsqueeze(1)
-            ckpt_g = torch.cat([read_col, write_col], dim=1)
-            roff_g = torch.where(roff_g < 0, roff_g, torch.zeros_like(roff_g))
-
-        active_g = (s_b > 0) & (ckpt_g[:, 0] > 0)
-        ckpt_g = torch.where(active_g.unsqueeze(1), ckpt_g, torch.zeros_like(ckpt_g))
-        roff_g = torch.where(active_g, roff_g, torch.zeros_like(roff_g))
-        ckpt_rows.append(ckpt_g)
-        roff_rows.append(roff_g)
-
-    ckpt_b = torch.stack(ckpt_rows, dim=0)
-    roff_b = torch.stack(roff_rows, dim=0)
-    active_seq = ckpt_b[0, :, 0] > 0
-    active_tok = active_seq.unsqueeze(1).expand(nseq_bkt, T).reshape(B)
-    zero_b = torch.zeros((B,), dtype=torch.int32, device=input_ids.device)
-    ids_b = torch.where(active_tok, _sp_1d(input_ids, B).to(torch.int32), zero_b)
-    pos_1d = positions[0] if positions.ndim == 2 else positions
-    pos_b = torch.where(active_tok, _sp_1d(pos_1d, B).to(torch.int32), zero_b)
-    return ids_b, pos_b, pt_b, ckpt_b, roff_b
-
-
-def test_step_meta_bitwise_parity_base_vs_head_and_jax() -> None:
-    """Verify bitwise parity of `prepare_step_inputs_eager` vs `pack_step_meta`."""
-    torch_ops = TorchStepMetaOps()
-    jax_ops = JaxStepMetaOps()
-    max_pages_per_seq = 4
-    num_req_rows = 6
-
-    s0 = torch.tensor([1, 0, 5, 8, 0, 12], dtype=torch.int32)
-    s1 = torch.tensor([2, 0, 6, 9, 0, 13], dtype=torch.int32)
-    s2 = torch.tensor([3, 0, 7, 10, 0, 14], dtype=torch.int32)
-    c0_2d = torch.tensor(
+def test_prepare_step_inputs_eager_is_pack_step_meta_over_torch_ops() -> None:
+    """The adapter's `prepare_step_inputs_eager` is `pack_step_meta` over
+    `TorchStepMetaOps` for its three recurrent groups (the packing itself is
+    tested in `tests/megakernel_runtime/test_step_meta_ops.py`)."""
+    ops = TorchStepMetaOps()
+    max_pages = 4
+    s = torch.tensor([1, 0, 5, 8, 0, 12], dtype=torch.int32)
+    c2d = torch.tensor(
         [
             [1, 2, 3, 4],
             [0, 0, 0, 0],
@@ -1001,318 +850,64 @@ def test_step_meta_bitwise_parity_base_vs_head_and_jax() -> None:
         ],
         dtype=torch.int32,
     )
-    c1_2d = c0_2d + 20
-    c1_2d[1] = 0
-    c1_2d[3, 0] = 0
-    c2_2d = c0_2d + 40
-    c2_2d[1] = 0
-    c2_2d[3, 0] = 0
-
-    roff_pos = torch.zeros((32,), dtype=torch.int32)
-    roff_pos[1] = 2
-    roff_pos[5] = 1
-    roff_pos[8] = 3
-    roff_pos[12] = 0
-
-    roff_neg = roff_pos.clone()
-    roff_neg[1] = -1
-    roff_neg[5] = 2
-    roff_neg[8] = -2
-    roff_neg[12] = -1
-
-    bt_2d = torch.arange(
-        10, 10 + num_req_rows * max_pages_per_seq, dtype=torch.int32
-    ).reshape(num_req_rows, max_pages_per_seq)
-    bt_1d_req_blocks = torch.arange(50, 50 + num_req_rows * 2, dtype=torch.int32)
-    bt_1d_max_pages = torch.arange(80, 80 + 5 * max_pages_per_seq, dtype=torch.int32)
-    s0_j, s1_j, s2_j = (
-        jnp.asarray(s0.numpy()),
-        jnp.asarray(s1.numpy()),
-        jnp.asarray(s2.numpy()),
-    )
-    c0_2d_j, c1_2d_j, c2_2d_j = (
-        jnp.asarray(c0_2d.numpy()),
-        jnp.asarray(c1_2d.numpy()),
-        jnp.asarray(c2_2d.numpy()),
-    )
-    r_zero = torch.zeros((1,), dtype=torch.int32)
-    r_zero_j = jnp.zeros((1,), dtype=jnp.int32)
-    roff_pos_j = jnp.asarray(roff_pos.numpy())
-    roff_neg_j = jnp.asarray(roff_neg.numpy())
-    bt_pairs = (
-        (bt_2d, jnp.asarray(bt_2d.numpy())),
-        (bt_1d_req_blocks, jnp.asarray(bt_1d_req_blocks.numpy())),
-        (bt_1d_max_pages, jnp.asarray(bt_1d_max_pages.numpy())),
-    )
-
-    for T in (1, 4):
-        for bucket_t in (4, 8, 16):
-            raw_tok_len = 12
-            ids_in = torch.arange(100, 100 + raw_tok_len, dtype=torch.int32)
-            ids_j = jnp.asarray(ids_in.numpy())
-            pos_1d = torch.arange(200, 200 + raw_tok_len, dtype=torch.int32)
-            pos_mrope = torch.stack([pos_1d, pos_1d, pos_1d], dim=0)
-            for pos_in, pos_j in (
-                (pos_1d, jnp.asarray(pos_1d.numpy())),
-                (pos_mrope, jnp.asarray(pos_mrope.numpy())),
-            ):
-                for bt_in, bt_j in bt_pairs:
-                    for has_roff, r_in, r_j in (
-                        (False, r_zero, r_zero_j),
-                        (True, roff_pos, roff_pos_j),
-                        (True, roff_neg, roff_neg_j),
-                    ):
-                        for use_ckpt_2d, c_set, c_set_j in (
-                            (False, (s0, s1, s2), (s0_j, s1_j, s2_j)),
-                            (True, (c0_2d, c1_2d, c2_2d), (c0_2d_j, c1_2d_j, c2_2d_j)),
-                        ):
-                            c0_in, c1_in, c2_in = c_set
-                            c0_j, c1_j, c2_j = c_set_j
-                            if T > 1 and not use_ckpt_2d:
-                                with pytest.raises(
-                                    ValueError,
-                                    match="requires 2-D ckpt_indices with >= T=",
-                                ):
-                                    prepare_step_inputs_eager(
-                                        ids_in,
-                                        pos_in,
-                                        bt_in,
-                                        s0,
-                                        c0_in,
-                                        r_in,
-                                        s1,
-                                        c1_in,
-                                        r_in,
-                                        s2,
-                                        c2_in,
-                                        r_in,
-                                        bucket_t,
-                                        T,
-                                        max_pages_per_seq,
-                                        has_roff,
-                                        use_ckpt_2d,
-                                    )
-                                continue
-                            ref_out = _ref_prepare_step_inputs_eager(
-                                ids_in,
-                                pos_in,
-                                bt_in,
-                                s0,
-                                c0_in,
-                                r_in,
-                                s1,
-                                c1_in,
-                                r_in,
-                                s2,
-                                c2_in,
-                                r_in,
-                                bucket_t,
-                                T,
-                                max_pages_per_seq,
-                                has_roff,
-                                use_ckpt_2d,
-                            )
-                            head_out = prepare_step_inputs_eager(
-                                ids_in,
-                                pos_in,
-                                bt_in,
-                                s0,
-                                c0_in,
-                                r_in,
-                                s1,
-                                c1_in,
-                                r_in,
-                                s2,
-                                c2_in,
-                                r_in,
-                                bucket_t,
-                                T,
-                                max_pages_per_seq,
-                                has_roff,
-                                use_ckpt_2d,
-                            )
-                            meta_torch = pack_step_meta(
-                                ids_in,
-                                pos_in,
-                                bt_in,
-                                (
-                                    (s0, c0_in, r_in),
-                                    (s1, c1_in, r_in),
-                                    (s2, c2_in, r_in),
-                                ),
-                                bucket_t=bucket_t,
-                                tokens_per_seq=T,
-                                max_pages_per_seq=max_pages_per_seq,
-                                has_roff=has_roff,
-                                use_ckpt_2d=use_ckpt_2d,
-                                ops=torch_ops,
-                            ).as_tuple()
-                            for r_t, h_t, m_t in zip(
-                                ref_out, head_out, meta_torch, strict=True
-                            ):
-                                assert torch.equal(r_t, h_t)
-                                assert torch.equal(r_t, m_t)
-                            if bucket_t == 8:
-                                meta_jax = pack_step_meta(
-                                    ids_j,
-                                    pos_j,
-                                    bt_j,
-                                    (
-                                        (s0_j, c0_j, r_j),
-                                        (s1_j, c1_j, r_j),
-                                        (s2_j, c2_j, r_j),
-                                    ),
-                                    bucket_t=bucket_t,
-                                    tokens_per_seq=T,
-                                    max_pages_per_seq=max_pages_per_seq,
-                                    has_roff=has_roff,
-                                    use_ckpt_2d=use_ckpt_2d,
-                                    ops=jax_ops,
-                                ).as_tuple()
-                                for r_t, m_j in zip(ref_out, meta_jax, strict=True):
-                                    assert np.array_equal(r_t.numpy(), np.asarray(m_j))
-
-    # Verify Dynamo traces prepare_step_inputs_eager with fullgraph=True, dynamic=False
-    compiled_fn = torch.compile(
-        prepare_step_inputs_eager, backend="eager", fullgraph=True, dynamic=False
-    )
-    comp_out = compiled_fn(
-        torch.arange(10, 18, dtype=torch.int32),
-        torch.arange(20, 28, dtype=torch.int32),
-        bt_2d,
-        s0,
-        c0_2d,
-        roff_neg,
-        s1,
-        c1_2d,
-        roff_neg,
-        s2,
-        c2_2d,
-        roff_neg,
-        8,
-        4,
-        max_pages_per_seq,
-        True,
-        True,
-    )
-    eager_out = _ref_prepare_step_inputs_eager(
-        torch.arange(10, 18, dtype=torch.int32),
-        torch.arange(20, 28, dtype=torch.int32),
-        bt_2d,
-        s0,
-        c0_2d,
-        roff_neg,
-        s1,
-        c1_2d,
-        roff_neg,
-        s2,
-        c2_2d,
-        roff_neg,
-        8,
-        4,
-        max_pages_per_seq,
-        True,
-        True,
-    )
-    for c_t, e_t in zip(comp_out, eager_out, strict=True):
-        assert torch.equal(c_t, e_t)
-
-    # Extra edge cases: int64 inputs, PAD_SLOT_ID = -1 in s/c, slot beyond
-    # r_raw.numel()-1, and 2-D ckpt narrower than T (shape=(6, 2) at T=4).
-    s_edge = torch.tensor([1, -1, 999, 8, -1, 12], dtype=torch.int64)
-    c_narrow = torch.tensor(
-        [[1, 2], [-1, -1], [5, 6], [-1, 9], [15, 16], [12, 13]], dtype=torch.int64
-    )
-    r_edge = roff_neg.to(torch.int64)
-    ids_64 = torch.arange(10, 22, dtype=torch.int64)
-    pos_64 = torch.arange(30, 42, dtype=torch.int64)
-    bt_64 = bt_2d.to(torch.int64)
-    for T_edge, bkt_edge in ((1, 4), (4, 8)):
-        if T_edge > 1:
-            with pytest.raises(
-                ValueError, match="requires 2-D ckpt_indices with >= T="
-            ):
-                prepare_step_inputs_eager(
-                    ids_64,
-                    pos_64,
-                    bt_64,
-                    s_edge,
-                    c_narrow,
-                    r_edge,
-                    s_edge,
-                    c_narrow,
-                    r_edge,
-                    s_edge,
-                    c_narrow,
-                    r_edge,
-                    bkt_edge,
-                    T_edge,
-                    max_pages_per_seq,
-                    True,
-                    True,
-                )
-            continue
-        ref_edge = _ref_prepare_step_inputs_eager(
-            ids_64,
-            pos_64,
-            bt_64,
-            s_edge,
-            c_narrow,
-            r_edge,
-            s_edge,
-            c_narrow,
-            r_edge,
-            s_edge,
-            c_narrow,
-            r_edge,
-            bkt_edge,
-            T_edge,
-            max_pages_per_seq,
-            True,
-            True,
+    roff = torch.zeros((32,), dtype=torch.int32)
+    roff[1], roff[5], roff[8] = 2, -1, 3
+    bt = torch.arange(10, 10 + 6 * max_pages, dtype=torch.int32).reshape(6, max_pages)
+    ids = torch.arange(100, 112, dtype=torch.int32)
+    pos = torch.arange(200, 212, dtype=torch.int32)
+    for T, bucket_t, c, has_roff, use_2d in (
+        (1, 4, s, False, False),
+        (1, 8, c2d, True, True),
+        (4, 8, c2d, True, True),
+    ):
+        groups = ((s, c, roff), (s, c, roff), (s, c, roff))
+        got = prepare_step_inputs_eager(
+            ids,
+            pos,
+            bt,
+            *groups[0],
+            *groups[1],
+            *groups[2],
+            bucket_t,
+            T,
+            max_pages,
+            has_roff,
+            use_2d,
         )
-        head_edge = prepare_step_inputs_eager(
-            ids_64,
-            pos_64,
-            bt_64,
-            s_edge,
-            c_narrow,
-            r_edge,
-            s_edge,
-            c_narrow,
-            r_edge,
-            s_edge,
-            c_narrow,
-            r_edge,
-            bkt_edge,
-            T_edge,
-            max_pages_per_seq,
-            True,
-            True,
-        )
-        jax_edge = pack_step_meta(
-            jnp.asarray(ids_64.numpy()),
-            jnp.asarray(pos_64.numpy()),
-            jnp.asarray(bt_64.numpy()),
-            tuple(
-                (
-                    jnp.asarray(s_edge.numpy()),
-                    jnp.asarray(c_narrow.numpy()),
-                    jnp.asarray(r_edge.numpy()),
-                )
-                for _ in range(3)
-            ),
-            bucket_t=bkt_edge,
-            tokens_per_seq=T_edge,
-            max_pages_per_seq=max_pages_per_seq,
-            has_roff=True,
-            use_ckpt_2d=True,
-            ops=jax_ops,
+        want = pack_step_meta(
+            ids,
+            pos,
+            bt,
+            groups,
+            bucket_t=bucket_t,
+            tokens_per_seq=T,
+            max_pages_per_seq=max_pages,
+            has_roff=has_roff,
+            use_ckpt_2d=use_2d,
+            ops=ops,
         ).as_tuple()
-        for r_t, h_t, j_t in zip(ref_edge, head_edge, jax_edge, strict=True):
-            assert r_t.dtype == torch.int32 and h_t.dtype == torch.int32
-            assert torch.equal(r_t, h_t)
-            assert np.array_equal(r_t.numpy(), np.asarray(j_t))
+        for g_t, w_t in zip(got, want, strict=True):
+            assert torch.equal(g_t, w_t)
+    with pytest.raises(ValueError, match="requires 2-D ckpt_indices with >= T="):
+        prepare_step_inputs_eager(
+            ids,
+            pos,
+            bt,
+            s,
+            s,
+            roff,
+            s,
+            s,
+            roff,
+            s,
+            s,
+            roff,
+            8,
+            4,
+            max_pages,
+            True,
+            False,
+        )
 
 
 def test_bind_caches_rejects_compact_mamba_and_non_aliasing_la_cache() -> None:
