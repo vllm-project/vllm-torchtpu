@@ -25,6 +25,8 @@ _DSV4_DSPARK_MODEL = (
 _QWEN35_MTP_MODEL = "vllm_torchtpu.models.vllm.qwen3_5_mtp:Qwen3_5MTP"
 _QWEN35_MOE_MTP_MODEL = "vllm_torchtpu.models.vllm.qwen3_5_mtp:Qwen3_5MoeMTP"
 _QWEN4_EXP_MODEL = "vllm_torchtpu.models.vllm.qwen4_exp.model:Qwen4ExpForCausalLM"
+_LFM3_MODEL = "vllm_torchtpu.models.vllm.lfm3:Lfm3ForCausalLM"
+_LFM3_VL_MODEL = "vllm_torchtpu.models.vllm.lfm3_vl:Lfm3VlForConditionalGeneration"
 
 
 class _TPUKimiK3Config(VerifyAndUpdateConfig):
@@ -60,6 +62,10 @@ def register_models() -> None:
     # The released checkpoint declares the vision-language arch; serve it with
     # the text-only model.
     ModelRegistry.register_model("Qwen4ExpForConditionalGeneration", _QWEN4_EXP_MODEL)
+    # No upstream LFM3; its config is the checkpoint's remote code.
+    ModelRegistry.register_model("Lfm3ForCausalLM", _LFM3_MODEL)
+    # Text-only for now, like Qwen4ExpForConditionalGeneration above.
+    ModelRegistry.register_model("Lfm3VlForConditionalGeneration", _LFM3_VL_MODEL)
     MODELS_CONFIG_MAP["KimiK3ForConditionalGeneration"] = _TPUKimiK3Config
     MODELS_CONFIG_MAP["Qwen4ExpForCausalLM"] = TPUQwen4ExpConfig
     MODELS_CONFIG_MAP["Qwen4ExpForConditionalGeneration"] = TPUQwen4ExpConfig
