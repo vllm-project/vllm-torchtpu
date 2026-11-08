@@ -71,6 +71,24 @@ if _strategy_name:
     )
 
 
+# Test-only replay of captured expert ids (TPU_MOE_ROUTING_REPLAY), resolved
+# once here like the simulation strategy above.
+_ROUTING_REPLAY = None
+if envs.TPU_MOE_ROUTING_REPLAY:
+    from vllm_torchtpu.layers.adapter.routing_replay import RoutingReplay
+
+    _ROUTING_REPLAY = RoutingReplay(envs.TPU_MOE_ROUTING_REPLAY)
+    logger.warning(
+        "TPU_MOE_ROUTING_REPLAY=%s: MoE expert routing REPLAYS captured ids "
+        "(%d layers x %d windows x %d positions). Profiling only; model output "
+        "is meaningless.",
+        envs.TPU_MOE_ROUTING_REPLAY,
+        _ROUTING_REPLAY.num_layers,
+        _ROUTING_REPLAY.num_windows,
+        _ROUTING_REPLAY.positions,
+    )
+
+
 def _uniform_random_routing(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
@@ -168,6 +186,16 @@ def _route_logical(
     input_ids: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     topk = layer.moe_config.experts_per_token
+    if _ROUTING_REPLAY is not None:
+        from vllm.distributed import get_tensor_model_parallel_world_size
+
+        return _ROUTING_REPLAY.route(
+            layer,
+            hidden_states,
+            router_logits,
+            topk,
+            tp_size=get_tensor_model_parallel_world_size(),
+        )
     simulated = maybe_simulate_routing(hidden_states, router_logits, topk)
     if simulated is not None:
         return simulated
@@ -372,6 +400,12 @@ def register_experts_start_buffer(layer, *, device: torch.device) -> None:
     )
     layer.register_buffer("_experts_start", buffer, persistent=False)
     expert_placement.register_slots_buffer(layer, device=device)
+    if _ROUTING_REPLAY is not None:
+        layer.register_buffer(
+            "_routing_replay_table",
+            _ROUTING_REPLAY.table(layer, device),
+            persistent=False,
+        )
 
 
 def validate_linear_ep_placement(layer) -> None:
