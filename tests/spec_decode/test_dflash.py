@@ -1169,3 +1169,21 @@ def test_request_window_positions_clamp_padding_slots():
 
     assert window.dtype == torch.int32
     assert window.tolist() == [[10, 40, 44], [12, 44, 44]]
+
+
+def test_draft_forward_runs_without_layerwise_kv_transfer(monkeypatch):
+    """The precompiled draft forward was traced with no connector metadata
+    bound; serving proposes while the step's metadata is still bound, which
+    retraced every draft bucket mid-serving (j-99bf94da guard:
+    `_KV_CONNECTOR_AGENT._connector_metadata is None`)."""
+    from vllm.distributed.kv_transfer import kv_transfer_state
+
+    connector = SimpleNamespace(_connector_metadata="step metadata")
+    monkeypatch.setattr(kv_transfer_state, "_KV_CONNECTOR_AGENT", connector)
+    with dflash_module._without_layerwise_kv_transfer():
+        assert connector._connector_metadata is None
+    assert connector._connector_metadata == "step metadata"
+
+    monkeypatch.setattr(kv_transfer_state, "_KV_CONNECTOR_AGENT", None)
+    with dflash_module._without_layerwise_kv_transfer():
+        pass

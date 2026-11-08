@@ -3851,3 +3851,25 @@ def test_async_spec_source_rows_hold_every_chunk_split(chunk_reqs):
             for n in chunks
         )
         assert parked <= rows, (num_reqs, chunks)
+
+
+def test_precompile_runs_under_the_serving_global_state(monkeypatch):
+    """Dynamo guards each graph on grad mode and the torch thread count;
+    j-99bf94da retraced compute_selected_logits and the substitution at
+    every serving bucket because their precompile ran with grad on and
+    before the worker dropped to its serving thread count."""
+    monkeypatch.delenv("OMP_NUM_THREADS", raising=False)
+    before = torch.get_num_threads()
+    torch.set_num_threads(4)
+    try:
+        runner = SimpleNamespace(
+            check_recompilation=False, _update_num_xla_graphs=lambda name: None
+        )
+        assert torch.is_grad_enabled()
+        with TPUModelRunner._precompile_timed(runner, "x"):
+            assert not torch.is_grad_enabled()
+            assert torch.get_num_threads() == 1
+        assert torch.is_grad_enabled()
+        assert torch.get_num_threads() == 4
+    finally:
+        torch.set_num_threads(before)

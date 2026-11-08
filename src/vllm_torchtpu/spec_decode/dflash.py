@@ -59,6 +59,33 @@ logger = init_logger(__name__)
 DRAFT_KV_OVER_DCP_KEY = "draft_kv_over_dcp"
 
 
+@contextlib.contextmanager
+def _without_layerwise_kv_transfer():
+    """Run a draft forward with the KV connector's step metadata unbound.
+
+    vLLM's attention wrapper (`maybe_transfer_kv_layer`) calls the
+    connector's per-layer load/save hooks only while step metadata is bound,
+    and dynamo guards the traced draft forward on that. The precompile runs
+    with no metadata bound, but serving proposes while the step's metadata
+    still is, so every draft bucket was traced again mid-serving. The draft
+    layers take no part in layer-wise transfer (the TPU connectors' hooks
+    are no-ops), so unbinding the metadata for the draft forward keeps the
+    outputs and lets it hit the precompiled programs.
+    """
+    from vllm.distributed.kv_transfer import kv_transfer_state
+
+    connector = kv_transfer_state._KV_CONNECTOR_AGENT
+    metadata = getattr(connector, "_connector_metadata", None)
+    if metadata is None:
+        yield
+        return
+    connector._connector_metadata = None
+    try:
+        yield
+    finally:
+        connector._connector_metadata = metadata
+
+
 def _draft_has_moe_layers(draft_model: torch.nn.Module) -> bool:
     """Whether a draft carries MoE layers, i.e. emits EP collectives.
 
@@ -731,6 +758,7 @@ class DFlashProposer:
                 set_vllm_model_wrapper_context(
                     mesh=self.runner.mesh, vllm_config=self.vllm_config
                 ),
+                _without_layerwise_kv_transfer(),
             ):
                 draft_tokens_chunk, draft_aux = self._dflash_forward_and_sample(
                     input_ids, positions, block_size
@@ -978,6 +1006,7 @@ class DFlashProposer:
             set_vllm_model_wrapper_context(
                 mesh=self.runner.mesh, vllm_config=self.vllm_config
             ),
+            _without_layerwise_kv_transfer(),
         ):
             draft_tokens_chunk, _ = self._dflash_forward_and_sample(
                 input_ids, positions, block_size
