@@ -109,12 +109,11 @@ def _make_sweep(
     return mod.validate_sweep_record(rec)
 
 
-def test_arm_commands_and_env_match_candidate30_specs(monkeypatch):
+def test_arm_commands_and_env_match_candidate30_specs():
     mod = _load_harness()
-    monkeypatch.delenv(mod.REF_IMAGE_ENV, raising=False)
 
     # Image reference mode requires explicit image URI (never hardcoded in src/).
-    with pytest.raises(ValueError, match=mod.REF_IMAGE_ENV):
+    with pytest.raises(ValueError, match="requires --reference-image"):
         mod.build_arm_server_command(
             "reference", mod.CONCURRENCY_SPECS["c8"], reference_mode="image"
         )

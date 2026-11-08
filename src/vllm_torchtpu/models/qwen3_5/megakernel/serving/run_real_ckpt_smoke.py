@@ -25,20 +25,21 @@ server's log lines:
 and fails on a megakernel decline. It prints a JSON summary between
 `=== MK_REAL_CKPT_SMOKE_SUMMARY_BEGIN/END ===`.
 
-Environment: `MK_SMOKE_MODE` (`decode`, `mtp` or `both`, default `both`),
-`MK_SMOKE_CKPT` (a checkpoint directory; default: `Qwen/Qwen3.5-397B-A17B-FP8`
-from the local Hugging Face cache, `HF_HUB_CACHE`), `MK_SMOKE_MEGAKERNEL`
-(extra `VLLM_TPU_MEGAKERNEL` settings, e.g. `profile=qwen35-baseline`),
-`MK_SMOKE_PORT` (default 8123).
+Flags: `--mode` (`decode`, `mtp` or `both`, default `both`), `--ckpt` (a
+checkpoint directory; default: `Qwen/Qwen3.5-397B-A17B-FP8` from the local
+Hugging Face cache, `HF_HUB_CACHE`), `--megakernel` (extra
+`VLLM_TPU_MEGAKERNEL` settings, e.g. `profile=qwen35-baseline`), `--port`
+(default 8123).
 
-Run it from a checkout of the repository (e.g. the recipe's NFS checkout, any
-working directory): it serves that checkout's `src/` (first on `PYTHONPATH`),
-checks first that `vllm_torchtpu` resolves there and not to the image's
-installed package, and writes nothing outside `/tmp`.
+Run it from a checkout of the repository (any working directory): it serves
+that checkout's `src/` (first on `PYTHONPATH`), checks first that
+`vllm_torchtpu` resolves there and not to an installed package, and writes
+nothing outside `/tmp`.
 """
 
 from __future__ import annotations
 
+import argparse
 import ast
 import glob
 import json
@@ -81,14 +82,14 @@ def _log(msg: str) -> None:
     sys.stdout.flush()
 
 
-def _checkpoint() -> str:
-    if ckpt := os.environ.get("MK_SMOKE_CKPT"):
+def _checkpoint(ckpt: str | None) -> str:
+    if ckpt:
         return ckpt
     hub = os.environ.setdefault("HF_HUB_CACHE", "/vllm-cache/hub")
     repo_dir = f"models--{CKPT_ID.replace('/', '--')}"
     snaps = sorted(glob.glob(os.path.join(hub, repo_dir, "snapshots", "*")))
     if not snaps:
-        raise RuntimeError(f"{CKPT_ID} is not in {hub}; set MK_SMOKE_CKPT")
+        raise RuntimeError(f"{CKPT_ID} is not in {hub}; pass --ckpt")
     return snaps[-1]
 
 
@@ -140,8 +141,11 @@ def _stop(proc: subprocess.Popen[str]) -> None:
 def tree_env() -> dict[str, str]:
     """The environment that serves this tree's `vllm_torchtpu`: its `src/`
     first on `PYTHONPATH` (ahead of the image's installed package)."""
-    py_path = os.pathsep.join(p for p in (SRC_ROOT, os.environ.get("PYTHONPATH")) if p)
-    return dict(os.environ, PYTHONPATH=py_path)
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(
+        p for p in (SRC_ROOT, env.get("PYTHONPATH")) if p
+    )
+    return env
 
 
 def check_tree_is_served() -> str:
@@ -170,11 +174,12 @@ def check_tree_is_served() -> str:
     return out
 
 
-def run_mode(mode: str, ckpt: str, port: int) -> dict[str, Any]:
-    """Serve `ckpt` in `mode` and check the megakernel's log lines."""
+def run_mode(mode: str, ckpt: str, port: int, megakernel: str = "") -> dict[str, Any]:
+    """Serve `ckpt` in `mode` and check the megakernel's log lines;
+    `megakernel` adds `VLLM_TPU_MEGAKERNEL` settings."""
     mk_cfg = f"stats_period_s={STATS_PERIOD_S}"
-    if extra := os.environ.get("MK_SMOKE_MEGAKERNEL"):
-        mk_cfg = f"{extra},{mk_cfg}"
+    if megakernel:
+        mk_cfg = f"{megakernel},{mk_cfg}"
     env = dict(
         tree_env(),
         MODEL=ckpt,
@@ -251,16 +256,30 @@ def run_mode(mode: str, ckpt: str, port: int) -> dict[str, Any]:
     }
 
 
-def main() -> int:
-    mode = os.environ.get("MK_SMOKE_MODE", "both").strip().lower()
-    modes = ["decode", "mtp"] if mode == "both" else [mode]
-    if any(m not in ("decode", "mtp") for m in modes):
-        raise SystemExit(f"MK_SMOKE_MODE must be decode, mtp or both, got {mode!r}")
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p.add_argument("--mode", choices=("decode", "mtp", "both"), default="both")
+    p.add_argument(
+        "--ckpt",
+        default=None,
+        help=f"checkpoint directory (default: {CKPT_ID} from the HF hub cache)",
+    )
+    p.add_argument(
+        "--megakernel",
+        default="",
+        help="extra VLLM_TPU_MEGAKERNEL settings, e.g. profile=qwen35-baseline",
+    )
+    p.add_argument("--port", type=int, default=8123)
+    return p.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    modes = ["decode", "mtp"] if args.mode == "both" else [args.mode]
     served = check_tree_is_served()
-    ckpt = _checkpoint()
-    port = int(os.environ.get("MK_SMOKE_PORT", "8123"))
+    ckpt = _checkpoint(args.ckpt)
     _log(f"[MK_SMOKE] modes={modes} ckpt={ckpt} vllm_torchtpu={served}")
-    results = [run_mode(m, ckpt, port) for m in modes]
+    results = [run_mode(m, ckpt, args.port, args.megakernel) for m in modes]
     _log("=== MK_REAL_CKPT_SMOKE_SUMMARY_BEGIN ===")
     _log(json.dumps(results, indent=1, sort_keys=True))
     _log("=== MK_REAL_CKPT_SMOKE_SUMMARY_END ===")

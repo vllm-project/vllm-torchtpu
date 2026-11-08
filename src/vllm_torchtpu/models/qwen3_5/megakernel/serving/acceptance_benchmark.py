@@ -64,7 +64,6 @@ DEFAULT_PAIRS = 3
 DEFAULT_SYNTHETIC_ACCEPTANCE_LEN = 3.39
 DEFAULT_ACCEPTANCE_LEN_TOL = 0.04
 DEFAULT_C16_BUNCHED_THRESHOLD_PCT = 6.0
-REF_IMAGE_ENV = "MK_ACCEPTANCE_REFERENCE_IMAGE"
 GSM8K_GREEDY_SAMPLING_PARAMS: dict[str, Any] = {"temperature": 0.0}
 
 _GIB = 1024**3
@@ -325,7 +324,7 @@ def build_arm_server_command(
     """Construct server command list for Arm A (`reference`) or Arm B (`candidate`).
 
     - Arm A (`reference`, `reference_mode='image'`): runs `vllm serve` inside
-      `reference_image` (or `MK_ACCEPTANCE_REFERENCE_IMAGE`) with `candidate30`'s
+      `reference_image` with `candidate30`'s
       exact flags (`--block-size 256`, `MTP=3`, prefix caching, async scheduling,
       KV offload).
     - Arm A (`reference`, `reference_mode='stock'`): runs stock `vllm serve` on the
@@ -355,11 +354,11 @@ def build_arm_server_command(
 
     if arm == "reference":
         if reference_mode == "image":
-            img = reference_image or os.environ.get(REF_IMAGE_ENV, "").strip()
+            img = (reference_image or "").strip()
             if not img:
                 raise ValueError(
-                    "reference_mode='image' requires --reference-image or "
-                    f"{REF_IMAGE_ENV} to be set (no hardcoded registry URI in src/)."
+                    "reference_mode='image' requires --reference-image "
+                    "(no hardcoded registry URI in src/)."
                 )
             env_map = build_arm_env(
                 "reference",
@@ -1708,10 +1707,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_cmd.add_argument(
         "--reference-image",
         default=None,
-        help=(
-            "Container image URI for Arm A when --reference-mode=image "
-            f"(or set {REF_IMAGE_ENV})."
-        ),
+        help="Container image URI for Arm A when --reference-mode=image.",
     )
     p_cmd.add_argument("--plugin", default=None, help="Template plugin module path.")
     p_cmd.add_argument("--profile", default=DEFAULT_PROFILE)
