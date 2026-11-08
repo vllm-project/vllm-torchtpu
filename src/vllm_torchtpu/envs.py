@@ -148,6 +148,7 @@ if TYPE_CHECKING:
     VLLM_TPU_FOLLOW_SHARED_PREFIX: bool = False
     TPU_PREFIX_AWARE_SHORT_PROMPTS: str = "off"
     TPU_PREFIX_AWARE_HOLD_SHARED_PREFIX: bool = False
+    TPU_PREFIX_AWARE_SHORTS_TAKE_OLDEST_CHUNK: bool = False
     MLA_XPOSE_N_TILE_SIZE: int = 160
     MIXED_Q_SPLIT: int | None = None
     MIXED_NUM_QUERIES_PER_BLOCK: int | None = None
@@ -1559,6 +1560,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # admits it at once.
     "TPU_PREFIX_AWARE_HOLD_SHARED_PREFIX": env_bool(
         "TPU_PREFIX_AWARE_HOLD_SHARED_PREFIX"
+    ),
+    # PrefixAwareScheduler with short prompts first: while a short prompt
+    # waits or is in prefill, the oldest running long prefill gets only the
+    # budget short prompts leave, as later long prefills do
+    # (core/prefix_aware_scheduler.py). A tradeoff: short prompts behind
+    # other short prompts start sooner, and the oldest long prefill is slowed
+    # down while they run. Off keeps its full chunk.
+    "TPU_PREFIX_AWARE_SHORTS_TAKE_OLDEST_CHUNK": env_bool(
+        "TPU_PREFIX_AWARE_SHORTS_TAKE_OLDEST_CHUNK"
     ),
     # Tile size for MLA transpose pipeline.
     "MLA_XPOSE_N_TILE_SIZE": lambda: int(os.getenv("MLA_XPOSE_N_TILE_SIZE", "160")),

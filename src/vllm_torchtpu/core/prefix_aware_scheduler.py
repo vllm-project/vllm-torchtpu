@@ -69,6 +69,15 @@ TPU_PREFIX_AWARE_HOLD_SHARED_PREFIX set, such a prompt, short or long, waits
 until the running prefill has cached the block, and with short prompts first
 that prefill keeps its full chunk.
 
+With TPU_PREFIX_AWARE_SHORTS_TAKE_OLDEST_CHUNK set, the oldest running long
+prefill keeps its full chunk only while no short prompt waits or is in
+prefill. Short prompts that run one after another behind each other then
+share the step instead of each getting only the tokens the oldest long
+prefill leaves: short prompts' chunks first, then every running long prefill
+in admission order. A prefill a held prompt waits for still keeps its full
+chunk. With no short prompt in the system, a lone long prompt is not slowed
+down.
+
 With TPU_PREFIX_AWARE_SHORT_PROMPTS=first-short-step, a step that starts a
 short waiting prompt beside a running long prefill holds fewer tokens: short
 prompts' chunks first, then running long prefills in admission order; in such
@@ -87,6 +96,7 @@ Enable with:
     VLLM_TPU_FOLLOW_SHARED_PREFIX=1 (optional)
     TPU_PREFIX_AWARE_SHORT_PROMPTS=first or first-short-step (optional)
     TPU_PREFIX_AWARE_HOLD_SHARED_PREFIX=1 (optional)
+    TPU_PREFIX_AWARE_SHORTS_TAKE_OLDEST_CHUNK=1 (optional, with short prompts)
 """
 
 import enum
@@ -200,6 +210,14 @@ class PrefixAwareScheduler(ShortPromptsFirstScheduler):
         self._skip_short_prompts = False
         self._carriers: set[str] = set()
         self._held_last_step: set[str] = set()
+        self.shorts_take_oldest_chunk = envs.TPU_PREFIX_AWARE_SHORTS_TAKE_OLDEST_CHUNK
+        self._short_prompts_present = False
+
+        if self.shorts_take_oldest_chunk and self.short_prompt_tokens is None:
+            raise NotImplementedError(
+                "TPU_PREFIX_AWARE_SHORTS_TAKE_OLDEST_CHUNK needs short prompts "
+                "first; set TPU_PREFIX_AWARE_SHORT_PROMPTS or unset it."
+            )
 
         if self.policy != SchedulingPolicy.FCFS and (
             self.short_prompt_tokens is not None or self.hold_shared_prefix
@@ -219,7 +237,8 @@ class PrefixAwareScheduler(ShortPromptsFirstScheduler):
         logger.info(
             "PrefixAwareScheduler ACTIVE (window=%d, tier_warmth=%s, "
             "follow shared prefix: %s, short prompts first: %s; "
-            "hold shared prefix: %s; short step: %s)",
+            "hold shared prefix: %s; short step: %s; "
+            "short prompts take the oldest long chunk: %s)",
             self.WINDOW,
             self._tier_warmth,
             "on" if self.follow_shared_prefix else "off",
@@ -230,6 +249,7 @@ class PrefixAwareScheduler(ShortPromptsFirstScheduler):
             "off"
             if self.short_step_tokens is None
             else f"{self.short_step_tokens} tokens",
+            "on" if self.shorts_take_oldest_chunk else "off",
         )
 
     def _short_prompt_limit(self) -> int:
@@ -323,6 +343,9 @@ class PrefixAwareScheduler(ShortPromptsFirstScheduler):
             if self._short_step:
                 assert self.short_step_tokens is not None
                 self.max_num_scheduled_tokens = self.short_step_tokens
+            self._short_prompts_present = (
+                self.shorts_take_oldest_chunk and self._has_short_prompts()
+            )
             reserved = self._reserve_for_short_prompts()
         if reserved:
             self._running_prefill_budget = max(
@@ -337,6 +360,7 @@ class PrefixAwareScheduler(ShortPromptsFirstScheduler):
         finally:
             self.max_num_scheduled_tokens = full_step
             self._short_step = False
+            self._short_prompts_present = False
             self._running_prefill_budget = None
         # A reservation that scheduled nothing (the short prompts got no KV
         # blocks) would cap the running long prefills again next step, and a
@@ -347,6 +371,15 @@ class PrefixAwareScheduler(ShortPromptsFirstScheduler):
             bool(reserved) and output.total_num_scheduled_tokens == 0
         )
         return output
+
+    def _has_short_prompts(self) -> bool:
+        """Whether a short prompt is in prefill, or waits with a sequence slot
+        free to start it."""
+        if self._pause_state != PauseState.UNPAUSED:
+            return False
+        if any(r.is_prefill_chunk and self._is_short_prompt(r) for r in self.running):
+            return True
+        return self._free_sequence_slots() > 0 and bool(self._short_waiting_chunks())
 
     def _starts_short_step(self) -> bool:
         """Whether this step holds at most the short step's tokens: a long
@@ -455,16 +488,21 @@ class PrefixAwareScheduler(ShortPromptsFirstScheduler):
 
     def _keeps_full_chunk(self, request: Request) -> bool:
         """Whether this running long prefill keeps its full chunk beside short
-        prompts: the oldest long prefill and every prefill a held prompt waits
-        for do, except in a short step, where every long prefill gives way."""
+        prompts: every prefill a held prompt waits for does, and so does the
+        oldest long prefill unless short prompts take its chunk too. In a short
+        step every long prefill gives way."""
         if self._short_step:
+            return False
+        if request.request_id in self._carriers:
+            return True
+        if self._short_prompts_present:
             return False
         longs = (
             r
             for r in self.running
             if r.is_prefill_chunk and not self._is_short_prompt(r)
         )
-        return request is next(longs, None) or request.request_id in self._carriers
+        return request is next(longs, None)
 
     def _full_chunk_tokens(self) -> int:
         return sum(
@@ -478,8 +516,9 @@ class PrefixAwareScheduler(ShortPromptsFirstScheduler):
     def _reserve_for_short_prompts(self) -> int:
         """Tokens this step keeps for short prompts' chunks while a longer
         prefill is running, or 0 when no running prefill is longer. The oldest
-        running long prefill keeps its full chunk, so short prompts take budget
-        only from the long prefills admitted after it."""
+        running long prefill keeps its full chunk, unless short prompts take
+        it too (TPU_PREFIX_AWARE_SHORTS_TAKE_OLDEST_CHUNK), so short prompts
+        take budget only from the long prefills that do not keep theirs."""
         if self._pause_state != PauseState.UNPAUSED:
             return 0
         prefills = [r for r in self.running if r.is_prefill_chunk]
