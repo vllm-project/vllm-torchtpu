@@ -49,11 +49,12 @@ def ragged_a2a_enabled() -> bool:
     return envs.TPU_MOE_RAGGED_A2A
 
 
-def get_dp_tp_mesh():
+def get_dp_tp_mesh(knob: str = "TPU_MOE_RAGGED_A2A"):
     """A (dp, tp) mesh over the torch.distributed world, partition = rank.
 
     The exchange assumes vLLM's layout: global rank ``dp_rank * tp + tp_rank``
-    and EP rank equal to the global rank. Checked here, outside any trace.
+    and EP rank equal to the global rank. Checked here, outside any trace;
+    ``knob`` names the switch a refusal reports.
     """
     global _MESH
     if _MESH is not None:
@@ -82,9 +83,7 @@ def get_dp_tp_mesh():
     }
     bad = {k: v for k, v in expected.items() if v[0] != v[1]}
     if bad:
-        raise NotImplementedError(
-            f"TPU_MOE_RAGGED_A2A needs a rank-aligned DP x TP layout: {bad}"
-        )
+        raise NotImplementedError(f"{knob} needs a rank-aligned DP x TP layout: {bad}")
     _MESH = get_pallas_mesh(
         axis_names=(DP_AXIS, TP_AXIS), mesh_shape=(dp_size, tp_size)
     )

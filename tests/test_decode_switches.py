@@ -29,6 +29,8 @@ NEW_LINE = {
     "TPU_DECODE_FAST_PATHS": "1",
     "TPU_LM_HEAD_HIDDEN_MAJOR": "1",
     "TPU_ROPE_CACHE_ROW_MAJOR": "1",
+    "TPU_EMBED_EP_SHARD": "1",
+    "TPU_TP4_HIER_ALL_REDUCE": "1",
 }
 ALL_PATHS = {p.name for p in ds.PATHS}
 EXCHANGE_OF_THE_NEW_LINE = {
@@ -46,7 +48,7 @@ EXCHANGE_OF_THE_NEW_LINE = {
 
 def test_the_path_table_names_are_short_lowercase_and_unique():
     names = [p.name for p in ds.PATHS]
-    assert len(names) == len(set(names)) == 11
+    assert len(names) == len(set(names)) == 12
     assert all(n == n.lower() and " " not in n and len(n) <= 20 for n in names)
 
 
@@ -79,6 +81,7 @@ def test_the_launch_line_turns_every_path_on():
         ({"TPU_BATCHED_RPA_VERIFY_BLOCK": "window"}, {"draft_one_query"}),
         ({"TPU_BATCHED_RPA_VERIFY_BLOCK": "4096,4,2"}, {"draft_one_query"}),
         ({"TPU_BATCHED_RPA_DECODE_BLOCK": "8192,4,2"}, set()),
+        ({"TPU_EMBED_EP_SHARD": "1"}, {"embed_rows"}),
         ({"TPU_DECODE_FAST_PATHS": "1"}, {"xla_schedule"}),
         ({"TPU_DECODE_FAST_PATHS": "0"}, set()),
     ],

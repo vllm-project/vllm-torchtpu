@@ -26,7 +26,8 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-# Barrier semaphore of this kernel: the expert kernels use 1 and 2.
+# Barrier semaphore of this kernel: the TP all-reduce kernel uses 0 and the
+# expert kernels 1 and 2.
 _COLLECTIVE_ID = 6
 
 

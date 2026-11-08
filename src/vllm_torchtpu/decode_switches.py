@@ -29,11 +29,16 @@ from vllm_torchtpu import envs
 
 RAGGED_A2A = "TPU_MOE_RAGGED_A2A"
 VERIFY_BLOCK = "TPU_BATCHED_RPA_VERIFY_BLOCK"
+EMBED_EP_SHARD = "TPU_EMBED_EP_SHARD"
 FAST_PATHS = "TPU_DECODE_FAST_PATHS"
 FAST_PATHS_OFF = "TPU_DECODE_FAST_PATHS_OFF"
 
 # Rows per capacity tile of the ragged exchange.
 A2A_ROW_TILE = 32
+# Column blocks per quarter of the hierarchical TP4 all-reduce.
+TP4_ALL_REDUCE_BLOCKS = 4
+# Partials of more rows than this reduce through XLA in that all-reduce.
+TP4_ALL_REDUCE_MAX_ROWS = 256
 
 # Attributes of a routed-experts layer that carry the owner-combine decision.
 OWNER_FACTS_ATTR = "_tpu_owner_combine_facts"
@@ -106,6 +111,11 @@ PATHS: tuple[Path, ...] = (
         "draft_one_query",
         VERIFY_BLOCK,
         "draft passes of one query per sequence run the one-query decode kernel",
+    ),
+    Path(
+        "embed_rows",
+        EMBED_EP_SHARD,
+        "each rank sends only the embedding rows it owns to their engines",
     ),
     Path(
         "xla_schedule",
