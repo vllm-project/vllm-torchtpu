@@ -716,6 +716,129 @@ class TestNvfp4MoEMethod:
             assert torch.equal(out, torch.ones(4, 64))
             mock_pipe.assert_called_once()
 
+    @pytest.mark.parametrize("skip_padded", [False, True])
+    def test_apply_monolithic_ragged_a2a_drops_padded_routes(
+        self, monkeypatch, skip_padded
+    ):
+        """With TPU_MOE_SKIP_PADDED_TOKENS the ragged all-to-all op gets this
+        rank's padded rows routed nowhere (id -1, weight 0), from the local
+        mask; without it the routing passes unchanged."""
+        from vllm_torchtpu.layers.adapter import token_padding
+
+        monkeypatch.setenv("TPU_MOE_SKIP_PADDED_TOKENS", "1" if skip_padded else "0")
+        layer = FakeRoutedExperts()
+        layer._experts_start = torch.zeros(4)
+        layer.w13_weight = torch.empty(0)
+        layer.w2_weight = torch.empty(0)
+        layer.w13_weight_scale = torch.empty(0)
+        layer.w2_weight_scale = torch.empty(0)
+        topk_weights = torch.full((4, 2), 0.5)
+        topk_ids = torch.tensor([[0, 1], [1, 2], [2, 3], [3, 0]], dtype=torch.int32)
+        method = VllmNvfp4MoEMethod(MagicMock(group_size=16), layer.moe_config)
+        method._tpu_activation_str = "silu"
+        state = token_padding.TokenPaddingState(
+            local_padding_mask=torch.zeros(8, dtype=torch.bool)
+        )
+        state.update(2, 4)
+        token_padding.set_padding_state(state)
+
+        def no_gather():
+            raise AssertionError("local routing needs no DP gather")
+
+        try:
+            with (
+                patch(
+                    "vllm_torchtpu.layers.adapter.quantization.nvfp4.moe_routing.route",
+                    return_value=(topk_weights, topk_ids),
+                ),
+                patch(
+                    "vllm_torchtpu.layers.adapter.quantization.nvfp4.ragged_a2a_enabled",
+                    return_value=True,
+                ),
+                patch(
+                    "vllm_torchtpu.layers.adapter.quantization.nvfp4.ragged_a2a_fused_moe_gmm"
+                ) as mock_a2a,
+                patch(
+                    "vllm.distributed.parallel_state.get_dp_group",
+                    side_effect=no_gather,
+                ),
+            ):
+                mock_a2a.return_value = torch.ones(4, 64)
+                method.apply_monolithic(layer, torch.randn(4, 64), torch.randn(4, 4))
+        finally:
+            token_padding.set_padding_state(None)
+        kwargs = mock_a2a.call_args.kwargs
+        if not skip_padded:
+            assert torch.equal(kwargs["topk_ids"], topk_ids)
+            assert torch.equal(kwargs["topk_weights"], topk_weights)
+            return
+        assert kwargs["topk_ids"].tolist() == [[0, 1], [1, 2], [-1, -1], [-1, -1]]
+        assert kwargs["topk_weights"].tolist() == [[0.5, 0.5]] * 2 + [[0.0, 0.0]] * 2
+
+    def test_excluded_moe_drops_padded_routes_of_gathered_rows(self, monkeypatch):
+        """An excluded (unquantized) MoE layer on the all-gather EP path routes
+        the DP group's gathered rows: their padded rows come from every DP
+        rank's mask, in rank order."""
+        from vllm_torchtpu.layers.adapter import token_padding
+
+        monkeypatch.setenv("TPU_MOE_SKIP_PADDED_TOKENS", "1")
+        layer = FakeRoutedExperts()
+        layer._experts_start = torch.zeros(4)
+        layer.w13_weight = torch.empty(0)
+        layer.w2_weight = torch.empty(0)
+        topk_weights = torch.full((4, 2), 0.5)
+        topk_ids = torch.tensor([[0, 1], [1, 2], [2, 3], [3, 0]], dtype=torch.int32)
+        method = VllmUnquantizedFusedMoEMethod.__new__(VllmUnquantizedFusedMoEMethod)
+        method._tpu_activation_str = "silu"
+        state = token_padding.TokenPaddingState(
+            local_padding_mask=torch.zeros(4, dtype=torch.bool)
+        )
+        state.update(1, 2)
+        token_padding.set_padding_state(state)
+
+        class _FakeGroup:
+            world_size = 2
+
+            @staticmethod
+            def all_gather(t, dim=0):
+                # The other DP rank's rows: [padded, valid].
+                return torch.cat([t, torch.tensor([1, 0], dtype=t.dtype)], dim=dim)
+
+        try:
+            with (
+                patch(
+                    "vllm_torchtpu.layers.adapter.quantization.unquantized.moe_routing.route",
+                    return_value=(topk_weights, topk_ids),
+                ),
+                patch(
+                    "vllm_torchtpu.layers.adapter.quantization.unquantized.enable_pipelined_collective_and_compute",
+                    return_value=False,
+                ),
+                patch(
+                    "vllm_torchtpu.layers.adapter.quantization.unquantized.fused_moe_gmm"
+                ) as mock_gmm,
+                patch(
+                    "vllm.distributed.parallel_state.get_dp_group",
+                    return_value=_FakeGroup(),
+                ),
+            ):
+                mock_gmm.return_value = torch.ones(4, 64)
+                method._forward_monolithic_tpu(
+                    layer, torch.randn(4, 64), torch.randn(4, 4)
+                )
+        finally:
+            token_padding.set_padding_state(None)
+        kwargs = mock_gmm.call_args.kwargs
+        # The rows are routed nowhere; the kernel does not also skip by weight.
+        assert kwargs["skip_padded_tokens"] is False
+        assert kwargs["topk_ids"].tolist() == [[0, 1], [-1, -1], [-1, -1], [3, 0]]
+        assert kwargs["topk_weights"].tolist() == [
+            [0.5, 0.5],
+            [0.0, 0.0],
+            [0.0, 0.0],
+            [0.5, 0.5],
+        ]
+
 
 class TestNvfp4DummyInitialization:
     @staticmethod

@@ -2341,6 +2341,63 @@ def _forward_draft_harness(monkeypatch):
     return proposer, run
 
 
+def test_forward_draft_marks_padded_rows_before_the_draft_runs(monkeypatch):
+    """With a token padding state, every draft forward first writes its padding
+    mask: rows from num_valid_tokens on (all rows when it is not given, or in a
+    chunk whose sequence layout is not the default one)."""
+    import vllm_torchtpu.spec_decode.eagle3 as e3
+
+    proposer = _make_proposer(draft_tp=1, method="mtp")
+    proposer.draft_vllm_config = object()
+    log = []
+    proposer.runner = SimpleNamespace(
+        mesh=object(),
+        _dp_num_tokens_across_dp=lambda n: n,
+        _token_padding_state=object(),
+        _token_padding_update=lambda padded, valid: log.append((padded, valid)),
+    )
+    proposer._build_draft_attn_metadata = lambda **_kwargs: {}
+
+    class _Draft:
+        def __call__(self, **kwargs):
+            log.append("draft")
+            return kwargs["hidden_states"]
+
+    proposer.draft_model = _Draft()
+
+    def null(*_args, **_kwargs):
+        return contextlib.nullcontext()
+
+    monkeypatch.setattr(e3, "set_model_tag", null)
+    monkeypatch.setattr(e3, "set_forward_context", null)
+    monkeypatch.setattr(e3, "set_vllm_model_wrapper_context", null)
+    default = SimpleNamespace(
+        sequence_layout_plan=SimpleNamespace(
+            descriptor=DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR
+        )
+    )
+    pcp = SimpleNamespace(
+        sequence_layout_plan=SimpleNamespace(
+            descriptor=SequenceLayoutDescriptor(
+                kind=SequenceLayoutKind.PARTIAL,
+                protocol=PCP_STREAMING_SEQUENCE_LAYOUT_PROTOCOL,
+            )
+        )
+    )
+    for chunk, valid in ((default, 3), (default, None), (pcp, 3), (default, 0)):
+        proposer._forward_draft(
+            chunk=chunk,
+            input_ids=torch.zeros(8, dtype=torch.int32),
+            positions=torch.zeros(8, dtype=torch.int32),
+            target_hidden_states=torch.zeros((8, 2)),
+            step_idx=0,
+            seq_lens_delta=0,
+            num_rejected_np=None,
+            num_valid_tokens=valid,
+        )
+    assert log == [(8, 3), "draft", (8, 8), "draft", (8, 8), "draft", (8, 0), "draft"]
+
+
 def test_forward_draft_without_index_share_runs_the_draft_at_every_step(monkeypatch):
     """Every other drafter keeps exactly one compiled program: no second
     program is consulted and skip_topk is never touched."""

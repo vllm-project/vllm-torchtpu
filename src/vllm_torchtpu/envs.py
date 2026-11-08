@@ -107,6 +107,16 @@ if TYPE_CHECKING:
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
+    TPU_MOE_RAGGED_A2A: bool = False
+    TPU_MOE_A2A_CAPACITY: float = 2.5
+    TPU_MOE_A2A_UNQUANTIZED: bool = False
+    TPU_MOE_A2A_ROUTE_CAPACITY: float = 3.0
+    TPU_MOE_A2A_ROW_TILE: int = 16
+    TPU_MOE_A2A_ROW_GATHER: bool = False
+    TPU_MOE_A2A_ROW_SCATTER: bool = False
+    TPU_MOE_A2A_STREAMED_COMBINE: bool = False
+    TPU_MOE_A2A_OWNER_COMBINE: bool = False
+    TPU_MOE_A2A_SORTED_PLAN: bool = False
     PCP_FA_KERNEL_BLOCK_SIZE: int | None = None
     PCP_GDN_COMM_CHUNK_SIZE: int | None = None
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
@@ -794,6 +804,49 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_COLLECTION_CHUNK_SIZE": lambda: int(
         os.getenv("TPU_MOE_COLLECTION_CHUNK_SIZE") or "0"
     ),
+    # Grouped-matmul MoE under DP + EP: exchange tokens with a ragged
+    # all-to-all inside each DP group (each token once to each member hosting
+    # one of its experts) instead of an all-gather and a reduce-scatter.
+    "TPU_MOE_RAGGED_A2A": env_bool("TPU_MOE_RAGGED_A2A"),
+    # With TPU_MOE_RAGGED_A2A, unquantized (bf16) MoE layers, such as an MTP
+    # draft layer, exchange their tokens the same way instead of with the
+    # all-gather and reduce-scatter (their experts run the two-kernel path).
+    "TPU_MOE_A2A_UNQUANTIZED": env_bool("TPU_MOE_A2A_UNQUANTIZED"),
+    # Ragged all-to-all exchange: size the per-rank token rows and local routes
+    # at this many times their uniform-routing mean (exact: a step that does
+    # not fit runs the full-size exchange). 0 = always full size.
+    "TPU_MOE_A2A_CAPACITY": env_float("TPU_MOE_A2A_CAPACITY", 2.5),
+    # The local routes' factor (0 = TPU_MOE_A2A_CAPACITY): real routing skews
+    # routes more than rows. Both factors are capped at 2 where the full-size
+    # exchange stays on the one-hot path (its rerun is cheap there).
+    "TPU_MOE_A2A_ROUTE_CAPACITY": env_float("TPU_MOE_A2A_ROUTE_CAPACITY", 3.0),
+    # Ragged all-to-all exchange: the capacity rows grow in tiles of this many
+    # rows (16 or 32; at 32 ranks and 96 tokens per engine, x2 gives 432 rows
+    # in 16-row tiles and 448 in 32-row tiles, whose relayouts cost less).
+    "TPU_MOE_A2A_ROW_TILE": lambda: int(os.getenv("TPU_MOE_A2A_ROW_TILE", "16")),
+    # Ragged all-to-all exchange with TPU_MOE_A2A_SORTED_PLAN: the expert side
+    # copies its routes' token rows out of the receive buffer with a row-DMA
+    # kernel instead of a one-hot matmul permute (same rows, bitwise), and the
+    # receive buffer is not zero-filled.
+    "TPU_MOE_A2A_ROW_GATHER": env_bool("TPU_MOE_A2A_ROW_GATHER"),
+    # Ragged all-to-all exchange with TPU_MOE_A2A_SORTED_PLAN: the send buffer
+    # is written by a kernel that relayouts the tokens once and copies their
+    # rows in VMEM instead of an XLA gather and relayout (same rows, bitwise).
+    "TPU_MOE_A2A_ROW_SCATTER": env_bool("TPU_MOE_A2A_ROW_SCATTER"),
+    # Ragged all-to-all exchange: the fused expert kernel sends each expert
+    # output row to the rank that sent its token while later experts compute,
+    # and that rank sums them, instead of a combine and a second exchange.
+    "TPU_MOE_A2A_STREAMED_COMBINE": env_bool("TPU_MOE_A2A_STREAMED_COMBINE"),
+    # Ragged all-to-all exchange: the expert kernel sends each output row to the
+    # TP rank of the token's engine that owns the token, with the shared
+    # expert's partials; the owner sums them and the engine all-gathers, so the
+    # MoE output needs no TP all-reduce.
+    "TPU_MOE_A2A_OWNER_COMBINE": env_bool("TPU_MOE_A2A_OWNER_COMBINE"),
+    # Ragged all-to-all exchange with the streamed or owner combine: the expert
+    # side orders its local routes with one sort over the DP group's gathered
+    # routing, carrying each route's destination, instead of reading,
+    # sorting and looking up the received rows' routes.
+    "TPU_MOE_A2A_SORTED_PLAN": env_bool("TPU_MOE_A2A_SORTED_PLAN"),
     # Override the PCP full-attention kernel page without changing KV manager pages.
     "PCP_FA_KERNEL_BLOCK_SIZE": env_positive_int_or_none("PCP_FA_KERNEL_BLOCK_SIZE"),
     # GDN stage/projection budget; token ownership still follows PCP interleave.
