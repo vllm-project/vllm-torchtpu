@@ -168,6 +168,7 @@ def _make_precompile_proposer(
         )
     )
     proposer.runner = SimpleNamespace(
+        device=torch.device("cpu"),
         num_reqs_max_model_len=num_reqs_max_model_len,
         num_reqs_most_model_len=None,
         most_model_len=None,
@@ -182,6 +183,9 @@ def _make_precompile_proposer(
     )
     proposer._dummy_precompute_and_update_kv_cache = mock.MagicMock()
     proposer._dummy_draft_forward = mock.MagicMock()
+    proposer._tpu_request_window_positions = mock.MagicMock(
+        side_effect=lambda qsl, pos: torch.zeros((2, qsl.shape[0] - 1))
+    )
     return proposer
 
 
@@ -1013,20 +1017,20 @@ def test_compiled_input_builders_compile_no_program_per_request_count(device, bu
     # rows verify windows of 1 + K tokens; query_start_loc and positions.
     qsl = torch.arange(0, (rows + 1) * (1 + K), 1 + K, dtype=torch.int32).to(device)
     pos = torch.arange(rows * (1 + K), dtype=torch.int32).to(device)
+    window = proposer._tpu_request_window_positions(qsl, pos)
 
     def run(num_reqs: int):
         nr = torch.tensor(num_reqs, dtype=torch.int32).to(device)
         if builder == "seed":
             seed = torch.ones(rows, dtype=torch.int32).to(device)
             return proposer._tpu_build_dflash_inputs_seed(
-                seed, qsl, pos, nr, block, padded_len, 7777
+                seed, window, nr, block, padded_len, 7777
             )
         next_tokens = torch.ones(rows, K + 1, dtype=torch.int32).to(device)
         draft_lengths = torch.full((rows,), K, dtype=torch.int32).to(device)
         return proposer._tpu_build_dflash_inputs_next_tokens(
             next_tokens,
-            qsl,
-            pos,
+            window,
             draft_lengths,
             nr,
             block,
@@ -1045,3 +1049,160 @@ def test_compiled_input_builders_compile_no_program_per_request_count(device, bu
     assert programs() == before, (
         f"{builder} builder compiled a program per request count"
     )
+
+
+def test_drafter_input_programs_see_only_warmed_shapes():
+    """For any request count next to a prefill chunk in any token bucket, the
+    drafter-input programs see only shapes the warmup produced: the window
+    gather is keyed on the token bucket and warmed at every one by
+    precompile, and the builders are keyed on request buckets alone, which
+    the spec-decode warmup grid visits once each. Before, the builders took
+    the token-axis positions and compiled mid-serving whenever a step paired
+    a long prefill chunk with a request count the grid never ran at that
+    token bucket (j-69535209: `_layout_draft_block` clamp programs)."""
+    from vllm_torchtpu.runner.tpu_runner import (
+        MIN_NUM_SEQS,
+        TPUModelRunner,
+        _get_padded_num_reqs_with_upper_limit,
+        _get_padded_token_len,
+    )
+
+    K, max_seqs = 7, 48
+    pads = [4, 8, 16, 24, 32, 48, 64, 96, 128, 256, 384, 512, 1024, 2048, 3072]
+    pads += [4096, 8192]
+    proposer = _make_proposer(draft_tp=1)
+    proposer.speculative_config.num_speculative_tokens = K
+    block = proposer.block_size
+    proposer.runner = SimpleNamespace(
+        device=torch.device("cpu"),
+        num_tokens_paddings=pads,
+        max_num_reqs=max(max_seqs, MIN_NUM_SEQS),
+        num_reqs_max_model_len=max_seqs,
+        num_reqs_most_model_len=None,
+        most_model_len=None,
+        _dp_lockstep_enabled=lambda: False,
+    )
+    window_keys: set = set()
+    builder_keys: set = set()
+
+    def shape_key(*args):
+        return tuple(tuple(a.shape) if isinstance(a, torch.Tensor) else a for a in args)
+
+    def record_window(qsl, positions):
+        window_keys.add(shape_key(qsl, positions))
+        return torch.zeros((2, qsl.shape[0] - 1), dtype=torch.int32)
+
+    def record_builder(name, padded_len_arg):
+        def builder(*args):
+            builder_keys.add((name, shape_key(*args)))
+            padded_len = args[padded_len_arg]
+            out = torch.zeros(padded_len, dtype=torch.int32)
+            return out, out, torch.zeros(padded_len // block, dtype=torch.int32)
+
+        return builder
+
+    proposer._tpu_request_window_positions = record_window
+    proposer._tpu_build_dflash_inputs_next_tokens = record_builder("next_tokens", 5)
+    proposer._tpu_build_dflash_inputs_seed = record_builder("seed", 4)
+
+    def step(num_reqs: int, num_tokens: int) -> None:
+        rows = _get_padded_num_reqs_with_upper_limit(num_reqs, max(max_seqs, 8))
+        qsl = np.zeros(max_seqs + 1, dtype=np.int32)
+        chunk = _make_chunk(
+            num_reqs=num_reqs,
+            start_index=0,
+            device=torch.device("cpu"),
+            query_start_loc_np=qsl,
+            position_ids=torch.zeros(num_tokens, dtype=torch.int32),
+            aux_hidden_states=[],
+        )
+        chunk.draft_lengths = torch.zeros(rows, dtype=torch.int32)
+        proposer._prepare_dflash_inputs(
+            chunk, next_tokens_device=torch.zeros((rows, K + 1), dtype=torch.int32)
+        )
+        proposer._prepare_dflash_inputs(
+            chunk, device_seed=torch.zeros(rows, dtype=torch.int32)
+        )
+
+    def bucket(n: int) -> int:
+        return _get_padded_token_len(pads, n)
+
+    # Warmup: precompile, then the real warmup's grid of decode and
+    # verify+prefill steps.
+    proposer._precompile_request_window_positions()
+    grid_runner = SimpleNamespace(
+        speculative_config=SimpleNamespace(num_speculative_tokens=K),
+        drafter=SimpleNamespace(block_size=block),
+        scheduler_config=SimpleNamespace(max_num_seqs=max_seqs),
+        max_num_reqs=max(max_seqs, MIN_NUM_SEQS),
+        max_num_tokens=pads[-1],
+        num_tokens_paddings=pads,
+    )
+    grid = TPUModelRunner._spec_warmup_bucket_grid(grid_runner, mixed=True)
+    window_warmed = set(window_keys)
+    for R in grid:
+        step(R, bucket(R * (1 + K)))
+        if max_seqs > R:
+            step(R + 1, bucket(R * (1 + K) + 1))
+    builder_warmed = set(builder_keys)
+    assert window_keys == window_warmed  # the grid's steps add no window shape
+
+    # Serving: counts the grid skips, next to a prefill chunk in every bucket.
+    counts = [11, 15, *range(20, 32), 34, 35, *range(38, 49)]
+    for num_reqs in counts:
+        for num_tokens in pads:
+            if num_tokens >= num_reqs:
+                step(num_reqs, num_tokens)
+    assert window_keys == window_warmed
+    assert builder_keys == builder_warmed
+
+
+def test_request_window_positions_clamp_padding_slots():
+    """Live slots read their first and last query-token positions; a padding
+    slot repeats the chunk's token total, here equal to the token bucket, and
+    must stay in range."""
+    window_fn = torch._dynamo.disable(DFlashProposer._tpu_request_window_positions)
+    qsl = torch.tensor([0, 3, 8, 8], dtype=torch.int32)
+    positions = torch.tensor([10, 11, 12, 40, 41, 42, 43, 44], dtype=torch.int32)
+
+    window = window_fn(None, qsl, positions)
+
+    assert window.dtype == torch.int32
+    assert window.tolist() == [[10, 40, 44], [12, 44, 44]]
+
+
+@pytest.mark.parametrize("skip_draft_kv", [True, False])
+def test_draft_forward_unbinds_connector_metadata_only_with_skip_draft_kv(
+    monkeypatch, skip_draft_kv
+):
+    """The precompiled draft forward was traced with no connector metadata
+    bound; serving proposes while the step's metadata is still bound, which
+    retraced every draft bucket mid-serving (j-99bf94da guard:
+    `_KV_CONNECTOR_AGENT._connector_metadata is None`). Unbinding is only
+    output-neutral when the connector keeps the draft K/V out of its store;
+    otherwise the draft layers keep their load/save hooks."""
+    from vllm.distributed.kv_transfer import kv_transfer_state
+
+    connector = SimpleNamespace(
+        _connector_metadata="step metadata", _skip_draft_kv=skip_draft_kv
+    )
+    monkeypatch.setattr(kv_transfer_state, "_KV_CONNECTOR_AGENT", connector)
+    with dflash_module._without_layerwise_kv_transfer():
+        inside = connector._connector_metadata
+    assert inside == (None if skip_draft_kv else "step metadata")
+    assert connector._connector_metadata == "step metadata"
+
+
+def test_draft_forward_keeps_metadata_of_a_connector_without_skip_draft_kv(
+    monkeypatch,
+):
+    from vllm.distributed.kv_transfer import kv_transfer_state
+
+    connector = SimpleNamespace(_connector_metadata="step metadata")
+    monkeypatch.setattr(kv_transfer_state, "_KV_CONNECTOR_AGENT", connector)
+    with dflash_module._without_layerwise_kv_transfer():
+        assert connector._connector_metadata == "step metadata"
+
+    monkeypatch.setattr(kv_transfer_state, "_KV_CONNECTOR_AGENT", None)
+    with dflash_module._without_layerwise_kv_transfer():
+        pass
