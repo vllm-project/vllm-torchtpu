@@ -57,13 +57,14 @@ from vllm_torchtpu.models.minimax_m3.kernels import (
 
 _NEG_INF = float("-inf")
 
-# Up to this many tokens an 8-token verify group fills an attention tile alone
+# Up to this many tokens (`msa_attention.SMALL_BATCH_TOKENS` is the non-DCP
+# limit) an 8-token verify group fills an attention tile alone
 # (no padding rows, half the page union of a 16-token tile). Larger decode
 # batches keep 16-token tiles: at 48-64 tiles of 8 the per-tile work list and
 # kernel steps cost more than the smaller unions save (c48 b39 decode twin
 # 108.4 -> 116.7 ms per step, c64 DCP8 b57 147.8 -> 191.1 ms; j-82660a13 vs
 # j-8a29ceb0, j-c0fd0e40 vs j-11d1908c).
-SMALL_BATCH_TOKENS = 128
+DCP_SMALL_BATCH_TOKENS = 128
 
 
 def rank_array(rank: int | jax.Array) -> jax.Array:
@@ -437,7 +438,7 @@ def msa_attend_dcp(
         sm_scale=sm_scale,
         block_q=(
             msa_attention.SMALL_BATCH_BLOCK_Q
-            if num_tokens <= SMALL_BATCH_TOKENS
+            if num_tokens <= DCP_SMALL_BATCH_TOKENS
             else msa_attention.DEFAULT_BLOCK_Q
         ),
         pages_per_step=msa_attention.DEFAULT_PAGES_PER_STEP,

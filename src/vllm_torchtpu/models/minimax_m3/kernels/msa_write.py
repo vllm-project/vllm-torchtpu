@@ -134,7 +134,8 @@ def _kernel_by_token(
         o_ref[...] = page_ref[...]
 
 
-# Batches of at most this many tokens (decode, MTP verify) write token by token
+# Steps of at most this many tokens (decode, MTP verify, small prefill chunks)
+# write token by token, rows and 4-bit scale pages alike
 # (`_kernel_by_token`): gathering max_runs x page_size rows per layer cost
 # 6 us per layer for 8 tokens in the b1 decode twin (j-3847708e), whatever
 # their width, and 0.12-0.17 ms per layer for the 312-456-token decode

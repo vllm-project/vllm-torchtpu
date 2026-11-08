@@ -204,15 +204,17 @@ def test_slot_scales_match_xla_scatter(
     np.testing.assert_array_equal(np.asarray(got), np.asarray(expected))
 
 
-def test_slot_scales_lower_for_tpu():
-    tokens = 384
+@pytest.mark.parametrize("rows,num_values", [(8, 2), (16, 16)])
+def test_slot_scales_lower_for_tpu(rows, num_values):
+    """Up to the largest batch the kernel takes, with 8 KV heads per rank."""
+    tokens = msa_write._BY_TOKEN_MAX_TOKENS
     args = (
-        jax.ShapeDtypeStruct((4096, 8, PAGE), jnp.float32),
-        jax.ShapeDtypeStruct((tokens, 2), jnp.float32),
+        jax.ShapeDtypeStruct((4096, rows, PAGE), jnp.float32),
+        jax.ShapeDtypeStruct((tokens, num_values), jnp.float32),
         jax.ShapeDtypeStruct((tokens,), jnp.int32),
         jax.ShapeDtypeStruct((tokens,), jnp.int32),
     )
-    write = functools.partial(msa_write.write_slot_scales, max_runs=99)
+    write = functools.partial(msa_write.write_slot_scales, max_runs=130)
     tpu7x = AbstractMesh((), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu"))
     with use_abstract_mesh(tpu7x):
         lowered = jax.jit(write).trace(*args).lower(lowering_platforms=("tpu",))
