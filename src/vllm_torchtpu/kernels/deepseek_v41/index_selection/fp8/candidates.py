@@ -133,17 +133,16 @@ def prepare_candidate_metadata(
     if jax.default_backend() == "tpu":
         info = pltpu.get_tpu_info()
         if info.sparse_core is not None and count % info.num_lanes == 0:
-            words = _metadata_scratch_words(
-                2,
-                count,
-                pl.cdiv(width, block),
-                pages.shape[1],
-                offsets=offsets.size,
-                requests=requests.size,
-            )
             direct = (
-                words * jnp.dtype(jnp.int32).itemsize
-                <= info.sparse_core.vmem_capacity_bytes // 2
+                _metadata_histogram_blocks(
+                    2,
+                    count,
+                    pl.cdiv(width, block),
+                    pages.shape[1],
+                    offsets=offsets.size,
+                    requests=requests.size,
+                )
+                > 0
             )
     if direct:
         candidate_block_ids, physical_block_ids, counts = canonical_candidate_blocks(
@@ -252,6 +251,41 @@ def _metadata_scratch_words(
     )
 
 
+# Each histogram window rescans the row's candidate IDs; past this many the
+# XLA reference is the better fallback.
+_MAX_HISTOGRAM_WINDOWS = 8
+
+
+def _metadata_histogram_blocks(
+    queries: int,
+    per_query: int,
+    blocks: int,
+    table_columns: int,
+    *,
+    offsets: int = 0,
+    requests: int = 0,
+) -> int:
+    """Presence-histogram window, in blocks, within half of subcore VMEM.
+
+    A 512K score width holds 64K blocks of 8 records, whose per-query
+    histograms exceed the budget; the kernel then walks the block range in
+    equal lane-aligned windows. Returns 0 when no window count fits.
+    """
+    info = pltpu.get_tpu_info()
+    assert info.sparse_core is not None
+    alignment = info.num_lanes
+    budget = info.sparse_core.vmem_capacity_bytes // 2 // jnp.dtype(jnp.int32).itemsize
+    fixed = _metadata_scratch_words(
+        queries, per_query, 0, table_columns, offsets=offsets, requests=requests
+    )
+    full = pl.cdiv(blocks, alignment) * alignment
+    window = min(full, (budget - fixed) // queries // alignment * alignment)
+    if window <= 0 or pl.cdiv(full, window) > _MAX_HISTOGRAM_WINDOWS:
+        return 0
+    # Equal windows, so the last is not left nearly empty.
+    return pl.cdiv(pl.cdiv(full, pl.cdiv(full, window)), alignment) * alignment
+
+
 def canonical_candidate_blocks(
     candidates: jax.Array,
     table: jax.Array,
@@ -293,9 +327,8 @@ def canonical_candidate_blocks(
     count = queries * per_query
     # Keep half of subcore VMEM free for compiler temporaries and alignment.
     info = pltpu.get_tpu_info().sparse_core if jax.default_backend() == "tpu" else None
-    fits = (
-        info is not None
-        and _metadata_scratch_words(
+    window = (
+        _metadata_histogram_blocks(
             queries,
             per_query,
             blocks,
@@ -303,10 +336,10 @@ def canonical_candidate_blocks(
             offsets=offsets.size if direct else 0,
             requests=requests.size if requests is not None else 0,
         )
-        * jnp.dtype(jnp.int32).itemsize
-        <= info.vmem_capacity_bytes // 2
+        if info is not None
+        else 0
     )
-    if not fits:
+    if not window:
         if direct:
             raise ValueError("Direct candidate metadata exceeds its TPU scratch budget")
         return _canonical_candidate_blocks_ref(
@@ -318,6 +351,7 @@ def canonical_candidate_blocks(
     alignment = pltpu.get_tpu_info().num_lanes
     columns = pl.cdiv(count, alignment) * alignment
     histogram_width = pl.cdiv(blocks, alignment) * alignment
+    windows = pl.cdiv(histogram_width, window)
     if not direct:
         candidates = jnp.pad(
             candidates.reshape(rows, count),
@@ -354,7 +388,7 @@ def canonical_candidate_blocks(
             jax.ShapeDtypeStruct((rows, alignment), jnp.int32),
         ),
         scratch_types=(
-            pltpu.VMEM((queries * histogram_width,), jnp.int32),
+            pltpu.VMEM((queries * window,), jnp.int32),
             pltpu.VMEM((columns + lanes,), jnp.int32),
             pltpu.VMEM((table.shape[1],), jnp.int32),
             pltpu.VMEM((columns + lanes,), jnp.int32),
@@ -416,11 +450,92 @@ def canonical_candidate_blocks(
                 page_row = row_id
             read_pages = pltpu.async_copy(pages.at[page_row], page_ids, sem.at[1])
 
-            @plsc.parallel_loop(
-                0, queries * histogram_width, lanes, unroll=alignment // lanes
-            )
-            def clear_hist(i):
-                hist[pl.ds(i, lanes)] = jnp.zeros(lanes, jnp.int32)
+            def clear_hist():
+                @plsc.parallel_loop(
+                    0, queries * window, lanes, unroll=alignment // lanes
+                )
+                def clear(i):
+                    hist[pl.ds(i, lanes)] = jnp.zeros(lanes, jnp.int32)
+
+            def scan_window(base, union_size):
+                """Append union blocks in [base, base + window), ascending."""
+
+                # One presence histogram per query; a block's owner bit is set
+                # when that query lists it. ``scan_count`` dedupes repeats
+                # within a query.
+                @plsc.parallel_loop(0, columns, lanes, unroll=alignment // lanes)
+                def scatter(i):
+                    keys = ids[pl.ds(i, lanes)]
+                    local = keys - base
+                    query = (i + jnp.arange(lanes)) // per_query
+                    inc, mask = plsc.scan_count(
+                        keys,
+                        mask=(keys >= 0)
+                        & (keys < blocks)
+                        & (local >= 0)
+                        & (local < window)
+                        & (query < row_queries)
+                        & row_valid,
+                    )
+                    plsc.addupdate_scatter(
+                        hist,
+                        [query * window + jnp.clip(local, 0, window - 1)],
+                        inc,
+                        mask=mask,
+                    )
+
+                def compact(i, count):
+                    logical = base + i + jnp.arange(lanes)
+                    owner = jnp.zeros(lanes, jnp.int32)
+                    for query in range(queries):
+                        present = hist[pl.ds(query * window + i, lanes)] != 0
+                        owner = owner | (present.astype(jnp.int32) << query)
+                    page = plsc.load_gather(
+                        page_ids,
+                        [jnp.minimum(logical // per_page * parts, table.shape[1] - 1)],
+                    )
+                    valid = (
+                        (owner != 0)
+                        & (logical < blocks)
+                        & (logical * block < table.shape[1] * page_size)
+                        & (page >= 0)
+                        & (page < cache_pages)
+                    )
+                    for part in range(1, parts):
+                        column = logical * parts + part
+                        following = plsc.load_gather(
+                            page_ids, [jnp.minimum(column, table.shape[1] - 1)]
+                        )
+                        valid &= (logical * block + part * page_size >= width) | (
+                            (column < table.shape[1])
+                            & (following >= 0)
+                            & (following < cache_pages)
+                        )
+                    plsc.store_compressed(
+                        logical_ids.at[pl.ds(count, lanes)], logical, mask=valid
+                    )
+                    plsc.store_compressed(
+                        owner_ids.at[pl.ds(count, lanes)], owner, mask=valid
+                    )
+                    return count + plsc.all_reduce_population_count(valid)[0]
+
+                loop = cast(
+                    Callable[[Callable[[jax.Array, jax.Array], jax.Array]], jax.Array],
+                    plsc.parallel_loop(
+                        0,
+                        window,
+                        lanes,
+                        # Fully unrolling one histogram vector miscompiles the
+                        # page-ID gather in libtpu 0.0.50.
+                        unroll=1 if window == alignment else alignment // lanes,
+                        carry=union_size,
+                    ),
+                )
+                return loop(compact)
+
+            if windows == 1:
+                # Clear while the row's IDs and pages are still in flight.
+                clear_hist()
 
             @plsc.parallel_loop(0, columns + lanes, lanes)
             def clear_result(i):
@@ -431,75 +546,14 @@ def canonical_candidate_blocks(
                 copy.wait()
             read_pages.wait()
 
-            # One presence histogram per query; a block's owner bit is set when
-            # that query lists it. ``scan_count`` dedupes repeats within a query.
-            @plsc.parallel_loop(0, columns, lanes, unroll=alignment // lanes)
-            def scatter(i):
-                keys = ids[pl.ds(i, lanes)]
-                query = (i + jnp.arange(lanes)) // per_query
-                base = query * histogram_width
-                inc, mask = plsc.scan_count(
-                    keys,
-                    mask=(keys >= 0)
-                    & (keys < blocks)
-                    & (query < row_queries)
-                    & row_valid,
-                )
-                plsc.addupdate_scatter(
-                    hist,
-                    [base + jnp.clip(keys, 0, histogram_width - 1)],
-                    inc,
-                    mask=mask,
-                )
-
-            def compact(i, count):
-                logical = i + jnp.arange(lanes)
-                owner = jnp.zeros(lanes, jnp.int32)
-                for query in range(queries):
-                    present = hist[pl.ds(query * histogram_width + i, lanes)] != 0
-                    owner = owner | (present.astype(jnp.int32) << query)
-                page = plsc.load_gather(
-                    page_ids,
-                    [jnp.minimum(logical // per_page * parts, table.shape[1] - 1)],
-                )
-                valid = (
-                    (owner != 0)
-                    & (logical < blocks)
-                    & (logical * block < table.shape[1] * page_size)
-                    & (page >= 0)
-                    & (page < cache_pages)
-                )
-                for part in range(1, parts):
-                    column = logical * parts + part
-                    following = plsc.load_gather(
-                        page_ids, [jnp.minimum(column, table.shape[1] - 1)]
-                    )
-                    valid &= (logical * block + part * page_size >= width) | (
-                        (column < table.shape[1])
-                        & (following >= 0)
-                        & (following < cache_pages)
-                    )
-                plsc.store_compressed(
-                    logical_ids.at[pl.ds(count, lanes)], logical, mask=valid
-                )
-                plsc.store_compressed(
-                    owner_ids.at[pl.ds(count, lanes)], owner, mask=valid
-                )
-                return count + plsc.all_reduce_population_count(valid)[0]
-
-            loop = cast(
-                Callable[[Callable[[jax.Array, jax.Array], jax.Array]], jax.Array],
-                plsc.parallel_loop(
-                    0,
-                    histogram_width,
-                    lanes,
-                    # Fully unrolling one histogram vector miscompiles the
-                    # page-ID gather in libtpu 0.0.50.
-                    unroll=1 if histogram_width == alignment else alignment // lanes,
-                    carry=jnp.int32(0),
-                ),
-            )
-            union_size = loop(compact)
+            # Windows ascend, so the union keeps ascending block order. The
+            # window count is static and small; unrolling chains the carry the
+            # same way the partition loops below do.
+            union_size = jnp.int32(0)
+            for index in range(windows):
+                if windows > 1:
+                    clear_hist()
+                union_size = scan_window(index * window, union_size)
             ends = []
             position = jnp.int32(0)
             for ownership in (1, 3, 2):
