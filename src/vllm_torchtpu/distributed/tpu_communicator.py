@@ -21,6 +21,8 @@ from vllm.distributed.device_communicators.base_device_communicator import (
 )
 from vllm.distributed.parallel_state import get_dp_group
 
+from vllm_torchtpu import envs
+
 
 class TpuNullAll2AllManager(All2AllManagerBase):
     """Probe-only stub; TPU EP dispatch/combine never goes through it."""
@@ -39,6 +41,16 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
     def _dp_gather(self, x: torch.Tensor) -> torch.Tensor:
         return get_dp_group().all_gather(x, dim=0)
 
+    def _dp_gather_packed(
+        self, hidden_states: torch.Tensor, router_logits: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Both gathers as one: per token, the hidden state and its router
+        logits sit side by side in one row, so each DP rank's rows arrive in
+        the same order as the two separate gathers deliver them."""
+        width = hidden_states.shape[-1]
+        packed = self._dp_gather(torch.cat([hidden_states, router_logits], dim=-1))
+        return packed[:, :width].contiguous(), packed[:, width:].contiguous()
+
     def dispatch_router_logits(
         self,
         hidden_states: torch.Tensor,
@@ -53,6 +65,12 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
         dp = get_dp_group()
         if dp.world_size == 1:
             return hidden_states, router_logits
+        if (
+            envs.TPU_MOE_PACKED_DISPATCH
+            and hidden_states.dim() == router_logits.dim() == 2
+            and hidden_states.dtype == router_logits.dtype
+        ):
+            return self._dp_gather_packed(hidden_states, router_logits)
         hidden_states = self._dp_gather(hidden_states)
         router_logits = self._dp_gather(router_logits)
         return hidden_states, router_logits

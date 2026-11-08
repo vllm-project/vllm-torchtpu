@@ -23,7 +23,12 @@ from vllm_torchtpu.kernels.experimental.moe_dense_expert import (
     can_use_dense_expert,
     dense_expert_moe,
 )
-from vllm_torchtpu.kernels.megablox.gmm_v2 import get_packing_factor, gmm_v2
+from vllm_torchtpu.kernels.megablox.gmm_v2 import (
+    get_packing_factor,
+    gmm_v2,
+    gmm_v2_mlp,
+    mlp_supported,
+)
 from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
     blockwise_onehot_unpermute,
     can_use_blockwise_onehot_unpermute,
@@ -61,18 +66,24 @@ def _select_ragged_gather_reduce(version: str):
 ragged_gather_reduce = _select_ragged_gather_reduce(envs.RAGGED_GATHER_REDUCE_VERSION)
 
 _ONEHOT_AUTO_CAP = 512
+# Largest decode step (routed rows) the auto threshold moves to the one-hot
+# path. The one-hot matmuls grow with tokens x routed rows, so larger steps
+# keep the SparseCore kernels.
+_ONEHOT_DECODE_CAP = 3840
 # Fixed at import, like the other MoE algorithm selectors.
 _DENSE_EXPERT_THRESHOLD = envs.TPU_MOE_DENSE_EXPERT_THRESHOLD
 
 
-def resolve_onehot_permute_threshold() -> int:
+def resolve_onehot_permute_threshold(step_routed_rows: int = 0) -> int:
     """Routed-row count at/below which MoE permute+combine run as TensorCore
     one-hot matmuls instead of the SparseCore gather/reduce kernels.
 
     Auto (env unset/empty/negative) resolves to ``min(SC block rows - 1,
-    _ONEHOT_AUTO_CAP)`` on SparseCore TPUs and 0 elsewhere. An explicit
-    ``ONEHOT_MOE_PERMUTE_THRESHOLD`` wins: 0 disables the one-hot path, a
-    positive value forces that threshold.
+    _ONEHOT_AUTO_CAP)`` on SparseCore TPUs and 0 elsewhere, raised to
+    ``step_routed_rows`` (at most ``_ONEHOT_DECODE_CAP``) so a full decode
+    step takes the one-hot path while prefill buckets keep the SparseCore
+    kernels. An explicit ``ONEHOT_MOE_PERMUTE_THRESHOLD`` wins: 0 disables
+    the one-hot path, a positive value forces that threshold.
     """
     explicit = envs.ONEHOT_MOE_PERMUTE_THRESHOLD
     if explicit is not None and explicit >= 0:
@@ -87,7 +98,7 @@ def resolve_onehot_permute_threshold() -> int:
     block_rows = sc_info.num_lanes * sc_info.num_cores * sc_info.num_subcores
     threshold = min(block_rows - 1, _ONEHOT_AUTO_CAP)
 
-    return threshold
+    return max(threshold, min(step_routed_rows, _ONEHOT_DECODE_CAP))
 
 
 def unpack_fp4_to_e2m1(w_packed: jax.Array) -> jax.Array:
@@ -179,6 +190,13 @@ def quantize_to_native_fp4_kmajor(
     return packed, scale
 
 
+def _is_fp4_weight(rhs) -> bool:
+    return (
+        jnp.issubdtype(rhs.dtype, jnp.floating)
+        and jax.dtypes.itemsize_bits(rhs.dtype) == 4
+    )
+
+
 def gmm_wrapper(
     lhs,
     rhs,
@@ -194,10 +212,7 @@ def gmm_wrapper(
     # fp4 weights: keep bf16 activations. Quantizing activations to fp8 collapses
     # fp4 accuracy (error compounds across MoE layers) with no decode speedup
     # (decode is weight-HBM-bound). fp8/int4 weights keep the default fp8 act.
-    is_fp4_weight = (
-        jnp.issubdtype(rhs.dtype, jnp.floating)
-        and jax.dtypes.itemsize_bits(rhs.dtype) == 4
-    )
+    is_fp4_weight = _is_fp4_weight(rhs)
     return gmm_v2(
         lhs=lhs,
         rhs=rhs,
@@ -209,6 +224,86 @@ def gmm_wrapper(
         fuse_act=fuse_act,
         preferred_element_type=preferred_element_type,
         maybe_quantize_lhs=not is_fp4_weight,
+        rhs_quant_dtype=rhs_quant_dtype,
+    )
+
+
+# Largest routed-row count (static GMM rows) that runs gate/up and down as one
+# kernel: decode and verify steps. Prefill chunks keep the two kernels.
+_MLP_KERNEL_MAX_ROWS = 4096
+
+
+def expert_mlp(
+    x,
+    w1,
+    w1_scale,
+    w1_bias,
+    w2,
+    w2_scale,
+    w2_bias,
+    group_sizes,
+    group_offset,
+    *,
+    activation,
+    rhs_quant_dtype=None,
+):
+    """Gate/up GMM with the fused activation, then the down GMM, per routed row.
+
+    Decode-sized steps run both in one kernel (`gmm_v2_mlp`, same results),
+    which streams every expert's weights once and keeps the activation in VMEM.
+    """
+    maybe_quantize_lhs = not _is_fp4_weight(w1)
+    if (
+        x.shape[0] <= _MLP_KERNEL_MAX_ROWS
+        and w1_bias is None
+        and w2_bias is None
+        and w1.dtype == w2.dtype
+        and mlp_supported(
+            x,
+            w1,
+            w1_scale,
+            w2,
+            w2_scale,
+            group_sizes,
+            fuse_act=activation,
+            maybe_quantize_lhs=maybe_quantize_lhs,
+            rhs_quant_dtype=rhs_quant_dtype,
+        )
+    ):
+        return gmm_v2_mlp(
+            x,
+            w1,
+            w2,
+            group_sizes,
+            w1_scale,
+            w2_scale,
+            group_offset[0],
+            fuse_act=activation,
+            maybe_quantize_lhs=maybe_quantize_lhs,
+            rhs_quant_dtype=rhs_quant_dtype,
+        )
+    gmm1_res = gmm_wrapper(
+        x,
+        w1,
+        w1_scale,
+        w1_bias,
+        group_sizes,
+        group_offset,
+        zero_initialize=False,
+        fuse_act=activation,
+        rhs_quant_dtype=rhs_quant_dtype,
+    )
+    packing_factor = get_packing_factor(w2.dtype, rhs_quant_dtype)
+    gmm1_res = gmm1_res[:, : w2.shape[1] * packing_factor]
+    return gmm_wrapper(
+        gmm1_res,
+        w2,
+        w2_scale,
+        w2_bias,
+        group_sizes,
+        group_offset,
+        zero_initialize=False,
+        preferred_element_type=x.dtype,
         rhs_quant_dtype=rhs_quant_dtype,
     )
 
@@ -322,14 +417,24 @@ def prepare_routed_gmm_inputs(
     if argsort_revert_indices is not None:
         group_sizes_local = bucket_counts[:local_num_experts]
     else:
-        argsort_revert_indices = jnp.argsort(sorted_indices)
+        # `sorted_indices` is a permutation: scattering the positions through
+        # it inverts it exactly, without a second sort.
+        assert sorted_indices is not None
+        argsort_revert_indices = (
+            jnp.zeros_like(sorted_indices)
+            .at[sorted_indices]
+            .set(
+                jnp.arange(sorted_indices.shape[0], dtype=sorted_indices.dtype),
+                unique_indices=True,
+            )
+        )
         topk_indices_for_count = jnp.where(valid_mask, topk_indices_flat, 0)
         group_sizes_local = jax.nn.one_hot(
             topk_indices_for_count, local_num_experts, dtype=jnp.int32
         ) * valid_mask[:, None].astype(jnp.int32)
         group_sizes_local = group_sizes_local.sum(axis=0)
 
-    if packable:
+    if sorted_indices is None:
         # Packing (key, token) into one int32 keeps the payload out of the sort
         # and drops the follow-up gather. Equal packed values carry the same
         # token id, so their order cannot matter.
@@ -338,6 +443,8 @@ def prepare_routed_gmm_inputs(
         )
         token_indices_sorted = jnp.bitwise_and(packed, (1 << token_bits) - 1)
     else:
+        # The argsort is stable, so each expert's tokens stay in ascending
+        # token order: the (key, token) order of the packed sort.
         token_indices_sorted = token_indices_flat[sorted_indices]
 
     if use_ep and use_sparse_core:
@@ -401,32 +508,20 @@ def moe_gmm(
     """
     group_offset = jnp.array([0], dtype=jnp.int32)
 
-    gmm1_res = gmm_wrapper(
+    topk_weights = topk_weights_flat.reshape((num_tokens, topk))
+    valid_mask = valid_mask_flat.reshape((num_tokens, topk))
+
+    gmm2_res = expert_mlp(
         x,
         w1,
         w1_scale,
         w1_bias,
-        group_sizes,
-        group_offset,
-        zero_initialize=False,
-        fuse_act=activation,
-        rhs_quant_dtype=rhs_quant_dtype,
-    )
-    packing_factor = get_packing_factor(w2.dtype, rhs_quant_dtype)
-    gmm1_res = gmm1_res[:, : w2.shape[1] * packing_factor]
-
-    topk_weights = topk_weights_flat.reshape((num_tokens, topk))
-    valid_mask = valid_mask_flat.reshape((num_tokens, topk))
-
-    gmm2_res = gmm_wrapper(
-        gmm1_res,
         w2,
         w2_scale,
         w2_bias,
         group_sizes,
         group_offset,
-        zero_initialize=False,
-        preferred_element_type=x.dtype,
+        activation=activation,
         rhs_quant_dtype=rhs_quant_dtype,
     )
     # The destination-major kernel packs source indices into 20 bits and
