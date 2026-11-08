@@ -141,13 +141,11 @@ def _kernel(
         lse_ref[...] = lse.reshape(num_heads, block_q, 1)
 
     def finish(m, l, acc):
-        """Output and lse from a tile's softmax state (log2 units)."""
-        seen_any = l > 0
-        safe = jnp.where(seen_any, l, 1.0)
-        write(
-            jnp.where(seen_any, acc * (1.0 / safe), 0.0),
-            jnp.where(seen_any, m * _LN_2 + jnp.log(safe), -jnp.inf),
-        )
+        """Output and lse from a tile's softmax state (log2 units, ``m``
+        finite). A row that saw no slot has ``l = 0`` and ``acc = 0``: its
+        output is 0 and its lse ``m + log(0) = -inf`` with no select (a seen
+        row has ``l >= 1``)."""
+        write(acc * (1.0 / jnp.maximum(l, 1.0)), m * _LN_2 + jnp.log(l))
 
     def attend(width, single):
         """One softmax update over the group's first `width` slots; a
@@ -206,14 +204,11 @@ def _kernel(
             s = s * jnp.concatenate(k_scales, axis=1)
         s = jnp.where(mask, s, -jnp.inf)
 
-        m_new = jnp.max(s, axis=1, keepdims=True)
-        if not single:
-            m_prev = m_ref[...]
-            m_new = jnp.maximum(m_prev, m_new)
-        # A row with no visible slot keeps m = -inf in a single group; its
-        # p must still be 0, not exp2(nan).
-        m_safe = jnp.where(m_new > -jnp.inf, m_new, 0.0) if single else m_new
-        p = jnp.exp2(s - m_safe)
+        # The running max starts at a finite floor (`_MASK_VALUE`), so a row
+        # with no visible slot gets p = exp2(-inf) = 0, not exp2(nan).
+        m_prev = m_ref[...] if not single else msa_attention._MASK_VALUE
+        m_new = jnp.maximum(m_prev, jnp.max(s, axis=1, keepdims=True))
+        p = jnp.exp2(s - m_new)
         l_cur = jnp.sum(p, axis=1, keepdims=True)
         p_v = p * jnp.concatenate(v_scales, axis=1) if fp4 else p
         pv = jax.lax.dot_general(
@@ -223,7 +218,7 @@ def _kernel(
             preferred_element_type=jnp.float32,
         )
         if single:
-            finish(m_safe, l_cur, pv)
+            finish(m_new, l_cur, pv)
             return
         alpha = jnp.exp2(m_prev - m_new)
         l_new = alpha * l_ref[...] + l_cur
