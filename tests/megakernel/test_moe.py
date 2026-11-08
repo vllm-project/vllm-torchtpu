@@ -16,8 +16,11 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import dataclasses
 import pathlib
+from types import SimpleNamespace
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -37,7 +40,7 @@ from tests.megakernel.megakernel_fakes import (
     FakeMixerModule,
     MiniCtx,
 )
-from vllm_torchtpu.megakernel import collectives, modules, planner, stream, vmem
+from vllm_torchtpu.megakernel import modules, planner
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec
 from vllm_torchtpu.megakernel.modules import MoEModule
 from vllm_torchtpu.megakernel.modules.moe import dedup, ring
@@ -58,6 +61,97 @@ from vllm_torchtpu.megakernel.ops import (
     round_up,
 )
 from vllm_torchtpu.megakernel.spec import LayerType, ModelSpec
+
+
+def _build_moe_test_scratch(
+    ms: ModelSpec, ex: ExecSpec, p: planner.Plan | None = None
+) -> tuple[Any, dict[str, Any]]:
+    """Build core + module scratch specs for standalone `MoEModule` Pallas tests."""
+    if p is None:
+        p = planner.plan(ms, ex)
+    g = ms.config
+    mb, sw = ex.MB, p.shared_widths
+    nbe = ex.resolved_tiles.nbe
+    scratch: dict[str, Any] = {
+        "res": pltpu.VMEM((mb, g.H), F32),
+        "xb": pltpu.VMEM((mb, g.H), BF16),
+        "xb2": pltpu.VMEM((mb, round_up(sw["xb2"], 128)), BF16),
+        "acc": pltpu.VMEM((mb, round_up(sw["acc"], 128)), F32),
+        "ybuf": pltpu.VMEM((mb, round_up(sw["ybuf"], 128)), F32),
+        "mix": pltpu.VMEM((mb, round_up(sw["mix"], 128)), F32),
+        "part": pltpu.VMEM((mb, g.H), F32),
+        "sm": pltpu.VMEM((2, 1, p.smalls_width), F32),
+        "sm_sem": pltpu.SemaphoreType.DMA((2,)),
+    }
+    for k in p.static_kinds:
+        _, n_k, dt_k = p.kinds[k]
+        scratch[f"_w_{k}"] = pltpu.VMEM((p.tk[k], n_k), dt_k)
+        scratch[f"_w_sem_{k}"] = pltpu.SemaphoreType.DMA(())
+    for k in p.dynamic_kinds:
+        _, n_k, dt_k = p.kinds[k]
+        scratch[f"_ebuf_{k}"] = pltpu.VMEM((nbe, p.tk[k], n_k), dt_k)
+        scratch[f"_esem_{k}"] = pltpu.SemaphoreType.DMA((nbe,))
+    for m in ms.all_modules():
+        reqs = m.scratch(g, ex, p)
+        items = (
+            list(reqs.items())
+            if isinstance(reqs, dict)
+            else [(r.name, r.spec) for r in reqs]
+        )
+        for name, spec in items:
+            scratch[name] = spec
+    cp = SimpleNamespace(
+        plan=p,
+        stream=SimpleNamespace(L=g.L, tk=p.tk, nt=p.nt, lay=p.smalls_layout),
+        comm=None,
+        module=p.module_params.__getitem__,
+    )
+    return cp, scratch
+
+
+class _FakeMoEStream:
+    """Minimal stream stub for `MoEModule.emit` (`dmatmul`, `mm`, `ecopy`, `eview`)."""
+
+    def __init__(self, sp: Any, W: dict[str, Any], scr: dict[str, Any]) -> None:
+        self.sp = sp
+        self.W = W
+        self.scr = scr
+
+    def expert_stream(self) -> Any:
+        return contextlib.nullcontext()
+
+    def segment(self, *, lazy: bool = False) -> Any:
+        del lazy
+        return contextlib.nullcontext()
+
+    def mm(self, a: Any, b: Any, dims: Any = (((1,), (0,)), ((), ()))) -> Any:
+        return lax.dot_general(a, b.astype(BF16), dims, preferred_element_type=F32)
+
+    def dmatmul(self, kind: str, x_ref: Any, n_dim: int) -> Any:
+        tk = self.sp.tk[kind]
+        nt = self.sp.nt[kind]
+        x = x_ref[...]
+        acc = jnp.zeros((x.shape[0], n_dim), dtype=F32)
+        w_buf = self.scr[f"_w_{kind}"]
+        w_sem = self.scr[f"_w_sem_{kind}"]
+        for t in range(nt):
+            cp = pltpu.make_async_copy(self.W[kind].at[0, t], w_buf, w_sem)
+            cp.start()
+            cp.wait()
+            acc = acc + self.mm(x[:, t * tk : (t + 1) * tk], w_buf[...])
+        self.scr["acc"][:, :n_dim] = acc
+        return self.scr["acc"][:, :n_dim]
+
+    def ecopy(self, kind: str, src: Any, bank: Any) -> Any:
+        return pltpu.make_async_copy(
+            src,
+            self.scr[f"_ebuf_{kind}"].at[bank],
+            self.scr[f"_esem_{kind}"].at[bank],
+        )
+
+    def eview(self, kind: str, bank: Any) -> Any:
+        return self.scr[f"_ebuf_{kind}"].at[bank]
+
 
 MODULES_DIR = pathlib.Path(modules.__file__).resolve().parent
 
@@ -134,7 +228,7 @@ def test_moe_module_declarations_and_emit_in_pallas_interpret(fake_ex: ExecSpec)
         "final_norm",
     )
 
-    cp_decl, scr_decl = vmem.build_scratch(ms_decl, fake_ex, p_decl)
+    cp_decl, scr_decl = _build_moe_test_scratch(ms_decl, fake_ex, p_decl)
     assert (
         "wn" in scr_decl
         and "elist" in scr_decl
@@ -161,7 +255,7 @@ def test_moe_module_declarations_and_emit_in_pallas_interpret(fake_ex: ExecSpec)
     )
     moe = MoEModule()
     ms = ModelSpec("moe_exec", config=g, layer_type=LayerType("lt", slots=(moe,)))
-    cp, scratch = vmem.build_scratch(ms, ex)
+    cp, scratch = _build_moe_test_scratch(ms, ex)
     p = cp.plan
     wsh = planner.weight_shapes(ms, ex, p)
     osh = planner.kernel_out_shapes(ms, ex, p)
@@ -175,8 +269,7 @@ def test_moe_module_declarations_and_emit_in_pallas_interpret(fake_ex: ExecSpec)
         out_refs = dict(zip(p.o_names, rest[n_w : n_w + n_o]))
         scr = dict(zip(s_names, rest[n_w + n_o :]))
         me = jnp.int32(0)
-        ring = stream.TwoRing(cp.stream, W, scr, interpret=True)
-        ar = collectives.AllReduceRing(cp.comm, scr, me)
+        ring = _FakeMoEStream(cp.stream, W, scr)
         ctx = MiniCtx(
             g=g,
             ex=ex,
@@ -188,11 +281,9 @@ def test_moe_module_declarations_and_emit_in_pallas_interpret(fake_ex: ExecSpec)
             scr=scr,
             me=me,
             stream=ring,
-            comm=ar,
+            comm=None,
         )
 
-        for i in range(cp.stream.NBD):
-            ring.fetch(jnp.int32(i))
         pltpu.make_async_copy(
             W["smalls"].at[0], scr["sm"].at[0], scr["sm_sem"].at[0]
         ).start()
@@ -205,10 +296,9 @@ def test_moe_module_declarations_and_emit_in_pallas_interpret(fake_ex: ExecSpec)
             W["smalls"].at[0], scr["sm"].at[0], scr["sm_sem"].at[0]
         ).wait()
         moe.on_layer_start(ctx, jnp.int32(0), jnp.int32(0))
-        ring.begin_layer(jnp.int32(0))
         ctx.apply_input_norm(moe.input_norm, jnp.int32(0))
         part_moe = moe.emit(ctx, jnp.int32(0), jnp.int32(0))
-        ar.add_residual(ar.allreduce(0, part_moe, jnp.bool_(True)))
+        scr["res"][...] = scr["res"][...] + part_moe.astype(BF16).astype(F32)
         out_refs["hidden"][: ex.MB] = scr["res"][...].astype(BF16)
         if ex.MB < ex.M:
             out_refs["hidden"][ex.MB :] = jnp.zeros((ex.M - ex.MB, g.H), BF16)
@@ -275,7 +365,7 @@ def test_moe_module_numerical_parity(moe_tp: bool, R: int, pipe: bool):
     )
     moe = MoEModule()
     ms = ModelSpec("moe_num", config=g, layer_type=LayerType("lt", slots=(moe,)))
-    cp, scratch = vmem.build_scratch(ms, ex)
+    cp, scratch = _build_moe_test_scratch(ms, ex)
     assert cp.module("moe").PIPE is pipe
     p = cp.plan
     wsh = planner.weight_shapes(ms, ex, p)
@@ -347,19 +437,7 @@ def test_moe_module_numerical_parity(moe_tp: bool, R: int, pipe: bool):
         out_refs = dict(zip(p.o_names, rest[n_w : n_w + n_o]))
         scr = dict(zip(s_names, rest[n_w + n_o :]))
         me = lax.axis_index("tp").astype(I32) if R > 1 else jnp.int32(0)
-        if R > 1:
-            barrier = pltpu.get_barrier_semaphore()
-            for off in range(1, R):
-                pl.semaphore_signal(
-                    barrier,
-                    1,
-                    device_id=(me ^ off,),
-                    device_id_type=pl.DeviceIdType.MESH,
-                )
-            pl.semaphore_wait(barrier, R - 1)
-
-        ring = stream.TwoRing(cp.stream, W, scr, interpret=True)
-        ar = collectives.AllReduceRing(cp.comm, scr, me)
+        ring = _FakeMoEStream(cp.stream, W, scr)
         ctx = MiniCtx(
             g=g,
             ex=ex,
@@ -371,11 +449,9 @@ def test_moe_module_numerical_parity(moe_tp: bool, R: int, pipe: bool):
             scr=scr,
             me=me,
             stream=ring,
-            comm=ar,
+            comm=None,
         )
 
-        for i in range(cp.stream.NBD):
-            ring.fetch(jnp.int32(i))
         pltpu.make_async_copy(
             W["smalls"].at[0], scr["sm"].at[0], scr["sm_sem"].at[0]
         ).start()
@@ -388,12 +464,9 @@ def test_moe_module_numerical_parity(moe_tp: bool, R: int, pipe: bool):
             W["smalls"].at[0], scr["sm"].at[0], scr["sm_sem"].at[0]
         ).wait()
         moe.on_layer_start(ctx, jnp.int32(0), jnp.int32(0))
-        ring.begin_layer(jnp.int32(0))
         ctx.apply_input_norm(moe.input_norm, jnp.int32(0))
         part_moe = moe.emit(ctx, jnp.int32(0), jnp.int32(0))
-        ar.add_residual(ar.allreduce(0, part_moe, jnp.bool_(True)))
-        ar.drain_sends()
-        out_refs["hidden"][: ex.MB] = scr["res"][...].astype(BF16)
+        out_refs["hidden"][: ex.MB] = part_moe.astype(BF16)
         if ex.MB < ex.M:
             out_refs["hidden"][ex.MB :] = jnp.zeros((ex.M - ex.MB, H), BF16)
 
@@ -417,8 +490,8 @@ def test_moe_module_numerical_parity(moe_tp: bool, R: int, pipe: bool):
     pos = jnp.array([4, 8], dtype=I32)
     w_all = [w_by_name[k] for k in p.w_names]
     if R == 1:
-        (hid_out,) = jax.jit(call)(pos, hid, *[w[0] for w in w_all])
-        out_ranks = hid_out[None, : ex.B]
+        (part_out,) = jax.jit(call)(pos, hid, *[w[0] for w in w_all])
+        part_ranks = part_out[None, : ex.B]
     else:
         mesh = Mesh(devs[:R], ("tp",))
         step = jax.jit(
@@ -433,7 +506,7 @@ def test_moe_module_numerical_parity(moe_tp: bool, R: int, pipe: bool):
             )
         )
         hid_rep = jnp.broadcast_to(hid[None, ...], (R, ex.M, H))
-        out_ranks = step(pos, hid_rep, *w_all)[:, : ex.B]
+        part_ranks = step(pos, hid_rep, *w_all)[:, : ex.B]
 
     # Pure-JAX MoE reference: RMSNorm -> router softmax + top-k -> shared + routed
     res = hid[: ex.B].astype(F32)
@@ -479,11 +552,15 @@ def test_moe_module_numerical_parity(moe_tp: bool, R: int, pipe: bool):
                 part_r = part_r.at[b : b + 1].add(top_w[b, k] * y_e)
         partials.append(part_r.astype(BF16).astype(F32))
 
-    ref_out = (res + jnp.sum(jnp.stack(partials, axis=0), axis=0)).astype(BF16)
     for r in range(R):
         assert jnp.allclose(
-            out_ranks[r].astype(F32), ref_out.astype(F32), atol=2e-2, rtol=2e-2
+            part_ranks[r].astype(F32), partials[r], atol=2e-2, rtol=2e-2
         )
+    ref_out = (res + jnp.sum(jnp.stack(partials, axis=0), axis=0)).astype(BF16)
+    actual_out = (res + jnp.sum(part_ranks.astype(F32), axis=0)).astype(BF16)
+    assert jnp.allclose(
+        actual_out.astype(F32), ref_out.astype(F32), atol=2e-2, rtol=2e-2
+    )
 
 
 @pytest.mark.parametrize(
@@ -561,7 +638,7 @@ def test_moe_dynamic_dma_race_invariants(
                 dma_execution_mode=dma_mode,
             ),
         )
-        cp, scratch = vmem.build_scratch(ms, ex)
+        cp, scratch = _build_moe_test_scratch(ms, ex)
         assert cp.module("moe").route_vec is route_vec
         if pipe_ep:
             assert cp.module("moe").PIPE_EP is True
@@ -633,18 +710,7 @@ def test_moe_dynamic_dma_race_invariants(
             out_refs = dict(zip(p.o_names, rest[n_w : n_w + n_o]))
             scr = dict(zip(s_names, rest[n_w + n_o :]))
             me = lax.axis_index("tp").astype(I32)
-            barrier = pltpu.get_barrier_semaphore()
-            for off in range(1, R):
-                pl.semaphore_signal(
-                    barrier,
-                    1,
-                    device_id=(me ^ off,),
-                    device_id_type=pl.DeviceIdType.MESH,
-                )
-            pl.semaphore_wait(barrier, R - 1)
-
-            ring = stream.TwoRing(cp.stream, W, scr, interpret=True)
-            ar = collectives.AllReduceRing(cp.comm, scr, me)
+            ring = _FakeMoEStream(cp.stream, W, scr)
             ctx = MiniCtx(
                 g=g,
                 ex=ex,
@@ -656,11 +722,9 @@ def test_moe_dynamic_dma_race_invariants(
                 scr=scr,
                 me=me,
                 stream=ring,
-                comm=ar,
+                comm=None,
             )
 
-            for i in range(cp.stream.NBD):
-                ring.fetch(jnp.int32(i))
             pltpu.make_async_copy(
                 W["smalls"].at[0], scr["sm"].at[0], scr["sm_sem"].at[0]
             ).start()
@@ -677,12 +741,9 @@ def test_moe_dynamic_dma_race_invariants(
             # inside `smalls_sync` at the start of every layer to wait on
             # `scr["ec_sem"].at[slot]` before `po2c_pass1` reads `scr["ecopy"]`.
             moe.on_layer_start(ctx, jnp.int32(0), jnp.int32(0))
-            ring.begin_layer(jnp.int32(0))
             ctx.apply_input_norm(moe.input_norm, jnp.int32(0))
             part_moe = moe.emit(ctx, jnp.int32(0), jnp.int32(0))
-            ar.add_residual(ar.allreduce(0, part_moe, jnp.bool_(True)))
-            ar.drain_sends()
-            out_refs["hidden"][: ex.MB] = scr["res"][...].astype(BF16)
+            out_refs["hidden"][: ex.MB] = part_moe.astype(BF16)
             if ex.MB < ex.M:
                 out_refs["hidden"][ex.MB :] = jnp.zeros((ex.M - ex.MB, H), BF16)
 
@@ -772,7 +833,7 @@ def test_moe_routing_and_ring_helpers_in_pallas_interpret(
         config=g,
         layer_type=LayerType("lt", slots=(FakeMixerModule(), FakeFFNModule())),
     )
-    cp, scratch = vmem.build_scratch(ms, ex)
+    cp, scratch = _build_moe_test_scratch(ms, ex)
     p = cp.plan
     tt = MoETunables(
         topk=True, topk_lanes=True, route_vec=route_vec, ecopy_opt=ecopy_opt
@@ -808,7 +869,7 @@ def test_moe_routing_and_ring_helpers_in_pallas_interpret(
         wn_out_ref, nhit_out_ref, e13_out_ref = rest[n_w : n_w + 3]
         scr = dict(zip(s_names, rest[n_w + 3 :]))
         me = jnp.int32(0)
-        two_ring = stream.TwoRing(cp.stream, W, scr, interpret=True)
+        two_ring = _FakeMoEStream(cp.stream, W, scr)
         ctx = MiniCtx(g, ex, cp, None, W, {}, {}, scr, me, stream=two_ring, comm=None)
         scr["hitv"][...] = jnp.zeros((ex.MR, 128), I32)
         _sync_copy(scr["hitv"].at[pl.ds(0, 8)], scr["seen"], scr["misc_sem"])

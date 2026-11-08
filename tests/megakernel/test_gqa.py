@@ -15,10 +15,15 @@
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
+from types import SimpleNamespace
+from typing import Any
 
 import jax
 import jax.numpy as jnp
+import pytest
+from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
@@ -28,13 +33,92 @@ from tests.megakernel.megakernel_fakes import (
     FakeGeometry,
     MiniCtx,
 )
-from vllm_torchtpu.megakernel import collectives, planner, stream, vmem
+from vllm_torchtpu.megakernel import planner
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec
 from vllm_torchtpu.megakernel.modules.gqa import GQAModule
-from vllm_torchtpu.megakernel.ops import BF16, F32, I32
+from vllm_torchtpu.megakernel.modules.gqa.context import GQAEmit
+from vllm_torchtpu.megakernel.modules.gqa.merge import split_merge
+from vllm_torchtpu.megakernel.ops import BF16, F32, I32, round_bf16, round_up
 from vllm_torchtpu.megakernel.spec import LayerType, ModelSpec
 
 _TINY_GQA_TILES = TINY_TILES.with_modules({"gqa": {"kv_blk": 256, "nkv": 3}})
+
+
+def _build_gqa_test_scratch(
+    ms: ModelSpec, ex: ExecSpec, p: planner.Plan | None = None
+) -> tuple[Any, dict[str, Any]]:
+    """Build core + module scratch specs for standalone `GQAModule` Pallas tests."""
+    if p is None:
+        p = planner.plan(ms, ex)
+    g = ms.config
+    mb, sw = ex.MB, p.shared_widths
+    scratch: dict[str, Any] = {
+        "res": pltpu.VMEM((mb, g.H), F32),
+        "xb": pltpu.VMEM((mb, g.H), BF16),
+        "xb2": pltpu.VMEM((mb, round_up(sw["xb2"], 128)), BF16),
+        "acc": pltpu.VMEM((mb, round_up(sw["acc"], 128)), F32),
+        "ybuf": pltpu.VMEM((mb, round_up(sw["ybuf"], 128)), F32),
+        "mix": pltpu.VMEM((mb, round_up(sw["mix"], 128)), F32),
+        "sm": pltpu.VMEM((2, 1, p.smalls_width), F32),
+        "sm_sem": pltpu.SemaphoreType.DMA((2,)),
+    }
+    for k in p.static_kinds:
+        _, n_k, dt_k = p.kinds[k]
+        scratch[f"_w_{k}"] = pltpu.VMEM((p.tk[k], n_k), dt_k)
+        scratch[f"_w_sem_{k}"] = pltpu.SemaphoreType.DMA(())
+    for m in ms.all_modules():
+        reqs = m.scratch(g, ex, p)
+        items = (
+            list(reqs.items())
+            if isinstance(reqs, dict)
+            else [(r.name, r.spec) for r in reqs]
+        )
+        for name, spec in items:
+            scratch[name] = spec
+    cp = SimpleNamespace(
+        plan=p,
+        stream=SimpleNamespace(
+            L=g.L,
+            tk=p.tk,
+            nt=p.nt,
+            lay=p.smalls_layout,
+            module_ord=lambda lyr, _name: lyr,
+        ),
+        comm=None,
+        module=p.module_params.__getitem__,
+    )
+    return cp, scratch
+
+
+class _FakeGQAStream:
+    """Minimal stream stub implementing `segment` and `dmatmul` for `GQAModule.emit`."""
+
+    def __init__(self, sp: Any, W: dict[str, Any], scr: dict[str, Any]) -> None:
+        self.sp = sp
+        self.W = W
+        self.scr = scr
+
+    def segment(self, *, lazy: bool = False) -> Any:
+        del lazy
+        return contextlib.nullcontext()
+
+    def mm(self, a: Any, b: Any, dims: Any = (((1,), (0,)), ((), ()))) -> Any:
+        return lax.dot_general(a, b.astype(BF16), dims, preferred_element_type=F32)
+
+    def dmatmul(self, kind: str, x_ref: Any, n_dim: int) -> Any:
+        tk = self.sp.tk[kind]
+        nt = self.sp.nt[kind]
+        x = x_ref[...]
+        acc = jnp.zeros((x.shape[0], n_dim), dtype=F32)
+        w_buf = self.scr[f"_w_{kind}"]
+        w_sem = self.scr[f"_w_sem_{kind}"]
+        for t in range(nt):
+            cp = pltpu.make_async_copy(self.W[kind].at[0, t], w_buf, w_sem)
+            cp.start()
+            cp.wait()
+            acc = acc + self.mm(x[:, t * tk : (t + 1) * tk], w_buf[...])
+        self.scr["acc"][:, :n_dim] = acc
+        return self.scr["acc"][:, :n_dim]
 
 
 def test_gqa_module_declarations_and_emit_in_pallas_interpret(fake_ex: ExecSpec):
@@ -55,7 +139,7 @@ def test_gqa_module_declarations_and_emit_in_pallas_interpret(fake_ex: ExecSpec)
     assert p_decl.s_names == ("kc", "vc")
     assert p_decl.o_names == ("hidden", "knew", "vnew")
 
-    cp_decl, scr_decl = vmem.build_scratch(ms_decl, fake_ex, p_decl)
+    cp_decl, scr_decl = _build_gqa_test_scratch(ms_decl, fake_ex, p_decl)
     # GQA scratch allocated, no GDN scratch allocated
     assert "kbuf" in scr_decl and "vbuf" in scr_decl and "wl_cnt" in scr_decl
     assert "recb" not in scr_decl and "sbuf" not in scr_decl and "convb" not in scr_decl
@@ -82,7 +166,7 @@ def test_gqa_module_declarations_and_emit_in_pallas_interpret(fake_ex: ExecSpec)
     ms = ModelSpec(
         "gqa_ffn_exec", config=g, layer_type=LayerType("lt", slots=(gqa, ffn))
     )
-    cp, scratch = vmem.build_scratch(ms, ex)
+    cp, scratch = _build_gqa_test_scratch(ms, ex)
     p = cp.plan
     wsh = planner.weight_shapes(ms, ex, p)
     ssh = planner.state_shapes(ms, ex, p)
@@ -99,8 +183,7 @@ def test_gqa_module_declarations_and_emit_in_pallas_interpret(fake_ex: ExecSpec)
         out_refs = dict(zip(p.o_names, rest[n_w + n_s : n_w + n_s + n_o]))
         scr = dict(zip(s_names, rest[n_w + n_s + n_o :]))
         me = jnp.int32(0)
-        ring = stream.TwoRing(cp.stream, W, scr, interpret=True)
-        ar = collectives.AllReduceRing(cp.comm, scr, me)
+        ring = _FakeGQAStream(cp.stream, W, scr)
         ctx = MiniCtx(
             g=g,
             ex=ex,
@@ -112,11 +195,9 @@ def test_gqa_module_declarations_and_emit_in_pallas_interpret(fake_ex: ExecSpec)
             scr=scr,
             me=me,
             stream=ring,
-            comm=ar,
+            comm=None,
         )
 
-        for i in range(cp.stream.NBD):
-            ring.fetch(jnp.int32(i))
         pltpu.make_async_copy(
             W["smalls"].at[0], scr["sm"].at[0], scr["sm_sem"].at[0]
         ).start()
@@ -128,10 +209,9 @@ def test_gqa_module_declarations_and_emit_in_pallas_interpret(fake_ex: ExecSpec)
         pltpu.make_async_copy(
             W["smalls"].at[0], scr["sm"].at[0], scr["sm_sem"].at[0]
         ).wait()
-        ring.begin_layer(jnp.int32(0))
         ctx.apply_input_norm(gqa.input_norm, jnp.int32(0))
         part_att = gqa.emit(ctx, jnp.int32(0), jnp.int32(0))
-        ar.add_residual(ar.allreduce(0, part_att, jnp.bool_(True)))
+        scr["res"][...] = scr["res"][...] + part_att.astype(F32)
         out_refs["hidden"][: ex.MB] = scr["res"][...].astype(BF16)
         if ex.MB < ex.M:
             out_refs["hidden"][ex.MB :] = jnp.zeros((ex.M - ex.MB, g.H), BF16)
@@ -179,3 +259,120 @@ def test_gqa_module_declarations_and_emit_in_pallas_interpret(fake_ex: ExecSpec)
     )
     assert updated["kc"].shape == ssh["kc"][0]
     assert updated["vc"].shape == ssh["vc"][0]
+
+
+@pytest.mark.parametrize("expect_gq", [True, False])
+def test_gqa_split_merge_gq_and_slab_in_pallas_interpret(expect_gq: bool):
+    """Verify `split_merge` (`gq_merge_start` and `slab_merge_start`) in Pallas."""
+    tiles = dataclasses.replace(_TINY_GQA_TILES, bank=512 << 10).with_modules(
+        {"gqa": {"gqa_qv": expect_gq, "gq_pack": expect_gq}}
+    )
+    ex = ExecSpec(B=8, T=4, R=2, ctx=256, stack_e=True, tiles=tiles, interpret=True)
+    g = FakeGeometry(
+        L=1,
+        att_every=1,
+        H=256,
+        NH=8,
+        NKV=1,
+        HD=256,
+        E=128,
+        TOPK=2,
+        I=256,
+        IS=256,
+        moe_tp=True,
+    )
+    gqa = GQAModule()
+    ms = ModelSpec(
+        "gqa_split",
+        config=g,
+        layer_type=LayerType("lt", slots=(gqa, FakeFFNModule())),
+    )
+    cp, scratch = _build_gqa_test_scratch(ms, ex)
+    ap = cp.module("gqa")
+    assert ap.SPLIT is True and ap.GQ is expect_gq
+    s_names = list(scratch.keys())
+
+    def body(
+        am_in_ref,
+        al_in_ref,
+        aacc_in_ref,
+        gate_in_ref,
+        am_out_ref,
+        al_out_ref,
+        aacc_out_ref,
+        gate_out_ref,
+        *scr_refs,
+    ):
+        scr = dict(zip(s_names, scr_refs))
+        scr["am"][...] = am_in_ref[...]
+        scr["al"][...] = al_in_ref[...]
+        scr["aacc"][...] = aacc_in_ref[...]
+        scr["gate"][...] = gate_in_ref[...]
+        if not ap.GQ:
+            scr["pso"][...] = jnp.zeros(scr["pso"].shape, F32)
+
+        class _FakePeerComm:
+            def group_copies(self, src_fn, dst_ref, ssem, rsem, G: int):
+                del dst_ref, ssem, rsem, G
+
+                class _Copy:
+                    def start(self):
+                        scr["pri"][1] = src_fn(1)[...]
+
+                    def wait_recv(self):
+                        return None
+
+                    def wait_send(self):
+                        return None
+
+                return [_Copy()]
+
+        ctx = MiniCtx(
+            g=g,
+            ex=ex,
+            core_plan=cp,
+            pos_ref=None,
+            W={},
+            ST={},
+            O={},
+            scr=scr,
+            me=jnp.int32(0),
+            stream=_FakeGQAStream(cp.stream, {}, scr),
+            comm=_FakePeerComm(),
+        )
+        cx = GQAEmit.build(ctx, ap, jnp.int32(0), gqa.name)
+        split_merge(cx)
+        am_out_ref[...] = scr["am"][...]
+        al_out_ref[...] = scr["al"][...]
+        aacc_out_ref[...] = scr["aacc"][...]
+        gate_out_ref[...] = scr["gate"][...]
+
+    am_sh = scratch["am"].shape
+    al_sh = scratch["al"].shape
+    aacc_sh = scratch["aacc"].shape
+    gate_sh = scratch["gate"].shape
+    call = pl.pallas_call(
+        body,
+        out_shape=[
+            jax.ShapeDtypeStruct(am_sh, F32),
+            jax.ShapeDtypeStruct(al_sh, F32),
+            jax.ShapeDtypeStruct(aacc_sh, F32),
+            jax.ShapeDtypeStruct(gate_sh, F32),
+        ],
+        in_specs=[pl.BlockSpec(memory_space=pltpu.VMEM)] * 4,
+        out_specs=[pl.BlockSpec(memory_space=pltpu.VMEM)] * 4,
+        scratch_shapes=[scratch[k] for k in s_names],
+        interpret=pltpu.InterpretParams(),
+    )
+    am_in = jnp.ones(am_sh, dtype=F32) * 0.5
+    al_in = jnp.ones(al_sh, dtype=F32) * 2.0
+    aacc_in = jnp.ones(aacc_sh, dtype=F32) * 1.25
+    gate_in = jnp.zeros(gate_sh, dtype=F32)
+    am_out, al_out, aacc_out, gate_out = jax.jit(call)(am_in, al_in, aacc_in, gate_in)
+    assert jnp.allclose(gate_out[: ex.B], round_bf16(jax.nn.sigmoid(gate_in[: ex.B])))
+    if not expect_gq:
+        assert jnp.allclose(am_out[:, : ap.nh], 0.5)
+        assert jnp.allclose(al_out[:, : ap.nh], 4.0)
+        assert jnp.allclose(aacc_out[:, : ap.nh], 2.5)
+    else:
+        assert jnp.all(jnp.isfinite(aacc_out))

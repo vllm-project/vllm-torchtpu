@@ -15,12 +15,16 @@
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
+from types import SimpleNamespace
+from typing import Any
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
@@ -30,13 +34,91 @@ from tests.megakernel.megakernel_fakes import (
     FakeGeometry,
     MiniCtx,
 )
-from vllm_torchtpu.megakernel import collectives, planner
-from vllm_torchtpu.megakernel.dma import stream, vmem
+from vllm_torchtpu.megakernel import planner
 from vllm_torchtpu.megakernel.errors import MegakernelConfigError
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec
 from vllm_torchtpu.megakernel.modules.gdn import GDNModule
-from vllm_torchtpu.megakernel.ops import BF16, F32, FP8, rmsnorm
+from vllm_torchtpu.megakernel.ops import BF16, F32, FP8, rmsnorm, round_up
 from vllm_torchtpu.megakernel.spec import LayerType, ModelSpec, SwitchSlot
+
+
+def _build_gdn_test_scratch(
+    ms: ModelSpec, ex: ExecSpec, p: planner.Plan | None = None
+) -> tuple[Any, dict[str, Any]]:
+    """Build core + module scratch specs for standalone `GDNModule` Pallas tests."""
+    if p is None:
+        p = planner.plan(ms, ex)
+    g = ms.config
+    mb, sw = ex.MB, p.shared_widths
+    scratch: dict[str, Any] = {
+        "res": pltpu.VMEM((mb, g.H), F32),
+        "xb": pltpu.VMEM((mb, g.H), BF16),
+        "xb2": pltpu.VMEM((mb, round_up(sw["xb2"], 128)), BF16),
+        "acc": pltpu.VMEM((mb, round_up(sw["acc"], 128)), F32),
+        "ybuf": pltpu.VMEM((mb, round_up(sw["ybuf"], 128)), F32),
+        "mix": pltpu.VMEM((mb, round_up(sw["mix"], 128)), F32),
+        "sm": pltpu.VMEM((2, 1, p.smalls_width), F32),
+        "sm_sem": pltpu.SemaphoreType.DMA((2,)),
+    }
+    for k in p.static_kinds:
+        _, n_k, dt_k = p.kinds[k]
+        scratch[f"_w_{k}"] = pltpu.VMEM((p.tk[k], n_k), dt_k)
+        scratch[f"_w_sem_{k}"] = pltpu.SemaphoreType.DMA(())
+    for m in ms.all_modules():
+        reqs = m.scratch(g, ex, p)
+        items = (
+            list(reqs.items())
+            if isinstance(reqs, dict)
+            else [(r.name, r.spec) for r in reqs]
+        )
+        for name, spec in items:
+            scratch[name] = spec
+    cp = SimpleNamespace(
+        plan=p,
+        stream=SimpleNamespace(
+            L=g.L,
+            tk=p.tk,
+            nt=p.nt,
+            lay=p.smalls_layout,
+            module_ord=lambda lyr, _name: lyr,
+        ),
+        comm=None,
+        module=p.module_params.__getitem__,
+    )
+    return cp, scratch
+
+
+class _FakeGDNStream:
+    """Minimal stream stub implementing `segment` and `dmatmul` for `GDNModule.emit`."""
+
+    def __init__(self, sp: Any, W: dict[str, Any], scr: dict[str, Any]) -> None:
+        self.sp = sp
+        self.W = W
+        self.scr = scr
+
+    def segment(self, *, lazy: bool = False) -> Any:
+        del lazy
+        return contextlib.nullcontext()
+
+    def dmatmul(self, kind: str, x_ref: Any, n_dim: int) -> Any:
+        tk = self.sp.tk[kind]
+        nt = self.sp.nt[kind]
+        x = x_ref[...]
+        acc = jnp.zeros((x.shape[0], n_dim), dtype=F32)
+        w_buf = self.scr[f"_w_{kind}"]
+        w_sem = self.scr[f"_w_sem_{kind}"]
+        for t in range(nt):
+            cp = pltpu.make_async_copy(self.W[kind].at[0, t], w_buf, w_sem)
+            cp.start()
+            cp.wait()
+            acc = acc + lax.dot_general(
+                x[:, t * tk : (t + 1) * tk],
+                w_buf[...].astype(BF16),
+                (((1,), (0,)), ((), ())),
+                preferred_element_type=F32,
+            )
+        self.scr["acc"][:, :n_dim] = acc
+        return self.scr["acc"][:, :n_dim]
 
 
 def test_gdn_module_declarations_bind_and_options():
@@ -104,7 +186,7 @@ def test_gdn_emit_in_pallas_interpret_matches_reference(T: int, B: int, chunked:
     ms = ModelSpec(
         "gdn_exec", config=g, layer_type=LayerType("lt", slots=(mixer, FakeFFNModule()))
     )
-    cp, scratch = vmem.build_scratch(ms, ex)
+    cp, scratch = _build_gdn_test_scratch(ms, ex)
     p = cp.plan
     wsh = planner.weight_shapes(ms, ex, p)
     ssh = planner.state_shapes(ms, ex, p)
@@ -118,8 +200,7 @@ def test_gdn_emit_in_pallas_interpret_matches_reference(T: int, B: int, chunked:
         out_refs = dict(zip(p.o_names, rest[n_w + n_s : n_w + n_s + n_o]))
         scr = dict(zip(s_names, rest[n_w + n_s + n_o :]))
         me = jnp.int32(0)
-        ring = stream.TwoRing(cp.stream, W, scr, interpret=True)
-        ar = collectives.AllReduceRing(cp.comm, scr, me)
+        ring = _FakeGDNStream(cp.stream, W, scr)
         ctx = MiniCtx(
             g=g,
             ex=ex,
@@ -131,10 +212,8 @@ def test_gdn_emit_in_pallas_interpret_matches_reference(T: int, B: int, chunked:
             scr=scr,
             me=me,
             stream=ring,
-            comm=ar,
+            comm=None,
         )
-        for i in range(cp.stream.NBD):
-            ring.fetch(jnp.int32(i))
         pltpu.make_async_copy(
             W["smalls"].at[0], scr["sm"].at[0], scr["sm_sem"].at[0]
         ).start()
@@ -145,10 +224,9 @@ def test_gdn_emit_in_pallas_interpret_matches_reference(T: int, B: int, chunked:
         pltpu.make_async_copy(
             W["smalls"].at[0], scr["sm"].at[0], scr["sm_sem"].at[0]
         ).wait()
-        ring.begin_layer(jnp.int32(0))
         ctx.apply_input_norm(gdn.input_norm, jnp.int32(0))
         part = gdn.emit(ctx, jnp.int32(0), jnp.int32(0))
-        ar.add_residual(ar.allreduce(0, part, jnp.bool_(True)))
+        scr["res"][...] = scr["res"][...] + part.astype(F32)
         gdn.epilogue(ctx)
         out_refs["hidden"][: ex.MB] = scr["res"][...].astype(BF16)
         if ex.MB < ex.M:
