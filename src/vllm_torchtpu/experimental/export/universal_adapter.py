@@ -694,6 +694,16 @@ def _draft_own_tensors(model: nn.Module, attr: str, prefix: str) -> dict[str, An
     return {names[n]: t for n, t in tensors.items() if names[n].startswith(prefix)}
 
 
+def _current_vllm_config(vllm_config: Any) -> contextlib.AbstractContextManager[Any]:
+    """Makes `vllm_config` current, which attention backends read their KV
+    cache layout from; a no-op for None."""
+    if vllm_config is None:
+        return contextlib.nullcontext()
+    from vllm.config import set_current_vllm_config
+
+    return set_current_vllm_config(vllm_config)
+
+
 # Constant values are gathered from every rank to lay them out, so only small
 # buffers qualify.
 _MAX_CONSTANT_ELEMENTS = 4096
@@ -1410,13 +1420,23 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
                 kv_dtype = getattr(
                     impl, "kv_cache_quantized_dtype", None
                 ) or tpu_lowering.torch_dtype(act_dtype_str)
-                kv_shape = PallasAttentionBackend.get_kv_cache_shape(
-                    cfg.num_blocks,
-                    cfg.block_size,
-                    impl.num_kv_heads,
-                    impl.head_size,
-                    kv_dtype,
-                )
+                # The shape the runner allocates: the layer's backend's, which
+                # for the batched RPA backend (`--attention-backend CUSTOM`)
+                # follows the configured KV cache layout.
+                backend = getattr(layer, "attn_backend", None)
+                if not (
+                    isinstance(backend, type)
+                    and issubclass(backend, PallasAttentionBackend)
+                ):
+                    backend = PallasAttentionBackend
+                with _current_vllm_config(getattr(self, "_vllm_config", None)):
+                    kv_shape = backend.get_kv_cache_shape(
+                        cfg.num_blocks,
+                        cfg.block_size,
+                        impl.num_kv_heads,
+                        impl.head_size,
+                        kv_dtype,
+                    )
                 per_layer.append(
                     [
                         api.ShapeDtypeStruct(
