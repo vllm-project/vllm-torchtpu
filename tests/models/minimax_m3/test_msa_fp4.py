@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """4-bit MSA cache format: quantizer, packing and the Hadamard rotation."""
 
+import functools
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -19,12 +21,14 @@ def test_rotation_leaves_scores_and_outputs_unchanged():
     q = jnp.asarray(rng.standard_normal((5, 128)), jnp.float32)
     k = jnp.asarray(rng.standard_normal((7, 128)), jnp.float32)
     v = jnp.asarray(rng.standard_normal((7, 128)), jnp.float32)
-    s = q @ k.T
-    s_rot = msa_fp4.rotate_queries(q) @ msa_fp4.rotate_keys(k).T
+    # f32 references: TPU's default matmul precision is one bf16 pass.
+    dot = functools.partial(jnp.dot, precision=jax.lax.Precision.HIGHEST)
+    s = dot(q, k.T)
+    s_rot = dot(msa_fp4.rotate_queries(q), msa_fp4.rotate_keys(k).T)
     np.testing.assert_allclose(s_rot, s, rtol=1e-5, atol=1e-4)
     p = jax.nn.softmax(s, axis=-1)
-    out = msa_fp4.unrotate_output(p @ msa_fp4.rotate_keys(v))
-    np.testing.assert_allclose(out, p @ v, rtol=1e-5, atol=1e-5)
+    out = msa_fp4.unrotate_output(dot(p, msa_fp4.rotate_keys(v)))
+    np.testing.assert_allclose(out, dot(p, v), rtol=1e-5, atol=1e-5)
 
 
 def test_quantize_error_is_at_most_half_a_step():
