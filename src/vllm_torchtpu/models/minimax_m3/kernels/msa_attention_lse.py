@@ -27,6 +27,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.models.minimax_m3.kernels import msa_attention
+from vllm_torchtpu.models.minimax_m3.kernels.packed_page import check_page_dtype
 
 
 def _kernel(
@@ -35,28 +36,26 @@ def _kernel(
     work_meta_ref,  # [groups] union row << _ROW_SHIFT | last and first bits
     page_table_ref,  # page key -> physical page (read by the index maps only)
     head_ref,  # [1] KV head of the cache rows (read by the index maps only)
+    tile_offset_ref,  # [1] the call's first tile (read by the index maps only)
     # In
     q_ref,  # [H, Bq, D]
     selected_ref,  # [Bq, K] page keys, -1 padded
     local_page_ref,  # [Bq, 1]
     local_limit_ref,  # [Bq, 1] visible slots of the local page
-    *refs,  # G KV pages, [G scale pages (4-bit)], out, lse, scratch
+    *refs,  # G x [1, S / p, p, 2D] KV pages, [aliased out, lse], out, lse, scratch
     sm_scale: float,
-    fp4_rows: tuple[int, int] | str | None = None,
+    aliased: bool = False,
 ):
     """`msa_attention._kernel_v2` that also writes ``lse = m + log(l)``
     (``-inf`` for a row that sees no slot; its output is 0)."""
-    fp4 = fp4_rows is not None
-    pages_per_step = (len(refs) - 5) // (2 if fp4 else 1)
+    pages_per_step = len(refs) - (7 if aliased else 5)
     kv_refs = refs[:pages_per_step]
-    scale_refs = refs[pages_per_step : 2 * pages_per_step] if fp4 else ()
-    refs = refs[len(refs) - 5 :]
-    o_ref, lse_ref, m_ref, l_ref, acc_ref = refs
+    o_ref, lse_ref, m_ref, l_ref, acc_ref = refs[len(refs) - 5 :]
     w = pl.program_id(0)
     meta = work_meta_ref[w]
     num_heads, block_q, head_dim = q_ref.shape
     rows_per_page, packing = kv_refs[0].shape[1:3]
-    page_size = rows_per_page * (8 if fp4 else packing)
+    page_size = rows_per_page * packing
 
     @pl.when((meta & msa_attention._FIRST_BIT) != 0)
     def _init():
@@ -64,16 +63,12 @@ def _kernel(
         l_ref[...] = jnp.zeros_like(l_ref)
         acc_ref[...] = jnp.zeros_like(acc_ref)
 
-    row_slots = (
-        jax.lax.broadcasted_iota(jnp.int32, (page_size, 1), 0)  # int4: slot order
-        if fp4
-        else msa_attention._bitcast_slots(rows_per_page, packing)
-    )  # [S, 1]
+    row_slots = msa_attention._bitcast_slots(rows_per_page, packing)  # [S, 1]
     slots = row_slots.T  # [1, S]
     selected = selected_ref[...]
     local_page = local_page_ref[...]
     local_limit = local_limit_ref[...]
-    keys, values, masks, k_scales, v_scales = [], [], [], [], []
+    keys, values, masks = [], [], []
     for g, kv_ref in enumerate(kv_refs):
         page = work_page_ref[msa_attention._slot(meta, pages_per_step, g)]
         is_selected = jnp.max(
@@ -82,18 +77,7 @@ def _kernel(
         limit = jnp.where(local_page == page, local_limit, page_size)
         limit = jnp.where(page >= 0, limit * is_selected, 0)  # [Bq, 1]
         seen = jnp.max(limit)
-        if fp4:
-            if fp4_rows == "head":  # rows 2h, 2h + 1 of the scale page
-                k_row = 2 * head_ref[0]
-                rows, sk, sv = msa_attention._fp4_page(
-                    kv_ref, scale_refs[g], k_row, k_row + 1
-                )
-            else:
-                rows, sk, sv = msa_attention._fp4_page(kv_ref, scale_refs[g], *fp4_rows)
-            values.append(rows[:, head_dim:])
-            k_scales.append(sk)
-            v_scales.append(sv)
-        elif packing == 4:
+        if packing == 4:
             rows = msa_attention._page_rows(kv_ref, None)
             values.append(jnp.where(row_slots < seen, rows[:, head_dim:], 0))
         else:
@@ -110,8 +94,6 @@ def _kernel(
     s = jax.lax.dot_general(
         q, k, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
     )
-    if fp4:  # x = int4 * scale: K scales the score columns, V scales p
-        s = s * jnp.concatenate(k_scales, axis=1)
     s = jnp.where(mask, s * sm_scale, -jnp.inf)
 
     m_prev = m_ref[...]
@@ -119,9 +101,8 @@ def _kernel(
     alpha = jnp.exp(m_prev - m_new)
     p = jnp.exp(s - m_new)
     l_ref[...] = alpha * l_ref[...] + jnp.sum(p, axis=1, keepdims=True)
-    p_v = p * jnp.concatenate(v_scales, axis=1) if fp4 else p
     acc_ref[...] = alpha * acc_ref[...] + jax.lax.dot_general(
-        p_v.astype(v.dtype),
+        p.astype(v.dtype),
         v,
         (((1,), (0,)), ((), ())),
         preferred_element_type=jnp.float32,
@@ -147,19 +128,24 @@ def _attention_call(
     local_limit,
     page_table,
     head,
+    tile_offset,
+    out,
     *,
     sm_scale,
     block_q,
     pages_per_step,
     interpret,
-    scale_cache=None,
-    scale_rows=None,
 ):
-    """One kernel call over a token count that is a multiple of block_q.
+    """One kernel call over the tokens of `selected` (a multiple of block_q),
+    which start at tile ``tile_offset`` (``int32[1]``) of the head-major
+    ``q [H, T, D]``, ``local_page`` and ``local_limit [T, 1]``.
 
-    ``head`` (``int32[1]``) is a scalar-prefetch input, not a static, so one
-    kernel serves every KV head of the cache rows."""
-    num_tokens, num_heads, head_dim = q.shape
+    Writes those tokens' rows of ``(out [H, T, D], lse [H, T, 1])``: into
+    `out` in place when given (an earlier call's result), else into new
+    arrays whose other rows are unset. ``head`` (``int32[1]``) is a
+    scalar-prefetch input, not a static, so one kernel serves every KV head
+    of the cache rows."""
+    num_heads, num_tokens, head_dim = q.shape
     _, rows_per_page, packing, _ = kv_cache.shape
     # One KV head's [K | V] slice of each row.
     row_width = 2 * head_dim
@@ -170,38 +156,36 @@ def _attention_call(
 
     groups_per_tile = msa_attention._groups_per_tile(block_q, topk, pages_per_step)
 
-    def tile_block(w, pages, meta, *_):
+    def call_tile_block(w, pages, meta, *_):
         return (msa_attention._meta_tile(meta[w], groups_per_tile), 0)
 
-    def head_major_block(w, pages, meta, *_):
-        return (0, msa_attention._meta_tile(meta[w], groups_per_tile), 0)
+    def tile_block(w, pages, meta, table, head_idx, offset):
+        tile = offset[0] + msa_attention._meta_tile(meta[w], groups_per_tile)
+        return (tile, 0)
+
+    def head_major_block(*args):
+        return (0, *tile_block(*args))
 
     def page_block(g):
-        def index_map(w, pages, meta, table, head_idx):
+        def index_map(w, pages, meta, table, head_idx, offset):
             slot = msa_attention._slot(meta[w], pages_per_step, g)
             page = table[jnp.maximum(pages[slot], 0)]
             return (page, 0, 0, head_idx[0])
 
         return pl.BlockSpec((1, rows_per_page, packing, row_width), index_map)
 
-    def scale_block(g):  # the page's scale page, same page index
-        def index_map(w, pages, meta, table, head_idx):
-            return (table[jnp.maximum(pages[w * pages_per_step + g], 0)], 0, 0)
-
-        return pl.BlockSpec((1,) + scale_cache.shape[1:], index_map)
-
-    fp4 = scale_rows is not None
-
+    aliased = out is not None
+    in_place = (pl.BlockSpec(memory_space=pl.ANY),) * 2 if aliased else ()
     grid_spec = pltpu.PrefetchScalarGridSpec(
-        num_scalar_prefetch=4,
+        num_scalar_prefetch=5,
         grid=(num_groups,),
         in_specs=[
             pl.BlockSpec((num_heads, block_q, head_dim), head_major_block),
-            pl.BlockSpec((block_q, topk), tile_block),
+            pl.BlockSpec((block_q, topk), call_tile_block),
             pl.BlockSpec((block_q, 1), tile_block),
             pl.BlockSpec((block_q, 1), tile_block),
             *(page_block(g) for g in range(pages_per_step)),
-            *(scale_block(g) for g in range(pages_per_step) if fp4),
+            *in_place,
         ],
         out_specs=[
             pl.BlockSpec((num_heads, block_q, head_dim), head_major_block),
@@ -213,15 +197,17 @@ def _attention_call(
             pltpu.VMEM((num_heads * block_q, head_dim), jnp.float32),
         ],
     )
-    out, lse = pl.pallas_call(
-        functools.partial(
-            _kernel, sm_scale=sm_scale, **({"fp4_rows": scale_rows} if fp4 else {})
-        ),
+    num_inputs = 5 + 4 + pages_per_step
+    return pl.pallas_call(
+        functools.partial(_kernel, sm_scale=sm_scale, aliased=aliased),
         grid_spec=grid_spec,
         out_shape=[
             jax.ShapeDtypeStruct((num_heads, num_tokens, head_dim), q.dtype),
             jax.ShapeDtypeStruct((num_heads, num_tokens, 1), jnp.float32),
         ],
+        input_output_aliases=(
+            {num_inputs: 0, num_inputs + 1: 1} if aliased else {}
+        ),
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("arbitrary",),
             vmem_limit_bytes=msa_attention._VMEM_LIMIT_BYTES,
@@ -233,14 +219,14 @@ def _attention_call(
         meta,
         page_table,
         head,
-        q.transpose(1, 0, 2),
+        tile_offset,
+        q,
         selected,
-        local_page[:, None],
-        local_limit[:, None],
+        local_page,
+        local_limit,
         *([kv_cache] * pages_per_step),
-        *([scale_cache] * (pages_per_step if fp4 else 0)),
+        *(out if aliased else ()),
     )
-    return out.transpose(1, 0, 2), lse[:, :, 0].T
 
 
 def _chunked_call(
@@ -256,12 +242,16 @@ def _chunked_call(
     block_q,
     pages_per_step,
     interpret,
-    scale_cache=None,
-    scale_rows=None,
 ):
     """`_attention_call` over chunks of at most `MAX_TOKENS_PER_CALL` tokens
-    (the work list lives in SMEM). Several chunks run as one `lax.map`, so
-    the kernel is emitted once per call site rather than once per chunk."""
+    (the work list lives in SMEM).
+
+    Every call reads the whole head-major query and writes its chunk's rows
+    of one output in place, so the chunks need no per-chunk slices,
+    transposes or stacking (~47 us per 2,048-token chunk under the former
+    `lax.map` in the c4 prefill twin, j-3c651507). The chunks after the
+    first run as one `fori_loop`, so the kernel is emitted twice per call
+    site (the first call creates the output) rather than once per chunk."""
     num_tokens = q.shape[0]
     call = functools.partial(
         _attention_call,
@@ -269,36 +259,28 @@ def _chunked_call(
         block_q=block_q,
         pages_per_step=pages_per_step,
         interpret=interpret,
-        scale_cache=scale_cache,
-        scale_rows=scale_rows,
     )
     limit = msa_attention.MAX_TOKENS_PER_CALL
-    step = max(block_q, limit - limit % block_q)
+    step = min(num_tokens, max(block_q, limit - limit % block_q))
     num_chunks = -(-num_tokens // step)
-    if num_chunks == 1:
-        return call(q, kv_cache, selected, local_page, local_limit, page_table, head)
     pad = num_chunks * step - num_tokens
-    q = jnp.pad(q, ((0, pad), (0, 0), (0, 0)))
+    q = jnp.pad(q, ((0, pad), (0, 0), (0, 0))).transpose(1, 0, 2)
     selected = jnp.pad(selected, ((0, pad), (0, 0)), constant_values=-1)
-    local_page = jnp.pad(local_page, (0, pad), constant_values=-1)
-    local_limit = jnp.pad(local_limit, (0, pad))
+    local_page = jnp.pad(local_page, (0, pad), constant_values=-1)[:, None]
+    local_limit = jnp.pad(local_limit, (0, pad))[:, None]
 
-    def chunk(xs):
-        q_c, sel_c, page_c, limit_c = xs
-        return call(q_c, kv_cache, sel_c, page_c, limit_c, page_table, head)
+    def chunk(c, out):
+        offset = jnp.full((1,), c * (step // block_q), jnp.int32)
+        sel_c = jax.lax.dynamic_slice_in_dim(selected, c * step, step)
+        return call(
+            q, kv_cache, sel_c, local_page, local_limit, page_table, head, offset, out
+        )
 
-    out, lse = jax.lax.map(
-        chunk,
-        (
-            q.reshape(num_chunks, step, *q.shape[1:]),
-            selected.reshape(num_chunks, step, -1),
-            local_page.reshape(num_chunks, step),
-            local_limit.reshape(num_chunks, step),
-        ),
-    )
-    out = out.reshape(num_chunks * step, *out.shape[2:])[:num_tokens]
-    lse = lse.reshape(num_chunks * step, -1)[:num_tokens]
-    return out, lse
+    out = chunk(0, None)
+    if num_chunks > 1:
+        out = jax.lax.fori_loop(1, num_chunks, chunk, out)
+    out, lse = out
+    return out.transpose(1, 0, 2)[:num_tokens], lse[:, :, 0].T[:num_tokens]
 
 
 def _pad_tokens(q, selected, local_page, local_limit, block_q):
@@ -327,15 +309,7 @@ def _check_rows(kv_cache, head_dim, head=None):
 
 @functools.partial(
     jax.jit,
-    static_argnames=(
-        "sm_scale",
-        "block_q",
-        "pages_per_step",
-        "head",
-        "k_scale_row",
-        "v_scale_row",
-        "interpret",
-    ),
+    static_argnames=("sm_scale", "block_q", "pages_per_step", "head", "interpret"),
 )
 def msa_sparse_attention_lse(
     q: jax.Array,
@@ -349,9 +323,6 @@ def msa_sparse_attention_lse(
     block_q: int = msa_attention.DEFAULT_BLOCK_Q,
     pages_per_step: int = msa_attention.DEFAULT_PAGES_PER_STEP,
     head: int = 0,
-    scale_cache: jax.Array | None = None,
-    k_scale_row: int = 0,
-    v_scale_row: int = 1,
     interpret: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """`msa_attention.msa_sparse_attention` (kernel v2, page keys translated
@@ -363,7 +334,7 @@ def msa_sparse_attention_lse(
     `head` picks the one these queries attend (a 2D-wide block of each page).
     """
     num_tokens, _, head_dim = q.shape
-    msa_attention.check_cache(kv_cache, scale_cache)
+    check_page_dtype(kv_cache.shape[2], kv_cache.dtype)
     _check_rows(kv_cache, head_dim, head)
     q, selected, local_page, local_limit = _pad_tokens(
         q, selected, local_page, local_limit, block_q
@@ -380,8 +351,6 @@ def msa_sparse_attention_lse(
         block_q=block_q,
         pages_per_step=pages_per_step,
         interpret=interpret,
-        scale_cache=scale_cache,
-        scale_rows=None if scale_cache is None else (k_scale_row, v_scale_row),
     )
     return out[:num_tokens], lse[:num_tokens]
 
@@ -400,7 +369,6 @@ def msa_sparse_attention_lse_heads(
     sm_scale: float,
     block_q: int = msa_attention.DEFAULT_BLOCK_Q,
     pages_per_step: int = msa_attention.DEFAULT_PAGES_PER_STEP,
-    scale_cache: jax.Array | None = None,
     interpret: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """`msa_sparse_attention_lse` for every KV head of the cache rows at once.
@@ -410,17 +378,10 @@ def msa_sparse_attention_lse_heads(
     over a single kernel whose KV head is an input, so the program carries
     one copy of the kernel instead of one per head. Returns ``(out
     [T, G * Hg, D], lse [T, G * Hg] f32)``.
-
-    With a 4-bit cache, `scale_cache` ``[pages, R, S]`` holds head ``h``'s K / V
-    scales in rows ``2h`` / ``2h + 1``.
     """
     num_tokens, num_q_heads, head_dim = q.shape
     num_heads = selected.shape[1]
-    msa_attention.check_cache(kv_cache, scale_cache)
-    if scale_cache is not None and scale_cache.shape[1] < 2 * num_heads:
-        raise ValueError(
-            f"scale pages {scale_cache.shape} miss K/V rows of {num_heads} heads."
-        )
+    check_page_dtype(kv_cache.shape[2], kv_cache.dtype)
     if _check_rows(kv_cache, head_dim) < num_heads or num_q_heads % num_heads:
         raise ValueError(
             f"{num_heads} KV heads of {num_q_heads} query heads do not fit cache "
@@ -447,8 +408,6 @@ def msa_sparse_attention_lse_heads(
             block_q=block_q,
             pages_per_step=pages_per_step,
             interpret=interpret,
-            scale_cache=scale_cache,
-            scale_rows=None if scale_cache is None else "head",
         )
 
     out, lse = jax.lax.map(
