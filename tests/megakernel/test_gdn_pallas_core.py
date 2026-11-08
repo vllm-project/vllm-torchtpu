@@ -203,7 +203,15 @@ def _run_gdn_pallas_case(
         HD=256,
     )
     pl_layout = None
-    cache = CacheExec()
+    ex = ExecSpec(
+        B=B,
+        T=T,
+        R=1,
+        ctx=256,
+        stack_e=True,
+        tiles=tiles,
+        interpret=interpret,
+    )
     if gpr:
         pl_layout = PoolLayout(
             num_pools=1,
@@ -215,22 +223,15 @@ def _run_gdn_pallas_case(
             conv_taps=3,
             conv_dtype=conv_dtype,
         )
-        cache = CacheExec(
-            paged_kv=True,
-            page_size=128,
-            num_pages=64,
-            pool_gather=True,
+        ex = dataclasses.replace(
+            ex,
+            cache=CacheExec(
+                paged_kv=True,
+                page_size=pl_layout.page_size,
+                num_pages=pl_layout.min_num_pages(ex),
+                pool_gather=True,
+            ),
         )
-    ex = ExecSpec(
-        B=B,
-        T=T,
-        R=1,
-        ctx=256,
-        stack_e=True,
-        tiles=tiles,
-        interpret=interpret,
-        cache=cache,
-    )
 
     class _GDNSmallMixer(FakeMixerModule):
         input_norm = None
@@ -485,16 +486,41 @@ def _run_gdn_pallas_case(
     ref_conv = ref_st[conv_out_key][0]
     if conv_out_dt == BF16:
         ref_conv = ref_conv.astype(BF16)
-    np.testing.assert_allclose(
-        conv_out[0].astype(F32),
-        ref_conv.astype(F32),
-        rtol=1e-5,
-        atol=1e-5,
-    )
-    # `rec_out` and `mix_out` are quantized to BF16 (unit roundoff 2**-7 = 7.8125e-3)
-    # across chained BF16 roundings (`beta`, `out`, `val.astype(BF16)`, `mix`), so
-    # JIT-fused vs eager F32 reductions before `round_bf16` can differ by 1-2 BF16 ULPs.
+    # `rec_out`, `mix_out`, and the newly projected `conv_out` rows
+    # (`round_bf16(xb @ w_in)`) are quantized to BF16 (unit roundoff 2**-7 =
+    # 7.8125e-3), so MXU vs CPU f32 matmuls or JIT-fused vs eager F32 reductions
+    # before `round_bf16` can differ by 1-2 BF16 ULPs. Shifted (`T == 1`) or
+    # gathered (`T > 1`) history rows are pure copies and must match bit-for-bit
+    # (`rtol=0, atol=0`).
     bf16_2ulp = 2.0 * (2.0**-7)
+    conv_new_rtol = 1e-5 if interpret else bf16_2ulp
+    conv_new_atol = 1e-5 if interpret else 1e-3
+    if T == 1:
+        np.testing.assert_allclose(
+            conv_out[0, : 2 * B].astype(F32),
+            ref_conv[: 2 * B].astype(F32),
+            rtol=0,
+            atol=0,
+        )
+        np.testing.assert_allclose(
+            conv_out[0, 2 * B :].astype(F32),
+            ref_conv[2 * B :].astype(F32),
+            rtol=conv_new_rtol,
+            atol=conv_new_atol,
+        )
+    else:
+        np.testing.assert_allclose(
+            conv_out[0, :, :3].astype(F32),
+            ref_conv[:, :3].astype(F32),
+            rtol=0,
+            atol=0,
+        )
+        np.testing.assert_allclose(
+            conv_out[0, :, 3:].astype(F32),
+            ref_conv[:, 3:].astype(F32),
+            rtol=conv_new_rtol,
+            atol=conv_new_atol,
+        )
     np.testing.assert_allclose(
         mix_out[:B].astype(F32),
         ref_out.astype(F32),
