@@ -29,6 +29,9 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu.models.minimax_m3.kernels import msa_attention
 from vllm_torchtpu.models.minimax_m3.kernels.packed_page import check_page_dtype
 
+# Page counts a kernel step may run at besides the full group (`_kernel`).
+_STEP_WIDTHS = (4, 8)
+
 
 def _kernel(
     # Scalar prefetch
@@ -63,51 +66,67 @@ def _kernel(
         l_ref[...] = jnp.zeros_like(l_ref)
         acc_ref[...] = jnp.zeros_like(acc_ref)
 
-    row_slots = msa_attention._bitcast_slots(rows_per_page, packing)  # [S, 1]
-    slots = row_slots.T  # [1, S]
-    selected = selected_ref[...]
-    local_page = local_page_ref[...]
-    local_limit = local_limit_ref[...]
-    keys, values, masks = [], [], []
-    for g, kv_ref in enumerate(kv_refs):
-        page = work_page_ref[msa_attention._slot(meta, pages_per_step, g)]
-        is_selected = jnp.max(
-            (selected == page).astype(jnp.int32), axis=1, keepdims=True
+    def attend(width):
+        """One online-softmax update over the group's first `width` slots."""
+        row_slots = msa_attention._bitcast_slots(rows_per_page, packing)  # [S, 1]
+        slots = row_slots.T  # [1, S]
+        selected = selected_ref[...]
+        local_page = local_page_ref[...]
+        local_limit = local_limit_ref[...]
+        keys, values, masks = [], [], []
+        for g, kv_ref in enumerate(kv_refs[:width]):
+            page = work_page_ref[msa_attention._slot(meta, pages_per_step, g)]
+            is_selected = jnp.max(
+                (selected == page).astype(jnp.int32), axis=1, keepdims=True
+            )
+            limit = jnp.where(local_page == page, local_limit, page_size)
+            limit = jnp.where(page >= 0, limit * is_selected, 0)  # [Bq, 1]
+            seen = jnp.max(limit)
+            if packing == 4:
+                rows = msa_attention._page_rows(kv_ref, None)
+                values.append(jnp.where(row_slots < seen, rows[:, head_dim:], 0))
+            else:
+                rows = msa_attention._page_rows(kv_ref, seen)
+                values.append(rows[:, head_dim:])
+            keys.append(rows[:, :head_dim])
+            masks.append(slots < limit)  # [Bq, S]
+        k = jnp.concatenate(keys, axis=0)
+        v = jnp.concatenate(values, axis=0)
+        mask = jnp.concatenate(masks, axis=1)
+        mask = jnp.concatenate([mask] * num_heads, axis=0)
+
+        q = q_ref[...].reshape(num_heads * block_q, head_dim)
+        s = jax.lax.dot_general(
+            q, k, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
         )
-        limit = jnp.where(local_page == page, local_limit, page_size)
-        limit = jnp.where(page >= 0, limit * is_selected, 0)  # [Bq, 1]
-        seen = jnp.max(limit)
-        if packing == 4:
-            rows = msa_attention._page_rows(kv_ref, None)
-            values.append(jnp.where(row_slots < seen, rows[:, head_dim:], 0))
-        else:
-            rows = msa_attention._page_rows(kv_ref, seen)
-            values.append(rows[:, head_dim:])
-        keys.append(rows[:, :head_dim])
-        masks.append(slots < limit)  # [Bq, S]
-    k = jnp.concatenate(keys, axis=0)
-    v = jnp.concatenate(values, axis=0)
-    mask = jnp.concatenate(masks, axis=1)
-    mask = jnp.concatenate([mask] * num_heads, axis=0)
+        s = jnp.where(mask, s * sm_scale, -jnp.inf)
 
-    q = q_ref[...].reshape(num_heads * block_q, head_dim)
-    s = jax.lax.dot_general(
-        q, k, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
-    )
-    s = jnp.where(mask, s * sm_scale, -jnp.inf)
+        m_prev = m_ref[...]
+        m_new = jnp.maximum(m_prev, jnp.max(s, axis=1, keepdims=True))
+        alpha = jnp.exp(m_prev - m_new)
+        p = jnp.exp(s - m_new)
+        l_ref[...] = alpha * l_ref[...] + jnp.sum(p, axis=1, keepdims=True)
+        acc_ref[...] = alpha * acc_ref[...] + jax.lax.dot_general(
+            p.astype(v.dtype),
+            v,
+            (((1,), (0,)), ((), ())),
+            preferred_element_type=jnp.float32,
+        )
+        m_ref[...] = m_new
 
-    m_prev = m_ref[...]
-    m_new = jnp.maximum(m_prev, jnp.max(s, axis=1, keepdims=True))
-    alpha = jnp.exp(m_prev - m_new)
-    p = jnp.exp(s - m_new)
-    l_ref[...] = alpha * l_ref[...] + jnp.sum(p, axis=1, keepdims=True)
-    acc_ref[...] = alpha * acc_ref[...] + jax.lax.dot_general(
-        p.astype(v.dtype),
-        v,
-        (((1,), (0,)), ((), ())),
-        preferred_element_type=jnp.float32,
-    )
-    m_ref[...] = m_new
+    # Run at the narrowest width holding the group's pages: unions are
+    # ascending with -1 at the end, so slot `n` is empty iff at most n pages
+    # remain. A step costs per score column, filled or not (~2.3 us at 16
+    # pages, ~1.1 us at 4, twin standalone j-952e8a64), and a 16-token
+    # tile's union is ~8-12 of its rank's pages at DCP 2, ~2-8 at DCP 8.
+    def present(g):
+        return work_page_ref[msa_attention._slot(meta, pages_per_step, g)] >= 0
+
+    widths = [n for n in _STEP_WIDTHS if n < pages_per_step] + [pages_per_step]
+    for i, width in enumerate(widths):
+        wider = present(widths[i - 1]) if i else True
+        fits = jnp.logical_not(present(width)) if width < pages_per_step else True
+        pl.when(jnp.logical_and(wider, fits))(functools.partial(attend, width))
 
     @pl.when((meta & msa_attention._LAST_BIT) != 0)
     def _finalize():
