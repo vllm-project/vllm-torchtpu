@@ -67,19 +67,25 @@ _LAZY_IMPORTERS = frozenset({"__init__.py", "dma/__init__.py", "runtime/__init__
 def test_megakernel_portability_ast_guard():
     """Enforce relative internal imports, 0 vllm/torch deps, and jax._src allowlist.
 
-    Checks all `.py` files under `src/vllm_torchtpu/megakernel/`:
-    - Zero imports from `vllm`, `vllm_torchtpu`, or `torch`.
+    Checks all `.py` files under `src/vllm_torchtpu/megakernel/` outside the
+    PyTorch/vLLM `adapter/` subpackage:
+    - Zero imports from `vllm`, `vllm_torchtpu`, `torch`, or `adapter/`.
     - All absolute (`level == 0`) imports come strictly from Python stdlib, `jax`,
       or `numpy` (enforcing relative imports for all internal modules).
     - Private `jax._src.*` imports are restricted to `{"dma/pool_alias.py"}`.
     - Dynamic import calls (`__import__`, `import_module`) are forbidden.
     """
     pkg_root = Path(megakernel.__file__).resolve().parent
+    adapter_root = pkg_root / "adapter"
     jax_src_allowlist = {"dma/pool_alias.py"}
     forbidden_roots = {"vllm", "vllm_torchtpu", "torch"}
     allowed_external_roots = sys.stdlib_module_names | {"jax", "numpy"}
 
-    py_files = sorted(pkg_root.rglob("*.py"))
+    py_files = sorted(
+        p
+        for p in pkg_root.rglob("*.py")
+        if p.relative_to(pkg_root).parts[0] != "adapter"
+    )
     rel_paths = {p.relative_to(pkg_root).as_posix() for p in py_files}
     required_modules = _derive_required_modules(pkg_root, py_files, rel_paths)
     assert len(required_modules) > 1
@@ -116,6 +122,20 @@ def test_megakernel_portability_ast_guard():
                 imported_names = [alias.name for alias in node.names]
             else:
                 continue
+
+            if level >= 1:
+                base = path.parent
+                for _ in range(level - 1):
+                    base = base.parent
+                rels = [m.replace(".", "/") for m in modules] or imported_names
+                for r in rels:
+                    target = base / r
+                    assert (
+                        target != adapter_root and adapter_root not in target.parents
+                    ), (
+                        f"{rel}:{_ln(node)} imports from 'adapter/'; framework-free "
+                        "megakernel modules must not import adapter/."
+                    )
 
             # `__init__.py` is the public package facade and may re-export
             # model helpers; all other core modules outside `models/` must not.

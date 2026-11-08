@@ -19,10 +19,10 @@ repository (such as `tests/experimental/export/test_checkpoint.py`) assume a
 single host CPU device per process. To avoid polluting the global XLA host
 device count when collected alongside non-megakernel tests in a shared pytest
 session:
-- Direct invocations targeting only `tests/megakernel*` configure `XLA_FLAGS`
+- Direct invocations targeting only `tests/megakernel` configure `XLA_FLAGS`
   in `pytest_configure` before JAX initializes its CPU backend and run in-process.
 - Mixed invocations leave the parent process's `XLA_FLAGS` untouched and
-  transparently stream each `tests/megakernel*` module through an isolated
+  transparently stream each `tests/megakernel` module through an isolated
   8-CPU-device subprocess whenever the parent process has fewer than 8 CPU
   devices.
 """
@@ -69,11 +69,7 @@ def _with_mk_xla_flags(raw_flags: str) -> str:
 
 
 def _mk_roots() -> tuple[Path, ...]:
-    tests_dir = Path(__file__).resolve().parent.parent
-    return (
-        (tests_dir / "megakernel").resolve(),
-        (tests_dir / "megakernel_runtime").resolve(),
-    )
+    return (Path(__file__).resolve().parent,)
 
 
 def _is_mk_path(path: Path) -> bool:

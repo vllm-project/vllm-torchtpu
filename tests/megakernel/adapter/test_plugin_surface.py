@@ -11,9 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The plugin-facing surface of the runtime: `RunnerView` on the CPU fake
-runner, `ForwardView`, the shorthand table, `StepContext`, the suppression
-scope and the runtime's errors."""
+"""The plugin-facing surface of `megakernel.adapter`: `RunnerView` on the CPU
+fake runner, `ForwardView`, the shorthand table, `StepContext`, the
+suppression scope and the adapter's errors."""
 
 from __future__ import annotations
 
@@ -29,12 +29,12 @@ from unittest import mock
 import pytest
 import torch
 
-from vllm_torchtpu import megakernel_runtime as mkr
+from vllm_torchtpu.megakernel import adapter as mka
 from vllm_torchtpu.megakernel import errors as mk_errors
+from vllm_torchtpu.megakernel.adapter import errors, hooks, testing
+from vllm_torchtpu.megakernel.adapter import plugin as plugin_mod
+from vllm_torchtpu.megakernel.adapter.plugin import ForwardView, RunnerView
 from vllm_torchtpu.megakernel.runtime import contract
-from vllm_torchtpu.megakernel_runtime import errors, hooks, testing
-from vllm_torchtpu.megakernel_runtime import plugin as plugin_mod
-from vllm_torchtpu.megakernel_runtime.plugin import ForwardView, RunnerView
 
 
 def test_fake_runner_implements_every_runner_view_property() -> None:
@@ -230,41 +230,41 @@ def test_step_context_and_package_exports() -> None:
     assert (ctx.model_kwargs, ctx.token_ids) == (None, None)
     with pytest.raises(dataclasses.FrozenInstanceError):
         ctx.input_ids = "other"  # type: ignore[misc]
-    assert mkr.StepContext is hooks.StepContext
-    assert mkr.suppressed is hooks.suppressed
-    assert mkr.is_suppressed is hooks.is_suppressed
-    assert mkr.MegakernelUnsupported is errors.MegakernelUnsupported
-    assert mkr.MegakernelPluginError is errors.MegakernelPluginError
+    assert mka.StepContext is hooks.StepContext
+    assert mka.suppressed is hooks.suppressed
+    assert mka.is_suppressed is hooks.is_suppressed
+    assert mka.MegakernelUnsupported is errors.MegakernelUnsupported
+    assert mka.MegakernelPluginError is errors.MegakernelPluginError
     assert issubclass(errors.MegakernelUnsupported, RuntimeError)
     assert issubclass(errors.MegakernelPluginError, RuntimeError)
 
 
 def test_suppressed_nests_and_restores_on_error() -> None:
     runner = SimpleNamespace()
-    assert not mkr.is_suppressed(runner) and not mkr.is_suppressed(None)
-    with mkr.suppressed(runner):
-        assert mkr.is_suppressed(runner)
-        with mkr.suppressed(runner):
-            assert mkr.is_suppressed(runner)
-        assert mkr.is_suppressed(runner)
-    assert not mkr.is_suppressed(runner)
-    with pytest.raises(RuntimeError, match="boom"), mkr.suppressed(runner):
+    assert not mka.is_suppressed(runner) and not mka.is_suppressed(None)
+    with mka.suppressed(runner):
+        assert mka.is_suppressed(runner)
+        with mka.suppressed(runner):
+            assert mka.is_suppressed(runner)
+        assert mka.is_suppressed(runner)
+    assert not mka.is_suppressed(runner)
+    with pytest.raises(RuntimeError, match="boom"), mka.suppressed(runner):
         raise RuntimeError("boom")
-    assert not mkr.is_suppressed(runner)
+    assert not mka.is_suppressed(runner)
     # Scoped to one runner; attribute-synthesizing mocks are never suppressed.
     other = SimpleNamespace()
-    with mkr.suppressed(runner):
-        assert not mkr.is_suppressed(other)
-    assert not mkr.is_suppressed(mock.MagicMock())
+    with mka.suppressed(runner):
+        assert not mka.is_suppressed(other)
+    assert not mka.is_suppressed(mock.MagicMock())
 
 
 _NO_FRAMEWORKS = """
 import sys
 for name in ("torch", "jax", "jaxlib", "vllm", "numpy"):
     sys.modules[name] = None
-import vllm_torchtpu.megakernel_runtime.errors
-import vllm_torchtpu.megakernel_runtime.hooks
-import vllm_torchtpu.megakernel_runtime.plugin
+import vllm_torchtpu.megakernel.adapter.errors
+import vllm_torchtpu.megakernel.adapter.hooks
+import vllm_torchtpu.megakernel.adapter.plugin
 """
 
 
@@ -272,7 +272,7 @@ def test_hooks_and_plugin_import_no_framework() -> None:
     """`errors`, `hooks` and `plugin` import with torch, jax, vLLM and numpy
     blocked (a model folder's stdlib-only `__init__` imports `plugin`); an
     import of any of them would fail the subprocess."""
-    src = Path(plugin_mod.__file__).resolve().parents[2]
+    src = Path(plugin_mod.__file__).resolve().parents[3]
     res = subprocess.run(
         [sys.executable, "-c", _NO_FRAMEWORKS],
         capture_output=True,

@@ -29,14 +29,14 @@ from typing import Any
 
 import pytest
 
+from vllm_torchtpu.megakernel.adapter import config as cfg_mod
+from vllm_torchtpu.megakernel.adapter import fingerprint as fp
+from vllm_torchtpu.megakernel.adapter import plugin as plugin_mod
+from vllm_torchtpu.megakernel.adapter.errors import MegakernelPluginError
 from vllm_torchtpu.megakernel.errors import MegakernelConfigError
 from vllm_torchtpu.megakernel.runtime.contract import TpuMonoSpec
-from vllm_torchtpu.megakernel_runtime import config as cfg_mod
-from vllm_torchtpu.megakernel_runtime import fingerprint as fp
-from vllm_torchtpu.megakernel_runtime import plugin as plugin_mod
-from vllm_torchtpu.megakernel_runtime.errors import MegakernelPluginError
 
-_SRC = Path(plugin_mod.__file__).resolve().parents[2]
+_SRC = Path(plugin_mod.__file__).resolve().parents[3]
 # A built-in shorthand and a checkpoint arch it claims: conftest's
 # `mk_fake_template`, entered in the table for every test here.
 _SHORTHAND = "mkfake"
@@ -172,12 +172,14 @@ def test_source_hash_is_bounded(mod_dir: Path, monkeypatch: pytest.MonkeyPatch) 
 
 
 def test_runtime_src_hash_covers_the_runtime_sources() -> None:
-    files = []
     h = fp.runtime_src_hash()
     assert len(h) == 64
-    pkg = _SRC / "vllm_torchtpu"
-    for sub in ("megakernel", "megakernel_runtime"):
-        files += [(f"{sub}/{rel}", p) for rel, p in fp._walk_py(pkg / sub, sub)]
+    mk_dir = _SRC / "vllm_torchtpu" / "megakernel"
+    files = [
+        (f"megakernel/{rel}", p)
+        for rel, p in fp._walk_py(mk_dir, "vllm_torchtpu.megakernel")
+    ]
+    assert any(rel.startswith("megakernel/adapter/") for rel, _ in files)
     assert fp.hash_files(files) == h
 
 
@@ -210,9 +212,9 @@ for name in ("torch", "jax", "jaxlib", "vllm", "numpy"):
     sys.modules[name] = None
 import vllm_torchtpu.megakernel.runtime.contract as contract
 import vllm_torchtpu.megakernel.errors as errors
-import vllm_torchtpu.megakernel_runtime.plugin as p
-import vllm_torchtpu.megakernel_runtime.config as c
-import vllm_torchtpu.megakernel_runtime.fingerprint as f
+import vllm_torchtpu.megakernel.adapter.plugin as p
+import vllm_torchtpu.megakernel.adapter.config as c
+import vllm_torchtpu.megakernel.adapter.fingerprint as f
 assert p.RunnerView and c.parse_config and f.source_hash
 assert issubclass(contract.LayoutDecline, errors.MegakernelLayoutError)
 assert errors.EligibilityResult is contract.EligibilityResult

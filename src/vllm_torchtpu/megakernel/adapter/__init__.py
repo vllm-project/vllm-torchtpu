@@ -11,19 +11,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Errors of the megakernel runtime (stdlib only). Config errors are the
-library's `megakernel.errors.MegakernelConfigError`."""
+"""PyTorch/vLLM adapter for `megakernel` plugins."""
 
 from __future__ import annotations
 
+from .errors import MegakernelPluginError, MegakernelUnsupported
+from .hooks import StepContext, is_suppressed, suppressed
 
-class MegakernelPluginError(RuntimeError):
-    """A plugin can't be fingerprinted (e.g. `plugin_source_unhashable:<why>`)."""
-
-
-class MegakernelUnsupported(RuntimeError):
-    """A framework feature was used that a serving megakernel can't follow
-    (e.g. `weight_update`: the packed weights would go stale)."""
-
-
-__all__ = ["MegakernelPluginError", "MegakernelUnsupported"]
+__all__ = [
+    "MegakernelPluginError",
+    "MegakernelUnsupported",
+    "StepContext",
+    "is_suppressed",
+    "suppressed",
+]
