@@ -100,24 +100,31 @@ def _ced_config(
     return ced_enabled, ced_boundary
 
 
+def _upload(values, dtype, device, reuse=None):
+    """``torch.tensor(values)`` on ``device``, or the last upload of equal values.
+
+    ``reuse`` (a dict owned by the caller) keeps the last upload, so a step
+    whose values did not change skips the host tensor and its H2D copy. No
+    consumer writes these tensors in place.
+    """
+    key = (values, dtype, device)
+    if reuse is not None and reuse.get("key") == key:
+        return reuse["tensor"]
+    tensor = torch.tensor(values, dtype=dtype, device=device)
+    if reuse is not None:
+        reuse.update(key=key, tensor=tensor)
+    return tensor
+
+
 def _with_window_starts(context, first, positions, reuse=None):
     """Publish each request's SWA bounded replay start to the attention layers.
 
-    ``reuse`` (a dict owned by the caller) keeps the last upload, so a step
-    whose replay starts did not change skips the host tensor and its H2D copy.
+    ``reuse``: see `_upload`.
     """
     requests = first.seq_lens.shape[0] if first is not None else 1
     hits = tuple(getattr(first, "replay_starts_cpu", None) or ())[:requests]
     values = hits + (0,) * (requests - len(hits))
-    key = (values, positions.dtype, positions.device)
-    if reuse is not None and reuse.get("key") == key:
-        window_starts = reuse["tensor"]
-    else:
-        window_starts = torch.tensor(
-            values, dtype=positions.dtype, device=positions.device
-        )
-        if reuse is not None:
-            reuse.update(key=key, tensor=window_starts)
+    window_starts = _upload(values, positions.dtype, positions.device, reuse)
     return replace(
         context,
         additional_kwargs={
@@ -425,6 +432,16 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
     @cached_property
     def _window_starts_upload(self) -> dict:
         """Last window-starts upload (TPU_DEEPSEEK_V41_REUSE_WINDOW_STARTS)."""
+        return {}
+
+    @cached_property
+    def _decoder_bounds_upload(self) -> dict:
+        """Last CED decoder query-bounds upload (as `_window_starts_upload`)."""
+        return {}
+
+    @cached_property
+    def _replay_starts_upload(self) -> dict:
+        """Last CED decoder replay-starts upload (as `_window_starts_upload`)."""
         return {}
 
     @cached_property
@@ -1008,11 +1025,19 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 decoder_positions = positions[gather]
                 decoder_ids = input_ids[gather] if input_ids is not None else None
                 decoder_hidden, decoder_mix = hidden[gather], pre_mix[gather]
-            bounds = torch.tensor(
-                plan.query_start_loc, dtype=torch.int32, device=positions.device
+            # Steady decode replans the same bounds and starts every step.
+            reuse = envs.TPU_DEEPSEEK_V41_REUSE_WINDOW_STARTS
+            bounds = _upload(
+                plan.query_start_loc,
+                torch.int32,
+                positions.device,
+                self._decoder_bounds_upload if reuse else None,
             )
-            replay_starts = torch.tensor(
-                plan.replay_starts, dtype=positions.dtype, device=positions.device
+            replay_starts = _upload(
+                plan.replay_starts,
+                positions.dtype,
+                positions.device,
+                self._replay_starts_upload if reuse else None,
             )
             decoder_metadata = {
                 key: replace(

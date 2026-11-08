@@ -102,33 +102,65 @@ def _context_kv(
     return attn._rotate(kv, positions)
 
 
+def _context_kv_addresses(
+    attn: DeepseekV41Attention,
+    positions: torch.Tensor,
+    metadata,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """One draft layer's SWA write slots and the rows inside its window."""
+    swa_cache = attn.swa_cache_layer.kv_cache
+    if isinstance(metadata, torch.Tensor):
+        return metadata, metadata >= 0
+    swa_slots = _cache_slots(swa_cache, metadata, positions)
+    if metadata.seq_lens.numel() == 0:
+        return swa_slots, swa_slots >= 0
+    requests = _token_requests(metadata, positions).clamp(
+        max=metadata.seq_lens.shape[0] - 1
+    )
+    offsets = (
+        positions - table_lookup.take(metadata.seq_lens, requests) + attn.window_size
+    )
+    swa_valid = (swa_slots >= 0) & (offsets >= 0) & (offsets < attn.window_size)
+    return swa_slots, swa_valid
+
+
 def _insert_context_kv(
     attn: DeepseekV41Attention,
     kv: torch.Tensor,
     positions: torch.Tensor,
     metadata,
+    addresses: dict | None = None,
 ) -> None:
-    """Write rotated context KV rows into one draft layer's SWA cache."""
+    """Write rotated context KV rows into one draft layer's SWA cache.
+
+    ``addresses`` (owned by the caller, for one set of ``positions``) keeps
+    each metadata's slots and window mask: the draft layers share one SWA
+    group, so they read the same tables and the second and third layer
+    reuse the first's addresses instead of recomputing them.
+    """
     swa_cache = attn.swa_cache_layer.kv_cache
     if metadata is None or not swa_cache.numel():
         return
+    if addresses is None:
+        swa_slots, swa_valid = _context_kv_addresses(attn, positions, metadata)
+        _insert(swa_cache, swa_slots, kv, swa_valid)
+        return
     if isinstance(metadata, torch.Tensor):
-        swa_slots = metadata
-        swa_valid = swa_slots >= 0
+        tables = (metadata,)
     else:
-        swa_slots = _cache_slots(swa_cache, metadata, positions)
-        if metadata.seq_lens.numel() > 0:
-            requests = _token_requests(metadata, positions).clamp(
-                max=metadata.seq_lens.shape[0] - 1
-            )
-            offsets = (
-                positions
-                - table_lookup.take(metadata.seq_lens, requests)
-                + attn.window_size
-            )
-            swa_valid = (swa_slots >= 0) & (offsets >= 0) & (offsets < attn.window_size)
-        else:
-            swa_valid = swa_slots >= 0
+        tables = (metadata.block_tables, metadata.query_start_loc, metadata.seq_lens)
+    # Matched by tensor identity, as `_cache_slots` does: the caller is a
+    # fullgraph compile, where Dynamo traces `is` but not `id()`.
+    key = (swa_cache.shape[1], attn.window_size)
+    entries = addresses.setdefault(key, [])
+    for cached_tables, swa_slots, swa_valid in entries:
+        if len(cached_tables) == len(tables) and all(
+            a is b for a, b in zip(cached_tables, tables)
+        ):
+            break
+    else:
+        swa_slots, swa_valid = _context_kv_addresses(attn, positions, metadata)
+        entries.append((tables, swa_slots, swa_valid))
     _insert(swa_cache, swa_slots, kv, swa_valid)
 
 
@@ -281,11 +313,16 @@ class DSparkDeepseekV41Model(nn.Module):
             main_x = self.combine_hidden_states(target_hidden_states)
         else:
             main_x = target_hidden_states
+        addresses: dict = {}
         for i, layer in enumerate(cast(Iterable[DeepseekV41DecoderLayer], self.layers)):
             attn = layer.attn
             layer_md = None if metadata is None else metadata[i]
             _insert_context_kv(
-                attn, _context_kv(attn, main_x, positions), positions, layer_md
+                attn,
+                _context_kv(attn, main_x, positions),
+                positions,
+                layer_md,
+                addresses,
             )
         return main_x
 

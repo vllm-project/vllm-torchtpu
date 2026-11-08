@@ -1282,18 +1282,34 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                             non_causal,
                         )
                     )
+                # Every layer of the stage reads the same tables, starts and
+                # positions, so the token requests and the write mask are
+                # stage-wide too.
+                swa_valid = csa2_write_records >= 0
+                swa_invalid_3d = (~swa_valid)[:, None, None]
+                requests = _token_requests(swa, positions).clamp(
+                    max=swa_table.shape[0] - 1
+                )
                 if stage_cache is not None:
                     stage_cache[meta_key] = (
                         swa.block_tables,
                         csa2_metadata,
                         csa2_bounds,
                         csa2_write_records,
+                        swa_valid,
+                        swa_invalid_3d,
+                        requests,
                     )
             else:
-                _, csa2_metadata, csa2_bounds, csa2_write_records = cached
-            swa_valid = csa2_write_records >= 0
-            swa_invalid_3d = (~swa_valid)[:, None, None]
-            requests = _token_requests(swa, positions).clamp(max=swa_table.shape[0] - 1)
+                (
+                    _,
+                    csa2_metadata,
+                    csa2_bounds,
+                    csa2_write_records,
+                    swa_valid,
+                    swa_invalid_3d,
+                    requests,
+                ) = cached
             swa_slots = records = valid_window = logical = None
         else:
             if (
