@@ -161,13 +161,7 @@ def _patch_vllm_mamba_split_scheduler_block_size() -> None:
         from vllm_torchtpu.distributed.pcp import pcp_splits_tokens
 
         physical_cache_config = self.cache_config
-        if physical_cache_config.block_size == self.block_size or not pcp_splits_tokens(
-            self.vllm_config
-        ):
-            # A model that keeps whole steps under PCP (qwen4_exp) caches its
-            # Mamba states at the physical block, as without PCP; aligning to
-            # the logical PCP block (its split main KV's) would clip every
-            # chunk shorter than that block to zero tokens.
+        if physical_cache_config.block_size == self.block_size:
             return original_split(self, *args, **kwargs)
 
         scheduler_cache_config = copy.copy(physical_cache_config)
@@ -176,9 +170,18 @@ def _patch_vllm_mamba_split_scheduler_block_size() -> None:
         # and the upstream implementation contains no callback or await point.
         self.cache_config = scheduler_cache_config
         try:
-            return original_split(self, *args, **kwargs)
+            aligned = original_split(self, *args, **kwargs)
         finally:
             self.cache_config = physical_cache_config
+        if aligned > 0 or pcp_splits_tokens(self.vllm_config):
+            return aligned
+        # A model that keeps whole steps under PCP (qwen4_exp) still prefers
+        # the logical block: a prefix hit stops at a multiple of its split
+        # main KV's block, so a Mamba state cached between two of them is
+        # never reusable (PP4 x PCP2: prefill hit rate 38% against PP8's 81%,
+        # j-9284a969-2e73-45d2-972f). Where that would clip the chunk to zero
+        # tokens, fall back to the physical block rather than stall.
+        return original_split(self, *args, **kwargs)
 
     split_with_scheduler_block_size._tpu_scheduler_block_size_patch = True
     Scheduler._mamba_block_aligned_split = split_with_scheduler_block_size
