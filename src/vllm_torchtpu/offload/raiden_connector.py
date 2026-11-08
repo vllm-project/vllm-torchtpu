@@ -44,6 +44,11 @@ Core mechanisms:
 - Memory reuse (jobs_to_flush): Handled entirely scheduler-side. Fence-pending
   stores are cancelled before launching, while active transfers are drained
   synchronously before shipping metadata, preventing torn reads upon block reuse.
+
+- Partial tails under DCP: `"dcp_partial_tail": true` in
+  `kv_connector_extra_config` (default off) offloads and loads hybrid-model
+  prefixes that end inside a DCP-scaled attention block. See
+  `TPURaidenOffloadingScheduler`.
 """
 
 from __future__ import annotations
@@ -67,9 +72,15 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading import (
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
     OffloadingConnectorMetadata,
     OffloadingWorkerMetadata,
+    TransferJob,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
+    _ConnectorMetricName,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
     OffloadingConnectorScheduler,
+    RequestOffloadState,
+    TransferJobStatus,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker import (
     OffloadingConnectorWorker,
@@ -77,6 +88,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker import (
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
     OffloadingConnector,
 )
+from vllm.utils.math_utils import round_down
+from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.kv_offload.base import (
@@ -84,9 +97,12 @@ from vllm.v1.kv_offload.base import (
     CanonicalKVCaches,
     CanonicalKVCacheTensor,
     GPULoadStoreSpec,
+    LookupResult,
     OffloadKey,
+    OffloadPolicy,
 )
 from vllm.v1.outputs import KVConnectorOutput
+from vllm.v1.request import Request
 
 from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.logger import init_logger
@@ -95,12 +111,16 @@ from vllm_torchtpu.offload.raiden_store import (
     RaidenLoadStoreSpec,
     RaidenOffloadingManager,
     TPURaidenStoreOffloadingSpec,
+    _parse_storage_flag,
 )
 
 if TYPE_CHECKING:
     from vllm.distributed.kv_events import KVCacheEvent
 
 logger = init_logger(__name__)
+
+# kv_connector_extra_config key enabling partial tails under DCP.
+_DCP_PARTIAL_TAIL_KEY = "dcp_partial_tail"
 
 
 def _enqueue_pool_writes(pool_tensors: list[torch.Tensor]) -> None:
@@ -200,6 +220,13 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
 
     Strips per-rank transfer jobs and orchestrates the store engine directly
     via RaidenOffloadingManager.
+
+    With `dcp_partial_tail` set, also stores and loads partial tails for
+    hybrid models under DCP. vLLM scales attention blocks by DCP but not
+    recurrent state blocks, so an attention block spans several hash
+    boundaries, each with its own state snapshot. Upstream partial tails need
+    one block size and DCP == 1. Here a tail is the partly filled attention
+    block plus the state snapshots, stored under the boundary's keys.
     """
 
     def __init__(
@@ -217,6 +244,339 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         assert isinstance(self.manager, RaidenOffloadingManager)
         self._raiden_manager: RaidenOffloadingManager = self.manager
         self._fence_pending: dict[int, _ParkedStore] = {}
+        # Recurrent snapshot block per (group_idx, boundary), held until the
+        # step that computes the rest of the prompt.
+        self._deferred_tail_states: dict[str, dict[tuple[int, int], int]] = {}
+        self._mixed_partial_tail = _parse_storage_flag(
+            spec.extra_config.get(_DCP_PARTIAL_TAIL_KEY),
+            default=False,
+            what=_DCP_PARTIAL_TAIL_KEY,
+        ) and self._enable_mixed_partial_tail(
+            vllm_config.parallel_config.decode_context_parallel_size
+        )
+
+    def _enable_mixed_partial_tail(self, dcp: int) -> bool:
+        """Turn on partial tails if the KV cache groups have the DCP shape."""
+        groups = self.config.kv_group_configs
+        attention_sizes = {
+            group.tokens_per_block for group in groups if not group.requires_cow_source
+        }
+        recurrent_sizes = {
+            group.tokens_per_block for group in groups if group.requires_cow_source
+        }
+        has_eagle_group = any(group.is_eagle_group for group in groups)
+        if not (
+            not self.config.supports_partial_tail
+            and self.config.blocks_per_chunk == 1
+            and len(attention_sizes) == 1
+            and min(attention_sizes) > self.config.tokens_per_hash
+            and bool(self._cow_source_groups)
+            and all(
+                group.tokens_per_block == self.config.tokens_per_hash
+                if group.requires_cow_source
+                else group.sliding_window_size_in_chunks is None
+                for group in groups
+            )
+            and not has_eagle_group
+        ):
+            logger.info(
+                "Raiden partial tail offloading stays off despite %s: it needs "
+                "blocks_per_chunk=1, one full-attention block size above "
+                "tokens_per_hash, align-mode recurrent groups at tokens_per_hash, "
+                "no EAGLE group, and no upstream partial tails; got "
+                "blocks_per_chunk=%d, attention blocks=%s, recurrent blocks=%s, "
+                "tokens_per_hash=%d, EAGLE group=%s, upstream partial tails=%s, "
+                "DCP=%d",
+                _DCP_PARTIAL_TAIL_KEY,
+                self.config.blocks_per_chunk,
+                sorted(attention_sizes),
+                sorted(recurrent_sizes),
+                self.config.tokens_per_hash,
+                has_eagle_group,
+                self.config.supports_partial_tail,
+                dcp,
+            )
+            return False
+        # The base class reads the tail block size only where partial tails
+        # are supported, so both are set together.
+        self.config = self.config._replace(supports_partial_tail=True)
+        self._partial_tail_block_size = min(attention_sizes)
+        logger.info(
+            "Raiden partial tail offloading enabled: attention block=%d tokens, "
+            "recurrent state/hash=%d tokens, DCP=%d",
+            self._partial_tail_block_size,
+            self.config.tokens_per_hash,
+            dcp,
+        )
+        return True
+
+    def _lookup(
+        self,
+        req_status: RequestOffloadState,
+        max_num_new_tokens: int | None = None,
+    ) -> int | None:
+        if not self._mixed_partial_tail:
+            return super()._lookup(req_status, max_num_new_tokens)
+        req_status.partial_tail_boundary = None
+        req = req_status.req
+        req_context = req_status.req_context
+        block_size = self._partial_tail_block_size
+        tokens_per_hash = self.config.tokens_per_hash
+        local_tokens = req_status.num_locally_computed_tokens
+        # A load fills attention blocks from the start of one.
+        if local_tokens % block_size:
+            return 0
+        complete_hit = self._lookup_complete_chunks(req_status, max_num_new_tokens)
+        complete_boundary = local_tokens + (complete_hit or 0)
+        attention_boundary = round_down(complete_boundary, block_size)
+        pending = complete_hit is None
+        max_tokens = req.num_prompt_tokens - 1
+        if max_num_new_tokens is not None:
+            max_tokens = min(max_tokens, local_tokens + max_num_new_tokens)
+        if req_status.max_load_tokens is not None:
+            max_tokens = min(max_tokens, local_tokens + req_status.max_load_tokens)
+        attention_groups = [
+            group
+            for group in self.config.kv_group_configs
+            if not group.requires_cow_source
+        ]
+        # An earlier recurrent checkpoint may be evicted while the attention
+        # prefix and a later tail checkpoint are still available. At a block
+        # boundary, an attention group's boundary key is its chunk key.
+        while attention_boundary + block_size <= max_tokens:
+            boundary = attention_boundary + block_size
+            results = [
+                self.manager.lookup(
+                    self._make_boundary_key(
+                        req, group.group_idx, boundary, req_context
+                    ),
+                    req_context,
+                )
+                for group in attention_groups
+            ]
+            pending |= any(
+                r in (LookupResult.HIT_PENDING, LookupResult.RETRY) for r in results
+            )
+            if not all(r is LookupResult.HIT for r in results):
+                break
+            attention_boundary = boundary
+
+        max_boundary = round_down(
+            min(max_tokens, attention_boundary + block_size - 1), tokens_per_hash
+        )
+        for boundary in range(max_boundary, complete_boundary, -tokens_per_hash):
+            hit, boundary_pending = self._lookup_partial_tail(
+                req_status, boundary, False
+            )
+            pending |= boundary_pending
+            if not hit:
+                continue
+            if self._chunks_being_loaded:
+                load_keys = {
+                    self._make_boundary_key(req, group.group_idx, boundary, req_context)
+                    for group in self.config.kv_group_configs
+                }
+                for group in attention_groups:
+                    group_state = req_status.group_states[group.group_idx]
+                    start = local_tokens // group.tokens_per_chunk
+                    end = (boundary - 1) // group.tokens_per_chunk
+                    load_keys.update(group_state.offload_keys[start:end])
+                if not self._chunks_being_loaded.isdisjoint(load_keys):
+                    logger.debug(
+                        "Raiden partial tail delayed for in-flight load: "
+                        "request=%s boundary=%d",
+                        req.request_id,
+                        boundary,
+                    )
+                    return None
+            req_status.partial_tail_boundary = boundary
+            logger.debug(
+                "Raiden partial tail hit: request=%s local=%d boundary=%d",
+                req.request_id,
+                local_tokens,
+                boundary,
+            )
+            return boundary - local_tokens
+        return None if pending and not complete_hit else complete_hit
+
+    def update_state_after_alloc(
+        self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int
+    ):
+        super().update_state_after_alloc(request, blocks, num_external_tokens)
+        if not self._mixed_partial_tail or not num_external_tokens:
+            return
+        req_status = self._req_status[request.request_id]
+        if req_status.offloading_context.policy != OffloadPolicy.CHUNK_LEVEL:
+            return
+        cached_tokens = req_status.num_locally_computed_tokens + num_external_tokens
+        for group, group_state in zip(
+            self.config.kv_group_configs, req_status.group_states
+        ):
+            # A loaded tail must still be stored under its full-block key
+            # once the request fills the rest of the attention block.
+            group_state.next_stored_chunk_idx = cached_tokens // group.tokens_per_chunk
+
+    def _build_partial_tail_store_jobs(
+        self, scheduler_output: SchedulerOutput
+    ) -> dict[int, TransferJob]:
+        if not self._mixed_partial_tail:
+            return super()._build_partial_tail_store_jobs(scheduler_output)
+
+        discarded = set(scheduler_output.preempted_req_ids or ()) | set(
+            scheduler_output.finished_req_ids or ()
+        )
+        allocated = self._current_batch_allocated_block_ids
+        for req_id, entries in list(self._deferred_tail_states.items()):
+            if req_id in discarded or req_id not in self._req_status:
+                del self._deferred_tail_states[req_id]
+                continue
+            self._deferred_tail_states[req_id] = {
+                key: block_id
+                for key, block_id in entries.items()
+                if block_id not in allocated
+            }
+
+        block_state = scheduler_output.kv_connector_block_state
+        handoffs = block_state.boundary_state_offloads if block_state else {}
+        aligned: dict[str, list[tuple[int, int, int]]] = {}
+        for req_id, handoff_entries in handoffs.items():
+            if req_id in discarded or req_id not in self._req_status:
+                continue
+            for group_idx, block_id, boundary in handoff_entries:
+                if boundary % self._partial_tail_block_size == 0:
+                    aligned.setdefault(req_id, []).append(
+                        (group_idx, block_id, boundary)
+                    )
+                elif group_idx in self._cow_source_groups and block_id:
+                    self._deferred_tail_states.setdefault(req_id, {})[
+                        group_idx, boundary
+                    ] = block_id
+
+        jobs = self._build_aligned_boundary_store_jobs(aligned)
+        for req_id, scheduled in scheduler_output.num_scheduled_tokens.items():
+            if req_id in discarded or req_id not in self._req_status:
+                continue
+            req_status = self._req_status[req_id]
+            req = req_status.req
+            boundary = req.num_prompt_tokens
+            if (
+                not scheduled
+                or req.sampling_params is None
+                or req.sampling_params.max_tokens != 1
+                or req.num_computed_tokens + scheduled != boundary
+                or boundary % self.config.tokens_per_hash
+                or boundary % self._partial_tail_block_size == 0
+            ):
+                continue
+            # Sparse retention may omit this final prompt state. With
+            # max_tokens=1, no later decode step can overwrite it.
+            deferred = self._deferred_tail_states.setdefault(req_id, {})
+            for group_idx in self._cow_source_groups:
+                group = self.config.kv_group_configs[group_idx]
+                block_ids = req_status.group_states[group_idx].block_ids
+                block_idx = boundary // group.tokens_per_block - 1
+                if block_idx < len(block_ids) and block_ids[block_idx]:
+                    deferred.setdefault((group_idx, boundary), block_ids[block_idx])
+
+        for req_id, deferred in list(self._deferred_tail_states.items()):
+            req_status = self._req_status[req_id]
+            req = req_status.req
+            scheduled = scheduler_output.num_scheduled_tokens.get(req_id, 0)
+            # Wait until the prompt is fully computed: the tail's attention
+            # block may be written by a later step than its state hand-off,
+            # and the save fence of the step that finishes the prompt covers
+            # both writes.
+            if not scheduled or req.num_computed_tokens + scheduled < req.num_tokens:
+                continue
+            del self._deferred_tail_states[req_id]
+            max_boundary = self._calc_num_offloadable_tokens(req_status, req.num_tokens)
+            for boundary in sorted({boundary for _, boundary in deferred}):
+                if boundary <= 0 or boundary > max_boundary:
+                    continue
+                if boundary % self.config.tokens_per_hash:
+                    continue
+                sources = []
+                for group in self.config.kv_group_configs:
+                    if group.requires_cow_source:
+                        block_id = deferred.get((group.group_idx, boundary), 0)
+                    else:
+                        block_ids = req_status.group_states[group.group_idx].block_ids
+                        block_idx = boundary // group.tokens_per_block
+                        block_id = (
+                            block_ids[block_idx] if block_idx < len(block_ids) else 0
+                        )
+                    if not block_id:
+                        break
+                    sources.append(block_id)
+                else:
+                    jobs.update(
+                        self._build_tail_store_job(req_status, boundary, sources)
+                    )
+        return jobs
+
+    def _build_tail_store_job(
+        self, req_status: RequestOffloadState, boundary: int, source_blocks: list[int]
+    ) -> dict[int, TransferJob]:
+        """Store each group's block at `boundary` under its boundary key."""
+        req = req_status.req
+        groups = self.config.kv_group_configs
+        keys = [
+            self._make_boundary_key(
+                req, group.group_idx, boundary, req_status.req_context
+            )
+            for group in groups
+        ]
+        output = self.manager.prepare_store(keys, req_status.req_context)
+        if output is None:
+            self._connector_stats.increase_counter(
+                _ConnectorMetricName.ALLOCATION_FAILURE
+            )
+            return {}
+        if not output.keys_to_store:
+            return {}
+
+        sources = dict(zip(keys, zip(groups, source_blocks)))
+        group_sizes = [0] * len(groups)
+        block_indices = [0] * len(groups)
+        accepted_blocks = []
+        for key in output.keys_to_store:
+            group, block_id = sources[key]
+            group_sizes[group.group_idx] = 1
+            block_indices[group.group_idx] = (boundary - 1) // group.tokens_per_block
+            accepted_blocks.append(block_id)
+            self._events_tracker.record_partial_store(req, group, boundary, key)
+
+        job_id = self._generate_job_id()
+        req_status.transfer_jobs.add(job_id)
+        for block_id in accepted_blocks:
+            self._block_id_to_pending_jobs.setdefault(block_id, set()).add(job_id)
+        self._jobs[job_id] = TransferJobStatus(
+            req_id=req.request_id,
+            pending_count=self.config.num_workers,
+            keys=set(output.keys_to_store),
+            is_store=True,
+            fenced_block_ids=accepted_blocks,
+        )
+        logger.debug(
+            "Raiden partial tail store: request=%s boundary=%d "
+            "groups=%s blocks=%s job=%d",
+            req.request_id,
+            boundary,
+            group_sizes,
+            accepted_blocks,
+            job_id,
+        )
+        return {
+            job_id: TransferJob(
+                req_id=req.request_id,
+                src_spec=GPULoadStoreSpec(
+                    accepted_blocks,
+                    group_sizes=group_sizes,
+                    block_indices=block_indices,
+                ),
+                dst_spec=output.store_spec,
+            )
+        }
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
