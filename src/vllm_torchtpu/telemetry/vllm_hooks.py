@@ -13,6 +13,7 @@ from typing import Any
 from vllm_torchtpu import envs
 from vllm_torchtpu.telemetry.eviction_tracker import (
     BlockEvictionTracker,
+    compute_tpu_bucket_padding_tokens,
     extract_hardware_span_attributes,
 )
 from vllm_torchtpu.telemetry.token_breakdown import (
@@ -53,6 +54,9 @@ SPAN_ATTRIBUTE_KEYS: tuple[str, ...] = (
     "vllm.kv_cache.ssd_tokens",
     "vllm.kv_cache.ssd_bytes",
     "vllm.kv_cache.ssd_ms",
+    "vllm.kv_cache.external_computed_tokens",
+    "vllm.kv_cache.remote_tokens",
+    "vllm.kv_cache.transfer_ms",
     "vllm.tpu.shape_padding_tokens",
 )
 
@@ -60,6 +64,7 @@ _ACTIVE_TRACE_HEADERS: contextvars.ContextVar[dict[str, str] | None] = (
     contextvars.ContextVar("_ACTIVE_TRACE_HEADERS", default=None)
 )
 _BLOCK_SIZE_SYNC_PATH = "/tmp/.vllm_tpu_agentic_block_size"
+_EVICTION_SYNC_PATH = "/tmp/.vllm_tpu_agentic_eviction_state"
 
 
 def _resolve_trace_headers(
@@ -81,6 +86,26 @@ def _resolve_num_cached_tokens(req_state: Any, engine_core_output: Any) -> int:
     if num_cached is None:
         num_cached = getattr(req_state, "num_cached_tokens", 0) or 0
     return int(num_cached)
+
+
+def _resolve_num_external_cached_tokens(
+    req_state: Any, engine_core_output: Any
+) -> int:
+    """Extract external/DRAM cached tokens from `prefill_stats`, `engine_core_output`, or `req_state`."""
+    ext = getattr(engine_core_output, "num_external_computed_tokens", None)
+    if ext is None:
+        ext = getattr(engine_core_output, "num_external_cached_tokens", None)
+    if ext is None:
+        prefill_stats = getattr(engine_core_output, "prefill_stats", None)
+        if prefill_stats is not None:
+            ext = getattr(prefill_stats, "num_external_cached_tokens", None)
+            if ext is None:
+                ext = getattr(prefill_stats, "num_external_computed_tokens", None)
+    if ext is None:
+        ext = getattr(req_state, "_cuj2_external_cached_tokens", None)
+    if ext is None:
+        ext = getattr(req_state, "num_external_cached_tokens", 0) or 0
+    return int(ext)
 
 
 def extract_agent_headers(
@@ -144,6 +169,26 @@ class AgenticTelemetryService:
         self.eviction_tracker = eviction_tracker or BlockEvictionTracker()
         self.category_totals: dict[str, int] = {cat: 0 for cat in CATEGORIES}
         self._req_breakdowns: dict[str, TokenBreakdown] = {}
+        self._req_external_tokens: dict[str, int] = {}
+
+    def _maybe_sync_eviction_state(self) -> None:
+        """Sync recent HBM eviction timestamps from EngineCore child process."""
+        if not envs.VLLM_TPU_AGENTIC_TELEMETRY or not os.path.exists(
+            _EVICTION_SYNC_PATH
+        ):
+            return
+        try:
+            with open(_EVICTION_SYNC_PATH, encoding="utf-8") as f:
+                parts = f.read().strip().split()
+            if len(parts) >= 2:
+                ts = float(parts[0])
+                wall_ms = int(parts[1])
+                cur_ts = self.eviction_tracker._last_evicted_ts
+                if cur_ts is None or ts > cur_ts:
+                    self.eviction_tracker._last_evicted_ts = ts
+                    self.eviction_tracker._last_evicted_wall_ms = wall_ms
+        except (OSError, ValueError):
+            pass
 
     def _maybe_sync_vllm_block_size(self) -> None:
         """Auto-detect `cache_config.block_size` (e.g. 64/128 on TPU) once if not explicitly set."""
@@ -183,6 +228,19 @@ class AgenticTelemetryService:
     def on_block_evicted(self, block_hash: Any, now: float | None = None) -> None:
         """Record an HBM block eviction event."""
         self.eviction_tracker.record_eviction(block_hash, now=now)
+        if (
+            envs.VLLM_TPU_AGENTIC_TELEMETRY
+            and self.eviction_tracker._last_evicted_ts is not None
+            and self.eviction_tracker._last_evicted_wall_ms is not None
+        ):
+            try:
+                with open(_EVICTION_SYNC_PATH, "w", encoding="utf-8") as f:
+                    f.write(
+                        f"{self.eviction_tracker._last_evicted_ts} "
+                        f"{self.eviction_tracker._last_evicted_wall_ms}"
+                    )
+            except OSError:
+                pass
 
     def on_prefill_output(
         self, req_state: Any, engine_core_output: Any
@@ -191,6 +249,16 @@ class AgenticTelemetryService:
         req_id = getattr(engine_core_output, "request_id", None) or getattr(
             req_state, "request_id", ""
         )
+        ext_cached = _resolve_num_external_cached_tokens(
+            req_state, engine_core_output
+        )
+        if ext_cached > 0:
+            if req_id:
+                self._req_external_tokens[req_id] = ext_cached
+            try:
+                req_state._cuj2_external_cached_tokens = ext_cached
+            except AttributeError:
+                pass
         if req_id and req_id in self._req_breakdowns:
             return self._req_breakdowns[req_id]
 
@@ -261,6 +329,17 @@ class AgenticTelemetryService:
         now: float | None = None,
     ) -> dict[str, Any]:
         """Build all CUJ-2 OTel span attributes for a completed request."""
+        req_id = getattr(engine_core_output, "request_id", None) or getattr(
+            req_state, "request_id", ""
+        )
+        ext_computed = (
+            self._req_external_tokens.pop(req_id, 0) if req_id else 0
+        )
+        if not ext_computed:
+            ext_computed = _resolve_num_external_cached_tokens(
+                req_state, engine_core_output
+            )
+
         breakdown = self.on_request_finished(req_state, engine_core_output)
         attrs = breakdown.to_span_attributes()
         attrs["gen_ai.server.replica_id"] = self.replica_id
@@ -275,6 +354,7 @@ class AgenticTelemetryService:
         if parent_session_id and "gen_ai.session.parent_id" not in attrs:
             attrs["gen_ai.session.parent_id"] = parent_session_id
 
+        self._maybe_sync_eviction_state()
         eviction_age_ms: float | None = None
         if breakdown.affinity_honored_eviction > 0:
             prompt_token_ids = getattr(req_state, "prompt_token_ids", None) or ()
@@ -287,17 +367,26 @@ class AgenticTelemetryService:
             )
             if eviction_age_ms is None:
                 eviction_age_ms = self.eviction_tracker.last_eviction_age_ms(now=now)
+            if (
+                session_id
+                and self.eviction_tracker.session_evicted_at_ms(session_id) is None
+                and self.eviction_tracker._last_evicted_wall_ms is not None
+            ):
+                self.eviction_tracker._session_evicted_wall_ms.put(
+                    session_id, self.eviction_tracker._last_evicted_wall_ms
+                )
 
+        scheduled_tokens = max(0, breakdown.total_tokens - breakdown.cache_hit)
         hw_attrs = extract_hardware_span_attributes(
             kv_transfer_params=getattr(engine_core_output, "kv_transfer_params", None),
-            num_external_computed_tokens=getattr(
-                engine_core_output, "num_external_computed_tokens", 0
-            )
-            or 0,
+            num_external_computed_tokens=ext_computed,
             time_since_eviction_ms=eviction_age_ms,
             lru_horizon_ms=self.eviction_tracker.lru_horizon_ms(now=now),
             session_evicted_at_ms=self.eviction_tracker.session_evicted_at_ms(
                 session_id
+            ),
+            tpu_shape_padding_tokens=compute_tpu_bucket_padding_tokens(
+                scheduled_tokens
             ),
         )
         attrs.update(hw_attrs)

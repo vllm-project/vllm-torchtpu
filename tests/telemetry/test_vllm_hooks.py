@@ -247,7 +247,10 @@ def test_vllm_v1_prefill_stats_weight_version_and_contextvar_headers(tmp_path) -
 
     out = SimpleNamespace(
         request_id="req-v1",
-        prefill_stats=SimpleNamespace(num_cached_tokens=4),
+        prefill_stats=SimpleNamespace(
+            num_cached_tokens=4,
+            num_external_cached_tokens=4,
+        ),
         new_token_ids=[99],
         finish_reason="stop",
         trace_headers=None,
@@ -261,6 +264,8 @@ def test_vllm_v1_prefill_stats_weight_version_and_contextvar_headers(tmp_path) -
     assert logged["gen_ai.session.turn_id"] == 1
     assert logged["gen_ai.usage.input_tokens.cache_hit"] == 4
     assert logged["gen_ai.usage.input_tokens.new_input"] == 4
+    assert logged["vllm.kv_cache.dram_tokens"] == 4
+    assert logged["vllm.tpu.shape_padding_tokens"] == 12
 
 
 def test_golden_fixtures_match_schema_contract() -> None:

@@ -142,6 +142,29 @@ def test_routing_loss_and_subagent_fork_inheritance():
     )
     assert fork_res.to_span_attributes()["gen_ai.session.parent_id"] == "parent-sess"
 
+    # Multi-turn server hop with ChatML <|im_end|> (151645) tokens:
+    # [sys .. 151645, user_1 .. 151645, assistant_1 .. 151645, user_2_tool_output .. 151645]
+    # Second-to-last <|im_end|> closes assistant_1 at index 12 (so [0..12) is prior history = 12 tokens),
+    # and [12..20) is new tool output (8 tokens).
+    hop_prompt = [
+        10, 11, 12, 151645,
+        20, 21, 22, 151645,
+        30, 31, 32, 151645,
+        40, 41, 42, 43, 44, 45, 46, 151645,
+    ]
+    hop_res = tracker.classify_prefill(
+        hop_prompt,
+        num_cached_tokens=4,
+        session_id="hopped-sess",
+        turn_id=2,
+    )
+    assert hop_res == TokenBreakdown(
+        cache_hit=4,
+        routing_loss=8,
+        new_input=8,
+    )
+    assert hop_res.total_tokens == len(hop_prompt)
+
 
 def test_tier1_to_tier2_demotion_preserves_attribution():
     tracker = SessionTurnTracker(block_size=4, tier1_maxsize=1, tier2_maxsize=10)
