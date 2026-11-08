@@ -144,6 +144,14 @@ class AttentionMetadataBuilderContext:
     # its own block). 1 means a single state per request, so the builder
     # emits no `mamba_ckpt_indices`.
     mamba_ckpt_window: int = 1
+    # Two-slot GDN checkpoints (window 2): checkpoint rows also name the
+    # block a mamba block boundary inside the window completes and the
+    # window position whose state it needs (gdn v3
+    # `MetadataRef.s_idx_to_ckpt_indices`). The builders then leave the
+    # requests' positions in `mamba_window_boundary` for the post-sampling
+    # read-code update.
+    mamba_two_slot_ckpts: bool = False
+    mamba_window_boundary: torch.Tensor | None = None
     mamba_request_distribution: torch.Tensor | None = None
     # Unified pool + spec decode only: the runner seeds this with an empty
     # list and each mamba group's builder appends the per-request state
@@ -156,12 +164,18 @@ class AttentionMetadataBuilderContext:
     )
     # Per-chunk cache of the shared mamba row-offset plan, keyed by
     # (target_block_size, target_num_blocks) -> (state_index, ckpt_index,
-    # ckpt_in_row). Valid only because every context is constructed fresh
-    # per chunk: the plan derives from this chunk's seq_lens/ckpt_window,
-    # which the key deliberately omits. Do not reuse a context across
-    # chunks.
+    # ckpt_in_row, two-slot boundary plan or None). Valid only because every
+    # context is constructed fresh per chunk: the plan derives from this
+    # chunk's seq_lens/ckpt_window, which the key deliberately omits. Do not
+    # reuse a context across chunks.
     mamba_row_plans: dict[
-        tuple[int, int], tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]
+        tuple[int, int],
+        tuple[
+            torch.Tensor,
+            torch.Tensor | None,
+            torch.Tensor | None,
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
+        ],
     ] = field(default_factory=dict)
     # Per-chunk batched block-table upload: kv_cache_group_id -> flat device
     # view into one staged H2D transfer (`stage_block_table_uploads`); None
@@ -173,12 +187,53 @@ class AttentionMetadataBuilderContext:
     staged_mamba_products: dict | None = None
 
 
+def _two_slot_boundary_plan(
+    seq_lens: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    state_offsets: torch.Tensor,
+    block_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Group-independent part of the two-slot checkpoint rows' boundary
+    columns (`MetadataRef.s_idx_to_ckpt_indices`).
+
+    A request's window covers tokens `[seq_len - query_len, seq_len)`.
+    When the first mamba block boundary past its start lies in it, the
+    state after window position `boundary - 1 - start` belongs to the
+    block that boundary completes; that position is -1 when the window
+    completes no block. A boundary strictly inside the window completes
+    the block one column before the window's state column (the pair's
+    first); returns that column, whether such a block is written, and the
+    position.
+    """
+    n = seq_lens.shape[0]
+    query_lens = query_start_loc[1 : n + 1] - query_start_loc[:n]
+    start = seq_lens - query_lens
+    boundary = (start // block_size + 1) * block_size
+    reached = (seq_lens > 0) & (query_lens > 0) & (boundary <= seq_lens)
+    pos = torch.where(reached, boundary - 1 - start, torch.full_like(start, -1))
+    inside = reached & (boundary < seq_lens) & (state_offsets >= 1)
+    return (state_offsets - 1).clamp(min=0), inside, pos
+
+
+def _two_slot_ckpt_rows(
+    tbl: torch.Tensor, pair: torch.Tensor, boundary_plan: tuple
+) -> torch.Tensor:
+    """Two-slot checkpoint rows of one mamba group: the pair's blocks, the
+    block a boundary inside the window completes (0 if none) and the
+    window position whose state it needs (-1 if none)."""
+    col, inside, pos = boundary_plan
+    block = torch.gather(tbl, 1, col.unsqueeze(1)) * inside.unsqueeze(1)
+    return torch.cat([pair, block, pos.to(pair.dtype).unsqueeze(1)], dim=1)
+
+
 def _staged_walk_products(
     staged_dev: torch.Tensor,
     seq_lens: torch.Tensor,
     table_geom: tuple,
     mamba_geom: tuple,
     ckpt_window: int,
+    query_start_loc: torch.Tensor | None = None,
+    two_slot: bool = False,
 ) -> tuple:
     """Splits the staged flat block-table buffer into per-group tables and
     derives unified-pool mamba state and checkpoint indices."""
@@ -187,6 +242,7 @@ def _staged_walk_products(
         outs.append(staged_dev[off : off + n * t].clone())
     states = []
     ckpts = []
+    window_boundary = []
     if mamba_geom:
         active = seq_lens > 0
         for ti, t, bs in mamba_geom:
@@ -203,8 +259,17 @@ def _staged_walk_products(
                 ).unsqueeze(0)
                 in_row = (ckpt_offsets < t) & active.unsqueeze(1)
                 safe = torch.where(in_row, ckpt_offsets, torch.zeros_like(ckpt_offsets))
-                ckpts.append(torch.gather(tbl, 1, safe) * in_row)
-    return tuple(outs) + tuple(states) + tuple(ckpts)
+                ckpt = torch.gather(tbl, 1, safe) * in_row
+                if two_slot:
+                    assert query_start_loc is not None
+                    plan = _two_slot_boundary_plan(
+                        seq_lens, query_start_loc, state_offsets, bs
+                    )
+                    ckpt = _two_slot_ckpt_rows(tbl, ckpt, plan)
+                    if not window_boundary:
+                        window_boundary.append(plan[2])
+                ckpts.append(ckpt)
+    return tuple(outs) + tuple(states) + tuple(ckpts) + tuple(window_boundary)
 
 
 @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
@@ -214,6 +279,8 @@ def _staged_walk_products_compiled(
     table_geom: tuple,
     mamba_geom: tuple,
     ckpt_window: int,
+    query_start_loc: torch.Tensor | None = None,
+    two_slot: bool = False,
 ) -> tuple:
     """One device program for everything the metadata walk consumes:
     per-group block-table splits (graph outputs are distinct buffers, so no
@@ -221,12 +288,19 @@ def _staged_walk_products_compiled(
     gathers. `table_geom` is `((offset, num_reqs, num_blocks), ...)` in walk
     order; `mamba_geom` is `((table_geom_index, num_blocks, block_size),
     ...)`; both are static per padding bucket. Returns `tables... +
-    states... + (ckpts... if ckpt_window > 1)`. Issued for every staged walk
+    states... + (ckpts... if ckpt_window > 1)`, then with `two_slot` the
+    requests' window boundary positions. Issued for every staged walk
     (dummy runs included) so warmup and lockstep ranks dispatch the same
     program sequence.
     """
     return _staged_walk_products(
-        staged_dev, seq_lens, table_geom, mamba_geom, ckpt_window
+        staged_dev,
+        seq_lens,
+        table_geom,
+        mamba_geom,
+        ckpt_window,
+        query_start_loc,
+        two_slot,
     )
 
 
@@ -259,12 +333,19 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
 
     def _mamba_row_plan(
         self, ctx: AttentionMetadataBuilderContext, target_num_blocks: int
-    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
+    ]:
         """Row offsets into a mamba block table, cached and shared across groups.
 
         Mamba groups share identical sequence lengths, block sizes, and checkpoint
         geometry. Deriving row offset indices once per (block_size, target_num_blocks)
         allows all mamba groups to share the plan, leaving only per-group gathers.
+        Two-slot checkpoints add their boundary columns' plan
+        (`_two_slot_boundary_plan`).
         """
         key = (self.target_block_size, target_num_blocks)
         plan = ctx.mamba_row_plans.get(key)
@@ -298,7 +379,12 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
                 in_row, ckpt_offsets, torch.zeros_like(ckpt_offsets)
             )
 
-        plan = (state_index, ckpt_index, in_row)
+        boundary_plan = None
+        if ctx.mamba_two_slot_ckpts and ckpt_index is not None:
+            boundary_plan = _two_slot_boundary_plan(
+                ctx.seq_lens, ctx.query_start_loc, state_offsets, self.target_block_size
+            )
+        plan = (state_index, ckpt_index, in_row, boundary_plan)
         ctx.mamba_row_plans[key] = plan
         return plan
 
@@ -417,8 +503,8 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
                 )
                 # Everything but the gathers is shared with the other mamba
                 # groups; see `_mamba_row_plan`.
-                state_index, ckpt_index, ckpt_in_row = self._mamba_row_plan(
-                    ctx, target_num_blocks
+                state_index, ckpt_index, ckpt_in_row, boundary_plan = (
+                    self._mamba_row_plan(ctx, target_num_blocks)
                 )
                 gathered_state_indices = torch.gather(
                     block_tables_2d,
@@ -439,6 +525,11 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
                         )
                         * ckpt_in_row
                     )
+                if boundary_plan is not None:
+                    mamba_ckpt_indices = _two_slot_ckpt_rows(
+                        block_tables_2d, mamba_ckpt_indices, boundary_plan
+                    )
+                    ctx.mamba_window_boundary = boundary_plan[2]
             if ctx.unified_mamba_state_indices is not None:
                 # Spec decode: expose this group's state blocks for the
                 # post-sampling read-offset scatter.
@@ -557,22 +648,21 @@ def stage_block_table_uploads(
         ctx.staged_block_tables = {gid: staged_dev[:length]}
         return
 
-    if staged_dev.device.type == "tpu":
-        products = _staged_walk_products_compiled(
-            staged_dev,
-            ctx.seq_lens,
-            tuple(table_geom),
-            tuple(mamba_geom),
-            ctx.mamba_ckpt_window,
-        )
-    else:
-        products = _staged_walk_products(
-            staged_dev,
-            ctx.seq_lens,
-            tuple(table_geom),
-            tuple(mamba_geom),
-            ctx.mamba_ckpt_window,
-        )
+    two_slot = ctx.mamba_two_slot_ckpts and ctx.mamba_ckpt_window > 1
+    products_fn = (
+        _staged_walk_products_compiled
+        if staged_dev.device.type == "tpu"
+        else _staged_walk_products
+    )
+    products = products_fn(
+        staged_dev,
+        ctx.seq_lens,
+        tuple(table_geom),
+        tuple(mamba_geom),
+        ctx.mamba_ckpt_window,
+        ctx.query_start_loc if two_slot else None,
+        two_slot,
+    )
 
     n_tables = len(entries)
     n_mamba = len(mamba_geom)
@@ -582,7 +672,13 @@ def stage_block_table_uploads(
     if n_mamba:
         states = products[n_tables : n_tables + n_mamba]
         has_ckpt = ctx.mamba_ckpt_window > 1
-        ckpts = products[n_tables + n_mamba :] if has_ckpt else (None,) * n_mamba
+        ckpts = (
+            products[n_tables + n_mamba : n_tables + 2 * n_mamba]
+            if has_ckpt
+            else (None,) * n_mamba
+        )
+        if two_slot:
+            ctx.mamba_window_boundary = products[n_tables + 2 * n_mamba]
         ctx.staged_mamba_products = {
             entries[ei][0]: (states[j], ckpts[j] if has_ckpt else None)
             for j, ei in enumerate(mamba_entry_indices)

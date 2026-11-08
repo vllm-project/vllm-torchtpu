@@ -2,6 +2,8 @@
 
 from dataclasses import dataclass
 
+from vllm_torchtpu import envs
+
 # Architectures whose recurrent layers read and write their state through the
 # attention-shaped pool. The Qwen3 families build on QwenGatedDeltaNetAttention,
 # which the TPU backend replaces with VllmGatedDeltaNetAttention; that subclass
@@ -144,3 +146,10 @@ def derive_pooled_gdn_state_layout(
         ssm_tokens=ssm_tokens,
         conv_tokens=conv_tokens,
     )
+
+
+def gdn_two_slot_ckpts(num_speculative_tokens: int) -> bool:
+    """Whether pooled GDN layers keep two state blocks per request (the verify
+    window's start and last states, TPU_GDN_TWO_SLOT_CKPT) instead of one per
+    window position. Only saves blocks from two drafts up."""
+    return envs.TPU_GDN_TWO_SLOT_CKPT and num_speculative_tokens >= 2

@@ -214,6 +214,46 @@ class TestAttentionMetadataBuilderPlumbing:
         # Checkpoint 0 is the state block the affine path also uses.
         assert torch.equal(meta.mamba_ckpt_indices[:, 0], meta.mamba_state_indices)
 
+    def test_two_slot_rows_name_the_completed_block_and_its_position(self):
+        """Two-slot checkpoint rows: the pair (state column and the next),
+        then the block a boundary strictly inside the window completes (the
+        column before the state column) and the window position whose state
+        the boundary needs, -1 where the window completes no block."""
+        runner = self._make_runner_mock(max_num_blocks_per_req=6, max_num_reqs=5)
+        runner._unified_kv_layout = True
+        builder = self._make_mamba_builder(runner)
+        # Windows [6, 10), [14, 18), [28, 32), [47, 48) of 16-token blocks,
+        # and a padded row.
+        seq_lens = torch.tensor([10, 18, 32, 48, 0], dtype=torch.int32)
+        ctx = AttentionMetadataBuilderContext(
+            num_reqs=5,
+            start_index=0,
+            use_max_model_len=True,
+            seq_lens=seq_lens,
+            query_start_loc=torch.tensor([0, 4, 8, 12, 13, 13], dtype=torch.int32),
+            request_distribution=torch.tensor([4, 4, 5], dtype=torch.int32),
+            mamba_ckpt_window=2,
+            mamba_two_slot_ckpts=True,
+        )
+        runner._attn_metadata_builder_ctx = ctx
+
+        meta = builder.build(common_prefix_len=0, common_attn_metadata=self._make_cm(5))
+
+        bt = runner.input_batch.block_table[0].get_cpu_tensor.return_value
+        expected = torch.tensor(
+            [
+                [bt[0, 0], bt[0, 1], 0, -1],  # completes no block
+                [bt[1, 1], bt[1, 2], bt[1, 0], 1],  # 16 after position 1
+                [bt[2, 1], bt[2, 2], 0, 3],  # last token completes block 1
+                [bt[3, 2], bt[3, 3], 0, 0],  # one-token window completing 2
+                [0, 0, 0, -1],
+            ],
+            dtype=torch.int32,
+        )
+        assert torch.equal(meta.mamba_ckpt_indices, expected)
+        assert torch.equal(meta.mamba_ckpt_indices[:, 0], meta.mamba_state_indices)
+        assert ctx.mamba_window_boundary.tolist() == [-1, 1, 3, 0, -1]
+
     def test_no_ckpt_indices_without_a_window(self):
         runner = self._make_runner_mock(max_num_blocks_per_req=4)
         runner._unified_kv_layout = True
@@ -478,6 +518,55 @@ class TestAttentionMetadataBuilderPlumbing:
                     meta_staged.mamba_ckpt_indices.dtype
                     == meta_plain.mamba_ckpt_indices.dtype
                 )
+
+    def test_two_slot_staged_build_matches_unstaged_build(self):
+        """The batched mamba derivation emits the same two-slot rows and
+        window boundary positions as the per-group build."""
+        num_reqs = 4
+
+        def make(staged):
+            runner = self._make_runner_mock(num_groups=3, max_num_blocks_per_req=6)
+            runner._unified_kv_layout = True
+            attn = self._make_builder(runner, kv_cache_group_id=0)
+            mambas = [
+                self._make_mamba_builder(runner, kv_cache_group_id=gid)
+                for gid in (1, 2)
+            ]
+            self._make_attn_groups(runner, [attn] + mambas)
+            ctx = AttentionMetadataBuilderContext(
+                num_reqs=num_reqs,
+                start_index=0,
+                use_max_model_len=True,
+                seq_lens=torch.tensor([0, 18, 32, 47], dtype=torch.int32),
+                query_start_loc=torch.tensor([0, 0, 4, 8, 12], dtype=torch.int32),
+                request_distribution=torch.tensor([4, 4, 4], dtype=torch.int32),
+                mamba_ckpt_window=2,
+                mamba_two_slot_ckpts=True,
+                unified_mamba_state_indices=[],
+            )
+            runner._attn_metadata_builder_ctx = ctx
+            if staged:
+                stage_block_table_uploads(runner, ctx, num_reqs)
+                assert ctx.staged_mamba_products is not None
+            metas = [
+                b.build(
+                    common_prefix_len=0, common_attn_metadata=self._make_cm(num_reqs)
+                )
+                for b in mambas
+            ]
+            return metas, ctx.mamba_window_boundary
+
+        (staged, pos_staged), (plain, pos_plain) = make(True), make(False)
+        assert pos_staged.tolist() == pos_plain.tolist() == [-1, 1, 3, -1]
+        for meta_staged, meta_plain in zip(staged, plain):
+            assert meta_plain.mamba_ckpt_indices.shape == (num_reqs, 4)
+            assert torch.equal(
+                meta_staged.mamba_ckpt_indices, meta_plain.mamba_ckpt_indices
+            )
+            assert (
+                meta_staged.mamba_ckpt_indices.dtype
+                == meta_plain.mamba_ckpt_indices.dtype
+            )
 
     def test_single_group_fast_path(self):
         """Single-group pure attention must stage directly without mamba derivation."""
