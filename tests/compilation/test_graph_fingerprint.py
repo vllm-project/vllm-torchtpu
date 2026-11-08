@@ -573,17 +573,26 @@ def _run_worker(result_dir: Path) -> None:
             orig_run_backend = compiler._run_backend
             orig_deserialize = tpu_compiler._deserialize_entry
 
-            def _tracked_run_backend(graph, example_inputs):
+            def _tracked_run_backend(
+                graph,
+                example_inputs,
+                *,
+                check_compilations: bool = True,
+            ):
                 nonlocal backend_called, exe_fp
                 if forbid_backend:
                     raise AssertionError(
                         f"rank {rank} invoked _run_backend instead of replaying peer"
                     )
                 backend_called = True
-                compiled_fn, entry = orig_run_backend(graph, example_inputs)
+                compiled_fn, entry, compilations = orig_run_backend(
+                    graph,
+                    example_inputs,
+                    check_compilations=check_compilations,
+                )
                 if entry is not None:
                     exe_fp = entry.compiled_fw.result.fingerprint()
-                return compiled_fn, entry
+                return compiled_fn, entry, compilations
 
             def _tracked_deserialize(entry):
                 nonlocal exe_fp
