@@ -1361,6 +1361,11 @@ class TpuPlatform(Platform):
         cls, kv_cache_dtype: str, _model_config: ModelConfig
     ) -> bool:
         supported = {"auto", "bfloat16", "fp8", "fp8_e4m3", "fp8_e5m2"}
+        if kv_cache_dtype == "int4_per_token_head":
+            # 4-bit MSA caches (`models/minimax_m3/kernels/msa_fp4`).
+            architectures = getattr(_model_config, "architectures", None) or []
+            # The target (MiniMaxM3*) and its DSpark draft (DSparkMiniMaxDraftModel).
+            return any("MiniMax" in a for a in architectures)
         return kv_cache_dtype in supported
 
     @classmethod

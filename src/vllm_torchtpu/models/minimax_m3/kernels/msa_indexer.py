@@ -34,6 +34,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.models.minimax_m3.kernels import msa_fp4
 from vllm_torchtpu.models.minimax_m3.kernels.packed_page import (
     check_page_dtype,
     unpack_page,
@@ -94,11 +95,48 @@ def _page_keys(page_ref) -> jax.Array:
     One width-changing bitcast of the packed 32-bit words: the token order
     inside the page changes, which a max over the page does not see.
     """
-    rows, packing, head_dim = page_ref.shape[1:]
     words = page_ref.bitcast(jnp.uint32)[0, :, 0, :]
-    keys = pltpu.bitcast(words, page_ref.dtype)
-    assert keys.shape == (rows * packing, head_dim), keys.shape
-    return keys.astype(jnp.bfloat16)
+    return _words_keys(words, page_ref.dtype)
+
+
+# Folded 4-bit pages: scale the keys (``[S, D]`` bf16, before the dot) rather
+# than the f32 scores (``[S, Bq]``, after it): fewer elements per page, the
+# same per-key scale (rounded to bf16 with the key, far finer than fp8 keys).
+SCALE_KEYS = True
+
+
+def _folded_keys(words: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """A 4-bit page with its scales folded in (`msa_fp4.scales_in_page`):
+    ``[S / 8 + 1, D]`` words -> (unscaled bf16 keys ``[S, D]``, the per-slot
+    scales of the last word row as a ``[1, S]`` f32 lane vector)."""
+    keys = pltpu.bitcast(words[:-1], jnp.int4).astype(jnp.bfloat16)
+    return keys, pltpu.bitcast(words[-1:], jnp.float32)
+
+
+def _scale_rows_to_column(rows: list[jax.Array]) -> jax.Array:
+    """The group's ``[1, S]`` slot-scale rows -> one ``[n * S, 1]`` column in
+    the score rows' (page-major) order, non-finite read as 0. One transpose
+    of the stacked ``[n, S]`` rows per dot group: a ``[1, S] -> [S, 1]``
+    transpose per page made the 4-bit indexer 50% slower than fp8."""
+    stacked = rows[0] if len(rows) == 1 else jnp.concatenate(rows, axis=0)  # [n, S]
+    stacked = jnp.where(jnp.isfinite(stacked), stacked, 0.0)
+    cols = stacked.T  # [S, n]
+    return jnp.concatenate([cols[:, g : g + 1] for g in range(len(rows))], axis=0)
+
+
+def _words_keys(words: jax.Array, dtype) -> jax.Array:
+    """Packed ``[S / p, D]`` words -> bf16 ``[S, D]`` keys. A 4-bit (uint8)
+    cache's int4 values come out unscaled, in slot order (`msa_fp4`)."""
+    if dtype == jnp.uint8:
+        return pltpu.bitcast(words, jnp.int4).astype(jnp.bfloat16)
+    return pltpu.bitcast(words, dtype).astype(jnp.bfloat16)
+
+
+def _scale_column(scale_page: jax.Array, row: int) -> jax.Array:
+    """``[8, 128]`` scale page -> ``[128, 1]`` scales of its slots for scale-page
+    row `row`. An unwritten slot's scale may be any bits; non-finite reads as 0."""
+    col = scale_page.T[:, row : row + 1]
+    return jnp.where(jnp.isfinite(col), col, 0.0)
 
 
 def _kernel_v2(
@@ -108,51 +146,98 @@ def _kernel_v2(
     block_tables_ref,  # [max_num_seqs * pages_per_seq]
     # In
     q_ref,  # [Bq, D]
-    *refs,  # G x [1, S / p, p, D] index-cache pages, then the output
+    *refs,  # G x [1, S / p, p, D] index-cache pages, [G x [1, 8, 128] scale pages], out
+    scale_row: int | None = None,
 ):
     """`_kernel_v1` with the pages' keys unpacked by one bitcast each and
-    stacked, so each dot keeps the query tile latched across many pages."""
-    pages_per_step = len(refs) - 1
-    page_refs, o_ref = refs[:pages_per_step], refs[pages_per_step]
+    stacked, so each dot keeps the query tile latched across many pages.
+
+    With `scale_row` (4-bit caches) each page is followed, after all pages,
+    by its scale page, and a key's score is scaled before the block max."""
+    num_inputs = len(refs) - 1
+    pages_per_step = num_inputs if scale_row is None else num_inputs // 2
+    page_refs, o_ref = refs[:pages_per_step], refs[num_inputs]
+    scale_refs = refs[pages_per_step:num_inputs]
     q = q_ref[...].astype(jnp.bfloat16)
     block_q = q.shape[0]
-    page_size = page_refs[0].shape[1] * page_refs[0].shape[2]
+    page_size = _page_tokens(page_refs[0].shape[1], page_refs[0].dtype)
     pages_per_dot = max(
         1, min(pages_per_step, _MAX_SCORE_ELEMS // (page_size * block_q))
     )
     maxima = []
+    folded = msa_fp4.scales_in_page(page_refs[0].shape[1], page_refs[0].dtype)
     for first in range(0, pages_per_step, pages_per_dot):
         group = page_refs[first : first + pages_per_dot]
-        keys = [_page_keys(r) for r in group]
+        if folded:
+            pairs = [_folded_keys(r.bitcast(jnp.uint32)[0, :, 0, :]) for r in group]
+            keys = [k for k, _ in pairs]
+        else:
+            keys = [_page_keys(r) for r in group]
         keys = keys[0] if len(keys) == 1 else jnp.concatenate(keys, axis=0)
+        col = _scale_rows_to_column([c for _, c in pairs]) if folded else None
+        if folded and SCALE_KEYS:
+            keys = keys * col.astype(jnp.bfloat16)
         s = jax.lax.dot_general(
             keys, q, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
         )
+        if folded and not SCALE_KEYS:
+            s = s * col
+        elif scale_row is not None:
+            cols = [
+                _scale_column(r[0], scale_row)
+                for r in scale_refs[first : first + pages_per_dot]
+            ]
+            s = s * (cols[0] if len(cols) == 1 else jnp.concatenate(cols, axis=0))
         maxima.append(jnp.max(s.reshape(len(group), page_size, block_q), axis=1))
     o_ref[...] = maxima[0] if len(maxima) == 1 else jnp.concatenate(maxima, axis=0)
 
 
-def _scores_v3(q, page_refs, o_ref, transposed):
+def _page_tokens(rows_per_page: int, dtype) -> int:
+    """Tokens per page: 4-bit (uint8) caches hold 8 per 32-bit word (a folded
+    page's extra word row holds scales, not tokens)."""
+    if dtype == jnp.uint8:
+        return msa_fp4.data_rows(rows_per_page) * msa_fp4.TOKENS_PER_WORD
+    return rows_per_page * (4 // jnp.dtype(dtype).itemsize)
+
+
+def _scores_v3(q, page_refs, o_ref, transposed, scale_refs=None, scale_row=None):
     """`_kernel_v2`'s scoring over pages already in VMEM; a `transposed`
     output block is ``[Bq, G]``."""
     block_q = q.shape[0]
     pages_per_step = len(page_refs)
-    rows, packing, _ = page_refs[0].shape
-    page_size = rows * packing
+    rows = page_refs[0].shape[0]
+    page_size = _page_tokens(rows, page_refs[0].dtype)
     pages_per_dot = max(
         1, min(pages_per_step, _MAX_SCORE_ELEMS // (page_size * block_q))
     )
     maxima = []
+    folded = msa_fp4.scales_in_page(rows, page_refs[0].dtype)
     for first in range(0, pages_per_step, pages_per_dot):
         group = page_refs[first : first + pages_per_dot]
-        keys = []
+        keys, cols = [], []
         for r in group:
             words = r.bitcast(jnp.uint32)[:, 0, :]
-            keys.append(pltpu.bitcast(words, r.dtype).astype(jnp.bfloat16))
+            if folded:
+                k, c = _folded_keys(words)
+                keys.append(k)
+                cols.append(c)
+            else:
+                keys.append(_words_keys(words, r.dtype))
         keys = keys[0] if len(keys) == 1 else jnp.concatenate(keys, axis=0)
+        col = _scale_rows_to_column(cols) if folded else None
+        if folded and SCALE_KEYS:
+            keys = keys * col.astype(jnp.bfloat16)
         s = jax.lax.dot_general(
             keys, q, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
         )
+        if folded and not SCALE_KEYS:
+            s = s * col
+        elif scale_row is not None:
+            cols = [
+                _scale_column(r[...], scale_row)
+                for r in scale_refs[first : first + pages_per_dot]
+            ]
+            s = s * (cols[0] if len(cols) == 1 else jnp.concatenate(cols, axis=0))
         maxima.append(jnp.max(s.reshape(len(group), page_size, block_q), axis=1))
     out = maxima[0] if len(maxima) == 1 else jnp.concatenate(maxima, axis=0)
     o_ref[...] = out.T if transposed else out
@@ -167,23 +252,30 @@ def _kernel_v3(
     # In
     q_ref,  # [Bq, D]
     cache_ref,  # [pages, S / p, p, D] index cache, left in HBM
-    # Out
-    o_ref,  # [G, Bq]
-    # Scratch
-    buf0,  # [G, S / p, p, D] pages of even steps
-    buf1,  # [G, S / p, p, D] pages of odd steps
-    sems,  # DMA semaphores [2, G]
-    *,
-    transposed=False,
+    *refs,
+    scale_row: int | None = None,
+    transposed: bool = False,
 ):
     """`_kernel_v2` with the pages fetched by a hand-written double-buffered
     DMA ring: one scalar address per page and no copy for pages past the
-    request's end (their scores are never read)."""
+    request's end (their scores are never read).
+
+    refs: without `scale_row`, ``o_ref [G, Bq]``, then scratch ``buf0``,
+    ``buf1`` (``[G, S / p, p, D]`` pages of even / odd steps) and DMA
+    semaphores ``[2, G]``. With `scale_row` (4-bit caches) the scale cache
+    ``[pages, 8, 128]`` (in HBM) comes first, and the scratch adds scale
+    buffers ``[G, 8, 128]`` for even / odd steps and their semaphores.
+    """
+    if scale_row is None:
+        o_ref, buf0, buf1, sems = refs
+        scale_ref = sbuf0 = sbuf1 = ssems = None
+    else:
+        scale_ref, o_ref, buf0, buf1, sems, sbuf0, sbuf1, ssems = refs
     pages_per_step = buf0.shape[0]
     pages_per_seq = block_tables_ref.shape[0] // seq_pages_ref.shape[0]
     step, num_steps = pl.program_id(0), pl.num_programs(0)
 
-    def copies(w, buf, slot):
+    def copies(w, buf, slot, sbuf=None):
         entry = work_ref[w]
         seq = tile_seq_ref[entry >> _TILE_SHIFT] & _SEQ_MASK
         first = (entry & _GROUP_MASK) * pages_per_step
@@ -201,19 +293,30 @@ def _kernel_v3(
                     ),
                 )
             )
+            if sbuf is not None:
+                out.append(
+                    (
+                        g < live,
+                        pltpu.make_async_copy(
+                            scale_ref.at[page], sbuf.at[g], ssems.at[slot, g]
+                        ),
+                    )
+                )
         return out
 
-    def start(w, buf, slot):
-        for live, copy in copies(w, buf, slot):
+    bufs = ((buf0, sbuf0), (buf1, sbuf1))
+
+    def start(w, slot):
+        for live, copy in copies(w, bufs[slot][0], slot, bufs[slot][1]):
             pl.when(live)(copy.start)
 
-    def wait(w, buf, slot):
-        for live, copy in copies(w, buf, slot):
+    def wait(w, slot):
+        for live, copy in copies(w, bufs[slot][0], slot, bufs[slot][1]):
             pl.when(live)(copy.wait)
 
     @pl.when(step == 0)
     def _():
-        start(step, buf0, 0)
+        start(step, 0)
 
     even = step % 2 == 0
 
@@ -221,23 +324,28 @@ def _kernel_v3(
     def _():
         @pl.when(even)
         def _():
-            start(step + 1, buf1, 1)
+            start(step + 1, 1)
 
         @pl.when(jnp.logical_not(even))
         def _():
-            start(step + 1, buf0, 0)
+            start(step + 1, 0)
 
     q = q_ref[...].astype(jnp.bfloat16)
 
-    @pl.when(even)
-    def _():
-        wait(step, buf0, 0)
-        _scores_v3(q, [buf0.at[g] for g in range(pages_per_step)], o_ref, transposed)
+    def score(slot):
+        buf, sbuf = bufs[slot]
+        wait(step, slot)
+        _scores_v3(
+            q,
+            [buf.at[g] for g in range(pages_per_step)],
+            o_ref,
+            transposed,
+            None if sbuf is None else [sbuf.at[g] for g in range(pages_per_step)],
+            scale_row,
+        )
 
-    @pl.when(jnp.logical_not(even))
-    def _():
-        wait(step, buf1, 1)
-        _scores_v3(q, [buf1.at[g] for g in range(pages_per_step)], o_ref, transposed)
+    pl.when(even)(lambda: score(0))
+    pl.when(jnp.logical_not(even))(lambda: score(1))
 
 
 _KERNELS = {"v1": _kernel_v1, "v2": _kernel_v2}
@@ -282,13 +390,18 @@ def _class_scores(
     kernel,
     interpret,
     token_major=False,
+    scale_cache=None,
+    scale_row=None,
 ):
     """Transposed scores ``[P, tiles * block_q]`` of one tile class, and the
     column of each token; `token_major` (kernel v3) returns them as
     ``[tiles * block_q, P]`` instead, so a token's scores are one row."""
     num_tokens, _, head_dim = index_q.shape
     _, rows_per_page, packing, _ = index_cache.shape
-    page_size = rows_per_page * packing
+    page_size = _page_tokens(rows_per_page, index_cache.dtype)
+    fp4 = scale_row is not None
+    if fp4 and kernel == "v1":
+        raise NotImplementedError("4-bit index caches need kernel v2 or v3")
     max_num_seqs = seq_lens.shape[0]
     pages_per_seq = block_tables.shape[0] // max_num_seqs
     num_groups_per_seq = -(-pages_per_seq // pages_per_step)
@@ -346,6 +459,13 @@ def _class_scores(
 
         return pl.BlockSpec((1, rows_per_page, packing, head_dim), index_map)
 
+    def scale_block(g):
+        page_map = page_block(g).index_map
+        return pl.BlockSpec(
+            (1, scale_cache.shape[1], msa_fp4.SCALE_LANES),
+            lambda *args: page_map(*args)[:3],
+        )
+
     grid_spec = pltpu.PrefetchScalarGridSpec(
         num_scalar_prefetch=3,
         # One step even with no tile in the class; its scores are never read.
@@ -361,6 +481,7 @@ def _class_scores(
                 ),
             ),
             *(page_block(g) for g in range(pages_per_step)),
+            *(scale_block(g) for g in range(pages_per_step) if fp4),
         ],
         out_specs=pl.BlockSpec(
             (pages_per_step, block_q),
@@ -381,39 +502,56 @@ def _class_scores(
         )
     params = pltpu.CompilerParams(dimension_semantics=("arbitrary",))
     if kernel == "v3":
+        page_buf = pltpu.VMEM(
+            (pages_per_step, rows_per_page, packing, head_dim), index_cache.dtype
+        )
+        scratch = [page_buf, page_buf, pltpu.SemaphoreType.DMA((2, pages_per_step))]
+        hbm = [pl.BlockSpec(memory_space=pl.ANY)]
+        operands = [index_cache]
+        if fp4:
+            scale_buf = pltpu.VMEM(
+                (pages_per_step, scale_cache.shape[1], msa_fp4.SCALE_LANES), jnp.float32
+            )
+            scratch += [
+                scale_buf,
+                scale_buf,
+                pltpu.SemaphoreType.DMA((2, pages_per_step)),
+            ]
+            hbm.append(pl.BlockSpec(memory_space=pl.ANY))
+            operands.append(scale_cache)
         scores_t = pl.pallas_call(
-            functools.partial(_kernel_v3, transposed=token_major),
+            functools.partial(_kernel_v3, scale_row=scale_row, transposed=token_major),
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=4,
                 grid=grid_spec.grid,
-                in_specs=[grid_spec.in_specs[0], pl.BlockSpec(memory_space=pl.ANY)],
+                in_specs=[grid_spec.in_specs[0], *hbm],
                 out_specs=out_specs,
-                scratch_shapes=[
-                    pltpu.VMEM(
-                        (pages_per_step, rows_per_page, packing, head_dim),
-                        index_cache.dtype,
-                    ),
-                    pltpu.VMEM(
-                        (pages_per_step, rows_per_page, packing, head_dim),
-                        index_cache.dtype,
-                    ),
-                    pltpu.SemaphoreType.DMA((2, pages_per_step)),
-                ],
+                scratch_shapes=scratch,
             ),
             out_shape=out_shape,
             compiler_params=params,
             interpret=interpret,
             name="minimax_m3_msa_block_scores",
-        )(work, tile_info, block_tables, seq_pages, q_rows, index_cache)
+        )(work, tile_info, block_tables, seq_pages, q_rows, *operands)
     else:
+        kernel_fn = _KERNELS[kernel]
+        if fp4:
+            kernel_fn = functools.partial(kernel_fn, scale_row=scale_row)
         scores_t = pl.pallas_call(
-            _KERNELS[kernel],
+            kernel_fn,
             grid_spec=grid_spec,
             out_shape=out_shape,
             compiler_params=params,
             interpret=interpret,
             name="minimax_m3_msa_block_scores",
-        )(work, tile_info, block_tables, q_rows, *([index_cache] * pages_per_step))
+        )(
+            work,
+            tile_info,
+            block_tables,
+            q_rows,
+            *([index_cache] * pages_per_step),
+            *([scale_cache] * (pages_per_step if fp4 else 0)),
+        )
 
     # Back to token order: token t of request r sits in r's tiles at its offset.
     tok = jnp.arange(num_tokens, dtype=jnp.int32)
@@ -438,6 +576,7 @@ def _class_scores(
         "small_pages_per_step",
         "kernel",
         "large_kernel",
+        "scale_row",
         "interpret",
     ),
 )
@@ -455,6 +594,8 @@ def block_scores(
     small_pages_per_step: int = DEFAULT_SMALL_PAGES_PER_STEP,
     kernel: str = DEFAULT_KERNEL,
     large_kernel: str = DEFAULT_LARGE_KERNEL,
+    scale_cache: jax.Array | None = None,
+    scale_row: int | None = None,
     interpret: bool = False,
 ) -> jax.Array:
     """Block-max index scores ``[T, 1, P]`` (``P`` padded to the page group).
@@ -474,6 +615,10 @@ def block_scores(
       large_kernel: the same choice for the `large_block_q` tiles.
       pages_per_step / small_pages_per_step: pages per grid step of the large
         and the block_q tile classes.
+      scale_cache, scale_row: for a 4-bit (uint8) index cache without folded
+        scales (`msa_fp4.scales_in_page`),
+        the ``[pages, 8, 128]`` f32 scale cache and the row of the index-key
+        scales. `index_q` must then be rotated (`msa_fp4.rotate_queries`).
     Pages past a token's own page hold scores of keys it must not see, and
     pages past its request's last page are not written; callers mask both.
     """
@@ -482,7 +627,16 @@ def block_scores(
         raise NotImplementedError(
             f"MSA indexer scores one index head per rank, got {num_heads}."
         )
-    check_page_dtype(index_cache.shape[2], index_cache.dtype)
+    if msa_fp4.is_fp4(index_cache) and msa_fp4.scales_in_page(
+        index_cache.shape[1], index_cache.dtype
+    ):
+        scale_cache = scale_row = None  # the pages carry their own scales
+    elif msa_fp4.is_fp4(index_cache):
+        if scale_cache is None or scale_row is None:
+            raise ValueError("a 4-bit index cache needs scale_cache and scale_row")
+    else:
+        check_page_dtype(index_cache.shape[2], index_cache.dtype)
+        scale_row = None
     max_num_seqs = seq_lens.shape[0]
     seq_ids = jnp.arange(max_num_seqs, dtype=jnp.int32)
     q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
@@ -496,6 +650,8 @@ def block_scores(
         block_tables,
         cu_q_lens,
         interpret=interpret,
+        scale_cache=scale_cache,
+        scale_row=scale_row,
     )
     # Large requests have more than block_q tokens each.
     max_large = min(max_num_seqs, num_tokens // (block_q + 1))

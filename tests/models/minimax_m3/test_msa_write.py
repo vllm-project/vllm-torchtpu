@@ -22,7 +22,7 @@ import pytest
 from jax.sharding import AbstractDevice, AbstractMesh, use_abstract_mesh
 
 from tests.models.minimax_m3.packing import CACHE_DTYPES, PACKING, pack
-from vllm_torchtpu.models.minimax_m3.kernels import msa
+from vllm_torchtpu.models.minimax_m3.kernels import msa, msa_fp4, msa_write
 
 PAGE = 128
 NUM_PAGES = 12
@@ -100,3 +100,74 @@ def test_lowers_for_tpu(dtype):
     text = lowered.as_text()
     assert "tpu_custom_call" in text
     assert "minimax_m3_msa_write_rows" in text
+
+
+@pytest.mark.parametrize("folded", [False, True])
+@pytest.mark.parametrize(
+    "q_lens,ctx_lens,pad_tokens",
+    [
+        ([1, 1, 1], [5, 130, 255], 2),
+        ([8, 8, 8], [124, 40, 250], 8),
+        ([300], [70], 0),
+    ],
+)
+def test_fp4_matches_page_writes(q_lens, ctx_lens, pad_tokens, folded, monkeypatch):
+    """4-bit writes, token by token (small batches) and page by page, land the
+    same nibbles and folded scales."""
+    rng = np.random.default_rng(sum(q_lens))
+    num_tokens = sum(q_lens) + pad_tokens
+    nib = jnp.asarray(rng.integers(0, 16, (NUM_PAGES, PAGE, PAGE)), jnp.uint8)
+    page_scales = jnp.asarray(rng.random((NUM_PAGES, PAGE)), jnp.float32)
+    cache = msa_fp4.pack_rows(nib, page_scales if folded else None)
+    rows = jnp.asarray(rng.integers(0, 16, (num_tokens, PAGE)), jnp.uint8)
+    scales = jnp.asarray(rng.random(num_tokens), jnp.float32) if folded else None
+    pages, pos = _batch(q_lens, ctx_lens, rng, pad_tokens)
+
+    def write():
+        return msa.write_rows(
+            cache,
+            rows,
+            pages,
+            pos,
+            max_num_seqs=len(q_lens),
+            scales=scales,
+            interpret=True,
+        )
+
+    got = write()
+    monkeypatch.setattr(msa_write, "_BY_TOKEN_MAX_TOKENS", 0)
+    expected = write()
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(expected))
+    # The page writes are v24's; check them against the logical scatter too.
+    want = np.asarray(nib).copy()
+    keep = np.asarray(pages) < NUM_PAGES
+    p, s = np.asarray(pages)[keep], np.asarray(pos)[keep] % PAGE
+    want[p, s] = np.asarray(rows)[keep]
+    np.testing.assert_array_equal(np.asarray(msa_fp4.unpack_rows(got)), want)
+    if folded:
+        want_scales = np.asarray(page_scales).copy()
+        want_scales[p, s] = np.asarray(scales)[keep]
+        np.testing.assert_array_equal(
+            np.asarray(msa_fp4.folded_scales(got)), want_scales
+        )
+
+
+@pytest.mark.parametrize("folded", [False, True])
+def test_fp4_by_token_lowers_for_tpu(folded):
+    tokens = 8
+    args = (
+        jax.ShapeDtypeStruct((4096, PAGE // 8 + folded, 4, PAGE), jnp.uint8),
+        jax.ShapeDtypeStruct((tokens, PAGE), jnp.uint8),
+        jax.ShapeDtypeStruct((tokens,), jnp.int32),
+        jax.ShapeDtypeStruct((tokens,), jnp.int32),
+    )
+    if folded:
+        args += (jax.ShapeDtypeStruct((tokens,), jnp.float32),)
+
+    def write(cache, rows, pages, pos, scales=None):
+        return msa.write_rows(cache, rows, pages, pos, max_num_seqs=1, scales=scales)
+
+    tpu7x = AbstractMesh((), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu"))
+    with use_abstract_mesh(tpu7x):
+        lowered = jax.jit(write).trace(*args).lower(lowering_platforms=("tpu",))
+    assert "tpu_custom_call" in lowered.as_text()

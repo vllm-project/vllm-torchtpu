@@ -51,6 +51,7 @@ from vllm.v1.core.sched.request_queue import (
 )
 from vllm.v1.request import Request
 
+from vllm_torchtpu.core.eviction_aware_connector import EvictionAwareConnector
 from vllm_torchtpu.core.external_prefix_probe import ExternalPrefixProbe
 from vllm_torchtpu.runner.utils import PAW_MAX_WAIT_S_KEY
 
@@ -97,6 +98,8 @@ class PrefixAwareScheduler(AsyncScheduler):
         self._paw_probe = (
             connector if isinstance(connector, ExternalPrefixProbe) else None
         )
+        if isinstance(connector, EvictionAwareConnector):
+            connector.attach_block_pool(self.kv_cache_manager.block_pool)
         self._paw_external_cache = {}
 
         logger.info(

@@ -22,6 +22,7 @@ import torch
 from torch_tpu._internal import pallas
 from vllm.distributed import get_tp_group
 
+from vllm_torchtpu.distributed.dcp import split_group_heads as _split_group_heads
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.models.minimax_m3.kernels import msa, msa_dcp, msa_indexer
 
@@ -29,17 +30,24 @@ _KV_CACHE_ARG = 5
 _INDEX_CACHE_ARG = 6
 _SHARD_KV_CACHE_ARG = 4
 _SHARD_INDEX_CACHE_ARG = 5
+# 4-bit caches (`msa_fp4`): the scale cache follows the index cache.
+_SCALE_CACHE_ARG = 7
+_DCP_SCALE_CACHE_ARG = 6
 
 
 @functools.cache
 def get_msa_op(
-    sm_scale: float, topk: int, init_blocks: int, local_blocks: int
+    sm_scale: float, topk: int, init_blocks: int, local_blocks: int, fp4: bool = False
 ) -> Callable[..., torch.Tensor]:
     """Build (once per config) the op that runs `msa.msa_forward` in place.
 
     Built eagerly from module `__init__`: `pallas.jax_op` inspects the
     function signature, which Dynamo cannot trace inside a compiled forward.
+    With `fp4` (4-bit caches, `msa_fp4`) the op also takes and updates the
+    layer's ``scale_cache``.
     """
+    if fp4:
+        return _get_msa_fp4_op(sm_scale, topk, init_blocks, local_blocks)
 
     def _msa_jax(
         q: jax.Array,
@@ -114,6 +122,96 @@ def get_msa_op(
         )
         kv_cache.copy_(new_kv_cache)
         index_cache.copy_(new_index_cache)
+        return out
+
+    return op
+
+
+def _get_msa_fp4_op(
+    sm_scale: float, topk: int, init_blocks: int, local_blocks: int
+) -> Callable[..., torch.Tensor]:
+    def _msa_jax(
+        q: jax.Array,
+        k: jax.Array,
+        v: jax.Array,
+        index_q: jax.Array,
+        index_k: jax.Array,
+        kv_cache: jax.Array,
+        index_cache: jax.Array,
+        scale_cache: jax.Array,
+        seq_lens: jax.Array,
+        block_tables: jax.Array,
+        query_start_loc: jax.Array,
+        request_distribution: jax.Array,
+    ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+        return msa.msa_forward(
+            q,
+            k,
+            v,
+            index_q,
+            index_k,
+            kv_cache,
+            index_cache,
+            seq_lens,
+            block_tables,
+            query_start_loc,
+            request_distribution,
+            sm_scale=sm_scale,
+            topk=topk,
+            init_blocks=init_blocks,
+            local_blocks=local_blocks,
+            scale_cache=scale_cache,
+        )
+
+    op_name = (
+        f"pallas::minimax_m3_msa_fp4_t{topk}_i{init_blocks}_l{local_blocks}"
+        f"_s{sm_scale:.8f}".replace(".", "p")
+    )
+    jax_op = pallas.jax_op(
+        op_name,
+        _msa_jax,
+        donate_argnums=(_KV_CACHE_ARG, _INDEX_CACHE_ARG, _SCALE_CACHE_ARG),
+    )
+
+    def _fake(q, k, v, index_q, index_k, kv_cache, index_cache, scale_cache, *args):
+        return (
+            torch.empty_like(kv_cache),
+            torch.empty_like(index_cache),
+            torch.empty_like(scale_cache),
+            torch.empty_like(q),
+        )
+
+    jax_op.register_fake(_fake)
+
+    def op(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        index_q: torch.Tensor,
+        index_k: torch.Tensor,
+        kv_cache: torch.Tensor,
+        index_cache: torch.Tensor,
+        metadata: AttentionMetadata,
+        *,
+        scale_cache: torch.Tensor,
+    ) -> torch.Tensor:
+        new_kv_cache, new_index_cache, new_scale_cache, out = jax_op(
+            q,
+            k,
+            v,
+            index_q,
+            index_k,
+            kv_cache,
+            index_cache,
+            scale_cache,
+            metadata.seq_lens,
+            metadata.block_tables,
+            metadata.query_start_loc,
+            metadata.request_distribution,
+        )
+        kv_cache.copy_(new_kv_cache)
+        index_cache.copy_(new_index_cache)
+        scale_cache.copy_(new_scale_cache)
         return out
 
     return op
@@ -264,19 +362,11 @@ def split_group_heads(
     """Split the DCP all-gather of every rank's ``[q | k | v | index_q]``
     (``[T, dcp * (q_heads + 3), D]``, rank-major) into the group's query
     heads ``[T, dcp * q_heads, D]`` and the ``k``/``v``/``index_q
-    [T, dcp // kv_head_replicas, D]`` of its KV heads: rank ``i`` of the
-    group holds KV head ``i // kv_head_replicas``, so every
-    ``kv_head_replicas``-th rank supplies the next head."""
-    num_tokens, _, head_dim = gathered.shape
-    gathered = gathered.view(num_tokens, dcp, q_heads + 3, head_dim)
-    q_all = gathered[:, :, :q_heads].reshape(num_tokens, dcp * q_heads, head_dim)
-    per_head = gathered[:, ::kv_head_replicas, q_heads:]
-    return (
-        q_all,
-        per_head[:, :, 0].contiguous(),
-        per_head[:, :, 1].contiguous(),
-        per_head[:, :, 2].contiguous(),
+    [T, dcp // kv_head_replicas, D]`` of its KV heads (`dcp.split_group_heads`)."""
+    q_all, (k, v, index_q) = _split_group_heads(
+        gathered, dcp, q_heads, kv_head_replicas, per_kv_head=3
     )
+    return q_all, k, v, index_q
 
 
 @functools.cache
@@ -287,9 +377,13 @@ def get_msa_dcp_op(
     local_blocks: int,
     dcp: int,
     kv_head_replicas: int = 1,
+    fp4: bool = False,
 ) -> Callable[..., torch.Tensor]:
     """`get_msa_op` for a KV head's context split over ``dcp`` ranks
     (`kernels.msa_dcp`).
+
+    With `fp4` (4-bit caches, one KV head per rank) the op also takes and
+    updates the layer's ``scale_cache``.
 
     The returned op takes this rank's DCP rank as an ``int32[1]`` device
     tensor (``dcp_rank``, a module buffer of the caller), not a Python int:
@@ -320,6 +414,10 @@ def get_msa_dcp_op(
             "must divide one another."
         )
     kv_heads = max(1, dcp // kv_head_replicas)
+    if fp4:
+        return _get_msa_dcp_fp4_op(
+            sm_scale, topk, init_blocks, local_blocks, dcp, kv_head_replicas
+        )
 
     def _score_jax(
         k: jax.Array,
@@ -452,6 +550,174 @@ def get_msa_dcp_op(
         out, lse = attend_op(
             q_all,
             kv_cache,
+            candidates,
+            metadata.seq_lens,
+            metadata.block_tables,
+            metadata.query_start_loc,
+            dcp_rank,
+        )
+        return merge_lse_partials_scatter_heads(out, lse)
+
+    return op
+
+
+def _get_msa_dcp_fp4_op(
+    sm_scale: float,
+    topk: int,
+    init_blocks: int,
+    local_blocks: int,
+    dcp: int,
+    kv_head_replicas: int,
+) -> Callable[..., torch.Tensor]:
+    """`get_msa_dcp_op` for 4-bit caches."""
+    kv_heads = max(1, dcp // kv_head_replicas)
+    from vllm_torchtpu.distributed.dcp import get_dcp_group
+    from vllm_torchtpu.layers.adapter.cp_mla_attention import (
+        all_gather_heads,
+        merge_lse_partials_scatter_heads,
+    )
+
+    def _score_jax(
+        k: jax.Array,
+        v: jax.Array,
+        index_q: jax.Array,
+        index_k: jax.Array,
+        kv_cache: jax.Array,
+        index_cache: jax.Array,
+        scale_cache: jax.Array,
+        seq_lens: jax.Array,
+        block_tables: jax.Array,
+        query_start_loc: jax.Array,
+        request_distribution: jax.Array,
+        dcp_rank: jax.Array,
+    ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+        return msa_dcp.msa_write_and_candidates_dcp(
+            k,
+            v,
+            index_q,
+            index_k,
+            kv_cache,
+            index_cache,
+            seq_lens,
+            block_tables,
+            query_start_loc,
+            request_distribution,
+            topk=topk,
+            init_blocks=init_blocks,
+            local_blocks=local_blocks,
+            rank=dcp_rank,
+            dcp=dcp,
+            scale_cache=scale_cache,
+        )
+
+    def _attend_jax(
+        q: jax.Array,
+        kv_cache: jax.Array,
+        scale_cache: jax.Array,
+        candidates: jax.Array,
+        seq_lens: jax.Array,
+        block_tables: jax.Array,
+        query_start_loc: jax.Array,
+        dcp_rank: jax.Array,
+    ) -> tuple[jax.Array, jax.Array]:
+        return msa_dcp.msa_attend_dcp(
+            q,
+            kv_cache,
+            candidates,
+            seq_lens,
+            block_tables,
+            query_start_loc,
+            sm_scale=sm_scale,
+            topk=topk,
+            rank=dcp_rank,
+            dcp=dcp,
+            scale_cache=scale_cache,
+        )
+
+    suffix = (
+        f"t{topk}_i{init_blocks}_l{local_blocks}_s{sm_scale:.8f}_dcp{dcp}_g{kv_heads}"
+    ).replace(".", "p")
+    score_op = pallas.jax_op(
+        f"pallas::minimax_m3_msa_dcp_fp4_score_{suffix}",
+        _score_jax,
+        donate_argnums=(
+            _SHARD_KV_CACHE_ARG,
+            _SHARD_INDEX_CACHE_ARG,
+            _DCP_SCALE_CACHE_ARG,
+        ),
+    )
+    attend_op = pallas.jax_op(
+        f"pallas::minimax_m3_msa_dcp_fp4_attend_{suffix}", _attend_jax
+    )
+
+    def _score_fake(k, v, index_q, index_k, kv_cache, index_cache, scale_cache, *args):
+        return (
+            torch.empty_like(kv_cache),
+            torch.empty_like(index_cache),
+            torch.empty_like(scale_cache),
+            torch.empty(
+                (k.shape[0], k.shape[1] * 2 * topk),
+                dtype=torch.float32,
+                device=k.device,
+            ),
+        )
+
+    def _attend_fake(q, *args):
+        return (
+            torch.empty_like(q),
+            torch.empty(q.shape[:2], dtype=torch.float32, device=q.device),
+        )
+
+    score_op.register_fake(_score_fake)
+    attend_op.register_fake(_attend_fake)
+
+    def op(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        index_q: torch.Tensor,
+        index_k: torch.Tensor,
+        kv_cache: torch.Tensor,
+        index_cache: torch.Tensor,
+        metadata: AttentionMetadata,
+        *,
+        dcp_rank: torch.Tensor,
+        scale_cache: torch.Tensor,
+    ) -> torch.Tensor:
+        group = get_dcp_group()
+        assert group is not None, "DCP group is not initialized"
+        if kv_heads == 1:
+            q_all = all_gather_heads(q)
+        else:
+            # As `get_msa_dcp_op`: one gather of [q | k | v | index_q].
+            gathered = group.all_gather(
+                torch.cat([q, k, v, index_q], dim=1).contiguous(), dim=1
+            )
+            q_all, k, v, index_q = split_group_heads(
+                gathered, dcp, q.shape[1], kv_head_replicas
+            )
+        new_kv_cache, new_index_cache, new_scale_cache, candidates = score_op(
+            k,
+            v,
+            index_q,
+            index_k,
+            kv_cache,
+            index_cache,
+            scale_cache,
+            metadata.seq_lens,
+            metadata.block_tables,
+            metadata.query_start_loc,
+            metadata.request_distribution,
+            dcp_rank,
+        )
+        kv_cache.copy_(new_kv_cache)
+        index_cache.copy_(new_index_cache)
+        scale_cache.copy_(new_scale_cache)
+        candidates = group.all_gather(candidates.unsqueeze(0), dim=0)
+        out, lse = attend_op(
+            q_all,
+            kv_cache,
+            scale_cache,
             candidates,
             metadata.seq_lens,
             metadata.block_tables,

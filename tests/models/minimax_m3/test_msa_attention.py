@@ -22,7 +22,11 @@ import pytest
 from jax.sharding import AbstractDevice, AbstractMesh, use_abstract_mesh
 
 from tests.models.minimax_m3.packing import CACHE_DTYPES, PACKING, pack, rounded
-from vllm_torchtpu.models.minimax_m3.kernels import msa_attention
+from vllm_torchtpu.models.minimax_m3.kernels import (
+    msa_attention,
+    msa_attention_lse,
+    msa_fp4,
+)
 from vllm_torchtpu.models.minimax_m3.kernels.msa_attention import (
     msa_sparse_attention,
 )
@@ -255,3 +259,76 @@ def test_dense_work_list_matches_unique(
     unique = msa_attention._work_list(jnp.asarray(selected), block_q, pages_per_step)
     for got, want in zip(dense, unique, strict=True):
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+
+
+def test_fp4_lse_small_tiles_match_default_tiles():
+    """The DCP attention's 8-token tiles (small batches) on a 4-bit cache give
+    the 16-token tiles' output and lse."""
+    num_tokens = 24
+    rng = np.random.default_rng(5)
+    q = jnp.asarray(rng.standard_normal((num_tokens, HEADS, HEAD_DIM))).astype(
+        jnp.bfloat16
+    )
+    nib, _ = msa_fp4.quantize(
+        jnp.asarray(rng.standard_normal((PAGES, PAGE, 2 * HEAD_DIM)), jnp.float32)
+    )
+    kv = msa_fp4.pack_rows(nib)
+    scale_cache = jnp.asarray(rng.random((PAGES, 8, PAGE)) * 0.3, jnp.float32)
+    keys = np.full((num_tokens, TOPK), -1, np.int32)
+    local_key = np.full(num_tokens, -1, np.int32)
+    local_limit = np.zeros(num_tokens, np.int32)
+    for t in range(num_tokens - 3):  # the last tokens are padding
+        chosen = rng.choice(PAGES, rng.integers(1, TOPK + 1), replace=False)
+        keys[t, : len(chosen)] = chosen
+        local_key[t] = chosen[0]
+        local_limit[t] = rng.integers(1, PAGE + 1)
+    args = (q, kv, jnp.asarray(keys), jnp.asarray(local_key), jnp.asarray(local_limit))
+    common = dict(
+        page_table=jnp.arange(PAGES, dtype=jnp.int32),
+        sm_scale=HEAD_DIM**-0.5,
+        scale_cache=scale_cache,
+        interpret=True,
+    )
+    small = msa_attention_lse.msa_sparse_attention_lse(
+        *args, block_q=msa_attention.SMALL_BATCH_BLOCK_Q, **common
+    )
+    default = msa_attention_lse.msa_sparse_attention_lse(
+        *args, block_q=msa_attention.DEFAULT_BLOCK_Q, **common
+    )
+    for a, b in zip(small, default):
+        np.testing.assert_allclose(
+            np.asarray(a.astype(jnp.float32)),
+            np.asarray(b.astype(jnp.float32)),
+            atol=2e-3,
+        )
+
+
+def test_fp4_lse_small_tiles_lower_for_tpu():
+    tokens, topk = 8, 16
+    args = (
+        jax.ShapeDtypeStruct((tokens, HEADS, HEAD_DIM), jnp.bfloat16),
+        jax.ShapeDtypeStruct((4096, PAGE // 8, 4, 2 * HEAD_DIM), jnp.uint8),
+        jax.ShapeDtypeStruct((tokens, topk), jnp.int32),
+        jax.ShapeDtypeStruct((tokens,), jnp.int32),
+        jax.ShapeDtypeStruct((tokens,), jnp.int32),
+        jax.ShapeDtypeStruct((4096,), jnp.int32),
+        jax.ShapeDtypeStruct((4096, 8, PAGE), jnp.float32),
+    )
+
+    def attention(q, kv, sel, page, limit, table, scales):
+        return msa_attention_lse.msa_sparse_attention_lse(
+            q,
+            kv,
+            sel,
+            page,
+            limit,
+            table,
+            sm_scale=0.1,
+            scale_cache=scales,
+            block_q=msa_attention.SMALL_BATCH_BLOCK_Q,
+        )
+
+    tpu7x = AbstractMesh((), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu"))
+    with use_abstract_mesh(tpu7x):
+        lowered = jax.jit(attention).trace(*args).lower(lowering_platforms=("tpu",))
+    assert "tpu_custom_call" in lowered.as_text()

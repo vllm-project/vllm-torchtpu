@@ -25,6 +25,7 @@ Served by the TPU `DSparkProposer`; the context K/V write is model-owned
 RMSNorm and an unquantized fused K/V weight.
 """
 
+import copy
 from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
@@ -138,6 +139,10 @@ class MiniMaxM3DSparkAttention(DFlashQwen3Attention):
         quant_config: QuantizationConfig | None,
         prefix: str,
     ) -> None:
+        if cache_config is not None and cache_config.cache_dtype == "int4_per_token_head":
+            # Only the target's MSA caches are 4-bit; the draft's KV stays fp8.
+            cache_config = copy.copy(cache_config)
+            cache_config.cache_dtype = "fp8"
         super().__init__(
             hidden_size=config.hidden_size,
             num_heads=config.num_attention_heads,
@@ -232,6 +237,13 @@ class MiniMaxM3DSparkModel(Qwen3DSparkModel):
             k, v = qkv[:, attn.q_size :].split([attn.kv_size, attn.kv_size], dim=-1)
             k = _per_head_norm(k, attn.k_norm, attn.head_dim)
             k, _ = attn.rotary_emb(positions, k, None)
+            impl = attn.attn.impl
+            if getattr(impl, "sharded_draft_dcp", None) is not None:
+                # DCP-sharded draft KV (`cp_draft_attention`): owner ranks write.
+                impl.write_sharded_draft_kv(
+                    attn.attn, k, v, attn.attn.kv_cache, layer_metadata
+                )
+                continue
             # The cache write rides the attention kernel; its output (for an
             # all-zero query) is discarded.
             query = torch.zeros(
@@ -239,7 +251,7 @@ class MiniMaxM3DSparkModel(Qwen3DSparkModel):
                 dtype=context.dtype,
                 device=context.device,
             )
-            attn.attn.impl.forward(
+            impl.forward(
                 layer=attn.attn,
                 query=query,
                 key=k.reshape(num_tokens, attn.num_kv_heads, attn.head_dim),
@@ -252,6 +264,10 @@ class MiniMaxM3DSparkModel(Qwen3DSparkModel):
 
 class MiniMaxM3DSparkForCausalLM(Qwen3DSparkForCausalLM):
     """Registry entry for ``architectures=DSparkMiniMaxDraftModel``."""
+
+    # Under DCP the draft's sliding-window KV is sharded over the group like
+    # the target's (`layers/adapter/cp_draft_attention`), not whole per rank.
+    shards_draft_kv_over_dcp = True
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         nn.Module.__init__(self)

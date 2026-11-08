@@ -29,6 +29,8 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.models.minimax_m3.kernels import msa_fp4
+
 _UINT_BY_BITS = {16: jnp.uint16, 8: jnp.uint8}
 
 
@@ -43,14 +45,19 @@ def _kernel(
     page_ref,  # [1, S / p, p, W] the page before the write
     # Out
     o_ref,  # [1, S / p, p, W] aliased with the cache
+    *refs,  # with folded scales: [1, 1, W] uint32 scale bits by slot, then o_ref
+    bits: int,
 ):
+    scale_ref = None
+    if refs:  # folded scales: the scale input precedes the output
+        scale_ref, o_ref = o_ref, refs[0]
     run = pl.program_id(0)
     active = run < num_runs_ref[0]
 
     @pl.when(active)
     def _():
-        rows, packing, width = page_ref.shape[1:]
-        bits = 32 // packing
+        rows, _, width = page_ref.shape[1:]
+        packing = 32 // bits
         words = page_ref.bitcast(jnp.uint32)[0, :, 0, :]
         lo, hi = run_lo_ref[run], run_hi_ref[run]
         row = jax.lax.broadcasted_iota(jnp.int32, (rows, width), 0)
@@ -60,6 +67,10 @@ def _kernel(
             keep = jnp.uint32(~(((1 << bits) - 1) << (bits * j)) & 0xFFFFFFFF)
             merged = (words & keep) | (new_ref[0, j] << jnp.uint32(bits * j))
             words = jnp.where(take, merged, words)
+        if scale_ref is not None:  # last word row: one f32 scale per slot (lane)
+            lane = jax.lax.broadcasted_iota(jnp.int32, (rows, width), 1)
+            take = (row == rows - 1) & (lane >= lo) & (lane < hi)
+            words = jnp.where(take, scale_ref[0], words)
         o_ref.bitcast(jnp.uint32)[0, :, 0, :] = words
 
     # With no run at all the single output page must still be written back
@@ -82,27 +93,37 @@ def _kernel_by_token(
     page_ref,  # [1, S / p, p, W] the page before the write
     # Out
     o_ref,  # [1, S / p, p, W] aliased with the cache
+    *refs,  # with folded scales: [T, W] uint32 scale bits per token, then o_ref
+    bits: int,
 ):
     """`_kernel` that merges a run's tokens one by one from the batch's rows,
     so no per-run page of rows is gathered first."""
+    scale_ref = None
+    if refs:  # folded scales: the scale input precedes the output
+        scale_ref, o_ref = o_ref, refs[0]
     run = pl.program_id(0)
     active = run < num_runs_ref[0]
 
     @pl.when(active)
     def _():
-        rows, packing, width = page_ref.shape[1:]
-        bits = 32 // packing
+        rows, _, width = page_ref.shape[1:]
+        packing = 32 // bits
         lo, tok0 = run_lo_ref[run], run_tok0_ref[run]
         row = jax.lax.broadcasted_iota(jnp.int32, (rows, width), 0)
+        lane = jax.lax.broadcasted_iota(jnp.int32, (rows, width), 1)
 
         def put(i, words):
             slot = lo + i
             shift = (slot % packing * bits).astype(jnp.uint32)
             keep = ~(jnp.uint32((1 << bits) - 1) << shift)
             new = rows_ref[pl.ds(tok0 + i, 1), :]
-            return jnp.where(
+            words = jnp.where(
                 row == slot // packing, (words & keep) | (new << shift), words
             )
+            if scale_ref is not None:  # last word row: the scale at lane = slot
+                take = (row == rows - 1) & (lane == slot)
+                words = jnp.where(take, scale_ref[pl.ds(tok0 + i, 1), :], words)
+            return words
 
         words = page_ref.bitcast(jnp.uint32)[0, :, 0, :]
         words = jax.lax.fori_loop(0, run_hi_ref[run] - lo, put, words)
@@ -145,7 +166,7 @@ def _runs(pages: jax.Array, slots: jax.Array, num_pages: int, max_runs: int):
     return num_runs, run_page, run_lo, run_lo + count, run_tok0
 
 
-@functools.partial(jax.jit, static_argnames=("max_runs", "interpret"))
+@functools.partial(jax.jit, static_argnames=("max_runs", "bits", "interpret"))
 def write_rows(
     cache: jax.Array,
     rows: jax.Array,
@@ -153,6 +174,8 @@ def write_rows(
     slots: jax.Array,
     *,
     max_runs: int,
+    bits: int | None = None,
+    scales: jax.Array | None = None,
     interpret: bool = False,
 ) -> jax.Array:
     """Write ``rows [T, W]`` (cache dtype) at ``(pages[t], slots[t])``.
@@ -161,31 +184,55 @@ def write_rows(
     run must take consecutive slots of one page, as a request's new tokens do;
     a run boundary is wherever that breaks. `max_runs` bounds the number of
     runs (see `max_write_runs`).
+
+    `bits` per slot defaults to the cache dtype's width. With ``bits=4`` (the
+    uint8 4-bit caches of `msa_fp4`) `rows` are uint8 values below 16, and
+    each 32-bit word holds 8 slots. `scales` (f32 ``[T]``) go to the last word
+    row of a page with folded scales (`msa_fp4.scales_in_page`), lane = slot.
     """
-    num_pages, rows_per_page, packing, width = cache.shape
-    page_size = rows_per_page * packing
+    num_pages, rows_per_page, word_bytes, width = cache.shape
+    if bits is None:
+        bits = 32 // word_bytes
+    packing = 32 // bits
+    folded = scales is not None
+    if folded and not (
+        bits == 4 and msa_fp4.scales_in_page(rows_per_page, cache.dtype)
+    ):
+        raise ValueError(
+            f"scales need a 4-bit cache with a scale row, got {cache.shape}"
+        )
+    data_rows = rows_per_page - 1 if folded else rows_per_page
+    page_size = data_rows * packing
     num_tokens = rows.shape[0]
-    bits = 32 // packing
     num_runs, run_page, run_lo, run_hi, run_tok0 = _runs(
         pages, slots, num_pages, max_runs
     )
-    word_bits = jax.lax.bitcast_convert_type(rows, _UINT_BY_BITS[bits]).astype(
-        jnp.uint32
-    )
+    if bits == 4:
+        word_bits = rows.astype(jnp.uint32) & 0xF
+    else:
+        word_bits = jax.lax.bitcast_convert_type(rows, _UINT_BY_BITS[bits]).astype(
+            jnp.uint32
+        )
+    scale_bits = None
+    if folded:
+        scale_bits = jax.lax.bitcast_convert_type(
+            scales.astype(jnp.float32), jnp.uint32
+        )
     page_block = pl.BlockSpec(
-        (1, rows_per_page, packing, width),
+        (1, rows_per_page, word_bytes, width),
         lambda r, n, run_page, *_: (run_page[r], 0, 0, 0),
     )
     if num_tokens <= _BY_TOKEN_MAX_TOKENS:
+        tokens_block = pl.BlockSpec((num_tokens, width), lambda r, *_: (0, 0))
+        extra = []
+        if folded:  # each token's scale bits on every lane
+            extra = [jnp.broadcast_to(scale_bits[:, None], (num_tokens, width))]
         return pl.pallas_call(
-            _kernel_by_token,
+            functools.partial(_kernel_by_token, bits=bits),
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=5,
                 grid=(max_runs,),
-                in_specs=[
-                    pl.BlockSpec((num_tokens, width), lambda r, *_: (0, 0)),
-                    page_block,
-                ],
+                in_specs=[tokens_block, page_block, *([tokens_block] * len(extra))],
                 out_specs=page_block,
             ),
             out_shape=jax.ShapeDtypeStruct(cache.shape, cache.dtype),
@@ -194,14 +241,20 @@ def write_rows(
             compiler_params=pltpu.CompilerParams(dimension_semantics=("arbitrary",)),
             interpret=interpret,
             name="minimax_m3_msa_write_rows",
-        )(num_runs[None], run_page, run_lo, run_hi, run_tok0, word_bits, cache)
+        )(num_runs[None], run_page, run_lo, run_hi, run_tok0, word_bits, cache, *extra)
     # Each run's rows laid out by slot ([run, j, r] = slot r * p + j), so the
     # kernel merges whole packing slots without strided loads.
     src = run_tok0[:, None] + jnp.arange(page_size, dtype=jnp.int32) - run_lo[:, None]
-    new = word_bits[jnp.clip(src, 0, num_tokens - 1)]
-    new = new.reshape(max_runs, rows_per_page, packing, width).transpose(0, 2, 1, 3)
+    src = jnp.clip(src, 0, num_tokens - 1)
+    new = word_bits[src]
+    new = new.reshape(max_runs, data_rows, packing, width).transpose(0, 2, 1, 3)
+    extra = []
+    if folded:
+        new = jnp.pad(new, ((0, 0), (0, 0), (0, rows_per_page - data_rows), (0, 0)))
+        bits_by_slot = scale_bits[src]  # [runs, S]
+        extra = [jnp.pad(bits_by_slot, ((0, 0), (0, width - page_size)))[:, None, :]]
     return pl.pallas_call(
-        _kernel,
+        functools.partial(_kernel, bits=bits),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=4,
             grid=(max_runs,),
@@ -210,6 +263,11 @@ def write_rows(
                     (1, packing, rows_per_page, width), lambda r, *_: (r, 0, 0, 0)
                 ),
                 page_block,
+                *(
+                    [pl.BlockSpec((1, 1, width), lambda r, *_: (r, 0, 0))]
+                    if folded
+                    else []
+                ),
             ],
             out_specs=page_block,
         ),
@@ -219,7 +277,7 @@ def write_rows(
         compiler_params=pltpu.CompilerParams(dimension_semantics=("arbitrary",)),
         interpret=interpret,
         name="minimax_m3_msa_write_rows",
-    )(num_runs[None], run_page, run_lo, run_hi, new, cache)
+    )(num_runs[None], run_page, run_lo, run_hi, new, cache, *extra)
 
 
 def max_write_runs(num_tokens: int, max_num_seqs: int, page_size: int) -> int:

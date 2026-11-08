@@ -26,6 +26,9 @@ _INDEXER_DTYPE_BY_KV_CACHE_DTYPE = {
     "bfloat16": "bf16",
     "fp8": "fp8",
     "fp8_e4m3": "fp8",
+    # 4-bit MSA caches (`kernels.msa_fp4`): the index keys are 4-bit too;
+    # indexer_kv_dtype must stay "auto" (no --attention-config entry).
+    "int4_per_token_head": "int4_per_token_head",
 }
 
 
@@ -75,8 +78,13 @@ class TPUMiniMaxM3Config(VerifyAndUpdateConfig):
             # TODO(minimax-m3): an index-key dtype independent of the KV cache.
             raise NotImplementedError(
                 f"MiniMax M3 on TPU stores index keys in the KV cache dtype "
-                f"({kv_dtype}); set indexer_kv_dtype to {kv_dtype!r} in "
-                f"--attention-config, got {indexer_dtype!r}."
+                f"({kv_dtype}); "
+                + (
+                    "leave indexer_kv_dtype unset"
+                    if kv_dtype == "int4_per_token_head"
+                    else f"set indexer_kv_dtype to {kv_dtype!r}"
+                )
+                + f" in --attention-config, got {indexer_dtype!r}."
             )
         if parallel_config.prefill_context_parallel_size > 1:
             raise NotImplementedError(

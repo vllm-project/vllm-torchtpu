@@ -166,7 +166,11 @@ def dcp_replicated_page_tokens(
     """
     dcp = vllm_config.parallel_config.decode_context_parallel_size
     impl = getattr(attn_module, "impl", None)
-    if dcp > 1 and getattr(impl, "kv_replicated_over_dcp", False):
+    if (
+        dcp > 1
+        and getattr(impl, "kv_replicated_over_dcp", False)
+        and getattr(impl, "sharded_draft_dcp", None) is None
+    ):
         return block_size * dcp
     return block_size
 
@@ -314,6 +318,8 @@ class KVCacheManager:
         # Model-owned caches that allocate their own exact shape
         # (`TpuOwnedKVCache.kv_cache_shape`); their specs are exact as given.
         owned_shape_layers: set[str] = set()
+        # Their per-block shapes, for the native-region budget below.
+        owned_block_shapes: dict[str, tuple[int, ...]] = {}
         # Attention layers kept whole on every DCP rank, with exact specs
         # (`dcp_replicated_page_tokens`).
         dcp_replicated_layers: set[str] = set()
@@ -386,6 +392,33 @@ class KVCacheManager:
                         attn_module.head_size,
                         self.runner.kv_cache_dtype,
                     )
+                    sharded_draft = getattr(attn_module.impl, "sharded_draft_dcp", None)
+                    if sharded_draft is not None:
+                        # A drafter's sliding-window KV sharded over DCP like
+                        # the target's (`cp_draft_attention`): block_size-token
+                        # pages holding every KV head of the DCP group. Exact
+                        # spec; full attention as vLLM's sliding-window
+                        # manager rejects DCP (the window is applied on read).
+                        kv_heads = max(
+                            1, sharded_draft["dcp"] // sharded_draft["kv_head_replicas"]
+                        )
+                        kv_cache_spec[layer_name] = FullAttentionSpec(
+                            block_size=block_size,
+                            num_kv_heads=kv_heads,
+                            head_size=attn_module.head_size,
+                            dtype=self.runner.kv_cache_dtype,
+                            page_size_padded=cast(
+                                "type[_TpuKVCacheBackend]", backend_cls
+                            ).get_kv_cache_page_size_bytes(
+                                block_size,
+                                kv_heads,
+                                attn_module.head_size,
+                                self.runner.kv_cache_dtype,
+                            ),
+                            sliding_window=attn_module.sliding_window,
+                        )
+                        dcp_replicated_layers.add(layer_name)
+                        continue
                     page_tokens = dcp_replicated_page_tokens(
                         attn_module, block_size, self.runner.vllm_config
                     )
@@ -514,8 +547,10 @@ class KVCacheManager:
                 spec = attn_module.get_kv_cache_spec(self.runner.vllm_config)
                 if spec is not None:
                     kv_cache_spec[layer_name] = spec
-                    if attn_module.kv_cache_shape(1) is not None:
+                    owned_block_shape = attn_module.kv_cache_shape(1)
+                    if owned_block_shape is not None:
                         owned_shape_layers.add(layer_name)
+                        owned_block_shapes[layer_name] = tuple(owned_block_shape)
             else:
                 continue
 
@@ -576,7 +611,9 @@ class KVCacheManager:
         ):
             assert backend_cls is not None
             kv_cache_spec = self._pad_native_attention_regions(
-                kv_cache_spec, cast("type[_TpuKVCacheBackend]", backend_cls)
+                kv_cache_spec,
+                cast("type[_TpuKVCacheBackend]", backend_cls),
+                owned_block_shapes,
             )
         return kv_cache_spec
 
@@ -584,7 +621,12 @@ class KVCacheManager:
         self,
         kv_cache_specs: dict[str, KVCacheSpec],
         backend_cls: type[_TpuKVCacheBackend],
+        owned_block_shapes: dict[str, tuple[int, ...]] | None = None,
     ) -> dict[str, KVCacheSpec]:
+        """`owned_block_shapes`: per-block shapes of model-owned caches
+        (`TpuOwnedKVCache.kv_cache_shape`), budgeted as allocated rather than
+        through the backend's shape for their spec."""
+        owned_block_shapes = owned_block_shapes or {}
         if can_share_attention_cache(list(kv_cache_specs.values()), backend_cls):
             return kv_cache_specs
         # Layouts that cannot share a packed pool need separate native arrays;
@@ -605,9 +647,14 @@ class KVCacheManager:
                 if isinstance(spec, MLAAttentionSpec)
                 else backend_cls
             )
-            shape = tuple(
-                backend.get_kv_cache_shape(
-                    1, spec.block_size, spec.num_kv_heads, spec.head_size, spec.dtype
+            owned = [owned_block_shapes[n] for n in group.layer_names if n in owned_block_shapes]
+            shape = (
+                owned[0]
+                if owned
+                else tuple(
+                    backend.get_kv_cache_shape(
+                        1, spec.block_size, spec.num_kv_heads, spec.head_size, spec.dtype
+                    )
                 )
             )
             native_pages[shape, spec.dtype] = math.prod(shape) * spec.dtype.itemsize

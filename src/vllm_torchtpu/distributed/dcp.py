@@ -210,3 +210,19 @@ def _patch_vllm_gqa_dcp_limit() -> None:
     verify_with_parallel_config._tpu_gqa_dcp_limit_patch = True  # type: ignore[attr-defined]
     ModelConfig.verify_with_parallel_config = verify_with_parallel_config
     logger.info("Applied TPU patch: GQA DCP up to the TP size for registered models.")
+
+
+def split_group_heads(
+    gathered: Any, dcp: int, q_heads: int, kv_head_replicas: int, *, per_kv_head: int
+) -> tuple[Any, tuple[Any, ...]]:
+    """Split a DCP all-gather of every rank's ``[q | t_1 | ... | t_n]``
+    (``[T, dcp * (q_heads + n), D]``, rank-major, ``n = per_kv_head``) into
+    the group's query heads ``[T, dcp * q_heads, D]`` and each ``t_i``
+    ``[T, dcp // kv_head_replicas, D]`` over the group's KV heads: rank
+    ``i`` holds KV head ``i // kv_head_replicas``, so every
+    ``kv_head_replicas``-th rank supplies the next head."""
+    num_tokens, _, head_dim = gathered.shape
+    gathered = gathered.view(num_tokens, dcp, q_heads + per_kv_head, head_dim)
+    q_all = gathered[:, :, :q_heads].reshape(num_tokens, dcp * q_heads, head_dim)
+    per_head = gathered[:, ::kv_head_replicas, q_heads:]
+    return q_all, tuple(per_head[:, :, i].contiguous() for i in range(per_kv_head))

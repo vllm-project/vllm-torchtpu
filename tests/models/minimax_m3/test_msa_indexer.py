@@ -22,6 +22,7 @@ import pytest
 from jax.sharding import AbstractDevice, AbstractMesh, use_abstract_mesh
 
 from tests.models.minimax_m3.packing import CACHE_DTYPES, PACKING, pack, rounded
+from vllm_torchtpu.models.minimax_m3.kernels import msa_fp4
 from vllm_torchtpu.models.minimax_m3.kernels.msa_indexer import block_scores
 
 PAGE = 128
@@ -108,6 +109,86 @@ def test_lowers_for_tpu(dtype, kernel):
     with use_abstract_mesh(tpu7x):
         lowered = (
             jax.jit(functools.partial(block_scores, kernel=kernel, large_kernel=kernel))
+            .trace(*args)
+            .lower(lowering_platforms=("tpu",))
+        )
+    assert "tpu_custom_call" in lowered.as_text()
+
+
+@pytest.mark.parametrize(
+    "q_lens,ctx_lens,pages_per_step",
+    [
+        ([1, 3], [1000, 5], 128),  # token-major (decode)
+        ([8, 8], [700, 90], 128),  # token-major (spec-decode verify)
+        ([8, 8], [700, 90], 4),  # page groups
+        ([1, 130, 3], [300, 200, 0], 4),  # small and large classes
+    ],
+)
+def test_fp4_folded_matches_reference(q_lens, ctx_lens, pages_per_step):
+    """4-bit index pages with their scales folded in (`msa_fp4`), kernel v3."""
+    rng = np.random.default_rng(len(q_lens) + pages_per_step)
+    num_seqs = len(q_lens)
+    num_real = sum(q_lens)
+    num_tokens = num_real + 5
+    seq_lens = np.zeros(MAX_SEQS, np.int32)
+    seq_lens[:num_seqs] = np.array(ctx_lens) + np.array(q_lens)
+    cu_q = np.full(MAX_SEQS + 1, num_real, np.int32)
+    cu_q[: num_seqs + 1] = np.concatenate([[0], np.cumsum(q_lens)])
+    tables = np.zeros((MAX_SEQS, PAGES_PER_SEQ), np.int32)
+    tables[:num_seqs] = rng.permutation(np.arange(1, NUM_PAGES))[
+        : num_seqs * PAGES_PER_SEQ
+    ].reshape(num_seqs, PAGES_PER_SEQ)
+    nib, scale = msa_fp4.quantize(
+        jnp.asarray(rng.standard_normal((NUM_PAGES, PAGE, HEAD_DIM)), jnp.float32)
+    )
+    cache = msa_fp4.pack_rows(nib, scale)
+    keys = np.asarray(msa_fp4.dequantize(nib, scale))
+    index_q = jnp.asarray(rng.standard_normal((num_tokens, 1, HEAD_DIM))).astype(
+        jnp.bfloat16
+    )
+
+    scores = block_scores(
+        index_q,
+        cache,
+        jnp.asarray(seq_lens),
+        jnp.asarray(tables.reshape(-1)),
+        jnp.asarray(cu_q),
+        jnp.int32(num_seqs),
+        block_q=64,
+        large_block_q=48,
+        pages_per_step=pages_per_step,
+        small_pages_per_step=pages_per_step,
+        kernel="v3",
+        large_kernel="v3",
+        interpret=True,
+    )
+
+    queries = np.asarray(index_q.astype(jnp.float32))[:, 0]
+    scores = np.asarray(scores)[:, 0]
+    for r in range(num_seqs):
+        num_pages = -(-seq_lens[r] // PAGE)
+        for t in range(cu_q[r], cu_q[r + 1]):
+            for b in range(num_pages):
+                expected = (keys[tables[r, b]] @ queries[t]).max()
+                # Keys are scaled in bf16 before the dot (msa_indexer.SCALE_KEYS).
+                np.testing.assert_allclose(scores[t, b], expected, rtol=2e-2, atol=5e-2)
+
+
+@pytest.mark.parametrize("tokens", [8, 256])
+def test_fp4_folded_lowers_for_tpu(tokens):
+    max_seqs, pages_per_seq = 16, 2048
+    args = (
+        jax.ShapeDtypeStruct((tokens, 1, HEAD_DIM), jnp.bfloat16),
+        jax.ShapeDtypeStruct((4096, PAGE // 8 + 1, 4, HEAD_DIM), jnp.uint8),
+        jax.ShapeDtypeStruct((max_seqs,), jnp.int32),
+        jax.ShapeDtypeStruct((max_seqs * pages_per_seq,), jnp.int32),
+        jax.ShapeDtypeStruct((max_seqs + 1,), jnp.int32),
+        jax.ShapeDtypeStruct((), jnp.int32),
+    )
+    tpu7x = AbstractMesh((), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu"))
+    with use_abstract_mesh(tpu7x):
+        lowered = (
+            jax.jit(functools.partial(block_scores, kernel="v3", large_kernel="v3"))
             .trace(*args)
             .lower(lowering_platforms=("tpu",))
         )
