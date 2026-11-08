@@ -249,12 +249,13 @@ def union_plan_nosort(blocks, lengths, *, group, union_cap, groups_cap, ratio=4,
     return union, vblocks, vlengths, usize
 
 
-def plan_selections(blocks, lengths, *, groups_cap, ratio=4):
+def plan_selections(blocks, lengths, *, groups_cap, ratio=4, live=None, tail=None):
     """(sel, bit_lengths): the selections the bitset takes (ids below ``groups_cap`` of live rows, else -1) and the
     lengths it takes (a row's partial tail dropped where the row already selects its tail group, so no bit is added
-    twice)."""
-    live = lengths > 0
-    tail = lengths // ratio
+    twice). ``live`` / ``tail``: the caller's ``lengths > 0`` / ``lengths // ratio``, if it has them (union_bits_plan
+    passes its own, so its TensorCore plan lowers to the same program as before the SparseCore option)."""
+    live = lengths > 0 if live is None else live
+    tail = lengths // ratio if tail is None else tail
     valid = (blocks >= 0) & (blocks < groups_cap) & live[:, None]
     sel = jnp.where(valid, blocks, -1)
     tail_selected = jnp.any(sel == tail[:, None], axis=1)
@@ -284,7 +285,7 @@ def union_bits_plan(blocks, lengths, *, group, union_cap, groups_cap, ratio=4, b
 
     live = lengths > 0
     tail = lengths // ratio
-    sel, bit_lengths = plan_selections(blocks, lengths, groups_cap=groups_cap, ratio=ratio)
+    sel, bit_lengths = plan_selections(blocks, lengths, groups_cap=groups_cap, ratio=ratio, live=live, tail=tail)
     if bitset == "sparsecore":
         from vllm_torchtpu.kernels.qwen4_exp.qsa_union_sc_gather import union_sc_bits
 
