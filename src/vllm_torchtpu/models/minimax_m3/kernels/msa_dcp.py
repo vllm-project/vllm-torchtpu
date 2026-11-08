@@ -167,6 +167,69 @@ def _candidates_kernel(
         pl.when(width_now == width)(functools.partial(select, width))
 
 
+def _candidates_kernel_t(
+    rank_ref,
+    widths_ref,
+    scores_ref,
+    pos_ref,
+    score_out_ref,
+    block_out_ref,
+    *,
+    block_size,
+    topk,
+    init_blocks,
+    local_blocks,
+    dcp,
+    widths,
+):
+    """`_candidates_kernel` with the row block transposed in VMEM: columns
+    on sublanes, rows on lanes (``pos_ref [1, rows]``, outputs ``[topk,
+    rows]``). Each pick's max and first index then reduce across vregs and
+    sublanes on the VPU instead of across lanes on the XLU, which bound the
+    row-major picks (~310 bundles per pick of a 256 x 128 block in the LLO)."""
+    rank = rank_ref[0]
+    width_now = widths_ref[pl.program_id(0)]
+    rows = scores_ref.shape[0]
+    num_visible = pos_ref[...] // block_size + 1  # [1, rows]
+
+    def select(width):
+        s = scores_ref[:, :width].T  # [width, rows]
+        cols = jax.lax.broadcasted_iota(jnp.int32, (width, rows), 0)
+        blocks = cols * dcp + rank
+        visible = blocks < num_visible
+        s = jnp.where(visible, s, _NEG_INF)
+        s = jnp.where(
+            visible & (blocks >= num_visible - local_blocks),
+            msa_select._FORCED_LOCAL_SCORE,
+            s,
+        )
+        s = jnp.where(
+            visible & (blocks < init_blocks), msa_select._FORCED_INIT_SCORE, s
+        )
+        picked_scores, picked_blocks = [], []
+        for _ in range(topk):
+            best_score = jnp.max(s, axis=0, keepdims=True)
+            best = jnp.min(
+                jnp.where(s == best_score, cols, width), axis=0, keepdims=True
+            )
+            picked_scores.append(best_score)
+            picked_blocks.append(
+                jnp.where(best_score > _NEG_INF, best * dcp + rank, -1)
+            )
+            s = jnp.where(cols == best, _NEG_INF, s)
+        score_out_ref[...] = jnp.concatenate(picked_scores, axis=0)
+        block_out_ref[...] = jnp.concatenate(picked_blocks, axis=0)
+
+    for width in widths:
+        pl.when(width_now == width)(functools.partial(select, width))
+
+
+# Row blocks of a multiple of this many rows (a vreg's lanes) pick
+# transposed (`_candidates_kernel_t`, `_merge_kernel_t`); smaller decode
+# blocks would fill few lanes of each vreg.
+_TRANSPOSED_ROWS = 128
+
+
 @functools.partial(
     jax.jit,
     static_argnames=(
@@ -226,10 +289,21 @@ def local_candidates(
         needed = -(-(last_pos // block_size + 1) // dcp)
         w = jnp.asarray(widths, jnp.int32)
         row_widths = jnp.min(jnp.where(w >= needed[:, None], w, num_cols), axis=1)
-    out_spec = pl.BlockSpec((block_rows, topk), lambda i: (i, 0))
+    transposed = block_rows % _TRANSPOSED_ROWS == 0
+    if transposed:
+        kernel = _candidates_kernel_t
+        pos_spec = pl.BlockSpec((1, block_rows), lambda i: (0, i))
+        p = p.T
+        out_spec = pl.BlockSpec((topk, block_rows), lambda i: (0, i))
+        out_dims = (topk, num_tokens + pad)
+    else:
+        kernel = _candidates_kernel
+        pos_spec = pl.BlockSpec((block_rows, 1), lambda i: (i, 0))
+        out_spec = pl.BlockSpec((block_rows, topk), lambda i: (i, 0))
+        out_dims = (num_tokens + pad, topk)
     picked_scores, picked_blocks = pl.pallas_call(
         functools.partial(
-            _candidates_kernel,
+            kernel,
             block_size=block_size,
             topk=topk,
             init_blocks=init_blocks,
@@ -242,12 +316,12 @@ def local_candidates(
             pl.BlockSpec(memory_space=pltpu.SMEM),
             pl.BlockSpec(memory_space=pltpu.SMEM),
             pl.BlockSpec((block_rows, num_cols), lambda i: (i, 0)),
-            pl.BlockSpec((block_rows, 1), lambda i: (i, 0)),
+            pos_spec,
         ],
         out_specs=[out_spec, out_spec],
         out_shape=[
-            jax.ShapeDtypeStruct((num_tokens + pad, topk), jnp.float32),
-            jax.ShapeDtypeStruct((num_tokens + pad, topk), jnp.int32),
+            jax.ShapeDtypeStruct(out_dims, jnp.float32),
+            jax.ShapeDtypeStruct(out_dims, jnp.int32),
         ],
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel",),
@@ -256,6 +330,8 @@ def local_candidates(
         interpret=interpret,
         name="minimax_m3_msa_dcp_candidates",
     )(rank_array(rank), row_widths, s, p)
+    if transposed:
+        picked_scores, picked_blocks = picked_scores.T, picked_blocks.T
     return picked_scores[:num_tokens], picked_blocks[:num_tokens]
 
 
@@ -322,6 +398,33 @@ def _merge_kernel(c_ref, o_ref, *, topk: int):
         o_ref[:, g * topk : (g + 1) * topk] = out
 
 
+def _merge_kernel_t(c_ref, o_ref, *, topk: int):
+    """`_merge_kernel` with each rank's block transposed in VMEM: candidate
+    slots on sublanes, tokens on lanes, so a head's ``dcp * topk``
+    candidates are whole vreg rows of the ranks' blocks (no lane shuffles)
+    and each pick reduces across vregs and sublanes on the VPU instead of
+    across lanes on the XLU. ``c_ref [dcp, Bt, G * 2 * topk]``, ``o_ref
+    [Bt, G * topk]``."""
+    dcp, block_t, width = c_ref.shape
+    ranks = [c_ref[r].T for r in range(dcp)]  # [width, Bt] each
+    no_block = jnp.iinfo(jnp.int32).max
+    out = []
+    for g in range(width // (2 * topk)):
+        base = g * 2 * topk
+        s = jnp.concatenate([c[base : base + topk] for c in ranks], axis=0)
+        b = jnp.concatenate(
+            [c[base + topk : base + 2 * topk] for c in ranks], axis=0
+        ).astype(jnp.int32)
+        for _ in range(topk):
+            best_score = jnp.max(s, axis=0, keepdims=True)  # [1, Bt]
+            best = jnp.min(
+                jnp.where(s == best_score, b, no_block), axis=0, keepdims=True
+            )
+            out.append(jnp.where(best_score > _NEG_INF, best, -1))
+            s = jnp.where(b == best, _NEG_INF, s)
+    o_ref[...] = jnp.concatenate(out, axis=0).T
+
+
 # Merges of more than this many candidates per token (DCP 8: 128) run
 # `_merge_kernel`: `merge_candidates`' [rows, n, n] ranking and the relayouts
 # of the [dcp, rows, 2 * topk] candidates into rows cost ~3 ms per layer in the
@@ -345,8 +448,9 @@ def merge_head_candidates(
     block_t = min(_MERGE_BLOCK_TOKENS, -(-num_tokens // 8) * 8)
     pad = -num_tokens % block_t
     c = jnp.pad(candidates, ((0, 0), (0, pad), (0, 0)))
+    kernel = _merge_kernel_t if block_t % _TRANSPOSED_ROWS == 0 else _merge_kernel
     out = pl.pallas_call(
-        functools.partial(_merge_kernel, topk=topk),
+        functools.partial(kernel, topk=topk),
         grid=((num_tokens + pad) // block_t,),
         in_specs=[pl.BlockSpec((dcp, block_t, width), lambda i: (0, i, 0))],
         out_specs=pl.BlockSpec((block_t, num_heads * topk), lambda i: (i, 0)),
