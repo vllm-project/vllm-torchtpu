@@ -22,9 +22,10 @@ once per tile. The cache packs consecutive tokens into 32-bit words
 (`packed_page`); each packing slot is scored separately, which a max does not
 mind.
 
-Scores are produced transposed, ``[pages, tiles * block_q]``, so each output
-block is lane-aligned, and gathered back to ``[tokens, pages]``; a decode
-batch's 128-page groups are lane-aligned either way and come out token-major.
+Long (prefill) requests' scores are produced transposed,
+``[pages, tiles * block_q]``, so each output block is lane-aligned, and
+gathered back to ``[tokens, pages]``; the short (decode) requests' 128-page
+groups are lane-aligned either way and come out token-major.
 """
 
 import functools
@@ -48,6 +49,12 @@ DEFAULT_PAGES_PER_STEP = 32
 # 1.95 -> 1.66 ms). The large prefill class keeps 32.
 DEFAULT_SMALL_PAGES_PER_STEP = 128
 DEFAULT_KERNEL = "v3"
+# Rows per token-major query tile of the block_q class (see `block_scores`).
+_SMALL_TILE_Q = 64
+# Folded 4-bit pages are scored transposed (`_folded_chunk_maxima_t`), whose
+# cost grows with the tile's rows: 32 holds a decode request of 4 folded
+# index heads x 8 (MTP) tokens.
+_SMALL_TILE_Q_FOLDED = 32
 # Large prefill tiles: v3's DMA ring is slower there on fp8 (1.79 vs 1.51 ms).
 DEFAULT_LARGE_KERNEL = "v2"
 _TILE_SHIFT = 16
@@ -200,47 +207,93 @@ def _page_tokens(rows_per_page: int, dtype) -> int:
     return rows_per_page * (4 // jnp.dtype(dtype).itemsize)
 
 
-def _scores_v3(q, page_refs, o_ref, transposed, scale_refs=None, scale_row=None):
-    """`_kernel_v2`'s scoring over pages already in VMEM; a `transposed`
-    output block is ``[Bq, G]``."""
-    block_q = q.shape[0]
-    pages_per_step = len(page_refs)
-    rows = page_refs[0].shape[0]
-    page_size = _page_tokens(rows, page_refs[0].dtype)
-    pages_per_dot = max(
-        1, min(pages_per_step, _MAX_SCORE_ELEMS // (page_size * block_q))
+# Pages per dot in `_kernel_v3`: 2 x 16 pages, paired along the contraction.
+_PAGES_PER_CHUNK = 32
+# `_kernel_v3` issues the next group's descriptors during its first chunks.
+_DMA_ISSUE_CHUNKS = 2
+
+
+def _paired_query(q: jax.Array) -> jax.Array:
+    """``[Bq, D]`` -> ``[[q, 0], [0, q]]`` of ``[2 Bq, 2 D]``."""
+    zeros = jnp.zeros_like(q)
+    return jnp.concatenate(
+        [
+            jnp.concatenate([q, zeros], axis=1),
+            jnp.concatenate([zeros, q], axis=1),
+        ],
+        axis=0,
     )
-    maxima = []
-    folded = msa_fp4.scales_in_page(rows, page_refs[0].dtype)
-    for first in range(0, pages_per_step, pages_per_dot):
-        group = page_refs[first : first + pages_per_dot]
-        keys, cols = [], []
-        for r in group:
-            words = r.bitcast(jnp.uint32)[:, 0, :]
-            if folded:
-                k, c = _folded_keys(words)
-                keys.append(k)
-                cols.append(c)
-            else:
-                keys.append(_words_keys(words, r.dtype))
-        keys = keys[0] if len(keys) == 1 else jnp.concatenate(keys, axis=0)
-        col = _scale_rows_to_column(cols) if folded else None
-        if folded and SCALE_KEYS:
-            keys = keys * col.astype(jnp.bfloat16)
-        s = jax.lax.dot_general(
-            keys, q, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
-        )
-        if folded and not SCALE_KEYS:
-            s = s * col
-        elif scale_row is not None:
-            cols = [
-                _scale_column(r[...], scale_row)
-                for r in scale_refs[first : first + pages_per_dot]
-            ]
-            s = s * (cols[0] if len(cols) == 1 else jnp.concatenate(cols, axis=0))
-        maxima.append(jnp.max(s.reshape(len(group), page_size, block_q), axis=1))
-    out = maxima[0] if len(maxima) == 1 else jnp.concatenate(maxima, axis=0)
-    o_ref[...] = out.T if transposed else out
+
+
+def _chunk_maxima(q_pair, page_keys, num_pages) -> jax.Array:
+    """``[num_pages, Bq]`` block maxima of `num_pages` pages against a query
+    tile given as `_paired_query`.
+
+    Pages ``j`` and ``h + j`` (``h = num_pages / 2``) share one MXU row,
+    ``[k_j | k_h+j] @ q_pair^T``: both are scored with one contraction of
+    ``2 D``, the MXU depth at D = 128. `page_keys(j)` is page ``j``'s bf16
+    ``[S, D]`` keys.
+    """
+    half = num_pages // 2
+    block_q = q_pair.shape[0] // 2
+    keys = [
+        jnp.concatenate([page_keys(j), page_keys(half + j)], axis=1)
+        for j in range(half)
+    ]
+    page_size = keys[0].shape[0]
+    s = jax.lax.dot_general(
+        jnp.concatenate(keys, axis=0),
+        q_pair,
+        (((1,), (1,)), ((), ())),
+        preferred_element_type=jnp.float32,
+    )  # [half * S, 2 Bq]
+    m = jnp.max(s.reshape(half, page_size, 2 * block_q), axis=1)
+    return jnp.concatenate([m[:, :block_q], m[:, block_q:]], axis=0)
+
+
+def _folded_chunk_maxima_t(q_pair, buf, first, chunk, live, issue) -> jax.Array:
+    """``[Bq, chunk]`` block maxima of the folded 4-bit pages
+    ``buf[first : first + chunk]`` with the scores computed transposed,
+    ``[2 Bq, tokens]``: the per-token scales are a lane vector (the page's
+    last word row), applied by a sublane broadcast, and the MXU result is
+    ``2 Bq`` rows rather than ``chunk * S / 2``. `issue(j)` runs among the
+    keys of page pair ``j``.
+    """
+    rows = buf.shape[1]
+    half = chunk // 2
+    block_q = q_pair.shape[0] // 2
+    keys, scale_rows = [], [[], []]
+    for j in range(half):
+        issue(j)
+        pair = []
+        for side, p in enumerate((first + j, first + half + j)):
+            k = pltpu.bitcast(buf[p, : rows - 1], jnp.int4).astype(jnp.bfloat16)
+            pair.append(k)
+            s = pltpu.bitcast(buf[p, rows - 1 :], jnp.float32)  # [1, S]
+            # Stale VMEM past the request's end, unwritten slots: scale 0.
+            scale_rows[side].append(jnp.where(jnp.isfinite(s) & (p < live), s, 0.0))
+        keys.append(jnp.concatenate(pair, axis=1))
+    page_size = keys[0].shape[0]
+    s = jax.lax.dot_general(
+        q_pair,
+        jnp.concatenate(keys, axis=0),
+        (((1,), (1,)), ((), ())),
+        preferred_element_type=jnp.float32,
+    )  # [2 Bq, half * S]
+    left, right = (jnp.concatenate(r, axis=1) for r in scale_rows)
+    row = jax.lax.broadcasted_iota(jnp.int32, s.shape, 0)
+    s = s * jnp.where(row < block_q, left, right)
+    m = jnp.max(s.reshape(2 * block_q, half, page_size), axis=2)  # [2 Bq, half]
+    return jnp.concatenate([m[:block_q], m[block_q:]], axis=1)
+
+
+def _v3_chunk(pages_per_step: int, block_q: int, page_size: int) -> int:
+    """Pages per dot of `_kernel_v3`: the f32 ``[chunk / 2 * S, 2 Bq]``
+    product within twice `_MAX_SCORE_ELEMS`."""
+    chunk = min(_PAGES_PER_CHUNK, pages_per_step)
+    while chunk > 2 and chunk * page_size * block_q > 2 * _MAX_SCORE_ELEMS:
+        chunk //= 2
+    return chunk
 
 
 def _kernel_v3(
@@ -252,100 +305,140 @@ def _kernel_v3(
     # In
     q_ref,  # [Bq, D]
     cache_ref,  # [pages, S / p, p, D] index cache, left in HBM
-    *refs,
-    scale_row: int | None = None,
-    transposed: bool = False,
+    # Out
+    o_ref,  # [G, Bq], or [Bq, G] if `transposed`
+    # Scratch
+    buf,  # [2, G, S / p, D] pages of even and odd steps, as 32-bit words
+    sems,  # DMA semaphores [2], one per ring slot
+    *,
+    transposed=False,
 ):
     """`_kernel_v2` with the pages fetched by a hand-written double-buffered
     DMA ring: one scalar address per page and no copy for pages past the
     request's end (their scores are never read).
 
-    refs: without `scale_row`, ``o_ref [G, Bq]``, then scratch ``buf0``,
-    ``buf1`` (``[G, S / p, p, D]`` pages of even / odd steps) and DMA
-    semaphores ``[2, G]``. With `scale_row` (4-bit caches) the scale cache
-    ``[pages, 8, 128]`` (in HBM) comes first, and the scratch adds scale
-    buffers ``[G, 8, 128]`` for even / odd steps and their semaphores.
+    Each ring slot has straight-line bodies (static buffers, so the
+    scheduler sees the next group's copies do not touch the pages being
+    scored), and the next group's descriptors are issued among this group's
+    matmuls. A wait between chunks would drain the MXU pipeline, so all of
+    the group's pages are waited for first.
+
+    A folded 4-bit page (`msa_fp4.scales_in_page`) is ``S / 8`` word rows of
+    int4 keys and one row of f32 slot scales (`_folded_chunk_maxima_t`).
     """
-    if scale_row is None:
-        o_ref, buf0, buf1, sems = refs
-        scale_ref = sbuf0 = sbuf1 = ssems = None
-    else:
-        scale_ref, o_ref, buf0, buf1, sems, sbuf0, sbuf1, ssems = refs
-    pages_per_step = buf0.shape[0]
+    _, pages_per_step, rows, head_dim = buf.shape
+    block_q = q_ref.shape[0]
+    folded = msa_fp4.scales_in_page(rows, cache_ref.dtype)
+    page_size = _page_tokens(rows, cache_ref.dtype)
+    chunk = _v3_chunk(pages_per_step, block_q, page_size)
     pages_per_seq = block_tables_ref.shape[0] // seq_pages_ref.shape[0]
     step, num_steps = pl.program_id(0), pl.num_programs(0)
+    # The pages as 32-bit words: a dense VMEM layout, so each key vreg is one
+    # load (a packed [S / p, p, D] page tiles VMEM in (p, D) tiles).
+    words = cache_ref.bitcast(jnp.uint32).reshape(cache_ref.shape[0], rows, head_dim)
 
-    def copies(w, buf, slot, sbuf=None):
+    def group(w):
+        """(first block-table entry, live pages) of work item `w`."""
         entry = work_ref[w]
         seq = tile_seq_ref[entry >> _TILE_SHIFT] & _SEQ_MASK
         first = (entry & _GROUP_MASK) * pages_per_step
-        live = jnp.maximum(seq_pages_ref[seq] - first, 1)
-        base = seq * pages_per_seq + first
-        out = []
-        for g in range(pages_per_step):
+        return seq * pages_per_seq + first, jnp.maximum(seq_pages_ref[seq] - first, 1)
+
+    def copy(base, g, slot):
+        col = g
+        if pages_per_seq % pages_per_step:
+            # Keep the last group's block-table reads in its request's row.
+            first = base % pages_per_seq
             col = jnp.minimum(first + g, pages_per_seq - 1) - first
-            page = block_tables_ref[base + col]
-            out.append(
-                (
-                    g < live,
-                    pltpu.make_async_copy(
-                        cache_ref.at[page], buf.at[g], sems.at[slot, g]
-                    ),
-                )
-            )
-            if sbuf is not None:
-                out.append(
-                    (
-                        g < live,
-                        pltpu.make_async_copy(
-                            scale_ref.at[page], sbuf.at[g], ssems.at[slot, g]
-                        ),
-                    )
-                )
-        return out
+        return pltpu.make_async_copy(
+            words.at[block_tables_ref[base + col]],
+            buf.at[slot, g],
+            sems.at[slot],
+        )
 
-    bufs = ((buf0, sbuf0), (buf1, sbuf1))
-
-    def start(w, slot):
-        for live, copy in copies(w, bufs[slot][0], slot, bufs[slot][1]):
-            pl.when(live)(copy.start)
-
-    def wait(w, slot):
-        for live, copy in copies(w, bufs[slot][0], slot, bufs[slot][1]):
-            pl.when(live)(copy.wait)
+    def start(base, live, pages, slot):
+        for g in pages:
+            pl.when(g < live)(copy(base, g, slot).start)
 
     @pl.when(step == 0)
     def _():
-        start(step, 0)
+        start(*group(step), range(pages_per_step), 0)
 
-    even = step % 2 == 0
+    base, live = group(step)
+    next_base, next_live = group(jnp.minimum(step + 1, num_steps - 1))
+    next_live = jnp.where(step + 1 < num_steps, next_live, 0)
+    q_pair = _paired_query(q_ref[...].astype(jnp.bfloat16))
+    num_chunks = pages_per_step // chunk
+    # The next group's descriptors, spread over the first chunks' page pairs:
+    # issued late in the step, a descriptor's DMA latency shows at the next
+    # step's wait.
+    issue_chunks = min(_DMA_ISSUE_CHUNKS, num_chunks)
+    per_pair = -(-pages_per_step // (issue_chunks * (chunk // 2)))
 
-    @pl.when(step + 1 < num_steps)
-    def _():
-        @pl.when(even)
-        def _():
-            start(step + 1, 1)
+    def score_chunk(slot, first, share):
+        """Score pages ``[first, first + chunk)``, issuing the next group's
+        descriptors `share` among the first page pairs."""
 
-        @pl.when(jnp.logical_not(even))
-        def _():
-            start(step + 1, 0)
+        def issue(j):
+            if j < chunk // 2:
+                start(
+                    next_base,
+                    next_live,
+                    share[j * per_pair : (j + 1) * per_pair],
+                    1 - slot,
+                )
 
-    q = q_ref[...].astype(jnp.bfloat16)
+        if folded:
+            m = _folded_chunk_maxima_t(
+                q_pair, buf.at[slot], first, chunk, live, issue
+            )  # [Bq, chunk]
+            if transposed:
+                o_ref[:, pl.ds(first, chunk)] = m
+            else:
+                o_ref[pl.ds(first, chunk), :] = m.T
+            return
 
-    def score(slot):
-        buf, sbuf = bufs[slot]
-        wait(step, slot)
-        _scores_v3(
-            q,
-            [buf.at[g] for g in range(pages_per_step)],
-            o_ref,
-            transposed,
-            None if sbuf is None else [sbuf.at[g] for g in range(pages_per_step)],
-            scale_row,
-        )
+        def page_keys(j):
+            issue(j)
+            # A page past the request's end was never copied: its stale words
+            # may be NaN or inf, which would reach its pair's score through
+            # the zero half of q_pair.
+            w = jnp.where(first + j < live, buf[slot, first + j], 0)
+            return pltpu.bitcast(w, cache_ref.dtype).astype(jnp.bfloat16)
 
-    pl.when(even)(lambda: score(0))
-    pl.when(jnp.logical_not(even))(lambda: score(1))
+        m = _chunk_maxima(q_pair, page_keys, chunk)
+        if transposed:
+            o_ref[:, pl.ds(first, chunk)] = m.T
+        else:
+            o_ref[pl.ds(first, chunk), :] = m
+
+    share = per_pair * (chunk // 2)
+
+    def body(slot, scored):
+        """Score the group's first `scored` chunks; the rest are past the
+        request's last page (their scores are never read) and only issue
+        their share of the next group's descriptors."""
+        for g in range(pages_per_step):
+            pl.when(g < live)(copy(base, g, slot).wait)
+        for c in range(num_chunks):
+            pages = range(
+                min(c * share, pages_per_step), min((c + 1) * share, pages_per_step)
+            )
+            if c < scored:
+                score_chunk(slot, c * chunk, pages)
+            else:
+                start(next_base, next_live, pages, 1 - slot)
+
+    # One straight-line body per slot and count of scored chunks, so that a
+    # chunk's matmuls overlap the previous chunk's maxima.
+    counts = sorted({num_chunks} | {2**k for k in range(1, 8) if 2**k < num_chunks})
+    live_chunks = jnp.minimum(-(-live // chunk), num_chunks)
+    for slot in (0, 1):
+        for i, n in enumerate(counts):
+            lo = counts[i - 1] if i else 0
+            pl.when((step % 2 == slot) & (live_chunks > lo) & (live_chunks <= n))(
+                functools.partial(body, slot, n)
+            )
 
 
 _KERNELS = {"v1": _kernel_v1, "v2": _kernel_v2}
@@ -500,39 +593,40 @@ def _class_scores(
             (block_q, pages_per_step),
             lambda w, work, *_: (work[w] >> _TILE_SHIFT, work[w] & _GROUP_MASK),
         )
-    params = pltpu.CompilerParams(dimension_semantics=("arbitrary",))
+    params = pltpu.CompilerParams(
+        dimension_semantics=("arbitrary",), disable_bounds_checks=kernel == "v3"
+    )
     if kernel == "v3":
-        page_buf = pltpu.VMEM(
-            (pages_per_step, rows_per_page, packing, head_dim), index_cache.dtype
-        )
-        scratch = [page_buf, page_buf, pltpu.SemaphoreType.DMA((2, pages_per_step))]
-        hbm = [pl.BlockSpec(memory_space=pl.ANY)]
-        operands = [index_cache]
         if fp4:
-            scale_buf = pltpu.VMEM(
-                (pages_per_step, scale_cache.shape[1], msa_fp4.SCALE_LANES), jnp.float32
+            raise NotImplementedError(
+                "kernel v3 reads 4-bit pages with folded scales only"
             )
-            scratch += [
-                scale_buf,
-                scale_buf,
-                pltpu.SemaphoreType.DMA((2, pages_per_step)),
-            ]
-            hbm.append(pl.BlockSpec(memory_space=pl.ANY))
-            operands.append(scale_cache)
+        chunk = _v3_chunk(pages_per_step, block_q, page_size)
+        if pages_per_step % chunk or chunk % 2:
+            raise NotImplementedError(
+                f"kernel v3 pairs pages in chunks of up to {_PAGES_PER_CHUNK}: "
+                f"pages_per_step must be an even divisor or a multiple of it, "
+                f"got {pages_per_step}"
+            )
         scores_t = pl.pallas_call(
-            functools.partial(_kernel_v3, scale_row=scale_row, transposed=token_major),
+            functools.partial(_kernel_v3, transposed=token_major),
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=4,
                 grid=grid_spec.grid,
-                in_specs=[grid_spec.in_specs[0], *hbm],
+                in_specs=[grid_spec.in_specs[0], pl.BlockSpec(memory_space=pl.ANY)],
                 out_specs=out_specs,
-                scratch_shapes=scratch,
+                scratch_shapes=[
+                    pltpu.VMEM(
+                        (2, pages_per_step, rows_per_page, head_dim), jnp.uint32
+                    ),
+                    pltpu.SemaphoreType.DMA((2,)),
+                ],
             ),
             out_shape=out_shape,
             compiler_params=params,
             interpret=interpret,
             name="minimax_m3_msa_block_scores",
-        )(work, tile_info, block_tables, seq_pages, q_rows, *operands)
+        )(work, tile_info, block_tables, seq_pages, q_rows, index_cache)
     else:
         kernel_fn = _KERNELS[kernel]
         if fp4:
@@ -655,50 +749,73 @@ def block_scores(
     )
     # Large requests have more than block_q tokens each.
     max_large = min(max_num_seqs, num_tokens // (block_q + 1))
-    # With one tile class (decode), token-major scores make the gather back to
-    # token order a row gather; a column gather first relayouts the whole
-    # padded [P, tiles * block_q] f32 block (4 us per layer in the b1 decode
-    # twin, j-b312f26a). Needs lane-aligned [block_q, pages_per_step] blocks.
-    token_major = max_large == 0 and kernel == "v3" and small_pages_per_step % 128 == 0
+    # Kernel v3 reads 4-bit pages with folded scales only.
+    small_kernel = "v2" if kernel == "v3" and scale_row is not None else kernel
+    # Token-major scores make the gather back to token order a row gather; a
+    # column gather first relayouts the whole padded [P, tiles * block_q] f32
+    # block (36 us per layer in the c48 decode twin, j-a281ffb0). Needs
+    # lane-aligned [tile, pages_per_step] blocks.
+    token_major = small_kernel == "v3" and small_pages_per_step % 128 == 0
+    # Token-major tiles of up to _SMALL_TILE_Q rows: decode requests have 8
+    # (MTP) to 32 (folded index heads) rows, and a tile of up to 64 rows costs
+    # the same as one of 8 (paired scores are 2 x tile lanes). A request of up
+    # to block_q rows takes several tiles; none holds more than the batch.
+    folded = msa_fp4.is_fp4(index_cache) and scale_row is None
+    tile = (
+        min(
+            block_q,
+            _SMALL_TILE_Q_FOLDED if folded else _SMALL_TILE_Q,
+            -(-num_tokens // _ROW_ALIGN) * _ROW_ALIGN,
+        )
+        if token_major
+        else block_q
+    )
+    # Aligned tile starts add up to _ROW_ALIGN - 1 rows per request.
+    tiles_per_request = -(-(block_q + _ROW_ALIGN - 1) // tile)
     small, small_col = score(
         active & ~is_large,
-        block_q=block_q,
-        # Aligned tile starts can push a request of <= block_q tokens into a
-        # second tile.
-        max_tiles=min(2 * max_num_seqs, num_tokens + max_num_seqs),
+        block_q=tile,
+        max_tiles=min(
+            tiles_per_request * max_num_seqs,
+            (num_tokens + (_ROW_ALIGN - 1) * max_num_seqs) // tile + max_num_seqs,
+        ),
         pages_per_step=small_pages_per_step,
-        kernel=kernel,
+        kernel=small_kernel,
         token_major=token_major,
     )
-    if token_major:
-        return small[small_col][:, None, :]
+    small = small[small_col] if token_major else small[:, small_col].T
     if max_large == 0:
-        return small[:, small_col].T[:, None, :]
-    large, large_col = score(
-        is_large,
-        block_q=large_block_q,
-        # +1 per request for the partial last tile, plus the up-to-7 rows each
-        # aligned start adds.
-        max_tiles=num_tokens // large_block_q
-        + max_large
-        + -(-(_ROW_ALIGN - 1) * max_large // large_block_q)
-        + 1,
-        pages_per_step=pages_per_step,
-        kernel=large_kernel,
-    )
-    tok = jnp.arange(num_tokens, dtype=jnp.int32)
-    seq = jnp.minimum(
-        jnp.searchsorted(cu_q_lens[1:], tok, side="right", method="compare_all").astype(
-            jnp.int32
-        ),
-        max_num_seqs - 1,
-    )
-    # One gather over both classes' columns (XLA fuses the concatenate into
-    # it) instead of a transposing gather per class and a select.
-    col = jnp.where(is_large[seq], small.shape[1] + large_col, small_col)
+        return small[:, None, :]
+
+    def with_large():
+        large, large_col = score(
+            is_large,
+            block_q=large_block_q,
+            # +1 per request for the partial last tile, plus the up-to-7 rows
+            # each aligned start adds.
+            max_tiles=num_tokens // large_block_q
+            + max_large
+            + -(-(_ROW_ALIGN - 1) * max_large // large_block_q)
+            + 1,
+            pages_per_step=pages_per_step,
+            kernel=large_kernel,
+        )
+        large = large[:, large_col].T
+        large = jnp.pad(large, ((0, 0), (0, pages - large.shape[1])))
+        tok = jnp.arange(num_tokens, dtype=jnp.int32)
+        seq = jnp.minimum(
+            jnp.searchsorted(
+                cu_q_lens[1:], tok, side="right", method="compare_all"
+            ).astype(jnp.int32),
+            max_num_seqs - 1,
+        )
+        return jnp.where(is_large[seq][:, None], large, small)
+
     # The classes may pad pages to different group multiples; pad to the wider.
-    pages = max(small.shape[0], large.shape[0])
-    small, large = (
-        jnp.pad(x, ((0, pages - x.shape[0]), (0, 0))) for x in (small, large)
+    pages = max(
+        small.shape[1],
+        -(-block_tables.shape[0] // max_num_seqs // pages_per_step) * pages_per_step,
     )
-    return jnp.concatenate([small, large], axis=1)[:, col].T[:, None, :]
+    small = jnp.pad(small, ((0, 0), (0, pages - small.shape[1])))
+    # Decode steps have no large request: skip its kernel call and gather.
+    return jax.lax.cond(jnp.any(is_large), with_large, lambda: small)[:, None, :]

@@ -90,6 +90,77 @@ def test_matches_reference(
                 np.testing.assert_allclose(scores[t, b], expected, rtol=1e-5, atol=1e-4)
 
 
+def _served_case(q_lens, ctx_lens, cache_kind, seed):
+    """Batch metadata, cache and dequantized keys at the served page group:
+    384 pages per request, so the v3 ring runs several 128-page groups."""
+    rng = np.random.default_rng(seed)
+    pages_per_seq, num_pages = 384, 1200
+    num_seqs, max_seqs = len(q_lens), 4
+    num_real = sum(q_lens)
+    seq_lens = np.zeros(max_seqs, np.int32)
+    seq_lens[:num_seqs] = np.array(ctx_lens) + np.array(q_lens)
+    cu_q = np.full(max_seqs + 1, num_real, np.int32)
+    cu_q[: num_seqs + 1] = np.concatenate([[0], np.cumsum(q_lens)])
+    tables = np.zeros((max_seqs, pages_per_seq), np.int32)
+    tables[:num_seqs] = rng.permutation(np.arange(1, num_pages))[
+        : num_seqs * pages_per_seq
+    ].reshape(num_seqs, pages_per_seq)
+    raw = rng.standard_normal((num_pages, PAGE, HEAD_DIM))
+    if cache_kind == "fp4":
+        nib, scale = msa_fp4.quantize(jnp.asarray(raw, jnp.float32))
+        cache = msa_fp4.pack_rows(nib, scale)
+        keys = np.asarray(msa_fp4.dequantize(nib, scale))
+    else:
+        keys = rounded(raw, cache_kind)
+        cache = pack(keys, cache_kind)
+    index_q = jnp.asarray(rng.standard_normal((num_real + 5, 1, HEAD_DIM))).astype(
+        jnp.bfloat16
+    )
+    return index_q, cache, keys, seq_lens, tables, cu_q, num_seqs
+
+
+@pytest.mark.parametrize("cache_kind", [*CACHE_DTYPES, "fp4"])
+@pytest.mark.parametrize(
+    "q_lens,ctx_lens",
+    [
+        # Last groups of 44, 80 and 1 live pages: 2, 3 and 1 of 4 chunks scored.
+        ([8, 8, 3], [300 * PAGE - 8, 207 * PAGE + 5, 7]),
+        # A 100-row request over two 64-row tiles, and a large (v2) request.
+        ([100, 8, 200], [290 * PAGE, 128 * PAGE + 3, 40 * PAGE]),
+    ],
+)
+def test_served_page_groups_match_reference(cache_kind, q_lens, ctx_lens):
+    """The default kernels at the served page group (128 pages per step)."""
+    index_q, cache, keys, seq_lens, tables, cu_q, num_seqs = _served_case(
+        q_lens, ctx_lens, cache_kind, len(q_lens) + q_lens[0]
+    )
+    scores = block_scores(
+        index_q,
+        cache,
+        jnp.asarray(seq_lens),
+        jnp.asarray(tables.reshape(-1)),
+        jnp.asarray(cu_q),
+        jnp.int32(num_seqs),
+        interpret=True,
+    )
+    queries = np.asarray(index_q.astype(jnp.float32))[:, 0]
+    scores = np.asarray(scores)[:, 0]
+    # The large class (v2) scales 4-bit keys in bf16 (msa_indexer.SCALE_KEYS).
+    tol = (
+        {"rtol": 2e-2, "atol": 5e-2}
+        if cache_kind == "fp4"
+        else {"rtol": 1e-5, "atol": 1e-4}
+    )
+    for r in range(num_seqs):
+        num_pages_r = -(-seq_lens[r] // PAGE)
+        expected = np.einsum(
+            "psd,td->tps", keys[tables[r, :num_pages_r]], queries[cu_q[r] : cu_q[r + 1]]
+        ).max(-1)
+        np.testing.assert_allclose(
+            scores[cu_q[r] : cu_q[r + 1], :num_pages_r], expected, **tol
+        )
+
+
 @pytest.mark.parametrize("kernel", ["v1", "v2", "v3"])
 @pytest.mark.parametrize("dtype", CACHE_DTYPES)
 def test_lowers_for_tpu(dtype, kernel):
