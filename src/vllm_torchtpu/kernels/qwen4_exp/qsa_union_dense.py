@@ -1829,7 +1829,7 @@ def union_walk_prefill(query, gate, blocks, lengths, table, cache, starts, *, kv
                        k_scale=1.0, v_scale=1.0, group=128, kv_tile=1024, union_cap, min_context,
                        lean, walk_runs=0, union_alpha=0.0, share_bits=False, qk16=False, listed=None,
                        run_tables=False, max_run=8, lazy_share=False, gathered=None, gather_chunks=4,
-                       gather_growth=1.0, compact_reqs=0):
+                       gather_growth=1.0, compact_reqs=0, compact_copy_method="vmem"):
     """D2 union-walk attention for a packed prefill step; ``(gated bf16 output, cache)``.
 
     Same contract as ``block_sparse_gqa_attention`` without ``return_lse``.
@@ -2051,7 +2051,7 @@ def union_walk_prefill(query, gate, blocks, lengths, table, cache, starts, *, kv
 
             def compact_branch():
                 _COMPACT_RAN.append(int(tokens))  # trace-time record (tests)
-                pool_c = compact_copy(cache, pairs, count)
+                pool_c = compact_copy(cache, pairs, count, method=compact_copy_method)
                 rows, ids = listing(compact_rows)
                 return _gathered_chunks(
                     aligned_query, bits, ubits, usize, vlengths, cache, page_rows, rows, ids, gathered=gathered,
@@ -2192,23 +2192,115 @@ def _compact_copy_kernel(pairs_ref, count_ref, pool_hbm, out_hbm, sem, *, inflig
     lax.fori_loop(jnp.maximum(count - inflight, 0), count, drain, None)
 
 
-def compact_copy(pool, pairs, count, *, inflight=8):
-    """The compact pool: ``pool[pairs[i, 0]]`` copied to page ``pairs[i, 1]`` for the first ``count`` pairs (whole-page
-    HBM DMAs, at most ``inflight`` in flight); other pages are left unwritten (the list never points at them)."""
+COMPACT_COPY_METHODS = ("dma", "vmem", "pipe")
+
+
+def _compact_copy_vmem_kernel(pairs_ref, count_ref, pool_hbm, out_hbm, buf, load_sem, store_sem):
+    """Whole pages staged through two VMEM buffers by DMA only (no vector loads: FP8 bytes stay exact): load page
+    i + 1 while page i is stored."""
+    count = count_ref[0]
+
+    def load(i, slot):
+        return pltpu.make_async_copy(pool_hbm.at[pairs_ref[i, 0]], buf.at[slot], load_sem.at[slot])
+
+    def store(i, slot):
+        return pltpu.make_async_copy(buf.at[slot], out_hbm.at[pairs_ref[i, 1]], store_sem.at[slot])
+
+    @pl.when(count > 0)
+    def _():
+        load(0, 0).start()
+
+    def step(i, carry):
+        slot = i % 2
+
+        @pl.when(i + 1 < count)
+        def _():
+            @pl.when(i >= 1)
+            def _():
+                store(i - 1, 1 - slot).wait()  # the other buffer is free once its store has landed
+
+            load(i + 1, 1 - slot).start()
+
+        load(i, slot).wait()
+        store(i, slot).start()
+        return carry
+
+    lax.fori_loop(0, count, step, None)
+
+    @pl.when(count >= 2)
+    def _():
+        store(count - 2, count % 2).wait()
+
+    @pl.when(count >= 1)
+    def _():
+        store(count - 1, (count - 1) % 2).wait()
+
+
+def _compact_copy_pipe_kernel(pairs_ref, count_ref, page_ref, out_ref):
+    out_ref.bitcast(jnp.uint32)[...] = page_ref.bitcast(jnp.uint32)[...]  # 32-bit words: no FP8 value semantics
+
+
+def compact_copy(pool, pairs, count, *, inflight=8, method="vmem"):
+    """The compact pool: ``pool[pairs[i, 0]]`` copied to page ``pairs[i, 1]`` for the first ``count`` pairs; other
+    pages are left unwritten (the list never points at them). Every method moves bytes exactly (no FP8 conversion):
+
+    ``dma``: whole-page HBM-to-HBM DMAs, ``inflight`` at a time (i2b j-950efc5d: about 0.095 ms per 3.28 MB page);
+    ``vmem``: whole pages staged through two VMEM buffers, DMA only, a dynamic loop over the live pages;
+    ``pipe``: a Pallas pipeline over all slots (one page per step, copied as 32-bit words); slots past ``count``
+    repeat the last live page's indices, so the pipeline fetches and writes nothing new for them.
+    """
+    if method not in COMPACT_COPY_METHODS:
+        raise ValueError(f"compact copy method {method!r} is not one of {COMPACT_COPY_METHODS}")
     pages, page_size, head_axis, packing, dim = pool.shape
     slots = pairs.shape[0]
+    out_shape = jax.ShapeDtypeStruct((slots, page_size, head_axis, packing, dim), pool.dtype)
+    page_bytes = page_size * head_axis * packing * dim * jnp.dtype(pool.dtype).itemsize
+    operands = (pairs.astype(jnp.int32), count.reshape(1).astype(jnp.int32), pool)
+    if method == "dma":
+        return pl.pallas_call(
+            functools.partial(_compact_copy_kernel, inflight=int(inflight)),
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=2,
+                grid=(1,),
+                in_specs=[pl.BlockSpec(memory_space=pltpu.HBM)],
+                out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+                scratch_shapes=[pltpu.SemaphoreType.DMA],
+            ),
+            out_shape=out_shape,
+            name="qsa_union_compact_pool",
+        )(*operands)
+    if method == "vmem":
+        return pl.pallas_call(
+            _compact_copy_vmem_kernel,
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=2,
+                grid=(1,),
+                in_specs=[pl.BlockSpec(memory_space=pltpu.HBM)],
+                out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+                scratch_shapes=[pltpu.VMEM((2, page_size, head_axis, packing, dim), pool.dtype),
+                                pltpu.SemaphoreType.DMA((2,)), pltpu.SemaphoreType.DMA((2,))],
+            ),
+            out_shape=out_shape,
+            compiler_params=pltpu.CompilerParams(vmem_limit_bytes=int(2 * page_bytes + (16 << 20))),
+            name="qsa_union_compact_pool_vmem",
+        )(*operands)
+
+    def live(i, pairs_ref, count_ref):
+        return jnp.minimum(i, jnp.maximum(count_ref[0] - 1, 0))
+
+    block = (1, page_size, head_axis, packing, dim)
     return pl.pallas_call(
-        functools.partial(_compact_copy_kernel, inflight=int(inflight)),
+        _compact_copy_pipe_kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=2,
-            grid=(1,),
-            in_specs=[pl.BlockSpec(memory_space=pltpu.HBM)],
-            out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
-            scratch_shapes=[pltpu.SemaphoreType.DMA],
+            grid=(slots,),
+            in_specs=[pl.BlockSpec(block, lambda i, pr, cr: (pr[live(i, pr, cr), 0], 0, 0, 0, 0))],
+            out_specs=pl.BlockSpec(block, lambda i, pr, cr: (pr[live(i, pr, cr), 1], 0, 0, 0, 0)),
         ),
-        out_shape=jax.ShapeDtypeStruct((slots, page_size, head_axis, packing, dim), pool.dtype),
-        name="qsa_union_compact_pool",
-    )(pairs.astype(jnp.int32), count.reshape(1).astype(jnp.int32), pool)
+        out_shape=out_shape,
+        compiler_params=pltpu.CompilerParams(vmem_limit_bytes=int(4 * page_bytes + (16 << 20))),
+        name="qsa_union_compact_pool_pipe",
+    )(*operands)
 
 
 def gather_chunk_bounds(ngroups, chunks, growth=1.0):

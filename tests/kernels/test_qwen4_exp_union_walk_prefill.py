@@ -307,7 +307,7 @@ def test_flag_on_dispatch_takes_the_walk(kernels, monkeypatch):
     assert calls == [dict(kv_heads=2, ratio=RATIO, k_scale=1.0, v_scale=1.0, group=128, kv_tile=1024,
                           union_cap=CAP, min_context=1000, lean=True, listed=None, share_bits=False,
                           union_alpha=0.0, qk16=False, run_tables=False, lazy_share=False, gathered=None,
-                          gather_chunks=4, gather_growth=1.0, compact_reqs=0)]
+                          gather_chunks=4, gather_growth=1.0, compact_reqs=0, compact_copy_method="vmem")]
     jax.clear_caches()
     want = _walk(step, union_cap=CAP, min_context=1000, lean=True)
     np.testing.assert_array_equal(_bits(got), _bits(want))
@@ -901,6 +901,37 @@ def test_compact_plan_pages(kernels):
     assert not bool(fits2)
 
 
+@pytest.mark.parametrize("method", ["vmem", "pipe", "dma"])
+@pytest.mark.parametrize("count", [0, 1, 2, 3, 7])
+def test_compact_copy_methods_are_byte_exact(kernels, method, count):
+    """Every copy method moves the live pages' bytes exactly, on a pool holding every byte value, 0xFF and 0x7F
+    included (FP8 NaN encodings: an FP8 value conversion would canonicalize them; XFER's repack bug, 11-07)."""
+    rng = np.random.default_rng(301 + count)
+    pages, page_rows = 9, 256
+    raw = rng.integers(0, 256, size=(pages, page_rows, 1, 4, 256), dtype=np.uint8)
+    raw[0, 0, 0, :, :8] = 0xFF
+    raw[1, 3, 0, :, :8] = 0x7F
+    assert (raw == 0xFF).sum() > 1000
+    pool = jax.lax.bitcast_convert_type(jnp.asarray(raw), jnp.float8_e4m3fn)
+    src = rng.permutation(pages)[:7]
+    pairs = np.stack([np.concatenate([src, np.zeros(1, np.int64)]), np.concatenate([rng.permutation(7), [7]])], 1)
+    out = ud.compact_copy(pool, jnp.asarray(pairs, jnp.int32), jnp.int32(count), method=method)
+    got = np.asarray(jax.lax.bitcast_convert_type(out, jnp.uint8))
+    for i in range(count):
+        np.testing.assert_array_equal(got[pairs[i, 1]], raw[pairs[i, 0]])
+    with pytest.raises(ValueError, match="compact copy method"):
+        ud.compact_copy(pool, jnp.asarray(pairs, jnp.int32), jnp.int32(count), method="xla")
+
+
+@pytest.mark.parametrize("method", ["pipe", "dma"])
+def test_compact_walk_other_copy_methods(kernels, method):
+    rows, cached = SPARE
+    step = _packed_step(233, rows, cached)
+    want = _walk(step, **COMPACT)
+    jax.clear_caches()
+    np.testing.assert_array_equal(_bits(_walk(step, compact_reqs=8, compact_copy_method=method, **COMPACT)), _bits(want))
+
+
 def test_compact_copy_moves_whole_pages(kernels):
     rows, cached = SPARE
     q, gate, blocks, lengths, table, pool, starts = _packed_step(225, rows, cached)
@@ -983,7 +1014,7 @@ def test_full_stack_dispatch(kernels, monkeypatch):
     assert calls == [dict(kv_heads=2, ratio=RATIO, k_scale=1.0, v_scale=1.0, group=64, kv_tile=1024,
                           union_cap=16384, min_context=0, lean=True, listed="reference", share_bits=True,
                           union_alpha=0.9, qk16=False, run_tables=False, lazy_share=False, gathered=None,
-                          gather_chunks=4, gather_growth=1.0, compact_reqs=0)]
+                          gather_chunks=4, gather_growth=1.0, compact_reqs=0, compact_copy_method="vmem")]
     stack = dict(group=64, union_cap=16384, listed="reference", share_bits=True)
     jax.clear_caches()
     np.testing.assert_array_equal(_bits(got), _bits(_walk(step, union_alpha=0.9, **stack)))

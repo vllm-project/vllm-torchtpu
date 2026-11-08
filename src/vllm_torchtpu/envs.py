@@ -165,6 +165,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_PREFILL_UNION_GATHER_CHUNKS: int = 4
     VLLM_TPU_QSA_PREFILL_UNION_GATHER_GROWTH: float = 1.0
     VLLM_TPU_QSA_PREFILL_UNION_COMPACT_REQS: int = 0
+    VLLM_TPU_QSA_PREFILL_UNION_COMPACT_COPY: str = "vmem"
     VLLM_TPU_QSA_MAIN_KV_DCP: int = 0
     VLLM_TPU_QSA_MTP_KV_DCP: bool = False
     VLLM_TPU_QSA_COMPRESSED_DCP: bool = False
@@ -882,6 +883,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # per-step compact pool of the first N requests' pages (whole-page copies); a step with more requests takes the
     # listed walk on the full pool (bitwise the gathered walk). 0 (default): the gather reads the pool itself.
     "VLLM_TPU_QSA_PREFILL_UNION_COMPACT_REQS": env_nonnegative_int("VLLM_TPU_QSA_PREFILL_UNION_COMPACT_REQS", 0),
+    # COMPACT_COPY: how the compact pool is copied ("vmem": whole pages staged through VMEM by DMA; "pipe": a Pallas
+    # pipeline copying 32-bit words; "dma": HBM-to-HBM DMAs, slow on TPU per i2b j-950efc5d). All byte-exact.
+    "VLLM_TPU_QSA_PREFILL_UNION_COMPACT_COPY": env_str("VLLM_TPU_QSA_PREFILL_UNION_COMPACT_COPY", "vmem"),
     # Main KV of the target QSA layers split over TP rank pairs that share a
     # KV head (2; 0/1 = off): each rank stores and attends half the tokens,
     # the pair's partial attention is LSE-combined.

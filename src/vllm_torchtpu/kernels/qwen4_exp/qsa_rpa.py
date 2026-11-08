@@ -610,6 +610,7 @@ def _prefill_attention(
             gather_chunks=envs.VLLM_TPU_QSA_PREFILL_UNION_GATHER_CHUNKS,
             gather_growth=envs.VLLM_TPU_QSA_PREFILL_UNION_GATHER_GROWTH,
             compact_reqs=envs.VLLM_TPU_QSA_PREFILL_UNION_COMPACT_REQS,
+            compact_copy_method=envs.VLLM_TPU_QSA_PREFILL_UNION_COMPACT_COPY,
         )
     from vllm_torchtpu.kernels.qwen4_exp.block_sparse_gqa_prefill import (
         block_sparse_gqa_attention,
