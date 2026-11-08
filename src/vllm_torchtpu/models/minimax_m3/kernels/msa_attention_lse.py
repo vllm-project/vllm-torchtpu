@@ -44,20 +44,25 @@ def _kernel(
     head_ref,  # [2] KV head of the cache rows, block of query heads
     tile_offset_ref,  # [1] the call's first tile (read by the index maps only)
     # In
-    q_ref,  # [H, Bq, D], pre-scaled by sm_scale * log2(e)
+    q_ref,  # [H, Bq, D]
     selected_ref,  # [Bq, K] page keys, -1 padded
     local_page_ref,  # [Bq, 1]
     local_limit_ref,  # [Bq, 1] visible slots of the local page
     kv_hbm_ref,  # [pages, S / p, p, G * 2D] the whole cache, in HBM
     *refs,  # [scale pages (4-bit)], [aliased out, lse], out, lse, m, l, acc,
     # page buffers, semaphores, [scale buffers, semaphores (4-bit)]
+    sm_scale: float,
     aliased: bool = False,
     fp4_rows: tuple[int, int] | str | None = None,
 ):
     """`msa_attention._kernel_v2` that also writes ``lse = m + log(l)``
     (``-inf`` for a row that sees no slot; its output is 0). Scores, the
-    running max ``m`` and ``l`` are in log2 units: the queries come scaled by
-    ``sm_scale * log2(e)``.
+    running max ``m`` and ``l`` are in log2 units (scaled by ``sm_scale *
+    log2(e)``): exp2 needs no multiply per score. 4-bit caches fold the scale
+    into the K scales of the score columns; others into the queries, which
+    then round to bf16 once more before the QK dot (an XLA multiply of the
+    whole head-major query outside the kernel was not fused, ~40 us per layer
+    in the c4 twin, j-18e7ec75).
 
     Each step copies the next group's pages into the other half of a
     double buffer itself, one loop iteration per page it holds: unrolled
@@ -196,12 +201,15 @@ def _kernel(
         mask = jnp.concatenate(masks, axis=1)
         mask = jnp.concatenate([mask] * num_heads, axis=0)
 
+        scale = sm_scale * _LOG2_E
         q = q_ref[...].reshape(num_heads * block_q, head_dim)
+        if not fp4:
+            q = (q.astype(jnp.float32) * scale).astype(q.dtype)
         s = jax.lax.dot_general(
             q, k, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
         )
         if fp4:  # x = int4 * scale: K scales the score columns, V scales p
-            s = s * jnp.concatenate(k_scales, axis=1)
+            s = s * (jnp.concatenate(k_scales, axis=1) * scale)
         s = jnp.where(mask, s, -jnp.inf)
 
         # The running max starts at a finite floor (`_MASK_VALUE`), so a row
@@ -269,6 +277,7 @@ def _attention_call(
     out,
     *,
     q_per_head,
+    sm_scale,
     block_q,
     pages_per_step,
     interpret,
@@ -277,8 +286,7 @@ def _attention_call(
 ):
     """One kernel call over the tokens of `selected` (a multiple of block_q),
     which start at tile ``tile_offset`` (``int32[1]``) of the head-major
-    ``q [G * Hg, T, D]`` (scaled by ``sm_scale * log2(e)``), ``local_page``
-    and ``local_limit [T, 1]``, for
+    ``q [G * Hg, T, D]``, ``local_page`` and ``local_limit [T, 1]``, for
     query heads ``[b * Hg, (b + 1) * Hg)`` attending cache-row KV head ``k``,
     ``head = (k, b)`` (``int32[2]``: a scalar-prefetch input, not a static,
     so one kernel serves every head).
@@ -358,6 +366,7 @@ def _attention_call(
     return pl.pallas_call(
         functools.partial(
             _kernel,
+            sm_scale=sm_scale,
             aliased=aliased,
             **({"fp4_rows": scale_rows} if fp4 else {}),
         ),
@@ -437,6 +446,7 @@ def _chunked_call(
     call = functools.partial(
         _attention_call,
         q_per_head=num_q_heads // num_heads,
+        sm_scale=sm_scale,
         block_q=block_q,
         pages_per_step=pages_per_step,
         interpret=interpret,
@@ -447,8 +457,6 @@ def _chunked_call(
     step = min(num_tokens, max(block_q, limit - limit % block_q))
     num_chunks = -(-num_tokens // step)
     pad = num_chunks * step - num_tokens
-    # Scores in log2 units: exp2 then needs no multiply per score.
-    q = (q.astype(jnp.float32) * (sm_scale * _LOG2_E)).astype(q.dtype)
     q = jnp.pad(q, ((0, pad), (0, 0), (0, 0))).transpose(1, 0, 2)
     selected = jnp.pad(
         selected, ((0, pad), (0, 0), (0, 0)), constant_values=-1
