@@ -152,9 +152,9 @@ def test_fp4_matches_page_writes(q_lens, ctx_lens, pad_tokens, folded, monkeypat
         )
 
 
+@pytest.mark.parametrize("tokens", [8, 512])
 @pytest.mark.parametrize("folded", [False, True])
-def test_fp4_by_token_lowers_for_tpu(folded):
-    tokens = 8
+def test_fp4_by_token_lowers_for_tpu(folded, tokens):
     args = (
         jax.ShapeDtypeStruct((4096, PAGE // 8 + folded, 4, PAGE), jnp.uint8),
         jax.ShapeDtypeStruct((tokens, PAGE), jnp.uint8),
@@ -165,9 +165,10 @@ def test_fp4_by_token_lowers_for_tpu(folded):
         args += (jax.ShapeDtypeStruct((tokens,), jnp.float32),)
 
     def write(cache, rows, pages, pos, scales=None):
-        return msa.write_rows(cache, rows, pages, pos, max_num_seqs=1, scales=scales)
+        return msa.write_rows(cache, rows, pages, pos, max_num_seqs=64, scales=scales)
 
     tpu7x = AbstractMesh((), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu"))
     with use_abstract_mesh(tpu7x):
         lowered = jax.jit(write).trace(*args).lower(lowering_platforms=("tpu",))
     assert "tpu_custom_call" in lowered.as_text()
+

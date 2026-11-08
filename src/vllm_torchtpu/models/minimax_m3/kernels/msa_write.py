@@ -137,8 +137,10 @@ def _kernel_by_token(
 # Batches of at most this many tokens (decode, MTP verify) write token by token
 # (`_kernel_by_token`): gathering max_runs x page_size rows per layer cost
 # 6 us per layer for 8 tokens in the b1 decode twin (j-3847708e), whatever
-# their width. A run then costs one merge per token instead of one per page.
-_BY_TOKEN_MAX_TOKENS = 64
+# their width, and 0.12-0.17 ms per layer for the 312-456-token decode
+# batches of c48 / c64 (j-fd793d3b, j-7df0161c). A run then costs one merge
+# per token instead of one per page.
+_BY_TOKEN_MAX_TOKENS = 512
 
 
 def _runs(pages: jax.Array, slots: jax.Array, num_pages: int, max_runs: int):
