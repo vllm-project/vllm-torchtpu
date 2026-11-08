@@ -31,8 +31,8 @@ from vllm_torchtpu.models.minimax_m3.kernels import msa_attention
 
 def _kernel(
     # Scalar prefetch
-    work_page_ref,  # [groups * G] page key of each slot, -1 for none
-    work_meta_ref,  # [groups] tile << _TILE_SHIFT | last and first bits
+    work_page_ref,  # tile page key unions (`msa_attention._work_list`)
+    work_meta_ref,  # [groups] union row << _ROW_SHIFT | last and first bits
     page_table_ref,  # page key -> physical page (read by the index maps only)
     head_ref,  # [1] KV head of the cache rows (read by the index maps only)
     # In
@@ -75,7 +75,7 @@ def _kernel(
     local_limit = local_limit_ref[...]
     keys, values, masks, k_scales, v_scales = [], [], [], [], []
     for g, kv_ref in enumerate(kv_refs):
-        page = work_page_ref[w * pages_per_step + g]
+        page = work_page_ref[msa_attention._slot(meta, pages_per_step, g)]
         is_selected = jnp.max(
             (selected == page).astype(jnp.int32), axis=1, keepdims=True
         )
@@ -168,15 +168,18 @@ def _attention_call(
         selected, block_q, pages_per_step
     )
 
+    groups_per_tile = msa_attention._groups_per_tile(block_q, topk, pages_per_step)
+
     def tile_block(w, pages, meta, *_):
-        return (meta[w] >> msa_attention._TILE_SHIFT, 0)
+        return (msa_attention._meta_tile(meta[w], groups_per_tile), 0)
 
     def head_major_block(w, pages, meta, *_):
-        return (0, meta[w] >> msa_attention._TILE_SHIFT, 0)
+        return (0, msa_attention._meta_tile(meta[w], groups_per_tile), 0)
 
     def page_block(g):
         def index_map(w, pages, meta, table, head_idx):
-            page = table[jnp.maximum(pages[w * pages_per_step + g], 0)]
+            slot = msa_attention._slot(meta[w], pages_per_step, g)
+            page = table[jnp.maximum(pages[slot], 0)]
             return (page, 0, 0, head_idx[0])
 
         return pl.BlockSpec((1, rows_per_page, packing, row_width), index_map)

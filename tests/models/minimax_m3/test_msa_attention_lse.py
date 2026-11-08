@@ -1,0 +1,168 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""MSA sparse attention with log-sum-exp (interpret mode) against a dense
+reference."""
+
+import jax.numpy as jnp
+import numpy as np
+import pytest
+
+from tests.models.minimax_m3.packing import CACHE_DTYPES, pack, rounded
+from vllm_torchtpu.models.minimax_m3.kernels import msa_attention
+from vllm_torchtpu.models.minimax_m3.kernels.msa_attention_lse import (
+    msa_sparse_attention_lse,
+    msa_sparse_attention_lse_heads,
+)
+
+Q_PER_KV = 16
+HEAD_DIM = 128
+PAGE = 128
+PAGES = 12
+TOPK = 4
+SCALE = HEAD_DIM**-0.5
+
+
+def _reference(q, kv_rows, keys, local_key, local_limit, table, head):
+    """Per token: out and lse over its selected pages (keys -> pages)."""
+    out = np.zeros_like(q)
+    lse = np.full(q.shape[:2], -np.inf, np.float32)
+    lo = 2 * HEAD_DIM * head
+    for t in range(q.shape[0]):
+        k_rows, v_rows = [], []
+        for key in keys[t]:
+            if key < 0:
+                continue
+            visible = local_limit[t] if key == local_key[t] else PAGE
+            rows = kv_rows[table[key], :visible, lo : lo + 2 * HEAD_DIM]
+            k_rows.append(rows[:, :HEAD_DIM])
+            v_rows.append(rows[:, HEAD_DIM:])
+        if not k_rows:
+            continue
+        s = q[t] @ np.concatenate(k_rows).T * SCALE
+        m = s.max(-1, keepdims=True)
+        w = np.exp(s - m)
+        out[t] = (w / w.sum(-1, keepdims=True)) @ np.concatenate(v_rows)
+        lse[t] = (m + np.log(w.sum(-1, keepdims=True)))[:, 0]
+    return out, lse
+
+
+def _inputs(rng, num_tokens, num_real, num_kv_heads, dtype):
+    q = jnp.asarray(
+        rng.standard_normal((num_tokens, num_kv_heads * Q_PER_KV, HEAD_DIM))
+    ).astype(jnp.bfloat16)
+    kv_rows = rounded(
+        rng.standard_normal((PAGES, PAGE, num_kv_heads * 2 * HEAD_DIM)), dtype
+    )
+    table = rng.permutation(PAGES).astype(np.int32)
+    keys = np.full((num_tokens, num_kv_heads, TOPK), -1, np.int32)
+    local_key = np.full(num_tokens, -1, np.int32)
+    local_limit = np.zeros(num_tokens, np.int32)
+    for t in range(num_real):
+        local_key[t] = rng.integers(PAGES)
+        local_limit[t] = rng.integers(1, PAGE + 1)
+        for h in range(num_kv_heads):
+            chosen = rng.choice(PAGES, rng.integers(0, TOPK + 1), replace=False)
+            keys[t, h, : len(chosen)] = chosen
+    return q, kv_rows, pack(kv_rows, dtype), table, keys, local_key, local_limit
+
+
+def _check(got, want):
+    out, lse = got
+    want_out, want_lse = want
+    np.testing.assert_allclose(
+        np.asarray(out.astype(jnp.float32)), want_out, atol=2e-2
+    )
+    seen = np.isfinite(want_lse)
+    np.testing.assert_array_equal(np.isfinite(np.asarray(lse)), seen)
+    np.testing.assert_allclose(np.asarray(lse)[seen], want_lse[seen], atol=2e-2)
+
+
+@pytest.mark.parametrize("dtype", CACHE_DTYPES)
+@pytest.mark.parametrize(
+    "num_tokens,num_real,block_q,tokens_per_call,sorted_unions",
+    [
+        (37, 35, 16, None, False),  # last tile part padding
+        (24, 24, 8, None, False),  # 8-token tiles
+        (150, 140, 16, 64, False),  # several kernel calls (the chunk loop)
+        (150, 140, 16, 64, True),  # the prefill (sorted) work list
+    ],
+)
+def test_lse_matches_dense_reference(
+    num_tokens, num_real, block_q, tokens_per_call, sorted_unions, dtype, monkeypatch
+):
+    if sorted_unions:
+        monkeypatch.setattr(msa_attention, "_DENSE_WORK_LIST_ELEMS", 0)
+    if tokens_per_call is not None:
+        monkeypatch.setattr(msa_attention, "MAX_TOKENS_PER_CALL", tokens_per_call)
+    rng = np.random.default_rng(num_tokens)
+    q, kv_rows, kv, table, keys, local_key, local_limit = _inputs(
+        rng, num_tokens, num_real, 1, dtype
+    )
+    got = msa_sparse_attention_lse(
+        q,
+        kv,
+        jnp.asarray(keys[:, 0]),
+        jnp.asarray(local_key),
+        jnp.asarray(local_limit),
+        jnp.asarray(table),
+        sm_scale=SCALE,
+        block_q=block_q,
+        interpret=True,
+    )
+    want = _reference(
+        np.asarray(q.astype(jnp.float32)),
+        kv_rows,
+        keys[:, 0],
+        local_key,
+        local_limit,
+        table,
+        0,
+    )
+    _check(got, want)
+
+
+@pytest.mark.parametrize("dtype", CACHE_DTYPES)
+def test_lse_heads_matches_dense_reference(dtype, monkeypatch):
+    """Every KV head of multi-head cache rows, over several kernel calls."""
+    monkeypatch.setattr(msa_attention, "MAX_TOKENS_PER_CALL", 32)
+    num_kv_heads, num_tokens = 2, 70
+    rng = np.random.default_rng(5)
+    q, kv_rows, kv, table, keys, local_key, local_limit = _inputs(
+        rng, num_tokens, num_tokens - 3, num_kv_heads, dtype
+    )
+    got = msa_sparse_attention_lse_heads(
+        q,
+        kv,
+        jnp.asarray(keys),
+        jnp.asarray(local_key),
+        jnp.asarray(local_limit),
+        jnp.asarray(table),
+        sm_scale=SCALE,
+        interpret=True,
+    )
+    q32 = np.asarray(q.astype(jnp.float32))
+    outs, lses = [], []
+    for h in range(num_kv_heads):
+        o, l = _reference(
+            q32[:, h * Q_PER_KV : (h + 1) * Q_PER_KV],
+            kv_rows,
+            keys[:, h],
+            local_key,
+            local_limit,
+            table,
+            h,
+        )
+        outs.append(o)
+        lses.append(l)
+    _check(got, (np.concatenate(outs, axis=1), np.concatenate(lses, axis=1)))
