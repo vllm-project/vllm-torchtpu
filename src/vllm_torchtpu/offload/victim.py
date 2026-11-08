@@ -104,15 +104,15 @@ def active_tap() -> VictimTap | None:
 
 
 def patch_block_pool_victims() -> None:
-    """Install the (inert unless a tap is active) BlockPool hooks. Idempotent."""
+    """Install the (inert unless a tap is active) BlockPool hooks. Idempotent. Free steps are stamped on the free
+    queue (_patch_free_queue_stamps), the one place every free path ends, so a later replacement of free_blocks (the
+    served engine's LIFO patch) cannot drop them."""
     from vllm.v1.core.block_pool import BlockPool
 
     if BlockPool.__dict__.get("_q38_victim_patch", False):
         return
     orig_get = BlockPool.get_new_blocks
     orig_evict = BlockPool._maybe_evict_cached_block
-    orig_free = BlockPool.free_blocks
-    orig_unpin = BlockPool.__dict__.get("unpin_blocks")
 
     def get_new_blocks(self, num_blocks):
         global _IN_ALLOC
@@ -129,28 +129,8 @@ def patch_block_pool_victims() -> None:
             _TAP.on_evict(self, block)
         return orig_evict(self, block)
 
-    def free_blocks(self, ordered_blocks):
-        if _TAP is None:
-            return orig_free(self, ordered_blocks)
-        blocks = list(ordered_blocks)
-        out = orig_free(self, blocks)
-        _TAP.on_freed(b.block_id for b in blocks if b.ref_cnt == 0 and not b.is_null)
-        return out
-
     BlockPool.get_new_blocks = get_new_blocks
     BlockPool._maybe_evict_cached_block = _maybe_evict_cached_block
-    BlockPool.free_blocks = free_blocks
-    if orig_unpin is not None:
-
-        def unpin_blocks(self, blocks, on_reuse):
-            if _TAP is None:
-                return orig_unpin(self, blocks, on_reuse)
-            blocks = list(blocks)
-            out = orig_unpin(self, blocks, on_reuse)
-            _TAP.on_freed(b.block_id for b in blocks if b.ref_cnt == 0 and not b.is_null)
-            return out
-
-        BlockPool.unpin_blocks = unpin_blocks
     BlockPool._q38_victim_patch = True
     _patch_free_queue_stamps()
 
