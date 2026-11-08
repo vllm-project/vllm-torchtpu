@@ -25,7 +25,10 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
-from typing import Any
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 import vllm_torchtpu.envs as envs
 
@@ -33,8 +36,11 @@ from .config import import_plugin, missing_template, resolve_callable, select_pl
 from .fingerprint import canonical_json
 
 
-def compile_cache_salt(vllm_config: Any) -> str | None:
-    """`sha256(canonical(layout_request(vllm_config, options)))[:16]`, or `None`."""
+def resolve_plugin_hook(
+    vllm_config: object,
+    hook: Literal["layout_request", "load_tensor"],
+) -> tuple[Callable[..., object], dict[str, object]] | None:
+    """Return the enabled plugin's `hook` callable and options, or `None`."""
     model_cfg = getattr(vllm_config, "model_config", None)
     cfg, resolved = select_plugin(
         envs.VLLM_TPU_MEGAKERNEL,
@@ -47,9 +53,18 @@ def compile_cache_salt(vllm_config: Any) -> str | None:
     if missing_template(ref) is not None:
         return None
     plugin, module = import_plugin(ref)
-    if plugin.layout_request is None:
+    target = plugin.layout_request if hook == "layout_request" else plugin.load_tensor
+    if target is None:
         return None
-    fn = resolve_callable(plugin.layout_request, module, what="layout_request")
+    return resolve_callable(target, module, what=hook), dict(options)
+
+
+def compile_cache_salt(vllm_config: object) -> str | None:
+    """`sha256(canonical(layout_request(vllm_config, options)))[:16]`, or `None`."""
+    resolved_hook = resolve_plugin_hook(vllm_config, "layout_request")
+    if resolved_hook is None:
+        return None
+    fn, options = resolved_hook
     req = fn(vllm_config, options)
     if req is None:
         return None
@@ -58,4 +73,4 @@ def compile_cache_salt(vllm_config: Any) -> str | None:
     return hashlib.sha256(canonical_json(req).encode("utf-8")).hexdigest()[:16]
 
 
-__all__ = ["compile_cache_salt"]
+__all__ = ["compile_cache_salt", "resolve_plugin_hook"]
