@@ -19,6 +19,7 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadataBuilderContext
+from vllm_torchtpu.layers.core.sequence_layout import DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
@@ -621,6 +622,7 @@ class Eagle3Proposer:
         self._draft_md_cache.pop(id(chunk), None)
 
         num_tokens = input_ids.shape[0]
+        self._token_padding_update(chunk, num_tokens, chunk.num_reqs)
         with (
             set_model_tag("eagle_head"),
             set_forward_context(
@@ -1122,6 +1124,7 @@ class Eagle3Proposer:
                 seq_lens_delta=0,
                 num_rejected_np=rejected,
                 num_tokens_padded=ids.shape[0],
+                num_valid_tokens=int(chunk.query_start_loc_np[-1]),
             )
             outputs.append(output)
             if not self.capture_prefill_snapshots:
@@ -1278,6 +1281,7 @@ class Eagle3Proposer:
                 seq_lens_delta=0,
                 num_rejected_np=rejected_np_per_chunk[ci],
                 num_tokens_padded=input_ids.shape[0],
+                num_valid_tokens=int(chunk.query_start_loc_np[-1]),
             )
             # [p, h] / [p] carries + first-pass draft token, computed in compiled
             # regions (the three gathers, then lm-head+argmax) so torch-tpu's
@@ -1388,6 +1392,7 @@ class Eagle3Proposer:
                     num_rejected_dev=rejected_dev_per_chunk[ci],
                     loop_query_start_loc=loop_qsl_per_chunk[ci],
                     loop_request_distribution=loop_reqdist_per_chunk[ci],
+                    num_valid_tokens=chunk.num_reqs,
                 )
                 with set_model_tag("eagle_head"):
                     draft_tokens_per_chunk[ci].append(
@@ -1875,6 +1880,21 @@ class Eagle3Proposer:
             last_hidden = hidden = out
         return last_hidden, hidden
 
+    def _token_padding_update(
+        self, chunk: DraftChunkInputs, num_tokens: int, num_valid_tokens: int | None
+    ) -> None:
+        """Mark the padded rows of a draft forward for the MoE layers (every
+        row valid in a chunk whose sequence layout is not the default one)."""
+        if getattr(self.runner, "_token_padding_state", None) is None:
+            return
+        if (
+            num_valid_tokens is None
+            or chunk.sequence_layout_plan.descriptor
+            != DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR
+        ):
+            num_valid_tokens = num_tokens
+        self.runner._token_padding_update(num_tokens, num_valid_tokens)
+
     def _forward_draft(
         self,
         chunk: DraftChunkInputs,
@@ -1888,7 +1908,9 @@ class Eagle3Proposer:
         num_rejected_dev: torch.Tensor | None = None,
         loop_query_start_loc: torch.Tensor | None = None,
         loop_request_distribution: torch.Tensor | None = None,
+        num_valid_tokens: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``num_valid_tokens``: rows from there on are padding (None: none)."""
         attn_metadata = self._build_draft_attn_metadata(
             chunk=chunk,
             step_idx=step_idx,
@@ -1901,6 +1923,7 @@ class Eagle3Proposer:
         )
 
         num_tokens = input_ids.shape[0]
+        self._token_padding_update(chunk, num_tokens, num_valid_tokens)
 
         kwargs: dict[str, torch.Tensor | int] = {
             "input_ids": input_ids,
@@ -2315,6 +2338,7 @@ class Eagle3Proposer:
                         seq_lens_delta=0,
                         num_rejected_np=None,
                         num_tokens_padded=bucket,
+                        num_valid_tokens=0,
                     )
                     last_hidden = first_pass_carry
                 else:
@@ -2329,6 +2353,7 @@ class Eagle3Proposer:
                         num_tokens_padded=p,
                         loop_query_start_loc=loop_qsl,
                         loop_request_distribution=loop_reqdist,
+                        num_valid_tokens=0,
                     )
                 with set_model_tag("eagle_head"):
                     tok = self._draft_propose_token(last_hidden)

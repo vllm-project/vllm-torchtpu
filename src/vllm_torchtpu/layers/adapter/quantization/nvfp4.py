@@ -60,10 +60,11 @@ from vllm.model_executor.layers.quantization.modelopt import (
 from vllm.model_executor.utils import replace_parameter
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu import decode_switches
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import (
     vllm_adapter as adaptive_moe,
 )
-from vllm_torchtpu.layers.adapter import moe_routing
+from vllm_torchtpu.layers.adapter import moe_routing, token_padding
 from vllm_torchtpu.layers.adapter.fused_moe import (
     TpuMoEActivationMixin,
     fused_moe_gmm,
@@ -82,6 +83,11 @@ from vllm_torchtpu.layers.adapter.quantization.configs import (
 )
 from vllm_torchtpu.layers.adapter.quantization.fp8 import resolve_online_fp8
 from vllm_torchtpu.layers.adapter.quantization.online_fp8 import map_online_fp8
+from vllm_torchtpu.layers.adapter.ragged_a2a_moe import (
+    prebuild_ragged_a2a_moe,
+    ragged_a2a_enabled,
+    ragged_a2a_fused_moe_gmm,
+)
 from vllm_torchtpu.layers.core.quant_methods import NVFP4, get_tpu_quant_method
 from vllm_torchtpu.layers.core.quantization import (
     dequantize_tensor,
@@ -317,6 +323,7 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
 
         return (
             enable_pipelined_collective_and_compute()
+            or ragged_a2a_enabled()
             or fused_moe_ep_supported(self)
             or adaptive_moe.adaptive_fused_moe_supported(self)
         )
@@ -524,6 +531,23 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
                 activation=activation_str,
                 use_ep=layer.moe_config.moe_parallel_config.use_ep,
             )
+        if ragged_a2a_enabled():
+            if op is not None or self._use_adaptive_fused_moe:
+                raise NotImplementedError(
+                    "TPU_MOE_RAGGED_A2A serves the grouped-matmul path only"
+                )
+            if enable_pipelined_collective_and_compute():
+                raise NotImplementedError(
+                    "TPU_MOE_RAGGED_A2A and TPU_MOE_COLLECTION_CHUNK_SIZE both own "
+                    "the EP exchange; set one"
+                )
+            if not layer.moe_config.moe_parallel_config.use_ep:
+                raise NotImplementedError("TPU_MOE_RAGGED_A2A needs expert parallelism")
+            prebuild_ragged_a2a_moe(
+                topk=layer.moe_config.experts_per_token,
+                activation=activation_str,
+                owner_combine=decode_switches.arm_owner_combine(layer),
+            )
 
         if self._use_adaptive_fused_moe:
             self._adaptive_fused_moe_op = op
@@ -599,6 +623,12 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
         # passes `layer` uniformly, which fixes that -- flagging separately as
         # it's a behavior change, not just a refactor.
         topk_weights, topk_ids = moe_routing.route(layer, x, router_logits)
+        if envs.TPU_MOE_SKIP_PADDED_TOKENS:
+            # A method that owns the EP exchange routes this rank's own tokens;
+            # otherwise vLLM's dispatch hands it the DP group's gathered tokens.
+            topk_ids, topk_weights = token_padding.drop_padded_routes(
+                topk_ids, topk_weights, is_local_tensor=self.supports_internal_mk
+            )
         kwargs = {
             "hidden_states": x,
             "w1": layer.w13_weight,
@@ -613,6 +643,16 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
             "topk": layer.moe_config.experts_per_token,
             "activation": activation_str,
         }
+        if ragged_a2a_enabled():
+            # Set by the MoE runner when the owner combine takes the shared
+            # expert's partial into the routed op.
+            shared_output = getattr(layer, "_tpu_owner_shared_output", None)
+            if shared_output is not None:
+                kwargs["shared_output"] = shared_output
+            kwargs["owner_combine"] = getattr(
+                layer, decode_switches.OWNER_COMBINE_ATTR, False
+            )
+            return ragged_a2a_fused_moe_gmm(**kwargs)
         if enable_pipelined_collective_and_compute():
             return pipelined_fused_moe_gmm(**kwargs)
 

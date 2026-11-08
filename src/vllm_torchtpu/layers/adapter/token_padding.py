@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
@@ -24,6 +24,9 @@ class TokenPaddingState:
     """Track token padding."""
 
     local_padding_mask: torch.Tensor
+    # The padded row range last written (None: not written yet), so a repeat
+    # writes nothing.
+    _written: tuple[int, int] | None = field(default=None, init=False, repr=False)
 
     @classmethod
     def create(cls, max_local_tokens: int, device) -> "TokenPaddingState":
@@ -34,6 +37,12 @@ class TokenPaddingState:
 
     def update(self, local_valid_tokens: int, local_padded_tokens: int) -> None:
         """Write this rank's token padding mask."""
+        padded_rows = (local_valid_tokens, local_padded_tokens)
+        if local_valid_tokens >= local_padded_tokens:
+            padded_rows = (0, 0)
+        if self._written == padded_rows:
+            return
+        self._written = padded_rows
         host = torch.zeros(self.local_padding_mask.shape[0], dtype=torch.bool)
         host[local_valid_tokens:local_padded_tokens] = True
         # Synchronous copy since the host tensor is temporary.
@@ -46,6 +55,26 @@ class TokenPaddingState:
 def set_padding_state(state: "TokenPaddingState | None") -> None:
     global _padding_state
     _padding_state = state
+
+
+def _padding_rows(num_rows: int, is_local_tensor: bool) -> torch.Tensor | None:
+    """Which of ``num_rows`` routing rows are padded tokens, or None without a
+    padding state. Rows not local to this rank (``is_local_tensor`` False) are
+    the DP group's tokens gathered by DP rank."""
+    if _padding_state is None:
+        return None
+    if is_local_tensor:
+        return _padding_state.get_local_padding_mask(num_rows)
+    from vllm.distributed.parallel_state import get_dp_group
+
+    dp_group = get_dp_group()
+    dp_size = dp_group.world_size
+    if dp_size > 1:
+        local_padding = _padding_state.get_local_padding_mask(num_rows // dp_size)
+        # TPU collectives may not support bool, so encode the mask as int8.
+        gathered_padding = dp_group.all_gather(local_padding.to(torch.int8), dim=0)
+        return gathered_padding.ne(0)
+    return _padding_state.get_local_padding_mask(num_rows)
 
 
 def zero_routing_weights_for_padding(
@@ -66,24 +95,31 @@ def zero_routing_weights_for_padding(
         tuple[torch.Tensor, torch.Tensor]: The (topk_ids, topk_weights) tensors
             with routing weights zeroed for padded tokens.
     """
-    if _padding_state is None:
+    is_padding = _padding_rows(topk_ids.shape[0], is_local_tensor)
+    if is_padding is None:
         return topk_ids, topk_weights
-    num_tokens = topk_ids.shape[0]
-    if is_local_tensor:
-        is_padding = _padding_state.get_local_padding_mask(num_tokens)
-    else:
-        from vllm.distributed.parallel_state import get_dp_group
-
-        dp_group = get_dp_group()
-        dp_size = dp_group.world_size
-        if dp_size > 1:
-            local_padding = _padding_state.get_local_padding_mask(num_tokens // dp_size)
-            # TPU collectives may not support bool, so encode the mask as int8.
-            gathered_padding = dp_group.all_gather(local_padding.to(torch.int8), dim=0)
-            is_padding = gathered_padding.ne(0)
-        else:
-            is_padding = _padding_state.get_local_padding_mask(num_tokens)
     topk_weights = torch.where(
         is_padding[:, None], torch.zeros_like(topk_weights), topk_weights
     )
+    return topk_ids, topk_weights
+
+
+def drop_padded_routes(
+    topk_ids: torch.Tensor, topk_weights: torch.Tensor, *, is_local_tensor: bool
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Leave padded tokens unrouted: expert id -1 and weight 0.
+
+    Padded rows of a partly filled step carry identical hidden states, so
+    with their selected experts kept they all land on the same few experts.
+    Id -1 is what the EP exchanges, their capacity checks and the expert
+    kernels read as no route: nothing is sent, counted or computed for the
+    row, and its routed output is 0. ``is_local_tensor`` as in
+    ``zero_routing_weights_for_padding``.
+    """
+    is_padding = _padding_rows(topk_ids.shape[0], is_local_tensor)
+    if is_padding is None:
+        return topk_ids, topk_weights
+    rows = is_padding[:, None]
+    topk_ids = torch.where(rows, torch.full_like(topk_ids, -1), topk_ids)
+    topk_weights = torch.where(rows, torch.zeros_like(topk_weights), topk_weights)
     return topk_ids, topk_weights
