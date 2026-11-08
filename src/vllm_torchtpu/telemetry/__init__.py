@@ -3,6 +3,7 @@
 
 from vllm_torchtpu.telemetry.eviction_tracker import (
     BlockEvictionTracker,
+    TpuPaddingCounterTracker,
     compute_request_padding_tokens,
     extract_hardware_span_attributes,
 )
@@ -22,6 +23,7 @@ from vllm_torchtpu.telemetry.vllm_hooks import (
     install_agentic_telemetry_patches,
     patch_block_pool,
     patch_output_processor,
+    patch_tpu_padding_metrics,
     patch_trace_headers,
     reset_telemetry_service,
 )
@@ -35,6 +37,7 @@ __all__ = [
     "SPAN_ATTRIBUTE_KEYS",
     "SessionTurnTracker",
     "TokenBreakdown",
+    "TpuPaddingCounterTracker",
     "compute_request_padding_tokens",
     "compute_rolling_block_hashes",
     "extract_agent_headers",
@@ -43,6 +46,7 @@ __all__ = [
     "install_agentic_telemetry_patches",
     "patch_block_pool",
     "patch_output_processor",
+    "patch_tpu_padding_metrics",
     "patch_trace_headers",
     "reset_telemetry_service",
 ]
