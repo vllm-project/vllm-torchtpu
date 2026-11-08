@@ -79,7 +79,8 @@ A stage that spans more than one chip drains its device and waits for every
 worker of the slice before each hand-off: with a stage program and a hand-off
 running at the same time, a core of the stage stops inside a stage collective
 and the runtime halts the device. A context-parallel stage drains too, even
-on one chip: its cores run stage collectives of their own. A one-device stage
+on one chip: its cores run stage collectives of their own. On one chip it waits
+only for its own workers, from the worker thread. A one-device stage
 never showed this and launches the hand-off without waiting.
 
 Stage 0 launches its hand-off in end_forward, after its forward. A first
@@ -144,9 +145,9 @@ def stage_chips() -> int:
     return sum(1 for chip in topology.chips if device_ids & set(chip))
 
 
-def _drain_slice(fence: "TpuEvent | None" = None) -> None:
+def _drain_slice(fence: "TpuEvent | None" = None, group: Any = None) -> None:
     """Waits for local device work (or the given fence) to complete, then joins
-    the slice barrier."""
+    the slice barrier (``group``: a CPU group; the world by default)."""
     import torch.distributed as dist
     from torch_tpu._internal.sync import sync
     from vllm.distributed.parallel_state import get_world_group
@@ -155,7 +156,7 @@ def _drain_slice(fence: "TpuEvent | None" = None) -> None:
         sync.synchronize(None, wait=True)
     else:
         fence.synchronize()
-    dist.barrier(group=get_world_group().cpu_group)
+    dist.barrier(group=get_world_group().cpu_group if group is None else group)
 
 
 def _launch_now(op, carried: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
@@ -231,10 +232,18 @@ class PPWave:
         # the same hazard: its two cores run stage collectives (PCP gathers,
         # the EP MoE exchange) and a hand-off beside them halts the chip's
         # SparseCore (PP4 x PCP2 prefill, stage 1, j-85b8464a-d0c6-472b-843b).
-        self.drain_before_handoff = stage_chips() > 1 or self.columns > 1
-        self.async_handoff = (
-            self.rank == 0 and self.size > 1 and self.drain_before_handoff
-        )
+        # The hazard is inside the chip, so such a stage waits only for its
+        # own workers: a world barrier per hand-off couples stages whose
+        # hosts are legitimately launches apart and deadlocked a push
+        # (j-ebc9f2b9-219c-4695-982e).
+        multi_chip = stage_chips() > 1
+        self.drain_before_handoff = multi_chip or self.columns > 1
+        self._drain_group = None
+        if not multi_chip and self.columns > 1:
+            from vllm_torchtpu.distributed.pcp import get_pcp_group
+
+            self._drain_group = get_pcp_group().cpu_group
+        self.async_handoff = self.rank == 0 and self.size > 1 and multi_chip
         # State for at most one in-flight async hand-off on stage 0, moving from
         # queued (_async_queued) to draining (_async_busy), drained
         # (_async_drained) and issuing (_async_issuing).
@@ -281,7 +290,7 @@ class PPWave:
     ) -> tuple[torch.Tensor, ...]:
         with TraceAnnotation("PP:Handoff"):
             if self.drain_before_handoff:
-                _drain_slice()
+                _drain_slice(group=self._drain_group)
             return _launch_now(self.op, carried)
 
     def _launch(self, carried: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
