@@ -27,6 +27,7 @@ NEW_LINE = {
     "TPU_BATCHED_RPA_DECODE_BLOCK": "8192,4,2",
     "TPU_BATCHED_RPA_VERIFY_BLOCK": "window",
     "TPU_BATCHED_RPA_KV_PAGE_RUNS": "1",
+    "TPU_GDN_TWO_SLOT_CKPT": "1",
     "TPU_DECODE_FAST_PATHS": "1",
     "TPU_LM_HEAD_HIDDEN_MAJOR": "1",
     "TPU_ROPE_CACHE_ROW_MAJOR": "1",
@@ -49,7 +50,7 @@ EXCHANGE_OF_THE_NEW_LINE = {
 
 def test_the_path_table_names_are_short_lowercase_and_unique():
     names = [p.name for p in ds.PATHS]
-    assert len(names) == len(set(names)) == 12
+    assert len(names) == len(set(names)) == 15
     assert all(n == n.lower() and " " not in n and len(n) <= 20 for n in names)
 
 
@@ -83,7 +84,10 @@ def test_the_launch_line_turns_every_path_on():
         ({"TPU_BATCHED_RPA_VERIFY_BLOCK": "4096,4,2"}, {"draft_one_query"}),
         ({"TPU_BATCHED_RPA_DECODE_BLOCK": "8192,4,2"}, set()),
         ({"TPU_EMBED_EP_SHARD": "1"}, {"embed_rows"}),
-        ({"TPU_DECODE_FAST_PATHS": "1"}, {"xla_schedule"}),
+        (
+            {"TPU_DECODE_FAST_PATHS": "1"},
+            {"xla_schedule", "gdn_packed", "gdn_single_launch", "gdn_paired_heads"},
+        ),
         ({"TPU_DECODE_FAST_PATHS": "0"}, set()),
     ],
 )
@@ -98,8 +102,8 @@ def test_the_off_list_leaves_one_path_off(path):
 
 
 def test_the_off_list_takes_several_names_with_spaces():
-    env = {**NEW_LINE, "TPU_DECODE_FAST_PATHS_OFF": " xla_schedule , draft_one_query,"}
-    assert ds.resolve(env).paths == ALL_PATHS - {"xla_schedule", "draft_one_query"}
+    env = {**NEW_LINE, "TPU_DECODE_FAST_PATHS_OFF": " xla_schedule , gdn_packed,"}
+    assert ds.resolve(env).paths == ALL_PATHS - {"xla_schedule", "gdn_packed"}
 
 
 def test_an_unknown_name_in_the_off_list_refuses_with_the_valid_names():

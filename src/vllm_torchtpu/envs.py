@@ -81,6 +81,7 @@ if TYPE_CHECKING:
     TPU_MLA_MASKED_DENSE_MAX_KV_LEN: int | None = None
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
+    TPU_GDN_TWO_SLOT_CKPT: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_PACKED_DISPATCH: bool = False
@@ -452,6 +453,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_GDN_CONV_QK_PAIR_LAYOUT": env_bool(
         "TPU_GDN_CONV_QK_PAIR_LAYOUT", default=False
     ),
+    # Speculative decoding on the unified pool: keep two GDN state blocks per
+    # request (the verify window's start state and its last state) instead of
+    # one per window position; a partially accepted window is recomputed from
+    # the start state at the next step (kernels/gdn/v3/window_tile.py). Same
+    # outputs, num_speculative_tokens - 1 fewer blocks per GDN group.
+    "TPU_GDN_TWO_SLOT_CKPT": env_bool("TPU_GDN_TWO_SLOT_CKPT", default=False),
     # Register the DeepSeek-V4 tokenizer that honors continue_final_message.
     # Off by default so tokenizer behavior matches stock vLLM; the DSv4
     # eval config turns it on, since a prefilled assistant turn needs it.
@@ -856,7 +863,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the DP group size and placement (see capacity_factors).
     "TPU_MOE_A2A_ROUTE_CAPACITY": env_optional_float("TPU_MOE_A2A_ROUTE_CAPACITY"),
     # Bitwise decode paths of kernels other models share (decode_switches.PATHS:
-    # xla_schedule).
+    # xla_schedule, gdn_packed, gdn_single_launch, gdn_paired_heads).
     "TPU_DECODE_FAST_PATHS": env_bool("TPU_DECODE_FAST_PATHS"),
     # Comma-separated paths of decode_switches.PATHS to leave off although their
     # parent switch is on. Unknown names refuse to start.

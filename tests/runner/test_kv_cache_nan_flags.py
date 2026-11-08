@@ -198,6 +198,11 @@ def test_install_binds_target_layers_and_reads_current_device_metadata(
             kv_cache_nan_flags.install_kv_cache_nan_detector(runner)
         setattr(runner.parallel_config, field, 1)
 
+    runner._two_slot_ckpts = True
+    with pytest.raises(ValueError, match="TPU_GDN_TWO_SLOT_CKPT"):
+        kv_cache_nan_flags.install_kv_cache_nan_detector(runner)
+    runner._two_slot_ckpts = False
+
     runner.kv_cache_config.kv_cache_groups[0].kv_cache_spec = replace(
         spec, dtype=torch.uint8
     )

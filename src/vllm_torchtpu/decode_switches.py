@@ -122,6 +122,21 @@ PATHS: tuple[Path, ...] = (
         FAST_PATHS,
         "batched RPA builds its decode schedules with array ops",
     ),
+    Path(
+        "gdn_packed",
+        FAST_PATHS,
+        "pooled GDN verify windows hand qkv, b and a to the kernels as one array",
+    ),
+    Path(
+        "gdn_single_launch",
+        FAST_PATHS,
+        "pooled GDN runs its batched and per-sequence segments in one kernel",
+    ),
+    Path(
+        "gdn_paired_heads",
+        FAST_PATHS,
+        "pooled GDN verify windows multiply two value heads per MXU dot",
+    ),
 )
 PATH_NAMES = tuple(p.name for p in PATHS)
 

@@ -173,6 +173,124 @@ def store_state_region(
         )
 
 
+def _head_rows(
+    block_shape: tuple[int, ...],
+    block_dtype,
+    region: config.StateRegion,
+    cfg: config.GDNConfig,
+) -> tuple[int, int, int] | None:
+    """(typed rows per head, typed rows per block, typed lanes) of a region
+    whose source blocks have `block_shape` / `block_dtype` and whose typed
+    rows each hold one state row, or None when a head's rows do not map
+    onto whole typed rows of a single block."""
+    if region.rows_perm is not None:
+        return None
+    out_lanes = block_shape[-1] // region.lane_split
+    block_bytes = math.prod(block_shape) * jnp.dtype(block_dtype).itemsize
+    rows_pb = block_bytes // (jnp.dtype(region.view_dtype).itemsize * out_lanes)
+    pack = 2 if region.view_dtype == jnp.uint32 else 1
+    head_elems = cfg.kq_head_dim * cfg.v_head_dim
+    if out_lanes != cfg.v_head_dim or head_elems % (out_lanes * pack):
+        return None
+    rows_ph = head_elems // (out_lanes * pack)
+    if rows_pb % rows_ph or rows_ph % 8:
+        return None
+    return rows_ph, rows_pb, out_lanes
+
+
+def supports_head_states(
+    block_shape: tuple[int, ...], block_dtype, cfg: config.GDNConfig
+) -> bool:
+    """Whether `load_state_head` / `store_state_head` can address one value
+    head's pooled recurrent state on its own, for source blocks of
+    `block_shape` / `block_dtype`."""
+    assert cfg.state_plan is not None
+    region = cfg.state_plan.recurrent
+    if region.view_dtype not in (jnp.uint32, jnp.float32):
+        return False
+    return _head_rows(block_shape, block_dtype, region, cfg) is not None
+
+
+def _head_view(tile_ref: jax.Ref, region: config.StateRegion, cfg, head: int):
+    """Typed rows of one value head inside one checkpoint's raw region tile."""
+    geometry = _head_rows(tile_ref.shape[1:], tile_ref.dtype, region, cfg)
+    assert geometry is not None
+    rows_ph, rows_pb, _ = geometry
+    block, row0 = divmod(head * rows_ph, rows_pb)
+    view = typed_ldst.typed_view(
+        tile_ref.at[block], region.view_dtype, region.lane_split
+    )
+    return view.at[pl.ds(row0, rows_ph)]
+
+
+def load_state_head(
+    slot_ref: jax.Ref, cfg: config.GDNConfig, idx: int, head: int
+) -> jax.Array:
+    """One value head of a slot's pooled recurrent state (window position
+    0) in FP32, [kq_head_dim, v_head_dim]: the same values
+    `_load_recurrent_state` returns for that head."""
+    assert cfg.state_plan is not None
+    region = cfg.state_plan.recurrent
+    arr = _head_view(slot_ref.at[idx, 0], region, cfg, head)[...]
+    if region.view_dtype == jnp.uint32:
+        arr = pltpu.bitcast(arr, jnp.bfloat16)
+    return arr.reshape(cfg.kq_head_dim, cfg.v_head_dim).astype(jnp.float32)
+
+
+def store_state_head(
+    slot_ref: jax.Ref, cfg: config.GDNConfig, idx: int, pos: int, head: int, values
+) -> None:
+    """Stores one value head of pooled checkpoint `pos` of a slot: the bytes
+    `store_state_region` writes for that head."""
+    assert cfg.state_plan is not None
+    region = cfg.state_plan.recurrent
+    if region.view_dtype == jnp.uint32:
+        arr = pltpu.bitcast(values.astype(jnp.bfloat16), jnp.uint32)
+    else:
+        arr = values.astype(region.view_dtype)
+    view = _head_view(slot_ref.at[idx, pos], region, cfg, head)
+    view[...] = arr.reshape(view.shape)
+
+
+def zero_state_padding(slot_ref: jax.Ref, cfg: config.GDNConfig, idx: int, pos: int):
+    """Zeroes the typed rows past the heads in checkpoint `pos` of a slot, as
+    `store_state_region` does, so the copied-out region is deterministic."""
+    assert cfg.state_plan is not None
+    region = cfg.state_plan.recurrent
+    tile = slot_ref.at[idx, pos]
+    geometry = _head_rows(tile.shape[1:], tile.dtype, region, cfg)
+    assert geometry is not None
+    _, rows_pb, out_lanes = geometry
+    used = region.rows_used
+    for block in range(used // rows_pb, region.nblocks):
+        start = max(used - block * rows_pb, 0)
+        if start >= rows_pb:
+            continue
+        view = typed_ldst.typed_view(
+            tile.at[block], region.view_dtype, region.lane_split
+        )
+        view[pl.ds(start, rows_pb - start)] = jnp.zeros(
+            (rows_pb - start, out_lanes), region.view_dtype
+        )
+
+
+def zero_state_tile(slot_ref: jax.Ref, cfg: config.GDNConfig, idx: int):
+    """Zeroes the whole pooled recurrent region tile of a slot's window
+    position 0, one source block at a time."""
+    assert cfg.state_plan is not None
+    region = cfg.state_plan.recurrent
+    tile = slot_ref.at[idx, 0]
+
+    def zero_block(block, carry):
+        view = typed_ldst.typed_view(
+            tile.at[block], region.view_dtype, region.lane_split
+        )
+        view[...] = jnp.zeros(view.shape, region.view_dtype)
+        return carry
+
+    jax.lax.fori_loop(0, region.nblocks, zero_block, 0)
+
+
 def _load_conv_state(slot_ref: jax.Ref, cfg: config.GDNConfig, idx: int) -> jax.Array:
     """One slot's conv state, decoded through the plan when there is one."""
     # NOTE: Conv1D mandates fp32 due to its usage of compact layout.

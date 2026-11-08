@@ -25,6 +25,7 @@ from jax.experimental.layout import Layout, with_layout_constraint
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
 
+from vllm_torchtpu import decode_switches
 from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.gdn_pool_layout import (
     derive_pooled_gdn_state_layout,
@@ -872,6 +873,7 @@ def run_jax_gdn_attention_pooled_local(
     pool_block_tokens: int,
     recurrent_state_dtype: jnp.dtype = jnp.float32,
     num_spec_tokens: int = 0,
+    two_slot_ckpts: bool = False,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """GDN attention over the unified block pool.
 
@@ -900,6 +902,7 @@ def run_jax_gdn_attention_pooled_local(
         qk_pair_layout=tpu_envs.TPU_GDN_CONV_QK_PAIR_LAYOUT,
         recurrent_state_dtype=recurrent_state_dtype,
     )
+    switches = decode_switches.get()
     recurrent_state, output = gdn_v3_wrapper.fused_conv1d_gdn(
         mixed_qkv,
         b,
@@ -924,6 +927,10 @@ def run_jax_gdn_attention_pooled_local(
         state_source=recurrent_state,
         state_plan=plan,
         num_spec_tokens=num_spec_tokens,
+        two_slot_ckpts=two_slot_ckpts,
+        packed_tokens=switches.path("gdn_packed"),
+        single_launch=switches.path("gdn_single_launch"),
+        paired_heads=switches.path("gdn_paired_heads"),
     )
     return recurrent_state, output
 
@@ -953,6 +960,7 @@ def run_jax_gdn_attention_pooled(
     mesh: jax.sharding.Mesh,
     recurrent_state_dtype: jnp.dtype = jnp.float32,
     num_spec_tokens: int = 0,
+    two_slot_ckpts: bool = False,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Runs GDN attention over the unified block pool, sharded on the mesh.
 
@@ -1036,6 +1044,7 @@ def run_jax_gdn_attention_pooled(
         pool_block_tokens=pool_block_tokens,
         num_spec_tokens=num_spec_tokens,
         recurrent_state_dtype=recurrent_state_dtype,
+        two_slot_ckpts=two_slot_ckpts,
     )
     mapped_fn = jax.shard_map(
         p_run_jax_gdn_attention_pooled_local,
