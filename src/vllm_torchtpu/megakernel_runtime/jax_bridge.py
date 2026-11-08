@@ -14,10 +14,9 @@
 """Generic torch <-> jax step bridge (no `megakernel` library imports).
 
 - `sharded_jax_callable`: an SPMD JAX function over a mesh as a `torch_tpu`
-  `JaxCallable`, built by torch_tpu's own `pallas.custom_jax_kernel` (the
-  builder `pallas.jax_op` uses), for callers that wrap it in their own custom
-  op (e.g. to take `list[Tensor]` arguments past the 64-argument schema
-  limit of a `torch.library` op).
+  `JaxCallable`, built by torch_tpu's own `pallas.custom_jax_kernel`, for
+  callers that wrap it in their own custom op (e.g. to take `list[Tensor]`
+  arguments past the 64-argument schema limit of a `torch.library` op).
 - `make_typed_step_wrapper`: a fixed-arity, `jax.Array`-annotated wrapper of a
   `*args` step function (`JaxCallable` rejects `*args` signatures).
 - `torch_cpu_to_jax` / `jax_to_torch_cpu`: lossless CPU conversions for the
@@ -28,6 +27,13 @@
   `sharded_jax_callable` with TPU tensors, the function run by JAX with CPU
   tensors, with donated outputs copied back into their input tensors in
   place.
+
+These ops are for megakernel steps. The driver compiles each step with
+`torch.compile(..., options={"serializable": False})`, so no compile cache
+persists them, and it runs them from `warmup` and `try_forward`, outside the
+stock model's cached executables. That is why this module is not in the TPU
+compile cache key (`tpu_compiler._RUNTIME_CACHE_KEY_PATHS`). A custom op used
+inside the stock model belongs in that list instead.
 """
 
 from __future__ import annotations
@@ -65,8 +71,7 @@ def sharded_jax_callable(
     Called with this rank's shards of the operands (`input_partition_specs`
     describe the global arrays), it returns this rank's shards of the
     outputs (`output_partition_specs`). Every parameter of `fn` must be an
-    array (no static arguments). The callable is the one `pallas.jax_op`
-    would build, without registering a custom op.
+    array (no static arguments). No custom op is registered.
     """
     from torch_tpu._internal.pallas import pallas as pallas_impl
 
