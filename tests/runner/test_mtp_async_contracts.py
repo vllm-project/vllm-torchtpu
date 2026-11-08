@@ -156,6 +156,7 @@ def test_mamba_read_offset_follows_storage_owner(
     runner._mamba_copy_plan = [(0, [torch.zeros((16, 8), device=device)])]
     runner._mamba_state_block_size = 256
     runner._mamba_ckpt_window = 4
+    runner._two_slot_ckpts = False
     runner._pool_block_split = 1
     runner.cache_config = SimpleNamespace(block_size=256)
     runner._pending_mamba_state_copies = []

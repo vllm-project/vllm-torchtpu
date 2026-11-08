@@ -1795,6 +1795,78 @@ class TestMambaSlotReadOffsets:
         runner._update_mamba_slot_read_offsets([], torch.tensor([[1, 2]]), 1)
         assert int(runner.mamba_slot_read_offsets.sum()) == 0
 
+    def test_two_slot_read_codes(self):
+        """Two-slot codes `start + 2 * pending` after a verify chunk: all
+        drafts accepted -> the other block starts the next window; otherwise
+        the start block does, with accepted + 1 tokens pending; requests
+        without drafts committed to block 0."""
+        runner = self._make_runner(num_blocks=16)
+        runner._update_two_slot_read_codes = (
+            TPUModelRunner._update_two_slot_read_codes.__get__(runner)
+        )
+        group0 = torch.tensor([1, 2, 3, 4, 5, 6, 0], dtype=torch.int32)
+        group1 = group0 + 8 * (group0 > 0)
+        # Previous codes: start block 0, 1, 1 (+2 pending), 0, 1, 0 (+3).
+        for group in (group0, group1):
+            for i, code in enumerate((0, 1, 1 + 2 * 2, 0, 1, 2 * 3)):
+                runner.mamba_slot_read_offsets[int(group[i])] = code
+        bad = INVALID_TOKEN_ID
+        next_tokens = torch.tensor(
+            [
+                [1, 2, 3, 4],  # 3 drafts, all accepted
+                [1, 2, 3, 4],  # 3 drafts, all accepted, from block 1
+                [1, 2, bad, bad],  # 3 drafts, 1 accepted
+                [1, bad, bad, bad],  # 3 drafts, none accepted
+                [1, 2, bad, bad],  # 1 draft, accepted
+                [1, bad, bad, bad],  # no drafts (one-token window)
+                [bad, bad, bad, bad],  # padding
+            ]
+        )
+        drafts = torch.tensor([3, 3, 3, 3, 1, 0, 0])
+        no_boundary = torch.full((7,), -1)
+        runner._update_mamba_slot_read_offsets(
+            [group0, group1], next_tokens, 6, drafts, no_boundary
+        )
+        expected = (1, 0, 1 + 2 * 2, 0 + 2 * 1, 0, 0)
+        for group in (group0, group1):
+            got = [int(runner.mamba_slot_read_offsets[int(b)]) for b in group[:6]]
+            assert got == list(expected)
+        assert int(runner.mamba_slot_read_offsets[0]) == 0
+
+    def test_two_slot_read_codes_when_the_window_completes_a_block(self):
+        """A window whose last token completes a mamba block wrote its last
+        state to block 0 and its start state to block 1: all drafts accepted
+        -> block 0 starts the next window; otherwise block 1 does, with
+        accepted + 1 tokens pending. A boundary inside the window or a
+        one-token window leaves the rule unchanged."""
+        runner = self._make_runner(num_blocks=16)
+        runner._update_two_slot_read_codes = (
+            TPUModelRunner._update_two_slot_read_codes.__get__(runner)
+        )
+        group0 = torch.tensor([1, 2, 3, 4, 5, 6, 0], dtype=torch.int32)
+        for i, code in enumerate((0, 1, 2 * 2, 1, 0, 1 + 2 * 3)):
+            runner.mamba_slot_read_offsets[int(group0[i])] = code
+        bad = INVALID_TOKEN_ID
+        next_tokens = torch.tensor(
+            [
+                [1, 2, 3, 4],  # all accepted, start was block 0
+                [1, 2, 3, 4],  # all accepted, start was block 1
+                [1, 2, bad, bad],  # 1 accepted
+                [1, bad, bad, bad],  # none accepted
+                [1, 2, 3, 4],  # all accepted, boundary at position 1
+                [1, bad, bad, bad],  # one-token window completing a block
+                [bad, bad, bad, bad],  # padding
+            ]
+        )
+        drafts = torch.tensor([3, 3, 3, 3, 3, 0, 0])
+        boundary = torch.tensor([3, 3, 3, 3, 1, 0, -1])
+        runner._update_mamba_slot_read_offsets(
+            [group0], next_tokens, 6, drafts, boundary
+        )
+        expected = (0, 0, 1 + 2 * 2, 1 + 2 * 1, 1, 0)
+        got = [int(runner.mamba_slot_read_offsets[int(b)]) for b in group0[:6]]
+        assert got == list(expected)
+
 
 class TestReadOffsetsClearedOnReallocation:
     """A recycled slot/block must not carry a read offset into its next owner.
@@ -1934,6 +2006,7 @@ class TestUnifiedReadOffsetMigration:
         runner.cache_config = MagicMock()
         runner.cache_config.block_size = block_size
         runner._mamba_ckpt_window = ckpt_window
+        runner._two_slot_ckpts = False
         runner._bucket_len = TPUModelRunner._bucket_len
         runner._pad_to_bucket = TPUModelRunner._pad_to_bucket
         for name in ("_pad_dev_to_bucket", "_expand_pool_split", "_spec_seed_sources"):
