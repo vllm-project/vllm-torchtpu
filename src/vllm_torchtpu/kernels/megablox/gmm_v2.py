@@ -596,7 +596,13 @@ def pack_fp8_rows(
         pltpu.get_tpu_info().get_sublane_tiling(jnp.dtype(q_dtype)),
         pltpu.get_tpu_info().get_sublane_tiling(x.dtype),
     )
-    tr = min(tile_rows, align_to(m, sub))
+    # The largest row tile <= tile_rows (halving) that divides the sublane-
+    # aligned row count, so served step sizes (e.g. 3,200) need no padding copy.
+    ma = align_to(m, sub)
+    tr = min(tile_rows, ma)
+    while tr > sub and ma % tr:
+        tr //= 2
+    tr = max(tr, sub)
     mp = align_to(m, tr)
     xp = jnp.pad(x, ((0, mp - m), (0, 0))) if mp != m else x
 

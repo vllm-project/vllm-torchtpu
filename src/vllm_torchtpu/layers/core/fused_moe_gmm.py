@@ -766,7 +766,8 @@ def moe_gmm(
     group_offset = jnp.array([0], dtype=jnp.int32)
     # The routed rows' activation dtype (x may be their packed fp8 carrier).
     act_dtype = x.dtype if nonep_lhs_packed_dtype is None else jnp.dtype(nonep_lhs_packed_dtype)
-    lp = nonep_lhs_packed_dtype
+    # passed only when set, so the bf16 path's GMM calls are unchanged
+    lpkw = {} if nonep_lhs_packed_dtype is None else {"lhs_packed_dtype": nonep_lhs_packed_dtype}
     # m-tile override of the non-EP GMMs (TPU_MOE_NONEP_GMM_TILE_M); 0 = default.
     tile_m = 0 if use_ep else nonep_gmm_tile_m
     hoist = nonep_gmm_hoist_quant and not use_ep
@@ -796,7 +797,7 @@ def moe_gmm(
         and epv2 == epv
         and get_packing_factor(w1.dtype, rhs_quant_dtype) == 1
         and get_packing_factor(w2.dtype, rhs_quant_dtype) == 1
-        and jaact_dtypes.itemsize_bits(w1.dtype) == 8
+        and jax.dtypes.itemsize_bits(w1.dtype) == 8
     )
     if fused_mlp:
         # shapes only; gmm2 below runs both GMMs from x
@@ -816,7 +817,7 @@ def moe_gmm(
             hoist_lhs_quant=hoist,
             experts_per_visit=epv,
             bucket=bucket,
-            lhs_packed_dtype=lp,
+            **lpkw,
         )
         packing_factor = get_packing_factor(w2.dtype, rhs_quant_dtype)
         gmm1_res = gmm1_res[:, : w2.shape[1] * packing_factor]
@@ -900,7 +901,7 @@ def moe_gmm(
                 bucket=bucket,
                 experts_per_visit=epv,
                 pack_out=packed,
-                lhs_packed_dtype=lp,
+                **lpkw,
             )
             logger.info_once("MoE expert GMMs run as one fused expert-MLP kernel.")
         except ValueError as e:
@@ -910,7 +911,7 @@ def moe_gmm(
                 x, w1, w1_scale, w1_bias, group_sizes, group_offset,
                 zero_initialize=False, fuse_act=activation, rhs_quant_dtype=rhs_quant_dtype,
                 tile_m=tile_m, hoist_lhs_quant=hoist, experts_per_visit=epv, bucket=bucket,
-                lhs_packed_dtype=lp,
+                **lpkw,
             )[:, : w2.shape[1] * get_packing_factor(w2.dtype, rhs_quant_dtype)]
     if gmm2_res is None:
         gmm2_res = gmm_wrapper(

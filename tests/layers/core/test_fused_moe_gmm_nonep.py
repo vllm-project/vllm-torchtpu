@@ -771,6 +771,9 @@ def test_fused_moe_func_nonep_choices_bitwise_on_tpu(tokens):
         dict(nonep_gmm_hoist_quant=True),
         dict(nonep_gather="xla_colchunk", nonep_combine_split=2, nonep_permute="two_sorts",
              nonep_gmm_tile_m=1024),
+        dict(nonep_gather="sc_fp8"),
+        dict(nonep_gather="sc_fp8", nonep_gmm_bucket=64, nonep_gmm_experts_per_visit=2,
+             nonep_fused_mlp=True, nonep_combine_packed=True),
     ):
         np.testing.assert_array_equal(_bits(run(**kw)), ref, err_msg=str(kw))
     # The comparison must be able to fail: moving token 0's first route to an
@@ -949,3 +952,148 @@ def test_sc_padded_gather_matches_sc_and_keeps_padded_rows(monkeypatch):
     ref = _bits(run("xla"))
     np.testing.assert_array_equal(_bits(run("sc")), ref)
     np.testing.assert_array_equal(_bits(run("sc_padded")), ref)
+
+
+# --- TPU_MOE_NONEP_GATHER=sc_fp8 (packed fp8 dispatch) ---------------------------------------
+
+
+def test_sc_fp8_is_a_gather_choice(monkeypatch):
+    from vllm_torchtpu import envs
+    monkeypatch.setenv("TPU_MOE_NONEP_GATHER", "SC_FP8")
+    assert envs.TPU_MOE_NONEP_GATHER.lower() == "sc_fp8"
+
+
+def test_fp8_words_round_trip_every_byte_in_column_order():
+    from vllm_torchtpu.kernels.megablox.gmm_v2 import pack_fp8_words, unpack_fp8_words
+
+    b = np.arange(4 * 128 * 2, dtype=np.uint32) % 256          # every byte value, in all four positions
+    q = jax.lax.bitcast_convert_type(jnp.asarray(b.reshape(2, 512).astype(np.uint8)), jnp.float8_e4m3fn)
+    u = np.asarray(pack_fp8_words(q))
+    assert u.shape == (2, 128) and u.dtype == np.uint32
+    # word j holds columns (j, j + 128, j + 256, j + 384) as bytes 3..0
+    assert u[0, 5] == (b[5] << 24 | b[133] << 16 | b[261] << 8 | b[389])
+    back = jax.lax.bitcast_convert_type(unpack_fp8_words(jnp.asarray(u), jnp.float8_e4m3fn), jnp.uint8)
+    np.testing.assert_array_equal(np.asarray(back), b.reshape(2, 512).astype(np.uint8))
+
+
+def _carrier_ref(x):
+    """pack_fp8_rows' layout in plain JAX (the kernel itself needs a TPU or interpret mode)."""
+    from vllm_torchtpu.kernels.megablox.gmm_v2 import (
+        LHS_PACK_PAD_WORDS, LHS_QUANT_BLOCK, pack_fp8_words, quantize_lhs_block)
+
+    qs, ss = [], []
+    for b in range(x.shape[1] // LHS_QUANT_BLOCK):
+        q, sc = quantize_lhs_block(x[:, b * LHS_QUANT_BLOCK:(b + 1) * LHS_QUANT_BLOCK], jnp.float8_e4m3fn)
+        qs.append(q)
+        ss.append(sc.astype(jnp.float32))
+    words = jax.lax.bitcast_convert_type(pack_fp8_words(jnp.concatenate(qs, axis=1)), jnp.float32)
+    pad = jnp.zeros((x.shape[0], LHS_PACK_PAD_WORDS - len(ss)), jnp.float32)
+    return jnp.concatenate([words] + ss + [pad], axis=1)
+
+
+def _sc_fp8_case(monkeypatch, *, fused=True, bias=False, bf16_weights=False, no_scale=False, gather="sc_fp8"):
+    """fused_moe_func with stand-ins for the SparseCore kernels, pack_fp8_rows and the GMMs, recording what reaches
+    the gather and the GMMs."""
+    from vllm_torchtpu.kernels.megablox.gmm_v2 import LHS_QUANT_BLOCK, unpack_fp8_rows
+
+    experts, hidden, inter, topk, tokens = 16, 512, 128, 4, 640
+    k1, k2, k3 = jax.random.split(jax.random.key(21), 3)
+    w1, s1 = _fp8_per_channel(k1, (experts, hidden, 2 * inter))
+    w2, s2 = _fp8_per_channel(k2, (experts, inter, hidden))
+    if bf16_weights:
+        w1, w2 = (w1.astype(jnp.float32) * s1[:, 0]).astype(jnp.bfloat16), (w2.astype(jnp.float32) * s2[:, 0]).astype(jnp.bfloat16)
+        s1 = s2 = None
+    if no_scale:
+        s1 = None
+    b1 = jnp.zeros((experts, 1, 2 * inter), jnp.float32) if bias else None
+    x = (jax.random.normal(k3, (tokens, hidden), jnp.float32) / 4).astype(jnp.bfloat16)
+    rng = np.random.default_rng(8)
+    ids = jnp.asarray(np.stack([rng.choice(experts, topk, replace=False) for _ in range(tokens)]), jnp.int32)
+    w = jnp.asarray(rng.random((tokens, topk)), jnp.bfloat16)
+    seen = dict(gather=[], gmm_lp=[], mlp_lp=[], log=[])
+
+    def fake_sc_gather(src, idx, start, end, trim_rows=True, copy_mode="vector", **kw):
+        seen["gather"].append(dict(dtype=str(src.dtype), cols=src.shape[1], copy_mode=copy_mode, trim_rows=trim_rows))
+        pad = -idx.shape[0] % 2048
+        out = src[jnp.pad(idx, (0, pad))]
+        return out[: idx.shape[0]] if trim_rows else out
+
+    def dequant(lhs, lhs_packed_dtype):
+        if lhs_packed_dtype is None:
+            return lhs
+        q, sc = unpack_fp8_rows(lhs, (lhs.shape[1] - 128) * 4, jnp.float8_e4m3fn)
+        sc = jnp.repeat(sc, LHS_QUANT_BLOCK, axis=1)
+        return (q.astype(jnp.float32) * sc).astype(lhs_packed_dtype)
+
+    ref0 = _ref_gmm([])
+
+    def ref(lhs, rhs, rhs_scale, *a, **k):  # unscaled (bf16) weights: scale 1
+        if rhs_scale is None:
+            rhs_scale = jnp.ones((rhs.shape[0], 1, 1, rhs.shape[2]), jnp.float32)
+        return ref0(lhs, rhs, rhs_scale, *a, **k)
+
+    def gmm(lhs, *a, lhs_packed_dtype=None, **k):
+        seen["gmm_lp"].append(lhs_packed_dtype)
+        return ref(dequant(lhs, lhs_packed_dtype), *a, **k)
+
+    def mlp(x_, w1_, s1_, w2_, s2_, gs_, *, fuse_act, rhs_quant_dtype=None, tile_m=0, bucket=0,
+            experts_per_visit=1, pack_out=False, lhs_packed_dtype=None):
+        seen["mlp_lp"].append(lhs_packed_dtype)
+        h = ref(dequant(x_, lhs_packed_dtype), w1_, s1_, None, gs_, jnp.array([0], jnp.int32),
+                fuse_act=fuse_act)[:, : w2_.shape[1]]
+        return ref(h, w2_, s2_, None, gs_, jnp.array([0], jnp.int32), preferred_element_type=h.dtype,
+                   pack_out=pack_out)
+
+    class _Log:
+        def info_once(self, msg, *args):
+            seen["log"].append(msg % args if args else msg)
+
+    from jax._src import tpu_info as ti
+    from jax._src.pallas.mosaic import tpu_info as pti
+    from jax.experimental.pallas import tpu as pltpu
+
+    info = ti.get_tpu_info_for_chip(ti.ChipVersion.TPU_7X, 1)   # the gate reads the chip's fp8 support
+    for mod in (pltpu, ti, pti):
+        monkeypatch.setattr(mod, "get_tpu_info", lambda: info, raising=False)
+    monkeypatch.setattr(fused_moe_gmm, "logger", _Log())
+    monkeypatch.setattr(fused_moe_gmm, "ragged_gather_v2", fake_sc_gather)
+    monkeypatch.setattr(fused_moe_gmm, "pack_fp8_rows", _carrier_ref)
+    monkeypatch.setattr(fused_moe_gmm, "gmm_wrapper", gmm)
+    monkeypatch.setattr(fused_moe_gmm, "mlp_wrapper", mlp)
+    monkeypatch.setattr(fused_moe_gmm, "_local_ragged_combine_eligible", lambda *a, **k: True)
+    monkeypatch.setattr(fused_moe_gmm, "ragged_gather_reduce_v3",
+                        lambda rows, rev, wts, valid, reduce_group_size, x_packed=False: _ref_combine(
+                            rows, rev, wts, valid, reduce_group_size))
+    out = fused_moe_gmm.fused_moe_func.__wrapped__(
+        x, w1, w2, s1, s2, b1, None, w, ids, topk=topk, activation="silu", use_ep=False,
+        use_sparse_core=True, nonep_gather=gather, nonep_fused_mlp=fused)
+    return out, seen, (tokens, hidden)
+
+
+@pytest.mark.parametrize("fused", [True, False])
+def test_sc_fp8_gathers_packed_rows_dma_only_and_gmm1_reads_them_packed(monkeypatch, fused):
+    from vllm_torchtpu.kernels.megablox.gmm_v2 import lhs_packed_width
+
+    out, seen, (tokens, hidden) = _sc_fp8_case(monkeypatch, fused=fused)
+    assert seen["gather"] == [dict(dtype="float32", cols=lhs_packed_width(hidden), copy_mode="dma",
+                                   trim_rows=False)], seen["gather"]
+    if fused:
+        assert seen["mlp_lp"] == [jnp.bfloat16] and seen["gmm_lp"] == []
+    else:
+        assert seen["gmm_lp"] == [jnp.bfloat16, None]   # gmm1 packed, gmm2 reads gmm1's bf16 output
+    assert out.dtype == jnp.bfloat16 and out.shape == (tokens, hidden)
+    assert np.isfinite(np.asarray(out, np.float32)).all()
+    assert any("sc_fp8" in m for m in seen["log"])
+    # the stand-in GMM dequantizes the packed rows, so the result is close to the bf16 path's
+    ref, _, _ = _sc_fp8_case(monkeypatch, fused=fused, gather="sc_padded")
+    np.testing.assert_allclose(np.asarray(out, np.float32), np.asarray(ref, np.float32), rtol=0.1, atol=0.02)
+
+
+@pytest.mark.parametrize("kw", [dict(bias=True), dict(bf16_weights=True), dict(no_scale=True)])
+def test_sc_fp8_falls_back_to_sc_padded_where_it_does_not_apply(monkeypatch, kw):
+    out, seen, (tokens, hidden) = _sc_fp8_case(monkeypatch, **kw)
+    assert seen["gather"] == [dict(dtype="bfloat16", cols=hidden, copy_mode="vector", trim_rows=False)], seen
+    assert all(v is None for v in seen["mlp_lp"] + seen["gmm_lp"])
+    assert any("not applicable" in m for m in seen["log"])
+    ref, _, _ = _sc_fp8_case(monkeypatch, gather="sc_padded", **kw)
+    np.testing.assert_array_equal(_bits(out), _bits(ref))
