@@ -299,8 +299,9 @@ PORT="${PORT:-8000}"
 # Verify vLLM is installed. find_spec locates the package without importing it:
 # the `vllm bench serve --help` this replaces imported all of vLLM, 6-50s per
 # config with the chips idle, and a missing subcommand still fails the first
-# benchmark call with its own error.
-if ! python3 -c 'import importlib.util, sys; sys.exit(importlib.util.find_spec("vllm") is None)'; then
+# benchmark call with its own error. A dry run starts nothing, so it skips the
+# check and prints its commands on a host without vLLM.
+if [ "$DRY_RUN" != "1" ] && ! python3 -c 'import importlib.util, sys; sys.exit(importlib.util.find_spec("vllm") is None)'; then
     echo "ERROR: vLLM is not installed."
     exit 1
 fi
