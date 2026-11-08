@@ -25,6 +25,9 @@ _DSV4_DSPARK_MODEL = (
 _QWEN35_MTP_MODEL = "vllm_torchtpu.models.vllm.qwen3_5_mtp:Qwen3_5MTP"
 _QWEN35_MOE_MTP_MODEL = "vllm_torchtpu.models.vllm.qwen3_5_mtp:Qwen3_5MoeMTP"
 _QWEN4_EXP_MODEL = "vllm_torchtpu.models.vllm.qwen4_exp.model:Qwen4ExpForCausalLM"
+_GRANITE_SWITCH_MODEL = (
+    "vllm_torchtpu.models.vllm.granite_switch:GraniteSwitchForCausalLM"
+)
 
 
 class _TPUKimiK3Config(VerifyAndUpdateConfig):
@@ -43,9 +46,12 @@ class _TPUQwen2Config(VerifyAndUpdateConfig):
 
 
 def register_models() -> None:
+    from transformers import AutoConfig
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
     from vllm.model_executor.models import ModelRegistry
     from vllm.model_executor.models.config import MODELS_CONFIG_MAP
 
+    from vllm_torchtpu.models.vllm.granite_switch import GraniteSwitchConfig
     from vllm_torchtpu.models.vllm.qwen4_exp.config import TPUQwen4ExpConfig
 
     ModelRegistry.register_model("KimiLinearForCausalLM", _KIMI_MODEL)
@@ -60,6 +66,11 @@ def register_models() -> None:
     # The released checkpoint declares the vision-language arch; serve it with
     # the text-only model.
     ModelRegistry.register_model("Qwen4ExpForConditionalGeneration", _QWEN4_EXP_MODEL)
+    # granite-switch checkpoints ship neither modeling code nor a config class
+    # that vLLM or transformers knows; keep a newer transformers' own class
+    if "granite_switch" not in CONFIG_MAPPING:
+        AutoConfig.register("granite_switch", GraniteSwitchConfig)
+    ModelRegistry.register_model("GraniteSwitchForCausalLM", _GRANITE_SWITCH_MODEL)
     MODELS_CONFIG_MAP["KimiK3ForConditionalGeneration"] = _TPUKimiK3Config
     MODELS_CONFIG_MAP["Qwen4ExpForCausalLM"] = TPUQwen4ExpConfig
     MODELS_CONFIG_MAP["Qwen4ExpForConditionalGeneration"] = TPUQwen4ExpConfig
