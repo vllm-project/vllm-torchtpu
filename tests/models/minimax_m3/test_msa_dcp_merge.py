@@ -13,9 +13,13 @@
 # limitations under the License.
 """`msa_dcp.merge_candidates` against a sequential top-k reference."""
 
+import functools
+
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.sharding import AbstractDevice, AbstractMesh, use_abstract_mesh
 
 from vllm_torchtpu.models.minimax_m3.kernels import msa_dcp, msa_select
 
@@ -65,3 +69,30 @@ def test_merge_candidates_matches_sequential_topk(dcp, num_tokens, topk):
     packed = _candidates(rng, dcp, num_tokens, topk, num_blocks=24 * dcp)
     got = np.asarray(msa_dcp.merge_candidates(jnp.asarray(packed), topk))
     np.testing.assert_array_equal(got, _reference(packed, topk))
+
+
+@pytest.mark.parametrize("num_heads,num_tokens", [(1, 37), (4, 300)])
+def test_kernel_merge_matches_sequential_topk(num_heads, num_tokens):
+    """The DCP 8 merge kernel (`_merge_kernel`), per head, head-major packing."""
+    dcp, topk = 8, 16
+    rng = np.random.default_rng(num_heads * 1000 + num_tokens)
+    heads = [
+        _candidates(rng, dcp, num_tokens, topk, num_blocks=24 * dcp)
+        for _ in range(num_heads)
+    ]
+    packed = np.concatenate(heads, axis=-1)  # [dcp, T, G * 2 * topk]
+    got = np.asarray(
+        msa_dcp.merge_head_candidates(jnp.asarray(packed), topk, interpret=True)
+    )
+    for g, head in enumerate(heads):
+        np.testing.assert_array_equal(got[:, g], _reference(head, topk))
+
+
+@pytest.mark.parametrize("num_heads,num_tokens", [(4, 512), (4, 8192), (1, 8192)])
+def test_kernel_merge_lowers_for_tpu(num_heads, num_tokens):
+    arg = jax.ShapeDtypeStruct((8, num_tokens, num_heads * 32), jnp.float32)
+    merge = functools.partial(msa_dcp.merge_head_candidates, topk=16)
+    tpu7x = AbstractMesh((), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu"))
+    with use_abstract_mesh(tpu7x):
+        lowered = jax.jit(merge).trace(arg).lower(lowering_platforms=("tpu",))
+    assert "tpu_custom_call" in lowered.as_text()
