@@ -83,6 +83,7 @@ if TYPE_CHECKING:
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
+    TPU_MOE_PACKED_DISPATCH: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
     USE_MOE_FUSED_EP_KERNEL: bool = False
     MOE_FUSED_EP_KERNEL_IMPL: str | None = None
@@ -596,7 +597,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Use one-hot matmuls for MoE permute and unpermute when the routed row
     # count (num_tokens * topk) is <= this threshold. Unset or empty means
     # auto: fused_moe_gmm.resolve_onehot_permute_threshold derives the value
-    # from SparseCore geometry (0 on hosts without SparseCore). 0 keeps every
+    # from SparseCore geometry and, under EP, the full decode step's routed
+    # rows (0 on hosts without SparseCore). 0 keeps every
     # size on the SparseCore path; a positive value forces that
     # threshold. The knob and its row-count semantics come from
     # tpu-inference PR #2674.
@@ -693,6 +695,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # weight-bandwidth bound and the per-device expert load is badly
     # imbalanced. See K3_HIERARCHICAL_EP_PLAN.md.
     "TPU_MOE_HIERARCHICAL_EP": env_bool("TPU_MOE_HIERARCHICAL_EP"),
+    # Under DP + EP, gather the DP group's hidden states and router logits
+    # in one all-gather (packed side by side along the last dim) instead of
+    # one all-gather each. Exact: the packing only moves bytes.
+    "TPU_MOE_PACKED_DISPATCH": env_bool("TPU_MOE_PACKED_DISPATCH"),
     # MoE router top-k implementation: "rowmax" (default) is the sort-free
     # k-pass selection, "sort" is torch.topk, kept as an escape hatch.
     "TPU_MOE_ROUTER_TOPK": env_with_choices(
