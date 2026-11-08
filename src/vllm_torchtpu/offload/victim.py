@@ -12,14 +12,16 @@
 
 Mechanism (engine-core process only; the scheduler and the block pool live there):
 
-* ``patch_block_pool_victims`` wraps four ``BlockPool`` methods at class level. They are inert unless a
-  ``VictimTap`` is active.
+* ``patch_block_pool_victims`` wraps two ``BlockPool`` methods and three ``FreeKVCacheBlockQueue`` methods at
+  class level. They are inert unless a ``VictimTap`` is active.
   - ``get_new_blocks`` marks the allocation window, and ``_maybe_evict_cached_block`` records a hashed block
     evicted *inside* that window. Every other eviction is excluded by construction: the retention patch's
     superseded checkpoints (``_drop_superseded``), failed-load invalidation (``evict_blocks``) and the
     transient Mamba checkpoint all call ``_maybe_evict_cached_block`` outside an allocation, and a block they
     clear reaches the free-queue head hashless.
-  - ``free_blocks`` and ``unpin_blocks`` stamp the scheduler step at which a block's reference count reached 0.
+  - ``FreeKVCacheBlockQueue.append`` / ``append_n`` / ``prepend_n`` stamp the scheduler step at which a block
+    entered the free queue, i.e. its reference count reached 0, whichever free path put it there
+    (``_patch_free_queue_stamps``).
 * The scheduler connector (``TPURaidenOffloadingScheduler``) takes the recorded victims in its
   ``build_connector_meta``, keeps those whose stamp is at least ``min_age`` steps old (young-block guard: a
   block freed recently may still be written by a batch in flight), stores them, and drains the store
@@ -138,12 +140,12 @@ def patch_block_pool_victims() -> None:
 def _patch_free_queue_stamps() -> None:
     """Stamp a block's free step where every free path ends: entering the free queue.
 
-    The free_blocks/unpin_blocks wrappers above are not enough on the served engine: there the victim hook is
-    installed at the engine_core stage, and the LIFO free patch (vllm_torchtpu._patch_vllm_block_pool_lifo_free,
-    platform_activation) replaces BlockPool.free_blocks seconds later in the same EngineCore process, so the
-    wrapper is dropped and every victim arrives unstamped (j-47fee8a1: 220,445 of 220,445). Any free path, the LIFO
-    one included, puts the block on FreeKVCacheBlockQueue, so stamping here survives later replacements. Idempotent;
-    inert unless a tap is active."""
+    Stamping in BlockPool.free_blocks / unpin_blocks (the earlier design) fails on the served engine: there the
+    victim hook is installed at the engine_core stage, and the LIFO free patch
+    (vllm_torchtpu._patch_vllm_block_pool_lifo_free, platform_activation) replaces BlockPool.free_blocks seconds
+    later in the same EngineCore process, so the wrapper is dropped and every victim arrives unstamped (j-47fee8a1:
+    220,445 of 220,445). Any free path, the LIFO one included, puts the block on FreeKVCacheBlockQueue, so stamping
+    here survives later replacements. Idempotent; inert unless a tap is active."""
     from vllm.v1.core.kv_cache_utils import FreeKVCacheBlockQueue
 
     if FreeKVCacheBlockQueue.__dict__.get("_q38_victim_stamp", False):
