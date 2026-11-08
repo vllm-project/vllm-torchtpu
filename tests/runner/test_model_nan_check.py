@@ -243,6 +243,7 @@ def test_capture_suspends_checks_and_restores_them_after_warmup(
         _precompile_backbone=lambda: None,
         _precompile_sampling_subgraphs=lambda: None,
         _precompile_mamba_rollback_helpers=lambda: None,
+        _precompile_spec_boundary_pairs=lambda: None,
         vllm_config=SimpleNamespace(),
         device=torch.device("cpu"),
         model=None,
