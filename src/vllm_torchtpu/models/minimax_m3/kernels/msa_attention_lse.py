@@ -20,6 +20,7 @@ output; the work list, page unpacking and masking are shared with it.
 """
 
 import functools
+import math
 
 import jax
 import jax.numpy as jnp
@@ -31,6 +32,8 @@ from vllm_torchtpu.models.minimax_m3.kernels.packed_page import check_page_dtype
 
 # Page counts a kernel step may run at besides the full group (`_kernel`).
 _STEP_WIDTHS = (4, 8)
+_LOG2_E = math.log2(math.e)
+_LN_2 = math.log(2.0)
 
 
 def _kernel(
@@ -50,7 +53,8 @@ def _kernel(
     aliased: bool = False,
 ):
     """`msa_attention._kernel_v2` that also writes ``lse = m + log(l)``
-    (``-inf`` for a row that sees no slot; its output is 0)."""
+    (``-inf`` for a row that sees no slot; its output is 0). The running
+    max ``m`` is kept in log2 units."""
     pages_per_step = len(refs) - (7 if aliased else 5)
     kv_refs = refs[:pages_per_step]
     o_ref, lse_ref, m_ref, l_ref, acc_ref = refs[len(refs) - 5 :]
@@ -99,12 +103,13 @@ def _kernel(
         s = jax.lax.dot_general(
             q, k, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
         )
-        s = jnp.where(mask, s * sm_scale, -jnp.inf)
+        # Scores in log2 units (m and l too): exp2 needs no multiply per score.
+        s = jnp.where(mask, s * (sm_scale * _LOG2_E), -jnp.inf)
 
         m_prev = m_ref[...]
         m_new = jnp.maximum(m_prev, jnp.max(s, axis=1, keepdims=True))
-        alpha = jnp.exp(m_prev - m_new)
-        p = jnp.exp(s - m_new)
+        alpha = jnp.exp2(m_prev - m_new)
+        p = jnp.exp2(s - m_new)
         l_ref[...] = alpha * l_ref[...] + jnp.sum(p, axis=1, keepdims=True)
         acc_ref[...] = alpha * acc_ref[...] + jax.lax.dot_general(
             p.astype(v.dtype),
@@ -135,7 +140,7 @@ def _kernel(
         safe = jnp.where(seen_any, denom, 1.0)
         out = jnp.where(seen_any, acc_ref[...] / safe, 0.0)
         o_ref[...] = out.reshape(num_heads, block_q, head_dim).astype(o_ref.dtype)
-        lse = jnp.where(seen_any, m_ref[...] + jnp.log(safe), -jnp.inf)
+        lse = jnp.where(seen_any, m_ref[...] * _LN_2 + jnp.log(safe), -jnp.inf)
         lse_ref[...] = lse.reshape(num_heads, block_q, 1)
 
 
