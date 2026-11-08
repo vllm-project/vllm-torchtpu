@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import itertools
 from collections.abc import Callable, Mapping, Sequence
-from typing import Any
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -77,8 +77,10 @@ def sharded_jax_callable(
         name,
         donate_argnums=list(donate_argnums) if donate_argnums else None,
         mesh=mesh,
-        input_partition_specs=tuple(input_partition_specs),
-        output_partition_specs=tuple(_leaf_output_specs(output_partition_specs)),
+        input_partition_specs=cast("Any", tuple(input_partition_specs)),
+        output_partition_specs=cast(
+            "Any", tuple(_leaf_output_specs(output_partition_specs))
+        ),
         warn_deprecated=False,
     )
 

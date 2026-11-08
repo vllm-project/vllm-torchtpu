@@ -572,13 +572,13 @@
     },
     {
       "path": "src/vllm_torchtpu/kernels/gdn/v3/memory_ref.py",
-      "name": "bad-override",
-      "concise_description": "Class member `BaseBufferedRef.create` overrides parent class `BufferedRef` in an inconsistent manner"
+      "name": "missing-attribute",
+      "concise_description": "Object of class `Ref` has no attribute `bitcast`"
     },
     {
       "path": "src/vllm_torchtpu/kernels/gdn/v3/memory_ref.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Ref` has no attribute `bitcast`"
+      "name": "bad-override",
+      "concise_description": "Class member `BaseBufferedRef.create` overrides parent class `BufferedRef` in an inconsistent manner"
     },
     {
       "path": "src/vllm_torchtpu/kernels/gdn/v3/memory_ref.py",
