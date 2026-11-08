@@ -54,7 +54,7 @@ def _run(fn, monkeypatch, tiled, *args, **kwargs):
     if tiled:
         monkeypatch.setattr(msa_attention_lse, "DECODE_TOKENS", 0)
     out = fn(*args, **kwargs)
-    monkeypatch.setattr(msa_attention_lse, "DECODE_TOKENS", 16)
+    monkeypatch.setattr(msa_attention_lse, "DECODE_TOKENS", 64)
     return [np.asarray(x.astype(jnp.float32)) for x in out]
 
 

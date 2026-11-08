@@ -340,8 +340,10 @@ def _work_lists(selected, block_q, pages_per_step, tiles=False):
 
 # Calls of at most this many tokens (decode, verify windows) run
 # `_decode_call`: one grid step per token over its own selected pages, with no
-# work list. Above it, the tiled kernel's page unions pay off.
-DECODE_TOKENS = 16
+# work list. It beats the tiled kernel with its work list up to 64 tokens,
+# G = 1 and 4, fp8 and 4-bit (j-e34cee54: 15.3 -> 13.2 us at 64, 12.2 -> 11.0
+# at 16); above that the tiles' page unions pay off.
+DECODE_TOKENS = 64
 
 
 def _decode_kernel(
