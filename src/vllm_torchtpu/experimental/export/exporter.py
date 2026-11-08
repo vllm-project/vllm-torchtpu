@@ -65,12 +65,22 @@ class _Drafter:
     intermediates: tuple[str, ...]
     # Its states are `{state_name}_layer_{i}`.
     state_name: str
+    # The optional model method naming, for a drafter that reads the target's
+    # KV instead of keeping its own, the target state each of its states is.
+    shared_states_fn: str | None = None
 
 
 _DRAFTERS = {
-    # The model's MTP layer reads the target's last hidden state.
+    # The MTP draft reads the target's last hidden state: the model's own MTP
+    # layer, keeping its own KV, or a separate draft reading the target's KV
+    # (Gemma 4's assistant).
     "mtp": _Drafter(
-        "mtp.", "mtp_abstract_states", "mtp_draft", ("hidden_states",), "mtp_kv_cache"
+        "mtp.",
+        "mtp_abstract_states",
+        "mtp_draft",
+        ("hidden_states",),
+        "mtp_kv_cache",
+        "mtp_state_indices",
     ),
     # A separate DSpark draft model reads the target's residual stream at a few
     # layers (`forward_extra_outputs()`).
@@ -1061,11 +1071,32 @@ def _export_draft(
     donated) and the forward intermediates it reads (`hidden_states` for an MTP
     layer, `aux_hidden_states` for a DSpark draft model).
     Outputs: the updated states and `draft_tokens` `[max_num_seqs, k]`.
+
+    A drafter reading the target's KV (`shared_states_fn`) takes those states
+    instead: each is the forward's state of that index, under its name.
     """
     cfg: api.TextOnlyLLMExportConfig = model.export_config
     axis_sizes = _axis_sizes(cfg)
     k = int(cfg.speculative_config["num_speculative_tokens"])  # type: ignore[index]
     state_specs = list(getattr(model, drafter.states_fn)())
+    shared_fn = (
+        getattr(model, drafter.shared_states_fn, None)
+        if drafter.shared_states_fn
+        else None
+    )
+    shared = shared_fn() if callable(shared_fn) else None
+    if shared is None:
+        state_ids = [
+            (first_state_index + s_i, f"{drafter.state_name}_layer_{s_i}")
+            for s_i in range(len(state_specs))
+        ]
+    else:
+        state_ids = [(i, f"kv_cache_layer_{i}") for i in shared]
+    if len(state_ids) != len(state_specs):
+        raise ValueError(
+            f"the drafter reads {len(state_ids)} target states but declares "
+            f"{len(state_specs)}"
+        )
     state_entries = []
     for spec in state_specs:
         sharding = (
@@ -1146,8 +1177,8 @@ def _export_draft(
             inputs.append(
                 _io_entry(
                     arg_index=state_start + s_i,
-                    index=first_state_index + s_i,
-                    name=f"{drafter.state_name}_layer_{s_i}",
+                    index=state_ids[s_i][0],
+                    name=state_ids[s_i][1],
                     shape=s_shape,
                     dtype=s_dtype,
                     argument_type="state",
@@ -1169,8 +1200,8 @@ def _export_draft(
         outputs: list[dict[str, Any]] = [
             _io_entry(
                 arg_index=s_i,
-                index=first_state_index + s_i,
-                name=f"{drafter.state_name}_out_layer_{s_i}",
+                index=state_ids[s_i][0],
+                name=state_ids[s_i][1].replace("_layer_", "_out_layer_"),
                 shape=s_shape,
                 dtype=s_dtype,
                 argument_type="state",
