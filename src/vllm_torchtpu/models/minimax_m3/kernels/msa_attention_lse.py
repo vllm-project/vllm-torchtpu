@@ -325,6 +325,8 @@ def _chunked_call(
         interpret=interpret,
     )
     limit = msa_attention.MAX_TOKENS_PER_CALL
+    if num_tokens == 0:
+        return q, jnp.zeros(q.shape[:2], jnp.float32)
     step = min(num_tokens, max(block_q, limit - limit % block_q))
     num_chunks = -(-num_tokens // step)
     pad = num_chunks * step - num_tokens

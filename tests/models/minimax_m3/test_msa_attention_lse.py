@@ -175,3 +175,17 @@ def test_lse_heads_matches_dense_reference(dtype, monkeypatch):
         outs.append(o)
         lses.append(l)
     _check(got, (np.concatenate(outs, axis=1), np.concatenate(lses, axis=1)))
+
+
+def test_lse_empty_batch():
+    out, lse = msa_sparse_attention_lse(
+        jnp.zeros((0, Q_PER_KV, HEAD_DIM), jnp.bfloat16),
+        pack(np.zeros((PAGES, PAGE, 2 * HEAD_DIM), np.float32), jnp.bfloat16),
+        jnp.zeros((0, TOPK), jnp.int32),
+        jnp.zeros((0,), jnp.int32),
+        jnp.zeros((0,), jnp.int32),
+        jnp.arange(PAGES, dtype=jnp.int32),
+        sm_scale=SCALE,
+        interpret=True,
+    )
+    assert out.shape == (0, Q_PER_KV, HEAD_DIM) and lse.shape == (0, Q_PER_KV)

@@ -55,7 +55,8 @@ def _reference(scores, pos, rank, dcp, init_blocks, local_blocks):
         (300, 512, 2, 1, 40_000, 0, 1),  # several row blocks, few chunks visible
         (300, 512, 2, 0, 130_000, 1, 1),  # every chunk visible in some block
         (5, 256, 8, 3, 9_000, 0, 1),  # decode-sized: one 8-row block
-        (40, 96, 4, 2, 20_000, 1, 2),  # a width that is not a chunk multiple
+        (40, 96, 4, 2, 20_000, 1, 2),  # a width below one 128-column step
+        (300, 384, 2, 0, 60_000, 0, 1),  # widths 128, 256 and the full 384
     ],
 )
 def test_candidates_match_reference(

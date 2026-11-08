@@ -208,13 +208,13 @@ def local_candidates(
     pad = -num_tokens % block_rows
     s = jnp.pad(scores[:, 0], ((0, pad), (0, 0)))
     p = jnp.pad(pos, (0, pad))[:, None]
-    # Static scan widths: powers of two times 128 up to the full width (one
-    # kernel body each); each row block takes the narrowest one holding every
-    # block its rows see (a rank's blocks below n are among its first
-    # ceil(n / dcp) columns).
+    # Static scan widths: 128 x powers of two below the full width, and the
+    # full width (one kernel body each); each row block takes the narrowest
+    # one holding every block its rows see (a rank's blocks below n are among
+    # its first ceil(n / dcp) columns).
     widths = [num_cols]
-    while widths[0] % 2 == 0 and widths[0] // 2 >= _MIN_CANDIDATE_WIDTH:
-        widths.insert(0, widths[0] // 2)
+    while widths[0] > _MIN_CANDIDATE_WIDTH:
+        widths.insert(0, max(_MIN_CANDIDATE_WIDTH, 1 << (widths[0] - 1).bit_length() - 1))
     needed = -(-(jnp.max(p.reshape(-1, block_rows), axis=1) // block_size + 1) // dcp)
     w = jnp.asarray(widths, jnp.int32)
     row_widths = jnp.min(jnp.where(w >= needed[:, None], w, num_cols), axis=1)
