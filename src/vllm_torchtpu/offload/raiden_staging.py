@@ -48,6 +48,7 @@ from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
+import jax
 
 from vllm_torchtpu.logger import init_logger
 
