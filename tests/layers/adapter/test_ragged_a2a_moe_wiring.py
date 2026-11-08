@@ -88,6 +88,37 @@ def test_ragged_a2a_op_threshold_covers_the_ep_decode_step(
     assert seen["route_factor"] == 3.0
 
 
+@pytest.mark.parametrize(
+    "placement,rows,routes,expected",
+    [
+        ("", None, None, (2.5, 3.0)),
+        ("/tmp/placement.npz", None, None, (2.0, 2.0)),
+        # Explicit factors win either way.
+        ("/tmp/placement.npz", "2.5", "3", (2.5, 3.0)),
+        ("", "1.5", "0", (1.5, 0.0)),
+    ],
+)
+def test_capacity_defaults_follow_the_expert_placement(
+    monkeypatch, placement, rows, routes, expected
+):
+    monkeypatch.setenv("TPU_MOE_EXPERT_PLACEMENT", placement)
+    for name, value in (
+        ("TPU_MOE_A2A_CAPACITY", rows),
+        ("TPU_MOE_A2A_ROUTE_CAPACITY", routes),
+    ):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    # Read the knobs themselves: a monkeypatched attribute restored by an
+    # earlier test would shadow the module's lazy lookup.
+    got = tuple(
+        envs.environment_variables[name]()
+        for name in ("TPU_MOE_A2A_CAPACITY", "TPU_MOE_A2A_ROUTE_CAPACITY")
+    )
+    assert got == expected
+
+
 def test_op_never_skips_routes_by_weight(monkeypatch):
     """Padded tokens reach the op unrouted (TPU_MOE_SKIP_PADDED_TOKENS drops
     them at top-k), so the prebuilt op and the one each call uses are the op
