@@ -129,6 +129,7 @@ if TYPE_CHECKING:
     TPU_MOE_A2A_OWNER_TAIL: bool = False
     TPU_MOE_EXPERT_PLACEMENT: str = ""
     TPU_MOE_ROUTING_COUNTS_DIR: str = ""
+    TPU_MOE_ROUTING_REPLAY: str = ""
     PCP_FA_KERNEL_BLOCK_SIZE: int | None = None
     PCP_GDN_COMM_CHUNK_SIZE: int | None = None
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
@@ -931,6 +932,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # change. For a capture window of representative traffic, with <dir> on
     # local disk. Unset = no counting.
     "TPU_MOE_ROUTING_COUNTS_DIR": env_str("TPU_MOE_ROUTING_COUNTS_DIR", ""),
+    # Profiling only: the router emits the expert ids captured in this .npz
+    # (ids [layers, windows, positions, topk]); see
+    # layers/adapter/routing_replay.py. Model output is meaningless.
+    "TPU_MOE_ROUTING_REPLAY": lambda: os.getenv("TPU_MOE_ROUTING_REPLAY", ""),
     # Override the PCP full-attention kernel page without changing KV manager pages.
     "PCP_FA_KERNEL_BLOCK_SIZE": env_positive_int_or_none("PCP_FA_KERNEL_BLOCK_SIZE"),
     # GDN stage/projection budget; token ownership still follows PCP interleave.
