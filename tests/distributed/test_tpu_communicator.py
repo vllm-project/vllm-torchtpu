@@ -96,3 +96,52 @@ def test_extra_tensors_rejected_before_collectives(
     with pytest.raises(NotImplementedError, match="extra_tensors"):
         getattr(communicator, method)(*[torch.ones(1)] * count, extra_tensors=[])
     get_group.assert_not_called()
+
+
+def _other_rank(x):
+    # What the second DP rank contributes: distinct values, same shape.
+    return x * 3 + 1
+
+
+@pytest.mark.parametrize("dp_size", [1, 2])
+def test_packed_dispatch_matches_two_gathers(monkeypatch, communicator, dp_size):
+    group = Mock(world_size=dp_size)
+    monkeypatch.setattr(comm, "get_dp_group", lambda: group)
+    group.all_gather.side_effect = lambda x, dim: torch.cat(
+        [x, _other_rank(x)], dim=dim
+    )
+    generator = torch.Generator().manual_seed(0)
+    hidden = torch.randn(3, 16, generator=generator).to(torch.bfloat16)
+    logits = torch.randn(3, 5, generator=generator).to(torch.bfloat16)
+
+    monkeypatch.setattr(comm.envs, "TPU_MOE_PACKED_DISPATCH", False, raising=False)
+    expected = communicator.dispatch_router_logits(hidden, logits)
+    unpacked_calls = group.all_gather.call_count
+    group.all_gather.reset_mock()
+    monkeypatch.setattr(comm.envs, "TPU_MOE_PACKED_DISPATCH", True, raising=False)
+    result = communicator.dispatch_router_logits(hidden, logits)
+
+    assert group.all_gather.call_count == (0 if dp_size == 1 else 1)
+    assert unpacked_calls == (0 if dp_size == 1 else 2)
+    for actual, reference in zip(result, expected):
+        assert actual.dtype == reference.dtype
+        assert torch.equal(actual, reference)
+        assert actual.is_contiguous()
+    if dp_size == 2:
+        (packed,), kwargs = group.all_gather.call_args
+        assert kwargs == {"dim": 0}
+        assert packed.shape == (3, 21)
+
+
+def test_packed_dispatch_keeps_two_gathers_for_mixed_dtypes(monkeypatch, communicator):
+    group = Mock(world_size=2)
+    monkeypatch.setattr(comm, "get_dp_group", lambda: group)
+    group.all_gather.side_effect = lambda x, dim: torch.cat([x, x], dim=dim)
+    monkeypatch.setattr(comm.envs, "TPU_MOE_PACKED_DISPATCH", True, raising=False)
+    hidden = torch.ones(2, 4, dtype=torch.bfloat16)
+    logits = torch.ones(2, 3, dtype=torch.float32)
+
+    result = communicator.dispatch_router_logits(hidden, logits)
+
+    assert group.all_gather.call_count == 2
+    assert [t.dtype for t in result] == [torch.bfloat16, torch.float32]

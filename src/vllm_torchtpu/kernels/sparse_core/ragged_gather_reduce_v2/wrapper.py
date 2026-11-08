@@ -20,11 +20,31 @@ def _fallback_implementation(
     valid_rows_mask: jax.Array,
     reduce_group_size: int,
 ) -> jax.Array:
-    out = x[indices] * topk_weights[:, None].astype(jnp.float32)
-    out = jnp.where(valid_rows_mask[:, None], out, 0)
-    out = out.reshape(-1, reduce_group_size, out.shape[-1])
-    out = jnp.sum(out, axis=1).astype(jnp.bfloat16)
-    return out
+    # The weighted sum is a matmul against a [groups, source rows] combine
+    # matrix, so the MXU accumulates the products in f32 and rounds once.
+    # Written as an f32 multiply and sum, XLA may store the products in
+    # bf16 when the sum is rounded to bf16 next, rounding every term.
+    dtype = jnp.promote_types(x.dtype, topk_weights.dtype)
+    num_groups = indices.size // reduce_group_size
+    weights = jnp.where(valid_rows_mask, topk_weights, 0).astype(jnp.float32)
+    groups = jnp.arange(indices.size, dtype=jnp.int32) // reduce_group_size
+    combine = jnp.zeros((num_groups, x.shape[0]), jnp.float32)
+    combine = combine.at[groups, indices].add(weights).astype(dtype)
+    # Source rows no valid route reads may hold stale non-finite values, and
+    # 0 * NaN is NaN in the matmul; zero them as the masked gather did.
+    reads = (
+        jnp.zeros((x.shape[0],), jnp.int32)
+        .at[indices]
+        .add(valid_rows_mask.astype(jnp.int32))
+    )
+    x = jnp.where(reads[:, None] > 0, x, 0).astype(dtype)
+    out = jnp.dot(
+        combine,
+        x,
+        precision=jax.lax.Precision.HIGHEST,
+        preferred_element_type=jnp.float32,
+    )
+    return out.astype(jnp.bfloat16)
 
 
 def _preprocess_scalar_data(
