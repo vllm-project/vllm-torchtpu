@@ -90,16 +90,24 @@ def _check(got, want):
 
 @pytest.mark.parametrize("dtype", CACHE_DTYPES)
 @pytest.mark.parametrize(
-    "num_tokens,num_real,block_q,tokens_per_call,sorted_unions",
+    "num_tokens,num_real,block_q,tokens_per_call,sorted_unions,pages_per_step",
     [
-        (37, 35, 16, None, False),  # last tile part padding
-        (24, 24, 8, None, False),  # 8-token tiles
-        (150, 140, 16, 64, False),  # several kernel calls (the chunk loop)
-        (150, 140, 16, 64, True),  # the prefill (sorted) work list
+        (37, 35, 16, None, False, 16),  # last tile part padding
+        (24, 24, 8, None, False, 16),  # 8-token tiles
+        (150, 140, 16, 64, False, 16),  # several kernel calls (the chunk loop)
+        (150, 140, 16, 64, True, 16),  # the prefill (sorted) work list
+        (150, 140, 16, 64, True, 5),  # groups per tile padded to a power of two
     ],
 )
 def test_lse_matches_dense_reference(
-    num_tokens, num_real, block_q, tokens_per_call, sorted_unions, dtype, monkeypatch
+    num_tokens,
+    num_real,
+    block_q,
+    tokens_per_call,
+    sorted_unions,
+    pages_per_step,
+    dtype,
+    monkeypatch,
 ):
     if sorted_unions:
         monkeypatch.setattr(msa_attention, "_DENSE_WORK_LIST_ELEMS", 0)
@@ -118,6 +126,7 @@ def test_lse_matches_dense_reference(
         jnp.asarray(table),
         sm_scale=SCALE,
         block_q=block_q,
+        pages_per_step=pages_per_step,
         interpret=True,
     )
     want = _reference(

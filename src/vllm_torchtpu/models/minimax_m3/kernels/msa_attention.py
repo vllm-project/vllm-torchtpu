@@ -65,7 +65,9 @@ _NO_PAGE = jnp.iinfo(jnp.int32).max
 
 def _groups_per_tile(block_q: int, topk: int, pages_per_step: int) -> int:
     """Union rows of `pages_per_step` pages per tile: a power of two, so a
-    meta word's row gives its tile by a shift (`_meta_tile`)."""
+    meta word's row gives its tile by a shift (`_meta_tile`). Other shapes
+    than the served ones (block_q 8/16, topk 16, 16 pages per step) can pad
+    the SMEM work list up to 2x."""
     groups = -(-block_q * topk // pages_per_step)
     return 1 << (groups - 1).bit_length()
 
@@ -395,7 +397,7 @@ def _work_list(selected: jax.Array, block_q: int, pages_per_step: int):
 
     Returns the unions as ``[tiles * groups_per_tile * pages_per_step]``
     (``-1`` past a tile's union; see `_slot`), one meta word per group (see
-    `_meta`) and the number of groups. The kernel reads its group's pages in
+    `_ROW_SHIFT`) and the number of groups. The kernel reads its group's pages in
     the unions directly, so no [groups, pages_per_step] gather builds a
     per-group list (a SparseCore offload of ~65 us per 2,048-token call in
     the c4 prefill twin, j-3c651507).

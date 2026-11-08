@@ -244,7 +244,13 @@ def test_page_table_keys_match_physical_pages(dtype):
 
 @pytest.mark.parametrize(
     "num_tokens,block_q,topk,pages_per_step",
-    [(16, 16, 16, 16), (16, 8, 16, 16), (64, 16, 16, 16), (48, 16, 4, 8)],
+    [
+        (16, 16, 16, 16),
+        (16, 8, 16, 16),
+        (64, 16, 16, 16),
+        (48, 16, 4, 8),
+        (48, 16, 3, 5),  # groups per tile (10) padded to a power of two
+    ],
 )
 def test_dense_work_list_matches_unique(
     monkeypatch, num_tokens, block_q, topk, pages_per_step
