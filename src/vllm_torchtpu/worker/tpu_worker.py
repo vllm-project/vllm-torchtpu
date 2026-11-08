@@ -38,6 +38,7 @@ from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 import vllm_torchtpu.distributed.utils as dist_utils
 from vllm_torchtpu import envs, profiler_trace, utils
 from vllm_torchtpu.distributed.pcp_rank_order import pcp_topology_order
+from vllm_torchtpu.layers.adapter import expert_placement
 from vllm_torchtpu.layers.adapter.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
@@ -741,7 +742,13 @@ class TPUWorker(WorkerBase):
         self.compilation_config.compilation_time = compilation_time
         set_torch_threads_for_runtime()
         _release_free_host_heap()
+        expert_placement.start_writing_counts()
         return CompilationTimes(language_model=compilation_time, encoder=0.0)
+
+    def shutdown(self) -> None:
+        # The routing counts since their last rewrite (TPU_MOE_ROUTING_COUNTS_DIR).
+        expert_placement.write_counts(final=True)
+        super().shutdown()
 
     def reload_kernels(self, modules: list[str] | None = None) -> dict:
         """Kernel-iteration hot-reload: re-import the reloadable kernel

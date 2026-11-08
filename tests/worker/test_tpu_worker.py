@@ -438,6 +438,48 @@ def test_warmup_releases_host_heap_after_compilation_artifacts(monkeypatch):
     assert events == ["capture", "save", "threads", "release"]
 
 
+@pytest.mark.cpu_test
+def test_warmup_starts_the_routing_counts_file_last(monkeypatch):
+    from vllm_torchtpu.worker import tpu_worker
+
+    events = []
+    monkeypatch.setattr(
+        tpu_worker, "resolve_compilations", lambda _: events.append("save")
+    )
+    monkeypatch.setattr(
+        tpu_worker, "set_torch_threads_for_runtime", lambda: events.append("threads")
+    )
+    monkeypatch.setattr(
+        tpu_worker, "_release_free_host_heap", lambda: events.append("release")
+    )
+    monkeypatch.setattr(
+        tpu_worker.expert_placement,
+        "start_writing_counts",
+        lambda: events.append("counts"),
+    )
+    worker = SimpleNamespace(
+        model_runner=SimpleNamespace(capture_model=lambda: events.append("capture")),
+        compilation_config=SimpleNamespace(compilation_time=0.0),
+    )
+
+    TPUWorker.compile_or_warm_up_model(worker)
+    assert events == ["capture", "save", "threads", "release", "counts"]
+
+
+@pytest.mark.cpu_test
+def test_shutdown_writes_the_last_routing_counts(monkeypatch):
+    from vllm_torchtpu.worker import tpu_worker
+
+    calls = []
+    monkeypatch.setattr(
+        tpu_worker.expert_placement,
+        "write_counts",
+        lambda **kwargs: calls.append(kwargs),
+    )
+    TPUWorker.shutdown(TPUWorker.__new__(TPUWorker))
+    assert calls == [{"final": True}]
+
+
 def test_release_free_host_heap_prefers_tcmalloc(monkeypatch):
     from vllm_torchtpu.worker import tpu_worker
 
