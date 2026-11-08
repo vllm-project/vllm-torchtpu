@@ -533,7 +533,12 @@ def fused_conv1d_gdn(
     packing = 4 // act_in_dtype.itemsize
     padded_batch_size = pl.cdiv(batch_size, packing) * packing
     decode_tile_size = min(decode_tile_size, batch_size)
+    # Round the static clip down to a power of two so a non-power-of-two token
+    # bucket (e.g. 24 or 40 requests per engine) stays divisible by the
+    # triangular solver's block size. Ported from vllm-torchtpu PR #2438.
     mixed_tile_size = min(mixed_tile_size, batch_size)
+    if mixed_tile_size > 1:
+        mixed_tile_size = 1 << (mixed_tile_size.bit_length() - 1)
     aligned_num_v_heads = pl.cdiv(n_v, num_lanes) * num_lanes
 
     if num_spec_tokens > 0:
