@@ -86,6 +86,11 @@ if TYPE_CHECKING:
     TPU_KERNEL_RELOAD_MODULES: str = ""
     TPU_GREEDY_TOP_TOKENS: bool = False
     DP_SCHED_ENABLED: bool = False
+    DP_PLACEMENT: str = ""
+    DP_SCHED_BUFFER_THRESHOLD: int = 0
+    DP_SCHED_BUFFER_FLUSH_MS: int = 5000
+    DP_SCHED_BUFFER_IDLE_TRIGGER: bool = True
+    DP_SCHED_BUFFER_QUIET_MS: int = 0
     MLA_XPOSE_N_TILE_SIZE: int = 160
     MIXED_Q_SPLIT: int | None = None
     MIXED_NUM_QUERIES_PER_BLOCK: int | None = None
@@ -784,6 +789,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_GREEDY_TOP_TOKENS": env_bool("TPU_GREEDY_TOP_TOKENS"),
     # Enable TpuDpScheduler.
     "DP_SCHED_ENABLED": lambda: bool(int(os.getenv("DP_SCHED_ENABLED") or "0")),
+    # DP_PLACEMENT=release: the API server's data-parallel router holds new
+    # requests and releases them as a group, one per engine, so the engines
+    # run their prefill steps together (core/dp_placement.py). A group is
+    # released at DP_SCHED_BUFFER_THRESHOLD held requests (0 = the engine
+    # count), when the oldest has waited DP_SCHED_BUFFER_FLUSH_MS, when an
+    # engine is idle (DP_SCHED_BUFFER_IDLE_TRIGGER), or after
+    # DP_SCHED_BUFFER_QUIET_MS without an arrival (0 = off). Unset or empty
+    # leaves vLLM's router unchanged.
+    "DP_PLACEMENT": env_with_choices("DP_PLACEMENT", "", ["", "release"]),
+    "DP_SCHED_BUFFER_THRESHOLD": lambda: int(
+        os.getenv("DP_SCHED_BUFFER_THRESHOLD") or "0"
+    ),
+    "DP_SCHED_BUFFER_FLUSH_MS": lambda: int(
+        os.getenv("DP_SCHED_BUFFER_FLUSH_MS") or "5000"
+    ),
+    "DP_SCHED_BUFFER_IDLE_TRIGGER": env_bool(
+        "DP_SCHED_BUFFER_IDLE_TRIGGER", default=True
+    ),
+    "DP_SCHED_BUFFER_QUIET_MS": lambda: int(
+        os.getenv("DP_SCHED_BUFFER_QUIET_MS") or "0"
+    ),
     # Tile size for MLA transpose pipeline.
     "MLA_XPOSE_N_TILE_SIZE": lambda: int(os.getenv("MLA_XPOSE_N_TILE_SIZE", "160")),
     "MIXED_Q_SPLIT": env_optional_int("MIXED_Q_SPLIT"),

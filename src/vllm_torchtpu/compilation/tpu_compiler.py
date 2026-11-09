@@ -150,6 +150,11 @@ _TPU_COMPILE_ENV_IGNORED = {
     # Startup, diagnostics, and orchestration only; these do not affect the
     # compiled model or custom-kernel lowering.
     "DP_SCHED_ENABLED",
+    "DP_PLACEMENT",
+    "DP_SCHED_BUFFER_THRESHOLD",
+    "DP_SCHED_BUFFER_FLUSH_MS",
+    "DP_SCHED_BUFFER_IDLE_TRIGGER",
+    "DP_SCHED_BUFFER_QUIET_MS",
     "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS",
     "VLLM_TPU_SRPT_ATTN_WORK_CAP",
     "VLLM_TPU_SRPT_ATTN_TILE_TOKENS",
