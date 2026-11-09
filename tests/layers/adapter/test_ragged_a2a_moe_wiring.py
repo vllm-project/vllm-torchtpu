@@ -223,3 +223,35 @@ def test_op_never_skips_routes_by_weight(monkeypatch):
         activation="silu",
     )
     assert built == [False, False]
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("routing_dma", [False, True])
+def test_routing_dma_knob_reaches_the_exchange(monkeypatch, routing_dma):
+    monkeypatch.setattr(vllm.config, "get_current_vllm_config_or_none", lambda: None)
+    monkeypatch.setattr(
+        ragged_a2a, "get_dp_tp_mesh", lambda: SimpleNamespace(shape={"dp": 16, "tp": 4})
+    )
+    monkeypatch.setattr(ragged_a2a, "_OPS", {})
+    monkeypatch.setattr(ragged_a2a, "_routed_rows_per_decode_step", lambda topk: 0)
+    seen = {}
+
+    def _ragged_a2a_moe(*args, **kwargs):
+        seen.update(kwargs)
+
+    monkeypatch.setattr(ragged_a2a, "ragged_a2a_moe", _ragged_a2a_moe)
+
+    class _Op:
+        def register_fake(self, fn):
+            pass
+
+    def _jax_op(name, fn, **kwargs):
+        fn(*([None] * 8))
+        return _Op()
+
+    monkeypatch.setattr(ragged_a2a.pallas, "jax_op", _jax_op)
+    monkeypatch.setattr(envs, "TPU_MOE_A2A_ROUTING_DMA", routing_dma, raising=False)
+    ragged_a2a._get_op(
+        topk=10, activation="silu", rhs_quant_dtype=None, skip_padded_tokens=False
+    )
+    assert seen["routing_dma"] is routing_dma
