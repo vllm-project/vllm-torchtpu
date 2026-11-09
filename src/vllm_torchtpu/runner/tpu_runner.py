@@ -6129,11 +6129,13 @@ class TPUModelRunner(GPUModelRunner):
                         )
                         # The fused head's int32 [rows] IDs; the row selection
                         # and validation compile as one program.
+                        # Match runtime's distinct inputs to avoid an alias guard.
+                        head_token_ids = torch.zeros_like(draft_token_ids)
                         synchronize_tensors(
                             self.rejection_sampler.greedy_from_head_ids(
                                 draft_token_ids=draft_token_ids,
                                 num_draft_tokens=draft_lengths,
-                                head_token_ids=draft_token_ids,
+                                head_token_ids=head_token_ids,
                                 bonus_indices=bonus_logits_indices,
                                 target_indices=target_logits_indices,
                                 segment_ids=segment_ids,

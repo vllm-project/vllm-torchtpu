@@ -1462,11 +1462,11 @@ def initialize_cache_ops():
 
 
 def _shares_word_owner(caches) -> bool:
-    """True if every cache is an int32 word-row view of one physical owner."""
+    """One word-row owner with disjoint layer regions in each physical page."""
     first = caches[0]
     if not all(isinstance(c, PagedCacheRows) for c in caches):
         return False
-    return all(
+    if not all(
         not c.native_swa
         and c.dtype != torch.uint8
         and c.raw.device.type != "cpu"
@@ -1474,16 +1474,22 @@ def _shares_word_owner(caches) -> bool:
         and c.raw_hi is first.raw_hi
         and c.dtype == first.dtype
         and c.row_bytes == first.row_bytes
+        and c.page_stride == first.page_stride
+        and c.shape[1] == first.shape[1]
+        and 0 <= c.row_offset < c.row_offset + c.shape[1] <= c.page_stride
         for c in caches
-    )
+    ):
+        return False
+    regions = sorted((c.row_offset, c.row_offset + c.shape[1]) for c in caches)
+    return all(left[1] <= right[0] for left, right in zip(regions, regions[1:]))
 
 
 def write_cache_layers(caches, slots, values, valid):
     """``write_cache`` for several layers; one write when they share an owner.
 
     ``caches``, ``slots``, ``values`` and ``valid`` are per layer.
-    Views of one word-row owner differ only in their page offset, so their
-    records are disjoint and one concatenated write publishes every layer
+    Compatible views occupy disjoint regions within each physical page, so
+    one concatenated write publishes every layer
     (one row-write launch instead of one per layer). Anything else falls back
     to a write per layer. Same rows either way.
     """

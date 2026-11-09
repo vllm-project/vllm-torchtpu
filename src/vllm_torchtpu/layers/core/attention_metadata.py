@@ -561,7 +561,8 @@ def stage_block_table_uploads(
     # Incremental staging keeps the packed buffer on device across steps and
     # uploads only changed entries (`block_table_delta.py`). Limited to walks
     # that run the products program, whose outputs are fresh buffers, so the
-    # kept copy is never handed to a consumer that could donate it.
+    # downstream consumers do not receive the kept copy. The delta updater
+    # itself may donate it when TPU_BLOCK_TABLE_DELTA_INPLACE is enabled.
     is_dummy = ctx.position_ids_override is not None
     stager: BlockTableDeltaStager | None = None
     delta_key = None

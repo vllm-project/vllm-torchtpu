@@ -1469,3 +1469,37 @@ def test_prebuild_reads_the_dspark_draft_mark_off_the_layer(marked):
     seen = []
     assert _prebuild(layer, build_op=lambda *a, **kw: seen.append(kw) or "op") == "op"
     assert seen[0]["dspark_draft"] is marked
+
+
+@pytest.mark.parametrize("impl", ["push", "v2"])
+def test_scale_lookup_flag_specializes_op_and_stays_bound(monkeypatch, impl):
+    """An existing op keeps its option when another env selection is built."""
+    from unittest.mock import Mock
+
+    from vllm_torchtpu.kernels.experimental import push_fused_moe
+    from vllm_torchtpu.kernels.fused_moe import v2
+
+    monkeypatch.setattr(bridge, "_OPS", {})
+    built = []
+
+    def build(name, fn, **kwargs):
+        op = Mock()
+        built.append((name, fn, op))
+        return op
+
+    kernel = Mock(side_effect=lambda x, *args, **kwargs: x)
+    monkeypatch.setattr(v2, "fused_ep_moe_v2", kernel)
+    monkeypatch.setattr(push_fused_moe, "fused_ep_moe_push", kernel)
+    monkeypatch.setattr(bridge, "jax_op", build)
+    monkeypatch.setattr(envs, "MOE_FUSED_EP_KERNEL_IMPL", impl)
+    selected = []
+    for enabled in (False, True, False):
+        monkeypatch.setattr(envs, "TPU_MOE_ONEHOT_SCALE_LOOKUP", enabled)
+        selected.append(bridge._build_op(None, 2, True, "silu", None, False))
+    assert selected[0] is selected[2]
+    assert selected[0] is not selected[1]
+    assert len(built) == 2 and built[0][0] != built[1][0]
+    x = jnp.ones((8, 8), dtype=jnp.bfloat16)
+    for enabled, (_, fn, _) in zip((False, True), built, strict=True):
+        fn(x, None, None, None, None, jnp.zeros((8, 4)), jnp.zeros((1, 1), jnp.int32))
+        assert kernel.call_args.kwargs["onehot_scale_lookup"] is enabled

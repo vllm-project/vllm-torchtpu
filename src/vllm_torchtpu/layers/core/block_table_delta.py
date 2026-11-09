@@ -23,11 +23,11 @@ subclass whose row mutators (`append_row` / `add_row` / `clear_row` /
 only writers of the host table: no `vllm_torchtpu` code writes it directly.
 `TPU_VERIFY_INCREMENTAL_BLOCK_TABLE=1` rechecks the whole table every step.
 
-The device tensor is only ever read by `_staged_walk_products_compiled`, whose
-outputs are fresh buffers, so reusing it across steps is safe. On TPU the
-scatter writes the kept buffer in place (`TPU_BLOCK_TABLE_DELTA_INPLACE`, a
-donated input); the runtime holds the write until the previous step's reads
-of the buffer finish. Otherwise the scatter is functional (clone + index_put).
+The products program returns fresh per-group buffers rather than exposing the
+kept tensor to downstream consumers. Delta updates are functional by default
+(clone + index_put). The opt-in TPU_BLOCK_TABLE_DELTA_INPLACE updater donates
+the kept tensor; enabling it requires validating read/write ordering across
+steps on the TPU backend, not just the scatter's numerical result.
 """
 
 from __future__ import annotations

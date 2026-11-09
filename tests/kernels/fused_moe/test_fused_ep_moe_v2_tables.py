@@ -356,12 +356,10 @@ def test_padded_tokens_are_dropped_from_routing_tables(
 
 
 @pytest.mark.parametrize("onehot", [False, True])
-def test_combine_arrivals_isolates_nan_on_unrouted_padded_tokens(monkeypatch, onehot):
+def test_combine_arrivals_isolates_nan_on_unrouted_padded_tokens(onehot):
     """NaN arrival rows stay isolated to padded rows and zero out via row_routes."""
-    from vllm_torchtpu import envs
     from vllm_torchtpu.kernels.fused_moe.v2.layer import _combine_arrivals
 
-    monkeypatch.setattr(envs, "TPU_MOE_ONEHOT_SCALE_LOOKUP", onehot)
     # Use t_local=8 so combine_step_tokens(t_local) is 0 and the XLA epilogue runs
     # on CPU without invoking the Pallas TPU combine kernel.
     t_local, topk, lane_blocks, lanes, tile_m = 8, 4, 2, 128, 128
@@ -393,6 +391,7 @@ def test_combine_arrivals_isolates_nan_on_unrouted_padded_tokens(monkeypatch, on
         jnp.asarray(mirror_pos),
         jnp.asarray(topk_weights),
         jnp.bfloat16,
+        onehot_scale_lookup=onehot,
     )
     out = np.asarray(jnp.where(row_routes, combined, jnp.zeros_like(combined)))
     assert np.isfinite(out).all()
@@ -422,18 +421,17 @@ def test_row_routes_rejects_nan_and_neg_inf_across_all_scoring_fns(scoring_fn):
 
 
 @pytest.mark.parametrize("onehot", [False, True])
+@pytest.mark.parametrize("enable_x64", [False, True])
 @pytest.mark.parametrize("lookups,sublanes", [(720, 264), (32, 4), (7, 1)])
 def test_row_scale_lookup_matches_gather_bit_for_bit(
-    monkeypatch, onehot, lookups, sublanes
+    onehot, enable_x64, lookups, sublanes
 ):
     """The one-hot lookup returns the gather's bits, NaN payloads included,
     and a NaN reaches only the lookups that read it."""
     import jax.numpy as jnp
 
-    from vllm_torchtpu import envs
     from vllm_torchtpu.kernels.fused_moe.v2.layer import _lookup_row_scales
 
-    monkeypatch.setattr(envs, "TPU_MOE_ONEHOT_SCALE_LOOKUP", onehot)
     rng = np.random.default_rng(lookups + sublanes)
     bits = rng.integers(0, 2**32, (sublanes, 128), dtype=np.uint64).astype(np.uint32)
     poison = rng.random(bits.shape) < 0.05
@@ -450,5 +448,11 @@ def test_row_scale_lookup_matches_gather_bit_for_bit(
         scl[::5] = rng.choice(nan_at, len(scl[::5]))
     scl = jnp.asarray(scl)
     expected = np.asarray(table[jnp.right_shift(scl, 7), scl & 127]).view(np.uint32)
-    got = np.asarray(jax.jit(_lookup_row_scales, static_argnums=2)(table, scl, 7))
+
+    lookup = jax.jit(_lookup_row_scales, static_argnames=("shift", "onehot"))
+
+    with jax.enable_x64(enable_x64):
+        lowered = lookup.lower(table, scl, 7, onehot=onehot)
+        assert ("stablehlo.dot_general" in lowered.as_text()) == onehot
+        got = np.asarray(lowered.compile()(table, scl))
     np.testing.assert_array_equal(got.view(np.uint32), expected)

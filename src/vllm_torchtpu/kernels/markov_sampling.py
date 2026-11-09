@@ -178,14 +178,9 @@ def sample_slot(
     base: jax.Array,
     *,
     slot: int,
-    pipelined: bool | None = None,
+    pipelined: bool = True,
 ) -> jax.Array:
-    """``pipelined`` selects `_pipelined_kernel` (default:
-    ``TPU_DSPARK_PIPELINED_MARKOV``); both return identical tokens."""
-    from vllm_torchtpu import envs
-
-    if pipelined is None:
-        pipelined = envs.TPU_DSPARK_PIPELINED_MARKOV
+    """``pipelined`` selects `_pipelined_kernel`; both return identical tokens."""
     assert x.shape == (48, 256) and w.shape == (129280, 256)
     assert base.shape == (240, 129280) and 0 <= slot < 5
     assert x.dtype == w.dtype == base.dtype == jnp.bfloat16

@@ -73,7 +73,7 @@ steps:
             .buildkite/kubernetes/run.sh python -m pytest
             tests/models/vllm/test_dsv41_common_mhc.py
             tests/models/vllm/test_dsv41_common_v1_v2_engram.py
-            -k 'test_aux_mean_preserves_tpu_reduction_order or test_ready_rows_packed_scales_match_tpu_and_cpu'
+            -k 'test_aux_mean_preserves_tpu_reduction_order or test_ready_rows_packed_scales_match_tpu_and_cpu or test_flat_collapse'
             -q --junitxml=perf_eval_results/dsv41-layout-parity.xml
 
       - label: "DeepSeek-V4.1 greedy head: CPU reference and rejection parity"
@@ -87,6 +87,7 @@ steps:
           - >-
             .buildkite/kubernetes/run.sh python -m pytest
             tests/kernels/test_fused_greedy_head.py
+            tests/kernels/test_markov_sampling.py
             tests/spec_decode/test_rejection_sampler.py
             --use-tpu -q --junitxml=perf_eval_results/dsv41-greedy-head.xml
 
@@ -180,6 +181,13 @@ steps:
             tests/models/vllm/test_dsv41_v2_local_q.py
             tests/models/vllm/test_dsv41_v2_prefix_replay.py
             tests/layers/adapter/test_fused_moe_ep.py
+            tests/kernels/fused_moe/test_fused_ep_moe_v2_tables.py
+            tests/runner/test_rejection_sampler_warmup.py
+            tests/models/vllm/test_dsv41_merged_cache_writes.py
+            tests/models/vllm/test_dsv41_dspark_sampling.py
+            tests/models/vllm/test_dsv41_v2_dspark.py::test_context_kv_addresses_derived_once_per_cache_group
+            tests/layers/core/test_block_table_delta.py::test_apply_block_table_delta_cpu_and_tpu_dispatch
+            tests/kernels/deepseek_v41/test_cache_write_rows.py::test_banked_row_writes_reject_empty_owners_before_device_query
             tests/kernels/test_dsv41_decode_tuning.py
             tests/kernels/test_decode_preparation.py
             tests/kernels/test_decode_bridge.py

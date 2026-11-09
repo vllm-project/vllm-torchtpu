@@ -141,3 +141,21 @@ def test_banked_row_writes_reject_incompatible_shapes():
     )
     np.testing.assert_array_equal(lo, 0)
     np.testing.assert_array_equal(hi, 0)
+
+
+@pytest.mark.parametrize("lo_rows,hi_rows", [(0, 8), (8, 0), (0, 0)])
+@pytest.mark.parametrize("count", [0, 1])
+def test_banked_row_writes_reject_empty_owners_before_device_query(
+    monkeypatch, lo_rows, hi_rows, count
+):
+    def unexpected_device_query():
+        pytest.fail("Empty owners must fail before inspecting TPU hardware")
+
+    monkeypatch.setattr(pltpu, "get_tpu_info", unexpected_device_query)
+    with pytest.raises(ValueError, match="non-empty owners"):
+        write_cache_rows_banked(
+            jnp.zeros((lo_rows, 128), jnp.int32),
+            jnp.zeros((hi_rows, 128), jnp.int32),
+            jnp.zeros(count, jnp.int32),
+            jnp.zeros((count, 128), jnp.int32),
+        )

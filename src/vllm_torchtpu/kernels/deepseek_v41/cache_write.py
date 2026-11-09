@@ -358,6 +358,8 @@ def write_cache_rows_banked(
     for cache in (cache_lo, cache_hi):
         if cache.ndim != 2 or cache.shape[1] != 128 or cache.dtype != jnp.int32:
             raise ValueError("Row writes require INT32 [rows,128] owners and words")
+        if cache.shape[0] == 0:
+            raise ValueError("Banked row writes require non-empty owners")
     if (
         rows.ndim != 1
         or rows.dtype != jnp.int32

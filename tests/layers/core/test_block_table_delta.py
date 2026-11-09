@@ -9,6 +9,7 @@ chunk offsets, drafter subsets and dummy runs.
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -335,20 +336,24 @@ def test_apply_block_table_delta_cpu_and_tpu_dispatch(monkeypatch):
     assert out.tolist() == [0, 10, 2, 3, 40, 5]
     assert staged.tolist() == list(range(6))  # functional
 
-    calls = []
-
-    def fake_compiled(s, u):
-        calls.append((s, u))
-        return s
-
-    monkeypatch.setattr(btd, "_apply_block_table_delta_compiled", fake_compiled)
-    monkeypatch.setattr(btd, "_apply_block_table_delta_donated_compiled", fake_compiled)
-    monkeypatch.setattr(btd, "_get_donated_delta_op", lambda: None)
+    functional = Mock(return_value=object())
+    donated = Mock(return_value=object())
+    initialize_donated = Mock()
+    monkeypatch.setattr(btd, "_apply_block_table_delta_compiled", functional)
+    monkeypatch.setattr(btd, "_apply_block_table_delta_donated_compiled", donated)
+    monkeypatch.setattr(btd, "_get_donated_delta_op", initialize_donated)
     tpu_like = SimpleNamespace(device=SimpleNamespace(type="tpu"))
-    for inplace in (False, True):
-        monkeypatch.setattr(btd.envs, "TPU_BLOCK_TABLE_DELTA_INPLACE", inplace)
-        assert btd.apply_block_table_delta(tpu_like, update) is tpu_like
-    assert len(calls) == 2
+    monkeypatch.setattr(btd.envs, "TPU_BLOCK_TABLE_DELTA_INPLACE", False)
+    assert btd.apply_block_table_delta(tpu_like, update) is functional.return_value
+    functional.assert_called_once_with(tpu_like, update)
+    donated.assert_not_called()
+    initialize_donated.assert_not_called()
+
+    monkeypatch.setattr(btd.envs, "TPU_BLOCK_TABLE_DELTA_INPLACE", True)
+    assert btd.apply_block_table_delta(tpu_like, update) is donated.return_value
+    donated.assert_called_once_with(tpu_like, update)
+    initialize_donated.assert_called_once_with()
+    functional.assert_called_once_with(tpu_like, update)
 
 
 def test_donated_delta_matches_functional():
