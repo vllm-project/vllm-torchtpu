@@ -3343,7 +3343,7 @@ def _attention_kernel(
     ### ------- Kernel end ------- ###
 
 
-# TPU_DCP_MLA_PIECE_ORDER values (see `out_pieces_order`).
+# `out_pieces_order` values; TPU_DCP_MLA_PIECE_ORDER_EDGE picks "edge".
 PIECE_ORDERS = ("barrier", "edge", "small_barrier", "none")
 
 

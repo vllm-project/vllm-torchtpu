@@ -1857,7 +1857,7 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
         (2048, 2, True),
     )
     def test_merge_pieces_order_bit_identical(self, query_tokens, pieces, gather_first):
-        """TPU_DCP_MLA_PIECE_ORDER only changes the schedule: every order's
+        """TPU_DCP_MLA_PIECE_ORDER_EDGE only changes the schedule: every order's
         outputs and lse equal the default ("barrier") bit for bit."""
         if jax.devices()[0].platform != "tpu":
             self.skipTest("SparseCore cache-layout attention requires a TPU")
@@ -2057,7 +2057,7 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
 
 
 class MergePiecesOrderTest(parameterized.TestCase):
-    """TPU_DCP_MLA_PIECE_ORDER pieces that need no TPU."""
+    """TPU_DCP_MLA_PIECE_ORDER_EDGE pieces that need no TPU."""
 
     def test_rejects_unknown_order(self):
         z = jnp.zeros((16, 8, HEAD_DIM), jnp.bfloat16)
@@ -2080,10 +2080,10 @@ class MergePiecesOrderTest(parameterized.TestCase):
         from vllm_torchtpu import envs
 
         with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("TPU_DCP_MLA_PIECE_ORDER", None)
-            self.assertEqual(envs.TPU_DCP_MLA_PIECE_ORDER, "barrier")
-        with mock.patch.dict(os.environ, {"TPU_DCP_MLA_PIECE_ORDER": "edge"}):
-            self.assertEqual(envs.TPU_DCP_MLA_PIECE_ORDER, "edge")
+            os.environ.pop("TPU_DCP_MLA_PIECE_ORDER_EDGE", None)
+            self.assertFalse(envs.TPU_DCP_MLA_PIECE_ORDER_EDGE)
+        with mock.patch.dict(os.environ, {"TPU_DCP_MLA_PIECE_ORDER_EDGE": "1"}):
+            self.assertTrue(envs.TPU_DCP_MLA_PIECE_ORDER_EDGE)
         for order in sparse_mla.PIECE_ORDERS:
             self.assertIn(order, ("barrier", "edge", "small_barrier", "none"))
         self.assertEqual(sparse_mla.PIECE_ORDERS[0], "barrier")

@@ -1587,7 +1587,7 @@ def sparse_mla_attention_dcp(
             decode_body_levers=_decode_body_levers(envs.TPU_MLA_DECODE_BODY_LEVERS),
             out_pieces=merge_pieces,
             out_pieces_gather_first=envs.TPU_DCP_MLA_MERGE_PIECES >= 3,
-            out_pieces_order=envs.TPU_DCP_MLA_PIECE_ORDER,
+            out_pieces_order="edge" if envs.TPU_DCP_MLA_PIECE_ORDER_EDGE else "barrier",
             **chunk_kwargs,
             **split_kwargs,
             **packed_rope_kwargs,
