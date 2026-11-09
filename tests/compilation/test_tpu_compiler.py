@@ -89,6 +89,28 @@ class TestTpuCompilerCache:
 
         assert unprofiled == phased
 
+    def test_tpu_hash_ignores_prefill_eplb_but_covers_dynamic_eplb(self):
+        from vllm_torchtpu.compilation.tpu_compiler import compute_tpu_compilation_hash
+
+        with patch(
+            "vllm_torchtpu.compilation.tpu_compiler._iter_runtime_cache_key_files",
+            return_value=[],
+        ):
+            hashes = {}
+            for dynamic in ("0", "1"):
+                for prefill in ("0", "1"):
+                    with patch.dict(
+                        os.environ,
+                        TPU_MOE_EPLB_DYNAMIC=dynamic,
+                        TPU_MOE_EPLB_PREFILL=prefill,
+                    ):
+                        hashes[dynamic, prefill] = compute_tpu_compilation_hash(
+                            self._config()
+                        )
+        assert hashes["0", "0"] == hashes["0", "1"]
+        assert hashes["1", "0"] == hashes["1", "1"]
+        assert hashes["0", "0"] != hashes["1", "0"]
+
     def test_tpu_hash_covers_native_compile_env(self):
         from vllm_torchtpu.compilation.tpu_compiler import compute_tpu_compilation_hash
 

@@ -838,6 +838,7 @@ def _build_fused_ep_moe_kernel(
     interleave_inputs = (
         rhs_packed4
         and layout_rows is not None
+        and all(height % layout_rows == 0 for height in height_rungs)
         and host.TOKEN_GATHER_TILES_PER_WINDOW == 1
     )
     input_slots = 3 if interleave_inputs else OUT_PARITIES

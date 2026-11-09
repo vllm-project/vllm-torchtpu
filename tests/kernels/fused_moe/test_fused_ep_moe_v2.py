@@ -40,6 +40,7 @@ from jax import lax
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.fused_moe.v2 import (
     AXIS,
     WeightFormat,
@@ -1288,10 +1289,27 @@ def test_expert_load_counts_the_rows_per_physical_slot():
     np.testing.assert_array_equal(np.asarray(updated), expected)
 
 
-@pytest.mark.parametrize("tokens", [8, 264, 16384])
-def test_input3_cache32_tracks_dense_reference(tokens):
+@pytest.mark.parametrize(
+    "tokens,height_rungs,use_input3",
+    [(8, 0, True), (264, 0, True), (16384, 0, True), (8, 8, False), (264, 16, False)],
+)
+def test_input3_cache32_tracks_dense_reference(
+    monkeypatch, tokens, height_rungs, use_input3
+):
     """Exercise empty experts, short rungs and repeated three-slot wraparound."""
     mesh = _mesh()
+    if kernel.pltpu.get_tpu_info().chip_version != kernel.pltpu.ChipVersion.TPU_7X:
+        pytest.skip("the input3/cache32 tuning entry targets TPU7x")
+    monkeypatch.setattr(envs, "MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE", height_rungs)
+    kernel._BUILD_CACHE.clear()
+    names = []
+    pallas_call = kernel.pl.pallas_call
+
+    def record_call(*args, **kwargs):
+        names.append(kwargs.get("name", ""))
+        return pallas_call(*args, **kwargs)
+
+    monkeypatch.setattr(kernel.pl, "pallas_call", record_call)
     weights, scales, decoded = _make_fp4_weights(
         mesh, 142, hidden=5120, inter=2560, e_total=8, rhs_qb=512
     )
@@ -1309,6 +1327,9 @@ def test_input3_cache32_tracks_dense_reference(tokens):
         rhs_qb=512,
         sharded_plan=True,
     )
+    routed_names = [name for name in names if name.startswith("fused_ep_moe_v2")]
+    assert routed_names, "the test must construct the routed Pallas kernel"
+    assert all(("_i3_lhscache32" in name) == use_input3 for name in routed_names)
     ref = _dense_reference(mesh, x, *decoded, None, None, gating, topk=1)
     error = _relative_l2(out, ref)
     worst = _worst_token_relative_l2(out, ref)
