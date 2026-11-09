@@ -1116,11 +1116,15 @@ class TpuPlatform(Platform):
         parallel_config = vllm_config.parallel_config
         # Resolve only the default. ``ParallelConfig.worker_cls`` is "auto"
         # unless a caller already chose a worker: ``--worker-cls`` on the CLI,
-        # or vllm-omni, which resolves each stage to
-        # ``get_omni_ar_worker_cls()`` / ``get_omni_generation_worker_cls()``
-        # before this hook runs. Overwriting unconditionally threw that choice
-        # away, so Omni AR stages silently ran on the plain TPUWorker. This is
-        # the same idiom upstream vLLM uses in its cuda/rocm/xpu/cpu platforms.
+        # or vllm-omni, which resolves each stage via ``resolve_worker_cls``
+        # (``stage_init_utils.py``) to ``get_omni_ar_worker_cls()`` /
+        # ``get_omni_generation_worker_cls()`` before this hook runs (at the
+        # pinned vllm-omni 0.32.0rc1, no stage config under
+        # ``vllm_omni/model_executor/stage_configs/`` hard-codes a GPU
+        # ``worker_cls``; stages specify ``worker_type: ar`` or ``generation``).
+        # Overwriting unconditionally threw that choice away, so Omni AR stages
+        # silently ran on the plain TPUWorker. This is the same idiom upstream
+        # vLLM uses in its cuda/rocm/xpu/cpu platforms.
         if parallel_config.worker_cls == "auto":
             parallel_config.worker_cls = "vllm_torchtpu.worker.tpu_worker.TPUWorker"
 

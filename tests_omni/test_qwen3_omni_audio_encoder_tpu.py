@@ -62,6 +62,9 @@ from vllm.model_executor.layers.attention.mm_encoder_attention import (
     MMEncoderAttention,
 )
 from vllm.model_executor.layers.linear import LinearBase
+from vllm.model_executor.models.qwen3_omni_moe_thinker import (
+    Qwen3OmniMoeAudioEncoder as VllmQwen3OmniMoeAudioEncoder,
+)
 from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
     Qwen3OmniMoeAudioEncoder,
 )
@@ -281,14 +284,15 @@ def encoders(
     # first so the class is restored for the test modules that run after this
     # one in the same process.
     with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(
-            Qwen3OmniMoeAudioEncoder, "forward", Qwen3OmniMoeAudioEncoder.forward
-        )
-        mp.setattr(
-            Qwen3OmniMoeAudioEncoder,
-            "_get_cnn_output_lengths",
-            Qwen3OmniMoeAudioEncoder._get_cnn_output_lengths,
-        )
+        for cls in (VllmQwen3OmniMoeAudioEncoder, Qwen3OmniMoeAudioEncoder):
+            mp.setattr(cls, "forward", cls.forward)
+            mp.setattr(cls, "_get_cnn_output_lengths", cls._get_cnn_output_lengths)
+            mp.setattr(
+                cls,
+                "_tpu_orig_get_cnn_output_lengths",
+                getattr(cls, "_tpu_orig_get_cnn_output_lengths", None),
+                raising=False,
+            )
         # The registry callback with a thinker-stage config: the same path
         # TPUWorker.load_model() takes in production. Idempotent.
         assert maybe_patch_qwen3_omni_thinker(_thinker_model_config()) is True
