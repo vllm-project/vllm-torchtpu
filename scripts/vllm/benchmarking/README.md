@@ -204,7 +204,7 @@ entry of that config, writing `<results-dir>/decode/sweep.md`:
 ### DP8 cached-extend and DP16 steady DSpark decode CI
 
 The `epic/dsv41` lane runs the audited recipes from
-[`server_steps`](../../dsv41_bench/server_steps/README.md), using TP1, EP,
+[`server_steps`](https://github.com/vllm-project/vllm-torchtpu/blob/epic/dsv41/scripts/dsv41_bench/server_steps/README.md), using TP1, EP,
 FP8 KV, CED, Engram CPU offload and DSpark K5:
 
 - Cached extend: DP8, C8, 98,304 cached prefix tokens plus 16,384 new input tokens,

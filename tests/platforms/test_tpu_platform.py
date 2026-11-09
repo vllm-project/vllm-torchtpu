@@ -1614,3 +1614,11 @@ def test_a_bad_peer_wait_fails_at_startup(monkeypatch, wait):
     monkeypatch.setenv("TPU_PRECOMPILE_PEER_WAIT_S", wait)
     with pytest.raises(ValueError, match="TPU_PRECOMPILE_PEER_WAIT_S"):
         _validate_peer_replay_config()
+
+
+def test_engram_peer_tables_stay_off_on_tpu():
+    """vLLM's Engram asks the platform whether the DP group can map peer HBM;
+    TPU cannot, so the DP-collective lookup is kept."""
+    from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+
+    assert TpuPlatform.is_fully_connected([0, 1, 2, 3]) is False

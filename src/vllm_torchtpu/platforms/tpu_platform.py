@@ -744,6 +744,13 @@ class TpuPlatform(Platform):
         return hardware.get_tpu_device_name()
 
     @classmethod
+    def is_fully_connected(cls, physical_device_ids: list[int]) -> bool:
+        # vLLM's GPU Engram table maps peers' HBM over NVLink when the DP group
+        # is fully connected. TPU has no such peer mapping, so Engram keeps the
+        # DP-collective lookup.
+        return False
+
+    @classmethod
     def fp8_dtype(cls) -> torch.dtype:
         if cls.get_device_name().lower() == "tpu v6e":
             logger.info("Automatically using fp8_e5m2 for FP8 KV cache on TPU v6e.")

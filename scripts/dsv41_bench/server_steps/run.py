@@ -314,7 +314,7 @@ def main() -> None:
         "packages": manifest["packages"],
         "torchtpu": source_identity(
             here.parents[2],
-            "vllm-torchtpu",
+            "vllm-torchtpu-core",
             build_commit=env.get("BUILDKITE_COMMIT"),
         ),
         "vllm": source_identity(Path(vllm.__file__).resolve().parent, "vllm"),

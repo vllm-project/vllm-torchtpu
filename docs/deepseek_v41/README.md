@@ -94,7 +94,7 @@ The host-placement choice does not change the checkpoint's numeric format.
 - `scripts/dsv41_bench/serve_cached_prefill.sh`: TP1/DP8, CED, CPU Engram,
   fused EP W4A8 and DSpark K5. Trailing serve arguments can override scheduler
   limits or compilation buckets.
-- [server steps](../../scripts/dsv41_bench/server_steps/README.md): frozen-input
+- [server steps](https://github.com/vllm-project/vllm-torchtpu/blob/epic/dsv41/scripts/dsv41_bench/server_steps/README.md): frozen-input
   cached extend and steady decode; formal measurements exclude profiling.
 - `scripts/vllm/benchmarking/configs/deepseek-v41-flash-dp8-ep.sh`: DP8 full
   forward smoke and GSM8K. The accuracy floor is inherited from the previous
