@@ -1864,3 +1864,18 @@ class GDNAttentionTest(parameterized.TestCase):
                     np.testing.assert_allclose(
                         rec_out[slot], rec_ref[slot], rtol=3e-2, atol=3e-2
                     )
+
+
+@pytest.mark.parametrize(
+    ("num_v_heads", "expected"),
+    [(8, 16), (16, 8), (24, 4), (32, 4), (40, 2), (48, 2), (64, 2), (96, 2)],
+)
+def test_gdn_triangular_block_size_is_a_power_of_two(num_v_heads, expected):
+    # 3 head groups (e.g. 24 value heads per rank) gave 16 // 3 = 5 and 5 head
+    # groups gave 3; neither divides the chunk.
+    from types import SimpleNamespace
+
+    from vllm_torchtpu.kernels.gdn.v3.config import GDNConfig
+
+    cfg = SimpleNamespace(num_v_heads=num_v_heads, is_kda=False)
+    assert GDNConfig.triangular_block_size.fget(cfg) == expected
