@@ -391,14 +391,18 @@ def generate_mask(
     bq_start: int,
     step_meta: ComputeMetadata,
     cfgs: configs.RpaConfigs,
-) -> jax.Array:
-    """Generates causal, sliding window, and attention scope mask for QK computation."""
+) -> list[jax.Array]:
+    """Generates the per-batch-lane QK masks.
+
+    Causal attention combines the causal, sliding-window and attention-scope
+    masks. Non-causal attention bounds keys by the sequence's KV length only.
+    """
     b, k_heads, tq, s = shape
 
     kv_iota = lax.broadcasted_iota(jnp.int32, (k_heads, tq, s), 2)
     if not cfgs.model.causal:
         # Every query sees its sequence's whole KV range. Sliding window and
-        # attention scopes are rejected for non-causal in `validate_inputs`.
+        # attention scopes are rejected for non-causal in `validate_non_causal`.
         assert step_meta.kv_len_in_tile is not None
         return [kv_iota < step_meta.kv_len_in_tile[b_idx] for b_idx in range(b)]
 

@@ -417,11 +417,6 @@
     },
     {
       "path": "src/vllm_torchtpu/kernels/experimental/batched_rpa/kernel.py",
-      "name": "bad-return",
-      "concise_description": "Returned type `list[Array]` is not assignable to declared return type `Array`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/batched_rpa/kernel.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `Ref` has no attribute `bitcast`"
     },

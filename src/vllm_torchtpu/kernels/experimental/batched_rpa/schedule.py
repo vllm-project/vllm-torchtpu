@@ -469,10 +469,10 @@ def _compute_waits(
 
 def get_end_k_idx(
     *,
-    q_offset: jax.typing.ArrayLike,
-    q_idx: jax.typing.ArrayLike,
-    q_sz_task: jax.typing.ArrayLike,
-    num_k: jax.typing.ArrayLike,
+    q_offset: jax.Array | int,
+    q_idx: jax.Array | int,
+    q_sz_task: jax.Array | int,
+    num_k: jax.Array | int,
     cfgs: configs.RpaConfigs,
 ) -> jax.Array:
     """Returns one past the last KV block a Q block attends to.
