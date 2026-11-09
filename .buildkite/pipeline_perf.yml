@@ -44,9 +44,6 @@ x-perf-step-defaults: &perf_step
 # chips, the queue names cores, so the two numbers differ for one shape.
 x-shape-8-core: &shape_8_core "tpu7x-standard-4t/2x2x1"
 x-shape-2-core: &shape_2_core "tpu7x-standard-1t/1x1x1"
-# Multi-host slice. run_multihost.sh takes --topology for placement; SHAPE on
-# that step only tells the ci.vllm.ai publish how many chips the slice has.
-x-shape-16-core: &shape_16_core "tpu7x-standard-4t/2x2x2"
 
 steps:
   - group: "Perf and Eval on TPU"
@@ -227,7 +224,6 @@ steps:
           queue: "kube"
         env:
           UPLOAD_TO_VLLM_CI: "1"
-          SHAPE: *shape_16_core
           TPU_ACCELERATOR_TYPE: "tpu7x"
           VLLM_ENGINE_READY_TIMEOUT_S: "14400"
           BENCHMARK_WARMUP_RUNS: "1"

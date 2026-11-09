@@ -208,7 +208,10 @@ Results are saved to `benchmark_runs/` (gitignored). Each run creates a director
 [ci.vllm.ai](https://ci.vllm.ai/perf), next to the GPU runs of the same model.
 A perf step opts in with `UPLOAD_TO_VLLM_CI: "1"` in its `env`;
 `run_eval_flow.sh` then publishes that step's own results after the database
-upload, and skips it on PRs and non-main branches like that upload. `--dry-run`
+upload, and skips it on PRs and non-main branches like that upload. The chip
+and host counts come from the TPU pod's GKE environment (`TPU_TOPOLOGY`,
+`TPU_HOST_BOUNDS`), so multi-host steps need no extra setting and their rows
+are marked multi-node. `--chips`/`--hosts` override that off GKE. `--dry-run`
 prints the rows without posting them.
 
 ## Environment Variables
