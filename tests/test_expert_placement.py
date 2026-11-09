@@ -26,7 +26,7 @@ pytestmark = pytest.mark.cpu_test
 @pytest.fixture(autouse=True)
 def _fresh(monkeypatch):
     monkeypatch.setattr(expert_placement, "_LAYER_MODULES", {})
-    monkeypatch.setattr(expert_placement, "_GROUP", None)
+    monkeypatch.setattr(expert_placement, "_GROUPS", {})
     yield
 
 
@@ -262,15 +262,34 @@ def test_mover_parts_supports_fp8_and_compressed_tensors_moe_layouts():
     ]
 
 
-def test_drafter_layers_are_left_unplaced_by_default(dynamic_enabled, monkeypatch):
+def test_drafter_layers_join_their_own_dynamic_group(dynamic_enabled, monkeypatch):
+    """The drafter's MoE layers are re-laid like the target's, in a group of
+    their own: its own experts, blind default and staging slots."""
     import vllm.config
 
+    target = _fake_layer("model.layers.3.ffn.experts", 1, experts=8)
+    assert expert_placement.apply_to_layer(target)
     runner = SimpleNamespace(
         model_config=SimpleNamespace(
             runner_type="draft", hf_config=SimpleNamespace(num_hidden_layers=6)
         )
     )
     monkeypatch.setattr(vllm.config, "get_current_vllm_config", lambda: runner)
-    assert not expert_placement.apply_to_layer(
-        _fake_layer("model.layers.6.ffn.experts", 1, experts=4)
-    )
+    # A 6-layer target: the drafter's module `model.layers.6` is draft layer 0.
+    layer = _fake_layer("model.layers.6.ffn.experts", 1, experts=4)
+    assert expert_placement.apply_to_layer(layer)
+    assert expert_placement.layout_key(layer) == ("draft", 0)
+    # Rank 1 holds [2, 3] + rank 0's first expert (0), plus 2 staging slots.
+    assert layer._expert_map.tolist() == [2, -1, 0, 1]
+    assert layer.local_num_experts == 5
+    assert expert_placement.physical_experts(layer) == 10
+    assert expert_placement.physical_experts(target) == 14
+    placement = expert_placement.current()
+    assert placement.target.experts == 8 and placement.draft.experts == 4
+    assert placement.group("draft") is expert_placement.dynamic_group("draft")
+    assert expert_placement.fetch_filter_ids(
+        "mtp.0.ffn.experts.0.w1.weight", 1
+    ) == frozenset({2, 3, 0})
+    assert expert_placement.fetch_filter_ids(
+        "layers.3.ffn.experts.0.w1.weight", 1
+    ) == frozenset({4, 5, 6, 7, 0})

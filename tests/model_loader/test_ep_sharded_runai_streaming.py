@@ -592,7 +592,7 @@ def test_fetch_filter_follows_the_layout_for_placed_layers(monkeypatch):
         staging=2,
         replica_cap=2,
     )
-    monkeypatch.setattr(expert_placement, "_GROUP", group)
+    monkeypatch.setattr(expert_placement, "_GROUPS", {"target": group})
     monkeypatch.setattr(model_loader_patches, "_ep_rank", lambda: 1)
     linear = {4, 5, 6, 7}
     target = "model.layers.3.ffn.experts.{}.w1.weight"
@@ -610,7 +610,7 @@ def test_fetch_filter_follows_the_layout_for_placed_layers(monkeypatch):
 def test_fetch_filter_is_the_linear_one_until_a_layer_applies(monkeypatch):
     from vllm_torchtpu import expert_placement
 
-    monkeypatch.setattr(expert_placement, "_GROUP", None)
+    monkeypatch.setattr(expert_placement, "_GROUPS", {})
     name = "model.layers.3.ffn.experts.{}.w1.weight"
     assert _should_skip(name.format(5), _LOCAL)
     assert not _should_skip(name.format(27), _LOCAL)
@@ -622,7 +622,7 @@ def test_fetch_filter_follows_a_static_layout_for_placed_layers(monkeypatch):
     drafter group included; unlisted layers keep the linear set."""
     from vllm_torchtpu import expert_placement, model_loader_patches
 
-    monkeypatch.setattr(expert_placement, "_GROUP", None)
+    monkeypatch.setattr(expert_placement, "_GROUPS", {})
     monkeypatch.setattr(
         expert_placement, "_APPLIED_LAYERS", {("target", 3), ("draft", 1)}
     )
