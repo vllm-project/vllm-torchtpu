@@ -280,6 +280,7 @@ def _pallas_rpa_kernel_impl(
     use_causal_mask: bool = True,
     kv_layout: batched_rpa_configs.KVLayout | None = None,
     block_major: bool = False,
+    hd64_rpa_func: Callable[..., Any] | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     pool_shape = kv_cache.shape
     # Fold the block-major pool's `(num_blocks, rows_per_block, *page)` layout so
@@ -349,6 +350,7 @@ def _pallas_rpa_kernel_impl(
         kv_block_cap=kv_block_cap,
         use_causal_mask=use_causal_mask,
         kv_layout=kv_layout,
+        hd64_rpa_func=hd64_rpa_func,
     )
     if len(pool_shape) == 4:
         # A 4-D pool is never block-major, so the ndim == 4 branch set this.

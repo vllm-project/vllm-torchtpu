@@ -198,3 +198,47 @@ def get_stage_mesh(
             f"ranks={tuple(group.ranks)}."
         )
     return mesh
+
+
+_TP_MESH_CACHE: dict[tuple[str, tuple[int, ...]], Any] = {}
+
+
+def get_or_create_tp_mesh(axis_name: str, group: Any | None) -> Any:
+    """Build a one-axis JAX mesh ordered by `group`'s TPU device layout."""
+    import jax
+    import numpy as np
+    from jax.sharding import Mesh
+
+    layout = get_cp_group_layout(group)
+    cache_key = (axis_name, layout.device_ids)
+    cached = _TP_MESH_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    import torch.distributed as dist
+
+    world_size = int(dist.get_world_size())
+    if layout.world_size != world_size:
+        raise NotImplementedError(
+            f"The TP group spans {layout.world_size} devices inside a "
+            f"torch.distributed world of {world_size}. torch_tpu Pallas meshes "
+            "must span the whole world, so the fixed-order TP collectives "
+            "support only data, pipeline and prefill-context parallel size 1."
+        )
+
+    devices_by_id = {int(device.id): device for device in jax.devices()}
+    missing = [
+        device_id for device_id in layout.device_ids if device_id not in devices_by_id
+    ]
+    if missing:
+        from torch_tpu._internal.pallas import get_pallas_mesh
+
+        ranked = get_pallas_mesh(axis_names=(axis_name,))
+        devices_by_id = {int(d.id): d for d in ranked.devices.flat}
+
+    mesh_devices = np.asarray(
+        [devices_by_id[device_id] for device_id in layout.device_ids]
+    )
+    mesh = Mesh(mesh_devices, axis_names=(axis_name,))
+    _TP_MESH_CACHE[cache_key] = mesh
+    return mesh

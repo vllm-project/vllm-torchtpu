@@ -118,3 +118,12 @@ At startup, `vllm-torchtpu` reports set environment variables that neither vLLM 
 | `TPU_TRACE_MODE` | `"TRACE_COMPUTE"` | SparseCore trace mode (`"TRACE_COMPUTE"`, `"TRACE_COMPUTE_AND_DMA"`, etc.). |
 | `TPU_NUM_SPARSE_CORES_TO_TRACE` | `1` | Number of SparseCores to trace when SparseCore tracing is active. |
 | `TPU_KERNEL_ITER_MODE` | `False` | Enables fast Pallas kernel hot-reloading without restarting the vLLM server (`TPU_KERNEL_RELOAD_MODULES`). |
+
+---
+
+## 7. Muse Spark Open Execution
+
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `VLLM_TPU_MUSE_BATCH_INVARIANT` | `True` | Enables batch-invariant Pallas matmul tiling, RMS normalization, and fixed-order TP reductions (`False` uses standard XLA ops). |
+| `VLLM_TPU_MUSE_MOE_IMPL` | `"fused"` | Selects Muse Spark MoE backend (`"fused"` or `"eager"`). |

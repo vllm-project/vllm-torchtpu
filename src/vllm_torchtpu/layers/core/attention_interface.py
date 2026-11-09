@@ -391,6 +391,7 @@ def sharded_ragged_paged_attention(
     kv_block_cap: int | None = None,
     use_causal_mask: bool = True,
     kv_layout: batched_rpa_configs.KVLayout | None = None,
+    hd64_rpa_func: Callable[..., Any] | None = None,
 ):
     """Shards along KV heads."""
 
@@ -419,9 +420,9 @@ def sharded_ragged_paged_attention(
     args = (q, k, v, kv_cache, kv_lens, page_indices, cu_q_lens, distribution)
 
     if use_hd64:
-        # Batched RPA has no hd64 variant; head_dim==64 always uses default.
+        # Batched RPA has no hd64 variant; head_dim==64 uses hd64_rpa_func or default.
         func = functools.partial(
-            ragged_paged_attention_hd64, strict_sliding_window=True
+            hd64_rpa_func or ragged_paged_attention_hd64, strict_sliding_window=True
         )
     else:
         func = rpa_func
@@ -643,6 +644,7 @@ def attention(
     kv_block_cap: int | None = None,
     use_causal_mask: bool = True,
     kv_layout: batched_rpa_configs.KVLayout | None = None,
+    hd64_rpa_func: Callable[..., Any] | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     # T: seq_len
     # N: num_heads
@@ -688,6 +690,7 @@ def attention(
         shard=shard,
         kv_block_cap=kv_block_cap,
         use_causal_mask=use_causal_mask,
+        hd64_rpa_func=hd64_rpa_func,
     )
 
     return kv_cache, output

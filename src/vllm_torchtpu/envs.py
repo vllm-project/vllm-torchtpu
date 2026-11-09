@@ -209,6 +209,8 @@ if TYPE_CHECKING:
     VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS: int = 8
     VLLM_TPU_SRPT_ATTN_WORK_CAP: int = 0
     VLLM_TPU_SRPT_ATTN_TILE_TOKENS: int = 32
+    VLLM_TPU_MUSE_BATCH_INVARIANT: bool = True
+    VLLM_TPU_MUSE_MOE_IMPL: str = "fused"
 
 
 def env_with_choices(
@@ -1281,6 +1283,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # tile).
     "VLLM_TPU_SRPT_ATTN_TILE_TOKENS": env_nonnegative_int(
         "VLLM_TPU_SRPT_ATTN_TILE_TOKENS", 32
+    ),
+    # Batch-invariant matmuls, norms, and TP reductions (0 opts into standard XLA ops).
+    "VLLM_TPU_MUSE_BATCH_INVARIANT": env_bool(
+        "VLLM_TPU_MUSE_BATCH_INVARIANT", default=True
+    ),
+    # Muse Spark MoE backend selector: "fused" (default) or "eager".
+    "VLLM_TPU_MUSE_MOE_IMPL": env_with_choices(
+        "VLLM_TPU_MUSE_MOE_IMPL", "fused", ["fused", "eager"], case_sensitive=False
     ),
 }
 
