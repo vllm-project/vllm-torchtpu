@@ -20,3 +20,9 @@ from jax.experimental.pallas import tpu as pltpu
 NORMALIZED_ROUTER_BLOCK_ROWS: dict[tuple[pltpu.ChipVersion, int, int, int], int] = {
     (pltpu.ChipVersion.TPU_7X, 288, 384, 6): 288,
 }
+
+# (chip, tile rows, hidden, padded intermediate, scale group) -> layout rows.
+# Shared by prefill and decode; the M128 short-height ladder remains enabled.
+INPUT_LAYOUT_ROWS: dict[tuple[pltpu.ChipVersion, int, int, int, int], int] = {
+    (pltpu.ChipVersion.TPU_7X, 128, 5120, 2560, 512): 32,
+}

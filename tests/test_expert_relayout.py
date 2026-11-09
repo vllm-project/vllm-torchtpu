@@ -737,3 +737,181 @@ def test_window_deltas_wrap_cleanly_across_int32_overflow():
         10.0,
         10.0,
     ]
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_prefill_short_burst_installs_only_when_enabled(enabled):
+    tap = _Tap()
+    installs = []
+    c = _controller(0, tap, _Mover(), installs, prefill_enabled=enabled)
+    for step in range(1, 14):
+        phase = "prefill" if step <= 8 else "padded"
+        c.on_step(step, c.fields(), phase=phase)
+        c.after_dispatch()
+        tap.advance()
+    assert bool(installs) == enabled
+    assert bool(c.prefill_windows) == enabled
+    if enabled:
+        assert c.stats["installed"] == 1
+        assert c.stats["moves"] > 0
+        assert c.prefill_windows[0]["layers"][0]["max_over_mean"] > 1
+
+
+def test_padded_tail_never_enters_the_next_prefill_window():
+    tap = _Tap()
+    seen = []
+    c = _controller(0, tap, _Mover(), [], prefill_enabled=True)
+    c._solve = lambda history, layouts, generation, step, **kwargs: (
+        seen.append([s[("target", 0)].copy() for s in history])
+        or rl.Plan(generation, step)
+    )
+    for step in range(1, 18):
+        phase = "padded" if step == 9 else "prefill"
+        c.on_step(step, c.fields(), phase=phase)
+        c.after_dispatch()
+        tap.advance(100000 if phase == "padded" else 1)
+    assert len(seen) == 2
+    first_delta = seen[0][-1] - seen[0][0]
+    second_delta = seen[1][-1] - seen[1][0]
+    # The large dirty increment is present in both snapshots of the second
+    # window and cancels; it must never become a hot-expert signal.
+    np.testing.assert_array_equal(first_delta, second_delta)
+    assert c._decode_converged is False
+
+
+def test_prefill_mode_does_not_change_decode_schedule_or_freeze():
+    controllers = []
+    for enabled in (False, True):
+        tap = _Tap()
+        c = _controller(0, tap, _Mover(), [], prefill_enabled=enabled, min_gain=0.005)
+        for step in range(1, 30):
+            c.on_step(step, c.fields(), phase="decode")
+            c.after_dispatch()
+            tap.advance()
+        controllers.append(c)
+    a, b = controllers
+    assert a.stats == b.stats
+    assert a.layouts[("target", 0)].held == b.layouts[("target", 0)].held
+    assert a._decode_converged and b._decode_converged
+
+
+def test_arm_wires_the_opt_in_prefill_flag(monkeypatch):
+    _arm_env(monkeypatch, TPU_MOE_EPLB_PREFILL=True)
+    _fake_placed_world(monkeypatch)
+    c = rl.arm(ep_rank=1, ep_world=2, ep_global_ranks=[4, 5], transport=_CPU)
+    assert c is not None and c._decode_only is False
+
+
+@pytest.mark.parametrize("policy", ["budgeted", "direct"])
+def test_migration_never_writes_a_slot_referenced_by_the_old_table(policy):
+    old = _layout()
+    if policy == "budgeted":
+        nxt = rl._budgeted_next(
+            old,
+            [[0, 1, 6, 7], [4, 5, 2, 3]],
+            np.array([1, 1, 5, 2, 1, 1, 9, 3]),
+            staging=1,
+        )
+    else:
+        nxt = rl._direct_staged_next(
+            old, np.array([120, 110, 80, 70, 10, 10, 10, 10]), staging=1, cap=2
+        )
+    for rank in range(old.shards):
+        for slot, expert in enumerate(nxt.held[rank]):
+            if expert != rl.FREE and expert not in old.held[rank]:
+                assert old.held[rank][slot] == rl.FREE, (
+                    "retiring an expert in the next table does not retire its "
+                    "current weight slot before install"
+                )
+
+
+def test_move_construction_rejects_an_in_place_live_slot_swap():
+    old = _layout()
+    unsafe = rl.LayerLayout([[4, 1, 2, 3, rl.FREE], [0, 5, 6, 7, rl.FREE]])
+    with pytest.raises(ValueError, match="original staging slot"):
+        rl._moves_between("target", 0, old, unsafe)
+
+
+def test_old_table_stays_readable_during_staging_across_generations():
+    import time
+    from types import SimpleNamespace
+
+    old = _layout()
+    experts = 8
+    slots, rows, cols, scale_rows = 5, 32, 128, 8
+    parts = ("w13_weight", "w2_weight", "_tpu_fused_w13_scale", "_tpu_fused_w2_scale")
+    modules = []
+    for rank in range(old.shards):
+        module = SimpleNamespace(local_num_experts=slots)
+        for part in parts:
+            flat = part.startswith("_tpu")
+            value = torch.zeros(
+                (slots * scale_rows, cols) if flat else (slots, rows, cols),
+                dtype=torch.int32,
+            )
+            for j, expert in enumerate(old.held[rank]):
+                if expert != rl.FREE:
+                    if flat:
+                        value[j * scale_rows : (j + 1) * scale_rows] = expert + 1
+                    else:
+                        value[j] = expert + 1
+            setattr(module, part, value)
+        modules.append(module)
+    exchange = mv.LocalExchange()
+    movers = [
+        mv.SlabMover(r, mv.CpuTransport(), exchange.endpoint(r), step_budget_bytes=4096)
+        for r in range(2)
+    ]
+    for generation, hot_rank in enumerate((0, 1, 0), start=1):
+        load = np.ones(experts)
+        for expert in old.ranks()[hot_rank]:
+            load[expert] = 120 + expert
+        nxt = rl._direct_staged_next(old, load, staging=1, cap=2)
+        moves = rl._moves_between("target", 0, old, nxt)
+        assert moves
+        plan = rl.Plan(generation, 0, {("target", 0): nxt}, moves)
+        before = [{part: getattr(m, part).clone() for part in parts} for m in modules]
+        for rank, mover in enumerate(movers):
+            mover.start(plan, {("target", 0): modules[rank]})
+        for _ in range(400):
+            # Every intermediate pump may overlap an old-layout forward.
+            for mover in movers:
+                mover.pump()
+            for rank, module in enumerate(modules):
+                for slot, expert in enumerate(old.held[rank]):
+                    if expert == rl.FREE:
+                        continue
+                    for part in parts:
+                        span = (
+                            slice(slot * scale_rows, (slot + 1) * scale_rows)
+                            if part.startswith("_tpu")
+                            else slot
+                        )
+                        torch.testing.assert_close(
+                            getattr(module, part)[span], before[rank][part][span]
+                        )
+            if all(m.staged_generation() == generation for m in movers):
+                break
+            assert not any(m.failed() for m in movers)
+            time.sleep(0.001)
+        assert all(m.staged_generation() == generation for m in movers)
+        for rank, module in enumerate(modules):
+            for slot, expert in enumerate(nxt.held[rank]):
+                if expert == rl.FREE:
+                    continue
+                for part in parts:
+                    span = (
+                        slice(slot * scale_rows, (slot + 1) * scale_rows)
+                        if part.startswith("_tpu")
+                        else slot
+                    )
+                    assert bool((getattr(module, part)[span] == expert + 1).all())
+            movers[rank].settle(generation)
+        old = nxt
+
+
+def test_move_construction_rejects_relabeling_retained_experts_without_copying():
+    old = _layout()
+    unsafe = rl.LayerLayout([[1, 0, 2, 3, rl.FREE], [4, 5, 6, 7, rl.FREE]])
+    with pytest.raises(ValueError, match="retained expert"):
+        rl._moves_between("target", 0, old, unsafe)

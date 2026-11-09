@@ -6,4 +6,4 @@ mkdir -p "$results"
 # Keep these local TPU checks on the original 8-device host. Each process
 # releases the TPU before the next check starts.
 python -m pytest -q tests/kernels/fused_moe/test_fused_ep_moe_v2.py \
-  -k row_padded_flat_scales --junitxml="$results/kernel-scales.xml"
+  -k 'row_padded_flat_scales or input3_cache32' --junitxml="$results/kernel-scales.xml"

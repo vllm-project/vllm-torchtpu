@@ -1286,3 +1286,31 @@ def test_expert_load_counts_the_rows_per_physical_slot():
     np.testing.assert_array_equal(np.asarray(out), np.asarray(plain))
     expected = 5 + np.bincount(np.asarray(hash_ids).ravel(), minlength=e_total)
     np.testing.assert_array_equal(np.asarray(updated), expected)
+
+
+@pytest.mark.parametrize("tokens", [8, 264, 16384])
+def test_input3_cache32_tracks_dense_reference(tokens):
+    """Exercise empty experts, short rungs and repeated three-slot wraparound."""
+    mesh = _mesh()
+    weights, scales, decoded = _make_fp4_weights(
+        mesh, 142, hidden=5120, inter=2560, e_total=8, rhs_qb=512
+    )
+    x, gating = _make_inputs(mesh, 143, tokens=tokens, hidden=5120, e_total=8)
+    out = fused_ep_moe_v2(
+        x,
+        *weights,
+        *scales,
+        gating,
+        topk=1,
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.FP4,
+        rhs_qb=512,
+        sharded_plan=True,
+    )
+    ref = _dense_reference(mesh, x, *decoded, None, None, gating, topk=1)
+    error = _relative_l2(out, ref)
+    worst = _worst_token_relative_l2(out, ref)
+    assert error < FP8_RELATIVE_BOUND, error
+    assert worst < FP8_TOKEN_BOUND, worst
