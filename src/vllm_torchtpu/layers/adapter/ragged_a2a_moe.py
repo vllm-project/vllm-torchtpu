@@ -101,6 +101,8 @@ def _get_op(
     for knob in ("TPU_MOE_A2A_ROW_GATHER", "TPU_MOE_A2A_ROW_SCATTER"):
         if getattr(envs, knob) and not envs.TPU_MOE_A2A_SORTED_PLAN:
             raise ValueError(f"{knob} needs TPU_MOE_A2A_SORTED_PLAN")
+    if envs.TPU_MOE_A2A_OWNER_TAIL and not envs.TPU_MOE_A2A_OWNER_COMBINE:
+        raise ValueError("TPU_MOE_A2A_OWNER_TAIL needs TPU_MOE_A2A_OWNER_COMBINE")
     mesh = get_dp_tp_mesh()
     # The full-size exchange receives into one region per DP member, sized for
     # all of that member's tokens: the local permute sees the all-gather
@@ -125,6 +127,7 @@ def _get_op(
         streamed_combine=envs.TPU_MOE_A2A_STREAMED_COMBINE,
         owner_combine=envs.TPU_MOE_A2A_OWNER_COMBINE,
         sorted_plan=envs.TPU_MOE_A2A_SORTED_PLAN,
+        owner_tail=envs.TPU_MOE_A2A_OWNER_TAIL,
     )
 
     # torch_tpu infers static argnums from annotations: every operand is jax.Array.
@@ -215,7 +218,8 @@ def _get_op(
     logger.info_once(
         "Ragged A2A MoE armed | topk=%d activation=%s dp=%d tp=%d | one-hot "
         "permute threshold %d routed rows (full decode step: %d routed rows) | "
-        "streamed combine %s, owner combine %s, row gather %s, row scatter %s",
+        "streamed combine %s, owner combine %s, row gather %s, row scatter %s, "
+        "owner tail %s",
         topk,
         activation,
         mesh.shape[DP_AXIS],
@@ -226,6 +230,7 @@ def _get_op(
         "on" if envs.TPU_MOE_A2A_OWNER_COMBINE else "off",
         "on" if envs.TPU_MOE_A2A_ROW_GATHER else "off",
         "on" if envs.TPU_MOE_A2A_ROW_SCATTER else "off",
+        "on" if envs.TPU_MOE_A2A_OWNER_TAIL else "off",
     )
     _log_capacity(mesh, topk, onehot_threshold, step_routed_rows)
     return op

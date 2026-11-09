@@ -1655,6 +1655,22 @@ class ExtraRowRefs:
 
 
 @dataclasses.dataclass(frozen=True)
+class OwnerTailRefs:
+    """Refs of `gmm_v2_mlp_scatter`'s owner tail (its `tail`)."""
+
+    tp_rank: jax.Array  # SMEM int32[K, blk]: per owner-order route position
+    dp_pos: jax.Array  # SMEM int32[K, blk]
+    sent: jax.Array  # SMEM int32[K, blk]
+    weight: jax.Array  # SMEM float32[K, blk]
+    fits: jax.Array  # SMEM int32[1]: 0 = the step sends nothing
+    out: jax.Array  # HBM [tp * blk, row_sublanes, L]: every TP rank's sums
+    sems: jax.Array  # DMA[7]: loads x2, stores x2, pushes x2, forwards
+    recv_sems: jax.Array  # DMA[1 + chunks]: peer rows, partner chunks
+    tp_size: int
+    chunk: int  # tokens summed per stage slot
+
+
+@dataclasses.dataclass(frozen=True)
 class ScatterRefs:
     """Refs of `gmm_v2_mlp_scatter`'s row sends (see there)."""
 
@@ -1671,6 +1687,7 @@ class ScatterRefs:
     axis: str | tuple[str, ...]
     num_members: int | tuple[int, ...]
     extra: ExtraRowRefs | None = None
+    tail: OwnerTailRefs | None = None
 
 
 def _axes(axis, num_members):
@@ -1799,6 +1816,202 @@ def owner_token_sum(
             x = shared(rr).astype(jnp.float32) + parts[rr]
             out = out + x.astype(dtype).astype(jnp.float32)
     return out
+
+
+def _owner_tail(sc: ScatterRefs, tl: OwnerTailRefs) -> None:
+    """`gmm_v2_mlp_scatter`'s owner tail, once every row bound here has landed:
+    sums this member's owned tokens in chunks and copies each summed chunk to
+    its rows of `tl.out` here and on the engine's other TP ranks; returns once
+    its own copies have left and the other ranks' rows have landed."""
+    topk, blk = tl.tp_rank.shape
+    tp, chunk = tl.tp_size, tl.chunk
+    row_shape = sc.recv.shape[1:]
+    dtype = sc.stage.dtype
+    me = sc.me[0]
+    my_tp = lax.rem(me, tp)
+    first = me - my_tp  # this engine's TP rank 0
+    # Route position j of owned token i at row j * blk + i; TP rank r's shared
+    # partial of it at row r * blk + i.
+    recv = sc.recv.reshape(topk, blk, *row_shape)
+    shared = None
+    if sc.extra is not None:
+        shared = sc.extra.recv.reshape(tp, blk, *row_shape)
+    # The row stage is free after the last tile. Per slot, in groups of `chunk`
+    # rows: the chunk's rows of each route position, then of each TP rank's
+    # shared partial, then its sums.
+    groups = sc.stage.reshape(2, sc.stage.shape[1] // chunk, chunk, *row_shape)
+    sums = topk + (0 if shared is None else tp)
+    nfull, rest = divmod(blk, chunk)
+    chunks = [(c * chunk, chunk) for c in range(nfull)]
+    if rest:
+        chunks.append((nfull * chunk, rest))
+    forward_sem = tl.sems.at[6]
+    peer_sem = tl.recv_sems.at[0]
+
+    def device(member):
+        return member_device(member, sc.axis, sc.num_members)
+
+    if tp == 4:
+        # Ranks 2k and 2k + 1 are the two cores of chip k: each chunk crosses
+        # to the other chip once, to the partner, which forwards what lands to
+        # the chip's other core.
+        other_core = first + my_tp + 1 - 2 * lax.rem(my_tp, 2)
+        partner_tp = lax.rem(my_tp + 2, 4)
+
+        def pushes(c):
+            return (
+                (first + partner_tp, tl.recv_sems.at[1 + c]),
+                (other_core, peer_sem),
+            )
+
+        expected = 2 * blk  # the other core's rows and its forward of its partner's
+    else:
+        peers = [first + lax.rem(my_tp + k, tp) for k in range(1, tp)]
+
+        def pushes(c):
+            del c
+            return tuple((p, peer_sem) for p in peers)
+
+        expected = (tp - 1) * blk
+
+    def loads(c0, n, slot):
+        sem = tl.sems.at[slot]
+        cps = [
+            pltpu.make_async_copy(
+                recv.at[:, pl.ds(c0, n)],
+                groups.at[slot, pl.ds(0, topk), pl.ds(0, n)],
+                sem,
+            )
+        ]
+        if shared is not None:
+            cps.append(
+                pltpu.make_async_copy(
+                    shared.at[:, pl.ds(c0, n)],
+                    groups.at[slot, pl.ds(topk, tp), pl.ds(0, n)],
+                    sem,
+                )
+            )
+        return cps
+
+    def copies(c, c0, n, slot):
+        src = groups.at[slot, sums, pl.ds(0, n)]
+        dst = tl.out.at[pl.ds(my_tp * blk + c0, n)]
+        out = [pltpu.make_async_copy(src, dst, tl.sems.at[2 + slot])]
+        for member, recv_sem in pushes(c):
+            out.append(
+                pltpu.make_async_remote_copy(
+                    src,
+                    dst,
+                    tl.sems.at[4 + slot],
+                    recv_sem,
+                    device_id=device(member),
+                    device_id_type=pl.DeviceIdType.MESH,
+                )
+            )
+        return out
+
+    def wait_copies(c, c0, n, slot):
+        local, *remote = copies(c, c0, n, slot)
+        local.wait()
+        for d in remote:
+            d.wait_send()
+
+    def compute(c0, n, slot):
+        for i in range(n):
+            out = owner_token_sum(
+                tl.tp_rank,
+                tl.dp_pos,
+                tl.sent,
+                tl.weight,
+                c0 + i,
+                lambda j, i=i: groups[slot, j, i],
+                None if shared is None else (lambda r, i=i: groups[slot, topk + r, i]),
+                topk=topk,
+                tp_size=tp,
+                dtype=dtype,
+                row_shape=row_shape,
+            )
+            groups[slot, sums, i] = out.astype(dtype)
+
+    @pl.when(tl.fits[0] != 0)
+    def _():
+        with jax.named_scope("tail_sum"):
+            for cp in loads(*chunks[0], 0):
+                cp.start()
+
+            def body(c, carry):
+                slot = lax.rem(c, 2)
+                # The next chunk's rows load while this one is summed.
+                if nfull > 1:
+
+                    @pl.when(c + 1 < nfull)
+                    def _():
+                        for cp in loads((c + 1) * chunk, chunk, 1 - slot):
+                            cp.start()
+
+                if rest:
+
+                    @pl.when(c + 1 == nfull)
+                    def _():
+                        for cp in loads(nfull * chunk, rest, 1 - slot):
+                            cp.start()
+
+                for cp in loads(c * chunk, chunk, slot):
+                    cp.wait()
+
+                @pl.when(c >= 2)
+                def _():
+                    # The sums of chunk c - 2 have left this slot.
+                    wait_copies(c - 2, (c - 2) * chunk, chunk, slot)
+
+                compute(c * chunk, chunk, slot)
+                for d in copies(c, c * chunk, chunk, slot):
+                    d.start()
+                return carry
+
+            if nfull:
+                lax.fori_loop(0, nfull, body, 0)
+            if rest:
+                slot = nfull % 2
+                for cp in loads(nfull * chunk, rest, slot):
+                    cp.wait()
+                if nfull >= 2:
+                    wait_copies(nfull - 2, (nfull - 2) * chunk, chunk, slot)
+                compute(nfull * chunk, rest, slot)
+                for d in copies(nfull, nfull * chunk, rest, slot):
+                    d.start()
+        if tp == 4:
+            with jax.named_scope("tail_peers"):
+                # Only after this rank's own chunks are out, so a rank that
+                # forwards never holds back rows another rank waits for.
+                def forward(c, c0, n):
+                    rows = tl.out.at[pl.ds(partner_tp * blk + c0, n)]
+                    wait_rows(tl.recv_sems.at[1 + c], tl.out, n)
+                    pltpu.make_async_remote_copy(
+                        rows,
+                        rows,
+                        forward_sem,
+                        peer_sem,
+                        device_id=device(other_core),
+                        device_id_type=pl.DeviceIdType.MESH,
+                    ).start()
+
+                def forward_full(c, carry):
+                    forward(c, c * chunk, chunk)
+                    return carry
+
+                if nfull:
+                    lax.fori_loop(0, nfull, forward_full, 0)
+                if rest:
+                    forward(nfull, nfull * chunk, rest)
+        with jax.named_scope("tail_push"):
+            for c in range(max(0, len(chunks) - 2), len(chunks)):
+                wait_copies(c, *chunks[c], c % 2)
+            if tp == 4:
+                wait_rows(forward_sem, tl.out, blk)
+        if tp > 1:
+            with jax.named_scope("tail_peers"):
+                wait_rows(peer_sem, tl.out, expected)
 
 
 def _mlp_kernel(
@@ -2183,6 +2396,8 @@ def _mlp_kernel(
             wait_rows(ex.sems.at[0], ex.recv, ex.counts[0])
             wait_rows(ex.sems.at[1], ex.recv, ex.counts[1])
             wait_rows(ex.sems.at[2], ex.recv, ex.expected[0])
+        if scatter.tail is not None:
+            _owner_tail(scatter, scatter.tail)
         return
     out_spec = pl.BlockSpec((bounded, sub, size_n), index_maps.out_index_map)
     pipeline_fn = pltpu.emit_pipeline(
@@ -2397,9 +2612,17 @@ def gmm_v2_mlp(
     )(group_sizes, group_offset, lhs, w1, w1_scale, w2, w2_scale)[:size_m, :size_n]
 
 
-def mlp_scatter_kernel_main(*refs, cfgs: MlpConfigs, axis, num_members, extra: bool):
+def mlp_scatter_kernel_main(
+    *refs,
+    cfgs: MlpConfigs,
+    axis,
+    num_members,
+    extra: bool,
+    tail: tuple[int, int] | None = None,
+):
     """Entry point of `gmm_v2_mlp_scatter` (refs: scalar prefetch, inputs,
-    outputs, scratch; the `extra` ones present when `extra`)."""
+    outputs, scratch; the `extra` ones present when `extra`, the owner tail's
+    when `tail` = (TP ranks, tokens per chunk))."""
     refs = list(refs)
 
     def take(n):
@@ -2409,10 +2632,12 @@ def mlp_scatter_kernel_main(*refs, cfgs: MlpConfigs, axis, num_members, extra: b
 
     group_sizes, group_offset, dest_member, dest_row, me, expected = take(6)
     extra_prefetch = take(3) if extra else []
+    tail_prefetch = take(5) if tail else []
     lhs, w1, s1, w2, s2 = take(5)
     extra_inputs = take(1) if extra else []
     recv = take(1)[0]
     extra_outputs = take(1) if extra else []
+    tail_outputs = take(1) if tail else []
     (
         w1_gate_slots,
         w1_up_slots,
@@ -2431,6 +2656,7 @@ def mlp_scatter_kernel_main(*refs, cfgs: MlpConfigs, axis, num_members, extra: b
         in_flight_ref,
     ) = take(15)
     extra_scratch = take(2) if extra else []
+    tail_scratch = take(2) if tail else []
     assert not refs
     extra_refs = None
     if extra:
@@ -2446,6 +2672,22 @@ def mlp_scatter_kernel_main(*refs, cfgs: MlpConfigs, axis, num_members, extra: b
             recv=extra_recv,
             sems=extra_sems,
             counts=extra_counts,
+        )
+    tail_refs = None
+    if tail:
+        tp_rank, dp_pos, sent, weight, fits = tail_prefetch
+        tail_sems, tail_recv_sems = tail_scratch
+        tail_refs = OwnerTailRefs(
+            tp_rank=tp_rank,
+            dp_pos=dp_pos,
+            sent=sent,
+            weight=weight,
+            fits=fits,
+            out=tail_outputs[0],
+            sems=tail_sems,
+            recv_sems=tail_recv_sems,
+            tp_size=tail[0],
+            chunk=tail[1],
         )
     _mlp_kernel(
         group_sizes,
@@ -2482,6 +2724,7 @@ def mlp_scatter_kernel_main(*refs, cfgs: MlpConfigs, axis, num_members, extra: b
             axis=axis,
             num_members=num_members,
             extra=extra_refs,
+            tail=tail_refs,
         ),
     )
 
@@ -2526,6 +2769,7 @@ def gmm_v2_mlp_scatter(
     me: jax.Array,  # int32[1]
     expected: jax.Array,  # int32[1]
     extra: tuple[jax.Array, ...] | None = None,
+    tail: tuple[jax.Array, ...] | None = None,
     *,
     num_recv_rows: int,
     num_extra_recv_rows: int = 0,
@@ -2558,6 +2802,20 @@ def gmm_v2_mlp_scatter(
     block `i` to rows from `row[i]` of member `member[i]`'s second receive
     buffer `[num_extra_recv_rows, ...]`, overlapping the expert compute;
     `counts[0]` rows land here. Then the result is (receive, second receive).
+
+    `tail` = (tp_rank, dp_pos, sent, weight, fits): the owner combine's tail,
+    with the members given over a (DP, TP) pair of axes, an engine's TP ranks
+    along the second. The [K, blk] arrays describe this member's owned tokens
+    as `owner_token_sum` reads them; route position `j` of owned token `i`
+    lands at receive row `j * blk + i` and TP rank `r`'s shared partial of it
+    (with `extra`) at second-receive row `r * blk + i`. Once every row bound
+    here has landed, the kernel sums its owned tokens a few at a time and
+    copies each summed chunk to its rows of the result on every TP rank of
+    its engine (at 4 TP ranks, ranks 2k and 2k + 1 being the cores of one
+    chip, a chunk crosses to the other chip once and is forwarded there).
+    Then the result is the engine's sums `[tp * blk, 16, size_n / 16]`, owned
+    block by owned block, returned once this member's copies have left and
+    the other ranks' blocks have landed. `fits[0]` = 0: no sums, no copies.
     """
 
     size_m = lhs.shape[0]
@@ -2601,6 +2859,29 @@ def gmm_v2_mlp_scatter(
     nb1 = w1_scale.shape[1]
     nb2 = w2_scale.shape[1]
 
+    tail_cfg = None
+    stage_rows = cfgs.tile_m
+    if tail is not None:
+        tp_size = num_members[-1] if isinstance(num_members, tuple) else 0
+        topk, blk = tail[0].shape
+        if (
+            not isinstance(axis, tuple)
+            or len(axis) != 2
+            or num_recv_rows != topk * blk
+            or (extra is not None and num_extra_recv_rows != tp_size * blk)
+        ):
+            raise ValueError("gmm_v2_mlp_scatter does not support this owner tail")
+        # A stage slot holds a chunk's K route rows, shared rows and sums per
+        # token (grown past a tile only where one token's rows do not fit).
+        per_token = topk + (0 if extra is None else tp_size) + 1
+        chunk = next(
+            c
+            for c in (4, 2, 1)
+            if per_token * c <= max(cfgs.tile_m, per_token) and cfgs.tile_m % c == 0
+        )
+        stage_rows = max(cfgs.tile_m, per_token * chunk)
+        tail_cfg = (tp_size, chunk)
+
     max_num_gm = dims.size_group + pl.cdiv(dims.size_m, cfgs.tile_m) - 1
     scratch_shapes = [
         pltpu.VMEM((num_parts, dims.size_k, part), w1.dtype),
@@ -2616,7 +2897,7 @@ def gmm_v2_mlp_scatter(
         ),
         pltpu.SMEM((1,), jnp.int32),
         pltpu.SemaphoreType.DMA((num_parts + 1,)),
-        pltpu.VMEM((2, cfgs.tile_m, row_sub, size_n // row_sub), lhs.dtype),
+        pltpu.VMEM((2, stage_rows, row_sub, size_n // row_sub), lhs.dtype),
         pltpu.SemaphoreType.DMA((2,)),
         pltpu.SemaphoreType.DMA((2,)),
         pltpu.SemaphoreType.DMA((1,)),
@@ -2652,14 +2933,28 @@ def gmm_v2_mlp_scatter(
         )
         out_specs = (hbm, hbm)
         name += "-x"
-    # The receive buffers are pinned to HBM: other members write into them.
-    return pl.pallas_call(
+    if tail is not None and tail_cfg is not None:
+        tp_size, chunk = tail_cfg
+        blk = tail[0].shape[1]
+        prefetch += list(tail)
+        result = pltpu.HBM((tp_size * blk, row_sub, size_n // row_sub), lhs.dtype)
+        out_shape = (out_shape, result) if extra is None else (*out_shape, result)
+        out_specs = (hbm,) * len(out_shape)
+        scratch_shapes += [
+            pltpu.SemaphoreType.DMA((7,)),
+            pltpu.SemaphoreType.DMA((1 + pl.cdiv(blk, chunk),)),
+        ]
+        name += "-t"
+    # The receive buffers and the owner tail's result are pinned to HBM: other
+    # members write into them.
+    out = pl.pallas_call(
         functools.partial(
             mlp_scatter_kernel_main,
             cfgs=cfgs,
             axis=axis,
             num_members=num_members,
             extra=extra is not None,
+            tail=tail_cfg,
         ),
         out_shape=out_shape,
         grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -2676,3 +2971,4 @@ def gmm_v2_mlp_scatter(
         name=name,
         cost_estimate=cost,
     )(*prefetch, *inputs)
+    return out if tail is None else out[-1]

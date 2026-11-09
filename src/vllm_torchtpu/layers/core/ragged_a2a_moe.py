@@ -1257,6 +1257,7 @@ def _owner_combine(
     plan=None,
     row_gather=False,
     src_rows=None,
+    owner_tail=False,
 ):
     """The expert kernel sends each output row to its token's OWNER rank: TP rank
     ``t // ceil(S / tp)`` of the token's engine owns token ``t``. The owner sums
@@ -1264,7 +1265,10 @@ def _owner_combine(
     ranks all-gather the owned rows: the result is already summed over TP.
     ``plan``: the routes from `route_plan` with `owner_dests`; ``row_gather``:
     ``received`` holds whole-tile rows and the routes' rows are copied out of
-    it, all below ``src_rows`` [1]."""
+    it, all below ``src_rows`` [1]. ``owner_tail``: the expert kernel also sums
+    the owned tokens and copies them to the engine's TP ranks in its tail (see
+    `gmm_v2_mlp_scatter`), instead of `owner_sum_kernel` and the all-gather:
+    same sums, same rows."""
     num_tokens = x.shape[0]
     local = w1.shape[0]
     mesh = dict(dp_size=dp_size, tp_size=tp_size, local_num_experts=local)
@@ -1302,6 +1306,22 @@ def _owner_combine(
                 jnp.int32
             ),
         )
+    tail = None
+    if owner_tail:
+        tp_s, dp_s, sent_s, weight_s = _owner_routes(
+            owned_ids,
+            owned_weights,
+            skip_padded_tokens=skip_padded_tokens,
+            dtype=x.dtype,
+            **mesh,
+        )
+        tail = (
+            tp_s,
+            dp_s,
+            sent_s.astype(jnp.int32),
+            weight_s,
+            jnp.asarray(fits, jnp.int32)[None],
+        )
     if plan is not None:
         recv = fused_moe_scatter_planned(
             received,
@@ -1314,6 +1334,7 @@ def _owner_combine(
             expected[None],
             extra,
             src_rows=src_rows,
+            tail=tail,
             activation=activation,
             rhs_quant_dtype=rhs_quant_dtype,
             num_recv_rows=blk * topk,
@@ -1340,6 +1361,7 @@ def _owner_combine(
             jnp.asarray(me, jnp.int32)[None],
             expected[None],
             extra,
+            tail,
             topk=topk,
             activation=activation,
             rhs_quant_dtype=rhs_quant_dtype,
@@ -1351,6 +1373,8 @@ def _owner_combine(
             num_members=(dp_size, tp_size),
             collective_id=collective_id,
         )
+    if owner_tail:
+        return recv.reshape(blk * tp_size, -1)[:num_tokens]
     shared_recv = None
     if shared is not None:
         recv, shared_recv = recv
@@ -1392,6 +1416,7 @@ def ragged_a2a_moe_local(
     streamed_combine: bool = False,
     owner_combine: bool = False,
     sorted_plan: bool = False,
+    owner_tail: bool = False,
     shared: jax.Array | None = None,
 ) -> jax.Array:
     """Per-rank body (inside shard_map over the (dp, tp) mesh).
@@ -1420,6 +1445,9 @@ def ragged_a2a_moe_local(
     (``owner_tp_sum``).
     ``shared`` [S, H] (owner mode only): this TP rank's shared-expert partial,
     added before the TP sum as the model would, so the result is final.
+    ``owner_tail`` (owner mode only): where the fused kernel runs, it also sums
+    the owned tokens and hands them to the engine's TP ranks in its tail,
+    instead of a separate sum kernel and an all-gather (same result).
 
     ``sorted_plan`` (with the streamed or owner combine): the expert side orders
     its local routes with one sort over the DP group's gathered routing
@@ -1435,6 +1463,7 @@ def ragged_a2a_moe_local(
     below the send sizes).
     """
     assert shared is None or owner_combine
+    assert not owner_tail or owner_combine
     num_tokens = x.shape[0]
     local_num_experts = w1.shape[0]
     slots = dp_size * num_tokens
@@ -1486,6 +1515,7 @@ def ragged_a2a_moe_local(
                 collective_id=collective_id,
                 shared=shared,
                 row_gather=row_gather,
+                owner_tail=owner_tail,
             )
         return functools.partial(
             _streamed_combine,
@@ -1656,6 +1686,7 @@ def ragged_a2a_moe(
     streamed_combine: bool = False,
     owner_combine: bool = False,
     sorted_plan: bool = False,
+    owner_tail: bool = False,
     shared: jax.Array | None = None,
 ) -> jax.Array:
     """Global-view entry: every operand is the ranks' local arrays stacked on
@@ -1681,6 +1712,7 @@ def ragged_a2a_moe(
         streamed_combine=streamed_combine,
         owner_combine=owner_combine,
         sorted_plan=sorted_plan,
+        owner_tail=owner_tail,
     )
 
     scaled = w1_scale is not None
