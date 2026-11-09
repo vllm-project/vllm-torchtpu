@@ -23,7 +23,7 @@ from vllm_torchtpu.kernels.deepseek_v41.csa2.pipeline import (
     csa2_gather_chunk_size,
     csa2_pipeline,
 )
-from vllm_torchtpu.kernels.mla.paged_swa import write_swa_pages
+from vllm_torchtpu.kernels.mla.paged_swa import swa_word_pages, write_swa_word_pool
 
 if TYPE_CHECKING:
     from .cache import PagedCacheRows
@@ -56,8 +56,10 @@ def _publish_main_banked(
     return *banks, *scale
 
 
-def _publish_swa(raw: jax.Array, records: jax.Array, values: jax.Array) -> jax.Array:
-    return write_swa_pages(raw, records, values)
+def _publish_swa(
+    raw: jax.Array, records: jax.Array, values: jax.Array, page_size: int
+) -> jax.Array:
+    return write_swa_word_pool(raw, records, values, page_size=page_size)
 
 
 def _publish_swa_banked(
@@ -65,8 +67,9 @@ def _publish_swa_banked(
     high: jax.Array,
     records: jax.Array,
     values: jax.Array,
+    page_size: int,
 ) -> tuple[jax.Array, jax.Array]:
-    return write_swa_pages((raw, high), records, values)
+    return write_swa_word_pool((raw, high), records, values, page_size=page_size)
 
 
 def _inverse_rope(cos_sin: jax.Array, positions: jax.Array) -> jax.Array:
@@ -99,6 +102,7 @@ def _attend(
     metadata: jax.Array,
     bounds: jax.Array,
     counts: jax.Array,
+    page_size: int,
     ratio: int,
     scale: float,
     non_causal: bool,
@@ -108,7 +112,7 @@ def _attend(
         q,
         words,
         scales,
-        raw if high is None else (raw, high),
+        swa_word_pages(raw if high is None else (raw, high), page_size),
         starts,
         positions,
         sink.astype(jnp.float32),
@@ -132,6 +136,7 @@ def _attend_swa(
     cos_sin: jax.Array,
     metadata: jax.Array,
     bounds: jax.Array,
+    page_size: int,
     scale: float,
     non_causal: bool,
     bq: int,
@@ -141,7 +146,7 @@ def _attend_swa(
         q,
         None,
         None,
-        raw if high is None else (raw, high),
+        swa_word_pages(raw if high is None else (raw, high), page_size),
         starts,
         positions,
         sink.astype(jnp.float32),
@@ -171,6 +176,7 @@ def _gather_attend(
     metadata: jax.Array,
     bounds: jax.Array,
     main_page_size: int,
+    swa_page_size: int,
     ratio: int,
     scale: float,
     non_causal: bool,
@@ -188,7 +194,7 @@ def _gather_attend(
         raw if high is None else (raw, high),
         scales if high_scales is None else (scales, high_scales),
         records,
-        swa if swa_high is None else (swa, swa_high),
+        swa_word_pages(swa if swa_high is None else (swa, swa_high), swa_page_size),
         starts,
         positions,
         sink.astype(jnp.float32),
@@ -254,13 +260,10 @@ def _prepare_publish_swa(
     minimum: jax.Array,
     values: jax.Array,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    from vllm_torchtpu.kernels.experimental.decode_preparation import (
-        swa_prepare_publish,
+    metadata, bounds, records = _metadata(
+        table, starts, positions, minimum, 64, 64, 0, False
     )
-
-    owner, metadata, bounds, records = swa_prepare_publish(
-        (raw,), table, starts, positions, minimum, values
-    )
+    owner = write_swa_word_pool(raw, records, values, page_size=64)
     return owner, metadata, bounds, records
 
 
@@ -273,14 +276,11 @@ def _prepare_publish_swa_banked(
     minimum: jax.Array,
     values: jax.Array,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
-    from vllm_torchtpu.kernels.experimental.decode_preparation import (
-        swa_prepare_publish,
+    metadata, bounds, records = _metadata(
+        table, starts, positions, minimum, 64, 64, 0, False
     )
-
-    owner, upper, metadata, bounds, records = swa_prepare_publish(
-        (raw, high), table, starts, positions, minimum, values
-    )
-    return owner, upper, metadata, bounds, records
+    owner = write_swa_word_pool((raw, high), records, values, page_size=64)
+    return *owner, metadata, bounds, records
 
 
 def _fake_prepare_publish_swa(raw, table, starts, positions, minimum, values):
@@ -378,31 +378,31 @@ def initialize_csa2_ops() -> None:
         (
             "publish_swa",
             _publish_swa,
-            (P(),) * 3,
+            (P(),) * 3 + (None,),
             lambda r, *_: torch.empty_like(r),
         ),
         (
             "publish_swa_banked",
             _publish_swa_banked,
-            (P(),) * 4,
+            (P(),) * 4 + (None,),
             lambda r, h, *_: (torch.empty_like(r), torch.empty_like(h)),
         ),
         (
             "attend",
             _attend,
-            (P(),) * 12 + (None,) * 4,
+            (P(),) * 12 + (None,) * 5,
             lambda q, *_: torch.empty_like(q),
         ),
         (
             "attend_swa",
             _attend_swa,
-            (P(),) * 9 + (None,) * 3,
+            (P(),) * 9 + (None,) * 4,
             lambda q, *_: torch.empty_like(q),
         ),
         (
             "gather_attend",
             _gather_attend,
-            (P(),) * 16 + (None,) * 5,
+            (P(),) * 16 + (None,) * 6,
             _fake_gather_attend,
         ),
         (
@@ -482,10 +482,12 @@ def publish_swa(
     cache: "PagedCacheRows", records: torch.Tensor, values: torch.Tensor
 ) -> None:
     if cache.raw_hi is None:
-        cache.raw.copy_(_ops["publish_swa"](cache.raw, records.int(), values))
+        cache.raw.copy_(
+            _ops["publish_swa"](cache.raw, records.int(), values, cache.shape[1])
+        )
     else:
         low, high = _ops["publish_swa_banked"](
-            cache.raw, cache.raw_hi, records.int(), values
+            cache.raw, cache.raw_hi, records.int(), values, cache.shape[1]
         )
         cache.raw.copy_(low)
         cache.raw_hi.copy_(high)
@@ -524,6 +526,7 @@ def attention(
             cos_sin,
             metadata.int(),
             bounds.int(),
+            swa.shape[1],
             scale,
             non_causal,
             bq,
@@ -564,6 +567,7 @@ def attention(
             metadata.int(),
             bounds.int(),
             page_size,
+            swa.shape[1],
             ratio,
             scale,
             non_causal,
@@ -587,6 +591,7 @@ def attention(
         metadata.int(),
         bounds.int(),
         cache.valid_counts,
+        swa.shape[1],
         ratio,
         scale,
         non_causal,
@@ -640,7 +645,7 @@ def prepare_publish_swa(
     cache: "PagedCacheRows",
     values: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Publish value-ready native pages while creating the shared metadata."""
+    """Publish into the shared word pool while creating the shared metadata."""
     args = (table.int(), starts.int(), positions.int(), minimum.int(), values)
     if cache.raw_hi is None:
         raw, metadata, bounds, records = _ops["prepare_publish_swa"](cache.raw, *args)
