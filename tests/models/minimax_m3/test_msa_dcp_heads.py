@@ -568,3 +568,36 @@ def test_lse_heads_fused_loop_matches_mapped_calls(monkeypatch, chunk_tokens, ti
         )
     np.testing.assert_array_equal(np.asarray(out[True][0]), np.asarray(out[False][0]))
     np.testing.assert_array_equal(np.asarray(out[True][1]), np.asarray(out[False][1]))
+
+
+@pytest.mark.parametrize("tiles", [True, False])
+def test_lse_heads_element_diet_matches(monkeypatch, tiles):
+    """Folding sm_scale into the K scales and broadcasting the mask over the
+    heads (`ELEMENT_DIET`) matches the replicated-mask scores."""
+    dtype = jnp.float8_e4m3fn
+    rng = np.random.default_rng(41)
+    num_tokens, pages, topk, heads, hd, q_per_head = 96, 24, 4, 2, 128, 4
+    q = jnp.asarray(rng.standard_normal((num_tokens, heads * q_per_head, hd))).astype(jnp.bfloat16)
+    rows = pack(rounded(rng.standard_normal((pages, PAGE, heads * 2 * hd)), dtype), dtype)
+    selected = np.full((num_tokens, heads, topk), -1, np.int32)
+    for t in range(num_tokens):
+        for h in range(heads):
+            chosen = rng.choice(pages, rng.integers(0, topk + 1), replace=False)
+            selected[t, h, : len(chosen)] = chosen
+    rest = (
+        jnp.asarray(selected[:, 0, 0]),
+        jnp.asarray(rng.integers(1, PAGE + 1, num_tokens), jnp.int32),
+        jnp.arange(pages, dtype=jnp.int32),
+    )
+    kw = dict(sm_scale=hd**-0.5, block_q=16, pages_per_step=8, tiles=tiles, interpret=True)
+    out = {}
+    for diet in (False, True):
+        monkeypatch.setattr(msa_attention_lse, "ELEMENT_DIET", diet)
+        jax.clear_caches()
+        out[diet] = msa_attention_lse.msa_sparse_attention_lse_heads(
+            q, rows, jnp.asarray(selected), *rest, **kw
+        )
+    np.testing.assert_allclose(
+        np.asarray(out[True][0], np.float32), np.asarray(out[False][0], np.float32), rtol=1e-2, atol=1e-2
+    )
+    np.testing.assert_allclose(np.asarray(out[True][1]), np.asarray(out[False][1]), rtol=1e-5, atol=1e-5)
