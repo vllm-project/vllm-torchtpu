@@ -711,6 +711,38 @@ def _build_fused_ep_moe_kernel(
     lane_blocks = host.row_lane_blocks(hidden)
     has_scales = form.has_scales
     has_act_scale = form.quantized_activations
+    # ragged_rows_alloc must cover every tile READ as well as every commit
+    # -- the shard's total rows plus tile_m, aligned to tile_m -- because a
+    # tail tile reads a full window.
+    if (
+        ragged_rows_alloc is None
+        or ragged_rows_alloc % ROWBLK
+        or ragged_rows_alloc % capacity
+    ):
+        raise ValueError(
+            f"ragged_rows_alloc {ragged_rows_alloc} must be a whole number "
+            f"of both {ROWBLK}-row blocks and {capacity}-row tiles, because "
+            "a tail tile reads a full window past the shard's last row"
+        )
+    tile_m = capacity  # the tile height IS the capacity
+    tile_blocks = tile_m // ROWBLK
+    # The mirror's unit is a tile, the run tables' unit is a block, and the
+    # kernel converts between them with a shift.
+    tile_block_shift = host.pow2_shift(tile_blocks, "tile_m // ROWBLK")
+    tile_shift = host.pow2_shift(tile_m, "tile_m")
+    height_rungs = tile_height_rungs(tile_m, ragged_rows_alloc, g_local, ep)
+    input_key = (pltpu.get_tpu_info().chip_version, tile_m, hidden, inter, rhs_qb)
+    interleave_inputs = (
+        rhs_packed4
+        and tuned_block_sizes.INPUT_SLOTS.get(input_key, OUT_PARITIES) == 3
+        and host.TOKEN_GATHER_TILES_PER_WINDOW == 1
+    )
+    layout_rows = tuned_block_sizes.INPUT_LAYOUT_ROWS.get(input_key)
+    if not rhs_packed4 or (
+        layout_rows is not None and any(height % layout_rows for height in height_rungs)
+    ):
+        layout_rows = None
+    input_slots = 3 if interleave_inputs else OUT_PARITIES
     # The prefetch schedule this build can afford: the deepest runway whose
     # nbuf copies of one expert still leave the rest of the buffers inside
     # the budget, walked down from the ceiling one slot at a time. Every
@@ -725,7 +757,33 @@ def _build_fused_ep_moe_kernel(
         rhs_qb=rhs_qb,
         has_w1_bias=has_w1_bias,
         has_w2_bias=has_w2_bias,
+        input_slots=input_slots,
+        cache_layout_rows=layout_rows,
     )
+    # A tuned input combination may cost more than the legacy minimum.
+    # Preserve formerly supported shapes if even one weight slot cannot fit.
+    if not slots.fits and (interleave_inputs or layout_rows is not None):
+        logger.warning(
+            "fused EP MoE: input slots=%d/cache rows=%s exceed VMEM even at "
+            "one weight slot; retrying legacy inputs",
+            input_slots,
+            layout_rows,
+        )
+        interleave_inputs = False
+        input_slots = OUT_PARITIES
+        layout_rows = None
+        slots = host.fit_weight_slots(
+            g_local,
+            capacity,
+            hidden,
+            inter,
+            weight_format=weight_format,
+            rhs_qb=rhs_qb,
+            has_w1_bias=has_w1_bias,
+            has_w2_bias=has_w2_bias,
+            input_slots=input_slots,
+            cache_layout_rows=layout_rows,
+        )
     prefetch_distance = slots.distance
     nbuf = slots.nbuf
     # The relation the whole schedule rests on: a refill writes its slot
@@ -796,26 +854,6 @@ def _build_fused_ep_moe_kernel(
             slots.limit / 2**20,
             host.MAX_WEIGHT_PREFETCH_DISTANCE,
         )
-    # ragged_rows_alloc must cover every tile READ as well as every commit
-    # -- the shard's total rows plus tile_m, aligned to tile_m -- because a
-    # tail tile reads a full window.
-    if (
-        ragged_rows_alloc is None
-        or ragged_rows_alloc % ROWBLK
-        or ragged_rows_alloc % capacity
-    ):
-        raise ValueError(
-            f"ragged_rows_alloc {ragged_rows_alloc} must be a whole number "
-            f"of both {ROWBLK}-row blocks and {capacity}-row tiles, because "
-            "a tail tile reads a full window past the shard's last row"
-        )
-    tile_m = capacity  # the tile height IS the capacity
-    tile_blocks = tile_m // ROWBLK
-    # The mirror's unit is a tile, the run tables' unit is a block, and the
-    # kernel converts between them with a shift.
-    tile_block_shift = host.pow2_shift(tile_blocks, "tile_m // ROWBLK")
-    tile_shift = host.pow2_shift(tile_m, "tile_m")
-    height_rungs = tile_height_rungs(tile_m, ragged_rows_alloc, g_local, ep)
     # The contribution slab exists for one reason: to give the push an HBM
     # source. A tile is computed into `out_vm`, copied to `contrib_hbm`, then
     # read straight back out of it by the push that ships it -- two local
@@ -831,17 +869,6 @@ def _build_fused_ep_moe_kernel(
     #
     # This subsumes the deferred commit drain the same bound used to select:
     # deferring a wait one visit is worth nothing once the wait is gone.
-    # Shared by prefill and decode; no phase-dependent kernel fork.
-    layout_rows = tuned_block_sizes.INPUT_LAYOUT_ROWS.get(
-        (pltpu.get_tpu_info().chip_version, tile_m, hidden, inter, rhs_qb)
-    )
-    interleave_inputs = (
-        rhs_packed4
-        and layout_rows is not None
-        and all(height % layout_rows == 0 for height in height_rungs)
-        and host.TOKEN_GATHER_TILES_PER_WINDOW == 1
-    )
-    input_slots = 3 if interleave_inputs else OUT_PARITIES
     tile_plan_capacity = ragged_rows_alloc // tile_m + g_local + 3
     push_from_vmem = ragged_rows_alloc <= ep * g_local * tile_m
     ls_window_rows = host.act_scale_window_rows(tile_m)
@@ -859,34 +886,10 @@ def _build_fused_ep_moe_kernel(
         rhs_qb=rhs_qb,
         has_w1_bias=has_w1_bias,
         has_w2_bias=has_w2_bias,
+        input_slots=input_slots,
+        cache_layout_rows=layout_rows,
         pad_scale_rows=pad_scale_rows,
     )
-    if interleave_inputs:
-        info = pltpu.get_tpu_info()
-        original_arrays = declared_vmem_arrays
-        declared_vmem_arrays = [
-            (
-                name,
-                (input_slots,) + shape[1:] if name in ("lhs_vm", "ls_vm") else shape,
-                dtype,
-            )
-            for name, shape, dtype in original_arrays
-        ]
-        declared_vmem_arrays.append(("lhs_compute_vm", (tile_m, hidden), FP8))
-        old_scratch = sum(
-            host.array_vmem_bytes(shape, dtype, info)
-            for _, shape, dtype in original_arrays
-        )
-        new_scratch = sum(
-            host.array_vmem_bytes(shape, dtype, info)
-            for _, shape, dtype in declared_vmem_arrays
-        )
-        unrefined_budget = slots.vmem_bytes + new_scratch - old_scratch
-        if unrefined_budget > slots.limit:
-            raise ValueError(
-                f"three input slots need {unrefined_budget} conservative VMEM bytes, "
-                f"limit {slots.limit}; weight nbuf remains {nbuf}"
-            )
 
     def kernel(*refs):
         it = iter(refs)
@@ -1002,7 +1005,7 @@ def _build_fused_ep_moe_kernel(
         ls_vm = next(it) if has_act_scale else None
         out_vm = next(it)
         oscl_vm = next(it)  # [parities, tile blocks, ROWBLK] f32
-        lhs_compute_vm = next(it) if interleave_inputs else None
+        lhs_compute_vm = next(it) if layout_rows is not None else None
         if interleave_inputs:
             token_gather_sems = next(it)
             token_gather_sem0, token_gather_sem1 = (
@@ -1802,8 +1805,8 @@ def _build_fused_ep_moe_kernel(
                     rung that still covers them.
                     """
                     full = height == tile_m
-                    if interleave_inputs:
-                        # Preserve the raw input3 DMA layout. A real row loop
+                    if layout_rows is not None:
+                        # Preserve the raw input DMA layout. A real row loop
                         # bounds relayout temporaries; GUP reads K slices from
                         # the final-layout Ref instead of loading a full SSA tile.
                         def convert_rows(block, unused):
@@ -2357,7 +2360,8 @@ def _build_fused_ep_moe_kernel(
             f"{'' if act_fn == 'silu' else '_' + act_fn}"
             f"{bias_tag}"
             f"_g{g_local}_c{capacity}_nb{nbuf}"
-            f"{'_i3_lhscache32' if interleave_inputs else ''}"
+            f"{'_i3' if interleave_inputs else ''}"
+            f"{f'_lhscache{layout_rows}' if layout_rows is not None else ''}"
         )
         return pl.pallas_call(
             kernel,
