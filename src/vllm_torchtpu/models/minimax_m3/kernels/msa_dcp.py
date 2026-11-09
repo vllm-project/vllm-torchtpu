@@ -31,7 +31,7 @@ lives on rank ``b % dcp``, whole, and every block-level step stays local:
 2. `msa_attend_dcp`: each rank merges the candidates into that selection,
    attends every query head of the KV head over the selected blocks it
    holds and returns the partial output with its log-sum-exp; the caller
-   merges the ranks' partials (`cp_mla_attention.merge_lse_partials_scatter_heads`).
+   merges the ranks' partials (`ops.msa.merge_head_partials`).
 
 A DCP group wider than a KV head's TP replicas (e.g. DCP 8 at TP 8 with 4
 KV heads) spans ``G = dcp / replicas`` KV heads: every rank then stores all
@@ -740,13 +740,17 @@ def msa_attend_dcp(
     """Second half of the DCP forward: attend over the selected blocks this
     rank holds.
 
-    With a 4-bit `kv_cache` pass its `scale_cache`: queries are rotated here
-    and the partial output rotated back, so callers see plain heads.
+    With a 4-bit `kv_cache` pass its `scale_cache`; `q` must then be rotated
+    (`msa_fp4.rotate_queries`) and the partial output is in the rotated
+    basis (callers rotate and unrotate their own heads, a 1 / DCP share of
+    the group's).
 
     ``q [T, G * Hg, D]`` holds every query head of the group's ``G`` KV heads
     (KV head ``h`` owns query heads ``[h * Hg, (h + 1) * Hg)``);
     ``candidates [dcp, T, G * 2 * topk]`` every rank's candidates. Returns
-    the partial ``(out [T, G * Hg, D], lse [T, G * Hg] f32)``.
+    the partial head-major, as the kernel writes it, ``(out [G * Hg, T, D],
+    lse [G * Hg, T] f32)``: the LSE merge reduce-scatters heads along the
+    leading axis (`ops.msa.merge_head_partials`).
     """
     num_tokens = q.shape[0]
     rank = rank_array(rank)[0]
@@ -779,28 +783,26 @@ def msa_attend_dcp(
     )
     args = (local_key, pos % block_size + 1, block_tables.reshape(-1))
     if scale_cache is not None:
-        q = msa_fp4.rotate_queries(q)
         if num_heads == 1:
-            out, lse = msa_attention_lse.msa_sparse_attention_lse(
+            return msa_attention_lse.msa_sparse_attention_lse(
                 q,
                 kv_cache,
                 keys[:, 0],
                 *args,
                 head=0,
+                head_major=True,
                 **common,
                 **msa._fp4_attention_kwargs(scale_cache),
             )
-        else:
-            # KV head h's K / V scales are scale-page rows 2h / 2h + 1.
-            out, lse = msa_attention_lse.msa_sparse_attention_lse_heads(
-                q, kv_cache, keys, *args, **common, scale_cache=scale_cache
-            )
-        return msa_fp4.unrotate_output(out), lse
+        # KV head h's K / V scales are scale-page rows 2h / 2h + 1.
+        return msa_attention_lse.msa_sparse_attention_lse_heads(
+            q, kv_cache, keys, *args, head_major=True, **common, scale_cache=scale_cache
+        )
     if num_heads == 1:
         return msa_attention_lse.msa_sparse_attention_lse(
-            q, kv_cache, keys[:, 0], *args, head=0, **common
+            q, kv_cache, keys[:, 0], *args, head=0, head_major=True, **common
         )
     # One kernel for all the group's KV heads (the head is a kernel input).
     return msa_attention_lse.msa_sparse_attention_lse_heads(
-        q, kv_cache, keys, *args, **common
+        q, kv_cache, keys, *args, head_major=True, **common
     )

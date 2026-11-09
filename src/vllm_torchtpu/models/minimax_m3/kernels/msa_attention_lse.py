@@ -426,9 +426,13 @@ def _chunked_call(
     interpret,
     scale_cache=None,
     scale_rows=None,
+    head_major=False,
 ):
     """`_attention_call` per KV head and chunk of at most
     `MAX_TOKENS_PER_CALL` tokens (the work list lives in SMEM).
+
+    With `head_major`, ``(out [G * Hg, T, D], lse [G * Hg, T])`` come back
+    head-major, as the kernel writes them, with no transpose.
 
     ``q [T, G * Hg, D]``: cache-row KV head ``first_head + h`` owns query
     heads ``[h * Hg, (h + 1) * Hg)``; ``selected [T, G, K]``. Every call
@@ -442,6 +446,8 @@ def _chunked_call(
     num_tokens, num_q_heads, _ = q.shape
     num_heads = selected.shape[1]
     if num_tokens == 0:
+        if head_major:
+            return q.transpose(1, 0, 2), jnp.zeros((num_q_heads, 0), jnp.float32)
         return q, jnp.zeros(q.shape[:2], jnp.float32)
     call = functools.partial(
         _attention_call,
@@ -479,8 +485,12 @@ def _chunked_call(
     if num_heads * num_chunks > 1:
         out = jax.lax.fori_loop(1, num_heads * num_chunks, head_chunk, out)
     out, lse = out
-    # lse [head blocks, tiles, 1, Hg * Bq] -> [T, G * Hg]
+    # lse [head blocks, tiles, 1, Hg * Bq] -> [T, G * Hg] (or head-major)
     num_blocks, num_tiles = lse.shape[:2]
+    if head_major:
+        lse = lse.reshape(num_blocks, num_tiles, -1, block_q).transpose(0, 2, 1, 3)
+        lse = lse.reshape(num_q_heads, num_tiles * block_q)
+        return out[:, :num_tokens], lse[:, :num_tokens]
     lse = lse.reshape(num_blocks, num_tiles, -1, block_q).transpose(1, 3, 0, 2)
     lse = lse.reshape(num_tiles * block_q, num_q_heads)
     return out.transpose(1, 0, 2)[:num_tokens], lse[:num_tokens]
@@ -520,6 +530,7 @@ def _check_rows(kv_cache, head_dim, head=None):
         "k_scale_row",
         "v_scale_row",
         "interpret",
+        "head_major",
     ),
 )
 def msa_sparse_attention_lse(
@@ -538,6 +549,7 @@ def msa_sparse_attention_lse(
     k_scale_row: int = 0,
     v_scale_row: int = 1,
     interpret: bool = False,
+    head_major: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """`msa_attention.msa_sparse_attention` (kernel v2, page keys translated
     by `page_table`) returning ``(out [T, H, D], lse [T, H] f32)``.
@@ -547,6 +559,8 @@ def msa_sparse_attention_lse(
     Cache rows may hold several KV heads, ``[K_0 | V_0 | K_1 | V_1 ...]``;
     `head` picks the one these queries attend (a 2D-wide block of each page).
     A 4-bit cache takes its `scale_cache` (`msa_attention.msa_sparse_attention`).
+    With `head_major`, the results come back head-major: ``out [H, T, D]``,
+    ``lse [H, T]``.
     """
     num_tokens, _, head_dim = q.shape
     msa_attention.check_cache(kv_cache, scale_cache)
@@ -568,12 +582,22 @@ def msa_sparse_attention_lse(
         interpret=interpret,
         scale_cache=scale_cache,
         scale_rows=None if scale_cache is None else (k_scale_row, v_scale_row),
+        head_major=head_major,
     )
+    if head_major:
+        return out[:, :num_tokens], lse[:, :num_tokens]
     return out[:num_tokens], lse[:num_tokens]
 
 
 @functools.partial(
-    jax.jit, static_argnames=("sm_scale", "block_q", "pages_per_step", "interpret")
+    jax.jit,
+    static_argnames=(
+        "sm_scale",
+        "block_q",
+        "pages_per_step",
+        "interpret",
+        "head_major",
+    ),
 )
 def msa_sparse_attention_lse_heads(
     q: jax.Array,
@@ -588,6 +612,7 @@ def msa_sparse_attention_lse_heads(
     pages_per_step: int = msa_attention.DEFAULT_PAGES_PER_STEP,
     scale_cache: jax.Array | None = None,
     interpret: bool = False,
+    head_major: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """`msa_sparse_attention_lse` for every KV head of the cache rows at once.
 
@@ -598,7 +623,7 @@ def msa_sparse_attention_lse_heads(
     [T, G * Hg, D], lse [T, G * Hg] f32)``.
 
     With a 4-bit cache, `scale_cache` ``[pages, R, S]`` holds head ``h``'s K / V
-    scales in rows ``2h`` / ``2h + 1``.
+    scales in rows ``2h`` / ``2h + 1``. `head_major` as `msa_sparse_attention_lse`.
     """
     num_tokens, num_q_heads, head_dim = q.shape
     num_heads = selected.shape[1]
@@ -629,5 +654,8 @@ def msa_sparse_attention_lse_heads(
         interpret=interpret,
         scale_cache=scale_cache,
         scale_rows=None if scale_cache is None else "head",
+        head_major=head_major,
     )
+    if head_major:
+        return out[:, :num_tokens], lse[:, :num_tokens]
     return out[:num_tokens], lse[:num_tokens]

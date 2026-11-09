@@ -179,6 +179,14 @@ def _dcp_rank_tensor(rank: int, device: str) -> torch.Tensor:
     return torch.tensor([rank], dtype=torch.int32, device=device)
 
 
+@functools.cache
+def _hadamard_tensor(n: int, device: str) -> torch.Tensor:
+    """The bf16 Sylvester Hadamard matrix of `msa_fp4`, shared by every MSA
+    layer as `_dcp_rank_tensor` is (a module buffer: built at load time,
+    outside the traced forward)."""
+    return torch.tensor(msa_fp4.hadamard(n), dtype=torch.bfloat16, device=device)
+
+
 def cache_dtype(cache_config: CacheConfig | None) -> torch.dtype:
     """Storage dtype of both MSA caches for ``--kv-cache-dtype``."""
     name = cache_config.cache_dtype if cache_config is not None else "auto"
@@ -377,6 +385,12 @@ class MiniMaxM3SparseAttention(nn.Module):
                 _dcp_rank_tensor(get_dcp_rank(), str(torch.get_default_device())),
                 persistent=False,
             )
+            if self.fp4:  # each rank rotates its own query heads (get_msa_dcp_op)
+                self.register_buffer(
+                    "hadamard",
+                    _hadamard_tensor(self.head_dim, str(torch.get_default_device())),
+                    persistent=False,
+                )
         elif self.index_shards > 1:
             self.msa_op = get_msa_sharded_op(
                 *msa_config, get_tensor_model_parallel_rank(), self.index_shards
@@ -414,6 +428,8 @@ class MiniMaxM3SparseAttention(nn.Module):
             extra = {"dcp_rank": self.dcp_rank} if self.dcp_size > 1 else {}
             if self.scale_cache is not None:
                 extra["scale_cache"] = self.scale_cache.kv_cache
+                if self.dcp_size > 1:
+                    extra["hadamard"] = self.hadamard
             attn_output = self.msa_op(
                 q.view(num_tokens, self.num_heads, self.head_dim),
                 k.view(num_tokens, self.num_kv_heads, self.head_dim),
