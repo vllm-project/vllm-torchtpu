@@ -278,6 +278,7 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # export is chosen from their source, so an edit here has to invalidate
     # the compiled executables like any other kernel change.
     "vllm_torchtpu/layers/adapter/fused_moe_ep.py",
+    "vllm_torchtpu/layers/adapter/fused_moe_ep_v3.py",
     # Same for the TP decode MoE op, whose body this module builds.
     "vllm_torchtpu/layers/adapter/moe_tp_decode.py",
     "vllm_torchtpu/layers/adapter/moe_lowtok_scores.py",

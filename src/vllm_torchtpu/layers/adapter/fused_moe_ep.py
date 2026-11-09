@@ -827,16 +827,20 @@ def prebuild_fused_moe_ep(
         )
         return None
     ep = mesh.shape[EP_AXIS_NAME]
+    use_v3 = envs.MOE_FUSED_EP_KERNEL_IMPL == "v3"
     # Collective over the world, so before any refusal that could differ by
     # rank; cached after the first layer.
     sorted_gather = (
-        ep_sorted_gather_group() if envs.MOE_FUSED_EP_SORTED_GATHER else None
+        ep_sorted_gather_group()
+        if envs.MOE_FUSED_EP_SORTED_GATHER and not use_v3
+        else None
     )
 
     gather_bytes = token_gather_smem_bytes(_TILE_M)
     needed_smem = _SMEM_OVERHEAD_BYTES + gather_bytes
     smem = _smem_capacity_bytes()
-    if needed_smem > smem:
+    # The v2 kernel's token-gather windows; v3 has no such table.
+    if needed_smem > smem and not use_v3:
         logger.warning_once(
             "Fused EP MoE not engaged: its fixed routing working set needs "
             "%d B of this chip's %d B SMEM (%d B for two streamed "
@@ -921,9 +925,25 @@ def prebuild_fused_moe_ep(
         rhs_qb=rhs_qb,
         supplies_hash_ids=supplies_hash_ids,
     )
+    if reason is None and use_v3:
+        from vllm_torchtpu.layers.adapter import fused_moe_ep_v3
+
+        reason = fused_moe_ep_v3.unsupported_reason(layer, activation, weight_format)
     if reason is not None:
         logger.warning_once("Fused EP MoE not engaged: %s", reason)
         return None
+
+    if use_v3:
+        return fused_moe_ep_v3.build_op(
+            mesh,
+            topk,
+            renormalize,
+            activation,
+            mesh_expert_order,
+            hidden=hidden,
+            inter=inter,
+            local_experts=local_experts,
+        )
 
     sharded_plan = envs.MOE_FUSED_EP_V2_SHARDED_PLAN
     token_replica_groups = ep_token_replica_groups(
