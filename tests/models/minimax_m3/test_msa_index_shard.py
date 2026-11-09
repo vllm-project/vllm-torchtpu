@@ -49,6 +49,7 @@ def _small_steps_block_scores(
     interp,
     scale_cache=None,
     scale_row=None,
+    num_heads=1,
 ):
     """`msa._block_scores` with 4 pages per grid step in both tile classes.
 

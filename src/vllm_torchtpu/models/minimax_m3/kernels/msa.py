@@ -259,8 +259,10 @@ def _block_scores(
     interpret,
     scale_cache=None,
     scale_row=None,
+    num_heads=1,
 ):
-    """`index_q` must already be rotated for a 4-bit cache."""
+    """`index_q` must already be rotated for a 4-bit cache; `num_heads` index
+    heads are folded into each request's rows."""
     return msa_indexer.block_scores(
         index_q,
         index_cache,
@@ -274,6 +276,7 @@ def _block_scores(
         small_pages_per_step=msa_indexer.DEFAULT_SMALL_PAGES_PER_STEP,
         scale_cache=scale_cache,
         scale_row=scale_row,
+        packed_rows=msa_indexer.packed_rows(num_heads),
         interpret=interpret,
     )
 
@@ -454,6 +457,7 @@ def partial_block_scores(
         interpret,
         scale_cache,
         scale_row,
+        num_heads,
     )
     return scores[rows, 0]
 

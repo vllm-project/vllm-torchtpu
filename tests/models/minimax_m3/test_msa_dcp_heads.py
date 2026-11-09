@@ -65,6 +65,7 @@ def _jnp_block_scores(
     interpret,
     scale_cache=None,
     scale_row=None,
+    num_heads=1,
 ):
     """`msa_indexer.block_scores` in jnp; pages past a request's end hold NaN
     (the kernel leaves them unwritten). bf16 / fp8 caches only."""
