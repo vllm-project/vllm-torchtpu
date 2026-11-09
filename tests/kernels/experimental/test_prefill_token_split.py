@@ -503,3 +503,71 @@ def test_rotated_scatter_rows_gives_each_core_the_rows_of_scatter_rows(
 
     np.testing.assert_array_equal(_bits(rotated), _bits(xla))
     assert chunks == ([2048] if h == 768 else [])
+
+
+def _all_gather_places():
+    places = [
+        ((x, y, z), c) for x in (0, 1) for y in (0, 1) for z in (0, 1) for c in (0, 1)
+    ]
+    return rotated_collectives.peer_table(places, "all_gather")
+
+
+# Rows per core: 128 is one combine chunk of 2,048 tokens, 256 two; hidden 256
+# is less than one lane tile per part; a float32 input keeps XLA's gather.
+@pytest.mark.parametrize(
+    ("rows", "h", "dtype", "kernels"),
+    [
+        (128, 768, jnp.bfloat16, 1),
+        (256, 768, jnp.bfloat16, 2),
+        (128, 256, jnp.bfloat16, 0),
+        (128, 768, jnp.float32, 0),
+    ],
+)
+def test_rotated_gather_rows_gives_each_core_the_rows_of_gather_rows(
+    mesh, interpret, monkeypatch, rows, h, dtype, kernels
+):
+    """v2.rotated_gather_rows against gather_rows, bit for bit, in the input's
+    dtype: one rotated kernel per combine chunk, none for a shape or dtype the
+    kernel does not take."""
+    table = _all_gather_places()
+    calls = []
+    chunked = rotated_collectives.all_gather_chunks
+
+    def counted(x, *args, chunk, **kwargs):
+        calls.extend([chunk] * (x.shape[0] // chunk))
+        return chunked(x, *args, chunk=chunk, **kwargs)
+
+    monkeypatch.setattr(rotated_collectives, "all_gather_chunks", counted)
+    rng = np.random.default_rng(rows + h)
+    x = jnp.asarray(rng.standard_normal((RANKS * rows, h)), dtype)
+    rank = jnp.arange(RANKS, dtype=jnp.int32).reshape(RANKS, 1)
+
+    rotated = _per_core(
+        mesh, lambda p, r: v2.rotated_gather_rows(p, r.reshape(1), table, "d"), x, rank
+    )
+    xla = _per_core(mesh, lambda p: v2.gather_rows(p, "d"), x)
+
+    assert rotated.dtype == dtype
+    np.testing.assert_array_equal(_bits(rotated), _bits(xla))
+    assert len(calls) == kernels
+
+
+# Words per chunk: 128 rows x 16 = one 16-row tile of 128 lanes; 72 rows x 16
+# pads to a tile; 256 rows are two combine chunks.
+@pytest.mark.parametrize("rows", [128, 72, 256])
+def test_rotated_gather_words_gives_each_core_the_words_of_gather_rows(
+    mesh, interpret, rows
+):
+    """v2.rotated_gather_words of the route words (8 ids, 8 weights as int32)
+    against gather_rows: every core's words, in token order, padding dropped."""
+    table = _all_gather_places()
+    rng = np.random.default_rng(rows)
+    w = jnp.asarray(rng.integers(-(2**31), 2**31 - 1, (RANKS * rows, 16)), jnp.int32)
+    rank = jnp.arange(RANKS, dtype=jnp.int32).reshape(RANKS, 1)
+
+    rotated = _per_core(
+        mesh, lambda p, r: v2.rotated_gather_words(p, r.reshape(1), table, "d"), w, rank
+    )
+    xla = _per_core(mesh, lambda p: v2.gather_rows(p, "d"), w)
+
+    np.testing.assert_array_equal(np.asarray(rotated), np.asarray(xla))

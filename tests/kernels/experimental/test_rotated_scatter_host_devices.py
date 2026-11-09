@@ -1,7 +1,7 @@
 # Copyright 2026 Google LLC
 # SPDX-License-Identifier: Apache-2.0
-"""The rotated reduce-scatter tests of the prefill token split and of the
-log-sum-exp reduce-scatter on 16 host devices.
+"""The rotated reduce-scatter and all-gather tests of the prefill token split
+and the log-sum-exp reduce-scatter tests on 16 host devices.
 
 They need the 16 cores of a 2x2x2 slice, more than the multichip lane's host
 has, so they skip there. Every pallas_call in them runs interpreted, so this
@@ -42,6 +42,13 @@ GROUPS = (
     ),
     (
         (
+            f"{SPLIT}::test_rotated_gather_rows_gives_each_core_the_rows_of_gather_rows",
+            f"{SPLIT}::test_rotated_gather_words_gives_each_core_the_words_of_gather_rows",
+        ),
+        7,
+    ),
+    (
+        (
             f"{LSE}::test_result_is_the_softmax_merge_of_the_projections",
             f"{LSE}::test_the_comparison_sees_the_merge_weights",
         ),
@@ -71,7 +78,7 @@ def _start(ids):
 
 
 @pytest.mark.timeout(TIMEOUT_SECONDS + 60)
-def test_rotated_scatter_cases_pass_on_16_host_devices():
+def test_rotated_collective_cases_pass_on_16_host_devices():
     processes = [_start(ids) for ids, _ in GROUPS]
     try:
         outputs = [p.communicate(timeout=TIMEOUT_SECONDS)[0] for p in processes]

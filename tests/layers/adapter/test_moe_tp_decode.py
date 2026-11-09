@@ -852,26 +852,34 @@ def built_bodies(monkeypatch):
 
 
 @pytest.mark.parametrize("sliced", [False, True])
+@pytest.mark.parametrize(("scatter", "gather"), [(True, False), (False, True)])
 def test_get_op_builds_the_ep_split_body_for_an_ep_layer(
-    built_bodies, monkeypatch, sliced
+    built_bodies, monkeypatch, sliced, scatter, gather
 ):
     """TPU_PREFILL_SEQ_PARALLEL_EP: the split op of an EP layer runs
     _ep_split_body over the op's 16 ranks, with the rotated reduce-scatter's
-    peer table when arming found the mesh's chip places."""
+    and all-gather's peer tables, each under its switch, when arming found the
+    mesh's chip places."""
     import numpy as np
 
     statics, mesh = _ep_statics(True), _OpMesh()
     monkeypatch.setattr(
         moe_tp_decode, "_EP_SCATTER_PLACES", {mesh: _PLACES} if sliced else {}
     )
+    monkeypatch.setattr(envs, "TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER", scatter)
+    monkeypatch.setattr(envs, "TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_GATHER", gather)
     moe_tp_decode._get_op(mesh, statics, split=True)
-    [(kind, (*args, rs_table))] = built_bodies
+    [(kind, (*args, rs_table, ag_table))] = built_bodies
     assert (kind, args) == ("_ep_split_body", [statics, 16, "ep"])
-    if sliced:
-        want = moe_tp_decode.rotated_collectives.peer_table(_PLACES, "reduce_scatter")
-        np.testing.assert_array_equal(rs_table, want)
-    else:
-        assert rs_table is None
+    for table, on, collective in (
+        (rs_table, scatter, "reduce_scatter"),
+        (ag_table, gather, "all_gather"),
+    ):
+        if sliced and on:
+            want = moe_tp_decode.rotated_collectives.peer_table(_PLACES, collective)
+            np.testing.assert_array_equal(table, want)
+        else:
+            assert table is None
 
 
 def test_get_op_keeps_the_tp_split_body_for_a_tp_layer(built_bodies):
@@ -949,9 +957,17 @@ def test_rotated_places_logs_the_collectives_it_takes(
     assert logs == [log]
 
 
-def test_rotated_scatter_finds_each_ep_mesh_places_once(monkeypatch):
-    """TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER: the first EP layer of a
-    mesh finds its chip places (a collective); later layers reuse them."""
+@pytest.mark.parametrize(
+    "switch",
+    [
+        "TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER",
+        "TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_GATHER",
+    ],
+)
+def test_rotated_scatter_finds_each_ep_mesh_places_once(monkeypatch, switch):
+    """TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER or _GATHER: the first EP
+    layer of a mesh finds its chip places (a collective); later layers reuse
+    them."""
     statics = _ep_statics(True)
     mesh, op = object(), object()
     found = []
@@ -962,7 +978,9 @@ def test_rotated_scatter_finds_each_ep_mesh_places_once(monkeypatch):
         moe_tp_decode, "_ep_scatter_places", lambda m: found.append(m) or ["places"]
     )
     monkeypatch.setattr(envs, "TPU_PREFILL_SEQ_PARALLEL_EP", True)
-    monkeypatch.setattr(envs, "TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER", True)
+    monkeypatch.setattr(envs, "TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER", False)
+    monkeypatch.setattr(envs, "TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_GATHER", False)
+    monkeypatch.setattr(envs, switch, True)
     for _ in range(2):
         layer = SimpleNamespace(
             quant_method=SimpleNamespace(**{moe_tp_decode._OP_ATTR: op}),
@@ -986,9 +1004,9 @@ def test_rotated_scatter_finds_each_ep_mesh_places_once(monkeypatch):
 def test_rotated_scatter_places_fall_back_to_xla_with_the_reason(
     monkeypatch, size, index, places, reason
 ):
-    """TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER: the EP group's chip places
-    of a 2x2x2 slice; a mesh the rotated kernel cannot run over keeps XLA's
-    reduce-scatter and logs why."""
+    """TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER or _GATHER: the EP group's
+    chip places of a 2x2x2 slice; a mesh the rotated kernels cannot run over
+    keeps XLA's collectives and logs why."""
     from vllm_torchtpu.layers.adapter import small_all_reduce_op
 
     def chip_places(mesh, mesh_index, gather=None, who=None):
@@ -1008,13 +1026,14 @@ def test_rotated_scatter_places_fall_back_to_xla_with_the_reason(
     if reason is None:
         assert found == places
         assert logs == [
-            "TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER: the split EP MoE's "
-            f"reduce-scatters run rotated over {_PLACES}"
+            "TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER/_GATHER: the split EP "
+            f"MoE's reduce-scatter or gathers run rotated over {_PLACES}"
         ]
     else:
         assert found is None
         assert logs == [
-            f"TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER: {reason}; XLA's collectives"
+            f"TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER/_GATHER: {reason}; "
+            "XLA's collectives"
         ]
 
 
