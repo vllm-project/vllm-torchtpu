@@ -21,9 +21,23 @@
 # built from that name.
 
 set -e
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+profile="${DISAGG_PROFILE:-qwen3.5-397b}"
+case "$profile" in
+  qwen3.5-397b) ;;
+  qwen3.8-flash)
+    case "${DISAGG_DP_SIZE:-8}" in
+      4|8) ;;
+      *) echo "DISAGG_DP_SIZE must be 4 or 8" >&2; exit 2 ;;
+    esac
+    ;;
+  *) echo "Unknown DISAGG_PROFILE: $profile" >&2; exit 2 ;;
+esac
 # The image ships libtpu, which makes vLLM's platform
 # detection pick TPU on this CPU-only pod and fail.
-pip uninstall -y libtpu libtpu-nightly >/dev/null 2>&1 || true
+if [ "$profile" = qwen3.5-397b ]; then
+  pip uninstall -y libtpu libtpu-nightly >/dev/null 2>&1 || true
+fi
 
 # JobSet's per-pod DNS; ${WORKLOAD_NAME} is unique to this
 # run.
@@ -31,14 +45,35 @@ prefill_host=${WORKLOAD_NAME}-prefill-0-0.${WORKLOAD_NAME}
 decode_host=${WORKLOAD_NAME}-decode-0-0.${WORKLOAD_NAME}
 
 echo "Starting proxy server..."
-python3 /workspace/vllm-torchtpu/examples/disagg/toy_proxy_server.py \
+proxy_args=()
+if [ "$profile" = qwen3.8-flash ]; then
+  proxy_args+=(--require-kv-transfer)
+fi
+python3 "$HERE/../../examples/disagg/toy_proxy_server.py" \
   --host 0.0.0.0 \
   --port 10000 \
   --prefiller-host "$prefill_host" \
   --prefiller-port 8000 \
   --decoder-host "$decode_host" \
-  --decoder-port 8000 &
+  --decoder-port 8000 "${proxy_args[@]}" &
 proxy_pid=$!
+
+cleanup_proxy() {
+  if jobs -pr | grep -qx "$proxy_pid"; then
+    kill -TERM "$proxy_pid" 2>/dev/null || true
+    for _ in 1 2 3 4 5; do
+      jobs -pr | grep -qx "$proxy_pid" || break
+      sleep 1
+    done
+    if jobs -pr | grep -qx "$proxy_pid"; then
+      kill -KILL "$proxy_pid" 2>/dev/null || true
+    fi
+  fi
+  wait "$proxy_pid" 2>/dev/null || true
+}
+trap cleanup_proxy EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # The proxy is backgrounded, so its death cannot fail the
 # script by itself and surfaces hours later as a benchmark
@@ -69,15 +104,19 @@ done
 
 echo "Both prefill and decode servers are HEALTHY!"
 
-mkdir -p /tmp/benchmark_results
+results_dir="${DISAGG_RESULTS_DIR:-/tmp/benchmark_results}"
+mkdir -p "$results_dir"
 model="Qwen/Qwen3.5-397B-A17B-FP8"
+if [ "$profile" = qwen3.8-flash ]; then
+  model="${DISAGG_MODEL:-Qwen/Qwen3.8-Flash-Next-FP8}"
+fi
 
 # One record id for the whole sweep, suffixed per cell, so
 # a night's rows can be selected together.
 record_base="kube-vllm-torchtpu-run-$(date +%Y%m%d-%H%M%S)"
 publish_failed=0
 
-publish_result() {
+upload_result_artifact() {
   local path=$1
   [ -f "$path" ] || return 0
   local name
@@ -89,6 +128,16 @@ publish_result() {
   # pass shows up as a duplicate rather than a correction.
   (cd "$(dirname "$path")" && buildkite-agent artifact upload "$name") \
     || { echo "WARNING: could not upload $name"; publish_failed=1; }
+}
+
+publish_result() {
+  local path=$1 artifact_uploaded=${2:-0}
+  [ -f "$path" ] || return 0
+  local name
+  name=$(basename "$path")
+  if [ "$artifact_uploaded" -ne 1 ]; then
+    upload_result_artifact "$path"
+  fi
 
   # A cell whose requests failed describes a broken serving
   # path, not a measurement: stop rather than spend the
@@ -117,9 +166,14 @@ publish_result() {
 # numbers incomparable with those.
 run_cell() {
   local filename=$1 concurrency=$2 input_len=$3 output_len=$4 num_prompts=$5 pmetrics=$6
-  local path="/tmp/benchmark_results/$filename"
+  local path="$results_dir/$filename"
+  require_proxy
   echo "Starting benchmark cell: $filename (c=$concurrency, i=$input_len, o=$output_len, n=$num_prompts)"
-  vllm bench serve \
+  local bench=(vllm bench serve)
+  if [ "$profile" = qwen3.8-flash ]; then
+    bench=(python3 "$HERE/disagg_cpu_bench.py" bench serve)
+  fi
+  "${bench[@]}" \
     --backend=openai \
     --endpoint=/v1/completions \
     --model="$model" \
@@ -143,12 +197,28 @@ run_cell() {
 
   # Per cell rather than at the end, so a sweep that runs
   # out its deadline still yields the cells that finished.
-  publish_result "$path"
+  if [ "$profile" = qwen3.8-flash ]; then
+    upload_result_artifact "$path"
+    python3 "$HERE/disagg_qwen38.py" check-result \
+      --result "$path" --expected-completed "$num_prompts"
+    publish_result "$path" 1
+  else
+    publish_result "$path"
+  fi
   sleep 10
 }
 
 # Warms the prefill + transfer + decode path before any
 # measured cell.
+if [ "$profile" = qwen3.8-flash ]; then
+  run_cell "pd_disagg_qwen38_smoke_c8_i8192_o32.json" \
+    8 8192 32 8 "ttft,tpot,itl,e2el"
+  concurrency=$(( ${DISAGG_DP_SIZE:-8} * 8 ))
+  for round in 1 2 3; do
+    run_cell "pd_disagg_qwen38_round${round}_c${concurrency}_i32768_o1024.json" \
+      "$concurrency" 32768 1024 512 "ttft,tpot,itl,e2el"
+  done
+else
 run_cell "pd_disagg_decode_smoke_c8_i8192_o32.json" 8 8192 32 8 "ttft,tpot,itl,e2el"
 
 # Prefill throughput sweep (bench_all.sh).
@@ -168,8 +238,10 @@ done
 for round in 1 2 3; do
   run_cell "pd_disagg_decode_daily_round${round}_c256_i65536_o1024.json" 256 65536 1024 256 "ttft,tpot,itl,e2el"
 done
+fi
 
-echo "Benchmark complete! Results saved in /tmp/benchmark_results."
+require_proxy
+echo "Benchmark complete! Results saved in $results_dir."
 
 # A sweep whose numbers are missing from the table looks
 # identical to a sweep that never ran.

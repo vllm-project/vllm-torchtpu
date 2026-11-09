@@ -246,3 +246,21 @@ steps:
           - *kube_plugin
         commands:
           - .buildkite/kubernetes/run_multihost.sh --manifest qwen3.5-397b-1p1d.yaml
+
+      - label: "Perf: Nightly Qwen3.8-Flash 1P1D DP{{matrix.dp}} -> DP{{matrix.dp}}"
+        depends_on: "build_docker"
+        if: 'build.env("NIGHTLY") == "1"'
+        timeout_in_minutes: 1440
+        matrix:
+          setup:
+            dp: ["8"]
+        agents:
+          queue: "kube"
+        env:
+          CREATED_BY: "${BUILDKITE_SOURCE:-buildkite}"
+          BQ_UPLOAD: "1"
+          DISAGG_DP_SIZE: "{{matrix.dp}}"
+        plugins:
+          - *kube_plugin
+        commands:
+          - .buildkite/kubernetes/run_multihost.sh --manifest qwen3.8-flash-1p1d.yaml

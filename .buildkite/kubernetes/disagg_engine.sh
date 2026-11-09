@@ -28,6 +28,14 @@ case "$role" in
   *) echo "usage: $0 prefill|decode" >&2; exit 2 ;;
 esac
 
+case "${DISAGG_PROFILE:-qwen3.5-397b}" in
+  qwen3.5-397b) ;;
+  qwen3.8-flash)
+    exec python3 "$(dirname "$0")/disagg_qwen38.py" "$role"
+    ;;
+  *) echo "Unknown DISAGG_PROFILE: $DISAGG_PROFILE" >&2; exit 2 ;;
+esac
+
 # Core dumps are ~4GiB each and overflow the pod's ephemeral storage.
 ulimit -c 0
 export VLLM_HOST_IP="${POD_IP}"

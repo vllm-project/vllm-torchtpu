@@ -125,6 +125,7 @@ FORWARD=(
   # The config both engines of the pair and its client read, when a step serves
   # another than the manifest's default (a Kimi-K3 megakernel recipe point).
   K3_PD_CONFIG
+  DISAGG_DP_SIZE DISAGG_MODEL
 )
 
 # The `tests` plugin mints these on the agent and their two-hour life starts
