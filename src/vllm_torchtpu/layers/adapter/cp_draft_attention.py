@@ -115,12 +115,16 @@ def write_kv(
     )
     if num_tokens < _RUN_WRITE_MIN_TOKENS:
         return kv_cache.at[page, pos % page_size].set(rows, mode="drop")
+    from vllm_torchtpu.models.minimax_m3.kernels.msa_write import max_write_runs
+
+    # A rank owns whole pages, so a request's tokens break into at most
+    # q // page_size + 2 runs, the bound `max_write_runs` takes.
     return write_runs(
         kv_cache,
         rows,
         page,
         pos % page_size,
-        max_runs=num_tokens // page_size + 2 * max_seqs,
+        max_runs=max_write_runs(num_tokens, max_seqs, page_size),
     )
 
 
@@ -142,11 +146,11 @@ def write_runs(
     """``kv_cache.at[pages, slots].set(rows, mode="drop")`` by DMA: one grid
     step per token run (consecutive tokens taking consecutive slots of one
     page), copying the run's rows from HBM in power-of-two pieces."""
-    from vllm_torchtpu.models.minimax_m3.kernels.msa_write import _runs
+    from vllm_torchtpu.models.minimax_m3.kernels.msa_write import token_runs
 
     num_pages, page_size = kv_cache.shape[:2]
     pieces = [1 << b for b in reversed(range(page_size.bit_length()))]
-    num_runs, run_page, run_lo, run_hi, run_tok0 = _runs(
+    num_runs, run_page, run_lo, run_hi, run_tok0 = token_runs(
         pages.astype(jnp.int32), slots.astype(jnp.int32), num_pages, max_runs
     )
 

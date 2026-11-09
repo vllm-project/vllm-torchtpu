@@ -312,7 +312,7 @@ def write_slot_scales(
     """
     num_tokens, num_values = values.shape
     num_pages, rows, lanes = scale_cache.shape
-    num_runs, run_page, run_lo, run_hi, run_tok0 = _runs(
+    num_runs, run_page, run_lo, run_hi, run_tok0 = token_runs(
         pages, slots, num_pages, max_runs
     )
     if num_tokens > _BY_TOKEN_MAX_TOKENS:
@@ -351,7 +351,7 @@ def write_slot_scales(
     )(num_runs[None], run_page, run_lo, run_hi, run_tok0, broadcast, scale_cache)
 
 
-def _runs(pages: jax.Array, slots: jax.Array, num_pages: int, max_runs: int):
+def token_runs(pages: jax.Array, slots: jax.Array, num_pages: int, max_runs: int):
     """Token runs: maximal spans of consecutive tokens writing one page."""
     num_tokens = pages.shape[0]
     tok = jnp.arange(num_tokens, dtype=jnp.int32)
@@ -414,7 +414,7 @@ def write_rows(
     data_rows = rows_per_page - 1 if folded else rows_per_page
     page_size = data_rows * packing
     num_tokens = rows.shape[0]
-    num_runs, run_page, run_lo, run_hi, run_tok0 = _runs(
+    num_runs, run_page, run_lo, run_hi, run_tok0 = token_runs(
         pages, slots, num_pages, max_runs
     )
     if bits == 4:
