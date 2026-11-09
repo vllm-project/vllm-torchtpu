@@ -29,6 +29,7 @@ import copy
 import dataclasses
 import math
 import time
+import types
 from collections.abc import Sequence
 
 import numpy as np
@@ -1230,6 +1231,14 @@ class StagedConsumer:
     # QWEN4_EXP_PD_DRAFT_KV (q38 F2), set by __init__; off for a consumer
     # assembled without it.
     draft_kv = False
+    # The producer's PCP / merged-key geometry (QWEN4_EXP_PD_PRODUCER_PCP,
+    # _MERGED, _SPLIT_KEYS), set by __init__; a plain TP1 producer for a
+    # consumer assembled without it (read-only defaults).
+    src_pcp = 1
+    src_merged = False
+    src_split_keys = False
+    _key_pools: "dict[str, int]" = types.MappingProxyType({})
+    _src_split: "frozenset[str]" = frozenset()
 
     def __init__(self, cfg, decode_layout, decode_groups, pool, rank: RankSlice, staging_bytes: int):
         from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
@@ -1497,6 +1506,13 @@ class StagedConsumer:
 
     # --- allocation (identical on every rank of the engine) ---
 
+    def _pool_group_map(self) -> dict[str, int]:
+        """Staging pool name -> producer group (``_pool_group``). A consumer
+        assembled without ``__init__`` (admission and reuse tests) has only
+        ``_src_owner``, which is the same map without split ``.pcp<r>`` pools."""
+        pool_group = getattr(self, "_pool_group", None)
+        return self._src_owner if pool_group is None else pool_group
+
     def _owner_counts(self, num_tokens: int, skip_tokens: int):
         if self.route is not None:
             # Compact pages per owner, identical on every rank (one destination
@@ -1523,7 +1539,8 @@ class StagedConsumer:
         if any(count <= 0 for count in group_counts):
             raise ValueError("A prefix-aware load must leave every group a suffix")
         owners = [pool.layer_name for pool in self.manifest.pools]
-        counts = [group_counts[self._pool_group[name]] for name in owners]
+        pool_group = self._pool_group_map()
+        counts = [group_counts[pool_group[name]] for name in owners]
         return first, owners, counts
 
     def pages_needed(self, uuid: int, num_tokens: int, *, skip_tokens: int = 0) -> int:
@@ -1629,8 +1646,9 @@ class StagedConsumer:
         # The clip is in the destination's live bytes: a merged key pool's
         # page carries `key_stride` of them (its single "keys" region's
         # unit), a trimmed compressed-key page its keys, else the stride.
+        pool_group = self._pool_group_map()
         return [
-            first[self._pool_group[pool.layer_name]] * _live_page_bytes(pool)
+            first[pool_group[pool.layer_name]] * _live_page_bytes(pool)
             for pool in self.manifest.pools
         ]
 
