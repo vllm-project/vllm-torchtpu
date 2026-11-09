@@ -103,6 +103,8 @@ class _DecodeLocalForwardOptions(TypedDict, total=False):
     attention_projection_schedule: Literal["default", "mla_up_double"]
     mla_commit_tile_size: int | None
     sequence_parallel_size: int
+    gate_first_kda_projection: bool
+    return_hidden: bool
 
 
 class _DecodePagedOptions(_DecodeLocalForwardOptions, total=False):
@@ -312,7 +314,7 @@ def commit_latent_rows(
     global_pages = (
         mla_dcp.GLOBAL_PAGES if global_pages_opt is None else bool(global_pages_opt)
     )
-    member = mla_dcp.owner_index(owner_table) % group
+    member = jnp.asarray(mla_dcp.owner_index(owner_table)) % group
     pool_list = list(pools)
     packing = pool_list[0].shape[-2]
     page_tokens = pool_list[0].shape[-3] * packing
@@ -455,6 +457,9 @@ def _commit_kda_states(
         conv,
         recurrent,
     )
+
+
+commit_kda_states = _commit_kda_states
 
 
 def _unpack_paged_step_inputs(
@@ -623,7 +628,7 @@ def decode_paged(
     if defer_kda_commit:
         conv_slots, recurrent_slots = conv, recurrent
     elif batch_size > _FUSED_KDA_COMMIT_MIN_BATCH and dp in (1, 2, 4):
-        conv_slots, recurrent_slots = _commit_kda_states(
+        conv_slots, recurrent_slots = commit_kda_states(
             conv_slots, recurrent_slots, conv, recurrent, state_index
         )
     else:
@@ -636,14 +641,18 @@ def decode_paged(
             block_tables[group_rows],
             positions[group_rows],
         )
+    dcp_group = 32 // dp if dp > 1 else mla_dcp.GROUP
     committed_pool = commit_latent_rows(
         pools,
         latents,
         block_tables,
         positions,
         dcp_pool_map,
+        group=dcp_group,
         owner_table=dcp_owner_table,
     )
+    return_hidden = bool(decode_options.get("return_hidden", False))
+    primary_out = logits if return_hidden else logits[0]
     if aux is not None:
-        return logits[0], aux, conv_slots, recurrent_slots, committed_pool
-    return logits[0], conv_slots, recurrent_slots, committed_pool
+        return primary_out, aux, conv_slots, recurrent_slots, committed_pool
+    return primary_out, conv_slots, recurrent_slots, committed_pool

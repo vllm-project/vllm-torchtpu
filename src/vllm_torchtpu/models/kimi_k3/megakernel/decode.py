@@ -30,7 +30,6 @@ import jax.numpy as jnp
 import numpy as np
 import torch
 from jax.sharding import PartitionSpec as P
-from torch_tpu._internal.sync import synchronize
 
 from vllm_torchtpu.logger import init_logger
 
@@ -70,6 +69,12 @@ from .runtime_shim.program import (
     StepInput,
     StepOutput,
 )
+
+try:
+    from torch_tpu._internal.sync import synchronize as _tpu_synchronize
+except (ModuleNotFoundError, AttributeError):
+    _tpu_synchronize = None
+synchronize = _tpu_synchronize
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -1150,7 +1155,11 @@ class KimiDecoder:
         if self.control is None:
             msg = "K3 decode: control tensor missing after first plain step"
             raise RuntimeError(msg)
-        synchronize(
+        sync_fn = synchronize or _tpu_synchronize
+        if sync_fn is None:
+            msg = "KimiDecoder precompilation requires torch_tpu synchronization"
+            raise RuntimeError(msg)
+        sync_fn(
             [first, self.control, *self.ops.slots, *self.ops.unified_pools],
             wait=False,
         )

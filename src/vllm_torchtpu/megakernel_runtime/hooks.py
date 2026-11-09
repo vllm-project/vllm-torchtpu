@@ -52,6 +52,10 @@ class StepContext:
     # `inputs_embeds` built from them alone (a multimodal-capable model, but
     # no multimodal embeddings in this step); `None` otherwise.
     token_ids: Any = None
+    req_ids: Any = None
+    finished_req_ids: Any = None
+    kda_block_tables: Any = None
+    accepted_counts: Any = None
 
 
 @contextlib.contextmanager

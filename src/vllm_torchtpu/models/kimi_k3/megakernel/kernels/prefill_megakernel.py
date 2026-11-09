@@ -4661,8 +4661,8 @@ def _load_kv_block(
 ) -> tuple[jax.Array, jax.Array]:
     """Wait for key_block's KV tile, prefetch next block, and mask values."""
     k_buf, v_buf, tile, value_mask = (
-        _args[0],
-        _args[1],
+        _args[0] if _args else _cfg["k_buf"],
+        _args[1] if len(_args) > 1 else _cfg["v_buf"],
         _cfg["tile"],
         _cfg["value_mask"],
     )
@@ -7353,7 +7353,11 @@ def make_regular_group4_sp_indexed(
             segment_desc = (
                 _kwargs["segment_desc"] if "segment_desc" in _kwargs else _args[6]
             )
-            arena = _kwargs["arena"] if "arena" in _kwargs else _args[-1]
+            arena = (
+                _kwargs["arena"]
+                if "arena" in _kwargs
+                else (_args[7] if len(_args) > 7 else _args[6])
+            )
         else:
             (
                 mla_families,
@@ -7505,7 +7509,11 @@ def make_regular_group8_sp_indexed(
             segment_desc = (
                 _kwargs["segment_desc"] if "segment_desc" in _kwargs else _args[6]
             )
-            arena = _kwargs["arena"] if "arena" in _kwargs else _args[-1]
+            arena = (
+                _kwargs["arena"]
+                if "arena" in _kwargs
+                else (_args[7] if len(_args) > 7 else _args[6])
+            )
         else:
             (
                 mla_families,
@@ -7608,7 +7616,11 @@ def make_final_mla_sp_indexed(
             segment_desc = (
                 _kwargs["segment_desc"] if "segment_desc" in _kwargs else _args[3]
             )
-            arena = _kwargs["arena"] if "arena" in _kwargs else _args[-1]
+            arena = (
+                _kwargs["arena"]
+                if "arena" in _kwargs
+                else (_args[4] if len(_args) > 4 else _args[3])
+            )
         else:
             moe_families, mla_state, length, segment_desc, arena = _args
         _check(len(mla_state) == 1, "mla_state is (latents,)")
@@ -7769,7 +7781,11 @@ def make_prefill_stack_sp_indexed(mesh: _KernelArg, **_cfg: _KernelArg) -> _Kern
             segment_desc = (
                 _kwargs["segment_desc"] if "segment_desc" in _kwargs else _args[4]
             )
-            arena = _kwargs["arena"] if "arena" in _kwargs else _args[-1]
+            arena = (
+                _kwargs["arena"]
+                if "arena" in _kwargs
+                else (_args[5] if len(_args) > 5 else _args[4])
+            )
         else:
             moe_families, kda_state, mla_state, length, segment_desc, arena = _args
         kda_state = tuple(kda_state)
@@ -7837,7 +7853,11 @@ def make_prefill_stack_sp_indexed(mesh: _KernelArg, **_cfg: _KernelArg) -> _Kern
         def body(index: _KernelArg, carry: _KernelArg) -> _KernelArg:
             """Advance one Pallas loop step over tiles, ring hops, or chunks."""
             prefix, blocks, kda_states, mla_cache, tap = carry
-            tap = jnp.where(index == tap_layer, prefix, tap) if tap != () else tap
+            tap = (
+                jnp.where(index == tap_layer, prefix, tap)
+                if tap_layer is not None
+                else tap
+            )
             blocks = jax.lax.cond(
                 index % 12 == 0,
                 lambda x: x.at[:, index // 12].set(prefix),

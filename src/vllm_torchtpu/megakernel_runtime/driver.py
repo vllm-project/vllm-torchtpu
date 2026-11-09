@@ -581,6 +581,28 @@ class ProgramDriver(StepRouting):
         self.step_mix_tracker.reset()
         self.ab_calibrator.reset()
 
+    def on_verify_accepted(
+        self,
+        req_ids: Sequence[str] | None,
+        num_valid: torch.Tensor,
+    ) -> None:
+        """Forward accepted token counts from speculative verification."""
+        hook = getattr(self.program, "on_verify_accepted", None)
+        if callable(hook):
+            hook(req_ids, num_valid)
+
+
+def _declined_on_verify_accepted(
+    _self: DeclinedDriver,
+    _req_ids: Sequence[str] | None,
+    _num_valid: torch.Tensor,
+) -> None:
+    """No-op speculative verification callback when declined."""
+    return
+
+
+type.__setattr__(DeclinedDriver, "on_verify_accepted", _declined_on_verify_accepted)
+
 
 def maybe_create(runner: Any) -> ProgramDriver | DeclinedDriver | None:
     """Create the configured megakernel plugin's driver for `runner`."""
