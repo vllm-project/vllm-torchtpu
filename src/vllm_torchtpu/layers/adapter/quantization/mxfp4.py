@@ -928,6 +928,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             _with_image_bias(layer, score_bias_operand(layer), input_ids, rows),
             hash_topk_ids_operand(layer, input_ids),
             expert_placement.expert_slot_table(layer),
+            expert_load.operand(layer),
             shared_expert=shared_expert,
         )
 
