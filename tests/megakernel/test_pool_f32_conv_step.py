@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""A Qwen3.5 pooled step over a pool that stores the conv state as f32.
+"""Pooled step over a pool that stores the conv state as f32.
 
 The step reads and writes the conv window as f32 (the dtype the serving
 framework's stock GDN kernel uses), on the split pool I/O path; it must match
@@ -30,10 +30,104 @@ import pytest
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
+from tests.megakernel.megakernel_synth import TINY_TILES, synth_hybrid_spec
 from vllm_torchtpu import megakernel as mk
 from vllm_torchtpu.megakernel import pool
-from vllm_torchtpu.models.qwen3_5.megakernel import model as qwen35
-from vllm_torchtpu.models.qwen3_5.megakernel.profiles.baseline import TINY_TILES
+from vllm_torchtpu.megakernel.modules import Norm
+from vllm_torchtpu.megakernel.modules.transforms import apply_hf_transforms
+from vllm_torchtpu.megakernel.ops import BF16, F32, FP8, I32
+from vllm_torchtpu.megakernel.pool.config import resolved_max_pages_per_seq
+from vllm_torchtpu.megakernel.reference import spec_reference_step
+from vllm_torchtpu.megakernel.weights.spec_inputs import coerce_canonical_hf_entry
+from vllm_torchtpu.megakernel.weights.spec_pack import switch_branch_for_layer
+
+
+def _random_synth_inputs(
+    key: jax.Array, spec: mk.ModelSpec, ex: mk.ExecSpec
+) -> tuple[jax.Array, jax.Array, dict, dict]:
+    """Generate `(pos, hid_l, w_l, st_l)` from `spec` with `hf_params()` PRNG order."""
+    g = spec.config
+    g.check(ex)
+    L = int(g.L)
+    counts = {m.name: 0 for m in spec.all_modules()}
+    for s in spec.layer_type.slots:
+        if isinstance(s, mk.SwitchSlot):
+            for lyr in range(L):
+                b_mod, _ = switch_branch_for_layer(s, lyr)
+                counts[b_mod.name] = counts.get(b_mod.name, 0) + 1
+        else:
+            counts[s.name] = counts.get(s.name, 0) + L
+    active_mods = [
+        (m, counts[m.name]) for m in spec.all_modules() if counts.get(m.name, 0) > 0
+    ]
+    k_hf, k_hid, *k_mods = jax.random.split(key, 2 + len(active_mods))
+    base_pos = jnp.arange(1, ex.NS + 1, dtype=I32) * min(16, ex.ctx // 4)
+    pos = (
+        base_pos
+        if ex.T == 1
+        else (base_pos[:, None] + jnp.arange(ex.T, dtype=I32)[None, :]).reshape(ex.B)
+    )
+    hidden = jax.random.normal(k_hid, (ex.B, int(g.H)), dtype=BF16) * 0.1
+    total_decls = 3 + sum(len(m.hf_params(g=g)) for m, _ in active_mods)
+    it = iter(jax.random.split(k_hf, max(16, total_decls)))
+
+    def _draw(d, lead: tuple[int, ...]) -> jax.Array:
+        hf_sh = d.shape if d.hf_shape is None else d.hf_shape
+        sh = (*lead, *hf_sh)
+        if d.transform.scale_for is not None:
+            return jnp.abs(jax.random.normal(next(it), sh, dtype=F32)) * 0.02 + 0.01
+        if d.transform.quantize is not None or jnp.dtype(d.dtype) == jnp.dtype(FP8):
+            return (jax.random.normal(next(it), sh, dtype=F32) * 0.25).astype(FP8)
+        mean = 0.0 if d.init is None else float(d.init.mean)
+        std = 0.05 if d.init is None else float(d.init.std)
+        raw = jax.random.normal(next(it), sh, dtype=d.dtype) * std
+        return jnp.ones(sh, dtype=d.dtype) + raw if mean == 1.0 else raw + mean
+
+    zc = bool(getattr(g, "zero_centered_norm", True))
+    pre_n = Norm("input_layernorm", zero_centered=zc, param_name="in_norm")
+    post_n = Norm("post_attention_layernorm", zero_centered=zc, param_name="post_norm")
+    final_n = Norm("model.norm", zero_centered=zc, param_name="final_norm")
+    hf = {
+        "in_norm": _draw(pre_n.hf_params(g=g)[0], (L,)),
+        "post_norm": _draw(post_n.hf_params(g=g)[0], (L,)),
+        "final_norm": _draw(final_n.hf_params(g=g)[0], ()),
+    }
+    split_sources: dict[tuple[str, str], jax.Array] = {}
+    for mod, n_l in active_mods:
+        for d in mod.hf_params(g=g):
+            if d.name in hf:
+                continue
+            if d.transform.split_from is not None:
+                sk = (mod.name, d.transform.split_from)
+                if sk not in split_sources:
+                    split_sources[sk] = _draw(d, (n_l,))
+                hf[d.name] = split_sources[sk]
+            else:
+                hf[d.name] = _draw(d, (n_l,))
+
+    w_l: dict = {
+        "in_norm": jnp.asarray(hf["in_norm"], dtype=F32),
+        "post_norm": jnp.asarray(hf["post_norm"], dtype=F32),
+        "final_norm": jnp.asarray(hf["final_norm"], dtype=F32),
+    }
+    for mod, _ in active_mods:
+        decls = mod.hf_params(g=g)
+        fuse_members: dict[str, list] = {}
+        for d in decls:
+            if d.transform.fuse_into is not None:
+                fuse_members.setdefault(d.transform.fuse_into, []).append(d)
+        for grp in fuse_members.values():
+            grp.sort(key=lambda m: m.transform.fuse_order)
+        canon = {
+            d.name: coerce_canonical_hf_entry(d, hf, fuse_members, has_layer_dim=True)
+            for d in decls
+        }
+        w_l.update(apply_hf_transforms(decls, canon, R=ex.R))
+
+    st_l: dict = {}
+    for k_m, (mod, n_l) in zip(k_mods, active_mods):
+        st_l.update(mod.init_logical_states(k_m, g, ex, n_l))
+    return pos, hidden, w_l, st_l
 
 
 @pytest.fixture(autouse=True)
@@ -49,11 +143,28 @@ def _cpu_mesh(R: int) -> Mesh:
     return Mesh(np.array(devs[:R]), ("tp",))
 
 
-def _tiny_geom() -> qwen35.Qwen35Geometry:
-    return qwen35.Qwen35Geometry(
-        L=4, H=256, I=256, IS=256, E=128, TOPK=2, NH=4, NKV=2, HD=256, ROT=64,
-        KH=2, VH=4, KD=128, VD=128, att_every=4, moe_tp=False, e_slots=0,
-    )  # fmt: skip
+def _tiny_geom() -> mk.ModelGeometry:
+    return mk.ModelGeometry(
+        L=4,
+        H=256,
+        I=256,
+        IS=256,
+        E=128,
+        TOPK=2,
+        NH=4,
+        NKV=2,
+        HD=256,
+        ROT=64,
+        KH=2,
+        VH=4,
+        KD=128,
+        VD=128,
+        att_every=4,
+        moe_tp=False,
+        e_slots=0,
+        theta=10_000_000.0,
+        zero_centered_norm=True,
+    )
 
 
 def _tiny_exec(R: int, B: int, T: int) -> mk.ExecSpec:
@@ -81,23 +192,32 @@ def test_f32_conv_pooled_step_matches_reference_and_keeps_conv_exact(T: int, B: 
     tp = NamedSharding(mesh, P("tp"))
     g = _tiny_geom()
     ex = _tiny_exec(R=2, B=B, T=T)
-    pos, hid_l, w_l, st_l = mk.random_logical_inputs(jax.random.key(70 + T), g, ex)
+    spec = synth_hybrid_spec(g, R=2)
+    pos, hid_l, w_l, st_l = _random_synth_inputs(jax.random.key(70 + T), spec, ex)
     conv = np.asarray(st_l["conv"], np.float32)
     assert not np.array_equal(
         conv, np.asarray(st_l["conv"].astype(jnp.bfloat16), np.float32)
     )
 
-    ref_out, ref_st = qwen35.reference_step(
-        g, ex, pos, hid_l, w_l, st_l, paged_kv=True, pool_io=True
+    ref_out, ref_st = spec_reference_step(
+        spec, g, ex, pos, hid_l, w_l, st_l, paged_kv=True, pool_io=True
     )
-    _, hid_mk, w_mk, st_mk_paged = mk.pack_inputs(
-        pos, hid_l, w_l, st_l, g, ex, mesh=mesh, build_default_pool=True
+    _, hid_mk, w_mk, st_mk_paged = mk.pack_spec_inputs(
+        pos, hid_l, w_l, st_l, spec, ex, mesh=mesh
     )
-    _, mk_st = qwen35.make_step(mesh, g, ex, donate_states=False)[0](
+    play_base = spec.cache_backend.layout
+    pt_base, ckpt_base, roff_base, _ = pool.allocate_test_layout(play_base, ex)
+    st_mk_paged[mk.POOL_STATE_NAME] = tuple(
+        jax.device_put(r, tp)
+        for r in pool.states_to_pool(play_base, ex, st_l, pt_base, ckpt_base, roff_base)
+    )
+    st_mk_paged["page_table"] = jax.device_put(
+        jnp.tile(pt_base[:, : resolved_max_pages_per_seq(ex)], (ex.R, 1)), tp
+    )
+    _, mk_st = mk.make_step(mesh, spec, ex, donate_states=False)[0](
         pos, hid_mk, w_mk, st_mk_paged
     )
 
-    spec = qwen35.qwen35_spec(g)
     errs = {}
     for name, dt in (("f32", jnp.float32), ("bf16", jnp.bfloat16)):
         spec_dt, lay = _with_conv_dtype(spec, dt)
@@ -149,8 +269,8 @@ def _with_f32_in_kernel_backend(spec):
     return replace(spec, cache_backend=pb), lay
 
 
-def _wide_conv_geom() -> qwen35.Qwen35Geometry:
-    """Per-rank `QKV = 1536` (`qkv_128 = 12`, matching Qwen3.5 TP=8 conv width):
+def _wide_conv_geom() -> mk.ModelGeometry:
+    """Per-rank `QKV = 1536` (`qkv_128 = 12`, wide TP=8 conv width):
     `GCONV_ROWS = 96 > 64` (2-DMA K+V GPR path) and `conv8_rows = 96 <= 128`."""
     return replace(_tiny_geom(), KH=4, VH=16)
 
@@ -192,18 +312,19 @@ def test_f32_conv_fused_matches_split_bitwise(T: int, wide_qkv: bool):
         tiles=tiles.with_modules({"gdn": {"conv_stage": True, "gdn_head_major": True}}),
     )
 
-    pos, hid_l, w_l, st_l = mk.random_logical_inputs(
-        jax.random.key(710 + 10 * T + B + 2000), g, ex_split
+    spec_base = synth_hybrid_spec(g, R=2)
+    pos, hid_l, w_l, st_l = _random_synth_inputs(
+        jax.random.key(710 + 10 * T + B + 2000), spec_base, ex_split
     )
     assert not np.array_equal(
         np.asarray(st_l["conv"], np.float32),
         np.asarray(st_l["conv"].astype(jnp.bfloat16), np.float32),
     )
-    _, hid_mk, w_mk, _ = mk.pack_inputs(
-        pos, hid_l, w_l, st_l, g, ex_split, mesh=mesh, build_default_pool=True
+    _, hid_mk, w_mk, _ = mk.pack_spec_inputs(
+        pos, hid_l, w_l, st_l, spec_base, ex_split, mesh=mesh
     )
 
-    spec_f32, lay = _with_f32_in_kernel_backend(qwen35.qwen35_spec(g))
+    spec_f32, lay = _with_f32_in_kernel_backend(spec_base)
     pt, ckpt, roff, min_np = pool.allocate_test_layout(lay, ex_split)
     assert mk.cache_exec(ex_split).num_pages >= min_np
     raw_init = [
@@ -295,14 +416,15 @@ def test_f32_conv_gpr_matches_split_bitwise(wide_qkv: bool):
     )
     ex_gpr = mk.with_cache(ex_split, fused_pool_io=False, pool_gather=True)
 
-    pos, hid_l, w_l, st_l = mk.random_logical_inputs(
-        jax.random.key(410 + int(wide_qkv)), g, ex_split
+    spec_base = synth_hybrid_spec(g, R=2)
+    pos, hid_l, w_l, st_l = mk.random_spec_inputs(
+        jax.random.key(410 + int(wide_qkv)), spec_base, ex_split
     )
-    _, hid_mk, w_mk, _ = mk.pack_inputs(
-        pos, hid_l, w_l, st_l, g, ex_split, mesh=mesh, build_default_pool=True
+    _, hid_mk, w_mk, _ = mk.pack_spec_inputs(
+        pos, hid_l, w_l, st_l, spec_base, ex_split, mesh=mesh
     )
 
-    spec_f32, lay = _with_f32_in_kernel_backend(qwen35.qwen35_spec(g))
+    spec_f32, lay = _with_f32_in_kernel_backend(spec_base)
     pt, ckpt, roff, min_np = pool.allocate_test_layout(lay, ex_split)
     assert mk.cache_exec(ex_split).num_pages >= min_np
     raw_init = tuple(
@@ -413,13 +535,14 @@ def test_f32_conv_ignores_poisoned_stale_rows_36_to_127(T: int):
             pool_gather=False,
         ),
     )
-    pos, hid_l, w_l, st_l = mk.random_logical_inputs(
-        jax.random.key(910 + T), g, ex_split
+    spec_base = synth_hybrid_spec(g, R=2)
+    pos, hid_l, w_l, st_l = mk.random_spec_inputs(
+        jax.random.key(910 + T), spec_base, ex_split
     )
-    _, hid_mk, w_mk, _ = mk.pack_inputs(
-        pos, hid_l, w_l, st_l, g, ex_split, mesh=mesh, build_default_pool=True
+    _, hid_mk, w_mk, _ = mk.pack_spec_inputs(
+        pos, hid_l, w_l, st_l, spec_base, ex_split, mesh=mesh
     )
-    spec_f32, lay = _with_f32_in_kernel_backend(qwen35.qwen35_spec(g))
+    spec_f32, lay = _with_f32_in_kernel_backend(spec_base)
     assert lay.conv_rows(ex_split.R) == 36
     pt, ckpt, roff, _ = pool.allocate_test_layout(lay, ex_split)
     raw_clean = tuple(
@@ -510,20 +633,20 @@ def test_f32_conv_non_interpret_lowers_cleanly(T: int, fused: bool, gpr: bool):
     ex_host = mk.with_cache(
         replace(ex, interpret=True), fused_pool_io=False, pool_gather=False
     )
-    pos, hid_l, w_l, st_l = mk.random_logical_inputs(
-        jax.random.key(500 + T + int(fused)), g, ex_host
+    spec_base = synth_hybrid_spec(g, R=2)
+    pos, hid_l, w_l, st_l = mk.random_spec_inputs(
+        jax.random.key(500 + T + int(fused)), spec_base, ex_host
     )
-    _, hid_mk, w_mk, _ = mk.pack_inputs(
+    _, hid_mk, w_mk, _ = mk.pack_spec_inputs(
         pos,
         hid_l,
         w_l,
         st_l,
-        g,
+        spec_base,
         ex_host,
         mesh=mesh,
-        build_default_pool=True,
     )
-    spec_f32, lay = _with_f32_in_kernel_backend(qwen35.qwen35_spec(g))
+    spec_f32, lay = _with_f32_in_kernel_backend(spec_base)
     pt, ckpt, roff, _ = pool.allocate_test_layout(lay, ex_host)
     raw_init = tuple(
         jax.device_put(r, tp)
@@ -550,7 +673,7 @@ def test_model_spec_with_layout_clones_gdn_module_without_mutating_shared_pool_l
     mesh = _cpu_mesh(2)
     g = _tiny_geom()
     ex = mk.with_cache(_tiny_exec(R=2, B=4, T=2), pool_gather=True)
-    spec_bf16 = qwen35.qwen35_spec(g)
+    spec_bf16 = synth_hybrid_spec(g, R=2)
     spec_f32, f32_lay = _with_conv_dtype(spec_bf16, jnp.float32)
 
     gdn_bf16 = next(m for m in spec_bf16.all_modules() if m.name == "gdn")

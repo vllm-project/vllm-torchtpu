@@ -28,6 +28,8 @@ import pytest
 
 import vllm_torchtpu.megakernel as mk
 from tests.megakernel import frozen_utils
+from vllm_torchtpu.megakernel import planner
+from vllm_torchtpu.megakernel.decls import RecurrentCacheDecl
 from vllm_torchtpu.megakernel.errors import MegakernelConfigError
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec
 from vllm_torchtpu.megakernel.model_def import (
@@ -36,6 +38,7 @@ from vllm_torchtpu.megakernel.model_def import (
     LMHead,
     ModelDef,
     Schedule,
+    find_model,
     get_model,
     register_model,
 )
@@ -51,6 +54,7 @@ from vllm_torchtpu.megakernel.modules import (
 )
 from vllm_torchtpu.megakernel.ops import BF16, F32, round_bf16
 from vllm_torchtpu.models.qwen3_5.megakernel import model as qwen35
+from vllm_torchtpu.models.qwen3_5.megakernel import model as qwen35_mod
 from vllm_torchtpu.models.qwen3_5.megakernel import pool as qwen35_pool
 from vllm_torchtpu.models.qwen3_5.megakernel.model import DEFAULT_HF_CONFIG, Qwen35
 from vllm_torchtpu.models.qwen3_5.megakernel.profiles.baseline import (
@@ -870,3 +874,243 @@ def test_synthetic_model_def_every2_cpu_kernel_vs_reference(
     assert jnp.allclose(
         rec_mk.astype(F32), ref_st["rec"].astype(F32), atol=5e-2, rtol=2e-2
     )
+
+
+@pytest.mark.parametrize(
+    ("arch", "model_type", "num_experts", "exp_found", "exp_eligible", "exp_reason"),
+    [
+        ("UnknownArch", "qwen3_5_moe", 512, True, True, "ok"),
+        ("UnknownArch", "qwen3_5_moe_text", 512, True, True, "ok"),
+        ("UnknownArch", "qwen3_5", 512, True, True, "ok"),
+        ("UnknownArch", "qwen3_5", 0, True, False, "non_moe_checkpoint"),
+        ("Qwen3_5MoeForConditionalGeneration", "unknown", 512, True, True, "ok"),
+        ("Qwen3_5MoeForCausalLM", "unknown", 512, True, True, "ok"),
+        ("Qwen3_5ForConditionalGeneration", "unknown", 512, True, True, "ok"),
+        (
+            "Qwen3_5ForConditionalGeneration",
+            "unknown",
+            0,
+            True,
+            False,
+            "non_moe_checkpoint",
+        ),
+        ("Qwen3_5ForCausalLM", "unknown", 512, True, True, "ok"),
+        ("Qwen3_5ForCausalLM", "unknown", None, True, False, "non_moe_checkpoint"),
+        ("LlamaForCausalLM", "llama", 512, False, False, ""),
+        ("Qwen2_5ForCausalLM", "qwen2_5", 512, False, False, ""),
+    ],
+)
+def test_qwen35_seven_routing_keys_and_dense_rejection(
+    arch: str,
+    model_type: str,
+    num_experts: int | None,
+    exp_found: bool,
+    exp_eligible: bool,
+    exp_reason: str,
+):
+    """Verify all 7 `Qwen35` routing keys resolve to `Qwen35` and reject dense."""
+    cfg = dict(Qwen35.default_hf_config)
+    cfg["architectures"] = [arch]
+    cfg["model_type"] = model_type
+    if num_experts is None:
+        cfg.pop("num_experts", None)
+    else:
+        cfg["num_experts"] = num_experts
+
+    found = find_model(cfg)
+    if not exp_found:
+        assert found is None
+        return
+    assert found is Qwen35
+    el = found.validate_hf_config(cfg)
+    assert el.eligible is exp_eligible
+    assert el.reason == exp_reason
+
+
+@pytest.mark.slow
+def test_verify_qwen35_model_hf():
+    """`mk.verify_model("qwen3_5", hf=True)` passes when `transformers` is installed
+    or skips cleanly with a clear reason when unavailable.
+    """
+    try:
+        import torch
+        import transformers
+
+        has_tf = hasattr(transformers, "Qwen3_5MoeForCausalLM") and hasattr(
+            torch, "Tensor"
+        )
+    except ImportError:
+        has_tf = False
+
+    rep = mk.verify_model("qwen3_5", hf=True, approx_profiles=False, T_values=(1,))
+    by_name = {c.name: c for c in rep.checks}
+    hf_c = by_name["reference_vs_hf"]
+    if has_tf:
+        rep.assert_passed(allow_skipped=False)
+        assert hf_c.status == "passed", hf_c.reason
+        assert hf_c.max_abs_err <= hf_c.tolerance["hf_hidden_atol"]
+        assert hf_c.min_cos >= hf_c.tolerance["hf_hidden_min_cos"]
+    else:
+        assert rep.passed
+        assert hf_c.status == "skipped"
+        assert "unavailable" in hf_c.reason
+
+
+def test_qwen35_b5_weight_hashes_and_random_hf_weights():
+    """Verify `Qwen35` `load_logical_weights` and `load_hf` match `b5_weight_hashes`."""
+    import hashlib
+    import json
+    from pathlib import Path
+
+    from vllm_torchtpu.megakernel.ops import FP8
+    from vllm_torchtpu.megakernel.weights.logical import (
+        resolve_spec_and_norms,
+        switch_branch_for_layer,
+    )
+
+    golden_path = (
+        Path(__file__).resolve().parents[3]
+        / "megakernel"
+        / "golden"
+        / "b5_weight_hashes.json"
+    )
+    if not golden_path.is_file():
+        pytest.skip("b5_weight_hashes.json not present")
+    golden = json.loads(golden_path.read_text(encoding="utf-8"))
+    assert golden["base_commit"] == "4d43f2936f571c305f516031038d1378e62e6295"
+
+    def _arr_info(a: Any) -> dict[str, Any]:
+        b = np.ascontiguousarray(np.asarray(a)).view(np.uint8).tobytes()
+        return {
+            "shape": list(a.shape),
+            "dtype": str(a.dtype),
+            "sha256": hashlib.sha256(b).hexdigest(),
+        }
+
+    ex_base = ExecSpec(R=2, B=2, T=1, ctx=2048)
+    g_eplb = dataclasses.replace(qwen35_mod.TINY_EP, e_slots=72)
+    e_cores_eplb = mk.default_eplb_cores(g_eplb, ex_base.R)
+    geom_cases = [
+        (
+            "TINY",
+            qwen35_mod.TINY,
+            None,
+            ("default", "candidate30", "candidate30-fused"),
+        ),
+        ("TINY_EP", qwen35_mod.TINY_EP, None, ("default", "candidate30")),
+        ("TINY_EP_EPLB72", g_eplb, e_cores_eplb, ("default",)),
+    ]
+
+    def _pinned_b5_hf_weights(key: jax.Array, geom: Any) -> dict[str, jax.Array]:
+        r_p = max(int(getattr(geom, "NKV", 1)), 1)
+        ex_p = ExecSpec(R=r_p, B=r_p, T=1, ctx=2048)
+        ms, geom, pre_n, post_n, final_n = resolve_spec_and_norms(Qwen35, ex_p, g=geom)
+        L_ = int(geom.L)
+        cnts: dict[str, int] = {m.name: 0 for m in ms.all_modules()}
+        for s in ms.layer_type.slots:
+            if isinstance(s, mk.SwitchSlot):
+                for lyr in range(L_):
+                    bm, _ = switch_branch_for_layer(s, lyr)
+                    cnts[bm.name] = cnts.get(bm.name, 0) + 1
+            else:
+                cnts[s.name] = cnts.get(s.name, 0) + L_
+        non_rec, rec = [], []
+        for m in ms.all_modules():
+            if (cnt := cnts.get(m.name, 0)) > 0:
+                (
+                    rec
+                    if isinstance(m.cache_decl(geom), RecurrentCacheDecl)
+                    else non_rec
+                ).append((m, cnt))
+        it = iter(jax.random.split(key, 56))
+
+        def _draw(d: Any, lead: tuple[int, ...]) -> jax.Array:
+            sh = (*lead, *d.shape)
+            if d.transform.scale_for is not None:
+                arr = jnp.abs(jax.random.normal(next(it), sh, dtype=F32)) * 0.02 + 0.01
+            elif d.transform.quantize is not None or jnp.dtype(d.dtype) == jnp.dtype(
+                FP8
+            ):
+                arr = (jax.random.normal(next(it), sh, dtype=F32) * 0.25).astype(FP8)
+            else:
+                mean = 0.0 if d.init is None else float(d.init.mean)
+                std = 0.05 if d.init is None else float(d.init.std)
+                raw = jax.random.normal(next(it), sh, dtype=d.dtype) * std
+                arr = jnp.ones(sh, dtype=d.dtype) + raw if mean == 1.0 else raw + mean
+            tp = d.transform.transpose
+            if d.hf_shape == d.shape and tp is not None:
+                n_l = len(lead)
+                arr = jnp.transpose(arr, (*range(n_l), *(n_l + i for i in tp)))
+            return arr
+
+        pre_drawn: dict[str, jax.Array] = {}
+        for mod, n_l in non_rec:
+            ds = mod.hf_params(g=geom)
+            by_n = {x.name: x for x in ds}
+            for d in ds:
+                t = by_n.get(d.transform.scale_for, d) if d.transform.scale_for else d
+                if t.transform.fuse_into is not None or bool(
+                    t.vllm_aliases and len(t.vllm_aliases[-1].targets) > 1
+                ):
+                    pre_drawn[d.name] = _draw(d, (n_l,))
+        out_hf: dict[str, jax.Array] = {}
+        for nm in (pre_n, post_n):
+            if nm is not None:
+                nd = nm.hf_params(g=geom)[0]
+                out_hf[nd.name] = _draw(nd, (L_,))
+        if final_n is not None:
+            fd = final_n.hf_params(g=geom)[0]
+            out_hf[fd.name] = _draw(fd, ())
+        for mod, n_l in (*non_rec, *rec):
+            for d in mod.hf_params(g=geom):
+                out_hf[d.name] = (
+                    pre_drawn[d.name] if d.name in pre_drawn else _draw(d, (n_l,))
+                )
+        return out_hf
+
+    hf_decl_only = mk.random_hf_weights(jax.random.PRNGKey(0), qwen35_mod.TINY)
+    assert "q_proj" in hf_decl_only and "lin_q" in hf_decl_only and "e2" in hf_decl_only
+
+    checked_packed = 0
+    for g_name, g_case, e_cores, profiles in geom_cases:
+        hf = _pinned_b5_hf_weights(jax.random.PRNGKey(0), g_case)
+        w_l = mk.load_logical_weights(Qwen35, ex_base, hf, g=g_case, e_cores=e_cores)
+        got_logical = {
+            k: _arr_info(v) for k, v in sorted(w_l.items()) if k != "e_cores"
+        }
+        assert got_logical == golden["logical"][g_name], f"logical mismatch on {g_name}"
+
+        for prof_name in profiles:
+            prof = Qwen35.get_profile(prof_name)
+            for stack_e in (False, True):
+                ex_c = prof.exec_for(
+                    dataclasses.replace(ex_base, stack_e=stack_e),
+                    B=ex_base.B,
+                    T=ex_base.T,
+                    g=g_case,
+                )
+                ex_c = mk.fit_default_tiles(g_case.to_model_spec(), ex_c)
+                w_mk = mk.load_hf(Qwen35, ex_c, hf, g=g_case, e_cores=e_cores)
+                p = planner.plan(g_case.to_model_spec(), ex_c)
+                w_flat = [
+                    x
+                    for k in p.w_names
+                    for x in (
+                        w_mk[k] if isinstance(w_mk[k], (tuple, list)) else (w_mk[k],)
+                    )
+                ]
+                got_w_mk = {
+                    k: [_arr_info(x) for x in v]
+                    if isinstance(v, tuple)
+                    else _arr_info(v)
+                    for k, v in sorted(w_mk.items())
+                }
+                got_w_flat = [_arr_info(x) for x in w_flat]
+                combo_key = f"{g_name}/{prof_name}/stack_e={stack_e}"
+                exp_combo = golden["packed"][combo_key]
+                assert got_w_mk == exp_combo["w_mk"], f"w_mk mismatch on {combo_key}"
+                assert got_w_flat == exp_combo["w_flat"], (
+                    f"w_flat mismatch on {combo_key}"
+                )
+                checked_packed += 1
+    assert checked_packed == 12

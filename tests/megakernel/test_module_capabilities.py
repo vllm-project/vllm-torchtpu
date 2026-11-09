@@ -18,7 +18,6 @@ output roles and comparison modes, `ModelDef`-free verification input builders,
 
 from __future__ import annotations
 
-import dataclasses
 from typing import Any
 
 import jax
@@ -27,9 +26,9 @@ import pytest
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import Mesh
 
+from tests.megakernel.megakernel_synth import synth_hybrid_spec
 from vllm_torchtpu import megakernel as mk
 from vllm_torchtpu.megakernel.ops import BF16, F32, rmsnorm, round_bf16
-from vllm_torchtpu.models.qwen3_5.megakernel import model as qwen35
 
 
 @pytest.fixture(autouse=True)
@@ -276,11 +275,7 @@ class _CustomNoRefModelDef(mk.ModelDef):
         ex: mk.ExecSpec | None = None,
     ) -> mk.ModelGeometry:
         del hf_config_or_geom, periods, ex
-        g = dataclasses.replace(
-            qwen35.Qwen35.shrink(periods=1, R=R),
-            L=2,
-            att_every=1,
-        )
+        g = _tiny_geom(L=2, R=R)
         object.__setattr__(g, "_model_def", cls)
         return g
 
@@ -339,8 +334,28 @@ class _CustomWithRefNoHFModelDef(_CustomNoRefModelDef):
         )
 
 
-def _tiny_geom(L: int = 1) -> mk.ModelGeometry:
-    return dataclasses.replace(qwen35.Qwen35.shrink(periods=1, R=2), L=L, att_every=1)
+def _tiny_geom(L: int = 1, R: int = 2) -> mk.ModelGeometry:
+    return mk.ModelGeometry(
+        L=L,
+        att_every=1,
+        H=1024,
+        NH=max(8, R),
+        NKV=min(2, R),
+        HD=256,
+        ROT=64,
+        KH=max(8, R),
+        VH=2 * max(8, R),
+        KD=128,
+        VD=128,
+        E=128,
+        TOPK=4,
+        I=512,
+        IS=max(512, 128 * R),
+        moe_tp=False,
+        e_slots=0,
+        theta=10_000_000.0,
+        zero_centered_norm=True,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -369,6 +384,7 @@ def test_builtin_and_custom_module_capability_properties():
 
 def test_moe_reference_accepts_extra_keyword_arguments():
     g = _tiny_geom(L=1)
+    spec = synth_hybrid_spec(g, R=2)
     ex = mk.ExecSpec(
         R=2,
         B=2,
@@ -377,9 +393,7 @@ def test_moe_reference_accepts_extra_keyword_arguments():
         tiles=mk.Tiles(),
         cache=mk.DirectHBM(),
     )
-    _, hid, w_log, _ = mk.random_logical_inputs(
-        jax.random.key(0), g, ex, model_def=qwen35.Qwen35
-    )
+    _, hid, w_log, _ = mk.random_spec_inputs(jax.random.key(0), spec, ex)
     moe = mk.MoEModule(geometry=g)
     out, updates = moe.reference(
         w_log,

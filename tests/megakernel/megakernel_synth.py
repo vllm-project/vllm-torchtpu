@@ -18,7 +18,9 @@ from __future__ import annotations
 from typing import Any
 
 from tests.megakernel.megakernel_fakes import (
-    TINY_TILES,
+    TINY_TILES as _FAKE_TINY_TILES,
+)
+from tests.megakernel.megakernel_fakes import (
     FakeGeometry,
     tile_field,
     with_tile_fields,
@@ -29,6 +31,7 @@ from vllm_torchtpu.megakernel.modules.gqa import GQAModule
 from vllm_torchtpu.megakernel.modules.moe import MoEModule
 from vllm_torchtpu.megakernel.spec import LayerType, ModelSpec, SwitchSlot
 
+TINY_TILES = _FAKE_TINY_TILES.with_modules({"gqa": {"kv_blk": 256, "nkv": 3}})
 SynthHybrid = FakeGeometry
 
 
@@ -55,12 +58,16 @@ def synth_hybrid_spec(
         for i in range(g.L)
     ]
     play = pool.derive_pool_layout(decls, R=R)
-    gqa_p = GQAModule(pool_layout=play)
+    gqa_p, gdn_p = GQAModule(pool_layout=play), GDNModule(pool_layout=play)
     br, cnt = (
-        ((gqa_p,), (1,)) if g.att_every == 1 else ((gdn, gqa_p), (g.att_every - 1, 1))
+        ((gqa_p,), (1,)) if g.att_every == 1 else ((gdn_p, gqa_p), (g.att_every - 1, 1))
     )
     mixer = SwitchSlot("mixer", br, cnt)
-    pb = pool.make_pool_backend(play, rec_chunk=GDNModule.chunk_rows)
+    pb = pool.make_pool_backend(
+        play,
+        check=getattr(g, "check", None),
+        rec_chunk=GDNModule.chunk_rows,
+    )
     return ModelSpec(
         "synth_hybrid", g, LayerType("synth_layer", (mixer, moe)), cache_backend=pb
     )

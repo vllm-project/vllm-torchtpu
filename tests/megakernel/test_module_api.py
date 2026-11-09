@@ -54,17 +54,174 @@ from vllm_torchtpu.megakernel import (
 )
 from vllm_torchtpu.megakernel.modules.gqa import GQATunables
 from vllm_torchtpu.megakernel.modules.transforms import apply_hf_transforms
-from vllm_torchtpu.megakernel.ops import BF16, F32, I32, rmsnorm, round_bf16, round_up
+from vllm_torchtpu.megakernel.ops import (
+    BF16,
+    F32,
+    FP8,
+    I32,
+    rmsnorm,
+    round_bf16,
+    round_up,
+)
 from vllm_torchtpu.megakernel.pool.config import resolved_max_pages_per_seq
-from vllm_torchtpu.megakernel.spec import combined_hf_param_shapes
-from vllm_torchtpu.models.qwen3_5.megakernel import model as qwen35
-from vllm_torchtpu.models.qwen3_5.megakernel.pool import (
-    qwen35_layer_cache_decls,
-    qwen35_pool_layout,
+from vllm_torchtpu.megakernel.spec import SwitchSlot, combined_hf_param_shapes
+from vllm_torchtpu.megakernel.weights.logical import (
+    resolve_spec_and_norms,
+    switch_branch_for_layer,
+)
+from vllm_torchtpu.megakernel.weights.spec_inputs import (
+    pack_spec_logical_weights,
+    random_spec_inputs,
 )
 
+_SYNTH_DEFAULT_HF_CONFIG: dict[str, Any] = {
+    "model_type": "synth_hybrid_moe",
+    "architectures": ["SynthHybridForCausalLM"],
+    "vocab_size": 248320,
+    "hidden_size": 4096,
+    "num_hidden_layers": 60,
+    "rms_norm_eps": 1e-6,
+    "rope_theta": 10_000_000.0,
+    "partial_rotary_factor": 0.25,
+    "num_attention_heads": 32,
+    "num_key_value_heads": 2,
+    "head_dim": 256,
+    "linear_num_key_heads": 16,
+    "linear_num_value_heads": 64,
+    "linear_key_head_dim": 128,
+    "linear_value_head_dim": 128,
+    "linear_conv_kernel_dim": 4,
+    "num_experts": 512,
+    "num_experts_per_tok": 10,
+    "moe_intermediate_size": 1024,
+    "shared_expert_intermediate_size": 1024,
+    "layer_types": (["linear_attention"] * 3 + ["full_attention"]) * 15,
+}
 
-def _make_mock_hf_config(g: qwen35.Qwen35Geometry) -> SimpleNamespace:
+
+class _SynthModel(mk.ModelDef):
+    """Synthetic hybrid `ModelDef` for model-free module API and weight tests."""
+
+    name = "synth_module_api_model"
+    default_hf_config = _SYNTH_DEFAULT_HF_CONFIG
+    geometry = mk.FromHF(
+        hidden="hidden_size",
+        layers="num_hidden_layers",
+        vocab="vocab_size",
+        eps="rms_norm_eps",
+        rope_theta="rope_theta",
+        rope_partial=("partial_rotary_factor", 0.25),
+    )
+    attn = mk.GQA.bind(
+        prefix="self_attn",
+        heads="num_attention_heads",
+        kv_heads="num_key_value_heads",
+        head_dim="head_dim",
+        qk_norm=True,
+        output_gate=True,
+    )
+    linear = mk.GDN.bind(
+        prefix="linear_attn",
+        k_heads="linear_num_key_heads",
+        v_heads="linear_num_value_heads",
+        k_dim="linear_key_head_dim",
+        v_dim="linear_value_head_dim",
+        conv_kernel="linear_conv_kernel_dim",
+    )
+    moe = mk.MoE.bind(
+        prefix="mlp",
+        experts="num_experts",
+        top_k="num_experts_per_tok",
+        inter="moe_intermediate_size",
+        shared_inter="shared_expert_intermediate_size",
+        shared_gate=True,
+    )
+    schedule = mk.Schedule(
+        mixer=mk.FromHFLayerTypes(
+            "layer_types", {"full_attention": attn, "linear_attention": linear}
+        ),
+        ffn=moe,
+        pre_norm=Norm.bind("input_layernorm", zero_centered=True),
+        post_norm=Norm.bind("post_attention_layernorm", zero_centered=True),
+    )
+    embed = Embedding("model.embed_tokens")
+    final_norm = Norm.bind("model.norm", zero_centered=True)
+    lm_head = mk.LMHead("lm_head", tied_to=None)
+
+
+_SYNTH_FULL = _SynthModel.derive_geometry(_SYNTH_DEFAULT_HF_CONFIG, moe_tp=True)
+_SYNTH_TINY = dataclasses.replace(
+    _SynthModel.shrink(_SYNTH_DEFAULT_HF_CONFIG, periods=1), moe_tp=True
+)
+_SYNTH_TINY_EP = dataclasses.replace(_SYNTH_TINY, moe_tp=False)
+
+
+def _synth_layer_cache_decls(g: mk.ModelGeometry):
+    gqa = GQAModule(geometry=g)
+    gdn = GDNModule(geometry=g)
+    return [
+        gqa.cache_decl(g) if (i + 1) % g.att_every == 0 else gdn.cache_decl(g)
+        for i in range(g.L)
+    ]
+
+
+def _draw_synth_hf_weights(
+    key: jax.Array, g: mk.ModelGeometry, model_def: Any = _SynthModel
+) -> dict[str, jax.Array]:
+    """Generate unsharded HF weights (`[L, *d.hf_shape]`) from `hf_params()`."""
+    ms, geom, pre_n, post_n, final_n = resolve_spec_and_norms(model_def, None, g=g)
+    L_ = int(geom.L)
+    counts: dict[str, int] = {m.name: 0 for m in ms.all_modules()}
+    for s in ms.layer_type.slots:
+        if isinstance(s, SwitchSlot):
+            for lyr in range(L_):
+                b_mod, _ = switch_branch_for_layer(s, lyr)
+                counts[b_mod.name] = counts.get(b_mod.name, 0) + 1
+        else:
+            counts[s.name] = counts.get(s.name, 0) + L_
+    active_mods = [
+        (m, counts[m.name]) for m in ms.all_modules() if counts.get(m.name, 0) > 0
+    ]
+    total_decls = 3 + sum(len(m.hf_params(g=geom)) for m, _ in active_mods)
+    it = iter(jax.random.split(key, max(16, total_decls)))
+
+    def _draw(d: Any, lead: tuple[int, ...]) -> jax.Array:
+        hf_sh = d.shape if d.hf_shape is None else d.hf_shape
+        sh = (*lead, *hf_sh)
+        if d.transform.scale_for is not None:
+            return jnp.abs(jax.random.normal(next(it), sh, dtype=F32)) * 0.02 + 0.01
+        if d.transform.quantize is not None or jnp.dtype(d.dtype) == jnp.dtype(FP8):
+            return (jax.random.normal(next(it), sh, dtype=F32) * 0.25).astype(FP8)
+        mean = 0.0 if d.init is None else float(d.init.mean)
+        std = 0.05 if d.init is None else float(d.init.std)
+        raw = jax.random.normal(next(it), sh, dtype=d.dtype) * std
+        return jnp.ones(sh, dtype=d.dtype) + raw if mean == 1.0 else raw + mean
+
+    hf: dict[str, jax.Array] = {}
+    for nm in (pre_n, post_n):
+        if nm is not None:
+            nd = nm.hf_params(g=geom)[0]
+            hf[nd.name] = _draw(nd, (L_,))
+    if final_n is not None:
+        fd = final_n.hf_params(g=geom)[0]
+        hf[fd.name] = _draw(fd, ())
+
+    split_sources: dict[tuple[str, str], jax.Array] = {}
+    for mod, n_l in active_mods:
+        for d in mod.hf_params(g=geom):
+            if d.name in hf:
+                continue
+            if d.transform.split_from is not None:
+                src_key = (mod.name, d.transform.split_from)
+                if src_key not in split_sources:
+                    split_sources[src_key] = _draw(d, (n_l,))
+                hf[d.name] = split_sources[src_key]
+            else:
+                hf[d.name] = _draw(d, (n_l,))
+    return hf
+
+
+def _make_mock_hf_config(g: mk.ModelGeometry) -> SimpleNamespace:
     text_cfg = SimpleNamespace(
         hidden_size=g.H,
         num_attention_heads=g.NH,
@@ -94,12 +251,12 @@ def _cpu_mesh(R: int) -> jax.sharding.Mesh:
     return jax.sharding.Mesh(np.array(devs[:R]), ("tp",))
 
 
-def test_derive_qwen35_pool_layout_from_module_cache_decls():
+def test_derive_pool_layout_from_module_cache_decls():
     """`derive_pool_layout` derives pool grouping and page counts from layer decls."""
     for g in (
-        qwen35.FULL,
-        qwen35.TINY,
-        dataclasses.replace(qwen35.TINY, att_every=1),
+        _SYNTH_FULL,
+        _SYNTH_TINY,
+        dataclasses.replace(_SYNTH_TINY, att_every=1),
     ):
         gqa = GQAModule(geometry=g)
         gdn = GDNModule(geometry=g)
@@ -117,7 +274,7 @@ def test_derive_qwen35_pool_layout_from_module_cache_decls():
         assert norm.cache_decl(g) is None
         assert emb.cache_decl(g) is None
 
-        layer_decls = qwen35_layer_cache_decls(g)
+        layer_decls = _synth_layer_cache_decls(g)
         if g.att_every == 1:
             derived = derive_pool_layout(layer_decls)
             via_classmethod = PoolLayout.from_cache_decls(layer_decls)
@@ -126,7 +283,7 @@ def test_derive_qwen35_pool_layout_from_module_cache_decls():
                 derive_pool_layout(layer_decls)
             derived = derive_pool_layout(layer_decls, R=8)
             via_classmethod = PoolLayout.from_cache_decls(layer_decls, R=8)
-        expected = qwen35_pool_layout(g)
+        expected = _SynthModel.pool_layout(g, R=8)
 
         assert derived == expected
         assert via_classmethod == expected
@@ -140,9 +297,9 @@ def test_derive_qwen35_pool_layout_from_module_cache_decls():
     assert wide_lay.rec_pages_per_slot == 8
 
 
-def test_qwen35_hf_params_transforms_and_vllm_aliases():
-    """`hf_params` transforms match `split_hf_weights` bitwise and cover aliases."""
-    hf_cfg_tp = _make_mock_hf_config(qwen35.TINY)
+def test_hf_params_transforms_and_vllm_aliases():
+    """`hf_params` transforms, `load_logical_weights`, `load_hf`, and `VLLMAlias`."""
+    hf_cfg_tp = _make_mock_hf_config(_SYNTH_TINY)
     in_norm_mod = Norm.bind("input_layernorm", zero_centered=True).resolve(hf_cfg_tp)
     post_norm_mod = Norm.bind("post_attention_layernorm", zero_centered=True).resolve(
         hf_cfg_tp
@@ -153,12 +310,12 @@ def test_qwen35_hf_params_transforms_and_vllm_aliases():
     moe_mod_tp = MoEModule.bind("mlp", moe_tp=True).resolve(hf_cfg_tp)
     moe_mod_ep = MoEModule.bind("mlp", moe_tp=False).resolve(hf_cfg_tp)
 
-    # Check real HF checkpoint names, shapes, hf_shapes, and derived pads.
+    # Check HF checkpoint names, shapes, hf_shapes, and derived pads.
     gqa_by_name = {d.name: d for d in gqa_mod.hf_params("self_attn")}
-    assert gqa_by_name["qn"].shape == (qwen35.TINY.NH, qwen35.TINY.HD)
-    assert gqa_by_name["qn"].hf_shape == (qwen35.TINY.HD,)
-    assert gqa_by_name["kn"].shape == (qwen35.TINY.NKV, qwen35.TINY.HD)
-    assert gqa_by_name["kn"].hf_shape == (qwen35.TINY.HD,)
+    assert gqa_by_name["qn"].shape == (_SYNTH_TINY.NH, _SYNTH_TINY.HD)
+    assert gqa_by_name["qn"].hf_shape == (_SYNTH_TINY.HD,)
+    assert gqa_by_name["kn"].shape == (_SYNTH_TINY.NKV, _SYNTH_TINY.HD)
+    assert gqa_by_name["kn"].hf_shape == (_SYNTH_TINY.HD,)
     assert gqa_by_name["k_proj"].transform.transpose == (0, 2, 1)
 
     gdn_by_name = {d.name: d for d in gdn_mod.hf_params("linear_attn")}
@@ -195,113 +352,11 @@ def test_qwen35_hf_params_transforms_and_vllm_aliases():
                 covered.update(alias.scale_targets)
         assert covered == canon_names, (sub, canon_names - covered)
 
-    # Check combined_hf_param_shapes on MoE and verify load_logical_weights and
-    # load_hf / w_flat match the base golden hashes (4d43f2936) across all 12 combos.
-    import hashlib
-    import json
-    from pathlib import Path
-
     moe_fused = combined_hf_param_shapes(moe_mod_tp.hf_params("mlp"))
     assert set(moe_fused.keys()) == {"sh13", "sh13_s", "e13", "e13_s"}
 
-    golden_path = Path(__file__).parent / "golden" / "b5_weight_hashes.json"
-    golden = json.loads(golden_path.read_text(encoding="utf-8"))
-    assert golden["base_commit"] == "4d43f2936f571c305f516031038d1378e62e6295"
-
-    def _arr_info(a: Any) -> dict[str, Any]:
-        b = np.ascontiguousarray(np.asarray(a)).view(np.uint8).tobytes()
-        return {
-            "shape": list(a.shape),
-            "dtype": str(a.dtype),
-            "sha256": hashlib.sha256(b).hexdigest(),
-        }
-
-    ex_base = ExecSpec(R=2, B=2, T=1, ctx=2048)
-    g_eplb = dataclasses.replace(qwen35.TINY_EP, e_slots=72)
-    e_cores_eplb = mk.default_eplb_cores(g_eplb, ex_base.R)
-    geom_cases = [
-        ("TINY", qwen35.TINY, None, ("default", "candidate30", "candidate30-fused")),
-        ("TINY_EP", qwen35.TINY_EP, None, ("default", "candidate30")),
-        ("TINY_EP_EPLB72", g_eplb, e_cores_eplb, ("default",)),
-    ]
-
-    def _pinned_b5_hf_weights(key: jax.Array, geom: Any) -> dict[str, jax.Array]:
-        from vllm_torchtpu.megakernel.ops import FP8
-        from vllm_torchtpu.megakernel.weights.logical import (
-            resolve_spec_and_norms,
-            switch_branch_for_layer,
-        )
-
-        r_p = max(int(getattr(geom, "NKV", 1)), 1)
-        ex_p = ExecSpec(R=r_p, B=r_p, T=1, ctx=2048)
-        ms, geom, pre_n, post_n, final_n = resolve_spec_and_norms(
-            qwen35.Qwen35, ex_p, g=geom
-        )
-        L_ = int(geom.L)
-        cnts: dict[str, int] = {m.name: 0 for m in ms.all_modules()}
-        for s in ms.layer_type.slots:
-            if isinstance(s, mk.SwitchSlot):
-                for lyr in range(L_):
-                    bm, _ = switch_branch_for_layer(s, lyr)
-                    cnts[bm.name] = cnts.get(bm.name, 0) + 1
-            else:
-                cnts[s.name] = cnts.get(s.name, 0) + L_
-        non_rec, rec = [], []
-        for m in ms.all_modules():
-            if (cnt := cnts.get(m.name, 0)) > 0:
-                (
-                    rec
-                    if isinstance(m.cache_decl(geom), RecurrentCacheDecl)
-                    else non_rec
-                ).append((m, cnt))
-        it = iter(jax.random.split(key, 56))
-
-        def _draw(d: Any, lead: tuple[int, ...]) -> jax.Array:
-            sh = (*lead, *d.shape)
-            if d.transform.scale_for is not None:
-                arr = jnp.abs(jax.random.normal(next(it), sh, dtype=F32)) * 0.02 + 0.01
-            elif d.transform.quantize is not None or jnp.dtype(d.dtype) == jnp.dtype(
-                FP8
-            ):
-                arr = (jax.random.normal(next(it), sh, dtype=F32) * 0.25).astype(FP8)
-            else:
-                mean = 0.0 if d.init is None else float(d.init.mean)
-                std = 0.05 if d.init is None else float(d.init.std)
-                raw = jax.random.normal(next(it), sh, dtype=d.dtype) * std
-                arr = jnp.ones(sh, dtype=d.dtype) + raw if mean == 1.0 else raw + mean
-            tp = d.transform.transpose
-            if d.hf_shape == d.shape and tp is not None:
-                n_l = len(lead)
-                arr = jnp.transpose(arr, (*range(n_l), *(n_l + i for i in tp)))
-            return arr
-
-        pre_drawn: dict[str, jax.Array] = {}
-        for mod, n_l in non_rec:
-            ds = mod.hf_params(g=geom)
-            by_n = {x.name: x for x in ds}
-            for d in ds:
-                t = by_n.get(d.transform.scale_for, d) if d.transform.scale_for else d
-                if t.transform.fuse_into is not None or bool(
-                    t.vllm_aliases and len(t.vllm_aliases[-1].targets) > 1
-                ):
-                    pre_drawn[d.name] = _draw(d, (n_l,))
-        out_hf: dict[str, jax.Array] = {}
-        for nm in (pre_n, post_n):
-            if nm is not None:
-                nd = nm.hf_params(g=geom)[0]
-                out_hf[nd.name] = _draw(nd, (L_,))
-        if final_n is not None:
-            fd = final_n.hf_params(g=geom)[0]
-            out_hf[fd.name] = _draw(fd, ())
-        for mod, n_l in (*non_rec, *rec):
-            for d in mod.hf_params(g=geom):
-                out_hf[d.name] = (
-                    pre_drawn[d.name] if d.name in pre_drawn else _draw(d, (n_l,))
-                )
-        return out_hf
-
-    # Verify mk.random_hf_weights draws at d.hf_shape and emits only decl names.
-    hf_decl_only = mk.random_hf_weights(jax.random.PRNGKey(0), qwen35.TINY)
+    # Verify _draw_synth_hf_weights draws at d.hf_shape and emits only decl names.
+    hf_decl_only = _draw_synth_hf_weights(jax.random.PRNGKey(0), _SYNTH_TINY)
     expected_decl_names = {
         d.name
         for mod in (
@@ -316,57 +371,53 @@ def test_qwen35_hf_params_transforms_and_vllm_aliases():
     }
     assert set(hf_decl_only) == expected_decl_names
     for d in gqa_mod.hf_params():
-        assert hf_decl_only[d.name].shape == (qwen35.TINY.NATT, *d.hf_shape)
+        assert hf_decl_only[d.name].shape == (_SYNTH_TINY.NATT, *d.hf_shape)
     for d in gdn_mod.hf_params():
-        assert hf_decl_only[d.name].shape == (qwen35.TINY.NGDN, *d.hf_shape)
+        assert hf_decl_only[d.name].shape == (_SYNTH_TINY.NGDN, *d.hf_shape)
     for d in moe_mod_tp.hf_params():
-        assert hf_decl_only[d.name].shape == (qwen35.TINY.L, *d.hf_shape)
+        assert hf_decl_only[d.name].shape == (_SYNTH_TINY.L, *d.hf_shape)
 
-    checked_packed = 0
-    for g_name, g_case, e_cores, profiles in geom_cases:
-        hf = _pinned_b5_hf_weights(jax.random.PRNGKey(0), g_case)
+    # Verify load_logical_weights + pack_logical_weights match load_hf bitwise
+    # across TP, EP, and EPLB geometries and stack_e=False/True.
+    ex_base = ExecSpec(R=2, B=2, T=1, ctx=2048)
+    g_eplb = dataclasses.replace(_SYNTH_TINY_EP, e_slots=72)
+    e_cores_eplb = mk.default_eplb_cores(g_eplb, ex_base.R)
+    for g_case, e_cores in (
+        (_SYNTH_TINY, None),
+        (_SYNTH_TINY_EP, None),
+        (g_eplb, e_cores_eplb),
+    ):
+        hf = _draw_synth_hf_weights(jax.random.PRNGKey(0), g_case)
         w_l = mk.load_logical_weights(
-            qwen35.Qwen35, ex_base, hf, g=g_case, e_cores=e_cores
+            _SynthModel, ex_base, hf, g=g_case, e_cores=e_cores
         )
-        got_logical = {
-            k: _arr_info(v) for k, v in sorted(w_l.items()) if k != "e_cores"
-        }
-        assert got_logical == golden["logical"][g_name], f"logical mismatch on {g_name}"
-
-        for prof_name in profiles:
-            prof = qwen35.Qwen35.get_profile(prof_name)
-            for stack_e in (False, True):
-                ex_c = prof.exec_for(
-                    dataclasses.replace(ex_base, stack_e=stack_e),
-                    B=ex_base.B,
-                    T=ex_base.T,
-                    g=g_case,
-                )
-                ex_c = mk.fit_default_tiles(g_case.to_model_spec(), ex_c)
-                w_mk = mk.load_hf(qwen35.Qwen35, ex_c, hf, g=g_case, e_cores=e_cores)
-                p = planner.plan(g_case.to_model_spec(), ex_c)
-                w_flat = [
-                    x
-                    for k in p.w_names
-                    for x in (
-                        w_mk[k] if isinstance(w_mk[k], (tuple, list)) else (w_mk[k],)
+        ms, _, pre_n, post_n, final_n = resolve_spec_and_norms(
+            _SynthModel, ex_base, g=g_case
+        )
+        for stack_e in (False, True):
+            ex_c = mk.fit_default_tiles(
+                ms, dataclasses.replace(ex_base, stack_e=stack_e)
+            )
+            w_mk = mk.load_hf(_SynthModel, ex_c, hf, g=g_case, e_cores=e_cores)
+            w_mk_direct = pack_spec_logical_weights(
+                ms, ex_c, w_l, pre_norm=pre_n, post_norm=post_n, final_norm=final_n
+            )
+            p = planner.plan(ms, ex_c)
+            assert set(w_mk.keys()) == set(p.w_names)
+            for k in p.w_names:
+                v_a, v_b = w_mk[k], w_mk_direct[k]
+                if isinstance(v_a, tuple):
+                    assert len(v_a) == len(v_b)
+                    for xa, xb in zip(v_a, v_b):
+                        np.testing.assert_array_equal(
+                            np.asarray(xa).view(np.uint8),
+                            np.asarray(xb).view(np.uint8),
+                        )
+                else:
+                    np.testing.assert_array_equal(
+                        np.asarray(v_a).view(np.uint8),
+                        np.asarray(v_b).view(np.uint8),
                     )
-                ]
-                got_w_mk = {
-                    k: [_arr_info(x) for x in v]
-                    if isinstance(v, tuple)
-                    else _arr_info(v)
-                    for k, v in sorted(w_mk.items())
-                }
-                got_w_flat = [_arr_info(x) for x in w_flat]
-                combo_key = f"{g_name}/{prof_name}/stack_e={stack_e}"
-                exp_combo = golden["packed"][combo_key]
-                assert got_w_mk == exp_combo["w_mk"], f"w_mk mismatch on {combo_key}"
-                assert got_w_flat == exp_combo["w_flat"], (
-                    f"w_flat mismatch on {combo_key}"
-                )
-                checked_packed += 1
-    assert checked_packed == 12
 
     # Verify apply_hf_transforms rejects wrong shapes and unsupported transform fields.
     q_decl = gqa_by_name["q_proj"]
@@ -415,7 +466,7 @@ def test_qwen35_hf_params_transforms_and_vllm_aliases():
 
 def test_module_bind_resolve_validation_and_fail_closed():
     """Test fail-closed options, field/rename/transforms validation, and deepcopy."""
-    g = qwen35.TINY
+    g = _SYNTH_TINY
     hf_cfg = _make_mock_hf_config(g)
 
     # 1. Fail-closed on unimplemented options, MoE mismatch, and conv_kernel != 4
@@ -428,10 +479,10 @@ def test_module_bind_resolve_validation_and_fail_closed():
     with pytest.raises(MegakernelConfigError, match="conv_kernel == 4"):
         GDNModule.bind("linear_attn", conv_kernel=3).resolve(hf_cfg)
     with pytest.raises(MegakernelConfigError, match="disagrees with geometry moe_tp"):
-        MoEModule(geometry=qwen35.TINY_EP, moe_tp=True)
+        MoEModule(geometry=_SYNTH_TINY_EP, moe_tp=True)
     with pytest.raises(MegakernelConfigError, match="disagrees with geometry e_slots"):
         MoEModule(
-            geometry=dataclasses.replace(qwen35.TINY_EP, e_slots=72),
+            geometry=dataclasses.replace(_SYNTH_TINY_EP, e_slots=72),
             moe_tp=False,
             e_slots=0,
         )
@@ -531,7 +582,7 @@ def test_module_bind_resolve_validation_and_fail_closed():
         emb.reference({"weight": table}, tok_ids)
 
     # 6. deepcopy / pickle / order-independent FrozenDict hashability
-    spec = qwen35.qwen35_spec(qwen35.TINY)
+    spec = _SynthModel.to_model_spec(_SYNTH_TINY, R=2)
     spec_copied = copy.deepcopy(spec)
     assert spec_copied.name == spec.name
     assert len(spec_copied.all_modules()) == len(spec.all_modules())
@@ -552,7 +603,7 @@ def test_module_bind_resolve_validation_and_fail_closed():
 
 def _pack_single_module_step_inputs(
     spec: ModelSpec,
-    g: qwen35.Qwen35Geometry,
+    g: mk.ModelGeometry,
     ex: ExecSpec,
     pos: jax.Array,
     hidden: jax.Array,
@@ -604,10 +655,9 @@ def _pack_single_module_step_inputs(
         if s_name in ("kc", "vc"):
             states_mk[s_name] = kernel.fold(logical_states[s_name])
         elif s_name == POOL_STATE_NAME:
-            pt, ckpt, roff, _ = qwen35.pool.default_pool_layout(g, ex)
-            raw_pools = qwen35.pool.states_to_pool(
-                g, ex, logical_states, pt, ckpt, roff
-            )
+            play = _SynthModel.pool_layout(g, R=R)
+            pt, ckpt, roff, _ = mk.pool.allocate_test_layout(play, ex)
+            raw_pools = mk.pool.states_to_pool(play, ex, logical_states, pt, ckpt, roff)
             states_mk[POOL_STATE_NAME] = raw_pools
             states_mk["page_table"] = jnp.tile(
                 pt[:, : resolved_max_pages_per_seq(ex)], (R, 1)
@@ -663,7 +713,7 @@ _TINY_STEP_TILES = Tiles(
 
 
 @dataclasses.dataclass(frozen=True)
-class _SingleLayerGDNGeometry(qwen35.Qwen35Geometry):
+class _SingleLayerGDNGeometry(mk.ModelGeometry):
     """1-layer GDN-only geometry for isolated `GDNModule` step testing."""
 
     @property
@@ -682,7 +732,7 @@ class _SingleLayerGDNGeometry(qwen35.Qwen35Geometry):
 @pytest.mark.parametrize("T", [1, 2])
 def test_gqa_module_reference_matches_kernel_make_step_cpu(T: int, paged_kv: bool):
     """`GQAModule.reference` matches `kernel.make_step` on a 1-module GQA model."""
-    g = dataclasses.replace(qwen35.TINY, L=1, att_every=1)
+    g = dataclasses.replace(_SYNTH_TINY, L=1, att_every=1)
     cache_cfg = (
         CacheExec(paged_kv=True, num_pages=64)
         if paged_kv
@@ -693,7 +743,10 @@ def test_gqa_module_reference_matches_kernel_make_step_cpu(T: int, paged_kv: boo
     )
     mesh = _cpu_mesh(ex.R)
 
-    pos, hid_l, w_l, st_l = mk.random_logical_inputs(jax.random.PRNGKey(10 + T), g, ex)
+    spec_full = _SynthModel.to_model_spec(g, R=ex.R)
+    pos, hid_l, w_l, st_l = random_spec_inputs(
+        jax.random.PRNGKey(10 + T), spec_full, ex
+    )
     gqa_mod = GQAModule(geometry=g)
     in_norm_mod = Norm(
         "input_layernorm", geometry=g, zero_centered=g.zero_centered_norm
@@ -720,7 +773,7 @@ def test_gqa_module_reference_matches_kernel_make_step_cpu(T: int, paged_kv: boo
         name="gqa_single",
         config=g,
         layer_type=LayerType(name="gqa_only", slots=(gqa_mod,)),
-        cache_backend=qwen35.pool.qwen35_pool_backend(g) if paged_kv else None,
+        cache_backend=_SynthModel.pool_backend(g, R=ex.R) if paged_kv else None,
     )
     pos_mk, hid_mk, w_mk, st_mk = _pack_single_module_step_inputs(
         spec, g, ex, pos, hid_l, w_l, st_l, mesh
@@ -775,25 +828,26 @@ def test_gdn_module_reference_matches_kernel_make_step_cpu(T: int):
     ex = ExecSpec(R=2, B=2, T=T, ctx=128, interpret=True, tiles=_TINY_STEP_TILES)
     mesh = _cpu_mesh(ex.R)
 
-    pos, hid_l, w_l4, st_l4 = mk.random_logical_inputs(
-        jax.random.PRNGKey(20 + T), qwen35.TINY, ex
+    spec_full = _SynthModel.to_model_spec(_SYNTH_TINY, R=ex.R)
+    pos, hid_l, w_l4, st_l4 = random_spec_inputs(
+        jax.random.PRNGKey(20 + T), spec_full, ex
     )
     g = _SingleLayerGDNGeometry(
         L=1,
         att_every=2,
-        H=qwen35.TINY.H,
-        NH=qwen35.TINY.NH,
-        NKV=qwen35.TINY.NKV,
-        HD=qwen35.TINY.HD,
-        ROT=qwen35.TINY.ROT,
-        KH=qwen35.TINY.KH,
-        VH=qwen35.TINY.VH,
-        KD=qwen35.TINY.KD,
-        VD=qwen35.TINY.VD,
-        E=qwen35.TINY.E,
-        TOPK=qwen35.TINY.TOPK,
-        I=qwen35.TINY.I,
-        IS=qwen35.TINY.IS,
+        H=_SYNTH_TINY.H,
+        NH=_SYNTH_TINY.NH,
+        NKV=_SYNTH_TINY.NKV,
+        HD=_SYNTH_TINY.HD,
+        ROT=_SYNTH_TINY.ROT,
+        KH=_SYNTH_TINY.KH,
+        VH=_SYNTH_TINY.VH,
+        KD=_SYNTH_TINY.KD,
+        VD=_SYNTH_TINY.VD,
+        E=_SYNTH_TINY.E,
+        TOPK=_SYNTH_TINY.TOPK,
+        I=_SYNTH_TINY.I,
+        IS=_SYNTH_TINY.IS,
     )
     w_l: dict[str, Any] = {
         "in_norm": w_l4["in_norm"][:1],
@@ -867,11 +921,12 @@ def test_gdn_module_reference_matches_kernel_make_step_cpu(T: int):
 @pytest.mark.parametrize("moe_tp", [True, False])
 def test_moe_module_reference_matches_kernel_make_step_cpu(moe_tp: bool):
     """`MoEModule.reference` matches `kernel.make_step` on a 1-module MoE model."""
-    g = dataclasses.replace(qwen35.TINY, L=1, att_every=1, moe_tp=moe_tp)
+    g = dataclasses.replace(_SYNTH_TINY, L=1, att_every=1, moe_tp=moe_tp)
     ex = ExecSpec(R=2, B=2, T=1, ctx=128, interpret=True, tiles=_TINY_STEP_TILES)
     mesh = _cpu_mesh(ex.R)
 
-    pos, hid_l, w_l, st_l = mk.random_logical_inputs(jax.random.PRNGKey(30), g, ex)
+    spec_full = _SynthModel.to_model_spec(g, R=ex.R)
+    pos, hid_l, w_l, st_l = random_spec_inputs(jax.random.PRNGKey(30), spec_full, ex)
     moe_mod = MoEModule(geometry=g, moe_tp=moe_tp)
     post_norm_mod = Norm(
         "post_attention_layernorm", geometry=g, zero_centered=g.zero_centered_norm
@@ -915,15 +970,13 @@ def test_moe_module_reference_matches_kernel_make_step_cpu(moe_tp: bool):
 
 def test_slice_alias_targets_jax_array_ops_and_loader_validations():
     """Unit test `slice_alias_targets` (`JaxArrayOps`) and loader validations."""
-    from vllm_torchtpu.megakernel.ops import FP8
     from vllm_torchtpu.megakernel.weights import (
         JaxArrayOps,
-        resolve_spec_and_norms,
         slice_alias_targets,
     )
 
     ops = JaxArrayOps()
-    g = qwen35.TINY
+    g = _SYNTH_TINY
     ex = ExecSpec(R=2, B=2, T=1, ctx=128)
     moe_decls = {d.name: d for d in MoEModule(geometry=g).hf_params("mlp")}
     gdn_decls = {d.name: d for d in GDNModule(geometry=g).hf_params("linear_attn")}
@@ -1032,23 +1085,23 @@ def test_slice_alias_targets_jax_array_ops_and_loader_validations():
 
     # 4. resolve_spec_and_norms requires a ModelDef subclass
     with pytest.raises(TypeError, match="Expected a ModelDef subclass"):
-        resolve_spec_and_norms(g.to_model_spec(), ex, g=g)
+        resolve_spec_and_norms(_SynthModel.to_model_spec(g, R=ex.R), ex, g=g)
 
     # 5. _coerce_canonical_hf_entry transposes hf_shape and rejects invalid shapes
-    hf_valid = mk.random_hf_weights(jax.random.PRNGKey(3), g)
+    hf_valid = _draw_synth_hf_weights(jax.random.PRNGKey(3), g)
     hf_bad = dict(hf_valid, sh2=jnp.zeros((g.L, g.H * g.IS, 1), dtype=FP8))
     with pytest.raises(ValueError, match="trailing shape"):
-        mk.load_logical_weights(qwen35.Qwen35, ex, hf_bad, g=g)
+        mk.load_logical_weights(_SynthModel, ex, hf_bad, g=g)
 
     # Transposed 2D hf_shape (L, H, IS) on sh2 (shape=(IS, H), transpose=(1, 0)) works
     g_rect = dataclasses.replace(g, IS=512)
-    hf_rect = mk.random_hf_weights(jax.random.PRNGKey(30), g_rect)
+    hf_rect = _draw_synth_hf_weights(jax.random.PRNGKey(30), g_rect)
     assert hf_rect["sh2"].shape == (g_rect.L, g_rect.H, g_rect.IS)
     sh2_kn = jnp.transpose(hf_rect["sh2"], (0, 2, 1))
     assert sh2_kn.shape == (g_rect.L, g_rect.IS, g_rect.H)
-    w_l_trans = mk.load_logical_weights(qwen35.Qwen35, ex, hf_rect, g=g_rect)
+    w_l_trans = mk.load_logical_weights(_SynthModel, ex, hf_rect, g=g_rect)
     w_l_canon = mk.load_logical_weights(
-        qwen35.Qwen35, ex, dict(hf_rect, sh2=sh2_kn), g=g_rect
+        _SynthModel, ex, dict(hf_rect, sh2=sh2_kn), g=g_rect
     )
     np.testing.assert_array_equal(
         np.asarray(w_l_trans["sh2"]).view(np.uint8),
@@ -1056,9 +1109,9 @@ def test_slice_alias_targets_jax_array_ops_and_loader_validations():
     )
 
     # 6. EPLB branch validates expert dtype/shape
-    g_eplb = dataclasses.replace(qwen35.TINY_EP, e_slots=72)
-    hf_ep = mk.random_hf_weights(jax.random.PRNGKey(4), g_eplb)
+    g_eplb = dataclasses.replace(_SYNTH_TINY_EP, e_slots=72)
+    hf_ep = _draw_synth_hf_weights(jax.random.PRNGKey(4), g_eplb)
     with pytest.raises(ValueError, match="dtype"):
         mk.load_logical_weights(
-            qwen35.Qwen35, ex, dict(hf_ep, e2=hf_ep["e2"].astype(BF16)), g=g_eplb
+            _SynthModel, ex, dict(hf_ep, e2=hf_ep["e2"].astype(BF16)), g=g_eplb
         )

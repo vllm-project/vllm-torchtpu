@@ -30,12 +30,15 @@ import pytest
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
+from tests.megakernel.megakernel_synth import (
+    TINY_TILES,
+    synth_full_scale_spec,
+    synth_hybrid_spec,
+)
 from vllm_torchtpu import megakernel as mk
-from vllm_torchtpu.megakernel import cache, kernel, planner, vmem
+from vllm_torchtpu.megakernel import cache, kernel, planner, pool, vmem
 from vllm_torchtpu.megakernel.modules import MoEDebug, MoEModule
 from vllm_torchtpu.megakernel.modules.moe import MoETunables
-from vllm_torchtpu.models.qwen3_5.megakernel import model as qwen35
-from vllm_torchtpu.models.qwen3_5.megakernel.profiles.baseline import TINY_TILES
 
 R = 2
 _BOTH = MoEDebug(forced_routing=True, row_mask=True)
@@ -53,7 +56,7 @@ def _debug(flags: MoEDebug | None = None, skip: frozenset[str] = frozenset()) ->
 
 
 def test_moe_debug_flags_declare_inputs_and_keep_the_default_tile_fit():
-    spec = qwen35.qwen35_spec(qwen35.FULL_EP)
+    spec = synth_full_scale_spec(moe_tp=False, R=8)
     base = mk.ExecSpec(B=64, T=1, R=8, ctx=4096)
     ex = dataclasses.replace(base, debug=_debug(_BOTH))
     assert planner.extra_inputs(spec, base) == []
@@ -77,11 +80,26 @@ def test_moe_debug_flags_declare_inputs_and_keep_the_default_tile_fit():
         )
 
 
-def _geom() -> qwen35.Qwen35Geometry:
-    return qwen35.Qwen35Geometry(
-        L=4, H=256, I=256, IS=256, E=128, TOPK=2, NH=4, NKV=2, HD=256, ROT=64,
-        KH=2, VH=4, KD=128, VD=128, att_every=4,
-    )  # fmt: skip
+def _geom() -> mk.ModelGeometry:
+    return mk.ModelGeometry(
+        L=4,
+        H=256,
+        I=256,
+        IS=256,
+        E=128,
+        TOPK=2,
+        NH=4,
+        NKV=2,
+        HD=256,
+        ROT=64,
+        KH=2,
+        VH=4,
+        KD=128,
+        VD=128,
+        att_every=4,
+        theta=10_000_000.0,
+        zero_centered_norm=True,
+    )
 
 
 def _exec(B: int, paged: bool) -> mk.ExecSpec:
@@ -119,17 +137,18 @@ def test_moe_forced_routing_and_row_mask_inputs_cpu_interpret(paged: bool):
     g = _geom()
     B = 2
     ex = _exec(B, paged)
-    spec = qwen35.qwen35_spec(g)
-    pos, hid_l, w_l, st_l = mk.random_logical_inputs(jax.random.key(7), g, ex)
+    spec = synth_hybrid_spec(g, R=R)
+    pos, hid_l, w_l, st_l = mk.random_spec_inputs(jax.random.key(7), spec, ex)
     st_l = dict(st_l, conv=st_l["conv"].astype(jnp.bfloat16).astype(jnp.float32))
-    _, hid_mk, w_mk, st_mk = mk.pack_inputs(
-        pos, hid_l, w_l, st_l, g, ex, mesh=mesh, build_default_pool=paged
+    _, hid_mk, w_mk, st_mk = mk.pack_spec_inputs(
+        pos, hid_l, w_l, st_l, spec, ex, mesh=mesh
     )
     if paged:
-        pt, ckpt, roff, _ = mk.default_pool_layout(g, ex)
+        lay = spec.cache_backend.layout
+        pt, ckpt, roff, _ = pool.allocate_test_layout(lay, ex)
         pools = tuple(
             jax.device_put(np.asarray(r).copy(), tp)
-            for r in mk.states_to_pool(g, ex, st_l, pt, ckpt, roff)
+            for r in pool.states_to_pool(lay, ex, st_l, pt, ckpt, roff)
         )
 
     def run(dbg: Any, *extra: Any) -> np.ndarray:

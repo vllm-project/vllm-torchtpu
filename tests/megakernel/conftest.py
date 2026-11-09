@@ -73,7 +73,7 @@ def _mk_roots() -> tuple[Path, ...]:
     return (
         (tests_dir / "megakernel").resolve(),
         (tests_dir / "megakernel_runtime").resolve(),
-        # Model folders' megakernel tests (e.g. `tests/models/qwen3_5/megakernel`).
+        # Model folders' megakernel tests (`tests/models/<model>/megakernel`).
         *(p.resolve() for p in sorted((tests_dir / "models").glob("*/megakernel"))),
     )
 
@@ -83,7 +83,7 @@ def _is_mk_path(path: Path) -> bool:
     roots = _mk_roots()
     if any(resolved == root or root in resolved.parents for root in roots):
         return True
-    # A directory holding only megakernel tests (e.g. `tests/models/qwen3_5`).
+    # A directory holding only megakernel tests (`tests/models/<model>`).
     if resolved.is_dir() and any(resolved in root.parents for root in roots):
         return all(
             any(root in t.parents for root in roots)

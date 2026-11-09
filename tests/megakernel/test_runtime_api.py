@@ -29,9 +29,11 @@ import numpy as np
 import pytest
 
 import vllm_torchtpu.megakernel as mk
+from tests.megakernel.megakernel_synth import TINY_TILES, synth_hybrid_spec
 from vllm_torchtpu.megakernel import model_def, planner, profile
 from vllm_torchtpu.megakernel import runtime as mk_rt
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec
+from vllm_torchtpu.megakernel.geometry import ModelGeometry
 from vllm_torchtpu.megakernel.model_def import (
     Every,
     FromHF,
@@ -68,11 +70,6 @@ from vllm_torchtpu.megakernel.runtime import (
     verify_pooled_step_hlo,
     verify_sentinel_step,
 )
-from vllm_torchtpu.models.qwen3_5.megakernel import model as qwen35
-from vllm_torchtpu.models.qwen3_5.megakernel.profiles.baseline import TINY_TILES
-
-# For the library's by-name lookups (the model, its profiles, its default).
-qwen35.register()
 
 
 @pytest.fixture()
@@ -177,7 +174,7 @@ def test_runtime_config_and_gpr_bucket_exec_spec():
 
     # BLOCKER 2 regression: Profile with pool_gather=True must normalize
     # True -> "eligible" via Profile.exec_for and never re-apply raw True on T=1.
-    g = qwen35.Qwen35Geometry(
+    g = ModelGeometry(
         L=4,
         att_every=4,
         H=256,
@@ -195,8 +192,10 @@ def test_runtime_config_and_gpr_bucket_exec_spec():
         IS=256,
         moe_tp=False,
         e_slots=0,
+        theta=10_000_000.0,
+        zero_centered_norm=True,
     )
-    ms = qwen35.qwen35_spec(g)
+    ms = synth_hybrid_spec(g, R=1)
     base_ex = ExecSpec(
         R=1,
         B=4,
@@ -332,36 +331,122 @@ def test_pack_step_meta_and_resolve_step_positions_jax():
         )
 
 
+_SYNTH_ROUTING_DEFAULT_HF_CONFIG: dict[str, Any] = {
+    "architectures": ["SynthMoeForCausalLM"],
+    "model_type": "synth_moe",
+    "vocab_size": 256,
+    "hidden_size": 4096,
+    "num_hidden_layers": 60,
+    "num_attention_heads": 32,
+    "num_key_value_heads": 2,
+    "head_dim": 256,
+    "partial_rotary_factor": 0.25,
+    "rope_theta": 10_000_000.0,
+    "rms_norm_eps": 1e-6,
+    "linear_num_key_heads": 16,
+    "linear_num_value_heads": 64,
+    "linear_key_head_dim": 128,
+    "linear_value_head_dim": 128,
+    "linear_conv_kernel_dim": 4,
+    "num_experts": 512,
+    "num_experts_per_tok": 10,
+    "moe_intermediate_size": 1024,
+    "shared_expert_intermediate_size": 1024,
+    "layer_types": (["linear_attention"] * 3 + ["full_attention"]) * 15,
+}
+
+
+class _SynthRoutingModel(ModelDef):
+    """Synthetic hybrid `ModelDef` registering 7 HF architecture / model_type keys."""
+
+    name = "synth_routing"
+    hf_architectures = (
+        "SynthMoeForConditionalGeneration",
+        "SynthMoeForCausalLM",
+        "SynthForConditionalGeneration",
+        "SynthForCausalLM",
+    )
+    hf_model_type = ("synth_moe", "synth_moe_text", "synth_family")
+    supported_tp_sizes = (8,)
+    default_hf_config = _SYNTH_ROUTING_DEFAULT_HF_CONFIG
+    geometry = FromHF(
+        hidden="hidden_size",
+        layers="num_hidden_layers",
+        vocab="vocab_size",
+        eps="rms_norm_eps",
+        rope_theta="rope_theta",
+        rope_partial=("partial_rotary_factor", 0.25),
+    )
+    attn = GQA.bind(
+        prefix="self_attn",
+        heads="num_attention_heads",
+        kv_heads="num_key_value_heads",
+        head_dim="head_dim",
+        qk_norm=True,
+        output_gate=True,
+    )
+    linear = GDN.bind(
+        prefix="linear_attn",
+        k_heads="linear_num_key_heads",
+        v_heads="linear_num_value_heads",
+        k_dim="linear_key_head_dim",
+        v_dim="linear_value_head_dim",
+        conv_kernel="linear_conv_kernel_dim",
+    )
+    moe = MoE.bind(
+        prefix="mlp",
+        experts="num_experts",
+        top_k="num_experts_per_tok",
+        inter="moe_intermediate_size",
+        shared_inter="shared_expert_intermediate_size",
+        shared_gate=True,
+        moe_tp=False,
+    )
+    schedule = Schedule(
+        mixer=FromHFLayerTypes(
+            "layer_types",
+            {"full_attention": attn, "linear_attention": linear},
+        ),
+        ffn=moe,
+        pre_norm=Norm.bind("input_layernorm", zero_centered=True),
+        post_norm=Norm.bind("post_attention_layernorm", zero_centered=True),
+    )
+    embed = Embedding("model.embed_tokens")
+    final_norm = Norm.bind("model.norm", zero_centered=True)
+    lm_head = LMHead("lm_head")
+
+
 @pytest.mark.parametrize(
     ("arch", "model_type", "num_experts", "exp_found", "exp_eligible", "exp_reason"),
     [
         # 1-2. Canonical MoE model_types
-        ("UnknownArch", "qwen3_5_moe", 512, True, True, "ok"),
-        ("UnknownArch", "qwen3_5_moe_text", 512, True, True, "ok"),
+        ("UnknownArch", "synth_moe", 512, True, True, "ok"),
+        ("UnknownArch", "synth_moe_text", 512, True, True, "ok"),
         # 3. Shared family model_type (MoE vs dense disambiguated by validate_hf_config)
-        ("UnknownArch", "qwen3_5", 512, True, True, "ok"),
-        ("UnknownArch", "qwen3_5", 0, True, False, "non_moe_checkpoint"),
+        ("UnknownArch", "synth_family", 512, True, True, "ok"),
+        ("UnknownArch", "synth_family", 0, True, False, "non_moe_checkpoint"),
         # 4-5. Canonical MoE HF architectures
-        ("Qwen3_5MoeForConditionalGeneration", "unknown", 512, True, True, "ok"),
-        ("Qwen3_5MoeForCausalLM", "unknown", 512, True, True, "ok"),
+        ("SynthMoeForConditionalGeneration", "unknown", 512, True, True, "ok"),
+        ("SynthMoeForCausalLM", "unknown", 512, True, True, "ok"),
         # 6-7. Shared family HF architectures (MoE vs dense)
-        ("Qwen3_5ForConditionalGeneration", "unknown", 512, True, True, "ok"),
+        ("SynthForConditionalGeneration", "unknown", 512, True, True, "ok"),
         (
-            "Qwen3_5ForConditionalGeneration",
+            "SynthForConditionalGeneration",
             "unknown",
             0,
             True,
             False,
             "non_moe_checkpoint",
         ),
-        ("Qwen3_5ForCausalLM", "unknown", 512, True, True, "ok"),
-        ("Qwen3_5ForCausalLM", "unknown", None, True, False, "non_moe_checkpoint"),
+        ("SynthForCausalLM", "unknown", 512, True, True, "ok"),
+        ("SynthForCausalLM", "unknown", None, True, False, "non_moe_checkpoint"),
         # Unsupported model keys return None from find_model
-        ("LlamaForCausalLM", "llama", 512, False, False, ""),
-        ("Qwen2_5ForCausalLM", "qwen2_5", 512, False, False, ""),
+        ("OtherForCausalLM", "other_arch", 512, False, False, ""),
+        ("AltForCausalLM", "alt_arch", 512, False, False, ""),
     ],
 )
-def test_qwen35_seven_routing_keys_and_dense_rejection(
+def test_multi_key_routing_and_dense_rejection(
+    isolated_model_registry,
     arch: str,
     model_type: str,
     num_experts: int | None,
@@ -369,8 +454,14 @@ def test_qwen35_seven_routing_keys_and_dense_rejection(
     exp_eligible: bool,
     exp_reason: str,
 ):
-    """Verify all 7 `Qwen35` routing keys resolve to `Qwen35` and reject dense."""
-    cfg = dict(qwen35.Qwen35.default_hf_config)
+    """Verify all 7 routing keys resolve to `_SynthRoutingModel` and reject dense."""
+    register_model(
+        name=_SynthRoutingModel.name,
+        hf_architectures=_SynthRoutingModel.hf_architectures,
+        hf_model_type=_SynthRoutingModel.hf_model_type,
+        replace=True,
+    )(_SynthRoutingModel)
+    cfg = dict(_SynthRoutingModel.default_hf_config)
     cfg["architectures"] = [arch]
     cfg["model_type"] = model_type
     if num_experts is None:
@@ -382,7 +473,7 @@ def test_qwen35_seven_routing_keys_and_dense_rejection(
     if not exp_found:
         assert found is None
         return
-    assert found is qwen35.Qwen35
+    assert found is _SynthRoutingModel
     el = found.validate_hf_config(cfg)
     assert el.eligible is exp_eligible
     assert el.reason == exp_reason
@@ -390,22 +481,22 @@ def test_qwen35_seven_routing_keys_and_dense_rejection(
 
 def test_schedule_driven_validate_hf_config(isolated_model_registry):
     """`ModelDef.validate_hf_config` resolves `Schedule.ffn` across schedule forms."""
-    valid_qwen = dict(qwen35.Qwen35.default_hf_config)
-    assert qwen35.Qwen35.validate_hf_config(valid_qwen).eligible
+    valid_cfg = dict(_SynthRoutingModel.default_hf_config)
+    assert _SynthRoutingModel.validate_hf_config(valid_cfg).eligible
 
-    dense_qwen = {k: v for k, v in valid_qwen.items() if k != "num_experts"}
-    res_dense = qwen35.Qwen35.validate_hf_config(dense_qwen)
+    dense_cfg = {k: v for k, v in valid_cfg.items() if k != "num_experts"}
+    res_dense = _SynthRoutingModel.validate_hf_config(dense_cfg)
     assert not res_dense.eligible and res_dense.reason == "non_moe_checkpoint"
-    assert "Qwen35 supports MoE checkpoints only" in res_dense.message
+    assert "_SynthRoutingModel supports MoE checkpoints only" in res_dense.message
 
     # Non-numeric num_experts (e.g. string "512") returns non_moe_checkpoint cleanly
-    str_experts_qwen = {**valid_qwen, "num_experts": "512"}
-    res_str = qwen35.Qwen35.validate_hf_config(str_experts_qwen)
+    str_experts_cfg = {**valid_cfg, "num_experts": "512"}
+    res_str = _SynthRoutingModel.validate_hf_config(str_experts_cfg)
     assert not res_str.eligible and res_str.reason == "non_moe_checkpoint"
 
     # Missing hidden_size still checks present geometry keys (e.g. head_dim)
     no_hidden_bad_hd = {"num_experts": 512, "head_dim": 64}
-    res_hd = qwen35.Qwen35.validate_hf_config(no_hidden_bad_hd)
+    res_hd = _SynthRoutingModel.validate_hf_config(no_hidden_bad_hd)
     assert not res_hd.eligible and res_hd.reason == "geometry_mismatch"
     assert "HD=64 (expected 256)" in res_hd.message
 
@@ -442,7 +533,7 @@ def test_schedule_driven_validate_hf_config(isolated_model_registry):
     dummy_non_moe = Norm.bind("mlp_norm", zero_centered=True)
 
     base_synth_cfg = {
-        **dense_qwen,
+        **dense_cfg,
         "architectures": [],
         "num_hidden_layers": 4,
         "routed_expert_count": 128,
@@ -1124,7 +1215,7 @@ def test_no_kw_rejects_legacy_and_unknown_kwargs():
     with pytest.raises(TypeError, match="unexpected keyword argument"):
         resolve_driver_profile(DEFAULT_PROFILE, unknown_flag=True)  # type: ignore[call-arg]
 
-    g = qwen35.Qwen35Geometry(
+    g = ModelGeometry(
         L=4,
         att_every=4,
         H=256,
@@ -1140,8 +1231,10 @@ def test_no_kw_rejects_legacy_and_unknown_kwargs():
         TOPK=2,
         I=256,
         IS=256,
+        theta=10_000_000.0,
+        zero_centered_norm=True,
     )
-    ms = qwen35.qwen35_spec(g)
+    ms = synth_hybrid_spec(g, R=1)
     base_ex = ExecSpec(R=1, B=4, T=1, ctx=256, interpret=True, stack_e=False)
     with pytest.raises(TypeError, match="unexpected keyword argument"):
         bucket_exec_spec(  # type: ignore[call-arg]

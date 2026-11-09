@@ -25,7 +25,6 @@ from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
 import vllm_torchtpu.megakernel as mk
-from vllm_torchtpu.models.qwen3_5.megakernel import model as qwen35
 
 
 @pytest.fixture(autouse=True)
@@ -357,123 +356,88 @@ def test_moe_col_chunk_h2560() -> None:
     report.assert_passed()
 
 
-class _Qwen35TinyBase(qwen35.Qwen35):
-    """Tiny 2-layer `Qwen35` base for mixed `weight_dtypes` + `hf=True` checks."""
-
-    name = "b8_qwen35_tiny_base"
-    supported_tp_sizes = (2, 8)
-    profiles = {}
-    default_hf_config = {
-        **qwen35.Qwen35.default_hf_config,
-        "vocab_size": 256,
-        "hidden_size": 256,
-        "num_hidden_layers": 2,
-        "num_attention_heads": 4,
-        "num_key_value_heads": 2,
-        "head_dim": 256,
-        "linear_num_key_heads": 2,
-        "linear_num_value_heads": 4,
-        "linear_key_head_dim": 128,
-        "linear_value_head_dim": 128,
-        "linear_conv_kernel_dim": 4,
-        "num_experts": 128,
-        "num_experts_per_tok": 2,
-        "moe_intermediate_size": 256,
-        "shared_expert_intermediate_size": 256,
-        "layer_types": ["linear_attention", "full_attention"],
-    }
-
-
-class _Bf16DenseModel(_Qwen35TinyBase):
-    """Tiny `Qwen35` with `bf16` dense projections and `fp8` routed experts."""
+class _Bf16DenseModel(_SynthBaseModel):
+    """Tiny synthetic model with `bf16` dense projections and `fp8` routed experts."""
 
     name = "b8_bf16_dense"
     attn = dataclasses.replace(
-        qwen35.Qwen35.attn,
+        _SynthBaseModel.attn,
         options={
-            **qwen35.Qwen35.attn.options,
+            **_SynthBaseModel.attn.options,
             "weight_dtypes": {"att_in": "bf16", "att_out": "bf16"},
         },
     )
     linear = dataclasses.replace(
-        qwen35.Qwen35.linear,
+        _SynthBaseModel.linear,
         options={
-            **qwen35.Qwen35.linear.options,
+            **_SynthBaseModel.linear.options,
             "weight_dtypes": {"lin_in": "bf16", "lin_out": "bf16"},
         },
     )
     moe = dataclasses.replace(
-        qwen35.Qwen35.moe,
+        _SynthBaseModel.moe,
         options={
-            **qwen35.Qwen35.moe.options,
+            **_SynthBaseModel.moe.options,
             "weight_dtypes": {"sh13": "bf16", "sh2": "bf16", "e13": "fp8_channel"},
         },
     )
     schedule = mk.Schedule(
-        mixer=mk.FromHFLayerTypes(
-            "layer_types", {"full_attention": attn, "linear_attention": linear}
-        ),
+        mixer=mk.Every(n=2, last=attn, rest=linear),
         ffn=moe,
-        pre_norm=qwen35.Qwen35.schedule.pre_norm,
-        post_norm=qwen35.Qwen35.schedule.post_norm,
+        pre_norm=_SynthBaseModel.schedule.pre_norm,
+        post_norm=_SynthBaseModel.schedule.post_norm,
     )
 
 
-class _GQAOnlyBf16Model(_Qwen35TinyBase):
+class _GQAOnlyBf16Model(_SynthBaseModel):
     """Mixed policy: GQA `bf16` + GDN `fp8` + MoE `fp8` (shares `in_s`/`out_s`)."""
 
     name = "b8_gqa_only_bf16"
     attn = _Bf16DenseModel.attn
     schedule = mk.Schedule(
-        mixer=mk.FromHFLayerTypes(
-            "layer_types",
-            {"full_attention": attn, "linear_attention": qwen35.Qwen35.linear},
-        ),
-        ffn=qwen35.Qwen35.moe,
-        pre_norm=qwen35.Qwen35.schedule.pre_norm,
-        post_norm=qwen35.Qwen35.schedule.post_norm,
+        mixer=mk.Every(n=2, last=attn, rest=_SynthBaseModel.linear),
+        ffn=_SynthBaseModel.moe,
+        pre_norm=_SynthBaseModel.schedule.pre_norm,
+        post_norm=_SynthBaseModel.schedule.post_norm,
     )
 
 
-class _GDNOnlyBf16Model(_Qwen35TinyBase):
+class _GDNOnlyBf16Model(_SynthBaseModel):
     """Mixed policy: GQA `fp8` + GDN `bf16` + MoE `fp8` (shares `in_s`/`out_s`)."""
 
     name = "b8_gdn_only_bf16"
     linear = _Bf16DenseModel.linear
     schedule = mk.Schedule(
-        mixer=mk.FromHFLayerTypes(
-            "layer_types",
-            {"full_attention": qwen35.Qwen35.attn, "linear_attention": linear},
-        ),
-        ffn=qwen35.Qwen35.moe,
-        pre_norm=qwen35.Qwen35.schedule.pre_norm,
-        post_norm=qwen35.Qwen35.schedule.post_norm,
+        mixer=mk.Every(n=2, last=_SynthBaseModel.attn, rest=linear),
+        ffn=_SynthBaseModel.moe,
+        pre_norm=_SynthBaseModel.schedule.pre_norm,
+        post_norm=_SynthBaseModel.schedule.post_norm,
     )
 
 
-class _Sh13OnlyBf16Model(_Qwen35TinyBase):
+class _Sh13OnlyBf16Model(_SynthBaseModel):
     """Mixed policy: MoE `sh13: bf16` + `sh2: fp8`."""
 
     name = "b8_sh13_only_bf16"
     moe = dataclasses.replace(
-        qwen35.Qwen35.moe,
-        options={**qwen35.Qwen35.moe.options, "weight_dtypes": {"sh13": "bf16"}},
+        _SynthBaseModel.moe,
+        options={**_SynthBaseModel.moe.options, "weight_dtypes": {"sh13": "bf16"}},
     )
-    schedule = dataclasses.replace(qwen35.Qwen35.schedule, ffn=moe)
+    schedule = dataclasses.replace(_SynthBaseModel.schedule, ffn=moe)
 
 
-class _Bf16ExpertsModel(_Qwen35TinyBase):
+class _Bf16ExpertsModel(_SynthBaseModel):
     """Policy with `bf16` routed experts (`e13: bf16, e2: bf16`)."""
 
     name = "b8_bf16_experts"
     moe = dataclasses.replace(
-        qwen35.Qwen35.moe,
+        _SynthBaseModel.moe,
         options={
-            **qwen35.Qwen35.moe.options,
+            **_SynthBaseModel.moe.options,
             "weight_dtypes": {"e13": "bf16", "e2": "bf16"},
         },
     )
-    schedule = dataclasses.replace(qwen35.Qwen35.schedule, ffn=moe)
+    schedule = dataclasses.replace(_SynthBaseModel.schedule, ffn=moe)
 
 
 def test_per_weight_dtype_policy() -> None:
@@ -543,29 +507,19 @@ def test_per_weight_dtype_policy() -> None:
 
     # Loading an FP8 vLLM checkpoint into a bf16-policy model dequantizes via
     # slice_alias_targets
-    g_fp8 = _Qwen35TinyBase.shrink(periods=1, R=2)
+    g_fp8 = _SynthBaseModel.shrink(periods=1, R=2)
     w_hf_fp8 = mk.normalize_hf_for_vllm(
-        _Qwen35TinyBase,
+        _SynthBaseModel,
         ex,
-        mk.random_hf_weights(jax.random.key(3), g_fp8, model_def=_Qwen35TinyBase),
+        mk.random_hf_weights(jax.random.key(3), g_fp8, model_def=_SynthBaseModel),
         g=g_fp8,
     )
-    src_fp8_vllm = mk.SyntheticVLLMWeightSource(_Qwen35TinyBase, ex, w_hf_fp8, g=g_fp8)
+    src_fp8_vllm = mk.SyntheticVLLMWeightSource(_SynthBaseModel, ex, w_hf_fp8, g=g_fp8)
     loaded_from_fp8 = mk.load_weights(_Bf16DenseModel, ex, src_fp8_vllm, g=g, tp_rank=0)
     for k_bf16 in ("att_in", "att_out", "lin_in", "lin_out", "sh13", "sh2"):
         assert jnp.dtype(loaded_from_fp8[k_bf16].dtype) == jnp.dtype(jnp.bfloat16)
         max_abs = float(jnp.max(jnp.abs(loaded_from_fp8[k_bf16].astype(jnp.float32))))
         assert max_abs > 0.0
-
-    try:
-        import torch
-        import transformers
-
-        has_tf = hasattr(transformers, "Qwen3_5MoeForCausalLM") and hasattr(
-            torch, "Tensor"
-        )
-    except ImportError:
-        has_tf = False
 
     for model_cls, t_vals in (
         (_Bf16DenseModel, (1, 4)),
@@ -580,15 +534,13 @@ def test_per_weight_dtype_policy() -> None:
             B_per_T=2,
             T_values=t_vals,
             seed=2,
-            hf=True,
+            hf=False,
             approx_profiles=False,
         )
-        report.assert_passed(allow_skipped=not has_tf)
+        report.assert_passed()
         by_name = {c.name: c for c in report.checks}
         assert by_name["loader_parity"].status == "passed"
         assert by_name["kernel_vs_reference"].status == "passed"
-        if has_tf:
-            assert by_name["reference_vs_hf"].status == "passed"
 
 
 def test_merged_tile_operand_layout() -> None:
@@ -831,7 +783,7 @@ def test_b7_deferred_minors(monkeypatch: pytest.MonkeyPatch) -> None:
     assert getattr(g_base, "_model_def", None) is _SynthBaseModel
     hf_w = mk.random_hf_weights(jax.random.key(0), g_base)
     assert "att_out" in hf_w and "lin_q" in hf_w
-    g_q2 = qwen35.Qwen35.shrink(periods=1, R=2)
+    g_q2 = _SynthBaseModel.shrink(periods=1, R=2)
     hf_q2 = mk.random_hf_weights(jax.random.key(1), g_q2)
     assert "att_out" in hf_q2 and "lin_q" in hf_q2
 
@@ -864,7 +816,7 @@ def test_b7_deferred_minors(monkeypatch: pytest.MonkeyPatch) -> None:
     # Padded kernel layout (`round_up(taps + T, 8) = 8` rows) at T=2 and T=4
     for T in (2, 4):
         ex_pad = mk.ExecSpec(R=2, B=2 * T, T=T, ctx=256)
-        lay_q = qwen35.GDNModule.lin_in_layout(g_q2, ex_pad)
+        lay_q = mk.GDNModule.lin_in_layout(g_q2, ex_pad)
         taps_q = 3
         hr = 8  # round_up(3 + T, 8) == 8 for both T=2 and T=4
         n_folded = ex_pad.R * g_q2.NGDN
@@ -886,12 +838,8 @@ def test_b7_deferred_minors(monkeypatch: pytest.MonkeyPatch) -> None:
         acc_pad = jnp.array([1, T], dtype=jnp.int32)
         with pytest.raises(ValueError, match="explicit `taps`"):
             mk.GDNModule.accept(st_pad, st_pad, acc_pad, T=T, vh=lay_q.vh)
-        out_q = qwen35.accept_states(g_q2, ex_pad, st_pad, acc_pad)
-        out_m = mk.GDNModule.accept(
+        out_q = mk.GDNModule.accept(
             st_pad, st_pad, acc_pad, T=T, vh=lay_q.vh, taps=taps_q
-        )
-        np.testing.assert_array_equal(
-            np.asarray(out_q["conv"]), np.asarray(out_m["conv"])
         )
         # Rows 0:3 of sequence 0 equal rows 1:4 of c_pad; rows 3:8 remain untouched
         np.testing.assert_array_equal(

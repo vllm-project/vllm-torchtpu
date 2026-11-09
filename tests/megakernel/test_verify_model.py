@@ -28,20 +28,11 @@ from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu import megakernel as mk
-from vllm_torchtpu.models.qwen3_5.megakernel import model as qwen35
-
-# For the library's by-name lookups (the model, its profiles, its default).
-qwen35.register()
-
-
-@pytest.fixture(autouse=True)
-def _use_cpu_default_device():
-    with jax.default_device(jax.devices("cpu")[0]):
-        yield
+from vllm_torchtpu.megakernel import model_def, profile
 
 
 class _SynthHybridModel(mk.ModelDef):
-    """Non-Qwen synthetic hybrid `ModelDef` with custom prefixes, renamed norms
+    """Synthetic hybrid `ModelDef` with custom prefixes, renamed norms
     (`attn_norm`, `ffn_norm`, `final_ln`), renamed module params (`attn_q`,
     `gdn_q`, `exp_gate`), and `Every(n=2, last=attn, rest=linear)`.
     """
@@ -122,11 +113,155 @@ class _SynthHybridModel(mk.ModelDef):
     lm_head = mk.LMHead("out_head")
 
 
+_SYNTH_BASELINE_TILES = mk.Tiles(vmem_mib=62).with_modules(
+    {"gqa": {"kv_blk": 256, "nkv": 3}}
+)
+_SYNTH_CANDIDATE_TILES = mk.Tiles(vmem_mib=62).with_modules(
+    {
+        "gqa": {"kv_blk": 256, "nkv": 3, "amask": 1},
+        "gdn": {"conv_stage": True, "gdn_head_major": True},
+    }
+)
+
+
+def _synth_baseline_tiles(_tc: Any) -> mk.Tiles:
+    return _SYNTH_BASELINE_TILES
+
+
+def _synth_candidate_tiles(_tc: Any) -> mk.Tiles:
+    return _SYNTH_CANDIDATE_TILES
+
+
+_SYNTH_BASELINE_PROF = mk.Profile(
+    name="synth-baseline",
+    model="synth_full",
+    numerics="exact",
+    model_default=True,
+    tiles=_synth_baseline_tiles,
+)
+
+_SYNTH_CANDIDATE_PROF = mk.Profile(
+    name="synth-candidate30",
+    model="synth_full",
+    numerics="approx",
+    tiles=_synth_candidate_tiles,
+)
+
+
+class _SynthFullGeometry(mk.ModelGeometry):
+    """Geometry subclass for `_SynthFullModel` that preserves `_model_def`."""
+
+
+class _SynthFullModel(mk.ModelDef):
+    """60-layer synthetic `Every(n=4)` hybrid `ModelDef` for `verify_model` tests."""
+
+    name = "synth_full"
+    hf_architectures = ("SynthFullMoeForCausalLM",)
+    hf_model_type = ("synth_full_moe",)
+    supported_tp_sizes = (8,)
+    geometry_cls = _SynthFullGeometry
+    default_hf_config = {
+        "architectures": ["SynthFullMoeForCausalLM"],
+        "model_type": "synth_full_moe",
+        "vocab_size": 256,
+        "hidden_size": 4096,
+        "num_hidden_layers": 60,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 2,
+        "head_dim": 256,
+        "partial_rotary_factor": 0.25,
+        "rope_theta": 10_000_000.0,
+        "rms_norm_eps": 1e-6,
+        "linear_num_key_heads": 16,
+        "linear_num_value_heads": 64,
+        "linear_key_head_dim": 128,
+        "linear_value_head_dim": 128,
+        "linear_conv_kernel_dim": 4,
+        "num_experts": 512,
+        "num_experts_per_tok": 10,
+        "moe_intermediate_size": 1024,
+        "shared_expert_intermediate_size": 1024,
+        "layer_types": (["linear_attention"] * 3 + ["full_attention"]) * 15,
+    }
+    geometry = mk.FromHF(
+        hidden="hidden_size",
+        layers="num_hidden_layers",
+        vocab="vocab_size",
+        eps="rms_norm_eps",
+        rope_theta="rope_theta",
+        rope_partial=("partial_rotary_factor", 0.25),
+    )
+    attn = mk.GQA.bind(
+        prefix="self_attn",
+        heads="num_attention_heads",
+        kv_heads="num_key_value_heads",
+        head_dim="head_dim",
+        qk_norm=True,
+        output_gate=True,
+    )
+    linear = mk.GDN.bind(
+        prefix="linear_attn",
+        k_heads="linear_num_key_heads",
+        v_heads="linear_num_value_heads",
+        k_dim="linear_key_head_dim",
+        v_dim="linear_value_head_dim",
+        conv_kernel="linear_conv_kernel_dim",
+    )
+    moe = mk.MoE.bind(
+        prefix="mlp",
+        experts="num_experts",
+        top_k="num_experts_per_tok",
+        inter="moe_intermediate_size",
+        shared_inter="shared_expert_intermediate_size",
+        shared_gate=True,
+    )
+    schedule = mk.Schedule(
+        mixer=mk.FromHFLayerTypes(
+            "layer_types",
+            {"full_attention": attn, "linear_attention": linear},
+        ),
+        ffn=moe,
+        pre_norm=mk.Norm.bind("input_layernorm", zero_centered=True),
+        post_norm=mk.Norm.bind("post_attention_layernorm", zero_centered=True),
+    )
+    embed = mk.Embedding("model.embed_tokens")
+    final_norm = mk.Norm.bind("model.norm", zero_centered=True)
+    lm_head = mk.LMHead("lm_head")
+    profiles = {
+        "default": _SYNTH_BASELINE_PROF,
+        "baseline": _SYNTH_BASELINE_PROF,
+        "candidate30": _SYNTH_CANDIDATE_PROF,
+    }
+
+
+_SynthFullGeometry._model_def = _SynthFullModel
+
+
+@pytest.fixture(autouse=True)
+def _use_cpu_and_register_synth_model(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(model_def, "_MODEL_REGISTRY", dict(model_def._MODEL_REGISTRY))
+    monkeypatch.setattr(model_def, "_ARCH_REGISTRY", dict(model_def._ARCH_REGISTRY))
+    monkeypatch.setattr(
+        model_def, "_MODEL_TYPE_REGISTRY", dict(model_def._MODEL_TYPE_REGISTRY)
+    )
+    monkeypatch.setattr(profile, "_REGISTRY", dict(profile._REGISTRY))
+    monkeypatch.setattr(profile, "_MODEL_DEFAULTS", dict(profile._MODEL_DEFAULTS))
+    mk.register_profile(_SYNTH_BASELINE_PROF, replace=True)
+    mk.register_profile(_SYNTH_CANDIDATE_PROF, replace=True)
+    mk.register_model(
+        name=_SynthFullModel.name,
+        hf_architectures=_SynthFullModel.hf_architectures,
+        hf_model_type=_SynthFullModel.hf_model_type,
+        replace=True,
+    )(_SynthFullModel)
+    with jax.default_device(jax.devices("cpu")[0]):
+        yield
+
+
 @pytest.mark.slow
-@pytest.mark.parametrize("model_name", mk.list_models())
-def test_verify_model_all_registered(model_name: str):
-    """`mk.verify_model(model_name, hf=False)` passes all checks across default T."""
-    rep = mk.verify_model(model_name, hf=False)
+def test_verify_model_all_registered():
+    """`mk.verify_model("synth_full", hf=False)` passes all checks across default T."""
+    rep = mk.verify_model("synth_full", hf=False)
     rep.assert_passed(allow_skipped=False)
     by_name = {c.name: c for c in rep.checks}
     assert set(by_name) == {
@@ -151,38 +286,52 @@ def test_verify_model_all_registered(model_name: str):
 
 
 @pytest.mark.slow
-@pytest.mark.parametrize("model_name", mk.list_models())
-def test_verify_model_hf(model_name: str):
-    """`mk.verify_model(model_name, hf=True)` passes when `transformers` is installed
-    or skips cleanly with a clear reason when unavailable.
+def test_verify_model_hf(monkeypatch: pytest.MonkeyPatch):
+    """`mk.verify_model(..., hf=True)` skips cleanly when HF oracle raises
+    `ImportError` and passes when `hf_oracle` succeeds.
     """
-    try:
-        import torch
-        import transformers
 
-        has_tf = hasattr(transformers, "Qwen3_5MoeForCausalLM") and hasattr(
-            torch, "Tensor"
-        )
-    except ImportError:
-        has_tf = False
+    class _SkipHFModel(_SynthFullModel):
+        @staticmethod
+        def hf_oracle(weights: Any, inputs: Any) -> tuple[Any, dict[str, Any]]:
+            del weights, inputs
+            raise ImportError("transformers model class unavailable")
 
-    rep = mk.verify_model(model_name, hf=True, approx_profiles=False, T_values=(1,))
-    by_name = {c.name: c for c in rep.checks}
-    hf_c = by_name["reference_vs_hf"]
-    if has_tf:
-        rep.assert_passed(allow_skipped=False)
-        assert hf_c.status == "passed", hf_c.reason
-        assert hf_c.max_abs_err <= hf_c.tolerance["hf_hidden_atol"]
-        assert hf_c.min_cos >= hf_c.tolerance["hf_hidden_min_cos"]
-    else:
-        assert rep.passed
-        assert hf_c.status == "skipped"
-        assert "unavailable" in hf_c.reason
+    rep_skip = mk.verify_model(
+        _SkipHFModel, hf=True, approx_profiles=False, T_values=(1,)
+    )
+    assert rep_skip.passed
+    hf_skip = {c.name: c for c in rep_skip.checks}["reference_vs_hf"]
+    assert hf_skip.status == "skipped"
+    assert "unavailable" in hf_skip.reason
+
+    class _PassHFModel(_SynthFullModel):
+        @staticmethod
+        def hf_oracle(weights: Any, inputs: Any) -> tuple[Any, dict[str, Any]]:
+            assert weights
+            return _SynthFullModel.reference_step(
+                inputs["g"],
+                inputs["ex"],
+                inputs["pos"],
+                inputs["hidden"],
+                inputs["w_logical"],
+                dict(inputs["states"]),
+                paged_kv=False,
+            )
+
+    rep_pass = mk.verify_model(
+        _PassHFModel, hf=True, approx_profiles=False, T_values=(1,)
+    )
+    rep_pass.assert_passed(allow_skipped=False)
+    hf_pass = {c.name: c for c in rep_pass.checks}["reference_vs_hf"]
+    assert hf_pass.status == "passed", hf_pass.reason
+    assert hf_pass.max_abs_err <= hf_pass.tolerance["hf_hidden_atol"]
+    assert hf_pass.min_cos >= hf_pass.tolerance["hf_hidden_min_cos"]
 
 
 @pytest.mark.slow
 def test_verify_model_synthetic_second_model_def():
-    """Non-Qwen `_SynthHybridModel` passes `auto_model` & `verify_model` without
+    """`_SynthHybridModel` passes `auto_model` & `verify_model` without
     code changes outside `models/`, exercising custom prefixes, renamed norms/params,
     and every reference/pool state key.
     """
@@ -432,13 +581,13 @@ def test_auto_model_resolution_and_fail_closed(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(mk.kernel, "build", _forbid_build)
 
     for target in (
-        "qwen3_5",
-        qwen35.Qwen35,
-        qwen35.Qwen35.default_hf_config,
-        qwen35.Qwen35.derive_geometry(),
+        "synth_full",
+        _SynthFullModel,
+        _SynthFullModel.default_hf_config,
+        _SynthFullModel.derive_geometry(),
     ):
         res = mk.auto_model(target)
-        assert res.model_def is qwen35.Qwen35
+        assert res.model_def is _SynthFullModel
         assert res.exec_spec.R == 8
         assert res.pool_layout.num_pools == 15
         assert res.pool_layout.slots_per_pool == 3
@@ -447,30 +596,30 @@ def test_auto_model_resolution_and_fail_closed(monkeypatch: pytest.MonkeyPatch):
     with pytest.raises(mk.MegakernelConfigError, match="Unknown"):
         mk.auto_model("nonexistent_model_xyz")
     with pytest.raises(mk.MegakernelConfigError):
-        mk.auto_model({"architectures": ["LlamaForCausalLM"], "model_type": "llama"})
+        mk.auto_model(
+            {"architectures": ["UnknownForCausalLM"], "model_type": "unknown"}
+        )
 
     # 2. Non-MoE checkpoint, geometry mismatch, and missing geometry keys
     with pytest.raises(mk.MegakernelConfigError, match="non_moe_checkpoint"):
-        mk.auto_model({"architectures": ["Qwen3_5MoeForCausalLM"]})
-    with pytest.raises(mk.MegakernelConfigError, match="geometry_mismatch"):
-        mk.auto_model({"architectures": ["Qwen3_5MoeForCausalLM"], "num_experts": 128})
+        mk.auto_model({"architectures": ["SynthFullMoeForCausalLM"]})
     with pytest.raises(mk.MegakernelConfigError, match="invalid_geometry"):
         mk.auto_model(
             {
-                "architectures": ["Qwen3_5MoeForCausalLM"],
+                "architectures": ["SynthFullMoeForCausalLM"],
                 "num_experts": 512,
                 "hidden_size": 4096,
             }
         )
 
     # 3. Non-MoE checkpoint for an MoE schedule
-    non_moe = dict(qwen35.Qwen35.default_hf_config, num_experts=0)
+    non_moe = dict(_SynthFullModel.default_hf_config, num_experts=0)
     with pytest.raises(mk.MegakernelConfigError, match="non_moe_checkpoint"):
         mk.auto_model(non_moe)
 
     # 4. Scaled RoPE
     scaled_rope = dict(
-        qwen35.Qwen35.default_hf_config,
+        _SynthFullModel.default_hf_config,
         rope_scaling={"rope_type": "yarn", "factor": 4.0},
     )
     with pytest.raises(mk.MegakernelConfigError, match="unsupported rope_scaling"):
@@ -478,14 +627,14 @@ def test_auto_model_resolution_and_fail_closed(monkeypatch: pytest.MonkeyPatch):
 
     # 5. Unsupported TP size, B < R * T, missing supported_tp_sizes, mismatched profile
     with pytest.raises(mk.MegakernelConfigError, match="supports TP sizes"):
-        mk.auto_model("qwen3_5", R=3)
+        mk.auto_model("synth_full", R=3)
     with pytest.raises(mk.MegakernelConfigError, match="must be >= R \\* T"):
-        mk.auto_model("qwen3_5", R=8, B=4, T=1)
+        mk.auto_model("synth_full", R=8, B=4, T=1)
     mismatched_prof = dataclasses.replace(
-        qwen35.Qwen35.default_profile(), name="other-prof", model="other_model"
+        _SynthFullModel.default_profile(), name="other-prof", model="other_model"
     )
     with pytest.raises(mk.MegakernelConfigError, match="targets model"):
-        mk.auto_model("qwen3_5", profile=mismatched_prof)
+        mk.auto_model("synth_full", profile=mismatched_prof)
 
     class _NoTPModel(_SynthHybridModel):
         name = "synth_no_tp"
@@ -495,7 +644,7 @@ def test_auto_model_resolution_and_fail_closed(monkeypatch: pytest.MonkeyPatch):
         mk.auto_model(_NoTPModel)
 
     # 6. VMEM / SMEM budget overflow
-    base_prof = qwen35.Qwen35.default_profile()
+    base_prof = _SynthFullModel.default_profile()
     vmem_overflow_prof = dataclasses.replace(
         base_prof,
         name="test-vmem-overflow",
@@ -504,7 +653,7 @@ def test_auto_model_resolution_and_fail_closed(monkeypatch: pytest.MonkeyPatch):
         ),
     )
     with pytest.raises(mk.MegakernelConfigError, match="VMEM"):
-        mk.auto_model("qwen3_5", profile=vmem_overflow_prof)
+        mk.auto_model("synth_full", profile=vmem_overflow_prof)
 
     smem_overflow_prof = dataclasses.replace(
         base_prof,
@@ -514,7 +663,7 @@ def test_auto_model_resolution_and_fail_closed(monkeypatch: pytest.MonkeyPatch):
         ),
     )
     with pytest.raises(mk.MegakernelConfigError, match="SMEM"):
-        mk.auto_model("qwen3_5", profile=smem_overflow_prof)
+        mk.auto_model("synth_full", profile=smem_overflow_prof)
 
 
 @pytest.mark.slow
@@ -525,7 +674,7 @@ def test_detect_races_multi_layer_split_and_fused(T: int, fused: bool):
     mesh = Mesh(np.array(jax.devices("cpu")[:R]), ("tp",))
     tp = NamedSharding(mesh, P("tp"))
     g = dataclasses.replace(
-        qwen35.Qwen35.shrink(periods=1, R=R),
+        _SynthFullModel.shrink(periods=1, R=R),
         H=256,
         I=256,
         IS=256,
@@ -536,7 +685,7 @@ def test_detect_races_multi_layer_split_and_fused(T: int, fused: bool):
         moe_tp=False,
     )
     assert g.L == 4
-    prof = mk.get_profile("qwen35-candidate30" if fused else "qwen35-baseline")
+    prof = mk.get_profile("synth-candidate30" if fused else "synth-baseline")
     race_ip = pltpu.InterpretParams(detect_races=True)
     base = mk.ExecSpec(
         R=R,
@@ -559,16 +708,19 @@ def test_detect_races_multi_layer_split_and_fused(T: int, fused: bool):
     ex = mk.with_cache(
         dataclasses.replace(ex, tiles=t, interpret=race_ip), pool_gather=False
     )
-    spec = qwen35.qwen35_spec(g)
+    spec = _SynthFullModel.to_model_spec(g, R=R)
     pos, hid_l, w_l, st_l = mk.random_logical_inputs(jax.random.key(42 + T), g, ex)
     st_l = dict(st_l, conv=st_l["conv"].astype(jnp.bfloat16).astype(jnp.float32))
     pos_mk, hid_mk, w_mk, st_mk = mk.pack_inputs(
         pos, hid_l, w_l, st_l, g, ex, mesh=mesh, build_default_pool=True
     )
-    pt, ckpt, roff, _ = mk.default_pool_layout(g, ex)
+    play = _SynthFullModel.pool_layout(g, R=R)
+    pt, ckpt, roff, _ = mk.pool.allocate_test_layout(play, ex)
     pools = tuple(
         jax.device_put(np.asarray(r).copy(), tp)
-        for r in mk.states_to_pool(g, ex, st_l, pt, ckpt[..., :T], jnp.maximum(roff, 0))
+        for r in mk.pool.states_to_pool(
+            play, ex, st_l, pt, ckpt[..., :T], jnp.maximum(roff, 0)
+        )
     )
     if not fused:
         # JAX resets `ipc.races` per interpreted kernel call; verify the
@@ -599,7 +751,7 @@ def test_fused_t1_in_place_read_equals_write_slot():
     mesh = Mesh(np.array(jax.devices("cpu")[:R]), ("tp",))
     tp = NamedSharding(mesh, P("tp"))
     g = dataclasses.replace(
-        qwen35.Qwen35.shrink(periods=1, R=R),
+        _SynthFullModel.shrink(periods=1, R=R),
         H=256,
         I=256,
         IS=256,
@@ -612,7 +764,7 @@ def test_fused_t1_in_place_read_equals_write_slot():
         moe_tp=False,
         e_slots=0,
     )
-    spec = qwen35.qwen35_spec(g)
+    spec = _SynthFullModel.to_model_spec(g, R=R)
     t = mk.Tiles(
         bank=512 << 10,
         nbd=10,
@@ -641,7 +793,8 @@ def test_fused_t1_in_place_read_equals_write_slot():
     _, hid_mk, w_mk, _ = mk.pack_inputs(
         pos, hid_l, w_l, st_l, g, ex, mesh=mesh, build_default_pool=True
     )
-    pt, ckpt_base, roff_base, _ = mk.default_pool_layout(g, ex)
+    play = _SynthFullModel.pool_layout(g, R=R)
+    pt, ckpt_base, roff_base, _ = mk.pool.allocate_test_layout(play, ex)
     # Set read slot == write slot for every sequence (roff = 0)
     ckpt_same = jnp.repeat(ckpt_base[..., :1], 2, axis=-1)
     roff_same = jnp.zeros_like(roff_base)
@@ -649,7 +802,7 @@ def test_fused_t1_in_place_read_equals_write_slot():
     def _fresh_pools():
         return tuple(
             jax.device_put(np.asarray(r).copy(), tp)
-            for r in mk.states_to_pool(g, ex, st_l, pt, ckpt_base, roff_same)
+            for r in mk.pool.states_to_pool(play, ex, st_l, pt, ckpt_base, roff_same)
         )
 
     step_s, _ = mk.PallasWriter(fused_pool_io=False).make_step(
@@ -675,8 +828,8 @@ def test_aliased_pool_metadata_negative_checks():
     `pool.check_step_pool_metadata` and `pack_step_meta`, and null-page routing
     protects `num_pages - 1`.
     """
-    g = qwen35.Qwen35.shrink(periods=1, R=2)
-    play = qwen35.Qwen35.pool_layout(g, R=2)
+    g = _SynthFullModel.shrink(periods=1, R=2)
+    play = _SynthFullModel.pool_layout(g, R=2)
     ex_t1 = mk.ExecSpec(
         R=2, B=4, T=1, ctx=256, cache=mk.CacheExec(paged_kv=True, num_pages=128)
     )
@@ -781,8 +934,8 @@ def test_planner_raw_hazard_guards():
     """Planner rejects ring depth 1 (`nbd=1`, `nbe=1`, `nkv=1`, `gdn_bufs=1`) and
     schedules where MoE is not active on every layer.
     """
-    g = qwen35.Qwen35.shrink(periods=1, R=2)
-    spec = qwen35.qwen35_spec(g)
+    g = _SynthFullModel.shrink(periods=1, R=2)
+    spec = _SynthFullModel.to_model_spec(g, R=2)
     base_t = mk.Tiles(
         bank=512 << 10, nbd=10, nbe=6, ebank=256 << 10, vmem_mib=62
     ).with_modules({"gqa": {"kv_blk": 256}})
@@ -861,7 +1014,7 @@ def test_negative_pos_routes_to_null_page_and_preserves_live_pages(
     mesh = Mesh(np.array(jax.devices("cpu")[:R]), ("tp",))
     tp = NamedSharding(mesh, P("tp"))
     g = dataclasses.replace(
-        qwen35.Qwen35.shrink(periods=1, R=R),
+        _SynthFullModel.shrink(periods=1, R=R),
         H=256,
         I=256,
         IS=256,
@@ -874,7 +1027,7 @@ def test_negative_pos_routes_to_null_page_and_preserves_live_pages(
         moe_tp=False,
         e_slots=0,
     )
-    spec = qwen35.qwen35_spec(g)
+    spec = _SynthFullModel.to_model_spec(g, R=R)
     t = mk.Tiles(
         bank=512 << 10, nbd=10, nbe=6, ebank=256 << 10, vmem_mib=32
     ).with_modules(
@@ -900,13 +1053,16 @@ def test_negative_pos_routes_to_null_page_and_preserves_live_pages(
     _, hid_mk, w_mk, _ = mk.pack_inputs(
         pos, hid_l, w_l, st_l, g, ex, mesh=mesh, build_default_pool=True
     )
-    pt, ckpt, roff, _ = mk.default_pool_layout(g, ex)
+    play = _SynthFullModel.pool_layout(g, R=R)
+    pt, ckpt, roff, _ = mk.pool.allocate_test_layout(play, ex)
     seq0_live_pages = [int(p) for p in np.asarray(pt[0]) if int(p) > 0]
     assert seq0_live_pages
 
     base_pools = [
         np.asarray(r).copy()
-        for r in mk.states_to_pool(g, ex, st_l, pt, ckpt[..., :T], jnp.maximum(roff, 0))
+        for r in mk.pool.states_to_pool(
+            play, ex, st_l, pt, ckpt[..., :T], jnp.maximum(roff, 0)
+        )
     ]
     step_s, _ = mk.PallasWriter(fused_pool_io=False).make_step(
         mesh, spec, ex, donate=False
@@ -949,7 +1105,7 @@ def test_fused_serialized_rmw_aliased_kv_write_page(case: str):
     mesh = Mesh(np.array(jax.devices("cpu")[:R]), ("tp",))
     tp = NamedSharding(mesh, P("tp"))
     g = dataclasses.replace(
-        qwen35.Qwen35.shrink(periods=1, R=R),
+        _SynthFullModel.shrink(periods=1, R=R),
         H=256,
         I=256,
         IS=256,
@@ -962,7 +1118,7 @@ def test_fused_serialized_rmw_aliased_kv_write_page(case: str):
         moe_tp=False,
         e_slots=0,
     )
-    spec = qwen35.qwen35_spec(g)
+    spec = _SynthFullModel.to_model_spec(g, R=R)
     race_ip = pltpu.InterpretParams(detect_races=True)
     t = mk.Tiles(
         bank=512 << 10, nbd=10, nbe=6, ebank=256 << 10, vmem_mib=32
@@ -984,7 +1140,8 @@ def test_fused_serialized_rmw_aliased_kv_write_page(case: str):
     )
     pos, hid_l, w_l, st_l = mk.random_logical_inputs(jax.random.key(T), g, ex)
     st_l = dict(st_l, conv=st_l["conv"].astype(jnp.bfloat16).astype(jnp.float32))
-    pt, ckpt, roff, _ = mk.default_pool_layout(g, ex)
+    play = _SynthFullModel.pool_layout(g, R=R)
+    pt, ckpt, roff, _ = mk.pool.allocate_test_layout(play, ex)
     # Sequence 0 spans page boundary (127 -> page 0, 128 -> page 1)
     pos = jnp.array([127, 128, 10, 11], dtype=jnp.int32)
     if case == "cross_seq_alias":
@@ -996,7 +1153,9 @@ def test_fused_serialized_rmw_aliased_kv_write_page(case: str):
     )
     base_pools = [
         np.asarray(r).copy()
-        for r in mk.states_to_pool(g, ex, st_l, pt, ckpt[..., :T], jnp.maximum(roff, 0))
+        for r in mk.pool.states_to_pool(
+            play, ex, st_l, pt, ckpt[..., :T], jnp.maximum(roff, 0)
+        )
     ]
     step_s, _ = mk.PallasWriter(fused_pool_io=False).make_step(
         mesh, spec, ex, donate=False
@@ -1016,7 +1175,6 @@ def test_fused_serialized_rmw_aliased_kv_write_page(case: str):
     np.testing.assert_array_equal(
         np.asarray(out_f).view(np.uint8), np.asarray(out_s).view(np.uint8)
     )
-    play = qwen35.Qwen35.pool_layout(g, R=R)
     for r_f, r_s in zip(raw_f, raw_s):
         uf = np.asarray(r_f).reshape(R, -1, *r_f.shape[1:])
         us = np.asarray(r_s).reshape(R, -1, *r_s.shape[1:])
@@ -1024,8 +1182,8 @@ def test_fused_serialized_rmw_aliased_kv_write_page(case: str):
             uf[:, play.reserved_pages :].view(np.uint8),
             us[:, play.reserved_pages :].view(np.uint8),
         )
-    st_f = mk.pool_to_states(g, ex, raw_f, pt, ckpt)
-    st_s = mk.pool_to_states(g, ex, raw_s, pt, ckpt)
+    st_f = mk.pool.pool_to_states(play, ex, raw_f, pt, ckpt)
+    st_s = mk.pool.pool_to_states(play, ex, raw_s, pt, ckpt)
     for k in ("kc", "vc", "conv"):
         np.testing.assert_array_equal(
             np.asarray(st_f[k]).view(np.uint8), np.asarray(st_s[k]).view(np.uint8)
