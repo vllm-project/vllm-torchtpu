@@ -22,7 +22,7 @@ import pytest
 from jax.sharding import AbstractDevice, AbstractMesh, use_abstract_mesh
 
 from tests.models.minimax_m3.packing import CACHE_DTYPES, PACKING, pack, rounded
-from vllm_torchtpu.models.minimax_m3.kernels import msa_fp4
+from vllm_torchtpu.models.minimax_m3.kernels import msa_fp4, msa_indexer
 from vllm_torchtpu.models.minimax_m3.kernels.msa_indexer import block_scores
 
 PAGE = 128
@@ -197,8 +197,15 @@ def test_lowers_for_tpu(dtype, kernel):
         ([1, 130, 3], [300, 200, 0], 4),  # small and large classes
     ],
 )
-def test_fp4_folded_matches_reference(q_lens, ctx_lens, pages_per_step):
-    """4-bit index pages with their scales folded in (`msa_fp4`), kernel v3."""
+@pytest.mark.parametrize("token_major", [False, True])
+def test_fp4_folded_matches_reference(
+    q_lens, ctx_lens, pages_per_step, token_major, monkeypatch
+):
+    """4-bit index pages with their scales folded in (`msa_fp4`), kernel v3:
+    transposed scores (tiles up to `_FOLDED_TRANSPOSED_MAX_ROWS` rows) and
+    token-major ones with the scales folded into the bf16 keys."""
+    if token_major:
+        monkeypatch.setattr(msa_indexer, "_FOLDED_TRANSPOSED_MAX_ROWS", 0)
     rng = np.random.default_rng(len(q_lens) + pages_per_step)
     num_seqs = len(q_lens)
     num_real = sum(q_lens)
@@ -243,8 +250,12 @@ def test_fp4_folded_matches_reference(q_lens, ctx_lens, pages_per_step):
         for t in range(cu_q[r], cu_q[r + 1]):
             for b in range(num_pages):
                 expected = (keys[tables[r, b]] @ queries[t]).max()
-                # Kernel v3 scales the f32 scores (both classes here).
-                np.testing.assert_allclose(scores[t, b], expected, rtol=1e-4, atol=1e-3)
+                # Transposed scores are scaled in f32; token-major keys carry
+                # bf16-rounded scales.
+                tol = dict(rtol=1e-2, atol=5e-2) if token_major else {}
+                np.testing.assert_allclose(
+                    scores[t, b], expected, **(tol or dict(rtol=1e-4, atol=1e-3))
+                )
 
 
 @pytest.mark.parametrize("tokens", [8, 256])

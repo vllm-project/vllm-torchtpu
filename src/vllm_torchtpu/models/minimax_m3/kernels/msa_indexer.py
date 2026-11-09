@@ -29,6 +29,8 @@ groups are lane-aligned either way and come out token-major.
 """
 
 import functools
+from collections.abc import Callable
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -52,11 +54,15 @@ DEFAULT_KERNEL = "v3"
 # Rows per token-major query tile of the block_q class (see `block_scores`).
 _SMALL_TILE_Q = 64
 # Folded 4-bit pages are scored transposed (`_folded_chunk_maxima_t`), whose
-# cost grows with the tile's rows: 32 holds a decode request of 4 folded
-# index heads x 8 (MTP) tokens.
+# cost grows with the tile's rows: by default 32 holds a decode request of 4
+# folded index heads x 8 (MTP) tokens; callers with one index head per rank
+# pass `folded_tile_q=8` (`msa.block_score_options`).
 _SMALL_TILE_Q_FOLDED = 32
-# Large prefill tiles: v3's DMA ring is slower there on fp8 (1.79 vs 1.51 ms).
-DEFAULT_LARGE_KERNEL = "v2"
+# Large prefill tiles: v3's DMA ring, as the small class. v2's 32 BlockSpec
+# page inputs cost ~1,900 scalar bundles per 32-page step beside ~2,500 of
+# vector work (AOT); v3 is bit-identical and -17..-24% per indexer call at
+# the c48 / c64 DCP 2 / c4 mixed-step shapes (bench j-5eb4a611).
+DEFAULT_LARGE_KERNEL = "v3"
 _TILE_SHIFT = 16
 # tile_info = query row of the tile << _ROW_SHIFT | request of the tile
 _ROW_SHIFT = 10
@@ -211,6 +217,11 @@ def _page_tokens(rows_per_page: int, dtype) -> int:
 _PAGES_PER_CHUNK = 32
 # `_kernel_v3` issues the next group's descriptors during its first chunks.
 _DMA_ISSUE_CHUNKS = 2
+# Folded 4-bit tiles of up to this many rows score transposed
+# (`_folded_chunk_maxima_t`, maxima across lanes); larger ones score
+# token-major with the slot scales folded into the keys (maxima across
+# sublanes, as the other caches).
+_FOLDED_TRANSPOSED_MAX_ROWS = 64
 
 
 def _paired_query(q: jax.Array) -> jax.Array:
@@ -388,7 +399,7 @@ def _kernel_v3(
                     1 - slot,
                 )
 
-        if folded:
+        if folded and block_q <= _FOLDED_TRANSPOSED_MAX_ROWS:
             m = _folded_chunk_maxima_t(
                 q_pair, buf.at[slot], first, chunk, live, issue
             )  # [Bq, chunk]
@@ -398,8 +409,27 @@ def _kernel_v3(
                 o_ref[pl.ds(first, chunk), :] = m.T
             return
 
+        if folded:
+            # Each page's slot scales as a column of one transpose for the
+            # chunk; stale VMEM past the request's end and unwritten slots
+            # get scale 0.
+            scale_rows = jnp.concatenate(
+                [
+                    pltpu.bitcast(buf[slot, first + j, rows - 1 :], jnp.float32)
+                    for j in range(chunk)
+                ],
+                axis=0,
+            )  # [chunk, S]
+            page = first + jax.lax.broadcasted_iota(jnp.int32, scale_rows.shape, 0)
+            scale_cols = jnp.where(
+                jnp.isfinite(scale_rows) & (page < live), scale_rows, 0.0
+            ).T.astype(jnp.bfloat16)  # [S, chunk]
+
         def page_keys(j):
             issue(j)
+            if folded:
+                k = pltpu.bitcast(buf[slot, first + j, : rows - 1], jnp.int4)
+                return k.astype(jnp.bfloat16) * scale_cols[:, j : j + 1]
             # A page past the request's end was never copied: its stale words
             # may be NaN or inf, which would reach its pair's score through
             # the zero half of q_pair.
@@ -469,6 +499,18 @@ def _tiles(cu_q_lens: jax.Array, seq_in_class: jax.Array, block_q: int, max_tile
     return tile_seq, tile_row0, first_tile, start, tile_ends[-1]
 
 
+class ClassScores(NamedTuple):
+    """One tile class's scores (`_class_scores`) and where its rows sit."""
+
+    scores: jax.Array  # [P, tiles * Bq], or [tiles * Bq, P] if token-major
+    col: jax.Array  # [T] each query row's column
+    tile_seq: jax.Array  # [tiles] request of each tile
+    tile_row0: jax.Array  # [tiles] query row of each tile's first column
+    num_tiles: jax.Array  # tiles in use
+    first_tile: jax.Array  # [max_num_seqs] each request's first tile
+    tile_start: jax.Array  # [max_num_seqs] query row of its first tile
+
+
 def _class_scores(
     index_q,
     index_cache,
@@ -487,8 +529,8 @@ def _class_scores(
     scale_row=None,
 ):
     """Transposed scores ``[P, tiles * block_q]`` of one tile class, and the
-    column of each token; `token_major` (kernel v3) returns them as
-    ``[tiles * block_q, P]`` instead, so a token's scores are one row."""
+    column of each token (`ClassScores`); `token_major` (kernel v3) returns
+    them as ``[tiles * block_q, P]`` instead, so a token's scores are one row."""
     num_tokens, _, head_dim = index_q.shape
     _, rows_per_page, packing, _ = index_cache.shape
     page_size = _page_tokens(rows_per_page, index_cache.dtype)
@@ -658,23 +700,32 @@ def _class_scores(
     offset = tok - tile_start[seq]
     col = (first_tile[seq] + offset // block_q) * block_q + offset % block_q
     col = jnp.clip(col, 0, max_tiles * block_q - 1)
-    return scores_t, col
+    return ClassScores(
+        scores_t, col, tile_seq, tile_row0, num_tiles, first_tile, tile_start
+    )
 
 
-@functools.partial(
-    jax.jit,
-    static_argnames=(
-        "block_q",
-        "large_block_q",
-        "pages_per_step",
-        "small_pages_per_step",
-        "kernel",
-        "large_kernel",
-        "scale_row",
-        "interpret",
-    ),
-)
-def block_scores(
+class _ClassPlan(NamedTuple):
+    """`block_scores`' two tile classes. `small()` / `large()` score them
+    (`ClassScores` each); `token_major` is the small class's layout."""
+
+    small: Callable
+    large: Callable
+    small_block_q: int
+    large_block_q: int
+    large_pages: int
+    max_large: int
+    is_large: jax.Array
+    token_major: bool
+
+
+def is_prefill_step(num_tokens: int, max_num_seqs: int) -> bool:
+    """More rows than a batch of decode requests: `block_scores` scores both
+    tile classes unconditionally."""
+    return num_tokens > max_num_seqs * _SMALL_TILE_Q
+
+
+def class_plan(
     index_q: jax.Array,
     index_cache: jax.Array,
     seq_lens: jax.Array,
@@ -690,33 +741,10 @@ def block_scores(
     large_kernel: str = DEFAULT_LARGE_KERNEL,
     scale_cache: jax.Array | None = None,
     scale_row: int | None = None,
+    folded_tile_q: int = _SMALL_TILE_Q_FOLDED,
     interpret: bool = False,
-) -> jax.Array:
-    """Block-max index scores ``[T, 1, P]`` (``P`` padded to the page group).
-
-    Requests of at most `block_q` query tokens (decode, short chunks) are
-    scored in `block_q`-row tiles; longer prefill chunks in `large_block_q`-row
-    tiles, so a request's index keys are read once per large tile rather than
-    once per `block_q` rows.
-
-    Args:
-      index_q: ``[T, 1, D]`` index queries (one index head per rank).
-      index_cache: ``[pages, S / p, p, D]`` key-only cache (bf16 or fp8).
-      seq_lens, block_tables, cu_q_lens, num_seqs: ragged batch metadata.
-      kernel: ``"v2"`` (bitcast unpack, query latched across pages), ``"v3"``
-        (v2 with a hand-written DMA ring for the pages) or the original
-        ``"v1"``, kept as the reference arm for benchmarks. A 4-bit cache
-        without folded scales runs v2 where v3 is asked for.
-      large_kernel: the same choice (and fallback) for the `large_block_q` tiles.
-      pages_per_step / small_pages_per_step: pages per grid step of the large
-        and the block_q tile classes.
-      scale_cache, scale_row: for a 4-bit (uint8) index cache without folded
-        scales (`msa_fp4.scales_in_page`),
-        the ``[pages, 8, 128]`` f32 scale cache and the row of the index-key
-        scales. `index_q` must then be rotated (`msa_fp4.rotate_queries`).
-    Pages past a token's own page hold scores of keys it must not see, and
-    pages past its request's last page are not written; callers mask both.
-    """
+) -> _ClassPlan:
+    """`block_scores`' tile classes, unscored (arguments as `block_scores`)."""
     num_tokens, num_heads, _ = index_q.shape
     if num_heads != 1:
         raise NotImplementedError(
@@ -767,7 +795,7 @@ def block_scores(
     tile = (
         min(
             block_q,
-            _SMALL_TILE_Q_FOLDED if folded else _SMALL_TILE_Q,
+            folded_tile_q if folded else _SMALL_TILE_Q,
             -(-num_tokens // _ROW_ALIGN) * _ROW_ALIGN,
         )
         if token_major
@@ -775,7 +803,8 @@ def block_scores(
     )
     # Aligned tile starts add up to _ROW_ALIGN - 1 rows per request.
     tiles_per_request = -(-(block_q + _ROW_ALIGN - 1) // tile)
-    small, small_col = score(
+    small = functools.partial(
+        score,
         active & ~is_large,
         block_q=tile,
         max_tiles=min(
@@ -786,12 +815,114 @@ def block_scores(
         kernel=small_kernel,
         token_major=token_major,
     )
-    # The classes may pad pages to different group multiples; pad to the wider.
-    pages_per_seq = block_tables.shape[0] // max_num_seqs
-    pages = max(
-        small.shape[1 if token_major else 0],
-        -(-pages_per_seq // pages_per_step) * pages_per_step,
+    large = functools.partial(
+        score,
+        is_large,
+        block_q=large_block_q,
+        # +1 per request for the partial last tile, plus the up-to-7 rows
+        # each aligned start adds.
+        max_tiles=num_tokens // large_block_q
+        + max_large
+        + -(-(_ROW_ALIGN - 1) * max_large // large_block_q)
+        + 1,
+        pages_per_step=pages_per_step,
+        kernel=large_kernel,
     )
+    pages_per_seq = block_tables.shape[0] // max_num_seqs
+    return _ClassPlan(
+        small=small,
+        large=large,
+        small_block_q=tile,
+        large_block_q=large_block_q,
+        large_pages=-(-pages_per_seq // pages_per_step) * pages_per_step,
+        max_large=max_large,
+        is_large=is_large,
+        token_major=token_major,
+    )
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=(
+        "block_q",
+        "large_block_q",
+        "pages_per_step",
+        "small_pages_per_step",
+        "kernel",
+        "large_kernel",
+        "scale_row",
+        "folded_tile_q",
+        "interpret",
+    ),
+)
+def block_scores(
+    index_q: jax.Array,
+    index_cache: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    cu_q_lens: jax.Array,
+    num_seqs: jax.Array,
+    *,
+    block_q: int = DEFAULT_BLOCK_Q,
+    large_block_q: int = DEFAULT_LARGE_BLOCK_Q,
+    pages_per_step: int = DEFAULT_PAGES_PER_STEP,
+    small_pages_per_step: int = DEFAULT_SMALL_PAGES_PER_STEP,
+    kernel: str = DEFAULT_KERNEL,
+    large_kernel: str = DEFAULT_LARGE_KERNEL,
+    scale_cache: jax.Array | None = None,
+    scale_row: int | None = None,
+    folded_tile_q: int = _SMALL_TILE_Q_FOLDED,
+    interpret: bool = False,
+) -> jax.Array:
+    """Block-max index scores ``[T, 1, P]`` (``P`` padded to the page group).
+
+    Requests of at most `block_q` query tokens (decode, short chunks) are
+    scored in `block_q`-row tiles; longer prefill chunks in `large_block_q`-row
+    tiles, so a request's index keys are read once per large tile rather than
+    once per `block_q` rows.
+
+    Args:
+      index_q: ``[T, 1, D]`` index queries (one index head per rank).
+      index_cache: ``[pages, S / p, p, D]`` key-only cache (bf16 or fp8).
+      seq_lens, block_tables, cu_q_lens, num_seqs: ragged batch metadata.
+      kernel: ``"v2"`` (bitcast unpack, query latched across pages), ``"v3"``
+        (v2 with a hand-written DMA ring for the pages) or the original
+        ``"v1"``, kept as the reference arm for benchmarks. A 4-bit cache
+        without folded scales runs v2 where v3 is asked for.
+      large_kernel: the same choice (and fallback) for the `large_block_q` tiles.
+      pages_per_step / small_pages_per_step: pages per grid step of the large
+        and the block_q tile classes.
+      scale_cache, scale_row: for a 4-bit (uint8) index cache without folded
+        scales (`msa_fp4.scales_in_page`),
+        the ``[pages, 8, 128]`` f32 scale cache and the row of the index-key
+        scales. `index_q` must then be rotated (`msa_fp4.rotate_queries`).
+    Pages past a token's own page hold scores of keys it must not see, and
+    pages past its request's last page are not written; callers mask both.
+    """
+    plan = class_plan(
+        index_q,
+        index_cache,
+        seq_lens,
+        block_tables,
+        cu_q_lens,
+        num_seqs,
+        block_q=block_q,
+        large_block_q=large_block_q,
+        pages_per_step=pages_per_step,
+        small_pages_per_step=small_pages_per_step,
+        kernel=kernel,
+        large_kernel=large_kernel,
+        scale_cache=scale_cache,
+        scale_row=scale_row,
+        folded_tile_q=folded_tile_q,
+        interpret=interpret,
+    )
+    num_tokens = index_q.shape[0]
+    max_num_seqs = seq_lens.shape[0]
+    max_large, is_large, token_major = plan.max_large, plan.is_large, plan.token_major
+    small, small_col, *_ = plan.small()
+    # The classes may pad pages to different group multiples; pad to the wider.
+    pages = max(small.shape[1 if token_major else 0], plan.large_pages)
 
     def small_only():
         rows = small[small_col] if token_major else small[:, small_col].T
@@ -801,18 +932,7 @@ def block_scores(
         return small_only()[:, None, :]
 
     def with_large():
-        large, large_col = score(
-            is_large,
-            block_q=large_block_q,
-            # +1 per request for the partial last tile, plus the up-to-7 rows
-            # each aligned start adds.
-            max_tiles=num_tokens // large_block_q
-            + max_large
-            + -(-(_ROW_ALIGN - 1) * max_large // large_block_q)
-            + 1,
-            pages_per_step=pages_per_step,
-            kernel=large_kernel,
-        )
+        large, large_col, *_ = plan.large()
         small_t = small.T if token_major else small
         tok = jnp.arange(num_tokens, dtype=jnp.int32)
         seq = jnp.minimum(
@@ -829,7 +949,7 @@ def block_scores(
         )
         return jnp.concatenate([small_t, large], axis=1)[:, col].T
 
-    if num_tokens > max_num_seqs * _SMALL_TILE_Q:
+    if is_prefill_step(num_tokens, max_num_seqs):
         # More rows than a batch of decode requests: a prefill step. A
         # conditional would wait for the gather (offloaded to the SparseCore)
         # and its neighbours' collectives at its end (c4 mixed twin +50 us
