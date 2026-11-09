@@ -91,6 +91,7 @@ class BlockEvictionTracker:
         self._session_evicted_wall_ms: BoundedLRU[str, int] = BoundedLRU(
             session_maxsize
         )
+        self._dirty_sessions: set[str] = set()
         self._last_evicted_ts: float | None = None
         self._last_evicted_wall_ms: int | None = None
 
@@ -129,6 +130,7 @@ class BlockEvictionTracker:
         if owner is not None:
             self._session_evicted_ts.put(owner, ts)
             self._session_evicted_wall_ms.put(owner, evict_wall)
+            self._dirty_sessions.add(owner)
 
     def last_eviction_age_ms(self, now: float | None = None) -> float | None:
         """Return milliseconds since the most recent block eviction on this pool."""
@@ -185,6 +187,34 @@ class BlockEvictionTracker:
             return None
         return max(0.0, (ts_now - latest_evict) * 1000.0)
 
+    def pop_dirty_session_state(self) -> dict[str, list[float | int]]:
+        """Pop and return only sessions whose eviction timestamp changed since the last flush."""
+        if not self._dirty_sessions:
+            return {}
+        dirty = tuple(self._dirty_sessions)
+        self._dirty_sessions.clear()
+        out: dict[str, list[float | int]] = {}
+        for sid in dirty:
+            ts = self._session_evicted_ts.peek(sid)
+            wall_ms = self._session_evicted_wall_ms.peek(sid)
+            if ts is not None and wall_ms is not None:
+                out[sid] = [float(ts), int(wall_ms)]
+        return out
+
+    def export_recent_session_state(
+        self, limit: int = 1024
+    ) -> dict[str, list[float | int]]:
+        """Export up to `limit` most recently evicted sessions for sync log compaction."""
+        items = list(self._session_evicted_ts._data.items())
+        if limit > 0 and len(items) > limit:
+            items = items[-limit:]
+        out: dict[str, list[float | int]] = {}
+        for sid, ts in items:
+            wall_ms = self._session_evicted_wall_ms.peek(sid)
+            if wall_ms is not None:
+                out[sid] = [float(ts), int(wall_ms)]
+        return out
+
     def export_session_state(self) -> dict[str, list[float | int]]:
         """Serialize per-session eviction state for once-per-step IPC sync."""
         out: dict[str, list[float | int]] = {}
@@ -214,6 +244,7 @@ class BlockEvictionTracker:
         self._block_owner.clear()
         self._session_evicted_ts.clear()
         self._session_evicted_wall_ms.clear()
+        self._dirty_sessions.clear()
         self._last_evicted_ts = None
         self._last_evicted_wall_ms = None
 
