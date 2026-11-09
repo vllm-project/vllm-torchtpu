@@ -25,7 +25,6 @@ import pytest
 import torch
 import torch.compiler.config as compiler_config
 
-from .mock_omni import vllm_omni_mock  # noqa: F401  # isort: split
 
 from vllm_torchtpu.omni import attention as omni_attention
 from vllm_torchtpu.omni import patches

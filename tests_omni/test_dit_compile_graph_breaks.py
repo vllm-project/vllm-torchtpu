@@ -29,7 +29,6 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from .mock_omni import _MockSDPAImpl  # noqa: F401  # isort: split
 
 from vllm_torchtpu.omni import attention as omni_attention
 from vllm_torchtpu.omni import patches
