@@ -193,9 +193,24 @@ def make_lookup(
         # partition-id and is rejected on this SPMD path.
         me = rank[0, 0]
         num_tokens = h.shape[0]
-        hashes = jax.lax.all_gather(
-            h, _AXIS, axis=0, tiled=False, axis_index_groups=groups
-        )  # [node, T, C]
+        # The node's hashes, [node, T, C], as an all-to-all of node_size copies
+        # rather than an all-gather. Serving sets
+        # --xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=0 (the
+        # topology MoE preprocess needs it), which offloads this all-gather to
+        # SparseCore; with that offload EP16 decode degenerates on multi-rank
+        # replays, and the all-to-all form does not.
+        # TODO(wenqin): find out why the SparseCore-offloaded all-gather breaks
+        # decode here. This all-to-all should not be needed: check whether the
+        # diagnosis is wrong or XLA's SparseCore all-gather offload has a bug.
+        copies = jnp.broadcast_to(h[None], (node_size, *h.shape))
+        hashes = jax.lax.all_to_all(
+            copies.reshape(node_size * num_tokens, h.shape[1]),
+            _AXIS,
+            0,
+            0,
+            tiled=True,
+            axis_index_groups=groups,
+        ).reshape(node_size, num_tokens, h.shape[1])
         heads = head_start[me] + jnp.arange(part_cols, dtype=jnp.int32)
         ids = jnp.take(hashes, jnp.clip(heads, 0, n_cols - 1), axis=2)
         valid = (
