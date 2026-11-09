@@ -83,66 +83,14 @@ def rope_rows() -> Any:
     )
 
 
-def rope_paired_rows() -> Any:
-    """``(pairs, positions) -> [T, rotary_dim]`` rows of a two-row-packed table."""
-    return _get(
-        "rope_paired_rows",
-        lambda: (
-            rope_gather.gather_paired_rows,
-            lambda pairs, pos: pairs.new_empty((pos.shape[0], pairs.shape[1] // 2)),
-        ),
-    )
-
-
 def rope_paired_rows_sc() -> Any:
-    """``rope_paired_rows`` with the row fetch on SparseCore (async offload)."""
+    """``(pairs, positions) -> [T, rotary_dim]`` rows of a two-row-packed table,
+    fetched on SparseCore (async offload) where the chip has one."""
     return _get(
         "rope_paired_rows_sc",
         lambda: (
             rope_gather.gather_paired_rows_sc,
             lambda pairs, pos: pairs.new_empty((pos.shape[0], pairs.shape[1] // 2)),
-        ),
-    )
-
-
-def _kv3_bridge(eps: float):
-    def kv_norm_rope_3(
-        x: jax.Array,
-        w0: jax.Array,
-        w1: jax.Array,
-        w2: jax.Array,
-        s0: jax.Array,
-        s1: jax.Array,
-        s2: jax.Array,
-        g0: jax.Array,
-        g1: jax.Array,
-        g2: jax.Array,
-        rope_rows: jax.Array,
-    ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        if not x.shape[0]:  # empty dummy batches
-            empty = jnp.zeros((0, g0.shape[0]), jnp.bfloat16)
-            return empty, empty, empty
-        a, b, c = qa_kernel.fused_kv_norm_rope_layers(
-            x, (w0, w1, w2), (s0, s1, s2), (g0, g1, g2), rope_rows, eps=eps
-        )
-        return a, b, c
-
-    return kv_norm_rope_3
-
-
-def kv_rope_3_layers(eps: float) -> Any:
-    """Three layers' KV-only ``qa_rope`` of one ``x`` in one kernel (DSpark).
-
-    ``(x, w0..w2, scale0..2, gamma_kv0..2, rope_rows) -> (kv0, kv1, kv2)``,
-    each bitwise equal to that layer's ``qa_rope(False, eps)``.
-    """
-    return _get(
-        f"kv_norm_rope_3_e{_tag(eps)}",
-        lambda: (
-            _kv3_bridge(eps),
-            lambda x, *rest: tuple(
-                x.new_empty((x.shape[0], g.shape[0])) for g in rest[6:9]
-            ),
         ),
     )
 

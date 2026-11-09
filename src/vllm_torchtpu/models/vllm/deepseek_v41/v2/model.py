@@ -129,19 +129,6 @@ def _with_window_starts(context, first, positions, reuse=None):
     )
 
 
-_identity_replay_logged = False
-
-
-def _log_identity_replay_once(total_rows: int) -> None:
-    # Serving evidence that steady decode takes the scatter-free path.
-    global _identity_replay_logged
-    if not _identity_replay_logged:
-        _identity_replay_logged = True
-        logger.info(
-            "CED decoder replay is identity at %d rows; skip scatter", total_rows
-        )
-
-
 def _scatter_decoder_rows(
     tensor: torch.Tensor, indices: torch.Tensor, total_rows: int
 ) -> torch.Tensor:
@@ -1078,11 +1065,11 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         identity = (
             plan is not None
             and plan.padded_num_tokens == total_rows
-            and len(plan.indices) == total_rows
             and plan.indices == tuple(range(total_rows))
         )
         if identity:
-            _log_identity_replay_once(total_rows)
+            # Serving evidence that steady decode takes the scatter-free path.
+            logger.info_once("CED decoder replay is identity; skip scatter")
         if indices is None or identity:
             if isinstance(output, (list, tuple)) and len(output) == 2:
                 dec_hidden, dec_aux = output

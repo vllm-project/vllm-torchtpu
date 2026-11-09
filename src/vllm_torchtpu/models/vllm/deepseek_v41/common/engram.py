@@ -369,8 +369,6 @@ class NgramHashState(upstream.NgramHashState):
         _, ngram = multipliers.shape
         dev = input_ids.device
         rows = torch.arange(count, device=dev)
-        # One-hot lookups into the per-request table: a bucketize or gather
-        # against it lowers to a scalar select chain on TPU (table_lookup).
         reqs = table_lookup.bucketize_right(rows, query_start_loc[1:]).clamp(
             max=lookback_token_ids.shape[0] - 1
         )

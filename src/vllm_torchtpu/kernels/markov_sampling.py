@@ -14,79 +14,8 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 
-def _kernel(x, w, base, vo, io, *, group, vocab_size):
-    m = x.shape[0]
-    acc = [
-        jax.empty_ref(
-            jax.ShapeDtypeStruct((m, 256), jnp.float32), memory_space=pltpu.ACC(i)
-        )
-        for i in range(2)
-    ]
-    lhs = x[...]
-
-    def launch(c):
-        for mx in range(2):
-            rhs = w[pl.ds(c * 512 + mx * 256, 256), :]
-            pltpu.matmul_push_rhs(rhs, 0, mx, transpose=True)
-            pltpu.matmul_acc_lhs(acc[mx], lhs, load_staged_rhs=0)
-
-    best_key = jnp.zeros((m, 1), jnp.int32)
-    key_shift = group.bit_length() - 1
-    launch(0)
-    for c in range(group // 512):
-        mat = [pltpu.matmul_pop(acc[i]) for i in range(2)]
-        if c + 1 < group // 512:
-            launch(c + 1)
-        for mx in range(2):
-            start = c * 512 + mx * 256
-            scores = (
-                (mat[mx] + base[:, pl.ds(start, 256)].astype(jnp.float32))
-                .astype(jnp.bfloat16)
-                .astype(jnp.float32)
-            )
-            ids = (
-                pl.program_id(0) * group
-                + start
-                + jnp.arange(256, dtype=jnp.int32)[None, :]
-            )
-            bits = jax.lax.bitcast_convert_type(scores, jnp.uint32) >> jnp.uint32(16)
-            bits = jnp.where(bits & jnp.uint32(32767) == 0, jnp.uint32(0), bits)
-            rank = jnp.where(
-                bits & jnp.uint32(32768) != 0,
-                ~bits & jnp.uint32(65535),
-                bits ^ jnp.uint32(32768),
-            )
-            rank = jnp.where(
-                (bits & jnp.uint32(32640) == jnp.uint32(32640))
-                & (bits & jnp.uint32(127) != 0),
-                jnp.uint32(65535),
-                rank,
-            )
-            rank = jnp.where(ids < vocab_size, rank, jnp.uint32(0))
-            local = start + jnp.arange(256, dtype=jnp.uint32)[None, :]
-            key = rank << jnp.uint32(key_shift) | jnp.uint32(group - 1) - local
-            best_key = jnp.maximum(
-                best_key, jnp.max(key.astype(jnp.int32), axis=1, keepdims=True)
-            )
-    packed = best_key.astype(jnp.uint32)
-    best_rank = packed >> jnp.uint32(key_shift)
-    winner = (jnp.uint32(group - 1) - (packed & jnp.uint32(group - 1))).astype(
-        jnp.int32
-    ) + pl.program_id(0) * group
-    bits = jnp.where(
-        best_rank >= jnp.uint32(32768),
-        best_rank ^ jnp.uint32(32768),
-        ~best_rank & jnp.uint32(65535),
-    )
-    best = jax.lax.bitcast_convert_type(bits << jnp.uint32(16), jnp.float32)
-    best = jnp.where(best_rank == 0, -jnp.inf, best)
-    winner = jnp.where(best_rank == 0, jnp.iinfo(jnp.int32).max, winner)
-    vo[0, :, :] = best
-    io[0, :, :] = winner
-
-
 def _pipelined_kernel(x, w, base, vo, io, *, group, vocab_size):
-    """`_kernel` with the same keys under a double-slot MXU schedule.
+    """Per-tile top-1 keys under a double-slot MXU schedule.
 
     Two RHS staging slots and two accumulators per MXU (the CSA2 pattern):
     chunk c+1 is pushed into the other slot before chunk c is accumulated, and
@@ -131,7 +60,7 @@ def _pipelined_kernel(x, w, base, vo, io, *, group, vocab_size):
                 .astype(jnp.bfloat16)
                 .astype(jnp.float32)
             )
-            # `_kernel`'s ordered key: mag = bits & 0x7fff folds +-0 (mag == 0)
+            # Ordered key: mag = bits & 0x7fff folds +-0 (mag == 0)
             # and detects NaN (mag > 0x7f80); the sign flip is one XOR.
             raw = jax.lax.bitcast_convert_type(scores, jnp.int32)
             bits = jax.lax.shift_right_logical(raw, 16)
@@ -178,9 +107,7 @@ def sample_slot(
     base: jax.Array,
     *,
     slot: int,
-    pipelined: bool = True,
 ) -> jax.Array:
-    """``pipelined`` selects `_pipelined_kernel`; both return identical tokens."""
     assert x.shape == (48, 256) and w.shape == (129280, 256)
     assert base.shape == (240, 129280) and 0 <= slot < 5
     assert x.dtype == w.dtype == base.dtype == jnp.bfloat16
@@ -196,7 +123,7 @@ def sample_slot(
 
     value, index = pl.pallas_call(
         functools.partial(
-            _pipelined_kernel if pipelined else _kernel,
+            _pipelined_kernel,
             group=group,
             vocab_size=vocab_size,
         ),
@@ -228,11 +155,7 @@ def sample_slot(
             ),
         ),
         compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
-        name=(
-            "markov_pipelined_n16384_key"
-            if pipelined
-            else "markov_direct_lookahead_n16384_key"
-        ),
+        name="markov_pipelined_n16384_key",
     )(x, w, base)
     value = value[:, :, 0]
     index = index[:, :, 0]

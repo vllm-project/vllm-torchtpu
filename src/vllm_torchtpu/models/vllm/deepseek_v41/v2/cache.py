@@ -641,17 +641,13 @@ class PagedCacheRows:
                     _write_values_after_op(self.raw_hi, rec_hi, values, after)
                 )
         else:
-            self._write_word_records(rec_lo, values)
-
-    def _write_word_records(self, rec_lo, values):
-        """Write ``values`` rows at int32 ``rec_lo`` records of this owner."""
-        assert _write_values_op is not None
-        self.raw.copy_(_write_values_op(self.raw, rec_lo, values))
-        if self.raw_hi is not None:
-            rec_hi = torch.where(
-                rec_lo >= self.bank_records, rec_lo - self.bank_records, -1
-            )
-            self.raw_hi.copy_(_write_values_op(self.raw_hi, rec_hi, values))
+            assert _write_values_op is not None
+            self.raw.copy_(_write_values_op(self.raw, rec_lo, values))
+            if self.raw_hi is not None:
+                rec_hi = torch.where(
+                    rec_lo >= self.bank_records, rec_lo - self.bank_records, -1
+                )
+                self.raw_hi.copy_(_write_values_op(self.raw_hi, rec_hi, values))
 
     def _write_fp8(self, records, values):
         """Quantize BF16 latents into NoPE rows and their RoPE companion slots."""
@@ -1423,55 +1419,6 @@ def initialize_cache_ops():
             latent.new_empty((latent.shape[0], ROPE_WORDS), dtype=torch.int32),
         )
     )
-
-
-def _shares_word_owner(caches) -> bool:
-    """One word-row owner with disjoint layer regions in each physical page."""
-    first = caches[0]
-    if not all(isinstance(c, PagedCacheRows) for c in caches):
-        return False
-    if not all(
-        not c.native_swa
-        and c.dtype != torch.uint8
-        and c.raw.device.type != "cpu"
-        and c.raw is first.raw
-        and c.raw_hi is first.raw_hi
-        and c.dtype == first.dtype
-        and c.row_bytes == first.row_bytes
-        and c.page_stride == first.page_stride
-        and c.shape[1] == first.shape[1]
-        and 0 <= c.row_offset < c.row_offset + c.shape[1] <= c.page_stride
-        for c in caches
-    ):
-        return False
-    regions = sorted((c.row_offset, c.row_offset + c.shape[1]) for c in caches)
-    return all(left[1] <= right[0] for left, right in zip(regions, regions[1:]))
-
-
-def write_cache_layers(caches, slots, values, valid):
-    """``write_cache`` for several layers; one write when they share an owner.
-
-    ``caches``, ``slots``, ``values`` and ``valid`` are per layer.
-    Compatible views occupy disjoint regions within each physical page, so
-    one concatenated write publishes every layer
-    (one row-write launch instead of one per layer). Anything else falls back
-    to a write per layer. Same rows either way.
-    """
-    if len(caches) < 2 or not _shares_word_owner(caches):
-        for cache, s, v, ok in zip(caches, slots, values, valid, strict=True):
-            write_cache(cache, s, v, ok)
-        return
-    records, rows = [], []
-    for cache, s, v, ok in zip(caches, slots, values, valid, strict=True):
-        count = v.shape[0]
-        layer_slots = s[:count].masked_fill(~ok[:count], -1).long()
-        records.append(
-            cache.row_indices(layer_slots.clamp(min=0)).masked_fill(layer_slots < 0, -1)
-        )
-        rows.append(
-            v.to(cache.dtype).reshape(count, cache.row_bytes // cache.dtype.itemsize)
-        )
-    caches[0]._write_word_records(torch.cat(records).int(), torch.cat(rows))
 
 
 def write_cache(cache, slots, values, valid, after=None):

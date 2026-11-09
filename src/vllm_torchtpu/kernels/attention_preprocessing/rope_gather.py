@@ -90,11 +90,8 @@ def gather_paired_rows(pairs: jax.Array, positions: jax.Array) -> jax.Array:
     A 64-wide FP32 row fills half a lane block, and XLA lowers that gather
     about 10x slower than a full-lane one (11.2 -> 1.0 us at 288 tokens).
     """
-    clamped = jnp.clip(positions, 0, 2 * pairs.shape[0] - 1)
-    rows = jnp.take(pairs, clamped >> 1, axis=0)
-    half = pairs.shape[1] // 2
-    even = ((clamped & 1) == 0)[:, None]
-    return jnp.where(even, rows[:, :half], rows[:, half:])
+    clamped = _clamp_paired(pairs, positions)
+    return _select_half(jnp.take(pairs, clamped >> 1, axis=0), clamped)
 
 
 def gather_paired_rows_sc(pairs: jax.Array, positions: jax.Array) -> jax.Array:
@@ -109,27 +106,38 @@ def gather_paired_rows_sc(pairs: jax.Array, positions: jax.Array) -> jax.Array:
     """
     from vllm_torchtpu.kernels.sparse_core.ragged_gather_v2 import ragged_gather_v2
 
-    if pltpu_sparse_core() is None:
+    if not _has_sparse_core():
         return gather_paired_rows(pairs, positions)
-    clamped = jnp.clip(positions, 0, 2 * pairs.shape[0] - 1)
-    tokens = positions.shape[0]
+    clamped = _clamp_paired(pairs, positions)
     rows = ragged_gather_v2(
         pairs,
         clamped >> 1,
         jnp.zeros((1,), jnp.int32),
-        jnp.full((1,), tokens, jnp.int32),
+        jnp.full((1,), positions.shape[0], jnp.int32),
     )
-    half = pairs.shape[1] // 2
+    return _select_half(rows, clamped)
+
+
+def _clamp_paired(pairs: jax.Array, positions: jax.Array) -> jax.Array:
+    return jnp.clip(positions, 0, 2 * pairs.shape[0] - 1)
+
+
+def _select_half(rows: jax.Array, clamped: jax.Array) -> jax.Array:
+    """Table row ``clamped`` from its packed pair row."""
+    half = rows.shape[1] // 2
     even = ((clamped & 1) == 0)[:, None]
     return jnp.where(even, rows[:, :half], rows[:, half:])
 
 
-def pltpu_sparse_core():
+def _has_sparse_core() -> bool:
     from jax.experimental.pallas import tpu as pltpu
 
-    if jax.default_backend() != "tpu":
-        return None
-    return pltpu.get_tpu_info().sparse_core
+    # Check the device, not only the backend name: host-traced TPU branches
+    # have no TPU device kind to query (same check as cache._sparse_core_rows).
+    return (
+        jax.devices()[0].platform == "tpu"
+        and pltpu.get_tpu_info().sparse_core is not None
+    )
 
 
 def coefficients(cos_sin):

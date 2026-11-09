@@ -481,8 +481,6 @@ def _shared_draft_attention(q, pool, records, sink, row_valid=None):
     )
     kv = jnp.where((shared >= 0)[None, :, :, None], kv, 0)
     mask = jnp.pad((shared >= 0).astype(jnp.int32), ((0, 0), (0, 64)))[:, None, :]
-    if row_valid is not None:
-        row_valid = (row_valid != 0).astype(jnp.int32)
     return shared_record_attention(
         mask, pieces, kv, jnp.tile(sink, 5)[:, None], row_valid
     ).reshape(q.shape)

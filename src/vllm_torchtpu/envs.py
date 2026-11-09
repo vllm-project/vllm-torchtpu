@@ -33,14 +33,10 @@ if TYPE_CHECKING:
     TPU_INLINE_DEDUPLICATED_CALLS: bool = True
     TPU_VERIFY_INCREMENTAL_BLOCK_TABLE: bool = False
     TPU_ROPE_PAIRED_ROWS: bool = True
-    TPU_ROPE_SC_GATHER: bool = True
-    TPU_DSPARK_FUSED_CONTEXT_KV: bool = True
-    TPU_DSPARK_MERGED_CONTEXT_WRITES: bool = True
     TPU_ENGRAM_REQUEST_FALLBACK: bool = True
     TPU_BLOCK_TABLE_DELTA_BUCKETS: bool = True
     TPU_FUSED_SPEC_NEXT_INPUTS: bool = True
     TPU_DSV41_FUSED_ATTENTION_ROW_MASK: bool = True
-    TPU_DSPARK_PIPELINED_MARKOV: bool = True
     TPU_MOE_ONEHOT_SCALE_LOOKUP: bool = True
     TPU_DSPARK_DRAFT_MOE_TUNING: bool = True
     LIBTPU_INIT_ARGS: str = ""
@@ -576,23 +572,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # per-step rows from it: a full-lane gather instead of a half-lane one.
     # Costs one extra copy of the compact table in HBM. Bit-exact.
     "TPU_ROPE_PAIRED_ROWS": env_bool("TPU_ROPE_PAIRED_ROWS", default=True),
-    # Fetch the paired RoPE rows on SparseCore (`rope_gather.gather_paired_rows_sc`)
-    # so the gather can overlap TensorCore work that does not need it
-    # (DSpark context KV: 123.9 -> 114.6 us on one v7x chip). Bit-exact.
-    "TPU_ROPE_SC_GATHER": env_bool("TPU_ROPE_SC_GATHER", default=True),
-    # Project the DSpark draft layers' context KV in one kernel
-    # (`qa_rope.fused_kv_norm_rope_layers`) instead of one per layer: x is
-    # quantized and the RoPE coefficients built once (DSpark context KV:
-    # 103.1 -> 100.8 us on one v7x chip). Bit-exact per layer.
-    "TPU_DSPARK_FUSED_CONTEXT_KV": env_bool(
-        "TPU_DSPARK_FUSED_CONTEXT_KV", default=True
-    ),
-    # Publish all DSpark draft layers' context KV in one cache write when
-    # their SWA caches are views of one word-row owner
-    # (`cache.write_cache_layers`); otherwise one write per layer. Same rows.
-    "TPU_DSPARK_MERGED_CONTEXT_WRITES": env_bool(
-        "TPU_DSPARK_MERGED_CONTEXT_WRITES", default=True
-    ),
     # Read the Engram slot-cache fallback once per (request, lookback slot)
     # instead of once per (token, n-gram shift), then look rows up in that
     # small table (Engram hash: 116.9 -> 102.9 us on one v7x chip). Same hashes.
@@ -605,13 +584,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (~13 us per draft layer on one v7x chip). Same values.
     "TPU_DSV41_FUSED_ATTENTION_ROW_MASK": env_bool(
         "TPU_DSV41_FUSED_ATTENTION_ROW_MASK", default=True
-    ),
-    # DSpark Markov sampling: run each slot's projection + greedy selection
-    # with a double-slot MXU schedule, elementwise key max and leaner keys
-    # (`markov_sampling._pipelined_kernel`) instead of the single-slot kernel
-    # (M48/K256/V129280 on one v7x chip: 40.7 -> 30.8 us per slot). Same tokens.
-    "TPU_DSPARK_PIPELINED_MARKOV": env_bool(
-        "TPU_DSPARK_PIPELINED_MARKOV", default=True
     ),
     # Fused EP MoE combine: read the arrival row scales through an exact
     # one-hot matmul over the f32 bits split into 16-bit halves
