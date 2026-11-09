@@ -80,7 +80,7 @@ from vllm_torchtpu.kernels.mla.kv_cache_utils import (
 from vllm_torchtpu.kernels.mla.v2 import kernel as mla_v2_kernel
 from vllm_torchtpu.layers.adapter import cp_mla_attention as _cp_mla_attention
 from vllm_torchtpu.layers.adapter.cp_attention import (
-    build_dcp_kernels as _build_dcp_kernels,
+    build_dcp_kernel as _build_dcp_kernel,
 )
 from vllm_torchtpu.layers.adapter.cp_attention import (
     forward_with_dcp as _forward_with_dcp,
@@ -902,8 +902,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # when decode_context_parallel_size > 1.
         self.dcp_world_size = 1
         self.dcp_rank = 0
-        self.rpa_dcp_cache_kernel = None  # CACHE_ONLY pass, returns (out, lse)
-        self.rpa_dcp_new_kernel = None  # NEW_TOKENS_ONLY pass, returns (out, lse)
+        self.rpa_dcp_kernel = None  # returns (out, lse)
         # Block-major bundled kernel and pre-allocated layer index. Initialized by
         # setup_bundled() after bundle allocation and prior to torch.compile tracing.
         # During profile_run, ctx.kv_cache_bundle is None and forward falls back to
@@ -1386,7 +1385,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             if dcp_group is not None:
                 self.dcp_world_size = int(dcp_group.world_size)
                 self.dcp_rank = int(dcp_group.rank_in_group)
-                self.rpa_dcp_cache_kernel, self.rpa_dcp_new_kernel = _build_dcp_kernels(
+                self.rpa_dcp_kernel = _build_dcp_kernel(
                     sliding_window=self.sliding_window,
                     sm_scale=self.scale,
                     logits_soft_cap=self.logits_soft_cap,

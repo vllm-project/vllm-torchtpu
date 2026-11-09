@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 import dataclasses
 import enum
 import math
@@ -173,6 +172,8 @@ class ServingConfigs:
     attention_scope: AttentionScope = AttentionScope.FULL
     return_lse: bool = False
     skip_kv_update: bool = False
+    quantize_p: bool = False
+    kv_interleaved_size: int = 1
     mask_invalid_v: bool | None = None
 
     def __post_init__(self):
@@ -182,6 +183,33 @@ class ServingConfigs:
                 "mask_invalid_v",
                 self.kv_layout == KVLayout.SEQ_ALONG_LANE,
             )
+
+    @property
+    def matmuls_are_8bit(self) -> bool:
+        """True when both the qk and pv matmuls run at the 8-bit MXU rate.
+
+        The MXU picks its data format from the LHS operand alone, evaluated after
+        any in-kernel cast. qk's LHS is q, which is cast down when scale_q is set.
+        pv's LHS is p, which is cast down only when quantize_p is set.
+        """
+        kv_is_8bit = jnp.dtype(self.dtype_kv).itemsize == 1
+        qk_is_8bit = jnp.dtype(self.dtype_q).itemsize == 1 or (
+            self.scale_q is not None and kv_is_8bit
+        )
+        pv_is_8bit = self.quantize_p and kv_is_8bit
+        return qk_is_8bit and pv_is_8bit
+
+    def prefill_tile_caps(self, tpu_info) -> tuple[int | None, int | None]:
+        """Returns (max_bq_sz, max_bkv_sz) for the prefill tile search.
+
+        (None, None) means uncapped. See SFS_PREFILL_MAX_* for where the numbers
+        come from.
+        """
+        if not is_sfs(tpu_info):
+            return None, None
+        if self.matmuls_are_8bit:
+            return SFS_PREFILL_MAX_BQ_SZ, SFS_PREFILL_MAX_BKV_SZ_8BIT
+        return SFS_PREFILL_MAX_BQ_SZ, SFS_PREFILL_MAX_BKV_SZ_16BIT
 
     @property
     def max_decode_bkv_p_new(self) -> int:
@@ -216,6 +244,56 @@ class ServingConfigs:
             return max(1, scale_bits // kv_bits)
         return 0
 
+    @property
+    def is_interleaved_kv(self) -> bool:
+        return self.kv_interleaved_size > 1
+
+
+def is_sfs(tpu_info) -> bool:
+    """Returns True on Sunfish (TPU v8i).
+
+    Accepts an enum or a string, since the unit tests mock chip_version with a
+    plain string and a strict `==` against the enum would never match.
+    """
+    return tpu_info.generation == 8 and tpu_info.chip_version in (
+        pltpu.ChipVersion.TPU_8I,
+        "v8i",
+        "8i",
+    )
+
+
+# Prefill tile caps on SFS. EMPIRICAL, not derived: the VMEM-driven search in
+# wrapper.find_best_block_sizes picks bkv=2304 on SFS, which is well past the
+# measured optimum, because prefill uses only ~6% of HBM bandwidth and a larger
+# tile buys no bandwidth relief while causal-mask waste and the bq_sz * bkv_sz
+# softmax intermediate both grow. The optimum depends on matmul precision.
+# Measured kernel latency, Qwen3.5, TP=8, one 8500-token sequence,
+# page_size=256, fp8 kv cache, prefill batch_size=2:
+#
+#   bkv            512       1024      2048      2304 (uncapped pick)
+#   bf16, c512     366.2 us  414.5 us  480.3 us  536.6 us
+#   fp8,  c512     266.4 us  250.2 us  288.7 us  458.4 us
+#   fp8,  c128     259.2 us  244.1 us  237.1 us
+#
+# (c128 is what the threshold below picks for fp8 on this shape; the c512 rows
+# are from the earlier hand-tuned sweep.) Batch size at a fixed tile is flat:
+# fp8 c128 bkv=1024 gives 240.1 / 244.1 / 240.6 us at batch_size 1 / 2 / 4, and
+# bkv=512 at batch_size 4 (same VMEM as bkv=1024 at 2) is 252.9 us, so more
+# batch is not a substitute for a bigger kv tile.
+#
+# Caps must be multiples of the bkv stride (256 here). Other chips are
+# unmeasured and stay uncapped.
+# TODO(karangoel): the cap is not the optimum at c128: bkv=1536 / 2048 at
+# batch_size=1 measured 225.1 / 229.0 us (-8% / -6% vs this cap), while
+# bkv=2048 at batch_size=4 is 281.2 us and bkv=4096 at 1 is 316.1 us, so the
+# surface has cliffs. Revisit the cap and prefill batch_size together, on
+# multi-sequence prefill and the other models, before moving either; and
+# re-measure when the per-block cost of the kernel changes (the
+# softmax work).
+SFS_PREFILL_MAX_BQ_SZ = 512
+SFS_PREFILL_MAX_BKV_SZ_8BIT = 1024
+SFS_PREFILL_MAX_BKV_SZ_16BIT = 512
+
 
 @dataclasses.dataclass(frozen=True, eq=True)
 class RpaConfigs:
@@ -245,7 +323,7 @@ class RpaConfigs:
 
     def seq_range(
         self, distribution: jax.Array | jax.Ref
-    ) -> tuple[jax.typing.ArrayLike, jax.typing.ArrayLike]:
+    ) -> tuple[int | jax.Array, int | jax.Array]:
         """Sequences this kernel call schedules.
 
         Batched RPA has no specialised prefill-only path, so MIXED also covers the
@@ -258,6 +336,30 @@ class RpaConfigs:
         raise ValueError(f"Batched RPA does not dispatch {self.mode}; use MIXED.")
 
     # Define derived values.
+
+    @property
+    def page_window_seqs(self) -> int:
+        """Sequences per page_indices DMA window: a power of two dividing num_seqs."""
+        max_rows = max(
+            1,
+            self.serve.page_indices_window_size // self.serve.pages_per_seq,
+        )
+        rows = 1 << (max_rows.bit_length() - 1)
+        return math.gcd(rows, self.serve.num_seqs)
+
+    @property
+    def page_window_entries(self) -> int:
+        """Flat page_indices entries covered by one window."""
+        return self.page_window_seqs * self.serve.pages_per_seq
+
+    @property
+    def page_window_slot_len(self) -> int:
+        """SMEM entries per window slot (lane-aligned, plus slack if unaligned)."""
+        num_lanes = pltpu.get_tpu_info().num_lanes
+        entries = self.page_window_entries
+        return utils.align_to(entries, num_lanes) + (
+            num_lanes if entries % num_lanes else 0
+        )
 
     @property
     def max_steps_ub(self) -> int:
@@ -289,8 +391,9 @@ class RpaConfigs:
         )
         bytes_per_step *= self.block.batch_size
         # Add 20 bytes for the 5 total_wait fields (total_wait_kv_in,
-        # total_wait_kv_out, total_wait_q_in, total_wait_o_out, total_wait_lse_out)
-        # which are 1D arrays (not multiplied by batch_size).
+        # total_wait_kv_out, total_wait_q_in, total_wait_o_out,
+        # total_wait_lse_out), which are 1D arrays (not multiplied by
+        # batch_size).
         bytes_per_step += 20
 
         max_steps_ub = available_bytes // bytes_per_step
@@ -298,29 +401,6 @@ class RpaConfigs:
         num_lanes = pltpu.get_tpu_info().num_lanes
         max_steps_ub = max(1, max_steps_ub // num_lanes) * num_lanes
         return int(max_steps_ub)
-
-    @property
-    def page_window_seqs(self) -> int:
-        """Sequences per page_indices DMA window: a power of two dividing num_seqs."""
-        max_rows = max(
-            1, self.serve.page_indices_window_size // self.serve.pages_per_seq
-        )
-        rows = 1 << (max_rows.bit_length() - 1)
-        return math.gcd(rows, self.serve.num_seqs)
-
-    @property
-    def page_window_entries(self) -> int:
-        return self.page_window_seqs * self.serve.pages_per_seq
-
-    @property
-    def page_window_slot_len(self) -> int:
-        """SMEM entries per window slot: lane-aligned, plus a lane group of slack
-        when the window itself is not."""
-        num_lanes = pltpu.get_tpu_info().num_lanes
-        entries = self.page_window_entries
-        return utils.align_to(entries, num_lanes) + (
-            num_lanes if entries % num_lanes else 0
-        )
 
     @property
     def bkv_p(self) -> int:
@@ -333,10 +413,28 @@ class RpaConfigs:
         return self.bkv_p
 
     @property
+    def is_decode_lane_stitch(self) -> bool:
+        return (
+            self.mode == RpaCase.DECODE
+            and self.block.bq_sz <= pltpu.get_tpu_info().num_lanes
+        )
+
+    @property
+    def uses_multi_page_lane_staging(self) -> bool:
+        return (
+            self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE
+            and self.serve.is_interleaved_kv
+            and not self.is_decode_lane_stitch
+        )
+
+    @property
     def bkv_p_new(self) -> int:
         if self.mode == RpaCase.DECODE or self.block.bq_sz == 1:
             return min(self.serve.max_decode_bkv_p_new, self.bkv_p)
-        if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
+        if (
+            self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE
+            and not self.serve.is_interleaved_kv
+        ):
             return self.bkv_p + 1
         return self.bkv_p
 
@@ -475,7 +573,12 @@ class RpaConfigs:
         #   want  [onnn][nnnn]
         #   got   [o---][---n][nnnn][nn--]
         #
-        # because we fetch at 128-lane boundary, we need 2 extra padding slots
+        # because we fetch at 128-lane boundary, we need 2 extra padding slots.
+        # For multi-page single-phase CP prefill, each of the `bkv_p` pages uses a
+        # dedicated `(page_size + 128)` staging slot, requiring `bkv_p + 1` extra
+        # 128-lane cells overall.
+        if self.uses_multi_page_lane_staging:
+            return self.block.bkv_sz + (self.bkv_p + 1) * self.kv_token_align
         return self.block.bkv_sz + 2 * self.kv_token_align
 
     @property
@@ -503,6 +606,7 @@ class RpaConfigs:
         if (
             self.serve.kv_layout == KVLayout.HEAD_ALONG_SUBLANE
             and self.serve.cp_group_size is not None
+            and self.serve.attention_scope != AttentionScope.CACHE_ONLY
         ):
             return 5
         return 4
@@ -538,9 +642,30 @@ class RpaConfigs:
         )
 
     @property
+    def max_steps_needed(self) -> int:
+        """Upper bound on the schedule steps *any* input of this shape can need."""
+        if self.mode == RpaCase.DECODE:
+            q_blocks_ub = self.serve.num_seqs * pl.cdiv(
+                self.serve.decode_query_size, self.block.bq_sz
+            )
+        else:
+            q_blocks_ub = min(
+                self.serve.total_q_tokens,
+                self.serve.num_seqs + self.serve.total_q_tokens // self.block.bq_sz,
+            )
+        k_blocks_ub = pl.cdiv(
+            self.serve.pages_per_seq * self.serve.page_size, self.block.bkv_sz
+        )
+        return pl.cdiv(q_blocks_ub * k_blocks_ub, self.block.batch_size)
+
+    @property
     def max_schedule_size_multiplier(self) -> int:
-        # By default, setting an upper bound of ~5x the SMEM capacity on schedule.
-        return self.serve.max_schedule_size_multiplier
+        # By default, setting an upper bound of ~5x the SMEM capacity on schedule,
+        # raised whenever the shape provably needs more room.
+        return max(
+            self.serve.max_schedule_size_multiplier,
+            pl.cdiv(self.max_steps_needed, self.max_steps_ub),
+        )
 
     def validate_inputs(
         self,
@@ -552,6 +677,7 @@ class RpaConfigs:
         page_indices: jax.Array,
         cu_q_lens: jax.Array,
         distribution: jax.Array,
+        attention_sink: jax.Array | None = None,
     ):
         """Validate inputs to the RPA kernel statically."""
 
@@ -649,14 +775,21 @@ class RpaConfigs:
             )
         if distribution.shape != (3,):
             raise ValueError(f"Expected {distribution.shape=} to be (3,).")
+        if attention_sink is not None:
+            if attention_sink.shape != (self.model.num_q_heads,):
+                raise ValueError(
+                    f"Expected {attention_sink.shape=} to be"
+                    f" ({self.model.num_q_heads},)."
+                )
+            if attention_sink.dtype != jnp.float32:
+                raise ValueError(
+                    f"Expected {attention_sink.dtype=} to be equal to {jnp.float32=}."
+                )
 
         # Context Parallel Support
         if self.serve.cp_group_size is not None:
-            if self.serve.attention_scope == AttentionScope.FULL:
-                raise ValueError(
-                    "Context Parallel does not support AttentionScope.FULL"
-                    " where cache is sharded but current tokens is sequential"
-                )
+            if attention_sink is not None:
+                raise ValueError("Context Parallel does not support attention sink")
             if self.model.sliding_window is not None:
                 raise ValueError(
                     "Context Parallel does not support sliding window right now"

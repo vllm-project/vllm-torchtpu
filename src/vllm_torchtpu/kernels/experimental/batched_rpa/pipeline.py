@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 """Manual triple buffering pipeline scheduling loop for RPA."""
 
 from collections.abc import Callable
@@ -51,12 +50,12 @@ def run_manual_triple_buffer(
     awaited before it is reused)
 
     Args:
-      total_steps: Total number of pipeline steps to execute.
-      compute_fn: Callable of the main kernel function.
-      q_bref: Fetch-only ref for the Q blocks.
-      o_bref: Writeback-only ref for the attention output.
-      kv_bref: Input/output ref for the KV cache.
-      lse_bref: Optional writeback-only ref for the log-sum-exp values.
+        total_steps: Total number of pipeline steps to execute.
+        compute_fn: Callable of the main kernel function.
+        q_bref: Fetch-only ref for the Q blocks.
+        o_bref: Writeback-only ref for the attention output.
+        kv_bref: Input/output ref for the KV cache.
+        lse_bref: Optional writeback-only ref for the log-sum-exp values.
     """
     with jax.named_scope("ep_initialize"):
         q_bref.copy_in(0, 0, total_steps)
