@@ -32,8 +32,11 @@ from vllm_torchtpu.layers.core.ragged_a2a_moe import (
     DP_AXIS,
     TP_AXIS,
     _member_index,
+    _owner_routes,
+    _owner_sum_ref,
     _sender_sum,
     exchange_capacity,
+    owner_sum_kernel,
     ragged_a2a_moe,
     route_order,
     sender_sum_kernel,
@@ -405,6 +408,58 @@ def test_sender_sum_kernel_matches_reference(num_tokens, skip_padded):
     args = (recv, jnp.asarray(ids), jnp.asarray(weights, jnp.bfloat16))
     want = jax.jit(functools.partial(_sender_sum, **common))(*args)
     got = jax.jit(functools.partial(sender_sum_kernel, **common))(*args)
+    np.testing.assert_array_equal(
+        np.asarray(got).view(np.uint16), np.asarray(want).view(np.uint16)
+    )
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize("tp_size", [1, 2, 4])
+@pytest.mark.parametrize("num_tokens", [4, 12, 13, 22, 24, 92])
+@pytest.mark.parametrize("with_shared", [False, True])
+@pytest.mark.parametrize("skip_padded", [False, True])
+def test_owner_sum_kernel_matches_reference(
+    tp_size, num_tokens, with_shared, skip_padded
+):
+    """The owner-side sum kernel is bitwise its jnp formulation, on the last
+    owner's block of an engine (padded tokens where tp does not divide the
+    tokens), with zero, negative and NaN weights, and stale NaN rows where no
+    output comes."""
+    _require_eight_tpu_devices()
+    dp_size, local, topk = 8 // tp_size, 8, 10
+    mesh = dict(dp_size=dp_size, tp_size=tp_size, local_num_experts=local)
+    blk = -(-num_tokens // tp_size)
+    real = num_tokens - (tp_size - 1) * blk
+    rng = np.random.default_rng(10 * num_tokens + tp_size)
+    ids = np.stack(
+        [rng.choice(dp_size * tp_size * local, topk, replace=False) for _ in range(blk)]
+    ).astype(np.int32)
+    weights = rng.uniform(0.01, 1.0, size=ids.shape).astype(np.float32)
+    weights[0, 3] = np.nan
+    weights[1 % blk] = 0
+    weights[2 % blk, 5] *= -1
+    ids[real:] = -1
+    weights[real:] = 0
+    ids, weights = jnp.asarray(ids), jnp.asarray(weights, jnp.bfloat16)
+    common = dict(skip_padded_tokens=skip_padded, dtype=jnp.bfloat16, **mesh)
+    _, _, sent, _ = _owner_routes(ids, weights, **common)
+    rows = (
+        rng.standard_normal((topk, blk, HIDDEN))
+        * np.exp2(rng.integers(-8, 8, size=(topk, blk, 1)))
+    ).astype(np.float32)
+    rows[~np.asarray(sent)] = np.nan
+    recv = jnp.asarray(rows.reshape(topk * blk, 16, HIDDEN // 16), jnp.bfloat16)
+    shared = None
+    if with_shared:
+        shared = jnp.asarray(
+            rng.standard_normal((tp_size * blk, 16, HIDDEN // 16)) / 4, jnp.bfloat16
+        )
+    want = jax.jit(functools.partial(_owner_sum_ref, **common))(
+        recv, ids, weights, shared=shared
+    )
+    got = jax.jit(functools.partial(owner_sum_kernel, **common))(
+        recv, ids, weights, shared=shared
+    )
     np.testing.assert_array_equal(
         np.asarray(got).view(np.uint16), np.asarray(want).view(np.uint16)
     )
