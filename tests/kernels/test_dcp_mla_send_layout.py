@@ -130,7 +130,7 @@ def _kernel_send(p, world, fault=None):
 
 
 GEOMETRIES = ((16, 64), (8, 64), (8, 32))  # (ranks, heads): mirror, twin, test
-DECODE_CELLS = tuple(c for c in prologue.CELLS if c[0] <= 32)
+DECODE_CELLS = ((4, (3,)), (8, (4, 3))) + tuple(c for c in prologue.CELLS if c[0] <= 32)
 
 
 def _problem(query_tokens, seq_q, heads, zero=False):
