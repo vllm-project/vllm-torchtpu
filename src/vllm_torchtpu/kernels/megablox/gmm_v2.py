@@ -395,9 +395,13 @@ def lhs_tile_cols(cfgs: "GmmConfigs") -> int:
 class IndexMaps:
     """Index maps for GMM kernel."""
 
-    def __init__(self, metadata_ref: MetadataRef, cfgs: GmmConfigs):
+    def __init__(self, metadata_ref: MetadataRef, cfgs: GmmConfigs, out_row_block_offset=None):
         self.metadata_ref = metadata_ref
         self.cfgs = cfgs
+        # Output rows start this many sublane blocks into the output (gmm_mlp_v2
+        # out_row_offset): the lhs is read from row 0, the output is written at
+        # the offset. None keeps the kernel unchanged.
+        self.out_row_block_offset = out_row_block_offset
 
     def lhs_index_map(self, _: jax.Array, gm_id: jax.Array, k_id: jax.Array):
         m_start = self.metadata_ref.gm_id_to_m_offset[gm_id]
@@ -436,16 +440,18 @@ class IndexMaps:
         last_row_end = pl.cdiv(m_end, self.cfgs.dims.size_lhs_sublane)
         row_end = jnp.where(is_last_gm, last_row_end, capped_row_end)
         row_size = row_end - row_start
+        if self.out_row_block_offset is not None:
+            row_start = row_start + self.out_row_block_offset
 
         return (pl.ds(row_start, row_size), 0, n_id)
 
 
 def generate_block_specs(
-    metadata_ref: MetadataRef, cfgs: GmmConfigs
+    metadata_ref: MetadataRef, cfgs: GmmConfigs, out_row_block_offset=None
 ) -> tuple[tuple[pl.BlockSpec, WeightsRef], pl.BlockSpec]:
     """Generates block specs for the given lhs, rhs, and out refs."""
 
-    index_map = IndexMaps(metadata_ref, cfgs)
+    index_map = IndexMaps(metadata_ref, cfgs, out_row_block_offset)
     bounded_slice_gm = pl.BoundedSlice(cfgs.tiles.tile_m // cfgs.dims.size_lhs_sublane)
 
     lhs_block_spec = pl.BlockSpec(
@@ -1482,6 +1488,7 @@ def fused_mlp_kernel_main(
     *,
     cfgs1: GmmConfigs,
     cfgs2: GmmConfigs,
+    out_row_offset: bool = False,
 ):
     """Fused expert MLP (gmm1 + activation + gmm2) in one pipeline: each step
     loads one expert's w1 and w2 and runs both GMMs on that visit's rows.
@@ -1503,7 +1510,10 @@ def fused_mlp_kernel_main(
     else:
         num_gm = fill_metadata(lhs_group_sizes_ref, group_offset_ref, metadata_ref, cfgs=cfgs1)
     (lhs_spec, rhs1_spec), _ = generate_block_specs(metadata_ref, cfgs1)
-    (_, rhs2_spec), out_spec = generate_block_specs(metadata_ref, cfgs2)
+    # out_row_offset: group_offset_ref = [group offset, output row offset] (the
+    # offset a multiple of the sublane block; gmm_mlp_v2 checks it).
+    out_off = group_offset_ref[1] // cfgs2.dims.size_lhs_sublane if out_row_offset else None
+    (_, rhs2_spec), out_spec = generate_block_specs(metadata_ref, cfgs2, out_off)
     rhs_up_ref = jax.tree.map(lambda x: x.at[..., cfgs1.out_size_n :], rhs1_ref)
     rhs1_ref = FusedWeightsRef(gate=rhs1_ref, up=rhs_up_ref)
     rhs1_spec = FusedWeightsRef(gate=rhs1_spec, up=rhs1_spec)
@@ -1527,6 +1537,15 @@ def fused_mlp_kernel_main(
     )
 
 
+def _fused_mlp_kernel_out_alias(gs_ref, goff_ref, lhs_ref, rhs1_ref, rhs2_ref, out_alias_ref, out_ref, *scratch,
+                                cfgs1, cfgs2):
+    """fused_mlp_kernel_main writing into an aliased output buffer at a row offset
+    (gmm_mlp_v2 out_buffer / out_row_offset); out_alias_ref is out_ref's buffer."""
+    del out_alias_ref
+    fused_mlp_kernel_main(gs_ref, goff_ref, lhs_ref, rhs1_ref, rhs2_ref, out_ref, *scratch,
+                          cfgs1=cfgs1, cfgs2=cfgs2, out_row_offset=True)
+
+
 def gmm_mlp_v2(
     lhs: jax.Array,  # [size_m, size_k]
     w1: jax.Array,  # [size_group, size_k, 2 * inter]
@@ -1543,13 +1562,22 @@ def gmm_mlp_v2(
     vmem_limit_bytes: int | None = None,
     experts_per_visit: int = 1,
     lhs_packed_dtype: jnp.dtype | None = None,
+    out_buffer: jax.Array | None = None,
+    out_row_offset: jax.Array | int | None = None,
 ) -> jax.Array:
     """gmm_v2(gmm_v2(lhs, w1, fuse_act), w2) as one kernel (fused expert MLP),
     bitwise equal to the two calls with zero_initialize=False and the same
     tilings, at experts_per_visit E in (1, 2, 4) (both stages visit the same E
     consecutive experts per step; the two-kernel path is bitwise across E).
     Non-EP only (group offset 0). lhs_packed_dtype as gmm_v2's (gmm1 reads the
-    packed fp8 carrier of rows of that dtype)."""
+    packed fp8 carrier of rows of that dtype).
+
+    out_buffer / out_row_offset (both or neither): write the result rows into
+    out_buffer (aliased, updated in place) starting at row out_row_offset, a
+    traced or static multiple of the lhs sublane block; lhs rows are still read
+    from row 0. Rows outside the visited groups' rows keep out_buffer's values.
+    Used to assemble one output from expert-range chunks (fused_moe_gmm chunked
+    dispatch). Each row is computed by the same ops as without the offset."""
     tile_info1 = calculate_tiling if tile_info1 is None else tile_info1
     tile_info2 = calculate_tiling if tile_info2 is None else tile_info2
     size_m = lhs.shape[0]
@@ -1609,28 +1637,50 @@ def gmm_mlp_v2(
         ),
     ]
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
-    out = pl.pallas_call(
-        functools.partial(fused_mlp_kernel_main, cfgs1=cfgs1, cfgs2=cfgs2),
-        out_shape=out_init,
-        grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=2,
-            in_specs=[
-                hbm,
-                WeightsRef(weight=hbm, scale=hbm if w1_scale is not None else None, bias=None),
-                WeightsRef(weight=hbm, scale=hbm if w2_scale is not None else None, bias=None),
-            ],
-            out_specs=hbm,
-            scratch_shapes=scratch_shapes,
-        ),
-        compiler_params=pltpu.CompilerParams(vmem_limit_bytes=vmem_limit_bytes, disable_bounds_checks=True),
-        name="gmm_mlp_v2-" + get_scope_name(cfgs1) + "+" + get_scope_name(cfgs2),
-    )(
+    in_specs = [
+        hbm,
+        WeightsRef(weight=hbm, scale=hbm if w1_scale is not None else None, bias=None),
+        WeightsRef(weight=hbm, scale=hbm if w2_scale is not None else None, bias=None),
+    ]
+    args = [
         group_sizes,
         group_offset,
         lhs,
         WeightsRef(weight=w1, scale=w1_scale, bias=None),
         WeightsRef(weight=w2, scale=w2_scale, bias=None),
-    )
+    ]
+    kernel = functools.partial(fused_mlp_kernel_main, cfgs1=cfgs1, cfgs2=cfgs2)
+    name = "gmm_mlp_v2-" + get_scope_name(cfgs1) + "+" + get_scope_name(cfgs2)
+    aliases = {}
+    if (out_buffer is None) != (out_row_offset is None):
+        raise ValueError("gmm_mlp_v2: out_buffer and out_row_offset go together")
+    if out_buffer is not None:
+        if size_m % sub:
+            raise ValueError(f"gmm_mlp_v2: out_buffer needs size_m ({size_m}) a multiple of {sub} (no row padding)")
+        if out_buffer.shape != out_init.shape or out_buffer.dtype != out_init.dtype:
+            raise ValueError(f"gmm_mlp_v2: out_buffer {out_buffer.shape} {out_buffer.dtype} != {out_init}")
+        if isinstance(out_row_offset, int) and out_row_offset % sub:
+            raise ValueError(f"gmm_mlp_v2: out_row_offset {out_row_offset} is not a multiple of {sub}")
+        # [group offset, output row offset]: the kernel reads the second.
+        args[1] = jnp.concatenate([group_offset, jnp.reshape(out_row_offset, (1,)).astype(jnp.int32)])
+        in_specs.append(hbm)
+        args.append(out_buffer)
+        aliases = {len(jax.tree.leaves(args)) - 1: 0}
+        kernel = functools.partial(_fused_mlp_kernel_out_alias, cfgs1=cfgs1, cfgs2=cfgs2)
+        name += "+oo"
+    out = pl.pallas_call(
+        kernel,
+        out_shape=out_init,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=2,
+            in_specs=in_specs,
+            out_specs=hbm,
+            scratch_shapes=scratch_shapes,
+        ),
+        compiler_params=pltpu.CompilerParams(vmem_limit_bytes=vmem_limit_bytes, disable_bounds_checks=True),
+        input_output_aliases=aliases,
+        name=name,
+    )(*args)
     return out[:size_m, : cfgs2.out_size_n // 2 if pack_out else cfgs2.out_size_n]
 
 

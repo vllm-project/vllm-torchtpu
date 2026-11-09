@@ -1302,3 +1302,127 @@ def test_ep_combine_dense_stays_served_on_the_one_hot_path(monkeypatch):
     out, seen = _ep_case(monkeypatch, tokens=64, stack=True, combine="dense", packed=True, threshold=2048)
     assert all(c == "served" or not isinstance(c, dict) for c in seen["combine"]), seen["combine"]
     assert all(not c["pack"] for c in seen["mlp"]), seen["mlp"]
+
+
+# --- TPU_MOE_NONEP_DISPATCH_CHUNKS (expert-range chunked dispatch) ------------------------------
+
+
+def _chunk_case(monkeypatch, *, gather="sc_padded", chunks=1, fused=True, tokens=640, sizes_skew=False):
+    """fused_moe_func on the non-EP SparseCore path with stand-ins: the gather returns whole 2,048-row blocks, the
+    fused MLP honours out_buffer/out_row_offset (rows outside the call's groups keep the buffer), the combine is v3's
+    reference. Records gather and MLP calls."""
+    from jax._src import tpu_info as ti
+    from jax._src.pallas.mosaic import tpu_info as pti
+    from jax.experimental.pallas import tpu as pltpu
+    from vllm_torchtpu.kernels.megablox.gmm_v2 import LHS_QUANT_BLOCK, pack_halves, unpack_fp8_rows, unpack_halves
+    from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v3 import _fallback_implementation
+
+    experts, hidden, inter, topk = 16, 512, 128, 4
+    k1, k2, k3 = jax.random.split(jax.random.key(41), 3)
+    w1, s1 = _fp8_per_channel(k1, (experts, hidden, 2 * inter))
+    w2, s2 = _fp8_per_channel(k2, (experts, inter, hidden))
+    x = (jax.random.normal(k3, (tokens, hidden), jnp.float32) / 4).astype(jnp.bfloat16)
+    rng = np.random.default_rng(6)
+    if sizes_skew:   # most routes on the first experts: some chunks nearly empty
+        p = np.exp(-np.arange(experts) / 2.0); p /= p.sum()
+        ids = np.stack([rng.choice(experts, topk, replace=False, p=p) for _ in range(tokens)])
+    else:
+        ids = np.stack([rng.choice(experts, topk, replace=False) for _ in range(tokens)])
+    ids = jnp.asarray(ids, jnp.int32)
+    w = jnp.asarray(rng.random((tokens, topk)), jnp.bfloat16)
+    seen = dict(gather=[], mlp=[])
+
+    def fake_sc_gather(src, idx, start, end, trim_rows=True, copy_mode="vector", **kw):
+        seen["gather"].append(dict(rows=int(idx.shape[0]), copy_mode=copy_mode))
+        pad = -idx.shape[0] % 2048
+        out = src[jnp.pad(idx, (0, pad))]
+        return out[: idx.shape[0]] if trim_rows else out
+
+    def dequant(lhs, lp):
+        if lp is None:
+            return lhs
+        q, sc = unpack_fp8_rows(lhs, (lhs.shape[1] - 128) * 4, jnp.float8_e4m3fn)
+        return (q.astype(jnp.float32) * jnp.repeat(sc, LHS_QUANT_BLOCK, axis=1)).astype(lp)
+
+    ref = _ref_gmm([])
+
+    def mlp(x_, w1_, s1_, w2_, s2_, gs_, *, fuse_act, rhs_quant_dtype=None, tile_m=0, bucket=0,
+            experts_per_visit=1, pack_out=False, lhs_packed_dtype=None, out_buffer=None, out_row_offset=None):
+        nz = np.nonzero(np.asarray(gs_))[0]
+        seen["mlp"].append(dict(offset=out_row_offset is not None, rows=int(x_.shape[0]),
+                                experts=(int(nz.min()), int(nz.max())) if nz.size else None))
+        h = ref(dequant(x_, lhs_packed_dtype), w1_, s1_, None, gs_, jnp.array([0], jnp.int32),
+                fuse_act=fuse_act)[:, : w2_.shape[1]]
+        full = ref(h, w2_, s2_, None, gs_, jnp.array([0], jnp.int32), preferred_element_type=h.dtype,
+                   pack_out=pack_out)
+        if out_buffer is None:
+            return full
+        assert int(out_row_offset) % 16 == 0, ("chunk output offset not sublane-aligned", int(out_row_offset))
+        n = gs_.sum()
+        rows = jnp.arange(full.shape[0])
+        src_rows = jnp.clip(rows - out_row_offset, 0, full.shape[0] - 1)
+        inside = (rows >= out_row_offset) & (rows < out_row_offset + n)
+        return jnp.where(inside[:, None], full[src_rows], out_buffer)
+
+    def combine(rows, rev, wts, valid, reduce_group_size, x_packed=False):
+        return _fallback_implementation(unpack_halves(rows) if x_packed else rows, rev, wts, valid,
+                                        reduce_group_size)
+
+    info = ti.get_tpu_info_for_chip(ti.ChipVersion.TPU_7X, 1)
+    for mod in (pltpu, ti, pti):
+        monkeypatch.setattr(mod, "get_tpu_info", lambda: info, raising=False)
+
+    class _Log:
+        def info_once(self, *a, **k):
+            pass
+
+    monkeypatch.setattr(fused_moe_gmm, "logger", _Log())
+    monkeypatch.setattr(fused_moe_gmm, "ragged_gather_v2", fake_sc_gather)
+    monkeypatch.setattr(fused_moe_gmm, "pack_fp8_rows", _carrier_ref)
+    monkeypatch.setattr(fused_moe_gmm, "mlp_wrapper", mlp)
+    monkeypatch.setattr(fused_moe_gmm, "gmm_wrapper", ref)
+    monkeypatch.setattr(fused_moe_gmm, "ragged_gather_reduce_v3", combine)
+    monkeypatch.setattr(fused_moe_gmm, "_local_ragged_combine_eligible", lambda *a, **k: True)
+    out = fused_moe_gmm.fused_moe_func.__wrapped__(
+        x, w1, w2, s1, s2, None, None, w, ids, topk=topk, activation="silu", use_ep=False, use_sparse_core=True,
+        nonep_gather=gather, nonep_fused_mlp=fused, nonep_gmm_experts_per_visit=2, nonep_gmm_bucket=64,
+        nonep_combine_packed=True, nonep_dispatch_chunks=chunks)
+    return out, seen
+
+
+@pytest.mark.parametrize("gather", ["sc_padded", "sc_fp8"])
+@pytest.mark.parametrize("chunks", [2, 4])
+@pytest.mark.parametrize("skew", [False, True])
+def test_chunked_dispatch_is_bitwise_the_one_chunk_path(monkeypatch, gather, chunks, skew):
+    ref, seen0 = _chunk_case(monkeypatch, gather=gather, chunks=1, sizes_skew=skew)
+    out, seen = _chunk_case(monkeypatch, gather=gather, chunks=chunks, sizes_skew=skew)
+    assert len(seen0["gather"]) == 1 and len(seen0["mlp"]) == 1 and not seen0["mlp"][0]["offset"]
+    assert len(seen["gather"]) == chunks and len(seen["mlp"]) == chunks, seen
+    assert [c["offset"] for c in seen["mlp"]] == [False] + [True] * (chunks - 1)
+    for k, c in enumerate(seen["mlp"]):   # each chunk visits only its own expert range (no repeated work)
+        lo, hi = k * 16 // chunks, (k + 1) * 16 // chunks
+        assert c["experts"] is None or (lo <= c["experts"][0] and c["experts"][1] < hi), (k, c)
+    assert all(g["copy_mode"] == ("dma" if gather == "sc_fp8" else "vector") for g in seen["gather"])
+    np.testing.assert_array_equal(_bits(out), _bits(ref))
+
+
+def test_chunked_dispatch_falls_back_without_the_fused_mlp(monkeypatch):
+    ref, _ = _chunk_case(monkeypatch, chunks=1, fused=False)
+    out, seen = _chunk_case(monkeypatch, chunks=2, fused=False)
+    assert len(seen["gather"]) == 1 and seen["mlp"] == [], seen
+    np.testing.assert_array_equal(_bits(out), _bits(ref))
+
+
+def test_chunked_dispatch_stays_off_where_it_does_not_apply(monkeypatch):
+    out, seen = _chunk_case(monkeypatch, gather="xla", chunks=2)
+    assert seen["gather"] == [] and len(seen["mlp"]) == 1 and not seen["mlp"][0]["offset"]
+
+
+def test_dispatch_chunks_env_choice(monkeypatch):
+    from vllm_torchtpu import envs
+    assert "TPU_MOE_NONEP_DISPATCH_CHUNKS" in envs.environment_variables
+    monkeypatch.setenv("TPU_MOE_NONEP_DISPATCH_CHUNKS", "4")
+    assert envs.TPU_MOE_NONEP_DISPATCH_CHUNKS == "4"
+    monkeypatch.setenv("TPU_MOE_NONEP_DISPATCH_CHUNKS", "3")
+    with pytest.raises(Exception):
+        envs.TPU_MOE_NONEP_DISPATCH_CHUNKS

@@ -109,6 +109,7 @@ if TYPE_CHECKING:
     TPU_MOE_EP_GATHER: str = "sc"
     TPU_MOE_EP_GMM_STACK: bool = False
     TPU_MOE_EP_COMBINE: str = "served"
+    TPU_MOE_NONEP_DISPATCH_CHUNKS: str = "1"
     TPU_MOE_NONEP_GATHER_COLS: int = 0
     TPU_MOE_NONEP_GATHER_CHUNK: int = 16384
     TPU_MOE_NONEP_PERMUTE: str = "sorts"
@@ -1908,6 +1909,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # The non-EP GMM knobs (TPU_MOE_NONEP_GMM_EXPERTS_PER_VISIT, _GMM2_..., _GMM_BUCKET,
     # _FUSED_MLP) also on the EP path. Same output bits.
     "TPU_MOE_EP_GMM_STACK": env_bool("TPU_MOE_EP_GMM_STACK"),
+    # Non-EP dispatch in this many expert-range chunks (1 = off; 2 or 4): each
+    # chunk's SparseCore gather overlaps the previous chunk's fused expert MLP;
+    # outputs land in one buffer. Needs TPU_MOE_NONEP_GATHER=sc_padded|sc_fp8
+    # and TPU_MOE_NONEP_FUSED_MLP=1. Same output bits.
+    "TPU_MOE_NONEP_DISPATCH_CHUNKS": env_with_choices(
+        "TPU_MOE_NONEP_DISPATCH_CHUNKS", "1", ["1", "2", "4"], case_sensitive=False
+    ),
     # EP combine: "served" (valid-mask SparseCore combine) or "dense" (all-valid
     # routes, non-local ones on a zeroed row with weight 0: the dense run-table
     # path, packed with TPU_MOE_NONEP_COMBINE_PACKED). Same output bits.
