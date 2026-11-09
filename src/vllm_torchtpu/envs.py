@@ -105,6 +105,7 @@ if TYPE_CHECKING:
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
     TPU_LM_HEAD_HIDDEN_MAJOR: bool = False
+    TPU_MTP_DRAFT_PROPOSE_DP_SPLIT: bool = False
     TPU_EMBED_EP_SHARD: bool = False
     TPU_EMBED_EP_ROWS: bool = False
     TPU_TP4_HIER_ALL_REDUCE: bool = False
@@ -800,6 +801,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # so the vocab projection is a plain matmul. Changes the accumulation
     # order of the logits (last-bit differences), hence opt-in.
     "TPU_LM_HEAD_HIDDEN_MAJOR": env_bool("TPU_LM_HEAD_HIDDEN_MAJOR", default=False),
+    # Greedy MTP draft tokens from a hidden-major LM head split over the DP
+    # group (layers/core/draft_propose_split.py): each rank scores 1/DP of its
+    # TP shard for every engine's draft rows (one DP all-gather of the rows,
+    # one DP all-to-all of (value, id) pairs), summing in XLA's windows; draft
+    # row counts outside its table keep the vocab-parallel argmax. Needs the
+    # EP-DP lockstep.
+    "TPU_MTP_DRAFT_PROPOSE_DP_SPLIT": env_bool(
+        "TPU_MTP_DRAFT_PROPOSE_DP_SPLIT", default=False
+    ),
     # Split the token embedding over every DP x TP rank instead of each DP
     # engine's TP ranks (layers/core/ep_sharded_embedding.py): 1/DP of the
     # table per rank for one DP reduce-scatter per lookup. Bitwise the

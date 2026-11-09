@@ -194,6 +194,9 @@ class Eagle3Proposer:
         )
         self.draft_model = None
         self._use_vocab_parallel_argmax = False
+        # Greedy draft tokens from the LM head split over the DP group
+        # (TPU_MTP_DRAFT_PROPOSE_DP_SPLIT). Resolved in load_model.
+        self._draft_propose_split = False
         self.draft_vllm_config: VllmConfig
         # Attention-layer names belonging to the draft model. Populated in
         # load_model by diffing the global attention-layer registry before
@@ -294,6 +297,8 @@ class Eagle3Proposer:
             and self.draft_model.lm_head.num_embeddings
             == self.draft_model.lm_head.org_vocab_size
         )
+        if envs.TPU_MTP_DRAFT_PROPOSE_DP_SPLIT:
+            self._enable_draft_propose_split()
         if envs.TPU_ROPE_CACHE_TRUNCATE:
             self.runner._truncate_rope_caches(self.draft_model)
         if envs.TPU_ROPE_CACHE_ROW_MAJOR:
@@ -360,6 +365,30 @@ class Eagle3Proposer:
                 impl.one_query_steps = True
                 marked.append(name)
         logger.info("Batched RPA one-query draft steps on layers %s", marked)
+
+    def _enable_draft_propose_split(self) -> None:
+        """Take greedy draft tokens from the LM head split over the DP group.
+
+        Each DP rank scores one slice of its TP shard for the draft rows of
+        every engine, so every engine must run every propose with the same row
+        count, which the EP-DP lockstep provides. The split replaces the
+        vocab-parallel argmax of a plain head, so it needs that path.
+        """
+        if not (self._use_vocab_parallel_argmax and self._dp_lockstep_sharded()):
+            raise NotImplementedError(
+                "TPU_MTP_DRAFT_PROPOSE_DP_SPLIT needs a Qwen3-Next / Qwen3.5 MTP "
+                "draft whose tokens come from the vocab-parallel argmax, under "
+                "the EP-DP lockstep (data parallelism with expert parallelism)"
+            )
+        from vllm_torchtpu.layers.adapter.draft_propose_split import (
+            enable_draft_propose_split,
+        )
+
+        assert self.draft_model is not None
+        enable_draft_propose_split(
+            self.draft_model.lm_head, self.draft_model.logits_processor
+        )
+        self._draft_propose_split = True
 
     def _validate_mtp_layer_count(self) -> None:
         """One nextn layer only: the proposer's per-step wiring assumes it.
@@ -1022,6 +1051,14 @@ class Eagle3Proposer:
             )
 
             head = self.draft_model.lm_head
+            if self._draft_propose_split:
+                from vllm_torchtpu.layers.adapter.draft_propose_split import (
+                    draft_split_tokens,
+                )
+
+                tokens = draft_split_tokens(head, hidden)
+                if tokens is not None:
+                    return tokens
             logits = self.draft_model.logits_processor(head, hidden, skip_gather=True)
             return vocab_parallel_argmax(
                 logits,
