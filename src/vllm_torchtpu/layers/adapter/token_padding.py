@@ -59,6 +59,17 @@ def mark_padding(num_valid_tokens: int, num_padded_tokens: int) -> None:
         _padding_state.update(num_valid_tokens, num_padded_tokens)
 
 
+def local_padding_rows(num_tokens: int, device) -> torch.Tensor:
+    """int32 [num_tokens]: 1 for this rank's padded rows, 0 for valid ones
+    (all 0 when no padding state is set). For ops that take this rank's own
+    rows and route inside, such as the few-token MoE kernel's scores entry,
+    which zeroes the router scores of padded rows so they select nothing.
+    """
+    if _padding_state is None:
+        return torch.zeros(num_tokens, dtype=torch.int32, device=device)
+    return _padding_state.get_local_padding_mask(num_tokens).to(torch.int32)
+
+
 def zero_routing_weights_for_padding(
     topk_ids: torch.Tensor, topk_weights: torch.Tensor, is_local_tensor: bool = False
 ) -> tuple[torch.Tensor, torch.Tensor]:

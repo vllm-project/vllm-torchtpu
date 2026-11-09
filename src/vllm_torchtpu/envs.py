@@ -75,10 +75,14 @@ if TYPE_CHECKING:
     TPU_MOE_SEQUENCE_PARALLEL: bool = False
     TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
+    TPU_EXPERT_PLACEMENT: str = ""
     FUSED_MOE_DECODE_KERNEL: bool = False
     FUSED_MOE_DECODE_KERNEL_MAX_TOKENS: int = 256
     TPU_MOE_SINGLE_SORT: bool = True
     TPU_MOE_COUNTING_SORT: bool = True
+    TPU_MOE_LOWTOK_MAX_TOKENS: int = 0
+    TPU_MOE_LOWTOK_FROM_SCORES: bool = False
+    TPU_MOE_LOWTOK_SCORES_STRICT: bool = False
     USE_MOE_TP_DECODE_KERNEL: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
@@ -724,6 +728,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_DENSE_EXPERT_THRESHOLD": env_nonnegative_int(
         "TPU_MOE_DENSE_EXPERT_THRESHOLD", 0
     ),
+    # Path to a static per-layer expert placement JSON for expert parallelism
+    # (expert_placement.py): which experts each EP rank holds, applied by
+    # permuting the checkpoint at load. Empty keeps the contiguous placement.
+    "TPU_EXPERT_PLACEMENT": lambda: os.getenv("TPU_EXPERT_PLACEMENT", ""),
     # Serve eligible MoE layers (TP experts, or EP with TP attention) with the
     # fused MoE decode kernel: routed experts, shared expert and all-reduce in
     # one Pallas call (layers/adapter/fused_moe_decode.py). Armed once after
@@ -748,6 +756,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # counting sort either way. A stand-down knob in case a libtpu release
     # miscompiles the rank contraction again.
     "TPU_MOE_COUNTING_SORT": env_bool("TPU_MOE_COUNTING_SORT", True),
+    # Maximum hidden-state row count (after any EP all-gather) for the
+    # few-token expert-parallel MoE kernel (kernels/moe_lowtok). It walks
+    # only the hit local experts and masks each row by its routing weight,
+    # with no sort or permute. Serves the routed GMM path (ahead of the
+    # dense-expert path) and, for small steps, the adaptive fused EP kernel.
+    # 0 disables it; larger shapes and unsupported layouts are unchanged.
+    "TPU_MOE_LOWTOK_MAX_TOKENS": env_nonnegative_int("TPU_MOE_LOWTOK_MAX_TOKENS", 0),
+    # Run the few-token kernel's scores entry inside the adaptive fused EP op
+    # (MOE_FUSED_EP_KERNEL_IMPL=adaptive) for steps of at most
+    # TPU_MOE_LOWTOK_MAX_TOKENS rows: the router's top-k and, under an
+    # expert placement with copy slots (TPU_EXPERT_PLACEMENT), the choice of
+    # one holder per hit copied expert run inside the kernel.
+    "TPU_MOE_LOWTOK_FROM_SCORES": env_bool("TPU_MOE_LOWTOK_FROM_SCORES"),
+    # Refuse to start when TPU_MOE_LOWTOK_FROM_SCORES is set and a MoE layer
+    # cannot be served by the scores entry (otherwise the refusal is logged).
+    "TPU_MOE_LOWTOK_SCORES_STRICT": env_bool("TPU_MOE_LOWTOK_SCORES_STRICT"),
     # Serve eligible tensor-parallel MoE layers (sigmoid + correction-bias
     # top-k with renormalization, one shared expert, FP8 per-channel weights)
     # with one op that also covers the shared expert and the TP all-reduce:

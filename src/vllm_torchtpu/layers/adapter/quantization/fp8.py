@@ -79,7 +79,7 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import (
     vllm_adapter as adaptive_moe,
 )
-from vllm_torchtpu.layers.adapter import moe_routing, token_padding
+from vllm_torchtpu.layers.adapter import moe_lowtok_scores, moe_routing, token_padding
 from vllm_torchtpu.layers.adapter.fused_moe import (
     TpuMoEActivationMixin,
     fused_moe_gmm,
@@ -617,6 +617,43 @@ def _process_fp8_moe_weights(
     return w13, w13_scale, w2, w2_scale, desired_quant_dtype, requant_block_size
 
 
+_COPY_SLOT_PARAMS = (
+    "w13_weight",
+    "w2_weight",
+    "w13_weight_scale_inv",
+    "w2_weight_scale_inv",
+)
+
+
+def _split_copy_slots(layer: torch.nn.Module) -> list[torch.Tensor]:
+    """Store an expert placement's copy slots apart from the primaries.
+
+    Under TPU_EXPERT_PLACEMENT with copies, a rank's expert tensors hold its
+    primaries, then its copy slots. Every routed path reads the primaries as
+    one contiguous block, so they stay under the usual names and the copy
+    slots move to ``w13_copy_weight`` and friends, which only the few-token
+    kernel's scores entry reads. Returns the copy tensors (none without copy
+    slots).
+    """
+    if not layer.moe_config.moe_parallel_config.use_ep:
+        return []
+    primaries = layer.global_num_experts // layer.moe_config.ep_size
+    if layer.w13_weight.shape[0] <= primaries:
+        return []
+    copies = []
+    for name in _COPY_SLOT_PARAMS:
+        weight = getattr(layer, name)
+        copy = torch.nn.Parameter(weight[primaries:].clone(), requires_grad=False)
+        setattr(
+            layer,
+            name,
+            torch.nn.Parameter(weight[:primaries].clone(), requires_grad=False),
+        )
+        setattr(layer, name.replace("_weight", "_copy_weight", 1), copy)
+        copies.append(copy)
+    return copies
+
+
 def _quantize_bf16_moe_weights(
     layer: TpuRoutedExperts,
     *,
@@ -1042,6 +1079,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         layer.w2_weight = torch.nn.Parameter(w2, requires_grad=False)
         layer.w13_weight_scale_inv = torch.nn.Parameter(w13_scale, requires_grad=False)
         layer.w2_weight_scale_inv = torch.nn.Parameter(w2_scale, requires_grad=False)
+        copy_slots = _split_copy_slots(layer)
 
         # Eagerly materialize weights to avoid OOM during vLLM memory probing.
         # Without this, lazy tensors accumulate and the profiling run OOMs.
@@ -1052,6 +1090,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                     layer.w2_weight,
                     layer.w13_weight_scale_inv,
                     layer.w2_weight_scale_inv,
+                    *copy_slots,
                 ]
             )
 
@@ -1069,12 +1108,17 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         if layer.moe_config.moe_parallel_config.use_ep:
             moe_routing.validate_linear_ep_placement(layer)
         moe_routing.register_experts_start_buffer(layer, device=layer.w13_weight.device)
+        scores_tables = moe_lowtok_scores.arm(
+            layer, activation_str, adaptive=self._use_adaptive_fused_moe
+        )
         if self._use_adaptive_fused_moe:
             self._adaptive_fused_moe_op = adaptive_moe.prebuild_adaptive_fused_moe(
                 layer,
                 topk=layer.moe_config.experts_per_token,
                 renormalize=layer.renormalize,
                 activation=activation_str,
+                lowtok_scores=scores_tables is not None,
+                lowtok_scores_copies=bool(scores_tables and scores_tables.has_copies),
             )
             return
         prebuild_fused_moe_kernel(
@@ -1139,6 +1183,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 layer.w13_weight_scale_inv,
                 layer.w2_weight_scale_inv,
                 router_logits,
+                scores_operands=moe_lowtok_scores.operands(layer, x),
             )
 
         # `score_bias_operand` is not optional, and omitting it is silent on
