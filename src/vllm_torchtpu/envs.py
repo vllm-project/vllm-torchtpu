@@ -120,6 +120,7 @@ if TYPE_CHECKING:
     TPU_PP_RING_DEPTH: int = 2
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
+    TPU_FUSED_QK_NORM_ROPE: bool = False
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_PRECOMPILE_BIGGEST_FIRST: bool = False
@@ -890,6 +891,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Materialize the rotary cos_sin caches with a row-major ({1,0}) device
     # layout at load, May cost more HBM due to padding.
     "TPU_ROPE_CACHE_ROW_MAJOR": env_bool("TPU_ROPE_CACHE_ROW_MAJOR", default=False),
+    # Qwen3-Next/Qwen3.5 attention: run the q/gate split, Q/K RMSNorm, RoPE
+    # and gate copy as one Pallas call for steps of up to 64 rows. Text-only.
+    "TPU_FUSED_QK_NORM_ROPE": env_bool("TPU_FUSED_QK_NORM_ROPE"),
     "TPU_MOE_HASH_TABLE_ROW_MAJOR": env_bool(
         "TPU_MOE_HASH_TABLE_ROW_MAJOR", default=False
     ),
