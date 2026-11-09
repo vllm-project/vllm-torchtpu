@@ -156,6 +156,7 @@ from vllm_torchtpu.platforms.tpu_block_size_utils import unified_kv_layout_enabl
 from vllm_torchtpu.runner import greedy_top_tokens
 from vllm_torchtpu.runner import min_tokens as min_tokens_mask
 from vllm_torchtpu.runner import utils as runner_utils
+from vllm_torchtpu.runner.bucket_stats import BucketStats
 from vllm_torchtpu.runner.kernel_block_table import install_kernel_block_tables
 from vllm_torchtpu.runner.kv_cache_manager import KVCacheManager
 from vllm_torchtpu.runner.mm_encoder_manager import (
@@ -167,7 +168,6 @@ from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpecDecodeMetadata,
     SpeculativeDecodingManager,
 )
-from vllm_torchtpu.runner.bucket_stats import BucketStats
 from vllm_torchtpu.runner.stage_timing import RunnerStageTiming
 from vllm_torchtpu.runner.tpu_pooling import (
     StaticPoolerChunkOutput,
@@ -5741,6 +5741,10 @@ class TPUModelRunner(GPUModelRunner):
 
             draft = self._async_drafter.draft_model if self._is_async_drafter else None
             arm(self.model, draft)
+
+        from vllm_torchtpu.distributed import small_all_reduce
+
+        small_all_reduce.arm_from_config(self.vllm_config, self.device)
 
     def load_lora_model(
         self,
