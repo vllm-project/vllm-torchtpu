@@ -437,3 +437,42 @@ def fresh_buffer(t: torch.Tensor) -> torch.Tensor:
         else:
             out = out + 0
     return out
+
+
+def merge_multimodal_embeddings_static(
+    inputs_embeds: torch.Tensor,
+    mm_embeds: torch.Tensor,
+    is_multimodal: torch.Tensor,
+) -> torch.Tensor:
+    """Place `mm_embeds` rows at the `is_multimodal` positions of `inputs_embeds`.
+
+    Uses a gather plus `torch.where` instead of a boolean `index_put`, so every
+    shape stays static on TPU. The placeholder count is checked on a CPU copy of
+    the mask. On TPU the result is copied into a buffer of its own shape (see
+    `fresh_buffer`) and synchronized before it is returned.
+    """
+    mm_embeds = mm_embeds.to(device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+    mask_cpu = is_multimodal.detach().reshape(-1).to(device="cpu", dtype=torch.bool)
+    expected = int(mask_cpu.sum().item())
+    actual = mm_embeds.shape[0]
+    if actual != expected:
+        raise ValueError(
+            f"Attempted to assign {actual} multimodal tokens to {expected} placeholders"
+        )
+    if actual == 0:
+        return inputs_embeds
+
+    media_indices_cpu = mask_cpu.to(torch.int64).cumsum(0).sub_(1)
+    media_indices_cpu.clamp_(min=0)
+    media_indices = media_indices_cpu.to(device=inputs_embeds.device)
+    aligned_media = mm_embeds.index_select(0, media_indices)
+    mask = is_multimodal.reshape(-1, 1).to(
+        device=inputs_embeds.device, dtype=torch.bool
+    )
+    merged = torch.where(mask, aligned_media, inputs_embeds)
+    if merged.device.type != "tpu":
+        return merged
+
+    materialized = fresh_buffer(merged)
+    synchronize_tensors(materialized)
+    return materialized
