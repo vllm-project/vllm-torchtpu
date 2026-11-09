@@ -224,9 +224,8 @@ def build_jax_step_op(
     tensor in place (`data_ptr()` is preserved) and returned as that tensor.
 
     The callable runs a `torch.library` custom op, named `name` (default
-    `megakernel_runtime::jax_step`; a name without a namespace gets
-    `megakernel_runtime::`) plus a per-op `_<n>` suffix, so every build
-    registers a new op.
+    `megakernel::jax_step`; a name without a namespace gets `megakernel::`)
+    plus a per-op `_<n>` suffix, so every build registers a new op.
     - With TPU tensors it calls `sharded_jax_callable` (built on first use):
       each rank passes its shards of the operands and gets its shards of the
       outputs.
@@ -253,7 +252,7 @@ def build_jax_step_op(
     op_id = next(_OP_IDS)
     base = name or "jax_step"
     if "::" not in base:
-        base = f"megakernel_runtime::{base}"
+        base = f"megakernel::{base}"
     name = f"{base}_{op_id}"
 
     def tuple_fn(*args: Any) -> tuple[Any, ...]:

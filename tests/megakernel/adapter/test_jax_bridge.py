@@ -182,8 +182,8 @@ def test_every_build_registers_its_own_op() -> None:
     assert len(names) == 4
     assert {n.rsplit("_", 1)[0] for n in names} == {
         "mk_tests::same_op",
-        "megakernel_runtime::plain",
-        "megakernel_runtime::jax_step",
+        "megakernel::plain",
+        "megakernel::jax_step",
     }
 
 

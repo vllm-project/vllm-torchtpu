@@ -83,7 +83,7 @@ def export_pooled_step(
     *,
     max_pages_per_seq: int,
     ckpt_cols: int | None = None,
-    op_name: str = "megakernel_runtime::exported_pooled_step",
+    op_name: str = "megakernel::exported_pooled_step",
     platforms: Sequence[str] = ("tpu",),
 ) -> PooledStepExport:
     """Export `make_flat_pooled_step` to a serialized StableHLO module.
@@ -161,9 +161,9 @@ def build_pooled_step_op(
     _OP_COUNTER += 1
     if op_name is None:
         n_pages = cache_exec(ex).num_pages
-        op_name = f"megakernel_runtime::step_t{ex.T}_b{ex.B}_p{n_pages}_{_OP_COUNTER}"
+        op_name = f"megakernel::step_t{ex.T}_b{ex.B}_p{n_pages}_{_OP_COUNTER}"
     elif "::" not in op_name:
-        op_name = f"megakernel_runtime::{op_name}"
+        op_name = f"megakernel::{op_name}"
 
     fn_name = op_name.replace("::", "_")
     typed_fn = make_typed_step_wrapper(

@@ -411,7 +411,7 @@ def test_build_pooled_step_op_without_torch_tpu(
         exported_bridge, "sharded_jax_callable", _missing("torch_tpu._internal")
     )
     op, _, _, _ = exported_bridge.build_pooled_step_op(
-        mesh, spec, ex, op_name="megakernel_runtime::no_torch_tpu_probe"
+        mesh, spec, ex, op_name="megakernel::no_torch_tpu_probe"
     )
     assert op is not None
 
@@ -420,5 +420,5 @@ def test_build_pooled_step_op_without_torch_tpu(
     )
     with pytest.raises(ModuleNotFoundError, match="some_other_dep"):
         exported_bridge.build_pooled_step_op(
-            mesh, spec, ex, op_name="megakernel_runtime::other_dep_probe"
+            mesh, spec, ex, op_name="megakernel::other_dep_probe"
         )

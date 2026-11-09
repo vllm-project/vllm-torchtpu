@@ -667,8 +667,7 @@ class Qwen35Program:
 
         self._bucket_fused_io[bkt_key], self._bucket_gpr[bkt_key] = use_fused, use_gpr
         op_name = (
-            f"megakernel_runtime::{self.spec.name}_t{tokens_per_seq}"
-            f"_b{bucket_t}_{self.mode}"
+            f"megakernel::{self.spec.name}_t{tokens_per_seq}_b{bucket_t}_{self.mode}"
         )
         op, _, _, _ = build_pooled_step_op(
             self.mesh, self.spec, ex, op_name=op_name, donate_pools=True
