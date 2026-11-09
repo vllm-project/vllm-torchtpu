@@ -178,3 +178,45 @@ def test_span_entry_owns_consecutive_columns(span):
     np.testing.assert_array_equal(pages, (3 * span + cols * n) * logical + np.arange(span * logical))
     expansion, stride, offset = _compressed_expansion(span * logical, 0, slot)
     assert (expansion, stride, offset) == (span * logical, span * logical, cols * n * logical)
+
+
+def test_split_merged_keys_write_only_owned_pages():
+    """QWEN4_EXP_PCP_SPLIT_COMPRESSED_K: a PCP2 rank keeps one region column
+    per main-KV ID (span 1) and writes only the keys of the pages it owns."""
+    block_tokens, n = 3200, 9
+    _, _, _, cols, _ = _geometry(block_tokens, n)
+    region = -(-n // cols)
+    pool = _pool(n + region, block_tokens)
+    slot = merged_compressed_slot(cols * n, 1)
+    table = jnp.asarray([[5, 1]], jnp.int32)
+    tokens = 4 * block_tokens  # two IDs of 2 pages each
+    logical = jnp.arange(tokens, dtype=jnp.int32)
+    layer_pairs = block_tokens // (2 * RATIO)
+    t = np.arange(tokens)
+    for rank in (0, 1):
+        pair, write, _, _ = compressed_pairs(
+            pool, jnp.zeros((tokens, 256), jnp.bfloat16), (logical % RATIO) == RATIO - 1,
+            jnp.zeros((tokens,), jnp.int32), logical, jnp.asarray([0, tokens], jnp.int32),
+            jnp.asarray([0], jnp.int32), table, RATIO, slot,
+            dcp=(jnp.asarray([rank], jnp.int32), 2),
+        )
+        owned = (t // block_tokens) % 2 == rank
+        assert not np.asarray(write)[~owned].any()
+        column = np.asarray(table)[0][t // (2 * block_tokens)] + cols * n
+        expect = column * layer_pairs + (t % block_tokens) // (2 * RATIO)
+        np.testing.assert_array_equal(np.asarray(pair)[owned], expect[owned])
+
+
+def test_split_key_repack_rows():
+    from vllm_torchtpu.models.vllm.qwen4_exp.pd_staging import compressed_rows_split_np
+
+    src, dst = compressed_rows_split_np(
+        4 * 3200, RATIO, [[10, 20], [11, 21]], 3200, list(range(100)), 512
+    )
+    span = 2 * RATIO
+    t = np.arange(len(src)) * span
+    owner = (t // 3200) % 2
+    entry = t // 6400
+    pages = np.asarray([[10, 20], [11, 21]])
+    np.testing.assert_array_equal(src, pages[owner, entry] * 3200 + (t % 3200) // span)
+    np.testing.assert_array_equal(dst, (t // 512) * 512 + (t % 512) // span)

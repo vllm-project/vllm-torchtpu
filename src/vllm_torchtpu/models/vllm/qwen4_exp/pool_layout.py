@@ -59,6 +59,20 @@ def merge_compressed_k_enabled() -> bool:
     return value in ("1", "true", "yes", "on")
 
 
+PCP_SPLIT_COMPRESSED_K_ENV = "QWEN4_EXP_PCP_SPLIT_COMPRESSED_K"
+
+
+def pcp_split_compressed_k_enabled() -> bool:
+    """Whether a PCP group splits its merged compressed keys by page owner.
+
+    Needs ``QWEN4_EXP_MERGE_COMPRESSED_K=1``. Each rank keeps (and scores)
+    only the keys of the pages it owns: one column of the key region per
+    main-KV block ID instead of ``pcp`` columns.
+    """
+    value = os.environ.get(PCP_SPLIT_COMPRESSED_K_ENV, "0").strip().lower()
+    return value in ("1", "true", "yes", "on")
+
+
 PACK_MAIN_KV_ENV = "QWEN4_EXP_PACK_MAIN_KV"
 
 
@@ -141,6 +155,9 @@ class Qwen4ExpPoolLayout:
     # QWEN4_EXP_MERGE_COMPRESSED_K: compressed keys live in a region of each
     # main KV carrier after its scheduler pages (``merged_compressed_slot``).
     merged_compressed: bool = False
+    # QWEN4_EXP_PCP_SPLIT_COMPRESSED_K: merged keys split over the PCP ranks
+    # by page owner (one region column per block ID per rank).
+    split_compressed: bool = False
 
     def compressed_owner(self, attention_prefix: str) -> tuple[str, int]:
         """Cache owner name and in-page slot of a QSA layer's compressed keys."""
@@ -181,7 +198,9 @@ class Qwen4ExpPoolLayout:
     def merged_key_span(self) -> int:
         """Pool pages of tokens one main-KV block ID covers, so columns of keys
         per ID in the merged region: ``main_dcp`` (2 under PCP2), else 1."""
-        return max(1, int(self.main_dcp)) if self.merged_compressed else 1
+        if not self.merged_compressed or self.split_compressed:
+            return 1
+        return max(1, int(self.main_dcp))
 
     def compressed_region_pages(self, num_blocks: int) -> int:
         """Pages a merged carrier appends after ``num_blocks`` scheduler pages."""
@@ -209,6 +228,7 @@ def pooled_cache_specs(
     pack_compressed: bool | None = None,
     merge_compressed: bool | None = None,
     main_interleave: int | None = None,
+    split_compressed: bool | None = None,
 ):
     """Derive uniform physical pages without widening compressed-key coverage.
 
@@ -435,6 +455,11 @@ def pooled_cache_specs(
         main_dcp_interleave=interleave,
         main_dcp_owners=dcp_owners,
         merged_compressed=merged,
+        split_compressed=bool(
+            merged and interleave and (
+                pcp_split_compressed_k_enabled() if split_compressed is None else split_compressed
+            )
+        ),
     )
     # Members other than their group's owner get no scheduler group.
     packed_away = {prefix + ".compressed_k" for prefix, owner, _ in owners} - {

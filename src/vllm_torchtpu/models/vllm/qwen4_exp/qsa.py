@@ -546,10 +546,26 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
                 build_pooled_qsa_pcp_op,
             )
 
-            self._dcp_op = partial(
-                build_pooled_qsa_pcp_op(get_pcp_group(), self.pcp, self.dcp_interleave),
-                **keywords,
-            )
+            from .pool_layout import pcp_split_compressed_k_enabled
+
+            if pcp_split_compressed_k_enabled():
+                from vllm_torchtpu.layers.adapter.custom_ops.qsa_op import (
+                    build_pooled_qsa_pcp_compressed_dcp_op,
+                )
+
+                # QWEN4_EXP_PCP_SPLIT_COMPRESSED_K: owned-key scoring, pair merge.
+                self._dcp_op = partial(
+                    build_pooled_qsa_pcp_compressed_dcp_op(
+                        get_pcp_group(), self.pcp, self.dcp_interleave
+                    ),
+                    kv_heads=self.num_kv_heads,
+                    **keywords,
+                )
+            else:
+                self._dcp_op = partial(
+                    build_pooled_qsa_pcp_op(get_pcp_group(), self.pcp, self.dcp_interleave),
+                    **keywords,
+                )
         elif self.main_kv_dcp > 1:
             from vllm.distributed import get_tp_group
 

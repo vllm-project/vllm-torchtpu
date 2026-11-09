@@ -1027,6 +1027,51 @@ def build_pooled_qsa_pcp_op(pcp_group, size: int, interleave: int):
     return run
 
 
+def build_pooled_qsa_pcp_compressed_dcp_op(pcp_group, size: int, interleave: int):
+    """``build_pooled_qsa_pcp_op`` with the compressed keys split over the PCP
+    group too (QWEN4_EXP_PCP_SPLIT_COMPRESSED_K, merged keys): each rank keeps
+    and scores the keys of the pages it owns, the group gathers the local
+    top-k lists and both ranks merge them into the global selection, then
+    attend their owned main-KV rows (``interleave`` units) and merge every
+    head as ``build_pooled_qsa_pcp_op`` does. Takes ``dcp_rank`` and
+    ``kv_heads`` keywords."""
+    select, attend, _ = _compressed_dcp_ops()
+    combine = _pcp_combine_op()
+
+    def run(*args, dcp_rank, kv_heads, **kwargs):
+        args = list(args)
+        for index in (8, 11, 12, 13, 14, 15):
+            args[index] = args[index].to(torch.int32)
+        qgate = args[0]
+        head_dim = args[4].shape[0]
+        tokens = qgate.shape[0]
+        heads = qgate.shape[1] // (2 * head_dim)
+        pool = args[10]
+        updated, q, gate, lengths, req, starts, vals, pos = select(
+            *args, dcp_rank, dcp_size=size, dcp_interleave=interleave, **kwargs
+        )
+        pool.copy_(updated)
+        vals_pair, pos_pair = _gathered_lists(vals, pos, pcp_group, size, tokens)
+        attend_kwargs = {
+            name: kwargs[name]
+            for name in ("k_scale", "v_scale", "main_slot", "max_query_len")
+            if name in kwargs
+        }
+        updated, out, lse, selected = attend(
+            q, gate, lengths, req, starts, args[14], args[12], pool, vals_pair, pos_pair,
+            dcp_rank, kv_heads=kv_heads, compress_ratio=kwargs["compress_ratio"],
+            token_topk=kwargs["token_topk"], dcp_size=size, dcp_interleave=interleave,
+            **attend_kwargs,
+        )
+        pool.copy_(updated)
+        qg = qgate.reshape(tokens, heads, 2 * head_dim)[..., head_dim:]
+        out_pair = pcp_group.all_gather(out.unsqueeze(0).contiguous(), dim=0)
+        lse_pair = pcp_group.all_gather(lse.unsqueeze(0).contiguous(), dim=0)
+        return combine(out_pair, lse_pair, qg).reshape(tokens, heads * head_dim), selected
+
+    return run
+
+
 def build_pooled_qsa_dcp_op(pair_group, size: int):
     """``build_pooled_qsa_op`` with the main KV split over ``pair_group``
     (VLLM_TPU_QSA_MAIN_KV_DCP): the pair's q heads are gathered, each rank
@@ -1157,7 +1202,8 @@ def _compressed_dcp_ops():
     def select_fake(qgate, key, value, index_qk, nq, nk, niq, nik, positions, trig, pool,
                     starts, context, ring_ids, main_table, compressed_table, dcp_rank,
                     compress_ratio, token_topk, norm_eps, rotary_dim, dcp_size=2, k_scale=1.0,
-                    v_scale=1.0, compressed_slot=0, main_slot=-1, max_query_len=1):
+                    v_scale=1.0, compressed_slot=0, main_slot=-1, max_query_len=1,
+                    dcp_interleave=0):
         tokens, head_dim = qgate.shape[0], nq.shape[0]
         heads = qgate.shape[1] // (2 * head_dim)
         k = token_topk // compress_ratio
@@ -1180,7 +1226,8 @@ def _compressed_dcp_ops():
     @attend.register_fake
     def attend_fake(q, gate, lengths, req, starts, main_table, context, pool, vals_pair,
                     pos_pair, dcp_rank, kv_heads, compress_ratio, token_topk, dcp_size=2,
-                    k_scale=1.0, v_scale=1.0, main_slot=-1, max_query_len=1):
+                    k_scale=1.0, v_scale=1.0, main_slot=-1, max_query_len=1,
+                    dcp_interleave=0):
         tokens = q.shape[0]
         return (
             torch.empty_like(pool),
