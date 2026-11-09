@@ -404,6 +404,10 @@ class MMEncoderManager(EncoderCudaGraphManager):
     ) -> list[torch.Tensor]:
         from vllm.distributed.parallel_state import get_tp_group
 
+        # Each new all-gather size compiles on every rank; budgets bound the sizes.
+        max_tokens = (
+            self._find_smallest_fitting_budget_given_tokens(max_tokens) or max_tokens
+        )
         padded = torch.zeros(
             (max_tokens, self.config.out_hidden_size),
             device=self.device,
@@ -432,6 +436,9 @@ class MMEncoderManager(EncoderCudaGraphManager):
         for path, templates in self.budget_templates.items():
             for budget in templates:
                 self._capture_budget_graph(budget, path=path)
+        if self.use_dp:
+            for budget in self.token_budgets:
+                self._gather_dp_outputs([], [], [], [], budget)
 
 
 def maybe_create_mm_encoder_manager(
