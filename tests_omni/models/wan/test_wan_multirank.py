@@ -37,24 +37,20 @@ pytestmark = [
     pytest.mark.multichip,
 ]
 
-RING_UNSUPPORTED = (
-    "Ring attention hangs on TPU: the ring K/V exchange never completes in "
-    "torch_tpu's P2P send (ProcessGroupTpu.experimental_send)"
-)
-
 # Parallel degrees are passed as flat extra kwargs into OmniRunner
 CASES = [
     (WAN2_1_T2V_1_3B, {"cfg_parallel_size": 2}, "cfg2", ()),
     (WAN2_1_T2V_1_3B, {"ulysses_degree": 2}, "u2", ()),
     (WAN2_1_T2V_1_3B, {"tensor_parallel_size": 2}, "tp2", ()),
     (WAN2_1_T2V_14B, {"cfg_parallel_size": 2, "ulysses_degree": 4}, "cfg2xu4", ()),
-    (WAN2_1_T2V_14B, {"ulysses_degree": 8}, "u8", ()),
     (
-        WAN2_1_T2V_1_3B,
-        {"ring_degree": 2},
-        "ring2",
-        pytest.mark.skip(reason=RING_UNSUPPORTED),
+        WAN2_1_T2V_14B,
+        {"cfg_parallel_size": 2, "ring_degree": 2, "ulysses_degree": 2},
+        "cfg2xr2xu2",
+        (),
     ),
+    (WAN2_1_T2V_14B, {"ulysses_degree": 8}, "u8", ()),
+    (WAN2_1_T2V_1_3B, {"ring_degree": 2}, "ring2", ()),
 ]
 
 

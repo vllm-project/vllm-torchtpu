@@ -13,7 +13,9 @@
 # limitations under the License.
 """TPU platform plugin for vllm-omni."""
 
+import functools
 import os
+from typing import Any
 
 import torch
 from torch_tpu._internal.utils import hardware
@@ -25,6 +27,8 @@ from vllm_torchtpu.omni.patches import apply_omni_tpu_patches
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
 logger = init_logger(__name__)
+
+_DIFFUSION_INIT_DEVICE_WRAPPED = "_tpu_diffusion_init_device_wrapped"
 
 
 class OmniTpuPlatform(OmniPlatform, TpuPlatform):
@@ -38,6 +42,8 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
 
     # Diffusion worker world size recorded by set_device (see dist_backend).
     _worker_world_size: int = 1
+    # Diffusion worker ring attention degree recorded before set_device.
+    _diffusion_ring_degree: int = 1
 
     @property
     def dist_backend(self) -> str:
@@ -99,6 +105,39 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
         return False
 
     @classmethod
+    def get_diffusion_worker_cls(cls) -> str:
+        worker_cls: str = super().get_diffusion_worker_cls()
+        # Import lazily: diffusion_worker.py resolves current_omni_platform at
+        # module import time while DiffusionWorker is not yet defined.
+        from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
+
+        if not getattr(
+            DiffusionWorker.init_device, _DIFFUSION_INIT_DEVICE_WRAPPED, False
+        ):
+            orig_init_device = DiffusionWorker.init_device
+
+            @functools.wraps(orig_init_device)
+            def _tpu_init_device(self: Any) -> None:
+                parallel_config = getattr(
+                    getattr(self, "od_config", None), "parallel_config", None
+                )
+                raw_ring_degree = getattr(parallel_config, "ring_degree", 1)
+                OmniTpuPlatform._diffusion_ring_degree = max(
+                    1, int(raw_ring_degree or 1)
+                )
+                if OmniTpuPlatform._diffusion_ring_degree > 1:
+                    from vllm_torchtpu.omni.patches import (
+                        _patch_parallel_state_device_order,
+                    )
+
+                    _patch_parallel_state_device_order()
+                orig_init_device(self)
+
+            setattr(_tpu_init_device, _DIFFUSION_INIT_DEVICE_WRAPPED, True)
+            DiffusionWorker.init_device = _tpu_init_device
+        return worker_cls
+
+    @classmethod
     def set_device(cls, device: torch.device | int) -> None:
         world_size = int(os.environ.get("WORLD_SIZE", "1") or "1")
         if world_size > 1:
@@ -115,7 +154,14 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
                     world_size - 1,
                 )
             cls._set_shared_slicebuilder_addresses(world_size)
-            cls._offload_dense_all_to_all()
+            if cls._diffusion_ring_degree <= 1:
+                cls._offload_dense_all_to_all()
+            else:
+                logger.info(
+                    "Skipping SparseCore dense all-to-all offload default "
+                    "because ring_degree=%d > 1.",
+                    cls._diffusion_ring_degree,
+                )
         cls._prepare_singlehost_tpu_env(world_size)
         torch.accelerator.set_device_index(0)
         _ = torch.empty(1, device=torch.device("tpu"))
@@ -127,13 +173,16 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
 
         Ulysses sequence parallelism moves q, k, v and the attention output
         through dense all-to-alls in every transformer block. By default XLA
-        runs them on the TensorCore, which waits for them.
+        runs them on the TensorCore, which waits for them. Callers skip this
+        default when ``ring_degree > 1``, where SparseCore dense all-to-all
+        offload slows down Pallas ring attention steps.
         """
         # TODO: Remove once libtpu enables the SparseCore dense all-to-all offload by
-        # default. This sets os.environ after torch_tpu is imported, but it still
-        # takes effect because libtpu reads LIBTPU_INIT_ARGS when the PjRt client
-        # is created on the first device allocation, the same pre-PjRt window
-        # that _set_shared_slicebuilder_addresses relies on.
+        # default without regressing Pallas ring attention collectives. This sets
+        # os.environ after torch_tpu is imported, but it still takes effect because
+        # libtpu reads LIBTPU_INIT_ARGS when the PjRt client is created on the first
+        # device allocation, the same pre-PjRt window that
+        # _set_shared_slicebuilder_addresses relies on.
         set_libtpu_flag_default(
             "--xla_tpu_enable_sparse_core_collective_offload_dense_all_to_all", "true"
         )

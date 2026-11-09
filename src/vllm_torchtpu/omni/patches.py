@@ -84,6 +84,7 @@ def apply_omni_model_specific_patches() -> None:
     _patch_wan_fresh_timestep()
     _patch_sdpa_fallback_dispatch()
     _patch_ltx2_vocoder_cpu_init()
+    _patch_ring_attention()
 
 
 def _patch_diffusion_ipc_cpu_pack() -> None:
@@ -645,3 +646,481 @@ def _patch_ltx2_split_rope() -> None:
     rope_cls.forward = _cached_rope_forward
     ltx2_transformer.apply_split_rotary_emb = _apply_split_rotary_emb
     logger.info("Applied TPU patch: cached LTX-2 split RoPE on the q/k layout.")
+
+
+_RING_ATTENTION_PATCHED = "_tpu_ring_attention_patched"
+
+
+def _patch_ring_attention() -> None:
+    """Route RingParallelAttention and hybrid Ring+Ulysses to TPU Pallas ring."""
+    from vllm_omni.diffusion.attention.layer import Attention
+    from vllm_omni.diffusion.attention.parallel.ring import RingParallelAttention
+
+    from vllm_torchtpu.omni.attention import (
+        can_fuse_tpu_ring_ulysses,
+        can_run_tpu_ring_attention,
+        tpu_ring_flash_attention,
+    )
+
+    if not getattr(RingParallelAttention.run_attention, _RING_ATTENTION_PATCHED, False):
+        orig_run = RingParallelAttention.run_attention
+
+        def _tpu_run_attention(
+            self: Any,
+            query: torch.Tensor,
+            key: torch.Tensor,
+            value: torch.Tensor,
+            attn_metadata: Any = None,
+            softmax_scale: float | None = None,
+            causal: bool = False,
+        ) -> torch.Tensor:
+            if not can_run_tpu_ring_attention(
+                self, query, key, value, attn_metadata, causal=causal
+            ):
+                return orig_run(
+                    self,
+                    query,
+                    key,
+                    value,
+                    attn_metadata,
+                    softmax_scale=softmax_scale,
+                    causal=causal,
+                )
+            sp_group = self._sp_group
+            return tpu_ring_flash_attention(
+                query,
+                key,
+                value,
+                softmax_scale,
+                ring_size=int(sp_group.ring_world_size),
+                uly_size=int(getattr(sp_group, "ulysses_world_size", 1)),
+                fuse_ulysses=False,
+            )
+
+        setattr(_tpu_run_attention, _RING_ATTENTION_PATCHED, True)
+        RingParallelAttention.run_attention = _tpu_run_attention
+
+    if not getattr(Attention._forward_impl, _RING_ATTENTION_PATCHED, False):
+        orig_forward_impl = Attention._forward_impl
+
+        def _tpu_attention_forward_impl(
+            self: Any,
+            query: torch.Tensor,
+            key: torch.Tensor,
+            value: torch.Tensor,
+            attn_metadata: Any = None,
+        ) -> torch.Tensor:
+            strategy = self._get_active_parallel_strategy()
+            checked_meta = self._with_kv_cache_dtype(attn_metadata)
+            if can_fuse_tpu_ring_ulysses(
+                self, strategy, query, key, value, checked_meta
+            ):
+                sp_group = self.ring_runner._sp_group
+                return tpu_ring_flash_attention(
+                    query,
+                    key,
+                    value,
+                    self.softmax_scale,
+                    ring_size=int(sp_group.ring_world_size),
+                    uly_size=int(sp_group.ulysses_world_size),
+                    fuse_ulysses=True,
+                )
+            return orig_forward_impl(self, query, key, value, attn_metadata)
+
+        setattr(_tpu_attention_forward_impl, _RING_ATTENTION_PATCHED, True)
+        Attention._forward_impl = _tpu_attention_forward_impl
+    logger.info("Applied TPU patch: Pallas 2D Ring-Ulysses diffusion attention.")
+
+
+_PARALLEL_DEVICE_ORDER_PATCHED = "_tpu_parallel_device_order_patched"
+_CACHED_DEVICE_ID_ORDER: tuple[int, list[int], list[int]] | None = None
+_DEVICE_IDS_BY_RANK_OVERRIDE: list[int] | None = None
+_ACTIVE_INIT_MP_DEVICE_ORDER: bool | None = None
+
+
+def _query_local_tpu_device_id() -> int | None:
+    try:
+        if not hasattr(torch, "tpu"):
+            return None
+        fn = getattr(
+            torch.tpu,
+            "get_local_device_attributes",
+            getattr(torch.tpu, "_get_local_device_attributes", None),
+        )
+        if fn is None:
+            return None
+        attrs = fn()
+        if isinstance(attrs, dict) and "id" in attrs:
+            return int(attrs["id"])
+    except Exception:
+        return None
+    return None
+
+
+def _resolve_device_ids_by_rank(world_size: int) -> tuple[list[int], list[int]] | None:
+    global _CACHED_DEVICE_ID_ORDER
+    from vllm_torchtpu.omni.attention import ranks_ordered_by_device_id
+
+    if _DEVICE_IDS_BY_RANK_OVERRIDE is not None:
+        if len(_DEVICE_IDS_BY_RANK_OVERRIDE) != world_size:
+            return None
+        dev_ids = [int(d) for d in _DEVICE_IDS_BY_RANK_OVERRIDE]
+        return dev_ids, ranks_ordered_by_device_id(dev_ids)
+
+    if _CACHED_DEVICE_ID_ORDER is not None and _CACHED_DEVICE_ID_ORDER[0] == world_size:
+        return _CACHED_DEVICE_ID_ORDER[1], _CACHED_DEVICE_ID_ORDER[2]
+
+    if world_size <= 1 or not torch.distributed.is_initialized():
+        return None
+
+    local_dev_id = _query_local_tpu_device_id()
+    local_val: int | None = None if local_dev_id is None else int(local_dev_id)
+
+    from vllm_omni.diffusion.distributed.parallel_state import get_world_group
+
+    gathered: list[int | None] = [None] * world_size
+    torch.distributed.all_gather_object(
+        gathered, local_val, group=get_world_group().cpu_group
+    )
+    if any(x is None for x in gathered):
+        logger.warning(
+            "TPU device-ID query failed on one or more ranks (gathered=%s); "
+            "falling back to default rank ordering.",
+            gathered,
+        )
+        return None
+    dev_ids = [int(x) for x in gathered if x is not None]
+    try:
+        ranks_by_dev = ranks_ordered_by_device_id(dev_ids)
+    except ValueError as exc:
+        logger.warning(
+            "Invalid TPU device-ID mapping across ranks (%s); "
+            "falling back to default rank ordering.",
+            exc,
+        )
+        return None
+    _CACHED_DEVICE_ID_ORDER = (world_size, dev_ids, ranks_by_dev)
+    logger.info(
+        "Resolved TPU device-ID rank ordering: dev_ids=%s, ranks_by_dev=%s",
+        dev_ids,
+        ranks_by_dev,
+    )
+    return dev_ids, ranks_by_dev
+
+
+def _validate_ascending_c10d_groups(layout: dict[str, Any]) -> None:
+    """Ensure c10d all-to-all / group-rank groups stay sorted by global rank."""
+    for group_kind, key in (
+        ("ulysses", "ulysses_groups"),
+        ("tp", "tp_groups"),
+        ("pp", "pp_groups"),
+    ):
+        for group in layout[key]:
+            ranks = [int(r) for r in group]
+            if ranks != sorted(ranks):
+                raise RuntimeError(
+                    f"TPU device-ID parallel group ordering produced non-ascending "
+                    f"{group_kind} group {ranks} (torch.distributed.new_group "
+                    f"sorts ranks); dev_ids={layout['device_ids_by_rank']}, "
+                    f"ranks_by_dev={layout['ranks_by_device_id']}."
+                )
+
+
+def _patch_parallel_state_device_order() -> None:
+    """Lay out vLLM-Omni parallel groups by PJRT device ID on TPU."""
+    from vllm_omni.diffusion.distributed import group_coordinator, parallel_state
+
+    if not getattr(
+        parallel_state.RankGenerator.get_ranks, _PARALLEL_DEVICE_ORDER_PATCHED, False
+    ):
+        orig_get_ranks = parallel_state.RankGenerator.get_ranks
+
+        def _tpu_get_ranks(
+            self: Any, token: str, *args: Any, **kwargs: Any
+        ) -> list[list[int]]:
+            groups = orig_get_ranks(self, token, *args, **kwargs)
+            if _ACTIVE_INIT_MP_DEVICE_ORDER is False:
+                return groups
+            world_size = getattr(self, "world_size", None)
+            if world_size is None:
+                world_size = sum(len(g) for g in groups)
+            resolved = _resolve_device_ids_by_rank(int(world_size))
+            if resolved is None:
+                return groups
+            _, ranks_by_dev = resolved
+            return [[ranks_by_dev[int(pos)] for pos in g] for g in groups]
+
+        setattr(_tpu_get_ranks, _PARALLEL_DEVICE_ORDER_PATCHED, True)
+        parallel_state.RankGenerator.get_ranks = _tpu_get_ranks
+
+    if not getattr(
+        parallel_state._initialize_model_parallel,
+        _PARALLEL_DEVICE_ORDER_PATCHED,
+        False,
+    ):
+        orig_init_mp = parallel_state._initialize_model_parallel
+
+        def _tpu_initialize_model_parallel(
+            data_parallel_size: int | None = None,
+            cfg_parallel_size: int = 1,
+            sequence_parallel_size: int | None = None,
+            ulysses_degree: int = 1,
+            ring_degree: int = 1,
+            allgather_degree: int = 1,
+            tensor_parallel_size: int = 1,
+            pipeline_parallel_size: int = 1,
+            fully_shard_degree: int = 1,
+            enable_expert_parallel: bool = False,
+            use_hsdp: bool = False,
+            backend: str | None = None,
+        ) -> None:
+            global _ACTIVE_INIT_MP_DEVICE_ORDER
+            use_device_order = (ring_degree > 1) or (
+                _DEVICE_IDS_BY_RANK_OVERRIDE is not None
+            )
+            if not use_device_order:
+                prev_active = _ACTIVE_INIT_MP_DEVICE_ORDER
+                _ACTIVE_INIT_MP_DEVICE_ORDER = False
+                try:
+                    orig_init_mp(
+                        data_parallel_size=data_parallel_size,
+                        cfg_parallel_size=cfg_parallel_size,
+                        sequence_parallel_size=sequence_parallel_size,
+                        ulysses_degree=ulysses_degree,
+                        ring_degree=ring_degree,
+                        allgather_degree=allgather_degree,
+                        tensor_parallel_size=tensor_parallel_size,
+                        pipeline_parallel_size=pipeline_parallel_size,
+                        fully_shard_degree=fully_shard_degree,
+                        enable_expert_parallel=enable_expert_parallel,
+                        use_hsdp=use_hsdp,
+                        backend=backend,
+                    )
+                finally:
+                    _ACTIVE_INIT_MP_DEVICE_ORDER = prev_active
+                return
+
+            expected_sp = ring_degree * ulysses_degree * allgather_degree
+            layout: dict[str, Any] | None = None
+            if allgather_degree == 1 and (
+                sequence_parallel_size is None or sequence_parallel_size == expected_sp
+            ):
+                world_size = (
+                    torch.distributed.get_world_size()
+                    if torch.distributed.is_initialized()
+                    else (
+                        len(_DEVICE_IDS_BY_RANK_OVERRIDE)
+                        if _DEVICE_IDS_BY_RANK_OVERRIDE is not None
+                        else 1
+                    )
+                )
+                resolved = _resolve_device_ids_by_rank(world_size)
+                if resolved is not None:
+                    from vllm_torchtpu.omni.attention import (
+                        compute_device_id_group_layout,
+                        validate_ring_cfg_lanes,
+                    )
+
+                    dev_ids, _ = resolved
+                    dp_arg = (
+                        1
+                        if (use_hsdp and data_parallel_size is None)
+                        else data_parallel_size
+                    )
+                    non_dp = (
+                        tensor_parallel_size
+                        * expected_sp
+                        * pipeline_parallel_size
+                        * cfg_parallel_size
+                    )
+                    if (
+                        non_dp > 0
+                        and world_size % non_dp == 0
+                        and (dp_arg is None or dp_arg * non_dp == world_size)
+                    ):
+                        layout = compute_device_id_group_layout(
+                            dev_ids,
+                            cfg_size=cfg_parallel_size,
+                            ring_size=ring_degree,
+                            uly_size=ulysses_degree,
+                            tp_size=tensor_parallel_size,
+                            pp_size=pipeline_parallel_size,
+                            dp_size=dp_arg,
+                        )
+                        if ring_degree > 1:
+                            _validate_ascending_c10d_groups(layout)
+                            outer_size = max(
+                                1, world_size // (ring_degree * ulysses_degree)
+                            )
+                            validate_ring_cfg_lanes(
+                                cfg_groups=layout["cfg_groups"],
+                                ring_groups=layout["ring_groups"],
+                                cfg_lane_by_rank=layout["cfg_lane_by_rank"],
+                                device_ids_by_rank=dev_ids,
+                                mesh_device_ids=list(range(world_size)),
+                                outer_size=outer_size,
+                                ring_size=ring_degree,
+                                uly_size=ulysses_degree,
+                            )
+
+            prev_active = _ACTIVE_INIT_MP_DEVICE_ORDER
+            _ACTIVE_INIT_MP_DEVICE_ORDER = True
+            try:
+                orig_init_mp(
+                    data_parallel_size=data_parallel_size,
+                    cfg_parallel_size=cfg_parallel_size,
+                    sequence_parallel_size=sequence_parallel_size,
+                    ulysses_degree=ulysses_degree,
+                    ring_degree=ring_degree,
+                    allgather_degree=allgather_degree,
+                    tensor_parallel_size=tensor_parallel_size,
+                    pipeline_parallel_size=pipeline_parallel_size,
+                    fully_shard_degree=fully_shard_degree,
+                    enable_expert_parallel=enable_expert_parallel,
+                    use_hsdp=use_hsdp,
+                    backend=backend,
+                )
+            finally:
+                _ACTIVE_INIT_MP_DEVICE_ORDER = prev_active
+
+            if layout is not None:
+                from vllm_torchtpu.omni.attention import set_ring_cfg_validation_state
+
+                set_ring_cfg_validation_state(layout)
+
+        setattr(_tpu_initialize_model_parallel, _PARALLEL_DEVICE_ORDER_PATCHED, True)
+        parallel_state._initialize_model_parallel = _tpu_initialize_model_parallel
+
+    if not getattr(
+        parallel_state.destroy_model_parallel, _PARALLEL_DEVICE_ORDER_PATCHED, False
+    ):
+        orig_destroy_mp = parallel_state.destroy_model_parallel
+
+        def _tpu_destroy_model_parallel() -> None:
+            global _CACHED_DEVICE_ID_ORDER
+            from vllm_torchtpu.omni.attention import clear_ring_cfg_validation_state
+
+            _CACHED_DEVICE_ID_ORDER = None
+            clear_ring_cfg_validation_state()
+            orig_destroy_mp()
+
+        setattr(_tpu_destroy_model_parallel, _PARALLEL_DEVICE_ORDER_PATCHED, True)
+        parallel_state.destroy_model_parallel = _tpu_destroy_model_parallel
+
+    if not getattr(
+        group_coordinator.GroupCoordinator.all_gather,
+        _PARALLEL_DEVICE_ORDER_PATCHED,
+        False,
+    ):
+        orig_all_gather = group_coordinator.GroupCoordinator.all_gather
+
+        def _tpu_all_gather(
+            self: Any,
+            input_: torch.Tensor,
+            dim: int = 0,
+            separate_tensors: bool = False,
+            group: Any | None = None,
+        ) -> torch.Tensor | list[torch.Tensor]:
+            is_own_group = group is None or group is getattr(self, "device_group", None)
+            ranks = list(getattr(self, "ranks", []))
+            if is_own_group and len(ranks) > 1 and ranks != sorted(ranks):
+                sorted_ranks = sorted(ranks)
+                order = [sorted_ranks.index(r) for r in ranks]
+                chunks = orig_all_gather(
+                    self, input_, dim=dim, separate_tensors=True, group=group
+                )
+                reordered = [chunks[i] for i in order]
+                if separate_tensors:
+                    return reordered
+                if dim < 0:
+                    dim += input_.dim()
+                return torch.cat(reordered, dim=dim)
+            return orig_all_gather(
+                self,
+                input_,
+                dim=dim,
+                separate_tensors=separate_tensors,
+                group=group,
+            )
+
+        setattr(_tpu_all_gather, _PARALLEL_DEVICE_ORDER_PATCHED, True)
+        group_coordinator.GroupCoordinator.all_gather = _tpu_all_gather
+
+    if not getattr(
+        group_coordinator.GroupCoordinator.gather,
+        _PARALLEL_DEVICE_ORDER_PATCHED,
+        False,
+    ):
+        orig_gather = group_coordinator.GroupCoordinator.gather
+
+        def _tpu_gather(
+            self: Any,
+            input_: torch.Tensor,
+            dst: int = 0,
+            dim: int = -1,
+        ) -> torch.Tensor | None:
+            ranks = list(getattr(self, "ranks", []))
+            if len(ranks) > 1 and ranks != sorted(ranks):
+                out = orig_gather(self, input_, dst=dst, dim=dim)
+                if out is None:
+                    return None
+                norm_dim = dim + input_.dim() if dim < 0 else dim
+                chunk_size = input_.size(norm_dim)
+                if chunk_size == 0:
+                    return out
+                sorted_ranks = sorted(ranks)
+                order = [sorted_ranks.index(r) for r in ranks]
+                chunks = out.split(chunk_size, dim=norm_dim)
+                return torch.cat([chunks[i] for i in order], dim=norm_dim)
+            return orig_gather(self, input_, dst=dst, dim=dim)
+
+        setattr(_tpu_gather, _PARALLEL_DEVICE_ORDER_PATCHED, True)
+        group_coordinator.GroupCoordinator.gather = _tpu_gather
+
+    if not getattr(
+        group_coordinator.SequenceParallelGroupCoordinator.__init__,
+        _PARALLEL_DEVICE_ORDER_PATCHED,
+        False,
+    ):
+        orig_sp_init = group_coordinator.SequenceParallelGroupCoordinator.__init__
+
+        def _tpu_sp_init(
+            self: Any,
+            group_ranks: list[list[int]],
+            local_rank: int,
+            torch_distributed_backend: Any,
+            **kwargs: Any,
+        ) -> None:
+            orig_sp_init(
+                self,
+                group_ranks=group_ranks,
+                local_rank=local_rank,
+                torch_distributed_backend=torch_distributed_backend,
+                **kwargs,
+            )
+            if _ACTIVE_INIT_MP_DEVICE_ORDER is False:
+                return
+            ranks = list(getattr(self, "ranks", []))
+            uly_w = int(getattr(self, "ulysses_world_size", 1))
+            ring_w = int(getattr(self, "ring_world_size", 1))
+            ag_w = int(getattr(self, "allgather_world_size", 1))
+            if ring_w <= 1 and _DEVICE_IDS_BY_RANK_OVERRIDE is None:
+                return
+            if (
+                len(ranks) > 1
+                and ag_w == 1
+                and uly_w * ring_w == len(ranks)
+                and self.rank in ranks
+            ):
+                pos = ranks.index(self.rank)
+                u_idx = pos % uly_w
+                r_idx = pos // uly_w
+                self.ulysses_ranks = ranks[r_idx * uly_w : (r_idx + 1) * uly_w]
+                self.ring_ranks = ranks[u_idx::uly_w]
+                self.ulysses_rank = u_idx
+                self.ring_rank = r_idx
+
+        setattr(_tpu_sp_init, _PARALLEL_DEVICE_ORDER_PATCHED, True)
+        group_coordinator.SequenceParallelGroupCoordinator.__init__ = _tpu_sp_init
+
+    logger.info("Applied TPU patch: PJRT device-ID ordering for Omni parallel groups.")

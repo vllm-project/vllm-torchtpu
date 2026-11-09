@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import math
 import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -20,6 +21,8 @@ import torch
 from diffusers.pipelines.ltx2.vocoder import UpSample1d
 from vllm_omni.diffusion import ipc
 from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
+from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.attention.parallel.ring import RingParallelAttention
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbeddingWan
@@ -67,6 +70,11 @@ from vllm_torchtpu.omni.rope import (
     wan_self_attention_fused,
 )
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+
+if "--xla_force_host_platform_device_count" not in os.environ.get("XLA_FLAGS", ""):
+    os.environ["XLA_FLAGS"] = (
+        f"{os.environ.get('XLA_FLAGS', '')} --xla_force_host_platform_device_count=8"
+    ).strip()
 
 pytestmark = pytest.mark.omni
 
@@ -945,3 +953,1246 @@ def test_ltx2_split_rope_tables_reused_for_coords_views(ltx2, table_syncs, infer
 def test_supports_talker_mtp_graph_capture_disabled():
     assert OmniTpuPlatform.supports_talker_mtp_graph_capture() is False
     assert OmniTpuPlatform().supports_talker_mtp_graph_capture() is False
+
+
+def _non_ring_reference_bshd(q, k, v, scale):
+    """Single-device f32 softmax attention over (B, S, H, D) inputs."""
+    import jax
+    import jax.numpy as jnp
+
+    heads_per_kv = q.shape[2] // k.shape[2]
+    k_rep = jnp.repeat(k, heads_per_kv, axis=2).astype(jnp.float32)
+    v_rep = jnp.repeat(v, heads_per_kv, axis=2).astype(jnp.float32)
+    scores = jnp.einsum("bqhd,bkhd->bhqk", q.astype(jnp.float32), k_rep) * scale
+    probs = jax.nn.softmax(scores, axis=-1)
+    return jnp.einsum("bhqk,bkhd->bqhd", probs, v_rep).astype(q.dtype)
+
+
+def test_ring_lse_helpers_match_single_pass():
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+
+    from vllm_torchtpu.kernels.diffusion_attention.kernel import (
+        RING_LSE_INIT,
+        merge_partials,
+        partial_to_lse,
+        residual_reference_bhsd,
+    )
+
+    key = jax.random.PRNGKey(0)
+    kq, kk, kv = jax.random.split(key, 3)
+    b, h_q, h_kv, s_q, s_kv, d = 2, 4, 2, 32, 64, 16
+    scale = 1.0 / math.sqrt(d)
+    q = jax.random.normal(kq, (b, h_q, s_q, d), jnp.bfloat16)
+    k = jax.random.normal(kk, (b, h_kv, s_kv, d), jnp.bfloat16)
+    v = jax.random.normal(kv, (b, h_kv, s_kv, d), jnp.bfloat16)
+
+    o_full_un, m_full, l_full = residual_reference_bhsd(q, k, v, scale=scale)
+    o_full, lse_full = partial_to_lse(o_full_un, m_full, l_full)
+
+    # Merge 4 KV chunks and compare against single-pass attention.
+    o_acc = jnp.zeros_like(o_full)
+    lse_acc = jnp.full_like(lse_full, RING_LSE_INIT)
+    for k_chunk, v_chunk in zip(jnp.split(k, 4, axis=2), jnp.split(v, 4, axis=2)):
+        o_un, m_c, l_c = residual_reference_bhsd(q, k_chunk, v_chunk, scale=scale)
+        o_c, lse_c = partial_to_lse(o_un, m_c, l_c)
+        o_acc, lse_acc = merge_partials(o_acc, lse_acc, o_c, lse_c)
+
+    np.testing.assert_allclose(
+        np.asarray(o_acc), np.asarray(o_full), rtol=1e-5, atol=1e-5
+    )
+    np.testing.assert_allclose(
+        np.asarray(lse_acc), np.asarray(lse_full), rtol=1e-5, atol=1e-5
+    )
+
+    # Merging with an empty partial (l == 0) leaves the accumulator unchanged.
+    o_empty, lse_empty = partial_to_lse(
+        jnp.zeros_like(o_full), jnp.zeros_like(m_full), jnp.zeros_like(l_full)
+    )
+    o_after, lse_after = merge_partials(o_full, lse_full, o_empty, lse_empty)
+    np.testing.assert_allclose(
+        np.asarray(o_after), np.asarray(o_full), rtol=1e-6, atol=1e-6
+    )
+    np.testing.assert_allclose(
+        np.asarray(lse_after), np.asarray(lse_full), rtol=1e-6, atol=1e-6
+    )
+
+
+@pytest.mark.parametrize("ring_size,h_q,h_kv", [(1, 4, 4), (2, 4, 4), (4, 4, 2)])
+def test_ring_flash_attention_bhsd_matches_non_ring(ring_size, h_q, h_kv):
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    from jax.sharding import Mesh, PartitionSpec
+
+    from vllm_torchtpu.kernels.diffusion_attention.kernel import (
+        residual_reference_bhsd,
+        ring_flash_attention_bhsd,
+    )
+
+    cpu_devices = jax.devices("cpu")[:ring_size]
+    if len(cpu_devices) < ring_size:
+        pytest.skip(f"Requires {ring_size} CPU devices")
+    mesh = Mesh(np.array(cpu_devices), ("ring",))
+    b, s_per_rank, d = 2, 16, 16
+    s_total = s_per_rank * ring_size
+    scale = 1.0 / math.sqrt(d)
+
+    kq, kk, kv = jax.random.split(jax.random.PRNGKey(10 + ring_size), 3)
+    q_full = jax.random.normal(kq, (b, s_total, h_q, d), jnp.bfloat16)
+    k_full = jax.random.normal(kk, (b, s_total, h_kv, d), jnp.bfloat16)
+    v_full = jax.random.normal(kv, (b, s_total, h_kv, d), jnp.bfloat16)
+    want = _non_ring_reference_bshd(q_full, k_full, v_full, scale)
+
+    q_sharded = q_full.reshape(b, ring_size, s_per_rank, h_q, d).transpose(
+        1, 0, 3, 2, 4
+    )
+    k_sharded = k_full.reshape(b, ring_size, s_per_rank, h_kv, d).transpose(
+        1, 0, 3, 2, 4
+    )
+    v_sharded = v_full.reshape(b, ring_size, s_per_rank, h_kv, d).transpose(
+        1, 0, 3, 2, 4
+    )
+    spec = PartitionSpec("ring", None, None, None, None)
+
+    def _run(q_s, k_s, v_s):
+        out = ring_flash_attention_bhsd(
+            q_s[0],
+            k_s[0],
+            v_s[0],
+            ring_axis="ring",
+            scale=scale,
+            residual_fn=residual_reference_bhsd,
+        )
+        return out[None]
+
+    got_sharded = jax.jit(
+        jax.shard_map(
+            _run,
+            mesh=mesh,
+            in_specs=(spec, spec, spec),
+            out_specs=spec,
+            check_vma=False,
+        )
+    )(q_sharded, k_sharded, v_sharded)
+    got = got_sharded.transpose(1, 0, 3, 2, 4).reshape(b, s_total, h_q, d)
+    np.testing.assert_allclose(
+        np.asarray(got, np.float32),
+        np.asarray(want, np.float32),
+        rtol=2e-2,
+        atol=2e-2,
+    )
+
+
+@pytest.mark.parametrize(
+    "cfg_size,ring_size,uly_size,h_q,h_kv",
+    [
+        (2, 2, 2, 4, 4),
+        (2, 2, 2, 4, 2),
+        (2, 4, 1, 4, 2),
+        (1, 2, 2, 4, 4),
+        (2, 2, 1, 4, 2),
+    ],
+)
+def test_ring_ulysses_2d_matches_non_ring_reference(
+    cfg_size, ring_size, uly_size, h_q, h_kv
+):
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    from jax.sharding import Mesh, PartitionSpec
+
+    from vllm_torchtpu.kernels.diffusion_attention.kernel import (
+        residual_reference_bhsd,
+        ring_ulysses_flash_attention_bshd,
+    )
+
+    n_dev = cfg_size * ring_size * uly_size
+    cpu_devices = jax.devices("cpu")[:n_dev]
+    if len(cpu_devices) < n_dev:
+        pytest.skip(f"Requires {n_dev} CPU devices")
+    mesh = Mesh(
+        np.array(cpu_devices).reshape(cfg_size, ring_size, uly_size),
+        ("batch", "ring", "uly"),
+    )
+    b, s_per_sp, d = 1, 12, 16
+    sp_size = ring_size * uly_size
+    s_total = s_per_sp * sp_size
+    scale = 1.0 / math.sqrt(d)
+
+    kq, kk, kv = jax.random.split(jax.random.PRNGKey(42), 3)
+    q_full = jax.random.normal(kq, (cfg_size, b, s_total, h_q, d), jnp.bfloat16)
+    k_full = jax.random.normal(kk, (cfg_size, b, s_total, h_kv, d), jnp.bfloat16)
+    v_full = jax.random.normal(kv, (cfg_size, b, s_total, h_kv, d), jnp.bfloat16)
+
+    want_branches = [
+        _non_ring_reference_bshd(q_full[c], k_full[c], v_full[c], scale)
+        for c in range(cfg_size)
+    ]
+    want = jnp.stack(want_branches, axis=0)
+
+    def _shard_sp(x):
+        return x.reshape(
+            cfg_size, b, ring_size, uly_size, s_per_sp, x.shape[3], d
+        ).transpose(0, 2, 3, 1, 4, 5, 6)
+
+    q_in = _shard_sp(q_full)
+    k_in = _shard_sp(k_full)
+    v_in = _shard_sp(v_full)
+    spec = PartitionSpec("batch", "ring", "uly", None, None, None, None)
+
+    def _body(q_loc, k_loc, v_loc):
+        out = ring_ulysses_flash_attention_bshd(
+            q_loc[0, 0, 0],
+            k_loc[0, 0, 0],
+            v_loc[0, 0, 0],
+            ring_axis="ring",
+            uly_axis="uly" if uly_size > 1 else None,
+            scale=scale,
+            residual_fn=residual_reference_bhsd,
+        )
+        return out[None, None, None]
+
+    got_sharded = jax.jit(
+        jax.shard_map(
+            _body,
+            mesh=mesh,
+            in_specs=(spec, spec, spec),
+            out_specs=spec,
+            check_vma=False,
+        )
+    )(q_in, k_in, v_in)
+    got = got_sharded.transpose(0, 3, 1, 2, 4, 5, 6).reshape(
+        cfg_size, b, s_total, h_q, d
+    )
+    np.testing.assert_allclose(
+        np.asarray(got, np.float32),
+        np.asarray(want, np.float32),
+        rtol=2e-2,
+        atol=2e-2,
+    )
+
+
+def test_tpu_ring_ulysses_pallas_stablehlo_export():
+    import jax
+    import jax.export
+    import jax.numpy as jnp
+    import numpy as np
+    from jax.sharding import Mesh, PartitionSpec
+    from torch_tpu._internal.pallas.pallas import _PallasDevice
+
+    from vllm_torchtpu.kernels.diffusion_attention.kernel import (
+        _RING_MEASURED_BLOCK_OVERRIDES,
+        ring_ulysses_flash_attention_bshd,
+    )
+
+    assert _RING_MEASURED_BLOCK_OVERRIDES[(7, 37800, 37800)] == {
+        "block_q": 6400,
+        "block_kv": 2048,
+        "block_kv_compute": 2048,
+    }
+    assert _RING_MEASURED_BLOCK_OVERRIDES[(7, 18900, 18900)] == {
+        "block_q": 9472,
+        "block_kv": 1024,
+        "block_kv_compute": 1024,
+    }
+    assert _RING_MEASURED_BLOCK_OVERRIDES[(7, 55800, 55800)] == {
+        "block_q": 6400,
+        "block_kv": 2048,
+        "block_kv_compute": 2048,
+    }
+
+    devs = [_PallasDevice(id=i, process_index=i, device_kind="TPU7x") for i in range(8)]
+    mesh = Mesh(np.array(devs).reshape(2, 2, 2), ("batch", "ring", "uly"))
+    spec = PartitionSpec("batch", "ring", "uly", None, None, None, None)
+    scale = 1.0 / math.sqrt(128)
+
+    def _body(q, k, v):
+        out = ring_ulysses_flash_attention_bshd(
+            q[0, 0, 0],
+            k[0, 0, 0],
+            v[0, 0, 0],
+            ring_axis="ring",
+            uly_axis="uly",
+            scale=scale,
+        )
+        return out[None, None, None]
+
+    fn = jax.jit(
+        jax.shard_map(
+            _body,
+            mesh=mesh,
+            in_specs=(spec, spec, spec),
+            out_specs=spec,
+            check_vma=False,
+        )
+    )
+    shape = jax.ShapeDtypeStruct((2, 2, 2, 1, 1024, 4, 128), jnp.bfloat16)
+    exported = jax.export.export(
+        fn,
+        platforms=["tpu"],
+        disabled_checks=[jax.export.DisabledSafetyCheck.custom_call("ALL")],
+    )(shape, shape, shape)
+    mlir = str(exported.mlir_module())
+    assert "stablehlo.collective_permute" in mlir
+    assert "stablehlo.all_to_all" in mlir
+    assert "stablehlo.all_gather" not in mlir
+    assert "tpu_custom_call" in mlir
+
+    from torch_tpu._internal.pallas import pallas as pallas_impl
+
+    from vllm_torchtpu.omni.attention import _ring_ulysses_attention_op
+
+    _ring_ulysses_attention_op.cache_clear()
+    orig_tp = pallas_impl.torch_placeholder
+    registered_names: list[str] = []
+    with (
+        patch("vllm_torchtpu.omni.attention.pallas.get_pallas_mesh", return_value=mesh),
+        patch.object(pallas_impl, "_validate_pallas_mesh_world_size"),
+        patch.object(
+            pallas_impl.tpu_torch_pallas, "lookup_custom_kernel", return_value=False
+        ),
+        patch.object(
+            pallas_impl.tpu_torch_pallas,
+            "register_custom_kernel",
+            side_effect=lambda name, *args, **kw: registered_names.append(name),
+        ),
+        patch.object(
+            pallas_impl.tpu_torch_pallas,
+            "call_custom_kernel",
+            side_effect=lambda name, fp, inputs, output_shapes, **kw: output_shapes,
+        ),
+        patch.object(
+            pallas_impl,
+            "torch_placeholder",
+            side_effect=lambda aval, mesh=None, partition_spec=None, device="cpu": (
+                orig_tp(aval, mesh=mesh, partition_spec=partition_spec, device="cpu")
+            ),
+        ),
+    ):
+        op = _ring_ulysses_attention_op(2, 2, 2, True)
+        q = torch.empty((1, 1, 1, 1, 1024, 4, 128), dtype=torch.bfloat16)
+        out = op(q, q, q, scale)
+        assert out.shape == q.shape
+    assert registered_names == ["pallas::diffusion_ring_ulysses_attn_2_2_2"]
+    _ring_ulysses_attention_op.cache_clear()
+
+
+def _make_ring_attention_layer(
+    ring_runner=None, strategy=None, softmax_scale=0.25, causal=False
+):
+    layer = object.__new__(Attention)
+    torch.nn.Module.__init__(layer)
+    layer.use_ring = ring_runner is not None
+    layer.ring_runner = ring_runner
+    layer._no_parallel_strategy = object()
+    layer.parallel_strategy = strategy or layer._no_parallel_strategy
+    layer.softmax_scale = softmax_scale
+    layer.causal = causal
+    layer._explicit_cross_contract = False
+    layer.attention = None
+    layer._disable_kv_quant = True
+    layer._kv_cache_dtype = None
+    layer._kv_cache_skip_steps = None
+    layer._kv_cache_skip_layers = None
+    layer.paged_kv_cache_role = None
+    return layer
+
+
+def test_ring_attention_patch_and_dispatch(monkeypatch):
+    from vllm_torchtpu.omni.attention import tpu_ring_flash_attention
+    from vllm_torchtpu.omni.patches import _patch_ring_attention
+
+    def _orig_run(
+        self, query, key, value, attn_metadata=None, softmax_scale=None, causal=False
+    ):
+        return "native_ring"
+
+    def _orig_forward_impl(self, query, key, value, attn_metadata=None):
+        if self.use_ring and self.ring_runner is not None:
+            return self.ring_runner.run_attention(
+                query,
+                key,
+                value,
+                attn_metadata,
+                softmax_scale=self.softmax_scale,
+                causal=self.causal,
+            )
+        return "native_attn"
+
+    monkeypatch.setattr(RingParallelAttention, "run_attention", _orig_run)
+    monkeypatch.setattr(Attention, "_forward_impl", _orig_forward_impl)
+    _patch_ring_attention()
+    calls = []
+
+    def _fake_op(outer_size, ring_size, uly_size, fuse_ulysses):
+        def _run(q, k, v, scale):
+            calls.append((outer_size, ring_size, uly_size, fuse_ulysses, scale))
+            return q.clone()
+
+        return _run
+
+    monkeypatch.setattr(
+        "vllm_torchtpu.omni.attention._ring_ulysses_attention_op", _fake_op
+    )
+
+    sp_group = SimpleNamespace(ring_world_size=2, ulysses_world_size=2)
+    runner = RingParallelAttention(sp_group, attn_backend_pref="TPU_FLASH_ATTN")
+    strategy = SimpleNamespace(name="ulysses", _scatter_idx=2, _gather_idx=1)
+    layer = _make_ring_attention_layer(
+        ring_runner=runner,
+        strategy=strategy,
+        softmax_scale=0.125,
+    )
+    monkeypatch.setattr(
+        layer, "_get_active_parallel_strategy", lambda: layer.parallel_strategy
+    )
+    monkeypatch.setattr(layer, "is_paged_kv_active", lambda: False)
+
+    q = torch.randn(1, 16, 4, 16, dtype=torch.bfloat16)
+    k = torch.randn(1, 16, 4, 16, dtype=torch.bfloat16)
+    v = torch.randn(1, 16, 4, 16, dtype=torch.bfloat16)
+
+    # 1. Hybrid Ring+Ulysses Attention._forward_impl fuses Ulysses all-to-all.
+    out = layer._forward_impl(q, k, v)
+    assert out.shape == q.shape
+    assert calls == [(1, 2, 2, True, 0.125)]
+
+    # 2. Direct RingParallelAttention.run_attention runs 1D ring (fuse_ulysses=False).
+    calls.clear()
+    out_ring = runner.run_attention(q, k, v, softmax_scale=0.25)
+    assert out_ring.shape == q.shape
+    assert calls == [(1, 2, 2, False, 0.25)]
+
+    # 3. Fallbacks: causal=True, float32, attn_mask, joint_query, or SDPA pref.
+    calls.clear()
+    assert runner.run_attention(q, k, v, causal=True) == "native_ring"
+    assert runner.run_attention(q.float(), k.float(), v.float()) == "native_ring"
+    masked_meta = SimpleNamespace(attn_mask=torch.ones(1, 16, dtype=torch.bool))
+    assert runner.run_attention(q, k, v, attn_metadata=masked_meta) == "native_ring"
+    joint_meta = SimpleNamespace(joint_query=q, extra={})
+    assert layer._forward_impl(q, k, v, attn_metadata=joint_meta) == "native_ring"
+    sdpa_runner = RingParallelAttention(sp_group, attn_backend_pref="TPU_SDPA")
+    assert sdpa_runner.run_attention(q, k, v) == "native_ring"
+    assert calls == []
+
+    # 4. Non-divisible GQA heads raise ValueError in tpu_ring_flash_attention.
+    with pytest.raises(ValueError, match="num_heads"):
+        tpu_ring_flash_attention(
+            q, torch.randn(1, 16, 3, 16, dtype=torch.bfloat16), v, 0.25, ring_size=2
+        )
+
+    # 5. Re-applying _patch_ring_attention is idempotent.
+    run_fn = RingParallelAttention.run_attention
+    fwd_fn = Attention._forward_impl
+    _patch_ring_attention()
+    assert RingParallelAttention.run_attention is run_fn
+    assert Attention._forward_impl is fwd_fn
+
+
+def test_device_id_rank_layout_c2r2u2_and_c2r4u1(
+    monkeypatch, _restore_parallel_state_device_order
+):
+    import numpy as np
+    from torch_tpu._internal.pallas.pallas import _PallasDevice
+    from vllm_omni.diffusion.distributed import group_coordinator, parallel_state
+
+    import vllm_torchtpu.omni.patches as omni_patches
+    from vllm_torchtpu.omni.attention import (
+        _get_device_ordered_pallas_mesh,
+        compute_device_id_group_layout,
+        ranks_ordered_by_device_id,
+        validate_ring_cfg_lanes,
+    )
+
+    device_ids = [0, 1, 4, 5, 6, 7, 2, 3]
+    assert ranks_ordered_by_device_id(device_ids) == [0, 1, 6, 7, 2, 3, 4, 5]
+
+    c2r2u2 = compute_device_id_group_layout(
+        device_ids, cfg_size=2, ring_size=2, uly_size=2
+    )
+    assert c2r2u2["cfg_groups"] == [[0, 2], [1, 3], [6, 4], [7, 5]]
+    assert c2r2u2["sp_groups"] == [[0, 1, 6, 7], [2, 3, 4, 5]]
+    assert c2r2u2["ulysses_groups"] == [[0, 1], [6, 7], [2, 3], [4, 5]]
+    assert c2r2u2["ring_groups"] == [[0, 6], [1, 7], [2, 4], [3, 5]]
+    assert [[device_ids[r] for r in g] for g in c2r2u2["ring_groups"]] == [
+        [0, 2],
+        [1, 3],
+        [4, 6],
+        [5, 7],
+    ]
+    assert [[device_ids[r] for r in g] for g in c2r2u2["ulysses_groups"]] == [
+        [0, 1],
+        [2, 3],
+        [4, 5],
+        [6, 7],
+    ]
+
+    c2r4u1 = compute_device_id_group_layout(
+        device_ids, cfg_size=2, ring_size=4, uly_size=1
+    )
+    assert c2r4u1["cfg_groups"] == [[0, 2], [1, 3], [6, 4], [7, 5]]
+    assert c2r4u1["sp_groups"] == [[0, 1, 6, 7], [2, 3, 4, 5]]
+    assert c2r4u1["ulysses_groups"] == [[0], [1], [6], [7], [2], [3], [4], [5]]
+    assert c2r4u1["ring_groups"] == [[0, 1, 6, 7], [2, 3, 4, 5]]
+    assert [[device_ids[r] for r in g] for g in c2r4u1["ring_groups"]] == [
+        [0, 1, 2, 3],
+        [4, 5, 6, 7],
+    ]
+
+    # Verify patched RankGenerator.get_ranks applies the device-ID permutation.
+    omni_patches._patch_parallel_state_device_order()
+    monkeypatch.setattr(omni_patches, "_DEVICE_IDS_BY_RANK_OVERRIDE", device_ids)
+    rg = parallel_state.RankGenerator(1, 4, 1, 2, 1, order="tp-sp-pp-cfg-dp")
+    assert rg.get_ranks("sp") == [[0, 1, 6, 7], [2, 3, 4, 5]]
+    assert rg.get_ranks("cfg") == [[0, 2], [1, 3], [6, 4], [7, 5]]
+
+    # Verify _get_device_ordered_pallas_mesh sorts devices into 0..7.
+    import jax.sharding
+
+    rank_ordered_devs = [
+        _PallasDevice(id=dev_id, process_index=r, device_kind="TPU7x")
+        for r, dev_id in enumerate(device_ids)
+    ]
+    raw_mesh = jax.sharding.Mesh(
+        np.array(rank_ordered_devs, dtype=object).reshape(2, 2, 2),
+        ("batch", "ring", "uly"),
+    )
+    with patch(
+        "vllm_torchtpu.omni.attention.pallas.get_pallas_mesh", return_value=raw_mesh
+    ):
+        ordered_mesh = _get_device_ordered_pallas_mesh(
+            ("batch", "ring", "uly"), (2, 2, 2)
+        )
+    assert [int(d.id) for d in ordered_mesh.devices.flat] == list(range(8))
+
+    validate_ring_cfg_lanes(
+        cfg_groups=c2r2u2["cfg_groups"],
+        ring_groups=c2r2u2["ring_groups"],
+        cfg_lane_by_rank=c2r2u2["cfg_lane_by_rank"],
+        device_ids_by_rank=device_ids,
+        mesh_device_ids=ordered_mesh,
+        outer_size=2,
+        ring_size=2,
+        uly_size=2,
+    )
+    validate_ring_cfg_lanes(
+        cfg_groups=c2r4u1["cfg_groups"],
+        ring_groups=c2r4u1["ring_groups"],
+        cfg_lane_by_rank=c2r4u1["cfg_lane_by_rank"],
+        device_ids_by_rank=device_ids,
+        mesh_device_ids=list(range(8)),
+        outer_size=2,
+        ring_size=4,
+        uly_size=1,
+    )
+
+    # Verify GroupCoordinator.all_gather reorders unsorted group [6, 4].
+    t_r4 = torch.tensor([40.0, 41.0])
+    t_r6 = torch.tensor([60.0, 61.0])
+
+    def _fake_orig_ag(self, input_, dim=0, separate_tensors=False, group=None):
+        assert separate_tensors is True
+        return [t_r4, t_r6]
+
+    fake_gc = SimpleNamespace(ranks=[6, 4], device_group="cfg_pg")
+    with (
+        patch.object(
+            group_coordinator.GroupCoordinator,
+            "all_gather",
+            wraps=group_coordinator.GroupCoordinator.all_gather,
+        ),
+        patch("torch.distributed.get_world_size", return_value=2),
+        patch(
+            "torch.distributed.all_gather_into_tensor",
+            side_effect=lambda out, inp, group=None: out.copy_(
+                torch.cat([t_r4, t_r6], dim=0)
+            ),
+        ),
+    ):
+        sep = group_coordinator.GroupCoordinator.all_gather(
+            fake_gc, t_r6, dim=0, separate_tensors=True
+        )
+        assert torch.equal(sep[0], t_r6)
+        assert torch.equal(sep[1], t_r4)
+        cat_out = group_coordinator.GroupCoordinator.all_gather(
+            fake_gc, t_r6, dim=0, separate_tensors=False
+        )
+        assert torch.equal(cat_out, torch.cat([t_r6, t_r4], dim=0))
+
+
+def test_same_cfg_lane_check_raises():
+    from vllm_torchtpu.omni.attention import (
+        RingCfgLaneMismatchError,
+        clear_ring_cfg_validation_state,
+        compute_device_id_group_layout,
+        set_ring_cfg_validation_state,
+        tpu_ring_flash_attention,
+        validate_ring_cfg_lanes,
+    )
+
+    device_ids = [0, 1, 4, 5, 6, 7, 2, 3]
+    layout = compute_device_id_group_layout(
+        device_ids, cfg_size=2, ring_size=2, uly_size=2
+    )
+
+    # 1. Direct ring group containing partners from different CFG lanes raises.
+    with pytest.raises(RingCfgLaneMismatchError, match="CFG lane"):
+        validate_ring_cfg_lanes(
+            cfg_groups=layout["cfg_groups"],
+            ring_groups=[[0, 2], [1, 3], [6, 4], [7, 5]],
+        )
+
+    # 2. Device-ordered mesh [0..7] paired with unpatched rank-ordered vllm-omni groups
+    # pairs device 0 (rank 0, cfg=0) with device 2 (rank 6, cfg=1) along mesh ring axis.
+    unpatched_cfg = [[0, 4], [1, 5], [2, 6], [3, 7]]
+    unpatched_ring = [[0, 2], [1, 3], [4, 6], [5, 7]]
+    with pytest.raises(RingCfgLaneMismatchError, match="CFG lane"):
+        validate_ring_cfg_lanes(
+            cfg_groups=unpatched_cfg,
+            ring_groups=unpatched_ring,
+            device_ids_by_rank=device_ids,
+            mesh_device_ids=list(range(8)),
+            outer_size=2,
+            ring_size=2,
+            uly_size=2,
+        )
+
+    # 3. tpu_ring_flash_attention enforces the active runtime validation state.
+    set_ring_cfg_validation_state(
+        {
+            "cfg_groups": unpatched_cfg,
+            "ring_groups": unpatched_ring,
+            "cfg_lane_by_rank": {0: 0, 1: 0, 2: 0, 3: 0, 4: 1, 5: 1, 6: 1, 7: 1},
+            "device_ids_by_rank": device_ids,
+        }
+    )
+    try:
+        q = torch.randn(1, 16, 4, 16, dtype=torch.bfloat16)
+        with pytest.raises(RingCfgLaneMismatchError, match="CFG lane"):
+            tpu_ring_flash_attention(
+                q, q, q, 0.25, ring_size=2, uly_size=2, outer_size=2, fuse_ulysses=True
+            )
+    finally:
+        clear_ring_cfg_validation_state()
+
+
+def test_resolve_device_ids_by_rank_collective_fallback(
+    monkeypatch, _restore_parallel_state_device_order
+):
+    """Rank-local device-ID failure still enters all_gather_object on all ranks."""
+    from typing import Any
+
+    from vllm_omni.diffusion.distributed import parallel_state
+
+    import vllm_torchtpu.omni.patches as omni_patches
+
+    omni_patches._patch_parallel_state_device_order()
+    monkeypatch.setattr(omni_patches, "_DEVICE_IDS_BY_RANK_OVERRIDE", None)
+    monkeypatch.setattr(omni_patches, "_CACHED_DEVICE_ID_ORDER", None)
+    monkeypatch.setattr("torch.distributed.is_initialized", lambda: True)
+    fake_world_group = SimpleNamespace(cpu_group="fake_cpu_pg")
+    monkeypatch.setattr(parallel_state, "get_world_group", lambda: fake_world_group)
+
+    # 1. Rank 2 fails local TPU device-ID query; all 4 ranks still participate in
+    # all_gather_object, warn, and fall back consistently to unpermuted groups.
+    per_rank_attrs: dict[int, Any] = {
+        0: {"id": 0},
+        1: {"id": 2},
+        2: RuntimeError("device query failed on rank 2"),
+        3: {"id": 3},
+    }
+    current_rank = {"val": 0}
+    gather_participating_ranks: list[tuple[int, int | None, Any]] = []
+
+    def _fake_get_attrs():
+        entry = per_rank_attrs[current_rank["val"]]
+        if isinstance(entry, Exception):
+            raise entry
+        return entry
+
+    fake_tpu = SimpleNamespace(get_local_device_attributes=_fake_get_attrs)
+    monkeypatch.setattr(torch, "tpu", fake_tpu, raising=False)
+
+    expected_gathered: list[int | None] = [0, 2, None, 3]
+
+    def _fake_all_gather_object(object_list, obj, group=None):
+        gather_participating_ranks.append((current_rank["val"], obj, group))
+        object_list[:] = expected_gathered
+
+    monkeypatch.setattr("torch.distributed.all_gather_object", _fake_all_gather_object)
+
+    rg = parallel_state.RankGenerator(1, 2, 1, 2, 1, order="tp-sp-pp-cfg-dp")
+    with patch.object(omni_patches.logger, "warning") as mock_warn:
+        results_by_rank = []
+        for r in range(4):
+            current_rank["val"] = r
+            results_by_rank.append(rg.get_ranks("sp"))
+
+    assert gather_participating_ranks == [
+        (0, 0, "fake_cpu_pg"),
+        (1, 2, "fake_cpu_pg"),
+        (2, None, "fake_cpu_pg"),
+        (3, 3, "fake_cpu_pg"),
+    ]
+    assert mock_warn.call_count == 4
+    assert results_by_rank == [[[0, 1], [2, 3]]] * 4
+    assert omni_patches._CACHED_DEVICE_ID_ORDER is None
+
+    # 2. Duplicate/non-permutation device IDs also warn and fall back on every rank.
+    expected_gathered = [0, 1, 1, 3]
+    per_rank_attrs[2] = {"id": 1}
+    gather_participating_ranks.clear()
+    with patch.object(omni_patches.logger, "warning") as mock_warn_dup:
+        for r in range(4):
+            current_rank["val"] = r
+            assert omni_patches._resolve_device_ids_by_rank(4) is None
+    assert len(gather_participating_ranks) == 4
+    assert mock_warn_dup.call_count == 4
+    assert omni_patches._CACHED_DEVICE_ID_ORDER is None
+
+    # 3. Valid permutation resolves and caches device-ordered ranks across ranks.
+    expected_gathered = [0, 2, 1, 3]
+    gather_participating_ranks.clear()
+    current_rank["val"] = 0
+    resolved = omni_patches._resolve_device_ids_by_rank(4)
+    assert resolved == ([0, 2, 1, 3], [0, 2, 1, 3])
+    assert len(gather_participating_ranks) == 1
+    assert rg.get_ranks("sp") == [[0, 2], [1, 3]]
+    assert len(gather_participating_ranks) == 1
+    parallel_state.destroy_model_parallel()
+    assert omni_patches._CACHED_DEVICE_ID_ORDER is None
+
+
+@pytest.fixture
+def _restore_parallel_state_device_order():
+    from vllm_omni.diffusion.distributed import group_coordinator, parallel_state
+
+    import vllm_torchtpu.omni.patches as omni_patches
+    from vllm_torchtpu.omni.attention import (
+        get_ring_cfg_validation_state,
+        set_ring_cfg_validation_state,
+    )
+
+    orig_get_ranks = parallel_state.RankGenerator.get_ranks
+    orig_init_mp = parallel_state._initialize_model_parallel
+    orig_public_init_mp = parallel_state.initialize_model_parallel
+    orig_destroy_mp = parallel_state.destroy_model_parallel
+    orig_all_gather = group_coordinator.GroupCoordinator.all_gather
+    orig_gather = group_coordinator.GroupCoordinator.gather
+    orig_sp_init = group_coordinator.SequenceParallelGroupCoordinator.__init__
+    orig_cached = omni_patches._CACHED_DEVICE_ID_ORDER
+    orig_override = omni_patches._DEVICE_IDS_BY_RANK_OVERRIDE
+    orig_active = omni_patches._ACTIVE_INIT_MP_DEVICE_ORDER
+    orig_cfg_state = get_ring_cfg_validation_state()
+    try:
+        yield parallel_state, group_coordinator
+    finally:
+        parallel_state.RankGenerator.get_ranks = orig_get_ranks
+        parallel_state._initialize_model_parallel = orig_init_mp
+        parallel_state.initialize_model_parallel = orig_public_init_mp
+        parallel_state.destroy_model_parallel = orig_destroy_mp
+        group_coordinator.GroupCoordinator.all_gather = orig_all_gather
+        group_coordinator.GroupCoordinator.gather = orig_gather
+        group_coordinator.SequenceParallelGroupCoordinator.__init__ = orig_sp_init
+        omni_patches._CACHED_DEVICE_ID_ORDER = orig_cached
+        omni_patches._DEVICE_IDS_BY_RANK_OVERRIDE = orig_override
+        omni_patches._ACTIVE_INIT_MP_DEVICE_ORDER = orig_active
+        set_ring_cfg_validation_state(orig_cfg_state)
+
+
+@pytest.fixture
+def _restore_diffusion_ring_degree_state(_restore_parallel_state_device_order):
+    from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
+
+    orig_ring_degree = OmniTpuPlatform._diffusion_ring_degree
+    orig_init_device = DiffusionWorker.init_device
+    try:
+        yield DiffusionWorker, orig_init_device
+    finally:
+        OmniTpuPlatform._diffusion_ring_degree = orig_ring_degree
+        DiffusionWorker.init_device = orig_init_device
+
+
+def _call_set_device_multi_rank(monkeypatch, world_size: int = 4) -> None:
+    monkeypatch.setenv("WORLD_SIZE", str(world_size))
+    monkeypatch.setenv("MASTER_PORT", "29500")
+    monkeypatch.delenv("TPU_VISIBLE_CHIPS", raising=False)
+    monkeypatch.setattr(OmniTpuPlatform, "_worker_world_size", 1)
+    monkeypatch.setattr(
+        OmniTpuPlatform,
+        "_prepare_singlehost_tpu_env",
+        staticmethod(lambda ws: None),
+    )
+    monkeypatch.setattr(torch, "accelerator", MagicMock(), raising=False)
+    with patch("torch.empty"), patch("torch.device"):
+        OmniTpuPlatform.set_device(None)
+
+
+def test_set_device_offload_dense_all_to_all_ring_degree_one(
+    monkeypatch, _restore_diffusion_ring_degree_state
+):
+    flag = "--xla_tpu_enable_sparse_core_collective_offload_dense_all_to_all"
+    OmniTpuPlatform._diffusion_ring_degree = 1
+
+    monkeypatch.setenv("LIBTPU_INIT_ARGS", "--xla_foo=1")
+    _call_set_device_multi_rank(monkeypatch)
+    assert os.environ["LIBTPU_INIT_ARGS"] == f"--xla_foo=1 {flag}=true"
+
+    monkeypatch.delenv("LIBTPU_INIT_ARGS", raising=False)
+    _call_set_device_multi_rank(monkeypatch)
+    assert os.environ["LIBTPU_INIT_ARGS"] == f"{flag}=true"
+
+
+def test_set_device_skips_offload_dense_all_to_all_for_ring_degree_two(
+    monkeypatch, _restore_diffusion_ring_degree_state
+):
+    flag = "--xla_tpu_enable_sparse_core_collective_offload_dense_all_to_all"
+    OmniTpuPlatform._diffusion_ring_degree = 2
+
+    monkeypatch.setenv("LIBTPU_INIT_ARGS", "--xla_foo=1")
+    with patch("vllm_torchtpu.omni.platform.logger.info") as mock_info:
+        _call_set_device_multi_rank(monkeypatch)
+    assert os.environ["LIBTPU_INIT_ARGS"] == "--xla_foo=1"
+    assert flag not in os.environ["LIBTPU_INIT_ARGS"]
+    assert any(
+        "ring_degree=%d" in str(call.args[0]) and call.args[1] == 2
+        for call in mock_info.call_args_list
+        if len(call.args) >= 2
+    )
+
+    monkeypatch.delenv("LIBTPU_INIT_ARGS", raising=False)
+    _call_set_device_multi_rank(monkeypatch)
+    assert "LIBTPU_INIT_ARGS" not in os.environ
+
+
+@pytest.mark.parametrize("explicit_val", ["true", "false"])
+def test_set_device_preserves_explicit_offload_flag_for_ring_degree_two(
+    monkeypatch, _restore_diffusion_ring_degree_state, explicit_val
+):
+    flag = "--xla_tpu_enable_sparse_core_collective_offload_dense_all_to_all"
+    OmniTpuPlatform._diffusion_ring_degree = 2
+
+    expected = f"--xla_foo=1 {flag}={explicit_val}"
+    monkeypatch.setenv("LIBTPU_INIT_ARGS", expected)
+    _call_set_device_multi_rank(monkeypatch)
+    assert os.environ["LIBTPU_INIT_ARGS"] == expected
+
+
+def test_get_diffusion_worker_cls_wraps_init_device_idempotently(
+    monkeypatch, _restore_diffusion_ring_degree_state
+):
+    from vllm_omni.platforms.interface import OmniPlatform
+
+    flag = "--xla_tpu_enable_sparse_core_collective_offload_dense_all_to_all"
+    diffusion_worker_cls, _ = _restore_diffusion_ring_degree_state
+    observed_in_orig: list[int] = []
+
+    def _fake_orig_init_device(self):
+        observed_in_orig.append(OmniTpuPlatform._diffusion_ring_degree)
+        _call_set_device_multi_rank(monkeypatch)
+
+    diffusion_worker_cls.init_device = _fake_orig_init_device
+
+    parent_ret = OmniPlatform.get_diffusion_worker_cls()
+    ret1 = OmniTpuPlatform.get_diffusion_worker_cls()
+    wrapped_first = diffusion_worker_cls.init_device
+    ret2 = OmniTpuPlatform.get_diffusion_worker_cls()
+    wrapped_second = diffusion_worker_cls.init_device
+
+    assert ret1 == parent_ret
+    assert ret2 == parent_ret
+    assert wrapped_first is not _fake_orig_init_device
+    assert wrapped_second is wrapped_first
+
+    # Records ring_degree=2 before calling original init_device once.
+    monkeypatch.setenv("LIBTPU_INIT_ARGS", "--xla_foo=1")
+    fake_worker_ring2 = SimpleNamespace(
+        od_config=SimpleNamespace(parallel_config=SimpleNamespace(ring_degree=2))
+    )
+    diffusion_worker_cls.init_device(fake_worker_ring2)
+    assert OmniTpuPlatform._diffusion_ring_degree == 2
+    assert observed_in_orig == [2]
+    assert os.environ["LIBTPU_INIT_ARGS"] == "--xla_foo=1"
+
+    # Defensive fallbacks: None, 0, "0", missing configs -> 1.
+    for fake_worker in (
+        SimpleNamespace(
+            od_config=SimpleNamespace(parallel_config=SimpleNamespace(ring_degree=None))
+        ),
+        SimpleNamespace(
+            od_config=SimpleNamespace(parallel_config=SimpleNamespace(ring_degree=0))
+        ),
+        SimpleNamespace(
+            od_config=SimpleNamespace(parallel_config=SimpleNamespace(ring_degree="0"))
+        ),
+        SimpleNamespace(od_config=SimpleNamespace(parallel_config=None)),
+        SimpleNamespace(od_config=None),
+        SimpleNamespace(),
+    ):
+        OmniTpuPlatform._diffusion_ring_degree = 4
+        monkeypatch.setenv("LIBTPU_INIT_ARGS", "--xla_foo=1")
+        diffusion_worker_cls.init_device(fake_worker)
+        assert OmniTpuPlatform._diffusion_ring_degree == 1
+        assert os.environ["LIBTPU_INIT_ARGS"] == f"--xla_foo=1 {flag}=true"
+
+    assert len(observed_in_orig) == 7
+
+
+def test_init_device_ring_degree_one_leaves_parallel_state_unpatched(
+    _restore_diffusion_ring_degree_state,
+    _restore_parallel_state_device_order,
+):
+    import vllm_torchtpu.omni.patches as omni_patches
+    from vllm_torchtpu.omni.attention import get_ring_cfg_validation_state
+
+    diffusion_worker_cls, _ = _restore_diffusion_ring_degree_state
+    parallel_state, group_coordinator = _restore_parallel_state_device_order
+    marker = omni_patches._PARALLEL_DEVICE_ORDER_PATCHED
+
+    assert omni_patches._DEVICE_IDS_BY_RANK_OVERRIDE is None
+
+    orig_calls: list[int] = []
+    diffusion_worker_cls.init_device = lambda self: orig_calls.append(
+        OmniTpuPlatform._diffusion_ring_degree
+    )
+    OmniTpuPlatform.get_diffusion_worker_cls()
+
+    fake_worker_ring1 = SimpleNamespace(
+        od_config=SimpleNamespace(parallel_config=SimpleNamespace(ring_degree=1))
+    )
+    diffusion_worker_cls.init_device(fake_worker_ring1)
+    assert orig_calls == [1]
+    assert omni_patches._DEVICE_IDS_BY_RANK_OVERRIDE is None
+
+    for fn in (
+        parallel_state.RankGenerator.get_ranks,
+        parallel_state._initialize_model_parallel,
+        parallel_state.initialize_model_parallel,
+        parallel_state.destroy_model_parallel,
+        group_coordinator.GroupCoordinator.all_gather,
+        group_coordinator.GroupCoordinator.gather,
+        group_coordinator.SequenceParallelGroupCoordinator.__init__,
+    ):
+        assert not getattr(fn, marker, False)
+
+    rg = parallel_state.RankGenerator(1, 4, 1, 2, 1, order="tp-sp-pp-cfg-dp")
+    assert rg.get_ranks("sp") == [[0, 1, 2, 3], [4, 5, 6, 7]]
+    assert rg.get_ranks("cfg") == [[0, 4], [1, 5], [2, 6], [3, 7]]
+
+    # Even if the patch was installed earlier in the process with cached device IDs,
+    # a subsequent ring_degree == 1 initialize_model_parallel call keeps default layout.
+    observed_groups: dict[str, object] = {}
+
+    def _fake_orig_sp_init(
+        self, group_ranks, local_rank, torch_distributed_backend, **kwargs
+    ):
+        self.rank = 6
+        self.ranks = [6, 7, 4, 5]
+        self.ulysses_world_size = 4
+        self.ring_world_size = 1
+        self.allgather_world_size = 1
+        self.ulysses_rank = 2
+        self.ring_rank = 0
+
+    def _fake_orig_init_mp(**kwargs):
+        gen = parallel_state.RankGenerator(
+            kwargs["tensor_parallel_size"],
+            kwargs["ulysses_degree"] * kwargs["ring_degree"],
+            kwargs["pipeline_parallel_size"],
+            kwargs["cfg_parallel_size"],
+            1,
+            order="tp-sp-pp-cfg-dp",
+        )
+        observed_groups["sp"] = gen.get_ranks("sp")
+        observed_groups["cfg"] = gen.get_ranks("cfg")
+        fake_sp = object.__new__(group_coordinator.SequenceParallelGroupCoordinator)
+        group_coordinator.SequenceParallelGroupCoordinator.__init__(
+            fake_sp,
+            observed_groups["sp"],
+            0,
+            "gloo",
+            ulysses_group="u",
+            ring_group="r",
+            allgather_group="ag",
+        )
+        observed_groups["ulysses_rank"] = fake_sp.ulysses_rank
+        observed_groups["ring_rank"] = fake_sp.ring_rank
+
+    parallel_state._initialize_model_parallel = _fake_orig_init_mp
+    group_coordinator.SequenceParallelGroupCoordinator.__init__ = _fake_orig_sp_init
+    omni_patches._patch_parallel_state_device_order()
+    omni_patches._CACHED_DEVICE_ID_ORDER = (
+        8,
+        [0, 1, 4, 5, 6, 7, 2, 3],
+        [0, 1, 6, 7, 2, 3, 4, 5],
+    )
+    assert omni_patches._DEVICE_IDS_BY_RANK_OVERRIDE is None
+
+    parallel_state.initialize_model_parallel(
+        cfg_parallel_size=2, ulysses_degree=4, ring_degree=1
+    )
+    assert observed_groups["sp"] == [[0, 1, 2, 3], [4, 5, 6, 7]]
+    assert observed_groups["cfg"] == [[0, 4], [1, 5], [2, 6], [3, 7]]
+    assert observed_groups["ulysses_rank"] == 2
+    assert observed_groups["ring_rank"] == 0
+    assert get_ring_cfg_validation_state() is None
+
+
+def test_init_device_ring_degree_two_installs_device_order_patch_once(
+    _restore_diffusion_ring_degree_state,
+    _restore_parallel_state_device_order,
+):
+    from vllm_omni.diffusion.worker import diffusion_worker
+
+    import vllm_torchtpu.omni.patches as omni_patches
+
+    diffusion_worker_cls, _ = _restore_diffusion_ring_degree_state
+    parallel_state, group_coordinator = _restore_parallel_state_device_order
+    marker = omni_patches._PARALLEL_DEVICE_ORDER_PATCHED
+
+    patched_during_orig: list[tuple[bool, bool, bool]] = []
+    mp_calls: list[int] = []
+
+    def _fake_orig_init_mp(**kwargs):
+        mp_calls.append(kwargs["ring_degree"])
+
+    parallel_state._initialize_model_parallel = _fake_orig_init_mp
+
+    def _fake_orig_init_device(self):
+        patched_during_orig.append(
+            (
+                getattr(parallel_state.RankGenerator.get_ranks, marker, False),
+                getattr(parallel_state._initialize_model_parallel, marker, False),
+                getattr(group_coordinator.GroupCoordinator.gather, marker, False),
+            )
+        )
+        # Exercise the exact by-name binding imported by diffusion_worker.py.
+        diffusion_worker.initialize_model_parallel(
+            cfg_parallel_size=2,
+            ulysses_degree=2,
+            ring_degree=self.od_config.parallel_config.ring_degree,
+        )
+
+    diffusion_worker_cls.init_device = _fake_orig_init_device
+    OmniTpuPlatform.get_diffusion_worker_cls()
+
+    fake_worker_ring2 = SimpleNamespace(
+        od_config=SimpleNamespace(parallel_config=SimpleNamespace(ring_degree=2))
+    )
+    diffusion_worker_cls.init_device(fake_worker_ring2)
+
+    first_refs = (
+        parallel_state.RankGenerator.get_ranks,
+        parallel_state._initialize_model_parallel,
+        parallel_state.destroy_model_parallel,
+        group_coordinator.GroupCoordinator.all_gather,
+        group_coordinator.GroupCoordinator.gather,
+        group_coordinator.SequenceParallelGroupCoordinator.__init__,
+    )
+    assert all(getattr(fn, marker, False) for fn in first_refs)
+    assert patched_during_orig == [(True, True, True)]
+    assert mp_calls == [2]
+
+    OmniTpuPlatform.get_diffusion_worker_cls()
+    diffusion_worker_cls.init_device(fake_worker_ring2)
+
+    second_refs = (
+        parallel_state.RankGenerator.get_ranks,
+        parallel_state._initialize_model_parallel,
+        parallel_state.destroy_model_parallel,
+        group_coordinator.GroupCoordinator.all_gather,
+        group_coordinator.GroupCoordinator.gather,
+        group_coordinator.SequenceParallelGroupCoordinator.__init__,
+    )
+    for fn1, fn2 in zip(first_refs, second_refs):
+        assert fn1 is fn2
+    assert patched_during_orig == [(True, True, True), (True, True, True)]
+    assert mp_calls == [2, 2]
+
+
+def test_non_ascending_group_raises_early_and_valid_host_layouts_pass(
+    monkeypatch,
+    _restore_parallel_state_device_order,
+):
+    import vllm_torchtpu.omni.patches as omni_patches
+
+    parallel_state, _ = _restore_parallel_state_device_order
+    orig_calls: list[dict[str, object]] = []
+    parallel_state._initialize_model_parallel = lambda **kw: orig_calls.append(kw)
+    omni_patches._patch_parallel_state_device_order()
+
+    # 1. Non-ascending ulysses group [1, 0] raises before orig_init_mp.
+    bad_dev_ids = [1, 0, 4, 5, 6, 7, 2, 3]
+    monkeypatch.setattr(omni_patches, "_DEVICE_IDS_BY_RANK_OVERRIDE", bad_dev_ids)
+    with pytest.raises(RuntimeError) as exc_info:
+        parallel_state.initialize_model_parallel(
+            cfg_parallel_size=2, ring_degree=2, ulysses_degree=2
+        )
+    msg = str(exc_info.value)
+    assert "[1, 0, 4, 5, 6, 7, 2, 3]" in msg
+    assert "[1, 0, 6, 7, 2, 3, 4, 5]" in msg
+    assert "[1, 0]" in msg
+    assert orig_calls == []
+
+    # 2. Non-ascending tp / pp groups also raise before orig_init_mp.
+    with pytest.raises(RuntimeError) as tp_exc:
+        parallel_state.initialize_model_parallel(
+            cfg_parallel_size=2,
+            ring_degree=2,
+            ulysses_degree=1,
+            tensor_parallel_size=2,
+        )
+    assert "[1, 0]" in str(tp_exc.value)
+    assert "[1, 0, 4, 5, 6, 7, 2, 3]" in str(tp_exc.value)
+    assert orig_calls == []
+
+    host_dev_ids = [0, 1, 4, 5, 6, 7, 2, 3]
+    monkeypatch.setattr(omni_patches, "_DEVICE_IDS_BY_RANK_OVERRIDE", host_dev_ids)
+    with pytest.raises(RuntimeError) as pp_exc:
+        parallel_state.initialize_model_parallel(
+            cfg_parallel_size=1,
+            ring_degree=2,
+            ulysses_degree=2,
+            pipeline_parallel_size=2,
+        )
+    assert "[6, 4]" in str(pp_exc.value)
+    assert "[0, 1, 4, 5, 6, 7, 2, 3]" in str(pp_exc.value)
+    assert orig_calls == []
+
+    # 3. Host mapping [0, 1, 4, 5, 6, 7, 2, 3] with c2r2u2, c2r4u1, and c1r2u4 passes.
+    parallel_state.initialize_model_parallel(
+        cfg_parallel_size=2, ring_degree=2, ulysses_degree=2
+    )
+    parallel_state.initialize_model_parallel(
+        cfg_parallel_size=2, ring_degree=4, ulysses_degree=1
+    )
+    parallel_state.initialize_model_parallel(
+        cfg_parallel_size=1, ring_degree=2, ulysses_degree=4
+    )
+    assert len(orig_calls) == 3
+
+
+def test_group_coordinator_gather_reorders_unsorted_group(
+    _restore_parallel_state_device_order,
+):
+    import vllm_torchtpu.omni.patches as omni_patches
+
+    _, group_coordinator = _restore_parallel_state_device_order
+    omni_patches._patch_parallel_state_device_order()
+
+    # Use a 3-cycle [6, 2, 4] (sorted [2, 4, 6]) so order != inverse(order).
+    t_r2 = torch.tensor([[20.0, 21.0]])
+    t_r4 = torch.tensor([[40.0, 41.0]])
+    t_r6 = torch.tensor([[60.0, 61.0]])
+    observed_dsts: list[int] = []
+
+    def _fake_dist_gather(tensor, gather_list=None, dst=0, group=None):
+        observed_dsts.append(dst)
+        if gather_list is not None:
+            for slot, src_t in zip(gather_list, (t_r2, t_r4, t_r6)):
+                slot.copy_(src_t)
+
+    with patch("torch.distributed.gather", side_effect=_fake_dist_gather):
+        gc_dst0 = SimpleNamespace(
+            ranks=[6, 2, 4],
+            world_size=3,
+            rank_in_group=0,
+            device_group="cfg_pg",
+        )
+        out_dim_neg1 = group_coordinator.GroupCoordinator.gather(
+            gc_dst0, t_r6, dst=0, dim=-1
+        )
+        assert out_dim_neg1 is not None
+        assert torch.equal(out_dim_neg1, torch.cat([t_r6, t_r2, t_r4], dim=-1))
+
+        out_dim0 = group_coordinator.GroupCoordinator.gather(
+            gc_dst0, t_r6, dst=0, dim=0
+        )
+        assert out_dim0 is not None
+        assert torch.equal(out_dim0, torch.cat([t_r6, t_r2, t_r4], dim=0))
+
+        gc_dst2 = SimpleNamespace(
+            ranks=[6, 2, 4],
+            world_size=3,
+            rank_in_group=2,
+            device_group="cfg_pg",
+        )
+        out_dst2 = group_coordinator.GroupCoordinator.gather(
+            gc_dst2, t_r4, dst=2, dim=0
+        )
+        assert out_dst2 is not None
+        assert torch.equal(out_dst2, torch.cat([t_r6, t_r2, t_r4], dim=0))
+
+        gc_non_dst = SimpleNamespace(
+            ranks=[6, 2, 4],
+            world_size=3,
+            rank_in_group=1,
+            device_group="cfg_pg",
+        )
+        assert (
+            group_coordinator.GroupCoordinator.gather(gc_non_dst, t_r2, dst=0, dim=0)
+            is None
+        )
+        assert observed_dsts == [6, 6, 4, 6]
+
+        # Sorted group passes through unchanged without reordering.
+        gc_sorted = SimpleNamespace(
+            ranks=[2, 4, 6],
+            world_size=3,
+            rank_in_group=0,
+            device_group="cfg_pg",
+        )
+        out_sorted = group_coordinator.GroupCoordinator.gather(
+            gc_sorted, t_r2, dst=0, dim=0
+        )
+        assert out_sorted is not None
+        assert torch.equal(out_sorted, torch.cat([t_r2, t_r4, t_r6], dim=0))
+
+    # Empty chunk dimension does not fail on split(0).
+    with patch(
+        "torch.distributed.gather",
+        side_effect=lambda tensor, gather_list=None, dst=0, group=None: None,
+    ):
+        empty_in = torch.empty((2, 0), dtype=torch.float32)
+        out_empty = group_coordinator.GroupCoordinator.gather(
+            gc_dst0, empty_in, dst=0, dim=-1
+        )
+        assert out_empty is not None
+        assert out_empty.shape == (2, 0)
+
+
+def test_can_fuse_tpu_ring_ulysses_requires_strict_ulysses_mode(monkeypatch):
+    from vllm_omni.diffusion.forward_context import set_forward_context
+
+    from vllm_torchtpu.omni.attention import can_fuse_tpu_ring_ulysses
+    from vllm_torchtpu.omni.patches import _patch_ring_attention
+
+    monkeypatch.setattr(
+        Attention, "_forward_impl", lambda self, q, k, v, attn_metadata=None: "fallback"
+    )
+    _patch_ring_attention()
+
+    sp_group = SimpleNamespace(ring_world_size=2, ulysses_world_size=2)
+    runner = RingParallelAttention(sp_group, attn_backend_pref="TPU_FLASH_ATTN")
+    strategy = SimpleNamespace(name="ulysses", _scatter_idx=2, _gather_idx=1)
+    layer = _make_ring_attention_layer(ring_runner=runner, strategy=strategy)
+    monkeypatch.setattr(
+        layer, "_get_active_parallel_strategy", lambda: layer.parallel_strategy
+    )
+    monkeypatch.setattr(layer, "is_paged_kv_active", lambda: False)
+
+    q = torch.randn(1, 16, 4, 16, dtype=torch.bfloat16)
+    assert can_fuse_tpu_ring_ulysses(layer, strategy, q, q, q, None) is True
+
+    strict_cfg = SimpleNamespace(parallel_config=SimpleNamespace(ulysses_mode="strict"))
+    with set_forward_context(vllm_config=None, omni_diffusion_config=strict_cfg):
+        assert can_fuse_tpu_ring_ulysses(layer, strategy, q, q, q, None) is True
+
+    uaa_cfg = SimpleNamespace(
+        parallel_config=SimpleNamespace(ulysses_mode="advanced_uaa")
+    )
+    with set_forward_context(vllm_config=None, omni_diffusion_config=uaa_cfg):
+        assert can_fuse_tpu_ring_ulysses(layer, strategy, q, q, q, None) is False
+        assert layer._forward_impl(q, q, q) == "fallback"
