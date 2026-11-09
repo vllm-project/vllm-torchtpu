@@ -36,6 +36,8 @@ from vllm_torchtpu.kernels.gdn.v3.input_layout import Conv1DInput
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
+# Trace-time record of which opt-in raw/zero-out paths were taken (log once each).
+_RAW_PATH_LOGGED: set = set()
 
 
 def _load_raw_rows(
@@ -691,6 +693,14 @@ def fused_conv1d_gdn(
     use_kernel_zero_out = (
         envs.TPU_GDN_KERNEL_ZERO_OUT and zero_initialize_out and not prefill_only
     )
+    if use_raw_qkv or use_raw_ba or use_kernel_zero_out:
+        _key = (use_raw_qkv, use_raw_ba, use_kernel_zero_out, qkv.shape[0])
+        if _key not in _RAW_PATH_LOGGED:
+            _RAW_PATH_LOGGED.add(_key)
+            logger.info(
+                "GDN_RAW_PATH raw_qkv=%s raw_ba=%s kernel_zero_out=%s rows=%d",
+                *_key,
+            )
 
     if not prepared_qkv and not use_raw_qkv:
         qkv = qkv.astype(jnp.float32)
