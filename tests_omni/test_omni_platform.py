@@ -46,6 +46,8 @@ from vllm_torchtpu.omni.attention import (
 from vllm_torchtpu.omni.patches import (
     _BWE_FILTER_CPU_RESTORE_PATCHED,
     _D2H_STREAM_PATCHED,
+    _QWEN_ENCODER_MASK_CACHE_MAXSIZE,
+    _QWEN_IMAGE_MASK_ONCE_PATCHED,
     _SDPA_FALLBACK_PATCHED,
     _SPLIT_ROPE_PATCHED,
     _VOCODER_CPU_INIT_PATCHED,
@@ -53,6 +55,7 @@ from vllm_torchtpu.omni.patches import (
     _patch_diffusion_worker_d2h_stream,
     _patch_ltx2_split_rope,
     _patch_ltx2_vocoder_cpu_init,
+    _patch_qwen_image_mask_once,
     _patch_sdpa_fallback_dispatch,
     apply_omni_model_specific_patches,
     apply_omni_tpu_patches,
@@ -78,6 +81,9 @@ _UPSTREAM_SDPA_FORWARD = SDPAImpl.forward
 _UPSTREAM_ROPE_FORWARD = ltx2_transformer.LTX2AudioVideoRotaryPosEmbed.forward
 _UPSTREAM_APPLY_SPLIT_ROTARY_EMB = ltx2_transformer.apply_split_rotary_emb
 _UPSTREAM_RESTORE_BWE_FILTER = ltx2_runtime._restore_ltx_bwe_resampler_filter
+_UPSTREAM_QWEN_IMAGE_FORWARD = (
+    qwen_image_transformer.QwenImageTransformer2DModel.forward
+)
 
 
 def test_register_omni_tpu_platform(monkeypatch):
@@ -429,6 +435,373 @@ def test_qwen_image_rope_txt_freqs_clone(rope_cls_name):
     assert torch.equal(txt_freqs, rope.pos_freqs[1:4])
     assert txt_freqs.dtype == torch.complex64
     assert vid_freqs.shape == (4, 64)
+
+
+def _make_dummy_qwen_image_transformer(
+    *,
+    sp_size: int = 1,
+    mask_sp_padding: bool = True,
+    zero_cond_t: bool = False,
+):
+    cls = qwen_image_transformer.QwenImageTransformer2DModel
+    model = cls.__new__(cls)
+    torch.nn.Module.__init__(model)
+    model.parallel_config = SimpleNamespace(
+        sequence_parallel_size=sp_size,
+        mask_sp_padding=mask_sp_padding,
+    )
+    model.zero_cond_t = zero_cond_t
+    model.image_rope_prepare = lambda h, img_shapes, txt_seq_lens: (
+        h + 1.0,
+        torch.ones(h.shape[1], 4, device=h.device, dtype=h.dtype),
+        torch.ones(1, 4, device=h.device, dtype=h.dtype),
+    )
+    model.txt_norm = lambda e: e
+    model.txt_in = lambda e: e + 0.5
+    model.modulate_index_prepare = lambda t, img_shapes: (
+        (torch.cat([t, t * 0], dim=0), torch.zeros(1, 4, dtype=torch.int))
+        if zero_cond_t
+        else (t, None)
+    )
+    model.time_text_embed = lambda t, h, add_cond=None: t.unsqueeze(-1).expand(
+        t.shape[0], h.shape[-1]
+    )
+
+    seen_masks: list[tuple[torch.Tensor | None, torch.Tensor | None]] = []
+
+    class _DummyBlock(torch.nn.Module):
+        def forward(
+            self,
+            *,
+            hidden_states,
+            encoder_hidden_states,
+            encoder_hidden_states_mask,
+            temb,
+            image_rotary_emb,
+            joint_attention_kwargs,
+            modulate_index,
+            hidden_states_mask,
+        ):
+            seen_masks.append((encoder_hidden_states_mask, hidden_states_mask))
+            out_h = hidden_states + temb[: hidden_states.shape[0]].unsqueeze(1)
+            if encoder_hidden_states_mask is not None:
+                out_h = out_h + encoder_hidden_states_mask.float().mean(
+                    dim=-1, keepdim=True
+                ).unsqueeze(-1)
+            if hidden_states_mask is not None:
+                out_h = out_h * hidden_states_mask.unsqueeze(-1).to(out_h.dtype)
+            return encoder_hidden_states, out_h
+
+    model.transformer_blocks = torch.nn.ModuleList([_DummyBlock(), _DummyBlock()])
+    model.norm_out = lambda h, temb: h + temb.unsqueeze(1)
+    model.proj_out = lambda h: h * 2.0
+    return model, seen_masks
+
+
+@pytest.fixture
+def qwen_mask_once(monkeypatch):
+    cls = qwen_image_transformer.QwenImageTransformer2DModel
+    monkeypatch.setattr(cls, "forward", _UPSTREAM_QWEN_IMAGE_FORWARD)
+    _patch_qwen_image_mask_once()
+    assert getattr(cls.forward, _QWEN_IMAGE_MASK_ONCE_PATCHED, False)
+    return cls
+
+
+@pytest.mark.parametrize("inference", [False, True], ids=["grad", "inference"])
+def test_qwen_image_mask_once_caches_encoder_mask(
+    monkeypatch, qwen_mask_once, inference
+):
+    model, seen_masks = _make_dummy_qwen_image_transformer()
+
+    # Calling _patch_qwen_image_mask_once again is a no-op.
+    patched_fn = qwen_mask_once.forward
+    _patch_qwen_image_mask_once()
+    assert qwen_mask_once.forward is patched_fn
+
+    monkeypatch.setattr(
+        qwen_image_transformer,
+        "get_forward_context",
+        lambda: SimpleNamespace(
+            sp_original_seq_len=None,
+            sp_padding_size=0,
+            split_text_embed_in_sp=True,
+        ),
+    )
+
+    all_calls = []
+    orig_tensor_all = torch.Tensor.all
+
+    def _spy_all(self, *args, **kwargs):
+        all_calls.append(int(self.data_ptr()))
+        return orig_tensor_all(self, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "all", _spy_all)
+
+    with torch.inference_mode(inference):
+        h = torch.randn(2, 8, 4)
+        e = torch.randn(2, 6, 4)
+        t = torch.tensor([500.0, 500.0])
+        pos_mask = torch.ones((2, 6), dtype=torch.bool)
+        neg_mask = torch.ones((2, 6), dtype=torch.bool)
+        partial_mask = torch.ones((2, 6), dtype=torch.bool)
+        partial_mask[1, 4:] = False
+
+        # 1. All-True positive & negative masks across 4 steps: .all() runs
+        # once per distinct mask tensor, blocks receive None.
+        for _ in range(4):
+            out_pos = model.forward(
+                h,
+                encoder_hidden_states=e,
+                encoder_hidden_states_mask=pos_mask,
+                timestep=t,
+            ).sample
+            out_neg = model.forward(
+                h,
+                encoder_hidden_states=e,
+                encoder_hidden_states_mask=neg_mask,
+                timestep=t,
+            ).sample
+        assert len(all_calls) == 2
+        assert all(enc_m is None and sp_m is None for enc_m, sp_m in seen_masks)
+
+        want_pos = _UPSTREAM_QWEN_IMAGE_FORWARD(
+            model,
+            h,
+            encoder_hidden_states=e,
+            encoder_hidden_states_mask=pos_mask,
+            timestep=t,
+        ).sample
+        assert torch.equal(out_pos, want_pos)
+        assert torch.equal(out_neg, want_pos)
+
+        # 2. Partial-False mask across 4 steps: .all() runs only once (upstream
+        # ran it every step), and blocks receive partial_mask.
+        all_calls.clear()
+        seen_masks.clear()
+        for _ in range(4):
+            out_partial = model.forward(
+                h,
+                encoder_hidden_states=e,
+                encoder_hidden_states_mask=partial_mask,
+                timestep=t,
+            ).sample
+        assert len(all_calls) == 1
+        assert all(enc_m is partial_mask for enc_m, _ in seen_masks)
+
+        want_partial = _UPSTREAM_QWEN_IMAGE_FORWARD(
+            model,
+            h,
+            encoder_hidden_states=e,
+            encoder_hidden_states_mask=partial_mask,
+            timestep=t,
+        ).sample
+        assert torch.equal(out_partial, want_partial)
+
+    if not inference:
+        # In-place mutation of pos_mask invalidates cache and recomputes once.
+        all_calls.clear()
+        seen_masks.clear()
+        pos_mask[0, -1] = False
+        for _ in range(3):
+            model.forward(
+                h,
+                encoder_hidden_states=e,
+                encoder_hidden_states_mask=pos_mask,
+                timestep=t,
+            )
+        assert len(all_calls) == 1
+        assert all(enc_m is pos_mask for enc_m, _ in seen_masks)
+
+
+def test_qwen_image_mask_once_inference_mode_cache_safety(monkeypatch, qwen_mask_once):
+    model, seen_masks = _make_dummy_qwen_image_transformer()
+    monkeypatch.setattr(
+        qwen_image_transformer,
+        "get_forward_context",
+        lambda: SimpleNamespace(
+            sp_original_seq_len=None,
+            sp_padding_size=0,
+            split_text_embed_in_sp=True,
+        ),
+    )
+
+    all_calls = []
+    orig_tensor_all = torch.Tensor.all
+
+    def _spy_all(self, *args, **kwargs):
+        all_calls.append(int(self.untyped_storage().data_ptr()))
+        return orig_tensor_all(self, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "all", _spy_all)
+
+    with torch.inference_mode():
+        h = torch.randn(2, 8, 4)
+        e = torch.randn(2, 4, 4)
+        t = torch.tensor([500.0, 500.0])
+
+        # Inference tensors raise on ._version and views have _base is None.
+        base = torch.tensor(
+            [[True, True, True, True, False, False]] * 2, dtype=torch.bool
+        )
+        assert base.is_inference()
+        with pytest.raises(RuntimeError, match="version"):
+            _ = base._version
+        assert base[:, :4]._base is None
+
+        # Fresh all-True views of the same layout hit without calling .all().
+        for _ in range(3):
+            model.forward(
+                h,
+                encoder_hidden_states=e,
+                encoder_hidden_states_mask=base[:, :4],
+                timestep=t,
+            )
+        assert len(all_calls) == 1
+        assert all(enc_m is None for enc_m, _ in seen_masks)
+
+        # Another slice on the same storage (different storage_offset, contains
+        # False) misses the cache and forwards the caller's exact view object.
+        seen_masks.clear()
+        view_a = base[:, 2:6]
+        view_b = base[:, 2:6]
+        assert view_a is not view_b
+        model.forward(
+            h,
+            encoder_hidden_states=e,
+            encoder_hidden_states_mask=view_a,
+            timestep=t,
+        )
+        model.forward(
+            h,
+            encoder_hidden_states=e,
+            encoder_hidden_states_mask=view_b,
+            timestep=t,
+        )
+        assert len(all_calls) == 2
+        assert seen_masks[0][0] is view_a and seen_masks[2][0] is view_b
+
+        # Bounded LRU eviction across > maxsize temporary inference tensors:
+        # live entries hold strong tensor refs so their addresses cannot be
+        # reused while cached, and cache size stays bounded.
+        for i in range(_QWEN_ENCODER_MASK_CACHE_MAXSIZE + 4):
+            tmp = torch.ones((2, 4), dtype=torch.bool)
+            if i % 2 == 1:
+                tmp[0, -1] = False
+            seen_masks.clear()
+            model.forward(
+                h,
+                encoder_hidden_states=e,
+                encoder_hidden_states_mask=tmp,
+                timestep=t,
+            )
+            want_mask = tmp if i % 2 == 1 else None
+            assert all(enc_m is want_mask for enc_m, _ in seen_masks)
+        assert len(model._tpu_encoder_mask_cache) == _QWEN_ENCODER_MASK_CACHE_MAXSIZE
+
+        # Explicit storage invalidation (resize_(0)) cannot leave a live pointer
+        # matching a stale cache entry.
+        resizable = torch.ones((2, 4), dtype=torch.bool)
+        all_calls.clear()
+        model.forward(
+            h,
+            encoder_hidden_states=e,
+            encoder_hidden_states_mask=resizable,
+            timestep=t,
+        )
+        assert len(all_calls) == 1
+        resizable.untyped_storage().resize_(0)
+        cached_tensors = [entry[0] for entry in model._tpu_encoder_mask_cache.values()]
+        assert any(t is resizable for t in cached_tensors)
+        assert resizable.untyped_storage().data_ptr() == 0
+
+
+def test_qwen_image_mask_once_sp_padding_skips_all(monkeypatch, qwen_mask_once):
+    model, seen_masks = _make_dummy_qwen_image_transformer(
+        sp_size=4, mask_sp_padding=True, zero_cond_t=True
+    )
+
+    ctx = SimpleNamespace(
+        sp_original_seq_len=6,
+        sp_padding_size=2,
+        split_text_embed_in_sp=True,
+    )
+    monkeypatch.setattr(qwen_image_transformer, "get_forward_context", lambda: ctx)
+
+    all_calls = []
+    orig_tensor_all = torch.Tensor.all
+
+    def _spy_all(self, *args, **kwargs):
+        all_calls.append(tuple(self.shape))
+        return orig_tensor_all(self, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "all", _spy_all)
+
+    h = torch.randn(2, 8, 4)
+    e = torch.randn(2, 5, 4)
+    t = torch.tensor([250.0, 250.0])
+
+    for _ in range(3):
+        out = model.forward(
+            h,
+            encoder_hidden_states=e,
+            encoder_hidden_states_mask=None,
+            timestep=t,
+        ).sample
+
+    # Patched forward never calls .all() on hidden_states_mask.
+    assert all_calls == []
+    assert ctx.split_text_embed_in_sp is False
+    assert len(seen_masks) == 6
+    grad_sp_mask = seen_masks[0][1]
+    assert grad_sp_mask is not None and not grad_sp_mask.is_inference()
+    assert grad_sp_mask.shape == (2, 8)
+    assert bool(orig_tensor_all(grad_sp_mask[:, :6]))
+    assert not bool(grad_sp_mask[:, 6:].any())
+    assert all(sp_m is grad_sp_mask for _, sp_m in seen_masks)
+
+    # Under torch.inference_mode(), SP mask is rebuilt as an inference tensor
+    # and cached separately from grad mode.
+    seen_masks.clear()
+    with torch.inference_mode():
+        for _ in range(2):
+            out_inf = model.forward(
+                h,
+                encoder_hidden_states=e,
+                encoder_hidden_states_mask=None,
+                timestep=t,
+            ).sample
+    assert all_calls == []
+    inf_sp_mask = seen_masks[0][1]
+    assert inf_sp_mask is not None and inf_sp_mask.is_inference()
+    assert inf_sp_mask is not grad_sp_mask
+    assert all(sp_m is inf_sp_mask for _, sp_m in seen_masks)
+    assert torch.equal(out_inf, out)
+
+    want = _UPSTREAM_QWEN_IMAGE_FORWARD(
+        model,
+        h,
+        encoder_hidden_states=e,
+        encoder_hidden_states_mask=None,
+        timestep=t,
+    ).sample
+    assert torch.equal(out, want)
+    # Upstream forward did call .all() on hidden_states_mask.
+    assert all_calls == [(2, 8)]
+
+    # Degenerate batch_size == 0 keeps hidden_states_mask=None without .all().
+    all_calls.clear()
+    seen_masks.clear()
+    h_empty = torch.empty((0, 8, 4))
+    e_empty = torch.empty((0, 5, 4))
+    t_empty = torch.empty((0,))
+    model.forward(
+        h_empty,
+        encoder_hidden_states=e_empty,
+        encoder_hidden_states_mask=torch.ones((0, 5), dtype=torch.bool),
+        timestep=t_empty,
+    )
+    assert all_calls == []
+    assert all(enc_m is None and sp_m is None for enc_m, sp_m in seen_masks)
 
 
 @pytest.mark.parametrize(

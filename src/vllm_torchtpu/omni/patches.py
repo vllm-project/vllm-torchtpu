@@ -83,6 +83,7 @@ def apply_omni_model_specific_patches() -> None:
     _patch_wan_fused_qk_norm_rope()
     _patch_wan_fresh_timestep()
     _patch_sdpa_fallback_dispatch()
+    _patch_qwen_image_mask_once()
     _patch_ltx2_vocoder_cpu_init()
 
 
@@ -645,3 +646,228 @@ def _patch_ltx2_split_rope() -> None:
     rope_cls.forward = _cached_rope_forward
     ltx2_transformer.apply_split_rotary_emb = _apply_split_rotary_emb
     logger.info("Applied TPU patch: cached LTX-2 split RoPE on the q/k layout.")
+
+
+_QWEN_IMAGE_MASK_ONCE_PATCHED = "_tpu_qwen_image_mask_once_patched"
+_QWEN_ENCODER_MASK_CACHE_MAXSIZE = 8
+
+
+def _storage_data_ptr(tensor: torch.Tensor) -> int:
+    try:
+        return int(tensor.untyped_storage().data_ptr())
+    except RuntimeError:
+        return int(tensor.data_ptr())
+
+
+def _mask_cache_key(mask: torch.Tensor) -> tuple[Any, ...]:
+    version = None if mask.is_inference() else mask._version
+    return (
+        _storage_data_ptr(mask),
+        version,
+        mask.storage_offset(),
+        tuple(mask.shape),
+        tuple(mask.stride()),
+        mask.dtype,
+        mask.device,
+    )
+
+
+def _resolve_qwen_encoder_mask(
+    model: Any,
+    mask: torch.Tensor | None,
+) -> torch.Tensor | None:
+    if mask is None or mask.numel() == 0:
+        return None
+    cache: dict[tuple[Any, ...], tuple[torch.Tensor, bool]] | None = getattr(
+        model, "_tpu_encoder_mask_cache", None
+    )
+    if cache is None:
+        cache = {}
+        model._tpu_encoder_mask_cache = cache
+    key = _mask_cache_key(mask)
+    if key[0] != 0:
+        cached = cache.get(key)
+        if cached is not None and _storage_data_ptr(cached[0]) == key[0]:
+            cache[key] = cache.pop(key)
+            return None if cached[1] else mask
+    is_all_true = bool(mask.all())
+    if key[0] != 0:
+        if len(cache) >= _QWEN_ENCODER_MASK_CACHE_MAXSIZE and key not in cache:
+            del cache[next(iter(cache))]
+        cache[key] = (mask, is_all_true)
+    return None if is_all_true else mask
+
+
+def _patch_qwen_image_mask_once() -> None:
+    # -------------------------------------------------------------------------
+    # TODO: Remove once vLLM-Omni resolves Qwen-Image prompt and SP padding
+    # masks without per-step .all() device-to-host synchronizations.
+    #
+    # Problem: QwenImageTransformer2DModel.forward evaluates
+    #   encoder_hidden_states_mask.all() on every denoising step after queueing
+    #   image/text input projections and timestep embeddings, forcing a
+    #   mid-step TPU device-to-host sync across all steps even though
+    #   cfg_parallel and the pipeline pass the same prompt mask tensor each
+    #   step. In addition, when sequence-parallel padding is active
+    #   (ctx.sp_padding_size > 0), forward sets
+    #   hidden_states_mask[:, ctx.sp_original_seq_len:] = False and then calls
+    #   hidden_states_mask.all(), which is provably False for non-empty batches
+    #   yet triggers another device-to-host sync every step.
+    # Fix: Resolve encoder_hidden_states_mask once per tensor storage/version/
+    #   layout at the start of forward (holding the tensor reference in a
+    #   bounded LRU cache so freed addresses are never falsely matched under
+    #   torch.inference_mode()), construct/cache the SP padding mask without
+    #   calling .all(), and issue a non-blocking step-entry flush with
+    #   synchronize_tensors(..., wait=False).
+    # -------------------------------------------------------------------------
+    from vllm_omni.diffusion.models.qwen_image import (
+        qwen_image_transformer as qwen_mod,
+    )
+
+    cls = qwen_mod.QwenImageTransformer2DModel
+    if getattr(cls.forward, _QWEN_IMAGE_MASK_ONCE_PATCHED, False):
+        return
+
+    def _forward(
+        self: Any,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor | None = None,
+        encoder_hidden_states_mask: torch.Tensor | None = None,
+        timestep: torch.Tensor | None = None,
+        img_shapes: list[tuple[int, int, int]] | None = None,
+        txt_seq_lens: list[int] | None = None,
+        guidance: torch.Tensor | None = None,
+        attention_kwargs: dict[str, Any] | None = None,
+        additional_t_cond: Any = None,
+        return_dict: bool = True,
+    ) -> Any:
+        encoder_hidden_states_mask = _resolve_qwen_encoder_mask(
+            self, encoder_hidden_states_mask
+        )
+
+        if (
+            self.parallel_config is not None
+            and self.parallel_config.sequence_parallel_size > 1
+        ):
+            qwen_mod.get_forward_context().split_text_embed_in_sp = False
+
+        hidden_states, vid_freqs, txt_freqs = self.image_rope_prepare(
+            hidden_states, img_shapes, txt_seq_lens
+        )
+        image_rotary_emb = (vid_freqs, txt_freqs)
+
+        assert timestep is not None
+        timestep = timestep.to(device=hidden_states.device, dtype=hidden_states.dtype)
+
+        timestep, modulate_index = self.modulate_index_prepare(timestep, img_shapes)
+
+        encoder_hidden_states = self.txt_norm(encoder_hidden_states)
+        encoder_hidden_states = self.txt_in(encoder_hidden_states)
+
+        if guidance is not None:
+            guidance = guidance.to(hidden_states.dtype) * 1000
+
+        temb = (
+            self.time_text_embed(timestep, hidden_states, additional_t_cond)
+            if guidance is None
+            else self.time_text_embed(
+                timestep, guidance, hidden_states, additional_t_cond
+            )
+        )
+
+        hidden_states_mask = None
+        ctx = qwen_mod.get_forward_context()
+        if (
+            self.parallel_config is not None
+            and self.parallel_config.sequence_parallel_size > 1
+            and self.parallel_config.mask_sp_padding
+            and ctx.sp_original_seq_len is not None
+            and ctx.sp_padding_size > 0
+        ):
+            batch_size = hidden_states.shape[0]
+            if batch_size > 0:
+                sp_key = (
+                    batch_size,
+                    ctx.sp_original_seq_len,
+                    ctx.sp_padding_size,
+                    hidden_states.device,
+                    torch.is_inference_mode_enabled(),
+                )
+                sp_cache = getattr(self, "_tpu_sp_padding_mask_cache", None)
+                if sp_cache is None or sp_cache[0] != sp_key:
+                    padded_seq_len = ctx.sp_original_seq_len + ctx.sp_padding_size
+                    hidden_states_mask = torch.ones(
+                        batch_size,
+                        padded_seq_len,
+                        dtype=torch.bool,
+                        device=hidden_states.device,
+                    )
+                    hidden_states_mask[:, ctx.sp_original_seq_len :] = False
+                    self._tpu_sp_padding_mask_cache = (
+                        sp_key,
+                        hidden_states_mask,
+                    )
+                else:
+                    hidden_states_mask = sp_cache[1]
+        elif (
+            self.parallel_config is not None
+            and self.parallel_config.sequence_parallel_size > 1
+            and not self.parallel_config.mask_sp_padding
+            and ctx.sp_original_seq_len is not None
+            and ctx.sp_padding_size > 0
+        ):
+            qwen_mod.logger.warning_once(
+                "SP auto-padding applied %d token(s) (seq_len=%d, "
+                "ulysses_degree=%d). Padding tokens are not masked from "
+                "attention (mask_sp_padding=False), which avoids the varlen "
+                "attention path but may produce minor numerical differences. "
+                "Set parallel_config.mask_sp_padding=True to restore strict "
+                "masking.",
+                ctx.sp_padding_size,
+                ctx.sp_original_seq_len,
+                self.parallel_config.sequence_parallel_size,
+            )
+
+        if hidden_states.device.type == "tpu":
+            from vllm_torchtpu.utils import synchronize_tensors
+
+            sync_tensors = [
+                t
+                for t in (
+                    hidden_states,
+                    encoder_hidden_states,
+                    temb,
+                    vid_freqs,
+                    txt_freqs,
+                    modulate_index,
+                    hidden_states_mask,
+                )
+                if t is not None
+                and isinstance(t, torch.Tensor)
+                and t.device.type == "tpu"
+            ]
+            if sync_tensors:
+                synchronize_tensors(sync_tensors, wait=False)
+
+        for block in self.transformer_blocks:
+            encoder_hidden_states, hidden_states = block(
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_hidden_states_mask=encoder_hidden_states_mask,
+                temb=temb,
+                image_rotary_emb=image_rotary_emb,
+                joint_attention_kwargs=attention_kwargs,
+                modulate_index=modulate_index,
+                hidden_states_mask=hidden_states_mask,
+            )
+
+        if self.zero_cond_t:
+            temb = temb.chunk(2, dim=0)[0]
+        hidden_states = self.norm_out(hidden_states, temb)
+        output = self.proj_out(hidden_states)
+
+        return qwen_mod.Transformer2DModelOutput(sample=output)
+
+    setattr(_forward, _QWEN_IMAGE_MASK_ONCE_PATCHED, True)
+    cls.forward = _forward
+    logger.info("Applied TPU patch: Qwen-Image one-shot mask resolution.")
