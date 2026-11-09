@@ -226,6 +226,17 @@ class TileSizes:
     tile_k: int
     tile_n: int
     bucket_base: int
+    # Row counts a tile can end at, ascending, the last one tile_m. None means
+    # every multiple of bucket_base.
+    buckets: tuple[int, ...] | None = None
+
+    @property
+    def bucket_sizes(self) -> tuple[int, ...]:
+        if self.buckets is not None:
+            return self.buckets
+        return tuple(
+            range(self.bucket_base, self.tile_m + 1, self.bucket_base)
+        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -249,6 +260,13 @@ class Dimensions:
 SKINNY_DEQUANT_AFTER_MATMUL_M = 256
 # Blocks shallower than this make the per-block matmuls too small.
 MIN_DEQUANT_AFTER_MATMUL_BLOCK = 128
+# Larger calls keep the before-matmul path for full tiles but scale the
+# partials of tiles ending at or below this many rows. An EP decode call is
+# sized for every route (c64: 1024-2048 rows) while each local expert gets a
+# few (~8-16), so its tiles are skinny although size_m is not. Converting
+# each weight element once per tile, the after path is cheaper while the
+# per-block [rows, tn] epilogue stays under the weight-scale multiply.
+HYBRID_DEQUANT_AFTER_MATMUL_MAX_ROWS = 64
 
 
 @dataclasses.dataclass(frozen=True)
@@ -261,6 +279,10 @@ class InputConfigs:
     # Scale each block's matmul partial instead of the dequantized weights
     # (see `SKINNY_DEQUANT_AFTER_MATMUL_M`).
     dequantize_after_matmul: bool = False
+    # Dequantize before the matmul, except in tiles ending at or below this
+    # many rows, which scale the partials (see
+    # `HYBRID_DEQUANT_AFTER_MATMUL_MAX_ROWS`). 0 disables.
+    hybrid_after_max_rows: int = 0
 
     @property
     def should_unpack(self) -> bool:
@@ -465,7 +487,11 @@ def inner_kernel(
         # contracting dimmensions
         rhs_tile_n = tiled_rhs.shape[1]
         rhs_qbs = cfgs.rhs_cfgs.quant_block_size
-        if cfgs.rhs_cfgs.should_dequantize_before_matmul:
+        dequant_before = cfgs.rhs_cfgs.should_dequantize_before_matmul and not (
+            bucket_m <= cfgs.rhs_cfgs.hybrid_after_max_rows
+        )
+        dequant_after = cfgs.rhs_cfgs.has_scale and not dequant_before
+        if dequant_before:
             tiled_rhs_scale = tiled_rhs_ref.get_scale(replicate_size=rhs_qbs).astype(
                 cfgs.lhs_cfgs.dtype
             )
@@ -500,7 +526,7 @@ def inner_kernel(
                         preferred_element_type=jnp.float32,
                     ).astype(acc_ref.dtype)
 
-                    if cfgs.rhs_cfgs.should_dequantize_after_matmul:
+                    if dequant_after:
                         b_id = start_k // rhs_qbs
                         rhs_scale_replicated = tiled_rhs_ref.get_scale(
                             replicate_size=bucket_m
@@ -566,7 +592,7 @@ def inner_kernel(
                     block_acc *= block_scale.astype(acc_ref.dtype)
 
                     # Apply rhs subchannel scale per quant block.
-                    if cfgs.rhs_cfgs.should_dequantize_after_matmul:
+                    if dequant_after:
                         b_id = start_k // rhs_qbs
                         rhs_scale_replicated = tiled_rhs_ref.get_scale(
                             replicate_size=bucket_m
@@ -628,8 +654,7 @@ def inner_kernel(
         else:
             acc_ref[:acc_m] = acc
 
-    def run_matmul_step(bucket_idx: int):
-        bucket_m = cfgs.tiles.bucket_base * (bucket_idx + 1)
+    def run_matmul_step(bucket_m: int):
 
         @jax.named_scope(f"bm{bucket_m}_first_last")
         def matmul_first_last():
@@ -662,10 +687,17 @@ def inner_kernel(
             # partial m is only invoked at last matmul.
             lax.cond(is_first_k_step, matmul_first_last, matmul_last)
 
-    branches = []
-    for bucket_idx in range(cfgs.tiles.tile_m // cfgs.tiles.bucket_base):
-        branches.append(functools.partial(run_matmul_step, bucket_idx=bucket_idx))
-    bucket_idx = m_end_local // cfgs.tiles.bucket_base
+    bucket_sizes = cfgs.tiles.bucket_sizes
+    if cfgs.tiles.buckets is None:
+        bucket_idx = m_end_local // cfgs.tiles.bucket_base
+    else:
+        # First bucket holding rows [0, m_end_local).
+        bucket_idx = sum(
+            (m_end_local > b).astype(jnp.int32) for b in bucket_sizes[:-1]
+        )
+    branches = [
+        functools.partial(run_matmul_step, bucket_m=b) for b in bucket_sizes
+    ]
     lax.switch(bucket_idx, branches)
 
 
@@ -1077,8 +1109,25 @@ def calculate_tiling(
             break
         tile_m = new_tile_m
 
+    buckets = None
+    max_after = rhs_cfgs.hybrid_after_max_rows
+    if max_after:
+        # Skinny tiles (scaled after the matmul) end at the next lhs sublane
+        # block; the rest at multiples of bucket_base.
+        sublane = _get_lhs_sublane_size(lhs_cfgs.dtype, dims.size_m)
+        max_after = min(max_after, tile_m)
+        small = range(sublane, max_after + 1, sublane)
+        large = range(bucket_base, tile_m + 1, bucket_base)
+        buckets = tuple(sorted({*small, *(b for b in large if b > max_after)}))
+        if buckets[-1] != tile_m:
+            buckets = None
+
     return TileSizes(
-        tile_m=tile_m, tile_k=tile_k, tile_n=tile_n, bucket_base=bucket_base
+        tile_m=tile_m,
+        tile_k=tile_k,
+        tile_n=tile_n,
+        bucket_base=bucket_base,
+        buckets=buckets,
     )
 
 
@@ -1215,17 +1264,23 @@ def make_gmm_configs(
         has_scale = False
         block_size = dims.size_k
 
+    after_matmul_ok = (
+        has_scale
+        and not maybe_quantize_lhs
+        and block_size >= MIN_DEQUANT_AFTER_MATMUL_BLOCK
+    )
+    skinny = after_matmul_ok and dims.size_m <= SKINNY_DEQUANT_AFTER_MATMUL_M
     rhs_cfgs = InputConfigs(
         quant_dtype=rhs_quant_dtype,
         quant_block_size=block_size,
         dtype=rhs.dtype,
         has_bias=rhs_bias is not None,
         has_scale=has_scale,
-        dequantize_after_matmul=(
-            has_scale
-            and not maybe_quantize_lhs
-            and block_size >= MIN_DEQUANT_AFTER_MATMUL_BLOCK
-            and dims.size_m <= SKINNY_DEQUANT_AFTER_MATMUL_M
+        dequantize_after_matmul=skinny,
+        hybrid_after_max_rows=(
+            HYBRID_DEQUANT_AFTER_MATMUL_MAX_ROWS
+            if after_matmul_ok and not skinny
+            else 0
         ),
     )
 

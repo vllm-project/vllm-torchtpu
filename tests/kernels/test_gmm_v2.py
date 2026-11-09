@@ -25,11 +25,15 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.megablox.gmm_v2 import (
+    HYBRID_DEQUANT_AFTER_MATMUL_MAX_ROWS,
     TileSizes,
     apply_act_fn,
+    calculate_tiling,
     gmm_v2,
+    make_gmm_configs,
     interleave_lane,
     situ_and_mul,
 )
@@ -313,6 +317,89 @@ def test_gmm_fused_activation_matches_reference(fuse_act):
 
     assert actual.shape == (batch_size, final_out_size)
     _assert_allclose(actual, expected, atol=4.0, rtol=2.0)
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("fuse_act", [None, "swigluoai"])
+def test_gmm_fp4_hybrid_dequant_matches_reference(fuse_act):
+    """EP decode shape: an lhs sized for every route, few rows per local
+    expert. Tiles ending at <= HYBRID_DEQUANT_AFTER_MATMUL_MAX_ROWS rows scale
+    the block-128 partials, larger ones dequantize the weights first; the
+    group sizes cover both, plus empty groups and rows past every group."""
+    _require_tpu()
+
+    size_m = 1024
+    in_size = 1024
+    out_size = 512
+    block_size = 128
+    # 16 local groups: skinny (<= 64), large (> 64, > tile_m) and empty.
+    sizes = [3, 8, 16, 17, 64, 65, 100, 1, 0, 40, 250, 30, 5, 128, 70, 97]
+    group_sizes = jnp.array(sizes, dtype=jnp.int32)
+    num_groups = len(sizes)
+    num_rows = sum(sizes)
+    assert num_rows < size_m
+    group_offset = jnp.array([0], dtype=jnp.int32)
+    key = jax.random.key(0)
+    k_lhs, k_rhs = jax.random.split(key)
+
+    lhs = jax.random.uniform(k_lhs, (size_m, in_size), jnp.bfloat16, -1, 1)
+    rhs = jax.random.uniform(
+        k_rhs, (num_groups, in_size, out_size), jnp.float32, -1, 1
+    )
+    rhs_q, rhs_scale = quantize_tensor(
+        rhs, jnp.float4_e2m1fn, axis=1, block_size=block_size
+    )
+    rhs_scale = jnp.expand_dims(rhs_scale, axis=2)
+
+    cfgs = make_gmm_configs(
+        lhs,
+        rhs_q,
+        rhs_scale,
+        None,
+        group_sizes,
+        group_offset,
+        tile_info=calculate_tiling,
+        vmem_limit_bytes=int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.9),
+        out_dtype=None,
+        acc_dtype=None,
+        maybe_quantize_lhs=False,
+        zero_initialize=False,
+        fuse_act=fuse_act,
+    )
+    assert cfgs.rhs_cfgs.should_dequantize_before_matmul
+    assert cfgs.rhs_cfgs.hybrid_after_max_rows == HYBRID_DEQUANT_AFTER_MATMUL_MAX_ROWS
+    assert cfgs.tiles.buckets is not None
+    assert cfgs.tiles.buckets[0] < HYBRID_DEQUANT_AFTER_MATMUL_MAX_ROWS
+    assert cfgs.tiles.buckets[-1] == cfgs.tiles.tile_m
+
+    raw_expected = reference_gmm(
+        lhs[:num_rows],
+        rhs_q,
+        group_sizes,
+        rhs_scale=rhs_scale,
+        group_offset=group_offset,
+    ).astype(jnp.float32)
+    if fuse_act is None:
+        expected = raw_expected
+    else:
+        raw_gate, raw_up = jnp.split(raw_expected, 2, axis=-1)
+        expected = apply_act_fn(interleave_lane(raw_gate, raw_up), fuse_act)
+
+    actual = gmm_v2(
+        lhs,
+        rhs_q,
+        group_sizes,
+        rhs_scale=rhs_scale,
+        group_offset=group_offset,
+        maybe_quantize_lhs=False,
+        zero_initialize=False,
+        fuse_act=fuse_act,
+    )[:num_rows].astype(jnp.float32)
+
+    err = jnp.max(jnp.abs(actual - expected))
+    ref = jnp.max(jnp.abs(expected))
+    # bf16 output, and the before path rounds the scaled weight to bf16.
+    assert float(err) <= 1e-2 * float(ref), (float(err), float(ref))
 
 
 @pytest.mark.tpu_test
