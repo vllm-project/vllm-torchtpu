@@ -29,7 +29,6 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-
 from vllm_torchtpu.omni import attention as omni_attention
 from vllm_torchtpu.omni import patches
 from vllm_torchtpu.omni import rope as omni_rope
@@ -86,8 +85,12 @@ def _wan_qk_norm_rope(
     swap = omni_rope._pair_swap_matrix(head_dim, qkv.dtype, qkv.device)
     outs = []
     for j, w in ((0, wq), (1, wk)):
-        y = _rms_norm(qkv[:, j * dim : (j + 1) * dim], w, eps).unflatten(1, (-1, head_dim))
-        outs.append((y * cos[:, None] + (y @ swap) * sin[:, None]).flatten(1).to(qkv.dtype))
+        y = _rms_norm(qkv[:, j * dim : (j + 1) * dim], w, eps).unflatten(
+            1, (-1, head_dim)
+        )
+        outs.append(
+            (y * cos[:, None] + (y @ swap) * sin[:, None]).flatten(1).to(qkv.dtype)
+        )
     return outs[0], outs[1]
 
 
@@ -209,7 +212,9 @@ class _TinyWanBlock(torch.nn.Module):
         self.to_kv = torch.nn.Linear(dim, 2 * dim)
         self.cross = _AttentionLayer(_flash_impl(num_heads, head_dim))
         # A causal layer always takes the SDPA fallback (and its warning).
-        self.cross_fallback = _AttentionLayer(_flash_impl(num_heads, head_dim, causal=True))
+        self.cross_fallback = _AttentionLayer(
+            _flash_impl(num_heads, head_dim, causal=True)
+        )
         self.to_out = torch.nn.Linear(dim, dim)
         self.ffn_in = wan.ColumnParallelGELU(dim, ffn_dim)
         self.ffn_out = torch.nn.Linear(ffn_dim, dim)
@@ -283,16 +288,26 @@ def test_tiny_wan_block_traces_as_one_graph(tiny_wan_block):
         out = compiled(*inputs)
     assert len(graphs) == 1
     # Every patched TPU path ran inside the graph.
-    assert eager_calls == {"qk_norm_rope": 1, "flash_attention": 2, "optimization_barrier": 1}
-    assert _CALLS == eager_calls
+    assert eager_calls == {
+        "qk_norm_rope": 1,
+        "flash_attention": 2,
+        "optimization_barrier": 1,
+    }
+    assert eager_calls == _CALLS
     targets = {str(n.target) for n in graphs[0].graph.nodes if n.op == "call_function"}
-    for op in ("o15test.flash_attention", "o15test.wan_qk_norm_rope", "o15test.optimization_barrier"):
+    for op in (
+        "o15test.flash_attention",
+        "o15test.wan_qk_norm_rope",
+        "o15test.optimization_barrier",
+    ):
         assert any(op in t for t in targets), (op, sorted(targets))
     torch.testing.assert_close(out, eager)
 
 
 def test_tiny_wan_block_does_not_recompile_across_steps(tiny_wan_block):
-    compiled = torch.compile(tiny_wan_block, backend="eager", fullgraph=True, dynamic=False)
+    compiled = torch.compile(
+        tiny_wan_block, backend="eager", fullgraph=True, dynamic=False
+    )
     with torch.no_grad():
         compiled(*_inputs())
         with torch._dynamo.config.patch(error_on_recompile=True):
@@ -310,7 +325,56 @@ def test_op_accessors_are_not_functools_caches():
 def test_op_accessors_build_once(monkeypatch):
     built = []
     monkeypatch.setattr(omni_rope, "_qk_norm_rope", None)
-    monkeypatch.setattr(omni_rope, "_build_qk_norm_rope_op", lambda: built.append(1) or "op")
+    monkeypatch.setattr(
+        omni_rope, "_build_qk_norm_rope_op", lambda: built.append(1) or "op"
+    )
     assert omni_rope._qk_norm_rope_op() == "op"
     assert omni_rope._qk_norm_rope_op() == "op"
     assert built == [1]
+
+
+def test_tiny_flux_tp_single_block_traces_as_one_graph(tiny_wan_block):
+    # Exercises FluxSingleTransformerBlock structure under functional TP
+    # collectives (all_gather_into_tensor + all_reduce) + pair-swap RoPE +
+    # TpuFlashAttentionImpl with fullgraph=True.
+    import torch.distributed._functional_collectives as funcol
+
+    dim = 128
+    num_heads = 2
+    head_dim = dim // num_heads
+    rope_mod = tiny_wan_block.rope
+    attn_layer = _AttentionLayer(_flash_impl(num_heads, head_dim))
+    qkv_proj = torch.nn.Linear(dim, 3 * dim, dtype=torch.bfloat16)
+    mlp_proj = torch.nn.Linear(dim, 2 * dim, dtype=torch.bfloat16)
+    out_proj = torch.nn.Linear(3 * dim, dim, dtype=torch.bfloat16)
+
+    def flux_single_block(hidden_states, encoder_hidden_states, cos, sin):
+        txt_len = encoder_hidden_states.shape[1]
+        cat = torch.cat([encoder_hidden_states, hidden_states], dim=1)
+        q, k, v = qkv_proj(cat).chunk(3, dim=-1)
+        q = rope_mod(q.unflatten(-1, (num_heads, head_dim)), cos, sin)
+        k = rope_mod(k.unflatten(-1, (num_heads, head_dim)), cos, sin)
+        v = v.unflatten(-1, (num_heads, head_dim))
+        attn_out = attn_layer(q, k, v).flatten(2, 3)
+        # Single-rank functional collective no-ops trace through the same
+        # Dynamo collective path as multi-rank TP.
+        if torch.distributed.is_initialized():
+            attn_out = funcol.all_reduce(attn_out, "sum", group=[0])
+        mlp_out = F.gelu(mlp_proj(cat), approximate="tanh")
+        out = cat + out_proj(torch.cat([attn_out, mlp_out], dim=-1))
+        return out[:, :txt_len], out[:, txt_len:]
+
+    h = torch.randn(1, 16, dim, dtype=torch.bfloat16)
+    eh = torch.randn(1, 8, dim, dtype=torch.bfloat16)
+    cos = torch.ones(1, 24, 1, head_dim // 2, dtype=torch.bfloat16)
+    sin = torch.zeros(1, 24, 1, head_dim // 2, dtype=torch.bfloat16)
+
+    explanation = torch._dynamo.explain(flux_single_block)(h, eh, cos, sin)
+    assert explanation.graph_count == 1
+    assert explanation.graph_break_count == 0
+
+    compiled = torch.compile(flux_single_block, backend="eager", fullgraph=True)
+    eh_c, h_c = compiled(h, eh, cos, sin)
+    eh_r, h_r = flux_single_block(h, eh, cos, sin)
+    torch.testing.assert_close(eh_c, eh_r, rtol=0, atol=0)
+    torch.testing.assert_close(h_c, h_r, rtol=0, atol=0)

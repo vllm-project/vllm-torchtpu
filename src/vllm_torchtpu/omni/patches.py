@@ -44,8 +44,19 @@ OMNI_COMPILE_MODES = ("0", "regional", "full")
 OMNI_COMPILE_SPMD_SAFE_ENV = "VLLM_TORCHTPU_OMNI_COMPILE_SPMD_SAFE"
 SPMD_SAFE_CACHE_TAG = "spmd-safe-regions-v1"
 # DiTs whose repeated blocks issue the same TPU ops and collectives, in the
-# same order and with the same shapes, on every sequence-parallel rank.
-_SPMD_SAFE_DIT_CLASSES = frozenset({"WanTransformer3DModel"})
+# same order and with the same shapes, on every TP or sequence-parallel rank.
+_SPMD_SAFE_DIT_CLASSES = frozenset(
+    {
+        "Flux2Transformer2DModel",
+        "FluxTransformer2DModel",
+        "QwenImageTransformer2DModel",
+        "WanTransformer3DModel",
+    }
+)
+# Repeated block classes omitted from upstream _repeated_blocks lists.
+_EXTRA_REPEATED_BLOCKS: dict[str, tuple[str, ...]] = {
+    "FluxTransformer2DModel": ("FluxSingleTransformerBlock",),
+}
 
 
 def omni_compile_mode() -> str:
@@ -188,6 +199,7 @@ def tpu_compile_transformer(runner: Any, attr_name: str) -> None:
             model.compile(**compile_kwargs)
             compiled_model = model
         else:
+            _ensure_extra_repeated_blocks(model)
             spmd_regions = _wrap_spmd_safe_regions(model)
             compiled_model = regionally_compile(model, **compile_kwargs)
             _feed_offset0_inputs(spmd_regions)
@@ -229,6 +241,18 @@ def _build_dit_ops_eagerly() -> None:
             build()
         except Exception as e:
             logger.warning("Could not prebuild %s: %s", build.__name__, e)
+
+
+def _ensure_extra_repeated_blocks(model: torch.nn.Module) -> None:
+    extras = _EXTRA_REPEATED_BLOCKS.get(type(model).__name__)
+    if not extras:
+        return
+    current = list(getattr(model, "_repeated_blocks", None) or ())
+    if not current:
+        return
+    missing = [name for name in extras if name not in current]
+    if missing:
+        model._repeated_blocks = [*current, *missing]
 
 
 def _region_forward_attr(block: torch.nn.Module) -> str:
@@ -369,7 +393,6 @@ def apply_omni_tpu_patches() -> None:
     #    completes before COMPUTE_DONE.
     # 2. AOT compilation caching stabilizes startup compile times.
     # -------------------------------------------------------------------------
-    import os
 
     os.environ.setdefault("VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT", "1800.0")
     logger.info("Applied TPU patch: extended VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT to 1800s.")
