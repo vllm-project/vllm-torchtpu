@@ -86,8 +86,8 @@ MODEL=Qwen/Qwen3.5-397B-A17B-FP8 \
 MODE=mtp MODEL=... src/vllm_torchtpu/models/qwen3_5/megakernel/serving/serve.sh
 ```
 
-`serve.sh` holds the candidate30 serving configuration. The flags the
-megakernel needs:
+`serve.sh` holds the Qwen3.5-397B-A17B-FP8 serving configuration on TPU
+v7x-8. The flags the megakernel needs:
 
 - `VLLM_TPU_MEGAKERNEL=1` (on; the template is picked from the checkpoint's
   architecture), with the runner settings `serve.sh` exports

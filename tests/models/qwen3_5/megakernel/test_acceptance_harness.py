@@ -455,8 +455,12 @@ def test_gsm8k_separate_pass_real_rejection_sampling_and_spread(capsys):
 
 def test_acceptance_script_stdlib_and_template_hygiene():
     assert HARNESS_PATH.is_file()
-    # Ensure no unintended __init__.py was added before template package creation.
-    assert not (HARNESS_PATH.parent / "__init__.py").exists()
+    # `serving/` is a package (its `__init__` is a docstring only), so the
+    # harness must stay importable-free: it loads nothing from the template.
+    init = HARNESS_PATH.parent / "__init__.py"
+    assert init.is_file()
+    init_tree = ast.parse(init.read_text(encoding="utf-8"))
+    assert len(init_tree.body) == 1 and isinstance(init_tree.body[0], ast.Expr)
 
     src = HARNESS_PATH.read_text(encoding="utf-8")
     tree = ast.parse(src, filename=str(HARNESS_PATH))

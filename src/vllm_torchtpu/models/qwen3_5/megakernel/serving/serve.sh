@@ -14,8 +14,8 @@
 # limitations under the License.
 #
 # Serve Qwen3.5-397B-A17B-FP8 with the Qwen3.5 megakernel on one TPU v7x host
-# (TP=8 over 4 chips). The flags are the candidate30 serving configuration the
-# template is validated with; see README.md.
+# (TP=8 over 4 chips). The flags are the template's validated
+# Qwen3.5-397B-A17B-FP8 serving configuration on TPU v7x-8; see README.md.
 #
 #   MODEL=<checkpoint dir or HF id> [MODE=decode|mtp] [PORT=8000] serving/serve.sh [extra vllm args]
 #

@@ -33,7 +33,6 @@ _DATA = (
     "README.md",
     "serving/serve.sh",
     "serving/run_real_ckpt_smoke.py",
-    "serving/acceptance_benchmark.py",
     "serving/BENCH.md",
 )
 
