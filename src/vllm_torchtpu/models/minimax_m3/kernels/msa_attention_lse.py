@@ -283,6 +283,7 @@ def _attention_call(
     interpret,
     scale_cache=None,
     scale_rows=None,
+    work=None,
 ):
     """One kernel call over the tokens of `selected` (a multiple of block_q),
     which start at tile ``tile_offset`` (``int32[1]``) of the head-major
@@ -296,16 +297,17 @@ def _attention_call(
     t``): into `out` in place when given (an earlier call's
     result), else into new arrays whose other rows are unset. A 4-bit
     `kv_cache` takes its `scale_cache` and `scale_rows` (`_kernel`'s
-    `fp4_rows`)."""
+    `fp4_rows`). `work` is `selected`'s `msa_attention._work_list` when the
+    caller built it."""
     num_q_heads, num_tokens, head_dim = q.shape
     num_heads = q_per_head
     _, rows_per_page, packing, _ = kv_cache.shape
     # One KV head's [K | V] slice of each row.
     row_width = 2 * head_dim
     topk = selected.shape[1]
-    pages, meta, num_groups, counts = msa_attention._work_list(
-        selected, block_q, pages_per_step
-    )
+    if work is None:
+        work = msa_attention._work_list(selected, block_q, pages_per_step)
+    pages, meta, num_groups, counts = work
 
     groups_per_tile = msa_attention._groups_per_tile(block_q, topk, pages_per_step)
 
@@ -470,6 +472,15 @@ def _chunked_call(
     local_page = jnp.pad(local_page, (0, pad), constant_values=-1)[:, None]
     local_limit = jnp.pad(local_limit, (0, pad))[:, None]
 
+    # Every call's work list in one batched pass ahead of the loop: built
+    # per call inside it, each call paid its own two union sorts and glue
+    # (~9 us per call, x G x 4 calls per layer).
+    work = jax.vmap(
+        functools.partial(
+            msa_attention._work_list, block_q=block_q, pages_per_step=pages_per_step
+        )
+    )(selected.reshape(num_heads * num_chunks, step, selected.shape[2]))
+
     def head_chunk(i, out):
         h, c = i // num_chunks, i % num_chunks
         offset = jnp.full((1,), c * (step // block_q), jnp.int32)
@@ -478,7 +489,16 @@ def _chunked_call(
         )[0]
         heads = jnp.stack([first_head + h, h]).astype(jnp.int32)
         return call(
-            q, kv_cache, sel, local_page, local_limit, page_table, heads, offset, out
+            q,
+            kv_cache,
+            sel,
+            local_page,
+            local_limit,
+            page_table,
+            heads,
+            offset,
+            out,
+            work=tuple(x[i] for x in work),
         )
 
     out = head_chunk(0, None)
