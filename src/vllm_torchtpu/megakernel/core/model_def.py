@@ -103,6 +103,11 @@ class ModelDef:
         for k, v in defaults.items():
             if k not in cls.__dict__:
                 setattr(cls, k, v)
+        raw_geom = cls.__dict__.get("geometry", getattr(cls, "geometry", None))
+        if isinstance(raw_geom, _BoundFromHF):
+            cls.geometry = _BoundFromHF(raw_geom._from_hf, cls)
+        elif isinstance(raw_geom, FromHF):
+            cls.geometry = _BoundFromHF(raw_geom, cls)
 
     @classmethod
     def _from_hf_decl(cls) -> FromHF:
@@ -188,7 +193,9 @@ class ModelDef:
     @classmethod
     def shrink(cls, hf_config_or_geom: Any = None, **kw: Any) -> ModelGeometry:
         """Return a tiny `ModelGeometry` with `periods` cycles that passes checks."""
-        return cls.derive_geometry(hf_config_or_geom).shrink(**kw)
+        shrunk = cls.derive_geometry(hf_config_or_geom).shrink(**kw)
+        object.__setattr__(shrunk, "_model_def", cls)
+        return shrunk
 
     @classmethod
     def default_profile(cls) -> Profile:
@@ -232,41 +239,6 @@ class ModelDef:
         )
         return composed_reference_step(sched, cls.final_norm, *args, **kw)
 
-
-_raw_geom_shrink = ModelGeometry.shrink
-
-
-def _from_hf_get(
-    self: FromHF, obj: Any, owner: type[Any] | None = None
-) -> FromHF | _BoundFromHF:
-    if (
-        isinstance(owner, type)
-        and issubclass(owner, ModelDef)
-        and owner is not ModelDef
-    ):
-        return _BoundFromHF(self, owner)
-    return self
-
-
-def _geom_shrink(self: ModelGeometry, **kw: Any) -> ModelGeometry:
-    shrunk = _raw_geom_shrink(self, **kw)
-    if (mdef := getattr(self, "_model_def", None)) is not None:
-        object.__setattr__(shrunk, "_model_def", mdef)
-    return shrunk
-
-
-def _geom_to_model_spec(self: ModelGeometry) -> ModelSpec:
-    """Convert this geometry into its declarative `ModelSpec`."""
-    if (mdef := getattr(self, "_model_def", None)) is not None:
-        return mdef.to_model_spec(self)
-    raise MegakernelConfigError(
-        "ModelGeometry is not bound to a ModelDef; call ModelDef.to_model_spec(g)"
-    )
-
-
-type.__setattr__(FromHF, "__get__", _from_hf_get)
-type.__setattr__(ModelGeometry, "shrink", _geom_shrink)
-type.__setattr__(ModelGeometry, "to_model_spec", _geom_to_model_spec)
 
 _MODEL_REGISTRY: dict[str, type[ModelDef]] = {}
 _ARCH_REGISTRY: dict[str, type[ModelDef]] = {}

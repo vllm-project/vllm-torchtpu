@@ -709,16 +709,20 @@ def test_synthetic_model_def_every2_spec_reference_and_override_errors(
         lm_head = LMHead("lm_head", tied_to=None)
 
     assert SynthHybrid.default_profile() is DEFAULT_PROFILE
-    raw_fhf = SynthHybrid.__dict__["geometry"]
-    assert raw_fhf.__get__(None, ModelDef) is raw_fhf
+    assert ModelDef.geometry is None
+    assert isinstance(SynthHybrid.geometry, model_def._BoundFromHF)
+    raw_fhf = SynthHybrid.geometry._from_hf
+    assert isinstance(raw_fhf, FromHF)
+    assert not hasattr(FromHF, "__get__")
 
-    class _FakeProbeOwner:
-        _IS_MODEL_DEF = True
+    class _NonModelDefOwner:
+        geometry = raw_fhf
 
-    assert raw_fhf.__get__(None, _FakeProbeOwner) is raw_fhf
+    assert _NonModelDefOwner.geometry is raw_fhf
     sub_named_base = type("ModelDef", (SynthHybrid,), {})
-    bound_sub = raw_fhf.__get__(None, sub_named_base)
+    bound_sub = sub_named_base.geometry
     assert isinstance(bound_sub, model_def._BoundFromHF)
+    assert bound_sub._model_cls is sub_named_base
     assert bound_sub == raw_fhf and repr(bound_sub) == repr(raw_fhf)
     assert SynthHybrid.geometry.fields == raw_fhf.fields
     assert SynthHybrid.geometry.resolve(synth_hf_cfg) == raw_fhf.resolve(synth_hf_cfg)
@@ -755,12 +759,14 @@ def test_synthetic_model_def_every2_spec_reference_and_override_errors(
         g_tiny.IS,
     ) == (4, 2, 4, 4, 8, 2, 512, 512)
     g_tiny.check(ex)
-    assert_specs_equal(g_tiny.to_model_spec(), SynthHybrid.to_model_spec(g_tiny, R=8))
+    assert not hasattr(geometry.ModelGeometry, "to_model_spec")
+    assert not hasattr(g_tiny, "to_model_spec")
+    assert_specs_equal(
+        SynthHybrid.to_model_spec(g_tiny), SynthHybrid.to_model_spec(g_tiny, R=8)
+    )
 
     g_unbound = dataclasses.replace(g_tiny)
     assert getattr(g_unbound, "_model_def", None) is None
-    with pytest.raises(MegakernelConfigError, match="not bound to a ModelDef"):
-        g_unbound.to_model_spec()
     ms = SynthHybrid.to_model_spec(g_unbound, R=ex.R)
     assert getattr(g_unbound, "_model_def", None) is None
     assert ms.name == "synth_hybrid"

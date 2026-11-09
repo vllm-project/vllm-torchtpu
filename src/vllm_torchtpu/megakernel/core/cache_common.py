@@ -83,6 +83,8 @@ def resolve_model_spec(g_or_spec: Any) -> ModelSpec:
         return g_or_spec
     if hasattr(g_or_spec, "to_model_spec"):
         return g_or_spec.to_model_spec()
+    if (mdef := getattr(g_or_spec, "_model_def", None)) is not None:
+        return mdef.to_model_spec(g_or_spec)
     raise TypeError(
         "Expected a ModelSpec or a geometry config implementing .to_model_spec(), "
         f"got {type(g_or_spec).__name__}"
