@@ -45,6 +45,9 @@ def compressed_live_bytes(layout) -> int | None:
     """
     if layout is None or getattr(layout, "compressed_slots", 1) != 1:
         return None
+    if getattr(layout, "merged_compressed", False):
+        # Merged keys are whole blocks of their own pool (no padding to trim).
+        return None
     live = (layout.block_size // layout.kernel_block_size) * layout.compressed_kernel_bytes
     return live if 0 < live < layout.page_bytes else None
 
@@ -85,6 +88,22 @@ def _leading_page_region(pool) -> bool:
         and 0 < region.unit_bytes <= stride
         and (region.name == "page") == (region.unit_bytes == stride)
     )
+
+
+def _group_of(groups, name: str) -> int:
+    for group in groups:
+        if name in group.layer_names:
+            return group.group_index
+    raise ManifestError(f"Qwen PD owner {name} has no group")
+
+
+def merged_key_owner(name: str, owners) -> str | None:
+    """The main-KV owner whose carrier region holds merged keys ``name``."""
+    if name.endswith(".compressed_k") and name not in owners:
+        main = name.removesuffix(".compressed_k")
+        if main in owners:
+            return main
+    return None
 
 
 def build_transfer_manifest(
@@ -146,11 +165,17 @@ def build_transfer_manifest(
                 raise ManifestError("Two owners in one group overlap the same carrier")
             used.add(index)
             referenced.add(index)
+            region_pages = (
+                layout.compressed_region_pages(config.num_blocks)
+                if getattr(layout, "merged_compressed", False)
+                else 0
+            )
             if (
                 raw.dtype != torch.float8_e4m3fn
                 or raw.storage_offset() != 0
                 or not raw.is_contiguous()
-                or raw.numel() * raw.element_size() != config.num_blocks * page_bytes
+                or raw.numel() * raw.element_size()
+                != (config.num_blocks + region_pages) * page_bytes
             ):
                 raise ManifestError(f"Qwen PD owner {name} has incompatible FP8 pages")
             pools.append(
@@ -164,6 +189,30 @@ def build_transfer_manifest(
                     block_stride_bytes=page_bytes,
                     num_blocks=config.num_blocks,
                     regions=page_regions(name, page_bytes, compressed_live),
+                    dtype_tag="qwen4-whole-fp8-page-v1",
+                )
+            )
+    merged = bool(getattr(layout, "merged_compressed", False))
+    if merged and pcp_rank == 0:
+        # QWEN4_EXP_MERGE_COMPRESSED_K: each QSA layer's compressed keys sit in
+        # a region of its main-KV carrier after the scheduler's pages, one
+        # `merged_key_span` pages' worth of keys per main-KV block ID. Expose
+        # them as their own pool on the main-KV group's IDs; the keys are the
+        # same on every PCP rank, so only rank 0 lists them.
+        span = layout.merged_key_span
+        key_stride = span * layout.page_bytes // layout.compressed_columns_per_page
+        main_pools = [p for p in pools if p.layer_name.endswith(".self_attn")]
+        for main in main_pools:
+            name = main.layer_name + ".compressed_k"
+            pools.append(
+                PoolEntry(
+                    tag=pool_tag(_group_of(groups, main.layer_name), name),
+                    layer_name=name,
+                    storage_index=main.storage_index,
+                    base_offset_bytes=config.num_blocks * main.block_stride_bytes,
+                    block_stride_bytes=key_stride,
+                    num_blocks=config.num_blocks,
+                    regions=(RegionSpec("page", 0, key_stride, key_stride, 1),),
                     dtype_tag="qwen4-whole-fp8-page-v1",
                 )
             )
@@ -230,15 +279,25 @@ def measure_transfer_layout(
         if any(dim % tile for dim, tile in zip(shape[-2:], tiles[0])):
             raise ManifestError("Qwen PD carrier would have native tile padding")
         row_bytes = math.prod(shape[1:])
+        token_row = row_bytes // shape[1]
         pools = [p for p in manifest.pools if p.storage_index == index]
         if not pools:
             raise ManifestError("Qwen PD layout has an unreferenced carrier")
         for pool in pools:
+            # Whole pages from offset 0; merged compressed keys
+            # (QWEN4_EXP_MERGE_COMPRESSED_K) add whole-row blocks in the region
+            # after them. Either way a pool stays inside its carrier.
+            whole = pool.base_offset_bytes == 0 and pool.block_stride_bytes % row_bytes == 0
+            keys = (
+                pool.layer_name.endswith(".compressed_k")
+                and pool.block_stride_bytes % token_row == 0
+                and pool.base_offset_bytes % row_bytes == 0
+            )
             if (
-                pool.base_offset_bytes != 0
-                or pool.block_stride_bytes <= 0
-                or pool.block_stride_bytes % row_bytes
-                or pool.num_blocks * pool.block_stride_bytes != raw.nbytes
+                pool.block_stride_bytes <= 0
+                or not (whole or keys)
+                or pool.base_offset_bytes + pool.num_blocks * pool.block_stride_bytes
+                > raw.nbytes
                 or not _leading_page_region(pool)
             ):
                 raise ManifestError("Qwen PD pages do not partition the native carrier")

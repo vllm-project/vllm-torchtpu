@@ -636,7 +636,6 @@ def validate_config(cfg):
         )
     if p.prefill_context_parallel_size > 1:
         from .pool_layout import (
-            merge_compressed_k_enabled,
             pack_compressed_k_enabled,
             pack_main_kv_enabled,
             main_kv_dcp,
@@ -653,13 +652,12 @@ def validate_config(cfg):
             or main_kv_dcp() > 1
             or pack_compressed_k_enabled()
             or pack_main_kv_enabled()
-            or merge_compressed_k_enabled()
             or cfg.speculative_config is not None
         ):
             raise ValueError(
                 "Qwen4Exp PCP requires TP1, --enable-expert-parallel, the unified "
-                "pool, no VLLM_TPU_QSA_MAIN_KV_DCP, unpacked and unmerged "
-                "compressed keys, unpacked main KV and speculative decoding off"
+                "pool, no VLLM_TPU_QSA_MAIN_KV_DCP, unpacked compressed keys "
+                "(merged is allowed), unpacked main KV and speculative decoding off"
             )
     if p.pipeline_parallel_size > 1:
         from .pool_layout import pack_compressed_k_enabled

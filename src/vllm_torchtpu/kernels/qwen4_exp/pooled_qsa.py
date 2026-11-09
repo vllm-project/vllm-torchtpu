@@ -469,17 +469,35 @@ def write_main_cache(
     )
 
 
+MERGED_SPAN_CODES = 8
+
+
+def merged_compressed_slot(region: int, span: int = 1) -> int:
+    """``compressed_slot`` of a merged layer: the region's first column and
+    the table entry's span in pool pages, in one negative int (static)."""
+    assert region > 0 and 1 <= span <= MERGED_SPAN_CODES, (region, span)
+    return -(region * MERGED_SPAN_CODES + span - 1)
+
+
 def compressed_region(slot: int) -> int:
     """First compressed-key column of the merged region for ``slot`` < 0.
 
     ``QWEN4_EXP_MERGE_COMPRESSED_K``: a layer's compressed keys live in its
-    main KV carrier, after the scheduler's ``N`` pages. One block's keys are
-    ``1 / cols`` of a page (``cols = page_bytes / keys_per_block``), so block
-    ``c``'s keys are column ``cols * N + c`` of that region, counted in
-    blocks' worth of keys. The layer binds ``compressed_slot = -cols * N``.
+    main KV carrier, after the scheduler's ``N`` pages. One page's worth of
+    tokens has keys filling ``1 / cols`` of a page (``cols = page_bytes /
+    keys_per_page``); a main-KV table entry spans ``merged_span(slot)`` pages
+    of tokens (2 under PCP2), so entry ``c``'s keys are columns
+    ``cols * N + span * c + i`` of that region. The layer binds
+    ``merged_compressed_slot(cols * N, span)``.
     """
     assert slot < 0, slot
-    return -slot
+    return -slot // MERGED_SPAN_CODES
+
+
+def merged_span(slot: int) -> int:
+    """Pool pages of tokens one main-KV table entry covers, for ``slot`` < 0."""
+    assert slot < 0, slot
+    return -slot % MERGED_SPAN_CODES + 1
 
 
 def compressed_pairs(
@@ -510,10 +528,14 @@ def compressed_pairs(
         write = write & (owner == jnp.asarray(rank).reshape(()).astype(owner.dtype))
     layer_pairs = pool.shape[1] // (2 * ratio)
     if slot < 0:
-        # Merged keys: a block's keys fill one column of the pool's
-        # compressed-key region, column ``table + region`` in layer_pairs units.
+        # Merged keys: a page's worth of keys fills one column of the pool's
+        # compressed-key region; a table entry of `merged_span` pages owns that
+        # many consecutive columns, column ``span * table + i + region``.
         assert dcp is None, "merged compressed keys do not support compressed DCP"
-        pair = (table[req, logical // span] + compressed_region(slot)) * layer_pairs + (
+        m = merged_span(slot)
+        entry = m * pool.shape[1]
+        column = table[req, logical // entry] * m + (logical % entry) // pool.shape[1]
+        pair = (column + compressed_region(slot)) * layer_pairs + (
             logical % pool.shape[1]
         ) // (2 * ratio)
     else:
@@ -1011,7 +1033,9 @@ def _compressed_expansion(logical_pages: int, physical_pages: int, slot: int):
     ``compressed_kernel_pages``): kernel page ``k`` of column ``c`` is
     ``c * stride + offset + k % logical_pages``."""
     if slot < 0:
-        return (logical_pages, logical_pages, compressed_region(slot) * logical_pages)
+        # `logical_pages` here is the entry's (merged_span pages of keys).
+        base = logical_pages // merged_span(slot)
+        return (logical_pages, logical_pages, compressed_region(slot) * base)
     return (logical_pages, physical_pages, slot * logical_pages)
 
 
@@ -1030,8 +1054,13 @@ def compressed_kernel_pages(pages: jax.Array, pool: jax.Array, slot: int = 0, ra
     logical_pages = pool.shape[1] // 128
     first = jnp.arange(logical_pages)
     if slot < 0:
-        # Merged keys (``compressed_region``): column ``c`` -> ``(c + region) * logical_pages + j``.
-        return ((pages[..., None] + compressed_region(slot)) * logical_pages + first).reshape(-1)
+        # Merged keys (``compressed_region``): entry ``c`` covers ``m`` columns,
+        # kernel pages ``(m * c + region) * logical_pages + j``, j < m * logical_pages.
+        m = merged_span(slot)
+        first = jnp.arange(m * logical_pages)
+        return (
+            (pages[..., None] * m + compressed_region(slot)) * logical_pages + first
+        ).reshape(-1)
     scaled = pages[..., None] * physical_pages
     if slot:
         first = first + slot * logical_pages
@@ -1122,6 +1151,9 @@ def _select_blocks(
     assert slot <= 0 or (slot + 1) * logical_pages <= physical_pages, (
         "packed compressed-key slot exceeds its pool page"
     )
+    if slot < 0:
+        # Merged keys: one table entry expands to merged_span pages of keys.
+        logical_pages *= merged_span(slot)
 
     def expand_pages(pages):
         return compressed_kernel_pages(pages, pool, slot, ratio)

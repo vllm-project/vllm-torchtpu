@@ -693,7 +693,16 @@ class QwenPagePlan:
             for group in self.groups
             for name in group.layer_names
         }
-        names = [pool.layer_name for pool in self.manifest.pools]
+        from .pd_manifest import merged_key_owner
+
+        # QWEN4_EXP_MERGE_COMPRESSED_K: a layer's keys are a pool of their own
+        # in its main-KV carrier, on the main-KV group's block IDs.
+        merged = {}
+        for pool in self.manifest.pools:
+            main = merged_key_owner(pool.layer_name, owners)
+            if main is not None:
+                merged[pool.layer_name] = owners[main]
+        names = [pool.layer_name for pool in self.manifest.pools if pool.layer_name not in merged]
         tags = [pool.tag for pool in self.manifest.pools]
         from vllm_torchtpu.distributed.pcp import get_pcp_rank
 
@@ -704,6 +713,7 @@ class QwenPagePlan:
         )
         if len(names) != len(set(names)) or len(tags) != len(set(tags)) or not covered:
             raise ValueError("Qwen PD page plan must cover every owner exactly once")
+        owners = owners | merged
         return tuple((pool, owners[pool.layer_name]) for pool in self.manifest.pools)
 
     def request_pages(
@@ -729,7 +739,9 @@ class QwenPagePlan:
             for page in ids:
                 if page >= pool.num_blocks:
                     raise ValueError("Qwen PD page is outside its native carrier")
-                key = (pool.storage_index, page)
+                # Merged keys share their main-KV pages' IDs in another byte
+                # region of the carrier (base offset past the pages).
+                key = (pool.storage_index, pool.base_offset_bytes, page)
                 if key in occupied:
                     raise ValueError("Qwen PD groups overlap a physical carrier page")
                 occupied.add(key)

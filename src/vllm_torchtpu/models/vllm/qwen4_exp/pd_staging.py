@@ -240,9 +240,11 @@ def compressed_rows(
 
 def compressed_rows_np(
     num_tokens, ratio, src_pages, src_block, dst_pages, dst_block,
-    start=0, src_first=0, dst_offset=0,
+    start=0, src_first=0, dst_offset=0, src_page_rows=None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """``compressed_rows`` as int64 arrays, vectorized."""
+    """``compressed_rows`` as int64 arrays, vectorized. ``src_page_rows``
+    (default ``src_block``): rows of a source page, when one source page holds
+    the keys of ``src_block`` tokens in fewer rows (merged producer keys)."""
     span = 2 * ratio
     if start % span:
         raise ValueError(f"A repack must start on a compressed pair ({span} tokens)")
@@ -250,7 +252,8 @@ def compressed_rows_np(
     t = np.arange(start // span, pairs, dtype=np.int64) * span
     sp = np.asarray(src_pages, dtype=np.int64)
     dp = np.asarray(dst_pages, dtype=np.int64)
-    src = sp[t // src_block - src_first] * src_block + (t % src_block) // span
+    page_rows = src_block if src_page_rows is None else src_page_rows
+    src = sp[t // src_block - src_first] * page_rows + (t % src_block) // span
     dst = dp[t // dst_block] * dst_block + dst_offset + (t % dst_block) // span
     return src, dst
 
@@ -551,11 +554,16 @@ class StagedConsumer:
         from .pool_layout import pcp_interleave
 
         self.src_pcp = int(os.environ.get("QWEN4_EXP_PD_PRODUCER_PCP", "1"))
+        # QWEN4_EXP_PD_PRODUCER_MERGED=1: the producer runs
+        # QWEN4_EXP_MERGE_COMPRESSED_K=1, so its keys ride the main-KV IDs in
+        # their own pools ("<layer>.self_attn.compressed_k" on the main group).
+        self.src_merged = os.environ.get("QWEN4_EXP_PD_PRODUCER_MERGED", "0") == "1"
         self.src_layout, src_specs = pooled_cache_specs(
             without_speculation(cfg),
             tp=1,
             main_dcp=self.src_pcp,
             pack_compressed=False,
+            merge_compressed=self.src_merged,
             main_interleave=pcp_interleave() if self.src_pcp > 1 else None,
         )
         self._src_split = (
@@ -588,6 +596,33 @@ class StagedConsumer:
         # The producer sends a compressed-key page's keys only; the carrier
         # declares the same region so both pool layouts agree.
         compressed_live = compressed_live_bytes(self.src_layout)
+        # Merged producer keys: one block of `key_stride` bytes per main-KV ID;
+        # a staging page holds `keys_per_page` of them, and a reserved page k
+        # lands its ID's keys in key block k * keys_per_page (the page's start).
+        self._key_pools: dict[str, int] = {}
+        key_entries = []
+        if self.src_merged:
+            span = self.src_layout.merged_key_span
+            key_stride = span * self.src_layout.page_bytes // self.src_layout.compressed_columns_per_page
+            self.keys_per_page = self.src_layout.page_bytes // key_stride
+            for group in self.src_groups:
+                for name in group.layer_names:
+                    if owner_kind(name) != "main":
+                        continue
+                    key = name + ".compressed_k"
+                    self._key_pools[key] = group.group_index
+                    key_entries.append(
+                        PoolEntry(
+                            tag=pool_tag(group.group_index, key),
+                            layer_name=key,
+                            storage_index=0,
+                            base_offset_bytes=0,
+                            block_stride_bytes=key_stride,
+                            num_blocks=self.pages * self.keys_per_page,
+                            regions=(RegionSpec("page", 0, key_stride, key_stride, 1),),
+                            dtype_tag="qwen4-whole-fp8-page-v1",
+                        )
+                    )
         self.manifest = PoolManifest(
             BINDING_ALIASED_RAW,
             [self.staging],
@@ -608,9 +643,11 @@ class StagedConsumer:
                 for name in group.layer_names
                 for split in (name in self._src_split,)
                 for r in (range(self.src_pcp) if split else (0,))
-            ],
+            ]
+            + key_entries,
         )
         self._src_owner = {n: g.group_index for g in self.src_groups for n in g.layer_names}
+        self._src_owner.update(self._key_pools)
         # Staging pool name -> producer group (a split owner's per-rank pools too).
         self._pool_group = dict(self._src_owner) | {
             f"{n}.pcp{r}": self._src_owner[n]
@@ -708,6 +745,9 @@ class StagedConsumer:
         tags, blocks, counts = [], [], []
         for pool in self.manifest.pools:
             owner_pages = pages[pool.layer_name]
+            if pool.layer_name in self._key_pools:
+                # Merged keys: the key block at the start of each staging page.
+                owner_pages = [k * self.keys_per_page for k in owner_pages]
             tags.append(pool.tag)
             blocks.extend(owner_pages)
             counts.append(len(owner_pages))
@@ -741,10 +781,15 @@ class StagedConsumer:
         main_s, main_d, copy_s, copy_d = [], [], [], []
         gdn_s, gdn_d = [], []
         for name, (gi, offset) in self._dst_compressed.items():
+            merged = name in self._key_pools
             s, d = compressed_rows_np(
                 num_tokens, self.ratio, src_pages[name],
-                self.src_block, dst_tables[gi], self.dst_block, start=skip_tokens,
+                # Merged: one staging page per main-KV ID, whose keys
+                # (span pages of tokens) start at the page's first row.
+                self.src_block * (self.src_layout.merged_key_span if merged else 1),
+                dst_tables[gi], self.dst_block, start=skip_tokens,
                 src_first=first[self._src_owner[name]], dst_offset=offset,
+                src_page_rows=self.src_block if merged else None,
             )
             copy_s.append(s)
             copy_d.append(d)
