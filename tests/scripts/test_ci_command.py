@@ -214,8 +214,10 @@ class TestCiCommand(unittest.TestCase):
             for expected in (
                 "`/ci precheck`: re-run all non-TPU checks "
                 "(pre-commit, PR checks, CPU tests).",
-                "`/ci run [perf-eval] [nightly-suite]`: TPU tests now.",
-                "`/ci merge [perf-eval] [nightly-suite]`",
+                "`/ci run`: run the TPU tests now. Optionally add `perf-eval`",
+                "e.g. `/ci run perf-eval`",
+                "`/ci merge`: queue for merge once approved and green",
+                "e.g. `/ci merge perf-eval`",
                 "`/ci merge precheck-only`",
                 "**Merge when ready** button at the bottom of the GitHub PR page",
                 "`/ci cancel`: stop this PR's running builds, take it out of the "
@@ -224,6 +226,7 @@ class TestCiCommand(unittest.TestCase):
                 "`/ci` commands except help need write access.",
             ):
                 self.assertIn(expected, reply)
+            self.assertNotIn("[perf-eval]", reply)
             self.assertFalse(any(u.endswith("/permission") for _, u, _ in calls))
 
         for cmd, sub in (
@@ -764,9 +767,9 @@ class TestCiCommand(unittest.TestCase):
         assert first is not None and second is None
         for expected in (
             "re-run all non-TPU checks (pre-commit, PR checks, CPU tests)",
-            "`/ci run [perf-eval] [nightly-suite]`",
+            "comment `/ci run` to run them. Optionally add `perf-eval`",
             "**Merge when ready** button at the bottom of the GitHub PR page",
-            "`/ci merge [perf-eval] [nightly-suite]`",
+            "`/ci merge perf-eval` or `/ci merge nightly-suite`",
             "`/ci merge precheck-only`",
             "`/ci cancel`",
             "`/ci help`",
