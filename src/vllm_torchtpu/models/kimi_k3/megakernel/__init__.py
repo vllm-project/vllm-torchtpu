@@ -13,5 +13,11 @@
 # limitations under the License.
 
 # Source provenance: inferact/k3-megakernel@30c9ba966b
-# src/vllm_torchtpu/megakernel/models/k3/__init__.py
-"""Kimi-K3 TP32 megakernel."""
+#   src/vllm_torchtpu/megakernel/kimi_k3/__init__.py
+"""Isolated Kimi-K3 megakernel package."""
+
+from __future__ import annotations
+
+from .spec import SPEC
+
+__all__ = ["SPEC"]
