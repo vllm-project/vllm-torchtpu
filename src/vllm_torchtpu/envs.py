@@ -125,6 +125,7 @@ if TYPE_CHECKING:
     TPU_MOE_A2A_STREAMED_COMBINE: bool = False
     TPU_MOE_A2A_OWNER_COMBINE: bool = False
     TPU_MOE_A2A_SORTED_PLAN: bool = False
+    TPU_MOE_A2A_OWNER_TAIL: bool = False
     TPU_MOE_EXPERT_PLACEMENT: str = ""
     TPU_MOE_ROUTING_COUNTS_DIR: str = ""
     TPU_MOE_ROUTING_REPLAY: str = ""
@@ -904,6 +905,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # routing, carrying each route's destination, instead of reading,
     # sorting and looking up the received rows' routes.
     "TPU_MOE_A2A_SORTED_PLAN": env_bool("TPU_MOE_A2A_SORTED_PLAN"),
+    # Ragged all-to-all exchange with the owner combine: where the fused expert
+    # kernel runs, its tail also sums the owned tokens and copies the sums to
+    # the engine's TP ranks, instead of a separate sum kernel and an all-gather
+    # after it (same outputs, bitwise).
+    "TPU_MOE_A2A_OWNER_TAIL": env_bool("TPU_MOE_A2A_OWNER_TAIL"),
     # Place each named MoE layer's experts by this .npz (logical expert ->
     # physical slot, e.g. balanced on routing counts; see
     # layers/core/expert_placement.py). Unset = linear placement.
