@@ -20,14 +20,101 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.utils import largest_divisor
+# Fallback TPU VMEM parameters used only when `interpret=True` on a CPU host.
+_INTERPRET_DEFAULT_VMEM_BYTES = 16 * 1024 * 1024
+_INTERPRET_DEFAULT_SUBLANES = 8
+_INTERPRET_DEFAULT_LANES = 128
+_F32_BYTES = 4
 
-# Maximum number of SSM heads blocked per Pallas grid step. At `head_block=8`,
-# `block_len=64`, `d_head=64`, and `d_state=128` (or even `block_len=256`),
-# double-buffered VMEM blocks for `B_c`/`C_c`, `X_c`/`out`, `states`, and
-# `chunk_state_pallas`'s 128-lane padded `(block_len, 1)` decay vector consume
-# ~1.6 MiB (~5.5 MiB at `block_len=256` in float32), fitting within scoped VMEM.
-_MAX_HEAD_BLOCK_SIZE = 8
+
+def _largest_divisor(x: int, cap: int) -> int:
+    """Largest positive divisor of `x` that is `<= cap`.
+
+    Defined locally to keep `kernels/ssd_scan/` free of `torch` and `vllm`
+    imports (`vllm_torchtpu.utils` imports both at module top level; see R-2.1).
+    """
+    for candidate in range(min(x, cap), 0, -1):
+        if x % candidate == 0:
+            return candidate
+    return 1
+
+
+def _aligned_vmem_tile_bytes(
+    lead_dim: int,
+    rows: int,
+    cols: int,
+    elem_bytes: int,
+    num_sublanes: int,
+    num_lanes: int,
+) -> int:
+    """Byte footprint of a 3D VMEM block padded to `(num_sublanes, num_lanes)`."""
+    aligned_rows = ((rows + num_sublanes - 1) // num_sublanes) * num_sublanes
+    aligned_cols = ((cols + num_lanes - 1) // num_lanes) * num_lanes
+    return lead_dim * aligned_rows * aligned_cols * elem_bytes
+
+
+def _select_head_block_size(
+    n_heads: int,
+    n_groups: int,
+    block_len: int,
+    d_head: int,
+    d_state: int,
+    *,
+    include_decay_tile: bool,
+    interpret: bool,
+) -> int:
+    """Selects the largest divisor `head_block` that fits in TPU VMEM.
+
+    When `n_groups < n_heads`, `head_block` divides `n_heads // n_groups` so
+    each grid step loads a single group slice of `B_c` or `C_c`. When
+    `n_groups == n_heads`, `head_block` divides `n_heads`.
+    """
+    if not interpret:
+        tpu_info = pltpu.get_tpu_info()
+        vmem_capacity_bytes = int(tpu_info.vmem_capacity_bytes)
+        num_sublanes = int(tpu_info.num_sublanes)
+        num_lanes = int(tpu_info.num_lanes)
+    else:
+        vmem_capacity_bytes = _INTERPRET_DEFAULT_VMEM_BYTES
+        num_sublanes = _INTERPRET_DEFAULT_SUBLANES
+        num_lanes = _INTERPRET_DEFAULT_LANES
+
+    # Reserve half of VMEM for double-buffered input/output blocks, leaving the
+    # remainder for compiler scratch and register spills.
+    vmem_budget_bytes = vmem_capacity_bytes // 2
+
+    bc_single_bytes = 2 * _aligned_vmem_tile_bytes(
+        1, block_len, d_state, _F32_BYTES, num_sublanes, num_lanes
+    )
+    states_per_head_bytes = 2 * _aligned_vmem_tile_bytes(
+        1, d_head, d_state, _F32_BYTES, num_sublanes, num_lanes
+    )
+    x_per_head_bytes = 2 * _aligned_vmem_tile_bytes(
+        1, block_len, d_head, _F32_BYTES, num_sublanes, num_lanes
+    )
+    decay_per_head_bytes = (
+        2
+        * _aligned_vmem_tile_bytes(1, 1, block_len, _F32_BYTES, num_sublanes, num_lanes)
+        if include_decay_tile
+        else 0
+    )
+
+    if n_groups < n_heads:
+        target_heads = n_heads // n_groups
+        fixed_bytes = bc_single_bytes
+        per_head_bytes = states_per_head_bytes + x_per_head_bytes + decay_per_head_bytes
+    else:
+        target_heads = n_heads
+        fixed_bytes = 0
+        per_head_bytes = (
+            bc_single_bytes
+            + states_per_head_bytes
+            + x_per_head_bytes
+            + decay_per_head_bytes
+        )
+
+    max_head_block = max(1, (vmem_budget_bytes - fixed_bytes) // per_head_bytes)
+    return _largest_divisor(target_heads, max_head_block)
 
 
 def chunk_state_pallas(
@@ -40,82 +127,103 @@ def chunk_state_pallas(
     """Pallas kernel for Step 2 of 4 of SSD scan (intra-chunk state generation).
 
     Computes in float32:
-      states = jnp.einsum("chln,chlp,chl->chpn", B_c, X_c, decay_states[..., 0])
-
-    Several heads are blocked per grid step (`block_shape=(1, H, ...)` with `H`
-    dividing `n_heads`) to amortize per-step Pallas launch overhead while
-    keeping the chunk axis `parallel` for megacore.
+      states = jnp.einsum("cgln,chlp,chl->chpn", B_c, X_c, decay_states[:, :, 0, :])
+    where each group `g` in `B_c` spans `n_heads // n_groups` consecutive heads.
 
     Args:
-      B_c: (n_chunks, n_heads, block_len, d_state)
-      decay_states: (n_chunks, n_heads, block_len, 1)
-      X_c: (n_chunks, n_heads, block_len, d_head)
+      B_c: `(n_chunks, n_groups, block_len, d_state)` where `n_groups` divides
+        `n_heads`.
+      decay_states: `(n_chunks, n_heads, 1, block_len)` with the size-1 axis in
+        the sublane dimension so TPU VMEM pads `1` to `8` sublanes rather than
+        `128` lanes.
+      X_c: `(n_chunks, n_heads, block_len, d_head)`.
       interpret: Run Pallas in host interpret mode (for CPU unit tests only).
 
     Returns:
-      states: (n_chunks, n_heads, d_head, d_state) in float32.
+      states: `(n_chunks, n_heads, d_head, d_state)` in float32.
     """
-    if X_c.ndim != 4:
+    if X_c.ndim != 4 or min(X_c.shape) <= 0:
         raise ValueError(
-            f"Expected 4D X_c (n_chunks, n_heads, block_len, d_head), got {X_c.shape}."
+            "Expected positive 4D X_c (n_chunks, n_heads, block_len, d_head), "
+            f"got {X_c.shape}."
         )
     n_chunks, n_heads, block_len, d_head = X_c.shape
-    if B_c.ndim != 4 or B_c.shape[:3] != (n_chunks, n_heads, block_len):
+    if (
+        B_c.ndim != 4
+        or B_c.shape[0] != n_chunks
+        or B_c.shape[2] != block_len
+        or B_c.shape[1] <= 0
+        or B_c.shape[3] <= 0
+        or n_heads % B_c.shape[1] != 0
+    ):
         raise ValueError(
-            f"Expected 4D B_c with leading shape {(n_chunks, n_heads, block_len)}, "
-            f"got {B_c.shape}."
+            "Expected positive 4D B_c (n_chunks, n_groups, block_len, d_state) "
+            f"with leading/chunk dims ({n_chunks}, n_groups, {block_len}) and "
+            f"n_groups dividing n_heads={n_heads}, got {B_c.shape}."
         )
-    if decay_states.shape != (n_chunks, n_heads, block_len, 1):
+    if decay_states.shape != (n_chunks, n_heads, 1, block_len):
         raise ValueError(
-            f"Expected decay_states shape {(n_chunks, n_heads, block_len, 1)}, "
+            f"Expected decay_states shape {(n_chunks, n_heads, 1, block_len)}, "
             f"got {decay_states.shape}."
         )
-    d_state = B_c.shape[-1]
-    head_block = largest_divisor(n_heads, _MAX_HEAD_BLOCK_SIZE)
+    n_groups = B_c.shape[1]
+    d_state = B_c.shape[3]
+    head_block = _select_head_block_size(
+        n_heads,
+        n_groups,
+        block_len,
+        d_head,
+        d_state,
+        include_decay_tile=True,
+        interpret=interpret,
+    )
+    b_head_block = 1 if n_groups < n_heads else head_block
+    blocks_per_group = (n_heads // n_groups) // head_block if n_groups < n_heads else 1
 
     def kernel(B_ref, decay_ref, X_ref, out_ref):
-        B_val = jnp.squeeze(B_ref[...], axis=0).astype(jnp.float32)
-        decay_val = jnp.squeeze(decay_ref[...], axis=0).astype(jnp.float32)
-        X_val = jnp.squeeze(X_ref[...], axis=0).astype(jnp.float32)
+        B_val = B_ref[...].astype(jnp.float32)
+        if b_head_block != head_block:
+            B_val = jnp.broadcast_to(B_val, (head_block, block_len, d_state))
+        decay_val = jnp.swapaxes(decay_ref[...].astype(jnp.float32), -1, -2)
+        X_val = X_ref[...].astype(jnp.float32)
 
-        X_scaled = X_val * decay_val  # (H, block_len, d_head)
+        X_scaled = X_val * decay_val  # (head_block, block_len, d_head)
         # Keep Precision.HIGHEST so TPU Mosaic does not round the float32
         # `X_scaled` operand to bfloat16 before MXU contraction (which degrades
         # `final_states` max abs error by 409x from 4.10e-5 to 1.68e-2 on bf16
         # inputs and 825x from 6.06e-5 to 5.00e-2 on f32 inputs).
-        out = jax.lax.dot_general(
+        out_ref[...] = jax.lax.dot_general(
             X_scaled,
             B_val,
             (((1,), (1,)), ((0,), (0,))),
             precision=jax.lax.Precision.HIGHEST,
             preferred_element_type=jnp.float32,
         )
-        out_ref[...] = jnp.expand_dims(out, axis=0)
 
     grid = (n_chunks, n_heads // head_block)
 
     in_specs = [
         pl.BlockSpec(
             memory_space=pltpu.VMEM,
-            index_map=lambda c, h_blk: (c, h_blk, 0, 0),
-            block_shape=(1, head_block, block_len, d_state),
+            index_map=lambda c, h_blk: (c, h_blk // blocks_per_group, 0, 0),
+            block_shape=(None, b_head_block, block_len, d_state),
         ),
         pl.BlockSpec(
             memory_space=pltpu.VMEM,
             index_map=lambda c, h_blk: (c, h_blk, 0, 0),
-            block_shape=(1, head_block, block_len, 1),
+            block_shape=(None, head_block, 1, block_len),
         ),
         pl.BlockSpec(
             memory_space=pltpu.VMEM,
             index_map=lambda c, h_blk: (c, h_blk, 0, 0),
-            block_shape=(1, head_block, block_len, d_head),
+            block_shape=(None, head_block, block_len, d_head),
         ),
     ]
 
     out_spec = pl.BlockSpec(
         memory_space=pltpu.VMEM,
         index_map=lambda c, h_blk: (c, h_blk, 0, 0),
-        block_shape=(1, head_block, d_head, d_state),
+        block_shape=(None, head_block, d_head, d_state),
     )
 
     out_shape = (n_chunks, n_heads, d_head, d_state)
@@ -148,41 +256,58 @@ def chunk_scan_pallas(
     """Pallas kernel for Step 4 of 4 of SSD scan (state-to-output conversion).
 
     Computes:
-      Y_off = jnp.einsum("chln,chpn->chlp", C_c, states)
-
+      Y_off = jnp.einsum("cgln,chpn->chlp", C_c, states)
+    where each group `g` in `C_c` spans `n_heads // n_groups` consecutive heads.
     The caller applies the per-position decay `exp(A_cumsum)` to the result.
 
     Args:
-      C_c: (n_chunks, n_heads, block_len, d_state)
-      states: (n_chunks, n_heads, d_head, d_state)
+      C_c: `(n_chunks, n_groups, block_len, d_state)` where `n_groups` divides
+        `n_heads`.
+      states: `(n_chunks, n_heads, d_head, d_state)`.
       out_dtype: Output dtype; defaults to `C_c.dtype` when omitted.
       interpret: Run Pallas in host interpret mode (for CPU unit tests only).
 
     Returns:
-      Y_off: (n_chunks, n_heads, block_len, d_head) in `out_dtype` (or `C_c.dtype`).
+      Y_off: `(n_chunks, n_heads, block_len, d_head)` in `out_dtype` (or `C_c.dtype`).
     """
-    if C_c.ndim != 4:
+    if C_c.ndim != 4 or min(C_c.shape) <= 0:
         raise ValueError(
-            f"Expected 4D C_c (n_chunks, n_heads, block_len, d_state), got {C_c.shape}."
+            "Expected positive 4D C_c (n_chunks, n_groups, block_len, d_state), "
+            f"got {C_c.shape}."
         )
-    n_chunks, n_heads, block_len, d_state = C_c.shape
+    n_chunks, n_groups, block_len, d_state = C_c.shape
     if (
         states.ndim != 4
-        or states.shape[:2] != (n_chunks, n_heads)
+        or min(states.shape) <= 0
+        or states.shape[0] != n_chunks
         or states.shape[3] != d_state
+        or states.shape[1] % n_groups != 0
     ):
         raise ValueError(
-            "Expected 4D states with shape "
-            f"({n_chunks}, {n_heads}, d_head, {d_state}), "
-            f"got {states.shape}."
+            "Expected positive 4D states (n_chunks, n_heads, d_head, d_state) "
+            f"with n_chunks={n_chunks}, d_state={d_state}, and n_heads "
+            f"divisible by n_groups={n_groups}, got {states.shape}."
         )
-    d_head = states.shape[-2]
-    head_block = largest_divisor(n_heads, _MAX_HEAD_BLOCK_SIZE)
+    n_heads = states.shape[1]
+    d_head = states.shape[2]
+    head_block = _select_head_block_size(
+        n_heads,
+        n_groups,
+        block_len,
+        d_head,
+        d_state,
+        include_decay_tile=False,
+        interpret=interpret,
+    )
+    c_head_block = 1 if n_groups < n_heads else head_block
+    blocks_per_group = (n_heads // n_groups) // head_block if n_groups < n_heads else 1
     resolved_out_dtype = jnp.dtype(C_c.dtype if out_dtype is None else out_dtype)
 
     def kernel(C_ref, states_ref, out_ref):
-        C_val = jnp.squeeze(C_ref[...], axis=0).astype(jnp.float32)
-        states_val = jnp.squeeze(states_ref[...], axis=0).astype(jnp.float32)
+        C_val = C_ref[...].astype(jnp.float32)
+        if c_head_block != head_block:
+            C_val = jnp.broadcast_to(C_val, (head_block, block_len, d_state))
+        states_val = states_ref[...].astype(jnp.float32)
 
         # Keep Precision.HIGHEST so TPU Mosaic preserves the float32 inter-chunk
         # carry `states_val` during MXU contraction instead of truncating it to
@@ -195,27 +320,27 @@ def chunk_scan_pallas(
             precision=jax.lax.Precision.HIGHEST,
             preferred_element_type=jnp.float32,
         )
-        out_ref[...] = jnp.expand_dims(prod.astype(resolved_out_dtype), axis=0)
+        out_ref[...] = prod.astype(resolved_out_dtype)
 
     grid = (n_chunks, n_heads // head_block)
 
     in_specs = [
         pl.BlockSpec(
             memory_space=pltpu.VMEM,
-            index_map=lambda c, h_blk: (c, h_blk, 0, 0),
-            block_shape=(1, head_block, block_len, d_state),
+            index_map=lambda c, h_blk: (c, h_blk // blocks_per_group, 0, 0),
+            block_shape=(None, c_head_block, block_len, d_state),
         ),
         pl.BlockSpec(
             memory_space=pltpu.VMEM,
             index_map=lambda c, h_blk: (c, h_blk, 0, 0),
-            block_shape=(1, head_block, d_head, d_state),
+            block_shape=(None, head_block, d_head, d_state),
         ),
     ]
 
     out_spec = pl.BlockSpec(
         memory_space=pltpu.VMEM,
         index_map=lambda c, h_blk: (c, h_blk, 0, 0),
-        block_shape=(1, head_block, block_len, d_head),
+        block_shape=(None, head_block, block_len, d_head),
     )
 
     out_shape = (n_chunks, n_heads, block_len, d_head)
@@ -273,65 +398,92 @@ def ssd_minimal_discrete_hybrid(
 ) -> tuple[jax.Array, jax.Array]:
     """Hybrid JAX/Pallas implementation of the Selective State Space (SSD) scan.
 
-    Implements the discrete SSD scan using Pallas TPU kernels (`kernels/ssd_scan/`)
-    for intra-chunk state generation and state-to-output conversion, and native
-    JAX for cumulative sums and f32 sequential inter-chunk recurrence.
+    Implements the discrete SSD scan using Pallas TPU kernels (`chunk_state_pallas`
+    and `chunk_scan_pallas`) for intra-chunk state generation and state-to-output
+    conversion, and native JAX for cumulative sums and `float32` sequential
+    inter-chunk recurrence.
 
-    Assumes packed layout: `(n_chunks, n_heads, block_len, dim)`.
+    Caller invariants for ragged/padded batches:
+      - Sub-chunk tail padding: Padded tail positions in a sequence's final
+        chunk must set `A_c = 0.0` (so `exp(A_c) == 1.0`, preserving the last
+        valid token's state across padded positions) and `X_c = 0.0` (or
+        `B_c = 0.0`, preventing padded positions from adding state updates).
+      - Finite log-decay `A_c`: All entries of `A_c` must be finite (`<= 0.0`,
+        never `-inf`), because `-inf - (-inf)` in `A_cumsum[..., -1:] - A_cumsum`
+        produces `NaN`.
+      - Checkpoint & final state gathering: `last_chunk_indices` of shape
+        `(num_out_states,)` may index one final chunk per sequence or arbitrary
+        intermediate/final chunk indices in `[0, n_chunks)` (e.g., for aligned
+        prefix caching or speculative decoding). Inactive padding slots may pass
+        `-1` sentinels, which are clamped to chunk `0` via `jnp.maximum(..., 0)`
+        without clamping upper-bound indices.
 
     Args:
-      X_c: (n_chunks, n_heads, block_len, d_head) - Discretized input tensor
-      A_c: (n_chunks, n_heads, block_len) - Log decay parameter (dt * A)
-      B_c: (n_chunks, n_heads, block_len, d_state) - Input projection
-      C_c: (n_chunks, n_heads, block_len, d_state) - Output projection
-      last_chunk_indices: (num_seqs,) - Maps each sequence to its last chunk
-      initial_states: (n_chunks, n_heads, d_head, d_state) - Optional initial
-        states (read only where `reset_mask` is True)
-      reset_mask: (n_chunks,) - Boolean mask indicating sequence starts
-      interpret: Run Pallas kernels in host interpret mode (CPU tests only)
+      X_c: `(n_chunks, n_heads, block_len, d_head)` - Discretized input tensor.
+      A_c: `(n_chunks, n_heads, block_len)` - Finite log decay (`dt * A`).
+      B_c: `(n_chunks, n_groups, block_len, d_state)` - Input projection where
+        `n_groups` divides `n_heads`.
+      C_c: `(n_chunks, n_groups, block_len, d_state)` - Output projection where
+        `n_groups == B_c.shape[1]`.
+      last_chunk_indices: `(num_out_states,)` - Chunk indices in `[0, n_chunks)`
+        (or `-1` for inactive padding slots) to gather from outgoing chunk states.
+      initial_states: Optional `(num_seqs, n_heads, d_head, d_state)` per-sequence
+        initial states indexed in sequence order at chunks where `reset_mask` is
+        `True`. When `None`, sequence starts reset directly to zero inside the
+        scan without allocating a 4D zero buffer in HBM.
+      reset_mask: `(n_chunks,)` - Boolean mask indicating sequence-start chunks.
+      interpret: Run Pallas kernels in host interpret mode (CPU tests only).
 
     Returns:
-      Y: (n_chunks, n_heads, block_len, d_head) in `X_c.dtype`
-      final_states: (num_seqs, n_heads, d_head, d_state) in `float32`
+      Y: `(n_chunks, n_heads, block_len, d_head)` in `X_c.dtype`.
+      final_states: `(num_out_states, n_heads, d_head, d_state)` in `float32`.
     """
-    if X_c.ndim != 4:
+    if X_c.ndim != 4 or min(X_c.shape) <= 0:
         raise ValueError(
-            f"Expected 4D X_c (n_chunks, n_heads, block_len, d_head), got {X_c.shape}."
+            "Expected positive 4D X_c (n_chunks, n_heads, block_len, d_head), "
+            f"got {X_c.shape}."
         )
     n_chunks, n_heads, block_len, d_head = X_c.shape
     if A_c.shape != (n_chunks, n_heads, block_len):
         raise ValueError(
             f"Expected A_c shape {(n_chunks, n_heads, block_len)}, got {A_c.shape}."
         )
-    if B_c.ndim != 4 or B_c.shape[:3] != (n_chunks, n_heads, block_len):
+    if (
+        B_c.ndim != 4
+        or B_c.shape[0] != n_chunks
+        or B_c.shape[2] != block_len
+        or B_c.shape[1] <= 0
+        or B_c.shape[3] <= 0
+        or n_heads % B_c.shape[1] != 0
+    ):
         raise ValueError(
-            f"Expected 4D B_c with leading shape {(n_chunks, n_heads, block_len)}, "
-            f"got {B_c.shape}."
+            "Expected positive 4D B_c (n_chunks, n_groups, block_len, d_state) "
+            f"with leading/chunk dims ({n_chunks}, n_groups, {block_len}) and "
+            f"n_groups dividing n_heads={n_heads}, got {B_c.shape}."
         )
-    d_state = B_c.shape[-1]
-    if C_c.shape != (n_chunks, n_heads, block_len, d_state):
+    n_groups = B_c.shape[1]
+    d_state = B_c.shape[3]
+    if C_c.shape != (n_chunks, n_groups, block_len, d_state):
         raise ValueError(
-            f"Expected C_c shape {(n_chunks, n_heads, block_len, d_state)}, "
+            f"Expected C_c shape {(n_chunks, n_groups, block_len, d_state)}, "
             f"got {C_c.shape}."
         )
-    if last_chunk_indices.ndim != 1:
+    if last_chunk_indices.ndim != 1 or last_chunk_indices.shape[0] <= 0:
         raise ValueError(
-            "Expected 1D last_chunk_indices (num_seqs,), "
+            "Expected non-empty 1D last_chunk_indices (num_out_states,), "
             f"got {last_chunk_indices.shape}."
         )
 
-    if initial_states is None:
-        initial_states_f32 = jnp.zeros(
-            (n_chunks, n_heads, d_head, d_state), dtype=jnp.float32
+    if initial_states is not None and (
+        initial_states.ndim != 4
+        or initial_states.shape[0] <= 0
+        or initial_states.shape[1:] != (n_heads, d_head, d_state)
+    ):
+        raise ValueError(
+            "Expected initial_states shape (num_seqs, "
+            f"{n_heads}, {d_head}, {d_state}) with num_seqs > 0, "
+            f"got {initial_states.shape}."
         )
-    else:
-        if initial_states.shape != (n_chunks, n_heads, d_head, d_state):
-            raise ValueError(
-                "Expected initial_states shape "
-                f"{(n_chunks, n_heads, d_head, d_state)}, "
-                f"got {initial_states.shape}."
-            )
-        initial_states_f32 = initial_states.astype(jnp.float32)
 
     if reset_mask is None:
         reset_mask = jnp.zeros((n_chunks,), dtype=bool).at[0].set(True)
@@ -343,39 +495,75 @@ def ssd_minimal_discrete_hybrid(
     A_c_f32 = A_c.astype(jnp.float32)
     A_cumsum = jnp.cumsum(A_c_f32, axis=-1)
 
-    # 1. Intra-chunk diagonal output (Y_diag)
+    # 1. Intra-chunk diagonal output (Y_diag). When `n_groups < n_heads`,
+    # contract `B_c` and `C_c` along their native group axis rather than
+    # materializing a `jnp.repeat` copy across `n_heads` in HBM.
     L = jnp.exp(_segsum_jax(A_c_f32))
-    Y_diag = jnp.einsum(
-        "chln,chsn,chls,chsp->chlp",
-        C_c,
-        B_c,
-        L,
-        X_c,
-        precision=jax.lax.Precision.HIGHEST,
-    )
+    if n_groups == n_heads:
+        Y_diag = jnp.einsum(
+            "chln,chsn,chls,chsp->chlp",
+            C_c,
+            B_c,
+            L,
+            X_c,
+            precision=jax.lax.Precision.HIGHEST,
+        )
+    else:
+        heads_per_group = n_heads // n_groups
+        L_grouped = L.reshape(n_chunks, n_groups, heads_per_group, block_len, block_len)
+        X_grouped = X_c.reshape(n_chunks, n_groups, heads_per_group, block_len, d_head)
+        Y_diag = jnp.einsum(
+            "cgln,cgsn,cghls,cghsp->cghlp",
+            C_c,
+            B_c,
+            L_grouped,
+            X_grouped,
+            precision=jax.lax.Precision.HIGHEST,
+        ).reshape(n_chunks, n_heads, block_len, d_head)
 
-    # 2. Intra-chunk state generation in float32 (Pallas). Append a size-1
-    # trailing axis `(..., block_len, 1)` so the tensor satisfies Pallas TPU's
-    # 2D minimum tiled `block_shape` requirement and broadcasts directly against
-    # `(head_block, block_len, d_head)` in registers.
-    decay_states = jnp.exp(A_cumsum[..., -1:] - A_cumsum)[..., None]
+    # 2. Intra-chunk state generation in float32 (Pallas). Place the size-1
+    # axis in the sublane dimension `(n_chunks, n_heads, 1, block_len)` so TPU
+    # VMEM pads `1` to `8` sublanes instead of `128` lanes.
+    decay_states = jnp.exp(A_cumsum[..., -1:] - A_cumsum)[:, :, None, :]
     states_c = chunk_state_pallas(B_c, decay_states, X_c, interpret=interpret)
 
-    # 3. Inter-chunk recurrence in float32 (JAX Scan)
+    # 3. Inter-chunk recurrence in float32 (JAX Scan).
     decay_chunk = jnp.exp(A_cumsum[..., -1])
-
-    def scan_body(carry, args):
-        states_c_c, decay_chunk_c, init_state_c, reset_c = args
-        incoming_state = jnp.where(reset_c, init_state_c, carry)
-        decay_exp = decay_chunk_c[:, None, None]
-        next_state = incoming_state * decay_exp + states_c_c
-        return next_state, (incoming_state, next_state)
-
-    scan_args = (states_c, decay_chunk, initial_states_f32, reset_mask)
     init_carry = jnp.zeros((n_heads, d_head, d_state), dtype=jnp.float32)
-    _, (states_incoming, states_outgoing) = jax.lax.scan(
-        scan_body, init_carry, scan_args
-    )
+
+    if initial_states is None:
+
+        def scan_body_zero_init(carry, args):
+            states_c_c, decay_chunk_c, reset_c = args
+            incoming_state = jnp.where(reset_c, jnp.zeros_like(carry), carry)
+            decay_exp = decay_chunk_c[:, None, None]
+            next_state = incoming_state * decay_exp + states_c_c
+            return next_state, (incoming_state, next_state)
+
+        _, (states_incoming, states_outgoing) = jax.lax.scan(
+            scan_body_zero_init,
+            init_carry,
+            (states_c, decay_chunk, reset_mask),
+        )
+    else:
+        initial_states_f32 = initial_states.astype(jnp.float32)
+        num_init_seqs = initial_states_f32.shape[0]
+
+        def scan_body_with_init(carry_and_seq, args):
+            carry, seq_idx = carry_and_seq
+            states_c_c, decay_chunk_c, reset_c = args
+            safe_seq_idx = jnp.minimum(seq_idx, num_init_seqs - 1)
+            incoming_state = jnp.where(reset_c, initial_states_f32[safe_seq_idx], carry)
+            next_seq_idx = jnp.where(reset_c, seq_idx + jnp.int32(1), seq_idx)
+            decay_exp = decay_chunk_c[:, None, None]
+            next_state = incoming_state * decay_exp + states_c_c
+            return (next_state, next_seq_idx), (incoming_state, next_state)
+
+        _, (states_incoming, states_outgoing) = jax.lax.scan(
+            scan_body_with_init,
+            (init_carry, jnp.int32(0)),
+            (states_c, decay_chunk, reset_mask),
+        )
 
     # 4. State to output conversion (Pallas). Keep Y_off in float32 until it is
     # summed with Y_diag so opposite-sign terms do not suffer pre-cancellation
@@ -387,11 +575,8 @@ def ssd_minimal_discrete_hybrid(
     state_decay_out = jnp.exp(A_cumsum)[..., None]
     Y = (Y_diag.astype(jnp.float32) + Y_off * state_decay_out).astype(X_c.dtype)
 
-    # Extract final states for each sequence using `last_chunk_indices`. In
-    # static-shape ragged batches (`mamba_mixer2.py`), inactive/padded sequence
-    # slots beyond `distribution[2]` carry `seq_chunk_starts[1:] - 1 == -1`
-    # sentinels whose outputs are masked out by the caller; clipping to
-    # `[0, n_chunks - 1]` avoids out-of-bounds gather indexing.
-    safe_last_chunk_indices = jnp.clip(last_chunk_indices, 0, n_chunks - 1)
+    # Clamp negative `-1` padding sentinels to `0` without clamping the upper
+    # bound so out-of-range caller indices are not masked.
+    safe_last_chunk_indices = jnp.maximum(last_chunk_indices, 0)
     final_states = states_outgoing[safe_last_chunk_indices]
     return Y, final_states
