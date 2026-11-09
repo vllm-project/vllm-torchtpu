@@ -623,3 +623,10 @@ BUFFERED_MATMUL_TUNING = {
     # windows 512 / 256 measured 40.1 / 45.7 us. About 44 MiB of scratch.
     (7, 288, 15360, 5120): (1024, 32, 60 * 1024**2),
 }
+
+# fused shared expert: (tpu_version, tokens, hidden, intermediate) ->
+# (gate/up window, down window, stream depth, DMAs per window, quant rows,
+#  vmem bytes)
+SHARED_EXPERT_TUNING = {
+    (7, 288, 5120, 2304): (256, 1024, 3, 2, 32, 56 * 1024**2),
+}

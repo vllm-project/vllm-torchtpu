@@ -47,7 +47,6 @@ from vllm_torchtpu.kernels.fused_moe.v2.kernel import (
     COMBINE_GROUP,
     COMBINE_LEAD,
     COMBINE_PARITIES,
-    HEIGHT_RUNGS,
     N_PREFETCH,
     N_PUSH_TABLES,
     N_SCALE_TABLES,
@@ -74,10 +73,17 @@ logger = init_logger(__name__)
 # Two more scalar-prefetch tables than v2: the dispatch segment table and its
 # meta row (host.push_dispatch_segments).
 N_DISPATCH_TABLES = 2
+# Tile heights the FFN body is emitted at (v2's HEIGHT_RUNGS, chosen for
+# this build). Each rung is a full copy of the body in the program text: at
+# the DP16 g25 shape four rungs are 47.0k LLO bundles and two 25.7k, and the
+# larger program costs more than the rows the finer ladder saves (kernel
+# slope at the served g25 / g9 shapes on eight shards: 271 -> 257 and
+# 130 -> 116 us a call, bit-exact).
+HEIGHT_RUNGS = 2
 
 
 def tile_height_rungs(tile_m, override=0):
-    """v2's equally spaced tile-height ladder, emitted on every build.
+    """v2's equally spaced tile-height ladder at this build's HEIGHT_RUNGS.
 
     v2 emits the ladder only where a routed expert is expected to fit in one
     tile (rows_alloc <= ep * g_local * tile_m); this build always emits it,
@@ -89,6 +95,19 @@ def tile_height_rungs(tile_m, override=0):
     if rungs < 2 or step % ROWBLK or step * rungs != tile_m:
         return (tile_m,)
     return tuple(range(step, tile_m + 1, step))
+
+
+def _entry_barrier_first_phase(ep):
+    """_all_pairs_barrier's first phase: every shard signals every shard."""
+    barrier_sem = pltpu.get_barrier_semaphore()
+    for i in range(ep):
+        pl.semaphore_signal(
+            barrier_sem,
+            inc=1,
+            device_id=(jnp.int32(i),),
+            device_id_type=pl.DeviceIdType.MESH,
+        )
+    pl.semaphore_wait(barrier_sem, ep)
 
 
 def _build_push_moe_kernel(
@@ -109,6 +128,10 @@ def _build_push_moe_kernel(
     push_tokens,
     sc_prepush,
     height_rungs_override=0,
+    tail_barrier=True,
+    hbm_staging=False,
+    dispatch_ahead=1,
+    single_barrier=False,
 ):
     """Build the pallas_call and the function that invokes it.
 
@@ -121,7 +144,9 @@ def _build_push_moe_kernel(
     destination's per-local-expert receive semaphore. Visit positions
     [0, sc_prepush) were pushed by the SparseCore before this kernel
     (sc_dispatch.sc_dispatch_chunk_2core), so their tiles start with no wait;
-    the TensorCore pushes the rest a visit position ahead of its own compute,
+    the TensorCore pushes the rest `dispatch_ahead` visit positions ahead of
+    its own compute (the first window right after the head barrier, one more
+    position per visit; a value of g_local or more pushes everything there),
     and waits an expert's semaphore for its pair count before loading its
     first tile. Tiles then read their rows as one contiguous slab copy, so no
     token-gather table exists. Only data movement changes: same rows, same
@@ -133,7 +158,40 @@ def _build_push_moe_kernel(
     viewed per expert. Each slot then stages an expert's whole padded table
     and the FFN reads only its first K / rhs_qb rows, so the result is the
     unpadded build's bit for bit.
+
+    `tail_barrier=False` drops the all-pairs barrier after the transport
+    drain. Every write a peer makes into this shard during the call is
+    counted by an exact wait before that point (dispatch rows per local
+    expert, arrival rows and mirror sublanes), and this shard's own sends are
+    drained, so the barrier waits for nothing this call still owes. A peer
+    that leaves first next writes here only from a kernel that opens with an
+    entry barrier of its own (this kernel's head barrier, the SparseCore
+    pre-push's, the TensorCore routing exchange's), which holds the write
+    until this shard has entered that kernel too.
+
+    `hbm_staging=True` ships result tiles the two-hop way even where a tile
+    could ship straight out of `out_vm`: each tile is committed to the HBM
+    contribution slab and every (expert, destination) run is pushed once the
+    visit's tiles are committed. Same bytes to the same places; what changes
+    is that the remote pushes no longer hold a VMEM staging slot, so when the
+    fabric is the busy resource the tile loop runs ahead of it instead of
+    waiting at the slot-reuse guard. A staged build commits each tile with
+    one copy into a contribution slab shaped like the expert slab, and
+    pushes each visit's runs at the end of the NEXT visit, so the commits it
+    waits for there have had a whole visit to land.
+
+    `single_barrier=True` opens with the first phase of the all-pairs entry
+    barrier only. The second phase guards the barrier semaphore against a
+    peer that races into this kernel's next call while this shard still
+    waits in this one; the layer's routing exchange stands between any two
+    calls, and a peer leaves it only once this shard's row has landed, which
+    this shard sends only after leaving this call.
     """
+    if dispatch_ahead < 1:
+        raise ValueError(
+            f"dispatch_ahead {dispatch_ahead} must be at least 1: a visit "
+            "position is pushed before the visit that reads it"
+        )
     if pad_scale_rows and weight_format != host.WeightFormat.FP4:
         raise ValueError(
             "pad_scale_rows describes the four-bit block-scale tables; "
@@ -376,7 +434,7 @@ def _build_push_moe_kernel(
     #
     # This subsumes the deferred commit drain the same bound used to select:
     # deferring a wait one visit is worth nothing once the wait is gone.
-    push_from_vmem = ragged_rows_alloc <= ep * g_local * tile_m
+    push_from_vmem = not hbm_staging and ragged_rows_alloc <= ep * g_local * tile_m
     ls_window_rows = host.act_scale_window_rows(tile_m)
     # A segment word packs dest << 24 | local expert << 16 | rows.
     if push_tokens >= 1 << 16 or ep > 128 or g_local > 256:
@@ -936,6 +994,23 @@ def _build_push_moe_kernel(
             def commit_tile(parity, t, tile_block_base, live_blocks):
                 """Commit the tile's intersection with each (expert, dest) run."""
                 assert commit_sems is not None and commit_scl_sems is not None
+                if hbm_staging:
+                    # A staged build lays the contribution slab out like the
+                    # expert slab, so the whole tile commits as one copy to
+                    # its own slab rows and push_expert reads each run there.
+                    pltpu.make_async_copy(
+                        out_vm.at[parity, pl.ds(0, live_blocks * ROWBLK)],
+                        contrib_hbm.at[
+                            pl.ds(slab_base + t * tile_m, live_blocks * ROWBLK)
+                        ],
+                        commit_sems.at[parity],
+                    ).start()
+                    pltpu.make_async_copy(
+                        oscl_vm.at[parity],
+                        cscl_hbm.at[pl.ds(_mirror_base(e) + t, 1)],
+                        commit_scl_sems.at[parity],
+                    ).start()
+                    return
                 # The runs tile the expert slab contiguously, so the
                 # per-dest lengths sum to exactly live_blocks. Rows go per
                 # run; the scales go once, below, because a tile's are one
@@ -1355,9 +1430,12 @@ def _build_push_moe_kernel(
         def _():
             prime_expert(visit_sm[0], jnp.int32(0), 0)
 
-        _all_pairs_barrier(ep)
+        if single_barrier:
+            _entry_barrier_first_phase(ep)
+        else:
+            _all_pairs_barrier(ep)
         if tc_dispatch:
-            dispatch_issue(sc_prepush, min(sc_prepush + 1, g_local))
+            dispatch_issue(sc_prepush, min(sc_prepush + dispatch_ahead, g_local))
 
         def push_expert(e):
             """Push expert e's remote regions and hop its own-dest region."""
@@ -1366,7 +1444,13 @@ def _build_push_moe_kernel(
             # on its own length: a zero-length REMOTE DMA must never issue.
             for d in range(ep):
                 region_blocks = commit_len_sm[e, d]
-                src_block = contrib_off_sm[e, d]
+                # A staged build's contribution slab is shaped like the expert
+                # slab (see commit_tile); otherwise it is packed per dest.
+                src_row = (
+                    expert_base_sm[e] + commit_start_sm[e, d] * ROWBLK
+                    if hbm_staging
+                    else contrib_off_sm[e, d] * ROWBLK
+                )
                 dst_block = push_dst_sm[e, d]
                 is_me = jnp.int32(d) == me
 
@@ -1378,9 +1462,7 @@ def _build_push_moe_kernel(
                     def push_run():
                         """The rows themselves, at their true length."""
                         pltpu.make_async_remote_copy(
-                            src_ref=contrib_hbm.at[
-                                pl.ds(src_block * ROWBLK, true_rows)
-                            ],
+                            src_ref=contrib_hbm.at[pl.ds(src_row, true_rows)],
                             dst_ref=recv_hbm.at[
                                 pl.ds(push_dst_sm[e, d] * ROWBLK, true_rows)
                             ],
@@ -1409,9 +1491,7 @@ def _build_push_moe_kernel(
                 @pl.when(_and_nonempty(is_me, region_blocks))
                 def _():
                     pltpu.make_async_copy(
-                        contrib_hbm.at[
-                            pl.ds(src_block * ROWBLK, region_blocks * ROWBLK)
-                        ],
+                        contrib_hbm.at[pl.ds(src_row, region_blocks * ROWBLK)],
                         recv_hbm.at[pl.ds(dst_block * ROWBLK, region_blocks * ROWBLK)],
                         mehop_sem,
                     ).start()
@@ -1426,9 +1506,10 @@ def _build_push_moe_kernel(
             """One step of the visit list: compute, then drain and push."""
             e = visit_sm[visit_i]
             if tc_dispatch:
-                # Push the position sc_prepush + 1 visits ahead, so a peer's
-                # rows for its next expert are in flight while it computes.
-                ahead = visit_i + sc_prepush + 1
+                # Push the position sc_prepush + dispatch_ahead visits ahead,
+                # so a peer's rows for its next experts are in flight while it
+                # computes.
+                ahead = visit_i + sc_prepush + dispatch_ahead
 
                 @pl.when(ahead < g_local)
                 def _():
@@ -1438,12 +1519,44 @@ def _build_push_moe_kernel(
             if push_from_vmem:
                 # Each tile shipped itself; there is nothing left to flush.
                 return carry
-            carry = drain_commits(carry)
-            push_expert(e)
+            if not hbm_staging:
+                carry = drain_commits(carry)
+                push_expert(e)
+                return carry
+            # A staged build pushes the PREVIOUS visit's runs here, so this
+            # visit's last commits land while the next visit computes. Of the
+            # previous visit, only its last tile can still owe commits: it
+            # sits on the parity this visit did not end on, which this
+            # visit's tiles reused (and so waited) unless it ran one tile.
+            other = jnp.int32(1) - lax.rem(carry[0] - 1, jnp.int32(OUT_PARITIES))
+            for q in range(OUT_PARITIES):
+                pend_q = carry[1 + q]
+
+                @pl.when(jnp.logical_and(other == q, pend_q > 0))
+                def _(q=q, pend_q=pend_q):
+                    wait_commits(q, pend_q)
+
+            carry = (
+                carry[0],
+                jnp.where(other == 0, 0, carry[1]),
+                jnp.where(other == 1, 0, carry[2]),
+            )
+
+            @pl.when(visit_i > 0)
+            def _():
+                push_expert(visit_sm[visit_i - 1])
+
             return carry
 
         carry0 = tuple(jnp.int32(0) for _ in range(5 if push_from_vmem else 3))
         carry_end = lax.fori_loop(0, n_visit, visit_step, carry0)
+        if hbm_staging:
+            # The last visit's runs, deferred past the loop.
+            carry_end = drain_commits(carry_end)
+
+            @pl.when(n_visit > 0)
+            def _():
+                push_expert(visit_sm[n_visit - 1])
 
         def drain_transport():
             """Consume the pushes and the commits the per-tile waits left."""
@@ -1475,7 +1588,9 @@ def _build_push_moe_kernel(
         if tc_dispatch:
             # Whatever visit positions the loop did not reach -- this shard
             # may visit fewer experts than its peers -- then the sends.
-            dispatch_issue(jnp.minimum(n_visit + sc_prepush + 1, g_local), g_local)
+            dispatch_issue(
+                jnp.minimum(n_visit + sc_prepush + dispatch_ahead, g_local), g_local
+            )
             n_remote = dmeta_sm[2 * g_local + 1]
 
             @pl.when(n_remote > 0)
@@ -1483,7 +1598,8 @@ def _build_push_moe_kernel(
                 _rows_wait(dsend_sem, dispatch_hbm, n_remote)
 
         drain_transport()
-        _all_pairs_barrier(ep)
+        if tail_barrier:
+            _all_pairs_barrier(ep)
 
     hbm = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
     # The VMEM buffers come from the same list the VMEM accounting sums, in
@@ -1609,6 +1725,10 @@ def _build_push_moe_kernel(
             f"{'' if act_fn == 'silu' else '_' + act_fn}"
             f"{bias_tag}"
             f"_g{g_local}_c{capacity}_nb{nbuf}_s{sc_prepush}"
+            f"{'' if tail_barrier else '_notail'}"
+            f"{'_hbmst' if hbm_staging else ''}"
+            f"{'' if dispatch_ahead == 1 else f'_da{dispatch_ahead}'}"
+            f"{'_1b' if single_barrier else ''}"
         )
         return pl.pallas_call(
             kernel,

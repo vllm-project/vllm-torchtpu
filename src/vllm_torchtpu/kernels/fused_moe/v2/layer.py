@@ -225,8 +225,12 @@ def _exchange_layout(t_local, topk, e_total, quantized):
 
     Section starts and total width are aligned to ``HIDDEN_LANE_BLOCK`` so
     every unpack slice is a view and the SparseCore-offloaded all-gather
-    operates on lane-aligned rows even when ``e_total`` includes non-multiple-of-128
-    spare slots.
+    operates on lane-aligned rows even when ``e_total`` includes spare slots
+    that are not a multiple of 128: an expert layout with spare slots (392 or
+    416 physical experts) was the first odd count, and the unaligned gather
+    failed XLA's offload-collective config builder at compile time
+    (offload_collective_config_builder.h:236). Padding the tail keeps every
+    existing width exactly as it was.
     """
     idx = align_up(t_local * topk, HIDDEN_LANE_BLOCK)
     scale = align_up(t_local, HIDDEN_LANE_BLOCK) if quantized else 0
@@ -756,6 +760,10 @@ def fused_ep_moe_v2(
         )
         if normalized_rows is not None:
             select_rows = normalized_rows
+        # A placed layer maps logical ids to slots between selection and
+        # finalization (`_to_slots`), so it takes the unfused route: the
+        # fused finalize writes the invalid-id sentinel, which `_to_slots`
+        # would clip onto a real expert's slot.
         fused_finalize = (
             normalized_rows is not None
             and expert_slot_l is None
@@ -797,7 +805,9 @@ def fused_ep_moe_v2(
                     normalize=normalized_rows is not None,
                 )
             if expert_slot_l is not None:
-                # Selection ran on global ids; only now do they become slots.
+                # Selection ran on global ids; only now do they become slots. A
+                # replicated expert's rows split over its copies by global row
+                # (see _to_slots).
                 topk_idx = _to_slots(topk_idx, expert_slot_l, me * t_local)
             topk_idx = _relabel_expert_ids_to_mesh_order(
                 topk_idx, g_local=g_local, mesh_ep_ranks=mesh_ep_ranks

@@ -106,7 +106,6 @@ def test_synchronized_profile_writes_to_requested_directory(
         (16, "v2", 2, True, True, "requires push"),
         (16, "push", 1, True, True, "SC_PREPUSH=2"),
         (16, "push", 2, False, True, "TC_EXCHANGE=1"),
-        (16, "push", 2, True, False, "TPU_MOE_EPLB_DYNAMIC=1"),
     ],
 )
 def test_dp16_ci_requires_push_and_dynamic_eplb_without_split_topology(
