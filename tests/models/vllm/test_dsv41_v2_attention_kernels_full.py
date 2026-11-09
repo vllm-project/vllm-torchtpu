@@ -1448,11 +1448,11 @@ class TestIndexerKernelsAndSelection:
                 topk=0,
                 block_size=16,
                 candidate_write=False,
-                candidate_filter=False,
+                sparse_logits=False,
             )
 
-        # 2. candidate_write and candidate_filter both True
-        with pytest.raises(ValueError, match="Candidate sources must not filter"):
+        # 2. candidate_write and sparse_logits both True
+        with pytest.raises(ValueError, match="must not use sparse logits"):
             select_indices_jax(
                 scores,
                 lengths,
@@ -1460,7 +1460,7 @@ class TestIndexerKernelsAndSelection:
                 topk=8,
                 block_size=16,
                 candidate_write=True,
-                candidate_filter=True,
+                sparse_logits=True,
             )
 
         # 3. candidate shape mismatch
@@ -1472,7 +1472,7 @@ class TestIndexerKernelsAndSelection:
                 topk=8,
                 block_size=16,
                 candidate_write=False,
-                candidate_filter=False,
+                sparse_logits=False,
             )
 
     def test_select_indices_jax_candidate_write_and_filter(self):
@@ -1489,13 +1489,13 @@ class TestIndexerKernelsAndSelection:
             topk=4,
             block_size=16,
             candidate_write=True,
-            candidate_filter=False,
+            sparse_logits=False,
         )
         assert selected_w.shape == (4, 4)
         assert published_w.shape == (4, 2)
         assert published_w[0, 0] >= 0
 
-        # 2. candidate_filter with batch_max <= topk short-context bypass
+        # 2. sparse_logits with batch_max <= topk short-context bypass
         selected_f, published_f = select_indices_jax(
             scores,
             lengths,
@@ -1503,11 +1503,11 @@ class TestIndexerKernelsAndSelection:
             topk=64,
             block_size=16,
             candidate_write=False,
-            candidate_filter=True,
+            sparse_logits=True,
         )
         assert selected_f.shape == (4, 64)
 
-        # 3. candidate_filter without short-circuit
+        # 3. sparse_logits without short-circuit
         candidates_valid = jnp.array([[0, 1], [0, 1], [0, 1], [0, 1]], dtype=jnp.int32)
         selected_f2, _ = select_indices_jax(
             scores,
@@ -1516,7 +1516,7 @@ class TestIndexerKernelsAndSelection:
             topk=4,
             block_size=16,
             candidate_write=False,
-            candidate_filter=True,
+            sparse_logits=True,
         )
         assert selected_f2.shape == (4, 4)
 
@@ -1528,7 +1528,7 @@ class TestIndexerKernelsAndSelection:
             topk=4,
             block_size=16,
             candidate_write=False,
-            candidate_filter=False,
+            sparse_logits=False,
             unordered=True,
         )
         assert selected_unord.shape == (4, 4)
@@ -1547,7 +1547,7 @@ class TestIndexerKernelsAndSelection:
                 topk=16,
                 block_size=16,
                 candidate_write=False,
-                candidate_filter=False,
+                sparse_logits=False,
                 unordered=True,
             )
             assert selected_sc.shape == (4, 16)
@@ -1562,7 +1562,7 @@ class TestIndexerKernelsAndSelection:
         candidates = jnp.full((4, 2), 0, dtype=jnp.int32)
         requests = jnp.array([0, 0, 1, 1], dtype=jnp.int32)
 
-        # 1. Full context bypass: not candidate_filter
+        # 1. Full context bypass: not sparse_logits
         sel1, pub1 = paged_indexer_jax(
             q,
             pool,
@@ -1574,7 +1574,7 @@ class TestIndexerKernelsAndSelection:
             topk=8,
             block_size=16,
             candidate_write=False,
-            candidate_filter=False,
+            sparse_logits=False,
         )
         assert sel1.shape == (4, 8)
         assert pub1.shape == (4, 2)
@@ -1591,7 +1591,7 @@ class TestIndexerKernelsAndSelection:
             topk=64,
             block_size=16,
             candidate_write=False,
-            candidate_filter=True,
+            sparse_logits=True,
         )
         assert sel2.shape == (4, 64)
 
@@ -1610,7 +1610,7 @@ class TestIndexerKernelsAndSelection:
             topk=4,
             block_size=16,
             candidate_write=False,
-            candidate_filter=True,
+            sparse_logits=True,
             unordered=True,
         )
         assert sel_cand_unord.shape == (4, 4)
@@ -1627,7 +1627,7 @@ class TestIndexerKernelsAndSelection:
             topk=4,
             block_size=16,
             candidate_write=False,
-            candidate_filter=True,
+            sparse_logits=True,
             unordered=False,
         )
         assert sel_cand_ord.shape == (4, 4)
@@ -1668,7 +1668,7 @@ class TestIndexerKernelsAndSelection:
                 topk=16,
                 block_size=16,
                 candidate_write=False,
-                candidate_filter=True,
+                sparse_logits=True,
                 unordered=True,
             )
             assert sel_cand_sc.shape == (4, 16)
@@ -1727,7 +1727,7 @@ class TestIndexerKernelsAndSelection:
             topk=8,
             block_size=16,
             candidate_write=False,
-            candidate_filter=False,
+            sparse_logits=False,
             unordered=False,
         )
         assert sel.shape == (4, 8)
@@ -1747,7 +1747,7 @@ class TestIndexerKernelsAndSelection:
             topk=8,
             block_size=16,
             candidate_write=False,
-            candidate_filter=False,
+            sparse_logits=False,
             unordered=False,
         )
         assert jnp.array_equal(sel_2b, sel)
@@ -1791,7 +1791,7 @@ class TestIndexerKernelsAndSelection:
                 topk=8,
                 block_size=16,
                 candidate_write=False,
-                candidate_filter=False,
+                sparse_logits=False,
                 unordered=False,
             )
             assert f_sel.shape == (4, 8)
@@ -1812,7 +1812,7 @@ class TestIndexerKernelsAndSelection:
                 topk=8,
                 block_size=16,
                 candidate_write=False,
-                candidate_filter=False,
+                sparse_logits=False,
                 unordered=False,
             )
             assert f_sel_2b.shape == (4, 8)
@@ -1848,7 +1848,7 @@ class TestIndexerKernelsAndSelection:
             topk=8,
             block_size=16,
             candidate_write=False,
-            candidate_filter=False,
+            sparse_logits=False,
             batch_max=None,
         )
         assert mock_idx_op.call_count == 1
@@ -1864,7 +1864,7 @@ class TestIndexerKernelsAndSelection:
             topk=8,
             block_size=16,
             candidate_write=False,
-            candidate_filter=False,
+            sparse_logits=False,
             batch_max=torch.tensor([64]),
         )
         assert mock_idx_op.call_count == 2
@@ -1881,7 +1881,7 @@ class TestIndexerKernelsAndSelection:
             topk=8,
             block_size=16,
             candidate_write=False,
-            candidate_filter=False,
+            sparse_logits=False,
             batch_max=torch.tensor([64]),
         )
         assert selected_2b.shape == (4, 8)

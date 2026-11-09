@@ -69,11 +69,10 @@ class SparseMQAIndexer(torch.nn.Module):
         unordered: bool,
         score_width: int,
         stage_cache: dict[Any, Any] | None,
+        query_start_loc: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        candidate_filter = (
-            self.candidate_blocks is not None and not self.candidate_write
-        )
-        reuse = candidate_filter and stage_cache is not None
+        sparse_logits = self.candidate_blocks is not None and not self.candidate_write
+        reuse = sparse_logits and stage_cache is not None
         packed_fp8 = isinstance(cache, PackedFP8IndexCacheRows)
         capacity = (
             cache_capacity(
@@ -94,6 +93,7 @@ class SparseMQAIndexer(torch.nn.Module):
                     stage_cache=stage_cache,
                     source_prefix=self.k_cache.prefix,
                     candidate_source=self.candidate_source_layer,
+                    query_start_loc=query_start_loc,
                 )
                 if packed_fp8
                 else functools.partial(
@@ -111,7 +111,7 @@ class SparseMQAIndexer(torch.nn.Module):
                 topk=self.topk_tokens,
                 block_size=max(1, self.candidate_block_size),
                 candidate_write=self.candidate_write,
-                candidate_filter=candidate_filter,
+                sparse_logits=sparse_logits,
                 unordered=unordered,
                 batch_max=batch_max,
             )

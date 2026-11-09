@@ -518,7 +518,7 @@ class TestBenchDecodeAttention:
 
 class TestBenchDecodeIndexerSplit:
     def test_constants_and_split_part(self):
-        assert bdis.SUBOPS == ("candidate_write", "candidate_filter", "full_context")
+        assert bdis.SUBOPS == ("candidate_write", "sparse_logits", "full_context")
         assert bdis.SPLITS == ("pad16", "balanced", "ceil")
         assert bdis.LEGACY_TILE == (16384, 2048)
 
@@ -651,7 +651,7 @@ class TestBenchDecodeIndexerSplit:
             for stage in ["scores", "select", "all"]:
                 for subop in (
                     "candidate_write",
-                    "candidate_filter",
+                    "sparse_logits",
                     "full_context",
                 ):
                     args = argparse.Namespace(

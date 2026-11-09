@@ -19,7 +19,6 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_ENGRAM_HBM: str = "auto"
     TPU_DEEPSEEK_V41_DECODE_FUSION: str = "auto"
     TPU_DEEPSEEK_V41_INDEXER_ISSUE_DEPTH: int | None = 8
-    TPU_DEEPSEEK_V41_INDEXER_PUBLISH_ISSUE_DEPTH: int | None = 7
     TPU_DEEPSEEK_V41_REUSE_WINDOW_STARTS: bool = True
     TPU_DEEPSEEK_V41_MHC_RESIDENT_GATES: bool = True
     TPU_DEEPSEEK_V41_MHC_EARLY_PREP: bool = True
@@ -473,14 +472,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         case_sensitive=False,
     ),
     # Packed FP8 dense indexer scorer: fragments in flight between the QK
-    # matmul and the head reduction (unset: the tuned 10). The second applies
-    # to the scorer with fused candidate publication. Scheduling only: the
-    # head-sum split stays keyed to the tuned depth (bit-exact).
+    # matmul and the head reduction (unset: the tuned 10). Scheduling only:
+    # the head-sum split stays keyed to the tuned depth (bit-exact).
     "TPU_DEEPSEEK_V41_INDEXER_ISSUE_DEPTH": env_positive_int_or_none(
         "TPU_DEEPSEEK_V41_INDEXER_ISSUE_DEPTH", default=8
-    ),
-    "TPU_DEEPSEEK_V41_INDEXER_PUBLISH_ISSUE_DEPTH": env_positive_int_or_none(
-        "TPU_DEEPSEEK_V41_INDEXER_PUBLISH_ISSUE_DEPTH", default=7
     ),
     # CED decode: reuse the per-request SWA window-starts device tensor while
     # the replay starts are unchanged, instead of building and uploading it in

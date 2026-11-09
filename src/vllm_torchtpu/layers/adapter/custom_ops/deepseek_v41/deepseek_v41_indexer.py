@@ -242,7 +242,7 @@ def select_indices_jax(
     topk: int,
     block_size: int,
     candidate_write: bool,
-    candidate_filter: bool,
+    sparse_logits: bool,
     *,
     sparsecore: bool = False,
     scores_masked: bool = False,
@@ -251,21 +251,19 @@ def select_indices_jax(
     count, width = scores.shape
     if topk < 1 or width < 1 or block_size < 1:
         raise ValueError("Positive top-k, score width and block size required")
-    if candidate_write and candidate_filter:
-        raise ValueError("Candidate sources must not filter their own scores")
+    if candidate_write and sparse_logits:
+        raise ValueError("Candidate sources must not use sparse logits")
     if candidates.ndim != 2 or candidates.shape[0] != count:
         raise ValueError("Candidate rows must match query rows")
     lengths = jnp.clip(lengths.reshape(count), 0, width)
     logical = jnp.arange(width)[None, :]
     visible = logical < lengths[:, None]
-    if not scores_masked or candidate_write or candidate_filter:
+    if not scores_masked or candidate_write or sparse_logits:
         scores = jnp.where(visible, scores, -jnp.inf)
     published = candidates
     # When the candidate buffer covers every block, publication/filtering are
     # identities. Keep the caller's buffer untouched in this static case.
-    if (candidate_write or candidate_filter) and candidates.shape[
-        1
-    ] * block_size < width:
+    if (candidate_write or sparse_logits) and candidates.shape[1] * block_size < width:
         blocks = (width + block_size - 1) // block_size
         if candidate_write:
             block_scores = (
@@ -369,7 +367,7 @@ def paged_indexer_jax(
     topk: int,
     block_size: int,
     candidate_write: bool,
-    candidate_filter: bool,
+    sparse_logits: bool,
     page_stride: int,
     *,
     sparsecore: bool = False,
@@ -387,12 +385,12 @@ def paged_indexer_jax(
             topk,
             block_size,
             candidate_write,
-            candidate_filter,
+            sparse_logits,
             sparsecore=sparsecore,
         )
 
     width = records.shape[1]
-    if not candidate_filter or candidates.shape[1] * block_size >= width:
+    if not sparse_logits or candidates.shape[1] * block_size >= width:
         return full_context(None)
 
     def candidate_context(_):
@@ -449,7 +447,7 @@ def bounded_indexer_jax(
     topk,
     block_size,
     candidate_write,
-    candidate_filter,
+    sparse_logits,
     page_size,
     page_stride,
     row_offset,
@@ -470,7 +468,7 @@ def bounded_indexer_jax(
     sparsecore = jax.default_backend() == "tpu"
     short_context = lengths.max() <= topk
 
-    if not candidate_write and not candidate_filter:
+    if not candidate_write and not sparse_logits:
 
         def prepare(index):
             start = index * tile
@@ -559,7 +557,7 @@ def bounded_indexer_jax(
                 scores_masked=True,
             )
 
-        if candidate_filter and candidates.shape[1] * block_size < capacity:
+        if sparse_logits and candidates.shape[1] * block_size < capacity:
 
             def candidate_context(_):
                 # Form only candidate addresses. A dense [tile, capacity]
@@ -685,7 +683,7 @@ def update_and_select_jax(
     topk: int,
     block_size: int,
     candidate_write: bool,
-    candidate_filter: bool,
+    sparse_logits: bool,
     page_size: int,
     page_stride: int,
     row_offset: int,
@@ -708,7 +706,7 @@ def update_and_select_jax(
         topk,
         block_size,
         candidate_write,
-        candidate_filter,
+        sparse_logits,
         page_size,
         page_stride,
         row_offset,
@@ -752,7 +750,7 @@ def initialize_indexer():
         topk,
         block_size,
         candidate_write,
-        candidate_filter,
+        sparse_logits,
         page_size,
         page_stride,
         row_offset,
@@ -808,7 +806,7 @@ def paged_indexer(
     topk,
     block_size,
     candidate_write,
-    candidate_filter,
+    sparse_logits,
 ):
     assert _indexer_op is not None
     return _indexer_op(
@@ -826,6 +824,6 @@ def paged_indexer(
         topk,
         block_size,
         candidate_write,
-        candidate_filter,
+        sparse_logits,
         *layout.geometry,
     )

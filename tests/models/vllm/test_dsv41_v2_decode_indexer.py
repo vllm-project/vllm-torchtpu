@@ -16,7 +16,7 @@ Target modules and diff lines:
      * split=False (ranks = 1, padding = 0, no slice / no gather)
      * cached_query_split hit vs miss (stage_attention_cache_scope)
      * candidate_write=True vs candidate_write=False
-     * candidate_filter=True vs False
+     * sparse_logits=True vs False
      * page_records passed to paged_indexer
 3. vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels
    - Constants _INDEX_KEYS_PER_ITER = 65536, _INDEX_MAX_TILE = 8192
@@ -442,7 +442,7 @@ class TestAttentionKernelsDecodeIndexer:
             topk=16,
             block_size=16,
             candidate_write=False,
-            candidate_filter=False,
+            sparse_logits=False,
         )
         assert len(called_args) == 1
         # page_records follows the eight tensor inputs and five selectors.
@@ -461,7 +461,7 @@ class TestAttentionKernelsDecodeIndexer:
             topk=16,
             block_size=16,
             candidate_write=False,
-            candidate_filter=False,
+            sparse_logits=False,
             batch_max=torch.tensor(50, dtype=torch.int32),
             page_records=32,
         )
@@ -490,7 +490,7 @@ class TestAttentionKernelsDecodeIndexer:
             block_size=16,
             batch_max=jnp.array(20, dtype=jnp.int32),
             candidate_write=False,
-            candidate_filter=False,
+            sparse_logits=False,
             unordered=False,
             page_records=0,
         )
@@ -508,7 +508,7 @@ class TestAttentionKernelsDecodeIndexer:
             block_size=16,
             batch_max=jnp.array(20, dtype=jnp.int32),
             candidate_write=False,
-            candidate_filter=False,
+            sparse_logits=False,
             unordered=False,
             page_records=64,
         )

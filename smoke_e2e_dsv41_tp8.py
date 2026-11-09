@@ -17,7 +17,7 @@ Exercises all DeepSeek-V4.1 architectural paths in 4 or 6 layers on TPU7x-8:
 - L0: SWA-only attention
 - L1: C2 KV compressor + Engram + Indexer full_context + SparseMLA + SWA
 - L2 (4L) / L3 (6L): CED boundary + C1 KV compressor + Indexer candidate_write
-- L3 (4L) / L4 (6L): C1 KV reuse + Indexer candidate_filter
+- L3 (4L) / L4 (6L): C1 KV reuse + Indexer sparse_logits
 - (6L also exercises L2 C2 shared-index reuse and L5 C1 shared-index reuse)
 
 Also installs a worker-side ``sitecustomize.py`` in the generated smoke model
