@@ -105,7 +105,6 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
     TPU_MOE_EPLB_DYNAMIC: bool = False
-    TPU_MOE_EPLB_PREFILL: bool = True
     TPU_MOE_EPLB_WINDOW_STEPS: int = 16
     TPU_MOE_EPLB_MIN_GAIN: float = 0.005
     TPU_MOE_EPLB_MOVER_STEP_BUDGET_MB: int = 256
@@ -870,8 +869,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # major_slice_bytes and FP4 (float4_e2m1fn_x2) raw-transfer support;
     # otherwise leave this feature disabled (default off).
     "TPU_MOE_EPLB_DYNAMIC": env_bool("TPU_MOE_EPLB_DYNAMIC"),
-    # Include clean prefill windows when dynamic EPLB is enabled.
-    "TPU_MOE_EPLB_PREFILL": env_bool("TPU_MOE_EPLB_PREFILL", True),
     # Clean decode steps per load window before triggering a re-layout solve.
     "TPU_MOE_EPLB_WINDOW_STEPS": env_nonnegative_int("TPU_MOE_EPLB_WINDOW_STEPS", 16),
     # Minimum relative reduction in slowest-rank load required to adopt a plan.
