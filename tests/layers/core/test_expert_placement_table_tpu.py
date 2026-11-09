@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Ragged all-to-all EP MoE under a static expert placement: the experts' weights
 moved to their slots and the routed ids replaced by the slots give the linear
-placement's result, bitwise where every member's partial sums keep their order."""
+placement's result, bitwise where every member's partial sums keep their order.
+Replicas of experts in redundant slots give the result of the same placement
+without them, bitwise."""
 
 import functools
 
@@ -16,7 +18,14 @@ from vllm_torchtpu.layers.core.fused_moe_gmm import (
     quantize_to_native_fp4_kmajor,
     resolve_onehot_permute_threshold,
 )
-from vllm_torchtpu.layers.core.ragged_a2a_moe import DP_AXIS, TP_AXIS, ragged_a2a_moe
+from vllm_torchtpu.layers.core.ragged_a2a_moe import (
+    DP_AXIS,
+    TP_AXIS,
+    _capacity_overflow,
+    exchange_capacity,
+    ragged_a2a_moe,
+    serving_slots,
+)
 
 HIDDEN, INTER, EXPERTS, RANKS = 2048, 512, 64, 8
 
@@ -121,3 +130,253 @@ def test_balanced_placement_matches_linear_up_to_sum_order(dp_size, tp_size, kno
     differ = (g != b).mean()
     print(f"dp{dp_size} tp{tp_size} {knobs}: {differ:.4%} of engine sums differ")
     np.testing.assert_allclose(g, b, rtol=2e-2, atol=2e-2)
+
+
+def _greedy_replicas(counts, slots, redundant_per_rank):
+    """Replicas from the builder's packing, every redundant slot asked for (the
+    replication greedy without the guard)."""
+    replicas = np.ones(EXPERTS, np.int64)
+    for _ in range(RANKS * redundant_per_rank):
+        replicas[int(np.argmax(counts / replicas))] += 1
+    return core.place_replicas(counts, slots, RANKS, redundant_per_rank, replicas)
+
+
+def _spread_replicas(counts, slots):
+    """One redundant slot per rank: the busiest expert on every rank but its
+    own, which replicates the next busiest expert it does not hold. Replicas
+    then serve routes on the token's owner rank and on every TP column."""
+    local = EXPERTS // RANKS
+    busiest = np.argsort(-counts, kind="stable")
+    redundant = np.full(RANKS, busiest[0], np.int32)
+    own = slots[busiest[0]] // local
+    redundant[own] = next(e for e in busiest[1:] if slots[e] // local != own)
+    return redundant
+
+
+def _with_replicas(args, slots, redundant):
+    """The placement's weights with each rank's redundant slots after its primaries
+    (an empty slot holds expert 0's weights: no route reaches it), the routed
+    ids as physical primaries, and the replica table on every rank."""
+    x, w1, w2, s1, s2, weights, ids, _ = args
+    local = EXPERTS // RANKS
+    redundant_per_rank = redundant.shape[0] // RANKS
+    held = np.concatenate(
+        [
+            np.argsort(slots).reshape(RANKS, local),
+            redundant.reshape(RANKS, redundant_per_rank),
+        ],
+        axis=1,
+    ).reshape(-1)
+    pick = jnp.asarray(np.maximum(held, 0))
+    w1, w2, s1, s2 = (a[pick] for a in (w1, w2, s1, s2))
+    primary = core.physical_slots(slots, RANKS, redundant_per_rank)
+    ids = jnp.asarray(primary.astype(np.int32))[ids]
+    es = jnp.arange(RANKS, dtype=jnp.int32) * (local + redundant_per_rank)
+    table = core.replica_table(slots, redundant, RANKS)
+    return (x, w1, w2, s1, s2, weights, ids, es), table
+
+
+def _run_owner(
+    args,
+    dp_size,
+    tp_size,
+    topk,
+    num_tokens,
+    *,
+    shared,
+    threshold,
+    replicas=None,
+    **knobs,
+):
+    mesh = Mesh(np.asarray(_devices()).reshape(dp_size, tp_size), (DP_AXIS, TP_AXIS))
+    stacked = tuple(a.reshape(dp_size, tp_size, -1, *a.shape[1:]) for a in args)
+    kwargs = {"shared": shared}
+    if replicas is not None:
+        tiled = np.tile(replicas, (RANKS, 1))
+        kwargs["replicas"] = jnp.asarray(tiled).reshape(
+            dp_size, tp_size, *replicas.shape
+        )
+    run = functools.partial(
+        ragged_a2a_moe,
+        mesh=mesh,
+        topk=topk,
+        activation="silu",
+        use_sparse_core=True,
+        onehot_moe_permute_threshold=threshold,
+        owner_combine=True,
+        sorted_plan=True,
+        **knobs,
+    )
+    return np.asarray(jax.jit(run)(*stacked, **kwargs))
+
+
+# (rows, routes) factors: a step that fits (replicas serve routes), one that
+# overflows on every rank (the full-size exchange serves the primaries), and
+# none (the full-size exchange only). "overflow_sc": the full-size exchange
+# runs the SparseCore permute and returns partials to the senders, as it does
+# at 32 chips, because the one-hot threshold sits between the capacity
+# exchange's routes and the full-size exchange's.
+REPLICA_CAPACITY = {
+    "fits": dict(capacity_factor=1.15, route_factor=1.5),
+    "overflow": dict(capacity_factor=0.5, route_factor=0.5),
+    "overflow_sc": dict(capacity_factor=0.5, route_factor=0.5),
+    "full": dict(capacity_factor=0.0),
+}
+REPLICA_OPTIONS = {
+    "served": dict(row_gather=True, row_scatter=True, routing_dma=True),
+    "served_tail": dict(
+        row_gather=True, row_scatter=True, routing_dma=True, owner_tail=True
+    ),
+    "plain": {},
+}
+REPLICA_CASES = (
+    [
+        (layout, table, capacity, options, False)
+        for layout in ((2, 4, 112), (4, 2, 56))
+        for table in ("spread", "greedy")
+        for capacity in ("fits", "overflow")
+        for options in ("served", "served_tail")
+    ]
+    + [
+        (layout, "greedy2", "fits", options, False)
+        for layout in ((2, 4, 112), (4, 2, 56))
+        for options in ("served", "served_tail")
+    ]
+    + [
+        (layout, "spread", "overflow_sc", "served", False)
+        for layout in ((2, 4, 112), (4, 2, 56))
+    ]
+    + [((2, 4, 112), "spread", "fits", "plain", False)]
+    + [((4, 2, 56), "greedy", "fits", "served_tail", True)]
+    + [((2, 4, 112), "spread", "full", "served", False)]
+)
+_REPLICA_BASE = {}
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize("layout,table,capacity,options,padded", REPLICA_CASES)
+def test_replicas_keep_every_output_bit(layout, table, capacity, options, padded):
+    """The owner-combine exchange as served (sorted plan, owner combine with the
+    shared partial; row copies, routing DMA and the owner tail by case) with
+    replicas in redundant slots gives, bit for bit, the same placement's result
+    without them: on a step that fits, where replicas serve routes, and on a
+    step that overflows, where the full-size exchange serves primaries."""
+    dp_size, tp_size, num_tokens = layout
+    topk = 10
+    args = _inputs(tp_size, num_tokens, topk, skew=False)
+    if padded:
+        weights = args[5].reshape(RANKS, num_tokens, topk).at[:, -5:].set(0)
+        args = args[:5] + (weights.reshape(-1, topk),) + args[6:]
+    counts = np.bincount(np.asarray(args[6]).ravel(), minlength=EXPERTS)
+    slots = core.balance(counts, RANKS)
+    redundant = {
+        "spread": lambda: _spread_replicas(counts, slots),
+        "greedy": lambda: _greedy_replicas(counts, slots, 1),
+        "greedy2": lambda: _greedy_replicas(counts, slots, 2),
+    }[table]()
+    core.validate(slots[None], ["layer"], RANKS, redundant[None])
+    replicated, table = _with_replicas(args, slots, redundant)
+    knobs = dict(REPLICA_CAPACITY[capacity], **REPLICA_OPTIONS[options])
+    knobs["skip_padded_tokens"] = padded
+    threshold = resolve_onehot_permute_threshold(dp_size * num_tokens * topk)
+    if capacity == "overflow_sc":
+        threshold = 1024
+        assert dp_size * num_tokens * topk > threshold
+    rng = np.random.default_rng(3)
+    shared = jnp.asarray(
+        rng.standard_normal((dp_size, tp_size, num_tokens, HIDDEN)) / 8, jnp.bfloat16
+    )
+
+    # The branch the run with replicas takes, from its serving slots.
+    local = EXPERTS // RANKS + redundant.shape[0] // RANKS
+    engine_ids = np.asarray(replicated[6]).reshape(dp_size, tp_size, num_tokens, topk)
+    engine_ids = jnp.asarray(engine_ids[:, 0])
+    serving = jax.vmap(serving_slots, in_axes=(0, None))(engine_ids, jnp.asarray(table))
+    if capacity != "full":
+        rows, routes = exchange_capacity(
+            dp_size=dp_size,
+            tp_size=tp_size,
+            num_tokens=num_tokens,
+            topk=topk,
+            local_num_experts=EXPERTS // RANKS,
+            factor=knobs["capacity_factor"],
+            onehot_moe_permute_threshold=threshold,
+            use_sparse_core=True,
+            route_factor=knobs["route_factor"],
+        )
+        assert rows < dp_size * num_tokens and routes <= threshold
+        overflow = _capacity_overflow(
+            serving, tp_size=tp_size, local_num_experts=local, rows=rows, routes=routes
+        )
+        assert bool(overflow) == capacity.startswith("overflow")
+    assert (np.asarray(serving) != np.asarray(engine_ids)).mean() > 0.01
+
+    key = (layout, capacity, options, padded)  # the same slots for every table
+    if key not in _REPLICA_BASE:
+        _REPLICA_BASE[key] = _run_owner(
+            _placed(args, slots),
+            dp_size,
+            tp_size,
+            topk,
+            num_tokens,
+            shared=shared,
+            threshold=threshold,
+            **knobs,
+        )
+    base = _REPLICA_BASE[key]
+    got = _run_owner(
+        replicated,
+        dp_size,
+        tp_size,
+        topk,
+        num_tokens,
+        shared=shared,
+        threshold=threshold,
+        replicas=table,
+        **knobs,
+    )
+    assert np.abs(base.astype(np.float32)).max() > 0
+    np.testing.assert_array_equal(got.view(np.uint16), base.view(np.uint16))
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize("capacity", ["fits", "overflow"])
+@pytest.mark.parametrize("layout", [(2, 4, 112), (4, 2, 56)])
+def test_replicas_with_the_owner_tail_match_the_sum_kernel_and_no_replicas(
+    layout, capacity
+):
+    """With replicas, the owner tail (the expert kernel sums the owned tokens)
+    gives, bit for bit, the result without the tail and that of the same
+    placement without redundant slots, on a step that fits (replicas serve
+    routes) and on one that overflows into the full-size exchange."""
+    dp_size, tp_size, num_tokens = layout
+    topk = 10
+    args = _inputs(tp_size, num_tokens, topk, skew=False)
+    counts = np.bincount(np.asarray(args[6]).ravel(), minlength=EXPERTS)
+    slots = core.balance(counts, RANKS)
+    redundant = _greedy_replicas(counts, slots, 1)
+    core.validate(slots[None], ["layer"], RANKS, redundant[None])
+    replicated, table = _with_replicas(args, slots, redundant)
+    served = dict(row_gather=True, row_scatter=True, routing_dma=True)
+    knobs = dict(REPLICA_CAPACITY[capacity], **served)
+    threshold = resolve_onehot_permute_threshold(dp_size * num_tokens * topk)
+    rng = np.random.default_rng(3)
+    shared = jnp.asarray(
+        rng.standard_normal((dp_size, tp_size, num_tokens, HIDDEN)) / 8, jnp.bfloat16
+    )
+    run = functools.partial(
+        _run_owner,
+        dp_size=dp_size,
+        tp_size=tp_size,
+        topk=topk,
+        num_tokens=num_tokens,
+        shared=shared,
+        threshold=threshold,
+    )
+    base = run(_placed(args, slots), **knobs)
+    assert np.abs(base.astype(np.float32)).max() > 0
+    for owner_tail in (False, True):
+        got = run(replicated, replicas=table, owner_tail=owner_tail, **knobs)
+        np.testing.assert_array_equal(got.view(np.uint16), base.view(np.uint16))
+    tail_base = run(_placed(args, slots), owner_tail=True, **knobs)
+    np.testing.assert_array_equal(tail_base.view(np.uint16), base.view(np.uint16))

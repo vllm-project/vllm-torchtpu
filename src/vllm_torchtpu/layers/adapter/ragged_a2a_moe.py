@@ -114,6 +114,30 @@ def capacity_factors(dp_size: int, *, placed: bool) -> tuple[float, float]:
     return rows, routes
 
 
+def _check_replicas(switches, *, scaled, owner_combine):
+    """Refuse a layer with redundant expert slots that the exchange cannot
+    serve them in: they need scaled experts, the layer's owner combine and the
+    sorted plan."""
+    what = "Expert replicas (TPU_MOE_EXPERT_PLACEMENT with redundant slots) need"
+    if not scaled:
+        raise ValueError(f"{what} scaled experts")
+    if not owner_combine:
+        if switches.path("a2a_owner_combine"):
+            raise ValueError(
+                f"{what} the owner combine of the layer, which is not armed "
+                "for it (see decode_switches.owner_combine_layer)"
+            )
+        raise ValueError(
+            f"{what} a2a_owner_combine: set TPU_MOE_RAGGED_A2A and remove "
+            f"a2a_owner_combine from {decode_switches.FAST_PATHS_OFF}"
+        )
+    if not switches.path("a2a_sorted_plan"):
+        raise ValueError(
+            f"{what} a2a_sorted_plan: remove a2a_sorted_plan from "
+            f"{decode_switches.FAST_PATHS_OFF}"
+        )
+
+
 def _get_op(
     *,
     topk,
@@ -124,6 +148,7 @@ def _get_op(
     scaled=True,
     placed=False,
     owner_combine=False,
+    replicas=False,
 ):
     key = (
         topk,
@@ -134,13 +159,15 @@ def _get_op(
         scaled,
         placed,
         owner_combine,
+        replicas,
     )
     op = _OPS.get(key)
     if op is not None:
         return op
-    keywords = decode_switches.exchange_keywords(
-        decode_switches.get(), owner_combine=owner_combine
-    )
+    switches = decode_switches.get()
+    keywords = decode_switches.exchange_keywords(switches, owner_combine=owner_combine)
+    if replicas:
+        _check_replicas(switches, scaled=scaled, owner_combine=owner_combine)
     mesh = get_dp_tp_mesh()
     # The full-size exchange receives into one region per DP member, sized for
     # all of that member's tokens: the local permute sees the all-gather
@@ -229,7 +256,57 @@ def _get_op(
             shared=shared_output,
         )
 
-    if scaled:
+    def fn_replicas(
+        x: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array,
+        w2_scale: jax.Array,
+        topk_weights: jax.Array,
+        topk_ids: jax.Array,
+        experts_start: jax.Array,
+        replica_table: jax.Array,
+    ) -> jax.Array:
+        return run(
+            x,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            topk_weights,
+            topk_ids,
+            experts_start,
+            replicas=replica_table,
+        )
+
+    def fn_replicas_shared(
+        x: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array,
+        w2_scale: jax.Array,
+        topk_weights: jax.Array,
+        topk_ids: jax.Array,
+        experts_start: jax.Array,
+        replica_table: jax.Array,
+        shared_output: jax.Array,
+    ) -> jax.Array:
+        return run(
+            x,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            topk_weights,
+            topk_ids,
+            experts_start,
+            replicas=replica_table,
+            shared=shared_output,
+        )
+
+    if replicas:
+        body = fn_replicas_shared if shared else fn_replicas
+    elif scaled:
         body = fn_shared if shared else fn
     else:
         body = fn_unscaled_shared if shared else fn_unscaled
@@ -239,7 +316,7 @@ def _get_op(
         f"pallas::ragged_a2a_moe_{len(_OPS)}",
         body,
         mesh=mesh,
-        input_partition_specs=(spec,) * (6 + 2 * scaled + shared),
+        input_partition_specs=(spec,) * (6 + 2 * scaled + shared + replicas),
         # A tuple of per-output specs: a bare PartitionSpec is not a tuple, so
         # torch_tpu would read its first axis name as the whole spec.
         output_partition_specs=(spec,),
@@ -329,11 +406,13 @@ def prebuild_ragged_a2a_moe(
     scaled=True,
     placed=False,
     owner_combine=False,
+    replicas=False,
 ) -> None:
     """Build the mesh and op at weight load, outside the traced forward.
     ``scaled=False``: the op for unscaled (bf16) experts; ``placed``: for a
     layer TPU_MOE_EXPERT_PLACEMENT places; ``owner_combine``: for a layer
-    whose owner combine is armed (``decode_switches.arm_owner_combine``).
+    whose owner combine is armed (``decode_switches.arm_owner_combine``);
+    ``replicas``: one whose file has redundant slots.
 
     Padded tokens reach the op unrouted (TPU_MOE_SKIP_PADDED_TOKENS
     drops their routes at top-k), so the op never skips routes by weight."""
@@ -347,6 +426,7 @@ def prebuild_ragged_a2a_moe(
             scaled=scaled,
             placed=placed,
             owner_combine=owner_combine,
+            replicas=replicas,
         )
 
 
@@ -367,6 +447,7 @@ def ragged_a2a_fused_moe_gmm(
     shared_output: torch.Tensor | None = None,
     placed: bool = False,
     owner_combine: bool = False,
+    replicas: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Same contract as ``fused_moe_gmm`` with local tokens in and out; the
     result still needs vLLM's TP all-reduce, except with ``owner_combine``
@@ -374,7 +455,8 @@ def ragged_a2a_fused_moe_gmm(
     summed over TP and includes ``shared_output`` (this rank's shared-expert
     partial) when given. Unscaled (bf16) experts pass ``None`` for both
     scales; ``placed``: the layer's experts are placed by
-    TPU_MOE_EXPERT_PLACEMENT."""
+    TPU_MOE_EXPERT_PLACEMENT; ``replicas``: its redundant slots
+    (``layer._expert_replicas``) when the file has them."""
     if w1_bias is not None or w2_bias is not None:
         raise NotImplementedError("TPU_MOE_RAGGED_A2A does not take expert biases")
     if experts_start is None:
@@ -393,6 +475,7 @@ def ragged_a2a_fused_moe_gmm(
         scaled=scaled,
         placed=placed,
         owner_combine=owner_combine,
+        replicas=replicas is not None,
     )
     scales = (w1_scale, w2_scale) if scaled else ()
     stacked = (
@@ -404,6 +487,8 @@ def ragged_a2a_fused_moe_gmm(
         topk_ids.to(torch.int32),
         experts_start.reshape(1),
     )
+    if replicas is not None:
+        stacked += (replicas,)
     if shared_output is not None:
         stacked += (shared_output.to(hidden_states.dtype),)
     out = op(*(t.reshape(1, 1, *t.shape) for t in stacked))

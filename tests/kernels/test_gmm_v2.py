@@ -643,3 +643,57 @@ def test_gmm_v2_mlp_supported_shapes():
     assert not mlp_supported(
         lhs, w1, s1, w2, s2, sizes, fuse_act="silu", maybe_quantize_lhs=True
     )
+
+
+def test_gmm_v2_mlp_row_results_do_not_depend_on_their_neighbours():
+    """A replica of an expert computes a route's row in another group and beside
+    other rows. The same 20 rows give the same bits alone in a group (a 32-row
+    bucket), among 40 more rows (one 64-row tile), across a tile boundary in a
+    300-row group, and in a ninth group holding a replica of the expert's weights
+    (served sizes)."""
+    _require_tpu()
+
+    w1, s1, w2, s2 = _mlp_inputs(8, 8192, 2048, 8192)
+    # Group 8 holds a replica of expert 3.
+    experts = jnp.asarray(list(range(8)) + [3])
+    w1, s1, w2, s2 = (a[experts] for a in (w1, s1, w2, s2))
+    rows = jax.random.uniform(jax.random.key(4), (20, 8192), jnp.bfloat16, -1, 1)
+    other = jax.random.uniform(jax.random.key(5), (320, 8192), jnp.bfloat16, -1, 1)
+
+    def layout(group, before, after):
+        """lhs, group sizes and the first of the 20 rows, which sit in
+        ``group`` after ``before`` and before ``after`` of its other rows."""
+        sizes = [3, 4, 0, 10, 5, 0, 2, 6, 0]
+        sizes[group] = before + 20 + after
+        parts, used = [], 0
+        for g, n in enumerate(sizes):
+            if g == group:
+                parts += [other[used : used + before], rows]
+                parts.append(other[used + before : used + before + after])
+                used += before + after
+            else:
+                parts.append(other[used : used + n])
+                used += n
+        return jnp.concatenate(parts), sizes, sum(sizes[:group]) + before
+
+    results = []
+    for group, before, after in ((3, 0, 0), (3, 20, 20), (3, 120, 160), (8, 0, 0)):
+        lhs, sizes, start = layout(group, before, after)
+        group_sizes = jnp.asarray(sizes, jnp.int32)
+        assert mlp_supported(lhs, w1, s1, w2, s2, group_sizes, fuse_act="silu")
+        out = gmm_v2_mlp(
+            lhs,
+            w1,
+            w2,
+            group_sizes,
+            s1,
+            s2,
+            jnp.zeros((1,), jnp.int32),
+            fuse_act="silu",
+            maybe_quantize_lhs=False,
+        )
+        bits = jax.lax.bitcast_convert_type(out[start : start + 20], jnp.uint16)
+        results.append(np.asarray(bits))
+    assert (results[0] != 0).any()
+    for got in results[1:]:
+        np.testing.assert_array_equal(got, results[0])

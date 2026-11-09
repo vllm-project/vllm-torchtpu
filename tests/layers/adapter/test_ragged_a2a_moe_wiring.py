@@ -254,3 +254,125 @@ def test_routing_dma_knob_reaches_the_exchange(monkeypatch, routing_dma):
         topk=10, activation="silu", rhs_quant_dtype=None, skip_padded_tokens=False
     )
     assert seen["routing_dma"] is routing_dma
+
+
+def _record_ops(monkeypatch, dp=16, tp=4):
+    """Build ops against a stub mesh: returns the exchange's kwargs and the
+    operand count of each op built."""
+    monkeypatch.setattr(vllm.config, "get_current_vllm_config_or_none", lambda: None)
+    monkeypatch.setattr(
+        ragged_a2a,
+        "get_dp_tp_mesh",
+        lambda: SimpleNamespace(shape={"dp": dp, "tp": tp}),
+    )
+    monkeypatch.setattr(ragged_a2a, "_OPS", {})
+    monkeypatch.setattr(ragged_a2a, "_routed_rows_per_decode_step", lambda topk: 0)
+    seen, operands = [], []
+
+    def _ragged_a2a_moe(*args, **kwargs):
+        seen.append(kwargs)
+
+    monkeypatch.setattr(ragged_a2a, "ragged_a2a_moe", _ragged_a2a_moe)
+
+    class _Op:
+        def register_fake(self, fn):
+            pass
+
+    def _jax_op(name, fn, **kwargs):
+        operands.append(len(kwargs["input_partition_specs"]))
+        fn(*range(operands[-1]))
+        return _Op()
+
+    monkeypatch.setattr(ragged_a2a.pallas, "jax_op", _jax_op)
+    return seen, operands
+
+
+@pytest.mark.cpu_test
+def test_replicas_reach_the_exchange_in_their_own_ops(monkeypatch):
+    """A placed layer whose file has redundant slots gets its own ops (with and
+    without the shared partial), and the replica table reaches the exchange as the
+    operand after experts_start."""
+    seen, operands = _record_ops(monkeypatch)
+    monkeypatch.setenv("TPU_MOE_RAGGED_A2A", "1")
+    monkeypatch.delenv("TPU_DECODE_FAST_PATHS_OFF", raising=False)
+    build = dict(topk=10, activation="silu", placed=True, owner_combine=True)
+    ragged_a2a.prebuild_ragged_a2a_moe(replicas=True, **build)
+    ragged_a2a.prebuild_ragged_a2a_moe(**build)
+    ragged_a2a.prebuild_ragged_a2a_moe(replicas=True, **build)
+    assert len(ragged_a2a._OPS) == 4
+    assert [key[-1] for key in ragged_a2a._OPS] == [True, True, False, False]
+    assert operands == [9, 10, 8, 9]
+    assert seen[0]["replicas"] == 8 and "shared" not in seen[0]
+    assert seen[1]["replicas"] == 8 and seen[1]["shared"] == 9
+    assert "replicas" not in seen[2] and "replicas" not in seen[3]
+    assert all(kw["owner_combine"] and kw["sorted_plan"] for kw in seen)
+
+
+NO_SORTED_PLAN = "a2a_sorted_plan,a2a_row_gather,a2a_row_scatter,a2a_send_rows_minor"
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "off,owner,scaled,message",
+    [
+        ("a2a_owner_combine", False, True, "a2a_owner_combine"),
+        ("", False, True, "owner combine of the layer, which is not armed"),
+        (NO_SORTED_PLAN, True, True, "remove a2a_sorted_plan from"),
+        ("", True, False, "scaled experts"),
+    ],
+)
+def test_replicas_refuse_paths_that_do_not_serve_them(
+    monkeypatch, off, owner, scaled, message
+):
+    _record_ops(monkeypatch)
+    monkeypatch.setenv("TPU_MOE_RAGGED_A2A", "1")
+    monkeypatch.setenv("TPU_DECODE_FAST_PATHS_OFF", off)
+    with pytest.raises(ValueError, match=f"Expert replicas.*{message}"):
+        ragged_a2a.prebuild_ragged_a2a_moe(
+            topk=10,
+            activation="silu",
+            scaled=scaled,
+            placed=True,
+            owner_combine=owner,
+            replicas=True,
+        )
+    assert ragged_a2a._OPS == {}
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("shared", [False, True])
+def test_replica_table_is_passed_to_the_op(monkeypatch, shared):
+    import torch
+
+    built, calls = [], []
+
+    def _get_op(**kwargs):
+        built.append(kwargs)
+        return lambda *operands: calls.append(operands) or operands[0]
+
+    monkeypatch.setattr(ragged_a2a, "_get_op", _get_op)
+    table = torch.arange(3 * 64, dtype=torch.int32).reshape(3, 64)
+    x = torch.zeros(4, 8)
+    ragged_a2a.ragged_a2a_fused_moe_gmm(
+        x,
+        torch.zeros(9, 8, 8),
+        torch.zeros(9, 4, 8),
+        torch.zeros(9, 1, 8),
+        torch.zeros(9, 1, 8),
+        None,
+        None,
+        torch.zeros(4, 2),
+        torch.zeros((4, 2), dtype=torch.int32),
+        torch.zeros((), dtype=torch.int32),
+        topk=2,
+        activation="silu",
+        shared_output=torch.ones(4, 8) if shared else None,
+        placed=True,
+        owner_combine=True,
+        replicas=table,
+    )
+    assert built[0]["replicas"] is True and built[0]["shared"] is shared
+    (operands,) = calls
+    assert len(operands) == 9 + shared
+    assert torch.equal(operands[8].reshape(3, 64), table)
+    assert operands[8].shape == (1, 1, 3, 64)

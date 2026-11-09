@@ -45,7 +45,6 @@ import math
 import zlib
 from typing import TYPE_CHECKING
 
-import numpy as np
 import torch
 from vllm.config import get_current_vllm_config_or_none
 from vllm.model_executor.layers.attention import Attention
@@ -345,7 +344,8 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
         ModelOptNvFp4FusedMoE.create_weights(
             self,
             layer,
-            num_experts,
+            # A placement file with redundant slots adds them after the experts.
+            num_experts + expert_placement.redundant_slots_per_rank(layer),
             hidden_size,
             intermediate_size_per_partition,
             params_dtype,
@@ -399,20 +399,21 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
             seed + int(self.moe.ep_rank) * 104729
         )
         # Experts placed by TPU_MOE_EXPERT_PLACEMENT draw from a generator per
-        # logical expert, so the dummy model is the same under any placement.
-        slots = expert_placement.host_slots(layer)
-        generators: list[torch.Generator] = []
-        if slots is not None:
-            local = layer.w13_weight.shape[0]
-            start = int(self.moe.ep_rank) * local
-            logical = np.argsort(slots)[start : start + local]
+        # logical expert, so the dummy model is the same under any placement
+        # and a replica gets its primary's values (empty redundant slots draw
+        # none).
+        logical = expert_placement.local_experts(layer)
+        generators: list[torch.Generator | None] = []
+        if logical is not None:
             generators = [
                 torch.Generator(device="cpu").manual_seed(seed + int(e) * 104729)
+                if e >= 0
+                else None
                 for e in logical
             ]
         for name, fan_in_multiplier in (("w13", 1), ("w2", self.moe.tp_size)):
             packed = getattr(layer, f"{name}_weight").data
-            if slots is None:
+            if logical is None:
                 values = torch.randint(
                     0,
                     256,
@@ -424,7 +425,9 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
             else:
                 values = torch.stack(
                     [
-                        torch.randint(
+                        torch.zeros(packed.shape[1:], dtype=torch.uint8)
+                        if g is None
+                        else torch.randint(
                             0,
                             256,
                             packed.shape[1:],
@@ -461,6 +464,7 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
         activation_str = self._set_tpu_activation(layer)
 
         self._initialize_dummy_quantized_weights(layer)
+        expert_placement.zero_empty_redundant(layer)
 
         # --- fuse E4M3 block scale * FP32 per-tensor global -> FP32 block scale.
         # w13: global is [E, 2] (separate w1/w3 per-tensor scales); apply to the
@@ -540,6 +544,7 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
                     layer.w2_weight_scale,
                 ]
             )
+        expert_placement.check_replicas(layer)
 
         logger.info_once(
             f"NVFP4 MoE weights prepared ({mode}): "
@@ -583,6 +588,7 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
                 activation=activation_str,
                 placed=expert_placement.host_slots(layer) is not None,
                 owner_combine=decode_switches.arm_owner_combine(layer),
+                replicas=expert_placement.redundant_slots_per_rank(layer) > 0,
             )
 
         if self._use_adaptive_fused_moe:
@@ -689,6 +695,7 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
             kwargs["owner_combine"] = getattr(
                 layer, decode_switches.OWNER_COMBINE_ATTR, False
             )
+            kwargs["replicas"] = getattr(layer, "_expert_replicas", None)
             return ragged_a2a_fused_moe_gmm(**kwargs)
         if enable_pipelined_collective_and_compute():
             return pipelined_fused_moe_gmm(**kwargs)

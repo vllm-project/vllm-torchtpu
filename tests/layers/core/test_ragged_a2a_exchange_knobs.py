@@ -22,23 +22,31 @@ import numpy as np
 import pytest
 from jax.sharding import Mesh
 
+from vllm_torchtpu.layers.core import expert_placement as core
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
     quantize_to_native_fp4_kmajor,
     resolve_onehot_permute_threshold,
     scatter_route_plan,
 )
 from vllm_torchtpu.layers.core.ragged_a2a_moe import (
+    _EMPTY_ROUTE,
     DP_AXIS,
     TP_AXIS,
     _capacity_overflow,
     _member_index,
+    _unpack_routes,
     exchange_capacity,
     owner_dests,
     owner_order,
+    owner_remote_routes,
+    pack_served_routes,
+    primary_slots,
     ragged_a2a_moe,
     route_order,
     route_plan,
+    serving_slots,
     streamed_dests,
+    unpack_served_routes,
 )
 
 HIDDEN = 2048
@@ -269,6 +277,208 @@ def test_route_plan_wide_destinations_match_one_key(recv_rows):
     got = route_plan(*args, wide, **kw)
     for a, b in zip(one_key, got):
         np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+
+
+@pytest.mark.cpu_test
+def test_served_route_fields_round_trip_through_the_packed_routing():
+    """With replicas, the id field of a packed route holds its serving slot and
+    owner order; the weight bits and an empty slot (serving -1) survive."""
+    rng = np.random.default_rng(0)
+    serving = rng.integers(-1, 64 * 9, size=(96, 10)).astype(np.int32)
+    order = rng.integers(0, 16, size=(96, 10)).astype(np.int32)
+    weights = jnp.asarray(rng.uniform(0, 1, size=(96, 10)), jnp.bfloat16)
+    fields = pack_served_routes(jnp.asarray(serving), jnp.asarray(order))
+    # The word _gather_routing packs.
+    bits = jax.lax.bitcast_convert_type(weights, jnp.uint16).astype(jnp.int32)
+    ids, got_weights = _unpack_routes(jnp.left_shift(fields, 16) | bits)
+    got_serving, got_order = unpack_served_routes(ids)
+    np.testing.assert_array_equal(np.asarray(got_serving), serving)
+    np.testing.assert_array_equal(np.asarray(got_order), order)
+    np.testing.assert_array_equal(
+        np.asarray(got_weights).view(np.uint16), np.asarray(weights).view(np.uint16)
+    )
+    empty, _ = _unpack_routes(jnp.asarray([_EMPTY_ROUTE], jnp.int32))
+    assert int(unpack_served_routes(empty)[0][0]) == -1
+
+
+def _replicas_layout(dp_size, tp_size, num_tokens, local, topk, seed=0):
+    """Skewed routing [D, S, K] (logical ids, one unrouted route) and a
+    placement with one redundant slot per rank from the builder: the routing
+    in physical primaries, the replica table and each physical slot's
+    expert."""
+    rng = np.random.default_rng(seed)
+    ep_size = dp_size * tp_size
+    num_experts = ep_size * local
+    ids, weights = _routing(rng, dp_size, num_tokens, num_experts, topk, True)
+    ids[0, 1, topk - 1] = -1
+    counts = np.bincount(ids[ids >= 0], minlength=num_experts)
+    slots = core.balance(counts, ep_size)
+    redundant = core.place_replicas(
+        counts, slots, ep_size, 1, core.replicate(counts, ep_size)
+    )
+    table = core.replica_table(slots, redundant, ep_size)
+    primary = core.physical_slots(slots, ep_size, 1)
+    expert_of = np.full(ep_size * (local + 1), -1)
+    expert_of[primary] = np.arange(num_experts)
+    expert_of[table[0][redundant >= 0]] = redundant[redundant >= 0]
+    phys = np.where(ids >= 0, primary[np.maximum(ids, 0)], -1).astype(np.int32)
+    return ids, weights, slots, table, phys, expert_of
+
+
+def _serving(phys, table):
+    topk = phys.shape[-1]
+    got = serving_slots(jnp.asarray(phys.reshape(-1, topk)), jnp.asarray(table))
+    return np.asarray(got).reshape(phys.shape)
+
+
+@pytest.mark.cpu_test
+def test_serving_slots_hold_the_routed_experts():
+    ids, _, _, table, phys, expert_of = _replicas_layout(16, 4, 28, 8, 10)
+    serving = _serving(phys, table)
+    assert serving.dtype == np.int32
+    np.testing.assert_array_equal(serving < 0, ids < 0)
+    np.testing.assert_array_equal(expert_of[serving[ids >= 0]], ids[ids >= 0])
+    assert (serving != phys).mean() > 0.1  # replicas serve a share of the routes
+    # The full-size exchange's primaries come back exactly.
+    got = primary_slots(jnp.asarray(serving), jnp.asarray(table))
+    np.testing.assert_array_equal(np.asarray(got), phys)
+
+
+@pytest.mark.cpu_test
+def test_serving_slots_follow_each_token_alone_and_split_evenly():
+    """The replica a route takes depends on its token's own routing only: a token
+    alone, or the batch reordered, gets the same slots. Over many tokens the
+    instances of a replicated expert share its routes about evenly."""
+    _, _, _, table, phys, _ = _replicas_layout(16, 4, 256, 8, 10, seed=1)
+    flat = phys.reshape(-1, phys.shape[-1])
+    serving = _serving(flat, table)
+    for i in (0, 5, 777, len(flat) - 1):
+        np.testing.assert_array_equal(_serving(flat[i : i + 1], table)[0], serving[i])
+    perm = np.random.default_rng(2).permutation(len(flat))
+    np.testing.assert_array_equal(_serving(flat[perm], table), serving[perm])
+    replica_slot, primary, _ = table
+    checked = 0
+    for p in np.unique(primary[primary >= 0]):
+        replicas = np.concatenate([[p], replica_slot[primary == p]])
+        n = np.array([(serving[flat == p] == r).sum() for r in replicas])
+        if n.sum() >= 100:
+            checked += 1
+            share = n / n.sum() * len(replicas)
+            assert np.abs(share - 1).max() < 0.3, (p, n)
+    assert checked >= 16
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "dp_size,tp_size,num_tokens,local", [(16, 4, 28, 8), (2, 4, 92, 8), (4, 2, 26, 8)]
+)
+def test_route_plan_with_replicas_lands_every_route_at_its_primary_row(
+    dp_size, tp_size, num_tokens, local
+):
+    """Every route is computed exactly once over the mesh, at its serving slot,
+    and its output goes to the owner row it has without replicas: the senders'
+    owner order from the primaries equals that of the file's slots."""
+    topk = 10
+    ids, _, slots, table, phys, _ = _replicas_layout(
+        dp_size, tp_size, num_tokens, local, topk, seed=dp_size
+    )
+    mesh9 = dict(dp_size=dp_size, tp_size=tp_size, local_num_experts=local + 1)
+    mesh8 = dict(dp_size=dp_size, tp_size=tp_size, local_num_experts=local)
+    order = np.stack([np.asarray(owner_order(jnp.asarray(p), **mesh9)) for p in phys])
+    file_ids = np.where(ids >= 0, slots[np.maximum(ids, 0)], -1)
+    order_off = np.asarray(owner_order(jnp.asarray(file_ids), **mesh8))
+    np.testing.assert_array_equal(order, order_off)
+    serving = _serving(phys, table)
+    gathered = jnp.asarray(serving)
+    dests = functools.partial(
+        owner_dests, **mesh9, order=jnp.moveaxis(jnp.asarray(order), -1, 0)
+    )
+    # The destinations without replicas, from the file's slots.
+    member_off, row_off, _, _ = owner_dests(
+        jnp.moveaxis(jnp.asarray(file_ids), -1, 0), **mesh8
+    )
+    member_off = np.broadcast_to(np.asarray(member_off), (dp_size, num_tokens))
+    row_off = np.moveaxis(np.asarray(row_off), 0, -1)  # [D, S, K]
+    blk = -(-num_tokens // tp_size)
+    seen = np.zeros(ids.shape, np.int32)
+    for ep_rank in range(dp_size * tp_size):
+        dp_pos = ep_rank // tp_size
+        member = _member_index(
+            gathered,
+            jnp.int32(ep_rank),
+            dp_size=dp_size,
+            tp_size=tp_size,
+            local_num_experts=local + 1,
+        )
+        need_in = np.asarray((member == dp_pos).any(axis=2))
+        got_rows = [(s, t) for s in range(dp_size) for t in range(num_tokens)]
+        got_rows = [(s, t) for s, t in got_rows if need_in[s, t]]
+        in_row = np.zeros((dp_size, num_tokens), np.int32)
+        for r, (s, t) in enumerate(got_rows):
+            in_row[s, t] = r
+        rows = len(got_rows) + 5
+        token, sizes, dest_member, dest_row = (
+            np.asarray(a)
+            for a in route_plan(
+                gathered,
+                jnp.asarray(in_row),
+                jnp.bool_(True),
+                jnp.asarray([ep_rank * (local + 1)], jnp.int32),
+                dests,
+                local_num_experts=local + 1,
+                routes=rows * topk,
+                rows=rows,
+            )
+        )
+        group = np.repeat(np.arange(local + 1), sizes)
+        for j, g in enumerate(group):
+            s, t = got_rows[token[j]]
+            k = int(np.flatnonzero(serving[s, t] == ep_rank * (local + 1) + g)[0])
+            seen[s, t, k] += 1
+            assert dest_member[j] == member_off[s, t] == s * tp_size + t // blk
+            assert dest_row[j] == row_off[s, t, k]
+    np.testing.assert_array_equal(seen, (ids >= 0).astype(np.int32))
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("padded", [False, True])
+def test_owner_waits_for_the_rows_other_ranks_serve(padded):
+    dp_size, tp_size, num_tokens, local, topk = 4, 2, 26, 8, 10
+    ids, weights, _, table, phys, _ = _replicas_layout(
+        dp_size, tp_size, num_tokens, local, topk, seed=7
+    )
+    if padded:
+        weights[:, -3:] = 0
+    serving = _serving(phys, table)
+    mesh = dict(dp_size=dp_size, tp_size=tp_size, local_num_experts=local + 1)
+    blk = -(-num_tokens // tp_size)
+    for d in range(dp_size):
+        for r in range(tp_size):
+            me = d * tp_size + r
+            own = slice(r * blk, (r + 1) * blk)
+            got = owner_remote_routes(
+                jnp.asarray(phys[d, own]),
+                jnp.asarray(weights[d, own], jnp.bfloat16),
+                jnp.asarray(serving[d, own]),
+                jnp.int32(me),
+                skip_padded_tokens=padded,
+                dtype=jnp.bfloat16,
+                **mesh,
+            )
+            sent = (ids[d, own] >= 0) & ((weights[d, own] != 0) | (not padded))
+            want = (sent & (serving[d, own] // (local + 1) != me)).sum()
+            assert int(got) == want
+            without = owner_remote_routes(
+                jnp.asarray(phys[d, own]),
+                jnp.asarray(weights[d, own], jnp.bfloat16),
+                jnp.asarray(phys[d, own]),
+                jnp.int32(me),
+                skip_padded_tokens=padded,
+                dtype=jnp.bfloat16,
+                **mesh,
+            )
+            want = (sent & (phys[d, own] // (local + 1) != me)).sum()
+            assert int(without) == want
 
 
 def _require_eight_tpu_devices():
