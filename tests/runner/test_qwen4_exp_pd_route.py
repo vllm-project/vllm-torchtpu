@@ -357,3 +357,22 @@ def test_a_consumer_built_without_init_takes_the_broadcast_path():
     for _ in range(pd_staging.quarantine_steps()):
         s.advance_quarantine()
     assert int(s.free.sum()) == 15
+
+
+@pytest.mark.parametrize("layout", [{"merged_compressed": True}, {"main_dcp": 2}])
+def test_routed_staging_refuses_a_merged_key_or_pcp_producer(monkeypatch, layout):
+    """pd_route models a plain TP1 producer. A producer with merged compressed
+    keys or a PCP producer's split main KV (main_dcp > 1 on its layout) must
+    fail when either leg builds the route, not be mis-routed."""
+    monkeypatch.setenv("QWEN4_EXP_PD_ROUTED_DST", "8:4:512")
+    row = ROWS * LANES
+    dst = SimpleNamespace(token_bytes=row, block_size=512)
+    rank = SimpleNamespace(tp_size=8, main_dcp=4)
+    plain = SimpleNamespace(token_bytes=row, block_size=3200, merged_compressed=False, main_dcp=1)
+    with pytest.raises(ValueError, match="plain TP1 producer"):
+        st.route_geometry_for(None, SimpleNamespace(**{**plain.__dict__, **layout}), dst, rank)
+    # Control: the plain producer passes this check and fails later, on the
+    # missing model config, for a different reason.
+    with pytest.raises(Exception) as other:
+        st.route_geometry_for(None, plain, dst, rank)
+    assert "plain TP1 producer" not in str(other.value)

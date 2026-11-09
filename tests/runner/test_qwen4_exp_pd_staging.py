@@ -664,3 +664,25 @@ def test_every_landing_path_zero_fills_the_draft_gap(mode):
     assert landed1 == landed0 - gap_pairs
     assert not landed1 & zero
     assert c.last_draft_rows[1] == len(gap_main) + len(gap_pairs)
+
+
+@pytest.mark.parametrize(
+    "env", [{"QWEN4_EXP_PD_PRODUCER_PCP": "2"}, {"QWEN4_EXP_PD_PRODUCER_MERGED": "1"}]
+)
+def test_draft_kv_refuses_a_pcp_or_merged_key_producer(monkeypatch, env):
+    """QWEN4_EXP_PD_DRAFT_KV models a plain TP1 producer's draft owners. The
+    staged decode also takes PCP and merged-key producers, so the combination
+    must fail when the decode is built."""
+    pkg = pytest.importorskip("vllm_torchtpu.models.vllm.qwen4_exp.pd_staging")
+    monkeypatch.setenv("QWEN4_EXP_PD_DRAFT_KV", "1")
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    with pytest.raises(ValueError, match="plain TP1 pipeline producer"):
+        pkg.StagedConsumer(_decode_cfg(3), None, None, None, None, 1 << 20)
+    # Control: without the PCP / merged producer the decode gets past this
+    # check and fails later, on the stand-in config, for a different reason.
+    for key in env:
+        monkeypatch.delenv(key)
+    with pytest.raises(Exception) as other:
+        pkg.StagedConsumer(_decode_cfg(3), None, None, None, None, 1 << 20)
+    assert "plain TP1 pipeline producer" not in str(other.value)
