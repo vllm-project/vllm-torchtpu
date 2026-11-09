@@ -373,15 +373,17 @@ def test_coordinated_encoder_dp_shards_and_gathers_empty_and_uneven_ranks(
     tp.all_gather.assert_called_once()
 
 
+@pytest.mark.parametrize(
+    "counts, assignments", [([3, 1, 4], [[2], [0, 1]]), ([3], [[0], []])]
+)
 @pytest.mark.parametrize("rank", [0, 1])
 def test_data_parallel_execute_gathers_between_synchronizations(
-    coordinated_manager, monkeypatch, rank
+    coordinated_manager, monkeypatch, counts, assignments, rank
 ):
     """Ranks encode different image shares, so the all-gather runs on its own."""
     manager = coordinated_manager
     manager.use_dp = True
-    counts = [3, 1, 4]
-    assignments = [[2], [0, 1]]
+    max_tokens = max(sum(counts[i] for i in assigned) for assigned in assignments)
     tp = SimpleNamespace(world_size=2, rank_in_group=rank, all_gather=Mock())
     monkeypatch.setattr(parallel_state, "get_tp_group", lambda: tp)
     monkeypatch.setattr(
@@ -395,16 +397,18 @@ def test_data_parallel_execute_gathers_between_synchronizations(
         "tensor_model_parallel_all_gather",
         lambda tensor, dim: tp.all_gather(tensor, dim=dim),
     )
-    gathered = torch.zeros(8, 2)
+    gathered = torch.zeros(2 * max_tokens, 2)
     for peer, assigned in enumerate(assignments):
-        offset = peer * 4
+        offset = peer * max_tokens
         for index in assigned:
             gathered[offset : offset + counts[index]] = counts[index]
             offset += counts[index]
 
     def tensors_gather(padded, *, dim):
         assert dim == 0
-        torch.testing.assert_close(padded, gathered[rank * 4 : (rank + 1) * 4])
+        torch.testing.assert_close(
+            padded, gathered[rank * max_tokens : (rank + 1) * max_tokens]
+        )
         assert mm.synchronize_tensors.call_args == call(padded, wait=True)
         return gathered
 
