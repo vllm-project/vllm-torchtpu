@@ -128,6 +128,7 @@ if TYPE_CHECKING:
     TPU_MOE_A2A_SORTED_PLAN: bool = False
     TPU_MOE_A2A_OWNER_TAIL: bool = False
     TPU_MOE_A2A_ROUTING_DMA: bool = False
+    TPU_MOE_A2A_SEND_INDEX_ROWS_MINOR: bool = False
     TPU_MOE_EXPERT_PLACEMENT: str = ""
     TPU_MOE_ROUTING_COUNTS_DIR: str = ""
     PCP_FA_KERNEL_BLOCK_SIZE: int | None = None
@@ -925,6 +926,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # barrier round, then one DMA to each member) instead of XLA's ring
     # all-gather, whose steps each wait on the previous one (same words).
     "TPU_MOE_A2A_ROUTING_DMA": env_bool("TPU_MOE_A2A_ROUTING_DMA"),
+    # Ragged all-to-all exchange with TPU_MOE_A2A_ROW_SCATTER: the send index
+    # (the token each send row copies) sums its compare over [tokens,
+    # members, rows] instead of [rows, tokens, members], so XLA keeps the
+    # send rows on a vector tile axis instead of reducing each row across
+    # the lanes (same index).
+    "TPU_MOE_A2A_SEND_INDEX_ROWS_MINOR": env_bool("TPU_MOE_A2A_SEND_INDEX_ROWS_MINOR"),
     # Place each named MoE layer's experts by this .npz (logical expert ->
     # physical slot, e.g. balanced on routing counts; see
     # layers/core/expert_placement.py). Unset = linear placement.
