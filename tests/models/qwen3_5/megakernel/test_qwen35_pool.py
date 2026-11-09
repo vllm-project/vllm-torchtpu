@@ -26,7 +26,7 @@ import pytest
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from vllm_torchtpu import megakernel as mk
+from vllm_torchtpu.megakernel import core as mk
 from vllm_torchtpu.models.qwen3_5.megakernel import model as qwen35
 from vllm_torchtpu.models.qwen3_5.megakernel.profiles.baseline import TINY_TILES
 
@@ -203,7 +203,7 @@ def test_full_pooled_step_att_every_2():
 # ---------------------------------------------------------------------------
 _MK_ROOT = Path(mk.__file__).resolve().parent
 # Paths below are relative to the `vllm_torchtpu` package (library and folder).
-_PKG = _MK_ROOT.parent
+_PKG = _MK_ROOT.parents[1]
 _FOLDER = _PKG / "models" / "qwen3_5" / "megakernel"
 
 
@@ -244,7 +244,7 @@ def test_no_raw_pool_state_literal_in_core():
     """`"raw"` is defined once (`POOL_STATE_NAME`), never repeated elsewhere."""
     assert mk.POOL_STATE_NAME == "raw"
     for path in _guarded_files():
-        if path.relative_to(_PKG).as_posix() == "megakernel/pool/config.py":
+        if path.relative_to(_PKG).as_posix() == "megakernel/core/pool/config.py":
             continue
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):

@@ -37,13 +37,15 @@
 /tests/kernels/gdn/v3/ @brianseung-google @mhhuang-machine
 /tests/kernels/test_gdn_attention_v3*.py @brianseung-google @mhhuang-machine
 
-# Megakernel library (framework-free JAX/Pallas)
-/src/vllm_torchtpu/megakernel/ @caojx-google @weinan1997 @hhb
+# Megakernel core (framework-free JAX/Pallas); the root package and the
+# shared test conftest go with it
+/src/vllm_torchtpu/megakernel/__init__.py @caojx-google @weinan1997 @hhb
+/src/vllm_torchtpu/megakernel/core/ @caojx-google @weinan1997 @hhb
 /tests/megakernel/ @caojx-google @weinan1997 @hhb
 
-# Megakernel runtime (PyTorch/vLLM bridge)
-/src/vllm_torchtpu/megakernel_runtime/ @caojx-google @weinan1997 @hhb @brianseung-google @qizzzh @Nanfang-Li
-/tests/megakernel_runtime/ @caojx-google @weinan1997 @hhb @brianseung-google @qizzzh @Nanfang-Li
+# Megakernel adapter (PyTorch/vLLM bridge)
+/src/vllm_torchtpu/megakernel/adapter/ @caojx-google @weinan1997 @hhb @brianseung-google @qizzzh @Nanfang-Li
+/tests/megakernel/adapter/ @caojx-google @weinan1997 @hhb @brianseung-google @qizzzh @Nanfang-Li
 
 # Model layers
 /src/vllm_torchtpu/layers/ @kyuyeunk @qizzzh @Nanfang-Li

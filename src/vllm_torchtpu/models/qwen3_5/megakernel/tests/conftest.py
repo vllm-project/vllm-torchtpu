@@ -17,8 +17,8 @@ from __future__ import annotations
 
 import pytest  # pyrefly: ignore[missing-import]
 
-from vllm_torchtpu.megakernel_runtime.testkit import mk_fake_runner as mk_fake_runner
-from vllm_torchtpu.megakernel_runtime.testkit import route_lazy_loggers
+from vllm_torchtpu.megakernel.adapter.testkit import mk_fake_runner as mk_fake_runner
+from vllm_torchtpu.megakernel.adapter.testkit import route_lazy_loggers
 
 
 @pytest.fixture(autouse=True)

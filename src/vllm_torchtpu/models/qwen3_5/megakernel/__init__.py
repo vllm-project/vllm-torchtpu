@@ -21,7 +21,7 @@ Importing this module loads no torch / jax / vLLM: `create` is imported lazily.
 
 from __future__ import annotations
 
-from vllm_torchtpu.megakernel.runtime.contract import TpuMonoSpec
+from vllm_torchtpu.megakernel.core.runtime.contract import TpuMonoSpec
 
 SPEC = TpuMonoSpec(
     name="qwen35",

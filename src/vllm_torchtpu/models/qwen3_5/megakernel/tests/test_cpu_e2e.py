@@ -33,11 +33,11 @@ import numpy as np
 import pytest  # pyrefly: ignore[missing-import]
 import torch
 
-from vllm_torchtpu.megakernel.runtime import (
+from vllm_torchtpu.megakernel.adapter.testkit import check_plugin_spec, run_cpu_e2e
+from vllm_torchtpu.megakernel.core.runtime import (
     EligibilityResult,
     facts_from_pool_layout,
 )
-from vllm_torchtpu.megakernel_runtime.testkit import check_plugin_spec, run_cpu_e2e
 
 from .. import adapter, model, profiles
 from .tiny import (

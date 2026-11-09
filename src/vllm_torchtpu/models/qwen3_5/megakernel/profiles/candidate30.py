@@ -30,11 +30,11 @@ from __future__ import annotations
 
 import dataclasses
 
-from vllm_torchtpu.megakernel.exec_spec import Tiles
-from vllm_torchtpu.megakernel.modules.gdn import GDNModule
-from vllm_torchtpu.megakernel.modules.gqa import GQAModule
-from vllm_torchtpu.megakernel.modules.moe import MoEModule
-from vllm_torchtpu.megakernel.profile import Profile, TileContext
+from vllm_torchtpu.megakernel.core.exec_spec import Tiles
+from vllm_torchtpu.megakernel.core.modules.gdn import GDNModule
+from vllm_torchtpu.megakernel.core.modules.gqa import GQAModule
+from vllm_torchtpu.megakernel.core.modules.moe import MoEModule
+from vllm_torchtpu.megakernel.core.profile import Profile, TileContext
 
 from .baseline import QWEN35_MODEL_NAME
 

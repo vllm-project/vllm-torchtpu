@@ -23,15 +23,15 @@ from __future__ import annotations
 
 from typing import Any
 
-from vllm_torchtpu.megakernel.cache import (
+from vllm_torchtpu.megakernel.core.cache import (
     default_pool_layout,
     gather_gdn_states,
     pool_to_states,
     scatter_pool_states,
     states_to_pool,
 )
-from vllm_torchtpu.megakernel.decls import KVCacheDecl, RecurrentCacheDecl
-from vllm_torchtpu.megakernel.pool import (
+from vllm_torchtpu.megakernel.core.decls import KVCacheDecl, RecurrentCacheDecl
+from vllm_torchtpu.megakernel.core.pool import (
     PoolLayout,
     conv_to_raw_page,
     kv_to_raw_page,
@@ -40,7 +40,7 @@ from vllm_torchtpu.megakernel.pool import (
     raw_pages_to_ssm,
     ssm_to_raw_pages,
 )
-from vllm_torchtpu.megakernel.pool.config import PoolBackend
+from vllm_torchtpu.megakernel.core.pool.config import PoolBackend
 
 
 def qwen35_layer_cache_decls(

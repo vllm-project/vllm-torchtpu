@@ -48,7 +48,7 @@ from vllm.config.utils import Range
 from vllm_torchtpu import envs, utils
 from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.megakernel_runtime.salt import compile_cache_salt
+from vllm_torchtpu.megakernel.adapter.salt import compile_cache_salt
 
 logger = init_logger(__name__)
 

@@ -13,7 +13,7 @@
 # limitations under the License.
 """The Qwen3.5 template as a plugin: shorthand equivalence, a collective-free
 `create` and the stdlib-only plugin module (the public-surface guard over
-every model folder is `tests/megakernel_runtime/test_template_surface.py`)."""
+every model folder is `tests/megakernel/adapter/test_template_surface.py`)."""
 
 from __future__ import annotations
 
@@ -30,9 +30,9 @@ import numpy as np
 import pytest
 import torch
 
-import vllm_torchtpu.megakernel_runtime.agreement as agreement_mod
-import vllm_torchtpu.megakernel_runtime.driver as driver_mod
-import vllm_torchtpu.megakernel_runtime.stepping as stepping_mod
+import vllm_torchtpu.megakernel.adapter.agreement as agreement_mod
+import vllm_torchtpu.megakernel.adapter.driver as driver_mod
+import vllm_torchtpu.megakernel.adapter.stepping as stepping_mod
 from tests.models.qwen3_5.megakernel.test_vllm_qwen35_e2e import (
     _allocate_aliased_pools,
     _cpu_mesh,
@@ -42,22 +42,25 @@ from tests.models.qwen3_5.megakernel.test_vllm_qwen35_e2e import (
 from tests.models.qwen3_5.megakernel.test_weight_collector import (
     make_synthetic_qwen35_backbone,
 )
-from vllm_torchtpu.megakernel import Profile, register_profile
-from vllm_torchtpu.megakernel import profile as profile_mod
-from vllm_torchtpu.megakernel.runtime import EligibilityResult, facts_from_pool_layout
-from vllm_torchtpu.megakernel_runtime import testing
-from vllm_torchtpu.megakernel_runtime.hooks import StepContext
-from vllm_torchtpu.megakernel_runtime.plugin import (
+from vllm_torchtpu.megakernel.adapter import testing
+from vllm_torchtpu.megakernel.adapter.hooks import StepContext
+from vllm_torchtpu.megakernel.adapter.plugin import (
     SHORTHANDS,
     RunnerView,
     discovered_shorthands,
+)
+from vllm_torchtpu.megakernel.core import Profile, register_profile
+from vllm_torchtpu.megakernel.core import profile as profile_mod
+from vllm_torchtpu.megakernel.core.runtime import (
+    EligibilityResult,
+    facts_from_pool_layout,
 )
 from vllm_torchtpu.models.qwen3_5 import megakernel as qwen_plugin
 from vllm_torchtpu.models.qwen3_5.megakernel import adapter
 from vllm_torchtpu.models.qwen3_5.megakernel import model as qwen35
 
 _RT = Path(driver_mod.__file__).resolve().parent
-_SRC = _RT.parents[1]
+_SRC = _RT.parents[2]
 _QWEN_HF = SimpleNamespace(architectures=["Qwen3_5MoeForCausalLM"])
 _MODULE = SHORTHANDS["qwen35"].module
 
@@ -98,7 +101,7 @@ import sys
 for name in ("torch", "jax", "jaxlib", "vllm", "numpy"):
     sys.modules[name] = None
 import vllm_torchtpu.models.qwen3_5.megakernel as t
-from vllm_torchtpu.megakernel_runtime.salt import compile_cache_salt
+from vllm_torchtpu.megakernel.adapter.salt import compile_cache_salt
 assert t.SPEC.name == "qwen35"
 cfg = type("C", (), {"additional_config": {"megakernel": {"plugin": "qwen35"}}})()
 assert compile_cache_salt(cfg) is None
@@ -416,7 +419,7 @@ def _false_result_codes(path: Path, *func_names: str) -> set[str]:
     ]
     assert not func_names or len(funcs) == len(func_names), func_names
 
-    from vllm_torchtpu.megakernel.runtime import contract
+    from vllm_torchtpu.megakernel.core.runtime import contract
 
     def literals(expr: ast.AST) -> set[str]:
         if isinstance(expr, ast.Constant) and isinstance(expr.value, str):
@@ -458,7 +461,7 @@ def _false_result_codes(path: Path, *func_names: str) -> set[str]:
 
 
 def test_every_template_decline_is_in_the_vote_table() -> None:
-    import vllm_torchtpu.megakernel as mk_lib
+    import vllm_torchtpu.megakernel.core as mk_lib
 
     codes = driver_mod.vote_codes(qwen_plugin.SPEC.decline_codes)
     assert codes[-1] == "other" and len(set(codes)) == len(codes)

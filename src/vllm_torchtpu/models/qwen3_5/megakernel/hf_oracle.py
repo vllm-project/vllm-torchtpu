@@ -26,13 +26,13 @@ from typing import Any
 
 import numpy as np
 
-from vllm_torchtpu.megakernel.decls import HFParamDecl
-from vllm_torchtpu.megakernel.derive import hf_config_for_geometry
-from vllm_torchtpu.megakernel.exec_spec import ExecSpec
-from vllm_torchtpu.megakernel.geometry import ModelGeometry
-from vllm_torchtpu.megakernel.ops import F32
-from vllm_torchtpu.megakernel.spec import SwitchSlot
-from vllm_torchtpu.megakernel.weights.logical import (
+from vllm_torchtpu.megakernel.core.decls import HFParamDecl
+from vllm_torchtpu.megakernel.core.derive import hf_config_for_geometry
+from vllm_torchtpu.megakernel.core.exec_spec import ExecSpec
+from vllm_torchtpu.megakernel.core.geometry import ModelGeometry
+from vllm_torchtpu.megakernel.core.ops import F32
+from vllm_torchtpu.megakernel.core.spec import SwitchSlot
+from vllm_torchtpu.megakernel.core.weights.logical import (
     coerce_canonical_hf_entry,
     resolve_spec_and_norms,
     switch_branch_for_layer,

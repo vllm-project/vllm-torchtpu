@@ -26,10 +26,10 @@ import numpy as np
 import torch
 from jax.sharding import Mesh
 
-from vllm_torchtpu.megakernel.exec_spec import ExecSpec
-from vllm_torchtpu.megakernel.modules.gdn import GDNModule
-from vllm_torchtpu.megakernel.pool.config import CacheExec
-from vllm_torchtpu.megakernel_runtime.weight_collector import WEIGHT_FLIPPED_ATTR
+from vllm_torchtpu.megakernel.adapter.weight_collector import WEIGHT_FLIPPED_ATTR
+from vllm_torchtpu.megakernel.core.exec_spec import ExecSpec
+from vllm_torchtpu.megakernel.core.modules.gdn import GDNModule
+from vllm_torchtpu.megakernel.core.pool.config import CacheExec
 
 from .. import model
 from ..profiles.baseline import TINY_TILES

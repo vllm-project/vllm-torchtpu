@@ -107,8 +107,8 @@ op = pallas.jax_op("pallas::quantized_matmul_kernel",
   | `kernels/` | JAX/Pallas kernels, tuned tables, kernel-eligibility predicates | jax/pallas + small pure helpers (`utils.py`, `logger.py`). **No vLLM imports, no torch** (torch only inside dedicated adapter files, e.g. `vllm_adapter.py`, that bridge a kernel to the torch side), no env reads |
   | `layers/core/` | Shared numeric/layout logic usable from any front-end | jax first; keep torch and vLLM imports at the boundary and minimal |
   | `layers/adapter/` | The vLLM/torch-facing layer: quant methods, fused-MoE wiring, attention backends, `custom_ops/` jax_op bridges | torch, vLLM, layers/core, kernels |
-  | `megakernel/` | The megakernel library and its framework-free runtime contract (`megakernel/runtime/contract.py`) | jax/pallas + small pure helpers, as `kernels/`. **No vLLM imports, no torch** |
-  | `megakernel_runtime/` | The torch / vLLM bridge for megakernel plugins: config and plugin loading, runner views, startup guards, agreements, the per-step driver | torch, vLLM, jax, `megakernel/`; the modules a model folder's `SPEC` imports (`plugin`, `hooks`, `errors`) stay stdlib-only at import |
+  | `megakernel/core/` | The megakernel library and its framework-free runtime contract (`megakernel/core/runtime/contract.py`) | jax/pallas + small pure helpers, as `kernels/`. **No vLLM imports, no torch, no `megakernel/adapter/`** |
+  | `megakernel/adapter/` | The torch / vLLM bridge for megakernel plugins: config and plugin loading, runner views, startup guards, agreements, the per-step driver | torch, vLLM, jax, `megakernel/core/`; the modules a model folder's `SPEC` imports (`plugin`, `hooks`, `errors`) stay stdlib-only at import |
   | `platforms/`, `runner/`, `worker/`, `executors/` | vLLM integration surface | thin translation only |
 
 - **R-2.2** **Interface files stay thin.** `platforms/`, `runner/`, and the

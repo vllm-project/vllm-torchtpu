@@ -26,10 +26,10 @@ from __future__ import annotations
 import dataclasses
 from typing import Any
 
-from vllm_torchtpu.megakernel.exec_spec import Tiles
-from vllm_torchtpu.megakernel.modules.gqa import GQAModule, GQATunables
-from vllm_torchtpu.megakernel.modules.moe import MoEModule
-from vllm_torchtpu.megakernel.profile import Profile, TileContext
+from vllm_torchtpu.megakernel.core.exec_spec import Tiles
+from vllm_torchtpu.megakernel.core.modules.gqa import GQAModule, GQATunables
+from vllm_torchtpu.megakernel.core.modules.moe import MoEModule
+from vllm_torchtpu.megakernel.core.profile import Profile, TileContext
 
 # `ModelSpec.name` and default HuggingFace config of the Qwen3.5-397B-A17B model.
 QWEN35_MODEL_NAME = "qwen3_5"

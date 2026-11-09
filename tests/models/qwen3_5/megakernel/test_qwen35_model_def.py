@@ -26,13 +26,13 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-import vllm_torchtpu.megakernel as mk
-from tests.megakernel import frozen_utils
-from vllm_torchtpu.megakernel import planner
-from vllm_torchtpu.megakernel.decls import RecurrentCacheDecl
-from vllm_torchtpu.megakernel.errors import MegakernelConfigError
-from vllm_torchtpu.megakernel.exec_spec import ExecSpec
-from vllm_torchtpu.megakernel.model_def import (
+import vllm_torchtpu.megakernel.core as mk
+from tests.megakernel.core import frozen_utils
+from vllm_torchtpu.megakernel.core import planner
+from vllm_torchtpu.megakernel.core.decls import RecurrentCacheDecl
+from vllm_torchtpu.megakernel.core.errors import MegakernelConfigError
+from vllm_torchtpu.megakernel.core.exec_spec import ExecSpec
+from vllm_torchtpu.megakernel.core.model_def import (
     Every,
     FromHF,
     LMHead,
@@ -42,7 +42,7 @@ from vllm_torchtpu.megakernel.model_def import (
     get_model,
     register_model,
 )
-from vllm_torchtpu.megakernel.modules import (
+from vllm_torchtpu.megakernel.core.modules import (
     GDN,
     GQA,
     Embedding,
@@ -52,7 +52,7 @@ from vllm_torchtpu.megakernel.modules import (
     MoEModule,
     Norm,
 )
-from vllm_torchtpu.megakernel.ops import BF16, F32, round_bf16
+from vllm_torchtpu.megakernel.core.ops import BF16, F32, round_bf16
 from vllm_torchtpu.models.qwen3_5.megakernel import model as qwen35
 from vllm_torchtpu.models.qwen3_5.megakernel import model as qwen35_mod
 from vllm_torchtpu.models.qwen3_5.megakernel import pool as qwen35_pool
@@ -248,7 +248,7 @@ def test_qwen35_model_def_line_budget_docstrings_and_runtime_registry(
     import logging
     import types
 
-    from vllm_torchtpu.megakernel_runtime import driver as driver_mod
+    from vllm_torchtpu.megakernel.adapter import driver as driver_mod
     from vllm_torchtpu.models.qwen3_5.megakernel import adapter as qwen_adapter
     from vllm_torchtpu.models.qwen3_5.megakernel.profiles import (
         baseline as qwen35_profile,
@@ -260,7 +260,7 @@ def test_qwen35_model_def_line_budget_docstrings_and_runtime_registry(
     monkeypatch.setattr(
         driver_mod,
         "logger",
-        logging.getLogger("vllm_torchtpu.megakernel_runtime.driver"),
+        logging.getLogger("vllm_torchtpu.megakernel.adapter.driver"),
     )
 
     qwen_text = Path(qwen35.__file__).read_text(encoding="utf-8")
@@ -352,7 +352,7 @@ def test_qwen35_model_def_line_budget_docstrings_and_runtime_registry(
         return obj
 
     def _make_runner(hf_cfg: Any) -> Any:
-        from vllm_torchtpu.megakernel_runtime import testing
+        from vllm_torchtpu.megakernel.adapter import testing
 
         return testing.fake_runner(
             hf_config=hf_cfg,
@@ -710,7 +710,7 @@ def test_synthetic_model_def_every2_cpu_kernel_vs_reference(
     monkeypatch: pytest.MonkeyPatch,
 ):
     """Synthetic `ModelDef` (`Every(n=2)`) HF loaders and CPU kernel vs reference."""
-    from vllm_torchtpu.megakernel import model_def, profile
+    from vllm_torchtpu.megakernel.core import model_def, profile
 
     monkeypatch.setattr(model_def, "_MODEL_REGISTRY", dict(model_def._MODEL_REGISTRY))
     monkeypatch.setattr(model_def, "_ARCH_REGISTRY", dict(model_def._ARCH_REGISTRY))
@@ -962,8 +962,8 @@ def test_qwen35_b5_weight_hashes_and_random_hf_weights():
     import json
     from pathlib import Path
 
-    from vllm_torchtpu.megakernel.ops import FP8
-    from vllm_torchtpu.megakernel.weights.logical import (
+    from vllm_torchtpu.megakernel.core.ops import FP8
+    from vllm_torchtpu.megakernel.core.weights.logical import (
         resolve_spec_and_norms,
         switch_branch_for_layer,
     )

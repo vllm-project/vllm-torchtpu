@@ -11,10 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Qwen3.5 tests of `megakernel_runtime.weight_collector.load_vllm_weights`:
+"""Qwen3.5 tests of `megakernel.adapter.weight_collector.load_vllm_weights`:
 base-buffer shapes / expert aliasing on the Qwen3.5 geometry and value parity
 with `pack_logical_weights`. The model-free tests of `weight_source` /
-`weight_collector` are `tests/megakernel_runtime/test_weight_source.py`."""
+`weight_collector` are `tests/megakernel/adapter/test_weight_source.py`."""
 
 from __future__ import annotations
 
@@ -28,17 +28,17 @@ import numpy as np
 import pytest
 import torch
 
-import vllm_torchtpu.megakernel as mk
-from vllm_torchtpu.megakernel import planner
-from vllm_torchtpu.megakernel.exec_spec import ExecSpec
-from vllm_torchtpu.megakernel.modules.gdn import GDNModule
-from vllm_torchtpu.megakernel.pool.config import CacheExec
-from vllm_torchtpu.megakernel.weights.ops import JaxArrayOps
-from vllm_torchtpu.megakernel_runtime.weight_collector import (
+import vllm_torchtpu.megakernel.core as mk
+from vllm_torchtpu.megakernel.adapter.weight_collector import (
     WEIGHT_FLIPPED_ATTR,
     extract_ecopy_layer,
     load_vllm_weights,
 )
+from vllm_torchtpu.megakernel.core import planner
+from vllm_torchtpu.megakernel.core.exec_spec import ExecSpec
+from vllm_torchtpu.megakernel.core.modules.gdn import GDNModule
+from vllm_torchtpu.megakernel.core.pool.config import CacheExec
+from vllm_torchtpu.megakernel.core.weights.ops import JaxArrayOps
 from vllm_torchtpu.models.qwen3_5.megakernel import model as qwen35
 from vllm_torchtpu.models.qwen3_5.megakernel.profiles.baseline import TINY_TILES
 from vllm_torchtpu.models.qwen3_5.megakernel.tests.tiny import (
@@ -141,14 +141,14 @@ def test_load_vllm_weights_value_parity(
     model_kind: str, fused_mlp: bool, stack_e: bool
 ) -> None:
     """Verify `load_vllm_weights` matches `pack_logical_weights`."""
-    from vllm_torchtpu.megakernel.model_def import (
+    from vllm_torchtpu.megakernel.core.model_def import (
         Every,
         FromHF,
         LMHead,
         ModelDef,
         Schedule,
     )
-    from vllm_torchtpu.megakernel.modules import GDN, GQA, Embedding, MoE, Norm
+    from vllm_torchtpu.megakernel.core.modules import GDN, GQA, Embedding, MoE, Norm
 
     if model_kind == "qwen35":
         model_def: type[ModelDef] = qwen35.Qwen35

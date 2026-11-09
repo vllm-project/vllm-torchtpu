@@ -19,16 +19,16 @@ import dataclasses
 from dataclasses import dataclass
 from typing import Any, cast
 
-from vllm_torchtpu.megakernel import cache, kernel
-from vllm_torchtpu.megakernel.exec_spec import ExecSpec
-from vllm_torchtpu.megakernel.geometry import FromHF, ModelGeometry
-from vllm_torchtpu.megakernel.model_def import (
+from vllm_torchtpu.megakernel.core import cache, kernel
+from vllm_torchtpu.megakernel.core.exec_spec import ExecSpec
+from vllm_torchtpu.megakernel.core.geometry import FromHF, ModelGeometry
+from vllm_torchtpu.megakernel.core.model_def import (
     LMHead,
     ModelDef,
     find_model,
     register_model,
 )
-from vllm_torchtpu.megakernel.modules import (
+from vllm_torchtpu.megakernel.core.modules import (
     GDN,
     GQA,
     Embedding,
@@ -38,8 +38,8 @@ from vllm_torchtpu.megakernel.modules import (
     MoEModule,
     Norm,
 )
-from vllm_torchtpu.megakernel.schedule import FromHFLayerTypes, Schedule
-from vllm_torchtpu.megakernel.spec import ModelSpec, Module
+from vllm_torchtpu.megakernel.core.schedule import FromHFLayerTypes, Schedule
+from vllm_torchtpu.megakernel.core.spec import ModelSpec, Module
 
 from . import hf_oracle, pool
 from .profiles import baseline, candidate30

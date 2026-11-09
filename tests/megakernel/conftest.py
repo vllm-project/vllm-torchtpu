@@ -19,10 +19,11 @@ repository (such as `tests/experimental/export/test_checkpoint.py`) assume a
 single host CPU device per process. To avoid polluting the global XLA host
 device count when collected alongside non-megakernel tests in a shared pytest
 session:
-- Direct invocations targeting only `tests/megakernel*` configure `XLA_FLAGS`
+- Direct invocations targeting only `tests/megakernel` (its `core/` and
+  `adapter/` subtrees) configure `XLA_FLAGS`
   in `pytest_configure` before JAX initializes its CPU backend and run in-process.
 - Mixed invocations leave the parent process's `XLA_FLAGS` untouched and
-  transparently stream each `tests/megakernel*` module through an isolated
+  transparently stream each `tests/megakernel` module through an isolated
   8-CPU-device subprocess whenever the parent process has fewer than 8 CPU
   devices.
 """
@@ -40,8 +41,8 @@ from typing import Any
 
 import pytest
 
-from tests.megakernel.megakernel_fakes import TINY_TILES
-from vllm_torchtpu.megakernel.exec_spec import ExecSpec
+from tests.megakernel.core.megakernel_fakes import TINY_TILES
+from vllm_torchtpu.megakernel.core.exec_spec import ExecSpec
 
 _PLUGIN_NAME = "vllm_megakernel_cpu_xla"
 _ENV_ACTIVE = "_VLLM_MK_SUBPROC_ACTIVE"
@@ -71,8 +72,8 @@ def _with_mk_xla_flags(raw_flags: str) -> str:
 def _mk_roots() -> tuple[Path, ...]:
     tests_dir = Path(__file__).resolve().parent.parent
     return (
-        (tests_dir / "megakernel").resolve(),
-        (tests_dir / "megakernel_runtime").resolve(),
+        # This directory: both subtrees, `core/` and `adapter/`.
+        Path(__file__).resolve().parent,
         # Model folders' megakernel tests (`tests/models/<model>/megakernel`).
         *(p.resolve() for p in sorted((tests_dir / "models").glob("*/megakernel"))),
     )
@@ -409,8 +410,8 @@ def route_lazy_loggers(monkeypatch: pytest.MonkeyPatch) -> None:
     import importlib
     import logging
 
-    importlib.import_module("vllm_torchtpu.megakernel_runtime.driver")
-    prefixes = ("vllm_torchtpu.megakernel_runtime.", "vllm_torchtpu.models.")
+    importlib.import_module("vllm_torchtpu.megakernel.adapter.driver")
+    prefixes = ("vllm_torchtpu.megakernel.adapter.", "vllm_torchtpu.models.")
     for name in sorted(sys.modules):
         if not name.startswith(prefixes):
             continue

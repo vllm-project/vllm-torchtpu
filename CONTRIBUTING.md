@@ -130,8 +130,9 @@ The project source is organized under `src/vllm_torchtpu/`:
   * `core/`: JAX-side numerical, attention metadata, and layout logic.
   * `adapter/`: Torch/vLLM-facing adapter layer (quantization methods, custom op bridges, attention backends).
 * `kernels/`: JAX and Pallas custom hardware kernels for TPU.
-* `megakernel/`: The megakernel library: a whole decoder step as one Pallas kernel (modules, pools, collectives, profiles) and its framework-free runtime contract (`megakernel/runtime/contract.py`, the types a megakernel model folder declares). JAX and Pallas only, like `kernels/`.
-* `megakernel_runtime/`: The torch / vLLM bridge for megakernel model folders: config and plugin loading, the views of the runner a plugin reads, startup guards and agreements, and the driver the runner calls each step.
+* `megakernel/`: A whole decoder step as one Pallas kernel.
+  * `core/`: The framework-free megakernel library (modules, pools, collectives, profiles) and its runtime contract (`megakernel/core/runtime/contract.py`, the types a megakernel model folder declares). JAX and Pallas only, like `kernels/`; it never imports `adapter/`.
+  * `adapter/`: The torch / vLLM bridge for megakernel model folders: config and plugin loading, the views of the runner a plugin reads, startup guards and agreements, and the driver the runner calls each step.
 * `models/`: Model implementations and architectures supported on TPU (e.g., Llama, Qwen, DeepSeek).
 * `spec_decode/`: Speculative decoding engines (Draft models, Jump decoding, GaaD).
 * `offload/`: KV cache offload subsystems (Raiden store connector, block-major memory layouts).

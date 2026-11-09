@@ -19,9 +19,11 @@ import dataclasses
 
 import pytest
 
-from tests.megakernel.test_moe_routing_ring import _simulate_expert_ring_no_collision
-from vllm_torchtpu.megakernel import CacheExec, vmem
-from vllm_torchtpu.megakernel.exec_spec import ExecSpec, Tiles
+from tests.megakernel.core.test_moe_routing_ring import (
+    _simulate_expert_ring_no_collision,
+)
+from vllm_torchtpu.megakernel.core import CacheExec, vmem
+from vllm_torchtpu.megakernel.core.exec_spec import ExecSpec, Tiles
 from vllm_torchtpu.models.qwen3_5.megakernel.model import (
     Qwen35Geometry,
     qwen35_spec,

@@ -30,7 +30,7 @@ Two execution modes are supported:
    microarchitecture and library versions, a host fingerprint mismatch skips
    with instructions to run base-vs-head mode.
 2. Base-vs-head mode (`MK_GOLDEN_JSON=<path>` or
-   `tests/megakernel/golden/compare_base_head.sh <base-ref> [-n N]`): records
+   `tests/megakernel/core/golden/compare_base_head.sh <base-ref> [-n N]`): records
    fresh reference hashes at `<base-ref>` on the current host with
    `MK_REGEN_GOLDEN=1 MK_GOLDEN_JSON=$TMP/base.json pytest <this file>` (falling
    back to running HEAD's `ref_tiny_*` cases against `<base-ref>`'s `src/` when
@@ -61,8 +61,8 @@ import pytest
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from vllm_torchtpu import megakernel as mk
-from vllm_torchtpu.megakernel.modules.gqa import GQATunables
+from vllm_torchtpu.megakernel import core as mk
+from vllm_torchtpu.megakernel.core.modules.gqa import GQATunables
 from vllm_torchtpu.models.qwen3_5.megakernel import model as qwen35
 
 GOLDEN = pathlib.Path(__file__).parent / "golden" / "b1_bitexact.json"
@@ -222,8 +222,8 @@ def _pinned_b1_golden_inputs(
     key: jax.Array, g: qwen35.Qwen35Geometry, ex: mk.ExecSpec
 ) -> tuple[jax.Array, jax.Array, dict[str, Any], dict[str, Any]]:
     """Pinned input tensor stream matching `b1_bitexact.json` / `aaafa5d66`."""
-    from vllm_torchtpu.megakernel.modules.gdn import GDNModule
-    from vllm_torchtpu.megakernel.ops import BF16, F32, FP8, I32
+    from vllm_torchtpu.megakernel.core.modules.gdn import GDNModule
+    from vllm_torchtpu.megakernel.core.ops import BF16, F32, FP8, I32
 
     R_, B, T, NS, ctx = ex.R, ex.B, ex.T, ex.NS, ex.ctx
     L, H, E, HD = int(g.L), int(g.H), int(g.E), int(g.HD)
@@ -465,7 +465,7 @@ def test_golden_bitexact(name: str):
                 f"golden recorded on {_format_fingerprint(meta)}, "
                 f"this host is {_format_fingerprint(cur)}; "
                 "use base-vs-head mode: "
-                "tests/megakernel/golden/compare_base_head.sh <base-ref>"
+                "tests/megakernel/core/golden/compare_base_head.sh <base-ref>"
             )
     elif name not in all_gold:
         pytest.skip(f"case {name!r} only exists in HEAD (not in {golden_path})")

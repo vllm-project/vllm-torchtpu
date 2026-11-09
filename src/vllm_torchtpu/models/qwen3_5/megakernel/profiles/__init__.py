@@ -24,7 +24,7 @@ Importing this package registers nothing (`model.register()` does).
 
 from __future__ import annotations
 
-from vllm_torchtpu.megakernel.profile import Profile
+from vllm_torchtpu.megakernel.core.profile import Profile
 
 from . import baseline, candidate30
 

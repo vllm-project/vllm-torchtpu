@@ -28,17 +28,30 @@ import torch
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
-import vllm_torchtpu.megakernel as mk
-import vllm_torchtpu.megakernel_runtime.driver as driver_mod
-import vllm_torchtpu.megakernel_runtime.guards as guards_mod
-import vllm_torchtpu.megakernel_runtime.stepping as stepping_mod
+import vllm_torchtpu.megakernel.adapter.driver as driver_mod
+import vllm_torchtpu.megakernel.adapter.guards as guards_mod
+import vllm_torchtpu.megakernel.adapter.stepping as stepping_mod
+import vllm_torchtpu.megakernel.core as mk
 from tests.models.qwen3_5.megakernel.test_weight_collector import (
     _jax_to_torch,
     make_synthetic_qwen35_backbone,
 )
-from vllm_torchtpu.megakernel.exec_spec import ExecSpec
-from vllm_torchtpu.megakernel.pool.config import with_cache
-from vllm_torchtpu.megakernel.runtime import (
+from vllm_torchtpu.megakernel.adapter import testing  # noqa: E402
+from vllm_torchtpu.megakernel.adapter.config import (  # noqa: E402
+    collect_config,
+    resolve_plugin_ref,
+)
+from vllm_torchtpu.megakernel.adapter.hooks import StepContext  # noqa: E402
+from vllm_torchtpu.megakernel.adapter.plugin import RunnerView  # noqa: E402
+from vllm_torchtpu.megakernel.adapter.step_meta_ops import (
+    TorchStepMetaOps,  # noqa: E402
+)
+from vllm_torchtpu.megakernel.adapter.weight_collector import (  # noqa: E402
+    WEIGHT_FLIPPED_ATTR,
+)
+from vllm_torchtpu.megakernel.core.exec_spec import ExecSpec
+from vllm_torchtpu.megakernel.core.pool.config import with_cache
+from vllm_torchtpu.megakernel.core.runtime import (
     DEFAULT_BUCKETS,
     DEFAULT_VERIFY_BUCKETS,
     BatchShape,
@@ -53,22 +66,9 @@ from vllm_torchtpu.megakernel.runtime import (
     resolve_step_positions,
     select_bucket,
 )
-from vllm_torchtpu.megakernel.runtime.contract import (  # noqa: E402
+from vllm_torchtpu.megakernel.core.runtime.contract import (  # noqa: E402
     Bucket,
     LayoutDecline,
-)
-from vllm_torchtpu.megakernel_runtime import testing  # noqa: E402
-from vllm_torchtpu.megakernel_runtime.config import (  # noqa: E402
-    collect_config,
-    resolve_plugin_ref,
-)
-from vllm_torchtpu.megakernel_runtime.hooks import StepContext  # noqa: E402
-from vllm_torchtpu.megakernel_runtime.plugin import RunnerView  # noqa: E402
-from vllm_torchtpu.megakernel_runtime.step_meta_ops import (
-    TorchStepMetaOps,  # noqa: E402
-)
-from vllm_torchtpu.megakernel_runtime.weight_collector import (  # noqa: E402
-    WEIGHT_FLIPPED_ATTR,
 )
 from vllm_torchtpu.models.qwen3_5 import (  # noqa: E402
     megakernel as qwen_plugin,
@@ -550,7 +550,7 @@ def test_bucket_parsing_and_selection() -> None:
     assert cfg_runner_c30["profile"] == "qwen35-candidate30"
     assert cfg_runner_c30["pool_gather"] == "auto"
 
-    import vllm_torchtpu.megakernel_runtime as mk_rt
+    import vllm_torchtpu.megakernel.adapter as mk_rt
 
     assert mk_rt._is_megakernel_requested(fake_runner)
     fake_runner_disabled = SimpleNamespace(
@@ -835,7 +835,7 @@ def test_block_tables_1d_reshape_most_model_len() -> None:
 def test_prepare_step_inputs_eager_is_pack_step_meta_over_torch_ops() -> None:
     """The adapter's `prepare_step_inputs_eager` is `pack_step_meta` over
     `TorchStepMetaOps` for its three recurrent groups (the packing itself is
-    tested in `tests/megakernel_runtime/test_step_meta_ops.py`)."""
+    tested in `tests/megakernel/adapter/test_step_meta_ops.py`)."""
     ops = TorchStepMetaOps()
     max_pages = 4
     s = torch.tensor([1, 0, 5, 8, 0, 12], dtype=torch.int32)
@@ -1055,8 +1055,8 @@ def test_bind_caches_rejects_compact_mamba_and_non_aliasing_la_cache() -> None:
 
 def test_compile_hlo_check_config_errors_are_not_layout_errors() -> None:
     """`compile_hlo_check` misconfiguration fails loudly; layout errors disable MK."""
-    from vllm_torchtpu.megakernel import MegakernelConfigError
-    from vllm_torchtpu.megakernel.runtime import check_compile_hlo_mesh
+    from vllm_torchtpu.megakernel.core import MegakernelConfigError
+    from vllm_torchtpu.megakernel.core.runtime import check_compile_hlo_mesh
 
     class _MockDevice:
         id = 0
@@ -1089,7 +1089,7 @@ def test_compile_hlo_check_config_errors_are_not_layout_errors() -> None:
         drv_val.bind_and_warmup(runner)
     assert runner._megakernel == "mk"
     # Only MegakernelLayoutError disables the megakernel (stock fallback).
-    from vllm_torchtpu.megakernel import MegakernelLayoutError
+    from vllm_torchtpu.megakernel.core import MegakernelLayoutError
 
     drv_layout = _driver_raising(MegakernelLayoutError("incompatible KV layout"))
     drv_layout.bind_and_warmup(runner)
@@ -1178,7 +1178,7 @@ def test_bind_caches_adopts_an_fp32_conv_framework_pool(
 
     import jax.numpy as jnp
 
-    from vllm_torchtpu.megakernel import runtime as _rt
+    from vllm_torchtpu.megakernel.core import runtime as _rt
 
     mesh = _cpu_mesh(1)
     g = _tiny_geom(L=4, att_every=4)
@@ -1244,7 +1244,7 @@ def test_bind_caches_adopts_an_fp32_conv_framework_pool(
 
 def test_bind_caches_budget_overflow_is_config_error() -> None:
     """VMEM budget overflow in `bind_caches` propagates; it is not a layout error."""
-    from vllm_torchtpu.megakernel import MegakernelConfigError
+    from vllm_torchtpu.megakernel.core import MegakernelConfigError
 
     mesh = _cpu_mesh(1)
     g = _tiny_geom(L=4, att_every=4)
@@ -1273,8 +1273,8 @@ def test_driver_validates_profile_before_packing_and_uses_profile_buckets(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Profile + compile-HLO checks run before packing; profile buckets apply."""
-    from vllm_torchtpu.megakernel import MegakernelConfigError, Profile
-    from vllm_torchtpu.megakernel import profile as profile_mod
+    from vllm_torchtpu.megakernel.core import MegakernelConfigError, Profile
+    from vllm_torchtpu.megakernel.core import profile as profile_mod
 
     g = _tiny_geom(L=4, att_every=4)
     ex_base = _tiny_exec(R=1, B=2, T=1, ctx=256, num_pages=96)
@@ -1324,7 +1324,7 @@ def test_maybe_create_disables_on_unsupported_tpu_chip(
     import logging
     import sys
 
-    from tests.megakernel.frozen_utils import dict_to_namespace
+    from tests.megakernel.core.frozen_utils import dict_to_namespace
 
     g = _tiny_geom(L=4, att_every=4)
     ex_base = _tiny_exec(R=8, B=4, T=1, ctx=256, num_pages=96)
@@ -1402,7 +1402,7 @@ def test_maybe_create_declines_without_usable_pallas_mesh(
     import logging
     import sys
 
-    from vllm_torchtpu import megakernel_runtime as mkr
+    from vllm_torchtpu.megakernel import adapter as mkr
 
     g = _tiny_geom(L=4, att_every=4)
     ex_base = _tiny_exec(R=8, B=4, T=1, ctx=256, num_pages=96)
@@ -1515,9 +1515,9 @@ def test_maybe_create_uses_model_default_profile_and_disables_empty_buckets(
     import logging
     import sys
 
-    from tests.megakernel.frozen_utils import dict_to_namespace
-    from vllm_torchtpu.megakernel import Profile, register_profile
-    from vllm_torchtpu.megakernel import profile as profile_mod
+    from tests.megakernel.core.frozen_utils import dict_to_namespace
+    from vllm_torchtpu.megakernel.core import Profile, register_profile
+    from vllm_torchtpu.megakernel.core import profile as profile_mod
 
     g = _tiny_geom(L=4, att_every=4)
     ex_base = _tiny_exec(R=8, B=4, T=1, ctx=256, num_pages=96)
@@ -1635,7 +1635,7 @@ def test_maybe_create_uses_model_default_profile_and_disables_empty_buckets(
 
     # 5. Table-driven check that every startup code in `check_startup_eligibility`
     #    and `check_post_mesh_eligibility` maps through `_VLLM_STARTUP_MESSAGES`.
-    from vllm_torchtpu.megakernel.runtime import check_startup_eligibility
+    from vllm_torchtpu.megakernel.core.runtime import check_startup_eligibility
 
     base_st = dict(
         num_layers=60,
@@ -1928,8 +1928,8 @@ def test_can_run_real_tpu_runner_metadata(monkeypatch: pytest.MonkeyPatch) -> No
     assert not driver.can_run(ids_2, pos_2, runner=runner)
     backbone.aux_hidden_state_layers = ()
 
-    # 9. `megakernel_runtime.maybe_create` registry and lazy fast-path
-    import vllm_torchtpu.megakernel_runtime as mk_rt
+    # 9. `megakernel.adapter.maybe_create` registry and lazy fast-path
+    import vllm_torchtpu.megakernel.adapter as mk_rt
 
     non_qwen_runner = SimpleNamespace(
         model=SimpleNamespace(),
@@ -2352,14 +2352,14 @@ def test_megakernel_driver_e2e_decode_verify_and_spec_accept(
         )
 
 
-def test_megakernel_runtime_package_has_no_model_names_and_no_legacy_exports():
-    """`megakernel_runtime/*.py` has zero model literals and no legacy re-exports."""
+def test_megakernel_adapter_package_has_no_model_names_and_no_legacy_exports():
+    """`megakernel/adapter/*.py` has zero model literals and no legacy re-exports."""
     import ast
     from pathlib import Path
 
-    import vllm_torchtpu.megakernel_runtime as mkr
-    import vllm_torchtpu.megakernel_runtime.driver as drv_mod
-    import vllm_torchtpu.megakernel_runtime.exported_bridge as eb_mod
+    import vllm_torchtpu.megakernel.adapter as mkr
+    import vllm_torchtpu.megakernel.adapter.driver as drv_mod
+    import vllm_torchtpu.megakernel.adapter.exported_bridge as eb_mod
 
     pkg_dir = Path(mkr.__file__).parent
     py_files = sorted(pkg_dir.glob("*.py"))
@@ -2421,7 +2421,7 @@ def test_megakernel_runtime_package_has_no_model_names_and_no_legacy_exports():
     )
     for attr in removed_driver_attrs:
         assert not hasattr(drv_mod, attr), f"driver.py still defines {attr}"
-        assert not hasattr(mkr, attr), f"megakernel_runtime still exports {attr}"
+        assert not hasattr(mkr, attr), f"megakernel.adapter still exports {attr}"
 
     for cls_attr in ("_step_mix", "_torchtpu_ir_checked", "_ir_required_buckets"):
         for cls in (driver_mod.ProgramDriver, Qwen35Program):
@@ -2444,8 +2444,8 @@ def test_megakernel_runtime_package_has_no_model_names_and_no_legacy_exports():
         "check_compile_hlo_mesh",
         "MKABCalibrator",
     ):
-        assert attr not in mkr.__all__, f"megakernel_runtime.__all__ still has {attr}"
-        assert not hasattr(mkr, attr), f"megakernel_runtime still re-exports {attr}"
+        assert attr not in mkr.__all__, f"megakernel.adapter.__all__ still has {attr}"
+        assert not hasattr(mkr, attr), f"megakernel.adapter still re-exports {attr}"
         assert not hasattr(drv_mod, attr), f"driver.py still defines {attr}"
         assert not hasattr(eb_mod, attr), f"exported_bridge.py still defines {attr}"
 

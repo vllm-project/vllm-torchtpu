@@ -25,7 +25,7 @@ calls it.
 ### 1. Copy (for a new model)
 
 ```bash
-python -m vllm_torchtpu.megakernel_runtime.new --from qwen35 \
+python -m vllm_torchtpu.megakernel.adapter.new --from qwen35 \
   --dir src/vllm_torchtpu/models/<model>/megakernel --name <model> \
   [--model-name <ModelDef name>]
 ```
@@ -59,7 +59,7 @@ the CPU-interpret kernel. The second is the full suite (bit-exact golden
 hashes, the reference checks, the vLLM integration tests).
 
 The folder's test uses the runtime's plugin test kit,
-`vllm_torchtpu.megakernel_runtime.testkit`:
+`vllm_torchtpu.megakernel.adapter.testkit`:
 
 - `check_plugin_spec("<package>")`: `SPEC` is valid, `create` is a lazy
   `"module:attr"` string, and the package imports with torch / jax / vLLM
@@ -73,7 +73,7 @@ The folder's test uses the runtime's plugin test kit,
   into `tests/conftest.py`.
 
 A program whose steps are JAX functions can build each with
-`megakernel_runtime.jax_bridge.build_jax_step_op(fn, mesh=..., in_specs=...,
+`megakernel.adapter.jax_bridge.build_jax_step_op(fn, mesh=..., in_specs=...,
 out_specs=..., donate={out: in})`: a torch callable that runs `fn` through
 `torch_tpu` on TPU and through JAX on CPU, so the same test serves on both.
 
@@ -210,6 +210,6 @@ atop every copied `.py` file, after the license header:
 ```
 
 so a change to this folder can list its copies:
-`python -m vllm_torchtpu.megakernel_runtime.provenance --base origin/main`
+`python -m vllm_torchtpu.megakernel.adapter.provenance --base origin/main`
 prints each changed file that has copies, and the copies. Files moved here
 (not copied) carry none.

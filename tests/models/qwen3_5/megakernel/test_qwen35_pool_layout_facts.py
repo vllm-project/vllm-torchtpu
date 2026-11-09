@@ -13,7 +13,7 @@
 # limitations under the License.
 """Qwen3.5's pool slot facts: `Qwen35.pool_layout` against the framework's
 layout of the Qwen3.5 GDN slot. The model-free checks of the slot facts and
-their comparison are in `tests/megakernel_runtime/test_pool_layout_facts.py`."""
+their comparison are in `tests/megakernel/adapter/test_pool_layout_facts.py`."""
 
 from __future__ import annotations
 
@@ -24,12 +24,12 @@ import pytest
 import torch
 
 from vllm_torchtpu import gdn_pool_layout as gpl
-from vllm_torchtpu.megakernel.runtime import (
+from vllm_torchtpu.megakernel.adapter.pool_facts import framework_pool_layout_facts
+from vllm_torchtpu.megakernel.core.runtime import (
     PoolLayoutFacts,
     compare_layout_facts,
     facts_from_pool_layout,
 )
-from vllm_torchtpu.megakernel_runtime.pool_facts import framework_pool_layout_facts
 from vllm_torchtpu.models.qwen3_5.megakernel.model import Qwen35
 
 TP = 8
