@@ -20,7 +20,8 @@ import re
 import numpy as np
 import pytest
 
-jax = pytest.importorskip("jax")
+pytest.importorskip("jax")
+import jax  # noqa: E402
 import jax.extend.backend  # noqa: E402
 import jax.numpy as jnp  # noqa: E402
 from jax._src.lib import xla_client as xc  # noqa: E402

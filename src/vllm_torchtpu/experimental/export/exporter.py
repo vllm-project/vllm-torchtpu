@@ -1130,9 +1130,9 @@ def _export_draft(
 
     # A draft function taking `draft_slots` is lowered once per request count and
     # the variants are composed into one module (`draft_slot_counts`).
-    slot_variants = "draft_slots" in inspect.signature(
-        getattr(model, drafter.draft_fn)
-    ).parameters
+    slot_variants = (
+        "draft_slots" in inspect.signature(getattr(model, drafter.draft_fn)).parameters
+    )
     variants: dict[str, Any] = {}
     for b_idx, bucket_size in enumerate(cfg.token_buckets):
         user_inputs = _draft_user_inputs(model, bucket_size)

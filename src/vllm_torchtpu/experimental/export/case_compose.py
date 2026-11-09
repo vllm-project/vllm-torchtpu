@@ -28,9 +28,7 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 
-_SYMBOL = re.compile(
-    r"(?:func\.func|sdy\.mesh)\s+(?:public\s+|private\s+)?@([\w.$-]+)"
-)
+_SYMBOL = re.compile(r"(?:func\.func|sdy\.mesh)\s+(?:public\s+|private\s+)?@([\w.$-]+)")
 _MAIN_START = "func.func public @main("
 
 
