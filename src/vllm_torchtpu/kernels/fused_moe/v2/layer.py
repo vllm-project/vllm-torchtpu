@@ -108,6 +108,50 @@ def _row_routes(scores, gate_l):
     )
 
 
+# Largest (lookups x mirror sublanes) one-hot the scale lookup builds; above
+# it the 2-D gather stays (only the DSpark draft envelope, 720 x 264, is
+# measured).
+_ONEHOT_SCALE_MAX_CELLS = 1 << 19
+
+
+def _lookup_row_scales(arrival_scales, scl, shift):
+    """``arrival_scales[scl >> shift, scl & (tile_m - 1)]``, bit for bit.
+
+    For small mirrors the gather lowers to slow scalar reads, so the row is
+    picked by a one-hot matmul instead. An f32 matmul would spread one NaN of
+    the table over a whole column (0 * NaN = NaN), and unwritten mirror
+    entries can be NaN, so the matmul runs on the f32 bit pattern split into
+    two 16-bit halves: each is an exact small integer in f32, a one-hot row
+    picks it exactly at HIGHEST precision, and the lane is selected in
+    integers. NaN payloads, infinities, -0.0 and denormals come back intact.
+    """
+    from vllm_torchtpu import envs
+
+    sublanes, tile_m = arrival_scales.shape
+    sub = jnp.right_shift(scl, shift)
+    lane = scl & (tile_m - 1)
+    if (
+        not envs.TPU_MOE_ONEHOT_SCALE_LOOKUP
+        or arrival_scales.dtype != jnp.float32
+        or scl.size * sublanes > _ONEHOT_SCALE_MAX_CELLS
+    ):
+        return arrival_scales[sub, lane]
+    shape = scl.shape
+    sub, lane = sub.reshape(-1), lane.reshape(-1)
+    raw = lax.bitcast_convert_type(arrival_scales, jnp.uint32)
+    halves = jnp.concatenate(
+        [(raw >> 16).astype(jnp.float32), (raw & 0xFFFF).astype(jnp.float32)], axis=1
+    )
+    hit = (sub[:, None] == jnp.arange(sublanes, dtype=sub.dtype)[None]).astype(
+        jnp.float32
+    )
+    picked = jnp.dot(hit, halves, precision=lax.Precision.HIGHEST).astype(jnp.uint32)
+    word = (picked[:, :tile_m] << 16) | picked[:, tile_m:]
+    keep = lane[:, None] == jnp.arange(tile_m, dtype=lane.dtype)[None]
+    word = jnp.sum(jnp.where(keep, word, jnp.uint32(0)), axis=1)
+    return lax.bitcast_convert_type(word, jnp.float32).reshape(shape)
+
+
 def _combine_arrivals(
     arrivals, arrival_scales, pos, mirror_pos, topk_weights, out_dtype
 ):
@@ -142,7 +186,7 @@ def _combine_arrivals(
     rows = jnp.minimum(pos, recv_rows - 1)
     shift = pow2_shift(tile_m, "the mirror's lane count")
     scl = jnp.minimum(mirror_pos, mirror_sublanes * tile_m - 1)
-    row_scales = arrival_scales[jnp.right_shift(scl, shift), scl & (tile_m - 1)]
+    row_scales = _lookup_row_scales(arrival_scales, scl, shift)
     coef = row_scales * topk_weights.astype(jnp.float32)
     if combine_step_tokens(t_local):
         combine = build_combine_kernel(

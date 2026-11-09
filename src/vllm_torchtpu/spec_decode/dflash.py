@@ -16,6 +16,7 @@ from vllm.model_executor.model_loader import get_model_loader
 
 from vllm_torchtpu.layers.adapter import token_padding
 from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackendImpl
+from vllm_torchtpu.layers.core import table_lookup
 from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadata,
     AttentionMetadataBuilderContext,
@@ -1086,9 +1087,15 @@ class DFlashProposer:
         last_live = torch.clamp(num_reqs - 1, min=0)
         safe_req_indices = torch.minimum(req_indices, last_live)
         valid_mask = (req_indices < num_reqs).unsqueeze(1).to(torch.int32)
-        start_positions = position_ids[query_start_loc[safe_req_indices]].unsqueeze(1)
-        end_indices = torch.clamp(query_start_loc[safe_req_indices + 1] - 1, min=0)
-        last_positions = position_ids[end_indices].unsqueeze(1)
+        # Per-request lookups into short tables: one-hot, not a scalar-operand
+        # gather chain (`table_lookup`).
+        start_positions = table_lookup.take(
+            position_ids, table_lookup.take(query_start_loc, safe_req_indices)
+        ).unsqueeze(1)
+        end_indices = torch.clamp(
+            table_lookup.take(query_start_loc, safe_req_indices + 1) - 1, min=0
+        )
+        last_positions = table_lookup.take(position_ids, end_indices).unsqueeze(1)
         return safe_req_indices, valid_mask, start_positions, last_positions
 
     def _layout_draft_block(
@@ -1209,7 +1216,7 @@ class DFlashProposer:
 
         # Anchor verify windows at start + num_accepted;
         # anchor prompt chunks at last_pos + 1.
-        num_draft = draft_lengths[safe_req_indices].unsqueeze(1)
+        num_draft = table_lookup.take(draft_lengths, safe_req_indices).unsqueeze(1)
         is_verify_window = (num_draft > 0).to(torch.int32)
         verify_base = start_positions_padded + num_accepted
         prompt_base = ((last_positions + 1) * valid_mask).to(torch.int32)

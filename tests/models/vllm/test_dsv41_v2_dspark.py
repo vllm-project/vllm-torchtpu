@@ -169,6 +169,68 @@ def test_insert_context_kv(monkeypatch: pytest.MonkeyPatch):
     assert torch.equal(inserted[0][2], torch.tensor([True, True, True]))
 
 
+@pytest.mark.parametrize("shared", [True, False])
+def test_context_kv_addresses_derived_once_per_cache_group(
+    monkeypatch: pytest.MonkeyPatch, shared: bool
+):
+    """Draft layers handed the same metadata derive their SWA slots once; the
+    slots and window mask each layer writes equal a per-layer derivation."""
+    slot_calls: list[object] = []
+    inserted: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    def fake_cache_slots(cache, md, pos):
+        slot_calls.append(md)
+        return pos * 10 + md.seq_lens[0]
+
+    monkeypatch.setattr(v2_dspark, "_cache_slots", fake_cache_slots)
+    monkeypatch.setattr(
+        v2_dspark,
+        "_token_requests",
+        lambda md, pos: torch.zeros_like(pos),
+    )
+    monkeypatch.setattr(
+        v2_dspark, "_insert", lambda cache, s, kv, v: inserted.append((s, v))
+    )
+    monkeypatch.setattr(v2_dspark, "_context_kv", lambda attn, x, pos: x)
+    # Per-layer inserts, so each layer's addresses reach the stubbed `_insert`.
+    monkeypatch.setattr(envs, "TPU_DSPARK_MERGED_CONTEXT_WRITES", False)
+
+    def layer():
+        return SimpleNamespace(
+            attn=SimpleNamespace(
+                window_size=4,
+                swa_cache_layer=SimpleNamespace(kv_cache=torch.zeros((2, 4, 1, 8))),
+            )
+        )
+
+    layers = [layer() for _ in range(3)]
+    tables = torch.zeros((1, 2), dtype=torch.int32)
+    starts = torch.tensor([0, 3], dtype=torch.int32)
+
+    def metadata():
+        return SimpleNamespace(
+            block_tables=tables,
+            query_start_loc=starts,
+            seq_lens=torch.tensor([6], dtype=torch.int32),
+        )
+
+    mds = [metadata()] * 3 if shared else [metadata() for _ in range(3)]
+    model = SimpleNamespace(config=SimpleNamespace(hidden_size=8), layers=layers)
+    positions = torch.tensor([1, 2, 5], dtype=torch.long)
+    v2_dspark.DSparkDeepseekV41Model.precompute_and_store_context_kv(
+        model, torch.ones((3, 8)), positions, tuple(mds)
+    )
+
+    assert len(slot_calls) == (1 if shared else 3)
+    assert len(inserted) == 3
+    for md, (slots, valid) in zip(mds, inserted, strict=True):
+        ref_slots, ref_valid = v2_dspark._context_kv_addresses(
+            layers[0].attn, md, positions
+        )
+        assert torch.equal(slots, ref_slots)
+        assert torch.equal(valid, ref_valid)
+
+
 def test_attend_window_width_over_512(monkeypatch: pytest.MonkeyPatch):
     attend_called = False
 

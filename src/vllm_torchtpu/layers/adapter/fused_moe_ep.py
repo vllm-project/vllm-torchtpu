@@ -124,6 +124,17 @@ _RANK_BUFFER: Any = None
 # that has to be torn down between models in one process.
 FUSED_MOE_EP_OP_ATTR = "_fused_moe_ep_op"
 
+# Set on a DSpark draft layer's routed experts (the object prebuild receives)
+# by `mark_dspark_draft_moe`, so that prebuild can build that layer's op with
+# draft-only knobs without the target model's layers seeing them.
+DSPARK_DRAFT_MOE_ATTR = "_dspark_draft_moe"
+
+
+def mark_dspark_draft_moe(experts) -> None:
+    """Tag a DSpark draft layer's `ffn.experts` (a MoE runner, or the routed
+    experts themselves) before its weights are processed."""
+    setattr(getattr(experts, "routed_experts", experts), DSPARK_DRAFT_MOE_ATTR, True)
+
 
 def _squeeze_channel_scale(
     scale: torch.Tensor, experts: int, channels: int
@@ -189,11 +200,17 @@ def _build_op(
     has_expert_slot=False,
     has_expert_load=False,
     row_score_bias=False,
+    dspark_draft=False,
 ):
     """The op for this closure, built once per distinct closure and reused.
 
     `row_score_bias` takes `score_bias` as [tokens, experts], sharded like the
     tokens, instead of one replicated row.
+
+    `dspark_draft` marks a DSpark draft layer (`mark_dspark_draft_moe`). Under
+    the push build and TPU_DSPARK_DRAFT_MOE_TUNING it gets its own knobs,
+    sc_prepush=1 and two tile-height rungs, in place of the process-wide envs;
+    every other layer is built exactly as before.
 
     `has_expert_slot` adds the expert layout's slot table as one more
     replicated operand (expert_placement.py): the table's values are data, so
@@ -217,6 +234,8 @@ def _build_op(
             tc_exchange=envs.MOE_FUSED_EP_PUSH_TC_EXCHANGE,
             height_rungs_override=envs.MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE,
         )
+        if dspark_draft and envs.TPU_DSPARK_DRAFT_MOE_TUNING:
+            impl_kw.update(sc_prepush=1, height_rungs_override=2)
 
     preprocess_topology = prepare_moe_preprocessing(mesh)
 
@@ -924,6 +943,7 @@ def prebuild_fused_moe_ep(
         has_expert_slot=placed is not None,
         has_expert_load=placed is not None and expert_load_tap.enabled(),
         row_score_bias=row_score_bias,
+        dspark_draft=bool(getattr(layer, DSPARK_DRAFT_MOE_ATTR, False)),
     )
     logger.info_once(
         "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d "

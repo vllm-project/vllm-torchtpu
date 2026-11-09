@@ -1406,3 +1406,66 @@ def test_build_op_picks_the_push_layer_and_passes_its_knobs(monkeypatch, impl):
         forwarded = v2_kernel.call_args.kwargs
         for knob in ("sc_prepush", "tc_exchange", "height_rungs_override"):
             assert knob not in forwarded
+
+
+@pytest.mark.parametrize("tuning", [True, False], ids=["tuned", "flag_off"])
+def test_dspark_draft_op_gets_its_own_push_knobs(monkeypatch, tuning):
+    """A DSpark draft layer's op runs sc_prepush=1 and two rungs (measured
+    161.8 -> 135.8 us per draft layer on EP16), while a target layer built in
+    the same process keeps the process-wide knobs: the draft tuning was never
+    measured on the target's shapes, so it must not leak onto them. The two
+    ops are distinct cache entries, and TPU_DSPARK_DRAFT_MOE_TUNING=0 gives
+    the draft layer the target's knobs back."""
+    from unittest.mock import Mock
+
+    from vllm_torchtpu.kernels.experimental import push_fused_moe
+
+    monkeypatch.setattr(bridge, "_OPS", {})
+    closures = []
+
+    def build(name, fn, **kwargs):
+        closures.append(fn)
+        return Mock()
+
+    monkeypatch.setattr(bridge, "jax_op", build)
+    push_kernel = Mock(side_effect=lambda x, *args, **kwargs: x)
+    monkeypatch.setattr(push_fused_moe, "fused_ep_moe_push", push_kernel)
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_KERNEL_IMPL", "push")
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_SC_PREPUSH", 2)
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_TC_EXCHANGE", True)
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE", 0)
+    monkeypatch.setitem(vars(envs), "TPU_DSPARK_DRAFT_MOE_TUNING", tuning)
+    target = bridge._build_op(None, 2, True, "silu", None, False)
+    draft = bridge._build_op(None, 2, True, "silu", None, False, dspark_draft=True)
+    assert (draft is target) != tuning
+    operands = (
+        jnp.ones((8, 8), dtype=jnp.bfloat16),
+        None,
+        None,
+        None,
+        None,
+        jnp.zeros((8, 4)),
+        jnp.zeros((1, 1), dtype=jnp.int32),
+    )
+    seen = []
+    for closure in closures:
+        closure(*operands)
+        kw = push_kernel.call_args.kwargs
+        seen.append((kw["sc_prepush"], kw["height_rungs_override"], kw["tc_exchange"]))
+    assert seen[0] == (2, 0, True)
+    if tuning:
+        assert seen[1] == (1, 2, True)
+    else:
+        assert len(seen) == 1
+
+
+@pytest.mark.parametrize("marked", [False, True])
+def test_prebuild_reads_the_dspark_draft_mark_off_the_layer(marked):
+    """prebuild learns a layer is a draft layer only from the mark the DSpark
+    model puts on its experts; an unmarked (target) layer builds as before."""
+    layer = _layer()
+    if marked:
+        bridge.mark_dspark_draft_moe(SimpleNamespace(routed_experts=layer))
+    seen = []
+    assert _prebuild(layer, build_op=lambda *a, **kw: seen.append(kw) or "op") == "op"
+    assert seen[0]["dspark_draft"] is marked

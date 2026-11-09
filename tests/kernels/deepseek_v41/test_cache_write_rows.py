@@ -7,7 +7,10 @@ import numpy as np
 import pytest
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.kernels.deepseek_v41.cache_write import write_cache_rows
+from vllm_torchtpu.kernels.deepseek_v41.cache_write import (
+    write_cache_rows,
+    write_cache_rows_banked,
+)
 
 
 @pytest.fixture
@@ -93,3 +96,48 @@ def test_row_writes_reject_incompatible_shapes():
         cache, jnp.zeros(0, jnp.int32), jnp.zeros((0, 128), jnp.int32)
     )
     np.testing.assert_array_equal(empty, 0)
+
+
+@pytest.mark.parametrize("lo_rows,hi_rows", [(8192, 8192), (8192, 3000), (512, 7000)])
+@pytest.mark.parametrize("count", [1, 37, 864, 4096])
+def test_banked_row_writes_match_per_bank_writes(
+    sparsecore_device, lo_rows, hi_rows, count
+):
+    # Rows address [lo; hi]; out-of-range and negative rows are dropped, and
+    # each bank must equal what one write_cache_rows per bank leaves.
+    rng = np.random.default_rng(count + lo_rows + hi_rows)
+    total = lo_rows + hi_rows
+    lo = _random_words(rng, (lo_rows, 128))
+    hi = _random_words(rng, (hi_rows, 128))
+    rows = rng.permutation(total)[: min(count, total)].astype(np.int32)
+    rows[3::11] = total + rows[3::11]
+    rows[::7] = -1
+    words = _random_words(rng, (rows.shape[0], 128))
+    got_lo, got_hi = write_cache_rows_banked(
+        jnp.asarray(lo), jnp.asarray(hi), jnp.asarray(rows), jnp.asarray(words)
+    )
+    lo_part = np.where((rows >= 0) & (rows < lo_rows), rows, -1).astype(np.int32)
+    hi_part = np.where(rows >= lo_rows, rows - lo_rows, -1).astype(np.int32)
+    np.testing.assert_array_equal(got_lo, _expected(lo, lo_part, words))
+    np.testing.assert_array_equal(got_hi, _expected(hi, hi_part, words))
+
+
+def test_banked_row_writes_reject_incompatible_shapes():
+    good = jnp.zeros((8, 128), jnp.int32)
+    with pytest.raises(ValueError, match="INT32"):
+        write_cache_rows_banked(
+            good,
+            jnp.zeros((8, 64), jnp.int32),
+            jnp.zeros(1, jnp.int32),
+            jnp.zeros((1, 128), jnp.int32),
+        )
+    # Two distinct owners: both are donated, and one buffer cannot be
+    # donated twice.
+    lo, hi = write_cache_rows_banked(
+        jnp.zeros((8, 128), jnp.int32),
+        jnp.zeros((8, 128), jnp.int32),
+        jnp.zeros(0, jnp.int32),
+        jnp.zeros((0, 128), jnp.int32),
+    )
+    np.testing.assert_array_equal(lo, 0)
+    np.testing.assert_array_equal(hi, 0)

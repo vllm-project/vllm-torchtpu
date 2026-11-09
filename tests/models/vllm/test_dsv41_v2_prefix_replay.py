@@ -193,3 +193,49 @@ def test_lookback_reads_committed_tokens_on_a_replayed_admission():
     # Generated positions on later steps may hold async placeholders.
     assert ids[1].tolist() == [-1, -1]
     assert ids[2].tolist() == [511, 510]
+
+
+@pytest.mark.parametrize(
+    "indices,padded,rows,expected",
+    [
+        (tuple(range(8)), 8, 8, True),  # every row, in order, no padding
+        (tuple(range(8)), 16, 8, False),  # DP raised the bucket: padding rows
+        (tuple(range(1, 8)), 8, 8, False),  # a skipped prompt row
+        ((0, 1, 3, 2, 4, 5, 6, 7), 8, 8, False),  # reordered
+        (tuple(range(6)), 6, 8, False),  # fewer rows than the input bucket
+        ((), 0, 0, True),  # empty bucket is trivially in order
+    ],
+)
+def test_identity_replay_detection(indices, padded, rows, expected):
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import ced
+
+    plan = ced.DecoderReplayPlan(indices, (0, len(indices)), (0,), padded)
+    assert ced.is_identity_replay(plan, rows) is expected
+
+
+def test_identity_replay_none_plan():
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import ced
+
+    assert ced.is_identity_replay(None, 8) is False
+
+
+@pytest.mark.parametrize(
+    "requests,count,prompt,length,rows,compile_sizes,expected",
+    [
+        # Steady DSpark decode: 48 requests x 6 positions, all past the window.
+        (48, 6, 1024, 2048, 288, [288], True),
+        # Partial batch padded up to the 288 bucket: padding rows stay.
+        (47, 6, 1024, 2048, 288, [288], False),
+        # Prefill: only the last WINDOW prompt rows replay.
+        (1, 256, 256, 256, 256, [256], False),
+    ],
+)
+def test_identity_replay_from_planner(
+    requests, count, prompt, length, rows, compile_sizes, expected
+):
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import ced
+
+    bounds = [i * count for i in range(requests + 1)]
+    metadata = _plan_metadata(bounds, [length] * requests, [prompt] * requests)
+    plan = plan_decoder_replay(metadata, WINDOW, rows, compile_sizes)
+    assert ced.is_identity_replay(plan, rows) is expected

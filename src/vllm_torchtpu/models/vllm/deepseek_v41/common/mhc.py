@@ -708,6 +708,56 @@ def collapse(x, pre_mix):
     return (x.float() * pre_mix.unsqueeze(-1)).sum(-2).to(x.dtype)
 
 
+_flat_collapse_op = None
+
+
+def _flat_collapse_jax(flat: jax.Array, previous_pre: jax.Array) -> jax.Array:
+    return _collapse_flat(flat, previous_pre).astype(flat.dtype)
+
+
+def initialize_flat_collapse():
+    """Register the op behind ``flat_collapse``; models that use it call this."""
+    global _flat_collapse_op
+    if _flat_collapse_op is not None:
+        return
+    from jax.sharding import PartitionSpec as P
+    from torch_tpu._internal import pallas
+
+    from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+        get_pallas_op_mesh,
+    )
+
+    _flat_collapse_op = pallas.jax_op(
+        "pallas::deepseek_v41_flat_collapse",
+        _flat_collapse_jax,
+        mesh=get_pallas_op_mesh(),
+        input_partition_specs=cast(tuple[tuple[str, ...], ...], (P(), P())),
+    )
+    _flat_collapse_op.register_fake(
+        lambda flat, pre: flat.new_empty((flat.shape[0], flat.shape[1] // pre.shape[1]))
+    )
+
+
+def flat_collapse(x, pre_mix):
+    """``collapse`` without XLA's FP32 ``[T, 4, D]`` relayout copy.
+
+    On TPU the ``[T, 4, D]`` view costs a ``T(4,128)`` relayout of the whole
+    FP32 residual before the reduce; ``_collapse_flat`` sums column slices of
+    the flat input instead. Other devices, stream counts or dtypes, or an
+    unregistered op, keep ``collapse``.
+    """
+    if (
+        _flat_collapse_op is not None
+        and x.device.type == "tpu"
+        and x.dim() == 3
+        and x.shape[1] == 4
+        and x.dtype == torch.bfloat16
+        and pre_mix.dtype == torch.float32
+    ):
+        return _flat_collapse_op(x.flatten(1), pre_mix)
+    return collapse(x, pre_mix)
+
+
 def _default_pre_mix(residual: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     # First layer uses residual[:, 0], not the newly computed gate.
     # Avoid `new_zeros(residual.shape[:2])` and slice-scatter so SP

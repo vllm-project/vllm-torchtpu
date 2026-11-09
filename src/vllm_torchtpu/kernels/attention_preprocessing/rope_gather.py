@@ -81,6 +81,57 @@ def gather_rows_blocked(cos_sin_cache: jax.Array, positions: jax.Array) -> jax.A
     return _clamped_rows(cos_sin_cache, positions, True)
 
 
+def gather_paired_rows(pairs: jax.Array, positions: jax.Array) -> jax.Array:
+    """``gather_rows`` from a table packed two rows per 128-lane row.
+
+    ``pairs`` is ``[ceil(max_position / 2), 2 * rotary_dim]``: row ``i`` holds
+    table rows ``2i`` and ``2i + 1`` side by side, an odd table padded with a
+    copy of its last row (so clamping to the padded length is still exact).
+    A 64-wide FP32 row fills half a lane block, and XLA lowers that gather
+    about 10x slower than a full-lane one (11.2 -> 1.0 us at 288 tokens).
+    """
+    clamped = jnp.clip(positions, 0, 2 * pairs.shape[0] - 1)
+    rows = jnp.take(pairs, clamped >> 1, axis=0)
+    half = pairs.shape[1] // 2
+    even = ((clamped & 1) == 0)[:, None]
+    return jnp.where(even, rows[:, :half], rows[:, half:])
+
+
+def gather_paired_rows_sc(pairs: jax.Array, positions: jax.Array) -> jax.Array:
+    """``gather_paired_rows`` with the row gather on SparseCore.
+
+    The paired-row fetch runs as one SparseCore row-DMA program
+    (``ragged_gather_v2``), an async offload the TensorCore does not wait on
+    until the rows are consumed, so it can overlap TensorCore work that does
+    not depend on it (the DSpark main_proj). The even/odd half select stays
+    on the TensorCore. Falls back to ``gather_paired_rows`` without
+    SparseCore. Bit-exact.
+    """
+    from vllm_torchtpu.kernels.sparse_core.ragged_gather_v2 import ragged_gather_v2
+
+    if pltpu_sparse_core() is None:
+        return gather_paired_rows(pairs, positions)
+    clamped = jnp.clip(positions, 0, 2 * pairs.shape[0] - 1)
+    tokens = positions.shape[0]
+    rows = ragged_gather_v2(
+        pairs,
+        clamped >> 1,
+        jnp.zeros((1,), jnp.int32),
+        jnp.full((1,), tokens, jnp.int32),
+    )
+    half = pairs.shape[1] // 2
+    even = ((clamped & 1) == 0)[:, None]
+    return jnp.where(even, rows[:, :half], rows[:, half:])
+
+
+def pltpu_sparse_core():
+    from jax.experimental.pallas import tpu as pltpu
+
+    if jax.default_backend() != "tpu":
+        return None
+    return pltpu.get_tpu_info().sparse_core
+
+
 def coefficients(cos_sin):
     """``[rows, rotary_dim]`` packed rows -> 128-lane cos and sign-folded sin.
 

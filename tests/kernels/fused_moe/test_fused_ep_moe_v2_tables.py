@@ -355,10 +355,13 @@ def test_padded_tokens_are_dropped_from_routing_tables(
             assert int(np.asarray(whole_visit[1]).item()) == 0
 
 
-def test_combine_arrivals_isolates_nan_on_unrouted_padded_tokens():
+@pytest.mark.parametrize("onehot", [False, True])
+def test_combine_arrivals_isolates_nan_on_unrouted_padded_tokens(monkeypatch, onehot):
     """NaN arrival rows stay isolated to padded rows and zero out via row_routes."""
+    from vllm_torchtpu import envs
     from vllm_torchtpu.kernels.fused_moe.v2.layer import _combine_arrivals
 
+    monkeypatch.setattr(envs, "TPU_MOE_ONEHOT_SCALE_LOOKUP", onehot)
     # Use t_local=8 so combine_step_tokens(t_local) is 0 and the XLA epilogue runs
     # on CPU without invoking the Pallas TPU combine kernel.
     t_local, topk, lane_blocks, lanes, tile_m = 8, 4, 2, 128, 128
@@ -416,3 +419,36 @@ def test_row_routes_rejects_nan_and_neg_inf_across_all_scoring_fns(scoring_fn):
     scores = _apply_scoring_fn(gate_l, scoring_fn)
     routes = np.asarray(_row_routes(scores, gate_l))
     np.testing.assert_array_equal(routes, np.array([[True], [False], [False], [True]]))
+
+
+@pytest.mark.parametrize("onehot", [False, True])
+@pytest.mark.parametrize("lookups,sublanes", [(720, 264), (32, 4), (7, 1)])
+def test_row_scale_lookup_matches_gather_bit_for_bit(
+    monkeypatch, onehot, lookups, sublanes
+):
+    """The one-hot lookup returns the gather's bits, NaN payloads included,
+    and a NaN reaches only the lookups that read it."""
+    import jax.numpy as jnp
+
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.kernels.fused_moe.v2.layer import _lookup_row_scales
+
+    monkeypatch.setattr(envs, "TPU_MOE_ONEHOT_SCALE_LOOKUP", onehot)
+    rng = np.random.default_rng(lookups + sublanes)
+    bits = rng.integers(0, 2**32, (sublanes, 128), dtype=np.uint64).astype(np.uint32)
+    poison = rng.random(bits.shape) < 0.05
+    payload = rng.integers(1, 1 << 22, poison.sum()).astype(np.uint32)
+    sign = rng.integers(0, 2, poison.sum()).astype(np.uint32) << 31
+    bits[poison] = sign | np.uint32(0x7F800000) | payload
+    flat = bits.reshape(-1)
+    for pattern in (0x7F800000, 0xFF800000, 0x80000000, 0x00000001):
+        flat[rng.integers(0, flat.size)] = pattern
+    table = jnp.asarray(bits.view(np.float32))
+    scl = rng.integers(0, sublanes * 128, lookups).astype(np.int32)
+    nan_at = np.flatnonzero(np.isnan(table.reshape(-1)))
+    if nan_at.size:
+        scl[::5] = rng.choice(nan_at, len(scl[::5]))
+    scl = jnp.asarray(scl)
+    expected = np.asarray(table[jnp.right_shift(scl, 7), scl & 127]).view(np.uint32)
+    got = np.asarray(jax.jit(_lookup_row_scales, static_argnums=2)(table, scl, 7))
+    np.testing.assert_array_equal(got.view(np.uint32), expected)

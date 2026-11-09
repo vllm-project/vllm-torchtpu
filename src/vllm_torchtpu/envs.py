@@ -32,8 +32,19 @@ if TYPE_CHECKING:
     TPU_ONEHOT_TABLE_LOOKUP: bool = True
     TPU_INLINE_DEDUPLICATED_CALLS: bool = True
     TPU_VERIFY_INCREMENTAL_BLOCK_TABLE: bool = False
+    TPU_ROPE_PAIRED_ROWS: bool = True
+    TPU_ROPE_SC_GATHER: bool = True
+    TPU_DSPARK_FUSED_CONTEXT_KV: bool = True
+    TPU_DSPARK_MERGED_CONTEXT_WRITES: bool = True
+    TPU_SC_BANKED_ROW_WRITES: bool = True
+    TPU_ENGRAM_REQUEST_FALLBACK: bool = True
     TPU_BLOCK_TABLE_DELTA_BUCKETS: bool = True
     TPU_FUSED_SPEC_NEXT_INPUTS: bool = True
+    TPU_BLOCK_TABLE_DELTA_INPLACE: bool = True
+    TPU_DSV41_FUSED_ATTENTION_ROW_MASK: bool = True
+    TPU_DSPARK_PIPELINED_MARKOV: bool = True
+    TPU_MOE_ONEHOT_SCALE_LOOKUP: bool = True
+    TPU_DSPARK_DRAFT_MOE_TUNING: bool = True
     LIBTPU_INIT_ARGS: str = ""
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
@@ -562,6 +573,75 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # program with vector table lookups instead of a program per eager op
     # (runner/tpu_runner_async_output.py). Integer-exact.
     "TPU_FUSED_SPEC_NEXT_INPUTS": env_bool("TPU_FUSED_SPEC_NEXT_INPUTS", default=True),
+    # Also keep each 64-wide FP32 RoPE table packed two rows per 128-lane row
+    # (`_tpu_rope_pairs`, runner.utils.relayout_rope_tables) and gather the
+    # per-step rows from it: a full-lane gather instead of a half-lane one.
+    # Costs one extra copy of the compact table in HBM. Bit-exact.
+    "TPU_ROPE_PAIRED_ROWS": env_bool("TPU_ROPE_PAIRED_ROWS", default=True),
+    # Fetch the paired RoPE rows on SparseCore (`rope_gather.gather_paired_rows_sc`)
+    # so the gather can overlap TensorCore work that does not need it
+    # (DSpark context KV: 123.9 -> 114.6 us on one v7x chip). Bit-exact.
+    "TPU_ROPE_SC_GATHER": env_bool("TPU_ROPE_SC_GATHER", default=True),
+    # Project the DSpark draft layers' context KV in one kernel
+    # (`qa_rope.fused_kv_norm_rope_layers`) instead of one per layer: x is
+    # quantized and the RoPE coefficients built once (DSpark context KV:
+    # 103.1 -> 100.8 us on one v7x chip). Bit-exact per layer.
+    "TPU_DSPARK_FUSED_CONTEXT_KV": env_bool(
+        "TPU_DSPARK_FUSED_CONTEXT_KV", default=True
+    ),
+    # Publish all DSpark draft layers' context KV in one cache write when
+    # their SWA caches are views of one word-row owner
+    # (`cache.write_cache_layers`); otherwise one write per layer. Same rows.
+    "TPU_DSPARK_MERGED_CONTEXT_WRITES": env_bool(
+        "TPU_DSPARK_MERGED_CONTEXT_WRITES", default=True
+    ),
+    # Write both banks of a two-bank native cache in one SparseCore launch
+    # (`cache_write.write_cache_rows_banked`) instead of one launch per bank.
+    # Each launch costs ~5 us of SparseCore overlay and setup. Same rows.
+    "TPU_SC_BANKED_ROW_WRITES": env_bool("TPU_SC_BANKED_ROW_WRITES", default=True),
+    # Read the Engram slot-cache fallback once per (request, lookback slot)
+    # instead of once per (token, n-gram shift), then look rows up in that
+    # small table (Engram hash: 116.9 -> 102.9 us on one v7x chip). Same hashes.
+    "TPU_ENGRAM_REQUEST_FALLBACK": env_bool(
+        "TPU_ENGRAM_REQUEST_FALLBACK", default=True
+    ),
+    # Scatter block-table deltas into the device-resident staged table in
+    # place (the buffer is donated) instead of into a fresh clone of it: the
+    # clone copies the whole table every delta step. Same table.
+    "TPU_BLOCK_TABLE_DELTA_INPLACE": env_bool(
+        "TPU_BLOCK_TABLE_DELTA_INPLACE", default=True
+    ),
+    # DSV4.1 bf16 paged attention: pass the SWA row validity into the op, so
+    # the shared DSpark draft kernel zeroes invalid rows in its write-back
+    # instead of a separate masked_fill over the [240, 64, 512] output
+    # (~13 us per draft layer on one v7x chip). Same values.
+    "TPU_DSV41_FUSED_ATTENTION_ROW_MASK": env_bool(
+        "TPU_DSV41_FUSED_ATTENTION_ROW_MASK", default=True
+    ),
+    # DSpark Markov sampling: run each slot's projection + greedy selection
+    # with a double-slot MXU schedule, elementwise key max and leaner keys
+    # (`markov_sampling._pipelined_kernel`) instead of the single-slot kernel
+    # (M48/K256/V129280 on one v7x chip: 40.7 -> 30.8 us per slot). Same tokens.
+    "TPU_DSPARK_PIPELINED_MARKOV": env_bool(
+        "TPU_DSPARK_PIPELINED_MARKOV", default=True
+    ),
+    # Fused EP MoE combine: read the arrival row scales through an exact
+    # one-hot matmul over the f32 bits split into 16-bit halves
+    # (`fused_moe.v2.layer._lookup_row_scales`) instead of a 2-D gather, for
+    # small scale mirrors (DSpark draft layer, 720 lookups into [264, 128]:
+    # 10.0 -> 3.6 us on one v7x chip). Bit-identical, NaN payloads included.
+    "TPU_MOE_ONEHOT_SCALE_LOOKUP": env_bool(
+        "TPU_MOE_ONEHOT_SCALE_LOOKUP", default=True
+    ),
+    # DSpark draft layers under MOE_FUSED_EP_KERNEL_IMPL=push: build their
+    # fused EP op with sc_prepush=1 and two tile-height rungs instead of the
+    # process-wide MOE_FUSED_EP_PUSH_SC_PREPUSH / ..._HEIGHT_RUNGS_OVERRIDE.
+    # Target layers are untouched. EP16 draft shape on 2x v7x hosts
+    # (t_local=240, topk=3, 8 local experts): 161.8 -> 135.8 us per layer
+    # (kernel + exposed SparseCore wait), output bit-identical.
+    "TPU_DSPARK_DRAFT_MOE_TUNING": env_bool(
+        "TPU_DSPARK_DRAFT_MOE_TUNING", default=True
+    ),
     # QK pair-blocked pooled GDN conv layout: full-width states interleave
     # Q and K row-pairs per tap so a TP-rank shard's first conv token maps
     # to one whole destination pool token (2 contiguous transfer spans per

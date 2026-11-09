@@ -316,6 +316,7 @@ def test_ced_aux_hidden_states_propagation(monkeypatch: pytest.MonkeyPatch):
     )
     monkeypatch.setattr(v2_model, "post", lambda h, *a: h)
     monkeypatch.setattr(v2_model, "collapse", lambda h, pm: h.mean(dim=1))
+    monkeypatch.setattr(v2_model, "flat_collapse", lambda h, pm: h.mean(dim=1))
 
     m = SimpleNamespace(
         _ced_boundary=2,
@@ -945,6 +946,7 @@ def test_v2_model_dspark_coverage(monkeypatch: pytest.MonkeyPatch):
     )
     monkeypatch.setattr(v2_model, "post", lambda h, *a: h)
     monkeypatch.setattr(v2_model, "collapse", lambda h, pm: h.mean(dim=1))
+    monkeypatch.setattr(v2_model, "flat_collapse", lambda h, pm: h.mean(dim=1))
     monkeypatch.setattr(
         v2_model.upstream, "sp_all_gather", lambda x: torch.cat([x, x], dim=0)
     )
@@ -1186,6 +1188,7 @@ def test_v2_model_dspark_coverage(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(v2_model, "initialize_cache_ops", lambda: None)
     monkeypatch.setattr(v2_model, "initialize_delayed_mhc", lambda: None)
     monkeypatch.setattr(v2_model, "initialize_mhc_post", lambda: None)
+    monkeypatch.setattr(v2_model, "initialize_flat_collapse", lambda: None)
     monkeypatch.setattr(v2_model, "initialize_paged_attention", lambda: None)
     monkeypatch.setattr(v2_model, "initialize_indexer", lambda: None)
     monkeypatch.setattr(v2_model, "compact_rope_caches", lambda *a: None)

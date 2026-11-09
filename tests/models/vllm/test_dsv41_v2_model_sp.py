@@ -650,6 +650,7 @@ def test_forward_stage_decoder_and_encoder_paths(monkeypatch: pytest.MonkeyPatch
     )
     monkeypatch.setattr(v2_model, "post", lambda h, *a: h)
     monkeypatch.setattr(v2_model, "collapse", lambda h, pm: h)
+    monkeypatch.setattr(v2_model, "flat_collapse", lambda h, pm: h)
 
     out_dec = v2_model.DeepseekV41Model._forward_stage(
         model,
@@ -780,6 +781,7 @@ def test_forward_stage_pipeline_parallel_and_aux_hidden_states(
     monkeypatch.setattr(v2_model.upstream, "sp_padding_mask", lambda mask, h: mask)
     monkeypatch.setattr(v2_model, "post", lambda h, *a: h)
     monkeypatch.setattr(v2_model, "collapse", lambda h, pm: h)
+    monkeypatch.setattr(v2_model, "flat_collapse", lambda h, pm: h)
 
     inter_tensors = {
         "hidden_states": torch.ones((4, 16), dtype=torch.bfloat16),
@@ -919,6 +921,7 @@ def test_model_init_validation_and_ced_setup(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(v2_model, "initialize_delayed_mhc", lambda: None)
     monkeypatch.setattr(v2_model, "initialize_shifted_mhc", lambda: None)
     monkeypatch.setattr(v2_model, "initialize_mhc_post", lambda: None)
+    monkeypatch.setattr(v2_model, "initialize_flat_collapse", lambda: None)
     monkeypatch.setattr(v2_model, "initialize_paged_attention", lambda: None)
     monkeypatch.setattr(v2_model, "initialize_indexer", lambda: None)
     monkeypatch.setattr(v2_model, "compact_rope_caches", lambda *a: None)

@@ -424,8 +424,32 @@ def paged_attention_jax(
     scale: float,
     gathered: jax.Array | None = None,
     query_group_size: int = 1,
+    row_valid: jax.Array | None = None,
 ) -> jax.Array:
-    """Attend physical cache records; query_group_size is a checked sharing hint."""
+    """Attend physical cache records; query_group_size is a checked sharing hint.
+
+    ``row_valid`` (``[tokens]`` int32, optional) zeroes the output rows it marks
+    0, the caller's mask of invalid SWA rows. The shared DSpark draft path
+    applies it in the kernel's write-back instead of a separate pass over the
+    ``[240, 64, 512]`` output (~13 us per draft layer on one v7x chip).
+    """
+
+    def general(_):
+        out = _general_paged_attention_jax(
+            q,
+            swa_pool,
+            main_pool,
+            swa_records,
+            main_records,
+            sink,
+            scale,
+            gathered,
+            query_group_size,
+        )
+        if row_valid is None:
+            return out
+        return jnp.where((row_valid != 0)[:, None, None], out, jnp.zeros((), out.dtype))
+
     if (
         q.shape == (240, 64, 512)
         and q.dtype == jnp.bfloat16
@@ -437,34 +461,16 @@ def paged_attention_jax(
         shared = jnp.all(swa_records.reshape(48, 5, 192) == swa_records[::5, None, :])
         return jax.lax.cond(
             shared,
-            lambda _: _shared_draft_attention(q, swa_pool, swa_records, sink),
-            lambda _: _general_paged_attention_jax(
-                q,
-                swa_pool,
-                main_pool,
-                swa_records,
-                main_records,
-                sink,
-                scale,
-                gathered,
-                query_group_size,
+            lambda _: _shared_draft_attention(
+                q, swa_pool, swa_records, sink, row_valid
             ),
+            general,
             None,
         )
-    return _general_paged_attention_jax(
-        q,
-        swa_pool,
-        main_pool,
-        swa_records,
-        main_records,
-        sink,
-        scale,
-        gathered,
-        query_group_size,
-    )
+    return general(None)
 
 
-def _shared_draft_attention(q, pool, records, sink):
+def _shared_draft_attention(q, pool, records, sink, row_valid=None):
     from vllm_torchtpu.kernels.shared_record_attention import shared_record_attention
 
     requests = q.shape[0] // 5
@@ -475,8 +481,10 @@ def _shared_draft_attention(q, pool, records, sink):
     )
     kv = jnp.where((shared >= 0)[None, :, :, None], kv, 0)
     mask = jnp.pad((shared >= 0).astype(jnp.int32), ((0, 0), (0, 64)))[:, None, :]
+    if row_valid is not None:
+        row_valid = (row_valid != 0).astype(jnp.int32)
     return shared_record_attention(
-        mask, pieces, kv, jnp.tile(sink, 5)[:, None]
+        mask, pieces, kv, jnp.tile(sink, 5)[:, None], row_valid
     ).reshape(q.shape)
 
 
@@ -1368,7 +1376,7 @@ def initialize_paged_attention():
         paged_attention_jax,
         mesh=get_pallas_op_mesh(),
         input_partition_specs=cast(
-            tuple[tuple[str, ...], ...], cast(Any, (P(),) * 6 + (None, P(), None))
+            tuple[tuple[str, ...], ...], cast(Any, (P(),) * 6 + (None, P(), None, P()))
         ),
     )
     _attention_op.register_fake(lambda q, *args: q.new_empty(q.shape))
@@ -1385,6 +1393,7 @@ def initialize_paged_attention():
         scale: float,
         gathered: jax.Array | None = None,
         query_group_size: int = 1,
+        row_valid: jax.Array | None = None,
     ) -> jax.Array:
         return paged_attention_jax(
             q,
@@ -1396,6 +1405,7 @@ def initialize_paged_attention():
             scale,
             gathered,
             query_group_size,
+            row_valid,
         )
 
     _attention_2bank_op = pallas.jax_op(
@@ -1403,7 +1413,7 @@ def initialize_paged_attention():
         paged_attention_2bank,
         mesh=get_pallas_op_mesh(),
         input_partition_specs=cast(
-            tuple[tuple[str, ...], ...], cast(Any, (P(),) * 8 + (None, P(), None))
+            tuple[tuple[str, ...], ...], cast(Any, (P(),) * 8 + (None, P(), None, P()))
         ),
     )
     _attention_2bank_op.register_fake(lambda q, *args: q.new_empty(q.shape))
@@ -2174,8 +2184,20 @@ def sparse_fp8_attention_qo(
 
 
 def paged_attention(
-    q, swa, main, swa_records, main_records, sink, scale, query_group_size=1
+    q,
+    swa,
+    main,
+    swa_records,
+    main_records,
+    sink,
+    scale,
+    query_group_size=1,
+    row_valid=None,
 ):
+    """``row_valid`` (``[tokens]`` bool, optional): rows marked False come back
+    zeroed, so the caller needs no separate mask of the output."""
+    if row_valid is not None:
+        row_valid = row_valid.int()
     gathered = None
     cache = _active_gathered_kv
     if cache is not None and main_records.shape[1]:
@@ -2209,6 +2231,7 @@ def paged_attention(
             scale,
             gathered,
             query_group_size,
+            row_valid,
         )
     assert _attention_op is not None
     return _attention_op(
@@ -2221,6 +2244,7 @@ def paged_attention(
         scale,
         gathered,
         query_group_size,
+        row_valid,
     )
 
 

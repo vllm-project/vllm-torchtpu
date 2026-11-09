@@ -387,6 +387,7 @@ _read_index_values_2bank_op = None
 _write_op = None
 _write_tiles_op = None
 _write_values_op = None
+_write_values_2bank_op = None
 _write_values_after_op = None
 _encode_fp8_op = None
 _write_index_values_op = None
@@ -640,6 +641,18 @@ class PagedCacheRows:
                 self.raw_hi.copy_(
                     _write_values_after_op(self.raw_hi, rec_hi, values, after)
                 )
+        else:
+            self._write_word_records(rec_lo, values)
+
+    def _write_word_records(self, rec_lo, values):
+        """Write ``values`` rows at int32 ``rec_lo`` records of this owner."""
+        if self.raw_hi is not None and envs.TPU_SC_BANKED_ROW_WRITES:
+            # Both banks in one op: whole-row writes take one SparseCore
+            # launch instead of one per bank.
+            assert _write_values_2bank_op is not None
+            low, high = _write_values_2bank_op(self.raw, self.raw_hi, rec_lo, values)
+            self.raw.copy_(low)
+            self.raw_hi.copy_(high)
         else:
             assert _write_values_op is not None
             self.raw.copy_(_write_values_op(self.raw, rec_lo, values))
@@ -1209,7 +1222,7 @@ def initialize_cache_ops():
     initialize_csa2_ops()
     global _read_values_op, _read_values_2bank_op, _write_op, _write_values_op
     global _write_tiles_op
-    global _encode_fp8_op, _write_values_after_op
+    global _encode_fp8_op, _write_values_after_op, _write_values_2bank_op
     global _write_index_values_op, _write_index_values_after_op
     global _read_index_values_op, _read_index_values_2bank_op
     if _write_op is not None:
@@ -1349,6 +1362,33 @@ def initialize_cache_ops():
         lambda cache, records, values: torch.empty_like(cache)
     )
 
+    def write_values_2bank_jax(
+        cache_lo: jax.Array, cache_hi: jax.Array, records: jax.Array, values: jax.Array
+    ) -> tuple[jax.Array, jax.Array]:
+        # Records address [cache_lo; cache_hi]; whole-row writes take one
+        # SparseCore launch for both banks (TPU_SC_BANKED_ROW_WRITES).
+        return cast(
+            tuple[jax.Array, jax.Array],
+            scatter_cache_values(cast(Any, (cache_lo, cache_hi)), records, values),
+        )
+
+    _write_values_2bank_op = pallas.jax_op(
+        "pallas::dsv41v2_cache_write_values_2bank",
+        jax.shard_map(
+            write_values_2bank_jax,
+            mesh=mesh,
+            in_specs=(P(), P(), P(), P()),
+            out_specs=(P(), P()),
+            check_vma=False,
+        ),
+        donate_argnums=(0, 1),
+        mesh=get_pallas_op_mesh(),
+        input_partition_specs=cast(tuple[tuple[str, ...], ...], (P(), P(), P(), P())),
+    )
+    _write_values_2bank_op.register_fake(
+        lambda lo, hi, records, values: (torch.empty_like(lo), torch.empty_like(hi))
+    )
+
     def write_values_after(
         cache: jax.Array, records: jax.Array, values: jax.Array, after: jax.Array
     ) -> jax.Array:
@@ -1419,6 +1459,49 @@ def initialize_cache_ops():
             latent.new_empty((latent.shape[0], ROPE_WORDS), dtype=torch.int32),
         )
     )
+
+
+def _shares_word_owner(caches) -> bool:
+    """True if every cache is an int32 word-row view of one physical owner."""
+    first = caches[0]
+    if not all(isinstance(c, PagedCacheRows) for c in caches):
+        return False
+    return all(
+        not c.native_swa
+        and c.dtype != torch.uint8
+        and c.raw.device.type != "cpu"
+        and c.raw is first.raw
+        and c.raw_hi is first.raw_hi
+        and c.dtype == first.dtype
+        and c.row_bytes == first.row_bytes
+        for c in caches
+    )
+
+
+def write_cache_layers(caches, slots, values, valid):
+    """``write_cache`` for several layers; one write when they share an owner.
+
+    ``caches``, ``slots``, ``values`` and ``valid`` are per layer.
+    Views of one word-row owner differ only in their page offset, so their
+    records are disjoint and one concatenated write publishes every layer
+    (one row-write launch instead of one per layer). Anything else falls back
+    to a write per layer. Same rows either way.
+    """
+    if len(caches) < 2 or not _shares_word_owner(caches):
+        for cache, s, v, ok in zip(caches, slots, values, valid, strict=True):
+            write_cache(cache, s, v, ok)
+        return
+    records, rows = [], []
+    for cache, s, v, ok in zip(caches, slots, values, valid, strict=True):
+        count = v.shape[0]
+        layer_slots = s[:count].masked_fill(~ok[:count], -1).long()
+        records.append(
+            cache.row_indices(layer_slots.clamp(min=0)).masked_fill(layer_slots < 0, -1)
+        )
+        rows.append(
+            v.to(cache.dtype).reshape(count, cache.row_bytes // cache.dtype.itemsize)
+        )
+    caches[0]._write_word_records(torch.cat(records).int(), torch.cat(rows))
 
 
 def write_cache(cache, slots, values, valid, after=None):
@@ -1521,6 +1604,27 @@ def _sparse_core_rows() -> bool:
     )
 
 
+def _record_words(values: jax.Array) -> jax.Array:
+    """One record's INT32 words: BF16 pairs packed, FP32 bitcast, INT32 as is."""
+    import jax.numpy as jnp
+
+    if values.dtype == jnp.int32:
+        return values
+    if (
+        values.dtype == jnp.bfloat16
+        and jax.default_backend() == "tpu"
+        and values.shape[1] >= 2 * ROW_WORDS
+        and values.shape[1] % (2 * ROW_WORDS) == 0
+    ):
+        return _pack_bf16_words(values)
+    return jax.lax.bitcast_convert_type(
+        values.reshape(values.shape[0], -1, 2)
+        if values.dtype == jnp.bfloat16
+        else values,
+        jnp.int32,
+    )
+
+
 def scatter_cache_values(
     cache: jax.Array,
     records: jax.Array,
@@ -1544,6 +1648,44 @@ def scatter_cache_values(
         bank_records = cache_lo.shape[0] * ROW_WORDS // record_words
         records_lo = jnp.where(records < bank_records, records, -1)
         records_hi = jnp.where(records >= bank_records, records - bank_records, -1)
+        words = _record_words(values)
+        if (
+            envs.TPU_SC_BANKED_ROW_WRITES
+            and values.shape[0]
+            and words.shape[1] >= ROW_WORDS
+            and words.shape[1] % ROW_WORDS == 0
+            and jax.default_backend() == "tpu"
+            and _sparse_core_rows()
+        ):
+            from vllm_torchtpu.kernels.deepseek_v41.cache_write import (
+                write_cache_rows_banked,
+            )
+
+            # The same per-bank rows as the two calls below, addressed into
+            # [cache_lo; cache_hi] so one SparseCore launch writes both banks.
+            chunks = words.shape[1] // ROW_WORDS
+            column = jnp.arange(chunks, dtype=jnp.int32)
+            lo_rows, hi_rows = cache_lo.shape[0], cache_hi.shape[0]
+            in_lo = (records_lo >= 0) & (records_lo < lo_rows // chunks)
+            in_hi = (records_hi >= 0) & (records_hi < hi_rows // chunks)
+            rows = jnp.where(
+                in_lo[:, None],
+                records_lo[:, None] * chunks + column,
+                jnp.where(
+                    in_hi[:, None],
+                    lo_rows + records_hi[:, None] * chunks + column,
+                    -1,
+                ),
+            ).astype(jnp.int32)
+            return cast(
+                Any,
+                write_cache_rows_banked(
+                    cache_lo,
+                    cache_hi,
+                    rows.reshape(-1),
+                    words.reshape(-1, ROW_WORDS),
+                ),
+            )
         return cast(
             Any,
             (
@@ -1554,25 +1696,7 @@ def scatter_cache_values(
     assert cache.dtype == jnp.int32 and cache.ndim == 2 and cache.shape[1] == ROW_WORDS
     if not values.shape[0]:
         return cache
-    words = (
-        values
-        if values.dtype == jnp.int32
-        else (
-            _pack_bf16_words(values)
-            if (
-                values.dtype == jnp.bfloat16
-                and jax.default_backend() == "tpu"
-                and values.shape[1] >= 2 * ROW_WORDS
-                and values.shape[1] % (2 * ROW_WORDS) == 0
-            )
-            else jax.lax.bitcast_convert_type(
-                values.reshape(values.shape[0], -1, 2)
-                if values.dtype == jnp.bfloat16
-                else values,
-                jnp.int32,
-            )
-        )
-    )
+    words = _record_words(values)
     width = words.shape[1]
     if width < ROW_WORDS and jax.default_backend() == "tpu":
         # An elementwise (row, lane) scatter is slow on TPU. Rebuild whole word

@@ -28,6 +28,7 @@ from vllm.model_executor.models.utils import maybe_prefix
 from vllm.models.deepseek_v41.nvidia import model as upstream
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.layers.adapter.fused_moe_ep import mark_dspark_draft_moe
 from vllm_torchtpu.layers.adapter.quantization.deepseek_v41 import DeepseekV41MoE
 from vllm_torchtpu.layers.core import table_lookup
 from vllm_torchtpu.logger import init_logger
@@ -39,6 +40,7 @@ from ..common.mhc import (
     pack_mix_weights,
     post,
 )
+from . import preprocess_ops
 from .attention import (
     DeepseekV41Attention,
     _cache_slots,
@@ -47,7 +49,7 @@ from .attention import (
     stage_attention_cache_scope,
 )
 from .attention_kernels import initialize_paged_attention
-from .cache import initialize_cache_ops
+from .cache import initialize_cache_ops, write_cache_layers
 from .engram import Engram, NgramHashState
 from .indexer_bf16 import initialize_indexer
 from .model import DeepseekV41DecoderLayer
@@ -102,33 +104,98 @@ def _context_kv(
     return attn._rotate(kv, positions)
 
 
+def _fused_context_kv(
+    attns: list[DeepseekV41Attention], x: torch.Tensor, positions: torch.Tensor
+) -> tuple[torch.Tensor, ...] | None:
+    """Every draft layer's context KV from one kernel, or None if unsupported.
+
+    The layers read the same ``x`` and positions, so one call quantizes the
+    rows and builds the RoPE coefficients once; each output equals that
+    layer's ``_context_kv``.
+    """
+    if not envs.TPU_DSPARK_FUSED_CONTEXT_KV or len(attns) != 3:
+        return None
+    first = attns[0]
+    if not all(
+        getattr(a, "_fused_preprocess", False)
+        and a._tpu_rope_cache is first._tpu_rope_cache
+        and a.kv_norm.variance_epsilon == first.kv_norm.variance_epsilon
+        for a in attns
+    ):
+        return None
+    layers = [a.fused_wqa_wkv for a in attns]
+    return preprocess_ops.kv_rope_3_layers(first.kv_norm.variance_epsilon)(
+        x,
+        *(layer.weight for layer in layers),
+        *(layer.weight_scale for layer in layers),
+        *(a.kv_norm.weight for a in attns),
+        first._rope_rows(positions),
+    )
+
+
+def _context_kv_addresses(
+    attn: DeepseekV41Attention, metadata, positions: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """One draft layer's SWA cache slots and the rows its window keeps."""
+    swa_cache = attn.swa_cache_layer.kv_cache
+    if isinstance(metadata, torch.Tensor):
+        return metadata, metadata >= 0
+    swa_slots = _cache_slots(swa_cache, metadata, positions)
+    if metadata.seq_lens.numel() == 0:
+        return swa_slots, swa_slots >= 0
+    requests = _token_requests(metadata, positions).clamp(
+        max=metadata.seq_lens.shape[0] - 1
+    )
+    offsets = (
+        positions - table_lookup.take(metadata.seq_lens, requests) + attn.window_size
+    )
+    swa_valid = (swa_slots >= 0) & (offsets >= 0) & (offsets < attn.window_size)
+    return swa_slots, swa_valid
+
+
+def _address_key(attn: DeepseekV41Attention, metadata) -> tuple:
+    """Inputs the addresses depend on, compared by identity.
+
+    Draft layers of one cache group are handed the same metadata tensors and
+    have the same page geometry and window, so their addresses are equal.
+    """
+    if isinstance(metadata, torch.Tensor):
+        return ("slots", metadata)
+    return (
+        "metadata",
+        metadata.block_tables,
+        metadata.query_start_loc,
+        metadata.seq_lens,
+        attn.swa_cache_layer.kv_cache.shape[1],
+        attn.window_size,
+    )
+
+
+def _same_key(a: tuple, b: tuple) -> bool:
+    return len(a) == len(b) and all(
+        x is y if isinstance(x, torch.Tensor) else x == y
+        for x, y in zip(a, b, strict=True)
+    )
+
+
 def _insert_context_kv(
     attn: DeepseekV41Attention,
     kv: torch.Tensor,
     positions: torch.Tensor,
     metadata,
+    addresses: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> None:
-    """Write rotated context KV rows into one draft layer's SWA cache."""
+    """Write rotated context KV rows into one draft layer's SWA cache.
+
+    ``addresses`` is this layer's ``_context_kv_addresses``, when the caller
+    already derived it for another layer of the same cache group.
+    """
     swa_cache = attn.swa_cache_layer.kv_cache
     if metadata is None or not swa_cache.numel():
         return
-    if isinstance(metadata, torch.Tensor):
-        swa_slots = metadata
-        swa_valid = swa_slots >= 0
-    else:
-        swa_slots = _cache_slots(swa_cache, metadata, positions)
-        if metadata.seq_lens.numel() > 0:
-            requests = _token_requests(metadata, positions).clamp(
-                max=metadata.seq_lens.shape[0] - 1
-            )
-            offsets = (
-                positions
-                - table_lookup.take(metadata.seq_lens, requests)
-                + attn.window_size
-            )
-            swa_valid = (swa_slots >= 0) & (offsets >= 0) & (offsets < attn.window_size)
-        else:
-            swa_valid = swa_slots >= 0
+    if addresses is None:
+        addresses = _context_kv_addresses(attn, metadata, positions)
+    swa_slots, swa_valid = addresses
     _insert(swa_cache, swa_slots, kv, swa_valid)
 
 
@@ -222,6 +289,7 @@ class DSparkDeepseekV41Model(nn.Module):
                 raise ValueError("CSA2 supports DSpark blocks of at most 64 queries")
             layer.attn.non_causal_multi_token_decode = True
             layer.attn.dspark_block_size = int(dspark_block_size)
+            mark_dspark_draft_moe(layer.ffn.experts)
 
         compact_rope_caches(
             (layer.attn for layer in self.layers),
@@ -281,12 +349,35 @@ class DSparkDeepseekV41Model(nn.Module):
             main_x = self.combine_hidden_states(target_hidden_states)
         else:
             main_x = target_hidden_states
-        for i, layer in enumerate(cast(Iterable[DeepseekV41DecoderLayer], self.layers)):
+        # Layers sharing metadata and cache geometry derive their SWA slots
+        # and window mask once (bucketize, block-table gather, seq_lens
+        # lookup) instead of once per layer.
+        derived: list[tuple[tuple, tuple[torch.Tensor, torch.Tensor]]] = []
+        layers = list(cast(Iterable[DeepseekV41DecoderLayer], self.layers))
+        fused = _fused_context_kv([layer.attn for layer in layers], main_x, positions)
+        # (cache, slots, kv, valid) per layer, published together below when
+        # TPU_DSPARK_MERGED_CONTEXT_WRITES (one row write for a shared owner).
+        pending: list[tuple] = []
+        for i, layer in enumerate(layers):
             attn = layer.attn
             layer_md = None if metadata is None else metadata[i]
-            _insert_context_kv(
-                attn, _context_kv(attn, main_x, positions), positions, layer_md
-            )
+            addresses = None
+            if layer_md is not None and attn.swa_cache_layer.kv_cache.numel():
+                key = _address_key(attn, layer_md)
+                addresses = next((a for k, a in derived if _same_key(k, key)), None)
+                if addresses is None:
+                    addresses = _context_kv_addresses(attn, layer_md, positions)
+                    derived.append((key, addresses))
+            kv = fused[i] if fused is not None else _context_kv(attn, main_x, positions)
+            if envs.TPU_DSPARK_MERGED_CONTEXT_WRITES and addresses is not None:
+                pending.append(
+                    (attn.swa_cache_layer.kv_cache, *addresses[:1], kv, addresses[1])
+                )
+                continue
+            _insert_context_kv(attn, kv, positions, layer_md, addresses)
+        if pending:
+            caches, slots, kvs, valid = (list(t) for t in zip(*pending))
+            write_cache_layers(caches, slots, kvs, valid)
         return main_x
 
     def forward(

@@ -30,6 +30,7 @@ from vllm.models.deepseek_v41.nvidia import vl_model as upstream_vl
 
 from vllm_torchtpu.layers.core.sequence_layout import SequenceLayoutKind
 from vllm_torchtpu.models.vllm import register_models
+from vllm_torchtpu.models.vllm.deepseek_v41.v2 import model as v2_model_module
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.ced import DecoderReplayPlan
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram import (
     HOST_ENGRAM_KEY,
@@ -1012,6 +1013,73 @@ class TestModelForward:
             assert res.shape == (2, 64)
             assert torch.all(res == 3.0)
 
+    def _run_ced_forward(self, plan, dec_out, rows=4):
+        model = self._create_model(ced_enabled=True)
+        hidden = torch.ones((rows, 64))
+        pre_mix = torch.zeros((rows, 64))
+        model.encoder_stage = MagicMock(return_value=(hidden, pre_mix))
+        model.decoder_stage = MagicMock(return_value=dec_out)
+        meta_entry = _FakeAttnMeta(seq_lens=torch.tensor([rows // 2, rows // 2]))
+        mock_ctx = _FakeForwardCtx(attn_metadata={"layer_0": meta_entry})
+        with (
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.get_forward_context",
+                return_value=mock_ctx,
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.plan_decoder_replay",
+                return_value=plan,
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model._scatter_decoder_rows",
+                wraps=v2_model_module._scatter_decoder_rows,
+            ) as scatter,
+        ):
+            res = model.forward(None, torch.arange(rows))
+        return res, scatter, model
+
+    def test_forward_ced_identity_plan_skips_scatter(self) -> None:
+        # Steady decode: every row kept, in order, bucket equals the rows.
+        plan = DecoderReplayPlan(
+            indices=(0, 1, 2, 3),
+            padded_num_tokens=4,
+            query_start_loc=(0, 2, 4),
+            replay_starts=(0, 0),
+        )
+        dec_hidden = torch.arange(4 * 64, dtype=torch.float32).view(4, 64)
+        dec_aux = [dec_hidden + 1, dec_hidden + 2, dec_hidden + 3]
+        res, scatter, model = self._run_ced_forward(plan, (dec_hidden, dec_aux))
+        scatter.assert_not_called()
+        hidden, aux = res
+        # Same values the scatter path would produce for an identity mapping.
+        expected = v2_model_module._scatter_decoder_rows(dec_hidden, torch.arange(4), 4)
+        torch.testing.assert_close(hidden, expected, rtol=0, atol=0)
+        assert hidden is dec_hidden
+        assert len(aux) == 3 and all(a is b for a, b in zip(aux, dec_aux))
+        # The plan still drives the decoder's query bounds.
+        model.decoder_stage.assert_called_once()
+
+    @pytest.mark.parametrize(
+        "indices,padded",
+        [
+            ((0, 1, 2, 3), 8),  # DP raised the bucket: padding rows to drop
+            ((1, 2, 3), 4),  # a skipped prompt row
+        ],
+    )
+    def test_forward_ced_non_identity_plan_keeps_scatter(self, indices, padded) -> None:
+        plan = DecoderReplayPlan(
+            indices=indices,
+            padded_num_tokens=padded,
+            query_start_loc=(0, len(indices)),
+            replay_starts=(0, 0),
+        )
+        dec_out = torch.arange(padded * 64, dtype=torch.float32).view(padded, 64)
+        res, scatter, _ = self._run_ced_forward(plan, dec_out)
+        scatter.assert_called_once()
+        assert res.shape == (4, 64)
+        for out_row, src_row in enumerate(indices):
+            torch.testing.assert_close(res[src_row], dec_out[out_row])
+
     def test_forward_ced_with_active_replay_plan_and_scatter(self) -> None:
         model = self._create_model(ced_enabled=True, sp_enabled=True)
         hidden = torch.ones((4, 64))
@@ -1194,6 +1262,10 @@ class TestModelForwardStage:
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.collapse",
                 side_effect=lambda h, pm: h,
             ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.flat_collapse",
+                side_effect=lambda h, pm: h,
+            ),
         ):
             mock_pp.return_value = SimpleNamespace(
                 is_first_rank=True, is_last_rank=True
@@ -1221,6 +1293,10 @@ class TestModelForwardStage:
             ),
             patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.collapse",
+                side_effect=lambda h, pm: h,
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.flat_collapse",
                 side_effect=lambda h, pm: h,
             ),
         ):
@@ -1268,6 +1344,10 @@ class TestModelForwardStage:
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.collapse",
                 side_effect=lambda h, pm: h,
             ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.flat_collapse",
+                side_effect=lambda h, pm: h,
+            ),
         ):
             mock_pp.return_value = SimpleNamespace(
                 is_first_rank=False, is_last_rank=False
@@ -1299,6 +1379,10 @@ class TestModelForwardStage:
             ),
             patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.collapse",
+                side_effect=lambda h, pm: h,
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.flat_collapse",
                 side_effect=lambda h, pm: h,
             ),
         ):
@@ -1355,6 +1439,10 @@ class TestModelForwardStage:
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.collapse",
                 side_effect=lambda h, pm: h,
             ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.flat_collapse",
+                side_effect=lambda h, pm: h,
+            ),
         ):
             model._forward_stage(inp, pos, None, stage="full")
             mock_pad_mask.assert_called_once()
@@ -1398,6 +1486,10 @@ class TestModelForwardStage:
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.collapse",
                 side_effect=lambda h, pm: h,
             ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.flat_collapse",
+                side_effect=lambda h, pm: h,
+            ),
         ):
             res = model._forward_stage(inp, pos, None, stage="full")
             # When layer is None after the loop, post(...) should NOT be called
@@ -1439,6 +1531,10 @@ class TestModelForwardStage:
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.collapse",
                 side_effect=lambda h, pm: h,
             ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.flat_collapse",
+                side_effect=lambda h, pm: h,
+            ),
         ):
             mock_pp.return_value = SimpleNamespace(
                 is_first_rank=True, is_last_rank=True
@@ -1473,6 +1569,10 @@ class TestModelForwardStage:
             ),
             patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.collapse",
+                side_effect=lambda h, pm: h,
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.flat_collapse",
                 side_effect=lambda h, pm: h,
             ),
         ):
@@ -1568,6 +1668,9 @@ class TestModelInitAndWeights:
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_mhc_post"
             ),
             patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_flat_collapse"
+            ),
+            patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_paged_attention"
             ),
             patch("vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_indexer"),
@@ -1605,6 +1708,9 @@ class TestModelInitAndWeights:
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_mhc_post"
             ),
             patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_flat_collapse"
+            ),
+            patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_paged_attention"
             ),
             patch("vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_indexer"),
@@ -1637,6 +1743,9 @@ class TestModelInitAndWeights:
             ),
             patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_mhc_post"
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_flat_collapse"
             ),
             patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_paged_attention"
@@ -1683,6 +1792,9 @@ class TestModelInitAndWeights:
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_mhc_post"
             ),
             patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_flat_collapse"
+            ),
+            patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_paged_attention"
             ),
             patch("vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_indexer"),
@@ -1722,6 +1834,9 @@ class TestModelInitAndWeights:
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_mhc_post"
             ),
             patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_flat_collapse"
+            ),
+            patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_paged_attention"
             ),
             patch("vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_indexer"),
@@ -1753,6 +1868,9 @@ class TestModelInitAndWeights:
             ),
             patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_mhc_post"
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_flat_collapse"
             ),
             patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_paged_attention"
@@ -1794,6 +1912,9 @@ class TestModelInitAndWeights:
             ),
             patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_mhc_post"
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_flat_collapse"
             ),
             patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_paged_attention"

@@ -21,6 +21,7 @@ from vllm.models.deepseek_v41 import attention as upstream
 from vllm.models.deepseek_v41 import compressor as compressor_upstream
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
@@ -832,7 +833,14 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         cached = stage_cache.get(key) if stage_cache is not None else None
         if cached is not None and cached[0] is positions and cached[1] is table:
             return cached[2]
-        rows = preprocess_ops.rope_rows()(table, positions)
+        # Set at load (runner.utils.relayout_rope_tables) for 64-wide tables.
+        pairs = getattr(self, "_tpu_rope_pairs", None)
+        if pairs is not None and envs.TPU_ROPE_SC_GATHER:
+            rows = preprocess_ops.rope_paired_rows_sc()(pairs, positions)
+        elif pairs is not None:
+            rows = preprocess_ops.rope_paired_rows()(pairs, positions)
+        else:
+            rows = preprocess_ops.rope_rows()(table, positions)
         if stage_cache is not None:
             stage_cache[key] = (positions, table, rows)
         return rows
@@ -1866,6 +1874,23 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     tp_rank=self._tp_rank_1d,
                 )
             else:
+                if envs.TPU_DSV41_FUSED_ATTENTION_ROW_MASK:
+                    # The op zeroes the invalid rows itself (in the shared
+                    # DSpark draft kernel's write-back).
+                    output.copy_(
+                        paged_attention(
+                            q,
+                            swa_cache,
+                            main_cache,
+                            records,
+                            main_records,
+                            self.attn_sink,
+                            self.scale,
+                            self._swa_query_group_size,
+                            row_valid=swa_valid,
+                        )
+                    )
+                    return None
                 result = paged_attention(
                     q,
                     swa_cache,
@@ -2212,8 +2237,13 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             # Register before TorchDynamo captures the first model forward.
             eps = self.kv_norm.variance_epsilon
             preprocess_ops.rope_rows()
+            preprocess_ops.rope_paired_rows()
+            if envs.TPU_ROPE_SC_GATHER:
+                preprocess_ops.rope_paired_rows_sc()
             preprocess_ops.qa_rope(True, eps)
             preprocess_ops.qa_rope(False, eps)  # DSpark context KV
+            if envs.TPU_DSPARK_FUSED_CONTEXT_KV:
+                preprocess_ops.kv_rope_3_layers(eps)
             preprocess_ops.qb_rope()
             if self.compressor is not None:
                 ratio = self.compress_ratio
