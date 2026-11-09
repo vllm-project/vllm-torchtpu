@@ -3,6 +3,8 @@
 from dataclasses import dataclass
 from typing import Any
 
+from vllm_torchtpu import envs
+
 
 @dataclass(frozen=True)
 class PcpStaticConfig:
@@ -79,6 +81,11 @@ class PcpStaticSupportValidator:
                 "cp_kv_cache_interleave_size to be a multiple of 128, "
                 f"got {config.interleave_size}."
             )
+        if envs.USE_TPU_PCP_MANAGER:
+            # TODO(weiyulin): Once we merge two PCP paths, we will validate
+            # in one place. For now, PcpManager.from_vllm_config validates the
+            # config in the workers.
+            return config
         if not config.enabled:
             return config
 

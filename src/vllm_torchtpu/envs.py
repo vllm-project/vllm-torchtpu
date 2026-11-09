@@ -65,6 +65,9 @@ if TYPE_CHECKING:
     TPU_DCP_MERGE_WEIGHTED_HM_MIN_TOKENS: int = 2048
     TPU_MLA_DECODE_BODY_LEVERS: str = "1"
     TPU_DCP_MLA_MIXED_KERNEL_V2: bool = True
+    USE_TPU_PCP_MANAGER: bool = False
+    TPU_PCP_KV_WORKSPACE_TOKENS: int = 1048576
+    TPU_PCP_KV_CHUNK_TOKENS: int = 65536
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
     TPU_NAME: str | None = None
@@ -828,6 +831,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # copies through the LSE merge. Bit-identical outputs. On by default on
     # glm-agentx (it replaces the branch's TPU_DCP_MLA_SPLIT_Q_LSE).
     "TPU_MLA_SPARSE_SPLIT_Q": env_bool("TPU_MLA_SPARSE_SPLIT_Q", default=True),
+    # Run PCP through `runner/pcp/manager.py` (PCP x DCP KV gather).
+    "USE_TPU_PCP_MANAGER": env_bool("USE_TPU_PCP_MANAGER", default=False),
+    # PCP manager: max context tokens one forward's prefills may gather.
+    "TPU_PCP_KV_WORKSPACE_TOKENS": env_int("TPU_PCP_KV_WORKSPACE_TOKENS", 1048576),
+    # PCP manager: context tokens gathered per all-gather chunk.
+    "TPU_PCP_KV_CHUNK_TOKENS": env_int("TPU_PCP_KV_CHUNK_TOKENS", 65536),
     # DCP sparse MLA: chunks of at most this many query tokens take the
     # decode-sized (small-chunk) path -- TPU_DCP_MLA_SMALL_CHUNK_BATCH tokens
     # per grid step and the one-atom live-bounded SparseCore gather

@@ -319,6 +319,7 @@ def _packed_by_the_indexer_op(hidden, q_fp8, k, weights):
         k_cache=SimpleNamespace(prefix="idx", kv_cache=torch.zeros(1)),
         topk_op_dcp=None,
         topk_op=capture,
+        pcp_kv_gather=False,
     )
     md = AttentionMetadata(
         input_positions=torch.zeros(1),
@@ -900,6 +901,7 @@ def test_write_op_hands_the_writer_what_the_attention_impl_does():
     op, calls = _write_op(quantized=True)
     impl = PallasMLAttentionBackendImpl.__new__(PallasMLAttentionBackendImpl)
     impl.dcp_size = 1
+    impl.pcp_kv_gather = False
     captured = []
 
     def sparse_op(kv_cache, ql, qpe, kv_c, k_pe, topk, seq_lens, bt, qsl, rd):
