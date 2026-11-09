@@ -121,6 +121,8 @@ PATCHES = (
         _ACTIVE,
     ),
     Patch("vllm_torchtpu.model_loader_patches:patch_moe_expert_write_staging", _ACTIVE),
+    # After the host expert-map and loader patches: wraps their versions.
+    Patch("vllm_torchtpu.expert_placement:install_model_patches", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_vocab_parallel_embedding", _ACTIVE),
     Patch(
         "vllm_torchtpu:_patch_vllm_merge_multimodal_embeddings",

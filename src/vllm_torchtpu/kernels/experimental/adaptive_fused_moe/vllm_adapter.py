@@ -45,6 +45,12 @@ from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.host import (
     PACK4,
     U32_SUBLANE_TILE,
 )
+from vllm_torchtpu.kernels.moe_lowtok.expert_parallel import (
+    moe_lowtok_ep,
+    moe_lowtok_ep_serves,
+    moe_lowtok_scores_ep,
+)
+from vllm_torchtpu.kernels.moe_lowtok.kernel import LANES
 from vllm_torchtpu.layers.adapter import moe_routing
 from vllm_torchtpu.logger import init_logger
 
@@ -86,6 +92,8 @@ def prebuild_adaptive_fused_moe(
     *,
     weights: PreparedWeights | None = None,
     rhs_qb: int | None = None,
+    lowtok_scores: bool = False,
+    lowtok_scores_copies: bool = False,
 ) -> torch.library.CustomOpDef:
     """Build the selected experimental path, raising on every refusal.
 
@@ -176,6 +184,10 @@ def prebuild_adaptive_fused_moe(
         weight_format,
         rhs_qb,
         token_replica_groups=groups,
+        lowtok_max_tokens=envs.TPU_MOE_LOWTOK_MAX_TOKENS,
+        lowtok_scores=lowtok_scores,
+        lowtok_scores_copies=lowtok_scores_copies,
+        small_reduce_scatter_max_rows=envs.TPU_SMALL_ALL_REDUCE_MAX_ROWS,
     )
     logger.info_once(
         "Experimental adaptive fused MoE armed | format=%s W1=%d W2=%d "
@@ -420,8 +432,23 @@ def _build_op(
     rhs_qb: int | None = None,
     *,
     token_replica_groups: tuple[tuple[int, ...], ...] | None = None,
+    lowtok_max_tokens: int = 0,
+    lowtok_scores: bool = False,
+    lowtok_scores_copies: bool = False,
+    small_reduce_scatter_max_rows: int = 0,
 ) -> torch.library.CustomOpDef:
-    """The op for this closure, built once per distinct closure and reused."""
+    """The op for this closure, built once per distinct closure and reused.
+
+    With ``lowtok_max_tokens`` set, a step of at most that many rows across
+    the EP group runs the few-token kernel between an all-gather and a
+    reduce-scatter instead (kernels/moe_lowtok/expert_parallel.py). The
+    choice is made from the static row count inside the op, so the op's
+    operands, and the model graph around it, are the same for every bucket.
+    With ``lowtok_scores`` the op takes nine more operands
+    (layers/adapter/moe_lowtok_scores.py) and that step runs the kernel's
+    scores entry, which routes and, with ``lowtok_scores_copies``, picks one
+    holder per hit copied expert.
+    """
     key = (
         mesh,
         topk,
@@ -431,6 +458,10 @@ def _build_op(
         weight_format,
         rhs_qb,
         token_replica_groups,
+        lowtok_max_tokens,
+        lowtok_scores,
+        lowtok_scores_copies,
+        small_reduce_scatter_max_rows,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -452,6 +483,36 @@ def _build_op(
         gating: jax.Array,
         rank: jax.Array,
     ) -> jax.Array:
+        if weight_format == "fp8" and moe_lowtok_ep_serves(
+            x,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            ep=mesh.shape[EP_AXIS_NAME],
+            max_tokens=lowtok_max_tokens,
+            activation=activation,
+            token_replica_groups=token_replica_groups,
+        ):
+            logger.info_once(
+                "Adaptive fused MoE: small steps run moe_lowtok "
+                "(small_reduce_scatter_max_rows=%d)",
+                small_reduce_scatter_max_rows,
+            )
+            return moe_lowtok_ep(
+                x,
+                gating,
+                rank,
+                w1,
+                w2,
+                w1_scale,
+                w2_scale,
+                mesh=mesh,
+                topk=topk,
+                renormalize=renormalize,
+                mesh_ep_ranks=mesh_expert_order,
+                small_reduce_scatter_max_rows=small_reduce_scatter_max_rows,
+            )
         # The router's top-k selector writes into an f32 accumulator ref, so a
         # bf16 gate output -- which is what the model's gate matmul produces --
         # fails inside the kernel on a dtype mismatch. Widen at the boundary;
@@ -481,6 +542,62 @@ def _build_op(
             token_replica_groups=token_replica_groups,
         )
 
+    def moe_from_scores(
+        x: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array,
+        w2_scale: jax.Array,
+        gating: jax.Array,
+        rank: jax.Array,
+        padding: jax.Array,
+        tables: jax.Array,
+        primary: jax.Array,
+        copy: jax.Array,
+        hot_onehot: jax.Array,
+        copy_w1: jax.Array,
+        copy_w2: jax.Array,
+        copy_w1_scale: jax.Array,
+        copy_w2_scale: jax.Array,
+    ) -> jax.Array:
+        if gating.shape[1] == LANES and moe_lowtok_ep_serves(
+            x,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            ep=mesh.shape[EP_AXIS_NAME],
+            max_tokens=lowtok_max_tokens,
+            activation=activation,
+            token_replica_groups=token_replica_groups,
+        ):
+            logger.info_once(
+                "Adaptive fused MoE: small steps run the scores entry "
+                "(small_reduce_scatter_max_rows=%d)",
+                small_reduce_scatter_max_rows,
+            )
+            return moe_lowtok_scores_ep(
+                x,
+                gating,
+                padding,
+                tables,
+                primary,
+                copy,
+                hot_onehot,
+                w1,
+                w2,
+                w1_scale,
+                w2_scale,
+                (copy_w1, copy_w2, copy_w1_scale, copy_w2_scale)
+                if lowtok_scores_copies
+                else None,
+                rank=rank,
+                mesh=mesh,
+                topk=topk,
+                small_reduce_scatter_max_rows=small_reduce_scatter_max_rows,
+            )
+        return moe(x, w1, w2, w1_scale, w2_scale, gating, rank)
+
     spec = PartitionSpec(EP_AXIS_NAME)
     # Stock jax_op. It used to size its outputs from the export's avals, where
     # a shard_map result is recorded as replicated, so this rank's 2048 rows
@@ -491,11 +608,12 @@ def _build_op(
     # come loose the way a text match on someone else's source can.
     op = jax_op(
         name,
-        moe,
+        moe_from_scores if lowtok_scores else moe,
         mesh=mesh,
-        # x, w1, w2, w1_scale, w2_scale, gating, rank -- every operand is
-        # sharded on axis 0 over the EP axis, and so is the single output.
-        input_partition_specs=(spec,) * 7,
+        # x, w1, w2, w1_scale, w2_scale, gating, rank (and the scores-entry
+        # operands) -- every operand is sharded on axis 0 over the EP axis,
+        # and so is the single output.
+        input_partition_specs=(spec,) * (16 if lowtok_scores else 7),
         output_partition_specs=spec,
     )
 
@@ -518,8 +636,13 @@ def run_adaptive_fused_moe(
     w1_scale: torch.Tensor,
     w2_scale: torch.Tensor,
     router_logits: torch.Tensor,
+    scores_operands: tuple[torch.Tensor, ...] = (),
 ) -> torch.Tensor:
-    """Execute a successfully prebuilt experimental op, or raise."""
+    """Execute a successfully prebuilt experimental op, or raise.
+
+    scores_operands: what an op built with ``lowtok_scores`` takes after its
+    own operands (``moe_lowtok_scores.operands``).
+    """
     op = getattr(owner, FUSED_MOE_EP_OP_ATTR, None)
     if op is None:
         raise RuntimeError("adaptive fused MoE was not prebuilt for this layer")
@@ -550,4 +673,5 @@ def run_adaptive_fused_moe(
         _squeeze_channel_scale_checked(w2_scale),
         router_logits,
         _RANK_BUFFER,
+        *scores_operands,
     )

@@ -61,7 +61,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import torch
 
-from vllm_torchtpu import envs
+from vllm_torchtpu import envs, expert_placement
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -85,6 +85,11 @@ def _should_skip(name: str, local_expert_ids: set[int]) -> bool:
         return False
     if not name.endswith(_EXPERT_WEIGHT_SUFFIXES):
         return False
+    # A per-layer placement (TPU_EXPERT_PLACEMENT): this rank fetches the
+    # experts the placement gives it for that layer.
+    placed = expert_placement.skip_expert_weight(name, expert_id)
+    if placed is not None:
+        return placed
     return expert_id not in local_expert_ids
 
 

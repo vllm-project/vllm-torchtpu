@@ -375,6 +375,7 @@ def register_experts_start_buffer(layer, *, device: torch.device) -> None:
     in the compiled graph"); same fix shape -- rank-derived values must reach
     the compiled graph as runtime data, not compile-time constants.
     """
+    _check_copy_slots_split(layer)
     experts_start = get_experts_start(layer)
     buffer = (
         torch.tensor(experts_start, dtype=torch.int32, device=device)
@@ -382,6 +383,24 @@ def register_experts_start_buffer(layer, *, device: torch.device) -> None:
         else None
     )
     layer.register_buffer("_experts_start", buffer, persistent=False)
+
+
+def _check_copy_slots_split(layer) -> None:
+    """Under an expert placement with copy slots, refuse a layer whose weights
+    still hold them: every routed path reads a rank's primaries as one
+    contiguous block, and only the FP8 MoE method stores the copies apart."""
+    from vllm_torchtpu import expert_placement
+
+    weight = getattr(layer, "w13_weight", None)
+    if not expert_placement.has_copies() or weight is None:
+        return
+    primaries = layer.global_num_experts // layer.moe_config.ep_size
+    if weight.shape[0] > primaries:
+        raise NotImplementedError(
+            "expert placement copy slots are supported by the FP8 MoE method "
+            f"only; this layer holds {weight.shape[0]} slots for {primaries} "
+            "primaries"
+        )
 
 
 def validate_linear_ep_placement(layer) -> None:

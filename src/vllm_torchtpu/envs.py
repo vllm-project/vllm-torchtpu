@@ -75,10 +75,16 @@ if TYPE_CHECKING:
     TPU_MOE_SEQUENCE_PARALLEL: bool = False
     TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
+    TPU_EXPERT_PLACEMENT: str = ""
+    TPU_SMALL_ALL_REDUCE_MAX_ROWS: int = 0
+    TPU_SMALL_ALL_REDUCE_FORM: str | None = None
     FUSED_MOE_DECODE_KERNEL: bool = False
     FUSED_MOE_DECODE_KERNEL_MAX_TOKENS: int = 256
     TPU_MOE_SINGLE_SORT: bool = True
     TPU_MOE_COUNTING_SORT: bool = True
+    TPU_MOE_LOWTOK_MAX_TOKENS: int = 0
+    TPU_MOE_LOWTOK_FROM_SCORES: bool = False
+    TPU_MOE_LOWTOK_SCORES_STRICT: bool = False
     USE_MOE_TP_DECODE_KERNEL: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
@@ -106,6 +112,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_KERNEL_IMPL: str | None = None
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
+    TPU_MOE_FUSED_EP_STEP_MIN_TOKENS: int = 0
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
     MOE_FUSED_EP_SORTED_GATHER: bool = False
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
@@ -724,6 +731,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_DENSE_EXPERT_THRESHOLD": env_nonnegative_int(
         "TPU_MOE_DENSE_EXPERT_THRESHOLD", 0
     ),
+    # Path to a static per-layer expert placement JSON for expert parallelism
+    # (expert_placement.py): which experts each EP rank holds, applied by
+    # permuting the checkpoint at load. Empty keeps the contiguous placement.
+    "TPU_EXPERT_PLACEMENT": lambda: os.getenv("TPU_EXPERT_PLACEMENT", ""),
+    # Maximum rows per rank for which an all-reduce or MoE combine
+    # reduce-scatter over the expert-parallel mesh runs as a Pallas kernel
+    # (layers/adapter/small_all_reduce_op.py) instead of XLA's collective.
+    # Applies to the TP all-reduces under TP+EP and to the MoE combine under
+    # DP+EP with TP=1 (not to a fused EP MoE kernel, which combines inside).
+    # 0 disables it.
+    "TPU_SMALL_ALL_REDUCE_MAX_ROWS": env_nonnegative_int(
+        "TPU_SMALL_ALL_REDUCE_MAX_ROWS", 0
+    ),
+    # Force the small all-reduce's exchange: "oneshot" (every core sends its
+    # whole block to every other core) or "twoshot" (reduce-scatter by column,
+    # then all-gather). Unset picks one-shot up to 32 KiB per core.
+    "TPU_SMALL_ALL_REDUCE_FORM": env_with_choices(
+        "TPU_SMALL_ALL_REDUCE_FORM", None, ["oneshot", "twoshot"], case_sensitive=False
+    ),
     # Serve eligible MoE layers (TP experts, or EP with TP attention) with the
     # fused MoE decode kernel: routed experts, shared expert and all-reduce in
     # one Pallas call (layers/adapter/fused_moe_decode.py). Armed once after
@@ -748,6 +774,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # counting sort either way. A stand-down knob in case a libtpu release
     # miscompiles the rank contraction again.
     "TPU_MOE_COUNTING_SORT": env_bool("TPU_MOE_COUNTING_SORT", True),
+    # Maximum hidden-state row count (after any EP all-gather) for the
+    # few-token expert-parallel MoE kernel (kernels/moe_lowtok). It walks
+    # only the hit local experts and masks each row by its routing weight,
+    # with no sort or permute. Serves the routed GMM path (ahead of the
+    # dense-expert path) and, for small steps, the adaptive fused EP kernel.
+    # 0 disables it; larger shapes and unsupported layouts are unchanged.
+    "TPU_MOE_LOWTOK_MAX_TOKENS": env_nonnegative_int("TPU_MOE_LOWTOK_MAX_TOKENS", 0),
+    # Run the few-token kernel's scores entry inside the adaptive fused EP op
+    # (MOE_FUSED_EP_KERNEL_IMPL=adaptive) for steps of at most
+    # TPU_MOE_LOWTOK_MAX_TOKENS rows: the router's top-k and, under an
+    # expert placement with copy slots (TPU_EXPERT_PLACEMENT), the choice of
+    # one holder per hit copied expert run inside the kernel.
+    "TPU_MOE_LOWTOK_FROM_SCORES": env_bool("TPU_MOE_LOWTOK_FROM_SCORES"),
+    # Refuse to start when TPU_MOE_LOWTOK_FROM_SCORES is set and a MoE layer
+    # cannot be served by the scores entry (otherwise the refusal is logged).
+    "TPU_MOE_LOWTOK_SCORES_STRICT": env_bool("TPU_MOE_LOWTOK_SCORES_STRICT"),
     # Serve eligible tensor-parallel MoE layers (sigmoid + correction-bias
     # top-k with renormalization, one shared expert, FP8 per-channel weights)
     # with one op that also covers the shared expert and the TP all-reduce:
@@ -846,8 +888,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Explicit implementation selection also enables fused EP. When unset,
     # preserve the legacy enable flag and v2 behavior. Adaptive owns its
     # admission, automatically supports FP4 and never falls back to GMM.
+    # v3 is the sorted-rows kernel (kernels/fused_moe/v3) for FP8 layers with
+    # softmax top-k routing; TPU_MOE_FUSED_EP_STEP_MIN_TOKENS can keep small
+    # compiled token shapes on the grouped-matmul path.
     "MOE_FUSED_EP_KERNEL_IMPL": env_with_choices(
-        "MOE_FUSED_EP_KERNEL_IMPL", None, ["v2", "adaptive"]
+        "MOE_FUSED_EP_KERNEL_IMPL", None, ["v2", "adaptive", "v3"]
     ),
     # Opt in to NVFP4 W4A8 in fused EP MoE v2. Requires the fused EP switch
     # above; defaults off so enabling fused EP alone preserves NVFP4 W4A16.
@@ -859,6 +904,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # arming everything. Below the threshold the grouped-matmul path serves.
     "MOE_FUSED_EP_KERNEL_MIN_TOKENS": lambda: int(
         os.getenv("MOE_FUSED_EP_KERNEL_MIN_TOKENS", "1024")
+    ),
+    # With MOE_FUSED_EP_KERNEL_IMPL=v3 only: compiled token shapes of at least
+    # this many rows per rank run the fused kernel, and smaller shapes take
+    # the grouped-matmul path with the layer's own all-gather and
+    # reduce-scatter. The choice is made per compiled shape, so every token
+    # bucket is traced for its side of the threshold. 0 (default) sends every
+    # shape to the fused kernel.
+    "TPU_MOE_FUSED_EP_STEP_MIN_TOKENS": env_nonnegative_int(
+        "TPU_MOE_FUSED_EP_STEP_MIN_TOKENS", 0
     ),
     # Build each rank's two consumed routing-plan slices instead of
     # replicating the full T * topk * experts plan arithmetic on every rank.

@@ -79,7 +79,7 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import (
     vllm_adapter as adaptive_moe,
 )
-from vllm_torchtpu.layers.adapter import moe_routing, token_padding
+from vllm_torchtpu.layers.adapter import moe_lowtok_scores, moe_routing, token_padding
 from vllm_torchtpu.layers.adapter.fused_moe import (
     TpuMoEActivationMixin,
     fused_moe_gmm,
@@ -617,6 +617,43 @@ def _process_fp8_moe_weights(
     return w13, w13_scale, w2, w2_scale, desired_quant_dtype, requant_block_size
 
 
+_COPY_SLOT_PARAMS = (
+    "w13_weight",
+    "w2_weight",
+    "w13_weight_scale_inv",
+    "w2_weight_scale_inv",
+)
+
+
+def _split_copy_slots(layer: torch.nn.Module) -> list[torch.Tensor]:
+    """Store an expert placement's copy slots apart from the primaries.
+
+    Under TPU_EXPERT_PLACEMENT with copies, a rank's expert tensors hold its
+    primaries, then its copy slots. Every routed path reads the primaries as
+    one contiguous block, so they stay under the usual names and the copy
+    slots move to ``w13_copy_weight`` and friends, which only the few-token
+    kernel's scores entry reads. Returns the copy tensors (none without copy
+    slots).
+    """
+    if not layer.moe_config.moe_parallel_config.use_ep:
+        return []
+    primaries = layer.global_num_experts // layer.moe_config.ep_size
+    if layer.w13_weight.shape[0] <= primaries:
+        return []
+    copies = []
+    for name in _COPY_SLOT_PARAMS:
+        weight = getattr(layer, name)
+        copy = torch.nn.Parameter(weight[primaries:].clone(), requires_grad=False)
+        setattr(
+            layer,
+            name,
+            torch.nn.Parameter(weight[:primaries].clone(), requires_grad=False),
+        )
+        setattr(layer, name.replace("_weight", "_copy_weight", 1), copy)
+        copies.append(copy)
+    return copies
+
+
 def _quantize_bf16_moe_weights(
     layer: TpuRoutedExperts,
     *,
@@ -1042,6 +1079,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         layer.w2_weight = torch.nn.Parameter(w2, requires_grad=False)
         layer.w13_weight_scale_inv = torch.nn.Parameter(w13_scale, requires_grad=False)
         layer.w2_weight_scale_inv = torch.nn.Parameter(w2_scale, requires_grad=False)
+        copy_slots = _split_copy_slots(layer)
 
         # Eagerly materialize weights to avoid OOM during vLLM memory probing.
         # Without this, lazy tensors accumulate and the profiling run OOMs.
@@ -1052,6 +1090,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                     layer.w2_weight,
                     layer.w13_weight_scale_inv,
                     layer.w2_weight_scale_inv,
+                    *copy_slots,
                 ]
             )
 
@@ -1069,12 +1108,27 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         if layer.moe_config.moe_parallel_config.use_ep:
             moe_routing.validate_linear_ep_placement(layer)
         moe_routing.register_experts_start_buffer(layer, device=layer.w13_weight.device)
+        if envs.TPU_SMALL_ALL_REDUCE_MAX_ROWS:
+            # Outside the trace: resolving the EP mesh gathers over the group.
+            from vllm_torchtpu.layers.adapter import small_all_reduce_op
+
+            small_all_reduce_op.prebuild(layer.w13_weight.device)
+        use_v3_fused = bool(
+            envs.USE_MOE_FUSED_EP_KERNEL and envs.MOE_FUSED_EP_KERNEL_IMPL == "v3"
+        )
+        scores_tables = moe_lowtok_scores.arm(
+            layer,
+            activation_str,
+            adaptive=self._use_adaptive_fused_moe or use_v3_fused,
+        )
         if self._use_adaptive_fused_moe:
             self._adaptive_fused_moe_op = adaptive_moe.prebuild_adaptive_fused_moe(
                 layer,
                 topk=layer.moe_config.experts_per_token,
                 renormalize=layer.renormalize,
                 activation=activation_str,
+                lowtok_scores=scores_tables is not None,
+                lowtok_scores_copies=bool(scores_tables and scores_tables.has_copies),
             )
             return
         prebuild_fused_moe_kernel(
@@ -1098,6 +1152,8 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             topk=layer.moe_config.experts_per_token,
             renormalize=layer.renormalize,
             activation=activation_str,
+            lowtok_scores=scores_tables is not None,
+            lowtok_scores_copies=bool(scores_tables and scores_tables.has_copies),
         )
         setattr(self, FUSED_MOE_EP_OP_ATTR, _ep_op)
         if _ep_op is not None:
@@ -1139,6 +1195,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 layer.w13_weight_scale_inv,
                 layer.w2_weight_scale_inv,
                 router_logits,
+                scores_operands=moe_lowtok_scores.operands(layer, x),
             )
 
         # `score_bias_operand` is not optional, and omitting it is silent on
@@ -1152,14 +1209,29 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         # survived here for as long as this path served only such models; a
         # `noaux_tc` router carries the bias and does not. The nvfp4 and mxfp4
         # methods already pass it.
+        from vllm_torchtpu.layers.adapter import fused_moe_ep as fused_moe_ep_bridge
         from vllm_torchtpu.layers.adapter.fused_moe_ep import (
             fused_moe_ep,
             fused_moe_ep_supported,
             score_bias_operand,
         )
+        from vllm_torchtpu.layers.adapter.fused_moe_ep_v3 import (
+            fused_kernel_takes,
+            retain_fork_graph_inputs,
+        )
 
-        if fused_moe_ep_supported(self):
-            return fused_moe_ep(
+        # An armed layer owns its dispatch and combine on every step. Under
+        # MOE_FUSED_EP_KERNEL_IMPL=v3 with TPU_MOE_FUSED_EP_STEP_MIN_TOKENS,
+        # steps below the threshold take the grouped-matmul path below and
+        # issue the all-gather and reduce-scatter themselves.
+        fused_ep_armed = fused_moe_ep_supported(self)
+        if fused_ep_armed and fused_kernel_takes(x.shape[0]):
+            scores_ops = (
+                moe_lowtok_scores.operands(layer, x)
+                if envs.MOE_FUSED_EP_KERNEL_IMPL == "v3"
+                else ()
+            )
+            out = fused_moe_ep(
                 self,
                 x,
                 layer.w13_weight,
@@ -1168,7 +1240,9 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 layer.w2_weight_scale_inv,
                 router_logits,
                 score_bias_operand(layer),
+                scores_operands=scores_ops,
             )
+            return retain_fork_graph_inputs(out, layer._experts_start)
         from vllm_torchtpu.layers.adapter.moe_tp_decode import (
             moe_tp_decode_forward,
             moe_tp_decode_supported,
@@ -1184,11 +1258,14 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         # methods so the routing-simulation hook lives in exactly one place.
         topk_weights, topk_ids = moe_routing.route(layer, x, router_logits)
 
-        # Either reason to take the collectives from vLLM leaves the routing
-        # tensors local here, still holding this rank's own tokens. (The third
-        # reason, the fused EP kernel, returned above.)
+        # Any reason to take the collectives from vLLM leaves the routing
+        # tensors local here, still holding this rank's own tokens. (An armed
+        # fused EP layer returned above unless its step is below the v3
+        # threshold.)
         owns_collectives = (
-            enable_pipelined_collective_and_compute() or envs.TPU_MOE_FP8_ALL_GATHER
+            enable_pipelined_collective_and_compute()
+            or envs.TPU_MOE_FP8_ALL_GATHER
+            or fused_ep_armed
         )
 
         if envs.TPU_MOE_SKIP_PADDED_TOKENS:
@@ -1215,7 +1292,10 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             "activation": activation_str,
         }
         if owns_collectives:
-            return pipelined_fused_moe_gmm(**kwargs)
+            out = pipelined_fused_moe_gmm(**kwargs)
+            if fused_ep_armed:
+                out = retain_fork_graph_inputs(out, fused_moe_ep_bridge._RANK_BUFFER)
+            return out
 
         from vllm_torchtpu.layers.adapter.fused_moe_decode import (
             fused_moe_decode,
