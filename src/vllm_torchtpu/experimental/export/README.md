@@ -171,6 +171,17 @@ draft checkpoint is how vLLM loads it, not something the runtime reads.
   values land past the accepted tokens, where the next step's context rows
   overwrite them.
 
+Each `draft_bucket{B}` drafts only for the step's live requests. The drafter
+(MTP or DSpark/DFlash) is lowered once per request count `N` in
+`exporter.draft_slot_counts(B, max_num_seqs)` (powers of two below
+`min(B, max_num_seqs)`, then that count), and `case_compose` merges the
+variants into one module whose `@main` runs, through `stablehlo.case`, the
+smallest `N` holding the step's request count (`req_dist[2]`). Every row still
+writes its context KV; only the per-request work (a DSpark block, an MTP
+draft's logits and further passes) covers `N` requests. The module keeps the
+largest variant's signature, so the artifact contract does not change, and
+`draft_tokens` rows past `N` are 0.
+
 A DFlash draft (`"method": "dflash"` with its `model`) is driven exactly like
 a DSpark one, so the artifact declares the runtime protocol, `dspark`: the same
 `aux_hidden_states`, paged KV and block per step. Its block is the anchor and
