@@ -1057,6 +1057,17 @@ def calculate_tiling(
     # TODO(alynie, kyuyeunk): max number of bucket was choosen empiirically.
     # Revisit the value to be based on number of instruction memory size.
     max_num_buckets = 4
+    if rhs_cfgs.dequantize_after_matmul:
+        # Skinny (decode) calls: an expert holds a few rows, so let a tile end
+        # at the next lhs sublane block instead of running all tile_m rows
+        # through the matmul and the per-block scale epilogue.
+        sublane = _get_lhs_sublane_size(lhs_cfgs.dtype, dims.size_m)
+        bucket_base = max(sublane, tile_m // max_num_buckets)
+        if tile_m % bucket_base:
+            bucket_base = tile_m
+        return TileSizes(
+            tile_m=tile_m, tile_k=tile_k, tile_n=tile_n, bucket_base=bucket_base
+        )
     bucket_base = tile_m
     for _ in range(1, max_num_buckets):
         new_tile_m = tile_m + bucket_base
