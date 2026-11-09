@@ -27,6 +27,8 @@ from vllm.distributed.device_communicators.base_device_communicator import (
 )
 from vllm.distributed.parallel_state import get_dp_group, get_ep_group
 
+from vllm_torchtpu.distributed.sequence_parallel_rows import replicated_rows_moe_step
+
 
 class TpuNullAll2AllManager(All2AllManagerBase):
     """Probe-only stub; TPU EP dispatch/combine never goes through it."""
@@ -43,6 +45,11 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
             self.all2all_manager = TpuNullAll2AllManager(self.cpu_group)
 
     def _moe_group(self, is_sequence_parallel: bool):
+        if is_sequence_parallel and replicated_rows_moe_step():
+            # Under TPU_SP_MIN_ROWS, a step below the threshold holds every
+            # token on every rank: nothing to gather, and the combine
+            # all-reduces (see combine).
+            return None
         group = get_ep_group() if is_sequence_parallel else get_dp_group()
         return group if group.world_size > 1 else None
 
@@ -87,6 +94,11 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
     def combine(
         self, hidden_states: torch.Tensor, is_sequence_parallel: bool = False
     ) -> torch.Tensor:
+        if is_sequence_parallel and replicated_rows_moe_step():
+            # Every rank holds every token and its own experts' partial sums;
+            # the runner's final all-reduce is skipped under sequence
+            # parallelism, so it happens here.
+            return get_ep_group().all_reduce(hidden_states)
         group = self._moe_group(is_sequence_parallel)
         if group is None:
             return hidden_states

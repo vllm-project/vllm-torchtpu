@@ -94,6 +94,7 @@ from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorOutput
 from vllm_torchtpu import envs, utils
 from vllm_torchtpu.block_major_pool import BlockMajorPoolLayout
 from vllm_torchtpu.compilation import shape_variants
+from vllm_torchtpu.distributed import sequence_parallel_rows
 from vllm_torchtpu.distributed import utils as dist_utils
 from vllm_torchtpu.distributed.kv_transfer.kv_save_nan_check import (
     KVSaveNanCheck,
@@ -8646,12 +8647,15 @@ class TPUModelRunner(GPUModelRunner):
         kwargs = {}
         if intermediate_tensors is not None:
             kwargs["intermediate_tensors"] = intermediate_tensors
-        out = self.model(
-            input_ids=input_ids,
-            positions=positions,
-            inputs_embeds=inputs_embeds,
-            **kwargs,
-        )
+        # The MoE communicator reads the step's token count at trace time
+        # (TPU_SP_MIN_ROWS, distributed/sequence_parallel_rows).
+        with sequence_parallel_rows.backbone_step(positions.shape[-1]):
+            out = self.model(
+                input_ids=input_ids,
+                positions=positions,
+                inputs_embeds=inputs_embeds,
+                **kwargs,
+            )
         # A stage before the last returns the tensors the next stage
         # consumes rather than hidden states to sample from.
         if isinstance(out, IntermediateTensors):

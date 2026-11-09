@@ -1005,6 +1005,11 @@ class TpuPlatform(Platform):
 
         if envs.TPU_MOE_SEQUENCE_PARALLEL:
             _configure_sequence_parallel_moe(vllm_config)
+        elif envs.TPU_SP_MIN_ROWS > 0 or envs.TPU_SP_FP8_GATHER:
+            raise ValueError(
+                "TPU_SP_MIN_ROWS and TPU_SP_FP8_GATHER modify sequence-parallel "
+                "MoE; set TPU_MOE_SEQUENCE_PARALLEL=1 as well."
+            )
         # After the sequence-parallel filter, which can drop the largest size.
         _validate_token_budget_fits_compile_sizes(vllm_config)
 
@@ -1587,6 +1592,15 @@ def _configure_sequence_parallel_moe(vllm_config: VllmConfig) -> None:
         raise ValueError(
             "TPU_MOE_SEQUENCE_PARALLEL=1 does not support pipeline parallelism "
             f"(pipeline_parallel_size={parallel_config.pipeline_parallel_size})."
+        )
+    if envs.TPU_SP_MIN_ROWS > 0 and (
+        envs.TPU_MOE_COLLECTION_CHUNK_SIZE > 0 or envs.TPU_MOE_FP8_ALL_GATHER
+    ):
+        # Those MoE paths issue their own collectives and would leave the
+        # routed partial sums of a replicated step unreduced.
+        raise ValueError(
+            "TPU_SP_MIN_ROWS does not support TPU_MOE_COLLECTION_CHUNK_SIZE or "
+            "TPU_MOE_FP8_ALL_GATHER."
         )
     if not envs.USE_MOE_FUSED_EP_KERNEL:
         logger.warning(

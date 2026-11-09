@@ -73,6 +73,8 @@ if TYPE_CHECKING:
     USE_MOE_SPARSE_CORE: bool = True
     ONEHOT_MOE_PERMUTE_THRESHOLD: int | None = None
     TPU_MOE_SEQUENCE_PARALLEL: bool = False
+    TPU_SP_MIN_ROWS: int = 0
+    TPU_SP_FP8_GATHER: bool = False
     TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
     FUSED_MOE_DECODE_KERNEL: bool = False
@@ -711,6 +713,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # T/tp tokens, and the next layer all-gathers. Qwen3.5 MoE with
     # EP and TP > 1 only.
     "TPU_MOE_SEQUENCE_PARALLEL": env_bool("TPU_MOE_SEQUENCE_PARALLEL", default=False),
+    # With TPU_MOE_SEQUENCE_PARALLEL=1: backbone steps of fewer tokens keep
+    # every token on every TP rank (attention all-reduce, MoE combine
+    # all-reduce) instead of the sequence-parallel form. 0 makes every step
+    # sequence parallel.
+    "TPU_SP_MIN_ROWS": env_nonnegative_int("TPU_SP_MIN_ROWS", 0),
+    # With TPU_MOE_SEQUENCE_PARALLEL=1: all-gather the normed rows before
+    # attention in fp8 with per-row scales instead of bf16.
+    "TPU_SP_FP8_GATHER": env_bool("TPU_SP_FP8_GATHER", default=False),
     # Select the blockwise owner-output kernel after the outer one-hot MoE
     # threshold has selected the TensorCore path. "off" keeps the dense
     # one-hot combine; "on" enables the kernel for every shape that passes

@@ -179,3 +179,29 @@ def test_sequence_parallel_rejects_pipeline_parallel(configure_sp_moe):
         match="does not support pipeline parallelism",
     ):
         configure_sp_moe(vllm_config)
+
+
+@pytest.mark.parametrize(
+    "env_name,value",
+    [("TPU_MOE_COLLECTION_CHUNK_SIZE", 1024), ("TPU_MOE_FP8_ALL_GATHER", True)],
+)
+def test_row_gate_rejects_moe_paths_owning_collectives(
+    configure_sp_moe, monkeypatch, env_name, value
+):
+    """Those paths would leave a replicated step's routed partial sums unreduced."""
+    import vllm_torchtpu.envs as envs
+
+    monkeypatch.setattr(envs, "TPU_SP_MIN_ROWS", 64)
+    monkeypatch.setattr(envs, env_name, value)
+    vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            use_sequence_parallel_moe=True,
+            tensor_parallel_size=8,
+            pipeline_parallel_size=1,
+        ),
+        model_config=SimpleNamespace(architectures=["Qwen3_5MoeForCausalLM"]),
+        compilation_config=SimpleNamespace(compile_sizes=[16, 32, 64]),
+        speculative_config=None,
+    )
+    with pytest.raises(ValueError, match="TPU_SP_MIN_ROWS does not support"):
+        configure_sp_moe(vllm_config)

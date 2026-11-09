@@ -60,6 +60,8 @@ At startup, `vllm-torchtpu` reports set environment variables that neither vLLM 
 | `USE_MOE_TP_DECODE_KERNEL` | `False` | Serves eligible tensor-parallel FP8 MoE layers with a fused TP decode MoE Pallas kernel (in-kernel routing, shared expert, and all-reduce; requires `TPU_MOE_SKIP_PADDED_TOKENS=1`, and arms nothing while `FUSED_MOE_DECODE_KERNEL` is set). |
 | `TPU_MOE_HIERARCHICAL_EP` | `False` | Enables two-level intra-chip / inter-chip hierarchical Expert Parallelism on dual-core TPU v7x hosts. |
 | `TPU_MOE_SEQUENCE_PARALLEL` | `False` | Enables sequence parallelism around MoE blocks. |
+| `TPU_SP_MIN_ROWS` | `0` | With `TPU_MOE_SEQUENCE_PARALLEL`, backbone steps with fewer tokens keep every token on every TP rank (all-reduce after attention and in the MoE combine). `0` keeps every step sequence parallel. |
+| `TPU_SP_FP8_GATHER` | `False` | With `TPU_MOE_SEQUENCE_PARALLEL`, all-gathers the normed rows before attention in fp8 with per-row scales instead of bf16. |
 | `TPU_ATTN_MOE_OVERLAP` | `False` | Overlaps Qwen3.5 MoE post-attention norm and router gate with TP collectives on token buckets >= 8 MiB per rank. |
 | `TPU_MOE_ROUTER_TOPK` | `"rowmax"` | MoE router top-k kernel implementation (`"rowmax"` or standard top-k). |
 | `TPU_MOE_FP8_ALL_GATHER` | `False` | Performs MoE activation all-gather in `fp8` before expert computation. |
