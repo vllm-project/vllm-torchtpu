@@ -97,6 +97,7 @@ from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
 from vllm_torchtpu.layers.adapter.quantization.configs import (
     VllmQuantConfig,
     VllmQuantLinearConfig,
+    should_quantize_on_load,
 )
 from vllm_torchtpu.layers.adapter.quantization.online_fp8 import (
     OnlineFp8Policy,
@@ -756,10 +757,10 @@ class VllmFp8Config(Fp8Config, VllmQuantConfig):
                 fused_mapping=self.packed_modules_mapping,
             ):
                 from vllm_torchtpu.layers.adapter.quantization.unquantized import (
-                    VllmUnquantizedLinearMethod,
+                    VllmUnquantizedConfig,
                 )
 
-                return VllmUnquantizedLinearMethod()
+                return VllmUnquantizedConfig.get_quant_method(self, layer, prefix)
             return VllmFp8LinearMethodTPU(self, self.get_linear_config(layer))
 
         if isinstance(layer, Attention):
@@ -1727,6 +1728,11 @@ def resolve_online_fp8(
     if not isinstance(layer, LinearBase):
         raise ValueError(f"Online FP8 target is not a supported Linear: {prefix}")
     if not isinstance(base_method, UnquantizedLinearMethod):
+        if should_quantize_on_load(prefix):
+            raise ValueError(
+                f"Online FP8 target {prefix} is already quantized on load by "
+                "QUANTIZE_ON_LOAD_PREFIXES; select it with only one of the two"
+            )
         raise ValueError(
             f"Online FP8 target {prefix} already has checkpoint "
             f"method {type(base_method).__name__}"

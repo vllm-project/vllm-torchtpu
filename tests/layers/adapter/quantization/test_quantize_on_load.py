@@ -103,3 +103,107 @@ class TestUnquantizedConfigQuantizeOnLoadDispatch:
             linear_layer, prefix="model.layers.0.mlp.down_proj"
         )
         assert isinstance(method, VllmUnquantizedLinearMethod)
+
+
+_UNQUANTIZED_PREFIX = "model.layers.3.self_attn.o_proj"
+
+
+def _nvfp4_config():
+    from vllm_torchtpu.layers.adapter.quantization.nvfp4 import VllmNvfp4Config
+
+    return VllmNvfp4Config(
+        is_checkpoint_nvfp4_serialized=True,
+        kv_cache_quant_algo=None,
+        exclude_modules=["model.layers.*.self_attn*"],
+    )
+
+
+def _fp8_config():
+    from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8Config
+
+    return VllmFp8Config(
+        is_checkpoint_fp8_serialized=True,
+        activation_scheme="dynamic",
+        ignored_layers=[_UNQUANTIZED_PREFIX],
+        weight_block_size=[128, 128],
+    )
+
+
+def _mxfp4_ignored_config():
+    from vllm_torchtpu.layers.adapter.quantization.mxfp4 import VllmMxfp4Config
+
+    return VllmMxfp4Config(ignored_layers=[_UNQUANTIZED_PREFIX])
+
+
+def _mxfp4_config():
+    # MXFP4 only quantizes MoE experts, so every linear layer is BF16.
+    from vllm_torchtpu.layers.adapter.quantization.mxfp4 import VllmMxfp4Config
+
+    return VllmMxfp4Config()
+
+
+def _deepseek_v4_fp8_config():
+    from vllm_torchtpu.layers.adapter.quantization.deepseek_v4_fp8 import (
+        VllmDeepseekV4Fp8Config,
+    )
+
+    return VllmDeepseekV4Fp8Config(
+        is_checkpoint_fp8_serialized=True,
+        activation_scheme="dynamic",
+        ignored_layers=[_UNQUANTIZED_PREFIX],
+        weight_block_size=[128, 128],
+    )
+
+
+@pytest.mark.parametrize(
+    "make_config",
+    [
+        _nvfp4_config,
+        _fp8_config,
+        _mxfp4_ignored_config,
+        _mxfp4_config,
+        _deepseek_v4_fp8_config,
+    ],
+    ids=["nvfp4", "fp8", "mxfp4_ignored", "mxfp4", "deepseek_v4_fp8"],
+)
+class TestCheckpointUnquantizedLayersQuantizeOnLoad:
+    """Linear layers a quantized checkpoint leaves in BF16 honor
+    QUANTIZE_ON_LOAD_PREFIXES like layers of unquantized checkpoints."""
+
+    def test_matching_prefix_quantizes_to_fp8(
+        self, monkeypatch, linear_layer, make_config
+    ):
+        monkeypatch.setenv("QUANTIZE_ON_LOAD_PREFIXES", "self_attn")
+        method = make_config().get_quant_method(linear_layer, _UNQUANTIZED_PREFIX)
+        assert isinstance(method, VllmFp8LinearMethodTPU)
+
+        w_bf16 = torch.randn(32, 64, dtype=torch.bfloat16) * 0.02
+        x = torch.randn(8, 64, dtype=torch.bfloat16)
+        ref = x.float() @ w_bf16.float().t()
+        linear_layer.register_parameter(
+            "weight",
+            torch.nn.Parameter(w_bf16.clone(), requires_grad=False),
+        )
+        method.process_weights_after_loading(linear_layer)
+        assert linear_layer.weight.dtype == torch.float8_e4m3fn
+        assert linear_layer.weight.shape == (64, 32)
+        assert linear_layer.weight_scale.shape == (32,)
+
+        monkeypatch.setattr(
+            "vllm_torchtpu.layers.adapter.quantization.fp8.quantized_matmul",
+            lambda x_in, w, s, **_: (x_in.float() @ (w.float() * s.unsqueeze(0))).to(
+                x_in.dtype
+            ),
+        )
+        out = method.apply(linear_layer, x)
+        assert out.shape == (8, 32)
+        assert out.dtype == torch.bfloat16
+        cos_sim = torch.nn.functional.cosine_similarity(out.float(), ref, dim=-1)
+        assert (cos_sim > 0.999).all()
+
+    def test_non_matching_prefix_stays_unquantized(
+        self, monkeypatch, linear_layer, make_config
+    ):
+        monkeypatch.setenv("QUANTIZE_ON_LOAD_PREFIXES", "")
+        method = make_config().get_quant_method(linear_layer, _UNQUANTIZED_PREFIX)
+        assert isinstance(method, VllmUnquantizedLinearMethod)
