@@ -127,14 +127,7 @@ def _pack_routing_exchange(pairs, scale_bits, counts, layout):
 
 
 def _combine_arrivals_fs(
-    arrivals,
-    arrival_scales,
-    pos,
-    mirror_pos,
-    topk_weights,
-    out_dtype,
-    *,
-    onehot_scale_lookup: bool = True,
+    arrivals, arrival_scales, pos, mirror_pos, topk_weights, out_dtype
 ):
     """v2's `_combine_arrivals`, with the arrival-scale lookup done inside the
     combine kernel (see kernel._build_combine_fs_kernel) where that kernel
@@ -144,13 +137,7 @@ def _combine_arrivals_fs(
     mirror_sublanes, tile_m = arrival_scales.shape
     if not combine_step_tokens(t_local):
         return _combine_arrivals(
-            arrivals,
-            arrival_scales,
-            pos,
-            mirror_pos,
-            topk_weights,
-            out_dtype,
-            onehot_scale_lookup=onehot_scale_lookup,
+            arrivals, arrival_scales, pos, mirror_pos, topk_weights, out_dtype
         )
     # A DMA does not clamp an out-of-range index the way a gather does.
     # Neither position is ever negative.
@@ -215,7 +202,6 @@ def fused_ep_moe_push(
     token_replica_groups=None,
     logical_intermediate_size=None,
     preprocess_topology=None,
-    onehot_scale_lookup: bool = True,
     sc_prepush=2,
     tc_exchange=False,
     height_rungs_override=0,
@@ -706,13 +692,7 @@ def fused_ep_moe_push(
         )
 
         combined = _combine_arrivals_fs(
-            arrivals,
-            arrival_scales,
-            pos,
-            mirror_pos,
-            topk_weights,
-            out_dtype,
-            onehot_scale_lookup=onehot_scale_lookup,
+            arrivals, arrival_scales, pos, mirror_pos, topk_weights, out_dtype
         )
         # A row that routed nowhere read arrival rows nobody wrote; its weight is
         # zero, but zero times an unwritten NaN is not.

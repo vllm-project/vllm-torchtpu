@@ -21,7 +21,6 @@ from vllm.models.deepseek_v41 import attention as upstream
 from vllm.models.deepseek_v41 import compressor as compressor_upstream
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 
-from vllm_torchtpu import envs
 from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
@@ -1872,9 +1871,8 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     tp_rank=self._tp_rank_1d,
                 )
             else:
-                # With the row mask on, the op zeroes the invalid rows itself
-                # (in the shared DSpark draft kernel's write-back).
-                fused_mask = envs.TPU_DSV41_FUSED_ATTENTION_ROW_MASK
+                # The op zeroes the invalid rows itself (in the shared DSpark
+                # draft kernel's write-back).
                 result = paged_attention(
                     q,
                     swa_cache,
@@ -1884,11 +1882,10 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     self.attn_sink,
                     self.scale,
                     self._swa_query_group_size,
-                    row_valid=swa_valid if fused_mask else None,
+                    row_valid=swa_valid,
                 )
-                if fused_mask:
-                    output.copy_(result)
-                    return None
+                output.copy_(result)
+                return None
             output.copy_(result.masked_fill(swa_invalid_3d, 0))
             return None
         if self._fp8_kv and self.compress_ratio:

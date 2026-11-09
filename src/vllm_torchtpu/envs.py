@@ -33,11 +33,8 @@ if TYPE_CHECKING:
     TPU_INLINE_DEDUPLICATED_CALLS: bool = True
     TPU_VERIFY_INCREMENTAL_BLOCK_TABLE: bool = False
     TPU_ROPE_PAIRED_ROWS: bool = True
-    TPU_ENGRAM_REQUEST_FALLBACK: bool = True
     TPU_BLOCK_TABLE_DELTA_BUCKETS: bool = True
     TPU_FUSED_SPEC_NEXT_INPUTS: bool = True
-    TPU_DSV41_FUSED_ATTENTION_ROW_MASK: bool = True
-    TPU_MOE_ONEHOT_SCALE_LOOKUP: bool = True
     TPU_DSPARK_DRAFT_MOE_TUNING: bool = True
     LIBTPU_INIT_ARGS: str = ""
     JAX_PLATFORMS: str = ""
@@ -572,27 +569,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # per-step rows from it: a full-lane gather instead of a half-lane one.
     # Costs one extra copy of the compact table in HBM. Bit-exact.
     "TPU_ROPE_PAIRED_ROWS": env_bool("TPU_ROPE_PAIRED_ROWS", default=True),
-    # Read the Engram slot-cache fallback once per (request, lookback slot)
-    # instead of once per (token, n-gram shift), then look rows up in that
-    # small table (Engram hash: 116.9 -> 102.9 us on one v7x chip). Same hashes.
-    "TPU_ENGRAM_REQUEST_FALLBACK": env_bool(
-        "TPU_ENGRAM_REQUEST_FALLBACK", default=True
-    ),
-    # DSV4.1 bf16 paged attention: pass the SWA row validity into the op, so
-    # the shared DSpark draft kernel zeroes invalid rows in its write-back
-    # instead of a separate masked_fill over the [240, 64, 512] output
-    # (~13 us per draft layer on one v7x chip). Same values.
-    "TPU_DSV41_FUSED_ATTENTION_ROW_MASK": env_bool(
-        "TPU_DSV41_FUSED_ATTENTION_ROW_MASK", default=True
-    ),
-    # Fused EP MoE combine: read the arrival row scales through an exact
-    # one-hot matmul over the f32 bits split into 16-bit halves
-    # (`fused_moe.v2.layer._lookup_row_scales`) instead of a 2-D gather, for
-    # small scale mirrors (DSpark draft layer, 720 lookups into [264, 128]:
-    # 10.0 -> 3.6 us on one v7x chip). Bit-identical, NaN payloads included.
-    "TPU_MOE_ONEHOT_SCALE_LOOKUP": env_bool(
-        "TPU_MOE_ONEHOT_SCALE_LOOKUP", default=True
-    ),
     # DSpark draft layers under MOE_FUSED_EP_KERNEL_IMPL=push: build their
     # fused EP op with sc_prepush=1 and two tile-height rungs instead of the
     # process-wide MOE_FUSED_EP_PUSH_SC_PREPUSH / ..._HEIGHT_RUNGS_OVERRIDE.

@@ -114,7 +114,7 @@ def _row_routes(scores, gate_l):
 _ONEHOT_SCALE_MAX_CELLS = 1 << 19
 
 
-def _lookup_row_scales(arrival_scales, scl, shift, *, onehot: bool):
+def _lookup_row_scales(arrival_scales, scl, shift):
     """``arrival_scales[scl >> shift, scl & (tile_m - 1)]``, bit for bit.
 
     For small mirrors the gather lowers to slow scalar reads, so the row is
@@ -129,8 +129,7 @@ def _lookup_row_scales(arrival_scales, scl, shift, *, onehot: bool):
     sub = jnp.right_shift(scl, shift)
     lane = scl & (tile_m - 1)
     if (
-        not onehot
-        or arrival_scales.dtype != jnp.float32
+        arrival_scales.dtype != jnp.float32
         or scl.size * sublanes > _ONEHOT_SCALE_MAX_CELLS
     ):
         return arrival_scales[sub, lane]
@@ -157,8 +156,6 @@ def _combine_arrivals(
     mirror_pos,
     topk_weights,
     out_dtype,
-    *,
-    onehot_scale_lookup: bool = True,
 ):
     """Combine arrivals [rows, lane blocks, 128] into [t_local, hidden].
 
@@ -191,9 +188,7 @@ def _combine_arrivals(
     rows = jnp.minimum(pos, recv_rows - 1)
     shift = pow2_shift(tile_m, "the mirror's lane count")
     scl = jnp.minimum(mirror_pos, mirror_sublanes * tile_m - 1)
-    row_scales = _lookup_row_scales(
-        arrival_scales, scl, shift, onehot=onehot_scale_lookup
-    )
+    row_scales = _lookup_row_scales(arrival_scales, scl, shift)
     coef = row_scales * topk_weights.astype(jnp.float32)
     if combine_step_tokens(t_local):
         combine = build_combine_kernel(
@@ -375,7 +370,6 @@ def fused_ep_moe_v2(
     routed_scaling_factor=1.0,
     token_replica_groups=None,
     logical_intermediate_size=None,
-    onehot_scale_lookup: bool = True,
     stage="fused",
     routed=None,
     gather_positions=None,
@@ -1068,7 +1062,6 @@ def fused_ep_moe_v2(
             mirror_pos,
             topk_weights,
             out_dtype,
-            onehot_scale_lookup=onehot_scale_lookup,
         )
         # A row that routed nowhere read arrival rows nobody wrote; its weight is
         # zero, but zero times an unwritten NaN is not.

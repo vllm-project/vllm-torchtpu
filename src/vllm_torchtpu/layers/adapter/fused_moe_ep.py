@@ -221,7 +221,6 @@ def _build_op(
     from vllm_torchtpu.kernels.fused_moe.v2 import WeightFormat, fused_ep_moe_v2
 
     moe_layer = fused_ep_moe_v2
-    onehot_scale_lookup = envs.TPU_MOE_ONEHOT_SCALE_LOOKUP
     impl_kw = {}
     if envs.MOE_FUSED_EP_KERNEL_IMPL == "push":
         # Same operands and admission as v2; only the dispatch differs. The
@@ -260,7 +259,6 @@ def _build_op(
         row_score_bias,
         envs.MOE_FUSED_EP_KERNEL_IMPL,
         tuple(sorted(impl_kw.items())),
-        onehot_scale_lookup,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -302,7 +300,6 @@ def _build_op(
             sharded_plan=sharded_plan,
             token_replica_groups=token_replica_groups,
             logical_intermediate_size=logical_intermediate_size,
-            onehot_scale_lookup=onehot_scale_lookup,
             **impl_kw,
             **bias_kw,
             **routing_kw,

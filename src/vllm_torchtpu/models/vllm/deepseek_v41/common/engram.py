@@ -392,7 +392,7 @@ class NgramHashState(upstream.NgramHashState):
             lookback_dead_mask, upstream.DEAD_ID
         )
         window = mapped_lookback[reqs_col, cols]
-        if envs.TPU_ENGRAM_REQUEST_FALLBACK and self.lookback_depth >= ngram - 1:
+        if self.lookback_depth >= ngram - 1:
             # The fallback is read only where ~in_chunk: then past is
             # chunk_position - 1 - cols with cols < ngram - 1 <= lookback_depth,
             # so every row reads one of its request's lookback_depth slots.
