@@ -47,7 +47,43 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
 
     def __init__(self) -> None:
         super().__init__()
+        self._normalize_gke_visible_chips()
         apply_omni_tpu_patches()
+
+    @classmethod
+    def _normalize_gke_visible_chips(cls) -> None:
+        """Clear full-pod physical-chip ``TPU_VISIBLE_CHIPS`` on dual-VF GKE TPUs.
+
+        On dual-TensorCore TPU families (such as TPU v7x), GKE's
+        ``tpu-device-plugin`` sets ``TPU_VISIBLE_CHIPS`` to the ``N`` physical
+        chip IDs ``{0, ..., N-1}`` (in arbitrary Go-map iteration order, e.g.
+        ``2,3,0,1``) while exposing ``2 * N`` VFIO TensorCore devices inside
+        the container. ``vllm-omni``'s stage initializer counts comma-separated
+        entries in ``device_control_env_var`` before querying
+        ``get_device_count()``, which otherwise under-counts a 4-chip / 8-core
+        pod as 4 devices and rejects 8-rank stages. True chip subsets (where
+        ``sorted(chip_ids) != list(range(N))`` or ``get_device_count() != 2 * N``)
+        are preserved untouched.
+        """
+        chips = os.environ.get("TPU_VISIBLE_CHIPS")
+        if not chips:
+            return
+        try:
+            chip_ids = [int(c.strip()) for c in chips.split(",") if c.strip()]
+        except ValueError:
+            return
+        if (
+            chip_ids
+            and sorted(chip_ids) == list(range(len(chip_ids)))
+            and cls.get_device_count() == 2 * len(chip_ids)
+        ):
+            os.environ.pop("TPU_VISIBLE_CHIPS", None)
+            logger.info_once(
+                "Cleared full-pod physical-chip TPU_VISIBLE_CHIPS=%s so vLLM-Omni "
+                "sees all %d TPU TensorCore devices.",
+                chips,
+                2 * len(chip_ids),
+            )
 
     @classmethod
     def get_diffusion_attn_backend_cls(
@@ -59,12 +95,20 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
         from vllm_torchtpu.omni.patches import apply_omni_model_specific_patches
 
         apply_omni_model_specific_patches()
-        if selected_backend is not None and selected_backend.upper() in (
+        upper = selected_backend.upper() if selected_backend is not None else None
+        if upper in (
             "SDPA",
             "TPU_SDPA",
             "TORCH_SDPA",
         ):
             backend = "vllm_torchtpu.omni.attention.TpuSDPABackend"
+        elif upper in (
+            "RAINFUSION_ATTN",
+            "FASTVIDEO_VSA",
+            "TPU_BLOCK_SPARSE",
+            "BLOCK_SPARSE",
+        ):
+            backend = "vllm_torchtpu.omni.attention.TpuBlockSparseAttentionBackend"
         else:
             backend = "vllm_torchtpu.omni.attention.TpuFlashAttentionBackend"
         logger.info_once(
@@ -100,6 +144,7 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
 
     @classmethod
     def set_device(cls, device: torch.device | int) -> None:
+        cls._normalize_gke_visible_chips()
         world_size = int(os.environ.get("WORLD_SIZE", "1") or "1")
         if world_size > 1:
             cls._worker_world_size = world_size
@@ -120,6 +165,9 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
         torch.accelerator.set_device_index(0)
         _ = torch.empty(1, device=torch.device("tpu"))
         torch.accelerator.synchronize()
+        from vllm_torchtpu.omni.patches import _patch_diffusion_tpu_compile
+
+        _patch_diffusion_tpu_compile()
 
     @staticmethod
     def _offload_dense_all_to_all() -> None:
