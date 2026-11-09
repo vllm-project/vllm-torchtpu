@@ -23,11 +23,10 @@ subclass whose row mutators (`append_row` / `add_row` / `clear_row` /
 only writers of the host table: no `vllm_torchtpu` code writes it directly.
 `TPU_VERIFY_INCREMENTAL_BLOCK_TABLE=1` rechecks the whole table every step.
 
-The products program returns fresh per-group buffers rather than exposing the
-kept tensor to downstream consumers. Delta updates are functional by default
-(clone + index_put). The opt-in TPU_BLOCK_TABLE_DELTA_INPLACE updater donates
-the kept tensor; enabling it requires validating read/write ordering across
-steps on the TPU backend, not just the scatter's numerical result.
+The device tensor is only ever read by `_staged_walk_products_compiled`, whose
+outputs are fresh buffers, so reusing it across steps is safe. The scatter
+program is functional (clone + index_put), so the previous buffer is never
+written in place.
 """
 
 from __future__ import annotations
@@ -150,65 +149,9 @@ _apply_block_table_delta_compiled = torch.compile(
     _apply_block_table_delta, backend="tpu", fullgraph=True, dynamic=False
 )
 
-# Donated delta scatter (TPU_BLOCK_TABLE_DELTA_INPLACE). A torch in-place
-# `staged[idx] = val` inside torch.compile still lowers to copy + scatter
-# (the copy costs ~10 us at the DSv4.1 table size); donating the table to a
-# JAX op lets XLA alias it, the pattern of `partial_kv_update.pallas_index_copy_`.
-_donated_delta_op = None
-
-
-def _jax_apply_delta(staged, update):
-    # The second output only gives the op a non-aliased result.
-    return staged.at[update[0]].set(update[1]), update[0, :1]
-
-
-def _get_donated_delta_op():
-    global _donated_delta_op
-    if _donated_delta_op is None:
-        import jax
-        from torch_tpu._internal import pallas as torch_pallas
-
-        # jax_op reads the signature's types; this module's annotations are
-        # strings (`from __future__ import annotations`), so set them directly.
-        _jax_apply_delta.__annotations__ = {
-            "staged": jax.Array,
-            "update": jax.Array,
-            "return": tuple[jax.Array, jax.Array],
-        }
-        op = torch_pallas.jax_op(
-            "pallas::block_table_delta_donated", _jax_apply_delta, donate_argnums=(0,)
-        )
-        op.register_fake(
-            lambda staged, update: (torch.empty_like(staged), update.new_empty((1,)))
-        )
-        _donated_delta_op = op
-    return _donated_delta_op
-
-
-def _apply_block_table_delta_donated(
-    staged: torch.Tensor, update: torch.Tensor
-) -> torch.Tensor:
-    """`staged[update[0]] = update[1]`, written into `staged` itself."""
-    assert _donated_delta_op is not None
-    updated, _ = _donated_delta_op(staged, update)
-    staged.copy_(updated)
-    return staged
-
-
-# One graph, so XLA folds the `copy_` write-back into the donation.
-_apply_block_table_delta_donated_compiled = torch.compile(
-    _apply_block_table_delta_donated, backend="tpu", fullgraph=True, dynamic=False
-)
-
 
 def apply_block_table_delta(staged: torch.Tensor, update: torch.Tensor) -> torch.Tensor:
-    """`staged` with the delta applied. On TPU with
-    `TPU_BLOCK_TABLE_DELTA_INPLACE` the result is `staged`, updated in place;
-    otherwise (and always on CPU) a new tensor."""
     if staged.device.type == "tpu":
-        if envs.TPU_BLOCK_TABLE_DELTA_INPLACE:
-            _get_donated_delta_op()
-            return _apply_block_table_delta_donated_compiled(staged, update)
         return _apply_block_table_delta_compiled(staged, update)
     return _apply_block_table_delta(staged, update)
 
@@ -389,17 +332,12 @@ class BlockTableDeltaStager:
         sizes = (
             DELTA_BUCKETS if envs.TPU_BLOCK_TABLE_DELTA_BUCKETS else (DELTA_CAPACITY,)
         )
-        # An in-place scatter must not touch the walk's staged buffer: compile
-        # it on a same-shaped scratch copy.
-        target = (
-            staged_dev.clone() if envs.TPU_BLOCK_TABLE_DELTA_INPLACE else staged_dev
-        )
         for size in sizes:
             zero = self._zero_update.get((device, size))
             if zero is None:
                 zero = torch.zeros((2, size), dtype=torch.int32).to(device)
                 self._zero_update[(device, size)] = zero
-            target = apply_block_table_delta(target, zero)
+            apply_block_table_delta(staged_dev, zero)
 
     def verify(self, key: tuple, expected_flat: torch.Tensor) -> None:
         """Raise unless the mirror and the device copy equal `expected_flat`."""

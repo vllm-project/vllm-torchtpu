@@ -31,22 +31,6 @@ class DecoderReplayPlan:
     padded_num_tokens: int
 
 
-def is_identity_replay(plan: DecoderReplayPlan | None, total_rows: int) -> bool:
-    """Whether the decoder output already lists every input row, in order.
-
-    True only when the plan keeps all ``total_rows`` rows in their original
-    order and the coordinated bucket adds no padding row. The decoder output
-    then needs no scatter back into the original row order. Host tuples only:
-    this never reads a device tensor.
-    """
-    return (
-        plan is not None
-        and plan.padded_num_tokens == total_rows
-        and len(plan.indices) == total_rows
-        and plan.indices == tuple(range(total_rows))
-    )
-
-
 def coordinate_decoder_replay(
     plan: DecoderReplayPlan | None, num_tokens: int
 ) -> DecoderReplayPlan | None:

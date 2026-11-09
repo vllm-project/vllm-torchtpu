@@ -52,7 +52,6 @@ from .attention_kernels import initialize_paged_attention
 from .cache import initialize_cache_ops
 from .ced import (
     coordinate_decoder_replay,
-    is_identity_replay,
     plan_decoder_replay,
     prefix_replay_enabled,
 )
@@ -1076,7 +1075,12 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         # the decoder output in original row order: skip the scatter back.
         # The plan itself still fed the decoder its query bounds and replay
         # starts above.
-        identity = is_identity_replay(plan, total_rows)
+        identity = (
+            plan is not None
+            and plan.padded_num_tokens == total_rows
+            and len(plan.indices) == total_rows
+            and plan.indices == tuple(range(total_rows))
+        )
         if identity:
             _log_identity_replay_once(total_rows)
         if indices is None or identity:
