@@ -30,7 +30,6 @@ def test_torch_lookups_match(monkeypatch, seed, requests, tokens):
         monkeypatch.setenv("TPU_ONEHOT_TABLE_LOOKUP", flag)
         out[flag] = (
             table_lookup.bucketize_right(rows, starts[1:]),
-            table_lookup.bucketize_right(rows.int(), starts[1:], out_int32=True),
             table_lookup.take(table, index),
             table_lookup.take(table, index.clamp(min=0)[:, None]),
         )

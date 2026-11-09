@@ -59,24 +59,3 @@ def _check_pair_with_sink(valid_keys):
     )
     if valid_keys == 0:
         np.testing.assert_array_equal(actual[0], jnp.zeros_like(actual[0]))
-
-
-def test_row_valid_zeroes_rows_and_keeps_the_rest_bitwise():
-    if jax.default_backend() != "tpu":
-        pytest.skip("Compiled MXU kernel requires TPU")
-    rng = np.random.default_rng(5)
-    q = jnp.asarray(rng.normal(size=(4, 320, 512)), jnp.bfloat16)
-    kv = jnp.asarray(rng.normal(size=(4, 192, 512)), jnp.bfloat16)
-    valid = jnp.arange(192)[None, :] < jnp.asarray([192, 100, 1, 50])[:, None]
-    kv = jnp.where(valid[..., None], kv, 0)
-    sink = jnp.linspace(-1, 1, 320, dtype=jnp.float32)[:, None]
-    mask = jnp.pad(valid.astype(jnp.int32), ((0, 0), (0, 64)))[:, None, :]
-    tokens = jnp.asarray(rng.integers(0, 2, size=(4 * 5,)), jnp.int32)
-    run = jax.jit(shared_record_attention)
-    plain = run(mask, _pieces(q), _pieces(kv), sink)
-    fused = run(mask, _pieces(q), _pieces(kv), sink, tokens)
-    rows = jnp.repeat(tokens.reshape(4, 5), 64, axis=1)[:, :, None]
-    expected = jnp.where(rows != 0, plain, jnp.zeros((), plain.dtype))
-    np.testing.assert_array_equal(
-        np.asarray(fused).view(np.uint16), np.asarray(expected).view(np.uint16)
-    )

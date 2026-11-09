@@ -5,8 +5,6 @@ takes the XLA path below 64 tokens (or off a multiple of 64) and the Pallas
 pass otherwise; the Pallas cases need TPU hardware.
 """
 
-from unittest.mock import MagicMock
-
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -230,76 +228,6 @@ def test_collapse_flat_matches_view_sum(mult):
         np.testing.assert_array_equal(_np(got), _np(want))
     else:
         np.testing.assert_allclose(_np(got), _np(want), rtol=1e-6, atol=1e-5)
-
-
-@pytest.mark.parametrize("tokens", [240, 288])
-def test_flat_collapse_matches_view_collapse(tokens):
-    """The flat op must compute the same weighted stream sum as ``collapse``.
-
-    288 is the target decode bucket (48 requests x 6 positions); 240 is
-    DSpark's.
-    """
-    if jax.default_backend() != "tpu":
-        pytest.skip("The reference reduction tree is specific to TPU")
-    rng = np.random.default_rng(3)
-    dim = 5120
-    flat = jnp.asarray(rng.standard_normal((tokens, MULT * dim)) * 4, jnp.bfloat16)
-    pre = jnp.asarray(rng.uniform(0.01, 1.5, (tokens, MULT)), jnp.float32)
-
-    def view_collapse(f, p):
-        # Same expression as ``collapse``: f32 view, weight, sum, back to BF16.
-        view = f.reshape(tokens, MULT, dim).astype(jnp.float32)
-        return (view * p[..., None]).sum(1).astype(f.dtype)
-
-    want = jax.jit(view_collapse)(flat, pre)
-    got = jax.jit(mhc._flat_collapse_jax)(flat, pre)
-    assert got.dtype == jnp.bfloat16
-    np.testing.assert_array_equal(_np(got), _np(want))
-
-
-@pytest.mark.cpu_test
-def test_flat_collapse_dispatch(monkeypatch):
-    """Only TPU BF16 4-stream inputs reach the op; the rest keep ``collapse``."""
-    calls = []
-
-    def fake_op(flat, pre):
-        calls.append((tuple(flat.shape), tuple(pre.shape)))
-        return flat[:, : flat.shape[1] // pre.shape[1]]
-
-    x = torch.randn(3, MULT, 8, dtype=torch.bfloat16)
-    pre = torch.rand(3, MULT, dtype=torch.float32)
-
-    # Unregistered op: fall back even on TPU-shaped inputs.
-    monkeypatch.setattr(mhc, "_flat_collapse_op", None)
-    torch.testing.assert_close(mhc.flat_collapse(x, pre), mhc.collapse(x, pre))
-
-    # Registered, but CPU tensors: still the fallback.
-    monkeypatch.setattr(mhc, "_flat_collapse_op", fake_op)
-    torch.testing.assert_close(mhc.flat_collapse(x, pre), mhc.collapse(x, pre))
-    assert not calls
-
-    # TPU device: the op receives the flattened [T, 4*D] input.
-    tpu_x = MagicMock()
-    tpu_x.device.type = "tpu"
-    tpu_x.dim.return_value = 3
-    tpu_x.shape = (3, MULT, 8)
-    tpu_x.dtype = torch.bfloat16
-    tpu_x.flatten.return_value = x.flatten(1)
-    mhc.flat_collapse(tpu_x, pre)
-    tpu_x.flatten.assert_called_once_with(1)
-    assert calls == [((3, MULT * 8), (3, MULT))]
-
-    # Wrong stream count or dtype on TPU: fallback, op not called.
-    for shape, dtype in (((3, 2, 8), torch.bfloat16), ((3, MULT, 8), torch.float32)):
-        calls.clear()
-        other = MagicMock()
-        other.device.type = "tpu"
-        other.dim.return_value = 3
-        other.shape = shape
-        other.dtype = dtype
-        monkeypatch.setattr(mhc, "collapse", lambda h, p: "fallback")
-        assert mhc.flat_collapse(other, pre) == "fallback"
-        assert not calls
 
 
 @pytest.mark.parametrize("tokens", [17, 240, 288, 2048])

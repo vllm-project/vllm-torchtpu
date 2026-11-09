@@ -856,14 +856,3 @@ def test_greedy_token_ids_match_logits_path(device, synthetic, edge):
     assert torch.equal(bonus_ids.cpu(), bonus_reference.cpu())
     assert torch.equal(target_ids.cpu(), torch.argmax(gathered, dim=-1).cpu())
     assert torch.equal(actual.cpu(), expected.cpu())
-
-    # Fused greedy head path: per-row head IDs, rows selected in the same
-    # program as the validation.
-    head_ids = torch.argmax(logits, dim=-1).to(torch.int32)
-    fused = sampler.greedy_from_head_ids(
-        head_token_ids=head_ids,
-        bonus_indices=bonus_indices,
-        target_indices=target_indices,
-        **common,
-    )
-    assert torch.equal(fused.cpu(), expected.cpu())

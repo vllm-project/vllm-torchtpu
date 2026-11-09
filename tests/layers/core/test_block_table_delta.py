@@ -356,21 +356,6 @@ def test_apply_block_table_delta_cpu_and_tpu_dispatch(monkeypatch):
     functional.assert_called_once_with(tpu_like, update)
 
 
-def test_donated_delta_matches_functional():
-    # The JAX body of the donated op must produce the functional table,
-    # duplicate (padding) pairs included.
-    import jax.numpy as jnp
-    import numpy as np
-
-    staged = torch.arange(6, dtype=torch.int32)
-    update = torch.tensor([[1, 4, 1], [10, 40, 10]], dtype=torch.int32)
-    want = btd._apply_block_table_delta(staged, update)
-    got, _ = btd._jax_apply_delta(
-        jnp.asarray(staged.numpy()), jnp.asarray(update.numpy())
-    )
-    assert np.array_equal(np.asarray(got), want.numpy())
-
-
 def test_warm_reuses_zero_update_and_device_copy_not_cloned(builders):
     stager = btd.BlockTableDeltaStager()
     staged = torch.zeros((8,), dtype=torch.int32)

@@ -189,33 +189,3 @@ def test_block_sizes_do_not_change_values(tokens, block):
         np.testing.assert_array_equal(
             np.asarray(a, np.float32), np.asarray(b, np.float32)
         )
-
-
-@pytest.mark.parametrize("tokens", [288, 240, 2048, 37])
-def test_kv_layers_match_single_layer_calls(tokens):
-    """One multi-layer call equals each layer's own KV-only call, bitwise."""
-    _requires_tpu()
-    x, weight, scale, gamma_qr, gamma_kv, rows = _inputs(
-        tokens, _positions(tokens, "jumps")
-    )
-    rng = np.random.default_rng(23)
-    weights = [weight] + [
-        jnp.asarray(rng.normal(size=weight.shape), jnp.float8_e4m3fn) for _ in range(2)
-    ]
-    scales = [scale] + [
-        jnp.asarray(rng.uniform(0.01, 0.1, scale.shape), jnp.float32) for _ in range(2)
-    ]
-    gammas = [gamma_kv] + [
-        jnp.asarray(rng.normal(size=gamma_kv.shape), jnp.bfloat16) for _ in range(2)
-    ]
-    fused = jax.jit(qa_rope.fused_kv_norm_rope_layers)(
-        x, tuple(weights), tuple(scales), tuple(gammas), rows
-    )
-    single = jax.jit(functools.partial(qa_rope.fused_qa_kv_norm_rope, emit_qr=False))
-    assert len(fused) == 3
-    for w, s, g, got in zip(weights, scales, gammas, fused, strict=True):
-        _, ref = single(x, w, s, gamma_qr, g, rows)
-        assert got.shape == ref.shape and got.dtype == ref.dtype
-        np.testing.assert_array_equal(
-            np.asarray(got).view(np.uint16), np.asarray(ref).view(np.uint16)
-        )

@@ -49,31 +49,6 @@ def test_shared_tables_relaid_once_and_still_shared():
     assert torch.equal(first, shared) and torch.equal(third, other)
 
 
-def test_64_wide_tables_get_shared_paired_copy(monkeypatch):
-    monkeypatch.setenv("TPU_ROPE_PAIRED_ROWS", "1")
-    shared, narrow = torch.randn(9, 64), torch.randn(8, 4)
-    model = torch.nn.ModuleList(
-        [_Attention(shared), _Attention(shared), _Attention(narrow)]
-    )
-    _relayout(model)
-    first, second, third = model
-    assert first._tpu_rope_pairs is second._tpu_rope_pairs
-    pairs = first._tpu_rope_pairs
-    assert pairs.shape == (5, 128)
-    assert torch.equal(pairs[:4].reshape(8, 64), shared[:8])
-    assert torch.equal(pairs[4, :64], shared[8]) and torch.equal(
-        pairs[4, 64:], shared[8]
-    )
-    assert not hasattr(third, "_tpu_rope_pairs")
-
-
-def test_paired_copy_disabled(monkeypatch):
-    monkeypatch.setenv("TPU_ROPE_PAIRED_ROWS", "0")
-    model = torch.nn.ModuleList([_Attention(torch.randn(8, 64))])
-    _relayout(model)
-    assert not hasattr(model[0], "_tpu_rope_pairs")
-
-
 def test_non_2d_or_missing_tables_are_skipped():
     attention = _Attention(torch.randn(8))
     model = torch.nn.ModuleList([attention, torch.nn.Linear(2, 2)])
