@@ -89,6 +89,7 @@ def apply_omni_model_specific_patches() -> None:
     _patch_wan_vae_conv_out_lane_padding()
     _patch_wan_vae_halo_allgather()
     _patch_distributed_vae_host_metadata_collectives()
+    _patch_wan_vae_replicated_encode()
 
 
 def _patch_diffusion_ipc_cpu_pack() -> None:
@@ -929,3 +930,50 @@ def _patch_distributed_vae_host_metadata_collectives() -> None:
         "Applied TPU patch: host (gloo) MAX all_reduce and integer metadata "
         "all_gather/broadcast for distributed tile-parallel VAE."
     )
+
+
+_WAN_VAE_REPLICATED_ENCODE_PATCHED = "_tpu_wan_vae_replicated_encode_patched"
+
+
+def _patch_wan_vae_replicated_encode() -> None:
+    # TODO: Remove once distributed Wan VAE encode avoids rank-0 merge skew
+    # and auto-enabled decode tiling does not force tiled encode on TPU.
+    if not envs.VLLM_TORCHTPU_OMNI_WAN_VAE_HALO_ALLGATHER:
+        return
+    try:
+        from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import (
+            DistributedAutoencoderKLWan,
+        )
+    except ImportError:
+        return
+    from diffusers.models.autoencoders import AutoencoderKLWan
+
+    if getattr(
+        DistributedAutoencoderKLWan.tiled_encode,
+        _WAN_VAE_REPLICATED_ENCODE_PATCHED,
+        False,
+    ):
+        return
+    orig_encode = DistributedAutoencoderKLWan._encode
+    orig_tiled_encode = DistributedAutoencoderKLWan.tiled_encode
+    DistributedAutoencoderKLWan._tpu_orig_encode = orig_encode
+    DistributedAutoencoderKLWan._tpu_orig_tiled_encode = orig_tiled_encode
+
+    def _encode(self: Any, x: torch.Tensor) -> Any:
+        prev_use_tiling = getattr(self, "use_tiling", False)
+        if self.is_distributed_enabled() and prev_use_tiling:
+            self.use_tiling = False
+            try:
+                return orig_encode(self, x)
+            finally:
+                self.use_tiling = prev_use_tiling
+        return orig_encode(self, x)
+
+    def _tiled_encode(self: Any, x: torch.Tensor) -> torch.Tensor:
+        return AutoencoderKLWan.tiled_encode(self, x)
+
+    setattr(_encode, _WAN_VAE_REPLICATED_ENCODE_PATCHED, True)
+    setattr(_tiled_encode, _WAN_VAE_REPLICATED_ENCODE_PATCHED, True)
+    DistributedAutoencoderKLWan._encode = _encode
+    DistributedAutoencoderKLWan.tiled_encode = _tiled_encode
+    logger.info("Applied TPU patch: replicated untiled Wan VAE encode.")

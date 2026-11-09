@@ -671,3 +671,126 @@ def test_sync_final_result_broadcasts_shape_on_host_group(wan_vae_modules, monke
     assert tuple(out.shape) == (1, 16, 2, 4, 4)
     assert len(sync_calls) == 1 and sync_calls[0][0][0] is out
     assert sync_calls[0][1] is False
+
+
+@pytest.mark.parametrize("num_frames", [1, 5])
+def test_wan_vae_replicated_encode_skips_distributed_executor(
+    wan_vae_modules, monkeypatch, num_frames: int
+):
+    from diffusers.models.autoencoders.autoencoder_kl_wan import patchify
+
+    autoencoder_kl_wan = wan_vae_modules.autoencoder_kl_wan
+    cls = autoencoder_kl_wan.DistributedAutoencoderKLWan
+    orig_encode = getattr(cls, "_tpu_orig_encode", cls._encode)
+    orig_tiled_encode = getattr(cls, "_tpu_orig_tiled_encode", cls.tiled_encode)
+    monkeypatch.setattr(cls, "_encode", orig_encode)
+    monkeypatch.setattr(cls, "tiled_encode", orig_tiled_encode)
+    monkeypatch.delattr(cls, "_tpu_orig_encode", raising=False)
+    monkeypatch.delattr(cls, "_tpu_orig_tiled_encode", raising=False)
+
+    monkeypatch.setenv("VLLM_TORCHTPU_OMNI_WAN_VAE_HALO_ALLGATHER", "0")
+    patches._patch_wan_vae_replicated_encode()
+    assert cls._encode is orig_encode
+    assert cls.tiled_encode is orig_tiled_encode
+    assert not hasattr(cls, "_tpu_orig_encode")
+    assert not hasattr(cls, "_tpu_orig_tiled_encode")
+
+    monkeypatch.setenv("VLLM_TORCHTPU_OMNI_WAN_VAE_HALO_ALLGATHER", "1")
+    patches._patch_wan_vae_replicated_encode()
+    patched_encode = cls._encode
+    patched_tiled = cls.tiled_encode
+    assert patched_encode is not orig_encode
+    assert patched_tiled is not orig_tiled_encode
+    assert cls._tpu_orig_encode is orig_encode
+    assert cls._tpu_orig_tiled_encode is orig_tiled_encode
+
+    # Idempotent on repeated application.
+    patches._patch_wan_vae_replicated_encode()
+    assert cls._encode is patched_encode
+    assert cls.tiled_encode is patched_tiled
+    assert cls._tpu_orig_encode is orig_encode
+    assert cls._tpu_orig_tiled_encode is orig_tiled_encode
+
+    torch.manual_seed(0)
+    ref_untiled = autoencoder_kl_wan.OmniAutoencoderKLWan(**WAN21_SMALL_CONFIG).eval()
+    ref_untiled.use_tiling = False
+    ref_tiled = autoencoder_kl_wan.OmniAutoencoderKLWan(**WAN21_SMALL_CONFIG).eval()
+    ref_tiled.load_state_dict(ref_untiled.state_dict())
+    ref_tiled.use_tiling = True
+
+    vae = cls(**WAN21_SMALL_CONFIG).eval()
+    vae.load_state_dict(ref_untiled.state_dict())
+    vae.use_tiling = True
+
+    def _forbid_execute(*args, **kwargs):
+        raise AssertionError(
+            "DistributedVaeExecutor.execute must not run during encode"
+        )
+
+    vae.distributed_executor = SimpleNamespace(execute=_forbid_execute)
+    monkeypatch.setattr(vae, "is_distributed_enabled", lambda: True)
+
+    # Exceeds tile_sample_min (256): distributed VAE keeps decode tiling enabled
+    # while running full-frame untiled encode locally on each rank.
+    x = torch.randn(
+        1, 3, num_frames, 320, 320, generator=torch.Generator().manual_seed(11)
+    )
+    with torch.no_grad():
+        ref_dist = ref_untiled.encode(x).latent_dist.mean
+        got_dist = vae.encode(x).latent_dist.mean
+        assert torch.equal(got_dist, ref_dist)
+        assert vae.use_tiling is True
+
+        # Direct tiled_encode calls also stay rank-local without executor collectives.
+        x_patch = (
+            patchify(x, patch_size=vae.config.patch_size)
+            if vae.config.patch_size is not None
+            else x
+        )
+        ref_tiled_out = ref_tiled.tiled_encode(x_patch)
+        got_tiled_out = vae.tiled_encode(x_patch)
+        assert torch.equal(got_tiled_out, ref_tiled_out)
+
+
+def test_wan_vae_replicated_encode_restores_tiling_and_respects_single_rank(
+    wan_vae_modules, monkeypatch
+):
+    autoencoder_kl_wan = wan_vae_modules.autoencoder_kl_wan
+    cls = autoencoder_kl_wan.DistributedAutoencoderKLWan
+    orig_encode = getattr(cls, "_tpu_orig_encode", cls._encode)
+    orig_tiled_encode = getattr(cls, "_tpu_orig_tiled_encode", cls.tiled_encode)
+    monkeypatch.setattr(cls, "_encode", orig_encode)
+    monkeypatch.setattr(cls, "tiled_encode", orig_tiled_encode)
+    monkeypatch.delattr(cls, "_tpu_orig_encode", raising=False)
+    monkeypatch.delattr(cls, "_tpu_orig_tiled_encode", raising=False)
+
+    monkeypatch.setenv("VLLM_TORCHTPU_OMNI_WAN_VAE_HALO_ALLGATHER", "1")
+    patches._patch_wan_vae_replicated_encode()
+
+    torch.manual_seed(1)
+    ref_tiled = autoencoder_kl_wan.OmniAutoencoderKLWan(**WAN21_SMALL_CONFIG).eval()
+    ref_tiled.use_tiling = True
+    vae = cls(**WAN21_SMALL_CONFIG).eval()
+    vae.load_state_dict(ref_tiled.state_dict())
+    vae.use_tiling = True
+
+    # Single-rank explicit tiling remains tiled when distributed VAE is disabled.
+    monkeypatch.setattr(vae, "is_distributed_enabled", lambda: False)
+    x = torch.randn(1, 3, 1, 320, 320, generator=torch.Generator().manual_seed(19))
+    with torch.no_grad():
+        assert torch.equal(
+            vae.encode(x).latent_dist.mean,
+            ref_tiled.encode(x).latent_dist.mean,
+        )
+
+    # Error path restores use_tiling=True in finally when distributed VAE is enabled.
+    monkeypatch.setattr(vae, "is_distributed_enabled", lambda: True)
+
+    def _boom(*_args, **_kwargs):
+        assert vae.use_tiling is False
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(vae.encoder, "forward", _boom)
+    with pytest.raises(RuntimeError, match="boom"):
+        vae.encode(x)
+    assert vae.use_tiling is True
