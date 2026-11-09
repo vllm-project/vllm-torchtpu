@@ -85,6 +85,7 @@ def apply_omni_model_specific_patches() -> None:
     _patch_sdpa_fallback_dispatch()
     _patch_ltx2_vocoder_cpu_init()
     _patch_ltx2_per_sample_timestep()
+    _patch_ltx2_v2a_local_kv_attn()
 
 
 def _patch_diffusion_ipc_cpu_pack() -> None:
@@ -694,3 +695,60 @@ def _patch_ltx2_per_sample_timestep() -> None:
 
     LTXRuntime._denoise_timestep_kwargs = _per_sample_timestep_kwargs
     logger.info("Applied TPU patch: per-sample LTX-2 timestep.")
+
+
+_LTX2_V2A_LOCAL_KV_PATCHED = "_tpu_ltx2_v2a_local_kv_patched"
+
+
+def _patch_ltx2_v2a_local_kv_attn() -> None:
+    # -------------------------------------------------------------------------
+    # TODO: Remove once vLLM-Omni's LTX2VideoToAudioParallelAttention computes
+    # local shard attention + LSE reduction instead of all-to-all gathering
+    # full-sequence video K/V across Ulysses ranks.
+    #
+    # In LTX-2 video_to_audio_attn, audio queries (128 tokens) are replicated
+    # while video K/V (14,080 tokens at 704x1280x121) are sequence-sharded
+    # across Ulysses ranks. Upstream runs two full-video SeqAllToAll4D
+    # collectives plus an output head all-gather; computing local K/V attention
+    # on each rank and merging (o, m, l) via one small audio all-gather avoids
+    # redistributing video K/V altogether.
+    # -------------------------------------------------------------------------
+    from vllm_omni.diffusion.distributed import parallel_state
+    from vllm_omni.diffusion.models.ltx2 import ltx2_transformer
+
+    from vllm_torchtpu.omni import ltx2_v2a
+
+    attn_cls = ltx2_transformer._LTX2ParallelAttention
+    if getattr(attn_cls._forward_impl, _LTX2_V2A_LOCAL_KV_PATCHED, False):
+        return
+    orig_forward_impl = attn_cls._forward_impl
+
+    def _v2a_forward_impl(
+        self: Any,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: Any | None = None,
+    ) -> torch.Tensor:
+        if self.ltx_sp_mode == "video_to_audio":
+            strategy = self._get_active_parallel_strategy()
+            if strategy.name == "ltx2_video_to_audio":
+                sp_group = parallel_state.get_sp_group()
+                if ltx2_v2a.can_run_ltx2_v2a_local_kv(
+                    self, query, key, value, attn_metadata, sp_group
+                ):
+                    return ltx2_v2a.ltx2_v2a_local_kv_attention(
+                        query,
+                        key,
+                        value,
+                        softmax_scale=self.softmax_scale,
+                        ulysses_pg=sp_group.ulysses_group,
+                        use_sync=self.use_sync,
+                    )
+        return orig_forward_impl(self, query, key, value, attn_metadata)
+
+    setattr(_v2a_forward_impl, _LTX2_V2A_LOCAL_KV_PATCHED, True)
+    attn_cls._forward_impl = _v2a_forward_impl
+    logger.info(
+        "Applied TPU patch: local-KV LSE merge for LTX-2 video-to-audio attention."
+    )

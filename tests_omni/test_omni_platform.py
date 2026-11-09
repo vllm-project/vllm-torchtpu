@@ -1102,3 +1102,208 @@ def test_ltx2_per_sample_timestep_patch(monkeypatch):
     ts1 = torch.tensor([125.0])
     kwargs1 = runtime._denoise_timestep_kwargs(ts1, None, unconditioned, **counts)
     assert kwargs1["timestep"].shape == (1,) and kwargs1["audio_timestep"].shape == (1,)
+
+
+def _run_simulated_ulysses(world_size: int, fn):
+    """Run ``fn(rank, pg)`` across ``world_size`` threads with barrier collectives."""
+    import threading
+
+    barrier = threading.Barrier(world_size)
+    slots: list[object] = [None] * world_size
+    stats = {"all_gather": 0, "all_to_all": 0}
+    lock = threading.Lock()
+    pg = SimpleNamespace(world_size=world_size)
+
+    def all_gather_into_tensor(out: torch.Tensor, inp: torch.Tensor, group=None):
+        assert group is pg
+        assert inp.is_contiguous()
+        idx = threading.current_thread()._rank_idx  # type: ignore[attr-defined]
+        slots[idx] = inp
+        barrier.wait()
+        out.copy_(torch.cat(slots, dim=0))  # type: ignore[arg-type]
+        barrier.wait()
+        with lock:
+            stats["all_gather"] += 1
+
+    def all_to_all_single(
+        out: torch.Tensor, inp: torch.Tensor, *args, group=None, **kwargs
+    ):
+        assert group is pg
+        assert inp.is_contiguous()
+        idx = threading.current_thread()._rank_idx  # type: ignore[attr-defined]
+        chunks = inp.chunk(world_size, dim=0)
+        slots[idx] = chunks
+        barrier.wait()
+        out.copy_(torch.cat([slots[src][idx] for src in range(world_size)], dim=0))  # type: ignore[index]
+        barrier.wait()
+        with lock:
+            stats["all_to_all"] += 1
+
+    results: list[object] = [None] * world_size
+    errors: list[BaseException] = []
+
+    def worker(r: int):
+        threading.current_thread()._rank_idx = r  # type: ignore[attr-defined]
+        try:
+            results[r] = fn(r, pg)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    with (
+        patch(
+            "torch.distributed.get_world_size", side_effect=lambda g=None: pg.world_size
+        ),
+        patch(
+            "torch.distributed.all_gather_into_tensor",
+            side_effect=all_gather_into_tensor,
+        ),
+        patch("torch.distributed.all_to_all_single", side_effect=all_to_all_single),
+    ):
+        threads = [
+            threading.Thread(target=worker, args=(r,)) for r in range(world_size)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+    if errors:
+        raise errors[0]
+    return results, stats
+
+
+@pytest.mark.parametrize(
+    "dtype,bsz,s_q,s_kv_local,q_heads,kv_heads,dim,max_elems,extreme_offset",
+    [
+        (torch.float32, 1, 5, 19, 8, 8, 16, 16_777_216, False),
+        (torch.bfloat16, 2, 16, 32, 8, 4, 32, 16_777_216, False),
+        (torch.float32, 1, 7, 23, 4, 4, 16, 64, True),
+    ],
+    ids=["odd_sq_pad", "bf16_gqa_batch2", "chunked_extreme_logit_shift"],
+)
+def test_ltx2_v2a_local_kv_matches_global_attention(
+    dtype, bsz, s_q, s_kv_local, q_heads, kv_heads, dim, max_elems, extreme_offset
+):
+    from vllm_torchtpu.omni.ltx2_v2a import ltx2_v2a_local_kv_attention
+
+    torch.manual_seed(123)
+    world_size = 4
+    scale = dim**-0.5
+    q = torch.randn(bsz, s_q, q_heads, dim, dtype=dtype)
+    if extreme_offset:
+        q = q.abs() + 0.5
+    k_full = torch.randn(bsz, world_size * s_kv_local, kv_heads, dim, dtype=dtype)
+    v_full = torch.randn(bsz, world_size * s_kv_local, kv_heads, dim, dtype=dtype)
+    if extreme_offset:
+        # Shift rank 0 (+30) and rank 2 (-30) to stress cross-rank LSE rescaling.
+        k_full[:, :s_kv_local] += 30.0
+        k_full[:, 2 * s_kv_local : 3 * s_kv_local] -= 30.0
+
+    # Global single-device reference
+    qf = q.transpose(1, 2).float()
+    kf = k_full.transpose(1, 2).repeat_interleave(q_heads // kv_heads, dim=1).float()
+    vf = v_full.transpose(1, 2).repeat_interleave(q_heads // kv_heads, dim=1).float()
+    scores = torch.matmul(qf, kf.transpose(-2, -1)) * scale
+    probs = torch.softmax(scores, dim=-1)
+    if dtype != torch.float32:
+        probs = probs.to(dtype).float()
+    ref = torch.matmul(probs, vf).transpose(1, 2).to(dtype)
+
+    sent_minor_dims: list[int] = []
+
+    def rank_fn(rank: int, pg):
+        k_shard = k_full[:, rank * s_kv_local : (rank + 1) * s_kv_local].contiguous()
+        v_shard = v_full[:, rank * s_kv_local : (rank + 1) * s_kv_local].contiguous()
+        out = ltx2_v2a_local_kv_attention(
+            q,
+            k_shard,
+            v_shard,
+            softmax_scale=scale,
+            ulysses_pg=pg,
+            max_score_elements=max_elems,
+        )
+        sent_minor_dims.append(out.shape[-1])
+        return out
+
+    outs, stats = _run_simulated_ulysses(world_size, rank_fn)
+    assert stats["all_gather"] == world_size
+    assert stats["all_to_all"] == 0
+    for out in outs:
+        assert out.dtype == dtype and out.is_contiguous()
+        if dtype == torch.float32:
+            torch.testing.assert_close(out, ref, rtol=1e-5, atol=1e-5)
+        else:
+            torch.testing.assert_close(out, ref, rtol=2e-2, atol=2e-2)
+
+
+def test_ltx2_v2a_patch_dispatch_and_fallbacks(monkeypatch):
+    from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+
+    patches._patch_ltx2_v2a_local_kv_attn()
+    attn_cls = ltx2_transformer._LTX2ParallelAttention
+    # Idempotent re-apply
+    installed = attn_cls._forward_impl
+    patches._patch_ltx2_v2a_local_kv_attn()
+    assert attn_cls._forward_impl is installed
+
+    fake_pg = SimpleNamespace(world_size=2)
+    sp_group = SimpleNamespace(
+        ulysses_group=fake_pg,
+        ulysses_world_size=2,
+        ulysses_rank=0,
+        ring_world_size=1,
+    )
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.distributed.parallel_state.get_sp_group", lambda: sp_group
+    )
+    monkeypatch.setattr(ltx2_transformer, "get_sp_group", lambda: sp_group)
+
+    from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
+
+    layer = object.__new__(attn_cls)
+    torch.nn.Module.__init__(layer)
+    layer.ltx_sp_mode = "video_to_audio"
+    layer._has_custom_attention = False
+    layer._explicit_cross_contract = False
+    layer._scheduler_paged_kv = False
+    layer.use_ring = False
+    layer.causal = False
+    layer.softmax_scale = 0.25
+    layer.use_sync = False
+    layer._disable_kv_quant = True
+    layer._kv_cache_dtype = None
+    layer.paged_kv_cache_role = None
+    layer._no_parallel_strategy = NoParallelAttention()
+    layer._get_active_parallel_strategy = lambda: SimpleNamespace(
+        name="ltx2_video_to_audio", enabled=True
+    )
+
+    q = torch.randn(1, 4, 4, 8, dtype=torch.bfloat16)
+    k = torch.randn(1, 6, 4, 8, dtype=torch.bfloat16)
+    v = torch.randn(1, 6, 4, 8, dtype=torch.bfloat16)
+
+    called_local = []
+    monkeypatch.setattr(
+        "vllm_torchtpu.omni.ltx2_v2a.ltx2_v2a_local_kv_attention",
+        lambda *a, **kw: called_local.append(1) or q.clone(),
+    )
+    out = layer._forward_impl(q, k, v, None)
+    assert len(called_local) == 1 and out.shape == q.shape
+
+    # Masked metadata falls back to upstream _forward_impl -> strategy / local attn.
+    fallback_calls = []
+    layer._get_active_parallel_strategy = lambda: SimpleNamespace(
+        name="ltx2_video_to_audio",
+        enabled=True,
+        pre_attention=lambda q_, k_, v_, m_: (q_, k_, v_, m_, None),
+        post_attention=lambda o_, c_: o_,
+    )
+    layer._run_local_attention = lambda *a, **kw: fallback_calls.append(1) or q.clone()
+    masked_meta = AttentionMetadata(attn_mask=torch.ones(1, 6, dtype=torch.bool))
+    layer._forward_impl(q, k, v, masked_meta)
+    assert len(called_local) == 1 and len(fallback_calls) == 1
+
+    # Non-v2a mode falls back untouched.
+    layer.ltx_sp_mode = "video_self"
+    layer._get_active_parallel_strategy = lambda: layer._no_parallel_strategy
+    layer._forward_impl(q, k, v, None)
+    assert len(called_local) == 1 and len(fallback_calls) == 2
