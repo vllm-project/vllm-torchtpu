@@ -360,10 +360,9 @@ def test_4chip_buckets_rejects_tl_above_128_and_bad_specs():
     with mock.patch.dict(
         os.environ, {**GATE_ENV, "TPU_MLA_FUSED_SMALL_A2A_4CHIP_BUCKETS": "1"}
     ):
-        # Cached keyed on env + shape args: repeated calls return same instance.
         c1 = ai.resolve_fused_small_a2a_config(num_q_heads=64, dcp_size=8)
         c2 = ai.resolve_fused_small_a2a_config(num_q_heads=64, dcp_size=8)
-        assert c1 is c2
+        assert c1 == c2
 
         # When num_q_heads or dcp_size is unknown (None), skip tl check cleanly.
         assert ai.resolve_fused_small_a2a_config().send_max_tokens == 16
@@ -435,6 +434,51 @@ def test_4chip_buckets_rejects_tl_above_128_and_bad_specs():
             ai.resolve_fused_small_a2a_config(num_q_heads=64, dcp_size=8)
 
 
+def test_resolve_config_dynamo_no_lru_cache_warning():
+    import logging
+    import types
+
+    import torch
+
+    from vllm_torchtpu.layers.core import attention_interface as ai
+
+    assert not hasattr(ai.resolve_fused_small_a2a_config, "cache_info")
+    records: list[str] = []
+
+    class _Handler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record.getMessage())
+
+    dynamo_logger = logging.getLogger("torch._dynamo")
+    handler = _Handler()
+    dynamo_logger.addHandler(handler)
+    fake_grp = types.SimpleNamespace(world_size=8)
+    try:
+        for val, expected in (("", 0.0), ("1", 16.0)):
+            torch._dynamo.reset()
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {**GATE_ENV, "TPU_MLA_FUSED_SMALL_A2A_4CHIP_BUCKETS": val},
+                ),
+                mock.patch.object(cp_mla, "get_dcp_group", lambda grp=fake_grp: grp),
+            ):
+
+                @torch.compile(backend="eager", fullgraph=True)
+                def traced(x: torch.Tensor) -> torch.Tensor:
+                    cfg = ai.resolve_fused_small_a2a_config(64, 8, fused_bucket=True)
+                    applies = cp_mla.send_small_a2a_applies(16, num_q_heads=64)
+                    return x + (cfg.send_max_tokens if applies else 0)
+
+                out = traced(torch.zeros(2))
+                assert out.tolist() == [expected, expected]
+    finally:
+        dynamo_logger.removeHandler(handler)
+        torch._dynamo.reset()
+
+    assert not [m for m in records if "lru_cache" in m], records
+
+
 def test_cpu8_step16_chunk_requires_capped_row_widths(_cpu8_worker_run: bool):
     if not _cpu8_worker_run:
         return
@@ -503,7 +547,8 @@ def _cpu8_worker_run(request: pytest.FixtureRequest) -> bool:
     targets = [
         f"{__file__}::{item.nodeid.split('::', 1)[1]}"
         for item in request.session.items
-        if item.path == request.path and "_cpu8_worker_run" in item.fixturenames
+        if item.path == request.path
+        and "_cpu8_worker_run" in getattr(item, "fixturenames", ())
     ]
     assert targets
     flags = re.sub(
@@ -518,11 +563,17 @@ def _cpu8_worker_run(request: pytest.FixtureRequest) -> bool:
     )
     env[_CPU8_WORKER_ENV] = "1"
     cache_dir = str(request.config.getini("cache_dir"))
+    plugin_args = [
+        arg
+        for plugin in (getattr(request.config.option, "plugins", None) or ())
+        for arg in ("-p", str(plugin))
+    ]
     proc = subprocess.run(
         [
             sys.executable,
             "-m",
             "pytest",
+            *plugin_args,
             "-o",
             "addopts=",
             "-o",

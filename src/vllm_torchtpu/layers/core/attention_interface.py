@@ -1172,22 +1172,27 @@ def _parse_bucket_pin_and_mib(
     return pin, vmem_mib
 
 
-@functools.lru_cache(maxsize=64)
-def _resolve_fused_small_a2a_config_cached(
-    raw_4chip: str,
-    raw_buckets: str,
-    send_max: int,
-    merge_max: int,
-    mtp_merge_max: int,
-    raw_levers: str,
-    default_vmem_mib: int,
-    num_q_heads: int | None,
-    dcp_size: int | None,
-    fused_bucket: bool,
+def resolve_fused_small_a2a_config(
+    num_q_heads: int | None = None,
+    dcp_size: int | None = None,
+    *,
+    fused_bucket: bool = True,
 ) -> FusedSmallA2AConfig:
-    bucket_spec = raw_buckets.strip()
-    levers = _decode_body_levers(raw_levers)
-    raw = raw_4chip.strip()
+    """Resolve effective fused small-all-to-all caps, bucket spec and decode levers.
+
+    When `TPU_MLA_FUSED_SMALL_A2A_4CHIP_BUCKETS` is unset / `"0"` / `"off"`,
+    returns the existing defaults unchanged. When set (`"1"` expands to
+    `FUSED_SMALL_A2A_4CHIP_DEFAULT_BUCKETS`, or an explicit `T=<pins>@<MiB>`
+    list), raises the effective caps to `max(buckets)` and, whenever both
+    `num_q_heads` and `dcp_size` are known, validates every bucket's
+    `tl = T * (num_q_heads // dcp_size) <= 128`.
+    """
+    bucket_spec = (envs.TPU_MLA_FUSED_SMALL_A2A_BUCKETS or "").strip()
+    levers = _decode_body_levers(envs.TPU_MLA_DECODE_BODY_LEVERS or "")
+    send_max = int(envs.TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS)
+    merge_max = int(envs.TPU_MLA_FUSED_SMALL_A2A_MERGE_MAX_TOKENS)
+    mtp_merge_max = int(envs.TPU_MTP_DCP_MERGE_SMALL_A2A_MAX_TOKENS)
+    raw = (envs.TPU_MLA_FUSED_SMALL_A2A_4CHIP_BUCKETS or "").strip()
     if raw.lower() in ("", "0", "off", "false"):
         return FusedSmallA2AConfig(
             bucket_spec=bucket_spec,
@@ -1216,9 +1221,13 @@ def _resolve_fused_small_a2a_config_cached(
                 )
             send_per = num_q_heads // dcp_size
 
+    default_vmem_mib = int(envs.TPU_MLA_FUSED_SMALL_A2A_VMEM_MIB)
     spec = FUSED_SMALL_A2A_4CHIP_DEFAULT_BUCKETS if raw == "1" else raw
     buckets: list[int] = []
-    for entry in filter(None, (e.strip() for e in spec.split(","))):
+    for raw_entry in spec.split(","):
+        entry = raw_entry.strip()
+        if not entry:
+            continue
         tok_s, eq, rest = entry.partition("=")
         if not eq:
             raise ValueError(
@@ -1260,7 +1269,7 @@ def _resolve_fused_small_a2a_config_cached(
 
     opt_max = max(buckets)
     if (
-        fused_bucket
+        bool(fused_bucket)
         and opt_max > sparse_mla_kernel.DECODE_STEP8_TOKENS
         and "step8" in levers
         and "step16" not in levers
@@ -1272,35 +1281,6 @@ def _resolve_fused_small_a2a_config_cached(
         merge_max_tokens=max(merge_max, opt_max),
         mtp_merge_max_tokens=max(mtp_merge_max, opt_max),
         decode_levers=levers,
-    )
-
-
-def resolve_fused_small_a2a_config(
-    num_q_heads: int | None = None,
-    dcp_size: int | None = None,
-    *,
-    fused_bucket: bool = True,
-) -> FusedSmallA2AConfig:
-    """Resolve effective fused small-all-to-all caps, bucket spec and decode levers.
-
-    When `TPU_MLA_FUSED_SMALL_A2A_4CHIP_BUCKETS` is unset / `"0"` / `"off"`,
-    returns the existing defaults unchanged. When set (`"1"` expands to
-    `FUSED_SMALL_A2A_4CHIP_DEFAULT_BUCKETS`, or an explicit `T=<pins>@<MiB>`
-    list), raises the effective caps to `max(buckets)` and, whenever both
-    `num_q_heads` and `dcp_size` are known, validates every bucket's
-    `tl = T * (num_q_heads // dcp_size) <= 128`.
-    """
-    return _resolve_fused_small_a2a_config_cached(
-        envs.TPU_MLA_FUSED_SMALL_A2A_4CHIP_BUCKETS or "",
-        envs.TPU_MLA_FUSED_SMALL_A2A_BUCKETS or "",
-        int(envs.TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS),
-        int(envs.TPU_MLA_FUSED_SMALL_A2A_MERGE_MAX_TOKENS),
-        int(envs.TPU_MTP_DCP_MERGE_SMALL_A2A_MAX_TOKENS),
-        envs.TPU_MLA_DECODE_BODY_LEVERS or "",
-        int(envs.TPU_MLA_FUSED_SMALL_A2A_VMEM_MIB),
-        num_q_heads,
-        dcp_size,
-        bool(fused_bucket),
     )
 
 
