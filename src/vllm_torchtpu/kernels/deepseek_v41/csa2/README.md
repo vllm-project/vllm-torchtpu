@@ -2,7 +2,7 @@
 
 `csa2.py:csa2` is the single attention entry point for decode and both prefill
 stages. Callers supply request starts `[B+1]`, per-token positions `[T]`, packed
-main KV, FP32 scales, native BF16 SWA pages and visibility metadata directly.
+main KV, FP32 scales, SWA word-row pages and visibility metadata directly.
 There are no decode adapters, query-compaction passes or output-reordering passes.
 
 Encoder/decoder identify the first and last 20 layers of the 40-layer DSV41

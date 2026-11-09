@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Measure SWA publication plus CSA2 attention with native or baseline word pages."""
+"""Measure SWA publication plus CSA2 attention on the shared INT32 word pool."""
 
 import argparse
 import functools
@@ -16,11 +16,11 @@ from vllm_torchtpu.kernels.deepseek_v41.csa2.cache import (
     prepare_swa_metadata,
 )
 from vllm_torchtpu.kernels.deepseek_v41.csa2.csa2 import csa2
+from vllm_torchtpu.kernels.mla.paged_swa import swa_word_pages, write_swa_word_pool
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--layout", choices=("native", "word"), required=True)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--tokens", type=int, nargs="+", default=[1, 8, 128, 1024])
     parser.add_argument("--mode", choices=("decode", "prefill"), default="prefill")
@@ -33,22 +33,8 @@ def main() -> None:
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     page_size, heads = args.page_size, 64
-    if args.layout == "native":
-        from vllm_torchtpu.kernels.mla.paged_swa import write_swa_pages
-
-        publish = write_swa_pages
-
-        def view(x):
-            return x
-    else:
-        # Run this mode against the baseline checkout, before the migration.
-        from vllm_torchtpu.kernels.mla.paged_swa import (
-            swa_word_pages,
-            write_swa_word_pool,
-        )
-
-        publish = functools.partial(write_swa_word_pool, page_size=page_size)
-        view = functools.partial(swa_word_pages, page_size=page_size)
+    publish = functools.partial(write_swa_word_pool, page_size=page_size)
+    view = functools.partial(swa_word_pages, page_size=page_size)
     results = []
     for tokens in args.tokens:
         requests = tokens if args.mode == "decode" else 1
@@ -82,14 +68,11 @@ def main() -> None:
         pages = jnp.zeros((args.pages, page_size, 512), jnp.bfloat16)
         history = random((requests * columns, page_size, 512))
         pages = pages.at[1 : requests * columns + 1].set(history)
-        if args.layout == "word":
-            bits = jax.lax.bitcast_convert_type(pages, jnp.uint16).astype(jnp.uint32)
-            bits = bits.reshape(args.pages, page_size, 2, 2, 128)
-            packed = bits[:, :, :, 0] | (bits[:, :, :, 1] << 16)
-            pages = jax.lax.bitcast_convert_type(packed, jnp.int32).transpose(
-                0, 2, 1, 3
-            )
-            pages = pages.reshape(-1, 128)
+        bits = jax.lax.bitcast_convert_type(pages, jnp.uint16).astype(jnp.uint32)
+        bits = bits.reshape(args.pages, page_size, 2, 2, 128)
+        packed = bits[:, :, :, 0] | (bits[:, :, :, 1] << 16)
+        pages = jax.lax.bitcast_convert_type(packed, jnp.int32).transpose(0, 2, 1, 3)
+        pages = pages.reshape(-1, 128)
         words, scales = encode_csa2_kv(random((512, 512)))
         words = jnp.broadcast_to(words, (tokens, *words.shape))
         scales = jnp.broadcast_to(scales, (tokens, *scales.shape))
@@ -144,7 +127,7 @@ def main() -> None:
             records,
         )
         compiled = jax.jit(step, donate_argnums=(0,)).lower(pages, *arrays).compile()
-        label = f"{args.mode}-{tokens}-{args.layout}"
+        label = f"{args.mode}-{tokens}"
         (args.out / f"{label}.hlo").write_text(compiled.as_text())
         for _ in range(5):
             pages, output = compiled(pages, *arrays)
@@ -161,7 +144,6 @@ def main() -> None:
                 jax.block_until_ready((pages, output))
         np.save(args.out / f"{label}.npy", np.asarray(output, np.float32))
         result = dict(
-            layout=args.layout,
             mode=args.mode,
             tokens=tokens,
             page_size=page_size,
