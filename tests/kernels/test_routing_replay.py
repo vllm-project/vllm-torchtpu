@@ -93,6 +93,29 @@ def test_deterministic_and_salted_by_dp_rank(capture):
     assert not torch.equal(a, d)
 
 
+def test_dp_salt_counts_redundant_slots(capture, monkeypatch):
+    """With a redundant slot per rank, rank r's slots start at r * 17: the TP
+    ranks of an engine still route alike, and as without redundant slots."""
+    from vllm_torchtpu.layers.adapter import expert_placement
+
+    path, _ = capture
+    replay = RoutingReplay(path)
+    torch.manual_seed(2)
+    logits = torch.randn(48, EXPERTS)
+    hidden = torch.zeros(48, 8)
+    name = "model.layers.0.mlp.experts"
+    monkeypatch.setattr(expert_placement, "_PLACEMENT", {name: np.arange(EXPERTS)})
+    for engine in (0, 2, 5):
+        monkeypatch.setattr(expert_placement, "_REDUNDANT_PER_RANK", 0)
+        start = engine * 4 * 16
+        _, want = replay.route(_layer(0, start), hidden, logits, TOPK, tp_size=4)
+        monkeypatch.setattr(expert_placement, "_REDUNDANT_PER_RANK", 1)
+        for tp_rank in range(4):
+            start = (engine * 4 + tp_rank) * 17
+            _, got = replay.route(_layer(0, start), hidden, logits, TOPK, tp_size=4)
+            assert torch.equal(got, want), (engine, tp_rank)
+
+
 def test_top_k_mismatch_raises(capture):
     path, _ = capture
     with pytest.raises(ValueError, match="top-10"):

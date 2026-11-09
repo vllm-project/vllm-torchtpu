@@ -22,6 +22,8 @@ import re
 import numpy as np
 import torch
 
+from vllm_torchtpu.layers.adapter import expert_placement
+
 _LAYER = re.compile(r"layers\.(\d+)\.")
 
 
@@ -80,7 +82,9 @@ class RoutingReplay:
         experts_start = getattr(layer, "_experts_start", None)
         salt = 0
         if experts_start is not None:
+            # Expert slots per rank, redundant ones included.
             local = layer.global_num_experts // layer.moe_config.ep_size
+            local += expert_placement.redundant_slots_per_rank(layer)
             salt = torch.div(experts_start, local * tp_size, rounding_mode="floor")
         window = torch.remainder(group_hash + group * 37 + salt * 101, windows)
         pick = window * positions + row % positions
