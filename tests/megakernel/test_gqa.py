@@ -22,6 +22,7 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 from jax import lax
 from jax.experimental import pallas as pl
@@ -38,7 +39,16 @@ from vllm_torchtpu.megakernel.exec_spec import ExecSpec
 from vllm_torchtpu.megakernel.modules.gqa import GQAModule
 from vllm_torchtpu.megakernel.modules.gqa.context import GQAEmit
 from vllm_torchtpu.megakernel.modules.gqa.merge import split_merge
-from vllm_torchtpu.megakernel.ops import BF16, F32, I32, round_bf16, round_up
+from vllm_torchtpu.megakernel.modules.gqa.new_token import att_new
+from vllm_torchtpu.megakernel.ops import (
+    BF16,
+    F32,
+    FP8,
+    I32,
+    rmsnorm,
+    round_bf16,
+    round_up,
+)
 from vllm_torchtpu.megakernel.spec import LayerType, ModelSpec
 
 _TINY_GQA_TILES = TINY_TILES.with_modules({"gqa": {"kv_blk": 256, "nkv": 3}})
@@ -212,6 +222,7 @@ def test_gqa_module_declarations_and_emit_in_pallas_interpret(fake_ex: ExecSpec)
         ctx.apply_input_norm(gqa.input_norm, jnp.int32(0))
         part_att = gqa.emit(ctx, jnp.int32(0), jnp.int32(0))
         scr["res"][...] = scr["res"][...] + part_att.astype(F32)
+        gqa.epilogue(ctx)
         out_refs["hidden"][: ex.MB] = scr["res"][...].astype(BF16)
         if ex.MB < ex.M:
             out_refs["hidden"][ex.MB :] = jnp.zeros((ex.M - ex.MB, g.H), BF16)
@@ -238,10 +249,48 @@ def test_gqa_module_declarations_and_emit_in_pallas_interpret(fake_ex: ExecSpec)
         interpret=pltpu.InterpretParams(),
     )
 
+    keys = jax.random.split(jax.random.PRNGKey(41), 9)
     pos = jnp.array([4, 8, 12, 16], dtype=I32)
-    hid = jnp.ones((ex.M, g.H), dtype=BF16) * 0.1
-    w_args = [jnp.zeros(wsh[k][0], dtype=wsh[k][1]) for k in p.w_names]
-    s_args = [jnp.zeros(ssh[k][0], dtype=ssh[k][1]) for k in p.s_names]
+    hid = jax.random.normal(keys[0], (ex.M, g.H), dtype=BF16) * 0.6
+    w_by_name = {k: jnp.zeros(wsh[k][0], dtype=wsh[k][1]) for k in p.w_names}
+    w_att_in = (jax.random.normal(keys[1], wsh["att_in"][0], dtype=BF16) * 0.4).astype(
+        FP8
+    )
+    w_att_out = (
+        jax.random.normal(keys[2], wsh["att_out"][0], dtype=BF16) * 0.5
+    ).astype(FP8)
+    w_by_name["att_in"] = w_att_in
+    w_by_name["att_out"] = w_att_out
+
+    lay = p.smalls_layout
+    in_norm_w = jax.random.normal(keys[3], (1, g.H), dtype=F32) * 0.2 + 0.1
+    in_s = jax.random.uniform(
+        keys[4], (1, lay["in_s"][1]), dtype=F32, minval=0.3, maxval=0.8
+    )
+    out_s = jax.random.uniform(
+        keys[5], (1, lay["out_s"][1]), dtype=F32, minval=0.3, maxval=0.8
+    )
+    qn = jax.random.normal(keys[6], (1, g.HD), dtype=F32) * 0.2 + 1.0
+    kn = jax.random.normal(keys[7], (1, g.HD), dtype=F32) * 0.2 + 1.0
+    sm = jnp.zeros(wsh["smalls"][0], dtype=F32)
+    for fname, val in (
+        ("in_norm", in_norm_w),
+        ("in_s", in_s),
+        ("out_s", out_s),
+        ("qn", qn),
+        ("kn", kn),
+    ):
+        o_sm, w_sm = lay[fname]
+        sm = sm.at[:, 0, o_sm : o_sm + w_sm].set(val)
+    w_by_name["smalls"] = sm
+
+    k_kc, k_vc = jax.random.split(keys[8], 2)
+    kc_in = jax.random.normal(k_kc, ssh["kc"][0], dtype=BF16) * 0.6
+    vc_in = jax.random.normal(k_vc, ssh["vc"][0], dtype=BF16) * 0.6 + jnp.asarray(
+        0.5, dtype=BF16
+    )
+    w_args = [w_by_name[k] for k in p.w_names]
+    s_args = [kc_in, vc_in]
     outs = jax.jit(call)(pos, hid, *w_args, *s_args)
     hid_out, knew_out, vnew_out = outs
     assert hid_out.shape == (ex.M, g.H)
@@ -249,21 +298,68 @@ def test_gqa_module_declarations_and_emit_in_pallas_interpret(fake_ex: ExecSpec)
     assert knew_out.shape == osh["knew"][0]
     assert vnew_out.shape == osh["vnew"][0]
 
-    # Verify host_update_states scatters knew/vnew into kc/vc
+    # Compare emitted attention delta and updated KV cache against `gqa.reference`.
+    x_norm = rmsnorm(
+        hid[: ex.B].astype(F32), in_norm_w[0], g.eps, zero_centered=g.zero_centered_norm
+    )
+    ref_params = {
+        "att_in": w_att_in.reshape(1, 1, g.H, -1),
+        "att_out": w_att_out.reshape(1, 1, -1, g.H),
+        "in_s": in_s,
+        "out_s": out_s,
+        "qn": qn,
+        "kn": kn,
+    }
+    ref_delta, ref_st = gqa.reference(
+        ref_params,
+        x_norm,
+        {"kc": kc_in[None], "vc": vc_in[None]},
+        g=g,
+        ex=ex,
+        pos=pos,
+        paged_kv=False,
+    )
+    actual_delta = hid_out[: ex.B].astype(F32) - hid[: ex.B].astype(F32)
+    ref_delta_f32 = np.asarray(ref_delta.astype(F32))
+    assert float(np.max(np.abs(ref_delta_f32))) >= 0.2
+    np.testing.assert_allclose(
+        np.asarray(actual_delta), ref_delta_f32, rtol=2e-2, atol=2e-2
+    )
+    with pytest.raises(AssertionError):
+        np.testing.assert_allclose(
+            np.asarray(actual_delta),
+            np.zeros_like(ref_delta_f32),
+            rtol=2e-2,
+            atol=2e-2,
+        )
+
+    # Verify host_update_states scatters knew/vnew into kc/vc and matches reference.
     updated = gqa.host_update_states(
         g,
         ex,
         pos,
-        {"kc": s_args[0], "vc": s_args[1]},
+        {"kc": kc_in, "vc": vc_in},
         {"knew": knew_out, "vnew": vnew_out},
     )
     assert updated["kc"].shape == ssh["kc"][0]
     assert updated["vc"].shape == ssh["vc"][0]
+    np.testing.assert_allclose(
+        np.asarray(updated["kc"].astype(F32)),
+        np.asarray(ref_st["kc"][0].astype(F32)),
+        rtol=1e-2,
+        atol=1e-2,
+    )
+    np.testing.assert_allclose(
+        np.asarray(updated["vc"].astype(F32)),
+        np.asarray(ref_st["vc"][0].astype(F32)),
+        rtol=1e-2,
+        atol=1e-2,
+    )
 
 
 @pytest.mark.parametrize("expect_gq", [True, False])
 def test_gqa_split_merge_gq_and_slab_in_pallas_interpret(expect_gq: bool):
-    """Verify `split_merge` (`gq_merge_start` and `slab_merge_start`) in Pallas."""
+    """Verify `split_merge` (`gq_merge_start` / `slab_merge_start`) + `att_new`."""
     tiles = dataclasses.replace(_TINY_GQA_TILES, bank=512 << 10).with_modules(
         {"gqa": {"gqa_qv": expect_gq, "gq_pack": expect_gq}}
     )
@@ -297,10 +393,12 @@ def test_gqa_split_merge_gq_and_slab_in_pallas_interpret(expect_gq: bool):
         al_in_ref,
         aacc_in_ref,
         gate_in_ref,
+        pri_out_ref,
         am_out_ref,
         al_out_ref,
         aacc_out_ref,
         gate_out_ref,
+        mix_out_ref,
         *scr_refs,
     ):
         scr = dict(zip(s_names, scr_refs))
@@ -308,6 +406,10 @@ def test_gqa_split_merge_gq_and_slab_in_pallas_interpret(expect_gq: bool):
         scr["al"][...] = al_in_ref[...]
         scr["aacc"][...] = aacc_in_ref[...]
         scr["gate"][...] = gate_in_ref[...]
+        scr["knew"][...] = jnp.zeros(scr["knew"].shape, scr["knew"].dtype)
+        scr["vnew"][...] = jnp.zeros(scr["vnew"].shape, scr["vnew"].dtype)
+        scr["mix"][...] = jnp.zeros(scr["mix"].shape, F32)
+        scr["qg"][...] = jnp.zeros(scr["qg"].shape, F32)
         if not ap.GQ:
             scr["pso"][...] = jnp.zeros(scr["pso"].shape, F32)
 
@@ -342,37 +444,173 @@ def test_gqa_split_merge_gq_and_slab_in_pallas_interpret(expect_gq: bool):
         )
         cx = GQAEmit.build(ctx, ap, jnp.int32(0), gqa.name)
         split_merge(cx)
+        pri_out_ref[...] = scr["pri"][...]
         am_out_ref[...] = scr["am"][...]
         al_out_ref[...] = scr["al"][...]
         aacc_out_ref[...] = scr["aacc"][...]
         gate_out_ref[...] = scr["gate"][...]
+        att_new(cx)
+        mix_out_ref[...] = scr["mix"][:, : ap.nh * ap.HD]
 
+    pri_sh = scratch["pri"].shape
     am_sh = scratch["am"].shape
     al_sh = scratch["al"].shape
     aacc_sh = scratch["aacc"].shape
     gate_sh = scratch["gate"].shape
+    mix_sh = (ex.MB, ap.nh * ap.HD)
     call = pl.pallas_call(
         body,
         out_shape=[
+            jax.ShapeDtypeStruct(pri_sh, F32),
             jax.ShapeDtypeStruct(am_sh, F32),
             jax.ShapeDtypeStruct(al_sh, F32),
             jax.ShapeDtypeStruct(aacc_sh, F32),
             jax.ShapeDtypeStruct(gate_sh, F32),
+            jax.ShapeDtypeStruct(mix_sh, F32),
         ],
         in_specs=[pl.BlockSpec(memory_space=pltpu.VMEM)] * 4,
-        out_specs=[pl.BlockSpec(memory_space=pltpu.VMEM)] * 4,
+        out_specs=[pl.BlockSpec(memory_space=pltpu.VMEM)] * 6,
         scratch_shapes=[scratch[k] for k in s_names],
         interpret=pltpu.InterpretParams(),
     )
-    am_in = jnp.ones(am_sh, dtype=F32) * 0.5
-    al_in = jnp.ones(al_sh, dtype=F32) * 2.0
-    aacc_in = jnp.ones(aacc_sh, dtype=F32) * 1.25
-    gate_in = jnp.zeros(gate_sh, dtype=F32)
-    am_out, al_out, aacc_out, gate_out = jax.jit(call)(am_in, al_in, aacc_in, gate_in)
-    assert jnp.allclose(gate_out[: ex.B], round_bf16(jax.nn.sigmoid(gate_in[: ex.B])))
-    if not expect_gq:
-        assert jnp.allclose(am_out[:, : ap.nh], 0.5)
-        assert jnp.allclose(al_out[:, : ap.nh], 4.0)
-        assert jnp.allclose(aacc_out[:, : ap.nh], 2.5)
+
+    # Build distinct (m, l, acc) per sequence, peer group (0 vs 1), token, and head.
+    NS, T, G, nh, HD = ex.NS, ex.T, ap.G, ap.nh, ap.HD
+    QG, QR, MLW = ap.QG, ap.QR, ap.MLW
+    sq_idx = np.arange(NS, dtype=np.float32)[:, None, None, None]
+    g_idx = np.arange(G, dtype=np.float32)[None, :, None, None]
+    t_idx = np.arange(T, dtype=np.float32)[None, None, :, None]
+    h_idx = np.arange(nh, dtype=np.float32)[None, None, None, :]
+    col_idx = np.arange(HD, dtype=np.float32)[None, None, None, None, :]
+
+    # Positive `m` (> 0) with a nontrivial gap between group 0 and group 1 so
+    # `exp(m0 - m)` and `exp(m1 - m)` are both strictly inside (0, 1) across rows.
+    m_logical = (
+        1.2
+        + 0.35 * sq_idx
+        + (0.9 - 0.55 * h_idx) * (2.0 * g_idx - 1.0)
+        + 0.15 * t_idx
+        + 0.08 * h_idx
+    )
+    l_logical = 1.5 + 0.4 * sq_idx + 0.7 * g_idx + 0.2 * t_idx + 0.1 * h_idx
+    acc_logical = (
+        (0.6 + 0.3 * sq_idx + 0.8 * g_idx - 0.12 * t_idx + 0.17 * h_idx)[..., None]
+        + 0.01 * np.sin(col_idx * 0.13 + (g_idx + 1.0)[..., None])
+    ).astype(np.float32)
+
+    if expect_gq:
+        am_rows = m_logical.reshape(NS, G * QG, 1)
+        al_rows = l_logical.reshape(NS, G * QG, 1)
+        aacc_rows = acc_logical.reshape(NS, G * QG, HD)
     else:
-        assert jnp.all(jnp.isfinite(aacc_out))
+        am_rows = np.swapaxes(m_logical, 1, 2).reshape(NS, T * QR, 1)
+        al_rows = np.swapaxes(l_logical, 1, 2).reshape(NS, T * QR, 1)
+        aacc_rows = np.swapaxes(acc_logical, 1, 2).reshape(NS, T * QR, HD)
+
+    am_in = jnp.broadcast_to(jnp.asarray(am_rows, dtype=F32), am_sh)
+    al_in = jnp.broadcast_to(jnp.asarray(al_rows, dtype=F32), al_sh)
+    aacc_in = jnp.asarray(aacc_rows, dtype=F32)
+    gate_in = jnp.linspace(-0.8, 0.9, gate_sh[0] * gate_sh[1], dtype=F32).reshape(
+        gate_sh
+    )
+
+    pri_out, am_out, al_out, aacc_out, gate_out, mix_out = jax.jit(call)(
+        am_in, al_in, aacc_in, gate_in
+    )
+    expected_gate = np.asarray(round_bf16(jax.nn.sigmoid(gate_in[: ex.B])), np.float32)
+    np.testing.assert_allclose(
+        np.asarray(gate_out[: ex.B]), expected_gate, rtol=1e-5, atol=1e-5
+    )
+
+    # Analytic NumPy LSE merge across groups g=0 and g=1: shape (NS, T, nh, ...).
+    m0, m1 = m_logical[:, 0], m_logical[:, 1]
+    l0, l1 = l_logical[:, 0], l_logical[:, 1]
+    acc0, acc1 = acc_logical[:, 0], acc_logical[:, 1]
+    m_merged = np.maximum(m0, m1)
+    r0 = np.exp(m0 - m_merged)
+    r1 = np.exp(m1 - m_merged)
+    l_merged = l0 * r0 + l1 * r1
+    acc_merged = acc0 * r0[..., None] + acc1 * r1[..., None]
+
+    if expect_gq:
+        # Check `gq_merge_start` packing into `pri[g, :NS]` and `pri[g, NS]`.
+        pri_np = np.asarray(pri_out)
+        for g_i in range(G):
+            for sq in range(NS):
+                np.testing.assert_allclose(
+                    pri_np[g_i, sq],
+                    acc_logical[sq, g_i].reshape(QG, HD),
+                    rtol=1e-6,
+                    atol=1e-6,
+                )
+                m_band = pri_np[g_i, NS, :, sq * MLW : (sq + 1) * MLW]
+                l_band = pri_np[g_i, NS, :, 128 + sq * MLW : 128 + (sq + 1) * MLW]
+                np.testing.assert_allclose(
+                    m_band,
+                    np.broadcast_to(m_logical[sq, g_i].reshape(QG, 1), (QG, MLW)),
+                    rtol=1e-6,
+                    atol=1e-6,
+                )
+                np.testing.assert_allclose(
+                    l_band,
+                    np.broadcast_to(l_logical[sq, g_i].reshape(QG, 1), (QG, MLW)),
+                    rtol=1e-6,
+                    atol=1e-6,
+                )
+    else:
+        for b in range(ex.B):
+            sq, tb = divmod(b, T)
+            q0 = tb * QR
+            np.testing.assert_allclose(
+                np.asarray(am_out[sq, q0 : q0 + nh, 0]),
+                m_merged[sq, tb],
+                rtol=1e-5,
+                atol=1e-5,
+            )
+            np.testing.assert_allclose(
+                np.asarray(al_out[sq, q0 : q0 + nh, 0]),
+                l_merged[sq, tb],
+                rtol=1e-5,
+                atol=1e-5,
+            )
+            np.testing.assert_allclose(
+                np.asarray(aacc_out[sq, q0 : q0 + nh]),
+                acc_merged[sq, tb],
+                rtol=1e-5,
+                atol=1e-5,
+            )
+
+    # Check post-`att_new` output (`mix_out`) against the analytic LSE merge +
+    # causal zero-score new-token steps (`t_tok + 1` steps with `s_j = 0 < m_merged`).
+    n_new = (np.arange(T, dtype=np.float32) + 1.0)[None, :, None]
+    l_final = l_merged + n_new * np.exp(-m_merged)
+    oh_ref = np.asarray(
+        round_bf16(jnp.asarray(acc_merged / l_final[..., None])), dtype=np.float32
+    ).reshape(ex.B, nh * HD)
+    mix_ref = np.asarray(
+        round_bf16(jnp.asarray(oh_ref * expected_gate)), dtype=np.float32
+    )
+    np.testing.assert_allclose(
+        np.asarray(mix_out[: ex.B]), mix_ref, rtol=1e-2, atol=1e-2
+    )
+
+    # Negative controls: wrong peer index (merging group 0 with itself) and
+    # inverted LSE rescale (`exp(m - m_g)`) must both fail.
+    l_wrong_peer = 2.0 * l0 + n_new * np.exp(-m0)
+    mix_wrong_peer = ((2.0 * acc0) / l_wrong_peer[..., None]).reshape(
+        ex.B, nh * HD
+    ) * expected_gate
+    with pytest.raises(AssertionError):
+        np.testing.assert_allclose(
+            np.asarray(mix_out[: ex.B]), mix_wrong_peer, rtol=1e-2, atol=1e-2
+        )
+
+    r0_inv = np.exp(m_merged - m0)
+    r1_inv = np.exp(m_merged - m1)
+    l_inv = l0 * r0_inv + l1 * r1_inv + n_new * np.exp(-m_merged)
+    acc_inv = acc0 * r0_inv[..., None] + acc1 * r1_inv[..., None]
+    mix_inv = (acc_inv / l_inv[..., None]).reshape(ex.B, nh * HD) * expected_gate
+    with pytest.raises(AssertionError):
+        np.testing.assert_allclose(
+            np.asarray(mix_out[: ex.B]), mix_inv, rtol=1e-2, atol=1e-2
+        )
