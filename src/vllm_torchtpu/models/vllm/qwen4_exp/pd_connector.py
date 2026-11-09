@@ -45,6 +45,7 @@ from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (
     SendMeta,
     TPURaidenConnector,
     TPURaidenConnectorWorker,
+    _prefix_aware_load_enabled,
     _resolved_reshard_controller_address,
     _Stage3LoadMeta,
     _Stage3TransferGroup,
@@ -77,6 +78,22 @@ class Qwen4ExpRaidenConnector(TPURaidenConnector):
         ):
             raise ValueError("Qwen PD cannot use another model's pool admission")
         super().__init__(vllm_config, role, kv_cache_config)
+        if (
+            vllm_config.cache_config.enable_prefix_caching
+            and vllm_config.kv_transfer_config.is_kv_consumer
+            and not _prefix_aware_load_enabled()
+        ):
+            raise ValueError("Qwen APC+PD requires enabled Stage-3 prefix-aware loads")
+        alignment = kv_cache_config.cache_hit_alignment_tokens
+        if vllm_config.cache_config.enable_prefix_caching and (
+            alignment is None
+            or any(
+                alignment % group.page_tokens
+                for group in self._stage3_transfer_groups
+                if not group.request_state
+            )
+        ):
+            raise ValueError("Qwen whole-page PD needs token-page-aligned APC hits")
 
     @staticmethod
     def _build_stage3_transfer_groups(
@@ -87,6 +104,7 @@ class Qwen4ExpRaidenConnector(TPURaidenConnector):
                 cache_group_index=group.group_index,
                 page_tokens=group.block_size,
                 request_state=group.extent is TransferExtent.REQUEST_STATE,
+                checkpointed=group.checkpointed,
             )
             for group in build_transfer_groups(config.kv_cache_groups)
         )
@@ -101,6 +119,7 @@ class Qwen4ExpRaidenConnector(TPURaidenConnector):
 
     @property
     def supports_divergent_local_hybrid_hits(self) -> bool:
+        # A no-load decision must have a checkpoint in every cacheable group.
         return False
 
 
@@ -166,7 +185,9 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
         engine = self._construct_raiden_transfer_engine(
             list(manifest.storages), num_slots=1
         )
-        summary = dict(engine.register_pools(manifest.pool_dicts()))
+        summary = self._register_raiden_pools(
+            engine, manifest, cache.native_config.kv_cache_groups
+        )
         summary["stage3_registration"] = self._register_raiden_stage3_work_unit(
             engine=engine, manifest=manifest, controller_address=address
         )
@@ -190,6 +211,7 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
                 )
             elif isinstance(spec, AttentionSpec):
                 cache_specs[name] = dict(
+                    block_size=spec.block_size,
                     num_kv_heads=spec.num_kv_heads,
                     head_size=spec.head_size,
                     dtype=str(spec.dtype),
@@ -297,6 +319,32 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
             raise ValueError("Qwen PD requires matching TP rank ownership")
         return self._qwen_page_plan
 
+    def _raiden_staging_blocks_per_pool(
+        self, manifest: PoolManifest, kv_cache_groups: Any
+    ) -> list[int]:
+        plan = self._page_plan()
+        if manifest is not plan.manifest or plan.groups != build_transfer_groups(
+            kv_cache_groups
+        ):
+            raise ValueError("Qwen staging must use its admitted cache-group plan")
+        # Aliases share a group's IDs; different groups on one storage may
+        # transfer disjoint IDs and need their union under the same lease.
+        pairs = plan.pool_groups()
+        groups_by_storage: dict[int, set[int]] = {}
+        for pool, group_index in pairs:
+            groups_by_storage.setdefault(pool.storage_index, set()).add(group_index)
+        max_tokens = self.vllm_config.model_config.max_model_len
+        return [
+            min(
+                pool.num_blocks,
+                sum(
+                    plan.groups[index].page_count(max_tokens)
+                    for index in groups_by_storage[pool.storage_index]
+                ),
+            )
+            for pool, _ in pairs
+        ]
+
     def _stage3_grouped_spans(
         self, req_meta: SendMeta, num_tokens: int
     ) -> tuple[tuple[tuple[int, ...], ...], list[PoolSpanRegistration]]:
@@ -312,6 +360,7 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
         spans = []
         for pool, group_index in plan.pool_groups():
             ids = pages[group_index]
+            token_pages = plan.groups[group_index].extent is TransferExtent.TOKEN_PAGES
             spans.append(
                 PoolSpanRegistration(
                     tag=pool.tag,
@@ -320,14 +369,17 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
                         PoolByteSpan(
                             src_block_ordinal=index,
                             src_offset_bytes=0,
-                            dst_block_index=index,
-                            dst_offset_bytes=0,
+                            dst_block_index=0,
+                            dst_offset_bytes=index * pool.block_stride_bytes
+                            if token_pages
+                            else 0,
                             size_bytes=pool.block_stride_bytes,
                             dst_unit_ordinal=self.tp_rank,
                         )
                         for index in range(len(ids))
                     ),
                     declared_bytes=len(ids) * pool.block_stride_bytes,
+                    dst_space_version=int(token_pages),
                 )
             )
         return pages, spans
@@ -336,10 +388,8 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
         self, req_meta: _Stage3LoadMeta, num_tokens: int
     ) -> tuple[list[str], list[int], list[int]]:
         plan = self._page_plan()
-        if req_meta.skip_tokens:
-            raise ValueError(
-                "Qwen whole-page state transfer needs a full committed prefix"
-            )
+        if not 0 <= req_meta.skip_tokens < num_tokens:
+            raise ValueError("Qwen receive requires a nonempty suffix extent")
         if req_meta.src_parallelism != self.tp_size:
             raise ValueError(
                 "Qwen whole-page ordinal routing has no shard conversion: "
@@ -352,10 +402,30 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
         tags, blocks, counts = [], [], []
         for pool, group_index in plan.pool_groups():
             ids = pages[group_index]
+            group = plan.groups[group_index]
+            if group.extent is TransferExtent.TOKEN_PAGES:
+                if req_meta.skip_tokens % group.block_size:
+                    raise ValueError("Qwen suffix must begin at a native token page")
+                ids = ids[req_meta.skip_tokens // group.block_size :]
             tags.append(pool.tag)
             blocks.extend(ids)
             counts.append(len(ids))
         return tags, blocks, counts
+
+    def _stage3_grouped_skip_bytes(self, req_meta: _Stage3LoadMeta) -> list[int]:
+        plan = self._page_plan()
+        clips = []
+        for pool, group_index in plan.pool_groups():
+            group = plan.groups[group_index]
+            if group.extent is TransferExtent.TOKEN_PAGES:
+                if req_meta.skip_tokens % group.block_size:
+                    raise ValueError("Qwen suffix must begin at a native token page")
+                clips.append(
+                    req_meta.skip_tokens // group.block_size * pool.block_stride_bytes
+                )
+            else:
+                clips.append(0)
+        return clips
 
 
 @dataclass(frozen=True)

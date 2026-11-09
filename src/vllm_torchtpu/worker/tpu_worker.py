@@ -847,6 +847,31 @@ class TPUWorker(WorkerBase):
     def get_kv_cache_spec(self):
         return self.model_runner.get_kv_cache_spec()
 
+    def get_kv_cache_plan(self) -> dict[str, Any]:
+        """Return initialized allocator geometry through the existing dev RPC."""
+        config = self.model_runner.kv_cache_config
+        return dict(
+            worker_rank=self.rank,
+            dp_rank=self.parallel_config.data_parallel_rank,
+            dp_size=self.parallel_config.data_parallel_size,
+            tp_rank=get_tensor_model_parallel_rank(),
+            tp_size=self.parallel_config.tensor_parallel_size,
+            prefix_caching=self.cache_config.enable_prefix_caching,
+            mamba_cache_mode=self.cache_config.mamba_cache_mode,
+            hash_block_size=config.hash_block_size,
+            cache_hit_alignment_tokens=config.cache_hit_alignment_tokens,
+            num_blocks=config.num_blocks,
+            max_model_len=self.model_runner.max_model_len,
+            groups=[
+                dict(
+                    layer_names=list(group.layer_names),
+                    block_tokens=group.kv_cache_spec.block_size,
+                    prefix_cacheable=group.kv_cache_spec.prefix_cacheable,
+                )
+                for group in config.kv_cache_groups
+            ],
+        )
+
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.model_runner.add_lora(lora_request)
 

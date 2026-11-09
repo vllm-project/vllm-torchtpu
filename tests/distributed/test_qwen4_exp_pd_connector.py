@@ -104,12 +104,15 @@ def test_constructor_routes_every_group_without_checkpoint_tag_shortcut(
 
 
 @pytest.mark.parametrize("option", ["pcp", "dcp", "pp", "apc", "mtp"])
-def test_feature_switch_alone_does_not_change_transfer_contract(option):
+def test_execution_switches_do_not_replace_required_transfer_contract(option):
     from vllm_torchtpu.models.vllm.qwen4_exp.pd_connector import Qwen4ExpRaidenWorker
 
     cfg = _make_vllm_config()
     if option == "apc":
         cfg.cache_config.enable_prefix_caching = True
+        with pytest.raises(ValueError, match="prefix-aware|token-page-aligned"):
+            connector(cfg)
+        return
     elif option == "mtp":
         cfg.speculative_config = object()
     else:
@@ -202,7 +205,7 @@ def test_scheduler_rejects_changed_state_group_under_same_request():
     assert replay["uuid"] == params["uuid"]
 
 
-def qwen_worker(monkeypatch, *, tp=1, rank=0, producer=True):
+def qwen_worker(monkeypatch, *, tp=1, rank=0, producer=True, as_connector=False):
     from vllm_torchtpu.distributed.kv_transfer.raiden.pool_manifest import (
         BINDING_ALIASED_RAW,
         PoolEntry,
@@ -254,7 +257,7 @@ def qwen_worker(monkeypatch, *, tp=1, rank=0, producer=True):
     worker._raiden_controller_facade = _FakeRaidenControllerFacade()
     worker._raiden_controller_address = "source:27000"
     worker._raiden_work_unit = SimpleNamespace(data_name="qwen")
-    return worker
+    return obj if as_connector else worker
 
 
 def send_pages(num_tokens=129):
@@ -288,13 +291,91 @@ def test_qwen_producer_dispatch_registers_full_pages_to_matching_tp(
     registrations = calls[0]["pool_spans"]
     assert [len(r.block_ids) for r in registrations] == [2, 2, 1, 1, 1]
     assert sum(r.declared_bytes for r in registrations) == 7 * 4096
-    for reg in registrations:
-        assert reg.dst_space_version == 0
+    from tpu_sync.api.torch.reshard_client import _span_entry_dict
+
+    for ordinal, reg in enumerate(registrations):
+        token_pages = ordinal < 2
+        assert reg.dst_space_version == int(token_pages)
         for index, span in enumerate(reg.spans):
             assert span.dst_unit_ordinal == rank
-            assert span.src_block_ordinal == span.dst_block_index == index
-            assert span.src_offset_bytes == span.dst_offset_bytes == 0
+            assert span.src_block_ordinal == index
+            assert span.dst_block_index == 0
+            assert span.src_offset_bytes == 0
+            assert span.dst_offset_bytes == (index * 4096 if token_pages else 0)
             assert span.size_bytes == 4096
+        wire = _span_entry_dict(reg)
+        assert wire == dict(
+            tag=reg.tag,
+            block_ids=list(reg.block_ids),
+            declared_bytes=len(reg.block_ids) * 4096,
+            dst_space_version=int(token_pages),
+            spans=[
+                (index, 0, 0, index * 4096 if token_pages else 0, 4096, 0, 0, 1, rank)
+                for index in range(len(reg.block_ids))
+            ],
+        )
+
+
+@pytest.mark.parametrize("suppressed", [False, True])
+@pytest.mark.parametrize("cleanup", [False, True])
+def test_multigroup_failed_receive_is_request_scoped(monkeypatch, suppressed, cleanup):
+    from vllm import SamplingParams
+    from vllm.v1.core.sched.scheduler import Scheduler
+    from vllm.v1.request import Request
+
+    obj = qwen_worker(monkeypatch, producer=False, as_connector=True)
+    worker = obj.connector_worker
+    worker._raiden_transfer_engine.poll_results = [([], [], [])]
+    worker._record_stage3_load_failure("failed", [5])
+    if suppressed:
+        worker._suppress_done_recving.add("failed")
+    result = obj.get_transfer_results({"failed"} if cleanup else set())
+    assert result.failed_recving == {"failed"}
+    assert result.finished_recving == {"failed"}
+    assert obj.get_block_ids_with_load_errors() == set()
+    assert obj.get_transfer_results(set()).failed_recving == set()
+    scheduler = object.__new__(Scheduler)
+    request = Request(
+        request_id="failed",
+        prompt_token_ids=[1] * 17,
+        sampling_params=SamplingParams(max_tokens=1),
+        pooling_params=None,
+    )
+    request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+    request.num_computed_tokens = 17
+    scheduler.requests = {"failed": request}
+    scheduler.recompute_kv_load_failures = False
+    assert scheduler._handle_failed_recving(result.failed_recving) == {"failed"}
+    assert request.num_computed_tokens == 17
+
+
+@pytest.mark.parametrize("with_state", [False, True])
+def test_shared_failure_scoping_uses_all_cache_groups(with_state):
+    from vllm_torchtpu.distributed.kv_transfer.tpu_connector import TPURaidenConnector
+
+    groups = cache_groups()
+    caches = KVCacheConfig(
+        num_blocks=64,
+        kv_cache_tensors=[],
+        kv_cache_groups=[groups[0], groups[3]] if with_state else [groups[0]],
+    )
+    with (
+        patch(f"{_MOD}.get_tensor_model_parallel_rank", return_value=0),
+        patch(f"{_MOD}.get_tensor_model_parallel_world_size", return_value=1),
+        patch(f"{_MOD}.dist_utils.get_node_id", return_value=0),
+        patch(f"{_MOD}.dist_utils.get_host_ip", return_value="127.0.0.1"),
+        patch(f"{_MOD}.dist_utils.get_kv_transfer_port", return_value=9100),
+    ):
+        obj = TPURaidenConnector(
+            _make_vllm_config(is_producer=False), KVConnectorRole.WORKER, caches
+        )
+    assert len(obj._stage3_transfer_groups) == 1
+    worker = obj.connector_worker
+    worker._raiden_transfer_engine = _FakeRaidenEngine()
+    worker._raiden_transfer_engine.poll_results = [([], [], [])]
+    worker._record_stage3_load_failure("failed", [5])
+    assert obj.get_transfer_results(set()).failed_recving == {"failed"}
+    assert obj.get_block_ids_with_load_errors() == (set() if with_state else {5})
 
 
 @pytest.mark.parametrize(
@@ -495,9 +576,11 @@ def _registered_qwen_pool(
     producer=True,
     scales=(0.5, 0.25),
     blocks=3,
+    max_model_len=None,
     state_shape_change=False,
     feature=None,
     gather_fault=None,
+    text_overrides=None,
 ):
     import torch
 
@@ -513,6 +596,8 @@ def _registered_qwen_pool(
     worker._qwen_page_plan = None
     worker._raiden_transfer_engine = None
     worker.vllm_config.parallel_config.enable_expert_parallel = False
+    if max_model_len is not None:
+        worker.vllm_config.model_config.max_model_len = max_model_len
     worker.vllm_config.cache_config.mamba_ssm_cache_dtype = ssm_dtype
     if feature == "apc":
         worker.vllm_config.cache_config.enable_prefix_caching = True
@@ -525,11 +610,16 @@ def _registered_qwen_pool(
         worker.vllm_config.parallel_config.enable_expert_parallel = True
     elif feature is not None:
         setattr(worker.vllm_config.parallel_config, feature, 2)
-    config, materialized = live_pool(tp=tp, ssm=ssm_dtype, num_blocks=blocks)
+    text_overrides = text_overrides or {}
+    config, materialized = live_pool(
+        tp=tp, ssm=ssm_dtype, num_blocks=blocks, **text_overrides
+    )
     from tests.runner.test_qwen4_exp_pool import pool_config
     from vllm_torchtpu.models.vllm.qwen4_exp.pool_layout import pooled_cache_specs
 
     cache_config = pool_config(tp=tp, ssm=ssm_dtype)
+    for key, value in text_overrides.items():
+        setattr(cache_config.model_config.hf_text_config, key, value)
     cache = Qwen4ExpPooledCache.__new__(Qwen4ExpPooledCache)
     cache.native_config, cache.materialized = config, materialized
     cache.layout, cache.specs = pooled_cache_specs(cache_config)
@@ -658,10 +748,17 @@ def _registered_qwen_pool(
     facade = _FakeRaidenControllerFacade()
     monkeypatch.setattr(worker, "_new_raiden_controller_facade", lambda _: facade)
     pools = []
+    pool_registration = {}
+
+    def register_pools(values, **kwargs):
+        pools.extend(values)
+        pool_registration.update(kwargs)
+        return {}
+
     engine = SimpleNamespace(
         transfer_address="data:1",
         listener_address="control:2",
-        register_pools=lambda values: pools.extend(values) or {},
+        register_pools=register_pools,
     )
     builds = []
 
@@ -682,7 +779,91 @@ def _registered_qwen_pool(
     assert len(pools) == len(materialized.kv_caches)
     assert worker._qwen_page_plan is not None
     assert worker._qwen_page_plan.manifest.storages[0] is materialized.raw_tensors[0]
-    return SimpleNamespace(worker=worker, runner=runner, facade=facade)
+    return SimpleNamespace(
+        worker=worker,
+        runner=runner,
+        facade=facade,
+        pool_registration=pool_registration,
+    )
+
+
+@pytest.mark.parametrize("producer", [False, True])
+@pytest.mark.parametrize("extra_pages", [0, 2])
+@pytest.mark.parametrize("leases", [1, 3])
+def test_qwen_registration_bounds_staging_by_transferred_group_ids(
+    monkeypatch, producer, extra_pages, leases
+):
+    from tests.runner.test_qwen4_exp_pd_manifest import live_pool
+    from vllm_torchtpu.models.vllm.qwen4_exp.pd import (
+        TransferExtent,
+        build_transfer_groups,
+    )
+
+    config, _ = live_pool(num_blocks=1)
+    groups = build_transfer_groups(config.kv_cache_groups)
+    page_tokens = min(
+        group.block_size
+        for group in groups
+        if group.extent is TransferExtent.TOKEN_PAGES
+    )
+    max_tokens = extra_pages * page_tokens + 1
+    blocks = 1 + sum(group.page_count(max_tokens) for group in groups)
+    monkeypatch.setenv("TPU_RAIDEN_POOL_STAGING_LEASES", str(leases))
+    registered = _registered_qwen_pool(
+        monkeypatch, producer=producer, blocks=blocks, max_model_len=max_tokens
+    )
+    assert registered.pool_registration.get("staging_leases") == leases
+    plan = registered.worker._page_plan()
+    tables = []
+    next_id = 1
+    for group in plan.groups:
+        count = group.page_count(max_tokens)
+        tables.append(list(range(next_id, next_id + count)))
+        next_id += count
+    pages = plan.request_pages(tables, max_tokens)
+    touched = {}
+    for pool, group_index in plan.pool_groups():
+        touched.setdefault(pool.storage_index, set()).update(pages[group_index])
+    hints = registered.pool_registration["staging_blocks_per_pool"]
+    assert hints == [len(touched[pool.storage_index]) for pool in plan.manifest.pools]
+    assert all(0 < hint < blocks for hint in hints)
+
+
+def test_qwen_registration_preserves_explicit_full_mirror_override(monkeypatch):
+    monkeypatch.setenv("TPU_RAIDEN_POOL_STAGING_LEASES", "0")
+    registered = _registered_qwen_pool(monkeypatch)
+    assert registered.pool_registration == {}
+
+
+def test_equal_carriers_with_different_ring_encoding_do_not_admit_as_peers(monkeypatch):
+    peers = []
+    for ratio in (4, 8):
+        peer = _registered_qwen_pool(
+            monkeypatch,
+            text_overrides=dict(
+                layer_types=["indexed_attention"],
+                num_hidden_layers=1,
+                ple_layer_ids=[],
+                indexer_compress_ratio=ratio,
+            ),
+        )
+        peers.append(peer.worker._raiden_layout_fingerprint_payload)
+        ring = peer.runner.model_adapter.cache.layout
+        assert ring.compressed_kernel_rows == 128 // ratio
+    assert peers[0]["layout"] == peers[1]["layout"]
+    from vllm_torchtpu.distributed.kv_transfer.raiden.layout_fingerprint import (
+        canonical_layout_fingerprint,
+    )
+
+    assert canonical_layout_fingerprint(peers[0]) != canonical_layout_fingerprint(
+        peers[1]
+    )
+    assert [
+        payload["semantics"]["ranks"][0]["cache_specs"][
+            "model.layers.0.self_attn.raw_ring"
+        ]["block_size"]
+        for payload in peers
+    ] == [4, 8]
 
 
 @pytest.mark.parametrize(
@@ -836,10 +1017,13 @@ def test_whole_page_ordinal_mapping_matches_actual_destination_coverage(
             cast(SendMeta, send_pages()), 129
         )
         assert sum(reg.declared_bytes for reg in registrations) == 7 * 4096
-        for reg in registrations:
-            assert reg.dst_space_version == 0
-            for span in reg.spans:
-                assert span.src_offset_bytes == span.dst_offset_bytes == 0
+        for ordinal, reg in enumerate(registrations):
+            token_pages = ordinal < 2
+            assert reg.dst_space_version == int(token_pages)
+            for index, span in enumerate(reg.spans):
+                assert span.src_offset_bytes == 0
+                assert span.dst_block_index == 0
+                assert span.dst_offset_bytes == (index * 4096 if token_pages else 0)
                 assert span.size_bytes == 4096
                 assert span.dst_unit_ordinal == rank
                 ordinals.add(span.dst_unit_ordinal)

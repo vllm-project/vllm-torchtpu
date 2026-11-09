@@ -41,6 +41,7 @@ class TransferGroup:
     layer_names: tuple[str, ...]
     block_size: int
     extent: TransferExtent
+    checkpointed: bool = False
 
     def page_count(self, committed_tokens: int) -> int:
         if committed_tokens < 0:
@@ -81,7 +82,15 @@ def build_transfer_groups(
         sizes = {spec.block_size for spec in specs}
         if len(extents) != 1 or len(sizes) != 1 or min(sizes) <= 0:
             raise ValueError("A transfer group needs one extent and positive page size")
-        result.append(TransferGroup(index, names, sizes.pop(), extents.pop()))
+        checkpointed = {
+            isinstance(spec, MambaSpec) and spec.mamba_cache_mode == "align"
+            for spec in specs
+        }
+        if len(checkpointed) != 1:
+            raise ValueError("A transfer group needs one state checkpoint convention")
+        result.append(
+            TransferGroup(index, names, sizes.pop(), extents.pop(), checkpointed.pop())
+        )
     if not result:
         raise ValueError("Qwen PD requires a nonempty cache-group plan")
     return tuple(result)

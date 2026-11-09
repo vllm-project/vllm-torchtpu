@@ -272,10 +272,8 @@ def test_pd_requires_model_owned_fp8_and_geometric_parallelism(
         ("parallel_config", "pipeline_parallel_size", 2),
         ("parallel_config", "prefill_context_parallel_size", 2),
         ("parallel_config", "decode_context_parallel_size", 2),
-        ("parallel_config", "enable_expert_parallel", False),
         ("cache_config", "cache_dtype", "auto"),
         ("cache_config", "mamba_ssm_cache_dtype", "float16"),
-        ("cache_config", "enable_prefix_caching", True),
         ("kv_transfer_config", "kv_role", "kv_both"),
         ("kv_transfer_config", "kv_connector", "TPURaidenConnector"),
         ("kv_transfer_config", "kv_connector_module_path", "other.module"),
@@ -286,7 +284,6 @@ def test_pd_requires_model_owned_fp8_and_geometric_parallelism(
         with pytest.raises(ValueError):
             validate_config(cfg)
         setattr(target, field, original)
-
     for offload, shared, across in [
         (False, False, True),
         (True, False, True),
@@ -313,6 +310,43 @@ def test_pd_requires_model_owned_fp8_and_geometric_parallelism(
     cfg.speculative_config = None
     monkeypatch.setenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", "0")
     with pytest.raises(ValueError, match="requires the dual-storage pool"):
+        validate_config(cfg)
+
+
+@pytest.mark.parametrize("role", ["kv_producer", "kv_consumer"])
+@pytest.mark.parametrize("expert_parallel", [False, True])
+def test_real_config_hook_accepts_pd_with_aligned_apc_and_independent_expert_routing(
+    monkeypatch, role, expert_parallel
+):
+    from types import SimpleNamespace
+
+    from vllm.config import CacheConfig
+
+    from vllm_torchtpu.models.vllm.qwen4_exp.config import TPUQwen4ExpConfig
+
+    monkeypatch.setenv("TPU_KV_RESHARD_TRANSPORT", "raiden")
+    cfg = config(tp=1, dp=8)
+    cfg.parallel_config.enable_expert_parallel = expert_parallel
+    cfg.parallel_config.ubatch_size = 1
+    cfg.model_config.multimodal_config = None
+    cfg.cache_config = CacheConfig(
+        block_size=128,
+        cache_dtype="fp8_e4m3",
+        enable_prefix_caching=True,
+        mamba_cache_mode="align",
+        mamba_ssm_cache_dtype="bfloat16",
+    )
+    cfg.kv_transfer_config = SimpleNamespace(
+        kv_connector="Qwen4ExpRaidenConnector",
+        kv_connector_module_path=None,
+        kv_role=role,
+    )
+    TPUQwen4ExpConfig.verify_and_update_config(cfg)
+    assert cfg.cache_config.enable_prefix_caching
+    assert cfg.cache_config.mamba_cache_mode == "align"
+    assert cfg.parallel_config.enable_expert_parallel is expert_parallel
+    cfg.speculative_config = object()
+    with pytest.raises(ValueError, match="no MTP"):
         validate_config(cfg)
 
 

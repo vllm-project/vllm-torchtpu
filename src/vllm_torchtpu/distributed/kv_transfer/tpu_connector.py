@@ -53,6 +53,7 @@ from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorRole,
+    KVConnectorTransferResults,
     SupportsHMA,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
@@ -200,6 +201,24 @@ class _Stage3TransferGroup:
     page_tokens: int
     window_tokens: int | None = None
     request_state: bool = False
+    checkpointed: bool = False
+
+    def committed_state_page(self, block_ids: Sequence[int], num_tokens: int) -> int:
+        """Select the state at the published position, excluding history/scratch."""
+        if not self.request_state or num_tokens <= 0:
+            raise ValueError("A committed state page requires a positive state extent")
+        if self.checkpointed:
+            index = (num_tokens - 1) // self.page_tokens
+            if index >= len(block_ids):
+                raise ValueError("Committed state position is absent from its table")
+        else:
+            if len(block_ids) != 1:
+                raise ValueError("Request state requires exactly one committed page")
+            index = 0
+        page = block_ids[index]
+        if type(page) is not int or page <= 0:
+            raise ValueError("Committed state has a null or invalid page ID")
+        return page
 
     def page_count(self, num_tokens: int) -> int:
         if num_tokens < 0:
@@ -1056,13 +1075,27 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_worker is not None
         return self.connector_worker.get_finished(finished_req_ids)
 
+    def get_transfer_results(
+        self, finished_req_ids: set[str]
+    ) -> KVConnectorTransferResults:
+        if self.use_raiden:
+            worker = self.connector_worker
+            assert isinstance(worker, TPURaidenConnectorWorker)
+            return worker.get_transfer_results(finished_req_ids)
+        return super().get_transfer_results(finished_req_ids)
+
     def get_block_ids_with_load_errors(self) -> set[int]:
         # Surface KV-load failures so the scheduler recomputes the affected
         # blocks instead of running with absent KV. Only the Raiden worker
         # tracks these; other backends fall back to the base (no errors).
         worker = self.connector_worker
         fn = getattr(worker, "get_block_ids_with_load_errors", None)
-        return fn() if fn is not None else set()
+        failed = fn() if fn is not None else set()
+        if self.use_raiden and len(self._kv_cache_config.kv_cache_groups) > 1:
+            # A flat block ID has no cache-group identity. These failures
+            # are reported by request through get_transfer_results instead.
+            return set()
+        return failed
 
     def get_block_ids_with_load_errors_group_index(self) -> int | None:
         """Scopes Stage-3 load errors to the one transferred FA group."""
@@ -1925,12 +1958,17 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             group.request_state for group in self._stage3_transfer_groups
         )
         if request_state_groups and (
-            dcp_size != 1 or num_external_tokens != num_tokens
+            dcp_size != 1
+            or (
+                num_external_tokens != num_tokens
+                and not self._stage3_prefix_aware_load_enabled
+            )
         ):
             self._fail_load(
                 request,
                 local_block_ids,
-                "Stage-3 request-state pages require CP1 and the complete prefix",
+                "Stage-3 request-state pages require CP1 and "
+                "prefix-aware partial loads",
             )
             return
         multi_group = len(self._stage3_transfer_groups) > 1
@@ -1939,6 +1977,29 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             if multi_group
             else _Stage3TransferGroup(self._stage3_fa_group_index, logical_block_tokens)
         )
+
+        if request_state_groups:
+            grouped_block_ids = list(grouped_block_ids)
+            try:
+                for group in self._stage3_transfer_groups:
+                    if group.request_state:
+                        grouped_block_ids[group.cache_group_index] = [
+                            group.committed_state_page(
+                                grouped_block_ids[group.cache_group_index], num_tokens
+                            )
+                        ]
+                    else:
+                        # Inline scheduling can reserve the next forward's
+                        # token page beyond the published transfer extent.
+                        grouped_block_ids[group.cache_group_index] = list(
+                            grouped_block_ids[group.cache_group_index][
+                                : group.page_count(num_tokens)
+                            ]
+                        )
+            except ValueError as exc:
+                self._fail_load(request, local_block_ids, str(exc))
+                return
+            local_block_ids = list(grouped_block_ids[self._stage3_fa_group_index])
 
         def _incomplete_pages(
             ids: list[int], group: _Stage3TransferGroup
@@ -1987,10 +2048,25 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         # none of those.
         skip_tokens = (
             num_tokens - external_tokens
-            if (self._stage3_prefix_aware_load_enabled and not multi_group)
+            if (
+                self._stage3_prefix_aware_load_enabled
+                and (not multi_group or request_state_groups)
+            )
             else 0
         )
-        if skip_tokens:
+        if skip_tokens and request_state_groups:
+            if any(
+                skip_tokens % group.page_tokens
+                for group in self._stage3_transfer_groups
+                if not group.request_state
+            ):
+                self._fail_load(
+                    request,
+                    local_block_ids,
+                    "Grouped whole-page prefix hits must align with each token group",
+                )
+                return
+        elif skip_tokens:
             # Partial local prefix hit: pull only the suffix, and only into
             # the trailing (newly allocated) pages — the leading adopted
             # cache pages are shared and must never be transfer targets.
@@ -2427,7 +2503,15 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             ids: Sequence[int], group: _Stage3TransferGroup
         ) -> tuple[int, ...] | None:
             if request_state_groups:
-                pages = tuple(ids)
+                try:
+                    pages = (
+                        (group.committed_state_page(ids, num_tokens),)
+                        if group.request_state
+                        else tuple(ids)
+                    )
+                except ValueError as exc:
+                    logger.error("Stage-3 cannot publish committed state: %s", exc)
+                    return None
                 if (
                     len(pages) != group.page_count(num_tokens)
                     or any(type(page) is not int or page <= 0 for page in pages)
@@ -4921,6 +5005,9 @@ class TPURaidenConnectorWorker:
             counts.append(len(pages))
         return tags, blocks, counts
 
+    def _stage3_grouped_skip_bytes(self, req_meta: _Stage3LoadMeta) -> list[int]:
+        raise NotImplementedError("Grouped pools need their own prefix byte mapping")
+
     @staticmethod
     def _stage3_load_replay_matches(
         submitted: _Stage3LoadMeta, repeated: _Stage3LoadMeta
@@ -5954,8 +6041,13 @@ class TPURaidenConnectorWorker:
             fa_skip_bytes = 0
             clip_kwargs: dict[str, Any] = {}
             if skip_tokens > 0:
-                fa_skip_bytes = self._stage3_fa_skip_bytes(skip_tokens)
-                clip_kwargs["dst_skip_bytes"] = [fa_skip_bytes] * fa_tag_count + [0] * (
+                if self._uses_stage3_grouped_pages():
+                    clips = self._stage3_grouped_skip_bytes(req_meta)
+                    fa_skip_bytes = max(clips)
+                else:
+                    fa_skip_bytes = self._stage3_fa_skip_bytes(skip_tokens)
+                    clips = [fa_skip_bytes] * fa_tag_count
+                clip_kwargs["dst_skip_bytes"] = clips + [0] * (
                     len(transfer_tags) - fa_tag_count
                 )
             dst_mem_type = self._raiden_hbm_memory_type()
@@ -6470,14 +6562,19 @@ class TPURaidenConnectorWorker:
             # order fixes the H2D order ranks executor-side (the first
             # tag = group 0 uploads first). Each tag replays over the
             # same destination pages.
-            transfer_tags = (
-                list(self._stage3_row_geometry)
-                if _use_raiden_glm_admission()
-                else self._stage3_fa_registration_tags()
-            )
+            if self._uses_stage3_grouped_pages():
+                transfer_tags, dst_blocks, dst_counts = (
+                    self._stage3_grouped_destination_pages(req_meta, num_tokens)
+                )
+            else:
+                transfer_tags = (
+                    list(self._stage3_row_geometry)
+                    if _use_raiden_glm_admission()
+                    else self._stage3_fa_registration_tags()
+                )
+                dst_blocks = list(local_blocks) * len(transfer_tags)
+                dst_counts = [len(local_blocks)] * len(transfer_tags)
             fa_tag_count = len(transfer_tags)
-            dst_blocks = list(local_blocks) * len(transfer_tags)
-            dst_counts = [len(local_blocks)] * len(transfer_tags)
             mamba_state_block_ids = getattr(req_meta, "mamba_state_block_ids", None)
             if self._stage3_state_group_count:
                 if (
@@ -6501,8 +6598,13 @@ class TPURaidenConnectorWorker:
             fa_skip_bytes = 0
             clip_kwargs: dict[str, Any] = {}
             if skip_tokens > 0:
-                fa_skip_bytes = self._stage3_fa_skip_bytes(skip_tokens)
-                clip_kwargs["dst_skip_bytes"] = [fa_skip_bytes] * fa_tag_count + [0] * (
+                if self._uses_stage3_grouped_pages():
+                    clips = self._stage3_grouped_skip_bytes(req_meta)
+                    fa_skip_bytes = max(clips)
+                else:
+                    fa_skip_bytes = self._stage3_fa_skip_bytes(skip_tokens)
+                    clips = [fa_skip_bytes] * fa_tag_count
+                clip_kwargs["dst_skip_bytes"] = clips + [0] * (
                     len(transfer_tags) - fa_tag_count
                 )
             dst_mem_type = self._raiden_hbm_memory_type()
@@ -6552,6 +6654,12 @@ class TPURaidenConnectorWorker:
     def get_finished(
         self, finished_req_ids: set[str] | None = None
     ) -> tuple[set[str], set[str]]:
+        result = self.get_transfer_results(finished_req_ids)
+        return result.finished_sending, result.finished_recving
+
+    def get_transfer_results(
+        self, finished_req_ids: set[str] | None = None
+    ) -> KVConnectorTransferResults:
         engine = self._ensure_raiden_transfer_engine()
         # A request aborted in WAITING_FOR_REMOTE_KVS is scheduler-finished,
         # but vLLM deliberately delays freeing its blocks until this connector
@@ -6596,14 +6704,14 @@ class TPURaidenConnectorWorker:
         if self.is_producer and self._raiden_stage3_enabled():
             done_sending = done_sending - self._stage3_reported_sends
             self._stage3_reported_sends.update(done_sending)
-        # Report failed recvs as finished too, so the scheduler stops waiting in
-        # WAITING_FOR_REMOTE_KVS until the API timeout; the affected blocks are
-        # surfaced via get_block_ids_with_load_errors() in the same pass so vLLM
-        # recomputes them rather than running with absent KV.
+        # Failed receives are terminal even for inline loads. Report their
+        # request IDs once so the scheduler applies its configured failure
+        # policy without ambiguous block IDs on multi-group layouts.
         recv_finished = self._done_recving | self._failed_recving
+        failed_recving = self._failed_recving - self._reported_recving
         done_recving = (
             recv_finished - self._suppress_done_recving - self._reported_recving
-        )
+        ) | failed_recving
         self._suppress_done_recving.difference_update(recv_finished)
         self._reported_recving.update(done_recving)
         if done_recving:
@@ -6658,7 +6766,11 @@ class TPURaidenConnectorWorker:
             self._stage3_finished_loads_pending_cleanup.discard(req_id)
         self._done_sending = set()
         self._done_recving = set()
-        return done_sending, done_recving
+        return KVConnectorTransferResults(
+            finished_sending=done_sending,
+            finished_recving=done_recving,
+            failed_recving=failed_recving,
+        )
 
     def _poll_finished(self, engine: "KVCacheManager") -> None:
         if (

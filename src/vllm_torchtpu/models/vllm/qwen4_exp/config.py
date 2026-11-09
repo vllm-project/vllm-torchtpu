@@ -389,12 +389,10 @@ def validate_config(cfg):
     if transfer is not None:
         connector_module = "vllm_torchtpu.models.vllm.qwen4_exp.pd_connector"
         if (
-            not p.enable_expert_parallel
-            or transfer.kv_connector != "Qwen4ExpRaidenConnector"
+            transfer.kv_connector != "Qwen4ExpRaidenConnector"
             or transfer.kv_connector_module_path not in (None, connector_module)
             or transfer.kv_role not in ("kv_producer", "kv_consumer")
             or c.cache_dtype not in ("fp8", "fp8_e4m3")
-            or c.enable_prefix_caching
             or c.mamba_ssm_cache_dtype not in ("bfloat16", "float32")
             or envs.TPU_KV_RESHARD_TRANSPORT != "raiden"
             or any(
@@ -408,8 +406,8 @@ def validate_config(cfg):
         ):
             raise ValueError(
                 "Qwen4Exp PD requires its model-owned Raiden connector, a producer "
-                "or consumer role, expert parallelism, matching peer layouts, "
-                "FP8 pages, BF16/FP32 SSM and APC off"
+                "or consumer role, matching peer layouts, "
+                "FP8 pages and BF16/FP32 SSM"
             )
     if envs.VLLM_TPU_BLOCK_MAJOR_KV:
         raise ValueError("Qwen4Exp requires its native HEAD_ALONG_SUBLANE cache layout")
