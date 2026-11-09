@@ -213,7 +213,7 @@ StepFn = Callable[..., Any]
 class MonoProgram(Protocol):
     """One megakernel instance on one TP rank (returned by `create`).
 
-    `view` is the runtime's read-only `RunnerView`; `fwd` its per-step
+    `view` is the adapter's read-only `RunnerView`; `fwd` its per-step
     `ForwardView`. Optional methods (looked up with `getattr`):
     `warmup_session()` (a context manager around warmup),
     `check_compiled_ir(debug, bucket)`, `attach_draft(drafter)` /

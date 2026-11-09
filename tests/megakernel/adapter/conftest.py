@@ -23,8 +23,6 @@ from pathlib import Path
 
 import pytest
 
-from tests.megakernel.conftest import register_megakernel_cpu_plugin
-
 _RUNTIME = "vllm_torchtpu.megakernel.adapter."
 
 # A built-in shorthand for tests: a stdlib-only template package on a temp
@@ -63,10 +61,6 @@ from vllm_torchtpu.megakernel.core.runtime.contract import Decline
 def create(view, options):
     return Decline("mkfake_declined", "the fake template serves nothing")
 """
-
-
-def pytest_configure(config: pytest.Config) -> None:
-    register_megakernel_cpu_plugin(config)
 
 
 @pytest.fixture(autouse=True)

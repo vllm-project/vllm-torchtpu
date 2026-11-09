@@ -27,7 +27,7 @@ Runtime keys: `plugin`, `options`, `enabled`, `ab`, `stats_period_s`. Any
 other top-level key (e.g. `profile`) is a plugin setting: `resolve_plugin_ref`
 forwards it into `options` when the resolved plugin's `SPEC.top_level_options`
 lists it, and raises a `MegakernelConfigError` naming it otherwise. The
-runtime reads `SPEC` by importing the plugin's module (stdlib-only at import,
+adapter reads `SPEC` by importing the plugin's module (stdlib-only at import,
 so none of the plugin's heavy code), and only when such keys are set.
 """
 
