@@ -51,6 +51,7 @@ class Policy:
     strict_window: int = 0
     token_budget: int = 2048
     input_budget: int = 2048
+    draft_slots: int | None = None
 
 
 def load_replay_plan(root: Path):
@@ -175,6 +176,8 @@ def simulate(
     draft_slots: int = 4,
 ) -> dict:
     """Model bounded active slots, prefill chunks and synchronized stage buckets."""
+    if policy.draft_slots is not None:
+        draft_slots = policy.draft_slots
     pending = [deque() for _ in range(dp)]
     active: list[list[Active]] = [[] for _ in range(dp)]
     indices = dict.fromkeys(chains, 0)
@@ -425,6 +428,10 @@ def main() -> None:
         )
     policies.append(Policy("rowcap512", token_budget=512))
     policies.append(Policy("budget512", token_budget=512, input_budget=512))
+    policies.append(Policy("budget_fix_only", buckets=(288, 2048), draft_slots=0))
+    policies.append(
+        Policy("strict8_budget_fix", interval=8, strict_window=1, draft_slots=0)
+    )
     accepted = (
         1 + data["summary"]["metrics_steady"]["mean_accepted_draft_tokens_per_step"]
     )

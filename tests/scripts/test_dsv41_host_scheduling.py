@@ -223,7 +223,7 @@ def cpu_scheduler(tmp_path, monkeypatch):
         SpeculativeConfig, "max_num_new_slots_for_drafting", property(upstream)
     )
 
-    def build(*, budget=2048, seqs=48, speculative=False):
+    def build(*, budget=2048, seqs=48, speculative=False, strict=False):
         config = VllmConfig(
             model_config=model,
             scheduler_config=SchedulerConfig(
@@ -273,7 +273,10 @@ def cpu_scheduler(tmp_path, monkeypatch):
         module = load_file(
             "dsv41_tpu_scheduler", ROOT / "src/vllm_torchtpu/core/tpu_scheduler.py"
         )
-        scheduler = module.TpuDpScheduler(
+        scheduler_cls = (
+            module.TpuPrefillWindowScheduler if strict else module.TpuDpScheduler
+        )
+        scheduler = scheduler_cls(
             vllm_config=config,
             kv_cache_config=kv,
             structured_output_manager=StructuredOutputManager(config),
@@ -325,6 +328,66 @@ def test_real_scheduler_drain_admits_arrival_on_throttled_step(cpu_scheduler):
     scheduler.schedule(False)
     add_request(scheduler, hasher, "new", 128)
     assert scheduler.schedule(True).num_scheduled_tokens["new"] > 0
+
+
+def test_strict_window_holds_chunks_and_new_requests_until_aligned(cpu_scheduler):
+    scheduler, hasher = cpu_scheduler(strict=True)
+    add_request(scheduler, hasher, "long", 3000)
+    assert scheduler.schedule(False).num_scheduled_tokens["long"] == 2048
+    request = scheduler.requests["long"]
+    fence = request.next_decode_eligible_step
+    computed = request.num_computed_tokens
+    free_blocks = scheduler.kv_cache_manager.block_pool.get_num_free_blocks()
+    add_request(scheduler, hasher, "new", 128)
+    for _ in range(7):
+        assert not scheduler.schedule(True).num_scheduled_tokens
+        assert request.num_computed_tokens == computed
+        assert request.next_decode_eligible_step == fence
+        assert (
+            scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == free_blocks
+        )
+    aligned = scheduler.schedule(False)
+    assert aligned.num_scheduled_tokens["long"] > 0
+    assert aligned.num_scheduled_tokens["new"] > 0
+
+
+@pytest.mark.parametrize("patched", [False, True])
+def test_strict_window_preserves_six_row_k5_decodes(cpu_scheduler, patched):
+    if patched:
+        install_budget_patch()
+    scheduler, hasher = cpu_scheduler(strict=True, speculative=True)
+    for i in range(47):
+        add_request(scheduler, hasher, f"decode-{i}", 1)
+    scheduler.schedule(False)
+    add_request(scheduler, hasher, "prefill", 5000)
+    scheduler.schedule(False)
+    for _ in range(7):
+        output = scheduler.schedule(True)
+        assert "prefill" not in output.num_scheduled_tokens
+        assert all(output.num_scheduled_tokens[f"decode-{i}"] == 6 for i in range(47))
+    assert scheduler.schedule(False).num_scheduled_tokens["prefill"] > 0
+
+
+def test_strict_window_restores_existing_fence_and_pause_on_error(
+    cpu_scheduler, monkeypatch
+):
+    from vllm.v1.core.sched.async_scheduler import AsyncScheduler
+
+    scheduler, hasher = cpu_scheduler(strict=True)
+    add_request(scheduler, hasher, "long", 3000)
+    scheduler.schedule(False)
+    request = scheduler.requests["long"]
+    request.next_decode_eligible_step = 59
+    pause = scheduler.pause_state
+
+    def fail(*args):
+        raise RuntimeError("probe")
+
+    monkeypatch.setattr(AsyncScheduler, "schedule", fail)
+    with pytest.raises(RuntimeError, match="probe"):
+        scheduler.schedule(True)
+    assert request.next_decode_eligible_step == 59
+    assert scheduler.pause_state == pause
 
 
 def test_drafting_budget_backport_frees_prefill_capacity(cpu_scheduler):

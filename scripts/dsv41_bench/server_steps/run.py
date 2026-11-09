@@ -118,6 +118,8 @@ def main() -> None:
     parser.add_argument("--rounds", type=int)
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--compile-sizes", type=int, nargs="+")
+    parser.add_argument("--scheduler-cls")
+    parser.add_argument("--prefill-schedule-interval", type=int)
     args = parser.parse_args()
     multihost = args.scenario == "decode_dp16"
     worker = multihost and args.host_rank == 1
@@ -208,6 +210,16 @@ def main() -> None:
         "--compilation-config",
         json.dumps({"compile_sizes": buckets}),
     ]
+    if args.scheduler_cls is not None:
+        env["DP_SCHED_ENABLED"] = "0"
+        server_command += ["--scheduler-cls", args.scheduler_cls]
+    if args.prefill_schedule_interval is not None:
+        if args.prefill_schedule_interval < 1:
+            parser.error("--prefill-schedule-interval must be positive")
+        server_command += [
+            "--prefill-schedule-interval",
+            str(args.prefill_schedule_interval),
+        ]
     if decode and not worker:
         server_command += ["--enable-log-requests", "--max-log-len", "0"]
     if multihost:
@@ -268,6 +280,11 @@ def main() -> None:
     manifest = {
         "scenario": args.scenario,
         "compile_sizes": buckets,
+        "scheduler": {
+            "class": args.scheduler_cls,
+            "prefill_schedule_interval": args.prefill_schedule_interval,
+            "dp_sched_enabled": env.get("DP_SCHED_ENABLED", "0"),
+        },
         "cache_mode": "disabled",
         "serialization": "enabled",
         "engram_transfer": "raw_dma",
@@ -304,6 +321,7 @@ def main() -> None:
     model = Path(env["MODEL_PATH"])
     identity = {
         "scenario": args.scenario,
+        "scheduler": manifest["scheduler"],
         "engram_transfer": "raw_dma",
         "compile_sizes": buckets,
         "packages": manifest["packages"],

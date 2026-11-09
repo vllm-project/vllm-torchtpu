@@ -56,6 +56,8 @@ K5 charges four additional drafting slots per scheduled request, so these
 policies differ substantially. The backport of main PR #2208 removes that
 charge for the TPU's separate draft forward; model it with `--draft-slots 0`.
 Epic's independent request-derived draft query ladder is retained.
+The report also includes `budget_fix_only` and `strict8_budget_fix` arms that
+override the charge to zero on the same workload as the original baseline.
 
 Right-censored requests have unknown output lengths. Missing slots are filled
 from observed same-rank samples. `--match-output-mean` rescales those samples
@@ -67,6 +69,20 @@ and all assumptions are saved in the result.
 The model does not run the vLLM allocator, async execution queue or sampling.
 The companion CPU tests exercise the real pinned AsyncScheduler separately,
 including continued chunks, an open drain window, and the K5 budget backport.
+
+The opt-in `TpuPrefillWindowScheduler` implements the strict one-step window
+with the existing DP-synchronized throttle signal. On other steps it pauses
+new admissions and temporarily fences in-progress prefills using the upstream
+request eligibility field. Active decode requests continue; held prefills keep
+their KV blocks and active request slots. The fence is restored after each
+scheduling call, including exceptions.
+
+Select it explicitly with
+`--scheduler-cls vllm_torchtpu.core.tpu_scheduler.TpuPrefillWindowScheduler`
+and `--prefill-schedule-interval 8`. Keep `DP_SCHED_ENABLED=0`: epic's platform
+rejects that automatic selector combined with a custom scheduler. The current
+default scheduler is unchanged. This candidate is host-tested at PP1 with K5;
+TPU lockstep execution and throughput remain unqualified.
 
 512 stage costs and the encoder/decoder cost split are unknown. Timing
 sensitivity varies them explicitly and fits the old 2048 cost to aggregate
@@ -83,8 +99,12 @@ The existing server launcher accepts an explicit ladder on either host:
 ```sh
 python scripts/dsv41_bench/server_steps/run.py \
   --scenario decode --input INPUT --out OUTPUT \
-  --compile-sizes 288 512 2048
+  --compile-sizes 288 512 2048 \
+  --scheduler-cls vllm_torchtpu.core.tpu_scheduler.TpuPrefillWindowScheduler \
+  --prefill-schedule-interval 8
 ```
 
 This command starts a server and is separate from the offline checks. Adding
 the option does not change the launcher's default ladder or the CI recipe.
+The explicit class disables the automatic DP scheduler selector in the child
+environment. Both scheduler options are emitted for either host role.

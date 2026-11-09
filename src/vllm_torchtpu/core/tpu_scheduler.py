@@ -53,3 +53,31 @@ class TpuDpScheduler(AsyncScheduler):
         if self._drain_prefill:
             return super().schedule(False)
         return self._schedule_paused_new()
+
+
+class TpuPrefillWindowScheduler(TpuDpScheduler):
+    """Restrict new and continued prefills to DP cadence-aligned steps.
+
+    Select with ``--scheduler-cls`` and ``--prefill-schedule-interval``;
+    ``DP_SCHED_ENABLED`` stays off because this is an explicit scheduler.
+    Request eligibility uses the upstream step fence also used by PP decode
+    microbatching. Holding a chunk retains its request slot and KV blocks.
+    """
+
+    def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        if not throttle_prefills:
+            return super().schedule(False)
+        held = [
+            (request, request.next_decode_eligible_step)
+            for request in self.running
+            if request.is_prefill_chunk
+        ]
+        # Upstream schedules current_step + 1. Restore every prior fence so
+        # this one-call hold does not bypass another reason for ineligibility.
+        for request, previous in held:
+            request.next_decode_eligible_step = max(previous, self.current_step + 2)
+        try:
+            return self._schedule_paused_new()
+        finally:
+            for request, previous in held:
+                request.next_decode_eligible_step = previous
