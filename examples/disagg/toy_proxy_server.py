@@ -378,6 +378,11 @@ def parse_args():
 
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--host", type=str, default="localhost")
+    parser.add_argument(
+        "--require-kv-transfer",
+        action="store_true",
+        help="Reject a prefill response without a transfer handle.",
+    )
 
     # For prefiller instances
     parser.add_argument(
@@ -605,6 +610,7 @@ async def _handle_completions(api: str, request: Request):
         # Extract the needed fields
         response_json = response.json()
         kv_transfer_params = response_json.get("kv_transfer_params", {})
+        require_transfer_handle(kv_transfer_params, global_args.require_kv_transfer)
         kv_uuid = kv_transfer_params.get("uuid") if kv_transfer_params else None
         kv_uuid_log = f" kv_uuid={kv_uuid}" if kv_uuid is not None else ""
         print(
@@ -689,6 +695,11 @@ async def _handle_completions(api: str, request: Request):
         print(e)
         print("".join(traceback.format_exception(*exc_info)))
         raise
+
+
+def require_transfer_handle(params: dict, required: bool) -> None:
+    if required and (not params or params.get("uuid") is None):
+        raise ValueError("Prefill did not publish a KV transfer handle")
 
 
 @app.post("/v1/completions")
