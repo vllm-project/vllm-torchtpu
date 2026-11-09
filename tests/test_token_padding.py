@@ -211,3 +211,62 @@ def test_mask_router_logits_for_padding():
     finally:
         token_padding.set_padding_state(None)
     assert token_padding.mask_router_logits_for_padding(logits) is logits
+
+
+_COUNT_SEQUENCE = [(3, 6), (3, 6), (2, 6), (2, 6), (6, 6), (0, 6), (0, 6), (3, 6)]
+
+
+def _masks_and_copies(monkeypatch, skip_unchanged_copy):
+    monkeypatch.setenv(
+        "TPU_SKIP_PADDING_MASK_COPY", "1" if skip_unchanged_copy else "0"
+    )
+    state = TokenPaddingState.create(8, "cpu")
+    copies = 0
+    real_copy = state.local_padding_mask.copy_
+
+    class _CountingMask:
+        """Forward to the real mask, counting host-to-device writes."""
+
+        shape = state.local_padding_mask.shape
+
+        def copy_(self, src):
+            nonlocal copies
+            copies += 1
+            return real_copy(src)
+
+        def __getitem__(self, index):
+            return state.local_padding_mask.__getitem__(index)
+
+    mask = state.local_padding_mask
+    masks, valid_counts = [], []
+    for valid, padded in _COUNT_SEQUENCE:
+        state.local_padding_mask = _CountingMask()
+        state.update(valid, padded)
+        state.local_padding_mask = mask
+        masks.append(state.get_local_padding_mask(8).clone())
+        if state.local_valid_tokens is not None:
+            valid_counts.append(state.local_valid_tokens.item())
+    return state, masks, valid_counts, copies
+
+
+def test_skip_unchanged_copy_gives_same_masks(monkeypatch):
+    _, masks_off, _, copies_off = _masks_and_copies(monkeypatch, False)
+    _, masks_on, valid_counts, copies_on = _masks_and_copies(monkeypatch, True)
+    for off, on in zip(masks_off, masks_on, strict=True):
+        assert torch.equal(off, on)
+    assert copies_off == len(_COUNT_SEQUENCE)
+    # Repeats at steps 1, 3 and 6 are skipped.
+    assert copies_on == len(_COUNT_SEQUENCE) - 3
+    assert valid_counts == [valid for valid, _ in _COUNT_SEQUENCE]
+
+
+def test_local_valid_tokens_only_with_skip(monkeypatch):
+    state_off, _, _, _ = _masks_and_copies(monkeypatch, False)
+    assert state_off.local_valid_tokens is None
+    state_on, _, _, _ = _masks_and_copies(monkeypatch, True)
+    token_padding.set_padding_state(state_on)
+    try:
+        assert token_padding.get_local_valid_tokens().tolist() == [3]
+    finally:
+        token_padding.set_padding_state(None)
+    assert token_padding.get_local_valid_tokens() is None

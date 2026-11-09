@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
+
+from vllm_torchtpu import envs
 
 _padding_state: "TokenPaddingState | None" = None
 
@@ -24,20 +26,53 @@ class TokenPaddingState:
     """Track token padding."""
 
     local_padding_mask: torch.Tensor
+    # This rank's valid-token count as a one-element device tensor, kept once
+    # for every MoE layer. Set only with TPU_SKIP_PADDING_MASK_COPY.
+    local_valid_tokens: torch.Tensor | None = None
+    skip_unchanged_copy: bool = field(
+        default_factory=lambda: envs.TPU_SKIP_PADDING_MASK_COPY
+    )
+    _last_counts: tuple[int, int] | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
 
     @classmethod
     def create(cls, max_local_tokens: int, device) -> "TokenPaddingState":
         local_padding_mask = torch.zeros(
             max_local_tokens, dtype=torch.bool, device=device
         )
-        return cls(local_padding_mask=local_padding_mask)
+        skip_unchanged_copy = envs.TPU_SKIP_PADDING_MASK_COPY
+        local_valid_tokens = (
+            torch.zeros(1, dtype=torch.int32, device=device)
+            if skip_unchanged_copy
+            else None
+        )
+        return cls(
+            local_padding_mask=local_padding_mask,
+            local_valid_tokens=local_valid_tokens,
+            skip_unchanged_copy=skip_unchanged_copy,
+        )
 
     def update(self, local_valid_tokens: int, local_padded_tokens: int) -> None:
-        """Write this rank's token padding mask."""
+        """Write this rank's token padding mask.
+
+        With `skip_unchanged_copy`, the write is skipped when both counts
+        match the previous call: consecutive decode steps often use the same
+        counts, and the device buffers already hold the right values.
+        """
+        if self.skip_unchanged_copy:
+            counts = (int(local_valid_tokens), int(local_padded_tokens))
+            if counts == self._last_counts:
+                return
+            self._last_counts = counts
         host = torch.zeros(self.local_padding_mask.shape[0], dtype=torch.bool)
         host[local_valid_tokens:local_padded_tokens] = True
         # Synchronous copy since the host tensor is temporary.
         self.local_padding_mask.copy_(host)
+        if self.local_valid_tokens is not None:
+            self.local_valid_tokens.copy_(
+                torch.tensor([local_valid_tokens], dtype=torch.int32)
+            )
 
     def get_local_padding_mask(self, num_tokens: int) -> torch.Tensor:
         return self.local_padding_mask[:num_tokens]
@@ -46,6 +81,14 @@ class TokenPaddingState:
 def set_padding_state(state: "TokenPaddingState | None") -> None:
     global _padding_state
     _padding_state = state
+
+
+def get_local_valid_tokens() -> torch.Tensor | None:
+    """This rank's valid-token count as a one-element device tensor, or None
+    when no padding state is set or TPU_SKIP_PADDING_MASK_COPY is off."""
+    if _padding_state is None:
+        return None
+    return _padding_state.local_valid_tokens
 
 
 def mark_padding(num_valid_tokens: int, num_padded_tokens: int) -> None:
