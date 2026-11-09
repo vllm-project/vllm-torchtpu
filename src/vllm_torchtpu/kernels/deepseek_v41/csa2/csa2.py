@@ -175,6 +175,10 @@ def _csa2_kernel(
         kv_sem,
         tile_scratch,
     ) = scratch
+    swa_hbm = tuple(
+        bank.bitcast(jnp.bfloat16) if bank.dtype == jnp.int32 else bank
+        for bank in swa_hbm
+    )
     tokens, heads = positions_ref.shape[0], q_hbm.shape[1]
     bq = q_buf.shape[1]
     batch = pages_ref.shape[0]
@@ -759,8 +763,10 @@ def csa2(
     """Ragged CSA2 attention with FP32 scales and independent SWA visibility.
 
     Main KV is query-local packed FP8 [T,512,128], scales are FP32 [T,512].
-    SWA uses one or two native BF16 page owners. starts [B+1] describes
-    requests; repeated boundaries and output padding are supported.
+    SWA uses one or two BF16 [pages,page_size,512] owners or row-packed
+    INT32 [pages,page_size/2,512] owners. Each INT32 word stores the low/high
+    BF16 bits of adjacent token rows at the same feature column. starts [B+1]
+    describes requests; repeated boundaries and output padding are supported.
     Explicit swa_bounds selects visibility independently of model layer stage.
 
     The T queries are rows [query_offset, query_offset + T) of q [T',H,512].
@@ -824,12 +830,12 @@ def csa2(
             bank.ndim != 3
             or bank.shape[0] < 1
             or bank.shape[-1] != 512
-            or bank.dtype != jnp.bfloat16
+            or bank.dtype not in (jnp.bfloat16, jnp.int32)
         ):
-            raise ValueError("SWA requires native BF16 [pages,page_size,512]")
-        if bank.shape[1:] != banks[0].shape[1:]:
-            raise ValueError("SWA banks must have matching page shapes")
-    cache_page_size = banks[0].shape[1]
+            raise ValueError("SWA requires BF16 or row-packed INT32 page owners")
+        if bank.shape[1:] != banks[0].shape[1:] or bank.dtype != banks[0].dtype:
+            raise ValueError("SWA banks must have matching page shapes and dtypes")
+    cache_page_size = banks[0].shape[1] * (2 if banks[0].dtype == jnp.int32 else 1)
     if cache_page_size not in (8, 16, 32, 64) and (
         cache_page_size < 128 or cache_page_size % 128
     ):
