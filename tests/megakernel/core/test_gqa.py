@@ -40,6 +40,7 @@ from vllm_torchtpu.megakernel.core.modules.gqa import GQAModule
 from vllm_torchtpu.megakernel.core.modules.gqa.context import GQAEmit
 from vllm_torchtpu.megakernel.core.modules.gqa.merge import split_merge
 from vllm_torchtpu.megakernel.core.modules.gqa.new_token import att_new
+from vllm_torchtpu.megakernel.core.modules.gqa.params import GQATunables
 from vllm_torchtpu.megakernel.core.ops import (
     BF16,
     F32,
@@ -614,3 +615,73 @@ def test_gqa_split_merge_gq_and_slab_in_pallas_interpret(expect_gq: bool):
         np.testing.assert_allclose(
             np.asarray(mix_out[: ex.B]), mix_inv, rtol=1e-2, atol=1e-2
         )
+
+
+@pytest.mark.parametrize(("T", "NS"), [(1, 8), (2, 8), (1, 20), (2, 20)])
+def test_gqa_host_update_states_single_scatter_vs_loop_and_numpy(T: int, NS: int):
+    """Verify `GQAModule.host_update_states` single-scatter (`NS > kv_scatter_vec_ns`)
+    matches the `dynamic_update_slice` loop and a NumPy scatter at `T=1` and `T>1`."""
+    assert GQATunables.NUMERICS["kv_scatter_vec_ns"] == "exact"
+    B = NS * T
+    L, ctx, HD = 2, 64, 128
+    g = FakeGeometry(L=L, att_every=1, H=256, NH=2, NKV=1, HD=HD)
+    gqa = GQAModule(geometry=g)
+
+    ex_default = ExecSpec(B=B, T=T, R=1, ctx=ctx, tiles=_TINY_GQA_TILES)
+    ex_vec0 = ExecSpec(
+        B=B,
+        T=T,
+        R=1,
+        ctx=ctx,
+        tiles=_TINY_GQA_TILES.with_modules({"gqa": {"kv_scatter_vec_ns": 0}}),
+    )
+    ex_loop = ExecSpec(
+        B=B,
+        T=T,
+        R=1,
+        ctx=ctx,
+        tiles=_TINY_GQA_TILES.with_modules({"gqa": {"kv_scatter_vec_ns": NS + 4}}),
+    )
+    assert gqa.tunables(ex_default).kv_scatter_vec_ns == 16
+    assert gqa.tunables(ex_vec0).kv_scatter_vec_ns == 0
+    assert gqa.tunables(ex_loop).kv_scatter_vec_ns == NS + 4
+
+    k0, k1, k2, k3 = jax.random.split(jax.random.PRNGKey(90 + T * 31 + NS), 4)
+    kc_init = jax.random.normal(k0, (L, NS, ctx, HD), dtype=BF16) * 0.5
+    vc_init = jax.random.normal(k1, (L, NS, ctx, HD), dtype=BF16) * 0.5
+    knew = jax.random.normal(k2, (L, ex_default.MR, HD), dtype=F32) * 0.7
+    vnew = jax.random.normal(k3, (L, ex_default.MR, HD), dtype=F32) * 0.7
+
+    base_pos = np.arange(NS, dtype=np.int32) * 2 + 3
+    pos_np = np.asarray(
+        [base_pos[s] + t for s in range(NS) for t in range(T)], dtype=np.int32
+    )
+    pos = jnp.asarray(pos_np, dtype=I32)
+
+    states = {"kc": kc_init, "vc": vc_init}
+    raw_out = {"knew": knew, "vnew": vnew}
+    out_default = gqa.host_update_states(g, ex_default, pos, states, raw_out)
+    out_vec0 = gqa.host_update_states(g, ex_vec0, pos, states, raw_out)
+    out_loop = gqa.host_update_states(g, ex_loop, pos, states, raw_out)
+
+    # NumPy scatter oracle.
+    kc_exp = np.asarray(kc_init).copy()
+    vc_exp = np.asarray(vc_init).copy()
+    knew_bf16 = np.asarray(knew[:, :B].astype(BF16))
+    vnew_bf16 = np.asarray(vnew[:, :B].astype(BF16))
+    for b in range(B):
+        s_idx = b if T == 1 else b // T
+        kc_exp[:, s_idx, pos_np[b], :] = knew_bf16[:, b, :]
+        vc_exp[:, s_idx, pos_np[b], :] = vnew_bf16[:, b, :]
+
+    for out in (out_default, out_vec0, out_loop):
+        np.testing.assert_array_equal(
+            np.asarray(out["kc"]).view(np.uint16), kc_exp.view(np.uint16)
+        )
+        np.testing.assert_array_equal(
+            np.asarray(out["vc"]).view(np.uint16), vc_exp.view(np.uint16)
+        )
+    assert not np.array_equal(
+        np.asarray(out_vec0["kc"]).view(np.uint16),
+        np.asarray(kc_init).view(np.uint16),
+    )
