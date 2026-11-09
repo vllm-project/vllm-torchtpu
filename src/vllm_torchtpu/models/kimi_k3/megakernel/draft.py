@@ -352,15 +352,132 @@ class DsparkDraft:
             )
         return wall
 
+    def _build_init_vector(self) -> Callable[..., tuple[torch.Tensor, ...]]:
+        """Build or return the mesh-replicated draft vector initializer custom op."""
+        key = ("init_vector",)
+        if key in self._ops:
+            return self._ops[key]
+        rows = int(self.dspark.ROWS)
+        bonus_idx = int(self.dspark.OUT_BONUS)
+
+        def fn(anchor: jax.Array) -> tuple[jax.Array]:
+            """Seed a replicated ``[1, _VECTOR_LEN]`` draft vector with ``anchor``."""
+            tok = anchor.reshape(-1)[0].astype(jnp.int32)
+            idx = jnp.arange(_VECTOR_LEN, dtype=jnp.int32)
+            vector = jnp.where(
+                (idx < rows - 1) | (idx == bonus_idx),
+                tok,
+                jnp.int32(-1),
+            )[None, :]
+            return (vector,)
+
+        self._ops[key] = register_global_op(
+            "pallas::k3_dspark_init_vector",
+            self.mesh,
+            fn,
+            OpRegistrationSpec(
+                in_specs=(P(),),
+                out_specs=(P(),),
+                export_key=repr(("dspark_init_vector", rows, bonus_idx)),
+            ),
+        )
+        return self._ops[key]
+
+    def _build_init_state(self) -> Callable[..., tuple[torch.Tensor, ...]]:
+        """Build or return the mesh-sharded cold draft state initializer custom op."""
+        key = ("init_state",)
+        if key in self._ops:
+            return self._ops[key]
+        cfg = self.config
+        rows = int(self.dspark.ROWS)
+        bonus_idx = int(self.dspark.OUT_BONUS)
+
+        def fn(anchor: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+            """Allocate cold ring cache, positions, and seeded draft vector on mesh."""
+            tok = anchor.reshape(-1)[0].astype(jnp.int32)
+            idx = jnp.arange(_VECTOR_LEN, dtype=jnp.int32)
+            cache = jnp.zeros(
+                (TP_SIZE, cfg.layers, cfg.window, 2 * cfg.head_dim),
+                dtype=jnp.bfloat16,
+            )
+            positions = jnp.full((1, cfg.window), -1, dtype=jnp.int32)
+            vector = jnp.where(
+                (idx < rows - 1) | (idx == bonus_idx),
+                tok,
+                jnp.int32(-1),
+            )[None, :]
+            return (cache, positions, vector)
+
+        self._ops[key] = register_global_op(
+            "pallas::k3_dspark_init_state",
+            self.mesh,
+            fn,
+            OpRegistrationSpec(
+                in_specs=(P(),),
+                out_specs=(P(AXIS), P(), P()),
+                export_key=repr(
+                    (
+                        "dspark_init_state",
+                        rows,
+                        bonus_idx,
+                        dataclasses.astuple(cfg),
+                    )
+                ),
+            ),
+        )
+        return self._ops[key]
+
+    def _target_device(self, anchor: int | torch.Tensor) -> torch.device:
+        """Resolve target device from ``anchor`` or resident draft weights."""
+        if isinstance(anchor, torch.Tensor):
+            return anchor.device
+        if self.weights:
+            return next(iter(self.weights.values())).device
+        return torch.device("tpu")
+
+    def _tpu_anchor(
+        self,
+        anchor: int | torch.Tensor,
+        dev: torch.device,
+    ) -> torch.Tensor:
+        """Return a synchronized ``(1,)`` int32 anchor tensor on ``dev``."""
+        if (
+            isinstance(anchor, torch.Tensor)
+            and anchor.device.type == "tpu"
+            and anchor.dtype == torch.int32
+            and anchor.shape == (1,)
+        ):
+            anchor_t = anchor
+        else:
+            anchor_t = (
+                anchor.reshape(1).to(dtype=torch.int32, device=dev)
+                if isinstance(anchor, torch.Tensor)
+                else torch.tensor([int(anchor)], dtype=torch.int32, device=dev)
+            )
+        sync_mod = importlib.import_module("torch_tpu._internal.sync")
+        sync_mod.synchronize([anchor_t], wait=False)
+        return anchor_t
+
     def new_state(self, anchor: int | torch.Tensor) -> DraftState:
         """Return a cold draft state seeded with ``anchor``."""
+        dev = self._target_device(anchor)
+        if dev.type == "tpu":
+            anchor_t = self._tpu_anchor(anchor, dev)
+            cache, positions, vector = self._build_init_state()(anchor_t)
+            return _settled(DraftState(cache, positions, vector))
         cfg = self.config
         cache = torch.zeros(
             (1, cfg.layers, cfg.window, 2 * cfg.head_dim),
             dtype=torch.bfloat16,
-        ).to("tpu")
-        positions = torch.full((1, cfg.window), -1, dtype=torch.int32).to("tpu")
-        return _settled(DraftState(cache, positions, self._vector(anchor)))
+            device=dev,
+        )
+        positions = torch.full(
+            (1, cfg.window),
+            -1,
+            dtype=torch.int32,
+            device=dev,
+        )
+        return _settled(DraftState(cache, positions, self._vector(anchor, device=dev)))
 
     def from_ring(
         self,
@@ -369,15 +486,26 @@ class DsparkDraft:
         anchor: int | torch.Tensor,
     ) -> DraftState:
         """Construct a draft state over a prefill-computed ring and ``anchor``."""
-        return _settled(DraftState(cache, positions, self._vector(anchor)))
+        dev = cache.device
+        if dev.type == "tpu":
+            anchor_t = self._tpu_anchor(anchor, dev)
+            (vector,) = self._build_init_vector()(anchor_t)
+            return _settled(DraftState(cache, positions, vector))
+        return _settled(DraftState(cache, positions, self._vector(anchor, device=dev)))
 
-    def _vector(self, anchor: int | torch.Tensor) -> torch.Tensor:
+    def _vector(
+        self,
+        anchor: int | torch.Tensor,
+        *,
+        device: torch.device | str = "cpu",
+    ) -> torch.Tensor:
         """Allocate and seed a ``[1, 128]`` draft output vector with ``anchor``."""
-        vector = torch.full((1, _VECTOR_LEN), -1, dtype=torch.int32).to("tpu")
+        dev = torch.device(device)
+        vector = torch.full((1, _VECTOR_LEN), -1, dtype=torch.int32, device=dev)
         anchor_t = (
-            anchor.reshape(1).to(torch.int32)
+            anchor.reshape(1).to(dtype=torch.int32, device=dev)
             if isinstance(anchor, torch.Tensor)
-            else torch.tensor([int(anchor)], dtype=torch.int32).to("tpu")
+            else torch.tensor([int(anchor)], dtype=torch.int32, device=dev)
         )
         vector[0, : self.dspark.ROWS - 1] = anchor_t
         vector[0, self.dspark.OUT_BONUS] = anchor_t[0]
@@ -747,6 +875,13 @@ class DsparkDraft:
                         priority=2 * rows,
                     )
                 )
+        anchor = torch.empty((1,), dtype=torch.int32)
+        calls.extend(
+            (
+                CompileCall(self._build_init_state(), (anchor,), {}, priority=1),
+                CompileCall(self._build_init_vector(), (anchor,), {}, priority=1),
+            )
+        )
         return calls
 
     def step_batched(

@@ -272,6 +272,7 @@ class KimiDecoder:
         self._pads: list[_DraftStateLike] = []
         self._compiled_layout: tuple[int, int, int] | None = None
         self._zero: torch.Tensor | None = None
+        self._zero_kda_blocks: torch.Tensor | None = None
         self._modes: dict[int, torch.Tensor] = {}
         self._live_batches: set[int] = set()
         self.stats = {"plans": 0, "enters": 0, "chained": 0, "plain": 0, "batched": 0}
@@ -395,6 +396,16 @@ class KimiDecoder:
         self.forget(step_input.finished)
         return StepOutput(self._decode(step_input.requests, mask))
 
+    def _ensure_zero_kda_blocks(self) -> torch.Tensor:
+        """Return a settled all-zero TPU KDA block-id vector."""
+        if self._zero_kda_blocks is None:
+            self._zero_kda_blocks = torch.zeros(
+                KDA_LAYERS,
+                dtype=torch.int32,
+            ).to("tpu")
+            synchronize([self._zero_kda_blocks], wait=False)
+        return self._zero_kda_blocks
+
     def _admit(self, request: RequestInput, slot: int) -> None:
         """Import ``request``'s KDA state and optional DSpark ring into ``slot``."""
         kda = kda_blocks_at_length(
@@ -406,14 +417,30 @@ class KimiDecoder:
             msg = f"K3 decode: KDA state blocks {kda.tolist()} are not shared blocks"
             raise RuntimeError(msg)
         if not kda.any() and self.groups == 1:
+            if (
+                self._importer is not None
+                and self.ops.slots
+                and self.ops.slots[0].device.type == "tpu"
+            ):
+                conv, recurrent = self._importer.import_state(
+                    self.ops.slots[0],
+                    self.ops.slots[1],
+                    self._ensure_zero_kda_blocks(),
+                    slot,
+                )
+                self.ops.slots = [conv, recurrent]
+                return
             for state in self.ops.slots:
                 state[0, slot].zero_()
+            if self.ops.slots and self.ops.slots[0].device.type == "tpu":
+                synchronize(list(self.ops.slots), wait=False)
             return
         if self._importer is None:
             msg = "K3 decode: KDA importer is not bound"
             raise RuntimeError(msg)
         started = time.perf_counter()
         kda_blocks = torch.from_numpy(kda).to("tpu")
+        synchronize([kda_blocks], wait=False)
         conv, recurrent = self._importer.import_state(
             self.ops.slots[0],
             self.ops.slots[1],
@@ -456,7 +483,7 @@ class KimiDecoder:
             raise RuntimeError(msg)
         return self._importer.import_ring(
             self.draft.config,
-            torch.zeros(KDA_LAYERS, dtype=torch.int32).to("tpu"),
+            self._ensure_zero_kda_blocks(),
             0,
         )
 
@@ -469,7 +496,7 @@ class KimiDecoder:
         conv, recurrent = self._importer.import_state(
             self.ops.slots[0],
             self.ops.slots[1],
-            torch.zeros(KDA_LAYERS, dtype=torch.int32).to("tpu"),
+            self._ensure_zero_kda_blocks(),
             0,
         )
         self.ops.slots = [conv, recurrent]
@@ -487,6 +514,7 @@ class KimiDecoder:
             self.control = None
         if self.control is None:
             self.control = torch.zeros(self.layout.size, dtype=torch.int32).to("tpu")
+            synchronize([self.control], wait=False)
             self.device_plan = None
         if self._zero is None:
             self._zero = torch.zeros(1, dtype=torch.int32).to("tpu")
@@ -494,6 +522,10 @@ class KimiDecoder:
                 0: torch.zeros(1, dtype=torch.int32).to("tpu"),
                 1: torch.ones(1, dtype=torch.int32).to("tpu"),
             }
+            synchronize(
+                [self._zero, self._modes[0], self._modes[1]],
+                wait=False,
+            )
         return self.layout
 
     def _splice(self) -> Callable[..., tuple[torch.Tensor, ...]]:
@@ -665,7 +697,9 @@ class KimiDecoder:
     def _modes_for(self, modes: tuple[int, ...]) -> torch.Tensor:
         """Return cached int32 TPU tensor for ``modes`` tuple."""
         if modes not in self._mode_rows:
-            self._mode_rows[modes] = torch.tensor(modes, dtype=torch.int32).to("tpu")
+            mode_row = torch.tensor(modes, dtype=torch.int32).to("tpu")
+            synchronize([mode_row], wait=False)
+            self._mode_rows[modes] = mode_row
         return self._mode_rows[modes]
 
     def _take_state(self, req_id: str) -> _DraftStateLike:
