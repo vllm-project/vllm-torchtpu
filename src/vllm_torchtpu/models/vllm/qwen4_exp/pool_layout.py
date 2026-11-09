@@ -177,17 +177,28 @@ class Qwen4ExpPoolLayout:
         """Blocks' worth of one layer's compressed keys that fill a page."""
         return self.compressed_physical_pages // self.main_kernel_pages
 
+    @property
+    def merged_key_span(self) -> int:
+        """Pool pages of tokens one main-KV block ID covers, so columns of keys
+        per ID in the merged region: ``main_dcp`` (2 under PCP2), else 1."""
+        return max(1, int(self.main_dcp)) if self.merged_compressed else 1
+
     def compressed_region_pages(self, num_blocks: int) -> int:
         """Pages a merged carrier appends after ``num_blocks`` scheduler pages."""
         if not self.merged_compressed:
             return 0
-        return -(-num_blocks // self.compressed_columns_per_page)
+        return -(-num_blocks * self.merged_key_span // self.compressed_columns_per_page)
 
     def merged_compressed_slot(self, num_blocks: int) -> int:
         """``compressed_slot`` of a merged layer in a pool of ``num_blocks``
-        scheduler pages: ``-cols * N`` (``pooled_qsa.compressed_region``)."""
+        scheduler pages: region ``cols * N`` and the ID's span, encoded by
+        ``pooled_qsa.merged_compressed_slot``."""
+        from vllm_torchtpu.kernels.qwen4_exp.pooled_qsa import merged_compressed_slot
+
         assert self.merged_compressed
-        return -self.compressed_columns_per_page * num_blocks
+        return merged_compressed_slot(
+            self.compressed_columns_per_page * num_blocks, self.merged_key_span
+        )
 
 
 def pooled_cache_specs(
@@ -335,7 +346,9 @@ def pooled_cache_specs(
                 f"{PCP_INTERLEAVE_ENV}={interleave} must divide the {block_size}-token page"
             )
     dcp = main_kv_dcp() if main_dcp is None else main_dcp
-    if merged and dcp > 1:
+    if merged and dcp > 1 and not interleave:
+        # PCP (an interleaved main-KV split) keeps replicated keys: each main-KV ID
+        # spans `pcp` pages and owns that many columns of the region.
         raise ValueError(f"{MERGE_COMPRESSED_K_ENV}=1 is not combined with {MAIN_KV_DCP_ENV}")
     draft_attention = {prefix + ".self_attn" for prefix in mtp_layer_prefixes(cfg)}
     paired_away = {name for name, owner, _ in main_owners if name != owner}

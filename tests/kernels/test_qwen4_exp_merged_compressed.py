@@ -19,6 +19,8 @@ from vllm_torchtpu.kernels.qwen4_exp.pooled_qsa import (
     compressed_kernel_pages,
     compressed_pairs,
     compressed_region,
+    merged_compressed_slot,
+    merged_span,
     write_compressed,
 )
 
@@ -57,8 +59,8 @@ def test_merged_reads_stay_in_the_region(block_tokens):
     page_bytes, key_bytes, logical, cols, region = _geometry(block_tokens, n)
     assert cols == 8
     pool = _pool(n + region, block_tokens)
-    slot = -cols * n
-    assert compressed_region(slot) == cols * n
+    slot = merged_compressed_slot(cols * n)
+    assert compressed_region(slot) == cols * n and merged_span(slot) == 1
     columns = jnp.arange(1, n, dtype=jnp.int32)
     pages = np.asarray(compressed_kernel_pages(columns, pool, slot, RATIO)).reshape(len(columns), logical)
     expect = (np.arange(1, n)[:, None] + cols * n) * logical + np.arange(logical)
@@ -77,7 +79,7 @@ def test_expansion_matches_kernel_pages(block_tokens):
     pool = _pool(n + region, block_tokens)
     page_bytes, key_bytes, _, _, _ = _geometry(block_tokens, n)
     physical = page_bytes // key_bytes
-    for slot in (0, 3, -cols * n):
+    for slot in (0, 3, merged_compressed_slot(cols * n)):
         if slot > 0 and (slot + 1) * logical > physical:
             continue
         expansion, stride, offset = _compressed_expansion(logical, physical, slot)
@@ -106,7 +108,7 @@ def test_merged_write_is_read_back_like_unmerged(interpret, tokens):
     table = jnp.asarray([[5, 2, 7]], jnp.int32)
     # Unmerged: the layer owns whole pages; merged: the region after N pages.
     plain = _write(_pool(n, block_tokens), table, 0, tokens, keys)
-    merged = _write(_pool(n + region, block_tokens), table, -cols * n, tokens, keys)
+    merged = _write(_pool(n + region, block_tokens), table, merged_compressed_slot(cols * n), tokens, keys)
     view = lambda pool, slot: np.asarray(  # noqa: E731
         pool.reshape(-1, 4, 256)[
             np.asarray(compressed_pairs(
@@ -117,7 +119,7 @@ def test_merged_write_is_read_back_like_unmerged(interpret, tokens):
             )[0])
         ].astype(jnp.float32)
     )
-    np.testing.assert_array_equal(view(plain, 0), view(merged, -cols * n))
+    np.testing.assert_array_equal(view(plain, 0), view(merged, merged_compressed_slot(cols * n)))
     # The merged write touched only the region.
     assert not np.asarray(merged[:n].astype(jnp.float32)).any()
     assert np.asarray(merged[n:].astype(jnp.float32)).any()
@@ -133,7 +135,7 @@ def test_merged_pairs_follow_the_table():
     pair, write, _, _ = compressed_pairs(
         pool, jnp.zeros((tokens, 256), jnp.bfloat16), (logical % RATIO) == RATIO - 1,
         jnp.zeros((tokens,), jnp.int32), logical, jnp.asarray([0, tokens], jnp.int32),
-        jnp.asarray([0], jnp.int32), table, RATIO, -cols * n,
+        jnp.asarray([0], jnp.int32), table, RATIO, merged_compressed_slot(cols * n),
     )
     layer_pairs = block_tokens // (2 * RATIO)
     pair = np.asarray(pair)
@@ -144,3 +146,35 @@ def test_merged_pairs_follow_the_table():
     pairs_per_page = block_tokens * 4 // 4
     assert pair.min() >= n * pairs_per_page
     assert pair.max() < (n + region) * pairs_per_page
+
+
+@pytest.mark.parametrize("span", [2])
+def test_span_entry_owns_consecutive_columns(span):
+    """PCP2: a main-KV ID covers ``span`` pages of tokens and its keys are
+    columns ``span * c + i`` of the region, read and written alike."""
+    block_tokens, n = 3200, 11
+    _, _, logical, cols, _ = _geometry(block_tokens, n)
+    region = -(-n * span // cols)
+    pool = _pool(n + region, block_tokens)
+    slot = merged_compressed_slot(cols * n, span)
+    assert compressed_region(slot) == cols * n and merged_span(slot) == span
+    table = jnp.asarray([[7, 2]], jnp.int32)
+    tokens = 2 * span * block_tokens
+    logical_ids = jnp.arange(tokens, dtype=jnp.int32)
+    pair, _, _, _ = compressed_pairs(
+        pool, jnp.zeros((tokens, 256), jnp.bfloat16), (logical_ids % RATIO) == RATIO - 1,
+        jnp.zeros((tokens,), jnp.int32), logical_ids, jnp.asarray([0, tokens], jnp.int32),
+        jnp.asarray([0], jnp.int32), table, RATIO, slot,
+    )
+    layer_pairs = block_tokens // (2 * RATIO)
+    t = np.arange(tokens)
+    entry = np.asarray(table)[0][t // (span * block_tokens)]
+    column = entry * span + (t % (span * block_tokens)) // block_tokens + cols * n
+    np.testing.assert_array_equal(np.asarray(pair), column * layer_pairs + (t % block_tokens) // (2 * RATIO))
+    pairs_per_page = block_tokens * 4 // 4
+    assert np.asarray(pair).max() < (n + region) * pairs_per_page
+    # Kernel pages of an entry: span * logical consecutive pages of its columns.
+    pages = np.asarray(compressed_kernel_pages(jnp.asarray([3], jnp.int32), pool, slot, RATIO))
+    np.testing.assert_array_equal(pages, (3 * span + cols * n) * logical + np.arange(span * logical))
+    expansion, stride, offset = _compressed_expansion(span * logical, 0, slot)
+    assert (expansion, stride, offset) == (span * logical, span * logical, cols * n * logical)
