@@ -529,6 +529,7 @@ def get_msa_dcp_op(
     kv_head_replicas: int = 1,
     fp4: bool = False,
     decode_rows: int = 1,
+    dump_keys: bool = False,
 ) -> Callable[..., torch.Tensor]:
     """`get_msa_op` for a KV head's context split over ``dcp`` ranks
     (`kernels.msa_dcp`).
@@ -539,6 +540,14 @@ def get_msa_dcp_op(
 
     With `fp4` (4-bit caches, one KV head per rank) the op also takes and
     updates the layer's ``scale_cache``.
+
+    `dump_keys` (debug only) adds a third JAX op that recomputes this rank's
+    selected page keys and returns them packed ``[T, 3 + G * topk]`` int32
+    (local_key, pos, valid, keys); the op then takes a ``keys_dump`` buffer
+    and copies them into it in place. Off, the op is unchanged.
+
+    `fp4` (4-bit caches with their scales in their pages) only names the op
+    apart.
 
     The returned op takes this rank's DCP rank as an ``int32[1]`` device
     tensor (``dcp_rank``, a module buffer of the caller), not a Python int:
@@ -575,6 +584,7 @@ def get_msa_dcp_op(
             dcp,
             kv_head_replicas,
             decode_rows,
+            dump_keys,
         )
 
     def _score_jax(
@@ -658,6 +668,8 @@ def get_msa_dcp_op(
     score_op.register_fake(_score_fake)
     attend_op.register_fake(_head_major_attend_fake)
 
+    keys_op = _keys_dump_op(topk, dcp, suffix) if dump_keys else None
+
     def op(
         q: torch.Tensor,
         k: torch.Tensor,
@@ -669,6 +681,8 @@ def get_msa_dcp_op(
         metadata: AttentionMetadata,
         *,
         dcp_rank: torch.Tensor,
+        keys_dump: torch.Tensor | None = None,
+        keys_dump_meta: torch.Tensor | None = None,
     ) -> torch.Tensor:
         group = get_dcp_group()
         assert group is not None, "DCP group is not initialized"
@@ -702,6 +716,8 @@ def get_msa_dcp_op(
             )
         else:
             candidates = group.all_gather(candidates.unsqueeze(0), dim=0)
+        if keys_op is not None and keys_dump is not None:
+            _save_keys(keys_op, keys_dump, keys_dump_meta, kv_cache, candidates, metadata, dcp_rank)
         out, lse = attend_op(
             q_all,
             kv_cache,
@@ -716,6 +732,51 @@ def get_msa_dcp_op(
     return op
 
 
+
+def _keys_dump_op(topk: int, dcp: int, suffix: str):
+    """Debug only (`keys_dump`): a JAX op returning this rank's selected page
+    keys packed ``[T, 3 + G * topk]`` int32 (`msa_dcp.selected_keys_packed`)."""
+
+    def _keys_jax(kv_cache, candidates, seq_lens, block_tables, query_start_loc, dcp_rank):
+        return msa_dcp.selected_keys_packed(
+            kv_cache,
+            candidates,
+            seq_lens,
+            block_tables,
+            query_start_loc,
+            topk=topk,
+            rank=dcp_rank,
+            dcp=dcp,
+        )
+
+    keys_op = pallas.jax_op(f"pallas::minimax_m3_msa_keysdump_{suffix}", _keys_jax)
+
+    def _keys_fake(kv_cache, candidates, *args):
+        return torch.empty(
+            (candidates.shape[1], 3 + candidates.shape[2] // 2),
+            dtype=torch.int32,
+            device=candidates.device,
+        )
+
+    keys_op.register_fake(_keys_fake)
+    return keys_op
+
+
+def _save_keys(keys_op, keys_dump, keys_dump_meta, kv_cache, candidates, metadata, dcp_rank):
+    """Debug only: copy this call's packed selections into the layer's buffer."""
+    keys = keys_op(
+        kv_cache,
+        candidates,
+        metadata.seq_lens,
+        metadata.block_tables,
+        metadata.query_start_loc,
+        dcp_rank,
+    )
+    rows = min(keys.shape[0], keys_dump.shape[0])
+    keys_dump[:rows].copy_(keys[:rows])
+    keys_dump_meta[0:1].fill_(keys.shape[0])
+    keys_dump_meta[1:2].add_(1)
+
 def _get_msa_dcp_fp4_op(
     sm_scale: float,
     topk: int,
@@ -724,6 +785,7 @@ def _get_msa_dcp_fp4_op(
     dcp: int,
     kv_head_replicas: int,
     decode_rows: int,
+    dump_keys: bool = False,
 ) -> Callable[..., torch.Tensor]:
     """`get_msa_dcp_op` for 4-bit caches."""
     kv_heads = max(1, dcp // kv_head_replicas)
@@ -827,6 +889,7 @@ def _get_msa_dcp_fp4_op(
     suffix = (
         f"t{topk}_i{init_blocks}_l{local_blocks}_s{sm_scale:.8f}_dcp{dcp}_g{kv_heads}"
     ).replace(".", "p")
+    keys_op = _keys_dump_op(topk, dcp, suffix + "_fp4") if dump_keys else None
     early = msa_dcp_heads.early_q_gather_enabled()
     attend_rot_op = None
     if early and kv_heads == 1:
@@ -902,6 +965,8 @@ def _get_msa_dcp_fp4_op(
         dcp_rank: torch.Tensor,
         scale_cache: torch.Tensor,
         hadamard: torch.Tensor,
+        keys_dump: torch.Tensor | None = None,
+        keys_dump_meta: torch.Tensor | None = None,
     ) -> torch.Tensor:
         group = get_dcp_group()
         assert group is not None, "DCP group is not initialized"
@@ -993,6 +1058,8 @@ def _get_msa_dcp_fp4_op(
                 attend = attend_op
             else:
                 attend = attend_rot_op
+        if keys_op is not None and keys_dump is not None:
+            _save_keys(keys_op, keys_dump, keys_dump_meta, kv_cache, candidates, metadata, dcp_rank)
         out, lse = attend(
             q_all,
             kv_cache,

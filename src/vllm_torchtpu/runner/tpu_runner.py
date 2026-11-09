@@ -24,6 +24,7 @@ import copy
 import dataclasses
 import math
 import os
+import sys
 import time
 from collections.abc import Callable, Collection, Iterator, Mapping
 from contextlib import contextmanager
@@ -4389,6 +4390,22 @@ class TPUModelRunner(GPUModelRunner):
                     positions=self.position_ids,
                     inputs_embeds=inputs_embeds,
                     intermediate_tensors=intermediate_tensors,
+                )
+            # Debug only (minimax_msa_dump_keys): save the layer's MSA
+            # selections, outside the compiled graph. Loaded only by MiniMax.
+            keys_dump = sys.modules.get("vllm_torchtpu.models.minimax_m3.keys_dump")
+            if keys_dump is not None and keys_dump.LAYERS:
+                keys_dump.maybe_dump(
+                    num_tokens_padded,
+                    num_reqs,
+                    {
+                        "query_start_loc": self.query_start_loc_np[
+                            : num_reqs + 1
+                        ].copy(),
+                        "num_scheduled_tokens": np.int64(
+                            scheduler_output.total_num_scheduled_tokens
+                        ),
+                    },
                 )
 
             if nan_check is not None:

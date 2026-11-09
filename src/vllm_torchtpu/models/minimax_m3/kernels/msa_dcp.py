@@ -861,3 +861,42 @@ def msa_attend_dcp(
     return msa_attention_lse.msa_sparse_attention_lse_heads(
         q, kv_cache, keys, *args, head_major=True, **common
     )
+
+
+def selected_keys_packed(
+    kv_cache: jax.Array,
+    candidates: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    cu_q_lens: jax.Array,
+    *,
+    topk: int,
+    rank: int | jax.Array,
+    dcp: int,
+    interpret: bool = False,
+) -> jax.Array:
+    """Debug only: `msa_attend_dcp`'s selection of this rank, packed
+    ``[T, 3 + G * topk]`` int32 as ``(local_key, pos, valid, keys [G * topk])``
+    (``-1`` where not held here)."""
+    num_tokens = candidates.shape[1]
+    rank = rank_array(rank)[0]
+    block_size = msa.page_size(kv_cache)
+    max_num_seqs = seq_lens.shape[0]
+    pages_per_seq = block_tables.reshape(max_num_seqs, -1).shape[1]
+    seq_id, pos, valid = msa.token_positions(num_tokens, seq_lens, cu_q_lens)
+    selected = merge_head_candidates(candidates, topk, interpret)
+    own_block = pos // block_size
+    local_key = jnp.where(
+        valid & (own_block % dcp == rank), seq_id * pages_per_seq + own_block // dcp, -1
+    )
+    mine = (selected >= 0) & (selected % dcp == rank) & valid[:, None, None]
+    keys = jnp.where(mine, seq_id[:, None, None] * pages_per_seq + selected // dcp, -1)
+    return jnp.concatenate(
+        [
+            local_key[:, None].astype(jnp.int32),
+            pos[:, None].astype(jnp.int32),
+            valid[:, None].astype(jnp.int32),
+            keys.reshape(num_tokens, -1).astype(jnp.int32),
+        ],
+        axis=1,
+    )

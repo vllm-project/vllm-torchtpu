@@ -39,6 +39,7 @@ from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 from vllm_torchtpu.layers.adapter.attention import PallasMLAttentionBackend
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.owned_kv_cache import TpuOwnedKVCache
+from vllm_torchtpu.models.minimax_m3 import keys_dump as msa_keys_dump
 from vllm_torchtpu.models.minimax_m3.kernels import msa_fp4
 from vllm_torchtpu.models.minimax_m3.ops.msa import (
     get_msa_dcp_op,
@@ -185,6 +186,29 @@ def _hadamard_tensor(n: int, device: str) -> torch.Tensor:
     layer as `_dcp_rank_tensor` is (a module buffer: built at load time,
     outside the traced forward)."""
     return torch.tensor(msa_fp4.hadamard(n), dtype=torch.bfloat16, device=device)
+
+
+# --additional-config key (debug only): the decoder layer index whose MSA
+# prefill selections (DCP path) are captured into a device buffer for
+# `keys_dump.maybe_dump` to save. Unset: no extra op.
+DUMP_KEYS_KEY = "minimax_msa_dump_keys"
+
+def dump_keys_layer(vllm_config: VllmConfig) -> list[int] | None:
+    config = vllm_config.additional_config
+    if not isinstance(config, dict) or config.get(DUMP_KEYS_KEY) is None:
+        return None
+    layer = config[DUMP_KEYS_KEY]
+    layers = layer if isinstance(layer, list) else [layer]
+    if any(isinstance(x, bool) or not isinstance(x, int) for x in layers):
+        raise ValueError(f"additional_config.{DUMP_KEYS_KEY} must be an int or ints")
+    return layers
+
+
+def _layer_index(prefix: str) -> int | None:
+    for part in prefix.split("."):
+        if part.isdigit():
+            return int(part)
+    return None
 
 
 def cache_dtype(cache_config: CacheConfig | None) -> torch.dtype:
@@ -375,6 +399,10 @@ class MiniMaxM3SparseAttention(nn.Module):
                     f"DCP group of {get_dcp_world_size()} ranks, expected "
                     f"{self.dcp_size}."
                 )
+            dump_layer = dump_keys_layer(vllm_config)
+            self.dump_keys = (
+                dump_layer is not None and _layer_index(prefix) in dump_layer
+            )
             spec = vllm_config.speculative_config
             self.msa_op = get_msa_dcp_op(
                 *msa_config,
@@ -382,7 +410,24 @@ class MiniMaxM3SparseAttention(nn.Module):
                 self.kv_head_replicas,
                 fp4=self.fp4,
                 decode_rows=1 + (spec.num_speculative_tokens if spec else 0),
+                dump_keys=self.dump_keys,
             )
+            if self.dump_keys:
+                rows = vllm_config.scheduler_config.max_num_batched_tokens
+                width = 3 + self.dcp_kv_heads * sparse_cfg["sparse_topk_blocks"]
+                self.register_buffer(
+                    "keys_dump",
+                    torch.full((rows, width), -1, dtype=torch.int32),
+                    persistent=False,
+                )
+                self.register_buffer(
+                    "keys_dump_meta",
+                    torch.zeros((2,), dtype=torch.int32),
+                    persistent=False,
+                )
+                self.dump_layer_prefix = prefix
+                self.dump_dcp_rank = get_dcp_rank()
+                msa_keys_dump.LAYERS.append(self)
             # A buffer, not a Python int, so the rank is a graph input and
             # every DCP rank compiles the same program (see get_msa_dcp_op).
             self.register_buffer(
@@ -435,6 +480,9 @@ class MiniMaxM3SparseAttention(nn.Module):
                 extra["scale_cache"] = self.scale_cache.kv_cache
                 if self.dcp_size > 1:
                     extra["hadamard"] = self.hadamard
+            if getattr(self, "dump_keys", False):
+                extra["keys_dump"] = self.keys_dump
+                extra["keys_dump_meta"] = self.keys_dump_meta
             attn_output = self.msa_op(
                 q.view(num_tokens, self.num_heads, self.head_dim),
                 k.view(num_tokens, self.num_kv_heads, self.head_dim),
