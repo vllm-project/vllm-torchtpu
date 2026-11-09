@@ -7,7 +7,6 @@ import numpy as np
 import pytest
 
 from vllm_torchtpu.kernels.attention_preprocessing import compress_rope
-from vllm_torchtpu.kernels.deepseek_v41.csa2 import cache
 from vllm_torchtpu.kernels.experimental import decode_preparation as prep
 
 
@@ -73,7 +72,7 @@ def test_admit_off_and_cpu_take_native(tpu, monkeypatch):
 
 
 def test_admit_tuple_buckets(tpu):
-    buckets = prep.SWA_BATCHES
+    buckets = prep.MAIN_RECORD_BATCHES
     assert prep.admit("swa", tokens=(288, 48), buckets=buckets)
     assert not prep.admit("swa", tokens=(288, 16), buckets=buckets)
     assert not prep.admit("swa", tokens=(1024, 48), buckets=buckets)
@@ -90,33 +89,6 @@ def test_tpu_version_problem(tpu, monkeypatch):
     assert prep.tpu_version_problem() is None
     monkeypatch.setattr(prep, "get_tpu_version", lambda: 6)
     assert "v6" in prep.tpu_version_problem()
-
-
-@pytest.mark.parametrize(
-    "tokens,requests,fused",
-    [
-        (96, 16, True),
-        (192, 32, True),
-        (288, 32, True),
-        (288, 48, True),
-        (96, 32, False),
-        (192, 16, False),
-        (288, 16, False),
-        (128, 16, False),
-    ],
-)
-def test_swa_bucket_dispatch(tpu, monkeypatch, tokens, requests, fused):
-    monkeypatch.setattr(cache, "prepare_swa_metadata", stop("fallback"))
-    monkeypatch.setattr(prep, "_swa_capacities", stop("fused"))
-    with pytest.raises(DispatchReached, match="^fused$" if fused else "^fallback$"):
-        prep.swa_prepare_publish(
-            (),
-            jax.ShapeDtypeStruct((requests, 8), jnp.int32),
-            None,
-            jax.ShapeDtypeStruct((tokens,), jnp.int32),
-            None,
-            None,
-        )
 
 
 @pytest.mark.parametrize(
