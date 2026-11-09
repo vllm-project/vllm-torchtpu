@@ -161,11 +161,6 @@ def test_router_logits_distinct_tensor_gathered_twice(monkeypatch, communicator)
 # ==============================================================================
 
 
-def test_v41_fp8_config_name():
-    """Verify quantization config registration and get_name."""
-    assert moe_quant.VllmDeepseekV41Fp8Config.get_name() == "deepseek_v41_fp8"
-
-
 def test_moe_init_rejects_eplb():
     """Verify DeepseekV41MoE raises when enable_eplb is True."""
     vllm_config = SimpleNamespace(

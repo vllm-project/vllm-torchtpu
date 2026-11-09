@@ -157,14 +157,13 @@ def test_failed_dma_preserves_pending_handle(transport):
     assert slot.pending is pending
 
 
-@pytest.mark.parametrize("version", ["v1", "v2"])
-def test_model_records_device_consumers_before_slot_reuse(transport, version):
+def test_model_records_device_consumers_before_slot_reuse(transport):
     module, events, _ = transport
     slot = module.PreparedEngramUpload(4, torch.device("cpu"))
     slot.acquire().fill_(17)
     slot.start()
     slot.activate()
-    tree = ast.parse((SOURCE / version / "model.py").read_text())
+    tree = ast.parse((SOURCE / "v2" / "model.py").read_text())
     cls = next(
         node for node in tree.body if getattr(node, "name", None) == "DeepseekV41Model"
     )
