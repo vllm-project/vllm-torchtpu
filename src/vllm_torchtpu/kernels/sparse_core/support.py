@@ -50,3 +50,8 @@ def get_sparse_core_info(tpu_info: pltpu.TpuInfo | None = None):
         )
         return None
     return info.sparse_core
+
+
+def has_usable_sparse_core(tpu_info: pltpu.TpuInfo | None = None) -> bool:
+    """Whether these SparseCore kernels can run on this chip (False off TPU)."""
+    return get_sparse_core_info(tpu_info) is not None

@@ -88,6 +88,7 @@ At startup, `vllm-torchtpu` reports set environment variables that neither vLLM 
 | `TPU_MLA_MASKED_DENSE_ENABLED` | `False` | Enables the masked-dense MLA attention path for short KV lengths. |
 | `TPU_SPARSE_MLA_NOPE_LAYOUT` | `"sparsecore"` | Memory layout for Sparse MLA non-positional (`nope`) KV cache (`"sparsecore"` or `"tc"`). |
 | `TPU_SPARSE_MLA_ROPE_LAYOUT` | `"sparsecore"` | Memory layout for Sparse MLA RoPE KV cache (`"sparsecore"` or `"tc"`). |
+| `VLLM_TPU_TOPK_BACKEND` | `"auto"` | StreamIndex top-k selector. `"auto"` uses the SparseCore selector where `has_usable_sparse_core()` is True and the exact, sort-free TensorCore `BisectTopK` on chips where it is False. `"sparsecore"` and `"bisect"` force one of them; `"xla"` forces `lax.top_k`, which XLA lowers to a full sort. Part of the compile cache key. |
 | `TPU_SPARSE_MLA_CHUNK_TOKENS` | `None` | Query-token chunk size for Sparse MLA attention (each chunk gathers its tokens' top-k KV rows into one buffer and attends over it; unset keeps the kernel default of `64`). |
 | `USE_RPA_PIPELINED_DMA_STAGING` | `False` | Enables pipelined DMA staging in Ragged Paged Attention. |
 

@@ -147,6 +147,7 @@ if TYPE_CHECKING:
     TPU_EVICT_WEIGHTS_PAGE_CACHE: bool = False
     TPU_SPARSE_MLA_NOPE_LAYOUT: str = "sparsecore"
     TPU_SPARSE_MLA_ROPE_LAYOUT: str = "sparsecore"
+    VLLM_TPU_TOPK_BACKEND: str = "auto"
     TPU_KV_TRANSFER_PORT: str = "9100"
     TPU_SIDE_CHANNEL_PORT: str = "9600"
     TPU_NODE_ID: int = 0
@@ -517,6 +518,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "TPU_SPARSE_MLA_ROPE_LAYOUT": env_with_choices(
         "TPU_SPARSE_MLA_ROPE_LAYOUT", "sparsecore", ["sparsecore", "tensorcore"]
+    ),
+    # StreamIndex top-k selector: "auto" (SparseCore where these kernels support
+    # the chip's SparseCore, else the exact TensorCore "bisect" selector),
+    # "sparsecore", "bisect", or "xla" (lax.top_k). Registered here so the
+    # compile cache keys on it.
+    "VLLM_TPU_TOPK_BACKEND": env_with_choices(
+        "VLLM_TPU_TOPK_BACKEND",
+        "auto",
+        ["auto", "sparsecore", "bisect", "xla"],
+        case_sensitive=False,
     ),
     # JAX platform selection (e.g., "tpu", "cpu", "proxy")
     "JAX_PLATFORMS": lambda: os.getenv("JAX_PLATFORMS", "").lower(),

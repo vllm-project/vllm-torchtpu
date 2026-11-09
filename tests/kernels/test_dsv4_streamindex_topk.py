@@ -14,6 +14,7 @@
 """Tests for Deepseek V4 StreamIndex Top-K kernel."""
 
 import functools
+import re
 from typing import NamedTuple
 
 import jax
@@ -31,6 +32,21 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk import (
     convert_cache_to_seq_along_lane,
 )
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.topk_backend import (
+    default_topk_backend,
+)
+
+
+def _emitted_chunks(hlo: str) -> bool:
+    """Whether the lowered call scored more than one chunk.
+
+    A selector that overlaps scoring tags each chunk pair with a scheduling
+    group. A TensorCore selector gets none, but the scoring kernels carry the
+    chunk count in their names (``StreamIdxTC-...-c<chunks>``).
+    """
+    if default_topk_backend().overlaps_scoring:
+        return "_scheduling_group_id" in hlo
+    return re.search(r"StreamIdxTC-[\w-]*-c[0-9]+", hlo) is not None
 
 
 # =====================================================================
@@ -1217,10 +1233,9 @@ def test_chunked_topk_matches_the_naive_reference(T_list, chunk_tokens):
     )
 
     hlo = streamindex_topk.lower(**kwargs).as_text()
-    assert "_scheduling_group_id" in hlo, (
-        f"chunk_tokens={chunk_tokens} did not chunk: no scheduling group id "
-        "reached the HLO, so the kernel took the single-pass fallback and "
-        "this test would prove nothing"
+    assert _emitted_chunks(hlo), (
+        f"chunk_tokens={chunk_tokens} did not chunk: the kernel took the "
+        "single-pass fallback and this test would prove nothing"
     )
 
     actual = np.array(streamindex_topk(**kwargs))
@@ -1398,13 +1413,15 @@ class TestChunkedPipelining:
                   kv_layout)
         chunked_kwargs = _chunk_call_kwargs(*common, chunk_tokens)
 
-        # The per-chunk scheduling annotation is the only externally visible
-        # proof that more than one chunk was emitted. Without it this would be
-        # comparing the unchunked kernel against itself.
+        # The per-chunk scheduling annotation (or, without an overlapping
+        # selector, the chunk count in the kernel names) is the only
+        # externally visible proof that more than one chunk was emitted.
+        # Without it this would be comparing the unchunked kernel against
+        # itself.
         hlo = streamindex_topk.lower(**chunked_kwargs).as_text()
-        assert "_scheduling_group_id" in hlo, (
-            "no scheduling group annotation: the kernel ran a single unchunked"
-            " pass and this comparison would pass trivially")
+        assert _emitted_chunks(hlo), (
+            "the kernel ran a single unchunked pass and this comparison would"
+            " pass trivially")
 
         chunked = np.array(streamindex_topk(**chunked_kwargs))
         unchunked = np.array(
@@ -1439,9 +1456,9 @@ class TestChunkedPipelining:
                                             chunk_tokens,
                                             return_scores=True)
         hlo = streamindex_topk.lower(**chunked_kwargs).as_text()
-        assert "_scheduling_group_id" in hlo, (
-            "no scheduling group annotation: the kernel ran a single unchunked"
-            " pass and this comparison would pass trivially")
+        assert _emitted_chunks(hlo), (
+            "the kernel ran a single unchunked pass and this comparison would"
+            " pass trivially")
 
         chunked_idx, chunked_scores = streamindex_topk(**chunked_kwargs)
         unchunked_idx, unchunked_scores = streamindex_topk(
@@ -1483,7 +1500,7 @@ class TestChunkedPipelining:
         hlo = streamindex_topk.lower(
             **_chunk_call_kwargs(inputs, T_list, S_list, 128, 1, 8, 2, _HAS,
                                  chunk_tokens)).as_text()
-        assert "_scheduling_group_id" not in hlo, (
+        assert not _emitted_chunks(hlo), (
             "an indivisible chunk_tokens emitted more than one chunk; the"
             " fallback that the cases above rely on has changed")
 

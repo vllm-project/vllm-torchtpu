@@ -38,6 +38,11 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     dcp_sc_compact,
     metadata,
 )
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.topk_backend import (
+    SparseCoreTopK,
+    TopKBackend,
+    default_topk_backend,
+)
 
 try:
     from vllm_torchtpu.logger import init_logger
@@ -1048,6 +1053,7 @@ def _effective_row_lengths(
         "interleave_size",
         "return_scores",
         "uniform_q_len",
+        "topk_backend",
     ),
 )
 def streamindex_topk(
@@ -1077,6 +1083,7 @@ def streamindex_topk(
     interleave_size: int = 1,
     return_scores: bool = False,
     uniform_q_len: int | None = None,
+    topk_backend: TopKBackend | None = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
 
@@ -1142,6 +1149,12 @@ def streamindex_topk(
         what makes a cross-rank merge possible. A local top-k over a sharded KV
         axis is not the global top-k, so the merge needs the scores the same way
         the DCP attention kernels need an LSE output.
+      topk_backend: static selector run on each chunk's score buffer. None
+        (default) takes `default_topk_backend()`: the SparseCore selector where
+        these kernels support the chip's SparseCore, the exact TensorCore
+        `BisectTopK` elsewhere, or whatever `VLLM_TPU_TOPK_BACKEND` names. Only
+        a selector that `overlaps_scoring` gets the cross-chunk scheduling
+        groups.
 
     Returns:
       Top-K indices (rank-local when `cp_size > 1`, global compressed positions
@@ -1151,6 +1164,8 @@ def streamindex_topk(
     # Scale factors for the FP8 index cache format are packed directly inside
     # `cache_kv`, keeping HBM transactions fused.
 
+    if topk_backend is None:
+        topk_backend = default_topk_backend()
     kv_layout = KVLayout.parse(kv_layout)
 
     if cp_size < 1:
@@ -1530,8 +1545,9 @@ def streamindex_topk(
 
         # Ids count from 1, so the 0 is never a real group: a single chunk has no
         # pair to annotate and takes the `None` branch below both times.
+        # Only a selector on another engine overlaps the next chunk's scoring.
         group_base = 0
-        if num_chunks > 1:
+        if num_chunks > 1 and topk_backend.overlaps_scoring:
             group_base = config.reserve_scheduling_group_ids(num_chunks - 1)
 
         chunk_starts = (
@@ -1549,8 +1565,8 @@ def streamindex_topk(
             # Group g holds chunk g's SparseCore top-k and chunk g+1's TensorCore
             # scoring, so the scheduler emits `sc(g).start, tc(g+1), sc(g).done`.
             # Chunk 0's scoring and the last top-k have no partner.
-            tc_group = None if m == 0 else group_base + m - 1
-            sc_group = None if m == num_chunks - 1 else group_base + m
+            tc_group = None if m == 0 or not group_base else group_base + m - 1
+            sc_group = None if m == num_chunks - 1 or not group_base else group_base + m
 
             start = m * chunk_len
             scores = _scores_for_chunk(
@@ -1569,25 +1585,18 @@ def streamindex_topk(
                     constant_values=BITS_NEG_INF,
                 )
 
+            selected = topk_backend.select(
+                scores,
+                k,
+                row_lengths=eff_row_lengths[start : start + chunk_len],
+                scheduling_group_id=sc_group,
+                return_scores=return_scores,
+            )
             if return_scores:
-                chunk_topk_idxs, chunk_topk_scores = sparsecore_topk(
-                    scores,
-                    k,
-                    row_lengths=eff_row_lengths[start : start + chunk_len],
-                    write_empty_rows=True,
-                    scheduling_group_id=sc_group,
-                    return_scores=True,
-                )
+                chunk_topk_idxs, chunk_topk_scores = selected
                 topk_scores_list.append(chunk_topk_scores)
             else:
-                chunk_topk_idxs = sparsecore_topk(
-                    scores,
-                    k,
-                    row_lengths=eff_row_lengths[start : start + chunk_len],
-                    write_empty_rows=True,
-                    scheduling_group_id=sc_group,
-                    return_scores=False,
-                )
+                chunk_topk_idxs = selected
             topk_idxs.append(chunk_topk_idxs)
 
         out = topk_idxs[0] if len(topk_idxs) == 1 else jnp.concatenate(topk_idxs)
@@ -1808,6 +1817,8 @@ def streamindex_topk_dcp(
             cp_rank=dcp_rank,
             interleave_size=interleave_size,
             return_scores=True,
+            # The cross-rank merge below runs on the SparseCore as well.
+            topk_backend=SparseCoreTopK(),
         )
 
         if a2a_merge:
