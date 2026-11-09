@@ -71,6 +71,7 @@ def test_megakernel_portability_ast_guard():
 
     Checks all `.py` files under `src/vllm_torchtpu/megakernel/`:
     - Zero imports from `vllm`, `vllm_torchtpu`, or `torch`.
+    - Zero environment reads (`os.environ`, `os.getenv`, `os.putenv`, `posix.environ`).
     - All absolute (`level == 0`) imports come strictly from Python stdlib, `jax`,
       or `numpy` (enforcing relative imports for all internal modules).
     - Private `jax._src.*` imports are restricted to `{"dma/pool_alias.py"}`.
@@ -80,6 +81,14 @@ def test_megakernel_portability_ast_guard():
     jax_src_allowlist = {"dma/pool_alias.py"}
     forbidden_roots = {"vllm", "vllm_torchtpu", "torch"}
     allowed_external_roots = sys.stdlib_module_names | {"jax", "numpy"}
+    forbidden_env_attrs = {
+        "environ",
+        "environb",
+        "getenv",
+        "getenvb",
+        "putenv",
+        "putenvb",
+    }
 
     py_files = sorted(pkg_root.rglob("*.py"))
     rel_paths = {p.relative_to(pkg_root).as_posix() for p in py_files}
@@ -90,7 +99,22 @@ def test_megakernel_portability_ast_guard():
     for path in py_files:
         rel = path.relative_to(pkg_root).as_posix()
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        os_aliases = {"os", "posix"}
         for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name in {"os", "posix"} and alias.asname:
+                        os_aliases.add(alias.asname)
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id in os_aliases
+            ):
+                assert node.attr not in forbidden_env_attrs, (
+                    f"{rel}:{_ln(node)} accesses '{node.value.id}.{node.attr}'; "
+                    "megakernel modules must not read/mutate the environment."
+                )
             if isinstance(node, ast.Call):
                 func = node.func
                 func_name = (
@@ -116,6 +140,12 @@ def test_megakernel_portability_ast_guard():
                 level = node.level
                 modules = [node.module] if node.module else []
                 imported_names = [alias.name for alias in node.names]
+                if level == 0 and node.module in {"os", "posix"}:
+                    bad_env = forbidden_env_attrs.intersection(imported_names)
+                    assert not bad_env, (
+                        f"{rel}:{_ln(node)} imports {sorted(bad_env)} from "
+                        f"'{node.module}'; megakernel modules must not read env."
+                    )
             else:
                 continue
 
