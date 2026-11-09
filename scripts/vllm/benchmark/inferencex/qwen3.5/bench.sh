@@ -15,17 +15,14 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/check_client.sh"
+prepare_inferencex_client || exit 1
+
 MODEL=Qwen/Qwen3.5-397B-A17B-FP8
 PORT="${PORT:-8000}"
 # Matching InferenceX's Qwen3.5 benchmarks.
 RANDOM_RANGE_RATIO="${RANDOM_RANGE_RATIO:-0.8}"
-if [ -z "${INFERENCEX_REPO:-}" ]; then
-  INFERENCEX_REPO=/tmp/InferenceX
-  if [ ! -d "$INFERENCEX_REPO/.git" ]; then
-    echo "INFERENCEX_REPO unset -> cloning InferenceX to $INFERENCEX_REPO"
-    git clone --depth 1 https://github.com/SemiAnalysisAI/InferenceX.git "$INFERENCEX_REPO"
-  fi
-fi
 BENCH_CLIENT="${INFERENCEX_REPO}/utils/bench_serving/benchmark_serving.py"
 RESULT_DIR="${RESULT_DIR:-/tmp/qwen3.5-inferencex-bench}"
 ISL="${ISL:-8192}"
