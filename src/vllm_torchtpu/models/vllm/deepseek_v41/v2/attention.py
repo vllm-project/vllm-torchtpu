@@ -52,7 +52,6 @@ from .ops import (
 )
 from .projection_rope import initialize_projection_rope
 from .sparse_mqa_indexer import SparseMQAIndexer, quantize_query
-from .swa_cache import DeepseekV41SWASpec
 
 logger = init_logger(__name__)
 
@@ -413,8 +412,6 @@ class AttentionBackend(compressor_upstream.CompressorBackend):
 
 
 class SWACache(NativeCacheView, DeepseekV4SWACache):
-    native_pages = False
-
     def __init__(self, *args, **kwargs):
         kwargs["block_size"] = kwargs["cache_config"].block_size
         # Upstream ties bounded replay to its V2 model runner; the TPU model
@@ -426,28 +423,9 @@ class SWACache(NativeCacheView, DeepseekV4SWACache):
         super().__init__(*args, **kwargs)
 
     def get_kv_cache_spec(self, vllm_config):
-        spec = super().get_kv_cache_spec(vllm_config)
-        if not self.native_pages:
-            return spec
-        values = {
-            field.name: getattr(spec, field.name) for field in dataclasses.fields(spec)
-        }
-        values["extra_retained_tokens"] = max(
-            0, vllm_config.num_prefill_lookahead_tokens - 1
-        )
-        # One spec with or without prefix caching: bounded replay rebuilds the
-        # window after a hit, so pages live only while their request holds them.
-        if vllm_config.cache_config.enable_prefix_caching and not spec.bounded_replay:
-            # A main-KV hit without replay would read a window never rebuilt.
-            raise ValueError(
-                "DeepSeek-V4.1 CSA2 SWA with prefix caching requires "
-                "--swa-bounded-replay and prefill-context-parallel-size=1"
-            )
-        return DeepseekV41SWASpec(
-            **values,
-            max_num_seqs=vllm_config.scheduler_config.max_num_seqs,
-            max_in_flight_tokens=vllm_config.max_in_flight_tokens,
-            num_lookahead_tokens=vllm_config.num_lookahead_tokens,
+        return dataclasses.replace(
+            super().get_kv_cache_spec(vllm_config),
+            extra_retained_tokens=max(0, vllm_config.num_prefill_lookahead_tokens - 1),
         )
 
 
@@ -592,13 +570,11 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             and self.window_size == 128
             and self.n_local_heads == 64
         )
-        # Compress-ratio-0 layers (SWA only, and the DSpark draft) run CSA2's
-        # SWA-only form: one attention kernel reads native pages for every layer.
+        # SWA-only and compressed-attention layers share the same word-pool path.
         self._csa2 = csa2_supported
-        # Set after weight loading, once wo_b's runtime layout is known.
         self._fused_wo_b = False
         self._fused_preprocess = csa2_supported
-        self.swa_cache_layer.native_pages = self._csa2
+        self.swa_cache_layer._tpu_swa_words = self._csa2
         if self.compress_ratio:
             logger.info_once(
                 "DeepSeek-V4.1 attention backend: %s",
@@ -1260,7 +1236,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             if cached is None or cached[0] is not swa.block_tables:
                 if (
                     self._fused_preprocess
-                    and swa_cache.native_swa
+                    and swa_cache.swa_words
                     and rows_per_page == swa_cache.page_stride == 64
                     and swa_cache.row_offset == 0
                     and not non_causal
