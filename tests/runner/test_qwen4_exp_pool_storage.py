@@ -75,6 +75,7 @@ def test_actual_pool_backing_does_not_allocate_main_sized_compressed_pages(
         ple=None,
     )
     model = NS(model=NS(layers=[layer0, layer1]))
+    model.get_language_model = lambda: model
     monkeypatch.setattr(
         "vllm_torchtpu.models.vllm.qwen4_exp.pooled_cache.compute_hbm_budget",
         lambda *a, **kw: NS(available=1 << 40),
@@ -171,7 +172,9 @@ def _startup_cache(
         "vllm_torchtpu.models.vllm.qwen4_exp.pooled_cache.compute_hbm_budget",
         lambda *a, **kw: NS(available=1 << 40),
     )
-    cache = Qwen4ExpPooledCache(runner, NS(model=NS(layers=layers)))
+    model = NS(model=NS(layers=layers))
+    model.get_language_model = lambda: model
+    cache = Qwen4ExpPooledCache(runner, model)
     cache.get_specs()
     cfg.cache_config.block_size = cache.layout.block_size
     cfg.cache_config.mamba_block_size = cache.layout.block_size if prefix else None

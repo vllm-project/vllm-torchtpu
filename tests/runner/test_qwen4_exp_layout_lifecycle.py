@@ -61,6 +61,7 @@ def configuration(prefix, dtype, tp, requested, dim):
     cfg.compilation_config = CompilationConfig()
     cfg.parallel_config.pipeline_parallel_size = 1
     cfg.parallel_config.world_size = tp
+    rotary_half = int(dim * q4exp_text_config().partial_rotary_factor) // 2
     cfg.model_config = ModelOptions(
         hf_config=PretrainedConfig.from_dict(
             {"architectures": ["Qwen4ExpForCausalLM"]}
@@ -74,6 +75,10 @@ def configuration(prefix, dtype, tp, requested, dim):
             num_attention_heads=4,
             num_key_value_heads=2,
             head_dim=dim,
+            rope_parameters={
+                **q4exp_text_config().rope_parameters,
+                "mrope_section": [(rotary_half + i) // 3 for i in (2, 1, 0)],
+            },
             indexer_head_dim=64,
             indexer_n_heads=1,
             indexer_budget=64,
@@ -129,6 +134,7 @@ def worker_and_adapter(cfg, events):
             ]
         )
     )
+    model.get_language_model = lambda: model
     events.append("load")
     adapter.bind_model(model)
     worker = TPUWorker.__new__(TPUWorker)
@@ -157,6 +163,8 @@ def test_load_negotiate_specs_profile_scheduler_with_independent_configs(
     monkeypatch.setattr(
         pooled_cache, "compute_hbm_budget", lambda *args: NS(available=1 << 40)
     )
+    monkeypatch.setattr(pooled_cache, "get_tp_group", lambda: NS(cpu_group="tp"))
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda *_args, **_kwargs: None)
     driver = configuration(prefix, dtype, tp, requested, dim)
     events, workers, adapters, owner_lists = [], [], [], []
     actual_specs = pooled_cache.pooled_cache_specs

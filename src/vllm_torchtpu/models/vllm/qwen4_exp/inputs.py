@@ -74,7 +74,7 @@ class Qwen4ExpAdapter:
 
     def get_kv_cache_spec(self):
         assert self.cache is not None
-        return self.cache.get_specs()
+        return self.cache.get_worker_specs()
 
     def initialize_kv_cache(self, config) -> dict[str, LayerKVCache] | None:
         assert self.cache is not None

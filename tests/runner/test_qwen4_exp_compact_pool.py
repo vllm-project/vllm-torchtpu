@@ -54,6 +54,14 @@ def compact_config(
         num_attention_heads=kv_heads * 2,
         num_key_value_heads=kv_heads,
         head_dim=head_dim,
+        rope_parameters={
+            **q4exp_text_config().rope_parameters,
+            "mrope_section": [
+                (int(head_dim * q4exp_text_config().partial_rotary_factor) // 2 + i)
+                // 3
+                for i in (2, 1, 0)
+            ],
+        },
         indexer_n_heads=1,
         indexer_head_dim=index_dim,
         indexer_compress_ratio=ratio,

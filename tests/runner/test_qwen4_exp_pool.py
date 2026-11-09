@@ -50,6 +50,8 @@ def pool_config(tp=1, kv="fp8_e4m3", ssm="bfloat16"):
         ),
         parallel_config=NS(
             tensor_parallel_size=tp,
+            data_parallel_size=1,
+            enable_expert_parallel=False,
             prefill_context_parallel_size=1,
             decode_context_parallel_size=1,
         ),

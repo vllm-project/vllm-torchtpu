@@ -16,7 +16,9 @@
 from dataclasses import replace
 
 import torch
+from vllm.distributed.parallel_state import get_tp_group
 from vllm.v1.core.kv_cache_utils import (
+    check_enough_kv_cache_memory,
     get_kv_cache_config_from_groups,
     get_kv_cache_groups,
     resolve_cache_hit_alignment_tokens,
@@ -29,7 +31,11 @@ from vllm.v1.worker.utils import AttentionGroup
 from vllm_torchtpu.kv_cache_materializer import LayerKVCache
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadataBuilder
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.utils import compute_hbm_budget, synchronize_tensors
+from vllm_torchtpu.utils import (
+    compute_hbm_budget,
+    min_across_ep_dp,
+    synchronize_tensors,
+)
 
 from .config import native_cache_capacity, require_unified_pool
 from .pd import TransferGroup, build_transfer_groups
@@ -47,29 +53,85 @@ class Qwen4ExpPooledCache:
         self.runner = runner
         self.model = None if model is None else model.get_language_model()
         self.requested_blocks = runner.cache_config.num_gpu_blocks_override
+        self._budgeted_pages: int | None = None
+        self._capacity_ceiling: int | None = None
         self.materialized = None
 
-    def get_specs(self):
+    def get_specs(self, available_memory: int | None = None):
         cfg = self.runner.vllm_config
         layout, specs = pooled_cache_specs(cfg)
         pages = native_cache_capacity(cfg, specs)
-        if self.materialized is not None and (
-            layout != self.layout or specs != self.specs or pages != self.pages
+        if (self.materialized is not None or self._budgeted_pages is not None) and (
+            layout != self.layout
+            or specs != self.specs
+            or pages != self._capacity_ceiling
         ):
             raise ValueError("Qwen native cache geometry changed after allocation")
         self.layout, self.specs = layout, specs
+        self._capacity_ceiling = pages
         cache = cfg.cache_config
         cache.block_size = self.layout.block_size
         cache.mamba_block_size = (
             self.layout.block_size if cache.enable_prefix_caching else None
         )
         cache.mamba_page_size_padded = self.layout.page_bytes
-        self.pages = pages
-        if self.requested_blocks not in (None, self.pages):
-            raise ValueError(f"Qwen4Exp native capacity requires {self.pages} blocks")
-        cache.num_gpu_blocks_override = self.pages
         self.groups = get_kv_cache_groups(cfg, self.specs)
+        if available_memory is not None and self._budgeted_pages is None:
+            previous_override = cache.num_gpu_blocks_override
+            cache.num_gpu_blocks_override = self.requested_blocks
+            try:
+                plan = get_kv_cache_config_from_groups(
+                    cfg, self.groups, available_memory
+                )
+            finally:
+                cache.num_gpu_blocks_override = previous_override
+            if plan.num_blocks <= 0:
+                raise ValueError("Qwen native pool budget cannot hold a cache block")
+            physical_bytes = {tensor.size for tensor in plan.kv_cache_tensors}
+            assert len(physical_bytes) == 1
+            bytes_per_block, remainder = divmod(physical_bytes.pop(), plan.num_blocks)
+            assert not remainder
+            selected = (
+                min(pages, plan.num_blocks)
+                if self.requested_blocks is None
+                else self.requested_blocks
+            )
+            layout.validate_capacity(selected)
+            required = selected * bytes_per_block
+            if required > available_memory:
+                raise ValueError(
+                    "Qwen native pool override exceeds available HBM budget"
+                )
+            check_enough_kv_cache_memory(cfg, self.specs, required)
+            self._budgeted_pages = selected
+        self.pages = (
+            self._budgeted_pages
+            if self._budgeted_pages is not None
+            else self.requested_blocks
+            if self.requested_blocks is not None
+            else pages
+        )
+        layout.validate_capacity(self.pages)
+        cache.num_gpu_blocks_override = self.pages
         return self.specs
+
+    def get_worker_specs(self):
+        """Select one physical capacity before the executor negotiates its plan."""
+        if self._budgeted_pages is not None or self.materialized is not None:
+            return self.get_specs()
+        cfg = self.runner.vllm_config
+        budget = compute_hbm_budget(
+            [self.runner.device], cfg.cache_config.gpu_memory_utilization
+        )
+        available = budget.available - TEMP_HEADROOM
+        if cfg.parallel_config.tensor_parallel_size > 1:
+            value = torch.tensor([available], dtype=torch.int64, device="cpu")
+            torch.distributed.all_reduce(
+                value, op=torch.distributed.ReduceOp.MIN, group=get_tp_group().cpu_group
+            )
+            available = int(value.item())
+        available = min_across_ep_dp(cfg.parallel_config, available)
+        return self.get_specs(available_memory=available)
 
     def get_transfer_groups(self) -> tuple[TransferGroup, ...]:
         """Use the bound scheduler plan, including auxiliary and state groups."""
@@ -81,7 +143,7 @@ class Qwen4ExpPooledCache:
         if self.materialized is not None:
             return
         runner = self.runner
-        self.get_specs()
+        self.get_worker_specs()
         config = get_kv_cache_config_from_groups(
             runner.vllm_config,
             self.groups,
