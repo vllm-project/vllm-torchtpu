@@ -520,7 +520,10 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         routed layer's is the shared expert's; the runner checks it again
         against the shared module before every call.
         """
-        if not envs.MOE_FUSED_EP_PUSH_SHARED_EXPERT:
+        if (
+            envs.MOE_FUSED_EP_KERNEL_IMPL != "push"
+            or not envs.MOE_FUSED_EP_PUSH_SHARED_EXPERT
+        ):
             return None
         limit = getattr(layer, "swiglu_limit", None)
         if limit is None:

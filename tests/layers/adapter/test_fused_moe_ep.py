@@ -1487,6 +1487,30 @@ def test_shared_expert_operands_reach_the_push_layer(monkeypatch):
         assert got is want
 
 
+@pytest.mark.parametrize(
+    "impl,shared_limit", [(None, None), ("v2", None), ("push", 10.0)]
+)
+@pytest.mark.parametrize("enabled", [False, True])
+def test_mxfp4_prebuild_only_fuses_shared_expert_for_push(
+    monkeypatch, impl, shared_limit, enabled
+):
+    """V2 serving keeps its standalone shared expert with the push flag enabled."""
+    from vllm_torchtpu.layers.adapter.quantization.mxfp4 import (
+        VllmDeepseekV4Mxfp4MoEMethod,
+    )
+
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_KERNEL_IMPL", impl)
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_SHARED_EXPERT", enabled)
+    method = object.__new__(VllmDeepseekV4Mxfp4MoEMethod)
+    method.fused_ep = True
+    layer = _layer(renormalize=True, swiglu_limit=10.0)
+    w13 = torch.empty((4, 512, 1024), device="meta")
+    w2 = torch.empty((4, 512, 512), device="meta")
+    with patch.object(bridge, "prebuild_fused_moe_ep", return_value="op") as build:
+        assert method._prebuild_w4a8(layer, "silu", w13, w2, 512) == "op"
+    assert build.call_args.kwargs["shared_limit"] == (shared_limit if enabled else None)
+
+
 def test_shared_expert_needs_the_push_kernel(monkeypatch):
     monkeypatch.setenv("MOE_FUSED_EP_KERNEL_IMPL", "v2")
     monkeypatch.setattr(bridge, "_OPS", {})
