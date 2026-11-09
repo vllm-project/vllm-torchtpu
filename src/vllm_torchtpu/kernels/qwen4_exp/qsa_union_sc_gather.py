@@ -553,6 +553,7 @@ def _gather_kernel(
     ratio,
     line_matmul,
     skip_dead,
+    bits_group_offset=0,
 ):
     if skip_dead:
         steps_hbm, kv_out_hbm, lines_hbm, kv_sem = refs
@@ -603,7 +604,9 @@ def _gather_kernel(
             )
             for s in range(streams)
         )
-        bit_specs = _bits_specs(ids_v, g * words, bits_hbm.shape[1], plan)
+        # (no add when the offset is 0: the kernel body stays the sliced form's)
+        bit_specs = _bits_specs(ids_v, (g + bits_group_offset) * words if bits_group_offset else g * words,
+                                bits_hbm.shape[1], plan)
         lines_spec = _lines_spec(item, plan, repeat, lines_hbm.shape[1])
 
         @pl.when(jnp.logical_and(item < plan.items, steps > 0))
@@ -663,7 +666,7 @@ def choose_gather_plan(
 
 
 def union_sc_gather(
-    pool, bits, rows, ids, *, ratio, line_matmul, usize=None, kv_tile=None, streams=None
+    pool, bits, rows, ids, *, ratio, line_matmul, usize=None, kv_tile=None, streams=None, bits_group_offset=0
 ):
     """SparseCore gather step: ``union_gather_reference``'s ``(gathered_kv, lines)``.
 
@@ -678,12 +681,15 @@ def union_sc_gather(
     attention kernel never reads (see the module docstring); those KV rows and
     lines are then unspecified. ``streams``: concurrent indirect gathers per
     pipeline step (default: 2 if the VMEM budget allows, else 1).
+
+    ``bits_group_offset`` (static): ``bits`` may hold more query groups than ``rows``/``ids``; group ``g`` of this
+    call then reads bits group ``g + bits_group_offset`` (one chunk of a larger plan, without a sliced copy of its bits).
     """
     pages, page_size, head_axis, packing, dim = pool.shape
     ngroups, cap_ranks = rows.shape
     bgroups, words, width = bits.shape
-    if ids.shape != rows.shape or bgroups != ngroups:
-        raise ValueError("rows, ids and bits must share the query groups")
+    if ids.shape != rows.shape or not 0 <= int(bits_group_offset) <= bgroups - ngroups:
+        raise ValueError("rows, ids and bits must share the query groups (bits may hold more, from bits_group_offset)")
     if jnp.dtype(pool.dtype).itemsize * packing != 4:
         raise ValueError("the pool's packed sublanes must make 32-bit words")
     _log2(ratio)
@@ -712,7 +718,7 @@ def union_sc_gather(
         # Splits the token dim only (major dims): free.
         pool.reshape(pages * page_size // ratio, ratio, head_axis, packing, dim),
         # Free when words % 8 == 0 (union_bits_plan pads words to 8).
-        bits.reshape(ngroups * words, width),
+        bits.reshape(bgroups * words, width),
         rows.astype(jnp.int32).reshape(-1),
         ids.astype(jnp.int32).reshape(-1),
     ]
@@ -729,6 +735,7 @@ def union_sc_gather(
             ratio=ratio,
             line_matmul=line_matmul,
             skip_dead=skip,
+            bits_group_offset=int(bits_group_offset),
         ),
         out_type=(
             jax.ShapeDtypeStruct((ranks, ratio, head_axis, packing, dim), pool.dtype),

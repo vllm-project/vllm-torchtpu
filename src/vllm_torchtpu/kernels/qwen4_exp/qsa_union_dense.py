@@ -1499,8 +1499,15 @@ def _word_bases(page_rows, *, words, page_size, word_tokens):
 def union_walk_kernel(query, bits, ubits, usize, vlengths, pool, page_table_row, *, group,
                       union_cap, kv_tile, ratio=4, k_scale=1.0, v_scale=1.0, lean=False,
                       scan_list=False, line_matmul=False, fast_walk=False, scopes=0, walk_runs=0,
-                      qk16=False, gathered=None, listed=None, listed_lines=None, run_tables=None):
+                      qk16=False, gathered=None, listed=None, listed_lines=None, run_tables=None,
+                      group_offset=0):
     """The walking kernel alone, on a precomputed ``union_bits_plan`` (ungated bf16 output).
+
+    ``group_offset`` (static; gathered only): ``query`` and ``vlengths`` are a larger plan's whole rows, and this call
+    walks its groups ``[group_offset, group_offset + ngroups)`` (``ngroups`` = ``ubits.shape[0]``): the blocks are
+    read in place instead of from sliced copies. ``bits`` may be None with ``gathered``: the gathered walk takes its
+    masks from the gathered lines and never reads the bitset (C: ``start_tile_gathered``), so no per-group bitset
+    block is staged. With either, the output holds this call's rows only.
 
     ``gathered`` (SparseCore union gather, step 1): ``(gathered KV, gathered
     lines)`` from ``union_gather_reference`` (or the SparseCore kernels, same
@@ -1539,16 +1546,27 @@ def union_walk_kernel(query, bits, ubits, usize, vlengths, pool, page_table_row,
     if run_tables is not None and (listed_lines is None or listed is not None or gathered is not None or walk_runs
                                    or scan_list or not fast_walk):
         raise ValueError("run tables need listed_lines and replace the listed walk, the gather and walk_runs")
+    if (group_offset or bits is None) and gathered is None:
+        raise ValueError("group_offset and bits=None need the gathered walk")
+    in_place = bool(group_offset) or bits is None
     tokens, query_heads, head_dim = query.shape
     pages, page_size, head_axis, packing, cache_dim = pool.shape
     kv_heads = 2 if query_heads == 24 else 1
     ngroups, words = ubits.shape
+    if in_place and ((group_offset + ngroups) * group > tokens or vlengths.shape[0] != tokens):
+        raise ValueError("group_offset: query and vlengths must hold the walked groups' rows")
+    if bits is None:
+        bits = jnp.zeros((1, 8, 128), jnp.int32)  # never read by the gathered walk (see the docstring)
     words_padded = _cdiv(words, _LIST_ALIGN) * _LIST_ALIGN
     cap_tiles = _cdiv(union_cap * ratio, kv_tile)
     tiles = jnp.minimum(_cdiv(usize * ratio, kv_tile), cap_tiles).astype(jnp.int32)
     q_heads_per_kv = query_heads // kv_heads
     state_shape = (1, kv_heads, group * q_heads_per_kv)
     width = bits.shape[2]
+    if in_place and bits.shape[0] != 1:
+        raise ValueError("an in-place gathered walk takes bits=None")
+    bits_block, bits_index = ((1, bits.shape[1], width), lambda b, *_: (0, 0, 0)) if in_place else (
+        (1, words, width), lambda b, *_: (b, 0, 0))
     word_tokens = 32 * ratio
     if fast_walk and page_size % word_tokens:
         raise ValueError("the fast walk needs pages that hold whole 32-group words")
@@ -1623,9 +1641,11 @@ def union_walk_kernel(query, bits, ubits, usize, vlengths, pool, page_table_row,
             num_scalar_prefetch=5,
             grid=(ngroups,),
             in_specs=[
-                pl.BlockSpec((group, query_heads, head_dim), lambda b, *_: (b, 0, 0)),
-                pl.BlockSpec((1, words, width), lambda b, *_: (b, 0, 0)),
-                pl.BlockSpec((group, 1), lambda b, *_: (b, 0)),
+                pl.BlockSpec((group, query_heads, head_dim), (lambda b, *_: (b + group_offset, 0, 0)) if group_offset
+                             else (lambda b, *_: (b, 0, 0))),
+                pl.BlockSpec(bits_block, bits_index),
+                pl.BlockSpec((group, 1), (lambda b, *_: (b + group_offset, 0)) if group_offset
+                             else (lambda b, *_: (b, 0))),
                 pl.BlockSpec(memory_space=pltpu.HBM),
                 pl.BlockSpec(memory_space=pltpu.HBM),
             ] + ([pl.BlockSpec(memory_space=pltpu.HBM)] * 2 if gathered is not None else []) + ids_extra
@@ -1653,7 +1673,8 @@ def union_walk_kernel(query, bits, ubits, usize, vlengths, pool, page_table_row,
             * 1024**2,
             disable_bounds_checks=True,
         ),
-        out_shape=jax.ShapeDtypeStruct(query.shape, jnp.bfloat16),
+        out_shape=jax.ShapeDtypeStruct((ngroups * group, query_heads, head_dim) if in_place else query.shape,
+                                       jnp.bfloat16),
         name=f"qsa_union_walk_g{group}_kv{kv_tile}" + ("_lean" if lean else "")
         + ("_list" if scan_list else "") + ("_mm" if line_matmul else "") + ("_fast" if fast_walk else "")
         + ("_sc" if scopes else "") + (f"_runs{walk_runs}" if walk_runs else "")
@@ -1829,7 +1850,8 @@ def union_walk_prefill(query, gate, blocks, lengths, table, cache, starts, *, kv
                        k_scale=1.0, v_scale=1.0, group=128, kv_tile=1024, union_cap, min_context,
                        lean, walk_runs=0, union_alpha=0.0, share_bits=False, qk16=False, listed=None,
                        run_tables=False, max_run=8, lazy_share=False, gathered=None, gather_chunks=4,
-                       gather_growth=1.0, compact_reqs=0, compact_copy_method="vmem", sc_bitset=False):
+                       gather_growth=1.0, compact_reqs=0, compact_copy_method="vmem", sc_bitset=False,
+                       in_place=False):
     """D2 union-walk attention for a packed prefill step; ``(gated bf16 output, cache)``.
 
     Same contract as ``block_sparse_gqa_attention`` without ``return_lse``.
@@ -1891,6 +1913,9 @@ def union_walk_prefill(query, gate, blocks, lengths, table, cache, starts, *, kv
 
     ``sc_bitset``: the plan's per-row bitset built on the SparseCore (``union_bits_plan(bitset="sparsecore")``,
     the same bits; TPU only) instead of the TensorCore. The rest of the plan is unchanged.
+
+    ``in_place`` (with ``gathered="sparsecore"``): each gather/walk chunk reads the plan's bits, queries and lengths in
+    place instead of from sliced copies (``_gathered_chunks``); bitwise the sliced form.
 
     ``qk16``: ``union_walk_kernel``'s single-pass BF16 QK (exact operands;
     power-of-two score scales only). Bitwise identity with the FP32 dot
@@ -2006,6 +2031,7 @@ def union_walk_prefill(query, gate, blocks, lengths, table, cache, starts, *, kv
                     aligned_query, bits, ubits, usize, vlengths, cache, page_rows, rows, ids, gathered=gathered,
                     chunks=int(gather_chunks), growth=float(gather_growth), group=group, union_cap=union_cap,
                     kv_tile=kv_tile, ratio=ratio, k_scale=k_scale, v_scale=v_scale, lean=lean, qk16=qk16,
+                    in_place=in_place,
                 )
             if run_tables:
                 # Step 4: run tables + precomputed lines (XLA builders, or the SparseCore kernels).
@@ -2060,7 +2086,7 @@ def union_walk_prefill(query, gate, blocks, lengths, table, cache, starts, *, kv
                     aligned_query, bits, ubits, usize, vlengths, cache, page_rows, rows, ids, gathered=gathered,
                     chunks=int(gather_chunks), growth=float(gather_growth), group=group, union_cap=union_cap,
                     kv_tile=kv_tile, ratio=ratio, k_scale=k_scale, v_scale=v_scale, lean=lean, qk16=qk16,
-                    gather_pool=pool_c,
+                    gather_pool=pool_c, in_place=in_place,
                 )
 
             def listed_branch():
@@ -2330,21 +2356,34 @@ def gather_chunk_bounds(ngroups, chunks, growth=1.0):
 
 
 def _gathered_chunks(query, bits, ubits, usize, vlengths, cache, page_rows, rows, ids, *, gathered, chunks, group,
-                     union_cap, kv_tile, ratio, k_scale, v_scale, lean, qk16, growth=1.0, gather_pool=None):
+                     union_cap, kv_tile, ratio, k_scale, v_scale, lean, qk16, growth=1.0, gather_pool=None,
+                     in_place=False):
     """``union_walk_prefill(gathered=...)``: per chunk of whole query groups, gather the chunk's union tiles from
     the list (``rows``/``ids``), then run the walk-free kernel on them; outputs concatenated in group order."""
     ngroups = ubits.shape[0]
     source = cache if gather_pool is None else gather_pool  # the gather's pool (``rows`` index it); the kernel reads tiles
+    # in_place (VLLM_TPU_QSA_PREFILL_UNION_IN_PLACE): the walk reads the plan's queries and lengths in place (a static
+    # chunk offset) instead of from per-chunk sliced copies and stages no unused bitset block; the SparseCore gather
+    # reads the plan's bits in place too (the XLA reference gather keeps its slice). Bitwise the sliced form.
+    in_place = bool(in_place)
     outs = []
     for g0, g1 in gather_chunk_bounds(ngroups, chunks, growth):
         sl, rs = slice(g0, g1), slice(g0 * group, g1 * group)
         if gathered == "sparsecore":
             from vllm_torchtpu.kernels.qwen4_exp.qsa_union_sc_gather import union_sc_gather
 
-            tiles = union_sc_gather(source, bits[sl], rows[sl], ids[sl], ratio=ratio, line_matmul=True,
-                                    usize=usize[sl], kv_tile=kv_tile)
+            tiles = union_sc_gather(source, bits if in_place else bits[sl], rows[sl], ids[sl], ratio=ratio,
+                                    line_matmul=True, usize=usize[sl], kv_tile=kv_tile,
+                                    **({"bits_group_offset": g0} if in_place else {}))
         else:
             tiles = union_gather_reference(source, bits[sl], rows[sl], ids[sl], ratio=ratio, line_matmul=True)
+        if in_place:
+            outs.append(union_walk_kernel(
+                query, None, ubits[sl], usize[sl], vlengths, cache, page_rows[sl], group=group,
+                union_cap=union_cap, kv_tile=kv_tile, ratio=ratio, k_scale=k_scale, v_scale=v_scale, lean=lean,
+                fast_walk=True, qk16=qk16, line_matmul=True, gathered=tiles, group_offset=g0,
+            ))
+            continue
         outs.append(union_walk_kernel(
             query[rs], bits[sl], ubits[sl], usize[sl], vlengths[rs], cache, page_rows[sl], group=group,
             union_cap=union_cap, kv_tile=kv_tile, ratio=ratio, k_scale=k_scale, v_scale=v_scale, lean=lean,

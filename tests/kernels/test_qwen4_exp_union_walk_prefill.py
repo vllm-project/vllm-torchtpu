@@ -788,6 +788,86 @@ def test_gather_chunk_bounds(ngroups, chunks, growth):
             assert sizes[0] * 2 <= ngroups // len(sizes), sizes  # the point: a small first gather
 
 
+@pytest.mark.parametrize("layout,chunks,growth", [(SPARE, 4, 1.0), (WORST, 3, 1.0), (A64, 8, 1.5)])
+def test_in_place_gathered_walk_is_the_sliced_one(kernels, monkeypatch, layout, chunks, growth):
+    """in_place=True (VLLM_TPU_QSA_PREFILL_UNION_IN_PLACE): every chunk's walk reads the plan's queries and lengths at a
+    static group offset, with no bitset block, bit for bit the sliced form on packed unaligned steps; and the in-place
+    walk is what ran (each chunk's walk got bits=None and its offset)."""
+    rows, cached = layout
+    tokens = 2048 if sum(-(-n // 256) * 256 for n in rows) > 1024 else 1024
+    step = _packed_step(131 + chunks + len(rows), rows, cached, tokens=tokens)
+    opts = dict(group=64, listed="reference", gathered="reference", gather_chunks=chunks, gather_growth=growth)
+    sliced = _walk(step, **opts)
+    calls = []
+    original = ud.union_walk_kernel
+
+    def spy(query, bits, *args, **kw):
+        calls.append((bits is None, kw.get("group_offset", 0), query.shape[0]))
+        return original(query, bits, *args, **kw)
+
+    monkeypatch.setattr(ud, "union_walk_kernel", spy)
+    jax.clear_caches()
+    got = _walk(step, in_place=True, **opts)
+    np.testing.assert_array_equal(_bits(got), _bits(sliced))
+    assert calls and all(none for none, _, _ in calls), calls
+    runs, run = [], []  # one run of chunk offsets per traced layout branch (the switch traces every branch)
+    for _, offset, _ in calls:
+        if offset == 0 and run:
+            runs.append(run)
+            run = []
+        run.append(offset)
+    runs.append(run)
+    assert all(r[0] == 0 and all(a < b for a, b in zip(r, r[1:])) for r in runs), calls
+    assert max(len(r) for r in runs) > (1 if chunks > 1 else 0), calls
+
+
+def test_in_place_compact_and_fallback(kernels):
+    """in_place with the compact pool and lazy share: the walk is still the sliced walk; an over-cap step is still the
+    served call bit for bit."""
+    rows, cached = A64
+    step = _packed_step(137, rows, cached)
+    opts = dict(group=64, listed="reference", gathered="reference", gather_chunks=3, share_bits=True, lazy_share=True,
+                compact_reqs=4)
+    sliced = _walk(step, **opts)
+    jax.clear_caches()
+    np.testing.assert_array_equal(_bits(_walk(step, in_place=True, **opts)), _bits(sliced))
+    jax.clear_caches()
+    np.testing.assert_array_equal(_bits(_walk(step, union_cap=32, in_place=True, **opts)), _bits(_served(step)))
+
+
+def test_in_place_dispatch(kernels, monkeypatch):
+    """VLLM_TPU_QSA_PREFILL_UNION_IN_PLACE=1 reaches union_walk_prefill as in_place=True; unset, the kwarg is absent."""
+    rows, cached = A64
+    step = _packed_step(139, rows, cached, tokens=1024)
+    for name, value in (("VLLM_TPU_QSA_PREFILL_UNION_WALK", "64"), ("VLLM_TPU_QSA_PREFILL_UNION_MIN_CONTEXT", "0"),
+                        ("VLLM_TPU_QSA_PREFILL_UNION_LISTED", "reference"),
+                        ("VLLM_TPU_QSA_PREFILL_UNION_GATHERED", "reference")):
+        monkeypatch.setenv(name, value)
+    calls = _spy(monkeypatch)
+    _dispatch(step)
+    assert "in_place" not in calls[0], calls
+    monkeypatch.setenv("VLLM_TPU_QSA_PREFILL_UNION_IN_PLACE", "1")
+    calls.clear()
+    jax.clear_caches()
+    _dispatch(step)
+    assert calls[0].get("in_place") is True, calls
+
+
+def test_in_place_args_are_checked(kernels):
+    """group_offset / bits=None need the gathered walk, and the offset must stay inside the plan's rows."""
+    rows, cached = A64
+    q, gate, blocks, lengths, table, pool, starts = _packed_step(149, rows, cached, tokens=1024)
+    ubits = jnp.zeros((4, 8), jnp.uint32)
+    usize = jnp.zeros((4,), jnp.int32)
+    with pytest.raises(ValueError, match="gathered"):
+        ud.union_walk_kernel(q, None, ubits, usize, lengths, pool, table[0], group=64, union_cap=CAP, kv_tile=1024,
+                             fast_walk=True, line_matmul=True)
+    fake = (jnp.zeros((4 * 8 * 4, 1, 4, 256), pool.dtype), jnp.zeros((4 * 8, 128), jnp.int32))
+    with pytest.raises(ValueError, match="rows"):
+        ud.union_walk_kernel(q, None, ubits, usize, lengths, pool, table[0], group=64, union_cap=CAP, kv_tile=1024,
+                             fast_walk=True, line_matmul=True, gathered=fake, group_offset=q.shape[0] // 64 - 3)
+
+
 def test_gathered_with_lazy_share_and_fallback(kernels):
     """With lazy share: the gathered walk is still the walk; an over-cap step is still the served call bit for bit."""
     rows, cached = A64

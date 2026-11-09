@@ -183,6 +183,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_PREFILL_UNION_RUN_TABLES: bool = False
     VLLM_TPU_QSA_PREFILL_UNION_LAZY_SHARE: bool = False
     VLLM_TPU_QSA_PREFILL_UNION_SC_BITSET: bool = False
+    VLLM_TPU_QSA_PREFILL_UNION_IN_PLACE: bool = False
     VLLM_TPU_QSA_PREFILL_UNION_GATHERED: str = ""
     VLLM_TPU_QSA_PREFILL_UNION_GATHER_CHUNKS: int = 4
     VLLM_TPU_QSA_PREFILL_UNION_GATHER_GROWTH: float = 1.0
@@ -1045,6 +1046,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_QSA_PREFILL_UNION_LAZY_SHARE": env_bool("VLLM_TPU_QSA_PREFILL_UNION_LAZY_SHARE"),
     # SC_BITSET: the union plan's per-row bitset built on the SparseCore (the same bits), off the TensorCore.
     "VLLM_TPU_QSA_PREFILL_UNION_SC_BITSET": env_bool("VLLM_TPU_QSA_PREFILL_UNION_SC_BITSET"),
+    # IN_PLACE (with GATHERED=sparsecore): gather/walk chunks read the plan's bits, queries and lengths in place
+    # (static chunk offsets) instead of from sliced copies, and the walk stages no unused bitset block. Bitwise.
+    "VLLM_TPU_QSA_PREFILL_UNION_IN_PLACE": env_bool("VLLM_TPU_QSA_PREFILL_UNION_IN_PLACE"),
     # GATHERED ("", "reference", "sparsecore"; with LISTED): the walk-free kernel on chunked gathered tiles.
     "VLLM_TPU_QSA_PREFILL_UNION_GATHERED": env_str("VLLM_TPU_QSA_PREFILL_UNION_GATHERED", ""),
     "VLLM_TPU_QSA_PREFILL_UNION_GATHER_CHUNKS": env_int("VLLM_TPU_QSA_PREFILL_UNION_GATHER_CHUNKS", 4),
