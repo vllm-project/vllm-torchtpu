@@ -163,3 +163,25 @@ def test_swa_only_matches_reference(benchmark, batch):
     expected = benchmark.reference(host, range(batch * 6))
     actual = csa2(**jax.device_put(inputs), bq=6)
     np.testing.assert_allclose(actual, expected, atol=3e-3, rtol=3e-2)
+
+
+@pytest.mark.parametrize("page_size", [8, 16, 32, 64, 128, 256])
+@pytest.mark.parametrize("banked", [False, True])
+def test_row_packed_swa_matches_native(benchmark, page_size, banked):
+    if jax.default_backend() != "tpu":
+        pytest.skip("Async MXU operations require TPU")
+    host = _serving_verify_inputs(benchmark, 2, page_size, 8192, page_size * 2)
+    expected = benchmark.reference(host, range(12))
+    words = host["swa_kv"].view(np.uint16).astype(np.uint32)
+    packed = (words[:, 0::2] | (words[:, 1::2] << 16)).view(np.int32)
+    inputs = jax.device_put(host)
+    packed = jax.device_put(packed)
+    if banked:
+        cut = packed.shape[0] // 2
+        inputs["swa_kv"] = (inputs["swa_kv"][:cut], inputs["swa_kv"][cut:])
+        packed = (packed[:cut], packed[cut:])
+    native = csa2(**inputs, bq=6)
+    actual = csa2(**dict(inputs, swa_kv=packed), bq=6)
+    assert np.isfinite(actual).all()
+    np.testing.assert_array_equal(actual, native)
+    np.testing.assert_allclose(actual, expected, atol=3e-3, rtol=3e-2)
