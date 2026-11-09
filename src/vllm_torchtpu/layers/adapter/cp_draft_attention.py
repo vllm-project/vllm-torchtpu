@@ -113,7 +113,80 @@ def write_kv(
         _quantize(value, kv_cache.dtype, v_scale),
         kv_cache.shape[2:],
     )
-    return kv_cache.at[page, pos % page_size].set(rows, mode="drop")
+    if num_tokens < _RUN_WRITE_MIN_TOKENS:
+        return kv_cache.at[page, pos % page_size].set(rows, mode="drop")
+    return write_runs(
+        kv_cache,
+        rows,
+        page,
+        pos % page_size,
+        max_runs=num_tokens // page_size + 2 * max_seqs,
+    )
+
+
+# An XLA scatter of the rows costs ~0.1 us per token (0.88 ms per draft layer
+# at 8K tokens, c4 / c64 twins j-872b7276 / j-f020b874); below this a
+# decode-sized batch's scatter is as cheap as the run kernel's grid.
+_RUN_WRITE_MIN_TOKENS = 1024
+
+
+def write_runs(
+    kv_cache: jax.Array,
+    rows: jax.Array,
+    pages: jax.Array,
+    slots: jax.Array,
+    *,
+    max_runs: int,
+    interpret: bool = False,
+) -> jax.Array:
+    """``kv_cache.at[pages, slots].set(rows, mode="drop")`` by DMA: one grid
+    step per token run (consecutive tokens taking consecutive slots of one
+    page), copying the run's rows from HBM in power-of-two pieces."""
+    from vllm_torchtpu.models.minimax_m3.kernels.msa_write import _runs
+
+    num_pages, page_size = kv_cache.shape[:2]
+    pieces = [1 << b for b in reversed(range(page_size.bit_length()))]
+    num_runs, run_page, run_lo, run_hi, run_tok0 = _runs(
+        pages.astype(jnp.int32), slots.astype(jnp.int32), num_pages, max_runs
+    )
+
+    def kernel(
+        n_ref, page_ref, lo_ref, hi_ref, tok0_ref, rows_hbm, cache_in, cache_out, sem
+    ):
+        del cache_in
+        r = pl.program_id(0)
+        count = hi_ref[r] - lo_ref[r]
+        copies = []
+        for i, size in enumerate(pieces):
+            off = count & ~(2 * size - 1)  # after the larger pieces
+            copy = pltpu.make_async_copy(
+                rows_hbm.at[pl.ds(tok0_ref[r] + off, size)],
+                cache_out.at[page_ref[r], pl.ds(lo_ref[r] + off, size)],
+                sem.at[i],
+            )
+            todo = (r < n_ref[0]) & ((count & size) != 0)
+            pl.when(todo)(copy.start)
+            copies.append((todo, copy))
+        for todo, copy in copies:
+            pl.when(todo)(copy.wait)
+
+    hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+    return pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=5,
+            grid=(max_runs,),
+            in_specs=[hbm, hbm],
+            out_specs=hbm,
+            scratch_shapes=[pltpu.SemaphoreType.DMA((len(pieces),))],
+        ),
+        out_shape=jax.ShapeDtypeStruct(kv_cache.shape, kv_cache.dtype),
+        # Operand 6 = the cache (after 5 scalar-prefetch operands and the rows).
+        input_output_aliases={6: 0},
+        compiler_params=pltpu.CompilerParams(dimension_semantics=("arbitrary",)),
+        interpret=interpret,
+        name="dcp_draft_write_runs",
+    )(num_runs[None], run_page, run_lo, run_hi, run_tok0, rows, kv_cache)
 
 
 def gather_pages(kv_cache: jax.Array, pages: jax.Array, *, interpret: bool = False) -> jax.Array:
