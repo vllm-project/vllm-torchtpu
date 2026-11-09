@@ -651,9 +651,14 @@ def _owner_invariant_layout(layout: dict[str, Any]) -> dict[str, Any]:
         torch_tpu=layout["torch_tpu"],
         libtpu=layout["libtpu"],
         carriers=unique(layout["carriers"]),
+        # Compressed-key pools are left out: merged keys
+        # (QWEN4_EXP_MERGE_COMPRESSED_K) are listed by a PCP producer's rank 0
+        # only, so its other units would otherwise encode different pages;
+        # unmerged keys share the page stride the other pools already pin.
         pages=unique(
             dict(block_stride_bytes=p["block_stride_bytes"], dtype_tag=p["dtype_tag"])
             for p in layout["pools"]
+            if not p["tag"].endswith(".compressed_k")
         ),
     )
 
