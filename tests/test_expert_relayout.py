@@ -464,6 +464,52 @@ def test_arm_builds_a_controller_from_the_placed_layers(monkeypatch):
     assert c.mover.p2p.group == ("gloo", (4, 5)) and c.mover.p2p._global(1) == 5
 
 
+def test_arm_takes_the_drafter_group_alongside_the_target(monkeypatch):
+    """With the drafter placed, the controller re-lays both groups, each with
+    its own experts and slots."""
+    from types import SimpleNamespace
+
+    from vllm_torchtpu import expert_placement
+
+    _arm_env(monkeypatch)
+    target_module = _fake_placed_world(monkeypatch)
+    target = SimpleNamespace(
+        experts=8,
+        active=4,
+        staging=1,
+        slots=5,
+        replica_cap=2,
+        ranks=lambda layer: ((0, 1, 2, 3), (4, 5, 6, 7)),
+    )
+    draft = SimpleNamespace(
+        experts=4,
+        active=3,
+        staging=1,
+        slots=4,
+        replica_cap=2,
+        ranks=lambda layer: ((0, 1, 2), (2, 3, 0)),
+    )
+    placement = SimpleNamespace(group={"target": target, "draft": draft}.get)
+    draft_module = SimpleNamespace(
+        layer_name="layers.6.mlp.experts",
+        _tpu_expert_slot=torch.zeros((4, 2), dtype=torch.int32),
+    )
+    monkeypatch.setattr(expert_placement, "current", lambda vllm_config=None: placement)
+    monkeypatch.setattr(
+        expert_placement,
+        "applied_layers",
+        lambda: {("target", 0): target_module, ("draft", 0): draft_module},
+    )
+    c = rl.arm(ep_rank=0, ep_world=2, transport=_CPU)
+    assert c is not None
+    assert c.groups == {
+        "target": dict(experts=8, active=4, staging=1, replica_cap=2),
+        "draft": dict(experts=4, active=3, staging=1, replica_cap=2),
+    }
+    assert c.layouts[("draft", 0)].held == [[0, 1, 2, rl.FREE], [2, 3, 0, rl.FREE]]
+    assert c.modules[("draft", 0)] is draft_module
+
+
 def test_arm_refuses_without_the_knob_staging_or_lockstep(monkeypatch):
     _fake_placed_world(monkeypatch)
     _arm_env(monkeypatch, TPU_MOE_EPLB_DYNAMIC=False)
