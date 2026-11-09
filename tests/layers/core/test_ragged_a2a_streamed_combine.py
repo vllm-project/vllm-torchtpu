@@ -431,6 +431,8 @@ def _tp_sum_f32(partials):
         (2, 4, 4, 10, 0.0),  # one owned token per core
         (2, 4, 13, 10, 0.0),
         (2, 4, 92, 10, 0.0),  # proxy K=3 decode at 23 requests per engine
+        (8, 1, 24, 10, 0.0),  # TP1: each core owns its engine's tokens
+        (8, 1, 24, 10, 2.0),
     ],
 )
 def test_owner_combine_matches_tp_sum(
@@ -520,3 +522,98 @@ def test_owner_combine_without_fused_kernel_adds_shared_and_tp_sum(num_tokens):
     )
     for r in range(tp_size):
         np.testing.assert_array_equal(got[:, r].view(np.uint16), want.view(np.uint16))
+
+
+def _owner_want(common, stacked, shared):
+    """The returned-partials result plus the shared partial (rounded per rank),
+    summed over TP in f32 in rank order: what owner mode returns."""
+    base = np.asarray(jax.jit(functools.partial(ragged_a2a_moe, **common))(*stacked))
+    base = (base.astype(np.float32) + np.asarray(shared).astype(np.float32)).astype(
+        BF16
+    )
+    return _tp_sum_f32(base)
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize("dp_size,tp_size,factor", [(2, 4, 0.0), (4, 2, 2.0)])
+def test_owner_combine_with_members_without_tiles(dp_size, tp_size, factor):
+    """Every route on the experts of DP position 0: the other members run no
+    expert tile but still send their shared-expert partials and sum their owned
+    tokens."""
+    devices = _require_eight_tpu_devices()
+    mesh = Mesh(np.asarray(devices).reshape(dp_size, tp_size), (DP_AXIS, TP_AXIS))
+    num_tokens, topk = 24, 10
+    x, w1, w2, s1, s2, weights, _, es = _inputs(
+        8, tp_size, num_tokens, 64, topk=topk, skew=False
+    )
+    # Top-10 of the 8 * tp_size experts of DP position 0, the same on every TP
+    # rank of an engine.
+    rng = np.random.default_rng(9)
+    picks = np.argsort(rng.random((dp_size, num_tokens, 8 * tp_size)), axis=-1)
+    ids = np.broadcast_to(
+        picks[:, None, :, :topk], (dp_size, tp_size, num_tokens, topk)
+    ).reshape(-1, topk)
+    stacked = tuple(
+        a.reshape(dp_size, tp_size, -1, *a.shape[1:])
+        for a in (x, w1, w2, s1, s2, weights, jnp.asarray(ids, jnp.int32), es)
+    )
+    common = dict(
+        mesh=mesh,
+        topk=topk,
+        activation="silu",
+        use_sparse_core=True,
+        onehot_moe_permute_threshold=resolve_onehot_permute_threshold(
+            dp_size * num_tokens * topk
+        ),
+        capacity_factor=factor,
+    )
+    shared = jnp.asarray(
+        rng.standard_normal((dp_size, tp_size, num_tokens, HIDDEN)) / 8, jnp.bfloat16
+    )
+    want = _owner_want(common, stacked, shared)
+    got = np.asarray(
+        jax.jit(functools.partial(ragged_a2a_moe, owner_combine=True, **common))(
+            *stacked, shared=shared
+        )
+    )
+    for r in range(tp_size):
+        np.testing.assert_array_equal(got[:, r].view(np.uint16), want.view(np.uint16))
+
+
+@pytest.mark.multichip
+def test_owner_combine_runs_both_capacity_branches():
+    """Steps that fit the capacity buffers and one that overflows them, in one
+    jitted program with the shared-expert partials (the overflowing step's
+    capacity kernel sends and expects nothing, its shared rows included)."""
+    devices = _require_eight_tpu_devices()
+    dp_size, tp_size, num_tokens, topk = 4, 2, 24, 2
+    mesh = Mesh(np.asarray(devices).reshape(dp_size, tp_size), (DP_AXIS, TP_AXIS))
+    common = dict(
+        mesh=mesh,
+        topk=topk,
+        activation="silu",
+        use_sparse_core=True,
+        onehot_moe_permute_threshold=resolve_onehot_permute_threshold(
+            dp_size * num_tokens * topk
+        ),
+        capacity_factor=2.0,
+    )
+    run = jax.jit(functools.partial(ragged_a2a_moe, owner_combine=True, **common))
+    args = _inputs(8, tp_size, num_tokens, 64, topk=topk, skew=False)
+    rng = np.random.default_rng(11)
+    shared = jnp.asarray(
+        rng.standard_normal((dp_size, tp_size, num_tokens, HIDDEN)) / 8, jnp.bfloat16
+    )
+    for forced in (False, True, False):
+        routing = args
+        if forced:
+            # Every route on rank 0's experts: past the capacity buffers.
+            ids = jnp.broadcast_to(jnp.asarray([0, 1], jnp.int32), args[6].shape)
+            routing = args[:6] + (ids, args[7])
+        stacked = tuple(a.reshape(dp_size, tp_size, -1, *a.shape[1:]) for a in routing)
+        want = _owner_want(common, stacked, shared)
+        got = np.asarray(run(*stacked, shared=shared))
+        for r in range(tp_size):
+            np.testing.assert_array_equal(
+                got[:, r].view(np.uint16), want.view(np.uint16)
+            )

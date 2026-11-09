@@ -1645,10 +1645,10 @@ def mlp_kernel_main(
 class ExtraRowRefs:
     """Refs of the rows `gmm_v2_mlp_scatter` sends once at entry (its `extra`)."""
 
-    rows: jax.Array  # HBM [num_extra, row_sublanes, L]
-    member: jax.Array  # SMEM int32[num_extra]
-    row: jax.Array  # SMEM int32[num_extra]
-    expected: jax.Array  # SMEM int32[2]: landing here, to send
+    rows: jax.Array  # HBM [num_blocks * block_rows, row_sublanes, L]
+    member: jax.Array  # SMEM int32[num_blocks]
+    row: jax.Array  # SMEM int32[num_blocks]
+    expected: jax.Array  # SMEM int32[2]: rows landing here, rows to send
     recv: jax.Array  # HBM [num_extra_recv, row_sublanes, L]
     sems: jax.Array  # DMA[3]: send, local, receive
     counts: jax.Array  # SMEM int32[2]: remote, local sent
@@ -1874,14 +1874,15 @@ def _mlp_kernel(
         return jnp.concatenate(acc_list, axis=1)
 
     def send_extra_rows(sc: ScatterRefs, ex: ExtraRowRefs):
-        """Send every `extra` row to its member's second receive buffer now;
-        the transfers overlap the expert compute."""
+        """Send every `extra` block to its member's second receive buffer now,
+        one DMA per block; the transfers overlap the expert compute."""
         me = sc.me[0]
+        block = ex.rows.shape[0] // ex.member.shape[0]
 
         def send(i, counts):
             member = ex.member[i]
-            src = ex.rows.at[pl.ds(i, 1)]
-            dst = ex.recv.at[pl.ds(ex.row[i], 1)]
+            src = ex.rows.at[pl.ds(i * block, block)]
+            dst = ex.recv.at[pl.ds(ex.row[i], block)]
             is_local = member == me
 
             @pl.when(is_local)
@@ -1899,11 +1900,12 @@ def _mlp_kernel(
                     device_id_type=pl.DeviceIdType.MESH,
                 ).start()
 
-            local = is_local.astype(jnp.int32)
-            return counts[0] + 1 - local, counts[1] + local
+            # Counted in rows: a semaphore wait counts the bytes of its rows.
+            local = is_local.astype(jnp.int32) * block
+            return counts[0] + block - local, counts[1] + local
 
         remote, local = lax.fori_loop(
-            0, ex.expected[1], send, (jnp.int32(0), jnp.int32(0))
+            0, ex.expected[1] // block, send, (jnp.int32(0), jnp.int32(0))
         )
         ex.counts[0] = remote
         ex.counts[1] = local
@@ -2485,11 +2487,11 @@ def gmm_v2_mlp_scatter(
     have landed. Rows nobody writes keep stale data. Row values are the ones
     `gmm_v2_mlp` returns.
 
-    `extra` = (rows [n, 16, size_n / 16], member [n], row [n], counts [2]):
-    the first `counts[1]` rows are sent once at entry to row `row` of member
-    `member`'s second receive buffer `[num_extra_recv_rows, ...]`, overlapping
-    the expert compute; `counts[0]` rows land here. Then the result is
-    (receive, second receive).
+    `extra` = (rows [n * b, 16, size_n / 16], member [n], row [n], counts [2]):
+    the first `counts[1]` rows are sent once at entry, one DMA per b-row block,
+    block `i` to rows from `row[i]` of member `member[i]`'s second receive
+    buffer `[num_extra_recv_rows, ...]`, overlapping the expert compute;
+    `counts[0]` rows land here. Then the result is (receive, second receive).
     """
 
     size_m = lhs.shape[0]
