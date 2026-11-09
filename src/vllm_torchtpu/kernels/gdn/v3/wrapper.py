@@ -27,6 +27,7 @@ from vllm_torchtpu.kernels.gdn.v3 import (
     config,
     memory_ref,
     metadata,
+    tables_in_kernel,
     tiling,
     vmem_ldst,
 )
@@ -308,6 +309,86 @@ def outer_kernel(
     _run()
 
 
+def outer_kernel_tables_in_kernel(
+    # Inputs.
+    query_start_loc_ref: jax.Array,
+    seq_lens_ref: jax.Array,
+    state_indices_ref: jax.Array,
+    read_offsets_ref: jax.Array,
+    distribution_ref: jax.Array,
+    prefill_ckpt_offsets_ref: jax.Array | None,
+    prefill_ckpt_indices_ref: jax.Array | None,
+    qkv_ref: jax.Array,
+    b_ref: jax.Array,
+    a_ref: jax.Array,
+    states_ref: jax.Array | tuple[jax.Array, jax.Array],
+    _: jax.Array,
+    weights_ref: memory_ref.WeightRefs,
+    # Outputs.
+    out_ref: jax.Array,
+    states_out_ref: jax.Array | tuple[jax.Array, jax.Array],
+    *,
+    batched_cfg: config.GDNConfig,
+    per_seq_cfg: config.GDNConfig,
+    max_seqs: int,
+    # Scratches.
+    carry_conv_scratch_ref: jax.Array,
+    carry_recurrent_scratch_ref: jax.Array,
+    **table_refs: jax.Array,
+):
+    """Runs both passes in one call, with the routing tables built at entry.
+
+    The tables come from the raw sequence arrays (see `tables_in_kernel`).
+    The per-sequence pass runs only when it has tiles.
+    """
+    batched_metadata, per_seq_metadata = tables_in_kernel.fill_and_wrap(
+        query_start_loc_ref,
+        seq_lens_ref,
+        state_indices_ref,
+        read_offsets_ref,
+        distribution_ref,
+        prefill_ckpt_offsets_ref,
+        prefill_ckpt_indices_ref,
+        table_refs,
+        batched_cfg,
+        per_seq_cfg,
+        max_seqs,
+    )
+    outer_kernel(
+        batched_metadata,
+        qkv_ref,
+        b_ref,
+        a_ref,
+        states_ref,
+        None,
+        weights_ref,
+        out_ref,
+        states_out_ref,
+        None,
+        None,
+        cfg=batched_cfg,
+    )
+
+    @pl.when(per_seq_metadata.num_tiles[...] > 0)
+    def _():
+        # The batched pass wrote its states in place, so the per-sequence
+        # pass reads and writes the same buffers.
+        outer_kernel(
+            per_seq_metadata,
+            qkv_ref,
+            b_ref,
+            a_ref,
+            states_out_ref,
+            None,
+            weights_ref,
+            out_ref,
+            states_out_ref,
+            carry_conv_scratch_ref,
+            carry_recurrent_scratch_ref,
+            cfg=per_seq_cfg,
+        )
+
+
 @jax.jit(
     donate_argnames=("states",),
     static_argnames=(
@@ -329,6 +410,7 @@ def outer_kernel(
         "gate_lower_bound",
         "kernel_act_dtype",
         "kernel_conv_weight_dtype",
+        "build_tables_in_kernel",
     ),
 )
 def fused_conv1d_gdn(
@@ -368,6 +450,7 @@ def fused_conv1d_gdn(
     # TODO(kyuyeunk): Calculate tile size based on input dimensions.
     decode_tile_size: int = 4,
     mixed_tile_size: int = 64,
+    build_tables_in_kernel: bool = False,
 ) -> tuple[jax.Array | tuple[jax.Array, jax.Array], jax.Array]:
     """Perform conv1d and gdn in a single fused kernel.
 
@@ -444,6 +527,12 @@ def fused_conv1d_gdn(
             Ignored when TPU_ENABLE_GDN_DYNAMIC_TILING is set.
         mixed_tile_size: Tile size along token/chunk dimension for prefill/mixed
             sequences. Ignored when TPU_ENABLE_GDN_DYNAMIC_TILING is set.
+        build_tables_in_kernel: Run both passes in one Pallas call that builds
+            its routing tables in SMEM at kernel entry, instead of two calls
+            fed by tables built with XLA ops here. Applies to steps with at
+            most `tables_in_kernel.MAX_ROWS` padded rows, no speculative
+            decoding and no explicit `ckpt_indices`; other steps keep the two
+            calls.
 
     Returns:
         new_states: The updated state cache, aliased in place, with the same
@@ -518,6 +607,7 @@ def fused_conv1d_gdn(
     if read_offsets is None:
         read_offsets = jnp.zeros_like(state_indices)
     assert read_offsets.shape == (num_seqs,)
+    has_explicit_ckpt_indices = ckpt_indices is not None
     if ckpt_indices is not None:
         # One source block per checkpoint (vLLM's ssm_state_indices scheme):
         # checkpoint t of sequence s lives at block ckpt_indices[s, t], so
@@ -648,11 +738,7 @@ def fused_conv1d_gdn(
     hbm_spec = pl.BlockSpec(memory_space=pltpu.HBM)
     weights_spec = jax.tree.map(lambda _: vmem_spec, weights)
 
-    def call_kernel(
-        in_states: jax.Array | tuple[jax.Array, jax.Array],
-        in_act: jax.Array | None,
-        mode: config.GDNMode,
-    ) -> tuple[jax.Array, jax.Array | tuple[jax.Array, jax.Array]]:
+    def make_config(mode: config.GDNMode) -> config.GDNConfig:
         if mode == config.GDNMode.PER_SEQ:
             tile_size = mixed_tile_size
             # Prefill / mixed sequences keep a single state checkpoint.
@@ -661,7 +747,7 @@ def fused_conv1d_gdn(
             tile_size = decode_tile_size
             window_size = num_spec_tokens + 1
 
-        cfg = config.GDNConfig(
+        return config.GDNConfig(
             mode=mode,
             batch_size=padded_batch_size,
             kernel_size=kernel_size,
@@ -683,6 +769,14 @@ def fused_conv1d_gdn(
             ),
             is_shared=is_shared,
         )
+
+    def call_kernel(
+        in_states: jax.Array | tuple[jax.Array, jax.Array],
+        in_act: jax.Array | None,
+        mode: config.GDNMode,
+    ) -> tuple[jax.Array, jax.Array | tuple[jax.Array, jax.Array]]:
+        cfg = make_config(mode)
+        window_size = cfg.window_size
 
         # Step 6: Metadata preprocessing. Will be executed multiple times per-layer
         # but will be CSEed by compiler.
@@ -770,11 +864,92 @@ def fused_conv1d_gdn(
     if batched_only and prefill_only:
         raise ValueError("batched_only and prefill_only are mutually exclusive")
 
-    out_act, out_states = None, states
-    if not prefill_only:
-        out_act, out_states = call_kernel(states, None, config.GDNMode.BATCHED)
-    if not batched_only:
-        out_act, out_states = call_kernel(out_states, out_act, config.GDNMode.PER_SEQ)
+    def call_kernel_tables_in_kernel(
+        in_states: jax.Array | tuple[jax.Array, jax.Array],
+    ) -> tuple[jax.Array, jax.Array | tuple[jax.Array, jax.Array]]:
+        """Runs both passes in one call that builds its routing tables."""
+        batched_cfg = make_config(config.GDNMode.BATCHED)
+        per_seq_cfg = make_config(config.GDNMode.PER_SEQ)
+        has_prefill_ckpt = prefill_ckpt_offsets is not None
+        sequence_arrays = (
+            query_start_loc.astype(jnp.int32),
+            seq_lens.astype(jnp.int32),
+            state_indices.astype(jnp.int32),
+            read_offsets.astype(jnp.int32),
+            distribution.astype(jnp.int32),
+            prefill_ckpt_offsets,
+            prefill_ckpt_indices,
+        )
+        sequence_specs = tuple(
+            None if x is None else smem_spec for x in sequence_arrays
+        )
+        state_spec = jax.tree.map(lambda _: hbm_spec, in_states)
+        scratch_shapes = tables_in_kernel.scratch_shapes(
+            num_seqs, padded_batch_size, has_prefill_ckpt
+        )
+        scratch_shapes.update(per_seq_cfg.get_scratch_shape_dict())
+
+        # Write both passes into one zeroed output, aliased like the states.
+        in_act = jnp.zeros_like(batched_cfg.get_out_shape())
+        state_pos = len(jax.tree.leaves(sequence_arrays)) + 3
+        num_states = len(jax.tree.leaves(in_states))
+        input_output_aliases = {state_pos + i: 1 + i for i in range(num_states)}
+        input_output_aliases[state_pos + num_states] = 0
+
+        return pl.pallas_call(
+            functools.partial(
+                outer_kernel_tables_in_kernel,
+                batched_cfg=batched_cfg,
+                per_seq_cfg=per_seq_cfg,
+                max_seqs=num_seqs,
+            ),
+            out_shape=(in_act, in_states),
+            in_specs=(
+                *sequence_specs,
+                hbm_spec,
+                hbm_spec,
+                hbm_spec,
+                state_spec,
+                hbm_spec,
+                weights_spec,
+            ),
+            out_specs=(hbm_spec, state_spec),
+            scratch_shapes=scratch_shapes,
+            input_output_aliases=input_output_aliases,
+            compiler_params=pltpu.CompilerParams(
+                disable_bounds_checks=True,
+                vmem_limit_bytes=config.GDNConfig.get_vmem_limit_bytes(),
+            ),
+            name=batched_cfg.get_kernel_name() + "_tables_in",
+            metadata=batched_cfg.get_metadata(),
+        )(
+            *sequence_arrays,
+            qkv,
+            b,
+            a,
+            in_states,
+            in_act,
+            weights,
+        )
+
+    use_tables_in_kernel = (
+        build_tables_in_kernel
+        and num_spec_tokens == 0
+        and not has_explicit_ckpt_indices
+        and not batched_only
+        and not prefill_only
+        and padded_batch_size <= tables_in_kernel.MAX_ROWS
+    )
+    if use_tables_in_kernel:
+        out_act, out_states = call_kernel_tables_in_kernel(states)
+    else:
+        out_act, out_states = None, states
+        if not prefill_only:
+            out_act, out_states = call_kernel(states, None, config.GDNMode.BATCHED)
+        if not batched_only:
+            out_act, out_states = call_kernel(
+                out_states, out_act, config.GDNMode.PER_SEQ
+            )
 
     out_act = out_act.reshape(padded_batch_size, -1)[:batch_size]
     # TODO(kyuyeunk): Ensure no reshape is needed and convert to assertion.

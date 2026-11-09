@@ -98,6 +98,8 @@ if TYPE_CHECKING:
     TPU_GDN_QKVZ_KERNEL_LAYOUT: bool = False
     TPU_ENABLE_GDN_DYNAMIC_TILING: bool = False
     TPU_GDN_PREFILL_CHECKPOINT: bool = True
+    TPU_GDN_TABLES_IN_KERNEL: bool = False
+    TPU_GDN_DECODE_TILE: int = 4
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
@@ -503,6 +505,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # block boundary. Set it to the same value on every rank and PP stage: the
     # scheduler requires identical MambaSpecs.
     "TPU_GDN_PREFILL_CHECKPOINT": env_bool("TPU_GDN_PREFILL_CHECKPOINT", default=True),
+    # Pooled GDN v3: for steps of at most 256 padded rows without speculative
+    # decoding, run the batched and per-sequence passes in one Pallas call
+    # that builds its routing tables in SMEM at kernel entry, instead of two
+    # calls fed by tables built with XLA ops (kernels/gdn/v3/tables_in_kernel.py).
+    "TPU_GDN_TABLES_IN_KERNEL": env_bool("TPU_GDN_TABLES_IN_KERNEL", default=False),
+    # Sequences per grid step of the pooled GDN v3 batched decode pass, before
+    # the wrapper's VMEM cap. Ignored with TPU_ENABLE_GDN_DYNAMIC_TILING.
+    "TPU_GDN_DECODE_TILE": env_int("TPU_GDN_DECODE_TILE", default=4),
     # Register the DeepSeek-V4 tokenizer that honors continue_final_message.
     # Off by default so tokenizer behavior matches stock vLLM; the DSv4
     # eval config turns it on, since a prefilled assistant turn needs it.
