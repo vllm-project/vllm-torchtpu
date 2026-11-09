@@ -2409,22 +2409,20 @@ def _attention_kernel(
         # The low half as a signed 16-bit value (the packed merge's words).
         lo = ((bits & 0xFFFF) ^ 0x8000) - 0x8000
         lane = lax.broadcasted_iota(jnp.int32, x.shape, 1)
+        hi_src = jnp.where(lane < num_q_heads, hi, 0)
         lo_src = pltpu.roll(lo, send_rows % lanes, 1) if send_rows % lanes else lo
         if fault == "send_lse_lo_skip":
             lo_src = jnp.zeros_like(lo_src)
-        src = jnp.where(
-            lane < num_q_heads,
-            hi,
-            jnp.where(
-                (lane >= send_rows) & (lane < send_rows + num_q_heads), lo_src, 0
-            ),
+        lo_src = jnp.where(
+            (lane >= send_rows) & (lane < send_rows + num_q_heads), lo_src, 0
         )
         # Sublane d of the result is rolled by d*L once at the end (one
         # strided roll, shifts below a vreg width); before it, lane j of
         # sublane d holds what lands at J = (j + d*L) mod lanes. Token t's
-        # source row, rolled by t*L - (W-1)*L, puts head d*L+l (lane
-        # (W-1-d)*L + l) at J = t*L + l and its lo half at rows + t*L + l, so
-        # each lane takes the token whose words cover its J.
+        # source rows, rolled by t*L - (W-1)*L, put head d*L+l (lane
+        # (W-1-d)*L + l) at J = t*L + l in `hi_src` and its lo half at
+        # rows + t*L + l in `lo_src`; `hi_src` and `lo_src` stay separate so
+        # `send_rows < num_q_heads` (`num_tokens < send_world`) cannot overlap.
         shape = (send_world, lanes)
         big_j = (
             lax.broadcasted_iota(jnp.int32, shape, 1)
@@ -2433,14 +2431,25 @@ def _attention_kernel(
         tok = lax.shift_right_logical(
             big_j & (send_rows - 1), jnp.int32(send_per.bit_length() - 1)
         )
-        tok = jnp.where(big_j < 2 * send_rows, tok, -1)
+        is_hi = big_j < send_rows
+        is_lo = (big_j >= send_rows) & (big_j < 2 * send_rows)
         acc = jnp.zeros(shape, jnp.int32)
         for t in range(num_tokens):
             shift = (t * send_per - (send_world - 1) * send_per) % lanes
-            row = src[t : t + 1, :]
+            hi_row = hi_src[t : t + 1, :]
+            lo_row = lo_src[t : t + 1, :]
             if shift:
-                row = pltpu.roll(row, shift, 1)
-            acc = jnp.where(tok == t, jnp.broadcast_to(row, shape), acc)
+                hi_row = pltpu.roll(hi_row, shift, 1)
+                lo_row = pltpu.roll(lo_row, shift, 1)
+            acc = jnp.where(
+                is_hi & (tok == t),
+                jnp.broadcast_to(hi_row, shape),
+                jnp.where(
+                    is_lo & (tok == t),
+                    jnp.broadcast_to(lo_row, shape),
+                    acc,
+                ),
+            )
         acc = pltpu.roll(acc, 0, 1, stride=send_per, stride_axis=0)
         if lanes < o_dim:
             acc = jnp.concatenate(
