@@ -707,7 +707,7 @@ def block_scores(
         (v2 with a hand-written DMA ring for the pages) or the original
         ``"v1"``, kept as the reference arm for benchmarks. A 4-bit cache
         without folded scales runs v2 where v3 is asked for.
-      large_kernel: the same choice for the `large_block_q` tiles.
+      large_kernel: the same choice (and fallback) for the `large_block_q` tiles.
       pages_per_step / small_pages_per_step: pages per grid step of the large
         and the block_q tile classes.
       scale_cache, scale_row: for a 4-bit (uint8) index cache without folded
@@ -751,10 +751,9 @@ def block_scores(
     # Large requests have more than block_q tokens each.
     max_large = min(max_num_seqs, num_tokens // (block_q + 1))
     # Kernel v3 reads 4-bit pages with folded scales only.
-    small_kernel, large_kernel = (
-        "v2" if k == "v3" and scale_row is not None else k
-        for k in (kernel, large_kernel)
-    )
+    unfolded_fp4 = scale_row is not None
+    small_kernel = "v2" if kernel == "v3" and unfolded_fp4 else kernel
+    large_kernel = "v2" if large_kernel == "v3" and unfolded_fp4 else large_kernel
     # Token-major scores make the gather back to token order a row gather; a
     # column gather first relayouts the whole padded [P, tiles * block_q] f32
     # block (36 us per layer in the c48 decode twin, j-a281ffb0). Needs
@@ -830,5 +829,11 @@ def block_scores(
         )
         return jnp.concatenate([small_t, large], axis=1)[:, col].T
 
+    if num_tokens > max_num_seqs * _SMALL_TILE_Q:
+        # More rows than a batch of decode requests: a prefill step. A
+        # conditional would wait for the gather (offloaded to the SparseCore)
+        # and its neighbours' collectives at its end (c4 mixed twin +50 us
+        # per layer, j-08c5e333).
+        return with_large()[:, None, :]
     # Decode steps have no large request: skip its kernel call and gather.
     return jax.lax.cond(jnp.any(is_large), with_large, small_only)[:, None, :]

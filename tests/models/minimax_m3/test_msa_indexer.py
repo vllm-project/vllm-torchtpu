@@ -127,6 +127,8 @@ def _served_case(q_lens, ctx_lens, cache_kind, seed):
         ([8, 8, 3], [300 * PAGE - 8, 207 * PAGE + 5, 7]),
         # A 100-row request over two 64-row tiles, and a large (v2) request.
         ([100, 8, 200], [290 * PAGE, 128 * PAGE + 3, 40 * PAGE]),
+        # A large request in a decode-sized step: the conditional's large path.
+        ([8, 150, 8], [200 * PAGE, 60 * PAGE, 3]),
     ],
 )
 def test_served_page_groups_match_reference(cache_kind, q_lens, ctx_lens):
