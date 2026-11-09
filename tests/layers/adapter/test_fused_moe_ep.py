@@ -1109,10 +1109,14 @@ def test_explicit_policy_keeps_hardware_and_placement_checks():
 
 
 @pytest.mark.parametrize("required", [False, True])
-def test_mxfp4_explicit_backend_never_silently_changes_to_gmm(required):
+def test_mxfp4_explicit_backend_never_silently_changes_to_gmm(required, monkeypatch):
     from vllm_torchtpu.layers.adapter.quantization.mxfp4 import (
         VllmDeepseekV4Mxfp4MoEMethod,
     )
+
+    # The subject is the REQUIRED policy's error; the in-op shared expert
+    # (on by default on this measurement branch) adds its own prebuild step.
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_SHARED_EXPERT", False)
 
     method = object.__new__(VllmDeepseekV4Mxfp4MoEMethod)
     method.fused_ep = required
@@ -1383,6 +1387,18 @@ def test_build_op_picks_the_push_layer_and_passes_its_knobs(monkeypatch, impl):
     monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_SC_PREPUSH", 3)
     monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_TC_EXCHANGE", True)
     monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE", 4)
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_TAIL_BARRIER", False)
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_ONEHOT_SLOTS", True)
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_HBM_STAGING", True)
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_DISPATCH_AHEAD", 25)
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_MATMUL_SCALE_REPEAT", True)
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_EXCHANGE_ROW_GATHER", True)
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_BF16_SORT_COUNTS", True)
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_SLIM_PREPUSH_BARRIER", True)
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_FUSED_DISPATCH_META", True)
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_TABLE_KERNEL", True)
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_EXCHANGE_TABLES", True)
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_KERNEL_PLAN_TABLES", True)
     bridge._build_op(None, 2, True, "silu", None, False)
     x = jnp.ones((8, 8), dtype=jnp.bfloat16)
     operands = (
@@ -1401,8 +1417,143 @@ def test_build_op_picks_the_push_layer_and_passes_its_knobs(monkeypatch, impl):
         assert forwarded["sc_prepush"] == 3
         assert forwarded["tc_exchange"] is True
         assert forwarded["height_rungs_override"] == 4
+        assert forwarded["tail_barrier"] is False
+        assert forwarded["onehot_slots"] is True
+        assert forwarded["hbm_staging"] is True
+        assert forwarded["dispatch_ahead"] == 25
+        assert forwarded["matmul_scale_repeat"] is True
+        assert forwarded["exchange_row_gather"] is True
+        assert forwarded["bf16_sort_counts"] is True
+        assert forwarded["slim_prepush_barrier"] is True
+        assert forwarded["fused_dispatch_meta"] is True
+        assert forwarded["table_kernel"] is True
+        assert forwarded["exchange_tables"] is True
+        assert forwarded["kernel_plan_tables"] is True
     else:
         push_kernel.assert_not_called()
         forwarded = v2_kernel.call_args.kwargs
-        for knob in ("sc_prepush", "tc_exchange", "height_rungs_override"):
+        for knob in (
+            "sc_prepush",
+            "tc_exchange",
+            "height_rungs_override",
+            "tail_barrier",
+            "onehot_slots",
+            "hbm_staging",
+            "dispatch_ahead",
+            "matmul_scale_repeat",
+            "exchange_row_gather",
+            "bf16_sort_counts",
+            "slim_prepush_barrier",
+            "fused_dispatch_meta",
+            "table_kernel",
+            "exchange_tables",
+            "kernel_plan_tables",
+        ):
             assert knob not in forwarded
+
+
+def test_shared_expert_operands_reach_the_push_layer(monkeypatch):
+    """A shared limit adds four replicated operands, hands them to the push
+    layer as `shared_expert`, and keys its own op."""
+    from vllm_torchtpu.kernels.experimental import push_fused_moe
+
+    monkeypatch.setenv("MOE_FUSED_EP_KERNEL_IMPL", "push")
+    monkeypatch.setattr(bridge, "_OPS", {})
+    built = []
+
+    def build(name, fn, **kwargs):
+        built.append((fn, kwargs))
+        return MagicMock()
+
+    monkeypatch.setattr(bridge, "jax_op", build)
+    kernel = MagicMock(side_effect=lambda x, *a, **kw: (x, x))
+    monkeypatch.setattr(push_fused_moe, "fused_ep_moe_push", kernel)
+    args = (None, 2, True, "silu", None, True)
+    plain = bridge._build_op(*args)
+    shared = bridge._build_op(*args, shared_limit=10.0)
+    assert shared is not plain
+    fn, kwargs = built[-1]
+    assert kwargs["input_partition_specs"][-4:] == (bridge.PartitionSpec(),) * 4
+    # Two outputs, two specs: one spec fails Dynamo's output pytree at compile.
+    out_specs = kwargs["output_partition_specs"]
+    assert isinstance(out_specs, tuple) and len(out_specs) == 2
+    x = jnp.ones((8, 8), dtype=jnp.bfloat16)
+    weights = tuple(jnp.full((2,), i, jnp.float32) for i in range(4))
+    operands = (x, None, None, None, None, jnp.zeros((8, 4)), jnp.zeros((1, 1)))
+    fn(*operands, *weights)
+    forwarded = kernel.call_args.kwargs
+    assert forwarded["shared_limit"] == 10.0
+    for got, want in zip(forwarded["shared_expert"], weights, strict=True):
+        assert got is want
+
+
+@pytest.mark.parametrize(
+    "impl,shared_limit", [(None, None), ("v2", None), ("push", 10.0)]
+)
+@pytest.mark.parametrize("enabled", [False, True])
+def test_mxfp4_prebuild_only_fuses_shared_expert_for_push(
+    monkeypatch, impl, shared_limit, enabled
+):
+    """V2 serving keeps its standalone shared expert with the push flag enabled."""
+    from vllm_torchtpu.layers.adapter.quantization.mxfp4 import (
+        VllmDeepseekV4Mxfp4MoEMethod,
+    )
+
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_KERNEL_IMPL", impl)
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_SHARED_EXPERT", enabled)
+    method = object.__new__(VllmDeepseekV4Mxfp4MoEMethod)
+    method.fused_ep = True
+    layer = _layer(renormalize=True, swiglu_limit=10.0)
+    w13 = torch.empty((4, 512, 1024), device="meta")
+    w2 = torch.empty((4, 512, 512), device="meta")
+    with patch.object(bridge, "prebuild_fused_moe_ep", return_value="op") as build:
+        assert method._prebuild_w4a8(layer, "silu", w13, w2, 512) == "op"
+    assert build.call_args.kwargs["shared_limit"] == (shared_limit if enabled else None)
+
+
+def test_shared_expert_needs_the_push_kernel(monkeypatch):
+    monkeypatch.setenv("MOE_FUSED_EP_KERNEL_IMPL", "v2")
+    monkeypatch.setattr(bridge, "_OPS", {})
+    monkeypatch.setattr(bridge, "jax_op", lambda *a, **kw: MagicMock())
+    with pytest.raises(ValueError, match="push"):
+        bridge._build_op(None, 2, True, "silu", None, True, shared_limit=10.0)
+
+
+def _runner_with_shared(limit, shared_limit=10.0):
+    routed = SimpleNamespace()
+    calls = []
+
+    def forward(layer, x, logits, input_ids, shared):
+        calls.append(shared)
+        return "routed", "shared"
+
+    routed.quant_method = SimpleNamespace(
+        shared_expert_limit=limit, forward_monolithic_with_shared_expert=forward
+    )
+    mlp = SimpleNamespace(
+        fused_operands=lambda: ("w13", "s13", "w2", "s2", shared_limit)
+    )
+    runner = SimpleNamespace(
+        _quant_method=routed.quant_method, routed_experts=routed, _tpu_shared_mlp=mlp
+    )
+    return runner, calls
+
+
+def test_runner_takes_the_shared_expert_from_the_fused_op():
+    runner, calls = _runner_with_shared(10.0)
+    hidden = torch.zeros(2, 4)
+    out = VllmMoERunner._apply_quant_method(runner, hidden, torch.zeros(2, 3), hidden)
+    assert out == ("shared", "routed")
+    assert calls == [("w13", "s13", "w2", "s2")]
+
+
+def test_runner_refuses_a_shared_expert_the_op_was_not_built_for():
+    runner, _ = _runner_with_shared(10.0, shared_limit=7.0)
+    hidden = torch.zeros(2, 4)
+    with pytest.raises(ValueError, match="swiglu limit"):
+        VllmMoERunner._apply_quant_method(runner, hidden, torch.zeros(2, 3), hidden)
+    runner, _ = _runner_with_shared(10.0)
+    with pytest.raises(NotImplementedError):
+        VllmMoERunner._apply_quant_method(
+            runner, hidden, torch.zeros(2, 3), hidden.clone()
+        )
