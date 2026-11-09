@@ -740,10 +740,9 @@ def msa_attend_dcp(
     """Second half of the DCP forward: attend over the selected blocks this
     rank holds.
 
-    With a 4-bit `kv_cache` pass its `scale_cache`; `q` must then be rotated
-    (`msa_fp4.rotate_queries`) and the partial output is in the rotated
-    basis (callers rotate and unrotate their own heads, a 1 / DCP share of
-    the group's).
+    With a 4-bit `kv_cache` pass its `scale_cache`: queries are rotated here
+    and the partial output is left in the rotated basis (callers unrotate
+    their own merged heads, a 1 / DCP share of the group's).
 
     ``q [T, G * Hg, D]`` holds every query head of the group's ``G`` KV heads
     (KV head ``h`` owns query heads ``[h * Hg, (h + 1) * Hg)``);
@@ -783,6 +782,7 @@ def msa_attend_dcp(
     )
     args = (local_key, pos % block_size + 1, block_tables.reshape(-1))
     if scale_cache is not None:
+        q = msa_fp4.rotate_queries(q)
         if num_heads == 1:
             return msa_attention_lse.msa_sparse_attention_lse(
                 q,

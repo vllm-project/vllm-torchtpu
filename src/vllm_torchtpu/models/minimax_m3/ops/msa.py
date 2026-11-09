@@ -374,17 +374,13 @@ def _rotate_heads(x: torch.Tensor, hadamard: torch.Tensor) -> torch.Tensor:
     return torch.matmul(x, hadamard) * (1.0 / x.shape[-1])
 
 
-def gather_query_heads(
-    q: torch.Tensor, group: Any, hadamard: torch.Tensor | None = None
-) -> torch.Tensor:
-    """The DCP group's query heads ``[T, dcp * q_heads, D]``. With a 4-bit
-    cache's `hadamard`, each rank rotates its own ``q [T, q_heads, D]``
-    before the gather (a ``1 / DCP`` share of the group's heads). The
-    gather stays token-major: a head-major transpose of `q` before it made
-    XLA re-lay out the qkv / rope fusions that produce `q` (+0.25 ms per
-    layer at 8K tokens, c48 / c64 twins j-4371707e, j-65bccede)."""
-    if hadamard is not None:
-        q = _rotate_heads(q, hadamard)
+def gather_query_heads(q: torch.Tensor, group: Any) -> torch.Tensor:
+    """The DCP group's query heads ``[T, dcp * q_heads, D]``, gathered as
+    they leave the rope: any op on `q` before the gather (a head-major
+    transpose, a 4-bit rotation of this rank's heads) made XLA re-lay out
+    the qkv / rope fusions that produce it (+0.25-0.3 ms per layer at 8K
+    tokens, c48 / c64 twins j-4371707e, j-65bccede, j-c5c4bdfc); the
+    attention op rotates the gathered queries itself."""
     return group.all_gather(q.contiguous(), dim=1)
 
 
@@ -424,7 +420,6 @@ def gather_group_heads(
     group: Any,
     dcp: int,
     kv_head_replicas: int,
-    hadamard: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """The DCP group's query heads ``[T, dcp * q_heads, D]``
     (`gather_query_heads`), and the ``k``/``v``/``index_q [T, dcp //
@@ -436,7 +431,7 @@ def gather_group_heads(
     the attention op needs the queries after it, so the query gather (8 of a
     rank's 11 heads at DCP 8) can run while the scoring op computes instead
     of before it, and needs no strided split of a combined gather."""
-    q_all = gather_query_heads(q, group, hadamard)
+    q_all = gather_query_heads(q, group)
     num_tokens, _, head_dim = k.shape
     per_rank = group.all_gather(torch.cat([k, v, index_q], dim=1).contiguous(), dim=1)
     per_head = per_rank.view(num_tokens, dcp, 3, head_dim)[:, ::kv_head_replicas]
@@ -738,10 +733,10 @@ def _get_msa_dcp_fp4_op(
         group = get_dcp_group()
         assert group is not None, "DCP group is not initialized"
         if kv_heads == 1:
-            q_all = gather_query_heads(q, group, hadamard)
+            q_all = gather_query_heads(q, group)
         else:
             q_all, k, v, index_q = gather_group_heads(
-                q, k, v, index_q, group, dcp, kv_head_replicas, hadamard
+                q, k, v, index_q, group, dcp, kv_head_replicas
             )
         new_kv_cache, new_index_cache, new_scale_cache, candidates = score_op(
             k,
