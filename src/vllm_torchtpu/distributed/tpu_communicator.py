@@ -90,4 +90,17 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
         group = self._moe_group(is_sequence_parallel)
         if group is None:
             return hidden_states
-        return group.reduce_scatter(hidden_states, dim=0)
+        # The small reduce-scatter kernel for a small block over the mesh
+        # (TPU_SMALL_ALL_REDUCE_MAX_ROWS), vLLM's reduce-scatter otherwise.
+        from vllm_torchtpu.layers.adapter import small_all_reduce_op
+
+        return small_all_reduce_op.reduce_scatter(
+            hidden_states, group.ranks, lambda x: group.reduce_scatter(x, dim=0)
+        )
+
+    def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
+        # The small all-reduce kernel for a small block over the mesh
+        # (TPU_SMALL_ALL_REDUCE_MAX_ROWS), the base all-reduce otherwise.
+        from vllm_torchtpu.layers.adapter import small_all_reduce_op
+
+        return small_all_reduce_op.all_reduce(input_, self.ranks, super().all_reduce)

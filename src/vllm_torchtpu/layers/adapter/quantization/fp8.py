@@ -1069,6 +1069,11 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         if layer.moe_config.moe_parallel_config.use_ep:
             moe_routing.validate_linear_ep_placement(layer)
         moe_routing.register_experts_start_buffer(layer, device=layer.w13_weight.device)
+        if envs.TPU_SMALL_ALL_REDUCE_MAX_ROWS:
+            # Outside the trace: resolving the EP mesh gathers over the group.
+            from vllm_torchtpu.layers.adapter import small_all_reduce_op
+
+            small_all_reduce_op.prebuild(layer.w13_weight.device)
         if self._use_adaptive_fused_moe:
             self._adaptive_fused_moe_op = adaptive_moe.prebuild_adaptive_fused_moe(
                 layer,
