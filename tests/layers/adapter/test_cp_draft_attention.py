@@ -55,7 +55,8 @@ def _dense_reference(q, keys, values, total, cu_q, window, sm_scale, causal):
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float8_e4m3fn])
 @pytest.mark.parametrize("dcp,kv_heads,q_heads", [(1, 1, 8), (2, 1, 16), (8, 4, 64)])
-def test_sharded_matches_replicated(dcp, kv_heads, q_heads, dtype, causal):
+@pytest.mark.parametrize("attend", ["xla", "flash"])
+def test_sharded_matches_replicated(dcp, kv_heads, q_heads, dtype, causal, attend):
     rng = np.random.default_rng(dcp * 10 + kv_heads)
     ctx = np.array([1000, 37, 600, 0], np.int32)[:MAX_SEQS]  # 0: empty context
     q_len = np.array([7, 7, 3, 7], np.int32)
@@ -115,7 +116,8 @@ def test_sharded_matches_replicated(dcp, kv_heads, q_heads, dtype, causal):
             jnp.asarray(ctx), tables.reshape(-1), cu_ctx,
             dcp=dcp, rank=jnp.int32(r), k_scale=scale, v_scale=scale,
         )
-        o, l = cda.attend_cached(
+        attend_fn = cda.attend_cached_flash if attend == "flash" else cda.attend_cached
+        o, l = attend_fn(
             q, cache_r, jnp.asarray(total), tables.reshape(-1), cu_q,
             kv_heads=kv_heads, max_query_len=max_q, sliding_window=WINDOW,
             sm_scale=sm_scale, dcp=dcp, rank=jnp.int32(r), k_scale=scale, v_scale=scale,
@@ -196,3 +198,268 @@ def test_gather_pages_matches_take():
     cache = jnp.asarray(rng.standard_normal((10, PAGE, 1, 2, HEAD_DIM)), jnp.bfloat16)
     pages = jnp.asarray(rng.integers(0, 10, (3, 4)), jnp.int32)
     np.testing.assert_array_equal(cda.gather_pages(cache, pages, interpret=True), cache[pages])
+
+
+# ---------------------------------------------------------------------------
+# attend_cached_flash: the Pallas paged sliding-window flash kernel.
+# Not bitwise equal to attend_cached (online softmax, P rounded to bf16 for
+# PV); checked against a float64 oracle and against attend_cached's argmax.
+# ---------------------------------------------------------------------------
+
+# float64-oracle tolerances: the output is bf16 (the op's contract), so each
+# element within one bf16 ulp of the oracle plus 1e-5 (f32 accumulation of
+# near-zero outputs); LSE (f32) within 1e-4.
+FLASH_OUT_ULPS = 1.0
+FLASH_OUT_ATOL = 1e-5
+FLASH_LSE_ATOL = 1e-4
+
+
+def _bf16_ulp(*xs):
+    mag = np.maximum(np.max([np.abs(x) for x in xs], axis=0), 2.0**-126)
+    return 2.0 ** (np.floor(np.log2(mag)) - 7)
+
+
+def _flash_case(dcp, kv_heads, q_heads, dtype, seed, ctx=None, q_len=None, window=WINDOW):
+    """Per-rank caches of a random context plus a query block."""
+    rng = np.random.default_rng(seed)
+    ctx = np.array([1000, 37, 600, 0, 2000, 130] if ctx is None else ctx, np.int32)
+    q_len = np.array([7, 7, 3, 7, 0, 7] if q_len is None else q_len, np.int32)
+    num_seqs = len(ctx)
+    total = ctx + q_len
+    pages_per_seq = -(-int(total.max()) // PAGE) + 1
+    logical = -(-pages_per_seq // dcp) + 1
+    # Shuffled pages, so a wrong page lookup reads someone else's KV.
+    tables = jnp.asarray(
+        rng.permutation(num_seqs * logical + 1)[: num_seqs * logical].reshape(num_seqs, -1),
+        jnp.int32,
+    )
+    scale = None if dtype == jnp.bfloat16 else 0.5
+    ck = rng.standard_normal((int(ctx.sum()), kv_heads, HEAD_DIM)).astype(np.float32)
+    cv = rng.standard_normal((int(ctx.sum()), kv_heads, HEAD_DIM)).astype(np.float32)
+    num_tokens = int(q_len.sum()) + 5  # padding tokens
+    q = jnp.asarray(rng.standard_normal((num_tokens, q_heads, HEAD_DIM)), jnp.bfloat16)
+    cu_q = jnp.asarray(np.concatenate([[0], np.cumsum(q_len)]), jnp.int32)
+    cu_ctx = jnp.asarray(np.concatenate([[0], np.cumsum(ctx)]), jnp.int32)
+    caches = [
+        cda.write_kv(
+            _cache(num_seqs * logical + 1, kv_heads, dtype), jnp.asarray(ck), jnp.asarray(cv),
+            jnp.asarray(ctx), tables.reshape(-1), cu_ctx,
+            dcp=dcp, rank=jnp.int32(r), k_scale=scale, v_scale=scale,
+        )
+        for r in range(dcp)
+    ]
+
+    def stored(x):
+        if scale is None:
+            return np.asarray(jnp.asarray(x).astype(dtype).astype(jnp.float32), np.float64)
+        return np.asarray(
+            (jnp.asarray(x) / scale).astype(dtype).astype(jnp.float32), np.float64
+        ) * scale
+
+    return dict(
+        ctx=ctx, q_len=q_len, total=jnp.asarray(total), tables=tables.reshape(-1), cu_q=cu_q,
+        q=q, caches=caches, scale=scale, keys=stored(ck), values=stored(cv),
+        cu_ctx=np.asarray(cu_ctx), window=window, dcp=dcp, kv_heads=kv_heads,
+    )
+
+
+def _oracle(case, rank):
+    """float64 partial attention of rank `rank`: keys of its blocks, below
+    the cache length, in the window. Returns (out [T, H, D], lse [T, H])."""
+    q = np.asarray(case["q"], np.float64)
+    num_tokens, q_heads, _ = q.shape
+    group = q_heads // case["kv_heads"]
+    out = np.zeros(q.shape)
+    lse = np.full((num_tokens, q_heads), -np.inf)
+    cu_q = np.asarray(case["cu_q"])
+    for s, c in enumerate(case["ctx"]):
+        lo, hi = int(cu_q[s]), int(cu_q[s + 1])
+        if hi == lo or c == 0:
+            continue
+        k = case["keys"][case["cu_ctx"][s] : case["cu_ctx"][s + 1]]
+        v = case["values"][case["cu_ctx"][s] : case["cu_ctx"][s + 1]]
+        k_pos = np.arange(c)
+        q_pos = c + np.arange(hi - lo)
+        mask = ((k_pos // PAGE) % case["dcp"] == rank)[None, :] & (
+            q_pos[:, None] - k_pos[None, :] < case["window"]
+        )
+        kk = np.repeat(k, group, axis=1)
+        vv = np.repeat(v, group, axis=1)
+        sc = np.einsum("qhd,khd->hqk", q[lo:hi], kk) * HEAD_DIM**-0.5
+        sc = np.where(mask[None], sc, -np.inf)
+        m = sc.max(-1, keepdims=True)
+        m = np.where(np.isfinite(m), m, 0.0)
+        p = np.exp(sc - m)
+        l = p.sum(-1, keepdims=True)
+        o = np.einsum("hqk,khd->qhd", p, vv) / np.where(l > 0, l, 1.0).transpose(1, 0, 2)
+        out[lo:hi] = np.where((l > 0).transpose(1, 0, 2), o, 0.0)
+        l0 = l[..., 0]
+        lse[lo:hi] = np.where(l0 > 0, m[..., 0] + np.log(np.where(l0 > 0, l0, 1)), -np.inf).T
+    return out, lse
+
+
+def _attend(case, cache_rank, fn=None, **over):
+    fn = fn or cda.attend_cached_flash
+    kw = dict(
+        kv_heads=case["kv_heads"], max_query_len=7, sliding_window=case["window"],
+        sm_scale=HEAD_DIM**-0.5, dcp=case["dcp"], rank=jnp.int32(cache_rank),
+        k_scale=case["scale"], v_scale=case["scale"], interpret=True,
+    )
+    kw.update(over)
+    tables = kw.pop("tables", case["tables"])
+    o, l = fn(case["q"], case["caches"][cache_rank], case["total"], tables, case["cu_q"], **kw)
+    return np.asarray(o, np.float64), np.asarray(l, np.float64)
+
+
+def _errors(case, rank, got):
+    ref_o, ref_l = _oracle(case, rank)
+    o, l = got
+    live = np.isfinite(ref_l)
+    if not (live == np.isfinite(l)).all():
+        return np.inf, np.inf
+    if not live.any():
+        return float(np.abs(o).max()), 0.0
+    # Output error in units of (one bf16 ulp + FLASH_OUT_ATOL): <= 1 passes.
+    err = np.abs(o - ref_o) / (FLASH_OUT_ULPS * _bf16_ulp(o, ref_o) + FLASH_OUT_ATOL)
+    return float(err[live].max()), float(np.abs(l - ref_l)[live].max())
+
+
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float8_e4m3fn])
+@pytest.mark.parametrize("dcp,kv_heads,q_heads", [(1, 1, 8), (2, 1, 16), (8, 4, 64)])
+def test_flash_matches_float64_oracle(dcp, kv_heads, q_heads, dtype):
+    case = _flash_case(dcp, kv_heads, q_heads, dtype, seed=dcp)
+    for r in range(dcp):
+        flash = _attend(case, r)
+        xla = _attend(case, r, cda.attend_cached)
+        out_err, lse_err = _errors(case, r, flash)
+        assert out_err <= 1.0 and lse_err < FLASH_LSE_ATOL, (r, out_err, lse_err)
+        # Against the XLA path: within one ulp of the bf16 output, plus 1e-5
+        # absolute for near-zero outputs (cancellation; f32 accumulation order).
+        ulp = _bf16_ulp(xla[0], flash[0])
+        diff = np.abs(flash[0] - xla[0])
+        assert (diff <= ulp + 1e-5).all(), (r, (diff - ulp).max())
+        live = np.isfinite(xla[1])
+        assert (live == np.isfinite(flash[1])).all()
+        assert np.abs(flash[1] - xla[1])[live].max(initial=0.0) < 1e-5
+
+
+@pytest.mark.parametrize(
+    "fault",
+    ["wrong_rank", "window_minus_one_page", "page_table_swap", "no_v_scale"],
+)
+def test_flash_fault_controls(fault):
+    """The oracle comparison catches each injected fault (positive controls)."""
+    case = _flash_case(2, 1, 16, jnp.float8_e4m3fn, seed=11)
+    rank, over = 0, {}
+    if fault == "wrong_rank":
+        over = dict(rank=jnp.int32(1))
+    elif fault == "window_minus_one_page":
+        over = dict(sliding_window=WINDOW - PAGE)
+    elif fault == "page_table_swap":
+        t = np.asarray(case["tables"]).reshape(len(case["ctx"]), -1).copy()
+        t[[0, 4]] = t[[4, 0]]
+        over = dict(tables=jnp.asarray(t.reshape(-1)))
+    elif fault == "no_v_scale":
+        over = dict(v_scale=None)
+    out_err, lse_err = _errors(case, rank, _attend(case, rank, **over))
+    assert out_err > 1.0 or lse_err >= FLASH_LSE_ATOL, (fault, out_err, lse_err)
+
+
+def _merge_np(parts):
+    out, lse = parts[0]
+    for o, l in parts[1:]:
+        m = np.maximum(lse, l)
+        m = np.where(np.isfinite(m), m, 0.0)
+        wa, wb = np.exp(lse - m), np.exp(l - m)
+        norm = np.where(wa + wb > 0, wa + wb, 1.0)
+        out = (wa[..., None] * out + wb[..., None] * o) / norm[..., None]
+        lse = np.where(wa + wb > 0, m + np.log(norm), -np.inf)
+    return out
+
+
+def test_flash_argmax_matches_xla_path():
+    """Draft-logit argmax (both ranks merged, through a random LM head).
+
+    Both paths return bf16 (the op's contract), and that rounding alone moves
+    the argmax of near-tied rows: the XLA path agrees with its own unrounded
+    (f32) output on ~99.5% of rows here. So: every row whose float64 top-2
+    logit gap is clear of that noise (> 1e-2; one output ulp moves a logit by
+    < 4e-3 here) has the same argmax in the kernel, the XLA path and float64,
+    and the kernel's overall agreement with the XLA path is no worse than the
+    XLA path's own rounding noise."""
+    rng = np.random.default_rng(5)
+    head = rng.standard_normal((16 * HEAD_DIM, 2048))
+    rows = 0
+    agree = dict(flash_xla=0, flash_f64=0, xla_f64=0, xla_unrounded=0)
+    for seed in range(4):
+        n = 24
+        ctx = rng.integers(0, 2600, n).astype(np.int32)
+        q_len = np.full(n, 7, np.int32)
+        case = _flash_case(2, 1, 16, jnp.float8_e4m3fn, seed=100 + seed, ctx=ctx, q_len=q_len)
+        f32_case = dict(case, q=case["q"].astype(jnp.float32))  # same values, f32 output
+        num = int(q_len.sum())
+        outs = dict(
+            flash=_merge_np([_attend(case, r) for r in range(2)]),
+            xla=_merge_np([_attend(case, r, cda.attend_cached) for r in range(2)]),
+            unrounded=_merge_np([_attend(f32_case, r, cda.attend_cached) for r in range(2)]),
+            f64=_merge_np([_oracle(case, r) for r in range(2)]),
+        )
+        logits = {k: v[:num].reshape(num, -1) @ head for k, v in outs.items()}
+        top = {k: v.argmax(-1) for k, v in logits.items()}
+        live = np.asarray(ctx > 0).repeat(7)
+        srt = np.sort(logits["f64"], axis=-1)
+        clear = live & (srt[:, -1] - srt[:, -2] > 1e-2)
+        for k in ("flash", "xla"):
+            assert (top[k] == top["f64"])[clear].all(), k
+        agree["flash_xla"] += int((top["flash"] == top["xla"])[live].sum())
+        agree["flash_f64"] += int((top["flash"] == top["f64"])[live].sum())
+        agree["xla_f64"] += int((top["xla"] == top["f64"])[live].sum())
+        agree["xla_unrounded"] += int((top["xla"] == top["unrounded"])[live].sum())
+        rows += int(live.sum())
+    print("argmax agreement over", rows, "rows:", {k: v / rows for k, v in agree.items()})
+    assert rows >= 500
+    assert agree["flash_xla"] >= agree["xla_unrounded"] - 2, agree
+    assert agree["flash_xla"] >= 0.999 * rows, agree  # same precision: only order differs
+    assert agree["flash_f64"] >= agree["xla_f64"] - 2, agree
+
+
+@pytest.mark.parametrize("dcp,kv_heads,q_heads", [(2, 1, 16), (8, 4, 64)])
+@pytest.mark.parametrize("num_tokens,max_seqs", [(32, 4), (128, 18), (512, 73), (1024, 146)])
+def test_flash_compiles_for_tpu7x(dcp, kv_heads, q_heads, num_tokens, max_seqs):
+    """Deviceless tpu7x AOT compile at the served draft shapes (T // 7 requests)."""
+    from jax.experimental import topologies
+    from jax.sharding import SingleDeviceSharding
+
+    try:
+        topology = topologies.get_topology_desc("tpu7x:2x2x1", "tpu")
+    except Exception as e:  # no libtpu
+        pytest.skip(f"no deviceless tpu7x topology: {e}")
+    sharding = SingleDeviceSharding(topology.devices[0])
+
+    def spec(shape, dt):
+        return jax.ShapeDtypeStruct(shape, dt, sharding=sharding)
+
+    words = -(-2 * kv_heads // 4)
+    args = (
+        spec((num_tokens, q_heads, HEAD_DIM), jnp.bfloat16),
+        spec((65536, PAGE, words, 4, HEAD_DIM), jnp.float8_e4m3fn),
+        spec((max_seqs,), jnp.int32),
+        spec((max_seqs * 64,), jnp.int32),
+        spec((max_seqs + 1,), jnp.int32),
+        spec((1,), jnp.int32),
+    )
+
+    def fn(q, cache, seq_lens, tables, cu_q, rank):
+        return cda.attend_cached_flash(
+            q, cache, seq_lens, tables, cu_q, kv_heads=kv_heads, max_query_len=7,
+            sliding_window=4096, sm_scale=HEAD_DIM**-0.5, dcp=dcp, rank=rank[0],
+            k_scale=0.7, v_scale=0.3,
+        )
+
+    from jax.sharding import AbstractDevice, AbstractMesh, use_abstract_mesh
+
+    tpu7x = AbstractMesh((), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu"))
+    with use_abstract_mesh(tpu7x):
+        lowered = jax.jit(fn).lower(*args)
+    compiled = lowered.compile()
+    assert "tpu_custom_call" in compiled.as_text()
