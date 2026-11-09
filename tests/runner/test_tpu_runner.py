@@ -1489,6 +1489,7 @@ class TestAttentionMetadataBuilder:
         runner.max_num_reqs = max_num_reqs
         runner.most_model_len = most_model_len
         runner._unified_kv_layout = False
+        runner.pcp_manager = None
         runner.position_ids = torch.full((8,), 42, dtype=torch.int32)
         runner._unfenced_h2d_sources = []
         runner._free_h2d_sources = {}
