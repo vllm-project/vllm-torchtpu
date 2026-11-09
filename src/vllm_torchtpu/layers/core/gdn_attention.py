@@ -928,6 +928,7 @@ def run_jax_gdn_attention_pooled_local(
         two_slot_ckpts=two_slot_ckpts,
         packed_tokens=tpu_envs.TPU_GDN_PACKED_TOKENS,
         single_launch=tpu_envs.TPU_GDN_SINGLE_LAUNCH,
+        paired_heads=tpu_envs.TPU_GDN_PAIRED_HEADS,
     )
     return recurrent_state, output
 

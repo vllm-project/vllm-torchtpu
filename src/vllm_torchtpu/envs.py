@@ -86,6 +86,7 @@ if TYPE_CHECKING:
     TPU_GDN_PACKED_TOKENS: bool = False
     TPU_GDN_SINGLE_LAUNCH: bool = False
     TPU_GDN_TWO_SLOT_CKPT: bool = False
+    TPU_GDN_PAIRED_HEADS: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_PACKED_DISPATCH: bool = False
@@ -481,6 +482,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the start state at the next step (kernels/gdn/v3/window_tile.py). Same
     # outputs, num_speculative_tokens - 1 fewer blocks per GDN group.
     "TPU_GDN_TWO_SLOT_CKPT": env_bool("TPU_GDN_TWO_SLOT_CKPT", default=False),
+    # Pooled GDN verify windows: multiply k and q with two value heads of one
+    # key head per MXU dot ([128, 256] weight) instead of one head per dot,
+    # which halves the weight pushes, and select no whole states in the
+    # window loop (kernels/gdn/v3/window_tile.py).
+    "TPU_GDN_PAIRED_HEADS": env_bool("TPU_GDN_PAIRED_HEADS", default=False),
     # Register the DeepSeek-V4 tokenizer that honors continue_final_message.
     # Off by default so tokenizer behavior matches stock vLLM; the DSv4
     # eval config turns it on, since a prefilled assistant turn needs it.

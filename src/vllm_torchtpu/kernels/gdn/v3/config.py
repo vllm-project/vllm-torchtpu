@@ -139,6 +139,12 @@ class GDNConfig:
     # padded with zeros). window_tile reads it directly; per-sequence tiles
     # build their one-token-per-register tiles from it in VMEM.
     packed_tokens: bool = False
+    # window_tile multiplies k (and q) with two value heads of one key head
+    # at a time when each key head has an even number of value heads: one
+    # [kq_head_dim, 2 * v_head_dim] MXU weight per dot instead of one
+    # [kq_head_dim, v_head_dim] weight per head. Its window loop selects no
+    # whole states either way (`window_tile`).
+    paired_heads: bool = False
 
     @property
     def num_ckpt_tiles(self) -> int:
@@ -238,6 +244,11 @@ class GDNConfig:
         suffix = f"_w{self.window_size}" if self.window_size > 1 else ""
         if self.two_slot_tiles and self.window_size > 2:
             suffix += "_2slot"
+        # "_pairs" names the switch: tiles that inner_kernel runs (window_tile
+        # unsupported) and an odd number of value heads per key head keep one
+        # head per dot.
+        if self.paired_heads and self.per_head_windows:
+            suffix += "_pairs"
         if self.is_kda and self.gate_lower_bound is not None:
             suffix += "_bounded"
         return f"fused_conv1d_{self.attention_mode.value}_{self.mode.value}{suffix}"

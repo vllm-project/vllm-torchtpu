@@ -544,6 +544,7 @@ def windowed_decode_tile_size(
         "two_slot_ckpts",
         "packed_tokens",
         "single_launch",
+        "paired_heads",
     ),
 )
 def fused_conv1d_gdn(
@@ -583,6 +584,7 @@ def fused_conv1d_gdn(
     two_slot_ckpts: bool = False,
     packed_tokens: bool = False,
     single_launch: bool = False,
+    paired_heads: bool = False,
 ) -> tuple[tuple[jax.Array, jax.Array], jax.Array] | tuple[jax.Array, jax.Array]:
     """Perform conv1d and gdn in a single fused kernel.
 
@@ -669,6 +671,10 @@ def fused_conv1d_gdn(
         single_launch: With a state source, run the batched and the
             per-sequence segments in one kernel instead of two, so a step
             without prefill does not launch an empty per-sequence kernel.
+        paired_heads: Where window_tile runs the verify windows, multiply k
+            and q with two value heads of one key head per MXU dot, and
+            select no whole states in its window loop
+            (`GDNConfig.paired_heads`).
 
     Returns:
         (new_conv_state, new_recurrent_state): Updated convolution state cache and
@@ -851,6 +857,7 @@ def fused_conv1d_gdn(
             ),
             state_plan=state_plan,
             packed_tokens=packed,
+            paired_heads=paired_heads,
         )
 
     # Packed activations: only where window_tile runs the verify windows.

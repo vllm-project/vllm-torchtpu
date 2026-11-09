@@ -11,7 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""GDN verify-window tile, one window position and one value head at a time.
+"""GDN verify-window tile, one window position and one value head (with
+paired heads, two per MXU dot) at a time.
 
 `wrapper.inner_kernel` computes a whole tile as large arrays: the conv on
 the compact [chunk, 1, dim_size] layout (one 128-lane chunk of one token
@@ -31,10 +32,10 @@ head and position) leave most of the VPU idle. This tile instead:
   independent, which hides each head's MXU round trip, and the conv and
   checkpoint work fills the slots the weight pushes leave free.
 
-Every element sees the same operations in the same order as in
-`inner_kernel` (the conv's tap sum, SiLU, per-row masks, L2 norms and
-gates, per-head dots, which `recurrent_gdn` batches over heads), so outputs
-and every checkpoint byte are bitwise equal.
+With paired heads off, every element sees the same operations in the
+same order as in `inner_kernel` (the conv's tap sum, SiLU, per-row masks,
+L2 norms and gates, per-head dots, which `recurrent_gdn` batches over
+heads), so outputs and every checkpoint byte are bitwise equal.
 
 With two-slot checkpoints (`GDNConfig.two_slot_ckpts`) a sequence keeps
 only the window's start state and the state after its last real token. A
@@ -50,6 +51,24 @@ inside the window, the state after the window position that completes the
 block goes to a third tile, the bytes the one-block-per-position kernel
 writes for that checkpoint, which the write-back stores in the completed
 block (`memory_ref.two_slot_boundary`).
+
+With paired heads (`GDNConfig.paired_heads`) and an even number of value
+heads per key head, every dot of k or q with the states, in the window
+loop, the replay and the boundary recompute alike, takes two value heads
+of one key head: their states side by side form one
+[kq_head_dim, 2 * v_head_dim] MXU weight, which halves the weight pushes
+that otherwise set the loop's pace. Each output lane still comes from the
+same BF16-rounded state column and the same row; that the MXU sums it to
+the same bits is hardware behaviour, which
+tests/kernels/test_gdn_v3_paired_dot.py checks. With the pushes halved the
+loop is bound by vector work, so it then selects no whole states in the
+window loop either: a fresh sequence's read tile, which copy_in leaves
+unread, is zero filled, and past a two-slot window's last real token each
+update is an exact no-op (decay exactly 1, added term k_t * -0.0 with
+k = +0), which keeps the state bit for bit if the VPU keeps x * 1.0 and
+x + -0.0 exact (also checked by that test). The two-slot start tile goes
+through the has_initial_state select in both forms, so its bytes are
+re-packed alike.
 """
 
 import math
@@ -65,6 +84,15 @@ from vllm_torchtpu.kernels.gdn.v3 import compute_gdn, config, memory_ref, vmem_l
 
 def _lanes() -> int:
     return pltpu.get_tpu_info().num_lanes
+
+
+def _head_groups(cfg: config.GDNConfig, kq_head: int) -> list[tuple[int, ...]]:
+    """The value heads of key head `kq_head` in order, one group per MXU
+    dot: two heads each with `cfg.paired_heads` and an even number of value
+    heads per key head, else one."""
+    heads = range(kq_head * cfg.v_per_kq_head, (kq_head + 1) * cfg.v_per_kq_head)
+    size = 2 if cfg.paired_heads and cfg.v_per_kq_head % 2 == 0 else 1
+    return [tuple(heads[i : i + size]) for i in range(0, len(heads), size)]
 
 
 def _stored_rows(cfg: config.GDNConfig) -> tuple[int, ...] | None:
@@ -262,6 +290,10 @@ def run(
         for idx in seqs
     ]
     two = cfg.two_slot_ckpts
+    # Paired heads select no whole states in the window loop: a fresh
+    # sequence's read tile is zero filled, and past a two-slot window's last
+    # real token each update is an exact no-op (decay 1, added term -0.0).
+    state_selects = not cfg.paired_heads
     num_replay = cfg.window_size - 1
     replays: list[jax.Array] = []
     # Two-slot: window position whose state a block boundary inside the
@@ -281,6 +313,17 @@ def run(
             )[0]
             for idx in seqs
         ]
+    if not state_selects:
+        # A live sequence without an initial state starts from zeros: its
+        # read tile, which copy_in leaves unread, is zero filled.
+        for idx in seqs:
+            fresh = jnp.logical_and(
+                metadata_ref.p_id_is_first_tile[p_id, idx],
+                jnp.logical_not(has_initial_state[idx]),
+            )
+            pl.when(fresh)(
+                lambda idx=idx: vmem_ldst.zero_state_tile(rec_in_ref, cfg, idx)
+            )
 
     # Conv inputs per sequence, dense and in the pool's stored row order: the
     # previous taps (zero for a fresh sequence), then the window's tokens.
@@ -347,6 +390,21 @@ def run(
         )
         return picked[0, head : head + 1]
 
+    def head_dot(row, mats):
+        # A [1, lanes] row times the group's [kq_head_dim, v_head_dim]
+        # matrices side by side: one MXU weight for the whole group.
+        rhs = mats[0] if len(mats) == 1 else jnp.concat(mats, axis=1)
+        return jax.lax.dot(
+            row[None],
+            rhs[None],
+            dimension_numbers=batched_dims,
+            preferred_element_type=jnp.float32,
+        )[0].astype(compute)
+
+    def head_part(prod, j, n):
+        # Head j's lanes of a group product over n heads.
+        return prod if n == 1 else prod[:, j * lanes : (j + 1) * lanes]
+
     def recompute(j, idx, taps_ref, gates, start_ref, out_ref, out_tile):
         # Token j recomputed with the arithmetic `position` gave it, state
         # only: conv inputs from `taps_ref`, b / a rows `gates`, the state
@@ -365,25 +423,23 @@ def run(
             r = stored_row[nkq + kq_head]
             k = compute_gdn.l2_norm(act[r : r + 1].astype(compute))
             k_t = compute_gdn.fused_transpose_broadcast(k, src_dim=1, dst_dim=0)
-            for head in range(
-                kq_head * cfg.v_per_kq_head, (kq_head + 1) * cfg.v_per_kq_head
-            ):
-                v = act[2 * nkq + head : 2 * nkq + head + 1].astype(compute)
-                if j == 0:
-                    state = vmem_ldst.load_state_head(start_ref, cfg, idx, head)
-                else:
-                    state = state_ref[idx, head]
-                state_updated = state * head_scalar(gating, head)
-                v_updated = jax.lax.dot(
-                    k[None],
-                    state_updated[None],
-                    dimension_numbers=batched_dims,
-                    preferred_element_type=jnp.float32,
-                )[0].astype(compute)
-                v_new = head_scalar(beta, head) * (v - v_updated)
-                state = state_updated + k_t * v_new
-                state_ref[idx, head] = state
-                vmem_ldst.store_state_head(out_ref, cfg, idx, out_tile, head, state)
+            for heads in _head_groups(cfg, kq_head):
+                vs, decayed = [], []
+                for head in heads:
+                    vs.append(act[2 * nkq + head : 2 * nkq + head + 1].astype(compute))
+                    if j == 0:
+                        state = vmem_ldst.load_state_head(start_ref, cfg, idx, head)
+                    else:
+                        state = state_ref[idx, head]
+                    decayed.append(state * head_scalar(gating, head))
+                v_updated = head_dot(k, decayed)
+                for h, head in enumerate(heads):
+                    v_new = head_scalar(beta, head) * (
+                        vs[h] - head_part(v_updated, h, len(heads))
+                    )
+                    state = decayed[h] + k_t * v_new
+                    state_ref[idx, head] = state
+                    vmem_ldst.store_state_head(out_ref, cfg, idx, out_tile, head, state)
 
     def replay(j, idx):
         # Token j of the previous window, recomputed from the start state.
@@ -441,7 +497,11 @@ def run(
             b_row, a_row = gate_rows(idx, pos)
             beta = jnp.where(valid, jax.nn.sigmoid(b_row.astype(compute)), 0)
             gating = neg_a * jax.nn.softplus(a_row.astype(compute) + dt_bias)
-            gating = jnp.exp(jnp.where(valid, gating, 0))
+            if two and not state_selects:
+                # Past the last real token the decay is exactly 1.
+                gating = jnp.where(valid, jnp.exp(gating), 1.0)
+            else:
+                gating = jnp.exp(jnp.where(valid, gating, 0))
 
             out_rows = []
             for kq_head in range(nkq):
@@ -455,54 +515,64 @@ def run(
                     jnp.where(valid, act[r : r + 1].astype(compute), 0)
                 )
                 k_t = compute_gdn.fused_transpose_broadcast(k, src_dim=1, dst_dim=0)
-                for head in range(
-                    kq_head * cfg.v_per_kq_head, (kq_head + 1) * cfg.v_per_kq_head
-                ):
-                    v = act[2 * nkq + head : 2 * nkq + head + 1]
-                    v = jnp.where(valid, v.astype(compute), 0)
-                    if first:
-                        state = jnp.where(
-                            has_initial_state[idx],
-                            vmem_ldst.load_state_head(rec_in_ref, cfg, idx, head),
-                            0,
+                for heads in _head_groups(cfg, kq_head):
+                    vs, states, decayed = [], [], []
+                    for head in heads:
+                        v = act[2 * nkq + head : 2 * nkq + head + 1]
+                        vs.append(jnp.where(valid, v.astype(compute), 0))
+                        if first:
+                            state = vmem_ldst.load_state_head(
+                                rec_in_ref, cfg, idx, head
+                            )
+                            if state_selects:
+                                state = jnp.where(has_initial_state[idx], state, 0)
+                            if two:
+                                # The start tile, through the select in both
+                                # forms: without it Mosaic folds the BF16 ->
+                                # FP32 -> BF16 round trip into a raw copy.
+                                start_state = (
+                                    state
+                                    if state_selects
+                                    else jnp.where(has_initial_state[idx], state, 0)
+                                )
+                                vmem_ldst.store_state_head(
+                                    rec_out_ref, cfg, idx, 0, head, start_state
+                                )
+                        else:
+                            state = state_ref[idx, head]
+                        states.append(state)
+                        decayed.append(state * head_scalar(gating, head))
+                    v_updated = head_dot(k, decayed)
+                    updates = []
+                    for h, head in enumerate(heads):
+                        v_new = head_scalar(beta, head) * (
+                            vs[h] - head_part(v_updated, h, len(heads))
                         )
+                        if two and not state_selects:
+                            # Past the last real token k is +0, so the added
+                            # term k_t * -0.0 is -0.0 and the state is kept bit
+                            # for bit (x * 1 + -0.0 == x, -0.0 included).
+                            v_new = jnp.where(valid, v_new, -0.0)
+                        updates.append(decayed[h] + k_t * v_new)
+                    outs = head_dot(q, updates)
+                    for h, head in enumerate(heads):
+                        out_rows.append(head_part(outs, h, len(heads)))
+                        updated = updates[h]
                         if two:
-                            # The start tile.
+                            if state_selects:
+                                # Past the last real token the state stays put, so the
+                                # window's last position holds the last state.
+                                updated = jnp.where(valid, updated, states[h])
+                            state_ref[idx, head] = updated
+                            if pos == cfg.chunk_size - 1:
+                                vmem_ldst.store_state_head(
+                                    rec_out_ref, cfg, idx, 1, head, updated
+                                )
+                        else:
+                            state_ref[idx, head] = updated
                             vmem_ldst.store_state_head(
-                                rec_out_ref, cfg, idx, 0, head, state
+                                rec_out_ref, cfg, idx, pos, head, updated
                             )
-                    else:
-                        state = state_ref[idx, head]
-                    state_updated = state * head_scalar(gating, head)
-                    v_updated = jax.lax.dot(
-                        k[None],
-                        state_updated[None],
-                        dimension_numbers=batched_dims,
-                        preferred_element_type=jnp.float32,
-                    )[0].astype(compute)
-                    v_new = head_scalar(beta, head) * (v - v_updated)
-                    updated = state_updated + k_t * v_new
-                    out = jax.lax.dot(
-                        q[None],
-                        updated[None],
-                        dimension_numbers=batched_dims,
-                        preferred_element_type=jnp.float32,
-                    )[0].astype(compute)
-                    out_rows.append(out)
-                    if two:
-                        # Past the last real token the state stays put, so
-                        # the window's last position holds the last state.
-                        updated = jnp.where(valid, updated, state)
-                        state_ref[idx, head] = updated
-                        if pos == cfg.chunk_size - 1:
-                            vmem_ldst.store_state_head(
-                                rec_out_ref, cfg, idx, 1, head, updated
-                            )
-                    else:
-                        state_ref[idx, head] = updated
-                        vmem_ldst.store_state_head(
-                            rec_out_ref, cfg, idx, pos, head, updated
-                        )
             out_slot_ref[idx, pos] = jnp.concat(out_rows, axis=0).astype(
                 out_slot_ref.dtype
             )

@@ -274,6 +274,23 @@ def zero_state_padding(slot_ref: jax.Ref, cfg: config.GDNConfig, idx: int, pos: 
         )
 
 
+def zero_state_tile(slot_ref: jax.Ref, cfg: config.GDNConfig, idx: int):
+    """Zeroes the whole pooled recurrent region tile of a slot's window
+    position 0, one source block at a time."""
+    assert cfg.state_plan is not None
+    region = cfg.state_plan.recurrent
+    tile = slot_ref.at[idx, 0]
+
+    def zero_block(block, carry):
+        view = typed_ldst.typed_view(
+            tile.at[block], region.view_dtype, region.lane_split
+        )
+        view[...] = jnp.zeros(view.shape, region.view_dtype)
+        return carry
+
+    jax.lax.fori_loop(0, region.nblocks, zero_block, 0)
+
+
 def _load_conv_state(slot_ref: jax.Ref, cfg: config.GDNConfig, idx: int) -> jax.Array:
     """One slot's conv state, decoded through the plan when there is one."""
     # NOTE: Conv1D mandates fp32 due to its usage of compact layout.
