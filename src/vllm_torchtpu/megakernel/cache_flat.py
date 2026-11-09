@@ -25,10 +25,10 @@ from .cache_common import (
     require_fused_donation,
     require_pool_backend,
     resolve_model_spec,
+    should_fuse_pool_io,
     should_use_pool_gather,
     validate_page_table_shape,
 )
-from .cache_experimental import should_fuse_pool_io
 from .exec_spec import ExecSpec
 from .pool import check_ckpt_bounds
 from .pool.config import (

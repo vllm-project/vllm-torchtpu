@@ -23,6 +23,7 @@ import jax.numpy as jnp
 
 from .errors import MegakernelConfigError
 from .exec_spec import ExecSpec
+from .fused_io_hook import fused_io_available
 from .pool.config import PoolBackend, cache_exec
 from .spec import ModelSpec
 
@@ -159,6 +160,78 @@ def should_use_pool_gather(
     return bool(cache_exec(ex).pool_gather)
 
 
+def should_fuse_pool_io(
+    model_spec: Any,
+    ex: ExecSpec,
+    *,
+    fused_pool_io: bool | str | None = False,
+    max_b_low: int = 24,
+    min_b_hi: int = 56,
+) -> bool:
+    """Resolve whether `(model_spec, ex)` should use opt-in 1-launch `fused_pool_io`.
+
+    Args:
+      model_spec: `ModelSpec` or geometry config implementing `.to_model_spec()`.
+      ex: Execution specification (`ex.B`, `cache_exec(ex).fused_pool_io`).
+      fused_pool_io:
+        - `None`: defer to `bool(cache_exec(ex).fused_pool_io)` (default `False`).
+        - `False` (default) / `"false"` / `"0"` / `"off"` / `"split"` / `"3stage"`:
+          use the default split pool I/O pipeline.
+        - `True` / `"true"` / `"1"` / `"on"` / `"fused"`: force 1-launch fused I/O.
+        - `"auto"`: opt-in selective heuristic that fuses when `ex.B <= max_b_low`
+          (`24`) or `ex.B >= min_b_hi` (`56`) and uses split I/O for `32..48`.
+      max_b_low: Upper batch threshold for low-`B` fusion in `"auto"` mode.
+      min_b_hi: Lower batch threshold for high-`B` fusion in `"auto"` mode.
+
+    Without a registered fused implementation (`fused_io_available()`), or when
+    the pool backend doesn't support fused I/O, `"auto"` resolves to split pool
+    I/O and an explicit `True` raises `MegakernelConfigError`.
+    """
+    ms = resolve_model_spec(model_spec)
+    pb = require_pool_backend(ms)
+    if fused_pool_io is None:
+        want_fused = bool(cache_exec(ex).fused_pool_io)
+        explicit_true = want_fused
+    elif isinstance(fused_pool_io, bool):
+        want_fused = fused_pool_io
+        explicit_true = fused_pool_io
+    elif isinstance(fused_pool_io, str):
+        s = fused_pool_io.strip().lower()
+        if s in ("1", "true", "yes", "on", "fused"):
+            want_fused = True
+            explicit_true = True
+        elif s in ("", "0", "false", "no", "off", "none", "split", "3stage"):
+            want_fused = False
+            explicit_true = False
+        elif s == "auto":
+            want_fused = bool(int(max_b_low) >= ex.B or int(min_b_hi) <= ex.B)
+            explicit_true = False
+        else:
+            raise ValueError(
+                f"Unsupported fused_pool_io={fused_pool_io!r}; "
+                "expected bool, 'auto', 'true', or 'false'"
+            )
+    else:
+        raise TypeError(
+            f"Unsupported fused_pool_io type {type(fused_pool_io).__name__}"
+        )
+
+    if not pb.supports_fused_io:
+        if explicit_true:
+            raise MegakernelConfigError(
+                f"ModelSpec {ms.name!r} cache_backend does not support fused_pool_io"
+            )
+        return False
+    if want_fused and not fused_io_available():
+        if explicit_true:
+            raise MegakernelConfigError(
+                "fused_pool_io=True needs a registered fused pool I/O "
+                "implementation (the megakernel experimental package is not loaded)"
+            )
+        return False
+    return want_fused
+
+
 def require_fused_donation(ms: ModelSpec, use_fused: bool, donate_pools: bool) -> None:
     """Fail closed: fused pool I/O is only correct with outer pool donation.
 
@@ -180,6 +253,7 @@ __all__ = [
     "require_pool_backend",
     "resolve_active_seqs_mode",
     "resolve_model_spec",
+    "should_fuse_pool_io",
     "should_use_pool_gather",
     "unwrap_active_seqs",
     "validate_page_table_shape",

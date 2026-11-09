@@ -18,7 +18,7 @@ from __future__ import annotations
 import dataclasses
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from .decls import REQUIRED, FrozenDict, _resolve_field_spec
 from .errors import MegakernelConfigError
@@ -28,9 +28,6 @@ from .modules.gdn.gate import validate_gdn_gate
 from .ops import col_chunk
 from .pool.config import cache_exec, resolved_max_pages_per_seq
 from .spec import ModelSpec
-
-if TYPE_CHECKING:
-    from .model_def import ModelDef
 
 _KNOWN_FROM_HF_KEYS = frozenset(
     (
@@ -59,7 +56,8 @@ class _BoundFromHF:
 
     __slots__ = ("_from_hf", "_model_cls")
 
-    def __init__(self, from_hf: FromHF, model_cls: type[ModelDef]) -> None:
+    # model_cls is type[ModelDef]; typed Any so geometry.py precedes model_def.py.
+    def __init__(self, from_hf: FromHF, model_cls: Any) -> None:
         self._from_hf = from_hf
         self._model_cls = model_cls
 

@@ -52,8 +52,11 @@ from dataclasses import dataclass
 from typing import Any
 
 from . import kernel, pool
-from .cache_common import resolve_model_spec, should_use_pool_gather
-from .cache_experimental import should_fuse_pool_io
+from .cache_common import (
+    resolve_model_spec,
+    should_fuse_pool_io,
+    should_use_pool_gather,
+)
 from .cache_flat import make_flat_pooled_step
 from .cache_hlo import check_pooled_step_hlo
 from .cache_pooled import make_pooled_step

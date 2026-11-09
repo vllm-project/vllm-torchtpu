@@ -27,11 +27,11 @@ from .cache_common import (
     require_pool_backend,
     resolve_active_seqs_mode,
     resolve_model_spec,
+    should_fuse_pool_io,
     should_use_pool_gather,
     unwrap_active_seqs,
     wrap_active_seqs,
 )
-from .cache_experimental import should_fuse_pool_io
 from .cache_pooled_local import raw_step
 from .exec_spec import ExecSpec
 from .planner import extra_inputs

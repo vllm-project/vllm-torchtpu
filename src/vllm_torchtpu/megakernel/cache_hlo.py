@@ -15,8 +15,26 @@
 
 from __future__ import annotations
 
-from . import cache_experimental
 from .pool import POOL_KERNEL_NAMES, PoolLayout
+
+
+def check_fused_pooled_step_hlo(
+    hlo_text: str,
+    *,
+    kernel_names: tuple[str, str] | None = None,
+) -> tuple[bool, str]:
+    """Verify that a 1-launch `fused_pool_io` HLO has no separate gather/scatter."""
+    gather_name, scatter_name = (
+        POOL_KERNEL_NAMES if kernel_names is None else kernel_names
+    )
+    if (gather_name and gather_name in hlo_text) or (
+        scatter_name and scatter_name in hlo_text
+    ):
+        return (
+            False,
+            "unexpected separate gather/scatter kernel in fused_pool_io HLO",
+        )
+    return True, "ok"
 
 
 def check_pooled_step_hlo(
@@ -54,9 +72,7 @@ def check_pooled_step_hlo(
     _, scatter_name = kernel_names
     if fused_pool_io:
         min_cc = 1
-        ok_f, msg_f = cache_experimental.check_fused_pooled_step_hlo(
-            hlo_text, kernel_names=kernel_names
-        )
+        ok_f, msg_f = check_fused_pooled_step_hlo(hlo_text, kernel_names=kernel_names)
         if not ok_f:
             return False, msg_f
     else:

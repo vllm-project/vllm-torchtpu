@@ -18,7 +18,7 @@ from __future__ import annotations
 import dataclasses
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal
+from typing import Any, Literal
 
 import jax
 import jax.numpy as jnp
@@ -38,6 +38,8 @@ from .pool.config import POOL_STATE_NAME, cache_exec, with_cache
 from .profile import Profile
 from .profiles.default import chip_budget
 from .verify_metrics import (
+    CheckResult,
+    ToleranceSpec,
     _allclose,
     _compare_state_dict,
     _spec_state_decls,
@@ -45,9 +47,6 @@ from .verify_metrics import (
     err_metrics,
 )
 from .weights.logical import resolve_spec_and_norms
-
-if TYPE_CHECKING:
-    from .verify import CheckResult, ToleranceSpec
 
 
 @dataclass(frozen=True)
