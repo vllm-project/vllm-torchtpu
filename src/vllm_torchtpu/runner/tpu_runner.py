@@ -113,7 +113,7 @@ from vllm_torchtpu.gdn_pool_layout import (
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs as rpa_configs
 from vllm_torchtpu.kernels.experimental.batched_rpa import wrapper as rpa_batched
 from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
-from vllm_torchtpu.layers.adapter import token_padding
+from vllm_torchtpu.layers.adapter import norm_weight_hoist, token_padding
 from vllm_torchtpu.layers.adapter.attention import (
     KV_LAYOUT_BY_VLLM_LAYOUT,
     TPU_STR_DTYPE_TO_TORCH_DTYPE,
@@ -5804,6 +5804,7 @@ class TPUModelRunner(GPUModelRunner):
             if self._pp_topk_buffer is not None:
                 # -1 is "no token": a row of it attends to nothing.
                 self._pp_topk_buffer.fill_(-1)
+        norm_weight_hoist.install_if_enabled(self.model)
         if envs.TPU_ROPE_CACHE_TRUNCATE:
             self._truncate_rope_caches(self.model)
         if envs.TPU_ROPE_CACHE_ROW_MAJOR:
