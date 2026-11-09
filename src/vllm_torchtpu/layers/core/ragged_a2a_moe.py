@@ -1309,14 +1309,15 @@ def _owner_combine(
     extra = None
     if shared is not None:
         # This rank's shared-expert partial of every engine token goes to the
-        # token's owner (row my_tp * blk + t % blk there), during the experts.
-        t = jnp.arange(blk * tp_size, dtype=jnp.int32)
+        # token's owner (row my_tp * blk + t % blk there), during the experts:
+        # one block of blk rows per owner.
+        owner = jnp.arange(tp_size, dtype=jnp.int32)
         rows = jnp.pad(shared, ((0, pad), (0, 0)))
         rows = rows.reshape(blk * tp_size, 16, -1)
         extra = (
             rows,
-            dp_pos * tp_size + t // blk,
-            my_tp * blk + t % blk,
+            dp_pos * tp_size + owner,
+            jnp.broadcast_to(my_tp * blk, (tp_size,)).astype(jnp.int32),
             # An overflowing step sends and expects nothing (the caller runs
             # the full-size exchange).
             jnp.where(fits, jnp.array([(tp_size - 1) * blk, blk * tp_size]), 0).astype(
