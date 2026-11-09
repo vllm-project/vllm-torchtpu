@@ -169,12 +169,19 @@ def summarize_extend(ranks: list[dict]) -> dict:
                 category = "encoder_tail"
             else:
                 category = "encoder_middle"
-                if (row["rows"], row["padded_rows"], row["replay_tokens"]) != (
-                    2044,
-                    2048,
-                    0,
+                # vLLM reserves max_num_new_slots_for_drafting per request from
+                # the chunk budget: K - 1 for DSpark before v0.33.0 (2044 rows
+                # at K5), 0 from v0.33.0 on (2048 rows).
+                full = scenario.chunk_tokens
+                if (
+                    row["rows"] not in (full - (scenario.dspark_tokens - 1), full)
+                    or row["padded_rows"] != full
+                    or row["replay_tokens"] != 0
                 ):
-                    raise ValueError("Middle requires actual2044/pad2048 and no replay")
+                    raise ValueError(
+                        f"Middle requires actual {full - (scenario.dspark_tokens - 1)}"
+                        f" or {full}, pad {full} and no replay"
+                    )
                 if any(s["stage"] == "decoder" for s in step["stages"]):
                     raise ValueError("Decoder executed in a middle chunk")
             if steps and step_index != steps[-1]["step_index"] + 1:
