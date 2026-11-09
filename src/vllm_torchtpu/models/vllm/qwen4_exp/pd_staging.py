@@ -258,6 +258,29 @@ def compressed_rows_np(
     return src, dst
 
 
+def compressed_rows_split_np(
+    num_tokens, ratio, src_pages_by_rank, src_block, dst_pages, dst_block,
+    start=0, src_first=0, dst_offset=0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """``compressed_rows_np`` for keys split over ``P`` producer ranks by page
+    owner: a main-KV ID spans ``P`` pages of ``src_block`` tokens and rank
+    ``(t // src_block) % P`` holds page ``t // src_block``'s keys, at the start
+    of that rank's staged page for the ID."""
+    span = 2 * ratio
+    if start % span:
+        raise ValueError(f"A repack must start on a compressed pair ({span} tokens)")
+    p = len(src_pages_by_rank)
+    pairs = math.ceil(math.ceil(num_tokens / ratio) / 2)
+    t = np.arange(start // span, pairs, dtype=np.int64) * span
+    owner = (t // src_block) % p
+    entry = t // (p * src_block) - src_first
+    sp = np.stack([np.asarray(pages, dtype=np.int64) for pages in src_pages_by_rank])
+    src = sp[owner, entry] * src_block + (t % src_block) // span
+    dp = np.asarray(dst_pages, dtype=np.int64)
+    dst = dp[t // dst_block] * dst_block + dst_offset + (t % dst_block) // span
+    return src, dst
+
+
 def align_rows(rows: np.ndarray, tile: int = REPACK_TILE) -> np.ndarray:
     """Pad a row segment to a multiple of ``tile`` by repeating its last row.
 
@@ -558,12 +581,19 @@ class StagedConsumer:
         # QWEN4_EXP_MERGE_COMPRESSED_K=1, so its keys ride the main-KV IDs in
         # their own pools ("<layer>.self_attn.compressed_k" on the main group).
         self.src_merged = os.environ.get("QWEN4_EXP_PD_PRODUCER_MERGED", "0") == "1"
+        # QWEN4_EXP_PD_PRODUCER_SPLIT_KEYS=1: the producer also runs
+        # QWEN4_EXP_PCP_SPLIT_COMPRESSED_K=1 (each PCP rank sends the keys of
+        # the pages it owns, "<layer>.compressed_k.pcp<r>").
+        self.src_split_keys = self.src_merged and (
+            os.environ.get("QWEN4_EXP_PD_PRODUCER_SPLIT_KEYS", "0") == "1"
+        )
         self.src_layout, src_specs = pooled_cache_specs(
             without_speculation(cfg),
             tp=1,
             main_dcp=self.src_pcp,
             pack_compressed=False,
             merge_compressed=self.src_merged,
+            split_compressed=self.src_split_keys,
             main_interleave=pcp_interleave() if self.src_pcp > 1 else None,
         )
         self._src_split = (
@@ -610,19 +640,25 @@ class StagedConsumer:
                     if owner_kind(name) != "main":
                         continue
                     key = name + ".compressed_k"
-                    self._key_pools[key] = group.group_index
-                    key_entries.append(
-                        PoolEntry(
-                            tag=pool_tag(group.group_index, key),
-                            layer_name=key,
-                            storage_index=0,
-                            base_offset_bytes=0,
-                            block_stride_bytes=key_stride,
-                            num_blocks=self.pages * self.keys_per_page,
-                            regions=(RegionSpec("page", 0, key_stride, key_stride, 1),),
-                            dtype_tag="qwen4-whole-fp8-page-v1",
+                    ranks = range(self.src_pcp) if self.src_split_keys else (None,)
+                    for r in ranks:
+                        pool_name = key if r is None else f"{key}.pcp{r}"
+                        self._key_pools[pool_name] = group.group_index
+                        key_entries.append(
+                            PoolEntry(
+                                tag=pool_tag(
+                                    group.group_index, key,
+                                    pcp_rank=r or 0, split=r is not None,
+                                ),
+                                layer_name=pool_name,
+                                storage_index=0,
+                                base_offset_bytes=0,
+                                block_stride_bytes=key_stride,
+                                num_blocks=self.pages * self.keys_per_page,
+                                regions=(RegionSpec("page", 0, key_stride, key_stride, 1),),
+                                dtype_tag="qwen4-whole-fp8-page-v1",
+                            )
                         )
-                    )
         self.manifest = PoolManifest(
             BINDING_ALIASED_RAW,
             [self.staging],
@@ -781,6 +817,18 @@ class StagedConsumer:
         main_s, main_d, copy_s, copy_d = [], [], [], []
         gdn_s, gdn_d = [], []
         for name, (gi, offset) in self._dst_compressed.items():
+            if self.src_split_keys:
+                # Keys of token t come from producer rank (t // B) % P, in that
+                # rank's page for t's main-KV ID (B-token pages, P per ID).
+                s, d = compressed_rows_split_np(
+                    num_tokens, self.ratio,
+                    [src_pages[f"{name}.pcp{r}"] for r in range(self.src_pcp)],
+                    self.src_block, dst_tables[gi], self.dst_block, start=skip_tokens,
+                    src_first=first[self._src_owner[f"{name}.pcp0"]], dst_offset=offset,
+                )
+                copy_s.append(s)
+                copy_d.append(d)
+                continue
             merged = name in self._key_pools
             s, d = compressed_rows_np(
                 num_tokens, self.ratio, src_pages[name],

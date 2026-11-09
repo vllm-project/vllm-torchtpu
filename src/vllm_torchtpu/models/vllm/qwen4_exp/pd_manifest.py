@@ -193,12 +193,15 @@ def build_transfer_manifest(
                 )
             )
     merged = bool(getattr(layout, "merged_compressed", False))
-    if merged and pcp_rank == 0:
+    split_keys = merged and bool(getattr(layout, "split_compressed", False))
+    if merged and (pcp_rank == 0 or split_keys):
         # QWEN4_EXP_MERGE_COMPRESSED_K: each QSA layer's compressed keys sit in
         # a region of its main-KV carrier after the scheduler's pages, one
         # `merged_key_span` pages' worth of keys per main-KV block ID. Expose
         # them as their own pool on the main-KV group's IDs; the keys are the
-        # same on every PCP rank, so only rank 0 lists them.
+        # same on every PCP rank, so only rank 0 lists them -- unless the ranks
+        # split them by page owner (QWEN4_EXP_PCP_SPLIT_COMPRESSED_K), when
+        # every rank lists its own, under a per-rank tag.
         span = layout.merged_key_span
         key_stride = span * layout.page_bytes // layout.compressed_columns_per_page
         main_pools = [p for p in pools if p.layer_name.endswith(".self_attn")]
@@ -206,7 +209,10 @@ def build_transfer_manifest(
             name = main.layer_name + ".compressed_k"
             pools.append(
                 PoolEntry(
-                    tag=pool_tag(_group_of(groups, main.layer_name), name),
+                    tag=pool_tag(
+                        _group_of(groups, main.layer_name), name,
+                        pcp_rank=pcp_rank, split=split_keys,
+                    ),
                     layer_name=name,
                     storage_index=main.storage_index,
                     base_offset_bytes=config.num_blocks * main.block_stride_bytes,

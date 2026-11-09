@@ -531,10 +531,14 @@ def compressed_pairs(
         # Merged keys: a page's worth of keys fills one column of the pool's
         # compressed-key region; a table entry of `merged_span` pages owns that
         # many consecutive columns, column ``span * table + i + region``.
-        assert dcp is None, "merged compressed keys do not support compressed DCP"
         m = merged_span(slot)
-        entry = m * pool.shape[1]
-        column = table[req, logical // entry] * m + (logical % entry) // pool.shape[1]
+        if dcp is not None:
+            # Split merged keys (PCP + compressed DCP): this rank keeps one
+            # column per entry, the keys of its owned page of the entry.
+            column = table[req, logical // span]
+        else:
+            entry = m * pool.shape[1]
+            column = table[req, logical // entry] * m + (logical % entry) // pool.shape[1]
         pair = (column + compressed_region(slot)) * layer_pairs + (
             logical % pool.shape[1]
         ) // (2 * ratio)
@@ -1647,7 +1651,7 @@ def _pooled_qsa(
         main_slot=main_slot,
         max_query_len=max_query_len,
         dcp=dcp,
-        **({"compressed_dcp": dcp} if compressed_dcp else {}),
+        **({"compressed_dcp": dcp[:2]} if compressed_dcp else {}),
     )
     fp8 = pool.dtype == jnp.float8_e4m3fn
     lengths = jnp.where(valid, logical + 1, 0).astype(jnp.int32)
@@ -1698,7 +1702,7 @@ def _pooled_qsa(
             block_topk=token_topk // compress_ratio,
             slot=compressed_slot,
             max_query_len=query_len,
-            dcp=dcp,
+            dcp=dcp[:2],
         )
         return pool, q, gate, lengths, req, starts, vals, pos
     if token_shard is not None:
@@ -2537,6 +2541,7 @@ def pooled_qsa_compressed_dcp_select_step(
     compressed_slot: int = 0,
     main_slot: int = -1,
     max_query_len: int = 1,
+    dcp_interleave: int = 0,
 ) -> tuple[
     jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array
 ]:
@@ -2570,7 +2575,9 @@ def pooled_qsa_compressed_dcp_select_step(
         compressed_slot,
         main_slot,
         max_query_len=max_query_len,
-        dcp=(dcp_rank, dcp_size),
+        # ``dcp_interleave`` (PCP): main KV alternates in those units; the
+        # compressed keys keep page ownership (``compressed_pairs``).
+        dcp=(dcp_rank, dcp_size, dcp_interleave),
         compressed_dcp=True,
     )
 
@@ -2662,6 +2669,7 @@ def pooled_qsa_compressed_dcp_attend_step(
     v_scale: float = 1.0,
     main_slot: int = -1,
     max_query_len: int = 1,
+    dcp_interleave: int = 0,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Merge the pair's local top-k (``compressed_dcp_blocks``) and attend this
     rank's owned main KV: ``(pool, out, lse, selected)`` for
@@ -2688,7 +2696,7 @@ def pooled_qsa_compressed_dcp_attend_step(
         main_slot=main_slot,
         max_query_len=max_query_len,
         merged=True,
-        dcp=(dcp_rank, dcp_size),
+        dcp=(dcp_rank, dcp_size, dcp_interleave),
     )
 
 def pooled_qsa_shared_step(
