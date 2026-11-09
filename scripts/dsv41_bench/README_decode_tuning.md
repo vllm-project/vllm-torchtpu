@@ -50,7 +50,7 @@ TPU generations.
 
 The decode route requires canonical request-major rows, BF16 Q with 32 heads
 and head dimension 128, k=512, and compatible packed-cache pages. It supports
-candidate publication, including the last-visible-block rule. Candidate-filtered
+candidate publication, including the last-visible-block rule. Sparse-layer
 indexers use the separate request-union route described below when supported;
 unsupported or ragged/mixed batches retain the existing route.
 Pages are padded through the compact page table; score rows are grouped by the
@@ -100,7 +100,7 @@ whole-request wall-clock throughput or a model-quality evaluation. Prefill and
 mixed-batch performance were not remeasured for this decode-only change. The
 profile does not quantify a physical TC/SC overlap percentage.
 
-## Candidate-filtered reindex
+## Sparse-layer reindex
 
 The candidate route shares request-union index keys within one decoder stage.
 Its serving envelope accepts regular request-major groups of 1–8 queries,
@@ -204,7 +204,7 @@ runs do not establish bitwise generation equivalence or model quality.
 
 ### Long-context functional coverage
 
-The candidate-filtered route now accepts index widths up to 1048576 records.
+The sparse-layer route now accepts index widths up to 1048576 records.
 Above 131072 records, metadata sorts the bounded candidate list by logical
 block and query ownership, then deduplicates it into union IDs and membership
 bits. Long contexts also allow one request group and mask inactive query rows.

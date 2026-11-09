@@ -1038,7 +1038,7 @@ class TestV1Attention:
             attn.forward_mqa.assert_called_once()
 
             # 3. Direct test of _select_paged_indices branches:
-            # - has_candidates=True, candidate_write=False (candidate_filter)
+            # - has_candidates=True, candidate_write=False (sparse_logits)
             attn.indexer.indexer_op.candidate_write = False
             sel = v1_attention.DeepseekV41Attention._select_paged_indices(
                 attn,
@@ -2127,7 +2127,7 @@ class TestDecodeIndexerCandidateContext:
             topk=topk,
             block_size=block_size,
             candidate_write=False,
-            candidate_filter=True,
+            sparse_logits=True,
             unordered=True,
             page_records=16,
         )
@@ -2145,7 +2145,7 @@ class TestDecodeIndexerCandidateContext:
             topk=topk,
             block_size=block_size,
             candidate_write=False,
-            candidate_filter=True,
+            sparse_logits=True,
             unordered=False,
             page_records=16,
         )

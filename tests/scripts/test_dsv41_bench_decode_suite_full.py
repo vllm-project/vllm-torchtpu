@@ -936,7 +936,7 @@ class TestBenchIndexerFull:
                 topk=32,
                 block_size=16,
                 candidate_write=cw,
-                candidate_filter=cf,
+                sparse_logits=cf,
                 unordered=False,
                 batch_max=batch_max,
             )
@@ -951,7 +951,7 @@ class TestBenchIndexerFull:
                 topk=32,
                 block_size=16,
                 candidate_write=cw,
-                candidate_filter=cf,
+                sparse_logits=cf,
                 unordered=True,
                 batch_max=batch_max,
             )
@@ -1005,7 +1005,7 @@ class TestBenchIndexerFull:
             "all",
             "full_context",
             "candidate_write",
-            "candidate_filter",
+            "sparse_logits",
             "topk_only",
             "cache_write_only",
         ]

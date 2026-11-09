@@ -1686,6 +1686,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                                 weights,
                                 lengths,
                                 swa_valid,
+                                query_start_loc=keys_meta.query_start_loc,
                             )
                         else:
                             index_q = self._project_index_q(qr, positions)
@@ -1951,8 +1952,13 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         weights,
         lengths,
         swa_valid,
+        query_start_loc=None,
     ):
-        """Select logical indices from the already-published Index-K cache."""
+        """Select logical indices from the already-published Index-K cache.
+
+        ``query_start_loc``: request row boundaries of ``qr``, which spare the
+        FP8 indexer from deriving them from ``requests``.
+        """
         indexer = self.indexer
         count = qr.shape[0]
         packed_fp8 = isinstance(index_cache, PackedFP8IndexCacheRows)
@@ -2036,6 +2042,13 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 lengths_part,
                 requests_part,
             ) = cached_query_split
+        offsets_part = None
+        if packed_fp8 and query_start_loc is not None:
+            # This rank's rows [rank * part, rank * part + part) of each request.
+            offsets_part = query_start_loc.int()
+            if split:
+                part = positions_part.shape[0]
+                offsets_part = (offsets_part - self._tp_rank * part).clamp(0, part)
         if split:
             qr_part, weights_part, candidates_part = (
                 torch.cat((x, x.new_full((padding, *x.shape[1:]), fill))).index_select(
@@ -2075,6 +2088,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             unordered=self._fp8_kv,
             score_width=max(1, self._max_model_len // self.compress_ratio),
             stage_cache=stage_cache if not split else None,
+            query_start_loc=offsets_part,
         )
         if split:
             selected = _gather_query_rows(selected)[:count]

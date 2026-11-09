@@ -14,6 +14,7 @@ from vllm_torchtpu.kernels.deepseek_v41 import (
     indexer,
 )
 from vllm_torchtpu.kernels.deepseek_v41.index_selection import (
+    block_topk,
     streaming_topk,
 )
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8.cache import (
@@ -29,7 +30,6 @@ from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8.candidates import (
 )
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8.dense_logits import (
     fp8_paged_mqa_logits,
-    supports_candidate_publication,
 )
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8.sparse_logits import (
     candidate_windows,
@@ -58,6 +58,9 @@ _read_op = None
 _select_op = None
 _prepare_op = None
 _prepared_select_op = None
+# Keys per block maximum that block top-k reduces on SparseCore for layers
+# without candidate publication: one maximum per half 16-lane vector.
+_BLOCK_TOPK_BLOCK = 8
 
 
 def paged_fp8_indexer(
@@ -72,17 +75,23 @@ def paged_fp8_indexer(
     topk: int,
     block_size: int,
     candidate_write: bool,
-    candidate_filter: bool,
+    sparse_logits: bool,
     unordered: bool,
     batch_max: torch.Tensor,
     score_width: int,
     stage_cache: dict[Any, Any] | None,
     source_prefix: str,
     candidate_source: int | None,
+    query_start_loc: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Score the published K cache using FP8 Q and weights with Q scales folded in."""
+    """Score the published K cache using FP8 Q and weights with Q scales folded in.
+
+    ``query_start_loc``: [page_table rows + 1] request row boundaries of ``q``
+    (the last may undercount trailing padding rows). None derives them from
+    ``requests``, which costs a rows x requests comparison.
+    """
     if (
-        candidate_filter
+        sparse_logits
         and stage_cache is not None
         and q.shape[0] > 0
         and block_size in (8, 16, 32, 64, 128)
@@ -127,6 +136,12 @@ def paged_fp8_indexer(
             score_width,
         )
         return selected, candidates
+    if query_start_loc is None:
+        # Padding requests (-1) trail the batch and count as the last request.
+        last = page_table.shape[0] - 1
+        owners = torch.where(requests >= 0, requests.clamp(max=last), last)
+        bounds = torch.arange(last + 2, device=requests.device, dtype=owners.dtype)
+        query_start_loc = (owners[:, None] < bounds).sum(0)
     assert _select_op is not None
     return _select_op(
         q,
@@ -137,11 +152,12 @@ def paged_fp8_indexer(
         candidates.int(),
         requests.int(),
         batch_max.reshape(1).int(),
+        query_start_loc.int(),
         cache._layout_args(),
         topk,
         block_size,
         candidate_write,
-        candidate_filter,
+        sparse_logits,
         unordered,
         score_width,
     )
@@ -172,11 +188,12 @@ def initialize_fp8_indexer() -> None:
         candidates,
         requests,
         batch_max,
+        query_start_loc,
         layout,
         topk,
         block_size,
         candidate_write,
-        candidate_filter,
+        sparse_logits,
         unordered,
         score_width,
     ):
@@ -218,7 +235,7 @@ def initialize_fp8_indexer() -> None:
     )
     _read_op = _register("pallas::dsv41_packed_fp8_read", _read, fake_read, 2, 1)
     _select_op = _register(
-        "pallas::dsv41_packed_fp8_select", select_fp8_indexer_jax, fake_select, 8, 7
+        "pallas::dsv41_packed_fp8_select", select_fp8_indexer_jax, fake_select, 9, 7
     )
     _prepare_op = _register(
         "pallas::dsv41_packed_fp8_prepare_candidates", _prepare, fake_prepare, 4, 3
@@ -425,11 +442,12 @@ def _select_fp8_indexer_jax(
     candidates: jax.Array,
     requests: jax.Array,
     batch_max: jax.Array,
+    query_start_loc: jax.Array,
     layout_args: tuple[int, ...],
     topk: int,
     block_size: int,
     candidate_write: bool,
-    candidate_filter: bool,
+    sparse_logits: bool,
     unordered: bool,
     score_width: int,
     *,
@@ -443,10 +461,10 @@ def _select_fp8_indexer_jax(
         raise ValueError(
             "Packed FP8 model scorer requires H32/D128 and nonempty context"
         )
-    if candidate_write and candidate_filter:
-        raise ValueError("Candidate sources must not filter their own scores")
+    if candidate_write and sparse_logits:
+        raise ValueError("Candidate sources must not use sparse logits")
     if (
-        candidate_filter
+        sparse_logits
         and block_size in (8, 16, 32, 64, 128)
         and candidates.shape[1] * block_size < width
     ):
@@ -481,6 +499,7 @@ def _select_fp8_indexer_jax(
                 candidates,
                 requests,
                 batch_max,
+                query_start_loc,
                 layout_args,
                 topk,
                 block_size,
@@ -508,23 +527,31 @@ def _select_fp8_indexer_jax(
         max(query_tile, _INDEX_UNTILED_SCORE_ELEMENTS // capacity),
     )
     padded = (tokens + rows - 1) // rows * rows
-    safe_requests = jnp.clip(requests, 0, page_table.shape[0] - 1)
+    # Callers group each request's queries contiguously in ascending request
+    # order; padding requests (-1) trail them. Clamping padding to the last
+    # request keeps that order, which the pipelined path relies on.
+    safe_requests = jnp.where(
+        requests >= 0,
+        jnp.minimum(requests, page_table.shape[0] - 1),
+        page_table.shape[0] - 1,
+    )
     valid_requests = (requests >= 0) & (requests < page_table.shape[0])
     lengths = jnp.where(valid_requests, jnp.clip(lengths, 0, width), 0)
     inputs = (q, weights, lengths, candidates, safe_requests)
     inputs = tuple(
         jnp.pad(x, ((0, padded - tokens),) + ((0, 0),) * (x.ndim - 1)) for x in inputs
     )
-    # A TensorCore comparison; bincount lowers to a SparseCore scatter offload.
-    counts = jnp.sum(
-        inputs[-1][:, None] == jnp.arange(page_table.shape[0], dtype=jnp.int32),
-        axis=0,
-        dtype=jnp.int32,
-    )
-    query_offsets = jnp.concatenate((jnp.zeros((1,), jnp.int32), jnp.cumsum(counts)))
+    if query_start_loc.shape != (page_table.shape[0] + 1,):
+        raise ValueError("query_start_loc needs one entry per page-table row, plus one")
+    # Trailing padding rows belong to the last request, as in safe_requests.
+    query_offsets = jnp.minimum(query_start_loc.astype(jnp.int32), tokens)
+    query_offsets = query_offsets.at[-1].set(tokens)
+    if padded > tokens:
+        # Tile padding rows own request 0, after its rows once sorted.
+        query_offsets = query_offsets.at[1:].add(padded - tokens)
     stream_select = (
         unordered
-        and not candidate_filter
+        and not sparse_logits
         and streaming_topk.is_supported(
             width,
             topk,
@@ -532,83 +559,60 @@ def _select_fp8_indexer_jax(
         )
     )
     publish_rows = candidate_write and candidates.shape[1] * block_size < width
-    fuse_publication = (
-        publish_rows
-        and prefill_chunk_rows is None
-        and supports_candidate_publication(block_size)
-    )
     select_topk = functools.partial(
         streaming_topk.streaming_topk,
         k=topk,
         exclude_neg_inf=True,
         reconstruct_threshold=topk_reconstruction_threshold(topk),
+        # Attention re-sorts the records; skip ID tie-breaks and output sorting.
+        unordered=unordered,
     )
+    chunk_rows = prefill_chunk_rows or indexer_query_rows(tokens, query_tile)
+    # Decode top-k scans only the blocks that can hold a winner. Publishing
+    # layers rank the same SparseCore block maxima for their candidates.
+    select_block = block_size if publish_rows else _BLOCK_TOPK_BLOCK
+    block_select = (
+        stream_select
+        and prefill_chunk_rows is None
+        and chunk_rows is not None
+        and block_topk.is_supported(chunk_rows, capacity, topk, select_block)
+    )
+    pool = banks[0] if len(banks) == 1 else banks
 
-    def block(start, rows, inputs, *, score_only=False, group=None):
-        shared_inputs = score_only and prefill_chunk_rows is None
-        queries, row_weights, row_lengths, row_candidates, owners = (
-            inputs
-            if shared_inputs
-            else tuple(jax.lax.dynamic_slice_in_dim(x, start, rows) for x in inputs)
+    def score(start, rows, inputs, *, pipelined, group=None):
+        """Scores of `rows` queries from `start`; decode tiles share the inputs."""
+        shared = pipelined and prefill_chunk_rows is None
+        queries, row_weights, row_lengths = (
+            inputs[:3]
+            if shared
+            else (jax.lax.dynamic_slice_in_dim(x, start, rows) for x in inputs[:3])
         )
-        offsets = (
-            query_offsets if shared_inputs else jnp.clip(query_offsets - start, 0, rows)
-        )
-        pool = banks[0] if len(banks) == 1 else banks
-
-        # Inline inside the outer model jit so scheduling metadata reaches
-        # the Pallas call instead of being lost at the inner jit boundary.
-        scorer = (
-            fp8_paged_mqa_logits.__wrapped__ if score_only else fp8_paged_mqa_logits
-        )
+        # Pipelined tiles inline inside the outer model jit so scheduling
+        # metadata reaches the Pallas call instead of the inner jit boundary.
+        scorer = fp8_paged_mqa_logits.__wrapped__ if pipelined else fp8_paged_mqa_logits
         scores = scorer(
             queries,
             pool,
             row_weights.astype(jnp.float32),
             row_lengths,
             pages,
-            query_start_loc=offsets,
+            query_start_loc=(
+                query_offsets if shared else jnp.clip(query_offsets - start, 0, rows)
+            ),
             max_model_len=capacity if stream_select else width,
             q_scale=jnp.ones_like(row_weights, dtype=jnp.float32),
             query_size=query_tile,
             cache_layout=layout,
-            query_start=start if shared_inputs else 0,
+            query_start=start if shared else 0,
             query_count=rows,
             reuse_keys=prefill_chunk_rows is not None and capacity == key_tile,
-            candidate_block_size=block_size
-            if score_only and fuse_publication
-            else None,
         )
-        if score_only:
-            return (
-                scores
-                if group is None
-                else jax.tree.map(
-                    lambda value: xla_metadata.set_xla_metadata(
-                        value, _scheduling_group_id=group
-                    ),
-                    scores,
-                )
-            )
-        if stream_select:
-            selected = select_topk(scores, valid_lengths=row_lengths)
-        else:
-            selected, row_candidates = indexer_select.select_indices_jax(
-                scores,
-                row_lengths,
-                row_candidates,
-                topk,
-                block_size,
-                candidate_write,
-                candidate_filter,
-                unordered,
-                batch_max,
-            )
-        if stream_select and publish_rows:
-            row_candidates = _publish_candidate_blocks(
-                scores, row_lengths, candidates.shape[1], block_size, unordered
-            )
-        return selected, row_candidates
+        if group is None:
+            return scores
+        tag = functools.partial(
+            xla_metadata.set_xla_metadata, _scheduling_group_id=group
+        )
+        return jax.tree.map(tag, scores)
 
     def select_serial():
         order = jnp.argsort(inputs[-1], stable=True)
@@ -621,96 +625,103 @@ def _select_fp8_indexer_jax(
             start, output, published = jax.lax.optimization_barrier(
                 (jnp.int32(index * rows), output, published)
             )
-            result = block(start, rows, sorted_inputs)
+            scores = score(start, rows, sorted_inputs, pipelined=False)
+            row_lengths, row_candidates = (
+                jax.lax.dynamic_slice_in_dim(x, start, rows) for x in sorted_inputs[2:4]
+            )
+            if not stream_select:
+                selected, row_candidates = indexer_select.select_indices_jax(
+                    scores,
+                    row_lengths,
+                    row_candidates,
+                    topk,
+                    block_size,
+                    candidate_write,
+                    sparse_logits,
+                    unordered,
+                    batch_max,
+                )
+            else:
+                selected = select_topk(scores, valid_lengths=row_lengths)
+                if publish_rows:
+                    row_candidates = _publish_candidate_blocks(
+                        scores, row_lengths, candidates.shape[1], block_size, unordered
+                    )
             output, published = (
                 jax.lax.dynamic_update_slice_in_dim(dst, src, start, axis=0)
-                for dst, src in zip((output, published), result)
+                for dst, src in zip((output, published), (selected, row_candidates))
             )
         inverse = jnp.argsort(order)
-        published = published[inverse]
-        return output[inverse][:tokens], published[:tokens]
+        return output[inverse][:tokens], published[inverse][:tokens]
 
-    short = jnp.minimum(batch_max.max(), width) <= topk
-
-    chunk_rows = prefill_chunk_rows or indexer_query_rows(tokens, query_tile)
     if not stream_select or chunk_rows is None or chunk_rows > rows or padded != tokens:
         return select_serial()
 
-    def select_pipelined():
-        def score(start, group):
-            return block(start, chunk_rows, inputs, score_only=True, group=group)
-
-        def select(tile, scores, group):
-            block_scores = None
-            if fuse_publication:
-                scores, block_scores = scores
-            row_lengths = jax.lax.dynamic_slice_in_dim(
-                inputs[2], tile * chunk_rows, chunk_rows
-            )
-            selected = select_topk(
+    def select(tile, scores, group):
+        row_lengths = jax.lax.dynamic_slice_in_dim(
+            inputs[2], tile * chunk_rows, chunk_rows
+        )
+        if block_select:
+            # One SparseCore pass ranks the block maxima for both outputs.
+            return block_topk.block_topk(
                 scores,
-                valid_lengths=row_lengths,
+                row_lengths,
+                k=topk,
+                block_size=select_block,
+                publish=candidates.shape[1] if publish_rows else 0,
                 scheduling_group_id=group,
             )
-            if publish_rows:
-                return selected, _publish_candidate_blocks(
-                    scores,
-                    row_lengths,
-                    candidates.shape[1],
-                    block_size,
-                    unordered,
-                    block_scores=block_scores,
-                    scheduling_group_id=group,
-                )
-            return selected
-
-        def write(tile, selected, output):
-            if publish_rows:
-                return tuple(
-                    jax.lax.dynamic_update_slice_in_dim(dst, src, tile * size, axis=0)
-                    for dst, src, size in zip(
-                        output, selected, (chunk_rows, chunk_rows)
-                    )
-                )
-            return jax.lax.dynamic_update_slice_in_dim(
-                output, selected, tile * chunk_rows, axis=0
-            )
-
-        output = jnp.full((tokens, topk), -1, jnp.int32)
-        if publish_rows:
-            output = (
-                output,
-                jnp.full(candidates.shape, -1, jnp.int32),
-            )
-        pipeline = (
-            indexer.pipeline_score_topk_bounded
-            if prefill_chunk_rows is not None or publish_rows
-            else indexer.pipeline_score_topk_unrolled
-        )
-        selected = pipeline(
-            padded // chunk_rows,
-            lambda tile: tile * chunk_rows,
-            score,
-            select,
-            write,
-            output,
+        selected = select_topk(
+            scores, valid_lengths=row_lengths, scheduling_group_id=group
         )
         if publish_rows:
-            selected, published = selected
-            return selected, jnp.where(valid_requests[:, None], published, -1)
-        return selected, candidates
+            return selected, _publish_candidate_blocks(
+                scores,
+                row_lengths,
+                candidates.shape[1],
+                block_size,
+                unordered,
+                scheduling_group_id=group,
+            )
+        return selected
 
-    # Already grouped requests need neither sorting nor output reordering.
-    # Decode preserves complete six-query groups. Prefill chunks instead match
-    # the serial score-buffer boundaries, including groups cut by that boundary.
-    # Both keep the same four-row/two-row head reduction and BF16 rounding.
-    grouped = jnp.all(inputs[-1][1:] >= inputs[-1][:-1])
-    complete = (
-        jnp.bool_(True)
-        if prefill_chunk_rows is not None
-        else jnp.all(counts % query_tile == 0)
+    def write(tile, selected, output):
+        update = functools.partial(
+            jax.lax.dynamic_update_slice_in_dim, start_index=tile * chunk_rows, axis=0
+        )
+        return jax.tree.map(update, output, selected)
+
+    # Grouped requests need neither sorting nor output reordering, so no
+    # runtime branch to the serial path: a branch costs an overlay load at its
+    # entry. Score tiles may split a request; the kernel resumes it mid-group.
+    output = jnp.full((tokens, topk), -1, jnp.int32)
+    if publish_rows:
+        output = (output, jnp.full(candidates.shape, -1, jnp.int32))
+    pipeline = (
+        indexer.pipeline_score_topk_bounded
+        if prefill_chunk_rows is not None or publish_rows
+        else indexer.pipeline_score_topk_unrolled
     )
-    return jax.lax.cond(grouped & complete & ~short, select_pipelined, select_serial)
+    selected = pipeline(
+        padded // chunk_rows,
+        lambda tile: tile * chunk_rows,
+        lambda start, group: score(
+            start, chunk_rows, inputs, pipelined=True, group=group
+        ),
+        select,
+        write,
+        output,
+    )
+    published = candidates
+    if publish_rows:
+        selected, published = selected
+        published = jnp.where(valid_requests[:, None], published, -1)
+    # Batch-wide short-context bypass: every visible key, as in the reference.
+    # A select rather than a cond keeps the scoring path free of branches.
+    short = jnp.minimum(batch_max.max(), width) <= topk
+    ids = jnp.arange(topk, dtype=jnp.int32)
+    visible = jnp.where(ids < lengths[:tokens, None], ids, -1)
+    return jnp.where(short, visible, selected), published
 
 
 def select_fp8_indexer_jax(
@@ -722,11 +733,12 @@ def select_fp8_indexer_jax(
     candidates: jax.Array,
     requests: jax.Array,
     batch_max: jax.Array,
+    query_start_loc: jax.Array,
     layout_args: tuple[int, ...],
     topk: int,
     block_size: int,
     candidate_write: bool,
-    candidate_filter: bool,
+    sparse_logits: bool,
     unordered: bool,
     score_width: int,
 ) -> tuple[jax.Array, jax.Array]:
@@ -740,11 +752,12 @@ def select_fp8_indexer_jax(
         candidates,
         requests,
         batch_max,
+        query_start_loc,
         layout_args,
         topk,
         block_size,
         candidate_write,
-        candidate_filter,
+        sparse_logits,
         unordered,
     )
     layout = PackedFP8Layout(*layout_args)
@@ -761,7 +774,7 @@ def select_fp8_indexer_jax(
         or chunk >= q.shape[0]
         or q.shape[0] % chunk
         or candidate_write
-        or candidate_filter
+        or sparse_logits
         or not unordered
         or topk > width
         or jax.default_backend() != "tpu"

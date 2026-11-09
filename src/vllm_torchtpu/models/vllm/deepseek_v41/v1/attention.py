@@ -385,7 +385,7 @@ class DeepseekV41Attention(DeepseekTPUAttentionMixin, upstream.DeepseekV4Attenti
             topk=self._config["index_topk"],
             block_size=max(1, self.candidate_block_size),
             candidate_write=candidate_write,
-            candidate_filter=has_candidates and not candidate_write,
+            sparse_logits=has_candidates and not candidate_write,
         )
         index_cache.copy_(updated_cache)
         scale_cache.copy_(updated_scales)

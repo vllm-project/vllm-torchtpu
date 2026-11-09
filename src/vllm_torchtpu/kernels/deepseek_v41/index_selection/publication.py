@@ -27,6 +27,126 @@ from vllm_torchtpu.kernels.deepseek_v41.index_selection.streaming_topk import (
 )
 
 
+class Radix:
+    """Radix selection over ordered FP32 key bits staged in VMEM.
+
+    Byte histograms refine the quota-th largest key, then one pass emits the
+    winners in candidate order, so IDs come out ascending without a sort.
+    """
+
+    def __init__(self, histogram, lanes):
+        self.histogram, self.lanes = histogram, lanes
+        self.lane_ids = jnp.arange(lanes, dtype=jnp.int32)
+
+    def positions(self, i):
+        return i * self.lanes + self.lane_ids
+
+    def clear(self):
+        @plsc.parallel_loop(0, RADIX_BUCKETS, self.lanes, unroll=4)
+        def clear(i):
+            self.histogram[pl.ds(i, self.lanes)] = jnp.zeros(self.lanes, jnp.int32)
+
+    def add(self, bits):
+        """Count the top byte of the keys above -inf."""
+        digits = (bits >> (FP32_BITS - RADIX_BITS)).astype(jnp.int32)
+        counts, last = plsc.scan_count(digits, mask=bits > ORDERED_NEG_INF)
+        plsc.addupdate_scatter(self.histogram, [digits], counts, mask=last)
+
+    def _bucket(self, bucket):
+        index = jnp.full(self.lanes, bucket, jnp.int32)
+        return plsc.load_gather(self.histogram, [index])[0]
+
+    def pivot(self, quota):
+        """The bucket holding the quota-th largest counted key."""
+        histogram, lanes = self.histogram, self.lanes
+        zero = jnp.asarray(0, jnp.int32)
+
+        @plsc.parallel_loop(0, RADIX_BUCKETS, lanes, carry=zero, unroll=2)
+        def total(i, running):
+            cumulative = plsc.cumsum(histogram[pl.ds(i, lanes)]) + running
+            histogram[pl.ds(i, lanes)] = cumulative
+            return cumulative[-1]
+
+        @plsc.parallel_loop(0, RADIX_BUCKETS, lanes, carry=zero, unroll=2)
+        def find(i, bucket):
+            below = histogram[pl.ds(i, lanes)] <= total - quota
+            return bucket + plsc.all_reduce_population_count(below)[0]
+
+        bucket = jnp.minimum(find, RADIX_MASK)
+        cumulative = self._bucket(bucket)
+        previous = self._bucket(jnp.maximum(bucket - 1, 0))
+        count = cumulative - jnp.where(bucket > 0, previous, 0)
+        return bucket, quota - (total - cumulative), total, count
+
+    def threshold(self, values, chunks, quota):
+        """The quota-th largest key; the top byte's histogram is filled."""
+        lanes = self.lanes
+        prefix, remaining, total, count = self.pivot(jnp.int32(quota))
+        keep_all = total <= quota
+        done = keep_all | (remaining == count)
+        remaining_bits = jnp.int32(FP32_BITS - RADIX_BITS)
+        for shift in reversed(range(0, FP32_BITS - RADIX_BITS, RADIX_BITS)):
+            self.clear()
+
+            @plsc.parallel_loop(0, jnp.where(done, 0, chunks), unroll=8)
+            def refine(i, shift=shift, prefix=prefix):
+                bits = values[pl.ds(i * lanes, lanes)].view(jnp.uint32)
+                match = (bits >> (shift + RADIX_BITS)) == prefix.astype(jnp.uint32)
+                digits = ((bits >> shift) & RADIX_MASK).astype(jnp.int32)
+                counts, last = plsc.scan_count(digits, mask=match)
+                plsc.addupdate_scatter(self.histogram, [digits], counts, mask=last)
+
+            bucket, next_remaining, _, count = self.pivot(remaining)
+            prefix = jnp.where(done, prefix, (prefix << RADIX_BITS) | bucket)
+            remaining = jnp.where(done, remaining, next_remaining)
+            remaining_bits = jnp.where(done, remaining_bits, shift)
+            done |= remaining == count
+        lower = prefix.astype(jnp.uint32) << remaining_bits.astype(jnp.uint32)
+        gate = jnp.where(keep_all, jnp.uint32(ORDERED_NEG_INF + 1), lower)
+        return total, lower, gate, remaining, done
+
+    def emit(self, values, chunks, quota, selection, destination, ids=None):
+        """Write `ids(i)` (default: positions) of the selected keys, -1 after."""
+        lanes, ids = self.lanes, ids or self.positions
+        total, lower, gate, remaining, done = selection
+
+        @plsc.parallel_loop(
+            jnp.minimum(total // lanes * lanes, quota), quota, lanes, unroll=4
+        )
+        def initialize(i):
+            destination[pl.ds(i, lanes)] = jnp.full(lanes, -1, jnp.int32)
+
+        def store(i, count, selected):
+            ranks = plsc.cumsum(selected.astype(jnp.int32))
+            plsc.store_scatter(destination, [count + ranks - 1], ids(i), mask=selected)
+            return count + plsc.all_reduce_population_count(selected)
+
+        @plsc.parallel_loop(
+            0, jnp.where(done, chunks, 0), carry=jnp.zeros(lanes, jnp.int32), unroll=8
+        )
+        def emit_whole(i, count):
+            bits = values[pl.ds(i * lanes, lanes)].view(jnp.uint32)
+            return store(
+                i, count, (bits >= gate) & (bits > jnp.uint32(ORDERED_NEG_INF))
+            )
+
+        @plsc.parallel_loop(
+            0,
+            jnp.where(done, 0, chunks),
+            carry=(jnp.zeros(lanes, jnp.int32), jnp.zeros(lanes, jnp.int32)),
+            unroll=4,
+        )
+        def emit_ranked(i, state):
+            count, ties = state
+            bits = values[pl.ds(i * lanes, lanes)].view(jnp.uint32)
+            equal = bits == lower
+            ranks = plsc.cumsum(equal.astype(jnp.int32)) + ties
+            selected = (bits > lower) | (equal & (ranks <= remaining))
+            return store(i, count, selected), ties + plsc.all_reduce_population_count(
+                equal
+            )
+
+
 @functools.partial(jax.jit, static_argnames=("block_size",))
 def candidate_block_scores(
     scores: jax.Array, lengths: jax.Array, *, block_size: int
@@ -189,51 +309,9 @@ def publish_candidates(
         output_sem,
         length_sem,
     ):
-        lane_ids = jnp.arange(lanes, dtype=jnp.int32)
+        radix = Radix(histogram, lanes)
         first = jax.lax.axis_index("core") * mesh.num_subcores
         first += jax.lax.axis_index("subcore")
-
-        def clear_histogram():
-            @plsc.parallel_loop(0, RADIX_BUCKETS, lanes, unroll=4)
-            def clear(i):
-                histogram[pl.ds(i, lanes)] = jnp.zeros(lanes, jnp.int32)
-
-        def add_histogram(digits, mask):
-            counts, last = plsc.scan_count(digits, mask=mask)
-            plsc.addupdate_scatter(histogram, [digits], counts, mask=last)
-
-        def pivot(quota):
-            @plsc.parallel_loop(
-                0, RADIX_BUCKETS, lanes, carry=jnp.asarray(0, jnp.int32), unroll=2
-            )
-            def prefix(i, total):
-                cumulative = plsc.cumsum(histogram[pl.ds(i, lanes)]) + total
-                histogram[pl.ds(i, lanes)] = cumulative
-                return cumulative[-1]
-
-            total = prefix
-
-            @plsc.parallel_loop(
-                0, RADIX_BUCKETS, lanes, carry=jnp.asarray(0, jnp.int32), unroll=2
-            )
-            def find(i, bucket):
-                return (
-                    bucket
-                    + plsc.all_reduce_population_count(
-                        histogram[pl.ds(i, lanes)] <= total - quota
-                    )[0]
-                )
-
-            bucket = jnp.minimum(find, RADIX_MASK)
-            cumulative = plsc.load_gather(
-                histogram, [jnp.full(lanes, bucket, jnp.int32)]
-            )[0]
-            previous = plsc.load_gather(
-                histogram, [jnp.full(lanes, jnp.maximum(bucket - 1, 0), jnp.int32)]
-            )[0]
-            count = cumulative - jnp.where(bucket > 0, previous, 0)
-            return bucket, quota - (total - cumulative), total, count
-
         stride = mesh.num_cores * mesh.num_subcores
 
         def copy_scores(row_id, slot):
@@ -271,44 +349,19 @@ def publish_candidates(
             length = jnp.clip(pl.cdiv(tokens, block_size), 0, width)
             last = (tokens - 1) // block_size
             chunks = pl.cdiv(length, lanes)
-            clear_histogram()
+            radix.clear()
 
             @plsc.parallel_loop(0, chunks, unroll=8)
             def prepare(i):
-                positions = i * lanes + lane_ids
+                positions = radix.positions(i)
                 values = jnp.where(
-                    positions == last,
-                    jnp.inf,
-                    keys[pl.ds(i * lanes, lanes)],
+                    positions == last, jnp.inf, keys[pl.ds(i * lanes, lanes)]
                 )
                 bits = _ordered_bits(jnp.where(positions < length, values, -jnp.inf))
                 keys[pl.ds(i * lanes, lanes)] = bits.view(jnp.float32)
-                add_histogram(
-                    (bits >> (FP32_BITS - RADIX_BITS)).astype(jnp.int32),
-                    bits > jnp.uint32(ORDERED_NEG_INF),
-                )
+                radix.add(bits)
 
-            prefix, quota, total, count = pivot(jnp.int32(k))
-            keep_all = total <= k
-            done = keep_all | (quota == count)
-            remaining_bits = jnp.int32(FP32_BITS - RADIX_BITS)
-            for shift in reversed(range(0, FP32_BITS - RADIX_BITS, RADIX_BITS)):
-                clear_histogram()
-
-                @plsc.parallel_loop(0, jnp.where(done, 0, chunks), unroll=8)
-                def refine(i, shift=shift, prefix=prefix):
-                    bits = keys[pl.ds(i * lanes, lanes)].view(jnp.uint32)
-                    match = (bits >> (shift + RADIX_BITS)) == prefix.astype(jnp.uint32)
-                    digits = ((bits >> shift) & RADIX_MASK).astype(jnp.int32)
-                    add_histogram(digits, match)
-
-                bucket, next_quota, _, count = pivot(quota)
-                prefix = jnp.where(done, prefix, (prefix << RADIX_BITS) | bucket)
-                quota = jnp.where(done, quota, next_quota)
-                remaining_bits = jnp.where(done, remaining_bits, shift)
-                done |= quota == count
-            lower = prefix.astype(jnp.uint32) << remaining_bits.astype(jnp.uint32)
-            gate = jnp.where(keep_all, jnp.uint32(ORDERED_NEG_INF + 1), lower)
+            selection = radix.threshold(keys, chunks, k)
 
             @pl.when(row_id > first)
             def wait_previous_output():
@@ -316,50 +369,7 @@ def publish_candidates(
                     output, out_ref.at[row_id - stride], output_sem
                 ).wait()
 
-            @plsc.parallel_loop(
-                jnp.minimum(total // lanes * lanes, k), k, lanes, unroll=4
-            )
-            def initialize(i):
-                output[pl.ds(i, lanes)] = jnp.full(lanes, -1, jnp.int32)
-
-            # Walking the original row emits ascending IDs without a final sort.
-            # Vector counters avoid a vector-to-scalar dependency for every chunk.
-            def store(i, count, selected):
-                positions = i * lanes + lane_ids
-                ranks = plsc.cumsum(selected.astype(jnp.int32))
-                plsc.store_scatter(
-                    output, [count + ranks - 1], positions, mask=selected
-                )
-                return count + plsc.all_reduce_population_count(selected)
-
-            @plsc.parallel_loop(
-                0,
-                jnp.where(done, chunks, 0),
-                carry=jnp.zeros(lanes, jnp.int32),
-                unroll=8,
-            )
-            def emit_whole(i, count):
-                bits = keys[pl.ds(i * lanes, lanes)].view(jnp.uint32)
-                return store(
-                    i, count, (bits >= gate) & (bits > jnp.uint32(ORDERED_NEG_INF))
-                )
-
-            @plsc.parallel_loop(
-                0,
-                jnp.where(done, 0, chunks),
-                carry=(jnp.zeros(lanes, jnp.int32), jnp.zeros(lanes, jnp.int32)),
-                unroll=4,
-            )
-            def emit_ranked(i, state):
-                count, ties = state
-                bits = keys[pl.ds(i * lanes, lanes)].view(jnp.uint32)
-                equal = bits == lower
-                ranks = plsc.cumsum(equal.astype(jnp.int32)) + ties
-                selected = (bits > lower) | (equal & (ranks <= quota))
-                return store(
-                    i, count, selected
-                ), ties + plsc.all_reduce_population_count(equal)
-
+            radix.emit(keys, chunks, k, selection, output)
             pltpu.async_copy(output, out_ref.at[row_id], output_sem)
 
         @pl.when(first < rows)

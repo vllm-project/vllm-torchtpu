@@ -22,7 +22,7 @@ zero-length padding rows, then everyone waits in the all-gather.
 ``--split pad16`` replays that policy; ``--split balanced`` uses
 ``part = count // tp + 1`` (every rank gets at most ``ceil(C / tp) + 1``
 rows). Each rank runs ``paged_indexer_jax`` on its part for
-``--subop candidate_write`` (L20 full_context source), ``candidate_filter``
+``--subop candidate_write`` (L20 full_context source), ``sparse_logits``
 (L24/28/32/36) or ``full_context`` (L2/8/14; ``compress_ratio = 2``, so pass
 ``--kv-len`` = context // 2), ``--reps`` times inside one compiled loop; the
 step is the slowest rank. ``--verify`` checks that every real token's
@@ -41,7 +41,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 import common  # noqa: E402
 
-SUBOPS = ("candidate_write", "candidate_filter", "full_context")
+SUBOPS = ("candidate_write", "sparse_logits", "full_context")
 SPLITS = ("pad16", "balanced", "ceil")
 LEGACY_TILE = (16384, 2048)  # baseline (_INDEX_KEYS_PER_ITER, _INDEX_MAX_TILE)
 
@@ -197,7 +197,7 @@ def worker(ctx: common.WorkerContext, args: argparse.Namespace) -> dict[str, Any
         full = expand_tokens(full, args.tokens_per_seq)
     count = full["q"].shape[0]
     cand_write = args.subop == "candidate_write"
-    cand_filter = args.subop == "candidate_filter"
+    sparse_logits = args.subop == "sparse_logits"
     batch_max = torch.tensor([int(full["lengths"].max())], dtype=torch.int32)
     pool = torch.from_numpy(full["pool"]).to("tpu")
     records = torch.from_numpy(full["records"]).to("tpu")
@@ -247,7 +247,7 @@ def worker(ctx: common.WorkerContext, args: argparse.Namespace) -> dict[str, Any
                             geo.index_topk,
                             geo.candidate_block_size,
                             cand_write,
-                            cand_filter,
+                            sparse_logits,
                             True,
                             bmax,
                         )
@@ -263,7 +263,7 @@ def worker(ctx: common.WorkerContext, args: argparse.Namespace) -> dict[str, Any
                         topk=geo.index_topk,
                         block_size=geo.candidate_block_size,
                         candidate_write=cand_write,
-                        candidate_filter=cand_filter,
+                        sparse_logits=sparse_logits,
                         unordered=True,
                         batch_max=bmax,
                         page_records=page_records,
@@ -289,7 +289,7 @@ def worker(ctx: common.WorkerContext, args: argparse.Namespace) -> dict[str, Any
                         topk=geo.index_topk,
                         block_size=geo.candidate_block_size,
                         candidate_write=cand_write,
-                        candidate_filter=cand_filter,
+                        sparse_logits=sparse_logits,
                         unordered=True,
                         batch_max=bmax,
                     )

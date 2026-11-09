@@ -574,7 +574,7 @@ class TestIntegratedAttentionKernelsDecode:
             topk=topk,
             block_size=block_size,
             candidate_write=False,
-            candidate_filter=True,
+            sparse_logits=True,
             unordered=True,
             page_records=16,
         )
@@ -595,7 +595,7 @@ class TestIntegratedAttentionKernelsDecode:
             topk=topk,
             block_size=block_size,
             candidate_write=False,
-            candidate_filter=True,
+            sparse_logits=True,
             unordered=False,
             page_records=None,
         )
@@ -629,7 +629,7 @@ class TestIntegratedAttentionKernelsDecode:
             topk,
             16,
             candidate_write=False,
-            candidate_filter=False,
+            sparse_logits=False,
             unordered=False,
             page_records=16,
         )
@@ -648,7 +648,7 @@ class TestIntegratedAttentionKernelsDecode:
             topk,
             16,
             candidate_write=False,
-            candidate_filter=False,
+            sparse_logits=False,
             unordered=False,
             page_records=0,
         )

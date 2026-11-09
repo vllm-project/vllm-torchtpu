@@ -205,7 +205,7 @@ def select_indices_jax(
     topk: int,
     block_size: int,
     candidate_write: bool,
-    candidate_filter: bool,
+    sparse_logits: bool,
     unordered: bool = False,
     batch_max: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array]:
@@ -219,8 +219,8 @@ def select_indices_jax(
     count, width = scores.shape
     if topk < 1 or width < 1 or block_size < 1:
         raise ValueError("Positive top-k, score width and block size required")
-    if candidate_write and candidate_filter:
-        raise ValueError("Candidate sources must not filter their own scores")
+    if candidate_write and sparse_logits:
+        raise ValueError("Candidate sources must not use sparse logits")
     if candidates.ndim != 2 or candidates.shape[0] != count:
         raise ValueError("Candidate rows must match query rows")
     lengths = jnp.clip(lengths.reshape(count), 0, width)
@@ -233,9 +233,7 @@ def select_indices_jax(
     published = candidates
     # When the candidate buffer covers every block, publication/filtering are
     # identities. Keep the caller's buffer untouched in this static case.
-    if (candidate_write or candidate_filter) and candidates.shape[
-        1
-    ] * block_size < width:
+    if (candidate_write or sparse_logits) and candidates.shape[1] * block_size < width:
         blocks = (width + block_size - 1) // block_size
         if candidate_write:
             published = _publish_candidate_blocks(

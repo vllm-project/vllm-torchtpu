@@ -39,10 +39,9 @@ def _pack(keys, layout):
 
 @pytest.mark.parametrize(
     "page_size,max_model_len",
-    [(128, 8192), (32, 8192), (256, 8192), (128, 50000), (128, 98816), (64, 98816)],
+    [(128, 8192), (128, 50000), (128, 98816), (256, 8192), (256, 98816)],
 )
-@pytest.mark.parametrize("block_size", [None, 8])
-def test_paged_mqa_logits_matches_reference(page_size, max_model_len, block_size):
+def test_paged_mqa_logits_matches_reference(page_size, max_model_len):
     if jax.default_backend() != "tpu":
         pytest.skip("Packed FP8 scoring requires TPU")
     rng = np.random.default_rng(7)
@@ -75,10 +74,8 @@ def test_paged_mqa_logits_matches_reference(page_size, max_model_len, block_size
         q_scale=jnp.ones_like(weights),
         query_size=6,
         cache_layout=layout,
-        candidate_block_size=block_size,
     )
-    scores, blocks = result if block_size else (result, None)
-    scores = np.asarray(scores)
+    scores = np.asarray(result)
 
     position = np.arange(max_model_len)
     for request in range(len(counts)):
@@ -101,18 +98,6 @@ def test_paged_mqa_logits_matches_reference(page_size, max_model_len, block_size
             actual[visible], expected[visible], rtol=2e-2, atol=2e-2 * expected.max()
         )
 
-    if block_size:
-        # Block maxima of the kernel's own scores, newest visible block forced on.
-        width = -(-max_model_len // block_size) * block_size
-        padded = np.pad(
-            scores, ((0, 0), (0, width - max_model_len)), constant_values=-np.inf
-        )
-        expected = padded.reshape(tokens, -1, block_size).max(-1)
-        newest = (lengths - 1) // block_size
-        live = lengths > 0
-        expected[np.flatnonzero(live), newest[live]] = np.inf
-        np.testing.assert_array_equal(np.asarray(blocks), expected)
-
 
 def _calc_diff(x, y):
     """DeepGEMM's `calc_diff`: one minus the cosine-style similarity."""
@@ -123,7 +108,7 @@ def _calc_diff(x, y):
 # Mirrors vLLM tests/kernels/attention/test_deepgemm_attention.py
 # `test_deepgemm_fp8_fp4_paged_mqa_logits`: BF16 references (unquantized q and
 # K, signed weights), causal speculative rows and calc_diff < 1e-3.
-@pytest.mark.parametrize("page_size", [64, 128])
+@pytest.mark.parametrize("page_size", [128, 256])
 @pytest.mark.parametrize("batch_size,next_n", [(4, 1), (2, 2), (2, 4)])
 def test_paged_mqa_logits_matches_vllm_reference(batch_size, next_n, page_size):
     if jax.default_backend() != "tpu":
