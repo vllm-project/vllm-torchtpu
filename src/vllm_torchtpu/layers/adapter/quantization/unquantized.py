@@ -224,6 +224,11 @@ class VllmUnquantizedConfig(QuantizationConfig, VllmQuantConfig):
             # For MoE layers, use our custom TPU implementation
             moe_config = self.get_moe_config(layer)
             if should_quantize_on_load(prefix):
+                if moe_config.has_bias:
+                    raise NotImplementedError(
+                        f"QUANTIZE_ON_LOAD_PREFIXES matched {prefix}, but FP8 MoE "
+                        "on-load quantization does not support expert bias"
+                    )
                 # BF16 experts are quantized to the MOE_REQUANTIZE_* format
                 # (per-channel FP8 by default) after loading.
                 from vllm_torchtpu.layers.adapter.quantization.fp8 import (

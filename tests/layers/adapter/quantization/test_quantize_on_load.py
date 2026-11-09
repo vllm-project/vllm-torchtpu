@@ -52,6 +52,7 @@ def moe_layer():
     torch.nn.Module.__init__(layer)
     layer.moe_config = MagicMock()
     layer.moe_config.moe_parallel_config.use_ep = False
+    layer.moe_config.has_bias = False
     return layer
 
 
@@ -128,6 +129,13 @@ class TestUnquantizedConfigQuantizeOnLoadDispatch:
         assert isinstance(method, VllmFp8MoEMethodTPU)
         assert not method.quant_config.is_checkpoint_fp8_serialized
         assert method.weight_block_size is None
+
+    def test_matching_moe_layer_with_bias_raises(self, monkeypatch, moe_layer):
+        monkeypatch.setenv("QUANTIZE_ON_LOAD_PREFIXES", "experts")
+        moe_layer.moe_config.has_bias = True
+        cfg = VllmUnquantizedConfig()
+        with pytest.raises(NotImplementedError, match="expert bias"):
+            cfg.get_quant_method(moe_layer, prefix="model.layers.0.mlp.experts")
 
     def test_experts_prefix_leaves_shared_experts_and_attention_unquantized(
         self, monkeypatch, linear_layer
