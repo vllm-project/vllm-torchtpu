@@ -2,9 +2,9 @@
 
 This package holds the Kimi-K3 decode megakernel, the sequence-parallel prefill
 kernels, the DSpark draft kernels, and the program that drives them. It is
-ported from `inferact/k3-megakernel@30c9ba966b` to set the Phase 1 baseline on
-main (RFC #2595). Cleanup and the move onto the shared megakernel library come
-in follow-up PRs.
+ported as-is from `inferact/k3-megakernel@30c9ba966b` to set the Phase 1
+baseline on main (RFC #2595). Cleanup and the move onto the shared megakernel
+library come in follow-up PRs.
 
 The package is opt-in. Nothing outside `models/kimi_k3/megakernel/` imports it,
 and it changes no existing model, runner, or scheduler path.
@@ -34,8 +34,8 @@ and it changes no existing model, runner, or scheduler path.
 | `kernels/prefill_megakernel.py`, `kernels/prefill_moe/`, `kernels/helpers.py` | sequence-parallel prefill kernels and prefill MoE | A2 | 3/7 |
 | `kernels/dspark*.py` | DSpark draft kernels | A3 | 4/7 |
 | `kernels/rank_loader.py`, `tools/preshard.py` | per-rank weight streaming and the offline preshard tool | A4 | 5/7 |
-| `program.py`, `decode.py`, `decode_ops.py`, `prefill.py`, `pools.py`, `sampling.py`, `draft.py`, `draft_mla.py`, `draft_mla_prefill.py`, `draft_ring.py` | the program: decode and prefill steps, pool binding, KDA slots, sampling, DSpark | B1 to B4 | 6/7 |
-| `tools/__main__.py`, `tools/bench.py`, `tools/check.py`, `tools/coverage.py`, `tools/harness.py`, `tools/k3.py` | `check`, `bench`, and `coverage` tools for silicon bring-up | D3 | 7/7 |
+| `program.py`, `decode*.py`, `prefill.py`, `pools.py`, `sampling.py`, `draft*.py` | the program: decode and prefill steps, pool binding, KDA slots, sampling, DSpark | B1 to B4 | 6/7 |
+| `tools/` (other files) | `check`, `bench`, and `coverage` tools for silicon bring-up | D3 | 7/7 |
 
 ## Provenance
 

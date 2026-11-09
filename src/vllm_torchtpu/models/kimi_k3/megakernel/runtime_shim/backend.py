@@ -31,7 +31,6 @@ patches call it.
 from __future__ import annotations
 
 import importlib
-import json
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -178,36 +177,6 @@ def draft(vllm_config: object) -> Path | None:
         return None
     path = _loader_config(vllm_config, "prefill").get("draft")
     return Path(str(path)) if path else None
-
-
-def mla_draft(vllm_config: object) -> Path | None:
-    """Return the MLA DSpark draft checkpoint path when ``model_type == "k3_dspark"``.
-
-    Its latent layers are KV cache layers of both roles (``megakernel.runner``),
-    so the KV transfer carries them across prefill and decode workers.
-
-    Args:
-        vllm_config: Active vLLM engine configuration object.
-
-    Returns:
-        ``Path`` to the MLA DSpark checkpoint directory, or ``None``.
-    """
-    selected = role(vllm_config)
-    if selected == "prefill":
-        path = draft(vllm_config)
-    elif selected == "decode":
-        spec = vars(vllm_config).get("speculative_config")
-        path = (
-            Path(str(spec.model))
-            if spec is not None and spec.method == "dspark" and spec.model
-            else None
-        )
-    else:
-        return None
-    if path is None or not (path / "config.json").is_file():
-        return None
-    config = json.loads((path / "config.json").read_text())
-    return path if config.get("model_type") == "k3_dspark" else None
 
 
 def attention_dp(vllm_config: object) -> int:

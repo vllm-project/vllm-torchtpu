@@ -244,69 +244,6 @@ _MODEL_HIDDEN_SIZE = 7168
 _MAX_PREFILL_SEQ_LEN = 8192
 
 
-@dataclasses.dataclass(frozen=True, slots=True)
-class PrefillStageRefs:
-    """Bundle HBM and VMEM buffer refs for prefill megakernel stages."""
-
-    batch_size: _KernelArg
-    batch_start: _KernelArg
-    col_block: _KernelArg
-    col_start: _KernelArg
-    out_hbm_ref: _KernelArg
-    out_stage_ref: _KernelArg
-
-
-@dataclasses.dataclass(frozen=True, slots=True)
-class ColumnLoopContext:
-    """Hold column-tile loop bounds, accumulators, and weight bank refs."""
-
-    acc_ref: _KernelArg
-    batch_size: _KernelArg
-    batch_start: _KernelArg
-    col_block: _KernelArg
-    col_start: _KernelArg
-    counts_ref: _KernelArg
-    max_routes: _KernelArg
-    out_stage_ref: _KernelArg
-    row_stage_ref: _KernelArg
-    sorted_out_hbm_ref: _KernelArg
-    w_routes_ref: _KernelArg
-
-
-@dataclasses.dataclass(frozen=True, slots=True)
-class RingStreamContext:
-    """Hold TP ring step index, semaphore refs, and VMEM stage buffers."""
-
-    acc_vmem_ref: _KernelArg
-    chunk_rows: _KernelArg
-    hidden_size: _KernelArg
-    left_neighbor: _KernelArg
-    my_id: _KernelArg
-    recv_sem: _KernelArg
-    recv_vmem_ref: _KernelArg
-    right_neighbor: _KernelArg
-    ring_scratch_hbm_ref: _KernelArg
-    send_sem: _KernelArg
-    send_vmem_ref: _KernelArg
-    src_hbm_ref: _KernelArg
-    step: _KernelArg
-    tp_size: _KernelArg
-
-
-@dataclasses.dataclass(frozen=True, slots=True)
-class GmmScaleSpec:
-    """Hold grouped matmul scale factors, tile dims, and output dtype."""
-
-    acc_vmem_ref: _KernelArg
-    is_last_k_step: _KernelArg
-    lhs_vmem_ref: _KernelArg
-    out_vmem_ref: _KernelArg
-    partial_out_vmem_ref: _KernelArg
-    preferred_element_type: _KernelArg
-    should_accumulate_out: _KernelArg
-    tile_m: _KernelArg
-
-
 def _fail(msg: str) -> NoReturn:
     """Raise ValueError with message."""
     raise ValueError(msg)
@@ -7401,18 +7338,33 @@ def make_regular_group4_sp_indexed(
         common: _KernelArg,
         kda_families: _KernelArg,
         *_args: _KernelArg,
+        **_kwargs: _KernelArg,
     ) -> _KernelArg:
         """Compute the compiled per-rank shard_map body for the prefill stage."""
-        (
-            mla_families,
-            moe_families,
-            kda_state,
-            mla_state,
-            length,
-            group,
-            segment_desc,
-            arena,
-        ) = _args
+        if _kwargs:
+            (
+                mla_families,
+                moe_families,
+                kda_state,
+                mla_state,
+                length,
+                group,
+            ) = _args[:6]
+            segment_desc = (
+                _kwargs["segment_desc"] if "segment_desc" in _kwargs else _args[6]
+            )
+            arena = _kwargs["arena"] if "arena" in _kwargs else _args[-1]
+        else:
+            (
+                mla_families,
+                moe_families,
+                kda_state,
+                mla_state,
+                length,
+                group,
+                segment_desc,
+                arena,
+            ) = _args
         base = group[0] * 4
         kda_states = tuple(kda_state)
         _check(
@@ -7538,18 +7490,33 @@ def make_regular_group8_sp_indexed(
         common: _KernelArg,
         kda_families: _KernelArg,
         *_args: _KernelArg,
+        **_kwargs: _KernelArg,
     ) -> _KernelArg:
         """Compute the compiled per-rank shard_map body for the prefill stage."""
-        (
-            mla_families,
-            moe_families,
-            kda_state,
-            mla_state,
-            length,
-            pair,
-            segment_desc,
-            arena,
-        ) = _args
+        if _kwargs:
+            (
+                mla_families,
+                moe_families,
+                kda_state,
+                mla_state,
+                length,
+                pair,
+            ) = _args[:6]
+            segment_desc = (
+                _kwargs["segment_desc"] if "segment_desc" in _kwargs else _args[6]
+            )
+            arena = _kwargs["arena"] if "arena" in _kwargs else _args[-1]
+        else:
+            (
+                mla_families,
+                moe_families,
+                kda_state,
+                mla_state,
+                length,
+                pair,
+                segment_desc,
+                arena,
+            ) = _args
         first = jnp.asarray([2 * pair[0] + 1], jnp.int32)
         second = first + 1
         arenas = arena.split()
@@ -7633,9 +7600,17 @@ def make_final_mla_sp_indexed(
         common: _KernelArg,
         mla_families: _KernelArg,
         *_args: _KernelArg,
+        **_kwargs: _KernelArg,
     ) -> _KernelArg:
         """Compute the compiled per-rank shard_map body for the prefill stage."""
-        moe_families, mla_state, length, segment_desc, arena = _args
+        if _kwargs:
+            moe_families, mla_state, length = _args[:3]
+            segment_desc = (
+                _kwargs["segment_desc"] if "segment_desc" in _kwargs else _args[3]
+            )
+            arena = _kwargs["arena"] if "arena" in _kwargs else _args[-1]
+        else:
+            moe_families, mla_state, length, segment_desc, arena = _args
         _check(len(mla_state) == 1, "mla_state is (latents,)")
         attn_res = common["attn_res"][:, 92]
         attn_norm = common["attn_norm"][:, 92]
@@ -7786,9 +7761,17 @@ def make_prefill_stack_sp_indexed(mesh: _KernelArg, **_cfg: _KernelArg) -> _Kern
         kda_families: _KernelArg,
         mla_families: _KernelArg,
         *_args: _KernelArg,
+        **_kwargs: _KernelArg,
     ) -> _KernelArg:
         """Compute the compiled per-rank shard_map body for the prefill stage."""
-        moe_families, kda_state, mla_state, length, segment_desc, arena = _args
+        if _kwargs:
+            moe_families, kda_state, mla_state, length = _args[:4]
+            segment_desc = (
+                _kwargs["segment_desc"] if "segment_desc" in _kwargs else _args[4]
+            )
+            arena = _kwargs["arena"] if "arena" in _kwargs else _args[-1]
+        else:
+            moe_families, kda_state, mla_state, length, segment_desc, arena = _args
         kda_state = tuple(kda_state)
         _check(
             len(kda_state) == len(kda_outputs),

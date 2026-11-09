@@ -3269,9 +3269,13 @@ def _prepare_layer_kernel(
         "_AsyncCopy",
         pltpu.make_async_copy(counts_v, counts_s, s["count_sem"]),
     )
-    maximum_copy = cast(
-        "_AsyncCopy",
-        pltpu.make_async_copy(maximum, maximum_s, s["max_sem"]),
+    maximum_copy = (
+        cast(
+            "_AsyncCopy",
+            pltpu.make_async_copy(maximum, maximum_s, s["max_sem"]),
+        )
+        if tokens == _OVERFLOW_WINDOW_TOKENS
+        else None
     )
     indices = cast(
         "_AsyncCopy",
@@ -3289,7 +3293,7 @@ def _prepare_layer_kernel(
     def counts_ready() -> None:
         """Start moving expert route counts (and 8K max) to SMEM."""
         count_copy.start()
-        if tokens == _OVERFLOW_WINDOW_TOKENS:
+        if maximum_copy is not None:
             maximum_copy.start()
 
     def metadata_ready() -> None:
@@ -3316,7 +3320,7 @@ def _prepare_layer_kernel(
         metadata_ready=metadata_ready,
     )
     count_copy.wait()
-    if tokens == _OVERFLOW_WINDOW_TOKENS:
+    if maximum_copy is not None:
         maximum_copy.wait()
     if tokens != _OVERFLOW_WINDOW_TOKENS:
         metadata_ready()

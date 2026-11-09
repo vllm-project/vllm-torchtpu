@@ -50,7 +50,7 @@ from __future__ import annotations
 import dataclasses
 import json
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 import jax
 import jax.numpy as jnp
@@ -67,11 +67,18 @@ from . import decode_megakernel
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Mapping, Sequence
 
-    from jax._src.basearray import _IndexUpdateRef
     from jax._src.pallas.mosaic import primitives as pl_primitives
 
+    class _IndexUpdateRefLike(Protocol):
+        """Structural protocol for JAX ``Array.at[...]`` index updater."""
+
+        def set(self, values: object, /) -> jax.Array:
+            """Return updated array with ``values`` written at the indexed slice."""
+            ...
+
+
 type _AsyncCopy = pl_primitives.AsyncCopyDescriptor
-type _Buffer = jax.Array | _IndexUpdateRef
+type _Buffer = jax.Array | _IndexUpdateRefLike
 
 _attention_scores: Callable[..., jax.Array] = (
     vars(decode_megakernel).get("attention_scores")
@@ -198,31 +205,6 @@ def synthetic_count(
     """
     uniform = jax.random.uniform(jax.random.fold_in(jax.random.PRNGKey(seed), position))
     return jnp.sum(uniform < jnp.asarray(rates, jnp.float32)).astype(jnp.int32)
-
-
-@dataclasses.dataclass(frozen=True, slots=True)
-class NucleusAcceptInputs:
-    """Bundled inputs for speculative top-p acceptance in ``nucleus_accept``."""
-
-    values: jax.Array | np.ndarray
-    ids: jax.Array | np.ndarray
-    lse: jax.Array | np.ndarray
-    drafts: jax.Array | np.ndarray
-    forced_count: int | jax.Array | np.ndarray
-    top_p: float | jax.Array | np.ndarray
-    uniforms: jax.Array | np.ndarray
-
-    def accept(self) -> tuple[jax.Array, jax.Array]:
-        """Run ``nucleus_accept`` on the bundled speculative sampling inputs."""
-        return nucleus_accept(
-            self.values,
-            self.ids,
-            self.lse,
-            self.drafts,
-            self.forced_count,
-            self.top_p,
-            self.uniforms,
-        )
 
 
 def nucleus_accept(
@@ -2180,34 +2162,6 @@ def ring_positions(c: DraftConfig, meta: jax.Array) -> jax.Array:
         position,
         -1,
     )
-
-
-@dataclasses.dataclass(frozen=True, slots=True)
-class DsparkRingWeightShards:
-    """Bundled weight shards for ``ring_weights_from_shards``."""
-
-    fc: jax.Array
-    kv: jax.Array
-    kvnorm: jax.Array
-    hidden_norm: jax.Array
-    axis: str = "tp"
-
-    def gather(self, c: DraftConfig) -> dict[str, jax.Array]:
-        """All-gather and reshape the bundled TP32 weight shards."""
-        return ring_weights_from_shards(
-            c, self.fc, self.kv, self.kvnorm, self.hidden_norm, self.axis
-        )
-
-
-@dataclasses.dataclass(frozen=True, slots=True)
-class DsparkRingUpdateSpec:
-    """Bundled sequence ring state inputs for ``prefill_ring_update``."""
-
-    sequences: jax.Array
-    rings: jax.Array
-    ends: jax.Array
-    stops: jax.Array
-    axis: str = "tp"
 
 
 def ring_weights_from_shards(

@@ -23,7 +23,7 @@ import logging
 import math
 import warnings
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import jax
 import jax.numpy as jnp
@@ -32,15 +32,18 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu
 
 from vllm_torchtpu.megakernel import pool_alias
-from vllm_torchtpu.models.kimi_k3.megakernel import kernels as kimi
-from vllm_torchtpu.models.kimi_k3.megakernel.common import collectives32
-from vllm_torchtpu.models.kimi_k3.megakernel.common.vmem_pool import VmemPool
-from vllm_torchtpu.models.kimi_k3.megakernel.config import active as _config
-from vllm_torchtpu.models.kimi_k3.megakernel.kernels import mla_dcp
-from vllm_torchtpu.models.kimi_k3.megakernel.layout import CONV_HEAD_ROWS, cache_layout
+
+from .. import kernels as kimi
+from ..common import collectives32
+from ..common.vmem_pool import VmemPool
+from ..config import active as _config
+from ..layout import CONV_HEAD_ROWS, cache_layout
+from . import mla_dcp
 
 logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from jax._src.lib import hlo as jax_hlo
     from jax._src.pallas import core as pl_core
     from jax._src.state import types as state_types
@@ -59,12 +62,10 @@ _NONE_STAGE_VAL: TensorLike = getattr(None, "", None)
 _PAIR_TUPLE_LEN = 2
 _DCP_HEAD_COUNT = 3
 _TP_RING_SIZE = 4
-_MAX_ROUTED_EXPERT_SLOTS = 6
 _LAST_EXPERT_SLOT = 7
 _ROUTED_EXPERTS_PER_TOKEN = 8
 _EXPERT_COL_PACKING = 12
 _EXPERT_GROUP_STRIDE = 16
-_KDA_SUB_WIDTH = 24
 _KDA_GROUP_WIDTH = 32
 _GATED_GROUP_WIDTH = 64
 _MAX_STAGE_INDEX = 92
@@ -2598,7 +2599,7 @@ def _run_routed_expert_stream_run_diverge_stage_y(stage_ctx: TensorLike) -> None
                 output_weights = jnp.where(first, first_weights, second_weights)
                 expert = jnp.where(first, first_expert, second_expert)
                 slot = current_base_slot + index
-                copies = copy_expert(expert, slot)
+                copies = copy_expert(expert, slot, gate_up=False)
                 finish_expert(
                     None, None, copies, index * 2 * expert_width, slot, output_weights
                 )
@@ -2627,7 +2628,7 @@ def _run_routed_expert_stream_run_diverge_stage_y(stage_ctx: TensorLike) -> None
                     output_weights = jnp.where(first, first_weights, second_weights)
                     expert = jnp.where(first, first_expert, second_expert)
                     slot = current_base_slot + index
-                    copies = copy_expert(expert, slot)
+                    copies = copy_expert(expert, slot, gate_up=False)
                     finish_compact_expert(
                         None,
                         None,
@@ -5298,6 +5299,27 @@ def _traced_dot_position(
                 copy(position + stream.depth, destination, semaphore).start()
 
 
+class _LazyProjectionCopies:
+    """Lazily instantiate projection DMA descriptors on first attribute access."""
+
+    def __init__(
+        self,
+        specs: dict[str, tuple[TensorLike, TensorLike, TensorLike]],
+    ) -> None:
+        """Store pre-sliced ``(src_ref, dst_ref, sem_ref)`` tuples per projection."""
+        self._specs = specs
+        self._cache: dict[str, TensorLike] = {}
+
+    def __getattr__(self, name: str) -> TensorLike:
+        """Create and cache the async copy descriptor for ``name``."""
+        if name not in self._cache:
+            if name not in self._specs:
+                raise AttributeError(name)
+            src_ref, dst_ref, sem_ref = self._specs[name]
+            self._cache[name] = tpu.make_async_copy(src_ref, dst_ref, sem_ref)
+        return self._cache[name]
+
+
 @dataclasses.dataclass(frozen=True, slots=True)
 class KimiDeltaAttentionWeights:
     """KDA parameters and their persistent projection-copy resources."""
@@ -5320,29 +5342,31 @@ class KimiDeltaAttentionWeights:
         """Register PyTree dataclasses lazily on first instantiation."""
         _ensure_dataclasses_registered()
 
-    def make_projection_copies(self) -> SimpleNamespace:
-        """Create the asynchronous projection-weight copies."""
-        return SimpleNamespace(
-            gate=tpu.make_async_copy(
-                self.gate_projection,
-                self.gate_projection_vmem,
-                self.projection_copy_semaphores.at[0],
-            ),
-            feature_gate=tpu.make_async_copy(
-                self.feature_gate_projection,
-                self.feature_gate_projection_vmem,
-                self.projection_copy_semaphores.at[1],
-            ),
-            input=tpu.make_async_copy(
-                self.input_projection,
-                self.input_projection_vmem,
-                self.projection_copy_semaphores.at[2],
-            ),
-            output=tpu.make_async_copy(
-                self.output_projection,
-                self.output_projection_vmem,
-                self.projection_copy_semaphores.at[3],
-            ),
+    def make_projection_copies(self) -> _LazyProjectionCopies:
+        """Create the asynchronous projection-weight copies on first use."""
+        return _LazyProjectionCopies(
+            {
+                "gate": (
+                    self.gate_projection,
+                    self.gate_projection_vmem,
+                    self.projection_copy_semaphores.at[0],
+                ),
+                "feature_gate": (
+                    self.feature_gate_projection,
+                    self.feature_gate_projection_vmem,
+                    self.projection_copy_semaphores.at[1],
+                ),
+                "input": (
+                    self.input_projection,
+                    self.input_projection_vmem,
+                    self.projection_copy_semaphores.at[2],
+                ),
+                "output": (
+                    self.output_projection,
+                    self.output_projection_vmem,
+                    self.projection_copy_semaphores.at[3],
+                ),
+            }
         )
 
 
@@ -6255,39 +6279,41 @@ class MultiHeadLatentAttentionWeights:
         """Register PyTree dataclasses lazily on first instantiation."""
         _ensure_dataclasses_registered()
 
-    def make_projection_copies(self) -> SimpleNamespace:
-        """Create the asynchronous projection-weight copies."""
-        return SimpleNamespace(
-            query_down=tpu.make_async_copy(
-                self.query_down_projection,
-                self.query_down_projection_vmem,
-                self.projection_copy_semaphores.at[0],
-            ),
-            key_value_down=tpu.make_async_copy(
-                self.key_value_down_projection,
-                self.key_value_down_projection_vmem,
-                self.projection_copy_semaphores.at[1],
-            ),
-            query_up=tpu.make_async_copy(
-                self.query_up_projection,
-                self.query_up_projection_vmem,
-                self.projection_copy_semaphores.at[2],
-            ),
-            key_value_up=tpu.make_async_copy(
-                self.key_value_up_projection,
-                self.key_value_up_projection_vmem,
-                self.projection_copy_semaphores.at[3],
-            ),
-            output_gate=tpu.make_async_copy(
-                self.output_gate_projection,
-                self.output_gate_projection_vmem,
-                self.projection_copy_semaphores.at[4],
-            ),
-            output=tpu.make_async_copy(
-                self.output_projection,
-                self.output_projection_vmem,
-                self.projection_copy_semaphores.at[5],
-            ),
+    def make_projection_copies(self) -> _LazyProjectionCopies:
+        """Create the asynchronous projection-weight copies on first use."""
+        return _LazyProjectionCopies(
+            {
+                "query_down": (
+                    self.query_down_projection,
+                    self.query_down_projection_vmem,
+                    self.projection_copy_semaphores.at[0],
+                ),
+                "key_value_down": (
+                    self.key_value_down_projection,
+                    self.key_value_down_projection_vmem,
+                    self.projection_copy_semaphores.at[1],
+                ),
+                "query_up": (
+                    self.query_up_projection,
+                    self.query_up_projection_vmem,
+                    self.projection_copy_semaphores.at[2],
+                ),
+                "key_value_up": (
+                    self.key_value_up_projection,
+                    self.key_value_up_projection_vmem,
+                    self.projection_copy_semaphores.at[3],
+                ),
+                "output_gate": (
+                    self.output_gate_projection,
+                    self.output_gate_projection_vmem,
+                    self.projection_copy_semaphores.at[4],
+                ),
+                "output": (
+                    self.output_projection,
+                    self.output_projection_vmem,
+                    self.projection_copy_semaphores.at[5],
+                ),
+            }
         )
 
 
@@ -9950,15 +9976,29 @@ def _stack_body_stage_cm_stage_ed(
             view_shape = (4, *logical_shape) if experts else logical_shape
             size = math.prod(view_shape) * value.dtype.itemsize
             storage_size = pool_alias.storage_size(view_shape, value.dtype)
-            views.append(
-                pool_alias.view(
-                    projection_expert_pool_vmem.at[
-                        pl.ds(offset // 128, size // 128), :
-                    ],
-                    view_shape,
-                    value.dtype,
+            slice_ref = projection_expert_pool_vmem.at[
+                pl.ds(offset // 128, size // 128), :
+            ]
+            if storage_size == size:
+                views.append(pool_alias.view(slice_ref, view_shape, value.dtype))
+            else:
+                # offset += storage_size reserves the padded tiled footprint,
+                # while ReshapeTransform._validate_shape requires slice_ref
+                # to match math.prod(view_shape) logical bytes.
+                bitcast_ref = slice_ref.bitcast(value.dtype)
+                reinterpret = cast(
+                    "Callable[[tuple[int, ...]], state_types.Transform]",
+                    pool_alias.Reinterpret,
                 )
-            )
+                views.append(
+                    pool_alias.types.TransformedRef(
+                        bitcast_ref.ref,
+                        (
+                            *bitcast_ref.transforms,
+                            reinterpret(tuple(view_shape)),
+                        ),
+                    )
+                )
             offset += storage_size
         return views
 

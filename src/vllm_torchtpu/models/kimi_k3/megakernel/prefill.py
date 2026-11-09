@@ -51,13 +51,12 @@ from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.kernels import pool_adapters
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.models.kimi_k3.megakernel import sampling
-from vllm_torchtpu.models.kimi_k3.megakernel.draft_mla_prefill import (
-    PrefillDraftLatents,
-)
-from vllm_torchtpu.models.kimi_k3.megakernel.draft_ring import PrefillRing
-from vllm_torchtpu.models.kimi_k3.megakernel.layout import NUM_LAYERS, cache_layout
-from vllm_torchtpu.models.kimi_k3.megakernel.pools import (
+
+from . import sampling
+from .draft_mla_prefill import PrefillDraftLatents
+from .draft_ring import PrefillRing
+from .layout import NUM_LAYERS, cache_layout
+from .pools import (
     CONV_ROWS,
     KDA_LAYERS,
     MLA_LAYERS,
@@ -70,14 +69,14 @@ from vllm_torchtpu.models.kimi_k3.megakernel.pools import (
     tp_rank_permutation,
     write_draft_rings,
 )
-from vllm_torchtpu.models.kimi_k3.megakernel.program import (
+from .program import (
     DCP_SIZE,
     HIDDEN_SIZE,
     TP_SIZE,
     VOCAB,
     kernel_modules,
 )
-from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim.bridge import (
+from .runtime_shim.bridge import (
     OpRegistrationSpec,
     hbm,
     kernel_mesh,
@@ -87,14 +86,12 @@ from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim.bridge import (
     report_load_stats,
     stream_to_device,
 )
-from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim.compilation import (
+from .runtime_shim.compilation import (
     CompileCall,
     compile_ops,
 )
-from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim.export_cache import (
-    prepare_distributed,
-)
-from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim.program import (
+from .runtime_shim.export_cache import prepare_distributed
+from .runtime_shim.program import (
     KVGroup,
     RequestInput,
     StepInput,
@@ -106,9 +103,7 @@ if TYPE_CHECKING:
 
     from jax.sharding import Mesh
 
-    from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim.config import (
-        MegakernelEngineConfig,
-    )
+    from .runtime_shim.config import MegakernelEngineConfig
 
     type CustomOp = Callable[..., tuple[torch.Tensor, ...]]
     type RingPair = tuple[torch.Tensor, torch.Tensor]
@@ -580,8 +575,8 @@ class PrefillProgram:
                 (rec, hist, rec_at, hist_at),
                 (latents,),
                 length,
-                segment_desc=segments,
-                arena=arena,
+                segments,
+                arena,
             )
             return (prefix, blocks, *kda_state, *mla_state, tap)
 
@@ -644,8 +639,8 @@ class PrefillProgram:
                 (latents,),
                 length,
                 pair,
-                segment_desc=segments,
-                arena=arena,
+                segments,
+                arena,
             )
             return (prefix, blocks, *kda_state, *mla_state, middle, tap)
 
@@ -701,8 +696,8 @@ class PrefillProgram:
                 w["moe"],
                 (latents,),
                 length,
-                segment_desc=segments,
-                arena=arena,
+                segments,
+                arena,
             )
             logits = logits_op(
                 prefix,

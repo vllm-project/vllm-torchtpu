@@ -42,7 +42,6 @@ from . import config as kernel_config
 from . import sampling
 from .layout import CONV_HEAD_ROWS, NUM_LAYERS
 from .pools import (
-    DP_BATCH_SIZES,
     KDA_LAYERS,
     ROUTED_RS_BATCHES,
     TOKEN_SCATTER_BATCHES,
@@ -89,19 +88,6 @@ _CONV_TAPS = 3
 _HEAD_DIM = 128
 _WORDS_DIVISOR = 32
 _SEED_MASK = 0x7FFFFFFF
-
-__all__ = [
-    "AXIS",
-    "DP_BATCH_SIZES",
-    "GREEDY",
-    "Control",
-    "DecodeOps",
-    "decode_batch_sizes",
-    "decode_options",
-    "dp_batch_sizes",
-    "dp_group_rows",
-    "dp_row_owners",
-]
 
 
 class _InPlaceSetTensor(Protocol):

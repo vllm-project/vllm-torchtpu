@@ -305,10 +305,6 @@ class MlaDsparkDraft:
             return tuple(self.synthetic_rates_by_width[drafts])
         return self.synthetic_rates
 
-    def _synthetic_rates(self, drafts: int) -> tuple[float, ...] | None:
-        """Return synthetic acceptance rates configured for ``drafts`` width."""
-        return self.synthetic_rates_for(drafts)
-
     def load_weights(self) -> float:
         """Load this rank's kernel shards and regenerate the RoPE table."""
         started = time.perf_counter()
@@ -405,10 +401,65 @@ class MlaDsparkDraft:
                 self._bridge.hbm(self.rank),
             )
 
+    def _build_init_state(self) -> Callable[..., tuple[torch.Tensor, ...]]:
+        """Build or return the mesh-replicated cold state initializer custom op."""
+        key = ("init_state",)
+        if key in self._ops:
+            return cast("Callable[..., tuple[torch.Tensor, ...]]", self._ops[key])
+        rows = int(self.dspark.ROWS)
+        bonus_idx = int(self.dspark.OUT_BONUS)
+
+        def body(anchor: jax.Array) -> tuple[jax.Array]:
+            """Seed a replicated draft vector with ``anchor``."""
+            tok = anchor.reshape(-1)[0].astype(jnp.int32)
+            idx = jnp.arange(DRAFT_VECTOR_LEN, dtype=jnp.int32)
+            return (
+                jnp.where(
+                    (idx < rows - 1) | (idx == bonus_idx),
+                    tok,
+                    jnp.int32(-1),
+                )[None, :],
+            )
+
+        self._ops[key] = self._bridge.register_global_op(
+            "pallas::k3_dspark_mla_init_state",
+            self.mesh,
+            body,
+            self._bridge.OpRegistrationSpec(
+                in_specs=(P(),),
+                out_specs=(P(),),
+                export_key=repr(("dspark_mla_init_state", rows, bonus_idx)),
+            ),
+        )
+        return cast("Callable[..., tuple[torch.Tensor, ...]]", self._ops[key])
+
     def new_state(self, anchor: int | torch.Tensor) -> MlaDraftState:
         """Return an initial draft state seeded with ``anchor``."""
-        dev = self.pools[0].device if self.pools else torch.device("tpu")
-        return make_draft_state(anchor, device=dev)
+        if self.pools:
+            dev = self.pools[0].device
+        elif isinstance(anchor, torch.Tensor):
+            dev = anchor.device
+        else:
+            dev = torch.device("tpu")
+        if dev.type != "tpu":
+            return make_draft_state(anchor, device=dev)
+        if (
+            isinstance(anchor, torch.Tensor)
+            and anchor.device.type == "tpu"
+            and anchor.dtype == torch.int32
+            and anchor.shape == (1,)
+        ):
+            anchor_t = anchor
+        else:
+            anchor_t = (
+                anchor.reshape(1).to(dtype=torch.int32, device=dev)
+                if isinstance(anchor, torch.Tensor)
+                else torch.tensor([int(anchor)], dtype=torch.int32, device=dev)
+            )
+        sync_mod = importlib.import_module("torch_tpu._internal.sync")
+        sync_mod.synchronize([anchor_t], wait=False)
+        (vector,) = self._build_init_state()(anchor_t)
+        return _settled(MlaDraftState(vector))
 
     def from_ring(
         self,
@@ -806,4 +857,12 @@ class MlaDsparkDraft:
                 )
                 for index in self.parts(requests, self.attention_dp, spec_rows)
             )
+        calls.append(
+            CompileCall(
+                self._build_init_state(),
+                (torch.empty((1,), dtype=torch.int32),),
+                {},
+                priority=1,
+            )
+        )
         return calls

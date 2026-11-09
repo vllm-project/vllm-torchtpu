@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import contextlib
+import sys
 import types
 from collections.abc import Mapping, Sequence
 from typing import Any
@@ -114,6 +115,8 @@ _VLLM_STARTUP_MESSAGES: dict[str, str] = {
 
 def _get_pallas_mesh_fn() -> Any:
     """Return `torch_tpu`'s `get_pallas_mesh`, or `None` without `torch_tpu`."""
+    if "torch_tpu" in sys.modules and sys.modules["torch_tpu"] is None:
+        return None
     try:
         from torch_tpu._internal.pallas import get_pallas_mesh
     except ImportError:
@@ -141,7 +144,12 @@ class MeshDecline(Exception):
         self.result = result
 
 
-def _build_tp_rank_mesh(r_cnt: int, fallback_mesh: Any = None) -> Any:
+def _build_tp_rank_mesh(
+    r_cnt: int,
+    fallback_mesh: jax.sharding.Mesh | None = None,
+    *,
+    is_tpu: bool = True,
+) -> jax.sharding.Mesh:
     """Build an `r_cnt`-device JAX `Mesh` with axis `'tp'` in TP-rank order.
 
     With `torch_tpu` this is always its Pallas mesh: `torch_tpu` binds
@@ -154,7 +162,7 @@ def _build_tp_rank_mesh(r_cnt: int, fallback_mesh: Any = None) -> Any:
     devices on axis `'tp'`. Without `torch_tpu` (CPU), the runner mesh is used,
     then `jax.devices()`.
     """
-    get_pallas_mesh = _get_pallas_mesh_fn()
+    get_pallas_mesh = _get_pallas_mesh_fn() if is_tpu else None
     if get_pallas_mesh is not None:
         try:
             pallas_mesh = get_pallas_mesh(axis_names=("tp",))
@@ -173,7 +181,7 @@ def _build_tp_rank_mesh(r_cnt: int, fallback_mesh: Any = None) -> Any:
             raise MeshDecline(EligibilityResult(False, "pallas_mesh_mismatch", msg))
         return pallas_mesh
     fb_devs = getattr(fallback_mesh, "devices", None)
-    if fb_devs is not None and int(fb_devs.size) == r_cnt:
+    if fallback_mesh is not None and fb_devs is not None and int(fb_devs.size) == r_cnt:
         if tuple(fallback_mesh.axis_names) == ("tp",):
             return fallback_mesh
         return jax.sharding.Mesh(np.asarray(fb_devs).reshape(-1), ("tp",))
@@ -187,13 +195,14 @@ def _local_tp_rank() -> int:
             get_tensor_model_parallel_rank,
             tensor_model_parallel_is_initialized,
         )
+
+        if tensor_model_parallel_is_initialized():
+            return int(get_tensor_model_parallel_rank())
     except ImportError:
-        dist = torch.distributed
-        ok = dist.is_available() and dist.is_initialized()
-        return int(dist.get_rank()) if ok else 0
-    if not tensor_model_parallel_is_initialized():
-        return 0
-    return int(get_tensor_model_parallel_rank())
+        pass
+    dist = torch.distributed
+    ok = dist.is_available() and dist.is_initialized()
+    return int(dist.get_rank()) if ok else 0
 
 
 _PROGRAM_METHODS = (
@@ -364,7 +373,9 @@ class ProgramDriver(StepRouting):
             if decline is None:
                 try:
                     mesh = _build_tp_rank_mesh(
-                        tp_size, fallback_mesh=getattr(runner, "mesh", None)
+                        tp_size,
+                        fallback_mesh=getattr(runner, "mesh", None),
+                        is_tpu=getattr(view.device, "type", None) == "tpu",
                     )
                 except MeshDecline as exc:
                     decline = exc.result
@@ -558,7 +569,9 @@ class ProgramDriver(StepRouting):
                     if is_tpu:
                         from vllm_torchtpu.utils import synchronize_tensors
 
-                        synchronize_tensors([out])
+                        synchronize_tensors(
+                            list(out) if isinstance(out, tuple) else [out]
+                        )
                     if case.check is not None:
                         case.check(out)
         self.reset_stats()

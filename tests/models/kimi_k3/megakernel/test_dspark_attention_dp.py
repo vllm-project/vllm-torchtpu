@@ -52,12 +52,28 @@ from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim.config import (
 
 pytest: Any = importlib.import_module("pytest")
 _MAX_PART_REQUESTS = 8
-_EXPECTED_VERIFY8_HLO_BYTES = 31311490
-_EXPECTED_VERIFY8_HLO_WORDS = (
-    0x5E9AB81B4163A692,
-    0xD94A76DD4CF323F6,
-    0x9CB49B39F54795F1,
-    0x1E0A9697BB08D348,
+_EXPECTED_VERIFY8_HLO_BYTES, _EXPECTED_VERIFY8_HLO_WORDS = (
+    (
+        31311490,
+        (
+            0x5E9AB81B4163A692,
+            0xD94A76DD4CF323F6,
+            0x9CB49B39F54795F1,
+            0x1E0A9697BB08D348,
+        ),
+    )
+    if jax.__version__ == "0.11.1"
+    else (
+        # Computed by test_dspark_mla_verify8_canonical_hlo_sha256 under
+        # jax==0.11.2 in vllm/vllm-torchtpu:nightly.
+        31305070,
+        (
+            0xFD49D00140D69533,
+            0x5916FB39C3485231,
+            0x5273B02AF283A360,
+            0xDA9CB02B1711A061,
+        ),
+    )
 )
 _EXPECTED_VERIFY8_CUSTOM_CALL_WORDS = (
     0xA8B5879A021C2C39,
@@ -471,3 +487,4 @@ def test_dspark_mla_verify8_canonical_hlo_sha256() -> None:
         line for line in canonical_hlo.splitlines() if "tpu_custom_call" in line
     )
     assert _sha256_words(custom_call_lines) == _EXPECTED_VERIFY8_CUSTOM_CALL_WORDS
+    jax.clear_caches()

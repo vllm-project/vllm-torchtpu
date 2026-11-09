@@ -55,11 +55,7 @@ _VERIFY_WIDTH = 8
 _KDA_GROUPS = 3
 
 
-def add_arguments(
-    parser: argparse.ArgumentParser,
-    *,
-    profile: bool = False,
-) -> None:
+def add_arguments(parser: argparse.ArgumentParser) -> None:
     """Register ``decode`` and ``prefill`` subparsers on ``parser``."""
     sub = parser.add_subparsers(dest="role", required=True)
     decode = sub.add_parser("decode", help="the decode ops")
@@ -131,12 +127,6 @@ def add_arguments(
             default="",
             help="directory: rank 0 saves an xprof trace of each case",
         )
-        if profile:
-            role.add_argument(
-                "--llo",
-                default="",
-                help="directory for the compiled LLO of every op",
-            )
 
 
 def _prompt_tokens(

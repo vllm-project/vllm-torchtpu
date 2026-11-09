@@ -27,18 +27,10 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-import tempfile
-from pathlib import Path
 
 from .. import config, settings
 from . import bench, check, harness, k3, preshard
 from .coverage import LineCoverage
-
-LLO_FLAGS = (
-    "--xla_jf_dump_to={dir} --xla_jf_dump_llo_text=true "
-    "--xla_jf_dump_llo_pass_label_regex=(vliw-packed-bundles|final_bundles) "
-    "--xla_jf_dump_llo_static_gaps=true --xla_mosaic_enable_llo_source_annotations=true"
-)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -91,10 +83,8 @@ def parser() -> argparse.ArgumentParser:
         commands.add_parser("bench", help="kernel-only timing of the serving ops")
     )
     check.add_arguments(commands.add_parser("check", help="numerics checks"))
-    profile = commands.add_parser(
-        "profile", help="a bench with an xprof trace and LLO dumps"
-    )
-    bench.add_arguments(profile, profile=True)
+    profile = commands.add_parser("profile", help="a bench with an xprof trace")
+    bench.add_arguments(profile)
     preshard.add_arguments(
         commands.add_parser(
             "preshard",
@@ -122,22 +112,6 @@ def _launch_remote(argv: list[str], args: argparse.Namespace) -> int:
         msg = "set --jobid (or $JOBID) to a running four-host allocation"
         raise SystemExit(msg)
     env: dict[str, str] = {}
-    llo = str(vars(args).get("llo", ""))
-    if args.command == "profile" and llo:
-        llo_path = Path(llo).resolve()
-        llo_path.mkdir(parents=True, exist_ok=True)
-        env["LIBTPU_INIT_ARGS"] = (
-            f"{settings.LIBTPU_INIT_ARGS} {LLO_FLAGS.format(dir=str(llo_path))}"
-        ).strip()
-        fresh = tempfile.mkdtemp(prefix="megakernel-profile-", dir=str(llo_path))
-        fresh_name = Path(fresh).name
-        env.update(
-            TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT=fresh,
-            TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT=fresh,
-            TORCH_TPU_TIER2_COMPILATION_CACHE=fresh_name,
-            TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE=fresh_name,
-            VLLM_XLA_CACHE_PATH=str(Path(fresh) / "xla"),
-        )
     if args.coverage:
         env["VLLM_XLA_CACHE_PATH"] = ""
     return harness.launch(argv, args.jobid, args.venv, env)
@@ -175,7 +149,7 @@ def main(argv: list[str]) -> int:
         check.run(args, records)
     else:
         if args.command == "profile" and not args.trace:
-            args.trace = vars(args).get("llo", "") or "profile-traces"
+            args.trace = "profile-traces"
         bench.run(args, records)
     if coverage is not None:
         coverage.stop()

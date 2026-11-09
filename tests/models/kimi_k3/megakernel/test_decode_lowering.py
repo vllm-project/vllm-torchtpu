@@ -81,7 +81,7 @@ MODES: dict[str, tuple[bool, bool, bool, bool, tuple[int, ...]]] = {
 
 # Pre-cleanup canonical HLO oracle across all 7 decode modes:
 # (batch_size, mode_key, expected_byte_len, sha256_upper_half, sha256_lower_half).
-CANONICAL_HLO_ORACLE: dict[str, tuple[int, str, int, str, str]] = {
+_CANONICAL_HLO_ORACLE_JAX_0_11_1: dict[str, tuple[int, str, int, str, str]] = {
     "batch1_plain": (
         1,
         "plain",
@@ -132,6 +132,65 @@ CANONICAL_HLO_ORACLE: dict[str, tuple[int, str, int, str, str]] = {
         "2f91c32e7fa7a73330feb1cd0b30eb11",
     ),
 }
+
+# Pre-cleanup canonical HLO oracle across all 7 decode modes under jax 0.11.2.
+_CANONICAL_HLO_ORACLE_JAX_0_11_2: dict[str, tuple[int, str, int, str, str]] = {
+    "batch1_plain": (
+        1,
+        "plain",
+        1_088_135,
+        "eba415c2ca76b5eec17169e2215cda41",
+        "805884aefd3e88b1982e8beb091ca374",
+    ),
+    "batch8_plain": (
+        8,
+        "plain",
+        1_434_810,
+        "8a98b75d85c4da0b9836a2e536b3207e",
+        "c2c806097aad549c88a9adbcbb602746",
+    ),
+    "scatter": (
+        8,
+        "scatter",
+        1_540_890,
+        "374dff18e9bf962139f9ea1a5cbdccc2",
+        "f182ef7e3cd0520b35bef19af5f30f35",
+    ),
+    "scatter_moe_out": (
+        8,
+        "scatter_moe_out",
+        1_560_674,
+        "e2db06e16b6839083cca2c93f2ac6d43",
+        "8065e40c5c2dac39fd9f4d994ea805e8",
+    ),
+    "scatter_moe_reduce_scatter": (
+        8,
+        "scatter_moe_reduce_scatter",
+        1_586_434,
+        "891bf4bc23eb4d919e05f4cd1788ecfd",
+        "c86bee9c2e68360b3407b307792348f8",
+    ),
+    "full_sequence_parallel": (
+        8,
+        "full_sequence_parallel",
+        1_605_270,
+        "05e5cb8b595b9eb62a41f6bde85f46b4",
+        "5fe6876ec2998d5cfb4fbe63a570cfad",
+    ),
+    "aux_hidden": (
+        8,
+        "aux_hidden",
+        1_437_179,
+        "2b870c3a0e529fb0713ce212a370867b",
+        "8c5b94bd85ae9d475ac2675a1cb300e1",
+    ),
+}
+
+CANONICAL_HLO_ORACLE: dict[str, tuple[int, str, int, str, str]] = (
+    _CANONICAL_HLO_ORACLE_JAX_0_11_1
+    if jax.__version__ == "0.11.1"
+    else _CANONICAL_HLO_ORACLE_JAX_0_11_2
+)
 
 
 @functools.lru_cache(maxsize=1)
@@ -256,6 +315,8 @@ def test_decode_canonical_hlo_sha256_oracle() -> None:
         ), oracle_mode
         digest = hashlib.sha256(canon_bytes).hexdigest()
         assert digest == f"{sha_hi}{sha_lo}", oracle_mode
+    _lower_canonical_hlo.cache_clear()
+    jax.clear_caches()
 
 
 def test_decode_dataclasses_register_lazily_on_instantiation() -> None:

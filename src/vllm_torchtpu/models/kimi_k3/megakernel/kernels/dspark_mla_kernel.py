@@ -47,7 +47,7 @@ pools (``paged.commit_latent_rows``).
 from __future__ import annotations
 
 import dataclasses
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 import jax
 import jax.numpy as jnp
@@ -94,11 +94,18 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Sequence
 
     import numpy as np
-    from jax._src.basearray import _IndexUpdateRef
     from jax._src.pallas.mosaic import primitives as pl_primitives
 
+    class _IndexUpdateRefLike(Protocol):
+        """Structural protocol for JAX ``Array.at[...]`` index updater."""
+
+        def set(self, values: object, /) -> jax.Array:
+            """Return updated array with ``values`` written at the indexed slice."""
+            ...
+
+
 type _AsyncCopy = pl_primitives.AsyncCopyDescriptor
-type _Buffer = jax.Array | _IndexUpdateRef
+type _Buffer = jax.Array | _IndexUpdateRefLike
 
 PHASE_SCOPES = decode_megakernel.PHASE_SCOPES
 _dot: Callable[..., jax.Array] = (

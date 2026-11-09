@@ -18,6 +18,4 @@
 
 from __future__ import annotations
 
-from vllm_torchtpu.megakernel import pool_alias
-
-__all__ = ["pool_alias"]
+from vllm_torchtpu.megakernel import pool_alias as pool_alias

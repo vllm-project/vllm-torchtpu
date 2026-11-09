@@ -606,16 +606,24 @@ class KdaImporter:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Copy the states in ``kda_blocks`` into ``slot`` of ``(conv, recurrent)``."""
         slot_val = int(slot.item()) if isinstance(slot, torch.Tensor) else int(slot)
-        slot_tensor = torch.tensor([slot_val], dtype=torch.int32, device=conv.device)
         if conv.device.type == "cpu":
             return self._import_state_cpu(conv, recurrent, kda_blocks, slot_val)
-        return self._build()(
+        blocks_t = kda_blocks.to(dtype=torch.int32, device=conv.device).contiguous()
+        slot_t = torch.tensor([slot_val], dtype=torch.int32, device=conv.device)
+        if conv.device.type == "tpu":
+            sync_mod = importlib.import_module("torch_tpu._internal.sync")
+            sync_mod.synchronize([blocks_t, slot_t], wait=False)
+        conv_out, rec_out = self._build()(
             conv,
             recurrent,
             *self.raw_pools,
-            kda_blocks.to(torch.int32).contiguous(),
-            slot_tensor,
+            blocks_t,
+            slot_t,
         )
+        if conv.device.type == "tpu":
+            sync_mod = importlib.import_module("torch_tpu._internal.sync")
+            sync_mod.synchronize([conv_out, rec_out], wait=False)
+        return conv_out, rec_out
 
     def import_ring(
         self,
@@ -666,11 +674,21 @@ class KdaImporter:
                     export_key=repr(("import_ring", kda_raw, perm, cfg_tuple)),
                 ),
             )
-        return self._ring_op(
+        dev = self.raw_pools[0].device
+        blocks_t = kda_blocks.to(dtype=torch.int32, device=dev).contiguous()
+        len_t = torch.tensor([length], dtype=torch.int32, device=dev)
+        if dev.type == "tpu":
+            sync_mod = importlib.import_module("torch_tpu._internal.sync")
+            sync_mod.synchronize([blocks_t, len_t], wait=False)
+        ring_out, pos_out = self._ring_op(
             *self.raw_pools,
-            kda_blocks.to(torch.int32).contiguous(),
-            torch.tensor([length], dtype=torch.int32, device=self.raw_pools[0].device),
+            blocks_t,
+            len_t,
         )
+        if dev.type == "tpu":
+            sync_mod = importlib.import_module("torch_tpu._internal.sync")
+            sync_mod.synchronize([ring_out, pos_out], wait=False)
+        return ring_out, pos_out
 
 
 def dp_row_owners(batch_size: int) -> int:
