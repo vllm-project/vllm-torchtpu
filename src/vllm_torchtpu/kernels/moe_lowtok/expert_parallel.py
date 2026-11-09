@@ -30,7 +30,11 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
-from vllm_torchtpu.kernels.moe_lowtok.kernel import can_use_moe_lowtok, moe_lowtok
+from vllm_torchtpu.kernels.moe_lowtok.kernel import (
+    can_use_moe_lowtok,
+    moe_lowtok,
+    moe_lowtok_scores,
+)
 
 
 def _local_shape(array, ep):
@@ -106,7 +110,11 @@ def moe_lowtok_ep(
     def local_fn(x_l, gate_l, rank_l, w1_l, w2_l, w1s_l, w2s_l):
         rows = lax.all_gather(x_l, axis, axis=0, tiled=True)
         logits = lax.all_gather(gate_l, axis, axis=0, tiled=True)
-        weights, ids = route_softmax_topk(logits, topk, renormalize)
+        padded_row = jnp.any(jnp.isnan(logits), axis=-1, keepdims=True)
+        safe_logits = jnp.where(padded_row, 0.0, logits)
+        weights, ids = route_softmax_topk(safe_logits, topk, renormalize)
+        weights = jnp.where(padded_row, 0.0, weights)
+        ids = jnp.where(padded_row, -1, ids)
         local_ids = ids - order[rank_l[0, 0]] * local_experts
         valid = (local_ids >= 0) & (local_ids < local_experts)
         partial = moe_lowtok(
@@ -133,3 +141,105 @@ def moe_lowtok_ep(
         out_specs=spec,
         check_vma=False,
     )(x, gating, rank, w1, w2, w1_scale, w2_scale)
+
+
+def zero_scores_for_padding(scores, padding):
+    """Zero the router scores of padded rows (padding [rows] nonzero): the
+    scores entry's router then selects nothing for them, as the routed path's
+    zeroed routing weights do."""
+    return jnp.where(padding.reshape(-1, 1) != 0, 0.0, scores)
+
+
+def moe_lowtok_scores_ep(
+    x,
+    gating,
+    padding,
+    tables,
+    prim,
+    copy,
+    hot1h,
+    w1,
+    w2,
+    w1_scale,
+    w2_scale,
+    copy_weights=None,
+    *,
+    mesh,
+    topk,
+    interpret=False,
+):
+    """`moe_lowtok_ep` with the router and the holder choice in the kernel
+    (`moe_lowtok_scores`), for placements whose experts may have a copy.
+
+    Beyond `moe_lowtok_ep`'s operands, all sharded on axis 0 over the mesh:
+    padding [rows] int32, nonzero for each rank's padded rows; per shard, its
+    packed tables (`pack_tables`), the primary and copy holder ranks [1,
+    LANES], the hot one-hot [LANES, NC]; copy_weights (w1, w2, w1_scale,
+    w2_scale) of the copy slots, or None without copies. The tables name
+    ranks in EP rank order, so the mesh order needs no relabelling.
+    """
+    (axis,) = mesh.axis_names
+    ep = mesh.shape[axis]
+    has_copies = copy_weights is not None
+
+    def local_fn(x_l, gate_l, pad_l, tab_l, prim_l, copy_l, hot_l, *weights_l):
+        w1_l, w2_l, w1s_l, w2s_l, *copies_l = weights_l
+        padded = (pad_l.reshape(-1, 1) != 0) | jnp.any(
+            jnp.isnan(gate_l), axis=-1, keepdims=True
+        )
+        safe_gate = jnp.where(padded, 0.0, gate_l.astype(jnp.float32))
+        scores = jax.nn.softmax(safe_gate, axis=-1)
+        scores = jnp.where(padded, 0.0, scores)
+        rows = lax.all_gather(x_l, axis, axis=0, tiled=True)
+        scores = lax.all_gather(scores, axis, axis=0, tiled=True)
+        if has_copies:
+            cw1, cw2, cw1s, cw2s = copies_l
+            copies = (cw1, cw1s, cw2, cw2s)
+        else:
+            copies = None
+        partial = moe_lowtok_scores(
+            rows,
+            scores,
+            tab_l,
+            prim_l,
+            copy_l,
+            hot_l,
+            w1_l,
+            w1s_l,
+            w2_l,
+            w2s_l,
+            copies,
+            topk=topk,
+            ranks=ep,
+            has_copies=has_copies,
+            interpret=interpret,
+        )
+        # Sum the shards' partials in float32 and round once.
+        out = lax.psum_scatter(
+            partial.astype(jnp.float32), axis, scatter_dimension=0, tiled=True
+        )
+        return out.astype(x_l.dtype)
+
+    operands = (
+        x,
+        gating,
+        padding,
+        tables,
+        prim,
+        copy,
+        hot1h,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+    )
+    if has_copies:
+        operands += tuple(copy_weights)
+    spec = jax.sharding.PartitionSpec(axis)
+    return jax.shard_map(
+        local_fn,
+        mesh=mesh,
+        in_specs=(spec,) * len(operands),
+        out_specs=spec,
+        check_vma=False,
+    )(*operands)

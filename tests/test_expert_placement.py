@@ -111,17 +111,55 @@ def test_a_duplicated_expert_is_refused(tmp_path, monkeypatch):
         ep.data()
 
 
-def test_copy_tables_are_refused(tmp_path, monkeypatch):
+def _copies_table(tmp_path, **changes):
     table = {
         "shards": 2,
         "experts": 4,
         "owned_per_core": 2,
         "slots_per_core": 3,
         "copies": True,
-        "layers": {"0": {"cores": [[0, 1, 2], [2, 3, 0]]}},
+        # Primaries: rank 0 holds 1, 0; rank 1 holds 3, 2. Copies: rank 0
+        # holds 2, rank 1 holds 1, declared hottest first.
+        "layers": {"0": {"cores": [[1, 0, 2], [3, 2, 1]], "copies": {"1": 1, "2": 0}}},
     }
-    monkeypatch.setenv("TPU_EXPERT_PLACEMENT", _write(tmp_path, table))
-    with pytest.raises(ValueError, match="copy slots"):
+    table.update(changes)
+    return _write(tmp_path, table)
+
+
+def test_copy_tables(tmp_path, monkeypatch):
+    monkeypatch.setenv("TPU_EXPERT_PLACEMENT", _copies_table(tmp_path))
+    assert ep.has_copies() and ep.owned() == 2 and ep.slots() == 3
+    # The router order and the loader see primaries; the map adds the copy.
+    assert ep.virtual_order(0) == [1, 0, 3, 2]
+    assert ep.expert_map(0, 0) == [1, 0, 2, -1]
+    assert ep.local_ids(0, 1) == {3, 2, 1}
+    # Virtual ids: 1 -> 0, 0 -> 1, 3 -> 2, 2 -> 3.
+    gid, primary, copy = ep.holder_tables(0, 0)
+    assert gid == [0, 1, 3]
+    assert primary == [0, 0, 1, 1]
+    assert copy == [1, -1, -1, 0]
+    assert ep.holder_tables(0, 1)[0] == [2, 3, 0]
+    assert ep.hot_order(0) == [0, 3]
+
+
+@pytest.mark.parametrize(
+    "cores",
+    [
+        [[1, 0, 0], [3, 2, 1]],  # a copy on its own primary rank
+        [[1, 0, 2], [3, 2, 2]],  # an expert copied twice
+        [[1, 0, 9], [3, 2, 1]],  # not an expert
+    ],
+)
+def test_bad_copy_tables_are_refused(tmp_path, monkeypatch, cores):
+    path = _copies_table(tmp_path, layers={"0": {"cores": cores}})
+    monkeypatch.setenv("TPU_EXPERT_PLACEMENT", path)
+    with pytest.raises(ValueError):
+        ep.data()
+
+
+def test_extra_slots_need_the_copies_flag(tmp_path, monkeypatch):
+    monkeypatch.setenv("TPU_EXPERT_PLACEMENT", _copies_table(tmp_path, copies=False))
+    with pytest.raises(ValueError, match="must equal"):
         ep.data()
 
 
@@ -388,3 +426,20 @@ def test_shipped_qwen35_table_is_valid(monkeypatch):
     monkeypatch.setenv("TPU_EXPERT_PLACEMENT", str(path))
     assert (ep.shards(), ep.global_count(), ep.slots()) == (8, 512, 64)
     assert len(ep.data()["layers"]) == 60
+
+
+def test_shipped_qwen35_copies_table_is_valid(monkeypatch):
+    import pathlib
+
+    path = (
+        pathlib.Path(__file__).resolve().parents[1]
+        / "scripts/vllm/benchmark/inferencex/qwen3.5"
+        / "expert_placement_dp8_ep8_copies128.json"
+    )
+    monkeypatch.setenv("TPU_EXPERT_PLACEMENT", str(path))
+    assert ep.has_copies()
+    assert (ep.shards(), ep.global_count(), ep.owned(), ep.slots()) == (8, 512, 64, 80)
+    assert len(ep.data()["layers"]) == 60
+    gid, primary, copy = ep.holder_tables(0, 3)
+    assert len(gid) == 80 and gid[:64] == list(range(3 * 64, 4 * 64))
+    assert sum(c >= 0 for c in copy) == len(ep.hot_order(0)) == 128

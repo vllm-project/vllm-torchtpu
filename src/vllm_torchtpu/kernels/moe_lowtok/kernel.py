@@ -39,6 +39,7 @@ import functools
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
@@ -85,7 +86,7 @@ def _quantize_rows(v):
 
 
 def _stream(
-    gid_s,
+    gid_of,
     hits_s,
     wtab_ref,
     x_ref,
@@ -107,11 +108,13 @@ def _stream(
     n_experts,
     inter,
     w13_parts,
+    copy_hbm=None,
+    choice=None,
 ):
     """Walk the hit experts and accumulate their weighted outputs.
 
-    gid_s int32[1, n_experts] (SMEM): the routing-table lane of each local
-    slot; hits_s int32[1, LANES] (SMEM): 1 in the lanes served by this shard;
+    gid_of(e): the routing-table lane of local slot e (a scalar read);
+    hits_s int32[1, LANES] (SMEM): 1 in the lanes served by this shard;
     wtab_ref [rows, LANES] f32: the routing weight of lane g for every row;
     x_ref [rows, hidden] bf16; s13_hbm [E, 1, 2*inter] and s2_hbm [E, 1,
     hidden] f32 per-channel scales in HBM (each expert's scales ride with its
@@ -124,6 +127,12 @@ def _stream(
     [slots, 1, hidden] the unit's scale rows; the DMA semaphores; h_acc
     [rows, 2*inter] f32 the current expert's gate|up rows; acc the output
     accumulator.
+
+    copy_hbm: optional (s13, s2, w13, w2) of the copy slots, which follow the
+    primaries in slot order: slot e >= len(w13_hbm) reads copy slot
+    e - len(w13_hbm). choice: an optional hook called with the count of hits
+    collected so far (whose first weight units are already in flight); it may
+    append local slots to `ids` from that index on and returns the new count.
     """
     rows = x_ref.shape[0]
     half = inter // w13_parts
@@ -133,7 +142,7 @@ def _stream(
 
     # The hit list of this shard's experts, in slot order: a scalar loop.
     def collect(e, n):
-        h = hits_s[0, gid_s[0, e]]
+        h = hits_s[0, gid_of(e)]
 
         @pl.when(h == 1)
         def _():
@@ -144,44 +153,68 @@ def _stream(
     n_hit = jax.lax.fori_loop(0, n_experts, collect, jnp.int32(0))
     n_units = n_hit * units
 
+    n_primary = w13_hbm.shape[0]
+
+    def source_copies(refs, expert, slot, col):
+        """The DMA descriptors of one unit of `expert` from refs (s13, s2,
+        w13, w2) into ring slot `slot`: the gate|up half at column `col`, and
+        the down projection."""
+        s13_src, s2_src, w13_src, w2_src = refs
+        w13_copies = (
+            pltpu.make_async_copy(
+                w13_src.at[expert, :, pl.ds(col, half)],
+                w13_buf.at[slot, :, pl.ds(0, half)],
+                w13_sem.at[slot],
+            ),
+            pltpu.make_async_copy(
+                w13_src.at[expert, :, pl.ds(inter + col, half)],
+                w13_buf.at[slot, :, pl.ds(half, half)],
+                w13_sem.at[slot],
+            ),
+            pltpu.make_async_copy(
+                s13_src.at[expert, :, pl.ds(col, half)],
+                s13_buf.at[slot, :, pl.ds(0, half)],
+                w13_sem.at[slot],
+            ),
+            pltpu.make_async_copy(
+                s13_src.at[expert, :, pl.ds(inter + col, half)],
+                s13_buf.at[slot, :, pl.ds(half, half)],
+                w13_sem.at[slot],
+            ),
+        )
+        w2_copies = (
+            pltpu.make_async_copy(w2_src.at[expert], w2_buf.at[slot], w2_sem.at[slot]),
+            pltpu.make_async_copy(s2_src.at[expert], s2_buf.at[slot], w2_sem.at[slot]),
+        )
+        return w13_copies, w2_copies
+
     def unit_copies(e_idx, part):
         """The DMA descriptors of a unit into its slot (slot = part, since the
-        ring has as many slots as an expert has units): parts below w13_parts
-        are gate|up halves (gate columns [p*half, (p+1)*half) and up columns
-        [inter + p*half, ...) of w13); part w13_parts is the down projection.
+        ring has as many slots as an expert has units), per weight source, as
+        (condition, gate|up descriptors, down descriptors): parts below
+        w13_parts are gate|up halves (gate columns [p*half, (p+1)*half) and up
+        columns [inter + p*half, ...) of w13); part w13_parts is the down
+        projection.
         """
         expert = ids[e_idx]
         slot = part
         # The down unit builds gate|up descriptors it never starts; clamp
         # their column into range.
         col = pl.multiple_of(jnp.minimum(part, w13_parts - 1) * half, half)
-        w13_copies = (
-            pltpu.make_async_copy(
-                w13_hbm.at[expert, :, pl.ds(col, half)],
-                w13_buf.at[slot, :, pl.ds(0, half)],
-                w13_sem.at[slot],
+        primary = (s13_hbm, s2_hbm, w13_hbm, w2_hbm)
+        if copy_hbm is None:
+            return part, ((True, *source_copies(primary, expert, slot, col)),)
+        in_primary = expert < n_primary
+        return part, (
+            (
+                in_primary,
+                *source_copies(primary, jnp.minimum(expert, n_primary - 1), slot, col),
             ),
-            pltpu.make_async_copy(
-                w13_hbm.at[expert, :, pl.ds(inter + col, half)],
-                w13_buf.at[slot, :, pl.ds(half, half)],
-                w13_sem.at[slot],
-            ),
-            pltpu.make_async_copy(
-                s13_hbm.at[expert, :, pl.ds(col, half)],
-                s13_buf.at[slot, :, pl.ds(0, half)],
-                w13_sem.at[slot],
-            ),
-            pltpu.make_async_copy(
-                s13_hbm.at[expert, :, pl.ds(inter + col, half)],
-                s13_buf.at[slot, :, pl.ds(half, half)],
-                w13_sem.at[slot],
+            (
+                jnp.logical_not(in_primary),
+                *source_copies(copy_hbm, jnp.maximum(expert - n_primary, 0), slot, col),
             ),
         )
-        w2_copies = (
-            pltpu.make_async_copy(w2_hbm.at[expert], w2_buf.at[slot], w2_sem.at[slot]),
-            pltpu.make_async_copy(s2_hbm.at[expert], s2_buf.at[slot], w2_sem.at[slot]),
-        )
-        return part, w13_copies, w2_copies
 
     def advance(e_idx, part, by):
         """The (expert index, part) of the unit `by` units ahead, without a
@@ -191,30 +224,32 @@ def _stream(
         return jnp.where(wrap, e_idx + 1, e_idx), jnp.where(wrap, p - units, p)
 
     def start(e_idx, part):
-        part, w13_copies, w2_copies = unit_copies(e_idx, part)
+        part, sources = unit_copies(e_idx, part)
+        for in_source, w13_copies, w2_copies in sources:
 
-        @pl.when(part < w13_parts)
-        def _():
-            for c in w13_copies:
-                c.start()
+            @pl.when(in_source & (part < w13_parts))
+            def _(*, w13_copies=w13_copies):
+                for c in w13_copies:
+                    c.start()
 
-        @pl.when(part == w13_parts)
-        def _():
-            for c in w2_copies:
-                c.start()
+            @pl.when(in_source & (part == w13_parts))
+            def _(*, w2_copies=w2_copies):
+                for c in w2_copies:
+                    c.start()
 
     def wait(e_idx, part):
-        part, w13_copies, w2_copies = unit_copies(e_idx, part)
+        part, sources = unit_copies(e_idx, part)
+        for in_source, w13_copies, w2_copies in sources:
 
-        @pl.when(part < w13_parts)
-        def _():
-            for c in w13_copies:
-                c.wait()
+            @pl.when(in_source & (part < w13_parts))
+            def _(*, w13_copies=w13_copies):
+                for c in w13_copies:
+                    c.wait()
 
-        @pl.when(part == w13_parts)
-        def _():
-            for c in w2_copies:
-                c.wait()
+            @pl.when(in_source & (part == w13_parts))
+            def _(*, w2_copies=w2_copies):
+                for c in w2_copies:
+                    c.wait()
 
     acc[...] = jnp.zeros_like(acc)
     x_q, x_s = _quantize_rows(x_ref[...].astype(jnp.float32))
@@ -224,6 +259,18 @@ def _stream(
         @pl.when(ahead < n_units)
         def _prime(*, ahead=ahead):
             start(jnp.int32(0), jnp.int32(ahead))
+
+    if choice is not None:
+        n_before = n_hit
+        n_hit = choice(n_hit)
+        n_units = n_hit * units
+        # No fixed hit on this shard: nothing was primed above; prime now
+        # from the appended hits.
+        for ahead in range(slots - 1):
+
+            @pl.when((n_before == 0) & (ahead < n_units))
+            def _prime_late(*, ahead=ahead):
+                start(jnp.int32(0), jnp.int32(ahead))
 
     def body(u, carry):
         e_idx, part = carry
@@ -273,7 +320,7 @@ def _stream(
             # The routing weight is the mask: zero for rows the expert does
             # not serve.
             w = jnp.sum(
-                jnp.where(lane == gid_s[0, expert], wtab_ref[...], 0.0),
+                jnp.where(lane == gid_of(expert), wtab_ref[...], 0.0),
                 axis=1,
                 keepdims=True,
             )
@@ -303,7 +350,7 @@ def _kernel_ids(
     """The ids entry: the routing table over local ids and the hit vector come
     from the caller; gid_ref is the identity over local ids."""
     _stream(
-        gid_ref,
+        lambda e: gid_ref[0, e],
         hit_ref,
         wtab_ref,
         x_ref,
@@ -432,6 +479,398 @@ def moe_lowtok(
         name="moe_lowtok",
     )(gid, hit, x_rows, wtab, s13, s2, w13, w2)
     return out[:tokens]
+
+
+NEG = -3.0e38  # scores at or below it never win a selection pass
+HOT_SLOTS = 128  # the copied-expert tables' fixed length (-1 padded)
+
+
+def _kernel_scores(
+    tab_s,
+    prim_ref,
+    copy_ref,
+    hot1h_ref,
+    x_hbm,
+    scores_ref,
+    s13_hbm,
+    s2_hbm,
+    w13_hbm,
+    w2_hbm,
+    *refs,
+    n_experts,
+    inter,
+    w13_parts,
+    topk,
+    ranks,
+    has_copies,
+    offsets,
+):
+    """The scores entry: the router's top-k runs here, then the assignment of
+    every hit expert to one holder.
+
+    tab_s int32[length] (SMEM): the scalar tables packed by `pack_tables`
+    (`offsets` = their (gid, hot, hprim, hcopy, slot) offsets); prim_ref /
+    copy_ref [1, LANES] int32: the rank holding each expert's primary / copy
+    (-1: none); hot1h_ref [LANES, NC] bf16: one-hot, 1 at (hot[i], i); x_hbm
+    [rows, hidden] (HBM): the rows, copied into VMEM under the selection;
+    scores_ref [rows, LANES] f32: the router's softmax. With copies, the copy
+    slots' (s13, s2, w13, w2) follow in refs.
+
+    Single-holder experts are fixed, and their first weight units are fetched
+    first. The hit copied experts are compacted into a short list on the
+    vector units (a one-hot gather on the MXU, a lane prefix sum, a one-hot
+    scatter) and assigned one after another in hot order, each to the holder
+    with fewer experts so far (fixed plus copies already placed), ties to the
+    primary. Every shard computes the same assignment.
+    """
+    if has_copies:
+        copy_hbm, refs = refs[:4], refs[4:]
+    else:
+        copy_hbm = None
+    (
+        out_ref,
+        ids,
+        wtab_ref,
+        hits_v,
+        hits_s,
+        cmp_v,
+        cmp_s,
+        hsem,
+        x_vmem,
+        xsem,
+        *stream_scratch,
+    ) = refs
+    rows = x_vmem.shape[0]
+    # Copy the rows into VMEM while selection and assignment run.
+    x_copy = pltpu.make_async_copy(x_hbm, x_vmem, xsem.at[0])
+    x_copy.start()
+    lane = jax.lax.broadcasted_iota(jnp.int32, (rows, LANES), 1)
+    o_gid, o_hot, o_hprim, o_hcopy, o_slot = offsets
+    my_rank = tab_s[0]
+
+    # The router's selection: topk passes of max-and-mask over the softmax
+    # scores (ties to the lowest id), the weights renormalized and rounded
+    # through bf16, written as the dense routing table [rows, LANES].
+    x = scores_ref[...]
+    x = jnp.where(x > NEG, x, NEG)
+    masked = jnp.finfo(jnp.float32).min
+    sel = jnp.zeros_like(x)
+    wsum = jnp.zeros((rows, 1), jnp.float32)
+    for _ in range(topk):
+        m = jnp.max(x, axis=1, keepdims=True)
+        idx = jnp.min(jnp.where(x == m, lane, LANES - 1), axis=1, keepdims=True)
+        pick = lane == idx
+        sel = jnp.where(pick, m, sel)
+        wsum = wsum + m
+        x = jnp.where(pick, masked, x)
+    wt = jnp.where(wsum > 0, sel / wsum, 0.0).astype(jnp.bfloat16).astype(jnp.float32)
+    wtab_ref[...] = wt
+    # The experts that serve a row this call, as a lane vector [1, LANES].
+    hit = jnp.any(wt != 0, axis=0, keepdims=True)
+    prim = prim_ref[...]
+    fixed = hit & jnp.logical_not(copy_ref[...] >= 0)
+    lane1 = lane[:1]
+    # This shard's fixed experts to SMEM first: the stream primes its first
+    # fetch from them while the assignment below runs.
+    hits_v[...] = jnp.where(fixed & (prim == my_rank), 1, 0).astype(jnp.int32)
+    cp1 = pltpu.make_async_copy(hits_v, hits_s, hsem.at[1])
+    cp1.start()
+
+    def stream(choice):
+        x_copy.wait()
+        _stream(
+            lambda e: tab_s[o_gid + e],
+            hits_s,
+            wtab_ref,
+            x_vmem,
+            s13_hbm,
+            s2_hbm,
+            w13_hbm,
+            w2_hbm,
+            out_ref,
+            ids,
+            *stream_scratch,
+            n_experts=n_experts,
+            inter=inter,
+            w13_parts=w13_parts,
+            copy_hbm=copy_hbm,
+            choice=choice,
+        )
+
+    if not has_copies:
+        # Every hit expert has one holder: no assignment.
+        cp1.wait()
+        stream(None)
+        return
+    # The fixed load of every rank, in lane r.
+    loads = jnp.zeros_like(lane1)
+    for r in range(ranks):
+        load_r = jnp.sum(jnp.where(fixed & (prim == r), 1, 0), axis=1, keepdims=True)
+        loads = jnp.where(lane1 == r, load_r, loads)
+    # The hit copied experts, compacted: hh[i] = hit[hot[i]] through the
+    # one-hot on the MXU; an inclusive lane prefix sum gives each hit entry
+    # its position; a one-hot scatter puts entry i at column pos[i].
+    nc = hot1h_ref.shape[1]
+    hit8 = jnp.broadcast_to(jnp.where(hit, 1.0, 0.0).astype(jnp.bfloat16), (8, LANES))
+    hh = jnp.dot(hit8, hot1h_ref[...], preferred_element_type=jnp.float32)[:1]
+    lane_c = jax.lax.broadcasted_iota(jnp.int32, (1, nc), 1)
+    ps = hh
+    k = 1
+    while k < nc:
+        ps = ps + jnp.where(lane_c >= k, pltpu.roll(ps, k, axis=1), 0.0)
+        k *= 2
+    n_active = ps[:, nc - 1 : nc].astype(jnp.int32)
+    pos = jnp.where(hh > 0.5, ps - 1.0, -1.0)
+    posm = jnp.transpose(jnp.broadcast_to(pos, (nc, nc)))  # row i: pos[i]
+    row_i = jax.lax.broadcasted_iota(jnp.int32, (nc, nc), 0)
+    lane_p = jax.lax.broadcasted_iota(jnp.int32, (nc, nc), 1).astype(jnp.float32)
+    comp = jnp.sum(jnp.where(posm == lane_p, row_i, 0), axis=0, keepdims=True)
+    # One buffer to SMEM: row 0 the compact list, row 1 its length, row 2
+    # the fixed load per rank.
+    cmp_v[...] = jnp.zeros_like(cmp_v)
+    cmp_v[0:1, :] = comp
+    cmp_v[1:2, :] = jnp.broadcast_to(n_active, (1, nc))
+    cmp_v[2:3, :] = loads[:, :nc].astype(jnp.int32)
+    cp2 = pltpu.make_async_copy(cmp_v, cmp_s, hsem.at[2])
+    cp2.start()
+    cp1.wait()
+
+    def choice(n_fixed):
+        """The hit copied experts, hottest first, each to the holder with
+        fewer experts so far, ties to the primary; the ones this shard serves
+        are appended to the hit list (their local slot) from n_fixed on."""
+        cp2.wait()
+
+        def assign(j, n):
+            i = cmp_s[0, j]
+            e = tab_s[o_hot + i]
+            o = tab_s[o_hprim + i]
+            c = tab_s[o_hcopy + i]
+            pick = jnp.where(cmp_s[2, c] < cmp_s[2, o], c, o)
+            cmp_s[2, pick] = cmp_s[2, pick] + 1
+            mine = pick == my_rank
+
+            @pl.when(mine)
+            def _():
+                hits_s[0, e] = 1
+                ids[n] = tab_s[o_slot + e]
+
+            return n + jnp.where(mine, 1, 0)
+
+        return jax.lax.fori_loop(0, cmp_s[1, 0], assign, n_fixed)
+
+    stream(choice)
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=("topk", "ranks", "has_copies", "vmem_limit_bytes", "interpret"),
+)
+def moe_lowtok_scores(
+    x,
+    scores,
+    tables,
+    prim,
+    copy,
+    hot1h,
+    w13,
+    s13,
+    w2,
+    s2,
+    copy_weights=None,
+    *,
+    topk,
+    ranks,
+    has_copies,
+    vmem_limit_bytes=None,
+    interpret=False,
+):
+    """The shard's MoE output for a few tokens, with the router's top-k and
+    the holder assignment inside.
+
+    x [tokens, hidden] bf16; scores [tokens, LANES] f32: the softmax over all
+    experts (a row of zeros selects nothing); tables: this shard's scalar
+    tables from `pack_tables`; prim / copy [LANES] int32: the rank holding
+    each expert's primary / copy (-1: none); hot1h [LANES, NC] from
+    `hot_onehot`; w13 / s13 / w2 / s2 the primary slots as in `moe_lowtok`;
+    copy_weights: (w13, s13, w2, s2) of the copy slots, read with
+    has_copies. A hit expert is served by exactly one rank: its only holder,
+    or, with a copy, the holder with fewer experts assigned so far when its
+    turn comes (hottest first, ties to the primary). Returns [tokens, hidden]
+    in x's dtype; the reduction over ranks is the caller's.
+    """
+    tokens, hidden = x.shape
+    n_primary, _, two_inter = w13.shape
+    inter = two_inter // 2
+    if scores.shape[1] != LANES or prim.size != LANES or copy.size != LANES:
+        raise ValueError(f"the routing table is {LANES} experts wide")
+    if inter % LANE:
+        raise ValueError(
+            f"the intermediate width {inter} must be a multiple of the lane tile"
+        )
+    if has_copies != (copy_weights is not None):
+        raise ValueError("copy weights come exactly with has_copies")
+    n_experts = n_primary + (copy_weights[0].shape[0] if has_copies else 0)
+    nc = hot1h.shape[-1]
+    if nc % LANE:
+        raise ValueError(f"the hot table's length {nc} must be a multiple of {LANE}")
+    *offsets, length = table_offsets(n_experts, nc)
+    if tables.size != length:
+        raise ValueError(
+            f"packed tables for {n_experts} slots and {nc} hot entries are "
+            f"[{length}], got {tables.shape}"
+        )
+    w13_parts = 2 if (inter // 2) % LANE == 0 else 1
+    rows = -(-tokens // ROW_TILE) * ROW_TILE
+    x_rows = jnp.pad(x, ((0, rows - tokens), (0, 0)))
+    sc = jnp.pad(scores.astype(jnp.float32), ((0, rows - tokens), (0, 0)))
+
+    def scales(s13, s2, slots):
+        return (
+            s13.reshape(slots, 1, two_inter).astype(jnp.float32),
+            s2.reshape(slots, 1, hidden).astype(jnp.float32),
+        )
+
+    weights = (*scales(s13, s2, n_primary), w13, w2)
+    if has_copies:
+        cw13, cs13, cw2, cs2 = copy_weights
+        weights += (*scales(cs13, cs2, cw13.shape[0]), cw13, cw2)
+    vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
+    hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+    if vmem_limit_bytes is None and not interpret:
+        vmem_limit_bytes = vmem_budget(rows, hidden, inter, w13_parts, two_inter)
+    half_width = 2 * (inter // w13_parts)
+    out = pl.pallas_call(
+        functools.partial(
+            _kernel_scores,
+            n_experts=n_experts,
+            inter=inter,
+            w13_parts=w13_parts,
+            topk=topk,
+            ranks=ranks,
+            has_copies=has_copies,
+            offsets=tuple(offsets),
+        ),
+        out_shape=jax.ShapeDtypeStruct((rows, hidden), x.dtype),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            in_specs=[vmem, vmem, vmem, hbm, vmem] + [hbm] * len(weights),
+            out_specs=vmem,
+            scratch_shapes=(
+                pltpu.SMEM((n_experts,), jnp.int32),
+                pltpu.VMEM((rows, LANES), jnp.float32),
+                pltpu.VMEM((1, LANES), jnp.int32),
+                pltpu.SMEM((1, LANES), jnp.int32),
+                pltpu.VMEM((8, nc), jnp.int32),
+                pltpu.SMEM((8, nc), jnp.int32),
+                pltpu.SemaphoreType.DMA((3,)),
+                pltpu.VMEM((rows, hidden), x_rows.dtype),
+                pltpu.SemaphoreType.DMA((1,)),
+                pltpu.VMEM((w13_parts + 1, hidden, half_width), FP8),
+                pltpu.VMEM((w13_parts + 1, inter, hidden), FP8),
+                pltpu.VMEM((w13_parts + 1, 1, half_width), jnp.float32),
+                pltpu.VMEM((w13_parts + 1, 1, hidden), jnp.float32),
+                pltpu.SemaphoreType.DMA((w13_parts + 1,)),
+                pltpu.SemaphoreType.DMA((w13_parts + 1,)),
+                pltpu.VMEM((rows, two_inter), jnp.float32),
+                pltpu.VMEM((rows, hidden), jnp.float32),
+            ),
+            grid=(),
+        ),
+        compiler_params=pltpu.CompilerParams(vmem_limit_bytes=vmem_limit_bytes),
+        interpret=pltpu.InterpretParams() if interpret else False,
+        name="moe_lowtok_scores",
+    )(
+        jnp.asarray(tables, jnp.int32).reshape(-1),
+        jnp.asarray(prim, jnp.int32).reshape(1, LANES),
+        jnp.asarray(copy, jnp.int32).reshape(1, LANES),
+        jnp.asarray(hot1h, jnp.bfloat16).reshape(LANES, nc),
+        x_rows,
+        sc,
+        *weights,
+    )
+    return out[:tokens]
+
+
+def table_offsets(n_experts, nc):
+    """The packed table's layout for `n_experts` local slots and `nc` hot
+    entries: (gid, hot, hprim, hcopy, slot) offsets and the padded length (a
+    multiple of the lane tile)."""
+    o_gid = 8
+    o_hot = o_gid + n_experts
+    o_hprim = o_hot + nc
+    o_hcopy = o_hprim + nc
+    o_slot = o_hcopy + nc
+    length = -(-(o_slot + LANES) // LANE) * LANE
+    return o_gid, o_hot, o_hprim, o_hcopy, o_slot, length
+
+
+def pack_tables(rank, gid, hot, hprim, hcopy):
+    """The scores entry's scalar tables as one flat int32 array (see
+    table_offsets): [0] this shard's EP rank, the expert in each local slot,
+    the copied experts hottest first with the rank of each one's primary and
+    copy (-1 padded), and this shard's local slot of every expert (-1: none).
+    """
+    gid = np.asarray(gid, np.int32).reshape(-1)
+    hot, hprim, hcopy = (
+        np.asarray(t, np.int32).reshape(-1) for t in (hot, hprim, hcopy)
+    )
+    if not hprim.size == hot.size == hcopy.size:
+        raise ValueError("hot, hprim and hcopy must be the same length")
+    o_gid, o_hot, o_hprim, o_hcopy, o_slot, length = table_offsets(gid.size, hot.size)
+    tab = np.full((length,), -1, np.int32)
+    tab[0] = int(rank)
+    tab[o_gid : o_gid + gid.size] = gid
+    tab[o_hot : o_hot + hot.size] = hot
+    tab[o_hprim : o_hprim + hot.size] = hprim
+    tab[o_hcopy : o_hcopy + hot.size] = hcopy
+    tab[o_slot + gid] = np.arange(gid.size, dtype=np.int32)
+    return tab
+
+
+def hot_tables(prim, copy, order, slots=HOT_SLOTS):
+    """The copied experts in `order` (hottest first) with the rank of each
+    one's primary and copy, -1 padded to `slots` entries."""
+    prim = np.asarray(prim, np.int32).reshape(-1)
+    copy = np.asarray(copy, np.int32).reshape(-1)
+    order = [int(e) for e in order]
+    if len(order) > slots:
+        raise ValueError(
+            f"{len(order)} copied experts exceed the {slots}-entry hot table"
+        )
+    if sorted(order) != sorted(np.flatnonzero(copy >= 0).tolist()):
+        raise ValueError("the hot order must list every copied expert once")
+    hot = np.full(slots, -1, np.int32)
+    hot[: len(order)] = order
+    hprim = np.where(hot >= 0, prim[np.maximum(hot, 0)], -1).astype(np.int32)
+    hcopy = np.where(hot >= 0, copy[np.maximum(hot, 0)], -1).astype(np.int32)
+    return hot, hprim, hcopy
+
+
+def hot_onehot(hot):
+    """[LANES, len(hot)] with a 1 at (hot[i], i) for the real entries (-1
+    padding gives an all-zero column)."""
+    hot = np.asarray(hot, np.int32).reshape(1, -1)
+    return (np.arange(LANES, dtype=np.int32).reshape(-1, 1) == hot).astype(np.float32)
+
+
+def router_select_reference(scores, topk):
+    """The scores entry's router in plain JAX: max-and-mask passes, ties to
+    the lowest id, renormalized, rounded through bf16."""
+    x = jnp.where(scores > NEG, scores, NEG)
+    n = x.shape[1]
+    iota = jax.lax.broadcasted_iota(jnp.int32, x.shape, 1)
+    ws, ids = [], []
+    for _ in range(topk):
+        m = jnp.max(x, axis=1, keepdims=True)
+        idx = jnp.min(jnp.where(x == m, iota, n - 1), axis=1)
+        ws.append(m[:, 0])
+        ids.append(idx)
+        x = jnp.where(iota == idx[:, None], jnp.finfo(x.dtype).min, x)
+    w = jnp.stack(ws, axis=1)
+    i = jnp.stack(ids, axis=1)
+    w = w / jnp.sum(w, axis=1, keepdims=True)
+    return w.astype(jnp.bfloat16), i.astype(jnp.int32)
 
 
 def moe_lowtok_reference(x, topk_ids_local, topk_weights, w13, s13, w2, s2):

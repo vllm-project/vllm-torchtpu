@@ -40,9 +40,12 @@ Numerics: each token selects the same experts with the same weights and
 runs the same expert weights; only the order in which the k expert
 contributions are summed can differ (rounding level).
 
-Tables with copy slots (an expert held by two ranks) need a kernel that
-picks one holder per expert; none on this package does, so they are
-refused.
+A table may add copy slots after each rank's primaries (``"copies": true``
+with ``owned_per_core`` primaries per rank): a copy is a second holder of an
+expert. The router order and every MoE path use the primaries only; the FP8
+MoE method stores the copy slots apart, and the few-token kernel's scores
+entry (TPU_MOE_LOWTOK_FROM_SCORES) assigns each hit copied expert to one of
+its two holders per call (``holder_tables``, ``hot_order``).
 """
 
 import functools
@@ -98,17 +101,14 @@ def data() -> dict:
         experts = int(table["experts"])
         ranks = int(table["shards"])
         per_rank = int(table["slots_per_core"])
-        if table.get("copies") or int(table.get("owned_per_core", per_rank)) != (
-            per_rank
-        ):
+        # A copies table: the first owned_per_core slots of every rank are a
+        # permutation of the experts; the slots after them hold copies.
+        copies = bool(table.get("copies", False))
+        owned_n = int(table.get("owned_per_core", per_rank)) if copies else per_rank
+        if ranks * owned_n != experts or owned_n > per_rank:
             raise ValueError(
-                f"expert placement {path}: copy slots are not supported; "
-                "use a table where each rank holds slots_per_core primaries"
-            )
-        if ranks * per_rank != experts:
-            raise ValueError(
-                f"expert placement {path}: {ranks} ranks x {per_rank} slots "
-                f"must equal {experts} experts"
+                f"expert placement {path}: {ranks} ranks x {owned_n} primary "
+                f"slots must equal {experts} experts (slots per rank {per_rank})"
             )
         for n, layer in table["layers"].items():
             cores = layer["cores"]
@@ -117,13 +117,38 @@ def data() -> dict:
                     f"expert placement {path}: layer {n} must list {ranks} "
                     f"ranks x {per_rank} slots"
                 )
-            if sorted(e for c in cores for e in c) != list(range(experts)):
+            if sorted(e for c in cores for e in c[:owned_n]) != list(range(experts)):
                 raise ValueError(
                     f"expert placement {path}: layer {n} must hold every "
-                    "expert exactly once"
+                    "expert exactly once among the primary slots"
                 )
+            if copies:
+                _check_copies(path, n, layer, cores, owned_n, experts)
         _DATA, _DATA_PATH = table, path
     return _DATA
+
+
+def _check_copies(path, n, layer, cores, owned_n, experts) -> None:
+    """A copy slot holds a valid expert that has at most one copy, never on
+    the rank holding its primary; a declared hot order lists the copies."""
+    copy_holder = {}
+    for r, c in enumerate(cores):
+        for e in c[owned_n:]:
+            if not 0 <= e < experts or e in c[:owned_n] or e in copy_holder:
+                raise ValueError(
+                    f"expert placement {path}: layer {n} copy slot {e} on rank "
+                    f"{r} must be a valid expert with one copy, held off its "
+                    "primary rank"
+                )
+            copy_holder[e] = r
+    declared = layer.get("copies")
+    if (
+        isinstance(declared, dict)
+        and {int(e): r for e, r in declared.items()} != copy_holder
+    ):
+        raise ValueError(
+            f"expert placement {path}: layer {n} copy order must match the copy slots"
+        )
 
 
 def layer_index(name: str) -> int | None:
@@ -179,10 +204,56 @@ def expert_map(layer: int, rank: int) -> list[int]:
     return m
 
 
+def has_copies() -> bool:
+    """Whether the table adds copy slots after each rank's primaries."""
+    return enabled() and bool(data().get("copies", False))
+
+
+def owned() -> int:
+    """The primary slots per rank; copy slots, if any, follow them."""
+    return int(data().get("owned_per_core", slots())) if has_copies() else slots()
+
+
 def virtual_order(layer: int) -> list[int]:
-    """The global expert of each virtual id ``v = r * slots + j`` (the
-    router's row order after the permutation)."""
-    return [e for c in cores(layer) for e in c]
+    """The global expert of each virtual id ``v = r * owned + j`` (the
+    router's row order after the permutation): every rank's primaries, copy
+    slots left out."""
+    o = owned()
+    return [e for c in cores(layer) for e in c[:o]]
+
+
+def _virtual_ids(layer: int) -> dict[int, int]:
+    """Global expert -> its virtual id (the rank and slot of its primary)."""
+    o = owned()
+    return {
+        e: r * o + j for r, c in enumerate(cores(layer)) for j, e in enumerate(c[:o])
+    }
+
+
+def holder_tables(layer: int, rank: int) -> tuple[list[int], list[int], list[int]]:
+    """For the few-token kernel's scores entry, in virtual ids: this rank's
+    slot -> virtual id (primaries, then copy slots), and per virtual id the
+    rank of its primary and of its copy (-1 without one)."""
+    o = owned()
+    vid = _virtual_ids(layer)
+    primary = [v // o for v in range(len(vid))]
+    copy = [-1] * len(vid)
+    for r, c in enumerate(cores(layer)):
+        for e in c[o:]:
+            copy[vid[e]] = r
+    return [vid[e] for e in cores(layer)[rank]], primary, copy
+
+
+def hot_order(layer: int) -> list[int]:
+    """The layer's copied experts as virtual ids, hottest first: the table's
+    per-layer ``copies`` mapping (written hottest first), else the copy slots
+    in rank order."""
+    o = owned()
+    vid = _virtual_ids(layer)
+    declared = data()["layers"][str(layer)].get("copies")
+    if isinstance(declared, dict):
+        return [vid[int(e)] for e in declared]
+    return [vid[e] for c in cores(layer) for e in c[o:]]
 
 
 def permute_router_rows(name: str, tensor):

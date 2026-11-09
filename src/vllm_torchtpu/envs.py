@@ -81,6 +81,8 @@ if TYPE_CHECKING:
     TPU_MOE_SINGLE_SORT: bool = True
     TPU_MOE_COUNTING_SORT: bool = True
     TPU_MOE_LOWTOK_MAX_TOKENS: int = 0
+    TPU_MOE_LOWTOK_FROM_SCORES: bool = False
+    TPU_MOE_LOWTOK_SCORES_STRICT: bool = False
     USE_MOE_TP_DECODE_KERNEL: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
@@ -761,6 +763,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # dense-expert path) and, for small steps, the adaptive fused EP kernel.
     # 0 disables it; larger shapes and unsupported layouts are unchanged.
     "TPU_MOE_LOWTOK_MAX_TOKENS": env_nonnegative_int("TPU_MOE_LOWTOK_MAX_TOKENS", 0),
+    # Run the few-token kernel's scores entry inside the adaptive fused EP op
+    # (MOE_FUSED_EP_KERNEL_IMPL=adaptive) for steps of at most
+    # TPU_MOE_LOWTOK_MAX_TOKENS rows: the router's top-k and, under an
+    # expert placement with copy slots (TPU_EXPERT_PLACEMENT), the choice of
+    # one holder per hit copied expert run inside the kernel.
+    "TPU_MOE_LOWTOK_FROM_SCORES": env_bool("TPU_MOE_LOWTOK_FROM_SCORES"),
+    # Refuse to start when TPU_MOE_LOWTOK_FROM_SCORES is set and a MoE layer
+    # cannot be served by the scores entry (otherwise the refusal is logged).
+    "TPU_MOE_LOWTOK_SCORES_STRICT": env_bool("TPU_MOE_LOWTOK_SCORES_STRICT"),
     # Serve eligible tensor-parallel MoE layers (sigmoid + correction-bias
     # top-k with renormalization, one shared expert, FP8 per-channel weights)
     # with one op that also covers the shared expert and the TP all-reduce:
