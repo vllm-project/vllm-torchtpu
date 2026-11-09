@@ -136,6 +136,8 @@ if TYPE_CHECKING:
     VLLM_TPU_INDEXER_KV_CACHE_MODE: str = "sal"
     TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER: bool = True
     TPU_SPARSE_MLA_CHUNK_TOKENS: int | None = None
+    TPU_RPA_DECODE_VMEM_MIB: int = 0
+    TPU_RPA_DECODE_BATCH: int = 0
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_MOE_FP8_ALL_GATHER: bool = False
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
@@ -1016,6 +1018,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_SPARSE_MLA_CHUNK_TOKENS": env_positive_int_or_none(
         "TPU_SPARSE_MLA_CHUNK_TOKENS"
     ),
+    # VMEM limit (MiB) for the batched attention kernel in decode-sized
+    # programs (at most RPA_DECODE_PROGRAM_ROWS query rows). A smaller limit
+    # leaves VMEM free to prefetch the next layer's weights across the kernel.
+    # 0 keeps the hardware VMEM capacity and the default decode batch.
+    "TPU_RPA_DECODE_VMEM_MIB": env_int("TPU_RPA_DECODE_VMEM_MIB", 0),
+    # Decode batch (sequences the batched attention kernel works on at once)
+    # in those programs; only read when TPU_RPA_DECODE_VMEM_MIB is set. 0 uses
+    # min(8, the padded sequence count the kernel sees). At most 8.
+    "TPU_RPA_DECODE_BATCH": env_int("TPU_RPA_DECODE_BATCH", 0),
     # Post-gather MoE token chunk size for communication-computation pipelining.
     # When set to 0, chunking and communication pipelining are disabled.
     "TPU_MOE_COLLECTION_CHUNK_SIZE": lambda: int(
