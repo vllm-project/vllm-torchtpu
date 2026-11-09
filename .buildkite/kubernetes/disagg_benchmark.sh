@@ -33,6 +33,17 @@ case "$profile" in
     ;;
   *) echo "Unknown DISAGG_PROFILE: $profile" >&2; exit 2 ;;
 esac
+test_mode="${DISAGG_TEST_MODE:-performance}"
+case "$test_mode" in
+  performance) ;;
+  apc)
+    if [ "$profile" != qwen3.8-flash ]; then
+      echo "Use the existing integration recipe for other APC model profiles" >&2
+      exit 2
+    fi
+    ;;
+  *) echo "DISAGG_TEST_MODE must be performance or apc" >&2; exit 2 ;;
+esac
 # The image ships libtpu, which makes vLLM's platform
 # detection pick TPU on this CPU-only pod and fail.
 if [ "$profile" = qwen3.5-397b ]; then
@@ -111,6 +122,17 @@ if [ "$profile" = qwen3.8-flash ]; then
   model="${DISAGG_MODEL:-Qwen/Qwen3.8-Flash-Next-FP8}"
 fi
 
+if [ "$test_mode" = apc ]; then
+  apc_rc=0
+  python3 "$HERE/../../examples/disagg/check_pd_apc.py" \
+    --prefill "http://$prefill_host:8000" --decode "http://$decode_host:8000" \
+    --proxy http://localhost:10000 --model "$model" --dp "${DISAGG_DP_SIZE:-8}" \
+    --output-dir "$results_dir/apc" || apc_rc=$?
+  (cd "$results_dir" && buildkite-agent artifact upload 'apc/**/*.json') \
+    || { [ "$apc_rc" -ne 0 ] || apc_rc=1; }
+  exit "$apc_rc"
+fi
+
 # One record id for the whole sweep, suffixed per cell, so
 # a night's rows can be selected together.
 record_base="kube-vllm-torchtpu-run-$(date +%Y%m%d-%H%M%S)"
@@ -173,6 +195,7 @@ run_cell() {
   if [ "$profile" = qwen3.8-flash ]; then
     bench=(python3 "$HERE/disagg_cpu_bench.py" bench serve)
   fi
+  local bench_rc=0
   "${bench[@]}" \
     --backend=openai \
     --endpoint=/v1/completions \
@@ -193,7 +216,12 @@ run_cell() {
     --port=10000 \
     --label="${filename%.json}" \
     --append-result \
-    --result-file="$path"
+    --result-file="$path" || bench_rc=$?
+
+  if [ "$bench_rc" -ne 0 ]; then
+    upload_result_artifact "$path"
+    return "$bench_rc"
+  fi
 
   # Per cell rather than at the end, so a sweep that runs
   # out its deadline still yields the cells that finished.

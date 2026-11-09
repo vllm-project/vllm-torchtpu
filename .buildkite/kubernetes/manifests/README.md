@@ -47,10 +47,8 @@ what it needs itself.
 `qwen3.8-flash-1p1d.yaml` uses the existing engine, proxy, benchmark and result
 publisher. `DISAGG_DP_SIZE=8` is the default; `4` selects TP2/DP4 on the same
 eight-rank host for manual validation. The nightly matrix enables only DP8.
-The TP2/DP4 decode startup failed during model profiling with incompatible
-`(24, 60, 128)` and `(24, 62, 128)` broadcast shapes, before any paired client ran;
-DP4 is not native-qualified. Both engines must use the same topology and
-`DISAGG_MODEL`.
+TP2/DP4 remains a manual, native-unqualified recipe. Both engines must use the
+same topology and `DISAGG_MODEL`.
 The latter defaults to `Qwen/Qwen3.8-Flash-Next-FP8`; a resident checkpoint path
 can be supplied for host tests. No model copy is part of the scripts.
 
@@ -62,34 +60,64 @@ can be supplied for host tests. No model copy is part of the scripts.
 | Compile sizes | `[8192]` | `[8, 8192]` |
 | MoE | fused EP v2, sharded plan | dense threshold 128, fused decode off |
 
-Both roles use block128 FP8 pages, FP32 convolution state and BF16 recurrent
-state, CP1/PP1, async/chunked scheduling, and APC/MTP off. The model-owned
+Both roles request block128 FP8 pages, FP32 convolution state and BF16 recurrent
+state, CP1/PP1 and async/chunked scheduling. Native pool planning resolves the
+actual manager-page and state-slot geometry. MTP is unsupported. The model-owned
 `Qwen4ExpRaidenConnector` transfers native cache groups with parallelism equal
-to TP, independently of DP. Its loaded checkpoint and physical layout checks
-remain mandatory; the Qwen3.5 admission and block8192 recipe do not apply.
+to TP, independently of DP or expert routing. Its physical layout checks remain
+mandatory; the Qwen3.5 admission and block8192 recipe do not apply.
 Operator bootstrap factors are preserved. Role-local environment overrides
 also set the PLE backend so an inherited `native_dma` cannot change prefill.
 
 PLE table weights stay local to each engine and are not part of the transfer
 fingerprint. Admission compares measured carrier geometry/layout/dtype, logical
-cache shapes and dtypes, GDN encoding/granules, loaded FP8 KV scales and TP
-mapping. It validates the live cache owner bindings independently. Local PLE
+cache shapes, dtypes and encoding block sizes, GDN encoding/granules, loaded
+FP8 KV scales and TP mapping. It validates the live cache owner bindings
+independently. Local PLE
 shards, backend/shared-memory choices and checkpoint paths may differ; incompatible
 cache encodings, scales or storage bindings are rejected. Matching transfer
 fingerprints do not establish model/checkpoint equivalence or numerical accuracy.
-PD does not reject CP/PP/APC/MTP configuration switches alone. This whole-page
+The model still requires CP1/PP1 and no speculative decoding. This whole-page
 mapper requires the actual local TP rank set and one explicitly mapped committed
-snapshot for each recurrent owner. Spare or historical state pages are not
-silently selected or dropped, regardless of cache-mode/speculative-capacity flags.
-Model/backend support and prefix-completion checks remain separate requirements.
+snapshot for each recurrent owner. In aligned mode the snapshot is selected at
+the published token position, excluding historical and spare slots.
 The Qwen adapter currently declares whole-page copies to matching transfer-unit
 ordinals. Cross-TP splitting/combining of packed QSA/GDN pages needs a fragment
 mapping that this adapter does not supply. Shared Raiden's support for explicit
 resharding spans does not infer that model-specific mapping automatically.
-The DP8 two-host smoke and three 512-request performance rounds completed with
-zero request failures. The separate exact diagnostic found PD outputs differing
-from decode-local outputs; numerical accuracy remains unqualified. These
-results do not qualify TP2/DP4 or other checkpoint/layout combinations.
+
+`DISAGG_TEST_MODE=apc` selects the correctness lane. Both roles enable APC with
+aligned Mamba state and Stage-3 prefix-aware loads; the performance lane keeps
+APC disabled. The correctness client uses the existing development RPC to read
+the default DP engine's initialized TP-worker plans. Per-engine counters check
+actual routing and hits on every DP rank. Qualification also requires native
+supervisor receipts for loaded source and cache plans on all workers.
+Development endpoints are enabled only in this test profile and must remain
+on the isolated test network.
+
+Local hits must align with the registered token-page spans. Only newly allocated
+token suffix pages are transfer targets; committed GDN/PLE snapshots and private
+raw rings transfer in full. Full local hits release the producer registration
+without a receive. Hit lookup reconciles cacheable groups before making a
+no-load decision.
+
+The worker chooses native pool capacity from the actual HBM budget and the
+upstream physical allocation plan, bounded by full-concurrency demand.
+`max_num_seqs` remains a concurrency limit rather than a promise that every
+request can hold `max_model_len` simultaneously. Existing scheduler admission
+handles cache pressure. Explicit block-count overrides are honored or rejected
+if they exceed the budget or cannot hold one maximum-length request. Once the
+physical owners are allocated, later spec queries retain that exact capacity.
+
+The client resets each role's cache separately and checks cold, both-warm,
+prefill-only-warm, decode-only-warm and branched-prefix requests. Per-engine
+local and external cache-hit counters establish routing and real reuse. Cold
+and warm first greedy token IDs must match, with selected-token logprob absolute
+difference at most 0.2, as in the Qwen3.5 PD divergence recipe. Interleaved prefixes
+check state restoration. Repeated known-answer checks require exact normalized
+answers and exercise multi-token continuation. Raw responses,
+counter snapshots, resolved plans and failures are artifacts. These checks
+require native execution; CPU contract tests alone do not qualify APC with PD.
 
 The performance lane follows the 397B smoke (C8, 8192 input, 32 output, 8 requests),
 then three 512-request measured rounds. It checks health, proxy, command status

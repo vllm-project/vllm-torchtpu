@@ -22,6 +22,9 @@
 # and supplies POD_IP, which needs the downward API.
 set -euo pipefail
 
+# Core dumps can overflow the pod's ephemeral storage.
+ulimit -c 0
+
 role="${1:-}"
 case "$role" in
   prefill|decode) ;;
@@ -36,8 +39,6 @@ case "${DISAGG_PROFILE:-qwen3.5-397b}" in
   *) echo "Unknown DISAGG_PROFILE: $DISAGG_PROFILE" >&2; exit 2 ;;
 esac
 
-# Core dumps are ~4GiB each and overflow the pod's ephemeral storage.
-ulimit -c 0
 export VLLM_HOST_IP="${POD_IP}"
 
 # Same for both engines.

@@ -16,6 +16,7 @@
 import importlib.util
 import json
 import os
+import resource
 import subprocess
 import sys
 from pathlib import Path
@@ -91,7 +92,7 @@ def test_role_command_and_model_admission(dp, role, monkeypatch):
 
 
 STUB = """#!{python}
-import json, os, pathlib, sys
+import json, os, pathlib, resource, sys
 name = pathlib.Path(sys.argv[0]).name
 root = pathlib.Path(os.environ["STUB_ROOT"])
 if name == "python3":
@@ -110,6 +111,13 @@ if name == "python3":
             numeric_reference_passed=os.environ.get("STUB_NUMERIC_FAILURE") != "1",
             diagnostic_failed=os.environ.get("STUB_NUMERIC_FAILURE") == "1")))
         sys.exit(int(os.environ.get("STUB_SANITY_RC", "0")))
+    if script == "check_pd_apc.py":
+        out = pathlib.Path(sys.argv[sys.argv.index("--output-dir") + 1])
+        out.mkdir(parents=True, exist_ok=True)
+        rc = int(os.environ.get("STUB_APC_RC", "0"))
+        (out / "summary.json").write_text(json.dumps(dict(passed=rc == 0)))
+        (root / "apc-client.json").write_text(json.dumps(sys.argv[2:]))
+        sys.exit(rc)
     if script == "parse_gke_results.py":
         with (root / "bq-called").open("a") as f:
             f.write(json.dumps(sys.argv[2:]) + "\\n")
@@ -123,7 +131,8 @@ if name == "vllm":
     with (root / "vllm.jsonl").open("a") as f:
         prefixes = ("TPU_", "VLLM_TPU_", "LIBTPU_", "MOE_", "USE_MOE_")
         selected = {{k: v for k, v in os.environ.items() if k.startswith(prefixes)}}
-        f.write(json.dumps(dict(argv=sys.argv[1:], env=selected)) + "\\n")
+        f.write(json.dumps(dict(argv=sys.argv[1:], env=selected,
+            core_limit=resource.getrlimit(resource.RLIMIT_CORE)[0])) + "\\n")
     for arg in sys.argv:
         if arg.startswith("--result-file="):
             result = pathlib.Path(arg.split("=", 1)[1])
@@ -142,6 +151,7 @@ if name == "pip":
 if name == "buildkite-agent":
     with (root / "artifacts.jsonl").open("a") as f:
         f.write(json.dumps(sys.argv[1:]) + "\\n")
+    sys.exit(int(os.environ.get("STUB_ARTIFACT_RC", "0")))
 if name == "curl":
     import time
     time.sleep(0.05)
@@ -198,9 +208,13 @@ def test_actual_engine_script_overrides_ambient_backend_and_keeps_bootstrap(
         capture_output=True,
         text=True,
         timeout=15,
+        preexec_fn=lambda: resource.setrlimit(
+            resource.RLIMIT_CORE, (1024, resource.getrlimit(resource.RLIMIT_CORE)[1])
+        ),
     )
     assert result.returncode == 0, result.stderr
     receipt = json.loads((tmp_path / "vllm.jsonl").read_text())
+    assert receipt["core_limit"] == 0
     effective = receipt["env"]
     assert effective["TPU_RAIDEN_ENGINE_ID"] == f"cpu-test-{role}"
     assert effective["TPU_KV_TRANSFER_NAMESPACE"] == f"cpu-test-{role}"
@@ -281,6 +295,35 @@ def test_actual_benchmark_accounting_and_client_failure_cleanup(benchmark_rc, tm
     else:
         assert not (tmp_path / "bq-called").exists()
         assert len((tmp_path / "vllm.jsonl").read_text().splitlines()) == 1
+        assert len((tmp_path / "artifacts.jsonl").read_text().splitlines()) == 1
+
+
+@pytest.mark.parametrize("profile", ["qwen3.5-397b", "qwen3.8-flash"])
+def test_failed_benchmark_preserves_raw_artifact_and_original_status(profile, tmp_path):
+    env = stubs(tmp_path)
+    env.update(
+        DISAGG_PROFILE=profile,
+        STUB_VLLM_RC="7",
+        STUB_ARTIFACT_RC="9",
+        STUB_RESULT_MODE="failed",
+        BQ_UPLOAD="1",
+        BUILDKITE_BRANCH="main",
+        BUILDKITE_PULL_REQUEST="false",
+    )
+    result = subprocess.run(
+        ["bash", str(KUBE / "disagg_benchmark.sh")],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert result.returncode == 7, (result.stdout, result.stderr)
+    assert len((tmp_path / "artifacts.jsonl").read_text().splitlines()) == 1
+    assert not (tmp_path / "bq-called").exists()
+    raw = list((tmp_path / "results").glob("*.json"))
+    assert len(raw) == 1 and json.loads(raw[0].read_text())["failed"] == 1
+    pid = int((tmp_path / "proxy.pid").read_text())
+    assert not Path(f"/proc/{pid}").exists()
 
 
 def test_manifest_and_matrix_use_same_eight_rank_roles():

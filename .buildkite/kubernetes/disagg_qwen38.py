@@ -23,7 +23,13 @@ CONNECTOR = "vllm_torchtpu.models.vllm.qwen4_exp.pd_connector"
 
 
 def role_profile(
-    role: str, dp: int, model: str, host: str, instance: str = "qwen38-pd"
+    role: str,
+    dp: int,
+    model: str,
+    host: str,
+    instance: str = "qwen38-pd",
+    *,
+    apc: bool = False,
 ) -> dict:
     if role not in ("prefill", "decode") or dp not in (4, 8):
         raise ValueError("Expected prefill/decode and DP4 or DP8 on eight ranks")
@@ -61,6 +67,7 @@ def role_profile(
         "TPU_RAIDEN_KIMIK3_ADMISSION": "0",
         "TPU_RAIDEN_GLM_ADMISSION": "0",
         "TPU_RAIDEN_DSV4_ADMISSION": "0",
+        "TPU_RAIDEN_PREFIX_AWARE_LOAD": "1" if apc else "0",
         # The model hook resolves this environment override before admission.
         "VLLM_TPU_QWEN38_FLASH_PLE_HOST_BACKEND": backend,
         "VLLM_TPU_HC_PREFILL_TILE": "256",
@@ -79,6 +86,9 @@ def role_profile(
     }
     if prefill:
         env["MOE_FUSED_EP_KERNEL_IMPL"] = "v2"
+    if apc:
+        env["VLLM_SERVER_DEV_MODE"] = "1"
+        env["TPU_RAIDEN_POOL_STAGING_LEASES"] = "1"
     qwen = dict(
         ple_host_backend=backend,
         engram_config=dict(
@@ -122,9 +132,9 @@ def role_profile(
         "--gpu-memory-utilization=0.9",
         "--mamba-cache-dtype=float32",
         "--mamba-ssm-cache-dtype=bfloat16",
-        "--mamba-cache-mode=none",
+        "--mamba-cache-mode=" + ("align" if apc else "none"),
         "--no-disable-hybrid-kv-cache-manager",
-        "--no-enable-prefix-caching",
+        "--enable-prefix-caching" if apc else "--no-enable-prefix-caching",
         "--enable-chunked-prefill",
         "--async-scheduling",
         "--enable-prompt-tokens-details",
@@ -149,6 +159,7 @@ def role_profile(
         unset_env=[] if prefill else ["MOE_FUSED_EP_KERNEL_IMPL"],
         max_request_tokens=33792,
         client_concurrency=dp * 8,
+        prefix_caching=apc,
     )
 
 
@@ -176,12 +187,16 @@ def main() -> None:
                 "Benchmark result is missing, incomplete or has failed requests"
             )
         return
+    mode = os.environ.get("DISAGG_TEST_MODE", "performance")
+    if mode not in ("performance", "apc"):
+        parser.error("DISAGG_TEST_MODE must be performance or apc")
     profile = role_profile(
         args.role,
         int(os.environ.get("DISAGG_DP_SIZE", "8")),
         os.environ.get("DISAGG_MODEL", MODEL),
         os.environ["POD_IP"],
         os.environ.get("WORKLOAD_NAME", "qwen38-pd"),
+        apc=mode == "apc",
     )
     if args.print_only:
         print(json.dumps(profile, indent=2))
