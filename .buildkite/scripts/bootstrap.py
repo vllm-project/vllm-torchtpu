@@ -201,6 +201,15 @@ class BuildContext:
         # after cutover, PR pushes are CPU-only
         return not (self.is_pr and self.ci_pr_push_cpu_only)
 
+    # Whether this build runs pre-commit itself (pipeline_precommit.yml), so the
+    # required Buildkite status covers it: always in the queue, and on PR and /ci
+    # builds after cutover. Docs-only changes still get it.
+    @property
+    def runs_precommit(self) -> bool:
+        return self.is_merge_queue or (
+            self.ci_pr_push_cpu_only and (self.is_pr or self.is_ci_command)
+        )
+
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> BuildContext:
         suite_override = env.get("CI_SUITE", "").strip()
@@ -1025,6 +1034,10 @@ def run_bootstrap(
                     "Docs-only change; skipped CPU and TPU checks in the merge queue.",
                     env=child_env,
                 )
+            if ctx.runs_precommit:
+                print("Only documentation/non-code files changed. Running pre-commit.")
+                upload_stages((("precommit",),), child_env, repo_root=repo_root)
+                return 0
             print("Only documentation/non-code files changed. Skipping CI build.")
             return 0
         print("Code files changed. Proceeding with pipeline upload.")
@@ -1128,7 +1141,10 @@ def run_bootstrap(
         child_env["PR_TPU_CONCURRENCY_GROUP"] = concurrency_group
 
     # 6. Upload stage 0 (multi-stage suites chain later stages via upload-stages).
-    upload_stages(suite.stages, child_env, repo_root=repo_root)
+    stages = suite.stages
+    if ctx.runs_precommit:
+        stages = (("precommit", *stages[0]), *stages[1:])
+    upload_stages(stages, child_env, repo_root=repo_root)
     print("--- Buildkite Bootstrap Finished")
     return 0
 
