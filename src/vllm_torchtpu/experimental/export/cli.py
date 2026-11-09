@@ -60,10 +60,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     engine arguments shape the artifact, and its frontend arguments, which do not,
     are reported and ignored (see `ignored_frontend_args`).
     """
-    try:
-        from vllm.entrypoints.common.cli_args import make_arg_parser
-        from vllm.utils.argparse_utils import FlexibleArgumentParser
+    from vllm.entrypoints.common.cli_args import make_arg_parser
+    from vllm.utils.argparse_utils import FlexibleArgumentParser
 
+    try:
         parser: argparse.ArgumentParser = make_arg_parser(
             FlexibleArgumentParser(
                 prog="python -m vllm_torchtpu.experimental.export",
@@ -73,7 +73,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                 ),
             )
         )
-    except Exception:
+    # vLLM raises RuntimeError when it cannot infer a device (e.g. the CPU CI runner).
+    except RuntimeError:
         parser = argparse.ArgumentParser(
             prog="python -m vllm_torchtpu.experimental.export",
             description=(

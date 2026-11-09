@@ -18,6 +18,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from types import SimpleNamespace
@@ -704,6 +705,14 @@ def test_build_arg_parser_uses_vllm_common_cli_args(
     parser = cli.build_arg_parser()
     assert len(calls) == 1
     assert "--export-spy-marker" in parser._option_string_actions
+
+
+def test_build_arg_parser_raises_when_cli_args_import_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(sys.modules, "vllm.entrypoints.common.cli_args", None)
+    with pytest.raises(ImportError):
+        cli.build_arg_parser()
 
 
 def test_parse_args_takes_the_vllm_serve_command_line(capsys) -> None:
