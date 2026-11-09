@@ -611,8 +611,13 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
         return loaded_params
 
     def process_weights_after_loading(self) -> None:
+        # vLLM v0.33.0 dropped finalize_mega_moe_weights from the NVIDIA
+        # DeepseekV41MoE (its target model only finalizes the mHC broadcast
+        # weights now); keep the call where an older vLLM still provides it.
         for layer in self.model.layers:
-            layer.ffn.finalize_mega_moe_weights()
+            finalize = getattr(layer.ffn, "finalize_mega_moe_weights", None)
+            if finalize is not None:
+                finalize()
         self.model.finalize_mhc_broadcast_weights()
 
     def _remap_dspark_name(self, name: str) -> str | None:
