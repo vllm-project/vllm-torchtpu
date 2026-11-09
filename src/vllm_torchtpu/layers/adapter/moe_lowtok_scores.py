@@ -102,7 +102,7 @@ def scores_entry_refusal(layer, activation: str, adaptive: bool) -> str | None:
     if not envs.TPU_MOE_LOWTOK_MAX_TOKENS:
         return "TPU_MOE_LOWTOK_MAX_TOKENS unset"
     if not adaptive:
-        return "it runs in the adaptive fused EP op (MOE_FUSED_EP_KERNEL_IMPL)"
+        return "it runs in the adaptive or v3 fused EP op (MOE_FUSED_EP_KERNEL_IMPL)"
     if not layer.moe_config.moe_parallel_config.use_ep:
         return "no expert parallelism"
     if int(layer.global_num_experts) != LANES:

@@ -30,6 +30,11 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
+try:
+    from vllm_torchtpu.kernels.collectives import small_gather_scatter as sgs
+except ImportError:  # pragma: no cover - optional collective kernel port
+    sgs = None
+
 from vllm_torchtpu.kernels.moe_lowtok.kernel import (
     can_use_moe_lowtok,
     moe_lowtok,
@@ -39,6 +44,41 @@ from vllm_torchtpu.kernels.moe_lowtok.kernel import (
 
 def _local_shape(array, ep):
     return jax.ShapeDtypeStruct((array.shape[0] // ep, *array.shape[1:]), array.dtype)
+
+
+def _combine_partials(
+    partial,
+    *,
+    axis,
+    ep: int,
+    rank_l,
+    out_dtype,
+    small_reduce_scatter_max_rows: int = 0,
+    interpret: bool = False,
+):
+    """Combine per-shard partial sums [ep * local_rows, hidden] into
+    [local_rows, hidden]."""
+    local_rows = partial.shape[0] // ep
+    if (
+        not interpret
+        and sgs is not None
+        and small_reduce_scatter_max_rows > 0
+        and rank_l is not None
+        and partial.dtype == jnp.bfloat16
+        and partial.shape[1] % sgs.LANE == 0
+        and local_rows <= small_reduce_scatter_max_rows
+    ):
+        return sgs.small_reduce_scatter(
+            partial,
+            num_cores=ep,
+            axis=axis,
+            rank=rank_l.reshape(1),
+        ).astype(out_dtype)
+    # Sum the shards' partials in float32 and round once.
+    out = lax.psum_scatter(
+        partial.astype(jnp.float32), axis, scatter_dimension=0, tiled=True
+    )
+    return out.astype(out_dtype)
 
 
 def moe_lowtok_ep_serves(
@@ -88,6 +128,7 @@ def moe_lowtok_ep(
     topk,
     renormalize,
     mesh_ep_ranks=None,
+    small_reduce_scatter_max_rows: int = 0,
     interpret=False,
 ):
     """One MoE layer for a small step, sharded over the mesh's one axis.
@@ -127,11 +168,15 @@ def moe_lowtok_ep(
             w2s_l,
             interpret=interpret,
         )
-        # Sum the shards' partials in float32 and round once.
-        out = lax.psum_scatter(
-            partial.astype(jnp.float32), axis, scatter_dimension=0, tiled=True
+        return _combine_partials(
+            partial,
+            axis=axis,
+            ep=ep,
+            rank_l=rank_l,
+            out_dtype=x_l.dtype,
+            small_reduce_scatter_max_rows=small_reduce_scatter_max_rows,
+            interpret=interpret,
         )
-        return out.astype(x_l.dtype)
 
     spec = jax.sharding.PartitionSpec(axis)
     return jax.shard_map(
@@ -164,8 +209,10 @@ def moe_lowtok_scores_ep(
     w2_scale,
     copy_weights=None,
     *,
+    rank=None,
     mesh,
     topk,
+    small_reduce_scatter_max_rows: int = 0,
     interpret=False,
 ):
     """`moe_lowtok_ep` with the router and the holder choice in the kernel
@@ -181,8 +228,13 @@ def moe_lowtok_scores_ep(
     (axis,) = mesh.axis_names
     ep = mesh.shape[axis]
     has_copies = copy_weights is not None
+    has_rank = rank is not None
 
-    def local_fn(x_l, gate_l, pad_l, tab_l, prim_l, copy_l, hot_l, *weights_l):
+    def local_fn(x_l, gate_l, pad_l, tab_l, prim_l, copy_l, hot_l, *rest_l):
+        if has_rank:
+            rank_l, *weights_l = rest_l
+        else:
+            rank_l, weights_l = None, rest_l
         w1_l, w2_l, w1s_l, w2s_l, *copies_l = weights_l
         padded = (pad_l.reshape(-1, 1) != 0) | jnp.any(
             jnp.isnan(gate_l), axis=-1, keepdims=True
@@ -214,11 +266,15 @@ def moe_lowtok_scores_ep(
             has_copies=has_copies,
             interpret=interpret,
         )
-        # Sum the shards' partials in float32 and round once.
-        out = lax.psum_scatter(
-            partial.astype(jnp.float32), axis, scatter_dimension=0, tiled=True
+        return _combine_partials(
+            partial,
+            axis=axis,
+            ep=ep,
+            rank_l=rank_l,
+            out_dtype=x_l.dtype,
+            small_reduce_scatter_max_rows=small_reduce_scatter_max_rows,
+            interpret=interpret,
         )
-        return out.astype(x_l.dtype)
 
     operands = (
         x,
@@ -228,6 +284,10 @@ def moe_lowtok_scores_ep(
         prim,
         copy,
         hot1h,
+    )
+    if has_rank:
+        operands += (rank,)
+    operands += (
         w1,
         w2,
         w1_scale,

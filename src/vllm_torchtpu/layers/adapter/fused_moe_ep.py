@@ -561,6 +561,7 @@ def fused_moe_ep(
     router_logits: torch.Tensor,
     score_bias: torch.Tensor | None = None,
     hash_ids: torch.Tensor | None = None,
+    scores_operands: tuple[torch.Tensor, ...] = (),
 ) -> torch.Tensor:
     """Run one MoE layer through the fused EP kernel.
 
@@ -595,7 +596,16 @@ def fused_moe_ep(
     if envs.TPU_MOE_SKIP_PADDED_TOKENS:
         router_logits = token_padding.mask_router_logits_for_padding(router_logits)
     extra = tuple(t for t in (score_bias, hash_ids) if t is not None)
-    return op(hidden_states, w1, w2, *scales, router_logits, _RANK_BUFFER, *extra)
+    return op(
+        hidden_states,
+        w1,
+        w2,
+        *scales,
+        router_logits,
+        _RANK_BUFFER,
+        *extra,
+        *scores_operands,
+    )
 
 
 def _simulated_routing_operands(
@@ -766,6 +776,8 @@ def prebuild_fused_moe_ep(
     rhs_qb=None,
     weights=None,
     supplies_hash_ids=False,
+    lowtok_scores: bool = False,
+    lowtok_scores_copies: bool = False,
 ) -> Any | None:
     """Resolve the mesh and build the fused-EP op for one layer.
 
@@ -934,6 +946,14 @@ def prebuild_fused_moe_ep(
         return None
 
     if use_v3:
+        extra_v3 = (
+            {
+                "lowtok_scores": True,
+                "lowtok_scores_copies": lowtok_scores_copies,
+            }
+            if lowtok_scores
+            else {}
+        )
         return fused_moe_ep_v3.build_op(
             mesh,
             topk,
@@ -943,6 +963,7 @@ def prebuild_fused_moe_ep(
             hidden=hidden,
             inter=inter,
             local_experts=local_experts,
+            **extra_v3,
         )
 
     sharded_plan = envs.MOE_FUSED_EP_V2_SHARDED_PLAN

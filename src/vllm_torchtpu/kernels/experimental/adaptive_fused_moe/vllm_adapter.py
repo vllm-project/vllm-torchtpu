@@ -187,6 +187,7 @@ def prebuild_adaptive_fused_moe(
         lowtok_max_tokens=envs.TPU_MOE_LOWTOK_MAX_TOKENS,
         lowtok_scores=lowtok_scores,
         lowtok_scores_copies=lowtok_scores_copies,
+        small_reduce_scatter_max_rows=envs.TPU_SMALL_ALL_REDUCE_MAX_ROWS,
     )
     logger.info_once(
         "Experimental adaptive fused MoE armed | format=%s W1=%d W2=%d "
@@ -434,6 +435,7 @@ def _build_op(
     lowtok_max_tokens: int = 0,
     lowtok_scores: bool = False,
     lowtok_scores_copies: bool = False,
+    small_reduce_scatter_max_rows: int = 0,
 ) -> torch.library.CustomOpDef:
     """The op for this closure, built once per distinct closure and reused.
 
@@ -459,6 +461,7 @@ def _build_op(
         lowtok_max_tokens,
         lowtok_scores,
         lowtok_scores_copies,
+        small_reduce_scatter_max_rows,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -491,7 +494,11 @@ def _build_op(
             activation=activation,
             token_replica_groups=token_replica_groups,
         ):
-            logger.info_once("Adaptive fused MoE: small steps run moe_lowtok")
+            logger.info_once(
+                "Adaptive fused MoE: small steps run moe_lowtok "
+                "(small_reduce_scatter_max_rows=%d)",
+                small_reduce_scatter_max_rows,
+            )
             return moe_lowtok_ep(
                 x,
                 gating,
@@ -504,6 +511,7 @@ def _build_op(
                 topk=topk,
                 renormalize=renormalize,
                 mesh_ep_ranks=mesh_expert_order,
+                small_reduce_scatter_max_rows=small_reduce_scatter_max_rows,
             )
         # The router's top-k selector writes into an f32 accumulator ref, so a
         # bf16 gate output -- which is what the model's gate matmul produces --
@@ -563,7 +571,11 @@ def _build_op(
             activation=activation,
             token_replica_groups=token_replica_groups,
         ):
-            logger.info_once("Adaptive fused MoE: small steps run the scores entry")
+            logger.info_once(
+                "Adaptive fused MoE: small steps run the scores entry "
+                "(small_reduce_scatter_max_rows=%d)",
+                small_reduce_scatter_max_rows,
+            )
             return moe_lowtok_scores_ep(
                 x,
                 gating,
@@ -579,8 +591,10 @@ def _build_op(
                 (copy_w1, copy_w2, copy_w1_scale, copy_w2_scale)
                 if lowtok_scores_copies
                 else None,
+                rank=rank,
                 mesh=mesh,
                 topk=topk,
+                small_reduce_scatter_max_rows=small_reduce_scatter_max_rows,
             )
         return moe(x, w1, w2, w1_scale, w2_scale, gating, rank)
 

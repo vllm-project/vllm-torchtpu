@@ -1113,8 +1113,13 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             from vllm_torchtpu.layers.adapter import small_all_reduce_op
 
             small_all_reduce_op.prebuild(layer.w13_weight.device)
+        use_v3_fused = bool(
+            envs.USE_MOE_FUSED_EP_KERNEL and envs.MOE_FUSED_EP_KERNEL_IMPL == "v3"
+        )
         scores_tables = moe_lowtok_scores.arm(
-            layer, activation_str, adaptive=self._use_adaptive_fused_moe
+            layer,
+            activation_str,
+            adaptive=self._use_adaptive_fused_moe or use_v3_fused,
         )
         if self._use_adaptive_fused_moe:
             self._adaptive_fused_moe_op = adaptive_moe.prebuild_adaptive_fused_moe(
@@ -1147,6 +1152,8 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             topk=layer.moe_config.experts_per_token,
             renormalize=layer.renormalize,
             activation=activation_str,
+            lowtok_scores=scores_tables is not None,
+            lowtok_scores_copies=bool(scores_tables and scores_tables.has_copies),
         )
         setattr(self, FUSED_MOE_EP_OP_ATTR, _ep_op)
         if _ep_op is not None:
@@ -1219,6 +1226,11 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         # issue the all-gather and reduce-scatter themselves.
         fused_ep_armed = fused_moe_ep_supported(self)
         if fused_ep_armed and fused_kernel_takes(x.shape[0]):
+            scores_ops = (
+                moe_lowtok_scores.operands(layer, x)
+                if envs.MOE_FUSED_EP_KERNEL_IMPL == "v3"
+                else ()
+            )
             out = fused_moe_ep(
                 self,
                 x,
@@ -1228,6 +1240,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 layer.w2_weight_scale_inv,
                 router_logits,
                 score_bias_operand(layer),
+                scores_operands=scores_ops,
             )
             return retain_fork_graph_inputs(out, layer._experts_start)
         from vllm_torchtpu.layers.adapter.moe_tp_decode import (

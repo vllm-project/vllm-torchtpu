@@ -119,6 +119,8 @@ def build_op(
     hidden: int,
     inter: int,
     local_experts: int,
+    lowtok_scores: bool = False,
+    lowtok_scores_copies: bool = False,
 ):
     """The v3 op for this closure, built once per distinct closure.
 
@@ -133,8 +135,16 @@ def build_op(
         layout,
     )
     from vllm_torchtpu.kernels.fused_moe.v3 import layer as kernel_layer
+    from vllm_torchtpu.kernels.moe_lowtok.expert_parallel import (
+        moe_lowtok_ep,
+        moe_lowtok_ep_serves,
+        moe_lowtok_scores_ep,
+    )
+    from vllm_torchtpu.kernels.moe_lowtok.kernel import LANES
 
     drop_nan_rows = bool(envs.TPU_MOE_SKIP_PADDED_TOKENS)
+    lowtok_max_tokens = int(envs.TPU_MOE_LOWTOK_MAX_TOKENS)
+    small_reduce_scatter_max_rows = int(envs.TPU_SMALL_ALL_REDUCE_MAX_ROWS)
     key = (
         topk,
         renormalize,
@@ -144,6 +154,10 @@ def build_op(
         inter,
         local_experts,
         drop_nan_rows,
+        lowtok_max_tokens,
+        lowtok_scores,
+        lowtok_scores_copies,
+        small_reduce_scatter_max_rows,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -177,6 +191,37 @@ def build_op(
         gating: jax.Array,
         rank: jax.Array,
     ) -> jax.Array:
+        if lowtok_max_tokens > 0 and moe_lowtok_ep_serves(
+            x,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            ep=ep,
+            max_tokens=lowtok_max_tokens,
+            activation=activation,
+            token_replica_groups=None,
+        ):
+            logger.info_once(
+                "Fused EP MoE v3: small steps (<=%d rows) run moe_lowtok "
+                "(small_reduce_scatter_max_rows=%d)",
+                lowtok_max_tokens,
+                small_reduce_scatter_max_rows,
+            )
+            return moe_lowtok_ep(
+                x,
+                gating,
+                rank,
+                w1,
+                w2,
+                w1_scale,
+                w2_scale,
+                mesh=mesh,
+                topk=topk,
+                renormalize=renormalize,
+                mesh_ep_ranks=mesh_expert_order,
+                small_reduce_scatter_max_rows=small_reduce_scatter_max_rows,
+            )
         gating = gating.astype(jnp.float32)
         if expert_order is not None:
             # The kernel reads expert id e as mesh index e // local_experts,
@@ -221,12 +266,71 @@ def build_op(
         if not _OPS
         else f"{FUSED_MOE_EP_V3_OP_NAME}_{len(_OPS)}"
     )
+
+    def moe_from_scores(
+        x: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array,
+        w2_scale: jax.Array,
+        gating: jax.Array,
+        rank: jax.Array,
+        padding: jax.Array,
+        tables: jax.Array,
+        primary: jax.Array,
+        copy: jax.Array,
+        hot_onehot: jax.Array,
+        copy_w1: jax.Array,
+        copy_w2: jax.Array,
+        copy_w1_scale: jax.Array,
+        copy_w2_scale: jax.Array,
+    ) -> jax.Array:
+        if gating.shape[1] == LANES and moe_lowtok_ep_serves(
+            x,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            ep=ep,
+            max_tokens=lowtok_max_tokens,
+            activation=activation,
+            token_replica_groups=None,
+        ):
+            logger.info_once(
+                "Fused EP MoE v3: small steps (<=%d rows) run moe_lowtok_scores "
+                "(copies=%s small_reduce_scatter_max_rows=%d)",
+                lowtok_max_tokens,
+                lowtok_scores_copies,
+                small_reduce_scatter_max_rows,
+            )
+            return moe_lowtok_scores_ep(
+                x,
+                gating,
+                padding,
+                tables,
+                primary,
+                copy,
+                hot_onehot,
+                w1,
+                w2,
+                w1_scale,
+                w2_scale,
+                (copy_w1, copy_w2, copy_w1_scale, copy_w2_scale)
+                if lowtok_scores_copies
+                else None,
+                rank=rank,
+                mesh=mesh,
+                topk=topk,
+                small_reduce_scatter_max_rows=small_reduce_scatter_max_rows,
+            )
+        return moe(x, w1, w2, w1_scale, w2_scale, gating, rank)
+
     spec = PartitionSpec(EP_AXIS_NAME)
     op = jax_op(
         name,
-        moe,
+        moe_from_scores if lowtok_scores else moe,
         mesh=mesh,
-        input_partition_specs=(spec,) * 7,
+        input_partition_specs=(spec,) * (16 if lowtok_scores else 7),
         output_partition_specs=spec,
     )
 
@@ -265,6 +369,8 @@ def fused_kernel_takes(rows: int) -> bool:
     """
     if envs.MOE_FUSED_EP_KERNEL_IMPL != "v3":
         return True
+    if envs.TPU_MOE_LOWTOK_MAX_TOKENS > 0:
+        return True
     threshold = envs.TPU_MOE_FUSED_EP_STEP_MIN_TOKENS
     return threshold <= 0 or rows >= threshold
 
@@ -283,6 +389,7 @@ def retain_fork_graph_inputs(
     """
     if (
         envs.MOE_FUSED_EP_KERNEL_IMPL != "v3"
+        or envs.TPU_MOE_LOWTOK_MAX_TOKENS > 0
         or envs.TPU_MOE_FUSED_EP_STEP_MIN_TOKENS <= 0
     ):
         return output
