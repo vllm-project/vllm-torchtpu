@@ -19,9 +19,9 @@ the mel features into 100-frame windows with
 reciprocal multiply, so every exact window multiple rounds up (800 / 100 ->
 8.000001 -> 9 windows) and the following ``split`` raises because the window
 lengths no longer add up to the input. CPU computes the same expression
-exactly, which is why the CPU unit tests in test_omni_platform.py cannot see
-the bug. ``maybe_patch_qwen3_omni_thinker`` moves ``feature_lens`` to CPU
-for that computation.
+exactly, which is why the CPU unit tests in test_qwen3omni_thinker_patch.py
+cannot see the bug. ``maybe_patch_qwen3_omni_thinker`` moves ``feature_lens``
+to CPU for that computation.
 
 The tests build the real encoder with the real chunking geometry (128 mel
 bins, three stride-2 convolutions, 100-frame windows, 800-frame attention
@@ -66,7 +66,7 @@ from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
     Qwen3OmniMoeAudioEncoder,
 )
 
-from tests_omni.omni_test_utils import assert_numerical_parity
+from tests_omni.omni_test_utils import assert_parity
 from vllm_torchtpu.omni.patches.qwen3omni_thinker import (
     _AUDIO_CHUNK_LENGTHS_PATCHED,
     maybe_patch_qwen3_omni_thinker,
@@ -83,14 +83,12 @@ MIXED_BATCH = [800, 250, 200, 30]
 # The exact multiple the patch rewrites and one partial-window neighbour.
 PARITY_LENGTHS = [800, 801]
 
-# Measured on TPU v6e (bf16 encoder vs the CPU reference, 799-801 frames): max
-# abs diff 0.0017 on outputs of magnitude ~0.19, cosine similarity 0.99998;
-# batched vs alone identical except the 30-frame sample (max abs diff 0.0015).
-# assert_numerical_parity's defaults (atol=rtol=1e-2, cos >= 0.999) leave ~6x
-# headroom.
-PARITY_ATOL = 1e-2
-PARITY_RTOL = 1e-2
-PARITY_MIN_COS_SIM = 0.999
+# Measured on TPU v6e (bf16 encoder vs the float32 CPU reference, 799-3200
+# frames): relative L2 error 5.9e-3, max abs diff 1.7e-3 on outputs of
+# magnitude ~0.19; batched vs alone identical except the 30-frame sample
+# (5.4e-3 / 1.5e-3). The gates leave ~5x headroom.
+PARITY_MAX_REL_L2 = 3e-2
+PARITY_MAX_ABS = 1e-2
 
 
 def _thinker_model_config() -> SimpleNamespace:
@@ -233,7 +231,7 @@ class Encoders(NamedTuple):
 @pytest.fixture(scope="module")
 def tpu_device() -> torch.device:
     # Fail, not skip: the Omni lanes always run on a TPU, so a missing device
-    # means the host is broken and must not turn the file into 14 green skips.
+    # means the host is broken and must not turn the file into green skips.
     if not torch.accelerator.is_available():
         pytest.fail("Needs a TPU: the chunk-length bug is in TPU float division.")
     return torch.device("tpu")
@@ -271,30 +269,46 @@ def dist_ctx(tpu_device: torch.device) -> Generator[None, None, None]:
 
 
 @pytest.fixture(scope="module")
-def encoders(dist_ctx: None, tpu_device: torch.device) -> Encoders:
+def encoders(
+    dist_ctx: None, tpu_device: torch.device
+) -> Generator[Encoders, None, None]:
     """A bf16 TPU encoder and a float32 CPU reference sharing one set of weights.
 
     The TPU encoder runs the patched forward, as in production. The CPU
     reference runs the same module with native custom ops.
     """
-    # The registry callback with a thinker-stage config: the same path
-    # TPUWorker.load_model() takes in production. Idempotent.
-    assert maybe_patch_qwen3_omni_thinker(_thinker_model_config()) is True
-    assert getattr(
-        Qwen3OmniMoeAudioEncoder.forward, _AUDIO_CHUNK_LENGTHS_PATCHED, False
-    )
+    # The callback rewrites two attributes on the shared class. Register them
+    # first so the class is restored for the test modules that run after this
+    # one in the same process.
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(
+            Qwen3OmniMoeAudioEncoder, "forward", Qwen3OmniMoeAudioEncoder.forward
+        )
+        mp.setattr(
+            Qwen3OmniMoeAudioEncoder,
+            "_get_cnn_output_lengths",
+            Qwen3OmniMoeAudioEncoder._get_cnn_output_lengths,
+        )
+        # The registry callback with a thinker-stage config: the same path
+        # TPUWorker.load_model() takes in production. Idempotent.
+        assert maybe_patch_qwen3_omni_thinker(_thinker_model_config()) is True
+        assert getattr(
+            Qwen3OmniMoeAudioEncoder.forward, _AUDIO_CHUNK_LENGTHS_PATCHED, False
+        )
 
-    config = _tiny_audio_config()
-    torch.manual_seed(0)
-    cpu_encoder = Qwen3OmniMoeAudioEncoder(config).eval()
-    _init_linear_weights(cpu_encoder, seed=0)
-    assert all(torch.isfinite(p).all() for p in cpu_encoder.parameters())
-    _route_custom_ops_to_cpu(cpu_encoder)
+        config = _tiny_audio_config()
+        torch.manual_seed(0)
+        cpu_encoder = Qwen3OmniMoeAudioEncoder(config).eval()
+        _init_linear_weights(cpu_encoder, seed=0)
+        assert all(torch.isfinite(p).all() for p in cpu_encoder.parameters())
+        _route_custom_ops_to_cpu(cpu_encoder)
 
-    tpu_encoder = Qwen3OmniMoeAudioEncoder(config).eval()
-    tpu_encoder.load_state_dict(cpu_encoder.state_dict())
-    tpu_encoder = tpu_encoder.to(tpu_device).to(torch.bfloat16)
-    return Encoders(tpu_encoder, cpu_encoder, config.n_window * 2, config.num_mel_bins)
+        tpu_encoder = Qwen3OmniMoeAudioEncoder(config).eval()
+        tpu_encoder.load_state_dict(cpu_encoder.state_dict())
+        tpu_encoder = tpu_encoder.to(tpu_device).to(torch.bfloat16)
+        yield Encoders(
+            tpu_encoder, cpu_encoder, config.n_window * 2, config.num_mel_bins
+        )
 
 
 def test_tpu_float_ceil_still_inexact_for_window_multiples(
@@ -352,12 +366,12 @@ def test_audio_encoder_mixed_batch_on_tpu(encoders: Encoders) -> None:
     for n_frames, feats, n_tokens in zip(MIXED_BATCH, per_sample, expected):
         alone = _encode(encoders.tpu, feats, [n_frames], encoders.window)
         assert alone.shape[0] == n_tokens
-        assert_numerical_parity(
-            out[row : row + n_tokens].cpu(),
-            alone.cpu(),
-            atol=PARITY_ATOL,
-            rtol=PARITY_RTOL,
-            min_cos_sim=PARITY_MIN_COS_SIM,
+        assert_parity(
+            out[row : row + n_tokens],
+            alone,
+            name=f"audio encoder {n_frames} frames, batched vs alone",
+            max_rel_l2=PARITY_MAX_REL_L2,
+            max_abs=PARITY_MAX_ABS,
         )
         row += n_tokens
 
@@ -369,10 +383,10 @@ def test_audio_encoder_matches_cpu_reference(encoders: Encoders, n_frames: int) 
     reference = _encode(encoders.cpu, feats, [n_frames], encoders.window)
     out = _encode(encoders.tpu, feats, [n_frames], encoders.window)
     assert out.shape == reference.shape
-    assert_numerical_parity(
-        out.cpu(),
+    assert_parity(
+        out,
         reference,
-        atol=PARITY_ATOL,
-        rtol=PARITY_RTOL,
-        min_cos_sim=PARITY_MIN_COS_SIM,
+        name=f"audio encoder {n_frames} frames, TPU bf16 vs CPU float32",
+        max_rel_l2=PARITY_MAX_REL_L2,
+        max_abs=PARITY_MAX_ABS,
     )

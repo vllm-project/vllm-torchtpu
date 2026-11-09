@@ -37,9 +37,10 @@ class OmniTPUModelRunner(TPUModelRunner):
         self.model_stage: str | None = None
         self.stage_id: int | None = None
         if isinstance(self.model_config, OmniModelConfig):
-            # The cast is for the type checker only: where vllm-omni is not
-            # installed, ``OmniModelConfig`` resolves to ``Any`` and the
-            # isinstance check above does not narrow ``ModelConfig``.
+            # The cast is for the type checker only. The full-environment check
+            # runs without vllm-omni installed, so there ``OmniModelConfig``
+            # resolves to ``Any`` and the isinstance check above does not
+            # narrow ``ModelConfig``; at runtime the import above is real.
             omni_config = cast(OmniModelConfig, self.model_config)
             self.model_stage = omni_config.model_stage
             self.stage_id = omni_config.stage_id
