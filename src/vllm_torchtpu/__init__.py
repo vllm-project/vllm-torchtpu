@@ -2011,9 +2011,10 @@ def _patch_vllm_merge_dsv41_swa_groups() -> None:
     if not getattr(patched, "_tpu_merge_swa_groups_patch", False):
         original = patched
 
+        # Pass every argument through: vLLM v0.33.0 added global_kv_cache_groups.
         @functools.wraps(original)
-        def patched(vllm_config, kv_cache_specs, available_memory):
-            configs = original(vllm_config, kv_cache_specs, available_memory)
+        def patched(*args, **kwargs):
+            configs = original(*args, **kwargs)
             return [merge_swa_groups(config) for config in configs]
 
         # pyrefly: ignore[missing-attribute]
