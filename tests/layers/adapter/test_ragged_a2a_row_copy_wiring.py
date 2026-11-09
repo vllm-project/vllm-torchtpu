@@ -11,7 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Op wiring of the ragged all-to-all row copy knobs."""
+"""Op wiring of the ragged all-to-all row copy knobs and the row scatter's
+send index."""
 
 from types import SimpleNamespace
 from unittest import mock
@@ -86,3 +87,40 @@ def test_row_copy_knobs_reach_the_exchange(monkeypatch, row_gather, row_scatter)
 def test_row_copy_knobs_need_the_sorted_plan(monkeypatch, knob):
     with pytest.raises(ValueError, match=f"{knob} needs TPU_MOE_A2A_SORTED_PLAN"):
         _build_op(monkeypatch, TPU_MOE_A2A_SORTED_PLAN=False, **{knob: True})
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("rows_minor", [False, True])
+def test_send_index_rows_minor_reaches_the_exchange(monkeypatch, rows_minor):
+    seen = _build_op(
+        monkeypatch,
+        TPU_MOE_A2A_SORTED_PLAN=True,
+        TPU_MOE_A2A_ROW_SCATTER=True,
+        TPU_MOE_A2A_SEND_INDEX_ROWS_MINOR=rows_minor,
+    )
+    assert seen["row_scatter"] is True
+    assert seen["send_index_rows_minor"] is rows_minor
+
+
+@pytest.mark.cpu_test
+def test_send_index_rows_minor_needs_the_row_scatter(monkeypatch):
+    with pytest.raises(
+        ValueError,
+        match="TPU_MOE_A2A_SEND_INDEX_ROWS_MINOR needs TPU_MOE_A2A_ROW_SCATTER",
+    ):
+        _build_op(
+            monkeypatch,
+            TPU_MOE_A2A_SORTED_PLAN=True,
+            TPU_MOE_A2A_ROW_SCATTER=False,
+            TPU_MOE_A2A_SEND_INDEX_ROWS_MINOR=True,
+        )
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("rows_minor", [False, True])
+def test_send_index_rows_minor_is_in_the_compile_key(monkeypatch, rows_minor):
+    from vllm_torchtpu.compilation.tpu_compiler import _tpu_compile_env_factors
+
+    monkeypatch.setenv("TPU_MOE_A2A_SEND_INDEX_ROWS_MINOR", str(int(rows_minor)))
+    factors = _tpu_compile_env_factors()
+    assert factors["TPU_MOE_A2A_SEND_INDEX_ROWS_MINOR"] is rows_minor

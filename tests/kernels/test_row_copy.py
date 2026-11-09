@@ -19,6 +19,7 @@ import numpy as np
 import pytest
 
 from vllm_torchtpu.kernels.megablox.row_copy import gather_rows
+from vllm_torchtpu.layers.core import ragged_a2a_moe
 from vllm_torchtpu.layers.core.fused_moe_gmm import onehot_permute
 from vllm_torchtpu.layers.core.ragged_a2a_moe import _scatter_send, _tile_rows
 
@@ -130,3 +131,131 @@ def test_copy_send_rows_writes_the_send_rows(num_members, num_tokens, routing):
     assert got.shape == want_shape.shape
     want = np.asarray(x).view(np.uint16)[index].reshape(want_shape.shape)
     np.testing.assert_array_equal(np.asarray(got).view(np.uint16)[:total], want[:total])
+
+
+def _need(rng, num_tokens, num_members, routing):
+    """Whether token t goes to member d [S, D]: ``random`` (each member
+    about half the tokens), ``skewed`` (most tokens to member 0, a few to
+    the others), ``dense`` (every token to most members), ``unrouted`` (the
+    last fifth of the tokens to none) or ``none``."""
+    if routing == "none":
+        return np.zeros((num_tokens, num_members), bool)
+    p = {"random": 0.5, "skewed": 0.05, "dense": 0.9, "unrouted": 0.5}[routing]
+    need = rng.random((num_tokens, num_members)) < p
+    if routing == "skewed":
+        need[:, 0] = rng.random(num_tokens) < 0.95
+    if routing == "unrouted":
+        need[num_tokens - max(1, num_tokens // 5) :] = False
+    return need
+
+
+def _send_rows(need, rows, layout):
+    """The send row of each (token, member) pair [S, D] (``rows``: not
+    sent): the capacity exchange's gapless destination groups (positions
+    past the buffer are dropped), or the full-size exchange's region of S
+    rows per member."""
+    num_tokens, num_members = need.shape
+    rank = np.cumsum(need, axis=0) - 1
+    if layout == "regions":
+        start = np.arange(num_members) * num_tokens
+    else:
+        sizes = need.sum(axis=0)
+        start = np.cumsum(sizes) - sizes
+    return np.where(need, start + rank, rows).astype(np.int32)
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("num_members", [2, 8, 16, 32])
+@pytest.mark.parametrize("layout", ["capacity", "regions"])
+def test_send_index_rows_minor_matches_the_default(monkeypatch, num_members, layout):
+    """The index and count `_scatter_send` hands `copy_send_rows` with
+    ``rows_minor`` equal the default's on every row: capacity buffers from one
+    row to the whole step (smaller than the step: positions past the buffer
+    dropped) and the full-size exchange's regions, with empty, partial and
+    full destination groups."""
+    monkeypatch.setattr(
+        ragged_a2a_moe, "copy_send_rows", lambda x, index, count, rows: (index, count)
+    )
+    send = jax.jit(
+        lambda x, out_row, rows, rows_minor: _scatter_send(
+            x, out_row, rows=rows, rows_minor=rows_minor
+        ),
+        static_argnames=("rows", "rows_minor"),
+    )
+    rng = np.random.default_rng(num_members)
+    for num_tokens in (4, 13, 104, 128):
+        x = jnp.zeros((num_tokens, 128), jnp.bfloat16)
+        slots = num_members * num_tokens
+        if layout == "regions":
+            row_counts = [slots]
+        else:
+            row_counts = sorted({1, 2, 15, 16, 17, slots // 3, slots // 2, slots})
+        for rows in row_counts:
+            for routing in ("random", "skewed", "dense", "unrouted", "none"):
+                out_row = jnp.asarray(
+                    _send_rows(
+                        _need(rng, num_tokens, num_members, routing), rows, layout
+                    )
+                )
+                want = send(x, out_row, rows=rows, rows_minor=False)
+                got = send(x, out_row, rows=rows, rows_minor=True)
+                np.testing.assert_array_equal(np.asarray(got[0]), np.asarray(want[0]))
+                np.testing.assert_array_equal(np.asarray(got[1]), np.asarray(want[1]))
+
+
+@pytest.mark.parametrize(
+    "num_members,num_tokens,rows",
+    [
+        # Capacity buffers and full-size regions (rows = members x tokens);
+        # at 128 tokens the default sum compiles with the send rows major.
+        (8, 104, 480),
+        (8, 104, 832),
+        (8, 128, 912),
+        (16, 112, 544),
+        (16, 112, 1056),
+        (16, 128, 1216),
+        (16, 128, 2048),
+    ],
+)
+def test_send_index_rows_minor_matches_the_default_on_tpu(
+    monkeypatch, num_members, num_tokens, rows
+):
+    """Compiled for TPU at the exchange's 8- and 16-member sizes, the send
+    index and count with ``rows_minor`` are the default's on every row, for
+    uniform, skewed, overflowing, partly unrouted and empty steps, and the
+    send rows written are the same bits."""
+    _require_tpu()
+    rng = np.random.default_rng(rows)
+    layout = "regions" if rows == num_members * num_tokens else "capacity"
+    x = _rows(rng, num_tokens, 8192)
+
+    def compiled(rows_minor):
+        return jax.jit(
+            lambda x, out_row: _scatter_send(
+                x, out_row, rows=rows, rows_minor=rows_minor
+            )
+        )
+
+    # Traced with copy_send_rows returning its index and count operands.
+    with monkeypatch.context() as m:
+        m.setattr(
+            ragged_a2a_moe,
+            "copy_send_rows",
+            lambda x, index, count, rows: (index, count),
+        )
+        index_default, index_rows_minor = compiled(False), compiled(True)
+        outs = []
+        for routing in ("random", "skewed", "dense", "unrouted", "none"):
+            need = _need(rng, num_tokens, num_members, routing)
+            out_row = jnp.asarray(_send_rows(need, rows, layout))
+            outs.append(
+                (out_row, index_default(x, out_row), index_rows_minor(x, out_row))
+            )
+    send_default, send_rows_minor = compiled(False), compiled(True)
+    for out_row, want, got in outs:
+        np.testing.assert_array_equal(np.asarray(got[0]), np.asarray(want[0]))
+        np.testing.assert_array_equal(np.asarray(got[1]), np.asarray(want[1]))
+        count = int(np.asarray(want[1])[0])
+        sent = np.asarray(send_rows_minor(x, out_row)).view(np.uint16)
+        sent_default = np.asarray(send_default(x, out_row)).view(np.uint16)
+        np.testing.assert_array_equal(sent[:count], sent_default[:count])

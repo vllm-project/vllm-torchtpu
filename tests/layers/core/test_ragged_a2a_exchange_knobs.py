@@ -30,7 +30,9 @@ from vllm_torchtpu.layers.core.fused_moe_gmm import (
 from vllm_torchtpu.layers.core.ragged_a2a_moe import (
     DP_AXIS,
     TP_AXIS,
+    _capacity_overflow,
     _member_index,
+    exchange_capacity,
     owner_dests,
     owner_order,
     ragged_a2a_moe,
@@ -71,6 +73,19 @@ OPTIONS["routing_dma_served"] = dict(
 OPTIONS["routing_dma_owner_tail"] = dict(OPTIONS["routing_dma_served"], owner_tail=True)
 CASES += [("routing_dma", "owner"), ("routing_dma_owner_tail", "owner")] + [
     ("routing_dma_served", combine) for combine in ("owner", "streamed")
+]
+# The row scatter's send index summed with the send rows on the minor axis,
+# alone with the row scatter and with the served options.
+OPTIONS["send_index_rows_minor"] = dict(
+    OPTIONS["row_scatter"], send_index_rows_minor=True
+)
+OPTIONS["send_index_rows_minor_served"] = dict(
+    OPTIONS["routing_dma_served"], send_index_rows_minor=True
+)
+CASES += [
+    (option, combine)
+    for option in ("send_index_rows_minor", "send_index_rows_minor_served")
+    for combine in ("owner", "streamed")
 ]
 
 
@@ -426,4 +441,92 @@ def test_row_copy_keeps_every_output_bit_with_special_values(
     )
     base, got = np.asarray(base), np.asarray(got)
     assert np.isfinite(base.astype(np.float32)).all()
+    np.testing.assert_array_equal(got.view(np.uint16), base.view(np.uint16))
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize("combine", ["owner", "streamed"])
+@pytest.mark.parametrize(
+    "dp_size,tp_size,num_tokens,topk,factor,route_factor,routing",
+    [
+        (8, 1, 104, 10, 1.15, 1.5, "uniform"),  # capacity exchange
+        # 128 tokens: the default sum compiles with the send rows major.
+        (8, 1, 128, 10, 1.15, 1.5, "uniform"),
+        (8, 1, 128, 10, 1.15, 1.5, "unrouted"),  # the last 20 tokens unrouted
+        (8, 1, 24, 10, 1.15, 1.5, "skewed"),  # overflows: the full-size exchange
+        (4, 2, 128, 10, 1.15, 1.5, "uniform"),
+        (2, 4, 128, 10, 2.5, 3.0, "uniform"),  # full-size exchange only
+    ],
+)
+def test_send_index_rows_minor_keeps_every_output_bit(
+    combine, dp_size, tp_size, num_tokens, topk, factor, route_factor, routing
+):
+    """With the served exchange options, the row scatter's send index summed
+    with the send rows on the minor axis gives every output bit of the
+    default sum: capacity steps, steps with unrouted tokens (id -1, weight
+    0), a step that overflows into the full-size exchange, and full-size
+    layouts."""
+    devices = _require_eight_tpu_devices()
+    mesh = Mesh(np.asarray(devices).reshape(dp_size, tp_size), (DP_AXIS, TP_AXIS))
+    x, w1, w2, s1, s2, weights, ids, es = _inputs(
+        8, tp_size, num_tokens, 64, topk=topk, skew=routing == "skewed"
+    )
+    if routing == "unrouted":
+        ids = ids.reshape(8, num_tokens, topk).at[:, -20:].set(-1).reshape(-1, topk)
+        weights = weights.reshape(8, num_tokens, topk).at[:, -20:].set(0)
+        weights = weights.reshape(-1, topk)
+    stacked = tuple(
+        a.reshape(dp_size, tp_size, -1, *a.shape[1:])
+        for a in (x, w1, w2, s1, s2, weights, ids, es)
+    )
+    threshold = resolve_onehot_permute_threshold(dp_size * num_tokens * topk)
+    rows, routes = exchange_capacity(
+        dp_size=dp_size,
+        tp_size=tp_size,
+        num_tokens=num_tokens,
+        topk=topk,
+        local_num_experts=64 // 8,
+        factor=factor,
+        onehot_moe_permute_threshold=threshold,
+        use_sparse_core=True,
+        route_factor=route_factor,
+    )
+    if rows < dp_size * num_tokens:
+        # The TP ranks of an engine hold the same routing.
+        overflow = _capacity_overflow(
+            stacked[6][:, 0],
+            tp_size=tp_size,
+            local_num_experts=64 // 8,
+            rows=rows,
+            routes=routes,
+        )
+        assert bool(overflow) == (routing == "skewed")
+    common = dict(
+        mesh=mesh,
+        topk=topk,
+        activation="silu",
+        use_sparse_core=True,
+        onehot_moe_permute_threshold=threshold,
+        capacity_factor=factor,
+        route_factor=route_factor,
+        streamed_combine=combine == "streamed",
+        owner_combine=combine == "owner",
+        sorted_plan=True,
+        row_gather=True,
+        row_scatter=True,
+        routing_dma=True,
+    )
+    kwargs = {}
+    if combine == "owner":
+        rng = np.random.default_rng(3)
+        kwargs["shared"] = jnp.asarray(
+            rng.standard_normal((dp_size, tp_size, num_tokens, HIDDEN)) / 8,
+            jnp.bfloat16,
+        )
+    base = jax.jit(functools.partial(ragged_a2a_moe, **common))(*stacked, **kwargs)
+    got = jax.jit(
+        functools.partial(ragged_a2a_moe, **common, send_index_rows_minor=True)
+    )(*stacked, **kwargs)
+    base, got = np.asarray(base), np.asarray(got)
+    assert np.abs(base.astype(np.float32)).max() > 0
     np.testing.assert_array_equal(got.view(np.uint16), base.view(np.uint16))

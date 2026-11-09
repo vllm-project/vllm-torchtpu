@@ -580,14 +580,26 @@ def _receive_buffer(sent, row_gather):
     return jnp.zeros_like(sent)
 
 
-def _scatter_send(x, out_row, *, rows):
+def _scatter_send(x, out_row, *, rows, rows_minor=False):
     """The send buffer [rows, 16, H / 16] written by `copy_send_rows`: token
     ``t``'s row at ``out_row[t, d]`` for each member ``d`` it goes to
-    (``out_row`` [S, D], ``rows`` where it does not)."""
+    (``out_row`` [S, D], ``rows`` where it does not).
+
+    The token of each send row is a compare-and-sum over every (token,
+    member) pair: at most one pair names a row, so the int32 sum is that
+    token, or 0. Over [rows, S, D], XLA may put the tokens on the lanes and
+    the rows on the major axis, and then reduces each row on its own;
+    ``rows_minor`` sums over [S, D, rows], which keeps the send rows on the
+    lanes or the sublanes. Same int32 terms, same index."""
     num_tokens = x.shape[0]
-    token = jnp.arange(num_tokens, dtype=jnp.int32)[:, None]
-    row = jnp.arange(rows, dtype=jnp.int32)[:, None, None]
-    index = jnp.where(out_row[None] == row, token[None], 0).sum(axis=(1, 2))
+    if rows_minor:
+        token = jnp.arange(num_tokens, dtype=jnp.int32)[:, None, None]
+        row = jnp.arange(rows, dtype=jnp.int32)
+        index = jnp.where(out_row[:, :, None] == row, token, 0).sum(axis=(0, 1))
+    else:
+        token = jnp.arange(num_tokens, dtype=jnp.int32)[:, None]
+        row = jnp.arange(rows, dtype=jnp.int32)[:, None, None]
+        index = jnp.where(out_row[None] == row, token[None], 0).sum(axis=(1, 2))
     count = jnp.max(jnp.where(out_row < rows, out_row + 1, 0), initial=0)
     return copy_send_rows(x, index, count[None], rows)
 
@@ -607,6 +619,7 @@ def _full_exchange(
     plan=None,
     row_gather=False,
     row_scatter=False,
+    send_index_rows_minor=False,
 ):
     """One receive region per DP member, sized for all of its tokens.
 
@@ -614,7 +627,8 @@ def _full_exchange(
     outputs to their senders instead of the return exchange; with ``plan`` too
     (see ``ragged_a2a_moe_local``), it gets its routes from `route_plan`, and
     with ``row_gather`` it copies their rows out of the receive buffer;
-    ``row_scatter`` writes the send buffer with `copy_send_rows`."""
+    ``row_scatter`` writes the send buffer with `copy_send_rows`, its send
+    index laid out rows-minor with ``send_index_rows_minor``."""
     num_tokens, hidden = x.shape
     local_num_experts = w1.shape[0]
     ep_rank = experts_start[0] // local_num_experts
@@ -675,7 +689,7 @@ def _full_exchange(
         recv_ids, recv_weights = read_routes(source_row)
 
     if planned and row_scatter:
-        sent = _scatter_send(x, slot_out, rows=slots)
+        sent = _scatter_send(x, slot_out, rows=slots, rows_minor=send_index_rows_minor)
     else:
         sent = _tile_rows(x[send_index])
     gather = planned and row_gather
@@ -757,6 +771,7 @@ def _capacity_exchange(
     routes=0,
     row_gather=False,
     row_scatter=False,
+    send_index_rows_minor=False,
 ):
     """Send and receive buffers of ``rows`` rows, filled without gaps.
 
@@ -774,7 +789,8 @@ def _capacity_exchange(
     side gets its ``routes`` routes from `route_plan` and the receive rows'
     sources and routes are never materialized; with ``row_gather`` it copies
     their rows out of the receive buffer, and ``row_scatter`` writes the send
-    buffer with `copy_send_rows`.
+    buffer with `copy_send_rows` (its send index laid out rows-minor with
+    ``send_index_rows_minor``).
     """
     num_tokens, hidden = x.shape
     local_num_experts = w1.shape[0]
@@ -840,7 +856,12 @@ def _capacity_exchange(
                 + jnp.cumsum(need_any, axis=0, dtype=jnp.int32)
                 - 1
             )
-            sent = _scatter_send(x, jnp.where(need_any, out_row, rows), rows=rows)
+            sent = _scatter_send(
+                x,
+                jnp.where(need_any, out_row, rows),
+                rows=rows,
+                rows_minor=send_index_rows_minor,
+            )
         else:
             sent = _tile_rows(x[send_index])
         received = jax.lax.ragged_all_to_all(
@@ -1426,6 +1447,7 @@ def ragged_a2a_moe_local(
     sorted_plan: bool = False,
     owner_tail: bool = False,
     routing_dma: bool = False,
+    send_index_rows_minor: bool = False,
     shared: jax.Array | None = None,
 ) -> jax.Array:
     """Per-rank body (inside shard_map over the (dp, tp) mesh).
@@ -1473,9 +1495,14 @@ def ragged_a2a_moe_local(
     ``routing_dma``: the DP group's packed routing is all-gathered by one
     kernel of remote DMAs (`dma_all_gather`) instead of XLA's ring
     all-gather, whose steps each wait on the previous one (same words).
+    ``send_index_rows_minor`` (with ``row_scatter``): the send index (the
+    token each send row copies) sums its compare over [S, D, rows] instead
+    of [rows, S, D], so XLA keeps the send rows on a vector tile axis
+    instead of reducing each row across the lanes (same index).
     """
     assert shared is None or owner_combine
     assert not owner_tail or owner_combine
+    assert not send_index_rows_minor or row_scatter
     num_tokens = x.shape[0]
     local_num_experts = w1.shape[0]
     slots = dp_size * num_tokens
@@ -1622,6 +1649,7 @@ def ragged_a2a_moe_local(
             plan=plan,
             row_gather=row_gather,
             row_scatter=row_scatter,
+            send_index_rows_minor=send_index_rows_minor,
         )
         return finish(out, full_streamed is not None)
 
@@ -1670,6 +1698,7 @@ def ragged_a2a_moe_local(
         routes=routes,
         row_gather=row_gather,
         row_scatter=row_scatter,
+        send_index_rows_minor=send_index_rows_minor,
     )
     out = finish(out, capacity_streamed is not None)
     return jax.lax.cond(overflow, full, lambda: out)
@@ -1702,6 +1731,7 @@ def ragged_a2a_moe(
     sorted_plan: bool = False,
     owner_tail: bool = False,
     routing_dma: bool = False,
+    send_index_rows_minor: bool = False,
     shared: jax.Array | None = None,
 ) -> jax.Array:
     """Global-view entry: every operand is the ranks' local arrays stacked on
@@ -1729,6 +1759,7 @@ def ragged_a2a_moe(
         sorted_plan=sorted_plan,
         owner_tail=owner_tail,
         routing_dma=routing_dma,
+        send_index_rows_minor=send_index_rows_minor,
     )
 
     scaled = w1_scale is not None
