@@ -5778,6 +5778,9 @@ class TPUModelRunner(GPUModelRunner):
         )
         self.vllm_config.quant_config = get_tpu_quantization_config(self.vllm_config)
 
+        # No placed layers or target depth left over from an earlier load.
+        expert_placement.reset_model_state()
+
         model_loader = get_model_loader(self.load_config)
         logger.info("Loading model from scratch...")
         with (

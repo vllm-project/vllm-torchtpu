@@ -211,9 +211,19 @@ def _load(path: str) -> Placement:
     return parse(table, path)
 
 
+def reset_model_state() -> None:
+    """Forget the layers placed so far and the target's depth, so a second
+    model load in the process starts from nothing; the table read is kept."""
+    _target_layers.cache_clear()
+    _APPLIED_LAYERS.clear()
+    _PERMUTED_LAYERS.clear()
+
+
 def clear_cache() -> None:
-    """Forget every table read so far, for a caller that rewrites one."""
+    """Forget every table read so far, for a caller that rewrites one, and
+    every model's placement state."""
     _load.cache_clear()
+    reset_model_state()
 
 
 def current() -> Placement | None:
@@ -331,9 +341,17 @@ def apply(runner) -> bool:
             f"expert placement: {name} holds {manager.local_num_experts} "
             f"experts on rank {rank}, the placement {len(held)}"
         )
-    expert_map = torch.full((placement.experts,), -1, dtype=torch.int32)
-    expert_map[list(held)] = torch.arange(len(held), dtype=torch.int32)
-    manager._expert_map = expert_map.to(manager.expert_map.device)
+    # Built on the host: the runner is built under the target device, where
+    # the scatter would run on the chip and cost a host sync per layer.
+    expert_map = torch.full((placement.experts,), -1, dtype=torch.int32, device="cpu")
+    expert_map[list(held)] = torch.arange(len(held), dtype=torch.int32, device="cpu")
+    # A single shard leaves no expert map to take the device from.
+    device = (
+        manager.expert_map.device
+        if manager.expert_map is not None
+        else torch.get_default_device()
+    )
+    manager._expert_map = expert_map.to(device)
     layer.update_expert_map_info()
     setattr(layer, EXPERT_ORDER_ATTR, placement.slot_order(layer_idx))
     _APPLIED_LAYERS[layer_idx] = rank

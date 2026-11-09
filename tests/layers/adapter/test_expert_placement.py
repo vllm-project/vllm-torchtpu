@@ -231,6 +231,53 @@ def test_apply_maps_slots_and_gates_the_fetch_filter(placement_file):
     assert expert_placement.fetch_filter_ids("mtp.0.ffn.experts.0.w1") is None
 
 
+def test_the_expert_map_is_built_on_the_host(placement_file):
+    """The runner is built under the target device; the map must not be
+    scattered there."""
+    runner = _Runner("model.layers.3.ffn.experts", rank=1)
+    with torch.device("meta"):
+        assert expert_placement.apply(runner)
+    layer = runner.routed_experts
+    assert layer._expert_map.device == torch.device("cpu")
+    assert layer._expert_map.tolist() == [-1, 0, -1, 2, 3, -1, 1, -1]
+
+
+def test_a_single_shard_without_an_expert_map_is_placed(tmp_path, monkeypatch):
+    path = tmp_path / "placement.json"
+    path.write_text(json.dumps(_table(shards=1, layers={"3": [list(ORDER)]})))
+    monkeypatch.setenv("TPU_EXPERT_PLACEMENT", str(path))
+    runner = _Runner("model.layers.3.ffn.experts", shards=1)
+    # With one shard vLLM builds no expert map.
+    runner.routed_experts.expert_map_manager.expert_map = None
+    assert expert_placement.apply(runner)
+    assert runner.routed_experts._expert_map.tolist() == list(range(8))
+    assert expert_placement.expert_order(runner.routed_experts) == ORDER
+
+
+def test_a_second_model_load_starts_from_no_placement_state(
+    placement_file, monkeypatch
+):
+    import vllm.config
+
+    expert_placement.apply(_Runner("model.layers.3.ffn.experts"))
+    assert expert_placement.has_applied_layers()
+    assert expert_placement.layer_index("mtp.0.ffn.experts") == 6
+    expert_placement.reset_model_state()
+    assert not expert_placement.has_applied_layers()
+    # The next model's depth is read afresh for its drafter's layer numbers.
+    text_config = SimpleNamespace(num_hidden_layers=4)
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(text_config=text_config),
+            hf_text_config=text_config,
+        )
+    )
+    monkeypatch.setattr(vllm.config, "get_current_vllm_config", lambda: config)
+    assert expert_placement.layer_index("mtp.0.ffn.experts") == 4
+    # The table read is kept across model loads.
+    assert expert_placement.current() is not None
+
+
 def test_the_fetch_filter_follows_the_rank_the_map_was_built_for(placement_file):
     expert_placement.apply(_Runner("model.layers.3.ffn.experts", rank=0))
     assert expert_placement.fetch_filter_ids(
