@@ -65,7 +65,7 @@ def _release_tpu_between_tests(request):
 
 
 # Spec-decode e2e integration suite, split across the PR and nightly steps in
-# `.buildkite/pipeline_tests.yml` on main (epic/dsv41 runs only the dsv41 lane):
+# `.buildkite/pipeline_tests.yml`:
 #
 #   correctness tests  -- representative cases run at PR time AND nightly.
 #       Basic model-based tests use bs1 + async and batched + sync on PRs,

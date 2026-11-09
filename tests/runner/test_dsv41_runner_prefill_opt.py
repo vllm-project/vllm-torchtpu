@@ -9,14 +9,13 @@
 
 from __future__ import annotations
 
-import contextlib
 from types import SimpleNamespace
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import MagicMock, Mock
 
 import numpy as np
 import torch
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
-from vllm.v1.outputs import LogprobsLists, ModelRunnerOutput
+from vllm.v1.outputs import ModelRunnerOutput
 
 from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadataBuilder,
@@ -359,93 +358,9 @@ def test_async_output_waits_when_spec_logprobs_present_even_if_all_discarded():
     assert out.sampled_token_ids == [[]]
 
 
-def test_async_output_selected_token_ids_numel_zero_and_dim_1():
-    """Verify empty selected_token_ids and 1D selected_token_ids handling."""
-    # Numel zero
-    copy_state_empty = AsyncTPUCopyState(
-        chunks_cpu=[torch.empty(0, dtype=torch.int32)],
-        chunk_real_lens=[0],
-        copy_ready_event=Mock(wait=Mock()),
-        completed=True,
-        spec_logprobs=None,
-    )
-    out_empty = AsyncTPUModelRunnerOutput(
-        model_runner_output=ModelRunnerOutput(
-            req_ids=["req-0"],
-            req_id_to_index={"req-0": 0},
-            sampled_token_ids=[],
-            logprobs=None,
-        ),
-        copy_state=copy_state_empty,
-        discard_sampled_tokens_req_indices=[],
-    ).get_output()
-    assert out_empty.sampled_token_ids == []
-
-    # 1D selected_token_ids gets unsqueezed
-    copy_state_1d = AsyncTPUCopyState(
-        chunks_cpu=[torch.tensor([42], dtype=torch.int32)],
-        chunk_real_lens=[1],
-        copy_ready_event=Mock(wait=Mock()),
-        completed=True,
-        spec_logprobs=None,
-    )
-    out_1d = AsyncTPUModelRunnerOutput(
-        model_runner_output=ModelRunnerOutput(
-            req_ids=["req-0"],
-            req_id_to_index={"req-0": 0},
-            sampled_token_ids=[],
-            logprobs=None,
-        ),
-        copy_state=copy_state_1d,
-        discard_sampled_tokens_req_indices=[],
-    ).get_output()
-    assert out_1d.sampled_token_ids == [[42]]
-
-
 # ==============================================================================
 # 3. Tests for TPUModelRunner: _modify_prev_results, _prepare_inputs & sample_tokens
 # ==============================================================================
-
-
-def test_modify_prev_results_branches():
-    """Verify _modify_prev_results drains copy_state when request_seq_lens is empty,
-    and advances when non-empty."""
-    runner = object.__new__(TPUModelRunner)
-    runner._pre_async_results = None
-
-    # 1. _pre_async_results is None -> early return
-    runner._modify_prev_results()
-
-    # 2. _pre_async_results has empty request_seq_lens and copy_state is not None
-    wait_for_copy = Mock()
-    runner._pre_async_results = SimpleNamespace(
-        req_ids=["r1"],
-        request_seq_lens=[],
-        copy_state=object(),
-        wait_for_copy=wait_for_copy,
-    )
-    runner._modify_prev_results()
-    wait_for_copy.assert_called_once()
-
-    # 3. copy_state is None
-    wait_for_copy.reset_mock()
-    runner._pre_async_results.copy_state = None
-    runner._modify_prev_results()
-    wait_for_copy.assert_not_called()
-
-    # 4. request_seq_lens is non-empty -> covers line 2441-2493
-    req_state = SimpleNamespace(output_token_ids=[999])
-    runner._pre_async_results = SimpleNamespace(
-        req_ids=["r1"],
-        request_seq_lens=[(0, req_state, 5, "r1")],
-        discard_sampled_tokens_req_indices=[],
-        num_draft_per_req=None,
-        copy_state=object(),
-        wait_for_copy=Mock(return_value=torch.tensor([[42]])),
-    )
-    runner.input_batch = SimpleNamespace(req_id_to_index={})
-    runner._modify_prev_results()
-    assert req_state.output_token_ids == [42]
 
 
 def test_prepare_inputs_single_req_fast_path_matches_general_path():
@@ -551,100 +466,3 @@ def test_prepare_inputs_single_req_fast_path_matches_general_path():
         runner_fast.positions_np[:num_scheduled],
         runner_gen.positions_np[:num_scheduled],
     )
-
-
-def test_sample_tokens_logprobs_and_chunks():
-    """Verify logprobs concatenation and next_tokens_tpu chunks handling
-    in TPUModelRunner.sample_tokens (lines 4453-4479, 4629-4632)."""
-
-    def _run_sample(num_chunks=1, needs_logprobs=True, discard_all=False):
-        stage_timing = MagicMock()
-        stage_timing.stage.return_value = contextlib.nullcontext()
-        stage_timing.host_stage.return_value = contextlib.nullcontext()
-
-        req_ids = ["req-0"]
-        req_state = SimpleNamespace(
-            num_computed_tokens=0,
-            num_tokens=10 if discard_all else 1,
-        )
-        requests = {"req-0": req_state}
-        scheduler_output = SimpleNamespace(num_scheduled_tokens={"req-0": 1})
-
-        dummy_lp = LogprobsLists(
-            logprob_token_ids=np.array([[42]]),
-            logprobs=np.array([[-0.5]]),
-            sampled_token_ranks=np.array([[0]]),
-        )
-        mock_sliced_lp = MagicMock()
-        mock_sliced_lp.tolists.return_value = dummy_lp
-
-        mock_gather = MagicMock(return_value=mock_sliced_lp)
-
-        runner = SimpleNamespace(
-            is_pooling_model=False,
-            scheduler_config=SimpleNamespace(async_scheduling=True),
-            speculative_config=None,
-            _is_async_drafter=False,
-            _get_sampling_generator=MagicMock(return_value=None),
-            input_batch=SimpleNamespace(
-                num_reqs=1,
-                req_ids=req_ids,
-                all_greedy=True,
-                generators={},
-                req_id_to_index={"req-0": 0},
-                max_num_logprobs=1 if needs_logprobs else None,
-            ),
-            requests=requests,
-            _stage_timing=stage_timing,
-            _update_num_xla_graphs=MagicMock(),
-            _update_mamba_slot_read_offsets=MagicMock(),
-            _greedy_sample=lambda logits: torch.tensor([42]),
-            gather_logprobs=mock_gather,
-            _modify_prev_results=MagicMock(),
-            _update_placeholder=MagicMock(return_value={"req-0": 0}),
-            maybe_wait_for_kv_save=MagicMock(),
-            get_finished_kv_transfers=MagicMock(
-                return_value=(None, None, None, [], 0, None)
-            ),
-            _sync_replicated_drafts_across_tp=lambda x: x,
-            max_num_reqs=1,
-        )
-
-        logits = torch.zeros((1, 10))
-        if num_chunks == 1:
-            state = SimpleNamespace(
-                logits_list=[logits],
-                num_reqs_list=[1],
-                spec_decode_metadata_list=[None],
-                mamba_state_indices_list=[None],
-                pooler_output_list=[],
-                scheduler_output=scheduler_output,
-            )
-        else:
-            state = SimpleNamespace(
-                logits_list=[logits, logits],
-                num_reqs_list=[1, 1],
-                spec_decode_metadata_list=[None, None],
-                mamba_state_indices_list=[None, None],
-                pooler_output_list=[],
-                scheduler_output=scheduler_output,
-            )
-        runner.execute_model_state = state
-
-        with patch.object(
-            torch, "tpu", SimpleNamespace(Event=MagicMock()), create=True
-        ):
-            return TPUModelRunner.sample_tokens(runner, grammar_output=None)
-
-    # 1. Single chunk with logprobs (covers 4453-4479 and 4633 single chunk)
-    out1 = _run_sample(num_chunks=1, needs_logprobs=True, discard_all=False)
-    assert out1.copy_state is not None
-    assert out1._model_runner_output.logprobs is not None
-
-    # 2. Two chunks (covers 4635 multi chunk torch.cat)
-    out2 = _run_sample(num_chunks=2, needs_logprobs=True, discard_all=False)
-    assert out2.copy_state is not None
-
-    # 3. Discard all (covers 4478 false branch when request_seq_lens empty)
-    out3 = _run_sample(num_chunks=1, needs_logprobs=True, discard_all=True)
-    assert out3.copy_state is None

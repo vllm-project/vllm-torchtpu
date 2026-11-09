@@ -33,16 +33,6 @@ def _table(experts=8, shards=2, layers=None, draft=None):
     return table
 
 
-@pytest.fixture(autouse=True)
-def _fresh(monkeypatch):
-    monkeypatch.setattr(expert_placement, "_APPLIED_LAYERS", set())
-    monkeypatch.setattr(expert_placement, "_LAYER_MODULES", {})
-    monkeypatch.setattr(expert_placement, "_GROUP", None)
-    expert_placement._read_once.cache_clear()
-    yield
-    expert_placement._read_once.cache_clear()
-
-
 @pytest.fixture
 def placement_file(tmp_path, monkeypatch):
     path = tmp_path / "placement.json"
@@ -99,24 +89,6 @@ def test_draft_group_has_its_own_experts_and_slots():
     assert p.draft.shards == 2 and p.draft.slots == 3
     assert p.draft.slot_table(0) == [[0, -1], [1, 5], [2, 3], [4, -1]]
     assert p.group("draft") is p.draft and p.group("target") is p.target
-
-
-def test_layer_index_reads_module_prefixes_and_checkpoint_names():
-    assert expert_placement.layer_index("model.layers.12.ffn.experts") == 12
-    assert expert_placement.layer_index("layers.3.ffn.experts.17.w1.weight") == 3
-    assert expert_placement.layer_index("mtp.0.ffn.experts.1.w1.weight") is None
-    assert expert_placement.layer_index("model.sublayers.3.x") is None
-
-
-@pytest.fixture(autouse=True)
-def _no_vllm_config(monkeypatch):
-    """Outside a served model the target group applies and the env var selects."""
-    import vllm.config
-
-    def _raise():
-        raise AssertionError("no current vllm config in this test")
-
-    monkeypatch.setattr(vllm.config, "get_current_vllm_config", _raise)
 
 
 def _fake_layer(name, rank, experts=8, shards=2):

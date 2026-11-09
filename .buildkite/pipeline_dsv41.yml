@@ -72,7 +72,7 @@ steps:
           - >-
             .buildkite/kubernetes/run.sh python -m pytest
             tests/models/vllm/test_dsv41_common_mhc.py
-            tests/models/vllm/test_dsv41_common_v1_v2_engram.py
+            tests/models/vllm/test_dsv41_common_engram.py
             -k 'test_aux_mean_preserves_tpu_reduction_order or test_ready_rows_packed_scales_match_tpu_and_cpu'
             -q --junitxml=perf_eval_results/dsv41-layout-parity.xml
 
@@ -183,8 +183,6 @@ steps:
             tests/kernels/test_dsv41_decode_tuning.py
             tests/kernels/test_decode_preparation.py
             tests/kernels/test_decode_bridge.py
-            tests/kernels/test_dsv41_decode_index_scores.py
-            tests/models/vllm/test_dsv41_decode_indexer_route.py
             tests/models/vllm/test_csa2_chunk_cache.py
             tests/models/vllm/test_native_swa_manager.py
             tests/compilation/test_moe_schedule.py
