@@ -250,7 +250,8 @@ def test_a_single_shard_without_an_expert_map_is_placed(tmp_path, monkeypatch):
     # With one shard vLLM builds no expert map.
     runner.routed_experts.expert_map_manager.expert_map = None
     assert expert_placement.apply(runner)
-    assert runner.routed_experts._expert_map.tolist() == list(range(8))
+    # The one rank holds every expert, each in its slot.
+    assert runner.routed_experts._expert_map.tolist() == SLOT
     assert expert_placement.expert_order(runner.routed_experts) == ORDER
 
 
