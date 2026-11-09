@@ -44,10 +44,9 @@ x-perf-step-defaults: &perf_step
 # chips, the queue names cores, so the two numbers differ for one shape.
 x-shape-8-core: &shape_8_core "tpu7x-standard-4t/2x2x1"
 x-shape-2-core: &shape_2_core "tpu7x-standard-1t/1x1x1"
-# Multi-host slices. run_multihost.sh takes --topology for placement; SHAPE on
-# those steps only tells the ci.vllm.ai publish how many chips the slice has.
+# Multi-host slice. run_multihost.sh takes --topology for placement; SHAPE on
+# that step only tells the ci.vllm.ai publish how many chips the slice has.
 x-shape-16-core: &shape_16_core "tpu7x-standard-4t/2x2x2"
-x-shape-32-core: &shape_32_core "tpu7x-standard-4t/2x2x4"
 
 steps:
   - group: "Perf and Eval on TPU"
@@ -240,50 +239,6 @@ steps:
           - *kube_plugin
         commands:
           - .buildkite/kubernetes/run_multihost.sh --topology 2x2x2 bash .buildkite/kubernetes/benchmark_with_profile.sh deepseek-v4-pro-dp16-ep --run-lm-eval
-
-      # GLM-5.2 on the same two-host slice and cells as DSv4 Pro (its config
-      # matches deepseek-v4-pro-dp16-ep cell for cell), so the two compare.
-      - label: "Perf/Eval: Nightly glm-5.2-fp8-dp16-ep (TPU v7x-16)"
-        depends_on:
-          - "build_docker"
-        if: 'build.env("NIGHTLY") == "1"'
-        timeout_in_minutes: 1440
-        agents:
-          queue: "kube"
-        env:
-          UPLOAD_TO_VLLM_CI: "1"
-          SHAPE: *shape_16_core
-          TPU_ACCELERATOR_TYPE: "tpu7x"
-          VLLM_ENGINE_READY_TIMEOUT_S: "14400"
-          BENCHMARK_WARMUP_RUNS: "1"
-          TMPDIR: "/dev/shm"
-          RAY_TMPDIR: "/tmp"
-        plugins:
-          - *kube_plugin
-        commands:
-          - .buildkite/kubernetes/run_multihost.sh --topology 2x2x2 bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config glm-5.2-fp8-dp16-ep --run-lm-eval
-
-      # Kimi-K3 at TP32 needs a four-host 2x2x4 slice, which only
-      # tpu-ci-us-central1 has.
-      - label: "Perf/Eval: Nightly kimi-k3-tp32-ep (TPU v7x-32)"
-        depends_on:
-          - "build_docker"
-        if: 'build.env("NIGHTLY") == "1"'
-        timeout_in_minutes: 1440
-        agents:
-          queue: "kube"
-        env:
-          UPLOAD_TO_VLLM_CI: "1"
-          SHAPE: *shape_32_core
-          TPU_ACCELERATOR_TYPE: "tpu7x"
-          VLLM_ENGINE_READY_TIMEOUT_S: "14400"
-          BENCHMARK_WARMUP_RUNS: "1"
-          TMPDIR: "/dev/shm"
-          RAY_TMPDIR: "/tmp"
-        plugins:
-          - *kube_plugin
-        commands:
-          - .buildkite/kubernetes/run_multihost.sh --topology 2x2x4 bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config kimi-k3-tp32-ep --run-lm-eval
 
       # Qwen3.5-397B as one prefill and one decode engine with KV transfer between
       # them. Its pods load their results into BigQuery (BQ_UPLOAD), in the same
