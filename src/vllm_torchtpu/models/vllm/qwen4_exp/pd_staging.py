@@ -626,15 +626,15 @@ class StagedConsumer:
         # The producer sends a compressed-key page's keys only; the carrier
         # declares the same region so both pool layouts agree.
         compressed_live = compressed_live_bytes(self.src_layout)
-        # Merged producer keys: one block of `key_stride` bytes per main-KV ID;
-        # a staging page holds `keys_per_page` of them, and a reserved page k
-        # lands its ID's keys in key block k * keys_per_page (the page's start).
+        # Merged producer keys: one block of `key_stride` bytes per main-KV ID.
+        # Each lands at the start of its own staging page, so its block id is
+        # the page id: raiden bounds every block id by every pool's num_blocks.
         self._key_pools: dict[str, int] = {}
         key_entries = []
         if self.src_merged:
             span = self.src_layout.merged_key_span
             key_stride = span * self.src_layout.page_bytes // self.src_layout.compressed_columns_per_page
-            self.keys_per_page = self.src_layout.page_bytes // key_stride
+            self.key_stride = key_stride
             for group in self.src_groups:
                 for name in group.layer_names:
                     if owner_kind(name) != "main":
@@ -653,9 +653,11 @@ class StagedConsumer:
                                 layer_name=pool_name,
                                 storage_index=0,
                                 base_offset_bytes=0,
-                                block_stride_bytes=key_stride,
-                                num_blocks=self.pages * self.keys_per_page,
-                                regions=(RegionSpec("page", 0, key_stride, key_stride, 1),),
+                                block_stride_bytes=self.src_layout.page_bytes,
+                                num_blocks=self.pages,
+                                regions=(
+                                    RegionSpec("keys", 0, self.src_layout.page_bytes, key_stride, 1),
+                                ),
                                 dtype_tag="qwen4-whole-fp8-page-v1",
                             )
                         )
@@ -781,9 +783,6 @@ class StagedConsumer:
         tags, blocks, counts = [], [], []
         for pool in self.manifest.pools:
             owner_pages = pages[pool.layer_name]
-            if pool.layer_name in self._key_pools:
-                # Merged keys: the key block at the start of each staging page.
-                owner_pages = [k * self.keys_per_page for k in owner_pages]
             tags.append(pool.tag)
             blocks.extend(owner_pages)
             counts.append(len(owner_pages))
@@ -793,8 +792,11 @@ class StagedConsumer:
         """Per-tag destination clips, in ``destination`` order: the bytes of
         the source pages a prefix-aware load leaves out of each pool."""
         _, first = self.skips.get(uuid, (0, [0] * len(self.src_groups)))
+        # The clip is in the destination's live bytes: a key pool's page
+        # carries `key_stride` of them.
         return [
-            first[self._pool_group[pool.layer_name]] * pool.block_stride_bytes
+            first[self._pool_group[pool.layer_name]]
+            * (self.key_stride if pool.layer_name in self._key_pools else pool.block_stride_bytes)
             for pool in self.manifest.pools
         ]
 
