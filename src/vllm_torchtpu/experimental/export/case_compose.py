@@ -1,12 +1,13 @@
 """Composes per-request-count variants of one module into a single module.
 
-PROTOTYPE (exp/draft-cond): TorchTPU's trace cannot lower `torch.cond`, so a
-drafter that computes only the step's live requests is lowered once per slot
-count `N` and the variants are merged here, at the StableHLO text level, into
-one `@main` that dispatches on the step's request count with `stablehlo.case`.
-The merged module keeps the signature of the largest variant (its argument and
-result attributes, donation and aliasing included), so the artifact contract is
-unchanged.
+TorchTPU's trace cannot lower `torch.cond`, so a drafter that computes only the
+step's live requests is lowered once per request count `N`
+(`exporter.draft_slot_counts`) and the variants are merged here, at the
+StableHLO text level, into one `@main` that runs the smallest `N` holding the
+step's requests with `stablehlo.case`. The merged `@main` keeps the signature of
+the largest variant, argument and result attributes (sharding, donation,
+aliasing) included, so the artifact contract is unchanged: a runtime sees one
+`draft_bucket{B}` with the inputs and outputs it always had.
 """
 
 from __future__ import annotations
@@ -14,35 +15,118 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 
-_FUNC = re.compile(r"func\.func (?:public |private )?@([\w.$-]+)")
-_MAIN = re.compile(r"func\.func public @main\((?P<args>.*?)\) -> \((?P<rets>.*?)\) \{", re.S)
-_ARG = re.compile(r"(%arg\d+): (tensor<[^>]*>)")
-_TENSOR = re.compile(r"tensor<[^>]*>")
-_ATTR_DICT = re.compile(r" \{[^{}]*\}")
+_SYMBOL = re.compile(r"(?:func\.func|sdy\.mesh)\s+(?:public\s+|private\s+)?@([\w.$-]+)")
+_MAIN_START = "func.func public @main("
 
 
-def _module_header(text: str) -> str:
-    start = text.index("module")
-    return text[start : text.index("\n", start)]
+def _close(text: str, start: int, open_ch: str, close_ch: str) -> int:
+    """Index just past the bracket closing `text[start]` (an `open_ch`),
+    skipping quoted strings and nested brackets of every kind."""
+    depth = 0
+    i = start
+    pairs = {"(": ")", "{": "}", "[": "]", "<": ">"}
+    stack: list[str] = []
+    while i < len(text):
+        c = text[i]
+        if c == '"':
+            i += 1
+            while text[i] != '"':
+                i += 2 if text[i] == "\\" else 1
+        elif c in pairs and not (c == "<" and text[i - 1 : i + 1] == "-<"):
+            stack.append(pairs[c])
+            depth += 1
+        elif stack and c == stack[-1]:
+            stack.pop()
+            depth -= 1
+            if depth == 0:
+                assert text[start] == open_ch and c == close_ch
+                return i + 1
+        i += 1
+    raise ValueError(f"unbalanced {open_ch!r} at {start}")
 
 
-def _branch_body(text: str, n: int) -> str:
-    """The module's functions with `@main` renamed `@branch_{n}`, every other
-    symbol prefixed, all made private and stripped of argument attributes."""
-    for name in sorted(set(_FUNC.findall(text)), key=len, reverse=True):
-        new = f"branch_{n}" if name == "main" else f"b{n}_{name}"
-        text = re.sub(rf"@{re.escape(name)}\b", f"@{new}", text)
-    start = text.index("\n", text.index("module")) + 1
-    body = text[start : text.rindex("}")]
-    body = body.replace("func.func public", "func.func private")
-    # Argument and result attributes (donation, aliasing, result info) belong to
-    # the composed `@main` only.
-    lines = []
-    for line in body.splitlines():
-        if line.lstrip().startswith("func.func private @"):
-            line = _ATTR_DICT.sub("", line[: line.rindex("{")]) + "{"
-        lines.append(line)
-    return "\n".join(lines) + "\n"
+def _split_top(text: str) -> list[str]:
+    """Splits on commas outside quotes and brackets."""
+    parts, depth, cur, i = [], 0, [], 0
+    while i < len(text):
+        c = text[i]
+        if c == '"':
+            j = i + 1
+            while text[j] != '"':
+                j += 2 if text[j] == "\\" else 1
+            cur.append(text[i : j + 1])
+            i = j + 1
+            continue
+        if c in "([{<":
+            depth += 1
+        elif c in ")]}>":
+            depth -= 1
+        if c == "," and depth == 0:
+            parts.append("".join(cur).strip())
+            cur = []
+        else:
+            cur.append(c)
+        i += 1
+    if "".join(cur).strip():
+        parts.append("".join(cur).strip())
+    return parts
+
+
+def _type_of(entry: str) -> str:
+    """The type of an argument (`%arg0: T {attrs}`) or result (`T {attrs}`)."""
+    body = entry.split(":", 1)[1].strip() if entry.startswith("%") else entry.strip()
+    if body.startswith("tensor<"):
+        return body[: _close(body, len("tensor"), "<", ">")]
+    return body.split(" ", 1)[0]
+
+
+class _Main:
+    """The parsed `@main` of a module: its signature and where it sits."""
+
+    def __init__(self, text: str) -> None:
+        start = text.find(_MAIN_START)
+        if start < 0:
+            raise ValueError("variant has no public @main")
+        args_open = start + len(_MAIN_START) - 1
+        args_close = _close(text, args_open, "(", ")")
+        self.args = _split_top(text[args_open + 1 : args_close - 1])
+        rest = text[args_close:]
+        m = re.match(r"\s*->\s*", rest)
+        if m is None:
+            raise ValueError("@main has no results")
+        pos = args_close + m.end()
+        if text[pos] == "(":
+            rets_close = _close(text, pos, "(", ")")
+            self.rets = _split_top(text[pos + 1 : rets_close - 1])
+        else:
+            rets_close = pos + len(_type_of(text[pos:]))
+            self.rets = [text[pos:rets_close]]
+        self.attrs_and_body = text[rets_close:]
+        self.start = start
+        self.header_end = rets_close
+        self.names = [a.split(":", 1)[0].strip() for a in self.args]
+        self.arg_types = [_type_of(a) for a in self.args]
+        self.ret_types = [_type_of(r) for r in self.rets]
+
+
+def _branch_functions(text: str, n: int) -> str:
+    """The module's top-level ops with `@main` renamed `@branch_{n}` (private,
+    without argument or result attributes) and every other symbol prefixed."""
+    main = _Main(text)
+    sig = (
+        f"func.func private @branch_{n}("
+        + ", ".join(f"{a}: {t}" for a, t in zip(main.names, main.arg_types, strict=True))
+        + f") -> ({', '.join(main.ret_types)})"
+    )
+    body = main.attrs_and_body
+    # Function attributes after the results (`attributes {...}`) stay off a branch.
+    body = body[body.index("{") :]
+    text = text[: main.start] + sig + " " + body
+    for name in sorted(set(_SYMBOL.findall(text)) - {f"branch_{n}"}, key=len, reverse=True):
+        text = re.sub(rf"@{re.escape(name)}\b", f"@b{n}_{name}", text)
+    text = text.replace("func.func public", "func.func private")
+    start = text.index("{", text.index("module")) + 1
+    return text[start : text.rindex("}")].strip("\n") + "\n"
 
 
 def compose_by_request_count(
@@ -54,34 +138,32 @@ def compose_by_request_count(
     """Merges `variants` (`N` -> MLIR text whose `@main` computes `N` request
     slots) into one module whose `@main` runs the smallest `N` that holds the
     step's request count, read from element `num_seqs_index` of argument
-    `req_dist_arg` (`i32[k]`). Every variant must have the same `@main`
-    signature; the largest `N` must hold every step.
+    `req_dist_arg` (`i32[k]`), or the largest. Every variant must have the same
+    `@main` argument and result types; the largest `N` must hold every step.
     """
     ns = sorted(variants)
-    largest = variants[ns[-1]]
-    sig = _MAIN.search(largest)
-    if sig is None:
-        raise ValueError("variant has no public @main")
-    arg_types = dict(_ARG.findall(sig.group("args")))
-    names = list(arg_types)
-    types = [arg_types[a] for a in names]
-    ret_types = _TENSOR.findall(_ATTR_DICT.sub("", sig.group("rets")))
+    largest_text = variants[ns[-1]]
+    largest = _Main(largest_text)
     for n in ns[:-1]:
-        other = _MAIN.search(variants[n])
-        if other is None or [t for _, t in _ARG.findall(other.group("args"))] != types:
+        other = _Main(variants[n])
+        if (other.arg_types, other.ret_types) != (largest.arg_types, largest.ret_types):
             raise ValueError(f"variant {n} has another @main signature")
-
-    rd_type = types[req_dist_arg]
+    names, types = largest.names, largest.arg_types
+    rets = largest.ret_types
+    rt = ", ".join(rets)
     k = len(ns)
-    rt = ", ".join(ret_types)
+    rd = names[req_dist_arg]
+    rd_type = types[req_dist_arg]
     call = f"{', '.join(names)}) : ({', '.join(types)}) -> ({rt})"
     regions = "    }, {\n".join(
-        f"      %r:{len(ret_types)} = func.call @branch_{n}({call}\n"
-        f"      stablehlo.return {', '.join(f'%r#{i}' for i in range(len(ret_types)))} : {rt}\n"
+        f"      %r:{len(rets)} = func.call @branch_{n}({call}\n"
+        f"      stablehlo.return {', '.join(f'%r#{i}' for i in range(len(rets)))} : {rt}\n"
         for n in ns
     )
-    main = f"""  func.func public @main({sig.group("args")}) -> ({sig.group("rets")}) {{
-    %s1 = stablehlo.slice %{names[req_dist_arg][1:]} [{num_seqs_index}:{num_seqs_index + 1}] : ({rd_type}) -> tensor<1xi32>
+    head = largest_text[largest.start : largest.header_end]
+    attrs = largest.attrs_and_body[: largest.attrs_and_body.index("{")]
+    main = f"""  {head}{attrs}{{
+    %s1 = stablehlo.slice {rd} [{num_seqs_index}:{num_seqs_index + 1}] : ({rd_type}) -> tensor<1xi32>
     %s = stablehlo.reshape %s1 : (tensor<1xi32>) -> tensor<i32>
     %ns = stablehlo.constant dense<[{", ".join(map(str, ns))}]> : tensor<{k}xi32>
     %sb = stablehlo.broadcast_in_dim %s, dims = [] : (tensor<i32>) -> tensor<{k}xi32>
@@ -93,10 +175,19 @@ def compose_by_request_count(
     %count = stablehlo.reduce(%below init: %z) applies stablehlo.add across dimensions = [0] : (tensor<{k}xi32>, tensor<i32>) -> tensor<i32>
     %last = stablehlo.constant dense<{k - 1}> : tensor<i32>
     %idx = stablehlo.minimum %count, %last : tensor<i32>
-    %out:{len(ret_types)} = "stablehlo.case"(%idx) ({{
+    %out:{len(rets)} = "stablehlo.case"(%idx) ({{
 {regions}    }}) : (tensor<i32>) -> ({rt})
-    return {", ".join(f"%out#{i}" for i in range(len(ret_types)))} : {rt}
+    return {", ".join(f"%out#{i}" for i in range(len(rets)))} : {rt}
   }}
 """
-    bodies = "".join(_branch_body(variants[n], n) for n in ns)
-    return f"{_module_header(largest)}\n{bodies}{main}}}\n"
+    module_start = largest_text.index("module")
+    module_head = largest_text[module_start : largest_text.index("{", module_start) + 1]
+    # A module header `attributes {...}` has its own braces: keep it whole.
+    attr_at = largest_text.find("attributes", module_start)
+    brace = largest_text.index("{", module_start)
+    if 0 <= attr_at < brace:
+        brace = largest_text.index("{", attr_at)
+        module_head = largest_text[module_start : _close(largest_text, brace, "{", "}")]
+        module_head += " {"
+    bodies = "".join(_branch_functions(variants[n], n) for n in ns)
+    return f"{module_head}\n{bodies}{main}}}\n"
