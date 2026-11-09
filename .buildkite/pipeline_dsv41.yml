@@ -302,7 +302,7 @@ steps:
             .buildkite/kubernetes/run.sh
             bash .buildkite/scripts/dsv41_publish_check.sh
             perf_eval_results/deepseek-v41-flash-dp8-96k-c8-cached-extend/benchmark
-            env MOE_FUSED_EP_KERNEL_IMPL=v2 TPU_MOE_EPLB_DYNAMIC=1
+            env TPU_MOE_EPLB_DYNAMIC=1
             TPU_MOE_EPLB_PREFILL=1
             bash .buildkite/scripts/run_dsv41_benchmark.sh
             encoder_extend
