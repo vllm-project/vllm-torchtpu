@@ -377,16 +377,3 @@ def test_from_device_chunks_copies_plain_logprobs_and_waits_for_them(
         [torch.zeros((8, 1), dtype=torch.int32)], [5]
     )
     assert empty.plain_logprobs is None and empty._plain_logprobs_tpu is None
-
-
-@pytest.mark.parametrize(
-    "value,expected", [(None, True), ("1", True), ("0", False), ("false", False)]
-)
-def test_defer_logprobs_knob_is_on_unless_switched_off(monkeypatch, value, expected):
-    from vllm_torchtpu import envs
-
-    if value is None:
-        monkeypatch.delenv("VLLM_TPU_DEFER_LOGPROBS", raising=False)
-    else:
-        monkeypatch.setenv("VLLM_TPU_DEFER_LOGPROBS", value)
-    assert envs.environment_variables["VLLM_TPU_DEFER_LOGPROBS"]() is expected

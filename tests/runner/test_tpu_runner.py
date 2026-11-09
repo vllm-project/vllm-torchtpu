@@ -41,6 +41,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
@@ -3619,10 +3620,10 @@ def test_skipping_topk_topp_is_exact_at_the_default_sampling_params(dtype):
 def test_sample_tokens_deferred_logprobs_match_the_blocking_copy(
     monkeypatch, max_logprobs
 ):
-    """The sampled-token logprobs that ride the async output copy equal the
-    ones the blocking per-step copy returns (two decode chunks, padded rows,
-    a discarded request), and VLLM_TPU_DEFER_LOGPROBS=0's path is still the
-    blocking one."""
+    """The sampled-token logprobs that ride the async output copy equal what
+    the former blocking per-step copy built from the same device tensors
+    (slice to the real rows, .tolists(), concatenate in chunk order), for two
+    decode chunks with padded rows and a discarded request."""
     monkeypatch.setattr(
         torch, "tpu", SimpleNamespace(Event=_FakeTpuEvent), raising=False
     )
@@ -3647,8 +3648,9 @@ def test_sample_tokens_deferred_logprobs_match_the_blocking_copy(
     num_reqs_list = [4, 2]
     req_ids = [f"r{i}" for i in range(6)]
 
-    def run(defer):
-        monkeypatch.setattr(tpu_runner, "_DEFER_PLAIN_LOGPROBS", defer)
+    gathered = []
+
+    def run():
         scheduler_output = SimpleNamespace(
             num_scheduled_tokens={r: 1 for r in req_ids},
             finished_req_ids=set(),
@@ -3711,25 +3713,44 @@ def test_sample_tokens_deferred_logprobs_match_the_blocking_copy(
         runner.sample_from_logits_func = (
             TPUModelRunner.sample_from_logits.__wrapped__.__get__(runner)
         )
-        runner.gather_logprobs = TPUModelRunner.gather_logprobs.__wrapped__.__get__(
-            runner
-        )
+        gather_logprobs = TPUModelRunner.gather_logprobs.__wrapped__.__get__(runner)
+
+        def recording_gather_logprobs(*args, **kwargs):
+            gathered.append(gather_logprobs(*args, **kwargs))
+            return gathered[-1]
+
+        runner.gather_logprobs = recording_gather_logprobs
         runner._stage_timing.take_samples.return_value = ([], [])
         for name in ("maybe_wait_for_kv_save", "get_finished_kv_transfers"):
             setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
         return TPUModelRunner.sample_tokens(runner, None)
 
-    blocking = run(defer=False)
-    assert captured.pop() is None
-    deferred = run(defer=True)
-    plain = captured.pop()
+    deferred = run()
+    (plain,) = captured
     assert [n for _, n in plain] == num_reqs_list
-    assert deferred.sampled_token_ids == blocking.sampled_token_ids
-    assert deferred.sampled_token_ids[1] == []
-    assert blocking.logprobs.logprob_token_ids.shape == (6, max_logprobs + 1)
+    assert len(gathered) == len(num_reqs_list)
+    argmax = [
+        [int(t)]
+        for logits, n in zip(logits_list, num_reqs_list)
+        for t in logits[:n].argmax(dim=-1)
+    ]
+    argmax[1] = []  # r1's token is discarded.
+    assert deferred.sampled_token_ids == argmax
+
+    # The former blocking copy in sample_tokens, on the same device tensors.
+    blocking = [
+        LogprobsTensors(
+            t.logprob_token_ids[:n],
+            t.logprobs[:n],
+            t.selected_token_ranks[:n],
+            t.cu_num_generated_tokens,
+        ).tolists()
+        for t, n in zip(gathered, num_reqs_list)
+    ]
+    assert deferred.logprobs.logprob_token_ids.shape == (6, max_logprobs + 1)
     for field in ("logprob_token_ids", "logprobs", "sampled_token_ranks"):
         actual = getattr(deferred.logprobs, field)
-        expected = getattr(blocking.logprobs, field)
+        expected = np.concatenate([getattr(lp, field) for lp in blocking])
         assert actual.dtype == expected.dtype, field
         assert np.array_equal(actual, expected), field
     assert deferred.logprobs.cu_num_generated_tokens is None

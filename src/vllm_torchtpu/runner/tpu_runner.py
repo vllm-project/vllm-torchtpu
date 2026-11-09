@@ -85,7 +85,6 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     DraftTokenIds,
-    LogprobsLists,
     LogprobsTensors,
     ModelRunnerOutput,
 )
@@ -483,9 +482,6 @@ def _build_kv_connector_output(
 
 # Smallest output size
 MIN_NUM_SEQS = 8
-# VLLM_TPU_DEFER_LOGPROBS=0 restores the blocking per-step logprob copy in
-# sample_tokens.
-_DEFER_PLAIN_LOGPROBS = envs.VLLM_TPU_DEFER_LOGPROBS
 SAMPLING_EPS = 1e-5
 
 
@@ -4679,11 +4675,9 @@ class TPUModelRunner(GPUModelRunner):
         next_tokens_tpu_chunks: list[torch.Tensor] = []
         next_token_indices: dict[int, int] = {}
         next_tokens_tpu_offset = 0
-        combined_logprobs: list[Any] = []
         # Non-spec chunks: bucketed device logprobs and their real row counts,
         # copied to the host with the sampled tokens and materialized in
         # AsyncTPUModelRunnerOutput.get_output instead of a blocking .tolists().
-        defer_plain_logprobs = needs_logprobs and _DEFER_PLAIN_LOGPROBS
         deferred_plain_logprobs: list[tuple[LogprobsTensors, int]] = []
         # Spec step only: per-chunk logprobs, filtered to the accepted tokens
         # once they reach the host (AsyncTPUModelRunnerOutput.get_output).
@@ -4884,18 +4878,9 @@ class TPUModelRunner(GPUModelRunner):
                             next_tokens_tpu_offset + req_idx - cur_start_idx
                         )
                     next_tokens_tpu_offset += selected_token_ids.shape[0]
-                if needs_logprobs and defer_plain_logprobs:
+                if needs_logprobs:
                     assert logprobs is not None
                     deferred_plain_logprobs.append((logprobs, num_reqs))
-                elif needs_logprobs:
-                    assert logprobs is not None
-                    sliced_logprobs = LogprobsTensors(
-                        logprobs.logprob_token_ids[:num_reqs],
-                        logprobs.logprobs[:num_reqs],
-                        logprobs.selected_token_ranks[:num_reqs],
-                        logprobs.cu_num_generated_tokens,
-                    )
-                    combined_logprobs.append(sliced_logprobs)
 
                 self._update_num_xla_graphs("decoding_step")
                 cur_start_idx = cur_end_idx
@@ -4904,28 +4889,9 @@ class TPUModelRunner(GPUModelRunner):
         # Those copies are blocking. Once they become async., kv_save
         # should be called right after each single forward pass,
         # instead of the forwards of the entire input batch.
+        # The step's logprobs are filled in AsyncTPUModelRunnerOutput.get_output
+        # from the copy state (non-spec: plain_logprobs; spec: spec_logprobs).
         logprobs = []
-        if needs_logprobs and len(combined_logprobs):
-            # TODO: concatenate the LogprobsTensors (torch) first, then
-            # call .tolists() once to match the GPU path and avoid the
-            # per-chunk numpy round-trip.
-            combined_logprobs_lists = []
-            for i in range(len(combined_logprobs)):
-                logprobs = combined_logprobs[i].tolists()
-                combined_logprobs_lists.append(logprobs)
-
-            logprobs_lists = LogprobsLists(
-                logprob_token_ids=np.concatenate(
-                    [lp.logprob_token_ids for lp in combined_logprobs_lists]
-                ),
-                logprobs=np.concatenate(
-                    [lp.logprobs for lp in combined_logprobs_lists]
-                ),
-                sampled_token_ranks=np.concatenate(
-                    [lp.sampled_token_ranks for lp in combined_logprobs_lists]
-                ),
-            )
-            logprobs = logprobs_lists
 
         discard_sampled_tokens_req_indices = []
         num_reqs = self.input_batch.num_reqs
