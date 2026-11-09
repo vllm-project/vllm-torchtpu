@@ -74,8 +74,7 @@ CLEAN_FILL = 0.8
 # The first decode window after a phase change is this many steps (or the
 # window, if shorter), so a layout for the decode mix lands early.
 DECODE_FIRST_WINDOW = 16
-# The existing asynchronous read protocol needs eight clean steps. A 16K
-# extend has only eight full 2K chunks before its padded tail resets history.
+# Use the minimum clean window supported by the asynchronous snapshot protocol.
 PREFILL_WINDOW = 8
 # How long the ranks drain a timed-out generation's host exchange together.
 DRAIN_S = 30.0
@@ -898,6 +897,7 @@ class Controller:
         self._solve_result: Plan | None = None
         self._solve_error: BaseException | None = None
         self._solve_step = 0
+        self._solve_phase = "init"
         self._phase: str = "init"
         self._steps_since_reset: int = 0
         self._first_decode_window: bool = False
@@ -906,10 +906,10 @@ class Controller:
         self.decode_first_window: int = max(DECODE_FIRST_WINDOW, 8)
         self._decode_only = not prefill_enabled
         self.prefill_windows: list[dict] = []
-        self._chain_decode: bool = True
+        self._chain_layouts: bool = True
         self._freeze_converged: bool = True
-        self._decode_logical_windows: dict[tuple[str, int], np.ndarray] | None = None
-        self._decode_converged: bool = False
+        self._logical_windows: dict[tuple[str, int], np.ndarray] | None = None
+        self._converged_phases: set[str] = set()
 
     # -- the three int64 fields of the per-step all-reduce
 
@@ -1018,7 +1018,7 @@ class Controller:
         if self._phase == "prefill" and self._decode_only:
             return
 
-        if self._phase == "decode" and self._decode_converged:
+        if self._phase in self._converged_phases:
             return
 
         self._steps_since_reset += 1
@@ -1086,12 +1086,14 @@ class Controller:
         history,
         layouts,
         logical_windows: dict[tuple[str, int], np.ndarray] | None = None,
+        solve_phase: str | None = None,
     ) -> None:
         self.stats["triggers"] += 1
         generation = self.generation + 1
         self._solve_result = None
         self._solve_error = None
         self._solve_step = step
+        self._solve_phase = self._phase if solve_phase is None else solve_phase
         self.state = SOLVING
         if self.synchronous_solve:
             try:
@@ -1175,9 +1177,9 @@ class Controller:
             logger.info("expert relayout | clean prefill load %s", event)
         layouts = {k: v.copy() for k, v in self.layouts.items()}
         logical_windows = None
-        if self._phase == "decode" and self._chain_decode:
+        if self._phase in ("prefill", "decode") and self._chain_layouts:
             logical_windows = self._compute_logical_windows(history, layouts)
-            self._decode_logical_windows = logical_windows
+            self._logical_windows = logical_windows
         self._launch_solve(step, history, layouts, logical_windows=logical_windows)
 
     def _collect_solve(self, step: int) -> None:
@@ -1193,7 +1195,7 @@ class Controller:
             )
             self._solve_error = None
             self.stats["skipped"] += 1
-            self._decode_logical_windows = None
+            self._logical_windows = None
             self.state = IDLE
             if self._phase in ("prefill", "decode") and self.history:
                 self.history = self.history[-1:]
@@ -1203,15 +1205,16 @@ class Controller:
         self._solve_result = None
         if plan is None or not plan.layouts:
             self.stats["skipped"] += 1
-            was_chaining = self._decode_logical_windows is not None
-            self._decode_logical_windows = None
-            if (self._phase == "decode" or was_chaining) and self._freeze_converged:
-                self._decode_converged = True
+            self._logical_windows = None
+            if self._solve_phase in ("prefill", "decode") and self._freeze_converged:
+                self._converged_phases.add(self._solve_phase)
             logger.info(
                 "expert relayout | step %d: no layer clears the %.0f%% gain gate%s",
                 step,
                 100 * self.min_gain,
-                " (decode converged; freezing)" if self._decode_converged else "",
+                f" ({self._solve_phase} converged; freezing)"
+                if self._solve_phase in self._converged_phases
+                else "",
             )
             self.state = IDLE
             if self._phase in ("prefill", "decode") and self.history:
@@ -1313,6 +1316,8 @@ class Controller:
                 layout.slot_table(spec["experts"], spec["replica_cap"]),
             )
             self.layouts[key] = layout
+        # Installing any layout invalidates convergence of the previous layout.
+        self._converged_phases.clear()
         self.generation = plan.generation
         self.mover.settle(self.generation)
         self.stats["installed"] += 1
@@ -1341,14 +1346,21 @@ class Controller:
             self._steps_since_reset = 0
         self.pending = None
         self.state = IDLE
-        if self._chain_decode and self._decode_logical_windows:
+        if (
+            self._chain_layouts
+            and self._logical_windows
+            and self._phase in (self._solve_phase, "padded")
+        ):
             layouts = {k: v.copy() for k, v in self.layouts.items()}
             self._launch_solve(
                 step,
                 [],
                 layouts,
-                logical_windows=self._decode_logical_windows,
+                logical_windows=self._logical_windows,
+                solve_phase=self._solve_phase,
             )
+        else:
+            self._logical_windows = None
 
     def _abort(self, step: int, why: str, drain: bool = False) -> None:
         """Drop the pending generation. A drop every rank takes at the same
@@ -1383,6 +1395,7 @@ class Controller:
             how,
         )
         self.mover.cancel()
+        self._logical_windows = None
         self.mover.settle(self.generation)
         self.pending = None
         self.state = IDLE

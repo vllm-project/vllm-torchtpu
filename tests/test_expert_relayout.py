@@ -704,7 +704,7 @@ def test_direct_staged_next_breaks_single_copy_cycle_and_chains_decode():
         c.after_dispatch()
         tap.advance()
     assert c.generation >= 1
-    assert c._decode_converged is True
+    assert "decode" in c._converged_phases
 
 
 def test_window_deltas_wrap_cleanly_across_int32_overflow():
@@ -761,6 +761,7 @@ def test_padded_tail_never_enters_the_next_prefill_window():
     tap = _Tap()
     seen = []
     c = _controller(0, tap, _Mover(), [], prefill_enabled=True)
+    c._freeze_converged = False  # Observe both windows for padding isolation.
     c._solve = lambda history, layouts, generation, step, **kwargs: (
         seen.append([s[("target", 0)].copy() for s in history])
         or rl.Plan(generation, step)
@@ -776,7 +777,7 @@ def test_padded_tail_never_enters_the_next_prefill_window():
     # The large dirty increment is present in both snapshots of the second
     # window and cancels; it must never become a hot-expert signal.
     np.testing.assert_array_equal(first_delta, second_delta)
-    assert c._decode_converged is False
+    assert "decode" not in c._converged_phases
 
 
 def test_prefill_mode_does_not_change_decode_schedule_or_freeze():
@@ -792,7 +793,7 @@ def test_prefill_mode_does_not_change_decode_schedule_or_freeze():
     a, b = controllers
     assert a.stats == b.stats
     assert a.layouts[("target", 0)].held == b.layouts[("target", 0)].held
-    assert a._decode_converged and b._decode_converged
+    assert a._converged_phases == b._converged_phases == {"decode"}
 
 
 def test_arm_wires_the_opt_in_prefill_flag(monkeypatch):
@@ -915,3 +916,73 @@ def test_move_construction_rejects_relabeling_retained_experts_without_copying()
     unsafe = rl.LayerLayout([[1, 0, 2, 3, rl.FREE], [4, 5, 6, 7, rl.FREE]])
     with pytest.raises(ValueError, match="retained expert"):
         rl._moves_between("target", 0, old, unsafe)
+
+
+@pytest.mark.parametrize("phase", ["prefill", "decode"])
+def test_both_phases_chain_the_same_load_until_frozen(phase):
+    tap = _Tap()
+    c = _controller(0, tap, _Mover(), [], min_gain=0.005)
+    windows = []
+    original = c._solve
+
+    def solve(history, layouts, generation, step, **kwargs):
+        windows.append((step, history, kwargs["logical_windows"]))
+        return original(history, layouts, generation, step, **kwargs)
+
+    c._solve = solve
+    for step in range(1, 40):
+        c.on_step(step, c.fields(), phase=phase)
+        c.after_dispatch()
+        tap.advance()
+    assert c.stats["installed"] > 0
+    assert phase in c._converged_phases
+    assert len(windows) > 1
+    first_load = windows[0][2]
+    assert first_load
+    for _, history, load in windows[1:]:
+        assert not history
+        for key in first_load:
+            np.testing.assert_array_equal(load[key], first_load[key])
+    triggers = c.stats["triggers"]
+    for step in range(40, 65):
+        c.on_step(step, c.fields(), phase="padded" if step == 40 else phase)
+        c.after_dispatch()
+        tap.advance()
+    assert c.stats["triggers"] == triggers
+
+
+@pytest.mark.parametrize("first,second", [("decode", "prefill"), ("prefill", "decode")])
+def test_other_phase_install_invalidates_previous_layout_convergence(first, second):
+    tap = _Tap()
+    c = _controller(0, tap, _Mover(), [], min_gain=0.005)
+    for step in range(1, 30):
+        c.on_step(step, c.fields(), phase=first)
+        c.after_dispatch()
+        tap.advance()
+    assert first in c._converged_phases
+    installed = c.stats["installed"]
+    for step in range(30, 60):
+        c.on_step(step, c.fields(), phase=second)
+        c.after_dispatch()
+        tap.advance()
+    assert c.stats["installed"] > installed
+    assert first not in c._converged_phases
+    assert second in c._converged_phases
+    triggers = c.stats["triggers"]
+    for step in range(60, 90):
+        c.on_step(step, c.fields(), phase=first)
+        c.after_dispatch()
+        tap.advance()
+    assert c.stats["triggers"] > triggers
+
+
+@pytest.mark.parametrize("phase", ["prefill", "decode"])
+def test_delayed_no_gain_result_freezes_its_source_phase(phase):
+    c = _controller(0, _Tap(), _Mover(), [])
+    c._solve_phase = phase
+    c._phase = "decode" if phase == "prefill" else "prefill"
+    c.state = rl.SOLVING
+    c._solve_result = rl.Plan(1, 0)
+    c._collect_solve(10)
+    assert c._converged_phases == {phase}
+    assert c._logical_windows is None
