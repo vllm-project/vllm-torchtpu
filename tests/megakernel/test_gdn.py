@@ -149,8 +149,16 @@ def test_gdn_module_declarations_bind_and_options():
 
     with pytest.raises(MegakernelConfigError, match="gate"):
         GDNModule(gate="invalid_gate")
+    with pytest.raises(MegakernelConfigError, match="gate"):
+        GDNModule.bind("linear_attn", gate="sigmoidd")
+    with pytest.raises(MegakernelConfigError, match="gate"):
+        GDNModule.bind("linear_attn", gdn_gate="sigmoidd")
     with pytest.raises(MegakernelConfigError, match="weight_dtypes"):
         GDNModule(weight_dtypes={"bad_weight": "bf16"})
+
+    b_sig = GDNModule.bind("linear_attn", gdn_gate="sigmoid")
+    mod_sig = b_sig.to_module(cfg)
+    assert mod_sig.gate == "sigmoid"
 
 
 @pytest.mark.parametrize(
@@ -160,9 +168,9 @@ def test_gdn_module_declarations_bind_and_options():
 )
 def test_gdn_emit_in_pallas_interpret_matches_reference(T: int, B: int, chunked: bool):
     """`GDNModule.emit` in Pallas interpret mode matches `GDNModule.reference`."""
-    tiles = dataclasses.replace(TINY_TILES, bank=256 << 10).with_modules(
-        {"gdn": {"gdn_rows": 4 if chunked else 8, "gdn_bufs": 2 if chunked else 1}}
-    )
+    tiles = dataclasses.replace(
+        TINY_TILES, bank=256 << 10, wide_rows=4 if chunked else 16
+    ).with_modules({"gdn": {"gdn_rows": 8, "gdn_bufs": 2 if chunked else 1}})
     ex = ExecSpec(B=B, T=T, R=1, ctx=256, stack_e=True, tiles=tiles, interpret=True)
     g = FakeGeometry(
         L=1,
@@ -188,6 +196,7 @@ def test_gdn_emit_in_pallas_interpret_matches_reference(T: int, B: int, chunked:
     )
     cp, scratch = _build_gdn_test_scratch(ms, ex)
     p = cp.plan
+    assert p.module_params["gdn"].GCH is chunked
     wsh = planner.weight_shapes(ms, ex, p)
     ssh = planner.state_shapes(ms, ex, p)
     osh = planner.kernel_out_shapes(ms, ex, p)
@@ -255,32 +264,32 @@ def test_gdn_emit_in_pallas_interpret_matches_reference(T: int, B: int, chunked:
     key = jax.random.PRNGKey(17 + T + B)
     k_h, k_in, k_out, k_sm, k_c, k_r = jax.random.split(key, 6)
     pos = jnp.zeros((ex.B,), dtype=jnp.int32)
-    hid = jax.random.normal(k_h, (ex.M, g.H), dtype=BF16) * 0.2
+    hid = jax.random.normal(k_h, (ex.M, g.H), dtype=BF16) * 0.5
     W_in = {k: jnp.zeros(wsh[k][0], dtype=wsh[k][1]) for k in p.w_names}
     W_in["lin_in"] = (
-        jax.random.normal(k_in, wsh["lin_in"][0], dtype=BF16) * 0.1
+        jax.random.normal(k_in, wsh["lin_in"][0], dtype=BF16) * 0.3
     ).astype(FP8)
     W_in["lin_out"] = (
-        jax.random.normal(k_out, wsh["lin_out"][0], dtype=BF16) * 0.1
+        jax.random.normal(k_out, wsh["lin_out"][0], dtype=BF16) * 0.3
     ).astype(FP8)
     sm = jnp.zeros(wsh["smalls"][0], dtype=F32)
     for fname, val in (
-        ("in_norm", 0.1),
-        ("in_s", 0.05),
-        ("out_s", 0.05),
-        ("conv", 0.1),
+        ("in_norm", 0.3),
+        ("in_s", 0.2),
+        ("out_s", 0.2),
+        ("conv", 0.35),
         ("alog", -1.0),
-        ("dtb", 0.1),
+        ("dtb", 0.2),
         ("gnorm", 1.0),
     ):
         o_sm, w_sm = cp.stream.lay[fname]
         sm = sm.at[:, :, o_sm : o_sm + w_sm].set(val)
-    sm = sm + jax.random.normal(k_sm, sm.shape, dtype=F32) * 0.01
+    sm = sm + jax.random.normal(k_sm, sm.shape, dtype=F32) * 0.03
     W_in["smalls"] = sm
 
     ST_in = {k: jnp.zeros(ssh[k][0], dtype=ssh[k][1]) for k in p.s_names}
-    ST_in["conv"] = jax.random.normal(k_c, ssh["conv"][0], dtype=F32) * 0.05
-    ST_in["rec"] = jax.random.normal(k_r, ssh["rec"][0], dtype=BF16) * 0.05
+    ST_in["conv"] = jax.random.normal(k_c, ssh["conv"][0], dtype=F32) * 0.3
+    ST_in["rec"] = jax.random.normal(k_r, ssh["rec"][0], dtype=BF16) * 0.3
 
     outs = dict(
         zip(
@@ -315,14 +324,64 @@ def test_gdn_emit_in_pallas_interpret_matches_reference(T: int, B: int, chunked:
             "rec": mod_st["rec"].reshape(1, 1, ex.NS, 2, 128, 128),
         }
     ref_part, ref_out_st = gdn.reference(ref_params, norm_x, ref_st, g=g, ex=ex)
+    assert float(np.max(np.abs(np.asarray(ref_part, dtype=np.float32)))) >= 0.2
     ref_hid = (hid[:B].astype(F32) + ref_part.astype(F32)).astype(BF16)
     np.testing.assert_allclose(
         outs["hidden"][:B].astype(F32), ref_hid.astype(F32), rtol=2e-2, atol=2e-2
     )
+    with pytest.raises(AssertionError):
+        np.testing.assert_allclose(
+            outs["hidden"][:B].astype(F32), hid[:B].astype(F32), rtol=2e-2, atol=2e-2
+        )
+
+    conv_key = "conv_ckpt" if T > 1 else "conv"
     rec_key = "rec_ckpt" if T > 1 else "rec"
+    conv_valid = slice(0, 3 * B) if T == 1 else (slice(None), slice(0, 3 + T))
+    np.testing.assert_allclose(
+        outs[conv_key][0][conv_valid].astype(F32),
+        ref_out_st[conv_key][0][conv_valid].astype(F32),
+        rtol=2e-2,
+        atol=2e-2,
+    )
     np.testing.assert_allclose(
         outs[rec_key][0].astype(F32),
         ref_out_st[rec_key][0].astype(F32),
+        rtol=2e-2,
+        atol=2e-2,
+    )
+    rec_in_cmp = (
+        jnp.repeat(ST_in["rec"][0].reshape(ex.NS, 2, 128, 128), T, axis=0).reshape(
+            -1, 128, 128
+        )
+        if T > 1
+        else ST_in["rec"][0]
+    )
+    with pytest.raises(AssertionError):
+        np.testing.assert_allclose(
+            outs[rec_key][0].astype(F32), rec_in_cmp.astype(F32), rtol=2e-2, atol=2e-2
+        )
+
+    # Also compare unpacked logical conv and rec states via `next_logical_states`.
+    host_st = gdn.host_update_states(g, ex, pos, ST_in, outs)
+    unpacked_st = gdn.unpack_kernel_states(host_st, g, ex)
+    next_logical = gdn.next_logical_states(unpacked_st, g, ex)
+    ref_next_logical = gdn.next_logical_states(
+        {
+            conv_key: ref_out_st[conv_key][:, None],
+            rec_key: ref_out_st[rec_key][:, None],
+        },
+        g,
+        ex,
+    )
+    np.testing.assert_allclose(
+        next_logical["conv"].astype(F32),
+        ref_next_logical["conv"].astype(F32),
+        rtol=2e-2,
+        atol=2e-2,
+    )
+    np.testing.assert_allclose(
+        next_logical["rec"].astype(F32),
+        ref_next_logical["rec"].astype(F32),
         rtol=2e-2,
         atol=2e-2,
     )

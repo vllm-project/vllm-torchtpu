@@ -16,7 +16,6 @@
 from __future__ import annotations
 
 import copy
-import dataclasses
 from collections.abc import Mapping
 from typing import Any, ClassVar
 
@@ -42,12 +41,12 @@ from ...spec import SmallField, StateDecl, WeightDecl
 from .conv import conv_step, gdn_in
 from .decls import (
     GDN_FIELD_ALIASES,
-    GDN_GATE_ACTS,
     GDN_GEOMETRY_FIELDS,
     GDN_GEOMETRY_METHODS,
     GDN_OPTIONS,
     GDN_PARAM_NAMES,
     GDN_WEIGHT_NAMES,
+    bind_gdn_module,
     gdn_cache_decl,
     gdn_hf_params,
     resolve_gdn_binding,
@@ -123,17 +122,7 @@ class GDNModule(Module):
 
     @classmethod
     def bind(cls, prefix: str = "", **hf_fields_or_options: Any) -> ModuleBinding:
-        kw = dict(hf_fields_or_options)
-        for k in ("gate", "gdn_gate"):
-            if k in kw and isinstance(kw[k], str) and kw[k] in GDN_GATE_ACTS:
-                gate_lit = kw.pop(k)
-                b = super().bind(prefix, **kw)
-                return dataclasses.replace(
-                    b,
-                    fields={**b.fields, "gate": ("gdn_gate", gate_lit)},
-                    options={**b.options, "gate": gate_lit},
-                )
-        return super().bind(prefix, **kw)
+        return bind_gdn_module(cls, prefix, **hf_fields_or_options)
 
     def _effective_gate(self, g: Any = None) -> str:
         if self._explicit_gate is not None:
@@ -160,15 +149,8 @@ class GDNModule(Module):
     def _resolve_binding(
         cls, binding: ModuleBinding, hf_config: Any
     ) -> ResolvedModuleGeometry:
-        eff_b = binding
-        opt_gate = binding.options.get("gate")
-        if opt_gate is not None and binding.fields.get("gate") == ("gdn_gate", "silu"):
-            eff_b = dataclasses.replace(
-                binding,
-                fields={**binding.fields, "gate": ("gdn_gate", opt_gate)},
-            )
         return resolve_gdn_binding(
-            cls, eff_b, super()._resolve_binding(eff_b, hf_config)
+            cls, binding, super()._resolve_binding(binding, hf_config)
         )
 
     @classmethod
