@@ -36,11 +36,11 @@ if TYPE_CHECKING:
     TPU_ROPE_SC_GATHER: bool = True
     TPU_DSPARK_FUSED_CONTEXT_KV: bool = True
     TPU_DSPARK_MERGED_CONTEXT_WRITES: bool = True
-    TPU_SC_BANKED_ROW_WRITES: bool = True
+    TPU_SC_BANKED_ROW_WRITES: bool = False
     TPU_ENGRAM_REQUEST_FALLBACK: bool = True
     TPU_BLOCK_TABLE_DELTA_BUCKETS: bool = True
     TPU_FUSED_SPEC_NEXT_INPUTS: bool = True
-    TPU_BLOCK_TABLE_DELTA_INPLACE: bool = True
+    TPU_BLOCK_TABLE_DELTA_INPLACE: bool = False
     TPU_DSV41_FUSED_ATTENTION_ROW_MASK: bool = True
     TPU_DSPARK_PIPELINED_MARKOV: bool = True
     TPU_MOE_ONEHOT_SCALE_LOOKUP: bool = True
@@ -598,7 +598,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Write both banks of a two-bank native cache in one SparseCore launch
     # (`cache_write.write_cache_rows_banked`) instead of one launch per bank.
     # Each launch costs ~5 us of SparseCore overlay and setup. Same rows.
-    "TPU_SC_BANKED_ROW_WRITES": env_bool("TPU_SC_BANKED_ROW_WRITES", default=True),
+    # Off by default: DP16 serving warmup (exp-t64ve82k9l) failed on a donated
+    # argument in a failed state; re-enable once the donation is cleared.
+    "TPU_SC_BANKED_ROW_WRITES": env_bool("TPU_SC_BANKED_ROW_WRITES", default=False),
     # Read the Engram slot-cache fallback once per (request, lookback slot)
     # instead of once per (token, n-gram shift), then look rows up in that
     # small table (Engram hash: 116.9 -> 102.9 us on one v7x chip). Same hashes.
@@ -608,8 +610,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Scatter block-table deltas into the device-resident staged table in
     # place (the buffer is donated) instead of into a fresh clone of it: the
     # clone copies the whole table every delta step. Same table.
+    # Off by default: DP16 serving warmup (exp-t64ve82k9l) failed on a donated
+    # argument in a failed state; re-enable once the donation is cleared.
     "TPU_BLOCK_TABLE_DELTA_INPLACE": env_bool(
-        "TPU_BLOCK_TABLE_DELTA_INPLACE", default=True
+        "TPU_BLOCK_TABLE_DELTA_INPLACE", default=False
     ),
     # DSV4.1 bf16 paged attention: pass the SWA row validity into the op, so
     # the shared DSpark draft kernel zeroes invalid rows in its write-back
