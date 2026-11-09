@@ -1,63 +1,33 @@
 # vLLM-Omni on TPU: Roadmap
 
-This page lists planned work for the omni plugin. These are plans, not
-commitments. To work on an item, open an issue first and follow
-[Contributing](README.md#contributing).
+This page describes how we plan to support vLLM-Omni on TPU over the next one
+to two quarters. These are plans, not commitments. To work on an item, open an
+issue first and follow [Contributing](README.md#contributing). See also the
+project [roadmap](../../../docs/roadmap.md).
 
 Last updated: November 2026.
 
-## New models
+## Model Support Scope
 
-| Model | Modality | Effort |
-| :--- | :--- | :--- |
-| MiniMax-H3 (33B) | Video and audio | L |
-| LingBot-World 2.0 (14B) | Interactive world model | L |
-| Cosmos3-Nano (15.8B) | Video and world | M |
-| Z-Image / Z-Image-Turbo (6.15B) | Image | S |
-| Qwen3-Omni (30B-A3B) | Omni (any-to-any) | L |
-| HunyuanVideo 1.5 | Video | M |
-| Stable Diffusion 3.5 (Large, Medium) | Image | S |
-| Qwen3-TTS (1.7B) | Text to speech | M |
+Our focus is on video and audio generation, world models, and TTS and audio
+models. The models below are examples, not a full list.
 
-Effort is a rough relative estimate: S (small), M (medium), L (large).
+| Category | Example models |
+| :--- | :--- |
+| Video and audio generation | MiniMax-H3, HunyuanVideo 1.5 |
+| World models | LingBot-World 2.0, Cosmos3-Nano |
+| TTS and audio | Qwen3-TTS, Qwen3-Omni |
+| Image generation | Z-Image, Stable Diffusion 3.5 |
 
-## New features
+## Feature Support Scope
 
-### **Entrypoint / API**
-
-| Feature | Upstream vLLM-Omni | TPU today |
-| :--- | :--- | :--- |
-| Streaming output, step execution, batching | Per pipeline; streaming is experimental | Untested |
-| Interactive world models | Experimental; see [RFC #9565](https://github.com/vllm-project/vllm-omni/issues/9565) | Not working: causal attention falls back to SDPA |
-
-
-### **Connectors (Mooncake, NIXL, etc.)**
-
-| Feature | Upstream vLLM-Omni | TPU today |
-| :--- | :--- | :--- |
-| Disaggregated multi-stage serving | Supported, e.g. Wan stages ([#6285](https://github.com/vllm-project/vllm-omni/issues/6285)) | Not working: multi-rank stages are unsupported |
-| Mooncake device-to-device connector | Mooncake store and transfer-engine connectors (NIXL, Mori also) | Not yet: stage outputs pass through CPU shared memory |
-
-### **Tensor caching / quantization**
-
-| Feature | Upstream vLLM-Omni | TPU today |
-| :--- | :--- | :--- |
-| TeaCache / Cache-DiT | Supported | Untested; lossy, needs a quality check |
-| FP8 linears and FP8 attention | Supported on CUDA | No FP8 path yet |
-
-### **Parallelism / multi-host**
-
-| Feature | Upstream vLLM-Omni | TPU today |
-| :--- | :--- | :--- |
-| Ring / 2-D ring attention | Supported | Not working: torch_tpu P2P send hangs |
-| VAE tiling / parallel decode | Supported | Slow decode; faster decode in draft [#2459](https://github.com/vllm-project/vllm-torchtpu/pull/2459) |
-| Multi-host support | Ray multi-node | Single host only |
-
-### **Misc**
-
-| Feature | Upstream vLLM-Omni | TPU today |
-| :--- | :--- | :--- |
-| Zero-recompile / shape bucketing | Inductor compile (not on TPU) | Partial: first requests still pay compile time |
+| Area | Planned TPU support |
+| :--- | :--- |
+| Entrypoints / API | All vLLM-Omni entrypoints, including streaming output and interactive world models |
+| Connectors | Multi-stage serving with the Mooncake connector; NIXL is not planned |
+| Parallelism | All parallelism strategies, including ring attention, parallel VAE decode and multi-host |
+| Caching / quantization | TeaCache and Cache-DiT after a quality check; FP8 linears and attention |
+| Compilation | Shape bucketing so that serving does not recompile |
 
 ## Hardware
 
@@ -66,7 +36,7 @@ We plan to support future hardware.
 ## Maintenance
 
 - The `omni` extra pins a vLLM-Omni release; we bump it as new releases ship.
-- At each pin bump we recheck the runtime patches in `patches.py` and
-  `platform.py` and drop obsolete ones.
+- At each pin bump we recheck the runtime patches in `patches.py` and drop
+  obsolete ones.
 - Omni tests live in [`tests_omni/`](../../../tests_omni/).
 - Omni owners in [CODEOWNERS](../../../.github/CODEOWNERS) triage omni issues.
