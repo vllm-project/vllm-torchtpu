@@ -25,7 +25,7 @@ from torch_tpu._internal.profiler import TpuProfilerConfig
 from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbeddingBase
 from vllm.v1.core.sched.output import SchedulerOutput as VllmSchedulerOutput
 
-from vllm_torchtpu import profiler_trace
+from vllm_torchtpu import envs, profiler_trace
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -487,6 +487,8 @@ def relayout_rope_tables(model: torch.nn.Module):
     # id(original) -> (original, row-major copy); holding the original keeps
     # its id from being reused while the map is live.
     relaid: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+    # id(original) -> two-row-packed copy (`_tpu_rope_pairs`), shared likewise.
+    paired: dict[int, torch.Tensor] = {}
     for name, module in model.named_modules():
         table = getattr(module, "_tpu_rope_cache", None)
         if not isinstance(table, torch.Tensor) or table.ndim != 2:
@@ -499,8 +501,24 @@ def relayout_rope_tables(model: torch.nn.Module):
                 tuple(table.shape),
             )
         module._tpu_rope_cache = relaid[id(table)][1]
+        if envs.TPU_ROPE_PAIRED_ROWS and 2 * table.shape[1] == 128:
+            if id(table) not in paired:
+                paired[id(table)] = _to_row_major(_pair_rows(table))
+            module._tpu_rope_pairs = paired[id(table)]
     if relaid:
         _install_entry_layout_pin()
+
+
+def _pair_rows(table: torch.Tensor) -> torch.Tensor:
+    """``[rows, D]`` -> ``[ceil(rows / 2), 2D]``: rows ``2i`` and ``2i + 1``
+    side by side, an odd table padded with a copy of its last row.
+
+    Read by `rope_gather.gather_paired_rows`, whose full-lane gather replaces
+    the half-lane one of a 64-wide FP32 table (11.2 -> 1.0 us at 288 tokens).
+    """
+    if table.shape[0] % 2:
+        table = torch.cat([table, table[-1:]])
+    return table.reshape(table.shape[0] // 2, 2 * table.shape[1])
 
 
 def relayout_hash_tables(model: torch.nn.Module):

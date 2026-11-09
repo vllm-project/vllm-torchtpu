@@ -39,6 +39,7 @@ from vllm.model_executor.models.utils import maybe_prefix
 from vllm.models.deepseek_v41.nvidia import model as upstream
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.layers.adapter.fused_moe_ep import mark_dspark_draft_moe
 from vllm_torchtpu.layers.adapter.quantization.deepseek_v41 import DeepseekV41MoE
 from vllm_torchtpu.layers.core import table_lookup
 from vllm_torchtpu.logger import init_logger
@@ -233,6 +234,7 @@ class DSparkDeepseekV41Model(nn.Module):
                 raise ValueError("CSA2 supports DSpark blocks of at most 64 queries")
             layer.attn.non_causal_multi_token_decode = True
             layer.attn.dspark_block_size = int(dspark_block_size)
+            mark_dspark_draft_moe(layer.ffn.experts)
 
         compact_rope_caches(
             (layer.attn for layer in self.layers),

@@ -256,7 +256,7 @@ def reconcile_40_layer_step(
         plus `cache_write_only = 0.295 ms`.
       - `candidate_write` (`L8, 20`): `3.123 ms` (`baseline`) -> `2.273 ms`
         (`precompact`), plus `cache_write_only = 0.295 ms`.
-      - `candidate_filter` (`L24, 28, 32, 36` at `kv_len=90112`): `23.390 ms` (`base`)
+      - `sparse_logits` (`L24, 28, 32, 36` at `kv_len=90112`): `23.390 ms` (`base`)
         -> `22.514 ms` (`precompact`) -> `1.131 ms` (shared-key-tile + SC scatter).
     - `bench_kv_compressor.py`:
       - `project_only` (`L2..39`): `0.2634 ms/layer`.
@@ -486,10 +486,10 @@ def reconcile_40_layer_decode_step(
         `0.7635 ms/layer`, `x38 = 29.011 ms`, `-24.179 ms` across 38 layers).
     - `bench_indexer.py` (`tpu7x-8`):
       - `q=1, T=16, query_split="pad16"` (`part=16`): `all = 4.0610 ms/layer`
-        (`2x source layers`), `candidate_filter = 1.6871 ms/layer` + `cache_write =
+        (`2x source layers`), `sparse_logits = 1.6871 ms/layer` + `cache_write =
         0.4169 ms/layer` (`4x follower layers`) -> `6L total = 16.538 ms`.
       - `q=1, T=16, query_split="ceil"` (`part=2`): `all = 1.9278 ms/layer`
-        (`2x source layers`), `candidate_filter = 0.9122 ms/layer` + `cache_write =
+        (`2x source layers`), `sparse_logits = 0.9122 ms/layer` + `cache_write =
         0.4169 ms/layer` (`4x follower layers`) -> `6L total = 9.172 ms` (`-7.366 ms`).
     - `bench_decode_moe.py` (`tpu7x-8`):
       - `q=1, T=16`: `fused_ep = 0.8588 ms/layer` (`gmm_only = 0.6742 ms`,

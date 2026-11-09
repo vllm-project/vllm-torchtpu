@@ -1026,3 +1026,32 @@ def test_deserialize_entry_does_not_copy_the_entry():
             raise AssertionError("replay must not deepcopy the entry")
 
     assert _deserialize_entry(Entry())(2, 3, 7) == 12
+
+
+def test_tpu_hash_covers_the_expert_layout_contents(tmp_path):
+    """Rewriting the file at the same expert_layout path must invalidate the
+    compile cache: the policy field is only the layout's name."""
+    from vllm_torchtpu import expert_placement
+    from vllm_torchtpu.compilation.tpu_compiler import compute_tpu_compilation_hash
+
+    path = tmp_path / "placement.json"
+    config = TestTpuCompilerCache._config()
+    config.additional_config = {"deepseek_v41": {"expert_layout": str(path)}}
+    with patch(
+        "vllm_torchtpu.compilation.tpu_compiler._iter_runtime_cache_key_files",
+        return_value=[],
+    ):
+        path.write_text('{"experts": 4, "shards": 2, "layers": {}}')
+        expert_placement._read_once.cache_clear()
+        first = compute_tpu_compilation_hash(config)
+        path.write_text(
+            '{"experts": 4, "shards": 2, "layers": {"0": [[2, 0], [3, 1]]}}'
+        )
+        expert_placement._read_once.cache_clear()
+        second = compute_tpu_compilation_hash(config)
+        config.additional_config = {}
+        with patch.dict(os.environ, {"TPU_EXPERT_PLACEMENT": ""}):
+            none = compute_tpu_compilation_hash(config)
+    expert_placement._read_once.cache_clear()
+
+    assert len({first, second, none}) == 3

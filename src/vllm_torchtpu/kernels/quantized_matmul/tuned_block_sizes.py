@@ -630,4 +630,15 @@ def get_tuned_block_sizes(
 BUFFERED_MATMUL_TUNING = {
     (7, 240, 8192, 5120): (1024, 32, 56 * 1024**2),
     (7, 288, 8192, 5120): (1024, 32, 56 * 1024**2),
+    # DSpark main_proj (3 x 5120 target aux hidden -> 5120). v7 single-chip
+    # A/B at T288, bitwise equal to xla_quantized_matmul: 48.7 -> 36.4 us;
+    # windows 512 / 256 measured 40.1 / 45.7 us. About 44 MiB of scratch.
+    (7, 288, 15360, 5120): (1024, 32, 60 * 1024**2),
+}
+
+# fused shared expert: (tpu_version, tokens, hidden, intermediate) ->
+# (gate/up window, down window, stream depth, DMAs per window, quant rows,
+#  vmem bytes)
+SHARED_EXPERT_TUNING = {
+    (7, 288, 5120, 2304): (256, 1024, 3, 2, 32, 56 * 1024**2),
 }

@@ -127,6 +127,20 @@ _RANK_BUFFER: Any = None
 # (`Fp8Config.get_quant_method`), so this is per-layer state without a registry
 # that has to be torn down between models in one process.
 FUSED_MOE_EP_OP_ATTR = "_fused_moe_ep_op"
+# Set beside the op when it was built with the layer's shared expert inside
+# (MOE_FUSED_EP_PUSH_SHARED_EXPERT): the swiglu limit it closed over.
+FUSED_MOE_EP_SHARED_LIMIT_ATTR = "_fused_moe_ep_shared_limit"
+
+# Set on a DSpark draft layer's routed experts (the object prebuild receives)
+# by `mark_dspark_draft_moe`, so that prebuild can build that layer's op with
+# draft-only knobs without the target model's layers seeing them.
+DSPARK_DRAFT_MOE_ATTR = "_dspark_draft_moe"
+
+
+def mark_dspark_draft_moe(experts) -> None:
+    """Tag a DSpark draft layer's `ffn.experts` (a MoE runner, or the routed
+    experts themselves) before its weights are processed."""
+    setattr(getattr(experts, "routed_experts", experts), DSPARK_DRAFT_MOE_ATTR, True)
 
 
 def _squeeze_channel_scale(
@@ -194,16 +208,25 @@ def _build_op(
     has_expert_load=False,
     row_score_bias=False,
     sorted_gather=None,
+    dspark_draft=False,
+    shared_limit: float | None = None,
 ):
     """The op for this closure, built once per distinct closure and reused.
 
     `row_score_bias` takes `score_bias` as [tokens, experts], sharded like the
     tokens, instead of one replicated row.
 
+    `dspark_draft` marks a DSpark draft layer (`mark_dspark_draft_moe`). Under
+    the push build and TPU_DSPARK_DRAFT_MOE_TUNING it gets its own knobs,
+    sc_prepush=1 and two tile-height rungs, in place of the process-wide envs;
+    every other layer is built exactly as before.
+
     `has_expert_slot` adds the expert layout's slot table as one more
     replicated operand (expert_placement.py): the table's values are data, so
     every placed layer of a model shares this one op and one exported program
-    per shape.
+    per shape. A `shared_limit` adds the layer's FP8 shared expert (w13, s13,
+    w2, s2; replicated) as four trailing operands, computed inside the op
+    (push only), and the op returns (routed, shared).
 
     `sorted_gather` is `ep_sorted_gather_group()`'s (group, positions), or
     None for the single fused program. With it the op is a `_SortedGatherOp`.
@@ -224,7 +247,24 @@ def _build_op(
             sc_prepush=envs.MOE_FUSED_EP_PUSH_SC_PREPUSH,
             tc_exchange=envs.MOE_FUSED_EP_PUSH_TC_EXCHANGE,
             height_rungs_override=envs.MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE,
+            tail_barrier=envs.MOE_FUSED_EP_PUSH_TAIL_BARRIER,
+            onehot_slots=envs.MOE_FUSED_EP_PUSH_ONEHOT_SLOTS,
+            hbm_staging=envs.MOE_FUSED_EP_PUSH_HBM_STAGING,
+            dispatch_ahead=envs.MOE_FUSED_EP_PUSH_DISPATCH_AHEAD,
+            matmul_scale_repeat=envs.MOE_FUSED_EP_PUSH_MATMUL_SCALE_REPEAT,
+            exchange_row_gather=envs.MOE_FUSED_EP_PUSH_EXCHANGE_ROW_GATHER,
+            bf16_sort_counts=envs.MOE_FUSED_EP_PUSH_BF16_SORT_COUNTS,
+            slim_prepush_barrier=envs.MOE_FUSED_EP_PUSH_SLIM_PREPUSH_BARRIER,
+            fused_dispatch_meta=envs.MOE_FUSED_EP_PUSH_FUSED_DISPATCH_META,
+            table_kernel=envs.MOE_FUSED_EP_PUSH_TABLE_KERNEL,
+            exchange_tables=envs.MOE_FUSED_EP_PUSH_EXCHANGE_TABLES,
+            kernel_plan_tables=envs.MOE_FUSED_EP_PUSH_KERNEL_PLAN_TABLES,
+            light_prepush=envs.MOE_FUSED_EP_PUSH_LIGHT_PREPUSH,
+            single_barrier=envs.MOE_FUSED_EP_PUSH_SINGLE_BARRIER,
+            early_scale_scatter=envs.MOE_FUSED_EP_PUSH_EARLY_SCALE_SCATTER,
         )
+        if dspark_draft and envs.TPU_DSPARK_DRAFT_MOE_TUNING:
+            impl_kw.update(sc_prepush=1, height_rungs_override=2)
 
     preprocess_topology = prepare_moe_preprocessing(mesh)
 
@@ -249,6 +289,8 @@ def _build_op(
         envs.MOE_FUSED_EP_KERNEL_IMPL,
         tuple(sorted(impl_kw.items())),
         None if sorted_gather is None else sorted_gather[1],
+        has_expert_slot,
+        shared_limit,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -263,9 +305,15 @@ def _build_op(
         scoring_fn=scoring_fn, routed_scaling_factor=routed_scaling_factor
     )
 
+    if shared_limit is not None and envs.MOE_FUSED_EP_KERNEL_IMPL != "push":
+        raise ValueError("MOE_FUSED_EP_PUSH_SHARED_EXPERT needs the push kernel")
+
     # Any: the layer, route or compute result depending on bias_kw's stage;
     # each wrapper below declares the one it returns.
     def call(x, w1, w2, w1_scale, w2_scale, gating, rank, **bias_kw) -> Any:
+        if shared_limit is not None:
+            bias_kw["shared_expert"] = tuple(bias_kw.pop(n) for n in _SHARED_OPERANDS)
+            bias_kw["shared_limit"] = shared_limit
         # The router's top-k selector writes into an f32 accumulator ref, so a
         # bf16 gate output -- which is what the model's gate matmul produces --
         # fails inside the kernel on a dtype mismatch. Widen at the boundary;
@@ -510,6 +558,9 @@ def _build_op(
         # The routed-row accumulator is per physical slot and identical on
         # every shard: replicated, donated, returned as a second output.
         + ((PartitionSpec(),) if has_expert_load else ())
+        # Every rank holds the whole shared expert.
+        + (PartitionSpec(),)
+        * (len(_SHARED_OPERANDS) if shared_limit is not None else 0)
     )
     load_argnum = 7 + has_score_bias + has_hash_ids + has_expert_slot
     # Stock jax_op. It used to size its outputs from the export's avals, where
@@ -518,50 +569,52 @@ def _build_op(
     # JaxCallable with that one line replaced, was the way around it. Torchtpu
     # takes output_partition_specs itself now, which is the same information
     # without a copy of anyone's source.
-    if has_expert_slot and has_expert_load:
-        if has_score_bias:
-            fn = moe_with_score_bias_expert_slot_expert_load
-        elif has_hash_ids:
-            fn = moe_with_hash_ids_expert_slot_expert_load
-        else:
-            fn = moe_with_expert_slot_expert_load
-    elif has_expert_slot:
-        if has_score_bias:
-            fn = moe_with_score_bias_expert_slot
-        elif has_hash_ids:
-            fn = moe_with_hash_ids_expert_slot
-        else:
-            fn = moe_with_expert_slot
+    if has_expert_slot or shared_limit is not None:
+        fn = _operand_fn(
+            call,
+            ("score_bias",) * has_score_bias
+            + ("hash_ids",) * has_hash_ids
+            + ("expert_slot",) * has_expert_slot
+            + ("expert_load",) * has_expert_load
+            + (_SHARED_OPERANDS if shared_limit is not None else ()),
+            outputs=1 + has_expert_load + (shared_limit is not None),
+        )
     elif has_score_bias:
         fn = moe_with_score_bias
     elif has_hash_ids:
         fn = moe_with_hash_ids
     else:
         fn = moe
+    # One spec per output (a single spec for a tuple fails Dynamo's output
+    # pytree): the accumulator is replicated, the shared expert sharded like x.
+    out_specs = (
+        (spec,)
+        + ((PartitionSpec(),) if has_expert_load else ())
+        + ((spec,) if shared_limit is not None else ())
+    )
     op = jax_op(
         name,
         fn,
         mesh=mesh,
         # x, w1, w2, w1_scale, w2_scale, gating, rank [, score_bias | hash_ids]
         # [, expert_slot] [, expert_load] -- and the output is sharded on
-        # axis 0 like x, followed by the updated accumulator when it is taken.
+        # axis 0 like x, followed by the updated accumulator when it is taken
+        # and the shared expert when it is computed in the op.
         input_partition_specs=input_specs,
-        output_partition_specs=(spec, PartitionSpec()) if has_expert_load else spec,
+        output_partition_specs=out_specs if len(out_specs) > 1 else spec,
         donate_argnums=(load_argnum,) if has_expert_load else None,
     )
 
     # Replaces the fake jax_op installs, which resolves the output aval by
     # running a real `jax.export` every time Dynamo traces the op. This kernel
     # returns the rows it was given, so the answer is known without exporting.
-    if has_expert_load:
-
-        def _fake(x, *args, **_kwargs):
-            return torch.empty_like(x), torch.empty_like(args[load_argnum - 1])
-
-    else:
-
-        def _fake(x, *_args, **_kwargs):
-            return torch.empty_like(x)
+    def _fake(x, *args, **_kwargs):
+        outs = (torch.empty_like(x),)
+        if has_expert_load:
+            outs += (torch.empty_like(args[load_argnum - 1]),)
+        if shared_limit is not None:
+            outs += (torch.empty_like(x),)
+        return outs if len(outs) > 1 else outs[0]
 
     op.register_fake(_fake)
     if sorted_gather is not None:
@@ -768,6 +821,55 @@ def _build_split_ops(
     return _SortedGatherOp(route_op, compute_op, group)
 
 
+# The dtype each optional operand is handed to fused_ep_moe_v2 in; None keeps it.
+_OPERAND_DTYPES = {
+    "score_bias": jnp.float32,
+    "hash_ids": jnp.int32,
+    "expert_slot": None,
+    "expert_load": jnp.int32,
+    **dict.fromkeys(("shared_w13", "shared_s13", "shared_w2", "shared_s2")),
+}
+# Operands whose keyword in the kernel call differs from their operand name.
+_KERNEL_KWARGS = {"hash_ids": "hash_topk_ids"}
+_SHARED_OPERANDS = ("shared_w13", "shared_s13", "shared_w2", "shared_s2")
+
+
+def _operand_fn(call, names, outputs=1):
+    """`call` behind the signature (x, w1, w2, w1_scale, w2_scale, gating,
+    rank, *names), every operand annotated jax.Array as torch_tpu requires.
+
+    The three fixed-arity functions in _build_op cover the unplaced layers and
+    keep their programs as they were; every combination with a slot table goes
+    through here instead of one more hand-written function per combination.
+    """
+    import inspect
+    import types
+
+    fixed = ("x", "w1", "w2", "w1_scale", "w2_scale", "gating", "rank")
+
+    def fn(*operands):
+        extra = dict(zip(names, operands[len(fixed) :], strict=True))
+        kw = {
+            _KERNEL_KWARGS.get(n, n): (
+                v if _OPERAND_DTYPES[n] is None else v.astype(_OPERAND_DTYPES[n])
+            )
+            for n, v in extra.items()
+        }
+        return call(*operands[: len(fixed)], **kw)
+
+    param = inspect.Parameter.POSITIONAL_OR_KEYWORD
+    ret = (
+        jax.Array if outputs == 1 else types.GenericAlias(tuple, (jax.Array,) * outputs)
+    )
+    fn.__signature__ = inspect.Signature(  # type: ignore[attr-defined]
+        [inspect.Parameter(n, param, annotation=jax.Array) for n in fixed + names],
+        return_annotation=ret,
+    )
+    fn.__annotations__ = {n: jax.Array for n in fixed + names} | {"return": ret}
+    fn.__name__ = "moe_with_" + "_".join(names)
+    return fn
+
+
 def fused_moe_ep(
     owner: Any,
     hidden_states: torch.Tensor,
@@ -780,7 +882,8 @@ def fused_moe_ep(
     hash_ids: torch.Tensor | None = None,
     expert_slot: torch.Tensor | None = None,
     expert_load: torch.Tensor | None = None,
-) -> torch.Tensor:
+    shared_expert: tuple[torch.Tensor, ...] | None = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Run one MoE layer through the fused EP kernel.
 
     Takes this rank's own tokens and returns this rank's own tokens: the
@@ -798,7 +901,8 @@ def fused_moe_ep(
     written back here. Each must be passed exactly when
     prebuild saw the corresponding thing on the layer -- prebuild built the
     op's signature around that. Getting it wrong is a torch arity error at the
-    first call, not a wrong answer.
+    first call, not a wrong answer. `shared_expert` (w13, s13, w2, s2) goes
+    with an op built with a shared limit, which then returns (routed, shared).
     """
     op = getattr(owner, FUSED_MOE_EP_OP_ATTR)
     if w1.dtype == torch.float4_e2m1fn_x2:
@@ -821,13 +925,14 @@ def fused_moe_ep(
     extra = tuple(
         t for t in (score_bias, hash_ids, expert_slot, expert_load) if t is not None
     )
+    extra += tuple(shared_expert or ())
     result = op(hidden_states, w1, w2, *scales, router_logits, _RANK_BUFFER, *extra)
     if expert_load is None:
         return result
-    out, updated = result
+    out, updated, *shared = result
     # The operand was donated: the buffer holds nothing useful until this.
     expert_load.copy_(updated)
-    return out
+    return (out, *shared) if shared else out
 
 
 def _simulated_routing_operands(
@@ -1001,6 +1106,7 @@ def prebuild_fused_moe_ep(
     logical_intermediate_size: int | None = None,
     policy: FusedEPPolicy = FusedEPPolicy.LEGACY,
     row_score_bias: bool = False,
+    shared_limit: float | None = None,
 ) -> Any | None:
     """Resolve the mesh and build the fused-EP op for one layer.
 
@@ -1029,6 +1135,8 @@ def prebuild_fused_moe_ep(
     down weights; only the loader that creates that padding may supply it.
     `row_score_bias` says the caller will pass `score_bias` as [tokens,
     experts], one row per token, instead of the staged [experts] vector.
+    `shared_limit` builds the op with the layer's shared expert inside (see
+    `_build_op`); the caller then passes it on every forward.
     """
     if policy == FusedEPPolicy.LEGACY:
         if not envs.USE_MOE_FUSED_EP_KERNEL:
@@ -1215,8 +1323,15 @@ def prebuild_fused_moe_ep(
         has_expert_load=placed is not None and expert_load_tap.enabled(),
         row_score_bias=row_score_bias,
         # The split route/compute ops take neither the expert layout's
-        # operands nor a per-row score bias; those layers keep one program.
-        sorted_gather=(None if placed is not None or row_score_bias else sorted_gather),
+        # operands, a per-row score bias, nor the in-op shared expert; those
+        # layers keep one program.
+        sorted_gather=(
+            None
+            if placed is not None or row_score_bias or shared_limit is not None
+            else sorted_gather
+        ),
+        dspark_draft=bool(getattr(layer, DSPARK_DRAFT_MOE_ATTR, False)),
+        shared_limit=shared_limit,
     )
     logger.info_once(
         "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d "

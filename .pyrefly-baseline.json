@@ -381,6 +381,11 @@
       "concise_description": "Object of class `NoneType` has no attribute `shape`"
     },
     {
+      "path": "src/vllm_torchtpu/runner/utils.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `shape`"
+    },
+    {
       "path": "src/vllm_torchtpu/spec_decode/eagle3.py",
       "name": "unbound-name",
       "concise_description": "`last_token_indices` may be uninitialized"

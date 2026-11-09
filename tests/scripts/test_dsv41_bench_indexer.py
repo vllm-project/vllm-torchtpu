@@ -134,11 +134,11 @@ def test_visible_top_k_signed_zero_and_lengths_mask_cpu():
 
 
 @pytest.mark.parametrize(
-    ("cand_write", "cand_filter"),
+    ("cand_write", "sparse_logits"),
     [(False, False), (True, False), (False, True)],
 )
 def test_paged_indexer_jax_subops_precompact_matches_baseline_cpu(
-    cand_write: bool, cand_filter: bool
+    cand_write: bool, sparse_logits: bool
 ):
     inp = bi._build_indexer_inputs(
         rng_seed=77,
@@ -174,7 +174,7 @@ def test_paged_indexer_jax_subops_precompact_matches_baseline_cpu(
         topk=32,
         block_size=16,
         candidate_write=cand_write,
-        candidate_filter=cand_filter,
+        sparse_logits=sparse_logits,
         unordered=False,
         batch_max=batch_max,
     )
@@ -189,7 +189,7 @@ def test_paged_indexer_jax_subops_precompact_matches_baseline_cpu(
         topk=32,
         block_size=16,
         candidate_write=cand_write,
-        candidate_filter=cand_filter,
+        sparse_logits=sparse_logits,
         unordered=True,
         batch_max=batch_max,
     )

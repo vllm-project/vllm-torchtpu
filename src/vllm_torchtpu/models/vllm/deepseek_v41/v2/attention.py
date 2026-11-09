@@ -832,7 +832,12 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         cached = stage_cache.get(key) if stage_cache is not None else None
         if cached is not None and cached[0] is positions and cached[1] is table:
             return cached[2]
-        rows = preprocess_ops.rope_rows()(table, positions)
+        # Set at load (runner.utils.relayout_rope_tables) for 64-wide tables.
+        pairs = getattr(self, "_tpu_rope_pairs", None)
+        if pairs is not None:
+            rows = preprocess_ops.rope_paired_rows_sc()(pairs, positions)
+        else:
+            rows = preprocess_ops.rope_rows()(table, positions)
         if stage_cache is not None:
             stage_cache[key] = (positions, table, rows)
         return rows
@@ -1686,6 +1691,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                                 weights,
                                 lengths,
                                 swa_valid,
+                                query_start_loc=keys_meta.query_start_loc,
                             )
                         else:
                             index_q = self._project_index_q(qr, positions)
@@ -1865,6 +1871,8 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     tp_rank=self._tp_rank_1d,
                 )
             else:
+                # The op zeroes the invalid rows itself (in the shared DSpark
+                # draft kernel's write-back).
                 result = paged_attention(
                     q,
                     swa_cache,
@@ -1874,7 +1882,10 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     self.attn_sink,
                     self.scale,
                     self._swa_query_group_size,
+                    row_valid=swa_valid,
                 )
+                output.copy_(result)
+                return None
             output.copy_(result.masked_fill(swa_invalid_3d, 0))
             return None
         if self._fp8_kv and self.compress_ratio:
@@ -1951,8 +1962,13 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         weights,
         lengths,
         swa_valid,
+        query_start_loc=None,
     ):
-        """Select logical indices from the already-published Index-K cache."""
+        """Select logical indices from the already-published Index-K cache.
+
+        ``query_start_loc``: request row boundaries of ``qr``, which spare the
+        FP8 indexer from deriving them from ``requests``.
+        """
         indexer = self.indexer
         count = qr.shape[0]
         packed_fp8 = isinstance(index_cache, PackedFP8IndexCacheRows)
@@ -2036,6 +2052,13 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 lengths_part,
                 requests_part,
             ) = cached_query_split
+        offsets_part = None
+        if packed_fp8 and query_start_loc is not None:
+            # This rank's rows [rank * part, rank * part + part) of each request.
+            offsets_part = query_start_loc.int()
+            if split:
+                part = positions_part.shape[0]
+                offsets_part = (offsets_part - self._tp_rank * part).clamp(0, part)
         if split:
             qr_part, weights_part, candidates_part = (
                 torch.cat((x, x.new_full((padding, *x.shape[1:]), fill))).index_select(
@@ -2075,6 +2098,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             unordered=self._fp8_kv,
             score_width=max(1, self._max_model_len // self.compress_ratio),
             stage_cache=stage_cache if not split else None,
+            query_start_loc=offsets_part,
         )
         if split:
             selected = _gather_query_rows(selected)[:count]
@@ -2198,6 +2222,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             # Register before TorchDynamo captures the first model forward.
             eps = self.kv_norm.variance_epsilon
             preprocess_ops.rope_rows()
+            preprocess_ops.rope_paired_rows_sc()
             preprocess_ops.qa_rope(True, eps)
             preprocess_ops.qa_rope(False, eps)  # DSpark context KV
             preprocess_ops.qb_rope()

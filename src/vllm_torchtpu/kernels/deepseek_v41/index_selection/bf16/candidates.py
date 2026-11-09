@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Request unions and reusable index keys for candidate-filtered decode.
+"""Request unions and reusable index keys for sparse-layer decode.
 
 The caller owns cache lifetime and falls back when any union overflows. IDs are
 ascending logical blocks; membership is applied before selection for every Q.

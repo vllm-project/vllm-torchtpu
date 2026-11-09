@@ -70,20 +70,40 @@ def _take_small(table, idx):
 ARGSORT_MIN_TOKENS = 512
 
 
-def _sorted_tokens_by_count(pid, seg_start_local, seg_end, *, e_total, t_local, topk):
-    """Token of each expert-sorted row via per-expert running counts (decode)."""
+def _sorted_tokens_by_count(
+    pid, seg_start_local, seg_end, *, e_total, t_local, topk, bf16_counts=False
+):
+    """Token of each expert-sorted row via per-expert running counts (decode).
+
+    `bf16_counts` reads the running counts as two single-pass bf16 matmuls
+    over 0/1 operands (the selection of row j's expert, then a prefix sum
+    over tokens) instead of a cumsum and a HIGHEST-precision matmul over the
+    counts; every product is 0 or 1 and every sum at most t_local, exact in
+    the f32 accumulator, so the tokens are the same."""
     n = pid.shape[0]
     sel = jnp.any(
         pid.reshape(t_local, topk)[:, :, None] == jnp.arange(e_total)[None, None, :],
         axis=1,
     )
-    C = jnp.cumsum(sel.astype(jnp.int32), axis=0)  # [t_local, e_total]
     jj = jnp.arange(n, dtype=jnp.int32)
     ge_j = jnp.minimum(
         jnp.sum(seg_end[None, :] <= jj[:, None], axis=1).astype(jnp.int32),
         e_total - 1,
     )
     m_j = jj - _take_small(seg_start_local, ge_j)
+    if bf16_counts:
+        onehot = (ge_j[:, None] == jnp.arange(e_total)[None, :]).astype(jnp.bfloat16)
+        hits = jnp.dot(
+            onehot, sel.T.astype(jnp.bfloat16), preferred_element_type=jnp.float32
+        ).astype(jnp.bfloat16)  # [n, t_local] = sel[:, ge_j]
+        tri = (jnp.arange(t_local)[:, None] <= jnp.arange(t_local)[None, :]).astype(
+            jnp.bfloat16
+        )
+        col = jnp.dot(hits, tri, preferred_element_type=jnp.float32).astype(jnp.int32)
+        return jnp.minimum(
+            jnp.sum(col <= m_j[:, None], axis=1).astype(jnp.int32), t_local - 1
+        )
+    C = jnp.cumsum(sel.astype(jnp.int32), axis=0)  # [t_local, e_total]
     # The token of row j is the m_j-th token selecting expert ge_j: a count
     # over C's column ge_j, read through a one-hot matmul (exact in f32 at
     # these sizes, Precision.HIGHEST) rather than a gather.
@@ -106,17 +126,10 @@ def _sorted_tokens_by_argsort(pid, seg_end, *, t_local, topk):
     return jnp.where(jj < seg_end[-1], order // topk, jnp.int32(t_local - 1))
 
 
-def local_sort_activations(my_pairs, my_counts, q_l, *, e_total, topk):
-    """Sort this shard's rows `q_l` by global expert, tokens ascending within.
-
-    `my_pairs` [t_local * topk] are this shard's selections (e_total = routes
-    nowhere) and `my_counts` [e_total] their per-expert counts. Depends only
-    on local routing, so it runs on the TensorCore while the routing
-    exchange is in flight. Returns `(q_sorted, seg_start)`: row j of q_sorted
-    is the j-th routed pair in (expert, token) order and seg_start [e_total]
-    the first row of each expert's run. Decode sizes find each row's token
-    by counting; above ARGSORT_MIN_TOKENS a stable argsort (same result).
-    """
+def local_sort_tokens(my_pairs, my_counts, *, e_total, topk, bf16_counts=False):
+    """`local_sort_activations` without the row gather: `(tok, seg_start)`,
+    tok [t_local * topk] the source row of each expert-sorted row
+    (`bf16_counts`: see _sorted_tokens_by_count)."""
     n = my_pairs.shape[0]
     t_local = n // topk
     my_pairs = my_pairs.astype(jnp.int32)
@@ -129,10 +142,34 @@ def local_sort_activations(my_pairs, my_counts, q_l, *, e_total, topk):
         tok_j = _sorted_tokens_by_argsort(pid, seg_end, t_local=t_local, topk=topk)
     else:
         tok_j = _sorted_tokens_by_count(
-            pid, seg_start_local, seg_end, e_total=e_total, t_local=t_local, topk=topk
+            pid,
+            seg_start_local,
+            seg_end,
+            e_total=e_total,
+            t_local=t_local,
+            topk=topk,
+            bf16_counts=bf16_counts,
         )
-    q_sorted = q_l[tok_j]
-    return q_sorted, seg_start_local
+    return tok_j, seg_start_local
+
+
+def local_sort_activations(
+    my_pairs, my_counts, q_l, *, e_total, topk, bf16_counts=False
+):
+    """Sort this shard's rows `q_l` by global expert, tokens ascending within.
+
+    `my_pairs` [t_local * topk] are this shard's selections (e_total = routes
+    nowhere) and `my_counts` [e_total] their per-expert counts. Depends only
+    on local routing, so it runs on the TensorCore while the routing
+    exchange is in flight. Returns `(q_sorted, seg_start)`: row j of q_sorted
+    is the j-th routed pair in (expert, token) order and seg_start [e_total]
+    the first row of each expert's run. Decode sizes find each row's token
+    by counting; above ARGSORT_MIN_TOKENS a stable argsort (same result).
+    """
+    tok_j, seg_start_local = local_sort_tokens(
+        my_pairs, my_counts, e_total=e_total, topk=topk, bf16_counts=bf16_counts
+    )
+    return q_l[tok_j], seg_start_local
 
 
 def push_dispatch_segments(
@@ -157,6 +194,42 @@ def push_dispatch_segments(
     receive pair count per local expert (g_local), remote rows sent (1),
     rows sent (1)]. visit [ep, g_local] is every shard's visit list.
     """
+    g_local = e_total // ep
+    seg, visit, _, cnt, recv, d_grid = _segment_grids(
+        expert_rows_aligned,
+        run_start_aligned,
+        rows_by_dest,
+        me,
+        seg_start_local,
+        e_total=e_total,
+        ep=ep,
+    )
+    n_remote = jnp.sum(jnp.where(d_grid != me, cnt, 0)).astype(jnp.int32).reshape(1)
+    n_sent = jnp.sum(cnt).astype(jnp.int32).reshape(1)
+    # Words [0, g_local] are not read by anyone: they are padding that puts
+    # `recv` at g_local + 1 and the two counts at 2 * g_local + 1 / + 2, the
+    # fixed offsets the kernel reads its scalar-prefetched `dmeta_sm` at (and
+    # layer.py slices). Dropping them would mean shifting those offsets in
+    # the kernel, which this table's consumers were compiled and measured
+    # with, so the layout stays as is.
+    meta = jnp.concatenate(
+        [jnp.zeros((g_local + 1,), jnp.int32), recv, n_remote, n_sent]
+    )
+    return seg, meta, visit
+
+
+def _segment_grids(
+    expert_rows_aligned,
+    run_start_aligned,
+    rows_by_dest,
+    me,
+    seg_start_local,
+    *,
+    e_total,
+    ep,
+):
+    """(seg, visit, hit_v, cnt, recv, d_grid): the segment table and the
+    (visit position, destination) grids it is built from."""
     g_local = e_total // ep
     rows_sh = expert_rows_aligned.astype(jnp.int32).reshape(ep, g_local)
     visit, n_visit = jax.vmap(lambda r: expert_visit_list(r, g_local))(rows_sh)
@@ -189,18 +262,71 @@ def push_dispatch_segments(
     recv = lax.dynamic_slice(
         rows_by_dest.astype(jnp.int32), (0, me * g_local), (ep, g_local)
     ).sum(axis=0)
-    n_remote = jnp.sum(jnp.where(d_grid != me, cnt, 0)).astype(jnp.int32).reshape(1)
-    n_sent = jnp.sum(cnt).astype(jnp.int32).reshape(1)
-    # Words [0, g_local] are not read by anyone: they are padding that puts
-    # `recv` at g_local + 1 and the two counts at 2 * g_local + 1 / + 2, the
-    # fixed offsets the kernel reads its scalar-prefetched `dmeta_sm` at (and
-    # layer.py slices). Dropping them would mean shifting those offsets in
-    # the kernel, which this table's consumers were compiled and measured
-    # with, so the layout stays as is.
-    meta = jnp.concatenate(
-        [jnp.zeros((g_local + 1,), jnp.int32), recv, n_remote, n_sent]
+    return seg, visit, hit_v, cnt, recv, d_grid
+
+
+def push_dispatch_tables(
+    expert_rows_aligned,
+    run_start_aligned,
+    rows_by_dest,
+    me,
+    seg_start_local,
+    *,
+    e_total,
+    ep,
+    n_pre,
+):
+    """push_dispatch_segments' (seg, meta, visit) plus what the layer hands
+    the SparseCore pre-push of visit positions [0, n_pre) and the
+    TensorCore kernel, built from the same grids rather than decoded back
+    out of seg and meta: (seg, meta, visit, my_visit [g_local], counts_sc
+    i32[8]).
+
+    meta's remote-rows word counts only the positions >= n_pre (the rows
+    the TensorCore kernel itself sends). counts_sc = [rows landing here at
+    the pre-pushed positions v with v % 2 == 0, with v % 2 == 1, remote rows
+    this shard sends at those even / odd positions, 0 x 4]: SparseCore core
+    c pushes the positions v with v % 2 == c.
+    """
+    g_local = e_total // ep
+    seg, visit, hit_v, cnt, recv, d_grid = _segment_grids(
+        expert_rows_aligned,
+        run_start_aligned,
+        rows_by_dest,
+        me,
+        seg_start_local,
+        e_total=e_total,
+        ep=ep,
     )
-    return seg, meta, visit
+    remote = jnp.where(d_grid != me, cnt, 0)  # [g_local (v), ep (d)]
+    me_row = jnp.arange(ep, dtype=jnp.int32)[:, None] == me
+    my_visit = jnp.sum(jnp.where(me_row, visit, 0), axis=0).astype(jnp.int32)
+    # Rows landing here at each of my visit positions.
+    rows_at_v = jnp.sum(
+        jnp.where(me_row[:, :, None] & hit_v, recv[None, None, :], 0), axis=(0, 2)
+    )
+    # Every count is one row of a single [8, g_local] reduction: a sum that
+    # ends in a vector, rather than a stack of reductions to scalars.
+    v = jnp.arange(g_local, dtype=jnp.int32)
+    pre, odd = v < n_pre, (v & 1) == 1
+    remote_v = remote.sum(axis=1)
+    zero = jnp.zeros_like(rows_at_v)
+    counts = jnp.stack(
+        [
+            jnp.where(pre & ~odd, rows_at_v, 0),
+            jnp.where(pre & odd, rows_at_v, 0),
+            jnp.where(pre & ~odd, remote_v, 0),
+            jnp.where(pre & odd, remote_v, 0),
+            jnp.where(v >= n_pre, remote_v, 0),
+            cnt.sum(axis=1),
+            zero,
+            zero,
+        ]
+    ).sum(axis=1, dtype=jnp.int32)
+    counts_sc = jnp.concatenate([counts[:4], jnp.zeros((4,), jnp.int32)])
+    # meta as push_dispatch_segments lays it out (see there).
+    meta = jnp.concatenate([jnp.zeros((g_local + 1,), jnp.int32), recv, counts[4:6]])
+    return seg, meta, visit, my_visit, counts_sc
 
 
 def _rank_within_window(expert_blocks, window):
@@ -357,3 +483,59 @@ def build_routing_tables_sharded(
         n_tokens=T,
         topk=K,
     )
+
+
+def routing_pairs_from_tables(
+    me,
+    gathered,
+    recv_base_me,
+    mirror_base,
+    run_base,
+    *,
+    e_total,
+    ep,
+    t_local,
+    block,
+    shard_stride,
+):
+    """build_routing_tables_sharded's per-pair tables -- (pos, mirror_pos,
+    slab_row rebased as local_slab_rows rebases it) -- from the small tables
+    plan_kernel.build_push_tables already built: this shard's arrival base
+    recv_base_me [e_total] (the plan's my_recv_base), mirror_base [e_total]
+    (the mirror table less my_off) and run_base [ep, g_local] (the slab row
+    each (source, local expert) run starts at, in this shard's own slab).
+    Same values as the sharded plan's."""
+    T, K = gathered.n_tokens, gathered.topk
+    n = T * K
+    g_local = e_total // ep
+    n_blocks = n // block
+    blocks_per_dest = (t_local * K) // block
+    expert_blocks = gathered.expert_blocks
+    bins = jnp.arange(e_total, dtype=jnp.int32)
+    window = rank_window(block, blocks_per_dest * block)
+    my_blocks, my_hist = gathered.local_blocks, gathered.block_hist
+    my_off = jnp.cumsum(my_hist, axis=0) - my_hist
+    my_rank = _rank_within_block(my_blocks, block)
+    pos = (
+        _lookup_per_pair(my_off + recv_base_me[None, :], my_blocks, bins) + my_rank
+    ).reshape(t_local, K)
+    mirror_pos = (
+        _lookup_per_pair(my_off + mirror_base[None, :], my_blocks, bins) + my_rank
+    ).reshape(t_local, K)
+    first = me * g_local
+    my_experts = first + jnp.arange(g_local, dtype=jnp.int32)
+    win_hist = _window_hist(expert_blocks, my_experts, window)
+    hist_mine = _over_sub_blocks(win_hist)
+    by_source = hist_mine.reshape(ep, blocks_per_dest, g_local)
+    off_in_source = jnp.cumsum(by_source, axis=1) - by_source
+    row_table = _window_table(
+        (off_in_source + run_base[:, None, :]).reshape(n_blocks, g_local), win_hist
+    )
+    on_me = (expert_blocks >= first) & (expert_blocks < first + g_local)
+    my_row = _lookup_per_sub_pair(
+        row_table, expert_blocks, my_experts, window
+    ) + _rank_within_window(expert_blocks, window)
+    # The sharded plan's off-shard sentinel, rebased like local_slab_rows.
+    off_shard = off_shard_slab_row(shard_stride, ep) - me * shard_stride
+    slab_row = jnp.where(on_me, my_row, off_shard).reshape(-1)
+    return pos, mirror_pos, slab_row

@@ -450,7 +450,7 @@ def paged_indexer_jax(
     topk: int,
     block_size: int,
     candidate_write: bool,
-    candidate_filter: bool,
+    sparse_logits: bool,
     unordered: bool = False,
     batch_max: jax.Array | None = None,
     page_records: int | None = None,
@@ -571,7 +571,7 @@ def paged_indexer_jax(
                     topk,
                     block_size,
                     candidate_write,
-                    candidate_filter,
+                    sparse_logits,
                     unordered,
                     longest,
                 )
@@ -701,7 +701,7 @@ def paged_indexer_jax(
         if (
             jax.default_backend() == "tpu"
             and unordered
-            and not candidate_filter
+            and not sparse_logits
             and (
                 not candidate_write
                 or (
@@ -740,7 +740,7 @@ def paged_indexer_jax(
         columns, query_tile = prefill_tuning.PAGED_INDEXER_PREFILL_BUCKET
         if (
             not candidate_write
-            and not candidate_filter
+            and not sparse_logits
             and topk <= columns
             and q.shape[0] >= query_tile
             and records.shape[1] > columns
@@ -763,7 +763,7 @@ def paged_indexer_jax(
         and jax.default_backend() == "tpu"
         and unordered
         and not candidate_write
-        and not candidate_filter
+        and not sparse_logits
         and streaming_topk.is_supported(records.shape[1], topk)
         and prefill_scores.supports_chunked_prefill(q, pool, page_records)
     ):
@@ -776,7 +776,7 @@ def paged_indexer_jax(
         return jax.lax.cond(prefill, prefill_context, lambda: full_context(None))
 
     width = records.shape[1]
-    if not candidate_filter or candidates.shape[1] * block_size >= width:
+    if not sparse_logits or candidates.shape[1] * block_size >= width:
         return full_context(None)
 
     # Bind shared-query prefill to one scoring pipeline when its static key
@@ -931,7 +931,7 @@ def select_indexer_jax(
     topk: int,
     block_size: int,
     candidate_write: bool,
-    candidate_filter: bool,
+    sparse_logits: bool,
     unordered: bool,
     page_records: int = 0,
     prefill_mode: str = "streaming",
@@ -948,7 +948,7 @@ def select_indexer_jax(
         topk,
         block_size,
         candidate_write,
-        candidate_filter,
+        sparse_logits,
         unordered,
         batch_max,
         page_records or None,
@@ -969,7 +969,7 @@ def select_indexer_2bank_jax(
     topk: int,
     block_size: int,
     candidate_write: bool,
-    candidate_filter: bool,
+    sparse_logits: bool,
     unordered: bool,
     page_records: int = 0,
     prefill_mode: str = "streaming",
@@ -985,7 +985,7 @@ def select_indexer_2bank_jax(
         topk,
         block_size,
         candidate_write,
-        candidate_filter,
+        sparse_logits,
         unordered,
         batch_max,
         page_records or None,
@@ -1013,7 +1013,7 @@ def initialize_indexer():
         topk,
         block_size,
         candidate_write,
-        candidate_filter,
+        sparse_logits,
         unordered,
         page_records=0,
         prefill_mode="streaming",
@@ -1042,7 +1042,7 @@ def initialize_indexer():
         topk,
         block_size,
         candidate_write,
-        candidate_filter,
+        sparse_logits,
         unordered,
         page_records=0,
         prefill_mode="streaming",
@@ -1076,7 +1076,7 @@ def paged_indexer(
     topk,
     block_size,
     candidate_write,
-    candidate_filter,
+    sparse_logits,
     unordered=False,
     batch_max=None,
     page_records=None,
@@ -1106,7 +1106,7 @@ def paged_indexer(
         topk,
         block_size,
         candidate_write,
-        candidate_filter,
+        sparse_logits,
         unordered,
         page_records or 0,
         prefill_mode,

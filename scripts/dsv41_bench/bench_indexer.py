@@ -14,15 +14,15 @@
 """Standalone TPU/CPU micro-benchmark and verifier for DeepSeek-V4.1 Indexer.
 
 Decomposes the 8 Indexer layers (`L2, 8, 14, 20, 24, 28, 32, 36`:
-3 full_context `L2, 8, 14` + 1 candidate_write `L20` + 4 candidate_filter
+3 full_context `L2, 8, 14` + 1 candidate_write `L20` + 4 sparse_logits
 `L24, 28, 32, 36`) into atomic sub-operations:
   - `all`: Full 8-rank query-sharded `paged_indexer` (`write_index_keys` +
     `paged_indexer_jax` on `[T/8, ...]` + `all_gather` to `[T, topk]`).
-  - `full_context`: `paged_indexer_jax(candidate_write=False, candidate_filter=False)`
+  - `full_context`: `paged_indexer_jax(candidate_write=False, sparse_logits=False)`
     (scans all `kv_len // compress_ratio` compressed keys in 512-key tiles).
-  - `candidate_write`: `paged_indexer_jax(candidate_write=True, candidate_filter=False)`
+  - `candidate_write`: `paged_indexer_jax(candidate_write=True, sparse_logits=False)`
     (full context scan + publishes `candidate_topk_blocks` block IDs).
-  - `candidate_filter`: `paged_indexer_jax` (`candidate_filter=True`,
+  - `sparse_logits`: `paged_indexer_jax` (`sparse_logits=True`,
     filters to `candidate_topk_blocks * candidate_block_size` candidate keys/token).
   - `topk_only`: `_visible_top_k` / `_compact_selected` on `float32[T_local, W]`
     scores (testing `+0.0` vs `-0.0` tie-breaking and `-inf` / `lengths` masks).
@@ -50,7 +50,7 @@ SUBOPS = (
     "all",
     "full_context",
     "candidate_write",
-    "candidate_filter",
+    "sparse_logits",
     "topk_only",
     "cache_write_only",
 )
@@ -257,7 +257,7 @@ def _compute_roofline(
             full_flops,
             full_hbm_bytes + topk_hbm_bytes + part * width * 4.0,
         )
-    elif subop == "candidate_filter":
+    elif subop == "sparse_logits":
         flops, hbm_bytes = cand_flops, cand_hbm_bytes + part * cand_width * 4.0
     elif subop == "topk_only":
         flops, hbm_bytes = 0.0, topk_hbm_bytes
@@ -356,7 +356,7 @@ def worker(ctx: common.WorkerContext, args: argparse.Namespace) -> dict[str, Any
         initialize_indexer()
 
         def _make_indexer_subop(
-            cand_write: bool, cand_filter: bool, is_unordered: bool
+            cand_write: bool, sparse_logits: bool, is_unordered: bool
         ):
             def _fn(
                 q_a: jax.Array,
@@ -379,13 +379,13 @@ def worker(ctx: common.WorkerContext, args: argparse.Namespace) -> dict[str, Any
                     topk=geo.index_topk,
                     block_size=geo.candidate_block_size,
                     candidate_write=cand_write,
-                    candidate_filter=cand_filter,
+                    sparse_logits=sparse_logits,
                     unordered=is_unordered,
                     batch_max=bmax_a,
                 )
 
             return pallas.jax_op(
-                f"pallas::dsv41_bench_idx_{int(cand_write)}_{int(cand_filter)}_{int(is_unordered)}",
+                f"pallas::dsv41_bench_idx_{int(cand_write)}_{int(sparse_logits)}_{int(is_unordered)}",
                 _fn,
                 mesh=mesh,
                 input_partition_specs=(P(),) * 8,
@@ -491,7 +491,7 @@ def worker(ctx: common.WorkerContext, args: argparse.Namespace) -> dict[str, Any
                 )
                 return {"selected": sel, "published": pub}
 
-        elif args.subop == "candidate_filter":
+        elif args.subop == "sparse_logits":
 
             def step():
                 sel, pub = cfilter_op(
@@ -532,7 +532,7 @@ def worker(ctx: common.WorkerContext, args: argparse.Namespace) -> dict[str, Any
                     topk=geo.index_topk,
                     block_size=geo.candidate_block_size,
                     candidate_write=True,
-                    candidate_filter=False,
+                    sparse_logits=False,
                     unordered=unordered,
                     batch_max=batch_max_t,
                 )
@@ -617,11 +617,11 @@ def worker(ctx: common.WorkerContext, args: argparse.Namespace) -> dict[str, Any
                 )
                 criteria = common.EXACT
 
-            elif args.subop in ("full_context", "candidate_write", "candidate_filter"):
+            elif args.subop in ("full_context", "candidate_write", "sparse_logits"):
                 ref_fn = {
                     "full_context": full_ref_op,
                     "candidate_write": cwrite_ref_op,
-                    "candidate_filter": cfilter_ref_op,
+                    "sparse_logits": cfilter_ref_op,
                 }[args.subop]
                 ref_sel, ref_pub = ref_fn(
                     q_part,
@@ -670,7 +670,7 @@ def worker(ctx: common.WorkerContext, args: argparse.Namespace) -> dict[str, Any
                     topk=geo.index_topk,
                     block_size=geo.candidate_block_size,
                     candidate_write=True,
-                    candidate_filter=False,
+                    sparse_logits=False,
                     unordered=False,
                     batch_max=batch_max_t,
                 )
@@ -738,7 +738,7 @@ def worker(ctx: common.WorkerContext, args: argparse.Namespace) -> dict[str, Any
                     topk=geo.index_topk,
                     block_size=geo.candidate_block_size,
                     candidate_write=True,
-                    candidate_filter=False,
+                    sparse_logits=False,
                     unordered=True,
                     batch_max=bmax4,
                 )
@@ -759,7 +759,7 @@ def worker(ctx: common.WorkerContext, args: argparse.Namespace) -> dict[str, Any
                     topk=geo.index_topk,
                     block_size=geo.candidate_block_size,
                     candidate_write=True,
-                    candidate_filter=False,
+                    sparse_logits=False,
                     unordered=False,
                     batch_max=bmax4,
                 )
@@ -868,7 +868,7 @@ def worker(ctx: common.WorkerContext, args: argparse.Namespace) -> dict[str, Any
                         cwrite_ref_op,
                     ),
                     (
-                        "candidate_filter",
+                        "sparse_logits",
                         "precompact",
                         lambda: cfilter_unord_op(
                             q_part,
@@ -883,7 +883,7 @@ def worker(ctx: common.WorkerContext, args: argparse.Namespace) -> dict[str, Any
                         cfilter_ref_op,
                     ),
                     (
-                        "candidate_filter",
+                        "sparse_logits",
                         "baseline",
                         lambda: cfilter_ref_op(
                             q_part,

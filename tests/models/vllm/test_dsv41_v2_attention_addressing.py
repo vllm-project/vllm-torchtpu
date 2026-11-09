@@ -242,13 +242,13 @@ def test_paged_index_scores_page_gather_bitwise(tokens, width, page):
 
 
 @pytest.mark.parametrize(
-    "candidate_write,candidate_filter",
+    "candidate_write,sparse_logits",
     [(False, False), (True, False), (False, True)],
 )
 @pytest.mark.parametrize("unordered", [False, True])
 @pytest.mark.parametrize("block_size,page", [(16, 16), (8, 16), (16, 8)])
 def test_paged_indexer_page_gather_matches_records(
-    candidate_write, candidate_filter, unordered, block_size, page
+    candidate_write, sparse_logits, unordered, block_size, page
 ):
     """Decode (one token per request row): page gathers select identically."""
     rng = np.random.default_rng(5)
@@ -276,7 +276,7 @@ def test_paged_indexer_page_gather_matches_records(
         topk,
         block_size,
         candidate_write,
-        candidate_filter,
+        sparse_logits,
         unordered,
     )
     expected = paged_indexer_jax(*args)
@@ -504,12 +504,10 @@ def test_paged_index_scores_shared_tiles_match_per_token(requests_count, tokens,
 
 
 @pytest.mark.parametrize(
-    "candidate_write,candidate_filter",
+    "candidate_write,sparse_logits",
     [(False, False), (True, False), (False, True)],
 )
-def test_paged_indexer_request_records_match_per_token(
-    candidate_write, candidate_filter
-):
+def test_paged_indexer_request_records_match_per_token(candidate_write, sparse_logits):
     rng = np.random.default_rng(7)
     width, topk, block_size = 640, 64, 16
     pool, records, requests, lengths, q, weights = _request_inputs(rng, 3, 24, width)
@@ -517,7 +515,7 @@ def test_paged_indexer_request_records_match_per_token(
     candidates = jnp.asarray(
         rng.integers(-1, width // block_size, (24, 8)), dtype=jnp.int32
     )
-    args = (topk, block_size, candidate_write, candidate_filter)
+    args = (topk, block_size, candidate_write, sparse_logits)
     tokens = jnp.arange(24, dtype=jnp.int32)
     expected = paged_indexer_jax(
         q,
@@ -544,12 +542,10 @@ def test_paged_indexer_request_records_match_per_token(
 
 
 @pytest.mark.parametrize(
-    "candidate_write,candidate_filter",
+    "candidate_write,sparse_logits",
     [(False, False), (True, False), (False, True)],
 )
-def test_paged_indexer_query_split_matches_whole_batch(
-    candidate_write, candidate_filter
-):
+def test_paged_indexer_query_split_matches_whole_batch(candidate_write, sparse_logits):
     rng = np.random.default_rng(11)
     width, topk, block_size, tokens = 640, 64, 16, 32
     pool, records, requests, lengths, q, weights = _request_inputs(
@@ -561,7 +557,7 @@ def test_paged_indexer_query_split_matches_whole_batch(
     candidates = jnp.asarray(
         rng.integers(-1, width // block_size, (tokens, 8)), dtype=jnp.int32
     )
-    args = (topk, block_size, candidate_write, candidate_filter)
+    args = (topk, block_size, candidate_write, sparse_logits)
     lengths = jnp.asarray(lengths)
     requests = jnp.asarray(requests)
     records = jnp.asarray(records)
@@ -597,7 +593,11 @@ def test_merge_sub_rows_matches_lane_scatter(width, count):
     records = rng.permutation(32 * per_row)[:count].astype(np.int32)
     records[::5] = -1
     words = jnp.asarray(rng.integers(-(2**31), 2**31, (count, width)), jnp.int32)
-    expected = scatter_cache_values(cache, jnp.asarray(records), words)
+    # On TPU scatter_cache_values donates its cache (write_cache_rows), so it
+    # gets a copy; merge_sub_rows and the reference scatter read the original.
+    expected = scatter_cache_values(
+        jnp.array(cache, copy=True), jnp.asarray(records), words
+    )
     rows, full = merge_sub_rows(cache, jnp.asarray(records), words)
     got = cache.at[jnp.where(rows >= 0, rows, cache.shape[0])].set(full, mode="drop")
     np.testing.assert_array_equal(np.asarray(got), np.asarray(expected))
@@ -654,7 +654,7 @@ def test_attend_window_branch_free_matches_conditional(lengths):
 
 
 @pytest.mark.parametrize(
-    "candidate_write,candidate_filter,short_ctx",
+    "candidate_write,sparse_logits,short_ctx",
     [
         (False, False, False),
         (True, False, False),
@@ -663,7 +663,7 @@ def test_attend_window_branch_free_matches_conditional(lengths):
     ],
 )
 def test_paged_indexer_unordered_is_precompacted(
-    candidate_write, candidate_filter, short_ctx
+    candidate_write, sparse_logits, short_ctx
 ):
     from vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels import (
         _pad_compacted_records,
@@ -694,7 +694,7 @@ def test_paged_indexer_unordered_is_precompacted(
         topk,
         block_size,
         candidate_write,
-        candidate_filter,
+        sparse_logits,
         unordered=False,
     )
     unordered_sel, unordered_pub = paged_indexer_jax(
@@ -708,7 +708,7 @@ def test_paged_indexer_unordered_is_precompacted(
         topk,
         block_size,
         candidate_write,
-        candidate_filter,
+        sparse_logits,
         unordered=True,
     )
     np.testing.assert_array_equal(np.asarray(unordered_pub), np.asarray(ordered_pub))
@@ -749,7 +749,7 @@ def test_paged_indexer_candidate_filter_shared_tiles_and_decode_branches(
         topk,
         block_size,
         candidate_write=False,
-        candidate_filter=True,
+        sparse_logits=True,
         unordered=unordered,
     )
     scores = paged_index_scores_jax(
@@ -772,7 +772,7 @@ def test_paged_indexer_candidate_filter_shared_tiles_and_decode_branches(
         topk,
         block_size,
         candidate_write=False,
-        candidate_filter=True,
+        sparse_logits=True,
         unordered=unordered,
     )
     np.testing.assert_array_equal(np.asarray(got_pub), np.asarray(ref_pub))
@@ -965,7 +965,8 @@ def test_swa_query_group_bridge_keeps_token_count_dynamic(monkeypatch, banked):
     op = torch.ops.swa_group_bridge_test.attend.default
 
     def bridge(*args):
-        return op(args[0], args[-1])
+        # query_group_size precedes the trailing row_valid argument.
+        return op(args[0], args[-2])
 
     monkeypatch.setattr(attention_kernels, "_attention_op", bridge)
     monkeypatch.setattr(attention_kernels, "_attention_2bank_op", bridge)

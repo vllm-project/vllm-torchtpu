@@ -35,14 +35,14 @@ def is_supported(x: jax.Array, w: jax.Array, scale: jax.Array) -> bool:
     """Whether concrete lowering inputs match the measured specialization."""
     return (
         x.ndim == 2
-        and x.shape[0] in (240, 288)
-        and x.shape[1] == 8192
-        and w.shape == (8192, 5120)
-        and scale.shape == (5120,)
+        and w.ndim == 2
+        and w.shape[0] == x.shape[1]
+        and scale.shape == (w.shape[1],)
         and x.dtype == jnp.bfloat16
         and w.dtype == jnp.float8_e4m3fn
         and scale.dtype == jnp.float32
-        and get_tpu_version() == 7
+        and (get_tpu_version(), x.shape[0], x.shape[1], w.shape[1])
+        in BUFFERED_MATMUL_TUNING
     )
 
 

@@ -373,7 +373,7 @@ class TestSelectIndicesJax:
                 topk=0,
                 block_size=16,
                 candidate_write=False,
-                candidate_filter=False,
+                sparse_logits=False,
             )
 
         with pytest.raises(
@@ -386,12 +386,12 @@ class TestSelectIndicesJax:
                 topk=4,
                 block_size=0,
                 candidate_write=False,
-                candidate_filter=False,
+                sparse_logits=False,
             )
 
         with pytest.raises(
             ValueError,
-            match="Candidate sources must not filter their own scores",
+            match="Candidate sources must not use sparse logits",
         ):
             select_indices_jax(
                 scores,
@@ -400,7 +400,7 @@ class TestSelectIndicesJax:
                 topk=4,
                 block_size=16,
                 candidate_write=True,
-                candidate_filter=True,
+                sparse_logits=True,
             )
 
         with pytest.raises(ValueError, match="Candidate rows must match query rows"):
@@ -411,7 +411,7 @@ class TestSelectIndicesJax:
                 topk=4,
                 block_size=16,
                 candidate_write=False,
-                candidate_filter=False,
+                sparse_logits=False,
             )
 
         with pytest.raises(ValueError, match="Candidate rows must match query rows"):
@@ -422,7 +422,7 @@ class TestSelectIndicesJax:
                 topk=4,
                 block_size=16,
                 candidate_write=False,
-                candidate_filter=False,
+                sparse_logits=False,
             )
 
     def test_candidate_write_branch(self):
@@ -440,7 +440,7 @@ class TestSelectIndicesJax:
             topk=16,
             block_size=block_size,
             candidate_write=True,
-            candidate_filter=False,
+            sparse_logits=False,
             unordered=False,
         )
         assert published.shape == (count, 4)
@@ -471,7 +471,7 @@ class TestSelectIndicesJax:
                 topk=16,
                 block_size=8,
                 candidate_write=True,
-                candidate_filter=False,
+                sparse_logits=False,
                 unordered=True,
             )
             assert sel_sc.shape == (count, 16)
@@ -497,7 +497,7 @@ class TestSelectIndicesJax:
             topk=16,
             block_size=block_size,
             candidate_write=False,
-            candidate_filter=True,
+            sparse_logits=True,
             unordered=False,
             batch_max=jnp.array([200], dtype=jnp.int32),
         )
@@ -512,7 +512,7 @@ class TestSelectIndicesJax:
             topk=320,
             block_size=block_size,
             candidate_write=False,
-            candidate_filter=True,
+            sparse_logits=True,
             unordered=False,
             batch_max=jnp.array([50], dtype=jnp.int32),
         )
@@ -533,7 +533,7 @@ class TestSelectIndicesJax:
             topk=8,
             block_size=block_size,
             candidate_write=True,
-            candidate_filter=False,
+            sparse_logits=False,
         )
         assert published is candidates
 
@@ -558,7 +558,7 @@ class TestSelectIndicesJax:
             topk=4,
             block_size=4,
             candidate_write=False,
-            candidate_filter=False,
+            sparse_logits=False,
             unordered=True,
         )
         assert sel_unord.shape == (count, 4)
@@ -577,7 +577,7 @@ class TestSelectIndicesJax:
             topk=4,
             block_size=4,
             candidate_write=False,
-            candidate_filter=False,
+            sparse_logits=False,
             unordered=False,
         )
         assert sel_ord.shape == (count, 4)
@@ -753,7 +753,7 @@ class TestPagedIndexerJax:
                 topk=16,
                 block_size=16,
                 candidate_write=False,
-                candidate_filter=True,
+                sparse_logits=True,
             )
 
         scores = paged_index_scores_jax(q, pool, records, weights, lengths, requests)
@@ -783,7 +783,7 @@ class TestPagedIndexerJax:
             topk=topk,
             block_size=block_size,
             candidate_write=False,
-            candidate_filter=False,  # False forces full_context
+            sparse_logits=False,  # False forces full_context
         )
         assert sel.shape == (8, topk)
         np.testing.assert_array_equal(pub, candidates)
@@ -806,7 +806,7 @@ class TestPagedIndexerJax:
             topk=topk,
             block_size=block_size,
             candidate_write=False,
-            candidate_filter=True,
+            sparse_logits=True,
         )
         assert sel.shape == (4, topk)
         np.testing.assert_array_equal(pub, candidates)
@@ -831,7 +831,7 @@ class TestPagedIndexerJax:
             topk=topk,
             block_size=block_size,
             candidate_write=False,
-            candidate_filter=True,
+            sparse_logits=True,
         )
         assert sel_short.shape == (16, topk)
 
@@ -851,7 +851,7 @@ class TestPagedIndexerJax:
             topk=topk,
             block_size=block_size,
             candidate_write=False,
-            candidate_filter=True,
+            sparse_logits=True,
         )
         assert sel_prefill.shape == (16, topk)
 
@@ -873,7 +873,7 @@ class TestPagedIndexerJax:
             topk=topk,
             block_size=block_size,
             candidate_write=False,
-            candidate_filter=True,
+            sparse_logits=True,
         )
         assert sel_dec.shape == (6, topk)
 
@@ -909,7 +909,7 @@ class TestPagedIndexerJax:
             topk=topk,
             block_size=block_size,
             candidate_write=False,
-            candidate_filter=True,
+            sparse_logits=True,
             unordered=True,
         )
         np.testing.assert_array_equal(pub_unord, candidates)
@@ -942,7 +942,7 @@ class TestPagedIndexerJax:
                 topk=topk,
                 block_size=block_size,
                 candidate_write=False,
-                candidate_filter=True,
+                sparse_logits=True,
                 unordered=True,
             )
             assert sel_sc.shape == (tokens, topk)
@@ -960,7 +960,7 @@ class TestPagedIndexerJax:
             topk=topk,
             block_size=block_size,
             candidate_write=False,
-            candidate_filter=True,
+            sparse_logits=True,
             unordered=False,
         )
         np.testing.assert_array_equal(pub_ord, candidates)
@@ -1012,7 +1012,7 @@ class TestWriteIndexKeysAndSelect:
             topk=2,
             block_size=1,
             candidate_write=False,
-            candidate_filter=False,
+            sparse_logits=False,
             unordered=False,
         )
         np.testing.assert_array_equal(sel, [[1, 6], [-1, -1]])
@@ -1092,7 +1092,7 @@ class TestIndexerOpAndWrapper:
                 topk=16,
                 block_size=16,
                 candidate_write=False,
-                candidate_filter=False,
+                sparse_logits=False,
             )
             assert len(res) == 2
             mock_op.assert_called_once()
@@ -1116,7 +1116,7 @@ class TestIndexerOpAndWrapper:
                 topk=16,
                 block_size=16,
                 candidate_write=False,
-                candidate_filter=False,
+                sparse_logits=False,
                 batch_max=torch.tensor([120], dtype=torch.int32),
             )
             assert len(res2) == 2
