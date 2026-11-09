@@ -43,7 +43,7 @@ HF_OVERRIDES = {
     "indexer_types": ["full", "full", "full", "shared"],
 }
 DCP_SIZE = 8
-# The production interleave; one cycle is DCP_SIZE * 4 = 32 positions.
+# The production interleave; one cycle is DCP_SIZE * INTERLEAVE positions.
 INTERLEAVE = 4
 # Long enough that every prompt spans several cycles, so each DCP rank owns
 # keys and the decode merge combines all of them.
@@ -62,6 +62,23 @@ def _get_local_tpu_chip_count() -> int:
         pytest.skip(f"Unable to detect local TPU chip count: {e}")
 
 
+def _mla_qrep_state(model) -> list[tuple[bool, bool, bool]]:
+    """(dcp_q_replicate, is_sparse, replicated W_UK_T present) per MLA layer."""
+    from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
+        VllmMultiHeadLatentAttentionWrapper,
+    )
+
+    return [
+        (
+            module.dcp_q_replicate,
+            module.is_sparse,
+            module.mla_attn.W_UK_T_dcp_qrep is not None,
+        )
+        for module in model.modules()
+        if isinstance(module, VllmMultiHeadLatentAttentionWrapper)
+    ]
+
+
 @pytest.mark.timeout(1800)
 @pytest.mark.parametrize("q_replicate", [False, True], ids=["ag_q", "q_replicate"])
 def test_glm52_dcp_generates(monkeypatch, q_replicate: bool):
@@ -71,6 +88,8 @@ def test_glm52_dcp_generates(monkeypatch, q_replicate: bool):
     # Upstream reads the variable only when it is set, so set it both ways
     # rather than leave one case to the model config's default.
     monkeypatch.setenv("VLLM_DCP_Q_REPLICATE", "1" if q_replicate else "0")
+    # apply_model sends a function to the workers.
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
 
     llm = LLM(
         model=GLM52_MODEL_NAME,
@@ -95,6 +114,7 @@ def test_glm52_dcp_generates(monkeypatch, q_replicate: bool):
         for i in range(NUM_PROMPTS)
     ]
     try:
+        layers_per_rank = llm.apply_model(_mla_qrep_state)
         outputs = llm.generate(
             prompts,
             sampling_params=SamplingParams(
@@ -104,6 +124,17 @@ def test_glm52_dcp_generates(monkeypatch, q_replicate: bool):
     finally:
         del llm
         cleanup_dist_env_and_memory()
+
+    # Both cases must prove which path they ran: a vLLM bump that drops
+    # q-replicate silently would still generate on the all-gather path.
+    assert len(layers_per_rank) == DCP_SIZE
+    for layers in layers_per_rank:
+        assert len(layers) == NUM_LAYERS
+        for flag, is_sparse, has_qrep_weights in layers:
+            assert flag == q_replicate
+            assert has_qrep_weights == (q_replicate and is_sparse)
+        if q_replicate:
+            assert any(has_qrep_weights for _, _, has_qrep_weights in layers)
 
     assert len(outputs) == NUM_PROMPTS
     for output in outputs:
