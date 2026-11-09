@@ -1443,8 +1443,14 @@ DECODE_BODY_LEVERS = (
     # the real tokens reads unwritten tiles for the padding tokens, whose
     # kv_len is 0 -- every key is zeroed and masked, so they attend nothing.
     "step8",
+    # "step16": as "step8", walking up to DECODE_STEP16_TOKENS tokens per
+    # attention grid step so a 16-token decode bucket runs its attention and
+    # in-kernel DCP small all-to-all + merge in a single grid step while window
+    # prep and SparseCore gather keep their 4-token small-chunk batch.
+    "step16",
 )
 DECODE_STEP8_TOKENS = 8
+DECODE_STEP16_TOKENS = 16
 # The measured set (decode probes 02 / 04 / 05): "step8" runs 8 tokens per
 # attention grid step and "quad" stacks them in one softmax; "nofill" and
 # "q128" measured no gain.
@@ -3007,43 +3013,52 @@ def _attention_kernel(
             pair_finish(batch_size // 2 - 1, *prev, levers)
 
         def run_quad(rows, levers):
-            """Decode lever "quad": the step's bsz tokens' QK scores stacked
-            into one [bsz * heads, w] tile (row max / exp / sum per row),
-            their unpacked KV staged in `kv_stage_ref[0]` and read back by
-            the PVs after the softmax."""
+            """Decode lever "quad": the step's tokens' QK scores stacked in
+            groups of up to DECODE_STEP8_TOKENS into one [g * heads, w] tile
+            (row max / exp / sum per row), their unpacked KV staged in
+            `kv_stage_ref[0]` and read back by the PVs after the softmax."""
             h = num_q_heads
-            scores = []
-            kv_lens = []
-            w = None
-            for t in range(batch_size):
-                kv_lens.append(kv_lens_ref[batch_start_seq_idx + t])
-                kv = load_bkv(bi_sem_idx, t, rows, levers)
-                w = kv.shape[0]
-                kv_stage_ref.at[0, t, pl.ds(0, w)][...] = kv
-                q = load_bq(bi_sem_idx, t)
-                scores.append(
-                    jnp.einsum("nd,md->nm", q, kv, preferred_element_type=jnp.float32)
-                )
-            s = jnp.concatenate(scores, axis=0)
-            s *= sm_scale
-            if k_scale != 1.0:
-                s *= k_scale
-            row = lax.broadcasted_iota(jnp.int32, s.shape, 0)
-            lim = jnp.full(s.shape, kv_lens[batch_size - 1], jnp.int32)
-            for t in range(batch_size - 2, -1, -1):
-                lim = jnp.where(row < (t + 1) * h, kv_lens[t], lim)
-            span = lax.broadcasted_iota(jnp.int32, s.shape, 1)
-            s = jnp.where(span < lim, s, jnp.finfo(jnp.float32).min)
-            m = jnp.max(s, axis=1, keepdims=True)
-            p = jnp.exp(s - m)
-            l_sum = jnp.sum(p, axis=1, keepdims=True)
-            for t in range(batch_size):
-                kv = kv_stage_ref.at[0, t, pl.ds(0, w)][...]
-                out = attention_step2_pv(
-                    p[t * h : (t + 1) * h], kv, l_sum[t * h : (t + 1) * h], levers
-                )
-                store_out(bo_sem_idx, t, out)
-                write_blse(t, m[t * h : (t + 1) * h], l_sum[t * h : (t + 1) * h])
+            for t0 in range(0, batch_size, DECODE_STEP8_TOKENS):
+                bsz = min(DECODE_STEP8_TOKENS, batch_size - t0)
+                scores = []
+                kv_lens = []
+                w = None
+                for j in range(bsz):
+                    t = t0 + j
+                    kv_lens.append(kv_lens_ref[batch_start_seq_idx + t])
+                    kv = load_bkv(bi_sem_idx, t, rows, levers)
+                    w = kv.shape[0]
+                    kv_stage_ref.at[0, j, pl.ds(0, w)][...] = kv
+                    q = load_bq(bi_sem_idx, t)
+                    scores.append(
+                        jnp.einsum(
+                            "nd,md->nm", q, kv, preferred_element_type=jnp.float32
+                        )
+                    )
+                s = jnp.concatenate(scores, axis=0)
+                s *= sm_scale
+                if k_scale != 1.0:
+                    s *= k_scale
+                row = lax.broadcasted_iota(jnp.int32, s.shape, 0)
+                lim = jnp.full(s.shape, kv_lens[bsz - 1], jnp.int32)
+                for j in range(bsz - 2, -1, -1):
+                    lim = jnp.where(row < (j + 1) * h, kv_lens[j], lim)
+                span = lax.broadcasted_iota(jnp.int32, s.shape, 1)
+                s = jnp.where(span < lim, s, jnp.finfo(jnp.float32).min)
+                m = jnp.max(s, axis=1, keepdims=True)
+                p = jnp.exp(s - m)
+                l_sum = jnp.sum(p, axis=1, keepdims=True)
+                for j in range(bsz):
+                    t = t0 + j
+                    kv = kv_stage_ref.at[0, j, pl.ds(0, w)][...]
+                    out = attention_step2_pv(
+                        p[j * h : (j + 1) * h],
+                        kv,
+                        l_sum[j * h : (j + 1) * h],
+                        levers,
+                    )
+                    store_out(bo_sem_idx, t, out)
+                    write_blse(t, m[j * h : (j + 1) * h], l_sum[j * h : (j + 1) * h])
 
         def xqk_row_to_col(row):
             """[1, heads] -> [heads, 1] exactly (one live entry per row)."""
@@ -4589,7 +4604,12 @@ def sparse_attention_chunk(
             assert sparsecore_layout
             scratch_shapes.append(
                 pltpu.VMEM(
-                    (1, batch_size, cache_kv_nope.shape[1], pair_head_dim)
+                    (
+                        1,
+                        min(batch_size, DECODE_STEP8_TOKENS),
+                        cache_kv_nope.shape[1],
+                        pair_head_dim,
+                    )
                     if "quad" in stage_levers
                     else (2, 2, cache_kv_nope.shape[1], pair_head_dim),
                     jnp.float8_e4m3fn,
@@ -4653,8 +4673,11 @@ def sparse_attention_chunk(
             recv_in=send_recv_in is not None,
         )
         if live_views is None and row_levers and row_widths and capped_windows:
-            # Decode body levers on the row-widths body.
-            kernel_body = functools.partial(kernel_body, body_levers=tuple(row_levers))
+            # Decode body levers on the row-widths body ("step16" selects the
+            # chunk's attention grid step below and is not an in-kernel lever).
+            kernel_levers = tuple(lv for lv in row_levers if lv != "step16")
+            if kernel_levers:
+                kernel_body = functools.partial(kernel_body, body_levers=kernel_levers)
         if live_views is not None:
             group_body = functools.partial(
                 kernel_body,
@@ -4865,10 +4888,18 @@ def sparse_attention_chunk(
     # `kernel_batch_size`.
     valid_rows = jnp.maximum(0, jnp.minimum(token_end, end_pos) - start_pos)
     batch_end = start_pos + cdiv(valid_rows, kernel_batch_size) * kernel_batch_size
-    # Decode lever "step8": the attention grid's own step (the prep and the
-    # gather above keep `kernel_batch_size`).
+    # Decode lever "step8" / "step16": the attention grid's own step (the prep
+    # and the gather above keep `kernel_batch_size`).
     attn_batch_size, attn_batch_end = kernel_batch_size, batch_end
-    if "step8" in row_levers and small_chunk:
+    if "step16" in row_levers:
+        if not (row_widths and capped_windows is not None):
+            raise ValueError("decode body lever 'step16' requires capped row_widths")
+        if small_chunk:
+            attn_batch_size = _largest_divisor(chunk_size, DECODE_STEP16_TOKENS)
+            attn_batch_end = (
+                start_pos + cdiv(valid_rows, attn_batch_size) * attn_batch_size
+            )
+    elif "step8" in row_levers and small_chunk:
         attn_batch_size = _largest_divisor(chunk_size, DECODE_STEP8_TOKENS)
         attn_batch_end = start_pos + cdiv(valid_rows, attn_batch_size) * attn_batch_size
     num_valid_indices = jnp.maximum(0, batch_end - start_pos) * topk
