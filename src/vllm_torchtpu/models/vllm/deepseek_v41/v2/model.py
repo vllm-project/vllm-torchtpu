@@ -751,7 +751,12 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         intermediate_tensors=None,
         inputs_embeds=None,
         lookback_token_ids=None,
+        decode_step=None,
     ):
+        # vLLM v0.33.0's CausalLM passes its specialized-decode plan here. That
+        # path is NVIDIA-only and never built on TPU, so the plan is None.
+        if decode_step is not None:
+            raise NotImplementedError("specialized decode is not supported on TPU")
         if not self._raw_dma_enabled:
             return self._forward_impl(
                 input_ids,
