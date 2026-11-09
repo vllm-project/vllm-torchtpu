@@ -235,7 +235,6 @@ def test_ordinary_loader_maps_hc_names_and_skips_mtp():
     # Complete ordinary parameters; expert/QSA completeness has separate tests.
     model = qwen4_model.Qwen4ExpForCausalLM.__new__(qwen4_model.Qwen4ExpForCausalLM)
     nn.Module.__init__(model)
-    model._pd_weight_identity_enabled = False
     model.model = nn.Module()
     model.model.layers = nn.ModuleList()
     model.model.hyper_connection_mixer = _hc(use_combine=False)

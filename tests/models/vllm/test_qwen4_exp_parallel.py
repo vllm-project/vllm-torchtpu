@@ -783,7 +783,7 @@ def test_tpu_upstream_moe_block128_checkpoint_accuracy(
         assert cosine > 0.999, cosine.item()
 
 
-@pytest.mark.parametrize("pd_identity", [False, True])
+@pytest.mark.parametrize("pd_enabled", [False, True])
 @pytest.mark.parametrize("prefix", ["model.language_model.", "model."])
 @pytest.mark.parametrize(
     "enable_ep,shared_fp8,missing_projection",
@@ -796,7 +796,7 @@ def test_tpu_upstream_moe_block128_checkpoint_accuracy(
     ],
 )
 def test_model_streams_expert_and_shared_weights_through_upstream_loaders(
-    upstream_moe, prefix, enable_ep, shared_fp8, missing_projection, pd_identity
+    upstream_moe, prefix, enable_ep, shared_fp8, missing_projection, pd_enabled
 ):
     """Checkpoint name mapping must preserve expert IDs and shared gate/up halves."""
     from vllm_torchtpu.models.vllm.qwen4_exp.model import Qwen4ExpForCausalLM
@@ -807,7 +807,7 @@ def test_model_streams_expert_and_shared_weights_through_upstream_loaders(
     nn.Module.__init__(model)
     model.vllm_config = config(tp)
     model.vllm_config.cache_config.block_size = 3328
-    model._pd_weight_identity_enabled = pd_identity
+    model.vllm_config.kv_transfer_config = object() if pd_enabled else None
     model.model = nn.Module()
     layer = nn.Module()
     layer.mlp = block
@@ -866,7 +866,6 @@ def test_model_streams_expert_and_shared_weights_through_upstream_loaders(
             if ".experts." not in name or ".experts.7." in name
         ]
     model.load_weights(iter(source))
-    assert (model.pd_loaded_weight_identity is not None) == pd_identity
     experts = block.experts.routed_experts
     expert_ids = [7] if enable_ep else list(range(8))
     logical_width = 640 if enable_ep else 320
@@ -912,12 +911,14 @@ def test_model_streams_expert_and_shared_weights_through_upstream_loaders(
     layer.self_attn.finalize_weights.assert_called_once_with(
         block_size=layout.block_size
     )
-    if pd_identity and enable_ep:
-        before_identity = model.pd_loaded_weight_identity
+    if enable_ep:
+        before_scales = experts.w13_weight_scale_inv.clone()
         unowned = prefix + "layers.0.mlp.experts.0.gate_proj.weight"
         extra = torch.full((640, 256), 3, dtype=torch.float8_e4m3fn)
         model.load_weights(iter([*source, (unowned, extra)]))
-        assert model.pd_loaded_weight_identity == before_identity
+        torch.testing.assert_close(
+            experts.w13_weight_scale_inv, before_scales, rtol=0, atol=0
+        )
         changed = [
             (
                 name,
@@ -928,7 +929,7 @@ def test_model_streams_expert_and_shared_weights_through_upstream_loaders(
             for name, value in source
         ]
         model.load_weights(iter(changed))
-        assert model.pd_loaded_weight_identity != before_identity
+        assert not torch.equal(experts.w13_weight_scale_inv, before_scales)
     missing_name = prefix + "layers.0.mlp.experts.7.gate_proj.weight_scale_inv"
     incomplete = ((name, value) for name, value in source if name != missing_name)
     with pytest.raises(ValueError, match="expert checkpoint: 1 missing"):
@@ -1002,7 +1003,7 @@ def test_pd_reuses_upstream_moe_without_precision_override(upstream_moe, transfe
 
 @pytest.mark.parametrize("storage", ["resident", "host", "shared"])
 @pytest.mark.parametrize("fp8", [False, True])
-def test_pd_identity_hashes_only_real_ple_checkpoint_overlap(
+def test_model_loads_owned_ple_rows_without_mutating_checkpoint(
     upstream_moe, monkeypatch, tmp_path, storage, fp8
 ):
     from typing import cast
@@ -1065,7 +1066,6 @@ def test_pd_identity_hashes_only_real_ple_checkpoint_overlap(
             nn.Module.__init__(model)
             model.vllm_config = config()
             model.vllm_config.model_config.hf_text_config = text
-            model._pd_weight_identity_enabled = True
             model.model = Qwen4ExpBackbone.__new__(Qwen4ExpBackbone)
             nn.Module.__init__(model.model)
             layer = Qwen4ExpDecoderLayer.__new__(Qwen4ExpDecoderLayer)
@@ -1127,10 +1127,24 @@ def test_pd_identity_hashes_only_real_ple_checkpoint_overlap(
                         torch.ones(shape, dtype=torch.bfloat16),
                     )
                 )
-            for name, value in layer.self_attn.named_parameters():
-                weights.append(
-                    (f"model.layers.0.self_attn.{name}", torch.full_like(value, 0.25))
-                )
+            qsa_weights = {
+                name: torch.full_like(value, 0.25)
+                for name, value in layer.self_attn.named_parameters()
+            }
+            packed = qsa_weights.pop("input_proj.weight")
+            for name, part in zip(
+                (
+                    "k_proj.weight",
+                    "v_proj.weight",
+                    "indexer.index_qk_proj.weight",
+                ),
+                packed.split(layer.self_attn.input_sizes[1:], dim=0),
+            ):
+                qsa_weights[name] = part
+            weights.extend(
+                (f"model.layers.0.self_attn.{name}", value)
+                for name, value in qsa_weights.items()
+            )
             for name, value in layer.ple.named_parameters():
                 if name != "ple_embedding.ngram_embedding.weight":
                     weights.append(
@@ -1163,14 +1177,28 @@ def test_pd_identity_hashes_only_real_ple_checkpoint_overlap(
             before = [value.view(torch.uint8).clone() for _, value in weights]
             try:
                 model.load_weights(iter(weights))
-                checkpoints.append(
-                    (model.pd_loaded_weight_identity, model.pd_loaded_ple_identity)
+                table = layer.ple.storage
+                start = table.shard_indices.org_vocab_start_index
+                stop = table.shard_indices.org_vocab_end_index
+                assert (start, stop) == (56, 64)
+                actual = (
+                    table.table.view(dtype).reshape(-1, table.embedding_dim)
+                    if isinstance(table, ple_storage.ResidentPLETable)
+                    else table.lookup_host(
+                        torch.arange(start, stop, dtype=torch.int32).unsqueeze(0)
+                    )
+                    .view(dtype)
+                    .reshape(-1, table.embedding_dim)
                 )
+                assert torch.equal(
+                    actual[: stop - start].view(torch.uint8),
+                    rows[start:stop].view(torch.uint8),
+                )
+                checkpoints.append(actual.view(torch.uint8).clone())
                 for (_, value), original in zip(weights, before):
                     assert torch.equal(value.view(torch.uint8), original)
             finally:
                 if isinstance(layer.ple.storage, ple_storage.HostPLETable):
                     layer.ple.storage.close()
-    assert checkpoints[0] == checkpoints[1]
-    assert checkpoints[0][0] != checkpoints[2][0]
-    assert checkpoints[0][1] != checkpoints[2][1]
+    assert torch.equal(checkpoints[0], checkpoints[1])
+    assert not torch.equal(checkpoints[0], checkpoints[2])

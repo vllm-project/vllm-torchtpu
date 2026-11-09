@@ -138,14 +138,38 @@ def test_reject_duplicate_pages_and_reordered_groups():
         )
 
 
-def test_refuse_unimplemented_align_state_and_duplicate_owners():
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"mamba_cache_mode": "align"},
+        {"mamba_cache_mode": "all"},
+        {"num_speculative_blocks": 1},
+    ],
+)
+def test_state_capacity_flags_accept_only_an_explicit_committed_snapshot(fields):
     groups = cache_groups()
     groups[3] = replace(
         groups[3],
-        kv_cache_spec=replace(groups[3].kv_cache_spec, mamba_cache_mode="align"),
+        kv_cache_spec=replace(groups[3].kv_cache_spec, **fields),
     )
-    with pytest.raises(NotImplementedError, match="APC and MTP off"):
-        build_transfer_groups(groups)
+    plan = build_transfer_groups(groups)
+    tables = [[1], [2], [3], [4], [5]]
+    assert handoff_block_ids(
+        plan, tables, committed_tokens=127, computed_tokens=127
+    ) == tuple(tuple(t) for t in tables)
+    for state_ids in ([], [4, 9]):
+        with pytest.raises(ValueError, match="needs 1 pages"):
+            handoff_block_ids(
+                plan,
+                [*tables[:3], state_ids, tables[4]],
+                committed_tokens=127,
+                computed_tokens=127,
+            )
+    with pytest.raises(ValueError, match="published committed prefix"):
+        handoff_block_ids(plan, tables, committed_tokens=127, computed_tokens=128)
+
+
+def test_duplicate_cache_owners_are_rejected():
     groups = cache_groups()
     groups.append(groups[0])
     with pytest.raises(ValueError, match="every cache owner once"):

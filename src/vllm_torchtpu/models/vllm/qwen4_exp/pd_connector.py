@@ -13,7 +13,7 @@
 # limitations under the License.
 """Model-owned Stage-3 page planning for Qwen's hybrid caches.
 
-Native admission binds the loaded model identity and measured page layout.
+Native admission binds cache encoding, loaded KV scales and measured page layout.
 This connector does not borrow another model's native pool admission.
 """
 
@@ -24,8 +24,8 @@ from typing import Any
 import torch
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
-from vllm.distributed.parallel_state import get_ep_group, get_tp_group
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.distributed.parallel_state import get_tp_group
+from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig, MambaSpec
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.kv_transfer.raiden.byte_spans import (
@@ -55,7 +55,6 @@ from vllm_torchtpu.gdn_pool_layout import (
 )
 
 from .pd import TransferExtent, TransferGroup, build_transfer_groups, handoff_block_ids
-from .pd_identity import canonical_rank_identity
 from .pd_manifest import build_transfer_manifest, measure_transfer_layout
 
 
@@ -66,16 +65,6 @@ class Qwen4ExpRaidenConnector(TPURaidenConnector):
         role: KVConnectorRole,
         kv_cache_config: KVCacheConfig,
     ):
-        parallel = vllm_config.parallel_config
-        cache = vllm_config.cache_config
-        if (
-            parallel.prefill_context_parallel_size != 1
-            or parallel.decode_context_parallel_size != 1
-            or parallel.pipeline_parallel_size != 1
-            or vllm_config.speculative_config is not None
-            or cache.enable_prefix_caching
-        ):
-            raise NotImplementedError("Qwen PD first requires CP1/PP1, APC and MTP off")
         if envs.TPU_KV_RESHARD_TRANSPORT != "raiden":
             raise ValueError("Qwen PD requires the Raiden Stage-3 transport")
         if any(
@@ -119,7 +108,7 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
     """Whole-page transport over the shared Stage-3 request lifecycle.
 
     Native admission binds ``_qwen_page_plan`` after validating the loaded
-    model identity and measured layout.
+    cache encoding and measured layout.
     """
 
     def __init__(self, vllm_config: VllmConfig):
@@ -191,7 +180,22 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
         return self._raiden_transfer_engine
 
     def _collect_pd_semantics(self, runner) -> dict[str, Any]:
-        model = runner.model_adapter.cache.model
+        cache = runner.model_adapter.cache
+        model = cache.model
+        cache_specs: dict[str, dict[str, Any]] = {}
+        for name, spec in cache.specs.items():
+            if isinstance(spec, MambaSpec):
+                cache_specs[name] = dict(
+                    shapes=spec.shapes, dtypes=[str(dtype) for dtype in spec.dtypes]
+                )
+            elif isinstance(spec, AttentionSpec):
+                cache_specs[name] = dict(
+                    num_kv_heads=spec.num_kv_heads,
+                    head_size=spec.head_size,
+                    dtype=str(spec.dtype),
+                )
+            else:
+                raise ValueError("Qwen PD has an unsupported logical cache encoding")
         scales = []
         for index, layer in enumerate(model.model.layers):
             if layer.layer_type == "indexed_attention":
@@ -210,37 +214,41 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
                 scales.append((index, k, v))
         if not scales:
             raise ValueError("Qwen PD requires loaded indexed-attention KV scales")
-        parallel = self.vllm_config.parallel_config
-        group = get_ep_group() if parallel.enable_expert_parallel else get_tp_group()
-        config = model.config.to_dict()
-        for name in ("_name_or_path", "_commit_hash", "transformers_version"):
-            config.pop(name, None)
+        group = get_tp_group()
+        if group.world_size != self.tp_size or group.rank_in_group != self.tp_rank:
+            raise ValueError("Qwen PD cache shards differ from the local TP group")
         record = dict(
             rank=group.rank_in_group,
             tp_rank=self.tp_rank,
             tp_size=self.tp_size,
-            checkpoint=model.pd_loaded_weight_identity,
-            ple_checkpoint=model.pd_loaded_ple_identity,
-            config=config,
+            cache_specs=cache_specs,
             kv_scales=scales,
             state_flags=dict(
                 gdn_conv_dtype=DEFAULT_POOLED_GDN_CONV_STATE_DTYPE,
                 gdn_granule_bytes=GRANULE_BYTES,
-                expert_parallel=parallel.enable_expert_parallel,
-                ssm_dtype=str(self.vllm_config.cache_config.mamba_ssm_cache_dtype),
-                cp=1,
-                pp=1,
-                mtp=False,
-                apc=False,
             ),
         )
         records: list[Any] = [None] * group.world_size
         torch.distributed.all_gather_object(records, record, group=group.cpu_group)
-        return canonical_rank_identity(records, world_size=group.world_size)
+        if (
+            len(records) != group.world_size
+            or any(not isinstance(row, dict) for row in records)
+            or [row["rank"] for row in records] != list(range(group.world_size))
+        ):
+            raise ValueError("Qwen PD cache encoding requires every rank in order")
+        for row in records:
+            if (
+                row["tp_size"] != self.tp_size
+                or row["tp_rank"] != row["rank"]
+                or row["cache_specs"] != cache_specs
+                or row["state_flags"] != record["state_flags"]
+            ):
+                raise ValueError("Qwen PD ranks disagree on cache encoding or TP map")
+        return dict(schema="qwen4-cache-state-v1", ranks=records)
 
     def _measure_stage3_layout(self, manifest) -> tuple[str, dict[str, Any], int]:
         if self._qwen_semantics is None:
-            raise RuntimeError("Qwen PD loaded-state identity has not been admitted")
+            raise RuntimeError("Qwen PD cache encoding has not been admitted")
         _, layout = measure_transfer_layout(manifest)
         payload = dict(layout=layout, semantics=self._qwen_semantics)
         token_sizes = {
@@ -253,16 +261,12 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
         return canonical_layout_fingerprint(payload), payload, token_sizes.pop()
 
     def _validate_stage3_transfer_parallelism(self, transfer_parallelism: int) -> None:
-        parallel = self.vllm_config.parallel_config
         if (
             transfer_parallelism != self.tp_size
-            or parallel.prefill_context_parallel_size != 1
-            or parallel.decode_context_parallel_size != 1
-            or parallel.pipeline_parallel_size != 1
-            or self.vllm_config.speculative_config is not None
-            or self.vllm_config.cache_config.enable_prefix_caching
+            or self.tp_size <= 0
+            or not 0 <= self.tp_rank < self.tp_size
         ):
-            raise ValueError("Qwen PD requires matching TP, CP1/PP1 and APC/MTP off")
+            raise ValueError("Qwen PD whole-shard spans require the local TP rank set")
 
     def _raiden_interleave_tokens(
         self, page_tokens: int, transfer_parallelism: int
@@ -296,6 +300,11 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
     def _stage3_grouped_spans(
         self, req_meta: SendMeta, num_tokens: int
     ) -> tuple[tuple[tuple[int, ...], ...], list[PoolSpanRegistration]]:
+        """Route whole local pages to the same destination ordinal.
+
+        Packed QSA/GDN pages expose no head/state-fragment conversion here.
+        Shared Raiden can execute such spans once an adapter supplies them.
+        """
         plan = self._page_plan()
         pages = plan.request_pages(req_meta.group_block_ids, num_tokens)
         if tuple(req_meta.local_block_ids) != pages[0]:
@@ -327,8 +336,16 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
         self, req_meta: _Stage3LoadMeta, num_tokens: int
     ) -> tuple[list[str], list[int], list[int]]:
         plan = self._page_plan()
-        if req_meta.skip_tokens or req_meta.src_parallelism != self.tp_size:
-            raise ValueError("Qwen PD needs a full prefix and identical source TP")
+        if req_meta.skip_tokens:
+            raise ValueError(
+                "Qwen whole-page state transfer needs a full committed prefix"
+            )
+        if req_meta.src_parallelism != self.tp_size:
+            raise ValueError(
+                "Qwen whole-page ordinal routing has no shard conversion: "
+                f"source_units={req_meta.src_parallelism}, "
+                f"destination_units={self.tp_size}"
+            )
         pages = plan.request_pages(req_meta.group_block_ids, num_tokens)
         if tuple(req_meta.local_block_ids) != pages[0]:
             raise ValueError("Qwen PD primary pages differ from the full group table")

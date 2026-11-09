@@ -17,12 +17,12 @@ import threading
 import time
 from dataclasses import replace
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Literal, cast
 from unittest.mock import patch
 
 import pytest
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.request import RequestStatus
 
 from tests.runner.test_qwen4_exp_pd import cache_groups
@@ -40,6 +40,7 @@ from .test_tpu_connector import (
 
 if TYPE_CHECKING:
     from tpu_sync.api.torch.kv_cache_manager import KVCacheManager
+    from vllm.config import SpeculativeConfig
 
 
 @pytest.fixture(autouse=True)
@@ -103,7 +104,9 @@ def test_constructor_routes_every_group_without_checkpoint_tag_shortcut(
 
 
 @pytest.mark.parametrize("option", ["pcp", "dcp", "pp", "apc", "mtp"])
-def test_constructor_rejects_unimplemented_state_lifecycles(option):
+def test_feature_switch_alone_does_not_change_transfer_contract(option):
+    from vllm_torchtpu.models.vllm.qwen4_exp.pd_connector import Qwen4ExpRaidenWorker
+
     cfg = _make_vllm_config()
     if option == "apc":
         cfg.cache_config.enable_prefix_caching = True
@@ -116,8 +119,15 @@ def test_constructor_rejects_unimplemented_state_lifecycles(option):
             "pp": "pipeline_parallel_size",
         }[option]
         setattr(cfg.parallel_config, name, 2)
-    with pytest.raises(NotImplementedError, match="CP1/PP1"):
-        connector(cfg)
+    obj = connector(cfg)
+    assert (
+        obj._stage3_transfer_groups
+        == connector(_make_vllm_config())._stage3_transfer_groups
+    )
+    worker = object.__new__(Qwen4ExpRaidenWorker)
+    worker.vllm_config = cfg
+    worker.tp_rank, worker.tp_size = 0, 1
+    worker._validate_stage3_transfer_parallelism(1)
 
 
 @pytest.mark.parametrize("admission", ["QWEN35", "KIMIK3", "GLM", "DSV4"])
@@ -476,12 +486,18 @@ def test_qwen_loaded_requires_controller_and_native_completion(
         _flush_stage3_submits(worker)
 
 
-@pytest.mark.parametrize(
-    "fault", [None, "checkpoint", "scale", "legacy_env", "layout_dtype", "binding"]
-)
-@pytest.mark.parametrize("ssm_dtype", ["bfloat16", "float32"])
-def test_qwen_register_runner_admits_actual_materialized_owners(
-    monkeypatch, fault, ssm_dtype
+def _registered_qwen_pool(
+    monkeypatch,
+    *,
+    fault=None,
+    ssm_dtype: Literal["bfloat16", "float32"] = "bfloat16",
+    tp=1,
+    producer=True,
+    scales=(0.5, 0.25),
+    blocks=3,
+    state_shape_change=False,
+    feature=None,
+    gather_fault=None,
 ):
     import torch
 
@@ -493,32 +509,69 @@ def test_qwen_register_runner_admits_actual_materialized_owners(
     from vllm_torchtpu.models.vllm.qwen4_exp.pooled_cache import Qwen4ExpPooledCache
 
     monkeypatch.setenv("TPU_GDN_CONV_QK_PAIR_LAYOUT", "1")
-    worker = qwen_worker(monkeypatch)
+    worker = qwen_worker(monkeypatch, tp=tp, producer=producer)
     worker._qwen_page_plan = None
     worker._raiden_transfer_engine = None
     worker.vllm_config.parallel_config.enable_expert_parallel = False
     worker.vllm_config.cache_config.mamba_ssm_cache_dtype = ssm_dtype
-    config, materialized = live_pool(tp=8, ssm=ssm_dtype)
+    if feature == "apc":
+        worker.vllm_config.cache_config.enable_prefix_caching = True
+    elif feature == "mtp":
+        worker.vllm_config.speculative_config = cast("SpeculativeConfig", object())
+    elif feature == "enable_expert_parallel":
+        worker.vllm_config.parallel_config.enable_expert_parallel = True
+    elif feature == "dp_ep":
+        worker.vllm_config.parallel_config.data_parallel_size = 2
+        worker.vllm_config.parallel_config.enable_expert_parallel = True
+    elif feature is not None:
+        setattr(worker.vllm_config.parallel_config, feature, 2)
+    config, materialized = live_pool(tp=tp, ssm=ssm_dtype, num_blocks=blocks)
+    from tests.runner.test_qwen4_exp_pool import pool_config
+    from vllm_torchtpu.models.vllm.qwen4_exp.pool_layout import pooled_cache_specs
+
+    cache_config = pool_config(tp=tp, ssm=ssm_dtype)
     cache = Qwen4ExpPooledCache.__new__(Qwen4ExpPooledCache)
     cache.native_config, cache.materialized = config, materialized
+    cache.layout, cache.specs = pooled_cache_specs(cache_config)
+    if state_shape_change:
+        for name, spec in cache.specs.items():
+            if name.endswith(".linear_attn"):
+                assert isinstance(spec, MambaSpec)
+                conv, ssm = spec.shapes
+                cache.specs[name] = replace(spec, shapes=(conv, ssm[::-1]))
     attention = SimpleNamespace(
-        _k_scale_float=0.5,
-        _v_scale_float=0.25,
-        _k_scale_cpu=torch.tensor(0.5),
-        _v_scale_cpu=torch.tensor(0.25),
+        _k_scale_float=scales[0],
+        _v_scale_float=scales[1],
+        _k_scale_cpu=torch.tensor(scales[0]),
+        _v_scale_cpu=torch.tensor(scales[1]),
     )
     cache.model = SimpleNamespace(
-        pd_loaded_weight_identity=None if fault == "checkpoint" else "a" * 64,
-        pd_loaded_ple_identity="b" * 64,
-        config=SimpleNamespace(to_dict=lambda: {"hidden_size": 16}),
+        checkpoint_path="/producer/checkpoint" if producer else "/consumer/checkpoint",
+        config=SimpleNamespace(
+            to_dict=lambda: pytest.fail("transfer admission read the full model config")
+        ),
         model=SimpleNamespace(
             layers=[
                 SimpleNamespace(
                     layer_type="indexed_attention",
                     self_attn=attention,
+                    ple=SimpleNamespace(
+                        weight=torch.arange(8 if producer else 16),
+                        owner=0 if producer else 1,
+                    ),
                 )
             ]
         ),
+    )
+    worker.vllm_config.additional_config = dict(
+        qwen4_exp=dict(
+            ple_host_backend="torch" if producer else "native_dma",
+            engram_config=dict(
+                cpu_offload=True,
+                dp_shared_memory=producer,
+                embedding_across_dp=not producer,
+            ),
+        )
     )
     if fault == "scale":
         attention._k_scale_cpu.fill_(0.75)
@@ -570,12 +623,22 @@ def test_qwen_register_runner_admits_actual_materialized_owners(
     monkeypatch.setattr(
         module,
         "get_tp_group",
-        lambda: SimpleNamespace(rank_in_group=0, world_size=1, cpu_group="cpu"),
+        lambda: SimpleNamespace(rank_in_group=0, world_size=tp, cpu_group="cpu"),
     )
 
     def gather(output, value, *, group):
         assert group == "cpu"
-        output[:] = [value]
+        output[:] = [dict(value, rank=i, tp_rank=i) for i in range(tp)]
+        if gather_fault == "missing":
+            output[1] = None
+        elif gather_fault == "rank":
+            output[1]["rank"] = 0
+        elif gather_fault == "tp":
+            output[1]["tp_rank"] = tp
+        elif gather_fault == "tp_duplicate":
+            output[1]["tp_rank"] = 0
+        elif gather_fault == "state":
+            output[1]["cache_specs"] = {}
 
     monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
     monkeypatch.setattr(module, "materialize_storages", lambda _: None)
@@ -609,33 +672,189 @@ def test_qwen_register_runner_admits_actual_materialized_owners(
         return engine
 
     monkeypatch.setattr(worker, "_construct_raiden_transfer_engine", construct)
+    try:
+        worker.register_runner(runner)
+    except (ValueError, RuntimeError):
+        assert not builds and not facade.register_work_unit_calls
+        raise
+    worker.register_runner(runner)
+    assert len(builds) == len(facade.register_work_unit_calls) == 1
+    assert len(pools) == len(materialized.kv_caches)
+    assert worker._qwen_page_plan is not None
+    assert worker._qwen_page_plan.manifest.storages[0] is materialized.raw_tensors[0]
+    return SimpleNamespace(worker=worker, runner=runner, facade=facade)
+
+
+@pytest.mark.parametrize(
+    "fault", [None, "scale", "legacy_env", "layout_dtype", "binding"]
+)
+@pytest.mark.parametrize("ssm_dtype", ["bfloat16", "float32"])
+def test_qwen_register_runner_admits_actual_materialized_owners(
+    monkeypatch, fault, ssm_dtype
+):
     if fault not in (None, "legacy_env"):
         with pytest.raises((ValueError, RuntimeError)):
-            worker.register_runner(runner)
-        assert not builds and not facade.register_work_unit_calls
+            _registered_qwen_pool(monkeypatch, fault=fault, ssm_dtype=ssm_dtype)
     else:
-        worker.register_runner(runner)
-        worker.register_runner(runner)
-        assert len(builds) == len(facade.register_work_unit_calls) == 1
-        from vllm_torchtpu.models.vllm.qwen4_exp.pd import TransferExtent
-
-        token_sizes = {
-            g.block_size
-            for g in cache.get_transfer_groups()
-            if g.extent is TransferExtent.TOKEN_PAGES
+        fixture = _registered_qwen_pool(monkeypatch, fault=fault, ssm_dtype=ssm_dtype)
+        payload = fixture.worker._raiden_layout_fingerprint_payload
+        rank = payload["semantics"]["ranks"][0]
+        assert set(rank) == {
+            "rank",
+            "tp_rank",
+            "tp_size",
+            "cache_specs",
+            "kv_scales",
+            "state_flags",
         }
-        assert token_sizes == {facade.register_work_unit_calls[0]["page_tokens"]}
-        assert len(pools) == len(materialized.kv_caches)
-        assert (
-            worker._qwen_page_plan.manifest.storages[0] is materialized.raw_tensors[0]
+        assert rank["state_flags"] == {
+            "gdn_conv_dtype": "torch.float32",
+            "gdn_granule_bytes": 512,
+        }
+        assert rank["kv_scales"] == [(0, 0.5, 0.25)]
+        recurrent = [
+            value
+            for name, value in rank["cache_specs"].items()
+            if name.endswith(".linear_attn")
+        ]
+        assert recurrent and all(
+            value["dtypes"] == ["torch.float32", "torch." + ssm_dtype]
+            for value in recurrent
         )
-        payload = worker._raiden_layout_fingerprint_payload
-        assert payload["semantics"]["ranks"][0]["state_flags"]["ssm_dtype"] == ssm_dtype
-        assert payload["semantics"]["ranks"][0]["checkpoint"] == "a" * 64
-        assert payload["semantics"]["ranks"][0]["kv_scales"] == [(0, 0.5, 0.25)]
-        assert (
-            "moe_combine_dtype" not in payload["semantics"]["ranks"][0]["state_flags"]
+
+
+@pytest.mark.parametrize("tp", [1, 2])
+def test_registered_peers_compare_cache_bytes_not_local_ple_or_checkpoint(
+    monkeypatch, tp
+):
+    producer = _registered_qwen_pool(monkeypatch, tp=tp, producer=True, blocks=3)
+    consumer = _registered_qwen_pool(monkeypatch, tp=tp, producer=False, blocks=5)
+    assert (
+        producer.worker.vllm_config.additional_config
+        != consumer.worker.vllm_config.additional_config
+    )
+    pmodel = producer.runner.model_adapter.cache.model
+    dmodel = consumer.runner.model_adapter.cache.model
+    assert pmodel.checkpoint_path != dmodel.checkpoint_path
+    assert (
+        pmodel.model.layers[0].ple.weight.shape
+        != dmodel.model.layers[0].ple.weight.shape
+    )
+    assert (
+        producer.worker._raiden_layout_fingerprint
+        == consumer.worker._raiden_layout_fingerprint
+    )
+    assert (
+        producer.worker._raiden_layout_fingerprint_payload
+        == consumer.worker._raiden_layout_fingerprint_payload
+    )
+    assert (
+        producer.facade.register_work_unit_calls[0]["layout_fingerprint"]
+        == consumer.facade.register_work_unit_calls[0]["layout_fingerprint"]
+    )
+
+
+@pytest.mark.parametrize("change", ["scale", "ssm_dtype", "state_shape", "tp"])
+def test_registered_peers_keep_wire_encoding_and_scale_differences(monkeypatch, change):
+    producer = _registered_qwen_pool(monkeypatch)
+    if change == "scale":
+        consumer = _registered_qwen_pool(
+            monkeypatch, producer=False, scales=(0.75, 0.25)
         )
+    elif change == "ssm_dtype":
+        consumer = _registered_qwen_pool(
+            monkeypatch, producer=False, ssm_dtype="float32"
+        )
+    elif change == "state_shape":
+        consumer = _registered_qwen_pool(
+            monkeypatch, producer=False, state_shape_change=True
+        )
+    else:
+        assert change == "tp"
+        consumer = _registered_qwen_pool(monkeypatch, producer=False, tp=2)
+    assert (
+        producer.worker._raiden_layout_fingerprint
+        != consumer.worker._raiden_layout_fingerprint
+    )
+
+
+@pytest.mark.parametrize(
+    "feature",
+    [
+        "prefill_context_parallel_size",
+        "decode_context_parallel_size",
+        "pipeline_parallel_size",
+        "enable_expert_parallel",
+        "dp_ep",
+        "apc",
+        "mtp",
+    ],
+)
+def test_feature_flags_do_not_fingerprint_an_unchanged_cache(monkeypatch, feature):
+    producer = _registered_qwen_pool(monkeypatch)
+    consumer = _registered_qwen_pool(monkeypatch, producer=False, feature=feature)
+    assert (
+        producer.worker._raiden_layout_fingerprint
+        == consumer.worker._raiden_layout_fingerprint
+    )
+
+
+@pytest.mark.parametrize(
+    "gather_fault", ["missing", "rank", "tp", "tp_duplicate", "state"]
+)
+def test_actual_collector_rejects_incomplete_or_inconsistent_tp_records(
+    monkeypatch, gather_fault
+):
+    with pytest.raises(ValueError, match="every rank|cache encoding or TP map"):
+        _registered_qwen_pool(monkeypatch, tp=2, gather_fault=gather_fault)
+
+
+@pytest.mark.parametrize("size,rank,transfer", [(2, 0, 1), (2, 2, 2), (0, 0, 0)])
+def test_whole_shard_span_mapping_rejects_an_invalid_transfer_rank_set(
+    monkeypatch, size, rank, transfer
+):
+    worker = qwen_worker(monkeypatch)
+    worker.tp_size, worker.tp_rank = size, rank
+    with pytest.raises(ValueError, match="whole-shard spans"):
+        worker._validate_stage3_transfer_parallelism(transfer)
+
+
+@pytest.mark.parametrize("source_units,destination_units", [(2, 2), (2, 1), (1, 2)])
+def test_whole_page_ordinal_mapping_matches_actual_destination_coverage(
+    monkeypatch, source_units, destination_units
+):
+    from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (
+        SendMeta,
+        _Stage3LoadMeta,
+    )
+
+    ordinals = set()
+    for rank in range(source_units):
+        producer = qwen_worker(monkeypatch, tp=source_units, rank=rank)
+        producer.vllm_config.parallel_config.data_parallel_size = 8
+        _, registrations = producer._stage3_grouped_spans(
+            cast(SendMeta, send_pages()), 129
+        )
+        assert sum(reg.declared_bytes for reg in registrations) == 7 * 4096
+        for reg in registrations:
+            assert reg.dst_space_version == 0
+            for span in reg.spans:
+                assert span.src_offset_bytes == span.dst_offset_bytes == 0
+                assert span.size_bytes == 4096
+                assert span.dst_unit_ordinal == rank
+                ordinals.add(span.dst_unit_ordinal)
+    consumer = qwen_worker(monkeypatch, tp=destination_units, producer=False)
+    consumer.vllm_config.parallel_config.data_parallel_size = 4
+    request = cast(_Stage3LoadMeta, send_pages())
+    request.src_parallelism, request.skip_tokens = source_units, 0
+    required_ordinals = set(range(destination_units))
+    if ordinals != required_ordinals:
+        with pytest.raises(ValueError, match="ordinal routing has no shard conversion"):
+            consumer._stage3_grouped_destination_pages(request, 129)
+    else:
+        tags, pages, counts = consumer._stage3_grouped_destination_pages(request, 129)
+        assert len(tags) == 5 and counts == [2, 2, 1, 1, 1]
+        assert pages == [1, 2, 70, 71, 140, 141, 142]
 
 
 @pytest.mark.parametrize("qwen", [False, True], ids=["dsv4", "qwen"])

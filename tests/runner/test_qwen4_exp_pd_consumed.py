@@ -98,13 +98,13 @@ def model_builder(monkeypatch):
         yield build
 
 
-def test_loaded_identity_ignores_unused_keys_and_normalizes_prefix(model_builder):
+def test_loading_ignores_unused_keys_and_normalizes_prefix(model_builder):
     model = model_builder([])
     weights = [
         (name, torch.full_like(param, 0.25)) for name, param in model.named_parameters()
     ]
     model.load_weights(iter(weights))
-    before = model.pd_loaded_weight_identity
+    before = {name: value.detach().clone() for name, value in model.named_parameters()}
     renamed = [
         (name.replace("model.", "model.language_model.", 1), value)
         for name, value in weights
@@ -113,10 +113,12 @@ def test_loaded_identity_ignores_unused_keys_and_normalizes_prefix(model_builder
     model.load_weights(
         iter([*renamed, ("model.visual.weight", ignored), ("mtp.weight", ignored + 1)])
     )
-    assert model.pd_loaded_weight_identity == before
+    for name, value in model.named_parameters():
+        torch.testing.assert_close(value, before[name], rtol=0, atol=0)
     changed = [(name, value + 1) for name, value in weights]
     model.load_weights(iter(changed))
-    assert model.pd_loaded_weight_identity != before
+    for name, value in model.named_parameters():
+        torch.testing.assert_close(value, dict(changed)[name], rtol=0, atol=0)
     assert torch.equal(ignored, torch.arange(12).reshape(3, 4).T)
 
 
@@ -128,8 +130,6 @@ def test_actual_model_normalized_layers_bind_loaded_scale_identity(
     model = model_builder(
         ["linear_attention" if fault == "empty" else "full_attention"]
     )
-    model.pd_loaded_weight_identity = "a" * 64
-    model.pd_loaded_ple_identity = "b" * 64
     layer = cast(Qwen4ExpDecoderLayer, model.model.layers[0])
     if fault != "empty":
         attention = layer.self_attn
@@ -147,7 +147,7 @@ def test_actual_model_normalized_layers_bind_loaded_scale_identity(
     worker.vllm_config = VllmConfig(device_config=DeviceConfig(device="cpu"))
     worker.vllm_config.cache_config.mamba_ssm_cache_dtype = "bfloat16"
     runner = SimpleNamespace(
-        model_adapter=SimpleNamespace(cache=SimpleNamespace(model=model))
+        model_adapter=SimpleNamespace(cache=SimpleNamespace(model=model, specs={}))
     )
     monkeypatch.setenv("TPU_GDN_CONV_QK_PAIR_LAYOUT", "1")
     monkeypatch.setattr(
@@ -202,22 +202,16 @@ def test_pd_tp1_uses_engine_geometry_instead_of_a_dp_literal(monkeypatch, dp):
     validate_config(cfg)
 
 
-def test_pd_disabled_uses_the_same_public_loaders_without_an_observer(
-    monkeypatch, model_builder
-):
-    from vllm_torchtpu.models.vllm.qwen4_exp import model as module
-
+@pytest.mark.parametrize("pd_enabled", [False, True])
+def test_pd_uses_the_same_public_weight_loaders(model_builder, pd_enabled):
     model = model_builder([])
-    model._pd_weight_identity_enabled = False
+    model.vllm_config.kv_transfer_config = object() if pd_enabled else None
     weights = [
         (name, torch.full_like(value, 0.75)) for name, value in model.named_parameters()
     ]
-
-    def forbidden(*args, **kwargs):
-        pytest.fail("disabled PD created a weight observer")
-
-    monkeypatch.setattr(module, "LoadedWeightIdentity", forbidden)
+    before = {name: value.clone() for name, value in weights}
     assert model.load_weights(iter(weights)) == set(dict(model.named_parameters()))
-    assert model.pd_loaded_weight_identity is None
     for name, value in model.named_parameters():
-        torch.testing.assert_close(value, dict(weights)[name], rtol=0, atol=0)
+        torch.testing.assert_close(value, before[name], rtol=0, atol=0)
+    for name, value in weights:
+        torch.testing.assert_close(value, before[name], rtol=0, atol=0)

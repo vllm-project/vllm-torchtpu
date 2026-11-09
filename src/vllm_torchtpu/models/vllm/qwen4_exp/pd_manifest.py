@@ -157,7 +157,7 @@ def measure_transfer_layout(
     """Fail closed unless every live carrier has whole, unpadded native pages.
 
     Matching peers may have different capacities, but must have the same page
-    encoding. Model/checkpoint, scales and rank ownership are separate admission
+    encoding. Logical cache specs, scales and TP ownership are separate admission
     checks. This observation does not fence future device writes or transfers.
     """
     if not manifest.storages or not manifest.pools:

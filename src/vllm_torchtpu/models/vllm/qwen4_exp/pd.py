@@ -70,13 +70,7 @@ def build_transfer_groups(
         )
         extents = set()
         for spec in specs:
-            if isinstance(spec, MambaSpec):
-                if spec.mamba_cache_mode != "none" or spec.num_speculative_blocks:
-                    raise NotImplementedError(
-                        "Qwen PD request-state transfer requires APC and MTP off"
-                    )
-                extents.add(TransferExtent.REQUEST_STATE)
-            elif isinstance(spec, CircularBufferSpec):
+            if isinstance(spec, (MambaSpec, CircularBufferSpec)):
                 extents.add(TransferExtent.REQUEST_STATE)
             elif isinstance(spec, FullAttentionSpec):
                 extents.add(TransferExtent.TOKEN_PAGES)
@@ -100,11 +94,12 @@ def handoff_block_ids(
     committed_tokens: int,
     computed_tokens: int,
 ) -> tuple[tuple[int, ...], ...]:
-    """Validate a complete CP1/APC-off prefix before publishing its pages.
+    """Validate a complete committed prefix before publishing its pages.
 
     The caller must use the producer's actual computed length. In particular,
     an N-token state cannot be published as N-1 for decoder recomputation.
     Scheduler block tables are unpadded; device table padding is not accepted.
+    Request-state tables identify the committed snapshot, not spare/history slots.
     """
     if committed_tokens != computed_tokens:
         raise ValueError(
