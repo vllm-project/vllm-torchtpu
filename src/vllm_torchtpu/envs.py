@@ -79,6 +79,7 @@ if TYPE_CHECKING:
     FUSED_MOE_DECODE_KERNEL_MAX_TOKENS: int = 256
     TPU_MOE_SINGLE_SORT: bool = True
     TPU_MOE_COUNTING_SORT: bool = True
+    TPU_MOE_LOWTOK_MAX_TOKENS: int = 0
     USE_MOE_TP_DECODE_KERNEL: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
@@ -748,6 +749,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # counting sort either way. A stand-down knob in case a libtpu release
     # miscompiles the rank contraction again.
     "TPU_MOE_COUNTING_SORT": env_bool("TPU_MOE_COUNTING_SORT", True),
+    # Maximum hidden-state row count (after any EP all-gather) for the
+    # few-token expert-parallel MoE kernel (kernels/moe_lowtok). It walks
+    # only the hit local experts and masks each row by its routing weight,
+    # with no sort or permute. Serves the routed GMM path (ahead of the
+    # dense-expert path) and, for small steps, the adaptive fused EP kernel.
+    # 0 disables it; larger shapes and unsupported layouts are unchanged.
+    "TPU_MOE_LOWTOK_MAX_TOKENS": env_nonnegative_int("TPU_MOE_LOWTOK_MAX_TOKENS", 0),
     # Serve eligible tensor-parallel MoE layers (sigmoid + correction-bias
     # top-k with renormalization, one shared expert, FP8 per-channel weights)
     # with one op that also covers the shared expert and the TP all-reduce:
