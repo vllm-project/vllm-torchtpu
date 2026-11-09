@@ -28,6 +28,7 @@ from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
     blockwise_onehot_unpermute,
     can_use_blockwise_onehot_unpermute,
 )
+from vllm_torchtpu.kernels.moe_lowtok import can_use_moe_lowtok, moe_lowtok
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce import (
     ragged_gather_reduce as ragged_gather_reduce_v1,
 )
@@ -72,6 +73,8 @@ ragged_gather_reduce = _select_ragged_gather_reduce(envs.RAGGED_GATHER_REDUCE_VE
 _ONEHOT_AUTO_CAP = 512
 # Fixed at import, like the other MoE algorithm selectors.
 _DENSE_EXPERT_THRESHOLD = envs.TPU_MOE_DENSE_EXPERT_THRESHOLD
+# Fixed at import: the few-token EP kernel's row cap (0 disables it).
+_LOWTOK_MAX_TOKENS = envs.TPU_MOE_LOWTOK_MAX_TOKENS
 # Fixed at import: build the MoE permutation from one packed sort.
 _SINGLE_SORT = envs.TPU_MOE_SINGLE_SORT
 # Fixed at import: let the counting sort replace the comparison sorts on the
@@ -751,6 +754,31 @@ def fused_moe_func(
         valid = (local_ids >= 0) & (local_ids < w1.shape[0])
         topk_weights = jnp.where(valid, topk_weights, jnp.zeros_like(topk_weights))
         topk_ids = jnp.where(valid, local_ids, jnp.full_like(local_ids, -1))
+
+    # A few tokens under expert parallelism: one Pallas call walks the
+    # shard's hit experts with the routing weights as the row mask, instead
+    # of the sort, permute, grouped matmuls and unpermute below. The caller's
+    # combine across shards is unchanged.
+    if (
+        use_ep
+        and experts_start is not None
+        and 0 < num_tokens <= _LOWTOK_MAX_TOKENS
+        and rhs_quant_dtype is None
+        and can_use_moe_lowtok(
+            hidden_states,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            w1_bias,
+            w2_bias,
+            activation=activation,
+        )
+    ):
+        logger.info_once("Selected few-token MoE kernel (moe_lowtok)")
+        return moe_lowtok(
+            hidden_states, topk_ids, topk_weights, w1, w1_scale, w2, w2_scale
+        )
 
     # Decode services also compile large prefill buckets. Apply the token
     # threshold before kernel admission so those buckets retain routed GMM.
