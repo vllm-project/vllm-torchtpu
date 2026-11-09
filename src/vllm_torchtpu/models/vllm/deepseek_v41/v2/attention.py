@@ -422,12 +422,6 @@ class SWACache(NativeCacheView, DeepseekV4SWACache):
         kwargs["backend_cls"] = AttentionBackend
         super().__init__(*args, **kwargs)
 
-    def get_kv_cache_spec(self, vllm_config):
-        return dataclasses.replace(
-            super().get_kv_cache_spec(vllm_config),
-            extra_retained_tokens=max(0, vllm_config.num_prefill_lookahead_tokens - 1),
-        )
-
 
 def _value(output):
     return output[0] if isinstance(output, tuple) else output
