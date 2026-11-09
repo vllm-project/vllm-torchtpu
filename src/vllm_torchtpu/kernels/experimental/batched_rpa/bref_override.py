@@ -27,6 +27,38 @@ from vllm_torchtpu.kernels.experimental.batched_rpa import configs, schedule
 _STATIC_FULL_BLOCK_COPIES = True
 
 
+def _mod_const(x, divisor: int, bound: int):
+    """`x % divisor` for a traced 0 <= x < bound, by a multiply and a shift."""
+    if divisor & (divisor - 1) == 0:
+        return x & (divisor - 1)
+    for shift in range(1, 31):
+        mult = -(-(1 << shift) // divisor)
+        err = mult * divisor - (1 << shift)
+        # floor(x * mult / 2**shift) == x // divisor while x * err < 2**shift.
+        if (bound - 1) * mult < 1 << 31 and (bound - 1) * err < 1 << shift:
+            return x - ((x * mult) >> shift) * divisor
+    return jax.lax.rem(x, divisor)
+
+
+def _block_page_runs(rel_page, num_valid, cfgs):
+    """(first page, pages) of each run in a block's first `num_valid` cache pages.
+
+    `rel_page` is the block's first page within its sequence. Runs end where a
+    run of `kv_run_pages` pages ends; a block crossing fewer run boundaries
+    gets empty trailing runs.
+    """
+    run_pages = cfgs.serve.kv_run_pages
+    num_pages = cfgs.bkv_p_cache
+    first = run_pages - _mod_const(rel_page, run_pages, cfgs.serve.pages_per_seq)
+    runs = []
+    start = 0
+    for j in range(pl.cdiv(num_pages - 1, run_pages) + 1):
+        size = jnp.minimum(first if j == 0 else run_pages, num_valid - start)
+        runs.append((start, size))
+        start = start + size
+    return runs
+
+
 def _page_id(page_indices_ref, logical_page, cfgs):
     if cfgs.serve.stream_page_indices:
         if cfgs.serve.page_table_row_stride != cfgs.serve.pages_per_seq:
@@ -273,6 +305,170 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
             flat_src.at[pl.ds(0, wait_lanes), :],
             sem,
         ).wait()
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class KVBufferedRefPageRuns(KVBufferedRefSeqAlongLane):
+    """SEQ_ALONG_LANE decode KV in a page-major window ([b, page] holds one HBM
+    page), so each contiguous run of a block's cache pages lands with one DMA.
+
+    The pages land where the token-major window holds the same tokens, and
+    the same bytes move per step, so the step waits are unchanged.
+    """
+
+    def copy_in(
+        self,
+        src_ref: tuple,
+        grid_indices: tuple[int | jax.Array, ...],
+    ):
+        kv_cache_hbm, new_kv_hbm, schedule_ref, page_indices_ref, kv_cache_lens_ref = (
+            src_ref
+        )
+        slot = self.current_copy_in_slot
+        block_idx = jnp.maximum(grid_indices[0], 0)
+        copy_runs = functools.partial(
+            self._copy_runs,
+            kv_cache_hbm,
+            new_kv_hbm,
+            schedule_ref,
+            page_indices_ref,
+            kv_cache_lens_ref,
+            self.window_ref.at[slot],
+            self.sem_recvs.at[slot],
+            block_idx,
+        )
+        if not _STATIC_FULL_BLOCK_COPIES:
+            copy_runs(full_blocks=False)
+            return
+        full = None
+        for b in range(self.cfgs.batch_size):
+            last_page = schedule_ref.dma_kv_cache[
+                block_idx, b, self.cfgs.bkv_p_cache - 1, 2
+            ]
+            no_new = schedule_ref.dma_kv_new[block_idx, b, 0].fetch_val == 0
+            lane_full = (last_page == 1) & no_new
+            full = lane_full if full is None else full & lane_full
+        jax.lax.cond(
+            full,
+            functools.partial(copy_runs, full_blocks=True),
+            functools.partial(copy_runs, full_blocks=False),
+        )
+
+    def _copy_runs(
+        self,
+        kv_cache_hbm: jax.Ref,
+        new_kv_hbm: jax.Ref,
+        schedule_ref: schedule.RpaSchedule,
+        page_indices_ref: jax.Ref,
+        kv_cache_lens_ref: jax.Ref,
+        vmem_dst: jax.Ref,
+        sem: jax.Ref,
+        block_idx: jax.Array,
+        *,
+        full_blocks: bool,
+    ):
+        cfgs = self.cfgs
+        page_size = cfgs.serve.page_size
+        num_pages = cfgs.bkv_p_cache
+        for b in range(cfgs.batch_size):
+            k_idx = schedule_ref.k_idx[block_idx, b]
+            # Logical index of the block's first page (that of an empty lane: 0).
+            first_page = schedule_ref.dma_kv_cache[block_idx, b, 0, 0]
+            if full_blocks:
+                num_valid = num_pages
+                last = num_pages - 1
+            else:
+                # The schedule's valid cache pages: those holding cached tokens.
+                s_idx = schedule_ref.s_idx[block_idx, b]
+                cache_len = kv_cache_lens_ref[jnp.maximum(s_idx, 0)]
+                left = jnp.maximum(cache_len - k_idx * cfgs.bkv_sz, 0)
+                num_valid = jnp.minimum(
+                    (left + page_size - 1) >> cfgs.serve.page_size_log2, num_pages
+                )
+                num_valid = jnp.where(s_idx >= 0, num_valid, 0)
+                last = jnp.maximum(num_valid - 1, 0)
+            for start, size in _block_page_runs(k_idx * num_pages, num_valid, cfgs):
+                # An empty run looks up a valid page: its copy moves nothing.
+                logical = first_page + jnp.minimum(start, last)
+                hbm_p_idx = _page_id(page_indices_ref, logical, cfgs)
+                # kv_cache_hbm: (num_pages, num_kv_heads * 2,
+                #     kv_head_dim // packing, packing, page_size)
+                # vmem_dst: (batch_size, bkv_p + 2, num_kv_heads * 2,
+                #     kv_head_dim // packing, packing, page_size)
+                pltpu.make_async_copy(
+                    kv_cache_hbm.at[pl.ds(hbm_p_idx, size)],
+                    vmem_dst.at[b, pl.ds(start, size)],
+                    sem,
+                ).start()
+            if full_blocks:
+                continue
+            for i in range(cfgs.bkv_p_new):
+                dma_entry = schedule_ref.dma_kv_new[block_idx, b, i]
+                src_new_off = pl.multiple_of(dma_entry.fetch_hbm[...], 128)
+                dst_page = dma_entry.fetch_vmem[...] >> cfgs.serve.page_size_log2
+                sz = pl.multiple_of(dma_entry.fetch_val * page_size, 128)
+                # new_kv_hbm: (num_kv_heads * 2, kv_head_dim // packing, packing,
+                #     total_new_tokens)
+                pltpu.make_async_copy(
+                    new_kv_hbm.at[:, :, :, pl.ds(src_new_off, sz)],
+                    vmem_dst.at[b, dst_page, :, :, :, pl.ds(0, sz)],
+                    sem,
+                ).start()
+
+    def copy_out(
+        self,
+        dst_ref: tuple,
+        grid_indices: tuple[int | jax.Array, ...],
+    ):
+        kv_out_ref, _, schedule_ref, page_indices_ref, _ = dst_ref
+        slot = self.current_copy_out_slot
+        sem = self.sem_sends.at[slot]
+        block_idx = grid_indices[0]
+
+        vmem_src = self.window_ref.at[slot]
+        for b in range(self.cfgs.batch_size):
+            do_writeback = schedule_ref.do_writeback[block_idx, b] == 1
+            for i in range(self.cfgs.bkv_p_new):
+                dma_entry = schedule_ref.dma_kv_new[block_idx, b, i]
+                dst_hbm_p = dma_entry.wb_hbm[...]
+                src_page = dma_entry.wb_vmem[...] >> self.cfgs.serve.page_size_log2
+                dma_valid = dma_entry.wb_val
+                hbm_p_idx = _page_id(page_indices_ref, dst_hbm_p, self.cfgs)
+                sz = jnp.where(do_writeback, dma_valid * self.cfgs.serve.page_size, 0)
+                sz = pl.multiple_of(sz, 128)
+
+                def write_page(
+                    *,
+                    b=b,
+                    src_page=src_page,
+                    sz=sz,
+                    hbm_p_idx=hbm_p_idx,
+                ):
+                    pltpu.make_async_copy(
+                        vmem_src.at[b, src_page, :, :, :, pl.ds(0, sz)],
+                        kv_out_ref.at[hbm_p_idx, :, :, :, pl.ds(0, sz)],
+                        sem,
+                    ).start()
+
+                if self.cfgs.serve.stream_page_indices:
+                    jax.lax.cond(sz > 0, write_page, lambda: None)
+                else:
+                    write_page()
+
+    def wait_in(
+        self,
+        src_ref: tuple,
+        grid_indices: tuple[int | jax.Array, ...],
+    ):
+        super().wait_in(src_ref[:4], grid_indices)
+
+    def wait_out(
+        self,
+        dst_ref: tuple,
+        grid_indices: tuple[int | jax.Array, ...],
+    ):
+        super().wait_out(dst_ref[:4], grid_indices)
 
 
 @jax.tree_util.register_dataclass

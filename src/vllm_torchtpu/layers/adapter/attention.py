@@ -501,11 +501,14 @@ def _pallas_rpa_kernel_batched(
     block_major: bool = False,
     max_model_len: int | None = None,
     one_query_steps: bool = False,
+    kv_run_pages: int | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Batched-RPA Pallas kernel entry — used by
     `PallasBatchedRPAAttentionBackendImpl`. max_model_len, if set, bounds the
     block-table columns passed to the kernel. one_query_steps adds the
-    one-query kernel for calls whose sequences all carry one query."""
+    one-query kernel for calls whose sequences all carry one query.
+    kv_run_pages, if set, is the number of kernel pages per manager block,
+    which decode steps copy with one DMA (TPU_BATCHED_RPA_KV_PAGE_RUNS)."""
     rpa_func = (
         _with_verify_block_override(
             functools.partial(
@@ -525,6 +528,11 @@ def _pallas_rpa_kernel_batched(
     if envs.TPU_BATCHED_RPA_XLA_SCHEDULE:
         logger.info_once("Batched RPA decode schedules built with array ops")
         rpa_func = functools.partial(rpa_func, xla_decode_schedule=True)
+    if kv_run_pages is not None:
+        logger.info_once(
+            "Batched RPA decode steps copy %d kernel pages per DMA", kv_run_pages
+        )
+        rpa_func = functools.partial(rpa_func, kv_run_pages=kv_run_pages)
     return _pallas_rpa_kernel_impl(
         kv_cache,
         query,
@@ -1187,6 +1195,9 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # `(pool_index, layout)` identifying this layer's region in the merged
         # block-major unified pool; populated by `set_block_major_pool()`.
         self._bm_region: tuple[int, BlockMajorPoolLayout] | None = None
+        # Kernel pages per manager block that decode steps copy with one DMA;
+        # set by `set_kv_run_pages()` (TPU_BATCHED_RPA_KV_PAGE_RUNS).
+        self.kv_run_pages: int | None = None
 
     def set_block_major_pool(
         self, pool_index: int, layout: BlockMajorPoolLayout
@@ -1194,6 +1205,27 @@ class PallasAttentionBackendImpl(AttentionImpl):
         """Binds this layer to its region index within the merged block-major pool."""
         assert self._bm_kernel, "kernels were built for per-region pools"
         self._bm_region = (pool_index, layout)
+
+    def set_kv_run_pages(self, runs: int) -> None:
+        """Copies the `runs` kernel pages of each manager block with one DMA.
+
+        The caller has checked that the block table and the pool keep them at
+        consecutive indices. Refuses a layer whose kernel would not copy runs.
+        """
+        missing = []
+        if not self._pool_is_seq_along_lane:
+            missing.append("the batched RPA kernel on SEQ_ALONG_LANE (HND) pages")
+        if self.head_size == 64:
+            missing.append("a head size other than 64 (the hd64 kernel)")
+        if self.sliding_window is not None:
+            missing.append("no sliding window")
+        if self.kv_sharing_target_layer_name is not None:
+            missing.append("a layer that writes its own KV cache")
+        if missing:
+            raise NotImplementedError(
+                "TPU_BATCHED_RPA_KV_PAGE_RUNS=1 needs " + "; ".join(missing)
+            )
+        self.kv_run_pages = runs
 
     @classmethod
     def _allocate_kernel_instance_id(cls) -> int:
@@ -1236,6 +1268,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             self.decode_query_size,
             block_major,
             self.one_query_steps,
+            self.kv_run_pages,
         )
         existing = self._kernel_config_cache.get(config_key)
         if existing is not None:
@@ -1276,6 +1309,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             self.decode_query_size,
             block_major,
             self.one_query_steps,
+            self.kv_run_pages,
         )
         existing = self._kernel_registry.get(registry_key)
         if existing is not None:
@@ -1319,6 +1353,15 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 entry_kwargs["max_model_len"] = vllm_config.model_config.max_model_len
             if self.one_query_steps and "one_query_steps" in entry_params:
                 entry_kwargs["one_query_steps"] = True
+            if self.kv_run_pages is not None:
+                if "kv_run_pages" not in entry_params:
+                    raise NotImplementedError(
+                        "TPU_BATCHED_RPA_KV_PAGE_RUNS=1: "
+                        f"{type(self).__name__} runs kernel "
+                        f"{self._kernel_entry.__name__}, which copies one page "
+                        "per DMA"
+                    )
+                entry_kwargs["kv_run_pages"] = self.kv_run_pages
             if block_major:
                 if "block_major" not in entry_params:
                     raise NotImplementedError(

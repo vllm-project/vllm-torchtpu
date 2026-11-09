@@ -72,6 +72,23 @@ def strided_load_bkv(
     )
 
 
+def load_page_major_head(
+    kv_in_vref: jax.Ref,
+    b_idx: int,
+    head: int,
+    *,
+    cfgs: configs.RpaConfigs,
+) -> jax.Array:
+    """One K or V head of a page-major window as (head_dim words, bkv_sz) u32:
+    the block's pages side by side, as the token-major window holds them."""
+    pages = []
+    for page in range(cfgs.bkv_p):
+        page_ref = kv_in_vref.at[b_idx, page, head].bitcast(jnp.uint32)
+        page_ref = page_ref.reshape(-1, cfgs.serve.page_size)
+        pages.append(utils.strided_load(page_ref, 0, page_ref.shape[0], 1))
+    return jnp.concatenate(pages, axis=1)
+
+
 def calculate_and_store_out(
     step_idx: jax.Array,
     schedule_ref: schedule.RpaSchedule,
@@ -501,16 +518,24 @@ def _attend(
             ks = []
             vs = []
             for kv_head in range(cfgs.model.num_kv_heads):
-                k_slice = kv_in_vref.at[b_idx, kv_head * 2].bitcast(jnp.uint32)
-                v_slice = kv_in_vref.at[b_idx, kv_head * 2 + 1].bitcast(jnp.uint32)
-                target_shape = (-1, cfgs.bkv_sz + 2 * cfgs.serve.page_size)
-                k_head_ref = k_slice.reshape(target_shape)
-                v_head_ref = v_slice.reshape(target_shape)
-                pack_dim = cfgs.aligned_kv_head_dim // cfgs.serve.packing_kv
+                if cfgs.page_runs:
+                    k_head_u32 = load_page_major_head(
+                        kv_in_vref, b_idx, kv_head * 2, cfgs=cfgs
+                    )
+                    v_head_u32 = load_page_major_head(
+                        kv_in_vref, b_idx, kv_head * 2 + 1, cfgs=cfgs
+                    )
+                else:
+                    k_slice = kv_in_vref.at[b_idx, kv_head * 2].bitcast(jnp.uint32)
+                    v_slice = kv_in_vref.at[b_idx, kv_head * 2 + 1].bitcast(jnp.uint32)
+                    target_shape = (-1, cfgs.bkv_sz + 2 * cfgs.serve.page_size)
+                    k_head_ref = k_slice.reshape(target_shape)
+                    v_head_ref = v_slice.reshape(target_shape)
+                    pack_dim = cfgs.aligned_kv_head_dim // cfgs.serve.packing_kv
 
-                # Load as uint32 to avoid dtype conversion during strided load
-                k_head_u32 = utils.strided_load(k_head_ref, 0, pack_dim, 1)
-                v_head_u32 = utils.strided_load(v_head_ref, 0, pack_dim, 1)
+                    # Load as uint32 to avoid dtype conversion during strided load
+                    k_head_u32 = utils.strided_load(k_head_ref, 0, pack_dim, 1)
+                    v_head_u32 = utils.strided_load(v_head_ref, 0, pack_dim, 1)
                 # HND packs channels of one token together. Mask the words
                 # before unpacking, including any co-located V scale channels.
                 v_head_u32 = v_head_u32[:, : cfgs.bkv_sz]
@@ -696,7 +721,9 @@ def create_allocs(
         pipeline_mode=pl.Buffered(buffer_count=2, use_lookahead=False),
     )
 
-    if cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
+    if cfgs.page_runs:
+        kv_cache_alloc_cls = bref_override.KVBufferedRefPageRuns
+    elif cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
         kv_cache_alloc_cls = bref_override.KVBufferedRefSeqAlongLane
     else:
         kv_cache_alloc_cls = bref_override.KVBufferedRefHeadAlongSublane
@@ -1044,9 +1071,12 @@ def rpa_kernel(
                     in_specs=(q_alloc.spec, kv_cache_alloc.spec),
                     out_specs=(o_alloc.spec, lse_alloc.spec if return_lse else None),
                 )
+                kv_refs = (kv_cache_hbm_ref, new_kv_hbm_ref, schedule_ref, page_ref)
+                if cfgs.page_runs:
+                    kv_refs += (kv_cache_lens_ref,)
                 pipeline_func(
                     (q_hbm_ref, schedule_ref),
-                    (kv_cache_hbm_ref, new_kv_hbm_ref, schedule_ref, page_ref),
+                    kv_refs,
                     (o_hbm_ref, schedule_ref),
                     (lse_hbm_ref, schedule_ref) if return_lse else None,
                     scratches=(schedule_ref,) + scratches,

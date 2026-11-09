@@ -77,6 +77,7 @@ if TYPE_CHECKING:
     TPU_BATCHED_RPA_VERIFY_BLOCK: str | tuple[int, int, int] | None = None
     TPU_BATCHED_RPA_DRAFT_ONE_QUERY: bool = False
     TPU_BATCHED_RPA_XLA_SCHEDULE: bool = False
+    TPU_BATCHED_RPA_KV_PAGE_RUNS: bool = False
     TPU_MLA_MASKED_DENSE_ENABLED: bool = False
     TPU_MLA_MASKED_DENSE_ANALYTIC_MAX_KV_LEN: int | None = None
     TPU_MLA_MASKED_DENSE_MAX_KV_LEN: int | None = None
@@ -705,6 +706,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # sequence) with array ops instead of the scalar schedule kernel; the
     # attention kernel reads identical entries.
     "TPU_BATCHED_RPA_XLA_SCHEDULE": env_bool("TPU_BATCHED_RPA_XLA_SCHEDULE"),
+    # Batched RPA decode steps copy the kernel pages of each manager block in
+    # one DMA (into a page-major VMEM window) instead of one DMA per page;
+    # outputs are unchanged. Startup refuses configs whose block tables or KV
+    # pool do not keep a manager block's pages at consecutive indices.
+    "TPU_BATCHED_RPA_KV_PAGE_RUNS": env_bool("TPU_BATCHED_RPA_KV_PAGE_RUNS"),
     # Opt in to GLM-5.2's measured masked-dense sparse-MLA prefill routing.
     # Off by default until the model and hardware scope of the cost model is
     # broadened or selected automatically from an explicit model profile.

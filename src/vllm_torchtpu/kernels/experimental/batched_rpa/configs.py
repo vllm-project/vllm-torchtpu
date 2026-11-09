@@ -108,6 +108,10 @@ class ServingConfigs:
     return_lse: bool = False
     skip_kv_update: bool = False
     stream_page_indices: bool = False
+    # Pages per physically contiguous run: logical pages [r * n, (r + 1) * n) of
+    # every sequence occupy consecutive physical pages, as when vLLM expands
+    # each manager block into its kernel pages. None: no such guarantee.
+    kv_run_pages: int | None = None
 
     @property
     def page_table_row_stride(self) -> int:
@@ -292,6 +296,25 @@ class RpaConfigs:
         return self.bkv_p
 
     @property
+    def page_runs(self) -> bool:
+        """Whether decode steps keep KV page-major in VMEM and fetch each
+        contiguous run of a block's cache pages with one DMA.
+
+        Needs `kv_run_pages`, and a decode schedule whose valid cache pages per
+        block follow from the cache length alone: the full scope, no KV
+        sharing, sliding window or context parallelism.
+        """
+        return (
+            self.serve.kv_run_pages is not None
+            and self.mode == RpaCase.DECODE
+            and self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE
+            and self.serve.attention_scope == AttentionScope.FULL
+            and not self.serve.skip_kv_update
+            and self.serve.cp_group_size is None
+            and self.model.sliding_window is None
+        )
+
+    @property
     def bkv_stride(self) -> int:
         bkv_stride = pl.cdiv(self.model.num_kv_heads * 2, self.serve.packing_kv)
 
@@ -408,6 +431,17 @@ class RpaConfigs:
 
     @property
     def kv_vmem_shape(self):
+        if self.page_runs:
+            # Page-major: one HBM page per [b, page] slot, the same bytes as
+            # the token-major window below.
+            return (
+                self.block.batch_size,
+                self.bkv_p + 2,
+                self.model.num_kv_heads * 2,
+                self.aligned_kv_head_dim // self.serve.packing_kv,
+                self.serve.packing_kv,
+                self.serve.page_size,
+            )
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
             return (
                 self.block.batch_size,
@@ -595,4 +629,14 @@ class RpaConfigs:
             if bkv_sz % page_size != 0:
                 raise NotImplementedError(
                     f"SEQ_ALONG_LANE expects {bkv_sz=} to be aligned to {page_size=}."
+                )
+
+        if self.serve.kv_run_pages is not None and self.serve.kv_run_pages < 1:
+            raise ValueError(f"Expected {self.serve.kv_run_pages=} to be positive.")
+        if self.page_runs:
+            num_lanes = pltpu.get_tpu_info().num_lanes
+            if self.block.bq_sz > num_lanes:
+                raise NotImplementedError(
+                    f"Page runs stitch at most {num_lanes} new tokens per block,"
+                    f" got {self.block.bq_sz=}."
                 )

@@ -13,6 +13,7 @@ import math
 from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING, cast
 
+import numpy as np
 import torch
 from vllm.config import get_layers_from_vllm_config, set_current_vllm_config
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
@@ -53,10 +54,12 @@ from vllm.v1.worker.utils import (
 from vllm_torchtpu import envs, utils
 from vllm_torchtpu.block_major_pool import (
     BlockMajorPoolLayout,
+    flat_kernel_ids,
     unified_block_major_enabled,
 )
 from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
 from vllm_torchtpu.kv_cache_materializer import (
+    MaterializedKVCache,
     build_kernel_block_size_by_group_id,
     can_share_attention_cache,
     format_kv_cache_layout_summary,
@@ -81,6 +84,90 @@ if TYPE_CHECKING:
     from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 logger = init_logger(__name__)
+
+
+def kv_page_runs(
+    block_table,
+    manager_block_size: int,
+    kernel_block_size: int,
+    num_blocks: int,
+    pool_pages: int,
+    bm_layout: BlockMajorPoolLayout | None = None,
+    pool_index: int = 0,
+) -> int:
+    """Kernel pages per manager block of one attention group, checked to sit at
+    consecutive pool indices for every manager block.
+
+    TPU_BATCHED_RPA_KV_PAGE_RUNS copies the kernel pages of a manager block with
+    one DMA, which reads the pages at consecutive indices of the pool the
+    attention kernel addresses. This runs the group's own block-table
+    expansion (and the block-major remap) on a probe row of scattered manager
+    blocks, and checks that each manager block comes out as consecutive
+    indices within a pool of `num_blocks` manager blocks of such pages.
+
+    Args:
+        block_table: the group's vLLM `BlockTable`; its last row must be free.
+        manager_block_size: tokens per manager (scheduler) block.
+        kernel_block_size: tokens per kernel page.
+        num_blocks: manager blocks in the pool.
+        pool_pages: leading dimension of the attention-shaped pool the kernel
+            addresses (of `kernel_view(pool)` when block-major).
+        bm_layout: the merged block-major pool, or None.
+        pool_index: the group's region in the merged pool.
+
+    Raises:
+        NotImplementedError: if a manager block's pages are not consecutive.
+    """
+
+    def refuse(why: str):
+        raise NotImplementedError(f"TPU_BATCHED_RPA_KV_PAGE_RUNS=1: {why}")
+
+    runs, rem = divmod(manager_block_size, kernel_block_size)
+    if rem or runs < 2:
+        refuse(
+            f"manager blocks of {manager_block_size} tokens do not span several "
+            f"{kernel_block_size}-token kernel pages"
+        )
+    if (block_table.block_size, block_table.blocks_per_kv_block) != (
+        kernel_block_size,
+        runs,
+    ):
+        refuse(
+            f"the block table maps manager blocks to {block_table.blocks_per_kv_block}"
+            f" kernel pages of {block_table.block_size} tokens, not {runs} of "
+            f"{kernel_block_size}"
+        )
+    row = len(block_table.num_blocks_per_row) - 1
+    if block_table.num_blocks_per_row[row]:
+        refuse("the block table's probe row is in use")
+    probe = list(dict.fromkeys([num_blocks - 1, 0, num_blocks // 2]))
+    block_table.append_row(probe, row)
+    try:
+        pages = np.array(block_table.get_numpy_array()[row, : len(probe) * runs])
+    finally:
+        block_table.clear_row(row)
+    if bm_layout is not None:
+        if bm_layout.split != runs:
+            refuse(f"the block-major pool splits manager blocks into {bm_layout.split}")
+        pages = flat_kernel_ids(
+            torch.from_numpy(pages), pool_index, bm_layout.num_pools, bm_layout.split
+        ).numpy()
+        expected_pages = num_blocks * bm_layout.num_pools * runs
+    else:
+        expected_pages = num_blocks * runs
+    if pool_pages != expected_pages:
+        refuse(f"the pool holds {pool_pages} kernel pages, not {expected_pages}")
+    pages = pages.reshape(len(probe), runs)
+    if not (
+        np.array_equal(
+            pages - pages[:, :1], np.broadcast_to(np.arange(runs), pages.shape)
+        )
+        and len(set(pages[:, 0].tolist())) == len(probe)
+        and pages.min() >= 0
+        and pages.max() < pool_pages
+    ):
+        refuse(f"manager blocks {probe} map to kernel pages {pages.tolist()}")
+    return runs
 
 
 def is_cache_for_ds_v4(attn_module: AttentionLayerBase) -> bool:
@@ -1175,6 +1262,10 @@ class KVCacheManager:
         )
         if materialized.bm_pool_layout is not None:
             self._bind_block_major_pool_layers(materialized.bm_pool_layout)
+        if envs.TPU_BATCHED_RPA_KV_PAGE_RUNS:
+            self._bind_kv_page_runs(
+                kv_cache_config, kernel_block_size_by_gid, materialized
+            )
 
         if has_kv_transfer_group():
             kv_connector = get_kv_transfer_group()
@@ -1259,6 +1350,75 @@ class KVCacheManager:
                     "the block-major unified pool"
                 )
 
+    def _bind_kv_page_runs(
+        self,
+        kv_cache_config: KVCacheConfig,
+        kernel_block_size_by_gid: dict[int, int],
+        materialized: MaterializedKVCache,
+    ) -> None:
+        """Hands every attention layer its kernel pages per manager block for
+        TPU_BATCHED_RPA_KV_PAGE_RUNS, then rebuilds the attention kernels.
+
+        Refuses to start unless each attention group's block table and pool keep
+        the pages of every manager block at consecutive indices (`kv_page_runs`)
+        and every attention layer runs the batched kernel on them.
+        """
+        from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackendImpl
+
+        parallel_config = self.runner.parallel_config
+        if (
+            parallel_config.prefill_context_parallel_size > 1
+            or parallel_config.decode_context_parallel_size > 1
+        ):
+            raise NotImplementedError(
+                "TPU_BATCHED_RPA_KV_PAGE_RUNS=1: context parallelism gives each "
+                "rank its own page ordinals"
+            )
+        layout = materialized.bm_pool_layout
+        layers = get_layers_from_vllm_config(
+            self.runner.vllm_config, AttentionLayerBase
+        )
+        bound = 0
+        for gid, group in enumerate(kv_cache_config.kv_cache_groups):
+            spec = group.kv_cache_spec
+            if not isinstance(spec, AttentionSpec):
+                continue
+            first = group.layer_names[0]
+            pool = materialized.kv_caches[first]
+            assert isinstance(pool, torch.Tensor), (first, type(pool))
+            pool_pages = pool.shape[0] * (pool.shape[1] if layout else 1)
+            runs = kv_page_runs(
+                self.runner.input_batch.block_table[gid],
+                spec.block_size,
+                kernel_block_size_by_gid[gid],
+                kv_cache_config.num_blocks,
+                pool_pages,
+                layout,
+                layout.pool_index_by_layer[first] if layout else 0,
+            )
+            for name in group.layer_names:
+                impl = getattr(layers.get(name), "impl", None)
+                if not isinstance(impl, PallasAttentionBackendImpl):
+                    raise NotImplementedError(
+                        f"TPU_BATCHED_RPA_KV_PAGE_RUNS=1: attention layer {name} "
+                        f"does not run the batched RPA kernel ({type(impl).__name__})"
+                    )
+                impl.set_kv_run_pages(runs)
+                bound += 1
+            logger.info(
+                "Batched RPA KV page runs: %d layers of KV cache group %d copy "
+                "%d kernel pages of %d tokens per DMA",
+                len(group.layer_names),
+                gid,
+                runs,
+                kernel_block_size_by_gid[gid],
+            )
+        if not bound:
+            raise NotImplementedError(
+                "TPU_BATCHED_RPA_KV_PAGE_RUNS=1: no attention layer to copy runs for"
+            )
+        self.runner._initialize_attention_kernels(force=True)
+
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         """
         Initialize KV cache based on `kv_cache_config`.
@@ -1284,6 +1444,11 @@ class KVCacheManager:
         if self.runner._unified_kv_layout:
             self._initialize_unified_kv_cache(kv_cache_config)
             return
+        if envs.TPU_BATCHED_RPA_KV_PAGE_RUNS:
+            raise NotImplementedError(
+                "TPU_BATCHED_RPA_KV_PAGE_RUNS=1 needs the unified KV layout: this "
+                "model allocates one kernel page per manager block"
+            )
         backend_cls = TpuPlatform._find_non_ssm_backend(self.runner.vllm_config)
 
         for group in kv_cache_config.kv_cache_groups:

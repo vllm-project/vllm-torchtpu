@@ -606,6 +606,7 @@ def _select_rpa_metadata(
         "return_lse",
         "stream_page_indices",
         "xla_decode_schedule",
+        "kv_run_pages",
     ),
     # Donation of transient inputs can fail for some runtime buffer layouts in
     # the experimental tuning path. Keep donation only for kv_cache, which is
@@ -649,6 +650,7 @@ def ragged_paged_attention(
     return_lse: bool = False,
     stream_page_indices: bool | None = None,
     xla_decode_schedule: bool = False,
+    kv_run_pages: int | None = None,
 ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
     """Perform batched ragged paged attention.
     Args:
@@ -702,6 +704,13 @@ def ragged_paged_attention(
         xla_decode_schedule: Build the decode-mode schedule with array ops
             (`schedule_xla`) instead of the scalar schedule kernel, where it
             reproduces the kernel's entries. Defaults to False.
+        kv_run_pages: Pages per physically contiguous run of every sequence:
+            logical pages [r * kv_run_pages, (r + 1) * kv_run_pages) occupy
+            consecutive physical pages, as vLLM lays out the kernel pages of a
+            manager block. If set, SEQ_ALONG_LANE decode steps copy each run
+            of a block's cache pages with one DMA into a page-major VMEM
+            window; outputs are unchanged. Defaults to None (one DMA per
+            page).
     Returns:
         out: [max_num_tokens, num_q_heads, head_dim]. Output of self attention.
         new_kv_cache: [num_pages, page_size, cdiv(num_kv_heads * 2, kv_packing),
@@ -798,6 +807,7 @@ def ragged_paged_attention(
         return_lse=return_lse,
         skip_kv_update=skip_kv_update,
         stream_page_indices=stream_page_indices,
+        kv_run_pages=kv_run_pages,
     )
     schedule_chunks = 40 if serve_cfgs.pages_per_seq >= 4096 else 16
     if stream_page_indices:
