@@ -72,7 +72,6 @@ from vllm_torchtpu.layers.adapter.quantization.configs import (
     VllmQuantConfig,
     should_quantize_on_load,
 )
-from vllm_torchtpu.layers.adapter.quantization.online_fp8 import online_fp8_config
 from vllm_torchtpu.layers.core.quant_methods import UNQUANTIZED, get_tpu_quant_method
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import synchronize_tensors
@@ -199,17 +198,20 @@ class VllmUnquantizedConfig(QuantizationConfig, VllmQuantConfig):
             # kv_b_proj.weight and quantizes them separately after loading.
             if should_quantize_on_load(prefix) and "kv_b_proj" not in prefix.split("."):
                 from vllm_torchtpu.layers.adapter.quantization.fp8 import (
+                    VllmFp8Config,
                     VllmFp8LinearMethodTPU,
                 )
 
+                fp8_config = VllmFp8Config(
+                    is_checkpoint_fp8_serialized=False,
+                    activation_scheme="dynamic",
+                )
                 linear_cfg = (
                     self.get_linear_config(layer)
                     if isinstance(layer, LinearBase)
                     else None
                 )
-                return VllmFp8LinearMethodTPU(
-                    online_fp8_config(), linear_cfg, prefix=prefix
-                )
+                return VllmFp8LinearMethodTPU(fp8_config, linear_cfg, prefix=prefix)
 
             if isinstance(layer, LinearBase):
                 # TPU-native dense linear: canonical (k, n) weight layout so the
@@ -230,10 +232,15 @@ class VllmUnquantizedConfig(QuantizationConfig, VllmQuantConfig):
                 # BF16 experts are quantized to the MOE_REQUANTIZE_* format
                 # (per-channel FP8 by default) after loading.
                 from vllm_torchtpu.layers.adapter.quantization.fp8 import (
+                    VllmFp8Config,
                     VllmFp8MoEMethodTPU,
                 )
 
-                return VllmFp8MoEMethodTPU(online_fp8_config(), moe_config)
+                fp8_config = VllmFp8Config(
+                    is_checkpoint_fp8_serialized=False,
+                    activation_scheme="dynamic",
+                )
+                return VllmFp8MoEMethodTPU(fp8_config, moe_config)
             return VllmUnquantizedFusedMoEMethod(moe_config)
 
         if isinstance(layer, Attention):

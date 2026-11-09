@@ -33,21 +33,9 @@ if TYPE_CHECKING:
     from vllm.model_executor.models.utils import WeightsMapper
 
     from vllm_torchtpu.layers.adapter.quantization.configs import TpuLinear
-    from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8Config
 
 
 logger = init_logger(__name__)
-
-
-def online_fp8_config() -> VllmFp8Config:
-    """FP8 config for BF16 weights quantized at load time."""
-    # Local import: fp8.py imports this module at load time.
-    from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8Config
-
-    return VllmFp8Config(
-        is_checkpoint_fp8_serialized=False,
-        activation_scheme="dynamic",
-    )
 
 
 @dataclass
