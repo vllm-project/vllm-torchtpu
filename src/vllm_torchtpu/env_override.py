@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+import pathlib
 
 # envs.py imports nothing from this package, so it is safe to load here,
 # while the package's own __init__ is still running.
@@ -106,12 +107,56 @@ _TPU_VMEM_BYTES_PER_TENSOR_CORE = {
 }
 
 
+_PCI_DEVICE_ID_TO_TPU_FAMILY = {
+    "0x0062": "v5p",
+    "0x0063": "v5litepod",
+    "0x006f": "v6e",
+    "0x0076": "tpu7x",
+}
+
+
+def detect_tpu_type_from_pci(
+    pci_root: str = "/sys/bus/pci/devices",
+) -> str | None:
+    """Detect the attached TPU chip family from Linux PCI sysfs without libtpu.
+
+    On GKE TPU pods (where ``TPU_SKIP_MDS_QUERY=true`` and ``TPU_ACCELERATOR_TYPE``
+    is unset), GCE instance metadata does not expose ``accelerator-type``. Reading
+    Google vendor ``0x1ae0`` PCI device IDs resolves the chip family before
+    ``libtpu.so`` loads and without mutating ``TPU_ACCELERATOR_TYPE`` (which
+    ``libtpu`` requires to carry a ``-<core_count>`` suffix when set).
+    """
+    root = pathlib.Path(pci_root)
+    try:
+        entries = sorted(root.iterdir())
+    except OSError:
+        return None
+    for dev in entries:
+        try:
+            vendor = (dev / "vendor").read_text().strip().lower()
+            if vendor != "0x1ae0":
+                continue
+            dev_id = (dev / "device").read_text().strip().lower()
+        except OSError:
+            continue
+        if dev_id in _PCI_DEVICE_ID_TO_TPU_FAMILY:
+            return _PCI_DEVICE_ID_TO_TPU_FAMILY[dev_id]
+    return None
+
+
 def _fetch_tpu_type_from_metadata() -> str | None:
     # Inline the GCE metadata probe instead of delegating to
     # vllm_torchtpu.tpu_info, because that helper transitively imports
     # vllm.logger -> vllm -> torch -> torch_tpu autoload -> libtpu.so, which
     # would violate the "set LIBTPU_INIT_ARGS before libtpu loads" invariant
     # this file exists to enforce.
+    if os.getenv("TPU_SKIP_MDS_QUERY", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        return None
     try:
         import requests
 
@@ -137,6 +182,8 @@ def _resolve_sc_offload_threshold_bytes() -> int | None:
     tpu_type = os.getenv("TPU_ACCELERATOR_TYPE")
     if not tpu_type:
         tpu_type = _fetch_tpu_type_from_metadata()
+    if not tpu_type:
+        tpu_type = detect_tpu_type_from_pci()
     if not tpu_type:
         return None
     tpu_type = tpu_type.strip().lower()

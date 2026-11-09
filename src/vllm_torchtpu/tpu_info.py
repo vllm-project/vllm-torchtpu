@@ -22,6 +22,7 @@ import requests
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.env_override import detect_tpu_type_from_pci
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -32,7 +33,18 @@ GCE_TPU_ACCELERATOR_ENDPOINT = (
 GCE_TPU_HEADERS = {"Metadata-Flavor": "Google"}
 
 
-def get_tpu_metadata(key: str = "") -> str:
+def _skip_mds_query() -> bool:
+    return os.getenv("TPU_SKIP_MDS_QUERY", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def get_tpu_metadata(key: str = "") -> str | None:
+    if _skip_mds_query():
+        return None
     try:
         accelerator_type_request = requests.get(
             os.path.join(GCE_TPU_ACCELERATOR_ENDPOINT, key),
@@ -54,10 +66,12 @@ def get_tpu_metadata(key: str = "") -> str:
     return None
 
 
-def get_tpu_type() -> str:
+def get_tpu_type() -> str | None:
     tpu_type = envs.TPU_ACCELERATOR_TYPE
     if tpu_type is None:
         tpu_type = get_tpu_metadata(key="accelerator-type")
+    if tpu_type is None:
+        tpu_type = detect_tpu_type_from_pci()
     return tpu_type
 
 
@@ -188,7 +202,7 @@ def get_node_worker_id() -> int:
 
 def get_num_cores_per_chip() -> int:
     tpu_type = get_tpu_type()
-    if tpu_type.startswith(("v5litepod", "v6e")):
+    if tpu_type and tpu_type.startswith(("v5litepod", "v6e")):
         return 1
     return 2
 

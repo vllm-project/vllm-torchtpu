@@ -134,3 +134,54 @@ def test_validate_libtpu_version_still_rejects_old_package(monkeypatch):
 
     with pytest.raises(RuntimeError, match="libtpu < 0.0.35"):
         tpu_runner._validate_libtpu_version()
+
+
+def test_detect_tpu_type_from_pci(tmp_path):
+    from vllm_torchtpu.env_override import detect_tpu_type_from_pci
+
+    assert detect_tpu_type_from_pci(str(tmp_path / "missing")) is None
+
+    nic = tmp_path / "0000:00:04.0"
+    nic.mkdir()
+    (nic / "vendor").write_text("0x1ae0\n")
+    (nic / "device").write_text("0x0042\n")  # gVNIC, not a TPU
+    assert detect_tpu_type_from_pci(str(tmp_path)) is None
+
+    tpu = tmp_path / "0000:04:00.0"
+    tpu.mkdir()
+    (tpu / "vendor").write_text("0x1ae0\n")
+    (tpu / "device").write_text("0x0076\n")
+    assert detect_tpu_type_from_pci(str(tmp_path)) == "tpu7x"
+
+
+def test_gke_skip_mds_and_pci_sc_offload_fallback(monkeypatch, tmp_path):
+    from vllm_torchtpu import env_override
+
+    tpu = tmp_path / "0000:04:00.0"
+    tpu.mkdir()
+    (tpu / "vendor").write_text("0x1ae0\n")
+    (tpu / "device").write_text("0x0076\n")
+
+    orig_detect = env_override.detect_tpu_type_from_pci
+    monkeypatch.delenv("TPU_ACCELERATOR_TYPE", raising=False)
+    monkeypatch.delenv("SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES", raising=False)
+    monkeypatch.setenv("TPU_SKIP_MDS_QUERY", "true")
+    monkeypatch.setattr(
+        tpu_info.requests,
+        "get",
+        lambda *args, **kwargs: pytest.fail("MDS HTTP query should be skipped"),
+    )
+    monkeypatch.setattr(
+        env_override,
+        "detect_tpu_type_from_pci",
+        lambda: orig_detect(str(tmp_path)),
+    )
+
+    assert env_override._fetch_tpu_type_from_metadata() is None
+    assert env_override._resolve_sc_offload_threshold_bytes() == 67108864
+    assert "TPU_ACCELERATOR_TYPE" not in tpu_info.os.environ
+    assert tpu_info.get_tpu_metadata("accelerator-type") is None
+
+    monkeypatch.setattr(tpu_info, "detect_tpu_type_from_pci", lambda: None)
+    assert tpu_info.get_tpu_type() is None
+    assert tpu_info.get_num_cores_per_chip() == 2
