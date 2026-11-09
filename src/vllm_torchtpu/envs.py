@@ -32,8 +32,10 @@ if TYPE_CHECKING:
     TPU_ONEHOT_TABLE_LOOKUP: bool = True
     TPU_INLINE_DEDUPLICATED_CALLS: bool = True
     TPU_VERIFY_INCREMENTAL_BLOCK_TABLE: bool = False
+    TPU_ROPE_PAIRED_ROWS: bool = True
     TPU_BLOCK_TABLE_DELTA_BUCKETS: bool = True
     TPU_FUSED_SPEC_NEXT_INPUTS: bool = True
+    TPU_DSPARK_DRAFT_MOE_TUNING: bool = True
     LIBTPU_INIT_ARGS: str = ""
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
@@ -579,6 +581,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # program with vector table lookups instead of a program per eager op
     # (runner/tpu_runner_async_output.py). Integer-exact.
     "TPU_FUSED_SPEC_NEXT_INPUTS": env_bool("TPU_FUSED_SPEC_NEXT_INPUTS", default=True),
+    # Also keep each 64-wide FP32 RoPE table packed two rows per 128-lane row
+    # (`_tpu_rope_pairs`, runner.utils.relayout_rope_tables) and gather the
+    # per-step rows from it: a full-lane gather instead of a half-lane one.
+    # Costs one extra copy of the compact table in HBM. Bit-exact.
+    "TPU_ROPE_PAIRED_ROWS": env_bool("TPU_ROPE_PAIRED_ROWS", default=True),
+    # DSpark draft layers under MOE_FUSED_EP_KERNEL_IMPL=push: build their
+    # fused EP op with sc_prepush=1 and two tile-height rungs instead of the
+    # process-wide MOE_FUSED_EP_PUSH_SC_PREPUSH / ..._HEIGHT_RUNGS_OVERRIDE.
+    # Target layers are untouched. EP16 draft shape on 2x v7x hosts
+    # (t_local=240, topk=3, 8 local experts): 161.8 -> 135.8 us per layer
+    # (kernel + exposed SparseCore wait), output bit-identical.
+    "TPU_DSPARK_DRAFT_MOE_TUNING": env_bool(
+        "TPU_DSPARK_DRAFT_MOE_TUNING", default=True
+    ),
     # QK pair-blocked pooled GDN conv layout: full-width states interleave
     # Q and K row-pairs per tap so a TP-rank shard's first conv token maps
     # to one whole destination pool token (2 contiguous transfer spans per

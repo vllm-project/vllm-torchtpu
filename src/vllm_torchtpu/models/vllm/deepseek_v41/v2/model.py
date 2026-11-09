@@ -28,7 +28,9 @@ from vllm_torchtpu.utils import synchronize_tensors
 
 from ..common.mhc import (
     collapse,
+    flat_collapse,
     initialize_delayed_mhc,
+    initialize_flat_collapse,
     initialize_mhc_post,
     pack_mix_weights,
     post,
@@ -1055,14 +1057,26 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             )
         if isinstance(output, (list, tuple)) and len(output) == 1:
             output = output[0]
-        if indices is None:
+        total_rows = positions.shape[0]
+        # An identity plan (every row kept, in order, no padding row) leaves
+        # the decoder output in original row order: skip the scatter back.
+        # The plan itself still fed the decoder its query bounds and replay
+        # starts above.
+        identity = (
+            plan is not None
+            and plan.padded_num_tokens == total_rows
+            and plan.indices == tuple(range(total_rows))
+        )
+        if identity:
+            # Serving evidence that steady decode takes the scatter-free path.
+            logger.info_once("CED decoder replay is identity; skip scatter")
+        if indices is None or identity:
             if isinstance(output, (list, tuple)) and len(output) == 2:
                 dec_hidden, dec_aux = output
                 return dec_hidden, [*encoder_aux, *dec_aux]
             if encoder_aux:
                 return output, list(encoder_aux)
             return output
-        total_rows = positions.shape[0]
         if isinstance(output, (list, tuple)) and len(output) == 2:
             dec_hidden, dec_aux = output
             return (
@@ -1369,7 +1383,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         # mixes — the mix the reference applies via
         # ``last_layer.hc_pre(h, pre_mix)`` (v4.1 has no learned hc_head).
         assert pre_mix is not None
-        hidden_states = collapse(hidden_states, pre_mix)
+        hidden_states = flat_collapse(hidden_states, pre_mix)
         hidden_states = self.norm(hidden_states)
         if stage_sp and self._mtp_hidden_buffer is None:
             # Without MTP, gather only the collapsed and normalized hidden states.
@@ -1394,6 +1408,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         initialize_delayed_mhc()
         initialize_shifted_mhc()
         initialize_mhc_post()
+        initialize_flat_collapse()
         initialize_paged_attention()
         initialize_indexer()
         with (

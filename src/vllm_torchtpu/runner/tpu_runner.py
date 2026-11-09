@@ -4418,27 +4418,33 @@ class TPUModelRunner(GPUModelRunner):
         if isinstance(logits, GreedyTokenIds):
             assert all_greedy and grammar_output is None
         if all_greedy and grammar_output is None:
-            if isinstance(logits, GreedyTokenIds):
-                bonus_token_ids, target_token_ids = self.gather_spec_token_ids(
-                    logits.token_ids, md.bonus_logits_indices, md.target_logits_indices
-                )
-            else:
-                bonus_token_ids, target_token_ids = (
-                    self.spec_bonus_and_target_token_ids(
-                        logits, md.bonus_logits_indices, md.target_logits_indices
-                    )
-                )
             assert self.rejection_sampler is not None
             assert self.speculative_config is not None
             accept_u = (
                 torch.rand(
                     md.draft_token_ids.shape,
                     dtype=torch.float32,
-                    device=bonus_token_ids.device,
+                    device=md.draft_token_ids.device,
                     generator=sampling_generator,
                 )
                 if self.rejection_sampler.synthetic_mode
                 else None
+            )
+            if isinstance(logits, GreedyTokenIds):
+                # Row selection runs inside the validation program.
+                return self.rejection_sampler.greedy_from_head_ids(
+                    draft_token_ids=md.draft_token_ids,
+                    num_draft_tokens=md.draft_lengths,
+                    head_token_ids=logits.token_ids,
+                    bonus_indices=md.bonus_logits_indices,
+                    target_indices=md.target_logits_indices,
+                    segment_ids=md.segment_ids,
+                    group_indices=md.group_indices,
+                    max_draft_tokens=self.speculative_config.num_speculative_tokens,
+                    accept_u=accept_u,
+                )
+            bonus_token_ids, target_token_ids = self.spec_bonus_and_target_token_ids(
+                logits, md.bonus_logits_indices, md.target_logits_indices
             )
             return self.rejection_sampler.greedy_from_token_ids(
                 draft_token_ids=md.draft_token_ids,
@@ -6117,15 +6123,29 @@ class TPUModelRunner(GPUModelRunner):
                         and num_tokens == self._fused_greedy_head.rows
                     ):
                         logger.info(
-                            "Rejection warmup: stage=gather_ids rows=%d reqs=%d",
+                            "Rejection warmup: stage=head_ids rows=%d reqs=%d",
                             num_tokens,
                             num_reqs,
                         )
+                        # The fused head's int32 [rows] IDs; the row selection
+                        # and validation compile as one program.
+                        # Match runtime's distinct inputs to avoid an alias guard.
+                        head_token_ids = torch.zeros_like(draft_token_ids)
                         synchronize_tensors(
-                            self.gather_spec_token_ids(
-                                draft_token_ids,
-                                bonus_logits_indices,
-                                target_logits_indices,
+                            self.rejection_sampler.greedy_from_head_ids(
+                                draft_token_ids=draft_token_ids,
+                                num_draft_tokens=draft_lengths,
+                                head_token_ids=head_token_ids,
+                                bonus_indices=bonus_logits_indices,
+                                target_indices=target_logits_indices,
+                                segment_ids=segment_ids,
+                                group_indices=group_indices,
+                                max_draft_tokens=k,
+                                accept_u=(
+                                    warm_accept_u
+                                    if self.rejection_sampler.synthetic_mode
+                                    else None
+                                ),
                             )
                         )
                     # --- greedy verify path (do_sampling=False) ---
@@ -7474,18 +7494,6 @@ class TPUModelRunner(GPUModelRunner):
     def compute_greedy_ids(self, hidden_states: torch.Tensor) -> torch.Tensor:
         assert self._fused_greedy_head is not None
         return self._fused_greedy_head(hidden_states)
-
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-    def gather_spec_token_ids(
-        self,
-        token_ids: torch.Tensor,
-        bonus_indices: torch.Tensor,
-        target_indices: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        return (
-            torch.index_select(token_ids, 0, bonus_indices),
-            torch.index_select(token_ids, 0, target_indices),
-        )
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def compute_selected_logits(

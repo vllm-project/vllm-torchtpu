@@ -392,10 +392,26 @@ class NgramHashState(upstream.NgramHashState):
             lookback_dead_mask, upstream.DEAD_ID
         )
         window = mapped_lookback[reqs_col, cols]
+        if self.lookback_depth >= ngram - 1:
+            # The fallback is read only where ~in_chunk: then past is
+            # chunk_position - 1 - cols with cols < ngram - 1 <= lookback_depth,
+            # so every row reads one of its request's lookback_depth slots.
+            # Read those [requests, lookback_depth] slots once instead of one
+            # per (token, shift); rows that discard the fallback differ only
+            # in the discarded value.
+            num_reqs = lookback_token_ids.shape[0]
+            req_ids = torch.arange(num_reqs, device=dev)
+            # Request r's first row; a slice, not a per-request gather.
+            first = query_start_loc[:num_reqs]
+            req_past = positions[first.long().clamp(max=count - 1)][:, None] - (
+                1 + torch.arange(self.lookback_depth, device=dev)
+            )
+            table = fallback(req_past, req_ids[:, None], req_past.to(window.dtype))
+            missing = table[reqs_col, cols]
+        else:
+            missing = fallback(past, reqs_col, window)
         source = torch.where(
-            in_chunk,
-            batch,
-            torch.where(known, window, fallback(past, reqs_col, window)),
+            in_chunk, batch, torch.where(known, window, missing)
         ).long()
         blocked = ((past < 0) | (source == upstream.DEAD_ID)).cumsum(dim=1) > 0
         source = source.masked_fill(blocked, self.pad_id)

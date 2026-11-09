@@ -1194,6 +1194,10 @@ class TestModelForwardStage:
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.collapse",
                 side_effect=lambda h, pm: h,
             ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.flat_collapse",
+                side_effect=lambda h, pm: h,
+            ),
         ):
             mock_pp.return_value = SimpleNamespace(
                 is_first_rank=True, is_last_rank=True
@@ -1221,6 +1225,10 @@ class TestModelForwardStage:
             ),
             patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.collapse",
+                side_effect=lambda h, pm: h,
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.flat_collapse",
                 side_effect=lambda h, pm: h,
             ),
         ):
@@ -1268,6 +1276,10 @@ class TestModelForwardStage:
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.collapse",
                 side_effect=lambda h, pm: h,
             ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.flat_collapse",
+                side_effect=lambda h, pm: h,
+            ),
         ):
             mock_pp.return_value = SimpleNamespace(
                 is_first_rank=False, is_last_rank=False
@@ -1299,6 +1311,10 @@ class TestModelForwardStage:
             ),
             patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.collapse",
+                side_effect=lambda h, pm: h,
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.flat_collapse",
                 side_effect=lambda h, pm: h,
             ),
         ):
@@ -1355,6 +1371,10 @@ class TestModelForwardStage:
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.collapse",
                 side_effect=lambda h, pm: h,
             ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.flat_collapse",
+                side_effect=lambda h, pm: h,
+            ),
         ):
             model._forward_stage(inp, pos, None, stage="full")
             mock_pad_mask.assert_called_once()
@@ -1398,6 +1418,10 @@ class TestModelForwardStage:
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.collapse",
                 side_effect=lambda h, pm: h,
             ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.flat_collapse",
+                side_effect=lambda h, pm: h,
+            ),
         ):
             res = model._forward_stage(inp, pos, None, stage="full")
             # When layer is None after the loop, post(...) should NOT be called
@@ -1439,6 +1463,10 @@ class TestModelForwardStage:
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.collapse",
                 side_effect=lambda h, pm: h,
             ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.flat_collapse",
+                side_effect=lambda h, pm: h,
+            ),
         ):
             mock_pp.return_value = SimpleNamespace(
                 is_first_rank=True, is_last_rank=True
@@ -1473,6 +1501,10 @@ class TestModelForwardStage:
             ),
             patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.collapse",
+                side_effect=lambda h, pm: h,
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.flat_collapse",
                 side_effect=lambda h, pm: h,
             ),
         ):
@@ -1568,6 +1600,9 @@ class TestModelInitAndWeights:
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_mhc_post"
             ),
             patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_flat_collapse"
+            ),
+            patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_paged_attention"
             ),
             patch("vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_indexer"),
@@ -1605,6 +1640,9 @@ class TestModelInitAndWeights:
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_mhc_post"
             ),
             patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_flat_collapse"
+            ),
+            patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_paged_attention"
             ),
             patch("vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_indexer"),
@@ -1637,6 +1675,9 @@ class TestModelInitAndWeights:
             ),
             patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_mhc_post"
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_flat_collapse"
             ),
             patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_paged_attention"
@@ -1683,6 +1724,9 @@ class TestModelInitAndWeights:
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_mhc_post"
             ),
             patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_flat_collapse"
+            ),
+            patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_paged_attention"
             ),
             patch("vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_indexer"),
@@ -1722,6 +1766,9 @@ class TestModelInitAndWeights:
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_mhc_post"
             ),
             patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_flat_collapse"
+            ),
+            patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_paged_attention"
             ),
             patch("vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_indexer"),
@@ -1753,6 +1800,9 @@ class TestModelInitAndWeights:
             ),
             patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_mhc_post"
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_flat_collapse"
             ),
             patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_paged_attention"
@@ -1794,6 +1844,9 @@ class TestModelInitAndWeights:
             ),
             patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_mhc_post"
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_flat_collapse"
             ),
             patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_paged_attention"

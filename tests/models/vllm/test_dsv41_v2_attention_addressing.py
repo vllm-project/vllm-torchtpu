@@ -593,7 +593,11 @@ def test_merge_sub_rows_matches_lane_scatter(width, count):
     records = rng.permutation(32 * per_row)[:count].astype(np.int32)
     records[::5] = -1
     words = jnp.asarray(rng.integers(-(2**31), 2**31, (count, width)), jnp.int32)
-    expected = scatter_cache_values(cache, jnp.asarray(records), words)
+    # On TPU scatter_cache_values donates its cache (write_cache_rows), so it
+    # gets a copy; merge_sub_rows and the reference scatter read the original.
+    expected = scatter_cache_values(
+        jnp.array(cache, copy=True), jnp.asarray(records), words
+    )
     rows, full = merge_sub_rows(cache, jnp.asarray(records), words)
     got = cache.at[jnp.where(rows >= 0, rows, cache.shape[0])].set(full, mode="drop")
     np.testing.assert_array_equal(np.asarray(got), np.asarray(expected))
@@ -961,7 +965,8 @@ def test_swa_query_group_bridge_keeps_token_count_dynamic(monkeypatch, banked):
     op = torch.ops.swa_group_bridge_test.attend.default
 
     def bridge(*args):
-        return op(args[0], args[-1])
+        # query_group_size precedes the trailing row_valid argument.
+        return op(args[0], args[-2])
 
     monkeypatch.setattr(attention_kernels, "_attention_op", bridge)
     monkeypatch.setattr(attention_kernels, "_attention_2bank_op", bridge)

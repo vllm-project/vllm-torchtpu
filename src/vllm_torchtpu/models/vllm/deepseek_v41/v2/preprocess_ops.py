@@ -83,6 +83,18 @@ def rope_rows() -> Any:
     )
 
 
+def rope_paired_rows_sc() -> Any:
+    """``(pairs, positions) -> [T, rotary_dim]`` rows of a two-row-packed table,
+    fetched on SparseCore (async offload) where the chip has one."""
+    return _get(
+        "rope_paired_rows_sc",
+        lambda: (
+            rope_gather.gather_paired_rows_sc,
+            lambda pairs, pos: pairs.new_empty((pos.shape[0], pairs.shape[1] // 2)),
+        ),
+    )
+
+
 def _qa(x, weight, scale, gamma_qr, gamma_kv, rows, *, eps, emit_qr):
     if not x.shape[0]:  # empty dummy batches
         return (

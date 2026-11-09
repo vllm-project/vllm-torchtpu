@@ -190,6 +190,7 @@ def test_model_forward_stage_write_encoder_global_kv(monkeypatch):
     model.has_engram = False
 
     monkeypatch.setattr(v2_model, "collapse", lambda h, pm: h)
+    monkeypatch.setattr(v2_model, "flat_collapse", lambda h, pm: h)
     monkeypatch.setattr(v2_model, "post", lambda h, *a: h)
     monkeypatch.setattr(v2_model.upstream, "sp_shard", lambda x: x)
     monkeypatch.setattr(v2_model.upstream, "sp_all_gather", lambda x: x)
@@ -232,6 +233,7 @@ def test_model_init_ced_compile_sizes_and_parallel_config(monkeypatch):
     monkeypatch.setattr(v2_model, "initialize_cache_ops", lambda: None)
     monkeypatch.setattr(v2_model, "initialize_delayed_mhc", lambda: None)
     monkeypatch.setattr(v2_model, "initialize_mhc_post", lambda: None)
+    monkeypatch.setattr(v2_model, "initialize_flat_collapse", lambda: None)
     monkeypatch.setattr(v2_model, "initialize_paged_attention", lambda: None)
     monkeypatch.setattr(v2_model, "initialize_indexer", lambda: None)
     monkeypatch.setattr(v2_model, "compact_rope_caches", lambda *a, **k: None)
