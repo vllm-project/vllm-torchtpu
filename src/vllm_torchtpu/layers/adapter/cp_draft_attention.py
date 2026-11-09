@@ -957,30 +957,6 @@ def _block_op(max_query_len: int, sm_scale: float, causal: bool):
     return op
 
 
-def gather_group(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    group: Any,
-    dcp: int,
-    kv_head_replicas: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Every rank's query heads, and the K/V of the group's KV heads.
-
-    A group no wider than a KV head's replicas shares one KV head, so only
-    the queries are gathered; a wider one gathers ``[q | k | v]`` once.
-    """
-    from vllm_torchtpu.distributed.dcp import split_group_heads
-
-    if dcp <= kv_head_replicas:
-        return group.all_gather(query.contiguous(), dim=1), key, value
-    gathered = group.all_gather(torch.cat([query, key, value], dim=1).contiguous(), dim=1)
-    q_all, (k_all, v_all) = split_group_heads(
-        gathered, dcp, query.shape[1], kv_head_replicas, per_kv_head=2
-    )
-    return q_all, k_all, v_all
-
-
 def write_with_dcp(
     *,
     key: torch.Tensor,
@@ -1041,12 +1017,17 @@ def forward_with_dcp(
 ) -> torch.Tensor:
     """The drafter's attention of its query block (``query [T, H, D]``, own
     heads; ``key``/``value [T, 1, D]``, own KV head) over the window of a
-    DCP-sharded cache plus the block itself. The block is not written."""
+    DCP-sharded cache plus the block itself. The block is not written.
+    ``kv_head_replicas`` is unused here; it is part of the shared
+    `sharded_draft_dcp` arguments `write_with_dcp` takes."""
     from vllm_torchtpu.distributed.dcp import get_dcp_group
     from vllm_torchtpu.distributed.dcp_comm import cp_lse_ag_out_rs
 
     group = get_dcp_group()
-    q_all, k_all, _ = gather_group(query, key, value, group, dcp, kv_head_replicas)
+    # Every rank attends all the group's query heads over its own share of the
+    # cached window; the block's K/V stay per rank (own KV head), so only the
+    # queries cross the group. ``[T, dcp * H, D]``, rank-major.
+    q_all = group.all_gather(query.contiguous(), dim=1)
     ctx_out, ctx_lse = ops["attend"](
         q_all,
         kv_cache,
