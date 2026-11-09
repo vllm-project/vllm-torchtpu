@@ -692,3 +692,136 @@ def test_precompile_backbone_trace_first_env_guards(
         else:
             assert dummy_runs == [16, 32]
             assert compiled_batches == []
+
+
+def _stub_graph(order, metas=None):
+    """A GraphModule whose placeholders carry the given names and metas."""
+    if metas is None:
+        metas = {
+            "hidden_states": torch.empty(4, HIDDEN, dtype=torch.bfloat16),
+            "gate_weight": torch.empty(HIDDEN, 2, dtype=torch.bfloat16),
+            "dp_metadata": torch.empty(3, dtype=torch.int32),
+        }
+    graph = fx.Graph()
+    outs = []
+    for name in order:
+        node = graph.placeholder(name)
+        node.meta["val"] = metas[name]
+        outs.append(node)
+    graph.output(tuple(outs))
+    return fx.GraphModule(nn.Module(), graph)
+
+
+def test_handover_reorders_a_permuted_input_list():
+    """Two traces that lift the same inputs in another order share a bucket."""
+    session = shape_variants.BucketExecutables()
+    received = []
+    session.put(
+        "dir",
+        "key",
+        _stub_graph(["hidden_states", "gate_weight", "dp_metadata"]),
+        lambda *args: received.append(args),
+    )
+
+    runnable = session.get(
+        "dir", "key", _stub_graph(["hidden_states", "dp_metadata", "gate_weight"])
+    )
+
+    hidden = torch.zeros(4, HIDDEN, dtype=torch.bfloat16)
+    gate = torch.zeros(HIDDEN, 2, dtype=torch.bfloat16)
+    meta = torch.zeros(3, dtype=torch.int32)
+    runnable(hidden, meta, gate)  # the new trace's order
+    assert received == [(hidden, gate, meta)]  # the executable's order
+
+
+def test_handover_without_permutation_returns_the_runnable_itself():
+    """An identical input list does not pay for the reordering wrapper."""
+    session = shape_variants.BucketExecutables()
+
+    def compiled(*args):
+        return args
+
+    order = ["hidden_states", "gate_weight", "dp_metadata"]
+    session.put("dir", "key", _stub_graph(order), compiled)
+    assert session.get("dir", "key", _stub_graph(order)) is compiled
+
+
+def test_handover_still_refuses_a_changed_input():
+    """A name whose dtype or shape changed is a real difference."""
+    session = shape_variants.BucketExecutables()
+    session.put(
+        "dir",
+        "key",
+        _stub_graph(["hidden_states", "gate_weight", "dp_metadata"]),
+        lambda *args: args,
+    )
+    changed = {
+        "hidden_states": torch.empty(4, HIDDEN, dtype=torch.bfloat16),
+        "gate_weight": torch.empty(HIDDEN, 4, dtype=torch.bfloat16),  # wider
+        "dp_metadata": torch.empty(3, dtype=torch.int32),
+    }
+    with pytest.raises(shape_variants.ShapeSpecializationError, match="inputs differ"):
+        session.get(
+            "dir",
+            "key",
+            _stub_graph(["hidden_states", "dp_metadata", "gate_weight"], changed),
+        )
+
+
+def test_handover_still_refuses_a_different_input_set():
+    """An input only one trace has cannot be matched by any reordering."""
+    session = shape_variants.BucketExecutables()
+    session.put(
+        "dir",
+        "key",
+        _stub_graph(["hidden_states", "gate_weight", "dp_metadata"]),
+        lambda *args: args,
+    )
+    other = {
+        "hidden_states": torch.empty(4, HIDDEN, dtype=torch.bfloat16),
+        "router_bias": torch.empty(2, dtype=torch.bfloat16),
+        "dp_metadata": torch.empty(3, dtype=torch.int32),
+    }
+    with pytest.raises(
+        shape_variants.ShapeSpecializationError,
+        match="TPU_MOE_FUSED_EP_STEP_MIN_TOKENS",
+    ):
+        session.get(
+            "dir",
+            "key",
+            _stub_graph(["hidden_states", "router_bias", "dp_metadata"], other),
+        )
+
+
+def test_handover_reorders_equal_type_inputs_by_name():
+    """Inputs of equal dtype and shape are still matched by name."""
+    metas = {
+        "gate_weight": torch.empty(1, dtype=torch.int32),
+        "dp_metadata": torch.empty(1, dtype=torch.int32),
+    }
+    session = shape_variants.BucketExecutables()
+    received = []
+    session.put(
+        "dir",
+        "key",
+        _stub_graph(list(metas), metas),
+        lambda *args: received.append(args),
+    )
+    runnable = session.get(
+        "dir", "key", _stub_graph(["dp_metadata", "gate_weight"], metas)
+    )
+    runnable("metadata", "weight")
+    assert received == [("weight", "metadata")]
+
+
+def test_handover_matches_symbolic_sizes_by_position():
+    """Each trace names its symbolic sizes itself; they match by position."""
+    stored = {"s77": 4, "hidden_states": torch.empty(4, HIDDEN)}
+    current = {"s57": 4, "hidden_states": torch.empty(4, HIDDEN)}
+    session = shape_variants.BucketExecutables()
+
+    def compiled(*args):
+        return args
+
+    session.put("dir", "key", _stub_graph(list(stored), stored), compiled)
+    assert session.get("dir", "key", _stub_graph(list(current), current)) is compiled

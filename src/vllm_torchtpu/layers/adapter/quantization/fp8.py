@@ -1152,14 +1152,24 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         # survived here for as long as this path served only such models; a
         # `noaux_tc` router carries the bias and does not. The nvfp4 and mxfp4
         # methods already pass it.
+        from vllm_torchtpu.layers.adapter import fused_moe_ep as fused_moe_ep_bridge
         from vllm_torchtpu.layers.adapter.fused_moe_ep import (
             fused_moe_ep,
             fused_moe_ep_supported,
             score_bias_operand,
         )
+        from vllm_torchtpu.layers.adapter.fused_moe_ep_v3 import (
+            fused_kernel_takes,
+            retain_fork_graph_inputs,
+        )
 
-        if fused_moe_ep_supported(self):
-            return fused_moe_ep(
+        # An armed layer owns its dispatch and combine on every step. Under
+        # MOE_FUSED_EP_KERNEL_IMPL=v3 with TPU_MOE_FUSED_EP_STEP_MIN_TOKENS,
+        # steps below the threshold take the grouped-matmul path below and
+        # issue the all-gather and reduce-scatter themselves.
+        fused_ep_armed = fused_moe_ep_supported(self)
+        if fused_ep_armed and fused_kernel_takes(x.shape[0]):
+            out = fused_moe_ep(
                 self,
                 x,
                 layer.w13_weight,
@@ -1169,6 +1179,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 router_logits,
                 score_bias_operand(layer),
             )
+            return retain_fork_graph_inputs(out, layer._experts_start)
         from vllm_torchtpu.layers.adapter.moe_tp_decode import (
             moe_tp_decode_forward,
             moe_tp_decode_supported,
@@ -1184,11 +1195,14 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         # methods so the routing-simulation hook lives in exactly one place.
         topk_weights, topk_ids = moe_routing.route(layer, x, router_logits)
 
-        # Either reason to take the collectives from vLLM leaves the routing
-        # tensors local here, still holding this rank's own tokens. (The third
-        # reason, the fused EP kernel, returned above.)
+        # Any reason to take the collectives from vLLM leaves the routing
+        # tensors local here, still holding this rank's own tokens. (An armed
+        # fused EP layer returned above unless its step is below the v3
+        # threshold.)
         owns_collectives = (
-            enable_pipelined_collective_and_compute() or envs.TPU_MOE_FP8_ALL_GATHER
+            enable_pipelined_collective_and_compute()
+            or envs.TPU_MOE_FP8_ALL_GATHER
+            or fused_ep_armed
         )
 
         if envs.TPU_MOE_SKIP_PADDED_TOKENS:
@@ -1215,7 +1229,10 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             "activation": activation_str,
         }
         if owns_collectives:
-            return pipelined_fused_moe_gmm(**kwargs)
+            out = pipelined_fused_moe_gmm(**kwargs)
+            if fused_ep_armed:
+                out = retain_fork_graph_inputs(out, fused_moe_ep_bridge._RANK_BUFFER)
+            return out
 
         from vllm_torchtpu.layers.adapter.fused_moe_decode import (
             fused_moe_decode,
