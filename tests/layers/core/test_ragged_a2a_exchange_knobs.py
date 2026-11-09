@@ -31,6 +31,7 @@ from vllm_torchtpu.layers.core.ragged_a2a_moe import (
     DP_AXIS,
     TP_AXIS,
     _member_index,
+    exchange_capacity,
     owner_dests,
     owner_order,
     ragged_a2a_moe,
@@ -72,6 +73,18 @@ OPTIONS["routing_dma_owner_tail"] = dict(OPTIONS["routing_dma_served"], owner_ta
 CASES += [("routing_dma", "owner"), ("routing_dma_owner_tail", "owner")] + [
     ("routing_dma_served", combine) for combine in ("owner", "streamed")
 ]
+# Exchange sizes from each DP group's own fit check, on the sorted plan's path
+# alone and with the served options (the owner tail only with the owner combine).
+OPTIONS["group_fit"] = dict(sorted_plan=True, group_fit=True)
+OPTIONS["group_fit_served"] = dict(OPTIONS["routing_dma_served"], group_fit=True)
+OPTIONS["group_fit_owner_tail"] = dict(
+    OPTIONS["routing_dma_owner_tail"], group_fit=True
+)
+CASES += [
+    (option, combine)
+    for option in ("group_fit", "group_fit_served")
+    for combine in ("owner", "streamed")
+] + [("group_fit_owner_tail", "owner")]
 
 
 def _routing(rng, dp_size, num_tokens, num_experts, topk, skew):
@@ -427,3 +440,155 @@ def test_row_copy_keeps_every_output_bit_with_special_values(
     base, got = np.asarray(base), np.asarray(got)
     assert np.isfinite(base.astype(np.float32)).all()
     np.testing.assert_array_equal(got.view(np.uint16), base.view(np.uint16))
+
+
+def _fit_by_group(ids, tp_size, local, rows):
+    """Whether each TP rank's DP group fits ``rows`` rows (every member's sends
+    and receives), and the token rows it exchanges, each [tp]; ``ids`` [D, S, K]
+    by engine."""
+    dp_size = ids.shape[0]
+    reach = (ids[..., None] // local == np.arange(dp_size * tp_size)).any(axis=2)
+    counts = reach.sum(axis=1).reshape(dp_size, dp_size, tp_size).transpose(2, 0, 1)
+    fits = (counts.sum(axis=2) <= rows).all(axis=1)
+    fits &= (counts.sum(axis=1) <= rows).all(axis=1)
+    return fits, counts.sum(axis=(1, 2))
+
+
+def _hot_column_ids(dp_size, tp_size, num_tokens, local):
+    """Top-2 routing whose first routes all go to rank 0's experts, past the
+    capacity of TP rank 0's DP group, and whose second routes go to TP rank
+    1's DP group, evenly over its members [D, S, 2]."""
+    n = np.arange(dp_size * num_tokens)
+    second = ((n % dp_size) * tp_size + 1) * local + (n // dp_size) % local
+    return np.stack([n % local, second], axis=1).reshape(dp_size, num_tokens, 2)
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize("combine", ["owner", "streamed"])
+@pytest.mark.parametrize("dp_size,tp_size", [(4, 2), (2, 4)])
+def test_group_fit_runs_both_branches(combine, dp_size, tp_size):
+    """Steps that fit and one that does not fit the mesh while TP rank 1's DP
+    group fits, through one jitted program with the served options: that
+    group's members exchange their rows, the expert side takes no routes, and
+    the full-size exchange gives the result."""
+    devices = _require_eight_tpu_devices()
+    mesh = Mesh(np.asarray(devices).reshape(dp_size, tp_size), (DP_AXIS, TP_AXIS))
+    num_tokens, topk, local = 24, 2, 8
+    args = _inputs(8, tp_size, num_tokens, 64, topk=topk, skew=False)
+    stacked = tuple(a.reshape(dp_size, tp_size, -1, *a.shape[1:]) for a in args)
+    threshold = resolve_onehot_permute_threshold(dp_size * num_tokens * topk)
+    rows, routes = exchange_capacity(
+        dp_size=dp_size,
+        tp_size=tp_size,
+        num_tokens=num_tokens,
+        topk=topk,
+        local_num_experts=local,
+        factor=2.0,
+        onehot_moe_permute_threshold=threshold,
+        use_sparse_core=True,
+    )
+    assert rows < dp_size * num_tokens
+    hot = _hot_column_ids(dp_size, tp_size, num_tokens, local)
+    hot_ids = jnp.asarray(np.broadcast_to(hot[:, None], stacked[6].shape), jnp.int32)
+    common = dict(
+        mesh=mesh,
+        topk=topk,
+        activation="silu",
+        use_sparse_core=True,
+        onehot_moe_permute_threshold=threshold,
+        capacity_factor=2.0,
+        streamed_combine=combine == "streamed",
+        owner_combine=combine == "owner",
+        **OPTIONS["routing_dma_served"],
+    )
+    kwargs = {}
+    if combine == "owner":
+        common["owner_tail"] = True
+        rng = np.random.default_rng(3)
+        kwargs["shared"] = jnp.asarray(
+            rng.standard_normal((dp_size, tp_size, num_tokens, HIDDEN)) / 8,
+            jnp.bfloat16,
+        )
+    base_run = jax.jit(functools.partial(ragged_a2a_moe, **common))
+    run = jax.jit(functools.partial(ragged_a2a_moe, group_fit=True, **common))
+    for forced in (False, True, False):
+        call = stacked[:6] + (hot_ids, stacked[7]) if forced else stacked
+        engine_ids = np.asarray(call[6])[:, 0]
+        fits, exchanged = _fit_by_group(engine_ids, tp_size, local, rows)
+        routes_fit = np.bincount(engine_ids.ravel() // local).max() <= routes
+        assert (fits.all() and routes_fit) != forced
+        if forced:
+            assert fits[1] and exchanged[1] == dp_size * num_tokens
+        base = np.asarray(base_run(*call, **kwargs))
+        got = np.asarray(run(*call, **kwargs))
+        assert np.abs(base.astype(np.float32)).max() > 0
+        np.testing.assert_array_equal(got.view(np.uint16), base.view(np.uint16))
+
+
+@pytest.mark.multichip
+def test_group_fit_leaves_unscaled_experts_alone():
+    """Unscaled (bf16) experts, as an MTP draft layer's exchange runs them, take
+    the two-exchange path, whose sizes stay with the mesh-wide check: the
+    switch lowers to the same program, through steps that fit and one that
+    does not fit the mesh while TP rank 1's DP group fits."""
+    devices = _require_eight_tpu_devices()
+    dp_size, tp_size, num_tokens, topk, local = 2, 4, 96, 2, 8
+    mesh = Mesh(np.asarray(devices).reshape(dp_size, tp_size), (DP_AXIS, TP_AXIS))
+    x, _, _, _, _, weights, ids, es = _inputs(
+        8, tp_size, num_tokens, 64, topk=topk, skew=False
+    )
+    k1, k2 = jax.random.split(jax.random.key(17))
+    w1 = (jax.random.normal(k1, (64, HIDDEN, 2 * INTER)) / 32).astype(jnp.bfloat16)
+    w2 = (jax.random.normal(k2, (64, INTER, HIDDEN)) / 16).astype(jnp.bfloat16)
+    stacked = tuple(
+        a.reshape(dp_size, tp_size, -1, *a.shape[1:])
+        for a in (x, w1, w2, weights, ids, es)
+    )
+    common = dict(
+        mesh=mesh,
+        topk=topk,
+        activation="silu",
+        use_sparse_core=True,
+        onehot_moe_permute_threshold=resolve_onehot_permute_threshold(
+            dp_size * num_tokens * topk
+        ),
+        capacity_factor=2.0,
+        route_factor=2.0,
+        owner_combine=True,
+        **OPTIONS["routing_dma_served"],
+    )
+    rows, _ = exchange_capacity(
+        dp_size=dp_size,
+        tp_size=tp_size,
+        num_tokens=num_tokens,
+        topk=topk,
+        local_num_experts=local,
+        factor=2.0,
+        onehot_moe_permute_threshold=common["onehot_moe_permute_threshold"],
+        use_sparse_core=True,
+        route_factor=2.0,
+    )
+    hot = _hot_column_ids(dp_size, tp_size, num_tokens, local)
+    fits, _ = _fit_by_group(hot, tp_size, local, rows)
+    assert rows < dp_size * num_tokens and fits[1] and not fits[0]
+    hot_ids = jnp.asarray(np.broadcast_to(hot[:, None], stacked[4].shape), jnp.int32)
+    rng = np.random.default_rng(8)
+    shared = jnp.asarray(
+        rng.standard_normal((dp_size, tp_size, num_tokens, HIDDEN)) / 8, jnp.bfloat16
+    )
+
+    def build(**knobs):
+        call = functools.partial(ragged_a2a_moe, **common, **knobs)
+        return jax.jit(
+            lambda x, w1, w2, w, i, e, **kw: call(x, w1, w2, None, None, w, i, e, **kw)
+        )
+
+    base_run, run = build(), build(group_fit=True)
+    lowered = run.lower(*stacked, shared=shared).as_text()
+    assert lowered == base_run.lower(*stacked, shared=shared).as_text()
+    for forced in (False, True, False):
+        call = stacked[:4] + (hot_ids, stacked[5]) if forced else stacked
+        base = np.asarray(base_run(*call, shared=shared))
+        got = np.asarray(run(*call, shared=shared))
+        assert np.abs(base.astype(np.float32)).max() > 0
+        np.testing.assert_array_equal(got.view(np.uint16), base.view(np.uint16))

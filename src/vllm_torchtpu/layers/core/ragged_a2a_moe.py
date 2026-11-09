@@ -251,6 +251,22 @@ def _capacity_overflow(
     return excess.max() > 0
 
 
+def _group_fits(gathered_ids: jax.Array, *, member_index, rows: int) -> jax.Array:
+    """Whether no member of this TP rank's DP group would send or receive more
+    than ``rows`` token rows: every row and column sum of the group's [D, D]
+    member-to-member token counts is at most ``rows``.
+
+    Every member of the group holds the same routing, so all members compute
+    the same answer and size their exchange alike.
+    """
+    member = jnp.arange(gathered_ids.shape[0], dtype=jnp.int32)
+    need = (member_index(gathered_ids)[..., None] == member).any(axis=2)  # [D, S, D]
+    counts = need.sum(axis=1, dtype=jnp.int32)
+    return jnp.logical_and(
+        counts.sum(axis=1).max() <= rows, counts.sum(axis=0).max() <= rows
+    )
+
+
 def _exclusive_cumsum(a: jax.Array, axis: int) -> jax.Array:
     return jnp.cumsum(a, axis=axis, dtype=jnp.int32) - a
 
@@ -757,11 +773,16 @@ def _capacity_exchange(
     routes=0,
     row_gather=False,
     row_scatter=False,
+    group_fit=False,
 ):
     """Send and receive buffers of ``rows`` rows, filled without gaps.
 
     When ``overflow`` is set no rank sends anything (every rank sees the same
     flag), so the buffers cannot overrun; the caller discards the result.
+    With ``group_fit`` (and ``streamed`` and ``plan``), a DP group sends nothing
+    only when its own routing does not fit the buffers (`_group_fits`), so its
+    sizes do not wait for the mesh-wide flag; the expert side still takes no
+    routes when ``overflow`` is set.
 
     A rank sends its tokens grouped by destination member, each group in token
     order, and receives the groups of its sources in DP-position order, each
@@ -792,10 +813,13 @@ def _capacity_exchange(
     row = jnp.arange(rows, dtype=jnp.int32)
 
     fits = jnp.logical_not(overflow)
+    sends = fits
+    if group_fit and streamed is not None and plan is not None:
+        sends = _group_fits(gathered_ids, member_index=member_index, rows=rows)
     need_any = (member_index(topk_ids)[:, :, None] == member).any(axis=1)  # [S, D]
-    need_out = need_any & fits
+    need_out = need_any & sends
     need = (member_index(gathered_ids)[..., None] == member).any(axis=2)  # [D, S, D]
-    need = need & fits
+    need = need & sends
     need_in = (need & (member == dp_pos)).any(axis=2)  # [D, S]
     counts = need.sum(axis=1, dtype=jnp.int32)  # [source, destination]
     send_sizes = need_out.sum(axis=0, dtype=jnp.int32)
@@ -1426,6 +1450,7 @@ def ragged_a2a_moe_local(
     sorted_plan: bool = False,
     owner_tail: bool = False,
     routing_dma: bool = False,
+    group_fit: bool = False,
     shared: jax.Array | None = None,
 ) -> jax.Array:
     """Per-rank body (inside shard_map over the (dp, tp) mesh).
@@ -1473,6 +1498,10 @@ def ragged_a2a_moe_local(
     ``routing_dma``: the DP group's packed routing is all-gathered by one
     kernel of remote DMAs (`dma_all_gather`) instead of XLA's ring
     all-gather, whose steps each wait on the previous one (same words).
+    ``group_fit`` (with ``sorted_plan``): the capacity exchange's sizes come
+    from its DP group's own fit check instead of the mesh-wide one, so the
+    exchange can start before that check, which still picks the full-size
+    exchange (same result).
     """
     assert shared is None or owner_combine
     assert not owner_tail or owner_combine
@@ -1670,6 +1699,7 @@ def ragged_a2a_moe_local(
         routes=routes,
         row_gather=row_gather,
         row_scatter=row_scatter,
+        group_fit=group_fit,
     )
     out = finish(out, capacity_streamed is not None)
     return jax.lax.cond(overflow, full, lambda: out)
@@ -1702,6 +1732,7 @@ def ragged_a2a_moe(
     sorted_plan: bool = False,
     owner_tail: bool = False,
     routing_dma: bool = False,
+    group_fit: bool = False,
     shared: jax.Array | None = None,
 ) -> jax.Array:
     """Global-view entry: every operand is the ranks' local arrays stacked on
@@ -1729,6 +1760,7 @@ def ragged_a2a_moe(
         sorted_plan=sorted_plan,
         owner_tail=owner_tail,
         routing_dma=routing_dma,
+        group_fit=group_fit,
     )
 
     scaled = w1_scale is not None

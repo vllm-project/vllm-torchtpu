@@ -33,6 +33,8 @@ from vllm_torchtpu.layers.core.ragged_a2a_moe import (
     TP_AXIS,
     _capacity_overflow,
     _gather_routing,
+    _group_fits,
+    _member_index,
     _tile_rows,
     exchange_capacity,
     exchange_need,
@@ -660,6 +662,51 @@ def test_capacity_overflow_matches_brute_force(dp_size, tp_size, topk):
         )
         want = _overflow_reference(ids, tp_size, local, rows, routes)
         assert (np.asarray(got) == want).all(), (rows, routes)
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("dp_size,tp_size", [(2, 4), (4, 2), (8, 1)])
+@pytest.mark.parametrize("skew", [False, True])
+def test_group_fits_matches_brute_force(dp_size, tp_size, skew):
+    """Each DP group's own fit check against brute force on every rank: the
+    same answer on every member of a group, and every group fits a step whose
+    rows fit the whole mesh."""
+    local, num_tokens = 8, 12
+    num_ranks = dp_size * tp_size
+    p = np.ones(num_ranks * local)
+    if skew:
+        p[:local] = 30.0  # rank 0's experts
+    rng = np.random.default_rng(dp_size * 10 + skew)
+    ids = np.stack(
+        [
+            rng.choice(num_ranks * local, TOPK, replace=False, p=p / p.sum())
+            for _ in range(dp_size * num_tokens)
+        ]
+    ).reshape(dp_size, num_tokens, TOPK)
+    ids = ids.astype(np.int32)
+    seen = set()
+    for rows in (2 * dp_size, 4 * dp_size, 6 * dp_size, 8 * dp_size, 12 * dp_size):
+        mesh_fits = not _overflow_reference(ids, tp_size, local, rows, 1 << 30)
+        for ep_rank in range(num_ranks):
+            member_index = functools.partial(
+                _member_index,
+                ep_rank=jnp.int32(ep_rank),
+                dp_size=dp_size,
+                tp_size=tp_size,
+                local_num_experts=local,
+            )
+            got = bool(
+                _group_fits(jnp.asarray(ids), member_index=member_index, rows=rows)
+            )
+            counts = _need_reference(ids, ep_rank, tp_size, local).sum(axis=1)
+            want = max(counts.sum(axis=0).max(), counts.sum(axis=1).max()) <= rows
+            assert got == want, (rows, ep_rank)
+            assert got or not mesh_fits, (rows, ep_rank)
+            seen.add((got, mesh_fits))
+    assert {(True, True), (False, False)} <= seen
+    if skew and tp_size > 1:
+        # TP rank 0's group overflows while other groups fit.
+        assert (True, False) in seen
 
 
 @pytest.mark.multichip
