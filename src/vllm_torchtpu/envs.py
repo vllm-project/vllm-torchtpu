@@ -750,6 +750,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # least this many tokens (0 = every chunked bucket). The lse-gather head
     # split (2) is torch-side and does not follow it (a token-count test there
     # specializes range-compiled graphs).
+    # Buckets that take the V-space merge (TPU_DCP_MERGE_VSPACE_FUSED) use
+    # min(this, TPU_DCP_MLA_UV_BEFORE_MERGE_MIN_TOKENS) instead.
     "TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS": env_int(
         "TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS", 2048
     ),
@@ -797,7 +799,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # mask, one rounding; layers/adapter/dcp_vspace.py) instead of a pre-merge
     # projection followed by the latent merge path. GLM-5.2 AgentX c4 TP16 x
     # DCP8: P90 TTFT -10..-12% (the separate W_UV bmm, concat and relayouts
-    # cost ~36 ms per 4096-token step).
+    # cost ~36 ms per 4096-token step). Its buckets also take merge pieces down
+    # to TPU_DCP_MLA_UV_BEFORE_MERGE_MIN_TOKENS (a sliced chunk is a slow copy).
     "TPU_DCP_MERGE_VSPACE_FUSED": env_bool("TPU_DCP_MERGE_VSPACE_FUSED"),
     # Sparse MLA split q (`sparse_ragged_paged_attention(q_pe=...)`): hand
     # q_nope and q_pe to the kernel as separate operands. The kernel joins
