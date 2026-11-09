@@ -488,10 +488,16 @@ def mtp_prefill_warmup_block_ids(
     ids, most = [], 0
     for group in kv_cache_groups:
         spec = group.kv_cache_spec
-        n = min(
-            int(spec.max_num_blocks_per_req(vllm_config, max_pos)),
-            int(spec.max_num_blocks_per_req(vllm_config, max_model_len)),
-        )
+        if vllm_config is None or not hasattr(spec, "max_num_blocks_per_req"):
+            # A stand-in spec / runner without a config (unit tests): the
+            # plain token count, as before this helper.
+            size = int(spec.block_size)
+            n = min(cdiv(max_pos, size), cdiv(max_model_len, size))
+        else:
+            n = min(
+                int(spec.max_num_blocks_per_req(vllm_config, max_pos)),
+                int(spec.max_num_blocks_per_req(vllm_config, max_model_len)),
+            )
         ids.append(list(range(top - n, top)))
         most = max(most, n)
     return ids, most
@@ -7247,7 +7253,8 @@ class TPUModelRunner(GPUModelRunner):
         assert self.kv_cache_config is not None
         top = int(self.kv_cache_config.num_blocks)
         block_ids_per_group, max_nblk = mtp_prefill_warmup_block_ids(
-            self.kv_cache_config.kv_cache_groups, self.vllm_config, max_pos, self.max_model_len, top
+            self.kv_cache_config.kv_cache_groups, getattr(self, "vllm_config", None), max_pos,
+            self.max_model_len, top,
         )
         if top <= max_nblk + 1:
             raise RuntimeError(
