@@ -85,6 +85,7 @@ if TYPE_CHECKING:
     TPU_KERNEL_ITER_MODE: bool = False
     TPU_KERNEL_RELOAD_MODULES: str = ""
     TPU_GREEDY_TOP_TOKENS: bool = False
+    TPU_SHARDED_LM_HEAD: bool = False
     DP_SCHED_ENABLED: bool = False
     MLA_XPOSE_N_TILE_SIZE: int = 160
     MIXED_Q_SPLIT: int | None = None
@@ -782,6 +783,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Greedy steps without logprobs or grammar take the vocabulary-parallel
     # argmax (runner/greedy_top_tokens.py) instead of gathering the logits.
     "TPU_GREEDY_TOP_TOKENS": env_bool("TPU_GREEDY_TOP_TOKENS"),
+    # Split the LM head's vocabulary projection across the expert-parallel
+    # data-parallel engines (layers/adapter/sharded_lm_head.py); the runner
+    # then keeps one request bucket.
+    "TPU_SHARDED_LM_HEAD": env_bool("TPU_SHARDED_LM_HEAD"),
     # Enable TpuDpScheduler.
     "DP_SCHED_ENABLED": lambda: bool(int(os.getenv("DP_SCHED_ENABLED") or "0")),
     # Tile size for MLA transpose pipeline.

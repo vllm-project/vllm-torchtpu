@@ -113,7 +113,7 @@ from vllm_torchtpu.gdn_pool_layout import (
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs as rpa_configs
 from vllm_torchtpu.kernels.experimental.batched_rpa import wrapper as rpa_batched
 from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
-from vllm_torchtpu.layers.adapter import token_padding
+from vllm_torchtpu.layers.adapter import sharded_lm_head, token_padding
 from vllm_torchtpu.layers.adapter.attention import (
     KV_LAYOUT_BY_VLLM_LAYOUT,
     TPU_STR_DTYPE_TO_TORCH_DTYPE,
@@ -1050,6 +1050,15 @@ class TPUModelRunner(GPUModelRunner):
         self.num_reqs_paddings = _get_req_paddings(
             min_req_size=MIN_NUM_SEQS, max_req_size=self.max_num_reqs
         )
+        if envs.TPU_SHARDED_LM_HEAD:
+            # The sharded head runs at one fixed row count. One request
+            # bucket keeps the compiled graph from padding rows before the
+            # head's exchange and trimming them after, which the compiler
+            # gets wrong above one row tile.
+            self.num_reqs_paddings = [self.max_num_reqs]
+            logger.info(
+                "TPU_SHARDED_LM_HEAD: one request bucket, %d rows", self.max_num_reqs
+            )
 
         # Pallas SMEM-aware num_reqs caps.
         # Capacity state exists before the first refresh; subsequent refreshes
@@ -3439,9 +3448,7 @@ class TPUModelRunner(GPUModelRunner):
         else:
             assert self.num_reqs_most_model_len is not None
             target_num_reqs = self.num_reqs_most_model_len
-        padded_num_reqs = _get_padded_num_reqs_with_upper_limit(
-            num_reqs, self.max_num_reqs
-        )
+        padded_num_reqs = _get_padded_token_len(self.num_reqs_paddings, num_reqs)
 
         layout_plan = sequence_layout_planner.prepare_real(
             runner=self,
@@ -5791,6 +5798,11 @@ class TPUModelRunner(GPUModelRunner):
             )
         validate_online_fp8(model, self.vllm_config.quant_config)
         self.model = model
+        # TPU_SHARDED_LM_HEAD: the projection split across the engines. With
+        # it on the runner runs one request bucket (set in __init__), so every
+        # engine calls the op with one shape and the compiled graph pads and
+        # trims nothing around the op's exchange.
+        sharded_lm_head.install_if_enabled(model, list(self.num_reqs_paddings))
         if self.lora_config is not None:
             self.model = self.load_lora_model(self.model, self.vllm_config, self.device)
         if self.is_pooling_model:
