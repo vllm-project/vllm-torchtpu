@@ -180,9 +180,11 @@
 /src/vllm_torchtpu/layers/adapter/custom_ops/batch_invariant_ops.py @qizzzh @QiliangCui @Nanfang-Li
 
 # Kernels & Models: Muse Spark
+/src/vllm_torchtpu/kernels/muse_megakernel/ @qizzzh @QiliangCui @Nanfang-Li
 /src/vllm_torchtpu/kernels/muse_moe_ops.py @qizzzh @QiliangCui @Nanfang-Li
 /src/vllm_torchtpu/layers/adapter/custom_ops/muse_moe_tpu.py @qizzzh @QiliangCui @Nanfang-Li
 /src/vllm_torchtpu/models/vllm/muse_spark/ @qizzzh @QiliangCui @Nanfang-Li
+/tests/kernels/test_muse_megakernel.py @qizzzh @QiliangCui @Nanfang-Li
 /tests/models/vllm/test_muse_spark_*.py @qizzzh @QiliangCui @Nanfang-Li
 
 # Megakernel (Framework-Free JAX/Pallas)

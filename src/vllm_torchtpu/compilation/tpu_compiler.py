@@ -254,6 +254,10 @@ _TPU_COMPILE_ENV_IGNORED = {
     # with the venv prefix or mount path. get_libtpu_cache_key() already
     # identifies the loaded build without its path.
     "TPU_LIBRARY_PATH",
+    # Standalone megakernel host-runtime escape hatches: neither changes the
+    # torch.compiled decoder graph.
+    "VLLM_TPU_MUSE_ASYNC_PREFETCH",
+    "VLLM_TPU_MUSE_MK_EAGER_KV_WRITEBACK",
 }
 
 _NATIVE_TPU_COMPILE_ENV_VARS = (
@@ -308,6 +312,7 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # Muse Spark hd64 RPA kernel entry and sharded_jax_op deterministic TP ops.
     "vllm_torchtpu/models/vllm/muse_spark/attention_compat.py",
     "vllm_torchtpu/models/vllm/muse_spark/det_collectives.py",
+    "vllm_torchtpu/models/vllm/muse_spark/megakernel_fastpath.py",
 )
 
 # vLLM-Omni diffusion code, dropped from the hashed set above. Diffusion
