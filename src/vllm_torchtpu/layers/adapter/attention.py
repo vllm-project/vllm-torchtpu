@@ -1194,6 +1194,9 @@ class PallasAttentionBackendImpl(AttentionImpl):
             unsupported_features.append("logits soft cap")
         if skip_kv_update:
             unsupported_features.append("skip_kv_update")
+        # The streaming kernel has no non-causal mode; it would run causal.
+        if not self.use_causal_mask:
+            unsupported_features.append("non-causal attention")
         if unsupported_features:
             raise NotImplementedError(
                 "PCP streaming attention does not support: "
