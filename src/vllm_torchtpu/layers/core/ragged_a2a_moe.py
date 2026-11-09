@@ -42,6 +42,13 @@ multiple of those means instead of the whole group; a step whose routing does
 not fit on some rank runs the full-size exchange, so results never depend on
 the capacity. Real routing loads the busiest rank with about twice the mean
 rows and more than twice the mean routes, so the routes take their own factor.
+
+Redundant experts (``replicas``, owner combine and sorted plan only):
+redundant expert slots per rank hold replicas of some experts, the bytes of
+their primaries, and the capacity exchange may serve a route at a replica
+instead of its primary. Every route still lands at the owner row and in the
+sums its primary gives, so outputs are those of the same placement without
+redundant slots; the full-size exchange serves primaries.
 """
 
 import functools
@@ -56,6 +63,7 @@ from jax.sharding import PartitionSpec as P
 from vllm_torchtpu.kernels.collectives.dma_all_gather import dma_all_gather
 from vllm_torchtpu.kernels.megablox.gmm_v2 import owner_token_sum
 from vllm_torchtpu.kernels.megablox.row_copy import copy_send_rows
+from vllm_torchtpu.layers.core.expert_placement import ROUTE_ORDER_BITS
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
     fused_moe_func,
     fused_moe_scatter,
@@ -174,6 +182,49 @@ def _unpack_routes(routes: jax.Array):
         jnp.bitwise_and(routes, 0xFFFF).astype(jnp.uint16), jnp.bfloat16
     )
     return jnp.right_shift(routes, 16), weights
+
+
+def pack_served_routes(serving: jax.Array, order: jax.Array) -> jax.Array:
+    """The id field `_gather_routing` packs with replicas: serving slot and
+    owner order (an unrouted slot, -1, reads -1 back)."""
+    return jnp.left_shift(serving, ROUTE_ORDER_BITS) | order
+
+
+def unpack_served_routes(fields: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """(serving slot, owner order) of packed id fields."""
+    order = jnp.bitwise_and(fields, (1 << ROUTE_ORDER_BITS) - 1)
+    return jnp.right_shift(fields, ROUTE_ORDER_BITS), order
+
+
+def serving_slots(topk_ids: jax.Array, replicas: jax.Array) -> jax.Array:
+    """The slot that serves each route [S, K]: its primary (``topk_ids``) or
+    one of the expert's replicas.
+
+    ``replicas`` [3, C]: per redundant slot, its slot, its replica's primary
+    slot (-1: empty) and its replica index (1, 2, ... among the expert's
+    replicas). A route whose expert has ``c`` instances, primary included,
+    takes instance ``((T * 1031 + p * 7) >> 3) mod c`` for its primary ``p``
+    and the sum ``T`` of its token's primaries: the token's own routing
+    decides, never the batch. Compare and select over the redundant slots, no
+    indexing op.
+    """
+    replica_slot, primary, replica = replicas[0], replicas[1], replicas[2]
+    routed = topk_ids >= 0
+    hit = (topk_ids[..., None] == primary) & routed[..., None]  # [S, K, C]
+    instances = 1 + hit.sum(axis=-1, dtype=jnp.int32)
+    total = jnp.where(routed, topk_ids, 0).sum(axis=-1, keepdims=True, dtype=jnp.int32)
+    pick = jnp.right_shift(total * 1031 + topk_ids * 7, 3) % instances
+    served = jnp.where(hit & (replica == pick[..., None]), replica_slot, 0)
+    return jnp.where(pick > 0, served.sum(axis=-1, dtype=jnp.int32), topk_ids)
+
+
+def primary_slots(slots: jax.Array, replicas: jax.Array) -> jax.Array:
+    """`serving_slots` undone: a redundant slot reads its replica's primary
+    slot, any other id stays."""
+    replica_slot, primary = replicas[0], replicas[1]
+    hit = (slots[..., None] == replica_slot) & (primary >= 0)
+    from_replica = jnp.where(hit, primary, 0).sum(axis=-1, dtype=jnp.int32)
+    return jnp.where(hit.any(axis=-1), from_replica, slots)
 
 
 def exchange_capacity(
@@ -399,21 +450,24 @@ def streamed_dests(ids, *, member_index, dp_size):
     return member, row, dp_size, num_tokens * topk
 
 
-def owner_dests(ids, *, dp_size, tp_size, local_num_experts):
+def owner_dests(ids, *, dp_size, tp_size, local_num_experts, order=None):
     """`route_plan` destinations of `_owner_combine` (``ids`` [K, D, S]):
     token ``t`` of member ``s`` is owned by TP rank ``t // blk`` of engine
-    ``s``, which gets its routes at rows ``owner_order * blk + t % blk``."""
+    ``s``, which gets its routes at rows ``owner_order * blk + t % blk``.
+    ``order`` [K, D, S]: the routes' owner order as their senders computed it
+    (with replicas, from the primaries ``ids`` no longer hold)."""
     topk, _, num_tokens = ids.shape
     blk = -(-num_tokens // tp_size)
     s = jnp.arange(dp_size, dtype=jnp.int32)[:, None]
     t = jnp.arange(num_tokens, dtype=jnp.int32)[None, :]
     member = s * tp_size + t // blk
-    # owner_order, k-major.
-    valid, key, _, _ = owner_route_key(
-        ids, dp_size=dp_size, tp_size=tp_size, local_num_experts=local_num_experts
-    )
-    k = jnp.arange(topk, dtype=jnp.int32)[:, None, None]
-    order = _rank_along_k(jnp.where(valid, key, (1 << 24) + k))
+    if order is None:
+        # owner_order, k-major.
+        valid, key, _, _ = owner_route_key(
+            ids, dp_size=dp_size, tp_size=tp_size, local_num_experts=local_num_experts
+        )
+        k = jnp.arange(topk, dtype=jnp.int32)[:, None, None]
+        order = _rank_along_k(jnp.where(valid, key, (1 << 24) + k))
     row = order * blk + t % blk
     return member, row, dp_size * tp_size, blk * topk
 
@@ -1218,6 +1272,22 @@ def owner_sum_kernel(
     return out.reshape(num_tokens, -1)
 
 
+def owner_remote_routes(
+    topk_ids, topk_weights, serving_ids, ep_rank, *, skip_padded_tokens, dtype, **mesh
+):
+    """How many output rows owner rank ``ep_rank`` gets from other ranks for
+    its owned tokens (``topk_ids`` [N, K], primaries): their routes whose
+    serving slot (``serving_ids``; the primaries themselves without replicas)
+    lives on another rank. Its own rows it writes itself."""
+    valid, _, _, _ = owner_route_key(topk_ids, **mesh)
+    w = topk_weights.astype(dtype)
+    w = jnp.where(jnp.isfinite(w), w, 0)
+    if skip_padded_tokens:
+        valid = valid & (w != 0)
+    remote = valid & (serving_ids // mesh["local_num_experts"] != ep_rank)
+    return remote.sum(dtype=jnp.int32)
+
+
 def owner_tp_sum(partial: jax.Array, *, tp_size: int) -> jax.Array:
     """Sum of the TP ranks' [S, H] partials with the owner ranks' arithmetic:
     each owner rank gets every rank's rows of its owned tokens (one
@@ -1267,6 +1337,7 @@ def _owner_combine(
     row_gather=False,
     src_rows=None,
     owner_tail=False,
+    serving_ids=None,
 ):
     """The expert kernel sends each output row to its token's OWNER rank: TP rank
     ``t // ceil(S / tp)`` of the token's engine owns token ``t``. The owner sums
@@ -1277,7 +1348,9 @@ def _owner_combine(
     it, all below ``src_rows`` [1]. ``owner_tail``: the expert kernel also sums
     the owned tokens and copies them to the engine's TP ranks in its tail (see
     `gmm_v2_mlp_scatter`), instead of `owner_sum_kernel` and the all-gather:
-    same sums, same rows."""
+    same sums, same rows. ``serving_ids`` [S, K]: the slots that serve the
+    routes when replicas serve some (`serving_slots`); the sums still follow the
+    primaries ``topk_ids``."""
     num_tokens = x.shape[0]
     local = w1.shape[0]
     mesh = dict(dp_size=dp_size, tp_size=tp_size, local_num_experts=local)
@@ -1290,13 +1363,20 @@ def _owner_combine(
     weights = jnp.pad(topk_weights, ((0, pad), (0, 0)))
     owned_ids = jax.lax.dynamic_slice_in_dim(ids, my_tp * blk, blk)
     owned_weights = jax.lax.dynamic_slice_in_dim(weights, my_tp * blk, blk)
-    valid, _, _, _ = owner_route_key(owned_ids, **mesh)
-    w = owned_weights.astype(x.dtype)
-    w = jnp.where(jnp.isfinite(w), w, 0)
-    if skip_padded_tokens:
-        valid = valid & (w != 0)
-    remote = valid & (owned_ids // local != ep_rank)
-    expected = jnp.where(fits, remote.sum(dtype=jnp.int32), 0)
+    owned_serving = owned_ids
+    if serving_ids is not None:
+        served = jnp.pad(serving_ids, ((0, pad), (0, 0)), constant_values=-1)
+        owned_serving = jax.lax.dynamic_slice_in_dim(served, my_tp * blk, blk)
+    remote = owner_remote_routes(
+        owned_ids,
+        owned_weights,
+        owned_serving,
+        ep_rank,
+        skip_padded_tokens=skip_padded_tokens,
+        dtype=x.dtype,
+        **mesh,
+    )
+    expected = jnp.where(fits, remote, 0)
     extra = None
     if shared is not None:
         # This rank's shared-expert partial of every engine token goes to the
@@ -1427,6 +1507,7 @@ def ragged_a2a_moe_local(
     owner_tail: bool = False,
     routing_dma: bool = False,
     shared: jax.Array | None = None,
+    replicas: jax.Array | None = None,
 ) -> jax.Array:
     """Per-rank body (inside shard_map over the (dp, tp) mesh).
 
@@ -1473,27 +1554,53 @@ def ragged_a2a_moe_local(
     ``routing_dma``: the DP group's packed routing is all-gathered by one
     kernel of remote DMAs (`dma_all_gather`) instead of XLA's ring
     all-gather, whose steps each wait on the previous one (same words).
+
+    ``replicas`` [3, C] (with ``owner_combine`` and ``sorted_plan``): the
+    redundant slots of `serving_slots`, ``C // (dp_size * tp_size)`` per rank
+    after its primaries; ``w1`` holds both, and ``topk_ids`` are primaries.
+    Where the capacity exchange runs the fused kernel, each route goes to the
+    slot `serving_slots` picks and its sender packs the route's owner order
+    (from the primaries) into the gathered routing, so the owner places and
+    sums every output as the primaries would; the full-size exchange, and
+    every other path, serves primaries. The capacities are those of the
+    primaries.
     """
     assert shared is None or owner_combine
     assert not owner_tail or owner_combine
     num_tokens = x.shape[0]
     local_num_experts = w1.shape[0]
     slots = dp_size * num_tokens
-    gathered_ids, read_routes, packed_routes = _gather_routing(
-        topk_ids, topk_weights, dma_members=dp_size if routing_dma else 0
-    )
-    ep_rank = experts_start[0] // local_num_experts
-    member_index = functools.partial(
-        _member_index,
-        ep_rank=ep_rank,
+    num_redundant = 0
+    if replicas is not None:
+        num_redundant = replicas.shape[-1] // (dp_size * tp_size)
+        if not (owner_combine and sorted_plan):
+            raise ValueError("expert replicas need the owner combine and sorted plan")
+        if topk_weights.dtype != jnp.bfloat16 or topk > 1 << ROUTE_ORDER_BITS:
+            raise ValueError(
+                "expert replicas need bfloat16 routing weights and topk <= "
+                f"{1 << ROUTE_ORDER_BITS}, got {topk_weights.dtype} and {topk}"
+            )
+        if dp_size * tp_size * local_num_experts << ROUTE_ORDER_BITS >= 1 << 15:
+            raise ValueError(
+                f"{dp_size * tp_size * local_num_experts} expert slots do not "
+                "fit the packed routing with replicas"
+            )
+    rows, routes = exchange_capacity(
         dp_size=dp_size,
         tp_size=tp_size,
-        local_num_experts=local_num_experts,
+        num_tokens=num_tokens,
+        topk=topk,
+        local_num_experts=local_num_experts - num_redundant,
+        factor=capacity_factor,
+        onehot_moe_permute_threshold=onehot_moe_permute_threshold,
+        use_sparse_core=use_sparse_core,
+        route_factor=route_factor or None,
+        row_tile=capacity_row_tile,
     )
 
-    def streamed(recv_rows, max_local_routes, collective_id):
-        """None when the exchange's local MoE does not take the fused kernel."""
-        if not (streamed_combine or owner_combine) or not scatter_moe_supported(
+    def fused(recv_rows, max_local_routes):
+        """Whether the exchange's local MoE takes the fused kernel."""
+        return (streamed_combine or owner_combine) and scatter_moe_supported(
             jax.ShapeDtypeStruct((recv_rows, x.shape[1]), x.dtype),
             w1,
             w2,
@@ -1505,7 +1612,37 @@ def ragged_a2a_moe_local(
             use_sparse_core=use_sparse_core,
             onehot_moe_permute_threshold=onehot_moe_permute_threshold,
             rhs_quant_dtype=rhs_quant_dtype,
-        ):
+        )
+
+    serving = None
+    routed = topk_ids
+    if replicas is not None and rows < slots and fused(rows, routes):
+        serving = serving_slots(topk_ids, replicas)
+        order = owner_order(
+            topk_ids,
+            dp_size=dp_size,
+            tp_size=tp_size,
+            local_num_experts=local_num_experts,
+        )
+        routed = pack_served_routes(serving, order)
+    gathered_ids, read_routes, packed_routes = _gather_routing(
+        routed, topk_weights, dma_members=dp_size if routing_dma else 0
+    )
+    gathered_order = None
+    if serving is not None:
+        gathered_ids, gathered_order = unpack_served_routes(gathered_ids)
+    ep_rank = experts_start[0] // local_num_experts
+    member_index = functools.partial(
+        _member_index,
+        ep_rank=ep_rank,
+        dp_size=dp_size,
+        tp_size=tp_size,
+        local_num_experts=local_num_experts,
+    )
+
+    def streamed(recv_rows, max_local_routes, collective_id, serving_ids=None):
+        """None when the exchange's local MoE does not take the fused kernel."""
+        if not fused(recv_rows, max_local_routes):
             return None
         if owner_combine:
             return functools.partial(
@@ -1530,6 +1667,7 @@ def ragged_a2a_moe_local(
                 shared=shared,
                 row_gather=row_gather,
                 owner_tail=owner_tail,
+                serving_ids=serving_ids,
             )
         return functools.partial(
             _streamed_combine,
@@ -1608,12 +1746,21 @@ def ragged_a2a_moe_local(
         plan = (dests, gathered_weights)
 
     def full():
+        ids, read = gathered_ids, read_routes
+        if serving is not None:
+            # Every route at its primary (inside the conditional only).
+            ids = primary_slots(gathered_ids, replicas)
+
+            def read(source_rows):
+                fields, weights = read_routes(source_rows)
+                return primary_slots(unpack_served_routes(fields)[0], replicas), weights
+
         out = _full_exchange(
             x,
             w1,
             topk_ids,
-            gathered_ids,
-            read_routes,
+            ids,
+            read,
             experts_start,
             tp_size=tp_size,
             dp_size=dp_size,
@@ -1625,18 +1772,6 @@ def ragged_a2a_moe_local(
         )
         return finish(out, full_streamed is not None)
 
-    rows, routes = exchange_capacity(
-        dp_size=dp_size,
-        tp_size=tp_size,
-        num_tokens=num_tokens,
-        topk=topk,
-        local_num_experts=local_num_experts,
-        factor=capacity_factor,
-        onehot_moe_permute_threshold=onehot_moe_permute_threshold,
-        use_sparse_core=use_sparse_core,
-        route_factor=route_factor or None,
-        row_tile=capacity_row_tile,
-    )
     if rows >= slots:
         # Bounding the routes alone saves less than the conditional costs
         # (the full exchange already runs the local-routes path over all routes).
@@ -1651,11 +1786,22 @@ def ragged_a2a_moe_local(
     )
     # The capacity exchange runs outside the conditional, so the schedule
     # around it (weight prefetches for the following layers) is unchanged.
-    capacity_streamed = streamed(rows, routes, 2)
+    capacity_streamed = streamed(rows, routes, 2, serving)
+    capacity_plan = plan
+    if serving is not None and plan is not None:
+        # The owners place each output by its sender's order.
+        dests = functools.partial(
+            owner_dests,
+            dp_size=dp_size,
+            tp_size=tp_size,
+            local_num_experts=local_num_experts,
+            order=jnp.moveaxis(gathered_order, -1, 0),
+        )
+        capacity_plan = (dests, plan[1])
     out = _capacity_exchange(
         x,
         w1,
-        topk_ids,
+        topk_ids if serving is None else serving,
         gathered_ids,
         read_routes,
         packed_routes,
@@ -1666,7 +1812,7 @@ def ragged_a2a_moe_local(
         rows=rows,
         moe=moe(routes),
         streamed=capacity_streamed,
-        plan=plan,
+        plan=capacity_plan,
         routes=routes,
         row_gather=row_gather,
         row_scatter=row_scatter,
@@ -1703,11 +1849,13 @@ def ragged_a2a_moe(
     owner_tail: bool = False,
     routing_dma: bool = False,
     shared: jax.Array | None = None,
+    replicas: jax.Array | None = None,
 ) -> jax.Array:
     """Global-view entry: every operand is the ranks' local arrays stacked on
     two leading axes [dp, tp, ...], and so is the result [dp, tp, S, H]
-    (``shared``, the shared-expert partials, likewise). Unscaled (bf16)
-    experts pass ``None`` for both scales."""
+    (``shared``, the shared-expert partials, and ``replicas``, the same
+    redundant slots on every rank, likewise). Unscaled (bf16) experts pass
+    ``None`` for both scales."""
     spec = P(DP_AXIS, TP_AXIS)
     local = functools.partial(
         ragged_a2a_moe_local,
@@ -1735,16 +1883,18 @@ def ragged_a2a_moe(
     assert scaled == (w2_scale is not None)
     scales = (w1_scale, w2_scale) if scaled else ()
     operands = (x, w1, w2, *scales, topk_weights, topk_ids, experts_start)
+    extra = {}
+    if replicas is not None:
+        extra["replicas"] = replicas
     if shared is not None:
-        operands += (shared,)
+        extra["shared"] = shared
+    operands += tuple(extra.values())
 
     def body(*args):
         args = [a[0, 0] for a in args]
         if not scaled:
             args[3:3] = [None, None]
-        if shared is not None:
-            return local(*args[:8], shared=args[8])[None, None]
-        return local(*args)[None, None]
+        return local(*args[:8], **dict(zip(extra, args[8:])))[None, None]
 
     mapped = jax.shard_map(
         body,

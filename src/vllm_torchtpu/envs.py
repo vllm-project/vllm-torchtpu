@@ -927,7 +927,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_A2A_ROUTING_DMA": env_bool("TPU_MOE_A2A_ROUTING_DMA"),
     # Place each named MoE layer's experts by this .npz (logical expert ->
     # physical slot, e.g. balanced on routing counts; see
-    # layers/core/expert_placement.py). Unset = linear placement.
+    # layers/core/expert_placement.py). A file with redundant slots also
+    # serves replicas of the busiest experts from them (same outputs; needs
+    # TPU_MOE_RAGGED_A2A, its owner combine and sorted plan). Unset = linear
+    # placement.
     "TPU_MOE_EXPERT_PLACEMENT": lambda: os.getenv("TPU_MOE_EXPERT_PLACEMENT", ""),
     # Count each MoE layer's routes per logical expert, for the layers
     # TPU_MOE_EXPERT_PLACEMENT can place (real tokens only), and rewrite

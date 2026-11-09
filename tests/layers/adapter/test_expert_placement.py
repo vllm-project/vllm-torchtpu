@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 import torch
 
+import vllm_torchtpu.envs as envs
 from vllm_torchtpu.layers.adapter import expert_placement, moe_routing, token_padding
 from vllm_torchtpu.layers.core import expert_placement as core
 
@@ -122,6 +123,183 @@ def test_to_slots_maps_ids_and_keeps_negative_ones(slots):
     assert got.dtype == torch.int32
     want = np.where(ids.numpy() >= 0, slots[ids.numpy().clip(0)], -1)
     np.testing.assert_array_equal(got.numpy(), want)
+
+
+def test_local_experts_without_redundant_slots_are_the_primaries(slots):
+    local = E // EP
+    for rank in (0, 6):
+        layer = _with_expert_tensors(_layer(rank), local)
+        expert_placement.place_experts(layer)
+        assert expert_placement.redundant_slots_per_rank(layer) == 0
+        assert layer.local_num_experts == local
+        np.testing.assert_array_equal(
+            expert_placement.local_experts(layer),
+            np.argsort(slots)[rank * local : (rank + 1) * local],
+        )
+        expert_placement.zero_empty_redundant(layer)
+        assert all(float(p.min()) == 1.0 for p in layer.parameters(recurse=False))
+        expert_placement.register_slots_buffer(layer, device=torch.device("cpu"))
+        np.testing.assert_array_equal(layer._expert_slots.numpy(), slots)
+        assert layer._expert_replicas is None
+        expert_placement.check_replicas(layer)  # nothing to check, no collective
+
+
+@pytest.fixture
+def redundant(slots, monkeypatch):
+    """One redundant slot per rank: rank r replicates the first expert of rank
+    r + 1; rank 3's redundant slot is empty."""
+    local = E // EP
+    logical = np.argsort(slots)
+    redundant = logical[((np.arange(EP) + 1) % EP) * local].astype(np.int32)
+    redundant[3] = -1
+    core.validate(slots[None], [NAME], EP, redundant[None])
+    monkeypatch.setattr(expert_placement, "_REDUNDANT", {NAME: redundant})
+    monkeypatch.setattr(expert_placement, "_REDUNDANT_PER_RANK", 1)
+    monkeypatch.setattr(envs, "TPU_MOE_RAGGED_A2A", True, raising=False)
+    return redundant
+
+
+def _with_expert_tensors(layer, slots_per_rank):
+    """Prepared-weight stand-ins: one row of each per-expert tensor per slot."""
+    for name in ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale"):
+        param = torch.nn.Parameter(
+            torch.ones(slots_per_rank, 4, 2), requires_grad=False
+        )
+        layer.register_parameter(name, param)
+    return layer
+
+
+def test_expert_map_puts_replicas_after_the_primaries(slots, redundant):
+    local = E // EP
+    for rank in range(EP):
+        layer = _layer(rank)
+        manager = layer.expert_map_manager
+        assert expert_placement.redundant_slots_per_rank(layer) == 1
+        expert_placement.place_experts(layer)
+        assert manager.local_num_experts == layer.local_num_experts == local + 1
+        after = [manager.map_global_to_local(e) for e in range(E)]
+        assert layer._expert_map.tolist() == after
+        for e, index in enumerate(after):
+            if index < local:
+                assert (index >= 0) == (slots[e] // local == rank)
+                if index >= 0:
+                    assert slots[e] == rank * local + index
+            else:
+                assert index == local and redundant[rank] == e
+        assert (redundant[rank] >= 0) == (local in after)
+        want = list(np.argsort(slots)[rank * local : (rank + 1) * local])
+        np.testing.assert_array_equal(
+            expert_placement.local_experts(layer), want + [redundant[rank]]
+        )
+
+
+def test_replicas_need_the_ragged_exchange(slots, redundant, monkeypatch):
+    monkeypatch.setattr(envs, "TPU_MOE_RAGGED_A2A", False, raising=False)
+    with pytest.raises(NotImplementedError, match="TPU_MOE_RAGGED_A2A"):
+        expert_placement.place_experts(_layer(0))
+
+
+@pytest.mark.parametrize(
+    "name,redundant_slots", [(NAME, 1), ("mtp.layers.0.mlp.experts", 0)]
+)
+def test_experts_start_counts_the_redundant_slots(
+    slots, redundant, name, redundant_slots
+):
+    for rank in (0, 5):
+        layer = SimpleNamespace(
+            layer_name=name,
+            global_num_experts=E,
+            moe_config=SimpleNamespace(
+                moe_parallel_config=SimpleNamespace(use_ep=True),
+                ep_size=EP,
+                ep_rank=rank,
+            ),
+        )
+        assert expert_placement.redundant_slots_per_rank(layer) == redundant_slots
+        assert moe_routing.get_experts_start(layer) == rank * (
+            E // EP + redundant_slots
+        )
+
+
+def test_buffers_with_replicas_hold_physical_slots(slots, redundant):
+    layer = _with_expert_tensors(_layer(2), E // EP + 1)
+    expert_placement.place_experts(layer)
+    expert_placement.register_slots_buffer(layer, device=torch.device("cpu"))
+    primary = core.physical_slots(slots, EP, 1)
+    np.testing.assert_array_equal(layer._expert_slots.numpy(), primary)
+    assert layer._expert_slots.dtype == torch.int32
+    table = core.replica_table(slots, redundant, EP)
+    np.testing.assert_array_equal(layer._expert_replicas.numpy(), table)
+    ids = torch.randint(0, E, (12, 10), dtype=torch.int32)
+    ids[0, 3] = -1
+    got = expert_placement.to_slots(layer, ids).numpy()
+    np.testing.assert_array_equal(got, np.where(ids >= 0, primary[ids.clip(0)], -1))
+    # A layer outside the file has no slots and no replica table.
+    plain = _layer(0, name="mtp.layers.0.mlp.experts")
+    expert_placement.place_experts(plain)
+    expert_placement.register_slots_buffer(plain, device=torch.device("cpu"))
+    assert plain._expert_slots is None and plain._expert_replicas is None
+
+
+def test_empty_redundant_slots_are_zeroed(slots, redundant):
+    for rank in (3, 4):  # rank 3's redundant slot is empty, rank 4's is not
+        layer = _with_expert_tensors(_layer(rank), E // EP + 1)
+        expert_placement.place_experts(layer)
+        expert_placement.zero_empty_redundant(layer)
+        for param in layer.parameters(recurse=False):
+            assert float(param[: E // EP].min()) == 1.0
+            assert float(param[E // EP].abs().max()) == float(rank != 3)
+
+
+def test_boot_check_finds_a_replica_without_its_primary_bytes(
+    slots, redundant, monkeypatch
+):
+    """Every rank's slot sums gathered over EP: a replica whose sums differ
+    from its primary's stops the boot; an empty redundant slot is not
+    checked."""
+    from vllm.distributed import parallel_state
+
+    def sums_of(rank, tamper):
+        layer = _layer(rank)
+        expert_placement.place_experts(layer)
+        experts = expert_placement.local_experts(layer)
+        sums = torch.from_numpy(experts[:, None] * 8 + np.arange(8)).to(torch.int32)
+        if tamper is not None and tamper[0] == rank:
+            sums[tamper[1], 0] += 1
+        return sums
+
+    monkeypatch.setattr(
+        parallel_state,
+        "get_ep_group",
+        lambda: SimpleNamespace(world_size=EP, cpu_group=None),
+    )
+    local = E // EP
+    # (rank, slot) whose sums change: none; rank 3's empty redundant slot; rank
+    # 5's replica; rank 5's first primary, which rank 4 replicates.
+    cases = [
+        (None, None),
+        ((3, local), None),
+        ((5, local), r"replica of expert \d+ on EP rank 5 "),
+        ((5, 0), r"replica of expert \d+ on EP rank 4 "),
+    ]
+    for tamper, error in cases:
+        everyone = [sums_of(rank, tamper) for rank in range(EP)]
+
+        def all_gather(out, tensor, group=None, everyone=everyone):
+            for o, t in zip(out, everyone):
+                o.copy_(t)
+
+        monkeypatch.setattr(torch.distributed, "all_gather", all_gather)
+        monkeypatch.setattr(
+            expert_placement, "_slot_sums", lambda *t, mine=everyone[1]: mine
+        )
+        layer = _with_expert_tensors(_layer(1), local + 1)
+        expert_placement.place_experts(layer)
+        if error is None:
+            expert_placement.check_replicas(layer)
+        else:
+            with pytest.raises(RuntimeError, match=error):
+                expert_placement.check_replicas(layer)
 
 
 @pytest.fixture
