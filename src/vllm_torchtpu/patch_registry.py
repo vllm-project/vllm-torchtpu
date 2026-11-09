@@ -163,6 +163,10 @@ PATCHES = (
         ("platform_activation", "model_load"),
         model_config=True,
     ),
+    Patch(
+        "vllm_torchtpu.models.vllm.fused_attn_proj_patch:maybe_patch_fused_attn_proj",
+        ("platform_activation", "model_load"),
+    ),
 )
 
 _applied: set[str] = set()
