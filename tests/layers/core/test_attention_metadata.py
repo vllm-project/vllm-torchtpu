@@ -941,3 +941,58 @@ class TestPrefillCheckpointIds:
         leaves = jax.tree_util.tree_leaves(meta)
         assert any(leaf is offsets for leaf in leaves)
         assert any(leaf is ids for leaf in leaves)
+
+
+class TestSkipUnchangedBlockTableUpload(TestAttentionMetadataBuilderPlumbing):
+    """TPU_SKIP_BLOCK_TABLE_UPLOAD reuses the last upload when rows match."""
+
+    def _stage_steps(self, monkeypatch, enabled, num_steps=4):
+        monkeypatch.setenv("TPU_SKIP_BLOCK_TABLE_UPLOAD", "1" if enabled else "0")
+        runner = self._make_runner_mock(num_groups=2)
+        builders = [
+            self._make_builder(runner, kv_cache_group_id=gid) for gid in range(2)
+        ]
+        self._make_attn_groups(runner, builders)
+        source = runner.input_batch.block_table[0].get_cpu_tensor.return_value
+        staged_per_step = []
+        for step in range(num_steps):
+            if step == 2:
+                source[1, 0] = 77  # A request crossed a page boundary.
+            ctx = AttentionMetadataBuilderContext(
+                num_reqs=2,
+                start_index=0,
+                use_max_model_len=True,
+                seq_lens=torch.ones(4, dtype=torch.int32),
+                query_start_loc=torch.arange(5, dtype=torch.int32),
+                request_distribution=torch.tensor([2, 2, 2], dtype=torch.int32),
+            )
+            stage_block_table_uploads(runner, ctx, 4)
+            staged_per_step.append(
+                {gid: t.clone() for gid, t in ctx.staged_block_tables.items()}
+            )
+        return runner, staged_per_step
+
+    def test_staged_tables_match_with_and_without_skip(self, monkeypatch):
+        _, staged_off = self._stage_steps(monkeypatch, enabled=False)
+        _, staged_on = self._stage_steps(monkeypatch, enabled=True)
+        assert len(staged_off) == len(staged_on)
+        for off, on in zip(staged_off, staged_on):
+            assert off.keys() == on.keys()
+            for gid in off:
+                assert torch.equal(off[gid], on[gid])
+        assert staged_on[2][0].view(4, 4)[1, 0].item() == 77
+
+    def test_uploads_only_when_rows_change(self, monkeypatch):
+        runner_off, _ = self._stage_steps(monkeypatch, enabled=False)
+        runner_on, _ = self._stage_steps(monkeypatch, enabled=True)
+        assert len(runner_off._unfenced_h2d_sources) == 4
+        # Step 0 uploads, step 1 reuses, step 2 changes a row, step 3 reuses.
+        assert len(runner_on._unfenced_h2d_sources) == 2
+
+    def test_skipped_buffer_returns_to_free_list(self, monkeypatch):
+        runner, _ = self._stage_steps(monkeypatch, enabled=True, num_steps=2)
+        (uploaded, _) = runner._unfenced_h2d_sources[0]
+        free = runner._free_h2d_sources[(uploaded.numel(), torch.int32)]
+        assert len(free) == 1
+        assert free[0] is not uploaded
+        assert id(free[0]) in runner._registered_h2d_sources
