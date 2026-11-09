@@ -28,6 +28,7 @@ from typing import Any
 from vllm_torchtpu import env_override
 from vllm_torchtpu.experimental.export import (
     api,
+    case_compose,
     checkpoint,
     sampling,
     tpu_lowering,
@@ -713,6 +714,22 @@ def _draft_intermediates(
     return [(n, returned[n]) for n in drafter.intermediates]
 
 
+def draft_slot_counts(bucket_size: int, max_num_seqs: int) -> list[int]:
+    """The request counts `N` `draft_bucket{bucket_size}` drafts for, one branch
+    each: powers of two below `min(bucket_size, max_num_seqs)`, the most
+    requests a step of `bucket_size` tokens holds, and that count. A step runs
+    the smallest `N` that holds its requests, so the drafter computes for at
+    most twice the step's requests instead of every slot.
+    """
+    full = min(bucket_size, max_num_seqs)
+    counts = []
+    n = 1
+    while n < full:
+        counts.append(n)
+        n *= 2
+    return [*counts, full]
+
+
 def _draft_user_inputs(
     model: api.ExportableTextOnlyLLM, bucket_size: int
 ) -> list[tuple[str, tuple[int, ...]]]:
@@ -1114,16 +1131,28 @@ def _export_draft(
     for b_idx, bucket_size in enumerate(cfg.token_buckets):
         user_inputs = _draft_user_inputs(model, bucket_size)
         intermediates = _draft_intermediates(model, drafter, bucket_size)
-        mlir = tpu_lowering.lower_torch_draft_to_mlir(
-            model,
-            draft_fn=drafter.draft_fn,
-            user_inputs=user_inputs,
-            weight_names=draft_weight_names,
-            params_map=lowered,
-            state_specs=state_specs,
-            intermediates=intermediates,
-            bucket_size=bucket_size,
-            weight_reshapes=reshapes,
+        slot_mlirs = {
+            slots: tpu_lowering.lower_torch_draft_to_mlir(
+                model,
+                draft_fn=drafter.draft_fn,
+                user_inputs=user_inputs,
+                weight_names=draft_weight_names,
+                params_map=lowered,
+                state_specs=state_specs,
+                intermediates=intermediates,
+                bucket_size=bucket_size,
+                weight_reshapes=reshapes,
+                draft_slots=slots,
+            )
+            for slots in draft_slot_counts(bucket_size, cfg.max_num_seqs)
+        }
+        mlir = (
+            next(iter(slot_mlirs.values()))
+            if len(slot_mlirs) == 1
+            else case_compose.compose_by_request_count(
+                slot_mlirs,
+                req_dist_arg=[n for n, _ in user_inputs].index("req_dist"),
+            )
         )
         file = f"draft_bucket{bucket_size}.mlir"
         rel = f"{subdir}/{file}" if subdir else file

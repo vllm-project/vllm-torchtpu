@@ -1746,6 +1746,7 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
         req_dist: Any,
         last_token_indices: Any,
         aux_hidden_states: Any,
+        draft_slots: int | None = None,
     ) -> tuple[Sequence[Any], Any]:
         """Drafts `K` tokens per request with the separate draft model (DSpark or
         DFlash).
@@ -1759,7 +1760,9 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
         own keys and values land past the request's accepted tokens, where the
         next step's context rows overwrite them. A step of `B` tokens holds at
         most `min(B, max_num_seqs)` requests, so only those draft;
-        `draft_tokens` rows past them are 0.
+        `draft_tokens` rows past them are 0. With `draft_slots` `N`, only the
+        first `N` requests draft: a variant for steps of at most `N` requests
+        (`draft_slot_counts`).
         """
         draft: Any = self._require_draft_model()
         cfg = self._export_config
@@ -1783,6 +1786,8 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
             request_distribution=attention_dist,
         )
         rows = min(int(input_ids.shape[0]), cfg.max_num_seqs)
+        if draft_slots is not None:
+            rows = min(rows, draft_slots)
         block_ids, block_positions, block_metadata = self._draft_block_inputs(
             input_ids=input_ids,
             positions=positions,
@@ -1932,6 +1937,7 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
         req_dist: Any,
         last_token_indices: Any,
         hidden_states: Any,
+        draft_slots: int | None = None,
     ) -> tuple[Sequence[Any], Any]:
         """Drafts `K` tokens per request with the MTP draft.
 
@@ -1940,7 +1946,9 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
         draft's KV for each row; each request's first draft comes from its row
         `last_token_indices`. Each further pass feeds every request its last
         draft and the draft's own hidden state, one token per request at the
-        next position, as vLLM's MTP proposer chains them.
+        next position, as vLLM's MTP proposer chains them. With `draft_slots`
+        `N`, only the first `N` requests draft (the first pass still covers every
+        row): a variant for steps of at most `N` requests (`draft_slot_counts`).
 
         A draft reading the target's KV (Gemma 4's assistant) takes the target
         states it reads (`mtp_state_indices()`) and writes none, so each further
@@ -2042,7 +2050,9 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
                 ),
             )
         )
-        rows = last_token_indices.to(torch.int64)
+        all_rows = last_token_indices.to(torch.int64)
+        slots = cfg.max_num_seqs if draft_slots is None else draft_slots
+        rows = all_rows[:slots]
         last, hidden = last[rows], hidden[rows]
         drafts = [greedy(last)]
         if k > 1:
@@ -2050,7 +2060,7 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
             live = torch.arange(cfg.max_num_seqs, device=rows.device) < num_seqs
             # KV index of each request's row `last_token_indices`: its KV length
             # less the rows after it in the step.
-            last_kv = kv_lens - (query_start_loc[1:] - rows.to(kv_lens.dtype) - 1) - 1
+            last_kv = kv_lens - (query_start_loc[1:] - all_rows.to(kv_lens.dtype) - 1) - 1
             one_per_seq = torch.clamp(
                 torch.arange(cfg.max_num_seqs + 1, device=rows.device), max=num_seqs
             ).to(query_start_loc.dtype)
@@ -2082,7 +2092,12 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
             else holder[s_i].kv_cache
             for s_i in range(len(kv_caches))
         ]
-        return updated, torch.stack(drafts, dim=1)
+        tokens = torch.stack(drafts, dim=1)
+        if slots < cfg.max_num_seqs:
+            tokens = torch.cat(
+                [tokens, tokens.new_zeros((cfg.max_num_seqs - slots, k))], dim=0
+            )
+        return updated, tokens
 
     def forward(
         self,
