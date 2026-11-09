@@ -9,8 +9,16 @@ fc and qkv_proj on every row on every rank, all-gathers bf16 K|V and
 scatters with `write_kv`. Every rank's whole cache must come out identical.
 
 The DCP group is simulated with one thread per rank and a barrier
-all-gather; JAX calls are serialized.
+all-gather; the ranks take turns (one runs at a time). On a TPU host
+(``jax.default_backend() == "tpu"``) the torch ops (fc, projections, norms,
+RoPE) run on the TPU device, the quantize/scatter and the pack run as jitted
+JAX on the TPU and `write_owned_rows` runs compiled (not interpreted); so the
+test also checks that the TPU's per-row results do not depend on the row
+count or the column count of the matmuls. Elsewhere everything runs on CPU.
 """
+
+import functools
+import sys
 
 import threading
 from types import SimpleNamespace
@@ -41,7 +49,19 @@ Q_HEADS_PER_RANK = 2
 ROT = 64
 EPS = 1e-6
 
-_JAX_LOCK = threading.Lock()
+
+
+@functools.cache
+def _on_tpu() -> bool:
+    # Not at import: a backend initialized during collection breaks the suite.
+    return jax.default_backend() == "tpu"
+
+
+def _dev() -> torch.device:
+    return torch.device("tpu") if _on_tpu() else torch.device("cpu")
+
+# Held by the running rank; the group's all-gather hands it over.
+_TURN = threading.RLock()
 
 
 # ---------------------------------------------------------------------------
@@ -106,6 +126,7 @@ _VIEW = {
 
 
 def _t2j(t: torch.Tensor) -> jax.Array:
+    t = t.detach().cpu()
     if t.dtype in _VIEW:
         raw, jdt = _VIEW[t.dtype]
         return jnp.asarray(t.contiguous().view(raw).numpy()).view(jdt)
@@ -116,8 +137,8 @@ def _j2t(a: jax.Array, dtype: torch.dtype) -> torch.Tensor:
     if dtype in _VIEW:
         raw, _ = _VIEW[dtype]
         np_raw = {torch.uint8: np.uint8, torch.int16: np.int16}[raw]
-        return torch.from_numpy(np.asarray(a).view(np_raw).copy()).view(dtype)
-    return torch.from_numpy(np.asarray(a).copy())
+        return torch.from_numpy(np.asarray(a).view(np_raw).copy()).view(dtype).to(_dev())
+    return torch.from_numpy(np.asarray(a).copy()).to(_dev())
 
 
 def _jdtype(dtype: torch.dtype):
@@ -133,9 +154,17 @@ class _Group:
 
     def all_gather(self, t: torch.Tensor, dim: int = 0) -> torch.Tensor:
         self.slots[self.local.rank] = t.clone()
-        self.barrier.wait()
+        _TURN.release()
+        try:
+            self.barrier.wait()
+        finally:
+            _TURN.acquire()
         out = torch.cat(self.slots, dim=dim)
-        self.barrier.wait()
+        _TURN.release()
+        try:
+            self.barrier.wait()
+        finally:
+            _TURN.acquire()
         return out
 
 
@@ -144,11 +173,12 @@ def _run_ranks(group: _Group, fn):
 
     def run(rank):
         group.local.rank = rank
-        try:
-            fn(rank)
-        except BaseException as e:  # noqa: BLE001
-            errors.append(e)
-            group.barrier.abort()
+        with _TURN:
+            try:
+                fn(rank)
+            except BaseException as e:  # noqa: BLE001
+                errors.append(e)
+                group.barrier.abort()
 
     threads = [threading.Thread(target=run, args=(r,)) for r in range(group.size)]
     for t in threads:
@@ -175,7 +205,9 @@ class _Rope:
 
     def __call__(self, positions, query, key=None):
         x = query.view(query.shape[0], -1, HEAD_DIM)
-        inv = 1.0 / (10000.0 ** (torch.arange(0, ROT, 2, dtype=torch.float32) / ROT))
+        inv = 1.0 / (
+            10000.0 ** (torch.arange(0, ROT, 2, dtype=torch.float32, device=x.device) / ROT)
+        )
         ang = positions.float()[:, None] * inv[None, :]
         cos, sin = ang.cos()[:, None, :], ang.sin()[:, None, :]
         x1, x2 = x[..., : ROT // 2].float(), x[..., ROT // 2 : ROT].float()
@@ -201,7 +233,7 @@ def _weights(seed):
     g = torch.Generator().manual_seed(seed)
 
     def rnd(*shape, scale=1.0):
-        return (torch.randn(*shape, generator=g) * scale).to(torch.bfloat16)
+        return (torch.randn(*shape, generator=g) * scale).to(torch.bfloat16).to(_dev())
 
     return dict(
         fc=rnd(NUM_AUX * HIDDEN, HIDDEN, scale=0.05),
@@ -218,41 +250,60 @@ def _weights(seed):
     )
 
 
-def _rank_model(w, tp_rank, dcp_rank, dcp, cache_dtype, scale, init_cache):
+_v29_write_jit = jax.jit(_v29_write_kv, static_argnames=("dcp", "k_scale", "v_scale"))
+
+
+@functools.cache
+def _pack_jit(page_shape, dtype, scale):
+    return jax.jit(
+        functools.partial(
+            cda.pack_rows, page_shape=page_shape, dtype=dtype, k_scale=scale, v_scale=scale
+        )
+    )
+
+
+@functools.cache
+def _write_rows_jit(dcp):
+    return jax.jit(
+        functools.partial(cda.write_owned_rows, dcp=dcp, interpret=not _on_tpu())
+    )
+
+
+def _rank_model(w, tp_rank, dcp_rank, dcp, cache_dtype, scale, init_cache, record):
     """The drafter as TP rank `tp_rank` holds it: own Q heads, KV head
-    ``tp_rank // REPLICAS``."""
+    ``tp_rank // REPLICAS``. `record` collects the bf16 K/V each path
+    quantizes: ``record["v29"][layer]``, ``record["new"][layer][rank]``."""
+    layer_of = {}
 
     def write(kv_cache, key, value, seq_lens, block_tables, qsl, rank):
-        with _JAX_LOCK:
-            out = _v29_write_kv(
-                _t2j(kv_cache), _t2j(key), _t2j(value), _t2j(seq_lens),
-                _t2j(block_tables), _t2j(qsl), dcp=dcp, rank=jnp.int32(int(rank[0])),
-                k_scale=scale, v_scale=scale,
-            )
-            return _j2t(out, kv_cache.dtype)
+        record["v29"][layer_of[id(kv_cache)]] = (key.cpu(), value.cpu())
+        out = _v29_write_jit(
+            _t2j(kv_cache), _t2j(key), _t2j(value), _t2j(seq_lens),
+            _t2j(block_tables), _t2j(qsl), dcp=dcp, rank=jnp.int32(int(rank[0])),
+            k_scale=scale, v_scale=scale,
+        )
+        return _j2t(out, kv_cache.dtype)
 
     def pack(kv_cache, key, value):
-        with _JAX_LOCK:
-            out = cda.pack_rows(
-                _t2j(key), _t2j(value), tuple(kv_cache.shape[2:]), _jdtype(kv_cache.dtype),
-                k_scale=scale, v_scale=scale,
-            )
-            return _j2t(out, kv_cache.dtype)
+        record["new"][layer_of[id(kv_cache)]][dcp_rank] = (key.cpu(), value.cpu())
+        out = _pack_jit(tuple(kv_cache.shape[2:]), _jdtype(kv_cache.dtype), scale)(
+            _t2j(key), _t2j(value)
+        )
+        return _j2t(out, kv_cache.dtype)
 
     def write_rows(kv_cache, rows, seq_lens, block_tables, qsl, rank):
-        with _JAX_LOCK:
-            out = cda.write_owned_rows(
-                _t2j(kv_cache), _t2j(rows), _t2j(seq_lens), _t2j(block_tables),
-                _t2j(qsl), dcp=dcp, rank=jnp.int32(int(rank[0])), interpret=True,
-            )
-            return _j2t(out, kv_cache.dtype)
+        out = _write_rows_jit(dcp)(
+            _t2j(kv_cache), _t2j(rows), _t2j(seq_lens), _t2j(block_tables),
+            _t2j(qsl), rank=jnp.int32(int(rank[0])),
+        )
+        return _j2t(out, kv_cache.dtype)
 
     impl = SimpleNamespace(
         sharded_draft_dcp=dict(ops=dict(write=write, pack=pack, write_rows=write_rows))
     )
     head = tp_rank // REPLICAS
     layers = []
-    for lw in w["layers"]:
+    for li, lw in enumerate(w["layers"]):
         attn = nn.Module()
         qkv = torch.cat([lw["q"][tp_rank], lw["k"][head], lw["v"][head]], dim=1)
         attn.qkv_proj = _Linear(qkv, returns_tuple=True)
@@ -264,9 +315,10 @@ def _rank_model(w, tp_rank, dcp_rank, dcp, cache_dtype, scale, init_cache):
         attn.rotary_emb = _Rope()
         attn.attn = SimpleNamespace(
             impl=impl,
-            kv_cache=init_cache.clone(),
-            draft_dcp_rank=torch.tensor([dcp_rank], dtype=torch.int32),
+            kv_cache=init_cache.clone().to(_dev()),
+            draft_dcp_rank=torch.tensor([dcp_rank], dtype=torch.int32, device=_dev()),
         )
+        layer_of[id(attn.attn.kv_cache)] = li
         layers.append(SimpleNamespace(self_attn=attn))
     return SimpleNamespace(
         fc=_Linear(w["fc"], returns_tuple=False),
@@ -340,9 +392,9 @@ def _metadata(case, dcp, rng):
         tables[1, :] = -num_pages - 2
         tables[2, :] = num_pages + 3
     return (
-        torch.from_numpy(seq_lens),
-        torch.from_numpy(tables.reshape(-1).copy()),
-        torch.from_numpy(cu),
+        torch.from_numpy(seq_lens).to(_dev()),
+        torch.from_numpy(tables.reshape(-1).copy()).to(_dev()),
+        torch.from_numpy(cu).to(_dev()),
         num_tokens,
         num_pages,
     )
@@ -354,33 +406,40 @@ def _caches(case, dcp, cache_dtype, scale, *, fault=None, monkeypatch=None, seed
     seq_lens, tables, qsl, num_tokens, num_pages = _metadata(case, dcp, rng)
     g = torch.Generator().manual_seed(seed + 7)
     aux = [
-        torch.randn(num_tokens, HIDDEN, generator=g).to(torch.bfloat16)
+        torch.randn(num_tokens, HIDDEN, generator=g).to(torch.bfloat16).to(_dev())
         for _ in range(NUM_AUX)
     ]
     positions = torch.zeros(num_tokens, dtype=torch.int64)
     for s in range(seq_lens.shape[0]):
         lo, hi = int(qsl[s]), int(qsl[s + 1])
         positions[lo:hi] = torch.arange(int(seq_lens[s]) - (hi - lo), int(seq_lens[s]))
+    positions = positions.to(_dev())
     md = SimpleNamespace(seq_lens=seq_lens, block_tables=tables, query_start_loc=qsl)
     metadata = (md,) * LAYERS
     G = max(1, dcp // REPLICAS)
     packing = 4 // torch.tensor([], dtype=cache_dtype).element_size()
     words = -(-2 * G // packing)
-    raw = torch.from_numpy(
-        rng.integers(0, 256, (num_pages, PAGE, words, packing, HEAD_DIM * cache_dtype.itemsize),
-                     dtype=np.uint8)
-    )
-    init = raw.view(cache_dtype).view(num_pages, PAGE, words, packing, HEAD_DIM)
+    # Random normal (finite, not denormal) values: an XLA float op on TPU
+    # canonicalizes NaN and flushes denormals, which would hide whether a
+    # path rewrote a slot it should not touch.
+    shape = (num_pages, PAGE, words, packing, HEAD_DIM)
+    mag = rng.uniform(0.5, 2.0, shape) * rng.choice([-1.0, 1.0], shape)
+    init = torch.from_numpy(mag.astype(np.float32)).to(cache_dtype)
 
     group = _Group(dcp)
-    old = [_rank_model(w, r, r, dcp, cache_dtype, scale, init) for r in range(dcp)]
-    new = [_rank_model(w, r, r, dcp, cache_dtype, scale, init) for r in range(dcp)]
+    record = dict(v29=[None] * LAYERS, new=[[None] * dcp for _ in range(LAYERS)])
+    old = [_rank_model(w, r, r, dcp, cache_dtype, scale, init, record) for r in range(dcp)]
+    new = [_rank_model(w, r, r, dcp, cache_dtype, scale, init, record) for r in range(dcp)]
     _run_ranks(group, lambda r: _v29_store(old[r], aux, positions, metadata, group, dcp))
 
     if monkeypatch is not None:
         monkeypatch.setattr("vllm_torchtpu.distributed.dcp.get_dcp_group", lambda: group)
     if fault == "max_runs":
         monkeypatch.setattr(cda, "max_owned_runs", lambda *a: 1)
+        # A fresh jit cache: retrace with the patched bound, restored after.
+        monkeypatch.setattr(
+            sys.modules[__name__], "_write_rows_jit", functools.cache(_write_rows_jit.__wrapped__)
+        )
 
     def run_new(r):
         assert dspark.prepare_rank_rows_context_kv(new[r], group, dcp, REPLICAS)
@@ -392,7 +451,7 @@ def _caches(case, dcp, cache_dtype, scale, *, fault=None, monkeypatch=None, seed
         if fault == "wrong_rank":
             for layer in new[r].layers:
                 layer.self_attn.attn.draft_dcp_rank = torch.tensor(
-                    [(r + 1) % dcp], dtype=torch.int32
+                    [(r + 1) % dcp], dtype=torch.int32, device=_dev()
                 )
         dspark.MiniMaxM3DSparkModel.store_context_kv(new[r], aux, positions, metadata)
 
@@ -400,10 +459,42 @@ def _caches(case, dcp, cache_dtype, scale, *, fault=None, monkeypatch=None, seed
     pairs = []
     for r in range(dcp):
         for lo, ln in zip(old[r].layers, new[r].layers, strict=True):
-            a = lo.self_attn.attn.kv_cache
-            b = ln.self_attn.attn.kv_cache
-            pairs.append((a, b))
-    return pairs, init
+            a = lo.self_attn.attn.kv_cache.cpu()
+            b = ln.self_attn.attn.kv_cache.cpu()
+            pairs.append((r, a, b))
+    owned = [_owned_slots(seq_lens, tables, qsl, num_tokens, num_pages, dcp, r) for r in range(dcp)]
+    return pairs, init, record, owned, num_tokens
+
+
+def _owned_slots(seq_lens, tables, qsl, num_tokens, num_pages, dcp, rank):
+    """``[pages, S]`` bool: the slots `write_kv` writes on `rank` (numpy)."""
+    seq_lens, tables, cu = (x.cpu().numpy() for x in (seq_lens, tables, qsl))
+    tables = tables.reshape(seq_lens.shape[0], -1)
+    mask = np.zeros((num_pages, PAGE), bool)
+    for s in range(seq_lens.shape[0]):
+        q = cu[s + 1] - cu[s]
+        for pos in range(seq_lens[s] - q, seq_lens[s]):
+            block = pos // PAGE
+            if block % dcp != rank:
+                continue
+            page = int(tables[s, min(block // dcp, tables.shape[1] - 1)])
+            page = page + num_pages if page < 0 else page
+            if 0 <= page < num_pages:
+                mask[page, pos % PAGE] = True
+    return mask
+
+
+def _kv_mismatch(record, num_tokens):
+    """Elements where the bf16 K/V the new path quantizes differ from v29's."""
+    bad = 0
+    for layer in range(LAYERS):
+        k_old, v_old = record["v29"][layer]
+        per_rank = record["new"][layer]
+        k_new = torch.cat([k for k, _ in per_rank])[:num_tokens]
+        v_new = torch.cat([v for _, v in per_rank])[:num_tokens]
+        bad += int((k_old.view(torch.int16) != k_new.view(torch.int16)).sum())
+        bad += int((v_old.view(torch.int16) != v_new.view(torch.int16)).sum())
+    return bad
 
 
 def _raw(t):
@@ -416,17 +507,29 @@ CASES = ["prefill_window", "mixed", "decode", "bad_pages"]
 @pytest.mark.parametrize("case", CASES)
 @pytest.mark.parametrize("dcp", [2, 4, 8])
 @pytest.mark.parametrize(
-    "cache_dtype,scale", [(torch.float8_e4m3fn, 0.5), (torch.bfloat16, None)], ids=["fp8", "bf16"]
+    "cache_dtype,scale",
+    [(torch.float8_e4m3fn, 0.5), (torch.float8_e4m3fn, 0.0371), (torch.bfloat16, None)],
+    ids=["fp8", "fp8-odd-scale", "bf16"],
 )
 def test_rank_rows_cache_bytes_match_v29(case, dcp, cache_dtype, scale, monkeypatch):
-    if cache_dtype == torch.bfloat16 and dcp == 4:
-        pytest.skip("bf16 covered at dcp 2 and 8")
-    pairs, init = _caches(case, dcp, cache_dtype, scale, monkeypatch=monkeypatch)
-    wrote = False
-    for a, b in pairs:
-        assert torch.equal(_raw(a), _raw(b))
-        wrote |= not torch.equal(_raw(a), _raw(init))
-    assert wrote  # the write did something
+    # A scale that is not a power of two: x / scale is not x * (1 / scale).
+    if scale != 0.5 and dcp == 4:
+        pytest.skip("covered at dcp 2 and 8")
+    pairs, init, record, owned, num_tokens = _caches(
+        case, dcp, cache_dtype, scale, monkeypatch=monkeypatch
+    )
+    # First the inputs of the quantize: fc / projection / norms / RoPE per row.
+    assert _kv_mismatch(record, num_tokens) == 0, "bf16 K/V differ before quantization"
+    raw_init = _raw(init).numpy()
+    for rank, a, b in pairs:
+        a, b = _raw(a).numpy(), _raw(b).numpy()
+        untouched = ~owned[rank]
+        # Neither path touches a slot outside the rank's own tokens.
+        assert (a[untouched] == raw_init[untouched]).all(), "v29 rewrote an untouched slot"
+        assert (b[untouched] == raw_init[untouched]).all(), "new rewrote an untouched slot"
+        diff = int((a != b).sum())
+        assert diff == 0, f"rank {rank}: {diff} cache bytes differ in written slots"
+    assert any(o.any() for o in owned)  # the batch writes something
 
 
 @pytest.mark.parametrize(
@@ -438,8 +541,8 @@ def test_rank_rows_cache_bytes_match_v29(case, dcp, cache_dtype, scale, monkeypa
     ],
 )
 def test_parity_catches_faults(fault, case, dcp, monkeypatch):
-    pairs, _ = _caches(case, dcp, torch.float8_e4m3fn, 0.5, fault=fault, monkeypatch=monkeypatch)
-    assert any(not torch.equal(_raw(a), _raw(b)) for a, b in pairs)
+    pairs, *_ = _caches(case, dcp, torch.float8_e4m3fn, 0.5, fault=fault, monkeypatch=monkeypatch)
+    assert any(not torch.equal(_raw(a), _raw(b)) for _, a, b in pairs)
 
 
 @pytest.mark.parametrize("dcp", [1, 2, 8])
