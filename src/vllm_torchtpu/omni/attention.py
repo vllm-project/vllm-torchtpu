@@ -26,6 +26,7 @@ from functools import cache as run_once
 from typing import Any
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import torch
 from jax.sharding import PartitionSpec
@@ -33,9 +34,13 @@ from torch_tpu._internal import pallas
 from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend, SDPAImpl
 from vllm_omni.diffusion.forward_context import get_ulysses_mode
 
+import vllm_torchtpu.envs as envs
 from vllm_torchtpu.kernels.diffusion_attention.kernel import (
     flash_attention_bshd,
     ring_ulysses_flash_attention_bshd,
+)
+from vllm_torchtpu.kernels.diffusion_attention.ring_kernel import (
+    ring_attention_sharded,
 )
 from vllm_torchtpu.logger import init_logger
 
@@ -449,6 +454,219 @@ def _ring_ulysses_attention_op(
     return op
 
 
+# Below 4096 rows per rank, pure-ring per-head ICI hops cost more than
+# intra-chip D2D all_to_all + bulk ppermute.
+_SHORT_SHARD_2D_RING_MAX = 4096
+
+
+@functools.cache
+def _pallas_ring_attention_op(
+    outer_size: int,
+    ring_size: int,
+    uly_size: int,
+    fuse_ulysses: bool,
+    scale: float,
+    use_fixed_m: bool,
+):
+    """Builds the torch custom op for ICI-DMA Pallas ring attention."""
+    axis_names = ("batch", "ring", "uly")
+    mesh = _get_device_ordered_pallas_mesh(
+        axis_names=axis_names,
+        mesh_shape=(outer_size, ring_size, uly_size),
+    )
+    if _RUNTIME_RING_CFG_STATE is not None and ring_size > 1:
+        validate_ring_cfg_lanes(
+            cfg_groups=_RUNTIME_RING_CFG_STATE.get("cfg_groups"),
+            ring_groups=_RUNTIME_RING_CFG_STATE.get("ring_groups"),
+            cfg_lane_by_rank=_RUNTIME_RING_CFG_STATE.get("cfg_lane_by_rank"),
+            device_ids_by_rank=_RUNTIME_RING_CFG_STATE.get("device_ids_by_rank"),
+            mesh_device_ids=mesh,
+            outer_size=outer_size,
+            ring_size=ring_size,
+            uly_size=uly_size,
+        )
+    spec = PartitionSpec("batch", "ring", "uly", None, None, None, None)
+    do_fuse = bool(fuse_ulysses and uly_size > 1)
+
+    def _body(q: jax.Array, k: jax.Array, v: jax.Array) -> jax.Array:
+        if do_fuse:
+            lead = (0, 1, 2)
+            q_u = jax.lax.all_to_all(
+                jnp.squeeze(q, axis=lead),
+                "uly",
+                split_axis=2,
+                concat_axis=1,
+                tiled=True,
+            )
+            k_u = jax.lax.all_to_all(
+                jnp.squeeze(k, axis=lead),
+                "uly",
+                split_axis=2,
+                concat_axis=1,
+                tiled=True,
+            )
+            v_u = jax.lax.all_to_all(
+                jnp.squeeze(v, axis=lead),
+                "uly",
+                split_axis=2,
+                concat_axis=1,
+                tiled=True,
+            )
+            out_u = ring_attention_sharded(
+                jnp.expand_dims(q_u, axis=lead),
+                jnp.expand_dims(k_u, axis=lead),
+                jnp.expand_dims(v_u, axis=lead),
+                ring_axis="ring",
+                axis_names=axis_names,
+                scale=scale,
+                use_fixed_m=use_fixed_m,
+            )
+            out_s = jax.lax.all_to_all(
+                jnp.squeeze(out_u, axis=lead),
+                "uly",
+                split_axis=1,
+                concat_axis=2,
+                tiled=True,
+            )
+            return jnp.expand_dims(out_s, axis=lead)
+        return ring_attention_sharded(
+            q,
+            k,
+            v,
+            ring_axis="ring",
+            axis_names=axis_names,
+            scale=scale,
+            use_fixed_m=use_fixed_m,
+        )
+
+    def _fn(q: jax.Array, k: jax.Array, v: jax.Array) -> jax.Array:
+        return jax.shard_map(
+            _body,
+            mesh=mesh,
+            in_specs=(spec, spec, spec),
+            out_specs=spec,
+            check_vma=False,
+        )(q, k, v)
+
+    scale_hex = f"{int(np.float64(scale).view(np.uint64)):016x}"
+    fm_tag = "fm1" if use_fixed_m else "fm0"
+    mode = "ring_ulysses_ici" if do_fuse else "ring_ici"
+    op_name = (
+        f"pallas::diffusion_{mode}_attn_"
+        f"{outer_size}_{ring_size}_{uly_size}_{fm_tag}_{scale_hex}"
+    )
+    # jax_op's stub types partition specs as tuple[tuple[str, ...], ...].
+    # pyrefly: ignore[no-matching-overload]
+    op = pallas.jax_op(
+        op_name,
+        _fn,
+        mesh=mesh,
+        input_partition_specs=(spec, spec, spec),
+        output_partition_specs=(spec,),
+    )
+    op.register_fake(lambda q, k, v: q.new_empty(q.shape))
+    return op
+
+
+@functools.cache
+def _short_2d_ring_attention_op(
+    outer_size: int,
+    ring_size: int,
+    scale: float,
+):
+    """Builds intra-chip Ulysses=2 + ppermute ring op for short shards."""
+    axis_names = ("batch", "ring", "uly")
+    mesh = _get_device_ordered_pallas_mesh(
+        axis_names=axis_names,
+        mesh_shape=(outer_size, ring_size // 2, 2),
+    )
+    if _RUNTIME_RING_CFG_STATE is not None and ring_size > 1:
+        validate_ring_cfg_lanes(
+            cfg_groups=_RUNTIME_RING_CFG_STATE.get("cfg_groups"),
+            ring_groups=_RUNTIME_RING_CFG_STATE.get("ring_groups"),
+            cfg_lane_by_rank=_RUNTIME_RING_CFG_STATE.get("cfg_lane_by_rank"),
+            device_ids_by_rank=_RUNTIME_RING_CFG_STATE.get("device_ids_by_rank"),
+            mesh_device_ids=[int(d.id) for d in mesh.devices.flat],
+            outer_size=outer_size,
+            ring_size=ring_size,
+            uly_size=1,
+        )
+    spec = PartitionSpec("batch", "ring", "uly", None, None, None, None)
+
+    def _body(q: jax.Array, k: jax.Array, v: jax.Array) -> jax.Array:
+        out = ring_ulysses_flash_attention_bshd(
+            q[0, 0, 0],
+            k[0, 0, 0],
+            v[0, 0, 0],
+            ring_axis="ring",
+            uly_axis="uly",
+            scale=scale,
+        )
+        return out[None, None, None]
+
+    def _fn(q: jax.Array, k: jax.Array, v: jax.Array) -> jax.Array:
+        return jax.shard_map(
+            _body,
+            mesh=mesh,
+            in_specs=(spec, spec, spec),
+            out_specs=spec,
+            check_vma=False,
+        )(q, k, v)
+
+    scale_hex = f"{int(np.float64(scale).view(np.uint64)):016x}"
+    op_name = (
+        f"pallas::diffusion_short_2d_ring_attn_{outer_size}_{ring_size}_{scale_hex}"
+    )
+    # jax_op's stub types partition specs as tuple[tuple[str, ...], ...].
+    # pyrefly: ignore[no-matching-overload]
+    op = pallas.jax_op(
+        op_name,
+        _fn,
+        mesh=mesh,
+        input_partition_specs=(spec, spec, spec),
+        output_partition_specs=(spec,),
+    )
+    op.register_fake(lambda q, k, v: q.new_empty(q.shape))
+    return op
+
+
+def _can_use_ici_ring_kernel(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    ring_size: int,
+    uly_size: int,
+    fuse_ulysses: bool,
+) -> bool:
+    """Whether a ring attention call fits the ICI-DMA Pallas ring kernel."""
+    if not envs.VLLM_TORCHTPU_OMNI_RING_KERNEL or ring_size < 2:
+        return False
+    if query.device.type != "tpu":
+        return False
+    if query.ndim != 4 or key.ndim != 4 or value.ndim != 4:
+        return False
+    batch, q_seq, num_q_heads, head_dim = query.shape
+    kv_batch, kv_seq, num_kv_heads, k_dim = key.shape
+    if batch != kv_batch or q_seq != kv_seq:
+        return False
+    if head_dim != 128 or k_dim != 128 or value.shape != key.shape:
+        return False
+    if not (query.dtype == key.dtype == value.dtype == torch.bfloat16):
+        return False
+    if fuse_ulysses and uly_size > 1:
+        if num_q_heads % uly_size != 0 or num_kv_heads % uly_size != 0:
+            return False
+        q_seq_eff = q_seq * uly_size
+        q_heads_eff = num_q_heads // uly_size
+        kv_heads_eff = num_kv_heads // uly_size
+    else:
+        q_seq_eff = q_seq
+        q_heads_eff = num_q_heads
+        kv_heads_eff = num_kv_heads
+    return q_seq_eff >= 256 and kv_heads_eff > 0 and q_heads_eff % kv_heads_eff == 0
+
+
 def tpu_ring_flash_attention(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -487,10 +705,40 @@ def tpu_ring_flash_attention(
             uly_size=uly_size,
         )
     fuse = bool(fuse_ulysses and uly_size > 1)
-    op = _ring_ulysses_attention_op(outer_size, ring_size, uly_size, fuse)
     q = query.contiguous().unsqueeze(0).unsqueeze(0).unsqueeze(0)
     k = key.contiguous().unsqueeze(0).unsqueeze(0).unsqueeze(0)
     v = value.contiguous().unsqueeze(0).unsqueeze(0).unsqueeze(0)
+
+    if _can_use_ici_ring_kernel(
+        query,
+        key,
+        value,
+        ring_size=ring_size,
+        uly_size=uly_size,
+        fuse_ulysses=fuse,
+    ):
+        if (
+            not fuse
+            and uly_size == 1
+            and ring_size >= 4
+            and ring_size % 2 == 0
+            and query.shape[1] <= _SHORT_SHARD_2D_RING_MAX
+            and query.shape[2] % 2 == 0
+            and key.shape[2] % 2 == 0
+        ):
+            short_op = _short_2d_ring_attention_op(outer_size, ring_size, float(scale))
+            return short_op(q, k, v).reshape(*query.shape[:3], value.shape[-1])
+        ring_op = _pallas_ring_attention_op(
+            outer_size,
+            ring_size,
+            uly_size,
+            fuse,
+            float(scale),
+            bool(envs.VLLM_TORCHTPU_OMNI_RING_FIXED_M),
+        )
+        return ring_op(q, k, v).reshape(*query.shape[:3], value.shape[-1])
+
+    op = _ring_ulysses_attention_op(outer_size, ring_size, uly_size, fuse)
     out = op(q, k, v, float(scale))
     return out.reshape(*query.shape[:3], value.shape[-1])
 
