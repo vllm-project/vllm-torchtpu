@@ -400,6 +400,104 @@ def test_golden_fixtures_match_schema_contract() -> None:
     for row in rows:
         total = sum(row[f"gen_ai.usage.input_tokens.{cat}"] for cat in CATEGORIES)
         assert total == row["gen_ai.usage.prompt_tokens"]
+        assert "vllm.kv_cache.lru_horizon_ms" not in row
+        assert "vllm.tpu.shape_padding_tokens" not in row
         for k in row:
             assert k in SPAN_ATTRIBUTE_KEYS or k.startswith("gen_ai.")
     assert rows[1]["gen_ai.usage.input_tokens.unreused_reply_loss"] == 37
+
+
+def test_delta_eviction_sync_compaction_and_lru_horizon_omitted(
+    monkeypatch, tmp_path
+) -> None:
+    """Delta sync writes only changed sessions per step, reads incrementally, compacts, and omits lru_horizon_ms."""
+    import json
+
+    import vllm_torchtpu.telemetry.vllm_hooks as hooks_mod
+
+    monkeypatch.setattr(envs, "VLLM_TPU_AGENTIC_TELEMETRY", True)
+    sync_base = str(tmp_path / ".evict_delta")
+    monkeypatch.setattr(hooks_mod, "_EVICTION_SYNC_PATH", sync_base)
+
+    engine_svc = AgenticTelemetryService(block_size=4, replica_id="rep-delta-0")
+    api_svc = AgenticTelemetryService(block_size=4, replica_id="rep-delta-0")
+    sync_file = tmp_path / ".evict_delta_rep-delta-0"
+
+    # Step 1: Evict sess-A only -> line 1 contains ONLY sess-A.
+    engine_svc.on_block_evicted("blk-a1", now=10.0, session_id="sess-A")
+    lines_1 = sync_file.read_text(encoding="utf-8").splitlines()
+    assert len(lines_1) == 1
+    assert list(json.loads(lines_1[0])["sessions"].keys()) == ["sess-A"]
+
+    api_svc._maybe_sync_eviction_state()
+    offset_after_1 = api_svc._eviction_sync_offset
+    assert offset_after_1 > 0
+    assert api_svc.eviction_tracker.session_evicted_at_ms("sess-A") is not None
+    assert api_svc.eviction_tracker.session_evicted_at_ms("sess-B") is None
+
+    # Step 2: Evict sess-B only -> line 2 contains ONLY sess-B (not sess-A again).
+    engine_svc.on_block_evicted("blk-b1", now=20.0, session_id="sess-B")
+    lines_2 = sync_file.read_text(encoding="utf-8").splitlines()
+    assert len(lines_2) == 2
+    assert list(json.loads(lines_2[1])["sessions"].keys()) == ["sess-B"]
+
+    api_svc._maybe_sync_eviction_state()
+    assert api_svc._eviction_sync_offset > offset_after_1
+    assert api_svc.eviction_tracker.session_evicted_at_ms("sess-A") is not None
+    assert api_svc.eviction_tracker.session_evicted_at_ms("sess-B") is not None
+
+    # No-op sync when file unchanged does not move offset.
+    steady_offset = api_svc._eviction_sync_offset
+    api_svc._maybe_sync_eviction_state()
+    assert api_svc._eviction_sync_offset == steady_offset
+
+    # Step 3: Trigger compaction when sync file exceeds threshold.
+    monkeypatch.setattr(hooks_mod, "_MAX_EVICTION_SYNC_BYTES", 64)
+    engine_svc.on_block_evicted("blk-c1", now=30.0, session_id="sess-C")
+    lines_3 = sync_file.read_text(encoding="utf-8").splitlines()
+    assert len(lines_3) == 1
+    compacted_keys = set(json.loads(lines_3[0])["sessions"].keys())
+    assert compacted_keys == {"sess-A", "sess-B", "sess-C"}
+
+    # Reader detects new inode / smaller size and resets offset cleanly.
+    api_svc._maybe_sync_eviction_state()
+    assert api_svc.eviction_tracker.session_evicted_at_ms("sess-C") is not None
+
+    # Verify per-turn span attributes omit lru_horizon_ms while keeping time_since_eviction_ms & session_evicted_at_ms.
+    req_t1 = SimpleNamespace(
+        request_id="req-a-1",
+        prompt_token_ids=[1, 2, 3, 4, 5, 6, 7, 8],
+        num_cached_tokens=0,
+        is_prefilling=True,
+        detokenizer=SimpleNamespace(output_token_ids=[9, 10, 11, 12]),
+    )
+    out_t1 = SimpleNamespace(
+        request_id="req-a-1",
+        num_cached_tokens=0,
+        new_token_ids=[9, 10, 11, 12],
+        finish_reason="stop",
+        trace_headers={"x-agent-session-id": "sess-A", "x-agent-turn-id": "1"},
+    )
+    api_svc.on_prefill_output(req_t1, out_t1)
+    api_svc.build_span_attributes(req_t1, out_t1, now=8.0)
+
+    req_t2 = SimpleNamespace(
+        request_id="req-a-2",
+        prompt_token_ids=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+        num_cached_tokens=4,
+        is_prefilling=True,
+        detokenizer=SimpleNamespace(output_token_ids=[17, 18]),
+    )
+    out_t2 = SimpleNamespace(
+        request_id="req-a-2",
+        num_cached_tokens=4,
+        new_token_ids=[17, 18],
+        finish_reason="stop",
+        trace_headers={"x-agent-session-id": "sess-A", "x-agent-turn-id": "2"},
+    )
+    api_svc.on_prefill_output(req_t2, out_t2)
+    attrs_t2 = api_svc.build_span_attributes(req_t2, out_t2, now=12.5)
+    assert attrs_t2["gen_ai.usage.input_tokens.affinity_honored_eviction"] == 8
+    assert attrs_t2["vllm.kv_cache.time_since_eviction_ms"] == 2500.0
+    assert "vllm.kv_cache.session_evicted_at_ms" in attrs_t2
+    assert "vllm.kv_cache.lru_horizon_ms" not in attrs_t2

@@ -76,6 +76,8 @@ def _ipc_base_dir() -> str:
 _BLOCK_SIZE_SYNC_PATH = f"{_ipc_base_dir()}/.vllm_tpu_agentic_block_size"
 _EVICTION_SYNC_PATH = f"{_ipc_base_dir()}/.vllm_tpu_agentic_eviction_state"
 _PADDING_SYNC_PATH = f"{_ipc_base_dir()}/.vllm_tpu_agentic_padding_state"
+_MAX_EVICTION_SYNC_BYTES = 524_288
+_COMPACT_RECENT_SESSIONS = 1024
 
 
 def _resolve_trace_headers(
@@ -186,9 +188,12 @@ class AgenticTelemetryService:
         self._req_external_tokens: dict[str, int] = {}
         self._req_prefill_ts: dict[str, float] = {}
         self._req_eviction_metrics: dict[
-            str, tuple[float | None, float | None, int | None]
+            str, tuple[float | None, int | None]
         ] = {}
         self._eviction_sync_dirty: bool = False
+        self._eviction_writer_initialized: bool = False
+        self._eviction_sync_inode: int | None = None
+        self._eviction_sync_offset: int = 0
 
     def _safe_replica_id(self) -> str:
         return "".join(
@@ -237,37 +242,59 @@ class AgenticTelemetryService:
         return self.padding_tracker.as_dict()
 
     def flush_eviction_sync(self) -> None:
-        """Flush pending per-session eviction timestamps once per step to shared memory."""
+        """Flush changed per-session eviction timestamps once per step as a delta line."""
         if not self._eviction_sync_dirty or not envs.VLLM_TPU_AGENTIC_TELEMETRY:
             return
         self._eviction_sync_dirty = False
-        payload = {
-            "sessions": self.eviction_tracker.export_session_state(),
-            "last": [
-                self.eviction_tracker._last_evicted_ts,
-                self.eviction_tracker._last_evicted_wall_ms,
-            ],
-        }
+        changed_sessions = self.eviction_tracker.pop_dirty_session_state()
+        last_pair = [
+            self.eviction_tracker._last_evicted_ts,
+            self.eviction_tracker._last_evicted_wall_ms,
+        ]
+        sync_path = self._eviction_sync_path()
         try:
-            with open(self._eviction_sync_path(), "w", encoding="utf-8") as f:
-                json.dump(payload, f)
+            needs_replace = not self._eviction_writer_initialized
+            if not needs_replace and os.path.exists(sync_path):
+                needs_replace = (
+                    os.path.getsize(sync_path) >= _MAX_EVICTION_SYNC_BYTES
+                )
+            if needs_replace:
+                sessions_payload = (
+                    changed_sessions
+                    if not self._eviction_writer_initialized
+                    else self.eviction_tracker.export_recent_session_state(
+                        _COMPACT_RECENT_SESSIONS
+                    )
+                )
+                payload = {
+                    "sessions": sessions_payload,
+                    "last": last_pair,
+                }
+                tmp_path = f"{sync_path}.tmp.{os.getpid()}"
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    f.write(json.dumps(payload, separators=(",", ":")) + "\n")
+                os.replace(tmp_path, sync_path)
+                self._eviction_writer_initialized = True
+            else:
+                payload = {
+                    "sessions": changed_sessions,
+                    "last": last_pair,
+                }
+                line = json.dumps(payload, separators=(",", ":")) + "\n"
+                with open(sync_path, "a", encoding="utf-8") as f:
+                    f.write(line)
         except OSError:
             pass
 
-    def _maybe_sync_eviction_state(self) -> None:
-        """Sync per-session HBM eviction timestamps from EngineCore child process."""
-        sync_path = self._eviction_sync_path()
-        if not envs.VLLM_TPU_AGENTIC_TELEMETRY or not os.path.exists(sync_path):
-            return
+    def _apply_eviction_sync_record(self, raw_line: str) -> bool:
+        """Parse and merge one eviction sync JSONL line (or legacy record)."""
+        if not raw_line:
+            return False
         try:
-            with open(sync_path, encoding="utf-8") as f:
-                raw = f.read().strip()
-            if not raw:
-                return
-            if raw.startswith("{"):
-                data = json.loads(raw)
+            if raw_line.startswith("{"):
+                data = json.loads(raw_line)
                 sessions = data.get("sessions")
-                if isinstance(sessions, Mapping):
+                if isinstance(sessions, Mapping) and sessions:
                     self.eviction_tracker.import_session_state(sessions)
                 last = data.get("last")
                 if (
@@ -282,16 +309,60 @@ class AgenticTelemetryService:
                     if cur_ts is None or ts > cur_ts:
                         self.eviction_tracker._last_evicted_ts = ts
                         self.eviction_tracker._last_evicted_wall_ms = wall_ms
-            else:
-                parts = raw.split()
-                if len(parts) >= 2:
-                    ts = float(parts[0])
-                    wall_ms = int(parts[1])
-                    cur_ts = self.eviction_tracker._last_evicted_ts
-                    if cur_ts is None or ts > cur_ts:
-                        self.eviction_tracker._last_evicted_ts = ts
-                        self.eviction_tracker._last_evicted_wall_ms = wall_ms
-        except (OSError, ValueError):
+                return True
+            parts = raw_line.split()
+            if len(parts) >= 2:
+                ts = float(parts[0])
+                wall_ms = int(parts[1])
+                cur_ts = self.eviction_tracker._last_evicted_ts
+                if cur_ts is None or ts > cur_ts:
+                    self.eviction_tracker._last_evicted_ts = ts
+                    self.eviction_tracker._last_evicted_wall_ms = wall_ms
+                return True
+        except ValueError:
+            return False
+        return False
+
+    def _maybe_sync_eviction_state(self) -> None:
+        """Incrementally read newly appended per-session eviction deltas from shared memory."""
+        sync_path = self._eviction_sync_path()
+        if not envs.VLLM_TPU_AGENTIC_TELEMETRY:
+            return
+        try:
+            st = os.stat(sync_path)
+        except OSError:
+            return
+        if (
+            self._eviction_sync_inode == st.st_ino
+            and self._eviction_sync_offset == st.st_size
+        ):
+            return
+        if (
+            self._eviction_sync_inode != st.st_ino
+            or st.st_size < self._eviction_sync_offset
+        ):
+            self._eviction_sync_inode = st.st_ino
+            self._eviction_sync_offset = 0
+        try:
+            with open(sync_path, "rb") as f:
+                f.seek(self._eviction_sync_offset)
+                chunk = f.read()
+            if not chunk:
+                return
+            last_nl = chunk.rfind(b"\n")
+            if last_nl == -1:
+                if self._eviction_sync_offset == 0:
+                    raw_text = chunk.decode("utf-8", errors="replace").strip()
+                    if self._apply_eviction_sync_record(raw_text):
+                        self._eviction_sync_offset = len(chunk)
+                return
+            complete = chunk[: last_nl + 1]
+            self._eviction_sync_offset += len(complete)
+            for raw_line in complete.decode("utf-8", errors="replace").splitlines():
+                line = raw_line.strip()
+                if line:
+                    self._apply_eviction_sync_record(line)
+        except OSError:
             pass
 
     def _maybe_sync_vllm_block_size(self) -> None:
@@ -389,13 +460,13 @@ class AgenticTelemetryService:
             self.category_totals[cat] += count
         if req_id:
             self._req_breakdowns[req_id] = breakdown
-            evict_age, lru_hor, evict_wall = self._compute_eviction_snapshot(
+            evict_age, evict_wall = self._compute_eviction_snapshot(
                 req_state,
                 breakdown,
                 session_id=session_id,
                 eval_now=prefill_now,
             )
-            self._req_eviction_metrics[req_id] = (evict_age, lru_hor, evict_wall)
+            self._req_eviction_metrics[req_id] = (evict_age, evict_wall)
         return breakdown
 
     def _compute_eviction_snapshot(
@@ -405,7 +476,7 @@ class AgenticTelemetryService:
         *,
         session_id: str | None,
         eval_now: float | None,
-    ) -> tuple[float | None, float | None, int | None]:
+    ) -> tuple[float | None, int | None]:
         eviction_age_ms: float | None = None
         if breakdown.affinity_honored_eviction > 0:
             prompt_token_ids = getattr(req_state, "prompt_token_ids", None) or ()
@@ -428,13 +499,8 @@ class AgenticTelemetryService:
                 missed_hashes, now=eval_now, session_id=session_id
             )
 
-        lru_horizon_ms = self.eviction_tracker.lru_horizon_ms(
-            now=eval_now, session_id=session_id
-        )
-        if lru_horizon_ms is None and eviction_age_ms is not None:
-            lru_horizon_ms = eviction_age_ms
         session_evicted_wall = self.eviction_tracker.session_evicted_at_ms(session_id)
-        return eviction_age_ms, lru_horizon_ms, session_evicted_wall
+        return eviction_age_ms, session_evicted_wall
 
     def on_request_finished(
         self, req_state: Any, engine_core_output: Any
@@ -514,10 +580,10 @@ class AgenticTelemetryService:
             attrs["gen_ai.session.parent_id"] = parent_session_id
 
         if snap_evict is not None and now is None:
-            eviction_age_ms, lru_horizon_ms, session_evicted_wall = snap_evict
+            eviction_age_ms, session_evicted_wall = snap_evict
         else:
             self._maybe_sync_eviction_state()
-            eviction_age_ms, lru_horizon_ms, session_evicted_wall = (
+            eviction_age_ms, session_evicted_wall = (
                 self._compute_eviction_snapshot(
                     req_state,
                     breakdown,
@@ -530,7 +596,7 @@ class AgenticTelemetryService:
             kv_transfer_params=getattr(engine_core_output, "kv_transfer_params", None),
             num_external_computed_tokens=ext_computed,
             time_since_eviction_ms=eviction_age_ms,
-            lru_horizon_ms=lru_horizon_ms,
+            lru_horizon_ms=None,
             session_evicted_at_ms=session_evicted_wall,
             tpu_shape_padding_tokens=None,
         )
