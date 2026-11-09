@@ -658,7 +658,8 @@ def _owner_invariant_layout(layout: dict[str, Any]) -> dict[str, Any]:
         pages=unique(
             dict(block_stride_bytes=p["block_stride_bytes"], dtype_tag=p["dtype_tag"])
             for p in layout["pools"]
-            if not p["tag"].endswith(".compressed_k")
+            # Split keys are tagged "<owner>.compressed_k.pcp<r>".
+            if ".compressed_k" not in p["tag"]
         ),
     )
 
