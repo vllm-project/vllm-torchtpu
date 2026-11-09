@@ -82,6 +82,7 @@ def apply_omni_model_specific_patches() -> None:
     _patch_ltx2_split_rope()
     _patch_wan_fused_qk_norm_rope()
     _patch_wan_fresh_timestep()
+    _patch_wan_host_resident_schedule()
     _patch_sdpa_fallback_dispatch()
     _patch_ltx2_vocoder_cpu_init()
 
@@ -389,14 +390,68 @@ def _wrap_fresh_timestep(cls: type) -> None:
         self: Any, hidden_states: Any, timestep: Any, *args: Any, **kwargs: Any
     ) -> Any:
         if isinstance(timestep, torch.Tensor):
-            from vllm_torchtpu.utils import synchronize_tensors
+            if (
+                isinstance(hidden_states, torch.Tensor)
+                and timestep.device.type != hidden_states.device.type
+            ):
+                # Host schedule (_patch_wan_host_resident_schedule): the
+                # transfer itself is the fresh buffer.
+                timestep = timestep.to(hidden_states.device)
+            else:
+                from vllm_torchtpu.utils import synchronize_tensors
 
-            timestep = timestep.clone()
-            synchronize_tensors(timestep, wait=False)
+                timestep = timestep.clone()
+                synchronize_tensors(timestep, wait=False)
         return forward(self, hidden_states, timestep, *args, **kwargs)
 
     setattr(_fresh_timestep_forward, _FRESH_TIMESTEP_PATCHED, True)
     cls.forward = _fresh_timestep_forward
+
+
+_HOST_SCHEDULE_PATCHED = "_tpu_host_schedule_patched"
+
+
+def _patch_wan_host_resident_schedule() -> None:
+    # -------------------------------------------------------------------------
+    # TODO: Remove this patch once torch_tpu passes view offsets to graphs as
+    # runtime inputs, or vLLM-Omni keeps the denoising schedule on the host.
+    #
+    # With the fresh timestep copy at transformer entry, the first request at a
+    # new step count still pays about 0.6 s per step (480x832x81 on 8 cores:
+    # 26.3 s against 14.9 s warm for 12 steps, 66.4 s against 39.6 s for 40
+    # steps). Each step still reads the schedule view `t` in small device
+    # programs that bake its offset: the expert-boundary compare in the
+    # pipeline loop and the UniPC `index_for_timestep` lookup before every
+    # update. Keeping `FlowUniPCMultistepScheduler.timesteps` on the host turns
+    # both into host work and leaves no device program that depends on the step
+    # index; the transformer then receives a host timestep, which the
+    # fresh-timestep hook moves to the device as a plain data transfer. The
+    # sigma arithmetic is unchanged (the scheduler already keeps `sigmas` on
+    # the host and moves each value to the device per step), so the output is
+    # bit-identical.
+    # -------------------------------------------------------------------------
+    from vllm_omni.diffusion.models.schedulers.scheduling_flow_unipc_multistep import (
+        FlowUniPCMultistepScheduler,
+    )
+
+    if getattr(
+        FlowUniPCMultistepScheduler.set_timesteps, _HOST_SCHEDULE_PATCHED, False
+    ):
+        return
+    orig_set_timesteps = FlowUniPCMultistepScheduler.set_timesteps
+
+    def _host_set_timesteps(
+        self: Any,
+        num_inference_steps: Any = None,
+        device: Any = None,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        return orig_set_timesteps(self, num_inference_steps, "cpu", *args, **kwargs)
+
+    setattr(_host_set_timesteps, _HOST_SCHEDULE_PATCHED, True)
+    FlowUniPCMultistepScheduler.set_timesteps = _host_set_timesteps
+    logger.info("Applied TPU patch: host-resident denoising schedule for FlowUniPC.")
 
 
 _SDPA_FALLBACK_PATCHED = "_tpu_sdpa_fallback_patched"

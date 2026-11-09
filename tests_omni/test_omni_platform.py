@@ -29,9 +29,19 @@ from vllm_omni.diffusion.models.ltx2 import (
     ltx2_transformer,
 )
 from vllm_omni.diffusion.models.qwen_image import qwen_image_transformer
+from vllm_omni.diffusion.models.schedulers.scheduling_flow_unipc_multistep import (
+    FlowUniPCMultistepScheduler,
+)
+from vllm_omni.diffusion.models.wan2_2.wan2_2_s2v_transformer import (
+    WanS2VTransformer3DModel,
+)
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import (
     ColumnParallelGELU,
     WanSelfAttention,
+    WanTransformer3DModel,
+)
+from vllm_omni.diffusion.models.wan2_2.wan2_2_vace_transformer import (
+    WanVACETransformer3DModel,
 )
 from vllm_omni.diffusion.worker.diffusion_worker import WorkerProc
 
@@ -46,6 +56,7 @@ from vllm_torchtpu.omni.attention import (
 from vllm_torchtpu.omni.patches import (
     _BWE_FILTER_CPU_RESTORE_PATCHED,
     _D2H_STREAM_PATCHED,
+    _HOST_SCHEDULE_PATCHED,
     _SDPA_FALLBACK_PATCHED,
     _SPLIT_ROPE_PATCHED,
     _VOCODER_CPU_INIT_PATCHED,
@@ -54,6 +65,8 @@ from vllm_torchtpu.omni.patches import (
     _patch_ltx2_split_rope,
     _patch_ltx2_vocoder_cpu_init,
     _patch_sdpa_fallback_dispatch,
+    _patch_wan_host_resident_schedule,
+    _wrap_fresh_timestep,
     apply_omni_model_specific_patches,
     apply_omni_tpu_patches,
 )
@@ -78,6 +91,7 @@ _UPSTREAM_SDPA_FORWARD = SDPAImpl.forward
 _UPSTREAM_ROPE_FORWARD = ltx2_transformer.LTX2AudioVideoRotaryPosEmbed.forward
 _UPSTREAM_APPLY_SPLIT_ROTARY_EMB = ltx2_transformer.apply_split_rotary_emb
 _UPSTREAM_RESTORE_BWE_FILTER = ltx2_runtime._restore_ltx_bwe_resampler_filter
+_UPSTREAM_FLOW_UNIPC_SET_TIMESTEPS = FlowUniPCMultistepScheduler.set_timesteps
 
 
 def test_register_omni_tpu_platform(monkeypatch):
@@ -273,6 +287,84 @@ def test_wan_ffn_gelu_fence(monkeypatch):
     torch.testing.assert_close(ffn(x), want * 2, rtol=0, atol=0)
     assert len(fenced) == 1
     torch.testing.assert_close(fenced[0], want, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "cls",
+    [WanTransformer3DModel, WanVACETransformer3DModel, WanS2VTransformer3DModel],
+    ids=["wan", "vace", "s2v"],
+)
+def test_wan_timestep_host_schedule_transfer(monkeypatch, cls):
+    # A timestep from a host-resident schedule is moved to the hidden-states
+    # device as a plain transfer; no copy-and-sync program is queued.
+    calls = []
+    monkeypatch.setattr(
+        cls,
+        "forward",
+        lambda self, hidden_states, timestep, *args, **kwargs: calls.append(
+            (hidden_states, timestep, args, kwargs)
+        ),
+    )
+    synced = []
+    monkeypatch.setattr(
+        "vllm_torchtpu.utils.synchronize_tensors",
+        lambda t, wait=True: synced.append((t, wait)),
+    )
+    _wrap_fresh_timestep(cls)
+
+    x_meta = torch.zeros(2, 4, device="meta")
+    host_t = torch.arange(6)[3].expand(2)
+    cls.forward(object(), hidden_states=x_meta, timestep=host_t, return_dict=False)
+    cls.forward(object(), x_meta, host_t, "ctx")
+    assert len(calls) == 2
+    assert calls[0][1].device.type == "meta" and calls[0][1].shape == (2,)
+    assert calls[0][3]["return_dict"] is False
+    assert calls[1][1].device.type == "meta" and calls[1][2] == ("ctx",)
+    assert synced == []
+
+    # Same-device view still clones and flushes asynchronously.
+    calls.clear()
+    x_cpu = torch.zeros(2, 4)
+    view_t = torch.arange(6.0)[3].expand(2)
+    cls.forward(object(), hidden_states=x_cpu, timestep=view_t)
+    got_t = calls[0][1]
+    assert got_t._base is None and got_t.data_ptr() != view_t.data_ptr()
+    torch.testing.assert_close(got_t, view_t)
+    assert len(synced) == 1 and synced[0] == (got_t, False)
+
+
+def test_flow_unipc_schedule_stays_on_host(monkeypatch):
+    # The Wan UniPC schedule is created on the host whatever device the
+    # pipeline asks for, so per-step scalar work never bakes view offsets
+    # into device programs.
+    monkeypatch.setattr(
+        FlowUniPCMultistepScheduler,
+        "set_timesteps",
+        _UPSTREAM_FLOW_UNIPC_SET_TIMESTEPS,
+    )
+    _patch_wan_host_resident_schedule()
+    patched = FlowUniPCMultistepScheduler.set_timesteps
+    assert getattr(patched, _HOST_SCHEDULE_PATCHED, False)
+    _patch_wan_host_resident_schedule()
+    assert FlowUniPCMultistepScheduler.set_timesteps is patched
+
+    scheduler = FlowUniPCMultistepScheduler(num_train_timesteps=1000, shift=3.0)
+    scheduler.set_timesteps(4, device="meta", shift=5.0)
+    assert scheduler.timesteps.device.type == "cpu"
+    assert scheduler.num_inference_steps == 4
+
+    want_scheduler = FlowUniPCMultistepScheduler(num_train_timesteps=1000, shift=3.0)
+    _UPSTREAM_FLOW_UNIPC_SET_TIMESTEPS(want_scheduler, 4, device="cpu", shift=5.0)
+    assert torch.equal(scheduler.timesteps, want_scheduler.timesteps)
+    assert torch.equal(scheduler.sigmas, want_scheduler.sigmas)
+
+    scheduler.set_timesteps(num_inference_steps=3, device=torch.device("meta"))
+    assert scheduler.timesteps.device.type == "cpu"
+    assert len(scheduler.timesteps) == 3
+
+    scheduler.set_timesteps(3, "meta")
+    assert scheduler.timesteps.device.type == "cpu"
+    assert scheduler.index_for_timestep(scheduler.timesteps[1]) == 1
 
 
 def test_device_control_env_var():
