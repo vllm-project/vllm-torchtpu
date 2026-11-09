@@ -79,10 +79,10 @@ scheduling call, including exceptions.
 
 Select it explicitly with
 `--scheduler-cls vllm_torchtpu.core.tpu_scheduler.TpuPrefillWindowScheduler`
-and `--prefill-schedule-interval 8`. Keep `DP_SCHED_ENABLED=0`: epic's platform
+and `--prefill-schedule-interval 4`. Keep `DP_SCHED_ENABLED=0`: epic's platform
 rejects that automatic selector combined with a custom scheduler. The current
 default scheduler is unchanged. This candidate is host-tested at PP1 with K5;
-TPU lockstep execution and throughput remain unqualified.
+the DP16 recipe below has also passed hardware serving qualification.
 
 512 stage costs and the encoder/decoder cost split are unknown. Timing
 sensitivity varies them explicitly and fits the old 2048 cost to aggregate
@@ -92,7 +92,52 @@ are hypothetical. Use
 bucket counts, occupancy and sensitivity to select candidates; do not report
 the modeled times as measured device throughput.
 
-## Future serving check
+## Measured 8-chip serving qualification
+
+On 2026-11-09, Falcon runs `exp-zmhsr0wir1` and `exp-yarpu1tn5r` compared
+epic `483575e23` with candidate `2d96daef8` on 8 physical v7x chips
+(two hosts, DP16/EP16/TP1/PP1). Both used `[288,512,2048]`, 48 requests per
+rank, CED/SWA128, DSpark K5, FP8 KV/indexer and W4A8 push. Each replay ran
+45 minutes with a 10-minute ramp: 768 closed-loop slots, 453 recorded turns
+from 16 DeepSWE trajectories, fresh generations at temperature 1/top-p .95.
+
+| Metric | Three-bucket epic | Budget fix + strict interval 4 |
+| --- | ---: | ---: |
+| Steady generation tokens/s | 13,346.7 | 20,043.6 |
+| Full replay generation tokens/s, including ramp | 12,274.1 | 18,626.0 |
+| Mean TTFT (s) | 0.920 | 1.048 |
+| Formal C768 median step (ms) | 36.017 | 35.861 |
+| Encoder 2048 forward share | 47.86% | 23.02% |
+| Decoder 2048 forward share | 1.51% | 3.87% |
+
+The combined candidate gained 50.2% steady throughput and 51.7% including
+ramp, with about 128 ms extra mean TTFT. Both completed with zero HTTP or
+transport errors, preemptions or replay compilation matches on either host.
+Input hashes, replay code, core packages, model configuration and context
+limit matched. Actual CED forward cadence agreed with engine metrics;
+these are serving observations, not isolated device-stage timings.
+
+512 compiled in encoder head/tail and decoder, and the log confirmed push
+MoE's 512 program. General Q-A/Q-B/compressor configurations and metadata
+fallbacks remain. At max_model_len 524288, the `[48,4096]` page table also
+exceeds main_records' 772-column limit on both arms. No measured-bucket
+fusion gate was broadened. Both arms already had three buckets, so this
+comparison does not isolate the speedup from adding 512.
+
+Interval 8 (`exp-rbsacceqke`) did not form the required consecutive full-DP
+decode window in the fixed 512-output burst: early requests completed
+before all requests entered decode. The formal gate failed and its replay
+did not start. Interval 4 passed the unchanged gate. This does not establish
+interval 8's unmeasured long-running throughput or an optimal interval.
+
+This is one matched serving replay, without actual tool execution or SWE
+task-success scoring. Repetition heuristics were 0.80%/0.90%, with sampling
+and right censoring. No EPLB installation occurred during either replay;
+actual layout switches and memory-pressure recovery remain unqualified.
+Commands, identities and raw summaries are in
+[the validation record](https://github.com/cjx0709/optimize-trace/pull/41).
+
+## Serving launcher
 
 The existing server launcher accepts an explicit ladder on either host:
 
@@ -101,7 +146,7 @@ python scripts/dsv41_bench/server_steps/run.py \
   --scenario decode --input INPUT --out OUTPUT \
   --compile-sizes 288 512 2048 \
   --scheduler-cls vllm_torchtpu.core.tpu_scheduler.TpuPrefillWindowScheduler \
-  --prefill-schedule-interval 8
+  --prefill-schedule-interval 4
 ```
 
 This command starts a server and is separate from the offline checks. Adding
