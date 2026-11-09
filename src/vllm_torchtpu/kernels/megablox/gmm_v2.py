@@ -1735,6 +1735,72 @@ def wait_rows(sem, ref, rows) -> None:
     lax.fori_loop(0, (rows + _WAIT_ROWS - 1) // _WAIT_ROWS, body, 0)
 
 
+def owner_token_sum(
+    tp_ref,
+    dp_ref,
+    sent_ref,
+    weight_ref,
+    t,
+    row,
+    shared,
+    *,
+    topk: int,
+    tp_size: int,
+    dtype,
+    row_shape: tuple[int, ...],
+) -> jax.Array:
+    """Owned token ``t``'s MoE output in f32, summed as the owner combine does
+    (``ragged_a2a_moe.owner_sum_kernel``). Per TP rank of the experts: per DP
+    member, its routes weighted and summed in f32 in expert order and rounded
+    once to ``dtype``; the members summed in f32 and rounded once. Then the TP
+    ranks' partials summed in f32 in rank order; with ``shared``, each rank's
+    partial first adds its shared-expert partial with one rounding.
+
+    The [K, N] SMEM refs hold, per owner-order route position ``j`` of token
+    ``t``: the TP rank of its expert (``tp_size``: none), its DP position,
+    whether an output comes for it, its weight in f32. ``row(j)`` reads route
+    ``j``'s output row and ``shared(r)`` TP rank ``r``'s shared partial (or
+    ``shared`` is None), each of ``row_shape``.
+    """
+    acc_m = jnp.zeros(row_shape, jnp.float32)
+    acc_r = jnp.zeros(row_shape, jnp.float32)
+    out = jnp.zeros(row_shape, jnp.float32)
+    parts = [jnp.zeros(row_shape, jnp.float32) for _ in range(tp_size)]
+    for j in range(topk):
+        r = tp_ref[j, t]
+        d = dp_ref[j, t]
+        x = row(j).astype(jnp.float32)
+        prod = jnp.where(sent_ref[j, t] != 0, weight_ref[j, t] * x, 0.0)
+        if j:
+            new_r = r != tp_ref[j - 1, t]
+            new_m = jnp.logical_or(new_r, d != dp_ref[j - 1, t])
+            acc_r = jnp.where(new_r, 0.0, acc_r)
+            acc_m = jnp.where(new_m, 0.0, acc_m)
+        acc_m = acc_m + prod
+        group = r < tp_size
+        if j + 1 < topk:
+            end_r = tp_ref[j + 1, t] != r
+            end_m = jnp.logical_or(end_r, dp_ref[j + 1, t] != d)
+        else:
+            end_r = end_m = True
+        part = acc_m.astype(dtype).astype(jnp.float32)
+        acc_r = acc_r + jnp.where(jnp.logical_and(group, end_m), part, 0.0)
+        part_r = acc_r.astype(dtype).astype(jnp.float32)
+        if shared is None:
+            out = out + jnp.where(jnp.logical_and(group, end_r), part_r, 0.0)
+        else:
+            done = jnp.logical_and(group, end_r)
+            parts = [
+                jnp.where(jnp.logical_and(done, r == rr), part_r, parts[rr])
+                for rr in range(tp_size)
+            ]
+    if shared is not None:
+        for rr in range(tp_size):
+            x = shared(rr).astype(jnp.float32) + parts[rr]
+            out = out + x.astype(dtype).astype(jnp.float32)
+    return out
+
+
 def _mlp_kernel(
     lhs_group_sizes_ref,
     group_offset_ref,

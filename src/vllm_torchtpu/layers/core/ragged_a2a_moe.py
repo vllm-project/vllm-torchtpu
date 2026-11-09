@@ -53,6 +53,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
 
+from vllm_torchtpu.kernels.megablox.gmm_v2 import owner_token_sum
 from vllm_torchtpu.kernels.megablox.row_copy import copy_send_rows
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
     fused_moe_func,
@@ -1140,7 +1141,8 @@ def owner_sum_kernel(
     in f32 in rank order and rounded once. With ``shared`` [tp * N, 16, H / 16]
     (TP rank ``r``'s shared-expert partial of owned token ``i`` at row
     ``r * N + i``), each TP rank's partial first adds its shared partial with
-    one rounding, as the model adds the two before its TP all-reduce."""
+    one rounding, as the model adds the two before its TP all-reduce. The
+    per-token sum is `owner_token_sum`."""
     num_tokens, topk = topk_ids.shape
     tp_size = mesh["tp_size"]
     tp_s, dp_s, sent_s, weight_s = _owner_routes(
@@ -1163,43 +1165,19 @@ def owner_sum_kernel(
             shared_ref, out_ref = rest
         base = pl.program_id(0) * tb
         for i in range(tb):
-            t = base + i
-            acc_m = jnp.zeros(row_shape, jnp.float32)
-            acc_r = jnp.zeros(row_shape, jnp.float32)
-            out = jnp.zeros(row_shape, jnp.float32)
-            parts = [jnp.zeros(row_shape, jnp.float32) for _ in range(tp_size)]
-            for j in range(topk):
-                r = tp_ref[j, t]
-                d = dp_ref[j, t]
-                row = rows_ref[j, i].astype(jnp.float32)
-                prod = jnp.where(sent_ref[j, t] != 0, weight_ref[j, t] * row, 0.0)
-                if j:
-                    new_r = r != tp_ref[j - 1, t]
-                    new_m = jnp.logical_or(new_r, d != dp_ref[j - 1, t])
-                    acc_r = jnp.where(new_r, 0.0, acc_r)
-                    acc_m = jnp.where(new_m, 0.0, acc_m)
-                acc_m = acc_m + prod
-                group = r < tp_size
-                if j + 1 < topk:
-                    end_r = tp_ref[j + 1, t] != r
-                    end_m = jnp.logical_or(end_r, dp_ref[j + 1, t] != d)
-                else:
-                    end_r = end_m = True
-                part = acc_m.astype(dtype).astype(jnp.float32)
-                acc_r = acc_r + jnp.where(jnp.logical_and(group, end_m), part, 0.0)
-                part_r = acc_r.astype(dtype).astype(jnp.float32)
-                if shared is None:
-                    out = out + jnp.where(jnp.logical_and(group, end_r), part_r, 0.0)
-                else:
-                    done = jnp.logical_and(group, end_r)
-                    parts = [
-                        jnp.where(jnp.logical_and(done, r == rr), part_r, parts[rr])
-                        for rr in range(tp_size)
-                    ]
-            if shared_ref is not None:
-                for rr in range(tp_size):
-                    x = shared_ref[rr, i].astype(jnp.float32) + parts[rr]
-                    out = out + x.astype(dtype).astype(jnp.float32)
+            out = owner_token_sum(
+                tp_ref,
+                dp_ref,
+                sent_ref,
+                weight_ref,
+                base + i,
+                lambda j, i=i: rows_ref[j, i],
+                None if shared_ref is None else (lambda r, i=i: shared_ref[r, i]),
+                topk=topk,
+                tp_size=tp_size,
+                dtype=dtype,
+                row_shape=row_shape,
+            )
             out_ref[i] = out.astype(out_ref.dtype)
 
     in_specs = [
