@@ -38,8 +38,9 @@ spare slots holding replicas of hot experts:
     keyed by the model's `runner_type`, never by layer index.
 
   * DYNAMIC EPLB (`TPU_MOE_EPLB_DYNAMIC=1`, expert_relayout.py): the target
-    layers start from an initial layout and are re-laid at runtime from the
-    kernel's load counts. Without a static layout the initial layout is blind
+    layers and the drafter's, each model its own group, start from an initial
+    layout and are re-laid at runtime from the kernel's load counts. Without a
+    static layout (or its group) the initial layout is blind
     (zero prior profiling): EP rank `r` holds its contiguous block plus the
     first expert of the next rank in one redundant active slot
     (`DEFAULT_EXTRA_SLOTS`). With a static layout, that layout is the initial
@@ -109,9 +110,10 @@ _LAYER_MODULES: dict[tuple[str, int], object] = {}
 # process. The fetch-time filter consults the layout only for these, so a
 # model whose MoE method never applied it keeps the default filter.
 _APPLIED_LAYERS: set[tuple[str, int]] = set()
-# The active Dynamic EPLB group of the target model's MoE layers, built when
-# the first target layer is placed with `TPU_MOE_EPLB_DYNAMIC` on.
-_GROUP: "Group | None" = None
+# The active Dynamic EPLB groups by name: the target model's MoE layers and
+# the drafter's, each built when its first layer is placed with
+# `TPU_MOE_EPLB_DYNAMIC` on.
+_GROUPS: dict[str, "Group"] = {}
 _LOCK = threading.Lock()
 
 
@@ -380,11 +382,21 @@ def static_placement(vllm_config=None) -> Placement | None:
     return _load(resolve(value)) if value else None
 
 
-def current(vllm_config=None) -> Group | None:
-    """The process's active Dynamic EPLB group, or None when it is off."""
+def current(vllm_config=None) -> Placement | None:
+    """The process's active Dynamic EPLB groups, or None when it is off: the
+    target group and, once the drafter placed a layer, the drafter's."""
     del vllm_config
     with _LOCK:
-        return _GROUP
+        target = _GROUPS.get(TARGET)
+        if target is None:
+            return None
+        return Placement(target=target, draft=_GROUPS.get(DRAFT))
+
+
+def dynamic_group(name: str) -> Group | None:
+    """The active Dynamic EPLB group of `name` ("target" or "draft"), or None."""
+    with _LOCK:
+        return _GROUPS.get(name)
 
 
 def layer_index(name: str) -> int | None:
@@ -422,20 +434,19 @@ def _is_draft_runner() -> bool:
 
 
 def has_applied_layers() -> bool:
-    """Whether any layout gates the fetch-time filter: the dynamic group covers
-    every target layer once it exists; a static layout covers the layers an
-    MoE method applied it to."""
-    return _GROUP is not None or bool(_APPLIED_LAYERS)
+    """Whether any layout gates the fetch-time filter: a dynamic group covers
+    every layer of its model once it exists; a static layout covers the layers
+    an MoE method applied it to."""
+    return bool(_GROUPS) or bool(_APPLIED_LAYERS)
 
 
 def _group_for(key: tuple[str, int]) -> Group | None:
-    """The group a placed (group, layer) follows: the dynamic group for target
-    layers while Dynamic EPLB is on, else the static layout's group."""
+    """The group a placed (group, layer) follows: its dynamic group while
+    Dynamic EPLB is on, else the static layout's group."""
     group_name = key[0]
-    if group_name == TARGET:
-        dynamic = current()
-        if dynamic is not None:
-            return dynamic
+    dynamic = dynamic_group(group_name)
+    if dynamic is not None:
+        return dynamic
     placement = static_placement()
     return placement.group(group_name) if placement is not None else None
 
@@ -461,12 +472,11 @@ def fetch_filter_ids(name: str, ep_rank: int) -> frozenset[int] | None:
     if key is None:
         return None
     group_name, layer = key
-    if group_name == TARGET:
-        dynamic = current()
-        if dynamic is not None:
-            # Dynamic EPLB lays out every target layer, blind default included.
-            ranks = dynamic.ranks(layer)
-            return None if ranks is None else frozenset(ranks[ep_rank])
+    dynamic = dynamic_group(group_name)
+    if dynamic is not None:
+        # Dynamic EPLB lays out every layer of its group, blind default included.
+        ranks = dynamic.ranks(layer)
+        return None if ranks is None else frozenset(ranks[ep_rank])
     if key not in _APPLIED_LAYERS:
         return None
     placement = static_placement()
@@ -480,15 +490,14 @@ def apply_to_layer(layer) -> bool:
 
     Must run before the weights load (from `VllmQuantConfig.get_moe_config` or
     the MoE method's `create_weights`). A layer the static layout lists takes
-    that layout; with `TPU_MOE_EPLB_DYNAMIC` a target layer also joins the
-    dynamic group (the static ranks as its initial layout, or the blind
-    default) and gains the staging slots. Registers the slot table the fused
-    EP op and `moe_routing.route` take. Idempotent if called more than once on
-    the same layer. Returns whether the layer is placed.
+    that layout; with `TPU_MOE_EPLB_DYNAMIC` a target or drafter layer also
+    joins its model's dynamic group (the static ranks as its initial layout,
+    or the blind default) and gains the staging slots. Registers the slot
+    table the fused EP op and `moe_routing.route` take. Idempotent if called
+    more than once on the same layer. Returns whether the layer is placed.
     """
     import torch
 
-    global _GROUP
     if expert_slot_table(layer) is not None:
         return True
     group_name, base = _runner_group()
@@ -501,7 +510,7 @@ def apply_to_layer(layer) -> bool:
     placement = static_placement()
     static_group = placement.group(group_name) if placement is not None else None
     static_ranks = static_group.ranks(layer_idx) if static_group is not None else None
-    dynamic = bool(envs.TPU_MOE_EPLB_DYNAMIC) and group_name == TARGET
+    dynamic = bool(envs.TPU_MOE_EPLB_DYNAMIC)
     if not dynamic and static_ranks is None:
         return False
 
@@ -532,7 +541,7 @@ def apply_to_layer(layer) -> bool:
     if dynamic:
         per_shard = experts // shards
         with _LOCK:
-            group = _GROUP
+            group = _GROUPS.get(group_name)
             if group is None:
                 if static_group is not None:
                     active = static_group.slots
@@ -550,7 +559,7 @@ def apply_to_layer(layer) -> bool:
                     layers=layers,
                     blind_fallback=True,
                 )
-                _GROUP = group
+                _GROUPS[group_name] = group
             elif group.experts != experts or group.shards != shards:
                 raise ValueError(
                     f"expert placement is for {group.shards} ranks x "
@@ -639,7 +648,7 @@ def physical_experts(layer) -> int | None:
     if expert_slot_table(layer) is None:
         return None
     key = layout_key(layer)
-    group = _group_for(key) if key is not None else current()
+    group = _group_for(key) if key is not None else dynamic_group(TARGET)
     return group.physical if group is not None else None
 
 
