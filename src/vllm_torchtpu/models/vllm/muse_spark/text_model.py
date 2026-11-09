@@ -104,6 +104,7 @@ from .batch_invariant import (
     rms_normalize,
 )
 from .configuration import (
+    MuseSparkConfig,
     MuseSparkDSparkConfig,
     MuseSparkTextConfig,
 )
@@ -192,6 +193,29 @@ def normalize_muse_spark_quant_config(
             seen.add(item)
 
 
+# MuseSparkDSparkModel always builds these blocks, so a draft config that
+# turns one off describes a different architecture.
+_DSPARK_ALWAYS_ON_FLAGS = (
+    "use_qk_norm",
+    "use_attn_o_gate",
+    "use_attn_o_norm",
+    "use_residual_gate",
+)
+
+
+def _reject_unsupported_dspark_config(hf_cfg: Any) -> None:
+    """Raise for Muse DSpark draft settings MuseSparkDSparkModel cannot run.
+
+    Keys a config does not set keep the model's behavior.
+    """
+    disabled = [f for f in _DSPARK_ALWAYS_ON_FLAGS if getattr(hf_cfg, f, True) is False]
+    if disabled:
+        raise ValueError(
+            f"Muse Spark DSpark draft sets {disabled} to False; the TPU DSpark "
+            "model only implements these blocks enabled."
+        )
+
+
 class TPUMuseSparkConfig(VerifyAndUpdateConfig):
     """MODELS_CONFIG_MAP hook for Muse Spark Open on TPU."""
 
@@ -212,6 +236,33 @@ class TPUMuseSparkConfig(VerifyAndUpdateConfig):
             )
             cache_config.block_size = 128  # type: ignore[assignment]
             cache_config.user_specified_block_size = True
+
+        spec_config = vllm_config.speculative_config
+        if (
+            spec_config is not None
+            and spec_config.method == "dspark"
+            and spec_config.draft_model_config is not None
+        ):
+            draft_cfg = spec_config.draft_model_config
+            hf_cfg = draft_cfg.hf_config
+            target_hf = vllm_config.model_config.hf_config
+            is_muse_target = isinstance(
+                target_hf,
+                (MuseSparkConfig, MuseSparkTextConfig, MuseSparkDSparkConfig),
+            )
+            if hf_cfg is not None and (
+                is_muse_target or isinstance(hf_cfg, MuseSparkDSparkConfig)
+            ):
+                _reject_unsupported_dspark_config(hf_cfg)
+                cast(Any, hf_cfg).model_type = "muse_spark_dspark"
+                hf_cfg.architectures = ["MuseSparkDSparkModel"]
+                # vLLM gives a dspark draft the target's quantization (and
+                # copies its quantization_config); the Muse draft is bf16.
+                # A quantized draft checkpoint still fails loudly at load:
+                # its scale tensors have no matching bf16 parameter.
+                draft_cfg.quantization = None
+                draft_cfg.quantization_config = None
+                spec_config.update_arch_()
 
 
 class MuseSparkRMSNorm(nn.Module):
