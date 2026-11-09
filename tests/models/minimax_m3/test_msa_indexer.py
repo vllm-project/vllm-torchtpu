@@ -274,7 +274,9 @@ def test_skip_dead_matches_reference_arm(q_lens, ctx_lens, layout, monkeypatch):
     ].reshape(num_seqs, PAGES_PER_SEQ)
     raw = rng.standard_normal((NUM_PAGES, PAGE, HEAD_DIM))
     if layout == "fp4_folded":
-        nib, scale = msa_fp4.quantize(msa_fp4.rotate_keys(jnp.asarray(raw, jnp.float32)))
+        nib, scale = msa_fp4.quantize(
+            msa_fp4.rotate_keys(jnp.asarray(raw, jnp.float32))
+        )
         cache = msa_fp4.pack_rows(nib, scales=scale)
     else:
         dtype = jnp.bfloat16 if layout == "bf16" else jnp.float8_e4m3fn
@@ -308,3 +310,188 @@ def test_skip_dead_matches_reference_arm(q_lens, ctx_lens, layout, monkeypatch):
         np.testing.assert_array_equal(
             got[rows, :num_pages].view(np.uint32), ref[rows, :num_pages].view(np.uint32)
         )
+
+
+def _packed_case(q_lens, ctx_lens, layout, heads, seed):
+    """Folded-row batch (`heads` index heads per token) on a 16-page table."""
+    from vllm_torchtpu.models.minimax_m3.kernels import msa_fp4
+
+    pages_per_seq, num_pages, max_seqs = 16, 72, 6
+    rng = np.random.default_rng(seed)
+    num_seqs = len(q_lens)
+    rows = [heads * q for q in q_lens]
+    num_real = sum(rows)
+    num_tokens = num_real + 5  # padding rows after the last request
+    seq_lens = np.zeros(max_seqs, np.int32)
+    seq_lens[:num_seqs] = np.array(ctx_lens) + np.array(q_lens)
+    cu_q = np.full(max_seqs + 1, num_real, np.int32)
+    cu_q[: num_seqs + 1] = np.concatenate([[0], np.cumsum(rows)])
+    tables = np.zeros((max_seqs, pages_per_seq), np.int32)
+    tables[:num_seqs] = rng.integers(1, num_pages, (num_seqs, pages_per_seq))
+    raw = rng.standard_normal((num_pages, PAGE, HEAD_DIM))
+    raw[5] = raw[5, :1]  # every token of a page ties
+    raw[7, :, :] = raw[9]  # two pages tie
+    if layout == "fp4_folded":
+        nib, scale = msa_fp4.quantize(
+            msa_fp4.rotate_keys(jnp.asarray(raw, jnp.float32))
+        )
+        scale = scale.at[3, 7].set(jnp.inf).at[4, 9].set(jnp.nan)  # unwritten slots
+        cache = msa_fp4.pack_rows(nib, scales=scale)
+    else:
+        dtype = jnp.bfloat16 if layout == "bf16" else jnp.float8_e4m3fn
+        cache = pack(rounded(raw, dtype), dtype)
+    index_q = jnp.asarray(rng.standard_normal((num_tokens, 1, HEAD_DIM))).astype(
+        jnp.bfloat16
+    )
+    index_q = index_q.at[2].set(index_q[1])  # tied query rows
+    args = (
+        index_q,
+        cache,
+        jnp.asarray(seq_lens),
+        jnp.asarray(tables.reshape(-1)),
+        jnp.asarray(cu_q),
+        jnp.int32(num_seqs),
+    )
+    return args, seq_lens, cu_q, num_seqs
+
+
+def _packed_scores(args, packed_rows, dma_mode="group", dma_group=4):
+    """`block_scores` with 16-page small steps and DMA groups of `dma_group`
+    pages (4: dot groups span DMA groups; 16: served alignment)."""
+    from vllm_torchtpu.models.minimax_m3.kernels import msa_indexer
+
+    saved = msa_indexer.DMA_MODE, msa_indexer.DMA_GROUP
+    msa_indexer.DMA_MODE, msa_indexer.DMA_GROUP = dma_mode, dma_group
+    jax.clear_caches()
+    try:
+        return np.asarray(
+            block_scores(
+                *args,
+                large_block_q=256,
+                pages_per_step=4,
+                small_pages_per_step=16,
+                packed_rows=packed_rows,
+                interpret=True,
+            )
+        )[:, 0]
+    finally:
+        msa_indexer.DMA_MODE, msa_indexer.DMA_GROUP = saved
+        jax.clear_caches()
+
+
+def _assert_same_visible(got, ref, seq_lens, cu_q, num_seqs):
+    assert got.shape == ref.shape
+    for r in range(num_seqs):
+        num_pages = -(-seq_lens[r] // PAGE)
+        rows = slice(cu_q[r], cu_q[r + 1])
+        np.testing.assert_array_equal(
+            got[rows, :num_pages].view(np.uint32), ref[rows, :num_pages].view(np.uint32)
+        )
+
+
+# (q_lens, ctx_lens, heads, packed_rows)
+PACKED_CASES = [
+    # DCP2-style decode (1 head x 8 tokens, the served packing): 16 pages
+    # per dot; 1..16 pages, dead DMA groups and dead pages inside live packs
+    ([8, 8, 1, 8], [0, 2000, 5, 1200], 1, 8),
+    # unaligned folded starts, every request packable (4 heads, 32-row tiles)
+    ([1, 5, 2, 8, 3], [129, 600, 300, 1015, 40], 4, 32),
+    # a block_q (40 rows) and a large (260 rows) request: the v29 classes
+    ([1, 5, 10, 8, 65], [129, 600, 300, 1015, 40], 4, 32),
+    ([8, 3, 8], [500, 70, 1990], 2, 16),
+    ([30, 8], [800, 64], 2, 64),
+]
+
+
+@pytest.mark.parametrize("layout", ["bf16", "fp8", "fp4_folded"])
+@pytest.mark.parametrize("q_lens,ctx_lens,heads,packed_rows", PACKED_CASES)
+def test_packed_matches_unpacked(q_lens, ctx_lens, heads, packed_rows, layout):
+    """The packed tile class (`packed_rows`: 128 / packed_rows pages share
+    each dot against a block-diagonal query) and the grouped page DMAs give
+    v29's scores (per-page DMAs, 128-row tiles) bit for bit on every page of
+    every request, including tied pages, tied rows, -inf dead groups and
+    non-finite 4-bit scales."""
+    args, seq_lens, cu_q, n = _packed_case(
+        q_lens, ctx_lens, layout, heads, sum(ctx_lens) + heads
+    )
+    ref = _packed_scores(args, None, dma_mode="v29")
+    _assert_same_visible(_packed_scores(args, None), ref, seq_lens, cu_q, n)
+    _assert_same_visible(_packed_scores(args, packed_rows), ref, seq_lens, cu_q, n)
+    _assert_same_visible(
+        _packed_scores(args, packed_rows, dma_group=16), ref, seq_lens, cu_q, n
+    )
+    _assert_same_visible(
+        _packed_scores(args, packed_rows, dma_mode="v29"), ref, seq_lens, cu_q, n
+    )
+
+
+@pytest.mark.parametrize(
+    "fault,case",
+    [
+        ("blocks_swapped", 0),  # every packed request
+        ("rows_shifted", 1),  # every packed request
+        ("dma_last_page", 0),  # requests with a page past the first group
+    ],
+)
+def test_packed_fault_controls(fault, case, monkeypatch):
+    """Broken packing / DMAs must fail the parity check: query blocks paired
+    with the wrong pages, packed tiles reading their query rows one off, or
+    the last DMA group of a request not fetched."""
+    from vllm_torchtpu.models.minimax_m3.kernels import msa_indexer
+
+    q_lens, ctx_lens, heads, packed_rows = PACKED_CASES[case]
+    args, seq_lens, cu_q, n = _packed_case(
+        q_lens, ctx_lens, "fp4_folded", heads, sum(ctx_lens) + heads
+    )
+    ref = _packed_scores(args, None)
+    if fault == "blocks_swapped":
+        orig = msa_indexer._block_diagonal
+
+        def swapped(q, pack):
+            bd = orig(q, pack)
+            rows = q.shape[0]
+            return jnp.concatenate([bd[rows:], bd[:rows]], axis=0)
+
+        monkeypatch.setattr(msa_indexer, "_block_diagonal", swapped)
+    elif fault == "rows_shifted":
+        orig = msa_indexer._packed_query_rows
+        monkeypatch.setattr(
+            msa_indexer, "_packed_query_rows", lambda r, n: orig(r, n) + 1
+        )
+    else:  # grouped DMAs fetch one page short
+        orig = msa_indexer._per_group
+        monkeypatch.setattr(
+            msa_indexer,
+            "_per_group",
+            lambda fn, pages, live: orig(fn, pages, jnp.maximum(live - 4, 1)),
+        )
+    got = _packed_scores(args, packed_rows)
+    with pytest.raises(AssertionError):
+        _assert_same_visible(got, ref, seq_lens, cu_q, n)
+
+
+@pytest.mark.parametrize(
+    "dtype,packed_rows",
+    [(jnp.uint8, 32), (jnp.uint8, 8), (jnp.float8_e4m3fn, 8), (jnp.float8_e4m3fn, 32)],
+)
+def test_packed_lowers_for_tpu(dtype, packed_rows):
+    """Packed tiles at served shapes (DCP8 c64 with 4 folded heads, or 1
+    head) lower for TPU7x."""
+    rows_per_page = 17 if dtype == jnp.uint8 else PAGE // PACKING[dtype]
+    tokens, max_seqs, pages_per_seq = 2048, 64, 256
+    args = (
+        jax.ShapeDtypeStruct((tokens, 1, HEAD_DIM), jnp.bfloat16),
+        jax.ShapeDtypeStruct((4096, rows_per_page, 4, HEAD_DIM), dtype),
+        jax.ShapeDtypeStruct((max_seqs,), jnp.int32),
+        jax.ShapeDtypeStruct((max_seqs * pages_per_seq,), jnp.int32),
+        jax.ShapeDtypeStruct((max_seqs + 1,), jnp.int32),
+        jax.ShapeDtypeStruct((), jnp.int32),
+    )
+    tpu7x = AbstractMesh((), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu"))
+    with use_abstract_mesh(tpu7x):
+        lowered = (
+            jax.jit(functools.partial(block_scores, packed_rows=packed_rows))
+            .trace(*args)
+            .lower(lowering_platforms=("tpu",))
+        )
+    assert lowered.as_text().count("tpu_custom_call") >= 2
