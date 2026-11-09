@@ -569,13 +569,14 @@ def _patch_vllm_compile_all_ranges() -> None:
             else:
                 # In the order the owners finish them: by turn, small first.
                 others.append(
-                    (turn, range_entry.compile_range.end, backend, range_entry)
+                    (turn, range_entry.compile_range.end, owner, backend, range_entry)
                 )
 
-        for backend, range_entry in mine:
-            compile_entry(backend, range_entry)
-        with wait_for_peer_artifact(PEER_WAIT_S):
-            for _, _, backend, range_entry in sorted(others, key=lambda o: o[:2]):
+        with wait_for_peer_artifact(0.0, owner_slot=slot):
+            for backend, range_entry in mine:
+                compile_entry(backend, range_entry)
+        for _, _, owner, backend, range_entry in sorted(others, key=lambda o: o[:2]):
+            with wait_for_peer_artifact(PEER_WAIT_S, owner_slot=owner):
                 compile_entry(backend, range_entry)
 
     def compile_all_ranges(self) -> None:

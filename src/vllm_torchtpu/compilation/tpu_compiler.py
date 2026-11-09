@@ -21,6 +21,7 @@ pipeline. Each shape bucket gets its own compiled executable.
 import contextlib
 import copy
 import dataclasses
+import fcntl
 import glob
 import hashlib
 import importlib.util
@@ -31,7 +32,7 @@ import re
 import shutil
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Any
@@ -41,6 +42,7 @@ import torch._guards
 import torch.fx as fx
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from torch_tpu._internal.compile._backend import TpuBackend
+from vllm import envs as vllm_envs
 from vllm.compilation.compiler_interface import CompilerInterface
 from vllm.config import VllmConfig
 from vllm.config.utils import Range
@@ -86,35 +88,52 @@ class TpuCompilationHandle:
 
 _tpu_backend = TpuBackend()
 
-# How long a rank waits for the rank of its host that compiles a bucket, and
-# how often it looks. The wait is bounded for a peer that never saves the
-# artifact (its serialize() failed, it crashed, or it does not exist); the rank
-# then compiles the bucket itself. A single bucket compiles in well under this
-# even with every rank of the host compiling at once (~165 s for the biggest
-# Qwen3.5-397B bucket at DP8), so a timeout costs one redundant compile rather
-# than stalling startup for an hour.
+# Discovery budget when no compatible owner holds a compilation lease.
+# A live compatible owner may use the existing engine-ready timeout instead.
 PEER_WAIT_S = 600.0
 _PEER_POLL_S = 0.5
 # get_attr tensors up to this size are hashed by value; bigger ones, which are
 # weights rather than constants, by dtype and shape.
 _FINGERPRINT_MAX_NUMEL = 1 << 16
 
-_peer_wait = threading.local()
+
+class _PeerWait(threading.local):
+    timeout_s = 0.0
+    owner_slot: int | None = None
+
+
+_peer_wait = _PeerWait()
+
+
+@dataclasses.dataclass(frozen=True)
+class _PeerOwner:
+    fingerprint: str
+    live: bool
 
 
 @contextlib.contextmanager
-def wait_for_peer_artifact(timeout_s: float):
-    """Within this block, `compile` waits up to `timeout_s` for another rank
-    of this host to save the bucket, and replays it, before compiling it.
+def wait_for_peer_artifact(timeout_s: float, owner_slot: int | None = None):
+    """Wait for a peer artifact, or compile locally when it is unavailable.
+
+    `timeout_s` bounds discovery. A compatible owner's held lease permits
+    waiting up to VLLM_ENGINE_READY_TIMEOUT_S from this compile's wait entry.
+    The engine client independently enforces its overall startup deadline.
 
     Outside it, `compile` still replays an artifact a peer has already saved,
     but does not wait for one.
+
+    `owner_slot` identifies the range's assigned host-local owner. Only that
+    owner's advice can end the wait early; advice never authorizes replay.
+    Unlocked advice cannot extend discovery; only strict artifact validation
+    authorizes replay.
     """
+    previous = _peer_wait.timeout_s, _peer_wait.owner_slot
     _peer_wait.timeout_s = timeout_s
+    _peer_wait.owner_slot = owner_slot
     try:
         yield
     finally:
-        _peer_wait.timeout_s = 0.0
+        _peer_wait.timeout_s, _peer_wait.owner_slot = previous
 
 
 def _graph_fingerprint(graph: fx.GraphModule) -> str | None:
@@ -761,15 +780,140 @@ class TpuCompilerAdaptor(CompilerInterface):
         time, or what appeared was built from a different graph -- then the
         ranks do not trace the same program and waiting on would not help.
         """
-        deadline = time.monotonic() + getattr(_peer_wait, "timeout_s", 0.0)
+        start = time.monotonic()
+        deadline = start + _peer_wait.timeout_s
+        live_deadline = start + max(0, vllm_envs.VLLM_ENGINE_READY_TIMEOUT_S)
         paths = self._peer_paths(key)
-        while not paths and time.monotonic() < deadline:
-            time.sleep(_PEER_POLL_S)
+        while not paths and _peer_wait.timeout_s > 0.0:
+            owners = []
+            pending = False
+            advice_key = f"{key}.owner_{_peer_wait.owner_slot}.fingerprint"
+            advice_paths = (
+                set(self._peer_paths(advice_key))
+                if _peer_wait.owner_slot is not None
+                else set()
+            )
+            if _peer_wait.owner_slot is not None:
+                advice_paths.update(
+                    path.removesuffix(".lock")
+                    for path in self._peer_paths(f"{advice_key}.lock")
+                )
+            for path in advice_paths:
+                try:
+                    with contextlib.ExitStack() as readers:
+                        publishing = False
+                        with contextlib.suppress(FileNotFoundError):
+                            publisher = readers.enter_context(open(f"{path}.lock"))
+                            try:
+                                fcntl.flock(publisher, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                            except BlockingIOError:
+                                publishing = True
+                        try:
+                            advice = readers.enter_context(open(path))
+                        except FileNotFoundError:
+                            pending |= publishing
+                            continue
+                        value = advice.read()
+                        try:
+                            fcntl.flock(advice, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                        except BlockingIOError:
+                            live = True
+                        else:
+                            live = False
+                        if publishing and not live:
+                            pending = True
+                            continue
+                except (OSError, UnicodeError):
+                    continue
+                if re.fullmatch(r"[0-9a-f]{64}", value):
+                    owners.append(_PeerOwner(value, live))
+            matching = [owner for owner in owners if owner.fingerprint == fingerprint]
+            if owners and not matching and not pending:
+                # Artifact publication may race with reading the advice.
+                paths = self._peer_paths(key)
+                if paths:
+                    break
+                logger.info(
+                    "[TpuCompilerAdaptor] Compiling %s locally: assigned owner "
+                    "slot %d advertised a different graph",
+                    key,
+                    _peer_wait.owner_slot,
+                )
+                return None
+            live = any(owner.live for owner in matching)
+            if matching and not live and not pending:
+                # Closing the lease publishes completion even if no bundled
+                # entry could be saved. Recheck the artifact after that close.
+                paths = self._peer_paths(key)
+                break
+            now = time.monotonic()
+            limit = live_deadline if live else min(deadline, live_deadline)
+            if now >= limit:
+                logger.info(
+                    "[TpuCompilerAdaptor] Compiling %s locally: peer wait "
+                    "deadline reached (compatible live owner=%s)",
+                    key,
+                    live,
+                )
+                break
+            time.sleep(min(_PEER_POLL_S, limit - now))
             paths = self._peer_paths(key)
         if not paths:
             return None
         compiled_fn = self._replay(paths[0], graph, was_wrapped, fingerprint)
         return None if compiled_fn is None else (compiled_fn, paths[0])
+
+    @contextlib.contextmanager
+    def _publish_peer_fingerprint(
+        self, key: str, fingerprint: str, owner_slot: int
+    ) -> Iterator[None]:
+        """Hold a process lease from atomic advice publication through save."""
+        assert self.cache_dir is not None
+        path = os.path.join(self.cache_dir, f"{key}.owner_{owner_slot}.fingerprint")
+        tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+        with contextlib.ExitStack() as leases:
+            try:
+                os.makedirs(self.cache_dir, exist_ok=True)
+                # Keep this inode: unlinking a lock file permits two publishers
+                # to lock different files under the same pathname.
+                publisher = leases.enter_context(open(f"{path}.lock", "a"))
+                deadline = time.monotonic() + max(
+                    0, vllm_envs.VLLM_ENGINE_READY_TIMEOUT_S
+                )
+                while True:
+                    try:
+                        fcntl.flock(publisher, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        # A reader's transient shared guard must not prevent
+                        # publication. An already leased inode is another writer.
+                        with (
+                            contextlib.suppress(FileNotFoundError),
+                            open(path) as existing,
+                        ):
+                            fcntl.flock(existing, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                        now = time.monotonic()
+                        if now >= deadline:
+                            raise
+                        time.sleep(min(_PEER_POLL_S, deadline - now))
+                advice = leases.enter_context(open(tmp, "w"))
+                fcntl.flock(advice, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                advice.write(fingerprint)
+                advice.flush()
+                # A reader sees either the previous publication or a locked,
+                # fully written fingerprint, never new liveness with old data.
+                os.replace(tmp, path)
+            except OSError as e:
+                leases.close()
+                logger.warning(
+                    "[TpuCompilerAdaptor] Could not publish fingerprint %s: %s",
+                    path,
+                    e,
+                )
+            finally:
+                with contextlib.suppress(OSError):
+                    os.remove(tmp)
+            yield
 
     @staticmethod
     def _link_artifact(src: str, dst: str) -> bool:
@@ -874,39 +1018,40 @@ class TpuCompilerAdaptor(CompilerInterface):
                 shape_variants.remember(self.cache_dir, key, graph, compiled_fn)
             return compiled_fn, handle
 
-        compiled_fn, entry = self._run_backend(graph, example_inputs)
+        owner_lease = (
+            self._publish_peer_fingerprint(key, fingerprint, _peer_wait.owner_slot)
+            if (
+                fingerprint is not None
+                and _peer_wait.timeout_s == 0.0
+                and _peer_wait.owner_slot is not None
+                and key is not None
+            )
+            else contextlib.nullcontext()
+        )
+        with owner_lease:
+            compiled_fn, entry = self._run_backend(graph, example_inputs)
+
+            # The wrapper and executable must be persisted together; rebuilding
+            # a wrapper from a fresh trace can change its padded input contract.
+            handle = None
+            if caching and entry is not None:
+                assert self.cache_dir is not None
+                save_path = os.path.join(self.cache_dir, key)
+                if self._save_handle(
+                    key, save_path, entry, graph, was_wrapped, fingerprint
+                ):
+                    handle = (key, save_path, was_wrapped)
+            elif caching:
+                logger.info(
+                    "[TpuCompilerAdaptor] No serializable artifact for range %s; "
+                    "it will be recompiled on the next start",
+                    compile_range,
+                )
 
         if was_wrapped:
             # Undo _ensure_tuple_output on the result side, so callers see the
             # single tensor the original graph returned.
             compiled_fn = self._unwrap_compiled_fn(compiled_fn)
-
-        # Persist torch's bundled AOTAutograd entry -- the aot_autograd wrapper
-        # metadata and the compiled executable as one object. It has to be one
-        # object: `load` cannot rebuild a wrapper from a fresh trace and pair
-        # it with a separately-fetched executable, because nothing at that
-        # point can check the two describe the same program, and a mismatch is
-        # only observable once the program runs -- as e0102
-        # RuntimeProgramInputMismatch if the padded input buffers differ in
-        # size, and as a silently wrong result if they happen not to.
-        #
-        # When the Tier-3 C++ persistent cache is active torch_tpu also keeps
-        # the PJRT binary itself (torch_tpu_tier3/*.bin); that covers the
-        # recompile path in `load`, not this one.
-        handle = None
-        if caching and entry is not None:
-            assert self.cache_dir is not None
-            save_path = os.path.join(self.cache_dir, key)
-            if self._save_handle(
-                key, save_path, entry, graph, was_wrapped, fingerprint
-            ):
-                handle = (key, save_path, was_wrapped)
-        elif caching:
-            logger.info(
-                "[TpuCompilerAdaptor] No serializable artifact for range %s; "
-                "it will be recompiled on the next start",
-                compile_range,
-            )
 
         # Offer this bucket to later traces of the same model, so a graph that
         # refuses it reuses this runnable instead of building a second
