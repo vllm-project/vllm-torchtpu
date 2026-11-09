@@ -39,6 +39,9 @@ import jax
 import torch
 from torch_tpu._internal import pallas
 
+from vllm_torchtpu.kernels.diffusion_attention.minimax_qk_norm_rope import (
+    fused_minimax_qk_norm_rope,
+)
 from vllm_torchtpu.kernels.diffusion_attention.qk_norm_rope import qk_norm_rope
 
 
@@ -215,3 +218,104 @@ def wan_self_attention_fused(
     out = attn.attn(query, key, value, attn_metadata)
     out = out.flatten(2, 3).type_as(query)
     return attn.dropout(attn.to_out(out))
+
+
+_MINIMAX_QK_NORM_ROPE_OP = None
+
+
+@run_once
+def _minimax_qk_norm_rope_op():
+    """Builds the torch custom op wrapping MiniMax-H3's fused QK RMSNorm + RoPE."""
+
+    def minimax_qk_norm_rope(
+        q: jax.Array,
+        k: jax.Array,
+        wq: jax.Array,
+        wk: jax.Array,
+        rope_table: jax.Array,
+        eps: float,
+        rotary_dim: int,
+    ) -> tuple[jax.Array, jax.Array]:
+        return fused_minimax_qk_norm_rope(
+            q,
+            k,
+            wq,
+            wk,
+            rope_table,
+            rot_dim=rotary_dim,
+            eps=eps,
+        )
+
+    op = pallas.jax_op("pallas::minimax_qk_norm_rope", minimax_qk_norm_rope)
+
+    def fake(q, k, wq, wk, rope_table, eps, rotary_dim):
+        del wq, wk, rope_table, eps, rotary_dim
+        return torch.empty_like(q), torch.empty_like(k)
+
+    op.register_fake(fake)
+    return op
+
+
+def register_minimax_qk_norm_rope_op() -> None:
+    """Pre-register the MiniMax-H3 QK RMSNorm + RoPE custom op outside compile."""
+    global _MINIMAX_QK_NORM_ROPE_OP
+    if _MINIMAX_QK_NORM_ROPE_OP is None:
+        _MINIMAX_QK_NORM_ROPE_OP = _minimax_qk_norm_rope_op()
+
+
+def can_fuse_minimax_qk_norm_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    rope_table: torch.Tensor,
+    head_dim: int,
+    rotary_dim: int,
+    interleaved: bool,
+) -> bool:
+    """Whether ``fused_qk_norm_rope`` inputs fit the MiniMax-H3 Pallas kernel."""
+    return (
+        not interleaved
+        and head_dim == 128
+        and rotary_dim == 96
+        and q.device.type == "tpu"
+        and k.device.type == "tpu"
+        and q.dtype == torch.bfloat16
+        and k.dtype == torch.bfloat16
+        and q.ndim == 3
+        and k.ndim == 3
+        and q.shape[0] > 0
+        and q.shape[0] == k.shape[0]
+        and q.shape[2] == 128
+        and k.shape[2] == 128
+        and q_weight.shape == (128,)
+        and k_weight.shape == (128,)
+        and rope_table.ndim == 2
+        and rope_table.shape == (q.shape[0], 96)
+    )
+
+
+def minimax_fused_qk_norm_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    rope_table: torch.Tensor,
+    eps: float,
+    rotary_dim: int = 96,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run MiniMax-H3 fused QK RMSNorm + half-split RoPE on TPU via Pallas."""
+    op = _MINIMAX_QK_NORM_ROPE_OP
+    if op is None:
+        register_minimax_qk_norm_rope_op()
+        op = _MINIMAX_QK_NORM_ROPE_OP
+    assert op is not None
+    return op(
+        q.contiguous(),
+        k.contiguous(),
+        q_weight.contiguous(),
+        k_weight.contiguous(),
+        rope_table.contiguous(),
+        float(eps),
+        int(rotary_dim),
+    )
