@@ -299,9 +299,7 @@ def _work_tiles(selected: jax.Array, block_q: int, pages_per_step: int):
     per_tile = jnp.where(selected < 0, msa_attention._NO_PAGE, selected).reshape(
         num_tiles, union_size
     )
-    union = jax.vmap(
-        lambda x: jnp.unique(x, size=union_size, fill_value=msa_attention._NO_PAGE)
-    )(per_tile)
+    union = msa_attention.tile_unions(per_tile)
     union = jnp.where(union == msa_attention._NO_PAGE, -1, union)
     union = jnp.pad(union, ((0, 0), (0, slots - union_size)), constant_values=-1)
     pages_in_tile = (union >= 0).sum(axis=1)

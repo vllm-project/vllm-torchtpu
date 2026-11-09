@@ -348,6 +348,29 @@ def _kernel_v2(
 _KERNELS = {"v1": _kernel_v1, "v2": _kernel_v2}
 
 
+def tile_unions(per_tile: jax.Array) -> jax.Array:
+    """``jnp.unique(row, size=row.size, fill_value=_NO_PAGE)`` of every row
+    of ``per_tile [..., N]``: each row's distinct values ascending, then
+    `_NO_PAGE` padding.
+
+    Built as sort, duplicates -> `_NO_PAGE`, sort again, so the result is the
+    same array as `jnp.unique`'s but without its compaction (a cumsum and a
+    SparseCore scatter and gathers: ~165 of its ~180 us per layer at 8K
+    prefill, DCP4, j-87d27e25; a row sort of these shapes is ~17 us).
+    `_NO_PAGE` is the int32 maximum, so the second sort moves the removed
+    duplicates behind the distinct values without reordering them."""
+    ordered = jax.lax.sort(per_tile, dimension=per_tile.ndim - 1, is_stable=False)
+    repeat = jnp.concatenate(
+        [
+            jnp.zeros_like(ordered[..., :1], dtype=bool),
+            ordered[..., 1:] == ordered[..., :-1],
+        ],
+        axis=-1,
+    )
+    unique = jnp.where(repeat, _NO_PAGE, ordered)
+    return jax.lax.sort(unique, dimension=unique.ndim - 1, is_stable=False)
+
+
 def _work_list(selected: jax.Array, block_q: int, pages_per_step: int):
     """Each tile's sorted page union, cut into groups of `pages_per_step`.
 
@@ -360,9 +383,7 @@ def _work_list(selected: jax.Array, block_q: int, pages_per_step: int):
     per_tile = jnp.where(selected < 0, _NO_PAGE, selected).reshape(
         num_tiles, union_size
     )
-    union = jax.vmap(lambda x: jnp.unique(x, size=union_size, fill_value=_NO_PAGE))(
-        per_tile
-    )
+    union = tile_unions(per_tile)
     union = jnp.where(union == _NO_PAGE, -1, union)
     # A tile with no page still gets one all-masked group so its output is set.
     pages_in_tile = (union >= 0).sum(axis=1)
