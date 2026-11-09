@@ -14,6 +14,7 @@
 """Op wiring of the ragged all-to-all EP exchange."""
 
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import vllm.config
@@ -89,34 +90,105 @@ def test_ragged_a2a_op_threshold_covers_the_ep_decode_step(
 
 
 @pytest.mark.parametrize(
-    "placement,rows,routes,expected",
+    "placement,dp_size,placed,rows,routes,expected",
     [
-        ("", None, None, (2.5, 3.0)),
-        ("/tmp/placement.npz", None, None, (2.0, 2.0)),
-        # Explicit factors win either way.
-        ("/tmp/placement.npz", "2.5", "3", (2.5, 3.0)),
-        ("", "1.5", "0", (1.5, 0.0)),
+        # Up to 8 members: x2.5 / x3, or x2 / x2 for every layer of a placement.
+        ("", 8, False, None, None, (2.5, 3.0)),
+        ("/tmp/placement.npz", 8, True, None, None, (2.0, 2.0)),
+        ("/tmp/placement.npz", 8, False, None, None, (2.0, 2.0)),
+        # Larger groups: layers the file places, and layers in linear placement
+        # with or without a placement file.
+        ("/tmp/placement.npz", 16, True, None, None, (4.0, 4.0)),
+        ("/tmp/placement.npz", 16, False, None, None, (4.0, 5.0)),
+        ("", 16, False, None, None, (4.0, 5.0)),
+        ("/tmp/placement.npz", 32, True, None, None, (7.0, 7.0)),
+        ("/tmp/placement.npz", 32, False, None, None, (7.0, 8.5)),
+        ("", 32, False, None, None, (7.0, 8.5)),
+        # Explicit factors win, each on its own.
+        ("/tmp/placement.npz", 16, True, 2.5, 3.0, (2.5, 3.0)),
+        ("/tmp/placement.npz", 32, False, 3.5, None, (3.5, 8.5)),
+        ("", 8, False, 1.5, 0.0, (1.5, 0.0)),
     ],
 )
-def test_capacity_defaults_follow_the_expert_placement(
-    monkeypatch, placement, rows, routes, expected
+def test_capacity_defaults_follow_the_group_size_and_placement(
+    placement, dp_size, placed, rows, routes, expected
 ):
-    monkeypatch.setenv("TPU_MOE_EXPERT_PLACEMENT", placement)
-    for name, value in (
-        ("TPU_MOE_A2A_CAPACITY", rows),
-        ("TPU_MOE_A2A_ROUTE_CAPACITY", routes),
+    # Patched with create=True and removed afterwards, so later tests read the
+    # environment again (see envs.__getattr__).
+    with mock.patch.multiple(
+        envs,
+        create=True,
+        TPU_MOE_EXPERT_PLACEMENT=placement,
+        TPU_MOE_A2A_CAPACITY=rows,
+        TPU_MOE_A2A_ROUTE_CAPACITY=routes,
     ):
-        if value is None:
-            monkeypatch.delenv(name, raising=False)
-        else:
-            monkeypatch.setenv(name, value)
-    # Read the knobs themselves: a monkeypatched attribute restored by an
-    # earlier test would shadow the module's lazy lookup.
-    got = tuple(
-        envs.environment_variables[name]()
-        for name in ("TPU_MOE_A2A_CAPACITY", "TPU_MOE_A2A_ROUTE_CAPACITY")
+        assert ragged_a2a.capacity_factors(dp_size, placed=placed) == expected
+
+
+def test_placed_and_linear_layers_get_their_own_ops_and_factors(monkeypatch):
+    """With a placement at 16 members (DP16 x TP4, 28 requests x 4 tokens per
+    engine), a placed layer and a layer left in linear placement (the bf16
+    draft layer) get separate ops, each built and logged with its factors."""
+    sc_info = SimpleNamespace(num_lanes=16, num_cores=2, num_subcores=16)
+    monkeypatch.setattr(
+        fused_moe_gmm.pltpu,
+        "get_tpu_info",
+        lambda: SimpleNamespace(sparse_core=sc_info),
     )
-    assert got == expected
+    cfg = _fake_vllm_config(28, [112, 1024], 16, draft_tokens=3)
+    cfg.model_config = SimpleNamespace(hf_text_config=SimpleNamespace(num_experts=512))
+    monkeypatch.setattr(vllm.config, "get_current_vllm_config_or_none", lambda: cfg)
+    monkeypatch.setattr(
+        ragged_a2a,
+        "get_dp_tp_mesh",
+        lambda: SimpleNamespace(shape={"dp": 16, "tp": 4}),
+    )
+    monkeypatch.setattr(ragged_a2a, "_OPS", {})
+    factors, lines = [], []
+
+    def _ragged_a2a_moe(*args, **kwargs):
+        factors.append((kwargs["capacity_factor"], kwargs["route_factor"]))
+
+    monkeypatch.setattr(ragged_a2a, "ragged_a2a_moe", _ragged_a2a_moe)
+    monkeypatch.setattr(
+        ragged_a2a,
+        "logger",
+        SimpleNamespace(
+            info=lambda msg, *args: lines.append(msg % args),
+            info_once=lambda *args: None,
+        ),
+    )
+
+    class _Op:
+        def register_fake(self, fn):
+            pass
+
+    def _jax_op(name, fn, **kwargs):
+        fn(*range(len(kwargs["input_partition_specs"])))
+        return _Op()
+
+    monkeypatch.setattr(ragged_a2a.pallas, "jax_op", _jax_op)
+    with mock.patch.multiple(
+        envs,
+        create=True,
+        TPU_MOE_EXPERT_PLACEMENT="/tmp/placement.npz",
+        TPU_MOE_A2A_CAPACITY=None,
+        TPU_MOE_A2A_ROUTE_CAPACITY=None,
+        TPU_MOE_A2A_ROW_TILE=32,
+        TPU_MOE_A2A_OWNER_COMBINE=False,
+        USE_MOE_SPARSE_CORE=True,
+        ONEHOT_MOE_PERMUTE_THRESHOLD=None,
+    ):
+        ragged_a2a.prebuild_ragged_a2a_moe(topk=10, activation="silu", placed=True)
+        ragged_a2a.prebuild_ragged_a2a_moe(topk=10, activation="silu", scaled=False)
+    assert len(ragged_a2a._OPS) == 2
+    assert factors == [(4.0, 4.0), (4.0, 5.0)]
+    assert lines == [
+        "Ragged A2A MoE capacity x4 (routes x4) | decode step: 1056 of 1792 rows, "
+        "1152 of 17920 routes per rank",
+        "Ragged A2A MoE capacity x4 (routes x5) | decode step: 1056 of 1792 rows, "
+        "1408 of 17920 routes per rank",
+    ]
 
 
 def test_op_never_skips_routes_by_weight(monkeypatch):
