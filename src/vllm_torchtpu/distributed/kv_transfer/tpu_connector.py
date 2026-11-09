@@ -3613,6 +3613,28 @@ class TPURaidenConnectorWorker:
 
         return KVCacheManager(**kwargs)
 
+    def _raiden_transfer_streams(self) -> int:
+        """TCP streams the producer's transport opens per (pool, peer) push.
+
+        TPU_RAIDEN_TRANSFER_STREAMS decouples the stream fan-out from the
+        source rank count (TPU_RAIDEN_TRANSFER_PARALLELISM); unset or 0
+        keeps the historical one-stream-per-rank coupling, and a larger
+        value is clamped to the rank count, matching the source store's
+        planner default."""
+        parallelism = self._raiden_transfer_parallelism()
+        streams = int(tpu_envs.TPU_RAIDEN_TRANSFER_STREAMS)
+        if streams <= 0:
+            return parallelism
+        if streams > parallelism:
+            logger.warning(
+                "TPU_RAIDEN_TRANSFER_STREAMS=%d exceeds the transfer "
+                "parallelism %d; clamping",
+                streams,
+                parallelism,
+            )
+            return parallelism
+        return streams
+
     def _raiden_transfer_parallelism(self) -> int:
         parallelism = int(tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM)
         if parallelism <= 0:
@@ -3999,12 +4021,12 @@ class TPURaidenConnectorWorker:
             )
         if tp_size == 1 and pcp_size == 1 and dp_size == 1 and pp_size in (2, 4, 8):
             return f"pp{pp_size}_decode"
-        if pcp_size != 1 or tp_size not in (1, 2) or dp_size not in (2, 4, 8, 16):
+        if pcp_size != 1 or tp_size not in (1, 2, 4) or dp_size not in (2, 4, 8, 16):
             raise ValueError(
                 "Raiden Qwen3.5 admission topology dp{N}_decode or "
-                "dp{N}tp2_decode requires kv_consumer with "
+                "dp{N}tp{2,4}_decode requires kv_consumer with "
                 "prefill_context_parallel_size=1, tensor_parallel_size in "
-                "(1, 2), data_parallel_size in (2, 4, 8, 16); got "
+                "(1, 2, 4), data_parallel_size in (2, 4, 8, 16); got "
                 f"prefill_context_parallel_size={pcp_size}, "
                 f"tensor_parallel_size={tp_size}, "
                 f"data_parallel_size={dp_size}"
@@ -6961,7 +6983,7 @@ class TPURaidenConnectorWorker:
             manager_kwargs.update(
                 listener_port=0,
                 parallelism=(
-                    self._raiden_transfer_parallelism() if self.is_producer else 1
+                    self._raiden_transfer_streams() if self.is_producer else 1
                 ),
             )
             if _reshard_store_mode():

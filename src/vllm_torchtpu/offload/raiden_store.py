@@ -1978,7 +1978,7 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
             "transfers are controller-driven and jobs must be stripped scheduler-side"
         )
 
-    def submit_load(self, job_id, src_spec, dst_spec) -> bool:
+    def submit_load(self, job_id, src_spec, dst_spec, expedited=False) -> bool:
         raise AssertionError(
             "TPURaidenOffloadingConnector: submit_load reached a worker; transfers are "
             "controller-driven and jobs must be stripped scheduler-side"

@@ -4212,14 +4212,23 @@ class TestDivergedHybridHitLookup(unittest.TestCase):
         spec = SimpleNamespace(
             config=SimpleNamespace(
                 groups=[
-                    SimpleNamespace(group_id=group, tokens_per_block=self.BLOCK)
-                    for group in (self.ATTN, self.MAMBA)
+                    SimpleNamespace(
+                        group_id=self.ATTN,
+                        tokens_per_block=self.BLOCK,
+                        sliding_window_size_in_chunks=None,
+                    ),
+                    SimpleNamespace(
+                        group_id=self.MAMBA,
+                        tokens_per_block=self.BLOCK,
+                        sliding_window_size_in_chunks=1,
+                    ),
                 ]
             ),
             blocks_per_chunk=1,
             tokens_per_block=[self.BLOCK, self.BLOCK],
             tokens_per_hash=self.BLOCK,
             offload_prompt_only=False,
+            extra_config={},
             kv_events_config=OffloadingKVEventsConfig(
                 enable_kv_cache_events=False, self_describing_kv_events=False
             ),
@@ -4237,6 +4246,7 @@ class TestDivergedHybridHitLookup(unittest.TestCase):
         self.scheduler = TPURaidenOffloadingScheduler(
             spec, vllm_config, kv_cache_config
         )
+        self._scheduler_args = (spec, vllm_config, kv_cache_config)
         init_none_hash(sha256)
         params = SamplingParams(max_tokens=1)
         params.update_from_generation_config({}, 2)
@@ -4261,6 +4271,18 @@ class TestDivergedHybridHitLookup(unittest.TestCase):
     def _hit(self) -> int | None:
         hit, _ = self.scheduler.get_num_new_matched_tokens(self.request, self.LOCAL)
         return hit
+
+    def test_rejects_synchronous_loads(self):
+        # Raiden loads land asynchronously, so a load upstream schedules as
+        # synchronous would let the step's forward read blocks still in flight.
+        from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingScheduler
+
+        spec, vllm_config, kv_cache_config = self._scheduler_args
+        spec = SimpleNamespace(
+            **{**vars(spec), "extra_config": {"sync_load_budget_bytes": 1}}
+        )
+        with self.assertRaisesRegex(ValueError, "sync_load_budget_bytes"):
+            TPURaidenOffloadingScheduler(spec, vllm_config, kv_cache_config)
 
     def test_no_hit_without_the_recurrent_state(self):
         # Attention chunks 1-3 are on the host but no Mamba state is: loading

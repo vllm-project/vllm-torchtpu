@@ -16,6 +16,7 @@ import contextlib
 import copy
 import inspect
 import weakref
+from collections import defaultdict
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -62,11 +63,19 @@ from vllm_torchtpu.layers.core.attention_metadata import (
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 from vllm_torchtpu.runner import tpu_runner
 from vllm_torchtpu.runner import utils as runner_utils_module
+from vllm_torchtpu.runner.speculative_decoding_manager import (
+    SpeculativeDecodingManager,
+)
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.runner.tpu_runner_async_output import (
     INVALID_TOKEN_ID,
     AsyncPreResults,
 )
+from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
+
+
+def _warmup_requests():
+    return defaultdict(lambda: SimpleNamespace(output_token_ids=[]))
 
 
 def test_idle_dp_rank_encodes_before_decoder_pairing():
@@ -119,6 +128,7 @@ def test_spec_warmup_request_counts_blocks_in_block_table_units(
         sample_tokens=lambda _: None,
         take_draft_token_ids=lambda: None,
         _warmup_spec_decode_cleanup=lambda rids: True,
+        requests=_warmup_requests(),
     )
 
     assert TPUModelRunner._warmup_one_spec_request(runner, 8192, idx=0)
@@ -129,6 +139,51 @@ def test_spec_warmup_request_counts_blocks_in_block_table_units(
     # 40960 tokens in 40 entries of 1024, and the ids must fit that row.
     assert block_ids == list(range(1, 1 + expected_blocks))
     assert len(block_ids) <= spec.max_num_blocks_per_req(config, 40960)
+
+
+def test_spec_warmup_request_verifies_k_drafts_under_dynamic_schedule():
+    """Each warmup decode step verifies the K drafts the step before proposed,
+    also when a dynamic speculative decoding schedule cuts host drafts."""
+    spec = FullAttentionSpec(
+        block_size=128, num_kv_heads=1, head_size=128, dtype=torch.bfloat16
+    )
+    drafter = MagicMock(spec=Eagle3Proposer)
+    drafter.propose.return_value = [[7, 8, 9]]
+    captured = []
+    runner = SimpleNamespace(
+        max_model_len=4096,
+        speculative_config=SimpleNamespace(
+            method="eagle3",
+            num_speculative_tokens=3,
+            uses_dynamic_speculative_decoding=lambda: True,
+        ),
+        kv_cache_config=SimpleNamespace(
+            num_blocks=64, kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec)]
+        ),
+        vllm_config=SimpleNamespace(
+            parallel_config=SimpleNamespace(decode_context_parallel_size=1)
+        ),
+        input_batch=SimpleNamespace(num_reqs=1, req_ids=["__spec_warmup_0__"]),
+        _is_async_drafter=True,
+        _async_drafter=drafter,
+        execute_model=lambda so: captured.append(so),
+        _warmup_spec_decode_cleanup=lambda rids: True,
+        requests=_warmup_requests(),
+    )
+    manager = SpeculativeDecodingManager(runner)
+    runner.sample_tokens = lambda _: manager.propose_draft_token_ids(
+        sampled_token_ids=None,
+        scheduler_output=captured[-1],
+        next_tokens_per_chunk=[None],
+    )
+    runner.take_draft_token_ids = manager.take_draft_token_ids
+
+    assert TPUModelRunner._warmup_one_spec_request(runner, 128, idx=0)
+
+    decode_steps = captured[1:]
+    assert decode_steps
+    for so in decode_steps:
+        assert so.scheduled_spec_decode_tokens == {"__spec_warmup_0__": [7, 8, 9]}
 
 
 class _BlockTables(list):
@@ -657,6 +712,7 @@ def test_spec_batch_warmup_holds_at_most_max_num_seqs_requests(R):
         sample_tokens=lambda _: None,
         take_draft_token_ids=lambda: None,
         _warmup_spec_decode_cleanup=lambda rids: True,
+        requests=_warmup_requests(),
     )
 
     TPUModelRunner._warmup_spec_batch(runner, R, 16, short=True, mixed=True)
@@ -664,6 +720,36 @@ def test_spec_batch_warmup_holds_at_most_max_num_seqs_requests(R):
     # Each mixed variant that fits ran: the peak is R decoders plus two
     # prefills, capped at max_num_seqs, so a swallowed failure shows here too.
     assert max(sizes) == min(R + 2, 4)
+
+
+def test_spec_warmup_keeps_optimistic_output_placeholders():
+    captured = []
+    requests = _warmup_requests()
+    spec = SimpleNamespace(max_num_blocks_per_req=lambda _config, _max_pos: 1)
+
+    def execute_model(so):
+        if so.scheduled_cached_reqs.req_ids:
+            captured.append(list(so.scheduled_cached_reqs.num_output_tokens))
+        rid = "__spec_warmup_0__"
+        requests[rid].output_token_ids.extend([0] * 8)
+
+    runner = SimpleNamespace(
+        max_model_len=256,
+        speculative_config=SimpleNamespace(num_speculative_tokens=7),
+        kv_cache_config=SimpleNamespace(
+            num_blocks=4096, kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec)]
+        ),
+        vllm_config=SimpleNamespace(),
+        execute_model=execute_model,
+        sample_tokens=lambda _: None,
+        take_draft_token_ids=lambda: None,
+        _warmup_spec_decode_cleanup=lambda rids: True,
+        requests=requests,
+    )
+
+    assert TPUModelRunner._warmup_one_spec_request(runner, 1, idx=0)
+
+    assert captured == [[8 * (t + 1)] for t in range(9)]
 
 
 def test_mtp_prefill_warmup_retries_each_bucket_without_a_pipeline():
@@ -976,6 +1062,9 @@ def test_no_forward_output_preserves_invalid_block_ids():
             )
         ),
     )
+    runner._build_kv_connector_output = (
+        TPUModelRunner._build_kv_connector_output.__get__(runner)
+    )
     scheduler_output = SimpleNamespace()
     vllm_config = SimpleNamespace()
 
@@ -994,7 +1083,30 @@ def test_no_forward_output_preserves_invalid_block_ids():
         assert output.kv_connector_output.invalid_block_group_index == 2
 
 
-def test_build_kv_connector_output_omits_unsupported_group_index():
+def test_no_forward_output_is_empty_without_transfers():
+    # What get_finished_kv_transfers returns when nothing finished.
+    runner = SimpleNamespace(
+        maybe_setup_kv_connector=MagicMock(),
+        get_finished_kv_transfers=MagicMock(
+            return_value=(None, None, set(), None, set(), None, None)
+        ),
+    )
+    runner._build_kv_connector_output = (
+        TPUModelRunner._build_kv_connector_output.__get__(runner)
+    )
+
+    with patch(
+        "vllm_torchtpu.runner.tpu_runner.dist_utils.get_raiden_inline_load",
+        return_value=False,
+    ):
+        output = TPUModelRunner.kv_connector_no_forward(
+            runner, SimpleNamespace(), SimpleNamespace()
+        )
+
+    assert output is tpu_runner.EMPTY_MODEL_RUNNER_OUTPUT
+
+
+def test_make_kv_connector_output_omits_unsupported_group_index():
     with (
         patch.object(
             tpu_runner,
@@ -1003,7 +1115,7 @@ def test_build_kv_connector_output_omits_unsupported_group_index():
         ),
         patch.object(tpu_runner, "KVConnectorOutput") as output_cls,
     ):
-        tpu_runner._build_kv_connector_output(
+        tpu_runner._make_kv_connector_output(
             finished_sending={"sent"},
             finished_recving=None,
             failed_recving=set(),
@@ -1022,13 +1134,13 @@ def test_build_kv_connector_output_omits_unsupported_group_index():
     )
 
 
-def test_build_kv_connector_output_forwards_invalid_block_ids_for_hybrid_recovery():
+def test_make_kv_connector_output_forwards_invalid_block_ids_for_hybrid_recovery():
     with patch.object(
         tpu_runner,
         "_KV_CONNECTOR_OUTPUT_SUPPORTS_INVALID_BLOCK_GROUP",
         False,
     ):
-        out = tpu_runner._build_kv_connector_output(
+        out = tpu_runner._make_kv_connector_output(
             finished_sending=None,
             finished_recving={"failed-load"},
             failed_recving=set(),
@@ -3641,6 +3753,7 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
             _is_dspark_pd_producer=False,
             _fence_spec_kv_under_token_copy=False,
             _min_tokens_batch_state=lambda: {},
+            _adaptive_verification=None,
             is_pooling_model=False,
             drafter=SimpleNamespace(),
             spec_decode_manager=SimpleNamespace(
@@ -3656,7 +3769,11 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
             _stage_timing=MagicMock(),
         )
         runner._stage_timing.take_samples.return_value = ([], [])
-        for name in ("maybe_wait_for_kv_save", "get_finished_kv_transfers"):
+        for name in (
+            "maybe_wait_for_kv_save",
+            "get_finished_kv_transfers",
+            "_build_kv_connector_output",
+        ):
             setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
 
         TPUModelRunner.sample_tokens(runner, None)

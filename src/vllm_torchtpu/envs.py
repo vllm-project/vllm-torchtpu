@@ -50,6 +50,7 @@ if TYPE_CHECKING:
     MOE_REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
     TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: bool | None = None
+    TPU_SKIP_MAMBA_SCHEDULER_BLOCKS: bool = True
     TPU_USE_RAIDEN_KV_CACHE_MANAGER: bool = False
     TPU_RAIDEN_QWEN35_ADMISSION: bool = False
     TPU_RAIDEN_KIMIK3_ADMISSION: bool = False
@@ -60,6 +61,7 @@ if TYPE_CHECKING:
     TPU_RAIDEN_JOB_NAME: str = ""
     TPU_RAIDEN_ENGINE_ID: str = "0"
     TPU_RAIDEN_TRANSFER_PARALLELISM: int = 8
+    TPU_RAIDEN_TRANSFER_STREAMS: int = 0
     TPU_RAIDEN_DST_SHARDS: int | None = None
     TPU_RAIDEN_POOL_TAGS_PER_LAYER: bool = False
     TPU_RAIDEN_MAX_TRANSFER_TOKENS: int | None = None
@@ -602,6 +604,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL": env_optional_bool(
         "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL"
     ),
+    # Debug escape hatch; 0 opts out. On the compact-mamba layout
+    # (TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=0) with prefix caching off, the
+    # scheduler stops charging GDN layers one block per group per request from
+    # the attention pool: the runner keeps GDN state in its own slot arrays and
+    # never reads those blocks. Applies only where that holds (GDN layers, no
+    # speculative decoding, no KV connector); everything else keeps vLLM's
+    # stock accounting either way. Read by the model runner;
+    # TpuPlatform.additional_env_vars carries it to Ray workers. See
+    # core/runner_slot_mamba.py.
+    "TPU_SKIP_MAMBA_SCHEDULER_BLOCKS": env_bool(
+        "TPU_SKIP_MAMBA_SCHEDULER_BLOCKS", default=True
+    ),
     # Destination (decode-side) page geometry in tokens, required on the
     # producer: the byte-span lowering splits declarations at destination
     # page boundaries at registration time. 0 means unset.
@@ -634,6 +648,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_RAIDEN_ENGINE_ID": lambda: os.getenv("TPU_RAIDEN_ENGINE_ID", "0").strip(),
     "TPU_RAIDEN_TRANSFER_PARALLELISM": lambda: int(
         os.getenv("TPU_RAIDEN_TRANSFER_PARALLELISM") or "8"
+    ),
+    # TCP streams each producer rank opens per (pool, peer) push. 0 (default)
+    # keeps the historical coupling to TPU_RAIDEN_TRANSFER_PARALLELISM (one
+    # stream per source rank); a positive value is clamped to that parallelism.
+    # The source store applies the same value when it plans a transfer, so
+    # export it on the producer role.
+    "TPU_RAIDEN_TRANSFER_STREAMS": env_nonnegative_int(
+        "TPU_RAIDEN_TRANSFER_STREAMS", 0
     ),
     # TP shards in one decode engine, not its DP replica count. Configure
     # both roles alike; the producer uses this to route head-sharded state.

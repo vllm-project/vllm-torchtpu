@@ -88,9 +88,14 @@ def test_pcp8_mixed_batch_zeroes_rows_without_a_checkpoint_and_the_tail():
 
 
 def _pcp8_vllm_config(
-    *, prefix_match_unit=None, speculative=True, disable_eagle_block_drop=False
+    *,
+    prefix_match_unit=None,
+    speculative=True,
+    disable_eagle_block_drop=False,
+    num_hash_lookahead_tokens=0,
 ):
     return SimpleNamespace(
+        num_hash_lookahead_tokens=num_hash_lookahead_tokens,
         cache_config=SimpleNamespace(
             block_size=384,
             mamba_block_size=384,
@@ -221,6 +226,15 @@ def test_eagle_env_in_the_worker_does_not_override_the_config(pcp8_runner):
     runner, monkeypatch = pcp8_runner
     monkeypatch.setenv("VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP", "1")
     assert _init(runner, _pcp8_kv_cache_config()).drop_eagle_block is True
+
+
+def test_lookahead_block_hashes_replace_the_eagle_drop_in_the_worker(pcp8_runner):
+    runner, _ = pcp8_runner
+    runner.vllm_config = _pcp8_vllm_config(num_hash_lookahead_tokens=1)
+    units = _init(runner, _pcp8_kv_cache_config())
+    assert units.drop_eagle_block is False
+    assert units.num_hash_lookahead_tokens == 1
+    assert _fill(units, [8191], [8191]) == [6144]
 
 
 def test_no_mtp_has_no_eagle_drop(pcp8_runner):

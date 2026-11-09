@@ -940,3 +940,8 @@ def test_ltx2_split_rope_tables_reused_for_coords_views(ltx2, table_syncs, infer
         fresh = call(coords[:, 0:1, :])
         assert len(table_syncs) == syncs + 1
         assert not torch.equal(fresh[0], stale[0])
+
+
+def test_supports_talker_mtp_graph_capture_disabled():
+    assert OmniTpuPlatform.supports_talker_mtp_graph_capture() is False
+    assert OmniTpuPlatform().supports_talker_mtp_graph_capture() is False

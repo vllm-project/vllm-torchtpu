@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for pure in-graph 1-D/2-D/3-D RoPE and M-RoPE export patching."""
+"""Unit tests for pure in-graph 1-D/2-D/3-D RoPE and M-RoPE patching."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from vllm_torchtpu.experimental.export import rope_patch
+from vllm_torchtpu import rope_patch
 
 _HEAD_SIZE = 64
 _NUM_HEADS = 4

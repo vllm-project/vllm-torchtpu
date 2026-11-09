@@ -16,6 +16,9 @@ python -m vllm_torchtpu.experimental.export \
 The exporter loads dummy weights, so it reads only the checkpoint's config and
 tokenizer files.
 
+[RESULTS.md](RESULTS.md) compares exported models served by rvllm with `vllm serve`:
+nightly throughput and accuracy, plus Muse Spark Open.
+
 ## Static parameters: pass them explicitly to match `vllm serve`
 
 `vllm serve` settles several sizes at startup, some of them by measuring the
@@ -33,10 +36,10 @@ explicitly rather than relying on the exporter's defaults:
 - `--kv-cache-memory-bytes`: unset by default. `vllm serve` logs
   `Memory statistics | ... total_hbm_avail_gb=G | profile_run=ran`; bytes =
   G x 2^30. Use it only from a line that says `profile_run=ran`. With
-  `profile_run=skipped`, the KV size was pinned before profiling (for example by
-  compact-mamba sizing on hybrid models), G was measured without activation
-  memory and over-sizes the KV cache: pass `--num-blocks` from the
-  `TPU KV cache size` line instead.
+  `profile_run=skipped`, the KV size was pinned before profiling (by
+  `--num-gpu-blocks-override`, or the uniform hybrid KV layout's own count), G
+  was measured without activation memory and over-sizes the KV cache: pass
+  `--num-blocks` from the `TPU KV cache size` line instead.
 - `--max-num-seqs`, `--max-model-len`, `--max-num-batched-tokens`: default to
   vLLM's engine defaults. Pass what `vllm serve` was given (its
   `non-default args` log line lists them).
@@ -67,8 +70,8 @@ make the default less faithful than an explicit value:
 
 - `vllm serve` runs a profile pass at `--max-num-batched-tokens` before
   measuring, so its KV budget excludes activation memory, unless the KV size is
-  already pinned (`num_gpu_blocks_override`, set by compact-mamba sizing on
-  hybrid models), in which case it skips the pass and logs
+  already pinned (`--num-gpu-blocks-override`, or the uniform hybrid KV
+  layout's own count), in which case it skips the pass and logs
   `profile_run=skipped`. The exporter does not profile, so activations must fit in the headroom `--gpu-memory-utilization`
   leaves. `--kv-cache-memory-bytes` skips the profile pass in `vllm serve`
   too, so it is the setting that gives both the same KV budget.
@@ -114,12 +117,12 @@ bytes come off the KV budget before it is divided among KV blocks.
 
 With `--speculative-config '{"method": "mtp", "num_speculative_tokens": K}'`
 the export loads the model together with the MTP draft vLLM builds for it (for
-Qwen3.5, `Qwen3_5MTP` from the checkpoint's `mtp.*` weights) and adds
-`mtp_draft_bucket{B}` for every forward bucket. The draft projects with the
+Qwen3.5, `Qwen3_5MTP` from the checkpoint's `mtp.*` weights) and adds the
+drafter `draft_bucket{B}` (function `draft`) for every forward bucket. The draft projects with the
 target's embedding and LM head, which keep their slots, so the artifact stores
 them once; its own weights are exported under their checkpoint names (`mtp.`).
 Its paged KV is a state numbered after the target's and counts against the KV
-budget like the target's. `mtp_draft` runs the draft over every row of the step
+budget like the target's. `draft` runs the draft over every row of the step
 and drafts the first token at each request's `last_token_indices` row; each
 further token comes from one more pass over one row per request, as vLLM's MTP
 proposer chains them.
@@ -150,7 +153,9 @@ The artifact's weights are the ones vLLM actually serves with, including what it
 does to some weights while loading them: FP8 checkpoints are dequantized and
 requantized to the runtime format, and checkpoint tensors are cast to the model
 dtype. They are saved as an Orbax checkpoint (Zarr v2 arrays `array_{i}`, one per
-`abstract_params` input, without OCDBT) in `serving_checkpoint/data/`:
+`abstract_params` input, in a TensorStore OCDBT database) in
+`serving_checkpoint/data/`, with `"format": "zarr2_ocdbt"` recorded in
+`serving_config.checkpoint_config`:
 
 | `--export-mode` | Runs on | Weights loaded | Writes |
 |---|---|---|---|
@@ -189,7 +194,7 @@ comma-separated glob patterns of module names:
 
 A pattern that matches no module fails, and the error lists example names.
 
-For the smallest token bucket, `forward` and `mtp_draft` are also exported with
+For the smallest token bucket, `forward` and `draft` are also exported with
 the matching modules' outputs as extra results, after the variant's own:
 
 ```bash
@@ -201,7 +206,7 @@ python -m vllm_torchtpu.experimental.export ... \
 ```text
 <output-dir>/assets.extra/debug/
   forward_debug_bucket16.mlir
-  mtp_draft_debug_bucket16.mlir
+  draft_debug_bucket16.mlir
   taps.json
 ```
 

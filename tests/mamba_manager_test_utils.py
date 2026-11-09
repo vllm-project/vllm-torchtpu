@@ -52,8 +52,8 @@ PREFILL_CHECKPOINT_ALIGNMENT = 1
 def pin_upstream_block_pool(monkeypatch) -> None:
     """Restores the unpatched BlockPool lookups for one test.
 
-    The same-step-hit patch hides blocks hashed since the last schedule(),
-    which these tests never call.
+    The same-step-hit patch hides blocks hashed since the last
+    `KVCacheManager.new_step_starts()`.
     """
     for name in ("_insert_block_hash", "get_cached_block"):
         monkeypatch.setattr(BlockPool, name, inspect.unwrap(getattr(BlockPool, name)))
@@ -69,6 +69,7 @@ class Geometry:
     eagle: bool
     budget: int
     retention: int | None
+    lookahead: int = 0
 
     def reserves_every_chunk(self) -> bool:
         """Whether the manager reserves a checkpoint on every chunk that has
@@ -109,16 +110,19 @@ def make_kv_cache_manager(geometry: Geometry, num_blocks: int = 4096) -> KVCache
         # The scheduler passes use_eagle_block_drop, True under MTP.
         use_eagle=geometry.eagle,
         enable_kv_cache_events=True,
+        num_hash_lookahead_tokens=geometry.lookahead,
     )
 
 
-def make_request(request_id: str, token_ids: list[int], hash_block: int) -> Request:
+def make_request(
+    request_id: str, token_ids: list[int], hash_block: int, lookahead: int = 0
+) -> Request:
     return Request(
         request_id,
         token_ids,
         SamplingParams(max_tokens=8),
         None,
-        block_hasher=get_request_block_hasher(hash_block, sha256),
+        block_hasher=get_request_block_hasher(hash_block, sha256, lookahead),
     )
 
 
@@ -146,6 +150,7 @@ class Lockstep:
             hash_block_size=geometry.hash_block,
             use_eagle=geometry.eagle,
             use_eagle_block_drop=geometry.eagle,
+            num_hash_lookahead_tokens=geometry.lookahead,
             max_num_scheduled_tokens=geometry.budget,
             scheduler_config=SimpleNamespace(
                 long_prefill_token_threshold=geometry.budget
@@ -164,6 +169,7 @@ class Lockstep:
             mamba_block_size=geometry.block,
             alignment=PREFILL_CHECKPOINT_ALIGNMENT,
             drop_eagle_block=geometry.eagle,
+            num_hash_lookahead_tokens=geometry.lookahead,
         )
         self.requests: dict[str, Request] = {}
         self.tables: dict[str, list[int]] = {}
