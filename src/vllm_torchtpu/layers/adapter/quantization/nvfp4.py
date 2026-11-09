@@ -578,7 +578,9 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
             if not layer.moe_config.moe_parallel_config.use_ep:
                 raise NotImplementedError("TPU_MOE_RAGGED_A2A needs expert parallelism")
             prebuild_ragged_a2a_moe(
-                topk=layer.moe_config.experts_per_token, activation=activation_str
+                topk=layer.moe_config.experts_per_token,
+                activation=activation_str,
+                placed=expert_placement.host_slots(layer) is not None,
             )
 
         if self._use_adaptive_fused_moe:
@@ -681,6 +683,7 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
             shared_output = getattr(layer, "_tpu_owner_shared_output", None)
             if shared_output is not None:
                 kwargs["shared_output"] = shared_output
+            kwargs["placed"] = getattr(layer, "_expert_slots", None) is not None
             return ragged_a2a_fused_moe_gmm(**kwargs)
         if enable_pipelined_collective_and_compute():
             return pipelined_fused_moe_gmm(**kwargs)

@@ -43,7 +43,8 @@ Build one from your own traffic:
            --ep-size 32
 
 3. Serve with ``TPU_MOE_EXPERT_PLACEMENT=OUT`` on every host of that EP
-   size. The ragged all-to-all capacities then default to x2
+   size. The ragged all-to-all capacities then default to x2 up to 8 DP
+   members, x4 up to 16 and x7 above
    (``TPU_MOE_A2A_CAPACITY``, ``TPU_MOE_A2A_ROUTE_CAPACITY``).
 """
 

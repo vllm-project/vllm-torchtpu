@@ -116,9 +116,9 @@ if TYPE_CHECKING:
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_MOE_RAGGED_A2A: bool = False
-    TPU_MOE_A2A_CAPACITY: float = 2.5
+    TPU_MOE_A2A_CAPACITY: float | None = None
     TPU_MOE_A2A_UNQUANTIZED: bool = False
-    TPU_MOE_A2A_ROUTE_CAPACITY: float = 3.0
+    TPU_MOE_A2A_ROUTE_CAPACITY: float | None = None
     TPU_MOE_A2A_ROW_TILE: int = 16
     TPU_MOE_A2A_ROW_GATHER: bool = False
     TPU_MOE_A2A_ROW_SCATTER: bool = False
@@ -320,12 +320,18 @@ def env_float(env_name: str, default: float) -> Callable[[], float]:
     return _get_float_env
 
 
-def _a2a_capacity(env_name: str, default: float) -> float:
-    """A ragged all-to-all capacity factor: 2 by default when an expert
-    placement file is set, else ``default``."""
-    if os.getenv("TPU_MOE_EXPERT_PLACEMENT", "").strip():
-        default = 2.0
-    return env_float(env_name, default)()
+def env_optional_float(env_name: str) -> Callable[[], float | None]:
+    """Same parsing as ``env_float``, but an unset or empty variable reads as
+    ``None`` so callers can tell "explicitly set" from "not configured"."""
+    parse_float = env_float(env_name, 0.0)
+
+    def _get_optional_float_env() -> float | None:
+        value = os.getenv(env_name)
+        if value is None or value.strip() == "":
+            return None
+        return parse_float()
+
+    return _get_optional_float_env
 
 
 def env_str(env_name: str, default: str) -> Callable[[], str]:
@@ -866,17 +872,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_A2A_UNQUANTIZED": env_bool("TPU_MOE_A2A_UNQUANTIZED"),
     # Ragged all-to-all exchange: size the per-rank token rows and local routes
     # at this many times their uniform-routing mean (exact: a step that does
-    # not fit runs the full-size exchange). 0 = always full size. Default 2.5,
-    # or 2 with TPU_MOE_EXPERT_PLACEMENT (a placement balanced on routing
-    # counts keeps the busiest rank near the mean).
-    "TPU_MOE_A2A_CAPACITY": lambda: _a2a_capacity("TPU_MOE_A2A_CAPACITY", 2.5),
+    # not fit runs the full-size exchange). 0 = always full size. Unset = by the
+    # DP group size: 2.5 up to 8 members (2 with TPU_MOE_EXPERT_PLACEMENT), 4 up
+    # to 16, 7 above (layers.adapter.ragged_a2a_moe.capacity_factors).
+    "TPU_MOE_A2A_CAPACITY": env_optional_float("TPU_MOE_A2A_CAPACITY"),
     # The local routes' factor (0 = TPU_MOE_A2A_CAPACITY): real routing skews
     # routes more than rows. Both factors are capped at 2 where the full-size
-    # exchange stays on the one-hot path (its rerun is cheap there). Default 3,
-    # or 2 with TPU_MOE_EXPERT_PLACEMENT.
-    "TPU_MOE_A2A_ROUTE_CAPACITY": lambda: _a2a_capacity(
-        "TPU_MOE_A2A_ROUTE_CAPACITY", 3.0
-    ),
+    # exchange stays on the one-hot path (its rerun is cheap there). Unset = by
+    # the DP group size and the layer's placement (capacity_factors).
+    "TPU_MOE_A2A_ROUTE_CAPACITY": env_optional_float("TPU_MOE_A2A_ROUTE_CAPACITY"),
     # Ragged all-to-all exchange: the capacity rows grow in tiles of this many
     # rows (16 or 32; at 32 ranks and 96 tokens per engine, x2 gives 432 rows
     # in 16-row tiles and 448 in 32-row tiles, whose relayouts cost less).
