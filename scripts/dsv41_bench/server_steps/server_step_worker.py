@@ -70,11 +70,11 @@ def require_dp16_recipe() -> None:
             "DP16 decode CI requires push with SC_PREPUSH=2, TC_EXCHANGE=1"
         )
     if not TPU_MOE_EPLB_DYNAMIC:
-        from vllm_torchtpu import expert_placement
+        from vllm_torchtpu.expert_placement import configured_value
 
         # A static expert layout (expert_layout / TPU_EXPERT_PLACEMENT) is the
         # other admitted placement; the CI itself always runs dynamic EPLB.
-        if expert_placement.configured_value() is None:
+        if configured_value() is None:
             raise ValueError(
                 "DP16 decode CI requires TPU_MOE_EPLB_DYNAMIC=1 or a static "
                 "expert layout"
