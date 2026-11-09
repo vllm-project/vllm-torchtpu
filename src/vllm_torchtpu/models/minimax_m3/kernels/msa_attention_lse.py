@@ -155,9 +155,10 @@ def _kernel(
     def attend(width, single):
         """One softmax update over the group's first `width` slots; a
         `single` group (the tile's only one) needs no carried state."""
+        # int4 and fp8 pages unpack in slot order; bf16 in the bitcast's order.
         row_slots = (
-            jax.lax.broadcasted_iota(jnp.int32, (page_size, 1), 0)  # int4: slot order
-            if fp4
+            jax.lax.broadcasted_iota(jnp.int32, (page_size, 1), 0)
+            if fp4 or packing == 4
             else msa_attention._bitcast_slots(rows_per_page, packing)
         )  # [S, 1]
         slots = row_slots.T  # [1, S]
@@ -189,7 +190,10 @@ def _kernel(
                 k_scales.append(sk)
                 v_scales.append(sv)
             elif packing == 4:
-                rows = msa_attention._page_rows(kv_ref, None)
+                # The packed [S / 4, 4, 2D] page read as [S, 2D] rows: slot
+                # r * 4 + j at row r * 4 + j, and a cheaper relayout than the
+                # 32-bit words' bitcast (16 vs 30 bundles a page, AOT).
+                rows = kv_ref[0].reshape(page_size, -1).astype(jnp.bfloat16)
                 values.append(jnp.where(row_slots < seen, rows[:, head_dim:], 0))
             else:
                 rows = msa_attention._page_rows(kv_ref, seen)
