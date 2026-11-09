@@ -54,6 +54,7 @@ from vllm_torchtpu.omni.patches import (
     _patch_ltx2_split_rope,
     _patch_ltx2_vocoder_cpu_init,
     _patch_sdpa_fallback_dispatch,
+    _patch_wan_vae_halo_allgather,
     apply_omni_model_specific_patches,
     apply_omni_tpu_patches,
 )
@@ -945,3 +946,40 @@ def test_ltx2_split_rope_tables_reused_for_coords_views(ltx2, table_syncs, infer
 def test_supports_talker_mtp_graph_capture_disabled():
     assert OmniTpuPlatform.supports_talker_mtp_graph_capture() is False
     assert OmniTpuPlatform().supports_talker_mtp_graph_capture() is False
+
+
+def test_wan_vae_halo_allgather_patch(monkeypatch):
+    from vllm_omni.diffusion.distributed.autoencoders import wan_spatial_shard
+
+    orig_fn = getattr(
+        wan_spatial_shard,
+        "_tpu_orig_halo_exchange_p2p",
+        wan_spatial_shard._halo_exchange_p2p,
+    )
+    orig_ag = getattr(
+        wan_spatial_shard,
+        "_tpu_orig_all_gather_along_dim",
+        wan_spatial_shard.all_gather_along_dim,
+    )
+    monkeypatch.setattr(wan_spatial_shard, "_halo_exchange_p2p", orig_fn)
+    monkeypatch.setattr(wan_spatial_shard, "all_gather_along_dim", orig_ag)
+    monkeypatch.delattr(wan_spatial_shard, "_tpu_orig_halo_exchange_p2p", raising=False)
+    monkeypatch.delattr(
+        wan_spatial_shard, "_tpu_orig_all_gather_along_dim", raising=False
+    )
+
+    monkeypatch.setenv("VLLM_TORCHTPU_OMNI_WAN_VAE_HALO_ALLGATHER", "0")
+    _patch_wan_vae_halo_allgather()
+    assert wan_spatial_shard._halo_exchange_p2p is orig_fn
+    assert not hasattr(wan_spatial_shard, "_tpu_orig_halo_exchange_p2p")
+
+    monkeypatch.delenv("VLLM_TORCHTPU_OMNI_WAN_VAE_HALO_ALLGATHER", raising=False)
+    apply_omni_model_specific_patches.cache_clear()
+    apply_omni_model_specific_patches()
+    assert wan_spatial_shard._tpu_orig_halo_exchange_p2p is orig_fn
+    patched = wan_spatial_shard._halo_exchange_p2p
+    assert patched is not orig_fn
+
+    _patch_wan_vae_halo_allgather()
+    assert wan_spatial_shard._halo_exchange_p2p is patched
+    assert wan_spatial_shard._tpu_orig_halo_exchange_p2p is orig_fn

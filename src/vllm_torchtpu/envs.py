@@ -209,6 +209,7 @@ if TYPE_CHECKING:
     VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS: int = 8
     VLLM_TPU_SRPT_ATTN_WORK_CAP: int = 0
     VLLM_TPU_SRPT_ATTN_TILE_TOKENS: int = 32
+    VLLM_TORCHTPU_OMNI_WAN_VAE_HALO_ALLGATHER: bool = True
 
 
 def env_with_choices(
@@ -1281,6 +1282,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # tile).
     "VLLM_TPU_SRPT_ATTN_TILE_TOKENS": env_nonnegative_int(
         "VLLM_TPU_SRPT_ATTN_TILE_TOKENS", 32
+    ),
+    # Replace Wan VAE spatial-shard p2p halo exchange with an all-gather on TPU.
+    "VLLM_TORCHTPU_OMNI_WAN_VAE_HALO_ALLGATHER": env_bool(
+        "VLLM_TORCHTPU_OMNI_WAN_VAE_HALO_ALLGATHER", True
     ),
 }
 
