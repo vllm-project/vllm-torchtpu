@@ -2786,14 +2786,16 @@ class _SlotMtpExportableLLM(_TinyMtpExportableLLM):
     """The tiny MTP model whose draft can run for only the first `draft_slots`
     requests, as the universal adapter's drafters do."""
 
-    def mtp_draft(self, weights, kv_caches, *, draft_slots=None, **controls):  # type: ignore[override]
+    def mtp_draft(  # type: ignore[override]
+        self, weights, kv_caches, *, draft_slots=None, **controls
+    ):
         kvs, tokens = super().mtp_draft(weights, kv_caches, **controls)
         n = tokens.shape[0] if draft_slots is None else draft_slots
         pad = tokens.new_zeros((tokens.shape[0] - n, tokens.shape[1]))
         return kvs, torch.cat([tokens[:n], pad])
 
 
-def test_draft_slot_counts_are_powers_of_two_up_to_the_most_requests_a_bucket_holds() -> None:
+def test_draft_slot_counts_are_powers_of_two_up_to_a_buckets_requests() -> None:
     assert exporter.draft_slot_counts(16, 64) == [1, 2, 4, 8, 16]
     assert exporter.draft_slot_counts(1024, 64) == [1, 2, 4, 8, 16, 32, 64]
     assert exporter.draft_slot_counts(48, 64) == [1, 2, 4, 8, 16, 32, 48]
@@ -2813,7 +2815,8 @@ def test_a_draft_taking_draft_slots_is_one_module_branching_on_the_request_count
     for bucket in ("8", "16"):
         mlir = Path(out_dir, functions["draft"][bucket]["file_path"]).read_text()
         assert mlir.count('"stablehlo.case"') == 1
-        branches = sorted(int(n) for n in re.findall(r"func\.func private @branch_(\d+)\(", mlir))
+        found = re.findall(r"func\.func private @branch_(\d+)\(", mlir)
+        branches = sorted(int(n) for n in found)
         assert branches == exporter.draft_slot_counts(int(bucket), 8)
         # The composed `@main` keeps the donated state aliased to its output.
         main = mlir[mlir.index("func.func public @main") :].split("\n", 1)[0]

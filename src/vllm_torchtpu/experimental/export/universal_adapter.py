@@ -2060,7 +2060,8 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
             live = torch.arange(cfg.max_num_seqs, device=rows.device) < num_seqs
             # KV index of each request's row `last_token_indices`: its KV length
             # less the rows after it in the step.
-            last_kv = kv_lens - (query_start_loc[1:] - all_rows.to(kv_lens.dtype) - 1) - 1
+            after = query_start_loc[1:] - all_rows.to(kv_lens.dtype) - 1
+            last_kv = kv_lens - after - 1
             one_per_seq = torch.clamp(
                 torch.arange(cfg.max_num_seqs + 1, device=rows.device), max=num_seqs
             ).to(query_start_loc.dtype)

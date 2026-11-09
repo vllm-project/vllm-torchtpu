@@ -1,3 +1,16 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Composes per-request-count variants of one module into a single module.
 
 TorchTPU's trace cannot lower `torch.cond`, so a drafter that computes only the
@@ -15,7 +28,9 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 
-_SYMBOL = re.compile(r"(?:func\.func|sdy\.mesh)\s+(?:public\s+|private\s+)?@([\w.$-]+)")
+_SYMBOL = re.compile(
+    r"(?:func\.func|sdy\.mesh)\s+(?:public\s+|private\s+)?@([\w.$-]+)"
+)
 _MAIN_START = "func.func public @main("
 
 
@@ -126,14 +141,17 @@ def _branch_functions(text: str, n: int) -> str:
     main = _Main(text)
     sig = (
         f"func.func private @branch_{n}("
-        + ", ".join(f"{a}: {t}" for a, t in zip(main.names, main.arg_types, strict=True))
+        + ", ".join(
+            f"{a}: {t}" for a, t in zip(main.names, main.arg_types, strict=True)
+        )
         + f") -> ({', '.join(main.ret_types)})"
     )
     body = main.attrs_and_body
     # Function attributes after the results (`attributes {...}`) stay off a branch.
     body = body[body.index("{") :]
     text = text[: main.start] + sig + " " + body
-    for name in sorted(set(_SYMBOL.findall(text)) - {f"branch_{n}"}, key=len, reverse=True):
+    symbols = set(_SYMBOL.findall(text)) - {f"branch_{n}"}
+    for name in sorted(symbols, key=len, reverse=True):
         text = re.sub(rf"@{re.escape(name)}\b", f"@b{n}_{name}", text)
     text = text.replace("func.func public", "func.func private")
     _, start = _module_open(text)
@@ -165,32 +183,41 @@ def compose_by_request_count(
     k = len(ns)
     rd = names[req_dist_arg]
     rd_type = types[req_dist_arg]
+    ki, k1 = f"tensor<{k}xi32>", f"tensor<{k}xi1>"
+    i32 = "tensor<i32>"
     call = f"{', '.join(names)}) : ({', '.join(types)}) -> ({rt})"
+    results = ", ".join(f"%r#{i}" for i in range(len(rets)))
     regions = "    }, {\n".join(
         f"      %r:{len(rets)} = func.call @branch_{n}({call}\n"
-        f"      stablehlo.return {', '.join(f'%r#{i}' for i in range(len(rets)))} : {rt}\n"
+        f"      stablehlo.return {results} : {rt}\n"
         for n in ns
     )
     head = largest_text[largest.start : largest.header_end]
     attrs = largest.attrs_and_body[: largest.attrs_and_body.index("{")]
-    main = f"""  {head}{attrs}{{
-    %s1 = stablehlo.slice {rd} [{num_seqs_index}:{num_seqs_index + 1}] : ({rd_type}) -> tensor<1xi32>
-    %s = stablehlo.reshape %s1 : (tensor<1xi32>) -> tensor<i32>
-    %ns = stablehlo.constant dense<[{", ".join(map(str, ns))}]> : tensor<{k}xi32>
-    %sb = stablehlo.broadcast_in_dim %s, dims = [] : (tensor<i32>) -> tensor<{k}xi32>
-    %lt = stablehlo.compare LT, %ns, %sb : (tensor<{k}xi32>, tensor<{k}xi32>) -> tensor<{k}xi1>
-    %one = stablehlo.constant dense<1> : tensor<{k}xi32>
-    %zero = stablehlo.constant dense<0> : tensor<{k}xi32>
-    %below = stablehlo.select %lt, %one, %zero : tensor<{k}xi1>, tensor<{k}xi32>
-    %z = stablehlo.constant dense<0> : tensor<i32>
-    %count = stablehlo.reduce(%below init: %z) applies stablehlo.add across dimensions = [0] : (tensor<{k}xi32>, tensor<i32>) -> tensor<i32>
-    %last = stablehlo.constant dense<{k - 1}> : tensor<i32>
-    %idx = stablehlo.minimum %count, %last : tensor<i32>
-    %out:{len(rets)} = "stablehlo.case"(%idx) ({{
-{regions}    }}) : (tensor<i32>) -> ({rt})
-    return {", ".join(f"%out#{i}" for i in range(len(rets)))} : {rt}
-  }}
-"""
+    lo = num_seqs_index
+    outs = ", ".join(f"%out#{i}" for i in range(len(rets)))
+    lines = [
+        f"  {head}{attrs}{{",
+        f"    %s1 = stablehlo.slice {rd} [{lo}:{lo + 1}]"
+        f" : ({rd_type}) -> tensor<1xi32>",
+        f"    %s = stablehlo.reshape %s1 : (tensor<1xi32>) -> {i32}",
+        f"    %ns = stablehlo.constant dense<[{', '.join(map(str, ns))}]> : {ki}",
+        f"    %sb = stablehlo.broadcast_in_dim %s, dims = [] : ({i32}) -> {ki}",
+        f"    %lt = stablehlo.compare LT, %ns, %sb : ({ki}, {ki}) -> {k1}",
+        f"    %one = stablehlo.constant dense<1> : {ki}",
+        f"    %zero = stablehlo.constant dense<0> : {ki}",
+        f"    %below = stablehlo.select %lt, %one, %zero : {k1}, {ki}",
+        f"    %z = stablehlo.constant dense<0> : {i32}",
+        "    %count = stablehlo.reduce(%below init: %z) applies stablehlo.add"
+        f" across dimensions = [0] : ({ki}, {i32}) -> {i32}",
+        f"    %last = stablehlo.constant dense<{k - 1}> : {i32}",
+        f"    %idx = stablehlo.minimum %count, %last : {i32}",
+        f'    %out:{len(rets)} = "stablehlo.case"(%idx) ({{',
+        f"{regions}    }}) : ({i32}) -> ({rt})",
+        f"    return {outs} : {rt}",
+        "  }",
+    ]
+    main = "\n".join(lines) + "\n"
     module_start, body_start = _module_open(largest_text)
     module_head = largest_text[module_start:body_start]
     bodies = "".join(_branch_functions(variants[n], n) for n in ns)

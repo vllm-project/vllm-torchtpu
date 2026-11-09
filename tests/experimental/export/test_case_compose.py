@@ -1,4 +1,17 @@
-"""PROTOTYPE (exp/draft-cond): `case_compose` merges per-request-count variants
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""`case_compose` merges per-request-count variants
 into one module that computes only the step's live requests, keeps the donated
 state aliased without a copy, and matches the full variant."""
 
@@ -43,7 +56,14 @@ def _variant(n, inputs):
     # `set_aliasing_outputs` does for TorchTPU modules.
     return (
         jax.jit(lambda *a: _draft(n, *a), donate_argnums=(5,))
-        .lower(jnp.zeros(3, jnp.int32), inputs["slots"], inputs["x"], inputs["w"], inputs["wout"], kv)
+        .lower(
+            jnp.zeros(3, jnp.int32),
+            inputs["slots"],
+            inputs["x"],
+            inputs["w"],
+            inputs["wout"],
+            kv,
+        )
         .as_text()
     )
 
@@ -59,7 +79,8 @@ def test_composed_draft_matches_the_full_one_without_copying_the_state(inputs) -
     hlo = exe.hlo_modules()[0].to_string()
     assert hlo.count(" conditional(") == 1
     assert "input_output_alias={ {0}" in hlo
-    assert not [l for l in hlo.splitlines() if " copy(" in l and f"[{SLOTS},{KVD}]" in l]
+    state = f"[{SLOTS},{KVD}]"
+    assert not [ln for ln in hlo.splitlines() if " copy(" in ln and state in ln]
 
     full = jax.jit(lambda *a: _draft(SMAX, *a))
     dev = jax.devices("cpu")[0]
@@ -67,7 +88,10 @@ def test_composed_draft_matches_the_full_one_without_copying_the_state(inputs) -
         rd = jnp.array([0, 0, s], jnp.int32)
         args = [rd, inputs["slots"], inputs["x"], inputs["w"], inputs["wout"]]
         out = exe.execute_sharded(
-            [jax.device_put(a, dev) for a in [*args, jnp.zeros((SLOTS, KVD), jnp.float32)]]
+            [
+                jax.device_put(a, dev)
+                for a in [*args, jnp.zeros((SLOTS, KVD), jnp.float32)]
+            ]
         ).disassemble_into_single_device_arrays()
         kv_ref, tok_ref = full(*args, jnp.zeros((SLOTS, KVD), jnp.float32))
         live = np.asarray(inputs["slots"][: s * BLOCK])
