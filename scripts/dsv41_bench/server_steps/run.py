@@ -117,6 +117,7 @@ def main() -> None:
     parser.add_argument("--head-address")
     parser.add_argument("--rounds", type=int)
     parser.add_argument("--profile", action="store_true")
+    parser.add_argument("--compile-sizes", type=int, nargs="+")
     args = parser.parse_args()
     multihost = args.scenario == "decode_dp16"
     worker = multihost and args.host_rank == 1
@@ -181,6 +182,12 @@ def main() -> None:
     # Target and context-KV buckets; draft queries derive their own ladder
     # from request buckets and the draft block size.
     buckets = [verify_rows, scenario.chunk_tokens] if decode else [128, 2048]
+    if args.compile_sizes is not None:
+        buckets = args.compile_sizes
+        if buckets != sorted(set(buckets)) or buckets[0] <= 0:
+            parser.error("--compile-sizes must be positive, unique and increasing")
+        if buckets[-1] < scenario.chunk_tokens:
+            parser.error("--compile-sizes must cover the scheduler token budget")
     env.update(
         TP="1",
         DP=str(scenario.dp_size),

@@ -174,6 +174,7 @@ def test_decode_admission_rejects_early_completion(tmp_path, failed):
 )
 @pytest.mark.parametrize("profile", ["disabled", "passed", "failed"])
 @pytest.mark.parametrize("model_uri", [None, "gs://test-bucket/checkpoint"])
+@pytest.mark.parametrize("middle_bucket", [False, True])
 def test_ci_launch_and_optional_profile_share_one_server(
     tmp_path,
     monkeypatch,
@@ -182,6 +183,7 @@ def test_ci_launch_and_optional_profile_share_one_server(
     buckets,
     profile,
     model_uri,
+    middle_bucket,
 ):
     monkeypatch.chdir(tmp_path)
     (tmp_path / "config.json").write_text("{}")
@@ -208,6 +210,7 @@ def test_ci_launch_and_optional_profile_share_one_server(
             "7200",
             *(["--head-address", "127.0.0.1"] if scenario == "decode_dp16" else []),
             *(["--profile"] if profile != "disabled" else []),
+            *(["--compile-sizes", "288", "512", "2048"] if middle_bucket else []),
         ],
     )
     monkeypatch.setattr(launcher, "load_frozen_input", lambda _: {})
@@ -315,7 +318,7 @@ def test_ci_launch_and_optional_profile_share_one_server(
     assert manifest["identity"]["model_weights"] == (model_uri or str(tmp_path))
     command = starts[0]
     assert json.loads(command[command.index("--compilation-config") + 1]) == {
-        "compile_sizes": buckets
+        "compile_sizes": [288, 512, 2048] if middle_bucket else buckets
     }
     assert clients[0][clients[0].index("--rounds") + 1] == str(rounds)
     assert len(audits) == 1 and len(audits[0]) == rounds
@@ -341,6 +344,7 @@ def test_dp16_ci_launch_keeps_local_shapes_and_selects_hbm(tmp_path, monkeypatch
         [288, 2048],
         "disabled",
         "gs://test-bucket/checkpoint",
+        False,
     )
 
 
