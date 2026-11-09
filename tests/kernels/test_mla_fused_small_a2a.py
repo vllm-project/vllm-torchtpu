@@ -1472,10 +1472,10 @@ def _run_dcp8_backbone_and_mtp_suite(mesh, *, is_cpu_interpret: bool) -> None:
         mtp_on_fn = make_mtp_fn(cap_on)
         hlo_off = mtp_off_fn.lower(o_mtp, l_mtp, r_ids, l_ids).as_text()
         hlo_on = mtp_on_fn.lower(o_mtp, l_mtp, r_ids, l_ids).as_text()
-        assert "all_to_all" in hlo_off and "pallas_call" not in hlo_off
-        assert "all_to_all" not in hlo_on
+        assert "stablehlo.all_to_all" in hlo_off and "pallas_call" not in hlo_off
+        assert "stablehlo.all_to_all" not in hlo_on
         if not is_cpu_interpret:
-            assert "pallas_call" in hlo_on
+            assert "tpu_custom_call" in hlo_on or "small_all_to_all" in hlo_on
         else:
             assert "callback" in hlo_on or "pallas_call" in hlo_on
 
