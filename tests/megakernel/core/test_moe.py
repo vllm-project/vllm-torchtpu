@@ -108,6 +108,7 @@ class _FakeMoEStream:
         self.sp = sp
         self.W = W
         self.scr = scr
+        self.cur_layer: Any = jnp.int32(0)
 
     def expert_stream(self) -> Any:
         return contextlib.nullcontext()
@@ -127,7 +128,7 @@ class _FakeMoEStream:
         w_buf = self.scr[f"_w_{kind}"]
         w_sem = self.scr[f"_w_sem_{kind}"]
         for t in range(nt):
-            cp = pltpu.make_async_copy(self.W[kind].at[0, t], w_buf, w_sem)
+            cp = pltpu.make_async_copy(self.W[kind].at[self.cur_layer, t], w_buf, w_sem)
             cp.start()
             cp.wait()
             acc = acc + self.mm(x[:, t * tk : (t + 1) * tk], w_buf[...])
@@ -331,6 +332,8 @@ def _run_moe_numerical_parity_case(
     IR: int = 128,
     ebank: int = 256 << 10,
     nbe: int = 4,
+    e_slots: int = 0,
+    L: int = 1,
     interpret: bool = True,
 ) -> None:
     """Compare `MoEModule.emit` in Pallas against a pure-JAX reference."""
@@ -339,7 +342,9 @@ def _run_moe_numerical_parity_case(
 
     E, TOPK, ISR = 128, 2, 128
     ER = E // R
-    EW = E if moe_tp else ER
+    EW = e_slots if e_slots > 0 else (E if moe_tp else ER)
+    EXTRA = EW - ER
+    ecopy = not moe_tp and e_slots > ER
     tiles = dataclasses.replace(
         TINY_TILES, bank=512 << 10, ebank=ebank, nbe=nbe, war=1, mb8=2
     ).with_modules(
@@ -356,7 +361,7 @@ def _run_moe_numerical_parity_case(
         B=2, T=1, R=R, ctx=128, stack_e=True, tiles=tiles, interpret=interpret
     )
     g = FakeGeometry(
-        L=1,
+        L=L,
         att_every=1,
         H=H,
         NH=2,
@@ -367,6 +372,7 @@ def _run_moe_numerical_parity_case(
         I=IR * R if moe_tp else IR,
         IS=ISR * R,
         moe_tp=moe_tp,
+        e_slots=e_slots,
     )
     moe = MoEModule()
     ms = ModelSpec("moe_num", config=g, layer_type=LayerType("lt", slots=(moe,)))
@@ -374,6 +380,7 @@ def _run_moe_numerical_parity_case(
     mp = cp.module("moe")
     assert mp.PIPE is pipe
     assert mp.PIPE_EP is pipe_ep
+    assert mp.ECOPY is ecopy
     assert mp.unroll is bool(moe_unroll or pipe_ep)
     assert mp.group_rel is (moe_group_rows >= ex.B)
     if H == 512 and IR == 256 and ebank == (64 << 10):
@@ -382,69 +389,164 @@ def _run_moe_numerical_parity_case(
         assert mp.T13 == 2 * mp.T2
     p = cp.plan
     wsh = planner.weight_shapes(ms, ex, p)
-    osh = planner.kernel_out_shapes(ms, ex, p)
     s_names = list(scratch.keys())
 
     with jax.default_device(jax.devices("cpu")[0]):
-        keys = jax.random.split(jax.random.PRNGKey(101), 12)
+        keys = jax.random.split(jax.random.PRNGKey(101 + L * 17 + e_slots), 12)
         hid = jax.random.normal(keys[0], (ex.M, H), dtype=BF16) * 0.5
         post_norm = jax.random.uniform(
-            keys[1], (H,), dtype=F32, minval=-0.2, maxval=0.2
+            keys[1], (L, H), dtype=F32, minval=-0.2, maxval=0.2
         )
-
-        # Construct router weights so token 0 strongly prefers experts on rank 0
-        # and token 1 strongly prefers experts on rank (R - 1), exercising both
-        # ranks and the multi-hit expert loop.
-        x_norm0 = rmsnorm(
-            hid[: ex.B].astype(F32),
-            post_norm,
-            g.eps,
-            zero_centered=g.zero_centered_norm,
-        ).astype(BF16)
-        router_f32 = jax.random.normal(keys[2], (H, E), dtype=F32) * 0.05
-        b0_dir = x_norm0[0].astype(F32)
-        b1_dir = x_norm0[1].astype(F32)
-        e_r0_a, e_r0_b = 2, 5
-        e_r1_a, e_r1_b = (R - 1) * ER + 3, (R - 1) * ER + 7
-        router_f32 = router_f32.at[:, e_r0_a].add(b0_dir * 2.0)
-        router_f32 = router_f32.at[:, e_r0_b].add(b0_dir * 1.5)
-        router_f32 = router_f32.at[:, e_r1_a].add(b1_dir * 2.0)
-        router_f32 = router_f32.at[:, e_r1_b].add(b1_dir * 1.5)
-        router = router_f32.astype(BF16)
-
-        sh_gate = jax.random.normal(keys[3], (H,), dtype=F32) * 0.2
-        sh13 = (jax.random.normal(keys[4], (R, H, 2 * ISR), dtype=F32) * 0.4).astype(
+        router_noise = jax.random.normal(keys[2], (L, H, E), dtype=F32) * 0.02
+        sh_gate = jax.random.normal(keys[3], (L, H), dtype=F32) * 0.2
+        sh13 = (jax.random.normal(keys[4], (R, L, H, 2 * ISR), dtype=F32) * 0.4).astype(
             FP8
         )
         sh13_s = jax.random.uniform(
-            keys[5], (R, 2 * ISR), dtype=F32, minval=0.05, maxval=0.15
+            keys[5], (R, L, 2 * ISR), dtype=F32, minval=0.05, maxval=0.15
         )
-        sh2 = (jax.random.normal(keys[6], (R, ISR, H), dtype=F32) * 0.4).astype(FP8)
-        sh2_s = jax.random.uniform(keys[7], (R, H), dtype=F32, minval=0.05, maxval=0.15)
-        e13 = (jax.random.normal(keys[8], (R, EW, H, 2 * IR), dtype=F32) * 0.4).astype(
+        sh2 = (jax.random.normal(keys[6], (R, L, ISR, H), dtype=F32) * 0.4).astype(FP8)
+        sh2_s = jax.random.uniform(
+            keys[7], (R, L, H), dtype=F32, minval=0.05, maxval=0.15
+        )
+        e13 = (
+            jax.random.normal(keys[8], (R, L, EW, H, 2 * IR), dtype=F32) * 0.4
+        ).astype(FP8)
+        e13_s = jax.random.uniform(
+            keys[9], (R, L, EW, 2 * IR), dtype=F32, minval=0.15, maxval=0.35
+        )
+        e2 = (jax.random.normal(keys[10], (R, L, EW, IR, H), dtype=F32) * 0.4).astype(
             FP8
         )
-        e13_s = jax.random.uniform(
-            keys[9], (R, EW, 2 * IR), dtype=F32, minval=0.05, maxval=0.15
-        )
-        e2 = (jax.random.normal(keys[10], (R, EW, IR, H), dtype=F32) * 0.4).astype(FP8)
         e2_s = jax.random.uniform(
-            keys[11], (R, EW, H), dtype=F32, minval=0.05, maxval=0.15
+            keys[11], (R, L, EW, H), dtype=F32, minval=0.15, maxval=0.35
         )
 
+        # Construct per-layer router weights (and replica weights + `ecopy` table
+        # when `ecopy=True`). When `ecopy=True`, both tokens pick from rank 0's
+        # experts `{2, 5, 8}` (`token 0 -> (2, 5)`, `token 1 -> (2, 8)`), and each
+        # layer replicates a different rank-0 expert onto rank 1 (`layer 0`:
+        # expert 5 -> rank 1 slot `ER + 0`; `layer 1`: expert 8 -> rank 1 slot
+        # `ER + 1`), exercising the `on_layer_start` double-buffer (`slot=0` then
+        # `slot=1`).
+        res = hid[: ex.B].astype(F32)
+        routers = []
+        ecopy_tbl = jnp.zeros((R, L, E), dtype=F32)
+        partials_by_layer: list[list[jax.Array]] = []
+        ref_outs_by_layer: list[jax.Array] = []
+
+        for lyr in range(L):
+            x_moe = rmsnorm(
+                res,
+                post_norm[lyr],
+                g.eps,
+                zero_centered=g.zero_centered_norm,
+            )
+            xb_moe = x_moe.astype(BF16).astype(F32)
+            x0, x1 = xb_moe[0], xb_moe[1]
+            u0 = x0 - (jnp.dot(x0, x1) / jnp.dot(x1, x1)) * x1
+            u1 = x1 - (jnp.dot(x1, x0) / jnp.dot(x0, x0)) * x0
+            d0 = u0 / jnp.dot(x0, u0)
+            d1 = u1 / jnp.dot(x1, u1)
+
+            r_l = router_noise[lyr]
+            if ecopy:
+                r_l = r_l.at[:, 2].add((d0 + d1) * 4.0)
+                r_l = r_l.at[:, 5].add(d0 * 3.0)
+                r_l = r_l.at[:, 8].add(d1 * 3.0)
+                rep_e = 5 if (lyr % 2 == 0) else 8
+                rep_extra = lyr % EXTRA
+                rep_slot = ER + rep_extra
+                rep_code = 1 + 1 * EXTRA + rep_extra
+                ecopy_tbl = ecopy_tbl.at[:, lyr, rep_e].set(float(rep_code))
+                e13 = e13.at[1, lyr, rep_slot].set(e13[0, lyr, rep_e])
+                e13_s = e13_s.at[1, lyr, rep_slot].set(e13_s[0, lyr, rep_e])
+                e2 = e2.at[1, lyr, rep_slot].set(e2[0, lyr, rep_e])
+                e2_s = e2_s.at[1, lyr, rep_slot].set(e2_s[0, lyr, rep_e])
+            else:
+                e_r0_a, e_r0_b = 2, 5
+                e_r1_a, e_r1_b = (R - 1) * ER + 3, (R - 1) * ER + 7
+                r_l = r_l.at[:, e_r0_a].add(d0 * 4.0)
+                r_l = r_l.at[:, e_r0_b].add(d0 * 3.0)
+                r_l = r_l.at[:, e_r1_a].add(d1 * 4.0)
+                r_l = r_l.at[:, e_r1_b].add(d1 * 3.0)
+                rep_e = -1
+                rep_slot = -1
+
+            router_l = r_l.astype(BF16)
+            routers.append(router_l)
+
+            logits = xb_moe @ router_l.astype(F32)
+            probs = jax.nn.softmax(logits, axis=-1)
+            top_vals, top_idx = lax.top_k(probs, TOPK)
+            if ecopy:
+                assert list(map(int, top_idx[0])) == [2, 5]
+                assert list(map(int, top_idx[1])) == [2, 8]
+            top_w = top_vals / jnp.sum(top_vals, axis=-1, keepdims=True)
+            sg = jax.nn.sigmoid(
+                jnp.sum(x_moe * sh_gate[lyr][None, :], axis=-1, keepdims=True)
+            )
+            partials_l: list[jax.Array] = []
+            for r in range(R):
+                g13 = (xb_moe @ sh13[r, lyr].astype(F32)) * sh13_s[r, lyr]
+                mid_sh = (
+                    round_bf16(
+                        round_bf16(jax.nn.silu(round_bf16(g13[:, :ISR])))
+                        * round_bf16(g13[:, ISR:])
+                    )
+                    .astype(BF16)
+                    .astype(F32)
+                )
+                part_r = (mid_sh @ sh2[r, lyr].astype(F32)) * sh2_s[r, lyr] * sg
+                for b in range(ex.B):
+                    for k in range(TOPK):
+                        e = int(top_idx[b, k])
+                        if ecopy and e == rep_e:
+                            owner_r, w_slot = 1, rep_slot
+                        else:
+                            owner_r = r if moe_tp else (e // ER)
+                            w_slot = e if moe_tp else (e - owner_r * ER)
+                        if owner_r != r:
+                            continue
+                        h_e = (
+                            xb_moe[b : b + 1] @ e13[r, lyr, w_slot].astype(F32)
+                        ) * e13_s[r, lyr, w_slot]
+                        mid_e = (
+                            round_bf16(
+                                round_bf16(jax.nn.silu(round_bf16(h_e[:, :IR])))
+                                * round_bf16(h_e[:, IR:])
+                            )
+                            .astype(BF16)
+                            .astype(F32)
+                        )
+                        y_e = round_bf16(
+                            (mid_e @ e2[r, lyr, w_slot].astype(F32))
+                            * e2_s[r, lyr, w_slot]
+                        )
+                        part_r = part_r.at[b : b + 1].add(top_w[b, k] * y_e)
+                partials_l.append(part_r.astype(BF16).astype(F32))
+            partials_by_layer.append(partials_l)
+            ref_outs_by_layer.append(
+                (res + jnp.sum(jnp.stack(partials_l, axis=0), axis=0)).astype(BF16)
+            )
+
+        router = jnp.stack(routers, axis=0)
         lay = p.smalls_layout
-        sm = jnp.zeros((R, 1, 1, p.smalls_width), dtype=F32)
-        for name, val in (
-            ("post_norm", jnp.broadcast_to(post_norm[None, :], (R, H))),
+        sm = jnp.zeros((R, L, 1, p.smalls_width), dtype=F32)
+        sm_items = [
+            ("post_norm", jnp.broadcast_to(post_norm[None, ...], (R, L, H))),
             ("sh13_s", sh13_s),
             ("sh2_s", sh2_s),
-            ("sh_gate", jnp.broadcast_to(sh_gate[None, :], (R, H))),
-        ):
+            ("sh_gate", jnp.broadcast_to(sh_gate[None, ...], (R, L, H))),
+        ]
+        if ecopy:
+            sm_items.append(("ecopy", ecopy_tbl))
+        for name, val in sm_items:
             o, w = lay[name]
-            sm = sm.at[:, 0, 0, o : o + w].set(val)
+            sm = sm.at[:, :, 0, o : o + w].set(val)
 
         w_by_name = {
-            "router": jnp.broadcast_to(router[None, ...], (R, 1, H, E)).reshape(
+            "router": jnp.broadcast_to(router[None, ...], (R, L, H, E)).reshape(
                 R, *wsh["router"][0]
             ),
             "sh13": sh13.reshape(R, *wsh["sh13"][0]),
@@ -455,53 +557,6 @@ def _run_moe_numerical_parity_case(
             "smalls": sm,
             "final_norm": jnp.zeros((R, *wsh["final_norm"][0]), dtype=F32),
         }
-
-        # Pure-JAX MoE reference: RMSNorm -> router softmax + top-k -> shared + routed
-        res = hid[: ex.B].astype(F32)
-        x_moe = rmsnorm(res, post_norm, g.eps, zero_centered=g.zero_centered_norm)
-        xb_moe = x_moe.astype(BF16).astype(F32)
-
-        logits = xb_moe @ router.astype(F32)
-        probs = jax.nn.softmax(logits, axis=-1)
-        top_vals, top_idx = lax.top_k(probs, TOPK)
-        top_w = top_vals / jnp.sum(top_vals, axis=-1, keepdims=True)
-
-        sg = jax.nn.sigmoid(jnp.sum(x_moe * sh_gate[None, :], axis=-1, keepdims=True))
-        partials = []
-        for r in range(R):
-            g13 = (xb_moe @ sh13[r].astype(F32)) * sh13_s[r]
-            mid_sh = (
-                round_bf16(
-                    round_bf16(jax.nn.silu(round_bf16(g13[:, :ISR])))
-                    * round_bf16(g13[:, ISR:])
-                )
-                .astype(BF16)
-                .astype(F32)
-            )
-            part_r = (mid_sh @ sh2[r].astype(F32)) * sh2_s[r] * sg
-            for b in range(ex.B):
-                for k in range(TOPK):
-                    e = int(top_idx[b, k])
-                    if not moe_tp and (e // ER) != r:
-                        continue
-                    w_slot = e if moe_tp else (e - r * ER)
-                    h_e = (xb_moe[b : b + 1] @ e13[r, w_slot].astype(F32)) * e13_s[
-                        r, w_slot
-                    ]
-                    mid_e = (
-                        round_bf16(
-                            round_bf16(jax.nn.silu(round_bf16(h_e[:, :IR])))
-                            * round_bf16(h_e[:, IR:])
-                        )
-                        .astype(BF16)
-                        .astype(F32)
-                    )
-                    y_e = round_bf16(
-                        (mid_e @ e2[r, w_slot].astype(F32)) * e2_s[r, w_slot]
-                    )
-                    part_r = part_r.at[b : b + 1].add(top_w[b, k] * y_e)
-            partials.append(part_r.astype(BF16).astype(F32))
-        ref_out = (res + jnp.sum(jnp.stack(partials, axis=0), axis=0)).astype(BF16)
 
     def pallas_body(pos_ref, hid_ref, *rest):
         n_w, n_o = len(p.w_names), len(p.o_names)
@@ -532,22 +587,33 @@ def _run_moe_numerical_parity_case(
         scr["mix"][...] = jnp.zeros(scr["mix"].shape, F32)
         moe.init_buffers(ctx)
 
-        pltpu.make_async_copy(
-            W["smalls"].at[0], scr["sm"].at[0], scr["sm_sem"].at[0]
-        ).wait()
-        moe.on_layer_start(ctx, jnp.int32(0), jnp.int32(0))
-        ctx.apply_input_norm(moe.input_norm, jnp.int32(0))
-        part_moe = moe.emit(ctx, jnp.int32(0), jnp.int32(0))
-        out_refs["hidden"][: ex.MB] = part_moe.astype(BF16)
-        if ex.MB < ex.M:
-            out_refs["hidden"][ex.MB :] = jnp.zeros((ex.M - ex.MB, H), BF16)
+        for lyr in range(L):
+            slot = lyr % 2
+            l_i32 = jnp.int32(lyr)
+            s_i32 = jnp.int32(slot)
+            ring.cur_layer = l_i32
+            pltpu.make_async_copy(
+                W["smalls"].at[lyr], scr["sm"].at[slot], scr["sm_sem"].at[slot]
+            ).wait()
+            if lyr + 1 < L:
+                pltpu.make_async_copy(
+                    W["smalls"].at[lyr + 1],
+                    scr["sm"].at[1 - slot],
+                    scr["sm_sem"].at[1 - slot],
+                ).start()
+            moe.on_layer_start(ctx, l_i32, s_i32)
+            ctx.apply_input_norm(moe.input_norm, s_i32)
+            part_moe = moe.emit(ctx, l_i32, s_i32)
+            out_refs["hidden"][lyr, : ex.MB] = part_moe.astype(BF16)
+            if ex.MB < ex.M:
+                out_refs["hidden"][lyr, ex.MB :] = jnp.zeros((ex.M - ex.MB, H), BF16)
 
     in_specs = [
         pl.BlockSpec(memory_space=pltpu.SMEM),
         pl.BlockSpec(memory_space=pltpu.VMEM),
     ] + [pl.BlockSpec(memory_space=pltpu.HBM) for _ in p.w_names]
     out_specs = [pl.BlockSpec(memory_space=pltpu.VMEM) for _ in p.o_names]
-    out_shape = [jax.ShapeDtypeStruct(*osh[k]) for k in p.o_names]
+    out_shape = [jax.ShapeDtypeStruct((L, ex.M, H), BF16)]
 
     call = pl.pallas_call(
         pallas_body,
@@ -563,7 +629,7 @@ def _run_moe_numerical_parity_case(
     w_all = [w_by_name[k] for k in p.w_names]
     if R == 1:
         (part_out,) = jax.jit(call)(pos, hid, *[w[0] for w in w_all])
-        part_ranks = part_out[None, : ex.B]
+        part_ranks = part_out[None, :, : ex.B]
     else:
         mesh = Mesh(devs[:R], ("tp",))
         step = jax.jit(
@@ -578,17 +644,26 @@ def _run_moe_numerical_parity_case(
             )
         )
         hid_rep = jnp.broadcast_to(hid[None, ...], (R, ex.M, H))
-        part_ranks = step(pos, hid_rep, *w_all)[:, : ex.B]
+        part_ranks = step(pos, hid_rep, *w_all)[:, :, : ex.B]
 
-    for r in range(R):
-        assert float(jnp.max(jnp.abs(partials[r]))) >= 0.08
-        assert jnp.allclose(
-            part_ranks[r].astype(F32), partials[r], atol=2e-2, rtol=2e-2
+    for lyr in range(L):
+        for r in range(R):
+            assert float(jnp.max(jnp.abs(partials_by_layer[lyr][r]))) >= 0.08
+            assert jnp.allclose(
+                part_ranks[r, lyr].astype(F32),
+                partials_by_layer[lyr][r],
+                atol=2e-2,
+                rtol=2e-2,
+            )
+        actual_out = (res + jnp.sum(part_ranks[:, lyr].astype(F32), axis=0)).astype(
+            BF16
         )
-    actual_out = (res + jnp.sum(part_ranks.astype(F32), axis=0)).astype(BF16)
-    assert jnp.allclose(
-        actual_out.astype(F32), ref_out.astype(F32), atol=2e-2, rtol=2e-2
-    )
+        assert jnp.allclose(
+            actual_out.astype(F32),
+            ref_outs_by_layer[lyr].astype(F32),
+            atol=2e-2,
+            rtol=2e-2,
+        )
 
 
 @pytest.mark.parametrize(
@@ -603,18 +678,21 @@ def _run_moe_numerical_parity_case(
         "IR",
         "ebank",
         "nbe",
+        "e_slots",
+        "L",
     ),
     [
-        (False, 1, False, False, False, 40, 128, 128, 256 << 10, 4),
-        (True, 1, False, False, False, 40, 128, 128, 256 << 10, 4),
-        (True, 1, True, False, False, 40, 128, 128, 256 << 10, 4),
-        (False, 2, False, False, False, 40, 128, 128, 256 << 10, 4),
-        (False, 2, True, False, False, 40, 128, 128, 256 << 10, 4),
-        (True, 2, True, False, False, 40, 128, 128, 256 << 10, 4),
-        (False, 1, False, True, True, 40, 256, 128, 32 << 10, 6),
-        (False, 1, False, False, False, 40, 512, 256, 64 << 10, 8),
-        (False, 1, False, False, True, 40, 512, 256, 64 << 10, 8),
-        (False, 1, False, False, True, 0, 512, 256, 64 << 10, 8),
+        (False, 1, False, False, False, 40, 128, 128, 256 << 10, 4, 0, 1),
+        (True, 1, False, False, False, 40, 128, 128, 256 << 10, 4, 0, 1),
+        (True, 1, True, False, False, 40, 128, 128, 256 << 10, 4, 0, 1),
+        (False, 2, False, False, False, 40, 128, 128, 256 << 10, 4, 0, 1),
+        (False, 2, True, False, False, 40, 128, 128, 256 << 10, 4, 0, 1),
+        (True, 2, True, False, False, 40, 128, 128, 256 << 10, 4, 0, 1),
+        (False, 2, True, False, False, 40, 128, 128, 256 << 10, 4, 70, 2),
+        (False, 1, False, True, True, 40, 256, 128, 32 << 10, 6, 0, 1),
+        (False, 1, False, False, False, 40, 512, 256, 64 << 10, 8, 0, 1),
+        (False, 1, False, False, True, 40, 512, 256, 64 << 10, 8, 0, 1),
+        (False, 1, False, False, True, 0, 512, 256, 64 << 10, 8, 0, 1),
     ],
     ids=[
         "ep_r1_unpiped_1t",
@@ -623,6 +701,7 @@ def _run_moe_numerical_parity_case(
         "ep_r2_unpiped_1t",
         "ep_r2_pipe",
         "tp_r2_pipe",
+        "ep_r2_ecopy_l2",
         "ep_r1_pipe_ep",
         "ep_r1_multitile_rolled",
         "ep_r1_multitile_unroll_group_rel",
@@ -640,6 +719,8 @@ def test_moe_module_numerical_parity(
     IR: int,
     ebank: int,
     nbe: int,
+    e_slots: int,
+    L: int,
 ):
     """Compare `MoEModule.emit` in Pallas `interpret=True` against a JAX reference."""
     _run_moe_numerical_parity_case(
@@ -653,6 +734,8 @@ def test_moe_module_numerical_parity(
         IR=IR,
         ebank=ebank,
         nbe=nbe,
+        e_slots=e_slots,
+        L=L,
         interpret=True,
     )
 
@@ -661,6 +744,7 @@ def test_moe_module_numerical_parity(
 @pytest.mark.parametrize(
     (
         "moe_tp",
+        "R",
         "pipe",
         "pipe_ep",
         "moe_unroll",
@@ -669,13 +753,16 @@ def test_moe_module_numerical_parity(
         "IR",
         "ebank",
         "nbe",
+        "e_slots",
+        "L",
     ),
     [
-        (True, True, False, False, 40, 128, 128, 256 << 10, 4),
-        (False, False, True, True, 40, 256, 128, 32 << 10, 6),
-        (False, False, False, False, 40, 512, 256, 64 << 10, 8),
-        (False, False, False, True, 40, 512, 256, 64 << 10, 8),
-        (False, False, False, True, 0, 512, 256, 64 << 10, 8),
+        (True, 1, True, False, False, 40, 128, 128, 256 << 10, 4, 0, 1),
+        (False, 1, False, True, True, 40, 256, 128, 32 << 10, 6, 0, 1),
+        (False, 1, False, False, False, 40, 512, 256, 64 << 10, 8, 0, 1),
+        (False, 1, False, False, True, 40, 512, 256, 64 << 10, 8, 0, 1),
+        (False, 1, False, False, True, 0, 512, 256, 64 << 10, 8, 0, 1),
+        (False, 2, True, False, False, 40, 128, 128, 256 << 10, 4, 70, 2),
     ],
     ids=[
         "tpu_pipe",
@@ -683,10 +770,12 @@ def test_moe_module_numerical_parity(
         "tpu_multitile_rolled",
         "tpu_multitile_unroll_group_rel",
         "tpu_multitile_unroll_no_group_rel",
+        "tpu_ep_r2_ecopy_l2",
     ],
 )
 def test_moe_module_numerical_parity_on_tpu(
     moe_tp: bool,
+    R: int,
     pipe: bool,
     pipe_ep: bool,
     moe_unroll: bool,
@@ -695,18 +784,20 @@ def test_moe_module_numerical_parity_on_tpu(
     IR: int,
     ebank: int,
     nbe: int,
+    e_slots: int,
+    L: int,
 ):
     """Run MoE numerical parity on TPU (`interpret=False`)."""
     try:
         tpu_devs = jax.devices("tpu")
     except RuntimeError:
         tpu_devs = []
-    if not tpu_devs:
-        pytest.skip("TPU device required for interpret=False Pallas execution")
+    if len(tpu_devs) < R:
+        pytest.skip(f"{R} TPU device(s) required for interpret=False Pallas execution")
     with jax.default_device(tpu_devs[0]):
         _run_moe_numerical_parity_case(
             moe_tp=moe_tp,
-            R=1,
+            R=R,
             pipe=pipe,
             pipe_ep=pipe_ep,
             moe_unroll=moe_unroll,
@@ -715,6 +806,8 @@ def test_moe_module_numerical_parity_on_tpu(
             IR=IR,
             ebank=ebank,
             nbe=nbe,
+            e_slots=e_slots,
+            L=L,
             interpret=False,
         )
 
