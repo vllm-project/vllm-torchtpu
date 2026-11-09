@@ -80,6 +80,17 @@ def _type_of(entry: str) -> str:
     return body.split(" ", 1)[0]
 
 
+def _module_open(text: str) -> tuple[int, int]:
+    """`(start, end)` of the module header: `module @name attributes {...} {`,
+    `end` just past its body's opening brace."""
+    start = text.index("module")
+    brace = text.index("{", start)
+    attr_at = text.find("attributes", start)
+    if 0 <= attr_at < brace:
+        brace = text.index("{", _close(text, text.index("{", attr_at), "{", "}"))
+    return start, brace + 1
+
+
 class _Main:
     """The parsed `@main` of a module: its signature and where it sits."""
 
@@ -125,7 +136,7 @@ def _branch_functions(text: str, n: int) -> str:
     for name in sorted(set(_SYMBOL.findall(text)) - {f"branch_{n}"}, key=len, reverse=True):
         text = re.sub(rf"@{re.escape(name)}\b", f"@b{n}_{name}", text)
     text = text.replace("func.func public", "func.func private")
-    start = text.index("{", text.index("module")) + 1
+    _, start = _module_open(text)
     return text[start : text.rindex("}")].strip("\n") + "\n"
 
 
@@ -180,14 +191,7 @@ def compose_by_request_count(
     return {", ".join(f"%out#{i}" for i in range(len(rets)))} : {rt}
   }}
 """
-    module_start = largest_text.index("module")
-    module_head = largest_text[module_start : largest_text.index("{", module_start) + 1]
-    # A module header `attributes {...}` has its own braces: keep it whole.
-    attr_at = largest_text.find("attributes", module_start)
-    brace = largest_text.index("{", module_start)
-    if 0 <= attr_at < brace:
-        brace = largest_text.index("{", attr_at)
-        module_head = largest_text[module_start : _close(largest_text, brace, "{", "}")]
-        module_head += " {"
+    module_start, body_start = _module_open(largest_text)
+    module_head = largest_text[module_start:body_start]
     bodies = "".join(_branch_functions(variants[n], n) for n in ns)
     return f"{module_head}\n{bodies}{main}}}\n"
