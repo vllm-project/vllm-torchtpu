@@ -475,9 +475,25 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
         # expert dispatch with AutoWeightsLoader consumption frees each host
         # tensor as soon as its parameter is loaded.
         def _ordinary_weights():
+            num_layers = (
+                getattr(self.config, "num_hidden_layers", None)
+                or len(self.model.layers)
+            )
             for name, loaded_weight in mapper.apply(weights):
                 if name.startswith(("vision_tower.", "mm_projector.")):
                     continue
+                if "layers." in name:
+                    parts = name.split(".")
+                    try:
+                        layers_idx = parts.index("layers")
+                        if (
+                            layers_idx + 1 < len(parts)
+                            and parts[layers_idx + 1].isdigit()
+                            and int(parts[layers_idx + 1]) >= num_layers
+                        ):
+                            continue
+                    except ValueError:
+                        pass
                 if experts_use_weight and name.endswith(".weight_packed"):
                     name = name.replace(".weight_packed", ".weight")
 
@@ -504,6 +520,8 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
                     if weight_name not in name:
                         continue
                     name = name.replace(weight_name, param_name)
+                    if name not in params_dict:
+                        continue
                     parameter = params_dict[name]
                     parameter.weight_loader(
                         parameter,
