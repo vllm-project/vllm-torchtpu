@@ -431,6 +431,7 @@ def lower_torch_draft_to_mlir(
     weight_reshapes: Mapping[str, tuple[int, ...]] | None = None,
     taps: Mapping[str, torch.nn.Module] | None = None,
     tap_names: list[str] | None = None,
+    draft_slots: int | None = None,
 ) -> str:
     """Lowers the drafter `model.<draft_fn>` for `bucket_size` to StableHLO MLIR.
 
@@ -439,7 +440,8 @@ def lower_torch_draft_to_mlir(
     and then the forward's `intermediates` it reads (`hidden_states` for an MTP
     layer), each passed to `draft_fn` by name. It returns the updated states,
     each donated by its input, and `draft_tokens`, then the `taps`' results as
-    in `lower_torch_forward_to_mlir`.
+    in `lower_torch_forward_to_mlir`. With `draft_slots` `N`, the draft runs for
+    the first `N` requests only (`draft_fn`'s `draft_slots`).
     """
     reshapes = dict(weight_reshapes or {})
     num_user = len(user_inputs)
@@ -472,13 +474,17 @@ def lower_torch_draft_to_mlir(
         user_args = {name: args[i] for i, (name, _) in enumerate(user_inputs)}
         for i, (name, _) in enumerate(intermediates):
             user_args[name] = args[intermediate_start + i]
+        slot_args = {} if draft_slots is None else {"draft_slots": draft_slots}
         w_dict = {weight_names[i]: args[num_user + i] for i in range(num_weights)}
         for name, shape in reshapes.items():
             if name in w_dict:
                 w_dict[name] = w_dict[name].reshape(shape)
         with record_module_outputs(taps or {}) as recorded:
             updated_kvs, draft_tokens = draft(
-                w_dict, list(args[state_start:intermediate_start]), **user_args
+                w_dict,
+                list(args[state_start:intermediate_start]),
+                **user_args,
+                **slot_args,
             )
         if tap_names is not None:
             tap_names[:] = [n for n, _ in recorded]
@@ -488,7 +494,10 @@ def lower_torch_draft_to_mlir(
         _torch_draft_entry,
         all_specs,
         donate_argnums=donate_argnums,
-        module_name=f"draft{'_debug' if taps else ''}_bucket{bucket_size}",
+        module_name=(
+            f"draft{'_debug' if taps else ''}_bucket{bucket_size}"
+            + (f"_slots{draft_slots}" if draft_slots is not None else "")
+        ),
     )
     return set_aliasing_outputs(
         mlir_text, {arg: i for i, arg in enumerate(donate_argnums)}
