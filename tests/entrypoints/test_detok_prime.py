@@ -16,7 +16,8 @@
 A detokenizer primed with the prompt tail must emit the same deltas, stop
 strings and final text as one primed with the whole prompt, for every prompt
 and output. Real tokenizers are loaded from the HF hub (or local paths via
-DETOK_PRIME_TEST_MODELS) and skipped when unavailable; DETOK_PRIME_TEST_GLM points at GLM-5.2's.
+DETOK_PRIME_TEST_MODELS) and skipped when unavailable; DETOK_PRIME_TEST_GLM
+points at GLM-5.2's.
 """
 
 import os
@@ -32,6 +33,7 @@ from vllm_torchtpu.detok_prime import (
     _PrimedRequest,
     patch_detokenizer_prime_tail,
     prime_ids,
+    tail_priming_is_exact,
 )
 
 transformers = pytest.importorskip("transformers")
@@ -156,9 +158,7 @@ def _gen_case(rng, tok):
     elif kind == "split":
         # One encoded text split inside a character, across the prompt boundary.
         ids = tok.encode(_random_text(rng, rng.randint(2, 8)), add_special_tokens=False)
-        cuts = [
-            k for k in range(1, len(ids)) if tok.decode(ids[:k]).endswith("�")
-        ]
+        cuts = [k for k in range(1, len(ids)) if tok.decode(ids[:k]).endswith("�")]
         k = rng.choice(cuts) if cuts else rng.randrange(1, max(2, len(ids)))
         prompt, out = prompt + ids[:k], ids[k:] or ids[-1:]
     elif kind == "specials":
@@ -197,7 +197,9 @@ def _params(rng, tok, out_ids):
 
 
 def _check(tok, prompt, out, params, n, rng):
-    req = SimpleNamespace(request_id="r", prompt_token_ids=prompt, sampling_params=params)
+    req = SimpleNamespace(
+        request_id="r", prompt_token_ids=prompt, sampling_params=params
+    )
     tail = prime_ids(tok._tokenizer, prompt, params.skip_special_tokens, n)
     primed = req if tail is prompt else _PrimedRequest(req, tail)
     chunks = []
@@ -250,27 +252,36 @@ def test_glm_long_chat_prompts():
     rng = random.Random(3)
     for _ in range(20):
         msgs = [
-            {"role": rng.choice(["user", "assistant"]), "content": _random_text(rng, 40)}
+            {
+                "role": rng.choice(["user", "assistant"]),
+                "content": _random_text(rng, 40),
+            }
             for _ in range(rng.randint(2, 12))
         ]
         msgs[-1]["role"] = "user"
-        prompt = tok.apply_chat_template(msgs, add_generation_prompt=True, tokenize=True)
+        prompt = tok.apply_chat_template(
+            msgs, add_generation_prompt=True, tokenize=True
+        )
         if not isinstance(prompt, list):
             prompt = prompt["input_ids"]
-        out = tok.encode("<think>" + _random_text(rng, 6) + "</think>", add_special_tokens=False)
+        out = tok.encode(
+            "<think>" + _random_text(rng, 6) + "</think>", add_special_tokens=False
+        )
         _check(tok, prompt, out, _params(rng, tok, out), 32, rng)
 
 
-def test_patch_installs_and_primes_tail(monkeypatch):
-    tok = _load("toy")
+def _unpatched(monkeypatch):
+    """Give the test the original FastIncrementalDetokenizer.__init__ and put
+    it back at teardown, whatever the test installs."""
     cls = vllm_detok.FastIncrementalDetokenizer
-    monkeypatch.setenv("VLLM_TPU_DETOK_PRIME_TOKENS", "8")
-    if getattr(cls, "_tpu_detok_prime_tokens", None) is not None:
-        monkeypatch.setattr(cls, "__init__", cls._tpu_detok_orig_init)
+    original = getattr(cls, "_tpu_detok_orig_init", None) or cls.__init__
+    monkeypatch.setattr(cls, "__init__", original)
+    monkeypatch.setattr(cls, "_tpu_detok_orig_init", None, raising=False)
     monkeypatch.setattr(cls, "_tpu_detok_prime_tokens", None, raising=False)
-    patch_detokenizer_prime_tail()
-    assert cls._tpu_detok_prime_tokens == 8
+    return cls
 
+
+def _record_primed_lengths(monkeypatch):
     seen = []
     real = tokenizers.decoders.DecodeStream
 
@@ -279,15 +290,60 @@ def test_patch_installs_and_primes_tail(monkeypatch):
         return real(ids=ids, skip_special_tokens=skip_special_tokens)
 
     monkeypatch.setattr(tokenizers.decoders, "DecodeStream", recording)
+    return seen
+
+
+def test_patch_installs_and_primes_tail(monkeypatch):
+    tok = _load("toy")
+    cls = _unpatched(monkeypatch)
+    monkeypatch.setenv("VLLM_TPU_DETOK_PRIME_TOKENS", "8")
+    patch_detokenizer_prime_tail()
+    assert cls._tpu_detok_prime_tokens == 8
+
+    seen = _record_primed_lengths(monkeypatch)
     prompt = tok.encode(_random_text(random.Random(0), 30), add_special_tokens=False)
     out = tok.encode(" 東京 😀 done", add_special_tokens=False)
     params = SamplingParams(max_tokens=64)
-    req = SimpleNamespace(request_id="r", prompt_token_ids=prompt, sampling_params=params)
+    req = SimpleNamespace(
+        request_id="r", prompt_token_ids=prompt, sampling_params=params
+    )
     d = vllm_detok.FastIncrementalDetokenizer(tok, req)
     ref = _make(tok, req)
     assert seen[0] <= 16 < len(prompt)
     chunks = [1] * len(out)
     assert _drive(d, out, chunks, False) == _drive(ref, out, chunks, False)
+
+
+@pytest.mark.parametrize("name", ["toy", *MODELS])
+def test_tested_tokenizers_are_on_the_exact_list(name):
+    """_TAIL_EXACT_DECODERS lists what these tokenizers' decoders use; a
+    tokenizer added here with another decoder type must extend it."""
+    assert tail_priming_is_exact(_load(name)._tokenizer)
+
+
+def test_unlisted_decoder_primes_with_the_whole_prompt(monkeypatch):
+    tok = _toy_tokenizer()
+    tok._tokenizer.decoder = decoders.BPEDecoder()
+    assert not tail_priming_is_exact(tok._tokenizer)
+    _unpatched(monkeypatch)
+    monkeypatch.setenv("VLLM_TPU_DETOK_PRIME_TOKENS", "8")
+    patch_detokenizer_prime_tail()
+
+    seen = _record_primed_lengths(monkeypatch)
+    prompt = tok.encode(_random_text(random.Random(0), 30), add_special_tokens=False)
+    req = SimpleNamespace(
+        request_id="r", prompt_token_ids=prompt, sampling_params=SamplingParams()
+    )
+    vllm_detok.FastIncrementalDetokenizer(tok, req)
+    assert len(prompt) > 8
+    assert seen == [len(prompt)]
+
+
+def test_negative_prime_tokens_is_refused(monkeypatch):
+    _unpatched(monkeypatch)
+    monkeypatch.setenv("VLLM_TPU_DETOK_PRIME_TOKENS", "-1")
+    with pytest.raises(ValueError, match="VLLM_TPU_DETOK_PRIME_TOKENS"):
+        patch_detokenizer_prime_tail()
 
 
 def test_prime_ids_edges():
