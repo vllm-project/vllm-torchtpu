@@ -1739,7 +1739,7 @@ def sparse_mla_pcp_write_split(
         split_qsl_,
     ):
         gather = functools.partial(
-            ws.pcp_gather_rows, axis_name=dcp_axis_name, pcp_size=pcp_size
+            ws.pcp_gather_rows, dcp_axis_name=dcp_axis_name, pcp_size=pcp_size
         )
         return update_sparse_mla_kv_cache_dcp(
             kv_cache_nope,
@@ -1864,6 +1864,7 @@ def sparse_mla_attention_pcp_prefill(
                 topk_idx,
                 qsl_,
                 ws_page_offset_,
+                qsl_[rd_[2]],
                 page_size=nope_spec.page_size,
                 dcp_size=dcp_size,
                 interleave=interleave_size,
@@ -1876,14 +1877,13 @@ def sparse_mla_attention_pcp_prefill(
             )
 
             # Gather only the chunks in use, then attend once (no merge).
+            # Workspace pages: [chunk, dcp, chunk_pages]
             num_ws_chunks = ws_req_.shape[0] // chunk_pages
             rows_per_chunk = dcp_size * chunk_pages
             ws_rows = num_ws_chunks * rows_per_chunk
 
             def gather_body(c, bufs):
                 buf_nope, buf_rope = bufs
-                # `ws_req` is padded to a multiple of `chunk_pages`, so this
-                # slice never runs off the end (dynamic_slice would shift it).
                 chunk_ids = jax.lax.dynamic_slice_in_dim(
                     pages, c * chunk_pages, chunk_pages
                 )
@@ -1899,6 +1899,8 @@ def sparse_mla_attention_pcp_prefill(
                 return buf_nope, buf_rope
 
             num_chunks = (ws_used_pages_[0] + chunk_pages - 1) // chunk_pages
+            # TODO(weiyulin): This line zero entire workspace, we should benchmark
+            # if this time-consuming.
             init = (
                 jnp.zeros((ws_rows, *nope.shape[1:]), nope.dtype),
                 jnp.zeros((ws_rows, *rope.shape[1:]), rope.dtype),

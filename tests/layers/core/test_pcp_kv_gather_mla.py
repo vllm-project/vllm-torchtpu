@@ -103,6 +103,7 @@ def _fake_runner(num_computed, num_prompt, q_lens, seq_lens):
     lens = np.zeros(LOCAL_REQS, dtype=np.int32)
     lens[: len(seq_lens)] = seq_lens
     return SimpleNamespace(
+        device=torch.device("cpu"),
         input_batch=SimpleNamespace(
             num_computed_tokens_cpu=np.asarray(num_computed, dtype=np.int32),
             num_prompt_tokens=np.asarray(num_prompt, dtype=np.int32),
@@ -302,7 +303,7 @@ def test_pcp_prefill_matches_numpy(monkeypatch, scenario, pcp, layout):
     mesh = _mesh()
     monkeypatch.setattr(envs, "TPU_PCP_KV_CHUNK_TOKENS", CHUNK_TOKENS)
     nope_spec, rope_spec = _specs(KVCacheLayout(layout))
-    chunk_pages = pcp_chunk_pages(PAGE_SIZE, DCP)
+    chunk_pages = pcp_chunk_pages(CHUNK_TOKENS, PAGE_SIZE, DCP)
     rng = np.random.default_rng(zlib.crc32(f"{scenario}-{pcp}-{layout}".encode()))
     tp = DCP // pcp
     steps = SCENARIOS[scenario]
@@ -333,7 +334,15 @@ def test_pcp_prefill_matches_numpy(monkeypatch, scenario, pcp, layout):
                     continue
                 r, pos = tok
                 kv[i], pe[i] = kv_fp8[r][pos], pe_fp8[r][pos]
-                if not st.is_decode[r]:
+                if st.is_decode[r]:
+                    # Decode rows are not in the split prefill; give them high
+                    # cache indices anyway, which the prefill must not read.
+                    topk[i] = rng.choice(
+                        np.arange(WORKSPACE_TOKENS // 2, WORKSPACE_TOKENS),
+                        TOPK,
+                        replace=False,
+                    )
+                else:
                     topk[i] = _topk_row(rng, pos)
                     owner[i] = (r, pos)
             kv_rows.append(kv)

@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""PCP manager KV workspace sizing follows the MLA cache's page size."""
+"""PCP manager config and layer validation, and KV workspace sizing."""
 
 from types import SimpleNamespace
 
@@ -24,10 +24,15 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.layers.adapter.pcp_kv_gather import pcp_chunk_pages
 from vllm_torchtpu.runner.pcp.head_tail_sharding_plan import (
     HeadTailPcpShardingPlan,
     mla_kv_page_size,
+)
+from vllm_torchtpu.runner.pcp.manager import (
+    validate_pcp_manager_config,
+    validate_pcp_manager_layers,
 )
 
 
@@ -67,7 +72,7 @@ def test_set_page_size_resizes_workspace(workspace_tokens, dcp_size):
     m.set_page_size(1024)
     assert m.page_size == 1024
     assert m.virtual_page_size == 1024 * dcp_size
-    chunk_pages = pcp_chunk_pages(1024, dcp_size)
+    chunk_pages = pcp_chunk_pages(envs.TPU_PCP_KV_CHUNK_TOKENS, 1024, dcp_size)
     assert m.num_ws_pages % chunk_pages == 0
     # Covers the requested tokens, overshooting by less than one chunk.
     ws_tokens = m.num_ws_pages * m.virtual_page_size
@@ -103,3 +108,75 @@ def test_mla_kv_page_size_plain_and_uniform_groups():
 def test_mla_kv_page_size_requires_one_size(specs):
     with pytest.raises(ValueError, match="one MLA KV cache block size"):
         mla_kv_page_size(_config(*specs))
+
+
+def _pcp_manager_config(max_model_len=8192, pcp_size=2, tp_size=4):
+    return SimpleNamespace(
+        model_config=SimpleNamespace(
+            use_mla=True,
+            hf_text_config=SimpleNamespace(index_topk=2048),
+            max_model_len=max_model_len,
+            is_multimodal_model=False,
+        ),
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=pcp_size,
+            decode_context_parallel_size=8,
+            tensor_parallel_size=tp_size,
+            pipeline_parallel_size=1,
+            data_parallel_size=1,
+            is_moe_model=False,
+            enable_expert_parallel=False,
+            cp_kv_cache_interleave_size=4,
+        ),
+        scheduler_config=SimpleNamespace(async_scheduling=True),
+        speculative_config=None,
+        lora_config=None,
+    )
+
+
+def test_max_model_len_must_fit_the_kv_workspace(monkeypatch):
+    """One request's context must fit the workspace on its own; the runner
+    chunks a step's split prefills to fit it otherwise."""
+    monkeypatch.setattr(envs, "TPU_PCP_KV_WORKSPACE_TOKENS", 1 << 20)
+    validate_pcp_manager_config(_pcp_manager_config(1 << 20))
+    with pytest.raises(ValueError, match="TPU_PCP_KV_WORKSPACE_TOKENS"):
+        validate_pcp_manager_config(_pcp_manager_config((1 << 20) + 1))
+
+
+def test_pcp_manager_layers_must_opt_in():
+    """An attention layer without `supports_tpu_pcp_manager` (e.g. DeepSeek V4's)
+    would ignore `pcp_metadata`; any such layer fails the check."""
+
+    class _Supported:
+        supports_tpu_pcp_manager = True
+
+    class _Unsupported:
+        pass
+
+    validate_pcp_manager_layers({"a": _Supported(), "b": _Supported()})
+    with pytest.raises(NotImplementedError, match="_Unsupported"):
+        validate_pcp_manager_layers({"a": _Supported(), "b": _Unsupported()})
+
+
+def test_glm_attention_layers_support_the_pcp_manager():
+    from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
+        VllmTPUIndexerCache,
+        VllmTPUMLAAttention,
+    )
+
+    assert VllmTPUMLAAttention.supports_tpu_pcp_manager
+    assert VllmTPUIndexerCache.supports_tpu_pcp_manager
+
+
+def test_pcp_manager_config_rejects_pcp_size_one():
+    """`USE_TPU_PCP_MANAGER=1` with pcp_size == 1 fails the manager's config
+    check."""
+    with pytest.raises(NotImplementedError, match="pcp=1"):
+        validate_pcp_manager_config(_pcp_manager_config(pcp_size=1, tp_size=8))
+
+
+def test_pcp_manager_config_rejects_packed_rope(monkeypatch):
+    """The KV gather workspace has no packed-rope layout."""
+    monkeypatch.setattr(envs, "TPU_SPARSE_MLA_PACKED_ROPE", True)
+    with pytest.raises(NotImplementedError, match="TPU_SPARSE_MLA_PACKED_ROPE"):
+        validate_pcp_manager_config(_pcp_manager_config())

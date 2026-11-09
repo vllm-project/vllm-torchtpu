@@ -81,16 +81,16 @@ class PcpStaticSupportValidator:
                 "cp_kv_cache_interleave_size to be a multiple of 128, "
                 f"got {config.interleave_size}."
             )
+        if envs.USE_TPU_PCP_MANAGER:
+            # TODO(weiyulin): Once we merge two PCP paths, we will validate
+            # in one place. For now, PcpManager.from_vllm_config validates the
+            # config in the workers.
+            return config
         if not config.enabled:
             return config
 
-        if envs.USE_TPU_PCP_MANAGER:
-            from vllm_torchtpu.runner.pcp import validate_pcp_manager_config
-
-            validate_pcp_manager_config(vllm_config)
-            return config
         if config.dcp_size > 1:
-            raise NotImplementedError("PCP with DCP requires USE_TPU_PCP_MANAGER=1.")
+            raise NotImplementedError("PCP runner path does not support DCP yet.")
         if config.is_moe and not config.expert_parallel:
             raise NotImplementedError(
                 "PCP on an MoE model requires --enable-expert-parallel: "

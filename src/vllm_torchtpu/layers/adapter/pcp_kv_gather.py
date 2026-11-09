@@ -19,16 +19,14 @@ from typing import Any
 
 import torch
 
-from vllm_torchtpu import envs
-
 
 def is_pcp_kv_gather_metadata(attn_metadata: Any) -> bool:
     return getattr(attn_metadata, "pcp_metadata", None) is not None
 
 
-def pcp_chunk_pages(page_size: int, dcp_size: int) -> int:
-    """Workspace pages (DCP virtual pages) per gather chunk."""
-    return max(1, envs.TPU_PCP_KV_CHUNK_TOKENS // (int(page_size) * int(dcp_size)))
+def pcp_chunk_pages(chunk_tokens: int, page_size: int, dcp_size: int) -> int:
+    """Workspace pages (DCP virtual pages) per `chunk_tokens`-token gather chunk."""
+    return max(1, int(chunk_tokens) // (int(page_size) * int(dcp_size)))
 
 
 def take_decode_rows(x: torch.Tensor, md: Any) -> torch.Tensor:

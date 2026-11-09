@@ -76,19 +76,18 @@ class PcpShardingPlan(ABC):
         self.global_padded_num_tokens = 0
         self.local_num_tokens = 0
         self.local_padded_num_tokens = 0
-        # Requests of the attention metadata, and their persistent-batch rows
-        # (None: the runner's request order).
+        # Requests of the attention metadata.
         self.local_num_reqs = 0
-        self.local_block_rows: np.ndarray | None = None
         # This rank's local row of each request-major token, -1 if another
         # rank holds it (None: `token_slice` maps it).
         self.request_major_to_local: np.ndarray | None = None
         # Global request-major sampling rows; each request's last token is
-        # local row `logits_local_indices_cpu[i]` on the ranks in
-        # `logits_owner_mask_cpu`.
+        # local row `logits_local_indices[i]` on the ranks in
+        # `logits_owner_mask`. Both are on the device, uploaded in
+        # `prepare_real` before the runner's input staging fence.
         self.logits_indices_cpu: torch.Tensor | None = None
-        self.logits_local_indices_cpu: torch.Tensor | None = None
-        self.logits_owner_mask_cpu: torch.Tensor | None = None
+        self.logits_local_indices: torch.Tensor | None = None
+        self.logits_owner_mask: torch.Tensor | None = None
         # No split request: every rank holds every sampling row.
         self.logits_all_local = False
 
@@ -138,9 +137,13 @@ class PcpShardingPlan(ABC):
         split_block_tables: torch.Tensor | None = None,
     ) -> PcpMetadata | None: ...
 
-    def num_reqs_in_chunk(self, is_prefilling: Any, capacity: int) -> int:
+    def num_reqs_in_chunk(
+        self, is_prefilling: Any, seq_lens: Any, capacity: int
+    ) -> int:
         """Requests that fit `capacity` local requests, given whether each is
-        prefilling (a prefill can become `local_reqs_per_req` of them)."""
+        prefilling (a prefill can become `local_reqs_per_req` of them) and its
+        context length after this step (`seq_lens`)."""
+        del seq_lens
         # TODO(weiyulin): Remove once the head and tail chunks share one
         # page table row.
         num_local = 0
@@ -172,16 +175,14 @@ class PcpShardingPlan(ABC):
     ) -> torch.Tensor | None:
         """The sampling rows of every request, or None to sample from
         `finalize_hidden_states`."""
-        if self.logits_local_indices_cpu is None or self.logits_owner_mask_cpu is None:
+        if self.logits_local_indices is None or self.logits_owner_mask is None:
             return None
-        device = hidden_states.device
-        local = self.logits_local_indices_cpu.to(device, non_blocking=True)
-        selected = hidden_states.index_select(0, local)
+        selected = hidden_states.index_select(0, self.logits_local_indices)
         if self.logits_all_local:
             return selected
         # The owner of each request's last token contributes it, the others
         # zeros, summed over PCP.
-        mask = self.logits_owner_mask_cpu.to(device, non_blocking=True)
+        mask = self.logits_owner_mask
         selected = torch.where(mask.unsqueeze(1), selected, torch.zeros_like(selected))
         return all_reduce_sum(selected)
 

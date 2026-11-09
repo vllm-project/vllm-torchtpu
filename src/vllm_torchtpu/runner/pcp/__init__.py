@@ -11,10 +11,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""PCP manager (`USE_TPU_PCP_MANAGER=1`): `PcpManager` (`manager.py`) and its
-sharding plans (`sharding_plan.py`, `head_tail_sharding_plan.py`)."""
+"""PCP manager and sharding plans"""
 
 from vllm_torchtpu.runner.pcp.head_tail_sharding_plan import mla_kv_page_size
-from vllm_torchtpu.runner.pcp.manager import PcpManager, validate_pcp_manager_config
+from vllm_torchtpu.runner.pcp.manager import (
+    PcpManager,
+    validate_pcp_manager_config,
+    validate_pcp_manager_layers,
+)
 
-__all__ = ["PcpManager", "mla_kv_page_size", "validate_pcp_manager_config"]
+__all__ = [
+    "PcpManager",
+    "mla_kv_page_size",
+    "validate_pcp_manager_config",
+    "validate_pcp_manager_layers",
+]

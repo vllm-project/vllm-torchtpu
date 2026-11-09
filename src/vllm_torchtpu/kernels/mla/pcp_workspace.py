@@ -23,16 +23,24 @@ INDEX_BLOCK_TOKENS = 4096
 
 
 def pcp_gather_rows(
-    x: jax.Array, restore_idx: jax.Array, *, axis_name: str, pcp_size: int
+    x: jax.Array, restore_idx: jax.Array, *, dcp_axis_name: str, pcp_size: int
 ) -> jax.Array:
-    """All-gather local rows over PCP and restore request-major split order."""
+    """All-gather local rows over PCP and restore request-major split order.
+
+    This function currently assume DCP = PCP x TP, and only do all gather from
+    PCP group.
+    """
     num_local = x.shape[0]
     as_bytes = x.dtype.itemsize == 1
     rows = lax.bitcast_convert_type(x, jnp.uint8) if as_bytes else x
-    gathered = lax.all_gather(rows, axis_name, tiled=False)
-    tp_size = gathered.shape[0] // pcp_size
-    gathered = gathered.reshape(pcp_size, tp_size, *rows.shape)[:, 0]
-    gathered = gathered.reshape(pcp_size * num_local, *rows.shape[1:])
+    tp_size = lax.axis_size(dcp_axis_name) // pcp_size
+    groups = [[p * tp_size + t for p in range(pcp_size)] for t in range(tp_size)]
+    gathered = lax.all_gather(
+        rows,
+        dcp_axis_name,
+        tiled=True,
+        axis_index_groups=groups if tp_size > 1 else None,
+    )
     out = gathered[restore_idx[: pcp_size * num_local]]
     return lax.bitcast_convert_type(out, x.dtype) if as_bytes else out
 
@@ -98,15 +106,22 @@ def topk_workspace_coords(
     topk: jax.Array,
     query_start_loc: jax.Array,
     ws_page_offset: jax.Array,
+    token_end: jax.Array,
     *,
     page_size: int,
     dcp_size: int,
     interleave: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    """Map global top-k positions to `(valid, owner_rank, ws_page, slot_in_page)`."""
+    """Map global top-k positions to `(valid, owner_rank, ws_page, slot_in_page)`.
+
+    Rows at or after `token_end` are invalid: they hold the decode rows'
+    rank-local cache indices or padding, not global positions, and the
+    attention kernel still gathers up to a kernel batch of them.
+    """
     seg = segment_of_rows(topk.shape[0], query_start_loc)
     offset = ws_page_offset[seg]
-    valid = topk >= 0
+    rows = jnp.arange(topk.shape[0], dtype=jnp.int32)
+    valid = (topk >= 0) & (rows[:, None] < token_end)
     p = jnp.maximum(topk, 0)
     cycle = dcp_size * interleave
     owner = (p // interleave) % dcp_size
@@ -122,7 +137,10 @@ def remap_topk_chunked(
     page_size: int,
     dcp_size: int,
 ) -> jax.Array:
-    """Map workspace coordinates to flat token indices in the chunked workspace."""
+    """Map workspace coordinates to flat token indices in the chunked workspace.
+
+    The shape of chunked workspace is `[chunk, dcp, chunk_pages, page_size]`
+    """
     valid, owner, ws_page, slot = coords
     chunk = ws_page // chunk_pages
     page = (chunk * dcp_size + owner) * chunk_pages + (ws_page - chunk * chunk_pages)

@@ -136,7 +136,11 @@ from vllm_torchtpu.runner.mm_encoder_manager import (
     maybe_create_mm_encoder_manager,
 )
 from vllm_torchtpu.runner.mm_video_chunking import chunked_video_encoding
-from vllm_torchtpu.runner.pcp import PcpManager, mla_kv_page_size
+from vllm_torchtpu.runner.pcp import (
+    PcpManager,
+    mla_kv_page_size,
+    validate_pcp_manager_layers,
+)
 from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpecDecodeMetadata,
     SpeculativeDecodingManager,
@@ -479,7 +483,11 @@ def _sample_from_logits_impl(
 
 
 def _compute_num_reqs_in_chunk(
-    runner: Any, start_index: int, num_reqs: int, capacity: int
+    runner: Any,
+    start_index: int,
+    num_reqs: int,
+    capacity: int,
+    num_scheduled_tokens: list[int],
 ) -> int:
     """Number of requests in the chunk starting at `start_index`.
 
@@ -489,6 +497,7 @@ def _compute_num_reqs_in_chunk(
     start_index: first request of this chunk.
     num_reqs: requests in the step.
     capacity: requests the attention metadata holds per forward.
+    num_scheduled_tokens: scheduled tokens of requests `[start_index, num_reqs)`.
     """
     pcp_manager = getattr(runner, "pcp_manager", None)
     if pcp_manager is None:
@@ -497,11 +506,12 @@ def _compute_num_reqs_in_chunk(
         # pcp manager splits a prefill request into head tail chunks, which means
         # num_reqs - start_index is not the local chunks number.
         rows = slice(start_index, num_reqs)
-        is_prefilling = (
-            runner.input_batch.num_computed_tokens_cpu[rows]
-            < runner.input_batch.num_prompt_tokens[rows]
-        )
-        return pcp_manager.num_reqs_in_chunk(is_prefilling, capacity)
+        num_computed = runner.input_batch.num_computed_tokens_cpu[rows]
+        q_lens = np.asarray(num_scheduled_tokens)
+        # Same rule as the sharding plan's `prepare_real`.
+        is_prefilling = q_lens > 1
+        seq_lens = num_computed + q_lens
+        return pcp_manager.num_reqs_in_chunk(is_prefilling, seq_lens, capacity)
 
 
 def _validate_libtpu_version() -> None:
@@ -1792,6 +1802,11 @@ class TPUModelRunner(GPUModelRunner):
     # KV-cache spec derivation, sizing and allocation live on
     # `self.kv_cache_manager` now; these forward the runner's existing callers.
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
+        if self.pcp_manager is not None:
+            # After the model is built, before any compile.
+            validate_pcp_manager_layers(
+                get_layers_from_vllm_config(self.vllm_config, AttentionLayerBase)
+            )
         with set_current_vllm_config(self.vllm_config):
             return self.kv_cache_manager.get_kv_cache_spec()
 
@@ -3024,7 +3039,7 @@ class TPUModelRunner(GPUModelRunner):
             assert self.num_reqs_most_model_len is not None
             chunk_capacity = self.num_reqs_most_model_len
         chunk_num_reqs = _compute_num_reqs_in_chunk(
-            self, start_index, num_reqs, chunk_capacity
+            self, start_index, num_reqs, chunk_capacity, num_scheduled_tokens_per_req
         )
         num_scheduled_tokens_per_req = num_scheduled_tokens_per_req[:chunk_num_reqs]
         end_index = start_index + chunk_num_reqs
@@ -3427,8 +3442,6 @@ class TPUModelRunner(GPUModelRunner):
             seq_lens=seq_lens,
             query_start_loc=query_start_loc,
             request_distribution=request_distribution,
-            block_table_rows=(None if pcp_plan is None else pcp_plan.local_block_rows),
-            use_pcp_manager=pcp_plan is not None,
             mamba_state_indices=mamba_state_indices,
             mamba_slot_read_offsets=self.mamba_slot_read_offsets,
             mamba_ckpt_window=self._mamba_ckpt_window,
@@ -3633,10 +3646,12 @@ class TPUModelRunner(GPUModelRunner):
         max_chunk_reqs = 0
         while start_index < num_reqs:
             use_max_model_len = self.most_model_len is None
+            num_scheduled_tokens = []
             for i in range(start_index, num_reqs):
                 req_id = self.input_batch.req_ids[i]
                 assert req_id is not None
                 num_tokens = scheduler_output.num_scheduled_tokens[req_id]
+                num_scheduled_tokens.append(num_tokens)
                 if (
                     not use_max_model_len
                     and self.most_model_len is not None
@@ -3650,7 +3665,7 @@ class TPUModelRunner(GPUModelRunner):
                 assert self.num_reqs_most_model_len is not None
                 chunk_reqs = self.num_reqs_most_model_len
             this_chunk_reqs = _compute_num_reqs_in_chunk(
-                self, start_index, num_reqs, chunk_reqs
+                self, start_index, num_reqs, chunk_reqs, num_scheduled_tokens
             )
             max_chunk_reqs = max(max_chunk_reqs, this_chunk_reqs)
             start_index += this_chunk_reqs
@@ -5741,7 +5756,6 @@ class TPUModelRunner(GPUModelRunner):
                 mamba_ckpt_window=self._mamba_ckpt_window,
                 mamba_request_distribution=dummy_mamba_request_distribution,
                 sequence_layout_descriptor=dummy_layout_descriptor,
-                use_pcp_manager=self.pcp_manager is not None,
             )
             slot_mappings = self.empty_slot_mappings
             per_layer_attn_metadata, _unused_spec_decode_common_attn_metadata = (

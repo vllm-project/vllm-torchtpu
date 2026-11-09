@@ -1154,8 +1154,6 @@ def indexer_kv_layout(
                 )
             return KVLayout.HEAD_ALONG_SUBLANE
         if pcp_manager:
-            # The PCP manager's split prefills write and gather the indexer K
-            # cache as packed rows (`pcp_workspace.position_ordered`).
             if explicit_mode:
                 raise ValueError(
                     "VLLM_TPU_INDEXER_KV_CACHE_MODE='sal' is not supported with "

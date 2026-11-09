@@ -663,7 +663,7 @@ def pcp_prefill_topk(
             k_split = ws.pcp_gather_rows(
                 k_packed,
                 restore_idx,
-                axis_name=DCP_AXIS_NAME,
+                dcp_axis_name=DCP_AXIS_NAME,
                 pcp_size=pcp_size,
             )
             cache_kv = _scatter_indexer_k_rows(
@@ -1429,15 +1429,19 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         assert self.topk_op_dcp is not None
         # The runner uploads the PCP fields as torch tensors.
         rep_rd = cast(torch.Tensor, pcp.rep_request_distribution)
-        decode_topk = self.topk_op_dcp(
-            kvg.take_decode_rows(q_bytes, md),
-            kvg.take_decode_rows(weights, md),
-            kv_cache,
-            kvg.take_decode_rows(k_packed, md),
-            pcp.rep_seq_lens,
-            pcp.rep_block_tables,
-            pcp.rep_query_start_loc,
-            torch.stack([rep_rd[0], rep_rd[0], rep_rd[2]]),
+        # Without a q_b layer the DCP op returns the top-k alone.
+        decode_topk = cast(
+            torch.Tensor,
+            self.topk_op_dcp(
+                kvg.take_decode_rows(q_bytes, md),
+                kvg.take_decode_rows(weights, md),
+                kv_cache,
+                kvg.take_decode_rows(k_packed, md),
+                pcp.rep_seq_lens,
+                pcp.rep_block_tables,
+                pcp.rep_query_start_loc,
+                torch.stack([rep_rd[0], rep_rd[0], rep_rd[2]]),
+            ),
         )
 
         rd = cast(torch.Tensor, md.request_distribution)
@@ -1655,6 +1659,8 @@ def rope_half_split_leading_cs(
 
 class VllmTPUIndexerCache(DeepseekV32IndexerCache):
     """Indexer K cache retyped onto the TPU backend. See `VllmTPUIndexer`."""
+
+    supports_tpu_pcp_manager: ClassVar[bool] = True
 
     def get_attn_backend(self) -> type[DeepseekV32IndexerBackend]:
         return VllmTPUDeepseekV32IndexerBackend
@@ -2026,9 +2032,10 @@ class TPUDummyMLAPrefillBackend:
 class VllmTPUMLAAttention(MLAAttention):
     """TPU-optimized out-of-tree wrapper for Multi-Head Latent Attention."""
 
-    # PCP x DCP runs the PCP manager's KV-gather path
-    # (USE_TPU_PCP_MANAGER=1); `pcp_validation` rejects it otherwise.
+    # Read by vLLM's `MLAAttention.__init__`, which rejects PCP + DCP unless
+    # the subclass opts in; the PCP manager handles that combination.
     supports_pcp_dcp: ClassVar[bool] = True
+    supports_tpu_pcp_manager: ClassVar[bool] = True
 
     def __init__(
         self,

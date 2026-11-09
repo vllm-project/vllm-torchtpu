@@ -175,10 +175,6 @@ class AttentionMetadataBuilderContext:
     # (state_indices, ckpt_indices | None) from the single
     # `_staged_walk_products_compiled` program; None -> per-group fallback.
     staged_mamba_products: dict | None = None
-    # Persistent-batch row of each request (None: rows [start_index,
-    # start_index + num_reqs)). Set by the PCP manager.
-    block_table_rows: Any = None
-    use_pcp_manager: bool = False
 
 
 def _staged_walk_products(
@@ -391,13 +387,14 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
                 )
             block_tables = self.block_tables_cpu[:target_num_reqs, :target_num_blocks]
             block_tables.zero_()
-            source_block_tables = block_table_obj.get_cpu_tensor()
-            _copy_block_table_rows(
-                block_tables[:, :target_num_blocks],
-                source_block_tables,
-                ctx,
-                target_num_blocks,
-            )
+            # PCP currently only read block table inside pcpmetadata
+            # TODO(weiyulin): Evaluate if we want to derive split/replicated block
+            # tables for pcpmanager from md.blocktable
+            if runner.pcp_manager is None:
+                source_block_tables = block_table_obj.get_cpu_tensor()
+                block_tables[: ctx.num_reqs, :target_num_blocks] = source_block_tables[
+                    ctx.start_index : ctx.start_index + ctx.num_reqs, :target_num_blocks
+                ]
             # Flatten on CPU before H2D to avoid device-side
             # as_strided/reshape materialization on every decode step.
             block_tables_dev = block_tables.reshape(-1).to(
@@ -470,7 +467,7 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
 
         pcp_metadata = (
             None
-            if not ctx.use_pcp_manager
+            if runner.pcp_manager is None
             else runner.pcp_manager.build_metadata(
                 runner=runner,
                 block_table_obj=block_table_obj,
@@ -494,22 +491,6 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             sequence_layout_protocol=(ctx.sequence_layout_descriptor.protocol),
             sequence_layout_version=ctx.sequence_layout_descriptor.version,
         )
-
-
-def _copy_block_table_rows(
-    dst: torch.Tensor,
-    source: torch.Tensor,
-    ctx: AttentionMetadataBuilderContext,
-    target_num_blocks: int,
-) -> None:
-    """Fill `dst[:ctx.num_reqs]` with this metadata's requests' block tables."""
-    if ctx.block_table_rows is None:
-        dst[: ctx.num_reqs] = source[
-            ctx.start_index : ctx.start_index + ctx.num_reqs, :target_num_blocks
-        ]
-    else:
-        rows = torch.as_tensor(ctx.block_table_rows, dtype=torch.long)
-        dst[: ctx.num_reqs] = source[:, :target_num_blocks].index_select(0, rows)
 
 
 def stage_block_table_uploads(
@@ -559,14 +540,17 @@ def stage_block_table_uploads(
     flat = scratch[:total]
     flat.zero_()
 
-    if ctx.position_ids_override is None:
+    # The PCP manager's layers read block tables inside pcp_metadata.
+    if ctx.position_ids_override is None and runner.pcp_manager is None:
         offset = 0
         for _, block_table_obj, target_num_blocks in entries:
             rows = flat[offset : offset + num_reqs_padded * target_num_blocks].view(
                 num_reqs_padded, target_num_blocks
             )
             source = block_table_obj.get_cpu_tensor()
-            _copy_block_table_rows(rows, source, ctx, target_num_blocks)
+            rows[: ctx.num_reqs] = source[
+                ctx.start_index : ctx.start_index + ctx.num_reqs, :target_num_blocks
+            ]
             offset += num_reqs_padded * target_num_blocks
     # Dummy runs keep the zeroed scratch: same staged layout, null blocks.
 

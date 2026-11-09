@@ -26,6 +26,9 @@ All environment variables read by `vllm-torchtpu` are declared and validated in 
 | `TPU_PP_DYNAMIC_CHUNKS` | `True` | Dynamically sizes microbatch chunks in Pipeline Parallelism (`--pipeline-parallel-size`). |
 | `TPU_PP_CHUNK_SLACK` | `0.1` | Slack ratio for dynamic pipeline-parallel chunk sizing. |
 | `TPU_PCP_TOPOLOGY_AWARE_MESH` | `True` | Orders Prefill Context Parallel (`PCP`) ranks along adjacent ICI torus neighbors to minimize ring hop count. |
+| `USE_TPU_PCP_MANAGER` | `False` | Runs `PCP` through the PCP manager. Only supports sparse MLA models with `DCP` = `PCP` x `TP`. See [PCP with PCP manager](../user_guide/parallelism.md#pcp-with-pcp-manager). |
+| `TPU_PCP_KV_WORKSPACE_TOKENS` | `1048576` | With `USE_TPU_PCP_MANAGER=1`, the context tokens one forward's prefills may gather; a step that needs more runs as several forwards. Must be at least `--max-model-len`. |
+| `TPU_PCP_KV_CHUNK_TOKENS` | `65536` | With `USE_TPU_PCP_MANAGER=1`, the context tokens each all-gather moves. |
 | `TPU_DCP_MLA_TOPK_CAP` | `-1` (auto: `512` at DCP >= 8, else off) | Caps top-k selection per Decode Context Parallel (`DCP`) rank in Sparse MLA (`0` disables cap). |
 | `TPU_DCP_LSE_MERGE_A2A` | `False` | Uses all-to-all LSE merge for Decode Context Parallelism when token count is below `TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS` (`32`). |
 | `TPU_DCP_MERGE_CHUNKED` | `0` | Splits the Decode Context Parallelism reduce-scatter LSE merge of backbone buckets of at least `TPU_DCP_MERGE_CHUNKED_MIN_TOKENS` (`1024`) tokens into this many token chunks, so each chunk's reduce-scatter overlaps the next chunk's compute (`0`/`1` disables). |

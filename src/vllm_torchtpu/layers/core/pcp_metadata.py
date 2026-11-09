@@ -11,10 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""`PcpMetadata`: the PCP manager's per-step attention metadata.
+"""PCP manager's per-step attention metadata.
 
-`PcpShardingPlan.build_metadata` (`runner/pcp/sharding_plan.py`) builds it;
-attention layers read it from `AttentionMetadata.pcp_metadata`.
+`PcpShardingPlan.build_metadata` (`runner/pcp/sharding_plan.py`) creates it,
+and attention layers read it from `AttentionMetadata.pcp_metadata`.
 """
 
 from __future__ import annotations
@@ -48,12 +48,10 @@ import torch
 )
 @dataclass
 class PcpMetadata:
-    """Attention metadata a `PcpShardingPlan` builds (`build_metadata`).
+    """Every sharding plan fills only its own fields and leaves the rest None."""
 
-    Every sharding plan fills only its own fields and leaves the rest None.
-    """
+    # Head-Tail Sharding Plan metadata
 
-    # --- HeadTailPcpShardingPlan, KV-gather (sparse MLA) ---
     # The split prefills, request-major: block tables, seq_lens,
     # query_start_loc, and each split token's PCP-gathered row.
     split_block_tables: jax.Array | torch.Tensor | None = None

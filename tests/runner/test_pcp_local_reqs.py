@@ -25,6 +25,7 @@ import numpy as np
 import pytest
 import torch
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.runner.pcp.head_tail_sharding_plan import HeadTailPcpShardingPlan
 
 MAX_NUM_SEQS = 8
@@ -52,6 +53,7 @@ def _runner(num_computed, num_prompt, q_lens, capacity):
     seq_lens = np.zeros(capacity, dtype=np.int32)
     seq_lens[: len(q_lens)] = np.asarray(num_computed) + np.asarray(q_lens)
     return SimpleNamespace(
+        device=torch.device("cpu"),
         input_batch=SimpleNamespace(
             num_computed_tokens_cpu=np.asarray(num_computed, dtype=np.int32),
             num_prompt_tokens=np.asarray(num_prompt, dtype=np.int32),
@@ -107,3 +109,114 @@ def test_local_reqs_fit_the_scaled_bucket(pcp_size, num_prefills):
         assert plan.local_num_split_reqs == 2 * num_prefills
         assert plan.rep_num_reqs == MAX_NUM_SEQS - num_prefills
         assert len(plan.host_metadata["ws_page_offset"]) == target
+
+
+@pytest.mark.parametrize("pcp_size", [2, 4])
+@pytest.mark.parametrize("num_prefills", [0, 3, MAX_NUM_SEQS])
+def test_decode_window_is_capped_at_max_num_seqs(pcp_size, num_prefills):
+    """Only prefills become two local requests: the decode window holds at
+    most `max_num_seqs` rows, in real and dummy steps alike."""
+    target = MAX_NUM_SEQS * _manager(pcp_size).local_reqs_per_req
+    plan = _prepare(_manager(pcp_size), num_prefills, target)
+    assert len(plan.host_metadata["rep_row_idx"]) == MAX_NUM_SEQS
+    dummy = _manager(pcp_size)
+    dummy.prepare_dummy(num_tokens=64, num_reqs=target, max_num_tokens=4096)
+    for key in ("rep_row_idx", "rep_seq_lens"):
+        assert len(dummy.host_metadata[key]) == len(plan.host_metadata[key])
+    assert dummy.host_metadata["rep_request_distribution"].max() <= MAX_NUM_SEQS
+
+
+@pytest.mark.parametrize("pcp_size", [2, 4])
+def test_resumed_request_is_split(pcp_size):
+    """A request resumed after preemption recomputes its output tokens, so
+    it is past `num_prompt_tokens` with several tokens scheduled; it must
+    be split, not replicated as a decode."""
+    q_lens = [300, 1, 1]
+    num_computed = [520, 700, 900]
+    num_prompt = [500, 700, 900]
+    target = 8 * _manager(pcp_size).local_reqs_per_req
+    plan = _manager(pcp_size)
+    plan.prepare_real(
+        runner=_runner(num_computed, num_prompt, q_lens, target),
+        scheduler_output=None,
+        start_index=0,
+        num_reqs=len(q_lens),
+        num_scheduled_tokens_per_req=q_lens,
+        total_num_scheduled_tokens=sum(q_lens),
+        use_max_model_len=False,
+        target_num_reqs=target,
+        padded_num_reqs=len(q_lens),
+    )
+    assert plan.local_num_split_reqs == 2
+    assert plan.rep_num_reqs == 2
+
+
+def test_chunk_counts_a_resumed_request_as_split():
+    from vllm_torchtpu.runner.tpu_runner import _compute_num_reqs_in_chunk
+
+    q_lens = [300, 300, 1]
+    runner = SimpleNamespace(
+        pcp_manager=_manager(2),
+        input_batch=SimpleNamespace(
+            num_computed_tokens_cpu=np.asarray([520, 0, 900], dtype=np.int32),
+            num_prompt_tokens=np.asarray([500, 1000, 900], dtype=np.int32),
+        ),
+    )
+    # Two split requests are 4 local requests, past a bucket of 3.
+    assert _compute_num_reqs_in_chunk(runner, 0, 3, 3, q_lens) == 1
+    assert _compute_num_reqs_in_chunk(runner, 0, 3, 5, q_lens) == 3
+
+
+@pytest.fixture
+def small_chunks(monkeypatch):
+    # 2-page gather chunks, so the workspace is not rounded up to 128 pages.
+    monkeypatch.setattr(envs, "TPU_PCP_KV_CHUNK_TOKENS", 1024)
+
+
+def _ws_manager(workspace_tokens):
+    # page 64 x DCP 8: 512-token virtual pages.
+    return HeadTailPcpShardingPlan(
+        pcp_size=2,
+        pcp_rank=0,
+        dcp_size=8,
+        page_size=64,
+        workspace_tokens=workspace_tokens,
+        max_num_batched_tokens=TOKEN_PADDINGS[-1],
+        max_num_seqs=MAX_NUM_SEQS,
+    )
+
+
+@pytest.mark.parametrize(
+    "is_prefilling,seq_lens,expected",
+    [
+        # 3 + 3 + 3 pages of a 8-page workspace: the third prefill waits.
+        ([True, True, True], [1500, 1100, 1300], 2),
+        # Decodes take no workspace.
+        ([False, True, False, True], [9000, 2000, 9000, 2000], 4),
+        # A first request alone always runs.
+        ([True, True], [4096, 1], 1),
+        ([True, True], [4096, 0], 2),
+    ],
+)
+def test_chunk_stops_at_the_kv_workspace(
+    is_prefilling, seq_lens, expected, small_chunks
+):
+    manager = _ws_manager(4096)
+    assert manager.num_ws_pages == 8
+    got = manager.num_reqs_in_chunk(
+        np.asarray(is_prefilling), np.asarray(seq_lens), capacity=64
+    )
+    assert got == expected
+
+
+def test_chunk_keeps_the_request_bucket_limit():
+    manager = _ws_manager(1 << 20)
+    # 5 prefills are 10 local requests, past a bucket of 9.
+    assert manager.num_reqs_in_chunk([True] * 5, [100] * 5, capacity=9) == 4
+
+
+@pytest.mark.parametrize("workspace_tokens", [4096, 4097, 5000, 8191])
+def test_workspace_holds_the_requested_tokens(workspace_tokens, small_chunks):
+    """Rounded up, so a `max_model_len <= workspace_tokens` request fits."""
+    manager = _ws_manager(workspace_tokens)
+    assert manager.num_ws_pages * manager.virtual_page_size >= workspace_tokens

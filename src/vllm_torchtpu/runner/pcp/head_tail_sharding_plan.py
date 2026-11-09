@@ -11,8 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""`HeadTailPcpShardingPlan`: DualChunkSwap PCP sharding, after upstream
-vLLM's MRV2 `PCPManager`.
+"""HeadTailPcpShardingPlan
 
   * A prefill is cut into `2 * pcp_size` chunks: rank r takes chunks r and
     `2 * pcp_size - 1 - r`, balancing causal attention cost.
@@ -32,7 +31,9 @@ from typing import Any
 
 import numpy as np
 import torch
+from vllm.utils.math_utils import cdiv
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.layers.adapter.pcp_kv_gather import pcp_chunk_pages
 from vllm_torchtpu.layers.core.pcp_metadata import PcpMetadata
 from vllm_torchtpu.logger import init_logger
@@ -251,7 +252,7 @@ def pcp_max_local_tokens(
     A rank holds 1/pcp of the prefill tokens, plus up to 2 per prefill from
     rounding its two chunks up, plus every (replicated) decode.
     """
-    return -(-int(max_num_batched_tokens) // int(pcp_size)) + 3 * int(max_num_seqs)
+    return cdiv(int(max_num_batched_tokens), int(pcp_size)) + 3 * int(max_num_seqs)
 
 
 @dataclass
@@ -296,12 +297,6 @@ class PcpWorkspacePlan:
                 ws_vpage[cursor + v] = v
             cursor += n
         return cls(num_pages, ws_req, ws_vpage, page_offset, cursor)
-
-
-def rep_window_size(max_reqs: int, dcp_size: int) -> int:
-    """Decode window rows: `max_reqs` rounded up to a multiple of `dcp_size`."""
-    dcp_size = max(int(dcp_size), 1)
-    return -(-max(int(max_reqs), 1) // dcp_size) * dcp_size
 
 
 def mla_kv_page_size(kv_cache_config: Any) -> int:
@@ -368,6 +363,7 @@ class HeadTailPcpShardingPlan(PcpShardingPlan):
     ) -> None:
         super().__init__(pcp_size, pcp_rank, dcp_size)
         self._workspace_tokens = int(workspace_tokens)
+        self._max_num_seqs = int(max_num_seqs)
         self.set_page_size(page_size)
         self._max_local_num_tokens = pcp_max_local_tokens(
             max_num_batched_tokens, max_num_seqs, self.pcp_size
@@ -407,15 +403,48 @@ class HeadTailPcpShardingPlan(PcpShardingPlan):
         # A DCP virtual page is one physical page on each DCP rank.
         self.virtual_page_size = self.page_size * self.dcp_size
         # A multiple of `chunk_pages`, so the chunk loop never slices past it.
-        chunk_pages = pcp_chunk_pages(self.page_size, self.dcp_size)
-        num_pages = max(1, self._workspace_tokens // self.virtual_page_size)
-        self.num_ws_pages = -(-num_pages // chunk_pages) * chunk_pages
+        chunk_pages = pcp_chunk_pages(
+            envs.TPU_PCP_KV_CHUNK_TOKENS, self.page_size, self.dcp_size
+        )
+        # Rounded up: a request of up to `workspace_tokens` (>= max_model_len,
+        # see `validate_pcp_manager_config`) always fits on its own.
+        num_pages = max(1, cdiv(self._workspace_tokens, self.virtual_page_size))
+        self.num_ws_pages = cdiv(num_pages, chunk_pages) * chunk_pages
         logger.info(
             "PCP manager KV workspace: page_size=%d, %d workspace pages (%d tokens)",
             self.page_size,
             self.num_ws_pages,
             self.num_ws_pages * self.virtual_page_size,
         )
+
+    def _rep_window_size(self, target_num_reqs: int) -> int:
+        """Decode window rows: `min(target_num_reqs, max_num_seqs)` rounded up
+        to a multiple of `dcp_size` (`streamindex_topk_dcp` requires it).
+
+        `target_num_reqs` is the local request bucket, where a split prefill
+        counts as two requests; decodes are not split, so a step holds at most
+        `max_num_seqs` of them.
+        """
+        # TODO(weiyulin): Evaluate if we need to bucket the window by the step's
+        # decode count (`num_reqs_paddings`) and compile each size, so steps with
+        # few or no decodes don't run `max_num_seqs` padding rows.
+        num_reqs = max(min(target_num_reqs, self._max_num_seqs), 1)
+        return cdiv(num_reqs, self.dcp_size) * self.dcp_size
+
+    def num_reqs_in_chunk(
+        self, is_prefilling: Any, seq_lens: Any, capacity: int
+    ) -> int:
+        """Also stop before the split prefills' contexts overflow the KV
+        workspace, so the runner runs the rest as more forwards."""
+        num_reqs = super().num_reqs_in_chunk(is_prefilling, seq_lens, capacity)
+        used_pages = 0
+        for i in range(num_reqs):
+            if not is_prefilling[i]:
+                continue
+            used_pages += cdiv(int(seq_lens[i]), self.virtual_page_size)
+            if used_pages > self.num_ws_pages:
+                return max(i, 1)
+        return num_reqs
 
     def request_distribution_counts(
         self, chunk_num_decode: int, num_reqs: int
@@ -444,10 +473,10 @@ class HeadTailPcpShardingPlan(PcpShardingPlan):
         q_lens = [int(n) for n in num_scheduled_tokens_per_req[:num_reqs]]
         rows = slice(start_index, start_index + num_reqs)
         num_computed = runner.input_batch.num_computed_tokens_cpu[rows].astype(np.int64)
-        num_prompt = np.asarray(
-            runner.input_batch.num_prompt_tokens[rows], dtype=np.int64
-        )
-        is_prefilling = [bool(c < p) for c, p in zip(num_computed, num_prompt)]
+        # Split a request iff it schedules more than one token
+        # TODO(weiyulin): Spec decode verify windows also schedule several
+        # tokens; tell them apart here once PCP x DCP supports spec decode.
+        is_prefilling = [q > 1 for q in q_lens]
 
         # Every rank pads its local batch to the same compile bucket.
         rank_counts = pcp_rank_token_counts(q_lens, is_prefilling, self.pcp_size)
@@ -520,8 +549,14 @@ class HeadTailPcpShardingPlan(PcpShardingPlan):
         self.local_num_tokens = plan.per_rank_num_tokens[self.pcp_rank]
         self.local_padded_num_tokens = local_padded
         self.logits_indices_cpu = torch.from_numpy(logits_indices.astype(np.int32))
-        self.logits_local_indices_cpu = torch.from_numpy(logits_local)
-        self.logits_owner_mask_cpu = torch.from_numpy(owner_mask)
+        # Upload now, before the runner records its input staging fence: the
+        # next step's prepare waits only on that fence before it drops these
+        # host tensors.
+        hosts = (torch.from_numpy(logits_local), torch.from_numpy(owner_mask))
+        self._keepalive.extend(hosts)
+        self.logits_local_indices, self.logits_owner_mask = (
+            t.to(runner.device, non_blocking=True) for t in hosts
+        )
         self.logits_all_local = logits_all_local
         self.request_major_to_local = request_major_to_local
 
@@ -588,12 +623,11 @@ class HeadTailPcpShardingPlan(PcpShardingPlan):
             local_ws_off[i] = ws.page_offset[split_pos[seg.req_idx]]
 
         # The decodes as a fixed `window`-row request window at `rep_row_start`.
-        window = rep_window_size(target_num_reqs, self.dcp_size)
+        window = self._rep_window_size(target_num_reqs)
         rep_seq_lens_padded = np.zeros(window, dtype=np.int32)
         rep_seq_lens_padded[:num_rep] = rep_seq_lens
 
         self.local_num_reqs = local_num_reqs
-        self.local_block_rows = local_block_rows
         self.local_num_split_reqs = num_split
         self.rep_num_reqs = num_rep
         self.split_block_rows = np.asarray(
@@ -631,7 +665,8 @@ class HeadTailPcpShardingPlan(PcpShardingPlan):
         # The serving shapes with valid indices but no requests. Warmup runs
         # the split-prefill branch (one split request, one workspace page), so
         # serving finds it built.
-        window = rep_window_size(num_reqs, self.dcp_size)
+        window = self._rep_window_size(num_reqs)
+        num_rep = min(num_reqs, window)
         self.host_metadata = _int32_fields(
             split_query_start_loc=np.arange(num_reqs + 1),
             split_seq_lens=np.ones(num_reqs),
@@ -640,9 +675,9 @@ class HeadTailPcpShardingPlan(PcpShardingPlan):
                 % num_packed
             ),
             rep_row_idx=np.minimum(np.arange(window), num_tokens - 1),
-            rep_query_start_loc=np.minimum(np.arange(window + 1), num_reqs),
-            rep_seq_lens=np.arange(window) < num_reqs,
-            rep_request_distribution=[num_reqs] * 3,
+            rep_query_start_loc=np.minimum(np.arange(window + 1), num_rep),
+            rep_seq_lens=np.arange(window) < num_rep,
+            rep_request_distribution=[num_rep] * 3,
             ws_req=np.zeros(self.num_ws_pages),
             ws_vpage=np.zeros(self.num_ws_pages),
             ws_page_offset=np.zeros(num_reqs),

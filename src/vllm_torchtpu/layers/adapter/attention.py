@@ -2897,6 +2897,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         assert mesh is not None
         dcp_size = self.dcp_size
         interleave_size = self.dcp_interleave_size
+        chunk_tokens = envs.TPU_PCP_KV_CHUNK_TOKENS
         k_scale = None
         if layer.kv_cache_quantized_dtype is not None:
             _, k_scale, _ = self._get_kv_scales(layer)
@@ -2938,7 +2939,9 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 k_scale=k_scale,
                 dcp_size=dcp_size,
                 interleave_size=interleave_size,
-                chunk_pages=pcp_chunk_pages(nope_spec.page_size, dcp_size),
+                chunk_pages=pcp_chunk_pages(
+                    chunk_tokens, nope_spec.page_size, dcp_size
+                ),
             )
 
         sharded = P(DCP_AXIS_NAME)

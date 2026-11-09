@@ -47,13 +47,13 @@ from torch_tpu._internal import pallas
 from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.dcp import get_dcp_group
 from vllm_torchtpu.distributed.dcp_comm import cp_lse_ag_out_rs
+from vllm_torchtpu.distributed.pcp import get_pcp_group
 from vllm_torchtpu.kernels.lse_rescale import lse_rescale_quantize
 from vllm_torchtpu.layers.core.quantization import quantize_tensor
 
 if envs.TPU_DCP_MERGE_VSPACE_FUSED:
     # Registers the fused V-space operand ops at import, never in a trace.
     from vllm_torchtpu.layers.adapter import dcp_vspace  # noqa: F401
-from vllm_torchtpu.distributed.pcp import get_pcp_group
 
 
 def _get_tp_group() -> Any | None:
@@ -65,19 +65,12 @@ def _get_tp_group() -> Any | None:
         return None
 
 
-def dcp_spans_pcp() -> bool:
-    """True when the DCP group covers TP x PCP rather than borrowing from TP.
-
-    That is the PCP manager's layout (`validate_pcp_manager_config` enforces
-    it). Decided from the flag rather than the groups: looking a group up can
-    fail an assert, which `torch.compile` cannot trace.
-    """
-    return bool(envs.USE_TPU_PCP_MANAGER)
-
-
-def _head_group() -> Any | None:
-    """The group whose ranks hold distinct query head slices."""
-    return _get_tp_group() if dcp_spans_pcp() else get_dcp_group()
+def _get_head_group() -> Any | None:
+    """The group whose ranks hold distinct query head slices: TP when the
+    PCP manager's DCP spans TP x PCP, else DCP."""
+    # From the flag, not the group sizes: looking a group up can fail an
+    # assert, which `torch.compile` cannot trace.
+    return _get_tp_group() if envs.USE_TPU_PCP_MANAGER else get_dcp_group()
 
 
 def all_gather_heads(q: torch.Tensor) -> torch.Tensor:
@@ -95,7 +88,7 @@ def all_gather_heads(q: torch.Tensor) -> torch.Tensor:
       on every rank (over TP only when DCP spans TP x PCP). Returned
       unchanged without a DCP group.
     """
-    group = _head_group()
+    group = _get_head_group()
     if group is None or int(group.world_size) == 1:
         return q
     return group.all_gather(q.contiguous(), dim=1)
@@ -108,7 +101,7 @@ def all_gather_q_nope_pe_heads(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused all-gather of `(ql_nope, q_pe)` across DCP ranks in a single call
     (over TP only when DCP spans TP x PCP)."""
-    group = _head_group()
+    group = _get_head_group()
     if group is None or int(group.world_size) == 1:
         return ql_nope, q_pe
     q_dcp = group.all_gather(torch.cat([ql_nope, q_pe], dim=-1), dim=1)
@@ -204,7 +197,7 @@ def merge_lse_partials_scatter_heads(
     # drafter never compares it.
     # A W_UV-projected f32 partial still crosses in the attention dtype.
     narrow = envs.TPU_DCP_RS_OUT_PRECISION and is_backbone
-    spans_pcp = dcp_spans_pcp()
+    spans_pcp = envs.USE_TPU_PCP_MANAGER
     if (
         envs.TPU_DCP_LSE_MERGE_A2A
         and not spans_pcp
@@ -264,7 +257,7 @@ def vspace_fused_applies(num_tokens: int, is_backbone: bool) -> bool:
     MTP drafter never takes it."""
     if not envs.TPU_DCP_MERGE_VSPACE_FUSED or not is_backbone:
         return False
-    if dcp_spans_pcp():
+    if envs.USE_TPU_PCP_MANAGER:
         return False
     if envs.TPU_DCP_MERGE_RS_BF16 == 2:
         return False
@@ -758,7 +751,7 @@ def send_layout_applies(
     group = get_dcp_group()
     if group is None or int(group.world_size) == 1:
         return False
-    if dcp_spans_pcp():
+    if envs.USE_TPU_PCP_MANAGER:
         return False
     if not (
         envs.TPU_DCP_MLA_SEND_LAYOUT
@@ -1136,7 +1129,7 @@ def fused_small_a2a_applies(num_tokens: int) -> bool:
 
     if not (envs.TPU_MLA_FUSED_SMALL_A2A and send_small_a2a_applies(num_tokens)):
         return False
-    if dcp_spans_pcp():
+    if envs.USE_TPU_PCP_MANAGER:
         return False
     group = get_dcp_group()
     dcp_size = 1 if group is None else int(group.world_size)
