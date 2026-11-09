@@ -146,10 +146,10 @@ def extract_ltx2_outputs(
     )
 
 
+LTX2_GOLDEN_VARIANT = "full_default"
 # Guidance of the golden request: vllm-omni's default 4-pass guidance (CFG, STG
 # at block 29, modality isolation, rescale), sent explicitly so the golden does
 # not depend on vllm-omni's defaults.
-LTX2_GOLDEN_VARIANT = "full_default"
 LTX2_GOLDEN_EXTRA_ARGS = {
     "video_cfg_scale": 3.0,
     "audio_cfg_scale": 7.0,
@@ -161,10 +161,14 @@ LTX2_GOLDEN_EXTRA_ARGS = {
     "audio_rescale_scale": 0.7,
 }
 LTX2_GOLDEN_STEPS = 40
+# The golden runs fp32 weights, which need 4 chips.
+LTX2_GOLDEN_DTYPE = "float32"
+LTX2_GOLDEN_TENSOR_PARALLEL_SIZE = 4
 # Metric -> (min, max), TPU bf16 vs the TPU fp32 golden. Observed (bitwise
 # identical on two images): MAE 0.0221, SSIM 0.9322, mean shift 0.0046,
-# log-spectrogram L1 0.335. MAE, 1 - SSIM and log-spectrogram L1 allow 2x,
-# mean shift +0.015. Caught: 30 steps (SSIM 0.843), another prompt, other seeds.
+# log-spectrogram L1 0.335, RMS ratio 1.065. MAE, 1 - SSIM and log-spectrogram
+# L1 allow 2x, mean shift +0.015; HF, motion and RMS ratios use fixed ranges.
+# Caught: 30 steps (SSIM 0.843), another prompt, other seeds.
 LTX2_GOLDEN_LIMITS = {
     "video_mae": (0.0, 0.045),
     "video_ssim": (0.864, 1.0),
@@ -191,13 +195,11 @@ def get_ltx2_golden_path() -> Path:
     )
 
 
-def load_and_verify_ltx2_golden() -> tuple[np.ndarray, np.ndarray]:
-    """Load the golden video and audio and check its metadata matches the test."""
-    with np.load(get_ltx2_golden_path()) as data:
-        video, audio = data["video"], data["audio"]
-        meta = json.loads(str(data["meta"]))
-    expected_meta = {
-        "model_id": LTX2_MODEL_ID,
+def ltx2_golden_meta() -> dict[str, object]:
+    """Metadata the golden is saved with and that the test checks."""
+    return {
+        "dtype": LTX2_GOLDEN_DTYPE,
+        "tensor_parallel_size": LTX2_GOLDEN_TENSOR_PARALLEL_SIZE,
         "variant": LTX2_GOLDEN_VARIANT,
         "omni_extra_args": LTX2_GOLDEN_EXTRA_ARGS,
         "prompt": LTX2_PROMPT,
@@ -212,9 +214,23 @@ def load_and_verify_ltx2_golden() -> tuple[np.ndarray, np.ndarray]:
         "frame_rate": LTX2_DEFAULT_FRAME_RATE,
         "steps": LTX2_GOLDEN_STEPS,
     }
-    for key, expected_val in expected_meta.items():
-        assert meta[key] == expected_val, (
-            f"Golden was generated with {key}={meta[key]!r}; "
+
+
+def load_and_verify_ltx2_golden() -> tuple[np.ndarray, np.ndarray]:
+    """Load the golden video and audio and check its metadata matches the test."""
+    path = get_ltx2_golden_path()
+    assert path.is_file(), (
+        f"LTX-2 golden {path} not found. Set LTX2_GOLDEN_DIR to its directory, "
+        f"or copy it from gs://tpu-commons-ci/golden/ltx2/."
+    )
+    with np.load(path) as data:
+        assert "meta" in data.files, f"Golden {path} has no meta. Regenerate it."
+        video, audio = data["video"], data["audio"]
+        meta = json.loads(str(data["meta"]))
+    for key, expected_val in ltx2_golden_meta().items():
+        actual_val = meta.get(key, "<missing>")
+        assert actual_val == expected_val, (
+            f"Golden was generated with {key}={actual_val!r}; "
             f"the test runs {key}={expected_val!r}. Regenerate the golden."
         )
     return video, audio

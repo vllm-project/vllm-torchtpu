@@ -11,16 +11,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Nightly end-to-end T2V smoke and seed determinism tests for LTX-2 on TPU v7x.
+"""Nightly end-to-end T2V smoke, seed determinism and golden tests for LTX-2.
 
 Runs the real ``Lightricks/LTX-2`` one-stage audio+video diffusion pipeline on a
-single TPU v7x chip using the canonical 2-step 512x768x25 request (24 fps,
-4-pass default guidance with CFG, STG, and modality isolation):
-1. ``test_ltx2_t2v_smoke_tpu``: verifies output container types, shapes, dtypes,
-   finite values, non-degenerate video spatial variance and temporal motion, and
-   non-silent stereo 24 kHz audio (24,240 samples per channel).
-2. ``test_ltx2_seed_determinism_tpu``: verifies bitwise-identical video and
-   audio across repeated runs with seed 42 and divergence against seed 43.
+single TPU v7x chip with the canonical 512x768x25 request (24 fps, 4-pass
+default guidance with CFG, STG, and modality isolation):
+1. ``test_ltx2_t2v_smoke_tpu``: at 2 steps, verifies output container types,
+   shapes, dtypes, finite values, non-degenerate video spatial variance and
+   temporal motion, and non-silent stereo 24 kHz audio (24,240 samples per
+   channel).
+2. ``test_ltx2_seed_determinism_tpu``: at 2 steps, verifies bitwise-identical
+   video and audio across repeated runs with seed 42 and divergence against
+   seed 43.
 3. ``test_ltx2_golden_answer_tpu``: runs the request at 40 steps and checks it
    against a TPU fp32 golden within ``LTX2_GOLDEN_LIMITS``. The golden
    (``ltx2_t2v_full_default_40step_tpu_fp32_golden.npz`` in
@@ -28,17 +30,8 @@ single TPU v7x chip using the canonical 2-step 512x768x25 request (24 fps,
    with fp32 weights and tensor_parallel_size=4; it matches CPU fp32 diffusers
    to video MAE 0.0036.
 
-Measured on TPU v7x (158.69s total for module,
-well within the 1800s CI Nightly per-test timeout):
-- Engine initialization: 58.81s; first request (with XLA compile): 89.32s
-  (``test_ltx2_t2v_smoke_tpu`` total: 148.13s).
-- Warm requests (``test_ltx2_seed_determinism_tpu``): 2.15s / 2.10s / 2.09s
-  (7.53s total including teardown).
-- Smoke metrics (seed 42): ``min_frame_std = 30.275`` (floor 5.0),
-  ``mean_frame_std = 31.020``, ``temporal_diff_mean = 4.089`` (floor 0.5),
-  ``audio_rms = 0.020038`` (floor 1e-3), ``audio_max_abs = 0.135742``.
-- All three seed=42 requests (including the cold first request) match bitwise
-  (``video_sha256 = 0e9bc093...``, ``audio_sha256 = 382ac716...``).
+All three share one engine; the module runs in about 270s on TPU v7x, well
+within the 1800s CI Nightly per-test timeout.
 """
 
 import numpy as np
@@ -136,13 +129,14 @@ def test_ltx2_seed_determinism_tpu(omni_runner: OmniRunner) -> None:
 
 # NOTE: How the golden was generated (outside pytest, on 4 chips).
 # 1. Omni model launch, with the tests_omni/conftest.py env defaults:
-#        omni = Omni(model=get_ltx2_model(), dtype="float32",
-#                    tensor_parallel_size=4)
+#        omni = Omni(model=get_ltx2_model(), dtype=LTX2_GOLDEN_DTYPE,
+#                    tensor_parallel_size=LTX2_GOLDEN_TENSOR_PARALLEL_SIZE)
 # 2. Request, the same as this test's:
 #        request = build_ltx2_request(num_inference_steps=LTX2_GOLDEN_STEPS,
 #                                     extra_args=LTX2_GOLDEN_EXTRA_ARGS)
 #        out = extract_ltx2_outputs(list(omni.generate(LTX2_PROMPT, request)))
-# 3. Output saving, with meta the dict that load_and_verify_ltx2_golden() checks:
+# 3. Output saving, with the checked meta plus the checkpoint's HF revision:
+#        meta = {**ltx2_golden_meta(), "revision": <HF commit>}
 #        np.savez_compressed(path, video=out.video, audio=out.audio,
 #                            meta=json.dumps(meta))
 # LTX2_GOLDEN_LIMITS are calibrated on the same request with the default
