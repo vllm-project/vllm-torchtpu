@@ -6130,35 +6130,26 @@ class TPURaidenConnectorWorker:
                     )
                 self._stage3_pending_submits[destination_req_id] = pending
                 return
-            cancelled_registration = (
-                str(exc)
-                == (
-                    "Remote Controller Server execution failed: Request block "
-                    "registration was cancelled for "
-                    f"req_id={source_req_id}, uuid={uuid}"
-                )
-                and destination_req_id not in self._stage3_controller_accepted
+            # A pre-arm reply proves nothing about destination blocks that an
+            # earlier attempt left accepted or uncertain.
+            never_accepted = (
+                destination_req_id not in self._stage3_controller_accepted
                 and destination_req_id not in self._stage3_pending_controller_failures
             )
-            unsent_connection_failure = (
-                str(exc)
-                == (
-                    "Control RPC connection failed before sending request to "
-                    f"{pending.req_meta.src_controller_address.strip()}"
-                )
-                and destination_req_id not in self._stage3_controller_accepted
-                and destination_req_id not in self._stage3_pending_controller_failures
+            cancelled_registration = never_accepted and str(exc) == (
+                "Remote Controller Server execution failed: Request block "
+                "registration was cancelled for "
+                f"req_id={source_req_id}, uuid={uuid}"
+            )
+            unsent_connection_failure = never_accepted and str(exc) == (
+                "Control RPC connection failed before sending request to "
+                f"{pending.req_meta.src_controller_address.strip()}"
             )
             # The source controller compares both sides' layout fingerprints
             # while it plans the transfer, before it arms any receiver.
-            layout_mismatch = (
-                str(exc)
-                == (
-                    "Remote Controller Server execution failed: Layout "
-                    "fingerprint mismatch between source and destination"
-                )
-                and destination_req_id not in self._stage3_controller_accepted
-                and destination_req_id not in self._stage3_pending_controller_failures
+            layout_mismatch = never_accepted and str(exc) == (
+                "Remote Controller Server execution failed: Layout "
+                "fingerprint mismatch between source and destination"
             )
             if (
                 missing_registration
@@ -6177,6 +6168,13 @@ class TPURaidenConnectorWorker:
                 self._record_stage3_load_failure(
                     destination_req_id, pending.local_blocks
                 )
+                hint = (
+                    " (prefill and decode registered different KV layouts; "
+                    "compare layout_fingerprint in each side's 'Raiden work "
+                    "unit registered' log line)"
+                    if layout_mismatch
+                    else ""
+                )
                 logger.error(
                     "Stage-3 controller transfer failed before receiver "
                     "arming req_id=%s destination_req_id=%s uuid=%d: %s%s",
@@ -6184,11 +6182,7 @@ class TPURaidenConnectorWorker:
                     destination_req_id,
                     uuid,
                     exc,
-                    " (prefill and decode registered different KV layouts; "
-                    "compare layout_fingerprint in each side's 'Raiden work "
-                    "unit registered' log line)"
-                    if layout_mismatch
-                    else "",
+                    hint,
                 )
                 return
             # Generic RPC rejection can occur after receiver arming.
