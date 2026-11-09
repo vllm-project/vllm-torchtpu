@@ -570,15 +570,15 @@ def _receive_buffer(sent, row_gather):
     return jnp.zeros_like(sent)
 
 
-def _scatter_send(x, out_row, *, rows):
+def _scatter_send(x, out_row_t, *, rows):
     """The send buffer [rows, 16, H / 16] written by `copy_send_rows`: token
-    ``t``'s row at ``out_row[t, d]`` for each member ``d`` it goes to
-    (``out_row`` [S, D], ``rows`` where it does not)."""
+    ``t``'s row at ``out_row_t[d, t]`` for each member ``d`` it goes to
+    (``out_row_t`` [D, S], destination-major; ``rows`` where it does not)."""
     num_tokens = x.shape[0]
-    token = jnp.arange(num_tokens, dtype=jnp.int32)[:, None]
+    token = jnp.arange(num_tokens, dtype=jnp.int32)
     row = jnp.arange(rows, dtype=jnp.int32)[:, None, None]
-    index = jnp.where(out_row[None] == row, token[None], 0).sum(axis=(1, 2))
-    count = jnp.max(jnp.where(out_row < rows, out_row + 1, 0), initial=0)
+    index = jnp.where(out_row_t[None] == row, token, 0).sum(axis=(1, 2))
+    count = jnp.max(jnp.where(out_row_t < rows, out_row_t + 1, 0), initial=0)
     return copy_send_rows(x, index, count[None], rows)
 
 
@@ -665,7 +665,7 @@ def _full_exchange(
         recv_ids, recv_weights = read_routes(source_row)
 
     if planned and row_scatter:
-        sent = _scatter_send(x, slot_out, rows=slots)
+        sent = _scatter_send(x, slot_out.T, rows=slots)
     else:
         sent = _tile_rows(x[send_index])
     gather = planned and row_gather
@@ -825,12 +825,15 @@ def _capacity_exchange(
         if row_scatter:
             # Written before the overflow flag is known: a step that does not
             # fit sends nothing, and rows past the buffer are dropped.
-            out_row = (
-                _exclusive_cumsum(need_any.sum(axis=0, dtype=jnp.int32), 0)
-                + jnp.cumsum(need_any, axis=0, dtype=jnp.int32)
+            need_any_t = need_any.T  # [D, S]
+            scatter_row_t = (
+                _exclusive_cumsum(need_any_t.sum(axis=1, dtype=jnp.int32), 0)[:, None]
+                + jnp.cumsum(need_any_t, axis=1, dtype=jnp.int32)
                 - 1
             )
-            sent = _scatter_send(x, jnp.where(need_any, out_row, rows), rows=rows)
+            sent = _scatter_send(
+                x, jnp.where(need_any_t, scatter_row_t, rows), rows=rows
+            )
         else:
             sent = _tile_rows(x[send_index])
         received = jax.lax.ragged_all_to_all(

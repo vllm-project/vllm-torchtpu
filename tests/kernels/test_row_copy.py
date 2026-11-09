@@ -19,6 +19,7 @@ import numpy as np
 import pytest
 
 from vllm_torchtpu.kernels.megablox.row_copy import gather_rows
+from vllm_torchtpu.layers.core import ragged_a2a_moe
 from vllm_torchtpu.layers.core.fused_moe_gmm import onehot_permute
 from vllm_torchtpu.layers.core.ragged_a2a_moe import _scatter_send, _tile_rows
 
@@ -123,10 +124,57 @@ def test_copy_send_rows_writes_the_send_rows(num_members, num_tokens, routing):
         rows = max(16, rows // 2 // 16 * 16)
     out_row, index, total = _send_layout(routed, num_members, rows)
     x = _rows(rng, num_tokens, 8192)
-    got = _scatter_send(x, jnp.asarray(out_row), rows=rows)
+    got = _scatter_send(x, jnp.asarray(out_row.T), rows=rows)
     # The layout of the XLA path's send buffer, with the token rows copied
     # bit for bit.
     want_shape = jax.eval_shape(lambda x, i: _tile_rows(x[i]), x, jnp.asarray(index))
     assert got.shape == want_shape.shape
     want = np.asarray(x).view(np.uint16)[index].reshape(want_shape.shape)
     np.testing.assert_array_equal(np.asarray(got).view(np.uint16)[:total], want[:total])
+
+
+def _token_major_index(out_row, rows):
+    """The token of each send row (0 where none) from the send rows [S, D],
+    by one compare-and-sum over [rows, S, D], and the filled row count."""
+    token = np.arange(out_row.shape[0], dtype=np.int32)[:, None]
+    hit = out_row[None] == np.arange(rows)[:, None, None]
+    index = np.where(hit, token[None], 0).sum(axis=(1, 2), dtype=np.int32)
+    return index, np.where(out_row < rows, out_row + 1, 0).max(initial=0)
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("num_members", [2, 8, 16, 32])
+@pytest.mark.parametrize("layout", ["capacity", "overflow", "regions"])
+def test_scatter_send_index_matches_the_token_major_build(
+    monkeypatch, num_members, layout
+):
+    """The index and count `_scatter_send` hands `copy_send_rows` equal the
+    token-major build's on every row: capacity buffers filled without gaps or
+    smaller than the step, and the full-size exchange's region per member,
+    with empty and full destination groups."""
+    seen = {}
+
+    def _copy_send_rows(x, index, count, rows):
+        seen.update(index=np.asarray(index), count=int(count[0]))
+
+    monkeypatch.setattr(ragged_a2a_moe, "copy_send_rows", _copy_send_rows)
+    rng = np.random.default_rng(num_members)
+    for num_tokens in (12, 112):
+        for density in (0.0, 0.05, 0.3, 1.0):
+            need = rng.random((num_tokens, num_members)) < density
+            if layout == "regions":
+                rows = num_members * num_tokens
+                start = np.arange(num_members) * num_tokens
+            else:
+                sizes = need.sum(axis=0)
+                start = np.cumsum(sizes) - sizes
+                rows = max(16, -(-int(sizes.sum()) // 32) * 32)
+                if layout == "overflow":
+                    rows = max(16, rows // 2 // 16 * 16)
+            out_row = np.where(need, start + np.cumsum(need, axis=0) - 1, rows)
+            out_row = out_row.astype(np.int32)
+            x = jnp.zeros((num_tokens, 128), jnp.bfloat16)
+            _scatter_send(x, jnp.asarray(out_row.T), rows=rows)
+            index, count = _token_major_index(out_row, rows)
+            np.testing.assert_array_equal(seen["index"], index)
+            assert seen["count"] == count
