@@ -1,10 +1,22 @@
-# SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # Implements profiling for vLLM on TPU VMs using the PyTorch/XLA profiler.
 # NOTE: you will need the xprof (or tensorboard-plugin-profile) python package
 # to visualize the results.
-# Please see docs/profiling.md for more details, including how to view the
-# resulting traces and how to profile a running server instead.
+# Please see docs/developers_guide/profiling/ for more details, including how
+# to view the resulting traces and how to profile a running server instead.
 # Usage example for prefilling 1 request of 1024 tokens:
 # python3 examples/tpu_profiling.py --input-len 1024 --output-len 1   --batch-size 1
 # Usage example for decoding 256 requests of 1 token each:

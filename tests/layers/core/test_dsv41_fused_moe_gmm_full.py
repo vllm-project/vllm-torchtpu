@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """100% Full-module line and branch coverage test suite for .
 
 Covers all lines and branches in:
@@ -23,6 +35,7 @@ if str(_REPO_ROOT) not in sys.path:
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("TPU_SKIP_MDS_QUERY", "true")
 
+import jax.experimental.pallas.tpu as pltpu  # noqa: E402
 import jax.numpy as jnp  # noqa: E402
 import numpy as np  # noqa: E402
 import pytest  # noqa: E402
@@ -88,6 +101,7 @@ def test_resolve_onehot_permute_threshold(monkeypatch):
     mock_sc.num_cores = 4
     mock_sc.num_subcores = 2
     mock_info_sc.sparse_core = mock_sc
+    mock_info_sc.chip_version = pltpu.ChipVersion.TPU_7X
     with patch(
         "jax.experimental.pallas.tpu.get_tpu_info",
         return_value=mock_info_sc,
@@ -102,6 +116,7 @@ def test_resolve_onehot_permute_threshold(monkeypatch):
     mock_sc_512.num_subcores = 8  # 16 * 4 * 8 = 512
     mock_info_sc_512 = MagicMock()
     mock_info_sc_512.sparse_core = mock_sc_512
+    mock_info_sc_512.chip_version = pltpu.ChipVersion.TPU_7X
     with patch(
         "jax.experimental.pallas.tpu.get_tpu_info",
         return_value=mock_info_sc_512,
@@ -116,6 +131,7 @@ def test_resolve_onehot_permute_threshold(monkeypatch):
     mock_sc_1024.num_subcores = 8  # 16 * 8 * 8 = 1024
     mock_info_sc_1024 = MagicMock()
     mock_info_sc_1024.sparse_core = mock_sc_1024
+    mock_info_sc_1024.chip_version = pltpu.ChipVersion.TPU_7X
     with patch(
         "jax.experimental.pallas.tpu.get_tpu_info",
         return_value=mock_info_sc_1024,

@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Exercise the DeepSeek-V4.1 SWA pool through the upstream KV-cache control plane."""
 
 from collections import deque
@@ -11,8 +23,11 @@ import torch
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_manager import KVCacheManager
-from vllm.v1.core.kv_cache_utils import (
+from vllm.v1.core.kv_cache_planning import (
+    get_global_kv_cache_groups,
     get_kv_cache_configs,
+)
+from vllm.v1.core.kv_cache_utils import (
     get_request_block_hasher,
     init_none_hash,
 )
@@ -391,7 +406,11 @@ def test_spec_merge_keeps_pool_inputs():
 
 def test_upstream_grouping_preserves_private_pool_contract():
     config = SimpleNamespace(
-        model_config=SimpleNamespace(max_model_len=32768, original_max_model_len=32768),
+        model_config=SimpleNamespace(
+            max_model_len=32768,
+            original_max_model_len=32768,
+            supports_kv_cache_grouping=False,
+        ),
         parallel_config=SimpleNamespace(
             tensor_parallel_size=1, decode_context_parallel_size=1
         ),
@@ -418,7 +437,12 @@ def test_upstream_grouping_preserves_private_pool_contract():
         "swa.1": spec(lookahead=5),
     }
     reservation = swa_pool_bytes(specs)
-    result = get_kv_cache_configs(config, [specs], [(256 << 20) - reservation])[0]
+    result = get_kv_cache_configs(
+        config,
+        [specs],
+        [(256 << 20) - reservation],
+        get_global_kv_cache_groups(config, [specs]),
+    )[0]
     swa_groups = [
         g
         for g in result.kv_cache_groups
@@ -433,7 +457,11 @@ def test_upstream_grouping_preserves_private_pool_contract():
 
 def _planned(num_swa):
     config = SimpleNamespace(
-        model_config=SimpleNamespace(max_model_len=32768, original_max_model_len=32768),
+        model_config=SimpleNamespace(
+            max_model_len=32768,
+            original_max_model_len=32768,
+            supports_kv_cache_grouping=False,
+        ),
         parallel_config=SimpleNamespace(
             tensor_parallel_size=1, decode_context_parallel_size=1
         ),
@@ -459,7 +487,12 @@ def _planned(num_swa):
         **{f"swa.{i}": spec(lookahead=5) for i in range(num_swa)},
     }
     reservation = swa_pool_bytes(specs)
-    return get_kv_cache_configs(config, [specs], [(256 << 20) - reservation])[0]
+    return get_kv_cache_configs(
+        config,
+        [specs],
+        [(256 << 20) - reservation],
+        get_global_kv_cache_groups(config, [specs]),
+    )[0]
 
 
 def test_merge_folds_swa_layers_and_keeps_the_shared_layout():

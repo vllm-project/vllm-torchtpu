@@ -1,5 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Correctness tests for the KDA path of the fused conv1d + GDN v3 kernel.
 
 What these tests exist for is the wiring: the per-channel gate is `kq_head_dim`
@@ -23,9 +34,12 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from absl.testing import parameterized
 
 from vllm_torchtpu.kernels.gdn.v3 import config, wrapper
+
+pytestmark = pytest.mark.tpu_test
 
 
 def _l2_normalize(x: np.ndarray) -> np.ndarray:
@@ -64,8 +78,7 @@ def kda_attention_ref(
     qkv: jnp.ndarray,
     b: jnp.ndarray,
     a: jnp.ndarray,
-    conv_state: jnp.ndarray,
-    recurrent_state: jnp.ndarray,
+    states: tuple[jnp.ndarray, jnp.ndarray],
     conv_weight: jnp.ndarray,
     conv_bias: jnp.ndarray | None,
     a_log: jnp.ndarray,
@@ -94,6 +107,7 @@ def kda_attention_ref(
     num_valid_seqs = int(distribution[2])
 
     out_mixed_qkv = jnp.zeros_like(qkv)
+    conv_state, recurrent_state = states
     new_conv_state = jnp.array(conv_state)
     new_recurrent_state = jnp.array(recurrent_state)
     output = np.zeros((num_tokens, n_v * d_v), np.float64)
@@ -191,8 +205,7 @@ def kda_attention_spec_ref(
     qkv: jnp.ndarray,
     b: jnp.ndarray,
     a: jnp.ndarray,
-    conv_state: jnp.ndarray,
-    recurrent_state: jnp.ndarray,
+    states: tuple[jnp.ndarray, jnp.ndarray],
     conv_weight: jnp.ndarray,
     conv_bias: jnp.ndarray | None,
     a_log: jnp.ndarray,
@@ -212,6 +225,7 @@ def kda_attention_spec_ref(
 ) -> tuple[tuple[jnp.ndarray, jnp.ndarray], jnp.ndarray]:
     """Token reference for KDA verify windows and their checkpoints."""
     del distribution
+    conv_state, recurrent_state = states
     new_conv_state = jnp.array(conv_state)
     new_recurrent_state = jnp.array(recurrent_state)
     output = np.zeros((qkv.shape[0], n_v * d_v), np.float64)
@@ -391,8 +405,7 @@ class KdaAttentionV3Test(parameterized.TestCase):
             qkv=qkv,
             b=b,
             a=a,
-            conv_state=conv_state,
-            recurrent_state=recurrent_state,
+            states=(conv_state, recurrent_state),
             conv_weight=conv_weight,
             conv_bias=conv_bias,
             a_log=a_log,
@@ -496,10 +509,11 @@ class KdaAttentionV3Test(parameterized.TestCase):
         a = jax.random.normal(
             next(rngs), (sum(spec_lengths), n_v * d_k), dtype=jnp.bfloat16
         )
+        # Production KDA keeps conv state in fp32 (kimi_k3 attention kda_state_dtype).
         conv_state = jax.random.normal(
             next(rngs),
             (num_blocks, kernel_size - 1, dim_size),
-            dtype=jnp.bfloat16,
+            dtype=jnp.float32,
         )
         recurrent_state = jax.random.normal(next(rngs), (num_blocks, n_v, d_k, d_v))
         conv_weight = jax.random.normal(
@@ -512,8 +526,7 @@ class KdaAttentionV3Test(parameterized.TestCase):
             qkv=qkv,
             b=b,
             a=a,
-            conv_state=conv_state,
-            recurrent_state=recurrent_state,
+            states=(conv_state, recurrent_state),
             conv_weight=conv_weight,
             conv_bias=None,
             a_log=a_log,
@@ -588,8 +601,10 @@ class KdaAttentionV3Test(parameterized.TestCase):
             qkv=jnp.zeros((8, dim_size)),
             b=jnp.zeros((8, n_v)),
             a=jnp.zeros((8, n_v * d_k)),
-            conv_state=jnp.zeros((9, kernel_size - 1, dim_size)),
-            recurrent_state=jnp.zeros((9, n_v, d_k, d_v)),
+            states=(
+                jnp.zeros((9, kernel_size - 1, dim_size)),
+                jnp.zeros((9, n_v, d_k, d_v)),
+            ),
             conv_weight=jnp.zeros((dim_size, 1, kernel_size)),
             conv_bias=None,
             a_log=jnp.zeros((n_v,)),

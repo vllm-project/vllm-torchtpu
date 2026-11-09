@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from collections.abc import Callable
+from typing import cast
 
 import jax
 import jax.numpy as jnp
@@ -81,7 +82,10 @@ def split_fn3(fn: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
     rem = fn - fn_hi
     fn_mid = jax.lax.reduce_precision(rem, 8, 7)
     fn_lo = jax.lax.reduce_precision(rem - fn_mid, 8, 7)
-    return tuple(t.astype(jnp.bfloat16) for t in (fn_hi, fn_mid, fn_lo))
+    return cast(
+        tuple[jax.Array, jax.Array, jax.Array],
+        tuple(t.astype(jnp.bfloat16) for t in (fn_hi, fn_mid, fn_lo)),
+    )
 
 
 def mhc_pre_gates(

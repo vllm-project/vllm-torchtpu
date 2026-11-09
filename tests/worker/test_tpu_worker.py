@@ -23,9 +23,11 @@ import pytest
 import torch
 from vllm.config import ParallelConfig
 from vllm.v1.engine.core import EngineCoreProc
+from vllm.v1.pool.late_interaction_runner import LateInteractionRunner
 
 import vllm_torchtpu as plugin
-from vllm_torchtpu import patch_registry
+from vllm_torchtpu import patch_registry, utils
+from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.worker.tpu_worker import TPUWorker, _configure_tpu_process_env
 
 
@@ -278,6 +280,15 @@ class TestProfileCaptureAndMerge:
         assert not list(tmp_path.iterdir())
 
 
+def test_reset_encoder_cache_delegates_to_model_runner():
+    worker = TPUWorker.__new__(TPUWorker)
+    worker.model_runner = MagicMock()
+
+    worker.reset_encoder_cache()
+
+    worker.model_runner.reset_encoder_cache.assert_called_once_with()
+
+
 def test_initialize_from_config_updates_num_gpu_blocks():
     worker = TPUWorker.__new__(TPUWorker)
     worker.cache_config = MagicMock(num_gpu_blocks=None)
@@ -290,6 +301,280 @@ def test_initialize_from_config_updates_num_gpu_blocks():
 
     assert worker.cache_config.num_gpu_blocks == 2048
     worker.model_runner.initialize_kv_cache.assert_called_once_with(kv_cache_config)
+
+
+def test_reset_encoder_cache_clears_the_runner_caches():
+    runner = TPUModelRunner.__new__(TPUModelRunner)
+    runner.encoder_cache = {"mm_hash": torch.zeros(1)}
+    runner.late_interaction_runner = LateInteractionRunner(enable_flash=False)
+    late = runner.late_interaction_runner
+    late._query_cache["query"] = torch.zeros(1)
+    late._query_uses["query"] = 1
+    late._doc_query_keys["doc"] = "query"
+    worker = TPUWorker.__new__(TPUWorker)
+    worker.model_runner = runner
+
+    worker.reset_encoder_cache()
+
+    assert runner.encoder_cache == {}
+    assert (late._query_cache, late._query_uses, late._doc_query_keys) == ({}, {}, {})
+
+
+def _ep_dp_worker(monkeypatch, dp_size, expert_parallel, local, peer):
+    """Build a TPUWorker whose MIN reduce across DP engines returns at most peer."""
+    budget = utils.HbmBudget(total_limit=0, total_used=0, cap=0, available=local)
+    monkeypatch.setattr(utils, "compute_hbm_budget", lambda *_: budget)
+    monkeypatch.setenv("TORCH_TPU_DP_SIZE", str(dp_size))
+    cpu_group = object()
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.get_dp_group",
+        lambda: SimpleNamespace(cpu_group=cpu_group),
+    )
+
+    def all_reduce(t, op, group):
+        assert (op, group) == (torch.distributed.ReduceOp.MIN, cpu_group)
+        t.clamp_(max=peer)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
+    worker = TPUWorker.__new__(TPUWorker)
+    worker.cache_config = SimpleNamespace(
+        kv_cache_memory_bytes=None,
+        gpu_memory_utilization=0.9,
+        num_gpu_blocks_override=None,
+    )
+    worker.parallel_config = SimpleNamespace(
+        data_parallel_size=1, enable_expert_parallel=expert_parallel
+    )
+    worker.vllm_config = SimpleNamespace(
+        kv_transfer_config=None,
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(architectures=[])),
+    )
+    worker.devices = []
+    worker.model_runner = MagicMock(is_pooling_model=False)
+    # No KV connector, no LoRA and no ring hand-off, so nothing is reserved.
+    worker.model_runner.post_profile_hbm_reserves.return_value = utils.HbmReserves(
+        kv_connector=0, lora_slot_write=0, pp_handoff=0
+    )
+    return worker
+
+
+@pytest.mark.parametrize(
+    "dp_size, expert_parallel, coupled",
+    [(2, True, True), (1, True, False), (2, False, False)],
+)
+def test_determine_available_memory_is_min_across_ep_dp(
+    monkeypatch, dp_size, expert_parallel, coupled
+):
+    """EP-coupled DP engines bake their KV extent into the compiled programs,
+    so they must all size the cache from the smallest per-engine budget."""
+    local, peer = 7 * utils.GBYTES, 6 * utils.GBYTES
+    worker = _ep_dp_worker(monkeypatch, dp_size, expert_parallel, local, peer)
+
+    assert worker.determine_available_memory() == (peer if coupled else local)
+
+
+def test_determine_available_memory_fails_on_every_ep_dp_engine(monkeypatch):
+    """An engine whose own budget fits still fails when a coupled peer's does not."""
+    worker = _ep_dp_worker(
+        monkeypatch, dp_size=2, expert_parallel=True, local=utils.GBYTES, peer=0
+    )
+
+    with pytest.raises(ValueError, match="gpu-memory-utilization"):
+        worker.determine_available_memory()
+
+
+def test_determine_available_memory_leaves_room_for_lora_slot_write(monkeypatch):
+    """An adapter swap holds HBM only while it runs, so profile_run misses it
+    and the KV cache budget must leave it free."""
+    worker = _ep_dp_worker(
+        monkeypatch,
+        dp_size=1,
+        expert_parallel=False,
+        local=7 * utils.GBYTES,
+        peer=7 * utils.GBYTES,
+    )
+    worker.model_runner.post_profile_hbm_reserves.return_value = utils.HbmReserves(
+        kv_connector=0, lora_slot_write=utils.GBYTES, pp_handoff=0
+    )
+
+    assert worker.determine_available_memory() == 6 * utils.GBYTES
+
+
+def test_determine_available_memory_reserves_the_pp_hand_off_buffers(monkeypatch):
+    """The ring hand-off allocates its buffers after profile_run, so the KV
+    cache leaves room for them."""
+    worker = _ep_dp_worker(
+        monkeypatch, dp_size=1, expert_parallel=False, local=7 * utils.GBYTES, peer=0
+    )
+    worker.model_runner.post_profile_hbm_reserves.return_value = utils.HbmReserves(
+        kv_connector=0, lora_slot_write=0, pp_handoff=utils.GBYTES
+    )
+
+    assert worker.determine_available_memory() == 6 * utils.GBYTES
+
+
+def test_out_of_memory_error_shows_the_lora_reserve(monkeypatch):
+    """The used HBM is under the cap and only the LoRA reserve pushes the
+    budget below zero, so the error must show the reserve and name the LoRA
+    flags that shrink it."""
+    worker = _ep_dp_worker(
+        monkeypatch, dp_size=1, expert_parallel=False, local=0, peer=0
+    )
+    budget = utils.HbmBudget(
+        total_limit=32 * utils.GBYTES,
+        total_used=18 * utils.GBYTES,
+        cap=19 * utils.GBYTES,
+        available=utils.GBYTES,
+    )
+    monkeypatch.setattr(utils, "compute_hbm_budget", lambda *_: budget)
+    worker.model_runner.post_profile_hbm_reserves.return_value = utils.HbmReserves(
+        kv_connector=0, lora_slot_write=2 * utils.GBYTES, pp_handoff=0
+    )
+
+    with pytest.raises(ValueError) as error:
+        worker.determine_available_memory()
+
+    message = str(error.value)
+    assert "total_hbm_used_gb=18.0GiB" in message
+    assert "lora_slot_write_hbm_gb=2.0GiB" in message
+    assert "pp_handoff_hbm_reserve_gb=0.0GiB" in message
+    assert "by 1.0GiB" in message
+    assert "--max-loras" in message
+
+
+def test_determine_available_memory_profiles_an_unpinned_kv_cache(monkeypatch):
+    worker = _ep_dp_worker(
+        monkeypatch, dp_size=1, expert_parallel=False, local=utils.GBYTES, peer=0
+    )
+
+    assert worker.determine_available_memory() == utils.GBYTES
+    worker.model_runner.profile_run.assert_called_once_with(
+        worker.model_runner.max_num_tokens
+    )
+
+
+def test_determine_available_memory_skips_profiling_a_pinned_kv_cache(monkeypatch):
+    """With num_gpu_blocks_override already set (e.g. --num-gpu-blocks-override),
+    vLLM ignores the profiled budget, so no profile run."""
+    worker = _ep_dp_worker(
+        monkeypatch, dp_size=1, expert_parallel=False, local=utils.GBYTES, peer=0
+    )
+    worker.cache_config.num_gpu_blocks_override = 49965
+
+    assert worker.determine_available_memory() == utils.GBYTES
+    worker.model_runner.profile_run.assert_not_called()
+
+
+def test_compact_mamba_kv_cache_is_sized_after_the_profile_run(monkeypatch):
+    """Compact-mamba sizing leaves num_gpu_blocks_override unset in
+    get_kv_cache_spec, so the profile run still happens, and sizes the attention
+    pool after it, from the same budget the worker hands vLLM."""
+    worker = _ep_dp_worker(
+        monkeypatch, dp_size=1, expert_parallel=False, local=utils.GBYTES, peer=0
+    )
+    runner = worker.model_runner
+
+    def budget(*_):
+        # The profile run leaves half of the budget allocated.
+        avail = utils.GBYTES // 2 if runner.profile_run.called else utils.GBYTES
+        return utils.HbmBudget(total_limit=0, total_used=0, cap=0, available=avail)
+
+    monkeypatch.setattr(utils, "compute_hbm_budget", budget)
+
+    assert worker.determine_available_memory() == utils.GBYTES // 2
+    sizing = runner.kv_cache_manager.size_compact_mamba_kv_cache
+    sizing.assert_called_once_with(utils.GBYTES // 2)
+
+
+def test_compact_mamba_kv_cache_is_sized_from_kv_cache_memory_bytes(monkeypatch):
+    """kv_cache_memory_bytes fixes the budget without a profile run."""
+    worker = _ep_dp_worker(
+        monkeypatch, dp_size=1, expert_parallel=False, local=utils.GBYTES, peer=0
+    )
+    worker.cache_config.kv_cache_memory_bytes = 3 * utils.GBYTES
+
+    assert worker.determine_available_memory() == 3 * utils.GBYTES
+    worker.model_runner.profile_run.assert_not_called()
+    sizing = worker.model_runner.kv_cache_manager.size_compact_mamba_kv_cache
+    sizing.assert_called_once_with(3 * utils.GBYTES)
+
+
+def _world(monkeypatch, world_size, peer_pinned=1):
+    """Initialized model parallelism with a world group of `world_size` ranks
+    whose MIN reduce returns at most `peer_pinned`. Returns the groups reduced."""
+    world = SimpleNamespace(world_size=world_size, cpu_group="world")
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        "vllm_torchtpu.worker.tpu_worker.model_parallel_is_initialized", lambda: True
+    )
+    monkeypatch.setattr(
+        "vllm_torchtpu.worker.tpu_worker.get_world_group", lambda: world
+    )
+    reduced = []
+
+    def all_reduce(t, op, group):
+        assert op == torch.distributed.ReduceOp.MIN
+        reduced.append(group)
+        t.clamp_(max=peer_pinned)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
+    return reduced
+
+
+def _pinned_worker():
+    worker = TPUWorker.__new__(TPUWorker)
+    worker.cache_config = SimpleNamespace(num_gpu_blocks_override=49965)
+    return worker
+
+
+@pytest.mark.parametrize("peer_pinned, expected", [(1, True), (0, False)])
+def test_kv_cache_size_pinned_is_agreed_across_the_world_group(
+    monkeypatch, peer_pinned, expected
+):
+    """The profile run holds collectives: a rank skips it only if every rank
+    of its world group does. That group is this engine's TP x PCP x PP ranks,
+    plus the other DP engines only when EP couples them."""
+    reduced = _world(monkeypatch, world_size=8, peer_pinned=peer_pinned)
+
+    assert _pinned_worker()._kv_cache_size_pinned() is expected
+    assert reduced == ["world"]
+
+
+def test_kv_cache_size_pinned_needs_no_reduce_on_a_single_rank(monkeypatch):
+    reduced = _world(monkeypatch, world_size=1)
+
+    assert _pinned_worker()._kv_cache_size_pinned() is True
+    assert reduced == []
+
+
+def test_kv_cache_size_pinned_without_model_parallel_groups(monkeypatch):
+    """torch.distributed can be left open (e.g. by an earlier test) without
+    vLLM's model-parallel groups; the check then stays local."""
+    reduced = _world(monkeypatch, world_size=8, peer_pinned=0)
+    monkeypatch.setattr(
+        "vllm_torchtpu.worker.tpu_worker.model_parallel_is_initialized", lambda: False
+    )
+
+    assert _pinned_worker()._kv_cache_size_pinned() is True
+    assert reduced == []
+
+
+def test_determine_available_memory_profiles_when_a_peer_is_not_pinned(
+    monkeypatch,
+):
+    """This rank's KV size is pinned but a peer's is not: the peer must profile,
+    and the profile run holds collectives, so this rank profiles too."""
+    worker = _ep_dp_worker(
+        monkeypatch, dp_size=1, expert_parallel=False, local=utils.GBYTES, peer=0
+    )
+    worker.cache_config.num_gpu_blocks_override = 49965
+    reduced = _world(monkeypatch, world_size=8, peer_pinned=0)
+
+    assert worker.determine_available_memory() == utils.GBYTES
+    worker.model_runner.profile_run.assert_called_once_with(
+        worker.model_runner.max_num_tokens
+    )
+    assert reduced == ["world"]
 
 
 @patch("vllm_torchtpu.worker.tpu_worker.get_pp_group")
@@ -307,18 +592,22 @@ def test_kv_connector_handshake_metadata_uses_pp_tp_rank_key(
     assert worker.get_kv_connector_handshake_metadata() == {(2, 3): metadata}
 
 
-def test_model_load_stage_precedes_runner(monkeypatch):
+def test_load_model_patches_loads_then_releases_free_host_heap(monkeypatch):
     events = []
     config = object()
     monkeypatch.setattr(
         patch_registry, "apply", lambda stage, **kwargs: events.append((stage, kwargs))
+    )
+    monkeypatch.setattr(
+        "vllm_torchtpu.worker.tpu_worker._release_free_host_heap",
+        lambda: events.append("release"),
     )
     worker = SimpleNamespace(
         model_config=config,
         model_runner=SimpleNamespace(load_model=lambda: events.append("load")),
     )
     TPUWorker.load_model(worker)
-    assert events == [("model_load", {"model_config": config}), "load"]
+    assert events == [("model_load", {"model_config": config}), "load", "release"]
 
 
 @pytest.mark.parametrize("managed_by_vllm, runtime_threads", [(True, 1), (False, 2)])
@@ -347,7 +636,17 @@ def test_warmup_restores_runtime_threads_without_overriding_user_choice(
     previous_threads = torch.get_num_threads()
     try:
         torch.set_num_threads(2)
-        result = TPUWorker.compile_or_warm_up_model(worker)
+        with (
+            patch("vllm_torchtpu.worker.tpu_worker.freeze_gc_heap") as freeze,
+            patch(
+                "vllm_torchtpu.worker.tpu_worker.maybe_attach_gc_debug_callback"
+            ) as gc_debug,
+        ):
+            result = TPUWorker.compile_or_warm_up_model(worker)
+        freeze.assert_called_once_with()
+        gc_debug.assert_called_once_with()
+        # Speculative decoding warms up at the serving thread count; other
+        # models keep the startup count during warm-up.
         assert warmup_threads == [runtime_threads if speculative else 2]
         assert torch.get_num_threads() == runtime_threads
         assert result.language_model == worker.compilation_config.compilation_time
@@ -362,7 +661,10 @@ def test_real_patch_entrypoints_in_spawned_processes():
 
     probe = Path(__file__).resolve()
     source = probe.parents[2] / "src"
-    env = dict(os.environ, PYTHONPATH=str(source), JAX_PLATFORMS="tpu")
+    pythonpath = os.pathsep.join(
+        filter(None, [str(source), os.environ.get("PYTHONPATH")])
+    )
+    env = dict(os.environ, PYTHONPATH=pythonpath, JAX_PLATFORMS="tpu")
     result = subprocess.run(
         [sys.executable, str(probe)],
         env=env,
@@ -438,6 +740,37 @@ def _worker_entry(connection):
             rank=0,
             distributed_init_method="tcp://127.0.0.1:29500",
         )
+
+
+def test_release_free_host_heap_prefers_tcmalloc(monkeypatch):
+    from vllm_torchtpu.worker import tpu_worker
+
+    calls = []
+
+    class FakeProcess:
+        def MallocExtension_ReleaseFreeMemory(self):  # noqa: N802
+            calls.append("tcmalloc")
+
+        def malloc_trim(self, pad):
+            calls.append("glibc")
+
+    monkeypatch.setattr(tpu_worker.ctypes, "CDLL", lambda name: FakeProcess())
+    tpu_worker._release_free_host_heap()
+    assert calls == ["tcmalloc"]
+
+
+def test_release_free_host_heap_falls_back_to_malloc_trim(monkeypatch):
+    from vllm_torchtpu.worker import tpu_worker
+
+    calls = []
+
+    class FakeProcess:
+        def malloc_trim(self, pad):
+            calls.append(pad)
+
+    monkeypatch.setattr(tpu_worker.ctypes, "CDLL", lambda name: FakeProcess())
+    tpu_worker._release_free_host_heap()
+    assert calls == [0]
 
 
 if __name__ == "__mp_main__":

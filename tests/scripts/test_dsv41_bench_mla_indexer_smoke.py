@@ -880,7 +880,7 @@ class TestBenchIndexer:
                         jnp.zeros((16,), dtype=jnp.int32),
                         jnp.array([128], dtype=jnp.int32),
                     )
-            except Exception:
+            except Exception:  # noqa: S110 (mock falls back to the default)
                 pass
 
             if "write_index_keys" in name:
@@ -1289,7 +1289,7 @@ class TestBenchSparseMlaSwa:
 
                 n_params = len(inspect.signature(fn).parameters)
                 fn(*[torch.zeros((16, 16)) for _ in range(n_params)])
-            except Exception:
+            except Exception:  # noqa: S110 (mock falls back to the default)
                 pass
 
             def _len(a):

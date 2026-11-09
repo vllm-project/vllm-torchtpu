@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Scheduler that sizes prefill chunks against a per-step time budget.
 
 vLLM's scheduler fills every step up to a token budget and clips each
@@ -94,6 +106,23 @@ class TpuPipelineChunkScheduler(Scheduler):
                 self._seeded.add(request.request_id)
         return super().schedule(throttle_prefills)
 
+    def step_estimate_ms(self, scheduler_output: Any) -> float | None:
+        """Modelled time on one stage of the step the last ``schedule``
+        produced, in ms; None until the cost model is installed."""
+        if self._cost is None:
+            return None
+        pairs = squares = 0.0
+        for req_id, tokens in scheduler_output.num_scheduled_tokens.items():
+            request = self.requests.get(req_id)
+            # schedule() already counted the step's tokens as computed.
+            prefix = request.num_computed_tokens - tokens if request is not None else 0
+            pairs += float(tokens) * prefix
+            squares += float(tokens) * tokens
+        buckets = self._cost.buckets
+        total = scheduler_output.total_num_scheduled_tokens
+        bucket = next((b for b in buckets if b >= total), buckets[-1])
+        return self._cost.step_ms(bucket, pairs, squares)
+
     def _pending_step_limit(self) -> int | None:
         """The bucket a step is held to: the prefill work still to schedule
         spread over up to as many steps as the pipeline has stages, rounded
@@ -107,8 +136,13 @@ class TpuPipelineChunkScheduler(Scheduler):
         pending = 0
         for request in self.running:
             pending += max(_prefill_end(request) - request.num_computed_tokens, 0)
-        for request in self.waiting:
-            pending += max(_prefill_end(request) - request.num_computed_tokens, 0)
+        # Requests holding KV blocks (including async KV loads) wait in a
+        # separate queue. Count both queues before the base scheduler scans
+        # them. deferred_waiting tracks a subset of these requests, so adding
+        # it separately would double-count their remaining prompt work.
+        for queue in (self.waiting, self.kv_holding_waiting):
+            for request in queue:
+                pending += max(_prefill_end(request) - request.num_computed_tokens, 0)
         if pending == 0:
             return None
         granularity = self._cost.granularity

@@ -28,7 +28,8 @@
     font-family: var(--md-text-font), sans-serif;
 }
 
-.cg-options-group {
+.cg-options-group,
+.cg-row {
     display: flex;
     align-items: stretch;
     border-bottom: 1px solid var(--md-default-fg-color--lightest);
@@ -36,14 +37,21 @@
     gap: 0.5rem;
 }
 
+.cg-options {
+    display: flex;
+    flex: 1;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+}
+
 .cg-label {
     font-weight: 600;
-    width: 110px;
+    width: 160px;
     flex-shrink: 0;
     color: var(--md-default-fg-color);
     display: flex;
     align-items: center;
-    font-size: 16px;
+    font-size: 15px;
 }
 
 .cg-btn {
@@ -154,4 +162,47 @@ body[data-md-color-scheme="slate"] .cg-output-container pre {
         flex: none;
         width: 100%;
     }
+}
+
+/* Expandable tables (see initExpandableTables in interactive.js) */
+.expandable-table .et-hidden {
+    display: none;
+}
+
+.expandable-table tr.et-row {
+    cursor: pointer;
+}
+
+.expandable-table tr.et-row > td:first-child::before {
+    content: "";
+    display: inline-block;
+    width: 0.4em;
+    height: 0.4em;
+    margin-right: 0.6em;
+    border-right: 2px solid currentColor;
+    border-bottom: 2px solid currentColor;
+    opacity: 0.6;
+    transform: rotate(-45deg);
+    transition: transform 0.15s ease;
+    vertical-align: 0.15em;
+}
+
+.expandable-table tr.et-open > td:first-child::before {
+    transform: rotate(45deg);
+}
+
+.expandable-table tr.et-row:focus-visible {
+    outline: 2px solid var(--md-accent-fg-color);
+    outline-offset: -2px;
+}
+
+.expandable-table tr.et-detail > td {
+    border-top: none;
+    background-color: var(--md-code-bg-color);
+}
+
+.expandable-table .et-detail-label {
+    display: block;
+    margin-bottom: 0.25em;
+    font-weight: 700;
 }

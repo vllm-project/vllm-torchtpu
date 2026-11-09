@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """E0' raw-layout calibration for controller-driven PCP8 -> DP8 FA.
 
 This standing device gate writes the same logical fp8 pattern into the live
@@ -26,6 +38,8 @@ from vllm_torchtpu.distributed.kv_transfer.raiden import layout_fingerprint as r
 from vllm_torchtpu.distributed.kv_transfer.raiden import pool_manifest as rpm
 
 from .tpu_test_utils import run_in_isolated_process
+
+pytestmark = pytest.mark.tpu_test
 
 _TOKEN_BYTES = 1024
 _NUM_BLOCKS = 16

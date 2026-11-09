@@ -48,6 +48,8 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
 )
 
+pytestmark = pytest.mark.tpu_test
+
 _TP_SIZE = 8
 _HEAD_DIM = 256
 _PAGE_SIZE = 128

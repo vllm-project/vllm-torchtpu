@@ -1,3 +1,16 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 # The environment variables override should be imported before any other
 # modules to ensure that the environment variables are set before any
 # other modules are imported.
@@ -6,6 +19,44 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
+
+
+def _patch_vllm_compact_mamba_streaming_input() -> None:
+    """Reject input sessions whose retained state can exceed the compact pool."""
+    import inspect
+    from functools import wraps
+
+    from vllm.v1.engine.input_processor import InputProcessor
+
+    from vllm_torchtpu.platforms.tpu_block_size_utils import unified_kv_layout_enabled
+
+    original = InputProcessor.process_inputs
+    marker = "_tpu_compact_mamba_input_patch"
+    if original.__dict__.get(marker, False):
+        return
+    signature = inspect.signature(original)
+
+    @wraps(original)
+    def process_inputs(self, *args, **kwargs):
+        config = self.vllm_config
+        transfer = config.kv_transfer_config
+        uses_slots = transfer is None or transfer.kv_connector == "DecodeBenchConnector"
+        if (
+            uses_slots
+            and config.model_config.is_hybrid
+            and not unified_kv_layout_enabled(config)
+            and signature.bind(self, *args, **kwargs).arguments.get("resumable", False)
+        ):
+            raise ValueError(
+                "resumable input is unsupported with the compact Mamba state pool: "
+                "waiting sessions retain state beyond the running-request limit. "
+                "Use the unified KV pool on a supported architecture, or submit "
+                "complete inputs. Streaming output remains supported."
+            )
+        return original(self, *args, **kwargs)
+
+    process_inputs.__dict__[marker] = True
+    InputProcessor.process_inputs = process_inputs
 
 
 def _patch_vllm_hybrid_kv_load_failure_recovery() -> None:
@@ -174,17 +225,17 @@ def _patch_vllm_config_hash_ignore_diagnostics() -> None:
 
     original = VllmConfig.compute_hash
 
-    def compute_hash(self) -> str:
+    def compute_hash(self, *args, **kwargs) -> str:
         additional_config = self.additional_config
         if not isinstance(additional_config, dict):
-            return original(self)
+            return original(self, *args, **kwargs)
         filtered = {
             key: value
             for key, value in additional_config.items()
             if key not in HASH_IGNORED_ADDITIONAL_CONFIG_KEYS
         }
         if filtered == additional_config:
-            return original(self)
+            return original(self, *args, **kwargs)
         # Hash a shallow copy with the filtered dict rather than mutating the
         # live config: compute_hash() may run while other code holds the same
         # VllmConfig, and a shallow copy shares every sub-config by reference
@@ -192,7 +243,7 @@ def _patch_vllm_config_hash_ignore_diagnostics() -> None:
         # compute_hash its own additional_config to read.
         proxy = copy.copy(self)
         proxy.additional_config = filtered
-        return original(proxy)
+        return original(proxy, *args, **kwargs)
 
     VllmConfig._tpu_upstream_compute_hash = original
     VllmConfig.compute_hash = compute_hash
@@ -360,10 +411,19 @@ def _patch_vllm_disable_compile_ranges() -> None:
 
 
 def _patch_vllm_compile_all_ranges() -> None:
-    """Patch vllm compile all ranges to support compilation rotation.
+    """Patch vllm compile all ranges so the ranks of a host split the ranges.
 
-    Compilation rotation allows vllm to compile multiple sizes at the same time,
-    which greatly reduce the vllm startup time.
+    With TPU_PRECOMPILE_PEER_REPLAY=1, each range is compiled by one rank of
+    the host, its owner; every other rank replays the artifact the owner saves
+    to vLLM's compile cache instead of tracing and compiling the range again
+    (see TpuCompilerAdaptor.compile). Startup then takes about as long as the
+    slowest single range instead of the sum over ranges. Peer replay needs
+    vLLM's compile cache: VLLM_DISABLE_COMPILE_CACHE=1 with the flag on fails
+    at startup (TpuPlatform.check_and_update_config), and a cache disabled any
+    other way makes the flag fall back here with a warning.
+
+    Off, the default, each rank compiles every range itself, starting on a
+    different one, and the ranks share only through the Tier-2 cache.
     """
     import os
     from collections import deque
@@ -374,18 +434,70 @@ def _patch_vllm_compile_all_ranges() -> None:
         get_fake_args_from_graph,
     )
 
-    def compile_all_ranges(self) -> None:
-        """Compile all range entries for this piecewise subgraph up front."""
-        assert self.graph is not None, (
-            "Cannot compile without a graph. "
-            "When loading from cache/AOT artifacts, "
-            "compile_all_ranges should not be called."
+    def host_slot() -> tuple[int, int] | None:
+        """(ranks splitting the ranges on this host, this rank's slot among
+        them), or None to opt out: compile every range here, waiting on no one.
+
+        With DP > 1 (or several nodes) vLLM's world group spans every DP rank
+        (world_size_across_dp), so world_size // nodes counts all the ranks of
+        the host, whatever the TP size; dense DP replicas and elastic EP keep a
+        world group per engine and so split only within it. The slot is the
+        host-local rank, LOCAL_RANK less the TPU_LOCAL_RANK_OFFSET the worker
+        binding adds to it. Owners are dealt to slots 0..count-1 and a rank
+        waits for every owner, so a slot outside that range opts out rather
+        than leave a range owned by a slot no process holds.
+        """
+        try:
+            from vllm.distributed.parallel_state import (
+                get_node_count,
+                get_world_group,
+            )
+
+            world_size = get_world_group().world_size
+            nodes = get_node_count()
+            slot = int(os.environ["LOCAL_RANK"]) - envs.TPU_LOCAL_RANK_OFFSET
+        except Exception:
+            return None
+        if nodes <= 0 or world_size % nodes:
+            return None
+        count = world_size // nodes
+        if count <= 1 or not 0 <= slot < count:
+            return None
+        return count, slot
+
+    def compile_entry(self, range_entry) -> None:
+        self._log_compile_start(range_entry.compile_range)
+
+        if range_entry.compile_range.is_single_size():
+            args_list = create_concrete_args(
+                self.graph, range_entry.compile_range.start
+            )
+        else:
+            args_list = get_fake_args_from_graph(self.graph)
+
+        range_entry.runnable = self.vllm_backend.compiler_manager.compile(
+            self.graph,
+            args_list,
+            self.vllm_backend.inductor_config,
+            self.compilation_config,
+            compile_range=range_entry.compile_range,
+            graph_index=self.piecewise_compile_index,
+            num_graphs=self.total_piecewise_compiles,
+            is_encoder=self.vllm_backend.is_encoder,
         )
 
-        local_rank = int(os.environ["LOCAL_RANK"])
-        range_entry_list = list(self.range_entries.values())
+        range_entry.compiled = True
 
-        range_entry_len = len(range_entry_list)
+    def compile_rotated(pairs, local_rank: int) -> None:
+        """Compile every range here, each local rank starting on a different
+        one: the order without peer replay."""
+        if envs.TPU_PRECOMPILE_BIGGEST_FIRST:
+            # Biggest first: local rank 0 starts on the biggest range, which
+            # takes far longer than the others and so bounds startup, instead
+            # of reaching it only after the smallest one.
+            pairs = sorted(pairs, key=lambda p: p[1].compile_range.end, reverse=True)
+
+        range_entry_len = len(pairs)
 
         expanded_indexes = list(range((range_entry_len + 7) // 8 * 8))
         d = deque(sorted(expanded_indexes, key=lambda x: (x % 8, x)))
@@ -393,55 +505,173 @@ def _patch_vllm_compile_all_ranges() -> None:
         indexes = list(d)
 
         for i in indexes:
-            if i >= len(range_entry_list):
+            if i >= range_entry_len:
                 continue
 
-            range_entry = range_entry_list[i]
+            backend, range_entry = pairs[i]
 
             if range_entry.compiled:
                 continue
 
-            self._log_compile_start(range_entry.compile_range)
+            compile_entry(backend, range_entry)
 
-            if range_entry.compile_range.is_single_size():
-                args_list = create_concrete_args(
-                    self.graph, range_entry.compile_range.start
-                )
-            else:
-                args_list = get_fake_args_from_graph(self.graph)
-
-            range_entry.runnable = self.vllm_backend.compiler_manager.compile(
-                self.graph,
-                args_list,
-                self.vllm_backend.inductor_config,
-                self.compilation_config,
-                compile_range=range_entry.compile_range,
-                graph_index=self.piecewise_compile_index,
-                num_graphs=self.total_piecewise_compiles,
-                is_encoder=self.vllm_backend.is_encoder,
+    def compile_ranges(pairs) -> None:
+        local_rank = int(os.environ["LOCAL_RANK"])
+        if not envs.TPU_PRECOMPILE_PEER_REPLAY:
+            compile_rotated(pairs, local_rank)
+            return
+        # Peers hand a compiled range over through vLLM's compile cache
+        # (TpuCompilerAdaptor saves and replays the cache artifact), so with
+        # the cache disabled there is nothing to replay: an owner/waiter split
+        # would only order the work. VLLM_DISABLE_COMPILE_CACHE=1 is already
+        # rejected at startup; this covers the cache being off for any other
+        # reason (e.g. vLLM disabling it for a feature it cannot cache).
+        if any(
+            getattr(b.vllm_backend.compiler_manager, "disable_cache", False)
+            for b, _ in pairs
+        ):
+            logger.warning_once(
+                "TPU_PRECOMPILE_PEER_REPLAY=1 has no effect while vLLM's "
+                "compile cache is disabled (e.g. VLLM_DISABLE_COMPILE_CACHE=1): "
+                "ranks share compiled ranges through that cache. Every rank "
+                "compiles every range itself; enable the compile cache to "
+                "use peer replay."
             )
+            compile_rotated(pairs, local_rank)
+            return
 
-            range_entry.compiled = True
+        from vllm_torchtpu.compilation.tpu_compiler import wait_for_peer_artifact
+
+        host = host_slot()
+        if host is None:
+            # Layout not recognized: never wait on an owner that may not
+            # exist; every range is compiled here, ranks still staggered.
+            compile_rotated(pairs, local_rank)
+            return
+        ranks, slot = host
+
+        # Biggest first, dealt out in a snake: local rank 0 starts on the
+        # biggest range, which takes far longer than the others and so bounds
+        # startup, and a rank whose first range is small gets the next one.
+        # TPU_PRECOMPILE_BIGGEST_FIRST=0 deals them in vLLM's order instead.
+        entries = [(b, e) for b, e in pairs if not e.compiled]
+        if envs.TPU_PRECOMPILE_BIGGEST_FIRST:
+            entries.sort(key=lambda p: p[1].compile_range.end, reverse=True)
+        mine, others = [], []
+        for i, (backend, range_entry) in enumerate(entries):
+            turn, position = divmod(i, ranks)
+            owner = position if turn % 2 == 0 else ranks - 1 - position
+            if owner == slot:
+                mine.append((backend, range_entry))
+            else:
+                # In the order the owners finish them: by turn, small first.
+                others.append(
+                    (turn, range_entry.compile_range.end, backend, range_entry)
+                )
+
+        for backend, range_entry in mine:
+            compile_entry(backend, range_entry)
+        with wait_for_peer_artifact(envs.TPU_PRECOMPILE_PEER_WAIT_S):
+            for _, _, backend, range_entry in sorted(others, key=lambda o: o[:2]):
+                compile_entry(backend, range_entry)
+
+    def compile_all_ranges(self) -> None:
+        """Compile all range entries for this piecewise subgraph up front."""
+        assert self.graph is not None, (
+            "Cannot compile without a graph. "
+            "When loading from cache/AOT artifacts, "
+            "compile_all_ranges should not be called."
+        )
+        from vllm_torchtpu.compilation import shape_variants
+
+        if shape_variants.deferring():
+            # TPU_PRECOMPILE_TRACE_FIRST: compiled with every other trace's
+            # buckets in compile_deferred, once the ladder has traced them all.
+            shape_variants.defer(self)
+            return
+
+        compile_ranges([(self, e) for e in self.range_entries.values()])
+
+    def compile_deferred(backends) -> None:
+        """Compile every bucket of every deferred trace in one pass.
+
+        The same deal as compile_all_ranges, over the buckets of all traces at
+        once rather than one trace's: biggest first, one owner per bucket per
+        host, the others replay. Buckets a trace refused are handed over from
+        the trace that built them last, once every trace has compiled.
+        """
+        from vllm_torchtpu.compilation import shape_variants
+
+        to_compile, to_hand_over = [], []
+        for backend in backends:
+            for range_entry in backend.range_entries.values():
+                mode = getattr(range_entry, "_tpu_deferred", None)
+                if mode is None:
+                    continue
+                del range_entry._tpu_deferred
+                range_entry.compiled = False
+                range_entry.runnable = None
+                if mode == "compile":
+                    to_compile.append((backend, range_entry))
+                else:
+                    to_hand_over.append((backend, range_entry))
+        num_traces = len({getattr(b, "_tpu_trace", i) for i, b in enumerate(backends)})
+        logger.info(
+            "Deferred precompile: %d traces, %d buckets to compile, %d to hand over",
+            num_traces,
+            len(to_compile),
+            len(to_hand_over),
+        )
+        if to_compile:
+            compile_ranges(to_compile)
+
+        # Only the last trace stays live (shape_variants.retrace replaced the
+        # earlier ones), so only its refused buckets are handed over; an
+        # earlier trace's would be checked against a graph that never runs.
+        live = max((getattr(b, "_tpu_trace", 0) for b in backends), default=0)
+        for backend, range_entry in to_hand_over:
+            if getattr(backend, "_tpu_trace", 0) == live:
+                compile_entry(backend, range_entry)
+            else:
+                range_entry.runnable = shape_variants.refusing_runnable(
+                    str(range_entry.compile_range)
+                )
+                range_entry.compiled = True
 
     if envs.TPU_PARALLEL_PRECOMPILE:
+        from vllm_torchtpu.compilation import shape_variants
+
+        shape_variants.register_deferred_compiler(compile_deferred)
         PiecewiseBackend.compile_all_ranges = compile_all_ranges
         logger.info("Applied TPU patch: compile_all_ranges.")
 
 
-def _patch_disable_sequence_parallel_moe() -> None:
-    """Disable vLLM's sequence-parallel MoE on TPU.
+def _patch_sequence_parallel_moe_admission() -> None:
+    """Gate vLLM's sequence-parallel MoE on TPU.
 
-    The sequence-parallel path is tied to vLLM all2all MoE backends. The TPU
-    communicator handles EP with unsplit token buffers.
+    Off by default. With TPU_MOE_SEQUENCE_PARALLEL=1, admit it at DP1
+    when EP is on and TP > 1. The GPU all2all-backend and DP > 1 conjuncts do
+    not apply on TPU. EP is required: without it the row-parallel expert sum
+    is never reduced.
     """
     from vllm.config.parallel import ParallelConfig
 
     if getattr(ParallelConfig, "_tpu_no_sp_moe_patch", False):
         return
 
-    ParallelConfig.use_sequence_parallel_moe = property(lambda self: False)
+    if envs.TPU_MOE_SEQUENCE_PARALLEL:
+        ParallelConfig.use_sequence_parallel_moe = property(
+            lambda self: self.enable_expert_parallel
+            and self.tensor_parallel_size > 1
+            and self.data_parallel_size == 1
+        )
+    else:
+        ParallelConfig.use_sequence_parallel_moe = property(lambda self: False)
     ParallelConfig._tpu_no_sp_moe_patch = True
-    logger.info("Applied TPU patch: disable sequence-parallel MoE.")
+    logger.info(
+        "Applied TPU patch: sequence-parallel MoE %s.",
+        "admitted" if envs.TPU_MOE_SEQUENCE_PARALLEL else "disabled",
+    )
 
 
 def _patch_multiproc_worker_global_rank_env() -> None:
@@ -467,6 +697,21 @@ def _patch_multiproc_worker_global_rank_env() -> None:
         pc = vllm_config.parallel_config
         binding = get_tpu_worker_binding(pc, rank, local_rank, env=_os.environ)
         _os.environ.update(binding.as_env())
+        # VLLM_TPU_DEVICE_ORDER lists a physical device per local rank, so
+        # consecutive ranks (a two-device pipeline stage) can sit on different
+        # chips; TorchTPU reads TPU_VISIBLE_DEVICES at import, hence set here.
+        order = envs.VLLM_TPU_DEVICE_ORDER
+        if order:
+            device = [int(x) for x in order.split(",")][binding.local_rank]
+            _os.environ["TPU_VISIBLE_CHIPS"] = str(device)
+            _os.environ["TPU_VISIBLE_DEVICES"] = str(device)
+            logger.info(
+                "Applied TPU patch: worker spawn env local rank %d -> device %d "
+                "(VLLM_TPU_DEVICE_ORDER=%s)",
+                binding.local_rank,
+                device,
+                order,
+            )
         logger.info(
             "Applied TPU patch: worker spawn env RANK=%d LOCAL_RANK=%d "
             "WORLD_SIZE=%d LOCAL_WORLD_SIZE=%d "
@@ -495,10 +740,12 @@ def _run_engine_core_with_tpu_patches(*args, **kwargs):
 
     patch_registry.apply("engine_core")
     from vllm_torchtpu.core.pp_chunk_scheduler import patch_engine_core_for_pp_chunks
-    from vllm_torchtpu.distributed.pp_push import patch_executor_for_pp_wave
+    from vllm_torchtpu.core.pp_lazy_step import patch_engine_core_for_lazy_push
+    from vllm_torchtpu.distributed.pp_push import patch_executor_for_pp_handoff
 
-    patch_executor_for_pp_wave(kwargs.get("vllm_config"))
+    patch_executor_for_pp_handoff(kwargs.get("vllm_config"))
     patch_engine_core_for_pp_chunks(kwargs.get("vllm_config"))
+    patch_engine_core_for_lazy_push(kwargs.get("vllm_config"))
 
     from vllm.v1.engine.core import EngineCoreProc
 
@@ -519,6 +766,8 @@ def _patch_vllm_offloading_config_build() -> None:
     hybrid configs ``build_offloading_config`` trips its own
     ``tokens_per_block % tokens_per_hash`` assert (the PCP-patched resolve
     returns logical hash sizes while the group sizes stay rank-local).
+    Each group's ``sliding_window_size_in_chunks`` is recomputed against the
+    logical chunk span for the same reason.
     """
     import sys
     from dataclasses import replace
@@ -526,6 +775,7 @@ def _patch_vllm_offloading_config_build() -> None:
     from vllm.distributed.kv_transfer.kv_connector.v1.offloading import (
         config as offloading_config_module,
     )
+    from vllm.v1.kv_cache_interface import iter_layer_specs
 
     if getattr(offloading_config_module, "_tpu_offloading_config_patch", False):
         return
@@ -561,12 +811,25 @@ def _patch_vllm_offloading_config_build() -> None:
         _, tokens_per_hash = kv_cache_utils.resolve_kv_cache_block_sizes(
             kv_cache_config, vllm_config
         )
+        blocks_per_chunk = config.cache.blocks_per_chunk
+
+        def logical_group(group):
+            tokens_per_block = group.tokens_per_block * pcp
+            group_spec = kv_cache_config.kv_cache_groups[group.group_id].kv_cache_spec
+            layer_spec = next(iter(iter_layer_specs(group_spec)))
+            return replace(
+                group,
+                tokens_per_block=tokens_per_block,
+                sliding_window_size_in_chunks=(
+                    offloading_config_module.get_sliding_window_size_in_chunks(
+                        layer_spec, tokens_per_block * blocks_per_chunk
+                    )
+                ),
+            )
+
         config = replace(
             config,
-            groups=tuple(
-                replace(group, tokens_per_block=group.tokens_per_block * pcp)
-                for group in config.groups
-            ),
+            groups=tuple(logical_group(group) for group in config.groups),
             cache=replace(config.cache, tokens_per_hash=tokens_per_hash),
         )
         for group in config.groups:
@@ -591,10 +854,53 @@ def _patch_vllm_offloading_config_build() -> None:
     logger.info("Applied TPU patch: PCP-aware OffloadingConfig build.")
 
 
+def _patch_vllm_offload_all_ranks_kv_bytes() -> None:
+    """Record every worker's KV bytes per block where the per-worker configs
+    pass by.
+
+    The engine core turns the per-worker KV cache configs into the scheduler's
+    config and keeps only that one; each worker is handed the whole list and
+    keeps its own entry. The Raiden offloading spec sizes the host capacity
+    from the bytes behind one block on all ranks, which under pipeline
+    parallelism differ between stages, so both places record the sum first.
+    """
+    from vllm.v1.engine import core as engine_core_module
+    from vllm.v1.worker.worker_base import WorkerWrapperBase
+
+    from vllm_torchtpu.offload.raiden_store import record_all_ranks_kv_bytes_per_block
+
+    marker = "_tpu_all_ranks_kv_bytes_patch"
+    original_generate = engine_core_module.generate_scheduler_kv_cache_config
+    if not original_generate.__dict__.get(marker, False):
+
+        def generate_scheduler_kv_cache_config_tpu(kv_cache_configs):
+            record_all_ranks_kv_bytes_per_block(kv_cache_configs)
+            return original_generate(kv_cache_configs)
+
+        generate_scheduler_kv_cache_config_tpu.__dict__[marker] = True
+        engine_core_module.generate_scheduler_kv_cache_config = (
+            generate_scheduler_kv_cache_config_tpu
+        )
+
+    original_initialize = WorkerWrapperBase.initialize_from_config
+    if not original_initialize.__dict__.get(marker, False):
+
+        def initialize_from_config_tpu(self, kv_cache_configs):
+            record_all_ranks_kv_bytes_per_block(kv_cache_configs)
+            return original_initialize(self, kv_cache_configs)
+
+        initialize_from_config_tpu.__dict__[marker] = True
+        WorkerWrapperBase.initialize_from_config = initialize_from_config_tpu
+
+    logger.info("Applied TPU patch: all-ranks KV bytes per block for offloading.")
+
+
 def _patch_vllm_kimi_kda_layer_counts() -> None:
     """Patch ModelConfig.get_num_layers_by_block_type to report accurate counts
     for Kimi models with KDA using linear_attn_config (e.g. Kimi-K3).
     """
+    from typing import Literal
+
     from vllm.config.model import ModelConfig
 
     if getattr(ModelConfig, "_tpu_kimi_kda_layer_counts_patched", False):
@@ -603,7 +909,9 @@ def _patch_vllm_kimi_kda_layer_counts() -> None:
     original_get_num_layers = ModelConfig.get_num_layers_by_block_type
 
     def patched_get_num_layers_by_block_type(
-        self, parallel_config, block_type="attention"
+        self,
+        parallel_config,
+        block_type: Literal["attention", "linear_attention", "mamba"] = "attention",
     ) -> int:
         try:
             return original_get_num_layers(self, parallel_config, block_type)
@@ -641,7 +949,7 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
     from dataclasses import replace
 
     from vllm.utils.math_utils import cdiv
-    from vllm.v1.core import kv_cache_coordinator, kv_cache_utils
+    from vllm.v1.core import kv_cache_coordinator, kv_cache_planning, kv_cache_utils
     from vllm.v1.kv_cache_interface import (
         AttentionSpec,
         FullAttentionSpec,
@@ -796,7 +1104,10 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
             scheduler_block_size,
             hash_block_size,
             metrics_collector=None,
+            num_hash_lookahead_tokens=0,
             num_prefill_lookahead=0,
+            allow_partial_hash_hits: bool = True,
+            **kwargs,
         ):
             groups = kv_cache_config.kv_cache_groups
             logical_pcp_world_size = pcp_world_size
@@ -867,7 +1178,10 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
                 scheduler_block_size,
                 hash_block_size,
                 metrics_collector,
+                num_hash_lookahead_tokens=num_hash_lookahead_tokens,
                 num_prefill_lookahead=num_prefill_lookahead,
+                allow_partial_hash_hits=allow_partial_hash_hits,
+                **kwargs,
             )
 
         _get_coordinator_with_logical_pcp_blocks._tpu_hybrid_pcp_coordinator_patch = (
@@ -899,26 +1213,25 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
     # uniform KV cache spec across groups, raising ValueError when encountering
     # heterogeneous layer configurations (e.g. hybrid attention/Mamba models,
     # pure linear state layers, or disaggregated PCP configurations with
-    # per-group block sizing). We patch it to catch ValueError and return an
-    # empty dict so initialization falls back cleanly to the TPU hybrid/PCP
-    # cache coordinator without crashing.
-    original_promote = getattr(kv_cache_utils, "_promote_local_kv_cache_specs", None)
-    if original_promote is not None and not getattr(
-        original_promote, "_tpu_hybrid_promote_patch", False
-    ):
+    # per-group block sizing). We patch it to catch ValueError and return the
+    # unmodified kv_cache_spec dict so initialization falls back cleanly to the
+    # TPU hybrid/PCP cache coordinator without crashing or logging a false
+    # promotion warning.
+    from vllm.v1.kv_cache_interface import KVCacheSpec
 
-        def patched_promote(specs):
+    original_promote = kv_cache_planning._promote_local_kv_cache_specs
+    if not getattr(original_promote, "_tpu_hybrid_promote_patch", False):
+
+        def patched_promote(
+            kv_cache_spec: dict[str, KVCacheSpec],
+        ) -> dict[str, KVCacheSpec]:
             try:
-                return original_promote(specs)
+                return original_promote(kv_cache_spec)
             except ValueError:
-                return {}
+                return kv_cache_spec
 
         patched_promote._tpu_hybrid_promote_patch = True
-        kv_cache_utils._promote_local_kv_cache_specs = patched_promote
-        for module_name in ("vllm.v1.engine.core", "vllm.v1.core.kv_cache_utils"):
-            mod = sys.modules.get(module_name)
-            if mod is not None and hasattr(mod, "_promote_local_kv_cache_specs"):
-                mod._promote_local_kv_cache_specs = patched_promote
+        kv_cache_planning._promote_local_kv_cache_specs = patched_promote
 
     if not getattr(EngineCoreProc, "_tpu_engine_core_patch_wrapper", False):
         EngineCoreProc._tpu_original_run_engine_core = EngineCoreProc.run_engine_core
@@ -929,13 +1242,67 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
         logger.info("Applied TPU patch: hybrid full-attention + Mamba PCP block sizes.")
 
 
+# CPU KV offloading connectors (vLLM's and the Raiden store-backed one). They
+# hash at the scheduler's hash unit and chunk at the logical block.
+_OFFLOADING_CONNECTORS = frozenset(
+    {"OffloadingConnector", "TPURaidenOffloadingConnector"}
+)
+
+
+def _is_offloading_connector(kv_transfer_config) -> bool:
+    return getattr(kv_transfer_config, "kv_connector", None) in _OFFLOADING_CONNECTORS
+
+
+def _patch_vllm_offload_fine_prefix_alignment() -> None:
+    """Load offloaded chunks only from a chunk-aligned GPU prefix hit.
+
+    With DCP fine prefix hits a GPU hit can end inside a logical block. The
+    manager then copy-on-writes that shared block into a fresh one, and the
+    copy is applied by the runner at the next forward. An offload load of the
+    same chunk would DMA into that fresh block concurrently, and whichever
+    lands last wins -- the copy carries the other sequence's tail past the hit
+    point. A hit that ends mid-block means the prompt diverged inside that
+    block (eviction frees whole blocks, tail first), so the offload tier holds
+    nothing past it either; skip the lookup there instead of racing.
+    """
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
+        OffloadingConnectorScheduler,
+    )
+
+    if getattr(OffloadingConnectorScheduler, "_tpu_fine_prefix_alignment", False):
+        return
+    original_lookup = OffloadingConnectorScheduler._lookup
+
+    def _lookup(self, req_status, *args, **kwargs):
+        local_tokens = req_status.num_locally_computed_tokens
+        for group_config in self.config.kv_group_configs:
+            if (
+                group_config.hashes_per_chunk > 1
+                and local_tokens % group_config.tokens_per_chunk
+            ):
+                return 0
+        return original_lookup(self, req_status, *args, **kwargs)
+
+    OffloadingConnectorScheduler._lookup = _lookup
+    OffloadingConnectorScheduler._tpu_fine_prefix_alignment = True
+    logger.info(
+        "Applied TPU patch: chunk-aligned offload loads under fine prefix hits."
+    )
+
+
 def _dcp_fine_prefix_match_unit(kv_cache_config, vllm_config) -> int | None:
     """Return the fine prefix-hit unit for a single-group DCP model, or None.
 
     Opt-in: only a single full-attention (incl. MLA) group under DCP with
-    prefix caching, no PCP, no KV connector, and an explicit
-    ``--prefix-match-unit`` smaller than the logical block (block_size * dcp).
-    Everything else keeps upstream behavior (hash == scheduler block).
+    prefix caching, no PCP, no KV connector other than a CPU offloading one,
+    and an explicit ``--prefix-match-unit`` smaller than the logical block
+    (block_size * dcp). Everything else keeps upstream behavior (hash ==
+    scheduler block).
+
+    Offloading connectors chunk at the logical block and key each chunk by its
+    last fine hash, so they work with a finer hash unit; see
+    ``_patch_vllm_offload_fine_prefix_alignment`` for the one load case that
+    needs care.
     """
     from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
     from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
@@ -951,8 +1318,11 @@ def _dcp_fine_prefix_match_unit(kv_cache_config, vllm_config) -> int | None:
         or not cache_config.enable_prefix_caching
         or dcp <= 1
         or parallel_config.prefill_context_parallel_size != 1
-        # Connectors (P/D, offload) consume block hashes at block granularity.
-        or vllm_config.kv_transfer_config is not None
+        # P/D connectors consume block hashes at block granularity.
+        or (
+            vllm_config.kv_transfer_config is not None
+            and not _is_offloading_connector(vllm_config.kv_transfer_config)
+        )
         or len(groups) != 1
     ):
         return None
@@ -1030,6 +1400,12 @@ def _patch_vllm_dcp_fine_prefix_hits() -> None:
                         "than block_size*dcp); prefix hits stay block-aligned.",
                         vllm_config.cache_config.prefix_match_unit,
                     )
+                    orig_unit = vllm_config.cache_config.prefix_match_unit
+                    try:
+                        vllm_config.cache_config.prefix_match_unit = None
+                        return previous_resolve(kv_cache_config, vllm_config)
+                    finally:
+                        vllm_config.cache_config.prefix_match_unit = orig_unit
                 return previous_resolve(kv_cache_config, vllm_config)
             dcp = vllm_config.parallel_config.decode_context_parallel_size
             scheduler_block_size = vllm_config.cache_config.block_size * dcp
@@ -1045,7 +1421,14 @@ def _patch_vllm_dcp_fine_prefix_hits() -> None:
         resolve_kv_cache_block_sizes._tpu_dcp_fine_prefix_patch = True
         kv_cache_utils.resolve_kv_cache_block_sizes = resolve_kv_cache_block_sizes
         resolve = resolve_kv_cache_block_sizes
-    for module_name in ("vllm.v1.engine.core", "vllm.v1.kv_offload.base"):
+    # The offloading config builder imports it by name too; its tokens_per_hash
+    # must match the scheduler's hash unit or offload keys land on the wrong
+    # hash boundaries.
+    for module_name in (
+        "vllm.v1.engine.core",
+        "vllm.v1.kv_offload.base",
+        "vllm.distributed.kv_transfer.kv_connector.v1.offloading.config",
+    ):
         module = sys.modules.get(module_name)
         if module is not None and hasattr(module, "resolve_kv_cache_block_sizes"):
             module.resolve_kv_cache_block_sizes = resolve
@@ -1092,7 +1475,7 @@ def _patch_vllm_dcp_fine_prefix_hits() -> None:
         self.pcp_world_size = init_args["pcp_world_size"]
         self.block_size = manager.block_size
         self.hash_block_size = hash_block_size
-        manager.use_eagle = 0 in self.eagle_group_ids
+        manager.use_eagle = 0 in self.drop_eagle_group_ids
         if not type(manager).supports_fine_grained_hash_lookup:
             raise ValueError(
                 f"{type(manager).__name__} does not support prefix hits finer "
@@ -1105,7 +1488,7 @@ def _patch_vllm_dcp_fine_prefix_hits() -> None:
             )
         # EAGLE/MTP drops one hash unit (not a whole block) from each hit; it
         # must still cover the multi-module prefill lookahead.
-        if self.eagle_group_ids and hash_block_size < num_prefill_lookahead:
+        if self.drop_eagle_group_ids and hash_block_size < num_prefill_lookahead:
             raise ValueError(
                 f"prefix_match_unit={hash_block_size} must be >= "
                 f"num_speculative_tokens={num_prefill_lookahead}."
@@ -1128,7 +1511,7 @@ def _patch_vllm_dcp_fine_prefix_hits() -> None:
             kv_cache_group_ids=[0],
             block_pool=self.block_pool,
             kv_cache_spec=self.kv_cache_spec,
-            drop_eagle_block=0 in self.eagle_group_ids,
+            drop_eagle_block=0 in self.drop_eagle_group_ids,
             alignment_tokens=self.hash_block_size,
             dcp_world_size=self.dcp_world_size,
             pcp_world_size=self.pcp_world_size,
@@ -1401,44 +1784,22 @@ def _patch_dflash_bypass_v2_runner_check() -> None:
     logger.info("Applied TPU patch: bypass DFlash V2 runner check on TPU.")
 
 
-def _patch_vllm_config_triton_tpu() -> None:
-    """Bypass V2 model runner Triton check on TPU.
-
-    The config forces use_v2_model_runner=True for hybrid DFlash drafters.
-    When it validates V2, it crashes on TPU because HAS_TRITON is False.
-    TPU uses TPUModelRunner instead, so we can safely bypass this.
-    """
-    from vllm.config.vllm import VllmConfig
-
-    if getattr(VllmConfig, "_tpu_triton_patch_applied", False):
-        return
-
-    original_validate = VllmConfig._validate_v2_model_runner
-
-    def patched_validate(self):
-        if (
-            getattr(self, "device_config", None)
-            and self.device_config.device_type == "tpu"
-        ):
-            return
-        return original_validate(self)
-
-    VllmConfig._validate_v2_model_runner = patched_validate
-    VllmConfig._tpu_triton_patch_applied = True
-    logger.info("Applied TPU patch: bypass V2 model runner Triton check.")
-
-
 def _patch_vllm_force_v1_runner_tpu() -> None:
     """Keep TPU's V1 scheduler contract and validate its own capabilities.
 
     vLLM 0.29 defaults to GPU Model Runner V2 when Triton is available and
     rejects GPU V2-only features when V1 is selected. TPUModelRunner owns
-    PCP, DSpark, and mixed-attention DFlash implementations, but consumes
-    V1-shaped scheduler output. Keep that default regardless of Triton and
-    remove only those implemented features from the native V1 rejection
-    list. The other native checks and TPU's combination checks still apply.
+    PCP, DSpark (with adaptive verification), and mixed-attention DFlash
+    implementations, but consumes V1-shaped scheduler output. Keep that
+    default regardless of Triton and remove only those implemented features
+    from the native V1 rejection list. The other native checks and TPU's
+    combination checks still apply. Adaptive verification's native check
+    requires full CUDA graphs, so TPU validates it against its own runner.
     An explicit VLLM_USE_V2_MODEL_RUNNER retains upstream precedence.
     """
+    from collections.abc import Callable
+    from typing import Any, cast
+
     from vllm.config.vllm import VllmConfig
 
     if getattr(VllmConfig, "_tpu_force_v1_runner_patch", False):
@@ -1453,15 +1814,17 @@ def _patch_vllm_force_v1_runner_tpu() -> None:
         )
         return
 
+    original_fget = cast(Callable[[Any], bool], original_prop.fget)
+
     def patched_use_v2(self):
         import vllm.envs as envs
 
         if envs.VLLM_USE_V2_MODEL_RUNNER is not None:
-            return original_prop.fget(self)
+            return original_fget(self)
         device_config = getattr(self, "device_config", None)
         if device_config is not None and device_config.device_type == "tpu":
             return False
-        return original_prop.fget(self)
+        return original_fget(self)
 
     original_unsupported = VllmConfig._get_v1_model_runner_unsupported_features
 
@@ -1471,16 +1834,32 @@ def _patch_vllm_force_v1_runner_tpu() -> None:
         if device_config is None or device_config.device_type != "tpu":
             return unsupported
         # These are limitations of the upstream GPU V1 runner. Do not bypass
-        # the validator: adaptive verification, DFlash2, and future features
-        # must remain rejected until TPU implements them.
+        # the validator: DFlash2 and future features must remain rejected
+        # until TPU implements them. Adaptive verification is DSpark-only.
         implemented = {
             "prefill context parallel",
             "dspark speculative decoding",
             "mixed sliding/full dflash drafts",
         }
+        spec = self.speculative_config
+        if spec is not None and spec.method == "dspark":
+            implemented.add("adaptive draft verification")
         return [feature for feature in unsupported if feature not in implemented]
 
+    original_validate_adaptive = VllmConfig._validate_adaptive_verification
+
+    def patched_validate_adaptive(self):
+        device_config = getattr(self, "device_config", None)
+        if device_config is None or device_config.device_type != "tpu":
+            return original_validate_adaptive(self)
+        from vllm_torchtpu.spec_decode.adaptive_verification import (
+            validate_adaptive_verification_config,
+        )
+
+        validate_adaptive_verification_config(self)
+
     VllmConfig._get_v1_model_runner_unsupported_features = patched_unsupported
+    VllmConfig._validate_adaptive_verification = patched_validate_adaptive
     VllmConfig.use_v2_model_runner = property(patched_use_v2)
     VllmConfig._tpu_force_v1_runner_patch = True
     logger.info("Applied TPU patch: force V1 model runner semantics on TPU.")
@@ -1522,40 +1901,16 @@ if "proxy" in envs.JAX_PLATFORMS:
         )
 
 
-def _patch_vllm_block_pool_lifo_free() -> None:
-    """Restore pre-#48017 LIFO block reuse when prefix caching is off.
+def _patch_vllm_abort_on_preemption() -> None:
+    from vllm_torchtpu.core.abort_on_preemption import patch_scheduler_init
 
-    vllm a82f1b38 switched hashless freed blocks from prepend (LIFO reuse
-    of a small hot set of block ids) to append (FIFO) when prefix caching
-    is disabled. On TPU v7x the FIFO order cycles the entire KV block-id
-    space under sustained load and an indexed SparseCore-offloaded op on
-    the paged-KV path traps with E0200 RuntimeUnexpectedCoreHalt (UserFatal
-    on SC2). Bisect evidence: docs/sc2-sparsecore-halt-2026-08.md on branch
-    mhhua/sc2-sparsecore-halt-evidence, vllm-torchtpu-dev builds 136-146.
-    Behavior with prefix caching enabled is unchanged. Remove once the
-    SparseCore index handling is fixed in the TPU runtime.
-    """
-    from vllm.v1.core.block_pool import BlockPool
+    patch_scheduler_init()
 
-    if BlockPool.__dict__.get("_tpu_lifo_free_patch", False):
-        return
 
-    def free_blocks(self, ordered_blocks) -> None:
-        blocks_with_hash = []
-        blocks_without_hash = []
-        for block in ordered_blocks:
-            block.ref_cnt -= 1
-            if block.ref_cnt == 0 and not block.is_null:
-                if block.block_hash is None:
-                    blocks_without_hash.append(block)
-                else:
-                    blocks_with_hash.append(block)
-        self.free_block_queue.prepend_n(blocks_without_hash)
-        self.free_block_queue.append_n(blocks_with_hash)
+def _patch_vllm_raiden_pd_completion() -> None:
+    from vllm_torchtpu.core.raiden_pd import patch_scheduler_init
 
-    BlockPool.free_blocks = free_blocks
-    BlockPool._tpu_lifo_free_patch = True
-    logger.info("Applied LIFO free-block patch (pre-vllm#48017 order) to BlockPool")
+    patch_scheduler_init()
 
 
 def _patch_vllm_same_step_prefix_hits() -> None:
@@ -1728,6 +2083,7 @@ def _patch_vllm_vocab_parallel_embedding() -> None:
             )
 
     def patched_forward(self, input_):
+        input_mask = None
         if self.tp_size > 1:
             masked_input, input_mask = vpe.get_masked_input_and_mask(
                 input_,
@@ -1759,6 +2115,7 @@ def _patch_vllm_vocab_parallel_embedding() -> None:
             masked_input = input_
         output_parallel = self.quant_method.embedding(self, masked_input.long())
         if self.tp_size > 1:
+            assert input_mask is not None
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
             from vllm.distributed import tensor_model_parallel_all_reduce
 

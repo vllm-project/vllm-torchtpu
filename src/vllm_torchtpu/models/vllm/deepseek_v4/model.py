@@ -49,6 +49,7 @@ from vllm.model_executor.models.utils import (
 from vllm.model_executor.offloader import NoopOffloader, set_offloader
 from vllm.sequence import IntermediateTensors
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor import (
     VllmDeepseekCompressor,  # noqa: E501
 )
@@ -84,7 +85,12 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.layer_idx = int(_m.group(1)) if _m else -1
 
         self.rms_norm_eps = config.rms_norm_eps
-        self.attn = VllmDeepseekV4MLAAttention(
+        attn_cls = VllmDeepseekV4MLAAttention
+        if envs.TPU_DSV4_ATTN_INTRA_CHIP_TP:
+            from vllm_torchtpu.models.vllm.deepseek_v4.attn_intra_chip import (
+                VllmDeepseekV4MLAAttentionIntraChip as attn_cls,
+            )
+        self.attn = attn_cls(
             vllm_config,
             prefix=f"{prefix}.attn",
             topk_indices_buffer=topk_indices_buffer,
@@ -290,6 +296,14 @@ class DeepseekV4Model(nn.Module):
         self.hc_mult = config.hc_mult
         self.hc_dim = self.hc_mult * config.hidden_size
         self.rms_norm_eps = config.rms_norm_eps
+        self.num_hash_layers: int = config.mlp_layer_types.count("hash_moe")
+        # The hash routing input gather and the start_layer test assume the
+        # hash layers come first.
+        if not set(config.mlp_layer_types[: self.num_hash_layers]) <= {"hash_moe"}:
+            raise ValueError(
+                "DeepSeek-V4 mlp_layer_types must list every hash_moe layer before "
+                f"any moe layer: {config.mlp_layer_types}"
+            )
 
         self.topk_indices_buffer = torch.empty(
             vllm_config.scheduler_config.max_num_batched_tokens,
@@ -384,9 +398,10 @@ class DeepseekV4Model(nn.Module):
         # rows they want. They are built from one config and armed by one
         # weight-load path, so disagreeing is a bug here rather than a case to
         # handle -- and it would be a silent shape mismatch deep in a layer.
-        hash_layers = self.layers[
-            self.start_layer : min(self.end_layer, self.config.num_hash_layers)
-        ]
+        hash_layers = typing.cast(
+            Iterable[DeepseekV4DecoderLayer],
+            self.layers[self.start_layer : min(self.end_layer, self.num_hash_layers)],
+        )
         wants = {layer.ffn.routes_dp_gathered_tokens for layer in hash_layers}
         assert len(wants) == 1, (
             "DeepSeek-V4 hash MoE layers disagree on whether the MoE runner "
@@ -434,7 +449,7 @@ class DeepseekV4Model(nn.Module):
         # Hash routing is confined to the first `num_hash_layers`; only those
         # layers need ids gathered across DP.
         moe_input_ids = input_ids
-        if input_ids is not None and self.start_layer < self.config.num_hash_layers:
+        if input_ids is not None and self.start_layer < self.num_hash_layers:
             moe_input_ids = self._dp_gather_hash_moe_input_ids(input_ids)
 
         residual, post_mix, res_mix = None, None, None
@@ -689,7 +704,7 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,

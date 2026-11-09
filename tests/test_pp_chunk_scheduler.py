@@ -1,3 +1,16 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -25,13 +38,19 @@ def _model(attn=1.5e-7, slack=0.1, granularity=4096) -> StepCostModel:
 
 
 def _scheduler(
-    mamba_split=False, cost=None, running=(), waiting=(), step_limit=None
+    mamba_split=False,
+    cost=None,
+    running=(),
+    waiting=(),
+    step_limit=None,
+    kv_holding_waiting=(),
 ) -> TpuPipelineChunkScheduler:
     scheduler = TpuPipelineChunkScheduler.__new__(TpuPipelineChunkScheduler)
     scheduler._cost = cost
     scheduler._step_limit = step_limit
     scheduler._pp_size = 8
     scheduler.waiting = list(waiting)
+    scheduler.kv_holding_waiting = list(kv_holding_waiting)
     scheduler.vllm_config = SimpleNamespace(
         scheduler_config=SimpleNamespace(max_num_batched_tokens=16384),
         parallel_config=SimpleNamespace(pipeline_parallel_size=8),
@@ -232,6 +251,30 @@ def test_the_step_limit_spreads_the_pending_prefill_over_the_stages():
     assert scheduler._step_limit is None
 
 
+def test_kv_holding_queue_does_not_shrink_the_pending_work_budget():
+    pending = [_request(0, 65536, f"w{i}") for i in range(4)]
+    scheduler = _scheduler(cost=_model(granularity=2048), waiting=pending)
+    assert scheduler._pending_step_limit() == 16384
+
+    # Queue placement alone does not consume prompt tokens. Requests holding
+    # KV blocks must contribute the same pending work as other waiting requests.
+    scheduler.waiting = []
+    scheduler.kv_holding_waiting = pending
+    assert scheduler._pending_step_limit() == 16384
+
+    # Splitting requests across both queues must preserve the same budget.
+    scheduler.waiting = pending[:2]
+    scheduler.kv_holding_waiting = pending[2:]
+    assert scheduler._pending_step_limit() == 16384
+    scheduler.waiting = []
+
+    # Count only the remaining prompt work, even in the KV-holding queue.
+    scheduler.kv_holding_waiting = [_request(24576, 32768)]
+    assert scheduler._pending_step_limit() == 4096
+    scheduler.kv_holding_waiting = [_decode("done")]
+    assert scheduler._pending_step_limit() is None
+
+
 def test_the_step_limit_keeps_a_prompt_whole_when_halves_are_no_faster():
     # A 4K step costs more than an 8K one: a lone 8K prompt on 4 stages
     # leaves sooner as one step (4 steps of 109 ms) than as two (5 of 118).
@@ -355,3 +398,57 @@ def test_engine_core_patch_is_skipped_without_dynamic_chunks(monkeypatch):
     monkeypatch.setattr(engine_core, "EngineCore", FakeCore)
     patch_engine_core_for_pp_chunks(_config(cls=None))
     assert not hasattr(FakeCore, "_tpu_pp_chunks_patch")
+
+
+def test_the_step_estimate_prices_the_step_the_cost_model_sees():
+    cost = _model()
+    scheduler = _scheduler(cost=cost)
+    # schedule() has already counted the step's tokens as computed
+    scheduler.requests = {
+        "a": _request(12288, 32768, "a"),
+        "d": _request(8193, 8192, "d", num_tokens=8193),
+    }
+    step = SimpleNamespace(
+        num_scheduled_tokens={"a": 4096, "d": 1, "gone": 7},
+        total_num_scheduled_tokens=4104,
+    )
+    pairs = 4096 * 8192 + 1 * 8192
+    squares = 4096**2 + 1 + 49
+    assert scheduler.step_estimate_ms(step) == cost.step_ms(8192, pairs, squares)
+    # past the largest bucket the step is priced at that bucket
+    step.total_num_scheduled_tokens = 20000
+    assert scheduler.step_estimate_ms(step) == cost.step_ms(16384, pairs, squares)
+    assert _scheduler().step_estimate_ms(step) is None
+
+
+@pytest.mark.parametrize(("checkpoint_blocks", "chunk"), [(True, 8191), (False, 3072)])
+def test_an_unclipped_mtp_prompt_runs_whole_with_internal_checkpoints(
+    monkeypatch, checkpoint_blocks, chunk
+):
+    from vllm_torchtpu import _patch_vllm_mamba_split_scheduler_block_size
+
+    monkeypatch.setattr(
+        Scheduler, "_mamba_block_aligned_split", Scheduler._mamba_block_aligned_split
+    )
+    _patch_vllm_mamba_split_scheduler_block_size()
+    # PP4xPCP8, --block-size 384, MTP: what the base split reads.
+    scheduler = _scheduler(mamba_split=True, cost=_model())
+    scheduler.cache_config = SimpleNamespace(block_size=384)
+    scheduler.block_size = 3072
+    scheduler.hash_block_size = 3072
+    scheduler.use_eagle = True
+    scheduler.use_eagle_block_drop = True
+    scheduler.num_hash_lookahead_tokens = 0
+    scheduler.max_num_scheduled_tokens = 16384
+    scheduler.scheduler_config = SimpleNamespace(long_prefill_token_threshold=16384)
+    scheduler.mamba_has_prefill_checkpoint_blocks = checkpoint_blocks
+    scheduler.mamba_prefill_checkpoint_alignment = 64 if checkpoint_blocks else None
+    scheduler.mamba_partial_cache_hit = False
+    scheduler.mamba_shared_prefix_checkpoint = False
+    request = _request(0, 8191)
+    request.shared_prefix_boundary = 0
+
+    # The cost model passes the whole prompt; the base split decides the rest.
+    assert scheduler._mamba_block_aligned_split(request, 8191) == chunk
+    assert scheduler._clips == 0
+    assert scheduler._step_prefill_tokens == chunk

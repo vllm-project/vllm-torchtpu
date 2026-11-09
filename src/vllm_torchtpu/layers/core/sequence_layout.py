@@ -1,9 +1,21 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 import bisect
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 import numpy as np
 import torch
@@ -120,8 +132,12 @@ class SequenceLayoutPlan:
             value=-1,
         )
 
-        packed_to_request = self._packed_to_request_major_token_indices
-        request_to_packed = self._request_major_to_packed_token_indices
+        packed_to_request = cast(
+            np.ndarray, self._packed_to_request_major_token_indices
+        )
+        request_to_packed = cast(
+            np.ndarray, self._request_major_to_packed_token_indices
+        )
         num_tokens = request_to_packed.size
         assert num_tokens <= self.global_padded_num_tokens, (
             "Request-major mapping exceeds the PCP global token capacity: "
@@ -238,6 +254,15 @@ class SequenceLayoutPlanner(Protocol):
         padded_num_reqs: int,
     ) -> SequenceLayoutPlan: ...
 
+    def padded_num_tokens(
+        self,
+        *,
+        runner: Any,
+        scheduler_output: Any,
+        start_index: int,
+        num_scheduled_tokens_per_req: Any,
+    ) -> int: ...
+
     def prepare_dummy(
         self,
         *,
@@ -271,6 +296,18 @@ def _first_ge(paddings: list[int] | tuple[int, ...], value: int) -> int:
     return int(paddings[index])
 
 
+def _all_padded_num_tokens(runner: Any, total_num_scheduled_tokens: int) -> int:
+    """The token bucket of a chunk every device holds whole, raised to the
+    data-parallel step's bucket."""
+    padded_num_tokens = _first_ge(
+        runner.num_tokens_paddings, int(total_num_scheduled_tokens)
+    )
+    dp_target_bucket = runner._dp_target_bucket
+    if dp_target_bucket is not None and dp_target_bucket > padded_num_tokens:
+        padded_num_tokens = int(dp_target_bucket)
+    return padded_num_tokens
+
+
 class AllSequenceLayoutPlanner:
     @property
     def requires_backend_preinit(self) -> bool:
@@ -302,6 +339,7 @@ class AllSequenceLayoutPlanner:
         target_num_reqs: int,
         padded_num_reqs: int,
     ) -> SequenceLayoutPlan:
+        # pyrefly: ignore[unsupported-delete]
         del (
             scheduler_output,
             start_index,
@@ -311,12 +349,9 @@ class AllSequenceLayoutPlanner:
             target_num_reqs,
             padded_num_reqs,
         )
-        padded_num_tokens = _first_ge(
-            runner.num_tokens_paddings, int(total_num_scheduled_tokens)
+        padded_num_tokens = _all_padded_num_tokens(
+            runner, int(total_num_scheduled_tokens)
         )
-        dp_target_bucket = runner._dp_target_bucket
-        if dp_target_bucket is not None and dp_target_bucket > padded_num_tokens:
-            padded_num_tokens = int(dp_target_bucket)
 
         return SequenceLayoutPlan(
             descriptor=DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR,
@@ -326,6 +361,19 @@ class AllSequenceLayoutPlanner:
             local_num_tokens=int(total_num_scheduled_tokens),
             local_padded_num_tokens=padded_num_tokens,
         )
+
+    def padded_num_tokens(
+        self,
+        *,
+        runner: Any,
+        scheduler_output: Any,
+        start_index: int,
+        num_scheduled_tokens_per_req: Any,
+    ) -> int:
+        """The ``local_padded_num_tokens`` of the plan ``prepare_real``
+        builds for this chunk, computed without staging anything."""
+        del scheduler_output, start_index
+        return _all_padded_num_tokens(runner, int(num_scheduled_tokens_per_req.sum()))
 
     def prepare_dummy(
         self,

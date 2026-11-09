@@ -41,7 +41,7 @@ import vllm.model_executor.custom_op as custom_op_mod
 import vllm.model_executor.layers.linear as linear_mod
 import vllm.model_executor.models.deepseek_v2 as deepseek_v2
 import vllm.model_executor.parameter as parameter_mod
-from vllm.config import CacheConfig, VllmConfig, set_current_vllm_config
+from vllm.config import CacheConfig, DeviceConfig, VllmConfig, set_current_vllm_config
 from vllm.config.compilation import CompilationConfig, CompilationMode
 from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache, Indexer
@@ -120,7 +120,9 @@ def _build_indexer(dtype=torch.float32, n_head=N_HEAD, buffer_tokens=32):
         qk_rope_head_dim=ROPE_DIM,
     )
     vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(max_model_len=MAX_MODEL_LEN)
+        model_config=SimpleNamespace(max_model_len=MAX_MODEL_LEN),
+        # VllmConfig resolves this to 5 for a max_model_len up to 256K.
+        attention_config=SimpleNamespace(sparse_mla_prefill_workspace_factor=5),
     )
     topk_indices_buffer = torch.full((buffer_tokens, TOPK), -1, dtype=torch.int32)
 
@@ -137,7 +139,7 @@ def _build_indexer(dtype=torch.float32, n_head=N_HEAD, buffer_tokens=32):
         patch.object(parameter_mod, "get_tensor_model_parallel_world_size", lambda: 1),
         _default_dtype(dtype),
         # The in-tree layers read the current config while being built.
-        set_current_vllm_config(VllmConfig()),
+        set_current_vllm_config(VllmConfig(device_config=DeviceConfig(device="cpu"))),
     ):
         indexer = Indexer(
             vllm_config=vllm_config,
@@ -542,3 +544,18 @@ if __name__ == "__main__":
     from absl import app
 
     app.run(main)
+
+
+def test_streamidx_block_sizes_small_bucket():
+    """The small-bucket knobs reach only the MIXED pass of buckets up to the cap."""
+    sizes = mla_attention_op._streamidx_block_sizes
+    default_bkvp = mla_attention_op.STREAMIDX_SMALL_BUCKET_DEFAULT_BKVP
+    default = ((2, 2, 2), (1, 128, 128))
+    assert sizes(16, None, None, 16) == default
+    assert sizes(16, None, 8, 16) == default
+    assert sizes(32, 8, 8, 16) == default
+    assert sizes(4096, 4, 8, 64) == default
+    assert sizes(16, 8, 4, 16) == ((2, 2, 4), (1, 128, 8))
+    assert sizes(8, 4, None, 16) == ((2, 2, default_bkvp), (1, 128, 4))
+    assert sizes(32, 4, None, 32) == ((2, 2, default_bkvp), (1, 128, 4))
+    assert sizes(64, 4, 8, 32) == default

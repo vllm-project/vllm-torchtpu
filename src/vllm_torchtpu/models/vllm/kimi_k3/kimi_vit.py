@@ -1,16 +1,27 @@
-# SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """TPU adaptations for the upstream Kimi-K3 MoonViT implementation."""
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 import torch
 from torch import nn
 from vllm.model_executor.models.kimi_k25_vit import MoonViT3dPretrainedModel
 
-from vllm_torchtpu.utils import synchronize_tensors
+from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
 
 
 def _materialize_vision_qkv(
@@ -34,7 +45,7 @@ def _materialize_vision_qkv(
     if qkv.device.type != "tpu" or torch.compiler.is_compiling():
         return None
 
-    materialized_qkv = torch.empty_like(qkv).copy_(qkv)
+    materialized_qkv = fresh_buffer(qkv)
     synchronize_tensors(materialized_qkv)
     return materialized_qkv, output[1]
 
@@ -45,4 +56,4 @@ class KimiK3MoonViT3dPretrainedModel(MoonViT3dPretrainedModel):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         for block in self.encoder.blocks:
-            block.wqkv.register_forward_hook(_materialize_vision_qkv)
+            cast(nn.Module, block.wqkv).register_forward_hook(_materialize_vision_qkv)

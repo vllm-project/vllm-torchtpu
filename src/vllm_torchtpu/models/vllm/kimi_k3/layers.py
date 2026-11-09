@@ -1,11 +1,23 @@
-# SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Small Kimi layers that are not attention or MoE."""
 
 from __future__ import annotations
 
 from contextlib import ExitStack
 from functools import cache
+from typing import cast
 from unittest.mock import patch
 
 import jax
@@ -22,6 +34,7 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.quantization import QuantizationConfig
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.utils import fresh_buffer
 
 from .collective_ops import TokenShardCollectives
 
@@ -171,9 +184,10 @@ class AttentionResidual(nn.Module):
 
     def process_weights_after_loading(self) -> None:
         """Fold the norm and projection weights into one [hidden] vector."""
-        folded = self.norm.weight.float() * self.proj.weight[0].float()
-        out = torch.empty_like(folded)
-        out.copy_(folded)
+        folded = (
+            self.norm.weight.float() * cast(torch.Tensor, self.proj.weight)[0].float()
+        )
+        out = fresh_buffer(folded)
         self.folded_weight = out
         self._prefill_op = (
             _build_attention_residual_op(self.eps) if out.device.type == "tpu" else None

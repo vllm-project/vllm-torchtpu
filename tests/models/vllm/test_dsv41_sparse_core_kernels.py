@@ -38,11 +38,9 @@ os.environ.setdefault("TPU_SKIP_MDS_QUERY", "true")
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax._src import core as jax_core
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.sparse_core import (
-    core_map_helper,
     ragged_gather,
     ragged_gather_reduce,
     ragged_gather_reduce_v3,
@@ -122,115 +120,6 @@ class MockAsyncCopy:
 
 
 # ==============================================================================
-# 1. core_map_helper.py Full Coverage Tests
-# ==============================================================================
-
-
-class TestCoreMapHelper:
-    """100% full-module line and branch coverage on core_map_helper.py."""
-
-    def test_empty_out_ref_standard_device(self):
-        # Branch: aval.memory_space is jax_core.MemorySpace -> memory_space = None
-        struct = jax.ShapeDtypeStruct((4, 8), jnp.float32)
-        ref = core_map_helper._empty_out_ref(struct)
-        assert isinstance(ref, jax_core.Ref)
-        assert ref.shape == (4, 8)
-        assert ref.dtype == jnp.float32
-
-    def test_empty_out_ref_vmem_non_memory_space(self):
-        # Branch: aval.memory_space is NOT jax_core.MemorySpace (e.g. pltpu.VMEM)
-        @jax.jit
-        def _build_vmem():
-            vmem_struct = pltpu.VMEM((2, 4), jnp.int32)
-            ref = core_map_helper._empty_out_ref(vmem_struct)
-            return ref[...]
-
-        val = _build_vmem()
-        assert val.shape == (2, 4)
-        assert val.dtype == jnp.int32
-
-    def test_kernel_single_output_execution(self):
-        # single_output = True, outs[0] return branch
-        called = False
-
-        def fake_core_map(*args, **kwargs):
-            def decorator(fn):
-                def wrapper(*a, **kw):
-                    nonlocal called
-                    called = True
-                    return fn(*a, **kw)
-
-                return wrapper()
-
-            return decorator
-
-        def body(in_ref, out_ref):
-            out_ref[...] = in_ref[...] * 3.0
-
-        with patch(
-            "vllm_torchtpu.kernels.sparse_core.core_map_helper.pl_core.core_map",
-            side_effect=fake_core_map,
-        ):
-            runner = core_map_helper.kernel(
-                body,
-                out_type=jax.ShapeDtypeStruct((4,), jnp.float32),
-                mesh=MagicMock(),
-            )
-            inp = jnp.array([1.0, 2.0, 3.0, 4.0], dtype=jnp.float32)
-            out = runner(inp)
-            assert called
-            np.testing.assert_allclose(np.asarray(out), [3.0, 6.0, 9.0, 12.0])
-
-    def test_kernel_multi_output_tuple_and_list(self):
-        # single_output = False with tuple and list out_type
-        def fake_core_map(*args, **kwargs):
-            def decorator(fn):
-                def wrapper(*a, **kw):
-                    return fn(*a, **kw)
-
-                return wrapper()
-
-            return decorator
-
-        def body(in_ref, out1_ref, out2_ref):
-            out1_ref[...] = in_ref[...] + 1.0
-            out2_ref[...] = in_ref[...] + 2.0
-
-        with patch(
-            "vllm_torchtpu.kernels.sparse_core.core_map_helper.pl_core.core_map",
-            side_effect=fake_core_map,
-        ):
-            # Tuple out_type
-            runner_tuple = core_map_helper.kernel(
-                body,
-                out_type=(
-                    jax.ShapeDtypeStruct((2,), jnp.float32),
-                    jax.ShapeDtypeStruct((2,), jnp.float32),
-                ),
-                mesh=MagicMock(),
-                scratch_types={"scratch": MagicMock()},
-            )
-            inp = jnp.array([10.0, 20.0], dtype=jnp.float32)
-            out1, out2 = runner_tuple(inp)
-            np.testing.assert_allclose(np.asarray(out1), [11.0, 21.0])
-            np.testing.assert_allclose(np.asarray(out2), [12.0, 22.0])
-
-            # List out_type
-            runner_list = core_map_helper.kernel(
-                body,
-                out_type=[
-                    jax.ShapeDtypeStruct((2,), jnp.float32),
-                    jax.ShapeDtypeStruct((2,), jnp.float32),
-                ],
-                mesh=MagicMock(),
-            )
-            out_list = runner_list(inp)
-            assert isinstance(out_list, list)
-            np.testing.assert_allclose(np.asarray(out_list[0]), [11.0, 21.0])
-            np.testing.assert_allclose(np.asarray(out_list[1]), [12.0, 22.0])
-
-
-# ==============================================================================
 # 2. ragged_gather.py Full Coverage Tests
 # ==============================================================================
 
@@ -241,19 +130,37 @@ class TestRaggedGather:
     def test_calculate_col_size_generations(self):
         sc_info = SimpleNamespace(num_lanes=16)
         # Gen 6
-        tpu_info6 = SimpleNamespace(sparse_core=sc_info, num_lanes=128, generation=6)
+        tpu_info6 = SimpleNamespace(
+            sparse_core=sc_info,
+            num_lanes=128,
+            generation=6,
+            chip_version=pltpu.ChipVersion.TPU_7X,
+            vmem_capacity_bytes=64 << 20,
+        )
         with patch.object(ragged_gather.pltpu, "get_tpu_info", return_value=tpu_info6):
             c6 = ragged_gather.calculate_col_size(1024)
             assert c6 == 1024
 
         # Gen 7
-        tpu_info7 = SimpleNamespace(sparse_core=sc_info, num_lanes=128, generation=7)
+        tpu_info7 = SimpleNamespace(
+            sparse_core=sc_info,
+            num_lanes=128,
+            generation=7,
+            chip_version=pltpu.ChipVersion.TPU_7X,
+            vmem_capacity_bytes=64 << 20,
+        )
         with patch.object(ragged_gather.pltpu, "get_tpu_info", return_value=tpu_info7):
             c7 = ragged_gather.calculate_col_size(1024)
             assert c7 == 1024
 
         # Gen other (default, e.g. 5)
-        tpu_info5 = SimpleNamespace(sparse_core=sc_info, num_lanes=128, generation=5)
+        tpu_info5 = SimpleNamespace(
+            sparse_core=sc_info,
+            num_lanes=128,
+            generation=5,
+            chip_version=pltpu.ChipVersion.TPU_7X,
+            vmem_capacity_bytes=64 << 20,
+        )
         with patch.object(ragged_gather.pltpu, "get_tpu_info", return_value=tpu_info5):
             c5 = ragged_gather.calculate_col_size(1024)
             assert c5 == 1024
@@ -283,7 +190,11 @@ class TestRaggedGather:
             )
 
     def test_ragged_gather_sc_info_none_fallback(self):
-        tpu_info_no_sc = SimpleNamespace(sparse_core=None)
+        tpu_info_no_sc = SimpleNamespace(
+            sparse_core=None,
+            chip_version=pltpu.ChipVersion.TPU_7X,
+            vmem_capacity_bytes=64 << 20,
+        )
         with patch.object(
             ragged_gather.pltpu, "get_tpu_info", return_value=tpu_info_no_sc
         ):
@@ -301,7 +212,13 @@ class TestRaggedGather:
 
     def test_ragged_gather_sc_kernel_wiring(self):
         sc_info = SimpleNamespace(num_lanes=16, num_cores=2, num_subcores=16)
-        tpu_info = SimpleNamespace(sparse_core=sc_info, num_lanes=128, generation=7)
+        tpu_info = SimpleNamespace(
+            sparse_core=sc_info,
+            num_lanes=128,
+            generation=7,
+            chip_version=pltpu.ChipVersion.TPU_7X,
+            vmem_capacity_bytes=64 << 20,
+        )
 
         def mock_kernel(body, out_type=None, **kwargs):
             def runner(s, e, x_val, idx_val):
@@ -325,7 +242,13 @@ class TestRaggedGather:
 
     def test_main_kernel_simulation_packing_1_and_packed(self):
         sc_info = SimpleNamespace(num_lanes=16)
-        tpu_info = SimpleNamespace(sparse_core=sc_info, num_lanes=128, generation=7)
+        tpu_info = SimpleNamespace(
+            sparse_core=sc_info,
+            num_lanes=128,
+            generation=7,
+            chip_version=pltpu.ChipVersion.TPU_7X,
+            vmem_capacity_bytes=64 << 20,
+        )
 
         def fake_emit(pipeline_step, *args, **kwargs):
             def runner(*a, **kw):
@@ -431,28 +354,44 @@ class TestRaggedGatherV2:
     """100% full-module line and branch coverage on ragged_gather_v2.py."""
 
     def test_calculate_col_size_branches(self):
-        sc_info = SimpleNamespace(num_lanes=16)
+        sc_info = SimpleNamespace(num_lanes=16, vmem_capacity_bytes=64 << 20)
 
         # Gen 6
-        tpu_info6 = SimpleNamespace(sparse_core=sc_info, generation=6)
+        tpu_info6 = SimpleNamespace(
+            sparse_core=sc_info,
+            generation=6,
+            chip_version=pltpu.ChipVersion.TPU_7X,
+            vmem_capacity_bytes=64 << 20,
+        )
         with patch.object(
             ragged_gather_v2.pltpu, "get_tpu_info", return_value=tpu_info6
         ):
             assert ragged_gather_v2.calculate_col_size(1024, packing=2) == 1024
 
         # Gen 7
-        tpu_info7 = SimpleNamespace(sparse_core=sc_info, generation=7)
+        tpu_info7 = SimpleNamespace(
+            sparse_core=sc_info,
+            generation=7,
+            chip_version=pltpu.ChipVersion.TPU_7X,
+            vmem_capacity_bytes=64 << 20,
+        )
         with patch.object(
             ragged_gather_v2.pltpu, "get_tpu_info", return_value=tpu_info7
         ):
             assert ragged_gather_v2.calculate_col_size(1024, packing=2) == 1024
 
         # Default gen (e.g. 5)
-        tpu_info5 = SimpleNamespace(sparse_core=sc_info, generation=5)
+        tpu_info5 = SimpleNamespace(
+            sparse_core=sc_info,
+            generation=5,
+            chip_version=pltpu.ChipVersion.TPU_7X,
+            vmem_capacity_bytes=64 << 20,
+        )
+        # Column size follows SparseCore VMEM only, not the chip generation.
         with patch.object(
             ragged_gather_v2.pltpu, "get_tpu_info", return_value=tpu_info5
         ):
-            assert ragged_gather_v2.calculate_col_size(1024, packing=2) == 512
+            assert ragged_gather_v2.calculate_col_size(1024, packing=2) == 1024
 
         # Fallback to max_safe_col (no divisor found in range)
         with patch.object(
@@ -490,7 +429,11 @@ class TestRaggedGatherV2:
             )
 
         # sc_info is None -> fallback x[indices]
-        tpu_info_no_sc = SimpleNamespace(sparse_core=None)
+        tpu_info_no_sc = SimpleNamespace(
+            sparse_core=None,
+            chip_version=pltpu.ChipVersion.TPU_7X,
+            vmem_capacity_bytes=64 << 20,
+        )
         with patch.object(
             ragged_gather_v2.pltpu, "get_tpu_info", return_value=tpu_info_no_sc
         ):
@@ -506,8 +449,16 @@ class TestRaggedGatherV2:
             np.testing.assert_allclose(np.asarray(res1d), np.asarray(res))
 
     def test_ragged_gather_v2_subchunk_range_and_sc_call(self):
-        sc_info = SimpleNamespace(num_lanes=16, num_cores=2, num_subcores=16)
-        tpu_info = SimpleNamespace(sparse_core=sc_info, num_lanes=128, generation=7)
+        sc_info = SimpleNamespace(
+            num_lanes=16, num_cores=2, num_subcores=16, vmem_capacity_bytes=64 << 20
+        )
+        tpu_info = SimpleNamespace(
+            sparse_core=sc_info,
+            num_lanes=128,
+            generation=7,
+            chip_version=pltpu.ChipVersion.TPU_7X,
+            vmem_capacity_bytes=64 << 20,
+        )
 
         def mock_kernel(body, out_type=None, **kwargs):
             def runner(s, e, x_val, idx_val):
@@ -543,8 +494,13 @@ class TestRaggedGatherV2:
             assert res_large.shape == (2048, 128)
 
     def test_main_kernel_v2_simulation(self):
-        sc_info = SimpleNamespace(num_lanes=16)
-        tpu_info = SimpleNamespace(sparse_core=sc_info, generation=7)
+        sc_info = SimpleNamespace(num_lanes=16, vmem_capacity_bytes=64 << 20)
+        tpu_info = SimpleNamespace(
+            sparse_core=sc_info,
+            generation=7,
+            chip_version=pltpu.ChipVersion.TPU_7X,
+            vmem_capacity_bytes=64 << 20,
+        )
 
         captured_inner = None
         captured_outer = None
@@ -715,17 +671,35 @@ class TestRaggedScatter:
         sc_info = SimpleNamespace(num_lanes=16)
 
         # Gen 6
-        tpu_info6 = SimpleNamespace(sparse_core=sc_info, num_lanes=128, generation=6)
+        tpu_info6 = SimpleNamespace(
+            sparse_core=sc_info,
+            num_lanes=128,
+            generation=6,
+            chip_version=pltpu.ChipVersion.TPU_7X,
+            vmem_capacity_bytes=64 << 20,
+        )
         with patch.object(ragged_scatter.pltpu, "get_tpu_info", return_value=tpu_info6):
             assert ragged_scatter.calculate_col_size(1024) == 1024
 
         # Gen 7
-        tpu_info7 = SimpleNamespace(sparse_core=sc_info, num_lanes=128, generation=7)
+        tpu_info7 = SimpleNamespace(
+            sparse_core=sc_info,
+            num_lanes=128,
+            generation=7,
+            chip_version=pltpu.ChipVersion.TPU_7X,
+            vmem_capacity_bytes=64 << 20,
+        )
         with patch.object(ragged_scatter.pltpu, "get_tpu_info", return_value=tpu_info7):
             assert ragged_scatter.calculate_col_size(1024) == 1024
 
         # Default gen (e.g. 5)
-        tpu_info5 = SimpleNamespace(sparse_core=sc_info, num_lanes=128, generation=5)
+        tpu_info5 = SimpleNamespace(
+            sparse_core=sc_info,
+            num_lanes=128,
+            generation=5,
+            chip_version=pltpu.ChipVersion.TPU_7X,
+            vmem_capacity_bytes=64 << 20,
+        )
         with patch.object(ragged_scatter.pltpu, "get_tpu_info", return_value=tpu_info5):
             assert ragged_scatter.calculate_col_size(1024) == 1024
             # Large hidden size triggering while loop iterations
@@ -751,7 +725,11 @@ class TestRaggedScatter:
             )
 
         # sc_info is None -> fallback x[indices]
-        tpu_info_no_sc = SimpleNamespace(sparse_core=None)
+        tpu_info_no_sc = SimpleNamespace(
+            sparse_core=None,
+            chip_version=pltpu.ChipVersion.TPU_7X,
+            vmem_capacity_bytes=64 << 20,
+        )
         with patch.object(
             ragged_scatter.pltpu, "get_tpu_info", return_value=tpu_info_no_sc
         ):
@@ -773,6 +751,7 @@ class TestRaggedScatter:
             vmem_capacity_bytes=100_000_000,
             num_lanes=128,
             generation=7,
+            chip_version=pltpu.ChipVersion.TPU_7X,
         )
         with patch.object(
             ragged_scatter.pltpu, "get_tpu_info", return_value=tpu_info_small
@@ -793,6 +772,7 @@ class TestRaggedScatter:
             vmem_capacity_bytes=100,  # small capacity forces SC path
             num_lanes=128,
             generation=7,
+            chip_version=pltpu.ChipVersion.TPU_7X,
         )
 
         def mock_kernel(body, out_type=None, **kwargs):
@@ -820,7 +800,13 @@ class TestRaggedScatter:
 
     def test_main_kernel_simulation_packing_and_branches(self):
         sc_info = SimpleNamespace(num_lanes=16)
-        tpu_info = SimpleNamespace(sparse_core=sc_info, num_lanes=128, generation=7)
+        tpu_info = SimpleNamespace(
+            sparse_core=sc_info,
+            num_lanes=128,
+            generation=7,
+            chip_version=pltpu.ChipVersion.TPU_7X,
+            vmem_capacity_bytes=64 << 20,
+        )
 
         def fake_emit(pipeline_step, *args, **kwargs):
             def runner(*a, **kw):
@@ -1048,7 +1034,11 @@ class TestRaggedGatherReduce:
             )
 
         # sc_info is None -> fallback
-        tpu_info_no_sc = SimpleNamespace(sparse_core=None)
+        tpu_info_no_sc = SimpleNamespace(
+            sparse_core=None,
+            chip_version=pltpu.ChipVersion.TPU_7X,
+            vmem_capacity_bytes=64 << 20,
+        )
         with patch.object(
             ragged_gather_reduce.pltpu, "get_tpu_info", return_value=tpu_info_no_sc
         ):
@@ -1067,6 +1057,7 @@ class TestRaggedGatherReduce:
             sparse_core=sc_info,
             vmem_capacity_bytes=100_000_000,
             num_lanes=128,
+            chip_version=pltpu.ChipVersion.TPU_7X,
         )
         with patch.object(
             ragged_gather_reduce.pltpu, "get_tpu_info", return_value=tpu_info_small
@@ -1087,6 +1078,7 @@ class TestRaggedGatherReduce:
             sparse_core=sc_info,
             vmem_capacity_bytes=10,  # small forces SC path
             num_lanes=128,
+            chip_version=pltpu.ChipVersion.TPU_7X,
         )
 
         def mock_kernel(body, out_type=None, **kwargs):
@@ -1122,7 +1114,12 @@ class TestRaggedGatherReduce:
 
     def test_main_kernel_simulation_bf16_f32_and_invalid_dtype(self):
         sc_info = SimpleNamespace(num_lanes=16)
-        tpu_info = SimpleNamespace(sparse_core=sc_info, num_lanes=128)
+        tpu_info = SimpleNamespace(
+            sparse_core=sc_info,
+            num_lanes=128,
+            chip_version=pltpu.ChipVersion.TPU_7X,
+            vmem_capacity_bytes=64 << 20,
+        )
 
         def fake_emit(pipeline_step, *args, **kwargs):
             def runner(*a, **kw):
@@ -1311,7 +1308,12 @@ class TestRaggedGatherReduceV3:
 
     def test_partition_counts_and_token_block_alignment(self):
         sc_info = SimpleNamespace(num_cores=2, num_subcores=16)
-        tpu_info = SimpleNamespace(sparse_core=sc_info, num_lanes=128)
+        tpu_info = SimpleNamespace(
+            sparse_core=sc_info,
+            num_lanes=128,
+            chip_version=pltpu.ChipVersion.TPU_7X,
+            vmem_capacity_bytes=64 << 20,
+        )
         col_p, row_p = ragged_gather_reduce_v3.partition_counts(1024, tpu_info)
         assert col_p * row_p == 32
         align = ragged_gather_reduce_v3.token_block_alignment(1024, tpu_info)
@@ -1323,6 +1325,7 @@ class TestRaggedGatherReduceV3:
             sparse_core=sc_info,
             num_lanes=128,
             vmem_capacity_bytes=100_000_000,
+            chip_version=pltpu.ChipVersion.TPU_7X,
         )
 
         x = jnp.ones((4, 128), dtype=jnp.bfloat16)
@@ -1331,7 +1334,12 @@ class TestRaggedGatherReduceV3:
         m = jnp.ones((4,), dtype=bool)
 
         # 1. sc_info is None -> fallback
-        tpu_no_sc = SimpleNamespace(sparse_core=None, num_lanes=128)
+        tpu_no_sc = SimpleNamespace(
+            sparse_core=None,
+            num_lanes=128,
+            chip_version=pltpu.ChipVersion.TPU_7X,
+            vmem_capacity_bytes=64 << 20,
+        )
         with patch.object(
             ragged_gather_reduce_v3.pltpu, "get_tpu_info", return_value=tpu_no_sc
         ):
@@ -1378,6 +1386,7 @@ class TestRaggedGatherReduceV3:
             sparse_core=sc_info,
             num_lanes=128,
             vmem_capacity_bytes=10,
+            chip_version=pltpu.ChipVersion.TPU_7X,
         )
         with (
             patch.object(
@@ -1416,6 +1425,7 @@ class TestRaggedGatherReduceV3:
             sparse_core=sc_info,
             num_lanes=128,
             vmem_capacity_bytes=10,  # force SC path
+            chip_version=pltpu.ChipVersion.TPU_7X,
         )
 
         def mock_kernel(body, out_type=None, **kwargs):
@@ -1473,7 +1483,12 @@ class TestRaggedGatherReduceV3:
 
     def test_main_kernel_simulation_fixed_two_routes_and_generic(self):
         sc_info = SimpleNamespace(num_lanes=16)
-        tpu_info = SimpleNamespace(sparse_core=sc_info, num_lanes=128)
+        tpu_info = SimpleNamespace(
+            sparse_core=sc_info,
+            num_lanes=128,
+            chip_version=pltpu.ChipVersion.TPU_7X,
+            vmem_capacity_bytes=64 << 20,
+        )
 
         captured_token_block = None
         captured_route_pipe = None

@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Checkpoint-loading contract for GDN TP Q/K replication.
 
 These CPU tests construct the real TPU GDN layer and call the loaders attached
@@ -20,8 +32,6 @@ from vllm.model_executor.models.qwen3_5 import Qwen3_5MoeForCausalLM
 
 from vllm_torchtpu.layers.adapter.custom_ops import gdn_attention_op
 from vllm_torchtpu.platforms.tpu_block_size_utils import _hybrid_mamba_state_layout
-
-pytestmark = pytest.mark.cpu_test
 
 K_HEADS = 4
 V_HEADS = 32
@@ -161,9 +171,9 @@ def test_unified_pool_declares_complete_qk_conv_state(make_gdn_attention, tp_siz
     spec = attention.get_kv_cache_spec(vllm_config)
 
     assert spec.shapes == ((taps, 1, conv_dim), (len(v_heads), HEAD_DIM, HEAD_DIM))
-    assert spec.dtypes == (torch.bfloat16, torch.float32)
+    assert spec.dtypes == (torch.float32, torch.float32)
     assert spec.page_size_bytes == (
-        taps * conv_dim * 2 + len(v_heads) * HEAD_DIM * HEAD_DIM * 4
+        taps * conv_dim * 4 + len(v_heads) * HEAD_DIM * HEAD_DIM * 4
     )
     # The NHD pool used by the failing startup has 256 lanes per row.
     assert conv_dim % 256 == 0
@@ -184,7 +194,7 @@ def test_pool_budget_includes_replicated_qk_state(
     layout = _hybrid_mamba_state_layout(vllm_config, fa_physical_bytes_per_token=1024)
     k_heads, v_heads = _owned_heads(tp_size, 0)
     conv_dim = (2 * len(k_heads) + len(v_heads)) * HEAD_DIM
-    assert layout.conv_bytes == (CONV_KERNEL_SIZE - 1) * conv_dim * 2
+    assert layout.conv_bytes == (CONV_KERNEL_SIZE - 1) * conv_dim * 4
     assert layout.ssm_bytes == len(v_heads) * HEAD_DIM * HEAD_DIM * 4
 
 

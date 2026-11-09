@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Unit tests for the Raiden KV offload subsystem.
 
 Tests scheduler and store components using a FakeKVCacheStore without requiring
@@ -30,11 +42,25 @@ physical TPU hardware or native C++ wheels:
    - Peer reads: Borrow nothing locally — no landing slot, no pin, and no
      directory entry once the bytes land.
    - Compatibility namespace: Generates deterministic 16-byte hashes to isolate entries.
+
+4. Storage Tier:
+   - SHARED_STORAGE answers: hits read back with read_remote, in the same call
+     as a peer's blocks, holding no pin; touch and prepare_load never take them
+     for pinned host-pool hits.
+   - Settings: extra-config and env sources, and the fail-fast checks.
+   - Plumbing: BackendConfigs reach the store and every worker, and nothing
+     new is passed while the tier is off.
+
+5. Diverged Hybrid Hits:
+   - A full-attention local hit deeper than the Mamba one: the store's hit
+     ends where it holds the recurrent state, and is 0 without it.
 """
 
 import enum
 import os
 import sys
+import tempfile
+import types
 import unittest
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -47,11 +73,17 @@ from vllm.v1.kv_offload.base import (
     Medium,
     OffloadKey,
     ReqContext,
+    make_offload_key,
 )
 
 
 def _key(n: int) -> bytes:
     return b"hash_%04d" % n
+
+
+def _group_key(n: int, group_idx: int) -> OffloadKey:
+    # A key as the offloading scheduler builds it: block hash + KV cache group.
+    return make_offload_key(b"hash_%04d" % n, group_idx)
 
 
 def _ctx(req_id: str = "req") -> ReqContext:
@@ -64,6 +96,17 @@ class FakeBlockStatus(enum.Enum):
     HOST = 2
     HBM = 3
     HOST_AND_HBM = 4
+    SHARED_STORAGE = 5
+
+
+@dataclass(frozen=True)
+class FakeRaidenId:
+    """A peer's id. Compares by value, as Raiden's RaidenId does."""
+
+    job_name: str = "peer"
+    job_replica_id: str = ""
+    data_name: str = ""
+    data_replica_idx: int = 0
 
 
 class FakeRaidenBlockId:
@@ -120,6 +163,17 @@ class FakeKVCacheStore:
         self.registry_down = False
         # Set by set_eviction_callback(); fired by simulate_evict().
         self.eviction_callback = None
+        # Storage tier behind the host pool: sub-hashes whose files exist.
+        # Empty means the store has no storage tier.
+        self.storage_entries: set[bytes] = set()
+        # With a storage tier, a failed save also drops the entry's pin,
+        # which is what makes raiden refuse the caller's retry.
+        self.failed_save_drops_pin = False
+        # Refuse to launch a read_remote call that includes storage slices;
+        # a call with only peer slices is unaffected.
+        self.fail_storage_read = False
+        # Peers whose read_remote launch is refused.
+        self.fail_read_remote_peers: set[object] = set()
         # Queued terminal outcomes drained asynchronously by poll methods.
         self._save_done: list[bytes] = []
         self._save_failed: list[bytes] = []
@@ -131,6 +185,8 @@ class FakeKVCacheStore:
         self._loading: list[bytes] = []
         self._remote_reading: list[bytes] = []
         self._remote_device_ids: dict[bytes, int] = {}
+        # The in-flight read_remote hashes whose source is the storage tier.
+        self._storage_reading: set[bytes] = set()
 
     # -- store surface used by the manager -----------------------------
 
@@ -143,6 +199,7 @@ class FakeKVCacheStore:
         self.calls.append(
             _Call("lookup", (list(block_hashes), enable_global, pin_found))
         )
+        block_hashes = list(block_hashes)
         out = []
         for h in block_hashes:
             entry = self.entries.get(h)
@@ -164,6 +221,23 @@ class FakeKVCacheStore:
                     SimpleNamespace(
                         status=entry.status,
                         device_block_id=entry.device_block_id,
+                        host_block_id=-1,
+                    ),
+                )
+            )
+        # Past the first hash the host pool (and registry) cannot answer, the
+        # storage tier answers for the rest, again up to its own first miss.
+        # It is asked whether or not enable_global is set, and its
+        # SHARED_STORAGE hits are never pinned.
+        for h in block_hashes[len(out) :]:
+            if h not in self.storage_entries:
+                break
+            out.append(
+                (
+                    h,
+                    SimpleNamespace(
+                        status=FakeBlockStatus.SHARED_STORAGE,
+                        device_block_id=-1,
                         host_block_id=-1,
                     ),
                 )
@@ -237,21 +311,35 @@ class FakeKVCacheStore:
         )
         if self.fail_read_remote:
             return False
-        # Mirror Raiden: a peer read consults nothing locally and needs no pin.
-        # It only needs a REMOTE slice naming the owner, and one destination
-        # device block per hash.
+        # Mirror Raiden: a peer or storage read consults nothing locally and
+        # needs no pin. It only needs a REMOTE or SHARED_STORAGE slice naming
+        # the source, and one destination device block per hash. One call may
+        # mix storage slices with REMOTE slices, but the REMOTE ones must all
+        # name the same peer (RaidenId compares by value).
         if len(slices) != len(block_hashes) or len(device_block_ids) != len(
             block_hashes
         ):
             return False
-        for h, sl in zip(block_hashes, slices):
-            if sl is None or sl.status != FakeBlockStatus.REMOTE:
-                return False
+        readable = (FakeBlockStatus.REMOTE, FakeBlockStatus.SHARED_STORAGE)
+        if any(sl is None or sl.status not in readable for sl in slices):
+            return False
+        peers = {sl.raiden_id for sl in slices if sl.status == FakeBlockStatus.REMOTE}
+        if len(peers) > 1 or peers & self.fail_read_remote_peers:
+            return False
+        storage = {
+            h
+            for h, sl in zip(block_hashes, slices)
+            if sl.status == FakeBlockStatus.SHARED_STORAGE
+        }
+        if storage and self.fail_storage_read:
+            return False
+        for h in block_hashes:
             if h in self._remote_reading:
                 return False
         self._remote_reading.extend(block_hashes)
         for h, d in zip(block_hashes, device_block_ids):
             self._remote_device_ids[h] = d
+        self._storage_reading.update(storage)
         return True
 
     def poll_save_status(self):
@@ -276,7 +364,9 @@ class FakeKVCacheStore:
 
     def complete_save(self, block_hashes, success=True) -> None:
         # A save that lands spends one pin per hash; a failed one spends none,
-        # which is what makes the caller's retry legal.
+        # which is what makes the caller's retry legal. Unless the store has
+        # a storage tier (failed_save_drops_pin): then raiden drops the pin of
+        # a failed save too, and the retry is refused.
         for h in block_hashes:
             self._saving.remove(h)
             if success:
@@ -285,6 +375,8 @@ class FakeKVCacheStore:
                 entry.pin_count -= 1
                 self._save_done.append(h)
             else:
+                if self.failed_save_drops_pin:
+                    self.entries[h].pin_count -= 1
                 self._save_failed.append(h)
 
     def complete_load(self, block_hashes, success=True) -> None:
@@ -298,10 +390,20 @@ class FakeKVCacheStore:
                 self._load_failed.append(h)
 
     def complete_remote_read(self, block_hashes, success=True) -> None:
-        # The bytes land in the destination device blocks and nowhere else:
-        # a peer read records nothing locally either way.
+        # The bytes land in the destination device blocks. A peer read records
+        # nothing locally either way. A storage read that lands also publishes
+        # the block into the host pool, unpinned and under this store's own
+        # id, unless the hash is already there (raiden admits per block and
+        # declines duplicates).
         for h in block_hashes:
             self._remote_reading.remove(h)
+            from_storage = h in self._storage_reading
+            self._storage_reading.discard(h)
+            if success and from_storage and h not in self.entries:
+                self.entries[h] = _Entry(
+                    status=FakeBlockStatus.HOST_AND_HBM,
+                    device_block_id=self._remote_device_ids[h],
+                )
             (self._remote_done if success else self._remote_failed).append(h)
 
     def calls_named(self, name: str) -> list[_Call]:
@@ -383,13 +485,21 @@ def seed_global_entries(
     device_block_size_factor: int = 4,
     key_namespace: bytes = b"",
     ns: bytes = b"",
+    raiden_id: object | None = None,
 ) -> None:
-    """Publish a peer's REMOTE slices for `key` in the fake registry."""
+    """Publish a peer's REMOTE slices for `key` in the fake registry: one peer
+    owns the whole key, `raiden_id` or else a peer of its own."""
     prefix = key_namespace or ns
+    peer = raiden_id if raiden_id is not None else object()
     for i, sub_hash in enumerate(sub_hashes(key, device_block_size_factor, prefix)):
         store.global_entries[sub_hash] = FakeRaidenBlockId(
-            raiden_id=object(), host_block_id=100 + i, status=FakeBlockStatus.REMOTE
+            raiden_id=peer, host_block_id=100 + i, status=FakeBlockStatus.REMOTE
         )
+
+
+def seed_storage_entries(store, key: bytes, device_block_size_factor: int = 4) -> None:
+    """Put `key`'s sub-hashes in the fake storage tier."""
+    store.storage_entries.update(sub_hashes(key, device_block_size_factor))
 
 
 class TestConstructionGuards(unittest.TestCase):
@@ -408,6 +518,7 @@ class TestConstructionGuards(unittest.TestCase):
         config.parallel.dcp_size = 1
         config.parallel.pcp_size = 1
         config.parallel.world_size = 1
+        config.parallel.pp_size = 1
         config.extra_config = {"cpu_bytes_to_use": 1024 * 1024}
         config.worker_kv_bytes_per_block = 1024
         config.groups = []
@@ -793,6 +904,119 @@ class TestLoadJobLifecycle(unittest.TestCase):
         self.assertFalse(finished_job.success)
         self.assertEqual(finished_job.failed_device_block_ids, [10])
 
+    def test_request_is_not_offered_a_load_it_could_not_pin_again(self):
+        # Key 5 is gone by the time prepare_load runs: r1 is not offered it
+        # again, while other requests still hit what is resident.
+        self.manager.on_new_request(_ctx("r1"))
+        self.assertEqual(self.manager.lookup(_key(0), _ctx("r1")), LookupResult.HIT)
+        spec = self.manager.prepare_load([_key(0), _key(5)], _ctx("r1"))
+        self.assertFalse(spec.pinned)
+        self.assertEqual(self.manager._unloadable, {"r1": {_key(5)}})
+        self.assertEqual(self.manager.lookup(_key(0), _ctx("r2")), LookupResult.HIT)
+        self.manager.on_request_finished(_ctx("r1"))
+        self.assertEqual(self.manager._unloadable, {})
+        self.assertEqual(self.store.pinned_hashes(), {})
+
+    def test_pin_failure_keeps_the_resident_prefix_of_its_group(self):
+        # Keys 0-2 of a prefix group are resident, key 3 is gone: on the retry
+        # r1 reloads keys 0-2 and recomputes only from key 3.
+        keys = [_group_key(n, group_idx=0) for n in range(4)]
+        for key in keys[:3]:
+            seed_host_entries(self.store, key)
+        self.manager.on_new_request(_ctx("r1"))
+        spec = self.manager.prepare_load(keys, _ctx("r1"))
+        self.assertFalse(spec.pinned)
+        for key in keys[:3]:
+            self.assertEqual(self.manager.lookup(key, _ctx("r1")), LookupResult.HIT)
+        self.assertEqual(self.manager._unloadable, {"r1": {keys[3]}})
+        self.assertEqual(self.store.pinned_hashes(), {})
+
+    def test_pin_failure_before_a_checked_window_marks_the_window(self):
+        # A sliding-window group (1) loads one chunk (key 4) before the window
+        # its lookup checked (keys 5-6). With key 4 gone, recording key 4 alone
+        # would leave the window a hit and the same load offered again.
+        other = _group_key(0, group_idx=0)
+        lead, *window = [_group_key(n, group_idx=1) for n in (4, 5, 6)]
+        for key in (other, *window):
+            seed_host_entries(self.store, key)
+        self.manager.on_new_request(_ctx("r1"))
+        spec = self.manager.prepare_load([other, lead, *window], _ctx("r1"))
+        self.assertFalse(spec.pinned)
+        self.assertEqual(self.manager.lookup(other, _ctx("r1")), LookupResult.HIT)
+        for key in window:
+            self.assertEqual(self.manager.lookup(key, _ctx("r1")), LookupResult.MISS)
+            self.assertEqual(self.manager.lookup(key, _ctx("r2")), LookupResult.HIT)
+        self.assertEqual(self.store.pinned_hashes(), {})
+
+    def test_pin_failure_records_nothing_for_an_unknown_request(self):
+        self.manager.prepare_load([_key(0), _key(5)], _ctx("r1"))
+        self.assertEqual(self.manager._unloadable, {})
+
+    def test_request_is_not_offered_a_load_whose_launch_failed_again(self):
+        # load() refuses the launch; the HOST entries stay intact, so without
+        # a record r1's next lookup would offer the same load again.
+        self.manager.on_new_request(_ctx("r1"))
+        self.store.fail_load = True
+        self.manager.prepare_load([_key(0), _key(1)], _ctx("r1"))
+        self.manager.submit_load_job(3, [_key(0), _key(1)], [10, 11], "r1")
+        (finished_job,) = self.manager.poll_finished_jobs()
+        self.assertFalse(finished_job.success)
+        self.assertEqual(self.manager.lookup(_key(0), _ctx("r1")), LookupResult.MISS)
+        self.assertEqual(self.manager.lookup(_key(1), _ctx("r1")), LookupResult.MISS)
+        self.assertEqual(self.manager.lookup(_key(0), _ctx("r2")), LookupResult.HIT)
+        self.manager.on_request_finished(_ctx("r1"))
+        self.assertEqual(self.manager.lookup(_key(0), _ctx("r1")), LookupResult.HIT)
+
+    def test_request_is_not_offered_the_failed_part_of_a_polled_load_again(self):
+        # Only the second key's transfer fails. The first precedes it in the
+        # same KV cache group, so r1 may still load it.
+        keys = [_group_key(n, group_idx=0) for n in range(2)]
+        for key in keys:
+            seed_host_entries(self.store, key)
+        self.manager.on_new_request(_ctx("r1"))
+        self.manager.prepare_load(keys, _ctx("r1"))
+        self.manager.submit_load_job(3, keys, [10, 11], "r1")
+        self.store.complete_load(sub_hashes(keys[0]))
+        self.store.complete_load(sub_hashes(keys[1]), success=False)
+        (finished_job,) = self.manager.poll_finished_jobs()
+        self.assertFalse(finished_job.success)
+        self.assertEqual(self.manager.lookup(keys[0], _ctx("r1")), LookupResult.HIT)
+        self.assertEqual(self.manager.lookup(keys[1], _ctx("r1")), LookupResult.MISS)
+        self.assertEqual(self.manager.lookup(keys[1], _ctx("r2")), LookupResult.HIT)
+        self.assertEqual(self.store.pinned_hashes(), {})
+
+    def test_failed_transfer_marks_the_rest_of_its_group(self):
+        # Only the transfer of key 4 (the chunk a sliding-window group loads
+        # before its checked window, keys 5-6) fails. The window is recorded
+        # with it; group 0, whose transfer landed, stays loadable.
+        other = _group_key(0, group_idx=0)
+        lead, *window = [_group_key(n, group_idx=1) for n in (4, 5, 6)]
+        keys = [other, lead, *window]
+        for key in keys:
+            seed_host_entries(self.store, key)
+        self.manager.on_new_request(_ctx("r1"))
+        self.manager.prepare_load(keys, _ctx("r1"))
+        self.manager.submit_load_job(3, keys, [10, 11, 12, 13], "r1")
+        for key in keys:
+            self.store.complete_load(sub_hashes(key), success=key != lead)
+        (finished_job,) = self.manager.poll_finished_jobs()
+        self.assertFalse(finished_job.success)
+        self.assertEqual(self.manager.lookup(other, _ctx("r1")), LookupResult.HIT)
+        self.assertEqual(self.manager._unloadable, {"r1": {lead, *window}})
+        self.assertEqual(self.store.pinned_hashes(), {})
+
+    def test_load_failing_after_its_request_finished_records_nothing(self):
+        # vLLM signals on_request_finished while a load may still be in
+        # flight; its later failure must not leave a record nobody clears.
+        self.manager.on_new_request(_ctx("r1"))
+        self.manager.prepare_load([_key(0)], _ctx("r1"))
+        self.manager.submit_load_job(3, [_key(0)], [10], "r1")
+        self.manager.on_request_finished(_ctx("r1"))
+        self.store.complete_load(sub_hashes(_key(0)), success=False)
+        (finished_job,) = self.manager.poll_finished_jobs()
+        self.assertFalse(finished_job.success)
+        self.assertEqual(self.manager._unloadable, {})
+
 
 class TestTouchAndMisc(unittest.TestCase):
     def setUp(self):
@@ -1020,7 +1244,26 @@ class TestSchedulerFenceFlow(unittest.TestCase):
         store.complete_load(sub_hashes(_key(0)))
         meta2 = self._build_meta(sched, self._stock_meta())
         self.assertEqual(meta2.finished_load_jobs, {3: "r1"})
-        self.assertEqual(meta2.failed_load_device_block_ids, [])
+        self.assertEqual(meta2.failed_load_req_ids, set())
+
+    def test_failed_load_is_reported_by_request(self):
+        # Block ids are only unique within a KV cache group, so a failed load
+        # must reach the scheduler as its request id; the request still
+        # finishes so it leaves WAITING_FOR_REMOTE_KVS, then recomputes or
+        # fails per kv_load_failure_policy.
+        store = FakeKVCacheStore()
+        manager = make_manager(store)
+        seed_host_entries(store, _key(0))
+        manager.prepare_load([_key(0)], _ctx("r1"))
+        sched = self._make_scheduler(manager)
+        self._build_meta(
+            sched, self._stock_meta(load_jobs={3: self._load_job([_key(0)], [10])})
+        )
+
+        store.complete_load(sub_hashes(_key(0)), success=False)
+        meta = self._build_meta(sched, self._stock_meta())
+        self.assertEqual(meta.finished_load_jobs, {3: "r1"})
+        self.assertEqual(meta.failed_load_req_ids, {"r1"})
 
     def test_flush_cancels_fence_pending_store(self):
         store = FakeKVCacheStore()
@@ -1091,6 +1334,11 @@ class _FakeFinishedRequest:
     def is_finished(self):
         return True
 
+    def __getattr__(self, name):
+        if name.startswith("__") and name.endswith("__"):
+            raise AttributeError(name)
+        return None
+
 
 class TestFinishedRequestStoreBuild(unittest.TestCase):
     """_build_store_jobs on aborted/finished requests, against the real
@@ -1115,7 +1363,13 @@ class TestFinishedRequestStoreBuild(unittest.TestCase):
 
         from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingScheduler
 
-        sched = object.__new__(TPURaidenOffloadingScheduler)
+        class _TestTPURaidenOffloadingScheduler(TPURaidenOffloadingScheduler):
+            def __getattr__(self, name):
+                if name.startswith("__") and name.endswith("__"):
+                    raise AttributeError(name)
+                return None
+
+        sched = object.__new__(_TestTPURaidenOffloadingScheduler)
         sched.config = SchedulerOffloadConfig(
             kv_group_configs=(
                 GroupOffloadConfig(
@@ -1125,6 +1379,8 @@ class TestFinishedRequestStoreBuild(unittest.TestCase):
                     hashes_per_chunk=1,
                     kv_event_group_spec=MagicMock(),
                     sliding_window_size_in_chunks=None,
+                    kv_cache_spec=MagicMock(),
+                    manager_cls=MagicMock(),
                 ),
             ),
             blocks_per_chunk=1,
@@ -1174,7 +1430,11 @@ class TestFinishedRequestStoreBuild(unittest.TestCase):
         )
 
     def _sched_output(self, req_id):
-        return SimpleNamespace(num_scheduled_tokens={}, finished_req_ids={req_id})
+        from vllm.v1.core.sched.output import SchedulerOutput
+
+        output = SchedulerOutput.make_empty()
+        output.finished_req_ids = {req_id}
+        return output
 
     def _aborted_setup(self, num_tokens=32, num_computed_tokens=12, num_blocks=3):
         from vllm.v1.request import RequestStatus
@@ -1244,7 +1504,6 @@ class TestWorkerSideConnector(unittest.TestCase):
         conn.connector_worker = MagicMock()
         conn._fenced_jobs = {}
         conn._completed_jobs = {}
-        conn._load_error_block_ids = set()
         conn._pool_sync_tensors = []
         conn._pending_fences = []
         return conn
@@ -1353,14 +1612,39 @@ class TestWorkerSideConnector(unittest.TestCase):
         conn._connector_metadata = self._meta(
             finished_store_job_ids=[1, 2],
             finished_load_jobs={3: "req-a"},
-            failed_load_device_block_ids=[10, 11],
         )
         sending, recving = conn.get_finished(set())
         self.assertEqual(sending, set())
         self.assertEqual(recving, {"req-a"})
         self.assertEqual(conn._completed_jobs, {1: 1, 2: 1, 3: 1})
-        self.assertEqual(conn.get_block_ids_with_load_errors(), {10, 11})
+
+    def test_failed_load_reported_as_failed_recving(self):
+        # vLLM rejects block-level load failures on multi-group KV layouts
+        # (DeepSeek-V4, hybrid Mamba), so failures travel by request id.
+        conn = self._make_worker_connector()
+        conn._connector_metadata = self._meta(
+            finished_load_jobs={3: "req-a", 4: "req-b"},
+            failed_load_req_ids={"req-b"},
+        )
+        results = conn.get_transfer_results(set())
+        self.assertEqual(results.finished_sending, set())
+        # The failed request still finishes, which releases it from
+        # WAITING_FOR_REMOTE_KVS.
+        self.assertEqual(results.finished_recving, {"req-a", "req-b"})
+        self.assertEqual(results.failed_recving, {"req-b"})
+        self.assertEqual(conn._completed_jobs, {3: 1, 4: 1})
         self.assertEqual(conn.get_block_ids_with_load_errors(), set())
+
+    def test_get_finished_refuses_to_report_a_failed_load(self):
+        # get_finished() has no failure channel: returning req-b as finished
+        # would pass its failed load as a good one.
+        conn = self._make_worker_connector()
+        conn._connector_metadata = self._meta(
+            finished_load_jobs={3: "req-a", 4: "req-b"},
+            failed_load_req_ids={"req-b"},
+        )
+        with self.assertRaisesRegex(RuntimeError, "get_transfer_results"):
+            conn.get_finished(set())
 
     def test_build_connector_worker_meta_drains_state(self):
         conn = self._make_worker_connector()
@@ -1715,6 +1999,99 @@ class TestRemoteReadFlow(unittest.TestCase):
         (finished_job,) = self.manager.poll_finished_jobs()
         self.assertTrue(finished_job.success)
 
+    def test_remote_reads_group_interleaved_sub_hashes_by_peer(self):
+        local_key, remote_key = _key(1), _key(2)
+        seed_host_entries(self.store, local_key)
+        seed_global_entries(self.store, remote_key)
+        remote_hashes = sub_hashes(remote_key)
+        # Each slice carries its own id object; equal ids name the same peer.
+        for i, sub_hash in enumerate(remote_hashes):
+            self.store.global_entries[sub_hash].raiden_id = FakeRaidenId(
+                data_replica_idx=i % 2
+            )
+        for key in (local_key, remote_key):
+            self.assertEqual(self.manager.lookup(key, _ctx()), LookupResult.HIT)
+        self.manager.prepare_load([local_key, remote_key], _ctx())
+        self.manager.submit_load_job(7, [local_key, remote_key], [5, 6], "req")
+
+        first, second = self.store.calls_named("read_remote")
+        self.assertEqual(first.args[0], remote_hashes[::2])
+        self.assertEqual(first.args[2], [24, 26])
+        self.assertEqual(second.args[0], remote_hashes[1::2])
+        self.assertEqual(second.args[2], [25, 27])
+        self.assertEqual(
+            self.manager.lookup(remote_key, _ctx()), LookupResult.HIT_PENDING
+        )
+
+        self.store.complete_remote_read(second.args[0])
+        self.store.complete_load(sub_hashes(local_key))
+        self.assertEqual(self.manager.poll_finished_jobs(), [])
+        self.store.complete_remote_read(first.args[0])
+        (finished_job,) = self.manager.poll_finished_jobs()
+        self.assertTrue(finished_job.success)
+        self.assertEqual(self.store.pinned_hashes(), {})
+        self.assertEqual(self.manager._hash_to_admission, {})
+        self.assertFalse(self.manager.has_pending_work())
+
+    def test_later_peer_launch_failure_waits_for_started_transfers(self):
+        keys = [_key(i) for i in range(1, 5)]
+        seed_host_entries(self.store, keys[0])
+        peers = [FakeRaidenId(job_replica_id=str(i)) for i in range(3)]
+        for key, peer in zip(keys[1:], peers):
+            seed_global_entries(self.store, key, raiden_id=peer)
+        for key in keys:
+            self.assertEqual(self.manager.lookup(key, _ctx()), LookupResult.HIT)
+        self.manager.prepare_load(keys, _ctx())
+        self.store.fail_read_remote_peers.add(peers[1])
+        self.manager.submit_load_job(7, keys, [5, 6, 7, 8], "req")
+
+        # The first peer's read launched; the second peer's was refused, so
+        # the third peer's was never tried.
+        self.assertEqual(len(self.store.calls_named("read_remote")), 2)
+        self.assertEqual(self.store._remote_reading, sub_hashes(keys[1]))
+        self.assertEqual(
+            self.manager._admissions[7].pending,
+            set(sub_hashes(keys[0]) + sub_hashes(keys[1])),
+        )
+        self.assertEqual(
+            set(self.manager._admissions[7].failed_sub_hashes),
+            set(sub_hashes(keys[2]) + sub_hashes(keys[3])),
+        )
+        # The open job holds the keys it never read too.
+        for key in keys[1:]:
+            self.assertEqual(self.manager.lookup(key, _ctx()), LookupResult.HIT_PENDING)
+        self.assertEqual(self.manager.poll_finished_jobs(), [])
+        self.store.complete_load(sub_hashes(keys[0]))
+        self.assertEqual(self.manager.poll_finished_jobs(), [])
+        self.store.complete_remote_read(sub_hashes(keys[1]))
+        (finished_job,) = self.manager.poll_finished_jobs()
+        self.assertFalse(finished_job.success)
+        self.assertEqual(finished_job.failed_device_block_ids, [5, 6, 7, 8])
+        self.assertEqual(self.store.pinned_hashes(), {})
+        self.assertEqual(self.manager._hash_to_admission, {})
+        self.assertFalse(self.manager.has_pending_work())
+        self.assertEqual(self.manager.poll_finished_jobs(), [])
+
+    def test_remote_failure_waits_for_other_peer(self):
+        keys = [_key(1), _key(2)]
+        for i, key in enumerate(keys):
+            seed_global_entries(
+                self.store, key, raiden_id=FakeRaidenId(job_replica_id=str(i))
+            )
+            self.assertEqual(self.manager.lookup(key, _ctx()), LookupResult.HIT)
+        self.manager.prepare_load(keys, _ctx())
+        self.manager.submit_load_job(7, keys, [5, 6], "req")
+
+        self.store.complete_remote_read(sub_hashes(keys[0]), success=False)
+        self.assertEqual(self.manager.poll_finished_jobs(), [])
+        self.assertTrue(self.manager.has_pending_work())
+        self.store.complete_remote_read(sub_hashes(keys[1]))
+        (finished_job,) = self.manager.poll_finished_jobs()
+        self.assertFalse(finished_job.success)
+        self.assertEqual(finished_job.failed_device_block_ids, [5, 6])
+        self.assertEqual(self.manager._hash_to_admission, {})
+        self.assertFalse(self.manager.has_pending_work())
+
     def test_remote_failure_leaves_nothing_behind(self):
         key = _key(1)
         seed_global_entries(self.store, key)
@@ -1794,6 +2171,95 @@ class TestRemoteReadFlow(unittest.TestCase):
             self.assertNotIn(h, self.store.entries)
             self.assertIn(h, self.store.global_entries)
 
+    def test_request_is_not_offered_a_peer_read_whose_launch_failed_again(self):
+        # The registry still names the peer after a failed launch.
+        key = _key(1)
+        seed_global_entries(self.store, key)
+        self.manager.on_new_request(_ctx("r1"))
+        self.assertEqual(self.manager.lookup(key, _ctx("r1")), LookupResult.HIT)
+        self.manager.prepare_load([key], _ctx("r1"))
+        self.store.fail_read_remote = True
+        self.manager.submit_load_job(7, [key], [5], "r1")
+        (finished_job,) = self.manager.poll_finished_jobs()
+        self.assertFalse(finished_job.success)
+        self.assertEqual(self.manager.lookup(key, _ctx("r1")), LookupResult.MISS)
+        self.assertEqual(self.manager.lookup(key, _ctx("r2")), LookupResult.HIT)
+
+    def test_mixed_job_marks_only_the_peer_keys_whose_read_failed(self):
+        # The local key precedes the failed peer key in the same KV cache
+        # group, so it stays loadable.
+        local_key, remote_key = (_group_key(n, group_idx=0) for n in (1, 2))
+        seed_host_entries(self.store, local_key)
+        seed_global_entries(self.store, remote_key)
+        self.manager.on_new_request(_ctx("r1"))
+        self.manager.lookup(local_key, _ctx("r1"))
+        self.manager.lookup(remote_key, _ctx("r1"))
+        self.manager.prepare_load([local_key, remote_key], _ctx("r1"))
+        self.manager.submit_load_job(7, [local_key, remote_key], [5, 6], "r1")
+        self.store.complete_load(sub_hashes(local_key))
+        self.store.complete_remote_read(sub_hashes(remote_key), success=False)
+        (finished_job,) = self.manager.poll_finished_jobs()
+        self.assertFalse(finished_job.success)
+        self.assertEqual(self.manager.lookup(local_key, _ctx("r1")), LookupResult.HIT)
+        self.assertEqual(self.manager.lookup(remote_key, _ctx("r1")), LookupResult.MISS)
+
+    def _store_during_peer_read(self, read_first):
+        # Request B reads `key` from a peer. Request A then stores the same
+        # key: a peer read leaves no local entry, so A's prepare_store offers
+        # it. Whatever order the two transfers land in, B's load must finish.
+        key, other = _key(1), _key(2)
+        seed_global_entries(self.store, key)
+        self.assertEqual(self.manager.lookup(key, _ctx("B")), LookupResult.HIT)
+        self.manager.prepare_load([key], _ctx("B"))
+        self.manager.submit_load_job(7, [key], [5], "B")
+        out = self.manager.prepare_store([key, other], _ctx("A"))
+        self.assertEqual(out.keys_to_store, [key, other])
+        self.manager.submit_store_job(8, [key, other], [6, 9])
+        # Only the key no load holds is admitted and saved.
+        (save,) = self.store.calls_named("save")
+        self.assertEqual(save.args[0], sub_hashes(other))
+        for h in sub_hashes(key):
+            self.assertNotIn(h, self.store.entries)
+
+        landings = [
+            lambda: self.store.complete_remote_read(sub_hashes(key)),
+            lambda: self.store.complete_save(sub_hashes(other)),
+        ]
+        finished = {}
+        for land in landings if read_first else landings[::-1]:
+            land()
+            for job in self.manager.poll_finished_jobs():
+                finished[job.job_id] = job
+        self.assertEqual(sorted(finished), [7, 8])
+        self.assertTrue(finished[7].success)
+        self.assertEqual(finished[7].req_id, "B")
+        self.assertTrue(finished[8].success)
+        self.assertFalse(self.manager.has_pending_work())
+        self.assertEqual(self.manager._inflight_store_keys, set())
+        self.assertEqual(self.manager._hash_to_admission, {})
+
+    def test_store_of_key_under_peer_read_read_lands_first(self):
+        self._store_during_peer_read(read_first=True)
+
+    def test_store_of_key_under_peer_read_save_lands_first(self):
+        self._store_during_peer_read(read_first=False)
+
+    def test_store_of_only_keys_under_peer_read_finishes_without_save(self):
+        key = _key(1)
+        seed_global_entries(self.store, key)
+        self.manager.lookup(key, _ctx("B"))
+        self.manager.prepare_load([key], _ctx("B"))
+        self.manager.submit_load_job(7, [key], [5], "B")
+        self.manager.prepare_store([key], _ctx("A"))
+        self.manager.submit_store_job(8, [key], [6])
+        self.assertEqual(self.store.calls_named("insert"), [])
+        self.assertEqual(self.store.calls_named("save"), [])
+        (store_job,) = self.manager.poll_finished_jobs()
+        self.assertEqual((store_job.job_id, store_job.success), (8, True))
+        self.store.complete_remote_read(sub_hashes(key))
+        (load_job,) = self.manager.poll_finished_jobs()
+        self.assertEqual((load_job.job_id, load_job.success), (7, True))
+
     def test_stale_stash_degenerates_to_local_load(self):
         # Keys promoted to local before prepare_load are routed to load() instead of
         # read_remote().
@@ -1837,6 +2303,429 @@ class TestRemoteLanding(unittest.TestCase):
         self.assertEqual(set(self.store.entries), set(resident_before))
         self.assertEqual(self.store.pinned_hashes(), {})
         self.assertEqual(list(self.manager.take_events()), [])
+
+
+class TestStorageTierLookups(unittest.TestCase):
+    """A store with a storage tier answers past the first host-pool miss from
+    storage. Those SHARED_STORAGE hits hold no pin: they are read back with
+    read_remote like a peer's block, and never pass for host-pool hits."""
+
+    def setUp(self):
+        self.store = FakeKVCacheStore()
+        # No global registry: the storage tier answers regardless.
+        self.manager = make_manager(self.store)
+
+    def test_storage_only_key_is_hit_and_read_from_storage(self):
+        key = _key(0)
+        batch = sub_hashes(key)
+        seed_storage_entries(self.store, key)
+        self.assertEqual(self.manager.lookup(key, _ctx()), LookupResult.HIT)
+        spec = self.manager.prepare_load([key], _ctx())
+        self.assertTrue(spec.pinned)
+        self.assertEqual(self.store.pinned_hashes(), {})
+
+        self.manager.submit_load_job(7, [key], [5], "req")
+        self.assertEqual(self.store.calls_named("load"), [])
+        (rr,) = self.store.calls_named("read_remote")
+        self.assertEqual(rr.args[0], batch)
+        self.assertEqual(
+            [sl.status for sl in rr.args[1]], [FakeBlockStatus.SHARED_STORAGE] * 4
+        )
+        self.assertEqual(rr.args[2], [20, 21, 22, 23])
+        self.store.complete_remote_read(batch)
+        (finished_job,) = self.manager.poll_finished_jobs()
+        self.assertTrue(finished_job.success)
+        # A storage read held no pin, so nothing is released or left pinned.
+        self.assertEqual(self.store.calls_named("release"), [])
+        self.assertEqual(self.store.pinned_hashes(), {})
+
+        # Raiden published the recalled blocks into host DRAM: the next load
+        # of the key is a local one.
+        self.store.calls.clear()
+        self.assertEqual(self.manager.lookup(key, _ctx()), LookupResult.HIT)
+        self.manager.prepare_load([key], _ctx())
+        self.manager.submit_load_job(8, [key], [6], "req2")
+        (ld,) = self.store.calls_named("load")
+        self.assertEqual(ld.args, (batch, [24, 25, 26, 27]))
+        self.assertEqual(self.store.calls_named("read_remote"), [])
+
+    def test_host_prefix_with_storage_remainder_is_one_job(self):
+        key = _key(0)
+        batch = sub_hashes(key)
+        for h in batch[:2]:
+            self.store.entries[h] = _Entry(status=FakeBlockStatus.HOST)
+        seed_storage_entries(self.store, key)
+        # Every sub-hash is answered, two by the host pool, two by storage.
+        self.assertEqual(self.manager.lookup(key, _ctx()), LookupResult.HIT)
+        spec = self.manager.prepare_load([key], _ctx())
+        self.assertTrue(spec.pinned)
+        self.assertEqual(self.store.pinned_hashes(), {h: 1 for h in batch[:2]})
+
+        self.manager.submit_load_job(7, [key], [5], "req")
+        (ld,) = self.store.calls_named("load")
+        self.assertEqual(ld.args, (batch[:2], [20, 21]))
+        (rr,) = self.store.calls_named("read_remote")
+        self.assertEqual(rr.args[0], batch[2:])
+        self.assertEqual(rr.args[2], [22, 23])
+        self.store.complete_load(batch[:2])
+        self.assertEqual(self.manager.poll_finished_jobs(), [])
+        self.store.complete_remote_read(batch[2:])
+        (finished_job,) = self.manager.poll_finished_jobs()
+        self.assertTrue(finished_job.success)
+        self.assertEqual(self.store.pinned_hashes(), {})
+
+    def test_lookup_is_pending_while_storage_read_in_flight(self):
+        key = _key(0)
+        seed_storage_entries(self.store, key)
+        self.manager.lookup(key, _ctx())
+        self.manager.prepare_load([key], _ctx())
+        self.manager.submit_load_job(7, [key], [5], "req")
+        # A second request must not launch a racing read of the same hashes.
+        self.assertEqual(self.manager.lookup(key, _ctx()), LookupResult.HIT_PENDING)
+        self.store.complete_remote_read(sub_hashes(key))
+        self.manager.poll_finished_jobs()
+        self.assertEqual(self.manager.lookup(key, _ctx()), LookupResult.HIT)
+
+    def test_store_of_key_under_storage_read_is_left_to_the_read(self):
+        # prepare_store re-offers a storage-only key on purpose, so a store can
+        # reach a key whose storage read is still in flight. The read keeps its
+        # completions, and on landing publishes the key into the host pool.
+        key, other = _key(0), _key(1)
+        seed_storage_entries(self.store, key)
+        self.assertEqual(self.manager.lookup(key, _ctx("B")), LookupResult.HIT)
+        self.manager.prepare_load([key], _ctx("B"))
+        self.manager.submit_load_job(7, [key], [5], "B")
+        out = self.manager.prepare_store([key, other], _ctx("A"))
+        self.assertEqual(out.keys_to_store, [key, other])
+        self.manager.submit_store_job(8, [key, other], [6, 9])
+        (save,) = self.store.calls_named("save")
+        self.assertEqual(save.args[0], sub_hashes(other))
+
+        self.store.complete_remote_read(sub_hashes(key))
+        self.store.complete_save(sub_hashes(other))
+        finished = {job.job_id: job for job in self.manager.poll_finished_jobs()}
+        self.assertEqual(sorted(finished), [7, 8])
+        self.assertTrue(finished[7].success)
+        self.assertEqual(finished[7].req_id, "B")
+        self.assertTrue(finished[8].success)
+        self.assertFalse(self.manager.has_pending_work())
+        self.assertEqual(self.manager._hash_to_admission, {})
+        for h in sub_hashes(key):
+            self.assertEqual(self.store.entries[h].status, FakeBlockStatus.HOST_AND_HBM)
+
+    def test_storage_read_failure_fails_job_holding_nothing(self):
+        key = _key(0)
+        seed_storage_entries(self.store, key)
+        self.manager.lookup(key, _ctx())
+        self.manager.prepare_load([key], _ctx())
+        self.manager.submit_load_job(7, [key], [5], "req")
+        self.store.complete_remote_read(sub_hashes(key), success=False)
+        (finished_job,) = self.manager.poll_finished_jobs()
+        self.assertFalse(finished_job.success)
+        self.assertEqual(finished_job.failed_device_block_ids, [5])
+        self.assertEqual(self.store.calls_named("release"), [])
+        self.assertEqual(self.store.entries, {})
+        self.assertFalse(self.manager.has_pending_work())
+
+    def test_storage_read_launch_failure_waits_for_local_load(self):
+        # The local load launched; the storage read did not. The job stays
+        # open until the local load resolves, then fails once, owing nothing.
+        self.store.fail_storage_read = True
+        key = _key(0)
+        batch = sub_hashes(key)
+        for h in batch[:2]:
+            self.store.entries[h] = _Entry(status=FakeBlockStatus.HOST)
+        seed_storage_entries(self.store, key)
+        self.manager.lookup(key, _ctx())
+        self.manager.prepare_load([key], _ctx())
+        self.manager.submit_load_job(7, [key], [5], "req")
+        self.assertEqual(len(self.store.calls_named("load")), 1)
+        self.assertEqual(self.manager.poll_finished_jobs(), [])
+        self.assertTrue(self.manager.is_job_launched(7))
+        self.store.complete_load(batch[:2])
+        (finished_job,) = self.manager.poll_finished_jobs()
+        self.assertFalse(finished_job.success)
+        self.assertEqual(finished_job.failed_device_block_ids, [5])
+        self.assertEqual(self.store.pinned_hashes(), {})
+
+    def test_storage_only_key_is_still_offered_for_store(self):
+        # A key still storage-only at store time was recomputed (its read
+        # failed, or its recall found no host room); storing it again puts it
+        # back in host DRAM and rewrites its files.
+        key = _key(0)
+        seed_storage_entries(self.store, key)
+        out = self.manager.prepare_store([key], _ctx())
+        self.assertEqual(out.keys_to_store, [key])
+        self.manager.submit_store_job(7, [key], [5])
+        (save,) = self.store.calls_named("save")
+        self.assertEqual(save.args[0], sub_hashes(key))
+        self.store.complete_save(sub_hashes(key))
+        (finished_job,) = self.manager.poll_finished_jobs()
+        self.assertTrue(finished_job.success)
+        self.assertEqual(self.store.pinned_hashes(), {})
+
+    def test_host_prefix_with_storage_remainder_stores_the_remainder(self):
+        key = _key(0)
+        batch = sub_hashes(key)
+        for h in batch[:2]:
+            self.store.entries[h] = _Entry(status=FakeBlockStatus.HOST)
+        seed_storage_entries(self.store, key)
+        out = self.manager.prepare_store([key], _ctx())
+        self.assertEqual(out.keys_to_store, [key])
+        self.manager.submit_store_job(7, [key], [5])
+        (save,) = self.store.calls_named("save")
+        self.assertEqual(save.args[0], batch[2:])
+
+    def test_touch_does_not_release_storage_hits(self):
+        # h0 has left the host pool; h1 is still there, pinned by an
+        # in-flight job; storage has all four. The store answers h0..h3 from
+        # storage without asking the host pool about h1, so releasing what
+        # the lookup returned would take the job's pin on h1.
+        key = _key(0)
+        batch = sub_hashes(key)
+        self.store.entries[batch[1]] = _Entry(status=FakeBlockStatus.HOST, pin_count=1)
+        seed_storage_entries(self.store, key)
+        self.manager.touch([key], _ctx())
+        self.assertEqual(self.store.calls_named("release"), [])
+        self.assertEqual(self.store.pinned_hashes(), {batch[1]: 1})
+
+    def test_touch_releases_only_host_pool_hits(self):
+        key = _key(0)
+        batch = sub_hashes(key)
+        self.store.entries[batch[0]] = _Entry(status=FakeBlockStatus.HOST)
+        self.store.entries[batch[2]] = _Entry(status=FakeBlockStatus.HOST, pin_count=1)
+        seed_storage_entries(self.store, key)
+        self.manager.touch([key], _ctx())
+        (release,) = self.store.calls_named("release")
+        self.assertEqual(release.args[0], batch[:1])
+        self.assertEqual(self.store.pinned_hashes(), {batch[2]: 1})
+
+    def test_prepare_load_reads_evicted_tail_from_storage(self):
+        # lookup() found the key whole in the host pool; by prepare_load its
+        # tail has been evicted and survives only in storage. The stash has
+        # nothing for it, but prepare_load's own lookup found it in storage,
+        # so the tail is read from there instead of failing the job.
+        key = _key(0)
+        batch = sub_hashes(key)
+        seed_host_entries(self.store, key)
+        self.assertEqual(self.manager.lookup(key, _ctx()), LookupResult.HIT)
+        for h in batch[2:]:
+            del self.store.entries[h]
+        seed_storage_entries(self.store, key)
+        spec = self.manager.prepare_load([key], _ctx())
+        self.assertTrue(spec.pinned)
+        self.assertEqual(self.store.pinned_hashes(), {h: 1 for h in batch[:2]})
+        self.manager.submit_load_job(3, [key], [10], "req")
+        (ld,) = self.store.calls_named("load")
+        self.assertEqual(ld.args, (batch[:2], [40, 41]))
+        (rr,) = self.store.calls_named("read_remote")
+        self.assertEqual(rr.args[0], batch[2:])
+        self.assertEqual(rr.args[2], [42, 43])
+        self.store.complete_load(batch[:2])
+        self.store.complete_remote_read(batch[2:])
+        (finished_job,) = self.manager.poll_finished_jobs()
+        self.assertTrue(finished_job.success)
+        self.assertEqual(self.store.pinned_hashes(), {})
+
+    def test_prepare_load_gap_in_every_tier_fails_cleanly(self):
+        # The tail left the host pool and storage has only part of it: the
+        # sub-hash neither tier holds fails the job before any transfer,
+        # holding nothing.
+        key = _key(0)
+        batch = sub_hashes(key)
+        seed_host_entries(self.store, key)
+        self.assertEqual(self.manager.lookup(key, _ctx()), LookupResult.HIT)
+        for h in batch[2:]:
+            del self.store.entries[h]
+        self.store.storage_entries.add(batch[2])
+        spec = self.manager.prepare_load([key], _ctx())
+        self.assertFalse(spec.pinned)
+        self.assertEqual(self.store.pinned_hashes(), {})
+        self.manager.submit_load_job(3, [key], [10], "req", pinned=spec.pinned)
+        self.assertEqual(self.store.calls_named("load"), [])
+        self.assertEqual(self.store.calls_named("read_remote"), [])
+        (finished_job,) = self.manager.poll_finished_jobs()
+        self.assertFalse(finished_job.success)
+        self.assertEqual(finished_job.failed_device_block_ids, [10])
+
+    def test_failed_save_is_terminal(self):
+        # With a storage tier raiden drops a failed save's pin, so it refuses
+        # the retry's save() and the job fails at once, owing nothing back.
+        self.store.failed_save_drops_pin = True
+        key = _key(0)
+        batch = sub_hashes(key)
+        out = self.manager.prepare_store([key], _ctx())
+        self.manager.submit_store_job(7, out.keys_to_store, [5])
+        self.store.complete_save(batch, success=False)
+        (finished_job,) = self.manager.poll_finished_jobs()
+        self.assertFalse(finished_job.success)
+        retry = self.store.calls_named("save")[-1]
+        self.assertEqual(retry.args[0], batch)
+        self.assertEqual(len(self.store.calls_named("save")), 2)
+        self.assertEqual(self.store.pinned_hashes(), {})
+        self.assertFalse(self.manager.has_pending_work())
+        self.assertEqual(self.manager.prepare_store([key], _ctx()).keys_to_store, [key])
+
+
+class TestStorageTierRemoteReads(unittest.TestCase):
+    """prepare_load when the storage tier also holds blocks the registry
+    names on a peer."""
+
+    def setUp(self):
+        self.store = FakeKVCacheStore()
+        self.manager = make_global_manager(self.store)
+
+    def test_stored_remote_key_is_read_from_peer(self):
+        key = _key(1)
+        seed_global_entries(self.store, key)
+        seed_storage_entries(self.store, key)
+        self.assertEqual(self.manager.lookup(key, _ctx()), LookupResult.HIT)
+        self.store.calls.clear()
+
+        spec = self.manager.prepare_load([key], _ctx())
+        self.assertTrue(spec.pinned)
+        # One lookup: the storage run is taken from the stash in one pass,
+        # not re-checked against storage once per sub-hash.
+        self.assertEqual(len(self.store.calls_named("lookup")), 1)
+        self.assertEqual(self.store.pinned_hashes(), {})
+
+        self.manager.submit_load_job(7, [key], [5], "req")
+        self.assertEqual(self.store.calls_named("load"), [])
+        (rr,) = self.store.calls_named("read_remote")
+        self.assertEqual(rr.args[0], sub_hashes(key))
+        self.assertEqual(rr.args[2], [20, 21, 22, 23])
+        self.store.complete_remote_read(sub_hashes(key))
+        (finished_job,) = self.manager.poll_finished_jobs()
+        self.assertTrue(finished_job.success)
+        self.assertEqual(self.store.pinned_hashes(), {})
+
+    def test_mixed_local_and_stored_remote_job(self):
+        local_key, remote_key = _key(1), _key(2)
+        seed_host_entries(self.store, local_key)
+        seed_global_entries(self.store, remote_key)
+        seed_storage_entries(self.store, remote_key)
+        self.assertEqual(self.manager.lookup(local_key, _ctx()), LookupResult.HIT)
+        self.assertEqual(self.manager.lookup(remote_key, _ctx()), LookupResult.HIT)
+        spec = self.manager.prepare_load([local_key, remote_key], _ctx())
+        self.assertTrue(spec.pinned)
+        # Only the host-pool hits are pinned.
+        self.assertEqual(
+            self.store.pinned_hashes(), {h: 1 for h in sub_hashes(local_key)}
+        )
+
+        self.manager.submit_load_job(7, [local_key, remote_key], [5, 6], "req")
+        (ld,) = self.store.calls_named("load")
+        self.assertEqual(ld.args, (sub_hashes(local_key), [20, 21, 22, 23]))
+        (rr,) = self.store.calls_named("read_remote")
+        self.assertEqual(rr.args[0], sub_hashes(remote_key))
+        self.assertEqual(rr.args[2], [24, 25, 26, 27])
+        self.store.complete_load(sub_hashes(local_key))
+        self.store.complete_remote_read(sub_hashes(remote_key))
+        (finished_job,) = self.manager.poll_finished_jobs()
+        self.assertTrue(finished_job.success)
+        self.assertEqual(self.store.pinned_hashes(), {})
+
+    def test_storage_run_resumes_at_first_unstashed_sub_hash(self):
+        # h0 is a peer's; h1..h3 are resident here; storage has all four.
+        # Past the host-pool miss on h0 the store answers h0..h3 from
+        # storage. The walk takes h0 from the stash, finds no stash entry for
+        # h1, and looks it up again, which finds h1..h3 in the host pool.
+        key = _key(1)
+        batch = sub_hashes(key)
+        seed_global_entries(self.store, key)
+        for h in batch[1:]:
+            self.store.entries[h] = _Entry(status=FakeBlockStatus.HOST)
+        seed_storage_entries(self.store, key)
+        self.assertEqual(self.manager.lookup(key, _ctx()), LookupResult.HIT)
+
+        spec = self.manager.prepare_load([key], _ctx())
+        self.assertTrue(spec.pinned)
+        self.assertEqual(self.store.pinned_hashes(), {h: 1 for h in batch[1:]})
+        self.manager.submit_load_job(7, [key], [5], "req")
+        (ld,) = self.store.calls_named("load")
+        self.assertEqual(ld.args, (batch[1:], [21, 22, 23]))
+        (rr,) = self.store.calls_named("read_remote")
+        self.assertEqual(rr.args[0], batch[:1])
+        self.assertEqual(rr.args[2], [20])
+
+    def test_peer_and_storage_reads_share_one_call(self):
+        # One job: a peer's key and a storage-only key. The store takes a
+        # peer's slices and storage slices in the same read_remote call.
+        peer_key, storage_key = _key(1), _key(2)
+        seed_global_entries(self.store, peer_key)
+        seed_storage_entries(self.store, storage_key)
+        self.assertEqual(self.manager.lookup(peer_key, _ctx()), LookupResult.HIT)
+        self.assertEqual(self.manager.lookup(storage_key, _ctx()), LookupResult.HIT)
+        spec = self.manager.prepare_load([peer_key, storage_key], _ctx())
+        self.assertTrue(spec.pinned)
+        self.assertEqual(self.store.pinned_hashes(), {})
+
+        self.manager.submit_load_job(7, [peer_key, storage_key], [5, 6], "req")
+        self.assertEqual(self.store.calls_named("load"), [])
+        (rr,) = self.store.calls_named("read_remote")
+        self.assertEqual(rr.args[0], sub_hashes(peer_key) + sub_hashes(storage_key))
+        self.assertEqual(
+            [sl.status for sl in rr.args[1]],
+            [FakeBlockStatus.REMOTE] * 4 + [FakeBlockStatus.SHARED_STORAGE] * 4,
+        )
+        self.assertEqual(rr.args[2], [20, 21, 22, 23, 24, 25, 26, 27])
+        self.store.complete_remote_read(sub_hashes(peer_key))
+        self.assertEqual(self.manager.poll_finished_jobs(), [])
+        self.store.complete_remote_read(sub_hashes(storage_key))
+        (finished_job,) = self.manager.poll_finished_jobs()
+        self.assertTrue(finished_job.success)
+        self.assertEqual(self.store.calls_named("release"), [])
+        self.assertEqual(self.store.pinned_hashes(), {})
+        # Only the storage blocks were published locally.
+        self.assertEqual(set(self.store.entries), set(sub_hashes(storage_key)))
+
+    def test_storage_failure_in_shared_call_fails_job_once(self):
+        peer_key, storage_key = _key(1), _key(2)
+        seed_global_entries(self.store, peer_key)
+        seed_storage_entries(self.store, storage_key)
+        self.manager.lookup(peer_key, _ctx())
+        self.manager.lookup(storage_key, _ctx())
+        self.manager.prepare_load([peer_key, storage_key], _ctx())
+        self.manager.submit_load_job(7, [peer_key, storage_key], [5, 6], "req")
+        self.store.complete_remote_read(sub_hashes(storage_key), success=False)
+        # The peer blocks are still in flight, so the job cannot end yet.
+        self.assertEqual(self.manager.poll_finished_jobs(), [])
+        self.store.complete_remote_read(sub_hashes(peer_key))
+        (finished_job,) = self.manager.poll_finished_jobs()
+        self.assertFalse(finished_job.success)
+        self.assertEqual(finished_job.failed_device_block_ids, [5, 6])
+        self.assertEqual(self.store.calls_named("release"), [])
+        self.assertEqual(self.store.entries, {})
+
+    def test_two_peers_and_storage_in_one_job_read_per_peer(self):
+        # The store takes one peer per read_remote call, plus any storage
+        # slices: a job with blocks on two peers and in storage makes two
+        # calls, the storage slices going with the first peer's.
+        local_key, key_a, storage_key, key_b = (_key(n) for n in range(4))
+        seed_host_entries(self.store, local_key)
+        seed_global_entries(self.store, key_a)
+        seed_storage_entries(self.store, storage_key)
+        seed_global_entries(self.store, key_b)
+        keys = [local_key, key_a, storage_key, key_b]
+        for key in keys:
+            self.assertEqual(self.manager.lookup(key, _ctx()), LookupResult.HIT)
+        self.manager.prepare_load(keys, _ctx())
+        self.manager.submit_load_job(7, keys, [4, 5, 6, 7], "req")
+
+        first, second = self.store.calls_named("read_remote")
+        self.assertEqual(first.args[0], sub_hashes(key_a) + sub_hashes(storage_key))
+        self.assertEqual(first.args[2], list(range(20, 28)))
+        self.assertEqual(second.args[0], sub_hashes(key_b))
+        self.assertEqual(second.args[2], list(range(28, 32)))
+        self.store.complete_load(sub_hashes(local_key))
+        self.store.complete_remote_read(first.args[0])
+        self.assertEqual(self.manager.poll_finished_jobs(), [])
+        self.store.complete_remote_read(second.args[0])
+        (finished_job,) = self.manager.poll_finished_jobs()
+        self.assertTrue(finished_job.success)
+        self.assertEqual(self.store.pinned_hashes(), {})
+        self.assertEqual(self.manager._hash_to_admission, {})
+        self.assertFalse(self.manager.has_pending_work())
 
 
 class TestNamespace(unittest.TestCase):
@@ -1906,6 +2795,39 @@ class TestNamespace(unittest.TestCase):
         self.assertNotEqual(ns, pcp_ns)
         self.assertNotEqual(
             pcp_ns, derive_offload_namespace(cfg(), **kwargs, cp_geometry=(8, 1, 16))
+        )
+
+    def test_namespace_is_salted_only_when_a_group_is_not_offloaded(self):
+        from vllm_torchtpu.offload.raiden_store import derive_offload_namespace
+
+        c = MagicMock()
+        c.model_config.model = "m"
+        c.model_config.revision = "r"
+        c.model_config.quantization = None
+        c.cache_config.prefix_caching_hash_algo = "sha256"
+        kwargs = dict(
+            kernel_block_size=256,
+            per_block_shape=(256, 8, 2, 128),
+            kv_dtype="bfloat16",
+            device_block_size=1280,
+            world_size=4,
+            num_kv_cache_groups=5,
+            num_kv_cache_tensors=64,
+        )
+        ns = derive_offload_namespace(c, **kwargs)
+        # Offloading every group keeps existing namespaces unchanged.
+        every = derive_offload_namespace(
+            c, **kwargs, offloaded_group_ids=(0, 1, 2, 3, 4)
+        )
+        self.assertEqual(ns, every)
+        # Skipping a group (the DSv4 HCA state) moves to a new namespace.
+        skipped = derive_offload_namespace(
+            c, **kwargs, offloaded_group_ids=(0, 1, 2, 4)
+        )
+        self.assertNotEqual(ns, skipped)
+        self.assertNotEqual(
+            skipped,
+            derive_offload_namespace(c, **kwargs, offloaded_group_ids=(0, 1, 2, 3)),
         )
 
 
@@ -2018,6 +2940,1436 @@ class TestRaidenStoreWorkerStub(unittest.TestCase):
             worker.submit_load(1, MagicMock(), MagicMock())
         self.assertEqual(worker.get_finished(), [])
         self.assertIsNone(worker.wait({1, 2}))
+
+    def test_default_controller_port_outside_linux_ephemeral_range(self):
+        from vllm_torchtpu.offload.raiden_store import (
+            _DEFAULT_CONTROLLER_PORT,
+            _DEFAULT_EPHEMERAL_PORT_RANGE,
+        )
+
+        ephemeral_low, _ = _DEFAULT_EPHEMERAL_PORT_RANGE
+        self.assertGreaterEqual(_DEFAULT_CONTROLLER_PORT, 1024)
+        self.assertLess(_DEFAULT_CONTROLLER_PORT, ephemeral_low)
+
+    def test_controller_reachable_rejects_tcp_loopback_self_connect(self):
+        from vllm_torchtpu.offload.raiden_store import RaidenStoreOffloadingWorker
+
+        worker = object.__new__(RaidenStoreOffloadingWorker)
+        worker._controller_address = "127.0.0.1:48800"
+
+        self_connected_sock = MagicMock()
+        self_connected_sock.__enter__.return_value = self_connected_sock
+        self_connected_sock.getsockname.return_value = ("127.0.0.1", 48800)
+        self_connected_sock.getpeername.return_value = ("127.0.0.1", 48800)
+
+        with patch(
+            "vllm_torchtpu.offload.raiden_store.socket.create_connection",
+            return_value=self_connected_sock,
+        ):
+            self.assertFalse(worker._controller_reachable())
+
+    def test_controller_reachable_accepts_listening_server(self):
+        import socket
+
+        from vllm_torchtpu.offload.raiden_store import RaidenStoreOffloadingWorker
+
+        worker = object.__new__(RaidenStoreOffloadingWorker)
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+            server.bind(("127.0.0.1", 0))
+            server.listen(1)
+            port = server.getsockname()[1]
+            for address in (f"127.0.0.1:{port}", f"[127.0.0.1]:{port}"):
+                worker._controller_address = address
+                self.assertTrue(worker._controller_reachable())
+
+        # Once the server closes, probing returns False.
+        self.assertFalse(worker._controller_reachable())
+
+    def test_register_loop_retries_past_self_connect_until_server_listens(self):
+        import threading
+
+        from vllm_torchtpu.offload.raiden_store import RaidenStoreOffloadingWorker
+
+        worker = object.__new__(RaidenStoreOffloadingWorker)
+        worker._device_tensors = []
+        worker._host_blocks_to_allocate = 4
+        worker._controller_address = "127.0.0.1:28800"
+        worker._rank = 0
+        worker._mgr = None
+        worker._backend_configs = []
+        worker._stop_registration = threading.Event()
+
+        self_connected_sock = MagicMock()
+        self_connected_sock.__enter__.return_value = self_connected_sock
+        self_connected_sock.getsockname.return_value = ("127.0.0.1", 28800)
+        self_connected_sock.getpeername.return_value = ("127.0.0.1", 28800)
+
+        server_connected_sock = MagicMock()
+        server_connected_sock.__enter__.return_value = server_connected_sock
+        server_connected_sock.getsockname.return_value = ("127.0.0.1", 50123)
+        server_connected_sock.getpeername.return_value = ("127.0.0.1", 28800)
+
+        kcm_calls: list[dict[str, object]] = []
+
+        def fake_kv_cache_manager(**kwargs: object) -> str:
+            kcm_calls.append(kwargs)
+            return "registered-manager"
+
+        with (
+            patch(
+                "vllm_torchtpu.offload.raiden_store.socket.create_connection",
+                side_effect=[self_connected_sock, server_connected_sock],
+            ) as create_conn,
+            patch.object(worker._stop_registration, "wait", return_value=False),
+            _fake_tpu_sync(
+                FAKE_STORAGE_IMPL, kv_cache_manager_cls=fake_kv_cache_manager
+            ),
+        ):
+            worker._register_loop()
+
+        self.assertEqual(create_conn.call_count, 2)
+        self.assertEqual(len(kcm_calls), 1)
+        self.assertEqual(worker._mgr, "registered-manager")
+
+    def test_get_ephemeral_port_range_parses_procfs_and_falls_back(self):
+        from vllm_torchtpu.offload.raiden_store import (
+            _DEFAULT_EPHEMERAL_PORT_RANGE,
+            _get_ephemeral_port_range,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            proc_file = os.path.join(tmpdir, "ip_local_port_range")
+            with open(proc_file, "w", encoding="utf-8") as fh:
+                fh.write("40000\t65000\n")
+            self.assertEqual(_get_ephemeral_port_range(proc_file), (40000, 65000))
+
+            with open(proc_file, "w", encoding="utf-8") as fh:
+                fh.write("65000\t40000\n")
+            self.assertEqual(
+                _get_ephemeral_port_range(proc_file), _DEFAULT_EPHEMERAL_PORT_RANGE
+            )
+
+            with open(proc_file, "w", encoding="utf-8") as fh:
+                fh.write("invalid\n")
+            self.assertEqual(
+                _get_ephemeral_port_range(proc_file), _DEFAULT_EPHEMERAL_PORT_RANGE
+            )
+
+            missing_file = os.path.join(tmpdir, "nonexistent")
+            self.assertEqual(
+                _get_ephemeral_port_range(missing_file), _DEFAULT_EPHEMERAL_PORT_RANGE
+            )
+
+    def test_spec_warns_when_controller_port_in_ephemeral_range(self):
+        from vllm_torchtpu.offload import raiden_store as rs
+
+        with (
+            patch.object(rs, "_get_ephemeral_port_range", return_value=(32768, 60999)),
+            patch.object(rs.logger, "warning") as warning,
+        ):
+            default_spec = _build_spec({})
+            self.assertEqual(default_spec.raiden_controller_port, 27800)
+            warning.assert_not_called()
+
+            ephemeral_spec = _build_spec({"raiden_controller_port": 48800})
+            self.assertEqual(ephemeral_spec.raiden_controller_port, 48800)
+            warning.assert_called_once()
+            rendered = warning.call_args.args[0] % warning.call_args.args[1:]
+            self.assertIn("48800", rendered)
+            self.assertIn("32768..60999", rendered)
+            self.assertIn("raiden_controller_port", rendered)
+
+            warning.reset_mock()
+            dp_offset_spec = _build_spec(
+                {"raiden_controller_port": 32766}, dp_rank_local=2
+            )
+            self.assertEqual(dp_offset_spec.raiden_controller_port, 32768)
+            warning.assert_called_once()
+            dp_rendered = warning.call_args.args[0] % warning.call_args.args[1:]
+            self.assertIn("base=32766 + dp_rank_local=2", dp_rendered)
+
+
+# -- storage tier: settings, backend configs, and plumbing ---------------------
+
+
+def _isolate_storage_env(test: unittest.TestCase) -> None:
+    """Run `test` with no storage-tier variables and a seeded hash."""
+    prefixes = ("RAIDEN_STORAGE_", "EXPERIMENTAL_RAIDEN_STORAGE_")
+    env = {k: v for k, v in os.environ.items() if not k.startswith(prefixes)}
+    env["PYTHONHASHSEED"] = "0"
+    patcher = patch.dict(os.environ, env, clear=True)
+    patcher.start()
+    test.addCleanup(patcher.stop)
+
+
+def _storage_config(**overrides):
+    from vllm_torchtpu.offload.raiden_store import RaidenStorageConfig
+
+    fields = {
+        "storage_type": "posix",
+        "root_dir": "/mnt/kv",
+        "model_name": "org/model",
+        "capacity_bytes": 1 << 30,
+    }
+    fields.update(overrides)
+    return RaidenStorageConfig(**fields)
+
+
+class _FakeParallelismConfig:
+    """Stand-in for raiden's ParallelismConfig binding, same defaults."""
+
+    def __init__(self):
+        self.tp_size = -1
+        self.tp_rank = -1
+        self.pcp_size = -1
+        self.pcp_rank = -1
+        self.pp_size = -1
+        self.pp_rank = -1
+
+
+class _FakeBackendConfig:
+    """Stand-in for raiden's BackendConfig binding; records its properties."""
+
+    def __init__(self):
+        self.type = ""
+        self.parallelism = _FakeParallelismConfig()
+        self.properties: dict[str, str] = {}
+
+    def set_property(self, key: str, value: str) -> None:
+        # The binding takes strings only.
+        assert isinstance(value, str), (key, value)
+        self.properties[key] = value
+
+
+FAKE_STORAGE_IMPL = SimpleNamespace(
+    BackendConfig=_FakeBackendConfig, ParallelismConfig=_FakeParallelismConfig
+)
+
+
+def _fake_tpu_sync(impl, kv_cache_manager_cls=None):
+    """Patch sys.modules so tpu_sync.api.torch.kv_cache_manager is a stub
+    whose _torch_impl() returns `impl`. The packages are real modules linked
+    by attribute, so `from tpu_sync.api.torch import kv_cache_manager` finds
+    the stub too."""
+    kcm = types.ModuleType("tpu_sync.api.torch.kv_cache_manager")
+    kcm._torch_impl = lambda: impl
+    if kv_cache_manager_cls is not None:
+        kcm.KVCacheManager = kv_cache_manager_cls
+    modules = {
+        name: types.ModuleType(name)
+        for name in ("tpu_sync", "tpu_sync.api", "tpu_sync.api.torch")
+    }
+    modules["tpu_sync"].api = modules["tpu_sync.api"]
+    modules["tpu_sync.api"].torch = modules["tpu_sync.api.torch"]
+    modules["tpu_sync.api.torch"].kv_cache_manager = kcm
+    modules[kcm.__name__] = kcm
+    return patch.dict(sys.modules, modules)
+
+
+def _worker_config(bytes_per_block, *, num_blocks=1):
+    """A per-worker KV cache config as the all-ranks recorder reads it."""
+    return SimpleNamespace(
+        num_blocks=num_blocks,
+        hisparse_host_num_blocks=None,
+        kv_cache_tensors=[SimpleNamespace(size=bytes_per_block * num_blocks)],
+    )
+
+
+def _build_spec(
+    extra_config,
+    *,
+    tp_size=4,
+    pp_size=1,
+    pcp_size=1,
+    dp_rank=None,
+    dp_rank_local=0,
+    dp_index=None,
+    groups=None,
+    kv_cache_groups=None,
+):
+    """A real TPURaidenStoreOffloadingSpec over stub configs, with kernel
+    geometry, the block-major contract, and the namespace patched out. Under
+    pipeline parallelism the spec needs the recorded all-ranks bytes, so
+    every worker is recorded at the stub's 4096 bytes per block."""
+    from vllm_torchtpu.offload import raiden_store as rs
+
+    if pp_size == 1:
+        rs._all_ranks_kv_bytes_per_block = None
+    elif rs.all_ranks_kv_bytes_per_block() is None:
+        rs.record_all_ranks_kv_bytes_per_block(
+            [_worker_config(4096)] * (tp_size * pp_size * pcp_size)
+        )
+    config = SimpleNamespace(
+        extra_config={"cpu_bytes_to_use": 1 << 20, **extra_config},
+        enable_kv_cache_events=False,
+        groups=groups or [SimpleNamespace(group_id=0, tokens_per_block=64)],
+        cache=SimpleNamespace(tokens_per_hash=64, blocks_per_chunk=1),
+        parallel=SimpleNamespace(
+            tp_size=tp_size,
+            pp_size=pp_size,
+            pcp_size=pcp_size,
+            dcp_size=1,
+            world_size=tp_size * pp_size * pcp_size,
+        ),
+        worker_kv_bytes_per_block=4096,
+        engine_id="engine",
+    )
+    vllm_config = MagicMock()
+    vllm_config.kv_events_config.enable_kv_cache_events = False
+    vllm_config.model_config.is_hybrid = False
+    vllm_config.model_config.model = "org/model"
+    vllm_config.parallel_config.data_parallel_rank = (
+        (0 if dp_rank_local is None else dp_rank_local) if dp_rank is None else dp_rank
+    )
+    vllm_config.parallel_config.data_parallel_rank_local = dp_rank_local
+    vllm_config.parallel_config.data_parallel_index = (
+        vllm_config.parallel_config.data_parallel_rank if dp_index is None else dp_index
+    )
+    kv_cache_config = SimpleNamespace(
+        kv_cache_groups=kv_cache_groups or [SimpleNamespace(kv_cache_spec=object())],
+        kv_cache_tensors=[object()],
+    )
+    with (
+        patch.object(
+            rs,
+            "resolve_kernel_geometry",
+            return_value=(16, (16, 2, 2, 8), "bfloat16", 64),
+        ),
+        patch.object(rs, "resolve_block_major_contract", return_value=None),
+        patch.object(rs, "derive_offload_namespace", return_value=b"\0" * 16),
+    ):
+        return rs.TPURaidenStoreOffloadingSpec(config, vllm_config, kv_cache_config)
+
+
+class TestOffloadedGroupSubset(unittest.TestCase):
+    """vLLM offloads only the prefix-cacheable groups, so the spec's group
+    configs can skip a KV cache group; each is checked against its own."""
+
+    def test_groups_are_matched_by_group_id(self):
+        import torch
+        from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+        def group(block_size):
+            spec = FullAttentionSpec(
+                block_size=block_size, num_kv_heads=1, head_size=8, dtype=torch.uint8
+            )
+            return SimpleNamespace(kv_cache_spec=spec)
+
+        spec = _build_spec(
+            {"cpu_bytes_to_use": 1 << 20},
+            groups=[
+                SimpleNamespace(group_id=0, tokens_per_block=64),
+                SimpleNamespace(group_id=2, tokens_per_block=16),
+            ],
+            kv_cache_groups=[group(64), group(32), group(16)],
+        )
+        self.assertIsNotNone(spec)
+
+
+class TestAllRanksKvBytesPerBlock(unittest.TestCase):
+    """Host capacity is sized from the bytes behind one block on every rank:
+    the recorded sum over the per-worker configs, or one worker's bytes times
+    the world size when nothing is recorded on a single stage."""
+
+    def setUp(self):
+        from vllm_torchtpu.offload import raiden_store as rs
+
+        patcher = patch.object(rs, "_all_ranks_kv_bytes_per_block", None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_records_the_sum_over_unequal_workers(self):
+        from vllm_torchtpu.offload import raiden_store as rs
+
+        total = rs.record_all_ranks_kv_bytes_per_block(
+            [_worker_config(1024), _worker_config(3072, num_blocks=2)]
+        )
+        self.assertEqual(total, 4096)
+        self.assertEqual(rs.all_ranks_kv_bytes_per_block(), 4096)
+
+    def test_falls_back_to_groups_without_tensors(self):
+        from vllm_torchtpu.offload import raiden_store as rs
+
+        group = SimpleNamespace(
+            kv_cache_spec=SimpleNamespace(page_size_bytes=256), layer_names=["a", "b"]
+        )
+        cfg = SimpleNamespace(
+            num_blocks=4,
+            hisparse_host_num_blocks=None,
+            kv_cache_tensors=[],
+            kv_cache_groups=[group],
+            prefix_cacheable_group_ids=(0,),
+        )
+        self.assertEqual(rs.record_all_ranks_kv_bytes_per_block([cfg]), 512)
+
+    def test_capacity_uses_the_recorded_sum(self):
+        from vllm_torchtpu.offload import raiden_store as rs
+
+        # Two stages of 4 ranks: one stage holds twice the bytes per block.
+        rs.record_all_ranks_kv_bytes_per_block(
+            [_worker_config(4096)] * 4 + [_worker_config(8192)] * 4
+        )
+        spec = _build_spec({"cpu_bytes_to_use": 1 << 20}, pp_size=2)
+        self.assertEqual(spec.offload_logical_blocks_capacity, (1 << 20) // 49152)
+
+    def test_single_stage_without_a_record_uses_the_world_size(self):
+        spec = _build_spec({"cpu_bytes_to_use": 1 << 20})
+        self.assertEqual(spec.offload_logical_blocks_capacity, (1 << 20) // (4096 * 4))
+
+    def test_pipeline_parallel_without_a_record_stops_construction(self):
+        from vllm_torchtpu.offload import raiden_store as rs
+
+        with (
+            patch.object(rs, "record_all_ranks_kv_bytes_per_block"),
+            self.assertRaisesRegex(ValueError, "not recorded"),
+        ):
+            _build_spec({"cpu_bytes_to_use": 1 << 20}, pp_size=2)
+
+
+class TestStorageConfig(unittest.TestCase):
+    """resolve_storage_config: where the settings come from, and the checks
+    that stop engine startup rather than let every save fail."""
+
+    def setUp(self):
+        _isolate_storage_env(self)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = tmp.name
+
+    def _resolve(self, extra_config=None, *, pp_size=1):
+        from vllm_torchtpu.offload.raiden_store import resolve_storage_config
+
+        return resolve_storage_config(
+            extra_config or {}, model_name="org/model", pp_size=pp_size
+        )
+
+    def test_off_without_a_path(self):
+        # Nothing else is read or checked while the tier is off, so DRAM-only
+        # deployments, pipeline parallel ones included, are unaffected.
+        os.environ.update(
+            RAIDEN_STORAGE_TYPE="s3",
+            RAIDEN_STORAGE_CAPACITY_GB="x",
+            RAIDEN_STORAGE_PROPERTIES="tp_size=2",
+            EXPERIMENTAL_RAIDEN_STORAGE_SKIP_PARALLELISM_CHECK="maybe",
+        )
+        del os.environ["PYTHONHASHSEED"]
+        self.assertIsNone(self._resolve(pp_size=2))
+
+    def test_env_turns_it_on(self):
+        os.environ["RAIDEN_STORAGE_PATH"] = self.root
+        self.assertEqual(
+            self._resolve(), _storage_config(root_dir=self.root, capacity_bytes=0)
+        )
+
+    def test_extra_config_wins_over_env(self):
+        env_root = os.path.join(self.root, "env")
+        cfg_root = os.path.join(self.root, "cfg")
+        os.environ.update(RAIDEN_STORAGE_PATH=env_root, RAIDEN_STORAGE_CAPACITY_GB="2")
+        cfg = self._resolve(
+            {
+                "raiden_storage_path": cfg_root,
+                "raiden_storage_capacity_gb": 1.5,
+                "raiden_storage_model_name": "shared-model",
+            }
+        )
+        self.assertEqual(
+            cfg,
+            _storage_config(
+                root_dir=cfg_root, model_name="shared-model", capacity_bytes=3 << 29
+            ),
+        )
+        self.assertTrue(os.path.isdir(cfg_root))
+        self.assertFalse(os.path.exists(env_root))
+
+    def test_empty_extra_config_value_falls_back_to_env(self):
+        os.environ.update(RAIDEN_STORAGE_PATH=self.root, RAIDEN_STORAGE_TYPE="POSIX")
+        cfg = self._resolve({"raiden_storage_path": "", "raiden_storage_type": None})
+        self.assertEqual(cfg.root_dir, self.root)
+        self.assertEqual(cfg.storage_type, "posix")
+
+    def test_creates_missing_directories(self):
+        nested = os.path.join(self.root, "a", "b")
+        cfg = self._resolve({"raiden_storage_path": nested + "/"})
+        self.assertEqual(cfg.root_dir, nested)
+        self.assertTrue(os.path.isdir(nested))
+
+    def test_metadata_cache_is_set_through_properties(self):
+        # The store's metadata cache is tuned with ordinary properties, passed
+        # on unread like the rest; raiden checks the values.
+        os.environ.update(
+            RAIDEN_STORAGE_PATH=self.root,
+            RAIDEN_STORAGE_PROPERTIES="metadata_cache_max_entries=-1",
+        )
+        cfg = self._resolve(
+            {"raiden_storage_properties": {"metadata_cache_ttl_secs": 300}}
+        )
+        self.assertEqual(
+            cfg.properties,
+            (("metadata_cache_max_entries", "-1"), ("metadata_cache_ttl_secs", "300")),
+        )
+
+    def test_properties_merge_key_by_key(self):
+        os.environ.update(
+            RAIDEN_STORAGE_PATH=self.root,
+            RAIDEN_STORAGE_PROPERTIES=(
+                " direct_io=true, storage_io_thread_pool_size=32,"
+            ),
+        )
+        cfg = self._resolve(
+            {
+                "raiden_storage_properties": {
+                    "storage_io_thread_pool_size": 64,
+                    "lookup_batch_size": 16,
+                    # Empty, so the env value stays.
+                    "direct_io": None,
+                    # Unknown keys pass through: raiden reads what it knows.
+                    "future_knob": "x",
+                }
+            }
+        )
+        self.assertEqual(
+            cfg.properties,
+            (
+                ("direct_io", "true"),
+                ("future_knob", "x"),
+                ("lookup_batch_size", "16"),
+                ("storage_io_thread_pool_size", "64"),
+            ),
+        )
+
+    def test_property_values_become_raiden_strings(self):
+        cfg = self._resolve(
+            {
+                "raiden_storage_path": self.root,
+                "raiden_storage_properties": {
+                    "direct_io": False,
+                    "ratio": 0.5,
+                    "blank": " ",
+                },
+            }
+        )
+        self.assertEqual(cfg.properties, (("direct_io", "false"), ("ratio", "0.5")))
+        # Extra config takes the env var's string form too.
+        cfg = self._resolve(
+            {
+                "raiden_storage_path": self.root,
+                "raiden_storage_properties": "direct_io=true",
+            }
+        )
+        self.assertEqual(cfg.properties, (("direct_io", "true"),))
+
+    def test_env_property_the_connector_sets_is_refused(self):
+        os.environ.update(
+            RAIDEN_STORAGE_PATH=self.root,
+            RAIDEN_STORAGE_PROPERTIES="capacity_bytes=5",
+        )
+        with self.assertRaisesRegex(
+            ValueError, "capacity_bytes.*RAIDEN_STORAGE_CAPACITY_GB"
+        ):
+            self._resolve()
+
+    def test_rejects_bad_settings(self):
+        properties = "raiden_storage_properties"
+        cases = {
+            "unsupported type": ({"raiden_storage_type": "s3"}, {}, "not supported"),
+            "relative path": ({"raiden_storage_path": "kv"}, {}, "absolute"),
+            "pipeline parallel": ({}, {"pp_size": 2}, "pp_size=2"),
+            "skip flag not a boolean": (
+                {"experimental_raiden_storage_skip_parallelism_check": "maybe"},
+                {},
+                "must be true or false",
+            ),
+            "capacity not a number": (
+                {"raiden_storage_capacity_gb": "x"},
+                {},
+                "positive",
+            ),
+            "zero capacity": ({"raiden_storage_capacity_gb": "0"}, {}, "positive"),
+            "negative capacity": ({"raiden_storage_capacity_gb": "-1"}, {}, "positive"),
+            "infinite capacity": (
+                {"raiden_storage_capacity_gb": "inf"},
+                {},
+                "positive",
+            ),
+            "property without a value": (
+                {properties: "direct_io"},
+                {},
+                "not key=value",
+            ),
+            "repeated property": ({properties: "a=1,a=2"}, {}, "repeated key 'a'"),
+            "empty property key": ({properties: "=1"}, {}, "empty or repeated key"),
+            "property the connector sets": (
+                {properties: {"root_dir": "/x"}},
+                {},
+                "'root_dir' is set by the connector, from raiden_storage_path",
+            ),
+            "TP size property": (
+                {properties: {"tp_size": 2}},
+                {},
+                "parallel config",
+            ),
+            "PCP size property": (
+                {properties: {"pcp_size": 2}},
+                {},
+                "parallel config",
+            ),
+            "PP size property": (
+                {properties: {"pp_size": 2}},
+                {},
+                "parallel config",
+            ),
+            "nested property value": (
+                {properties: {"a": {"b": 1}}},
+                {},
+                "string, number or boolean",
+            ),
+            "properties not a mapping": (
+                {properties: ["direct_io=true"]},
+                {},
+                "mapping or a string",
+            ),
+        }
+        for name, (extra, kwargs, message) in cases.items():
+            with self.subTest(name), self.assertRaisesRegex(ValueError, message):
+                self._resolve({"raiden_storage_path": self.root, **extra}, **kwargs)
+
+    def test_pipeline_parallel_needs_the_experimental_flag(self):
+        from vllm_torchtpu.offload import raiden_store as rs
+
+        flag = "experimental_raiden_storage_skip_parallelism_check"
+        env_flag = flag.upper()
+        on = {"raiden_storage_path": self.root}
+        # The refusal names the way out.
+        with self.assertRaisesRegex(ValueError, f"pp_size=2.*{env_flag}"):
+            self._resolve(on, pp_size=2)
+        # Either source turns it into a warning; a set extra-config value wins.
+        cases = {
+            "extra config": ({flag: True}, {}),
+            "extra config string": ({flag: "yes"}, {}),
+            "env": ({}, {env_flag: "1"}),
+            "empty extra config value": ({flag: ""}, {env_flag: "on"}),
+        }
+        for name, (extra, env) in cases.items():
+            with (
+                self.subTest(name),
+                patch.dict(os.environ, env),
+                patch.object(rs.logger, "warning") as warning,
+            ):
+                self.assertIsNotNone(self._resolve({**on, **extra}, pp_size=2))
+                warning.assert_called_once()
+                self.assertIn("pp_size=2", warning.call_args.args[1])
+        with (
+            patch.dict(os.environ, {env_flag: "true"}),
+            self.assertRaisesRegex(ValueError, "pp_size=2"),
+        ):
+            self._resolve({**on, flag: False}, pp_size=2)
+        # Without pipeline parallelism the flag changes nothing.
+        with patch.object(rs.logger, "warning") as warning:
+            self.assertEqual(self._resolve({**on, flag: True}), self._resolve(on))
+            warning.assert_not_called()
+        # A misspelled variable stops startup, as for every env_bool flag.
+        with (
+            patch.dict(os.environ, {env_flag: "maybe"}),
+            self.assertRaisesRegex(ValueError, env_flag),
+        ):
+            self._resolve(on)
+
+    def test_requires_pythonhashseed(self):
+        del os.environ["PYTHONHASHSEED"]
+        with self.assertRaisesRegex(ValueError, "PYTHONHASHSEED"):
+            self._resolve({"raiden_storage_path": self.root})
+
+    def test_rejects_uncreatable_directory(self):
+        blocker = os.path.join(self.root, "file")
+        with open(blocker, "w"):
+            pass
+        with self.assertRaisesRegex(ValueError, "cannot create"):
+            self._resolve({"raiden_storage_path": os.path.join(blocker, "kv")})
+
+    def test_rejects_unwritable_directory(self):
+        # Patched rather than chmod-ed: permissions do not stop root.
+        with (
+            patch.object(os, "access", return_value=False),
+            self.assertRaisesRegex(ValueError, "not writable"),
+        ):
+            self._resolve({"raiden_storage_path": self.root})
+
+
+class TestStorageBackendConfigs(unittest.TestCase):
+    """What the store and each worker are told about the storage tier."""
+
+    def test_store_config(self):
+        from vllm_torchtpu.offload import raiden_store as rs
+
+        cfg = rs.build_store_storage_backend_config(
+            FAKE_STORAGE_IMPL, _storage_config(), rs.StorageRankCoords(0, 4)
+        )
+        self.assertEqual(cfg.type, "posix")
+        # The store finds a block by its shard files, whose paths come from the
+        # declared parallelism axes. The store holds no shard, so it sets sizes
+        # only, leaving ranks at -1.
+        self.assertEqual(
+            (
+                cfg.parallelism.tp_size,
+                cfg.parallelism.tp_rank,
+                cfg.parallelism.pcp_size,
+                cfg.parallelism.pp_size,
+            ),
+            (4, -1, -1, -1),
+        )
+        self.assertEqual(
+            cfg.properties,
+            {
+                "root_dir": "/mnt/kv",
+                "model_name": "org/model",
+                "capacity_bytes": str(1 << 30),
+            },
+        )
+
+    def test_pass_through_properties_reach_store_and_workers(self):
+        from vllm_torchtpu.offload import raiden_store as rs
+
+        properties = {
+            "direct_io": "true",
+            # Only the store builds the metadata cache; workers check these
+            # values when they build their backend, then ignore them.
+            "metadata_cache_max_entries": "1024",
+            "metadata_cache_ttl_secs": "-1",
+        }
+        storage = _storage_config(properties=tuple(sorted(properties.items())))
+        store = rs.build_store_storage_backend_config(
+            FAKE_STORAGE_IMPL, storage, rs.StorageRankCoords(0, 4)
+        )
+        worker = rs.build_worker_storage_backend_config(
+            FAKE_STORAGE_IMPL, storage, rs.StorageRankCoords(1, 4)
+        )
+        for cfg in (store, worker):
+            for key, value in properties.items():
+                self.assertEqual(cfg.properties[key], value)
+
+    def test_worker_config(self):
+        from vllm_torchtpu.offload import raiden_store as rs
+
+        cfg = rs.build_worker_storage_backend_config(
+            FAKE_STORAGE_IMPL, _storage_config(), rs.StorageRankCoords(2, 4)
+        )
+        self.assertEqual(cfg.type, "posix")
+        self.assertEqual(
+            (
+                cfg.parallelism.tp_rank,
+                cfg.parallelism.tp_size,
+                cfg.parallelism.pcp_rank,
+                cfg.parallelism.pcp_size,
+                cfg.parallelism.pp_rank,
+                cfg.parallelism.pp_size,
+            ),
+            (2, 4, -1, -1, -1, -1),
+        )
+        self.assertEqual(
+            cfg.properties,
+            {
+                "root_dir": "/mnt/kv",
+                "model_name": "org/model",
+                "capacity_bytes": str(1 << 30),
+            },
+        )
+
+    def test_unset_capacity_is_not_sent(self):
+        from vllm_torchtpu.offload import raiden_store as rs
+
+        cfg = rs.build_store_storage_backend_config(
+            FAKE_STORAGE_IMPL,
+            _storage_config(capacity_bytes=0),
+            rs.StorageRankCoords(0, 1),
+        )
+        self.assertNotIn("capacity_bytes", cfg.properties)
+
+    def test_tpu_sync_without_backend_config_fails(self):
+        from vllm_torchtpu.offload import raiden_store as rs
+
+        with self.assertRaisesRegex(RuntimeError, "BackendConfig"):
+            rs.build_worker_storage_backend_config(
+                SimpleNamespace(), _storage_config(), rs.StorageRankCoords(0, 1)
+            )
+
+    def test_rank_coords_are_checked(self):
+        from vllm_torchtpu.offload.raiden_store import StorageRankCoords
+
+        cases = (
+            {"tp_rank": -1, "tp_size": 4},
+            {"tp_rank": 4, "tp_size": 4},
+            {"tp_rank": 0, "tp_size": 0},
+            {"tp_rank": 0, "tp_size": 1, "pcp_rank": 2, "pcp_size": 2},
+            {"tp_rank": 0, "tp_size": 1, "pcp_rank": -1, "pcp_size": 2},
+            {"tp_rank": 0, "tp_size": 1, "pcp_rank": 0, "pcp_size": 0},
+            {"tp_rank": 0, "tp_size": 1, "pp_rank": 2, "pp_size": 2},
+            {"tp_rank": 0, "tp_size": 1, "pp_rank": -1, "pp_size": 2},
+            {"tp_rank": 0, "tp_size": 1, "pp_rank": 0, "pp_size": 0},
+        )
+        for kwargs in cases:
+            with self.subTest(**kwargs), self.assertRaises(ValueError):
+                StorageRankCoords(**kwargs)
+
+    def test_pcp_ranks_get_their_own_shard_files(self):
+        from vllm_torchtpu.offload import raiden_store as rs
+
+        # PP -> PCP -> TP major order.
+        coords = rs.StorageRankCoords(
+            tp_rank=1, tp_size=2, pcp_rank=3, pcp_size=4, pp_rank=1, pp_size=2
+        )
+        self.assertEqual((coords.storage_rank, coords.storage_size), (15, 16))
+        # The shard a rank writes is its index among the engine's workers.
+        self.assertEqual(coords.engine_rank, coords.storage_rank)
+        # Every (PP, PCP, TP) tuple gets a distinct engine rank, and the
+        # ranks fill [0, world_size).
+        ranks = sorted(
+            rs.StorageRankCoords(
+                tp, 2, pcp_rank=pcp, pcp_size=4, pp_rank=pp, pp_size=2
+            ).engine_rank
+            for pp in range(2)
+            for pcp in range(4)
+            for tp in range(2)
+        )
+        self.assertEqual(ranks, list(range(16)))
+        # PCP=8, TP=1: PCP is declared alongside TP=1 (pcp8_r5_tp1_r0).
+        worker = rs.build_worker_storage_backend_config(
+            FAKE_STORAGE_IMPL,
+            _storage_config(),
+            rs.StorageRankCoords(0, 1, pcp_rank=5, pcp_size=8),
+        )
+        self.assertEqual(
+            (
+                worker.parallelism.tp_rank,
+                worker.parallelism.tp_size,
+                worker.parallelism.pcp_rank,
+                worker.parallelism.pcp_size,
+                worker.parallelism.pp_rank,
+                worker.parallelism.pp_size,
+            ),
+            (0, 1, 5, 8, -1, -1),
+        )
+        store = rs.build_store_storage_backend_config(
+            FAKE_STORAGE_IMPL,
+            _storage_config(),
+            rs.StorageRankCoords(0, 1, pcp_size=8),
+        )
+        self.assertEqual(
+            (
+                store.parallelism.tp_size,
+                store.parallelism.pcp_size,
+                store.parallelism.pp_size,
+            ),
+            (1, 8, -1),
+        )
+
+    def test_worker_coords_come_from_tp_and_pcp_groups(self):
+        from vllm_torchtpu.offload import raiden_store as rs
+
+        with (
+            patch(
+                "vllm.distributed.parallel_state.get_tensor_model_parallel_rank",
+                return_value=3,
+            ),
+            patch(
+                "vllm.distributed.parallel_state.get_tensor_model_parallel_world_size",
+                return_value=4,
+            ),
+            patch("vllm_torchtpu.distributed.pcp.get_pcp_rank", return_value=1),
+            patch("vllm_torchtpu.distributed.pcp.get_pcp_world_size", return_value=2),
+            patch(
+                "vllm.distributed.parallel_state.get_pp_group",
+                return_value=SimpleNamespace(rank_in_group=1, world_size=2),
+            ),
+        ):
+            coords = rs.worker_storage_rank_coords()
+        self.assertEqual(
+            coords,
+            rs.StorageRankCoords(
+                tp_rank=3, tp_size=4, pcp_rank=1, pcp_size=2, pp_rank=1, pp_size=2
+            ),
+        )
+
+
+def _get_manager_and_worker(
+    spec,
+    *,
+    tp_rank=2,
+    tp_world_size=4,
+    pcp_rank=0,
+    pcp_world_size=1,
+    pp_rank=0,
+    pp_world_size=1,
+):
+    """Build the spec's manager and worker over stubbed parallel groups and
+    return the kwargs each was constructed with."""
+    with (
+        _fake_tpu_sync(FAKE_STORAGE_IMPL),
+        patch(
+            "vllm_torchtpu.offload.raiden_store.RaidenOffloadingManager"
+        ) as manager_cls,
+        patch(
+            "vllm_torchtpu.offload.raiden_store.RaidenStoreOffloadingWorker"
+        ) as worker_cls,
+        # World rank 6 is TP rank 2 of the second data parallel replica.
+        # The worker must not register under it (see TestWorkerNodeId).
+        patch(
+            "vllm.distributed.parallel_state.get_world_group",
+            return_value=SimpleNamespace(rank_in_group=6),
+        ),
+        patch(
+            "vllm.distributed.parallel_state.get_tensor_model_parallel_rank",
+            return_value=tp_rank,
+        ),
+        patch(
+            "vllm.distributed.parallel_state.get_tensor_model_parallel_world_size",
+            return_value=tp_world_size,
+        ),
+        patch("vllm_torchtpu.distributed.pcp.get_pcp_rank", return_value=pcp_rank),
+        patch(
+            "vllm_torchtpu.distributed.pcp.get_pcp_world_size",
+            return_value=pcp_world_size,
+        ),
+        patch(
+            "vllm.distributed.parallel_state.get_pp_group",
+            return_value=SimpleNamespace(
+                rank_in_group=pp_rank, world_size=pp_world_size
+            ),
+        ),
+    ):
+        spec.get_manager()
+        spec.get_worker(MagicMock())
+    return manager_cls.call_args.kwargs, worker_cls.call_args.kwargs
+
+
+class TestStorageSpec(unittest.TestCase):
+    """The spec resolves the tier when it is built, in the scheduler and in
+    every worker, and hands the store and each worker its own config."""
+
+    def setUp(self):
+        _isolate_storage_env(self)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = tmp.name
+
+    def _get_manager_and_worker(self, spec, **kwargs):
+        return _get_manager_and_worker(spec, **kwargs)
+
+    def test_off_passes_no_configs(self):
+        spec = _build_spec({})
+        self.assertIsNone(spec.storage_config)
+        self.assertEqual(spec.dp_rank, 0)
+        manager_kwargs, worker_kwargs = self._get_manager_and_worker(spec)
+        self.assertEqual(manager_kwargs["secondary_backend_configs"], [])
+        self.assertEqual(manager_kwargs["dp_rank"], 0)
+        self.assertEqual(worker_kwargs["backend_configs"], [])
+
+    def test_global_dp_rank_forwarded_to_manager(self):
+        from vllm_torchtpu.offload import raiden_store as rs
+
+        # Multi-host DP: port offsets by local DP rank while KVCacheStore
+        # telemetry and RaidenId suffix use the global DP rank.
+        spec = _build_spec({}, dp_rank=3, dp_rank_local=1)
+        self.assertEqual(spec.dp_rank, 3)
+        manager_kwargs, _ = self._get_manager_and_worker(spec)
+        self.assertEqual(manager_kwargs["dp_rank"], 3)
+        self.assertEqual(
+            manager_kwargs["raiden_controller_port"],
+            rs._DEFAULT_CONTROLLER_PORT + 1,
+        )
+        self.assertEqual(manager_kwargs["raiden_job_name"], "vllm-offload-engine-dp3")
+
+        # Unset local DP rank falls back to global DP rank for port offset.
+        fallback_spec = _build_spec({}, dp_rank=3, dp_rank_local=None)
+        self.assertEqual(
+            fallback_spec.raiden_controller_port,
+            rs._DEFAULT_CONTROLLER_PORT + 3,
+        )
+
+    def test_on_configures_store_and_worker(self):
+        spec = _build_spec(
+            {
+                "raiden_storage_path": self.root,
+                "raiden_storage_properties": {"direct_io": True},
+            }
+        )
+        self.assertEqual(
+            spec.storage_config,
+            _storage_config(
+                root_dir=self.root,
+                capacity_bytes=0,
+                properties=(("direct_io", "true"),),
+            ),
+        )
+        manager_kwargs, worker_kwargs = self._get_manager_and_worker(spec)
+        (store_cfg,) = manager_kwargs["secondary_backend_configs"]
+        self.assertEqual(store_cfg.properties["root_dir"], self.root)
+        self.assertEqual(store_cfg.parallelism.tp_size, 4)
+        self.assertEqual(store_cfg.parallelism.pcp_size, -1)
+        self.assertEqual(store_cfg.parallelism.pp_size, -1)
+        self.assertNotIn("tp_size", store_cfg.properties)
+        self.assertEqual(store_cfg.properties["direct_io"], "true")
+        # The worker registers under its engine-local rank -- its TP rank
+        # here, not its world rank -- and writes as its TP rank.
+        self.assertEqual(worker_kwargs["rank"], 2)
+        (worker_cfg,) = worker_kwargs["backend_configs"]
+        self.assertEqual(
+            (worker_cfg.parallelism.tp_rank, worker_cfg.parallelism.tp_size), (2, 4)
+        )
+        self.assertEqual(worker_cfg.properties["direct_io"], "true")
+
+    def test_pcp_without_tp_writes_one_file_per_pcp_rank(self):
+        # PCP=8, TP=1, the interleaved layout: each PCP rank holds a different
+        # token chunk of every block, so each writes a file of its own.
+        spec = _build_spec({"raiden_storage_path": self.root}, tp_size=1, pcp_size=8)
+        manager_kwargs, worker_kwargs = self._get_manager_and_worker(
+            spec, tp_rank=0, tp_world_size=1, pcp_rank=5, pcp_world_size=8
+        )
+        (store_cfg,) = manager_kwargs["secondary_backend_configs"]
+        self.assertEqual(
+            (store_cfg.parallelism.tp_size, store_cfg.parallelism.pcp_size), (1, 8)
+        )
+        (worker_cfg,) = worker_kwargs["backend_configs"]
+        self.assertEqual(
+            (
+                worker_cfg.parallelism.tp_rank,
+                worker_cfg.parallelism.tp_size,
+                worker_cfg.parallelism.pcp_rank,
+                worker_cfg.parallelism.pcp_size,
+            ),
+            (0, 1, 5, 8),
+        )
+
+    def test_worker_groups_must_match_config(self):
+        spec = _build_spec({"raiden_storage_path": self.root})
+        with self.assertRaisesRegex(AssertionError, "worker group sizes TP=2"):
+            self._get_manager_and_worker(spec, tp_rank=0, tp_world_size=2)
+        spec = _build_spec({"raiden_storage_path": self.root}, tp_size=1, pcp_size=8)
+        with self.assertRaisesRegex(AssertionError, "PCP=4, PP=1 != configured"):
+            self._get_manager_and_worker(
+                spec, tp_rank=0, tp_world_size=1, pcp_rank=0, pcp_world_size=4
+            )
+        # The node id the worker registers under comes from the same groups,
+        # so the check holds without a storage tier too.
+        spec = _build_spec({})
+        with self.assertRaisesRegex(AssertionError, "worker group sizes TP=2"):
+            self._get_manager_and_worker(spec, tp_rank=0, tp_world_size=2)
+
+    def test_bad_setting_stops_construction(self):
+        with self.assertRaisesRegex(ValueError, "pp_size=2"):
+            _build_spec({"raiden_storage_path": self.root}, pp_size=2)
+
+    def test_experimental_flag_lets_pipeline_parallel_start(self):
+        from vllm_torchtpu.offload import raiden_store as rs
+
+        with patch.object(rs.logger, "warning") as warning:
+            spec = _build_spec(
+                {
+                    "raiden_storage_path": self.root,
+                    "experimental_raiden_storage_skip_parallelism_check": True,
+                },
+                pp_size=2,
+            )
+        self.assertEqual(spec.storage_config.root_dir, self.root)
+        warning.assert_called_once()
+        manager_kwargs, worker_kwargs = self._get_manager_and_worker(
+            spec, pp_rank=1, pp_world_size=2
+        )
+        (store_cfg,) = manager_kwargs["secondary_backend_configs"]
+        self.assertEqual(
+            (store_cfg.parallelism.tp_size, store_cfg.parallelism.pp_size), (4, 2)
+        )
+        (worker_cfg,) = worker_kwargs["backend_configs"]
+        self.assertEqual(
+            (
+                worker_cfg.parallelism.tp_rank,
+                worker_cfg.parallelism.tp_size,
+                worker_cfg.parallelism.pp_rank,
+                worker_cfg.parallelism.pp_size,
+            ),
+            (2, 4, 1, 2),
+        )
+
+
+class TestWorkerNodeId(unittest.TestCase):
+    """The node id a worker registers with its engine's store under.
+
+    It is the worker's index within the engine, [0, world_size), from its
+    TP, PCP, and PP group ranks (PP -> PCP -> TP major, the order vLLM lays an
+    engine's ranks out in). The store -- one per data-parallel replica --
+    requires node ids to form that dense range once a global registry is
+    configured, and pairs P2P transfers on them (this replica's worker k
+    reads from the peer's worker k). The world group's rank is not that:
+    under DP + EP it is the global `dp_rank * world_size + k`, which made
+    every replica but the first fail KVCacheStore construction with "worker
+    node ids must form the dense range [0, 1)".
+    """
+
+    def setUp(self):
+        _isolate_storage_env(self)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = tmp.name
+
+    def test_node_id_is_the_engine_local_rank_not_the_world_rank(self):
+        # DP=8, TP=1, EP: the only worker of the second replica has world
+        # rank 6 and must register as 0.
+        spec = _build_spec({}, tp_size=1)
+        _, worker_kwargs = _get_manager_and_worker(spec, tp_rank=0, tp_world_size=1)
+        self.assertEqual(worker_kwargs["rank"], 0)
+        # TP=4: TP rank 2 of the second replica (world rank 6) registers as 2.
+        _, worker_kwargs = _get_manager_and_worker(_build_spec({}))
+        self.assertEqual(worker_kwargs["rank"], 2)
+
+    def test_node_id_orders_pp_pcp_tp_major(self):
+        # TP=4, PCP=2: (pcp 1, tp 3) is worker 1 * 4 + 3.
+        spec = _build_spec({}, tp_size=4, pcp_size=2)
+        _, worker_kwargs = _get_manager_and_worker(
+            spec, tp_rank=3, tp_world_size=4, pcp_rank=1, pcp_world_size=2
+        )
+        self.assertEqual(worker_kwargs["rank"], 7)
+        # TP=4, PP=2: (pp 1, tp 2) is worker 1 * 4 + 2.
+        spec = _build_spec({}, tp_size=4, pp_size=2)
+        _, worker_kwargs = _get_manager_and_worker(
+            spec, tp_rank=2, tp_world_size=4, pp_rank=1, pp_world_size=2
+        )
+        self.assertEqual(worker_kwargs["rank"], 6)
+
+    def test_node_id_matches_the_storage_shard(self):
+        # One identity for both: the shard file a worker writes is the one
+        # a peer's worker of the same node id holds in host memory.
+        spec = _build_spec({"raiden_storage_path": self.root}, tp_size=2, pcp_size=4)
+        _, worker_kwargs = _get_manager_and_worker(
+            spec, tp_rank=1, tp_world_size=2, pcp_rank=3, pcp_world_size=4
+        )
+        (worker_cfg,) = worker_kwargs["backend_configs"]
+        self.assertEqual(worker_kwargs["rank"], 3 * 2 + 1)
+        self.assertEqual(
+            (worker_cfg.parallelism.pcp_rank, worker_cfg.parallelism.tp_rank), (3, 1)
+        )
+
+
+class TestStoragePlumbing(unittest.TestCase):
+    """Storage configs reach raiden's KVCacheStore and KVCacheManager
+    constructors, and neither gets a new argument while the tier is off."""
+
+    def setUp(self):
+        self.store_kwargs: list[dict] = []
+        self.manager_kwargs: list[dict] = []
+        store_kwargs, manager_kwargs = self.store_kwargs, self.manager_kwargs
+
+        class RecordingKVCacheStore:
+            def __init__(self, **kwargs):
+                store_kwargs.append(kwargs)
+                self.raiden_id = object()
+                self.raiden_controller_address = "127.0.0.1:0"
+                self.store_server_address = ""
+
+        class RecordingKVCacheManager:
+            def __init__(self, **kwargs):
+                manager_kwargs.append(kwargs)
+
+        impl = SimpleNamespace(
+            KVCacheStore=RecordingKVCacheStore,
+            RaidenId=lambda *args: args,
+            BlockStatus=FakeBlockStatus,
+            RaidenBlockId=FakeRaidenBlockId,
+        )
+        patcher = _fake_tpu_sync(impl, kv_cache_manager_cls=RecordingKVCacheManager)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_store_gets_storage_configs_only_when_set(self):
+        make_manager(None)
+        cfg = object()
+        make_manager(None, secondary_backend_configs=[cfg])
+        plain, tiered = self.store_kwargs
+        self.assertNotIn("secondary_backend_configs", plain)
+        self.assertEqual(tiered["secondary_backend_configs"], [cfg])
+
+    def test_store_raiden_id_carries_dp_rank(self):
+        make_manager(None)
+        make_manager(None, dp_rank=2)
+        plain, multi_dp = self.store_kwargs
+        self.assertEqual(plain["raiden_id"], ("test", "0", "kv_cache", 0))
+        self.assertEqual(multi_dp["raiden_id"], ("test", "0", "kv_cache", 2))
+        self.assertNotIn("dp_rank", plain)
+        self.assertNotIn("dp_rank", multi_dp)
+        with self.assertRaisesRegex(ValueError, "dp_rank must be non-negative"):
+            make_manager(None, dp_rank=-1)
+
+    def _start_worker(self, **kwargs):
+        import torch
+        from vllm.v1.kv_offload.base import (
+            CanonicalKVCacheRef,
+            CanonicalKVCaches,
+            CanonicalKVCacheTensor,
+        )
+
+        from vllm_torchtpu.offload.raiden_store import RaidenStoreOffloadingWorker
+
+        # A kernel block is 16 x 2 x 2 x 8 bf16 values; a page holds four.
+        page_bytes = 4 * 16 * 2 * 2 * 8 * 2
+        kv_caches = CanonicalKVCaches(
+            tensors=[
+                CanonicalKVCacheTensor(
+                    tensor=torch.zeros(2, page_bytes, dtype=torch.int8),
+                    page_size_bytes=page_bytes,
+                )
+            ],
+            group_data_refs=[
+                [CanonicalKVCacheRef(tensor_idx=0, page_size_bytes=page_bytes)]
+            ],
+        )
+        with (
+            patch(
+                "vllm_torchtpu.offload.raiden_store.resolve_kernel_geometry",
+                return_value=(16, (16, 2, 2, 8), torch.bfloat16, 64),
+            ),
+            patch.object(
+                RaidenStoreOffloadingWorker, "_controller_reachable", return_value=True
+            ),
+        ):
+            worker = RaidenStoreOffloadingWorker(
+                kv_caches,
+                vllm_config=MagicMock(),
+                kv_cache_config=MagicMock(),
+                host_blocks_to_allocate=8,
+                controller_address="127.0.0.1:1",
+                rank=0,
+                **kwargs,
+            )
+            # Registration runs on the worker's background thread.
+            worker._register_thread.join(timeout=10.0)
+        self.addCleanup(worker.shutdown)
+        self.assertFalse(worker._register_thread.is_alive())
+
+    def test_worker_registers_storage_backend_only_when_set(self):
+        self._start_worker()
+        cfg = object()
+        self._start_worker(backend_configs=[cfg])
+        plain, tiered = self.manager_kwargs
+        self.assertNotIn("backend_configs", plain)
+        self.assertEqual(tiered["backend_configs"], [cfg])
+
+
+class TestDivergedHybridHitLookup(unittest.TestCase):
+    """The offload child's lookup on a diverged hybrid hit.
+
+    With TPU_RAIDEN_PREFIX_AWARE_LOAD=1 the connector reports
+    supports_divergent_local_hybrid_hits, so the scheduler may start from a
+    full-attention local hit deeper than the Mamba one. That is safe because
+    the lookup treats a Mamba group as a one-chunk window: a host hit ends
+    where the store holds the recurrent state, and without it the answer is
+    0, which makes the scheduler fall back to the common boundary. These run
+    the real lookup (upstream OffloadingConnectorScheduler, not patched) and
+    the real RaidenOffloadingManager over the fake store.
+    """
+
+    BLOCK = 16
+    # Five full blocks; the last prompt token is always recomputed.
+    PROMPT = 5 * BLOCK + 1
+    # Full-attention local hit: chunk 0. The Mamba state for it is absent.
+    LOCAL = BLOCK
+    ATTN, MAMBA = 0, 1
+
+    def setUp(self):
+        import torch
+        from vllm import SamplingParams
+        from vllm.utils.hashing import sha256
+        from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+        from vllm.v1.kv_cache_interface import (
+            FullAttentionSpec,
+            KVCacheConfig,
+            KVCacheGroupSpec,
+            MambaSpec,
+        )
+        from vllm.v1.kv_offload.base import OffloadingKVEventsConfig
+        from vllm.v1.request import Request
+
+        from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingScheduler
+
+        self.store = FakeKVCacheStore()
+        self.manager = make_manager(self.store)
+        attn = FullAttentionSpec(
+            block_size=self.BLOCK, num_kv_heads=1, head_size=8, dtype=torch.bfloat16
+        )
+        mamba = MambaSpec(
+            block_size=self.BLOCK,
+            shapes=((2, 8),),
+            dtypes=(torch.bfloat16,),
+            mamba_cache_mode="align",
+        )
+        kv_cache_config = KVCacheConfig(
+            num_blocks=64,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(["attn"], attn),
+                KVCacheGroupSpec(["gdn"], mamba),
+            ],
+        )
+        # Only the fields the scheduler reads; the store spec's sizing and
+        # control plane play no part in a lookup.
+        spec = SimpleNamespace(
+            config=SimpleNamespace(
+                groups=[
+                    SimpleNamespace(
+                        group_id=self.ATTN,
+                        tokens_per_block=self.BLOCK,
+                        sliding_window_size_in_chunks=None,
+                    ),
+                    SimpleNamespace(
+                        group_id=self.MAMBA,
+                        tokens_per_block=self.BLOCK,
+                        sliding_window_size_in_chunks=1,
+                    ),
+                ]
+            ),
+            blocks_per_chunk=1,
+            tokens_per_block=[self.BLOCK, self.BLOCK],
+            tokens_per_hash=self.BLOCK,
+            offload_prompt_only=False,
+            extra_config={},
+            kv_events_config=OffloadingKVEventsConfig(
+                enable_kv_cache_events=False, self_describing_kv_events=False
+            ),
+            get_manager=lambda: self.manager,
+        )
+        vllm_config = SimpleNamespace(
+            cache_config=SimpleNamespace(
+                prefix_cache_retention_interval=None, enable_prefix_caching=True
+            ),
+            speculative_config=None,
+            parallel_config=SimpleNamespace(
+                world_size=2, decode_context_parallel_size=1
+            ),
+        )
+        self.scheduler = TPURaidenOffloadingScheduler(
+            spec, vllm_config, kv_cache_config
+        )
+        self._scheduler_args = (spec, vllm_config, kv_cache_config)
+        init_none_hash(sha256)
+        params = SamplingParams(max_tokens=1)
+        params.update_from_generation_config({}, 2)
+        self.request = Request(
+            "req",
+            list(range(self.PROMPT)),
+            params,
+            None,
+            block_hasher=get_request_block_hasher(self.BLOCK, sha256),
+        )
+        self.scheduler.on_new_request(self.request)
+
+    def _key(self, group: int, chunk: int):
+        from vllm.v1.kv_offload.base import make_offload_key
+
+        return make_offload_key(self.request.block_hashes[chunk], group)
+
+    def _seed(self, group: int, *chunks: int) -> None:
+        for chunk in chunks:
+            seed_host_entries(self.store, self._key(group, chunk))
+
+    def _hit(self) -> int | None:
+        hit, _ = self.scheduler.get_num_new_matched_tokens(self.request, self.LOCAL)
+        return hit
+
+    def test_rejects_synchronous_loads(self):
+        # Raiden loads land asynchronously, so a load upstream schedules as
+        # synchronous would let the step's forward read blocks still in flight.
+        from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingScheduler
+
+        spec, vllm_config, kv_cache_config = self._scheduler_args
+        spec = SimpleNamespace(
+            **{**vars(spec), "extra_config": {"sync_load_budget_bytes": 1}}
+        )
+        with self.assertRaisesRegex(ValueError, "sync_load_budget_bytes"):
+            TPURaidenOffloadingScheduler(spec, vllm_config, kv_cache_config)
+
+    def test_no_hit_without_the_recurrent_state(self):
+        # Attention chunks 1-3 are on the host but no Mamba state is: loading
+        # them would leave the request without the state at their end.
+        self._seed(self.ATTN, 1, 2, 3)
+        self.assertEqual(self._hit(), 0)
+
+    def test_hit_ends_at_the_recurrent_state_and_loads_its_block(self):
+        from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+        from vllm.v1.core.kv_cache_utils import KVCacheBlock
+
+        self._seed(self.ATTN, 1, 2, 3)
+        self._seed(self.MAMBA, 3)
+        self.assertEqual(self._hit(), 3 * self.BLOCK)
+
+        # Block 0 of each group is the local hit. A Mamba group holds null
+        # blocks below the boundary and a fresh block at its end.
+        attn_blocks = [KVCacheBlock(block_id) for block_id in (10, 11, 12, 13)]
+        mamba_blocks = [KVCacheBlock(0) for _ in range(3)] + [KVCacheBlock(23)]
+        for block in mamba_blocks[:3]:
+            block.is_null = True
+        self.scheduler.update_state_after_alloc(
+            self.request,
+            KVCacheBlocks(blocks=(attn_blocks, mamba_blocks)),
+            3 * self.BLOCK,
+        )
+        (job,) = self.scheduler._current_batch_load_jobs.values()
+        self.assertEqual(list(job.dst_spec.block_ids), [11, 12, 13, 23])
+        (status,) = self.scheduler._jobs.values()
+        loaded = {self._key(self.ATTN, chunk) for chunk in (1, 2, 3)}
+        self.assertEqual(status.keys, loaded | {self._key(self.MAMBA, 3)})
+        # prepare_load pinned the Mamba state's host blocks for the transfer.
+        for sub_hash in sub_hashes(self._key(self.MAMBA, 3)):
+            self.assertEqual(self.store.entries[sub_hash].pin_count, 1)
+
+    def test_hit_stops_at_an_earlier_recurrent_state(self):
+        # The state is on the host at chunk 2 but not at chunk 3, so the hit
+        # ends at chunk 2 although attention reaches chunk 3.
+        self._seed(self.ATTN, 1, 2, 3)
+        self._seed(self.MAMBA, 2)
+        self.assertEqual(self._hit(), 2 * self.BLOCK)
+
+
+class TestDenseDpIndex(unittest.TestCase):
+    """Dense (non-MoE) DP>1: vLLM's EngineCore resets
+    `data_parallel_rank` to 0 via `reconfigure_for_independent_dp_rank()`,
+    so the spec must read the surviving `data_parallel_index`."""
+
+    def setUp(self):
+        _isolate_storage_env(self)
+
+    def test_dp_index_reaches_raiden_id_and_job_name_suffix(self):
+        from vllm_torchtpu.offload import raiden_store as rs
+
+        spec = _build_spec({}, dp_rank=0, dp_rank_local=0, dp_index=2)
+        self.assertEqual(spec.dp_rank, 2)
+        # Job-name suffix and RaidenId follow data_parallel_index; port offset
+        # still follows data_parallel_rank_local.
+        self.assertEqual(spec.raiden_job_name, "vllm-offload-engine-dp2")
+        self.assertEqual(spec.raiden_controller_port, rs._DEFAULT_CONTROLLER_PORT)
+
+        manager_kwargs, _ = _get_manager_and_worker(spec)
+        self.assertEqual(manager_kwargs["dp_rank"], 2)
+        self.assertEqual(manager_kwargs["raiden_job_name"], "vllm-offload-engine-dp2")
+
+        store_kwargs: list[dict] = []
+
+        class RecordingKVCacheStore:
+            def __init__(self, **kwargs):
+                store_kwargs.append(kwargs)
+                self.raiden_id = object()
+                self.raiden_controller_address = "127.0.0.1:0"
+                self.store_server_address = ""
+
+        impl = SimpleNamespace(
+            KVCacheStore=RecordingKVCacheStore,
+            RaidenId=lambda *args: args,
+            BlockStatus=FakeBlockStatus,
+            RaidenBlockId=FakeRaidenBlockId,
+        )
+        with _fake_tpu_sync(impl):
+            # Replay the spec's exact manager kwargs into the real manager.
+            rs.RaidenOffloadingManager(**manager_kwargs)
+        (kwargs,) = store_kwargs
+        job_name, _, _, data_replica_idx = kwargs["raiden_id"]
+        self.assertEqual(data_replica_idx, 2)
+        self.assertEqual(job_name, "vllm-offload-engine-dp2")
 
 
 if __name__ == "__main__":

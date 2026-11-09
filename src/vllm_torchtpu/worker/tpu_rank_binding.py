@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Rank -> TPU device binding for vLLM workers.
 
 ``LOCAL_RANK`` selects which physical chip a worker opens: torch_tpu copies it
@@ -262,7 +274,7 @@ def get_tpu_worker_binding(
         global_rank = dp_rank * world_size + rank
         global_world = world_size * dp_size
         local_world = world_size * dp_size_local
-        if pcp_size > 1 and use_spawned_pcp_local_rank:
+        if pcp_size > 1 and use_spawned_pcp_local_rank and bool(env.get("LOCAL_RANK")):
             tpu_local_rank = _get_spawned_pcp_local_rank(
                 env=env,
                 local_rank_offset=local_rank_offset,
@@ -286,7 +298,7 @@ def get_tpu_worker_binding(
 
     dp_rank = parallel_config.data_parallel_index or 0
     native_local_rank = dp_rank * world_size + local_rank
-    if pcp_size > 1 and use_spawned_pcp_local_rank:
+    if pcp_size > 1 and use_spawned_pcp_local_rank and bool(env.get("LOCAL_RANK")):
         tpu_local_rank = _get_spawned_pcp_local_rank(
             env=env,
             local_rank_offset=local_rank_offset,
@@ -297,12 +309,15 @@ def get_tpu_worker_binding(
         # dp offset because it is the physical chip ordinal, and two dense
         # DP replicas must not resolve to the same chip.
         tpu_local_rank = local_rank
-    # LOCAL_WORLD_SIZE must be the per-host chip count, not the global TP*PP
-    # world size: on a single host they're equal, but across --nnodes hosts
-    # each host only has world_size // nnodes chips, and PjRt bootstrap fails
-    # ("PjRtClient is not initialized") if told to expect more local devices
-    # than physically exist on this host.
-    local_chip_count = parallel_config.local_world_size
+    # Ray sets per-host LOCAL_WORLD_SIZE without setting LOCAL_RANK; multiproc
+    # parent/child reuse env after as_env() has already added local_rank_offset
+    # into LOCAL_WORLD_SIZE (alongside LOCAL_RANK), so only read it when
+    # LOCAL_RANK is absent.
+    local_chip_count = (
+        parallel_config.local_world_size
+        if env.get("LOCAL_RANK")
+        else _get_int_env(env, "LOCAL_WORLD_SIZE", parallel_config.local_world_size)
+    )
     return TpuWorkerBinding(
         rank=rank,
         local_rank=local_rank_offset + tpu_local_rank,

@@ -16,7 +16,7 @@ import dataclasses
 import functools
 from abc import ABC, abstractmethod
 from collections.abc import Callable
-from typing import Any
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -241,7 +241,7 @@ class Dimensions:
 @dataclasses.dataclass(frozen=True)
 class InputConfigs:
     quant_dtype: jnp.dtype | None
-    quant_block_size: int | None
+    quant_block_size: int
     dtype: jnp.dtype
     has_bias: bool = False
     has_scale: bool = False
@@ -495,7 +495,7 @@ def inner_kernel(
                 acc_list.append(acc_n)
         else:
             # Quantized matmul path.
-            lhs_q_dtype = cfgs.lhs_cfgs.quant_dtype
+            lhs_q_dtype = cast(jnp.dtype, cfgs.lhs_cfgs.quant_dtype)
             q_block_size = cfgs.lhs_cfgs.quant_block_size
 
             if jnp.issubdtype(lhs_q_dtype, jnp.floating):
@@ -882,8 +882,8 @@ def kernel_main(
     if cfgs.zero_init:
         zero_size = zero_out_start(
             out_ref,
-            zero_ref,
-            semaphore_ref,
+            cast(jax.Array, zero_ref),
+            cast(jax.Array, semaphore_ref),
             metadata_ref,
             num_gm,
             dims=cfgs.dims,
@@ -916,7 +916,7 @@ def kernel_main(
     pipeline_fn(lhs_in, rhs_ref, out_in, scratches=scratches)
 
     if cfgs.zero_init:
-        zero_out_end(out_ref, semaphore_ref, zero_size, dims=cfgs.dims)
+        zero_out_end(out_ref, cast(jax.Array, semaphore_ref), zero_size, dims=cfgs.dims)
 
 
 def calculate_tiling(
@@ -976,7 +976,9 @@ def calculate_tiling(
         # If LHS is quantized on-the-fly, we need an extra single-buffered cast
         # buffer in VMEM.
         if lhs_cfgs.should_quantize:
-            lhs_quant_bits = jax.dtypes.itemsize_bits(lhs_cfgs.quant_dtype)
+            lhs_quant_bits = jax.dtypes.itemsize_bits(
+                cast(jnp.dtype, lhs_cfgs.quant_dtype)
+            )
             lhs_vmem += tm * tk * (lhs_quant_bits // 8)
 
         # 2. RHS tile (triple-buffered, includes scale and bias if present)
@@ -1154,7 +1156,7 @@ def make_gmm_configs(
     group_offset: jax.Array,
     *,
     tile_info: TileSizes | TileFn,
-    vmem_limit_bytes: int | None,
+    vmem_limit_bytes: int,
     out_dtype: jnp.dtype | None,
     acc_dtype: jnp.dtype | None,
     maybe_quantize_lhs: bool,
@@ -1197,14 +1199,16 @@ def make_gmm_configs(
     lhs_q_dtype = None
     if maybe_quantize_lhs and rhs_cfgs.should_dequantize_after_matmul:
         # Choose lhs quantization dtype based on TPU hardware support.
-        is_rhs_float = jnp.issubdtype(rhs_quant_dtype, jnp.floating)
+        is_rhs_float = jnp.issubdtype(cast(jnp.dtype, rhs_quant_dtype), jnp.floating)
         tpu_info = pltpu.get_tpu_info()
         # Check if there is hardware compute support for rhs dtype group.
         if tpu_info.fp8_ops_per_second > 0:
             # Special handling for 4-bit integer rhs as it can be converted to fp8
             # without a numeric issues. Note that this is not the case for 4-bit
             # floating rhs as conversion to int8 will cause numeric issues.
-            is_rhs_4bits = jax.dtypes.itemsize_bits(rhs_quant_dtype) == 4
+            is_rhs_4bits = (
+                jax.dtypes.itemsize_bits(cast(jnp.dtype, rhs_quant_dtype)) == 4
+            )
             if is_rhs_float or is_rhs_4bits:
                 lhs_q_dtype = jnp.float8_e4m3fn.dtype
         if tpu_info.int8_ops_per_second > 0 and not is_rhs_float:

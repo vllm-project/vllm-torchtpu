@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Deviceless tests for the stand-alone seq-on-lane reshard module.
 
 Goldens model the measured v7x physical layout (probes/seq-on-lane-layout,
@@ -527,6 +539,12 @@ def test_sol_fingerprint_is_role_invariant_and_layout_specific():
     assert payload_a["fa_kernel_page_tokens"] == 128
     assert payload_a["pool_lane_width"] == 128
     assert "kv_rows" not in payload_a
+    assert set(payload_a["gdn_state_unit_bytes"]) == {
+        "gdn_conv_k",
+        "gdn_conv_q",
+        "gdn_conv_v",
+        "gdn_ssm",
+    }
     assert fp_a == sol.canonical_fingerprint(payload_a)
     # A token-major peer cannot produce this fingerprint: the module refuses
     # its manifest outright (and the schema token differs anyway).

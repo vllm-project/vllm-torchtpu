@@ -1,5 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """DeepSeek-V4 KV-cache allocation: layer classification and cache arrays.
 
 Moved verbatim out of `TPUModelRunner`; see vllm-project/vllm-torchtpu#713.
@@ -22,6 +33,14 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
+from vllm_torchtpu.kernels.deepseek_v4.compress_and_store import (
+    config as compressor_config,
+)
+from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
+from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor import (
+    RunLocalStateSpec,
+)
+from vllm_torchtpu.layers.core.attention_metadata import attention_block_table_width
 from vllm_torchtpu.logger import init_logger
 
 if TYPE_CHECKING:
@@ -231,6 +250,23 @@ class DsV4KVCacheAllocator:
         swa_layer_groups: list[list[str]] = []
         state_layer_names: list[str] = []
         for group in kv_cache_config.kv_cache_groups:
+            # vLLM's grouping compares neither the spec type nor prefix
+            # caching, so a cacheable window of the same size and block size
+            # can share a group with the run-local state; one side would then
+            # be prefix-cached wrongly. Layers keep their own spec only in the
+            # packed layout DSv4 uses; a merged group spec maps every layer
+            # to one spec, so this check cannot see a mix there.
+            run_local = {
+                isinstance(per_layer_spec(layer_name), RunLocalStateSpec)
+                for layer_name in group.layer_names
+                if layer_name not in self.runner.shared_kv_cache_layers
+            }
+            if len(run_local) > 1:
+                raise ValueError(
+                    "DeepSeek-V4 cache group mixes RunLocalStateSpec layers, "
+                    "which are not prefix-cacheable, with prefix-cacheable "
+                    f"layers: layers={group.layer_names}"
+                )
             swa_in_group: list[str] = []
             for layer_name in group.layer_names:
                 if layer_name in self.runner.shared_kv_cache_layers:
@@ -330,9 +366,17 @@ class DsV4KVCacheAllocator:
             spec = per_layer_spec(layer_name)
             page_size = spec.num_states
             if layer_name.endswith(self._DS_V4_INDEXER_CACHE_SUFFIX):
-                # Lightning indexer: 128 fp8 values + 1 e8m0 scale per token,
-                # padded to a 256B record; 4 tokens per row.
-                shape = (num_blocks, page_size // packing, packing, 256)
+                # SEQ_ALONG_LANE: token t is lane t of 32 fp8 groups + 1
+                # e8m0 scale group (132B/token of key traffic); the
+                # compressor state still addresses the page as
+                # (33, 4, 256) rows, hence exactly 256 tokens per page.
+                compressor_config.check_seq_along_lane_page_size(page_size)
+                shape = (
+                    num_blocks,
+                    compressor_config.SAL_SUBLANE_GROUPS,
+                    packing,
+                    page_size,
+                )
                 kv_caches[layer_name] = _create_cache(shape, layer_name)
             elif spec.tokens_per_state == self._DS_V4_CSA_COMPRESS_RATIO:
                 # CSA is split across two arrays, for NoPE and RoPE.
@@ -409,6 +453,9 @@ class DsV4KVCacheAllocator:
             kv_caches[layer_name] = _host_at(overlay_hosts, position)
 
         self._validate_ds_v4_overlay(kv_cache_config, kv_caches)
+        self._refresh_ds_v4_request_caps(
+            kv_cache_config, swa_layer_groups, state_layer_names
+        )
 
         # SWA and HCA-state overlays are assigned by position *within a cache
         # group*, so the group shape decides how many arrays are needed: two
@@ -439,6 +486,74 @@ class DsV4KVCacheAllocator:
                 key=lambda shp: math.prod(shp),
                 default=(),
             ),
+        )
+
+    def _refresh_ds_v4_request_caps(
+        self,
+        kv_cache_config: KVCacheConfig,
+        swa_layer_groups: list[list[str]],
+        state_layer_names: list[str],
+    ) -> None:
+        """Set the requests-per-forward caps from the compressed-KV tables only.
+
+        The SWA kernels get each sequence's window pages and the compressor
+        kernel gets each token's state pages, so those groups' full block
+        tables never reach SMEM. This repeats
+        `TPUModelRunner._refresh_smem_request_caps` with those groups left
+        out, so it must run after the runner's own refresh.
+        """
+        # TODO(patemotter): give TPUModelRunner._refresh_smem_request_caps a
+        # way to skip groups whose kernels never copy their full block table
+        # into SMEM (for example a backend flag), then delete this copy.
+        runner = self.runner
+        groups = kv_cache_config.kv_cache_groups
+        exempt_layers = {name for group in swa_layer_groups for name in group}
+        exempt_layers.update(state_layer_names)
+        counted_gids = []
+        for gid, group in enumerate(groups):
+            own_layers = [
+                name
+                for name in group.layer_names
+                if name not in runner.shared_kv_cache_layers
+            ]
+            # A group is skipped only if every layer with its own cache is SWA
+            # or compressor state.
+            if not (own_layers and exempt_layers.issuperset(own_layers)):
+                counted_gids.append(gid)
+
+        def widest_table(model_len: int | None) -> int:
+            return max(
+                attention_block_table_width(
+                    runner.input_batch.block_table[gid],
+                    groups[gid].kv_cache_spec,
+                    runner.vllm_config,
+                    model_len,
+                )
+                for gid in counted_gids
+            )
+
+        runner.num_reqs_max_model_len = min(
+            PallasAttentionBackend.get_max_num_seqs_for_pages(widest_table(None)),
+            runner.max_num_reqs,
+            runner.max_num_tokens,
+        )
+        runner.num_reqs_most_model_len = None
+        if runner.most_model_len is not None:
+            pages = widest_table(runner.most_model_len)
+            runner.num_reqs_most_model_len = min(
+                PallasAttentionBackend.get_max_num_seqs_for_pages(pages),
+                runner.max_num_reqs,
+                runner.max_num_tokens,
+            )
+            runner.num_blocks_per_most_len_req = pages
+        runner._attention_capacity.clear()
+        runner._decode_device_cache_key = None
+        logger.info(
+            "DeepSeek-V4 requests per forward: %d (max_model_len), %s "
+            "(most_model_len), bounded by KV-cache groups %s",
+            runner.num_reqs_max_model_len,
+            runner.num_reqs_most_model_len,
+            counted_gids,
         )
 
     @staticmethod

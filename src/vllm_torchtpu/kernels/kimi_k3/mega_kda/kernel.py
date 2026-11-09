@@ -1,4 +1,17 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # Adapted from the private upstream repository primatrix/pallas-kernel.
 # Upstream contact: @pathfinder-pf.
 """Inference-only native segment-ID KDA forward Pallas kernel.
@@ -14,6 +27,7 @@ from __future__ import annotations
 
 import functools
 import math
+from typing import cast
 
 import jax
 import jax.numpy as jnp
@@ -333,7 +347,7 @@ def _fwd_mega_kernel_native_segids(
             else:
                 ref_decay = jnp.exp2(gn - prev_gn)
                 k_eng_prefix = jnp.concatenate(
-                    [k_eng_prefix * ref_decay, k_eng_current],
+                    [cast(jax.Array, k_eng_prefix) * ref_decay, k_eng_current],
                     axis=1,
                 )
             prev_gn = gn
@@ -365,7 +379,7 @@ def _fwd_mega_kernel_native_segids(
             L_rows.append(Akk_r)
 
         g_last = g_cumsum[:, BT - 1 : BT, :]
-        kg = k_eng_prefix * jnp.exp2(g_last - prev_gn)
+        kg = cast(jax.Array, k_eng_prefix) * jnp.exp2(g_last - prev_gn)
         Aqk = jnp.concatenate(Aqk_rows, axis=1)
         L = jnp.concatenate(L_rows, axis=1)
 
@@ -635,7 +649,7 @@ def _fwd_mega_kernel_native_segids(
             else:
                 ref_decay = jnp.exp2(gn - prev_gn)
                 k_eng_prefix = jnp.concatenate(
-                    [k_eng_prefix * ref_decay, k_eng_current],
+                    [cast(jax.Array, k_eng_prefix) * ref_decay, k_eng_current],
                     axis=1,
                 )
             prev_gn = gn
@@ -936,7 +950,7 @@ def _fwd_mega_kernel_native_segids(
             else:
                 ref_decay = jnp.exp2(gn - prev_gn)
                 k_eng_prefix = jnp.concatenate(
-                    [k_eng_prefix * ref_decay, k_eng_current],
+                    [cast(jax.Array, k_eng_prefix) * ref_decay, k_eng_current],
                     axis=1,
                 )
             prev_gn = gn
@@ -1444,6 +1458,7 @@ def _chunk_kda_fwd_native_segids_impl(
         A_scale_in = jnp.zeros((H, 1, 1, 1), dtype=jnp.float32)
 
     if use_gate_in_kernel and dt_bias is not None:
+        assert A_log is not None
         H_A = A_log.shape[0]
         n_rep = H // H_A
         db_2d = dt_bias.reshape(-1)[: H_A * K].reshape(H_A, K).astype(jnp.float32)

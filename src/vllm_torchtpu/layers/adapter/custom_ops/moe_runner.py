@@ -16,6 +16,9 @@
 from collections.abc import Callable
 
 from vllm.distributed.parallel_state import get_dp_group, get_ep_group
+from vllm.model_executor.layers.fused_moe.router.routing_simulator_router import (
+    RoutingSimulatorRouter,
+)
 from vllm.model_executor.layers.fused_moe.runner import moe_runner as _moe_runner
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 
@@ -25,6 +28,7 @@ from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.vllm_adapter import (
 )
 from vllm_torchtpu.layers.adapter import moe_routing
 from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
+from vllm_torchtpu.layers.adapter.moe_tp_decode import moe_tp_decode_supported
 
 # Taken once at import, outside any trace: the MoE forward is traced by
 # torch.compile, and reading the upstream property from inside the trace does
@@ -48,6 +52,12 @@ class VllmMoERunner(MoERunner):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._take_over_moe_quant_config_init()
+        if isinstance(self.router, RoutingSimulatorRouter):
+            # With VLLM_MOE_ROUTING_SIMULATION_STRATEGY set, the simulator
+            # replaces the logits before a monolithic kernel (or raises for
+            # strategies without monolithic support). The TPU MoE methods
+            # simulate routing themselves from the real logits (moe_routing).
+            self.router.prepare_monolithic_logits = lambda router_logits: router_logits
 
     def _take_over_moe_quant_config_init(self) -> None:
         routed_experts = self.routed_experts
@@ -103,6 +113,16 @@ class VllmMoERunner(MoERunner):
         # Not super()._fused_output_is_reduced: under torch.compile dynamo
         # reads that as truthy, and the routed output then skips its TP
         # all-reduce.
+        # A layer armed by fused_moe_decode reduces shared + routed itself.
+        if getattr(self, "_fused_moe_decode_armed", False) and not getattr(
+            self.moe_config, "skip_final_all_reduce", False
+        ):
+            return True
+        # A layer armed by moe_tp_decode reduces shared + routed in its op.
+        if moe_tp_decode_supported(self._quant_method) and not getattr(
+            self.moe_config, "skip_final_all_reduce", False
+        ):
+            return True
         if not envs.USE_MOE_FUSED_EP_KERNEL or getattr(
             self.moe_config, "skip_final_all_reduce", False
         ):

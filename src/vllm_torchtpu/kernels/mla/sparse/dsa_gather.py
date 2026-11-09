@@ -271,7 +271,7 @@ def dsa_gather(
         subcore_axis_name="subcore",
     )
     nope_out, rope_out = cast(
-        tuple[jax.Array, jax.Array],
+        Any,
         pl.kernel(
             functools.partial(
                 main_kernel,
@@ -300,7 +300,7 @@ def dsa_gather(
             mesh=vector_mesh,
             name="sc_dsa_gather",
         )(nope_cache, rope_cache, indices, valid_indices),
-    )
+    )  # pyrefly: ignore[not-iterable]
     return (
         nope_out.reshape(-1, word_bytes, tile_lane_bytes)[:out_size],
         rope_out[:out_size],

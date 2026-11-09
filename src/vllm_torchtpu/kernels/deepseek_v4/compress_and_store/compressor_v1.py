@@ -40,6 +40,7 @@ def derive_metadata(
     overlap: bool,
     cos_sin_cache: jax.Array | None,
     state_cache: jax.Array | None = None,
+    seq_along_lane: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Derives token_to_req_indices, slot_mapping_slots, and kv_slot_mapping.
 
@@ -70,11 +71,13 @@ def derive_metadata(
       cos_sin_cache: [max_pos, rope_head_dim] or None. RoPE cos/sin cache.
       state_cache: [num_pages, state_page_size, 4, lanes] uint8, or None when the
         state shares ``cache``'s buffer. Only its shape is read here.
+      seq_along_lane: ``cache`` is the SEQ_ALONG_LANE indexer array.
     Returns:
       token_to_req_indices: [num_tokens]. Request index for each token.
       slot_mapping_slots: [num_tokens]. Physical row index in the state cache.
       kv_slot_mapping: [num_tokens]. Sub-slot index in the compressed KV cache
-        (``// tokens_in_second_minor`` gives the physical row).
+        (``// tokens_in_second_minor`` gives the physical row; under
+        SEQ_ALONG_LANE it is ``page * SAL_PAGE_SIZE + lane``).
     """
     num_tokens = positions.shape[0]
     rope_head_dim = cos_sin_cache.shape[1] if cos_sin_cache is not None else 0
@@ -89,6 +92,7 @@ def derive_metadata(
         head_dim=head_dim,
         rope_head_dim=rope_head_dim,
         compress_ratio=compress_ratio,
+        seq_along_lane=seq_along_lane,
     )
     # Rows per page, rows per token's state, and the KV sub-slot packing.
     page_size = cfgs.state_physical_page_size
@@ -233,7 +237,7 @@ def compressor_forward(
     query_start_loc: jax.Array,  # [num_reqs + 1] int
     kv_block_table: jax.Array,  # [num_reqs * max_kv_blocks] int
     cache: jax.Array,  # [num_pages, page_size, 4, 128] u8 / CSA [..., 128] i32
-    rope_cache: jax.Array,  # CSA [num_pages, page_size // 4, 128] int32
+    rope_cache: jax.Array | None,  # CSA [num_pages, page_size // 4, 128] int32
     distribution: jax.Array,  # i32[3]
     state_block_size: int,
     head_dim: int,
@@ -242,7 +246,8 @@ def compressor_forward(
     rms_eps: float,
     quant_block: int,
     state_cache: jax.Array | None = None,  # [num_pages, state_page_size, 4, 128] uint8
-) -> tuple[jax.Array, jax.Array, jax.Array]:
+    seq_along_lane: bool = False,  # indexer only: `cache` is SEQ_ALONG_LANE
+) -> tuple[jax.Array, jax.Array | None, jax.Array]:
     """Projects, saves state, then compresses and stores the boundary records."""
     num_tokens = positions.shape[0]
     num_reqs = query_start_loc.shape[0] - 1
@@ -260,6 +265,7 @@ def compressor_forward(
         overlap=overlap,
         cos_sin_cache=cos_sin_cache,
         state_cache=state_cache,
+        seq_along_lane=seq_along_lane,
     )
 
     token_index = jnp.arange(num_tokens)
@@ -309,6 +315,7 @@ def compressor_forward(
         overlap=overlap,
         quant_block=quant_block,
         rms_eps=rms_eps,
+        seq_along_lane=seq_along_lane,
     )
 
     if shares_buffer:

@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Widened RPAd buckets must respect runtime lengths and preserve paged KV."""
 
 import jax
@@ -7,6 +19,8 @@ import numpy as np
 import pytest
 
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs, wrapper
+
+pytestmark = pytest.mark.tpu_test
 
 
 @pytest.mark.parametrize(
@@ -129,7 +143,7 @@ def test_ragged_verify_matches_reference_and_preserves_cache(
 
 
 def _lse_combine(out_a, lse_a, out_b, lse_b):
-    """numpy twin of cp_attention.lse_weighted_combine (handles -inf lse)."""
+    """numpy twin of cp_attention.merge_attn_results (handles -inf lse)."""
     m = np.maximum(lse_a, lse_b)
     m_finite = np.isfinite(m)
     m_safe = np.where(m_finite, m, 0.0)

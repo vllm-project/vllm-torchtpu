@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Raiden pool manifests for hybrid KV caches.
 
 Raiden's admission surface is model-agnostic (storages / pools / regions, see
@@ -389,31 +401,14 @@ def _gdn_conv_regions(
     row_stride = local_dim * itemsize
     key_bytes = geometry.key_head_dim * itemsize
     value_bytes = geometry.value_head_dim * itemsize
-    qk_bytes = 2 * geometry.local_key_heads * key_bytes
     if tpu_envs.TPU_GDN_CONV_QK_PAIR_LAYOUT:
-        # QK pair-blocked layout: the rank-local Q and K rows share whole
-        # pool tokens ([Q-pair, K-pair] per token), so the transferable
-        # unit is the combined QK block followed by the V block — two
-        # contiguous extents per tap.  Full-width states store the rank
-        # blocks in rank order, which the pooled kernel's rows_perm maps
-        # back to the logical [Q | K | V] row order.
-        return (
-            RegionSpec(
-                name="gdn_conv_qk",
-                offset_bytes=0,
-                stride_bytes=row_stride,
-                unit_bytes=qk_bytes,
-                num_units=taps,
-                units_per_stride=1,
-            ),
-            RegionSpec(
-                name="gdn_conv_v",
-                offset_bytes=qk_bytes,
-                stride_bytes=row_stride,
-                unit_bytes=value_bytes,
-                num_units=taps,
-                units_per_stride=geometry.local_value_heads,
-            ),
+        # The pooled GDN kernel reads conv rows in [Q | K | V] order with
+        # no row permutation, so a pair-blocked transfer would mix up Q and
+        # K channels. With fp32 conv, each rank's Q and K slices are whole
+        # 1,024-B tiles up to an 8-way head split.
+        raise ManifestError(
+            "TPU_GDN_CONV_QK_PAIR_LAYOUT is not readable by the pooled GDN "
+            "kernel; unset it to use the per-segment conv layout"
         )
     q_offset = 0
     k_offset = geometry.local_key_heads * key_bytes
@@ -467,6 +462,29 @@ def _gdn_ssm_regions(
     )
 
 
+def gdn_state_unit_bytes(manifest: PoolManifest) -> dict[str, int]:
+    """Per-head byte width of each GDN state region, keyed by region name.
+
+    A region's unit is one head's slice (per tap for the conv regions), so
+    the widths follow the state dtypes and head dims but not how the heads
+    are sharded: a producer and its differently sharded consumers agree,
+    while peers on different conv or SSM state dtypes do not. Empty when the
+    manifest holds no GDN state.
+    """
+    widths: dict[str, int] = {}
+    for pool in manifest.pools:
+        if not pool.tag.startswith((TAG_GDN_CONV, TAG_GDN_SSM)):
+            continue
+        for region in pool.regions:
+            width = int(region.unit_bytes)
+            if widths.setdefault(region.name, width) != width:
+                raise ManifestError(
+                    f"GDN pools disagree on the {region.name} unit width: "
+                    f"{widths[region.name]} vs {width}"
+                )
+    return dict(sorted(widths.items()))
+
+
 # ---------------------------------------------------------------------------
 # Manifest builder.
 # ---------------------------------------------------------------------------
@@ -491,7 +509,7 @@ def _pooled_gdn_state_views(
     """Derive logical ``(conv, ssm)`` descriptors from a unified raw pool.
 
     The state geometry is tied to the pooled GDN kernel's byte model
-    (``gdn_pool_layout`` — the same helpers ``_build_v3_pool_state_plan``
+    (``gdn_pool_layout`` — the same helpers the pooled slot sizing
     uses), NOT to the layer's declared MambaSpec shapes or Conv dtype.  The
     pooled kernel never reads those declarations, so only the kernel model
     describes the geometry and Conv bytes that actually move; a declaration
@@ -774,6 +792,7 @@ def build_qwen35_pool_manifest(
     per_layer_tags: bool = False,
     fa_layout: FaLayoutHook | None = None,
     block_major: BlockMajorPoolLayout | None = None,
+    layer_index_by_name: Mapping[str, int] | None = None,
 ) -> PoolManifest:
     """Builds the canonical pool manifest from the live materialization.
 
@@ -785,6 +804,11 @@ def build_qwen35_pool_manifest(
     (``fa.l3``, ``gdn.conv.g0.l0`` ...) so pools pair up by layer: a
     pipeline-parallel producer registers only its own layers, and the
     controller matches each of them to the same layer on the destination.
+
+    ``layer_index_by_name`` overrides the layer index parsed from a cache's
+    name. An MTP draft layer (``mtp.layers.0``) is given an index after the
+    target's layers, so it orders and tags after them instead of colliding
+    with the target's layer of the same local index.
 
     ``mamba_group_ordinal_by_layer`` (opt-in, state-reshard deployments):
     suffixes GDN pool tags with the layer's mamba kv-cache-group ordinal
@@ -807,7 +831,7 @@ def build_qwen35_pool_manifest(
 
     # Flatten to (pool key, typed/logical tensor) in canonical order.
     flat: list[tuple[str, str, Any]] = []  # (tag, layer_name, tensor)
-    for layer_name in _ordered_layers(named_kv_caches):
+    for layer_name in _ordered_layers(named_kv_caches, layer_index_by_name):
         cache = named_kv_caches[layer_name]
         placement = None
         if block_major is not None:
@@ -862,7 +886,7 @@ def build_qwen35_pool_manifest(
     if per_layer_tags:
         tagged = []
         for tag, layer_name, tensor in flat:
-            layer_index = layer_index_from_name(layer_name)
+            layer_index = _pool_layer_index(layer_name, layer_index_by_name)
             if layer_index is None:
                 raise ManifestError(
                     f"per-layer pool tags need a layer index in {layer_name}"
@@ -1002,8 +1026,12 @@ def build_kimi_k3_pool_manifest(
                 f"Kimi cache {layer_name} has invalid packed-row geometry"
             )
         declared_block_size = getattr(spec, "block_size", None)
+        # Attention blocks count stored tokens. A Mamba block describes a
+        # logical sequence interval, not the row capacity of its state page.
+        # Validate state capacity through page bytes and _pooled_kda_regions.
         if (
-            declared_block_size is not None
+            not is_state
+            and declared_block_size is not None
             and int(declared_block_size) != rows * packing
         ):
             raise ManifestError(
@@ -1047,14 +1075,25 @@ def build_kimi_k3_pool_manifest(
     return _bind_pool_manifest(entries, raw_tensors)
 
 
-def _ordered_layers(named_kv_caches: Mapping[str, Any]) -> list[str]:
+def _pool_layer_index(
+    layer_name: str, layer_index_by_name: Mapping[str, int] | None
+) -> int | None:
+    if layer_index_by_name and layer_name in layer_index_by_name:
+        return int(layer_index_by_name[layer_name])
+    return layer_index_from_name(layer_name)
+
+
+def _ordered_layers(
+    named_kv_caches: Mapping[str, Any],
+    layer_index_by_name: Mapping[str, int] | None = None,
+) -> list[str]:
     if not named_kv_caches:
         raise ManifestError("named_kv_caches is empty")
     return sorted(
         named_kv_caches,
         key=lambda name: (
-            layer_index_from_name(name) is None,
-            layer_index_from_name(name) or 0,
+            _pool_layer_index(name, layer_index_by_name) is None,
+            _pool_layer_index(name, layer_index_by_name) or 0,
             str(name),
         ),
     )
@@ -1152,7 +1191,7 @@ def materialize_storages(manifest: PoolManifest) -> None:
         if hasattr(storage, "cpu"):
             try:  # noqa: SIM105 (non-torch test fakes)
                 storage[:1].cpu()
-            except Exception:  # pragma: no cover - non-torch fakes
+            except Exception:  # pragma: no cover - non-torch fakes  # noqa: S110
                 pass
 
 
@@ -1301,13 +1340,24 @@ def build_glm_mla_pool_manifest(
     for tag, layer_name, dtype_tag, tensor in flat:
         nbytes = _nbytes(tensor)
         shape = tuple(int(dim) for dim in getattr(tensor, "shape", ()))
-        if len(shape) != 4:
+        itemsize = _element_size(tensor)
+        if len(shape) == 4:
+            num_blocks, rows, packing, width = shape
+            tokens_per_row = packing
+        elif (
+            len(shape) == 3
+            and itemsize == 4
+            and class_tag(tag) in (TAG_MLA_NOPE, TAG_MLA_ROPE)
+        ):
+            num_blocks, rows, width = shape
+            packing = 1
+            tokens_per_row = block_size_tokens // rows if rows > 0 else 0
+        else:
             raise ManifestError(
-                f"cache {layer_name} must be [blocks, rows, packing, width]: "
+                f"cache {layer_name} must be [blocks, rows, packing, width] "
+                "(or a SparseCore uint32 [blocks, rows, words] MLA cache): "
                 f"got shape {shape}"
             )
-        num_blocks, rows, packing, width = shape
-        itemsize = _element_size(tensor)
         if num_blocks <= 0 or nbytes % num_blocks != 0:
             raise ManifestError(
                 f"cache {layer_name} nbytes {nbytes} is not divisible by "
@@ -1321,9 +1371,9 @@ def build_glm_mla_pool_manifest(
                     f"cache {layer_name} nope rows {rows} do not match the "
                     f"KV block size {block_size_tokens}"
                 )
-        elif rows * packing != block_size_tokens:
+        elif rows * tokens_per_row != block_size_tokens:
             raise ManifestError(
-                f"cache {layer_name} rows*packing {rows}*{packing} does not "
+                f"cache {layer_name} rows*packing {rows}*{tokens_per_row} does not "
                 f"match the KV block size {block_size_tokens}"
             )
         # The packing axis must fill one 32-bit word (see the layout
@@ -1373,6 +1423,7 @@ def build_glm_mla_pool_manifest(
 DSV4_STATE_CACHE_SUFFIX = ".compressor.state_cache"
 DSV4_INDEXER_CACHE_SUFFIX = ".indexer.k_cache"
 DSV4_CSA_COMPRESS_RATIO = 4
+DSV4_IDX_SAL_ROWS = 33
 
 _DSV4_STATE_TAG_BY_KV_TAG = {
     TAG_DSV4_CSA_NOPE: TAG_DSV4_STATE_CSA,
@@ -1577,7 +1628,7 @@ def _dsv4_check_role_rows(
     if kv_tag == TAG_DSV4_CSA_NOPE:
         expected = {"nope": tokens, "rope": tokens // DSV4_CSA_COMPRESS_RATIO}
     elif kv_tag == TAG_DSV4_IDX:
-        expected = {"k_cache": tokens // DSV4_CSA_COMPRESS_RATIO}
+        expected = {"k_cache": DSV4_IDX_SAL_ROWS}
     else:
         expected = {"latents": tokens * 2}
     for (role, rows), array in zip(expected.items(), arrays):

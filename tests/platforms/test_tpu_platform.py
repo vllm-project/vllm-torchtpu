@@ -25,6 +25,7 @@ import torch
 from vllm.config import (
     CacheConfig,
     KVTransferConfig,
+    LoRAConfig,
     ModelConfig,
     ParallelConfig,
     VllmConfig,
@@ -33,6 +34,7 @@ from vllm.config.compilation import DynamicShapesType
 from vllm.model_executor.layers.attention import Attention
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine.core import EngineCoreProc
+from vllm.v1.engine.input_processor import InputProcessor
 
 import vllm_torchtpu as plugin
 import vllm_torchtpu.platforms.tpu_platform as tpu_platform
@@ -43,9 +45,58 @@ from vllm_torchtpu.platforms.tpu_platform import (
     TPU_3D_TORUS_MULTIHOST_TOPOLOGY_MAP,
     TPU_8I_MULTIHOST_TOPOLOGY_MAP,
     TpuPlatform,
+    _validate_lora_config,
+    _validate_peer_replay_config,
     _validate_phased_profiling_config,
     get_tpu_multihost_topology,
 )
+
+
+@pytest.mark.parametrize(
+    "hybrid,unified,resumable,blocked",
+    [
+        (True, False, True, True),
+        (True, False, False, False),
+        (True, True, True, False),
+        (False, False, True, False),
+    ],
+)
+@pytest.mark.parametrize("positional", [False, True])
+@pytest.mark.parametrize("connector", [None, "DecodeBenchConnector", "RaidenConnector"])
+def test_compact_mamba_rejects_resumable_input_before_admission(
+    monkeypatch, hybrid, unified, resumable, blocked, positional, connector
+):
+    calls = []
+
+    def process_inputs(self, request_id, resumable=False):
+        calls.append(request_id)
+        return request_id
+
+    monkeypatch.setattr(InputProcessor, "process_inputs", process_inputs)
+    monkeypatch.setattr(
+        "vllm_torchtpu.platforms.tpu_block_size_utils.unified_kv_layout_enabled",
+        lambda config: unified,
+    )
+    plugin._patch_vllm_compact_mamba_streaming_input()
+    wrapped = InputProcessor.process_inputs
+    plugin._patch_vllm_compact_mamba_streaming_input()
+    assert InputProcessor.process_inputs is wrapped
+    processor = object.__new__(InputProcessor)
+    processor.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(is_hybrid=hybrid),
+        kv_transfer_config=(
+            SimpleNamespace(kv_connector=connector) if connector is not None else None
+        ),
+    )
+    args = ("request", resumable) if positional else ("request",)
+    kwargs = {} if positional else {"resumable": resumable}
+    if blocked and connector != "RaidenConnector":
+        with pytest.raises(ValueError, match="resumable.*compact Mamba"):
+            processor.process_inputs(*args, **kwargs)
+        assert calls == []
+    else:
+        assert processor.process_inputs(*args, **kwargs) == "request"
+        assert calls == ["request"]
 
 
 def test_grouped_topk_dynamic_compile_wrapper_is_unwrapped(monkeypatch):
@@ -80,8 +131,13 @@ def test_scheduler_mamba_split_accepts_external_kv_tokens():
         cache_config=SimpleNamespace(block_size=16),
         block_size=16,
         use_eagle=False,
+        use_eagle_block_drop=False,
+        num_hash_lookahead_tokens=0,
         mamba_partial_cache_hit=False,
         mamba_has_prefill_checkpoint_blocks=False,
+        mamba_shared_prefix_checkpoint=False,
+        max_num_scheduled_tokens=16384,
+        scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
         hash_block_size=16,
     )
     request = SimpleNamespace(
@@ -230,7 +286,10 @@ class TestTpuPlatform:
         vllm_config.model_config = MagicMock(spec=ModelConfig)
         vllm_config.model_config.dtype = torch.bfloat16
         vllm_config.model_config.is_hybrid = False
+        vllm_config.model_config.is_attention_free = False
         vllm_config.model_config.hf_config = None
+        # Set in ModelConfig.__post_init__, so the spec has no such attribute.
+        vllm_config.model_config.runner_type = "generate"
         vllm_config.cache_config = CacheConfig()
         vllm_config.cache_config.block_size = None
         vllm_config.cache_config.enable_prefix_caching = False
@@ -239,11 +298,17 @@ class TestTpuPlatform:
         vllm_config.compilation_config.mode = MagicMock()
         vllm_config.compilation_config.compile_sizes = [16, 32]
         vllm_config.scheduler_config = MagicMock()
-        vllm_config.scheduler_config.max_num_batched_tokens = 2048
+        # Within the largest compile size, which the platform requires.
+        vllm_config.scheduler_config.max_num_batched_tokens = 32
+        vllm_config.scheduler_config.max_num_seqs = 16
+        vllm_config.scheduler_config.max_num_scheduled_tokens = None
+        vllm_config.scheduler_config.enable_chunked_prefill = True
         vllm_config.scheduler_config.is_multimodal_model = False
         vllm_config.scheduler_config.async_scheduling = False
         vllm_config.speculative_config = None
+        vllm_config.lora_config = None
         vllm_config.parallel_config = MagicMock()
+        vllm_config.parallel_config.prefill_context_parallel_size = 1
         vllm_config.parallel_config.nnodes = 1
         vllm_config.parallel_config.node_rank = 0
         vllm_config.parallel_config.world_size = 1
@@ -353,6 +418,18 @@ class TestTpuPlatform:
             vllm_config.kv_transfer_config = MagicMock()
             assert unified_kv_layout_enabled(vllm_config)
 
+    @pytest.mark.parametrize("method", ["block", "fly"])
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_check_and_update_config_rejects_unsupported_rejection_sampling(
+        self, mock_prepare_env, mock_apply_patches, vllm_config, method
+    ):
+        vllm_config.speculative_config = MagicMock(rejection_sample_method=method)
+        with pytest.raises(NotImplementedError, match="rejection_sample_method"):
+            TpuPlatform.check_and_update_config(vllm_config)
+
     @pytest.mark.parametrize(
         ("mamba_cache_mode", "speculative_config", "async_scheduling", "message"),
         [
@@ -426,6 +503,45 @@ class TestTpuPlatform:
         else:
             TpuPlatform.check_and_update_config(vllm_config)
 
+    @pytest.mark.parametrize("batched_rpa", [True, False])
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_registered_attention_backend_class_sets_the_kv_cache_layout(
+        self,
+        mock_prepare_env,
+        mock_apply_patches,
+        vllm_config,
+        monkeypatch,
+        batched_rpa,
+    ):
+        from vllm_torchtpu.layers.adapter import attention_backend
+        from vllm_torchtpu.layers.adapter.attention import (
+            PallasBatchedRPAAttentionBackend,
+            PallasMLAttentionBackend,
+        )
+
+        # Only batched RPA lays out HND, so passing shows its layouts were used.
+        monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "HND")
+        monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "fork")
+        monkeypatch.setattr(attention_backend, "_REGISTERED_BACKENDS", {"tpu_test"})
+        backend = (
+            PallasBatchedRPAAttentionBackend
+            if batched_rpa
+            else PallasMLAttentionBackend
+        )
+        vllm_config.attention_config.backend = SimpleNamespace(
+            name="TPU_TEST", get_class=lambda: backend
+        )
+        vllm_config.model_config.get_head_size = lambda: 128
+
+        if batched_rpa:
+            TpuPlatform.check_and_update_config(vllm_config)
+        else:
+            with pytest.raises(TypeError, match="not a PallasAttentionBackend"):
+                TpuPlatform.check_and_update_config(vllm_config)
+
     @patch.dict("os.environ", {"TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL": "0"})
     @patch("vllm_torchtpu.patch_registry.apply")
     @patch(
@@ -443,6 +559,47 @@ class TestTpuPlatform:
         vllm_config.cache_config.mamba_cache_mode = "align"
 
         with pytest.raises(NotImplementedError, match="unified KV pool"):
+            TpuPlatform.check_and_update_config(vllm_config)
+
+    @pytest.mark.parametrize(
+        ("enable_prefix_caching", "connector", "should_raise"),
+        [
+            (True, None, True),
+            (False, None, False),
+            (True, "DecodeBenchConnector", False),
+        ],
+    )
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_check_and_update_config_rejects_attention_free_apc(
+        self,
+        mock_prepare_env,
+        mock_apply_patches,
+        vllm_config,
+        enable_prefix_caching,
+        connector,
+        should_raise,
+    ):
+        vllm_config.model_config.is_attention_free = True
+        vllm_config.cache_config.block_size = 16
+        vllm_config.cache_config.enable_prefix_caching = enable_prefix_caching
+        if connector is not None:
+            vllm_config.kv_transfer_config = KVTransferConfig(
+                kv_connector=connector, kv_role="kv_both"
+            )
+
+        if should_raise:
+            with pytest.raises(
+                NotImplementedError,
+                match=(
+                    "Prefix caching on attention-free models is not yet "
+                    "supported on TPU; run with --no-enable-prefix-caching"
+                ),
+            ):
+                TpuPlatform.check_and_update_config(vllm_config)
+        else:
             TpuPlatform.check_and_update_config(vllm_config)
 
     @patch.dict("os.environ", {"TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL": "0"})
@@ -526,6 +683,7 @@ class TestTpuPlatform:
         expected_type,
     ):
         vllm_config.compilation_config.compile_sizes = compile_sizes
+        vllm_config.scheduler_config.max_num_batched_tokens = max(compile_sizes)
         vllm_config.compilation_config.dynamic_shapes_config.type = shapes_type
 
         TpuPlatform.check_and_update_config(vllm_config)
@@ -533,6 +691,98 @@ class TestTpuPlatform:
         assert (
             vllm_config.compilation_config.dynamic_shapes_config.type == expected_type
         )
+
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_check_and_update_config_rejects_budget_above_compile_sizes(
+        self, mock_prepare_env, mock_apply_patches, vllm_config
+    ):
+        # A step of up to 2048 tokens would have no compile size to pad to.
+        vllm_config.scheduler_config.max_num_batched_tokens = 2048
+
+        with pytest.raises(ValueError, match=r"--max-num-batched-tokens \(2048\)"):
+            TpuPlatform.check_and_update_config(vllm_config)
+
+        assert vllm_config.scheduler_config.max_num_batched_tokens == 2048
+        assert vllm_config.scheduler_config.max_num_scheduled_tokens is None
+
+    @pytest.mark.parametrize(
+        "compile_sizes",
+        [["cudagraph_capture_sizes"], [16, "cudagraph_capture_sizes"]],
+    )
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_check_and_update_config_rejects_string_compile_sizes(
+        self, mock_prepare_env, mock_apply_patches, vllm_config, compile_sizes
+    ):
+        # TPU never expands vLLM's "cudagraph_capture_sizes" placeholder.
+        vllm_config.compilation_config.compile_sizes = compile_sizes
+
+        with pytest.raises(ValueError, match="compile_sizes entries must be integers"):
+            TpuPlatform.check_and_update_config(vllm_config)
+
+    @pytest.mark.parametrize(
+        ("linear", "max_model_len", "added"),
+        [
+            (False, 32768, []),
+            # budget/32 = 64 rows would be 23 buckets above budget/4; the
+            # step widens to 4 * 64 to stay within seven.
+            (True, 32768, [768, 1280, 1536, 1792]),
+            # Up to the longest prompt pass, 1000 + 8 rounded up to 1024:
+            # eight 64-row buckets, so 128 rows.
+            (True, 1000, [640, 768, 896]),
+        ],
+    )
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_linear_token_buckets(
+        self,
+        mock_prepare_env,
+        mock_apply_patches,
+        vllm_config,
+        monkeypatch,
+        linear,
+        max_model_len,
+        added,
+    ):
+        monkeypatch.setenv("TPU_TOKEN_BUCKET_LINEAR", "1" if linear else "0")
+        vllm_config.compilation_config.compile_sizes = None
+        vllm_config.model_config.max_model_len = max_model_len
+        vllm_config.scheduler_config.max_num_batched_tokens = 2048
+        vllm_config.scheduler_config.max_num_seqs = 8
+
+        TpuPlatform.check_and_update_config(vllm_config)
+
+        ladder = [16, 32, 64, 128, 256, 512, 1024, 2048]
+        assert vllm_config.compilation_config.compile_sizes == sorted(ladder + added)
+
+    def test_linear_token_step_at_the_served_budget(self):
+        paddings = tpu_platform._get_linear_token_paddings(16384, 262144 + 8)
+
+        assert paddings == list(range(6144, 16385, 2048))
+
+    def test_linear_token_buckets_for_tp8_qwen35_mtp(self):
+        # The TP8 Qwen3.5 recipe: 16384-token budget, max_model_len 10240,
+        # 64 seqs. 512-row buckets were 13 (4608..10752) and OOMed the
+        # 512 GiB pod precompiling under MTP; 1024 rows keep it to seven,
+        # six of them new beside the power-of-two 8192.
+        paddings = tpu_platform._get_linear_token_paddings(16384, 10240 + 64)
+
+        assert paddings == list(range(5120, 11265, 1024))
+
+    @pytest.mark.parametrize("budget", [256, 2048, 8192, 16384, 65536])
+    def test_linear_token_buckets_are_capped(self, budget):
+        for longest_pass in range(16, 4 * budget, max(1, budget // 61)):
+            paddings = tpu_platform._get_linear_token_paddings(budget, longest_pass)
+
+            assert len(paddings) <= tpu_platform._MAX_LINEAR_BUCKETS
+            assert all(budget // 4 < p <= budget for p in paddings)
 
     @pytest.mark.parametrize(
         ("is_hybrid", "pool_env", "expect_error"),
@@ -585,6 +835,51 @@ class TestTpuPlatform:
             else:
                 TpuPlatform.check_and_update_config(vllm_config)
 
+    @pytest.mark.parametrize(
+        ("model_dtype", "lora_dtype"),
+        [
+            # vLLM resolves lora_dtype "auto" to the model dtype.
+            (torch.float16, torch.float16),
+            (torch.float32, torch.float32),
+            # Set by hand to a dtype other than the model dtype.
+            (torch.float32, torch.float16),
+            # Set by hand to the dtype the model runs in on TPU.
+            (torch.float16, torch.bfloat16),
+        ],
+    )
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_check_and_update_config_runs_lora_in_bfloat16(
+        self, mock_prepare_env, mock_apply_patches, vllm_config, model_dtype, lora_dtype
+    ):
+        """The TPU runs a float16 or float32 model in bfloat16; its LoRA weights
+        must follow, or the first forward fails on the LoRA dtype check."""
+        vllm_config.model_config.dtype = model_dtype
+        vllm_config.model_config.is_moe = False
+        vllm_config.lora_config = LoRAConfig(lora_dtype=lora_dtype)
+
+        TpuPlatform.check_and_update_config(vllm_config)
+
+        assert vllm_config.model_config.dtype == torch.bfloat16
+        assert vllm_config.lora_config.lora_dtype == torch.bfloat16
+
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_check_and_update_config_rejects_unsupported_lora(
+        self, mock_prepare_env, mock_apply_patches, vllm_config
+    ):
+        vllm_config.model_config.is_moe = False
+        vllm_config.lora_config = LoRAConfig(
+            lora_dtype=torch.bfloat16, fully_sharded_loras=True
+        )
+
+        with pytest.raises(ValueError, match="LoRA on TPU"):
+            TpuPlatform.check_and_update_config(vllm_config)
+
     @patch("vllm_torchtpu.patch_registry.apply")
     @patch(
         "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
@@ -620,6 +915,40 @@ class TestTpuPlatform:
         TpuPlatform.check_and_update_config(vllm_config)
 
         assert vllm_config.scheduler_config.disable_chunked_mm_input is False
+
+    @pytest.mark.parametrize(
+        ("initial_cls", "expected_cls"),
+        [
+            (None, "vllm_torchtpu.core.tpu_scheduler.TpuDpScheduler"),
+            (
+                "vllm_torchtpu.core.experimental.srpt_prefill_scheduler.SrptPrefillScheduler",
+                "vllm_torchtpu.core.experimental.srpt_prefill_scheduler.SrptPrefillScheduler",
+            ),
+        ],
+    )
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_dp_sched_respects_custom_scheduler_cls(
+        self,
+        mock_prepare_env,
+        mock_apply_patches,
+        vllm_config,
+        monkeypatch,
+        initial_cls,
+        expected_cls,
+    ):
+        monkeypatch.setattr(tpu_platform.envs, "DP_SCHED_ENABLED", True)
+        vllm_config.cache_config.block_size = 16
+        vllm_config.parallel_config.data_parallel_size = 2
+        vllm_config.parallel_config.data_parallel_size_local = 2
+        vllm_config.parallel_config.data_parallel_master_ip = ""
+        vllm_config.scheduler_config.scheduler_cls = initial_cls
+
+        TpuPlatform.check_and_update_config(vllm_config)
+
+        assert vllm_config.scheduler_config.scheduler_cls == expected_cls
 
     def test_get_tpu_multihost_topology(self, monkeypatch):
         # Test env override via TORCH_TPU_TOPOLOGY
@@ -697,7 +1026,7 @@ class TestTpuPlatform:
             ("TPU v8i", "TPU v8i"),
         ],
     )
-    @patch("jax.devices")
+    @patch("jax.local_devices")
     def test_get_device_name(self, mock_devices, raw_kind, expected_name):
         """Tests get_device_name across TPU generations."""
         mock_dev = MagicMock()
@@ -743,6 +1072,89 @@ class TestPhasedProfilingConfigValidation:
         monkeypatch.delenv("USE_PHASED_PROFILER", raising=False)
 
         _validate_phased_profiling_config(self._config())
+
+
+class TestLoRAConfigValidation:
+    """LoRA runs on a single chip with a dense generative model and no
+    speculative decoding; any other setting is rejected at startup, by name."""
+
+    @staticmethod
+    def _config(
+        *,
+        is_moe=False,
+        runner_type="generate",
+        speculative_config=None,
+        lora=None,
+        **parallel,
+    ):
+        # By the time the platform hook runs, verify_with_model_config has
+        # resolved lora_dtype "auto" to the model dtype.
+        lora = {"lora_dtype": torch.bfloat16, **(lora or {})}
+        return SimpleNamespace(
+            lora_config=LoRAConfig(**lora),
+            model_config=SimpleNamespace(
+                is_moe=is_moe, runner_type=runner_type, dtype=torch.bfloat16
+            ),
+            parallel_config=ParallelConfig(**parallel),
+            speculative_config=speculative_config,
+        )
+
+    @pytest.mark.parametrize(
+        "lora", [{}, {"default_mm_loras": {"image": "/adapters/image"}}]
+    )
+    def test_single_chip_dense_model_passes(self, lora):
+        _validate_lora_config(self._config(lora=lora))
+
+    def test_without_lora_nothing_is_checked(self):
+        config = self._config(tensor_parallel_size=2)
+        config.lora_config = None
+
+        _validate_lora_config(config)
+
+    @pytest.mark.parametrize(
+        "kwargs,setting",
+        [
+            ({"tensor_parallel_size": 2}, "tensor_parallel_size > 1"),
+            ({"data_parallel_size": 2}, "data_parallel_size > 1"),
+            ({"pipeline_parallel_size": 2}, "pipeline_parallel_size > 1"),
+            (
+                {"prefill_context_parallel_size": 2},
+                "prefill_context_parallel_size > 1",
+            ),
+            # DCP has to divide TP.
+            (
+                {"tensor_parallel_size": 2, "decode_context_parallel_size": 2},
+                "decode_context_parallel_size > 1",
+            ),
+            ({"speculative_config": object()}, "speculative decoding"),
+            ({"is_moe": True}, "MoE models"),
+            ({"runner_type": "pooling"}, "pooling models"),
+            ({"lora": {"fully_sharded_loras": True}}, "fully_sharded_loras"),
+            (
+                {"lora": {"enable_tower_connector_lora": True}},
+                "enable_tower_connector_lora",
+            ),
+            (
+                {"lora": {"lora_dtype": torch.float16}},
+                "lora_dtype torch.float16 differing from the model dtype "
+                "torch.bfloat16",
+            ),
+        ],
+    )
+    def test_unsupported_setting_is_named(self, kwargs, setting):
+        with pytest.raises(ValueError, match=setting):
+            _validate_lora_config(self._config(**kwargs))
+
+    def test_every_unsupported_setting_is_listed(self):
+        config = self._config(
+            tensor_parallel_size=2, lora={"lora_dtype": torch.float16}
+        )
+
+        with pytest.raises(ValueError) as excinfo:
+            _validate_lora_config(config)
+
+        assert "tensor_parallel_size > 1" in str(excinfo.value)
+        assert "lora_dtype torch.float16" in str(excinfo.value)
 
 
 def test_config_hook_registers_tpu_kv_connectors_by_name():
@@ -917,6 +1329,7 @@ def test_qwen_import_failure_leaves_targets_unchanged(monkeypatch):
     assert torch.cumsum is original_cumsum
 
 
+@pytest.mark.tpu_test
 class TestQwen3VLModelPatches:
     """Tests for Qwen3-VL platform and model-level patches."""
 
@@ -1117,3 +1530,87 @@ def test_dp_forward_context_keeps_host_sizes_before_device_upload(monkeypatch):
     sizes.fill_(99)
     assert additional["tpu_num_tokens_across_dp_cpu"] == (0, 2048)
     assert TpuPlatform.set_additional_forward_context() == {}
+
+
+def test_tpu_platform_accelerator_methods(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(torch.accelerator, "is_available", lambda: True)
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
+    monkeypatch.setattr(
+        torch.accelerator,
+        "set_device_index",
+        lambda dev: calls.append(("set_device_index", dev)),
+    )
+    monkeypatch.setattr(
+        torch.accelerator,
+        "synchronize",
+        lambda dev=None: calls.append(("synchronize", dev)),
+    )
+    fake_stream = object()
+    monkeypatch.setattr(
+        torch.accelerator, "current_stream", lambda dev=None: fake_stream
+    )
+    monkeypatch.setattr(
+        torch.accelerator,
+        "set_stream",
+        lambda s: calls.append(("set_stream", s)),
+    )
+
+    assert TpuPlatform.is_available() is True
+    assert TpuPlatform.current_device() == 0
+    assert TpuPlatform.current_device_index() == 0
+
+    TpuPlatform.set_device(0)
+    assert calls[-1] == ("set_device_index", 0)
+
+    TpuPlatform.set_device_index(1)
+    assert calls[-1] == ("set_device_index", 1)
+
+    TpuPlatform.synchronize()
+    assert calls[-1] == ("synchronize", None)
+
+    TpuPlatform.synchronize(0)
+    assert calls[-1] == ("synchronize", 0)
+
+    assert TpuPlatform.current_stream() is fake_stream
+
+    TpuPlatform.set_stream(fake_stream)
+    assert calls[-1] == ("set_stream", fake_stream)
+
+
+@pytest.mark.parametrize(
+    "parallel, peer_replay, disable_cache, raises",
+    [
+        ("1", "1", "1", True),
+        ("1", "1", "0", False),
+        ("1", "0", "1", False),
+        ("0", "1", "1", False),  # peer replay only acts under parallel precompile
+    ],
+)
+def test_peer_replay_requires_the_compile_cache(
+    monkeypatch, parallel, peer_replay, disable_cache, raises
+):
+    """TPU_PRECOMPILE_PEER_REPLAY hands ranges over through vLLM's compile
+    cache, so turning it on with VLLM_DISABLE_COMPILE_CACHE=1 fails at startup
+    instead of doing nothing."""
+    monkeypatch.setenv("TPU_PARALLEL_PRECOMPILE", parallel)
+    monkeypatch.setenv("TPU_PRECOMPILE_PEER_REPLAY", peer_replay)
+    monkeypatch.setenv("VLLM_DISABLE_COMPILE_CACHE", disable_cache)
+    if raises:
+        with pytest.raises(ValueError, match="VLLM_DISABLE_COMPILE_CACHE"):
+            _validate_peer_replay_config()
+    else:
+        _validate_peer_replay_config()
+
+
+@pytest.mark.parametrize("wait", ["-1", "nan", "soon"])
+def test_a_bad_peer_wait_fails_at_startup(monkeypatch, wait):
+    """TPU_PRECOMPILE_PEER_WAIT_S is first read by the precompile, after the
+    model has loaded; the startup check parses it so a typo fails the launch."""
+    monkeypatch.setenv("TPU_PARALLEL_PRECOMPILE", "1")
+    monkeypatch.setenv("TPU_PRECOMPILE_PEER_REPLAY", "1")
+    monkeypatch.setenv("VLLM_DISABLE_COMPILE_CACHE", "0")
+    monkeypatch.setenv("TPU_PRECOMPILE_PEER_WAIT_S", wait)
+    with pytest.raises(ValueError, match="TPU_PRECOMPILE_PEER_WAIT_S"):
+        _validate_peer_replay_config()

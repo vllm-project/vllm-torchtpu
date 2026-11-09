@@ -22,6 +22,7 @@ CPU.
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from absl.testing import parameterized
 
 from vllm_torchtpu.kernels.mla import kv_cache_utils, scatter, scatter_utils
@@ -80,6 +81,7 @@ def _decode_rows(cache: jax.Array, spec: SparseMLAKVCacheSpec) -> np.ndarray:
     return rows.reshape(spec.num_pages * spec.page_size, spec.token_bytes)
 
 
+@pytest.mark.tpu_test
 class SparseMLAScatterTest(parameterized.TestCase):
     def setUp(self):
         super().setUp()
@@ -124,6 +126,16 @@ class SparseMLAScatterTest(parameterized.TestCase):
             )
             for name, cache_type, layout, head_dim in _LIVE_SPECS
         }
+        # Explicit 128-byte SparseCore RoPE spec (4 tokens/row); `rope_sc`
+        # above tests the default 64-byte SparseCore RoPE spec (8 tokens/row).
+        specs["rope_sc_128"] = SparseMLAKVCacheSpec.create(
+            KVCacheType.ROPE,
+            KVCacheLayout.SPARSECORE,
+            num_pages,
+            page_size,
+            128,
+            KV_PACKING,
+        )
         page, slot = kv_cache_utils.get_page_and_slot(
             num_tokens,
             jnp.asarray(seq_lens),
@@ -175,9 +187,17 @@ class SparseMLAScatterTest(parameterized.TestCase):
             spec.num_pages, spec.page_size, spec.token_bytes
         )
         written = rows[inp["page"], inp["slot"]]
-        np.testing.assert_array_equal(
+        # TPU hardware canonicalizes FP8 negative NaN (0xFF) to positive NaN (0x7F).
+        # Treat both representations as equivalent for float8_e4m3fn latents.
+        expected = np.asarray(raw_u8)
+        written_canonical = np.where(
+            (written[:, : raw_u8.shape[1]] == 0x7F) & (expected == 0xFF),
+            0xFF,
             written[:, : raw_u8.shape[1]],
-            np.asarray(raw_u8),
+        )
+        np.testing.assert_array_equal(
+            written_canonical,
+            expected,
             err_msg=f"Pallas {key} decoded bytes mismatch vs input",
         )
         # A short token's padded tail must be zero-filled, never stale: stale
@@ -198,6 +218,13 @@ class SparseMLAScatterTest(parameterized.TestCase):
     def test_scatter_rope_sc(self, num_seqs, tokens_per_seq, max_seq_len, num_pages):
         inp = self._generate_inputs(num_seqs, tokens_per_seq, max_seq_len, num_pages)
         self._check_scatter(inp, "rope_sc", inp["k_pe"], inp["k_pe_u8"])
+
+    @parameterized.named_parameters(*_SCENARIOS)
+    def test_scatter_rope_sc_128(
+        self, num_seqs, tokens_per_seq, max_seq_len, num_pages
+    ):
+        inp = self._generate_inputs(num_seqs, tokens_per_seq, max_seq_len, num_pages)
+        self._check_scatter(inp, "rope_sc_128", inp["k_pe"], inp["k_pe_u8"])
 
     def test_nope_sparsecore_is_byte_identical_to_tensorcore(self):
         """`pack_tokens` reproduces the TC sublane fold, so the two nope

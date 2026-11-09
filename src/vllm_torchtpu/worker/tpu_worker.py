@@ -1,9 +1,22 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 # Ensure environment overrides are applied before any other imports,
 # especially torch_tpu which might read them at import time.
 import vllm_torchtpu.env_override  # noqa: F401  # isort: skip
 
+import ctypes
 import os
 import time
 from typing import Any, cast
@@ -12,6 +25,7 @@ from urllib.parse import urlparse
 import torch
 import torch.profiler
 import torch_tpu  # noqa: F401
+from torch.compiler._cache import CacheArtifactManager
 from torch_tpu._internal.profiler import TpuProfilerConfig
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.distributed.kv_transfer import (
@@ -23,8 +37,12 @@ from vllm.distributed.parallel_state import (
     ensure_model_parallel_initialized,
     get_pp_group,
     get_tensor_model_parallel_rank,
+    get_world_group,
     init_distributed_environment,
+    model_parallel_is_initialized,
 )
+from vllm.lora.request import LoRARequest
+from vllm.utils.gc_utils import freeze_gc_heap, maybe_attach_gc_debug_callback
 from vllm.utils.torch_utils import set_torch_threads_for_runtime
 from vllm.v1 import utils as vllm_utils
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -35,6 +53,7 @@ from vllm_torchtpu import envs, gc_policy, profiler_trace, utils
 from vllm_torchtpu.distributed.pcp_rank_order import pcp_topology_order
 from vllm_torchtpu.layers.adapter.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.runner.tpu_pooling import compute_pooling_kv_cache_cap_bytes
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.worker.runai_repull import ensure_runai_aux_files
 from vllm_torchtpu.worker.tpu_rank_binding import get_tpu_worker_binding
@@ -62,6 +81,17 @@ def _configure_tpu_process_env(
         os.environ["WORLD_SIZE"] = str(world_size)
     else:
         os.environ.pop("WORLD_SIZE", None)
+
+
+def _release_free_host_heap() -> None:
+    """Return free allocator pages from model loading and compilation to the OS."""
+    process = ctypes.CDLL(None)
+    if hasattr(process, "MallocExtension_ReleaseFreeMemory"):
+        process.MallocExtension_ReleaseFreeMemory()
+        logger.info("Released free host heap via tcmalloc.")
+    elif hasattr(process, "malloc_trim"):
+        process.malloc_trim(0)
+        logger.info("Released free host heap via glibc malloc_trim.")
 
 
 class TPUWorker(WorkerBase):
@@ -147,7 +177,9 @@ class TPUWorker(WorkerBase):
                 "Profiling enabled. Traces will be saved to: %s", self.profile_dir
             )
 
-    def set_kv_cache_layout(self, kv_cache_layout: str) -> None:
+    def set_kv_cache_layout(
+        self, kv_cache_layout: str, cp_kv_cache_interleave_size: int
+    ) -> None:
         # TPU resolves before model load because layout determines its page
         # geometry. Check the actual loaded backends when engine core publishes
         # that choice; its pre-resolved-config path does not validate them.
@@ -157,7 +189,7 @@ class TPUWorker(WorkerBase):
                 f"TPU KV cache layout {kv_cache_layout} is incompatible with "
                 f"the loaded attention backends; supported layouts: {supported}"
             )
-        super().set_kv_cache_layout(kv_cache_layout)
+        super().set_kv_cache_layout(kv_cache_layout, cp_kv_cache_interleave_size)
 
     def initialize_cache(self, num_gpu_blocks: int, num_cpu_blocks: int) -> None:
         self.cache_config.num_gpu_blocks = num_gpu_blocks
@@ -494,10 +526,39 @@ class TPUWorker(WorkerBase):
             auto=self.cache_config.kv_cache_memory_bytes is None,
         )
 
+    def _kv_cache_size_pinned(self) -> bool:
+        """Whether every rank's KV block count is already fixed by
+        `num_gpu_blocks_override`, set by the user or by the runner's uniform
+        hybrid sizing in get_kv_cache_spec, which vLLM calls before
+        determine_available_memory. Compact-mamba sizing does not set it until
+        after the profile run (KVCacheManager.size_compact_mamba_kv_cache).
+
+        Agreed (MIN) across the world group, which is exactly the ranks that
+        share the profile run's collectives: this engine's TP x PCP x PP ranks,
+        plus the other DP engines only when EP couples them -- dense DP engines
+        each get their own tpu_dist world (see init_device).
+        """
+        pinned = int(self.cache_config.num_gpu_blocks_override is not None)
+        dist = torch.distributed
+        if (
+            dist.is_available()
+            and dist.is_initialized()
+            and model_parallel_is_initialized()
+        ):
+            world = get_world_group()
+            if world.world_size > 1:
+                pinned = utils.min_over_group(pinned, world.cpu_group)
+        return bool(pinned)
+
     def determine_available_memory(self) -> int:
         # To determine a reasonable kv_cache_memory_bytes for a specific vllm
         # setup, users can run vllm without this flag, and collect the
-        # total_hbm_avail_gb value logged later in this function.
+        # total_hbm_avail_gb value logged later in this function -- only from
+        # a run whose log says profile_run=ran. With profile_run=skipped (the
+        # KV size was pinned first, by --num-gpu-blocks-override or the uniform
+        # hybrid sizing) that value was measured before any activation memory
+        # was allocated, so it over-sizes the KV cache: pin
+        # --num-gpu-blocks-override from the "TPU KV cache size" line instead.
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
             msg = (
                 "kv_cache_memory_bytes in cache_config is specified."
@@ -510,29 +571,51 @@ class TPUWorker(WorkerBase):
                 "correspondingly."
             )
             logger.info(msg)
+            self.model_runner.kv_cache_manager.size_compact_mamba_kv_cache(
+                kv_cache_memory_bytes
+            )
             return self._reserve_deepseek_v41_rope_companion(kv_cache_memory_bytes)
 
-        # VLLM directive of the percentage of HBM memory the model executor can use
-        self.model_runner.profile_run(self.model_runner.max_num_tokens)
+        profile_skipped = self._kv_cache_size_pinned()
+        if profile_skipped:
+            # The KV cache size is already fixed: vLLM replaces the block count
+            # derived from the budget below with num_gpu_blocks_override, so
+            # profiling it would only cost a throwaway compile of the largest
+            # token bucket. The kernel pre-warm it also does already ran in
+            # load_model (_initialize_pallas_kernels), and its sampling
+            # precompiles run again in capture_model. The budget below then
+            # sees the HBM in use after load_model, without the profile
+            # compile's activation slab and program reservation.
+            logger.info(
+                "Skipping the profile run: the KV cache size is pinned "
+                "(num_gpu_blocks_override=%d) before memory profiling.",
+                self.cache_config.num_gpu_blocks_override,
+            )
+        else:
+            self.model_runner.profile_run(self.model_runner.max_num_tokens)
 
+        # VLLM directive of the percentage of HBM memory the model executor can use
         gpu_memory_utilization = self.cache_config.gpu_memory_utilization
         budget = utils.compute_hbm_budget(self.devices, gpu_memory_utilization)
 
         # Some KV connectors allocate HBM AFTER profile_run completes — e.g.,
         # an offload spec with a host<->device transfer staging buffer, or a
-        # P/D disagg connector with NCCL receive buffers. vLLM's normal
-        # accounting misses those bytes. Ask the active connector how much
-        # to reserve and subtract from the KV-cache budget. Returns 0 if no
-        # connector needs a reserve. The connector owns the size formula.
-        kv_connector_hbm_reserve = utils.estimate_kv_connector_hbm_reserve(
-            self.vllm_config
+        # P/D disagg connector with NCCL receive buffers. An adapter swap
+        # holds HBM only while it runs, and the pipeline ring hand-off
+        # allocates its buffers after profile_run too. vLLM's normal
+        # accounting misses those bytes, so subtract them from the KV-cache
+        # budget.
+        reserves = self.model_runner.post_profile_hbm_reserves()
+        available = utils.min_across_ep_dp(
+            self.parallel_config, budget.available - sum(reserves)
         )
-        available = budget.available - kv_connector_hbm_reserve
 
         total_hbm_limit_gb = round(budget.total_limit / utils.GBYTES, 2)
         total_hbm_limit_cap_gb = round(budget.cap / utils.GBYTES, 2)
         total_hbm_used_gb = round(budget.total_used / utils.GBYTES, 2)
-        kv_connector_hbm_reserve_gb = round(kv_connector_hbm_reserve / utils.GBYTES, 2)
+        kv_connector_hbm_reserve_gb = round(reserves.kv_connector / utils.GBYTES, 2)
+        lora_slot_write_hbm_gb = round(reserves.lora_slot_write / utils.GBYTES, 2)
+        pp_handoff_hbm_reserve_gb = round(reserves.pp_handoff / utils.GBYTES, 2)
         total_hbm_avail_gb = round(available / utils.GBYTES, 2)
         logger.info(
             "Memory statistics | "
@@ -540,23 +623,82 @@ class TPUWorker(WorkerBase):
             "total_hbm_limit_cap_gb=%rGiB | "
             "total_hbm_used_gb=%rGiB | "
             "kv_connector_hbm_reserve_gb=%rGiB | "
-            "total_hbm_avail_gb=%rGiB",
+            "lora_slot_write_hbm_gb=%rGiB | "
+            "pp_handoff_hbm_reserve_gb=%rGiB | "
+            "total_hbm_avail_gb=%rGiB | "
+            "profile_run=%s",
             total_hbm_limit_gb,
             total_hbm_limit_cap_gb,
             total_hbm_used_gb,
             kv_connector_hbm_reserve_gb,
+            lora_slot_write_hbm_gb,
+            pp_handoff_hbm_reserve_gb,
             total_hbm_avail_gb,
+            "skipped" if profile_skipped else "ran",
         )
 
         if available <= 0:
-            raise ValueError(
-                f"{total_hbm_used_gb=}GiB exceeds "
-                f"{total_hbm_limit_cap_gb=}GiB by "
-                f"{-total_hbm_avail_gb}GiB. Please consider "
+            fix = (
                 f"increasing --gpu-memory-utilization from "
-                f"{gpu_memory_utilization} to a larger value."
+                f"{gpu_memory_utilization} to a larger value"
             )
+            if reserves.lora_slot_write > 0:
+                fix += ", or lowering --max-loras or --max-lora-rank"
+            raise ValueError(
+                f"{total_hbm_used_gb=}GiB plus the HBM reserved after the "
+                f"memory profile ({kv_connector_hbm_reserve_gb=}GiB, "
+                f"{lora_slot_write_hbm_gb=}GiB, "
+                f"{pp_handoff_hbm_reserve_gb=}GiB) exceeds "
+                f"{total_hbm_limit_cap_gb=}GiB by "
+                f"{-total_hbm_avail_gb}GiB. Please consider {fix}."
+            )
+
+        # From the post-profile budget, so the pool leaves room for activations.
+        self.model_runner.kv_cache_manager.size_compact_mamba_kv_cache(available)
+
+        cap = self._pooling_kv_cache_cap_bytes()
+        if cap is not None and cap < available:
+            logger.info(
+                "Pooling KV cache cap: %.2f GiB of %.2f GiB available; "
+                "%.2f GiB reclaimed (consider raising --max-num-batched-tokens; "
+                "set VLLM_TPU_POOLING_KV_CACHE_TOKENS=0 to disable).",
+                cap / utils.GBYTES,
+                available / utils.GBYTES,
+                (available - cap) / utils.GBYTES,
+            )
+            available = cap
         return self._reserve_deepseek_v41_rope_companion(available)
+
+    def _pooling_kv_cache_cap_bytes(self) -> int | None:
+        """Deterministic KV budget for pure pooling models, or None.
+
+        Pooling requests are prefill-only, so KV only has to hold the in-flight
+        steps plus the earlier chunks of requests still in chunked prefill.
+        The cap is derived from the config alone, so num_gpu_blocks (and thus
+        the backbone compile hash) is identical across restarts and ranks.
+        """
+        runner = getattr(self, "model_runner", None)
+        setting = envs.VLLM_TPU_POOLING_KV_CACHE_TOKENS
+        if (
+            runner is None
+            or not getattr(runner, "is_pooling_model", False)
+            or setting == 0
+            or self.cache_config.num_gpu_blocks_override is not None
+            or self.parallel_config.pipeline_parallel_size > 1
+            or self.vllm_config.kv_transfer_config is not None
+            or getattr(self.model_config, "is_hybrid", False)
+        ):
+            return None
+        sc = self.scheduler_config
+        return compute_pooling_kv_cache_cap_bytes(
+            runner.get_kv_cache_spec(),
+            max_model_len=self.model_config.max_model_len,
+            max_num_batched_tokens=sc.max_num_batched_tokens,
+            max_num_seqs=sc.max_num_seqs,
+            async_scheduling=bool(sc.async_scheduling),
+            long_prefill_token_threshold=sc.long_prefill_token_threshold,
+            override_tokens=setting if setting > 0 else None,
+        )
 
     def execute_model(self, scheduler_output):
         return self.model_runner.execute_model(scheduler_output)
@@ -569,6 +711,12 @@ class TPUWorker(WorkerBase):
 
     def pp_settle(self):
         return self.model_runner.pp_settle()
+
+    def pp_drains_before_handoff(self) -> bool:
+        """Whether this worker's stage drains the slice before each hand-off
+        launch."""
+        wave = self.model_runner._pp_wave
+        return bool(getattr(wave, "drain_before_handoff", False))
 
     def profile_pipeline_chunks(self) -> dict:
         return self.model_runner.profile_pipeline_chunks()
@@ -718,10 +866,16 @@ class TPUWorker(WorkerBase):
 
         patch_registry.apply("model_load", model_config=self.model_config)
         self.model_runner.load_model()
+        # The host buffers the weights were staged in are freed, but the
+        # allocator keeps their pages. Return them before initialize_from_config,
+        # where a KV connector may allocate its host store.
+        _release_free_host_heap()
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
         start = time.perf_counter()
-        if self.speculative_config is not None:
+        if getattr(self, "speculative_config", None) is not None:
+            # Record the warm-up traces under the serving thread count. Other
+            # models keep upstream's warm-up at the startup count.
             set_torch_threads_for_runtime()
         self.model_runner.capture_model()
         # Dynamic expert re-layout (TPU_MOE_EPLB_DYNAMIC): armed on every rank
@@ -735,6 +889,16 @@ class TPUWorker(WorkerBase):
         compilation_time = time.perf_counter() - start
         self.compilation_config.compilation_time = compilation_time
         set_torch_threads_for_runtime()
+        # torch records every compile artifact for save_cache_artifacts(), which
+        # vLLM never calls; drop the record so its memory can be freed.
+        CacheArtifactManager.clear()
+        # The warmed worker holds a large static heap (model, compiled
+        # executables, KV bookkeeping); freezing it keeps a gen-2 collection
+        # from scanning those objects mid-step.
+        freeze_gc_heap()
+        maybe_attach_gc_debug_callback()
+        _release_free_host_heap()
+        # The serving gc policy (gc_policy.py) arms after the heap is frozen.
         gc_policy.arm_after_warmup()
         return CompilationTimes(language_model=compilation_time, encoder=0.0)
 
@@ -770,6 +934,21 @@ class TPUWorker(WorkerBase):
 
     def get_kv_cache_spec(self):
         return self.model_runner.get_kv_cache_spec()
+
+    def reset_encoder_cache(self) -> None:
+        self.model_runner.reset_encoder_cache()
+
+    def add_lora(self, lora_request: LoRARequest) -> bool:
+        return self.model_runner.add_lora(lora_request)
+
+    def remove_lora(self, lora_id: int) -> bool:
+        return self.model_runner.remove_lora(lora_id)
+
+    def pin_lora(self, lora_id: int) -> bool:
+        return self.model_runner.pin_lora(lora_id)
+
+    def list_loras(self) -> set[int]:
+        return self.model_runner.list_loras()
 
     def get_num_gpu_blocks_override(self) -> int | None:
         return self.vllm_config.cache_config.num_gpu_blocks_override

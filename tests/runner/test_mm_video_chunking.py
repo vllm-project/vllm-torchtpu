@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Unit tests for the vision-encoder video frame chunking
 (`MM_ENCODER_FRAME_CHUNK_PATCH_SIZE`).
 
@@ -108,6 +120,17 @@ class TestChunkPatchSize:
         )
         with patch.dict(os.environ, {"MM_ENCODER_FRAME_CHUNK_PATCH_SIZE": "4096"}):
             assert mvc.get_video_chunk_patch_size(model_config) == 0
+
+    def test_default_max_patches_and_env_min(self):
+        """Use `default_max_patches` when env is unset, or cap by env."""
+        cfg = SimpleNamespace(multimodal_config=None)
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("MM_ENCODER_FRAME_CHUNK_PATCH_SIZE", None)
+            assert mvc.get_video_chunk_patch_size(cfg, default_max_patches=2048) == 2048
+        with patch.dict(os.environ, {"MM_ENCODER_FRAME_CHUNK_PATCH_SIZE": "1024"}):
+            assert mvc.get_video_chunk_patch_size(cfg, default_max_patches=2048) == 1024
+        with patch.dict(os.environ, {"MM_ENCODER_FRAME_CHUNK_PATCH_SIZE": "4096"}):
+            assert mvc.get_video_chunk_patch_size(cfg, default_max_patches=2048) == 2048
 
 
 class TestChunkedVideoEncodingContext:

@@ -57,6 +57,7 @@ def _run_swa(
     logical_page_size: int,
     swa_only: bool,
     non_causal_block: bool = False,
+    verify_q_len: int | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Sliding-window pass: updates the SWA cache and returns its partials.
 
@@ -89,6 +90,7 @@ def _run_swa(
         q_compute_block_size=4,
         unnormalized_output=not swa_only,
         non_causal_block=non_causal_block,
+        chunk_prefill_size=verify_q_len,
     )
 
 
@@ -115,8 +117,14 @@ def _attention_hca(
     swa_only: bool,
     two_caches_same_buffer: bool,
     non_causal_block: bool = False,
+    verify_q_len: int | None = None,
 ) -> tuple[jax.Array, jax.Array]:
-    """SWA-only layers, and HCA layers over a single raw-bf16 latent array."""
+    """SWA-only layers, and HCA layers over a single raw-bf16 latent array.
+
+    `verify_q_len`: requests [distribution[0], distribution[1]) are speculative
+    verify windows of exactly this many tokens; they run the kernels' static
+    query-length pass instead of the mixed one.
+    """
     if main_cache_kv.shape[0] == 0 or (swa_only and sw_cache.shape[0] == 0):
         # Profiling-shape trace: the kernel is skipped. Unused inputs stay in
         # the compiled signature because torch_tpu jits with keep_unused=True.
@@ -139,6 +147,7 @@ def _attention_hca(
         logical_page_size=logical_page_size,
         swa_only=swa_only,
         non_causal_block=non_causal_block,
+        verify_q_len=verify_q_len,
     )
 
     if swa_only:
@@ -163,8 +172,9 @@ def _attention_hca(
         swa_m=swa_m,
         sm_scale=sm_scale,
         # The following parameters are tuned based on microbenchmark results.
-        num_kv_pages_per_block=(32, 32, 32),
+        num_kv_pages_per_block=(128, 64, 64),
         num_queries_per_block=(1, 32, 32),
+        chunk_prefill_size=verify_q_len,
     )
     return output, updated_sw_cache
 
@@ -192,10 +202,15 @@ def _attention_csa(
     swa_only: bool,
     two_caches_same_buffer: bool,
     non_causal_block: bool = False,
-    attention_kernel_batch_size: int = 16,
+    attention_kernel_batch_size: int | None = None,
     logical_main_page_size: int | None = None,
+    verify_q_len: int | None = None,
 ) -> tuple[jax.Array, jax.Array]:
-    """CSA: sparse gather over top-k rows, NoPE and RoPE in two arrays."""
+    """CSA: sparse gather over top-k rows, NoPE and RoPE in two arrays.
+
+    `verify_q_len` as in `_attention_hca`; the sparse gather is per token and
+    reads only distribution[2].
+    """
     if main_cache_kv.shape[0] == 0 or main_cache_rope.shape[0] == 0:
         return jnp.zeros(q.shape, dtype=q.dtype), sw_cache
 
@@ -216,6 +231,7 @@ def _attention_csa(
         logical_page_size=logical_page_size,
         swa_only=False,
         non_causal_block=non_causal_block,
+        verify_q_len=verify_q_len,
     )
 
     if two_caches_same_buffer:
@@ -254,14 +270,31 @@ def _attention_csa_from_swa(
     swa_m: jax.Array,
     *,
     sm_scale: float,
-    attention_kernel_batch_size: int = 16,
+    attention_kernel_batch_size: int | None = None,
     logical_main_page_size: int | None = None,
 ) -> jax.Array:
     """Merge compressed attention with an already-computed SWA softmax state.
 
     V4 and ordinary V4.1 layers obtain the state from `_run_swa`. CED
     supplies its bounded-replay state without changing the SWA kernel.
+    `attention_kernel_batch_size` defaults to the chunk-size heuristic below.
     """
+    gather_and_attention_chunk_size = 128
+    default_batch_size = 16
+    # small chunks override:
+    if q.shape[0] <= 128:
+        gather_and_attention_chunk_size = 32
+        default_batch_size = 8
+    elif q.shape[0] <= 256:
+        gather_and_attention_chunk_size = 64
+    if attention_kernel_batch_size is None:
+        attention_kernel_batch_size = default_batch_size
+
+    # First use of the top-k after the SWA pass: the indexer's SparseCore
+    # top-k then completes behind the q projection and SWA, which do not need
+    # it, instead of stalling the TensorCore before them.
+    topk_indices, swa_output = jax.lax.optimization_barrier((topk_indices, swa_output))
+
     if logical_main_page_size is not None:
         # A padded physical page may hold more native rows than the logical
         # compressed page. Keep the source page table; adapt only the row
@@ -293,6 +326,7 @@ def _attention_csa_from_swa(
         swa_l=swa_l,
         swa_m=swa_m,
         sm_scale=sm_scale,
+        gather_and_attention_chunk_size=gather_and_attention_chunk_size,
         attention_kernel_batch_size=attention_kernel_batch_size,
     )
 

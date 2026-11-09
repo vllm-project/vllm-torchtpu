@@ -1,5 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """DSpark draft model for DeepSeek-V4.1 on TPU."""
 
 import re
@@ -471,6 +482,10 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
     def should_load_weight(self, name: str) -> bool:
         """Let the streaming loader reject unused tensors before reading them."""
         return self._remap_dspark_name(name) is not None
+
+    def is_unused_checkpoint_weight(self, name: str) -> bool:
+        """The loaders' skip hook: tensors the draft never loads are not read."""
+        return not self.should_load_weight(name)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load the ``mtp.{0,1,2}.*`` draft weights from the target checkpoint."""

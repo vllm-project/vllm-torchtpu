@@ -28,10 +28,12 @@ import time
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
-from vllm_torchtpu.kernels import pool_adapters
 from vllm_torchtpu.kernels.gdn.v3 import wrapper
 from vllm_torchtpu.layers.core import gdn_attention
+
+pytestmark = pytest.mark.tpu_test
 
 # Measured 1.043-1.049x over five runs; a per-tile decode lands near 2.2x.
 # Arms are timed best-of-N because each is only ~7.5 ms.
@@ -49,9 +51,13 @@ BENCH_KBS, BENCH_LANES = 256, 256
 BENCH_PAYLOAD = (1, 4)
 BENCH_TOK_BYTES = int(np.prod(BENCH_PAYLOAD) * BENCH_LANES * np.dtype(np.int8).itemsize)
 BENCH_SSM_NTOK = BENCH_N_V * BENCH_D_K * BENCH_D_V * 4 // BENCH_TOK_BYTES
-BENCH_CONV_TOK0 = BENCH_SSM_NTOK
-BENCH_CONV_NTOK = 128
-BENCH_MANAGER_TOKENS = 4352
+# fp32 conv: 3 * 12288 * 4 = 144 KiB, rounded up to one 256-token kernel block.
+BENCH_CONV_NTOK = 256
+# Granule coordinates of the two regions -- all the kernel is told.
+BENCH_GRANULE = 512
+BENCH_WORDS_PER_GRANULE = BENCH_GRANULE // 4
+BENCH_SSM_GRANULES = BENCH_N_V * BENCH_D_K * BENCH_D_V * 4 // BENCH_GRANULE
+BENCH_MANAGER_TOKENS = BENCH_SSM_NTOK + BENCH_CONV_NTOK  # 4352
 BENCH_SPLIT = BENCH_MANAGER_TOKENS // BENCH_KBS
 BENCH_NUM_MGR = 2  # null slot and one active request
 BENCH_POOL_SHAPE = (
@@ -69,56 +75,50 @@ BENCH_DISTRIBUTION = np.array([0, 1, 1], dtype=np.int32)
 BENCH_SEQ_LENS = np.array([BENCH_NUM_TOKENS + 1], dtype=np.int32)
 
 
+def _benchmark_mgr_words(pool):
+    """The pool the way the kernel addresses it: one uint32 row per state.
+
+    A ref's `bitcast(uint32)` packs along the *second-minor* (sublane) axis,
+    so for a pool row `(..., packing, lanes)` a word spans one lane's `packing`
+    sublanes, not `packing` adjacent elements. Moving that axis minormost
+    first is what makes the host view agree with the kernel's granule stream.
+    """
+    words = jnp.moveaxis(pool, -2, -1).view(jnp.uint32)
+    return words.reshape(pool.shape[0] // BENCH_SPLIT, -1)
+
+
+def _benchmark_unwords(words, pool):
+    """Inverse of `_benchmark_mgr_words`."""
+    moved = words.reshape(*pool.shape[:-2], pool.shape[-1], 1).view(pool.dtype)
+    return jnp.moveaxis(moved, -2, -1).reshape(pool.shape)
+
+
 def _benchmark_write_states(pool, recurrent, conv):
-    recurrent_rows = recurrent.reshape(1, BENCH_N_V * BENCH_D_K, BENCH_D_V)
-    pool = pool_adapters.scatter_region(
-        pool,
-        recurrent_rows,
-        BENCH_STATE_IDX,
-        tok0=0,
-        ntok=BENCH_SSM_NTOK,
-        split=BENCH_SPLIT,
-    )
-    conv_rows = conv.astype(jnp.bfloat16).reshape(1, -1, BENCH_LANES)
-    conv_capacity_rows = (
-        BENCH_CONV_NTOK
-        * BENCH_TOK_BYTES
-        // (jnp.dtype(jnp.bfloat16).itemsize * BENCH_LANES)
-    )
-    conv_rows = jnp.pad(
-        conv_rows,
-        ((0, 0), (0, conv_capacity_rows - conv_rows.shape[1]), (0, 0)),
-    )
-    return pool_adapters.scatter_region(
-        pool,
-        conv_rows,
-        BENCH_STATE_IDX,
-        tok0=BENCH_CONV_TOK0,
-        ntok=BENCH_CONV_NTOK,
-        split=BENCH_SPLIT,
-    )
+    words = _benchmark_mgr_words(pool)
+    for granule0, payload in (
+        (0, jnp.asarray(recurrent, jnp.float32)),
+        (BENCH_SSM_GRANULES, jnp.asarray(conv, jnp.float32)),
+    ):
+        body = payload.reshape(1, -1).view(jnp.uint32)
+        start = granule0 * BENCH_WORDS_PER_GRANULE
+        words = words.at[BENCH_STATE_IDX, start : start + body.shape[1]].set(body)
+    return _benchmark_unwords(words, pool)
 
 
 def _benchmark_read_states(pool):
-    recurrent = pool_adapters.gather_region(
-        pool,
-        BENCH_STATE_IDX,
-        tok0=0,
-        ntok=BENCH_SSM_NTOK,
-        split=BENCH_SPLIT,
-        out_dtype=jnp.float32,
-        out_lanes=BENCH_D_V,
-    ).reshape(1, BENCH_N_V, BENCH_D_K, BENCH_D_V)
-    conv = pool_adapters.gather_region(
-        pool,
-        BENCH_STATE_IDX,
-        tok0=BENCH_CONV_TOK0,
-        ntok=BENCH_CONV_NTOK,
-        split=BENCH_SPLIT,
-        out_dtype=jnp.bfloat16,
-    )
-    conv_rows = (BENCH_KERNEL_SIZE - 1) * BENCH_DIM // BENCH_LANES
-    conv = conv[:, :conv_rows].reshape(1, BENCH_KERNEL_SIZE - 1, BENCH_DIM)
+    words = _benchmark_mgr_words(pool)
+
+    def take(granule0, shape):
+        start = granule0 * BENCH_WORDS_PER_GRANULE
+        nwords = int(np.prod(shape))
+        return (
+            words[BENCH_STATE_IDX, start : start + nwords]
+            .view(jnp.float32)
+            .reshape(1, *shape)
+        )
+
+    recurrent = take(0, (BENCH_N_V, BENCH_D_K, BENCH_D_V))
+    conv = take(BENCH_SSM_GRANULES, (BENCH_KERNEL_SIZE - 1, BENCH_DIM))
     return conv, recurrent
 
 
@@ -150,10 +150,7 @@ def _benchmark_dense_five(
 ):
     def step(states, _):
         new_states, output = wrapper.fused_conv1d_gdn(
-            conv_state=states[0],
-            recurrent_state=states[1],
-            state_source=None,
-            state_plan=None,
+            states=states,
             **_benchmark_common_args(qkv, b, a, conv_weight, conv_bias, a_log, dt_bias),
         )
         return new_states, output
@@ -260,7 +257,7 @@ class TestProductionShapeDenseVsUnifiedPool:
         dense_conv = (
             jnp.zeros(
                 (BENCH_NUM_MGR, BENCH_KERNEL_SIZE - 1, BENCH_DIM),
-                dtype=jnp.bfloat16,
+                dtype=jnp.float32,
             )
             .at[1]
             .set(initial_conv[0])
@@ -340,4 +337,127 @@ class TestProductionShapeDenseVsUnifiedPool:
             f"pooled prefill is {ratio:.3f}x dense (limit "
             f"{MAX_POOLED_OVER_DENSE}); the pooled state seam may be decoding "
             "the source layout once per tile again"
+        )
+
+
+# Internal prefill checkpoint at the same geometry: a fresh 4096-token prefill
+# that checkpoints after 3072 tokens (the logical Mamba block under PP4xPCP8)
+# into a second manager block.
+CKPT_OFFSET = 3072
+CKPT_STATE_BLOCK = 1
+CKPT_BLOCK = 2
+CKPT_NUM_MGR = 3  # null slot, the request's state block, its checkpoint block
+CKPT_POOL_SHAPE = (
+    (CKPT_NUM_MGR * BENCH_SPLIT, BENCH_KBS) + BENCH_PAYLOAD + (BENCH_LANES,)
+)
+
+
+def _fresh_prefill(pool, qkv, b, a, weights, *, state_block, ckpt):
+    conv_weight, conv_bias, a_log, dt_bias = weights
+    num_tokens = qkv.shape[0]
+    extra = {}
+    if ckpt:
+        extra = dict(
+            prefill_ckpt_offsets=jnp.array([CKPT_OFFSET], dtype=jnp.int32),
+            prefill_ckpt_indices=jnp.array([CKPT_BLOCK], dtype=jnp.int32),
+        )
+    return gdn_attention.run_jax_gdn_attention_pooled_local(
+        mixed_qkv=qkv,
+        b=b,
+        a=a,
+        recurrent_state=pool,
+        conv_weight=conv_weight,
+        conv_bias=conv_bias,
+        A_log=a_log,
+        dt_bias=dt_bias,
+        query_start_loc=jnp.array([0, num_tokens], dtype=jnp.int32),
+        state_indices=jnp.array([state_block], dtype=jnp.int32),
+        distribution=BENCH_DISTRIBUTION,
+        seq_lens=jnp.array([num_tokens], dtype=jnp.int32),
+        n_kq=BENCH_N_KQ,
+        n_v=BENCH_N_V,
+        d_k=BENCH_D_K,
+        d_v=BENCH_D_V,
+        kernel_size=BENCH_KERNEL_SIZE,
+        pool_block_tokens=BENCH_MANAGER_TOKENS,
+        **extra,
+    )
+
+
+@functools.partial(jax.jit, donate_argnums=(0,), static_argnames=("ckpt",))
+def _checkpoint_prefill_five(pool, qkv, b, a, *weights, ckpt):
+    def step(state_pool, _):
+        return _fresh_prefill(
+            state_pool, qkv, b, a, weights, state_block=CKPT_STATE_BLOCK, ckpt=ckpt
+        )
+
+    return jax.lax.scan(step, pool, xs=None, length=BENCH_ITERATIONS)
+
+
+@functools.partial(jax.jit, donate_argnums=(0,))
+def _first_chunk(pool, qkv, b, a, *weights):
+    return _fresh_prefill(
+        pool,
+        qkv[:CKPT_OFFSET],
+        b[:CKPT_OFFSET],
+        a[:CKPT_OFFSET],
+        weights,
+        state_block=CKPT_BLOCK,
+        ckpt=False,
+    )
+
+
+def _manager_block(pool, mgr):
+    return np.asarray(pool[mgr * BENCH_SPLIT : (mgr + 1) * BENCH_SPLIT])
+
+
+class TestProductionShapePrefillCheckpoint:
+    """Checkpoint contents at production geometry.
+
+    The checkpoint block must hold the bytes a real 3072-token first chunk
+    writes as its final state, and the outputs and every other block must
+    match the same prefill without a checkpoint.
+    """
+
+    def test_checkpoint_matches_first_chunk(self):
+        keys = iter(jax.random.split(jax.random.key(20261015), 7))
+
+        def normal(shape, scale):
+            value = jax.random.normal(next(keys), shape, dtype=jnp.bfloat16)
+            return value * jnp.asarray(scale, dtype=jnp.bfloat16)
+
+        qkv = normal((BENCH_NUM_TOKENS, BENCH_DIM), 0.05)
+        b = normal((BENCH_NUM_TOKENS, BENCH_N_V), 0.05)
+        a = normal((BENCH_NUM_TOKENS, BENCH_N_V), 0.05)
+        conv_weight = normal((BENCH_DIM, 1, BENCH_KERNEL_SIZE), 0.02)
+        conv_bias = normal((BENCH_DIM,), 0.01)
+        a_log = normal((BENCH_N_V,), 0.02).astype(jnp.float32)
+        dt_bias = normal((BENCH_N_V,), 0.02).astype(jnp.float32) - 2.0
+        shared_args = (qkv, b, a, conv_weight, conv_bias, a_log, dt_bias)
+        pool = jnp.zeros(CKPT_POOL_SHAPE, dtype=jnp.int8)
+
+        def make_args():
+            return (jnp.copy(pool).block_until_ready(), *shared_args)
+
+        def plain(*args):
+            return _checkpoint_prefill_five(*args, ckpt=False)
+
+        def with_ckpt(*args):
+            return _checkpoint_prefill_five(*args, ckpt=True)
+
+        pool_plain, out_plain = _block_until_ready(plain(*make_args()))
+        pool_ckpt, out_ckpt = _block_until_ready(with_ckpt(*make_args()))
+        pool_split, _ = _block_until_ready(_first_chunk(*make_args()))
+
+        np.testing.assert_array_equal(np.asarray(out_ckpt), np.asarray(out_plain))
+        for mgr in range(CKPT_NUM_MGR):
+            if mgr != CKPT_BLOCK:
+                np.testing.assert_array_equal(
+                    _manager_block(pool_ckpt, mgr),
+                    _manager_block(pool_plain, mgr),
+                    f"block {mgr}",
+                )
+        np.testing.assert_array_equal(
+            _manager_block(pool_ckpt, CKPT_BLOCK),
+            _manager_block(pool_split, CKPT_BLOCK),
         )

@@ -21,8 +21,6 @@ import vllm  # noqa: F401
 
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 
-pytestmark = pytest.mark.cpu_test
-
 
 def _vllm_config(
     *,
@@ -85,11 +83,6 @@ def test_from_vllm_config_without_speculation():
     [
         (_vllm_config(dcp_size=2), NotImplementedError, "DCP"),
         (
-            _vllm_config(pipeline_parallel_size=2),
-            NotImplementedError,
-            "pipeline parallelism",
-        ),
-        (
             _vllm_config(
                 speculative_method="eagle3",
                 num_speculative_tokens=1,
@@ -144,6 +137,16 @@ def test_static_validator_accepts_supported_pcp_platform_config():
 
     assert config.enabled
     assert config.pcp_size == 4
+
+
+def test_static_validator_accepts_pcp_inside_pipeline_stages():
+    config = PcpStaticSupportValidator.validate_platform_config(
+        _vllm_config(pipeline_parallel_size=2),
+        kv_cache_layout="NHD",
+    )
+
+    assert config.enabled
+    assert config.pipeline_parallel_size == 2
 
 
 def test_static_validator_accepts_moe_pcp_with_expert_parallel():

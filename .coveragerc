@@ -21,7 +21,5 @@ omit =
 [paths]
 source =
     src/vllm_torchtpu
-    /root/torchtpu-vllm/src/vllm_torchtpu
     /workspace/vllm-torchtpu/src/vllm_torchtpu
-    /workspace/torchtpu-vllm/src/vllm_torchtpu
     */site-packages/vllm_torchtpu

@@ -52,6 +52,8 @@ from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs, wrapper
 
+pytestmark = pytest.mark.tpu_test
+
 
 @pytest.fixture
 def mesh():

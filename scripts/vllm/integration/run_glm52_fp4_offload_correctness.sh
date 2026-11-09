@@ -66,10 +66,8 @@ export TMPDIR="${TMPDIR:-${SCRATCH_ROOT}/tmp}"
 mkdir -p "${TMPDIR}" "${VLLM_CACHE_ROOT}" || exit 1
 
 # Everything down to the next blank line is the GLM-5.2 NVFP4 recipe's
-# environment (cloud-devkit-recipes: recipes/experimental/torchtpu-vllm/
-# disagg/glm52-nvfp4-disagg-raiden-dp8.yml), minus what only its JobSet needs;
-# what follows that is rig plumbing carried over from the DSv4 sibling and
-# holds for any model.
+# environment, minus what only its JobSet needs; what follows that is rig
+# plumbing carried over from the DSv4 sibling and holds for any model.
 #
 # Block-512 requantization of the checkpoint's block-16 fp4 MoE weights
 # (nvfp4.py): ~32x less scale data and no in-kernel dequant. The recipe sets
@@ -175,6 +173,8 @@ if [[ -z "${PYTHON_BIN:-}" ]]; then
 fi
 
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.9}"
+# Decode is one token (max-num-seqs=1); prefill chunks pad up to the budget.
+COMPILE_SIZES="${COMPILE_SIZES:-16,${MAX_NUM_BATCHED_TOKENS}}"
 
 KVT='{"kv_connector":"TPURaidenOffloadingConnector","kv_connector_module_path":"vllm_torchtpu.offload.raiden_connector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":'"${CPU_BYTES_TO_USE}"',"raiden_controller_port":'"${RAIDEN_CONTROLLER_PORT}"',"raiden_job_name":"glm52-fp4-offload-probe"}}'
 
@@ -260,6 +260,7 @@ serve() {
     --gpu-memory-utilization="${GPU_MEM_UTIL}" \
     --enable-prefix-caching \
     --enable-prompt-tokens-details \
+    --compilation-config "{\"compile_sizes\":[${COMPILE_SIZES}]}" \
     --api-server-count=1 \
     --port "${PORT}" \
     --kv-transfer-config "$KVT"

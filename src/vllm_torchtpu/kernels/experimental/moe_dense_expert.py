@@ -1,5 +1,16 @@
 # Copyright 2026 Google LLC
-# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Experimental small-batch FP8 MoE without token permutation.
 
 Each nonempty local expert is visited once. Its two weights are DMA'd once,
@@ -50,7 +61,7 @@ def _select_expert_buffers(
     # Hidden input/output, quantized hidden, and FP32 output accumulator.
     fixed_bytes = m * h * (2 + 2 + 1 + 4)
     # BF16 activation, FP8 activation, and the two BF16 quantization scales.
-    fixed_bytes += m * i * (2 + 1) + (h // 512 + i // 512) * m * 128 * 2
+    fixed_bytes += m * i * (2 + 1) + (h // 512 + pl.cdiv(i, 512)) * m * 128 * 2
     fixed_bytes += m * pl.cdiv(experts, 128) * 128 * 4
     budget = vmem_capacity_bytes * 4 // 5
     return max(1, min(_MAX_EXPERT_BUFFERS, (budget - fixed_bytes) // expert_bytes))
@@ -101,20 +112,32 @@ def can_use_dense_expert(
     i = i_packed * packing_factor
     if min(m, h, i, e) <= 0:
         return False
+    # FP4 block-scaled weights (epic) admit sub-16-token batches and need
+    # 512-wide scale blocks on both contracting axes; FP8 per-channel weights
+    # (main) only need 128-aligned intermediate columns.
     is_fp4 = rhs_quant_dtype == jnp.float4_e2m1fn or w1.dtype == jnp.float4_e2m1fn
-    if (not is_fp4 and m % 16) or h % 512 or i % 512:
+    if (not is_fp4 and m % 16) or h % 512 or i % (512 if is_fp4 else 128):
         return False
     if out != h or w1.shape != (e, h // packing_factor, 2 * i):
         return False
     if hidden.dtype != jnp.bfloat16:
         return False
-    valid_s1 = s1.shape in ((e, 1, 1, 2 * i), (e, h // 512, 1, 2 * i))
-    valid_s2 = s2.shape in ((e, 1, 1, h), (e, i // 512, 1, h))
-    return valid_s1 and valid_s2 and s1.dtype == jnp.float32 and s2.dtype == jnp.float32
+    if s1.dtype != jnp.float32 or s2.dtype != jnp.float32:
+        return False
+    if is_fp4:
+        return s1.shape in ((e, 1, 1, 2 * i), (e, h // 512, 1, 2 * i)) and (
+            s2.shape in ((e, 1, 1, h), (e, i // 512, 1, h))
+        )
+    if not (s1.shape == (e, 1, 1, 2 * i) and s2.shape == (e, 1, 1, h)):
+        return False
+    # Per-channel GMM quantizes activations only with native FP8 support and
+    # a scale block at least one MXU column wide, for both contracting axes.
+    tpu_info = pltpu.get_tpu_info()
+    return tpu_info.fp8_ops_per_second > 0 and min(h, i) >= tpu_info.mxu_column_size
 
 
 def _quantize(x, q_ref, scale_ref):
-    """Same BF16 scale/inverse and 512-wide FP8 quantization as gmm_v2."""
+    """Quantize activations to FP8 in up-to-512-wide blocks with BF16 scales."""
     # Keep K blocks first so each scale read is a contiguous [tokens, 128]
     # plane; placing K between tokens and lanes causes expensive relayouts.
     for k in range(0, x.shape[1], 512):
@@ -399,7 +422,7 @@ def dense_expert_moe(
                 pltpu.VMEM((h // 512, m, 128), jnp.bfloat16),
                 pltpu.VMEM((m, i), jnp.bfloat16),
                 pltpu.VMEM((m, i), jnp.float8_e4m3fn),
-                pltpu.VMEM((i // 512, m, 128), jnp.bfloat16),
+                pltpu.VMEM((pl.cdiv(i, 512), m, 128), jnp.bfloat16),
                 pltpu.VMEM((m, h), jnp.float32),
                 pltpu.SMEM((experts,), jnp.int32),
                 pltpu.SemaphoreType.DMA((num_buffers, 4)),

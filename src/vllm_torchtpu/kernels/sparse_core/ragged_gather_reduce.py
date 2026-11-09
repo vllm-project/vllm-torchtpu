@@ -22,6 +22,7 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
 
 from vllm_torchtpu.kernels.sparse_core import core_map_helper
+from vllm_torchtpu.kernels.sparse_core.support import get_sparse_core_info
 
 
 # ceil up to the nearest multiple of b.
@@ -328,7 +329,7 @@ def main_kernel(
                 # efficiency. We just repeat the write of lastest accumulated data
                 # multiple times.
                 # `src_row_idx_in_vmem` tracks the right idx in vmem for each hbm write.
-                src_row_idx_in_vmem = []
+                src_row_idx_in_vmem: list[int | jax.Array] = []
                 row_valid_vec = []
                 for row_vmem_idx in reversed(range(num_simd_lanes)):
                     row_idx = row_block_id * num_simd_lanes + row_vmem_idx
@@ -486,7 +487,7 @@ def ragged_gather_reduce(
         "ragged_gather_reduce only supports 1d valid_rows_mask."
     )
 
-    sc_info = pltpu.get_tpu_info().sparse_core
+    sc_info = get_sparse_core_info()
     if sc_info is None:
         return _fallback_implementation(
             x, indices, topk_weights, valid_rows_mask, reduce_group_size

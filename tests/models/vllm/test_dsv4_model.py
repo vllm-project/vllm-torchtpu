@@ -20,6 +20,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn as nn
+from transformers import DeepseekV4Config
 from vllm.config import (
     CacheConfig,
     CompilationMode,
@@ -29,7 +30,6 @@ from vllm.config import (
 )
 from vllm.model_executor.models import ModelRegistry
 from vllm.model_executor.models.utils import WeightsMapper
-from vllm.transformers_utils.configs.deepseek_v4 import DeepseekV4Config
 
 import vllm_torchtpu.models.vllm.deepseek_v4.model as model_mod
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_attention_op import (  # noqa: E501
@@ -53,7 +53,6 @@ def test_deepseek_v4_model_registration():
     assert model_cls is DeepseekV4ForCausalLM
 
 
-@pytest.mark.cpu_test
 def test_weight_loader_drops_mtp_after_mapping_and_keeps_plain_weights():
     model = DeepseekV4ForCausalLM.__new__(DeepseekV4ForCausalLM)
     nn.Module.__init__(model)
@@ -160,39 +159,13 @@ def _tiny_hf_config():
         hc_eps=1e-5,
         rms_norm_eps=1e-6,
         num_hidden_layers=N_LAYERS,
-        num_hash_layers=1,
+        mlp_layer_types=["hash_moe"] + ["moe"] * (N_LAYERS - 1),
         index_topk=4,
         vocab_size=VOCAB,
     )
 
 
-@pytest.fixture(scope="module")
-def dist_ctx():
-    import torch.distributed as dist
-    from vllm.distributed import (
-        ensure_model_parallel_initialized,
-        init_distributed_environment,
-    )
-
-    if not dist.is_initialized():
-        import portpicker
-
-        port = portpicker.pick_unused_port()
-        init_distributed_environment(
-            world_size=1,
-            rank=0,
-            local_rank=0,
-            distributed_init_method=f"tcp://127.0.0.1:{port}",
-            backend="gloo",
-        )
-    # GroupCoordinator construction consults the current vLLM config.
-    with set_current_vllm_config(VllmConfig()):
-        ensure_model_parallel_initialized(1, 1)
-    yield
-
-
-@pytest.mark.cpu_test
-@pytest.mark.parametrize("compress_ratio", [1, 4, 128])
+@pytest.mark.parametrize("compress_ratio", [0, 4, 128])
 def test_attention_constructs_tpu_swa_cache(monkeypatch, request, compress_ratio):
     """Exercise upstream construction, including its SWA backend argument."""
     from vllm.platforms import current_platform
@@ -227,6 +200,10 @@ def test_attention_constructs_tpu_swa_cache(monkeypatch, request, compress_ratio
     config.model_config = SimpleNamespace(
         hf_config=hf_config, dtype=torch.bfloat16, max_model_len=256
     )
+    # VllmConfig resolves this only when built with a model config; 5 is its
+    # value for this max_model_len. The compress_ratio=4 indexer sizes its
+    # prefill buffer from it.
+    config.attention_config.sparse_mla_prefill_workspace_factor = 5
     config.cache_config = CacheConfig(block_size=1024, cache_dtype="fp8_e4m3")
     config.scheduler_config = SchedulerConfig(
         max_model_len=256,
@@ -252,6 +229,10 @@ def test_attention_constructs_tpu_swa_cache(monkeypatch, request, compress_ratio
 @pytest.fixture()
 def tiny_fc(dist_ctx, monkeypatch):
     """A real DeepseekV4ForCausalLM at toy scale, kernels stubbed."""
+    from vllm.platforms import current_platform
+
+    monkeypatch.setattr(current_platform, "device_name", "cpu")
+    monkeypatch.setattr(current_platform, "device_type", "cpu")
     monkeypatch.setattr(model_mod, "DeepseekV4DecoderLayer", _StubDecoderLayer)
     monkeypatch.setattr(model_mod, "mhc_collapse_head", _fake_collapse_head)
     vllm_config = VllmConfig()
@@ -288,6 +269,7 @@ def _expected_aux(fc, tag):
     return _FakePostOp()(x, residual, post_mix, res_mix).mean(dim=1)
 
 
+@pytest.mark.tpu_test
 def test_untagged_forward_is_bare_tensor_and_unchanged(tiny_fc):
     out = _forward(tiny_fc, ())
     assert isinstance(out, torch.Tensor)
@@ -300,6 +282,7 @@ def test_untagged_forward_is_bare_tensor_and_unchanged(tiny_fc):
     torch.testing.assert_close(out, expected)
 
 
+@pytest.mark.tpu_test
 def test_tagged_forward_captures_and_keeps_main_output(tiny_fc):
     for bad in [(0,), (N_LAYERS + 1,)]:
         with pytest.raises(ValueError, match="aux hidden-state layers"):

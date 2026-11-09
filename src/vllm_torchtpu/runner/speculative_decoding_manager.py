@@ -1,5 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -23,8 +34,9 @@ class SpecDecodeMetadata:
     """
 
     # [padded_logits_length] draft token id validated at each
-    # target_logits_indices slot.
-    draft_token_ids: torch.Tensor
+    # target_logits_indices slot. None only while deferred (see
+    # `deferred_draft_token_ids_cpu`).
+    draft_token_ids: torch.Tensor | None
     # [padded_num_reqs] per-request draft-token count (device copy).
     draft_lengths: torch.Tensor
     # [num_reqs] per-request draft-token count (host copy, unpadded).
@@ -43,6 +55,16 @@ class SpecDecodeMetadata:
     segment_ids: torch.Tensor
     # [padded_logits_length] within-request draft-slot index of each position.
     group_indices: torch.Tensor
+    # Host copy of draft_token_ids when its upload was deferred: under async
+    # scheduling execute_model re-sources the drafts from the device and
+    # uploads this only for a chunk with nothing substituted.
+    deferred_draft_token_ids_cpu: np.ndarray | None = None
+
+    def upload_deferred_draft_token_ids(self, device: torch.device) -> torch.Tensor:
+        assert self.deferred_draft_token_ids_cpu is not None
+        return torch.from_numpy(self.deferred_draft_token_ids_cpu).to(
+            device, non_blocking=True
+        )
 
 
 class SpeculativeDecodingManager:
@@ -248,6 +270,7 @@ class SpeculativeDecodingManager:
         num_draft_tokens: np.ndarray,
         cu_num_scheduled_tokens: np.ndarray,
         padded_num_reqs: int,
+        defer_draft_token_ids: bool = False,
     ) -> SpecDecodeMetadata:
         """Calculates indices for speculative decoding forward pass and
         rejection sampling.
@@ -256,6 +279,9 @@ class SpeculativeDecodingManager:
           num_draft_tokens: The number of draft tokens for each request.
           cu_num_scheduled_tokens: The cumulative number of scheduled tokens.
           padded_num_reqs: The padded number of requests.
+          defer_draft_token_ids: Leave `draft_token_ids` None and keep its
+            host copy in `deferred_draft_token_ids_cpu` instead of uploading
+            it; the caller fills it in.
 
         Returns:
           A SpecDecodeMetadata object containing the necessary indices for
@@ -279,8 +305,12 @@ class SpeculativeDecodingManager:
             padded_draft_token_ids = np.zeros(padded_logits_length, dtype=np.int32)
             padded_draft_token_ids[: draft_token_ids.shape[0]] = draft_token_ids
             return SpecDecodeMetadata(
-                draft_token_ids=torch.from_numpy(padded_draft_token_ids).to(
-                    self.runner.device, non_blocking=True
+                draft_token_ids=(
+                    None
+                    if defer_draft_token_ids
+                    else torch.from_numpy(padded_draft_token_ids).to(
+                        self.runner.device, non_blocking=True
+                    )
                 ),
                 draft_lengths=self._meta_cache.draft_lengths,
                 draft_lengths_cpu=self._meta_cache.draft_lengths_cpu,
@@ -289,6 +319,9 @@ class SpeculativeDecodingManager:
                 final_logits_indices=self._meta_cache.final_logits_indices,
                 segment_ids=self._meta_cache.segment_ids,
                 group_indices=self._meta_cache.group_indices,
+                deferred_draft_token_ids_cpu=(
+                    padded_draft_token_ids if defer_draft_token_ids else None
+                ),
             )
 
         # [num_reqs]
@@ -382,8 +415,12 @@ class SpeculativeDecodingManager:
         device = self.runner.device
 
         metadata = SpecDecodeMetadata(
-            draft_token_ids=torch.from_numpy(padded_draft_token_ids).to(
-                device, non_blocking=True
+            draft_token_ids=(
+                None
+                if defer_draft_token_ids
+                else torch.from_numpy(padded_draft_token_ids).to(
+                    device, non_blocking=True
+                )
             ),
             draft_lengths=torch.from_numpy(padded_num_draft_tokens).to(
                 device, non_blocking=True
@@ -403,6 +440,9 @@ class SpeculativeDecodingManager:
             ),
             group_indices=torch.from_numpy(padded_group_indices).to(
                 device, non_blocking=True
+            ),
+            deferred_draft_token_ids_cpu=(
+                padded_draft_token_ids if defer_draft_token_ids else None
             ),
         )
         # draft_lengths_cpu aliases the caller's array; copy so a later caller

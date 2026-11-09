@@ -21,7 +21,7 @@ experimental path always builds sharded routing and never returns a GMM fallback
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -50,6 +50,8 @@ from vllm_torchtpu.logger import init_logger
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe import RoutedExperts
+
+    from vllm_torchtpu.layers.adapter.quantization.configs import TpuRoutedExperts
 
 PreparedWeights = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
 
@@ -91,6 +93,7 @@ def prebuild_adaptive_fused_moe(
     contraction block size are inferred from their dtype and scale shapes.
     No W4A8 opt-in or routing-plan environment variable is read here.
     """
+    layer = cast("TpuRoutedExperts", layer)
     parallel = layer.moe_config.moe_parallel_config
     if not parallel.use_ep:
         raise ValueError("adaptive fused MoE requires expert-parallel weights")
@@ -200,6 +203,7 @@ def prebuild_adaptive_nvfp4(
     configured_block: int | None = None,
 ) -> tuple[torch.library.CustomOpDef, int]:
     """Validate checkpoint geometry before committing runtime requantization."""
+    layer = cast("TpuRoutedExperts", layer)
     block = U32_SUBLANE_TILE * PACK4 if configured_block is None else configured_block
     hidden = layer.w13_weight.shape[-1] * 2
     inter = layer.w2_weight.shape[-1] * 2
@@ -384,12 +388,11 @@ def _unsupported_routing_reason(layer: RoutedExperts) -> str | None:
         return f"scoring_func {scoring_fn!r}; the kernel scores with softmax"
     if layer.e_score_correction_bias is not None:
         return "e_score_correction_bias is not applied inside the kernel"
-    if (
-        layer.use_grouped_topk
-        and layer.num_expert_group > 1
-        and layer.topk_group < layer.num_expert_group
-    ):
-        return "grouped top-k routing is not implemented in the kernel"
+    if layer.use_grouped_topk:
+        # vLLM's router requires both group sizes when grouped top-k is on.
+        assert layer.num_expert_group is not None and layer.topk_group is not None
+        if layer.num_expert_group > 1 and layer.topk_group < layer.num_expert_group:
+            return "grouped top-k routing is not implemented in the kernel"
     if getattr(layer, "hash_indices_table", None) is not None:
         return "hash routing is not implemented in the kernel"
     scale = float(layer.routed_scaling_factor)

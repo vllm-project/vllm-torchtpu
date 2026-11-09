@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Full-module line and branch coverage tests for megablox and quantized_matmul.
 
 Covers megablox (common, tuned_block_sizes, moe_onehot_unpermute, gmm_v2) and
@@ -83,7 +95,7 @@ class MockBuffer:
         if self._jnp is not None:
             try:
                 return self._jnp[idx]
-            except Exception:
+            except Exception:  # noqa: S110 (mock falls back to the default)
                 pass
         res = self.arr[idx]
         return jnp.asarray(res) if isinstance(res, (np.ndarray, np.generic)) else res

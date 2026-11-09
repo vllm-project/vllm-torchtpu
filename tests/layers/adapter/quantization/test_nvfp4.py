@@ -13,7 +13,7 @@
 # limitations under the License.
 """Tests for NVFP4 (ModelOpt FP4) quantization support for TPU.
 
-Verifies helper functions (_fresh, _to_kernel_scale, _requant_moe_w4a8),
+Verifies helper functions (fresh_buffer, _to_kernel_scale, _requant_moe_w4a8),
 VllmNvfp4Config dispatch, VllmNvfp4LinearMethod (create_weights,
 process_weights_after_loading, apply), and VllmNvfp4MoEMethod (create_weights,
 process_weights_after_loading across W4A16 and W4A8 paths, apply_monolithic).
@@ -35,7 +35,7 @@ from vllm_torchtpu.layers.adapter.quantization.nvfp4 import (
     VllmNvfp4Config,
     VllmNvfp4LinearMethod,
     VllmNvfp4MoEMethod,
-    _fresh,
+    _NullInputQuantKernel,
     _requant_moe_w4a8,
     _to_kernel_scale,
 )
@@ -43,6 +43,7 @@ from vllm_torchtpu.layers.adapter.quantization.unquantized import (
     VllmUnquantizedFusedMoEMethod,
     VllmUnquantizedLinearMethod,
 )
+from vllm_torchtpu.utils import fresh_buffer
 
 
 class FakeActivation:
@@ -90,7 +91,7 @@ class TestNvfp4Helpers:
 
     def test_fresh(self):
         t = torch.randn(4, 8, dtype=torch.float32)
-        f = _fresh(t)
+        f = fresh_buffer(t)
         assert torch.equal(f, t)
         assert f.data_ptr() != t.data_ptr()
         assert f.dtype == t.dtype
@@ -162,6 +163,7 @@ class TestNvfp4Helpers:
             _requant_moe_w4a8(w13_u8, w13_scale_f, w2_u8, w2_scale_f, block)
 
 
+@pytest.mark.tpu_test
 class TestNvfp4Config:
     """Tests for VllmNvfp4Config get_name and get_quant_method dispatch."""
 
@@ -216,27 +218,28 @@ class TestNvfp4Config:
 class TestNvfp4LinearMethod:
     """Tests for VllmNvfp4LinearMethod weight creation, processing, and apply."""
 
+    def test_null_input_quant_kernel(self):
+        kernel = _NullInputQuantKernel()
+        assert kernel.input_quant_key() is None
+
     def test_create_weights_registers_scalar_loader(self):
-        quant_config = VllmNvfp4Config.from_config({"quant_algo": "NVFP4"})
-        method = VllmNvfp4LinearMethod(quant_config, MagicMock())
+        quant_config = MagicMock(group_size=16)
+        linear_config = MagicMock()
+        method = VllmNvfp4LinearMethod(quant_config, linear_config)
+        assert method.ctx.group_size == 16
+        assert method.akey is None
+        assert method.spec is not None
         layer = make_linear_layer(64, 32)
-        with (
-            patch(
-                "vllm.model_executor.parameter.get_tensor_model_parallel_rank",
-                return_value=0,
-            ),
-            patch(
-                "vllm.model_executor.parameter.get_tensor_model_parallel_world_size",
-                return_value=1,
-            ),
+
+        def mock_base_create_weights(self, lyr, *args, **kwargs):
+            lyr.input_scale = torch.nn.Parameter(torch.zeros(1), requires_grad=False)
+            lyr.weight_scale_2 = torch.nn.Parameter(torch.zeros(1), requires_grad=False)
+
+        with patch(
+            "vllm.model_executor.layers.quantization.modelopt.ModelOptLinearMethod.create_weights",
+            mock_base_create_weights,
         ):
             method.create_weights(layer, 64, [32], 64, 32, torch.bfloat16)
-        assert layer.weight.shape == (32, 32)
-        assert layer.weight.dtype == torch.uint8
-        assert layer.weight_scale.shape == (32, 4)
-        assert layer.weight_scale.dtype == torch.float8_e4m3fn
-        assert method.kernel is None
-        assert not hasattr(layer, "input_quant_key")
 
         assert hasattr(layer.input_scale, "weight_loader")
         assert hasattr(layer.weight_scale_2, "weight_loader")

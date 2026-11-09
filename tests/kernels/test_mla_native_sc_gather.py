@@ -16,11 +16,13 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from absl.testing import absltest
 
 from vllm_torchtpu.kernels.mla.sparse import native_sc_cache_layout, native_sc_gather
 
 
+@pytest.mark.tpu_test
 class NativeScGatherTest(absltest.TestCase):
     def test_combined_gather_is_byte_exact(self):
         if jax.devices()[0].platform != "tpu":
@@ -65,6 +67,186 @@ class NativeScGatherTest(absltest.TestCase):
                     flat_rope_u8[flat_indices]
                 )
                 np.testing.assert_array_equal(np.asarray(gathered_rope), expected_rope)
+
+    def test_packed_rope_gather_matches_the_padded_cache(self):
+        """A 64-byte-per-token ROPE cache gathers to the same rows as the
+        128-byte padded one, rope tail zeroed, derived from cache shapes."""
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("native-SC gather requires a TPU SparseCore")
+
+        pages, page_size = 64, 1024
+        cache_tokens = pages * page_size
+        query_tokens, topk = 16, 2048
+        count = query_tokens * topk
+        rng = np.random.default_rng(20261018)
+        nope_u8 = rng.integers(0, 256, (pages, page_size, 4, 128), np.uint8)
+        rope_u8 = rng.integers(0, 256, (pages, page_size // 4, 4, 128), np.uint8)
+        rope_u8[..., 64:] = 0
+        nope_i32 = jnp.asarray(native_sc_cache_layout.pack_nope(nope_u8))
+        flat_rope_u8 = rope_u8.reshape(-1, 128)
+        packed_rope_i32 = jnp.asarray(
+            native_sc_cache_layout.pack_rope_packed(
+                flat_rope_u8[:, :64].reshape(pages, page_size, 64)
+            )
+        )
+        self.assertEqual(packed_rope_i32.shape, (pages, page_size // 8, 128))
+        flat_indices = rng.integers(0, cache_tokens, count, dtype=np.int32)
+        expected_rope = native_sc_cache_layout.pack_selected_rope_for_tc(
+            flat_rope_u8[flat_indices]
+        )
+
+        for atoms, live_kwargs in (
+            (16, {}),
+            (1, dict(num_live_indices=jnp.int32(5 * topk), live_multiple=topk)),
+        ):
+            with self.subTest(atoms=atoms, live=bool(live_kwargs)):
+                _, gathered_rope = jax.block_until_ready(
+                    native_sc_gather.dsa_gather_native_sc(
+                        nope_i32,
+                        packed_rope_i32,
+                        jnp.asarray(flat_indices.reshape(query_tokens, topk)),
+                        out_size=count,
+                        atoms_per_batch=atoms,
+                        **live_kwargs,
+                    )
+                )
+                groups = (
+                    count if not live_kwargs else 5 * topk
+                ) // native_sc_gather.ROPE_PACKING
+                np.testing.assert_array_equal(
+                    np.asarray(gathered_rope)[:groups], expected_rope[:groups]
+                )
+
+    def test_live_bounded_gather_is_byte_exact_on_live_rows(self):
+        """The decode bucket (16 tokens x topk 2048) with a traced live count.
+
+        Only the rows below ``num_live_indices`` are promised; the rest are
+        left unwritten. Whole-token counts (``live_multiple`` = topk) take the
+        unguarded grid; a ragged count exercises the per-owner tail guard.
+        """
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("native-SC gather requires a TPU SparseCore")
+
+        pages, page_size = 64, 1024
+        cache_tokens = pages * page_size
+        query_tokens, topk = 16, 2048
+        count = query_tokens * topk
+        rng = np.random.default_rng(20260925)
+        nope_u8 = rng.integers(0, 256, (pages, page_size, 4, 128), np.uint8)
+        rope_u8 = rng.integers(0, 0x7E, (pages, page_size // 4, 4, 128), np.uint8)
+        rope_u8[..., 64:] = 0
+        nope_i32 = native_sc_cache_layout.pack_nope(nope_u8)
+        rope_i32 = native_sc_cache_layout.pack_rope_banded(rope_u8)
+        flat_nope = native_sc_cache_layout.flatten_nope_rows(nope_i32)
+        flat_rope_u8 = rope_u8.reshape(-1, 128)
+        flat_indices = rng.integers(0, cache_tokens, count, dtype=np.int32)
+        indices = jnp.asarray(flat_indices.reshape(query_tokens, topk))
+
+        # Zero live rows first (an idle rank's dummy batch): the zero-trip
+        # path must start no DMA it does not wait, or every later launch in
+        # this process fails.
+        cases = [
+            (0, topk),
+            (0, 1),
+            (1 * topk, topk),
+            (5 * topk, topk),
+            (16 * topk, topk),
+            (1000, 1),
+        ]
+        for num_live, live_multiple in cases:
+            with self.subTest(num_live=num_live, live_multiple=live_multiple):
+                gathered_nope, gathered_rope = native_sc_gather.dsa_gather_native_sc(
+                    jnp.asarray(nope_i32),
+                    jnp.asarray(rope_i32),
+                    indices,
+                    out_size=count,
+                    atoms_per_batch=1,
+                    num_live_indices=jnp.int32(num_live),
+                    live_multiple=live_multiple,
+                )
+                gathered_nope, gathered_rope = jax.block_until_ready(
+                    (gathered_nope, gathered_rope)
+                )
+                live = flat_indices[:num_live]
+                np.testing.assert_array_equal(
+                    np.asarray(gathered_nope)[:num_live], flat_nope[live]
+                )
+                # ROPE rows pack four tokens each; compare whole groups only.
+                groups = num_live // native_sc_gather.ROPE_PACKING
+                expected_rope = native_sc_cache_layout.pack_selected_rope_for_tc(
+                    flat_rope_u8[flat_indices]
+                )
+                np.testing.assert_array_equal(
+                    np.asarray(gathered_rope)[:groups], expected_rope[:groups]
+                )
+
+
+class NativeScGatherCpuTest(absltest.TestCase):
+    def test_exported_mlir_has_no_allocate_buffer(self):
+        """Ensure native-SC gather lowers without AllocateBuffer custom calls
+        for both 64B (16-word) and 128B (32-word) SparseCore RoPE shapes."""
+        from unittest import mock
+
+        from jax._src import tpu_info as src_tpu_info
+        from jax._src.pallas.mosaic import tpu_info
+        from jax.experimental import pallas as pl
+        from jax.experimental.pallas import tpu as pltpu
+
+        info = src_tpu_info.get_tpu_info_for_chip(src_tpu_info.ChipVersion.TPU_7X, 1)
+        nope = jax.ShapeDtypeStruct((1024, 128), jnp.uint32)
+        idx = jax.ShapeDtypeStruct((256, 2048), jnp.int32)
+        live = jax.ShapeDtypeStruct((), jnp.int32)
+
+        def fn(n, r, i, live_idx):
+            return native_sc_gather.dsa_gather_native_sc(
+                n,
+                r,
+                i,
+                out_size=256 * 2048,
+                atoms_per_batch=16,
+                num_live_indices=live_idx,
+                live_multiple=16 * 512,
+            )
+
+        for rope_rows in (128, 256):
+            rope = jax.ShapeDtypeStruct((rope_rows, 128), jnp.uint32)
+            with (
+                self.subTest(rope_rows=rope_rows),
+                mock.patch.object(src_tpu_info, "get_tpu_info", return_value=info),
+                mock.patch.object(src_tpu_info, "is_tpu_device", return_value=True),
+                mock.patch.object(tpu_info, "get_tpu_info", return_value=info),
+                mock.patch.object(tpu_info, "is_tpu_device", return_value=True),
+                mock.patch.object(pltpu, "get_tpu_info", return_value=info),
+                pl.pallas_export_experimental(dynamic_shapes=False),
+            ):
+                exported = jax.export.export(jax.jit(fn), platforms=["tpu"])(
+                    nope, rope, idx, live
+                )
+                mlir_str = str(exported.mlir_module())
+            self.assertNotIn("AllocateBuffer", mlir_str)
+
+    def test_rejects_mismatched_or_unsupported_rope_row_widths(self):
+        """Negative controls: invalid rope_cache shapes fail before lowering."""
+        nope = jnp.zeros((4, 256, 128), jnp.uint32)
+        idx = jnp.zeros((16, 64), jnp.int32)
+        for bad_rope_shape, match in (
+            # Not divisible across the 1024 nope tokens (14848 % 1024 == 512).
+            ((4, 29, 128), "must divide"),
+            # 16 tokens/row -> 8 words/token (not a multiple of 16 lanes).
+            ((4, 16, 128), "derived rope_words"),
+            # 2 tokens/row -> 64 words/token (4 * 64 > 128).
+            ((4, 128, 128), "derived rope_words"),
+        ):
+            with (
+                self.subTest(bad_rope_shape=bad_rope_shape),
+                self.assertRaisesRegex(ValueError, match),
+            ):
+                native_sc_gather.dsa_gather_native_sc(
+                    nope,
+                    jnp.zeros(bad_rope_shape, jnp.uint32),
+                    idx,
+                    out_size=16 * 64,
+                )
 
 
 if __name__ == "__main__":

@@ -1,3 +1,16 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """USE_MOE_EP_KERNEL was deleted: setting it must now fail startup.
 
 It is not aliased to USE_MOE_FUSED_EP_KERNEL, which would enable the kernel
@@ -23,7 +36,11 @@ def vllm_config():
     config.model_config.is_hybrid = False
     config.cache_config = CacheConfig(enable_prefix_caching=False)
     config.compilation_config.compile_sizes = [16, 32]
+    # Budget within the largest compile size, which the platform requires.
+    config.scheduler_config.max_num_scheduled_tokens = None
+    config.scheduler_config.max_num_batched_tokens = 32
     config.speculative_config = None
+    config.lora_config = None
     config.parallel_config.nnodes = 1
     config.parallel_config.data_parallel_size = 1
     config.parallel_config.prefill_context_parallel_size = 1

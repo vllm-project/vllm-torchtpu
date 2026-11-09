@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Deviceless goldens for the Stage-3 physical-layout identity."""
 
 import pytest
@@ -127,6 +139,71 @@ def test_fingerprint_diverges_across_gdn_conv_layouts(monkeypatch):
     assert pair_payload["gdn_conv_layout"] == "qk-pair-v1"
     assert legacy_payload["gdn_conv_layout"] == "legacy-split-qk"
     assert pair_fingerprint != legacy_fingerprint
+
+
+def _gdn_manifest(*, key_heads=2, value_heads=8, conv_itemsize=4, ssm_itemsize=4):
+    """`_manifest` plus one GDN conv and one GDN SSM pool."""
+    manifest = _manifest()
+    head_dim = 128
+    key_bytes = value_bytes = head_dim * conv_itemsize
+    row = (2 * key_heads + value_heads) * head_dim * conv_itemsize
+    conv = (
+        rpm.RegionSpec("gdn_conv_q", 0, row, key_bytes, 3, key_heads),
+        rpm.RegionSpec(
+            "gdn_conv_k", key_heads * key_bytes, row, key_bytes, 3, key_heads
+        ),
+        rpm.RegionSpec(
+            "gdn_conv_v", 2 * key_heads * key_bytes, row, value_bytes, 3, value_heads
+        ),
+    )
+    head_bytes = head_dim * head_dim * ssm_itemsize
+    ssm = (rpm.RegionSpec("gdn_ssm", 0, head_bytes, head_bytes, value_heads),)
+    for tag, regions in (("gdn.conv.g0", conv), ("gdn.ssm.g0", ssm)):
+        manifest.pools.append(
+            rpm.PoolEntry(
+                tag=tag,
+                layer_name="model.layers.0.linear_attn",
+                storage_index=0,
+                base_offset_bytes=0,
+                block_stride_bytes=4096 * 1024,
+                num_blocks=16,
+                regions=regions,
+                dtype_tag="float8_e4m3fn",
+            )
+        )
+    return manifest
+
+
+def _measure_gdn(**kwargs):
+    return rlf.measured_fa_layout_fingerprint(
+        _gdn_manifest(**kwargs),
+        layout_getter=lambda tensor: ([4, 3, 2, 1, 0], [[4, 128], [4, 1]], 0),
+        package_version=lambda package: "unused",
+    )
+
+
+def test_fingerprint_pins_gdn_state_dtypes(monkeypatch):
+    """Peers on different conv or SSM state dtypes must not pair: neither the
+    layout version nor the FA geometry shows the state dtypes."""
+    monkeypatch.delenv("TPU_GDN_CONV_QK_PAIR_LAYOUT", raising=False)
+    fp32, payload = _measure_gdn()
+    assert payload["gdn_state_unit_bytes"] == {
+        "gdn_conv_k": 512,
+        "gdn_conv_q": 512,
+        "gdn_conv_v": 512,
+        "gdn_ssm": 65536,
+    }
+    bf16_conv, _ = _measure_gdn(conv_itemsize=2)
+    bf16_ssm, _ = _measure_gdn(ssm_itemsize=2)
+    assert len({fp32, bf16_conv, bf16_ssm}) == 3
+
+
+def test_gdn_state_fingerprint_ignores_head_sharding(monkeypatch):
+    """A producer and a consumer sharding the GDN heads differently pair."""
+    monkeypatch.delenv("TPU_GDN_CONV_QK_PAIR_LAYOUT", raising=False)
+    full, _ = _measure_gdn(key_heads=2, value_heads=8)
+    shard, _ = _measure_gdn(key_heads=1, value_heads=4)
+    assert full == shard
 
 
 @pytest.mark.parametrize(
@@ -258,6 +335,67 @@ def test_glm_fingerprint_rejects_shape_divergence_within_tag():
             manifest,
             page_tokens=1024,
             layout_getter=_glm_layout_getter,
+            package_version=lambda package: "unused",
+        )
+
+
+def _glm_sparsecore_manifest():
+    # TPU_SPARSE_MLA_{NOPE,ROPE}_LAYOUT=sparsecore: uint32 word rows.
+    named = glm_named_kv_caches()
+    for idx in range(2):
+        named[f"model.layers.{idx}.self_attn.mla_attn"] = (
+            FakeTensor((16, 1024, 128), 4, dtype="torch.uint32"),
+            FakeTensor((16, 256, 128), 4, dtype="torch.uint32"),
+        )
+    return rpm.build_glm_mla_pool_manifest(
+        named_kv_caches=named, raw_tensors=(), block_size_tokens=1024
+    )
+
+
+def test_measured_glm_layout_fingerprint_accepts_sparsecore_rows():
+    fingerprint, payload = rlf.measured_glm_layout_fingerprint(
+        _glm_sparsecore_manifest(),
+        page_tokens=1024,
+        layout_getter=_glm_layout_getter,
+        package_version=_glm_versions,
+    )
+
+    word_rows = {
+        "row_bytes": 512,
+        "minor_to_major": [2, 1, 0],
+        "tiles": [[8, 128]],
+        "element_size_in_bits": 32,
+    }
+    assert payload["layouts"]["mla.nope"] == word_rows | {"page_shape": [1024, 1, 128]}
+    assert payload["layouts"]["mla.rope"] == word_rows | {"page_shape": [256, 1, 128]}
+    # Same bytes per row, but a tensorcore peer must not pair with it.
+    tensorcore, _ = rlf.measured_glm_layout_fingerprint(
+        _glm_manifest(),
+        page_tokens=1024,
+        layout_getter=_glm_layout_getter,
+        package_version=_glm_versions,
+    )
+    assert fingerprint != tensorcore
+
+
+@pytest.mark.parametrize(
+    ("layout", "page_tokens", "message"),
+    [
+        (([1, 2, 0], [[8, 128]], 0), 1024, "physical order"),
+        (([2, 1, 0], [[8, 256]], 0), 1024, "tile shape"),
+        (([2, 1, 0], [[3, 128]], 0), 1024, "tile shape"),
+        (([2, 1, 0], [[8, 128]], 0), 512, "page geometry"),
+    ],
+)
+def test_measured_glm_sparsecore_fingerprint_fails_closed(layout, page_tokens, message):
+    def getter(tensor):
+        return layout if len(tensor.shape) == 3 else _glm_layout_getter(tensor)
+
+    with pytest.raises(RuntimeError, match=message):
+        rlf.measured_glm_layout_fingerprint(
+            _glm_sparsecore_manifest(),
+            page_tokens=page_tokens,
+            layout_getter=getter,
             package_version=lambda package: "unused",
         )
 

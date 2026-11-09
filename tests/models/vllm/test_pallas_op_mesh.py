@@ -17,7 +17,6 @@ from types import SimpleNamespace
 
 import jax
 import numpy as np
-import pytest
 from jax.sharding import Mesh
 
 import vllm_torchtpu
@@ -25,8 +24,6 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     get_pallas_op_mesh,
     set_vllm_model_wrapper_context,
 )
-
-pytestmark = pytest.mark.cpu_test
 
 _KERNEL_BUILDERS = ("jax_op", "custom_jax_kernel")
 

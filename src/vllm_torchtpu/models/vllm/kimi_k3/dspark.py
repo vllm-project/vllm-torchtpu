@@ -1,10 +1,22 @@
-# SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """TPU implementation of the dense MLA Kimi-K3 DSpark drafter."""
 
 from __future__ import annotations
 
 from collections.abc import Iterable
+from typing import TYPE_CHECKING, cast
 
 import torch
 from torch import nn
@@ -27,6 +39,11 @@ from vllm_torchtpu.layers.core.quantization import quantize_kv
 
 from .attention import MultiHeadLatentAttention
 from .layers import KimiMLP
+
+if TYPE_CHECKING:
+    from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
+        VllmTPUMLAAttention,
+    )
 
 
 def _duplicate_context_kv_weights(
@@ -148,6 +165,9 @@ class K3DSparkModel(nn.Module):
             self.config.markov_rank,
             prefix=maybe_prefix(prefix, "markov_head"),
         )
+        # load_weights skips the checkpoint's confidence head, so adaptive
+        # verification verifies every draft (see DSparkProposer.load_model).
+        self.confidence_head: nn.Module | None = None
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         assert self.embed_tokens is not None
@@ -174,9 +194,12 @@ class K3DSparkModel(nn.Module):
         kv_width = self.config.kv_lora_rank + self.config.qk_rope_head_dim
         all_kv = all_kv.view(num_tokens, num_layers, kv_width)
 
-        for layer_idx, layer in enumerate(self.layers):
+        for layer_idx, layer in enumerate(
+            cast("Iterable[K3DSparkDecoderLayer]", self.layers)
+        ):
             wrapper = layer.self_attn.mla_attn
-            core = wrapper.mla_attn
+            # The TPU MLA wrapper always builds a VllmTPUMLAAttention core.
+            core = cast("VllmTPUMLAAttention", wrapper.mla_attn)
             kv_lora = all_kv[:, layer_idx]
             kv_c, k_pe = kv_lora.split(
                 [self.config.kv_lora_rank, self.config.qk_rope_head_dim],
@@ -279,9 +302,8 @@ class K3DSparkForCausalLM(nn.Module):
         return self.model.get_draft_attn_causal()
 
     def get_draft_kv_cache_layer_names(self) -> list[str]:
-        return [
-            layer.self_attn.mla_attn.mla_attn.layer_name for layer in self.model.layers
-        ]
+        layers = cast("Iterable[K3DSparkDecoderLayer]", self.model.layers)
+        return [layer.self_attn.mla_attn.mla_attn.layer_name for layer in layers]
 
     def tpu_precompute_and_store_context_kv(
         self,

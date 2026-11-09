@@ -2,6 +2,15 @@
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Seq-along-lane FA pool byte spans (RESHARD_DP4TP2_SEQ_ON_LANE_PLAN.md, D1).
 
 The batched-RPA ``SEQ_ALONG_LANE`` cache is
@@ -41,6 +50,7 @@ from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.distributed.kv_transfer.raiden.byte_spans import (
     PoolByteSpan,
     PoolSpanRegistration,
+    _region_value,
     lower_gdn_state_shard_spans,
     owned_token_ranges,
 )
@@ -50,8 +60,16 @@ from vllm_torchtpu.distributed.kv_transfer.raiden.pool_manifest import (
     PoolManifest,
     RegionSpec,
     build_qwen35_pool_manifest,
+    gdn_state_unit_bytes,
 )
-from vllm_torchtpu.distributed.kv_transfer.raiden.tags import TAG_FA, class_tag
+from vllm_torchtpu.distributed.kv_transfer.raiden.tags import (
+    TAG_FA,
+    TAG_GDN_CONV,
+    TAG_GDN_SSM,
+    class_tag,
+    libtpu_key,
+)
+from vllm_torchtpu.kernels.gdn.head_geometry import derive_gdn_head_geometry
 
 # One vreg lane row: the DMA / tile granule of the layout.
 LANE_WIDTH = 128
@@ -238,6 +256,7 @@ def build_qwen35_pool_manifest_sol(
     gdn_geometry: GdnHeadGeometry,
     mamba_group_ordinal_by_layer: Mapping[str, int] | None = None,
     per_layer_tags: bool = False,
+    layer_index_by_name: Mapping[str, int] | None = None,
 ) -> PoolManifest:
     """The canonical Qwen3.5 manifest with seq-on-lane FA regions; GDN state
     pools derive exactly as in the token-major manifest (byte-level: SSM at
@@ -250,6 +269,7 @@ def build_qwen35_pool_manifest_sol(
         mamba_group_ordinal_by_layer=mamba_group_ordinal_by_layer,
         fa_layout=SolFaLayout(),
         per_layer_tags=per_layer_tags,
+        layer_index_by_name=layer_index_by_name,
     )
 
 
@@ -499,6 +519,8 @@ def lower_gdn_state_shard_spans_sol(
     producer_tp_size: int = 1,
     producer_tp_rank: int = 0,
     physical_granule_bytes: int = 1024,
+    num_key_heads: int | None = None,
+    num_value_heads: int | None = None,
 ) -> PoolSpanRegistration:
     """One rank's GDN head shard into its destination shard's full state.
 
@@ -509,7 +531,11 @@ def lower_gdn_state_shard_spans_sol(
     ``dst_shards == 1`` is exactly the existing lowering. A full-width
     producer (``parallelism == 1``, e.g. a DP prefill engine) splits its
     state instead: shard ``d`` takes head block ``d`` of every region
-    (``_lower_gdn_state_split_spans``). Layout-independent: GDN state bytes
+    (``_lower_gdn_state_split_spans``). A sharded producer with more
+    destination shards than ranks (``dst_shards % parallelism == 0``) feeds
+    several destinations from each rank
+    (``lower_gdn_state_fanout_spans_sol``, which needs the model's head
+    counts). Layout-independent: GDN state bytes
     are word-row separable under both FA layouts.
 
     ``physical_granule_bytes`` is the measured state carrier's word-row
@@ -537,6 +563,23 @@ def lower_gdn_state_shard_spans_sol(
             block_id=block_id,
             regions=regions,
             dst_shards=dst_shards,
+            physical_granule_bytes=physical_granule_bytes,
+        )
+    if dst_shards > parallelism and dst_shards % parallelism == 0:
+        if num_key_heads is None or num_value_heads is None:
+            raise SeqOnLaneError(
+                "GDN fan-out to more destination shards than producer ranks "
+                "requires the model's key and value head counts"
+            )
+        return lower_gdn_state_fanout_spans_sol(
+            tag=tag,
+            block_id=block_id,
+            transfer_rank=transfer_rank,
+            parallelism=parallelism,
+            regions=regions,
+            dst_shards=dst_shards,
+            num_key_heads=num_key_heads,
+            num_value_heads=num_value_heads,
             physical_granule_bytes=physical_granule_bytes,
         )
     if parallelism % dst_shards:
@@ -630,6 +673,231 @@ def _lower_gdn_state_split_spans(
     return dataclasses.replace(full, spans=tuple(spans))
 
 
+_STATE_REGION_FIELDS = (
+    "offset_bytes",
+    "stride_bytes",
+    "unit_bytes",
+    "num_units",
+    "units_per_stride",
+)
+
+
+def _state_region_map(
+    tag: str, regions: Sequence[object]
+) -> dict[str, tuple[int, ...]]:
+    """``name -> (offset, stride, unit, num_units, units_per_stride)``."""
+    result: dict[str, tuple[int, ...]] = {}
+    for region in regions:
+        name = str(_region_value(region, "name"))
+        if name in result:
+            raise SeqOnLaneError(f"duplicate GDN state region {name!r} ({tag})")
+        values = tuple(
+            int(_region_value(region, field)) for field in _STATE_REGION_FIELDS
+        )
+        if min(values[:2]) < 0 or min(values[2:]) <= 0:
+            raise SeqOnLaneError(f"invalid GDN state region {name!r} ({tag})")
+        result[name] = values
+    return result
+
+
+def lower_gdn_state_fanout_spans_sol(
+    *,
+    tag: str,
+    block_id: int,
+    transfer_rank: int,
+    parallelism: int,
+    regions: Sequence[object],
+    dst_shards: int,
+    num_key_heads: int,
+    num_value_heads: int,
+    physical_granule_bytes: int = 1024,
+) -> PoolSpanRegistration:
+    """One rank's GDN head shard into the narrower states of the
+    ``F = dst_shards // parallelism`` destination shards holding its heads.
+
+    Both sides own heads as ``derive_gdn_head_geometry`` describes: rank
+    ``r`` of degree ``N`` holds value-head block ``r`` and key-head block
+    ``r // R`` (``R`` = Q/K replication at degree ``N``). Destination ``d``
+    holds a subset of producer rank ``d // F``'s heads and receives its
+    whole state from that rank, routed by ``dst_unit_ordinal``.
+    Destinations sharing a key head each receive a copy of its Q/K rows.
+
+    Conv: the unified pool stores each tap segment-major, ``[Q heads |
+    K heads | V heads]``, so a destination takes one run per segment and
+    tap. SSM: one run of the destination's value heads.
+
+    ``declared_bytes`` counts every routed byte, so replicated Q/K rows
+    count once per destination.
+    """
+    if parallelism <= 1 or dst_shards <= parallelism or dst_shards % parallelism:
+        raise SeqOnLaneError(
+            "GDN fan-out requires a sharded producer and a whole number of "
+            f"destination shards per rank: parallelism={parallelism}, "
+            f"dst_shards={dst_shards}"
+        )
+    if not 0 <= transfer_rank < parallelism:
+        raise SeqOnLaneError(
+            f"transfer_rank {transfer_rank} is outside parallelism {parallelism}"
+        )
+    if block_id < 0 or physical_granule_bytes <= 0:
+        raise SeqOnLaneError("GDN state block id and physical granule must be valid")
+    try:
+        source = derive_gdn_head_geometry(num_key_heads, num_value_heads, parallelism)
+        destination = derive_gdn_head_geometry(
+            num_key_heads, num_value_heads, dst_shards
+        )
+    except ValueError as exc:
+        raise SeqOnLaneError(f"GDN heads do not shard: {exc}") from exc
+    fan_out = dst_shards // parallelism
+    src_keys, src_values = source.local_num_kq_heads, source.local_num_v_heads
+    dst_keys, dst_values = (
+        destination.local_num_kq_heads,
+        destination.local_num_v_heads,
+    )
+    src_key0 = source.kq_shard_index(transfer_rank) * src_keys
+    src_value0 = transfer_rank * src_values
+    # (destination shard, first key head, first value head), local to this
+    # rank's head blocks.
+    targets = []
+    for shard in range(transfer_rank * fan_out, (transfer_rank + 1) * fan_out):
+        key = destination.kq_shard_index(shard) * dst_keys - src_key0
+        value = shard * dst_values - src_value0
+        if not (
+            0 <= key <= src_keys - dst_keys and 0 <= value <= src_values - dst_values
+        ):
+            raise SeqOnLaneError(
+                f"destination shard {shard} heads lie outside producer rank "
+                f"{transfer_rank}'s heads"
+            )
+        targets.append((shard, key, value))
+
+    layout = _state_region_map(tag, regions)
+    is_conv = tag == TAG_GDN_CONV or tag.startswith(f"{TAG_GDN_CONV}.")
+    is_ssm = tag == TAG_GDN_SSM or tag.startswith(f"{TAG_GDN_SSM}.")
+    names = set(layout)
+    if is_ssm:
+        if names != {"gdn_ssm"}:
+            raise SeqOnLaneError(
+                f"GDN SSM layout requires exactly gdn_ssm, got {sorted(names)} ({tag})"
+            )
+        offset, stride, unit, heads, per_stride = layout["gdn_ssm"]
+        head_bytes = unit * per_stride
+        if offset != 0 or stride != head_bytes or heads != src_values:
+            raise SeqOnLaneError(
+                "GDN SSM compact layout must be dense and head-major over "
+                f"the rank's {src_values} value heads ({tag})"
+            )
+        taps, src_row, dst_row = 1, 0, 0
+        runs = [
+            (shard, [(value * head_bytes, 0, dst_values * head_bytes)])
+            for shard, _, value in targets
+        ]
+    elif is_conv and names == {"gdn_conv_q", "gdn_conv_k", "gdn_conv_v"}:
+        q, k, v = layout["gdn_conv_q"], layout["gdn_conv_k"], layout["gdn_conv_v"]
+        taps = q[3]
+        key_bytes, value_bytes = q[2], v[2]
+        src_q = key_bytes * src_keys
+        src_row = 2 * src_q + value_bytes * src_values
+        if (
+            q[0] != 0
+            or k[0] != src_q
+            or v[0] != 2 * src_q
+            or k[2] != key_bytes
+            or q[4] != src_keys
+            or k[4] != src_keys
+            or v[4] != src_values
+            or k[3] != taps
+            or v[3] != taps
+            or any(region[1] != src_row for region in (q, k, v))
+        ):
+            raise SeqOnLaneError(
+                "GDN conv compact layout must be dense tap-major "
+                f"[Q | K | V] over the rank's heads ({tag})"
+            )
+        dst_q = dst_keys * key_bytes
+        dst_row = 2 * dst_q + dst_values * value_bytes
+        runs = [
+            (
+                shard,
+                [
+                    (key * key_bytes, 0, dst_q),
+                    (src_q + key * key_bytes, dst_q, dst_q),
+                    (
+                        2 * src_q + value * value_bytes,
+                        2 * dst_q,
+                        dst_values * value_bytes,
+                    ),
+                ],
+            )
+            for shard, key, value in targets
+        ]
+    else:
+        raise SeqOnLaneError(
+            f"unsupported GDN state tag or regions: {tag!r} {sorted(names)}"
+        )
+
+    spans: list[PoolByteSpan] = []
+    for shard, shard_runs in runs:
+        for src_offset, dst_offset, size in shard_runs:
+            for name, extent in (
+                ("source offset", src_offset),
+                ("destination offset", dst_offset),
+                ("size", size),
+                ("source row", src_row),
+                ("destination row", dst_row),
+            ):
+                if extent % physical_granule_bytes:
+                    raise SeqOnLaneError(
+                        f"GDN fan-out {name} {extent} B is not a whole "
+                        f"physical granule ({physical_granule_bytes} B) ({tag})"
+                    )
+            spans.append(
+                PoolByteSpan(
+                    src_block_ordinal=0,
+                    src_offset_bytes=src_offset,
+                    dst_block_index=0,
+                    dst_offset_bytes=dst_offset,
+                    size_bytes=size,
+                    src_stride_bytes=src_row,
+                    dst_stride_bytes=dst_row,
+                    count=taps,
+                    dst_unit_ordinal=shard,
+                )
+            )
+    return PoolSpanRegistration(
+        tag=tag,
+        block_ids=(int(block_id),),
+        spans=tuple(spans),
+        declared_bytes=sum(span.size_bytes * span.count for span in spans),
+    )
+
+
+def registration_source_bytes(registration: PoolSpanRegistration) -> int:
+    """Distinct source bytes a registration reads: the union over every span
+    repeat, so source bytes copied to several destinations count once."""
+    intervals = sorted(
+        (
+            span.src_block_ordinal,
+            span.src_offset_bytes + repeat * span.src_stride_bytes,
+            span.src_offset_bytes + repeat * span.src_stride_bytes + span.size_bytes,
+        )
+        for span in registration.spans
+        for repeat in range(span.count)
+    )
+    total = 0
+    current: tuple[int, int, int] | None = None
+    for ordinal, start, end in intervals:
+        if current is not None and current[0] == ordinal and start <= current[2]:
+            current = (ordinal, current[1], max(current[2], end))
+            continue
+        if current is not None:
+            total += current[2] - current[1]
+        current = (ordinal, start, end)
+    if current is not None:
+        total += current[2] - current[1]
+    return total
+
+
 def _default_layout_getter(tensor: Any) -> Any:
     from torch_tpu._internal.compile import tpu_torch_compile
 
@@ -688,11 +956,11 @@ def measured_sol_layout_fingerprint(
             f"gate: measured={element_bits} expected=8"
         )
     version = package_version or importlib.metadata.version
-    qk_pair = bool(getattr(tpu_envs, "TPU_GDN_CONV_QK_PAIR_LAYOUT", True))
-    payload = {
+    qk_pair = tpu_envs.TPU_GDN_CONV_QK_PAIR_LAYOUT
+    payload: dict[str, Any] = {
         "schema": SOL_FINGERPRINT_SCHEMA,
         "torch_tpu": version("torch_tpu"),
-        "libtpu": version("libtpu"),
+        "libtpu": libtpu_key(package_version),
         "minor_to_major": list(minor_to_major),
         "tiles": [list(tile) for tile in tiles],
         "element_size_in_bits": element_bits,
@@ -702,6 +970,10 @@ def measured_sol_layout_fingerprint(
         "pool_lane_width": LANE_WIDTH,
         "gdn_conv_layout": "qk-pair-v1" if qk_pair else "legacy-split-qk",
     }
+    # See measured_fa_layout_fingerprint: pins the GDN state dtypes.
+    unit_bytes = gdn_state_unit_bytes(manifest)
+    if unit_bytes:
+        payload["gdn_state_unit_bytes"] = unit_bytes
     return canonical_fingerprint(payload), payload
 
 
@@ -720,8 +992,10 @@ __all__ = [
     "build_qwen35_pool_manifest_sol",
     "canonical_fingerprint",
     "lower_fa_spans_sol",
+    "lower_gdn_state_fanout_spans_sol",
     "lower_gdn_state_shard_spans_sol",
     "measured_sol_layout_fingerprint",
+    "registration_source_bytes",
     "sol_fa_geometry_from_manifest",
     "sol_fa_geometry_from_shape",
     "sol_fa_page_tokens",

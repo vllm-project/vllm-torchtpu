@@ -1,3 +1,16 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from unittest.mock import MagicMock
 
 import pytest
@@ -168,3 +181,65 @@ class TestCompressedTensorsConfigRouting:
             VllmCompressedTensorsMoEMethod.get_moe_method(
                 config, layer, "model.layers.0.block"
             )
+
+
+def _compressed_tensors_fp8_config(weights: dict) -> VllmCompressedTensorsConfig:
+    """llm-compressor FP8 `quantization_config`, reduced to what MoE dispatch reads."""
+    return VllmCompressedTensorsConfig.from_config(
+        {
+            "config_groups": {
+                "group_0": {
+                    "weights": {"type": "float", **weights},
+                    "targets": ["Linear"],
+                }
+            },
+            "format": "float-quantized",
+            "quant_method": "compressed-tensors",
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    "weights,w13_scale_shape,w2_scale_shape",
+    [
+        # One scale per 128x128 block of the 2 experts' [512, 256] w13 / [256, 256] w2.
+        pytest.param(
+            {"strategy": "block", "block_structure": [128, 128]},
+            (2, 4, 2),
+            (2, 2, 2),
+            id="block",
+        ),
+        # Channel and tensor already used `weight_scale`; they must keep doing so.
+        pytest.param({"strategy": "channel"}, (2, 512, 1), (2, 256, 1), id="channel"),
+        pytest.param({"strategy": "tensor"}, (2, 2), (2,), id="tensor"),
+    ],
+)
+def test_fp8_experts_register_compressed_tensors_scale_names(
+    make_fp8_experts, weights, w13_scale_shape, w2_scale_shape
+):
+    """compressed-tensors names every scale `weight_scale`; the fused layer must
+    register that name, not the DeepSeek-style `weight_scale_inv`."""
+    quant = _compressed_tensors_fp8_config(weights)
+    layer = make_fp8_experts(quant, 256, tp_size=1, tp_rank=0)
+
+    assert isinstance(layer.quant_method, VllmFp8MoEMethodTPU)
+    params = dict(layer.named_parameters())
+    assert not [name for name in params if name.endswith("weight_scale_inv")]
+    assert params["w13_weight_scale"].shape == w13_scale_shape
+    assert params["w2_weight_scale"].shape == w2_scale_shape
+    # Expert loaders pass the checkpoint's own tensor name to the loader.
+    w2_scale = params["w2_weight_scale"]
+    scales = torch.arange(w2_scale[0].numel(), dtype=torch.float32).reshape(
+        w2_scale.shape[1:]
+    )
+    for proj in ("gate", "up", "down"):
+        list(layer.load_weights([(f"0.{proj}_proj.weight_scale", scales)]))
+    torch.testing.assert_close(w2_scale[0], scales)
+    gate, up = params["w13_weight_scale"][0].reshape(2, *scales.shape)
+    torch.testing.assert_close(gate, scales)
+    torch.testing.assert_close(up, scales)
+
+    layer.quant_method.process_weights_after_loading(layer)
+    params = dict(layer.named_parameters())
+    assert "w13_weight_scale" not in params and "w2_weight_scale" not in params
+    assert "w13_weight_scale_inv" in params and "w2_weight_scale_inv" in params

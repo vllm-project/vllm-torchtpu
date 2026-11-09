@@ -15,7 +15,9 @@
 position-ownership rule the indexer's return leg and the KV write agree on, and
 the kernel `return_lse` flag the merge is built on."""
 
+import concurrent.futures
 import math
+import threading
 
 import jax
 import jax.numpy as jnp
@@ -24,6 +26,7 @@ import pytest
 import torch
 from absl.testing import parameterized
 
+from vllm_torchtpu.distributed import dcp_comm
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     cp_global_to_local,
     cp_owner_rank,
@@ -55,7 +58,10 @@ class _FakeGroup:
         total = None
         for rank in range(self.world_size):
             peer = _FakeGroup(self._outputs, self._lses, rank)
-            term = cp_mla._weight_by_lse(self._outputs[rank], self._lses[rank], peer)
+            peer.reduce_scatter = lambda tensor, dim: tensor
+            term = dcp_comm.cp_lse_ag_out_rs(
+                self._outputs[rank], self._lses[rank], peer
+            )
             total = term if total is None else total + term
         return total.to(dtype)
 
@@ -115,6 +121,91 @@ def test_torch_merge_matches_the_reference(dcp_size, monkeypatch):
     got = _merge_whole(outputs, lses, monkeypatch).numpy()
     np.testing.assert_allclose(
         got, _reference_merge(outputs, lses), rtol=1e-5, atol=1e-5
+    )
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_rs_bf16_flag_sets_the_reduce_scatter_dtype(enabled, monkeypatch):
+    """TPU_DCP_RS_OUT_PRECISION rounds the terms to the output dtype before the
+    reduce-scatter; off, they cross in f32. The result keeps the output dtype."""
+    monkeypatch.setattr(
+        cp_mla.envs,
+        "TPU_DCP_RS_OUT_PRECISION",
+        enabled,
+        raising=False,
+    )
+    outputs, lses = _partials(np.random.default_rng(5), 4)
+    outputs = outputs.to(torch.bfloat16)
+    group = _FakeGroup(outputs, lses, 0)
+    seen = []
+    inner = group.reduce_scatter
+
+    def spy(tensor, dim=-1):
+        seen.append(tensor.dtype)
+        return inner(tensor, dim)
+
+    group.reduce_scatter = spy
+    monkeypatch.setattr(cp_mla, "get_dcp_group", lambda: group)
+    got = cp_mla.merge_lse_partials_scatter_heads(outputs[0], lses[0])
+    assert seen == [torch.bfloat16 if enabled else torch.float32]
+    assert got.dtype == torch.bfloat16
+
+
+def test_rs_bf16_flag_leaves_the_drafter_in_f32(monkeypatch):
+    """The MTP drafter (is_backbone=False) keeps the f32 reduce-scatter even
+    with TPU_DCP_RS_OUT_PRECISION on."""
+    monkeypatch.setattr(cp_mla.envs, "TPU_DCP_RS_OUT_PRECISION", True, raising=False)
+    outputs, lses = _partials(np.random.default_rng(6), 4)
+    outputs = outputs.to(torch.bfloat16)
+    group = _FakeGroup(outputs, lses, 0)
+    seen = []
+    inner = group.reduce_scatter
+
+    def spy(tensor, dim=-1):
+        seen.append(tensor.dtype)
+        return inner(tensor, dim)
+
+    group.reduce_scatter = spy
+    monkeypatch.setattr(cp_mla, "get_dcp_group", lambda: group)
+    got = cp_mla.merge_lse_partials_scatter_heads(
+        outputs[0], lses[0], is_backbone=False
+    )
+    assert seen == [torch.float32]
+    assert got.dtype == torch.bfloat16
+
+
+def test_glm52_fp8_default_reduce_scatters_in_bf16(monkeypatch):
+    """GLM-5.2-FP8 (bf16 activations, 64 heads, kv_lora_rank 512) at DCP=16:
+    with the flag at its default, the merge passes rs_dtype=bf16."""
+    monkeypatch.delenv("TPU_DCP_RS_OUT_PRECISION", raising=False)
+    dcp, heads, kv_lora_rank = 16, 64, 512
+    outputs, lses = _partials(
+        np.random.default_rng(52),
+        dcp,
+        tokens=4,
+        local_heads=heads // dcp,
+        vdim=kv_lora_rank,
+    )
+    outputs = outputs.to(torch.bfloat16)
+    group = _FakeGroup(outputs, lses, 3)
+    seen = []
+    real = cp_mla.cp_lse_ag_out_rs
+
+    def spy(output, lse, grp, **kwargs):
+        seen.append(kwargs.get("rs_dtype"))
+        return real(output, lse, grp, **kwargs)
+
+    monkeypatch.setattr(cp_mla, "cp_lse_ag_out_rs", spy)
+    monkeypatch.setattr(cp_mla, "get_dcp_group", lambda: group)
+    got = cp_mla.merge_lse_partials_scatter_heads(outputs[3], lses[3])
+    assert seen == [torch.bfloat16]
+    assert got.dtype == torch.bfloat16
+    assert tuple(got.shape) == (4, heads // dcp, kv_lora_rank)
+    np.testing.assert_allclose(
+        got.float().numpy(),
+        _reference_merge(outputs.float(), lses)[:, 12:16],
+        rtol=2e-2,
+        atol=2e-2,
     )
 
 
@@ -187,11 +278,21 @@ def test_head_gather_puts_this_ranks_heads_in_its_own_block(rank, monkeypatch):
         got[:, rank * 3 : (rank + 1) * 3].numpy(), per_rank[rank].numpy()
     )
 
+    nope_dcp, pe_dcp = cp_mla.all_gather_q_nope_pe_heads(
+        per_rank[rank][..., :5], per_rank[rank][..., 5:], 5
+    )
+    np.testing.assert_array_equal(nope_dcp.numpy(), got[..., :5].numpy())
+    np.testing.assert_array_equal(pe_dcp.numpy(), got[..., 5:].numpy())
+
 
 def test_head_gather_is_a_noop_without_a_group(monkeypatch):
     monkeypatch.setattr(cp_mla, "get_dcp_group", lambda: None)
     q = torch.ones(2, 3, 4)
     assert cp_mla.all_gather_heads(q) is q
+    q_pe = torch.ones(2, 3, 2)
+    nope_out, pe_out = cp_mla.all_gather_q_nope_pe_heads(q, q_pe, 4)
+    assert nope_out is q
+    assert pe_out is q_pe
 
 
 def test_scatter_merge_is_a_noop_without_a_group(monkeypatch):
@@ -229,13 +330,175 @@ def test_merge_reproduces_an_unsplit_softmax(monkeypatch):
 
 
 # ===================================================================== #
+# The all-to-all merge (`TPU_DCP_LSE_MERGE_A2A`).
+# ===================================================================== #
+
+
+class _ExchangeHub:
+    """A lockstep all-to-all between threads, one thread per DCP rank."""
+
+    def __init__(self, world, wrong_destination=False):
+        self.world = world
+        self.slots = [None] * world
+        self.barrier = threading.Barrier(world)
+        # Fault injection: rank `r` is handed the block meant for rank `r+1`.
+        self.wrong_destination = wrong_destination
+
+
+class _A2AGroup:
+    def __init__(self, hub, rank):
+        self.world_size = hub.world
+        self.rank_in_group = rank
+        self.device_group = None
+        self._hub = hub
+
+    def all_to_all(self, x):
+        hub = self._hub
+        hub.slots[self.rank_in_group] = x
+        hub.barrier.wait()
+        dest = (self.rank_in_group + int(hub.wrong_destination)) % hub.world
+        recv = torch.stack([hub.slots[src][dest] for src in range(hub.world)])
+        hub.barrier.wait()
+        return recv
+
+
+def _a2a_merge_whole(outputs, lses, monkeypatch, wrong_destination=False):
+    """Every rank's all-to-all merge, run in lockstep, reassembled over heads."""
+    monkeypatch.setattr(cp_mla, "_all_to_all", lambda x, group: group.all_to_all(x))
+    world = outputs.shape[0]
+    hub = _ExchangeHub(world, wrong_destination)
+
+    def run(rank):
+        return cp_mla.merge_lse_partials_all_to_all(
+            outputs[rank], lses[rank], _A2AGroup(hub, rank)
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(world) as pool:
+        blocks = list(pool.map(run, range(world)))
+    return torch.cat(blocks, dim=1)
+
+
+def _hard_partials(rng, dcp_size, tokens=12, local_heads=4, vdim=64):
+    """bf16 partials (the kernel's output dtype) with f32 lse that exercise
+    every merge rule: large lse (a merge without the max shift overflows exp),
+    tokens one rank owns alone, a token no rank owns, a rank owning nothing."""
+    heads = dcp_size * local_heads
+    outputs = torch.from_numpy(
+        rng.standard_normal((dcp_size, tokens, heads, vdim)).astype(np.float32)
+    ).to(torch.bfloat16)
+    lses = torch.from_numpy(
+        (rng.standard_normal((dcp_size, tokens, heads)) * 4).astype(np.float32)
+    )
+    lses[:, 0] += 200.0  # exp(200) overflows f32: only the shift saves it
+    lses[:, 1] -= 200.0  # exp(-200) underflows f32 to 0: only the shift saves it
+    lses[1:, 2] = float("-inf")  # rank 0 owns token 2 alone
+    lses[:, 3] = float("-inf")  # nobody owns token 3 (a padding row)
+    lses[dcp_size - 1] = float("-inf")  # the last rank owns nothing at all
+    lses[0, 4, :local_heads] = float("-inf")  # a mixed row, per head
+    return outputs, lses
+
+
+def _bf16_close(got, reference):
+    """Within bf16 rounding of the f64 answer: one bf16 ulp (2^-8 relative,
+    since the bf16 mantissa has 8 bits with the implicit one) plus a floor."""
+    got = got.to(torch.float32).numpy().astype(np.float64)
+    return bool(
+        np.isfinite(got).all()
+        and (np.abs(got - reference) <= 2.0**-8 * np.abs(reference) + 1e-6).all()
+    )
+
+
+@pytest.mark.parametrize("dcp_size", [2, 4, 8, 16])
+def test_all_to_all_merge_matches_the_f64_reference(dcp_size, monkeypatch):
+    outputs, lses = _hard_partials(np.random.default_rng(20261002), dcp_size)
+    got = _a2a_merge_whole(outputs, lses, monkeypatch)
+    assert got.dtype == torch.bfloat16
+    assert got.shape == outputs.shape[1:]
+    reference = _reference_merge(outputs.float(), lses)
+    assert _bf16_close(got, reference)
+    # The `-inf` rules, stated exactly: a lone owner comes back verbatim and a
+    # token nobody owns is zero, not NaN.
+    torch.testing.assert_close(got[2], outputs[0, 2], rtol=0, atol=0)
+    assert (got[3] == 0).all()
+
+
+def test_all_to_all_merge_agrees_with_the_reduce_scatter_merge(monkeypatch):
+    """Compare both paths to the reference."""
+    outputs, lses = _hard_partials(np.random.default_rng(7), 8)
+    reference = _reference_merge(outputs.float(), lses)
+    a2a_result = _a2a_merge_whole(outputs, lses, monkeypatch)
+    ag_rs_result = _merge_whole(outputs.float(), lses, monkeypatch).to(torch.bfloat16)
+    assert _bf16_close(a2a_result, reference)
+    assert _bf16_close(ag_rs_result, reference)
+
+
+def test_positive_control_wrong_head_slice_is_caught(monkeypatch):
+    """The reference check must fail when a rank merges another rank's heads."""
+    outputs, lses = _hard_partials(np.random.default_rng(13), 4)
+    got = _a2a_merge_whole(outputs, lses, monkeypatch, wrong_destination=True)
+    assert not _bf16_close(got, _reference_merge(outputs.float(), lses))
+
+
+def test_positive_control_dropped_lse_shift_is_caught(monkeypatch):
+    """The reference check must fail when the merge skips the max shift."""
+
+    def unshifted(o_recv, l_recv):
+        weights = torch.where(
+            torch.isfinite(l_recv), torch.exp(l_recv), torch.zeros_like(l_recv)
+        )
+        denom = weights.sum(dim=0)
+        weights = weights / torch.where(denom > 0, denom, torch.ones_like(denom))
+        return (o_recv.to(torch.float32) * weights.unsqueeze(-1)).sum(dim=0)
+
+    outputs, lses = _hard_partials(np.random.default_rng(17), 4)
+    monkeypatch.setattr(cp_mla, "_merge_received", unshifted)
+    got = _a2a_merge_whole(outputs, lses, monkeypatch)
+    assert not _bf16_close(got, _reference_merge(outputs.float(), lses))
+
+
+@pytest.mark.parametrize(
+    "enabled,tokens,is_backbone,expect_a2a",
+    [
+        (False, 8, True, False),
+        (True, 8, True, True),
+        (True, 256, True, True),
+        (True, 257, True, False),
+        # The MTP drafter, traced once for every bucket, keeps the
+        # reduce-scatter at every size.
+        (True, 8, False, False),
+        (True, 257, False, False),
+        (False, 257, False, False),
+    ],
+)
+def test_merge_picks_the_all_to_all(
+    enabled, tokens, is_backbone, expect_a2a, monkeypatch
+):
+    calls = []
+    monkeypatch.setattr(cp_mla.envs, "TPU_DCP_LSE_MERGE_A2A", enabled, raising=False)
+    monkeypatch.setattr(
+        cp_mla.envs, "TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS", 256, raising=False
+    )
+    monkeypatch.setattr(
+        cp_mla,
+        "merge_lse_partials_all_to_all",
+        lambda o, lse, g: calls.append(o.shape[0]) or o[:, :2],
+    )
+    outputs, lses = _partials(np.random.default_rng(3), 2, tokens=tokens, vdim=4)
+    group = _FakeGroup(outputs, lses, 0)
+    monkeypatch.setattr(cp_mla, "get_dcp_group", lambda: group)
+    cp_mla.merge_lse_partials_scatter_heads(
+        outputs[0], lses[0], is_backbone=is_backbone
+    )
+    assert calls == ([tokens] if expect_a2a else [])
+
+
+# ===================================================================== #
 # Position ownership tests.
 # ===================================================================== #
 
 _OWNERSHIP = [(d, c) for d in (2, 4, 8, 16) for c in (1, 4, 64)]
 
 
-@pytest.mark.cpu_test
 @pytest.mark.parametrize("dcp_size,interleave_c", _OWNERSHIP)
 def test_ownership_is_a_partition_of_the_positions(dcp_size, interleave_c):
     """Every position has exactly one owner, and every rank is an owner."""
@@ -247,7 +510,6 @@ def test_ownership_is_a_partition_of_the_positions(dcp_size, interleave_c):
     assert set(owners.tolist()) == set(range(dcp_size))
 
 
-@pytest.mark.cpu_test
 @pytest.mark.parametrize("dcp_size,interleave_c", _OWNERSHIP)
 def test_owner_counts_are_balanced_over_a_whole_cycle(dcp_size, interleave_c):
     """Over a whole interleave cycle the shards are exactly equal.
@@ -264,7 +526,6 @@ def test_owner_counts_are_balanced_over_a_whole_cycle(dcp_size, interleave_c):
     assert (counts == 3 * interleave_c).all()
 
 
-@pytest.mark.cpu_test
 @pytest.mark.parametrize("dcp_size,interleave_c", _OWNERSHIP)
 def test_local_indices_stay_inside_the_shard(dcp_size, interleave_c):
     """A rank is only ever handed an index into its own cache shard."""
@@ -372,6 +633,7 @@ def _merge_partials(
     return (weights[..., None] * outs).sum(0)
 
 
+@pytest.mark.tpu_test
 class SparseMlaLseTest(parameterized.TestCase):
     """`return_lse` and the KV-sharded merge it exists to enable. Tolerances
     are set by the kernel's bf16 output, not the merge, which is exact in f32."""

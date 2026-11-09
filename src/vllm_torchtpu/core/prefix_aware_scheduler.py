@@ -93,20 +93,21 @@ class PrefixAwareScheduler(AsyncScheduler):
         tier = _TIER_PREEMPTED if request.num_preemptions > 0 else _TIER_NORMAL
         return (tier, cold_tokens, request.arrival_time), warmth
 
-    def schedule(self, *args, **kwargs):
-        self._select_waiting_queue_for_scheduling()
-        return super().schedule(*args, **kwargs)
-
     def _select_waiting_queue_for_scheduling(self) -> RequestQueue | None:
-        """Promote the warmest request in the queue upstream admits from next.
-
-        vLLM v0.31 dropped its per-admission queue-selection hook, so this runs
-        once per step: only the step's first admission is warmth-ordered.
-        """
-        queue = self.kv_holding_waiting or self.waiting or None
+        queue = getattr(self, "kv_holding_waiting", None) or getattr(
+            self, "waiting", None
+        )
         if queue is not None:
             self._promote_warmest(queue)
         return queue
+
+    def schedule(self, throttle_prefills: bool = False):
+        queue = getattr(self, "kv_holding_waiting", None) or getattr(
+            self, "waiting", None
+        )
+        if queue is not None:
+            self._promote_warmest(queue)
+        return super().schedule(throttle_prefills)
 
     def _promote_warmest(self, queue: RequestQueue) -> None:
         """Promote the request with the fewest uncached tokens within WINDOW."""

@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Shared pytest configuration for the Omni tests.
 
 tests_omni/ holds tests that need the real vllm-omni package, which only the
@@ -10,6 +22,8 @@ tests/conftest.py does not apply here, so the environment defaults that
 engine-starting tests rely on are repeated below. Keep them in sync with it.
 """
 
+from __future__ import annotations
+
 import os
 
 os.environ.setdefault("TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS", "false")
@@ -17,3 +31,236 @@ os.environ.setdefault("TORCHINDUCTOR_AUTOGRAD_CACHE", "0")
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 os.environ.setdefault("VLLM_NO_USAGE_STATS", "1")
 os.environ.setdefault("VLLM_DO_NOT_TRACK", "1")
+
+import contextlib
+import copy
+import gc
+import json
+import threading
+from collections.abc import Generator
+from typing import Any
+
+import psutil
+import pytest
+import torch
+
+from tests.tpu_release import wait_for_tpu_release
+
+omni_fixture_lock = threading.Lock()
+
+
+def cleanup_test_environment() -> None:
+    """Tear down distributed state and wait for TPU device nodes to be released."""
+    from vllm.distributed import cleanup_dist_env_and_memory
+
+    cleanup_dist_env_and_memory()
+    gc.collect()
+    wait_for_tpu_release()
+
+
+def _parse_omni_runner_param(param: Any) -> tuple[str, str | None, dict[str, Any]]:
+    if isinstance(param, str):
+        model, stage_cfg, extra = param, None, {}
+    elif isinstance(param, (tuple, list)) and 1 <= len(param) <= 3:
+        model = param[0]
+        stage_cfg = param[1] if len(param) >= 2 else None
+        extra = dict(param[2] or {}) if len(param) == 3 else {}
+    else:
+        raise ValueError("Invalid omni_runner param; expected model or tuple")
+    prefix = os.environ.get("MODEL_PREFIX", "").rstrip("/")
+    return f"{prefix}/{model}" if prefix else str(model), stage_cfg, extra
+
+
+def _omni_runner_cache_key(param: Any) -> tuple[str, str | None, str]:
+    model, stage_cfg, extra = _parse_omni_runner_param(param)
+    return (model, stage_cfg, json.dumps(extra, sort_keys=True, default=repr))
+
+
+class OmniRunner:
+    """Context-managed wrapper around :class:`vllm_omni.entrypoints.omni.Omni`. Adapted
+    from :class:`vllm_omni.tests.helpers.runtime.OmniRunner`
+    (https://github.com/vllm-project/vllm-omni/blob/main/tests/helpers/runtime.py)
+    and vLLM's :class:`tests.conftest.VllmRunner`
+    (https://github.com/vllm-project/vllm/blob/main/tests/conftest.py).
+    """
+
+    def __init__(self, model_name: str, **kwargs: Any) -> None:
+        cleanup_test_environment()
+        self.model_name = model_name
+        self.omni: Omni | None = None
+        self._baseline_children: set[psutil.Process] = set()
+        with contextlib.suppress(Exception):
+            self._baseline_children = set(psutil.Process().children(recursive=True))
+        kwargs.setdefault("stage_init_timeout", 600)
+        kwargs.setdefault("init_timeout", 1800)
+        kwargs.setdefault("log_stats", False)
+
+        try:
+            from vllm_omni.entrypoints.omni import Omni
+
+            self.omni = Omni(model=model_name, **kwargs)
+        except BaseException:
+            self.close()
+            raise
+
+    def get_default_sampling_params_list(self) -> list[Any]:
+        assert self.omni is not None, "Omni was not initialized"
+        return copy.deepcopy(list(self.omni.default_sampling_params_list))
+
+    def generate(
+        self, prompts: Any, sampling_params_list: Any = None, *args: Any, **kwargs: Any
+    ) -> Generator[Any, None, None]:
+        assert self.omni is not None, "Omni cannot generate before initializing"
+        if sampling_params_list is None:
+            sampling_params_list = self.get_default_sampling_params_list()
+        return self.omni.generate(prompts, sampling_params_list, *args, **kwargs)
+
+    def _cleanup_process(self) -> None:
+        with contextlib.suppress(Exception):
+            children = []
+            for p in psutil.Process().children(recursive=True):
+                if p in self._baseline_children:
+                    continue
+                with contextlib.suppress(psutil.Error):
+                    if not any("resource_tracker" in arg for arg in p.cmdline()):
+                        children.append(p)
+            for p in children:
+                with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+                    p.terminate()
+            _, alive = psutil.wait_procs(children, timeout=5)
+            for p in alive:
+                with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+                    p.kill()
+
+    def __getattr__(self, name: str) -> Any:
+        omni = self.__dict__.get("omni")
+        if omni is not None:
+            return getattr(omni, name)
+        raise AttributeError(name)
+
+    def __enter__(self) -> OmniRunner:
+        return self
+
+    def close(self, *_: Any) -> None:
+        omni = self.omni
+        self.omni = None
+        try:
+            if omni is not None:
+                omni.close()
+        finally:
+            self._cleanup_process()
+            cleanup_test_environment()
+
+    shutdown = __exit__ = close
+
+
+class _OmniRunnerManager:
+    """Module-scoped cache ensuring each model's OmniRunner is spun up once."""
+
+    def __init__(self, lock: threading.Lock) -> None:
+        self._lock = lock
+        self._active_key: tuple[str, str | None, str] | None = None
+        self._active_runner: OmniRunner | None = None
+
+    def get_or_create(self, param: Any) -> OmniRunner:
+        key = _omni_runner_cache_key(param)
+        model, stage_cfg, extra = _parse_omni_runner_param(param)
+        with self._lock:
+            omni = getattr(self._active_runner, "omni", None)
+            if (
+                self._active_key == key
+                and omni is not None
+                and not getattr(omni, "_shutdown_called", False)
+                and bool(getattr(omni, "is_running", True))
+            ):
+                assert self._active_runner is not None
+                return self._active_runner
+            self.close()
+            self._active_runner = OmniRunner(model, deploy_config=stage_cfg, **extra)
+            self._active_key = key
+            return self._active_runner
+
+    def close(self) -> None:
+        if self._active_runner is not None:
+            runner = self._active_runner
+            self._active_runner = self._active_key = None
+            runner.close()
+
+
+@pytest.fixture(scope="module")
+def _omni_runner_manager() -> Generator[_OmniRunnerManager, None, None]:
+    manager = _OmniRunnerManager(omni_fixture_lock)
+    try:
+        yield manager
+    finally:
+        with omni_fixture_lock:
+            manager.close()
+
+
+@pytest.fixture(scope="function")
+def omni_runner(
+    request: pytest.FixtureRequest, _omni_runner_manager: _OmniRunnerManager
+) -> Generator[OmniRunner, None, None]:
+    """Function-scoped :class:`OmniRunner` that spins up each model as needed."""
+    yield _omni_runner_manager.get_or_create(request.param)
+
+
+@pytest.fixture(autouse=True)
+def _omni_model_patches(request: pytest.FixtureRequest) -> None:
+    """Install the TPU model patches that the diffusion worker runs with.
+
+    Production installs them on the first diffusion attention backend lookup,
+    so without this an in-process test runs them only if an earlier test in
+    the session built attention. Engine tests are skipped: their workers
+    install the patches themselves.
+    """
+    if request.node.get_closest_marker("spawns_tpu_workers"):
+        return
+    from vllm_torchtpu.omni.patches import apply_omni_model_specific_patches
+
+    apply_omni_model_specific_patches()
+
+
+@pytest.fixture(autouse=True)
+def _torchtpu_eager_mode(request: pytest.FixtureRequest) -> None:
+    """Run in-process tests in production's torch_tpu eager mode (DEFER_AND_FUSE).
+
+    Production sets it when a VllmConfig is built, so without this an in-process
+    test's numerics depend on whether an earlier test in the session built one.
+    Engine tests are skipped: their workers set it themselves, and setting it in
+    the pytest parent makes the parent open a TPU device the workers hold.
+    """
+    if request.node.get_closest_marker("spawns_tpu_workers"):
+        return
+    from vllm_torchtpu.platforms.tpu_platform import _configure_torchtpu_eager_mode
+
+    _configure_torchtpu_eager_mode()
+
+
+@pytest.fixture(autouse=True)
+def _sync_tpu(request: pytest.FixtureRequest) -> Generator[None, None, None]:
+    """Flush deferred torch_tpu ops between in-process TPU tests."""
+    if request.node.get_closest_marker("spawns_tpu_workers"):
+        yield
+        return
+    torch.accelerator.synchronize()
+    yield
+    torch.accelerator.synchronize()
+
+
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    """Group ``omni_runner`` tests by model within each module to spin up once."""
+    first_seen: dict[tuple[str, tuple[str, str | None, str]], int] = {}
+
+    def _sort_key(idx_and_item: tuple[int, pytest.Item]) -> tuple[int, str, int]:
+        idx, item = idx_and_item
+        group = 0 if item.get_closest_marker("spawns_tpu_workers") else 1
+        file_path = item.nodeid.split("::")[0]
+        callspec = getattr(item, "callspec", None)
+        if callspec is None or "omni_runner" not in callspec.params:
+            return (group, file_path, idx)
+        key = (file_path, _omni_runner_cache_key(callspec.params["omni_runner"]))
+        return (group, file_path, first_seen.setdefault(key, idx))
+
+    indexed = sorted(enumerate(items), key=_sort_key)
+    items[:] = [item for _, item in indexed]

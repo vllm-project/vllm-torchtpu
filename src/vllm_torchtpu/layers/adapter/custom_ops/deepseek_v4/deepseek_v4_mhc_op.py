@@ -19,7 +19,7 @@ pre as a single kernel.
 """
 
 import functools
-from typing import Any, NamedTuple, cast
+from typing import Any, NamedTuple
 
 import jax
 import torch
@@ -193,14 +193,11 @@ def _mhc_pre_op(
                 sinkhorn_repeat=sinkhorn_repeat,
             ),
             mesh=get_pallas_op_mesh(),
-            input_partition_specs=cast(
-                tuple[tuple[str, ...], ...],
-                (
-                    P(ATTN_DATA_AXIS, None, None),  # residual
-                    P(),  # fn
-                    P(),  # hc_scale
-                    P(),  # hc_base
-                ),
+            input_partition_specs=(
+                P(ATTN_DATA_AXIS, None, None),  # residual
+                P(),  # fn
+                P(),  # hc_scale
+                P(),  # hc_base
             ),
         )
         op.register_fake(_fake_mhc_pre)
@@ -221,14 +218,11 @@ def get_mhc_post_op():
             op_name,
             _mhc_post_jax,
             mesh=get_pallas_op_mesh(),
-            input_partition_specs=cast(
-                tuple[tuple[str, ...], ...],
-                (
-                    P(ATTN_DATA_AXIS, None),  # x
-                    P(ATTN_DATA_AXIS, None, None),  # residual
-                    P(ATTN_DATA_AXIS, None, None),  # post_layer_mix
-                    P(ATTN_DATA_AXIS, None, None),  # comb_res_mix
-                ),
+            input_partition_specs=(
+                P(ATTN_DATA_AXIS, None),  # x
+                P(ATTN_DATA_AXIS, None, None),  # residual
+                P(ATTN_DATA_AXIS, None, None),  # post_layer_mix
+                P(ATTN_DATA_AXIS, None, None),  # comb_res_mix
             ),
         )
         op.register_fake(_fake_mhc_post)
@@ -259,17 +253,14 @@ def _mhc_fused_post_pre_op(
                 sinkhorn_repeat=sinkhorn_repeat,
             ),
             mesh=get_pallas_op_mesh(),
-            input_partition_specs=cast(
-                tuple[tuple[str, ...], ...],
-                (
-                    P(ATTN_DATA_AXIS, None),  # x
-                    P(ATTN_DATA_AXIS, None, None),  # residual
-                    P(ATTN_DATA_AXIS, None, None),  # post_layer_mix
-                    P(ATTN_DATA_AXIS, None, None),  # comb_res_mix
-                    P(),  # fn
-                    P(),  # hc_scale
-                    P(),  # hc_base
-                ),
+            input_partition_specs=(
+                P(ATTN_DATA_AXIS, None),  # x
+                P(ATTN_DATA_AXIS, None, None),  # residual
+                P(ATTN_DATA_AXIS, None, None),  # post_layer_mix
+                P(ATTN_DATA_AXIS, None, None),  # comb_res_mix
+                P(),  # fn
+                P(),  # hc_scale
+                P(),  # hc_base
             ),
         )
         op.register_fake(_fake_mhc_fused_post_pre)

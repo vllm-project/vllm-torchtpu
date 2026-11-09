@@ -155,4 +155,4 @@ def generate_mask_sc(
         )(padded_topk_indices),
     )
 
-    return out[:chunk_size, :]
+    return cast(Any, out)[:chunk_size, :]  # pyrefly: ignore[unsupported-operation]

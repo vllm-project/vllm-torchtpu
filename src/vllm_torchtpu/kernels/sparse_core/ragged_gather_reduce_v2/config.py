@@ -1,3 +1,16 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import dataclasses
 from typing import Any
 
@@ -5,6 +18,8 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
+
+from vllm_torchtpu.kernels.sparse_core.support import get_sparse_core_info
 
 
 # ceil up to the nearest multiple of b.
@@ -80,7 +95,7 @@ class Config:
     def should_fallback(self) -> bool:
         # For a small {input + output} both likely fit in TensorCore VMEM, where a
         # plain TC gather-reduce beats routing through SparseCore and HBM.
-        if self.tpu_info.sparse_core is None:
+        if get_sparse_core_info(self.tpu_info) is None:
             return True
         vmem_capacity_threshold = self.tpu_info.vmem_capacity_bytes * 0.6
         source_size = self.source_rows * self.hidden_size * self.in_dtype_bytes
@@ -215,13 +230,7 @@ class Config:
         The chunk is the largest divisor of ``col_size`` whose gather double-buffer
         still fits comfortably in SparseCore VMEM.
         """
-        match self.tpu_info.generation:
-            case 6:
-                target_bytes = int(256 * 1024 * 0.95)
-            case 7:
-                target_bytes = int(512 * 1024 * 0.95)
-            case _:
-                target_bytes = int(128 * 1024 * 0.95)
+        target_bytes = int(self.sc_info.vmem_capacity_bytes * 0.95)
 
         # uint32 gather buffer, double-buffered by emit_pipeline.
         num_simd_lanes = self.sc_info.num_lanes

@@ -5,6 +5,12 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """TPU device communicator for EP across data-parallel engines.
 
 Dispatch gathers tokens across DP ranks that share the same TP rank. Combine
@@ -40,12 +46,9 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
         if self.use_all2all:
             self.all2all_manager = TpuNullAll2AllManager(self.cpu_group)
 
-    @staticmethod
-    def _token_group(is_sequence_parallel: bool):
-        # SP shards tokens across TP as well, so the tokens an expert must see
-        # span the EP group; otherwise TP ranks replicate them and only DP
-        # ranks differ.
-        return get_ep_group() if is_sequence_parallel else get_dp_group()
+    def _moe_group(self, is_sequence_parallel: bool):
+        group = get_ep_group() if is_sequence_parallel else get_dp_group()
+        return group if group.world_size > 1 else None
 
     def dispatch_router_logits(
         self,
@@ -58,8 +61,8 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
             raise NotImplementedError(
                 "extra_tensors is not supported by TpuDeviceCommunicator"
             )
-        group = self._token_group(is_sequence_parallel)
-        if group.world_size == 1:
+        group = self._moe_group(is_sequence_parallel)
+        if group is None:
             return hidden_states, router_logits
         same = router_logits is hidden_states
         hidden_states = group.all_gather(hidden_states, dim=0)
@@ -81,8 +84,8 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
             raise NotImplementedError(
                 "extra_tensors is not supported by TpuDeviceCommunicator"
             )
-        group = self._token_group(is_sequence_parallel)
-        if group.world_size == 1:
+        group = self._moe_group(is_sequence_parallel)
+        if group is None:
             return hidden_states, topk_weights, topk_ids
         hidden_states = group.all_gather(hidden_states, dim=0)
         topk_weights = group.all_gather(topk_weights, dim=0)
@@ -92,7 +95,7 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
     def combine(
         self, hidden_states: torch.Tensor, is_sequence_parallel: bool = False
     ) -> torch.Tensor:
-        group = self._token_group(is_sequence_parallel)
-        if group.world_size == 1:
+        group = self._moe_group(is_sequence_parallel)
+        if group is None:
             return hidden_states
         return group.reduce_scatter(hidden_states, dim=0)

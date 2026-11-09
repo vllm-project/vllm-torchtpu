@@ -44,6 +44,7 @@ from vllm_torchtpu.kernels.deepseek_v4.o_projection import (
 )
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_attention_op import (  # noqa: E501
     BATCH_AXIS,
+    VllmDeepseekSparseSWABackend,
     VllmDeepseekV4SWACache,
     _attention_csa,
     _attention_hca,
@@ -54,12 +55,14 @@ from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor 
 )
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_indexer import (
     VllmDeepseekV4Indexer,
+    static_verify_q_len,
 )
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     get_pallas_op_mesh,
     get_vllm_model_wrapper_context,
 )
+from vllm_torchtpu.utils import fresh_buffer
 
 logger = init_logger(__name__)
 
@@ -233,7 +236,9 @@ class DeepseekTPUAttentionMixin:
 
         built_from_real_caches = swa_tensor is not None
 
-        hf_config = vllm_context.vllm_config.model_config.hf_config
+        # The wrapper context types vllm_config as object.
+        vllm_config = cast(VllmConfig, vllm_context.vllm_config)
+        hf_config = vllm_config.model_config.hf_config
         sm_scale = (
             getattr(self, "scale", None)
             or getattr(self, "softmax_scale", None)
@@ -252,6 +257,11 @@ class DeepseekTPUAttentionMixin:
         # layers -- DSparkDeepseekV4ForCausalLM (DSV4 DSpark). Absent the
         # attribute a layer stays causal, so target layers are unaffected.
         non_causal = bool(getattr(self, "non_causal_multi_token_decode", False))
+        # Speculative verify windows (1 + K tokens) get the kernels' static
+        # query-length pass; the runner places them in the request
+        # distribution's middle segment. Draft layers need it too: their
+        # context-KV insert runs on the target's verify metadata.
+        verify_q_len = static_verify_q_len(vllm_config)
 
         csa_batch_size = getattr(self, "csa_kernel_batch_size", 16)
         main_page_size = getattr(self.main_cache_layer, "cache_num_states", None)
@@ -271,6 +281,7 @@ class DeepseekTPUAttentionMixin:
                 if is_csa
                 else {}
             ),
+            verify_q_len=verify_q_len,
         )
 
         op_type = "swa" if swa_only else ("csa" if is_csa else "hca")
@@ -282,6 +293,7 @@ class DeepseekTPUAttentionMixin:
             f"_b{csa_batch_size}_m{main_page_size}"
             f"{'_aliased' if two_caches_same_buffer else ''}"
             f"{'_ncb' if non_causal else ''}"
+            f"{f'_vq{verify_q_len}' if verify_q_len else ''}"
             f"{'' if built_from_real_caches else '_prof'}"
         )
 
@@ -594,8 +606,7 @@ class DeepseekTPUAttentionMixin:
             f"{list(transposed[::-1])}, got {list(weight.shape)}."
         )
 
-        out = torch.empty(transposed, dtype=weight.dtype, device=weight.device)
-        out.copy_(weight.data.t())
+        out = fresh_buffer(weight.data.t())
         self.wo_a.weight = torch.nn.Parameter(out, requires_grad=False)
 
     def _assert_o_proj_supported(self) -> None:
@@ -655,6 +666,8 @@ class VllmDeepseekV4MLAAttention(
 ):
     """Sparse MLA attention on TPU, over the SWA and compressed-KV caches."""
 
+    backend_cls = DeepseekV4TPUAttentionBackend
+    swa_backend_cls = VllmDeepseekSparseSWABackend
     # Set with object.__setattr__ in __init__ to avoid registering a submodule.
     mla_attn: VllmDeepseekV4MLAAttention
     # Set to True on DSpark draft layers; read with getattr(..., False).
@@ -857,6 +870,12 @@ class VllmDeepseekV4MLAAttention(
         """Apply scaling RoPE to decoupled key states."""
         return self.kv_rope_op(kv, positions, self.mla_attn.rotary_emb.cos_sin_cache)
 
+    def _project_q(self, qr: torch.Tensor) -> torch.Tensor:
+        """Project the q latent to query heads: [num_tokens, heads, head_dim]."""
+        return self.wq_b(qr).view(
+            qr.shape[0], self.mla_attn.n_local_heads, self.mla_attn.head_dim
+        )
+
     def attention_impl(
         self,
         hidden_states: torch.Tensor,
@@ -867,9 +886,7 @@ class VllmDeepseekV4MLAAttention(
         out: torch.Tensor | None,
     ) -> torch.Tensor:
         """Execute indexing, state compression, and kernel attention dispatch."""
-        q = self.wq_b(qr).view(
-            qr.shape[0], self.mla_attn.n_local_heads, self.mla_attn.head_dim
-        )
+        q = self._project_q(qr)
         q = self.qnorm_rope(q, positions)
         kv = self.kv_rope(kv, positions)
 
@@ -896,7 +913,7 @@ class VllmDeepseekV4MLAAttention(
         )
         return res
 
-    def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+    def _o_proj(self, o: torch.Tensor | Any, positions: torch.Tensor) -> torch.Tensor:
         """Apply inverse RoPE and low-rank output projections wo_a and wo_b."""
         # The kernel folds the inverse RoPE, the activation quantization and
         # the per-group `wo_a` matmul into one pass.

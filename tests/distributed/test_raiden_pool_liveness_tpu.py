@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Device byte-liveness test: bytes in the unified KV pool buffers must be
 readable through raiden's pool surface, and bytes written through raiden must
 land in those buffers.
@@ -39,6 +51,8 @@ from vllm_torchtpu.distributed.kv_transfer.raiden import pool_manifest as rpm
 from vllm_torchtpu.distributed.kv_transfer.raiden.tags import class_tag
 
 from .tpu_test_utils import run_in_isolated_process
+
+pytestmark = pytest.mark.tpu_test
 
 
 def _can_allocate_tpu_tensor() -> tuple[bool, str]:

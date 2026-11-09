@@ -20,6 +20,7 @@ operations, to match the JAX reference implementation in
 
 Key functions:
 - e8m0_to_fp32: Convert e8m0 (8-bit exponent) scales to float32
+- e8m0_to_fp32_bits: Decode e8m0 scales to CPU-compatible bits on device
 - unpack_uint8_to_fp4: Unpack uint8 to FP4 e2m1 float values
 - dequantize_mxfp4_packed: Dequantize MXFP4 packed weights
 - quantize_tensor_to_fp4: Quantize float tensor to FP4 with block scaling
@@ -32,6 +33,8 @@ Usage in MXFP4 MoE pipeline:
 4. Pack indices using pack_fp4_indices()
 5. Use in GMM kernel with rhs_scale
 """
+
+from collections.abc import Sequence
 
 import jax.numpy as jnp
 import torch
@@ -123,6 +126,7 @@ def e8m0_to_fp32(u8: torch.Tensor) -> torch.Tensor:
         float32 tensor with actual scale values.
 
     FIXME: TPU-specific behavior difference for large exponents (u8 >= 254).
+        Use `e8m0_to_fp32_bits` for device-safe decoding.
         - u8=254 -> exponent=127 -> 2^127 ≈ 1.7e38
         - On CPU: torch.ldexp correctly returns 1.7e38
         - On TPU: torch.ldexp overflows to inf (due to float32 limits)
@@ -201,7 +205,7 @@ def unpack_uint8_to_fp4(packed: torch.Tensor) -> torch.Tensor:
 def dequantize_tensor(
     tensor_q: torch.Tensor,
     scale: torch.Tensor,
-    axis: int = -1,
+    axis: int | Sequence[int] = -1,
     out_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     """Dequantize a quantized tensor with block scaling.
@@ -366,7 +370,7 @@ def dequantize_mxfp4_packed(
 
 def quantize_tensor_to_fp4(
     tensor: torch.Tensor,
-    axis: int = -1,
+    axis: int | Sequence[int] = -1,
     block_size: int = REQUANTIZED_BLOCK_SIZE,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize float tensor to FP4 with block scaling.

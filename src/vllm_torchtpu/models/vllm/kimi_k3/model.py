@@ -1,10 +1,21 @@
-# SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Kimi K3 and Kimi-Linear models for TPU."""
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Hashable, Iterable
 from typing import cast
 from unittest.mock import patch
 
@@ -65,7 +76,7 @@ from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.utils import synchronize_tensors
+from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
 
 from .attention import KimiDeltaAttention, MultiHeadLatentAttention, kda_state_dtype
 from .collective_ops import TokenShardCollectives
@@ -520,7 +531,7 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
 
 def _tpu_tp_all_gather(input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
     """Gather a materialized encoder output without leaving the TPU."""
-    materialized = torch.empty_like(input_).copy_(input_)
+    materialized = fresh_buffer(input_)
     synchronize_tensors(materialized)
     gathered = tensor_model_parallel_all_gather(materialized, dim=dim)
     synchronize_tensors(gathered)
@@ -591,6 +602,7 @@ class KimiK3ForConditionalGeneration(
 
             self.mm_projector = KimiK25MultiModalProjector(
                 config=config.vision_config,
+                out_hidden_size=config.text_config.hidden_size,
                 use_data_parallel=self.use_data_parallel,
                 quant_config=vision_quant_config,
                 prefix=maybe_prefix(prefix, "mm_projector"),
@@ -777,10 +789,13 @@ class KimiK3ForConditionalGeneration(
         device: torch.device,
         dtype: torch.dtype,
         path: str = "default",
+        axis_keys: tuple[Hashable, ...] | None = None,
     ):
         from vllm.v1.worker.encoder_cudagraph_defs import EncoderCudaGraphCaptureInputs
 
         del max_frames_per_batch  # image-only modality
+        if axis_keys:
+            raise ValueError("Kimi K3 does not define encoder capture axes")
 
         merge_h, merge_w = self.vision_tower.merge_kernel_size
         # Ceil so captured capacity is never smaller than token_budget when
@@ -945,7 +960,7 @@ class KimiK3ForConditionalGeneration(
         if merged.device.type != "tpu":
             return merged
 
-        materialized = torch.empty_like(merged).copy_(merged)
+        materialized = fresh_buffer(merged)
         synchronize_tensors(materialized)
         return materialized
 

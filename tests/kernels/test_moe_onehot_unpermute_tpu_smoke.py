@@ -24,6 +24,8 @@ import pytest
 
 from vllm_torchtpu.kernels.megablox import gmm_v2, moe_onehot_unpermute
 
+pytestmark = pytest.mark.tpu_test
+
 
 def _require_tpu() -> jax.Device:
     devices = jax.devices("tpu")

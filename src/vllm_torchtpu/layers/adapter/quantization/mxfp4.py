@@ -171,7 +171,7 @@ def _dequantize_mxfp4_packed_on_device(
     axis: int,
     out_dtype: torch.dtype,
 ) -> torch.Tensor:
-    """`dequantize_mxfp4_packed`, bit for bit, without leaving the device.
+    """Dequantize packed FP4 weights and scales on their current device.
 
     Scales are decoded by constructing their float32 bits on the device.
     The fp4 nibbles are decoded with selects rather than a LUT gather.

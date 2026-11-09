@@ -1,12 +1,25 @@
 # Copyright 2026 Google LLC
-# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Admission and interpreted arithmetic for shapes beyond the original caps.
 
-Run with JAX_PLATFORMS=cpu. Interpretation checks routing/DMA indexing and
-arithmetic, not TPU resource capacity or compiled device performance.
+Run with JAX_PLATFORMS=cpu. Hardware profiles below are CPU-side capability
+mocks. Interpretation checks dense arithmetic and indexing, not GMM parity,
+TPU resource capacity or compiled device performance.
 """
 
 import functools
+from dataclasses import replace
 from types import SimpleNamespace
 
 import jax
@@ -15,6 +28,14 @@ import numpy as np
 import pytest
 
 from vllm_torchtpu.kernels.experimental import moe_dense_expert as kernel
+from vllm_torchtpu.kernels.megablox import gmm_v2
+
+
+@pytest.fixture(autouse=True)
+def chip_capability(monkeypatch):
+    info = kernel.pltpu.get_tpu_info_for_chip(kernel.pltpu.ChipVersion.TPU_7X, 1)
+    monkeypatch.setattr(kernel.pltpu, "get_tpu_info", lambda: info)
+    return info
 
 
 @pytest.mark.parametrize(
@@ -45,6 +66,14 @@ def test_buffer_selection_leaves_resource_failure_to_compiler():
     assert kernel._select_expert_buffers(1024, 8192, 4096, 512, 16 * 1024**2) == 1
 
 
+@pytest.mark.parametrize(
+    "shape, capacity, expected",
+    [((80, 4608, 1792, 256), 64 << 20, 1), ((16, 512, 640, 2), 3868673, 2)],
+)
+def test_partial_scale_plane_counts_toward_buffer_budget(shape, capacity, expected):
+    assert kernel._select_expert_buffers(*shape, capacity) == expected
+
+
 def _shapes(m, h, i, e):
     return (
         jax.ShapeDtypeStruct((m, h), jnp.bfloat16),
@@ -59,6 +88,8 @@ def _shapes(m, h, i, e):
     "shape",
     [
         (272, 512, 512, 4),
+        (64, 2560, 640, 64),
+        (16, 512, 256, 2),
         (16, 1536, 1536, 2),
         (16, 512, 512, 129),
         (1024, 8192, 4096, 512),
@@ -67,7 +98,7 @@ def _shapes(m, h, i, e):
 @pytest.mark.parametrize("skip_padded_tokens", [False, True])
 def test_aligned_shapes_have_no_resource_admission_cap(shape, skip_padded_tokens):
     # Includes a deliberately enormous shape: resource admission belongs to
-    # the compiler, so this predicate must neither allocate nor query a TPU.
+    # the compiler. Capability metadata is mocked, without allocating a TPU.
     assert kernel.can_use_dense_expert(
         *_shapes(*shape),
         None,
@@ -78,12 +109,79 @@ def test_aligned_shapes_have_no_resource_admission_cap(shape, skip_padded_tokens
     )
 
 
+@pytest.mark.parametrize("chip", ["TPU_V5E", "TPU_V5P", "TPU_V6E", "TPU_7X"])
+@pytest.mark.parametrize("i", [128, 256, 384, 640])
+def test_admission_matches_both_gmm_quantization_regimes(monkeypatch, chip, i):
+    info = kernel.pltpu.get_tpu_info_for_chip(kernel.pltpu.ChipVersion[chip], 1)
+    monkeypatch.setattr(kernel.pltpu, "get_tpu_info", lambda: info)
+    x, w1, w2, s1, s2 = _shapes(16, 512, i, 4)
+    configs = [
+        gmm_v2.make_gmm_configs(
+            lhs,
+            rhs,
+            scale,
+            None,
+            jax.ShapeDtypeStruct((4,), jnp.int32),
+            jax.ShapeDtypeStruct((1,), jnp.int32),
+            tile_info=gmm_v2.TileSizes(16, 512, 256, 16),
+            vmem_limit_bytes=info.vmem_capacity_bytes,
+            out_dtype=jnp.bfloat16,
+            acc_dtype=None,
+            maybe_quantize_lhs=True,
+            zero_initialize=False,
+            fuse_act=activation,
+        )
+        for lhs, rhs, scale, activation in (
+            (x, w1, s1, "silu"),
+            (jax.ShapeDtypeStruct((16, i), jnp.bfloat16), w2, s2, None),
+        )
+    ]
+    expected = all(
+        c.lhs_cfgs.quant_dtype == jnp.float8_e4m3fn
+        and c.lhs_cfgs.should_quantize
+        and c.rhs_cfgs.should_dequantize_after_matmul
+        for c in configs
+    )
+    assert (
+        kernel.can_use_dense_expert(
+            x,
+            w1,
+            w2,
+            s1,
+            s2,
+            None,
+            None,
+            activation="silu",
+            rhs_quant_dtype=None,
+            skip_padded_tokens=False,
+        )
+        == expected
+    )
+    assert expected == (info.fp8_ops_per_second > 0 and i >= info.mxu_column_size)
+
+
+def test_hidden_contracting_axis_also_needs_gmm_quantization(
+    chip_capability, monkeypatch
+):
+    # A hypothetical wider MXU catches guarding only the second matmul.
+    info = replace(chip_capability, mxu_column_size=1024)
+    monkeypatch.setattr(kernel.pltpu, "get_tpu_info", lambda: info)
+    assert not kernel.can_use_dense_expert(
+        *_shapes(16, 512, 1024, 4),
+        None,
+        None,
+        activation="silu",
+        rhs_quant_dtype=None,
+        skip_padded_tokens=False,
+    )
+
+
 @pytest.mark.parametrize(
     "shape",
     [
         (15, 512, 512, 4),
         (16, 768, 512, 4),
-        (16, 512, 768, 4),
+        (16, 512, 704, 4),
         (0, 512, 512, 4),
         (16, 0, 512, 4),
         (16, 512, 0, 4),
@@ -139,7 +237,15 @@ def _reference_expert(x, w1, w2, s1, s2):
 
 
 @pytest.mark.parametrize(
-    "shape", [(272, 512, 512, 2), (16, 1536, 1536, 2), (16, 512, 512, 129)]
+    "shape",
+    [
+        (272, 512, 512, 2),
+        (16, 1536, 1536, 2),
+        (16, 512, 512, 129),
+        (16, 512, 128, 2),
+        (16, 512, 640, 2),
+        (16, 512, 768, 2),
+    ],
 )
 def test_expanded_shapes_match_routed_reference(shape, monkeypatch):
     if jax.default_backend() != "cpu":

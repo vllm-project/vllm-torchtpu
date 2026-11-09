@@ -1,10 +1,35 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+import numpy as np
+
+from vllm_torchtpu.logger import init_logger
+
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
+
+logger = init_logger(__name__)
 
 # Architectures whose recurrent layers read and write their state through the
-# attention-shaped pool. The Qwen3 families build on QwenGatedDeltaNetAttention,
-# which the TPU backend replaces with VllmGatedDeltaNetAttention; that subclass
+# attention-shaped pool. The Qwen3 and Qwen4Exp families build on
+# QwenGatedDeltaNetAttention, which the TPU backend replaces with
+# VllmGatedDeltaNetAttention; that subclass
 # accepts a single pooled buffer instead of a separate conv/ssm pair.
 # KimiLinearForCausalLM runs its KDA layers through the gather/scatter pooled
 # op (build_kimi_pooled_kda_op, around the fused conv1d + GDN v3 kernel)
@@ -18,6 +43,8 @@ QWEN_GDN_ARCHITECTURES = frozenset(
         "Qwen3_5ForConditionalGeneration",
         "Qwen3_5MoeForCausalLM",
         "Qwen3_5MoeForConditionalGeneration",
+        "Qwen4ExpForCausalLM",
+        "Qwen4ExpForConditionalGeneration",
     }
 )
 POOLED_GDN_ARCHITECTURES = QWEN_GDN_ARCHITECTURES | frozenset(
@@ -41,9 +68,11 @@ POOLED_GDN_ARCHITECTURES = QWEN_GDN_ARCHITECTURES | frozenset(
 # These are torch dtype *names*, not torch.dtype objects: this module is
 # imported by the JAX kernel path and by deviceless tests, so it must stay
 # importable without torch.
-DEFAULT_POOLED_GDN_CONV_STATE_DTYPE = "torch.bfloat16"
+DEFAULT_POOLED_GDN_CONV_STATE_DTYPE = "torch.float32"
 DEFAULT_POOLED_GDN_SSM_STATE_DTYPE = "torch.float32"
 _ITEMSIZE_BY_DTYPE = {"torch.bfloat16": 2, "torch.float32": 4}
+
+GRANULE_BYTES = 512
 
 
 def pooled_gdn_state_dtypes(
@@ -117,6 +146,18 @@ class PooledGDNStateLayout:
     def required_bytes(self) -> int:
         return self.required_tokens * self.token_bytes
 
+    @property
+    def granules_per_token(self) -> int:
+        return self.token_bytes // GRANULE_BYTES
+
+    @property
+    def ssm_granules(self) -> int:
+        return self.ssm_tokens * self.granules_per_token
+
+    @property
+    def conv_granules(self) -> int:
+        return self.conv_tokens * self.granules_per_token
+
 
 def derive_pooled_gdn_state_layout(
     *,
@@ -131,6 +172,11 @@ def derive_pooled_gdn_state_layout(
     """
     if min(ssm_bytes, conv_bytes, token_bytes) <= 0:
         raise ValueError("pooled GDN byte sizes must be positive")
+    if token_bytes % GRANULE_BYTES != 0:
+        raise ValueError(
+            "pooled GDN token rows must be a whole number of "
+            f"{GRANULE_BYTES}-byte granules, got {token_bytes}"
+        )
 
     ssm_tokens = (ssm_bytes + token_bytes - 1) // token_bytes
     conv_tokens = 1
@@ -144,3 +190,84 @@ def derive_pooled_gdn_state_layout(
         ssm_tokens=ssm_tokens,
         conv_tokens=conv_tokens,
     )
+
+
+def prefill_checkpoint_enabled(vllm_config: VllmConfig) -> bool:
+    """Enables checkpoints for pooled GDN with block-aligned prefix hits."""
+    from vllm_torchtpu import envs as tpu_envs
+
+    if not tpu_envs.TPU_GDN_PREFILL_CHECKPOINT:
+        return False
+    cache = vllm_config.cache_config
+    parallel = vllm_config.parallel_config
+    if (
+        cache.mamba_cache_mode != "align"
+        or parallel.decode_context_parallel_size != 1
+        or not unified_kv_layout_enabled_for_architecture(
+            vllm_config.model_config.architecture
+        )
+    ):
+        return False
+    assert cache.mamba_block_size is not None
+    # vLLM 0.32.0 can hash a partial-hit state copy at the next block boundary
+    # without writing it when an internal checkpoint skips that boundary.
+    # TODO(https://github.com/vllm-project/vllm/issues/65264): remove this
+    # check once the pin has the fix.
+    logical_block = cache.mamba_block_size * parallel.prefill_context_parallel_size
+    unit = cache.prefix_match_unit
+    if unit is None or unit >= logical_block:
+        return True
+    logger.info_once(
+        "GDN internal prefill checkpoints are off: prefix_match_unit=%d is finer "
+        "than the logical Mamba block size %d.",
+        unit,
+        logical_block,
+    )
+    return False
+
+
+@dataclass(frozen=True)
+class PrefillCheckpointUnits:
+    """Units of the prefill checkpoint rule, as the engine core applies it.
+
+    All token sizes are global across PCP ranks: mamba_block_size is
+    MambaSpec.block_size * pcp_world_size, the column stride of the Mamba
+    block table. cache_hit_alignment_tokens is the prefix-cache hit
+    granularity, which places the checkpoint below a chunk's end.
+    """
+
+    hash_block_size: int
+    cache_hit_alignment_tokens: int
+    mamba_block_size: int
+    alignment: int
+    drop_eagle_block: bool
+    num_hash_lookahead_tokens: int = 0
+
+    def fill_offsets(
+        self, out: np.ndarray, seq_lens: np.ndarray, query_lens: np.ndarray
+    ) -> None:
+        """Populates per-request logical query checkpoint offsets into out (0 if none).
+
+        seq_lens (chunk ends) and query_lens (scheduled tokens) cover active
+        requests; any padded tail in out is zeroed.
+        """
+        # Lazy import to avoid a circular import while vllm.platforms initializes.
+        from vllm.model_executor.layers.mamba.checkpoint import (
+            compute_mamba_prefill_checkpoints,
+        )
+
+        out[:] = 0
+        # A checkpoint lies at least one hash block past the query start.
+        rows = np.flatnonzero(query_lens > self.hash_block_size)
+        if rows.size:
+            offsets, _ = compute_mamba_prefill_checkpoints(
+                [int(n) for n in seq_lens[rows]],
+                [int(n) for n in query_lens[rows]],
+                hash_block_size=self.hash_block_size,
+                mamba_block_size=self.mamba_block_size,
+                checkpoint_alignment=self.alignment,
+                drop_eagle_block=self.drop_eagle_block,
+                cache_hit_alignment_tokens=self.cache_hit_alignment_tokens,
+                num_hash_lookahead_tokens=self.num_hash_lookahead_tokens,
+            )
+            out[rows] = np.asarray(offsets, dtype=np.int32)

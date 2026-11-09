@@ -15,13 +15,15 @@
 quantization config resolution."""
 
 import torch
-from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 
-from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8LinearMethodTPU
+from vllm_torchtpu.layers.adapter.quantization.fp8 import (
+    VllmFp8Config,
+    VllmFp8LinearMethodTPU,
+)
 from vllm_torchtpu.layers.core.quant_methods import DEEPSEEK_V4_FP8
 
 
-class _DummyDeepseekV4Fp8Config(Fp8Config):
+class _DummyDeepseekV4Fp8Config(VllmFp8Config):
     """Stub DeepSeek-V4 FP8 config for testing weight block size resolution."""
 
     @classmethod

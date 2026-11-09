@@ -24,6 +24,8 @@ from jax._src import test_util as jtu
 from vllm_torchtpu.kernels.sparse_core.ragged_gather import ragged_gather
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_v2 import ragged_gather_v2
 
+pytestmark = pytest.mark.tpu_test
+
 jax.config.parse_flags_with_absl()
 
 

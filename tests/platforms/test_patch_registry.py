@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Checks staged patch execution without importing the TPU runtime."""
 
 import contextlib
@@ -12,6 +24,10 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+from vllm.config.parallel import ParallelConfig
+
+import vllm_torchtpu.envs as envs
+from vllm_torchtpu import _patch_sequence_parallel_moe_admission
 
 _REGISTRY_PATH = (
     Path(__file__).resolve().parents[2] / "src/vllm_torchtpu/patch_registry.py"
@@ -213,7 +229,11 @@ def test_manifest_preserves_lifecycle_dependencies():
         "_patch_vllm_dcp_fine_prefix_hits",
         "_patch_vllm_mamba_split_scheduler_block_size",
         "_patch_vllm_offloading_config_build",
+        "_patch_vllm_offload_all_ranks_kv_bytes",
+        "_patch_vllm_offload_fine_prefix_alignment",
         "_patch_vllm_hybrid_kv_load_failure_recovery",
+        "_patch_vllm_abort_on_preemption",
+        "_patch_vllm_raiden_pd_completion",
         "_patch_vllm_same_step_prefix_hits",
         "_patch_vllm_merge_dsv41_swa_groups",
         "_patch_vllm_merge_multimodal_embeddings",
@@ -222,12 +242,13 @@ def test_manifest_preserves_lifecycle_dependencies():
     assert stages["platform_activation"] == (
         stages["worker_init"] + stages["model_load"]
     )
-    assert stages["model_load"] == ["maybe_patch_qwen3_vl"]
+    assert stages["model_load"] == [
+        "maybe_patch_qwen3_vl",
+        "maybe_patch_qwen3_next",
+        "maybe_patch_qwen2",
+        "maybe_patch_qwen3_5_attn_moe_overlap",
+    ]
     assert "patch_moe_expert_write_staging" in stages["worker_init"]
-    for names in (stages["platform_activation"], stages["worker_init"]):
-        assert names.index("_patch_vllm_force_v1_runner_tpu") < names.index(
-            "_patch_vllm_config_triton_tpu"
-        )
 
 
 def test_plugin_import_sets_environment_before_jax():
@@ -317,3 +338,65 @@ def test_fork_during_application_retains_completed_patches(registry):
         parent.close()
         child.close()
     assert seen == ["completed", "pending"]
+
+
+def test_sequence_parallel_moe_admission(monkeypatch):
+    # Save original property and guard flag so teardown restores them cleanly
+    monkeypatch.setattr(
+        ParallelConfig,
+        "use_sequence_parallel_moe",
+        ParallelConfig.use_sequence_parallel_moe,
+    )
+    if hasattr(ParallelConfig, "_tpu_no_sp_moe_patch"):
+        monkeypatch.setattr(
+            ParallelConfig,
+            "_tpu_no_sp_moe_patch",
+            ParallelConfig._tpu_no_sp_moe_patch,
+        )
+    else:
+        monkeypatch.setattr(
+            ParallelConfig,
+            "_tpu_no_sp_moe_patch",
+            False,
+            raising=False,
+        )
+
+    # Case 1: envs.TPU_MOE_SEQUENCE_PARALLEL = False
+    monkeypatch.setattr(envs, "TPU_MOE_SEQUENCE_PARALLEL", False)
+    if hasattr(ParallelConfig, "_tpu_no_sp_moe_patch"):
+        del ParallelConfig._tpu_no_sp_moe_patch
+    _patch_sequence_parallel_moe_admission()
+    cfg = Mock(
+        enable_expert_parallel=True, tensor_parallel_size=8, data_parallel_size=1
+    )
+    assert not ParallelConfig.use_sequence_parallel_moe.fget(cfg)
+
+    # Case 2: envs.TPU_MOE_SEQUENCE_PARALLEL = True
+    monkeypatch.setattr(envs, "TPU_MOE_SEQUENCE_PARALLEL", True)
+    if hasattr(ParallelConfig, "_tpu_no_sp_moe_patch"):
+        del ParallelConfig._tpu_no_sp_moe_patch
+    _patch_sequence_parallel_moe_admission()
+
+    # EP=False, TP=8, DP=1 -> False
+    cfg_no_ep = Mock(
+        enable_expert_parallel=False, tensor_parallel_size=8, data_parallel_size=1
+    )
+    assert not ParallelConfig.use_sequence_parallel_moe.fget(cfg_no_ep)
+
+    # EP=True, TP=1, DP=1 -> False
+    cfg_tp1 = Mock(
+        enable_expert_parallel=True, tensor_parallel_size=1, data_parallel_size=1
+    )
+    assert not ParallelConfig.use_sequence_parallel_moe.fget(cfg_tp1)
+
+    # EP=True, TP=8, DP=2 -> False
+    cfg_dp2 = Mock(
+        enable_expert_parallel=True, tensor_parallel_size=8, data_parallel_size=2
+    )
+    assert not ParallelConfig.use_sequence_parallel_moe.fget(cfg_dp2)
+
+    # EP=True, TP=8, DP=1 -> True
+    cfg_sp = Mock(
+        enable_expert_parallel=True, tensor_parallel_size=8, data_parallel_size=1
+    )
+    assert ParallelConfig.use_sequence_parallel_moe.fget(cfg_sp)

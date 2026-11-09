@@ -1,11 +1,24 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Serving reuses the pipeline's gathered KV with one attention launch per layer."""
 
 from types import SimpleNamespace
 
 import pytest
 import torch
-from vllm.v1.core.kv_cache_utils import (
+from vllm.v1.core.kv_cache_planning import (
+    get_global_kv_cache_groups,
     get_kv_cache_configs,
     unify_kv_cache_spec_page_size,
 )
@@ -162,7 +175,9 @@ def test_swa_pool_admits_million_token_context(record_property):
             )
     config = SimpleNamespace(
         model_config=SimpleNamespace(
-            max_model_len=1048576, original_max_model_len=1048576
+            max_model_len=1048576,
+            original_max_model_len=1048576,
+            supports_kv_cache_grouping=False,
         ),
         parallel_config=SimpleNamespace(
             tensor_parallel_size=1, decode_context_parallel_size=1
@@ -180,7 +195,12 @@ def test_swa_pool_admits_million_token_context(record_property):
     )
     unified = unify_kv_cache_spec_page_size(specs)
     reservation = swa_pool_bytes(unified)
-    caches = get_kv_cache_configs(config, [unified], [(24 << 30) - reservation])[0]
+    caches = get_kv_cache_configs(
+        config,
+        [unified],
+        [(24 << 30) - reservation],
+        get_global_kv_cache_groups(config, [unified]),
+    )[0]
     record_property("blocks", caches.num_blocks)
     record_property("swa_reserved_bytes", reservation)
     assert caches.num_blocks > 0

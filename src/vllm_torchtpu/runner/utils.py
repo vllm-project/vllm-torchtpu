@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Utility functions and classes for TPU runners."""
 
 import datetime
@@ -427,12 +439,14 @@ def _to_row_major(tensor: torch.Tensor) -> torch.Tensor:
 
 def relayout_rope_caches(model: torch.nn.Module):
     """Re-materialize every rope cache with a row-major device layout."""
+    # Share one relayouted device tensor across modules that share a buffer.
+    relayouted_by_id: dict[int, torch.Tensor] = {}
     num_changed = 0
     for name, module in model.named_modules():
         if not isinstance(module, RotaryEmbeddingBase):
             continue
         # The buffers on a rotary module that are indexed by position.
-        caches = [
+        caches: list[tuple[str, Any]] = [
             (buf_name, getattr(module, buf_name, None))
             for buf_name in ("cos_sin_cache", "cos_sin_cache_bf16")
         ]
@@ -442,7 +456,12 @@ def relayout_rope_caches(model: torch.nn.Module):
         if any(b.ndim != 2 for _, b in caches):
             continue
         for buf_name, buf in caches:
-            setattr(module, buf_name, _to_row_major(buf))
+            buf_id = id(buf)
+            relayouted = relayouted_by_id.get(buf_id)
+            if relayouted is None:
+                relayouted = _to_row_major(buf)
+                relayouted_by_id[buf_id] = relayouted
+            setattr(module, buf_name, relayouted)
         num_changed += 1
         logger.info(
             "Relayouted rope cache %s to {1,0} (shape %s)",
@@ -492,7 +511,7 @@ def relayout_hash_tables(model: torch.nn.Module):
         # The attributes under which one hash-routing table is reachable;
         # the same tensor object is bound to all of them.
         for attr in ("tid2eid", "hash_indices_table"):
-            table = getattr(module, attr, None)
+            table: torch.Tensor | None = getattr(module, attr, None)
             if not isinstance(table, torch.Tensor) or id(table) in seen:
                 continue
             seen.add(id(table))

@@ -17,26 +17,21 @@ Bridge the torch gdn_attention_core op for gated deltanet attention TPU impl
 """
 
 import functools
-import math
 
 import jax
 import jax.numpy as jnp
 from jax.experimental.layout import Layout, with_layout_constraint
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
+from vllm import envs
 
-from vllm_torchtpu import envs as tpu_envs
-from vllm_torchtpu.gdn_pool_layout import (
-    derive_pooled_gdn_state_layout,
-    pooled_gdn_conv_state_bytes,
-    pooled_gdn_ssm_state_bytes,
+from vllm_torchtpu.kernels.experimental.gdn_pcp_fused import (
+    pcp_wrapper as gdn_pcp_fused_wrapper,
 )
-from vllm_torchtpu.kernels import pool_adapters
 from vllm_torchtpu.kernels.gdn.head_geometry import (
     GdnHeadGeometry,
     derive_gdn_head_geometry,
 )
-from vllm_torchtpu.kernels.gdn.v3 import pcp_wrapper as gdn_v3_pcp_wrapper
 from vllm_torchtpu.kernels.gdn.v3 import wrapper as gdn_v3_wrapper
 from vllm_torchtpu.utils import get_mesh_shape_product
 
@@ -123,8 +118,10 @@ def run_jax_gdn_attention(
         P(None, "model"),  # j_mixed_qkv
         P(None, "model"),  # j_b
         P(None, "model"),  # j_a
-        P(None, None, "model"),  # conv_state
-        P(None, "model", None, None),  # recurrent_state
+        (
+            P(None, None, "model"),  # states: conv
+            P(None, "model", None, None),  # states: recurrent
+        ),
         P("model", None, None),  # j_conv_weight
         P("model") if j_conv_bias is not None else None,  # j_conv_bias
         P("model"),  # j_A_log
@@ -185,8 +182,7 @@ def run_jax_gdn_attention(
         j_mixed_qkv,
         j_b,
         j_a,
-        conv_state,
-        recurrent_state,
+        (conv_state, recurrent_state),
         j_conv_weight,
         j_conv_bias,
         j_A_log,
@@ -210,7 +206,7 @@ def _exchange_pcp_token_shards_for_head_shards(
 ) -> jnp.ndarray:
     """Exchange PCP token shards for PCP head shards.
 
-    Native torchtpu-vLLM PCP feeds rank-local token shards into this op. The
+    Native vllm-torchtpu PCP feeds rank-local token shards into this op. The
     op-local PCP mesh then treats PCP as extra head parallelism for the GDN
     recurrent scan: each PCP rank receives all tokens for only its local head
     slice.
@@ -444,14 +440,27 @@ def _derive_pcp_ragged_exchange_descriptors(
     return jax.vmap(_summarize_rank)(rank_major, valid, run_starts, run_ids)
 
 
+# Chips with compile and numerical coverage for the explicit ragged-exchange
+# layout below, which pins (8, 128) tiles. Gate on the chip rather than the
+# generation, so an unvalidated chip of a validated generation (TPU 8t) stays
+# rejected.
+_VALIDATED_PCP_RAGGED_EXCHANGE_CHIPS = frozenset(
+    {
+        pltpu.ChipVersion.TPU_7,
+        pltpu.ChipVersion.TPU_7X,
+        pltpu.ChipVersion.TPU_8I,
+    }
+)
+
+
 def _validate_pcp_ragged_exchange_layout_support() -> None:
-    generation = pltpu.get_tpu_info().generation
-    # TODO: Validate this explicit tiled layout on TPU v4/v5e/v6 and relax
-    # this guard once compile and numerical coverage exists for those targets.
-    if generation != 7:
+    chip_version = pltpu.get_tpu_info().chip_version
+    # TODO: Validate this explicit tiled layout on other TPU chips and extend
+    # the allowlist once compile and numerical coverage exists for them.
+    if chip_version not in _VALIDATED_PCP_RAGGED_EXCHANGE_CHIPS:
         raise NotImplementedError(
-            "GDN PCP ragged exchange layout is only validated on TPU "
-            f"generation 7, got generation {generation}."
+            "GDN PCP ragged exchange layout is only validated on TPU 7, 7x, "
+            f"and 8i, got TPU {chip_version}."
         )
 
 
@@ -713,8 +722,7 @@ def run_jax_gdn_attention_pcp_tp_prefill(
                 qkv_shard,
                 b_shard,
                 a_shard,
-                conv_state_,
-                recurrent_state_,
+                (conv_state_, recurrent_state_),
                 weight_shard,
                 bias_shard,
                 A_shard,
@@ -786,63 +794,32 @@ def run_jax_gdn_attention_pcp_tp_prefill(
 # ---------------------------------------------------------------
 
 
-def _build_v3_pool_state_plan(
-    pool: jnp.ndarray,
-    *,
-    conv_dim: int,
-    n_v: int,
-    d_k: int,
-    d_v: int,
-    kernel_size: int,
-    pool_block_tokens: int,
-    qk_pair_layout: bool,
-    recurrent_state_dtype: jnp.dtype = jnp.float32,
-):
-    """Describe this rank's GDN state regions in the unified pool."""
-    block_size, payload, lanes = pool_adapters._pool_geometry(pool)
-    if pool_block_tokens % block_size != 0:
-        raise ValueError(
-            "Manager block size must be divisible by the unified "
-            f"pool kernel block size: {pool_block_tokens} and "
-            f"{block_size}."
+def _is_seq_along_lane_pool() -> bool:
+    """True if pool uses the SEQ_ON_LANE
+    (nb, heads2, packed_d, pack, page_size) layout."""
+    return envs.VLLM_KV_CACHE_LAYOUT == "HND"
+
+
+def _as_logical_block_pool(
+    recurrent_state: jnp.ndarray, pool_block_tokens: int
+) -> jnp.ndarray:
+    """Reshape the attention-shaped pool so dim 0 is `num_logical_blocks`.
+
+    `*pool_shape[-2:]` is kept untouched so the reshape is a free 0-copy one;
+    the V3 kernel addresses each logical block through granule views.
+    """
+    pool_shape = recurrent_state.shape
+    if _is_seq_along_lane_pool():
+        # HND shape is (num_blocks, Kx2, D // P, P, kernel_block_size) with
+        # `kernel_block_size` at dim -1; fold `split` into dim 1 since the
+        # kernel only requires `dim 0 == num_logical_blocks`.
+        split = pool_block_tokens // pool_shape[-1]
+        return recurrent_state.reshape(
+            pool_shape[0] // split,
+            pool_shape[1] * split,
+            *pool_shape[2:],
         )
-    split = pool_block_tokens // block_size
-    if pool_adapters.is_seq_along_lane_pool():
-        tok_bytes = math.prod(payload) * jnp.dtype(pool.dtype).itemsize
-    else:
-        tok_bytes = math.prod(payload) * lanes * jnp.dtype(pool.dtype).itemsize
-    state_layout = derive_pooled_gdn_state_layout(
-        ssm_bytes=pooled_gdn_ssm_state_bytes(
-            num_v_heads=n_v,
-            head_k_dim=d_k,
-            head_v_dim=d_v,
-            dtype=jnp.dtype(recurrent_state_dtype),
-        ),
-        conv_bytes=pooled_gdn_conv_state_bytes(
-            kernel_size=kernel_size, conv_dim=conv_dim
-        ),
-        token_bytes=tok_bytes,
-    )
-    if state_layout.required_tokens > pool_block_tokens:
-        raise ValueError(
-            "GDN state does not fit in the unified pool manager "
-            f"block: {state_layout.required_tokens} > "
-            f"{pool_block_tokens}."
-        )
-    return pool_adapters.v3_state_source(
-        pool,
-        split=split,
-        ssm_ntok=state_layout.ssm_tokens,
-        conv_tok0=state_layout.ssm_tokens,
-        conv_ntok=state_layout.conv_tokens,
-        conv_dim=conv_dim,
-        n_v=n_v,
-        d_k=d_k,
-        d_v=d_v,
-        kernel_size=kernel_size,
-        qk_pair_layout=qk_pair_layout,
-        recurrent_state_dtype=recurrent_state_dtype,
-    )
+    return recurrent_state.reshape(-1, pool_block_tokens, *pool_shape[2:])
 
 
 def run_jax_gdn_attention_pooled_local(
@@ -860,6 +837,8 @@ def run_jax_gdn_attention_pooled_local(
     seq_lens: jnp.ndarray,
     read_offsets: jnp.ndarray | None = None,
     ckpt_indices: jnp.ndarray | None = None,
+    prefill_ckpt_offsets: jnp.ndarray | None = None,
+    prefill_ckpt_indices: jnp.ndarray | None = None,
     *,
     n_kq: int,
     n_v: int,
@@ -879,30 +858,14 @@ def run_jax_gdn_attention_pooled_local(
     kernel's state operands, so the kernel itself never sees the pool layout.
     """
 
-    conv_dim = conv_weight.shape[0]
-    # Fused conv+GDN kernel: both state regions stream directly
-    # between the pool and the kernel's double-buffered pipeline (one
-    # contiguous DMA per slot per region) — no external gather/scatter
-    # round trip. The kernel masks fresh slots via has_initial_state,
-    # so a newly-allocated block's bytes are never read, and padded
-    # slots move no bytes in either direction.
-    plan = _build_v3_pool_state_plan(
-        recurrent_state,
-        conv_dim=conv_dim,
-        n_v=n_v,
-        d_k=d_k,
-        d_v=d_v,
-        kernel_size=kernel_size,
-        pool_block_tokens=pool_block_tokens,
-        qk_pair_layout=tpu_envs.TPU_GDN_CONV_QK_PAIR_LAYOUT,
-        recurrent_state_dtype=recurrent_state_dtype,
-    )
-    recurrent_state, output = gdn_v3_wrapper.fused_conv1d_gdn(
+    pool_shape = recurrent_state.shape
+    pool = _as_logical_block_pool(recurrent_state, pool_block_tokens)
+
+    pool, output = gdn_v3_wrapper.fused_conv1d_gdn(
         mixed_qkv,
         b,
         a,
-        None,
-        None,
+        pool,
         conv_weight,
         conv_bias,
         A_log,
@@ -918,11 +881,13 @@ def run_jax_gdn_attention_pooled_local(
         d_k=d_k,
         d_v=d_v,
         kernel_size=kernel_size,
-        state_source=recurrent_state,
-        state_plan=plan,
+        recurrent_dtype=jnp.dtype(recurrent_state_dtype),
+        conv_dtype=jnp.dtype(jnp.float32),
         num_spec_tokens=num_spec_tokens,
+        prefill_ckpt_offsets=prefill_ckpt_offsets,
+        prefill_ckpt_indices=prefill_ckpt_indices,
     )
-    return recurrent_state, output
+    return pool.reshape(pool_shape), output
 
 
 def run_jax_gdn_attention_pooled(
@@ -950,6 +915,8 @@ def run_jax_gdn_attention_pooled(
     mesh: jax.sharding.Mesh,
     recurrent_state_dtype: jnp.dtype = jnp.float32,
     num_spec_tokens: int = 0,
+    prefill_ckpt_offsets: jnp.ndarray | None = None,
+    prefill_ckpt_indices: jnp.ndarray | None = None,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Runs GDN attention over the unified block pool, sharded on the mesh.
 
@@ -982,6 +949,10 @@ def run_jax_gdn_attention_pooled(
         d_v: Dimension of value.
         kernel_size: Convolution kernel size.
         mesh: The device mesh for distributed computation.
+        prefill_ckpt_offsets: Optional (max_reqs,) int32 internal prefill
+          checkpoint query offsets (0 for none).
+        prefill_ckpt_indices: Optional (max_reqs,) int32 destination block IDs
+          for prefill checkpoints (-1 for none).
 
     Returns:
         A tuple containing:
@@ -1003,18 +974,40 @@ def run_jax_gdn_attention_pooled(
         P(None),  # distribution
         P(None),  # seq_lens
     )
+    # Optional per-sequence operands follow seq_lens positionally, replicated
+    # like the other per-sequence inputs.
+    extra_args: tuple = ()
     if slot_read_offsets is not None:
-        # Per-sequence read offsets (see below), replicated like the other
-        # per-sequence inputs.
+        # `slot_read_offsets` is the per-slot offset buffer indexed by manager
+        # block id: `slot_read_offsets[block]` holds `num_accepted - 1` for
+        # the request whose state block is `block`. Index it by
+        # `state_indices` (each sequence's state block) to get the
+        # per-sequence read offsets the kernel expects (shape (num_seqs,));
+        # it then reads each request's initial state from checkpoint
+        # `read_offsets[s]` of block `state_indices[s]`. Both operands are
+        # replicated, so gather here, outside the shard_map (mirrors
+        # run_jax_gdn_attention).
+        extra_args = extra_args + (slot_read_offsets[state_indices],)
         in_specs = in_specs + (P(None),)
     if ckpt_indices is not None:
-        # `(num_seqs, num_spec_tokens + 1)` block id per checkpoint,
-        # replicated like the other per-sequence inputs.
+        # `(num_seqs, num_spec_tokens + 1)` block id per checkpoint. Already
+        # per-sequence (row s names sequence s's checkpoint blocks), so it
+        # needs no gather by state_indices.
         assert slot_read_offsets is not None, (
             "ckpt_indices selects a checkpoint per sequence, which needs "
             "slot_read_offsets to say which one"
         )
+        extra_args = extra_args + (ckpt_indices,)
         in_specs = in_specs + (P(None, None),)
+    if prefill_ckpt_offsets is not None:
+        assert prefill_ckpt_indices is not None
+        # Pad absent spec-decode operands with None to preserve positional order
+        # in run_jax_gdn_attention_pooled_local.
+        while len(extra_args) < 2:
+            extra_args = extra_args + (None,)
+            in_specs = in_specs + (None,)
+        extra_args = extra_args + (prefill_ckpt_offsets, prefill_ckpt_indices)
+        in_specs = in_specs + (P(None), P(None))
 
     out_specs = (
         pool_spec,  # new_recurrent_state (attention-shaped pool)
@@ -1042,22 +1035,6 @@ def run_jax_gdn_attention_pooled(
         check_vma=False,
     )
 
-    # `slot_read_offsets` is the per-slot offset buffer indexed by manager
-    # block id: `slot_read_offsets[block]` holds `num_accepted - 1` for the
-    # request whose state block is `block`. Index it by `state_indices`
-    # (each sequence's state block) to get the per-sequence read offsets
-    # the kernel expects (shape (num_seqs,)); it then reads each request's
-    # initial state from checkpoint `read_offsets[s]` of block
-    # `state_indices[s]`. Both operands are replicated, so gather here,
-    # outside the shard_map (mirrors run_jax_gdn_attention).
-    if slot_read_offsets is not None:
-        extra_args = (slot_read_offsets[state_indices],)
-    else:
-        extra_args = ()
-    if ckpt_indices is not None:
-        # Already per-sequence (row s names sequence s's checkpoint blocks),
-        # so it needs no gather by state_indices.
-        extra_args = extra_args + (ckpt_indices,)
     outputs = mapped_fn(
         j_mixed_qkv,
         j_b,
@@ -1102,8 +1079,16 @@ def run_jax_gdn_attention_pooled_pcp_prefill_projection(
     interleave_size: int,
     mesh: jax.sharding.Mesh,
     recurrent_state_dtype: jnp.dtype = jnp.float32,
+    prefill_ckpt_offsets: jnp.ndarray | None = None,
+    prefill_ckpt_indices: jnp.ndarray | None = None,
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """Fused QKVZ projection, PCP exchange, and GDN over the unified pool."""
+    """Fused QKVZ projection, PCP exchange, and GDN over the unified pool.
+
+    prefill_ckpt_offsets (global logical query tokens) and prefill_ckpt_indices
+    come together or not at all; every PCP rank writes its head shard of the
+    checkpoint into its own pool.
+    """
+    assert (prefill_ckpt_offsets is None) == (prefill_ckpt_indices is None)
     pcp_axis = "pcp"
     if pcp_axis not in mesh.axis_names:
         raise NotImplementedError("GDN pooled PCP prefill requires a pcp mesh axis.")
@@ -1111,6 +1096,9 @@ def run_jax_gdn_attention_pooled_pcp_prefill_projection(
         raise ValueError(
             f"pcp_size={pcp_size} does not match mesh axis size {mesh.shape[pcp_axis]}."
         )
+    # The fused projection path (gdn_pcp_fused) pins the same (8, 128) tiles
+    # as the ragged exchange, but does not go through that exchange.
+    _validate_pcp_ragged_exchange_layout_support()
     geometry = derive_gdn_head_geometry(n_kq, n_v, pcp_size)
     local_n_v = geometry.local_num_v_heads
     local_conv_dim = geometry.local_conv_dim(d_k, d_v)
@@ -1122,6 +1110,7 @@ def run_jax_gdn_attention_pooled_pcp_prefill_projection(
     replicated_spec = P()
     tp_parameter_spec = P(tp_axis) if tp_axis is not None else replicated_spec
     pool_spec = P(pcp_tp_state_axis)
+    prefill_ckpt_spec = replicated_spec if prefill_ckpt_offsets is not None else None
     in_specs = (
         token_spec,  # hidden states
         tp_parameter_spec,  # QKVZ weight
@@ -1137,6 +1126,8 @@ def run_jax_gdn_attention_pooled_pcp_prefill_projection(
         replicated_spec,  # state_indices
         replicated_spec,  # distribution
         replicated_spec,  # seq_lens
+        prefill_ckpt_spec,  # prefill checkpoint offsets
+        prefill_ckpt_spec,  # prefill checkpoint block ids
     )
     output_spec = P(pcp_axis, tp_axis, None)
     out_specs = (pool_spec, output_spec, output_spec)
@@ -1156,6 +1147,8 @@ def run_jax_gdn_attention_pooled_pcp_prefill_projection(
         state_indices_,
         distribution_,
         seq_lens_,
+        prefill_ckpt_offsets_,
+        prefill_ckpt_indices_,
     ):
         # BA is small enough to exchange outside the fused kernel. Restore it
         # to request-major order before the GDN schedule consumes it.
@@ -1220,25 +1213,16 @@ def run_jax_gdn_attention_pooled_pcp_prefill_projection(
                 f"selection: expected {local_conv_dim}, got "
                 f"{weight_shard.shape[0]}."
             )
-        state_plan = _build_v3_pool_state_plan(
-            pool_,
-            conv_dim=local_conv_dim,
-            n_v=local_n_v,
-            d_k=d_k,
-            d_v=d_v,
-            kernel_size=kernel_size,
-            pool_block_tokens=pool_block_tokens,
-            qk_pair_layout=tpu_envs.TPU_GDN_CONV_QK_PAIR_LAYOUT,
-            recurrent_state_dtype=recurrent_state_dtype,
-        )
+        pool_shape = pool_.shape
+        pool = _as_logical_block_pool(pool_, pool_block_tokens)
 
-        return gdn_v3_pcp_wrapper.fused_qkvz_projection_pcp_gdn(
+        pool, output, z = gdn_pcp_fused_wrapper.fused_qkvz_projection_pcp_gdn(
             local_hidden_states,
             qkvz_weight_,
             qkvz_weight_scale_,
             b_shard,
             a_shard,
-            pool_,
+            pool,
             weight_shard,
             bias_shard,
             A_shard,
@@ -1256,8 +1240,11 @@ def run_jax_gdn_attention_pooled_pcp_prefill_projection(
             comm_chunk_size=interleave_size,
             mesh_axis_names=tuple(mesh.axis_names),
             pcp_axis_name=pcp_axis,
-            state_plan=state_plan,
+            recurrent_state_dtype=jnp.dtype(recurrent_state_dtype),
+            prefill_ckpt_offsets=prefill_ckpt_offsets_,
+            prefill_ckpt_indices=prefill_ckpt_indices_,
         )
+        return pool.reshape(pool_shape), output, z
 
     mapped_fn = jax.shard_map(
         _pooled_pcp_prefill_fn,
@@ -1281,6 +1268,8 @@ def run_jax_gdn_attention_pooled_pcp_prefill_projection(
         state_indices,
         distribution,
         seq_lens,
+        prefill_ckpt_offsets,
+        prefill_ckpt_indices,
     )
 
 

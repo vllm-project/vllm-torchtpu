@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Exercise the serving adapter with real EP workers, in eager and compiled mode.
 
 Unlike the pure-JAX kernel tests and mocked adapter tests, this checks that each
@@ -28,10 +40,9 @@ LAUNCH_TIMEOUT_SECONDS = 480
 
 
 def _prepare_worker_env():
-    from torch_tpu._internal.distributed.launchers.singlehost_wrapper import (
-        prepare_tpu_environment,
-    )
     from torch_tpu._internal.utils import hardware
+
+    from tests.distributed.tpu_test_utils import prepare_tpu_environment
 
     if hardware.get_tpu_device_count() < WORLD_SIZE:
         pytest.skip("requires eight TPU devices")

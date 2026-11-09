@@ -44,6 +44,8 @@ from vllm import LLM, SamplingParams
 from vllm.distributed import cleanup_dist_env_and_memory
 from vllm.sampling_params import StructuredOutputsParams
 
+pytestmark = pytest.mark.tpu_test
+
 MODEL_NAME = "Qwen/Qwen3-0.6B"
 
 CHOICES = ["Positive", "Negative"]
@@ -231,9 +233,13 @@ def llm():
         mp.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
         # pytest caches the fixture so we use weakref.proxy to
         # enable garbage collection
+        # Prompts are ~15 tokens and at most 4 run at once, so no step needs
+        # more than 128 tokens; the default budget (max_model_len *
+        # max_num_seqs) compiles buckets up to 1024.
         llm = LLM(
             model=MODEL_NAME,
             max_model_len=256,
+            max_num_batched_tokens=128,
             max_num_seqs=4,
             tensor_parallel_size=1,
             gpu_memory_utilization=0.6,

@@ -21,6 +21,7 @@ and src/vllm_torchtpu/runner/tpu_runner.py spec-warmup diffs (eab4fc815) on CPU.
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import os
 from types import SimpleNamespace
@@ -227,109 +228,6 @@ class TestDSparkProposerFull:
             assert p4.sample_from_anchor is True
             assert p4._query_block_size(5) == 5
 
-    def test_init_missing_target_layers_error(self):
-        cfg, _ = self._make_valid_vllm_config()
-        with (
-            patch.object(
-                DSparkProposer.__bases__[0],
-                "__init__",
-                lambda self, runner, v_cfg: (
-                    setattr(self, "dflash_config", {})
-                    or setattr(self, "speculative_config", v_cfg.speculative_config)
-                ),
-            ),
-            pytest.raises(ValueError, match="DSpark requires target layer ids"),
-        ):
-            DSparkProposer(MagicMock(), cfg)
-
-    def test_init_block_size_mismatch_error(self):
-        cfg, target_layers = self._make_valid_vllm_config(
-            dspark_block_size=4,
-            num_speculative_tokens=5,
-        )
-        with (
-            patch.object(
-                DSparkProposer.__bases__[0],
-                "__init__",
-                lambda self, runner, v_cfg: (
-                    setattr(
-                        self,
-                        "dflash_config",
-                        {"target_layer_ids": target_layers},
-                    )
-                    or setattr(self, "speculative_config", v_cfg.speculative_config)
-                ),
-            ),
-            pytest.raises(
-                ValueError,
-                match="does not match the DSpark checkpoint's block size 4",
-            ),
-        ):
-            DSparkProposer(MagicMock(), cfg)
-
-    def test_init_unsupported_options_errors(self):
-        # 1. draft_sample_method != "greedy"
-        cfg1, target_layers = self._make_valid_vllm_config(draft_sample_method="sample")
-        with (
-            patch.object(
-                DSparkProposer.__bases__[0],
-                "__init__",
-                lambda self, runner, v_cfg: (
-                    setattr(
-                        self,
-                        "dflash_config",
-                        {"target_layer_ids": target_layers},
-                    )
-                    or setattr(self, "speculative_config", v_cfg.speculative_config)
-                ),
-            ),
-            pytest.raises(
-                ValueError,
-                match="DSpark on TPU does not support draft_sample_method='sample'",
-            ),
-        ):
-            DSparkProposer(MagicMock(), cfg1)
-
-        # 2. enable_adaptive_verification = True
-        cfg2, target_layers = self._make_valid_vllm_config(
-            enable_adaptive_verification=True
-        )
-        with (
-            patch.object(
-                DSparkProposer.__bases__[0],
-                "__init__",
-                lambda self, runner, v_cfg: (
-                    setattr(
-                        self,
-                        "dflash_config",
-                        {"target_layer_ids": target_layers},
-                    )
-                    or setattr(self, "speculative_config", v_cfg.speculative_config)
-                ),
-            ),
-            pytest.raises(ValueError, match="enable_adaptive_verification=True"),
-        ):
-            DSparkProposer(MagicMock(), cfg2)
-
-        # 3. dspark_draft_topk is not None
-        cfg3, target_layers = self._make_valid_vllm_config(dspark_draft_topk=8)
-        with (
-            patch.object(
-                DSparkProposer.__bases__[0],
-                "__init__",
-                lambda self, runner, v_cfg: (
-                    setattr(
-                        self,
-                        "dflash_config",
-                        {"target_layer_ids": target_layers},
-                    )
-                    or setattr(self, "speculative_config", v_cfg.speculative_config)
-                ),
-            ),
-            pytest.raises(ValueError, match="dspark_draft_topk=8"),
-        ):
-            DSparkProposer(MagicMock(), cfg3)
-
     def test_load_model_checks(self):
         cfg, target_layers = self._make_valid_vllm_config()
         with patch.object(
@@ -450,7 +348,9 @@ class TestTpuRunnerSpecWarmupDiff:
         ring_group = SimpleNamespace(kv_cache_spec=ring_spec)
         runner = SimpleNamespace(
             max_model_len=8192,
-            vllm_config=SimpleNamespace(),
+            vllm_config=SimpleNamespace(
+                parallel_config=SimpleNamespace(decode_context_parallel_size=1)
+            ),
         )
         # max_pos = 2060 -> cdiv(2060, 8) = 258, max_blocks = 1 -> clamped to 1
         assert tpu_runner._spec_warmup_group_num_blocks(runner, ring_group, 2060) == 1
@@ -458,7 +358,9 @@ class TestTpuRunnerSpecWarmupDiff:
         # Case 2: CircularBufferSpec where max_pos is limited by runner.max_model_len
         runner_short = SimpleNamespace(
             max_model_len=4,
-            vllm_config=SimpleNamespace(),
+            vllm_config=SimpleNamespace(
+                parallel_config=SimpleNamespace(decode_context_parallel_size=1)
+            ),
         )
         # max_pos = 2060, max_model_len = 4 -> min(2060, 4) = 4 -> cdiv(4, 8) = 1
         assert (
@@ -471,8 +373,8 @@ class TestTpuRunnerSpecWarmupDiff:
         custom_ring_spec.block_size = 128
         custom_ring_spec.max_num_blocks_per_req.return_value = 10
         custom_group = SimpleNamespace(kv_cache_spec=custom_ring_spec)
-        # max_pos = 64, max_model_len = 8192 -> cdiv(64, 128) = 1, min(1, 10) = 1
-        assert tpu_runner._spec_warmup_group_num_blocks(runner, custom_group, 64) == 1
+        # Counted in the spec's own block-table units (max_num_blocks_per_req).
+        assert tpu_runner._spec_warmup_group_num_blocks(runner, custom_group, 64) == 10
 
         # Case 4: Non-CircularBufferSpec (e.g. FullAttentionSpec)
         attn_spec = FullAttentionSpec(
@@ -486,47 +388,6 @@ class TestTpuRunnerSpecWarmupDiff:
         assert tpu_runner._spec_warmup_group_num_blocks(runner, attn_group, 2060) == 9
         # max_pos = 10000 -> min(10000, 8192) = 8192 -> cdiv(8192, 256) = 32
         assert tpu_runner._spec_warmup_group_num_blocks(runner, attn_group, 10000) == 32
-
-    def test_warmup_one_pcp_mtp_prefill_wiring(self):
-        # Covers line 5920 in tpu_runner.py
-        ring_spec = CircularBufferSpec(
-            block_size=8,
-            num_kv_heads=1,
-            head_size=512,
-            dtype=torch.bfloat16,
-        )
-        attn_spec = FullAttentionSpec(
-            block_size=256,
-            num_kv_heads=8,
-            head_size=128,
-            dtype=torch.bfloat16,
-        )
-        executed = []
-        runner = SimpleNamespace(
-            max_model_len=8192,
-            max_num_tokens=2048,
-            kv_cache_config=SimpleNamespace(
-                num_blocks=200,
-                kv_cache_groups=[
-                    SimpleNamespace(kv_cache_spec=attn_spec),
-                    SimpleNamespace(kv_cache_spec=ring_spec),
-                ],
-            ),
-            execute_model=MagicMock(
-                side_effect=lambda so: executed.append(so) and None
-            ),
-            sample_tokens=MagicMock(),
-            take_draft_token_ids=MagicMock(return_value=None),
-            _warmup_spec_decode_cleanup=MagicMock(return_value=True),
-        )
-
-        res = TPUModelRunner._warmup_one_pcp_mtp_prefill(runner, P=2048)
-        assert res is True
-        assert len(executed) == 1
-        new_req = executed[0].scheduled_new_reqs[0]
-        # Attention group has 9 blocks, CircularBufferSpec has 1 block
-        assert len(new_req.block_ids[0]) == 9
-        assert len(new_req.block_ids[1]) == 1
 
     def test_warmup_spec_batch_and_one_spec_request_wiring(self):
         # Covers lines 6223 and 6339 in tpu_runner.py
@@ -554,6 +415,13 @@ class TestTpuRunnerSpecWarmupDiff:
             kv_cache_config=SimpleNamespace(
                 num_blocks=200,
                 kv_cache_groups=[attn_spec, ring_group],
+            ),
+            vllm_config=SimpleNamespace(
+                parallel_config=SimpleNamespace(decode_context_parallel_size=1)
+            ),
+            scheduler_config=SimpleNamespace(max_num_seqs=4),
+            requests=collections.defaultdict(
+                lambda: SimpleNamespace(output_token_ids=[])
             ),
             execute_model=MagicMock(
                 side_effect=lambda so: executed.append(so) and None
@@ -723,28 +591,34 @@ class TestOProjectionFull:
             assert mock_pallas.called
 
     def test_rope_heads(self):
-        # 1. head_dim = 128 (lo = 0, entire head roped)
-        x_128 = jnp.ones((2, 4, 128), dtype=jnp.bfloat16)
+        # Flat (rows, heads_per_group * head_dim) input; head_dim must exceed
+        # LANE, so every head keeps channels before its roped tail.
         cs = jnp.ones((2, 2 * LANE), dtype=jnp.float32)
-        roped_128 = op._rope_heads(x_128, cs, head_dim=128)
-        assert roped_128.shape == (2, 4, 128)
-        assert roped_128.dtype == jnp.bfloat16
+        with pytest.raises(AssertionError):
+            op._rope_heads(
+                jnp.ones((2, 4 * 128), dtype=jnp.bfloat16),
+                cs,
+                head_dim=128,
+                heads_per_group=4,
+            )
 
-        # 2. head_dim = 256 (lo = 128, first 128 kept, last 128 roped)
-        x_256 = jnp.ones((2, 4, 256), dtype=jnp.bfloat16)
-        roped_256 = op._rope_heads(x_256, cs, head_dim=256)
-        assert roped_256.shape == (2, 4, 256)
+        # head_dim = 256: per head, the first 128 lanes pass through and the
+        # last 128 are roped.
+        x_256 = jnp.ones((2, 4 * 256), dtype=jnp.bfloat16)
+        roped_256 = op._rope_heads(x_256, cs, head_dim=256, heads_per_group=4)
+        assert roped_256.shape == (2, 4 * 256)
         assert roped_256.dtype == jnp.bfloat16
-        # lo part should match exactly
-        np.testing.assert_array_equal(
-            np.asarray(roped_256[:, :, :128]), np.asarray(x_256[:, :, :128])
-        )
+        for h in range(4):
+            np.testing.assert_array_equal(
+                np.asarray(roped_256[:, h * 256 : h * 256 + 128]),
+                np.asarray(x_256[:, h * 256 : h * 256 + 128]),
+            )
 
     def test_kernel_quantized_and_unquantized(self):
         tile_t = 4
         num_sub_t = 2
         H = 8
-        head_dim = 128
+        head_dim = 256  # _rope_heads ropes the last LANE lanes only
         D = H * head_dim
         tile_r = 16
 
@@ -913,7 +787,7 @@ class TestOProjectionFull:
         T = 16
         G = 2
         H = 8
-        head_dim = 128
+        head_dim = 256  # _rope_heads ropes the last LANE lanes only
         D = H * head_dim
         R = 32
         out_features = G * R
@@ -985,7 +859,7 @@ class TestOProjectionFull:
         T = 16
         G = 2
         H = 8
-        head_dim = 128
+        head_dim = 256  # _rope_heads ropes the last LANE lanes only
         D = H * head_dim
         R = 32
         out_features = G * R

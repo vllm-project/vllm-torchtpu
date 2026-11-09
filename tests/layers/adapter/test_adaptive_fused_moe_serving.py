@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Load-time selection and communication ownership of adaptive fused MoE."""
 
 from types import SimpleNamespace
@@ -14,8 +26,6 @@ from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import vllm_adapter a
 from vllm_torchtpu.layers.adapter import fused_moe_ep as legacy
 from vllm_torchtpu.layers.adapter.custom_ops.moe_runner import VllmMoERunner
 from vllm_torchtpu.layers.adapter.quantization import fp8, nvfp4
-
-pytestmark = pytest.mark.cpu_test
 
 
 @pytest.mark.parametrize(

@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from dataclasses import dataclass
 from typing import Any
 
@@ -6,6 +18,7 @@ import numpy as np
 import torch
 from vllm.v1.outputs import (
     AsyncModelRunnerOutput,
+    KVConnectorOutput,
     LogprobsLists,
     LogprobsTensors,
     ModelRunnerOutput,
@@ -113,6 +126,15 @@ class AsyncTPUCopyState:
             spec_logprobs=spec_logprobs or None,
             _spec_logprobs_tpu=spec_logprobs_tpu,
         )
+
+    def fence_pending_device_work(self) -> None:
+        """Re-arms the ready event behind everything enqueued on the device
+        since the copy was issued. A torch.tpu.Event covers all work
+        enqueued before it is recorded, so wait() then also proves that
+        later work (a drafter's KV writes) has executed."""
+        event = torch.tpu.Event()
+        event.record()
+        self.copy_ready_event = event
 
     def wait(self) -> None:
         if self.completed:
@@ -226,6 +248,10 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
 
         self._model_runner_output.sampled_token_ids = valid_sampled_token_ids
         return self._model_runner_output
+
+    def get_kv_connector_output(self) -> KVConnectorOutput | None:
+        """Get the KV connector output for this async output."""
+        return self._model_runner_output.kv_connector_output
 
 
 def assemble_spec_next_tokens(

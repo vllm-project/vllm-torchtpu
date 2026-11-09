@@ -18,6 +18,7 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from absl.testing import absltest, parameterized
 from jax._src import dtypes
 from jax._src import test_util as jtu
@@ -31,6 +32,8 @@ from vllm_torchtpu.kernels.experimental.batched_rpa.utils import (
 from vllm_torchtpu.kernels.experimental.batched_rpa.wrapper import (
     ragged_paged_attention,
 )
+
+pytestmark = pytest.mark.tpu_test
 
 jax.config.parse_flags_with_absl()
 
@@ -719,11 +722,9 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         )
 
         rpa_bkv_sz = bkv_sz
-        rpa_n_buffer = 3
         rpa_batch_size = 2
         if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
             rpa_bkv_sz = max(bkv_sz, 128)
-            rpa_n_buffer = 2
             rpa_batch_size = 1
 
         decode_block_sizes = configs.BlockSizes(
@@ -731,14 +732,12 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             bq_c_sz=bq_csz,
             bkv_sz=rpa_bkv_sz,
             batch_size=rpa_batch_size,
-            n_buffer=rpa_n_buffer,
         )
         prefill_block_sizes = configs.BlockSizes(
             bq_sz=bq_sz,
             bq_c_sz=bq_csz,
             bkv_sz=rpa_bkv_sz,
             batch_size=rpa_batch_size,
-            n_buffer=rpa_n_buffer,
         )
 
         output, updated_kv_cache = ragged_paged_attention(

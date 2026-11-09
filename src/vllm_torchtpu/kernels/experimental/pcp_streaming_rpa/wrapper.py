@@ -2,6 +2,15 @@
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Composite wrappers for PCP streaming RPA."""
 
 import math
@@ -551,6 +560,7 @@ def _build_writeback_segment_descriptors(
     )
     discontinuous = compact_slot_ids != previous_slots + 1
     if kv_layout == KVLayout.SEQ_ALONG_LANE:
+        assert page_size is not None
         crossed_page = (compact_slot_ids // page_size) != (previous_slots // page_size)
         discontinuous = jnp.logical_or(discontinuous, crossed_page)
     segment_starts = jnp.logical_and(

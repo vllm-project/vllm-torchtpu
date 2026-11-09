@@ -26,7 +26,6 @@ FP8_DTYPE = torch.float8_e4m3fn
 FP8_MAX = float(torch.finfo(FP8_DTYPE).max)
 
 
-@pytest.mark.cpu_test
 @pytest.mark.parametrize("strided", [False, True])
 def test_bit_decoder_matches_cpu_ldexp_for_every_byte(strided):
     values = torch.arange(256, dtype=torch.int32).to(torch.uint8).reshape(16, 16)
@@ -41,11 +40,19 @@ def test_bit_decoder_matches_cpu_ldexp_for_every_byte(strided):
     )
 
 
-def test_bit_decoder_on_device_matches_cpu_bits(device):
-    values = torch.arange(256, dtype=torch.int32).to(torch.uint8)
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("strided", [False, True])
+def test_bit_decoder_on_device_matches_cpu_bits(device, strided):
+    values = torch.arange(256, dtype=torch.int32).to(torch.uint8).reshape(16, 16)
+    device_values = values.to(device)
+    if strided:
+        values = values.T
+        device_values = device_values.T
     expected = e8m0_to_fp32(values)
-    actual = e8m0_to_fp32_bits(values.to(device)).cpu()
-    assert torch.equal(actual.view(torch.int32), expected.view(torch.int32))
+    actual = e8m0_to_fp32_bits(device_values).cpu()
+    assert torch.equal(
+        actual.view(torch.int32), expected.contiguous().view(torch.int32)
+    )
 
 
 def _quantize_ue8m0(tensor: torch.Tensor, block_size: int | None = None):
@@ -54,6 +61,7 @@ def _quantize_ue8m0(tensor: torch.Tensor, block_size: int | None = None):
     )
 
 
+@pytest.mark.tpu_test
 def test_scale_is_a_ue8m0_byte(device):
     tensor = torch.randn(4, 128, device=device, dtype=torch.bfloat16)
 
@@ -68,6 +76,7 @@ def test_scale_is_a_ue8m0_byte(device):
     assert torch.equal(decoded.to(torch.float8_e8m0fnu).view(torch.uint8), scale)
 
 
+@pytest.mark.tpu_test
 def test_dequantized_values_are_close(device):
     torch.manual_seed(0)
     tensor = torch.randn(16, 512, device=device, dtype=torch.bfloat16) * 3.0

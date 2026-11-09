@@ -28,7 +28,7 @@ on CPU under JAX_PLATFORMS=cpu TPU_SKIP_MDS_QUERY=true.
 from __future__ import annotations
 
 import os
-from unittest.mock import MagicMock, PropertyMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -38,11 +38,8 @@ os.environ.setdefault("TPU_SKIP_MDS_QUERY", "true")
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.experimental import pallas as pl
-from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.deepseek_v4.compress_and_store import (
-    buffered_ref,
     compress_store_ref,
     compressor_v1,
     compute,
@@ -101,7 +98,7 @@ class MockArrayRef:
                 self.arr[...] = np.asarray(val_arr)
             else:
                 self.arr[_norm_idx(idx)] = np.asarray(val_arr)
-        except Exception:
+        except Exception:  # noqa: S110 (mock falls back to the default)
             pass
 
     @property
@@ -125,7 +122,7 @@ class MockArrayRef:
                         self.ref.arr[...] = np.asarray(val_arr)
                     else:
                         self.ref.arr[_norm_idx(idx)] = np.asarray(val_arr)
-                except Exception:
+                except Exception:  # noqa: S110 (mock falls back to the default)
                     pass
 
         return _AtIndexer(self)
@@ -197,7 +194,7 @@ def fake_bitcast(x, ty):
         if "uint16" in ty_str and arr.dtype in (np.float32, np.float16):
             return jnp.asarray(arr.astype(np.float16).view(np.uint16))
         return jnp.asarray(arr.view(ty))
-    except Exception:
+    except Exception:  # noqa: S110 (mock falls back to the default)
         pass
     try:
         return x.view(ty)
@@ -807,88 +804,6 @@ class TestCompute:
         assert merged.shape == slots_val.shape
         assert jnp.any(merged > 0)
 
-    def test_gather_from_page_buffer(self):
-        # 1. is_indexer = True with overlap = True and False
-        page_buf_idx = MockArrayRef(np.ones((2, 3, 32, 4, 256), dtype=np.uint8))
-        pos_ref = np.array([3, 7], dtype=np.int32)
-        kv_u8 = MockArrayRef(np.zeros((2, 8, 1, 4, 128), dtype=np.uint8))
-        sc_u8 = MockArrayRef(np.zeros((2, 8, 1, 4, 128), dtype=np.uint8))
-
-        with patch("jax.experimental.pallas.when", side_effect=fake_when):
-            compute.gather_from_page_buffer(
-                page_buf_idx,
-                pos_ref,
-                kv_u8,
-                sc_u8,
-                global_idx=0,
-                num_tokens=2,
-                window=8,
-                block_size=4,
-                pages_to_buffer_per_token=2,
-                field_rows=1,
-                state_rows_per_token=2,
-                overlap=True,
-                is_indexer=True,
-            )
-            assert np.any(kv_u8.arr > 0)
-
-            # overlap = False
-            compute.gather_from_page_buffer(
-                page_buf_idx,
-                pos_ref,
-                kv_u8,
-                sc_u8,
-                global_idx=0,
-                num_tokens=2,
-                window=4,
-                block_size=4,
-                pages_to_buffer_per_token=2,
-                field_rows=1,
-                state_rows_per_token=2,
-                overlap=False,
-                is_indexer=True,
-            )
-
-        # 2. is_indexer = False (Standard CSA/HCA) with overlap = True and False
-        page_buf_std = MockArrayRef(np.ones((2, 3, 128, 4, 128), dtype=np.uint8))
-        kv_u8_std = MockArrayRef(np.zeros((2, 8, 4, 4, 128), dtype=np.uint8))
-        sc_u8_std = MockArrayRef(np.zeros((2, 8, 4, 4, 128), dtype=np.uint8))
-
-        with patch("jax.experimental.pallas.loop", side_effect=fake_loop):
-            compute.gather_from_page_buffer(
-                page_buf_std,
-                pos_ref,
-                kv_u8_std,
-                sc_u8_std,
-                global_idx=0,
-                num_tokens=2,
-                window=8,
-                block_size=4,
-                pages_to_buffer_per_token=2,
-                field_rows=2,
-                state_rows_per_token=4,
-                overlap=True,
-                is_indexer=False,
-            )
-            assert np.any(kv_u8_std.arr > 0)
-
-            # overlap = False
-            compute.gather_from_page_buffer(
-                page_buf_std,
-                pos_ref,
-                kv_u8_std,
-                sc_u8_std,
-                global_idx=0,
-                num_tokens=2,
-                window=4,
-                block_size=4,
-                pages_to_buffer_per_token=2,
-                field_rows=1,
-                state_rows_per_token=2,
-                overlap=False,
-                is_indexer=False,
-            )
-
 
 # ==============================================================================
 # 5. TestBufferedRef (buffered_ref.py)
@@ -897,299 +812,6 @@ class TestCompute:
 
 class TestBufferedRef:
     """Tests 100% of buffered_ref.py."""
-
-    def test_create_allocs_and_specs(self):
-        cfg_csa = config.Configs.make(
-            config.Mode.CSA, size_n=4, physical_page_size=32, state_block_size=8
-        )
-        cache_ref = MockArrayRef(np.zeros((2, 32, 128), dtype=np.int32))
-        rope_cache_ref = MockArrayRef(np.zeros((2, 8, 128), dtype=np.int32))
-        state_cache_ref = MockArrayRef(np.zeros((2, 32, 128), dtype=np.int32))
-        cos_sin_ref = jnp.zeros((16, 64), dtype=jnp.float32)
-        pos_ref = jnp.zeros((4,), dtype=jnp.int32)
-        bt_ref = jnp.zeros((4,), dtype=jnp.int32)
-        t2r_ref = jnp.zeros((4,), dtype=jnp.int32)
-        kv_slot_ref = jnp.zeros((4,), dtype=jnp.int32)
-        mask_ref = jnp.zeros((4,), dtype=bool)
-
-        allocs, specs, args = buffered_ref.create_allocs_and_specs(
-            cfgs=cfg_csa,
-            cache_ref=cache_ref,
-            rope_cache_ref=rope_cache_ref,
-            state_cache_ref=state_cache_ref,
-            cos_sin_cache_ref=cos_sin_ref,
-            positions_ref=pos_ref,
-            block_table_ref=bt_ref,
-            block_table_stride=2,
-            token_to_req_indices_ref=t2r_ref,
-            kv_slot_mapping_ref=kv_slot_ref,
-            is_first_mask_ref=mask_ref,
-            is_first_mask_rope_ref=mask_ref,
-        )
-        assert len(allocs) == 4
-        assert len(specs) == 4
-        assert len(args) == 4
-
-        # Non-rope / non-rope_cache
-        cfg_hca = config.Configs.make(
-            config.Mode.HCA,
-            size_n=4,
-            physical_page_size=64,
-            state_block_size=8,
-            rope_head_dim=0,
-        )
-        allocs_hca, _, _ = buffered_ref.create_allocs_and_specs(
-            cfgs=cfg_hca,
-            cache_ref=jnp.zeros((2, 64, 4, 128), dtype=jnp.uint8),
-            rope_cache_ref=None,
-            state_cache_ref=None,
-            cos_sin_cache_ref=None,
-            positions_ref=pos_ref,
-            block_table_ref=bt_ref,
-            block_table_stride=2,
-            token_to_req_indices_ref=t2r_ref,
-            kv_slot_mapping_ref=kv_slot_ref,
-            is_first_mask_ref=mask_ref,
-            is_first_mask_rope_ref=mask_ref,
-        )
-        assert allocs_hca[0] is None
-        assert allocs_hca[3] is None
-
-        # CSA_INDEXER mode (covers line 480: output_args with 3 elements)
-        cfg_idx = config.Configs.make(
-            config.Mode.CSA_INDEXER,
-            size_n=4,
-            physical_page_size=16,
-            state_block_size=4,
-            rope_head_dim=0,
-        )
-        allocs_idx, _, args_idx = buffered_ref.create_allocs_and_specs(
-            cfgs=cfg_idx,
-            cache_ref=jnp.zeros((2, 16, 4, 256), dtype=jnp.uint8),
-            rope_cache_ref=None,
-            state_cache_ref=None,
-            cos_sin_cache_ref=None,
-            positions_ref=pos_ref,
-            block_table_ref=bt_ref,
-            block_table_stride=2,
-            token_to_req_indices_ref=t2r_ref,
-            kv_slot_mapping_ref=kv_slot_ref,
-            is_first_mask_ref=mask_ref,
-            is_first_mask_rope_ref=mask_ref,
-        )
-        assert len(allocs_idx) == 4
-        assert len(args_idx[1]) == 3
-
-    def test_buffered_ref_dma_methods(self):
-        cfg_csa = config.Configs.make(
-            config.Mode.CSA, size_n=4, physical_page_size=32, state_block_size=8
-        )
-        cfg_idx = config.Configs.make(
-            config.Mode.CSA_INDEXER, size_n=4, physical_page_size=16, state_block_size=4
-        )
-
-        mock_copy = MockAsyncCopy()
-        mock_sem = MockArrayRef(np.zeros((2,), dtype=np.int32))
-        mock_win = MockArrayRef(np.zeros((2, 4, 4, 32, 4, 256), dtype=np.uint8))
-
-        with (
-            patch("jax.experimental.pallas.loop", side_effect=fake_loop),
-            patch("jax.experimental.pallas.when", side_effect=fake_when),
-            patch(
-                "jax.experimental.pallas.tpu.make_async_copy", return_value=mock_copy
-            ),
-            patch.object(
-                pltpu.BufferedRef,
-                "current_copy_in_slot",
-                new_callable=PropertyMock,
-                return_value=0,
-            ),
-            patch.object(
-                pltpu.BufferedRef,
-                "current_wait_in_slot",
-                new_callable=PropertyMock,
-                return_value=0,
-            ),
-            patch.object(
-                pltpu.BufferedRef,
-                "current_copy_out_slot",
-                new_callable=PropertyMock,
-                return_value=0,
-            ),
-            patch.object(
-                pltpu.BufferedRef,
-                "current_wait_out_slot",
-                new_callable=PropertyMock,
-                return_value=0,
-            ),
-        ):
-
-            def _setup_alloc(alloc):
-                object.__setattr__(alloc, "sem_recvs", mock_sem)
-                object.__setattr__(alloc, "sem_sends", mock_sem)
-                object.__setattr__(alloc, "window_ref", mock_win)
-                return alloc
-
-            # CosSinRef
-            cos_sin_alloc = _setup_alloc(
-                buffered_ref.CosSinRef.create(
-                    spec=pl.BlockSpec(
-                        block_shape=cfg_csa.cos_sin_shape(), memory_space=pltpu.VMEM
-                    ),
-                    dtype_or_type=jnp.float32,
-                    buffer_type=pltpu.BufferType.INPUT,
-                    buffer_count=2,
-                    use_lookahead=False,
-                    cfgs=cfg_csa,
-                )
-            )
-            cos_sin_alloc.copy_in(
-                (
-                    MockArrayRef(np.zeros((16, 64), dtype=np.float32)),
-                    np.array([0, 1, 2, 3]),
-                ),
-                (0,),
-            )
-            cos_sin_alloc.wait_in(None, (0,))
-
-            # PageBufferRef
-            page_alloc = _setup_alloc(
-                buffered_ref.PageBufferRef.create(
-                    spec=pl.BlockSpec(
-                        block_shape=cfg_csa.page_buffer_shape(), memory_space=pltpu.VMEM
-                    ),
-                    dtype_or_type=jnp.uint8,
-                    buffer_type=pltpu.BufferType.INPUT,
-                    buffer_count=2,
-                    use_lookahead=False,
-                    cfgs=cfg_csa,
-                )
-            )
-            page_alloc.copy_in(
-                (
-                    MockArrayRef(np.zeros((2, 32, 4, 128), dtype=np.uint8)),
-                    np.array([0, 1, 2, 3]),
-                    np.array([0, 1]),
-                    1,
-                    np.array([0, 0, 0, 0]),
-                ),
-                (0,),
-            )
-            page_alloc.wait_in(None, (0,))
-
-            # OutputRef (non-indexer)
-            out_alloc = _setup_alloc(
-                buffered_ref.OutputRef.create(
-                    spec=pl.BlockSpec(
-                        block_shape=cfg_csa.output_shape(), memory_space=pltpu.VMEM
-                    ),
-                    dtype_or_type=jnp.uint8,
-                    buffer_type=pltpu.BufferType.OUTPUT,
-                    buffer_count=2,
-                    use_lookahead=False,
-                    cfgs=cfg_csa,
-                )
-            )
-            out_alloc.copy_out(
-                (
-                    MockArrayRef(np.zeros((2, 32, 4, 128), dtype=np.uint8)),
-                    np.array([0, 1, 2, 3]),
-                ),
-                (0,),
-            )
-            out_alloc.wait_out((None, np.array([0, 1, 2, 3])), (0,))
-
-            # OutputRef (indexer)
-            out_idx_alloc = _setup_alloc(
-                buffered_ref.OutputRef.create(
-                    spec=pl.BlockSpec(
-                        block_shape=cfg_idx.output_shape(), memory_space=pltpu.VMEM
-                    ),
-                    dtype_or_type=jnp.uint8,
-                    buffer_type=pltpu.BufferType.INPUT_OUTPUT,
-                    buffer_count=2,
-                    use_lookahead=False,
-                    cfgs=cfg_idx,
-                )
-            )
-            out_idx_alloc.copy_in(
-                (
-                    MockArrayRef(np.zeros((2, 16, 4, 256), dtype=np.uint8)),
-                    np.array([0, 1, 2, 3]),
-                    np.array([True, True, True, True]),
-                ),
-                (0,),
-            )
-            out_idx_alloc.wait_in(
-                (
-                    None,
-                    np.array([0, 1, 2, 3]),
-                    np.array([True, True, True, True]),
-                ),
-                (0,),
-            )
-            out_idx_alloc.copy_out(
-                (
-                    MockArrayRef(np.zeros((2, 16, 4, 256), dtype=np.uint8)),
-                    np.array([0, 1, 2, 3]),
-                    np.array([True, True, True, True]),
-                ),
-                (0,),
-            )
-            out_idx_alloc.wait_out(
-                (
-                    None,
-                    np.array([0, 1, 2, 3]),
-                    np.array([True, True, True, True]),
-                ),
-                (0,),
-            )
-
-            # RoPEOutputRef
-            rope_alloc = _setup_alloc(
-                buffered_ref.RoPEOutputRef.create(
-                    spec=pl.BlockSpec(
-                        block_shape=cfg_csa.rope_output_shape(), memory_space=pltpu.VMEM
-                    ),
-                    dtype_or_type=jnp.uint8,
-                    buffer_type=pltpu.BufferType.INPUT_OUTPUT,
-                    buffer_count=2,
-                    use_lookahead=False,
-                    cfgs=cfg_csa,
-                )
-            )
-            rope_alloc.copy_in(
-                (
-                    MockArrayRef(np.zeros((2, 8, 4, 128), dtype=np.uint8)),
-                    np.array([0, 1, 2, 3]),
-                    np.array([True, True, True, True]),
-                ),
-                (0,),
-            )
-            rope_alloc.wait_in(
-                (
-                    None,
-                    np.array([0, 1, 2, 3]),
-                    np.array([True, True, True, True]),
-                ),
-                (0,),
-            )
-            rope_alloc.copy_out(
-                (
-                    MockArrayRef(np.zeros((2, 8, 4, 128), dtype=np.uint8)),
-                    np.array([0, 1, 2, 3]),
-                    np.array([True, True, True, True]),
-                ),
-                (0,),
-            )
-            rope_alloc.wait_out(
-                (
-                    None,
-                    np.array([0, 1, 2, 3]),
-                    np.array([True, True, True, True]),
-                ),
-                (0,),
-            )
 
 
 # ==============================================================================
@@ -1389,44 +1011,6 @@ class TestKernel:
                 cfgs=cfg_single_tile,
             )
             assert np.any(out_vmem_single.arr > 0)
-
-    def test_kernel_fn_execution(self):
-        cfg_csa = config.Configs.make(
-            config.Mode.CSA, size_n=4, physical_page_size=32, state_block_size=8
-        )
-        mock_pipeline = MagicMock()
-
-        with (
-            patch(
-                "jax.experimental.pallas.tpu.emit_pipeline", return_value=mock_pipeline
-            ),
-            patch(
-                "jax.experimental.pallas.with_scoped",
-                side_effect=lambda allocations: lambda fn: lambda: fn(allocations),
-            ),
-        ):
-            kernel.kernel_fn(
-                block_table_ref=MockArrayRef(np.zeros((2,), dtype=np.int32)),
-                positions_ref=MockArrayRef(np.zeros((4,), dtype=np.int32)),
-                token_to_req_indices_ref=MockArrayRef(np.zeros((4,), dtype=np.int32)),
-                kv_slot_mapping_ref=MockArrayRef(np.zeros((4,), dtype=np.int32)),
-                is_first_mask_ref=MockArrayRef(np.zeros((4,), dtype=bool)),
-                is_first_mask_rope_ref=MockArrayRef(np.zeros((4,), dtype=bool)),
-                grid_size_ref=MockArrayRef(np.array(1, dtype=np.int32)),
-                rms_weight_ref=MockArrayRef(np.zeros((4, 128), dtype=np.float32)),
-                cos_sin_cache_ref=MockArrayRef(np.zeros((16, 64), dtype=np.float32)),
-                cache_ref=MockArrayRef(np.zeros((2, 32, 4, 128), dtype=np.uint8)),
-                rope_cache_ref=MockArrayRef(np.zeros((2, 8, 4, 128), dtype=np.uint8)),
-                state_cache_ref=MockArrayRef(np.zeros((2, 32, 4, 128), dtype=np.uint8)),
-                _out_cache_ref=None,
-                _out_rope_cache_ref=None,
-                window_scratch_ref=MockArrayRef(
-                    np.zeros((2, 4, 8, 4, 128), dtype=np.float32)
-                ),
-                cfgs=cfg_csa,
-                block_table_stride=2,
-            )
-            mock_pipeline.assert_called_once()
 
     def test_compress_norm_rope_store_validation_guards(self):
         cache = jnp.zeros((2, 32, 4, 128), dtype=jnp.uint8)

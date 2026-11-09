@@ -1,3 +1,16 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """
 End-to-end tests for vLLM LLM generation API with MoE models on TPU.
 
@@ -49,9 +62,12 @@ def _run_moe_generation(async_scheduling: bool, enable_expert_parallel: bool = F
             "chips; running here would silently reduce TP coverage"
         )
 
+    # Four ~6-token prompts and 4 output tokens: 8 sequences is the only
+    # request bucket a step uses; the default compiles them up to 64.
     llm = LLM(
         model=MOE_MODEL_NAME,
         max_num_batched_tokens=64,
+        max_num_seqs=8,
         max_model_len=64,
         tensor_parallel_size=tp_size,
         enable_expert_parallel=enable_expert_parallel,

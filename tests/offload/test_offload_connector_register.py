@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Unit test for TPURaidenOffloadingConnector.register_kv_caches.
 
 The override canonicalizes the TPU unified KV pool itself instead of
@@ -20,12 +32,17 @@ from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingConnector
 NUM_BLOCKS = 4
 
 
-def _fake_connector(num_groups: int):
+def _fake_connector(num_groups: int, offloaded_group_ids=None):
     """Connector stand-in with just the attributes the override touches."""
     captured: list = []
+    if offloaded_group_ids is None:
+        offloaded_group_ids = tuple(range(num_groups))
     worker = SimpleNamespace(
         kv_cache_config=SimpleNamespace(
-            num_blocks=NUM_BLOCKS, kv_cache_groups=[object() for _ in range(num_groups)]
+            num_blocks=NUM_BLOCKS,
+            kv_cache_groups=[object() for _ in range(num_groups)],
+            hisparse_host_num_blocks=None,
+            prefix_cacheable_group_ids=offloaded_group_ids,
         ),
         _init_worker=captured.append,
     )
@@ -71,6 +88,16 @@ def test_register_kv_caches_canonicalizes_unified_pool():
     assert len(canonical.group_data_refs) == 2
     for refs in canonical.group_data_refs:
         assert [(r.tensor_idx, r.page_size_bytes) for r in refs] == [(0, 128), (1, 128)]
+
+
+def test_register_kv_caches_builds_refs_for_offloaded_groups_only():
+    # vLLM pairs the refs with the offloaded groups only; a group that is not
+    # prefix-cacheable (the DSv4 HCA compressor state) gets no ref list.
+    pool = torch.zeros(8, 16, dtype=torch.float32)
+    fake, captured = _fake_connector(num_groups=3, offloaded_group_ids=(0, 2))
+    TPURaidenOffloadingConnector.register_kv_caches(fake, {"attn": pool})
+
+    assert len(captured[0].group_data_refs) == 2
 
 
 def test_register_kv_caches_ds_v4_alias_groups():

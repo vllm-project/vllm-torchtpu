@@ -1,3 +1,16 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import functools
 
 import jax
@@ -223,7 +236,7 @@ def _row_kernel(
     # reduced value -- the last row of the group within this block. Scanning
     # backwards, a row inherits its successor's merge target when they share
     # a destination, otherwise it is its own target.
-    rev_src_row_idx_in_vmem = []
+    rev_src_row_idx_in_vmem: list[int | jax.Array] = []
     rev_is_row_valid = []
     for row_vmem_idx in reversed(range(cfg.row_chunk_size)):
         if row_vmem_idx == cfg.row_chunk_size - 1:

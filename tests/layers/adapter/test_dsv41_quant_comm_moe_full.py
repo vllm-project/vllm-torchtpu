@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """100% full-module line and branch coverage test suite for .
 
 Covers all lines and branches in:
@@ -178,7 +190,7 @@ class TestDeepseekV41Quant:
 
         super_forward_calls: list[tuple[torch.Tensor, torch.Tensor | None]] = []
 
-        def mock_super_forward(self, hidden, input_ids=None):
+        def mock_super_forward(self, hidden, input_ids=None, mega_gate_metadata=None):
             super_forward_calls.append((hidden, input_ids))
             return hidden * 2
 
@@ -251,15 +263,19 @@ class TestTpuCommunicator:
         tc_false = comm.TpuDeviceCommunicator()
         assert not hasattr(tc_false, "all2all_manager")
 
-    def test_token_group(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Test _token_group for is_sequence_parallel True and False."""
+    def test_moe_group(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Test _moe_group for is_sequence_parallel True and False, and the
+        single-rank group that skips the collective."""
         fake_ep = _FakeDistGroup(4)
         fake_dp = _FakeDistGroup(2)
         monkeypatch.setattr(comm, "get_ep_group", lambda: fake_ep)
         monkeypatch.setattr(comm, "get_dp_group", lambda: fake_dp)
+        tc = comm.TpuDeviceCommunicator.__new__(comm.TpuDeviceCommunicator)
 
-        assert comm.TpuDeviceCommunicator._token_group(True) is fake_ep
-        assert comm.TpuDeviceCommunicator._token_group(False) is fake_dp
+        assert tc._moe_group(True) is fake_ep
+        assert tc._moe_group(False) is fake_dp
+        fake_dp.world_size = 1
+        assert tc._moe_group(False) is None
 
     def test_dispatch_router_logits(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Test dispatch_router_logits with extra_tensors, world_size 1, same/distinct
@@ -429,7 +445,8 @@ class TestMoeRunner:
         runner.routed_experts._ensure_moe_quant_config_init()
         upstream_init.assert_called_once()
 
-        # Full __init__ call
+        # Full __init__ call; the mocked base __init__ sets no router.
+        runner.router = None
         runner.__init__("arg1", kw=2)
         super_init.assert_called_once_with("arg1", kw=2)
 

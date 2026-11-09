@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Pool-tag vocabulary shared with the Raiden controller.
 
 These strings are wire-visible: they name pools in manifests and byte-span
@@ -6,6 +18,8 @@ registrations on both sides of a disagg pair, and the live-pair acceptance
 gate builds its expected tag list from them. The values are frozen; changing
 one is a coupled two-repo protocol change, not a refactor.
 """
+
+from collections.abc import Callable
 
 TAG_FA = "fa"
 TAG_GDN_CONV = "gdn.conv"
@@ -60,3 +74,18 @@ def split_layer_tag(tag: str) -> tuple[str, int | None]:
 def class_tag(tag: str) -> str:
     """The tag with any per-layer suffix removed."""
     return split_layer_tag(tag)[0]
+
+
+def libtpu_key(package_version: Callable[[str], str] | None) -> str:
+    """libtpu identity for a layout fingerprint.
+
+    An injected ``package_version`` (tests) is used as given; otherwise the
+    build actually loaded, which may come from ``TPU_LIBRARY_PATH`` rather than
+    the pip package (see ``tpu_info.get_libtpu_cache_key``).
+    """
+    if package_version is not None:
+        return package_version("libtpu")
+    # Deferred so that importing this module does not import tpu_info.
+    from vllm_torchtpu.tpu_info import get_libtpu_cache_key
+
+    return get_libtpu_cache_key()

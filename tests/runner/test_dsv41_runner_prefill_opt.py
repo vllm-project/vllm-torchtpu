@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """100% Diff coverage test suite for runner prefill & async output optimizations.
 
 # Covers all lines and branches in:
@@ -25,7 +37,7 @@ from vllm_torchtpu.layers.core.attention_metadata import (
 from vllm_torchtpu.layers.core.sequence_layout import (
     DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR,
 )
-from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+from vllm_torchtpu.runner.tpu_runner import ExecuteModelState, TPUModelRunner
 from vllm_torchtpu.runner.tpu_runner_async_output import (
     AsyncTPUCopyState,
     AsyncTPUModelRunnerOutput,
@@ -79,8 +91,10 @@ def _make_dummy_builder(
     runner.max_num_reqs = max_num_reqs
     runner.most_model_len = 1024
     runner.position_ids = torch.full((8,), 42, dtype=torch.int32)
-    runner._block_table_stage_cpu = None
     runner._unified_kv_layout = False
+    runner._unfenced_h2d_sources = []
+    runner._free_h2d_sources = {}
+    runner._registered_h2d_sources = set()
 
     bt = MagicMock()
     bt.max_num_blocks_per_req = max_num_blocks_per_req
@@ -238,21 +252,24 @@ def test_builder_build_variants():
 
 
 def test_stage_block_table_uploads_allocation_and_override():
-    """Verify stage_block_table_uploads scratch buffer reuse and override path."""
+    """stage_block_table_uploads gives each walk its own host buffer.
+
+    TorchTPU reads the CPU source until the async H2D drains, so a later walk
+    must not refill a buffer whose upload may still be in flight (see
+    `stage_h2d_upload`). Dummy walks stage the same layout zero-filled.
+    """
     builder, runner = _make_dummy_builder(max_num_reqs=4, max_num_blocks_per_req=32)
 
-    # position_ids_override is not None: scratch kept zeroed
     ctx_dummy = _make_ctx(
         position_ids_override=torch.ones(4, dtype=torch.int32),
         num_reqs=2,
     )
-    runner._block_table_stage_cpu = None
     stage_block_table_uploads(runner, ctx_dummy, 4)
-    assert runner._block_table_stage_cpu is not None
-    assert runner._block_table_stage_cpu.shape[0] == 4 * 32
+    assert len(runner._unfenced_h2d_sources) == 1
+    dummy_host, _ = runner._unfenced_h2d_sources[0]
+    assert dummy_host.shape[0] == 4 * 32
+    assert not dummy_host.any()
 
-    # Normal upload path reusing existing scratch
-    scratch_ref = runner._block_table_stage_cpu
     ctx_normal = _make_ctx(
         position_ids_override=None,
         seq_lens_cpu=(32, 16),
@@ -260,7 +277,11 @@ def test_stage_block_table_uploads_allocation_and_override():
         start_index=0,
     )
     stage_block_table_uploads(runner, ctx_normal, 4)
-    assert runner._block_table_stage_cpu is scratch_ref
+    assert len(runner._unfenced_h2d_sources) == 2
+    normal_host, _ = runner._unfenced_h2d_sources[1]
+    # Still unfenced, so the first walk's buffer is not recycled.
+    assert normal_host is not dummy_host
+    assert normal_host.shape[0] == 4 * 32
 
 
 # ==============================================================================
@@ -504,6 +525,9 @@ def test_prepare_inputs_single_req_fast_path_matches_general_path():
             scheduler_config=SimpleNamespace(async_scheduling=False),
             speculative_config=None,
             _pre_async_results=None,
+            _prefill_ckpt_units=None,
+            _prefill_ckpt_offsets_cpu=None,
+            _h2d_reuse={},
             _decode_device_cache_key=None,
             _request_distribution_cpu=torch.zeros(3, dtype=torch.int32),
             _has_mamba_state=False,
@@ -521,6 +545,8 @@ def test_prepare_inputs_single_req_fast_path_matches_general_path():
             num_tokens_paddings=[16, 64, 128],
             pcp_size=1,
             dcp_size=1,
+            # CPU-only test: the upload is the host tensor itself.
+            _upload_unless_unchanged=lambda _slot, host: host,
         )
 
     # 1) Single-request fast path: num_reqs == 1 (lines 2788-2805)
@@ -582,6 +608,7 @@ def test_sample_tokens_logprobs_and_chunks():
 
         runner = SimpleNamespace(
             is_pooling_model=False,
+            _pp_wave=None,
             scheduler_config=SimpleNamespace(async_scheduling=True),
             speculative_config=None,
             _is_async_drafter=False,
@@ -603,16 +630,24 @@ def test_sample_tokens_logprobs_and_chunks():
             _modify_prev_results=MagicMock(),
             _update_placeholder=MagicMock(return_value={"req-0": 0}),
             maybe_wait_for_kv_save=MagicMock(),
+            _build_kv_connector_output=lambda _so: None,
             get_finished_kv_transfers=MagicMock(
                 return_value=(None, None, None, [], 0, None)
             ),
             _sync_replicated_drafts_across_tp=lambda x: x,
             max_num_reqs=1,
+            _adaptive_verification=None,
+            _is_dspark_pd_producer=False,
+            _fence_spec_kv_under_token_copy=False,
+            _dp_step_other_decode=False,
+            _mtp_prefill_only=False,
+            _pp_is_last=True,
+            _min_tokens_batch_state=lambda: {},
         )
 
         logits = torch.zeros((1, 10))
         if num_chunks == 1:
-            state = SimpleNamespace(
+            state = ExecuteModelState(
                 logits_list=[logits],
                 num_reqs_list=[1],
                 spec_decode_metadata_list=[None],
@@ -621,7 +656,7 @@ def test_sample_tokens_logprobs_and_chunks():
                 scheduler_output=scheduler_output,
             )
         else:
-            state = SimpleNamespace(
+            state = ExecuteModelState(
                 logits_list=[logits, logits],
                 num_reqs_list=[1, 1],
                 spec_decode_metadata_list=[None, None],

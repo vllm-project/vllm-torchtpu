@@ -1,3 +1,16 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """
 End-to-end tests for vLLM LLM generation API on TPU.
 
@@ -24,6 +37,8 @@ from vllm import LLM, SamplingParams
 from vllm.distributed import cleanup_dist_env_and_memory
 from vllm.exceptions import VLLMValidationError
 
+pytestmark = pytest.mark.tpu_test
+
 MODEL_NAME = "Qwen/Qwen3-0.6B"
 
 PROMPTS = [
@@ -46,9 +61,12 @@ GREEDY_SAMPLING_PARAMS = SamplingParams(temperature=0.0, max_tokens=4)
 def llm():
     # pytest caches the fixture so we use weakref.proxy to
     # enable garbage collection
+    # Every call sends at most 4 prompts, so 8 sequences is the only request
+    # bucket a step uses; the default compiles them up to 64.
     llm = LLM(
         model=MODEL_NAME,
         max_num_batched_tokens=64,
+        max_num_seqs=8,
         max_model_len=64,
         tensor_parallel_size=1,
         # TODO: Reduce GPU memory utilization after KV cache optimization.
@@ -161,3 +179,10 @@ def test_logprobs(llm: LLM):
 def test_log_stats(llm: LLM):
     outputs = llm.generate(PROMPTS, sampling_params=GREEDY_SAMPLING_PARAMS)
     assert all(output.metrics is not None for output in outputs)
+
+
+def test_reset_encoder_cache(llm: LLM):
+    baseline = llm.generate(PROMPTS[:1], sampling_params=GREEDY_SAMPLING_PARAMS)
+    llm.llm_engine.reset_encoder_cache()
+    outputs = llm.generate(PROMPTS[:1], sampling_params=GREEDY_SAMPLING_PARAMS)
+    assert outputs[0].outputs[0].token_ids == baseline[0].outputs[0].token_ids

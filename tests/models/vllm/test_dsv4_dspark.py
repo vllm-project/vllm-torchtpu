@@ -48,7 +48,6 @@ def test_dspark_draft_model_registration():
 # draft loader skips. Name shapes follow the DeepSeek-V4-Flash-DSpark
 # inventory: three full-layer stages under mtp.{0,1,2}, the combiner on
 # stage 0, the head stack and confidence head on the last stage.
-@pytest.mark.cpu_test
 @pytest.mark.parametrize(
     "expert_dtype,name,expected",
     [
@@ -89,6 +88,15 @@ def test_checkpoint_name_rewrite(expert_dtype, name, expected):
     assert _rewrite_dspark_name(name, mapper) == expected
 
 
+def test_adaptive_verification_keeps_the_confidence_head():
+    mapper = _make_deepseek_v4_weights_mapper("fp4")
+    name = "mtp.2.confidence_head.proj.weight"
+    assert (
+        _rewrite_dspark_name(name, mapper, keep_confidence_head=True)
+        == "confidence_head.proj.weight"
+    )
+
+
 class _StubDecoderLayer(nn.Module):
     """Stands in for DeepseekV4DecoderLayer at construction time."""
 
@@ -105,7 +113,7 @@ class _StubDecoderLayer(nn.Module):
         )
 
 
-def _tiny_vllm_config():
+def _tiny_vllm_config(adaptive_verification=False):
     hf_config = SimpleNamespace(
         hidden_size=HIDDEN,
         hc_mult=HC,
@@ -124,34 +132,10 @@ def _tiny_vllm_config():
     vllm_config = VllmConfig()
     vllm_config.speculative_config = SimpleNamespace(
         num_speculative_tokens=5,
+        enable_adaptive_verification=adaptive_verification,
         draft_model_config=SimpleNamespace(hf_config=hf_config),
     )
     return vllm_config
-
-
-@pytest.fixture(scope="module")
-def dist_ctx():
-    import torch.distributed as dist
-    from vllm.distributed import (
-        ensure_model_parallel_initialized,
-        init_distributed_environment,
-    )
-
-    if not dist.is_initialized():
-        import portpicker
-
-        port = portpicker.pick_unused_port()
-        init_distributed_environment(
-            world_size=1,
-            rank=0,
-            local_rank=0,
-            distributed_init_method=f"tcp://127.0.0.1:{port}",
-            backend="gloo",
-        )
-    # GroupCoordinator construction consults the current vLLM config.
-    with set_current_vllm_config(VllmConfig()):
-        ensure_model_parallel_initialized(1, 1)
-    yield
 
 
 def _use_cpu_platform(monkeypatch, request):
@@ -162,19 +146,22 @@ def _use_cpu_platform(monkeypatch, request):
     request.getfixturevalue("dist_ctx")
 
 
-@pytest.fixture()
-def tiny_fc(monkeypatch, request):
-    """A real DSparkDeepseekV4ForCausalLM at toy scale, layers stubbed."""
+def _build_tiny_fc(monkeypatch, request, adaptive_verification=False):
     _use_cpu_platform(monkeypatch, request)
     monkeypatch.setattr(dspark_mod, "DeepseekV4DecoderLayer", _StubDecoderLayer)
-    vllm_config = _tiny_vllm_config()
+    vllm_config = _tiny_vllm_config(adaptive_verification)
     with set_current_vllm_config(vllm_config):
         return dspark_mod.DSparkDeepseekV4ForCausalLM(
             vllm_config=vllm_config, prefix=""
         )
 
 
-@pytest.mark.cpu_test
+@pytest.fixture()
+def tiny_fc(monkeypatch, request):
+    """A real DSparkDeepseekV4ForCausalLM at toy scale, layers stubbed."""
+    return _build_tiny_fc(monkeypatch, request)
+
+
 def test_construction_wiring(tiny_fc):
     model = tiny_fc.model
     # vLLM prefixes continue the target's numbering so the KV-cache layer
@@ -195,7 +182,6 @@ def test_construction_wiring(tiny_fc):
     assert model.main_proj.weight.shape == (HIDDEN, HIDDEN * len(TARGET_LAYER_IDS))
 
 
-@pytest.mark.cpu_test
 def test_block_must_fit_the_sliding_window(monkeypatch, request):
     """The non-causal block mode only reaches keys inside the window's
     key-block walk, so construction rejects a block that cannot fit."""
@@ -210,7 +196,6 @@ def test_block_must_fit_the_sliding_window(monkeypatch, request):
         dspark_mod.DSparkDeepseekV4ForCausalLM(vllm_config=vllm_config, prefix="")
 
 
-@pytest.mark.cpu_test
 def test_weight_load_round_trip(tiny_fc):
     """mtp.* names -> rewrite -> params, reported under the wrapper's prefix."""
     model = tiny_fc.model
@@ -251,3 +236,25 @@ def test_weight_load_round_trip(tiny_fc):
         model.markov_head.markov_w2.weight[:VOCAB],
         ckpt["mtp.2.markov_head.markov_w2.weight"],
     )
+
+
+def test_confidence_head_is_built_only_for_adaptive_verification(tiny_fc):
+    assert tiny_fc.model.confidence_head is None
+
+
+@pytest.mark.parametrize("in_checkpoint", [True, False])
+def test_confidence_head_loads_from_the_checkpoint(monkeypatch, request, in_checkpoint):
+    fc = _build_tiny_fc(monkeypatch, request, adaptive_verification=True)
+    assert fc.model.confidence_head is not None
+    weight = torch.randn(1, HIDDEN + RANK)
+    ckpt = {"mtp.2.norm.weight": torch.randn_like(fc.model.norm.weight)}
+    if in_checkpoint:
+        ckpt["mtp.2.confidence_head.proj.weight"] = weight
+    loaded = fc.load_weights(iter(ckpt.items()))
+    if in_checkpoint:
+        assert "model.confidence_head.proj.weight" in loaded
+        torch.testing.assert_close(fc.model.confidence_head.proj.weight, weight)
+    else:
+        # An unloaded head would score drafts at random: drop it, so the
+        # proposer verifies every draft.
+        assert fc.model.confidence_head is None

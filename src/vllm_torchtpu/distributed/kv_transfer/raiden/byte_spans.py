@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Native byte-span declarations for Stage-3 resharding.
 
 The producer lowers the PCP kernel's token ownership directly to the byte
@@ -163,22 +175,26 @@ def lower_gdn_state_shard_spans(
 ) -> PoolSpanRegistration:
     """Lower one rank's GDN head shard into a full destination state.
 
-    Under the QK pair-blocked conv layout the rank-local conv row is
-    ``[QK | V]`` where the QK block shares whole pool tokens (Q and K
-    row-pairs interleaved) and V is whole-token aligned.  The full-width
-    destination stores the rank QK blocks in rank order followed by the
-    rank V blocks in rank order, which is exactly the stored order the
-    pooled kernel's ``rows_perm`` maps back to logical ``[Q | K | V]``.
-    Each rank therefore contributes two contiguous spans per tap; every
-    span offset and size is a whole multiple of the physical pool token,
-    so the raw (physical-byte) transport moves them placement-exactly.
+    The rank-local conv row is segment-major, ``[Q_r | K_r | V_r]``.  Rank
+    r's Q lands at ``Q_base + r * size`` in the full-width destination row,
+    and likewise its K and V, so the destination holds the logical
+    ``[Q | K | V]`` the pooled kernel reads, with no permutation after the
+    transfer.  Each rank contributes one span per segment per tap; every
+    span offset and size must be a whole multiple of the physical pool
+    token so the raw (physical-byte) transport moves them
+    placement-exactly.  With the unified pool's fp32 conv state this holds
+    up to an 8-way head split (Qwen3.5: 2 key heads x 128 x 4 B = 1024 B).
+
+    The QK pair-blocked vocabulary (``gdn_conv_qk``/``gdn_conv_v``) is still
+    lowered, but the pool manifest no longer emits it: with fan-in > 1 it
+    leaves the QK block rank-grouped, which the pooled kernel cannot read.
 
     SSM state is head-major and whole-token aligned: one contiguous span
     at a rank-dependent destination offset.
 
-    ``regions`` comes from the admitted source pool manifest.  The legacy
-    ``gdn_conv_q``/``gdn_conv_k`` vocabulary is rejected: its half-token
-    Q/K extents are not placement-exact under the raw tiled layout.
+    ``regions`` comes from the admitted source pool manifest.  Sub-token
+    segments (for example bf16 conv at an 8-way split) fail closed in the
+    whole-token guard below.
 
     ``physical_granule_bytes`` describes the common source/destination
     carrier layout. It must be derived from that layout, not from conv or
@@ -256,9 +272,10 @@ def lower_gdn_state_shard_spans(
 
     names = set(normalized)
     if names == {"gdn_conv_qk", "gdn_conv_v"}:
-        # QK pair-blocked layout (source transfer degree >= 8): the rank's
-        # QK block shares whole pool tokens, so one QK span and one V span
-        # per tap are placement-exact.
+        # QK pair-blocked layout: the rank's QK block shares whole pool
+        # tokens, so one QK span and one V span per tap are placement-exact.
+        # The pool manifest rejects it for the unified pool; kept for
+        # manifests built elsewhere.
         qk = normalized["gdn_conv_qk"]
         v = normalized["gdn_conv_v"]
         taps = qk[3]
@@ -266,11 +283,10 @@ def lower_gdn_state_shard_spans(
             raise ValueError("GDN conv qk/v regions disagree on tap count")
         segments = (("qk", qk, qk[2] * qk[4]), ("v", v, v[2] * v[4]))
     elif names == {"gdn_conv_q", "gdn_conv_k", "gdn_conv_v"}:
-        # Segment-major layout (source transfer degree < 8): each per-rank
-        # segment is a whole-token multiple on its own, so the classic one
-        # span per segment per tap is placement-exact.  At degree >= 8 the
-        # Q/K segments are sub-token and the alignment guard below fails
-        # this path closed.
+        # Segment-major layout: each per-rank segment is a whole-token
+        # multiple on its own, so one span per segment per tap is
+        # placement-exact.  Sub-token Q/K segments fail closed in the
+        # alignment guard below.
         q = normalized["gdn_conv_q"]
         k = normalized["gdn_conv_k"]
         v = normalized["gdn_conv_v"]
@@ -308,7 +324,7 @@ def lower_gdn_state_shard_spans(
         if value % physical_granule_bytes:
             raise ValueError(
                 "raw TPU GDN conv extents must be whole physical tokens "
-                "(sub-token Q/K segments need the QK pair-blocked layout): "
+                "(sub-token Q/K segments are not supported by the unified pool): "
                 f"{name}={value}"
             )
 
@@ -483,6 +499,164 @@ def lower_glm_row_spans(
     )
 
 
+def glm_dcp_chunk_bytes(
+    *,
+    page_tokens: int,
+    live_bytes_per_block: int,
+    row_bytes: int,
+    interleave_tokens: int,
+) -> int:
+    """Bytes of one ``interleave_tokens`` chunk of a packed-row GLM page.
+
+    A chunk must be whole packed rows and must not straddle a page, the same
+    constraints the DCP cache writers put on the interleave.
+    """
+    if page_tokens <= 0:
+        raise ValueError("page_tokens must be positive")
+    if row_bytes <= 0 or live_bytes_per_block <= 0:
+        raise ValueError("row_bytes and live_bytes_per_block must be positive")
+    if live_bytes_per_block % row_bytes:
+        raise ValueError(
+            "page live bytes must be whole rows: "
+            f"live={live_bytes_per_block}, row_bytes={row_bytes}"
+        )
+    rows_per_page = live_bytes_per_block // row_bytes
+    if page_tokens % rows_per_page:
+        raise ValueError(
+            "page tokens must spread evenly over the page's rows: "
+            f"page_tokens={page_tokens}, rows_per_page={rows_per_page}"
+        )
+    tokens_per_row = page_tokens // rows_per_page
+    if interleave_tokens <= 0 or page_tokens % interleave_tokens:
+        raise ValueError(
+            "the DCP interleave must divide the page: "
+            f"interleave_tokens={interleave_tokens}, page_tokens={page_tokens}"
+        )
+    if interleave_tokens % tokens_per_row:
+        raise ValueError(
+            "the DCP interleave must be whole packed rows: "
+            f"interleave_tokens={interleave_tokens}, "
+            f"tokens_per_row={tokens_per_row}"
+        )
+    return interleave_tokens // tokens_per_row * row_bytes
+
+
+def lower_glm_dcp_row_spans(
+    *,
+    tag: str,
+    num_tokens: int,
+    page_tokens: int,
+    live_bytes_per_block: int,
+    row_bytes: int,
+    block_ids: Sequence[int],
+    dst_dcp_size: int,
+    interleave_tokens: int,
+) -> PoolSpanRegistration:
+    """Lower a GLM cache holding every token to a DCP-sharded destination."""
+    if not tag:
+        raise ValueError("pool tag must not be empty")
+    if num_tokens <= 0:
+        raise ValueError("num_tokens must be positive")
+    if dst_dcp_size <= 0:
+        raise ValueError("dst_dcp_size must be positive")
+    chunk_bytes = glm_dcp_chunk_bytes(
+        page_tokens=page_tokens,
+        live_bytes_per_block=live_bytes_per_block,
+        row_bytes=row_bytes,
+        interleave_tokens=interleave_tokens,
+    )
+    num_pages = (num_tokens + page_tokens - 1) // page_tokens
+    if len(block_ids) != num_pages:
+        raise ValueError(
+            "block_ids must cover the complete request page set: "
+            f"got {len(block_ids)}, expected {num_pages} for "
+            f"{num_tokens} tokens at {page_tokens} per page"
+        )
+    chunks_per_page = page_tokens // interleave_tokens
+    last_chunk = (num_tokens - 1) // interleave_tokens
+    chunks_per_rank = last_chunk // dst_dcp_size + 1
+    spans = []
+    for chunk in range(chunks_per_rank * dst_dcp_size):
+        src_page, src_chunk = divmod(min(chunk, last_chunk), chunks_per_page)
+        spans.append(
+            PoolByteSpan(
+                src_block_ordinal=src_page,
+                src_offset_bytes=src_chunk * chunk_bytes,
+                dst_block_index=0,
+                dst_offset_bytes=chunk // dst_dcp_size * chunk_bytes,
+                size_bytes=chunk_bytes,
+                dst_unit_ordinal=chunk % dst_dcp_size if dst_dcp_size > 1 else None,
+            )
+        )
+    return PoolSpanRegistration(
+        tag=tag,
+        block_ids=tuple(int(block_id) for block_id in block_ids),
+        spans=tuple(spans),
+        declared_bytes=len(spans) * chunk_bytes,
+        dst_space_version=1,
+    )
+
+
+def lower_glm_dcp_identity_spans(
+    *,
+    tag: str,
+    num_tokens: int,
+    page_tokens: int,
+    dcp_size: int,
+    dcp_rank: int,
+    live_bytes_per_block: int,
+    block_ids: Sequence[int],
+) -> PoolSpanRegistration:
+    """Lower one DCP rank's GLM cache to the same DCP rank of the destination.
+
+    Producer and destination run the same DCP size, interleave and page size,
+    so rank k holds the same tokens of every scheduler block on both sides and
+    each page ships whole to the same page slot. Unlike lower_glm_row_spans,
+    which trims the tail, the last page ships whole too: its slots past the
+    rank's local token count (the whole page on a rank that owns no token of
+    the tail block) carry stale bytes from the page's previous occupant. That
+    is safe because the consumer reads no slot past its local token count and
+    decode overwrites those slots as it appends.
+    """
+    if not tag:
+        raise ValueError("pool tag must not be empty")
+    if num_tokens <= 0:
+        raise ValueError("num_tokens must be positive")
+    if page_tokens <= 0 or live_bytes_per_block <= 0:
+        raise ValueError("page_tokens and live_bytes_per_block must be positive")
+    if dcp_size <= 1 or not 0 <= dcp_rank < dcp_size:
+        raise ValueError(
+            "dcp_rank must be in [0, dcp_size) with dcp_size > 1, got "
+            f"dcp_rank={dcp_rank}, dcp_size={dcp_size}"
+        )
+    scheduler_block_tokens = page_tokens * dcp_size
+    num_pages = (num_tokens + scheduler_block_tokens - 1) // scheduler_block_tokens
+    if len(block_ids) != num_pages:
+        raise ValueError(
+            "block_ids must cover the complete request scheduler block set: "
+            f"got {len(block_ids)}, expected {num_pages} for {num_tokens} "
+            f"tokens at {page_tokens} per page and DCP {dcp_size}"
+        )
+    spans = tuple(
+        PoolByteSpan(
+            src_block_ordinal=page,
+            src_offset_bytes=0,
+            dst_block_index=0,
+            dst_offset_bytes=page * live_bytes_per_block,
+            size_bytes=live_bytes_per_block,
+            dst_unit_ordinal=dcp_rank,
+        )
+        for page in range(num_pages)
+    )
+    return PoolSpanRegistration(
+        tag=tag,
+        block_ids=tuple(int(block_id) for block_id in block_ids),
+        spans=spans,
+        declared_bytes=num_pages * live_bytes_per_block,
+        dst_space_version=1,
+    )
+
+
 def lower_dsv4_row_spans(
     *,
     tag: str,
@@ -524,7 +698,14 @@ def lower_dsv4_row_spans(
             f"{num_tokens} tokens at {page_tokens} per page"
         )
     tail_tokens = num_tokens - (num_pages - 1) * page_tokens
-    tail_rows = -(-tail_tokens * rows_per_page // page_tokens)
+    # The SAL indexer cache puts tokens along the lane axis and spreads each
+    # token's head-dim + scale across all 33 rows, so a partial page still
+    # needs every row.
+    tail_rows = (
+        rows_per_page
+        if tag.startswith("dsv4.idx")
+        else -(-tail_tokens * rows_per_page // page_tokens)
+    )
     tail_bytes = tail_rows * row_bytes
     spans = tuple(
         PoolByteSpan(

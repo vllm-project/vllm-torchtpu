@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """DSpark speculative decoding for TPU.
 
 DSpark is semi-autoregressive parallel drafting: one DFlash-style parallel
@@ -16,18 +28,31 @@ DFlash's 1 + K (anchor is bonus only). Speculators-format checkpoints set
 ``sample_from_anchor=False`` and keep the DFlash layout.
 
 PoC scope: greedy draft sampling only (argmax + d2t remap); probabilistic
-Gumbel-coupled sampling is not implemented.
+Gumbel-coupled sampling is not implemented. Adaptive verification scores the
+drafts with the checkpoint's confidence head (``adaptive_verification.py``).
 """
 
 from __future__ import annotations
+
+from typing import NamedTuple
 
 import torch
 from vllm.config import VllmConfig
 
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
+from vllm_torchtpu.spec_decode.utils import DraftChunkInputs
 
 logger = init_logger(__name__)
+
+
+class DraftConfidences(NamedTuple):
+    """One proposal's per-chunk ``[rows, K]`` acceptance confidences at the
+    chunk's bucketed rows, and each chunk's ``(start_index, num_reqs)`` span
+    of the input batch."""
+
+    chunks: list[torch.Tensor]
+    spans: list[tuple[int, int]]
 
 
 class DSparkProposer(DFlashProposer):
@@ -40,37 +65,43 @@ class DSparkProposer(DFlashProposer):
         super().__init__(runner, vllm_config)
         self._decode_samples = None
 
-        if not self.dflash_config.get("target_layer_ids"):
-            raise ValueError(
-                "DSpark requires target layer ids in the draft config (one of "
-                "eagle_aux_hidden_state_layer_ids, dspark_target_layer_ids, "
-                "target_layer_ids, or dflash_config.target_layer_ids)."
-            )
-
         # Same key/default as upstream DSparkSpeculator: dense checkpoints
         # omit it (-> True); the speculators converter writes it explicitly.
         self.sample_from_anchor = bool(hf_dict.get("sample_from_anchor", True))
-        block = hf_dict.get("dspark_block_size") or hf_dict.get("block_size")
         K = self.speculative_config.num_speculative_tokens
-        if block is not None and int(block) != K:
-            raise ValueError(
-                f"num_speculative_tokens={K} does not match the DSpark "
-                f"checkpoint's block size {block}; the block/Markov-head "
-                "machinery is trained for exactly that block length."
-            )
-        # vLLM 0.29 drafting options this proposer does not implement yet.
+        # vLLM 0.29 drafting options this proposer does not implement yet. They
+        # are ignored, not rejected: drafting stays greedy over a fixed block.
         spec = self.speculative_config
-        if (
-            spec.draft_sample_method != "greedy"
-            or spec.enable_adaptive_verification
-            or spec.dspark_draft_topk is not None
-        ):
-            raise ValueError(
-                "DSpark on TPU does not support draft_sample_method="
-                f"{spec.draft_sample_method!r}, enable_adaptive_verification="
-                f"{spec.enable_adaptive_verification}, dspark_draft_topk="
-                f"{spec.dspark_draft_topk}; only greedy drafting of a fixed "
-                "block is implemented."
+        if spec.draft_sample_method != "greedy" or spec.dspark_draft_topk is not None:
+            logger.warning(
+                "DSpark on TPU does not support draft_sample_method=%r, "
+                "dspark_draft_topk=%s; ignoring them and using greedy drafting "
+                "of a fixed block.",
+                spec.draft_sample_method,
+                spec.dspark_draft_topk,
+            )
+        # Whether the compiled draft step scores its drafts; it traces against
+        # this. Set by load_model once the checkpoint's heads are known.
+        self.use_confidence_head = False
+        self._draft_confidences: DraftConfidences | None = None
+        # The query block follows K, not the block length the checkpoint was
+        # trained at; upstream vLLM likewise only enforces K == block for
+        # Qwen3-Omni DSpark. The checkpoint's block is a query-block length in
+        # both layouts (K for dense, 1 + K for speculators-format), so compare
+        # it to block_size rather than K. In-block attention is non-causal, so
+        # a mismatch shifts every slot's hidden state, not just the slots past
+        # the trained length: outputs stay exact (the target verifies), but
+        # acceptance can drop at every position.
+        trained_block = hf_dict.get("dspark_block_size") or hf_dict.get("block_size")
+        if trained_block is not None and int(trained_block) != self.block_size:
+            logger.warning(
+                "DSpark: num_speculative_tokens=%d gives a %d-token query "
+                "block, but the checkpoint was trained with block size %s; "
+                "every draft slot is out of the training distribution, so "
+                "check the acceptance rate.",
+                K,
+                self.block_size,
+                trained_block,
             )
         logger.info("DSpark: sample_from_anchor=%s, K=%d.", self.sample_from_anchor, K)
 
@@ -114,6 +145,22 @@ class DSparkProposer(DFlashProposer):
                     f"DSpark draft model lacks {attr}(); expected a "
                     "Qwen3DSpark/Gemma4DSpark-family model."
                 )
+        if self.speculative_config.enable_adaptive_verification:
+            assert self.draft_model is not None
+            # Every DSpark backbone declares confidence_head, None when the
+            # checkpoint has none; upstream DSparkSpeculator reads it alike.
+            self.use_confidence_head = (
+                self.draft_model.model.confidence_head is not None
+            )
+            if not self.use_confidence_head:
+                # TODO: estimate confidences from the draft logits, as
+                # upstream's OnlineAcceptanceEstimator does without a head.
+                logger.warning(
+                    "Adaptive verification needs the DSpark checkpoint's "
+                    "confidence head, which %s does not provide; verifying "
+                    "every draft.",
+                    type(self.draft_model).__name__,
+                )
 
         # Optional model capability, initialized after target weight sharing.
         # Returning None keeps the standard DSpark sampling contract.
@@ -124,6 +171,23 @@ class DSparkProposer(DFlashProposer):
                 block_size=self.block_size,
                 sample_from_anchor=self.sample_from_anchor,
             )
+
+    def _observe_draft_aux(
+        self, aux: torch.Tensor, chunk_index: int, chunk: DraftChunkInputs
+    ) -> None:
+        if not self.use_confidence_head:
+            return
+        if chunk_index == 0:
+            self._draft_confidences = DraftConfidences([], [])
+        confidences = self._draft_confidences
+        assert confidences is not None
+        confidences.chunks.append(aux)
+        confidences.spans.append((chunk.start_index, chunk.num_reqs))
+
+    def take_draft_confidences(self) -> DraftConfidences | None:
+        """The last proposal's confidences; None once taken."""
+        confidences, self._draft_confidences = self._draft_confidences, None
+        return confidences
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def _dflash_forward_and_sample(
@@ -140,6 +204,11 @@ class DSparkProposer(DFlashProposer):
         the K mask slots (1..block_size-1) are sampled. Either way the Markov
         chain seeds from the anchor input id and runs a static K-iteration
         loop: embedding gather + rank-r bias + argmax.
+
+        With ``use_confidence_head`` the second output is each sampled slot's
+        acceptance confidence ``[padded_num_reqs, K]`` instead of the hidden
+        states. A slot's confidence reads its hidden state and the previous
+        token, never the token it drafts.
         """
         assert self.draft_model is not None
         hidden = self.draft_model.model(
@@ -165,14 +234,26 @@ class DSparkProposer(DFlashProposer):
         )
         prev = ids_3d[:, 0]
         draft_tokens = []
+        markov_embeds = []
         sample_start = 0 if self.sample_from_anchor else 1
         for i in range(sample_start, block_size):
-            bias = self.draft_model.markov_bias(self.draft_model.markov_embed(prev))
+            markov_embed = self.draft_model.markov_embed(prev)
+            bias = self.draft_model.markov_bias(markov_embed)
             step = self.draft_model.map_draft_to_target(
                 (logits_3d[:, i] + bias).argmax(dim=-1)
             )
             draft_tokens.append(step)
+            markov_embeds.append(markov_embed)
             prev = step
         draft_tokens_chunk = torch.stack(draft_tokens, dim=1)
 
-        return draft_tokens_chunk, hidden
+        if not self.use_confidence_head:
+            return draft_tokens_chunk, hidden
+        sampled_hidden = valid_hidden.view(padded_num_reqs, block_size, -1)[
+            :, sample_start:
+        ]
+        confidence = self.draft_model.compute_confidence(
+            sampled_hidden.flatten(0, 1),
+            torch.stack(markov_embeds, dim=1).flatten(0, 1),
+        )
+        return draft_tokens_chunk, confidence.view(padded_num_reqs, -1)

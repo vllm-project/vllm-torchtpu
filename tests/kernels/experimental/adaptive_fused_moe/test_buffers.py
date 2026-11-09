@@ -20,8 +20,6 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import host
 
-pytestmark = pytest.mark.cpu_test
-
 
 @pytest.mark.parametrize(
     "hidden,inter,weight_format,rhs_qb,expected,expected_mib",

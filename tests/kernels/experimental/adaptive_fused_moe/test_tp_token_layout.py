@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """SPMD token-replica layout contract, including noncontiguous TP groups.
 
 Runs on an eight-device CPU mesh with
@@ -18,7 +30,6 @@ from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.token_parallel import
 )
 
 
-@pytest.mark.cpu_test
 @pytest.mark.parametrize("groups", [None, tuple((i,) for i in range(8))])
 @pytest.mark.parametrize("rows", [1, 7, 17, 257])
 def test_singleton_preserves_unaligned_inputs_without_traced_operations(groups, rows):
@@ -103,7 +114,6 @@ def test_unique_rows_and_original_output_on_every_tp_rank(groups, rows, alignmen
     )
 
 
-@pytest.mark.cpu_test
 @pytest.mark.parametrize(
     "groups", [(), ((0, 1),), ((0, 0), (2, 3)), ((0,), (1, 2, 3)), ((0, 1), (2, 4))]
 )

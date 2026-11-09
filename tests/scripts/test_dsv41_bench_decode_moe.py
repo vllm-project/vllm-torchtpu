@@ -459,8 +459,15 @@ class TestMoeDenseExpertDiff:
         # Unsupported rhs_quant_dtype
         assert kde._packing_factor_for(u8_t, u8_t, jnp.bfloat16) is None
 
-    def test_can_use_dense_expert_predicates(self):
+    def test_can_use_dense_expert_predicates(self, monkeypatch):
         """Test can_use_dense_expert across all rejection criteria and valid path."""
+        # The FP8 per-channel path asks the chip for FP8 support (vLLM
+        # torchtpu main); CPU hosts raise, so report a v7x-like chip.
+        monkeypatch.setattr(
+            kde.pltpu,
+            "get_tpu_info",
+            lambda: SimpleNamespace(fp8_ops_per_second=1, mxu_column_size=256),
+        )
 
         def _make_tensors(
             m=16,

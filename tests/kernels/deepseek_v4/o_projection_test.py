@@ -14,6 +14,7 @@
 
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from absl.testing import absltest, parameterized
 
 from vllm_torchtpu.kernels.deepseek_v4.o_projection import (
@@ -23,6 +24,8 @@ from vllm_torchtpu.kernels.deepseek_v4.o_projection import (
 )
 
 from .rope_test import make_cos_sin_cache, rope_ref_impl
+
+pytestmark = pytest.mark.tpu_test
 
 # DeepSeek-V4: head_dim 512, qk_rope_head_dim 64, 8 heads per group.
 HEAD_DIM = 512

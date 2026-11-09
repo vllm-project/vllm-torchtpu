@@ -1,11 +1,25 @@
-# SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the tpu-inference project
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 import os
 
 # envs.py imports nothing from this package, so it is safe to load here,
 # while the package's own __init__ is still running.
 from vllm_torchtpu import envs
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
 
 # Configure TorchTPU compilation cache environment variables directly
 if envs.TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT:
@@ -76,31 +90,6 @@ elif envs.TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD:
     # settings (including zero), and let Raiden retain its larger pool.
     os.environ.setdefault("TPU_PREMAPPED_BUFFER_SIZE", str(256 << 20))
 
-# TPU_GDN_CONV_QK_PAIR_LAYOUT resolves in two layers:
-#   1. An explicitly set value always wins (enable or disable), for both
-#      raiden and non-raiden runs — hence setdefault below.
-#   2. Otherwise, when the Raiden reshard stack is enabled, the layout
-#      follows the reshard's source fan-in: enabled iff
-#      TPU_RAIDEN_TRANSFER_PARALLELISM >= 8.  At such degrees a rank's
-#      conv Q and K segments are sub-token (512 B halves of the 1024-byte
-#      physical pool token under TP8), so only the pair-blocked layout
-#      gives whole-token — placement-exact — raw transfer spans; at lower
-#      source degrees the segment-major layout is already token-aligned.
-# The fan-in is parsed exactly like envs.TPU_RAIDEN_TRANSFER_PARALLELISM
-# (unset/empty means the default degree of 8 — keep the two in sync), so
-# the layout decision and the transfer stack always agree; today that
-# makes the pair layout the raiden default.  The launcher exports the
-# variable identically on both roles, so producer and consumer resolve the
-# same layout; a mismatched pair still fails closed through the layout
-# fingerprint.  An unparsable value raises here, at startup, rather than
-# letting the two readers diverge.
-if (
-    os.getenv("TPU_KV_RESHARD_TRANSPORT") == "raiden"
-    or os.getenv("TPU_USE_RAIDEN_KV_CACHE_MANAGER") == "1"
-):
-    _raiden_transfer_degree = int(os.getenv("TPU_RAIDEN_TRANSFER_PARALLELISM") or "8")
-    if _raiden_transfer_degree >= 8:
-        os.environ.setdefault("TPU_GDN_CONV_QK_PAIR_LAYOUT", "1")
 
 # Per-tensor-core VMEM capacity by TPU family (used to set the SC-offload
 # threshold below). Values mirror JAX's pallas chip table at
@@ -138,7 +127,7 @@ def _fetch_tpu_type_from_metadata() -> str | None:
         )
         if resp.status_code == 200 and resp.text:
             return resp.text
-    except Exception:
+    except Exception:  # noqa: S110
         pass
     return None
 
@@ -165,13 +154,43 @@ def _resolve_sc_offload_threshold_bytes() -> int | None:
 _existing_libtpu_args = os.environ.get("LIBTPU_INIT_ARGS", "")
 
 
-def _user_has_flag(flag_name: str) -> bool:
+def _user_has_flag(flag_name: str, args_string: str | None = None) -> bool:
     # Tokenized startswith("<flag>=") check so a hypothetical longer flag
     # that embeds ours as a prefix doesn't false-positive.
+    if args_string is None:
+        args_string = _existing_libtpu_args
     return any(
         token.startswith(flag_name + "=") or token == flag_name
-        for token in _existing_libtpu_args.split()
+        for token in args_string.split()
     )
+
+
+def set_libtpu_flag_default(flag_name: str, value: str) -> None:
+    """Append ``<flag_name>=<value>`` to ``LIBTPU_INIT_ARGS`` unless already set.
+
+    Must be called before the PjRt client is initialized (libtpu parses
+    ``LIBTPU_INIT_ARGS`` at PjRt client creation, not when ``libtpu.so`` is
+    loaded). An explicit user setting in ``LIBTPU_INIT_ARGS`` (either
+    ``<flag_name>=...`` or bare ``<flag_name>``) takes precedence.
+    """
+    current = os.environ.get("LIBTPU_INIT_ARGS", "")
+    if _user_has_flag(flag_name, current):
+        return
+    new_args = f"{current} {flag_name}={value}".strip()
+    os.environ["LIBTPU_INIT_ARGS"] = new_args
+    logger.info("Appended default flag to LIBTPU_INIT_ARGS: %s", new_args)
+
+
+def experimental_libtpu_init_args() -> list[str]:
+    """The flags libtpu will read from ``LIBTPU_INIT_ARGS``, one per token.
+
+    Includes the user's flags, the defaults added below at import, and any
+    added since with :func:`set_libtpu_flag_default`.
+
+    Experimental: only the AOT exporter (``experimental/export``) uses this.
+    It may change or be removed at any time without notice.
+    """
+    return os.environ.get("LIBTPU_INIT_ARGS", "").split()
 
 
 _libtpu_extra_args: list[str] = []

@@ -1,3 +1,16 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Unit tests for the align-mode Mamba state-block seed copies.
 
 These cover the decision logic in
@@ -23,6 +36,7 @@ import pytest
 import torch
 
 import vllm_torchtpu.runner.tpu_runner as runner_mod
+from vllm_torchtpu.gdn_pool_layout import PrefillCheckpointUnits
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 BLOCK_SIZE = 256
@@ -78,7 +92,11 @@ def _make_self(
     ]
     plan = [(gid + 1, [raws[gid]]) for gid in range(len(group_block_rows))]
     ns = SimpleNamespace(
+        requests={rid: object() for rid in req_ids},
         _mamba_copy_plan=plan,
+        scheduler_config=SimpleNamespace(async_scheduling=False),
+        speculative_config=None,
+        _pre_async_results=None,
         _mamba_state_pos=dict(state_pos or {}),
         _mamba_offset_seeded=set(req_ids),
         _mamba_state_block_size=state_block_size,
@@ -97,6 +115,8 @@ def _make_self(
         device="cpu",
         mamba_slot_read_offsets=read_offsets,
         _pending_mamba_state_copies=[],
+        _unfenced_h2d_sources=[],
+        _registered_h2d_sources=set(),
         input_batch=input_batch,
     )
     # Padding/expansion/source-selection helpers the collector calls on
@@ -289,13 +309,47 @@ def test_decode_boundary_crossing_copies():
 
 
 def test_stale_request_positions_are_forgotten():
-    # A req_id no longer in the batch is dropped from _mamba_state_pos.
+    # Finished requests no longer own KV state.
     fake, _ = _make_self(
         ["live"], [2 * BLOCK_SIZE], [[[5, 6, 7, 8]]], state_pos={"live": 1, "gone": 3}
     )
     _collect(fake, _sched({"live": BLOCK_SIZE}))
     assert "gone" not in fake._mamba_state_pos
     assert "live" in fake._mamba_state_pos
+
+
+@pytest.mark.parametrize("scheduled", [1, 4])
+@pytest.mark.parametrize("offset", [0, 1])
+def test_unscheduled_request_resumes_last_written_checkpoint(scheduled, offset):
+    """Rejection can leave the committed position before the written state column."""
+    offsets = torch.zeros(NUM_BLOCKS, dtype=torch.int32)
+    offsets[6] = offset
+    fake, raws = _make_self(
+        ["a"],
+        [BLOCK_SIZE - 1],
+        [[[5, 6, 7, 8, 9]]],
+        state_pos={"a": 1},
+        ckpt_window=4,
+        read_offsets=offsets,
+    )
+    # Each offset corresponds to a legal four-token window ending in column 1
+    # and accepting offset + 1 inputs, leaving computed == BLOCK_SIZE - 1.
+    raw = raws[0]
+    raw[5].fill_(float("nan"))
+    raw[6:10] = torch.arange(4).unsqueeze(1).expand(4, STATE_DIM) + 100
+    batch_a = fake.input_batch
+    batch_b, _ = _make_self(["b"], [10], [[[15, 16, 17, 18]]])
+    fake.requests["b"] = object()
+    fake.input_batch = batch_b.input_batch
+    _collect(fake, _sched({"b": 1}))
+    fake.input_batch = batch_a
+    _collect(fake, _sched({"a": scheduled}))
+    for buffers, src, dst in fake._pending_mamba_state_copies:
+        buffers[0][dst.long()] = buffers[0][src.long()].clone()
+    column = (BLOCK_SIZE - 1 + scheduled - 1) // BLOCK_SIZE
+    base = 5 + column
+    actual = raw[base + int(offsets[base])]
+    torch.testing.assert_close(actual, torch.full_like(actual, 100 + offset))
 
 
 def test_start_index_window_skips_other_rows():
@@ -759,3 +813,240 @@ def test_new_owner_without_crossing_leaves_source_selection_to_forward_reset():
     _collect(fake, _sched({"a": 1}))
     assert fake._pending_mamba_state_copies == []
     assert int(fake.mamba_slot_read_offsets[10]) == 3
+
+
+@pytest.mark.parametrize("rejected", [1, 2, 3])
+@pytest.mark.parametrize("cp_world", [1, 2])
+def test_async_rejections_seed_only_at_actual_state_crossing(
+    monkeypatch, rejected, cp_world
+):
+    """A rejected checkpoint must never become the next block's live state."""
+    monkeypatch.setattr(
+        runner_mod, "get_pcp_group", lambda: SimpleNamespace(world_size=cp_world)
+    )
+    stride = 384 * cp_world
+    fake, pools = _make_self(
+        ["a"],
+        [stride - 4 + rejected],
+        [[[5, 6, 7, 8, 9]]],
+        state_pos={"a": 0},
+        state_block_size=384,
+        ckpt_window=4,
+        read_offsets=torch.zeros(NUM_BLOCKS, dtype=torch.int32),
+    )
+    sampled = torch.tensor([[77] * (4 - rejected) + [-1] * rejected])
+    fake.scheduler_config = SimpleNamespace(async_scheduling=True)
+    fake.speculative_config = SimpleNamespace(num_speculative_tokens=3)
+    fake._pre_async_results = SimpleNamespace(
+        req_id_to_index_copy={"a": 0},
+        num_draft_per_req={0: 3},
+        spec_decode_num_rejected_tokens=torch.tensor([rejected]),
+        wait_for_copy=lambda: sampled,
+    )
+    _collect(fake, _sched({"a": 4}))
+    assert fake._pending_mamba_state_copies == []
+    assert fake._mamba_state_pos["a"] == 0
+    for i in range(4):
+        pools[0][5 + i].fill_(1000 + i)
+    fake.mamba_slot_read_offsets[5] = 3 - rejected
+    fake.input_batch.num_computed_tokens_cpu[0] += 4 - rejected
+    _collect(fake, _sched({"a": 4}))
+    assert _real_pairs(fake._pending_mamba_state_copies[0]) == [(8 - rejected, 6)]
+    for source, destination in _real_pairs(fake._pending_mamba_state_copies[0]):
+        pools[0][destination].copy_(pools[0][source].clone())
+    assert pools[0][6, 0].item() == 1003 - rejected
+    assert fake.mamba_slot_read_offsets[6].item() == 0
+
+
+def test_async_state_seed_away_from_boundary_does_not_wait():
+    fake, _ = _make_self(
+        ["a"], [100], [[[5, 6, 7, 8]]], state_pos={"a": 0}, state_block_size=384
+    )
+
+    def unexpected_wait():
+        raise AssertionError("Copy must not be awaited away from a boundary")
+
+    fake.scheduler_config = SimpleNamespace(async_scheduling=True)
+    fake.speculative_config = SimpleNamespace(num_speculative_tokens=3)
+    fake._pre_async_results = SimpleNamespace(
+        req_id_to_index_copy={"a": 0},
+        num_draft_per_req={0: 3},
+        spec_decode_num_rejected_tokens=torch.tensor([3]),
+        wait_for_copy=unexpected_wait,
+    )
+    _collect(fake, _sched({"a": 4}))
+    assert fake._pending_mamba_state_copies == []
+
+
+def test_async_state_seed_uses_previous_request_order():
+    fake, _ = _make_self(
+        ["b", "a"],
+        [100, 383],
+        [[[10, 11, 12, 13, 14], [5, 6, 7, 8, 9]]],
+        state_pos={"a": 0, "b": 0},
+        state_block_size=384,
+        ckpt_window=4,
+        read_offsets=torch.zeros(NUM_BLOCKS, dtype=torch.int32),
+    )
+    fake.scheduler_config = SimpleNamespace(async_scheduling=True)
+    fake.speculative_config = SimpleNamespace(num_speculative_tokens=3)
+    fake._pre_async_results = SimpleNamespace(
+        req_id_to_index_copy={"a": 0, "b": 1},
+        num_draft_per_req={0: 3, 1: 3},
+        wait_for_copy=lambda: torch.tensor([[77, -1, -1, -1], [77, 88, 99, 11]]),
+    )
+    before = fake.input_batch.num_computed_tokens_cpu.copy()
+    _collect(fake, _sched({"a": 4, "b": 4}))
+    assert fake._pending_mamba_state_copies == []
+    np.testing.assert_array_equal(fake.input_batch.num_computed_tokens_cpu, before)
+
+
+def test_async_state_seed_can_return_to_previous_column_after_rejection():
+    fake, pools = _make_self(
+        ["a"],
+        [386],
+        [[[5, 6, 7, 8, 9]]],
+        state_pos={"a": 1},
+        state_block_size=384,
+        ckpt_window=4,
+        read_offsets=torch.zeros(NUM_BLOCKS, dtype=torch.int32),
+    )
+    pools[0][6].fill_(42)
+    fake.scheduler_config = SimpleNamespace(async_scheduling=True)
+    fake.speculative_config = SimpleNamespace(num_speculative_tokens=3)
+    fake._pre_async_results = SimpleNamespace(
+        req_id_to_index_copy={"a": 0},
+        num_draft_per_req={0: 3},
+        wait_for_copy=lambda: torch.tensor([[77, -1, -1, -1]]),
+    )
+    _collect(fake, _sched({"a": 1}))
+    assert fake._mamba_state_pos["a"] == 0
+    assert _real_pairs(fake._pending_mamba_state_copies[0]) == [(6, 5)]
+    for source, destination in _real_pairs(fake._pending_mamba_state_copies[0]):
+        pools[0][destination].copy_(pools[0][source].clone())
+    assert pools[0][5, 0].item() == 42
+
+
+def test_async_state_seed_keeps_actual_crossing_when_all_drafts_accepted():
+    offsets = torch.zeros(NUM_BLOCKS, dtype=torch.int32)
+    offsets[5] = 3
+    fake, _ = _make_self(
+        ["a"],
+        [383],
+        [[[5, 6, 7, 8, 9]]],
+        state_pos={"a": 0},
+        state_block_size=384,
+        ckpt_window=4,
+        read_offsets=offsets,
+    )
+    fake.scheduler_config = SimpleNamespace(async_scheduling=True)
+    fake.speculative_config = SimpleNamespace(num_speculative_tokens=3)
+    fake._pre_async_results = SimpleNamespace(
+        req_id_to_index_copy={"a": 0},
+        num_draft_per_req={0: 3},
+        wait_for_copy=lambda: torch.tensor([[77, 88, 99, 11]]),
+    )
+    _collect(fake, _sched({"a": 4}))
+    assert fake._mamba_state_pos["a"] == 1
+    assert _real_pairs(fake._pending_mamba_state_copies[0]) == [(8, 6)]
+
+
+# --- internal prefill checkpoints -------------------------------------------
+#
+# A step that ends at seq_len has its prefill checkpoint block at column
+# cdiv(seq_len, B) - 2, one before the state column. It lies strictly between
+# the seed source (the previous state column) and destination (the new one),
+# so no seed copy reads or writes it in the step that exports it. The tables
+# below are the worker's append-only rows that MambaManager produces (vLLM
+# #59759 moves a spec block into the checkpoint column), scaled from B = 3072
+# to B = BLOCK_SIZE.
+
+_B = BLOCK_SIZE
+
+
+def _ckpt_units(drop_eagle_block):
+    return PrefillCheckpointUnits(
+        hash_block_size=_B,
+        cache_hit_alignment_tokens=_B,
+        mamba_block_size=_B,
+        alignment=64,
+        drop_eagle_block=drop_eagle_block,
+    )
+
+
+def _ckpt_block(units, row, computed, scheduled):
+    """The block the step's prefill checkpoint is exported into, or None."""
+    offsets = np.zeros(1, dtype=np.int32)
+    units.fill_offsets(offsets, np.array([computed + scheduled]), np.array([scheduled]))
+    if offsets[0] == 0:
+        return None
+    return row[(computed + scheduled - 1) // _B - 1]
+
+
+# (steps, drop_eagle_block): each step is (computed, scheduled, worker row
+# after the step's allocation, expected seed pairs, expect a checkpoint).
+_CKPT_LAYOUTS = {
+    # 8191 tokens in one chunk with MTP: [null, ckpt, state, spec]; the next
+    # verify step crosses from the state into the spec column.
+    "one_chunk_mtp": (
+        [
+            (0, 2 * _B + 255, [0, 4, 5, 6], [], True),
+            (2 * _B + 255, 2, [0, 4, 5, 6], [(5, 6)], False),
+        ],
+        True,
+    ),
+    # 22000 tokens as [15360, 22000] with MTP: chunk 2 relocates chunk 1's
+    # spec block 8 into its checkpoint column 6.
+    "two_chunks_mtp_relocated": (
+        [
+            (0, 5 * _B, [0, 0, 0, 6, 7, 8], [], True),
+            (5 * _B, 2 * _B + 41, [0, 0, 0, 6, 7, 8, 8, 11, 12], [(7, 11)], True),
+        ],
+        True,
+    ),
+    # 19456 tokens as [15360, 19456] without MTP: checkpoint at column 5.
+    "two_chunks_no_mtp": (
+        [
+            (0, 5 * _B, [0, 0, 0, 6, 7], [], True),
+            (5 * _B, _B + 85, [0, 0, 0, 6, 7, 9, 10], [(7, 10)], True),
+        ],
+        False,
+    ),
+}
+
+
+@pytest.mark.parametrize("window", [1, 2])
+@pytest.mark.parametrize("layout", sorted(_CKPT_LAYOUTS))
+def test_prefill_checkpoint_block_is_never_a_seed_copy_operand(layout, window):
+    steps, drop_eagle_block = _CKPT_LAYOUTS[layout]
+    units = _ckpt_units(drop_eagle_block)
+    fake, _ = _make_self(
+        ["a"],
+        [0],
+        [[[0]]],
+        num_cols=12,
+        ckpt_window=window,
+        # Prefill steps leave every read offset at 0.
+        read_offsets=(
+            torch.zeros(NUM_BLOCKS, dtype=torch.int32) if window > 1 else None
+        ),
+    )
+    table = fake.input_batch.block_table[1].get_cpu_tensor()
+    for computed, scheduled, row, expected_pairs, expect_ckpt in steps:
+        fake.input_batch.num_computed_tokens_cpu[0] = computed
+        table[0, : len(row)] = torch.tensor(row, dtype=torch.int32)
+        fake._pending_mamba_state_copies = []
+
+        _collect(fake, _sched({"a": scheduled}))
+
+        pairs = [
+            pair
+            for staged in fake._pending_mamba_state_copies
+            for pair in _real_pairs(staged)
+        ]
+        assert pairs == expected_pairs
+        ckpt = _ckpt_block(units, row, computed, scheduled)
+        assert (ckpt is not None) == expect_ckpt
+        if ckpt is not None:
+            assert ckpt != 0
+            assert all(ckpt not in pair for pair in pairs)

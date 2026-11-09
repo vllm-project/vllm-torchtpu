@@ -1,10 +1,22 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import importlib
 import os
 import time
 from collections.abc import Callable, Mapping, Sequence
 from functools import wraps
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, cast
 
 import jax
 import torch
@@ -60,6 +72,26 @@ def get_dp_size(parallel_config) -> int:
     )
 
 
+def min_over_group(value: int, cpu_group: Any) -> int:
+    """Return the minimum of `value` over the ranks of a gloo `cpu_group`."""
+    t = torch.tensor([value], dtype=torch.int64, device="cpu")
+    torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MIN, group=cpu_group)
+    return int(t.item())
+
+
+def min_across_ep_dp(parallel_config, value: int) -> int:
+    """Return the minimum of `value` across the DP engines coupled by EP.
+
+    EP-coupled engines must compile identical programs, so a value baked into
+    them (such as the KV cache size) has to agree; uncoupled engines keep theirs.
+    """
+    if get_dp_size(parallel_config) == 1 or not parallel_config.enable_expert_parallel:
+        return value
+    from vllm.distributed.parallel_state import get_dp_group
+
+    return min_over_group(value, get_dp_group().cpu_group)
+
+
 def hbm_usage_bytes(devices: Any) -> list[tuple[int, int]]:
     usage = []
     multihost_backend = envs.TPU_MULTIHOST_BACKEND
@@ -91,8 +123,19 @@ def hbm_usage_bytes(devices: Any) -> list[tuple[int, int]]:
     return usage
 
 
+def local_device_kind() -> str:
+    """The `device_kind` of this process's first local JAX device (e.g.
+    `"TPU7x"`, or `"cpu"` off TPU). No collective."""
+    devices = jax.local_devices()
+    if not devices:
+        raise RuntimeError(
+            "No local JAX devices in this process; can't read the device kind"
+        )
+    return str(devices[0].device_kind)
+
+
 def get_device_name(num_devices: int | None = None):
-    kind = jax.devices()[0].device_kind
+    kind = local_device_kind()
     if "TPU" not in kind:
         raise RuntimeError("Expected TPU devices")
     suffix = ""
@@ -174,6 +217,22 @@ class HbmBudget(NamedTuple):
     available: int
 
 
+class HbmReserves(NamedTuple):
+    """HBM allocated after profile_run, which the KV-cache budget must leave
+    free. Its sum is what the budget subtracts.
+
+    All fields are bytes:
+      kv_connector:    what the KV connector allocates, such as the offload
+                       H2D staging pool.
+      lora_slot_write: what an adapter swap holds while it runs.
+      pp_handoff:      what the pipeline ring hand-off's buffers take.
+    """
+
+    kv_connector: int
+    lora_slot_write: int
+    pp_handoff: int
+
+
 def compute_hbm_budget(devices: Any, gpu_memory_utilization: float) -> HbmBudget:
     """Compute the HBM budget available for the KV cache."""
     total_limit = total_used = 0
@@ -239,7 +298,7 @@ def get_dtype_packing(dtype):
     return 32 // bits
 
 
-def get_hash_fn_by_name(hash_fn_name: str) -> Callable[[Any], bytes]:
+def get_hash_fn_by_name(hash_fn_name: str) -> Callable[[Any], bytes | int]:
     """
     A wrapper function of vllm.utils.hashing.get_hash_fn_by_name to support builtin
     """
@@ -303,7 +362,7 @@ def tpu_bind_kv_cache(
             if isinstance(cache, (list, tuple)):
                 runner_kv_caches.extend(cache)
             else:
-                runner_kv_caches.append(cache)
+                runner_kv_caches.append(cast(torch.Tensor, cache))
 
     for layer_name, kv_cache in kv_caches.items():
         layer = forward_context[layer_name]
@@ -372,3 +431,50 @@ def synchronize_tensors(
     from torch_tpu._internal import sync
 
     sync.synchronize(tensors=tensors, wait=wait)
+
+
+# Copied by `fresh_buffer` through bfloat16, which holds each of their non-NaN
+# values exactly. Not `float4_e2m1fn_x2`: it packs two values per element, and
+# a bfloat16 round trip corrupts it.
+_FLOAT8_DTYPES = frozenset(
+    {
+        torch.float8_e4m3fn,
+        torch.float8_e5m2,
+        torch.float8_e8m0fnu,
+        torch.float8_e4m3fnuz,
+        torch.float8_e5m2fnuz,
+    }
+)
+
+
+def fresh_buffer(t: torch.Tensor) -> torch.Tensor:
+    """Return a copy of `t` backed by a fresh device buffer of its own shape.
+
+    torch_tpu hands a compiled executable the buffer behind each argument. If a
+    persistent tensor's storage is a buffer of a different shape (e.g. it is a
+    view, or was filled by `copy_` from a view), torch_tpu re-materializes it as
+    a standalone `tt_jit_as_strided` program before every forward. Calling this
+    once at load time removes that per-step program.
+
+    `torch.empty(...).copy_(t)` is not enough: torch_tpu may satisfy a
+    same-shape, same-dtype `copy_` by aliasing the destination's storage to
+    `t`'s base buffer, which keeps the shape mismatch. On TPU a real op forces
+    an output buffer of `t`'s logical shape: `+ 0`, or for float8 a round trip
+    through bfloat16. Other devices get a plain contiguous clone (CPU has no
+    `add` kernel for float8 dtypes).
+
+    Float8 takes the round trip because torch_tpu builds since commit cf43c606
+    (google-pytorch/torch_tpu) have no float8 `add`, while casts stay
+    supported. Every non-NaN value comes back bit-identical; a NaN stays NaN
+    but may lose its sign or payload. A uint8 `+ 0` viewed back as float8 is no
+    substitute: the result is a dtype view, and a model loaded that way halted
+    at its first warmup step in torch_tpu's `tt_jit_execute_as_strided`
+    programs.
+    """
+    out = torch.clone(t, memory_format=torch.contiguous_format)
+    if out.device.type == "tpu":
+        if out.dtype in _FLOAT8_DTYPES:
+            out = out.to(torch.bfloat16).to(out.dtype)
+        else:
+            out = out + 0
+    return out

@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import torch
 
 from vllm_torchtpu.model_loader_patches import ExpertParamStager, ExpertWriteTracker
@@ -101,6 +113,16 @@ def test_flush_all_writes_incomplete_parameters():
     assert len(stager) == 0
     assert stager.flushed == 1
     assert torch.equal(w13.data[0], torch.full((8, 4), 5.0))
+
+
+def test_flush_all_drops_the_buffers_flushes_left_behind():
+    stager = ExpertParamStager()
+    w2 = _param(1, 8, 4)
+    stager.host_param(w2)
+    assert stager.written(w2, 0, "w2")
+    assert stager._pool
+    stager.flush_all()
+    assert not stager._pool
 
 
 def test_flush_uploads_in_chunks(monkeypatch):

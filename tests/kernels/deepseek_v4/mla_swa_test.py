@@ -16,11 +16,14 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from absl.testing import absltest, parameterized
 
 # Import the kernels
 from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
 from vllm_torchtpu.kernels.deepseek_v4.core_attention import mla_swa
+
+pytestmark = pytest.mark.tpu_test
 
 
 def get_kv_cache_shape(
@@ -324,7 +327,9 @@ class CorrectnessTest(parameterized.TestCase):
         )
 
         ref_cache_masked = np.where(valid_mask, self.ref_cache, 0)
-        swa_cache = reformat_swc_cache(self.swc_cache[:, : page_size * 2, :, :])
+        swa_cache = reformat_swc_cache(
+            self.swc_cache[: batch_size * pages_per_seq, : page_size * 2, :, :]
+        )
         swa_cache = swa_cache.reshape(
             batch_size * pages_per_seq, page_size // kv_packing, kv_packing, 512
         )
@@ -346,6 +351,7 @@ class CorrectnessTest(parameterized.TestCase):
         non_causal_block=False,
         num_queries_per_block=8,
         num_kv_pages_per_block=2,
+        chunk_prefill_size=None,
     ):
         total_tokens = q.shape[0]
         out_base, self.ref_cache, l_base, m_base = ref_implementation(
@@ -378,6 +384,7 @@ class CorrectnessTest(parameterized.TestCase):
             q_compute_block_size=2,
             logical_page_size=self.page_size,
             non_causal_block=non_causal_block,
+            chunk_prefill_size=chunk_prefill_size,
         )
         self.swc_cache = self.from_host(swc_cache)
 
@@ -529,6 +536,78 @@ class CorrectnessTest(parameterized.TestCase):
             num_kv_pages_per_block=num_kv_pages_per_block,
         )
 
+    @parameterized.named_parameters(("causal", False), ("non_causal", True))
+    def test_static_verify_segment(self, non_causal_block):
+        """Speculative verify windows of a fixed length (1 + K) in the
+        distribution's middle segment, run by the static query-length pass:
+        [4 decodes][4 windows of 7][4 mixed]. The output must equal the same
+        step run with the windows in the mixed segment."""
+        verify_q_len = 7
+        new_kv_lens = jnp.array([1, 8, 40] * (self.batch_size // 3), dtype=jnp.int32)
+        cu_q_lens = jnp.concatenate(
+            [jnp.array([0]), jnp.cumulative_sum(new_kv_lens, dtype=jnp.int32)]
+        )
+        self.kv_lens += new_kv_lens
+        total_tokens = jnp.sum(new_kv_lens)
+        q = self.gen_random((total_tokens, self.num_heads, self.head_dim), self.q_dtype)
+        new_kv = self.gen_random((total_tokens, self.head_dim), self.kv_dtype)
+        self.run_and_compare_outputs(
+            q,
+            new_kv,
+            self.kv_lens,
+            cu_q_lens,
+            jnp.array([0, 0, self.batch_size], dtype=jnp.int32),
+        )
+
+        n = self.batch_size // 3
+        q_lens = jnp.array(
+            [1] * n + [verify_q_len] * n + [3, 9, 2, 12][:n] + [5] * (n - 4),
+            dtype=jnp.int32,
+        )
+        cu_q_lens = jnp.concatenate(
+            [jnp.array([0]), jnp.cumulative_sum(q_lens, dtype=jnp.int32)]
+        )
+        self.kv_lens += q_lens
+        total_tokens = jnp.sum(q_lens)
+        q = self.gen_random((total_tokens, self.num_heads, self.head_dim), self.q_dtype)
+        new_kv = self.gen_random((total_tokens, self.head_dim), self.kv_dtype)
+
+        def run(distribution, cache):
+            return mla_swa.mla_sliding_window_ragged_paged_attention(
+                q,
+                new_kv,
+                self.to_host(cache),
+                self.kv_lens,
+                self.swc_page_indices,
+                cu_q_lens,
+                distribution,
+                self.attention_sinks,
+                sm_scale=1.0,
+                sliding_window=self.sliding_window,
+                num_queries_per_block=(1, 8, 8),
+                num_kv_pages_per_block=2,
+                q_compute_block_size=2,
+                logical_page_size=self.page_size,
+                non_causal_block=non_causal_block,
+                chunk_prefill_size=verify_q_len,
+            )
+
+        mixed = run(jnp.array([n, n, self.batch_size], jnp.int32), self.swc_cache + 0)
+        static = run(
+            jnp.array([n, 2 * n, self.batch_size], jnp.int32), self.swc_cache + 0
+        )
+        for a, b in zip(mixed, static):
+            np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+        self.run_and_compare_outputs(
+            q,
+            new_kv,
+            self.kv_lens,
+            cu_q_lens,
+            jnp.array([n, 2 * n, self.batch_size], jnp.int32),
+            non_causal_block=non_causal_block,
+            chunk_prefill_size=verify_q_len,
+        )
+
 
 class Int32HostTest(CorrectnessTest):
     """The SWA cache overlaid on the int32 CSA NoPE host array."""
@@ -539,6 +618,75 @@ class Int32HostTest(CorrectnessTest):
     def from_host(self, cache):
         assert cache.dtype == jnp.int32
         return csa_cache_layout.words_to_slabs(cache)
+
+
+class LongPageTableTest(CorrectnessTest):
+    """Runs the base tests with a page table larger than SMEM.
+
+    Fails if the kernel reads an entry outside a sequence's pages: those entries
+    point at an added page filled with large values. Each sequence gets one
+    entry per page of a 524,288-token context, 32,768 at the base test's
+    16-token pages, so the full table, 12 x 32,768 x 4 bytes = 1.5 MiB, is more
+    than the 1 MiB of SMEM on TPU v7x. The first entries of each row are the
+    base test's pages.
+    """
+
+    max_model_len = 524_288
+
+    def setUp(self):
+        super().setUp()
+        sentinel_page = self.swc_cache.shape[0]
+        sentinel = jnp.full((1, *self.swc_cache.shape[1:]), 0x46, dtype=jnp.uint8)
+        self.swc_cache = jnp.concatenate([self.swc_cache, sentinel])
+        pages_per_seq = self.max_model_len // self.page_size
+        table = np.full((self.batch_size, pages_per_seq), sentinel_page, dtype=np.int32)
+        table[:, : self.ref_pages_per_seq] = np.asarray(self.ref_page_indices).reshape(
+            self.batch_size, self.ref_pages_per_seq
+        )
+        self.swc_page_indices = jnp.array(table.reshape(-1))
+
+
+class NarrowPageIndicesTest(parameterized.TestCase):
+    def test_keeps_window_pages_and_shifts_kv_lens(self):
+        # 2 sequences, 8 pages each of 4 tokens; page i of sequence s is 10*s+i.
+        page_indices = jnp.array(
+            [10 * s + i for s in range(2) for i in range(8)], dtype=jnp.int32
+        )
+        kv_lens = jnp.array([30, 3], dtype=jnp.int32)
+        cu_q_lens = jnp.array([0, 1, 3], dtype=jnp.int32)
+
+        new_kv_lens, narrowed = mla_swa.narrow_page_indices(
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            sliding_window=4,
+            logical_page_size=4,
+            max_q_len=2,
+            max_kv_pages_per_block=1,
+        )
+
+        # span_pages = cdiv(2 + 4, 4) + 1 = 3 and window_pages = 3 + 1 + 1 = 5.
+        # Sequence 0 decodes at position 29, so its first key is 26 (page 6);
+        # sequence 1 starts at 0.
+        np.testing.assert_array_equal(new_kv_lens, [30 - 24, 3])
+        np.testing.assert_array_equal(narrowed, [6, 7, 7, 7, 7, 10, 11, 12, 13, 14])
+
+    def test_narrow_table_is_unchanged(self):
+        page_indices = jnp.arange(8, dtype=jnp.int32)
+        kv_lens = jnp.array([30], dtype=jnp.int32)
+
+        out_lens, out_pages = mla_swa.narrow_page_indices(
+            kv_lens,
+            page_indices,
+            jnp.array([0, 1], dtype=jnp.int32),
+            sliding_window=16,
+            logical_page_size=4,
+            max_q_len=1,
+            max_kv_pages_per_block=2,
+        )
+
+        self.assertIs(out_lens, kv_lens)
+        self.assertIs(out_pages, page_indices)
 
 
 if __name__ == "__main__":

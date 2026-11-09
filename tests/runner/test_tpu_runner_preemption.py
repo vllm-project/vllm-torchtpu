@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """A resumed request must not consume asynchronous output from its old KV state."""
 
 from types import SimpleNamespace
@@ -10,6 +22,7 @@ import torch
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
+from vllm_torchtpu.runner.min_tokens import MinTokensTracker
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 
@@ -17,6 +30,7 @@ from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 @pytest.mark.parametrize("num_drafts", [0, 3])
 def test_async_results_do_not_overwrite_recomputed_request(transition, num_drafts):
     runner = object.__new__(TPUModelRunner)
+    runner._min_tokens = MinTokensTracker()
     stride = 1 + num_drafts
     invalid = transition != "continue"
     states = {
@@ -55,6 +69,9 @@ def test_async_results_do_not_overwrite_recomputed_request(transition, num_draft
     runner._mamba_offset_seeded = {"resumed", "continuing"}
     runner._replay_starts = {}
     runner.kv_cache_config = None
+
+    runner._mamba_slot_by_req_id = {"resumed": 1, "continuing": 1 + stride}
+    runner._free_mamba_slots = []
     output = SchedulerOutput.make_empty()
     output.finished_req_ids = {"resumed"} if transition == "finish" else set()
     output.preempted_req_ids = {"resumed"} if transition == "preempt" else None
@@ -92,6 +109,12 @@ def test_async_results_do_not_overwrite_recomputed_request(transition, num_draft
     assert runner._mamba_offset_seeded == (
         {"continuing"} if invalid else {"resumed", "continuing"}
     )
+    assert runner._mamba_slot_by_req_id == (
+        {"continuing": 1 + stride}
+        if invalid
+        else {"resumed": 1, "continuing": 1 + stride}
+    )
+    assert runner._free_mamba_slots == ([1] if invalid else [])
     # Preserve source row indices and rejection correction for the other request.
     assert previous.req_id_to_index_copy["continuing"] == 1
     assert previous.spec_decode_num_rejected_tokens is (

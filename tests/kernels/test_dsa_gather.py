@@ -20,10 +20,13 @@ direct indexing into the source byte arrays and every comparison is exact.
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from absl.testing import parameterized
 
 from vllm_torchtpu.kernels.mla import kv_cache_utils
 from vllm_torchtpu.kernels.mla.sparse import dsa_gather
+
+pytestmark = pytest.mark.tpu_test
 
 LKV_DIM = 512
 PAGE_SIZE = 32

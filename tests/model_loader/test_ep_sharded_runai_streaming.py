@@ -261,8 +261,8 @@ def test_request_plan_groups_contiguous_kept_runs(filter_model_weights):
                 ["gs://bucket/file0.safetensors"],
                 local_expert_ids={0},
                 use_tqdm_on_load=False,
-                weight_filter=(
-                    (lambda name: name.startswith("mtp."))
+                is_unused_weight=(
+                    (lambda name: not name.startswith("mtp."))
                     if filter_model_weights
                     else None
                 ),
@@ -479,6 +479,7 @@ def test_patch_falls_back_when_filter_inactive():
 
     class FakeLoader:
         _get_weights_iterator = original
+        load_weights = MagicMock(name="original_load_weights")
 
     with patch.object(rsl, "RunaiModelStreamerLoader", FakeLoader):
         mlp.patch_runai_sharded_expert_streaming()
@@ -489,53 +490,149 @@ def test_patch_falls_back_when_filter_inactive():
         with patch.object(mlp, "_compute_local_expert_ids", return_value=None):
             loader = FakeLoader()
             FakeLoader._get_weights_iterator(loader, "gs://b/m", None)
-        original.assert_called_once_with(loader, "gs://b/m", None)
+        original.assert_called_once_with(loader, "gs://b/m", None, None)
 
 
-@pytest.mark.parametrize("with_filter", [False, True])
-@pytest.mark.parametrize("override", [None, "gs://b/override"])
-def test_patch_passes_model_filter_for_each_load(with_filter, override):
-    """The callback belongs to this model load, not the loader instance."""
+def test_patch_forwards_is_unused_weight_when_filter_active():
+    """With EP sharding active, _get_weights_iterator forwards every shard and
+    is_unused_weight to _sharded_runai_weights_iterator, which skips unused
+    tensors from the shard headers without a separate file pre-filter."""
     from vllm.model_executor.model_loader import runai_streamer_loader as rsl
 
     from vllm_torchtpu import model_loader_patches as mlp
 
     class FakeLoader:
-        _get_weights_iterator = MagicMock()
-        _prepare_weights = MagicMock(return_value=["weights.safetensors"])
+        _get_weights_iterator = MagicMock(name="original_get_weights_iterator")
+        load_weights = MagicMock(name="original_load_weights")
         load_config = SimpleNamespace(use_tqdm_on_load=False)
 
-    config = SimpleNamespace(
-        model="gs://b/model", model_weights=override, revision="revision"
-    )
-    model = SimpleNamespace(load_weights=MagicMock())
-    if with_filter:
-        model.should_load_weight = lambda name: name.endswith(".weight")
-    weights = iter(())
+        def _prepare_weights(self, model_or_path, revision):
+            return ["gs://b/m/shard0.safetensors", "gs://b/m/shard1.safetensors"]
+
+    unused_fn = lambda name: name.startswith("unused.")  # noqa: E731
     with (
         patch.object(rsl, "RunaiModelStreamerLoader", FakeLoader),
+        patch.object(rsl, "is_runai_obj_uri", return_value=True),
+        patch.object(rsl, "_filter_remote_weights") as mock_filter,
         patch.object(mlp, "_compute_local_expert_ids", return_value={0}),
-        patch.object(
-            mlp, "_sharded_runai_weights_iterator", return_value=weights
-        ) as stream,
+        patch.object(mlp, "_sharded_runai_weights_iterator") as mock_sharded_iter,
     ):
         mlp.patch_runai_sharded_expert_streaming()
         loader = FakeLoader()
-        loader.load_weights(model, config)
-        FakeLoader._prepare_weights.assert_called_once_with(
-            override or config.model, config.revision
-        )
-        stream.assert_called_once_with(
-            ["weights.safetensors"],
+        FakeLoader._get_weights_iterator(loader, "gs://b/m", "main", unused_fn)
+        mock_filter.assert_not_called()
+        mock_sharded_iter.assert_called_once_with(
+            ["gs://b/m/shard0.safetensors", "gs://b/m/shard1.safetensors"],
             {0},
             False,
-            weight_filter=getattr(model, "should_load_weight", None),
+            None,
+            is_unused_weight=unused_fn,
         )
-        model.load_weights.assert_called_once_with(weights)
 
-        # Reusing this loader for another model must not retain the callback.
-        loader.load_weights(SimpleNamespace(load_weights=MagicMock()), config)
-        assert stream.call_args.kwargs["weight_filter"] is None
+
+def test_layer_finisher_runs_after_consumer_receives_tensor():
+    pytest.importorskip("runai_model_streamer")
+    import runai_model_streamer.safetensors_streamer.safetensors_pytorch as sp
+    import torch
+    from runai_model_streamer.safetensors_streamer import safetensors_streamer
+
+    from vllm_torchtpu import model_loader_patches as mlp
+
+    names = ["model.layers.0.q.weight", "model.layers.0.v.weight"]
+    metadata = _fake_file_meta(100, [(name, 4) for name in names])
+    received, finalized = [], []
+    model = torch.nn.Module()
+
+    class FakeFinisher:
+        def __init__(self, actual_model, actual_names):
+            assert actual_model is model
+            assert actual_names == names
+
+        def consumed(self, name):
+            assert received[-1] == name
+            finalized.append(name)
+
+    class FakeStreamer:
+        def __init__(self):
+            self.file_streamer = self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def stream_files(self, *args, **kwargs):
+            pass
+
+        def get_chunks(self):
+            return iter([(0, 0, b"1234"), (0, 1, b"5678")])
+
+    with (
+        patch.object(safetensors_streamer, "SafetensorsStreamer", FakeStreamer),
+        patch.object(sp.SafetensorsMetadata, "from_files", return_value=[metadata]),
+        patch.object(sp, "create_torch_tensor", return_value=torch.ones(1)),
+        patch.object(mlp, "_OnlineFp8LayerFinisher", FakeFinisher),
+        patch.object(mlp.envs, "TPU_SHARDED_LOAD_SYNC_EVERY", 0),
+    ):
+        for name, _ in _sharded_runai_weights_iterator(
+            ["gs://b/m"], {0}, False, model=model
+        ):
+            assert name not in finalized
+            received.append(name)
+    assert finalized == names
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_loading_model_is_scoped_to_load_weights(fail):
+    import torch
+    from vllm.model_executor.model_loader import runai_streamer_loader as rsl
+
+    from vllm_torchtpu import model_loader_patches as mlp
+
+    model = torch.nn.Module()
+
+    class FakeLoader:
+        _get_weights_iterator = MagicMock()
+
+        def load_weights(self, actual_model, model_config):
+            assert self._loading_model is actual_model
+            if fail:
+                raise RuntimeError("load failed")
+
+    with patch.object(rsl, "RunaiModelStreamerLoader", FakeLoader):
+        mlp.patch_runai_sharded_expert_streaming()
+        loader = FakeLoader()
+        assert loader._loading_model is None
+        if fail:
+            with pytest.raises(RuntimeError, match="load failed"):
+                loader.load_weights(model, None)
+        else:
+            loader.load_weights(model, None)
+    assert loader._loading_model is None
+
+
+def test_local_rank_discovery_reuses_exported_group_size(monkeypatch):
+    pytest.importorskip("runai_model_streamer")
+    from runai_model_streamer.distributed_streamer import (
+        distributed_streamer as rds,
+    )
+
+    from vllm_torchtpu import model_loader_patches as mlp
+
+    mlp._patch_runai_local_rank_discovery()
+    mlp._patch_runai_local_rank_discovery()  # idempotent
+    params = rds._distributedStreamerParams()
+    monkeypatch.setenv("RUNAI_STREAMER_PROCESS_GROUP_SIZE", "8")
+    with (
+        patch("torch.distributed.is_initialized", return_value=True),
+        patch("torch.distributed.get_rank", return_value=5),
+        patch("torch.distributed.new_group", side_effect=AssertionError("collective")),
+    ):
+        assert params.find_local_ranks() == (8, 5, [])
+    monkeypatch.delenv("RUNAI_STREAMER_PROCESS_GROUP_SIZE")
+    with patch("torch.distributed.is_initialized", return_value=False):
+        assert params.find_local_ranks() == (1, 0, [[0]])
 
 
 def test_model_filter_preserves_original_checkpoint_names():
@@ -566,7 +663,7 @@ def test_model_filter_preserves_original_checkpoint_names():
                 ["weights.safetensors"],
                 local_expert_ids=set(),
                 use_tqdm_on_load=False,
-                weight_filter=keep,
+                is_unused_weight=lambda name: not keep(name),
             )
         )
     assert result == [(kept_name, tensor)]

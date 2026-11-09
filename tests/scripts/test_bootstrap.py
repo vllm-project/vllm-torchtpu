@@ -1196,7 +1196,7 @@ class TestBootstrapUnits(unittest.TestCase):
                 ("upload-stages:upload_stage_0:build", "1"),
             ],
         )
-        self.assertEqual(self.pinned, "v0.31.1rc0")
+        self.assertEqual(self.pinned, "v0.33.0")
         self.assertEqual(
             pr.annotations,
             [("info", "ci-suite", f"CI suite: pr: {bp._PR_SUITES['pr'].about}")],
