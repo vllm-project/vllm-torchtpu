@@ -102,15 +102,6 @@ def inner_kernel(
 
     # Step 1: Conv1D.
     qkv_in = qkv_slot_ref[...].astype(jnp.float32)
-    row_tiled = (
-        conv_output_scratch_ref is not None and conv_output_scratch_ref.ndim == 3
-    )
-    if conv_output_scratch_ref is not None:
-        if not row_tiled:
-            qkv_in = qkv_in[:, :, None, :]
-        qkv_work_ref = conv_output_scratch_ref
-    else:
-        qkv_work_ref = qkv_slot_ref
 
     # Prepare conv1d weights.
     conv_weight = weights_ref.conv.weight[...].astype(jnp.float32)
@@ -118,7 +109,10 @@ def inner_kernel(
     if weights_ref.conv.bias is not None:
         conv_bias = weights_ref.conv.bias[...].astype(jnp.float32)
 
-    if row_tiled:
+    qkv_work_ref = (
+        conv_output_scratch_ref if conv_output_scratch_ref is not None else qkv_slot_ref
+    )
+    if conv_output_scratch_ref is not None:
         qkv_out, new_conv_state = compute_conv1d.causal_conv1d_full_tile(
             qkv_in, prev_conv, conv_weight, conv_bias, cfg
         )
@@ -335,8 +329,6 @@ def outer_kernel(
         "mixed_tile_size",
         "batched_only",
         "prefill_only",
-        "fuse_packed_prefill_cast",
-        "packed_conv_row_tiled",
         "zero_initialize_out",
         "compute_precision",
         "recurrent_dtype",
@@ -373,8 +365,6 @@ def fused_conv1d_gdn(
     num_spec_tokens: int = 0,
     batched_only: bool = False,
     prefill_only: bool = False,
-    fuse_packed_prefill_cast: bool = False,
-    packed_conv_row_tiled: bool = False,
     zero_initialize_out: bool = True,
     compute_precision: jnp.dtype = jnp.float32.dtype,
     # TODO(kyuyeunk): Calculate tile size based on input dimensions.
@@ -386,7 +376,8 @@ def fused_conv1d_gdn(
     Args:
         qkv: Mixed query, key, value input tensor of shape [batch_size, dim_size],
             where `dim_size = n_kq * d_k * 2 + n_v * d_v`. The pooled GDN
-            path also accepts packed BF16 QKVZ with trailing value-width Z.
+            path without speculative decoding also accepts packed QKVZ
+            with trailing value-width Z.
         b: b tensor (for beta) of shape [batch_size, n_v].
         a: a tensor (for g) of shape [batch_size, n_v].
         states: FP32 convolution and BF16/FP32 recurrent state tensors as
@@ -403,11 +394,13 @@ def fused_conv1d_gdn(
             Mosaic rejects that shape cast from a flat vector
             ("infer-vector-layout: unsupported shape cast").
         query_start_loc: Start locations of sequences of shape [num_seqs + 1].
+            Active sequences have ordered offsets within [0, batch_size].
         state_indices: Indices mapping sequences to state cache slots of shape
             [num_seqs]. With speculative decoding these are the *base* slots
             of per-request groups of `num_spec_tokens + 1` consecutive slots.
         distribution: Tensor of shape [3] int32 — [decode_end, prefill_end,
-            mixed_end]. With `num_spec_tokens > 0`, the first segment holds
+            mixed_end], where mixed_end is the active sequence count and is
+            at most num_seqs. With `num_spec_tokens > 0`, the first segment holds
             speculative verify windows of up to `num_spec_tokens + 1` tokens
             rather than 1-token decodes.
         seq_lens: Sequence lengths for each sequence of shape [num_seqs].
@@ -421,7 +414,7 @@ def fused_conv1d_gdn(
         n_v: Number of value heads.
         d_k: Key/query dimension.
         d_v: Value dimension.
-        kernel_size: Convolution kernel size.
+        kernel_size: Convolution kernel size, at least 2.
         attention_mode: `GDN` for the per-head scalar gate, `KDA` for the
             per-channel one. Selects which compute path runs.
         gate_lower_bound: KDA only, and must be negative. `None` gives the
@@ -435,10 +428,6 @@ def fused_conv1d_gdn(
         batched_only: Run only the leading decode/verify segment.
         prefill_only: Run only PER_SEQ, leaving decode/verify checkpoints
             untouched. Mutually exclusive with batched_only.
-        fuse_packed_prefill_cast: Enable the aligned 8K packed BF16 prefill
-            kernel when the runtime batch is eligible.
-        packed_conv_row_tiled: Keep the aligned packed convolution and its
-            FP32 output scratch in the row-tiled layout.
         zero_initialize_out: Whether to zero-initialize the output buffer before
             executing non-batched sequences.
         compute_precision: Computation precision dtype.
@@ -497,10 +486,7 @@ def fused_conv1d_gdn(
     num_seqs = state_indices.size
     batch_size, input_dim = qkv.shape
     dim = conv_weight.shape[0]
-    packed_qkvz = input_dim != dim
-    if packed_qkvz:
-        assert is_shared and not is_kda and num_spec_tokens == 0
-        assert qkv.dtype == jnp.bfloat16 and input_dim == dim + n_v * d_v
+    packed_qkvz = input_dim == dim + n_v * d_v
     assert conv_weight.shape == (dim, 1, kernel_size)
     if conv_bias is not None:
         assert conv_bias.shape == (dim,)
@@ -527,8 +513,6 @@ def fused_conv1d_gdn(
     act_in_dtype = jnp.dtype(jnp.float32)
 
     num_lanes = pltpu.get_tpu_info().num_lanes
-    packing = 4 // act_in_dtype.itemsize
-    padded_batch_size = pl.cdiv(batch_size, packing) * packing
     decode_tile_size = min(decode_tile_size, batch_size)
     mixed_tile_size = min(mixed_tile_size, batch_size)
     aligned_num_v_heads = pl.cdiv(n_v, num_lanes) * num_lanes
@@ -536,11 +520,12 @@ def fused_conv1d_gdn(
     decode_vmem_limit_bytes = config.GDNConfig.get_vmem_limit_bytes(window_size)
 
     # KDA stays on static tiles until the VMEM estimate models its gate.
-    if envs.TPU_ENABLE_GDN_DYNAMIC_TILING and not is_kda:
+    use_dynamic_tiling = envs.TPU_ENABLE_GDN_DYNAMIC_TILING and not is_kda
+    if use_dynamic_tiling:
         decode_tile_size, mixed_tile_size = tiling.get_tile_sizes(
             batch_size=batch_size,
             num_seqs=num_seqs,
-            padded_batch_size=padded_batch_size,
+            padded_batch_size=batch_size,
             n_kq=n_kq,
             n_v=n_v,
             d_k=d_k,
@@ -553,6 +538,7 @@ def fused_conv1d_gdn(
             decode_vmem_limit_bytes=decode_vmem_limit_bytes,
             mixed_vmem_limit_bytes=config.GDNConfig.get_vmem_limit_bytes(),
             window_size=window_size,
+            mixed_tile_size=mixed_tile_size if batched_only else None,
         )
         logger.info_once(
             "GDN dynamic tiling: num_seqs=%d batch=%d window=%d -> T=%d C=%d",
@@ -586,16 +572,37 @@ def fused_conv1d_gdn(
             1, min(decode_tile_size, spec_tile_budget // bytes_per_seq)
         )
 
+    if packed_qkvz and not use_dynamic_tiling and not batched_only:
+        mixed_tile_size = tiling.calculate_mixed_tile_size(
+            seq_len=batch_size,
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            conv_state_dim_size=dim,
+            act_out_dtype=act_out_dtype,
+            recurrent_state_dtype=recurrent_dtype,
+            num_lanes=num_lanes,
+            vmem_capacity_limit_bytes=config.GDNConfig.get_vmem_limit_bytes(),
+            kernel_size=kernel_size,
+            preferred_tile_size=mixed_tile_size,
+        )
+
     if num_spec_tokens > 0 and is_kda:
         # KDA verify keeps one sequence per tile until multi-sequence KDA
         # verify tiles are sized by a KDA-aware VMEM estimate.
         decode_tile_size = 1
 
+    # Two BF16 input buffers and one FP32 scratch tile use the same QKV budget
+    # as the two FP32 input buffers in tiling's estimate.
+    # The full-tile convolution saves its entire history from the current tile.
     packed_prefill_kernel = (
-        fuse_packed_prefill_cast
-        and packed_qkvz
+        packed_qkvz
+        and qkv.dtype == jnp.bfloat16
         and not batched_only
-        and (batch_size, dim, input_dim, mixed_tile_size) == (8192, 10240, 16384, 64)
+        and batch_size >= 4096
+        and mixed_tile_size >= 32
+        and kernel_size - 1 <= mixed_tile_size
     )
     if packed_prefill_kernel:
         # Preserve the baseline BF16 gate projection layout with both
@@ -608,25 +615,20 @@ def fused_conv1d_gdn(
     b = b.astype(jnp.float32)
     a = a.astype(jnp.float32)
 
-    batch_padding_size = padded_batch_size - batch_size
     num_v_padding_size = aligned_num_v_heads - n_v
     # KDA's gate carries d_k channels per value head, so it pads out to a
     # lane multiple of n_v * d_k rather than of n_v.
     gate_dim = n_v * d_k if is_kda else n_v
     gate_padding_size = (pl.cdiv(gate_dim, num_lanes) * num_lanes) - gate_dim
 
-    def prepare_conv_input(activation: jax.Array) -> jax.Array:
-        if packed_qkvz:
-            return conv_input.cast_packed_conv_input(
-                activation, padded_batch_size, dim, distribution
-            )
-        return conv_input.cast_conv_input(activation, padded_batch_size)
+    count = distribution[2]
+    pure_prefill = (distribution[0] == 0) & (count > 0)
 
-    b = jnp.pad(b, ((0, batch_padding_size), (0, num_v_padding_size)))
-    a = jnp.pad(a, ((0, batch_padding_size), (0, gate_padding_size)))
+    b = jnp.pad(b, ((0, 0), (0, num_v_padding_size)))
+    a = jnp.pad(a, ((0, 0), (0, gate_padding_size)))
 
-    b = b.reshape(padded_batch_size, 1, -1)
-    a = a.reshape(padded_batch_size, 1, -1)
+    b = b[:, None, :]
+    a = a[:, None, :]
 
     # TODO(kyuyeunk): Ensure no reshape is needed and convert to assertion.
     conv_state_shape = None
@@ -672,7 +674,7 @@ def fused_conv1d_gdn(
 
         cfg = config.GDNConfig(
             mode=mode,
-            batch_size=padded_batch_size,
+            batch_size=batch_size,
             kernel_size=kernel_size,
             tile_size=tile_size,
             window_size=window_size,
@@ -744,16 +746,11 @@ def fused_conv1d_gdn(
         scratch_shapes = cfg.get_scratch_shape_dict()
         kernel_name = cfg.get_kernel_name()
         if packed_tile:
-            kernel_name += "_packed_tile_cast"
-            if packed_conv_row_tiled:
-                kernel_name += "_row_tiled"
-        conv_out_shape = (
-            (1, cfg.chunk_size, cfg.dim_size)
-            if packed_conv_row_tiled
-            else (1, cfg.chunk_size, 1, cfg.dim_size)
-        )
+            kernel_name += "_packed_tile_cast_row_tiled"
         scratch_shapes["conv_output_scratch_ref"] = (
-            pltpu.VMEM(conv_out_shape, jnp.float32) if packed_tile else None
+            pltpu.VMEM((1, cfg.chunk_size, cfg.dim_size), jnp.float32)
+            if packed_tile
+            else None
         )
         return pl.pallas_call(
             functools.partial(outer_kernel, cfg=cfg),
@@ -792,7 +789,9 @@ def fused_conv1d_gdn(
         raise ValueError("batched_only and prefill_only are mutually exclusive")
 
     def call_standard_path(activation, pool):
-        activation = prepare_conv_input(activation)
+        activation = conv_input.cast_conv_input(
+            activation, qkv_width=dim if packed_qkvz else None
+        )
         out_act, out_states = None, pool
         if not prefill_only:
             out_act, out_states = call_kernel(
@@ -805,28 +804,13 @@ def fused_conv1d_gdn(
         return out_act, out_states
 
     if packed_prefill_kernel:
-        count = distribution[2]
         active = jnp.arange(num_seqs) < count
         starts, ends = query_start_loc[:-1], query_start_loc[1:]
         aligned = jnp.all(
-            ~active
-            | (
-                (starts >= 0)
-                & (ends <= batch_size)
-                & (ends > starts)
-                & (starts % mixed_tile_size == 0)
-                & (ends % mixed_tile_size == 0)
-            )
-        )
-        use_packed = (
-            aligned
-            & (distribution[0] == 0)
-            & (distribution[1] == 0)
-            & (count > 0)
-            & (count <= num_seqs)
+            ~active | ((starts % mixed_tile_size == 0) & (ends % mixed_tile_size == 0))
         )
         out_act, out_states = jax.lax.cond(
-            use_packed,
+            pure_prefill & aligned,
             lambda activation, pool: call_kernel(
                 activation, pool, None, config.GDNMode.PER_SEQ
             ),
@@ -837,7 +821,7 @@ def fused_conv1d_gdn(
     else:
         out_act, out_states = call_standard_path(qkv, states)
 
-    out_act = out_act.reshape(padded_batch_size, -1)[:batch_size]
+    out_act = out_act.reshape(batch_size, -1)
     # TODO(kyuyeunk): Ensure no reshape is needed and convert to assertion.
     if conv_state_shape is not None:
         out_states = (out_states[0].reshape(conv_state_shape), out_states[1])

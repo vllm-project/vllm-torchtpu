@@ -19,6 +19,14 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu.kernels.gdn.v3 import config, memory_ref
 
 
+def _validate_head_dim(head_dim: int, num_lanes: int) -> None:
+    if head_dim < num_lanes or head_dim % num_lanes:
+        raise ValueError(
+            f"GDN head width {head_dim} must be a positive multiple "
+            f"of the loader lane count {num_lanes}"
+        )
+
+
 def load_strided_heads(
     vmem_ref: jax.Ref, num_heads: int, head_dim: int, lane_offset: int = 0
 ) -> jax.Array:
@@ -35,11 +43,7 @@ def load_strided_heads(
         [num_heads, chunk_size, head_dim]
     """
     num_lanes = pltpu.get_tpu_info().num_lanes
-    if head_dim < num_lanes or head_dim % num_lanes:
-        raise ValueError(
-            f"Strided GDN head width {head_dim} must be a positive multiple "
-            f"of the loader lane count {num_lanes}"
-        )
+    _validate_head_dim(head_dim, num_lanes)
     lanes_per_col = vmem_ref.shape[-1] // num_lanes
     lanes_per_head = head_dim // num_lanes
 
@@ -100,7 +104,9 @@ def load_row_tiled_heads(
     vmem_ref: jax.Ref, num_heads: int, head_dim: int, lane_offset: int = 0
 ) -> jax.Array:
     """Load heads from an FP32 row-tiled [tokens, channels] ref."""
-    offset = lane_offset * pltpu.get_tpu_info().num_lanes
+    num_lanes = pltpu.get_tpu_info().num_lanes
+    _validate_head_dim(head_dim, num_lanes)
+    offset = lane_offset * num_lanes
     return jnp.stack(
         [
             vmem_ref[:, offset + h * head_dim : offset + (h + 1) * head_dim]

@@ -18,7 +18,10 @@ import pytest
 
 
 @pytest.mark.parametrize("lanes,head_dim", [(128, 64), (128, 192), (64, 32)])
-def test_strided_loader_rejects_partial_lane_heads(monkeypatch, lanes, head_dim):
+@pytest.mark.parametrize("row_tiled", [False, True])
+def test_head_loader_rejects_partial_lane_heads(
+    monkeypatch, lanes, head_dim, row_tiled
+):
     from types import SimpleNamespace
 
     from vllm_torchtpu.kernels.gdn.v3 import vmem_ldst
@@ -29,21 +32,24 @@ def test_strided_loader_rejects_partial_lane_heads(monkeypatch, lanes, head_dim)
     import jax
     from jax.experimental import pallas as pl
 
+    loader = (
+        vmem_ldst.load_row_tiled_heads if row_tiled else vmem_ldst.load_strided_heads
+    )
+
     def kernel(input_ref, output_ref):
-        output_ref[...] = vmem_ldst.load_strided_heads(
-            input_ref.at[...], num_heads=1, head_dim=head_dim
-        )
+        output_ref[...] = loader(input_ref.at[...], num_heads=1, head_dim=head_dim)
 
     with pytest.raises(ValueError, match=f"loader lane count {lanes}"):
         pl.pallas_call(
             kernel,
             out_shape=jax.ShapeDtypeStruct((1, 1, head_dim), jnp.float32),
             interpret=True,
-        )(jnp.zeros((1, 1, lanes), jnp.float32))
+        )(jnp.zeros((1, lanes) if row_tiled else (1, 1, lanes), jnp.float32))
 
 
 @pytest.mark.parametrize("lanes,head_dim", [(128, 128), (128, 256), (64, 64)])
-def test_strided_loader_uses_public_lane_geometry(monkeypatch, lanes, head_dim):
+@pytest.mark.parametrize("row_tiled", [False, True])
+def test_head_loader_uses_public_lane_geometry(monkeypatch, lanes, head_dim, row_tiled):
     from types import SimpleNamespace
 
     import jax
@@ -55,12 +61,15 @@ def test_strided_loader_uses_public_lane_geometry(monkeypatch, lanes, head_dim):
     monkeypatch.setattr(
         vmem_ldst.pltpu, "get_tpu_info", lambda: SimpleNamespace(num_lanes=lanes)
     )
-    values = jnp.arange(3 * 2 * head_dim, dtype=jnp.float32).reshape(3, 1, 2 * head_dim)
+    values = jnp.arange(3 * 2 * head_dim, dtype=jnp.float32).reshape(
+        (3, 2 * head_dim) if row_tiled else (3, 1, 2 * head_dim)
+    )
+    loader = (
+        vmem_ldst.load_row_tiled_heads if row_tiled else vmem_ldst.load_strided_heads
+    )
 
     def kernel(input_ref, output_ref):
-        output_ref[...] = vmem_ldst.load_strided_heads(
-            input_ref.at[...], num_heads=2, head_dim=head_dim
-        )
+        output_ref[...] = loader(input_ref.at[...], num_heads=2, head_dim=head_dim)
 
     actual = pl.pallas_call(
         kernel,

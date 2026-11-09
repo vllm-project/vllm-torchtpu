@@ -213,8 +213,10 @@ def calculate_mixed_tile_size(
     num_lanes: int,
     vmem_capacity_limit_bytes: int,
     kernel_size: int = 4,
+    *,
+    preferred_tile_size: int | None = None,
 ) -> int:
-    """Largest prefill chunk whose VMEM estimate fits the limit.
+    """Largest prefill chunk whose VMEM estimate fits the limit, or 1.
 
     Searches candidate tile sizes within maximum VMEM capacity limits.
 
@@ -230,9 +232,10 @@ def calculate_mixed_tile_size(
       num_lanes: Number of lanes for TPU vector layout alignment.
       vmem_capacity_limit_bytes: Maximum allowed VMEM capacity in bytes.
       kernel_size: 1D convolution kernel window size.
+      preferred_tile_size: Try this chunk first, then smaller candidates.
 
     Returns:
-      Derived chunk tile size fitting within VMEM capacity limits.
+      Largest fitting candidate, or 1 when none fit the VMEM estimate.
     """
     # Return a minimum valid chunk size of 1 for empty or zero-length sequences.
     if seq_len <= 0:
@@ -241,9 +244,13 @@ def calculate_mixed_tile_size(
     act_out_bytes = jnp.dtype(act_out_dtype).itemsize
     rec_state_bytes = jnp.dtype(recurrent_state_dtype).itemsize
 
-    # Select the largest candidate chunk (up to 128 tokens) that fits in VMEM.
+    # Dynamic chunks are bounded by the largest tuned candidate.
     prefill_candidates = [c for c in MIXED_TILE_SIZES if c <= seq_len]
-    mixed_tile_size = prefill_candidates[-1]
+    if preferred_tile_size is not None:
+        preferred_tile_size = max(1, min(preferred_tile_size, seq_len))
+        prefill_candidates = [preferred_tile_size] + [
+            c for c in prefill_candidates if c < preferred_tile_size
+        ]
     for candidate in prefill_candidates:
         vmem_est = get_vmem_estimate_bytes(
             tile_b=1,
@@ -262,7 +269,7 @@ def calculate_mixed_tile_size(
         if vmem_est <= vmem_capacity_limit_bytes:
             return candidate
 
-    return mixed_tile_size
+    return 1
 
 
 def get_tile_sizes(

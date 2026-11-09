@@ -26,27 +26,26 @@ from vllm_torchtpu.kernels.gdn.v3.conv_input import cast_conv_input
 
 
 @pytest.mark.parametrize(
-    "tokens,width,padded",
+    "tokens,width",
     [
-        (128, 128, 128),
-        (256, 256, 256),
-        (8, 384, 8),
-        (16, 384, 16),
-        (9, 384, 15),
-        (63, 257, 65),
-        (64, 512, 64),
-        (96, 512, 96),
-        (17, 128, 18),
-        (1, 129, 1),
-        (0, 128, 0),
-        (129, 129, 257),
-        (127, 255, 128),
-        (0, 129, 128),
-        (17, 0, 32),
+        (128, 128),
+        (256, 256),
+        (8, 384),
+        (16, 384),
+        (9, 384),
+        (63, 257),
+        (64, 512),
+        (96, 512),
+        (17, 128),
+        (1, 129),
+        (0, 128),
+        (129, 129),
+        (127, 255),
+        (17, 0),
     ],
 )
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16, jnp.float32])
-def test_cast_layout_and_fallback(monkeypatch, tokens, width, padded, dtype):
+def test_cast_layout_and_fallback(monkeypatch, tokens, width, dtype):
     if jax.default_backend() == "cpu":
         info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
         monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
@@ -58,9 +57,8 @@ def test_cast_layout_and_fallback(monkeypatch, tokens, width, padded, dtype):
     )
     raw = jnp.asarray(data, dtype)
     before = np.asarray(raw).copy()
-    expected = np.zeros((padded, 1, width), np.float32)
-    expected[:tokens, 0] = np.asarray(raw, np.float32)
-    actual = cast_conv_input(raw, padded)
+    expected = np.asarray(raw, np.float32)[:, None, :]
+    actual = cast_conv_input(raw)
     assert actual.dtype == jnp.float32
     np.testing.assert_array_equal(
         np.asarray(actual).view(np.uint32), expected.view(np.uint32)
@@ -80,12 +78,12 @@ def test_float16_uses_original_cast(monkeypatch):
 
     monkeypatch.setattr(pl, "pallas_call", unexpected_kernel)
     raw = jnp.ones((128, 128), dtype=jnp.float16)
-    actual = cast_conv_input(raw, 128)
+    actual = cast_conv_input(raw)
     np.testing.assert_array_equal(np.asarray(actual), np.ones((128, 1, 128)))
 
 
-@pytest.mark.parametrize("tokens,padded", [(8, 8), (9, 15), (16, 16)])
-def test_packed_prefix_keeps_row_stride_and_zero_tail(monkeypatch, tokens, padded):
+@pytest.mark.parametrize("tokens", [8, 9, 16])
+def test_packed_prefix_keeps_row_stride(monkeypatch, tokens):
     if jax.default_backend() == "cpu":
         info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
         monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
@@ -97,17 +95,11 @@ def test_packed_prefix_keeps_row_stride_and_zero_tail(monkeypatch, tokens, padde
     data[:, prefix:] = np.nan
     raw = jnp.asarray(data, jnp.bfloat16)
     before = np.asarray(raw).copy()
-    expected = np.zeros((padded, 1, prefix), np.float32)
-    expected[:tokens, 0] = np.asarray(raw[:, :prefix], np.float32)
-    actual = cast_conv_input(raw, padded, qkv_width=prefix)
+    expected = np.asarray(raw[:, :prefix], np.float32)[:, None, :]
+    actual = cast_conv_input(raw, qkv_width=prefix)
     np.testing.assert_array_equal(
         np.asarray(actual).view(np.uint32), expected.view(np.uint32)
     )
     np.testing.assert_array_equal(
         np.asarray(raw).view(np.uint16), before.view(np.uint16)
     )
-
-
-def test_padding_cannot_drop_input_tokens():
-    with pytest.raises(ValueError, match="cover every input token"):
-        cast_conv_input(jnp.ones((17, 129), jnp.bfloat16), 16)

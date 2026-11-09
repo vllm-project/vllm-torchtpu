@@ -970,6 +970,62 @@ class TestVllmGatedDeltaNetAttention:
 
         assert torch.all(output == 5)
 
+    @pytest.mark.parametrize(
+        ("dtype", "tp_size", "num_spec", "expect_packed"),
+        [
+            (torch.bfloat16, 1, 0, True),
+            (torch.float32, 1, 0, True),
+            (torch.bfloat16, 2, 0, False),
+            (torch.bfloat16, 1, 1, False),
+        ],
+    )
+    @patch(
+        "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op.get_forward_context"
+    )
+    def test_forward_passes_packed_qkvz_to_supported_pooled_calls(
+        self, mock_get_forward_context, dtype, tp_size, num_spec, expect_packed
+    ):
+        attn = _qwen38_gdn_attn("test_layer", tp_size=tp_size)
+        attn.num_spec = num_spec
+        attn.value_dim = attn.num_v_heads * attn.head_v_dim
+        attn._pcp_streaming_configured = False
+        attn._bm_kernel = False
+        attn.kv_cache = (torch.ones(1),)
+        v_heads = attn.num_v_heads // tp_size
+        qkv_width = attn.tp_head_geometry.local_conv_dim(
+            attn.head_k_dim, attn.head_v_dim
+        )
+        z_width = v_heads * attn.head_v_dim
+        projection = torch.randn((2, qkv_width + z_width), dtype=dtype)
+        attn.in_proj_qkvz = MagicMock(return_value=(projection, None))
+        attn.in_proj_ba = MagicMock(return_value=(torch.zeros((2, 2 * v_heads)), None))
+        attn.conv1d.weight = torch.zeros((qkv_width, 1, attn.conv_kernel_size))
+        attn.A_log = torch.zeros(v_heads)
+        attn.dt_bias = torch.zeros(v_heads)
+        attn.gdn_pooled_op = MagicMock(
+            return_value=torch.zeros((2, v_heads, attn.head_v_dim))
+        )
+        attn.norm = MagicMock(side_effect=lambda out, z: out)
+        attn.out_proj = MagicMock(side_effect=lambda out: (out, None))
+        metadata = SimpleNamespace(
+            mamba_state_indices=torch.tensor([1], dtype=torch.int32),
+            mamba_slot_read_offsets=torch.zeros(2, dtype=torch.int32),
+            query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
+            request_distribution=torch.tensor([0, 0, 1], dtype=torch.int32),
+            seq_lens=torch.tensor([2], dtype=torch.int32),
+        )
+        mock_get_forward_context.return_value = SimpleNamespace(
+            attn_metadata={attn.prefix: metadata}
+        )
+
+        attn.forward(torch.zeros((2, 64), dtype=dtype))
+
+        passed_qkv = attn.gdn_pooled_op.call_args.args[0]
+        expected = projection if expect_packed else projection[:, :qkv_width]
+        torch.testing.assert_close(passed_qkv, expected)
+        expected_z = projection[:, qkv_width:].reshape(2, v_heads, attn.head_v_dim)
+        torch.testing.assert_close(attn.norm.call_args.args[1], expected_z)
+
     @patch(
         "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op.get_forward_context"
     )

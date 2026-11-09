@@ -24,6 +24,7 @@ Timings print (use `-s`); the ratio is the assertion.
 """
 
 import functools
+import re
 import time
 
 import jax
@@ -197,6 +198,163 @@ def _benchmark_pooled_five(pool, qkv, b, a, conv_weight, conv_bias, a_log, dt_bi
 
 def _block_until_ready(tree):
     return jax.tree.map(lambda x: x.block_until_ready(), tree)
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize(
+    (
+        "n_kq",
+        "n_v",
+        "d_k",
+        "d_v",
+        "kernel_size",
+        "state_dtype",
+        "tile_rows",
+        "dynamic_tiling",
+        "expect_packed",
+        "input_dtype",
+    ),
+    [
+        (16, 96, 128, 128, 4, jnp.bfloat16, 32, True, True, jnp.bfloat16),
+        (16, 32, 128, 128, 4, jnp.float32, 128, True, True, jnp.bfloat16),
+        (8, 8, 128, 128, 4, jnp.bfloat16, 128, True, True, jnp.bfloat16),
+        (4, 8, 384, 128, 9, jnp.bfloat16, 128, True, True, jnp.bfloat16),
+        (4, 8, 384, 128, 9, jnp.bfloat16, 64, False, True, jnp.bfloat16),
+        (4, 8, 128, 128, 66, jnp.bfloat16, 64, False, False, jnp.bfloat16),
+        (16, 48, 128, 128, 4, jnp.float32, 64, False, False, jnp.float32),
+    ],
+)
+def test_pooled_packed_prefill_fuses_with_tiling(
+    monkeypatch,
+    n_kq,
+    n_v,
+    d_k,
+    d_v,
+    kernel_size,
+    state_dtype,
+    tile_rows,
+    dynamic_tiling,
+    expect_packed,
+    input_dtype,
+):
+    if jax.devices()[0].device_kind != "TPU7x":
+        pytest.skip("These dynamic tile sizes are validated on TPU v7x.")
+    monkeypatch.setattr(wrapper.envs, "TPU_ENABLE_GDN_DYNAMIC_TILING", dynamic_tiling)
+    monkeypatch.setattr(gdn_attention.envs, "VLLM_KV_CACHE_LAYOUT", "NHD")
+    # The tiling env is captured by the wrapper when JAX traces it.
+    jax.clear_caches()
+    tokens = 4096
+    qkv_dim = 2 * n_kq * d_k + n_v * d_v
+    keys = iter(jax.random.split(jax.random.key(38), 4))
+    qkvz = jax.random.normal(
+        next(keys), (tokens, qkv_dim + n_v * d_v), dtype=input_dtype
+    ) * input_dtype(0.1)
+    b, a = [
+        jax.random.normal(next(keys), (tokens, n_v), dtype=jnp.bfloat16)
+        for _ in range(2)
+    ]
+    weights = jax.random.normal(next(keys), (qkv_dim, 1, kernel_size)) * 0.1
+    state_bytes = n_v * d_k * d_v * jnp.dtype(state_dtype).itemsize
+    conv_bytes = (kernel_size - 1) * qkv_dim * 4
+    pool_rows = (state_bytes + conv_bytes + 511) // 512
+
+    @jax.jit(donate_argnums=(1,))
+    def run(activation, pool, b, a, weights, query_start_loc, distribution, seq_lens):
+        return gdn_attention.run_jax_gdn_attention_pooled_local(
+            activation,
+            b,
+            a,
+            pool,
+            weights,
+            None,
+            jnp.zeros(n_v),
+            jnp.zeros(n_v),
+            query_start_loc,
+            jnp.array([1, 2], dtype=jnp.int32),
+            distribution,
+            seq_lens,
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            kernel_size=kernel_size,
+            pool_block_tokens=pool_rows,
+            recurrent_state_dtype=state_dtype,
+        )
+
+    def args(activation, starts, distribution, has_initial_state, pool_dtype):
+        words = np.zeros((3, pool_rows * 128), dtype=np.uint32)
+        if has_initial_state:
+            rng = np.random.default_rng(327)
+            recurrent = rng.uniform(-0.1, 0.1, (2, n_v, d_k, d_v)).astype(state_dtype)
+            if state_dtype == jnp.bfloat16:
+                bits = recurrent.view(np.uint16).astype(np.uint32)
+                recurrent_words = bits[..., ::2, :] | (
+                    bits[..., 1::2, :] << np.uint32(16)
+                )
+            else:
+                recurrent_words = recurrent.view(np.uint32)
+            conv = rng.uniform(-0.1, 0.1, (2, kernel_size - 1, qkv_dim)).astype(
+                np.float32
+            )
+            rec_end = state_bytes // 4
+            words[1:, :rec_end] = recurrent_words.reshape(2, -1)
+            words[1:, rec_end : rec_end + conv_bytes // 4] = conv.view(
+                np.uint32
+            ).reshape(2, -1)
+        # Ref bitcasts pack the pool's second-minor axis into uint32 words.
+        pool = np.ascontiguousarray(
+            np.moveaxis(words.reshape(3, pool_rows, 1, 128, 1).view(np.int8), -1, -2)
+        )
+        pool = jax.device_put(pool.view(np.dtype(pool_dtype)))
+        seq_lens = np.diff(starts) + int(has_initial_state)
+        return (
+            activation,
+            pool,
+            b,
+            a,
+            weights,
+            jnp.array(starts, dtype=jnp.int32),
+            jnp.array(distribution, dtype=jnp.int32),
+            jnp.array(seq_lens, dtype=jnp.int32),
+        )
+
+    for pool_dtype in (jnp.int8, jnp.float8_e4m3fn):
+        packed_args = args(qkvz, [0, tokens, tokens], [0, 0, 1], False, pool_dtype)
+        packed = run.lower(*packed_args).compile()
+        kernel_names = set(
+            re.findall(
+                r"fused_conv1d_gdn_per_seq_b1_c\d+_packed_tile_cast_row_tiled",
+                packed.as_text(),
+            )
+        )
+        expected_kernel = (
+            f"fused_conv1d_gdn_per_seq_b1_c{tile_rows}_packed_tile_cast_row_tiled"
+        )
+        assert kernel_names == ({expected_kernel} if expect_packed else set())
+        for starts, distribution, has_initial_state in (
+            ([0, tokens, tokens], [0, 0, 1], False),
+            ([0, 2 * tile_rows, tokens], [0, 0, 2], True),
+            ([0, tile_rows + 1, tokens], [0, 0, 2], True),
+            ([0, 1, tokens], [1, 1, 2], True),
+        ):
+            expected_pool, expected = run(
+                *args(
+                    qkvz[:, :qkv_dim],
+                    starts,
+                    distribution,
+                    has_initial_state,
+                    pool_dtype,
+                )
+            )
+            actual_pool, actual = packed(
+                *args(qkvz, starts, distribution, has_initial_state, pool_dtype)
+            )
+            np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+            np.testing.assert_array_equal(
+                np.asarray(actual_pool).view(np.uint8),
+                np.asarray(expected_pool).view(np.uint8),
+            )
 
 
 def _time_five_steps(run, make_args):

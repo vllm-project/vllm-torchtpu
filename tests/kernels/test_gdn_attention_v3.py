@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 import sys
 from unittest import mock
 
@@ -26,7 +27,13 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import AbstractDevice, AbstractMesh, use_abstract_mesh
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.kernels.gdn.v3 import compute_gdn, config, tiling, wrapper
+from vllm_torchtpu.kernels.gdn.v3 import (
+    compute_gdn,
+    config,
+    memory_ref,
+    tiling,
+    wrapper,
+)
 
 
 def _l2_normalize(x: jnp.ndarray, eps: float = 1e-6) -> jnp.ndarray:
@@ -282,6 +289,55 @@ def gdn_attention_spec_ref(
 class GDNAttentionTileSelectionTest(parameterized.TestCase):
     """Selects optimal (decode_tile, mixed_tile) across Qwen3.5-397B parallelisms."""
 
+    @parameterized.named_parameters(
+        ("dynamic", None, 128, 128),
+        ("static_fits", 64, 128, 64),
+        ("static_non_power_of_two", 96, 128, 96),
+        ("static_shrinks", 64, 32, 32),
+    )
+    def test_prefill_tile_respects_vmem_budget(self, preferred, budget_tile, expected):
+        geometry = dict(
+            n_kq=4,
+            n_v=8,
+            d_k=128,
+            d_v=128,
+            kernel_size=4,
+            conv_state_dim_size=(2 * 4 + 8) * 128,
+            num_lanes=128,
+        )
+        limit = tiling.get_vmem_estimate_bytes(
+            tile_b=1,
+            chunk_sz=budget_tile,
+            act_out_bytes=2,
+            rec_state_bytes=2,
+            **geometry,
+        )
+        actual = tiling.calculate_mixed_tile_size(
+            seq_len=4096,
+            act_out_dtype=jnp.bfloat16,
+            recurrent_state_dtype=jnp.bfloat16,
+            vmem_capacity_limit_bytes=limit,
+            preferred_tile_size=preferred,
+            **geometry,
+        )
+        self.assertEqual(actual, expected)
+
+    def test_prefill_tile_falls_back_to_one_when_estimate_exceeds_budget(self):
+        actual = tiling.calculate_mixed_tile_size(
+            seq_len=4096,
+            n_kq=4,
+            n_v=8,
+            d_k=128,
+            d_v=128,
+            kernel_size=4,
+            conv_state_dim_size=(2 * 4 + 8) * 128,
+            act_out_dtype=jnp.bfloat16,
+            recurrent_state_dtype=jnp.bfloat16,
+            num_lanes=128,
+            vmem_capacity_limit_bytes=1,
+        )
+        self.assertEqual(actual, 1)
+
     def test_qwen3_5_397b_parallelism_tile_selection(self):
         d_k, d_v, kernel_size = 128, 128, 4
         f32 = jnp.dtype(jnp.float32)
@@ -390,7 +446,63 @@ class GDNAttentionTileSelectionTest(parameterized.TestCase):
 class GDNStatePipelineRaceTest(parameterized.TestCase):
     """CPU interpret-mode checks of the state DMA pipeline."""
 
-    def test_state_pipeline_has_no_dma_race(self):
+    @parameterized.named_parameters(
+        ("dense_separate_pool_sizes", False, 4),
+        ("pooled_long_history", True, 66),
+    )
+    def test_conv_state_traces(self, packed, kernel_size):
+        shape = jax.ShapeDtypeStruct
+        tokens = 4096 if packed else 32
+        states = (
+            shape((3, kernel_size - 1, 512), jnp.float32),
+            shape((2, 2, 128, 128), jnp.float32),
+        )
+        if packed:
+            granules = (2 * 128 * 128 + (kernel_size - 1) * 512) // 128
+            states = shape((2, granules, 1, 128), jnp.uint32)
+        mesh = AbstractMesh(
+            (), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu")
+        )
+        with (
+            use_abstract_mesh(mesh),
+            mock.patch.object(envs, "TPU_ENABLE_GDN_DYNAMIC_TILING", False),
+        ):
+            out_states, output = jax.eval_shape(
+                functools.partial(
+                    wrapper.fused_conv1d_gdn,
+                    n_kq=1,
+                    n_v=2,
+                    d_k=128,
+                    d_v=128,
+                    kernel_size=kernel_size,
+                    mixed_tile_size=32,
+                    recurrent_dtype=jnp.float32,
+                    conv_dtype=jnp.float32,
+                ),
+                qkv=shape((tokens, 768 if packed else 512), jnp.bfloat16),
+                b=shape((tokens, 2), jnp.bfloat16),
+                a=shape((tokens, 2), jnp.bfloat16),
+                states=states,
+                conv_weight=shape((512, 1, kernel_size), jnp.float32),
+                conv_bias=None,
+                a_log=shape((2,), jnp.float32),
+                dt_bias=shape((2,), jnp.float32),
+                query_start_loc=shape((2,), jnp.int32),
+                state_indices=shape((1,), jnp.int32),
+                distribution=shape((3,), jnp.int32),
+                seq_lens=shape((1,), jnp.int32),
+            )
+        self.assertEqual(
+            jax.tree.map(lambda value: value.shape, out_states),
+            jax.tree.map(lambda value: value.shape, states),
+        )
+        self.assertEqual(output.shape, (tokens, 256))
+
+    @parameterized.named_parameters(
+        ("dense", False),
+        ("pooled", True),
+    )
+    def test_state_pipeline_has_no_dma_race(self, pooled):
         """Pallas interpret-mode vector-clock detector finds zero DMA races."""
         n_kq, n_v, d_k, d_v, kernel_size = 1, 2, 128, 128, 4
         dim = 2 * n_kq * d_k + n_v * d_v
@@ -416,6 +528,16 @@ class GDNStatePipelineRaceTest(parameterized.TestCase):
         init_rec = jax.random.normal(
             next(rngs), (num_seqs, n_v, d_k, d_v), dtype=jnp.float32
         )
+        states = (init_conv, init_rec)
+        if pooled:
+            states = (
+                jnp.concatenate(
+                    (init_rec.reshape(num_seqs, -1), init_conv.reshape(num_seqs, -1)),
+                    axis=1,
+                )
+                .reshape(num_seqs, -1, 1, 128)
+                .view(jnp.uint32)
+            )
 
         q_loc = jnp.arange(num_seqs + 1, dtype=jnp.int32)
         state_indices = jnp.arange(num_seqs, dtype=jnp.int32)
@@ -433,6 +555,7 @@ class GDNStatePipelineRaceTest(parameterized.TestCase):
         races_per_call: list[bool] = []
         orig_clear = mosaic_interpret._clear_shared_memory
         orig_store = shared_memory.SharedMemory.store_buffer_content
+        orig_granule_view = memory_ref.granule_view
 
         def _record_and_clear():
             races = getattr(mosaic_interpret, "races", None)
@@ -467,11 +590,21 @@ class GDNStatePipelineRaceTest(parameterized.TestCase):
 
         def _store_buffer_content(buf_self, key, rnge, value, *args, **kwargs):
             # Bitcast DMAs move raw bits between equal-width dtypes only.
-            buff_dtype = buf_self.mem[key].dtype
-            assert value.itemsize == buff_dtype.itemsize, (value.dtype, buff_dtype)
-            return orig_store(
-                buf_self, key, rnge, value.view(buff_dtype), *args, **kwargs
-            )
+            buff = buf_self.mem[key]
+            assert value.itemsize == buff.dtype.itemsize, (value.dtype, buff.dtype)
+            value = value.view(buff.dtype).reshape(buff[rnge].shape)
+            return orig_store(buf_self, key, rnge, value, *args, **kwargs)
+
+        def _granule_view(ref, leading_shape):
+            # The pooled HBM fixture is already in granules. Preserve its range
+            # indices rather than applying the dense-state transform shim.
+            if (
+                ref.dtype == jnp.uint32
+                and ref.ndim == len(leading_shape) + 3
+                and ref.shape[-2:] == (1, pltpu.get_tpu_info().num_lanes)
+            ):
+                return ref
+            return orig_granule_view(ref, leading_shape)
 
         mesh = AbstractMesh(
             (), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu")
@@ -483,6 +616,7 @@ class GDNStatePipelineRaceTest(parameterized.TestCase):
                 use_abstract_mesh(mesh),
                 mock.patch.object(envs, "TPU_ENABLE_GDN_DYNAMIC_TILING", False),
                 mock.patch.object(interpret_utils, "to_range", _resolve_to_range),
+                mock.patch.object(memory_ref, "granule_view", _granule_view),
                 mock.patch.object(
                     shared_memory.SharedMemory,
                     "store_buffer_content",
@@ -497,11 +631,11 @@ class GDNStatePipelineRaceTest(parameterized.TestCase):
                     )
                 ),
             ):
-                (conv_out, rec_out), out = wrapper.fused_conv1d_gdn(
+                _, out = wrapper.fused_conv1d_gdn(
                     qkv=qkv,
                     b=b,
                     a=a,
-                    states=(init_conv, init_rec),
+                    states=states,
                     conv_weight=conv_w,
                     conv_bias=conv_b,
                     a_log=a_log,
@@ -515,12 +649,14 @@ class GDNStatePipelineRaceTest(parameterized.TestCase):
                     d_k=d_k,
                     d_v=d_v,
                     kernel_size=kernel_size,
+                    recurrent_dtype=jnp.float32,
+                    conv_dtype=jnp.float32,
                     decode_tile_size=decode_tile,
                     # CPU interpret mode does not support ref.reshape on the C > 1
                     # chunked prefill path; each 1-token prefill is one tile at C = 1.
                     mixed_tile_size=1,
                 )
-                jax.block_until_ready((conv_out, rec_out, out))
+                jax.block_until_ready(out)
             self.assertTrue(races_per_call)
             self.assertFalse(
                 any(races_per_call),

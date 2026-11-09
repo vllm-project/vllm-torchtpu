@@ -1140,6 +1140,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         # Part 1: Input Projection
         # ============================================================
         if hasattr(self, "in_proj_qkv"):
+            mixed_qkvz = None
             mixed_qkv, _ = self.in_proj_qkv(hidden_states)
             ba, _ = self.in_proj_ba(hidden_states)
             z, _ = self.in_proj_z(hidden_states)
@@ -1157,17 +1158,6 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             )
             z_size = self.value_dim // self.tp_size
             mixed_qkv, z = mixed_qkvz.split([qkv_size, z_size], dim=-1)
-            if (
-                kv_cache is not None
-                and len(kv_cache) == 1
-                and self.tp_size == 1
-                and self.num_spec == 0
-                and mixed_qkvz.dtype == torch.bfloat16
-                and (qkv_size, z_size) == (10240, 6144)
-            ):
-                # The pooled wrapper selects the conversion from the runtime
-                # request distribution, since decode can use the same bucket.
-                mixed_qkv = mixed_qkvz
             z = z.reshape(z.size(0), -1, self.head_v_dim)
             b, a = ba.chunk(2, dim=-1)
             b = b.contiguous()
@@ -1192,6 +1182,9 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             )[self.prefix]
 
             if len(kv_cache) == 1:
+                if mixed_qkvz is not None and self.tp_size == 1 and self.num_spec == 0:
+                    # Let the pooled kernel read the QKV prefix from the projection.
+                    mixed_qkv = mixed_qkvz
                 # Unified block pool: the attention-shaped pool carries the
                 # ssm and conv byte-regions; state ids come from the pool
                 # metadata builder.
