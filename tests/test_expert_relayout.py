@@ -704,7 +704,7 @@ def test_direct_staged_next_breaks_single_copy_cycle_and_chains_decode():
         c.after_dispatch()
         tap.advance()
     assert c.generation >= 1
-    assert c._decode_converged is True
+    assert c._converged is True
 
 
 def test_window_deltas_wrap_cleanly_across_int32_overflow():
