@@ -65,6 +65,11 @@ FP4_OUTPUT_CHUNK = 256
 # top rung is always tile_m, so a full tile is unchanged. Overridable per
 # process by MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE, read at BUILD time.
 HEIGHT_RUNGS = 4
+# How many tile heights a build gets whose slab is over the one-tile-per-
+# expert bound while its routed rows are not: the 1,024-token build, whose
+# experts hold about 16 rows each. 2, not HEIGHT_RUNGS: the 4 copies of the
+# FFN body made 2 of 20 layers of that build run at about twice the time.
+SHORT_TILE_RUNGS = 2
 # DMA priority the weight refills take, so that they stay off the in-order
 # queue the token gather issues on.
 WEIGHT_DMA_PRIORITY = 1
@@ -139,6 +144,16 @@ def _apply_act(gate, up, act_fn):
     )
 
 
+def routed_rows_bound(tile_m, rows_alloc, g_local, ep):
+    """The rows a shard's experts can be routed, from its slab size.
+
+    The slab (host.ragged_stride_bound) adds to the routed rows one
+    ROWBLK-alignment pad per expert and one tile-height window that a tail
+    tile reads past the last row. Neither is a row an expert holds.
+    """
+    return rows_alloc - (ROWBLK - 1) * ep * g_local - tile_m
+
+
 def tile_height_rungs(tile_m, rows_alloc, g_local, ep):
     """The ascending static tile heights a build emits, ending at tile_m.
 
@@ -155,15 +170,19 @@ def tile_height_rungs(tile_m, rows_alloc, g_local, ep):
     of every routed row landing on one shard, so `ep` shards' worth of it is
     what a shard's `g_local` experts actually expect to hold.
 
+    The slab adds alignment padding and a tail-read window to the routed
+    rows, so a build can be over that bound by its slab and under it by its
+    routed rows. Such a build gets SHORT_TILE_RUNGS heights.
+
     """
+    one_tile_rows = ep * g_local * tile_m
     rungs = envs.MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE or HEIGHT_RUNGS
+    if rows_alloc > one_tile_rows:
+        if routed_rows_bound(tile_m, rows_alloc, g_local, ep) > one_tile_rows:
+            return (tile_m,)
+        rungs = SHORT_TILE_RUNGS
     step = tile_m // rungs
-    if (
-        rungs < 2
-        or step % ROWBLK
-        or step * rungs != tile_m
-        or rows_alloc > ep * g_local * tile_m
-    ):
+    if rungs < 2 or step % ROWBLK or step * rungs != tile_m:
         return (tile_m,)
     return tuple(range(step, tile_m + 1, step))
 
