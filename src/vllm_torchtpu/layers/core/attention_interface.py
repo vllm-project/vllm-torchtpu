@@ -1202,8 +1202,8 @@ def sparse_mla_attention_dcp(
 
     `merge_epilogue` (TPU_DCP_MERGE_INTERLEAVE; a
     `cp_mla_attention.MergePieceVspace`, with replicated `merge_w_uv`
-    `[H, C, V]` and `merge_w_uv_scale`, a `[1, 1, 1]` placeholder when the
-    epilogue is unscaled): the op also runs the V-space merge and returns
+    `[H, C, V]` and `merge_w_uv_scale`, any array (W_UV again) when the
+    epilogue is unscaled: it is not read): the op also runs the V-space merge and returns
     this rank's merged `[T, H / dcp, V]` in place of the partial (the lse
     stays). On a bucket whose merge pieces are one merge chunk each the kernel
     runs it piece by piece inside its loop (`out_pieces_epilogue`); otherwise

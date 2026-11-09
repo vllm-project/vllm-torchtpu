@@ -2556,7 +2556,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             request_distribution: jax.Array,
             rank_ids: jax.Array,  # i32[dcp], sharded: shard r holds r
             w_uv: jax.Array,  # [H, C, V], replicated
-            w_uv_scale: jax.Array,  # [H, 1, V], or a [1, 1, 1] placeholder
+            w_uv_scale: jax.Array,  # [H, 1, V]; unscaled: W_UV again, unread
         ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
             return _sparse_mla_attention_dcp_run(
                 kv_cache_nope,
@@ -2592,7 +2592,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             rope_table: jax.Array,
             rank_ids: jax.Array,  # i32[dcp], sharded: shard r holds r
             w_uv: jax.Array,  # [H, C, V], replicated
-            w_uv_scale: jax.Array,  # [H, 1, V], or a [1, 1, 1] placeholder
+            w_uv_scale: jax.Array,  # [H, 1, V]; unscaled: W_UV again, unread
         ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
             return _sparse_mla_attention_dcp_run(
                 kv_cache_nope,
@@ -2902,21 +2902,18 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
 
         sparse_mla_jax_op.register_fake(_fake_sparse_mla_dcp)
 
-        # The unscaled epilogue never reads its scale operand: a placeholder,
-        # built here (model build), outside any trace.
-        merge_scale_placeholder = (
-            layer.W_UV_dcp_qrep.new_zeros((1, 1, 1))
-            if merge_interleave and not merge_scaled
-            else None
-        )
-
         def merge_operands() -> tuple[torch.Tensor, ...]:
+            # Only layer buffers every bucket's trace already lifts (forward's
+            # `_retain_buffers`): a fresh tensor here would be a graph input of
+            # the interleaved buckets alone, and the shape-variant compile
+            # refuses traces whose inputs differ (j-cf682422). Unscaled, the
+            # scale slot repeats W_UV, which the epilogue never reads.
             if not merge_interleave:
                 return ()
             scale = layer.W_UV_dcp_qrep_scale
             return (
                 layer.W_UV_dcp_qrep,
-                merge_scale_placeholder if scale is None else scale,
+                layer.W_UV_dcp_qrep if scale is None else scale,
             )
 
         def sparse_mla_dcp_impl(
@@ -3320,6 +3317,13 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 out_proj.transpose(0, 1)
                 .to(input_dtype)
                 .reshape(-1, layer.num_heads * layer.v_head_dim)
+            )
+        if getattr(layer, "sparse_mla_dcp_mil_op", None) is not None:
+            # TPU_DCP_MERGE_INTERLEAVE: the interleaved buckets' op takes
+            # W_UV_dcp_qrep (+ scale); every other bucket lifts the same
+            # buffers, so all buckets' traces take one input set.
+            outputs = _retain_buffers(
+                outputs, layer.W_UV_dcp_qrep, layer.W_UV_dcp_qrep_scale
             )
         if envs.TPU_DCP_MLA_UV_BEFORE_MERGE_MIN_TOKENS > 0 and (
             getattr(layer, "W_UV_dcp_qrep", None) is not None
