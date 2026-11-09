@@ -4177,6 +4177,7 @@ def sparse_ragged_paged_attention(
     for i in range(num_chunks):
         start_pos = i * gather_and_attention_chunk_size
         out_piece = None
+        offset = 0
         piece_lse = lse
         if piece_rows:
             if gather_first and i == chunks_per_piece and i < num_chunks:
@@ -4193,7 +4194,7 @@ def sparse_ragged_paged_attention(
                 piece_lse = piece_lses.pop()
                 carried = piece_outs.pop()
             out_piece = (piece_rows, offset, carried)
-        extra = {"out_piece": out_piece}
+        extra: dict[str, Any] = {"out_piece": out_piece}
         if pre[i] is not None:
             extra["pre_gathered"] = pre[i]
         if (
