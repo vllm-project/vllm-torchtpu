@@ -62,6 +62,15 @@ CASES += [
     for option in ("row_gather", "row_scatter", "row_copy")
     for combine in ("owner", "streamed")
 ]
+# The one-shot routing all-gather moves the same words, alone and with the
+# served options.
+OPTIONS["routing_dma"] = dict(routing_dma=True)
+OPTIONS["routing_dma_served"] = dict(
+    sorted_plan=True, row_gather=True, row_scatter=True, routing_dma=True
+)
+CASES += [("routing_dma", "owner")] + [
+    ("routing_dma_served", combine) for combine in ("owner", "streamed")
+]
 
 
 def _routing(rng, dp_size, num_tokens, num_experts, topk, skew):
