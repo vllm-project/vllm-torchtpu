@@ -16,6 +16,7 @@ import contextlib
 import copy
 import inspect
 import weakref
+from collections import defaultdict
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -69,6 +70,10 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
 )
 
 
+def _warmup_requests():
+    return defaultdict(lambda: SimpleNamespace(output_token_ids=[]))
+
+
 def test_idle_dp_rank_encodes_before_decoder_pairing():
     order = []
     runner = SimpleNamespace(
@@ -119,6 +124,7 @@ def test_spec_warmup_request_counts_blocks_in_block_table_units(
         sample_tokens=lambda _: None,
         take_draft_token_ids=lambda: None,
         _warmup_spec_decode_cleanup=lambda rids: True,
+        requests=_warmup_requests(),
     )
 
     assert TPUModelRunner._warmup_one_spec_request(runner, 8192, idx=0)
@@ -657,6 +663,7 @@ def test_spec_batch_warmup_holds_at_most_max_num_seqs_requests(R):
         sample_tokens=lambda _: None,
         take_draft_token_ids=lambda: None,
         _warmup_spec_decode_cleanup=lambda rids: True,
+        requests=_warmup_requests(),
     )
 
     TPUModelRunner._warmup_spec_batch(runner, R, 16, short=True, mixed=True)
@@ -664,6 +671,36 @@ def test_spec_batch_warmup_holds_at_most_max_num_seqs_requests(R):
     # Each mixed variant that fits ran: the peak is R decoders plus two
     # prefills, capped at max_num_seqs, so a swallowed failure shows here too.
     assert max(sizes) == min(R + 2, 4)
+
+
+def test_spec_warmup_keeps_optimistic_output_placeholders():
+    captured = []
+    requests = _warmup_requests()
+    spec = SimpleNamespace(max_num_blocks_per_req=lambda _config, _max_pos: 1)
+
+    def execute_model(so):
+        if so.scheduled_cached_reqs.req_ids:
+            captured.append(list(so.scheduled_cached_reqs.num_output_tokens))
+        rid = "__spec_warmup_0__"
+        requests[rid].output_token_ids.extend([0] * 8)
+
+    runner = SimpleNamespace(
+        max_model_len=256,
+        speculative_config=SimpleNamespace(num_speculative_tokens=7),
+        kv_cache_config=SimpleNamespace(
+            num_blocks=4096, kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec)]
+        ),
+        vllm_config=SimpleNamespace(),
+        execute_model=execute_model,
+        sample_tokens=lambda _: None,
+        take_draft_token_ids=lambda: None,
+        _warmup_spec_decode_cleanup=lambda rids: True,
+        requests=requests,
+    )
+
+    assert TPUModelRunner._warmup_one_spec_request(runner, 1, idx=0)
+
+    assert captured == [[8 * (t + 1)] for t in range(9)]
 
 
 def test_mtp_prefill_warmup_retries_each_bucket_without_a_pipeline():
@@ -976,6 +1013,9 @@ def test_no_forward_output_preserves_invalid_block_ids():
             )
         ),
     )
+    runner._build_kv_connector_output = (
+        TPUModelRunner._build_kv_connector_output.__get__(runner)
+    )
     scheduler_output = SimpleNamespace()
     vllm_config = SimpleNamespace()
 
@@ -994,7 +1034,30 @@ def test_no_forward_output_preserves_invalid_block_ids():
         assert output.kv_connector_output.invalid_block_group_index == 2
 
 
-def test_build_kv_connector_output_omits_unsupported_group_index():
+def test_no_forward_output_is_empty_without_transfers():
+    # What get_finished_kv_transfers returns when nothing finished.
+    runner = SimpleNamespace(
+        maybe_setup_kv_connector=MagicMock(),
+        get_finished_kv_transfers=MagicMock(
+            return_value=(None, None, set(), None, set(), None, None)
+        ),
+    )
+    runner._build_kv_connector_output = (
+        TPUModelRunner._build_kv_connector_output.__get__(runner)
+    )
+
+    with patch(
+        "vllm_torchtpu.runner.tpu_runner.dist_utils.get_raiden_inline_load",
+        return_value=False,
+    ):
+        output = TPUModelRunner.kv_connector_no_forward(
+            runner, SimpleNamespace(), SimpleNamespace()
+        )
+
+    assert output is tpu_runner.EMPTY_MODEL_RUNNER_OUTPUT
+
+
+def test_make_kv_connector_output_omits_unsupported_group_index():
     with (
         patch.object(
             tpu_runner,
@@ -1003,7 +1066,7 @@ def test_build_kv_connector_output_omits_unsupported_group_index():
         ),
         patch.object(tpu_runner, "KVConnectorOutput") as output_cls,
     ):
-        tpu_runner._build_kv_connector_output(
+        tpu_runner._make_kv_connector_output(
             finished_sending={"sent"},
             finished_recving=None,
             failed_recving=set(),
@@ -1022,13 +1085,13 @@ def test_build_kv_connector_output_omits_unsupported_group_index():
     )
 
 
-def test_build_kv_connector_output_forwards_invalid_block_ids_for_hybrid_recovery():
+def test_make_kv_connector_output_forwards_invalid_block_ids_for_hybrid_recovery():
     with patch.object(
         tpu_runner,
         "_KV_CONNECTOR_OUTPUT_SUPPORTS_INVALID_BLOCK_GROUP",
         False,
     ):
-        out = tpu_runner._build_kv_connector_output(
+        out = tpu_runner._make_kv_connector_output(
             finished_sending=None,
             finished_recving={"failed-load"},
             failed_recving=set(),
@@ -2887,6 +2950,7 @@ class TestInputStagingFence:
             _has_mamba_state=False,
             mamba_slot_read_offsets=None,
             _mamba_ckpt_window=1,
+            _prefill_ckpt_units=None,
             _unified_kv_layout=False,
             empty_slot_mappings={},
             position_ids=torch.zeros(64, dtype=torch.int32),
@@ -3311,6 +3375,7 @@ def test_relayout_tables_reaches_the_draft_model(monkeypatch):
     """
     from vllm_torchtpu import envs
 
+    monkeypatch.setattr(envs, "TPU_ROPE_CACHE_TRUNCATE", True)
     monkeypatch.setattr(envs, "TPU_ROPE_CACHE_ROW_MAJOR", True)
     monkeypatch.setattr(envs, "TPU_MOE_HASH_TABLE_ROW_MAJOR", True)
     seen = []
@@ -3325,14 +3390,22 @@ def test_relayout_tables_reaches_the_draft_model(monkeypatch):
         lambda model: seen.append(("hash", model)),
     )
     runner = MagicMock(spec=TPUModelRunner)
+    runner._truncate_rope_caches.side_effect = lambda model: seen.append(
+        ("truncate", model)
+    )
     draft_model = object()
 
     TPUModelRunner._relayout_tables(runner, draft_model)
-    assert seen == [("rope", draft_model), ("hash", draft_model)]
+    assert seen == [
+        ("truncate", draft_model),
+        ("rope", draft_model),
+        ("hash", draft_model),
+    ]
 
     # No draft (ngram) or flags off: nothing to relayout.
     seen.clear()
     TPUModelRunner._relayout_tables(runner, None)
+    monkeypatch.setattr(envs, "TPU_ROPE_CACHE_TRUNCATE", False)
     monkeypatch.setattr(envs, "TPU_ROPE_CACHE_ROW_MAJOR", False)
     monkeypatch.setattr(envs, "TPU_MOE_HASH_TABLE_ROW_MAJOR", False)
     TPUModelRunner._relayout_tables(runner, draft_model)
@@ -3631,6 +3704,7 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
             _is_dspark_pd_producer=False,
             _fence_spec_kv_under_token_copy=False,
             _min_tokens_batch_state=lambda: {},
+            _adaptive_verification=None,
             is_pooling_model=False,
             drafter=SimpleNamespace(),
             spec_decode_manager=SimpleNamespace(
@@ -3646,9 +3720,222 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
             _stage_timing=MagicMock(),
         )
         runner._stage_timing.take_samples.return_value = ([], [])
-        for name in ("maybe_wait_for_kv_save", "get_finished_kv_transfers"):
+        for name in (
+            "maybe_wait_for_kv_save",
+            "get_finished_kv_transfers",
+            "_build_kv_connector_output",
+        ):
             setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
 
         TPUModelRunner.sample_tokens(runner, None)
 
     assert seen_u_dtypes == [torch.float32, torch.float32]
+
+
+def test_decode_metadata_cache_hit_updates_request_distribution_cpu():
+    from runner_input_test_utils import (
+        _make_runner,
+        _scheduler_output,
+    )
+
+    runner = _make_runner(
+        num_computed_tokens=[10, 10, 10, 10],
+        prompt_tokens=[10, 10, 10, 10],
+        scheduled_tokens=[1, 1, 1, 1],
+        token_paddings=[4, 8, 16],
+        max_num_reqs=4,
+        pcp_size=1,
+    )
+    scheduler_output = _scheduler_output([1, 1, 1, 1])
+
+    # First call: cache miss, initializes cache and sets distribution.
+    TPUModelRunner._prepare_inputs(
+        runner, scheduler_output, start_index=0, num_decode_reqs=4
+    )
+    assert torch.equal(
+        runner._request_distribution_cpu,
+        torch.tensor([4, 4, 4], dtype=torch.int32),
+    )
+
+    # Simulate stale CPU request distribution from intervening prefill/mixed step.
+    runner._request_distribution_cpu.copy_(torch.tensor([0, 0, 4], dtype=torch.int32))
+
+    # Second call: cache hit. Must refresh _request_distribution_cpu to [4, 4, 4].
+    TPUModelRunner._prepare_inputs(
+        runner, scheduler_output, start_index=0, num_decode_reqs=4
+    )
+    assert torch.equal(
+        runner._request_distribution_cpu,
+        torch.tensor([4, 4, 4], dtype=torch.int32),
+    )
+
+
+def _bare_rope(cls, rows: int) -> torch.nn.Module:
+    """A `cls` instance holding only a `[rows, 8]` cos_sin_cache buffer;
+    `_truncate_rope_caches` dispatches on the type and reads only the buffer."""
+    module = cls.__new__(cls)
+    torch.nn.Module.__init__(module)
+    module.register_buffer("cos_sin_cache", torch.zeros(rows, 8), persistent=False)
+    return module
+
+
+def test_truncate_rope_caches_covers_deepseek_scaling(monkeypatch):
+    """TPU_ROPE_CACHE_TRUNCATE also truncates DeepSeek-scaling caches (MLA
+    YaRN and DeepSeek-V4), preserves shared buffers across both truncation and
+    row-major relayout, and reaches the draft model via `_relayout_tables`."""
+    from vllm.model_executor.layers.rotary_embedding import (
+        DeepseekScalingRotaryEmbedding,
+        RotaryEmbedding,
+    )
+    from vllm.model_executor.layers.rotary_embedding.deepseek_scaling_rope import (
+        DeepseekV4ScalingRotaryEmbedding,
+    )
+
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
+        VllmDeepseekScalingRotaryEmbedding,
+    )
+
+    max_len = 32
+    shared_buf = torch.arange(128 * 8, dtype=torch.float32).reshape(128, 8)
+    shared_a = _bare_rope(DeepseekV4ScalingRotaryEmbedding, 128)
+    shared_b = _bare_rope(DeepseekV4ScalingRotaryEmbedding, 128)
+    shared_a.cos_sin_cache = shared_buf
+    shared_b.cos_sin_cache = shared_buf
+    # Distinct sole-owner buffers stay distinct after truncation + relayout.
+    sole_a = _bare_rope(DeepseekV4ScalingRotaryEmbedding, 128)
+    sole_a.cos_sin_cache.fill_(1.0)
+    sole_b = _bare_rope(DeepseekV4ScalingRotaryEmbedding, 128)
+    sole_b.cos_sin_cache.fill_(2.0)
+    model = torch.nn.ModuleDict(
+        {
+            "rope": _bare_rope(RotaryEmbedding, 128),
+            "deepseek": _bare_rope(DeepseekScalingRotaryEmbedding, 128),
+            "tpu_deepseek": _bare_rope(VllmDeepseekScalingRotaryEmbedding, 128),
+            "deepseek_v4": _bare_rope(DeepseekV4ScalingRotaryEmbedding, 128),
+            "sole_a": sole_a,
+            "sole_b": sole_b,
+            "shared_a": shared_a,
+            "shared_b": shared_b,
+            "short": _bare_rope(DeepseekScalingRotaryEmbedding, 16),
+        }
+    )
+    other = torch.nn.Module()
+    other.register_buffer("cos_sin_cache", torch.zeros(128, 8), persistent=False)
+    model["other"] = other
+
+    draft_shared_buf = torch.ones(128, 8)
+    draft_shared_a = _bare_rope(DeepseekV4ScalingRotaryEmbedding, 128)
+    draft_shared_b = _bare_rope(DeepseekV4ScalingRotaryEmbedding, 128)
+    draft_shared_a.cos_sin_cache = draft_shared_buf
+    draft_shared_b.cos_sin_cache = draft_shared_buf
+    draft_model = torch.nn.ModuleDict(
+        {
+            "draft_rope": _bare_rope(DeepseekV4ScalingRotaryEmbedding, 128),
+            "shared_a": draft_shared_a,
+            "shared_b": draft_shared_b,
+        }
+    )
+
+    relayout_calls = 0
+
+    def fake_to_row_major(t: torch.Tensor) -> torch.Tensor:
+        nonlocal relayout_calls
+        relayout_calls += 1
+        return t.clone()
+
+    monkeypatch.setattr(envs, "TPU_ROPE_CACHE_TRUNCATE", True)
+    monkeypatch.setattr(envs, "TPU_ROPE_CACHE_ROW_MAJOR", True)
+    monkeypatch.setattr(envs, "TPU_MOE_HASH_TABLE_ROW_MAJOR", False)
+    monkeypatch.setattr(runner_utils_module, "_to_row_major", fake_to_row_major)
+    monkeypatch.setattr(runner_utils_module, "_install_entry_layout_pin", lambda: None)
+
+    runner = TPUModelRunner.__new__(TPUModelRunner)
+    runner.model = model
+    runner.speculative_config = None
+    runner.model_config = SimpleNamespace(
+        is_multimodal_model=False, multimodal_config=None, max_model_len=max_len
+    )
+
+    runner._truncate_rope_caches(model)
+    runner_utils_module.relayout_rope_caches(model)
+    runner._relayout_tables(draft_model)
+
+    for name in (
+        "rope",
+        "deepseek",
+        "tpu_deepseek",
+        "deepseek_v4",
+        "sole_a",
+        "sole_b",
+        "shared_a",
+        "shared_b",
+    ):
+        assert model[name].cos_sin_cache.shape == (max_len, 8), name
+    assert model["sole_a"].cos_sin_cache is not model["sole_b"].cos_sin_cache
+    assert torch.all(model["sole_a"].cos_sin_cache == 1.0)
+    assert torch.all(model["sole_b"].cos_sin_cache == 2.0)
+    assert model["shared_a"].cos_sin_cache is model["shared_b"].cos_sin_cache
+    assert model["short"].cos_sin_cache.shape == (16, 8)
+    assert model["other"].cos_sin_cache.shape == (128, 8)
+    assert draft_model["draft_rope"].cos_sin_cache.shape == (max_len, 8)
+    assert draft_model["shared_a"].cos_sin_cache.shape == (max_len, 8)
+    assert (
+        draft_model["shared_a"].cos_sin_cache is draft_model["shared_b"].cos_sin_cache
+    )
+    # 8 unique RoPE buffers in `model` (shared_a/shared_b share 1, plus short)
+    # + 2 unique RoPE buffers in `draft_model` (draft_rope + shared_a/shared_b).
+    assert relayout_calls == 10
+
+
+def test_truncate_rope_caches_keeps_speculative_slack(monkeypatch):
+    """Under MTP K > 1, un-clamped draft positions at the end of context reach
+    `max_model_len - 2 + (K - 1) >= max_model_len`; both target and draft RoPE
+    caches keep 8-row-aligned speculative slack so those rows stay in bounds."""
+    from vllm.model_executor.layers.rotary_embedding.deepseek_scaling_rope import (
+        DeepseekV4ScalingRotaryEmbedding,
+    )
+
+    from vllm_torchtpu import envs
+
+    max_len = 32
+    spec_k = 3
+    # cdiv(32 + 3, 8) * 8 == 40 rows.
+    expected_rows = 40
+    untruncated = torch.arange(128 * 8, dtype=torch.float32).reshape(128, 8)
+
+    target_rope = _bare_rope(DeepseekV4ScalingRotaryEmbedding, 128)
+    target_rope.cos_sin_cache = untruncated.clone()
+    model = torch.nn.ModuleDict({"rope": target_rope})
+
+    draft_rope = _bare_rope(DeepseekV4ScalingRotaryEmbedding, 128)
+    draft_rope.cos_sin_cache = untruncated.clone()
+    draft_model = torch.nn.ModuleDict({"draft_rope": draft_rope})
+
+    monkeypatch.setattr(envs, "TPU_ROPE_CACHE_TRUNCATE", True)
+    monkeypatch.setattr(envs, "TPU_ROPE_CACHE_ROW_MAJOR", False)
+    monkeypatch.setattr(envs, "TPU_MOE_HASH_TABLE_ROW_MAJOR", False)
+
+    runner = TPUModelRunner.__new__(TPUModelRunner)
+    runner.model = model
+    runner.speculative_config = SimpleNamespace(num_speculative_tokens=spec_k)
+    runner.model_config = SimpleNamespace(
+        is_multimodal_model=False, multimodal_config=None, max_model_len=max_len
+    )
+
+    runner._truncate_rope_caches(model)
+    runner._relayout_tables(draft_model)
+
+    assert model["rope"].cos_sin_cache.shape == (expected_rows, 8)
+    assert draft_model["draft_rope"].cos_sin_cache.shape == (expected_rows, 8)
+
+    # End-of-context request whose last accepted token is at max_model_len - 2:
+    # K = 3 draft steps advance positions [30, 31, 32] (reaching max_model_len).
+    draft_positions = torch.tensor(
+        [max_len - 2 + step for step in range(spec_k)], dtype=torch.long
+    )
+    assert int(draft_positions.max().item()) == max_len
+    torch.testing.assert_close(
+        draft_model["draft_rope"].cos_sin_cache[draft_positions],
+        untruncated[draft_positions],
+    )

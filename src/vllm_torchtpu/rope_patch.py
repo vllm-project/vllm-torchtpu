@@ -11,12 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Pure in-graph RotaryEmbedding and MRotaryEmbedding patch for AOT StableHLO export.
+"""Pure in-graph RotaryEmbedding and MRotaryEmbedding patching.
 
-Eliminates the `cos_sin_cache` module buffer on eligible rotary embedding modules
-(both 1-D standard `RotaryEmbedding` and 2-D `[3, num_tokens]` multimodal
-`MRotaryEmbedding` / `MRotaryEmbeddingInterleaved`) during export so that `@main`
-does not take an extra static cache buffer input, computing `cos` and `sin`
+Eliminates static `cos_sin_cache` module buffers on eligible rotary embedding
+modules (both 1-D standard `RotaryEmbedding` and 2-D `[3, num_tokens]` multimodal
+`MRotaryEmbedding` / `MRotaryEmbeddingInterleaved`), computing `cos` and `sin`
 directly in-graph from `positions` and `inv_freq`.
 """
 
@@ -24,9 +23,10 @@ from __future__ import annotations
 
 import dataclasses
 import inspect
+import math
 import types
 from collections.abc import Mapping, Sequence
-from typing import Any
+from typing import Any, Literal
 
 import torch
 import torch.nn as nn
@@ -307,7 +307,11 @@ def patch_in_graph_rotary_embedding(model: nn.Module) -> int:
                 module._buffers.pop(buf_name, None)
             module.__dict__.pop(buf_name, None)
         num_patched += 1
-    return num_patched + patch_cos_sin_cache_buffers(model)
+    return (
+        num_patched
+        + patch_cos_sin_cache_buffers(model)
+        + patch_cos_sin_table_pairs(model)
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -428,8 +432,11 @@ class InGraphCosSinCache:
         dtype: torch.dtype,
         num_rows: int,
         width: int,
+        half: Literal["cos", "sin"] | None = None,
     ) -> None:
         self.segments = tuple(segments)
+        # "cos" or "sin" for a table holding only that half, else `[cos | sin]`.
+        self.half = half
         self.dtype = dtype
         self.shape = torch.Size((num_rows, width))
         self.ndim = 2
@@ -446,7 +453,7 @@ class InGraphCosSinCache:
                 dtype = arg.dtype
         if dtype is None or dtype == self.dtype:
             return self
-        return InGraphCosSinCache(self.segments, dtype, *self.shape)
+        return InGraphCosSinCache(self.segments, dtype, *self.shape, half=self.half)
 
     def index_select(self, dim: int, index: torch.Tensor) -> torch.Tensor:
         if dim != 0:
@@ -484,7 +491,12 @@ class InGraphCosSinCache:
             pos = index - seg.start if seg.start else index
             inv = _build_device_vector_f32(seg.inv_freq, device)
             freqs = pos.to(torch.float32).unsqueeze(-1) * inv
-            rows = torch.cat((freqs.cos(), freqs.sin()), dim=-1)
+            if self.half == "cos":
+                rows = freqs.cos()
+            elif self.half == "sin":
+                rows = freqs.sin()
+            else:
+                rows = torch.cat((freqs.cos(), freqs.sin()), dim=-1)
             if seg.mscale != 1.0:
                 rows = rows * float(seg.mscale)
             if out is None:
@@ -518,8 +530,66 @@ def patch_cos_sin_cache_buffers(model: nn.Module) -> int:
             setattr(
                 module,
                 buf_name,
-                InGraphCosSinCache(segments, buf.dtype, *buf.shape),
+                InGraphCosSinCache(segments, buf.dtype, buf.shape[0], buf.shape[1]),
             )
             patched = True
         num_patched += patched
+    return num_patched
+
+
+def _rope_table_inv_freq(cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor | None:
+    """The inverse frequencies of a RoPE table, or None if it is not one.
+
+    `cos`/`sin` `[n, w]` must hold `cos/sin(p * f_j)` for row `p` and column `j`.
+    Each `f_j` is read off the table, unwrapped over rows 1, 2, 4, ... so its
+    error shrinks with the row, and the table rebuilt from them in float32 must
+    match within `1e-3`: the float32 angles `p * f_j` of the table itself are
+    only that exact at its last rows, while a table that is not RoPE misses by
+    far more.
+    """
+    if cos.ndim != 2 or cos.shape != sin.shape or cos.shape[0] < 2:
+        return None
+    n = int(cos.shape[0])
+    c, s = cos.detach().cpu().double(), sin.detach().cpu().double()
+    freq = torch.atan2(s[1], c[1])
+    row = 1
+    while 2 * row < n:
+        row *= 2
+        angle = torch.atan2(s[row], c[row])
+        turns = torch.round((row * freq - angle) / (2 * math.pi))
+        freq = (angle + 2 * math.pi * turns) / row
+    inv_freq = freq.float()
+    angles = torch.outer(torch.arange(n).float(), inv_freq)
+    err = max(
+        float((angles.cos() - cos.detach().cpu().float()).abs().max()),
+        float((angles.sin() - sin.detach().cpu().float()).abs().max()),
+    )
+    return inv_freq if err <= 1e-3 else None
+
+
+def patch_cos_sin_table_pairs(model: nn.Module) -> int:
+    """Replaces paired `cos`/`sin` rotary table buffers with in-graph rows.
+
+    For rotary modules that keep the two halves as separate `[max_len, d / 2]`
+    buffers (Muse Spark's), indexed by position: each pair that
+    `_rope_table_inv_freq` recognizes becomes two `InGraphCosSinCache` halves, so
+    `@main` takes no table input. Returns the number of modules patched.
+    """
+    num_patched = 0
+    for _, module in model.named_modules():
+        cos, sin = module._buffers.get("cos"), module._buffers.get("sin")
+        if cos is None or sin is None:
+            continue
+        inv_freq = _rope_table_inv_freq(cos, sin)
+        if inv_freq is None:
+            continue
+        segment = CosSinSegment(0, int(cos.shape[0]), tuple(inv_freq.tolist()))
+        for half, buf in (("cos", cos), ("sin", sin)):
+            del module._buffers[half]
+            setattr(
+                module,
+                half,
+                InGraphCosSinCache([segment], buf.dtype, *buf.shape, half=half),
+            )
+        num_patched += 1
     return num_patched

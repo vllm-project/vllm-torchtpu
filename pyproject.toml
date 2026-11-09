@@ -51,11 +51,12 @@ dependencies = [
     # * before v5.18: qwen_sparse_attention
     # * from v5.18 on: indexed_attention
     #   (https://github.com/huggingface/transformers/pull/48974)
-    # qwen4_exp/ accepts only indexed_attention, hence the floor. vLLM 0.32.0
-    # and vllm-omni 0.32.0rc1 both take transformers>=5.16.1,<5.20.0. No upper
-    # bound in base dependencies, so upstream vLLM HEAD canary builds
-    # (vllm-torchtpu-integration) can resolve. Monitored for potential
-    # structured-output spec-decode divergence (#1093) on transformers>=5.17.
+    # qwen4_exp/ accepts only indexed_attention, hence the floor. vLLM 0.33.0
+    # takes transformers>=5.16.1,<5.21.0 and vllm-omni 0.32.0rc1 takes
+    # >=5.16.1,<5.20.0. No upper bound in base dependencies, so upstream vLLM
+    # HEAD canary builds (vllm-torchtpu-integration) can resolve. Monitored for
+    # potential structured-output spec-decode divergence (#1093) on
+    # transformers>=5.17.
     "transformers>=5.18.0",
     # Required for N-gram speculative decoding
     # vLLM only lists it in its per-platform requirements/*.txt files (cuda.txt,
@@ -136,7 +137,7 @@ torchtpu_layers = "vllm_torchtpu.layers:register_layers"
 vllm = [
     # Note: we **intentionally** build vllm from source, see README.
     # Keep vllm_test_utils on the same upstream tag below.
-    "vllm @ git+https://github.com/vllm-project/vllm.git@v0.32.0",
+    "vllm @ git+https://github.com/vllm-project/vllm.git@v0.33.0",
 ]
 
 # Source for the `omni` extra's vllm-omni==0.32.0rc1 while that release is not
@@ -156,7 +157,7 @@ test = [
     "pytest-cov",
     "parameterized",
     # Not published on PyPI; lives in vLLM's tests/ directory.
-    "vllm_test_utils @ git+https://github.com/vllm-project/vllm.git@v0.32.0#subdirectory=tests/vllm_test_utils",
+    "vllm_test_utils @ git+https://github.com/vllm-project/vllm.git@v0.33.0#subdirectory=tests/vllm_test_utils",
 ]
 
 [tool.pytest.ini_options]
@@ -202,6 +203,7 @@ ignore = [
 "torch".msg = "kernels/ is JAX and Pallas only. Put torch code in a vllm_adapter.py."
 "torch_tpu".msg = "kernels/ is JAX and Pallas only. Use it in a vllm_adapter.py."
 "vllm".msg = "kernels/ does not import vLLM. Pass the values in as arguments."
+"vllm_torchtpu.megakernel_runtime".msg = "kernels/ and megakernel/ do not import the megakernel runtime bridge (megakernel_runtime imports megakernel, not the reverse)."
 
 [tool.ruff.lint.per-file-ignores]
 # Kernels must not import torch, torch_tpu or vLLM directly. Adapter files

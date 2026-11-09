@@ -21,24 +21,48 @@ from unittest.mock import patch
 
 import pytest
 
+from tests.compilation.test_graph_fingerprint import (
+    _trace_all_reduce_graph,
+    install_group_stand_ins,
+)
 from vllm_torchtpu.env_override import _TPU_VMEM_BYTES_PER_TENSOR_CORE
+
+
+@pytest.fixture
+def group_stand_ins(monkeypatch):
+    return install_group_stand_ins(monkeypatch)
 
 
 class TestTpuCompilerCache:
     @staticmethod
-    def _config(*, max_num_seqs=16, num_gpu_blocks=1024):
+    def _config(
+        *,
+        max_num_seqs=16,
+        num_gpu_blocks=1024,
+        mamba_cache_mode="none",
+        prefix_match_unit=None,
+    ):
         return SimpleNamespace(
             cache_config=SimpleNamespace(
                 gpu_memory_utilization=0.9,
                 num_gpu_blocks=num_gpu_blocks,
                 num_gpu_blocks_override=None,
+                mamba_cache_mode=mamba_cache_mode,
+                mamba_block_size=3072,
+                prefix_match_unit=prefix_match_unit,
             ),
-            model_config=SimpleNamespace(max_model_len=4096),
+            model_config=SimpleNamespace(
+                max_model_len=4096, architecture="Qwen3_5MoeForCausalLM"
+            ),
             scheduler_config=SimpleNamespace(
                 max_num_batched_tokens=2048,
                 max_num_seqs=max_num_seqs,
             ),
-            parallel_config=SimpleNamespace(data_parallel_size=1),
+            parallel_config=SimpleNamespace(
+                data_parallel_size=1,
+                decode_context_parallel_size=1,
+                prefill_context_parallel_size=1,
+            ),
             speculative_config=None,
         )
 
@@ -59,6 +83,29 @@ class TestTpuCompilerCache:
 
         assert base != different_batch
         assert base != different_kv
+
+    def test_tpu_hash_covers_gdn_prefill_checkpoint_gate_only(self):
+        """The hash follows prefill_checkpoint_enabled, not its raw inputs."""
+        from vllm_torchtpu.compilation.tpu_compiler import compute_tpu_compilation_hash
+
+        with patch(
+            "vllm_torchtpu.compilation.tpu_compiler._iter_runtime_cache_key_files",
+            return_value=[],
+        ):
+            disabled = compute_tpu_compilation_hash(self._config())
+            enabled = compute_tpu_compilation_hash(
+                self._config(mamba_cache_mode="align")
+            )
+            enabled_block_unit = compute_tpu_compilation_hash(
+                self._config(mamba_cache_mode="align", prefix_match_unit=3072)
+            )
+            disabled_fine_unit = compute_tpu_compilation_hash(
+                self._config(mamba_cache_mode="align", prefix_match_unit=1024)
+            )
+
+        assert disabled != enabled
+        assert enabled == enabled_block_unit
+        assert disabled_fine_unit == disabled
 
     def test_tpu_hash_covers_plugin_compile_env(self):
         from vllm_torchtpu.compilation.tpu_compiler import compute_tpu_compilation_hash
@@ -132,6 +179,59 @@ class TestTpuCompilerCache:
                     changed = compute_tpu_compilation_hash(self._config())
                 assert base != changed
 
+    @pytest.mark.parametrize(
+        "libtpu_version",
+        (pytest.param(None, id="no-package"), pytest.param("0.0.50", id="package")),
+    )
+    def test_tpu_hash_follows_custom_library_bytes_not_path(
+        self, tmp_path, libtpu_version
+    ):
+        # JAX loads a custom TPU_LIBRARY_PATH in preference to the pip package,
+        # so the hash follows that library's bytes whether or not libtpu is
+        # installed, and not the path it was loaded from.
+        from importlib import metadata as importlib_metadata
+
+        from vllm_torchtpu.compilation.tpu_compiler import compute_tpu_compilation_hash
+
+        def version(name):
+            if name != "libtpu":
+                return "1"
+            if libtpu_version is None:
+                raise importlib_metadata.PackageNotFoundError(name)
+            return libtpu_version
+
+        def compilation_hash(library):
+            with (
+                patch(
+                    "vllm_torchtpu.compilation.tpu_compiler._iter_runtime_cache_key_files",
+                    return_value=[],
+                ),
+                patch(
+                    "vllm_torchtpu.compilation.tpu_compiler.importlib_metadata.version",
+                    side_effect=version,
+                ),
+                patch.dict(os.environ, {"TPU_LIBRARY_PATH": str(library)}),
+            ):
+                return compute_tpu_compilation_hash(self._config())
+
+        build_a = b"build-a" * 4096
+        # A different size as well as different bytes, so the cached
+        # fingerprint of the first build at this path is not reused.
+        build_b = b"build-b" * 8192
+        library = tmp_path / "a" / "libtpu.so"
+        library.parent.mkdir()
+        library.write_bytes(build_a)
+        hash_a = compilation_hash(library)
+        library.write_bytes(build_b)
+        hash_b = compilation_hash(library)
+        assert hash_a != hash_b
+
+        # The same build mounted at another path.
+        moved = tmp_path / "b" / "libtpu.so"
+        moved.parent.mkdir()
+        moved.write_bytes(build_b)
+        assert compilation_hash(moved) == hash_b
+
     def test_tpu_hash_covers_effective_data_parallel_size(self):
         from vllm_torchtpu.compilation.tpu_compiler import compute_tpu_compilation_hash
 
@@ -176,6 +276,7 @@ class TestTpuCompilerCache:
             if path in excluded_files or path.startswith(excluded_dirs)
         }
         assert {
+            "vllm_torchtpu/gdn_pool_layout.py",
             "vllm_torchtpu/kernels/quantized_matmul/blockwise_kernel.py",
             "vllm_torchtpu/kernels/pool_adapters.py",
             "vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
@@ -244,6 +345,7 @@ class TestTpuCompilerCache:
             "TPU_RAIDEN_STAGE3_STATUS_PROBE_S",
             "TPU_RAIDEN_TEST_REGISTRATION_DELAY_S",
             "TPU_RAIDEN_TRANSFER_NUM_SLOTS",
+            "TPU_RAIDEN_TRANSFER_STREAMS",
             "TPU_SIDE_CHANNEL_PORT",
             "TPU_USE_RAIDEN_CONNECTOR",
             "DEBUG_TPU_LOCAL_RANK_OFFSET",
@@ -265,6 +367,7 @@ class TestTpuCompilerCache:
             "VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S",
             "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES",
             "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT",
+            "TPU_LIBRARY_PATH",
         }
 
         assert serving_only <= _TPU_COMPILE_ENV_IGNORED
@@ -690,6 +793,123 @@ class TestTpuCompilerCache:
         assert compiled == [1]
         assert replayed == []
 
+    def test_a_rank_stops_waiting_when_the_owner_cannot_save(
+        self, tmp_path, monkeypatch
+    ):
+        """An owner with nothing to save leaves a marker; its waiter compiles
+        the bucket at once instead of waiting out the full timeout."""
+        import time
+
+        from vllm_torchtpu.compilation import tpu_compiler
+        from vllm_torchtpu.compilation.tpu_compiler import wait_for_peer_artifact
+
+        (a, b), compile, compiled, replayed = self._peer_compilers(
+            tmp_path, monkeypatch
+        )
+        backend = tpu_compiler._tpu_backend
+        # No serialize(): nothing the owner can hand over.
+        monkeypatch.setattr(
+            tpu_compiler,
+            "_tpu_backend",
+            lambda graph, inputs: (lambda *args: backend(graph, inputs)(*args)),
+        )
+        compile(a)
+        assert os.path.exists(os.path.join(a.cache_dir, "artifact_bucket.failed"))
+        start = time.monotonic()
+        with wait_for_peer_artifact(30.0):
+            fn, _ = compile(b)
+        assert time.monotonic() - start < 10.0
+        assert replayed == []
+        # The lazy backend compiles on the first call: b built its own.
+        fn()
+        assert compiled == [1]
+
+    def test_a_rank_stops_waiting_when_the_owner_save_fails(
+        self, tmp_path, monkeypatch
+    ):
+        """An owner whose save fails (e.g. a full disk) leaves a marker; its
+        waiter compiles the bucket at once instead of waiting out the timeout."""
+        import time
+
+        from vllm_torchtpu.compilation.tpu_compiler import (
+            TpuCompilerAdaptor,
+            wait_for_peer_artifact,
+        )
+
+        (a, b), compile, compiled, replayed = self._peer_compilers(
+            tmp_path, monkeypatch
+        )
+        monkeypatch.setattr(
+            TpuCompilerAdaptor, "_save_handle", lambda self, *args: False
+        )
+        _, handle = compile(a)
+        assert handle is None
+        assert os.path.exists(os.path.join(a.cache_dir, "artifact_bucket.failed"))
+        start = time.monotonic()
+        with wait_for_peer_artifact(30.0):
+            compile(b)
+        assert time.monotonic() - start < 10.0
+        assert compiled == [0, 1]
+        assert replayed == []
+
+    def test_a_marker_for_another_graph_is_ignored(self, tmp_path, monkeypatch):
+        """A marker from a rank that traced a different graph does not cut the
+        wait short: the rank compiling this graph may still save it."""
+        import time
+
+        import torch
+
+        from vllm_torchtpu.compilation.tpu_compiler import (
+            TpuCompilerAdaptor,
+            wait_for_peer_artifact,
+        )
+
+        (a, b), compile, compiled, replayed = self._peer_compilers(
+            tmp_path, monkeypatch
+        )
+        monkeypatch.setattr(
+            TpuCompilerAdaptor, "_save_handle", lambda self, *args: False
+        )
+        compile(a, graph=torch.fx.symbolic_trace(lambda x: x * 3 - 1))
+        assert os.path.exists(os.path.join(a.cache_dir, "artifact_bucket.failed"))
+        start = time.monotonic()
+        with wait_for_peer_artifact(0.3):
+            compile(b)
+        assert time.monotonic() - start >= 0.3
+        assert compiled == [0, 1]
+
+    def test_a_marker_from_an_earlier_run_is_ignored(self, tmp_path, monkeypatch):
+        """A marker older than this process does not cut the wait short."""
+        import time
+
+        from vllm_torchtpu.compilation import tpu_compiler
+        from vllm_torchtpu.compilation.tpu_compiler import wait_for_peer_artifact
+
+        (a, b), compile, compiled, replayed = self._peer_compilers(
+            tmp_path, monkeypatch
+        )
+        os.makedirs(a.cache_dir)
+        marker = os.path.join(a.cache_dir, "artifact_bucket.failed")
+        open(marker, "w").close()
+        old = tpu_compiler._PROCESS_START - 3600
+        os.utime(marker, (old, old))
+        start = time.monotonic()
+        with wait_for_peer_artifact(0.3):
+            compile(b)
+        assert time.monotonic() - start >= 0.3
+        assert compiled == [1]
+
+    def test_a_saved_artifact_clears_an_old_marker(self, tmp_path, monkeypatch):
+        (a, _), compile, compiled, replayed = self._peer_compilers(
+            tmp_path, monkeypatch
+        )
+        os.makedirs(a.cache_dir)
+        marker = os.path.join(a.cache_dir, "artifact_bucket.failed")
+        open(marker, "w").close()
+        compile(a)
+        assert not os.path.exists(marker)
+        assert os.path.exists(os.path.join(a.cache_dir, "artifact_bucket"))
+
     def test_no_peer_replay_outside_a_rank_cache_dir(self, tmp_path, monkeypatch):
         (a, b), compile, compiled, replayed = self._peer_compilers(
             tmp_path, monkeypatch
@@ -736,6 +956,25 @@ class TestTpuCompilerCache:
         assert not os.path.samefile(path, os.path.join(a.cache_dir, key))
         with open(path, "rb") as f:
             assert pickle.load(f).fingerprint is None
+
+    def test_a_peer_artifact_is_replayed_across_c10d_subgroups(
+        self, tmp_path, monkeypatch, group_stand_ins
+    ):
+        """Ranks in distinct DP/TP subgroups trace different rank-local c10d
+        group_name strings for the same collective role, yet replay the first
+        rank's compiled artifact."""
+        (a, b), compile, compiled, replayed = self._peer_compilers(
+            tmp_path, monkeypatch
+        )
+        compile(a, _trace_all_reduce_graph("1"))
+        fn, handle = compile(b, _trace_all_reduce_graph("7"))
+
+        assert compiled == [0]
+        assert replayed == ["entry-from-rank-0"]
+        assert fn() == "entry-from-rank-0"
+        key, path, _ = handle
+        assert a.cache_dir is not None
+        assert os.path.samefile(path, os.path.join(a.cache_dir, key))
 
 
 def test_deserialize_entry_does_not_copy_the_entry():

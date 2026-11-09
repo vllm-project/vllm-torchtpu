@@ -99,21 +99,14 @@ PATCHES = (
     Patch("vllm_torchtpu:_patch_vllm_offload_all_ranks_kv_bytes", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_offload_fine_prefix_alignment", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_hybrid_kv_load_failure_recovery", _ENGINE),
-    Patch("vllm_torchtpu:_patch_vllm_block_pool_lifo_free", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_abort_on_preemption", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_raiden_pd_completion", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_same_step_prefix_hits", _ENGINE),
-    Patch(
-        "vllm_torchtpu.core.eagle_block_drop:patch_disable_eagle_block_drop",
-        _ENGINE,
-    ),
-    Patch("vllm_torchtpu:_patch_dflash_drafting_slot_budget", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_kimi_kda_layer_counts", _ACTIVE),
     # Process setup and runner selection.
     Patch("vllm_torchtpu:_patch_multiproc_worker_global_rank_env", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_force_v1_runner_tpu", _ACTIVE),
     Patch("vllm_torchtpu:_patch_dflash_bypass_v2_runner_check", _ACTIVE),
-    Patch("vllm_torchtpu:_patch_vllm_config_triton_tpu", _ACTIVE),
     # Weight loading and embeddings.
     Patch(
         "vllm_torchtpu.model_loader_patches:patch_default_loader_ep_weight_filter",

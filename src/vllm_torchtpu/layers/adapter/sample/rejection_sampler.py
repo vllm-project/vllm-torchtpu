@@ -370,6 +370,7 @@ def _greedy_rejection_sample(
             ]
             accepted = (accept_u < conditional_rates) & (draft_token_ids >= 0)
         else:
+            # A -1 (grammar-invalidated) draft never equals an argmax token.
             accepted = draft_token_ids == target_logits_argmax
         mismatch_indices = torch.where(
             valid_slot_mask & ~accepted,

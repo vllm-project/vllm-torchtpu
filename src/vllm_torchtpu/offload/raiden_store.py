@@ -83,6 +83,7 @@ import os
 import socket
 import threading
 import time
+from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, cast
@@ -303,6 +304,26 @@ class FinishedJob:
     success: bool
     req_id: str | None = None
     failed_device_block_ids: list[int] = field(default_factory=list)
+
+
+@dataclass
+class _ReadBatch:
+    """The arguments of one read_remote call, index-aligned: the sub-hashes,
+    the slices naming where each lives, and each one's destination block."""
+
+    hashes: list[bytes] = field(default_factory=list)
+    slices: list[object] = field(default_factory=list)
+    device_ids: list[int] = field(default_factory=list)
+
+    def add(self, sub_hash: bytes, block: object, device_id: int) -> None:
+        self.hashes.append(sub_hash)
+        self.slices.append(block)
+        self.device_ids.append(device_id)
+
+    def extend(self, other: _ReadBatch) -> None:
+        self.hashes.extend(other.hashes)
+        self.slices.extend(other.slices)
+        self.device_ids.extend(other.device_ids)
 
 
 class RaidenOffloadingManager(OffloadingManager):
@@ -922,6 +943,30 @@ class RaidenOffloadingManager(OffloadingManager):
         account for fails the job closed (rollback + recompute).
         """
         assert len(keys) == len(device_block_ids), (len(keys), len(device_block_ids))
+        # A live load (a peer or storage-tier read) owns these sub-hashes in
+        # `_hash_to_admission`; admitting them would steal its completions.
+        held_keys = {
+            key
+            for key in keys
+            if any(
+                sub_hash in self._hash_to_admission
+                for sub_hash in self._sub_hashes(key)
+            )
+        }
+        if held_keys:
+            self._inflight_store_keys.difference_update(held_keys)
+            kept = [
+                (key, block_id)
+                for key, block_id in zip(keys, device_block_ids)
+                if key not in held_keys
+            ]
+            keys = [key for key, _ in kept]
+            device_block_ids = [block_id for _, block_id in kept]
+            if not keys:
+                self._finished.append(
+                    FinishedJob(job_id=job_id, op=AdmissionOp.STORE, success=True)
+                )
+                return
         with self._eviction_lock:
             for key in keys:
                 self._evicted_sub_hashes.pop(key, None)
@@ -1032,30 +1077,38 @@ class RaidenOffloadingManager(OffloadingManager):
         # pinned in the local host pool. The slice is the only record of a peer
         # block — read_remote writes nothing to the local directory, so no live
         # probe could rediscover it. Only the BYTES are non-local: every
-        # destination is one of this instance's HBM blocks. The two destination
+        # destination is one of this instance's HBM blocks. The destination
         # lists are disjoint subsequences of `device_ids`, each preserving its
         # batch's hash-to-block pairing, because load() and read_remote() both
-        # require block_hashes[i] to line up with device_block_ids[i]. One
-        # read_remote call takes a peer's slices and storage slices together.
-        remote_hashes: list[bytes] = []
-        remote_slices: list[object] = []
-        dst_device_ids_for_remote: list[int] = []
+        # require block_hashes[i] to line up with device_block_ids[i].
+        peer_batches: defaultdict[object, _ReadBatch] = defaultdict(_ReadBatch)
+        storage_batch = _ReadBatch()
         local_hashes: list[bytes] = []
         dst_device_ids_for_local: list[int] = []
         for sub_hash, dev_id in zip(sub_hashes, device_ids):
-            block = self._pending_remote_slices.pop(sub_hash, None)
-            if block is not None:
-                remote_hashes.append(sub_hash)
-                remote_slices.append(block)
-                dst_device_ids_for_remote.append(dev_id)
-            else:
+            block: Any = self._pending_remote_slices.pop(sub_hash, None)
+            if block is None:
                 local_hashes.append(sub_hash)
                 dst_device_ids_for_local.append(dev_id)
+            elif block.status == self._block_status.REMOTE:
+                peer_batches[block.raiden_id].add(sub_hash, block, dev_id)
+            else:  # SHARED_STORAGE
+                storage_batch.add(sub_hash, block, dev_id)
+        # One read_remote call takes a single peer's slices; storage slices
+        # may join any call, so they go with the first peer's, or alone when
+        # no peer is involved.
+        remote_batches = list(peer_batches.values())
+        if storage_batch.hashes:
+            if remote_batches:
+                remote_batches[0].extend(storage_batch)
+            else:
+                remote_batches.append(storage_batch)
+        remote_hashes = [h for batch in remote_batches for h in batch.hashes]
 
         def _fail_launch(
             what: str, failed_hashes: list[bytes], in_flight: list[bytes]
         ) -> None:
-            # failed_hashes is the batch whose launch failed.
+            # failed_hashes: the refused batch and every batch not yet launched.
             logger.error(
                 "TPURaidenOffloadingConnector: load job %d (req %s): %s launch failed "
                 "(%d local, %d remote sub-blocks)",
@@ -1078,11 +1131,13 @@ class RaidenOffloadingManager(OffloadingManager):
                 failed_sub_hashes=list(failed_hashes),
             )
             if in_flight:
-                # The other launch already succeeded: the job must stay
-                # non-terminal until its transfer resolves, then the
-                # finalizer runs the failure cleanup exactly once.
+                # Earlier launches succeeded: the job must stay non-terminal
+                # until their transfers resolve, then the finalizer runs the
+                # failure cleanup exactly once. Like a launched job, it holds
+                # every sub-hash the finalizer will release, launched or not,
+                # so no other job admits one in the meantime.
                 self._admissions[job_id] = admission
-                for sub_hash in in_flight:
+                for sub_hash in sub_hashes:
                     self._hash_to_admission[sub_hash] = admission
                 return
             # Nothing in flight: immediately terminal. The finalizer keeps
@@ -1097,11 +1152,19 @@ class RaidenOffloadingManager(OffloadingManager):
         ):
             _fail_launch("load()", local_hashes, [])
             return
-        if remote_hashes and not self._store.read_remote(
-            remote_hashes, remote_slices, dst_device_ids_for_remote
-        ):
-            _fail_launch("read_remote()", remote_hashes, local_hashes)
-            return
+        in_flight = list(local_hashes)
+        for batch in remote_batches:
+            if not self._store.read_remote(
+                batch.hashes, batch.slices, batch.device_ids
+            ):
+                launched = set(in_flight)
+                _fail_launch(
+                    "read_remote()",
+                    [h for h in remote_hashes if h not in launched],
+                    in_flight,
+                )
+                return
+            in_flight.extend(batch.hashes)
         admission = Admission(
             job_id=job_id,
             op=AdmissionOp.LOAD,
@@ -1915,7 +1978,7 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
             "transfers are controller-driven and jobs must be stripped scheduler-side"
         )
 
-    def submit_load(self, job_id, src_spec, dst_spec) -> bool:
+    def submit_load(self, job_id, src_spec, dst_spec, expedited=False) -> bool:
         raise AssertionError(
             "TPURaidenOffloadingConnector: submit_load reached a worker; transfers are "
             "controller-driven and jobs must be stripped scheduler-side"
