@@ -495,3 +495,42 @@ def test_lse_heads_tile_grid_lowers_for_tpu():
     with use_abstract_mesh(tpu7x):
         lowered = jax.jit(f).trace(*args).lower(lowering_platforms=("tpu",))
     assert "tpu_custom_call" in lowered.as_text()
+
+
+@pytest.mark.parametrize("tiles", [True, False])
+@pytest.mark.parametrize("pages_per_step,page_bucket", [(16, 4), (16, 8), (8, 4), (32, 8)])
+def test_lse_heads_page_bucket_matches_full_groups(monkeypatch, tiles, pages_per_step, page_bucket):
+    """A step computing only its valid pages (rounded up to `PAGE_BUCKET`)
+    equals computing every slot of the group, for tiles with unions of every
+    size (empty, partial last groups, several groups)."""
+    dtype = jnp.float8_e4m3fn
+    rng = np.random.default_rng(31)
+    num_tokens, pages, topk, heads, hd, q_per_head = 160, 40, 6, 2, 128, 2
+    q = jnp.asarray(rng.standard_normal((num_tokens, heads * q_per_head, hd))).astype(jnp.bfloat16)
+    rows = pack(rounded(rng.standard_normal((pages, PAGE, heads * 2 * hd)), dtype), dtype)
+    selected = np.full((num_tokens, heads, topk), -1, np.int32)
+    for t in range(num_tokens):
+        if 32 <= t < 48:  # one tile with no page at all
+            continue
+        for h in range(heads):
+            chosen = rng.choice(pages, rng.integers(0, topk + 1), replace=False)
+            selected[t, h, : len(chosen)] = chosen
+    rest = (
+        jnp.asarray(selected[:, 0, 0]),
+        jnp.asarray(rng.integers(1, PAGE + 1, num_tokens), jnp.int32),
+        jnp.arange(pages, dtype=jnp.int32),
+    )
+    kw = dict(sm_scale=hd**-0.5, block_q=16, pages_per_step=pages_per_step, tiles=tiles, interpret=True)
+    out = {}
+    for bucket in (0, page_bucket):
+        monkeypatch.setattr(msa_attention_lse, "PAGE_BUCKET", bucket)
+        jax.clear_caches()
+        out[bucket] = msa_attention_lse.msa_sparse_attention_lse_heads(
+            q, rows, jnp.asarray(selected), *rest, **kw
+        )
+    full, bucketed = out[0], out[page_bucket]
+    np.testing.assert_allclose(
+        np.asarray(bucketed[0], np.float32), np.asarray(full[0], np.float32), rtol=1e-2, atol=1e-2
+    )
+    np.testing.assert_allclose(np.asarray(bucketed[1]), np.asarray(full[1]), rtol=1e-5, atol=1e-5)
+    assert np.isneginf(np.asarray(bucketed[1])[32:48]).all()

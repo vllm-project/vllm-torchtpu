@@ -586,7 +586,11 @@ def msa_attend_dcp(
     common = dict(
         sm_scale=sm_scale,
         block_q=msa_attention.DEFAULT_BLOCK_Q,
-        pages_per_step=msa_attention.DEFAULT_PAGES_PER_STEP,
+        pages_per_step=(
+            msa_attention_lse.TILE_PAGES_PER_STEP
+            if prefill
+            else msa_attention.DEFAULT_PAGES_PER_STEP
+        ),
         # Prefill tiles read their page unions directly (`_work_tiles`).
         tiles=prefill,
         interpret=interpret,

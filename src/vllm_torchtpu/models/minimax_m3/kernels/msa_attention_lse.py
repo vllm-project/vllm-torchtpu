@@ -20,6 +20,7 @@ output; the work list, page unpacking and masking are shared with it.
 """
 
 import functools
+import os
 
 import jax
 import jax.numpy as jnp
@@ -27,6 +28,20 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.models.minimax_m3.kernels import msa_attention, msa_fp4
+
+# A work-list step computes only its valid pages, rounded up to a multiple of
+# PAGE_BUCKET, instead of all `pages_per_step` slots: a group's pages are a
+# sorted prefix of its slots and the padding slots past it (the last group of
+# every tile) are fully masked, yet cost the int4 unpack and the score /
+# softmax work of a real page. 0 computes every slot.
+PAGE_BUCKET = int(os.environ.get("VLLM_TORCHTPU_MSA_PAGE_BUCKET", "4"))
+# Pages per step of the prefill tiles (`_work_tiles`) of DCP attention.
+TILE_PAGES_PER_STEP = int(
+    os.environ.get(
+        "VLLM_TORCHTPU_MSA_TILE_PAGES_PER_STEP",
+        str(msa_attention.DEFAULT_PAGES_PER_STEP),
+    )
+)
 
 
 def _kernel(
@@ -44,6 +59,7 @@ def _kernel(
     sm_scale: float,
     fp4: bool = False,
     slots_per_tile: int | None = None,
+    page_bucket: int = 0,
 ):
     """`msa_attention._kernel_v2` that also writes ``lse = m + log(l)``
     (``-inf`` for a row that sees no slot; its output is 0).
@@ -51,7 +67,11 @@ def _kernel(
     With `slots_per_tile` the grid is ``(tile, group)`` and the work list is
     each tile's padded page union (`_work_tiles`): ``work_page_ref`` holds
     `slots_per_tile` pages per tile and ``work_meta_ref`` each tile's group
-    count; steps past a tile's last group do nothing."""
+    count; steps past a tile's last group do nothing.
+
+    With `page_bucket` a step computes only its first ``n`` slots, ``n`` its
+    valid page count rounded up to a multiple of `page_bucket` (a group's
+    valid pages are a prefix of its slots); a step with none does nothing."""
     pages_per_step = len(refs) - 5
     kv_refs = refs[:pages_per_step]
     o_ref, lse_ref, m_ref, l_ref, acc_ref = refs[pages_per_step:]
@@ -84,7 +104,7 @@ def _kernel(
         l_ref[...] = jnp.zeros_like(l_ref)
         acc_ref[...] = jnp.zeros_like(acc_ref)
 
-    def _step():
+    def _step(num_pages):
         row_slots = (
             jax.lax.broadcasted_iota(jnp.int32, (page_size, 1), 0)  # int4: slot order
             if fp4
@@ -95,7 +115,7 @@ def _kernel(
         local_page = local_page_ref[...]
         local_limit = local_limit_ref[...]
         keys, values, masks, k_scales, v_scales = [], [], [], [], []
-        for g, kv_ref in enumerate(kv_refs):
+        for g, kv_ref in enumerate(kv_refs[:num_pages]):
             page = work_page_ref[base + g]
             is_selected = jnp.max(
                 (selected == page).astype(jnp.int32), axis=1, keepdims=True
@@ -143,10 +163,22 @@ def _kernel(
         )
         m_ref[...] = m_new
 
-    if active is None:
-        _step()
+    if not page_bucket or page_bucket >= pages_per_step:
+        if active is None:
+            _step(pages_per_step)
+        else:
+            pl.when(active)(functools.partial(_step, pages_per_step))
     else:
-        pl.when(active)(_step)
+        valid = sum(
+            jnp.where(work_page_ref[base + g] >= 0, 1, 0)
+            for g in range(pages_per_step)
+        )
+        for hi in range(page_bucket, pages_per_step + page_bucket, page_bucket):
+            hi = min(hi, pages_per_step)
+            run = (valid > hi - page_bucket) & (valid <= hi)
+            if active is not None:
+                run = run & active
+            pl.when(run)(functools.partial(_step, hi))
 
     @pl.when((meta & msa_attention._LAST_BIT) != 0)
     def _finalize():
@@ -259,6 +291,7 @@ def _attention_call(
             _kernel,
             sm_scale=sm_scale,
             slots_per_tile=slots,
+            page_bucket=PAGE_BUCKET,
             **({"fp4": True} if fp4 else {}),
         ),
         grid_spec=grid_spec,
