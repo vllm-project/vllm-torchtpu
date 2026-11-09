@@ -370,6 +370,30 @@ class MMEncoderManager(EncoderCudaGraphManager):
             )
         return local_outputs
 
+    def _dp_gather(
+        self,
+        local_outputs: list[torch.Tensor],
+        per_item_out_tokens: list[int],
+        image_rank_assignment: list[int],
+        images_per_rank: list[int],
+        max_output_tokens_per_rank: int,
+    ) -> list[torch.Tensor]:
+        """Gather encoder DP outputs at the same point on every TP rank.
+
+        Each rank encodes a different share of the images, and upstream's
+        gather leaves its input and output deferred, so ranks can execute the
+        all-gather at different points among their collectives.
+        ``_gather_dp_outputs`` materializes the input before the all-gather
+        and the output right after it.
+        """
+        return self._gather_dp_outputs(
+            local_outputs,
+            per_item_out_tokens,
+            image_rank_assignment,
+            images_per_rank,
+            max_output_tokens_per_rank,
+        )
+
     def _gather_dp_outputs(
         self,
         local_outputs: list[torch.Tensor],

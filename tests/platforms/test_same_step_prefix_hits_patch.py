@@ -45,14 +45,28 @@ PROMPT = list(range(BLOCK_SIZE + 8))
 
 @pytest.fixture(autouse=True)
 def patched(monkeypatch):
-    """Patch unpatched BlockPool methods around a stub `Scheduler.schedule`.
+    """Patch unpatched methods around a stub `Scheduler.schedule`.
 
     The plugin may already have patched these in this process; unwrap to
     upstream first so the test patches exactly once, and restore afterwards.
+    The stub keeps the one thing the real `schedule()` does that matters here:
+    it calls `kv_cache_manager.new_step_starts()` once per step, before it
+    looks anything up or allocates. So the `[scheduler]` cases check the wiring
+    through `Scheduler.schedule`, not vLLM's scheduler itself; that the real
+    `schedule()` clears the set is covered in tests/test_abort_on_preemption.py.
     """
     for name in ("_insert_block_hash", "get_cached_block"):
         monkeypatch.setattr(BlockPool, name, inspect.unwrap(getattr(BlockPool, name)))
-    monkeypatch.setattr(Scheduler, "schedule", lambda self, *args, **kwargs: None)
+    monkeypatch.setattr(
+        KVCacheManager,
+        "new_step_starts",
+        inspect.unwrap(KVCacheManager.new_step_starts),
+    )
+    monkeypatch.setattr(
+        Scheduler,
+        "schedule",
+        lambda self, *args, **kwargs: self.kv_cache_manager.new_step_starts(),
+    )
     _patch_vllm_same_step_prefix_hits()
 
 
@@ -98,23 +112,37 @@ def _admit(manager: KVCacheManager, request: Request) -> int:
     return num_hit_tokens
 
 
-def _start_step(manager: KVCacheManager) -> None:
+def _scheduler_step(manager: KVCacheManager) -> None:
+    # `vllm serve`: the step begins in `Scheduler.schedule`.
     Scheduler.schedule(SimpleNamespace(kv_cache_manager=manager))
 
 
-def test_same_step_request_recomputes_unwritten_prefix(manager):
-    _start_step(manager)
+def _kv_cache_manager_step(manager: KVCacheManager) -> None:
+    # An engine that drives `KVCacheManager` without vLLM's scheduler.
+    manager.new_step_starts()
+
+
+@pytest.fixture(
+    params=[_scheduler_step, _kv_cache_manager_step],
+    ids=["scheduler", "kv_cache_manager"],
+)
+def start_step(request):
+    return request.param
+
+
+def test_same_step_request_recomputes_unwritten_prefix(manager, start_step):
+    start_step(manager)
     assert _admit(manager, _request("filler")) == 0
     # Upstream hands this request the block "filler" is still filling.
     assert _admit(manager, _request("same_step")) == 0
 
 
-def test_later_step_hits_written_prefix(manager):
-    _start_step(manager)
+def test_later_step_hits_written_prefix(manager, start_step):
+    start_step(manager)
     _admit(manager, _request("filler"))
     _admit(manager, _request("same_step"))
 
-    _start_step(manager)
+    start_step(manager)
     assert _admit(manager, _request("next_step")) == BLOCK_SIZE
 
 
@@ -122,7 +150,7 @@ def test_patch_is_idempotent():
     patched_methods = (
         BlockPool._insert_block_hash,
         BlockPool.get_cached_block,
-        Scheduler.schedule,
+        KVCacheManager.new_step_starts,
     )
 
     _patch_vllm_same_step_prefix_hits()
@@ -130,5 +158,5 @@ def test_patch_is_idempotent():
     assert (
         BlockPool._insert_block_hash,
         BlockPool.get_cached_block,
-        Scheduler.schedule,
+        KVCacheManager.new_step_starts,
     ) == patched_methods

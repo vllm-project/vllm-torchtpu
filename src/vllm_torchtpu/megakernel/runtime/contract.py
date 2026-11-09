@@ -272,6 +272,12 @@ class TpuMonoSpec:
     of the fingerprint, not a gate.
     `collective_domain` names the ranks the kernel's collectives span (see
     `COLLECTIVE_DOMAINS`); the runtime's agreements run over that group.
+
+    `top_level_options` names the `options` keys a user may also set at the
+    top level of the megakernel config (e.g. `VLLM_TPU_MEGAKERNEL=
+    "mode=ep,buckets=8"`); the runtime forwards those into `options`. It reads
+    them from `SPEC` when the config has top-level keys, so the module that
+    defines `SPEC` must stay stdlib-only at import.
     """
 
     name: str
@@ -288,6 +294,7 @@ class TpuMonoSpec:
     decline_codes: tuple[str, ...] = ()
     source_root: str | None = None
     api_version: int = API_VERSION
+    top_level_options: frozenset[str] = frozenset()
 
     def __post_init__(self) -> None:
         def fix(name: str, value: Any) -> None:
@@ -334,6 +341,8 @@ class TpuMonoSpec:
                 f"{where}: collective_domain={self.collective_domain!r}; "
                 f"expected one of {sorted(COLLECTIVE_DOMAINS)}"
             )
+        values = _items(where, "top_level_options", self.top_level_options)
+        fix("top_level_options", frozenset(str(v) for v in values))
 
 
 __all__ = [
