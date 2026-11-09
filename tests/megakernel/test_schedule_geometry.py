@@ -17,11 +17,12 @@ from __future__ import annotations
 
 import dataclasses
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from vllm_torchtpu.megakernel import geometry, pool, schedule
-from vllm_torchtpu.megakernel.decls import KVCacheDecl
+from vllm_torchtpu.megakernel.decls import KVCacheDecl, RecurrentCacheDecl
 from vllm_torchtpu.megakernel.errors import MegakernelConfigError
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec
 from vllm_torchtpu.megakernel.geometry import FromHF, ModelGeometry
@@ -35,6 +36,37 @@ class _StubAttnModule(Module):
     name = "gqa"
     cache_role = "kv"
     OPTIONS = {"dummy": None}
+
+    def __init__(
+        self,
+        *,
+        geometry: Any = None,
+        prefix: str = "self_attn",
+        dummy: Any = None,
+    ) -> None:
+        self.geometry = geometry
+        self.prefix = prefix
+        self.dummy = dummy
+
+    def cache_decl(self, g: Any = None) -> KVCacheDecl:
+        geom = self._require_geometry(g)
+        return KVCacheDecl(hd=int(geom.HD), kvh=int(geom.NKV))
+
+
+class _NoCacheAttnModule(Module):
+    name = "gqa"
+    OPTIONS = {"dummy": None}
+
+    def __init__(
+        self,
+        *,
+        geometry: Any = None,
+        prefix: str = "self_attn",
+        dummy: Any = None,
+    ) -> None:
+        self.geometry = geometry
+        self.prefix = prefix
+        self.dummy = dummy
 
 
 class _StubFFNModule(Module):
@@ -116,6 +148,22 @@ def test_model_geometry_properties_shrink_check_and_pool_backend():
     )
     assert (mg.NATT, mg.NGDN, mg.QKV(8)) == (2, 6, 512)
     assert mg.ER(8) == 16 and mg.EW(8) == 128
+    mg_copy = dataclasses.replace(mg)
+    assert mg == mg_copy and hash(mg) == hash(mg_copy)
+    for f in dataclasses.fields(ModelGeometry):
+        cur = getattr(mg, f.name)
+        if isinstance(cur, bool):
+            alt: Any = not cur
+        elif isinstance(cur, int):
+            alt = cur + 1
+        elif isinstance(cur, float):
+            alt = cur * 2.0
+        else:
+            alt = "sigmoid" if cur == "silu" else "silu"
+        mg_diff = dataclasses.replace(mg, **{f.name: alt})
+        assert mg_diff != mg, f"ModelGeometry equality ignored field {f.name!r}"
+        assert hash(mg_diff) != hash(mg), f"ModelGeometry hash ignored field {f.name!r}"
+
     mg_shrunk = mg.shrink(R=2)
     assert (mg_shrunk.L, mg_shrunk.att_every) == (8, 4)
     mg_shrunk.check(ExecSpec(R=2, B=2, T=1, ctx=128))
@@ -139,9 +187,87 @@ def test_schedule_every_and_from_hf_layer_types_resolution_and_errors():
     """`Every`, `FromHFLayerTypes`, and `Schedule.resolve` validate mixer order."""
     attn = _StubAttnModule.bind("self_attn")
     gdn = GDN.bind("linear_attn")
+    alt_gdn = GDN.bind("alt_linear_attn")
     moe = _StubFFNModule.bind("mlp")
+    alt_moe = _StubFFNModule.bind("alt_mlp")
     in_norm = Norm.bind("input_layernorm", zero_centered=True)
+    alt_in_norm = Norm.bind("alt_input_layernorm", zero_centered=True)
     post_norm = Norm.bind("post_attention_layernorm", zero_centered=True)
+    alt_post_norm = Norm.bind("alt_post_attention_layernorm", zero_centered=True)
+
+    mg = ModelGeometry(
+        L=8,
+        att_every=4,
+        H=1024,
+        NH=8,
+        NKV=2,
+        HD=256,
+        ROT=64,
+        KH=8,
+        VH=16,
+        KD=128,
+        VD=128,
+        E=128,
+        TOPK=4,
+        I=1024,
+        IS=1024,
+    )
+    exp_rec_decl = GDNModule(geometry=mg).cache_decl(mg)
+    exp_kv_decl = KVCacheDecl(hd=mg.HD, kvh=mg.NKV)
+    assert isinstance(exp_rec_decl, RecurrentCacheDecl)
+
+    sched_every4 = Schedule(
+        mixer=Every(n=4, last=attn, rest=gdn),
+        ffn=moe,
+        pre_norm=in_norm,
+        post_norm=post_norm,
+        overrides={
+            2: {"ffn": alt_moe, "pre_norm": alt_in_norm, "post_norm": alt_post_norm},
+            5: {"mixer": alt_gdn},
+        },
+    )
+    res_every4 = sched_every4.resolve({}, 8)
+    assert res_every4.num_layers == 8
+    assert res_every4.att_every == 4
+    assert res_every4.mixer_branch_indices == (0, 1, 2, 0, 3, 4, 5, 1)
+    assert res_every4.mixer == (gdn, gdn, gdn, attn, gdn, alt_gdn, gdn, attn)
+    assert res_every4.ffn == (moe, moe, alt_moe, moe, moe, moe, moe, moe)
+    assert res_every4.pre_norm[2] == alt_in_norm and res_every4.pre_norm[0] == in_norm
+    assert (
+        res_every4.post_norm[2] == alt_post_norm
+        and res_every4.post_norm[0] == post_norm
+    )
+    decls_every4 = res_every4.layer_cache_decls(mg)
+    assert [type(d) for d in decls_every4] == (
+        [RecurrentCacheDecl, RecurrentCacheDecl, RecurrentCacheDecl, KVCacheDecl] * 2
+    )
+    assert decls_every4 == ([exp_rec_decl] * 3 + [exp_kv_decl]) * 2
+
+    sched_hf = Schedule(
+        mixer=FromHFLayerTypes(
+            field="layer_types",
+            mapping={"full_attention": attn, "linear_attention": gdn},
+        ),
+        ffn=moe,
+        pre_norm=in_norm,
+        post_norm=post_norm,
+    )
+    res_hf = sched_hf.resolve(
+        {"layer_types": (["linear_attention"] * 3 + ["full_attention"]) * 2},
+        8,
+    )
+    assert res_hf.num_layers == 8
+    assert res_hf.att_every == 4
+    assert res_hf.mixer_branch_indices == (0, 1, 2, 0, 3, 4, 5, 1)
+    decls_hf = res_hf.layer_cache_decls(mg)
+    assert decls_hf == ([exp_rec_decl] * 3 + [exp_kv_decl]) * 2
+
+    res_no_cache = Schedule(
+        mixer=Every(n=4, last=_NoCacheAttnModule.bind("self_attn"), rest=gdn),
+        ffn=moe,
+    ).resolve({}, 4)
+    with pytest.raises(MegakernelConfigError, match=r"layer 3 has no cache_decl\(\)"):
+        res_no_cache.layer_cache_decls(mg)
 
     with pytest.raises(MegakernelConfigError, match=r"layer 0.*None"):
         Every(n=2, last=attn, rest=None)
@@ -174,15 +300,6 @@ def test_schedule_every_and_from_hf_layer_types_resolution_and_errors():
     assert "ModuleBinding(" not in str(mix_ov_exc.value)
     assert "FrozenDict(" not in str(mix_ov_exc.value)
 
-    sched_hf = Schedule(
-        mixer=FromHFLayerTypes(
-            field="layer_types",
-            mapping={"full_attention": attn, "linear_attention": gdn},
-        ),
-        ffn=moe,
-        pre_norm=in_norm,
-        post_norm=post_norm,
-    )
     with pytest.raises(MegakernelConfigError, match=r"sliding_attention.*layer 2"):
         sched_hf.resolve(
             {

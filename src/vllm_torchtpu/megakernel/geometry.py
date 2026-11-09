@@ -27,7 +27,6 @@ from .modules.gdn import GDNModule
 from .modules.gdn.gate import validate_gdn_gate
 from .ops import col_chunk
 from .pool.config import cache_exec, resolved_max_pages_per_seq
-from .spec import ModelSpec
 
 _KNOWN_FROM_HF_KEYS = frozenset(
     (
@@ -49,45 +48,6 @@ class LMHead:
 
     prefix: str = "lm_head"
     tied_to: str | None = None
-
-
-class _BoundFromHF:
-    """`FromHF` bound to a `ModelDef` class; callable to derive geometry."""
-
-    __slots__ = ("_from_hf", "_model_cls")
-
-    # model_cls is type[ModelDef]; typed Any so geometry.py precedes model_def.py.
-    def __init__(self, from_hf: FromHF, model_cls: Any) -> None:
-        self._from_hf = from_hf
-        self._model_cls = model_cls
-
-    @property
-    def fields(self) -> Mapping[str, Any]:
-        return self._from_hf.fields
-
-    def resolve(self, hf_config: Any) -> FrozenDict:
-        return self._from_hf.resolve(hf_config)
-
-    def __call__(
-        self,
-        hf_config: Any = None,
-        *,
-        moe_tp: bool | None = None,
-        e_slots: int | None = None,
-    ) -> ModelGeometry:
-        return self._model_cls.derive_geometry(
-            hf_config, moe_tp=moe_tp, e_slots=e_slots
-        )
-
-    def __eq__(self, other: object) -> Any:
-        if isinstance(other, _BoundFromHF):
-            return self._from_hf == other._from_hf
-        if isinstance(other, FromHF):
-            return self._from_hf == other
-        return NotImplemented
-
-    def __repr__(self) -> str:
-        return repr(self._from_hf)
 
 
 @dataclass(frozen=True)
@@ -116,15 +76,6 @@ class FromHF:
                 )
         object.__setattr__(self, "fields", FrozenDict(fields))
 
-    def __get__(self, obj: Any, owner: type[Any] | None = None) -> Any:
-        if (
-            owner is not None
-            and getattr(owner, "_IS_MODEL_DEF", False)
-            and owner.__name__ != "ModelDef"
-        ):
-            return _BoundFromHF(self, owner)
-        return self
-
     def resolve(self, hf_config: Any) -> FrozenDict:
         """Resolve all declared fields strictly from `hf_config`."""
         return FrozenDict(
@@ -137,33 +88,7 @@ class FromHF:
         )
 
 
-_GEOM_FIELD_NAMES = (
-    "L",
-    "att_every",
-    "H",
-    "NH",
-    "NKV",
-    "HD",
-    "ROT",
-    "KH",
-    "VH",
-    "KD",
-    "VD",
-    "E",
-    "TOPK",
-    "I",
-    "IS",
-    "moe_tp",
-    "e_slots",
-    "eps",
-    "gdn_l2_eps",
-    "theta",
-    "zero_centered_norm",
-    "gdn_gate",
-)
-
-
-@dataclass(frozen=True, eq=False)
+@dataclass(frozen=True)
 class ModelGeometry:
     """Resolved hybrid attention / linear-attention (`GQA` + `GDN`) + `MoE` geometry."""
 
@@ -189,19 +114,6 @@ class ModelGeometry:
     theta: float = 10_000.0
     zero_centered_norm: bool = False
     gdn_gate: str = "silu"
-
-    def _tuple_key(self) -> tuple[Any, ...]:
-        return tuple(getattr(self, f) for f in _GEOM_FIELD_NAMES)
-
-    def __eq__(self, other: object) -> Any:
-        return (
-            self._tuple_key() == other._tuple_key()
-            if isinstance(other, ModelGeometry)
-            else NotImplemented
-        )
-
-    def __hash__(self) -> int:
-        return hash(self._tuple_key())
 
     def nh(self, R: int) -> int:
         return self.NH // R
@@ -364,7 +276,7 @@ class ModelGeometry:
             base_er = self.E // R if self.e_slots >= self.E // R else self.E // 8
             e_slots = e_tiny // R + max(0, self.e_slots - base_er)
         i_min = 128 * R if self.moe_tp else 128
-        shrunk = dataclasses.replace(
+        return dataclasses.replace(
             self,
             L=periods * self.att_every,
             H=min(self.H, 1024),
@@ -378,17 +290,6 @@ class ModelGeometry:
             IS=max(128 * R, min(self.IS, 512)),
             e_slots=e_slots,
         )
-        if (mdef := getattr(self, "_model_def", None)) is not None:
-            object.__setattr__(shrunk, "_model_def", mdef)
-        return shrunk
-
-    def to_model_spec(self) -> ModelSpec:
-        """Convert this geometry into its declarative `ModelSpec`."""
-        if (mdef := getattr(self, "_model_def", None)) is not None:
-            return mdef.to_model_spec(self)
-        raise MegakernelConfigError(
-            "ModelGeometry is not bound to a ModelDef; call ModelDef.to_model_spec(g)"
-        )
 
 
-__all__ = ["FromHF", "LMHead", "ModelGeometry", "_BoundFromHF"]
+__all__ = ["FromHF", "LMHead", "ModelGeometry"]

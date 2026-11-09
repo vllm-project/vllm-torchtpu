@@ -20,7 +20,7 @@ from typing import Any, ClassVar
 
 import jax
 
-from . import pool
+from . import derive, pool, validate
 from .decls import (
     FrozenDict,
     KVCacheDecl,
@@ -28,15 +28,9 @@ from .decls import (
     RecurrentCacheDecl,
     _sub_cfg,
 )
-from .derive import (
-    derive_model_geometry,
-    derive_model_spec,
-    resolve_model_schedule,
-    shrink_model_hf_config,
-)
 from .errors import EligibilityResult, MegakernelConfigError
 from .exec_spec import ExecSpec
-from .geometry import FromHF, LMHead, ModelGeometry, _BoundFromHF
+from .geometry import FromHF, LMHead, ModelGeometry
 from .modules.gdn import GDNModule
 from .pool import PoolBackend, PoolLayout
 from .profile import Profile, get_profile, model_default_profile, register_profile
@@ -49,18 +43,38 @@ from .schedule import (
     Schedule,
 )
 from .spec import ModelSpec, Module
-from .validate import (
-    model_label,
-    validate_model_def,
-    validate_model_hf_config,
-    validate_norms,
-)
+
+
+class _BoundFromHF:
+    """`FromHF` bound to a `ModelDef` subclass; callable to derive geometry."""
+
+    __slots__ = ("_from_hf", "_model_cls")
+
+    def __init__(self, from_hf: FromHF, model_cls: type[ModelDef]) -> None:
+        self._from_hf, self._model_cls = from_hf, model_cls
+
+    @property
+    def fields(self) -> Mapping[str, Any]:
+        return self._from_hf.fields
+
+    def resolve(self, hf_config: Any) -> FrozenDict:
+        return self._from_hf.resolve(hf_config)
+
+    def __call__(self, hf_config: Any = None, **kw: Any) -> ModelGeometry:
+        return self._model_cls.derive_geometry(hf_config, **kw)
+
+    def __eq__(self, other: object) -> Any:
+        if isinstance(other, _BoundFromHF):
+            return self._from_hf == other._from_hf
+        return self._from_hf == other if isinstance(other, FromHF) else NotImplemented
+
+    def __repr__(self) -> str:
+        return repr(self._from_hf)
 
 
 class ModelDef:
     """Declarative model definition base class for the hybrid GQA/GDN + MoE family."""
 
-    _IS_MODEL_DEF: ClassVar[bool] = True
     name: ClassVar[str] = ""
     display_name: ClassVar[str] = ""
     hf_architectures: ClassVar[tuple[str, ...]] = ()
@@ -80,14 +94,15 @@ class ModelDef:
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
-        for attr, empty in (
-            ("name", ""),
-            ("display_name", ""),
-            ("hf_architectures", ()),
-            ("hf_model_type", ()),
-        ):
-            if attr not in cls.__dict__:
-                setattr(cls, attr, empty)
+        defaults = {
+            "name": "",
+            "display_name": "",
+            "hf_architectures": (),
+            "hf_model_type": (),
+        }
+        for k, v in defaults.items():
+            if k not in cls.__dict__:
+                setattr(cls, k, v)
 
     @classmethod
     def _from_hf_decl(cls) -> FromHF:
@@ -96,18 +111,17 @@ class ModelDef:
             return raw._from_hf
         if isinstance(raw, FromHF):
             return raw
+        mname = validate.model_label(cls)
         raise MegakernelConfigError(
-            f"ModelDef {model_label(cls)} must declare `geometry = FromHF(...)`"
+            f"ModelDef {mname} must declare `geometry = FromHF(...)`"
         )
 
     @classmethod
     def _effective_hf_config(cls, hf_config: Any = None) -> Any:
-        if hf_config is not None:
-            return hf_config
-        if cls.default_hf_config is not None:
-            return cls.default_hf_config
+        if hf_config is not None or cls.default_hf_config is not None:
+            return hf_config if hf_config is not None else cls.default_hf_config
         raise MegakernelConfigError(
-            f"ModelDef {model_label(cls)!r} has no default_hf_config; "
+            f"ModelDef {validate.model_label(cls)!r} has no default_hf_config; "
             "pass an explicit hf_config"
         )
 
@@ -115,29 +129,20 @@ class ModelDef:
     def _find_binding(
         cls, target_cls: type[Module], sched: ResolvedSchedule
     ) -> ModuleBinding | None:
-        for seq in (sched.mixer, sched.ffn):
-            for b in seq:
-                if isinstance(b, ModuleBinding) and issubclass(
-                    b.module_cls, target_cls
-                ):
-                    return b
+        for b in (*sched.mixer, *sched.ffn):
+            if isinstance(b, ModuleBinding) and issubclass(b.module_cls, target_cls):
+                return b
         return None
 
     @classmethod
-    def derive_geometry(
-        cls,
-        hf_config: Any = None,
-        *,
-        moe_tp: bool | None = None,
-        e_slots: int | None = None,
-    ) -> ModelGeometry:
+    def derive_geometry(cls, hf_config: Any = None, **kw: Any) -> ModelGeometry:
         """Derive `ModelGeometry` from `cls.geometry`, bindings, and `schedule`."""
-        return derive_model_geometry(cls, hf_config, moe_tp=moe_tp, e_slots=e_slots)
+        return derive.derive_model_geometry(cls, hf_config, **kw)
 
     @classmethod
     def resolve_schedule(cls, hf_config_or_geom: Any = None) -> ResolvedSchedule:
         """Resolve per-layer schedule for `hf_config_or_geom`."""
-        return resolve_model_schedule(cls, hf_config_or_geom)
+        return derive.resolve_model_schedule(cls, hf_config_or_geom)
 
     @classmethod
     def layer_cache_decls(
@@ -153,8 +158,9 @@ class ModelDef:
         g = cls.derive_geometry(hf_config_or_geom)
         if cls.pool_layout_override is not None:
             if not callable(cls.pool_layout_override):
+                mname = validate.model_label(cls)
                 raise MegakernelConfigError(
-                    f"ModelDef {model_label(cls)!r}: pool_layout_override not callable"
+                    f"ModelDef {mname!r}: pool_layout_override not callable"
                 )
             return cls.pool_layout_override(g, R=R)
         return pool.derive_pool_layout(cls.layer_cache_decls(g), R=R)
@@ -170,57 +176,24 @@ class ModelDef:
         )
 
     @classmethod
-    def to_model_spec(
-        cls,
-        hf_config_or_geom: Any = None,
-        *,
-        gdn_module: Module | None = None,
-        moe_tp: bool | None = None,
-        e_slots: int | None = None,
-        R: int | None = 8,
-    ) -> ModelSpec:
+    def to_model_spec(cls, hf_config_or_geom: Any = None, **kw: Any) -> ModelSpec:
         """Derive `ModelSpec` (`LayerType` + `SwitchSlot`s, deduping shared modules)."""
-        return derive_model_spec(
-            cls,
-            hf_config_or_geom,
-            gdn_module=gdn_module,
-            moe_tp=moe_tp,
-            e_slots=e_slots,
-            R=R,
-        )
+        return derive.derive_model_spec(cls, hf_config_or_geom, **kw)
 
     @classmethod
-    def shrink_hf_config(
-        cls,
-        hf_config: Any = None,
-        *,
-        periods: int = 2,
-        R: int = 8,
-        ex: ExecSpec | None = None,
-    ) -> dict[str, Any]:
+    def shrink_hf_config(cls, hf_config: Any = None, **kw: Any) -> dict[str, Any]:
         """Return a shrunk HF config dict (`periods` cycles, legal heads/experts)."""
-        return shrink_model_hf_config(cls, hf_config, periods=periods, R=R, ex=ex)
+        return derive.shrink_model_hf_config(cls, hf_config, **kw)
 
     @classmethod
-    def shrink(
-        cls,
-        hf_config_or_geom: Any = None,
-        *,
-        periods: int = 2,
-        R: int = 8,
-        ex: ExecSpec | None = None,
-    ) -> ModelGeometry:
+    def shrink(cls, hf_config_or_geom: Any = None, **kw: Any) -> ModelGeometry:
         """Return a tiny `ModelGeometry` with `periods` cycles that passes checks."""
-        shrunk = cls.derive_geometry(hf_config_or_geom).shrink(
-            periods=periods, R=R, ex=ex
-        )
-        object.__setattr__(shrunk, "_model_def", cls)
-        return shrunk
+        return cls.derive_geometry(hf_config_or_geom).shrink(**kw)
 
     @classmethod
     def default_profile(cls) -> Profile:
         """Return the registered default `Profile` for this model."""
-        return model_default_profile(model_label(cls))
+        return model_default_profile(validate.model_label(cls))
 
     @classmethod
     def get_profile(cls, name: str | None = None) -> Profile:
@@ -233,7 +206,7 @@ class ModelDef:
     @classmethod
     def validate_hf_config(cls, hf_config: Any) -> EligibilityResult:
         """Validate `hf_config` against this model's schedule and geometry."""
-        return validate_model_hf_config(cls, hf_config)
+        return validate.validate_model_hf_config(cls, hf_config)
 
     @classmethod
     def reference_step(
@@ -254,9 +227,46 @@ class ModelDef:
         if not cls.schedule:
             return spec_reference_step(cls.to_model_spec(g, R=ex.R), *args, **kw)
         sched = cls.resolve_schedule(g)
-        validate_norms(cls, sched, None, g.eps, expected_zc=g.zero_centered_norm)
+        validate.validate_norms(
+            cls, sched, None, g.eps, expected_zc=g.zero_centered_norm
+        )
         return composed_reference_step(sched, cls.final_norm, *args, **kw)
 
+
+_raw_geom_shrink = ModelGeometry.shrink
+
+
+def _from_hf_get(
+    self: FromHF, obj: Any, owner: type[Any] | None = None
+) -> FromHF | _BoundFromHF:
+    if (
+        isinstance(owner, type)
+        and issubclass(owner, ModelDef)
+        and owner is not ModelDef
+    ):
+        return _BoundFromHF(self, owner)
+    return self
+
+
+def _geom_shrink(self: ModelGeometry, **kw: Any) -> ModelGeometry:
+    shrunk = _raw_geom_shrink(self, **kw)
+    if (mdef := getattr(self, "_model_def", None)) is not None:
+        object.__setattr__(shrunk, "_model_def", mdef)
+    return shrunk
+
+
+def _geom_to_model_spec(self: ModelGeometry) -> ModelSpec:
+    """Convert this geometry into its declarative `ModelSpec`."""
+    if (mdef := getattr(self, "_model_def", None)) is not None:
+        return mdef.to_model_spec(self)
+    raise MegakernelConfigError(
+        "ModelGeometry is not bound to a ModelDef; call ModelDef.to_model_spec(g)"
+    )
+
+
+type.__setattr__(FromHF, "__get__", _from_hf_get)
+type.__setattr__(ModelGeometry, "shrink", _geom_shrink)
+type.__setattr__(ModelGeometry, "to_model_spec", _geom_to_model_spec)
 
 _MODEL_REGISTRY: dict[str, type[ModelDef]] = {}
 _ARCH_REGISTRY: dict[str, type[ModelDef]] = {}
@@ -272,12 +282,13 @@ def register_model(
 ) -> Callable[[type[ModelDef]], type[ModelDef]]:
     """Class decorator registering a declarative `ModelDef` subclass."""
     archs = tuple(hf_architectures)
-    if hf_model_type is None:
-        mtypes: tuple[str, ...] = ()
-    elif isinstance(hf_model_type, str):
-        mtypes = (hf_model_type,)
-    else:
-        mtypes = tuple(hf_model_type)
+    mtypes = (
+        ()
+        if hf_model_type is None
+        else (
+            (hf_model_type,) if isinstance(hf_model_type, str) else tuple(hf_model_type)
+        )
+    )
 
     def _decorator(cls: type[ModelDef]) -> type[ModelDef]:
         if name in _MODEL_REGISTRY and not replace:
@@ -302,15 +313,13 @@ def register_model(
                     raise MegakernelConfigError(
                         f"{kind} {k!r} is already registered to {prev.name!r}"
                     )
-        validate_model_def(cls, name, archs, mtypes, ModelDef)
+        validate.validate_model_def(cls, name, archs, mtypes, ModelDef)
         if replace:
             old_cls = _MODEL_REGISTRY.get(name)
             for reg in (_ARCH_REGISTRY, _MODEL_TYPE_REGISTRY):
                 for k in [rk for rk, rv in reg.items() if rv in (cls, old_cls)]:
                     del reg[k]
-        cls.name = name
-        cls.hf_architectures = archs
-        cls.hf_model_type = mtypes
+        cls.name, cls.hf_architectures, cls.hf_model_type = name, archs, mtypes
         cls.profiles = FrozenDict(cls.profiles or {})
         for prof in cls.profiles.values():
             register_profile(prof, replace=replace)

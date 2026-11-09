@@ -709,6 +709,20 @@ def test_synthetic_model_def_every2_spec_reference_and_override_errors(
         lm_head = LMHead("lm_head", tied_to=None)
 
     assert SynthHybrid.default_profile() is DEFAULT_PROFILE
+    raw_fhf = SynthHybrid.__dict__["geometry"]
+    assert raw_fhf.__get__(None, ModelDef) is raw_fhf
+
+    class _FakeProbeOwner:
+        _IS_MODEL_DEF = True
+
+    assert raw_fhf.__get__(None, _FakeProbeOwner) is raw_fhf
+    sub_named_base = type("ModelDef", (SynthHybrid,), {})
+    bound_sub = raw_fhf.__get__(None, sub_named_base)
+    assert isinstance(bound_sub, model_def._BoundFromHF)
+    assert bound_sub == raw_fhf and repr(bound_sub) == repr(raw_fhf)
+    assert SynthHybrid.geometry.fields == raw_fhf.fields
+    assert SynthHybrid.geometry.resolve(synth_hf_cfg) == raw_fhf.resolve(synth_hf_cfg)
+
     g_full = SynthHybrid.geometry()
     assert (g_full.L, g_full.att_every, g_full.H, g_full.NH, g_full.E, g_full.TOPK) == (
         12,
@@ -729,6 +743,7 @@ def test_synthetic_model_def_every2_spec_reference_and_override_errors(
         tiles=dataclasses.replace(TINY_TILES, bank=512 << 10, nbd=6),
     )
     g_tiny = SynthHybrid.shrink(R=ex.R)
+    assert getattr(g_full.shrink(R=ex.R), "_model_def", None) is SynthHybrid
     assert (
         g_tiny.L,
         g_tiny.att_every,
@@ -740,9 +755,12 @@ def test_synthetic_model_def_every2_spec_reference_and_override_errors(
         g_tiny.IS,
     ) == (4, 2, 4, 4, 8, 2, 512, 512)
     g_tiny.check(ex)
+    assert_specs_equal(g_tiny.to_model_spec(), SynthHybrid.to_model_spec(g_tiny, R=8))
 
     g_unbound = dataclasses.replace(g_tiny)
     assert getattr(g_unbound, "_model_def", None) is None
+    with pytest.raises(MegakernelConfigError, match="not bound to a ModelDef"):
+        g_unbound.to_model_spec()
     ms = SynthHybrid.to_model_spec(g_unbound, R=ex.R)
     assert getattr(g_unbound, "_model_def", None) is None
     assert ms.name == "synth_hybrid"
