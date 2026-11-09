@@ -18,6 +18,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import re
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from types import SimpleNamespace
@@ -2779,6 +2780,48 @@ def test_mtp_draft_follows_the_contract(tmp_path) -> None:
     assert mtp_state["index"] == len(target_states)
     draft = [o for o in variant["outputs"] if o["name"] == "draft_tokens"]
     assert draft[0]["shape"] == [8, 1] and draft[0]["dtype"] == "i32"
+
+
+class _SlotMtpExportableLLM(_TinyMtpExportableLLM):
+    """The tiny MTP model whose draft can run for only the first `draft_slots`
+    requests, as the universal adapter's drafters do."""
+
+    def mtp_draft(  # type: ignore[override]
+        self, weights, kv_caches, *, draft_slots=None, **controls
+    ):
+        kvs, tokens = super().mtp_draft(weights, kv_caches, **controls)
+        n = tokens.shape[0] if draft_slots is None else draft_slots
+        pad = tokens.new_zeros((tokens.shape[0] - n, tokens.shape[1]))
+        return kvs, torch.cat([tokens[:n], pad])
+
+
+def test_draft_slot_counts_are_powers_of_two_up_to_a_buckets_requests() -> None:
+    assert exporter.draft_slot_counts(16, 64) == [1, 2, 4, 8, 16]
+    assert exporter.draft_slot_counts(1024, 64) == [1, 2, 4, 8, 16, 32, 64]
+    assert exporter.draft_slot_counts(48, 64) == [1, 2, 4, 8, 16, 32, 48]
+    assert exporter.draft_slot_counts(8, 1) == [1]
+
+
+def test_a_draft_taking_draft_slots_is_one_module_branching_on_the_request_count(
+    tmp_path,
+) -> None:
+    plain = json.loads(
+        Path(_export_mtp(tmp_path / "plain"), "metadata.json").read_text()
+    )["functions"]["draft"]
+    out_dir = _export_mtp(tmp_path / "slots", _SlotMtpExportableLLM)
+    functions = json.loads(Path(out_dir, "metadata.json").read_text())["functions"]
+    # The artifact contract is unchanged: the same executables, inputs and outputs.
+    assert functions["draft"] == plain
+    for bucket in ("8", "16"):
+        mlir = Path(out_dir, functions["draft"][bucket]["file_path"]).read_text()
+        assert mlir.count('"stablehlo.case"') == 1
+        assert f"_slots{max(exporter.draft_slot_counts(int(bucket), 8))}" not in mlir
+        found = re.findall(r"func\.func private @branch_(\d+)\(", mlir)
+        branches = sorted(int(n) for n in found)
+        assert branches == exporter.draft_slot_counts(int(bucket), 8)
+        # The composed `@main` keeps the donated state aliased to its output.
+        main = mlir[mlir.index("func.func public @main") :].split("\n", 1)[0]
+        assert "tf.aliasing_output" in main or "jax.buffer_donor" in main
 
 
 class _KvSharingMtpExportableLLM(_TinyMtpExportableLLM):
