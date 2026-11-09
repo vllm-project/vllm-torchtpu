@@ -155,6 +155,10 @@ def main() -> None:
     ap.add_argument("--keep-pods", action="store_true")
     ap.add_argument("--env", action="append", default=[], metavar="KEY=VAL",
                     help="extra env for both servers (repeatable)")
+    ap.add_argument("--decode-env", action="append", default=[], metavar="KEY=VAL",
+                    help="extra env for the decode server only (repeatable)")
+    ap.add_argument("--prefill-env", action="append", default=[], metavar="KEY=VAL",
+                    help="extra env for the prefill server only (repeatable)")
     ap.add_argument("--proxy-dp-size", type=int, default=8,
                     help="proxy pins decode requests over this many DP ranks (0 = server LB)")
     ap.add_argument("--no-extra-whls", action="store_true", help="skip scripts/pd/whls/*.whl")
@@ -277,6 +281,7 @@ def main() -> None:
                     "ENABLE_DSPARK": "0" if r == "prefill" else str(a.enable_dspark),
                     "GPU_MEMORY_UTILIZATION": a.gpu_mem,
                     **dict(kv.split("=", 1) for kv in a.env),
+                    **dict(kv.split("=", 1) for kv in (a.decode_env if r == "decode" else a.prefill_env)),
                 }
                 env_sh = "".join(f"export {kk}='{vv}'\n" for kk, vv in env.items())
                 k.exec_sh(dl + f"cat > /tmp/pd_env.sh <<'EOF'\n{env_sh}EOF\n"
