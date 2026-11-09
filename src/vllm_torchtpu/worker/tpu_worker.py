@@ -50,7 +50,7 @@ from vllm_torchtpu import envs, profiler_trace, utils
 from vllm_torchtpu.distributed.pcp_rank_order import pcp_topology_order
 from vllm_torchtpu.layers.adapter.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.megakernel import adapter as megakernel_runtime
+from vllm_torchtpu.megakernel import adapter as megakernel_adapter
 from vllm_torchtpu.runner.tpu_pooling import compute_pooling_kv_cache_cap_bytes
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.worker.runai_repull import ensure_runai_aux_files
@@ -866,7 +866,7 @@ class TPUWorker(WorkerBase):
         transpose_keys: dict[str, tuple[int]],
         reshard_fn=None,
     ) -> None:
-        megakernel_runtime.guard_weight_update(self.model_runner)
+        megakernel_adapter.guard_weight_update(self.model_runner)
         return self.model_runner._sync_weights(
             updated_weights=updated_weights,
             mappings=mappings,

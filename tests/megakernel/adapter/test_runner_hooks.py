@@ -43,7 +43,7 @@ def test_runner_dummy_run_forward_is_suppressed() -> None:
         call = item.context_expr
         return (
             isinstance(call, ast.Call)
-            and ast.unparse(call.func) == "megakernel_runtime.suppressed"
+            and ast.unparse(call.func) == "megakernel_adapter.suppressed"
             and [ast.unparse(a) for a in call.args] == ["self"]
         )
 
@@ -92,7 +92,7 @@ def _runner_forward_model() -> Any:
     from pathlib import Path
 
     import vllm_torchtpu
-    from vllm_torchtpu.megakernel import adapter as megakernel_runtime
+    from vllm_torchtpu.megakernel import adapter as megakernel_adapter
 
     path = Path(vllm_torchtpu.__file__).parent / "runner" / "tpu_runner.py"
     src = path.read_text(encoding="utf-8")
@@ -103,7 +103,7 @@ def _runner_forward_model() -> Any:
     )
     fn_src = textwrap.dedent(ast.get_source_segment(src, fn) or "")
     ns: dict[str, Any] = {
-        "megakernel_runtime": megakernel_runtime,
+        "megakernel_adapter": megakernel_adapter,
         "IntermediateTensors": _FakeIntermediateTensors,
     }
     exec(compile(fn_src, str(path), "exec"), ns)
@@ -218,7 +218,7 @@ def test_worker_sync_weights_runs_the_weight_update_guard() -> None:
         if isinstance(n, ast.FunctionDef) and n.name == "sync_weights"
     )
     first = ast.unparse(fn.body[0])
-    assert first == "megakernel_runtime.guard_weight_update(self.model_runner)"
+    assert first == "megakernel_adapter.guard_weight_update(self.model_runner)"
 
 
 def _worker_compile_or_warm_up_model() -> Any:

@@ -145,7 +145,7 @@ from vllm_torchtpu.layers.core.sequence_layout import (
     create_sequence_layout_planner,
 )
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.megakernel import adapter as megakernel_runtime
+from vllm_torchtpu.megakernel import adapter as megakernel_adapter
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
 )
@@ -5354,7 +5354,7 @@ class TPUModelRunner(GPUModelRunner):
 
         # Ensure attention custom ops exist before any compile/inference path,
         self._initialize_pallas_kernels()
-        self._megakernel = megakernel_runtime.maybe_create(self)
+        self._megakernel = megakernel_adapter.maybe_create(self)
 
         from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4 import (  # noqa: E501
             VllmCompressedTensorsW4ANMxfp4MoEMethod,
@@ -5735,7 +5735,7 @@ class TPUModelRunner(GPUModelRunner):
             ),
             # Dummy, precompile and profile forwards always run (and so
             # compile) the stock model, even where the megakernel would serve.
-            megakernel_runtime.suppressed(self),
+            megakernel_adapter.suppressed(self),
         ):
             if self.supports_mm_inputs and self._pp_is_first:
                 input_ids, inputs_embeds = self._get_model_inputs(input_ids, None)
@@ -7747,7 +7747,7 @@ class TPUModelRunner(GPUModelRunner):
             # through the normalization below.
             hit, out = self._megakernel.try_forward(
                 self,
-                megakernel_runtime.StepContext(
+                megakernel_adapter.StepContext(
                     input_ids=input_ids,
                     positions=positions,
                     inputs_embeds=inputs_embeds,
