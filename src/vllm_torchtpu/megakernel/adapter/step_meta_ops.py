@@ -13,7 +13,7 @@
 # limitations under the License.
 """`TorchStepMetaOps`: the library's `StepMetaOps` step-metadata primitives
 over `torch.Tensor` (Dynamo `fullgraph=True` safe), for programs that pack
-their step metadata with `megakernel.runtime.step_meta`."""
+their step metadata with `megakernel.core.runtime.step_meta`."""
 
 from __future__ import annotations
 

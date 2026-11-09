@@ -13,10 +13,10 @@
 # limitations under the License.
 """CPU end-to-end test of this megakernel folder (fake runner, no TPU).
 
-The runtime loads `SPEC` by this folder's package name, runs its startup
+The adapter loads `SPEC` by this folder's package name, runs its startup
 checks on a fake runner, and `create` builds a program for a tiny geometry;
 the program loads, binds the runner's raw pools, warms up and serves a decode
-step through the CPU-interpret kernel (the runtime test kit's `run_cpu_e2e`).
+step through the CPU-interpret kernel (the adapter test kit's `run_cpu_e2e`).
 Only relative imports of the folder, so a copy under another package name runs
 it unchanged.
 """

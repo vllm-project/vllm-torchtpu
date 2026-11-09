@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Thin PyTorch/vLLM adapter for the `megakernel` runtime library."""
+"""Thin PyTorch/vLLM driver over the `megakernel.core` library."""
 
 from __future__ import annotations
 

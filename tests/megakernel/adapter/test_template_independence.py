@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The runtime is model-independent: no runtime module and no runtime test
+"""The adapter is model-independent: no adapter module and no adapter test
 imports a model folder (`vllm_torchtpu.models.<model>.megakernel`) or a model
 folder's tests (`tests/models/`). A model folder is named by string only (a
 shorthand or a `module:attr` plugin reference); the toy plugin in

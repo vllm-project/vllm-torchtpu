@@ -71,7 +71,7 @@ def pytest_configure(config: pytest.Config) -> None:
 
 @pytest.fixture(autouse=True)
 def _std_megakernel_loggers(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Route the lazy vLLM loggers of the imported runtime modules to
+    """Route the lazy vLLM loggers of the imported adapter modules to
     `logging` when vLLM is absent (CPU)."""
     for name in sorted(n for n in sys.modules if n.startswith(_RUNTIME)):
         lazy = getattr(sys.modules[name], "logger", None)

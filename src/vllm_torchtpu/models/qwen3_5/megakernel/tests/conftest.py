@@ -23,6 +23,6 @@ from vllm_torchtpu.megakernel.adapter.testkit import route_lazy_loggers
 
 @pytest.fixture(autouse=True)
 def _std_loggers(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Route the runtime's and this folder's lazy vLLM loggers to `logging`
+    """Route the adapter's and this folder's lazy vLLM loggers to `logging`
     when vLLM is absent (CPU)."""
     route_lazy_loggers(monkeypatch, (__package__ or "").rpartition(".")[0])

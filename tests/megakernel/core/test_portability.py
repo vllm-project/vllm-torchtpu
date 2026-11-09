@@ -270,7 +270,7 @@ def _assert_package_is_framework_free(pkg: str) -> None:
                 else:
                     assert node.level == 1, (
                         f"{pkg}/{path.name}:{_ln(node)} relative import level "
-                        f"{node.level} leaves the megakernel package"
+                        f"{node.level} leaves megakernel/core"
                     )
 
 
@@ -352,7 +352,7 @@ def test_no_model_names_in_core_and_adapter():
     rt_root = pkg_root.parent / "adapter"
     forbidden_tokens = ("qwen", "llama", "deepseek", "mistral", "gemma")
 
-    # Model folders are plugins; the runtime names them by string in two
+    # Model folders are plugins; the adapter names them by string in two
     # tables: the shorthand templates and the replacements of removed exports.
     allowed = {
         "adapter/plugin.py": _assignment_lines(rt_root / "plugin.py", "SHORTHANDS"),

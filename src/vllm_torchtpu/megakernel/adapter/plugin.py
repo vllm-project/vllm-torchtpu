@@ -11,13 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Runtime-facing views for megakernel model folders.
+"""Adapter-facing views for megakernel model folders.
 
 The model contract itself (`TpuMonoSpec`, the `MonoProgram` protocol,
 `Bucket`, `RunnerShape`, `WarmupCase`, `Decline`, `LayoutDecline`,
 `StepDecision`, `EligibilityResult`, the feature / parallelism / `requires`
-vocabularies) lives in the framework-free `megakernel.runtime.contract`;
-import it from there (its only import path). Here are the runtime's own
+vocabularies) lives in the framework-free `megakernel.core.runtime.contract`;
+import it from there (its only import path). Here are the adapter's own
 facts about the runner, `RunnerView` (startup / bind) and `ForwardView` (per
 step), and the shorthands: the built-in table and the model folders
 discovered by their `SPEC` (`shorthands()`).
@@ -65,7 +65,7 @@ class Shorthand(NamedTuple):
 
 
 # Built-in templates by shorthand name. Imported by string only, so the
-# runtime never imports a template at module load.
+# adapter never imports a template at module load.
 SHORTHANDS: Mapping[str, Shorthand] = {
     "qwen35": Shorthand(
         module="vllm_torchtpu.models.qwen3_5.megakernel",
@@ -293,9 +293,9 @@ class ForwardView:
     `mrope_positions` the runner's host M-RoPE positions (read-only, or
     `None`), `steps` the compiled `StepFn` per bucket key and `num_tokens`
     the row count the stock model would return. `batch_shape(attn_md, m0)`
-    is the runtime's host-only batch inspection; the program passes its
+    is the adapter's host-only batch inspection; the program passes its
     attention and first recurrent layer metadata, used only when the runner
-    can't describe the batch itself. Built once per step by the runtime;
+    can't describe the batch itself. Built once per step by the adapter;
     programs treat it as read-only.
     """
 

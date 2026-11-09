@@ -22,7 +22,7 @@
 - `run_two_ranks(...)` / `assert_rank_uniform_declines(...)`: a plugin's
   startup on two real gloo ranks; a decline on any rank declines every rank,
   and nothing hangs.
-- `route_lazy_loggers(monkeypatch, *packages)`: route the runtime's (and a
+- `route_lazy_loggers(monkeypatch, *packages)`: route the adapter's (and a
   folder's) lazy vLLM loggers to `logging` when vLLM is absent.
 - `write_plugin`: write a single-file plugin module (e.g. one skewed per rank).
 - Fixture `mk_fake_runner` (the `testing.fake_runner` factory); import it
@@ -64,7 +64,7 @@ def write_plugin(directory: Path, source: str, module: str) -> Path:
 
 
 def route_lazy_loggers(monkeypatch: pytest.MonkeyPatch, *packages: str) -> None:
-    """Route the lazy vLLM loggers of the runtime and of the already imported
+    """Route the lazy vLLM loggers of the adapter and of the already imported
     modules of `packages` to `logging` when vLLM is absent (CPU)."""
     importlib.import_module(_RUNTIME_PREFIX + "driver")
     prefixes = (_RUNTIME_PREFIX, *(f"{p}." for p in packages), *packages)
@@ -104,7 +104,7 @@ def check_plugin_spec(
     """Check a plugin's `SPEC` (a module name, `"module:attr"`, the module or
     the spec itself) and return it; raises `AssertionError` on a problem.
 
-    The spec must be a `TpuMonoSpec` of this runtime's API with well-formed
+    The spec must be a `TpuMonoSpec` of this adapter's API with well-formed
     `decline_codes`, and its `create` (and `layout_request`, if a string)
     must resolve. `create` must be a lazy `"module:attr"` string when
     `lazy_create` is true (default: when the plugin is a package, i.e. a
@@ -374,7 +374,7 @@ def assert_rank_uniform_declines(tmp_path: Path, **kwargs: Any) -> list[dict[str
 @pytest.fixture
 def mk_fake_runner(monkeypatch: pytest.MonkeyPatch) -> Callable[..., Any]:
     """The `fake_runner` factory, with `VLLM_TPU_MEGAKERNEL` unset and the
-    runtime's lazy loggers routed to `logging`."""
+    adapter's lazy loggers routed to `logging`."""
     monkeypatch.delenv("VLLM_TPU_MEGAKERNEL", raising=False)
     route_lazy_loggers(monkeypatch)
     return fake_runner

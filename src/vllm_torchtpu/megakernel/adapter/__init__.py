@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""PyTorch/vLLM runtime bridge, weight collector, and driver for `megakernel`."""
+"""PyTorch/vLLM adapter (bridge, weight collector, driver) for `megakernel`."""
 
 from __future__ import annotations
 

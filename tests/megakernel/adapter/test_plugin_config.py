@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The runtime config against the library's runtime-config parser, and the
+"""The adapter config against the library's runtime-config parser, and the
 driver with a missing shorthand template."""
 
 from __future__ import annotations
@@ -93,7 +93,7 @@ _LEGACY_ADD = (
 @pytest.fixture
 def _template_profile_names(monkeypatch: pytest.MonkeyPatch) -> None:
     """The legacy inputs name the Qwen3.5 template's profiles; register
-    stand-ins under those names (the runtime's tests import no model folder)."""
+    stand-ins under those names (the adapter's tests import no model folder)."""
     from vllm_torchtpu.megakernel.core import Profile, register_profile
     from vllm_torchtpu.megakernel.core import profile as profile_mod
 
@@ -144,7 +144,7 @@ def _enabled_by_rule(*sources: Any) -> bool:
 def test_legacy_inputs_match_parse_runtime_config(env: Any, add: Any) -> None:
     """Legacy syntaxes resolve to what `parse_runtime_config` gives: the
     runtime keys directly, the template settings through `options`. `enabled`
-    follows the runtime's rule instead: an earlier explicit off holds over a
+    follows the adapter's rule instead: an earlier explicit off holds over a
     later source's settings (`parse_runtime_config` turns such a source on)."""
     from vllm_torchtpu.megakernel.core.runtime import parse_runtime_config
 

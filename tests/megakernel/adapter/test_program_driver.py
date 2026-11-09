@@ -101,7 +101,7 @@ def test_toy_plugin_serves_through_try_forward(
     drv.on_warmup_done(runner)
     drv.on_warmup_done(runner)
     assert prog.events[-1] == "warm" and prog.events.count("warm") == 1
-    # Runtime-enumerated runner shapes: first padding >= B, x every
+    # Adapter-enumerated runner shapes: first padding >= B, x every
     # (req, blk) pair; ckpt_cols = max(T, ckpt_window).
     assert [(k, s) for k, s, _ in prog.warmed] == [
         ((1, 4), RunnerShape(16, 8, 4, 1)),

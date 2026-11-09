@@ -13,7 +13,7 @@
 # limitations under the License.
 """Minimal `ArrayOps` and `WeightSource` protocols for generic weight loading.
 
-The core weight loader (`megakernel.weights`) never imports `torch` or `vllm`
+The core weight loader (`megakernel.core.weights`) never imports `torch` or `vllm`
 and never branches on the concrete source type. Instead, every `WeightSource`
 exposes an `ops: ArrayOps` implementation (`slice_axis`, `concat`, `reshape`,
 `transpose`, `pad`, `cast`, `is_fp8`, `dequantize`, `quantize_fp8`, `zeros`,

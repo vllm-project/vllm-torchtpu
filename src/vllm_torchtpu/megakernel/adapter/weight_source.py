@@ -29,7 +29,7 @@ via `vllm_torchtpu.megakernel.core.weights.load_weights`:
   copies on compiled steps.
 
 No `megakernel` library imports at module level: the library's weight
-packing (`megakernel.weights`) and the MoE expert-copy helper
+packing (`megakernel.core.weights`) and the MoE expert-copy helper
 (`weight_collector.extract_ecopy_layer`) are imported when a weight load
 runs. The MoE / library-geometry helpers are in `weight_collector`.
 """

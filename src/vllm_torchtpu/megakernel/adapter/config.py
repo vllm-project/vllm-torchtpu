@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Megakernel runtime config and plugin loading (stdlib only).
+"""Megakernel adapter config and plugin loading (stdlib only).
 
 Sources, in order: `VLLM_TPU_MEGAKERNEL`, then `additional_config["megakernel"]`.
 Each is unset (`None` or an empty string), a bool, a string or a mapping. A
@@ -438,7 +438,7 @@ def _is_package_or_parent(name: str | None, module: str) -> bool:
 def missing_template(ref: PluginRef, hf_config: Any = None) -> str | None:
     """The log line when `ref` is a shorthand template whose module isn't
     installed (`None` otherwise). Shorthands are imported by string, so the
-    runtime works without the model folders; then the megakernel stays off.
+    adapter works without the model folders; then the megakernel stays off.
     An explicit plugin reference that doesn't import is an error instead.
 
     `find_spec` imports the parent packages, so a `ModuleNotFoundError` from
@@ -478,7 +478,7 @@ def import_plugin(ref: PluginRef) -> tuple[TpuMonoSpec, ModuleType]:
     if int(plugin.api_version) != API_VERSION:
         raise MegakernelConfigError(
             f"megakernel plugin {ref.module}:{ref.attr} targets api_version "
-            f"{plugin.api_version}; this runtime supports {API_VERSION}"
+            f"{plugin.api_version}; this adapter supports {API_VERSION}"
         )
     return plugin, module
 

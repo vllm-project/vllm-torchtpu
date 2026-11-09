@@ -15,7 +15,7 @@
 
 The serving framework's stock GDN v3 kernel (`kernels.gdn.v3.wrapper.
 fused_conv1d_gdn`) owns the unified-pool state layout; the megakernel's split
-gather / scatter (`megakernel.pool`, `PoolLayout(conv_dtype=f32)`) must read and
+gather / scatter (`megakernel.core.pool`, `PoolLayout(conv_dtype=f32)`) must read and
 write the same bytes. These tests check that contract with the stock kernel as
 the oracle instead of a hand-written layout:
 

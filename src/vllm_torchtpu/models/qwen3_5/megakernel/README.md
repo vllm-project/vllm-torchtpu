@@ -2,12 +2,12 @@
 
 This folder serves Qwen3.5-397B-A17B with the TPU megakernel: one Pallas
 kernel per decode (`T=1`) or MTP verify (`T=4`) step, plugged into the
-vLLM-TorchTPU runner through the megakernel runtime. It is also the template
+vLLM-TorchTPU runner through the megakernel adapter. It is also the template
 to copy for a new model.
 
 | File | What it holds |
 |---|---|
-| `__init__.py` | `SPEC`: the `TpuMonoSpec` the runtime loads (stdlib only) |
+| `__init__.py` | `SPEC`: the `TpuMonoSpec` the adapter loads (stdlib only) |
 | `adapter.py` | `create` and `Qwen35Program`: options, eligibility, weights, cache binding, per-step routing |
 | `model.py` | `Qwen35`: the declarative `ModelDef` (geometry, schedule, weights); `register()` |
 | `pool.py` | the raw KV+GDN pool layout |
@@ -52,13 +52,13 @@ JAX_PLATFORMS=cpu pytest src/vllm_torchtpu/models/qwen3_5/megakernel/tests
 JAX_PLATFORMS=cpu pytest tests/models/qwen3_5/megakernel -n 8
 ```
 
-The first runs the folder's own end-to-end test: `SPEC` loads, the runtime's
+The first runs the folder's own end-to-end test: `SPEC` loads, the adapter's
 startup checks pass on a fake runner, `create` builds a program for a tiny
 geometry, and the program binds, warms up and serves a decode step through
 the CPU-interpret kernel. The second is the full suite (bit-exact golden
 hashes, the reference checks, the vLLM integration tests).
 
-The folder's test uses the runtime's plugin test kit,
+The folder's test uses the adapter's plugin test kit,
 `vllm_torchtpu.megakernel.adapter.testkit`:
 
 - `check_plugin_spec("<package>")`: `SPEC` is valid, `create` is a lazy
@@ -182,7 +182,7 @@ is the default profile's; the bound line names the served profile's.
 | Server settings | `--mamba-ssm-cache-dtype bfloat16` | anything else (`requires_unmet:mamba_ssm_cache_dtype`) |
 | Checkpoint | Qwen3.5-397B-A17B (FP8), its 60-layer hybrid GQA / GDN + MoE geometry | dense Qwen3.5 checkpoints, other geometries (`non_moe_checkpoint`, `geometry_mismatch`) |
 
-The runtime checks the chip, TP size, parallelism, features and server
+The adapter checks the chip, TP size, parallelism, features and server
 settings from `SPEC` before `create` runs; the checkpoint checks are
 `create`'s.
 

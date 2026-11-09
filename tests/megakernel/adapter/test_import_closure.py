@@ -11,11 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The model-agnostic runtime imports without the megakernel library.
+"""The model-agnostic adapter imports without the megakernel library.
 
 With every `vllm_torchtpu.megakernel.core` module blocked except the package, its
 errors and the framework-free `runtime.contract` / `runtime.stats`, the
-runtime modules that land first (config, fingerprint, salt, plugin, hooks,
+adapter modules that land first (config, fingerprint, salt, plugin, hooks,
 testing, agreement, guards, driver, the generic jax bridge and weight source,
 the plugin test kit and scaffold) import fine. The library-bound pieces
 (`exported_bridge`, `weight_collector`, `step_meta_ops`, `pool_facts`) are not

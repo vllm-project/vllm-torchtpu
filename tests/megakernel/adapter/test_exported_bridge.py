@@ -371,7 +371,7 @@ def test_verify_compiled_step_ir() -> None:
 def test_verify_pooled_step_hlo_compile_on_mock_mesh_is_config_error():
     """`compile_hlo=True` on a non-`jax.Device` mesh is a config error, not layout.
 
-    `MegakernelConfigError` must not be a `ValueError`, so runtime code that
+    `MegakernelConfigError` must not be a `ValueError`, so adapter code that
     disables the megakernel on `ValueError` (incompatible KV layout) cannot
     swallow it.
     """

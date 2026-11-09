@@ -13,7 +13,7 @@
 # limitations under the License.
 """Test helpers for megakernel plugins: a CPU stand-in for `TPUModelRunner`.
 
-`fake_runner(...)` sets every attribute `RunnerView` and the runtime's
+`fake_runner(...)` sets every attribute `RunnerView` and the adapter's
 startup checks read, with serving-like defaults (TP=1, no draft, no
 connectors, the KV cache initialized), so a plugin's `create` / `bind` /
 `decide` can run on CPU. `RunnerView` reads them directly: a runner stand-in

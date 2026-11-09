@@ -13,7 +13,7 @@
 # limitations under the License.
 """`build_jax_step_op`: a JAX step as a torch callable, run by JAX on CPU;
 its fake kernel's shapes with sharded specs; the typed step wrapper; and a
-toy plugin whose `StepFn` is one, serving through the runtime."""
+toy plugin whose `StepFn` is one, serving through the adapter."""
 
 from __future__ import annotations
 

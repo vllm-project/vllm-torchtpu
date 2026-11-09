@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The runtime tests' toy plugin: `y = x * scale + B` in pure torch, as the
+"""The adapter tests' toy plugin: `y = x * scale + B` in pure torch, as the
 single-file module `toy_mk_plugin`, and the `mk_toy_plugin` fixture that puts it
 on `sys.path`."""
 

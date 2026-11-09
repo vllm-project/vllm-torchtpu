@@ -181,7 +181,7 @@ def create(view: RunnerView, options: Mapping[str, Any]) -> Qwen35Program | Decl
 
     Runs no collective and loads no weights (the mesh doesn't exist yet). The
     chip, TP size, parallelism, features and required server settings are the
-    runtime's checks (`SPEC`), done before this runs.
+    adapter's checks (`SPEC`), done before this runs.
     """
     cfg = parse_options(options)
     if cfg["profile"] is None:
@@ -246,7 +246,7 @@ class Qwen35Program:
     """The Qwen3.5 megakernel on one TP rank (a `MonoProgram`).
 
     Passing `mesh` loads immediately (direct use and tests); `create` leaves
-    it to `load(mesh)`, after the runtime's first agreement.
+    it to `load(mesh)`, after the adapter's first agreement.
     """
 
     def __init__(
@@ -360,7 +360,7 @@ class Qwen35Program:
         return self.model_def.to_model_spec(geom)
 
     def load(self, mesh: Any) -> None:
-        """Build the spec and pack the weights (after the runtime's agreement:
+        """Build the spec and pack the weights (after the adapter's agreement:
         the EP->TP reshard all-gathers across ranks)."""
         self.mesh = mesh
         r_cnt = int(mesh.devices.size)
@@ -548,7 +548,7 @@ class Qwen35Program:
         comparison, which declines them.
 
         This replaces `self.spec` before the comparison; on a decline the
-        runtime replaces the whole driver, so nothing else sees it.
+        adapter replaces the whole driver, so nothing else sees it.
         `PoolBackend.with_layout` raises `ValueError` (voted `bind_error`) for
         a backend not built by `make_pool_backend`.
         """
@@ -1041,7 +1041,7 @@ class Qwen35Program:
         self, decision: mk_rt.StepDecision | None, ctx: Any, fwd: ForwardView
     ) -> torch.Tensor:
         """Execute one full-backbone decode (`T=1`) or MTP verify (`T=4`) step
-        (the runtime calls it under `torch.no_grad()`)."""
+        (the adapter calls it under `torch.no_grad()`)."""
         input_ids, positions = ctx.input_ids, ctx.positions
         prepared, self._prepared = self._prepared, None
         if decision is not None and prepared is not None:

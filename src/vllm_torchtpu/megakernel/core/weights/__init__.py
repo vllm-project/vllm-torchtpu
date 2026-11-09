@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Generic declarative weight loaders and packers (`megakernel.weights`).
+"""Generic declarative weight loaders and packers (`megakernel.core.weights`).
 
 Sublayers:
 - `ops`, `eplb`, `spec_pack`: `ArrayOps`/`WeightSource` protocols, alias

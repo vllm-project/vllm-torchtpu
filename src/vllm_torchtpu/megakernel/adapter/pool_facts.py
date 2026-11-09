@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The framework's recurrent pool slot, as `megakernel.runtime.PoolLayoutFacts`.
+"""The framework's recurrent pool slot, as `megakernel.core.runtime.PoolLayoutFacts`.
 
 Built only from what vllm-torchtpu itself uses to lay out the pool: the GDN
 layer's declared state dtypes, resolved through `gdn_pool_layout` exactly as

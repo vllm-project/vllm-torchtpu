@@ -15,7 +15,7 @@
 (`src/vllm_torchtpu/models/*/megakernel/**`).
 
 A model folder imports its own files relatively (so a copy under another
-package name works), uses only the runtime's public surface (not the driver,
+package name works), uses only the adapter's public surface (not the driver,
 config, fingerprint or salt modules, nor the vLLM runner), imports no private
 library names, and registers nothing at import time.
 """

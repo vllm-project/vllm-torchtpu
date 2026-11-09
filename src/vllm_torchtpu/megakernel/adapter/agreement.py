@@ -51,7 +51,7 @@ DECLINE_VOTE_CODES: tuple[str, ...] = (
 
 
 def vote_codes(extra: Sequence[str] = ()) -> tuple[str, ...]:
-    """The vote table: the runtime's codes, a plugin's own codes, then `other`."""
+    """The vote table: the adapter's codes, a plugin's own codes, then `other`."""
     base = DECLINE_VOTE_CODES[:-1]
     return (*base, *(c for c in extra if c not in base and c != "other"), "other")
 

@@ -88,7 +88,7 @@ def test_shorthand_table_matches_the_template() -> None:
         {"spec_decode", "mrope", "prefix_caching", "kv_offload"}
     )
     assert qwen_plugin.SPEC.layout_request is None
-    # The runtime enforces these before `create`.
+    # The adapter enforces these before `create`.
     assert qwen_plugin.SPEC.chips == ("TPU7x",)
     assert qwen_plugin.SPEC.tp_sizes == (8,)
     assert qwen_plugin.SPEC.parallelism == frozenset({"tp", "ep_in_tp"})
@@ -391,11 +391,11 @@ _QWEN_DECLINES = frozenset(
         "geometry_mismatch",
         "backbone_not_found",
         # create: `check_startup_eligibility` with the arguments it passes
-        # (no TP size: the runtime checks `SPEC.tp_sizes`)
+        # (no TP size: the adapter checks `SPEC.tp_sizes`)
         "layer_count_mismatch",
         "unaligned_cache_layout",
         # create: `check_post_mesh_eligibility` (no mesh_size, no device_kind:
-        # the runtime checks `SPEC.chips`)
+        # the adapter checks `SPEC.chips`)
         "empty_buckets",
         # bind: slot layout (`compare_layout_facts`) and generic layout errors
         "pool_layout_unknown",
@@ -410,7 +410,7 @@ def _false_result_codes(path: Path, *func_names: str) -> set[str]:
     """Literal codes of `EligibilityResult(False, <code>, ...)` / `Decline(<code>,
     ...)` in the named functions of `path` (all functions if none); a `code`
     variable assigned string literals (or a conditional of them) counts too,
-    and so does a decline-code constant of `megakernel.runtime.contract`."""
+    and so does a decline-code constant of `megakernel.core.runtime.contract`."""
     tree = ast.parse(path.read_text(encoding="utf-8"))
     funcs = [
         n
@@ -467,7 +467,7 @@ def test_every_template_decline_is_in_the_vote_table() -> None:
     assert codes[-1] == "other" and len(set(codes)) == len(codes)
     missing = sorted(c for c in _QWEN_DECLINES if c not in codes[:-1])
     assert missing == [], missing
-    # The template lists only codes the runtime doesn't already have.
+    # The template lists only codes the adapter doesn't already have.
     assert not set(qwen_plugin.SPEC.decline_codes) & set(driver_mod.DECLINE_VOTE_CODES)
 
     # Static scan: the adapter and the library checks it calls emit nothing else.
@@ -483,6 +483,6 @@ def test_every_template_decline_is_in_the_vote_table() -> None:
     assert {"non_moe_checkpoint", "invalid_geometry", "geometry_mismatch"} <= scanned
     assert scanned <= _QWEN_DECLINES, sorted(scanned - _QWEN_DECLINES)
     assert {"unsupported_tpu_chip", "empty_buckets"} <= post
-    # The runtime's chip / TP-size declines come before any vote (`check_spec`,
+    # The adapter's chip / TP-size declines come before any vote (`check_spec`,
     # identical on every rank), so they aren't in the vote table.
     assert not {"unsupported_tpu_chip", "unsupported_tp_size"} & set(codes)

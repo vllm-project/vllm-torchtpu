@@ -456,7 +456,7 @@ def _make_backbone_from_logical_weights(
 
 
 def test_bucket_parsing_and_selection() -> None:
-    """Runtime config parsing with the template's profiles, and the adapter's
+    """Adapter config parsing with the template's profiles, and the adapter's
     options (the bucket-list parsers are tested in `test_bucket_policy.py`)."""
     # Single VLLM_TPU_MEGAKERNEL string forms + additional_config["megakernel"]
     assert not parse_runtime_config("")["enabled"]
@@ -1369,7 +1369,7 @@ def test_maybe_create_disables_on_unsupported_tpu_chip(
     monkeypatch.setattr(logging.getLogger("vllm"), "propagate", True)
     with caplog.at_level(logging.WARNING):
         drv = driver_mod.ProgramDriver.maybe_create(runner)
-    # The runtime's spec check declines identically on every rank: no driver.
+    # The adapter's spec check declines identically on every rank: no driver.
     assert drv is None
     assert "supports chips ('TPU7x',), not 'TPU v5 lite'" in caplog.text
 

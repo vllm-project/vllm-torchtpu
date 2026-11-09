@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Bind-time recurrent pool slot facts, model-free: a `PoolLayout` built
-directly (`megakernel.runtime.layout_facts`) against the framework's view of
+directly (`megakernel.core.runtime.layout_facts`) against the framework's view of
 the same slot (`megakernel.adapter.pool_facts`)."""
 
 from __future__ import annotations

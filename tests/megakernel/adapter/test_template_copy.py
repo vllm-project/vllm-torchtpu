@@ -16,7 +16,7 @@ works: `python -m vllm_torchtpu.megakernel.adapter.new` copies it with fresh
 registry names and provenance headers, the copy's own CPU tests pass, and the
 original and the copy import side by side in one process (neither registers
 anything at import time). The template is named by string only, so the
-runtime's tests import no model folder."""
+adapter's tests import no model folder."""
 
 from __future__ import annotations
 

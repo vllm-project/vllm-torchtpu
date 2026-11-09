@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """The runtime contract: `TpuMonoSpec` validation, the decline and result
-types, and the framework-free import of `megakernel.runtime`."""
+types, and the framework-free import of `megakernel.core.runtime`."""
 
 from __future__ import annotations
 

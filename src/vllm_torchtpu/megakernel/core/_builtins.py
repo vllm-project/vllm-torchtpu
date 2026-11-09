@@ -14,8 +14,8 @@
 """Load the built-in registrations on first registry lookup.
 
 The package `__init__` resolves names lazily, so importing `megakernel` no
-longer imports `megakernel.modules` (module tunables / debug options,
-registered by `Module.__init_subclass__`) or `megakernel.experimental` (the
+longer imports `megakernel.core.modules` (module tunables / debug options,
+registered by `Module.__init_subclass__`) or `megakernel.core.experimental` (the
 fused pool I/O implementation). Registry lookups call `ensure_builtins(...)`
 first, for the packages their registry needs. A missing package (a partial
 tree, or one that moved out) is skipped. Models and their profiles live in

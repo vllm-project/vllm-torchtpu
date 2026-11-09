@@ -11,9 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The plugin-facing surface of the runtime: `RunnerView` on the CPU fake
+"""The plugin-facing surface of the adapter: `RunnerView` on the CPU fake
 runner, `ForwardView`, the shorthand table, `StepContext`, the suppression
-scope and the runtime's errors."""
+scope and the adapter's errors."""
 
 from __future__ import annotations
 
@@ -213,7 +213,7 @@ def test_shorthand_table_entries() -> None:
 
 
 def test_contract_types_have_one_import_path() -> None:
-    """The contract types are imported from `megakernel.runtime.contract`
+    """The contract types are imported from `megakernel.core.runtime.contract`
     only; `plugin` neither exports nor re-binds them."""
     for name in contract.__all__:
         assert not hasattr(plugin_mod, name), name
