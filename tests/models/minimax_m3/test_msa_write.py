@@ -46,6 +46,7 @@ def _batch(q_lens, ctx_lens, rng, pad_tokens):
     return jnp.asarray(pages), jnp.asarray(pos)
 
 
+@pytest.mark.parametrize("by_page", [False, True])
 @pytest.mark.parametrize("dtype", CACHE_DTYPES)
 @pytest.mark.parametrize("width", [128, 256])
 @pytest.mark.parametrize(
@@ -58,7 +59,13 @@ def _batch(q_lens, ctx_lens, rng, pad_tokens):
         ([], [], 3),  # nothing to write
     ],
 )
-def test_matches_xla_scatter(q_lens, ctx_lens, pad_tokens, width, dtype):
+def test_matches_xla_scatter(
+    q_lens, ctx_lens, pad_tokens, width, dtype, by_page, monkeypatch, request
+):
+    if by_page:  # the page path of prefill-sized writes
+        monkeypatch.setattr(msa_write, "_BY_TOKEN_MAX_TOKENS", 0)
+        jax.clear_caches()  # the writes read the threshold when traced
+        request.addfinalizer(jax.clear_caches)
     rng = np.random.default_rng(sum(q_lens) + width)
     num_tokens = sum(q_lens) + pad_tokens
     cache = pack(
