@@ -7901,10 +7901,7 @@ class TPUModelRunner(GPUModelRunner):
         separate compiled graph that the precompiles warm next to the full
         one, with or without speculative decoding. Skipping is exact: on
         all-False predicates the full path's `torch.where` returns the
-        unmasked logits bit for bit. Without speculative decoding the full
-        path costs about 25 us per padded row per decode step on Qwen3.5's
-        248,320-token vocabulary, for every RL rollout that samples with
-        top_k=-1 and top_p=1.
+        unmasked logits bit for bit.
         """
         return not (self.input_batch.no_top_k and self.input_batch.no_top_p)
 

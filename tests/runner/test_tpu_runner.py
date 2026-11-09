@@ -48,6 +48,7 @@ from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
 )
 from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
 from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
+from vllm_torchtpu.layers.adapter.sample.top_k_top_p import apply_top_k_top_p
 from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadata,
     AttentionMetadataBuilder,
@@ -3515,13 +3516,72 @@ def test_precompile_warms_the_no_topk_topp_graph_without_spec_decode():
     assert seen == variants * 2
 
 
+@pytest.mark.parametrize("candidate_blocks", [0, 8])
+@pytest.mark.parametrize("speculative_config", [None, SimpleNamespace()])
+def test_every_runtime_sampler_variant_is_precompiled(
+    speculative_config, candidate_blocks
+):
+    """Every (all_greedy, topk_candidates, apply_topk_topp) graph that the
+    random sampling path picks at runtime is one the precompile warms, so
+    serving compiles no sampler graph after warmup."""
+    warmed = set()
+
+    def fake_sample_from_logits(
+        logits,
+        temperatures,
+        u,
+        top_k,
+        top_p,
+        all_greedy=False,
+        topk_candidates=0,
+        apply_topk_topp=True,
+    ):
+        warmed.add((all_greedy, topk_candidates, apply_topk_topp))
+        return torch.zeros((logits.shape[0], 1), dtype=torch.int32)
+
+    TPUModelRunner._precompile_sample_from_logits(
+        SimpleNamespace(
+            num_reqs_paddings=[2],
+            _hidden_states_dtype=torch.bfloat16,
+            device=torch.device("cpu"),
+            _dummy_logits=lambda n: torch.zeros((n, 16), dtype=torch.bfloat16),
+            _topk_candidate_blocks=lambda: candidate_blocks,
+            _precompile_timed=lambda _name: contextlib.nullcontext(),
+            sample_from_logits_func=fake_sample_from_logits,
+            speculative_config=speculative_config,
+        )
+    )
+
+    for top_k, top_p in (
+        ([0, 0], [1.0, 1.0]),
+        ([0, 0], [0.9, 1.0]),
+        ([2, 2], [1.0, 1.0]),
+        ([2, 0], [1.0, 1.0]),
+        ([100, 2], [0.9, 0.9]),
+    ):
+        runner = SimpleNamespace(
+            speculative_config=speculative_config,
+            _topk_candidate_blocks=lambda: candidate_blocks,
+            input_batch=SimpleNamespace(
+                top_k_cpu_tensor=torch.tensor(top_k, dtype=torch.int32),
+                no_top_k=not any(top_k),
+                no_top_p=all(p == 1.0 for p in top_p),
+            ),
+        )
+        for grammar_output in (None, object()):
+            variant = (
+                False,
+                TPUModelRunner._sampler_topk_candidates(runner, 0, 2, grammar_output),
+                TPUModelRunner._sampler_applies_topk_topp(runner),
+            )
+            assert variant in warmed, (top_k, top_p, grammar_output, variant)
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_skipping_topk_topp_is_exact_at_the_default_sampling_params(dtype):
     """At top_k == 0 and top_p == 1.0 (RL rollouts sample with top_k=-1 and
     top_p=1) the no-top-k/top-p path samples exactly the tokens of the full
     path; with top-k set, skipping would change them (negative control)."""
-    from vllm_torchtpu.layers.adapter.sample.top_k_top_p import apply_top_k_top_p
-
     torch.manual_seed(0)
     runner = SimpleNamespace()
     runner._apply_temperature = TPUModelRunner._apply_temperature.__get__(runner)
