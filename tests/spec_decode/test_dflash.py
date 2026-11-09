@@ -1091,7 +1091,8 @@ def test_draft_forward_takes_decode_stage_on_batched_rpa():
         [_batched(5), _fake_attn_impl(attention_adapter.PallasAttentionBackendImpl, 1)],
         # Replicated draft: the runner moves it to the local RPA v3 kernel.
         [_batched(1, kernel_entry=attention_adapter._pallas_rpa_kernel_local)],
-        # DECODE tile narrower or wider than the draft block (e.g. DSpark).
+        # DECODE tile narrower or wider than the draft block (e.g. dense-layout
+        # DSpark, whose block is K).
         [_batched(4)],
         [_batched(6)],
         # DCP builds separate kernels and no layer-major one.
