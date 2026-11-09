@@ -245,6 +245,21 @@ steps:
             --run-lm-eval --lm-eval-limit none --skip-perf-check
             --results-dir perf_eval_results/deepseek-v41-flash-dp8-ep
 
+      - label: "DeepSeek-V4.1 persistent indexer: TPU parity"
+        key: "dsv41_persistent_indexer_parity"
+        <<: *tpu_step
+        env:
+          SHAPE: *shape_2_core
+        plugins:
+          - *kube_plugin
+        commands:
+          - >-
+            .buildkite/kubernetes/run.sh python -m pytest -q
+            tests/kernels/deepseek_v41/test_fp8_paged_mqa_logits.py
+            tests/kernels/deepseek_v41/test_fp8_indexer_select.py
+            tests/kernels/test_dsv41_streaming_topk.py
+            --junitxml=perf_eval_results/dsv41-persistent-indexer.xml
+
       - label: "DeepSeek-V4.1 decode kernels: TPU parity"
         key: "dsv41_decode_kernel_parity"
         <<: *tpu_step
