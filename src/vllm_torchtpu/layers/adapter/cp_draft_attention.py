@@ -377,12 +377,16 @@ def _swa_flash_kernel(
             alpha = jnp.exp(m_prev - m_safe)
             m_ref[g] = m_cur
             l_ref[g] = alpha * l_ref[g] + jnp.sum(p, axis=1, keepdims=True)
-            # P as bf16 hi + lo halves (V is exact in bf16): ~16 mantissa bits,
-            # so PV matches an f32 PV to ~1e-5 for one extra MXU pass.
-            p_hi = p.astype(q.dtype)
-            p_lo = (p - p_hi.astype(jnp.float32)).astype(q.dtype)
-            pv = jnp.dot(p_hi, v, preferred_element_type=jnp.float32)
-            pv = pv + jnp.dot(p_lo, v, preferred_element_type=jnp.float32)
+            # f32 P x V: V is exact in bf16 (widened fp8 / bf16 cache), and
+            # P splits exactly into three bf16 terms (8 + 8 + 8 mantissa bits),
+            # so three bf16 MXU passes with f32 accumulation give exact
+            # products of the f32 P; only the summation order differs.
+            pv = jnp.zeros(acc_ref.shape[1:], jnp.float32)
+            rest = p
+            for _ in range(3):
+                part = rest.astype(q.dtype)
+                pv = pv + jnp.dot(part, v, preferred_element_type=jnp.float32)
+                rest = rest - part.astype(jnp.float32)
             acc_ref[g] = alpha * acc_ref[g] + pv
 
     def page_body(i, carry):
@@ -436,13 +440,15 @@ def attend_cached_flash(
     """`attend_cached` as one Pallas kernel: per request, DMA this rank's
     window pages straight from the paged cache (double-buffered across
     requests), unpack K/V of each KV head in VMEM and run online-softmax
-    attention for every query head of the group: QK exact products (bf16 q,
-    fp8 K widened to bf16) with f32 accumulation, PV with P split into two
-    bf16 halves.
+    attention for every query head of the group. Precision as the XLA path:
+    fp8 KV read as before; f32 accumulation and f32 softmax; bf16 output.
+    QK^T multiplies bf16 q by K widened exactly from fp8 (exact products, f32
+    accumulation, k_scale applied to the f32 scores); P x V multiplies the f32
+    P, split exactly into three bf16 terms, by V widened exactly from fp8.
 
-    Same contract as `attend_cached`, not bitwise equal to it: the softmax is
-    accumulated page by page (f32 rounding differs; outputs differ by at most
-    an ulp of the bf16 output where a value straddles a rounding boundary).
+    Not bitwise equal to `attend_cached`: only the reduction order differs
+    (online softmax page by page), which moves an output by at most an ulp
+    of the bf16 output where a value straddles a rounding boundary.
     """
     num_tokens, num_heads, head_dim = q.shape
     num_pages, page_size, words, packing, width = kv_cache.shape

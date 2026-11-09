@@ -419,6 +419,7 @@ def test_flash_argmax_matches_xla_path():
     print("argmax agreement over", rows, "rows:", {k: v / rows for k, v in agree.items()})
     assert rows >= 500
     assert agree["flash_xla"] >= agree["xla_unrounded"] - 2, agree
+    assert agree["flash_xla"] >= 0.999 * rows, agree  # same precision: only order differs
     assert agree["flash_f64"] >= agree["xla_f64"] - 2, agree
 
 
