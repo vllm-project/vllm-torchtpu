@@ -701,7 +701,10 @@ class StagedConsumer:
         # Decode-only MTP: the draft layer's owners (and its packed compressed
         # slot) have no producer pages; its prompt KV starts empty (synthetic
         # acceptance does not read it).
-        missing = (set(self._dst_owner) | set(self._dst_compressed)) - set(self._src_owner)
+        # Split keys are staged per producer rank ("<owner>.pcp<r>"), as split
+        # main KV is; either way the logical owner is covered.
+        staged = set(self._src_owner) | {n.rsplit(".pcp", 1)[0] for n in self._key_pools}
+        missing = (set(self._dst_owner) | set(self._dst_compressed)) - staged
         if any(not n.startswith("mtp.") for n in missing):
             raise ValueError(f"Qwen PD staging lacks producer pages for {sorted(missing)}")
         self._dst_owner = {n: g for n, g in self._dst_owner.items() if n not in missing}
