@@ -17,6 +17,7 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
+from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm.model_executor.layers.linear import LinearBase
 
@@ -150,9 +151,15 @@ class TestUnquantizedConfigQuantizeOnLoadDispatch:
             assert isinstance(method, VllmUnquantizedLinearMethod)
 
     def test_non_matching_moe_layer_uses_unquantized_method(
-        self, monkeypatch, moe_layer, vllm_config_context
+        self, monkeypatch, moe_layer
     ):
         monkeypatch.setenv("QUANTIZE_ON_LOAD_PREFIXES", "self_attn")
         cfg = VllmUnquantizedConfig()
-        method = cfg.get_quant_method(moe_layer, prefix="model.layers.0.mlp.experts")
+        # CPU CI does not register torch's TPU device type.
+        with set_current_vllm_config(
+            VllmConfig(device_config=DeviceConfig(device="cpu"))
+        ):
+            method = cfg.get_quant_method(
+                moe_layer, prefix="model.layers.0.mlp.experts"
+            )
         assert isinstance(method, VllmUnquantizedFusedMoEMethod)
