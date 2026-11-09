@@ -61,9 +61,7 @@ are functional paths, not redundant implementations.
 Run kernel correctness tests before full serving:
 
 ```bash
-python -m pytest tests/kernels/test_dsv41_decode_tuning.py \
-  tests/kernels/test_dsv41_decode_index_scores.py \
-  tests/models/vllm/test_dsv41_decode_indexer_route.py
+python -m pytest tests/kernels/test_dsv41_decode_tuning.py
 ```
 
 Use `scripts/dsv41_bench/server_steps/run.py` for paired `encoder_extend` and

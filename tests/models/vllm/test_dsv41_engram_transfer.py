@@ -1,5 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Exercise production DMA lifetimes with a deliberately delayed transport."""
 
 import ast
@@ -157,14 +168,13 @@ def test_failed_dma_preserves_pending_handle(transport):
     assert slot.pending is pending
 
 
-@pytest.mark.parametrize("version", ["v1", "v2"])
-def test_model_records_device_consumers_before_slot_reuse(transport, version):
+def test_model_records_device_consumers_before_slot_reuse(transport):
     module, events, _ = transport
     slot = module.PreparedEngramUpload(4, torch.device("cpu"))
     slot.acquire().fill_(17)
     slot.start()
     slot.activate()
-    tree = ast.parse((SOURCE / version / "model.py").read_text())
+    tree = ast.parse((SOURCE / "v2" / "model.py").read_text())
     cls = next(
         node for node in tree.body if getattr(node, "name", None) == "DeepseekV41Model"
     )

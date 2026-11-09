@@ -3757,11 +3757,6 @@ def test_refresh_smem_request_caps_deepseek_v41_v2_vs_rpa(monkeypatch):
     assert runner.num_reqs_max_model_len == 64
     assert runner.num_reqs_most_model_len == 64
 
-    monkeypatch.setenv("TPU_DEEPSEEK_V41_IMPL", "v1")
-    runner._refresh_smem_request_caps()
-    assert runner.num_reqs_max_model_len == 20
-    assert runner.num_reqs_most_model_len == 23
-
     runner.most_model_len = None
     runner.model_config = SimpleNamespace(
         hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"])

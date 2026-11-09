@@ -1,9 +1,20 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """100% Line and branch coverage test suite for DeepSeek-V4.1 Engram.
 
 Covers all lines and branches in:
 - vllm_torchtpu.models.vllm.deepseek_v41.common.engram
-- vllm_torchtpu.models.vllm.deepseek_v41.v1.engram
 - vllm_torchtpu.models.vllm.deepseek_v41.v2.engram
 """
 
@@ -17,7 +28,6 @@ import torch
 import torch.nn as nn
 
 from vllm_torchtpu.models.vllm.deepseek_v41.common import engram as common_engram
-from vllm_torchtpu.models.vllm.deepseek_v41.v1 import engram as v1_engram
 from vllm_torchtpu.models.vllm.deepseek_v41.v2 import engram as v2_engram
 
 pytestmark = pytest.mark.usefixtures("cpu_engram_transfer")
@@ -845,113 +855,7 @@ class TestEngramModule:
 
 
 # ==============================================================================
-# 4. v1.engram tests (lines 1-53)
-# ==============================================================================
-
-
-class TestV1Engram:
-    def test_v1_write_cache(self, monkeypatch: pytest.MonkeyPatch):
-        mock_write = MagicMock()
-        monkeypatch.setattr(v1_engram, "write_cache", mock_write)
-
-        state = object.__new__(v1_engram.NgramHashState)
-        cache = torch.zeros(10)
-        slots = torch.zeros(2)
-        values = torch.zeros(2)
-        valid = torch.ones(2, dtype=torch.bool)
-
-        state.write_cache(cache, slots, values, valid)
-        mock_write.assert_called_once_with(cache, slots, values, valid)
-
-    def test_v1_ensure_cache_compiling(self, monkeypatch: pytest.MonkeyPatch):
-        monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
-        super_called = []
-        monkeypatch.setattr(
-            common_engram.NgramHashState,
-            "ensure_cache",
-            lambda self: super_called.append(True) or True,
-        )
-
-        state = object.__new__(v1_engram.NgramHashState)
-        assert state.ensure_cache() is True
-        assert len(super_called) == 1
-
-    def test_v1_ensure_cache_eager_empty_kv_cache(
-        self, monkeypatch: pytest.MonkeyPatch
-    ):
-        monkeypatch.setattr(torch.compiler, "is_compiling", lambda: False)
-        state = object.__new__(v1_engram.NgramHashState)
-        state._cache = torch.zeros(10)
-        state._kv_cache_ref = "dummy_ref"
-        state.swa_cache_module = SimpleNamespace(
-            bound_cache=torch.empty(0),
-            block_size=8,
-        )
-
-        # Empty bound_cache -> resets _cache and _kv_cache_ref,
-        # returns False (lines 30-33)
-        assert state.ensure_cache() is False
-        assert state._cache is None
-        assert state._kv_cache_ref is None
-
-    def test_v1_ensure_cache_eager_no_slot_cache(self, monkeypatch: pytest.MonkeyPatch):
-        monkeypatch.setattr(torch.compiler, "is_compiling", lambda: False)
-        state = object.__new__(v1_engram.NgramHashState)
-        state.use_slot_cache = False
-        state.swa_cache_module = SimpleNamespace(
-            bound_cache=torch.ones(4, 8),
-            block_size=8,
-        )
-
-        # not use_slot_cache -> returns True (lines 34-35)
-        assert state.ensure_cache() is True
-
-    def test_v1_ensure_cache_eager_block_size_resize_and_cache_hit_and_miss(
-        self, monkeypatch: pytest.MonkeyPatch
-    ):
-        monkeypatch.setattr(torch.compiler, "is_compiling", lambda: False)
-        state = object.__new__(v1_engram.NgramHashState)
-        state.use_slot_cache = True
-        state.block_size = 8
-        state._kv_cache_ref = None
-        state._cache = None
-
-        kv_cache = torch.zeros(4, 16)
-        state.swa_cache_module = SimpleNamespace(
-            bound_cache=kv_cache,
-            block_size=16,
-        )
-
-        # 1. First call: block_size resized from 8 to 16, cache miss, allocates _cache
-        assert state.ensure_cache() is True
-        assert state.block_size == 16
-        assert state._cache is not None
-        assert state._cache.shape == (4 * 16,)
-        assert state._kv_cache_ref is not None
-        assert state._kv_cache_ref() is kv_cache
-        cached_obj = state._cache
-
-        # 2. Second call with same kv_cache: block_size matches (line 41 False),
-        # cache hit (line 44 True), returns True without reallocating
-        assert state.ensure_cache() is True
-        assert state._cache is cached_obj
-
-        # 3. Third call with different kv_cache object (same block_size 16):
-        # cache miss (line 44 False), allocates fresh _cache
-        new_kv_cache = torch.zeros(4, 16)
-        state.swa_cache_module.bound_cache = new_kv_cache
-        assert state.ensure_cache() is True
-        assert state._cache is not cached_obj
-        assert state._kv_cache_ref() is new_kv_cache
-
-    def test_v1_all_exports(self):
-        assert set(v1_engram.__all__) == {"Engram", "NgramHashState"}
-        assert v1_engram.Engram is common_engram.Engram
-        assert issubclass(v1_engram.NgramHashState, common_engram.NgramHashState)
-
-
-# ==============================================================================
-# 5. v2.engram tests (lines 1-39)
+# 4. v2.engram tests (lines 1-39)
 # ==============================================================================
 
 

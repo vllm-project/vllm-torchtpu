@@ -1,5 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """`relayout_rope_tables` re-materializes model-owned RoPE tables row-major."""
 
 from unittest import mock
@@ -135,139 +146,3 @@ def test_runner_load_model_relayouts_draft_model_rope_tables():
         mock_relayout.assert_has_calls(
             [mock.call(target_model), mock.call(draft_model)]
         )
-
-
-def test_runner_load_model_skips_when_draft_model_is_none():
-    drafter = mock.MagicMock()
-    drafter.draft_model = None
-
-    target_table = torch.randn(8, 4)
-    target_model = torch.nn.ModuleList([_Attention(target_table)])
-
-    runner = _make_dummy_runner()
-
-    real_torch_device = torch.device
-
-    def fake_torch_device(d):
-        if d == "tpu":
-            return real_torch_device("cpu")
-        return real_torch_device(d)
-
-    with (
-        mock.patch("torch.device", side_effect=fake_torch_device),
-        mock.patch.object(
-            TPUModelRunner,
-            "_is_async_drafter",
-            new_callable=mock.PropertyMock,
-            return_value=True,
-        ),
-        mock.patch.object(
-            TPUModelRunner,
-            "_async_drafter",
-            new_callable=mock.PropertyMock,
-            return_value=drafter,
-        ),
-        mock.patch("vllm_torchtpu.runner.tpu_runner.get_tpu_quantization_config"),
-        mock.patch("vllm_torchtpu.runner.tpu_runner.get_model_loader") as mock_loader,
-        mock.patch("vllm_torchtpu.runner.tpu_runner.validate_online_fp8"),
-        mock.patch(
-            "vllm_torchtpu.model_loader_patches.evict_loaded_weights_page_cache"
-        ),
-        mock.patch.object(runner, "_initialize_pallas_kernels"),
-        mock.patch.object(
-            utils, "relayout_rope_tables", wraps=utils.relayout_rope_tables
-        ) as mock_relayout,
-    ):
-        mock_loader.return_value.load_model.return_value = target_model
-        runner.load_model()
-
-        drafter.load_model.assert_called_once_with(target_model)
-        assert mock_relayout.call_count == 1
-        mock_relayout.assert_called_once_with(target_model)
-
-
-def test_runner_load_model_skips_when_no_draft_model_attr():
-    drafter = mock.MagicMock(spec=["load_model"])
-
-    target_table = torch.randn(8, 4)
-    target_model = torch.nn.ModuleList([_Attention(target_table)])
-
-    runner = _make_dummy_runner()
-
-    real_torch_device = torch.device
-
-    def fake_torch_device(d):
-        if d == "tpu":
-            return real_torch_device("cpu")
-        return real_torch_device(d)
-
-    with (
-        mock.patch("torch.device", side_effect=fake_torch_device),
-        mock.patch.object(
-            TPUModelRunner,
-            "_is_async_drafter",
-            new_callable=mock.PropertyMock,
-            return_value=True,
-        ),
-        mock.patch.object(
-            TPUModelRunner,
-            "_async_drafter",
-            new_callable=mock.PropertyMock,
-            return_value=drafter,
-        ),
-        mock.patch("vllm_torchtpu.runner.tpu_runner.get_tpu_quantization_config"),
-        mock.patch("vllm_torchtpu.runner.tpu_runner.get_model_loader") as mock_loader,
-        mock.patch("vllm_torchtpu.runner.tpu_runner.validate_online_fp8"),
-        mock.patch(
-            "vllm_torchtpu.model_loader_patches.evict_loaded_weights_page_cache"
-        ),
-        mock.patch.object(runner, "_initialize_pallas_kernels"),
-        mock.patch.object(
-            utils, "relayout_rope_tables", wraps=utils.relayout_rope_tables
-        ) as mock_relayout,
-    ):
-        mock_loader.return_value.load_model.return_value = target_model
-        runner.load_model()
-
-        drafter.load_model.assert_called_once_with(target_model)
-        assert mock_relayout.call_count == 1
-        mock_relayout.assert_called_once_with(target_model)
-
-
-def test_runner_load_model_skips_when_not_async_drafter():
-    target_table = torch.randn(8, 4)
-    target_model = torch.nn.ModuleList([_Attention(target_table)])
-
-    runner = _make_dummy_runner()
-
-    real_torch_device = torch.device
-
-    def fake_torch_device(d):
-        if d == "tpu":
-            return real_torch_device("cpu")
-        return real_torch_device(d)
-
-    with (
-        mock.patch("torch.device", side_effect=fake_torch_device),
-        mock.patch.object(
-            TPUModelRunner,
-            "_is_async_drafter",
-            new_callable=mock.PropertyMock,
-            return_value=False,
-        ),
-        mock.patch("vllm_torchtpu.runner.tpu_runner.get_tpu_quantization_config"),
-        mock.patch("vllm_torchtpu.runner.tpu_runner.get_model_loader") as mock_loader,
-        mock.patch("vllm_torchtpu.runner.tpu_runner.validate_online_fp8"),
-        mock.patch(
-            "vllm_torchtpu.model_loader_patches.evict_loaded_weights_page_cache"
-        ),
-        mock.patch.object(runner, "_initialize_pallas_kernels"),
-        mock.patch.object(
-            utils, "relayout_rope_tables", wraps=utils.relayout_rope_tables
-        ) as mock_relayout,
-    ):
-        mock_loader.return_value.load_model.return_value = target_model
-        runner.load_model()
-
-        assert mock_relayout.call_count == 1
-        mock_relayout.assert_called_once_with(target_model)

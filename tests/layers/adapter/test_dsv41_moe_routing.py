@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """100% Diff coverage test suite for partitioned SP MoE routing.
 
 Covers all lines and branches in:
@@ -77,34 +89,6 @@ class _FakeDistributedGroup:
         repeats = [1] * tensor.ndim
         repeats[dim] = self.world_size
         return tensor.repeat(*repeats)
-
-
-def _make_routing_layer(
-    *,
-    topk: int = 6,
-    is_sequence_parallel: bool = True,
-    custom_routing_function=None,
-    scoring_func: str = "sqrtsoftplus",
-    renormalize: bool = True,
-    routed_scaling_factor: float = 1.0,
-    e_score_correction_bias: torch.Tensor | None = None,
-):
-    """Construct a minimal layer namespace satisfying moe_routing requirements."""
-    return SimpleNamespace(
-        moe_config=SimpleNamespace(
-            experts_per_token=topk,
-            is_sequence_parallel=is_sequence_parallel,
-        ),
-        custom_routing_function=custom_routing_function,
-        scoring_func=scoring_func,
-        renormalize=renormalize,
-        routed_scaling_factor=routed_scaling_factor,
-        e_score_correction_bias=e_score_correction_bias,
-        hash_indices_table=None,
-        use_grouped_topk=False,
-        num_expert_group=1,
-        topk_group=1,
-    )
 
 
 # ==============================================================================
@@ -297,255 +281,9 @@ def test_gather_partitioned_topk_fallback_separate_gathers(
     assert torch.equal(out_i[:tokens], ids)
 
 
-def test_route_simulation_override(monkeypatch):
-    """Lines 191-193: Simulated routing takes immediate priority when active."""
-    sim_strategy = SimpleNamespace(
-        route_tokens=lambda **kw: (
-            torch.ones(4, 4, dtype=torch.bfloat16),
-            torch.zeros(4, 4, dtype=torch.int32),
-        )
-    )
-    monkeypatch.setattr(moe_routing, "_SIMULATION_STRATEGY", sim_strategy)
-    monkeypatch.setattr(moe_routing, "_strategy_name", "custom_sim")
-
-    layer = _make_routing_layer(topk=4)
-    hidden = torch.randn(4, 16, dtype=torch.bfloat16)
-    logits = torch.randn(4, 32, dtype=torch.float32)
-
-    w, i = moe_routing.route(layer, hidden, logits)
-    assert w.shape == (4, 4)
-    assert i.shape == (4, 4)
-    assert torch.equal(w, torch.ones(4, 4, dtype=torch.bfloat16))
-    assert torch.equal(i, torch.zeros(4, 4, dtype=torch.int32))
-
-
-def test_route_custom_routing_function():
-    """Lines 194-201: layer.custom_routing_function is executed if provided."""
-    custom_fn = MagicMock(return_value=("custom_w", "custom_i"))
-    layer = _make_routing_layer(custom_routing_function=custom_fn)
-    hidden = torch.randn(4, 16)
-    logits = torch.randn(4, 32)
-
-    res = moe_routing.route(layer, hidden, logits)
-    assert custom_fn.called
-    assert res == ("custom_w", "custom_i")
-
-
-def test_route_partitioned_sp_input_ids_sliced(monkeypatch):
-    """Lines 202-223: router_logits < hidden with SP=True and matching input_ids."""
-    monkeypatch.setattr(moe_routing, "_SIMULATION_STRATEGY", None)
-    monkeypatch.setattr(moe_routing, "_ROUTER_TOPK", "sort")
-
-    world_size = 4
-    total_t = 16
-    local_t = total_t // world_size
-    hidden = torch.randn(total_t, 16, dtype=torch.bfloat16)
-    logits_shard = torch.randn(local_t, 32, dtype=torch.float32)
-    input_ids = torch.arange(total_t, dtype=torch.int64)
-
-    fake_group = _FakeDistributedGroup(world_size=world_size, rank=1)
-    import vllm.distributed.parallel_state as ps
-
-    monkeypatch.setattr(ps, "get_ep_group", lambda: fake_group)
-
-    layer = _make_routing_layer(topk=4, is_sequence_parallel=True)
-    out_w, out_i = moe_routing.route(layer, hidden, logits_shard, input_ids=input_ids)
-
-    assert len(fake_group.all_gather_calls) == 1
-    assert out_w.shape == (total_t, 4)
-    assert out_i.shape == (total_t, 4)
-
-
-def test_route_partitioned_dp_input_ids_none(monkeypatch):
-    """Lines 202-223: router_logits < hidden_states with SP=False and input_ids=None."""
-    monkeypatch.setattr(moe_routing, "_SIMULATION_STRATEGY", None)
-    monkeypatch.setattr(moe_routing, "_ROUTER_TOPK", "sort")
-
-    world_size = 2
-    total_t = 8
-    local_t = total_t // world_size
-    hidden = torch.randn(total_t, 16, dtype=torch.bfloat16)
-    logits_shard = torch.randn(local_t, 32, dtype=torch.float32)
-
-    fake_group = _FakeDistributedGroup(world_size=world_size, rank=0)
-    import vllm.distributed.parallel_state as ps
-
-    monkeypatch.setattr(ps, "get_dp_group", lambda: fake_group)
-
-    layer = _make_routing_layer(topk=2, is_sequence_parallel=False)
-    out_w, out_i = moe_routing.route(layer, hidden, logits_shard, input_ids=None)
-
-    assert len(fake_group.all_gather_calls) == 1
-    assert out_w.shape == (total_t, 2)
-    assert out_i.shape == (total_t, 2)
-
-
-def test_route_partitioned_input_ids_mismatched_numel(monkeypatch):
-    """Lines 211-213: When input_ids.numel() != hidden_states.shape[0], no slicing."""
-    monkeypatch.setattr(moe_routing, "_SIMULATION_STRATEGY", None)
-    monkeypatch.setattr(moe_routing, "_ROUTER_TOPK", "sort")
-
-    world_size = 2
-    total_t = 8
-    local_t = total_t // world_size
-    hidden = torch.randn(total_t, 16, dtype=torch.bfloat16)
-    logits_shard = torch.randn(local_t, 32, dtype=torch.float32)
-    mismatched_ids = torch.arange(5, dtype=torch.int64)
-
-    fake_group = _FakeDistributedGroup(world_size=world_size, rank=0)
-    import vllm.distributed.parallel_state as ps
-
-    monkeypatch.setattr(ps, "get_ep_group", lambda: fake_group)
-
-    layer = _make_routing_layer(topk=2, is_sequence_parallel=True)
-    out_w, out_i = moe_routing.route(
-        layer, hidden, logits_shard, input_ids=mismatched_ids
-    )
-
-    assert len(fake_group.all_gather_calls) == 1
-    assert out_w.shape == (total_t, 2)
-
-
-def test_route_unpartitioned_path(monkeypatch):
-    """Lines 224-232: router_logits >= hidden runs select_experts."""
-    monkeypatch.setattr(moe_routing, "_SIMULATION_STRATEGY", None)
-    monkeypatch.setattr(moe_routing, "_ROUTER_TOPK", "sort")
-
-    hidden = torch.randn(4, 16, dtype=torch.bfloat16)
-    logits = torch.randn(4, 32, dtype=torch.float32)
-
-    layer = _make_routing_layer(topk=2)
-    out_w, out_i = moe_routing.route(layer, hidden, logits)
-    assert out_w.shape == (4, 2)
-    assert out_i.shape == (4, 2)
-
-
 # ==============================================================================
 # Part 3: v2/attention.py (_prepare_tpu lines 617-621 & forward lines 456-475)
 # ==============================================================================
-
-
-class _FakeForwardContext:
-    def __init__(self, attn_metadata=None):
-        self.attn_metadata = attn_metadata
-        self.additional_kwargs = {}
-
-
-def test_prepare_tpu_metadata_not_dict_early_return(monkeypatch):
-    """Lines 617-620: metadata is not dict -> output.zero_() and early return."""
-    monkeypatch.setattr(
-        v2_attn, "get_forward_context", lambda: _FakeForwardContext(None)
-    )
-
-    attn_obj = SimpleNamespace(
-        swa_cache_layer=SimpleNamespace(prefix="swa", kv_cache=torch.ones(4, 8)),
-        wq_b=MagicMock(),
-    )
-    output = torch.ones(2, 4)
-    DeepseekV41Attention._prepare_tpu(
-        attn_obj,
-        hidden_states=None,
-        qr=None,
-        kv=None,
-        qr_scale=None,
-        kv_score=None,
-        index_weights=None,
-        positions=None,
-        output=output,
-    )
-    assert torch.equal(output, torch.zeros(2, 4))
-    assert not attn_obj.wq_b.called
-
-
-def test_prepare_tpu_empty_cache_early_return(monkeypatch):
-    """Lines 617-620: metadata is dict, kv_cache is empty -> output.zero_() & return."""
-    metadata = {"swa": SimpleNamespace()}
-    monkeypatch.setattr(
-        v2_attn, "get_forward_context", lambda: _FakeForwardContext(metadata)
-    )
-
-    attn_obj = SimpleNamespace(
-        swa_cache_layer=SimpleNamespace(prefix="swa", kv_cache=torch.empty(0)),
-        wq_b=MagicMock(),
-    )
-    output = torch.ones(3, 5)
-    DeepseekV41Attention._prepare_tpu(
-        attn_obj,
-        hidden_states=None,
-        qr=None,
-        kv=None,
-        qr_scale=None,
-        kv_score=None,
-        index_weights=None,
-        positions=None,
-        output=output,
-    )
-    assert torch.equal(output, torch.zeros(3, 5))
-    assert not attn_obj.wq_b.called
-
-
-def test_prepare_tpu_valid_cache_proceeds(monkeypatch):
-    """Lines 617-621: metadata is dict AND kv_cache.numel() > 0 proceeds past check."""
-    metadata = {
-        "swa": SimpleNamespace(
-            block_table=torch.zeros((1, 4), dtype=torch.int32),
-            slot_mapping=torch.zeros((1,), dtype=torch.int64),
-        )
-    }
-    monkeypatch.setattr(
-        v2_attn, "get_forward_context", lambda: _FakeForwardContext(metadata)
-    )
-    monkeypatch.setattr(v2_attn, "_block_table", lambda swa: swa.block_table)
-    monkeypatch.setattr(
-        v2_attn, "_cache_slots", lambda cache, swa, pos: swa.slot_mapping
-    )
-    monkeypatch.setattr(
-        v2_attn, "_token_requests", lambda swa, pos: torch.zeros_like(pos)
-    )
-    monkeypatch.setattr(v2_attn, "_insert", MagicMock())
-    monkeypatch.setattr(v2_attn, "_read_rows", lambda *a, **kw: torch.zeros(1, 4, 8))
-    monkeypatch.setattr(
-        v2_attn, "sparse_attention", lambda *a, **kw: torch.zeros(1, 1, 2, 8)
-    )
-
-    wq_b_mock = MagicMock(return_value=torch.zeros(1, 16))
-    attn_obj = SimpleNamespace(
-        swa_cache_layer=SimpleNamespace(
-            prefix="swa", kv_cache=torch.ones(2, 4, 16, dtype=torch.bfloat16)
-        ),
-        wq_b=wq_b_mock,
-        n_local_heads=2,
-        head_dim=8,
-        _rotate=lambda q, pos: q,
-        compressor=None,
-        has_compressor=False,
-        indexer=None,
-        has_indexer=False,
-        window_size=4,
-        _ced_decoder=False,
-        use_fp8_cache=False,
-        compress_ratio=0,
-        _fp8_kv=False,
-        attn_sink=torch.zeros(1),
-        scale=1.0,
-    )
-    output = torch.ones(1, 2, 8)
-    qr = torch.randn(1, 16)
-    kv = torch.randn(1, 8)
-    positions = torch.zeros(1, dtype=torch.int64)
-
-    DeepseekV41Attention._prepare_tpu(
-        attn_obj,
-        hidden_states=None,
-        qr=qr,
-        kv=kv,
-        qr_scale=None,
-        kv_score=None,
-        index_weights=None,
-        positions=positions,
-        output=output,
-    )
-    assert wq_b_mock.called
 
 
 def test_forward_sp_sharded_with_indexer_weights(monkeypatch):

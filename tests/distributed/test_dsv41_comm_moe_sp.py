@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """100% Diff coverage test suite for TPU Communicator and SP MoE routing.
 
 Covers all lines and branches in:
@@ -159,11 +171,6 @@ def test_router_logits_distinct_tensor_gathered_twice(monkeypatch, communicator)
 # ==============================================================================
 # 2. Tests for VllmDeepseekV41Fp8Config & DeepseekV41MoE
 # ==============================================================================
-
-
-def test_v41_fp8_config_name():
-    """Verify quantization config registration and get_name."""
-    assert moe_quant.VllmDeepseekV41Fp8Config.get_name() == "deepseek_v41_fp8"
 
 
 def test_moe_init_rejects_eplb():

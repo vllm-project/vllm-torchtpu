@@ -544,7 +544,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "TPU_DEEPSEEK_V41_ENGRAM_FUSED_PREP", default=True
     ),
     # Deprecated aliases, resolved by the DSV41 serving-policy verifier.
-    # Serving supports v2; v1 remains only as a standalone reference.
+    # v1 was removed; the verifier rejects it with a clear message.
     "TPU_DEEPSEEK_V41_IMPL": env_with_choices(
         "TPU_DEEPSEEK_V41_IMPL", "v2", ["v1", "v2"]
     ),
