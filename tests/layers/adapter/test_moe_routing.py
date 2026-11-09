@@ -153,6 +153,96 @@ def test_select_experts_rowmax_matches_sort(monkeypatch):
     assert torch.equal(got_i, ref_i.to(torch.int32))
 
 
+@pytest.mark.parametrize("scoring_fn", ["sigmoid", "softmax"])
+@pytest.mark.parametrize("with_bias", [True, False])
+@pytest.mark.parametrize(
+    "num_experts,num_expert_group,topk_group,topk",
+    [(256, 8, 4, 8), (160, 8, 3, 6)],
+    ids=["e256_g8_tg4_k8", "e160_g8_tg3_k6"],
+)
+def test_grouped_topk_rowmax_matches_upstream(
+    monkeypatch, scoring_fn, with_bias, num_experts, num_expert_group, topk_group, topk
+):
+    """Same experts and weights as upstream ``grouped_topk``, per row."""
+    torch = pytest.importorskip("torch")
+    from vllm.model_executor.layers.fused_moe.router import grouped_topk_router
+
+    # Upstream is torch.compile(dynamic=True); call the eager function.
+    fn = grouped_topk_router.grouped_topk
+    grouped_topk = getattr(fn, "__wrapped__", fn)
+    monkeypatch.setattr(moe_routing, "_ROUTER_TOPK", "rowmax")
+    torch.manual_seed(0)
+    logits = torch.randn(64, num_experts)
+    bias = torch.randn(num_experts) * 0.1 if with_bias else None
+    kwargs = dict(
+        topk=topk,
+        renormalize=True,
+        num_expert_group=num_expert_group,
+        topk_group=topk_group,
+        routed_scaling_factor=2.5,
+        e_score_correction_bias=bias,
+    )
+
+    ref_w, ref_i = grouped_topk(
+        hidden_states=logits, gating_output=logits, scoring_func=scoring_fn, **kwargs
+    )
+    got_w, got_i = moe_routing._grouped_topk_rowmax(
+        logits, scoring_fn=scoring_fn, **kwargs
+    )
+
+    # Order within a row may differ; compare the (id, weight) pairs sorted by id.
+    ref_i, ref_order = ref_i.sort(dim=-1)
+    got_i, got_order = got_i.sort(dim=-1)
+    assert got_i.dtype == torch.int32
+    assert torch.equal(got_i, ref_i)
+    torch.testing.assert_close(got_w.gather(1, got_order), ref_w.gather(1, ref_order))
+
+
+@pytest.mark.parametrize("weights_fp32", [False, True])
+def test_select_experts_grouped_rowmax_matches_sort(monkeypatch, weights_fp32):
+    """The grouped branch dispatches by ``_ROUTER_TOPK`` and keeps the dtype."""
+    torch = pytest.importorskip("torch")
+    from vllm.model_executor.layers.fused_moe.router import grouped_topk_router
+
+    fn = grouped_topk_router.grouped_topk
+    monkeypatch.setattr(
+        grouped_topk_router, "grouped_topk", getattr(fn, "__wrapped__", fn)
+    )
+    monkeypatch.setattr(moe_routing.envs, "TPU_MOE_TOPK_WEIGHTS_FLOAT32", weights_fp32)
+    torch.manual_seed(0)
+    hidden = torch.randn(64, 8, dtype=torch.bfloat16)
+    logits = torch.randn(64, 256)
+    layer = _routing_layer(topk=8)
+    layer.use_grouped_topk = True
+    layer.num_expert_group = 8
+    layer.topk_group = 4
+    layer.routed_scaling_factor = 2.5
+    layer.e_score_correction_bias = torch.randn(256) * 0.1
+
+    def run():
+        return moe_routing.select_experts(
+            hidden_states=hidden,
+            router_logits=logits,
+            topk=8,
+            renormalize=True,
+            scoring_fn="sigmoid",
+            layer=layer,
+        )
+
+    monkeypatch.setattr(moe_routing, "_ROUTER_TOPK", "sort")
+    ref_w, ref_i = run()
+    monkeypatch.setattr(moe_routing, "_ROUTER_TOPK", "rowmax")
+    got_w, got_i = run()
+
+    expected = torch.float32 if weights_fp32 else torch.bfloat16
+    assert got_w.dtype == ref_w.dtype == expected
+    assert got_i.dtype == ref_i.dtype == torch.int32
+    ref_i, ref_order = ref_i.sort(dim=-1)
+    got_i, got_order = got_i.sort(dim=-1)
+    assert torch.equal(got_i, ref_i)
+    torch.testing.assert_close(got_w.gather(1, got_order), ref_w.gather(1, ref_order))
+
+
 def test_router_topk_op_is_registered_at_import():
     """The op must exist before the first call: a lazy, lock-guarded
     registration is untraceable by Dynamo and aborts the MoE compile."""

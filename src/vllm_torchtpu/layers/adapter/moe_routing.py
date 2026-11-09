@@ -240,6 +240,59 @@ def _hash_moe_select(
     return topk_weights, topk_ids
 
 
+def _grouped_topk_rowmax(
+    router_logits: torch.Tensor,
+    *,
+    topk: int,
+    renormalize: bool,
+    num_expert_group: int,
+    topk_group: int,
+    scoring_fn: str,
+    routed_scaling_factor: float,
+    e_score_correction_bias: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Upstream ``grouped_topk`` with every ``torch.topk`` replaced by ``_topk``.
+
+    On TPU ``torch.topk`` lowers to a full sort, which on prefill-sized batches
+    (``[32768, E]``) costs milliseconds per call, up to three calls per MoE layer.
+    ``_topk`` with ``TPU_MOE_ROUTER_TOPK=rowmax`` is the sort-free kernel. The
+    arithmetic is the same as upstream: group score = top-2 sum of the biased
+    scores (or the group max without a bias), keep the ``topk_group`` best
+    groups, then the ``topk`` best experts inside them; weights come from the
+    unbiased scores.
+    """
+    scores = _apply_scoring_fn(scoring_fn, router_logits)
+    num_tokens, num_experts = scores.shape
+    group_size = num_experts // num_expert_group
+    original_scores = scores
+    if e_score_correction_bias is not None:
+        scores = scores + e_score_correction_bias.float().unsqueeze(0)
+        top2, _ = _topk(scores.reshape(num_tokens * num_expert_group, group_size), 2)
+        group_scores = top2.sum(dim=-1).view(num_tokens, num_expert_group)
+    else:
+        group_scores = scores.view(num_tokens, num_expert_group, group_size).amax(
+            dim=-1
+        )
+    _, group_idx = _topk(group_scores, topk_group)
+    group_mask = torch.zeros_like(group_scores).scatter(1, group_idx.long(), 1.0)
+    score_mask = (
+        group_mask.unsqueeze(-1)
+        .expand(num_tokens, num_expert_group, group_size)
+        .reshape(num_tokens, num_experts)
+    )
+    tmp_scores = scores.masked_fill(score_mask == 0, float("-inf"))
+    if e_score_correction_bias is not None:
+        _, topk_ids = _topk(tmp_scores, topk)
+        topk_weights = original_scores.gather(1, topk_ids.long())
+    else:
+        topk_weights, topk_ids = _topk(tmp_scores, topk)
+    if renormalize:
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+    if routed_scaling_factor != 1.0:
+        topk_weights = topk_weights * routed_scaling_factor
+    return topk_weights.float(), topk_ids.to(torch.int32)
+
+
 def select_experts(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
@@ -292,6 +345,21 @@ def select_experts(
         and layer.num_expert_group > 1
         and layer.topk_group < layer.num_expert_group
     )
+    if use_grouped and _ROUTER_TOPK == "rowmax":
+        assert layer is not None
+        topk_weights, topk_ids = _grouped_topk_rowmax(
+            router_logits,
+            topk=topk,
+            renormalize=renormalize,
+            num_expert_group=layer.num_expert_group,
+            topk_group=layer.topk_group,
+            scoring_fn=scoring_fn,
+            routed_scaling_factor=layer.routed_scaling_factor,
+            e_score_correction_bias=layer.e_score_correction_bias,
+        )
+        return topk_weights.to(
+            _get_topk_weights_dtype(hidden_states.dtype)
+        ), topk_ids.to(torch.int32)
     if use_grouped:
         from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import (
             grouped_topk,
