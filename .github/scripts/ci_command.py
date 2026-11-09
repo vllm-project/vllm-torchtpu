@@ -361,7 +361,9 @@ def _leave_merge(pr: dict[str, Any], gh_token: str) -> list[str]:
     state = gql(_MERGE_STATE_QUERY)
     if state.get("isInMergeQueue"):
         gql(_DEQUEUE_MUTATION)
-        done.append("Took the PR out of the merge queue.")
+        done.append(
+            "Took the PR out of the merge queue (its queue build is cancelled)."
+        )
         state = gql(_MERGE_STATE_QUERY)
     if state.get("autoMergeRequest"):
         gql(_DISABLE_AUTO_MERGE_MUTATION)
@@ -410,6 +412,8 @@ def handle_pr_info(
         )
     else:
         guidance = (
+            "- Your pushes don't build until a reviewer runs `/ci precheck` (CPU "
+            "checks) or `/ci run` (TPU tests).\n"
             "- You don't have write access, so a reviewer can run `/ci` commands "
             "for you (`/ci help` is open to anyone):\n"
             "  - `/ci precheck`: re-run all non-TPU checks "
@@ -493,9 +497,12 @@ def handle_comment(
             if cancelled:
                 nums = ", ".join(f"#{n}" for n in cancelled)
                 noun = "build" if len(cancelled) == 1 else "builds"
-                parts.append(f"Cancelled {noun} {nums}.")
+                parts.append(
+                    f"Cancelled {noun} {nums}. Comment `/ci precheck` to get a green "
+                    "check again before merging."
+                )
             else:
-                parts.append("No running CI builds for this PR.")
+                parts.append("No running PR builds to cancel.")
         except Exception as exc:
             parts.append(f"@{author}, could not cancel builds ({_err_summary(exc)}).")
         try:
@@ -598,7 +605,9 @@ def handle_comment(
     extras_label = ", ".join(extras) if extras else "none"
     return reply(
         f"Started `{cmd_text}` on `{pr['head']['sha'][:7]}` "
-        f"(extras: {extras_label}): {build['web_url']}"
+        f"(extras: {extras_label}): {build['web_url']}\n\n"
+        "The merge queue waits for this run. To merge without it, comment "
+        "`/ci cancel`, then `/ci precheck`."
     )
 
 

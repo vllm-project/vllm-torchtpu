@@ -429,6 +429,7 @@ class TestCiCommand(unittest.TestCase):
             assert reply is not None
             self.assertIn(BK_WEB, reply)
             self.assertIn(label, reply)
+            self.assertIn("The merge queue waits for this run.", reply)
             bk_calls = [p for m, u, p in calls if m == "POST" and u == BK_URL]
             self.assertEqual(len(bk_calls), 1)
             assert bk_calls[0] is not None
@@ -621,7 +622,8 @@ class TestCiCommand(unittest.TestCase):
         reply, calls = self._run("/ci cancel", head=fork_head, active_builds=builds)
         self.assertEqual(
             reply,
-            "Cancelled builds #901, #902.\n\n<!-- ci-merge-extras: -->",
+            "Cancelled builds #901, #902. Comment `/ci precheck` to get a green check "
+            "again before merging.\n\n<!-- ci-merge-extras: -->",
         )
         list_urls = [u for m, u, _ in calls if m == "GET" and u.startswith(BK_URL)]
         self.assertEqual(len(list_urls), 1)
@@ -635,7 +637,7 @@ class TestCiCommand(unittest.TestCase):
         empty_reply, _ = self._run("/ci cancel", active_builds=[])
         self.assertEqual(
             empty_reply,
-            "No running CI builds for this PR.\n\n<!-- ci-merge-extras: -->",
+            "No running PR builds to cancel.\n\n<!-- ci-merge-extras: -->",
         )
 
         # `auto_merge_disabled` event also posts an empty marker to clear extras.
@@ -732,7 +734,8 @@ class TestCiCommand(unittest.TestCase):
             )
         self.assertEqual(
             reply,
-            "No running CI builds for this PR. Took the PR out of the merge queue. "
+            "No running PR builds to cancel. Took the PR out of the merge queue (its "
+            "queue build is cancelled). "
             "Turned off auto-merge.\n\n<!-- ci-merge-extras: -->",
         )
         self.assertIn("dequeuePullRequest", gql_queries(calls))
@@ -747,7 +750,7 @@ class TestCiCommand(unittest.TestCase):
         self.assertEqual(
             bk_reply,
             "@alice, could not cancel builds (HTTP 403). Took the PR out of the merge "
-            "queue.\n\n<!-- ci-merge-extras: -->",
+            "queue (its queue build is cancelled).\n\n<!-- ci-merge-extras: -->",
         )
         self.assertNotIn("disablePullRequestAutoMerge", gql_queries(bk_calls))
 
@@ -783,6 +786,9 @@ class TestCiCommand(unittest.TestCase):
             ext = ci_command.handle_pr_info(REPO, 43, "ext-dev", "gh-tok")
         assert ext is not None
         self.assertIn("You don't have write access", ext)
+        self.assertIn(
+            "Your pushes don't build until a reviewer runs `/ci precheck`", ext
+        )
         self.assertIn("`/ci help` is open to anyone", ext)
         self.assertIn(
             "`/ci precheck`: re-run all non-TPU checks "
