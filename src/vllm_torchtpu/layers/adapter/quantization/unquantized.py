@@ -223,6 +223,19 @@ class VllmUnquantizedConfig(QuantizationConfig, VllmQuantConfig):
         if isinstance(layer, RoutedExperts):
             # For MoE layers, use our custom TPU implementation
             moe_config = self.get_moe_config(layer)
+            if should_quantize_on_load(prefix):
+                # BF16 experts are quantized to the MOE_REQUANTIZE_* format
+                # (per-channel FP8 by default) after loading.
+                from vllm_torchtpu.layers.adapter.quantization.fp8 import (
+                    VllmFp8Config,
+                    VllmFp8MoEMethodTPU,
+                )
+
+                fp8_config = VllmFp8Config(
+                    is_checkpoint_fp8_serialized=False,
+                    activation_scheme="dynamic",
+                )
+                return VllmFp8MoEMethodTPU(fp8_config, moe_config)
             return VllmUnquantizedFusedMoEMethod(moe_config)
 
         if isinstance(layer, Attention):
