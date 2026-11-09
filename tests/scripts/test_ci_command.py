@@ -323,10 +323,10 @@ class TestCiCommand(unittest.TestCase):
         reply, calls = self._run("/ci precheck", workflow_runs=runs)
         self.assertEqual(
             reply,
-            "Started prechecks on `abcdef1`: "
-            "pre-commit re-run (https://gh/runs/10), "
-            "PR Text re-run (https://gh/runs/20), "
-            f"Buildkite CPU checks ({BK_WEB})",
+            "Started prechecks on `abcdef1`:\n\n"
+            "- pre-commit re-run (https://gh/runs/10)\n"
+            "- PR Text re-run (https://gh/runs/20)\n"
+            f"- Buildkite CPU checks ({BK_WEB})",
         )
         post_urls = [u for m, u, _ in calls if m == "POST" and "/actions/runs/" in u]
         self.assertEqual(post_urls, [f"{RUNS_URL}/10/rerun", f"{RUNS_URL}/20/rerun"])
@@ -372,10 +372,10 @@ class TestCiCommand(unittest.TestCase):
         )
         self.assertEqual(
             reply,
-            "Started prechecks on `1234567`: "
-            "pre-commit approved (https://gh/runs/51), "
-            "PR Text already in_progress (https://gh/runs/52), "
-            f"Buildkite CPU checks ({BK_WEB})",
+            "Started prechecks on `1234567`:\n\n"
+            "- pre-commit approved (https://gh/runs/51)\n"
+            "- PR Text already in_progress (https://gh/runs/52)\n"
+            f"- Buildkite CPU checks ({BK_WEB})",
         )
         action_posts = [u for m, u, _ in calls if m == "POST" and "/actions/runs/" in u]
         self.assertEqual(action_posts, [f"{RUNS_URL}/51/approve"])

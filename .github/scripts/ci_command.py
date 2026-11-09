@@ -573,9 +573,10 @@ def handle_comment(
         except Exception as exc:
             bk_ok = False
             notes.append(f"Buildkite CPU checks failed ({_err_summary(exc)})")
+        bullets = "\n".join(f"- {note}" for note in notes)
         if actions_ok and bk_ok:
-            return reply(f"Started prechecks on `{sha7}`: " + ", ".join(notes))
-        return reply(f"Prechecks on `{sha7}` (partial): " + "; ".join(notes))
+            return reply(f"Started prechecks on `{sha7}`:\n\n{bullets}")
+        return reply(f"Prechecks on `{sha7}` (partial):\n\n{bullets}")
     cmd_text = "/ci run" + (f" {' '.join(extras)}" if extras else "")
     try:
         build = _trigger_build(
