@@ -44,6 +44,12 @@ TILE_PAGES_PER_STEP = int(
 )
 
 
+# `msa_sparse_attention_lse_heads` above DECODE_TOKENS runs `_heads_call`
+# (one loop of kernel calls over whole head-major q / out / lse) instead of a
+# `lax.map` over heads and chunks of sliced and restacked operands.
+FUSED_HEADS = os.environ.get("VLLM_TORCHTPU_MSA_FUSED_HEADS", "1") == "1"
+
+
 def _kernel(
     # Scalar prefetch
     work_page_ref,  # [groups * G] page key of each slot, -1 for none
@@ -60,6 +66,7 @@ def _kernel(
     fp4: bool = False,
     slots_per_tile: int | None = None,
     page_bucket: int = 0,
+    aliased: int = 0,
 ):
     """`msa_attention._kernel_v2` that also writes ``lse = m + log(l)``
     (``-inf`` for a row that sees no slot; its output is 0).
@@ -71,10 +78,13 @@ def _kernel(
 
     With `page_bucket` a step computes only its first ``n`` slots, ``n`` its
     valid page count rounded up to a multiple of `page_bucket` (a group's
-    valid pages are a prefix of its slots); a step with none does nothing."""
-    pages_per_step = len(refs) - 5
+    valid pages are a prefix of its slots); a step with none does nothing.
+
+    `aliased` inputs (in HBM, never read) follow the KV pages: the outputs'
+    previous contents, which the call writes into in place."""
+    pages_per_step = len(refs) - 5 - aliased
     kv_refs = refs[:pages_per_step]
-    o_ref, lse_ref, m_ref, l_ref, acc_ref = refs[pages_per_step:]
+    o_ref, lse_ref, m_ref, l_ref, acc_ref = refs[pages_per_step + aliased :]
     active = None
     if slots_per_tile is None:
         w = pl.program_id(0)
@@ -529,6 +539,158 @@ def _decode_call(
     return out, lse[:, :, 0]
 
 
+def _heads_call(
+    q,
+    kv_cache,
+    selected,
+    local_page,
+    local_limit,
+    page_table,
+    *,
+    sm_scale,
+    block_q,
+    pages_per_step,
+    interpret,
+    tiles,
+):
+    """Every KV head and token chunk of `msa_sparse_attention_lse_heads` as
+    kernel calls in one loop that read their queries from, and write their
+    outputs into, whole head-major arrays at the head's and chunk's block:
+    no per-call slicing, transposing and stacking of q / out / lse.
+
+    ``q [G, Hg, T, D]`` (T a multiple of block_q), ``selected [G, T, K]``.
+    Returns ``(out [G, Hg, T, D], lse [G, Hg, T, 1] f32)``."""
+    num_heads, q_per_head, num_tokens, head_dim = q.shape
+    _, rows_per_page, packing, _ = kv_cache.shape
+    row_width = 2 * head_dim
+    topk = selected.shape[-1]
+    step, num_chunks = _chunk_len(num_tokens, block_q)
+    pad = num_chunks * step - num_tokens
+    if pad:
+        q = jnp.pad(q, ((0, 0), (0, 0), (0, pad), (0, 0)))
+        selected = jnp.pad(selected, ((0, 0), (0, pad), (0, 0)), constant_values=-1)
+        local_page = jnp.pad(local_page, (0, pad), constant_values=-1)
+        local_limit = jnp.pad(local_limit, (0, pad))
+    padded = num_chunks * step
+    tiles_per_chunk = step // block_q
+    works = _work_lists(selected, block_q, pages_per_step, tiles)  # [G, chunks, ...]
+    fp4 = kv_cache.dtype == jnp.uint8
+
+    if tiles:
+
+        def grid_tile(t, grp, pages, meta, *_):
+            return t
+
+        def slot_index(t, grp, meta, g, slots):
+            return t * slots + jnp.minimum(grp, meta[t] - 1) * pages_per_step + g
+
+    else:
+
+        def grid_tile(w, pages, meta, *_):
+            return meta[w] >> msa_attention._TILE_SHIFT
+
+        def slot_index(w, meta, g, slots):
+            return w * pages_per_step + g
+
+    def tile_of(*idx):
+        return idx[-1][1] + grid_tile(*idx)  # chunk's first tile + tile
+
+    def call(h, c, out, lse):
+        pages, meta, num_groups = jax.tree.map(lambda x: x[h, c], works)
+        slots = pages.shape[0] // tiles_per_chunk if tiles else None
+        grid = (tiles_per_chunk, num_groups) if tiles else (num_groups,)
+
+        def page_block(g):
+            def index_map(*idx):
+                *grid_idx, pages_, meta_, table, hc = idx
+                key = pages_[slot_index(*grid_idx, meta_, g, slots)]
+                return (table[jnp.maximum(key, 0)], 0, 0, hc[0])
+
+            return pl.BlockSpec((1, rows_per_page, packing, row_width), index_map)
+
+        def head_block(*idx):
+            return (idx[-1][0], 0, tile_of(*idx), 0)
+
+        def sel_block(*idx):
+            return (idx[-1][0], tile_of(*idx), 0)
+
+        def row_block(*idx):
+            return (tile_of(*idx), 0)
+
+        any_spec = pl.BlockSpec(memory_space=pl.ANY)
+        grid_spec = pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=4,
+            grid=grid,
+            in_specs=[
+                pl.BlockSpec((None, q_per_head, block_q, head_dim), head_block),
+                pl.BlockSpec((None, block_q, topk), sel_block),
+                pl.BlockSpec((block_q, 1), row_block),
+                pl.BlockSpec((block_q, 1), row_block),
+                *(page_block(g) for g in range(pages_per_step)),
+                any_spec,
+                any_spec,
+            ],
+            out_specs=[
+                pl.BlockSpec((None, q_per_head, block_q, head_dim), head_block),
+                pl.BlockSpec((None, q_per_head, block_q, 1), head_block),
+            ],
+            scratch_shapes=[
+                pltpu.VMEM((q_per_head * block_q, 1), jnp.float32),
+                pltpu.VMEM((q_per_head * block_q, 1), jnp.float32),
+                pltpu.VMEM((q_per_head * block_q, head_dim), jnp.float32),
+            ],
+        )
+        first = 8 + pages_per_step  # operand index of `out` (prefetch included)
+        return pl.pallas_call(
+            functools.partial(
+                _kernel,
+                sm_scale=sm_scale,
+                slots_per_tile=slots,
+                page_bucket=PAGE_BUCKET,
+                aliased=2,
+                **({"fp4": True} if fp4 else {}),
+            ),
+            grid_spec=grid_spec,
+            out_shape=[
+                jax.ShapeDtypeStruct(out.shape, out.dtype),
+                jax.ShapeDtypeStruct(lse.shape, lse.dtype),
+            ],
+            input_output_aliases={first: 0, first + 1: 1},
+            compiler_params=pltpu.CompilerParams(
+                dimension_semantics=("arbitrary",) * len(grid),
+                vmem_limit_bytes=msa_attention._VMEM_LIMIT_BYTES,
+            ),
+            interpret=interpret,
+            name="minimax_m3_msa_sparse_attention_lse",
+        )(
+            pages,
+            meta,
+            page_table,
+            jnp.stack([h, c * tiles_per_chunk]).astype(jnp.int32),
+            q,
+            selected,
+            local_page[:, None],
+            local_limit[:, None],
+            *([kv_cache] * pages_per_step),
+            out,
+            lse,
+        )
+
+    def body(i, carry):
+        return tuple(call(i // num_chunks, i % num_chunks, *carry))
+
+    out, lse = jax.lax.fori_loop(
+        0,
+        num_heads * num_chunks,
+        body,
+        (
+            jnp.zeros((num_heads, q_per_head, padded, head_dim), q.dtype),
+            jnp.zeros((num_heads, q_per_head, padded, 1), jnp.float32),
+        ),
+    )
+    return out[:, :, :num_tokens], lse[:, :, :num_tokens]
+
+
 def _chunked_call(
     q,
     kv_cache,
@@ -737,10 +899,26 @@ def msa_sparse_attention_lse_heads(
         )
     padded = q.shape[0]
     q_per_head = num_q_heads // num_heads
-    q_heads = q.reshape(padded, num_heads, q_per_head, head_dim).transpose(1, 0, 2, 3)
-
     selected_heads = selected.transpose(1, 0, 2)  # [G, T, K]
     decode = padded <= DECODE_TOKENS
+    if not decode and FUSED_HEADS:
+        out, lse = _heads_call(
+            q.reshape(padded, num_heads, q_per_head, head_dim).transpose(1, 2, 0, 3),
+            kv_cache,
+            selected_heads,
+            local_page,
+            local_limit,
+            page_table,
+            sm_scale=sm_scale,
+            block_q=block_q,
+            pages_per_step=pages_per_step,
+            interpret=interpret,
+            tiles=tiles,
+        )  # [G, Hg, T, D], [G, Hg, T, 1]
+        out = out.transpose(2, 0, 1, 3).reshape(padded, num_q_heads, head_dim)
+        lse = lse[..., 0].transpose(2, 0, 1).reshape(padded, num_q_heads)
+        return out[:num_tokens], lse[:num_tokens]
+    q_heads = q.reshape(padded, num_heads, q_per_head, head_dim).transpose(1, 0, 2, 3)
     works = (
         jnp.zeros((num_heads,), jnp.int32)  # unused: decode calls need no work list
         if decode
