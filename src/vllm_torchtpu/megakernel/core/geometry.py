@@ -276,7 +276,7 @@ class ModelGeometry:
             base_er = self.E // R if self.e_slots >= self.E // R else self.E // 8
             e_slots = e_tiny // R + max(0, self.e_slots - base_er)
         i_min = 128 * R if self.moe_tp else 128
-        return dataclasses.replace(
+        shrunk = dataclasses.replace(
             self,
             L=periods * self.att_every,
             H=min(self.H, 1024),
@@ -290,6 +290,10 @@ class ModelGeometry:
             IS=max(128 * R, min(self.IS, 512)),
             e_slots=e_slots,
         )
+        for k, v in vars(self).items():
+            if k not in shrunk.__dict__:
+                object.__setattr__(shrunk, k, v)
+        return shrunk
 
 
 __all__ = ["FromHF", "LMHead", "ModelGeometry"]

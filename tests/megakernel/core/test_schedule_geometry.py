@@ -164,7 +164,9 @@ def test_model_geometry_properties_shrink_check_and_pool_backend():
         assert mg_diff != mg, f"ModelGeometry equality ignored field {f.name!r}"
         assert hash(mg_diff) != hash(mg), f"ModelGeometry hash ignored field {f.name!r}"
 
+    object.__setattr__(mg, "_extra_tag", "preserved")
     mg_shrunk = mg.shrink(R=2)
+    assert getattr(mg_shrunk, "_extra_tag", None) == "preserved"
     assert (mg_shrunk.L, mg_shrunk.att_every) == (8, 4)
     mg_shrunk.check(ExecSpec(R=2, B=2, T=1, ctx=128))
 
