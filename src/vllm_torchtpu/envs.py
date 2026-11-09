@@ -118,6 +118,8 @@ if TYPE_CHECKING:
     TPU_PP_LAZY_PUSH: bool = False
     TPU_PP_HANDOFF: str = "wave"
     TPU_PP_RING_DEPTH: int = 2
+    TPU_GDN_FUSED_NORM_QUANT: bool = False
+    TPU_GATED_NORM_TILE: int = 32
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
@@ -884,6 +886,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Experimental: shard DSv4 attention wq_b/wo_a/wo_b across a chip's two
     # cores while KV and attention stay DP (deepseek_v4/attn_intra_chip.py).
     "TPU_DSV4_ATTN_INTRA_CHIP_TP": env_bool("TPU_DSV4_ATTN_INTRA_CHIP_TP"),
+    # Run the GDN output's gated RMSNorm and the per-channel FP8 out_proj's
+    # activation quantization as one Pallas pass (kernels/gated_norm_quant.py).
+    "TPU_GDN_FUSED_NORM_QUANT": env_bool("TPU_GDN_FUSED_NORM_QUANT"),
+    # Upper bound on the token rows per grid step of that kernel; it uses the
+    # largest legal block at or below this value for each token bucket.
+    "TPU_GATED_NORM_TILE": lambda: int(os.getenv("TPU_GATED_NORM_TILE", "32")),
     # Slice the rotary cos_sin caches to max model len at load to
     # minimize xla layout data copy overhead. Text-only.
     "TPU_ROPE_CACHE_TRUNCATE": env_bool("TPU_ROPE_CACHE_TRUNCATE"),
