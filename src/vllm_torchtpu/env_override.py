@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 import os
 
 # envs.py imports nothing from this package, so it is safe to load here,
@@ -119,12 +120,19 @@ def _fetch_tpu_type_from_metadata() -> str | None:
             "http://metadata.google.internal/computeMetadata/v1/"
             "instance/attributes/accelerator-type",
             headers={"Metadata-Flavor": "Google"},
+            timeout=2,
         )
         if resp.status_code == 200 and resp.text:
             return resp.text
     except Exception:  # noqa: S110
         pass
     return None
+
+
+@functools.cache
+def _tpu_type() -> str | None:
+    tpu_type = os.getenv("TPU_ACCELERATOR_TYPE") or _fetch_tpu_type_from_metadata()
+    return tpu_type.strip().lower() if tpu_type else None
 
 
 def _resolve_sc_offload_threshold_bytes() -> int | None:
@@ -134,12 +142,9 @@ def _resolve_sc_offload_threshold_bytes() -> int | None:
     if override is not None:
         return override if override > 0 else None
 
-    tpu_type = os.getenv("TPU_ACCELERATOR_TYPE")
-    if not tpu_type:
-        tpu_type = _fetch_tpu_type_from_metadata()
+    tpu_type = _tpu_type()
     if not tpu_type:
         return None
-    tpu_type = tpu_type.strip().lower()
     for prefix, size in _TPU_VMEM_BYTES_PER_TENSOR_CORE.items():
         if tpu_type.startswith(prefix):
             return size
@@ -210,6 +215,17 @@ if _sc_offload_bytes is not None:
     ):
         if not _user_has_flag(_flag_name):
             _libtpu_extra_args.append(f"{_flag_name}={_sc_offload_bytes}")
+
+# --xla_tpu_enable_sparse_core_hierarchical_all_reduce: run whatever
+# all-reduces libtpu offloads to the SparseCore (e.g. a prefill step's
+# residual all-reduces) hierarchically. On a tpu7x 2x2x1 over 8 cores a
+# bf16[8192, 6144] all-reduce takes 0.96 ms instead of 1.24 ms; the bf16
+# summation order changes, with the same error against an f32 sum.
+_hierarchical_ar_flag = "--xla_tpu_enable_sparse_core_hierarchical_all_reduce"
+if (_tpu_type() or "").startswith(("tpu7x", "v7x")) and not _user_has_flag(
+    _hierarchical_ar_flag
+):
+    _libtpu_extra_args.append(f"{_hierarchical_ar_flag}=true")
 
 if _libtpu_extra_args:
     _assembled = " ".join(_libtpu_extra_args)
