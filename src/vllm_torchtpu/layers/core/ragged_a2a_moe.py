@@ -596,16 +596,17 @@ def _receive_buffer(sent, row_gather):
     return jnp.zeros_like(sent)
 
 
-def _scatter_send(x, out_row, *, rows):
+def _scatter_send(x, out_row, *, rows, canonical=False):
     """The send buffer [rows, 16, H / 16] written by `copy_send_rows`: token
     ``t``'s row at ``out_row[t, d]`` for each member ``d`` it goes to
-    (``out_row`` [S, D], ``rows`` where it does not)."""
+    (``out_row`` [S, D], ``rows`` where it does not); ``canonical``: with the
+    row gather's special-value mapping applied."""
     num_tokens = x.shape[0]
     token = jnp.arange(num_tokens, dtype=jnp.int32)[:, None]
     row = jnp.arange(rows, dtype=jnp.int32)[:, None, None]
     index = jnp.where(out_row[None] == row, token[None], 0).sum(axis=(1, 2))
     count = jnp.max(jnp.where(out_row < rows, out_row + 1, 0), initial=0)
-    return copy_send_rows(x, index, count[None], rows)
+    return copy_send_rows(x, index, count[None], rows, canonical=canonical)
 
 
 def _full_exchange(
@@ -623,6 +624,7 @@ def _full_exchange(
     plan=None,
     row_gather=False,
     row_scatter=False,
+    canonical_send=False,
 ):
     """One receive region per DP member, sized for all of its tokens.
 
@@ -630,7 +632,8 @@ def _full_exchange(
     outputs to their senders instead of the return exchange; with ``plan`` too
     (see ``ragged_a2a_moe_local``), it gets its routes from `route_plan`, and
     with ``row_gather`` it copies their rows out of the receive buffer;
-    ``row_scatter`` writes the send buffer with `copy_send_rows`."""
+    ``row_scatter`` writes the send buffer with `copy_send_rows`, which maps
+    special values with ``canonical_send``."""
     num_tokens, hidden = x.shape
     local_num_experts = w1.shape[0]
     ep_rank = experts_start[0] // local_num_experts
@@ -691,7 +694,7 @@ def _full_exchange(
         recv_ids, recv_weights = read_routes(source_row)
 
     if planned and row_scatter:
-        sent = _scatter_send(x, slot_out, rows=slots)
+        sent = _scatter_send(x, slot_out, rows=slots, canonical=canonical_send)
     else:
         sent = _tile_rows(x[send_index])
     gather = planned and row_gather
@@ -774,6 +777,7 @@ def _capacity_exchange(
     row_gather=False,
     row_scatter=False,
     group_fit=False,
+    canonical_send=False,
 ):
     """Send and receive buffers of ``rows`` rows, filled without gaps.
 
@@ -795,7 +799,8 @@ def _capacity_exchange(
     side gets its ``routes`` routes from `route_plan` and the receive rows'
     sources and routes are never materialized; with ``row_gather`` it copies
     their rows out of the receive buffer, and ``row_scatter`` writes the send
-    buffer with `copy_send_rows`.
+    buffer with `copy_send_rows`, which maps special values with
+    ``canonical_send``.
     """
     num_tokens, hidden = x.shape
     local_num_experts = w1.shape[0]
@@ -864,7 +869,12 @@ def _capacity_exchange(
                 + jnp.cumsum(need_any, axis=0, dtype=jnp.int32)
                 - 1
             )
-            sent = _scatter_send(x, jnp.where(need_any, out_row, rows), rows=rows)
+            sent = _scatter_send(
+                x,
+                jnp.where(need_any, out_row, rows),
+                rows=rows,
+                canonical=canonical_send,
+            )
         else:
             sent = _tile_rows(x[send_index])
         received = jax.lax.ragged_all_to_all(
@@ -980,6 +990,7 @@ def _streamed_combine(
     plan=None,
     row_gather=False,
     src_rows=None,
+    canonical_send=False,
 ):
     """The expert kernel sends each output row to the rank that sent its token.
 
@@ -991,6 +1002,8 @@ def _streamed_combine(
     from `route_plan` with `streamed_dests` (the received rows' sources and
     routes are not needed); ``row_gather``: ``received`` holds whole-tile rows
     and the routes' rows are copied out of it, all below ``src_rows`` [1].
+    ``canonical_send``: the senders mapped the special values, so the routes'
+    rows are copied as they are.
     """
     num_tokens = x.shape[0]
     member = member_index(topk_ids)
@@ -1018,6 +1031,7 @@ def _streamed_combine(
             num_members=dp_size,
             collective_id=collective_id,
             row_gather=row_gather,
+            canonical_rows=canonical_send,
         )
     else:
         in_group = member_index(recv_ids) < dp_size
@@ -1291,6 +1305,7 @@ def _owner_combine(
     row_gather=False,
     src_rows=None,
     owner_tail=False,
+    canonical_send=False,
 ):
     """The expert kernel sends each output row to its token's OWNER rank: TP rank
     ``t // ceil(S / tp)`` of the token's engine owns token ``t``. The owner sums
@@ -1301,7 +1316,8 @@ def _owner_combine(
     it, all below ``src_rows`` [1]. ``owner_tail``: the expert kernel also sums
     the owned tokens and copies them to the engine's TP ranks in its tail (see
     `gmm_v2_mlp_scatter`), instead of `owner_sum_kernel` and the all-gather:
-    same sums, same rows."""
+    same sums, same rows. ``canonical_send``: the senders mapped the special
+    values, so the routes' rows are copied as they are."""
     num_tokens = x.shape[0]
     local = w1.shape[0]
     mesh = dict(dp_size=dp_size, tp_size=tp_size, local_num_experts=local)
@@ -1375,6 +1391,7 @@ def _owner_combine(
             num_members=(dp_size, tp_size),
             collective_id=collective_id,
             row_gather=row_gather,
+            canonical_rows=canonical_send,
         )
     else:
         dest = sender_member * tp_size + sender_token // blk
@@ -1445,6 +1462,7 @@ def ragged_a2a_moe_local(
     capacity_row_tile: int = _ROW_TILE,
     row_gather: bool = False,
     row_scatter: bool = False,
+    canonical_send: bool = False,
     streamed_combine: bool = False,
     owner_combine: bool = False,
     sorted_plan: bool = False,
@@ -1495,6 +1513,10 @@ def ragged_a2a_moe_local(
     kernel that relayouts the tokens once and copies their rows in VMEM,
     instead of an XLA gather of the send rows and their relayout (same rows
     below the send sizes).
+    ``canonical_send`` (with ``row_gather`` and ``row_scatter``): the send
+    kernel maps each token row's zeros, subnormals and non-finite values to +0
+    once, as the one-hot permute does, and the row gather copies the received
+    rows as they are, instead of mapping every route's row (same rows).
     ``routing_dma``: the DP group's packed routing is all-gathered by one
     kernel of remote DMAs (`dma_all_gather`) instead of XLA's ring
     all-gather, whose steps each wait on the previous one (same words).
@@ -1505,6 +1527,7 @@ def ragged_a2a_moe_local(
     """
     assert shared is None or owner_combine
     assert not owner_tail or owner_combine
+    assert not canonical_send or (row_gather and row_scatter)
     num_tokens = x.shape[0]
     local_num_experts = w1.shape[0]
     slots = dp_size * num_tokens
@@ -1559,6 +1582,7 @@ def ragged_a2a_moe_local(
                 shared=shared,
                 row_gather=row_gather,
                 owner_tail=owner_tail,
+                canonical_send=canonical_send,
             )
         return functools.partial(
             _streamed_combine,
@@ -1579,6 +1603,7 @@ def ragged_a2a_moe_local(
             max_local_routes=max_local_routes,
             collective_id=collective_id,
             row_gather=row_gather,
+            canonical_send=canonical_send,
         )
 
     def moe(max_local_routes):
@@ -1651,6 +1676,7 @@ def ragged_a2a_moe_local(
             plan=plan,
             row_gather=row_gather,
             row_scatter=row_scatter,
+            canonical_send=canonical_send,
         )
         return finish(out, full_streamed is not None)
 
@@ -1700,6 +1726,7 @@ def ragged_a2a_moe_local(
         row_gather=row_gather,
         row_scatter=row_scatter,
         group_fit=group_fit,
+        canonical_send=canonical_send,
     )
     out = finish(out, capacity_streamed is not None)
     return jax.lax.cond(overflow, full, lambda: out)
@@ -1727,6 +1754,7 @@ def ragged_a2a_moe(
     capacity_row_tile: int = _ROW_TILE,
     row_gather: bool = False,
     row_scatter: bool = False,
+    canonical_send: bool = False,
     streamed_combine: bool = False,
     owner_combine: bool = False,
     sorted_plan: bool = False,
@@ -1755,6 +1783,7 @@ def ragged_a2a_moe(
         capacity_row_tile=capacity_row_tile,
         row_gather=row_gather,
         row_scatter=row_scatter,
+        canonical_send=canonical_send,
         streamed_combine=streamed_combine,
         owner_combine=owner_combine,
         sorted_plan=sorted_plan,

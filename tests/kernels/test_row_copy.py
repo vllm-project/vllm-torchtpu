@@ -36,6 +36,13 @@ def _require_tpu() -> None:
         pytest.fail(f"Expected JAX TPU backend, got {jax.default_backend()}.")
 
 
+def _canonical(bits):
+    """The one-hot permute's bf16 bit patterns: +0 for exponent fields 0 and
+    255 (zeros, subnormals, infinities, NaNs), every other pattern kept."""
+    exponent = bits & 0x7F80
+    return np.where((exponent != 0) & (exponent != 0x7F80), bits, 0).astype(np.uint16)
+
+
 def _rows(rng, num_rows, hidden):
     """bf16 rows [num_rows, hidden] with special values in about 1% of the
     elements."""
@@ -56,9 +63,11 @@ def _group_sizes(rng, count, groups=16):
 @pytest.mark.parametrize("num_routes", [512, 640, 1024, 1840])
 @pytest.mark.parametrize("count", [0, 1, 63, 64, 65, 260, -1])
 @pytest.mark.parametrize("hidden", [8192, 2048])
-def test_gather_rows_matches_the_onehot_permute(num_routes, count, hidden):
+@pytest.mark.parametrize("canonical", [True, False])
+def test_gather_rows_matches_the_onehot_permute(num_routes, count, hidden, canonical):
     """Every row the expert kernel reads (the computed routes, padded to whole
-    16-row blocks with zeros) is bitwise the one-hot permute's row."""
+    16-row blocks with zeros) is bitwise the one-hot permute's row; without
+    ``canonical``, from sources that already hold the permute's values."""
     _require_tpu()
     count = num_routes if count < 0 else count
     rng = np.random.default_rng(num_routes * 10 + count)
@@ -66,6 +75,10 @@ def test_gather_rows_matches_the_onehot_permute(num_routes, count, hidden):
     # the 4-host capacity exchange.
     num_src = 184 if num_routes == 1840 else 480
     rows2d = _rows(rng, num_src, hidden)
+    src = rows2d
+    if not canonical:
+        bits = _canonical(np.asarray(rows2d).view(np.uint16))
+        src = jnp.asarray(bits.view(jnp.bfloat16))
     index = rng.integers(0, num_src, size=num_routes).astype(np.int32)
     # Routes past the computed ones read no row (the plan's out-of-range index).
     index[count:] = num_src
@@ -73,10 +86,11 @@ def test_gather_rows_matches_the_onehot_permute(num_routes, count, hidden):
     # The rows the routes read lie below the filled bound, as in the exchange.
     filled = int(index[:count].max()) + 1 if count else 0
     got = gather_rows(
-        rows2d.reshape(num_src, 16, hidden // 16),
+        src.reshape(num_src, 16, hidden // 16),
         jnp.asarray(index),
         jnp.asarray(sizes),
         jnp.asarray([filled], jnp.int32),
+        canonical=canonical,
     )
     want = jax.jit(onehot_permute)(rows2d, jnp.asarray(index))
     written = min(num_routes, -(-count // 16) * 16)
@@ -103,9 +117,13 @@ def _send_layout(routed, num_members, rows):
 @pytest.mark.parametrize("num_members", [2, 8, 16, 32])
 @pytest.mark.parametrize("num_tokens", [12, 92, 104, 112, 128])
 @pytest.mark.parametrize("routing", ["random", "one_member", "none", "overflow"])
-def test_copy_send_rows_writes_the_send_rows(num_members, num_tokens, routing):
+@pytest.mark.parametrize("canonical", [False, True])
+def test_copy_send_rows_writes_the_send_rows(
+    num_members, num_tokens, routing, canonical
+):
     """The send buffer rows the exchange sends are exact copies of their
-    token rows, in the XLA path's layout."""
+    token rows (``canonical``: the one-hot permute's values of them), in the
+    XLA path's layout."""
     _require_tpu()
     topk = 10
     rng = np.random.default_rng(num_members * 1000 + num_tokens)
@@ -123,10 +141,60 @@ def test_copy_send_rows_writes_the_send_rows(num_members, num_tokens, routing):
         rows = max(16, rows // 2 // 16 * 16)
     out_row, index, total = _send_layout(routed, num_members, rows)
     x = _rows(rng, num_tokens, 8192)
-    got = _scatter_send(x, jnp.asarray(out_row), rows=rows)
+    got = _scatter_send(x, jnp.asarray(out_row), rows=rows, canonical=canonical)
     # The layout of the XLA path's send buffer, with the token rows copied
     # bit for bit.
     want_shape = jax.eval_shape(lambda x, i: _tile_rows(x[i]), x, jnp.asarray(index))
     assert got.shape == want_shape.shape
     want = np.asarray(x).view(np.uint16)[index].reshape(want_shape.shape)
+    if canonical:
+        want = _canonical(want)
     np.testing.assert_array_equal(np.asarray(got).view(np.uint16)[:total], want[:total])
+
+
+@pytest.mark.parametrize("hidden", [8192, 2048])
+@pytest.mark.parametrize("cut", [0, 5])
+def test_canonical_send_rows_gather_to_the_same_rows(hidden, cut):
+    """Every bf16 bit pattern: token rows the send kernel maps once and the
+    row gather copies are bitwise the rows the row gather maps from exact
+    send copies, the one-hot permute's rows (the ragged all-to-all moves
+    whole send rows unchanged into the receive buffer in between)."""
+    _require_tpu()
+    rng = np.random.default_rng(hidden + cut)
+    num_members, topk = 4, 3
+    # Two shuffled copies of the 65536 patterns, H per token row.
+    num_tokens = 2 * 65536 // hidden
+    bits = np.concatenate([rng.permutation(65536), rng.permutation(65536)])
+    bits = bits.astype(np.uint16).reshape(num_tokens, hidden)
+    x = jnp.asarray(bits.view(jnp.bfloat16))
+    # Every token goes to one to three members.
+    routed = rng.integers(0, num_members + 1, size=(num_tokens, topk))
+    routed[:, 0] = np.arange(num_tokens) % num_members
+    need = (routed[:, :, None] == np.arange(num_members)).any(axis=1)
+    rows = max(16, -(-int(need.sum()) // 32) * 32)
+    out_row, send_index, total = _send_layout(routed, num_members, rows)
+    exact = _scatter_send(x, jnp.asarray(out_row), rows=rows)
+    mapped = _scatter_send(x, jnp.asarray(out_row), rows=rows, canonical=True)
+    sent = np.asarray(mapped).view(np.uint16)[:total].reshape(total, hidden)
+    np.testing.assert_array_equal(sent, _canonical(bits[send_index[:total]]))
+    # Routes read every received row once, then random ones; ``cut`` leaves
+    # the last 16-row block part empty.
+    num_routes = -(-(total + 40) // 16) * 16
+    index = np.concatenate(
+        [rng.permutation(total), rng.integers(0, total, size=num_routes - total)]
+    ).astype(np.int32)
+    count = num_routes - cut
+    index[count:] = rows
+    args = (
+        jnp.asarray(index),
+        jnp.asarray(_group_sizes(rng, count)),
+        jnp.asarray([total], jnp.int32),
+    )
+    want = gather_rows(exact, *args)
+    got = gather_rows(mapped, *args, canonical=False)
+    written = -(-count // 16) * 16
+    got = np.asarray(got).view(np.uint16)[:written]
+    np.testing.assert_array_equal(got, np.asarray(want).view(np.uint16)[:written])
+    ref = np.zeros((written, hidden), np.uint16)
+    ref[:count] = _canonical(bits[send_index[index[:count]]])
+    np.testing.assert_array_equal(got, ref)

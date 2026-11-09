@@ -67,6 +67,7 @@ def _gather_kernel(
     *,
     tile: int,
     num_rows: int,
+    canonical: bool,
 ):
     n = sizes_ref[0]
     for i in range(1, sizes_ref.shape[0]):
@@ -128,7 +129,10 @@ def _gather_kernel(
         v = n - base
         keep = jnp.where(2 * sublane < v, u(0xFFFF), u(0))
         keep = keep | jnp.where(2 * sublane + 1 < v, u(0xFFFF0000), u(0))
-        w = _canonical_bits(pltpu.bitcast(x, jnp.uint32)) & keep
+        w = pltpu.bitcast(x, jnp.uint32)
+        if canonical:
+            w = _canonical_bits(w)
+        w = w & keep
         out_buf[slot, pl.ds(c * _ROWS_PER_TILE, _ROWS_PER_TILE)] = pltpu.bitcast(
             w, out_buf.dtype
         )
@@ -158,11 +162,15 @@ def _gather_kernel(
         store_op(num_tiles - 1, lax.rem(num_tiles - 1, 2), "wait")
 
 
-@functools.partial(jax.jit, static_argnames=("tile",))
-def gather_rows(src, index, sizes, filled, *, tile: int = _GATHER_TILE):
+@functools.partial(jax.jit, static_argnames=("tile", "canonical"))
+def gather_rows(
+    src, index, sizes, filled, *, tile: int = _GATHER_TILE, canonical: bool = True
+):
     """Matmul rows of the routes' token rows: ``out[j] = src[index[j]]`` for
     ``j < sum(sizes)``, as `fused_moe_scatter_planned`'s one-hot permute
     computes them (zeros, subnormals and non-finite values become +0).
+    ``canonical`` false: the rows are copied bit for bit, for sources that
+    already hold those values (`copy_send_rows` with ``canonical``).
 
     ``src`` [R, 16, H / 16] bf16 holds one token row per major index, the
     gathered ones below ``filled[0]``; ``index`` [P] int32; ``sizes`` int32
@@ -189,8 +197,13 @@ def gather_rows(src, index, sizes, filled, *, tile: int = _GATHER_TILE):
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     # The kernel copies the rows itself: XLA must not stage them in VMEM.
     src = pltpu.with_memory_space_constraint(src, pltpu.HBM)
+    name = f"row_copy_gather-p_{num_rows}-r_{num_src}-h_{hidden}-t_{tile}"
+    if not canonical:
+        name += "-bits"
     return pl.pallas_call(
-        functools.partial(_gather_kernel, tile=tile, num_rows=num_rows),
+        functools.partial(
+            _gather_kernel, tile=tile, num_rows=num_rows, canonical=canonical
+        ),
         out_shape=jax.ShapeDtypeStruct((num_rows, hidden), src.dtype),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=3,
@@ -206,20 +219,29 @@ def gather_rows(src, index, sizes, filled, *, tile: int = _GATHER_TILE):
         compiler_params=pltpu.CompilerParams(
             disable_bounds_checks=True, vmem_limit_bytes=vmem_limit
         ),
-        name=f"row_copy_gather-p_{num_rows}-r_{num_src}-h_{hidden}-t_{tile}",
+        name=name,
     )(index, sizes, filled, src)
 
 
-def _send_kernel(index_ref, count_ref, x_ref, out_ref, stage, rows_vmem, sem):
+def _send_kernel(
+    index_ref, count_ref, x_ref, out_ref, stage, rows_vmem, sem, *, canonical: bool
+):
     c = pl.program_id(0)
     sub = ROW_SUBLANES
     lanes = stage.shape[1]
     # Token t's row is stage rows [16 t, 16 t + 16): whole tiles.
     block = x_ref[...].reshape(_ROWS_PER_TILE, sub, lanes)
     start = pl.multiple_of(c * _ROWS_PER_TILE * sub, _ROWS_PER_TILE * sub)
-    stage[pl.ds(start, _ROWS_PER_TILE * sub)] = block.reshape(
-        _ROWS_PER_TILE * sub, lanes
-    )
+    if canonical:
+        # The one-hot permute's values, stored one token row at a time.
+        for t in range(_ROWS_PER_TILE):
+            w = _canonical_bits(pltpu.bitcast(block[t], jnp.uint32))
+            rows = pl.ds(pl.multiple_of(start + t * sub, sub), sub)
+            stage[rows] = pltpu.bitcast(w, stage.dtype)
+    else:
+        stage[pl.ds(start, _ROWS_PER_TILE * sub)] = block.reshape(
+            _ROWS_PER_TILE * sub, lanes
+        )
 
     @pl.when(c == pl.num_programs(0) - 1)
     def _():
@@ -254,12 +276,14 @@ def _send_kernel(index_ref, count_ref, x_ref, out_ref, stage, rows_vmem, sem):
         lax.fori_loop(0, pieces, lambda k, z: (copy(k).wait(), z)[1], 0)
 
 
-@functools.partial(jax.jit, static_argnames=("rows",))
-def copy_send_rows(x, index, count, rows: int):
+@functools.partial(jax.jit, static_argnames=("rows", "canonical"))
+def copy_send_rows(x, index, count, rows: int, *, canonical: bool = False):
     """The send buffer of the ragged all-to-all: row ``r`` of the [rows, 16,
     H / 16] result is token ``index[r]``'s row of ``x`` [S, H] as one block of
     whole tiles, for ``r < count[0]``; later rows are not written. The kernel
-    relayouts ``x`` in VMEM once and copies rows there.
+    relayouts ``x`` in VMEM once and copies rows there. ``canonical``: the rows
+    carry the values `gather_rows` gives (zeros, subnormals and non-finite
+    values become +0), mapped once per token, instead of exact copies.
     """
     num_tokens, hidden = x.shape
     if not row_copy_supported(x.dtype, hidden):
@@ -273,8 +297,11 @@ def copy_send_rows(x, index, count, rows: int):
     vmem_limit = vmem + (16 << 20)
     if vmem_limit > pltpu.get_tpu_info().vmem_capacity_bytes * 0.9:
         raise ValueError(f"copy_send_rows: {rows} rows do not fit VMEM")
+    name = f"row_copy_send-s_{num_tokens}-r_{rows}-h_{hidden}"
+    if canonical:
+        name += "-canonical"
     out = pl.pallas_call(
-        _send_kernel,
+        functools.partial(_send_kernel, canonical=canonical),
         # In HBM, where the ragged all-to-all reads it.
         out_shape=pltpu.HBM((rows * sub, lanes), x.dtype),
         grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -293,6 +320,6 @@ def copy_send_rows(x, index, count, rows: int):
             disable_bounds_checks=True,
             vmem_limit_bytes=vmem_limit,
         ),
-        name=f"row_copy_send-s_{num_tokens}-r_{rows}-h_{hidden}",
+        name=name,
     )(index, count, x)
     return out.reshape(rows, sub, lanes)

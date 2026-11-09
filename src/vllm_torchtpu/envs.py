@@ -123,6 +123,7 @@ if TYPE_CHECKING:
     TPU_MOE_A2A_ROW_TILE: int = 16
     TPU_MOE_A2A_ROW_GATHER: bool = False
     TPU_MOE_A2A_ROW_SCATTER: bool = False
+    TPU_MOE_A2A_CANONICAL_SEND: bool = False
     TPU_MOE_A2A_STREAMED_COMBINE: bool = False
     TPU_MOE_A2A_OWNER_COMBINE: bool = False
     TPU_MOE_A2A_SORTED_PLAN: bool = False
@@ -902,6 +903,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # is written by a kernel that relayouts the tokens once and copies their
     # rows in VMEM instead of an XLA gather and relayout (same rows, bitwise).
     "TPU_MOE_A2A_ROW_SCATTER": env_bool("TPU_MOE_A2A_ROW_SCATTER"),
+    # Ragged all-to-all exchange with TPU_MOE_A2A_ROW_GATHER and
+    # TPU_MOE_A2A_ROW_SCATTER: the send kernel maps zeros, subnormals and
+    # non-finite values to +0 once per token row, as the one-hot permute does,
+    # and the row gather copies the received rows as they are, instead of
+    # mapping each route's row (same rows, bitwise).
+    "TPU_MOE_A2A_CANONICAL_SEND": env_bool("TPU_MOE_A2A_CANONICAL_SEND"),
     # Ragged all-to-all exchange: the fused expert kernel sends each expert
     # output row to the rank that sent its token while later experts compute,
     # and that rank sums them, instead of a combine and a second exchange.

@@ -21,7 +21,9 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax.sharding import Mesh
+from jax.sharding import PartitionSpec as P
 
+from vllm_torchtpu.kernels.megablox.row_copy import gather_rows
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
     quantize_to_native_fp4_kmajor,
     resolve_onehot_permute_threshold,
@@ -30,6 +32,10 @@ from vllm_torchtpu.layers.core.fused_moe_gmm import (
 from vllm_torchtpu.layers.core.ragged_a2a_moe import (
     DP_AXIS,
     TP_AXIS,
+    _capacity_exchange,
+    _capacity_overflow,
+    _full_exchange,
+    _gather_routing,
     _member_index,
     exchange_capacity,
     owner_dests,
@@ -85,6 +91,27 @@ CASES += [
     for option in ("group_fit", "group_fit_served")
     for combine in ("owner", "streamed")
 ] + [("group_fit_owner_tail", "owner")]
+# The send kernel maps the special values instead of the row gather, with the
+# row copies alone and with the served options.
+OPTIONS["canonical_send"] = dict(OPTIONS["row_copy"], canonical_send=True)
+OPTIONS["canonical_send_served"] = dict(
+    OPTIONS["routing_dma_owner_tail"], canonical_send=True
+)
+CASES += [("canonical_send", combine) for combine in ("owner", "streamed")] + [
+    ("canonical_send_served", "owner")
+]
+# With the group fit sizes too, and the served options (the owner tail only
+# with the owner combine).
+OPTIONS["canonical_send_group_fit"] = dict(
+    OPTIONS["group_fit_served"], canonical_send=True
+)
+OPTIONS["canonical_send_group_fit_owner_tail"] = dict(
+    OPTIONS["group_fit_owner_tail"], canonical_send=True
+)
+CASES += [
+    ("canonical_send_group_fit", "streamed"),
+    ("canonical_send_group_fit_owner_tail", "owner"),
+]
 
 
 def _routing(rng, dp_size, num_tokens, num_experts, topk, skew):
@@ -381,7 +408,9 @@ _SPECIALS = np.array(
 
 
 @pytest.mark.multichip
-@pytest.mark.parametrize("option", ["row_gather", "row_scatter", "row_copy"])
+@pytest.mark.parametrize(
+    "option", ["row_gather", "row_scatter", "row_copy", "canonical_send"]
+)
 @pytest.mark.parametrize("combine", ["owner", "streamed"])
 @pytest.mark.parametrize(
     "dp_size,tp_size,num_tokens,factor,route_factor",
@@ -464,13 +493,14 @@ def _hot_column_ids(dp_size, tp_size, num_tokens, local):
 
 
 @pytest.mark.multichip
+@pytest.mark.parametrize("canonical_send", [False, True])
 @pytest.mark.parametrize("combine", ["owner", "streamed"])
 @pytest.mark.parametrize("dp_size,tp_size", [(4, 2), (2, 4)])
-def test_group_fit_runs_both_branches(combine, dp_size, tp_size):
+def test_group_fit_runs_both_branches(combine, dp_size, tp_size, canonical_send):
     """Steps that fit and one that does not fit the mesh while TP rank 1's DP
-    group fits, through one jitted program with the served options: that
-    group's members exchange their rows, the expert side takes no routes, and
-    the full-size exchange gives the result."""
+    group fits, through one jitted program with the served options (and the
+    send-side special values): that group's members exchange their rows, the
+    expert side takes no routes, and the full-size exchange gives the result."""
     devices = _require_eight_tpu_devices()
     mesh = Mesh(np.asarray(devices).reshape(dp_size, tp_size), (DP_AXIS, TP_AXIS))
     num_tokens, topk, local = 24, 2, 8
@@ -510,7 +540,11 @@ def test_group_fit_runs_both_branches(combine, dp_size, tp_size):
             jnp.bfloat16,
         )
     base_run = jax.jit(functools.partial(ragged_a2a_moe, **common))
-    run = jax.jit(functools.partial(ragged_a2a_moe, group_fit=True, **common))
+    run = jax.jit(
+        functools.partial(
+            ragged_a2a_moe, group_fit=True, canonical_send=canonical_send, **common
+        )
+    )
     for forced in (False, True, False):
         call = stacked[:6] + (hot_ids, stacked[7]) if forced else stacked
         engine_ids = np.asarray(call[6])[:, 0]
@@ -592,3 +626,136 @@ def test_group_fit_leaves_unscaled_experts_alone():
         got = np.asarray(run(*call, shared=shared))
         assert np.abs(base.astype(np.float32)).max() > 0
         np.testing.assert_array_equal(got.view(np.uint16), base.view(np.uint16))
+
+
+def _rows_read(
+    mesh, x, ids, weights, es, *, exchange, combine, canonical_send, topk, factors
+):
+    """The rows the row gather hands the expert kernel on every rank after the
+    capacity (``exchange`` "capacity", sized by ``factors``) or the full-size
+    exchange with the row copies: bf16 bits [dp, tp, P, H] as uint16, zero
+    past the computed routes' 16-row blocks."""
+    dp_size, tp_size = mesh.shape[DP_AXIS], mesh.shape[TP_AXIS]
+    num_tokens = x.shape[0] // (dp_size * tp_size)
+    local = 64 // (dp_size * tp_size)
+    mesh_kw = dict(dp_size=dp_size, tp_size=tp_size, local_num_experts=local)
+
+    def read(received, *_, plan, src_rows):
+        # fused_moe_scatter_planned's row gather, without the experts.
+        token_sorted, group_sizes = plan[:2]
+        token_sorted = jnp.pad(token_sorted, (0, -token_sorted.shape[0] % 16))
+        rows = gather_rows(
+            received, token_sorted, group_sizes, src_rows, canonical=not canonical_send
+        )
+        bits = jax.lax.bitcast_convert_type(rows, jnp.uint16)
+        written = jnp.arange(bits.shape[0]) < (group_sizes.sum() + 15) // 16 * 16
+        return jnp.where(written[:, None], bits, 0)
+
+    def body(x, ids, weights, es):
+        x, ids, weights, es = (a[0, 0] for a in (x, ids, weights, es))
+        gathered_ids, read_routes, packed_routes = _gather_routing(ids, weights)
+        if combine == "owner":
+            dests = functools.partial(owner_dests, **mesh_kw)
+        else:
+            member_index = functools.partial(
+                _member_index, ep_rank=es[0] // local, **mesh_kw
+            )
+            dests = functools.partial(
+                streamed_dests, member_index=member_index, dp_size=dp_size
+            )
+        kw = dict(
+            tp_size=tp_size,
+            dp_size=dp_size,
+            moe=None,
+            streamed=read,
+            plan=(dests, None),
+            row_gather=True,
+            row_scatter=True,
+            canonical_send=canonical_send,
+        )
+        # The exchanges read only the expert count of the weights.
+        w1 = jnp.zeros((local, 1, 1), x.dtype)
+        if exchange == "full":
+            return _full_exchange(x, w1, ids, gathered_ids, read_routes, es, **kw)[
+                None, None
+            ]
+        rows, routes = exchange_capacity(
+            num_tokens=num_tokens,
+            topk=topk,
+            factor=factors[0],
+            onehot_moe_permute_threshold=resolve_onehot_permute_threshold(
+                dp_size * num_tokens * topk
+            ),
+            use_sparse_core=True,
+            route_factor=factors[1],
+            **mesh_kw,
+        )
+        assert rows < dp_size * num_tokens
+        overflow = _capacity_overflow(
+            gathered_ids,
+            tp_size=tp_size,
+            local_num_experts=local,
+            rows=rows,
+            routes=routes,
+        )
+        out = _capacity_exchange(
+            x,
+            w1,
+            ids,
+            gathered_ids,
+            read_routes,
+            packed_routes,
+            es,
+            overflow,
+            rows=rows,
+            routes=routes,
+            **kw,
+        )
+        return out[None, None]
+
+    spec = P(DP_AXIS, TP_AXIS)
+    operands = [
+        a.reshape(dp_size, tp_size, -1, *a.shape[1:]) for a in (x, ids, weights, es)
+    ]
+    run = jax.shard_map(
+        body, mesh=mesh, in_specs=(spec,) * 4, out_specs=spec, check_vma=False
+    )
+    return np.asarray(jax.jit(run)(*operands))
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize("combine", ["owner", "streamed"])
+@pytest.mark.parametrize(
+    "exchange,dp_size,tp_size,num_tokens,factors",
+    [
+        ("capacity", 8, 1, 24, (1.15, 1.5)),
+        ("full", 8, 1, 24, None),  # the capacity exchange's fallback
+        ("capacity", 4, 2, 24, (1.0, 1.5)),
+        ("full", 2, 4, 92, None),  # proxy layout: full-size exchange only
+    ],
+)
+def test_canonical_send_keeps_the_rows_the_expert_kernel_reads(
+    combine, exchange, dp_size, tp_size, num_tokens, factors
+):
+    """Every bf16 bit pattern in the tokens: the rows the row gather hands the
+    expert kernel are bitwise the same whether the send kernel or the row
+    gather maps the special values."""
+    devices = _require_eight_tpu_devices()
+    mesh = Mesh(np.asarray(devices).reshape(dp_size, tp_size), (DP_AXIS, TP_AXIS))
+    x, _, _, _, _, weights, ids, es = _inputs(
+        8, tp_size, num_tokens, 64, topk=10, skew=False
+    )
+    # The 65536 patterns, shuffled and repeated over the engines' tokens, which
+    # are replicated across their engine's TP ranks.
+    engines = 8 // tp_size
+    rng = np.random.default_rng(17)
+    bits = np.resize(rng.permutation(65536).astype(np.uint16), x.size // tp_size)
+    bits = bits.reshape(engines, 1, num_tokens, HIDDEN)
+    bits = np.broadcast_to(bits, (engines, tp_size, num_tokens, HIDDEN))
+    x = jnp.asarray(bits.reshape(-1, HIDDEN).view(jnp.bfloat16))
+    kw = dict(exchange=exchange, combine=combine, topk=10, factors=factors)
+    base = _rows_read(mesh, x, ids, weights, es, canonical_send=False, **kw)
+    got = _rows_read(mesh, x, ids, weights, es, canonical_send=True, **kw)
+    # Every rank computes routes.
+    assert (base.reshape(dp_size * tp_size, -1) != 0).any(axis=1).all()
+    np.testing.assert_array_equal(got, base)

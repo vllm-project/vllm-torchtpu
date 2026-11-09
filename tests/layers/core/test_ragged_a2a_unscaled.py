@@ -242,3 +242,57 @@ def test_unscaled_owner_combine_sums_over_tp_with_the_shared_partial():
     got = owner.reshape(dp_size, tp_size, num_tokens, HIDDEN)
     for r in range(tp_size):
         np.testing.assert_allclose(got[:, r], want, rtol=2e-2, atol=2e-2)
+
+
+# Zeros, subnormals, infinities, NaNs and the smallest normals.
+_SPECIALS = np.array(
+    [0x0000, 0x8000, 0x0001, 0x8001, 0x007F, 0x807F, 0x7F80, 0xFF80, 0x7FC0,
+     0xFFC1, 0x0080, 0x8080],
+    np.uint16,
+)  # fmt: skip
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize("owner", [False, True])
+@pytest.mark.parametrize(
+    "dp_size,tp_size,num_tokens,topk",
+    [
+        (2, 4, 96, 2),  # capacity rows and routes
+        (8, 1, 24, 10),  # top-10: the capacity is the full size
+    ],
+)
+def test_unscaled_exchange_keeps_every_bit_with_canonical_send(
+    dp_size, tp_size, num_tokens, topk, owner
+):
+    """Unscaled experts keep the one-hot permute and the XLA send rows, so the
+    served exchange options give the same bits with TPU_MOE_A2A_CANONICAL_SEND,
+    special values included."""
+    devices = _devices()
+    mesh = Mesh(np.asarray(devices).reshape(dp_size, tp_size), (DP_AXIS, TP_AXIS))
+    x, *rest = _inputs(tp_size, num_tokens, 64, skew=False, topk=topk)
+    rng = np.random.default_rng(19)
+    bits = np.array(x).view(np.uint16)
+    hit = rng.random(bits.shape) < 0.02
+    bits[hit] = rng.choice(_SPECIALS, size=int(hit.sum()))
+    # Tokens are replicated across their engine's TP ranks.
+    bits = bits.reshape(-1, tp_size, num_tokens, HIDDEN)
+    bits[:] = bits[:, :1]
+    args = (jnp.asarray(bits.reshape(-1, HIDDEN).view(jnp.bfloat16)), *rest)
+    kw = dict(
+        topk=topk,
+        activation="silu",
+        use_sparse_core=True,
+        onehot_moe_permute_threshold=_threshold(dp_size, num_tokens, topk),
+        owner_combine=owner,
+        streamed_combine=owner,
+        capacity_factor=2.0,
+        route_factor=2.0,
+        sorted_plan=True,
+        row_gather=True,
+        row_scatter=True,
+        routing_dma=True,
+    )
+    base = _run(mesh, dp_size, tp_size, args, **kw)
+    got = _run(mesh, dp_size, tp_size, args, canonical_send=True, **kw)
+    assert np.isfinite(base.astype(np.float32)).all()
+    np.testing.assert_array_equal(got.view(np.uint16), base.view(np.uint16))

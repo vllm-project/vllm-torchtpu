@@ -143,6 +143,13 @@ def _get_op(
     ):
         if getattr(envs, knob) and not envs.TPU_MOE_A2A_SORTED_PLAN:
             raise ValueError(f"{knob} needs TPU_MOE_A2A_SORTED_PLAN")
+    if envs.TPU_MOE_A2A_CANONICAL_SEND and not (
+        envs.TPU_MOE_A2A_ROW_GATHER and envs.TPU_MOE_A2A_ROW_SCATTER
+    ):
+        raise ValueError(
+            "TPU_MOE_A2A_CANONICAL_SEND needs TPU_MOE_A2A_ROW_GATHER and "
+            "TPU_MOE_A2A_ROW_SCATTER"
+        )
     if envs.TPU_MOE_A2A_OWNER_TAIL and not envs.TPU_MOE_A2A_OWNER_COMBINE:
         raise ValueError("TPU_MOE_A2A_OWNER_TAIL needs TPU_MOE_A2A_OWNER_COMBINE")
     mesh = get_dp_tp_mesh()
@@ -166,6 +173,7 @@ def _get_op(
         capacity_row_tile=envs.TPU_MOE_A2A_ROW_TILE,
         row_gather=envs.TPU_MOE_A2A_ROW_GATHER,
         row_scatter=envs.TPU_MOE_A2A_ROW_SCATTER,
+        canonical_send=envs.TPU_MOE_A2A_CANONICAL_SEND,
         streamed_combine=envs.TPU_MOE_A2A_STREAMED_COMBINE,
         owner_combine=envs.TPU_MOE_A2A_OWNER_COMBINE,
         sorted_plan=envs.TPU_MOE_A2A_SORTED_PLAN,
@@ -264,7 +272,7 @@ def _get_op(
         "permute threshold %d routed rows (full decode step: %d routed rows) | "
         "streamed combine %s, owner combine %s, row gather %s, row scatter %s, "
         "owner tail %s, "
-        "routing dma %s, group fit %s",
+        "routing dma %s, group fit %s, canonical send %s",
         topk,
         activation,
         mesh.shape[DP_AXIS],
@@ -278,6 +286,7 @@ def _get_op(
         "on" if envs.TPU_MOE_A2A_OWNER_TAIL else "off",
         "on" if envs.TPU_MOE_A2A_ROUTING_DMA else "off",
         "on" if envs.TPU_MOE_A2A_GROUP_FIT else "off",
+        "on" if envs.TPU_MOE_A2A_CANONICAL_SEND else "off",
     )
     _log_capacity(
         mesh, topk, onehot_threshold, step_routed_rows, capacity_factor, route_factor

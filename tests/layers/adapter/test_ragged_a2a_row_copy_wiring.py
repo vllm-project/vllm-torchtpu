@@ -86,3 +86,30 @@ def test_row_copy_knobs_reach_the_exchange(monkeypatch, row_gather, row_scatter)
 def test_row_copy_knobs_need_the_sorted_plan(monkeypatch, knob):
     with pytest.raises(ValueError, match=f"{knob} needs TPU_MOE_A2A_SORTED_PLAN"):
         _build_op(monkeypatch, TPU_MOE_A2A_SORTED_PLAN=False, **{knob: True})
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("canonical_send", [False, True])
+def test_canonical_send_reaches_the_exchange(monkeypatch, canonical_send):
+    seen = _build_op(
+        monkeypatch,
+        TPU_MOE_A2A_SORTED_PLAN=True,
+        TPU_MOE_A2A_ROW_GATHER=True,
+        TPU_MOE_A2A_ROW_SCATTER=True,
+        TPU_MOE_A2A_CANONICAL_SEND=canonical_send,
+    )
+    assert seen["canonical_send"] is canonical_send
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("off", ["TPU_MOE_A2A_ROW_GATHER", "TPU_MOE_A2A_ROW_SCATTER"])
+def test_canonical_send_needs_both_row_copies(monkeypatch, off):
+    knobs = dict(
+        TPU_MOE_A2A_SORTED_PLAN=True,
+        TPU_MOE_A2A_ROW_GATHER=True,
+        TPU_MOE_A2A_ROW_SCATTER=True,
+        TPU_MOE_A2A_CANONICAL_SEND=True,
+    )
+    knobs[off] = False
+    with pytest.raises(ValueError, match="TPU_MOE_A2A_CANONICAL_SEND needs"):
+        _build_op(monkeypatch, **knobs)
