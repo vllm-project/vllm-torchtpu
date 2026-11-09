@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import dataclasses
 import fnmatch
+import functools
+import inspect
 import json
 import math
 import os
@@ -28,6 +30,7 @@ from typing import Any
 from vllm_torchtpu import env_override
 from vllm_torchtpu.experimental.export import (
     api,
+    case_compose,
     checkpoint,
     sampling,
     tpu_lowering,
@@ -713,6 +716,22 @@ def _draft_intermediates(
     return [(n, returned[n]) for n in drafter.intermediates]
 
 
+def draft_slot_counts(bucket_size: int, max_num_seqs: int) -> list[int]:
+    """The request counts `N` `draft_bucket{bucket_size}` drafts for, one branch
+    each: powers of two below `min(bucket_size, max_num_seqs)`, the most
+    requests a step of `bucket_size` tokens holds, and that count. A step runs
+    the smallest `N` that holds its requests, so the drafter computes for at
+    most twice the step's requests instead of every slot.
+    """
+    full = min(bucket_size, max_num_seqs)
+    counts = []
+    n = 1
+    while n < full:
+        counts.append(n)
+        n *= 2
+    return [*counts, full]
+
+
 def _draft_user_inputs(
     model: api.ExportableTextOnlyLLM, bucket_size: int
 ) -> list[tuple[str, tuple[int, ...]]]:
@@ -1110,11 +1129,17 @@ def _export_draft(
     lowered = _lowered_params(params_map, layouts)
     reshapes = _weight_reshapes(layouts)
 
+    # A draft function taking `draft_slots` is lowered once per request count and
+    # the variants are composed into one module (`draft_slot_counts`).
+    slot_variants = (
+        "draft_slots" in inspect.signature(getattr(model, drafter.draft_fn)).parameters
+    )
     variants: dict[str, Any] = {}
     for b_idx, bucket_size in enumerate(cfg.token_buckets):
         user_inputs = _draft_user_inputs(model, bucket_size)
         intermediates = _draft_intermediates(model, drafter, bucket_size)
-        mlir = tpu_lowering.lower_torch_draft_to_mlir(
+        lower = functools.partial(
+            tpu_lowering.lower_torch_draft_to_mlir,
             model,
             draft_fn=drafter.draft_fn,
             user_inputs=user_inputs,
@@ -1125,6 +1150,24 @@ def _export_draft(
             bucket_size=bucket_size,
             weight_reshapes=reshapes,
         )
+        counts = draft_slot_counts(bucket_size, cfg.max_num_seqs)
+        if not slot_variants:
+            mlir = lower()
+        elif len(counts) == 1:
+            mlir = lower(draft_slots=counts[0])
+        else:
+            mlir = case_compose.compose_by_request_count(
+                {n: lower(draft_slots=n) for n in counts},
+                req_dist_arg=[n for n, _ in user_inputs].index("req_dist"),
+            )
+            # The module takes the plain name, not its largest variant's.
+            mlir = re.sub(
+                r"^module @[\w.$-]+",
+                f"module @draft_bucket{bucket_size}",
+                mlir,
+                count=1,
+                flags=re.M,
+            )
         file = f"draft_bucket{bucket_size}.mlir"
         rel = f"{subdir}/{file}" if subdir else file
         with open(os.path.join(target_dir, file), "w") as f:
