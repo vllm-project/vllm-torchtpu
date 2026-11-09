@@ -53,6 +53,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
 
+from vllm_torchtpu.kernels.collectives.dma_all_gather import dma_all_gather
 from vllm_torchtpu.kernels.megablox.row_copy import copy_send_rows
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
     fused_moe_func,
@@ -128,9 +129,11 @@ def _tile_rows(a: jax.Array) -> jax.Array:
 _EMPTY_ROUTE = -1 << 16
 
 
-def _gather_routing(topk_ids: jax.Array, topk_weights: jax.Array):
+def _gather_routing(topk_ids: jax.Array, topk_weights: jax.Array, *, dma_members=0):
     """All-gather the DP group's routing in one collective when it packs:
-    a bf16 weight and an expert id below 2**15 share one int32.
+    a bf16 weight and an expert id below 2**15 share one int32. With
+    ``dma_members`` (the DP group's size) the packed routing travels by
+    `dma_all_gather` instead of XLA's all-gather: the same words.
 
     Returns the gathered ids [D, S, K], a function that reads the routes of
     the given flat (member, token) rows (an out-of-range row reads expert id
@@ -150,7 +153,13 @@ def _gather_routing(topk_ids: jax.Array, topk_weights: jax.Array):
 
         return ids, read, None
     bits = jax.lax.bitcast_convert_type(topk_weights, jnp.uint16).astype(jnp.int32)
-    packed = jax.lax.all_gather(jnp.left_shift(topk_ids, 16) | bits, DP_AXIS)
+    routes = jnp.left_shift(topk_ids, 16) | bits
+    if dma_members:
+        # One [K, S] block per member: the tokens fill the lanes.
+        packed = dma_all_gather(routes.T, axis=DP_AXIS, num_members=dma_members)
+        packed = jnp.swapaxes(packed, 1, 2)
+    else:
+        packed = jax.lax.all_gather(routes, DP_AXIS)
 
     def read(rows):
         routes = packed.reshape(-1, packed.shape[-1])
@@ -1416,6 +1425,7 @@ def ragged_a2a_moe_local(
     streamed_combine: bool = False,
     owner_combine: bool = False,
     sorted_plan: bool = False,
+    routing_dma: bool = False,
     shared: jax.Array | None = None,
 ) -> jax.Array:
     """Per-rank body (inside shard_map over the (dp, tp) mesh).
@@ -1457,12 +1467,17 @@ def ragged_a2a_moe_local(
     kernel that relayouts the tokens once and copies their rows in VMEM,
     instead of an XLA gather of the send rows and their relayout (same rows
     below the send sizes).
+    ``routing_dma``: the DP group's packed routing is all-gathered by one
+    kernel of remote DMAs (`dma_all_gather`) instead of XLA's ring
+    all-gather, whose steps each wait on the previous one (same words).
     """
     assert shared is None or owner_combine
     num_tokens = x.shape[0]
     local_num_experts = w1.shape[0]
     slots = dp_size * num_tokens
-    gathered_ids, read_routes, packed_routes = _gather_routing(topk_ids, topk_weights)
+    gathered_ids, read_routes, packed_routes = _gather_routing(
+        topk_ids, topk_weights, dma_members=dp_size if routing_dma else 0
+    )
     ep_rank = experts_start[0] // local_num_experts
     member_index = functools.partial(
         _member_index,
@@ -1680,6 +1695,7 @@ def ragged_a2a_moe(
     streamed_combine: bool = False,
     owner_combine: bool = False,
     sorted_plan: bool = False,
+    routing_dma: bool = False,
     shared: jax.Array | None = None,
 ) -> jax.Array:
     """Global-view entry: every operand is the ranks' local arrays stacked on
@@ -1705,6 +1721,7 @@ def ragged_a2a_moe(
         streamed_combine=streamed_combine,
         owner_combine=owner_combine,
         sorted_plan=sorted_plan,
+        routing_dma=routing_dma,
     )
 
     scaled = w1_scale is not None
