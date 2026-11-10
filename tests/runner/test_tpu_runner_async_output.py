@@ -239,3 +239,45 @@ def test_get_output_attaches_spec_logprobs():
         1,
     ]
     assert out.logprobs.slice_request(2, 1).logprobs[:, 0].tolist() == [-6.0]
+
+
+def test_logprobs_lists_trims_each_chunk_to_its_real_requests():
+    copy_state = AsyncTPUCopyState(
+        chunks_cpu=[],
+        chunk_real_lens=[3, 1],
+        copy_ready_event=None,
+        completed=True,
+        logprobs=[_row_logprobs(4), _row_logprobs(2, base=100)],
+    )
+    out = copy_state.logprobs_lists()
+    assert out.logprob_token_ids[:, 0].tolist() == [0, 1, 2, 100]
+    assert out.logprobs[:, 1].tolist() == [-0.5, -1.5, -2.5, -100.5]
+    assert out.sampled_token_ranks.tolist() == [0, 1, 2, 100]
+    # One token per request: the scheduler's slice_request reads row `i`.
+    assert out.cu_num_generated_tokens is None
+    assert out.slice_request(3, 1).logprob_token_ids[:, 0].tolist() == [100]
+
+
+def test_get_output_attaches_plain_logprobs():
+    copy_state = AsyncTPUCopyState(
+        # A bucket of 4 rows holding 2 requests.
+        chunks_cpu=[torch.tensor([[11], [12], [0], [0]], dtype=torch.int32)],
+        chunk_real_lens=[2],
+        copy_ready_event=None,
+        completed=True,
+        logprobs=[_row_logprobs(4)],
+    )
+    out = AsyncTPUModelRunnerOutput(
+        model_runner_output=ModelRunnerOutput(
+            req_ids=["a", "b"],
+            req_id_to_index={"a": 0, "b": 1},
+            sampled_token_ids=[],
+            logprobs=None,
+        ),
+        copy_state=copy_state,
+        # A discarded request keeps its row; the scheduler never reads it.
+        discard_sampled_tokens_req_indices=[1],
+    ).get_output()
+    assert out.sampled_token_ids == [[11], []]
+    assert out.logprobs.logprob_token_ids[:, 0].tolist() == [0, 1]
+    assert out.logprobs.slice_request(0, 1).logprobs[:, 0].tolist() == [0.0]

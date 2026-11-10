@@ -83,7 +83,6 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     DraftTokenIds,
-    LogprobsLists,
     LogprobsTensors,
     ModelRunnerOutput,
 )
@@ -5204,7 +5203,9 @@ class TPUModelRunner(GPUModelRunner):
         next_tokens_tpu_chunks: list[torch.Tensor] = []
         next_token_indices: dict[int, int] = {}
         next_tokens_tpu_offset = 0
-        combined_logprobs: list[Any] = []
+        # Plain step only: per-chunk logprobs at their bucketed row count,
+        # trimmed once they reach the host (AsyncTPUCopyState.logprobs_lists).
+        combined_logprobs: list[LogprobsTensors] = []
         # Spec step only: per-chunk logprobs, filtered to the accepted tokens
         # once they reach the host (AsyncTPUModelRunnerOutput.get_output).
         spec_logprobs_chunks: list[SpecLogprobsChunk] = []
@@ -5434,13 +5435,7 @@ class TPUModelRunner(GPUModelRunner):
                     next_tokens_tpu_offset += selected_token_ids.shape[0]
                 if needs_logprobs:
                     assert logprobs is not None
-                    sliced_logprobs = LogprobsTensors(
-                        logprobs.logprob_token_ids[:num_reqs],
-                        logprobs.logprobs[:num_reqs],
-                        logprobs.selected_token_ranks[:num_reqs],
-                        logprobs.cu_num_generated_tokens,
-                    )
-                    combined_logprobs.append(sliced_logprobs)
+                    combined_logprobs.append(logprobs)
 
                 self._update_num_xla_graphs("decoding_step")
                 cur_start_idx = cur_end_idx
@@ -5449,28 +5444,6 @@ class TPUModelRunner(GPUModelRunner):
         # Those copies are blocking. Once they become async., kv_save
         # should be called right after each single forward pass,
         # instead of the forwards of the entire input batch.
-        logprobs = []
-        if needs_logprobs and len(combined_logprobs):
-            # TODO: concatenate the LogprobsTensors (torch) first, then
-            # call .tolists() once to match the GPU path and avoid the
-            # per-chunk numpy round-trip.
-            combined_logprobs_lists = []
-            for i in range(len(combined_logprobs)):
-                logprobs = combined_logprobs[i].tolists()
-                combined_logprobs_lists.append(logprobs)
-
-            logprobs_lists = LogprobsLists(
-                logprob_token_ids=np.concatenate(
-                    [lp.logprob_token_ids for lp in combined_logprobs_lists]
-                ),
-                logprobs=np.concatenate(
-                    [lp.logprobs for lp in combined_logprobs_lists]
-                ),
-                sampled_token_ranks=np.concatenate(
-                    [lp.sampled_token_ranks for lp in combined_logprobs_lists]
-                ),
-            )
-            logprobs = logprobs_lists
 
         discard_sampled_tokens_req_indices = []
         num_reqs = self.input_batch.num_reqs
@@ -5505,6 +5478,7 @@ class TPUModelRunner(GPUModelRunner):
                     combined_selected_tokens,
                     combined_selected_tokens_real_lens,
                     spec_logprobs=spec_logprobs_chunks,
+                    logprobs=combined_logprobs,
                 )
 
         if self.scheduler_config.async_scheduling:
@@ -5732,7 +5706,7 @@ class TPUModelRunner(GPUModelRunner):
                 # Snapshot of the req_id_to_index for the VLLM scheduler.
                 req_id_to_index=dict(self.input_batch.req_id_to_index),
                 sampled_token_ids=[],  # Filled in AsyncTPUModelRunnerOutput get_output
-                logprobs=logprobs,
+                logprobs=None,  # Likewise, when requested
                 prompt_logprobs_dict={req_id: None for req_id in req_ids},
                 pooler_output=pooler_output,
                 kv_connector_output=kv_connector_output,
