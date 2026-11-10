@@ -5123,6 +5123,8 @@ class TPUModelRunner(GPUModelRunner):
                 "State error: sample_tokens() must be called "
                 "after execute_model() returns None."
             )
+        if _t3_host.STEP_HOOK:
+            _t3_host.on_step()
         if self._adaptive_verification is not None:
             # Before anything reads the step layout, the DP token sync
             # included: the rest of the step runs on the trimmed copy.
