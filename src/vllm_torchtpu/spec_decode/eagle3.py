@@ -1663,12 +1663,8 @@ class Eagle3Proposer:
             sl_delta = 1 if self.advance_draft_positions else 0
             seq_lens_step1 = base_seq_lens + sl_delta - num_rejected_out
             if step0_pad_len > 0:
-                step0_gather_indices = (
-                    torch.nn.functional.pad(
-                        gather_indices, (0, step0_pad_len - gather_indices.shape[0])
-                    )
-                    if step0_pad_len > gather_indices.shape[0]
-                    else gather_indices
+                step0_gather_indices = _pad_dim0_repeat_last(
+                    gather_indices, step0_pad_len
                 )
                 return (
                     draft_input_ids,
@@ -2245,7 +2241,9 @@ class Eagle3Proposer:
         skip_cat = self._skip_next_multi_chunk_draft_cat
         self._skip_next_multi_chunk_draft_cat = False
         if return_device:
-            if len(per_chunk_stacked) == 1 or skip_cat:
+            if skip_cat:
+                out = per_chunk_stacked[0]
+            elif len(per_chunk_stacked) == 1:
                 out = per_chunk_stacked[0][: chunks[0].num_reqs]
             else:
                 out = torch.cat(
