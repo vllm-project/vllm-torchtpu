@@ -224,7 +224,7 @@ def _get_fused_moe_custom_op(
     if skip_padded_tokens is None:
         skip_padded_tokens = envs.TPU_MOE_SKIP_PADDED_TOKENS
     if use_ep and num_primary_experts is None:
-        from vllm_torchtpu import expert_placement
+        from vllm_torchtpu.layers.adapter import expert_placement
 
         if expert_placement.has_copies():
             raise ValueError(

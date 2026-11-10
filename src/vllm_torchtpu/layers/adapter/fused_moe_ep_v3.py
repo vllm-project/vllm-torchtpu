@@ -647,7 +647,10 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool, activation: str) 
         return
     ep = mesh.shape[EP_AXIS_NAME]
     _EP_SIZE = ep
-    check_kernel_threshold(ep, tp)
+    from vllm_torchtpu.layers.adapter.quantization import moe_lowtok_scores
+
+    # The FP8 method arms the few-token kernel before this, so its cap is known.
+    check_kernel_threshold(ep, tp, lowtok_cap=moe_lowtok_scores.armed_max_tokens())
 
     w1, w2 = layer.w13_weight, layer.w2_weight
     w1_scale = layer.w13_weight_scale_inv
