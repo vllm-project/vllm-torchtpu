@@ -33,6 +33,16 @@ FP8 = jnp.float8_e4m3fn
 FP8_MAX = float(jnp.finfo(FP8).max)
 VREG_F32_LANES = 8 * 128  # 1024 fp32 lanes per TPU VREG (4 KiB)
 TARGET_VREG_BUDGET = 64  # Hardware VREG count per TPU core (256 KiB)
+# VMEM the double-buffered blocks of one grid step may take. The kernel runs
+# under the 32 MiB scoped default (it sets no vmem_limit_bytes); the budget
+# holds the unsharded GDN width (64 heads x 128 = 8192 columns, TP1 under
+# pipeline parallelism) to 200 rows (128 once legal_tile divides a step)
+# and leaves widths of 1638 columns or
+# less at the 512-row cap.
+TILE_VMEM_BUDGET_BYTES = 16 << 20
+# Bytes per element of a block across its buffers: two bf16 inputs and one
+# fp8 output, double buffered.
+TILE_BYTES_PER_ELEMENT = 2 * (2 + 2 + 1)
 
 
 def _kernel(o_ref, z_ref, w_ref, q_ref, s_ref, *, step_m: int, eps: float):
@@ -112,12 +122,17 @@ def default_tile_cap(tokens: int, cols: int) -> int:
     2. For large prefill sizes (``tokens > 256``), uses a larger VMEM block (up
        to 512 rows) while the kernel iterates in VREG-sized sub-tiles internally,
        preventing both VREG spills and large-grid overhead at ``T=8192``.
+    3. Either way the block's double-buffered bytes stay under
+       ``TILE_VMEM_BUDGET_BYTES``.
     """
     vreg_cap = default_vreg_step(cols)
+    budget_cap = max(
+        8, TILE_VMEM_BUDGET_BYTES // (TILE_BYTES_PER_ELEMENT * cols) // 8 * 8
+    )
     if tokens <= 256:
         dma_cap = max(8, (tokens // 6 // 8) * 8)
-        return min(vreg_cap, dma_cap)
-    return max(vreg_cap, 512)
+        return min(vreg_cap, dma_cap, budget_cap)
+    return min(max(vreg_cap, 512), budget_cap)
 
 
 def gated_norm_quant(
