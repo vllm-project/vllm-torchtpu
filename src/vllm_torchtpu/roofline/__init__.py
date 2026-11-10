@@ -16,12 +16,15 @@
 from __future__ import annotations
 
 from .chips import (
+    CHIP_TOPOLOGIES,
     CHIPS,
     SUPPORTED_CHIPS,
     TOPOLOGIES,
+    TPU6E_TOPOLOGIES,
     ChipOverrides,
     ChipSpec,
     SliceTopology,
+    topologies_for_chip,
 )
 from .collectives import (
     Collective,
@@ -39,10 +42,12 @@ from .geometry import (
 )
 
 __all__ = [
+    "CHIP_TOPOLOGIES",
     "CHIPS",
     "SUPPORTED_CHIPS",
     "SUPPORTED_MODEL_TYPES",
     "TOPOLOGIES",
+    "TPU6E_TOPOLOGIES",
     "ChipOverrides",
     "ChipSpec",
     "Collective",
@@ -52,5 +57,6 @@ __all__ = [
     "SliceTopology",
     "count_layer_types",
     "from_hf_config",
+    "topologies_for_chip",
     "torus_collective_s",
 ]

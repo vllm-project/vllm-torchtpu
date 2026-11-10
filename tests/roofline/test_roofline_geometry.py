@@ -22,7 +22,15 @@ from types import MappingProxyType
 
 import pytest
 
-from vllm_torchtpu.roofline import CHIPS, TOPOLOGIES, ChipOverrides, chips
+from vllm_torchtpu.roofline import (
+    CHIP_TOPOLOGIES,
+    CHIPS,
+    TOPOLOGIES,
+    TPU6E_TOPOLOGIES,
+    ChipOverrides,
+    chips,
+    topologies_for_chip,
+)
 from vllm_torchtpu.roofline.constants import (
     DEFAULT_ICI_BW,
     DEFAULT_ICI_HOP_LATENCY_S,
@@ -208,3 +216,44 @@ def test_chips_sources_contain_no_legacy_tpu_v5_or_v4_references() -> None:
             assert not pattern.search(desc), (
                 f"legacy reference in {key}.description: {desc}"
             )
+
+
+def test_tpu6e_chip_table_fallback_and_topologies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify CHIPS['tpu6e'], fallback spec, and 2D topologies match TPU v6e specs."""
+    c = CHIPS["tpu6e"]
+    assert c.cores_per_chip == 1
+    if chips.pltpu is not None and hasattr(chips.pltpu.ChipVersion, "TPU_V6E"):
+        info = chips.pltpu.get_tpu_info_for_chip(chips.pltpu.ChipVersion.TPU_V6E, 1)
+        assert c.hbm_bytes == info.hbm_capacity_bytes
+        assert c.hbm_bw == info.mem_bw_bytes_per_second
+        assert c.bf16_flops == info.bf16_ops_per_second
+        assert c.fp8_flops == info.fp8_ops_per_second
+        assert c.vmem_bytes == info.vmem_capacity_bytes
+    assert (c.ici_link_bw, c.d2d_bw, c.ici_bw, c.ici_hop_latency_s) == (
+        100.0e9,
+        400.0e9,
+        400.0e9,
+        1.0e-6,
+    )
+
+    monkeypatch.setattr(chips, "pltpu", None)
+    fallback = chips.from_jax(
+        "tpu6e",
+        "tpu6e",
+        ChipOverrides(
+            cores_per_chip=1,
+            ici_link_bw=100.0e9,
+            d2d_bw=400.0e9,
+            ici_bw=400.0e9,
+            ici_hop_latency_s=1.0e-6,
+        ),
+    )
+    assert fallback == c
+    assert topologies_for_chip("tpu7x") is TOPOLOGIES
+    assert topologies_for_chip(c) is TPU6E_TOPOLOGIES
+    assert CHIP_TOPOLOGIES["tpu6e"] is TPU6E_TOPOLOGIES
+    assert all(t.cores_per_chip == 1 for t in TPU6E_TOPOLOGIES.values())
+    assert TPU6E_TOPOLOGIES["16x16"].num_chips == 256
+    assert TPU6E_TOPOLOGIES["16x16"].num_cores == 256
