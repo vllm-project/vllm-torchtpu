@@ -136,7 +136,6 @@ class DFlashProposer:
         self._draft_has_moe_cache: bool | None = None
         self._draft_attn_layer_names: set[str] | None = None
         self.draft_chunks: list[DraftChunkInputs] | None = None
-        self._logged_draft_stage = False
         self._static_attn_tensors_cache: dict[
             int, tuple[torch.Tensor, torch.Tensor]
         ] = {}
@@ -202,14 +201,12 @@ class DFlashProposer:
             stage, dist = "PREFILL (RPA v3)", [0, num_reqs, num_reqs]
         else:
             stage, dist = "MIXED", [0, 0, num_reqs]
-        if not self._logged_draft_stage:
-            self._logged_draft_stage = True
-            logger.info(
-                "DFlash draft forward runs its %d-query requests in the %s "
-                "attention stage.",
-                self.block_size,
-                stage,
-            )
+        logger.info_once(
+            "DFlash draft forward runs its %d-query requests in the %s "
+            "attention stage.",
+            self.block_size,
+            stage,
+        )
         return dist
 
     def _draft_uses_prefill_stage(self) -> bool:

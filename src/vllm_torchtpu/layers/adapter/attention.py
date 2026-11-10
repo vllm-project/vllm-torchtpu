@@ -16,7 +16,7 @@ import dataclasses
 import functools
 import inspect
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any, ClassVar, cast
 
 import jax
@@ -941,15 +941,16 @@ class PallasAttentionBackendImpl(AttentionImpl):
         cls._kernel_instance_counter += 1
         return kernel_instance_id
 
-    def _kernel_chunk_prefill_size(self, use_pcp_streaming: bool) -> int | None:
+    def _kernel_chunk_prefill_size(
+        self, use_pcp_streaming: bool, entry_params: Mapping[str, Any]
+    ) -> int | None:
         """The chunk_prefill_size the layer-major kernel gets: only RPA v3
-        entries declare it, and hd64 reroutes to a kernel without the PREFILL
-        stage."""
+        entries declare it (`entry_params` is the entry's signature), and hd64
+        reroutes to a kernel without the PREFILL stage."""
         if (
             use_pcp_streaming
             or self.head_size == 64
-            or "chunk_prefill_size"
-            not in inspect.signature(self._kernel_entry).parameters
+            or "chunk_prefill_size" not in entry_params
         ):
             return None
         return self.chunk_prefill_size
@@ -977,7 +978,9 @@ class PallasAttentionBackendImpl(AttentionImpl):
             else batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
         )
         entry_params = inspect.signature(self._kernel_entry).parameters
-        chunk_prefill_size = self._kernel_chunk_prefill_size(use_pcp_streaming)
+        chunk_prefill_size = self._kernel_chunk_prefill_size(
+            use_pcp_streaming, entry_params
+        )
         self._rpa_kernel_chunk_prefill_size = chunk_prefill_size
         config_key = (
             self._kernel_op_prefix,
