@@ -20,7 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from vllm_torchtpu.kernels.experimental.qk_norm_rope_gate import (
+from vllm_torchtpu.models.qwen3_5.kernels.qk_norm_rope_gate import (
     qk_norm_rope_gate,
     reference,
 )
