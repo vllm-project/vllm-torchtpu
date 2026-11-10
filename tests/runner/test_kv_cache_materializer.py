@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from unittest.mock import patch
+
 import pytest
 import torch
 from vllm.v1.kv_cache_interface import (
@@ -25,6 +27,7 @@ from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_torchtpu.distributed.kv_transfer.raiden import pool_manifest as rpm
 from vllm_torchtpu.kv_cache_materializer import (
+    DeviceKVCacheAllocator,
     format_kv_cache_layout_summary,
     materialize_kv_cache_tensors,
 )
@@ -637,3 +640,24 @@ def test_attention_aliases_reject_mixed_native_shapes():
             device=torch.device("cpu"),
             cache_dtype=torch.bfloat16,
         )
+
+
+def test_device_allocator_synchronizes_its_arrays_in_one_call():
+    """Each zero-filled array is synchronized exactly once; an allocator that
+    allocated nothing synchronizes nothing."""
+    allocator = DeviceKVCacheAllocator(torch.device("cpu"))
+    with patch(
+        "vllm_torchtpu.kv_cache_materializer.synchronize_tensors"
+    ) as synchronize:
+        allocator.synchronize()
+        synchronize.assert_not_called()
+
+        first = allocator.zeros((2, 3), torch.bfloat16)
+        second = allocator.zeros((4,), torch.int32)
+        allocator.synchronize()
+
+    synchronize.assert_called_once()
+    assert list(map(id, synchronize.call_args.args[0])) == [id(first), id(second)]
+    assert (first.shape, first.dtype) == ((2, 3), torch.bfloat16)
+    assert (second.shape, second.dtype) == ((4,), torch.int32)
+    assert not first.any() and not second.any()

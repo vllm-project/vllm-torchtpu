@@ -42,6 +42,7 @@ from vllm_torchtpu.layers.core.attention_metadata import attention_block_table_w
 from vllm_torchtpu.logger import init_logger
 
 if TYPE_CHECKING:
+    from vllm_torchtpu.kv_cache_materializer import DeviceKVCacheAllocator
     from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 logger = init_logger(__name__)
@@ -159,6 +160,7 @@ class DsV4KVCacheAllocator:
         per_layer_spec: Callable[[str], KVCacheSpec],
         kv_caches: dict[str, torch.Tensor],
         num_blocks: int,
+        allocator: DeviceKVCacheAllocator,
     ) -> None:
         """Allocate and alias DeepSeek-V4's KV caches.
 
@@ -195,7 +197,9 @@ class DsV4KVCacheAllocator:
           array.
 
         Overlays are planned before allocating: allocating an array and
-        aliasing it afterwards still counts against peak HBM.
+        aliasing it afterwards still counts against peak HBM. Every array
+        comes from `allocator`, which the caller synchronizes once all caches
+        exist.
         """
         mla_layer_names, swa_layer_groups, state_layer_names = (
             self._classify_ds_v4_layers(kv_cache_config, per_layer_spec)
@@ -206,7 +210,7 @@ class DsV4KVCacheAllocator:
         def _create_cache(
             shape: tuple[int, ...], tag: str, dtype: torch.dtype = torch.uint8
         ) -> torch.Tensor:
-            cache = torch.zeros(shape, dtype=dtype).to(self.runner.device)
+            cache = allocator.zeros(shape, dtype)
             logger.debug(
                 "DeepSeek-V4 KV array for %s: shape=%s dtype=%s", tag, shape, dtype
             )

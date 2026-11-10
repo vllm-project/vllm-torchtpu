@@ -23,8 +23,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 from vllm.config import (
     CacheConfig,
+    DeviceConfig,
     ModelConfig,
     ParallelConfig,
     SchedulerConfig,
@@ -35,6 +37,8 @@ from vllm.model_executor.layers.attention import Attention, MLAAttention
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
+from vllm.v1.core.kv_cache_planning import get_kv_cache_config_from_groups
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -48,6 +52,7 @@ from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_torchtpu import utils
 from vllm_torchtpu.core.runner_slot_mamba import RunnerSlotMambaSpec
+from vllm_torchtpu.kv_cache_materializer import DeviceKVCacheAllocator
 from vllm_torchtpu.layers.adapter.attention import (
     PallasAttentionBackend,
     PallasBatchedRPAAttentionBackend,
@@ -123,6 +128,157 @@ class _FakeReserveSpec:
     @classmethod
     def estimate_hbm_reserve_bytes(cls, vllm_config):
         return cls.RESERVE_BYTES
+
+
+class _RecordHostTensors(TorchDispatchMode):
+    """Records the size of every host tensor an op returns."""
+
+    def __init__(self):
+        super().__init__()
+        self.nbytes = []
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        out = func(*args, **(kwargs or {}))
+        if isinstance(out, torch.Tensor) and out.device.type == "cpu":
+            self.nbytes.append(out.nbytes)
+        return out
+
+
+def _initialize_kv_cache(runner, kv_cache_config, forward_context=None):
+    """Runs `runner.initialize_kv_cache` and returns the caches it binds.
+
+    `forward_context` stands in for the model's layers (none by default).
+    """
+    runner.vllm_config.compilation_config.static_forward_context = (
+        {} if forward_context is None else forward_context
+    )
+    runner.block_table_cpu = torch.zeros((1, 1), dtype=torch.int32)
+    runner.input_batch = SimpleNamespace(
+        block_table=[
+            SimpleNamespace(
+                max_num_blocks_per_req=kv_cache_config.num_blocks,
+                get_cpu_tensor=lambda: runner.block_table_cpu,
+            )
+            for _ in kv_cache_config.kv_cache_groups
+        ]
+    )
+    with (
+        patch("vllm_torchtpu.utils.tpu_bind_kv_cache") as bind,
+        patch(
+            "vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group",
+            return_value=False,
+        ),
+    ):
+        runner.initialize_kv_cache(kv_cache_config)
+    bind.assert_called_once()
+    return bind.call_args.args[0]
+
+
+def _cache_arrays(caches):
+    """The distinct arrays behind `caches`; some layers bind a tuple of them."""
+    arrays = {}
+    for cache in caches.values():
+        for array in cache if isinstance(cache, tuple) else (cache,):
+            arrays[id(array)] = array
+    return list(arrays.values())
+
+
+def _attention_config(vllm_config):
+    """Two full-attention layers, each in a region of its own."""
+    spec = PallasAttentionBackend.customize_spec(
+        FullAttentionSpec(
+            block_size=16, num_kv_heads=2, head_size=128, dtype=torch.bfloat16
+        )
+    )
+    groups = [KVCacheGroupSpec(layer_names=["attn.0", "attn.1"], kv_cache_spec=spec)]
+    return get_kv_cache_config_from_groups(
+        vllm_config, groups, 2 * 4 * spec.page_size_bytes
+    )
+
+
+def _shared_attention_config(vllm_config):
+    """Full and sliding-window layers that share their regions pairwise."""
+
+    def spec(cls, **kwargs):
+        return PallasAttentionBackend.customize_spec(
+            cls(
+                block_size=16,
+                num_kv_heads=2,
+                head_size=128,
+                dtype=torch.bfloat16,
+                **kwargs,
+            )
+        )
+
+    full = spec(FullAttentionSpec)
+    groups = [
+        KVCacheGroupSpec(layer_names=["full.0", "full.1"], kv_cache_spec=full),
+        KVCacheGroupSpec(
+            layer_names=["swa.0", "swa.1"],
+            kv_cache_spec=spec(SlidingWindowSpec, sliding_window=32),
+        ),
+    ]
+    return get_kv_cache_config_from_groups(
+        vllm_config, groups, 2 * 4 * full.page_size_bytes
+    )
+
+
+def _mamba_config(vllm_config):
+    """An attention layer and a Mamba layer, each with arrays of its own."""
+    mamba = MambaSpec(
+        block_size=16,
+        shapes=((4, 128), (8, 64, 32)),
+        dtypes=(torch.bfloat16, torch.float32),
+    )
+    attention = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=2,
+        head_size=128,
+        dtype=torch.bfloat16,
+        page_size_padded=mamba.page_size_bytes,
+    )
+    groups = [
+        KVCacheGroupSpec(layer_names=["attn.0"], kv_cache_spec=attention),
+        KVCacheGroupSpec(layer_names=["mamba.0"], kv_cache_spec=mamba),
+    ]
+    return get_kv_cache_config_from_groups(
+        vllm_config, groups, 4 * mamba.page_size_bytes
+    )
+
+
+@pytest.fixture
+def synchronize_mock():
+    with patch("vllm_torchtpu.kv_cache_materializer.synchronize_tensors") as mock:
+        yield mock
+
+
+@pytest.fixture
+def meta_runner(synchronize_mock):
+    """A runner mock that allocates its KV caches on the `meta` device.
+
+    `meta` tensors have a shape and a dtype but no memory, so no TPU is
+    needed and host tensors are the only ones that hold bytes. The config is
+    pinned to CPU: CPU CI does not always register torch's TPU device type.
+    """
+    vllm_config = VllmConfig(device_config=DeviceConfig(device="cpu"))
+    resolve_kv_cache_layout(vllm_config, [["LBNHC", "LBHNC"]])
+    runner = MagicMock(spec=TPUModelRunner)
+    runner.vllm_config = vllm_config
+    runner.device = torch.device("meta")
+    runner.max_num_reqs = 16
+    runner.use_spmd = False
+    runner.enforce_eager = False
+    runner.speculative_config = None
+    runner.shared_kv_cache_layers = {}
+    runner._unified_kv_layout = False
+    runner._mamba_num_blocks = None
+    runner._uniform_mamba_layout = False
+    runner.kv_cache_manager = KVCacheManager(runner)
+    runner.initialize_kv_cache = TPUModelRunner.initialize_kv_cache.__get__(runner)
+    with patch.object(
+        TpuPlatform, "_find_non_ssm_backend", return_value=PallasAttentionBackend
+    ):
+        yield runner
 
 
 @pytest.mark.parametrize("allocated_blocks", [0, 2, 3])
@@ -238,6 +394,79 @@ def test_get_kv_cache_spec_sparse_mla(monkeypatch, layout):
     assert spec.page_size_bytes == token_bytes * runner.block_size
     assert spec.state_content_bytes == token_bytes
     assert spec.num_head_slots == 1
+
+
+@pytest.mark.parametrize("make_config", [_attention_config, _mamba_config])
+def test_initialize_kv_cache_allocates_caches_on_device(meta_runner, make_config):
+    """Attention caches and Mamba states are created on the device, not on the
+    host first."""
+    config = make_config(meta_runner.vllm_config)
+
+    with _RecordHostTensors() as host:
+        caches = _initialize_kv_cache(meta_runner, config)
+
+    arrays = _cache_arrays(caches)
+    assert {array.device.type for array in arrays} == {"meta"}
+    # The host holds only small tensors such as block tables: no staging
+    # buffer, of any dtype or shape, is as large as one block of the smallest
+    # cache array (one page for attention).
+    smallest_block_bytes = min(array.nbytes // array.shape[0] for array in arrays)
+    assert max(host.nbytes, default=0) < smallest_block_bytes
+
+
+def _assert_not_bound_yet(arrays):
+    # `_initialize_kv_cache` patches the binding for the call.
+    assert not utils.tpu_bind_kv_cache.called
+
+
+@pytest.mark.parametrize(
+    "make_config", [_attention_config, _shared_attention_config, _mamba_config]
+)
+def test_initialize_kv_cache_synchronizes_new_caches_once_before_binding(
+    meta_runner, synchronize_mock, make_config
+):
+    """The device zero fill is asynchronous, so every new cache array is
+    synchronized once, before any layer is bound to it."""
+    synchronize_mock.side_effect = _assert_not_bound_yet
+
+    caches = _initialize_kv_cache(meta_runner, make_config(meta_runner.vllm_config))
+
+    synchronize_mock.assert_called_once()
+    synchronized = synchronize_mock.call_args.args[0]
+    assert sorted(map(id, synchronized)) == sorted(map(id, _cache_arrays(caches)))
+
+
+def test_initialize_kv_cache_synchronizes_deepseek_v4_arrays(
+    meta_runner, synchronize_mock
+):
+    """DeepSeek-V4 allocates its arrays through the allocator that
+    `initialize_kv_cache` synchronizes, so they are in the same single
+    synchronize, before binding."""
+
+    def allocate(kv_cache_config, per_layer_spec, kv_caches, num_blocks, allocator):
+        for group in kv_cache_config.kv_cache_groups:
+            for name in group.layer_names:
+                kv_caches[name] = allocator.zeros((num_blocks, 8), torch.uint8)
+
+    ds_v4 = MagicMock()
+    ds_v4._initialize_ds_v4_kv_cache.side_effect = allocate
+    meta_runner.kv_cache_manager.ds_v4 = ds_v4
+    synchronize_mock.side_effect = _assert_not_bound_yet
+
+    with patch(
+        "vllm_torchtpu.runner.kv_cache_manager.is_cache_for_ds_v4", return_value=True
+    ):
+        caches = _initialize_kv_cache(
+            meta_runner,
+            _attention_config(meta_runner.vllm_config),
+            forward_context={"attn.0": MagicMock()},
+        )
+
+    ds_v4._initialize_ds_v4_kv_cache.assert_called_once()
+    synchronize_mock.assert_called_once()
+    synchronized = synchronize_mock.call_args.args[0]
+    assert sorted(map(id, synchronized)) == sorted(map(id, _cache_arrays(caches)))
+    assert len(synchronized) == 2
 
 
 @pytest.mark.tpu_test
@@ -779,7 +1008,7 @@ class TestKVCacheManager:
             # request's state to block 0.
             self.runner._mamba_num_blocks = None
             with (
-                patch("vllm_torchtpu.runner.kv_cache_manager.synchronize_tensors"),
+                patch("vllm_torchtpu.kv_cache_materializer.synchronize_tensors"),
                 pytest.raises(RuntimeError, match="take no scheduler blocks"),
             ):
                 self.runner.initialize_kv_cache(kv_cache_config)
@@ -800,7 +1029,7 @@ class TestKVCacheManager:
         with (
             patch.object(torch, "zeros", side_effect=recording_zeros),
             patch(
-                "vllm_torchtpu.runner.kv_cache_manager.synchronize_tensors"
+                "vllm_torchtpu.kv_cache_materializer.synchronize_tensors"
             ) as mock_sync,
         ):
             self.runner.initialize_kv_cache(kv_cache_config)
@@ -1499,25 +1728,8 @@ class TestKVCacheManager:
         )
         assert config.num_blocks == num_blocks
         assert all(tensor.size == budget for tensor in config.kv_cache_tensors)
-        self.runner.vllm_config.compilation_config.static_forward_context = {}
-        self.runner.block_table_cpu = torch.zeros((1, 1), dtype=torch.int32)
-        tables = []
-        for _ in groups:
-            table = MagicMock()
-            table.get_cpu_tensor.return_value = self.runner.block_table_cpu
-            tables.append(table)
-        self.runner.input_batch = SimpleNamespace(block_table=tables)
-
-        with (
-            patch("vllm_torchtpu.utils.tpu_bind_kv_cache") as bind,
-            patch(
-                "vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group",
-                return_value=False,
-            ),
-            patch("vllm_torchtpu.runner.kv_cache_manager.synchronize_tensors") as sync,
-        ):
-            self.runner.initialize_kv_cache(config)
-        caches = bind.call_args.args[0]
+        with patch("vllm_torchtpu.kv_cache_materializer.synchronize_tensors") as sync:
+            caches = _initialize_kv_cache(self.runner, config)
         unique = {id(cache): cache for cache in caches.values()}
         assert sum(cache.nbytes for cache in unique.values()) == budget
         assert len(unique) == 2
@@ -1587,26 +1799,7 @@ class TestKVCacheManager:
         config = get_kv_cache_config_from_groups(
             self.runner.vllm_config, groups, budget
         )
-        self.runner.vllm_config.compilation_config.static_forward_context = {}
-        self.runner.block_table_cpu = torch.zeros((1, 1), dtype=torch.int32)
-        self.runner.input_batch = SimpleNamespace(
-            block_table=[
-                SimpleNamespace(
-                    max_num_blocks_per_req=4,
-                    get_cpu_tensor=lambda: self.runner.block_table_cpu,
-                )
-                for _ in groups
-            ]
-        )
-        with (
-            patch("vllm_torchtpu.utils.tpu_bind_kv_cache") as bind,
-            patch(
-                "vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group",
-                return_value=False,
-            ),
-        ):
-            self.runner.initialize_kv_cache(config)
-        caches = bind.call_args.args[0]
+        caches = _initialize_kv_cache(self.runner, config)
         unique = {id(cache): cache for cache in caches.values()}
         assert config.num_blocks == num_blocks
         assert len(unique) == (2 if shared else 4)
@@ -1682,29 +1875,8 @@ class TestKVCacheManager:
             kv_cache_groups=kv_cache_groups,
         )
 
-        self.runner.vllm_config.compilation_config.static_forward_context = {}
-        self.runner.block_table_cpu = torch.zeros((1, 4), dtype=torch.int32)
-        self.runner.kv_caches = []
-
-        mock_input_batch = MagicMock()
-        mock_block_tables = []
-        for _ in kv_cache_groups:
-            mock_bt = MagicMock()
-            mock_bt.max_num_blocks_per_req = 4
-            mock_bt.get_cpu_tensor.return_value = torch.zeros((1, 4), dtype=torch.int32)
-            mock_block_tables.append(mock_bt)
-        mock_input_batch.block_table = mock_block_tables
-        self.runner.input_batch = mock_input_batch
-
-        with (
-            patch("vllm_torchtpu.utils.tpu_bind_kv_cache") as mock_bind,
-            patch.object(TpuPlatform, "_find_non_ssm_backend", return_value=backend),
-            patch(
-                "vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group",
-                return_value=False,
-            ),
-        ):
-            self.runner.initialize_kv_cache(kv_cache_config)
+        with patch.object(TpuPlatform, "_find_non_ssm_backend", return_value=backend):
+            caches = _initialize_kv_cache(self.runner, kv_cache_config)
 
         # (1) One shared TPU builder per group, in the parent's
         # list-of-list-of-AttentionGroup layout.
@@ -1730,7 +1902,6 @@ class TestKVCacheManager:
         for tensor in self.runner.empty_slot_mappings.values():
             assert tensor.numel() == 0
 
-        caches = mock_bind.call_args.args[0]
         first, second = caches["attn.0"], caches["attn.1"]
         assert first is second
         assert first.shape[0] == kv_cache_config.num_blocks
@@ -1738,54 +1909,6 @@ class TestKVCacheManager:
         assert first.stride(0) * dtype.itemsize == page_bytes
         caches["attn.0"][kv_cache_config.num_blocks - 1].fill_(1)
         assert torch.all(caches["attn.1"][-1] == 1)
-
-    def test_initialize_kv_cache_allocates_attention_caches_on_device(self):
-        """Attention caches are created on the device, not on the host first."""
-        from torch.utils._python_dispatch import TorchDispatchMode
-        from vllm.v1.core.kv_cache_utils import get_kv_cache_config_from_groups
-
-        class RecordHostTensors(TorchDispatchMode):
-            def __init__(self):
-                super().__init__()
-                self.numels = []
-
-            def __torch_dispatch__(self, func, types, args=(), kwargs=None):
-                out = func(*args, **(kwargs or {}))
-                if isinstance(out, torch.Tensor) and out.device.type == "cpu":
-                    self.numels.append(out.numel())
-                return out
-
-        spec = PallasAttentionBackend.customize_spec(
-            FullAttentionSpec(
-                block_size=16, num_kv_heads=2, head_size=128, dtype=torch.bfloat16
-            )
-        )
-        groups = [
-            KVCacheGroupSpec(layer_names=["attn.0", "attn.1"], kv_cache_spec=spec)
-        ]
-        config = get_kv_cache_config_from_groups(
-            self.runner.vllm_config, groups, 2 * 4 * spec.page_size_bytes
-        )
-        self.runner.device = torch.device("meta")
-        self.runner.vllm_config.compilation_config.static_forward_context = {}
-        self.runner.block_table_cpu = torch.zeros((1, 1), dtype=torch.int32)
-        table = MagicMock()
-        table.get_cpu_tensor.return_value = self.runner.block_table_cpu
-        self.runner.input_batch = SimpleNamespace(block_table=[table])
-
-        with (
-            patch("vllm_torchtpu.utils.tpu_bind_kv_cache") as bind,
-            patch(
-                "vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group",
-                return_value=False,
-            ),
-            RecordHostTensors() as host,
-        ):
-            self.runner.initialize_kv_cache(config)
-
-        caches = bind.call_args.args[0]
-        assert {cache.device.type for cache in caches.values()} == {"meta"}
-        assert caches["attn.0"].numel() not in host.numels
 
     def test_initialize_kv_cache_composite_specs(self):
         """Verify composite kv_cache_specs unpacking when a group's spec wraps
@@ -1816,32 +1939,12 @@ class TestKVCacheManager:
             kv_cache_groups=kv_cache_groups,
         )
 
-        self.runner.vllm_config.compilation_config.static_forward_context = {}
-        self.runner.block_table_cpu = torch.zeros((1, 1), dtype=torch.int32)
-        self.runner.kv_caches = []
-
-        mock_input_batch = MagicMock()
-        mock_bt = MagicMock()
-        mock_bt.max_num_blocks_per_req = 4
-        mock_bt.get_cpu_tensor.return_value = torch.zeros((1, 1), dtype=torch.int32)
-        mock_input_batch.block_table = [mock_bt]
-        self.runner.input_batch = mock_input_batch
-
-        with (
-            patch(
-                "vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_shape",
-                return_value=(1, 16, 2, 1, 128),
-            ),
-            patch("vllm_torchtpu.utils.tpu_bind_kv_cache") as mock_bind,
-            patch(
-                "vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group",
-                return_value=False,
-            ),
+        with patch(
+            "vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_shape",
+            return_value=(1, 16, 2, 1, 128),
         ):
-            self.runner.initialize_kv_cache(kv_cache_config)
+            created_caches = _initialize_kv_cache(self.runner, kv_cache_config)
 
-        mock_bind.assert_called_once()
-        created_caches = mock_bind.call_args[0][0]
         assert "attn.0" in created_caches
         assert created_caches["attn.0"].shape == (1, 16, 2, 1, 128)
 
@@ -2369,6 +2472,7 @@ def test_dsv4_csa_allocates_int32_nope_and_rope_arrays():
     NoPE keeps one 128-word row per token, RoPE packs four tokens' 32 words
     per row, so the sparse gather can fetch a token's own 128 RoPE bytes. The
     bytes are the uint8 pair's; overflow overlay hosts copy the NoPE host.
+    Every array comes from the device allocator.
     """
     from vllm.v1.kv_cache_interface import SlidingWindowMLASpec
 
@@ -2419,7 +2523,6 @@ def test_dsv4_csa_allocates_int32_nope_and_rope_arrays():
         group.kv_cache_spec = specs[group.layer_names[0]]
     runner = MagicMock()
     runner.shared_kv_cache_layers = {}
-    runner.device = "cpu"
     runner.max_num_reqs = 256
     runner.max_num_tokens = 1024
     runner.most_model_len = None
@@ -2429,12 +2532,14 @@ def test_dsv4_csa_allocates_int32_nope_and_rope_arrays():
     ]
     kv_caches: dict = {}
     num_blocks = 3
+    allocator = DeviceKVCacheAllocator(torch.device("cpu"))
 
     DsV4KVCacheAllocator(runner)._initialize_ds_v4_kv_cache(
         SimpleNamespace(kv_cache_groups=groups),
         specs.__getitem__,
         kv_caches,
         num_blocks,
+        allocator,
     )
 
     # Only the compressed-KV group (1,024 pages) bounds the requests per
@@ -2471,6 +2576,11 @@ def test_dsv4_csa_allocates_int32_nope_and_rope_arrays():
     assert overflow is not nope
     assert overflow.dtype == torch.int32
     assert tuple(overflow.shape) == tuple(nope.shape)
+    # So the caller's one synchronize covers each array, and none is staged on
+    # the host first.
+    assert sorted(map(id, allocator.arrays)) == sorted(
+        map(id, _cache_arrays(kv_caches))
+    )
 
 
 @pytest.mark.parametrize(
@@ -2534,7 +2644,6 @@ def test_dsv4_indexer_seq_along_lane_cache(block_size, expected):
         group.kv_cache_spec = specs[group.layer_names[0]]
     runner = MagicMock()
     runner.shared_kv_cache_layers = {}
-    runner.device = "cpu"
     runner.max_num_reqs = 256
     runner.max_num_tokens = 1024
     runner.most_model_len = None
@@ -2550,6 +2659,7 @@ def test_dsv4_indexer_seq_along_lane_cache(block_size, expected):
             specs.__getitem__,
             kv_caches,
             num_blocks,
+            DeviceKVCacheAllocator(torch.device("cpu")),
         )
 
     if expected is None:
