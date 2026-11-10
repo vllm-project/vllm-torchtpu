@@ -58,7 +58,7 @@ def _require_tpu() -> None:
 def _cfg():
     return dict(
         num_layers=6,
-        num_blocks=64,
+        num_blocks=96,
         page_size=16,
         num_kv_heads=4,
         head_dim=128,
