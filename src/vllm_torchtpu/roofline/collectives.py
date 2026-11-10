@@ -135,7 +135,7 @@ def collective_ici_hops(
     mesh_axes: tuple[int, int, int, int] | None = None,
 ) -> int:
     """Unloaded one-way or two-phase physical ICI hops traversed by a collective."""
-    if c.group <= 1 or c.offchip <= 0.0:
+    if c.group <= 1:
         return 0
     if topology is not None or mesh_axes is not None:
         _, ax, ay, az = submesh_for_group(c.group, topology, ranks_per_chip, mesh_axes)
@@ -152,7 +152,7 @@ def collective_ici_hops(
         )
         phases = 2 if c.kind == "ar" else 1
         return phases * hops_1p
-    return c.hops
+    return 0 if c.offchip <= 0.0 else c.hops
 
 
 def torus_collective_s(
@@ -200,9 +200,7 @@ def torus_collective_s(
 
     contention = float(max(1, d2d))
     cap_bw = (
-        chip.ici_bw
-        if d2d >= _DEFAULT_RANKS_PER_CHIP
-        else chip.ici_bw * chip.cores_per_chip
+        chip.ici_bw if d2d >= chip.cores_per_chip else chip.ici_bw * chip.cores_per_chip
     )
     raw_bw = lanes_sum * chip.ici_link_bw / contention
     eff_bw = min(raw_bw, cap_bw) if math.isfinite(cap_bw) and cap_bw > 0.0 else raw_bw

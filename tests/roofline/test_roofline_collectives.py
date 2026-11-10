@@ -20,9 +20,12 @@ import pytest
 from vllm_torchtpu.roofline import (
     CHIPS,
     TOPOLOGIES,
+    TPU6E_TOPOLOGIES,
+    collective_ici_hops,
     submesh_for_group,
     torus_collective_s,
 )
+from vllm_torchtpu.roofline.collectives import make
 
 _EXPECTED_LINK_BW: float = 100.0e9
 _EXPECTED_ICI_BW: float = 300.0e9
@@ -58,3 +61,38 @@ def test_spec_cited_chip_and_unloaded_hop_latency() -> None:
     assert torus_collective_s(
         "ar", 16.0, (2, 2, 2, 1), chip, TOPOLOGIES["2x2x1"]
     ) == pytest.approx(2 * 2 * _EXPECTED_HOP_LATENCY)
+
+
+def test_tpu6e_single_core_collectives_and_2d_torus_wraparound() -> None:
+    """Verify 1-core packing, external hops, and 16-axis 2D torus wraparound."""
+    chip = CHIPS["tpu6e"]
+    topo_2x2 = TPU6E_TOPOLOGIES["2x2"]
+    assert submesh_for_group(2, topo_2x2, 1) == (1, 2, 1, 1)
+
+    coll_1c = make("tp_ar", "ar", 16.0, 2, "one_shot", 1)
+    coll_default = make("tp_ar", "ar", 16.0, 2)
+    assert coll_1c.offchip == pytest.approx(1.0)
+    assert collective_ici_hops(coll_1c, topo_2x2, 1) == 2
+    assert collective_ici_hops(coll_default, topo_2x2, 1) == 2
+    assert torus_collective_s(
+        "ar", 16.0, (1, 2, 1, 1), chip, topo_2x2
+    ) == pytest.approx(2 * _EXPECTED_HOP_LATENCY)
+
+    for open_name in ("1x1", "2x2", "2x4", "4x4", "4x8", "8x8"):
+        assert not TPU6E_TOPOLOGIES[open_name].has_torus_wraparound
+
+    topo_8x16 = TPU6E_TOPOLOGIES["8x16"]
+    assert topo_8x16.has_torus_wraparound
+    assert not topo_8x16.axis_wrapped(0, 8)
+    assert topo_8x16.axis_wrapped(1, 16)
+    assert torus_collective_s(
+        "ar", _PAYLOAD_BYTES, (1, 8, 16, 1), chip, topo_8x16
+    ) < torus_collective_s("ar", _PAYLOAD_BYTES, (1, 8, 16, 1), chip)
+
+    topo_16x16 = TPU6E_TOPOLOGIES["16x16"]
+    assert topo_16x16.has_torus_wraparound
+    assert topo_16x16.axis_wrapped(0, 16)
+    assert topo_16x16.axis_wrapped(1, 16)
+    assert torus_collective_s(
+        "ar", _PAYLOAD_BYTES, (1, 16, 16, 1), chip, topo_16x16
+    ) < torus_collective_s("ar", _PAYLOAD_BYTES, (1, 16, 16, 1), chip)

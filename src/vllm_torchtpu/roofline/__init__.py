@@ -15,7 +15,15 @@
 
 from __future__ import annotations
 
-from .chips import CHIPS, TOPOLOGIES, ChipSpec, SliceTopology
+from .chips import (
+    CHIP_TOPOLOGIES,
+    CHIPS,
+    TOPOLOGIES,
+    TPU6E_TOPOLOGIES,
+    ChipSpec,
+    SliceTopology,
+    topologies_for_chip,
+)
 from .collectives import (
     Collective,
     collective_ici_hops,
@@ -25,9 +33,11 @@ from .collectives import (
 from .geometry import LAYER_FAMILIES, ModelGeometry, from_hf_config
 
 __all__ = [
+    "CHIP_TOPOLOGIES",
     "CHIPS",
     "LAYER_FAMILIES",
     "TOPOLOGIES",
+    "TPU6E_TOPOLOGIES",
     "ChipSpec",
     "Collective",
     "ModelGeometry",
@@ -35,5 +45,6 @@ __all__ = [
     "collective_ici_hops",
     "from_hf_config",
     "submesh_for_group",
+    "topologies_for_chip",
     "torus_collective_s",
 ]
