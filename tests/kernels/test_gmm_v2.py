@@ -529,7 +529,14 @@ def test_gmm_fp4_block_matches_reference(batch_size, group_sizes, block_size):
 @pytest.mark.parametrize(
     "size_m, decode",
     # MiniMax-M3.1 routed experts under EP8: c4 b4 .. c64 decode, 8k prefill.
-    [(96, False), (128, False), (384, False), (1536, True), (2048, True), (32768, False)],
+    [
+        (96, False),
+        (128, False),
+        (384, False),
+        (1536, True),
+        (2048, True),
+        (32768, False),
+    ],
 )
 def test_calculate_tiling_fp4_decode_tiles(size_m, decode):
     _require_tpu()

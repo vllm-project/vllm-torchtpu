@@ -161,6 +161,9 @@ FP8_RHS_TILE_M = 32
 # binding, so finer bf16 buckets would only grow the program.
 FP8_DECODE_TILE_M = 128
 FP8_DECODE_BUCKETS = (16, 32, 48, FP8_DECODE_TILE_M)
+# Largest routed buffer given decode tiles (e.g. 64 requests x 8 tokens x
+# top-4); prefill chunks above it keep the MXU-bound tiling.
+FP8_DECODE_MAX_M = 2048
 # Up to this size_m local groups stay within FP8_RHS_TILE_M rows, so the
 # small-m tiles (2 fp8 buckets, a third of the program) serve them.
 FP8_SMALL_DECODE_MAX_M = 512
@@ -1285,14 +1288,18 @@ def calculate_tiling(
             break
         tile_m = new_tile_m
 
-    # Decode-sized buffer (a group holding all of size_m / size_group rows fits
+    # Decode-sized buffer (the average group, size_m / size_group rows, fits
     # one tile): keep small groups on the fp8 feed instead of a >= 64-row
-    # bf16 bucket. Partial buckets assume a single k tile (run_matmul_step).
+    # bf16 bucket. Partial buckets assume a single k tile (run_matmul_step),
+    # and 16-row buckets a sublane tiling of at most 16 rows.
+    sublane = _get_lhs_sublane_size(lhs_cfgs.dtype, dims.size_m)
     if (
         tile_m > bucket_base
         and tile_m >= FP8_DECODE_TILE_M
         and dims.size_m <= FP8_DECODE_TILE_M * dims.size_group
+        and dims.size_m <= FP8_DECODE_MAX_M
         and num_k_tiles == 1
+        and FP8_DECODE_BUCKETS[0] % sublane == 0
         and fp8_rhs_feed_dtype(lhs_cfgs, rhs_cfgs) is not None
     ):
         if dims.size_m <= FP8_SMALL_DECODE_MAX_M:
@@ -1314,7 +1321,6 @@ def calculate_tiling(
     # rows, and rows cost MXU time on the fp8 rhs feed: use fp8-sized tiles in
     # two buckets. Two such tiles cost what one bf16 tile does, and more
     # buckets would bloat the program (each bucket is a copy of the body).
-    sublane = _get_lhs_sublane_size(lhs_cfgs.dtype, dims.size_m)
     if (
         bucket_base == tile_m
         and dims.size_m < 2 * tile_m  # growth stopped by size_m, not VMEM
