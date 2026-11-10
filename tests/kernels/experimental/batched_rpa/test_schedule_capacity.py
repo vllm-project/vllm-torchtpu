@@ -71,9 +71,7 @@ def test_schedule_overflow_is_dropped_not_written_out_of_bounds(monkeypatch):
         kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
     )
     cfgs = configs.RpaConfigs(
-        block=configs.BlockSizes(
-            bq_sz=128, bq_c_sz=128, bkv_sz=128, batch_size=2
-        ),
+        block=configs.BlockSizes(bq_sz=128, bq_c_sz=128, bkv_sz=128, batch_size=2),
         model=configs.ModelConfigs(
             num_q_heads=2,
             num_kv_heads=1,

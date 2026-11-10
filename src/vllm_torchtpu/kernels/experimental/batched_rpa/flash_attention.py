@@ -29,9 +29,7 @@ from vllm_torchtpu.kernels.experimental.batched_rpa.schedule import SmemWrapper
 
 
 def _use_native_fp8(cfgs: configs.RpaConfigs, which: str) -> bool:
-    return cfgs.mode == configs.RpaCase.DECODE and cfgs.serve.native_fp8_enabled(
-        which
-    )
+    return cfgs.mode == configs.RpaCase.DECODE and cfgs.serve.native_fp8_enabled(which)
 
 
 # Weight of the low fp8 half in a split (hi + lo / _SPLIT_LO) quantization.
