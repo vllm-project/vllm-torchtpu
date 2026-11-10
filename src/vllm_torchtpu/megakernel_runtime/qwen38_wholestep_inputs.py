@@ -38,6 +38,7 @@ from typing import Any
 
 import jax.numpy as jnp
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.qwen4_exp.pooled_qsa import compressed_kernel_pages
 from vllm_torchtpu.kernels.qwen4_exp.qsa_state import read_ring_and_tags
 
@@ -61,6 +62,35 @@ def carrier_pages_per_block(pool: Any) -> int:
     """Compressed-key carrier pages (32 groups of 2 x 128 BF16 lanes) per pool block."""
     rows, width = 128 // GROUP, pool.shape[-1]
     return math.prod(pool.shape[1:]) * pool.dtype.itemsize // (rows * width * 2)
+
+
+def _layer_batched_tables(pool, tables, slots, live, ctx, n_req, nreq, pages_per_seq, n_ck, lp):
+    """`qsa_step_inputs`' per-layer table and ring prep for all layers at once
+    (VLLM_TPU_MK_WHOLE_BATCHED_INPUTS): `[layers, nreq, cols]` page tables and one ring
+    read for every layer's requests. Same values as the per-layer loop; 11 ring-read calls
+    and ~200 small ops per step become a few (xprof j-30c70bee: ~216 us of the head).
+    """
+    def stacked(i, cols):
+        t = jnp.stack([_fit(tab[i].reshape(n_req, -1).astype(jnp.int32), nreq) for tab in tables])
+        return jnp.pad(t, ((0, 0), (0, 0), (0, max(0, cols - t.shape[2]))))[:, :, :cols]
+
+    mtab = stacked(1, pages_per_seq)
+    cols = -(-n_ck // lp)
+    comp = stacked(2, cols)
+    # `compressed_kernel_pages` with each layer's slot offset.
+    first = jnp.asarray([[cslot * lp + j for j in range(lp)] for _, cslot in slots], jnp.int32)
+    physical = carrier_pages_per_block(pool)
+    cktab = comp[..., None] * physical + first[:, None, None, :]
+    cktab = cktab.reshape(len(tables), nreq, cols * lp)
+    cktab = cktab[:, :, :n_ck].astype(jnp.int32)
+    ids = jnp.stack(
+        [_fit(tab[0].reshape(n_req, -1)[:, 0].astype(jnp.int32), nreq) for tab in tables]
+    )
+    ids = jnp.where(live[None], ids, 0).reshape(-1)
+    ring, _ = read_ring_and_tags(pool, ids, RING_ROWS * IDX_DIM, RING_ROWS * 2)
+    ring = ring.reshape(len(tables), nreq, RING_ROWS, IDX_DIM)
+    ring = jnp.where((ctx > 0)[None, :, None, None], ring, 0).astype(jnp.bfloat16)
+    return mtab, cktab, ring.reshape(-1, RING_ROWS, IDX_DIM)
 
 
 def qsa_step_inputs(
@@ -107,30 +137,40 @@ def qsa_step_inputs(
     # 4). Addressed by `pooled_qsa.compressed_kernel_pages`, the stock selection's own
     # mapping.
     lp = pool.shape[1] // 128
-    mtab, cktab, rings = [], [], []
-    for (ring_ids, main, comp), (_, cslot) in zip(tables, slots, strict=True):
-        main = _fit(main.reshape(n_req, -1).astype(jnp.int32), nreq)
-        comp = _fit(comp.reshape(n_req, -1).astype(jnp.int32), nreq)
-        ids = _fit(ring_ids.reshape(n_req, -1)[:, 0].astype(jnp.int32), nreq)
-        ids = jnp.where(live, ids, 0)
-        # Columns past `pages_per_seq` / the compressed width only address contexts past
-        # `wholecap`, which the driver routes to stock (`_whole_eligible`); padding
-        # covers
-        # tables narrower than the cap.
-        mtab.append(
-            jnp.pad(main, ((0, 0), (0, max(0, pages_per_seq - main.shape[1]))))[
-                :, :pages_per_seq
-            ]
+    if envs.VLLM_TPU_MK_WHOLE_BATCHED_INPUTS:
+        mtab, cktab, ring = _layer_batched_tables(
+            pool, tables, slots, live, ctx, n_req, nreq, pages_per_seq, n_ck, lp
         )
-        cols = -(-n_ck // lp)
-        comp = jnp.pad(comp, ((0, 0), (0, max(0, cols - comp.shape[1]))))[:, :cols]
-        pages = compressed_kernel_pages(comp, pool, cslot, GROUP).reshape(
-            nreq, cols * lp
-        )
-        cktab.append(pages[:, :n_ck].astype(jnp.int32))
-        ring, _ = read_ring_and_tags(pool, ids, RING_ROWS * IDX_DIM, RING_ROWS * 2)
-        ring = ring.reshape(nreq, RING_ROWS, IDX_DIM)
-        rings.append(jnp.where((ctx > 0)[:, None, None], ring, 0).astype(jnp.bfloat16))
+        if not layer_major_tables:
+            mtab = mtab.reshape(-1, mtab.shape[-1])
+            cktab = cktab.reshape(-1, cktab.shape[-1])
+    else:
+        mtab, cktab, rings = [], [], []
+        for (ring_ids, main, comp), (_, cslot) in zip(tables, slots, strict=True):
+            main = _fit(main.reshape(n_req, -1).astype(jnp.int32), nreq)
+            comp = _fit(comp.reshape(n_req, -1).astype(jnp.int32), nreq)
+            ids = _fit(ring_ids.reshape(n_req, -1)[:, 0].astype(jnp.int32), nreq)
+            ids = jnp.where(live, ids, 0)
+            # Columns past `pages_per_seq` / the compressed width only address contexts past
+            # `wholecap`, which the driver routes to stock (`_whole_eligible`); padding
+            # covers
+            # tables narrower than the cap.
+            mtab.append(
+                jnp.pad(main, ((0, 0), (0, max(0, pages_per_seq - main.shape[1]))))[
+                    :, :pages_per_seq
+                ]
+            )
+            cols = -(-n_ck // lp)
+            comp = jnp.pad(comp, ((0, 0), (0, max(0, cols - comp.shape[1]))))[:, :cols]
+            pages = compressed_kernel_pages(comp, pool, cslot, GROUP).reshape(
+                nreq, cols * lp
+            )
+            cktab.append(pages[:, :n_ck].astype(jnp.int32))
+            ring, _ = read_ring_and_tags(pool, ids, RING_ROWS * IDX_DIM, RING_ROWS * 2)
+            ring = ring.reshape(nreq, RING_ROWS, IDX_DIM)
+            rings.append(jnp.where((ctx > 0)[:, None, None], ring, 0).astype(jnp.bfloat16))
+        stack = jnp.stack if layer_major_tables else jnp.concatenate
+        mtab, cktab, ring = stack(mtab), stack(cktab), jnp.concatenate(rings)
 
     # Gather the rows, then widen: converting the whole [max_model_len, 128] table every
     # step cost
@@ -145,14 +185,14 @@ def qsa_step_inputs(
     return {
         "qsa_pool": pool,
         "qsa_ck": pool.reshape(-1, 128 // GROUP // 2, pool.shape[-2], pool.shape[-1]),
-        "qsa_cktab": jnp.stack(cktab) if layer_major_tables else jnp.concatenate(cktab),
+        "qsa_cktab": cktab,
         "qsa_nvis": lens // GROUP,
         "qsa_tail": lens % GROUP,
-        "qsa_mtab": jnp.stack(mtab) if layer_major_tables else jnp.concatenate(mtab),
+        "qsa_mtab": mtab,
         "qsa_off": jnp.asarray([max(m, 0) for m, _ in slots], jnp.int32),
         "qsa_scales": jnp.asarray([k_scale, v_scale], jnp.float32),
         "qsa_rope": trig32(pos),
         "qsa_ctx": ctx,
-        "qsa_ring": jnp.concatenate(rings),
+        "qsa_ring": ring,
         "qsa_rope_ck": trig32(jnp.maximum(j0, 0))[:, None, :],
     }
