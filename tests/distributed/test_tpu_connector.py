@@ -418,6 +418,9 @@ def _make_raiden_worker(
 def test_pd_decode_failure_uses_transfer_results_failed_recving(
     block_ids, inline_load, monkeypatch
 ):
+    from vllm import SamplingParams
+    from vllm.v1.request import Request
+
     monkeypatch.setenv("TPU_KV_RESHARD_TRANSPORT", "raiden")
     monkeypatch.setattr(
         f"{_MOD}.dist_utils.get_raiden_inline_load", lambda: inline_load
@@ -431,17 +434,26 @@ def test_pd_decode_failure_uses_transfer_results_failed_recving(
     connector = TPURaidenConnector.__new__(TPURaidenConnector)
     connector.connector_worker = worker
     connector.use_raiden = True
-    connector._stage3_fa_group_index = 3
+    connector._kv_cache_config = _make_test_kv_cache_config()
+    connector._stage3_fa_group_index = 0
 
     results = connector.get_transfer_results(set())
     assert results.finished_sending == set()
     assert results.finished_recving == {"failed-load"}
-    if inline_load:
-        assert results.failed_recving == set()
-        assert connector.get_block_ids_with_load_errors() == set(block_ids) | {99}
-    else:
-        assert results.failed_recving == {"failed-load"}
-        assert connector.get_block_ids_with_load_errors() == {99}
+    assert results.failed_recving == {"failed-load"}
+    assert connector.get_block_ids_with_load_errors() == set(block_ids) | {99}
+    request = Request(
+        request_id="failed-load",
+        prompt_token_ids=[1] * 17,
+        sampling_params=SamplingParams(max_tokens=1),
+        pooling_params=None,
+    )
+    request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+    scheduler = object.__new__(Scheduler)
+    scheduler.requests = {"failed-load": request}
+    scheduler.recompute_kv_load_failures = False
+    assert scheduler._handle_failed_recving(results.failed_recving) == {"failed-load"}
+    assert connector.get_transfer_results(set()).failed_recving == set()
 
 
 @pytest.mark.parametrize("send_completion", [False, True])
