@@ -31,8 +31,6 @@ def replica_wire_rows(input_rows, width, row_alignment):
     once for every token bucket and refuses a graph that assumes any bound on
     the token count.
     """
-    if width == 1:
-        return input_rows
     share = (input_rows + width - 1) // width
     return (share + row_alignment - 1) // row_alignment * row_alignment
 
@@ -43,7 +41,8 @@ class TokenReplicaLayout:
 
     Every member supplies identical input rows. Each computes one contiguous
     slice, then all members recover the original row order. Singleton groups
-    leave the input and output unchanged, including unaligned row counts.
+    pad their rows to an aligned tile like wider groups, and restore slices
+    the output back to input_rows.
     """
 
     groups: tuple[tuple[int, ...], ...]
