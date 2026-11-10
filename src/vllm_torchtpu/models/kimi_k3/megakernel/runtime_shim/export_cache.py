@@ -46,7 +46,7 @@ import vllm_torchtpu
 from vllm_torchtpu.logger import init_logger
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Sequence
+    from collections.abc import Callable, Iterable, Mapping, Sequence
 
     from jax.sharding import Mesh, PartitionSpec
 
@@ -80,20 +80,23 @@ class _LoweredExportProtocol(Protocol):
     out_tree: object
 
 
-class _CompileCallOpProtocol(Protocol):
-    """Callable wrapper inside a :class:`CompileCall` record."""
-
-    _init_fn: _JaxCallableProtocol | None
-
-    def __call__(self, *args: object) -> object: ...
-
-
 class _CompileCallProtocol(Protocol):
     """Structural contract for ``compilation.CompileCall`` instances."""
 
-    op: _CompileCallOpProtocol
-    operands: tuple[object, ...]
-    options: dict[str, object]
+    @property
+    def op(self) -> Callable[..., object]:
+        """Compiled callable wrapped by this call entry."""
+        ...
+
+    @property
+    def operands(self) -> tuple[object, ...]:
+        """Operand placeholders or tensors passed to ``op``."""
+        ...
+
+    @property
+    def options(self) -> Mapping[str, object]:
+        """Lowering options attached to this call entry."""
+        ...
 
 
 class _ShapeAndDtypeProtocol(Protocol):

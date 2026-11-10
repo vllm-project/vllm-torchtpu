@@ -12,12 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Source provenance: inferact/k3-megakernel@30c9ba966b src/vllm_torchtpu/megakernel/kimi_k3/sampling.py
+# Source provenance: inferact/k3-megakernel@30c9ba966b
+# src/vllm_torchtpu/megakernel/kimi_k3/sampling.py
 """Token choice on the K3 decoder's vocabulary-sharded logits, inside its ops.
 
-Every function runs inside ``shard_map`` over the 32-rank ``tp`` axis on this
-rank's logits ``[rows, V / 32]`` and returns replicated results: all ranks
-reach the same tokens through collectives and deterministic draws.
+Every function runs inside ``shard_map`` over the 32-rank ``tp`` axis on
+this rank's logits ``[rows, V / 32]`` and returns replicated results: all
+ranks reach the same tokens through collectives and deterministic draws.
 
 - :func:`greedy`: the argmax (the first shard holding the maximum on ties).
 - :func:`sample_rows`: independent rows (a plain batch step): each row's
@@ -27,28 +28,44 @@ reach the same tokens through collectives and deterministic draws.
   (``kernels.dspark.nucleus_accept``).
 
 Sampled rows need ``temperature > 0``; callers select :func:`greedy` for
-greedy rows. Top-p and top-k act on the ``CANDIDATES`` largest logits of each
-rank (exact unless the nucleus needs more than that many tokens of one rank).
+greedy rows. Top-p and top-k act on the ``CANDIDATES`` largest logits of
+each rank (exact unless the nucleus needs more than that many tokens of one
+rank).
 """
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import jax
 import jax.numpy as jnp
 
-from vllm_torchtpu.models.kimi_k3.megakernel.program import TP_SIZE, kernel_modules
+from .common.constants import BITS_PER_WORD
+from .program import TP_SIZE, kernel_modules
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 AXIS = "tp"
 CANDIDATES = 128
+_FP32_EXACT_INT_BOUND = 2**24
+_MIN_SPLIT_ROWS = 16
+_MIN_SPLIT_WIDTH = 2048
+_HALF_DIVISOR = 2
+_MASKED_LOGIT_FLOOR = -1e30
+_UNIFORM_COLS = 2
+_PACKET_HEADER_FIELDS = 2
 
 
-def _nucleus_accept():
+def _nucleus_accept() -> Callable[..., tuple[jax.Array, jax.Array]]:
+    """Return the DSpark nucleus acceptance function from kernel modules."""
     (dspark,) = kernel_modules("dspark")
-    return dspark.nucleus_accept
+    accept_fn: Callable[..., tuple[jax.Array, jax.Array]] = dspark.nucleus_accept
+    return accept_fn
 
 
 def greedy(local_logits: jax.Array) -> jax.Array:
-    """``[rows]`` int32 argmax over the full vocabulary."""
+    """Return ``[rows]`` int32 argmax over the full vocabulary."""
     rows, width = local_logits.shape
     rank = jax.lax.axis_index(AXIS)
     local_id = jnp.argmax(local_logits, axis=1).astype(jnp.int32)
@@ -57,49 +74,61 @@ def greedy(local_logits: jax.Array) -> jax.Array:
     if (
         rows > 0
         and local_logits.dtype in (jnp.float32, jnp.bfloat16)
-        and width * TP_SIZE <= 2**24
+        and width * TP_SIZE <= _FP32_EXACT_INT_BOUND
     ):
-        # These IDs are exact in FP32. A flat payload lowers to one TPU
-        # all-reduce; the differently typed tuple requires two collectives.
+        # These IDs are exact in FP32. A flat payload lowers to one TPU all-reduce; the
+        # differently typed tuple requires two collectives.
         packet = jnp.concatenate(
             (local_max.astype(jnp.float32), global_id.astype(jnp.float32))
-        )
+        )  # [ranks, rows]
         gathered = jax.lax.all_gather(packet, AXIS, axis=0, tiled=True).reshape(
-            -1, 2, rows
+            -1, _PACKET_HEADER_FIELDS, rows
         )
         maxima, ids = gathered[:, 0], gathered[:, 1].astype(jnp.int32)
     else:
-        maxima, ids = jax.lax.all_gather(
-            (local_max, global_id), AXIS, axis=0
-        )  # [ranks, rows]
+        maxima, ids = jax.lax.all_gather((local_max, global_id), AXIS, axis=0)
     winner = jnp.argmax(maxima, axis=0)
     return jnp.take_along_axis(ids, winner[None], axis=0)[0]
 
 
-def _local_top_k(logits):
-    """Exact top-128 via two narrower selections, with a single top_k's tie order.
+def _local_top_k(logits: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """Compute exact top-128 via two narrower selections with stable tie order.
+
+    Exact top-128 via two narrower selections, with a single top_k's tie order.
 
     A discarded entry already has 128 earlier/better entries in its half, so
     cannot belong to the global top-128. Concatenating contiguous halves keeps
     lower vocabulary IDs first on ties in the final selection.
     """
     rows, width = logits.shape
-    # Below 16 rows one top_k is cheaper than the split/merge's extra layout work.
-    if rows < 16 or width < 2048 or width % 2:
+    if rows < _MIN_SPLIT_ROWS or width < _MIN_SPLIT_WIDTH or width % _HALF_DIVISOR != 0:
         return jax.lax.top_k(logits, CANDIDATES)
-    values, indices = jax.lax.top_k(logits.reshape(rows * 2, width // 2), CANDIDATES)
-    indices = indices.reshape(rows, 2, CANDIDATES) + (
-        jnp.arange(2, dtype=jnp.int32)[None, :, None] * (width // 2)
+    half_width = width // _HALF_DIVISOR
+    values, indices = jax.lax.top_k(
+        logits.reshape(rows * _HALF_DIVISOR, half_width),
+        CANDIDATES,
     )
-    values, selected = jax.lax.top_k(values.reshape(rows, 2 * CANDIDATES), CANDIDATES)
+    indices = indices.reshape(rows, _HALF_DIVISOR, CANDIDATES) + (
+        jnp.arange(_HALF_DIVISOR, dtype=jnp.int32)[None, :, None] * half_width
+    )
+    merged_width = _HALF_DIVISOR * CANDIDATES
+    values, selected = jax.lax.top_k(
+        values.reshape(rows, merged_width),
+        CANDIDATES,
+    )
     indices = jnp.take_along_axis(
-        indices.reshape(rows, 2 * CANDIDATES), selected, axis=1
+        indices.reshape(rows, merged_width),
+        selected,
+        axis=1,
     )
     return values, indices
 
 
-def _local_candidates(local_logits, temperature):
-    """Local normalizer and stable candidates, with global vocabulary IDs."""
+def _local_candidates(
+    local_logits: jax.Array,
+    temperature: jax.Array,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Compute local normalizer and top candidates with global vocabulary IDs."""
     _, width = local_logits.shape
     scaled = local_logits.astype(jnp.float32) / temperature[:, None]
     local_max = jnp.max(scaled, axis=1)
@@ -109,26 +138,38 @@ def _local_candidates(local_logits, temperature):
     return local_max, local_lse, values, ids
 
 
-def _limit_candidates(values, top_k):
+def _limit_candidates(values: jax.Array, top_k: jax.Array) -> jax.Array:
+    """Mask candidates below each row's k-th largest logit when top_k > 0."""
+
     # Keep ties at the k-th largest value, matching vLLM's sampler.
-    def limit(values):
-        ordered = -jnp.sort(-values, axis=1)
-        k = jnp.clip(top_k, 1, values.shape[1])
-        threshold = jnp.take_along_axis(ordered, (k - 1)[:, None], axis=1)
-        return jnp.where((top_k > 0)[:, None] & (values < threshold), -jnp.inf, values)
+    def limit(candidate_values: jax.Array) -> jax.Array:
+        """Apply per-row top-k threshold preserving ties."""
+        ordered = -jnp.sort(-candidate_values, axis=1)
+        k_clipped = jnp.clip(top_k, 1, candidate_values.shape[1])
+        threshold = jnp.take_along_axis(ordered, (k_clipped - 1)[:, None], axis=1)
+        return jnp.where(
+            (top_k > 0)[:, None] & (candidate_values < threshold),
+            -jnp.inf,
+            candidate_values,
+        )
 
     # Keep this outside vmap: disabled top-k must skip its sort.
     return jax.lax.cond(jnp.any(top_k > 0), limit, lambda v: v, values)
 
 
-def _candidates(local_logits, temperature, top_k):
-    """Every rank's ``CANDIDATES`` largest tempered logits, gathered:
-    ``(values [rows, n], ids [rows, n], lse [rows])``, top-k applied."""
+def _candidates(
+    local_logits: jax.Array,
+    temperature: jax.Array,
+    top_k: jax.Array,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Gather every rank's ``CANDIDATES`` largest tempered logits.
+
+    Every rank's ``CANDIDATES`` largest tempered logits, gathered:
+    ``(values [rows, n], ids [rows, n], lse [rows])``, top-k applied.
+    """
     rows, width = local_logits.shape
     local_max, local_lse, values, ids = _local_candidates(local_logits, temperature)
-    # Vocabulary IDs are exact in FP32; one flat packet avoids four
-    # collectives and per-row payload padding. Preserve rank-major order.
-    if width * TP_SIZE <= 2**24:
+    if width * TP_SIZE <= _FP32_EXACT_INT_BOUND:
         packet = jnp.concatenate(
             (
                 local_max,
@@ -138,18 +179,16 @@ def _candidates(local_logits, temperature, top_k):
             )
         )
         packet = jax.lax.all_gather(packet, AXIS, axis=0)
-        maxima, lses = packet[:, :rows], packet[:, rows : 2 * rows]
-        values = packet[:, 2 * rows : 2 * rows + rows * CANDIDATES].reshape(
-            -1, rows, CANDIDATES
-        )
-        ids = (
-            packet[:, 2 * rows + rows * CANDIDATES :]
-            .astype(jnp.int32)
-            .reshape(-1, rows, CANDIDATES)
-        )
+        header_end = _PACKET_HEADER_FIELDS * rows
+        values_end = header_end + rows * CANDIDATES
+        maxima, lses = packet[:, :rows], packet[:, rows:header_end]
+        values = packet[:, header_end:values_end].reshape(-1, rows, CANDIDATES)
+        ids = packet[:, values_end:].astype(jnp.int32).reshape(-1, rows, CANDIDATES)
     else:
         maxima, lses, values, ids = jax.lax.all_gather(
-            (local_max, local_lse, values, ids), AXIS, axis=0
+            (local_max, local_lse, values, ids),
+            AXIS,
+            axis=0,
         )
     best = jnp.max(maxima, axis=0)
     lse = best + jnp.log(jnp.sum(jnp.exp(maxima - best[None] + lses), axis=0))
@@ -159,8 +198,14 @@ def _candidates(local_logits, temperature, top_k):
     return _limit_candidates(values, top_k), ids, lse
 
 
-def _request_candidates(local_logits, temperature, top_k):
-    """Exchange only the request assigned to this rank; preserve source order.
+def _request_candidates(
+    local_logits: jax.Array,
+    temperature: jax.Array,
+    top_k: jax.Array,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Exchange only the request assigned to this rank preserving source order.
+
+    Exchange only the request assigned to this rank; preserve source order.
 
     Rank r samples request r % requests. Each sender supplies that request's
     local candidates to r through all-to-all, rather than replicating every
@@ -169,29 +214,47 @@ def _request_candidates(local_logits, temperature, top_k):
     """
     requests, rows, width = local_logits.shape
     maximum, lse, values, ids = _local_candidates(
-        local_logits.reshape(requests * rows, width), jnp.repeat(temperature, rows)
+        local_logits.reshape(requests * rows, width),
+        jnp.repeat(temperature, rows),
     )
-    fields = 2 + 2 * CANDIDATES
+    fields = _PACKET_HEADER_FIELDS + _HALF_DIVISOR * CANDIDATES
     packet = jnp.concatenate(
-        (maximum[:, None], lse[:, None], values, ids.astype(jnp.float32)), axis=1
+        (maximum[:, None], lse[:, None], values, ids.astype(jnp.float32)),
+        axis=1,
     ).reshape(requests, rows, fields)
     packet = jnp.broadcast_to(
-        packet[None], (TP_SIZE // requests, requests, rows, fields)
+        packet[None],
+        (TP_SIZE // requests, requests, rows, fields),
     ).reshape(TP_SIZE, rows, fields)
-    packet = jax.lax.all_to_all(packet, AXIS, split_axis=0, concat_axis=0, tiled=True)
+    packet = jax.lax.all_to_all(
+        packet,
+        AXIS,
+        split_axis=0,
+        concat_axis=0,
+        tiled=True,
+    )
     maxima, lses = packet[:, :, 0], packet[:, :, 1]
     best = jnp.max(maxima, axis=0)
     lse = best + jnp.log(jnp.sum(jnp.exp(maxima - best[None] + lses), axis=0))
-    values = packet[:, :, 2 : 2 + CANDIDATES].transpose(1, 0, 2).reshape(rows, -1)
-    ids = packet[:, :, 2 + CANDIDATES :].astype(jnp.int32)
+    val_end = _PACKET_HEADER_FIELDS + CANDIDATES
+    values = (
+        packet[:, :, _PACKET_HEADER_FIELDS:val_end].transpose(1, 0, 2).reshape(rows, -1)
+    )
+    ids = packet[:, :, val_end:].astype(jnp.int32)
     ids = ids.transpose(1, 0, 2).reshape(rows, -1)
     request = jax.lax.axis_index(AXIS) % requests
     values = _limit_candidates(values, jnp.full((rows,), top_k[request], jnp.int32))
     return values, ids, lse
 
 
-def mask_logits(local_logits: jax.Array, mask: jax.Array, rank: jax.Array) -> jax.Array:
-    """``rank``'s ``[rows, V / 32]`` logits with its disallowed tokens masked.
+def mask_logits(
+    local_logits: jax.Array,
+    mask: jax.Array,
+    rank: int | jax.Array,
+) -> jax.Array:
+    """Return ``rank``'s ``[rows, V / 32]`` logits with disallowed tokens masked.
+
+    ``rank``'s ``[rows, V / 32]`` logits with its disallowed tokens masked.
 
     ``mask`` is ``[rows, vocab_words]`` int32: bit ``j`` of word ``w`` is the
     allowed-ness of token ``32 * w + j`` (1: allowed; xgrammar's
@@ -204,42 +267,67 @@ def mask_logits(local_logits: jax.Array, mask: jax.Array, rank: jax.Array) -> ja
     """
     rows, width = local_logits.shape
     local = jax.lax.dynamic_index_in_dim(
-        mask.reshape(rows, TP_SIZE, width // 32), rank, axis=1, keepdims=False
+        mask.reshape(rows, TP_SIZE, width // BITS_PER_WORD),
+        rank,
+        axis=1,
+        keepdims=False,
     )
-    allowed = ((local[:, :, None] >> jnp.arange(32, dtype=jnp.int32)) & 1) != 0
-    return jnp.where(allowed.reshape(rows, width), local_logits, -1e30)
+    bit_shifts = jnp.arange(BITS_PER_WORD, dtype=jnp.int32)
+    allowed = ((local[:, :, None] >> bit_shifts) & 1) != 0
+    return jnp.where(allowed.reshape(rows, width), local_logits, _MASKED_LOGIT_FLOOR)
 
 
 def apply_grammar_mask(local_logits: jax.Array, mask: jax.Array) -> jax.Array:
-    """Mask each row's disallowed tokens (:func:`mask_logits` at this rank)."""
+    """Mask each row's disallowed tokens at this TP rank."""
     return mask_logits(local_logits, mask, jax.lax.axis_index(AXIS))
 
 
 def uniforms(seed: jax.Array, position: jax.Array, rows: int) -> jax.Array:
-    """``[rows, 2]`` uniforms for one step of a sequence: a function of its
-    seed and the step's (first row's) position, identical on every rank."""
+    """Return ``[rows, 2]`` deterministic uniform draws for one step.
+
+    ``[rows, 2]`` uniforms for one step of a sequence: a function of its
+    seed and the step's (first row's) position, identical on every rank.
+    """
     key = jax.random.fold_in(jax.random.PRNGKey(seed.astype(jnp.uint32)), position)
-    return jax.random.uniform(key, (rows, 2), jnp.float32)
+    return jax.random.uniform(key, (rows, _UNIFORM_COLS), jnp.float32)
 
 
-def sample_rows(local_logits, temperature, top_p, top_k, seeds, positions) -> jax.Array:
-    """``[rows]`` int32: row r drawn from its own distribution (per-row
-    ``temperature > 0``, ``top_p``, ``top_k``, ``seeds``, ``positions``)."""
+def sample_rows(
+    local_logits: jax.Array,
+    temperature: jax.Array,
+    top_p: jax.Array,
+    top_k: jax.Array,
+    seeds: jax.Array,
+    positions: jax.Array,
+) -> jax.Array:
+    """Sample ``[rows]`` int32 tokens independently from per-row parameters.
+
+    ``[rows]`` int32: row r drawn from its own distribution (per-row
+    ``temperature > 0``, ``top_p``, ``top_k``, ``seeds``, ``positions``).
+    """
     accept = _nucleus_accept()
     values, ids, lse = _candidates(local_logits, temperature, top_k)
-    # [rows, 1, 2]
+    # Note Shape [rows, 1, 2]
     draws = jax.vmap(lambda seed, position: uniforms(seed, position, 1))(
-        seeds, positions
+        seeds,
+        positions,
     )
 
-    def one(values, ids, lse, top_p, draw):
+    def one(
+        row_values: jax.Array,
+        row_ids: jax.Array,
+        row_lse: jax.Array,
+        row_top_p: jax.Array,
+        draw: jax.Array,
+    ) -> jax.Array:
+        """Draw a single token from one row's gathered candidates."""
         _, token = accept(
-            values[None],
-            ids[None],
-            lse[None],
+            row_values[None],
+            row_ids[None],
+            row_lse[None],
             jnp.full((1,), -1, jnp.int32),
             jnp.int32(0),
-            top_p,
+            row_top_p,
             draw,
         )
         return token
@@ -248,11 +336,21 @@ def sample_rows(local_logits, temperature, top_p, top_k, seeds, positions) -> ja
 
 
 def accept_rows(
-    local_logits, drafts, forced_count, temperature, top_p, top_k, seed, position
-):
-    """``(count, bonus)`` for one sequence's verify rows: ``drafts[k]`` the
-    draft verified at row k (-1: none), scalar sampling parameters,
-    ``forced_count >= 0`` to fix the count (the bonus then from row count)."""
+    local_logits: jax.Array,
+    drafts: jax.Array,
+    forced_count: jax.Array,
+    temperature: jax.Array,
+    top_p: jax.Array,
+    top_k: jax.Array,
+    seed: jax.Array,
+    position: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    """Return ``(count, bonus)`` for one sequence's verify rows.
+
+    ``drafts[k]`` is the draft verified at row k (-1: none), with scalar
+    sampling parameters and ``forced_count >= 0`` to fix the accepted count
+    (the bonus token is then drawn from row ``count``).
+    """
     rows = local_logits.shape[0]
     accept = _nucleus_accept()
     values, ids, lse = _candidates(
@@ -261,14 +359,27 @@ def accept_rows(
         jnp.full((rows,), top_k, jnp.int32),
     )
     return accept(
-        values, ids, lse, drafts, forced_count, top_p, uniforms(seed, position, rows)
+        values,
+        ids,
+        lse,
+        drafts,
+        forced_count,
+        top_p,
+        uniforms(seed, position, rows),
     )
 
 
 def accept_batched(
-    local_logits, drafts, forced_count, temperature, top_p, top_k, seed, position
-):
-    """Independent, identically seeded acceptance with replicated decisions.
+    local_logits: jax.Array,
+    drafts: jax.Array,
+    forced_count: jax.Array,
+    temperature: jax.Array,
+    top_p: jax.Array,
+    top_k: jax.Array,
+    seed: jax.Array,
+    position: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    """Run independent identically-seeded acceptance with replicated decisions.
 
     Large supported batches distribute candidate sorting by request. Small
     batches and other shapes use the replicated candidate exchange.
@@ -277,8 +388,8 @@ def accept_batched(
     if (
         1 < requests <= TP_SIZE
         and TP_SIZE % requests == 0
-        and requests * rows >= 16
-        and width * TP_SIZE <= 2**24
+        and requests * rows >= _MIN_SPLIT_ROWS
+        and width * TP_SIZE <= _FP32_EXACT_INT_BOUND
     ):
         values, ids, lse = _request_candidates(local_logits, temperature, top_k)
         request = jax.lax.axis_index(AXIS) % requests
@@ -298,7 +409,10 @@ def accept_batched(
         jnp.repeat(temperature, rows),
         jnp.repeat(top_k, rows),
     )
-    draws = jax.vmap(lambda seed, pos: uniforms(seed, pos, rows))(seed, position)
+    draws = jax.vmap(lambda req_seed, pos: uniforms(req_seed, pos, rows))(
+        seed,
+        position,
+    )
     return jax.vmap(_nucleus_accept())(
         values.reshape(requests, rows, -1),
         ids.reshape(requests, rows, -1),
@@ -311,34 +425,35 @@ def accept_batched(
 
 
 def verify_acceptance(
-    local_logits,
-    tokens,
-    positions,
-    modes,
-    parameters,
+    local_logits: jax.Array,
+    verify_rows: tuple[jax.Array, jax.Array, jax.Array],
+    parameters: tuple[jax.Array, jax.Array, jax.Array, jax.Array],
     *,
-    synthetic_rates=None,
-    single=False,
-):
-    """Replicated [requests, 2] accepted-count/bonus before KDA state commit.
+    synthetic_rates: jax.Array | None = None,
+    single: bool = False,
+) -> jax.Array:
+    """Return replicated ``[requests, 2]`` accepted-count and bonus decisions.
+
+    Replicated [requests, 2] accepted-count/bonus before KDA state commit.
 
     Runs inside the verifier's shard_map. Preserve the drafter's lowest-rank,
     lowest-token greedy ties, per-request random draws and forced cold counts.
     Synthetic acceptance takes precedence over temperature, as in the drafter.
     """
-    requests, rows = tokens.shape
+    tokens, positions, modes = verify_rows
     temperature, top_p, top_k, seed = parameters
+    requests, rows = tokens.shape
     forced = jnp.where(modes == 0, 0, -1).astype(jnp.int32)
     if synthetic_rates is not None:
         (dspark,) = kernel_modules("dspark")
+        rates = synthetic_rates[: rows - 1]
         drawn = jax.vmap(
-            lambda seed, pos: dspark.synthetic_count(
-                synthetic_rates[: rows - 1], seed, pos
-            )
+            lambda req_seed, pos: dspark.synthetic_count(rates, req_seed, pos)
         )(seed, positions)
         forced = jnp.where(modes == 0, 0, drawn).astype(jnp.int32)
 
-    def greedy_decision(_):
+    def greedy_decision(_unused: None) -> jax.Array:
+        """Compute greedy verification acceptance counts and bonus tokens."""
         targets = greedy(local_logits).reshape(requests, rows)
         match = tokens[:, 1:] == targets[:, :-1]
         first = jnp.min(jnp.where(match, rows - 1, jnp.arange(rows - 1)), axis=1)
@@ -349,9 +464,11 @@ def verify_acceptance(
     if synthetic_rates is not None:
         return greedy_decision(None)
 
-    def sampled_decision(_):
+    def sampled_decision(_unused: None) -> jax.Array:
+        """Compute nucleus-sampled verification acceptance counts and bonus tokens."""
         drafts = jnp.concatenate(
-            (tokens[:, 1:], jnp.full((requests, 1), -1, jnp.int32)), axis=1
+            (tokens[:, 1:], jnp.full((requests, 1), -1, jnp.int32)),
+            axis=1,
         )
         safe_temperature = jnp.where(temperature > 0, temperature, 1.0)
         if single:
@@ -382,11 +499,16 @@ def verify_acceptance(
             jnp.all(temperature > 0),
             lambda _: selected,
             lambda _: jnp.where(
-                (temperature > 0)[:, None], selected, greedy_decision(None)
+                (temperature > 0)[:, None],
+                selected,
+                greedy_decision(None),
             ),
             None,
         )
 
     return jax.lax.cond(
-        jnp.any(temperature > 0), sampled_decision, greedy_decision, None
+        jnp.any(temperature > 0),
+        sampled_decision,
+        greedy_decision,
+        None,
     )
