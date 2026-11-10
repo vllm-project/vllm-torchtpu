@@ -214,20 +214,24 @@ def _apply_kv_budget(vllm_config: VllmConfig) -> None:
 
 
 def apply_kernel_numerics(model_config) -> bool | None:
-    """Qwen3.5's quantized-matmul numerics, in every process that loads it.
+    """Qwen3.5's kernel numerics and code paths, in every process that loads it.
 
     The Qwen3.5 PD stack was tuned and evaluated with the quantize helpers'
-    reciprocal scale (kernels/quantized_matmul/util.RECIPROCAL_SCALE), which
-    is off by default; turn it on before the model's kernels are traced.
-    Other models keep main's arithmetic. Returns False while no model config
-    is available, so the patch registry tries again at model load.
+    reciprocal scale (kernels/quantized_matmul/util.RECIPROCAL_SCALE) and the
+    grouped matmul's hand-streamed whole-expert slabs
+    (kernels/megablox/gmm_v2.RHS_STREAM), both off by default; turn them on
+    before the model's kernels are traced. Other models keep main's arithmetic
+    and code. Returns False while no model config is available, so the patch
+    registry tries again at model load.
     """
     if model_config is None:
         return False
     if settings.is_qwen3_5(model_config):
+        from vllm_torchtpu.kernels.megablox import gmm_v2
         from vllm_torchtpu.kernels.quantized_matmul import util
 
         util.set_reciprocal_scale(True)
+        gmm_v2.set_rhs_stream(True)
     return None
 
 
