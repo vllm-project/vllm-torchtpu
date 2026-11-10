@@ -247,6 +247,13 @@ class Config:
         tables inside the dense-slots program itself, under its first weight
         refills, on the shard's unpadded rows (padding and valid-row masks in
         the program); supersedes dense_slots_pallas_tables.
+      dense_slots_skip_unrouted: the dense-slots program streams the weights
+        of only its live local experts (those with at least one routed row)
+        instead of all of them; bit-identical output, fewer weight bytes when
+        the routing leaves experts cold.
+      dense_slots_weight_slots: the dense-slots program's VMEM weight slots
+        (whole experts); it keeps slots - 1 expert refills in flight. 0 (the
+        default) means 3 slots, 2 in flight. Same values, another schedule.
     """
 
     result_slots: int = RESULT_SLOTS_DEFAULT
@@ -285,6 +292,8 @@ class Config:
     dense_slots_fused: bool = False
     dense_slots_pallas_tables: bool = False
     dense_slots_merged: bool = False
+    dense_slots_skip_unrouted: bool = False
+    dense_slots_weight_slots: int = 0
 
     @property
     def token_dtype(self):
@@ -458,6 +467,11 @@ class Config:
             raise ValueError(
                 f"dense_slots_max_tokens {self.dense_slots_max_tokens}: a "
                 "positive multiple of 8"
+            )
+        if self.dense_slots_weight_slots not in (0, 2, 3, 4, 5):
+            raise ValueError(
+                f"dense_slots_weight_slots {self.dense_slots_weight_slots}: 0 "
+                "(the default, 3) or 2..5"
             )
         if self.weight_dma_priority not in WEIGHT_DMA_PRIORITIES:
             raise ValueError(
