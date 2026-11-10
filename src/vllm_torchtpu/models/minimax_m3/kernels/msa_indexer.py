@@ -529,6 +529,12 @@ class ClassScores(NamedTuple):
     tile_start: jax.Array  # [max_num_seqs] query row of its first tile
 
 
+def _query_rows(index_q, pad):
+    """Token-ordered f32 queries with `pad` rows after the last token, which
+    the tile at the end may read past (`_class_scores`)."""
+    return jnp.pad(index_q[:, 0].astype(jnp.float32), ((0, pad), (0, 0)))
+
+
 def _class_scores(
     index_q,
     index_cache,
@@ -545,10 +551,13 @@ def _class_scores(
     token_major=False,
     scale_cache=None,
     scale_row=None,
+    q_rows=None,
 ):
     """Transposed scores ``[P, tiles * block_q]`` of one tile class, and the
     column of each token (`ClassScores`); `token_major` (kernel v3) returns
-    them as ``[tiles * block_q, P]`` instead, so a token's scores are one row."""
+    them as ``[tiles * block_q, P]`` instead, so a token's scores are one row.
+    `q_rows` (`_query_rows`, padded by at least block_q) is shared by both
+    classes."""
     num_tokens, _, head_dim = index_q.shape
     _, rows_per_page, packing, _ = index_cache.shape
     page_size = _page_tokens(rows_per_page, index_cache.dtype)
@@ -572,7 +581,9 @@ def _class_scores(
         raise NotImplementedError(
             f"at most {_SEQ_MASK + 1} requests, got {max_num_seqs}"
         )
-    q_rows = jnp.pad(index_q[:, 0].astype(jnp.float32), ((0, block_q), (0, 0)))
+    if q_rows is None:
+        q_rows = _query_rows(index_q, block_q)
+    assert q_rows.shape[0] >= num_tokens + block_q, (q_rows.shape, block_q)
     tile_info = (
         jnp.clip(tile_row0, 0, num_tokens // _ROW_ALIGN * _ROW_ALIGN) << _ROW_SHIFT
     ) | tile_seq
@@ -821,9 +832,19 @@ def class_plan(
     )
     # Aligned tile starts add up to _ROW_ALIGN - 1 rows per request.
     tiles_per_request = -(-(block_q + _ROW_ALIGN - 1) // tile)
+    # A prefill scores both classes: one padded copy of the queries for both
+    # (it paid the f32 cast and pad of [num_tokens, D] once per class). A
+    # decode step runs the large class only under a cond, so it keeps the
+    # small class's own short pad.
+    q_rows = (
+        _query_rows(index_q, max(tile, large_block_q))
+        if is_prefill_step(num_tokens, max_num_seqs)
+        else None
+    )
     small = functools.partial(
         score,
         active & ~is_large,
+        q_rows=q_rows,
         block_q=tile,
         max_tiles=min(
             tiles_per_request * max_num_seqs,
@@ -836,6 +857,7 @@ def class_plan(
     large = functools.partial(
         score,
         is_large,
+        q_rows=q_rows,
         block_q=large_block_q,
         # +1 per request for the partial last tile, plus the up-to-7 rows
         # each aligned start adds.
