@@ -37,10 +37,7 @@ from vllm_torchtpu.kernels.qwen4_exp.prefill_tiles import (
 
 
 def _kernel(
-    table_ref,
-    active_tiles_ref,
-    active_counts_ref,
-    last_page_ref,
+    metadata_hbm_ref,
     query_ref,
     bitset_ref,
     lengths_ref,
@@ -53,6 +50,8 @@ def _kernel(
     max_ref,
     mass_ref,
     accumulator_ref,
+    metadata_ref,
+    metadata_sem,
     *,
     ratio: int,
     kv_tile: int,
@@ -68,8 +67,16 @@ def _kernel(
     k_scale: float,
     v_scale: float,
     query_transposed: bool,
+    metadata_stride: int,
 ):
     block = pl.program_id(0)
+    metadata_copy = pltpu.make_async_copy(
+        metadata_hbm_ref.at[pl.ds(block * metadata_stride, metadata_stride)],
+        metadata_ref,
+        metadata_sem,
+    )
+    metadata_copy.start()
+    metadata_copy.wait()
     # The model produces BF16 queries.  A BF16 call boundary can avoid a large
     # FP32 input window while preserving the existing FP32 QK accumulation.
     query = query_ref[...]
@@ -83,11 +90,12 @@ def _kernel(
     )
     positions = lengths_ref[:, 0] - 1
     row = jnp.arange(kv_tile, dtype=jnp.int32)
-    count = active_counts_ref[block]
+    count = metadata_ref[pages_per_query + num_kv_tiles]
+    last_page = metadata_ref[pages_per_query + num_kv_tiles + 1]
 
     def active_tile(slot):
         slot = jnp.minimum(slot, num_kv_tiles - 1)
-        return active_tiles_ref[block * num_kv_tiles + slot]
+        return metadata_ref[pages_per_query + slot]
 
     def copy_tiles(tile, kv_ref, sem_ref):
         copies = []
@@ -97,8 +105,7 @@ def _kernel(
             page = logical // physical_page_size
             in_page = logical % physical_page_size
             # Masked segments repeat an owned page's DMA address.
-            address = block * pages_per_query + jnp.minimum(page, last_page_ref[block])
-            physical = table_ref[address]
+            physical = metadata_ref[jnp.minimum(page, last_page)]
             destination = (
                 kv_ref if copy_rows == kv_tile else kv_ref.at[pl.ds(offset, copy_rows)]
             )
@@ -726,6 +733,16 @@ def _prefill(
             bitset=bitset,
         )
     table, active_tiles, active_counts, block_bits_native = prepared
+    metadata = jnp.concatenate(
+        (table, active_tiles, active_counts[:, None], last_page[:, None]), axis=1
+    )
+    metadata_stride = _metadata_native_align(metadata.shape[1])
+    if (
+        metadata_stride * metadata.dtype.itemsize
+        > pltpu.get_tpu_info().smem_capacity_bytes
+    ):
+        raise ValueError("One sparse-prefill metadata row exceeds SMEM capacity")
+    metadata = jnp.pad(metadata, ((0, 0), (0, metadata_stride - metadata.shape[1])))
 
     query_tile = min(query_block, 256)
     state_shape = (
@@ -752,11 +769,13 @@ def _prefill(
             k_scale=k_scale,
             v_scale=v_scale,
             query_transposed=query_transposed,
+            metadata_stride=metadata_stride,
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=4,
+            num_scalar_prefetch=0,
             grid=(nblocks,),
             in_specs=[
+                pl.BlockSpec(memory_space=pltpu.HBM),
                 pl.BlockSpec(
                     (query_heads, head_dim, query_block)
                     if query_transposed
@@ -784,6 +803,8 @@ def _prefill(
                 pltpu.VMEM(state_shape, jnp.float32),
                 pltpu.VMEM(state_shape, jnp.float32),
                 pltpu.VMEM((*state_shape, head_dim), jnp.float32),
+                pltpu.SMEM((metadata_stride,), metadata.dtype),
+                pltpu.SemaphoreType.DMA,
             ],
         ),
         cost_estimate=pl.CostEstimate(
@@ -795,10 +816,7 @@ def _prefill(
                 * jnp.dtype(jnp.bfloat16 if bf16_io else jnp.float32).itemsize
                 + block_bits_native.nbytes
                 + lengths.nbytes
-                + table.nbytes
-                + active_tiles.nbytes
-                + active_counts.nbytes
-                + last_page.nbytes
+                + metadata.nbytes
                 + nblocks
                 * num_kv_tiles
                 * kv_tile
@@ -820,10 +838,7 @@ def _prefill(
             else "general_qsub256_state_ref_sparse_gqa_prefill"
         ),
     )(
-        table.reshape(-1),
-        active_tiles.reshape(-1),
-        active_counts,
-        last_page,
+        metadata.reshape(-1),
         (query.transpose(1, 2, 0) if query_transposed else query).astype(
             jnp.bfloat16 if bf16_io else jnp.float32
         ),

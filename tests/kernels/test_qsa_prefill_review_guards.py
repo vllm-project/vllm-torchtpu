@@ -14,6 +14,7 @@
 """CPU regressions for live sparse-prefill addressing and bounded dispatch."""
 
 import functools
+import math
 from dataclasses import replace
 
 import jax
@@ -77,6 +78,54 @@ def test_bounded_metadata_duplicate_bits_cannot_carry_to_another_group(tpu_info)
     np.testing.assert_array_equal(np.asarray(bits)[0, 1:], 0)
 
 
+@pytest.mark.parametrize("tokens", [512, 262144])
+@pytest.mark.parametrize("lanes", [64, 128])
+def test_scalar_metadata_staging_is_query_block_local(
+    monkeypatch, tpu_info, tokens, lanes
+):
+    hardware = replace(tpu_info, num_lanes=lanes)
+    monkeypatch.setattr(pltpu, "get_tpu_info", lambda: hardware)
+    seen = {}
+
+    def capture(kernel, *, out_shape, **kwargs):
+        seen.update(kwargs)
+        return lambda *args: jnp.zeros(out_shape.shape, out_shape.dtype)
+
+    monkeypatch.setattr(pl, "pallas_call", capture)
+    args = (
+        jax.ShapeDtypeStruct((tokens, 4, 128), jnp.bfloat16),
+        jax.ShapeDtypeStruct((tokens, 4), jnp.int32),
+        jax.ShapeDtypeStruct((tokens,), jnp.int32),
+        jax.ShapeDtypeStruct((tokens, 158), jnp.int32),
+        jax.ShapeDtypeStruct((158, 1664, 2, 2, 128), jnp.bfloat16),
+    )
+    result = jax.eval_shape(
+        lambda *xs: tc._prefill(
+            *xs,
+            None,
+            ratio=4,
+            kv_heads=2,
+            query_block=128,
+            kv_tile=256,
+            k_scale=1.0,
+            v_scale=1.0,
+            bf16_io=True,
+        ),
+        *args,
+    )
+    assert result.shape == args[0].shape and result.dtype == jnp.bfloat16
+    grid = seen["grid_spec"]
+    assert grid.num_scalar_prefetch == 0
+    metadata = grid.scratch_shapes[-2]
+    assert metadata.memory_space == pltpu.SMEM
+    tiles = math.ceil(args[3].shape[1] * args[4].shape[1] / 256)
+    row_words = args[3].shape[1] + tiles + 2
+    expected_words = math.ceil(row_words / lanes) * lanes
+    assert metadata.shape == (expected_words,)
+    assert metadata.dtype == jnp.int32
+    assert expected_words * metadata.dtype.itemsize <= hardware.smem_capacity_bytes
+
+
 def capture_tc(
     monkeypatch,
     query,
@@ -93,6 +142,7 @@ def capture_tc(
 
     def call(kernel, *, out_shape, **kwargs):
         captured.update(kwargs)
+        captured["kernel_config"] = kernel.keywords
 
         def run(*args):
             captured["args"] = args
@@ -125,15 +175,71 @@ def test_full_metadata_matches_bounded_and_prefetches_last_live_page(
     cache = jnp.zeros((4, 128, 2, 2, 128), jnp.bfloat16)
     captured, _ = capture_tc(monkeypatch, query, blocks, lengths, table, cache)
     args = captured["args"]
-    np.testing.assert_array_equal(args[3], [1])
+    metadata = np.asarray(args[0]).reshape(1, -1)
+    np.testing.assert_array_equal(metadata[0, :8], [0, 1, 2, 3, 0, 0, 1, 1])
+    np.testing.assert_array_equal(metadata[0, 8:], 0)
     _, _, _, expected = tc._prepare_metadata_bounded(
         blocks, lengths, table, query_block=128, physical_page_size=128
     )
-    np.testing.assert_array_equal(args[5], expected)
+    np.testing.assert_array_equal(args[2], expected)
     cost = captured["cost_estimate"]
     assert cost.flops > 0 and cost.transcendentals > 0
     assert cost.bytes_accessed >= query.nbytes + cache.nbytes
     assert captured["compiler_params"].vmem_limit_bytes < tpu_info.vmem_capacity_bytes
+
+
+def test_metadata_rows_keep_each_query_blocks_table_and_active_tiles(
+    monkeypatch, tpu_info
+):
+    query = jnp.zeros((256, 4, 128), jnp.bfloat16)
+    blocks = jnp.full((256, 4), -1, jnp.int32)
+    blocks = blocks.at[0].set(jnp.arange(4, dtype=jnp.int32))
+    blocks = blocks.at[128, 0].set(0)
+    lengths = jnp.zeros(256, jnp.int32).at[0].set(129).at[128].set(257)
+    tables = np.repeat(np.array([[2, 0, 3, 1], [1, 3, 2, 0]], np.int32), 128, 0)
+    table = jnp.asarray(tables)
+    cache = jnp.zeros((4, 128, 2, 2, 128), jnp.bfloat16)
+    captured, _ = capture_tc(monkeypatch, query, blocks, lengths, table, cache)
+    config = captured["kernel_config"]
+    columns = config["pages_per_query"]
+    tiles = config["num_kv_tiles"]
+    assert columns >= 3 and tiles == 2
+    rows = np.asarray(captured["args"][0]).reshape(2, config["metadata_stride"])
+    np.testing.assert_array_equal(rows[:, :columns], tables[[0, 128], :columns])
+    np.testing.assert_array_equal(
+        rows[:, columns : columns + 4], [[0, 0, 1, 1], [0, 1, 2, 2]]
+    )
+    np.testing.assert_array_equal(rows[:, columns + 4 :], 0)
+    np.testing.assert_array_equal(table, tables)
+
+
+def test_single_metadata_row_exceeding_smem_fails_before_launch(monkeypatch, tpu_info):
+    hardware = replace(tpu_info, smem_capacity_bytes=tpu_info.num_lanes * 4 - 1)
+    monkeypatch.setattr(pltpu, "get_tpu_info", lambda: hardware)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Unfittable metadata reached Pallas")
+
+    monkeypatch.setattr(pl, "pallas_call", forbidden)
+    query = jnp.zeros((128, 4, 128), jnp.bfloat16)
+    blocks, lengths, table = metadata_inputs()
+    cache = jnp.zeros((4, 128, 2, 2, 128), jnp.bfloat16)
+    with pytest.raises(ValueError, match="metadata row exceeds SMEM capacity"):
+        tc._prefill(
+            query,
+            blocks,
+            lengths,
+            table,
+            cache,
+            None,
+            ratio=4,
+            kv_heads=2,
+            query_block=128,
+            kv_tile=256,
+            k_scale=1.0,
+            v_scale=1.0,
+            bf16_io=True,
+        )
 
 
 @pytest.mark.parametrize("length,last", [(0, 0), (1664, 0), (1665, 1)])
@@ -146,9 +252,13 @@ def test_prefetch_bound_ignores_padded_table_capacity(
     table = jnp.zeros((128, 158), jnp.int32).at[:, 2:].set(999999)
     cache = jnp.zeros((2, 1664, 2, 2, 128), jnp.bfloat16)
     captured, _ = capture_tc(monkeypatch, query, blocks, lengths, table, cache)
-    assert int(captured["args"][3][0]) == last
+    words = np.asarray(captured["args"][0])
+    columns = captured["kernel_config"]["pages_per_query"]
+    tiles = captured["kernel_config"]["num_kv_tiles"]
+    assert int(words[columns + tiles + 1]) == last
+    np.testing.assert_array_equal(words[:columns], table[0, :columns])
     if length == 0:
-        np.testing.assert_array_equal(captured["args"][2], 0)
+        assert int(words[columns + tiles]) == 0
 
 
 def test_ratio8_page1664_general_tile_is_legal(monkeypatch, tpu_info):
@@ -161,7 +271,8 @@ def test_ratio8_page1664_general_tile_is_legal(monkeypatch, tpu_info):
         monkeypatch, query, blocks, lengths, table, cache, ratio=8
     )
     assert result.shape == query.shape
-    assert int(captured["args"][3][0]) == 0
+    tiles = math.ceil(table.shape[1] * cache.shape[1] / 256)
+    assert int(captured["args"][0][table.shape[1] + tiles + 1]) == 0
 
 
 def test_ragged_general_tc_uses_bounded_pack_and_each_requests_table(
@@ -262,7 +373,7 @@ def test_tc_hint_counts_cast_boundaries_and_main_matrix_products(
     )
     args = captured["args"]
     boundary_dtype = jnp.bfloat16 if bf16_io else jnp.float32
-    assert args[4].dtype == output.dtype == boundary_dtype
+    assert args[1].dtype == output.dtype == boundary_dtype
     repeated_kv_bytes = 4 * 128 * 2 * 2 * 128 * 2
     cost = captured["cost_estimate"]
     assert cost.flops == 4 * 128 * 4 * 128 * 128 * 4
