@@ -215,8 +215,10 @@ def _page_tokens(rows_per_page: int, dtype) -> int:
 
 # Pages per dot in `_kernel_v3`: 2 x 16 pages, paired along the contraction.
 _PAGES_PER_CHUNK = 32
-# `_kernel_v3` issues the next group's descriptors during its first chunks.
+# `_kernel_v3` issues the ahead group's descriptors during its first chunks.
 _DMA_ISSUE_CHUNKS = 2
+# Page groups in `_kernel_v3`'s DMA ring.
+_RING_SLOTS = 3
 # Folded 4-bit and fp8 tiles of up to this many rows score transposed
 # (`_chunk_maxima_t`, maxima across lanes); larger ones score token-major
 # (maxima across sublanes), a folded page with its slot scales folded into
@@ -354,25 +356,29 @@ def _kernel_v3(
     # Out
     o_ref,  # [G, Bq], or [Bq, G] if `transposed`
     # Scratch
-    buf,  # [2, G, S / p, D] pages of even and odd steps, as 32-bit words
-    sems,  # DMA semaphores [2], one per ring slot
+    buf,  # [R, G, S / p, D] ring of R groups of pages, as 32-bit words
+    sems,  # DMA semaphores [R], one per ring slot
     *,
     transposed=False,
 ):
-    """`_kernel_v2` with the pages fetched by a hand-written double-buffered
-    DMA ring: one scalar address per page and no copy for pages past the
-    request's end (their scores are never read).
+    """`_kernel_v2` with the pages fetched by a hand-written DMA ring of
+    `_RING_SLOTS` groups: one scalar address per page and no copy for pages
+    past the request's end (their scores are never read). A step issues the
+    group `_RING_SLOTS - 1` steps ahead: with one group ahead, each step
+    waited out its pages' DMA latency (~1.3 us per step at 64 or 128 pages,
+    bench j-9956cd34).
 
     Each ring slot has straight-line bodies (static buffers, so the
-    scheduler sees the next group's copies do not touch the pages being
-    scored), and the next group's descriptors are issued among this group's
-    matmuls. A wait between chunks would drain the MXU pipeline, so all of
-    the group's pages are waited for first.
+    scheduler sees the ahead group's copies do not touch the pages being
+    scored), and the ahead group's descriptors are issued among this
+    group's matmuls. A wait between chunks would drain the MXU pipeline, so
+    all of the group's pages are waited for first.
 
     A folded 4-bit page (`msa_fp4.scales_in_page`) is ``S / 8`` word rows of
     int4 keys and one row of f32 slot scales (`_chunk_maxima_t`).
     """
-    _, pages_per_step, rows, head_dim = buf.shape
+    slots, pages_per_step, rows, head_dim = buf.shape
+    ahead = slots - 1
     block_q = q_ref.shape[0]
     folded = msa_fp4.scales_in_page(rows, cache_ref.dtype)
     page_size = _page_tokens(rows, cache_ref.dtype)
@@ -402,28 +408,53 @@ def _kernel_v3(
             sems.at[slot],
         )
 
+    def wait_pages(live, slot):
+        """Wait for the slot's `live` page copies: the slot's semaphore counts
+        their bytes, so one wait per set bit of `live` waits for them all
+        (a wait per page cost two serial bundles each)."""
+        live = jnp.minimum(live, pages_per_step)
+        n = 1
+        while n <= pages_per_step:
+            pl.when((live & n) != 0)(fake_copy(n, slot).wait)
+            n *= 2
+
+    def fake_copy(n, slot):
+        """A descriptor of `n` pages' bytes on the slot's semaphore, to wait on."""
+        return pltpu.make_async_copy(
+            words.at[pl.ds(0, n)], buf.at[slot, pl.ds(0, n)], sems.at[slot]
+        )
+
     def start(base, live, pages, slot):
+        """Start the copies of a group's `pages` that are below its `live`
+        pages, alternate pages on the second DMA queue (priority 1)."""
         for g in pages:
-            pl.when(g < live)(copy(base, g, slot).start)
+            pl.when(g < live)(
+                functools.partial(copy(base, g, slot).start, priority=g % 2)
+            )
+
+    def ahead_group(k):
+        """(first entry, live pages) of work item `k`; none past the grid."""
+        k_base, k_live = group(jnp.minimum(k, num_steps - 1))
+        return k_base, jnp.where(k < num_steps, k_live, 0)
 
     @pl.when(step == 0)
     def _():
-        start(*group(step), range(pages_per_step), 0)
+        for k in range(ahead):
+            start(*ahead_group(k), range(pages_per_step), k)
 
     base, live = group(step)
-    next_base, next_live = group(jnp.minimum(step + 1, num_steps - 1))
-    next_live = jnp.where(step + 1 < num_steps, next_live, 0)
+    next_base, next_live = ahead_group(step + ahead)
     q_pair = _paired_query(q_ref[...].astype(jnp.bfloat16))
     num_chunks = pages_per_step // chunk
-    # The next group's descriptors, spread over the first chunks' page pairs:
-    # issued late in the step, a descriptor's DMA latency shows at the next
-    # step's wait.
+    # The ahead group's descriptors, spread over the first chunks' page pairs
+    # (in one chunk they crowd its scalar slots, in all chunks they issue
+    # late: both slower, benches j-9956cd34 / j-2e0b290e).
     issue_chunks = min(_DMA_ISSUE_CHUNKS, num_chunks)
     per_pair = -(-pages_per_step // (issue_chunks * (chunk // 2)))
 
     def score_chunk(slot, first, share):
-        """Score pages ``[first, first + chunk)``, issuing the next group's
-        descriptors `share` among the first page pairs."""
+        """Score pages ``[first, first + chunk)``, issuing the ahead group's
+        descriptors `share` among the first page pairs (`start`)."""
 
         def issue(j):
             if j < chunk // 2:
@@ -431,7 +462,7 @@ def _kernel_v3(
                     next_base,
                     next_live,
                     share[j * per_pair : (j + 1) * per_pair],
-                    1 - slot,
+                    (slot + ahead) % slots,
                 )
 
         if _scores_transposed(block_q, rows, cache_ref.dtype):
@@ -489,9 +520,8 @@ def _kernel_v3(
     def body(slot, scored):
         """Score the group's first `scored` chunks; the rest are past the
         request's last page (their scores are never read) and only issue
-        their share of the next group's descriptors."""
-        for g in range(pages_per_step):
-            pl.when(g < live)(copy(base, g, slot).wait)
+        their share of the ahead group's descriptors."""
+        wait_pages(live, slot)
         for c in range(num_chunks):
             pages = range(
                 min(c * share, pages_per_step), min((c + 1) * share, pages_per_step)
@@ -499,16 +529,16 @@ def _kernel_v3(
             if c < scored:
                 score_chunk(slot, c * chunk, pages)
             else:
-                start(next_base, next_live, pages, 1 - slot)
+                start(next_base, next_live, pages, (slot + ahead) % slots)
 
     # One straight-line body per slot and count of scored chunks, so that a
     # chunk's matmuls overlap the previous chunk's maxima.
     counts = sorted({num_chunks} | {2**k for k in range(1, 8) if 2**k < num_chunks})
     live_chunks = jnp.minimum(-(-live // chunk), num_chunks)
-    for slot in (0, 1):
+    for slot in range(slots):
         for i, n in enumerate(counts):
             lo = counts[i - 1] if i else 0
-            pl.when((step % 2 == slot) & (live_chunks > lo) & (live_chunks <= n))(
+            pl.when((step % slots == slot) & (live_chunks > lo) & (live_chunks <= n))(
                 functools.partial(body, slot, n)
             )
 
@@ -719,9 +749,10 @@ def _class_scores(
                 out_specs=out_specs,
                 scratch_shapes=[
                     pltpu.VMEM(
-                        (2, pages_per_step, rows_per_page, head_dim), jnp.uint32
+                        (_RING_SLOTS, pages_per_step, rows_per_page, head_dim),
+                        jnp.uint32,
                     ),
-                    pltpu.SemaphoreType.DMA((2,)),
+                    pltpu.SemaphoreType.DMA((_RING_SLOTS,)),
                 ],
             ),
             out_shape=out_shape,
