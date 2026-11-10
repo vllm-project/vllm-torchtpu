@@ -378,6 +378,7 @@ if TYPE_CHECKING:
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
     VLLM_TPU_STATIC_POOLER: bool = True
     VLLM_TPU_POOLING_KV_CACHE_TOKENS: int = -1
+    VLLM_TPU_KV_BUDGET_PIN_TOLERANCE: float = 0.01
     VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS: int = 8
     VLLM_TPU_MEGAKERNEL: str = ""
     VLLM_TPU_MK_OWN_OPERANDS: bool = True
@@ -2287,6 +2288,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # deterministic cap from the scheduler config, 0 disables the cap (all
     # post-profile HBM goes to KV), N > 0 caps KV at N tokens.
     "VLLM_TPU_POOLING_KV_CACHE_TOKENS": env_int("VLLM_TPU_POOLING_KV_CACHE_TOKENS", -1),
+    # Reuse the KV byte budget an earlier start with the same compile hash
+    # recorded (under VLLM_CACHE_ROOT) when it fits and is within this
+    # fraction of the measured budget, so the KV block count, and with it the
+    # backbone compile hash, is stable across restarts and a restored compile
+    # cache is actually read. 0 disables (see worker/kv_budget_pin.py).
+    "VLLM_TPU_KV_BUDGET_PIN_TOLERANCE": env_float(
+        "VLLM_TPU_KV_BUDGET_PIN_TOLERANCE", 0.01
+    ),
     # SrptPrefillScheduler: consecutive steps a running prefill chunk may go
     # without getting one KV block of tokens before it moves ahead of the
     # other prefill chunks and is no longer held (0 disables hold-back).

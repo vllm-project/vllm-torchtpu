@@ -39,6 +39,7 @@ from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.parallel_requirements import requires_dp_collectives
 from vllm_torchtpu.runner.tpu_pooling import compute_pooling_kv_cache_cap_bytes
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+from vllm_torchtpu.worker.kv_budget_pin import pin_kv_budget
 from vllm_torchtpu.worker.runai_repull import ensure_runai_aux_files
 from vllm_torchtpu.worker.tpu_rank_binding import get_tpu_worker_binding
 
@@ -519,6 +520,13 @@ class TPUWorker(WorkerBase):
         sized = adapter_budget() if callable(adapter_budget) else None
         if isinstance(sized, int):
             local_available = sized
+        # Same budget as an earlier start with the same compile hash, so the
+        # KV block count and the backbone compile hash do not move with HBM
+        # measurement noise and a restored compile cache is used. Before the
+        # cross-rank minimum, so every rank still agrees afterwards.
+        local_available = pin_kv_budget(
+            self.vllm_config, local_available, write=self.local_rank == 0
+        )
         available = utils.min_across_ep_dp(self.parallel_config, local_available)
 
         total_hbm_limit_gb = round(budget.total_limit / utils.GBYTES, 2)
