@@ -5632,6 +5632,13 @@ class TPUModelRunner(GPUModelRunner):
         self.device = self.device_config.device
         self.vllm_config.device_config = self.device_config
 
+        additional = self.vllm_config.additional_config
+        if isinstance(additional, dict) and "moe_skinny_gmm" in additional:
+            from vllm_torchtpu.kernels.megablox import gmm_v2
+
+            gmm_v2.set_skinny_gmm_path(additional["moe_skinny_gmm"])
+            logger.info("MoE skinny gmm path: %s", gmm_v2.skinny_gmm_path())
+
         # Set TPU-specific quantization config before model loading.
         # This ensures that TPU-compatible quantization methods are used
         # instead of the default GPU-based ones (e.g., MXFP4 for MoE models).
@@ -5741,10 +5748,26 @@ class TPUModelRunner(GPUModelRunner):
 
             draft = self._async_drafter.draft_model if self._is_async_drafter else None
             arm(self.model, draft)
+        if envs.TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES > 0:
+            from vllm_torchtpu.distributed import pallas_all_reduce
 
-        from vllm_torchtpu.distributed import small_all_reduce
+            pallas_all_reduce.arm(self.model_config.get_hidden_size(), self.device)
 
-        small_all_reduce.arm_from_config(self.vllm_config, self.device)
+            # One small-AR path at a time: the env path (annyan's, at the
+            # device communicator) replaces additional_config
+            # tp_small_all_reduce (at GroupCoordinator.all_reduce).
+            additional = self.vllm_config.additional_config
+            if isinstance(additional, dict) and additional.get(
+                "tp_small_all_reduce", False
+            ):
+                logger.warning(
+                    "tp_small_all_reduce ignored: TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES "
+                    "is set and routes the small TP all-reduces itself."
+                )
+        else:
+            from vllm_torchtpu.distributed import small_all_reduce
+
+            small_all_reduce.arm_from_config(self.vllm_config, self.device)
 
     def load_lora_model(
         self,

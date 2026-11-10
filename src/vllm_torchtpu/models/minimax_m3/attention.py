@@ -13,6 +13,8 @@
 # limitations under the License.
 """MiniMax Sparse Attention layer on TPU."""
 
+import functools
+
 import torch
 from torch import nn
 from transformers import PreTrainedConfig
@@ -72,8 +74,7 @@ class MiniMaxM3Cache(nn.Module, TpuOwnedKVCache):
         super().__init__()
         self.row_width = row_width
         # 4-bit pages that carry their per-slot f32 scales in one extra word
-        # row (`kernels.msa_fp4.scales_in_page`): row_width / tokens scales per
-        # slot (index keys: 1; K/V rows of G heads: 2G).
+        # row (`kernels.msa_fp4.scales_in_page`); needs row_width == block size.
         self.scales_in_page = scales_in_page and dtype == torch.uint8
         self.dtype = dtype
         self.prefix = prefix
@@ -97,8 +98,8 @@ class MiniMaxM3Cache(nn.Module, TpuOwnedKVCache):
         # stores 1 / token_shards of the rows, budgeted as a narrower row.
         # A 4-bit (uint8) row takes row_width / 2 bytes.
         width = self.row_width // 2 if self.dtype == torch.uint8 else self.row_width
-        if self.scales_in_page:  # + one f32 scale per vector of the row
-            width += 4 * (self.row_width // (self.block_size // self.token_shards))
+        if self.scales_in_page:  # + one f32 scale per token
+            width += 4
         return MLAAttentionSpec(
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=1,
@@ -111,10 +112,9 @@ class MiniMaxM3Cache(nn.Module, TpuOwnedKVCache):
         if self.dtype == torch.uint8:
             # 4-bit: 8 tokens per 32-bit word of 4 bytes (`kernels.msa_fp4`),
             # plus the scale row when the page carries its scales.
-            if self.scales_in_page and self.row_width % tokens:
+            if self.scales_in_page and self.row_width != tokens:
                 raise NotImplementedError(
-                    f"folded scales need a row width that is a multiple of "
-                    f"{tokens}, got {self.row_width}"
+                    f"folded scales need a {tokens}-wide row, got {self.row_width}"
                 )
             return (num_blocks, tokens // 8 + self.scales_in_page, 4, self.row_width)
         if self.token_shards == 1:
@@ -124,6 +124,31 @@ class MiniMaxM3Cache(nn.Module, TpuOwnedKVCache):
 
     def get_attn_backend(self) -> type[AttentionBackend]:
         return PallasMLAttentionBackend
+
+
+class MiniMaxM3ScaleCache(MiniMaxM3Cache):
+    """Scale pages of a layer's 4-bit caches: ``[pages, R, 128]`` f32, one
+    page per KV block, lanes = the block's tokens (`kernels.msa_fp4`)."""
+
+    def __init__(self, kv_heads: int, prefix: str) -> None:
+        super().__init__(msa_fp4.scale_rows(kv_heads), torch.float32, prefix)
+        if self.block_size != msa_fp4.SCALE_LANES:
+            raise NotImplementedError(
+                f"4-bit MSA caches need block size {msa_fp4.SCALE_LANES}, "
+                f"got {self.block_size}."
+            )
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+        # R f32 per token = one [R, 128] page per block.
+        return MLAAttentionSpec(
+            block_size=vllm_config.cache_config.block_size,
+            num_kv_heads=1,
+            head_size=self.row_width,
+            dtype=torch.float32,
+        )
+
+    def kv_cache_shape(self, num_blocks: int) -> tuple[int, ...] | None:
+        return (num_blocks, self.row_width, msa_fp4.SCALE_LANES)
 
 
 # --additional-config key: shard the MSA index-K cache over the TP group
@@ -139,6 +164,27 @@ def shard_index_cache_enabled(vllm_config: VllmConfig) -> bool:
     if not isinstance(enabled, bool):
         raise ValueError(f"additional_config.{SHARD_INDEX_CACHE_KEY} must be a bool")
     return enabled
+
+
+@functools.cache
+def _dcp_rank_tensor(rank: int, device: str) -> torch.Tensor:
+    """One ``int32[1]`` rank tensor shared by every MSA layer's buffer.
+
+    Dynamo lifts a tensor shared by several modules as one graph input, so
+    XLA can CSE the rank-dependent step metadata (KV-write runs, indexer work
+    list) across layers instead of recomputing it in every layer. The sharing
+    holds because the model is built on the target device: a later
+    ``Module.to`` would give each layer its own copy again.
+    """
+    return torch.tensor([rank], dtype=torch.int32, device=device)
+
+
+@functools.cache
+def _hadamard_tensor(n: int, device: str) -> torch.Tensor:
+    """The bf16 Sylvester Hadamard matrix of `msa_fp4`, shared by every MSA
+    layer as `_dcp_rank_tensor` is (a module buffer: built at load time,
+    outside the traced forward)."""
+    return torch.tensor(msa_fp4.hadamard(n), dtype=torch.bfloat16, device=device)
 
 
 def cache_dtype(cache_config: CacheConfig | None) -> torch.dtype:
@@ -293,14 +339,8 @@ class MiniMaxM3SparseAttention(nn.Module):
         self.kv_head_replicas = max(1, tp_size // config.num_key_value_heads)
         self.dcp_kv_heads = max(1, self.dcp_size // self.kv_head_replicas)
         dtype = cache_dtype(cache_config)
-        # 4-bit K/V pages carry their scales in a last word row: lanes
-        # [256 h, 256 h + 128) the K scales of head h, the next 128 its V
-        # scales (`kernels.msa_fp4.kv_scales`), so attention reads one page.
         self.kv_cache = MiniMaxM3Cache(
-            2 * self.head_dim * self.dcp_kv_heads,
-            dtype,
-            prefix=f"{prefix}.attn",
-            scales_in_page=True,
+            2 * self.head_dim * self.dcp_kv_heads, dtype, prefix=f"{prefix}.attn"
         )
         self.index_cache = MiniMaxM3Cache(
             self.index_head_dim,
@@ -311,19 +351,16 @@ class MiniMaxM3SparseAttention(nn.Module):
             scales_in_page=True,
         )
         self.fp4 = dtype == torch.uint8
+        self.scale_cache = None
         if self.fp4:
             if self.index_shards > 1:
                 raise NotImplementedError(
                     "--kv-cache-dtype int4_per_token_head needs an unsharded "
                     f"index cache; got {self.index_shards} index shards."
                 )
-            block_size = vllm_config.cache_config.block_size
-            if block_size != msa_fp4.SCALE_LANES or self.head_dim != block_size:
-                raise NotImplementedError(
-                    f"4-bit MSA caches need block size {msa_fp4.SCALE_LANES} "
-                    f"and head dim {msa_fp4.SCALE_LANES}, got {block_size} and "
-                    f"{self.head_dim}."
-                )
+            self.scale_cache = MiniMaxM3ScaleCache(
+                self.dcp_kv_heads, prefix=f"{prefix}.attn.scale_cache"
+            )
         msa_config = (
             scaling,
             sparse_cfg["sparse_topk_blocks"],
@@ -345,9 +382,15 @@ class MiniMaxM3SparseAttention(nn.Module):
             # every DCP rank compiles the same program (see get_msa_dcp_op).
             self.register_buffer(
                 "dcp_rank",
-                torch.tensor([get_dcp_rank()], dtype=torch.int32),
+                _dcp_rank_tensor(get_dcp_rank(), str(torch.get_default_device())),
                 persistent=False,
             )
+            if self.fp4:  # each rank rotates its own query heads (get_msa_dcp_op)
+                self.register_buffer(
+                    "hadamard",
+                    _hadamard_tensor(self.head_dim, str(torch.get_default_device())),
+                    persistent=False,
+                )
         elif self.index_shards > 1:
             self.msa_op = get_msa_sharded_op(
                 *msa_config, get_tensor_model_parallel_rank(), self.index_shards
@@ -383,6 +426,10 @@ class MiniMaxM3SparseAttention(nn.Module):
                 # Every rank scores all index heads on its share of the keys.
                 index_q = get_tp_group().all_gather(index_q.contiguous(), dim=1)
             extra = {"dcp_rank": self.dcp_rank} if self.dcp_size > 1 else {}
+            if self.scale_cache is not None:
+                extra["scale_cache"] = self.scale_cache.kv_cache
+                if self.dcp_size > 1:
+                    extra["hadamard"] = self.hadamard
             attn_output = self.msa_op(
                 q.view(num_tokens, self.num_heads, self.head_dim),
                 k.view(num_tokens, self.num_kv_heads, self.head_dim),

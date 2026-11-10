@@ -33,7 +33,6 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.models.minimax_m3.kernels import msa_fp4
 from vllm_torchtpu.models.minimax_m3.kernels.packed_page import (
     check_page_dtype,
     slot_ids,
@@ -53,19 +52,40 @@ DEFAULT_KERNEL = "v2"
 # Tokens per kernel call. The work list lives in SMEM, sized for the worst
 # case of tokens * topk pages.
 MAX_TOKENS_PER_CALL = 2048
+# A group's meta word: its row in the unions (`_work_list`) << _ROW_SHIFT, and
+# whether it is its tile's first and last group.
 _FIRST_BIT = 1
 _LAST_BIT = 2
-_TILE_SHIFT = 2
+_ROW_SHIFT = 2
 # The score tile is (heads * block_q) x (pages_per_step * page_size) f32.
 _VMEM_LIMIT_BYTES = 48 * 1024 * 1024
 _MASK_VALUE = -1e30
 _NO_PAGE = jnp.iinfo(jnp.int32).max
 
 
+def _groups_per_tile(block_q: int, topk: int, pages_per_step: int) -> int:
+    """Union rows of `pages_per_step` pages per tile: a power of two, so a
+    meta word's row gives its tile by a shift (`_meta_tile`). Other shapes
+    than the served ones (block_q 8/16, topk 16, 16 pages per step) can pad
+    the SMEM work list up to 2x."""
+    groups = -(-block_q * topk // pages_per_step)
+    return 1 << (groups - 1).bit_length()
+
+
+def _slot(meta, pages_per_step: int, g: int):
+    """Index in the unions of slot `g` of the group with meta word `meta`."""
+    return (meta >> _ROW_SHIFT) * pages_per_step + g
+
+
+def _meta_tile(meta, groups_per_tile: int):
+    """The tile of the group with meta word `meta`."""
+    return meta >> (_ROW_SHIFT + groups_per_tile.bit_length() - 1)
+
+
 def _kernel_v1(
     # Scalar prefetch
-    work_page_ref,  # [groups * G] page of each group slot, -1 for none
-    work_meta_ref,  # [groups] tile << _TILE_SHIFT | last and first bits
+    work_page_ref,  # tile page unions (`_work_list`), -1 past a union
+    work_meta_ref,  # [groups] union row << _ROW_SHIFT | last and first bits
     # In
     q_ref,  # [H, Bq, D]
     selected_ref,  # [Bq, K] physical pages, -1 padded
@@ -96,7 +116,7 @@ def _kernel_v1(
     per_array = page_size // packing
     value_slot = (row % per_array) * packing + row // per_array
     for g, kv_ref in enumerate(kv_refs):
-        page = work_page_ref[w * pages_per_step + g]
+        page = work_page_ref[_slot(meta, pages_per_step, g)]
         rows = unpack_page(kv_ref)
         is_selected = jnp.max(
             (selected == page).astype(jnp.int32), axis=1, keepdims=True
@@ -188,17 +208,20 @@ def _bitcast_slots(rows_per_page: int, packing: int) -> jax.Array:
     return slots[:, :1]  # [S, 1]
 
 
-def _fp4_page(kv_ref):
-    """One KV head's block of a folded 4-bit page (uint8 ``[1, S / 8 + 1, 4,
-    2D]``, `msa_fp4`) -> unscaled bf16 rows ``[S, 2D]`` in slot order, and its
-    K / V scales as ``[1, S]`` lane vectors: lanes ``[0, S)`` / ``[S, 2S)`` of
-    the block's last word row (`msa_fp4.kv_scales`). An unwritten slot's
-    scale may be any bits: non-finite reads 0 (int4 data has no NaN code)."""
+def _fp4_page(kv_ref, scale_ref, k_row, v_row):
+    """4-bit page (uint8 ``[1, S / 8, 4, 2D]``, `msa_fp4`) -> unscaled bf16
+    rows ``[S, 2D]`` in slot order, and its K / V scales (scale-page rows
+    `k_row` / `v_row`, static ints or run-time scalars) as ``[1, S]`` lane
+    vectors. An unwritten slot's scale may be any bits: non-finite reads 0
+    (int4 data itself has no NaN code)."""
     words = kv_ref.bitcast(jnp.uint32)[0, :, 0, :]
-    rows = pltpu.bitcast(words[:-1], jnp.int4).astype(jnp.bfloat16)
-    scales = pltpu.bitcast(words[-1:], jnp.float32)  # [1, 2D]
-    page_size = rows.shape[0]
-    sk, sv = scales[:, :page_size], scales[:, page_size : 2 * page_size]
+    rows = pltpu.bitcast(words, jnp.int4).astype(jnp.bfloat16)
+    if isinstance(k_row, int):  # static rows
+        page = scale_ref[0]  # [R, S]
+        sk, sv = page[k_row : k_row + 1], page[v_row : v_row + 1]
+    else:  # rows picked at run time (one kernel for every KV head)
+        sk = scale_ref[0, pl.ds(k_row, 1), :]
+        sv = scale_ref[0, pl.ds(v_row, 1), :]
     return (
         rows,
         jnp.where(jnp.isfinite(sk), sk, 0.0),
@@ -208,66 +231,51 @@ def _fp4_page(kv_ref):
 
 def page_tokens(kv_cache) -> int:
     """Tokens per page of a packed cache (4-bit uint8 caches: 8 per word)."""
-    if kv_cache.dtype == jnp.uint8:
-        return msa_fp4.page_tokens(kv_cache)
-    return kv_cache.shape[1] * kv_cache.shape[2]
+    rows, word = kv_cache.shape[1:3]
+    return rows * (8 if kv_cache.dtype == jnp.uint8 else word)
 
 
-def check_cache(kv_cache) -> None:
-    """A 4-bit (uint8) cache must carry its K/V scales in its pages
-    (`msa_fp4.scales_in_page`)."""
+def check_cache(kv_cache, scale_cache) -> None:
+    """A 4-bit (uint8) cache needs its scale cache; others must not have one."""
     if kv_cache.dtype == jnp.uint8:
-        if kv_cache.shape[2] != 4 or not msa_fp4.scales_in_page(
-            kv_cache.shape[1], kv_cache.dtype
-        ):
+        if scale_cache is None or kv_cache.shape[2] != 4:
             raise NotImplementedError(
-                "4-bit MSA caches are uint8 [pages, S / 8 + 1, 4, W] with the "
-                "K/V scales folded into the last word row."
+                "4-bit MSA caches are uint8 [pages, S / 8, 4, W] with a scale cache."
             )
         return
+    if scale_cache is not None:
+        raise ValueError("scale_cache is only for 4-bit (uint8) caches.")
     check_page_dtype(kv_cache.shape[2], kv_cache.dtype)
-
-
-def check_fp4_rows(kv_cache, head_dim) -> None:
-    """A folded 4-bit page keeps head ``h``'s K / V scales at lanes ``2hS`` /
-    ``(2h + 1)S`` of its last row, inside the head's ``2D``-wide column block
-    only when ``D == S``."""
-    if kv_cache.dtype == jnp.uint8 and page_tokens(kv_cache) != head_dim:
-        raise NotImplementedError(
-            f"4-bit pages of {page_tokens(kv_cache)} tokens need head dim "
-            f"{page_tokens(kv_cache)}, got {head_dim}."
-        )
 
 
 def _kernel_v2(
     # Scalar prefetch
-    work_page_ref,  # [groups * G] page (or page key) of each slot, -1 for none
-    work_meta_ref,  # [groups] tile << _TILE_SHIFT | last and first bits
+    work_page_ref,  # tile page (or page key) unions, -1 past a union
+    work_meta_ref,  # [groups] union row << _ROW_SHIFT | last and first bits
     page_table_ref,  # page key -> physical page (read by the index maps only)
     # In
     q_ref,  # [H, Bq, D]
     selected_ref,  # [Bq, K] physical pages, -1 padded
     local_page_ref,  # [Bq, 1]
     local_limit_ref,  # [Bq, 1] visible slots of the local page
-    *refs,  # G KV pages (4-bit: scales folded in), then out and scratch
+    *refs,  # G KV pages, [G scale pages (4-bit)], then out and scratch
     sm_scale: float,
-    fp4: bool = False,
+    fp4_rows: tuple[int, int] | None = None,
 ):
     """`_kernel_v1` with pages unpacked by one bitcast each, and one mask
     select per score: masked scores are -inf against a finite running max,
     so their exp is already 0."""
-    pages_per_step = len(refs) - 4
+    fp4 = fp4_rows is not None
+    pages_per_step = (len(refs) - 4) // (2 if fp4 else 1)
     kv_refs = refs[:pages_per_step]
-    o_ref, m_ref, l_ref, acc_ref = refs[pages_per_step:]
+    scale_refs = refs[pages_per_step : 2 * pages_per_step] if fp4 else ()
+    refs = refs[len(refs) - 4 :]
+    o_ref, m_ref, l_ref, acc_ref = refs
     w = pl.program_id(0)
     meta = work_meta_ref[w]
     num_heads, block_q, head_dim = q_ref.shape
     rows_per_page, packing = kv_refs[0].shape[1:3]
-    page_size = (
-        msa_fp4.data_rows(rows_per_page) * msa_fp4.TOKENS_PER_WORD
-        if fp4
-        else rows_per_page * packing
-    )
+    page_size = rows_per_page * (8 if fp4 else packing)
 
     @pl.when((meta & _FIRST_BIT) != 0)
     def _init():
@@ -286,7 +294,7 @@ def _kernel_v2(
     local_limit = local_limit_ref[...]
     keys, values, masks, k_scales, v_scales = [], [], [], [], []
     for g, kv_ref in enumerate(kv_refs):
-        page = work_page_ref[w * pages_per_step + g]
+        page = work_page_ref[_slot(meta, pages_per_step, g)]
         is_selected = jnp.max(
             (selected == page).astype(jnp.int32), axis=1, keepdims=True
         )
@@ -298,7 +306,7 @@ def _kernel_v2(
         # fp8 value rows; an AND on the packed bf16 words.
         seen = jnp.max(limit)
         if fp4:
-            rows, sk, sv = _fp4_page(kv_ref)
+            rows, sk, sv = _fp4_page(kv_ref, scale_refs[g], *fp4_rows)
             values.append(rows[:, head_dim:])
             k_scales.append(sk)
             v_scales.append(sv)
@@ -348,34 +356,52 @@ def _kernel_v2(
 _KERNELS = {"v1": _kernel_v1, "v2": _kernel_v2}
 
 
-def tile_unions(per_tile: jax.Array) -> jax.Array:
-    """``jnp.unique(row, size=row.size, fill_value=_NO_PAGE)`` of every row
-    of ``per_tile [..., N]``: each row's distinct values ascending, then
-    `_NO_PAGE` padding.
+# `_work_list` builds small batches' unions from dense compares when the
+# pairwise array (tiles x union^2) is at most this.
+_DENSE_WORK_LIST_ELEMS = 1 << 20
 
-    Built as sort, duplicates -> `_NO_PAGE`, sort again, so the result is the
-    same array as `jnp.unique`'s but without its compaction (a cumsum and a
-    SparseCore scatter and gathers: ~165 of its ~180 us per layer at 8K
-    prefill, DCP4, j-87d27e25; a row sort of these shapes is ~17 us).
-    `_NO_PAGE` is the int32 maximum, so the second sort moves the removed
-    duplicates behind the distinct values without reordering them."""
-    ordered = jax.lax.sort(per_tile, dimension=per_tile.ndim - 1, is_stable=False)
-    repeat = jnp.concatenate(
-        [
-            jnp.zeros_like(ordered[..., :1], dtype=bool),
-            ordered[..., 1:] == ordered[..., :-1],
-        ],
-        axis=-1,
+
+def _dense_unions(per_tile: jax.Array) -> jax.Array:
+    """Each row's distinct pages, ascending, `_NO_PAGE` filled, from pairwise
+    compares and one-hot selects only.
+
+    A decode batch has one to a few tiles, where sorts are tiny XLA ops of
+    fixed cost each (~14 us per layer in the b1 decode twin, j-b312f26a);
+    dense compares of a few vregs each fuse into a handful.
+    """
+    union_size = per_tile.shape[1]
+    lane = jnp.arange(union_size, dtype=jnp.int32)
+    x_i, x_j = per_tile[:, :, None], per_tile[:, None, :]
+    seen = jnp.any((x_j == x_i) & (lane[None, :] < lane[:, None]), axis=2)
+    first = (per_tile != _NO_PAGE) & ~seen
+    # Each distinct page's slot in the ascending union.
+    place = jnp.sum(first[:, None, :] & (x_j < x_i), axis=2, dtype=jnp.int32)
+    return jnp.min(
+        jnp.where(first[:, :, None] & (place[:, :, None] == lane), x_i, _NO_PAGE),
+        axis=1,
     )
-    unique = jnp.where(repeat, _NO_PAGE, ordered)
-    return jax.lax.sort(unique, dimension=unique.ndim - 1, is_stable=False)
+
+
+def _sorted_unions(per_tile: jax.Array) -> jax.Array:
+    """`_dense_unions` by two row sorts: duplicates of the first sort become
+    `_NO_PAGE`, which the second sort moves past the distinct pages. No
+    scatter or gather (`jnp.unique` compacts with both, SparseCore offloads
+    of ~25 us per call in the c4 prefill twin, j-3c651507)."""
+    s = jnp.sort(per_tile, axis=1)
+    dup = jnp.pad(s[:, 1:] == s[:, :-1], ((0, 0), (1, 0)))
+    return jnp.sort(jnp.where(dup, _NO_PAGE, s), axis=1)
 
 
 def _work_list(selected: jax.Array, block_q: int, pages_per_step: int):
     """Each tile's sorted page union, cut into groups of `pages_per_step`.
 
-    Returns the flattened group pages (``-1`` past a tile's union), one meta
-    word per group, and the number of groups.
+    Returns the unions as ``[tiles * groups_per_tile * pages_per_step]``
+    (``-1`` past a tile's union; see `_slot`), one meta word per group (see
+    `_ROW_SHIFT`), the number of groups, and each group's page count (its
+    present slots are the first ones). The kernel reads its group's pages in
+    the unions directly, so no [groups, pages_per_step] gather builds a
+    per-group list (a SparseCore offload of ~65 us per 2,048-token call in
+    the c4 prefill twin, j-3c651507).
     """
     num_tokens, topk = selected.shape
     num_tiles = num_tokens // block_q
@@ -383,31 +409,40 @@ def _work_list(selected: jax.Array, block_q: int, pages_per_step: int):
     per_tile = jnp.where(selected < 0, _NO_PAGE, selected).reshape(
         num_tiles, union_size
     )
-    union = tile_unions(per_tile)
-    union = jnp.where(union == _NO_PAGE, -1, union)
+    if num_tiles * union_size**2 <= _DENSE_WORK_LIST_ELEMS:
+        union = _dense_unions(per_tile)
+    else:
+        union = _sorted_unions(per_tile)
+    groups_per_tile = _groups_per_tile(block_q, topk, pages_per_step)
     # A tile with no page still gets one all-masked group so its output is set.
-    pages_in_tile = (union >= 0).sum(axis=1)
+    pages_in_tile = jnp.sum(union != _NO_PAGE, axis=1, dtype=jnp.int32)
     groups_in_tile = jnp.maximum(-(-pages_in_tile // pages_per_step), 1)
     ends = jnp.cumsum(groups_in_tile)
-    max_groups_per_tile = -(-union_size // pages_per_step)
-    w = jnp.arange(num_tiles * max_groups_per_tile, dtype=jnp.int32)
-    tile = jnp.minimum(
-        jnp.searchsorted(ends, w, side="right", method="compare_all").astype(jnp.int32),
-        num_tiles - 1,
+    starts = ends - groups_in_tile
+    # Group w's tile, first group and end from compares against every tile's
+    # range ([groups, tiles], fused into reductions): no gathers.
+    w = jnp.arange(num_tiles * groups_per_tile, dtype=jnp.int32)[:, None]
+    tile = jnp.sum(starts[None, 1:] <= w, axis=1, dtype=jnp.int32)
+    start = jnp.max(jnp.where(starts[None, :] <= w, starts[None, :], 0), axis=1)
+    end = jnp.min(jnp.where(ends[None, :] > w, ends[None, :], ends[-1]), axis=1)
+    tile_pages = jnp.max(
+        jnp.where((starts[None, :] <= w) & (ends[None, :] > w), pages_in_tile, 0),
+        axis=1,
     )
-    group = w - (ends[tile] - groups_in_tile[tile])
-    grouped = jnp.pad(
-        union,
-        ((0, 0), (0, max_groups_per_tile * pages_per_step - union_size)),
-        constant_values=-1,
-    ).reshape(num_tiles, max_groups_per_tile, pages_per_step)
-    pages = grouped[tile, jnp.clip(group, 0, max_groups_per_tile - 1)]
+    w = w[:, 0]
+    group = jnp.clip(w - start, 0, groups_per_tile - 1)
+    count = jnp.clip(tile_pages - group * pages_per_step, 0, pages_per_step)
     meta = (
-        (tile << _TILE_SHIFT)
-        | jnp.where(group == 0, _FIRST_BIT, 0)
-        | jnp.where(group == groups_in_tile[tile] - 1, _LAST_BIT, 0)
+        ((tile * groups_per_tile + group) << _ROW_SHIFT)
+        | jnp.where(w == start, _FIRST_BIT, 0)
+        | jnp.where(w + 1 == end, _LAST_BIT, 0)
     )
-    return pages.reshape(-1), meta.astype(jnp.int32), ends[-1]
+    union = jnp.pad(
+        jnp.where(union == _NO_PAGE, -1, union),
+        ((0, 0), (0, groups_per_tile * pages_per_step - union_size)),
+        constant_values=-1,
+    )
+    return union.reshape(-1), meta.astype(jnp.int32), ends[-1], count
 
 
 def _attention_call(
@@ -423,12 +458,14 @@ def _attention_call(
     kernel,
     page_table,
     interpret,
+    scale_cache=None,
+    scale_rows=None,
 ):
     """One kernel call over a token count that is a multiple of block_q."""
     num_tokens, num_heads, head_dim = q.shape
     _, rows_per_page, packing, row_width = kv_cache.shape
     topk = selected.shape[1]
-    pages, meta, num_groups = _work_list(selected, block_q, pages_per_step)
+    pages, meta, num_groups, _ = _work_list(selected, block_q, pages_per_step)
     prefetch = [pages, meta]
     if kernel == "v2":
         prefetch.append(
@@ -437,22 +474,30 @@ def _attention_call(
     elif page_table is not None:
         raise NotImplementedError("page_table needs kernel v2")
 
+    groups_per_tile = _groups_per_tile(block_q, topk, pages_per_step)
+
     def tile_block(w, pages, meta, *_):
-        return (meta[w] >> _TILE_SHIFT, 0)
+        return (_meta_tile(meta[w], groups_per_tile), 0)
 
     def head_major_block(w, pages, meta, *_):
-        return (0, meta[w] >> _TILE_SHIFT, 0)
+        return (0, _meta_tile(meta[w], groups_per_tile), 0)
 
     def page_block(g):
-        def index_map(w, pages, *rest):
-            page = jnp.maximum(pages[w * pages_per_step + g], 0)
+        def index_map(w, pages, meta, *rest):
+            page = jnp.maximum(pages[_slot(meta[w], pages_per_step, g)], 0)
             if page_table is not None:
                 page = rest[-1][page]
             return (page, 0, 0, 0)
 
         return pl.BlockSpec((1, rows_per_page, packing, row_width), index_map)
 
-    fp4 = kv_cache.dtype == jnp.uint8
+    def scale_block(g):  # the page's scale page, same page index
+        def index_map(*args):
+            return page_block(g).index_map(*args)[:3]
+
+        return pl.BlockSpec((1,) + scale_cache.shape[1:], index_map)
+
+    fp4 = scale_rows is not None
     if fp4 and kernel != "v2":
         raise NotImplementedError("4-bit caches need kernel v2")
 
@@ -465,6 +510,7 @@ def _attention_call(
             pl.BlockSpec((block_q, 1), tile_block),
             pl.BlockSpec((block_q, 1), tile_block),
             *(page_block(g) for g in range(pages_per_step)),
+            *(scale_block(g) for g in range(pages_per_step) if fp4),
         ],
         out_specs=pl.BlockSpec((num_heads, block_q, head_dim), head_major_block),
         scratch_shapes=[
@@ -477,7 +523,7 @@ def _attention_call(
         functools.partial(
             _KERNELS[kernel],
             sm_scale=sm_scale,
-            **({"fp4": True} if fp4 else {}),
+            **({"fp4_rows": scale_rows} if fp4 else {}),
         ),
         grid_spec=grid_spec,
         out_shape=jax.ShapeDtypeStruct((num_heads, num_tokens, head_dim), q.dtype),
@@ -493,6 +539,7 @@ def _attention_call(
         local_page[:, None],
         local_limit[:, None],
         *([kv_cache] * pages_per_step),
+        *([scale_cache] * (pages_per_step if fp4 else 0)),
     )
     return out.transpose(1, 0, 2)
 
@@ -504,6 +551,8 @@ def _attention_call(
         "block_q",
         "pages_per_step",
         "kernel",
+        "k_scale_row",
+        "v_scale_row",
         "interpret",
     ),
 )
@@ -519,16 +568,16 @@ def msa_sparse_attention(
     pages_per_step: int = DEFAULT_PAGES_PER_STEP,
     kernel: str = DEFAULT_KERNEL,
     page_table: jax.Array | None = None,
+    scale_cache: jax.Array | None = None,
+    k_scale_row: int = 0,
+    v_scale_row: int = 1,
     interpret: bool = False,
 ) -> jax.Array:
     """Attention of each token over its selected pages.
 
     Args:
       q: ``[T, H, D]`` queries of one KV head's query heads.
-      kv_cache: ``[pages, S / p, p, 2D]`` packed ``[K | V]`` rows (bf16 or
-        fp8), or a 4-bit uint8 cache (`msa_fp4`) ``[pages, S / 8 + 1, 4, 2D]``
-        whose last word row holds each slot's K / V scale (x = int4 * scale);
-        `q` is then in the rotated basis and so is the output.
+      kv_cache: ``[pages, S / p, p, 2D]`` packed ``[K | V]`` rows (bf16 or fp8).
       selected: ``[T, K]`` physical pages each token attends, ``-1`` padded.
       local_page: ``[T]`` the page holding the token itself (``-1`` for
         padding tokens).
@@ -539,12 +588,15 @@ def msa_sparse_attention(
         it, `selected` and `local_page` hold keys (any ids unique per page,
         e.g. ``seq * pages_per_seq + block``) and only the kernel's page
         fetch translates them, so no [T, K] gather runs in XLA (v2 only).
+      scale_cache: with a 4-bit uint8 `kv_cache` (`msa_fp4`), its scale cache
+        ``[pages, 8, S]`` f32; rows `k_scale_row` / `v_scale_row` hold the
+        K / V scale of each slot (x = int4 * scale). `q` is then in the
+        rotated basis and so is the output.
     Returns:
       ``[T, H, D]`` outputs; padding tokens get zeros.
     """
     num_tokens, _, head_dim = q.shape
-    check_cache(kv_cache)
-    check_fp4_rows(kv_cache, head_dim)
+    check_cache(kv_cache, scale_cache)
     if kv_cache.shape[3] != 2 * head_dim:
         raise ValueError(
             f"Cache rows hold [K | V] of width {2 * head_dim}, got {kv_cache.shape}."
@@ -563,6 +615,8 @@ def msa_sparse_attention(
         kernel=kernel,
         page_table=page_table,
         interpret=interpret,
+        scale_cache=scale_cache,
+        scale_rows=None if scale_cache is None else (k_scale_row, v_scale_row),
     )
     step = max(block_q, MAX_TOKENS_PER_CALL - MAX_TOKENS_PER_CALL % block_q)
     outputs = [
