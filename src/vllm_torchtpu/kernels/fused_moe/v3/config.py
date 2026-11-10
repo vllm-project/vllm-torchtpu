@@ -232,6 +232,21 @@ class Config:
         before the FFN kernel; and the exchange's finish is ordered after
         the shard tables instead of after the scatter, so its waits overlap
         the scatter. Only the schedule changes: the same values.
+      dense_slots: (adapter binding) calls of at most dense_slots_max_tokens
+        rows per shard run the dense-slots layer (dense_slots.py) instead:
+        every result row lands at a row fixed by the routing alone, so no
+        packed tables, sparse-core scatter or sort. bf16 result rows; the
+        same per-row math as this layer with result_rows "bf16".
+      dense_slots_max_tokens: the largest rows per shard dense_slots takes,
+        a positive multiple of 8.
+      dense_slots_fused: the dense-slots variant whose exchange, arrivals and
+        combine stay in the program (VMEM).
+      dense_slots_pallas_tables: the dense-slots index exchange and tables as
+        one Pallas program instead of XLA ops.
+      dense_slots_merged: (with dense_slots_fused) the index exchange and the
+        tables inside the dense-slots program itself, under its first weight
+        refills, on the shard's unpadded rows (padding and valid-row masks in
+        the program); supersedes dense_slots_pallas_tables.
     """
 
     result_slots: int = RESULT_SLOTS_DEFAULT
@@ -265,6 +280,11 @@ class Config:
     sort_index_compare: bool = False
     compact_message: bool = False
     reorder_chain: bool = False
+    dense_slots: bool = False
+    dense_slots_max_tokens: int = 64
+    dense_slots_fused: bool = False
+    dense_slots_pallas_tables: bool = False
+    dense_slots_merged: bool = False
 
     @property
     def token_dtype(self):
@@ -433,6 +453,11 @@ class Config:
             raise ValueError(
                 f"tables_zero_words {self.tables_zero_words}: a "
                 f"whole number of {SUBLANES * LANES}-word tiles"
+            )
+        if self.dense_slots_max_tokens <= 0 or self.dense_slots_max_tokens % 8:
+            raise ValueError(
+                f"dense_slots_max_tokens {self.dense_slots_max_tokens}: a "
+                "positive multiple of 8"
             )
         if self.weight_dma_priority not in WEIGHT_DMA_PRIORITIES:
             raise ValueError(
