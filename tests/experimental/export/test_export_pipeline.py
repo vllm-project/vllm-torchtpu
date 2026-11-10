@@ -859,6 +859,7 @@ def test_universal_adapter_1d_and_2d_mrope_export_and_cli(tmp_path) -> None:
     hf_dir = tmp_path / "hf_ckpt"
     hf_dir.mkdir()
     (hf_dir / "tokenizer.json").write_text(json.dumps({"version": "1.0"}))
+    (hf_dir / "tokenizer_config.json").write_text(json.dumps({}))
     with open(hf_dir / "config.json", "w") as f:
         json.dump(
             {
@@ -1390,6 +1391,7 @@ def test_generation_config_is_not_declared_when_the_checkpoint_has_none(
     hf_dir.mkdir()
     (hf_dir / "config.json").write_text(json.dumps({"eos_token_id": 2}))
     (hf_dir / "tokenizer.json").write_text(json.dumps({"version": "1.0"}))
+    (hf_dir / "tokenizer_config.json").write_text(json.dumps({}))
     out_dir = tmp_path / "artifact"
     out_dir.mkdir()
     cfg = api.TextOnlyLLMExportConfig(
@@ -1402,24 +1404,22 @@ def test_generation_config_is_not_declared_when_the_checkpoint_has_none(
     assert not (out_dir / "generation_config.json").exists()
 
 
-def test_hf_config_files_are_not_declared_when_the_checkpoint_has_none(
-    tmp_path,
-) -> None:
+@pytest.mark.parametrize("missing", ["config.json", "tokenizer_config.json"])
+def test_companion_files_require_hf_config_files(tmp_path, missing: str) -> None:
     hf_dir = tmp_path / "hf_ckpt"
     hf_dir.mkdir()
     (hf_dir / "tokenizer.json").write_text(json.dumps({"version": "1.0"}))
+    for name in ("config.json", "tokenizer_config.json"):
+        if name != missing:
+            (hf_dir / name).write_text(json.dumps({}))
     out_dir = tmp_path / "artifact"
     out_dir.mkdir()
     cfg = api.TextOnlyLLMExportConfig(
         model_name="tiny", vocab_size=64, hf_checkpoint_dir=str(hf_dir)
     )
 
-    serving_config = exporter._emit_model_companion_files(cfg, str(out_dir))
-
-    assert "hf_config" not in serving_config
-    assert "hf_tokenizer_config" not in serving_config
-    assert not (out_dir / "config.json").exists()
-    assert not (out_dir / "tokenizer_config.json").exists()
+    with pytest.raises(FileNotFoundError, match=re.escape(missing)):
+        exporter._emit_model_companion_files(cfg, str(out_dir))
 
 
 def test_byte_tokenizer_artifact_declares_no_hf_config_files(tmp_path) -> None:
@@ -1471,6 +1471,8 @@ def test_chat_template_is_written_and_declared_like_huggingface_finds_it(
     hf_dir = tmp_path / "hf_ckpt"
     hf_dir.mkdir()
     (hf_dir / "tokenizer.json").write_text(json.dumps({"version": "1.0"}))
+    (hf_dir / "config.json").write_text(json.dumps({}))
+    (hf_dir / "tokenizer_config.json").write_text(json.dumps({}))
     for name, text in files.items():
         (hf_dir / name).write_text(text)
     out_dir = tmp_path / "artifact"
