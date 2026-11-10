@@ -449,8 +449,8 @@ def maybe_share_lm_head(
     if not share_lm_head:
         greedy_top_tokens.release_draft_bf16_head(target_lm_head)
     else:
-        # The target's head may be quantized in place (W8A8 FP8,
-        # TPU_QUANTIZE_SHARED_LM_HEAD); the draft then takes the BF16 twin
+        # The target's head may be quantized in place (W8A8 FP8, the Qwen3.5
+        # quantize_target_lm_head setting); the draft then takes the BF16 twin
         # kept for it, so it computes at the checkpoint's precision.
         bf16_head = greedy_top_tokens.draft_bf16_head_of(target_lm_head)
         draft_lm_head = target_lm_head if bf16_head is None else bf16_head

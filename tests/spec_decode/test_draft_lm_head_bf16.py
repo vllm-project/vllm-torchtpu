@@ -176,7 +176,7 @@ def _fake_qwen3_next_model(head: torch.nn.Module) -> torch.nn.Module:
 def test_post_load_hook_keeps_a_bf16_twin_by_default(monkeypatch):
     from vllm_torchtpu.models.vllm import qwen3_next_patch
 
-    monkeypatch.delenv("TPU_QUANTIZE_SHARED_LM_HEAD", raising=False)
+    monkeypatch.setattr(qwen3_next_patch, "_quantize_target_lm_head", lambda: True)
     monkeypatch.setattr(
         qwen3_next_patch, "_speculative_decoding_configured", lambda: True
     )
@@ -202,7 +202,7 @@ def test_post_load_hook_keeps_a_bf16_twin_by_default(monkeypatch):
 def test_post_load_hook_keeps_no_twin_without_a_draft(monkeypatch):
     from vllm_torchtpu.models.vllm import qwen3_next_patch
 
-    monkeypatch.delenv("TPU_QUANTIZE_SHARED_LM_HEAD", raising=False)
+    monkeypatch.setattr(qwen3_next_patch, "_quantize_target_lm_head", lambda: True)
     # No speculative decoding: no twin, so no extra memory.
     monkeypatch.setattr(
         qwen3_next_patch, "_speculative_decoding_configured", lambda: False
@@ -269,3 +269,48 @@ def test_draft_greedy_head_defaults_to_bf16_with_no_proxy(monkeypatch):
     tokens = owner.logits_processor.get_top_tokens(owner.lm_head, x)
     ref = (x @ draft.lm_head.weight.t()).argmax(dim=-1)
     assert torch.equal(tokens, ref)
+
+
+def test_target_lm_head_stays_bf16_by_default(monkeypatch):
+    """quantize_target_lm_head is off unless set: the target head keeps its
+    BF16 weight and no twin is made, whatever the draft."""
+    from vllm_torchtpu.models.vllm import qwen3_next_patch
+
+    monkeypatch.setattr(
+        qwen3_next_patch, "_speculative_decoding_configured", lambda: True
+    )
+    monkeypatch.setattr(qwen3_next_patch, "_quantize_target_lm_head", lambda: False)
+    head = ParallelLMHead()
+    w = head.weight
+    qwen3_next_patch.setup_qwen3_next_v6_after_loading(_fake_qwen3_next_model(head))
+    assert getattr(head, "_quant_mode", None) is None
+    assert head.weight is w
+    assert gtt.draft_bf16_head_of(head) is None
+
+
+def _engine_config(architectures, section=None):
+    from types import SimpleNamespace as NS
+
+    return NS(
+        model_config=NS(architectures=architectures),
+        additional_config={} if section is None else {"qwen3_5": section},
+    )
+
+
+def test_quantize_target_lm_head_follows_the_qwen3_5_setting(monkeypatch):
+    import vllm.config
+
+    from vllm_torchtpu.models.vllm import qwen3_next_patch
+
+    qwen35 = ["Qwen3_5MoeForConditionalGeneration"]
+    cases = [
+        (_engine_config(qwen35), False),
+        (_engine_config(qwen35, {"quantize_target_lm_head": True}), True),
+        (_engine_config(qwen35, {"quantize_target_lm_head": False}), False),
+        # Qwen3-Next (and an MTP draft's own config) keep the BF16 head.
+        (_engine_config(["Qwen3NextForCausalLM"]), False),
+    ]
+    for config, expected in cases:
+        monkeypatch.setattr(vllm.config, "get_current_vllm_config", lambda c=config: c)
+        assert qwen3_next_patch._quantize_target_lm_head() is expected
+

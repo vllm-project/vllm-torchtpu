@@ -76,7 +76,6 @@ forwards restructured so torch.compile serves every bucket:
 import contextlib
 import functools
 import gc
-import os
 from collections.abc import Callable
 from itertools import islice
 from typing import TYPE_CHECKING, Any, cast
@@ -1129,6 +1128,17 @@ def _speculative_decoding_configured() -> bool:
         return True
 
 
+def _quantize_target_lm_head() -> bool:
+    """The Qwen3.5 `quantize_target_lm_head` setting of the engine being
+    loaded; False for any other model (Qwen3-Next keeps its BF16 head)."""
+    from vllm.config import get_current_vllm_config
+
+    vllm_config = get_current_vllm_config()
+    if not qwen3_5_settings.is_qwen3_5(vllm_config.model_config):
+        return False
+    return qwen3_5_settings.get(vllm_config).quantize_target_lm_head
+
+
 def setup_qwen3_next_v6_after_loading(model: Any) -> None:
     """Post-weight-load setup for fused router/shared-expert FP8 weights, Pallas
     sigmoid-gate o_proj and GDN weight layout."""
@@ -1145,9 +1155,6 @@ def setup_qwen3_next_v6_after_loading(model: Any) -> None:
         "Qwen3_5MTP",
         "Qwen3_5MoeMTP",
     )
-    quant_shared_lm_head = os.environ.get(
-        "TPU_QUANTIZE_SHARED_LM_HEAD", "1"
-    ).strip().lower() not in ("0", "false", "no", "off")
     hoisted_norm_tensors: list[torch.Tensor] = []
     for module in model.modules():
         if isinstance(module, GemmaRMSNorm):
@@ -1197,7 +1204,7 @@ def setup_qwen3_next_v6_after_loading(model: Any) -> None:
         elif (
             type(module).__name__ == "ParallelLMHead"
             and not is_mtp_wrapper
-            and quant_shared_lm_head
+            and _quantize_target_lm_head()
         ):
             from vllm_torchtpu.runner import greedy_top_tokens
 
