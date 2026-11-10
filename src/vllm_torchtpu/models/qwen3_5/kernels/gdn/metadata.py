@@ -57,25 +57,32 @@ def compute_batched_seq_metadata(
     `cfg.window_size` of them. The initial state is read from
     `state_indices[s] + read_offsets[s]` and one state checkpoint per window
     position is written back to `state_indices[s] + t`.
+
+    The five `p_id_*` SMEM arrays are padded to a multiple of `cfg.tile_size`
+    so the final tile never reads out-of-bounds SMEM when `max_seqs % T != 0`
+    under `disable_bounds_checks=True`.
     """
 
     max_seqs = seq_lens.size
-    all_seqs = jnp.arange(max_seqs)
+    padded_seqs = pl.cdiv(max_seqs, cfg.tile_size) * cfg.tile_size
+    all_seqs = jnp.arange(padded_seqs, dtype=jnp.int32)
+    safe_seqs = jnp.minimum(all_seqs, max_seqs - 1)
 
     # NOTE: Only supports use case where query_lens[i] <= cfg.window_size where
     # i < end_seq. This must be guaranteed by the function caller.
     # TODO(kyuyeunk): Add error handling when above condition is not met.
     query_lens = query_start_loc[1:] - query_start_loc[:-1]
-    is_valid_seqs = jnp.where(all_seqs < end_seq, True, False)
+    valid_end_seq = jnp.minimum(end_seq, max_seqs)
+    is_valid_seqs = all_seqs < valid_end_seq
     has_initial_state = (seq_lens - query_lens) > 0
     all_valid_seqs = jnp.where(is_valid_seqs, all_seqs, 0)
 
     return memory_ref.MetadataRef.create(
         cfgs=cfg,
-        num_tiles=pl.cdiv(end_seq, cfg.tile_size),
+        num_tiles=pl.cdiv(valid_end_seq, cfg.tile_size),
         p_id_to_s_idx=all_valid_seqs,
         p_id_to_r_base=query_start_loc[all_valid_seqs],
-        p_id_to_r_size=jnp.where(is_valid_seqs, query_lens, 0),
+        p_id_to_r_size=jnp.where(is_valid_seqs, query_lens[safe_seqs], 0),
         p_id_is_first_tile=is_valid_seqs,
         p_id_is_last_tile=is_valid_seqs,
         s_idx_has_initial_state=has_initial_state,
@@ -112,9 +119,18 @@ def compute_per_seq_metadata(
     tile boundary regardless of chunk_size.
     """
     max_seqs = seq_lens.size
-    max_tokens = cfg.batch_size
+    # Each PER_SEQ tile covers `cfg.chunk_size` tokens (plus at most one
+    # partial tile per sequence, and one more per sequence that splits at a
+    # prefill checkpoint), so the total number of tiles never exceeds
+    # `cdiv(batch_size, chunk_size) + max_seqs` (+ max_seqs with checkpoints),
+    # bounded above by `batch_size`.
+    partial_tiles_per_seq = 1 if prefill_ckpt_offsets is None else 2
+    max_tiles = min(
+        cfg.batch_size,
+        pl.cdiv(cfg.batch_size, cfg.chunk_size) + partial_tiles_per_seq * max_seqs,
+    )
     all_seqs = jnp.arange(max_seqs)
-    all_tokens = jnp.arange(max_tokens)
+    all_tiles = jnp.arange(max_tiles)
 
     # Shift to ensure first element is for start_seq.
     query_start_loc = jnp.roll(query_start_loc, shift=-start_seq)
@@ -176,10 +192,10 @@ def compute_per_seq_metadata(
     # kernel only checks value up-to p_id_to_s_idx[num_tiles-1], padded value
     # will not impact kernel execution.
     p_id_to_s_idx = jnp.repeat(
-        all_seqs, s_idx_to_num_tiles, total_repeat_length=max_tokens
+        all_seqs, s_idx_to_num_tiles, total_repeat_length=max_tiles
     )
     # Map program id (p_id) to tile id of a sequence.
-    p_id_to_t_id = all_tokens - s_idx_to_start_p_id[p_id_to_s_idx]
+    p_id_to_t_id = all_tiles - s_idx_to_start_p_id[p_id_to_s_idx]
     if ckpt_split_row is not None and s_idx_to_num_pre_ckpt_tiles is not None:
         num_pre_ckpt_tiles = s_idx_to_num_pre_ckpt_tiles[p_id_to_s_idx]
         is_pre_ckpt = p_id_to_t_id < num_pre_ckpt_tiles
