@@ -57,12 +57,14 @@ def _weighted_sum_body(
     [tokens * lane blocks, LANES], which viewed as [tokens, hidden] is
     the output. The sum runs in `dtype`; the coefficient is cast to it as
     a vector."""
+    scales_ref = None
     if with_scales:
         scales_ref, weights_ref, rows_ref, out_ref, coef_vmem, sum_vmem = refs
     else:
         weights_ref, rows_ref, out_ref, coef_vmem, sum_vmem = refs
     coef = weights_ref[...]
     if with_scales:
+        assert scales_ref is not None
         coef = coef * scales_ref[...]
     coef_vmem[...] = coef
 
@@ -77,6 +79,7 @@ def _weighted_sum_body(
             # there cannot reach the token.
             term = jnp.where(coef != 0, term, jnp.zeros_like(term))
             acc = term if k == 0 else acc + term
+        assert acc is not None  # top_k >= 1
         row0 = pl.multiple_of(t * lane_blocks, _stage_align(sum_vmem.dtype))
         sum_vmem[pl.ds(row0, lane_blocks), :] = acc.astype(sum_vmem.dtype)
         return carry
@@ -126,7 +129,7 @@ def weighted_sum(
         )
     top_k = n_rows // tokens_per_shard
     with_scales = scales is not None
-    if (with_scales and scales.shape != (n_rows,)) or weights.shape != (
+    if (scales is not None and scales.shape != (n_rows,)) or weights.shape != (
         tokens_per_shard,
         top_k,
     ):
@@ -136,7 +139,9 @@ def weighted_sum(
             f"do not match {n_rows} rows as {tokens_per_shard} "
             f"tokens x {top_k} slots"
         )
-    if (with_scales and scales.dtype != jnp.float32) or weights.dtype != jnp.float32:
+    if (scales is not None and scales.dtype != jnp.float32) or weights.dtype != (
+        jnp.float32
+    ):
         raise ValueError(
             f"scales {None if scales is None else scales.dtype} "
             f"and weights {weights.dtype}: "
@@ -166,6 +171,7 @@ def weighted_sum(
     table = pl.BlockSpec((tokens_per_tile, top_k), lambda i: (i, 0))
     tables = [weights]
     if with_scales:
+        assert scales is not None
         tables = [scales.reshape(tokens_per_shard, top_k)] + tables
 
     def body(*refs):
