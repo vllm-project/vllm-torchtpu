@@ -265,6 +265,7 @@ if TYPE_CHECKING:
     VLLM_TPU_WARM_SPEC_LOGITS_LENGTHS: bool = True
     VLLM_TPU_PLE_HOST_FAST_LOOKUP: bool = False
     VLLM_TPU_PLE_HOST_GATHER_WORKERS: int = 0
+    VLLM_TPU_QSA_VISIBLE_BYPASS: bool = False
     VLLM_TPU_PLE_HOST_TIMING: bool = False
     VLLM_TPU_PLE_HOST_OVERLAP: bool = False
     VLLM_TPU_PLE_HOST_OVERLAP_CHECK: int = 0
@@ -848,6 +849,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # qwen4_exp QSA sparse prefill: skip the FP8 key finite/written guard,
     # which the score mask select already covers (bit-identical output).
     "VLLM_TPU_QSA_PREFILL_LEAN": env_bool("VLLM_TPU_QSA_PREFILL_LEAN"),
+    # qwen4_exp QSA (unsharded indexer path): when every row's completed groups
+    # fit the top-k budget, take all visible groups and skip the StreamIndex
+    # scoring call (the sharded path already does). Same selected set; the
+    # order of the selected groups may differ from the kernel's.
+    "VLLM_TPU_QSA_VISIBLE_BYPASS": env_bool("VLLM_TPU_QSA_VISIBLE_BYPASS"),
     # qwen4_exp QSA sparse prefill: when a step's selections and causal lengths
     # fit a page-table prefix, build the selection metadata (bitset, active
     # tiles) over that prefix instead of max_model_len (bit-identical).
