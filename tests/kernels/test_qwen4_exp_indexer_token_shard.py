@@ -138,3 +138,36 @@ def test_mode_is_decided_once_for_the_smallest_sp_bucket(
     assert Qwen4ExpQSA._token_shard_mode(8, False, max_num_seqs) is False
     monkeypatch.setattr(envs, "QWEN4_EXP_PREFILL_SP", False, raising=False)
     assert Qwen4ExpQSA._token_shard_mode(8, True, max_num_seqs) is False
+
+
+@pytest.mark.parametrize(
+    "tokens,max_num_seqs,compressed_dcp,expected",
+    [
+        (256, 16, False, True),
+        (512, 24, False, True),
+        (3072, 32, False, True),
+        (256, 32, False, False),  # 32 rows per rank, not more than 32 slots
+        (128, 8, False, False),  # below the 256-row minimum
+        (264, 16, False, True),
+        (260, 16, False, False),  # does not divide by TP
+        (512, 16, True, False),  # compressed DCP: DECODE_TOKEN_SHARD's job
+    ],
+)
+def test_replicated_token_shard_eligibility(
+    monkeypatch, tokens, max_num_seqs, compressed_dcp, expected
+):
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.models.vllm.qwen4_exp import sequence_parallel as sp
+
+    monkeypatch.setattr(
+        envs, "VLLM_TPU_QSA_PREFILL_REPLICATED_TOKEN_SHARD", True, raising=False
+    )
+    monkeypatch.setattr(
+        envs, "VLLM_TPU_QSA_COMPRESSED_DCP", compressed_dcp, raising=False
+    )
+    assert sp.replicated_token_shard_eligible(tokens, 8, max_num_seqs) is expected
+    assert sp.replicated_token_shard_eligible(tokens, 1, max_num_seqs) is False
+    monkeypatch.setattr(
+        envs, "VLLM_TPU_QSA_PREFILL_REPLICATED_TOKEN_SHARD", False, raising=False
+    )
+    assert sp.replicated_token_shard_eligible(tokens, 8, max_num_seqs) is False

@@ -54,6 +54,7 @@ from vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op import (
     GdnStepMetadataCache,
 )
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
+from vllm_torchtpu.logger import init_logger
 
 from . import sequence_parallel as sp
 from .config import (
@@ -73,6 +74,8 @@ from .ple_storage import SharedPLEOptions
 from .pool_layout import POOLED_GDN_CONV_STATE_DTYPE
 from .pooled_ple import Qwen4ExpPooledPLE
 from .qsa import QSAMetadata, Qwen4ExpQSA
+
+logger = init_logger(__name__)
 
 
 def _parameter_storage_key(parameter):
@@ -344,11 +347,15 @@ class Qwen4ExpDecoderLayer(nn.Module):
         sequence_parallel=False,
         sp_pad=0,
         gdn_step_metadata_cache=None,
+        replicated_token_shard=False,
     ):
         """``sequence_parallel``: ``hidden`` and the result are this TP rank's
         token shard; the token-indexed inputs still cover the whole step.
         ``sp_pad``: the shard's HC streams are padded to a multiple of this many
-        rows; only the real rows enter collectives, attention and the MoE."""
+        rows; only the real rows enter collectives, attention and the MoE.
+        ``replicated_token_shard``: the replicated prefill graph of
+        VLLM_TPU_QSA_PREFILL_REPLICATED_TOKEN_SHARD; QSA runs the
+        token-sharded indexer."""
         num_tokens = input_ids.shape[0] if sequence_parallel else None
         rows = (
             num_tokens // sp.tp_world_size()
@@ -391,7 +398,11 @@ class Qwen4ExpDecoderLayer(nn.Module):
                     sequence_parallel and envs.VLLM_TPU_QSA_INDEXER_SHARD_SKIP_SP
                 ),
                 token_shard=(
-                    sequence_parallel and envs.VLLM_TPU_QSA_INDEXER_TOKEN_SHARD
+                    (sequence_parallel and envs.VLLM_TPU_QSA_INDEXER_TOKEN_SHARD)
+                    or (
+                        replicated_token_shard
+                        and self.self_attn.replicated_token_shard
+                    )
                 ),
                 decode_token_shard=(
                     not sequence_parallel and self.self_attn.decode_token_shard
@@ -668,6 +679,7 @@ class Qwen4ExpBackbone(nn.Module):
         valid_tokens,
         main_block_table,
         compressed_block_table,
+        replicated_token_shard: bool = False,
     ):
         # Resolve host lookup before any decoder work so shape arithmetic
         # stays in the main graph and model preparation precedes the D2H wait.
@@ -683,6 +695,9 @@ class Qwen4ExpBackbone(nn.Module):
                 envs.VLLM_TPU_PLE_HOST_OVERLAP
                 and self.host_ple_index > 0
                 and not sequence_parallel
+                # The replicated prefill graph's token-shard all-gathers keep
+                # the single boundary too.
+                and not replicated_token_shard
             ):
                 # Start the ids' copy now; finish it just before the PLE layer
                 # so the earlier layers run on the device meanwhile. The
@@ -727,6 +742,7 @@ class Qwen4ExpBackbone(nn.Module):
                 sequence_parallel=sequence_parallel,
                 sp_pad=sp_pad,
                 gdn_step_metadata_cache=gdn_step_metadata_cache,
+                replicated_token_shard=replicated_token_shard,
             )
         mixed = self.hyper_connection_mixer.mix(hidden)[0]
         if sp_pad:
@@ -1129,6 +1145,63 @@ class Qwen4ExpBackboneSP(nn.Module):
         "valid_tokens": 0,
     }
 )
+class Qwen4ExpBackboneRP(nn.Module):
+    """The replicated backbone's prefill graph with the token-sharded QSA
+    indexer (VLLM_TPU_QSA_PREFILL_REPLICATED_TOKEN_SHARD).
+
+    Like ``Qwen4ExpBackboneSP``: a compiled module of its own over the
+    backbone's layers, holding the backbone without registering it. The
+    router sends it the non-sequence-parallel buckets that
+    ``sequence_parallel.replicated_token_shard_eligible`` admits; the layers
+    run as in ``Qwen4ExpBackbone`` except that each QSA layer indexes this
+    rank's 1/TP of the step's rows and all-gathers the selection, so the
+    graph holds an all-gather the decode buckets must not pay.
+    """
+
+    _backbone: Any
+
+    def __init__(self, *, vllm_config: Any = None, backbone):
+        super().__init__()
+        object.__setattr__(self, "_backbone", backbone)
+
+    def forward(
+        self,
+        input_ids,
+        positions,
+        inputs_embeds=None,
+        *,
+        query_start_loc,
+        ngram_context,
+        state_slots,
+        context_lens,
+        valid_tokens,
+        main_block_table,
+        compressed_block_table,
+    ):
+        return self._backbone._forward_impl(
+            input_ids,
+            positions,
+            inputs_embeds,
+            sequence_parallel=False,
+            query_start_loc=query_start_loc,
+            ngram_context=ngram_context,
+            state_slots=state_slots,
+            context_lens=context_lens,
+            valid_tokens=valid_tokens,
+            main_block_table=main_block_table,
+            compressed_block_table=compressed_block_table,
+            replicated_token_shard=True,
+        )
+
+
+@support_torch_compile(
+    dynamic_arg_dims={
+        "input_ids": 0,
+        "positions": 0,
+        "inputs_embeds": 0,
+        "valid_tokens": 0,
+    }
+)
 class Qwen4ExpWholeStepModel(nn.Module):
     """A third compiled program: the backbone with the whole-step megakernel.
 
@@ -1344,7 +1417,9 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
         self.config = vllm_config.model_config.hf_text_config
         self.model = Qwen4ExpBackbone(vllm_config)
         self.model_sp = None
+        self.model_rp = None
         tp_size = sp.tp_world_size()
+        sp_eligible = None
         if sp.enabled(tp_size):
             self.model_sp = Qwen4ExpBackboneSP(
                 vllm_config=vllm_config, backbone=self.model
@@ -1371,6 +1446,34 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
             # One rule for the router, both bucket filters and retraces.
             bucket_filter.assign(self.model_sp, eligible)
             bucket_filter.assign(self.model, lambda n: not eligible(n))
+            sp_eligible = eligible
+        scheduler_cfg = getattr(vllm_config, "scheduler_config", None)
+        max_num_seqs = int(getattr(scheduler_cfg, "max_num_seqs", 0) or 0)
+        if sp.replicated_token_shard_eligible(1 << 30, tp_size, max_num_seqs):
+            # VLLM_TPU_QSA_PREFILL_REPLICATED_TOKEN_SHARD: a third graph for
+            # the replicated prefill buckets, with the token-sharded indexer.
+            self.model_rp = Qwen4ExpBackboneRP(
+                vllm_config=vllm_config, backbone=self.model
+            )
+            in_sp = sp_eligible or (lambda n: False)
+
+            def in_rp(n, in_sp=in_sp):
+                return not in_sp(n) and sp.replicated_token_shard_eligible(
+                    n, tp_size, max_num_seqs
+                )
+
+            bucket_filter.assign(self.model_rp, in_rp)
+            bucket_filter.assign(
+                self.model, lambda n, in_sp=in_sp: not in_sp(n) and not in_rp(n)
+            )
+            logger.info_once(
+                "QSA token-sharded replicated prefill graph on "
+                "(VLLM_TPU_QSA_PREFILL_REPLICATED_TOKEN_SHARD): buckets of >= %d "
+                "rows outside the SP graph, divisible by TP %d, > %d rows per rank",
+                envs.VLLM_TPU_QSA_PREFILL_REPLICATED_TOKEN_SHARD_MIN_TOKENS,
+                tp_size,
+                max_num_seqs,
+            )
         self.lm_head = ParallelLMHead(
             self.config.vocab_size, self.config.hidden_size, prefix="lm_head"
         )
@@ -1378,13 +1481,25 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
 
     def forward(self, input_ids, positions, inputs_embeds=None, **kwargs):
         # The route reads the padded bucket size outside both compiled graphs.
-        if self.model_sp is None:
+        if self.model_sp is None and self.model_rp is None:
             return self.model(input_ids, positions, inputs_embeds, **kwargs)
-        serves_sp = bucket_filter.assigned(self.model_sp)
-        assert serves_sp is not None
-        if serves_sp(input_ids.shape[0]):
-            with bucket_filter.serving(serves_sp), set_model_tag("backbone_sp"):
-                return self.model_sp(input_ids, positions, inputs_embeds, **kwargs)
+        if self.model_sp is not None:
+            serves_sp = bucket_filter.assigned(self.model_sp)
+            assert serves_sp is not None
+            if serves_sp(input_ids.shape[0]):
+                with bucket_filter.serving(serves_sp), set_model_tag("backbone_sp"):
+                    return self.model_sp(input_ids, positions, inputs_embeds, **kwargs)
+        if self.model_rp is not None:
+            serves_rp = bucket_filter.assigned(self.model_rp)
+            assert serves_rp is not None
+            if serves_rp(input_ids.shape[0]):
+                logger.info_once(
+                    "QSA token-sharded replicated prefill graph serving a %d-row "
+                    "bucket (backbone_rp)",
+                    int(input_ids.shape[0]),
+                )
+                with bucket_filter.serving(serves_rp), set_model_tag("backbone_rp"):
+                    return self.model_rp(input_ids, positions, inputs_embeds, **kwargs)
         serves_main = bucket_filter.assigned(self.model)
         assert serves_main is not None
         with bucket_filter.serving(serves_main):
