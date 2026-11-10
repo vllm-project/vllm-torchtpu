@@ -3917,6 +3917,8 @@ def _precompile_runner(
         _topk_candidate_blocks=lambda: topk_candidate_blocks(
             candidate_blocks, _VOCAB_SIZE
         ),
+        # The packed top-k candidate warmup is off.
+        _greedy_head_owner=None,
         _precompile_timed=lambda _name: contextlib.nullcontext(),
         sample_from_logits_func=_recording_sampler(record),
         speculative_config=speculative_config,
