@@ -144,6 +144,8 @@ legs:
         detok_prompt_tail: true
         lazy_reasoning_count: true
         tokenize_prefix_cache: true
+      tpu_runner:
+        stage_timing: false
       tpu_worker:
         numa_bind: true
   decode:
@@ -264,5 +266,7 @@ legs:
         detok_prompt_tail: true
         lazy_reasoning_count: true
         tokenize_prefix_cache: true
+      tpu_runner:
+        stage_timing: false
       tpu_worker:
         numa_bind: true
