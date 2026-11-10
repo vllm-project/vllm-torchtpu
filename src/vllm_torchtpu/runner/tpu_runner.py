@@ -3478,9 +3478,13 @@ class TPUModelRunner(GPUModelRunner):
 
         use_fast_slice = self._fast_token_substitution
         use_subst_cache = use_fast_slice or self.device.type == "tpu"
-        if use_fast_slice:
+        if use_fast_slice and spec_decode_metadata is None:
             # Fast path 1: Direct device token slicing for 1:1 steady-state decode
-            # Bypasses the _substitute_placeholder_token kernel entirely when unpadded
+            # Bypasses the _substitute_placeholder_token kernel entirely when unpadded.
+            # Speculative verify steps must skip this path so they run the single
+            # fused _substitute_and_extract_draft_token_ids graph instead of
+            # returning an un-extracted as_strided slice view that triggers
+            # 3x tt_jit_execute_as_strided + _compiled_extract_draft_token_ids.
             n_subst = len(token_in_tpu_cur_input_indices)
             if (
                 n_subst == len(input_ids)
