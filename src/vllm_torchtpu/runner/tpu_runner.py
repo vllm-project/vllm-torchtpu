@@ -9003,6 +9003,42 @@ class TPUModelRunner(GPUModelRunner):
         dtype: torch.dtype,
         device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if envs.VLLM_TPU_SAMPLING_PARAMS_MEMO:
+            # The result is a function of these arguments and the requests'
+            # host sampling values only: while those bytes repeat (steady
+            # decode), hand back the previous step's device tensors without
+            # the ~10 CPU tensor ops and three uploads below.
+            ib = self.input_batch
+            s, e = cur_start_idx, cur_end_idx
+            slot = (s, e, padded_num_reqs, dtype, str(device))
+            values = (
+                ib.temperature_cpu[s:e].tobytes(),
+                ib.top_k_cpu[s:e].tobytes(),
+                ib.top_p_cpu[s:e].tobytes(),
+            )
+            memo = self.__dict__.setdefault("_sampling_params_memo", {})
+            hit = memo.get(slot)
+            if hit is not None and hit[0] == values:
+                return hit[1]
+            out = TPUModelRunner._padded_sampling_params_uncached(
+                self, cur_start_idx, cur_end_idx, padded_num_reqs, dtype, device
+            )
+            if len(memo) > 16:
+                memo.clear()
+            memo[slot] = (values, out)
+            return out
+        return TPUModelRunner._padded_sampling_params_uncached(
+            self, cur_start_idx, cur_end_idx, padded_num_reqs, dtype, device
+        )
+
+    def _padded_sampling_params_uncached(
+        self,
+        cur_start_idx: int,
+        cur_end_idx: int,
+        padded_num_reqs: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # Stage [padded_num_reqs] on CPU with neutral padding, then use one
         # fixed-shape H2D copy per tensor to keep decode shape-stable.
         num_active_reqs = cur_end_idx - cur_start_idx
@@ -9069,6 +9105,23 @@ class TPUModelRunner(GPUModelRunner):
         num_blocks = self._topk_candidate_blocks()
         if num_blocks == 0 or grammar_output is not None:
             return 0
+        if envs.VLLM_TPU_SAMPLING_PARAMS_MEMO:
+            # Same rule on the numpy view, memoized on the top-k bytes.
+            raw = self.input_batch.top_k_cpu[cur_start_idx:cur_end_idx]
+            key = (num_blocks, raw.tobytes())
+            hit = self.__dict__.get("_topk_candidates_memo")
+            if hit is not None and hit[0] == key:
+                return hit[1]
+            ok = bool(((raw >= 1) & (raw <= num_blocks // 2)).all())
+            result = num_blocks if ok else 0
+            self._topk_candidates_memo = (key, result)
+            if ok:
+                logger.info_once(
+                    "Sampler top-k filters vocab to %d candidate blocks of %d logits.",
+                    num_blocks,
+                    CANDIDATE_BLOCK,
+                )
+            return result
         top_k = self.input_batch.top_k_cpu_tensor[cur_start_idx:cur_end_idx]
         if not bool(((top_k >= 1) & (top_k <= num_blocks // 2)).all()):
             return 0
