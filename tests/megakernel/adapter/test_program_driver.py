@@ -22,6 +22,7 @@ import dataclasses
 import importlib
 import json
 import logging
+import sys
 import textwrap
 from pathlib import Path
 from types import SimpleNamespace
@@ -124,6 +125,66 @@ def test_toy_plugin_serves_through_try_forward(
             None,
         )
     assert drv.step_mix_tracker.counts == {"mk_t1_b4": 1, "stock_big": 1}
+
+
+def _fake_vllm_distributed(
+    monkeypatch: pytest.MonkeyPatch, *, initialized: bool, rank: int = 0
+) -> None:
+    """vLLM importable; its TP group exists only when `initialized` (asking
+    for the rank otherwise asserts, as vLLM does)."""
+
+    def get_tensor_model_parallel_rank() -> int:
+        assert initialized, "tensor model parallel group is not initialized"
+        return rank
+
+    fake = SimpleNamespace(
+        get_tensor_model_parallel_rank=get_tensor_model_parallel_rank,
+        model_parallel_is_initialized=lambda: initialized,
+    )
+    monkeypatch.setitem(sys.modules, "vllm.distributed", fake)
+
+
+@pytest.mark.parametrize(
+    ("vllm", "dist_rank", "want"),
+    [
+        ("missing", None, 0),
+        ("missing", 5, 5),
+        ("no_tp_group", None, 0),
+        ("no_tp_group", 5, 5),
+        ("tp_group", 5, 3),
+    ],
+)
+def test_local_tp_rank_without_a_vllm_tp_group(
+    monkeypatch: pytest.MonkeyPatch, vllm: str, dist_rank: int | None, want: int
+) -> None:
+    """vLLM's TP rank once its groups exist; else the `torch.distributed` rank;
+    else 0. Never asks vLLM for the rank of a group it hasn't built."""
+    if vllm == "missing":
+        monkeypatch.setitem(sys.modules, "vllm.distributed", None)
+    else:
+        _fake_vllm_distributed(monkeypatch, initialized=vllm == "tp_group", rank=3)
+    dist = torch.distributed
+    monkeypatch.setattr(dist, "is_initialized", lambda: dist_rank is not None)
+    monkeypatch.setattr(dist, "get_rank", lambda: dist_rank)
+    assert driver_mod._local_tp_rank() == want
+
+
+def test_toy_plugin_serves_with_vllm_importable_and_no_tp_group(
+    toy: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A CPU process with vLLM installed but no TP group (a unit test, not a
+    server): `maybe_create` takes rank 0 instead of asserting in vLLM."""
+    _fake_vllm_distributed(monkeypatch, initialized=False)
+    _no_group(monkeypatch)
+    _fwd_ctx(monkeypatch)
+    runner = _runner({"scale": 3.0})
+    drv = driver_mod.ProgramDriver.maybe_create(runner)
+    assert isinstance(drv, driver_mod.ProgramDriver) and drv.tp_rank == 0
+    runner._megakernel = drv
+    drv.bind_and_warmup(runner)
+    ids = torch.arange(3, dtype=torch.int32)
+    hit, out = drv.try_forward(runner, StepContext(ids, torch.zeros(3)))
+    assert hit and torch.equal(out, ids.float() * 3.0 + 4)
 
 
 class _StockModel:

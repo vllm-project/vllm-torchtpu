@@ -180,14 +180,22 @@ def _build_tp_rank_mesh(r_cnt: int, fallback_mesh: Any = None) -> Any:
 
 
 def _local_tp_rank() -> int:
-    """This rank's TP rank (config-only, no collective)."""
+    """This rank's TP rank (config-only, no collective): vLLM's TP-group rank
+    once vLLM's model parallel groups exist, else the `torch.distributed` rank,
+    else 0 (a single process, e.g. a CPU test with vLLM installed but no TP
+    group)."""
     try:
-        from vllm.distributed import get_tensor_model_parallel_rank
+        from vllm.distributed import (
+            get_tensor_model_parallel_rank,
+            model_parallel_is_initialized,
+        )
     except ImportError:
-        dist = torch.distributed
-        ok = dist.is_available() and dist.is_initialized()
-        return dist.get_rank() if ok else 0
-    return get_tensor_model_parallel_rank()
+        pass
+    else:
+        if model_parallel_is_initialized():
+            return get_tensor_model_parallel_rank()
+    dist = torch.distributed
+    return dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
 
 
 _PROGRAM_METHODS = (
