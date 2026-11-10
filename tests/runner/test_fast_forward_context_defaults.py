@@ -58,3 +58,10 @@ def test_off_takes_the_stock_forward_context(reload_with, monkeypatch):
                                           num_tokens_across_dp=torch.tensor([4], dtype=torch.int32)):
             pass
     assert len(ffc._CACHE) == 0
+
+
+def test_enabled_follows_the_switch(reload_with):
+    reload_with()
+    assert ffc.enabled() is False
+    reload_with(VLLM_TPU_FAST_FORWARD_CONTEXT="1")
+    assert ffc.enabled() is True
