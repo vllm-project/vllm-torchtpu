@@ -18,7 +18,10 @@ Each leg (`prefill`, `decode`) lists:
   replica); `chips` is their total over both legs.
 - `serve_args`: the `vllm serve` arguments the record job's leg ran, from its
   rendered recipe. `$MODEL` and `$SERVED_MODEL` are the recipe's model path
-  and served name.
+  and served name. The prefill legs name no `--scheduler-cls`: the record
+  jobs named PrefixAwareScheduler there, but their platform replaced it with
+  the pipeline chunk scheduler for the PP > 1 leg, which is what ran. On this
+  tree the platform installs that scheduler only when no class is named.
 - `env`: the environment the leg set, limited to variables this package
   declares in `envs.py`. Per-pod wiring (ports, hosts, engine ids, cache
   directories) stays in the recipe.
