@@ -98,8 +98,8 @@ class TestTpuCompilerCache:
         assert base != different_prefix
         assert base != different_mamba
 
-    def test_tpu_hash_covers_gdn_prefill_checkpoint_gate_only(self):
-        """The hash follows prefill_checkpoint_enabled, not its raw inputs."""
+    def test_tpu_hash_covers_gdn_prefill_checkpoint_gate(self):
+        """Checkpoint granularity and Mamba cache mode remain separate inputs."""
         from vllm_torchtpu.compilation.tpu_compiler import compute_tpu_compilation_hash
 
         with patch(
@@ -116,10 +116,14 @@ class TestTpuCompilerCache:
             disabled_fine_unit = compute_tpu_compilation_hash(
                 self._config(mamba_cache_mode="align", prefix_match_unit=1024)
             )
+            disabled_finer_unit = compute_tpu_compilation_hash(
+                self._config(mamba_cache_mode="align", prefix_match_unit=512)
+            )
 
         assert disabled != enabled
         assert enabled == enabled_block_unit
-        assert disabled_fine_unit == disabled
+        assert disabled_fine_unit == disabled_finer_unit
+        assert disabled_fine_unit != disabled
 
     def test_tpu_hash_covers_plugin_compile_env(self):
         from vllm_torchtpu.compilation.tpu_compiler import compute_tpu_compilation_hash

@@ -1019,6 +1019,8 @@ class TestVllmGatedDeltaNetAttention:
         metadata = SimpleNamespace(
             mamba_state_indices=torch.tensor([1], dtype=torch.int32),
             mamba_slot_read_offsets=torch.zeros(2, dtype=torch.int32),
+            mamba_prefill_ckpt_offsets=None,
+            mamba_prefill_ckpt_indices=None,
             query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
             request_distribution=torch.tensor([0, 0, 1], dtype=torch.int32),
             seq_lens=torch.tensor([2], dtype=torch.int32),

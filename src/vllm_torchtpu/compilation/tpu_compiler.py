@@ -461,10 +461,9 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
             "mamba_cache_mode": cache_config.mamba_cache_mode,
         },
         # The GDN op traces with prefill checkpoint operands or with constant
-        # None inputs depending on this gate. Its inputs (prefix_match_unit,
-        # mamba_cache_mode, the PCP and DCP sizes, TPU_GDN_PREFILL_CHECKPOINT)
-        # are hashed only through the outcome, so changing one of them without
-        # flipping the gate keeps the cache.
+        # None inputs depending on this gate. Prefix match granularity is
+        # hashed through the outcome; cache mode and compile environment
+        # values also retain their independent cache-key contracts.
         "gdn_prefill_checkpoint": prefill_checkpoint_enabled(vllm_config),
         "scheduler": {
             "max_model_len": vllm_config.model_config.max_model_len,
