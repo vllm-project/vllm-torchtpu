@@ -108,8 +108,8 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
 
 # Public names resolve on first access (PEP 562): importing a submodule
 # (e.g. `runtime.contract`) doesn't import jax through this package. The
-# framework-free part is `contract` (stdlib) and `stats` (numpy); the rest is
-# policy- / kernel-bound.
+# framework-free part is `contract` and `policy` (stdlib) and `stats` (numpy);
+# the rest is policy- / kernel-bound.
 _SUBMODULES = frozenset(
     {
         "contract",

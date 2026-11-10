@@ -44,15 +44,29 @@ def _parse_bucket_list(
     if not isinstance(val, str):
         if not isinstance(val, Iterable) or isinstance(val, (bytes, bytearray)):
             raise ValueError(f"Megakernel: invalid {label}={val!r}")
-        bs = sorted({int(x) for x in val})
-        _need(all(valid_fn(b) for b in bs), f"invalid {label}={val!r}")
-        return tuple(bs)
+        bs = list(val)
+        _need(
+            all(
+                isinstance(b, int) and not isinstance(b, bool) and valid_fn(b)
+                for b in bs
+            )
+            and len(set(bs)) == len(bs),
+            f"invalid {label}={val!r}",
+        )
+        return tuple(sorted(bs))
     raw = val.strip()
     if raw.lower() in _FALSE_STRS:
         return ()
-    bs = sorted({int(x.strip()) for x in raw.replace(":", ",").split(",") if x.strip()})
-    _need(bool(bs) and all(valid_fn(b) for b in bs), f"invalid {label}={val!r}")
-    return tuple(bs)
+    parts = [x.strip() for x in raw.replace(":", ",").split(",") if x.strip()]
+    try:
+        bs = [int(x) for x in parts]
+    except ValueError:
+        raise ValueError(f"Megakernel: invalid {label}={val!r}") from None
+    _need(
+        bool(bs) and len(set(bs)) == len(bs) and all(valid_fn(b) for b in bs),
+        f"invalid {label}={val!r}",
+    )
+    return tuple(sorted(bs))
 
 
 def parse_mk_buckets(val: str | Iterable[int]) -> tuple[int, ...]:
@@ -85,6 +99,23 @@ class BucketPolicy:
     verify_buckets: tuple[int, ...] = DEFAULT_VERIFY_BUCKETS
     token_paddings: tuple[int, ...] = ()
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "buckets", parse_mk_buckets(self.buckets))
+        object.__setattr__(
+            self, "verify_buckets", parse_mk_verify_buckets(self.verify_buckets)
+        )
+        pads = self.token_paddings
+        if isinstance(pads, (str, bytes, bytearray)) or not isinstance(pads, Iterable):
+            raise ValueError(f"Megakernel: invalid token_paddings={pads!r}")
+        items = list(pads)
+        _need(
+            all(
+                isinstance(p, int) and not isinstance(p, bool) and p >= 1 for p in items
+            ),
+            f"invalid token_paddings={pads!r}",
+        )
+        object.__setattr__(self, "token_paddings", tuple(sorted(set(items))))
+
     @property
     def max_bucket(self) -> int:
         return max(self.buckets) if self.buckets else 0
@@ -109,10 +140,10 @@ class BucketPolicy:
         def_b = DEFAULT_BUCKETS if profile.buckets is None else profile.buckets
         p_ver = profile.verify_buckets
         def_v = DEFAULT_VERIFY_BUCKETS if p_ver is None else p_ver
-        eff_b = def_b if buckets is None else buckets
-        eff_v = def_v if verify_buckets is None else verify_buckets
-        b_sorted = tuple(sorted(int(x) for x in eff_b))
-        v_sorted = tuple(sorted(int(x) for x in eff_v))
+        b_sorted = parse_mk_buckets(def_b if buckets is None else buckets)
+        v_sorted = parse_mk_verify_buckets(
+            def_v if verify_buckets is None else verify_buckets
+        )
         if speculative_tokens is not None:
             b_ok = buckets is not None
             v_ok = verify_buckets is not None
@@ -122,7 +153,7 @@ class BucketPolicy:
                 b_sorted = ()
             elif speculative_tokens != MTP_SPECULATIVE_TOKENS and not v_exp:
                 v_sorted = ()
-        return cls(b_sorted, v_sorted, tuple(int(x) for x in token_paddings))
+        return cls(b_sorted, v_sorted, tuple(token_paddings))
 
     def select(
         self, active_rows: int, tokens_per_seq: int = 1, *, clamp: bool = False
@@ -136,7 +167,7 @@ class BucketPolicy:
 
     def out_rows(self, b: int, m_rows: int | None = None) -> int:
         """Return output row count for bucket `b` given `token_paddings`."""
-        eff_m = max(16, (b + 15) // 16 * 16) if m_rows is None else int(m_rows)
+        eff_m = max(16, (b + 15) // 16 * 16) if m_rows is None else m_rows
         return next((p for p in self.token_paddings if p >= b), eff_m)
 
     def iter_buckets(self) -> Iterator[tuple[int, int]]:

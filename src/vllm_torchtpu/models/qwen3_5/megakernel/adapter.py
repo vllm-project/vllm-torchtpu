@@ -313,7 +313,6 @@ class Qwen35Program:
         self.mamba_layer_names: list[str] = []
         self.attn_layer_name, self._ckpt_window = "", 1
         self._zero_roff_1d: torch.Tensor | None = None
-        self._bucket_out_rows: dict[tuple[int, int], int] = {}
         self._bucket_fused_io: dict[tuple[int, int], bool] = {}
         self._bucket_gpr: dict[tuple[int, int], bool] = {}
         self._expected_buckets: list[tuple[int, int]] = []
@@ -614,9 +613,9 @@ class Qwen35Program:
         self.bucket_policy = mk_rt.BucketPolicy(
             self.decode_buckets,
             self.verify_buckets,
-            tuple(int(x) for x in token_paddings),
+            tuple(token_paddings),
         )
-        for d in (self._bucket_out_rows, self._bucket_fused_io, self._bucket_gpr):
+        for d in (self._bucket_fused_io, self._bucket_gpr):
             d.clear()
         self._hlo_checked_buckets.clear()
         self._torchtpu_ir_checked_buckets.clear()
@@ -674,7 +673,6 @@ class Qwen35Program:
         )
         m_rows, max_pages, embed = ex.M, self.max_pages_per_seq, self.embed_tokens
         out_rows = int(bucket.out_rows) if bucket.out_rows is not None else m_rows
-        self._bucket_out_rows[bkt_key] = out_rows
 
         def _step_impl(
             input_ids: torch.Tensor,
@@ -1029,7 +1027,6 @@ class Qwen35Program:
             bs,
             self.bucket_policy,
             fwd.steps,
-            self._bucket_out_rows,
             input_rows=int(input_ids.shape[0]),
             mrope_ok=mrope_ok,
         )

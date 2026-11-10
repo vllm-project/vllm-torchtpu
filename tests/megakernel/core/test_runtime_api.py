@@ -975,7 +975,7 @@ def test_second_framework_plain_jax_adapter_on_synthetic_model_def(
         decode_and_total_reqs=(1, 1),
         query_start_loc=np.array([0, 1], dtype=np.int32),
     )
-    dec = check_step_eligibility(bs, pol, {(1, 2): step_fn}, {(1, 2): 2}, input_rows=2)
+    dec = check_step_eligibility(bs, pol, {(1, 2): step_fn}, input_rows=2)
     assert dec.eligible and dec.reason == "mk_t1_b2"
 
     meta = pack_step_meta(

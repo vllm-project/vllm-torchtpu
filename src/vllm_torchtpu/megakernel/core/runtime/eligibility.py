@@ -22,7 +22,7 @@ here.
 
 from __future__ import annotations
 
-from collections.abc import Container, Mapping, Sequence
+from collections.abc import Container, Sequence
 
 from ..errors import MegakernelConfigError
 from ..profiles.default import chip_budget
@@ -66,7 +66,7 @@ def check_post_mesh_eligibility(
     bucket_policy: BucketPolicy | None = None,
 ) -> EligibilityResult:
     """Validate post-mesh device count, TPU chip budget, and bucket policy."""
-    if mesh_size is not None and int(mesh_size) != int(tp_size):
+    if mesh_size is not None and mesh_size != tp_size:
         msg = (
             f"Megakernel TP-rank mesh has {mesh_size} devices, "
             f"expected {tp_size}; skipping."
@@ -74,7 +74,7 @@ def check_post_mesh_eligibility(
         return EligibilityResult(False, MESH_SIZE_MISMATCH, msg)
     if device_kind is not None:
         try:
-            chip_budget(str(device_kind))
+            chip_budget(device_kind)
         except MegakernelConfigError as exc:
             msg = f"Megakernel disabled: {exc}; skipping."
             return EligibilityResult(False, UNSUPPORTED_TPU_CHIP, msg)
@@ -123,7 +123,7 @@ def check_startup_eligibility(
         return EligibilityResult(False, "disabled", "", "debug")
     if hf_config_result is not None and not hf_config_result.eligible:
         return hf_config_result
-    if int(num_layers) != int(expected_num_layers):
+    if num_layers != expected_num_layers:
         return EligibilityResult(False, "layer_count_mismatch", "", "debug")
     bad_flags = (
         not unified_cache_layout,
@@ -135,24 +135,23 @@ def check_startup_eligibility(
         aux_hidden_states,
     )
     for is_bad, (code, detail) in zip(bad_flags, _STARTUP_FLAG_RULES, strict=True):
-        if bool(is_bad):
+        if is_bad:
             return EligibilityResult(False, code, f"Megakernel {detail}; skipping.")
     if tp_size is None:
         return check_post_mesh_eligibility(
             tp_size=0, device_kind=device_kind, bucket_policy=bucket_policy
         )
-    allowed_tp = tuple(int(x) for x in supported_tp_sizes)
-    if not allowed_tp:
+    if not supported_tp_sizes:
         msg = (
             "Megakernel model does not declare any supported TPU mesh sizes; skipping."
         )
         return EligibilityResult(False, UNSUPPORTED_TP_SIZE, msg)
-    if int(tp_size) not in allowed_tp:
+    if tp_size not in supported_tp_sizes:
         msg = (
-            f"Megakernel requires {allowed_tp[0]} TPU devices in mesh, "
+            f"Megakernel requires {supported_tp_sizes[0]} TPU devices in mesh, "
             f"got {tp_size}; skipping."
-            if len(allowed_tp) == 1
-            else f"Megakernel requires TPU mesh size in {allowed_tp}, "
+            if len(supported_tp_sizes) == 1
+            else f"Megakernel requires TPU mesh size in {supported_tp_sizes}, "
             f"got {tp_size}; skipping."
         )
         return EligibilityResult(False, UNSUPPORTED_TP_SIZE, msg)
@@ -168,7 +167,6 @@ def check_step_eligibility(
     batch_shape: BatchShape,
     bucket_policy: BucketPolicy,
     compiled_buckets: Container[tuple[int, int]],
-    bucket_out_rows: Mapping[tuple[int, int], int],
     *,
     input_rows: int,
     mrope_ok: bool = True,
@@ -199,9 +197,7 @@ def check_step_eligibility(
     bkt = bucket_policy.select(active_rows, T)
     if (T, bkt) not in compiled_buckets:
         return StepDecision(False, f"stock_t{T}_nobkt", num_reqs, T, bkt)
-    if bucket_policy.token_paddings and bucket_out_rows.get(
-        (T, bkt), input_rows
-    ) != int(input_rows):
+    if bucket_policy.token_paddings and bucket_policy.out_rows(bkt) != input_rows:
         return StepDecision(False, f"stock_t{T}_rows{bkt}", num_reqs, T, bkt)
     return StepDecision(True, f"mk_t{T}_b{bkt}", num_reqs, T, bkt)
 
