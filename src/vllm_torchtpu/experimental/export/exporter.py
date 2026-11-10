@@ -608,6 +608,18 @@ def _extra_user_inputs(
     return list(extra_fn()) if callable(extra_fn) else []
 
 
+def _attention_decode_query_size(model: api.ExportableTextOnlyLLM) -> int:
+    """The longest query, in tokens, in the decode segment of `req_dist`.
+
+    The model's `attention_decode_query_size()`, or 1 for a model without one.
+    """
+    size_fn = getattr(model, "attention_decode_query_size", None)
+    size = int(size_fn()) if callable(size_fn) else 1
+    if size < 1:
+        raise ValueError(f"attention_decode_query_size must be >= 1, got {size}")
+    return size
+
+
 def _recurrent_serving_config(model: api.ExportableTextOnlyLLM) -> dict[str, int]:
     """`num_state_slots` for a model with recurrent state, else nothing.
 
@@ -1526,6 +1538,7 @@ def export(
         "tensor_parallel_size": tp_size,
         "pipeline_parallel_size": pp_size,
         "data_parallel_size": dp_size,
+        "attention_decode_query_size": _attention_decode_query_size(model),
         **_emit_model_companion_files(cfg, output_dir),
         # How a checkpoint of this artifact is stored (Zarr v2 arrays in OCDBT).
         "checkpoint_config": {"format": checkpoint.CHECKPOINT_FORMAT},
