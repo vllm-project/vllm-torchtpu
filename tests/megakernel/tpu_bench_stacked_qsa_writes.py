@@ -89,9 +89,10 @@ def step(rng, ctx):
     return positions, starts, jnp.asarray(ctx), rows, norms
 
 
-def writer(stacked):
+def writer(stacked, unique=False):
     def fn(pool, rows, norms, tabs, positions, trig, starts, context):
         envs.VLLM_TPU_MK_STACKED_QSA_WRITES = stacked
+        envs.VLLM_TPU_MK_COMPRESSED_UNIQUE_WRITE = unique
         return wholestep_qsa_writes(
             pool, rows, norms, tabs, LAYERS, positions, trig, starts, context,
             compress_ratio=RATIO, norm_eps=1e-6, rotary_dim=ROTARY, max_query_len=T,
@@ -106,6 +107,8 @@ def main():
     ap.add_argument("--pages", type=int, default=1024)
     ap.add_argument("--iters", type=int, default=50)
     ap.add_argument("--interpret", action="store_true", help="CPU smoke run")
+    ap.add_argument("--ablate", action="store_true",
+                    help="also time the stacked writer without each stage (no parity)")
     a = ap.parse_args()
     if a.interpret:
         from jax.experimental import pallas as pl
@@ -124,8 +127,8 @@ def main():
                        ((0, 0), (0, 128 - ROTARY)))
         pool0 = np.asarray(rng.integers(0, 256, (a.pages, PAGE_ROWS, 1, 4, WIDTH), np.uint8))
         mk = lambda: jax.lax.bitcast_convert_type(jnp.asarray(pool0), jnp.float8_e4m3fn)
-        f_b, f_s = writer(False), writer(True)
-        p_b, p_s = mk(), mk()
+        f_b, f_s, f_u = writer(False), writer(True), writer(True, True)
+        p_b, p_s, p_u = mk(), mk(), mk()
         ctx = rng.integers(0, 3000, nreq).astype(np.int32)
         ok = True
         for _ in range(3):
@@ -133,11 +136,13 @@ def main():
             positions, starts, context, rows, norms = args
             p_b = f_b(p_b, rows, norms, tabs, positions, trig, starts, context)
             p_s = f_s(p_s, rows, norms, tabs, positions, trig, starts, context)
+            p_u = f_u(p_u, rows, norms, tabs, positions, trig, starts, context)
             ok &= bool(np.array_equal(raw(p_b), raw(p_s)))
+            ok &= bool(np.array_equal(raw(p_b), raw(p_u)))
             ctx = ctx + rng.integers(1, T + 1, nreq).astype(np.int32)
         changed = not np.array_equal(raw(p_b), pool0)
         res = {"bitwise": ok, "changed": changed}
-        for name, f, p in (("batched", f_b, p_b), ("stacked", f_s, p_s)):
+        for name, f, p in (("batched", f_b, p_b), ("stacked", f_s, p_s), ("unique", f_u, p_u)):
             positions, starts, context, rows, norms = step(rng, ctx)
             for _ in range(3):
                 p = f(p, rows, norms, tabs, positions, trig, starts, context)
@@ -150,6 +155,34 @@ def main():
             n_ops = len(f.lower(p, rows, norms, tabs, positions, trig, starts, context)
                         .compile().as_text().splitlines())
             res[f"{name}_hlo_lines"] = n_ops
+        if a.ablate:
+            from vllm_torchtpu.megakernel_runtime import qwen38_wholestep_cache as wc
+
+            keep = lambda pool, *x, **k: pool
+            f0, p = jax.jit(keep, donate_argnums=0), mk()
+            positions, starts, context, rows, norms = step(rng, ctx)
+            for _ in range(3):
+                p = f0(p, rows, norms, tabs, positions, trig, starts, context)
+            p.block_until_ready()
+            t0 = time.perf_counter()
+            for _ in range(a.iters):
+                p = f0(p, rows, norms, tabs, positions, trig, starts, context)
+            p.block_until_ready()
+            res["noop_dispatch_us"] = round((time.perf_counter() - t0) / a.iters * 1e6, 1)
+            for stage in ("write_compressed_pairs", "write_ring_and_tags"):
+                orig = getattr(wc, stage)
+                setattr(wc, stage, keep)
+                f, p = writer(True), mk()
+                positions, starts, context, rows, norms = step(rng, ctx)
+                for _ in range(3):
+                    p = f(p, rows, norms, tabs, positions, trig, starts, context)
+                p.block_until_ready()
+                t0 = time.perf_counter()
+                for _ in range(a.iters):
+                    p = f(p, rows, norms, tabs, positions, trig, starts, context)
+                p.block_until_ready()
+                res[f"stacked_no_{stage}_us"] = round((time.perf_counter() - t0) / a.iters * 1e6, 1)
+                setattr(wc, stage, orig)
         out[nreq] = res
         print("RESULT", nreq, json.dumps(res), flush=True)
     print("SUMMARY", json.dumps(out), flush=True)
