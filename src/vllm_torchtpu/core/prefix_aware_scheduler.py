@@ -58,6 +58,12 @@ def _prompt_ids_ndarray() -> bool:
     return envs.VLLM_TPU_PROMPT_IDS_NDARRAY
 
 
+def _paw_skip_full() -> bool:
+    from vllm_torchtpu import envs
+
+    return envs.VLLM_TPU_PAW_SKIP_FULL
+
+
 def ship_prompt_ids_as_ndarray(scheduler_output, requests) -> None:
     """Replace each new request's ``prompt_token_ids`` list in the scheduler
     output by the int32 ndarray cached on its ``Request`` at add time.
@@ -97,6 +103,7 @@ class PrefixAwareScheduler(AsyncScheduler):
     _hp_n = 0
     _hp_promote_ns = 0
     _prompt_np = False
+    _paw_skip_full = False
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -110,6 +117,7 @@ class PrefixAwareScheduler(AsyncScheduler):
         self._hp_n = 0
         self._hp_promote_ns = 0
         self._prompt_np = _prompt_ids_ndarray()
+        self._paw_skip_full = _paw_skip_full()
 
         logger.info("PrefixAwareScheduler ACTIVE (window=%d)", self.WINDOW)
 
@@ -235,9 +243,31 @@ class PrefixAwareScheduler(AsyncScheduler):
         finally:
             self._hp_promote_ns += time.perf_counter_ns() - t0
 
+    def _no_seat_free(self) -> bool:
+        """True when this schedule() cannot admit a waiting request: every
+        seat is taken at entry, and seats only free up in update_from_output
+        (a preemption inside schedule() blocks admissions for the step)."""
+        limit = getattr(self, "max_num_active_reqs", None)
+        if limit is None:
+            return False
+        running = len(self.running) + getattr(
+            self, "num_waiting_for_streaming_input", 0
+        )
+        return running >= limit
+
     def _promote_warmest_impl(self, queue: RequestQueue) -> None:
         """Promote the request with the fewest uncached tokens within WINDOW."""
         if self.policy != SchedulingPolicy.FCFS or len(queue) < 2:
+            return
+        if (
+            self._paw_skip_full
+            and len(queue) <= self.WINDOW
+            and self._no_seat_free()
+        ):
+            # Nothing is admitted this step, and with the whole queue inside
+            # the window the next promotion picks the same argmin regardless
+            # of the order left behind (keys include arrival_time, no ties):
+            # skip the per-request prefix-cache lookups.
             return
 
         window = list(islice(queue, self.WINDOW))

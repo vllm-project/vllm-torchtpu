@@ -269,3 +269,18 @@ def test_prompt_ids_left_as_list_by_default():
     with patch.object(AsyncScheduler, "schedule", return_value=out):
         s.schedule()
     assert new_r.prompt_token_ids is ids
+
+
+def test_skip_full_skips_scoring_only_when_no_seat_is_free():
+    reqs = [_make_request("cold", 1000, 0.0), _make_request("warm", 1000, 1.0)]
+    s = _make_scheduler(reqs, {"warm": 900})
+    s._paw_skip_full = True
+    s.max_num_active_reqs = 2
+    s.num_waiting_for_streaming_input = 0
+    s.running = [object(), object()]
+    s._promote_warmest(s.waiting)
+    assert [r.request_id for r in s.waiting] == ["cold", "warm"]
+    s.kv_cache_manager.coordinator.find_longest_cache_hit.assert_not_called()
+    s.running = [object()]
+    s._promote_warmest(s.waiting)
+    assert [r.request_id for r in s.waiting] == ["warm", "cold"]
