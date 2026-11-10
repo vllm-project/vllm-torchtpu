@@ -85,6 +85,7 @@ class PcpStaticSupportValidator:
         config = PcpStaticSupportValidator.from_vllm_config(vllm_config)
         if (
             config.enabled
+            and not envs.use_headtail_pcp_manager()
             and kv_cache_layout == "HND"
             and config.interleave_size % 128 != 0
         ):
@@ -94,9 +95,9 @@ class PcpStaticSupportValidator:
                 f"got {config.interleave_size}."
             )
         if envs.USE_TPU_PCP_MANAGER:
-            # TODO(weiyulin): Once we merge two PCP paths, we will validate
-            # in one place. For now, PcpManager.from_vllm_config validates the
-            # config in the workers.
+            from vllm_torchtpu.runner.pcp import validate_pcp_manager_config
+
+            validate_pcp_manager_config(vllm_config)
             return config
         if not config.enabled:
             return config

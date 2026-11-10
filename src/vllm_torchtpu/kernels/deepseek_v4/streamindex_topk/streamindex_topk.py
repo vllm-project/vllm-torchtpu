@@ -863,7 +863,7 @@ def indexer_kv_layout(
         from vllm_torchtpu import envs
 
         raiden_glm_admission = envs.use_raiden_glm_admission()
-        pcp_manager = envs.USE_TPU_PCP_MANAGER
+        pcp_manager = envs.use_headtail_pcp_manager()
         explicit_env = envs.is_indexer_kv_cache_mode_explicit()
         env_mode = envs.VLLM_TPU_INDEXER_KV_CACHE_MODE
     except ImportError:

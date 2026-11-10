@@ -349,8 +349,14 @@ class PcpPreparedBatch:
 
 
 class PcpSequenceLayoutPlanner:
-    def __init__(self, eligibility: PcpSequenceLayoutEligibility):
+    def __init__(
+        self,
+        eligibility: PcpSequenceLayoutEligibility,
+        *,
+        pcp_rank: int | None = None,
+    ):
         self.eligibility = eligibility
+        self._pcp_rank = pcp_rank
         self._all_planner = AllSequenceLayoutPlanner()
 
     @classmethod
@@ -377,7 +383,7 @@ class PcpSequenceLayoutPlanner:
         self, runner: Any, required_num_tokens: int
     ) -> None:
         if self.enabled:
-            _ensure_host_token_buffer_capacity(runner, required_num_tokens)
+            ensure_host_token_buffer_capacity(runner, required_num_tokens)
 
     def prepare_real(
         self,
@@ -421,6 +427,12 @@ class PcpSequenceLayoutPlanner:
             use_max_model_len,
             target_num_reqs,
             padded_num_reqs,
+            get_native_pcp_rank=(
+                None if self._pcp_rank is None else lambda: self._pcp_rank
+            ),
+            get_native_pcp_world_size=(
+                None if self._pcp_rank is None else lambda: self.eligibility.pcp_size
+            ),
             decision=decision,
         )
         return SequenceLayoutPlan(
@@ -547,7 +559,7 @@ class PcpSequenceLayoutPlanner:
         return _pcp_all_reduce_sum(selected)
 
 
-def _ensure_host_token_buffer_capacity(runner: Any, required_num_tokens: int) -> None:
+def ensure_host_token_buffer_capacity(runner: Any, required_num_tokens: int) -> None:
     """Grow CPU-only token staging buffers for partial sequence layouts."""
     required_num_tokens = int(required_num_tokens)
     if required_num_tokens <= 0:
@@ -560,44 +572,35 @@ def _ensure_host_token_buffer_capacity(runner: Any, required_num_tokens: int) ->
     if current_num_tokens >= required_num_tokens:
         return
 
-    old_input_ids_cpu = runner.input_ids_cpu
-    runner.input_ids_cpu = torch.zeros(
-        required_num_tokens,
-        dtype=old_input_ids_cpu.dtype,
-        device=old_input_ids_cpu.device,
-    )
-    runner.input_ids_cpu[:current_num_tokens] = old_input_ids_cpu
+    attrs = ["input_ids_cpu", "positions_cpu"]
+    if getattr(runner, "supports_mm_inputs", False) and hasattr(
+        runner, "is_mm_embed_cpu"
+    ):
+        attrs.append("is_mm_embed_cpu")
+    for attr in attrs:
+        buf = getattr(runner, attr)
+        cur = int(buf.shape[0])
+        if cur < required_num_tokens:
+            grown = torch.zeros(
+                required_num_tokens,
+                dtype=buf.dtype,
+                device=buf.device,
+                pin_memory=buf.is_pinned(),
+            )
+            grown[:cur] = buf
+            setattr(runner, attr, grown)
+            if attr == "positions_cpu":
+                runner.positions_np = grown.numpy()
 
-    old_positions_cpu = runner.positions_cpu
-    runner.positions_cpu = torch.zeros(
-        required_num_tokens,
-        dtype=old_positions_cpu.dtype,
-        device=old_positions_cpu.device,
-    )
-    runner.positions_cpu[:current_num_tokens] = old_positions_cpu
-    runner.positions_np = runner.positions_cpu.numpy()
-
-    if runner.supports_mm_inputs and hasattr(runner, "is_mm_embed_cpu"):
-        old_is_mm_embed_cpu = runner.is_mm_embed_cpu
-        runner.is_mm_embed_cpu = torch.zeros(
-            required_num_tokens,
-            dtype=old_is_mm_embed_cpu.dtype,
-            device=old_is_mm_embed_cpu.device,
-        )
-        runner.is_mm_embed_cpu[:current_num_tokens] = old_is_mm_embed_cpu
-
-    if runner.uses_mrope:
-        old_mrope_positions = runner.mrope_positions
-        new_mrope_positions = runner._make_buffer(
-            3, required_num_tokens + 1, dtype=torch.int32
-        )
-        copy_len = min(
-            current_num_tokens + 1,
-            int(old_mrope_positions.cpu.shape[1]),
-            required_num_tokens + 1,
-        )
-        new_mrope_positions.cpu[:, :copy_len] = old_mrope_positions.cpu[:, :copy_len]
-        runner.mrope_positions = new_mrope_positions
+    if getattr(runner, "uses_mrope", False):
+        old_mrope = runner.mrope_positions
+        mrope_cols = int(old_mrope.cpu.shape[1])
+        if mrope_cols < required_num_tokens + 1:
+            new_mrope = runner._make_buffer(
+                3, required_num_tokens + 1, dtype=old_mrope.cpu.dtype
+            )
+            new_mrope.cpu[:, :mrope_cols] = old_mrope.cpu[:, :mrope_cols]
+            runner.mrope_positions = new_mrope
 
 
 def _debug_pcp_layout_window(
@@ -698,7 +701,7 @@ def prepare_pcp_sequence_layout(
     assert local_padded_tokens is not None
     assert padded_total_num_scheduled_tokens is not None
 
-    _ensure_host_token_buffer_capacity(runner, padded_total_num_scheduled_tokens)
+    ensure_host_token_buffer_capacity(runner, padded_total_num_scheduled_tokens)
 
     mrope_slice = None
     if runner.uses_mrope:
