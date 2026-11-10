@@ -13,6 +13,8 @@
 # limitations under the License.
 """VMEM scratchpad allocation and alignment helpers for Fused EP MoE v3 kernels."""
 
+from typing import Any
+
 import jax.numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
 
@@ -91,7 +93,7 @@ def scratch_arrays(
     if form.packed:
         # Four-bit weights stream as packed 32-bit words, half the bytes
         # of the fp8 form.
-        weights = [
+        weights: list[tuple[str, tuple[int, ...], Any]] = [
             ("w1_vmem", (weight_slots, hidden // FP4_PER_WORD, w1_cols), jnp.uint32),
             ("w2_vmem", (weight_slots, slot_inter // FP4_PER_WORD, hidden), jnp.uint32),
         ]
@@ -235,7 +237,7 @@ def tile_body_arrays(
     form = weight_form(weight_format)
     inter = stream_block or inter  # a streamed body holds one block's worth
     w1_cols = inter if no_gate else 2 * inter
-    arrays = [
+    arrays: list[tuple[str, tuple[int, ...], Any]] = [
         ("acc1", (tile_rows, w1_cols), jnp.float32),
         ("mid_column_slices", (tile_rows, inter), jnp.bfloat16),
         ("mid_fp8", (tile_rows, inter), FP8),

@@ -676,7 +676,7 @@ def _pallas_step(
 _LAYER_CACHE = {}
 _LAYER_CACHE_LOCK = threading.Lock()
 
-WRAP_IN_JIT = True
+WRAP_IN_JIT: bool = True
 
 
 def _cached_layer_program(key, build):

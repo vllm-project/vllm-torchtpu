@@ -322,7 +322,10 @@ def _shard_tables_body(
     shard_ref = next(it) if shard_operand else None
 
     def shard_of():
-        return shard_ref[0] if shard_operand else lax.axis_index(axis)
+        if shard_operand:
+            assert shard_ref is not None
+            return shard_ref[0]
+        return lax.axis_index(axis)
 
     ids_ref = next(it)
     if hosts_transport:
