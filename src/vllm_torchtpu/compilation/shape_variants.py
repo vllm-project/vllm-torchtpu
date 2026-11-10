@@ -191,10 +191,9 @@ def _input_permutation(
 ) -> list[int] | None:
     """Where each stored argument sits in ``current``; None unless a reordering."""
     position = {entry: i for i, entry in enumerate(current)}
-    perm = [position.get(entry) for entry in stored]
-    if len(stored) != len(current) or None in perm:
+    if len(stored) != len(current) or any(entry not in position for entry in stored):
         return None
-    return perm
+    return [position[entry] for entry in stored]
 
 
 def _is_int_input(value: Any) -> bool:
