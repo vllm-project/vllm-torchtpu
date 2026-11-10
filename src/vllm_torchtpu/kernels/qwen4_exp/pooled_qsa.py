@@ -1772,19 +1772,34 @@ def _pooled_qsa(
     if shared is not None:
         blocks = shared_blocks(shared, lengths, compress_ratio, token_topk)
     else:
-        blocks = select_blocks(
-            iq,
-            pool,
-            lengths,
-            compressed_table,
-            req,
-            starts,
-            context,
-            ratio=compress_ratio,
-            block_topk=token_topk // compress_ratio,
-            slot=compressed_slot,
-            max_query_len=max_query_len,
-        )
+
+        def score_blocks(_=None):
+            return select_blocks(
+                iq,
+                pool,
+                lengths,
+                compressed_table,
+                req,
+                starts,
+                context,
+                ratio=compress_ratio,
+                block_topk=token_topk // compress_ratio,
+                slot=compressed_slot,
+                max_query_len=max_query_len,
+            )
+
+        if envs.VLLM_TPU_QSA_VISIBLE_BYPASS:
+            # Steps whose rows' completed groups all fit the budget select
+            # every visible group: skip the StreamIndex launch and metadata.
+            block_topk = token_topk // compress_ratio
+            blocks = jax.lax.cond(
+                jnp.max(lengths) // compress_ratio <= block_topk,
+                lambda _: visible_blocks(lengths, compress_ratio, block_topk),
+                score_blocks,
+                None,
+            )
+        else:
+            blocks = score_blocks()
     if envs.VLLM_TPU_QSA_TOPK_STATS:
         from vllm_torchtpu.kernels.qwen4_exp import topk_stats
 
