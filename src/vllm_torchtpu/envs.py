@@ -118,6 +118,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_PREFIX_SLICE: bool = False
     VLLM_TPU_QSA_INDEXER_UPDATE_SHIFT: bool = False
     VLLM_TPU_QSA_PREFILL_BITSET_KERNEL: bool = True
+    VLLM_TPU_QSA_PREFILL_BITSET_RANGED: bool = False
     VLLM_TPU_QSA_PREFILL_BF16_MXU: bool = False
     VLLM_TPU_QSA_DCP_FINE_PREFIX: bool = False
     VLLM_TPU_QSA_DCP_FINE_PREFIX_SEQ_TAIL: bool = False
@@ -881,6 +882,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # scatter-add, which XLA:TPU lowers to a global sort of every selection.
     "VLLM_TPU_QSA_PREFILL_BITSET_KERNEL": env_bool(
         "VLLM_TPU_QSA_PREFILL_BITSET_KERNEL", default=True
+    ),
+    # Qwen4-exp QSA prefill, with the bitset kernel: per eight-word group
+    # compare only the selection chunks whose word range can reach it,
+    # O(selections) per query block on the SparseCore top-k's ascending ids
+    # instead of every word group against every selection (bit-identical).
+    "VLLM_TPU_QSA_PREFILL_BITSET_RANGED": env_bool(
+        "VLLM_TPU_QSA_PREFILL_BITSET_RANGED", default=False
     ),
     # Qwen4-exp QSA prefill attention: feed the MXU BF16 operands (exact
     # queries and keys, probabilities split into two BF16 terms) instead of
