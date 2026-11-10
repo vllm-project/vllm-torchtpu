@@ -11,8 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Shared ring topology, barrier semaphore, and VMEM scratch utilities for small collectives.
-"""
+"""Shared ring topology, barrier semaphore, and VMEM scratch utilities for small
+collectives."""
 
 import jax
 import jax.numpy as jnp

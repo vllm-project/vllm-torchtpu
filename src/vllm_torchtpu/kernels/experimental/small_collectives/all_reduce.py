@@ -13,21 +13,21 @@
 # limitations under the License.
 """All-reduce of a small bf16 [rows, hidden] block as one Pallas kernel.
 
-    one-shot      Every core pushes its whole block to every other core and
-                  sums the arrivals locally (XOR static-slot addressing on 8
-                  cores eliminates @pl.when branches and self-copies).
-    hier-halves   On 8 cores (4 chips x 2 cores/chip), intra-chip reduce-scatter
-                  of (rows, hidden/2) with twin `me ^ 1`, 4-chip all-reduce of
-                  (rows, hidden/2) across `me ^ {2, 4, 6}`, then intra-chip
-                  all-gather with `me ^ 1` (5 DMAs total, used at rows == 8).
-    two-shot      Core j owns columns [j * own, (j + 1) * own). Every core
-                  pushes each owner its columns; the owner sums them and pushes
-                  the sum back to everyone (used for 8 < rows < 24).
-    hier-2stage   On 8 cores (rows >= 24), 4-step hierarchical reduce-scatter +
-                  all-gather: intra-chip RS (rows, hidden/2) with `me ^ 1` ->
-                  4-chip RS (rows, hidden/8) with `me ^ {2, 4, 6}` -> 4-chip AG
-                  -> intra-chip AG. Cuts inter-chip DMA count and inter-chip
-                  bytes in half compared to flat two-shot.
+one-shot      Every core pushes its whole block to every other core and
+              sums the arrivals locally (XOR static-slot addressing on 8
+              cores eliminates @pl.when branches and self-copies).
+hier-halves   On 8 cores (4 chips x 2 cores/chip), intra-chip reduce-scatter
+              of (rows, hidden/2) with twin `me ^ 1`, 4-chip all-reduce of
+              (rows, hidden/2) across `me ^ {2, 4, 6}`, then intra-chip
+              all-gather with `me ^ 1` (5 DMAs total, used at rows == 8).
+two-shot      Core j owns columns [j * own, (j + 1) * own). Every core
+              pushes each owner its columns; the owner sums them and pushes
+              the sum back to everyone (used for 8 < rows < 24).
+hier-2stage   On 8 cores (rows >= 24), 4-step hierarchical reduce-scatter +
+              all-gather: intra-chip RS (rows, hidden/2) with `me ^ 1` ->
+              4-chip RS (rows, hidden/8) with `me ^ {2, 4, 6}` -> 4-chip AG
+              -> intra-chip AG. Cuts inter-chip DMA count and inter-chip
+              bytes in half compared to flat two-shot.
 """
 
 import jax.numpy as jnp
@@ -37,7 +37,6 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu.kernels.experimental.small_collectives.common import (
     LANES,
     barrier,
-    barrier_peers,
     call,
     push,
     split_rank,
@@ -175,18 +174,21 @@ def _hier_halves_col_zcopy(x, n, axis, rank, collective_id):
     dict_ids = rank is not None
 
     def kernel(*refs):
-        me, (
-            x_ref,
-            o_ref,
-            s1_recv,
-            s2_send,
-            s2_recv,
-            send1,
-            recv1,
-            send2,
-            recv2,
-            send3,
-            recv3,
+        (
+            me,
+            (
+                x_ref,
+                o_ref,
+                s1_recv,
+                s2_send,
+                s2_recv,
+                send1,
+                recv1,
+                send2,
+                recv2,
+                send3,
+                recv3,
+            ),
         ) = split_rank(refs, dict_ids, axis)
         barrier(n, axis, dict_ids)
 
@@ -349,12 +351,16 @@ def _twoshot(x, n, axis, rank, collective_id):
 
 
 def _hier_2stage_rs_ag(x, n, axis, rank, collective_id):
-    """4-step hierarchical Reduce-Scatter + All-Gather on 8 cores (4 chips x 2 cores/chip):
-    Step 1 (Intra-chip RS): exchange (rows, hidden/2) with `me ^ 1` (1 intra-chip DMA) -> sum (rows, hidden/2).
-    Step 2 (4-Chip RS): split (rows, hidden/2) into 4x (rows, hidden/8), exchange 3 slices with
-      `me ^ {2, 4, 6}` (3 inter-chip DMAs) -> sum (rows, hidden/8).
-    Step 3 (4-Chip AG): push (rows, hidden/8) to `me ^ {2, 4, 6}` (3 inter-chip DMAs) -> assemble (rows, hidden/2).
-    Step 4 (Intra-chip AG): push (rows, hidden/2) to `me ^ 1` (1 intra-chip DMA) -> write (rows, hidden).
+    """4-step hierarchical Reduce-Scatter + All-Gather on 8 cores (4 chips x 2
+    cores/chip):
+    Step 1 (Intra-chip RS): exchange (rows, hidden/2) with `me ^ 1` (1 intra-chip
+      DMA) -> sum (rows, hidden/2).
+    Step 2 (4-Chip RS): split (rows, hidden/2) into 4x (rows, hidden/8), exchange
+      3 slices with `me ^ {2, 4, 6}` (3 inter-chip DMAs) -> sum (rows, hidden/8).
+    Step 3 (4-Chip AG): push (rows, hidden/8) to `me ^ {2, 4, 6}` (3 inter-chip
+      DMAs) -> assemble (rows, hidden/2).
+    Step 4 (Intra-chip AG): push (rows, hidden/2) to `me ^ 1` (1 intra-chip DMA)
+      -> write (rows, hidden).
     """
     rows, hidden = x.shape
     half = hidden // 2
@@ -362,25 +368,28 @@ def _hier_2stage_rs_ag(x, n, axis, rank, collective_id):
     dict_ids = rank is not None
 
     def kernel(*refs):
-        me, (
-            x_ref,
-            o_ref,
-            s1_send,
-            s1_recv,
-            s1_sum,
-            s2_mine,
-            s2_slices,
-            s3_gathered,
-            s4_send,
-            s4_recv,
-            send1,
-            recv1,
-            send2,
-            recv2,
-            send3,
-            recv3,
-            send4,
-            recv4,
+        (
+            me,
+            (
+                x_ref,
+                o_ref,
+                s1_send,
+                s1_recv,
+                s1_sum,
+                s2_mine,
+                s2_slices,
+                s3_gathered,
+                s4_send,
+                s4_recv,
+                send1,
+                recv1,
+                send2,
+                recv2,
+                send3,
+                recv3,
+                send4,
+                recv4,
+            ),
         ) = split_rank(refs, dict_ids, axis)
         barrier(n, axis, dict_ids)
 

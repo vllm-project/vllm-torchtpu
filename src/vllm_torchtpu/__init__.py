@@ -664,8 +664,7 @@ def _patch_sequence_parallel_moe_admission() -> None:
 
     if envs.TPU_MOE_SEQUENCE_PARALLEL:
         ParallelConfig.use_sequence_parallel_moe = property(
-            lambda self: self.enable_expert_parallel
-            and self.tensor_parallel_size > 1
+            lambda self: self.enable_expert_parallel and self.tensor_parallel_size > 1
         )
     else:
         ParallelConfig.use_sequence_parallel_moe = property(lambda self: False)

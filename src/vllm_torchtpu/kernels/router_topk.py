@@ -11,8 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Fused MoE router scoring, group-limited top-k selection, and weight normalization.
-"""
+"""Fused MoE router scoring, group-limited top-k selection, and weight normalization."""
 
 import functools
 
