@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""TPU_SCHED_PACK_PROMPT_IDS: packed int32 prompt ids must reach the worker's
+"""Packed int32 prompt ids must reach the worker's
 InputBatch exactly as the list would, through the same pickling as
 vLLM's shm MessageQueue."""
 
@@ -24,7 +24,6 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
-
 from vllm import SamplingParams
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
@@ -50,7 +49,9 @@ def _mq_roundtrip(obj):
 
     dispatch_table = dict(copyreg.dispatch_table)
     with io.BytesIO() as bio:
-        p = pickle.Pickler(bio, protocol=pickle.HIGHEST_PROTOCOL, buffer_callback=oob_callback)
+        p = pickle.Pickler(
+            bio, protocol=pickle.HIGHEST_PROTOCOL, buffer_callback=oob_callback
+        )
         p.dispatch_table = dispatch_table
         p.dump(obj)
         data = bio.getvalue()
@@ -95,8 +96,8 @@ def test_list_pickle_baseline_is_larger():
 
 
 def test_worker_input_batch_identical(monkeypatch):
-    import vllm.v1.worker.gpu_input_batch as gib
     import vllm.v1.worker.block_table as bt
+    import vllm.v1.worker.gpu_input_batch as gib
 
     # CPU-only test host: no pinned-memory allocator.
     monkeypatch.setattr(gib, "PIN_MEMORY", False, raising=False)
@@ -129,7 +130,12 @@ def test_worker_input_batch_identical(monkeypatch):
         )
         assert st.num_prompt_tokens == n and st.num_tokens == n + 2
         assert [int(st.get_token_id(i)) for i in (0, 1, n - 1, n, n + 1, n + 2)] == [
-            ids[0], ids[1], ids[-1], 7, 8, -1
+            ids[0],
+            ids[1],
+            ids[-1],
+            7,
+            8,
+            -1,
         ]
         idx = ib.add_request(st)
         rows.append(
@@ -162,14 +168,15 @@ def test_exclusions_and_small_prompts():
     assert pack_prompt_ids([1, 2**40]) is None
 
 
-def test_scheduler_hook_and_kill_switch(monkeypatch):
+def test_scheduler_hook_and_off_switch():
     s = PrefixAwareScheduler.__new__(PrefixAwareScheduler)
     so = SimpleNamespace(scheduled_new_reqs=[_new_req(list(range(4096)))])
     s._maybe_pack_prompt_ids(so)
     assert isinstance(so.scheduled_new_reqs[0].prompt_token_ids, PackedPromptIds)
 
-    monkeypatch.setenv("TPU_SCHED_PACK_PROMPT_IDS", "0")
+    # A failed pack turns packing off for the scheduler's lifetime.
     s2 = PrefixAwareScheduler.__new__(PrefixAwareScheduler)
+    s2._pack_ids = False
     so2 = SimpleNamespace(scheduled_new_reqs=[_new_req(list(range(4096)))])
     s2._maybe_pack_prompt_ids(so2)
     assert type(so2.scheduled_new_reqs[0].prompt_token_ids) is list
