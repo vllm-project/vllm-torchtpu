@@ -25,9 +25,6 @@ import torch
 from vllm.compilation.backends import set_model_tag
 from vllm.config import VllmConfig, get_layers_from_vllm_config, set_current_vllm_config
 from vllm.forward_context import set_forward_context
-from vllm_torchtpu.runner import fast_forward_context as _ffc
-from vllm_torchtpu.runner import t3_host as _t3
-from vllm_torchtpu.runner.fast_forward_context import fast_set_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.v1.kv_cache_interface import FullAttentionSpec
@@ -45,6 +42,9 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
 )
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
+from vllm_torchtpu.runner import fast_forward_context as _ffc
+from vllm_torchtpu.runner import host_trims
+from vllm_torchtpu.runner.fast_forward_context import fast_set_forward_context
 from vllm_torchtpu.spec_decode.utils import (
     DraftChunkInputs,
     _force_draft_tp1,
@@ -678,8 +678,8 @@ class Eagle3Proposer:
                 seq_lens.copy_(seq_lens_step1)
                 self._mtp_fused_loop_warm = True
             out = self._mtp_fused_loop(input_ids, positions, hidden_states, seq_lens)
-        if _t3.AOT_SKIP_GUARDS:
-            _t3.maybe_skip_aot_guards(self._mtp_fused_loop)
+        if host_trims.AOT_SKIP_GUARDS:
+            host_trims.maybe_skip_aot_guards(self._mtp_fused_loop)
         return out
 
     def _draft_model_for_step(self, step_idx: int) -> torch.nn.Module:
@@ -2139,8 +2139,8 @@ class Eagle3Proposer:
                 model(**kwargs)
                 self._mtp_loop_model_warm = True
             out = model(**kwargs)
-        if _t3.AOT_SKIP_GUARDS:
-            _t3.maybe_skip_aot_guards(model)
+        if host_trims.AOT_SKIP_GUARDS:
+            host_trims.maybe_skip_aot_guards(model)
 
         return self._unwrap_model_out(out)
 
