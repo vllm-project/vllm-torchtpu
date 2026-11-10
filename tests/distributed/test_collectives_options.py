@@ -115,3 +115,11 @@ def test_validate_refuses_small_all_reduce_without_an_expert_parallel_group(
 def test_validate_rejects_a_malformed_section():
     with pytest.raises(ValueError, match="unknown keys"):
         co.validate(_config({"tpu_collectives": {"small_all_reduce_max_rows": 64}}))
+
+
+def test_the_section_is_registered():
+    """A tpu_* section the tree does not list is refused at engine start."""
+    from vllm_torchtpu import additional_config_sections as sections
+
+    assert co.SECTION in sections.KNOWN_SECTIONS
+    sections.check({co.SECTION: {"small_all_reduce": True}})
