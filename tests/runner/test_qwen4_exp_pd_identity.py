@@ -2,6 +2,7 @@
 """Loaded bytes and rank/state identity, without device or model snapshots."""
 
 import copy
+import hashlib
 
 import pytest
 import torch
@@ -108,6 +109,19 @@ def test_merged_identity_rejects_ranks_that_loaded_different_bytes():
         merged_identity([{}, {}])
     # A tensor outside the fragment does not take part in that digest.
     assert merged_identity(shards, name_fragment=".ple.")
+
+
+def test_fragment_without_matching_tensors_digests_the_empty_set():
+    # A Qwen4Exp config without PLE layers loads no ".ple." tensor; its PLE
+    # identity is the digest of the empty set, not an error.
+    dense, experts = ep_checkpoint()
+    dense = [(name, value) for name, value in dense if ".ple." not in name]
+    identity = LoadedWeightIdentity()
+    list(identity.observe(dense + experts))
+    empty = hashlib.sha256(b"{}").hexdigest()
+    assert identity.finish(name_fragment=".ple.") == empty
+    shards = ep_rank_records(dense, experts, 2)
+    assert merged_identity(shards, name_fragment=".ple.") == empty
 
 
 def ranks():

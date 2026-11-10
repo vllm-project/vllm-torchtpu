@@ -372,7 +372,7 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
             config.pop(name, None)
         checkpoint = model.pd_loaded_weight_identity
         ple_checkpoint = model.pd_loaded_ple_identity
-        weight_records = getattr(model, "pd_loaded_weight_records", None)
+        weight_records = model.pd_loaded_weight_records
         if weight_records is not None and group.world_size > 1:
             # Under --enable-ep-weight-filter each rank loads only its own
             # experts: identify the union the group loaded, not each share.

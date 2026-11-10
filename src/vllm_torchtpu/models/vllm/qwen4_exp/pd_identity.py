@@ -61,15 +61,19 @@ def merged_identity(
     a tensor two ranks loaded with different bytes is still rejected.
     """
     merged: dict = {}
+    loaded = False
     for records in per_rank_records:
         for name, value in records.items():
+            loaded = True
             if name_fragment is not None and name_fragment not in name:
                 continue
             value = (value[0], tuple(value[1]), value[2])
             previous = merged.setdefault(name, value)
             if previous != value:
                 raise ValueError(f"Qwen PD ranks loaded different bytes for {name}")
-    if not merged:
+    # Something must have been loaded; a fragment that matches none of it
+    # still digests the empty set, as finish() always did.
+    if not loaded:
         raise ValueError("PD identity requires successfully loaded checkpoint tensors")
     payload = json.dumps(merged, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode()).hexdigest()

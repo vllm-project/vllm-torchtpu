@@ -594,6 +594,7 @@ def test_qwen_register_runner_admits_actual_materialized_owners(
     cache.model = SimpleNamespace(
         pd_loaded_weight_identity=None if fault == "checkpoint" else "a" * 64,
         pd_loaded_ple_identity="b" * 64,
+        pd_loaded_weight_records=None,
         pd_gdn_qk_pair_layout=fault != "layout_flag",
         config=SimpleNamespace(to_dict=lambda: {"hidden_size": 16}),
         model=SimpleNamespace(
@@ -678,6 +679,71 @@ def test_qwen_register_runner_admits_actual_materialized_owners(
         assert (
             "moe_combine_dtype" not in payload["semantics"]["ranks"][0]["state_flags"]
         )
+
+
+def test_qwen_pd_semantics_digest_the_union_of_filtered_expert_shards(monkeypatch):
+    import torch
+
+    from tests.runner.test_qwen4_exp_pd_identity import (
+        ep_checkpoint,
+        ep_rank_records,
+    )
+    from vllm_torchtpu.models.vllm.qwen4_exp import pd_connector as module
+    from vllm_torchtpu.models.vllm.qwen4_exp.pd_identity import merged_identity
+
+    monkeypatch.setenv("TPU_GDN_CONV_QK_PAIR_LAYOUT", "1")
+    worker = qwen_worker(monkeypatch, tp=2)
+    worker.vllm_config.parallel_config.enable_expert_parallel = True
+    # Under --enable-ep-weight-filter each EP rank records the dense tensors
+    # and only its own experts, so its own digest is not the checkpoint's.
+    dense, experts = ep_checkpoint()
+    shards = ep_rank_records(dense, experts, 2)
+    attention = SimpleNamespace(
+        _k_scale_float=0.5,
+        _v_scale_float=0.25,
+        _k_scale_cpu=torch.tensor(0.5),
+        _v_scale_cpu=torch.tensor(0.25),
+    )
+    model = SimpleNamespace(
+        pd_loaded_weight_identity=merged_identity([shards[0]]),
+        pd_loaded_ple_identity=merged_identity([shards[0]], name_fragment=".ple."),
+        pd_loaded_weight_records=shards[0],
+        pd_gdn_qk_pair_layout=True,
+        config=SimpleNamespace(to_dict=lambda: {"hidden_size": 16}),
+        model=SimpleNamespace(
+            stage=[0],
+            layers=[SimpleNamespace(layer_type="full_attention", self_attn=attention)],
+        ),
+    )
+    runner = SimpleNamespace(
+        model_adapter=SimpleNamespace(cache=SimpleNamespace(model=model))
+    )
+    monkeypatch.setattr(
+        module,
+        "get_ep_group",
+        lambda: SimpleNamespace(rank_in_group=0, world_size=2, cpu_group="cpu"),
+    )
+    gathers = []
+
+    def gather(output, value, *, group):
+        assert group == "cpu"
+        gathers.append(value)
+        if value is shards[0]:
+            output[:] = shards
+        else:
+            output[:] = [value, dict(value, rank=1, tp_rank=1)]
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
+    semantics = worker._collect_pd_semantics(runner)
+
+    assert gathers[0] is shards[0] and len(gathers) == 2
+    expected = merged_identity(shards)
+    assert expected != model.pd_loaded_weight_identity
+    assert [r["checkpoint"] for r in semantics["ranks"]] == [expected, expected]
+    assert semantics["ranks"][0]["ple_checkpoint"] == merged_identity(
+        shards, name_fragment=".ple."
+    )
+    assert module._owner_invariant_semantics(semantics)["checkpoint"] == expected
 
 
 @pytest.mark.parametrize("enabled", [False, True])
