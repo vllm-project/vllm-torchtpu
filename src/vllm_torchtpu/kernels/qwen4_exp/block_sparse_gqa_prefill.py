@@ -2,6 +2,7 @@
 """QSA block-sparse prefill with query-block reuse across paged KV tiles."""
 
 import functools
+import math
 
 import jax
 import jax.numpy as jnp
@@ -13,6 +14,9 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.experimental.batched_rpa import utils
 from vllm_torchtpu.kernels.qwen4_exp.prefill_tiles import PAIRED_PAGE_VMEM_MIB
 from vllm_torchtpu.kernels.qwen4_exp.rounding import bf16
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
 
 # Extra query blocks of the intermediate block-aligned prefill layout, for
 # steps whose aligned requests overflow the token bucket by a few blocks
@@ -26,6 +30,26 @@ SPARE_QUERY_BLOCKS = 4
 PAIRED_PAGE_MAX_QUERY_ROWS = 256 * 24
 # KV tiles spanning several 128-token FP8 mask segments (selection words).
 PAIRED_KV_TILES = (256, 512, 1024)
+
+# VLLM_TPU_QSA_PREFILL_VPU features (see envs.py) and the set "1" selects.
+VPU_FEATURES = ("mask", "qk16", "pv16")
+VPU_DEFAULT = ("mask", "qk16", "pv16")
+
+
+def vpu_features():
+    """Features of the reduced-VPU inner loop requested by the environment."""
+    raw = envs.VLLM_TPU_QSA_PREFILL_VPU
+    if raw in ("", "0"):
+        return ()
+    names = VPU_DEFAULT if raw == "1" else tuple(
+        name.strip() for name in raw.split(",") if name.strip()
+    )
+    unknown = sorted(set(names) - set(VPU_FEATURES))
+    if unknown:
+        raise ValueError(f"Unknown VLLM_TPU_QSA_PREFILL_VPU features: {unknown}")
+    # The per-segment bits and diagonal-only guards are the path's base.
+    names = set(names) | {"mask"}
+    return tuple(name for name in VPU_FEATURES if name in names)
 
 
 def default_query_tile(query_block):
@@ -225,11 +249,16 @@ def _kernel(
     lean: bool = False,
     return_lse: bool = False,
     dcp_world: int = 1,
+    vpu: tuple = (),
 ):
     # DCP: a fourth scalar operand holds this rank; its KV tiles are its owned
     # page-sized blocks only (local tile t is global block t * dcp_world + rank).
     rank_ref = refs[0] if dcp_world > 1 else None
     refs = refs[1:] if dcp_world > 1 else refs
+    # VPU path: the next scalar operand holds each block's shortest live
+    # length; KV tiles ending at or before it need no causal/written guard.
+    min_length_ref = refs[0] if vpu else None
+    refs = refs[1:] if vpu else refs
     query_ref, bitset_ref, lengths_ref, cache_ref, output_ref = refs[:5]
     refs = refs[5:]
     lse_ref = refs[0] if return_lse else None
@@ -252,6 +281,16 @@ def _kernel(
     # The FP32 path folds the softmax and key scales into the queries once per
     # block instead of scaling every score of every visited KV tile.
     score_scale = sm_scale * k_scale
+    # VPU path, qk16: BF16 queries are exact in BF16; a power-of-two score
+    # scale keeps them exact after folding, otherwise the scores are scaled.
+    scale_folded = math.frexp(score_scale)[0] == 0.5
+    q16_vpu = (
+        query_ref[...]
+        .astype(jnp.float32)
+        .reshape(query_block, kv_heads, q_heads_per_kv, head_dim)
+        .transpose(1, 2, 0, 3)
+        * (score_scale if scale_folded else 1.0)
+    ).astype(jnp.bfloat16) if "qk16" in vpu else None
     if not bf16_mxu:
         q = q * score_scale
     positions = lengths_ref[:, 0] - 1
@@ -445,6 +484,121 @@ def _kernel(
                 accumulator_ref[query_tile_index, head, :, :] = (
                     acc * alpha[:, None] + weighted
                 )
+
+    def compute_tile_vpu(tile, kv_ref, boundary):
+        """compute_tile with less vector work per score (VLLM_TPU_QSA_PREFILL_VPU).
+
+        Each 128-key segment of a KV tile is covered by one selection word, so
+        the bits come from one lane-broadcast shift per segment instead of a
+        select chain over the whole tile. Only a ``boundary`` tile (one that
+        reaches the block's shortest live length) needs the causal and
+        written guards.
+        """
+        logical = tile * kv_tile
+        if dcp_world > 1:
+            logical = (tile * dcp_world + rank_ref[0]) * kv_tile
+        parts = bitset_ref.shape[0]
+        live = query_block // parts
+        tile_words = kv_tile // (ratio * 32)
+        # Move bit (lane // ratio) of the segment's word to the sign bit.
+        shift = 31 - lax.broadcasted_iota(jnp.int32, (1, ratio * 32), 1) // ratio
+        part_bits = []
+        for part in range(parts):
+            segments = [
+                bitset_ref[part, tile_words * tile + index, :live][:, None] << shift
+                for index in range(tile_words)
+            ]
+            part_bits.append(
+                segments[0] if tile_words == 1 else jnp.concatenate(segments, axis=1)
+            )
+        bits = part_bits[0] if parts == 1 else jnp.concatenate(part_bits, axis=0)
+        visible = bits < 0
+        if boundary:
+            visible &= logical + row[None, :] <= positions[:, None]
+            written = logical + lax.broadcasted_iota(
+                jnp.int32, (kv_tile, head_dim), 0
+            ) < jnp.max(lengths_ref[:, 0])
+        pv16 = "pv16" in vpu
+        key_values = []
+        for key, value in split_kv(kv_ref)[kv_head_offset : kv_head_offset + kv_heads]:
+            if kv_ref.dtype == jnp.float8_e4m3fn:
+                key = key.astype(jnp.float32)
+                value = value.astype(jnp.float32)
+                if not lean:
+                    guard = jnp.isfinite(key)
+                    key = jnp.where(guard & written if boundary else guard, key, 0)
+                guard = jnp.isfinite(value)
+                value = jnp.where(guard & written if boundary else guard, value, 0)
+            elif boundary:
+                key = jnp.where(written, key, 0)
+                value = jnp.where(written, value, 0)
+            if "qk16" in vpu:
+                key = key.astype(jnp.bfloat16)
+            if pv16:
+                value = value.astype(jnp.bfloat16)
+            key_values.append((key, value))
+        for query_tile_index in range(num_query_tiles):
+            start = query_tile_index * query_tile
+            tile_visible = visible[start : start + query_tile]
+            for head, (key, value) in enumerate(key_values):
+                m = max_ref[query_tile_index, head, :]
+                mass = mass_ref[query_tile_index, head, :]
+                acc = accumulator_ref[query_tile_index, head, :, :]
+                rows = query_tile * q_heads_per_kv
+                source = q16_vpu if "qk16" in vpu else q
+                query = source[head, :, start : start + query_tile].reshape(
+                    rows, head_dim
+                )
+                score = lax.dot(
+                    query,
+                    key,
+                    dimension_numbers=(([1], [1]), ([], [])),
+                    preferred_element_type=jnp.float32,
+                )
+                if "qk16" in vpu and not scale_folded:
+                    score = score * score_scale
+                row_visible = jnp.broadcast_to(
+                    tile_visible[None, :, :],
+                    (q_heads_per_kv, query_tile, kv_tile),
+                ).reshape(rows, kv_tile)
+                score = jnp.where(row_visible, score, -jnp.inf)
+                next_m = jnp.maximum(m, jnp.max(score, axis=1))
+                finite_m = jnp.where(jnp.isneginf(next_m), 0.0, next_m)
+                alpha = jnp.where(jnp.isneginf(next_m), 1.0, jnp.exp(m - next_m))
+                prob = jnp.exp(score - finite_m[:, None])
+                prob_sum = jnp.sum(prob, axis=1)
+                if pv16:
+                    # Mosaic already feeds an FP32 dot to the MXU as one BF16
+                    # pass (bit-identical on v7x); casting here only skips the
+                    # FP32 operand relayout.
+                    prob = prob.astype(jnp.bfloat16)
+                weighted = lax.dot(
+                    prob,
+                    value,
+                    dimension_numbers=(([1], [0]), ([], [])),
+                    preferred_element_type=jnp.float32,
+                )
+                max_ref[query_tile_index, head, :] = next_m
+                mass_ref[query_tile_index, head, :] = mass * alpha + prob_sum
+                accumulator_ref[query_tile_index, head, :, :] = (
+                    acc * alpha[:, None] + weighted
+                )
+
+    if vpu:
+        min_length = min_length_ref[block]
+
+        def compute_tile(tile, kv_ref):  # noqa: F811 (the VPU path's tile)
+            end = tile * kv_tile + kv_tile
+            if dcp_world > 1:
+                end = (tile * dcp_world + rank_ref[0]) * kv_tile + kv_tile
+
+            @pl.when(end <= min_length)
+            def interior():
+                compute_tile_vpu(tile, kv_ref, False)
+
+            @pl.when(end > min_length)
+            def boundary():
+                compute_tile_vpu(tile, kv_ref, True)
 
     @pl.when(count > 0)
     def prefetch_first():
@@ -937,8 +1091,25 @@ def _block_sparse_gqa_prefill(
         query_tile = default_query_tile(query_block)
     if query_block % query_tile or query_tile % 8:
         raise ValueError("Query subtiles must evenly split the query block")
+    # VLLM_TPU_QSA_PREFILL_VPU: the per-segment bits need one 128-key
+    # selection word per lane row (ratio 4); BF16 operands need BF16 queries.
+    vpu = vpu_features() if ratio * 32 == 128 and bf16_io else ()
+    if query_tile % 16:
+        vpu = tuple(name for name in vpu if name == "mask")
+    if vpu:
+        logger.info_once(
+            "QSA sparse prefill VPU path on: features=%s "
+            "(VLLM_TPU_QSA_PREFILL_VPU=%s)",
+            ",".join(vpu),
+            envs.VLLM_TPU_QSA_PREFILL_VPU,
+        )
+        live_lengths = jnp.where(lengths > 0, lengths, jnp.iinfo(jnp.int32).max)
+        min_lengths = jnp.min(
+            live_lengths.reshape(nblocks, query_block), axis=1
+        ).astype(jnp.int32)
     bf16_mxu = (
-        envs.VLLM_TPU_QSA_PREFILL_BF16_MXU
+        not vpu
+        and envs.VLLM_TPU_QSA_PREFILL_BF16_MXU
         and bf16_io
         and query_tile % 16 == 0
         and cache.dtype in (jnp.float8_e4m3fn, jnp.bfloat16)
@@ -974,9 +1145,10 @@ def _block_sparse_gqa_prefill(
             **({"lean": True} if envs.VLLM_TPU_QSA_PREFILL_LEAN else {}),
             **({"return_lse": True} if return_lse else {}),
             **({"dcp_world": dcp_world} if dcp else {}),
+            **({"vpu": vpu} if vpu else {}),
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=4 if dcp else 3,
+            num_scalar_prefetch=3 + int(dcp) + int(bool(vpu)),
             grid=(nblocks,),
             in_specs=[
                 pl.BlockSpec(
@@ -1047,6 +1219,7 @@ def _block_sparse_gqa_prefill(
         active_tiles.reshape(-1),
         active_counts,
         *([jnp.asarray(dcp_rank, jnp.int32).reshape(1)] if dcp else []),
+        *([min_lengths] if vpu else []),
         query.astype(jnp.bfloat16 if bf16_io else jnp.float32),
         block_bits_native,
         lengths[:, None],
