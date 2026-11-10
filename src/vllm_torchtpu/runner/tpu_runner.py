@@ -4200,7 +4200,7 @@ class TPUModelRunner(GPUModelRunner):
             num_reqs = state.num_reqs_list[0]
             md = state.spec_decode_metadata_list[0]
             bound = self.max_num_reqs * (
-                1 + self.speculative_config.num_speculative_tokens
+                1 + cast(Any, self.speculative_config).num_speculative_tokens
             )
             dl_dev = (
                 md.draft_lengths
@@ -4285,7 +4285,7 @@ class TPUModelRunner(GPUModelRunner):
                 else self._get_zero_draft_lengths(B1)
             )
             bound = self.max_num_reqs * (
-                1 + self.speculative_config.num_speculative_tokens
+                1 + cast(Any, self.speculative_config).num_speculative_tokens
             )
             if (
                 deferred_mamba_indices is not None
@@ -5049,6 +5049,9 @@ class TPUModelRunner(GPUModelRunner):
             )
 
             num_rejected_dev, seq_idx_dev, pos_idx_dev = _pending_rejected_sub
+            # _pending_rejected_sub comes from the previous step's results.
+            pre_async = self._pre_async_results
+            assert pre_async is not None
             if (
                 seq_lens.device.type == "tpu"
                 and getattr(self, "max_num_reqs", None) is not None
@@ -5058,12 +5061,10 @@ class TPUModelRunner(GPUModelRunner):
                         num_rejected_dev,
                         (0, self.max_num_reqs - num_rejected_dev.shape[0]),
                     )
-                    self._pre_async_results.spec_decode_num_rejected_tokens = (
-                        num_rejected_dev
-                    )
+                    pre_async.spec_decode_num_rejected_tokens = num_rejected_dev
                 can_fuse_subst = (
                     len(cur_input_indices) > 0
-                    and self._pre_async_results.next_tokens_tpu is not None
+                    and pre_async.next_tokens_tpu is not None
                     and "_apply_async_token_substitution"
                     not in getattr(self, "__dict__", {})
                 )
@@ -5097,7 +5098,7 @@ class TPUModelRunner(GPUModelRunner):
                                     pos_idx_dev,
                                     self.input_ids,
                                     substitution_indices,
-                                    self._pre_async_results.next_tokens_tpu,
+                                    pre_async.next_tokens_tpu,
                                     spec_decode_metadata.final_logits_indices,
                                     spec_decode_metadata.target_logits_indices,
                                 )
@@ -5122,7 +5123,7 @@ class TPUModelRunner(GPUModelRunner):
                                 pos_idx_dev,
                                 self.input_ids,
                                 substitution_indices,
-                                self._pre_async_results.next_tokens_tpu,
+                                pre_async.next_tokens_tpu,
                                 spec_decode_metadata.final_logits_indices,
                                 spec_decode_metadata.target_logits_indices,
                             )
@@ -5152,7 +5153,7 @@ class TPUModelRunner(GPUModelRunner):
                             pos_idx_dev,
                             self.input_ids,
                             substitution_indices,
-                            self._pre_async_results.next_tokens_tpu,
+                            pre_async.next_tokens_tpu,
                         )
                     self._fused_async_subst_done = True
                 else:
@@ -7721,7 +7722,7 @@ class TPUModelRunner(GPUModelRunner):
                 if spec_num_rejected is not None:
                     assert self.speculative_config is not None
                     bound = self.max_num_reqs * (
-                        1 + self.speculative_config.num_speculative_tokens
+                        1 + cast(Any, self.speculative_config).num_speculative_tokens
                     )
                     if next_tokens_tpu.shape[0] < bound:
                         next_tokens_tpu = torch.nn.functional.pad(
@@ -9308,7 +9309,7 @@ class TPUModelRunner(GPUModelRunner):
             getattr(self, "most_model_len", None) is not None
             and getattr(self, "num_reqs_most_model_len", None) is not None
         ):
-            knr_buckets.add(self.num_reqs_most_model_len)
+            knr_buckets.add(int(self.num_reqs_most_model_len))
         bound = self.max_num_reqs * (1 + k)
         req_loop_pairs = sorted(
             {
