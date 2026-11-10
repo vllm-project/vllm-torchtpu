@@ -9231,11 +9231,12 @@ class TPUModelRunner(GPUModelRunner):
         )
 
         knr_buckets = {self.num_reqs_max_model_len}
+        num_reqs_most = getattr(self, "num_reqs_most_model_len", None)
         if (
             getattr(self, "most_model_len", None) is not None
-            and getattr(self, "num_reqs_most_model_len", None) is not None
+            and num_reqs_most is not None
         ):
-            knr_buckets.add(int(self.num_reqs_most_model_len))
+            knr_buckets.add(num_reqs_most)
         bound = self.max_num_reqs * (1 + k)
         req_loop_pairs = sorted(
             {

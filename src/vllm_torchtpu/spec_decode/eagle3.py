@@ -3307,11 +3307,12 @@ class Eagle3Proposer:
         )
         K = self.speculative_config.num_speculative_tokens
         knr_buckets = {runner.num_reqs_max_model_len}
+        num_reqs_most = getattr(runner, "num_reqs_most_model_len", None)
         if (
             getattr(runner, "most_model_len", None) is not None
-            and getattr(runner, "num_reqs_most_model_len", None) is not None
+            and num_reqs_most is not None
         ):
-            knr_buckets.add(int(runner.num_reqs_most_model_len))
+            knr_buckets.add(num_reqs_most)
         req_loop_pairs = sorted(
             {
                 (
@@ -3459,11 +3460,12 @@ class Eagle3Proposer:
         )
         all_sizes = set(runner.num_reqs_paddings) | set(loop_p_buckets)
         knr_buckets = {runner.num_reqs_max_model_len}
+        num_reqs_most = getattr(runner, "num_reqs_most_model_len", None)
         if (
             getattr(runner, "most_model_len", None) is not None
-            and getattr(runner, "num_reqs_most_model_len", None) is not None
+            and num_reqs_most is not None
         ):
-            knr_buckets.add(int(runner.num_reqs_most_model_len))
+            knr_buckets.add(num_reqs_most)
         with (
             set_model_tag("eagle_head"),
             runner._precompile_timed("drafter compute_logits"),
