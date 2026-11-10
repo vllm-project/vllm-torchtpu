@@ -271,6 +271,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MAMBA_CHECKPOINT_RETENTION: bool = True
     VLLM_TPU_MAMBA_DECODE_CHECKPOINT: bool = True
     VLLM_TPU_MAMBA_TAIL_FOLD: bool = False
+    VLLM_TPU_MAMBA_TAIL_FOLD_UNIT: int = 0
     VLLM_TORCHTPU_IPC_KEY: str = ""
     TPU_SHARDED_LOAD_SYNC_EVERY: int = 512
     VLLM_TPU_MXFP4_DEVICE_DEQUANT: bool = True
@@ -1796,6 +1797,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the GDN / conv / PLE state at that boundary from inside the step
     # (core/mamba_tail_fold.py). Engine core and workers.
     "VLLM_TPU_MAMBA_TAIL_FOLD": env_bool("VLLM_TPU_MAMBA_TAIL_FOLD", default=False),
+    # With VLLM_TPU_MAMBA_TAIL_FOLD: the granularity (tokens) of the internal
+    # prefill checkpoint and of prefix-cache hits. 0 = the Mamba block (512,
+    # unchanged). A finer unit (e.g. 256) that divides the Mamba block and is a
+    # multiple of the largest GDN prefill tile (128, 256 with TPU_GDN_CHUNK_PAIR)
+    # checkpoints the prompt nearer its end, so the next turn's prefix hit
+    # stops at most unit - 1 tokens short of the prior prompt instead of up
+    # to 511. Also sets --prefix-match-unit to the unit when it is unset.
+    "VLLM_TPU_MAMBA_TAIL_FOLD_UNIT": env_int("VLLM_TPU_MAMBA_TAIL_FOLD_UNIT", 0),
     # Secret for the KV-transfer IPC socket; "" derives one from the host.
     # Read raw, not through env_str: a secret's bytes must not be trimmed.
     "VLLM_TORCHTPU_IPC_KEY": lambda: os.getenv("VLLM_TORCHTPU_IPC_KEY", ""),

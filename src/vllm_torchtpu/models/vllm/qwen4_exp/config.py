@@ -16,6 +16,7 @@
 import math
 
 import torch
+from vllm.logger import init_logger
 from vllm.model_executor.models.config import (
     Qwen4ExpForCausalLMConfig,
     VerifyAndUpdateConfig,
@@ -26,6 +27,8 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.gdn_pool_layout import unified_kv_layout_enabled_for_architecture
 
 from .ple_host import host_available_memory
+
+logger = init_logger(__name__)
 
 # Model-owned prefill/decode disaggregation (see pd_connector.py).
 PD_CONNECTOR = "Qwen4ExpRaidenConnector"
@@ -307,6 +310,38 @@ def pooled_pool_blocks(
     return blocks
 
 
+def _apply_tail_fold_unit(cache_config, mamba_block_size: int) -> None:
+    """VLLM_TPU_MAMBA_TAIL_FOLD_UNIT: hash prompts at the fold unit.
+
+    The fold checkpoints the Mamba state at the prompt's last unit boundary,
+    and prefix hits must land on the same boundaries, so the unit is also the
+    prefix-match unit. Set it when the launch leaves ``--prefix-match-unit``
+    unset; any other explicit value is kept and the fold's guard then turns
+    the fold off with a warning (core/mamba_tail_fold.py).
+    """
+    from vllm_torchtpu.core.mamba_tail_fold import fold_unit
+
+    if (
+        not envs.VLLM_TPU_MAMBA_TAIL_FOLD
+        or envs.VLLM_TPU_MAMBA_TAIL_FOLD_UNIT <= 0
+        or not cache_config.enable_prefix_caching
+        or cache_config.mamba_cache_mode != "align"
+    ):
+        return
+    unit = fold_unit(mamba_block_size)
+    if unit == mamba_block_size:
+        return
+    if getattr(cache_config, "prefix_match_unit", None) is None:
+        cache_config.prefix_match_unit = unit
+        logger.info(
+            "VLLM_TPU_MAMBA_TAIL_FOLD_UNIT=%d: prefix_match_unit set to %d "
+            "(Mamba block %d).",
+            unit,
+            unit,
+            mamba_block_size,
+        )
+
+
 class TPUQwen4ExpConfig(VerifyAndUpdateConfig):
     @staticmethod
     def verify_and_update_config(vllm_config):
@@ -352,6 +387,7 @@ class TPUQwen4ExpConfig(VerifyAndUpdateConfig):
                 else None
             )
             vllm_config.cache_config.mamba_page_size_padded = layout.page_bytes
+            _apply_tail_fold_unit(vllm_config.cache_config, layout.block_size)
             if hbm_pool_sizing(vllm_config):
                 # Workers report the pool budget after profiling
                 # (Qwen4ExpPooledCache.memory_budget); vLLM plans the blocks.

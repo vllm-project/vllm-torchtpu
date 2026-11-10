@@ -26,6 +26,7 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu import envs as tpu_envs
+from vllm_torchtpu.core.mamba_tail_fold import fold_unit
 from vllm_torchtpu.gdn_pool_layout import (
     derive_pooled_gdn_state_layout,
     pooled_gdn_conv_state_bytes,
@@ -935,8 +936,11 @@ def run_jax_gdn_attention_pooled_local(
         conv_weight_kmajor=conv_weight_kmajor,
         per_seq_inputs=per_seq_inputs,
         prefill_ckpt=prefill_ckpt,
-        # Checkpoint offsets are whole manager blocks (core/mamba_tail_fold.py).
-        prefill_ckpt_alignment=pool_block_tokens if prefill_ckpt is not None else 0,
+        # Checkpoint offsets are whole fold units, by default whole manager
+        # blocks (core/mamba_tail_fold.py).
+        prefill_ckpt_alignment=(
+            fold_unit(pool_block_tokens) if prefill_ckpt is not None else 0
+        ),
     )
     return recurrent_state, output
 
