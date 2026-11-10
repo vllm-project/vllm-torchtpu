@@ -36,7 +36,7 @@ from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
 from vllm.model_executor.models.qwen3_next import Qwen3NextAttention
 
-from vllm_torchtpu.layers.adapter import fused_qk_norm_rope as fused
+from vllm_torchtpu.models.qwen3_5.kernels import fused_qk_norm_rope as fused
 
 pytestmark = pytest.mark.cpu_test
 
