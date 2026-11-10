@@ -287,7 +287,8 @@ CTX_C = [
 def _run_c(key: int = 17, T: int = 4, long: bool = False, shard: bool = False, rank_ids: bool = False,
            union: bool = False, stats: bool = False, loop: bool = False, ctx: list | None = None,
            max_groups: int | None = None, phys: bool = False, dcp: int = 1, dcp_pool: bool = True,
-           shared_kv: bool = False, cdcp: bool = False, cdcp_keys: bool = True, ck_fn=None):
+           shared_kv: bool = False, cdcp: bool = False, cdcp_keys: bool = True, ck_fn=None,
+           async_dma: bool = False):
     from vllm_torchtpu.megakernel.wholestep.qsa_full_b import DBG_IDS, DBG_IQ
     from vllm_torchtpu.megakernel.wholestep.qsa_full_c import (
         CK_NEW,
@@ -336,7 +337,8 @@ def _run_c(key: int = 17, T: int = 4, long: bool = False, shard: bool = False, r
         qsa=dict(budget=BUDGET),
         step=True,
         indexed=dict(
-            max_groups=MG, pages_per_seq=pps, debug=True, **(long_kw if long else {})
+            max_groups=MG, pages_per_seq=pps, debug=True, async_dma=async_dma,
+            **(long_kw if long else {})
         ),
     )
     w_mk, states = wi.pack_wholestep(spec, G, ex, d, L)
@@ -1108,3 +1110,18 @@ def test_partial_last_cycle_ends_on_qsa_matches_reference():
     for r in range(R):
         dd = np.abs(res[r, :T] - refn[:T])
         assert dd.mean() < 3e-2 * k * scale, (r, dd.mean() / scale)
+
+
+@pytest.mark.parametrize("kw", [
+    dict(long=True, union=True, shard=True, loop=True),
+    dict(long=True, union=True, shard=True),
+    dict(long=True),
+])
+def test_async_selection_dmas_bit_identical(kw):
+    """VLLM_TPU_MK_QSEL_ASYNC: the selection's SMEM id copies and the new group's loads /
+    stores issued together (waited once) leave every output byte-identical."""
+    base = _run_c(rank_ids=True, **kw)
+    run = _run_c(rank_ids=True, async_dma=True, **kw)
+    for a, b in ((base[0], run[0]), (base[3], run[3]), (base[4], run[4]), (base[7], run[7]),
+                 (base[8]["_kr_new"], run[8]["_kr_new"]), (base[8]["_ir_new"], run[8]["_ir_new"])):
+        np.testing.assert_array_equal(np.asarray(a), np.asarray(b))

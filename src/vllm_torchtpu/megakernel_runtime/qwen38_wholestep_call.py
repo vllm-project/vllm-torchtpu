@@ -101,6 +101,7 @@ def indexed_options() -> dict:
         LONG_CONTEXT, shard_index=SHARD_INDEX, union_attn=UNION_ATTN, union_stats=union_stats_on(),
         loop_requests=LOOP_REQUESTS, union_phys=UNION_ATTN and UNION_PHYS, dcp=main_kv_dcp(),
         compressed_dcp=compressed_dcp(),
+        async_dma=envs.VLLM_TPU_MK_QSEL_ASYNC,
     )
 
 
