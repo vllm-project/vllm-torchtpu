@@ -29,6 +29,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.megablox import gmm_v2 as gmm_v2_module
 from vllm_torchtpu.kernels.megablox.gmm_v2 import (
+    FP8_RHS_TILE_M,
     HYBRID_DEQUANT_AFTER_MATMUL_MAX_ROWS,
     TileSizes,
     apply_act_fn,
@@ -415,6 +416,70 @@ def test_gmm_fp4_hybrid_dequant_matches_reference(fuse_act, monkeypatch):
         ref,
     )
     assert err <= 2e-2 * ref, (err, ref)
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("size_m", [128, 512, 2048])
+def test_gmm_fp8_feed_wide_keeps_fp8_tiles(size_m, monkeypatch):
+    """Decode MoE shape whose tile_m growth VMEM stops at 64 rows: under
+    "fp8_feed_wide" it keeps the fp8 32-row tiles, and each row's output is
+    bitwise the one it gets from an lhs small enough for "fp8_feed"'s own
+    fp8 tiles (64 rows)."""
+    _require_tpu()
+
+    in_size, out_size, block_size = 6144, 6144, 128
+    sizes = [3, 1, 17, 0, 9, 2, 0, 16, 5, 0, 0, 4, 1, 0, 6, 0]
+    num_rows = sum(sizes)
+    group_sizes = jnp.array(sizes, dtype=jnp.int32)
+    group_offset = jnp.array([0], dtype=jnp.int32)
+    k_lhs, k_rhs = jax.random.split(jax.random.key(0))
+    lhs = jax.random.uniform(k_lhs, (size_m, in_size), jnp.bfloat16, -1, 1)
+    rhs = jax.random.uniform(
+        k_rhs, (len(sizes), in_size, out_size), jnp.float32, -1, 1
+    )
+    rhs_q, rhs_scale = quantize_tensor(
+        rhs, jnp.float4_e2m1fn, axis=1, block_size=block_size
+    )
+    rhs_scale = jnp.expand_dims(rhs_scale, axis=2)
+
+    def tiles(x):
+        return make_gmm_configs(
+            x,
+            rhs_q,
+            rhs_scale,
+            None,
+            group_sizes,
+            group_offset,
+            tile_info=calculate_tiling,
+            vmem_limit_bytes=int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.9),
+            out_dtype=None,
+            acc_dtype=None,
+            maybe_quantize_lhs=False,
+            zero_initialize=False,
+            fuse_act="swigluoai",
+        ).tiles
+
+    def run(x):
+        jax.clear_caches()  # gmm_v2 is jitted; its config is read at trace
+        return gmm_v2(
+            x,
+            rhs_q,
+            group_sizes,
+            rhs_scale=rhs_scale,
+            group_offset=group_offset,
+            maybe_quantize_lhs=False,
+            zero_initialize=False,
+            fuse_act="swigluoai",
+        )[:num_rows]
+
+    monkeypatch.setattr(gmm_v2_module, "_skinny_gmm_path", "fp8_feed")
+    assert tiles(lhs[:64]).tile_m == FP8_RHS_TILE_M
+    small = run(lhs[:64])
+    monkeypatch.setattr(gmm_v2_module, "_skinny_gmm_path", "fp8_feed_wide")
+    assert tiles(lhs).tile_m == FP8_RHS_TILE_M
+    wide = run(lhs)
+    jax.clear_caches()
+    np.testing.assert_array_equal(np.asarray(wide), np.asarray(small))
 
 
 @pytest.mark.tpu_test

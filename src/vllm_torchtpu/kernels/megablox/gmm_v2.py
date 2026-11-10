@@ -161,9 +161,14 @@ FP8_RHS_TILE_M = 32
 # (`fp8_rhs_feed_dtype`, buckets up to FP8_RHS_MAX_BUCKET_M rows, and
 # gmm_v2_mlp's fused kernel); "bf16_after" keeps the bf16 per-block path
 # (`SKINNY_DEQUANT_AFTER_MATMUL_M`, `HYBRID_DEQUANT_AFTER_MATMUL_MAX_ROWS`).
+# "fp8_feed_wide" is "fp8_feed" that also keeps the fp8 tiles (tile_m
+# FP8_RHS_TILE_M) up to FP8_RHS_WIDE_MAX_M rows when VMEM stopped tile_m's
+# growth: from 128 decode rows (T=32) "fp8_feed" grows tile_m past
+# FP8_RHS_MAX_BUCKET_M and drops every bucket to bf16 dequantize-before.
 # Set with --additional-config '{"moe_skinny_gmm": "bf16_after"}'
 # (`set_skinny_gmm_path`), before the model's first trace.
-SKINNY_GMM_PATHS = ("fp8_feed", "bf16_after")
+SKINNY_GMM_PATHS = ("fp8_feed", "bf16_after", "fp8_feed_wide")
+FP8_RHS_WIDE_MAX_M = 2048
 _skinny_gmm_path = "fp8_feed"
 
 
@@ -349,7 +354,7 @@ def fp8_rhs_feed_dtype(
     Feeding it to the MXU (scale applied after the matmul) halves the weight
     pushes of the bf16 dequantize-before-matmul path, which bind at skinny m.
     """
-    if _skinny_gmm_path != "fp8_feed":
+    if _skinny_gmm_path not in ("fp8_feed", "fp8_feed_wide"):
         return None
     fp8 = jnp.float8_e4m3fn.dtype
     rhs_q = rhs_cfgs.quant_dtype
@@ -1357,10 +1362,19 @@ def calculate_tiling(
     # rows, and rows cost MXU time on the fp8 rhs feed: use fp8-sized tiles in
     # two buckets. Two such tiles cost what one bf16 tile does, and more
     # buckets would bloat the program (each bucket is a copy of the body).
+    # "fp8_feed_wide" takes them even when VMEM stopped the growth: a tile_m
+    # above FP8_RHS_MAX_BUCKET_M would otherwise drop every bucket to the bf16
+    # dequantize-before-matmul path.
     sublane = _get_lhs_sublane_size(lhs_cfgs.dtype, dims.size_m)
     if (
         bucket_base == tile_m
-        and dims.size_m < 2 * tile_m  # growth stopped by size_m, not VMEM
+        and (
+            dims.size_m < 2 * tile_m  # growth stopped by size_m, not VMEM
+            or (
+                _skinny_gmm_path == "fp8_feed_wide"
+                and dims.size_m <= FP8_RHS_WIDE_MAX_M
+            )
+        )
         and fp8_rhs_feed_dtype(lhs_cfgs, rhs_cfgs) is not None
     ):
         if tile_m > FP8_RHS_MAX_BUCKET_M and tile_m % FP8_RHS_TILE_M == 0:
