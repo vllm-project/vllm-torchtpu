@@ -27,23 +27,22 @@ both options default to off):
   ``GLOBAL_STATE`` guards (CPU intra-op ``num_threads``, ``grad_mode``) so
   warmup entries are reused across threads while preserving all tensor and
   value guards. Off, the filter keeps every guard.
-* ``VLLM_TPU_T3_GUARD_MEMO=1`` (default off): on top of the direct dispatch,
+* The guard memo (``runner.host_trims`` turns it on under the batch-1 rule;
+  it only acts with ``fast_compiled_call``): on top of the direct dispatch,
   remember which cache entry the guard check selected for an argument
   *signature* (per tensor: shape, stride, dtype, device, requires_grad; per
   Python scalar / None / str: its type and value; any other object: its id;
   lists and tuples element-wise) and dispatch later calls with the same
   signature to that entry without re-running ``guard_manager.check``. The
   memo is dropped whenever the code object's cache entries change (recompile
-  or eviction). ``VLLM_TPU_T3_GUARD_MEMO=check`` still runs the guard check on
-  every memo hit, dispatches the guard-selected entry, and counts calls where
-  the memo would have picked an entry whose guards fail (logged).
+  or eviction). A guard on something the signature does not cover (a global,
+  or an attribute of an argument object) is not re-checked on a memo hit.
 """
 
 from __future__ import annotations
 
 import functools
 import inspect
-import os
 import types
 from typing import Any
 
@@ -55,20 +54,9 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 _STATS = [0, 0]  # [fast, slow]
-# VLLM_TPU_T3_GUARD_MEMO: "" / "0" off, "1" on, "check" on with verification.
-def _parse_memo_mode(value: str | None) -> str:
-    v = (value or "").strip().lower()
-    if v in ("", "0", "false", "off", "no"):
-        return ""
-    return "check" if v == "check" else "1"
-
-
-# VLLM_TPU_T3_HOST=1 is the master switch for the IX track-3 host trims; an
-# explicit VLLM_TPU_T3_GUARD_MEMO wins over it.
-_MEMO_MODE = _parse_memo_mode(
-    os.environ.get("VLLM_TPU_T3_GUARD_MEMO", os.environ.get("VLLM_TPU_T3_HOST"))
-)
-_MEMO_STATS = {"hit": 0, "store": 0, "check_ok": 0, "check_mismatch": 0, "nokey": 0}
+# The guard memo: off until runner.host_trims applies the batch-1 rule.
+_MEMO = {"on": False}
+_MEMO_STATS = {"hit": 0, "store": 0, "nokey": 0}
 _MEMO_MAX_ENTRIES = 64
 _MEMO_MAX_SEQ = 16
 _SCALARS = (bool, int, float, str)
@@ -101,6 +89,13 @@ def _memo_key(args: tuple | list) -> tuple | None:
 
 def memo_stats() -> dict[str, int]:
     return dict(_MEMO_STATS)
+
+
+def configure_guard_memo(enabled: bool) -> None:
+    """Turn the guard memo on or off for this process (``runner.host_trims``)."""
+    _MEMO["on"] = bool(enabled)
+
+
 _LOG_EVERY = 20000
 _INSTALLED = False
 # Armed by configure(); both off until the worker applies tpu_compile.
@@ -150,7 +145,7 @@ def _wrap(compiled: Any, fn: types.FunctionType) -> Any:
         "count": -1,
         "disabled": not simple_sig,
         "logged": False,
-        "memo": {},  # signature -> direct fn (VLLM_TPU_T3_GUARD_MEMO)
+        "memo": {},  # signature -> direct fn (guard memo)
         "memo_count": -1,
     }
 
@@ -224,19 +219,16 @@ def _wrap(compiled: Any, fn: types.FunctionType) -> Any:
 
     def _note(fast: bool) -> None:
         _STATS[0 if fast else 1] += 1
-        if (_STATS[0] + _STATS[1]) % (_LOG_EVERY // 4 if _MEMO_MODE else _LOG_EVERY) == 0:
-            if _MEMO_MODE:
+        if (_STATS[0] + _STATS[1]) % _LOG_EVERY == 0:
+            if _MEMO["on"]:
                 logger.info(
-                    "fast_compiled_call: fast=%d slow=%d t3_guard_memo(%s)=%s",
+                    "fast_compiled_call: fast=%d slow=%d guard_memo=%s",
                     _STATS[0],
                     _STATS[1],
-                    _MEMO_MODE,
                     _MEMO_STATS,
                 )
             else:
-                logger.info(
-                    "fast_compiled_call: fast=%d slow=%d", _STATS[0], _STATS[1]
-                )
+                logger.info("fast_compiled_call: fast=%d slow=%d", _STATS[0], _STATS[1])
 
     def _memo_dispatch(args: tuple, count: int) -> Any:
         """Memo lookup; returns the direct fn to call or None."""
@@ -251,32 +243,6 @@ def _wrap(compiled: Any, fn: types.FunctionType) -> Any:
         hit = state["memo"].get(key)
         if hit is None:
             return None
-        if _MEMO_MODE == "check":
-            f_locals = _f_locals(args, {})
-            sel = None
-            for gm, direct in state["entries"]:
-                if gm.check(f_locals):
-                    sel = direct
-                    break
-            # Guard sets can overlap; the memo is right whenever the memoized
-            # entry's own guards accept the call.
-            ok = sel is hit or any(
-                d is hit and gm.check(f_locals) for gm, d in state["entries"]
-            )
-            if ok:
-                _MEMO_STATS["check_ok"] += 1
-            else:
-                _MEMO_STATS["check_mismatch"] += 1
-                if _MEMO_STATS["check_mismatch"] <= 20:
-                    logger.warning(
-                        "VLLM_TPU_T3_GUARD_MEMO=check: memo entry for %s fails "
-                        "its guards (guard-selected: %s)",
-                        fn.__qualname__,
-                        "none" if sel is None else "other entry",
-                    )
-            if sel is None:
-                return None
-            hit = sel
         _MEMO_STATS["hit"] += 1
         return hit
 
@@ -304,7 +270,7 @@ def _wrap(compiled: Any, fn: types.FunctionType) -> Any:
                 and stance_mod._stance.stance == "default"
                 and not torch.compiler.is_compiling()
             ):
-                if _MEMO_MODE and not kwargs and len(args) == nargs:
+                if _MEMO["on"] and not kwargs and len(args) == nargs:
                     count = _entry_count(code)
                     if count == state["count"]:
                         hit = _memo_dispatch(args, count)
@@ -315,7 +281,7 @@ def _wrap(compiled: Any, fn: types.FunctionType) -> Any:
                 if f_locals is not None and _entry_count(code) == state["count"]:
                     for idx, (gm, direct) in enumerate(entries):
                         if gm.check(f_locals):
-                            if _MEMO_MODE and not kwargs and len(args) == nargs:
+                            if _MEMO["on"] and not kwargs and len(args) == nargs:
                                 _memo_store(args, direct, state["count"])
                             if idx > 0:
                                 item = entries.pop(idx)
