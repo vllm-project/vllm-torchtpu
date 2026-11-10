@@ -189,18 +189,45 @@ def load_activation_as_compact(
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """Load activations from VMEM as a compact layout."""
 
-    qkv_vmem_ref[...] = qkv_vreg.astype(qkv_vmem_ref.dtype)
-
     k_offset = cfgs.num_kq_heads * cfgs.kq_head_dim
     v_offset = 2 * k_offset
+    num_lanes = pltpu.get_tpu_info().num_lanes
 
-    q_compact = load_compact_heads(qkv_vmem_ref, cfgs.num_kq_heads, cfgs.kq_head_dim)
-    k_compact = load_compact_heads(
-        qkv_vmem_ref, cfgs.num_kq_heads, cfgs.kq_head_dim, k_offset
-    )
-    v_compact = load_compact_heads(
-        qkv_vmem_ref, cfgs.num_v_heads, cfgs.v_head_dim, v_offset
-    )
+    if cfgs.kq_head_dim % num_lanes == 0 and cfgs.v_head_dim % num_lanes == 0:
+        # Lane-aligned heads: slice them out of the conv output in registers
+        # instead of storing it to VMEM and loading it back per head.
+        q_list = [
+            qkv_vreg[..., h * cfgs.kq_head_dim : (h + 1) * cfgs.kq_head_dim]
+            for h in range(cfgs.num_kq_heads)
+        ]
+        k_list = [
+            qkv_vreg[
+                ...,
+                k_offset + h * cfgs.kq_head_dim : k_offset + (h + 1) * cfgs.kq_head_dim,
+            ]
+            for h in range(cfgs.num_kq_heads)
+        ]
+        v_list = [
+            qkv_vreg[
+                ...,
+                v_offset + h * cfgs.v_head_dim : v_offset + (h + 1) * cfgs.v_head_dim,
+            ]
+            for h in range(cfgs.num_v_heads)
+        ]
+        q_compact = jnp.stack(q_list, axis=1)
+        k_compact = jnp.stack(k_list, axis=1)
+        v_compact = jnp.stack(v_list, axis=1)
+    else:
+        qkv_vmem_ref[...] = qkv_vreg.astype(qkv_vmem_ref.dtype)
+        q_compact = load_compact_heads(
+            qkv_vmem_ref, cfgs.num_kq_heads, cfgs.kq_head_dim
+        )
+        k_compact = load_compact_heads(
+            qkv_vmem_ref, cfgs.num_kq_heads, cfgs.kq_head_dim, k_offset
+        )
+        v_compact = load_compact_heads(
+            qkv_vmem_ref, cfgs.num_v_heads, cfgs.v_head_dim, v_offset
+        )
     b_compact = jnp.expand_dims(b_vmem_ref[...], axis=1)
     if cfgs.is_kda:
         # KDA's gate is per-channel, so it splits into heads like q/k/v do
