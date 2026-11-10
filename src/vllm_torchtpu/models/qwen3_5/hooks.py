@@ -19,7 +19,9 @@ architectures in ``settings.ARCHITECTURES``, so vLLM calls it from
 ``check_and_update_config``) for those models only. It keeps vLLM's own
 Qwen3.5 checks, validates ``additional_config["qwen3_5"]``, and applies
 the TPU defaults below. Each default fills a value only when the user left it
-unset, so an explicit command-line value always wins.
+unset, so an explicit command-line value always wins. It also refuses a
+``qwen3_5`` or ``tpu_*`` section of ``additional_config`` that no reader in
+this build claims (``additional_config_sections``).
 
 - ``kv_cache_memory_bytes``: a shape-calibrated budget, except on a
   ``kv_producer`` (prefill) leg, which stays on ``gpu_memory_utilization``.
@@ -32,6 +34,7 @@ from typing import TYPE_CHECKING
 
 from vllm.model_executor.models.config import Qwen3_5ForConditionalGenerationConfig
 
+from vllm_torchtpu import additional_config_sections
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.qwen3_5 import settings
 
@@ -143,6 +146,9 @@ class TPUQwen35MoeConfig(Qwen3_5ForConditionalGenerationConfig):
     @staticmethod
     def verify_and_update_config(vllm_config: VllmConfig) -> None:
         Qwen3_5ForConditionalGenerationConfig.verify_and_update_config(vllm_config)
+        # Fails at engine start on a qwen3_5 or tpu_* section this build does
+        # not read, so a deployment never runs silently without it.
+        additional_config_sections.check(vllm_config.additional_config)
         # Fails at engine start on an unknown setting or a wrongly typed value.
         settings.get(vllm_config)
         apply_serving_defaults(vllm_config)
