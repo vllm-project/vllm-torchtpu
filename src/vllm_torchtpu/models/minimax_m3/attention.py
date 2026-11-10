@@ -181,6 +181,21 @@ def tile_select_enabled(vllm_config: VllmConfig) -> bool:
     return enabled
 
 
+# --additional-config key: DCP decode candidates scan only each row block's
+# live pages (`kernels.msa_dcp._live_candidates`). Part of the compile-cache key.
+LIVE_SELECT_KEY = "minimax_msa_live_select"
+
+
+def live_select_enabled(vllm_config: VllmConfig) -> bool:
+    config = vllm_config.additional_config
+    if not isinstance(config, dict):
+        return False
+    enabled = config.get(LIVE_SELECT_KEY, False)
+    if not isinstance(enabled, bool):
+        raise ValueError(f"additional_config.{LIVE_SELECT_KEY} must be a bool")
+    return enabled
+
+
 @functools.cache
 def _dcp_rank_tensor(rank: int, device: str) -> torch.Tensor:
     """One ``int32[1]`` rank tensor shared by every MSA layer's buffer.
@@ -381,6 +396,7 @@ class MiniMaxM3SparseAttention(nn.Module):
         # With one index head per rank, each rank can keep a 1 / tp share of
         # the index keys (`kernels.msa` index-cache sharding).
         msa_dcp.TILE_SELECT_ENABLED = tile_select_enabled(get_current_vllm_config())
+        msa_dcp.LIVE_SELECT_ENABLED = live_select_enabled(get_current_vllm_config())
         shard = shard_index_cache_enabled(get_current_vllm_config())
         self.index_shards = tp_size if shard else 1
         if self.index_shards > 1 and tp_size != config.num_key_value_heads:

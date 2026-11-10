@@ -242,6 +242,7 @@ _TRANSPOSED_ROWS = 128
         "local_blocks",
         "dcp",
         "block_rows",
+        "live_select",
         "interpret",
     ),
 )
@@ -257,12 +258,17 @@ def local_candidates(
     dcp: int,
     block_rows: int = msa_select.DEFAULT_BLOCK_ROWS,
     live_rows: jax.Array | None = None,
+    live_select: bool = False,
     interpret: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """This rank's top-k ``(scores [T, topk] f32, blocks [T, topk] i32)``.
 
     With `live_rows` (a traced count), only the row blocks holding rows
     ``[0, live_rows)`` are picked; the other rows' results are unset.
+
+    With `live_select`, a batch that would scan the full width (at most
+    `_MIN_CANDIDATE_TOKENS` rows) copies in and scans only the columns its
+    row block sees (`_live_candidates_kernel`), with the same picks.
 
     ``scores [T, 1, P]`` are this rank's block scores (column ``c`` is global
     block ``c * dcp + rank``), or ``[P, T]`` transposed (the large tiles'
@@ -307,6 +313,26 @@ def local_candidates(
         w = jnp.asarray(widths, jnp.int32)
         row_widths = jnp.min(jnp.where(w >= needed[:, None], w, num_cols), axis=1)
     transposed = block_rows % _TRANSPOSED_ROWS == 0
+    if live_select and len(widths) == 1 and _live_fits(num_cols, pretransposed):
+        picked_scores, picked_blocks = _live_candidates(
+            s,
+            p.T if transposed else p,
+            rank_array(rank),
+            num_blocks=num_blocks,
+            block_rows=block_rows,
+            transposed=transposed,
+            pretransposed=pretransposed,
+            block_size=block_size,
+            topk=topk,
+            init_blocks=init_blocks,
+            local_blocks=local_blocks,
+            dcp=dcp,
+            live_rows=live_rows,
+            interpret=interpret,
+        )
+        if transposed:
+            picked_scores, picked_blocks = picked_scores.T, picked_blocks.T
+        return picked_scores[:num_tokens], picked_blocks[:num_tokens]
     if transposed:
         kernel = functools.partial(_candidates_kernel_t, pretransposed=pretransposed)
         pos_spec = pl.BlockSpec((1, block_rows), lambda i: (0, i))
@@ -358,6 +384,273 @@ def local_candidates(
     if transposed:
         picked_scores, picked_blocks = picked_scores.T, picked_blocks.T
     return picked_scores[:num_tokens], picked_blocks[:num_tokens]
+
+
+# Set from `--additional-config '{"minimax_msa_live_select": true}'` at layer
+# init (`attention.live_select_enabled`); read at trace time. Off by default.
+LIVE_SELECT_ENABLED = False
+
+# Columns a `_live_candidates_kernel` loop step scans when they sit on
+# sublanes (8 vregs of a 128-row block), and columns per copy when the
+# scores keep them on lanes.
+_LIVE_CHUNK = 64
+_LANES = 128
+_NO_COL = jnp.iinfo(jnp.int32).max
+
+
+def _live_fits(num_cols: int, pretransposed: bool) -> bool:
+    """Whether `_live_candidates` takes scores of `num_cols` columns: whole
+    vregs per copy (8 sublanes or 128 lanes)."""
+    return num_cols % (8 if pretransposed else _LANES) == 0
+
+
+def _live_columns(
+    pos: jax.Array, rank: jax.Array, *, block_size: int, dcp: int, num_cols: int
+) -> jax.Array:
+    """Columns any row of each row block of ``pos [blocks, rows]`` sees: the
+    rank's blocks below ``n`` are its first ``ceil((n - rank) / dcp)``
+    columns, so this is the local page count (`local_seq_lens`) of the
+    block's longest request."""
+    num_visible = jnp.max(pos, axis=1) // block_size + 1
+    return jnp.clip(-(-(num_visible - rank) // dcp), 0, num_cols)
+
+
+def _live_chunks(need, cols: int):
+    """Loop steps of `cols` columns that cover the first `need` columns."""
+    return (need + cols - 1) // cols
+
+
+def _live_candidates_kernel(
+    # Scalar prefetch
+    counts_ref,  # [2] rank, grid steps
+    need_ref,  # [row blocks] columns any row of the block sees
+    # In
+    scores_hbm,  # [T, P] (or [P, T] pretransposed) scores in HBM
+    pos_ref,  # [rows, 1] (or [1, rows] transposed)
+    # Out
+    score_out_ref,  # [rows, topk] (or [topk, rows] transposed)
+    block_out_ref,
+    # Scratch
+    buf_ref,  # [2, rows, P] (or [2, P, rows] pretransposed): two blocks
+    sems,  # DMA semaphores, one per buffer
+    masked_ref,  # [rows, P] (or [P, rows] transposed): masked scores
+    *,
+    block_size,
+    topk,
+    init_blocks,
+    local_blocks,
+    dcp,
+    col_axis,
+    src_axis,
+    copy_cols,
+    scan_cols,
+):
+    """`_candidates_kernel` (``col_axis`` 1) or `_candidates_kernel_t`
+    (``col_axis`` 0) over the first ``need_ref[i]`` columns of row block
+    ``i`` only, with the same picks: a column past every row's last visible
+    block is ``-inf`` for all of them, so it only ever ties a pick that is
+    already a miss ``(-inf, -1)``.
+
+    The block's live columns are copied in ``copy_cols`` at a time (the next
+    block's while this one picks). Each pick scans ``scan_cols`` at a time
+    and keeps a running max and its first column per vreg slot (strict ``>``
+    over columns in increasing order keeps the lowest of equal scores), then
+    reduces the slots once; the previous pick is cleared on the same scan."""
+    i = pl.program_id(0)
+    rank, steps = counts_ref[0], counts_ref[1]
+    slot = i % 2
+    num_visible = pos_ref[...] // block_size + 1
+    rows = num_visible.shape[1 - col_axis]
+    unit = 8 if col_axis == 0 else _LANES
+    slot_shape = (unit, rows) if col_axis == 0 else (rows, unit)
+    slot_col = jax.lax.broadcasted_iota(jnp.int32, slot_shape, col_axis)
+
+    def num_chunks(block, cols):
+        return _live_chunks(need_ref[block], cols)
+
+    def copy_block(block, buf, op):
+        def body(c, carry):
+            cols = pl.ds(pl.multiple_of(c * copy_cols, copy_cols), copy_cols)
+            block_rows = pl.ds(pl.multiple_of(block * rows, rows), rows)
+            src, dst = (
+                (scores_hbm.at[cols, block_rows], buf_ref.at[buf, cols])
+                if src_axis == 0
+                else (scores_hbm.at[block_rows, cols], buf_ref.at[buf, :, cols])
+            )
+            getattr(pltpu.make_async_copy(src, dst, sems.at[buf]), op)()
+            return carry
+
+        jax.lax.fori_loop(0, num_chunks(block, copy_cols), body, 0)
+
+    @pl.when(i == 0)
+    def _first():
+        copy_block(0, 0, "start")
+
+    @pl.when(i + 1 < steps)
+    def _next():
+        copy_block(i + 1, 1 - slot, "start")
+
+    copy_block(i, slot, "wait")
+
+    def chunk_cols(base, n):
+        shape = (n, rows) if col_axis == 0 else (rows, n)
+        return jax.lax.broadcasted_iota(jnp.int32, shape, col_axis) + base
+
+    def masked_at(base, n):
+        cols = pl.ds(pl.multiple_of(base, n), n)
+        return masked_ref.at[cols] if col_axis == 0 else masked_ref.at[:, cols]
+
+    def accumulate(best, s, base):
+        m, col = best
+        for k in range(s.shape[col_axis] // unit):
+            v = jax.lax.slice_in_dim(s, k * unit, (k + 1) * unit, axis=col_axis)
+            gt = v > m
+            m = jnp.where(gt, v, m)
+            col = jnp.where(gt, slot_col + (base + k * unit), col)
+        return m, col
+
+    def first_scan(c, best):
+        base = c * copy_cols
+        cols = pl.ds(pl.multiple_of(base, copy_cols), copy_cols)
+        s = buf_ref[slot, cols] if src_axis == 0 else buf_ref[slot, :, cols]
+        if src_axis != col_axis:
+            s = s.T
+        blocks = chunk_cols(base, copy_cols) * dcp + rank
+        visible = blocks < num_visible
+        s = jnp.where(visible, s, _NEG_INF)
+        s = jnp.where(
+            visible & (blocks >= num_visible - local_blocks),
+            msa_select._FORCED_LOCAL_SCORE,
+            s,
+        )
+        s = jnp.where(
+            visible & (blocks < init_blocks), msa_select._FORCED_INIT_SCORE, s
+        )
+        masked_at(base, copy_cols)[...] = s
+        return accumulate(best, s, base)
+
+    def later_scan(picked):
+        def body(c, best):
+            base = c * scan_cols
+            ref = masked_at(base, scan_cols)
+            s = jnp.where(chunk_cols(base, scan_cols) == picked, _NEG_INF, ref[...])
+            ref[...] = s
+            return accumulate(best, s, base)
+
+        return body
+
+    init = (
+        jnp.full(slot_shape, _NEG_INF, jnp.float32),
+        jnp.full(slot_shape, _NO_COL, jnp.int32),
+    )
+    scan, trips = first_scan, num_chunks(i, copy_cols)
+    picked_scores, picked_blocks = [], []
+    for _ in range(topk):
+        m, col = jax.lax.fori_loop(0, trips, scan, init)
+        best_score = jnp.max(m, axis=col_axis, keepdims=True)
+        best = jnp.min(
+            jnp.where(m == best_score, col, _NO_COL), axis=col_axis, keepdims=True
+        )
+        picked_scores.append(best_score)
+        picked_blocks.append(jnp.where(best_score > _NEG_INF, best * dcp + rank, -1))
+        scan, trips = later_scan(best), num_chunks(i, scan_cols)
+    score_out_ref[...] = jnp.concatenate(picked_scores, axis=col_axis)
+    block_out_ref[...] = jnp.concatenate(picked_blocks, axis=col_axis)
+
+
+def _live_candidates(
+    s: jax.Array,
+    p: jax.Array,
+    rank: jax.Array,
+    *,
+    num_blocks: int,
+    block_rows: int,
+    transposed: bool,
+    pretransposed: bool,
+    block_size: int,
+    topk: int,
+    init_blocks: int,
+    local_blocks: int,
+    dcp: int,
+    live_rows: jax.Array | None,
+    interpret: bool,
+) -> tuple[jax.Array, jax.Array]:
+    """`local_candidates`' pick of padded scores ``s`` (``[T, P]``, or
+    ``[P, T]`` pretransposed) and positions ``p`` (``[T, 1]``, or ``[1, T]``
+    when `transposed`) with `_live_candidates_kernel`: picks ``[T, topk]``
+    (``[topk, T]`` when `transposed`)."""
+    num_cols = s.shape[0] if pretransposed else s.shape[1]
+    col_axis = 0 if transposed else 1
+    src_axis = 0 if pretransposed else 1
+    if src_axis == 0:
+        copy_cols = _select_chunk(num_cols)
+    else:
+        copy_cols = _LANES
+    scan_cols = min(_LIVE_CHUNK, copy_cols) if col_axis == 0 else _LANES
+    need = _live_columns(
+        p.reshape(num_blocks, block_rows),
+        rank[0],
+        block_size=block_size,
+        dcp=dcp,
+        num_cols=num_cols,
+    )
+    steps = (
+        num_blocks
+        if live_rows is None
+        else jnp.clip(-(-live_rows // block_rows), 1, num_blocks).astype(jnp.int32)
+    )
+    if transposed:
+        pos_spec = pl.BlockSpec((1, block_rows), lambda i, *_: (0, i))
+        out_spec = pl.BlockSpec((topk, block_rows), lambda i, *_: (0, i))
+        out_dims = (topk, num_blocks * block_rows)
+    else:
+        pos_spec = pl.BlockSpec((block_rows, 1), lambda i, *_: (i, 0))
+        out_spec = pl.BlockSpec((block_rows, topk), lambda i, *_: (i, 0))
+        out_dims = (num_blocks * block_rows, topk)
+    buf_block = (num_cols, block_rows) if src_axis == 0 else (block_rows, num_cols)
+    masked_block = (num_cols, block_rows) if col_axis == 0 else (block_rows, num_cols)
+    kernel = functools.partial(
+        _live_candidates_kernel,
+        block_size=block_size,
+        topk=topk,
+        init_blocks=init_blocks,
+        local_blocks=local_blocks,
+        dcp=dcp,
+        col_axis=col_axis,
+        src_axis=src_axis,
+        copy_cols=copy_cols,
+        scan_cols=scan_cols,
+    )
+    return pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=2,
+            grid=(steps,),
+            in_specs=[pl.BlockSpec(memory_space=pl.ANY), pos_spec],
+            out_specs=[out_spec, out_spec],
+            scratch_shapes=[
+                pltpu.VMEM((2, *buf_block), s.dtype),
+                pltpu.SemaphoreType.DMA((2,)),
+                pltpu.VMEM(masked_block, s.dtype),
+            ],
+        ),
+        out_shape=[
+            jax.ShapeDtypeStruct(out_dims, jnp.float32),
+            jax.ShapeDtypeStruct(out_dims, jnp.int32),
+        ],
+        compiler_params=pltpu.CompilerParams(
+            # The next block's copy starts in this block's step.
+            dimension_semantics=("arbitrary",),
+            vmem_limit_bytes=msa_select._VMEM_LIMIT_BYTES,
+        ),
+        interpret=interpret,
+        name="minimax_m3_msa_dcp_live_candidates",
+    )(
+        jnp.stack([rank[0], jnp.asarray(steps, jnp.int32)]),
+        need.astype(jnp.int32),
+        s,
+        p,
+    )
 
 
 def pack_candidates(scores: jax.Array, blocks: jax.Array) -> jax.Array:
@@ -1195,6 +1488,7 @@ def msa_write_and_candidates_dcp(
         local_blocks=local_blocks,
         rank=rank,
         dcp=dcp,
+        live_select=LIVE_SELECT_ENABLED,
         interpret=interpret,
     )
     if tile_select(num_tokens, num_heads):
