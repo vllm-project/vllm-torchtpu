@@ -39,7 +39,7 @@ from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 from vllm_torchtpu.layers.adapter.attention import PallasMLAttentionBackend
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.owned_kv_cache import TpuOwnedKVCache
-from vllm_torchtpu.models.minimax_m3.kernels import msa_fp4
+from vllm_torchtpu.models.minimax_m3.kernels import msa_dcp, msa_fp4
 from vllm_torchtpu.models.minimax_m3.ops.msa import (
     get_msa_dcp_op,
     get_msa_op,
@@ -163,6 +163,21 @@ def shard_index_cache_enabled(vllm_config: VllmConfig) -> bool:
     enabled = config.get(SHARD_INDEX_CACHE_KEY, False)
     if not isinstance(enabled, bool):
         raise ValueError(f"additional_config.{SHARD_INDEX_CACHE_KEY} must be a bool")
+    return enabled
+
+
+# --additional-config key: pick DCP prefill candidates per query tile
+# (`kernels.msa_dcp._tile_candidates`). Part of the compile-cache key.
+TILE_SELECT_KEY = "minimax_msa_tile_select"
+
+
+def tile_select_enabled(vllm_config: VllmConfig) -> bool:
+    config = vllm_config.additional_config
+    if not isinstance(config, dict):
+        return False
+    enabled = config.get(TILE_SELECT_KEY, False)
+    if not isinstance(enabled, bool):
+        raise ValueError(f"additional_config.{TILE_SELECT_KEY} must be a bool")
     return enabled
 
 
@@ -365,6 +380,7 @@ class MiniMaxM3SparseAttention(nn.Module):
         )
         # With one index head per rank, each rank can keep a 1 / tp share of
         # the index keys (`kernels.msa` index-cache sharding).
+        msa_dcp.TILE_SELECT_ENABLED = tile_select_enabled(get_current_vllm_config())
         shard = shard_index_cache_enabled(get_current_vllm_config())
         self.index_shards = tp_size if shard else 1
         if self.index_shards > 1 and tp_size != config.num_key_value_heads:

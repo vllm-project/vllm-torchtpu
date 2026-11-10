@@ -590,10 +590,19 @@ def _class_candidates(
 TILE_SELECT_MIN_TOKENS = 1024
 
 
+# Set from `--additional-config '{"minimax_msa_tile_select": true}'` at layer
+# init (`attention.tile_select_enabled`); read at trace time. Off by default.
+TILE_SELECT_ENABLED = False
+
+
 def tile_select(num_tokens: int, num_heads: int = 1) -> bool:
     """Whether a step of `num_tokens` tokens and `num_heads` KV heads per
     rank picks its candidates with `_tile_candidates`."""
-    return num_tokens >= TILE_SELECT_MIN_TOKENS and num_heads & (num_heads - 1) == 0
+    return (
+        TILE_SELECT_ENABLED
+        and num_tokens >= TILE_SELECT_MIN_TOKENS
+        and num_heads & (num_heads - 1) == 0
+    )
 
 
 _NO_ROW = jnp.iinfo(jnp.int32).max

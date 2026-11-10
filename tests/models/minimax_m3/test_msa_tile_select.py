@@ -120,7 +120,8 @@ def _inputs(rng, q_lens, ctx_lens, dcp, heads, pad):
 
 
 def _candidates(monkeypatch, tile, caches, tensors, meta, rank, dcp, **config):
-    monkeypatch.setattr(msa_dcp, "TILE_SELECT_MIN_TOKENS", 0 if tile else 1 << 30)
+    monkeypatch.setattr(msa_dcp, "TILE_SELECT_ENABLED", tile)
+    monkeypatch.setattr(msa_dcp, "TILE_SELECT_MIN_TOKENS", 0)
     _, _, cand = msa_dcp.msa_write_and_candidates_dcp(
         *tensors, *caches, *meta, rank=rank, dcp=dcp, interpret=True, **config
     )
@@ -246,6 +247,20 @@ _COMPILE_SHAPES = [
 ]
 
 
+def _bf16_scatters(text):
+    """Result types of the `stablehlo.scatter` ops in `text` that hold bf16."""
+    lines = text.splitlines()
+    found = []
+    for i, line in enumerate(lines):
+        if "stablehlo.scatter" not in line:
+            continue
+        # A scatter with an update region ends at its `}) : (...) -> ...` line.
+        end = next((j for j in range(i, len(lines)) if "->" in lines[j]), i)
+        if "bf16" in lines[end].split("->")[-1]:
+            found.append(lines[end].strip())
+    return found
+
+
 @pytest.mark.parametrize("dcp,heads,num_tokens,cache", _COMPILE_SHAPES)
 def test_tile_select_compiles_for_tpu7x(monkeypatch, dcp, heads, num_tokens, cache):
     """The DCP score op of a prefill step (writes, both tile classes and
@@ -292,12 +307,30 @@ def test_tile_select_compiles_for_tpu7x(monkeypatch, dcp, heads, num_tokens, cac
             *rest, topk=TOPK, init_blocks=1, local_blocks=1, rank=rank, dcp=dcp
         )
 
+    monkeypatch.setattr(msa_dcp, "TILE_SELECT_ENABLED", True)
     assert msa_dcp.tile_select(num_tokens)
     tpu7x = AbstractMesh((), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu"))
     with use_abstract_mesh(tpu7x):
         lowered = jax.jit(score).lower(*args)
         text = lowered.as_text()
         assert "minimax_m3_msa_tile_select" in text
-        assert "scatter" not in text
+        # The int32 step-metadata scatter stays; the bf16 head fold must not.
+        assert not _bf16_scatters(text)
         assert lowered.out_info[2].shape == (num_tokens, heads * 2 * TOPK)
         assert lowered.compile() is not None
+
+
+def test_tile_select_toggle():
+    from types import SimpleNamespace
+
+    from vllm_torchtpu.models.minimax_m3 import attention
+
+    assert not msa_dcp.TILE_SELECT_ENABLED
+    assert not attention.tile_select_enabled(SimpleNamespace(additional_config={}))
+    assert not attention.tile_select_enabled(SimpleNamespace(additional_config=None))
+    on = SimpleNamespace(additional_config={attention.TILE_SELECT_KEY: True})
+    assert attention.tile_select_enabled(on)
+    with pytest.raises(ValueError):
+        attention.tile_select_enabled(
+            SimpleNamespace(additional_config={attention.TILE_SELECT_KEY: "yes"})
+        )
