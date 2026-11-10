@@ -805,3 +805,69 @@ def test_head_and_vocab_shard_buffers_are_int32():
     assert masked.dtype == torch.int32
     assert masked.tolist() == [0, 0, 1, 0, 0]
     assert mask.tolist() == [True, False, False, True, True]
+
+
+def _fused_candidate_block_inputs(blocks: int):
+    """Two requests: req 0 has two drafts, req 1 has one (rows d, d, bonus)."""
+    gen = torch.Generator().manual_seed(7)
+    num_cand = blocks * 128
+    return dict(
+        logits=torch.randn(5, blocks * 128 * 2, generator=gen),
+        draft_token_ids=torch.tensor([3, 9, 5], dtype=torch.int32),
+        num_draft_tokens=torch.tensor([2, 1], dtype=torch.int32),
+        bonus_logits_indices=torch.tensor([2, 4], dtype=torch.int32),
+        target_logits_indices=torch.tensor([0, 1, 3], dtype=torch.int32),
+        segment_ids=torch.tensor([0, 0, 1], dtype=torch.int64),
+        group_indices=torch.tensor([0, 1, 0], dtype=torch.int32),
+        max_draft_tokens=2,
+        req_temperatures=torch.ones((2, 1)),
+        req_top_k=torch.full((2, 1), blocks // 2, dtype=torch.int32),
+        req_top_p=torch.ones((2, 1)),
+        accept_u=None,
+        u_all=torch.rand((5, num_cand + 1), generator=gen),
+        topk_candidates=blocks,
+    )
+
+
+def test_fused_candidate_blocks_cut_off_at_half_the_block_count(monkeypatch):
+    # The runner takes the candidate-block path only while every request has
+    # 1 <= top_k <= blocks // 2, so the fused sampler's k-th value needs a
+    # top-(blocks // 2): 20 at TPU_SAMPLER_TOPK_CANDIDATES=40. Packed top-32
+    # candidates keep a top-32.
+    from vllm_torchtpu.layers.adapter.sample import rejection_sampler as rs
+
+    real = rs.apply_top_k_top_p
+    widths: list[int] = []
+
+    def spy(logits, top_k, top_p, topk_candidates=0, max_k=0):
+        widths.append(max_k)
+        return real(logits, top_k, top_p, topk_candidates, max_k=max_k)
+
+    def full_width(logits, top_k, top_p, topk_candidates=0, max_k=0):
+        return real(logits, top_k, top_p, topk_candidates, max_k=8)
+
+    sampler = RejectionSampler()
+    monkeypatch.setattr(rs, "apply_top_k_top_p", spy)
+    with torch.compiler.set_stance("force_eager"):
+        out = sampler.fused_verify_and_sample_candidates(
+            **_fused_candidate_block_inputs(8)
+        )
+    assert widths == [4]
+
+    # The same tokens as the block-count width it replaces.
+    monkeypatch.setattr(rs, "apply_top_k_top_p", full_width)
+    with torch.compiler.set_stance("force_eager"):
+        out_full = sampler.fused_verify_and_sample_candidates(
+            **_fused_candidate_block_inputs(8)
+        )
+    assert torch.equal(out, out_full)
+
+    widths.clear()
+    monkeypatch.setattr(rs, "apply_top_k_top_p", spy)
+    packed = _fused_candidate_block_inputs(8)
+    packed["logits"] = torch.randn(5, 2 * 64)
+    packed["u_all"] = torch.rand((5, 64 + 1))
+    packed["topk_candidates"] = 0
+    with torch.compiler.set_stance("force_eager"):
+        sampler.fused_verify_and_sample_candidates(**packed)
+    assert widths == [32]
