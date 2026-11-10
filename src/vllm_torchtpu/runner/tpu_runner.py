@@ -4229,7 +4229,10 @@ class TPUModelRunner(GPUModelRunner):
         if kind == "admit":
             info = (
                 f"new={len(new_reqs)} prompt="
-                + ",".join(str(len(r.prompt_token_ids or ())) for r in new_reqs)
+                + ",".join(
+                    str(0 if r.prompt_token_ids is None else len(r.prompt_token_ids))
+                    for r in new_reqs
+                )
                 + " cached="
                 + ",".join(str(r.num_computed_tokens) for r in new_reqs)
                 + f" toks={scheduler_output.total_num_scheduled_tokens}"

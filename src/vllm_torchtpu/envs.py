@@ -298,6 +298,7 @@ if TYPE_CHECKING:
     VLLM_TPU_LOG_POST_WARMUP_COMPILES: bool = False
     VLLM_TPU_CPU_PIN: str = "off"
     VLLM_TPU_HOST_PHASES: int = 0
+    VLLM_TPU_PROMPT_IDS_NDARRAY: bool = False
     VLLM_TPU_SERIALIZE_COPY_WAIT: bool = False
     VLLM_TPU_PINNED_TOKEN_COPY: bool = False
     VLLM_TPU_SAMPLING_PARAMS_REUSE: bool = False
@@ -1895,6 +1896,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Log each rank's per-step host time by runner phase every N steps
     # (0 = off); runner/host_phases.py.
     "VLLM_TPU_HOST_PHASES": env_nonnegative_int("VLLM_TPU_HOST_PHASES", 0),
+    # Ship a new request's prompt token ids to the workers as one int32
+    # ndarray (converted once when the request is added) instead of a Python
+    # list. A ~100K-token agentic prompt otherwise costs every rank a list
+    # unpickle plus a list->numpy copy into token_ids_cpu on the admit step's
+    # critical path (core/prefix_aware_scheduler.py). Same token values.
+    "VLLM_TPU_PROMPT_IDS_NDARRAY": env_bool("VLLM_TPU_PROMPT_IDS_NDARRAY"),
     # Let only one thread synchronize a sampled-token copy at a time (the
     # async-output thread and the deferred previous-results wait share one).
     "VLLM_TPU_SERIALIZE_COPY_WAIT": env_bool("VLLM_TPU_SERIALIZE_COPY_WAIT"),
