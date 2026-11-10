@@ -793,6 +793,16 @@ def prebuild_fused_moe_ep(
     """
     if not envs.USE_MOE_FUSED_EP_KERNEL:
         return None
+    if envs.MOE_FUSED_EP_KERNEL_IMPL == "v3":
+        # The FP8 method builds v3 and never comes here under a v3 request, so
+        # reaching this means a method v3 does not serve: refuse instead of
+        # serving the request with v2 (or with no fused kernel at all).
+        raise ValueError(
+            "MOE_FUSED_EP_KERNEL_IMPL=v3 selects the fused EP v3 kernel, which "
+            f"serves FP8 MoE layers; this layer ({weight_format} weights) would "
+            "build the v2 kernel instead. Set MOE_FUSED_EP_KERNEL_IMPL=v2 or "
+            "adaptive for this model."
+        )
     if weight_format == "fp4" and not envs.MOE_FUSED_EP_ENABLE_W4A8:
         return None
 

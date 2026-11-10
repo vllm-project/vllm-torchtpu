@@ -621,19 +621,21 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool, activation: str) 
             tp,
             _step_min_tokens(),
         )
-        if _sp.min_rows() // tp < envs.TPU_MOE_FUSED_EP_STEP_MIN_TOKENS:
+        gate = _step_min_tokens()
+        if _sp.min_rows() // tp < gate:
             logger.warning_once(
-                "Fused EP MoE: TPU_SP_MIN_ROWS=%d gives %d rows per rank at the "
-                "first sequence-parallel step, below "
-                "TPU_MOE_FUSED_EP_STEP_MIN_TOKENS=%d, so the kernel's share of "
-                "the SP steps is decided by a traced row-count guard; a bucket "
-                "at exactly %d tokens may fail to trace (see "
-                "_fused_kernel_takes). Set TPU_SP_MIN_ROWS >= %d.",
+                "Fused EP MoE: the sequence-parallel threshold of %d rows gives "
+                "%d rows per rank at the first sequence-parallel step, below "
+                "this layout's step gate of %d, so the kernel's share of the SP "
+                "steps is decided by a traced row-count guard; a bucket at "
+                "exactly %d tokens may fail to trace (see _fused_kernel_takes). "
+                "The layout's entries in the two tables should give a threshold "
+                "of at least %d rows.",
                 _sp.min_rows(),
                 _sp.min_rows() // tp,
-                envs.TPU_MOE_FUSED_EP_STEP_MIN_TOKENS,
-                envs.TPU_MOE_FUSED_EP_STEP_MIN_TOKENS * tp,
-                envs.TPU_MOE_FUSED_EP_STEP_MIN_TOKENS * tp,
+                gate,
+                gate * tp,
+                gate * tp,
             )
 
     mesh = build_ep_mesh()
