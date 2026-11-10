@@ -3638,7 +3638,13 @@ def test_flush_keeps_zero_token_async_results_until_waited():
     copy_state = FakeCopyState()
     weakref.finalize(copy_state, events.append, "freed")
     runner = SimpleNamespace(
-        input_batch=SimpleNamespace(num_reqs=1, req_ids=["req-prefill"]),
+        input_batch=SimpleNamespace(
+            num_reqs=1,
+            req_ids=["req-prefill"],
+            req_id_to_index={"req-prefill": 0},
+            num_tokens_no_spec=np.zeros(1, dtype=np.int32),
+            token_ids_cpu=np.zeros((1, 8), dtype=np.int32),
+        ),
         _pre_async_results=AsyncPreResults(
             req_ids=["req-prefill"],
             next_tokens_tpu=torch.tensor([7], dtype=torch.int32),
