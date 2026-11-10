@@ -14,7 +14,7 @@
 """Options of compiled-function dispatch, from ``additional_config["tpu_compile"]``.
 
     --additional-config '{"tpu_compile": {"fast_compiled_call": true,
-        "drop_global_state_guard": true, "skip_aot_guard_checks": true}}'
+        "drop_global_state_guard": true}}'
 
 Every option defaults to off, which is main's behaviour. The options change
 how compiled programs are guarded and called, so the section stays in the
@@ -43,11 +43,6 @@ class CompileOptions:
     """Call those functions' compiled code directly when one of their cached
     entries' guards accepts the arguments, instead of going through Dynamo's
     frame evaluation on every call (``_qx_fastcall``)."""
-
-    skip_aot_guard_checks: bool = False
-    """After warmup, turn off the per-call guard check of the target's and the
-    MTP drafter's AOT-compiled forward functions; serving only calls them at
-    the warmed shapes."""
 
 
 def parse(raw: Any) -> CompileOptions:

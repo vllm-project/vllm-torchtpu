@@ -169,39 +169,6 @@ def test_drop_global_state_guard_reuses_the_entry_across_threads():
     assert _num_threads_recompiles() == 1
 
 
-class _Module:
-    def __init__(self, *children):
-        self.aot_compiled_fn = SimpleNamespace(disable_guard_check=False)
-        self._children = children
-
-    def modules(self):
-        yield self
-        for child in self._children:
-            yield from child.modules()
-
-
-def _aot_runner(section):
-    from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
-
-    target = _Module(_Module())
-    draft = _Module()
-    runner = SimpleNamespace(
-        vllm_config=_config(section),
-        model=target,
-        drafter=SimpleNamespace(draft_model=draft),
-    )
-    TPUModelRunner._qx_maybe_disable_aot_guard_checks(runner)
-    return [m.aot_compiled_fn.disable_guard_check for m in (*target.modules(), draft)]
-
-
-def test_aot_guard_checks_stay_on_by_default():
-    assert _aot_runner(None) == [False, False, False]
-
-
-def test_skip_aot_guard_checks_covers_target_and_drafter():
-    assert _aot_runner({"skip_aot_guard_checks": True}) == [True, True, True]
-
-
 def test_worker_arms_the_hook_before_anything_else():
     from vllm_torchtpu.worker.tpu_worker import TPUWorker
 
