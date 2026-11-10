@@ -11,8 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Weight quantization packing, padding, and scale reshape utilities for quantized matmul.
-"""
+"""Weight quantization packing, padding, and scale reshape utilities for quantized
+matmul."""
 
 from collections.abc import Callable
 from typing import Any
