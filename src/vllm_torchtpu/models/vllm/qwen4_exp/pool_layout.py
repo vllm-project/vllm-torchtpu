@@ -264,7 +264,6 @@ def pooled_cache_specs(cfg):
                 f"kernel's {PAIRED_KV_TILES} and an FP8 main KV cache; got "
                 f"{main.dtype}"
             )
-        from vllm_torchtpu import envs
 
         # VLLM_TPU_QSA_MTP_KV_DCP: the draft's main KV splits like the target's.
         split_draft = bool(envs.VLLM_TPU_QSA_MTP_KV_DCP)
