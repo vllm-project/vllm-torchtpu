@@ -61,3 +61,40 @@ def test_sampling_params_are_staged_until_the_fence(monkeypatch):
         [1.0, 0.800000011920929, 1.0, 1.0],
     ]
     assert top_p.flatten().tolist() == staged[2]
+
+
+def test_sampling_params_memo_reuses_until_values_change(monkeypatch):
+    monkeypatch.setenv("VLLM_TPU_SAMPLING_PARAMS_MEMO", "1")
+    monkeypatch.delenv("VLLM_TPU_SAMPLING_PARAMS_REUSE", raising=False)
+    temps = torch.tensor([0.5, 1.0, 0.7])
+    top_k = torch.tensor([5, 200, 7], dtype=torch.int32)
+    top_p = torch.tensor([0.9, 1.0, 0.8])
+    runner = _staging_runner(
+        vocab_size=100,
+        input_batch=SimpleNamespace(
+            temperature_cpu_tensor=temps,
+            top_k_cpu_tensor=top_k,
+            top_p_cpu_tensor=top_p,
+            temperature_cpu=temps.numpy(),
+            top_k_cpu=top_k.numpy(),
+            top_p_cpu=top_p.numpy(),
+        ),
+    )
+    call = TPUModelRunner._padded_sampling_params
+    args = (1, 3, 4, torch.float32, torch.device("cpu"))
+    first = call(runner, *args)
+    assert first[0].flatten().tolist() == [1.0, 0.699999988079071, 1.0, 1.0]
+    assert first[1].flatten().tolist() == [0, 7, 0, 0]
+    second = call(runner, *args)
+    assert all(a is b for a, b in zip(first, second))
+    # A changed value (in the host arrays the input batch writes) misses.
+    top_p.numpy()[2] = 0.5
+    third = call(runner, *args)
+    assert third[2] is not first[2]
+    assert third[2].flatten().tolist() == [1.0, 0.5, 1.0, 1.0]
+    monkeypatch.delenv("VLLM_TPU_SAMPLING_PARAMS_MEMO")
+    off = call(runner, *args)
+    assert off[2] is not third[2]
+    assert [t.flatten().tolist() for t in off] == [
+        t.flatten().tolist() for t in third
+    ]

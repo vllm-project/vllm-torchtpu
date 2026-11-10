@@ -345,6 +345,7 @@ if TYPE_CHECKING:
     VLLM_TPU_CPU_PIN_RESERVE: int = 2
     VLLM_TPU_CPU_PROBE_S: float = 0.0
     VLLM_TPU_CPU_PIN_MIGRATE: bool = False
+    VLLM_TPU_SAMPLING_PARAMS_MEMO: bool = False
     VLLM_TPU_FUSED_READ_OFFSET_UPDATE: bool = True
     VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE: bool = False
     VLLM_TPU_BLOCK_TABLE_PACK_DELTA: bool = False
@@ -2094,6 +2095,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # thread's new allocations. Pinning happens after warmup, so the heap
     # built during load/warmup can sit on the far socket.
     "VLLM_TPU_CPU_PIN_MIGRATE": env_bool("VLLM_TPU_CPU_PIN_MIGRATE"),
+    # Memoize the padded per-request sampling tensors (temperature/top-k/
+    # top-p uploads) and the top-k candidate check on the requests' host
+    # sampling values; steady decode skips ~10 CPU tensor ops per verify.
+    "VLLM_TPU_SAMPLING_PARAMS_MEMO": env_bool("VLLM_TPU_SAMPLING_PARAMS_MEMO"),
     # Async scheduling: wait for the previous step's sampled-token copy after
     # launching this step's draft rather than before it (sample_tokens).
     "VLLM_TPU_DEFER_PREV_RESULTS_WAIT": env_bool(
