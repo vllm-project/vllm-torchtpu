@@ -1187,8 +1187,6 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         qkvz_weight, qkvz_weight_scale = self._require_pcp_projection_parameters()
         ba, _ = self.in_proj_ba(hidden_states)
         b, a = ba.chunk(2, dim=-1)
-        b = b.contiguous()
-        a = a.contiguous()
 
         state_indices = attn_metadata.mamba_state_indices
         assert state_indices is not None
@@ -1245,8 +1243,6 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             z, _ = self.in_proj_z(hidden_states)
             z = z.reshape(z.size(0), -1, self.head_v_dim)
             b, a = ba.chunk(2, dim=-1)
-            b = b.contiguous()
-            a = a.contiguous()
         else:
             mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
             ba, _ = self.in_proj_ba(hidden_states)
@@ -1259,8 +1255,6 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             mixed_qkv, z = mixed_qkvz.split([qkv_size, z_size], dim=-1)
             z = z.reshape(z.size(0), -1, self.head_v_dim)
             b, a = ba.chunk(2, dim=-1)
-            b = b.contiguous()
-            a = a.contiguous()
 
         # ============================================================
         # Part 2: Core Attention (Custom Op)
