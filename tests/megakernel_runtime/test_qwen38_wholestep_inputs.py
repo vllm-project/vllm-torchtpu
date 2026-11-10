@@ -203,17 +203,18 @@ def test_layer_batched_inputs_match_the_per_layer_loop(layer_major, monkeypatch)
 @pytest.mark.parametrize("n_blocks", [None, 50])
 def test_layer_batched_gdn_blocks_match_the_per_layer_loop(n_blocks, monkeypatch):
     """VLLM_TPU_MK_WHOLE_BATCHED_INPUTS: gdn_blocks' vmapped pass equals the per-layer
-    loop, padding / idle / out-of-range ids included."""
+    loop, padding / idle / negative / out-of-range ids included."""
     from vllm_torchtpu import envs
     from vllm_torchtpu.megakernel_runtime.qwen38_segment_call import gdn_blocks
 
     rng = np.random.default_rng(3)
     n, NS, slots = 3, 4, 9
     meta = []
+    off = jnp.asarray(rng.integers(0, 5, size=slots), jnp.int32)  # the runner's one table
     for _ in range(6):
         meta += [
             jnp.asarray(rng.integers(-1, slots, size=n), jnp.int32),  # state indices
-            jnp.asarray(rng.integers(0, 5, size=slots), jnp.int32),  # read offsets
+            off,  # read offsets (every mamba group's metadata holds the same tensor)
             jnp.asarray(rng.integers(-3, 64, size=(n, 5)), jnp.int32),  # ckpt ids
             jnp.asarray([0, 4, 4, 8], jnp.int32),  # query_start_loc (request 1 idle)
             jnp.asarray(rng.integers(0, 9, size=n), jnp.int32),  # seq lens

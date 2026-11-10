@@ -120,25 +120,26 @@ def gdn_blocks(
             live & ((_fit(seq, NS) - q_len) > 0),
         )
 
-    # (idx, ck, qsl, seq) per layer. The slot-offset table is one [num_slots] array that
-    # every GDN layer passes; gathered per layer, never stacked (33 x 113728 copied).
-    layers = [
-        (off[_fit(st, NS)], ck, qsl, seq)
-        for st, off, ck, qsl, seq in (
-            meta[i : i + GDN_META] for i in range(0, len(meta), GDN_META)
-        )
-    ]
+    metas = [meta[i : i + GDN_META] for i in range(0, len(meta), GDN_META)]
     if (
         envs.VLLM_TPU_MK_WHOLE_BATCHED_INPUTS
-        and len(layers) > 1
+        and len(metas) > 1
         and all(
             (x.shape, x.dtype) == (y.shape, y.dtype)
-            for lay in layers
-            for x, y in zip(lay, layers[0], strict=True)
+            for lay in metas
+            for x, y in zip(lay, metas[0], strict=True)
         )
     ):
         # One vmapped pass instead of ~8 small ops per GDN layer (33 in the whole step).
-        return jax.vmap(one)(*(jnp.stack(f) for f in zip(*layers, strict=True)))
+        # The slot-offset table is the runner's one `mamba_slot_read_offsets` (indexed by
+        # physical slot, the same tensor in every mamba group's metadata), so all layers'
+        # offsets come from one vector gather: per-layer `off[st]` lowered to scalar
+        # dynamic slices, two vector->scalar stalls of ~34 us per step (xprof j-30c70bee
+        # fusion.1614/1615); stacking the table per layer would copy 33 x 113728 int32.
+        st, ck, qsl, seq = (jnp.stack([lay[k] for lay in metas]) for k in (0, 2, 3, 4))
+        idx = metas[0][1][jax.vmap(lambda s: _fit(s, NS))(st)]
+        return jax.vmap(one)(idx, ck, qsl, seq)
+    layers = [(off[_fit(st, NS)], ck, qsl, seq) for st, off, ck, qsl, seq in metas]
     rbs, wbs, his = zip(*(one(*lay) for lay in layers), strict=True)
     return jnp.stack(rbs), jnp.stack(wbs), jnp.stack(his)
 
