@@ -54,6 +54,10 @@ PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY = (
 # owns the name) never change a compiled program.
 RUNNER_OPTIONS_SECTION = runner_options.SECTION
 
+# Host-only section: the API-server patches (`frontend_options`) never change
+# a compiled program.
+FRONTEND_OPTIONS_SECTION = "tpu_frontend"
+
 # Diagnostics-only knobs and host-only sections: they steer profiling or the
 # host and never change the compiled graph, so
 # `_patch_vllm_config_hash_ignore_diagnostics` keeps them out of the TPU compile
@@ -62,6 +66,7 @@ HASH_IGNORED_ADDITIONAL_CONFIG_KEYS = frozenset(
     {
         PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY,
         PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY,
+        FRONTEND_OPTIONS_SECTION,
         RUNNER_OPTIONS_SECTION,
     }
 )
