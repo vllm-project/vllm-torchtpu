@@ -53,12 +53,16 @@ def gdn_chunk(qkv, b, a, conv_state, rec_state, w, a_log, dt_bias):
     x_full = jnp.concatenate([conv_state, qkv], axis=0)
     acc = jnp.zeros((n, DIM), jnp.float32)
     for k in range(K):
-        acc += x_full[k : k + n].astype(jnp.float32) * w[:, 0, k].astype(jnp.float32)[None]
+        acc += (
+            x_full[k : k + n].astype(jnp.float32) * w[:, 0, k].astype(jnp.float32)[None]
+        )
     conv_out = jax.nn.silu(acc.astype(qkv.dtype))
     new_conv = x_full[-(K - 1) :]
     kd = N_KQ * D_K
     q = _l2n(jnp.repeat(conv_out[:, :kd].reshape(n, N_KQ, D_K), N_V // N_KQ, 1))
-    k_ = _l2n(jnp.repeat(conv_out[:, kd : 2 * kd].reshape(n, N_KQ, D_K), N_V // N_KQ, 1))
+    k_ = _l2n(
+        jnp.repeat(conv_out[:, kd : 2 * kd].reshape(n, N_KQ, D_K), N_V // N_KQ, 1)
+    )
     v = conv_out[:, 2 * kd :].reshape(n, N_V, D_V).astype(jnp.float32)
     beta = jax.nn.sigmoid(b.astype(jnp.float32))
     g = -jnp.exp(a_log)[None] * jax.nn.softplus(a.astype(jnp.float32) + dt_bias[None])
@@ -68,9 +72,10 @@ def gdn_chunk(qkv, b, a, conv_state, rec_state, w, a_log, dt_bias):
         q_t = q_t * D_K**-0.5
         eg = jnp.exp(g_t)
         v_new = beta_t[:, None] * (v_t - eg[:, None] * jnp.einsum("hd,hdm->hm", k_t, s))
-        out = eg[:, None] * jnp.einsum("hd,hdm->hm", q_t, s) + jnp.sum(
-            q_t * k_t, -1, keepdims=True
-        ) * v_new
+        out = (
+            eg[:, None] * jnp.einsum("hd,hdm->hm", q_t, s)
+            + jnp.sum(q_t * k_t, -1, keepdims=True) * v_new
+        )
         s = s * eg[:, None, None] + jnp.einsum("hd,hm->hdm", k_t, v_new)
         return s.astype(jnp.float32), out.astype(qkv.dtype)
 
@@ -115,7 +120,16 @@ def run_align_prefill(x, hit, prompt, ends, store_dtype, no_round_at=()):
     # column (hit - 1) // BS.
     zc = jnp.zeros((K - 1, DIM), jnp.bfloat16)
     zr = jnp.zeros((N_V, D_K, D_V), jnp.float32)
-    c0, r0, _ = gdn_chunk(x["qkv"][:hit], x["b"][:hit], x["a"][:hit], zc, zr, x["w"], x["a_log"], x["dt_bias"])
+    c0, r0, _ = gdn_chunk(
+        x["qkv"][:hit],
+        x["b"][:hit],
+        x["a"][:hit],
+        zc,
+        zr,
+        x["w"],
+        x["a_log"],
+        x["dt_bias"],
+    )
     store(block((hit - 1) // BS), c0, r0)
 
     fine = prompt // HB * HB
@@ -130,8 +144,14 @@ def run_align_prefill(x, hit, prompt, ends, store_dtype, no_round_at=()):
         bid = block(curr)
         conv_in = pool_conv[bid].astype(jnp.bfloat16)
         conv, rec, out = gdn_chunk(
-            x["qkv"][start:end], x["b"][start:end], x["a"][start:end],
-            conv_in, pool_rec[bid], x["w"], x["a_log"], x["dt_bias"],
+            x["qkv"][start:end],
+            x["b"][start:end],
+            x["a"][start:end],
+            conv_in,
+            pool_rec[bid],
+            x["w"],
+            x["a_log"],
+            x["dt_bias"],
         )
         store(bid, conv, rec, rnd=end not in no_round_at)
         outs.append(out)
@@ -140,7 +160,10 @@ def run_align_prefill(x, hit, prompt, ends, store_dtype, no_round_at=()):
             # next chunk overwrites the running block.
             ckpts[end] = (np.asarray(pool_conv[bid]), np.asarray(pool_rec[bid]))
         start = end
-    final = (np.asarray(pool_conv[block((prompt - 1) // BS)]), np.asarray(pool_rec[block((prompt - 1) // BS)]))
+    final = (
+        np.asarray(pool_conv[block((prompt - 1) // BS)]),
+        np.asarray(pool_rec[block((prompt - 1) // BS)]),
+    )
     return ckpts, final, np.asarray(jnp.concatenate(outs))
 
 
@@ -177,14 +200,20 @@ def test_bf16_pool_differs_only_by_the_dropped_round_trip(seed):
     x = _inputs(200, seed)
     hit, prompt = HIT, 187
     stock = run_align_prefill(x, hit, prompt, STOCK, jnp.bfloat16)
-    stock_nr = run_align_prefill(x, hit, prompt, STOCK, jnp.bfloat16, no_round_at=(160,))
+    stock_nr = run_align_prefill(
+        x, hit, prompt, STOCK, jnp.bfloat16, no_round_at=(160,)
+    )
     merged = run_align_prefill(x, hit, prompt, MERGED, jnp.bfloat16)
     for pos in (180, 184):
         for i in (0, 1):
-            np.testing.assert_array_equal(_bits(stock_nr[0][pos][i]), _bits(merged[0][pos][i]))
+            np.testing.assert_array_equal(
+                _bits(stock_nr[0][pos][i]), _bits(merged[0][pos][i])
+            )
         np.testing.assert_array_equal(_bits(stock[0][pos][0]), _bits(merged[0][pos][0]))
         # Same magnitude as one extra bf16 rounding (2^-8 relative).
         rec_s, rec_m = stock[0][pos][1], merged[0][pos][1]
-        assert np.max(np.abs(rec_s - rec_m)) <= 2.0**-6 * max(1.0, np.max(np.abs(rec_m)))
+        assert np.max(np.abs(rec_s - rec_m)) <= 2.0**-6 * max(
+            1.0, np.max(np.abs(rec_m))
+        )
     for i in (0, 1):
         np.testing.assert_array_equal(_bits(stock_nr[1][i]), _bits(merged[1][i]))
