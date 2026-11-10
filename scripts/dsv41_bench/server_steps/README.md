@@ -290,7 +290,8 @@ keeps 48 requests per DP rank and raises global concurrency from 384 to 768.
 Each request uses a 98304-token cached prefix and 512 output tokens, with
 DSpark K5. Local target/draft shapes remain 288/240 rows and the target
 compile buckets remain `[288,2048]`. KV sizing is automatic at memory
-utilization 0.85, with FP8 KV/indexer, block size 64 and max model length 98816.
+utilization 0.85, with FP8 KV/indexer, block size 256 (SWA pages stay 64
+tokens) and max model length 98816.
 
 Both hosts use `TPU_DEEPSEEK_V41_ENGRAM_HBM=first`, Engram `cpu_offload=true`
 and `dp_shared_memory=false`, `MOE_FUSED_EP_KERNEL_IMPL=push`,

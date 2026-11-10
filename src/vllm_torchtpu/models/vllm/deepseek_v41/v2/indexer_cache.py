@@ -15,7 +15,13 @@ from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8.cache import (
 )
 
 from . import indexer_fp8
-from .cache import IndexCacheRows, NativeCacheView, PagedCacheRows, RawCachePool
+from .cache import (
+    BLOCK_STRIDE_ALIGNMENT,
+    IndexCacheRows,
+    NativeCacheView,
+    PagedCacheRows,
+    RawCachePool,
+)
 
 logger = init_logger(__name__)
 
@@ -149,7 +155,10 @@ class IndexerCache(NativeCacheView, upstream.DeepseekV4IndexerCache):
             )
 
     def get_kv_cache_spec(self, vllm_config):
-        spec = super().get_kv_cache_spec(vllm_config)
+        spec = dataclasses.replace(
+            super().get_kv_cache_spec(vllm_config),
+            block_stride_alignment=BLOCK_STRIDE_ALIGNMENT,
+        )
         return replace_as(spec, PackedFP8IndexerSpec) if self.packed_fp8 else spec
 
     @property

@@ -101,6 +101,9 @@ def test_swa_bridge_preserves_dynamic_token_dimension(monkeypatch):
         def __init__(self, raw):
             self.raw = raw
             self.raw_hi = None
+            # Second SWA page of a block-outer 512 KiB block.
+            self.page_stride = 512
+            self.row_offset = 64
 
     class Bridge(torch.nn.Module):
         def forward(self, raw, table, starts, positions, minimum, values):

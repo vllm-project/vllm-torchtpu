@@ -21,6 +21,12 @@ NOPE_SCALE_PERIOD = 64
 # Each 512-byte pool row owns 128 RoPE bytes (32 words) in a companion array,
 # addressed by the same row index, as `csa_gather` expects.
 ROPE_WORDS = 32
+# CSA2 reads and publishes BF16 SWA in 64-token word-pool pages (64 KiB).
+SWA_PAGE_TOKENS = 64
+SWA_PAGE_BYTES = SWA_PAGE_TOKENS * 512 * 2
+# Block-outer blocks are a whole number of SWA pages, so every page of every
+# cache group stays page-aligned under one shared block stride.
+BLOCK_STRIDE_ALIGNMENT = SWA_PAGE_BYTES
 
 
 # TPU7x SparseCore hardware addressing limit: a single HBM tensor passed to

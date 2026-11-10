@@ -50,7 +50,7 @@ exec vllm serve "$model" \
   --attention-config '{"indexer_kv_dtype":"fp8"}' \
   --engram-config "$engram_config" \
   --additional-config '{"deepseek_v41":{"execution":"ced","moe":"fused_ep_w4a8"}}' \
-  --block-size 64 \
+  --block-size 256 \
   --max-num-batched-tokens "$chunk" --max-num-seqs "$max_seqs" \
   "${server_args[@]}" \
   --speculative-config "{\"method\":\"dspark\",\"num_speculative_tokens\":5,\"model\":\"$model\"}" \

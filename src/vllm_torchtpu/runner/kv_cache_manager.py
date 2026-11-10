@@ -1762,6 +1762,21 @@ class KVCacheManager:
             native_rope_pools=native_rope_pools,
             native_scale_pools=native_scale_pools,
         )
+        # DSv4.1 fused compressors specialize on each layer's bound page
+        # geometry, which block-outer groups make layer-specific.
+        compilation_config = self.runner.vllm_config.compilation_config
+        forward_context = compilation_config.static_forward_context
+        bound_layouts = [
+            module
+            for module in forward_context.values()
+            if callable(getattr(module, "bind_compressor_layout", None))
+        ]
+        if bound_layouts:
+            with set_vllm_model_wrapper_context(
+                mesh=self.runner.mesh, vllm_config=self.runner.vllm_config
+            ):
+                for module in bound_layouts:
+                    module.bind_compressor_layout()
 
         # Pre-build and cache bundled RPA kernels across all attention layers before
         # torch.compile tracing.

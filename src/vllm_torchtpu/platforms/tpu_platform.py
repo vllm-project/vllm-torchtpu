@@ -688,9 +688,16 @@ class TpuPlatform(Platform):
             else PallasAttentionBackend
         )
         supported = [layout.name for layout in backend.supported_kv_cache_layouts()]
-        if (
-            vllm_config.model_config is not None
-            and "DeepseekV4ForCausalLM" in vllm_config.model_config.architectures
+        architectures = (
+            vllm_config.model_config.architectures
+            if vllm_config.model_config is not None
+            else []
+        )
+        if "DeepseekV4ForCausalLM" in architectures or (
+            # V4.1 v2 packs its cache groups block-outer, so several SWA
+            # layers share one group and block table instead of one group each.
+            "DeepseekV41ForCausalLM" in architectures
+            and envs.TPU_DEEPSEEK_V41_IMPL == "v2"
         ):
             supported = ["BLHNC"]
         layout = resolve_kv_cache_layout(vllm_config, [supported])

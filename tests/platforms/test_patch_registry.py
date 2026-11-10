@@ -215,6 +215,7 @@ def test_manifest_preserves_lifecycle_dependencies():
         "_patch_vllm_offloading_config_build",
         "_patch_vllm_hybrid_kv_load_failure_recovery",
         "_patch_vllm_same_step_prefix_hits",
+        "_patch_vllm_dsv41_page_order",
         "_patch_vllm_merge_multimodal_embeddings",
         "install_engine_core",
     ]
