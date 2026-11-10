@@ -180,6 +180,15 @@ def _ep_mesh_order(device_ids: tuple[int, ...]) -> tuple[int, ...]:
     With MOE_FUSED_EP_SORTED_GATHER the mesh stays in rank order too, and the
     activation all-gather gets the device-id order on its own instead; see
     `ep_sorted_gather_group`.
+
+    The push kernel (MOE_FUSED_EP_KERNEL_IMPL=push) and expert placement (a
+    static expert layout or TPU_MOE_EPLB_DYNAMIC) also keep rank order. Both
+    were written and validated on a rank-ordered mesh only, and under the
+    device-id order they route tokens to the wrong experts: a DSV4.1 DP16 C768
+    decode on two tpu7x hosts (push, dynamic EPLB) degenerated into repeated
+    text for ~30% of requests, and recovered once the mesh was rank-ordered.
+    Rank order here costs nothing measurable on that run (27.11 vs 27.13 ms
+    median step).
     """
     if len(set(device_ids)) != len(device_ids):
         raise RuntimeError(
@@ -190,9 +199,25 @@ def _ep_mesh_order(device_ids: tuple[int, ...]) -> tuple[int, ...]:
         get_pcp_world_size() > 1
         or get_dcp_world_size() > 1
         or envs.MOE_FUSED_EP_SORTED_GATHER
+        or _mesh_order_must_be_rank_order()
     ):
         return tuple(ep_ranks)
     return tuple(sorted(ep_ranks, key=device_ids.__getitem__))
+
+
+def _mesh_order_must_be_rank_order() -> bool:
+    """True when a MoE path that only supports a rank-ordered mesh is on.
+
+    See `_ep_mesh_order`: the push kernel and expert placement (static layout
+    or dynamic EPLB) assume mesh index == EP rank.
+    """
+    from vllm_torchtpu import expert_placement
+
+    return (
+        envs.MOE_FUSED_EP_KERNEL_IMPL == "push"
+        or bool(envs.TPU_MOE_EPLB_DYNAMIC)
+        or expert_placement.configured_value() is not None
+    )
 
 
 def ep_rank_order() -> tuple[int, ...] | None:

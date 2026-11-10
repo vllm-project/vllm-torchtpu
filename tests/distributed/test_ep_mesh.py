@@ -20,6 +20,7 @@ import numpy as np
 import pytest
 from vllm.distributed import parallel_state
 
+from vllm_torchtpu import envs, expert_placement
 from vllm_torchtpu.distributed import ep_mesh as ep
 
 
@@ -29,6 +30,11 @@ def mesh_cache(monkeypatch):
     monkeypatch.setattr(ep, "_TOKEN_GROUP_CACHE", {})
     monkeypatch.setattr(ep, "get_pcp_world_size", lambda: 1)
     monkeypatch.setattr(ep, "get_dcp_world_size", lambda: 1)
+    # The MoE paths that pin rank order are off unless a test turns one on.
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_KERNEL_IMPL", None)
+    monkeypatch.setitem(vars(envs), "TPU_MOE_EPLB_DYNAMIC", False)
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_SORTED_GATHER", False)
+    monkeypatch.setattr(expert_placement, "configured_value", lambda *a: None)
 
 
 # Each CP axis whose rank-ordered mesh pins the EP mesh to rank order, with a
@@ -99,6 +105,36 @@ def test_cp_keeps_rank_order(monkeypatch, group, cp_size_fn, cp_size):
     assert ep.ep_rank_order() == (0, 1, 2, 3)
     # Global rank 6 is EP rank 2 of [2, 4, 6, 8].
     assert ep.ep_mesh_index() == 2
+
+
+@pytest.mark.parametrize(
+    "turn_on",
+    [
+        lambda mp: mp.setitem(vars(envs), "MOE_FUSED_EP_KERNEL_IMPL", "push"),
+        lambda mp: mp.setitem(vars(envs), "TPU_MOE_EPLB_DYNAMIC", True),
+        lambda mp: mp.setattr(
+            expert_placement, "configured_value", lambda *a: "layout.json"
+        ),
+    ],
+    ids=["push", "eplb_dynamic", "static_layout"],
+)
+def test_push_and_expert_placement_keep_rank_order(monkeypatch, group, turn_on):
+    """The push kernel and expert placement assume mesh index == EP rank, so
+    either one keeps the mesh rank-ordered even where device ids would
+    reorder it."""
+    monkeypatch.setattr(ep, "ep_device_ids", lambda: (40, 20, 10, 30))
+    assert ep.ep_rank_order() == (2, 1, 3, 0)
+    turn_on(monkeypatch)
+    assert ep.ep_rank_order() == (0, 1, 2, 3)
+    # Global rank 6 is EP rank 2 of [2, 4, 6, 8].
+    assert ep.ep_mesh_index() == 2
+
+
+@pytest.mark.parametrize("impl", [None, "v2", "adaptive"])
+def test_other_kernels_without_placement_keep_device_id_order(monkeypatch, group, impl):
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_KERNEL_IMPL", impl)
+    monkeypatch.setattr(ep, "ep_device_ids", lambda: (40, 20, 10, 30))
+    assert ep.ep_rank_order() == (2, 1, 3, 0)
 
 
 def test_missing_rank_mapping(monkeypatch, group):
