@@ -12,34 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Source provenance: inferact/k3-megakernel@30c9ba966b tools/megakernel/__main__.py
+# Source provenance: inferact/k3-megakernel@30c9ba966b
+# tools/megakernel/__main__.py
 """Run a megakernel program without a vLLM server.
-
-    python -m vllm_torchtpu.models.kimi_k3.megakernel.tools [--jobid J] [--set field=value ...] [--json FILE] \\
-        COMMAND ...
-
-Commands (Kimi-K3; see each module's docstring):
-
-    bench decode --batches 1,8,16 --contexts 1152,32768 [--dspark [CKPT]] \\
-        [--mix 1152x4,131072x4]
-    bench prefill --prompts 8192x1,2048x4,3000x1@32768
-    check spec                  DSpark against plain decode, batch transitions,
-                                seeded sampling
-    check handoff               prefill -> pools -> decode against a decode-only replay
-    check greedy --output FILE  prompts replayed on the decoder, then greedy tokens
-    check masked                grammar-masked (structured outputs) vs unmasked decode
-    profile decode|prefill ...  the bench's cases with an xprof trace (--trace) and,
-                                with --llo DIR, the compiled LLO of every op (fresh
-                                compile caches, so nothing is skipped)
-    preshard k3|prefill|dspark --output DIR   kernel-layout checkpoints and projections
-    preshard verify             a rebuilt sample of one rank against an existing
-                                pre-shard
 
 From the login node the tool runs itself as 32 processes (8 per host) on the
 allocation ``--jobid`` (default ``$JOBID``). ``--set`` overrides a
-``KernelConfig`` field (``vllm_torchtpu.models.kimi_k3.megakernel.config``) to compare
-configs; every result line and JSON record names the config digest and git
-revision that produced it.
+``KernelConfig`` field to compare configs; every result line and JSON record
+names the config digest and git revision that produced it.
 """
 
 from __future__ import annotations
@@ -47,25 +27,15 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-import tempfile
 
-from vllm_torchtpu.models.kimi_k3.megakernel.tools import _settings as settings
-from vllm_torchtpu.models.kimi_k3.megakernel.tools import (
-    bench,
-    check,
-    harness,
-    k3,
-    preshard,
-)
-
-LLO_FLAGS = (
-    "--xla_jf_dump_to={dir} --xla_jf_dump_llo_text=true "
-    "--xla_jf_dump_llo_pass_label_regex=(vliw-packed-bundles|final_bundles) "
-    "--xla_jf_dump_llo_static_gaps=true --xla_mosaic_enable_llo_source_annotations=true"
-)
+from .. import config
+from . import _settings as settings
+from . import bench, check, harness, k3, preshard
+from .coverage import LineCoverage
 
 
 def parser() -> argparse.ArgumentParser:
+    """Build and return the top-level CLI argument parser."""
     top = argparse.ArgumentParser(
         prog="python -m vllm_torchtpu.models.kimi_k3.megakernel.tools",
         description=__doc__,
@@ -99,7 +69,9 @@ def parser() -> argparse.ArgumentParser:
         help="merge the kernel lines this run executes into this JSON file",
     )
     top.add_argument(
-        "--json", default="", help="append one JSON record per result to this file"
+        "--json",
+        default="",
+        help="append one JSON record per result to this file",
     )
     top.add_argument(
         "--kv-cache-dtype",
@@ -112,92 +84,73 @@ def parser() -> argparse.ArgumentParser:
         commands.add_parser("bench", help="kernel-only timing of the serving ops")
     )
     check.add_arguments(commands.add_parser("check", help="numerics checks"))
-    profile = commands.add_parser(
-        "profile", help="a bench with an xprof trace and LLO dumps"
-    )
-    bench.add_arguments(profile, profile=True)
+    profile = commands.add_parser("profile", help="a bench with an xprof trace")
+    bench.add_arguments(profile)
     preshard.add_arguments(
         commands.add_parser(
-            "preshard", help="write the checkpoints in the kernels' per-rank layout"
+            "preshard",
+            help="write the checkpoints in the kernels' per-rank layout",
         )
     )
     return top
 
 
-def kernel_config(overrides: list[str]):
-    from vllm_torchtpu.models.kimi_k3.megakernel import config
-
-    fields = {}
+def kernel_config(overrides: list[str]) -> config.KernelConfig:
+    """Parse ``FIELD=VALUE`` ``overrides`` and install ``KernelConfig``."""
+    fields: dict[str, str] = {}
     for item in overrides:
         name, _, value = item.partition("=")
         if not value or name not in config.KernelConfig.__dataclass_fields__:
-            raise SystemExit(
-                f"--set {item!r}: expected FIELD=VALUE with a KernelConfig field"
-            )
+            msg = f"--set {item!r}: expected FIELD=VALUE with a KernelConfig field"
+            raise SystemExit(msg)
         fields[name] = value
     return config.install(config.KernelConfig().replace(**fields))
 
 
+def _launch_remote(argv: list[str], args: argparse.Namespace) -> int:
+    """Prepare worker environment variables and launch across the Slurm allocation."""
+    if not args.jobid:
+        msg = "set --jobid (or $JOBID) to a running four-host allocation"
+        raise SystemExit(msg)
+    env: dict[str, str] = {}
+    if args.coverage:
+        env["VLLM_XLA_CACHE_PATH"] = ""
+    return harness.launch(argv, args.jobid, args.venv, env)
+
+
 def main(argv: list[str]) -> int:
+    """CLI entry point for ``vllm_torchtpu.models.kimi_k3.megakernel.tools``."""
     args = parser().parse_args(argv)
     if args.command == "preshard":
         return run_preshard(argv, args)
     if not args.presharded:
-        raise SystemExit("set --presharded to the TP32 pre-shard directory")
+        msg = "set --presharded to the TP32 pre-shard directory"
+        raise SystemExit(msg)
     if not harness.is_worker():
-        if not args.jobid:
-            raise SystemExit(
-                "set --jobid (or $JOBID) to a running four-host allocation"
-            )
-        env = {}
-        llo = getattr(args, "llo", "")
-        if args.command == "profile" and llo:
-            os.makedirs(llo, exist_ok=True)
-            env["LIBTPU_INIT_ARGS"] = (
-                settings.LIBTPU_INIT_ARGS
-                + " "
-                + LLO_FLAGS.format(dir=os.path.abspath(llo))
-            ).strip()
-            # Compile everything afresh: a cached executable dumps nothing.
-            fresh = tempfile.mkdtemp(
-                prefix="megakernel-profile-", dir=os.path.abspath(llo)
-            )
-            env.update(
-                TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT=fresh,
-                TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT=fresh,
-                TORCH_TPU_TIER2_COMPILATION_CACHE=os.path.basename(fresh),
-                TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE=os.path.basename(fresh),
-                VLLM_XLA_CACHE_PATH=os.path.join(fresh, "xla"),
-            )
-        if args.coverage:
-            # The kernel builders run only while their ops are traced; an
-            # exported op loaded from the cache would record nothing.
-            env["VLLM_XLA_CACHE_PATH"] = ""
-        return harness.launch(argv, args.jobid, args.venv, env)
+        return _launch_remote(argv, args)
     harness.init()
     coverage = None
     if args.coverage and harness.rank() == 0:
-        from vllm_torchtpu.models.kimi_k3.megakernel.tools.coverage import LineCoverage
-
         coverage = LineCoverage(args.coverage)
-        coverage.start()  # before the kernels import: their module-level lines count
+        coverage.start()
     k3.configure_cache(args.kv_cache_dtype)
-    config = kernel_config(args.set)  # before any kernel module is imported
+    installed = kernel_config(args.set)
     harness.log(
-        f"kernel config {config.key()}"
+        f"kernel config {installed.key()}"
         + (f" ({', '.join(args.set)})" if args.set else " (defaults)")
     )
+    sub_target = str(vars(args).get("role", "") or vars(args).get("check", ""))
     records = harness.Records(
         args.json,
-        args.command + " " + (getattr(args, "role", "") or getattr(args, "check", "")),
-        config,
+        f"{args.command} {sub_target}",
+        installed,
     )
     records.context.update(kv_cache_dtype=args.kv_cache_dtype, page_tokens=k3.PAGE)
     if args.command == "check":
         check.run(args, records)
     else:
         if args.command == "profile" and not args.trace:
-            args.trace = args.llo or "profile-traces"
+            args.trace = "profile-traces"
         bench.run(args, records)
     if coverage is not None:
         coverage.stop()
@@ -206,19 +159,21 @@ def main(argv: list[str]) -> int:
     return 0
 
 
-def run_preshard(argv: list[str], args) -> int:
-    """Host-side conversion: no TPU, one process per host on the allocation
-    for the model's checkpoint, in place otherwise."""
+def run_preshard(argv: list[str], args: argparse.Namespace) -> int:
+    """Run host-side checkpoint presharding locally or across the allocation."""
     if preshard.runs_on_allocation(args) and not harness.is_worker():
         if not args.jobid:
-            raise SystemExit(
-                "set --jobid (or $JOBID) to a running four-host allocation"
-            )
+            msg = "set --jobid (or $JOBID) to a running four-host allocation"
+            raise SystemExit(msg)
         return harness.launch(
-            argv, args.jobid, args.venv, {"JAX_PLATFORMS": "cpu"}, per_host=1
+            argv,
+            args.jobid,
+            args.venv,
+            {"JAX_PLATFORMS": "cpu"},
+            per_host=1,
         )
     os.environ.setdefault("JAX_PLATFORMS", "cpu")
-    kernel_config(args.set)  # before any kernel module is imported
+    kernel_config(args.set)
     status = preshard.run(args, harness.log_host)
     harness.log("done")
     return status
