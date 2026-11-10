@@ -20,7 +20,6 @@ output; the work list, page unpacking and masking are shared with it.
 """
 
 import functools
-import os
 
 import jax
 import jax.numpy as jnp
@@ -46,9 +45,6 @@ TILE_PAGES_PER_STEP = 32
 # (one loop of kernel calls over whole head-major q / out / lse) instead of a
 # `lax.map` over heads and chunks of sliced and restacked operands.
 FUSED_HEADS = True
-# Score elementwise work: fold sm_scale into the K scales and broadcast the
-# per-token mask over the query heads (`_kernel`).
-ELEMENT_DIET = os.environ.get("VLLM_TORCHTPU_MSA_ELEMENT_DIET", "1") == "1"
 # 4-bit caches: fetch a step's pages with manual DMAs of its valid pages only
 # (prefetching the next active step's) into a double-buffered VMEM scratch,
 # instead of one pipelined BlockSpec input per page slot (c64 DCP4 shapes,
@@ -242,26 +238,16 @@ def _kernel(
             masks.append(slots < limit)  # [Bq, S]
         k = jnp.concatenate(keys, axis=0)
         v = jnp.concatenate(values, axis=0)
-        mask = jnp.concatenate(masks, axis=1)  # [Bq, n * S]
+        mask = jnp.concatenate(masks, axis=1)
+        mask = jnp.concatenate([mask] * num_heads, axis=0)
 
         q = q_ref[...].reshape(num_heads * block_q, head_dim)
         s = jax.lax.dot_general(
             q, k, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
         )
-        if ELEMENT_DIET:
-            # One multiply per score (K scales with sm_scale folded in), and
-            # the tokens' mask broadcast over the heads rather than copied.
-            scale = (
-                jnp.concatenate(k_scales, axis=1) * sm_scale if fp4 else sm_scale
-            )
-            s = jnp.where(
-                mask[None], (s * scale).reshape(num_heads, block_q, -1), -jnp.inf
-            ).reshape(num_heads * block_q, -1)
-        else:
-            mask = jnp.concatenate([mask] * num_heads, axis=0)
-            if fp4:  # x = int4 * scale: K scales the score columns, V scales p
-                s = s * jnp.concatenate(k_scales, axis=1)
-            s = jnp.where(mask, s * sm_scale, -jnp.inf)
+        if fp4:  # x = int4 * scale: K scales the score columns, V scales p
+            s = s * jnp.concatenate(k_scales, axis=1)
+        s = jnp.where(mask, s * sm_scale, -jnp.inf)
 
         m_prev = m_ref[...]
         m_new = jnp.maximum(m_prev, jnp.max(s, axis=1, keepdims=True))
