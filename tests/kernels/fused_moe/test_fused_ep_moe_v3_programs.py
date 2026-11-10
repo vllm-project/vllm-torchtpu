@@ -110,6 +110,31 @@ def test_select_top_k_routes_rows_past_the_valid_count_nowhere(interpret):
     )
 
 
+def test_select_top_k_routing_message_marks_rows_past_the_valid_count(interpret):
+    """In the routing-message layout the layer uses (`message_rows`; word
+    k * rows + r is row r's slot k), rows past valid_tokens carry the
+    unrouted index `num_experts` on every slot, and valid rows carry
+    lax.top_k's experts."""
+    rows, experts, top_k, valid = 256, 64, 4, 200
+    logits = _logits(rows, experts, seed=3)
+    message_rows = rows * top_k // LANES
+    weights, message = select_kernel.select_top_k(
+        jnp.asarray(logits),
+        top_k=top_k,
+        block_rows=LANES,
+        renormalize=True,
+        message_rows=message_rows,
+        valid_tokens=jnp.asarray([valid], jnp.int32),
+    )
+    message = np.asarray(message)
+    assert message.shape == (message_rows, LANES)
+    by_slot = message.reshape(top_k, rows)
+    _, want_indices = jax.lax.top_k(jnp.asarray(logits[:valid]), top_k)
+    np.testing.assert_array_equal(by_slot[:, :valid].T, np.asarray(want_indices))
+    assert (by_slot[:, valid:] == experts).all()
+    assert not np.asarray(weights)[valid:].any()
+
+
 # ---- weighted_sum ----
 
 
