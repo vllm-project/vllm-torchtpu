@@ -174,3 +174,79 @@ def has_bank_conflicts(stride: int, distance=24, num_banks=32) -> bool:
             return True
         banks.add(bank)
     return False
+
+
+# ---------------------------------------------------------------------------
+# Compact (lane-dense) LSE (TPU_PCP_LSE_COMPACT; ServingConfigs.lse_compact).
+# The LSE of row (t, g) lives at flat index t * Gp + g of a [rows, 128] f32
+# buffer, 128 values per row, instead of one lane-replicated 128-lane row per
+# (t, g).
+
+
+def lane_dense_rows(x: jax.Array) -> jax.Array:
+    """(R, L) rows whose lanes all hold the row's value -> (ceil(R / L), L) lane-dense.
+
+    Lane j of output row k is x[k * L + j, j], the diagonal of the k-th L x L
+    block; with lane-replicated rows that is row k * L + j's value. R % L == 0,
+    or R < L (padded with -inf).
+    -inf stays -inf (the off-diagonal is replaced by 0 before the sum).
+    """
+    rows, lanes = x.shape
+    if rows % lanes:
+        if rows > lanes:
+            raise ValueError(f"lane_dense_rows needs rows % {lanes} == 0 or rows < {lanes}, got {rows}")
+        # A short block (e.g. the DECODE kernel's bq = 1): pad with -inf rows;
+        # their lanes lie past the block's valid values.
+        x = jnp.concatenate([x, jnp.full((lanes - rows, lanes), -jnp.inf, x.dtype)], axis=0)
+        rows = lanes
+    eye = jax.lax.broadcasted_iota(jnp.int32, (lanes, lanes), 0) == jax.lax.broadcasted_iota(
+        jnp.int32, (lanes, lanes), 1
+    )
+    out = [
+        jnp.sum(jnp.where(eye, x[k * lanes : (k + 1) * lanes, :], 0.0), axis=0, keepdims=True)
+        for k in range(rows // lanes)
+    ]
+    return out[0] if len(out) == 1 else jnp.concatenate(out, axis=0)
+
+
+def lane_dense_window_rows(k: int) -> int:
+    """Rows of the aligned read-modify-write window ``place_lane_dense`` uses
+    for a K-row block (the destination needs this many rows of headroom past
+    the block's first row rounded down to 8)."""
+    return align_to(k + 8, 8)
+
+
+def place_lane_dense(dst_ref, src: jax.Array, flat_start, n_valid) -> None:
+    """Write a lane-dense block into a lane-dense buffer at any flat offset.
+
+    src (K, L): block-relative flat index j = r * L + l, values j < n_valid are
+    written. dst_ref (rows, L) VMEM: they land at absolute flat index
+    flat_start + j; every other value of dst_ref is preserved. The access is an
+    8-row-aligned window of ``lane_dense_window_rows(K)`` rows at
+    floor(flat_start / L) rounded down to 8, so dst_ref needs that headroom.
+    """
+    k, lanes = src.shape
+    w = lane_dense_window_rows(k)
+    flat_start = jnp.asarray(flat_start, jnp.int32)
+    off = jax.lax.rem(flat_start, lanes)
+    row0 = flat_start // lanes
+    row0a = pl.multiple_of((row0 // 8) * 8, 8)
+    sh = row0 - row0a
+    # dr[r, l] = src[r, (l - off) mod L]
+    dr = pltpu.roll(src, off, 1)
+    fill = jnp.zeros((1, lanes), src.dtype)
+    cur = jnp.concatenate([dr, fill], axis=0)
+    prev = jnp.concatenate([fill, dr], axis=0)
+    lane_k = jax.lax.broadcasted_iota(jnp.int32, (k + 1, lanes), 1)
+    # row r' covers absolute row row0 + r': lanes >= off come from block row r',
+    # lanes < off from block row r' - 1 (the carry).
+    out = jnp.where(lane_k >= off, cur, prev)
+    out = jnp.concatenate([out, jnp.zeros((w - k - 1, lanes), src.dtype)], axis=0)
+    out = pltpu.roll(out, sh, 0)  # window row r_w holds out row r_w - sh
+    r_w = jax.lax.broadcasted_iota(jnp.int32, (w, lanes), 0)
+    lane = jax.lax.broadcasted_iota(jnp.int32, (w, lanes), 1)
+    rel = r_w - sh
+    j = rel * lanes + lane - off
+    valid = (rel >= 0) & (j >= 0) & (j < n_valid)
+    old = dst_ref[pl.ds(row0a, w), :]
+    dst_ref[pl.ds(row0a, w), :] = jnp.where(valid, out, old)

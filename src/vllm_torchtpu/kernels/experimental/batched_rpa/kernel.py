@@ -140,22 +140,45 @@ def calculate_and_store_out(
 
     def _stage_lse(b_idx: int, batch_m: jax.Array, batch_l: jax.Array):
         assert lse_o_vref is not None
+        lse_dtype = cfgs.serve.lse_dtype
+        if lse_dtype == jnp.float32:
+            # m and l live in dtype_out scratch; form the sum in f32 so the
+            # stored LSE carries no extra rounding beyond l's own.
+            batch_m = batch_m.astype(jnp.float32)
+            batch_l = batch_l.astype(jnp.float32)
         lse_val = batch_m + jnp.log(jnp.maximum(batch_l, 1e-9))
+        if cfgs.serve.lse_compact:
+            # Lane-dense rows of this chunk (flat index t * Gp + g); m and l are
+            # lane-replicated, so each row's value is its diagonal entry.
+            gp = cfgs.aligned_num_q_heads_per_kv_head
+            lanes = lse_o_vref.shape[-1]
+            short = chunk_start == 0 and lse_val.shape[1] < lanes  # e.g. DECODE, bq = 1
+            if not short and ((chunk_start * gp) % lanes or lse_val.shape[1] % lanes):
+                raise ValueError(
+                    f"compact LSE needs chunk_start * Gp and the chunk's rows to be multiples of "
+                    f"{lanes}: chunk_start {chunk_start}, Gp {gp}, rows {lse_val.shape[1]}"
+                )
+            r0 = chunk_start * gp // lanes
+            for kv_h in range(cfgs.model.num_kv_heads):
+                comp = utils.lane_dense_rows(lse_val[kv_h].astype(jnp.float32))
+                lse_o_vref[b_idx, kv_h, r0 : r0 + comp.shape[0], :] = comp
+            return
         lse_u32 = lse_o_vref.at[b_idx].bitcast(jnp.uint32)
         lse_ref = lse_u32.reshape(-1, lse_o_vref.shape[-1])
-        q_p = cfgs.aligned_num_q_heads_per_kv_head // cfgs.serve.packing_q
+        # u32 rows one token's LSE occupies per KV head.
+        q_p = cfgs.aligned_num_q_heads_per_kv_head // cfgs.serve.lse_packing
         full_q_rows = cfgs.bq_sz * cfgs.aligned_num_q_heads_per_kv_head
         if chunk_start == 0 and (
             cfgs.model.num_kv_heads == 1 or lse_val.shape[1] == full_q_rows
         ):
             lse_u32_val = pltpu.bitcast(
-                lse_val.astype(cfgs.serve.dtype_out), jnp.uint32
+                lse_val.astype(lse_dtype), jnp.uint32
             ).reshape(-1, lse_o_vref.shape[-1])
             utils.strided_store(lse_ref, 0, lse_u32_val.shape[0], 1, lse_u32_val)
         else:
             for kv_h in range(cfgs.model.num_kv_heads):
                 lse_h = pltpu.bitcast(
-                    lse_val[kv_h].astype(cfgs.serve.dtype_out), jnp.uint32
+                    lse_val[kv_h].astype(lse_dtype), jnp.uint32
                 ).reshape(-1, lse_o_vref.shape[-1])
                 utils.strided_store(
                     lse_ref,
@@ -762,6 +785,65 @@ def block_fully_visible(
             )
         full = full_b if full is None else jnp.logical_and(full, full_b)
     return full
+
+
+def masked_trim_widths(cfgs: configs.RpaConfigs) -> tuple[int, ...]:
+    """TPU_RPA_MASKED_TRIM (default off): KV widths a masked MIXED step may run at.
+
+    A step that `block_fully_visible` does not prove visible runs the masked
+    body over the whole `bkv` tile, although every key at or past the block's
+    valid length (`bkv_sz_frm_cache + bkv_sz_frm_new`) is masked out. With this
+    flag the masked body runs at the smallest listed width W >= that length,
+    on the first W keys only: the keys it drops are exactly keys the mask
+    removes. Values: "" / "0" off; "p2" = 128 * 2**i below bkv; "h1" = bkv / 2
+    when bkv >= 2048, else p2; "cur" = p2 for the PCP current-pass kernel only
+    (bq <= 128, batch 1, bkv 1024) and untrimmed everywhere else, so the history
+    kernel (bkv 2048) is the base kernel; an integer G = G, 2G, ... below bkv. The full
+    `bkv` is always the last width. Returns ()
+    when off or when the step layout is not the plain served one.
+    """
+    spec = os.environ.get("TPU_RPA_MASKED_TRIM", "").strip().lower()
+    if spec in ("", "0", "off"):
+        return ()
+    if (
+        cfgs.mode != configs.RpaCase.MIXED
+        or cfgs.serve.kv_layout != configs.KVLayout.SEQ_ALONG_LANE
+        or cfgs.serve.per_token_scale
+        or flash_attention.mxu_acc(cfgs, "qk")
+        or flash_attention.mxu_acc(cfgs, "pv")
+        or not flash_attention.vpu_diet_enabled()
+    ):
+        return ()
+    bkv = cfgs.bkv_sz
+    if spec == "cur":
+        # AT3-cur (lead waiver 11-02): the current pass only. Its p2 widths are the
+        # current-kernel half of h1 (r1pats4: 822 -> 760 us/call, bitwise); every other
+        # shape, the history kernel included, keeps the untrimmed masked body.
+        if not (cfgs.bq_sz <= 128 and cfgs.batch_size == 1 and bkv == 1024):
+            return ()
+        spec = "p2"
+    if spec == "h1" and not (cfgs.bq_sz <= 128 and cfgs.batch_size == 1 and bkv in (1024, 2048)):
+        # h1 is scoped to the PCP history (128-16-2048-1) and current (q128, bkv 1024)
+        # kernels it was measured on (r1pats4: 60.4K / 39.7K static bundles). Other
+        # shapes (PP8 q256-k1024 with q-tail rungs: 72.2K with p2 widths) would cross the
+        # ~60-76K-bundle code-size cliff, so they keep the untrimmed masked body.
+        return ()
+    if spec == "h1" and bkv >= 2048:
+        # One trimmed width (bkv / 2) for wide blocks: r1pats3c measured a code-size
+        # cliff (history kernel +13% at 76.5K static bundles, none at 47K), so the
+        # history kernel gets a single extra masked body; narrow blocks take p2.
+        widths = [bkv // 2]
+    elif spec in ("p2", "h1"):
+        widths, w = [], 128
+        while w < bkv:
+            widths.append(w)
+            w *= 2
+    else:
+        g = int(spec)
+        if g <= 0 or g % 128:
+            raise ValueError(f"TPU_RPA_MASKED_TRIM={spec}: a positive multiple of 128")
+        widths = list(range(g, bkv, g))
+    return tuple(widths) + (bkv,)
 
 
 def q_tail_trim_enabled() -> bool:
@@ -1507,7 +1589,11 @@ def _rpa_step(
         schedule_ref.dma_q if (len(rungs) > 1 and cfgs.batch_size > 1) else None
     )
 
-    def _run_chunk(chunk_start: int, chunk_end: int, *, apply_mask: bool):
+    def _run_chunk(chunk_start: int, chunk_end: int, *, apply_mask: bool, kv_w: int | None = None):
+        # kv_w (TPU_RPA_MASKED_TRIM): run on the first kv_w keys of the block only.
+        k_w = k if kv_w is None else k[..., :kv_w]
+        v_w = v if kv_w is None else v[..., :kv_w]
+        s_w = cfgs.bkv_sz if kv_w is None else kv_w
         chunk_sz = chunk_end - chunk_start
         q_chunk = _load_q_chunk(q_vref, chunk_start, chunk_end, cfgs=cfgs)
         step_bq_c_sz = min(cfgs.bq_c_sz, chunk_sz)
@@ -1547,7 +1633,7 @@ def _rpa_step(
                         cfgs.batch_size,
                         cfgs.model.num_kv_heads,
                         (bq_end - bq_start) * cfgs.aligned_num_q_heads_per_kv_head,
-                        cfgs.bkv_sz,
+                        s_w,
                     ),
                     bq_start=bq_start,
                     stitch_meta=stitch_meta,
@@ -1559,7 +1645,7 @@ def _rpa_step(
                 flash_attention.flash_attention_qk_softmax(
                     step,
                     q_chunk[:, :, rel_q_slice],
-                    k,
+                    k_w,
                     m_scratch_ref[:, q_slice],
                     l_scratch_ref[:, q_slice],
                     schedule_ref.is_last_k,
@@ -1581,7 +1667,7 @@ def _rpa_step(
             if prev_p is not None:
                 o_next, o_carry = flash_attention.flash_attention_pv(
                     prev_p,
-                    v,
+                    v_w,
                     cast(list[jax.Array], prev_alpha_list),
                     acc_scratch_ref[:, prev_q_slice],
                     step,
@@ -1600,7 +1686,7 @@ def _rpa_step(
         assert prev_p is not None
         o_next, o_carry = flash_attention.flash_attention_pv(
             prev_p,
-            v,
+            v_w,
             cast(list[jax.Array], prev_alpha_list),
             acc_scratch_ref[:, prev_q_slice],
             step,
@@ -1629,18 +1715,52 @@ def _rpa_step(
             cfgs=cfgs,
         )
 
-    def _dispatch_rungs(*, apply_mask: bool):
+    def _dispatch_rungs(*, apply_mask: bool, kv_w: int | None = None):
         prev_r = 0
         for idx, r in enumerate(rungs):
             if idx == 0:
-                _run_chunk(0, r, apply_mask=apply_mask)
+                _run_chunk(0, r, apply_mask=apply_mask, kv_w=kv_w)
             else:
 
                 @pl.when(max_q_sz > prev_r)
                 def _chunk(c_start=prev_r, c_end=r):
-                    _run_chunk(c_start, c_end, apply_mask=apply_mask)
+                    _run_chunk(c_start, c_end, apply_mask=apply_mask, kv_w=kv_w)
 
             prev_r = r
+
+    def _dispatch_masked():
+        # TPU_RPA_MASKED_TRIM: the masked body at the smallest width W >= the
+        # step's valid KV length (max over lanes); the widths' conditions
+        # partition the length range, so exactly one body runs.
+        widths = () if mask_bias_ref is not None else masked_trim_widths(cfgs)
+        if not widths:
+            _dispatch_rungs(apply_mask=True)
+            return
+        n_valid = None
+        for b_idx in range(cfgs.batch_size):
+            nv_b = stitch_meta.bkv_sz_frm_cache[b_idx] + stitch_meta.bkv_sz_frm_new[b_idx]
+            n_valid = nv_b if n_valid is None else jnp.maximum(n_valid, nv_b)
+        # TPU_RPA_MASKED_TRIM_MUTANT=1 (tests only): run each range one width
+        # too small (the first range at half width), dropping valid keys; the
+        # same-process bitwise compare must fail.
+        mutant = os.environ.get("TPU_RPA_MASKED_TRIM_MUTANT", "0") == "1"
+        lo = None
+        for i, w in enumerate(widths):
+            if lo is None:
+                cond = n_valid <= w
+            elif w == cfgs.bkv_sz:
+                cond = n_valid > lo
+            else:
+                cond = jnp.logical_and(n_valid > lo, n_valid <= w)
+            run_w = w
+            if mutant:  # one width too small; the first range halves (when >= 128)
+                run_w = widths[i - 1] if i > 0 else (w // 2 if w >= 256 else w)
+
+            @pl.when(cond)
+            def _w(run_w=run_w):
+                _dispatch_rungs(apply_mask=True, kv_w=None if run_w == cfgs.bkv_sz else run_w)
+
+            lo = w
 
     full = block_fully_visible(stitch_meta, step_meta, cfgs)
     if full is None:
@@ -1653,10 +1773,18 @@ def _rpa_step(
 
     @pl.when(jnp.logical_not(full))
     def _masked():
-        _dispatch_rungs(apply_mask=True)
+        _dispatch_masked()
 
 
 # Define main kernel.
+
+
+def _lse_acc_shape(lse_hbm_ref, cfgs: configs.RpaConfigs) -> tuple[int, int, int]:
+    """Compact LSE accumulator: the call's whole compact LSE plus the headroom of
+    one q block's aligned read-modify-write window (utils.place_lane_dense)."""
+    num_kv_heads, rows, lanes = lse_hbm_ref.shape
+    block_rows = -(-cfgs.bq_sz * cfgs.aligned_num_q_heads_per_kv_head // lanes)
+    return (num_kv_heads, utils.align_to(rows, 8) + utils.lane_dense_window_rows(block_rows), lanes)
 
 
 def create_allocs(
@@ -1746,6 +1874,8 @@ def get_kernel_name(cfgs: configs.RpaConfigs) -> str:
     name += f"-b{cfgs.batch_size}-q{cfgs.bq_sz}-k{cfgs.bkv_sz}"
     if cfgs.model.sliding_window:
         name += f"-sw{cfgs.model.sliding_window}"
+    if serve.return_lse and serve.dtype_lse is not None:
+        name += f"-lse{jnp.dtype(serve.dtype_lse).itemsize * 8}"
     return name
 
 
@@ -1776,8 +1906,13 @@ def rpa_kernel(
     *,
     cfgs: configs.RpaConfigs,
     computer_cls: type[schedule.BaseMetadataComputer] = schedule.BaseMetadataComputer,
+    alias_q: bool = True,
 ) -> tuple[jax.Array, jax.Array, jax.Array | None]:
     """Perform batched ragged paged attention with scheduler data.
+
+    ``alias_q=False``: the output o is a fresh buffer instead of an alias of q
+    (q stays read-only, so callers that share one q need no defensive copy).
+    Rows the kernel does not write are then undefined, not q.
 
     Args:
         cu_q_lens: [max_num_seqs + 1]. Cumulative sum of each sequence's query
@@ -1866,6 +2001,11 @@ def rpa_kernel(
             )
             + (mask_bias_shapes(cfgs) if mask_bias(cfgs) else ()),
             mxu_accs=flash_attention.mxu_acc_shapes(cfgs),
+            lse_acc=(
+                pltpu.VMEM(_lse_acc_shape(lse_hbm_ref, cfgs), jnp.float32)
+                if return_lse and cfgs.serve.lse_compact
+                else ()
+            ),
             skew_scratches=skew_shapes(cfgs) if skew else (),
             fold_scratches=(
                 (zero_tile_shape(cfgs), pltpu.SemaphoreType.DMA((FOLD_INPUT_SLOTS,)))
@@ -1874,9 +2014,10 @@ def rpa_kernel(
             ),
         )
         def _run(
-            final_allocs, schedule_ref, dma_sem, scratches, mxu_accs, skew_scratches,
+            final_allocs, schedule_ref, dma_sem, scratches, mxu_accs, lse_acc, skew_scratches,
             fold_scratches,
         ):
+            compact_lse = return_lse and cfgs.serve.lse_compact
             # Initialize Q to zeros to prevent NaN pollution.
             #
             # When a query block is partially filled, tail slots in uninitialized VMEM
@@ -1976,7 +2117,9 @@ def rpa_kernel(
                     q_bound = q_alloc.bind(src_ref=(q_hbm_ref, schedule_ref))
                     o_bound = o_alloc.bind(dst_ref=(o_hbm_ref, schedule_ref))
                     lse_bound = (
-                        lse_alloc.bind(dst_ref=(lse_hbm_ref, schedule_ref))
+                        lse_alloc.bind(
+                            dst_ref=(lse_acc if compact_lse else lse_hbm_ref, schedule_ref)
+                        )
                         if return_lse
                         else None
                     )
@@ -2118,6 +2261,16 @@ def rpa_kernel(
                         lse_bref=lse_bound,
                     )
 
+                if compact_lse:
+                    # The compact LSE lives in VMEM for the whole call: start from the
+                    # caller's buffer (aliased in/out, -inf where nothing is written).
+                    acc_rows = lse_hbm_ref.shape[1]
+                    cp = pltpu.make_async_copy(
+                        lse_hbm_ref, lse_acc.at[:, pl.ds(0, acc_rows), :], dma_sem.at[0]
+                    )
+                    cp.start()
+                    cp.wait()
+
                 @pl.loop(0, num_safe_step_iterations)
                 def loop_body(step_idx):
                     start = step_idx * cfgs.max_steps_ub
@@ -2127,6 +2280,13 @@ def rpa_kernel(
                     size = jnp.where(is_last_step, last_step_size, cfgs.max_steps_ub)
 
                     execute_schedule_chunk(start, size)
+
+                if compact_lse:
+                    cp = pltpu.make_async_copy(
+                        lse_acc.at[:, pl.ds(0, acc_rows), :], lse_hbm_ref, dma_sem.at[0]
+                    )
+                    cp.start()
+                    cp.wait()
 
         _run()
 
@@ -2147,6 +2307,8 @@ def rpa_kernel(
         num_active_scalers + schedule_leaves: 0,
         num_active_scalers + schedule_leaves + 2: 1,
     }
+    if not alias_q:
+        del input_output_aliases[num_active_scalers + schedule_leaves]
     if return_lse:
         input_output_aliases[num_active_scalers + schedule_leaves + 3] = (
             2  # lse_hbm -> out[2]

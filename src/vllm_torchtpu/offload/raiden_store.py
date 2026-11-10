@@ -76,6 +76,7 @@ See `raiden_connector.py` for connector wiring, device fencing, and echo channel
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import enum
 import hashlib
@@ -153,6 +154,199 @@ def controller_ready_marker(port: int) -> str:
     then holds the port the controller is about to bind.
     """
     return f"/tmp/raiden_controller_ready_{port}"
+
+
+# -- live-extent offload (TPU_RAIDEN_LIVE_EXTENT) --------------------------------
+
+_LIVE_EXTENT_ENV = "TPU_RAIDEN_LIVE_EXTENT"
+_LIVE_EXTENT_CLASSES = frozenset({"state", "tail"})
+# Test-only: store one kernel block fewer than a GDN state needs, so that a
+# numerics check can be shown to fail. Never set in a serving recipe.
+_LIVE_EXTENT_MUTANT_ENV = "TPU_RAIDEN_LIVE_EXTENT_MUTANT"
+
+
+def live_extent_requested() -> frozenset[str]:
+    """Key classes whose host copy keeps only the kernel blocks holding live bytes.
+
+    TPU_RAIDEN_LIVE_EXTENT: unset, empty or 0 = off (the default); "state",
+    "tail", or "state,tail" (also "1" / "all"). "state" stores a Mamba/GDN state
+    key's state region only; "tail" stores a full-attention partial-tail key's
+    rows below its boundary only.
+    """
+    raw = os.environ.get(_LIVE_EXTENT_ENV, "").strip().lower()
+    if raw in ("", "0", "off", "false", "no"):
+        return frozenset()
+    if raw in ("1", "all", "on", "true", "yes"):
+        return _LIVE_EXTENT_CLASSES
+    parts = frozenset(p.strip() for p in raw.split(",") if p.strip())
+    unknown = parts - _LIVE_EXTENT_CLASSES
+    if unknown:
+        raise ValueError(
+            f"{_LIVE_EXTENT_ENV}={raw!r}: unknown class(es) {sorted(unknown)}; "
+            "use state, tail or state,tail"
+        )
+    return parts
+
+
+@dataclass(frozen=True)
+class LiveExtent:
+    """How many of a key's `factor` kernel-block sub-hashes hold live bytes.
+
+    The host store keeps one entry per physical kernel block, and a key is
+    `factor` of them (`OffloadKey ‖ sub_idx`). A key whose live bytes sit in
+    the first n kernel blocks of its device block can store and load just
+    those n entries; capacity is counted in entries, so the key then costs n.
+
+    - A GDN state slot holds the state region at its start: the SSM rows from
+      row 0, then the conv rows (`pool_adapters.v3_state_source`,
+      `gdn_attention._build_v3_pool_state_plan`). Under PCP each rank holds a
+      head-sharded half state, so `state_sub_blocks` is about half of `factor`.
+    - A full-attention key whose end position b is not a block boundary is a
+      partial tail: it holds the logical tokens [floor(b/B)*B, b) of its block
+      (B = `tail_block_tokens`, all CP ranks). With CP interleave `il` over
+      `pcp` ranks, rank 0 holds the most rows: ceil(ceil(L/il)/pcp) chunks.
+    """
+
+    factor: int
+    kernel_block_tokens: int
+    state_group_ids: frozenset[int] = frozenset()
+    state_sub_blocks: int | None = None
+    tail_group_ids: frozenset[int] = frozenset()
+    tail_block_tokens: int = 0
+    pcp_size: int = 1
+    interleave: int = 1
+    mutant_short_state: bool = False
+
+    @property
+    def state_on(self) -> bool:
+        return self.state_sub_blocks is not None and bool(self.state_group_ids)
+
+    @property
+    def tail_on(self) -> bool:
+        return bool(self.tail_group_ids) and self.tail_block_tokens > 0
+
+    def state_count(self) -> int:
+        assert self.state_sub_blocks is not None
+        n = self.state_sub_blocks - (1 if self.mutant_short_state else 0)
+        return max(1, min(n, self.factor))
+
+    def tail_count(self, end_token: int) -> int:
+        """Kernel blocks below `end_token` in its block (`factor` if aligned)."""
+        live = end_token % self.tail_block_tokens
+        if live == 0:
+            return self.factor
+        if self.pcp_size > 1:
+            chunks = -(-live // self.interleave)
+            rows = -(-chunks // self.pcp_size) * self.interleave
+        else:
+            rows = live
+        return max(1, min(-(-rows // self.kernel_block_tokens), self.factor))
+
+
+def resolve_live_extent(
+    classes: frozenset[str],
+    *,
+    factor: int,
+    kernel_block_tokens: int,
+    state_group_ids: Sequence[int],
+    state_required_tokens: int | None,
+    fa_group_ids: Sequence[int],
+    tail_block_tokens: int,
+    pcp_size: int,
+    dcp_size: int,
+    interleave: int,
+    layer_major: bool,
+    mutant_short_state: bool = False,
+) -> LiveExtent | None:
+    """The live-extent rule for this engine, or None when nothing applies.
+
+    Fails safe: any class whose preconditions do not hold is switched off with
+    a warning, and None means every key keeps all `factor` sub-hashes.
+    """
+    if not classes:
+        return None
+    if not layer_major or factor <= 1:
+        logger.warning(
+            "TPURaidenOffloadingConnector: %s=%s ignored: needs the layer-major "
+            "registration with several kernel blocks per device block (factor=%d)",
+            _LIVE_EXTENT_ENV,
+            ",".join(sorted(classes)),
+            factor,
+        )
+        return None
+    state_sub_blocks = None
+    state_ids: frozenset[int] = frozenset()
+    if "state" in classes:
+        if state_required_tokens and state_group_ids:
+            n = -(-int(state_required_tokens) // kernel_block_tokens)
+            if n < factor:
+                state_sub_blocks = n
+                state_ids = frozenset(state_group_ids)
+            else:
+                logger.info(
+                    "TPURaidenOffloadingConnector: %s state: the state fills "
+                    "%d of %d kernel blocks; nothing to save",
+                    _LIVE_EXTENT_ENV,
+                    n,
+                    factor,
+                )
+        else:
+            logger.warning(
+                "TPURaidenOffloadingConnector: %s state ignored: no state group "
+                "or unknown state extent",
+                _LIVE_EXTENT_ENV,
+            )
+    tail_ids: frozenset[int] = frozenset()
+    if "tail" in classes:
+        reason = None
+        if not fa_group_ids:
+            reason = "no full-attention group"
+        elif dcp_size > 1:
+            reason = f"DCP {dcp_size}"
+        elif pcp_size > 1 and (
+            interleave <= 0 or tail_block_tokens % (interleave * pcp_size)
+        ):
+            reason = (
+                f"block {tail_block_tokens} is not a multiple of interleave "
+                f"{interleave} x PCP {pcp_size}"
+            )
+        if reason is None:
+            tail_ids = frozenset(fa_group_ids)
+        else:
+            logger.warning(
+                "TPURaidenOffloadingConnector: %s tail ignored: %s",
+                _LIVE_EXTENT_ENV,
+                reason,
+            )
+    if state_sub_blocks is None and not tail_ids:
+        return None
+    rule = LiveExtent(
+        factor=factor,
+        kernel_block_tokens=kernel_block_tokens,
+        state_group_ids=state_ids,
+        state_sub_blocks=state_sub_blocks,
+        tail_group_ids=tail_ids,
+        tail_block_tokens=tail_block_tokens if tail_ids else 0,
+        pcp_size=pcp_size,
+        interleave=interleave,
+        mutant_short_state=mutant_short_state,
+    )
+    logger.info(
+        "TPURaidenOffloadingConnector: live-extent offload on (%s=%s): state "
+        "groups %s store %s of %d kernel blocks%s; full-attention tail groups %s "
+        "store ceil(ceil(L/%d)/%d) blocks of %d-token logical blocks",
+        _LIVE_EXTENT_ENV,
+        ",".join(sorted(classes)),
+        sorted(state_ids),
+        rule.state_count() if rule.state_on else factor,
+        factor,
+        " (TEST MUTANT: one block short)" if mutant_short_state else "",
+        sorted(tail_ids),
+        interleave if pcp_size > 1 else 1,
+        pcp_size,
+        tail_block_tokens,
+    )
+    return rule
 
 
 def iter_leaf_kv_cache_specs(kv_cache_spec):
@@ -404,6 +598,10 @@ class RaidenOffloadingManager(OffloadingManager):
         # Storage tier behind the host DRAM pool: raiden BackendConfigs from
         # `build_store_storage_backend_config`. Empty keeps the store DRAM-only.
         secondary_backend_configs: Sequence[object] = (),
+        # Live-extent offload (TPU_RAIDEN_LIVE_EXTENT): per-key sub-hash
+        # counts below `device_block_size_factor`. None keeps every key at
+        # the full factor, which is the default path.
+        live_extent: LiveExtent | None = None,
         # Test overrides: allow injecting mock store instance and type bindings.
         store: Any = None,
         store_types: Any = None,
@@ -414,6 +612,21 @@ class RaidenOffloadingManager(OffloadingManager):
         self._capacity_keys = offload_logical_blocks_capacity
         self._device_block_size_factor = device_block_size_factor
         self._key_namespace = key_namespace
+        if live_extent is not None:
+            assert live_extent.factor == device_block_size_factor, (
+                live_extent.factor,
+                device_block_size_factor,
+            )
+        self._live = live_extent
+        # Sub-hash counts of partial-tail keys, learnt from the request
+        # context (the key's end position) on lookup/touch/prepare_*, and read
+        # on the context-free paths (submit_*_job, demote, eviction). Bounded;
+        # a key missing here falls back to the full factor, which can only
+        # turn a hit into a miss, never load fewer blocks than were stored.
+        self._tail_counts: collections.OrderedDict[OffloadKey, int] = (
+            collections.OrderedDict()
+        )
+        self._tail_counts_cap = max(1 << 16, 4 * offload_logical_blocks_capacity)
         # Tier telemetry: cumulative job counters plus the launch time and
         # block count of every in-flight job, reported once a minute from
         # poll_finished_jobs. The connector scheduler adds its own keys
@@ -442,6 +655,19 @@ class RaidenOffloadingManager(OffloadingManager):
             "demote_keys": 0,
             "demoted_sub_hashes": 0,
         }
+        if live_extent is not None:
+            # Launched store keys and the sub-hashes they stored, per class;
+            # "saved" counts the sub-hashes live extent did not store.
+            for k in (
+                "live_state_keys",
+                "live_state_sub",
+                "live_tail_keys",
+                "live_tail_sub",
+                "live_other_keys",
+                "live_other_sub",
+                "live_saved_sub",
+            ):
+                self.telemetry[k] = 0
         self._tel_launch: dict[int, tuple[float, int]] = {}
         self._tel_last_log = time.monotonic()
         self._tel_last_snapshot = dict(self.telemetry)
@@ -556,12 +782,61 @@ class RaidenOffloadingManager(OffloadingManager):
 
     # -- sub-hash / block-id expansion ----------------------------------
 
+    def _sub_count(self, key: OffloadKey, touch: bool = True) -> int:
+        """Sub-hashes `key` stores: the full factor unless live extent applies.
+
+        `touch=False` only reads the tail map; the eviction callback runs on a
+        Raiden thread and must not reorder it under the scheduler thread.
+        """
+        live = self._live
+        if live is None:
+            return self._device_block_size_factor
+        group_idx = int.from_bytes(key[-4:], "big")
+        if live.state_on and group_idx in live.state_group_ids:
+            return live.state_count()
+        if live.tail_on and group_idx in live.tail_group_ids:
+            count = self._tail_counts.get(key)
+            if count is not None:
+                if touch:
+                    with contextlib.suppress(KeyError):
+                        self._tail_counts.move_to_end(key)
+                return count
+        return self._device_block_size_factor
+
+    def _note_positions(self, keys: Sequence[OffloadKey], req_context: Any) -> None:
+        """Learns partial-tail keys' sub-hash counts from their end positions."""
+        live = self._live
+        if live is None or not live.tail_on or req_context is None:
+            return
+        get_position = getattr(req_context, "get_offload_key_position", None)
+        if get_position is None:
+            return
+        counts = self._tail_counts
+        for key in keys:
+            if int.from_bytes(key[-4:], "big") not in live.tail_group_ids:
+                continue
+            end_token = get_position(key)
+            if end_token is None:
+                continue
+            count = live.tail_count(int(end_token))
+            if count >= self._device_block_size_factor:
+                continue
+            counts[key] = count
+            counts.move_to_end(key)
+        while len(counts) > self._tail_counts_cap:
+            counts.popitem(last=False)
+
     def _sub_hashes(self, key: OffloadKey) -> list[bytes]:
         # The namespace prefix makes registry keys byte-distinct
         # across incompatible engines; locally it is inert.
+        if self._live is None:
+            return [
+                self._key_namespace + key + i.to_bytes(4, "big")
+                for i in range(self._device_block_size_factor)
+            ]
         return [
             self._key_namespace + key + i.to_bytes(4, "big")
-            for i in range(self._device_block_size_factor)
+            for i in range(self._sub_count(key))
         ]
 
     def _expand_keys(self, keys: list[OffloadKey]) -> list[bytes]:
@@ -570,9 +845,37 @@ class RaidenOffloadingManager(OffloadingManager):
             out.extend(self._sub_hashes(key))
         return out
 
-    def _expand_device_blocks(self, device_block_ids: list[int]) -> list[int]:
+    def _expand_device_blocks(
+        self, device_block_ids: list[int], keys: list[OffloadKey] | None = None
+    ) -> list[int]:
         f = self._device_block_size_factor
-        return [b * f + i for b in device_block_ids for i in range(f)]
+        if self._live is None or keys is None:
+            return [b * f + i for b in device_block_ids for i in range(f)]
+        assert len(keys) == len(device_block_ids), (len(keys), len(device_block_ids))
+        return [
+            b * f + i
+            for key, b in zip(keys, device_block_ids)
+            for i in range(self._sub_count(key))
+        ]
+
+    def _account_live_store(self, keys: list[OffloadKey]) -> None:
+        live = self._live
+        if live is None:
+            return
+        tel = self.telemetry
+        f = self._device_block_size_factor
+        for key in keys:
+            n = self._sub_count(key)
+            group_idx = int.from_bytes(key[-4:], "big")
+            if live.state_on and group_idx in live.state_group_ids:
+                cls = "state"
+            elif live.tail_on and group_idx in live.tail_group_ids and n < f:
+                cls = "tail"
+            else:
+                cls = "other"
+            tel[f"live_{cls}_keys"] += 1
+            tel[f"live_{cls}_sub"] += n
+            tel["live_saved_sub"] += f - n
 
     # -- pin bookkeeping -------------------------------------------------
 
@@ -678,6 +981,8 @@ class RaidenOffloadingManager(OffloadingManager):
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
         if key in self._inflight_store_keys:
             return LookupResult.HIT_PENDING
+        if self._live is not None:
+            self._note_positions((key,), req_context)
         sub_hashes = self._sub_hashes(key)
         # A probe across all sub-hashes, not a claim: the store pins every
         # local hit it reports, and those pins go straight back below.
@@ -747,6 +1052,9 @@ class RaidenOffloadingManager(OffloadingManager):
         # been asked about them, so the pool may still hold the same hash,
         # pinned by an in-flight job, and a release would drop that job's pin.
         skip = (self._block_status.REMOTE, self._block_status.SHARED_STORAGE)
+        if self._live is not None:
+            keys = list(keys)
+            self._note_positions(keys, req_context)
         for key in keys:
             sub_hashes = self._sub_hashes(key)
             held = [
@@ -759,6 +1067,8 @@ class RaidenOffloadingManager(OffloadingManager):
 
     def prepare_load(self, keys, req_context: ReqContext) -> LoadStoreSpec:
         keys = list(keys)
+        if self._live is not None:
+            self._note_positions(keys, req_context)
         sub_hashes = self._expand_keys(keys)
         # Split the batch by where the bytes are. A local sub-hash is pinned
         # here so it survives until the load runs; a peer or storage sub-hash
@@ -850,6 +1160,9 @@ class RaidenOffloadingManager(OffloadingManager):
         # or whose recall found no host room. The save puts it back in host
         # DRAM and rewrites the files, which also repairs a copy that could
         # not be read.
+        if self._live is not None:
+            keys = list(keys)
+            self._note_positions(keys, req_context)
         keys_to_store = [key for key in keys if not self.holds(key)]
         if len(keys_to_store) > self._capacity_keys:
             return None
@@ -957,8 +1270,20 @@ class RaidenOffloadingManager(OffloadingManager):
                     # block is no longer intact or retrievable from host cache.
                     self._evicted_keys_queue.append(key)
                 sub_indices.add(sub_idx)
-                if len(sub_indices) >= self._device_block_size_factor:
+                if self._live is None:
+                    if len(sub_indices) >= self._device_block_size_factor:
+                        self._evicted_sub_hashes.pop(key, None)
+                    continue
+                if len(sub_indices) >= self._sub_count(key, touch=False):
                     self._evicted_sub_hashes.pop(key, None)
+            if self._live is not None:
+                # A tail key whose count fell out of the bounded map is
+                # tracked against the full factor and may never complete;
+                # keep the tracker bounded too.
+                while len(self._evicted_sub_hashes) > self._tail_counts_cap:
+                    self._evicted_sub_hashes.pop(
+                        next(iter(self._evicted_sub_hashes))
+                    )
 
     def take_events(self) -> list[OffloadingEvent]:
         with self._eviction_lock:
@@ -1029,7 +1354,7 @@ class RaidenOffloadingManager(OffloadingManager):
             for key in keys:
                 self._evicted_sub_hashes.pop(key, None)
         sub_hashes = self._expand_keys(keys)
-        device_ids = self._expand_device_blocks(device_block_ids)
+        device_ids = self._expand_device_blocks(device_block_ids, keys)
         slices = [
             self._block_id_cls(
                 raiden_id=self._raiden_id,
@@ -1111,6 +1436,8 @@ class RaidenOffloadingManager(OffloadingManager):
             saved_sub_hashes=to_save,
             retries_left=_SAVE_RETRIES,
         )
+        if self._live is not None:
+            self._account_live_store(keys)
         self._admissions[job_id] = admission
         for sub_hash in to_save:
             self._hash_to_admission[sub_hash] = admission
@@ -1143,7 +1470,7 @@ class RaidenOffloadingManager(OffloadingManager):
             )
             return
         sub_hashes = self._expand_keys(keys)
-        device_ids = self._expand_device_blocks(device_block_ids)
+        device_ids = self._expand_device_blocks(device_block_ids, keys)
         # Partition by where prepare_load found each sub-hash: one that came
         # with a peer or storage slice is read from there, everything else is
         # pinned in the local host pool. The slice is the only record of a peer
@@ -1463,11 +1790,41 @@ class RaidenOffloadingManager(OffloadingManager):
             tel["store_blocks"],
         )
         logger.info(
-            "offload-tier store-split: window %.0fs fa_keys=%d mamba_keys=%d",
+            "offload-tier store-split: window %.0fs fa_keys=%d mamba_keys=%d "
+            "demote_keys=%d demoted_sub_hashes=%d store_has_demote=%d "
+            "state_tail_hits=%d floor_states_skipped=%d",
             dt,
             d["split_fa_keys"],
             d["split_mamba_keys"],
+            d["demote_keys"],
+            d["demoted_sub_hashes"],
+            int(getattr(self._store, "demote", None) is not None),
+            d.get("state_tail_hits", 0),
+            d.get("floor_states_skipped", 0),
         )
+        if self._live is not None:
+            logger.info(
+                "offload-tier live-extent: window %.0fs state_keys=%d state_sub=%d "
+                "(%.2f/key) tail_keys=%d tail_sub=%d (%.2f/key) other_keys=%d "
+                "other_sub=%d saved_sub=%d of factor %d | total state_keys=%d "
+                "state_sub=%d tail_keys=%d tail_sub=%d saved_sub=%d",
+                dt,
+                d["live_state_keys"],
+                d["live_state_sub"],
+                d["live_state_sub"] / max(d["live_state_keys"], 1),
+                d["live_tail_keys"],
+                d["live_tail_sub"],
+                d["live_tail_sub"] / max(d["live_tail_keys"], 1),
+                d["live_other_keys"],
+                d["live_other_sub"],
+                d["live_saved_sub"],
+                self._device_block_size_factor,
+                tel["live_state_keys"],
+                tel["live_state_sub"],
+                tel["live_tail_keys"],
+                tel["live_tail_sub"],
+                tel["live_saved_sub"],
+            )
         class_evicted = getattr(self._store, "evicted_sub_hashes", None)
         if class_evicted is not None:
             # Per-class sub-hash counts since the last line: evicted, and
@@ -2546,6 +2903,34 @@ def build_worker_storage_backend_config(
     return cfg
 
 
+def _gdn_state_required_tokens(
+    vllm_config: VllmConfig,
+    *,
+    bytes_per_pool_row: int,
+    slot_bytes: int,
+) -> int | None:
+    """Pool rows the platform reserves for one GDN state slot's live regions.
+
+    The same derivation that sized the slot (`tpu_block_size_utils`, logged as
+    mamba_required_state_bytes): SSM rows from row 0, then the conv rows. It
+    covers the spec-decode conv widening the kernel does not keep, so it is an
+    upper bound on the rows the kernel reads or writes.
+    """
+    from vllm_torchtpu.platforms.tpu_block_size_utils import (
+        _hybrid_mamba_state_layout,
+    )
+
+    layout = _hybrid_mamba_state_layout(vllm_config, bytes_per_pool_row)
+    if layout is None:
+        return None
+    if layout.required_bytes > slot_bytes:
+        raise ValueError(
+            f"GDN state extent {layout.required_bytes} B exceeds the slot "
+            f"{slot_bytes} B"
+        )
+    return int(layout.required_tokens)
+
+
 class TPURaidenStoreOffloadingSpec(OffloadingSpec):
     """Configuration specification wiring the Raiden offloading manager and
     per-rank workers.
@@ -2817,8 +3202,93 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                 ).encode()
             ).digest()[:16]
 
+        self.live_extent = self._resolve_live_extent(
+            config,
+            kernel_block_size=kernel_block_size,
+            per_block_shape=per_block_shape,
+            kv_dtype=kv_dtype,
+            device_block_size=device_block_size,
+        )
+
         self._manager: RaidenOffloadingManager | None = None
         self._worker: RaidenStoreOffloadingWorker | None = None
+
+    def _resolve_live_extent(
+        self,
+        config: OffloadingConfig,
+        *,
+        kernel_block_size: int,
+        per_block_shape: Any,
+        kv_dtype: Any,
+        device_block_size: int,
+    ) -> LiveExtent | None:
+        """The TPU_RAIDEN_LIVE_EXTENT rule, or None (the default)."""
+        classes = live_extent_requested()
+        if not classes:
+            return None
+        from vllm.v1.kv_cache_interface import MambaSpec
+
+        vllm_config = self.vllm_config
+        kv_cache_config = self.kv_cache_config
+        parallel = config.parallel
+        offloaded = {g.group_id for g in config.groups}
+        state_ids = [
+            idx
+            for idx, group in enumerate(kv_cache_config.kv_cache_groups)
+            if idx in offloaded and isinstance(group.kv_cache_spec, MambaSpec)
+        ]
+        fa_ids = [
+            idx
+            for idx, group in enumerate(kv_cache_config.kv_cache_groups)
+            if idx in offloaded and isinstance(group.kv_cache_spec, FullAttentionSpec)
+        ]
+        layer_major = (
+            self.block_major_contract is None
+            and not unified_block_major_enabled(vllm_config)
+            and not is_multi_shapes_geometry(per_block_shape)
+        )
+        factor = self.device_block_size_factor
+        state_required_tokens = None
+        if "state" in classes and state_ids and layer_major:
+            try:
+                import numpy as np
+                import torch
+
+                kernel_block_bytes = (
+                    int(np.prod(per_block_shape))
+                    * torch.empty(0, dtype=kv_dtype).element_size()
+                )
+                state_required_tokens = _gdn_state_required_tokens(
+                    vllm_config,
+                    bytes_per_pool_row=kernel_block_bytes // kernel_block_size,
+                    slot_bytes=kernel_block_bytes * factor,
+                )
+            except Exception:
+                logger.warning(
+                    "TPURaidenOffloadingConnector: %s state: could not derive "
+                    "the GDN state extent; state keys keep all %d kernel blocks",
+                    _LIVE_EXTENT_ENV,
+                    factor,
+                    exc_info=True,
+                )
+        interleave = int(vllm_config.parallel_config.cp_kv_cache_interleave_size or 1)
+        return resolve_live_extent(
+            classes,
+            factor=factor,
+            kernel_block_tokens=kernel_block_size,
+            state_group_ids=state_ids,
+            state_required_tokens=state_required_tokens,
+            fa_group_ids=fa_ids,
+            tail_block_tokens=device_block_size * parallel.pcp_size * parallel.dcp_size,
+            pcp_size=parallel.pcp_size,
+            dcp_size=parallel.dcp_size,
+            interleave=interleave,
+            layer_major=layer_major,
+            mutant_short_state=os.environ.get(_LIVE_EXTENT_MUTANT_ENV, "")
+            .strip()
+            .lower()
+            == "short_state",
+        )
 
     def _build_dedup_manager(self) -> RaidenOffloadingManager:
         """Builds the full-attention and state stores and the manager over both."""
@@ -2883,6 +3353,7 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
             raiden_controller_port=layout.state_port,
             raiden_job_name=self.raiden_job_name,
             key_namespace=self.key_namespace,
+            live_extent=self.live_extent,
             store=store,
             store_types=store_types,
         )
@@ -2994,6 +3465,7 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                 kv_pool_group=self.kv_pool_group,
                 key_namespace=self.key_namespace,
                 secondary_backend_configs=secondary_backend_configs,
+                live_extent=self.live_extent,
             )
         return self._manager
 

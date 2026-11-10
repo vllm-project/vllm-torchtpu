@@ -28,8 +28,10 @@ pushes the ``C`` output rows belonging to every destination into that rank's
 packed token rows and the source rank's value-head columns.
 """
 
+import contextlib
 import dataclasses
 import functools
+import os
 from typing import cast
 
 import jax
@@ -52,6 +54,17 @@ class _ProjectionConfig:
     qkv_dim: int
     full_key_dim: int
     kq_replication_factor: int
+    # > 0: stream the weight in n_chunk-column chunks (double-buffered) and run
+    # one matmul per chunk (TPU_PCP_GDN_PROJ_NCHUNK). 0: one weight slab per
+    # output block, as before.
+    n_chunk: int = 0
+    # > 0: legacy single-slab weight, but one dot per n_sub output columns
+    # (TPU_PCP_GDN_PROJ_NSUB), bounding the f32 temporary for larger token blocks.
+    n_sub: int = 0
+    # True: each destination's QKV is two jobs, QK (2 * shard_key_dim columns) and V
+    # (shard_value_dim), so the resident weight slab is max(QK, V) rows instead of
+    # QK + V (TPU_PCP_GDN_PROJ_SPLIT_QKV; needs n_sub > 0).
+    split_qkv: bool = False
 
 
 _TPU_TILE_ROWS = 8
@@ -99,6 +112,137 @@ def _mesh_device_id(
         pcp_rank if axis_name == pcp_axis_name else lax.axis_index(axis_name)
         for axis_name in mesh_axis_names
     )
+
+
+# Collective id of this kernel's entry barrier (other PCP-stage kernels: fused EP
+# v3 0/3, dense slots 5/6, PCP streaming attention 14/15).
+GDN_PCP_COLLECTIVE_ID = 13
+
+
+def pcp_entry_barrier_enabled() -> bool:
+    """TPU_PCP_ENTRY_BARRIER=1: barrier every PCP rank on the runtime's barrier
+    semaphore before the kernel's first remote DMA.
+
+    Without it a rank that enters the kernel first DMAs its QKV into the
+    peer's VMEM and signals the peer's scratch semaphores while the peer may
+    still be running a different kernel, whose scratch occupies the same
+    addresses. The barrier semaphore (pltpu.get_barrier_semaphore, reserved
+    per collective_id) is the one semaphore that is safe to signal before the
+    peer has entered."""
+    return os.environ.get("TPU_PCP_ENTRY_BARRIER", "0") == "1"
+
+
+def pcp_gdn_projection_block_tokens(local_num_tokens: int, comm_chunk_size: int) -> int:
+    """Rank-local tokens per in-kernel QKVZ projection matmul.
+
+    Default (TPU_PCP_GDN_PROJ_BLOCK unset): one communication chunk, as before.
+    TPU_PCP_GDN_PROJ_BLOCK=N picks the largest multiple of the chunk that is
+    <= N and divides the rank-local bucket. Every projection tile re-streams
+    its whole QKV or Z weight slice from HBM and feeds only this many rows to
+    the MXU, so a larger block cuts weight traffic and fills the MXU better.
+    """
+    raw = os.environ.get("TPU_PCP_GDN_PROJ_BLOCK", "").strip()
+    if not raw:
+        return comm_chunk_size
+    cap = int(raw)
+    # The chunked projection keeps VMEM small enough for blocks that are not
+    # multiples of the chunk (e.g. 544 rows for a 2,176-row bucket); 32 rows
+    # keeps the fp8 (32, 128) and bf16 (16, 128) tiles whole.
+    step = 32 if pcp_gdn_projection_n_chunk() > 0 else comm_chunk_size
+    best = comm_chunk_size
+    block = step
+    while block <= cap:
+        if local_num_tokens % block == 0 and block >= comm_chunk_size:
+            best = block
+        block += step
+    return best
+
+
+def pcp_gdn_no_zero_init() -> bool:
+    """TPU_PCP_GDN_NO_ZERO_INIT=1: no XLA zero-fill of the kernel's packed output and GDN
+    scratch output, and no XLA select on Z. The kernel zeroes only the padded tail rows
+    (rows >= the rank's live row end) of packed_out and Z itself. Same arrays."""
+    return os.environ.get("TPU_PCP_GDN_NO_ZERO_INIT", "0") == "1"
+
+
+def pcp_gdn_ba_direct() -> bool:
+    """TPU_PCP_GDN_BA_DIRECT (lane r1p GDN, default off): the kernel reads b/a straight
+    from the rank-major packed BA shard at per-tile packed rows, so the caller skips the
+    request-major scatter and its per-forward reorder indices. Bitwise."""
+    return os.environ.get("TPU_PCP_GDN_BA_DIRECT", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def pcp_gdn_projection_split_qkv() -> bool:
+    """TPU_PCP_GDN_PROJ_SPLIT_QKV=1: QK and V of each destination as separate projection
+    jobs (weight slab 16 MiB instead of 24 MiB), freeing VMEM for 256-row blocks."""
+    return os.environ.get("TPU_PCP_GDN_PROJ_SPLIT_QKV", "0") == "1"
+
+
+def pcp_gdn_projection_n_sub() -> int:
+    """TPU_PCP_GDN_PROJ_NSUB=S: with the single-slab weight (no chunking), split each
+    projection dot into S-column dots. Unset or 0: one dot per output block."""
+    raw = os.environ.get("TPU_PCP_GDN_PROJ_NSUB", "").strip()
+    return int(raw) if raw else 0
+
+
+def pcp_gdn_projection_n_chunk() -> int:
+    """TPU_PCP_GDN_PROJ_NCHUNK=C: chunked in-kernel projection, C weight columns
+    per matmul, double-buffered weight DMA (chunk c+1 streams during chunk c's
+    matmul). Unset or 0: the original single-slab projection."""
+    raw = os.environ.get("TPU_PCP_GDN_PROJ_NCHUNK", "").strip()
+    return int(raw) if raw else 0
+
+
+def _gdn_scopes_enabled() -> bool:
+    """TPU_PCP_GDN_SCOPES=1: named device scopes inside the kernel (visible with
+    --xla_enable_custom_call_region_trace=true). Off by default."""
+    return os.environ.get("TPU_PCP_GDN_SCOPES", "0") == "1"
+
+
+def _scope(name: str):
+    return jax.named_scope(name) if _gdn_scopes_enabled() else contextlib.nullcontext()
+
+
+def _scoped(name: str):
+    """Decorator form of _scope (applied under pl.when)."""
+
+    def deco(fn):
+        @functools.wraps(fn)
+        def inner(*args, **kwargs):
+            with _scope(name):
+                return fn(*args, **kwargs)
+
+        return inner
+
+    return deco
+
+
+def _gdn_ablations() -> frozenset[str]:
+    """TPU_PCP_GDN_ABLATE (debug, timing only; outputs become wrong): comma- or
+    plus-separated list of proj_mm (no projection matmul), proj_wdma (no weight DMA), gdn (no
+    GDN tile compute). Unset by default."""
+    raw = os.environ.get("TPU_PCP_GDN_ABLATE", "").replace("+", ",")
+    return frozenset(x.strip() for x in raw.split(",") if x.strip())
+
+
+def _entry_barrier(
+    pcp_size: int, *, mesh_axis_names: tuple[str, ...], pcp_axis_name: str
+) -> None:
+    """Wait until every PCP rank has entered this kernel (barrier semaphore)."""
+    barrier = pltpu.get_barrier_semaphore()
+    for peer in range(pcp_size):
+        pl.semaphore_signal(
+            barrier,
+            inc=1,
+            device_id=_mesh_device_id(mesh_axis_names, pcp_axis_name, peer),
+            device_id_type=pl.DeviceIdType.MESH,
+        )
+    pl.semaphore_wait(barrier, pcp_size)
 
 
 def _all_rank_barrier(
@@ -191,25 +335,33 @@ def _compute_gdn_tile(
                 :,
             ] = dense_qkv[prefix : prefix + cfg.tile_size, :].astype(jnp.float32)
 
-    for prefix in range(_TPU_TILE_ROWS):
-        _load_qkv(prefix)
+    if "gdn" in _gdn_ablations():
+        return
+    with _scope("g_gdn_load"):
+        for prefix in range(_TPU_TILE_ROWS):
+            _load_qkv(prefix)
 
-    wrapper.inner_kernel(
-        compute_qkv_ref,
-        b_slot_ref,
-        a_slot_ref,
-        conv_state_in_slot_ref,
-        recurrent_in_slot_ref,
-        out_slot_ref,
-        conv_state_out_slot_ref,
-        recurrent_out_slot_ref,
-        metadata_ref,
-        weights_ref,
-        carry_conv_scratch_ref,
-        carry_recurrent_scratch_ref,
-        cfg=cfg,
-        p_id=p_id,
-    )
+    with _scope("g_gdn_inner"):
+        _gdn_inner_kernel(
+            compute_qkv_ref,
+            b_slot_ref,
+            a_slot_ref,
+            conv_state_in_slot_ref,
+            recurrent_in_slot_ref,
+            out_slot_ref,
+            conv_state_out_slot_ref,
+            recurrent_out_slot_ref,
+            metadata_ref,
+            weights_ref,
+            carry_conv_scratch_ref,
+            carry_recurrent_scratch_ref,
+            cfg=cfg,
+            p_id=p_id,
+        )
+
+
+def _gdn_inner_kernel(*args, **kwargs) -> None:
+    wrapper.inner_kernel(*args, **kwargs)
 
 
 def _pcp_qkvz_projection_gdn_outer_kernel(
@@ -258,6 +410,9 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
     projection_pending_out_ref: jax.Array,
     active_rows_smem_ref: jax.Array,
     active_rows_dma_sem: jax.Array,
+    zero_packed_ref: jax.Array | None = None,
+    zero_z_ref: jax.Array | None = None,
+    zero_tail_sem: jax.Array | None = None,
     *,
     cfg: config.GDNConfig,
     pcp_size: int,
@@ -265,6 +420,8 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
     projection_cfg: _ProjectionConfig,
     mesh_axis_names: tuple[str, ...],
     pcp_axis_name: str,
+    entry_barrier: bool = False,
+    zero_tail: bool = False,
 ) -> None:
     """Schedule QKVZ projection, QKV remote DMA, and per-sequence GDN."""
     del packed_out_hbm_ref
@@ -280,6 +437,11 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
     )
     active_rows_store.start()
     active_rows_store.wait()
+    if zero_tail:
+        # Test-only mutant "tail_ones": the tail is filled with ones (bit identity must fail).
+        fill = 1.0 if os.environ.get("TPU_PCP_GDN_TEST_MUTANT", "") == "tail_ones" else 0.0
+        zero_packed_ref[...] = jnp.full(zero_packed_ref.shape, fill, zero_packed_ref.dtype)
+        zero_z_ref[...] = jnp.full(zero_z_ref.shape, fill, zero_z_ref.dtype)
 
     shard_key_dim = cfg.kq_dim_size
     shard_value_dim = cfg.v_dim_size
@@ -393,14 +555,17 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
         comm_chunk_size,
         cfg.tile_size,
     )
-    num_qkv_out_blocks = pcp_size
+    split_qkv = projection_cfg.split_qkv
+    num_qkv_out_blocks = 2 * pcp_size if split_qkv else pcp_size
     num_z_out_blocks = pcp_size
     num_projection_out_blocks = num_qkv_out_blocks + num_z_out_blocks
     full_key_dim = projection_cfg.full_key_dim
+    qk_tiles = 2 * shard_key_dim // _TPU_TILE_COLUMNS
+    v_tiles = shard_value_dim // _TPU_TILE_COLUMNS
 
     def _projection_job(out_block):
         is_qkv = out_block < num_qkv_out_blocks
-        destination = out_block
+        destination = out_block // 2 if split_qkv else out_block
         z_group = out_block - num_qkv_out_blocks
         return is_qkv, destination, z_group
 
@@ -528,6 +693,129 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
             sem=qkv_send_sems.at[slot],
         ).wait()
 
+    n_chunk = projection_cfg.n_chunk
+    n_sub = projection_cfg.n_sub
+
+    def _qkv_chunk_plan():
+        """Static (piece, offset-in-piece, out column) per QKV chunk."""
+        plan = []
+        for piece, width, col0 in (
+            ("q", shard_key_dim, 0),
+            ("k", shard_key_dim, shard_key_dim),
+            ("v", shard_value_dim, 2 * shard_key_dim),
+        ):
+            for off in range(0, width, n_chunk):
+                plan.append((piece, off, col0 + off))
+        return plan
+
+    def _z_chunk_plan():
+        return [("z", off, off) for off in range(0, shard_value_dim, n_chunk)]
+
+    def _chunk_sources(is_qkv, destination, z_group):
+        """Weight source row of every chunk (dynamic job type: select per chunk
+        index; QKV has more chunks than Z, the extra ones are unused for Z)."""
+        kq_destination = destination // projection_cfg.kq_replication_factor
+        base = {
+            "q": kq_destination * shard_key_dim,
+            "k": full_key_dim + kq_destination * shard_key_dim,
+            "v": 2 * full_key_dim + destination * shard_value_dim,
+        }
+        z_base = projection_cfg.qkv_dim + z_group * shard_value_dim
+        qplan, zplan = _qkv_chunk_plan(), _z_chunk_plan()
+        out = []
+        for c in range(max(len(qplan), len(zplan))):
+            q_src = base[qplan[c][0]] + qplan[c][1] if c < len(qplan) else 0
+            z_src = z_base + zplan[c][1] if c < len(zplan) else 0
+            out.append(lax.select(is_qkv, q_src, z_src))
+        return out
+
+    def _start_weight_chunk(source_row, slot: int) -> None:
+        if "proj_wdma" in _gdn_ablations():
+            return
+        pltpu.make_async_copy(
+            src_ref=projection_weight_ref.at[pl.ds(source_row, n_chunk), :],
+            dst_ref=projection_weight_vmem_ref.at[slot],
+            sem=projection_weight_sem,
+        ).start()
+        if is_fp8_projection:
+            assert projection_weight_scale_ref is not None
+            assert projection_weight_scale_vmem_ref is not None
+            if projection_weight_scale_ref.ndim == 2:
+                src = projection_weight_scale_ref.at[:, pl.ds(source_row, n_chunk)]
+            else:
+                src = projection_weight_scale_ref.at[pl.ds(source_row, n_chunk)]
+            pltpu.make_async_copy(
+                src_ref=src,
+                dst_ref=projection_weight_scale_vmem_ref.at[slot],
+                sem=projection_scale_sem,
+            ).start()
+
+    def _wait_weight_chunk(slot: int) -> None:
+        if "proj_wdma" in _gdn_ablations():
+            return
+        with _scope("g_proj_w_wait"):
+            pltpu.make_async_copy(
+                src_ref=projection_weight_vmem_ref.at[slot],
+                dst_ref=projection_weight_vmem_ref.at[slot],
+                sem=projection_weight_sem,
+            ).wait()
+            if is_fp8_projection:
+                pltpu.make_async_copy(
+                    src_ref=projection_weight_scale_vmem_ref.at[slot],
+                    dst_ref=projection_weight_scale_vmem_ref.at[slot],
+                    sem=projection_scale_sem,
+                ).wait()
+
+    def _chunk_matmul(slot: int):
+        """(block, n_chunk) projection of the prepared X tile with weight slot."""
+        if "proj_mm" in _gdn_ablations():
+            return jnp.zeros((projection_token_block_size, n_chunk), hidden_ref.dtype)
+        w = projection_weight_vmem_ref.at[slot]
+        blocked = (
+            is_fp8_projection
+            and cast(jax.Array, projection_weight_scale_vmem_ref).ndim == 3
+        )
+        if blocked:
+            scale = projection_weight_scale_vmem_ref.at[slot]
+            num_blocks = scale.shape[0]
+            block_k = w.shape[1] // num_blocks
+            acc = jnp.zeros((projection_token_block_size, n_chunk), jnp.float32)
+            for block in range(num_blocks):
+                k_slice = pl.ds(block * block_k, block_k)
+                part = jax.lax.dot_general(
+                    projection_x_prepared_ref[:, k_slice],
+                    w[:, k_slice],
+                    dimension_numbers=(((1,), (1,)), ((), ())),
+                    preferred_element_type=jnp.float32,
+                )
+                acc += part * scale[pl.ds(block, 1), :]
+            acc *= projection_x_scale_ref[...][:, None]
+        else:
+            acc = jax.lax.dot_general(
+                projection_x_prepared_ref[...],
+                w[...],
+                dimension_numbers=(((1,), (1,)), ((), ())),
+                preferred_element_type=jnp.float32,
+            )
+            if is_fp8_projection:
+                acc *= projection_x_scale_ref[...][:, None]
+                acc *= projection_weight_scale_vmem_ref.at[slot][...][None, :]
+        return acc.astype(hidden_ref.dtype)
+
+    def _run_chunks(plan, sources, store) -> None:
+        """Chunk 0 is already streaming into slot 0 (started with the tile)."""
+        cols = [col for _, _, col in plan]
+        if os.environ.get("TPU_PCP_GDN_TEST_MUTANT", "") == "swap_chunks" and len(cols) > 1:
+            # Test-only mutant: chunks 0 and 1 land in each other's columns.
+            cols[0], cols[1] = cols[1], cols[0]
+        for c, col in enumerate(cols):
+            slot = c % 2
+            _wait_weight_chunk(slot)
+            if c + 1 < len(plan):
+                _start_weight_chunk(sources[c + 1], (c + 1) % 2)
+            with _scope("g_proj_mm"):
+                store(col, _chunk_matmul(slot))
+
     def _start_projection_tile(token_block, out_block) -> None:
         token_row = token_block * projection_token_block_size
         is_qkv, destination, z_group = _projection_job(out_block)
@@ -548,6 +836,8 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
             destination_row: int,
             width: int,
         ) -> None:
+            if "proj_wdma" in _gdn_ablations():
+                return
             pltpu.make_async_copy(
                 src_ref=projection_weight_ref.at[
                     pl.ds(source_row, width),
@@ -573,19 +863,45 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
                     sem=projection_scale_sem,
                 ).start()
 
-        @pl.when(is_qkv)
-        def _start_qkv() -> None:
-            kq_destination = destination // projection_cfg.kq_replication_factor
-            q_col = kq_destination * shard_key_dim
-            k_col = full_key_dim + kq_destination * shard_key_dim
-            v_col = 2 * full_key_dim + destination * shard_value_dim
-            _start_weight_piece(q_col, 0, shard_key_dim)
-            _start_weight_piece(k_col, shard_key_dim, shard_key_dim)
-            _start_weight_piece(
-                v_col,
-                2 * shard_key_dim,
-                shard_value_dim,
-            )
+        if projection_cfg.n_chunk > 0:
+            src0 = _chunk_sources(is_qkv, destination, z_group)[0]
+            _start_weight_chunk(src0, 0)
+            return
+
+        if not split_qkv:
+
+            @pl.when(is_qkv)
+            def _start_qkv() -> None:
+                kq_destination = destination // projection_cfg.kq_replication_factor
+                q_col = kq_destination * shard_key_dim
+                k_col = full_key_dim + kq_destination * shard_key_dim
+                v_col = 2 * full_key_dim + destination * shard_value_dim
+                _start_weight_piece(q_col, 0, shard_key_dim)
+                _start_weight_piece(k_col, shard_key_dim, shard_key_dim)
+                _start_weight_piece(
+                    v_col,
+                    2 * shard_key_dim,
+                    shard_value_dim,
+                )
+
+        else:
+            part = lax.rem(out_block, 2)
+
+            @pl.when(jnp.logical_and(is_qkv, part == 0))
+            def _start_qk() -> None:
+                kq_destination = destination // projection_cfg.kq_replication_factor
+                _start_weight_piece(kq_destination * shard_key_dim, 0, shard_key_dim)
+                _start_weight_piece(
+                    full_key_dim + kq_destination * shard_key_dim,
+                    shard_key_dim,
+                    shard_key_dim,
+                )
+
+            @pl.when(jnp.logical_and(is_qkv, part == 1))
+            def _start_v() -> None:
+                _start_weight_piece(
+                    2 * full_key_dim + destination * shard_value_dim, 0, shard_value_dim
+                )
 
         @pl.when(jnp.logical_not(is_qkv))
         def _start_z_group() -> None:
@@ -596,13 +912,30 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
         pending = projection_pending_out_ref[0]
         is_qkv, _, _ = _projection_job(pending)
 
-        @pl.when(jnp.logical_and(pending >= 0, is_qkv))
-        def _wait_qkv() -> None:
-            pltpu.make_async_copy(
-                src_ref=projection_out_ref,
-                dst_ref=projection_out_ref,
-                sem=projection_out_sem,
-            ).wait()
+        if not split_qkv:
+
+            @pl.when(jnp.logical_and(pending >= 0, is_qkv))
+            def _wait_qkv() -> None:
+                pltpu.make_async_copy(
+                    src_ref=projection_out_ref,
+                    dst_ref=projection_out_ref,
+                    sem=projection_out_sem,
+                ).wait()
+
+        else:
+            pending_part = lax.rem(pending, 2)
+            for part_id, tiles in ((0, qk_tiles), (1, v_tiles)):
+
+                @pl.when(
+                    jnp.logical_and(
+                        jnp.logical_and(pending >= 0, is_qkv), pending_part == part_id
+                    )
+                )
+                def _wait_qkv_part(tiles=tiles) -> None:
+                    ref = projection_out_ref.at[:, pl.ds(0, tiles), :, :]
+                    pltpu.make_async_copy(
+                        src_ref=ref, dst_ref=ref, sem=projection_out_sem
+                    ).wait()
 
         @pl.when(jnp.logical_and(pending >= 0, jnp.logical_not(is_qkv)))
         def _wait_z() -> None:
@@ -622,10 +955,12 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
         wait_final,
     ) -> None:
         @pl.when(wait_previous)
+        @_scoped("g_proj_out_wait")
         def _wait_previous_projection_output() -> None:
             _wait_projection_output()
 
         @pl.when(out_block == 0)
+        @_scoped("g_proj_xprep")
         def _prepare_projection_x() -> None:
             pltpu.make_async_copy(
                 src_ref=projection_x_ref,
@@ -658,26 +993,34 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
                 pl.ds(0, width),
                 :,
             ]
-            pltpu.make_async_copy(
-                src_ref=weight_ref,
-                dst_ref=weight_ref,
-                sem=projection_weight_sem,
-            ).wait()
+            no_wdma = "proj_wdma" in _gdn_ablations()
+            if not no_wdma:
+                with _scope("g_proj_w_wait"):
+                    pltpu.make_async_copy(
+                        src_ref=weight_ref,
+                        dst_ref=weight_ref,
+                        sem=projection_weight_sem,
+                    ).wait()
             blocked = (
                 is_fp8_projection
                 and cast(jax.Array, projection_weight_scale_vmem_ref).ndim == 2
             )
-            if is_fp8_projection:
+            if is_fp8_projection and not no_wdma:
                 assert projection_weight_scale_vmem_ref is not None
                 scale_slice = (pl.ds(0, width),)
                 if blocked:
                     scale_slice = (slice(None),) + scale_slice
                 scale_ref = projection_weight_scale_vmem_ref.at[scale_slice]
-                pltpu.make_async_copy(
-                    src_ref=scale_ref,
-                    dst_ref=scale_ref,
-                    sem=projection_scale_sem,
-                ).wait()
+                with _scope("g_proj_w_wait"):
+                    pltpu.make_async_copy(
+                        src_ref=scale_ref,
+                        dst_ref=scale_ref,
+                        sem=projection_scale_sem,
+                    ).wait()
+            if "proj_mm" in _gdn_ablations():
+                return jnp.zeros(
+                    (projection_token_block_size, width), hidden_ref.dtype
+                )
             if blocked:
                 assert projection_weight_scale_vmem_ref is not None
                 assert projection_x_scale_ref is not None
@@ -713,32 +1056,174 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
                     acc *= projection_weight_scale_vmem_ref[pl.ds(0, width)][None, :]
             return acc.astype(hidden_ref.dtype)
 
-        @pl.when(is_qkv)
-        def _finish_qkv() -> None:
-            projection_out_ref[...] = pltpu.einshape(
-                "(ab)(cd)->acbd",
-                _finish_matmul(qkv_width),
-                b=_TPU_TILE_ROWS,
-                d=_TPU_TILE_COLUMNS,
-                assert_is_tile_preserving=True,
-            )
+        def _finish_matmul_cols(width: int, store) -> None:
+            """Wait for the resident weight slab once, then run one dot per n_sub columns
+            (TPU_PCP_GDN_PROJ_NSUB) so the f32 temporary stays [rows, n_sub] while the
+            token block (rows per weight load) grows. Same per-element math as one dot."""
+            weight_ref = projection_weight_vmem_ref.at[pl.ds(0, width), :]
+            if "proj_wdma" not in _gdn_ablations():
+                with _scope("g_proj_w_wait"):
+                    pltpu.make_async_copy(
+                        src_ref=weight_ref, dst_ref=weight_ref, sem=projection_weight_sem
+                    ).wait()
+                    if is_fp8_projection:
+                        scale_ref = projection_weight_scale_vmem_ref.at[pl.ds(0, width)]
+                        pltpu.make_async_copy(
+                            src_ref=scale_ref, dst_ref=scale_ref, sem=projection_scale_sem
+                        ).wait()
+            cols = list(range(0, width, n_sub))
+            if os.environ.get("TPU_PCP_GDN_TEST_MUTANT", "") == "swap_nsub" and len(cols) > 1:
+                # Test-only mutant: the first two sub-dots land in each other's columns.
+                cols[0], cols[1] = cols[1], cols[0]
+            for i, n0 in enumerate(range(0, width, n_sub)):
+                if "proj_mm" in _gdn_ablations():
+                    res = jnp.zeros((projection_token_block_size, n_sub), hidden_ref.dtype)
+                else:
+                    acc = jax.lax.dot_general(
+                        projection_x_prepared_ref[...],
+                        projection_weight_vmem_ref[pl.ds(n0, n_sub), :],
+                        dimension_numbers=(((1,), (1,)), ((), ())),
+                        preferred_element_type=jnp.float32,
+                    )
+                    if is_fp8_projection:
+                        acc *= projection_x_scale_ref[...][:, None]
+                        acc *= projection_weight_scale_vmem_ref[pl.ds(n0, n_sub)][None, :]
+                    res = acc.astype(hidden_ref.dtype)
+                store(cols[i], res)
 
-        @pl.when(jnp.logical_not(is_qkv))
-        def _finish_z() -> None:
-            lanes = shard_value_dim // _TPU_TILE_COLUMNS
-            values = _finish_matmul(shard_value_dim).reshape(
-                projection_token_block_size,
-                lanes,
-                _TPU_TILE_COLUMNS,
-            )
-            projection_z_out_ref[...] = jnp.pad(
-                values,
-                (
-                    (0, 0),
-                    (0, projection_z_out_ref.shape[-2] - lanes),
-                    (0, 0),
-                ),
-            )
+        if n_sub > 0 and n_chunk == 0:
+
+            def _store_qkv_cols(col, res):
+                projection_out_ref[
+                    :, pl.ds(col // _TPU_TILE_COLUMNS, n_sub // _TPU_TILE_COLUMNS), :, :
+                ] = pltpu.einshape(
+                    "(ab)(cd)->acbd",
+                    res,
+                    b=_TPU_TILE_ROWS,
+                    d=_TPU_TILE_COLUMNS,
+                    assert_is_tile_preserving=True,
+                )
+
+            if not split_qkv:
+
+                @pl.when(is_qkv)
+                @_scoped("g_proj_mm")
+                def _finish_qkv_nsub() -> None:
+                    _finish_matmul_cols(qkv_width, _store_qkv_cols)
+
+            else:
+                part = lax.rem(out_block, 2)
+
+                @pl.when(jnp.logical_and(is_qkv, part == 0))
+                @_scoped("g_proj_mm")
+                def _finish_qk_nsub() -> None:
+                    _finish_matmul_cols(2 * shard_key_dim, _store_qkv_cols)
+
+                @pl.when(jnp.logical_and(is_qkv, part == 1))
+                @_scoped("g_proj_mm")
+                def _finish_v_nsub() -> None:
+                    _finish_matmul_cols(shard_value_dim, _store_qkv_cols)
+
+            @pl.when(jnp.logical_not(is_qkv))
+            @_scoped("g_proj_mm")
+            def _finish_z_nsub() -> None:
+                lanes = shard_value_dim // _TPU_TILE_COLUMNS
+                if projection_z_out_ref.shape[-2] > lanes:
+                    projection_z_out_ref[:, pl.ds(lanes, projection_z_out_ref.shape[-2] - lanes), :] = (
+                        jnp.zeros(
+                            (
+                                projection_token_block_size,
+                                projection_z_out_ref.shape[-2] - lanes,
+                                _TPU_TILE_COLUMNS,
+                            ),
+                            projection_z_out_ref.dtype,
+                        )
+                    )
+
+                def store(col, res):
+                    projection_z_out_ref[
+                        :, pl.ds(col // _TPU_TILE_COLUMNS, n_sub // _TPU_TILE_COLUMNS), :
+                    ] = res.reshape(
+                        projection_token_block_size,
+                        n_sub // _TPU_TILE_COLUMNS,
+                        _TPU_TILE_COLUMNS,
+                    )
+
+                _finish_matmul_cols(shard_value_dim, store)
+
+        if n_chunk > 0:
+            sources = _chunk_sources(is_qkv, destination, z_group)
+
+            @pl.when(is_qkv)
+            def _finish_qkv_chunks() -> None:
+                def store(col, res):
+                    projection_out_ref[
+                        :, pl.ds(col // _TPU_TILE_COLUMNS, n_chunk // _TPU_TILE_COLUMNS), :, :
+                    ] = pltpu.einshape(
+                        "(ab)(cd)->acbd",
+                        res,
+                        b=_TPU_TILE_ROWS,
+                        d=_TPU_TILE_COLUMNS,
+                        assert_is_tile_preserving=True,
+                    )
+
+                _run_chunks(_qkv_chunk_plan(), sources, store)
+
+            @pl.when(jnp.logical_not(is_qkv))
+            def _finish_z_chunks() -> None:
+                lanes = shard_value_dim // _TPU_TILE_COLUMNS
+                if projection_z_out_ref.shape[-2] > lanes:
+                    projection_z_out_ref[:, pl.ds(lanes, projection_z_out_ref.shape[-2] - lanes), :] = (
+                        jnp.zeros(
+                            (
+                                projection_token_block_size,
+                                projection_z_out_ref.shape[-2] - lanes,
+                                _TPU_TILE_COLUMNS,
+                            ),
+                            projection_z_out_ref.dtype,
+                        )
+                    )
+
+                def store(col, res):
+                    projection_z_out_ref[
+                        :, pl.ds(col // _TPU_TILE_COLUMNS, n_chunk // _TPU_TILE_COLUMNS), :
+                    ] = res.reshape(
+                        projection_token_block_size,
+                        n_chunk // _TPU_TILE_COLUMNS,
+                        _TPU_TILE_COLUMNS,
+                    )
+
+                _run_chunks(_z_chunk_plan(), sources, store)
+
+        if n_chunk == 0 and n_sub == 0:
+            @pl.when(is_qkv)
+            @_scoped("g_proj_mm")
+            def _finish_qkv() -> None:
+                projection_out_ref[...] = pltpu.einshape(
+                    "(ab)(cd)->acbd",
+                    _finish_matmul(qkv_width),
+                    b=_TPU_TILE_ROWS,
+                    d=_TPU_TILE_COLUMNS,
+                    assert_is_tile_preserving=True,
+                )
+
+            @pl.when(jnp.logical_not(is_qkv))
+            @_scoped("g_proj_mm")
+            def _finish_z() -> None:
+                lanes = shard_value_dim // _TPU_TILE_COLUMNS
+                values = _finish_matmul(shard_value_dim).reshape(
+                    projection_token_block_size,
+                    lanes,
+                    _TPU_TILE_COLUMNS,
+                )
+                projection_z_out_ref[...] = jnp.pad(
+                    values,
+                    (
+                        (0, 0),
+                        (0, projection_z_out_ref.shape[-2] - lanes),
+                        (0, 0),
+                    ),
+                )
 
         token_row = token_block * projection_token_block_size
 
@@ -746,17 +1231,35 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
         def _write_qkv_projection() -> None:
             group_start = token_row // _TPU_TILE_ROWS
             num_groups = projection_token_block_size // _TPU_TILE_ROWS
-            pltpu.make_async_copy(
-                src_ref=projection_out_ref,
-                dst_ref=projected_qkv_ref.at[
-                    destination,
-                    pl.ds(group_start, num_groups),
-                    :,
-                    :,
-                    :,
-                ],
-                sem=projection_out_sem,
-            ).start()
+            if not split_qkv:
+                pltpu.make_async_copy(
+                    src_ref=projection_out_ref,
+                    dst_ref=projected_qkv_ref.at[
+                        destination,
+                        pl.ds(group_start, num_groups),
+                        :,
+                        :,
+                        :,
+                    ],
+                    sem=projection_out_sem,
+                ).start()
+                return
+            part = lax.rem(out_block, 2)
+            for part_id, col0, tiles in ((0, 0, qk_tiles), (1, qk_tiles, v_tiles)):
+
+                @pl.when(part == part_id)
+                def _write_part(col0=col0, tiles=tiles) -> None:
+                    pltpu.make_async_copy(
+                        src_ref=projection_out_ref.at[:, pl.ds(0, tiles), :, :],
+                        dst_ref=projected_qkv_ref.at[
+                            destination,
+                            pl.ds(group_start, num_groups),
+                            pl.ds(col0, tiles),
+                            :,
+                            :,
+                        ],
+                        sem=projection_out_sem,
+                    ).start()
 
         @pl.when(out_block >= num_qkv_out_blocks)
         def _write_z_projection() -> None:
@@ -815,6 +1318,19 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
         cfg=cfg,
         conv_state_output_ref=conv_state_updates_ref,
         recurrent_state_output_ref=recurrent_state_updates_ref,
+        **(
+            {}
+            if stage_metadata_ref.tile_ba_row is None
+            else dict(
+                ba_metadata_ref=dataclasses.replace(
+                    metadata_ref,
+                    p_id_to_r_base=memory_ref.SmemWrapper(
+                        stage_metadata_ref.tile_ba_row,
+                        metadata_ref.p_id_to_r_base.shape,
+                    ),
+                )
+            )
+        ),
     )
 
     num_tiles = metadata_ref.num_tiles[...]
@@ -936,6 +1452,7 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
         )
 
         @pl.when(projection_is_active)
+        @_scoped("g_proj_issue")
         def _prefetch_projection_tile() -> None:
             _start_projection_tile(
                 projection_token_block,
@@ -943,6 +1460,7 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
             )
 
         @pl.when(jnp.logical_and(is_stage_first_tile, stage >= 2))
+        @_scoped("g_out_reuse_wait")
         def _reuse_output_stage_slot() -> None:
             # A slot is reused only after every send sourced from it and every
             # receive targeting its paired semaphore have completed.
@@ -975,6 +1493,7 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
         )
 
         @pl.when(projection_is_active)
+        @_scoped("g_proj")
         def _compute_projection_tile() -> None:
             _finish_projection_tile(
                 projection_token_block,
@@ -992,22 +1511,24 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
             )
 
         output_slot = lax.rem(stage, 2)
-        output_stage_ref[
-            output_slot,
-            pl.ds(stage_metadata_ref.tile_row_in_stage[p_id], cfg.tile_size),
-            :,
-            :,
-        ] = out_slot_ref[0].reshape(
-            cfg.tile_size,
-            cfg.num_v_heads,
-            cfg.v_head_dim,
-        )
+        with _scope("g_out_stage_copy"):
+            output_stage_ref[
+                output_slot,
+                pl.ds(stage_metadata_ref.tile_row_in_stage[p_id], cfg.tile_size),
+                :,
+                :,
+            ] = out_slot_ref[0].reshape(
+                cfg.tile_size,
+                cfg.num_v_heads,
+                cfg.v_head_dim,
+            )
 
         is_stage_last_tile = (
             p_id == stage_first_tile + stage_metadata_ref.num_tiles[stage] - 1
         )
 
         @pl.when(is_stage_last_tile)
+        @_scoped("g_out_send")
         def _finish_output_stage() -> None:
             _start_output_stage(
                 stage,
@@ -1033,6 +1554,31 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
         ),
     )
 
+    def _zero_tail_rows(dst_ref, zero_ref) -> None:
+        """Zero dst rows [rank live row end, rows): all DMAs started, then all waited."""
+        rows = dst_ref.shape[0]
+        chunk = zero_ref.shape[0]
+        start = jnp.minimum(active_rows_smem_ref[0], rows)
+        n_chunks = pl.cdiv(rows - start, chunk)
+
+        def _copy(i):
+            row = start + i * chunk
+            n = jnp.minimum(chunk, rows - row)
+            return pltpu.make_async_copy(
+                src_ref=zero_ref.at[pl.ds(0, n)],
+                dst_ref=dst_ref.at[pl.ds(row, n)],
+                sem=zero_tail_sem,
+            )
+
+        def _start(i, _):
+            _copy(i).start()
+
+        def _wait(i, _):
+            _copy(i).wait()
+
+        lax.fori_loop(0, n_chunks, _start, None)
+        lax.fori_loop(0, n_chunks, _wait, None)
+
     def _stage_prologue() -> None:
         p_id = pl.program_id(0)
         stage = stage_metadata_ref.tile_stage[p_id]
@@ -1040,7 +1586,8 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
 
         @pl.when(is_stage_start)
         def _start_stage() -> None:
-            _wait_qkv_recv(stage)
+            with _scope("g_qkv_recv_wait"):
+                _wait_qkv_recv(stage)
             next_stage = stage + 1
 
             @pl.when(next_stage < active_stages)
@@ -1049,21 +1596,25 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
                 # highly imbalanced ragged batch can expose too few tiles; in
                 # that case project only the live rank's exact missing prefix
                 # before its QKV communication reads the HBM blocks.
-                _run_projection_catchup(next_stage)
+                with _scope("g_catchup"):
+                    _run_projection_catchup(next_stage)
 
                 @pl.when(stage > 0)
                 def _reuse_slot() -> None:
-                    _wait_qkv_send(stage - 1, active_stages)
+                    with _scope("g_qkv_send_wait"):
+                        _wait_qkv_send(stage - 1, active_stages)
                     barrier_slot = lax.rem(stage, 2)
-                    _all_rank_barrier(
-                        barrier_sems.at[barrier_slot],
-                        rank,
-                        pcp_size,
-                        mesh_axis_names=mesh_axis_names,
-                        pcp_axis_name=pcp_axis_name,
-                    )
+                    with _scope("g_barrier"):
+                        _all_rank_barrier(
+                            barrier_sems.at[barrier_slot],
+                            rank,
+                            pcp_size,
+                            mesh_axis_names=mesh_axis_names,
+                            pcp_axis_name=pcp_axis_name,
+                        )
 
-                _start_qkv_stage(next_stage)
+                with _scope("g_qkv_start"):
+                    _start_qkv_stage(next_stage)
 
     @pl.with_scoped(
         allocations=(
@@ -1084,14 +1635,23 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
         barrier_sems,
         allocations,
     ) -> None:
+        if entry_barrier:
+            # Before any remote DMA: the peer must be inside this kernel.
+            _entry_barrier(
+                pcp_size,
+                mesh_axis_names=mesh_axis_names,
+                pcp_axis_name=pcp_axis_name,
+            )
         # Only QKV from the first live projection block is unconditional
         # critical-path work. Subsequent QKVZ blocks are overlapped below and
         # dynamically caught up only when a ragged stage reaches them early.
         @pl.when(active_projection_token_blocks > 0)
+        @_scoped("g_prologue_proj")
         def _project_first_live_token_block() -> None:
             _project_first_token_block()
 
         @pl.when(active_stages > 0)
+        @_scoped("g_first_qkv")
         def _start_first_qkv_stage() -> None:
             _run_projection_catchup(0)
             _start_qkv_stage(0)
@@ -1143,16 +1703,19 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
                 wait_final=index == remaining_projection_tiles - 1,
             )
 
-        lax.fori_loop(
-            0,
-            remaining_projection_tiles,
-            _finish_projection_tail,
-            None,
-            unroll=False,
-        )
+        with _scope("g_proj_tail"):
+            lax.fori_loop(
+                0,
+                remaining_projection_tiles,
+                _finish_projection_tail,
+                None,
+                unroll=False,
+            )
 
         # All earlier send semaphores were drained before their slot was
         # reused. Only the final two stages can still be outstanding.
+        _final_waits_scope = _scope("g_final_wait")
+        _final_waits_scope.__enter__()
         _wait_qkv_send(active_stages - 2, active_stages)
         _wait_qkv_send(active_stages - 1, active_stages)
         _wait_output_stage(
@@ -1172,9 +1735,16 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
             output_recv_sems,
         )
 
+        _final_waits_scope.__exit__(None, None, None)
+        if zero_tail:
+            with _scope("g_zero_tail"):
+                _zero_tail_rows(packed_out_hbm_ref, zero_packed_ref)
+                _zero_tail_rows(z_ref, zero_z_ref)
         # A two-phase final barrier prevents a fast rank from entering the next
         # invocation and reusing this remote-copy schedule while a peer is still
         # leaving the current one.
+        _final_barrier_scope = _scope("g_final_barrier")
+        _final_barrier_scope.__enter__()
         _all_rank_barrier(
             barrier_sems.at[0],
             rank,
@@ -1189,6 +1759,7 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
             mesh_axis_names=mesh_axis_names,
             pcp_axis_name=pcp_axis_name,
         )
+        _final_barrier_scope.__exit__(None, None, None)
 
     _run(
         gdn_out_ref,
@@ -1405,7 +1976,9 @@ def fused_qkvz_projection_pcp_gdn(
     expected_local_qkv_dim = 2 * full_key_dim + full_value_dim
     # Project one communication chunk at a time to bound the live input and
     # output tiles when the PCP-local head shard grows (e.g. PP4 x PCP8).
-    projection_token_block_size = comm_chunk_size
+    projection_token_block_size = pcp_gdn_projection_block_tokens(
+        local_num_tokens, comm_chunk_size
+    )
     projection_out_block_size = local_dim
     expected_qkvz_dim = expected_local_qkv_dim + full_value_dim
     if hidden_states.ndim != 2 or qkvz_weight.ndim != 2:
@@ -1469,12 +2042,41 @@ def fused_qkvz_projection_pcp_gdn(
             f"{shard_key_dim=} {shard_value_dim=} "
             f"{projection_out_block_size=}."
         )
+    n_chunk = pcp_gdn_projection_n_chunk()
+    if n_chunk > 0 and (
+        n_chunk % _TPU_TILE_COLUMNS
+        or shard_key_dim % n_chunk
+        or shard_value_dim % n_chunk
+    ):
+        raise ValueError(
+            "TPU_PCP_GDN_PROJ_NCHUNK must be a multiple of 128 dividing the "
+            f"PCP-local key and value widths: {n_chunk=} {shard_key_dim=} "
+            f"{shard_value_dim=}."
+        )
+    n_sub = pcp_gdn_projection_n_sub() if n_chunk == 0 else 0
+    split_qkv = pcp_gdn_projection_split_qkv() and n_chunk == 0
+    if split_qkv and n_sub == 0:
+        raise ValueError("TPU_PCP_GDN_PROJ_SPLIT_QKV needs TPU_PCP_GDN_PROJ_NSUB > 0.")
+    if n_sub > 0 and (
+        n_sub % _TPU_TILE_COLUMNS or shard_key_dim % n_sub or shard_value_dim % n_sub
+        or is_fp8_projection and qkvz_weight_scale.ndim == 2
+    ):
+        raise ValueError(
+            "TPU_PCP_GDN_PROJ_NSUB must be a multiple of 128 dividing the PCP-local key and "
+            f"value widths, with a per-channel or tensor scale: {n_sub=} {shard_key_dim=} "
+            f"{shard_value_dim=}."
+        )
+    if projection_token_block_size % _TPU_TILE_ROWS:
+        raise ValueError(f"{projection_token_block_size=} must be a multiple of 8.")
     projection_cfg = _ProjectionConfig(
         token_block_size=projection_token_block_size,
         out_block_size=projection_out_block_size,
         qkv_dim=expected_local_qkv_dim,
         full_key_dim=full_key_dim,
         kq_replication_factor=geometry.kq_replication_factor,
+        n_chunk=n_chunk,
+        n_sub=n_sub,
+        split_qkv=split_qkv,
     )
 
     if b.shape[1] != local_n_v:
@@ -1493,7 +2095,7 @@ def fused_qkvz_projection_pcp_gdn(
             "The global PCP communication stage must be divisible by the GDN "
             f"compute tile: {global_stage_tokens=} {tile_size=}."
         )
-    num_qkv_out_blocks = pcp_size
+    num_qkv_out_blocks = 2 * pcp_size if projection_cfg.split_qkv else pcp_size
     num_z_out_blocks = pcp_size
     num_projection_out_blocks = num_qkv_out_blocks + num_z_out_blocks
 
@@ -1553,6 +2155,18 @@ def fused_qkvz_projection_pcp_gdn(
         num_qkv_out_blocks=num_qkv_out_blocks,
         num_projection_out_blocks=num_projection_out_blocks,
     )
+    if pcp_gdn_ba_direct():
+        stage_metadata_obj = pcp_metadata.with_packed_ba_rows(
+            stage_metadata_obj,
+            metadata_obj.num_tiles,
+            local_rows=local_num_tokens,
+            comm_chunk_size=comm_chunk_size,
+        )
+        if os.environ.get("TPU_PCP_GDN_TEST_MUTANT", "") == "ba_shift":
+            # Test-only mutant: every tile reads its b/a one packed row late (must break identity).
+            stage_metadata_obj = dataclasses.replace(
+                stage_metadata_obj, tile_ba_row=stage_metadata_obj.tile_ba_row + 1
+            )
     metadata_spec = jax.tree.map(
         lambda _: pl.BlockSpec(memory_space=pltpu.SMEM),
         metadata_obj,
@@ -1589,6 +2203,16 @@ def fused_qkvz_projection_pcp_gdn(
         d_v,
     )
     zero_packed_out = jnp.zeros(packed_out_shape, act_out_dtype)
+    no_zero_init = pcp_gdn_no_zero_init()
+    if no_zero_init:
+        out_gdn_shape = jax.ShapeDtypeStruct(gdn_out_shape.shape, gdn_out_shape.dtype)
+        out_packed_shape = jax.ShapeDtypeStruct(packed_out_shape, act_out_dtype)
+        # Unused, unaliased carriers keep the kernel's operand list unchanged.
+        zero_gdn_in = jnp.zeros((_TPU_TILE_ROWS, _TPU_TILE_COLUMNS), gdn_out_shape.dtype)
+        zero_packed_in = jnp.zeros((_TPU_TILE_ROWS, _TPU_TILE_COLUMNS), act_out_dtype)
+    else:
+        out_gdn_shape, out_packed_shape = zero_gdn_out, zero_packed_out
+        zero_gdn_in, zero_packed_in = zero_gdn_out, zero_packed_out
     projected_qkv_shape = jax.ShapeDtypeStruct(
         (
             pcp_size,
@@ -1626,6 +2250,12 @@ def fused_qkvz_projection_pcp_gdn(
         state_plan.recurrent,
         whole_block_dma=state_plan.whole_block_dma,
     )
+    # Rows of the resident weight slab and lane tiles of the QKV staging tile.
+    proj_slab_rows = (
+        max(2 * shard_key_dim, shard_value_dim)
+        if projection_cfg.split_qkv
+        else projection_cfg.out_block_size
+    )
     projection_scratch_shapes = (
         pltpu.SemaphoreType.DMA,
         pltpu.SemaphoreType.DMA,
@@ -1646,14 +2276,24 @@ def fused_qkvz_projection_pcp_gdn(
         if is_fp8_projection
         else None,
         pltpu.VMEM(
-            (projection_cfg.out_block_size, hidden_states.shape[1]),
+            (proj_slab_rows, hidden_states.shape[1])
+            if n_chunk == 0
+            else (2, n_chunk, hidden_states.shape[1]),
             qkvz_weight.dtype,
         ),
         pltpu.VMEM(
             (
-                (qkvz_weight_scale.shape[0], projection_cfg.out_block_size)
-                if qkvz_weight_scale.ndim == 2
-                else (projection_cfg.out_block_size,)
+                (
+                    (qkvz_weight_scale.shape[0], proj_slab_rows)
+                    if qkvz_weight_scale.ndim == 2
+                    else (proj_slab_rows,)
+                )
+                if n_chunk == 0
+                else (
+                    (2, qkvz_weight_scale.shape[0], n_chunk)
+                    if qkvz_weight_scale.ndim == 2
+                    else (2, n_chunk)
+                )
             ),
             qkvz_weight_scale.dtype,
         )
@@ -1662,7 +2302,7 @@ def fused_qkvz_projection_pcp_gdn(
         pltpu.VMEM(
             (
                 projection_cfg.token_block_size // _TPU_TILE_ROWS,
-                projection_cfg.out_block_size // _TPU_TILE_COLUMNS,
+                proj_slab_rows // _TPU_TILE_COLUMNS,
                 _TPU_TILE_ROWS,
                 _TPU_TILE_COLUMNS,
             ),
@@ -1694,19 +2334,33 @@ def fused_qkvz_projection_pcp_gdn(
             )
         )
     )
-    input_output_aliases = {
-        output_input_offset: 0,
-        output_input_offset + 1: 1,
-    }
+    input_output_aliases = (
+        {}
+        if no_zero_init
+        else {
+            output_input_offset: 0,
+            output_input_offset + 1: 1,
+        }
+    )
     carry_shapes = cfg.get_scratch_shape_dict()
     kernel_name = (
         "fused_pcp_qkvz_projection_gdn_per_seq_compact_qkv"
         f"_c{comm_chunk_size}_p{pcp_size}_pooled"
     )
+    if projection_token_block_size != comm_chunk_size or n_chunk or n_sub:
+        # Non-default projection schedule: visible in xprof op names (proof the knob took effect).
+        kernel_name += f"_pb{projection_token_block_size}_nc{n_chunk}"
+        if n_sub:
+            kernel_name += f"_ns{n_sub}"
+        if split_qkv:
+            kernel_name += "_sq"
+    if no_zero_init:
+        kernel_name += "_nz"
     # The compiler may retain more transient tiles as this limit rises. Use
     # the same 90% hardware budget as the production GMM kernels.
     vmem_limit_bytes = int(0.90 * pltpu.get_tpu_info().vmem_capacity_bytes)
 
+    entry_barrier = pcp_entry_barrier_enabled()
     (
         gdn_out,
         packed_out,
@@ -1724,10 +2378,12 @@ def fused_qkvz_projection_pcp_gdn(
             projection_cfg=projection_cfg,
             mesh_axis_names=mesh_axis_names,
             pcp_axis_name=pcp_axis_name,
+            entry_barrier=entry_barrier,
+            **({"zero_tail": True} if no_zero_init else {}),
         ),
         out_shape=(
-            zero_gdn_out,
-            zero_packed_out,
+            out_gdn_shape,
+            out_packed_shape,
             conv_state_updates_shape,
             recurrent_state_updates_shape,
             projected_qkv_shape,
@@ -1785,11 +2441,21 @@ def fused_qkvz_projection_pcp_gdn(
             *projection_scratch_shapes,
             pltpu.SMEM((1,), jnp.int32),
             pltpu.SemaphoreType.DMA,
+            *(
+                (
+                    pltpu.VMEM((_TPU_TILE_ROWS, *packed_out_shape[1:]), act_out_dtype),
+                    pltpu.VMEM((_TPU_TILE_ROWS, *z_shape.shape[1:]), act_out_dtype),
+                    pltpu.SemaphoreType.DMA,
+                )
+                if no_zero_init
+                else ()
+            ),
         ),
         input_output_aliases=input_output_aliases,
         compiler_params=pltpu.CompilerParams(
             disable_bounds_checks=True,
             vmem_limit_bytes=vmem_limit_bytes,
+            **({"collective_id": GDN_PCP_COLLECTIVE_ID} if entry_barrier else {}),
         ),
         name=kernel_name,
         metadata=cfg.get_metadata(),
@@ -1802,8 +2468,8 @@ def fused_qkvz_projection_pcp_gdn(
         b,
         a,
         state_source,
-        zero_gdn_out,
-        zero_packed_out,
+        zero_gdn_in,
+        zero_packed_in,
         weights,
     )
 
@@ -1836,6 +2502,7 @@ def fused_qkvz_projection_pcp_gdn(
     # short invocation does not acquire the static compile bucket's matmul
     # work. Its unwritten HBM suffix is unspecified; do not expose that suffix
     # to normalization or later compiled layers.
-    live_row = jnp.arange(local_num_tokens, dtype=jnp.int32) < active_rows[0]
-    z = jnp.where(live_row[:, None, None], z, jnp.zeros((), dtype=z.dtype))
+    if not no_zero_init:
+        live_row = jnp.arange(local_num_tokens, dtype=jnp.int32) < active_rows[0]
+        z = jnp.where(live_row[:, None, None], z, jnp.zeros((), dtype=z.dtype))
     return state_source, packed_out, z

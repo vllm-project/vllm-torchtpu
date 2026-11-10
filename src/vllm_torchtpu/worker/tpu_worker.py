@@ -139,6 +139,15 @@ class _LatePollModelRunnerOutput(AsyncModelRunnerOutput):
         return output
 
 
+
+def _pp_handoff_hbm_reserve(model_runner: Any) -> int:
+    """HBM the pipeline ring hand-off allocates after profile_run (0 for a
+    runner class without the method, e.g. a test fake; looked up on the class
+    so a mock's auto-created attribute does not count)."""
+    fn = getattr(type(model_runner), "pp_handoff_hbm_reserve_bytes", None)
+    return int(fn(model_runner)) if fn is not None else 0
+
+
 class TPUWorker(WorkerBase):
     def __init__(
         self,
@@ -601,17 +610,22 @@ class TPUWorker(WorkerBase):
         # accounting misses those bytes. Ask the active connector how much
         # to reserve and subtract from the KV-cache budget. Returns 0 if no
         # connector needs a reserve. The connector owns the size formula.
+        # The pipeline ring hand-off allocates its buffers after profile_run
+        # too (upstream PR 2527 commit 712a5873b), so subtract its bound.
         kv_connector_hbm_reserve = utils.estimate_kv_connector_hbm_reserve(
             self.vllm_config
         )
+        pp_handoff_hbm_reserve = _pp_handoff_hbm_reserve(self.model_runner)
         available = utils.min_across_ep_dp(
-            self.parallel_config, budget.available - kv_connector_hbm_reserve
+            self.parallel_config,
+            budget.available - kv_connector_hbm_reserve - pp_handoff_hbm_reserve,
         )
 
         total_hbm_limit_gb = round(budget.total_limit / utils.GBYTES, 2)
         total_hbm_limit_cap_gb = round(budget.cap / utils.GBYTES, 2)
         total_hbm_used_gb = round(budget.total_used / utils.GBYTES, 2)
         kv_connector_hbm_reserve_gb = round(kv_connector_hbm_reserve / utils.GBYTES, 2)
+        pp_handoff_hbm_reserve_gb = round(pp_handoff_hbm_reserve / utils.GBYTES, 2)
         total_hbm_avail_gb = round(available / utils.GBYTES, 2)
         logger.info(
             "Memory statistics | "
@@ -619,11 +633,13 @@ class TPUWorker(WorkerBase):
             "total_hbm_limit_cap_gb=%rGiB | "
             "total_hbm_used_gb=%rGiB | "
             "kv_connector_hbm_reserve_gb=%rGiB | "
+            "pp_handoff_hbm_reserve_gb=%rGiB | "
             "total_hbm_avail_gb=%rGiB",
             total_hbm_limit_gb,
             total_hbm_limit_cap_gb,
             total_hbm_used_gb,
             kv_connector_hbm_reserve_gb,
+            pp_handoff_hbm_reserve_gb,
             total_hbm_avail_gb,
         )
 

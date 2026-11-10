@@ -62,7 +62,9 @@ every bucket:
 """
 
 import contextlib
+import dataclasses
 import functools
+import itertools
 import gc
 import os
 from collections.abc import Callable
@@ -586,7 +588,9 @@ def _get_fp8_gate_and_se_op() -> Callable:
 # Fused GemmaRMSNorm ops, one per norm epsilon (baked into the traced op).
 _norm_quantize_rows_with_res_ops: dict[float, Callable] = {}
 _norm_quantize_rows_no_res_ops: dict[float, Callable] = {}
-_norm_fp8_gate_and_se_ops: dict[float, Callable] = {}
+_norm_fp8_gate_and_se_ops: dict[float | tuple, Callable] = {}
+# TPU_SE_PREQUANT_KERNEL >= 2: one must-fuse id per MoE block (process-wide counter).
+_se_fuse_ids = itertools.count(1)
 
 
 def _eps_op_tag(eps: float) -> str:
@@ -696,8 +700,37 @@ def _norm_fp8_gate_and_se_jax(
     s_down: jax.Array,
     *,
     eps: float,
+    prequant: int = 0,
+    fuse_id: int | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     res_out = (x + residual.astype(x.dtype)).astype(jnp.bfloat16)
+    if prequant:
+        # TPU_SE_PREQUANT_KERNEL (DN1): the same outputs bit for bit, with the
+        # x quant (1) or the whole pre-MoE chain (2) in one kernel; None when
+        # the rows or widths do not tile, and then today's path runs.
+        from vllm_torchtpu.kernels.experimental.se_prequant import serving as _se_pq
+
+        out = _se_pq.norm_fp8_gate_and_se(
+            res_out,
+            norm_w_plus_one,
+            w_gate_gu_fp8,
+            s_gate_gu,
+            w_se_gate_bf16,
+            w_down_fp8,
+            s_down,
+            eps=eps,
+            mode=prequant,
+            fuse_id=fuse_id,
+            vmem_mib=int(envs.TPU_SE_PREQUANT_VMEM_MIB),
+        )
+        if out is not None and prequant == 4:
+            logits, se_out, moe_q, moe_s = out
+            return logits, se_out, moe_q, moe_s, res_out
+        if prequant == 4:
+            raise ValueError("TPU_SE_PREQUANT_KERNEL=4 op called on rows the kernel cannot tile")
+        if out is not None:
+            logits, se_out, h_bf16 = out
+            return logits, se_out, h_bf16, res_out
     h_bf16 = _gemma_rms_norm_jax(res_out, norm_w_plus_one, eps)
     logits, se_out = _fp8_gate_and_se_jax(
         h_bf16, w_gate_gu_fp8, s_gate_gu, w_se_gate_bf16, w_down_fp8, s_down
@@ -705,16 +738,173 @@ def _norm_fp8_gate_and_se_jax(
     return logits, se_out, h_bf16, res_out
 
 
-def _get_norm_fp8_gate_and_se_op(eps: float) -> Callable:
+def _norm_fp8_gate_and_se_mo3b_jax(
+    x: jax.Array,
+    residual: jax.Array,
+    norm_w_plus_one: jax.Array,
+    w_gate_gu_fp8: jax.Array,
+    s_gate_gu: jax.Array,
+    w_se_gate_bf16: jax.Array,
+    w_down_fp8: jax.Array,
+    s_down: jax.Array,
+    *,
+    eps: float,
+    fuse_id: int | None = None,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    """TPU_SE_PREQUANT_KERNEL=4 (MO3b): (router logits, shared-expert output, MoE route q
+    [T, H/128, 128] fp8, its scale [T, 1] f32, residual out). Its own function because
+    `pallas.jax_op` takes the op's torch schema from the return annotation, which is a
+    4-tuple for the other modes (r1pdnse4: a 5-tuple through that schema segfaulted in
+    torch's output conversion)."""
+    return _norm_fp8_gate_and_se_jax(
+        x,
+        residual,
+        norm_w_plus_one,
+        w_gate_gu_fp8,
+        s_gate_gu,
+        w_se_gate_bf16,
+        w_down_fp8,
+        s_down,
+        eps=eps,
+        prequant=4,
+        fuse_id=fuse_id,
+    )
+
+
+def _push_must_fuse_inward(exported: Any) -> Any:
+    """TPU_SE_PREQUANT_MUSTFUSE: copy the MUST_FUSE frontend attribute of every
+    `xla_metadata_call` call site in a jax.export module onto the ops inside the
+    callee. torch_tpu's embedding of a jax_op module drops call-site attributes
+    (the pod HLO had no MUST_FUSE and ran a standalone convert, r1pdnse5), while
+    op attributes survive it (the pod HLO keeps `kernel_metadata`). AOT tpu7x:
+    with the call attribute stripped the kCustom fusion re-forms only with the
+    inner attributes, and the optimized HLO equals the call-attribute program."""
+    from jax._src.interpreters import mlir as jmlir
+    from jax._src.lib.mlir import ir
+    from jaxlib.mlir.dialects import stablehlo as shlo
+
+    with jmlir.make_ir_context() as ctx:
+        module = shlo.deserialize_portable_artifact(ctx, exported.mlir_module_serialized)
+        callee_attrs = {}
+        for func in module.body.operations:
+            for block in func.regions[0].blocks:
+                for op in block.operations:
+                    if (
+                        op.operation.name == "func.call"
+                        and "mhlo.frontend_attributes" in op.attributes
+                        and "MUST_FUSE" in str(op.attributes["mhlo.frontend_attributes"])
+                    ):
+                        callee = ir.FlatSymbolRefAttr(op.attributes["callee"]).value
+                        callee_attrs[callee] = op.attributes["mhlo.frontend_attributes"]
+        tagged = 0
+        for func in module.body.operations:
+            attr = callee_attrs.get(ir.StringAttr(func.attributes["sym_name"]).value)
+            if attr is None:
+                continue
+            for block in func.regions[0].blocks:
+                for op in block.operations:
+                    if op.operation.name != "func.return":
+                        op.attributes["mhlo.frontend_attributes"] = attr
+                        tagged += 1
+        if not tagged:
+            raise RuntimeError(
+                "TPU_SE_PREQUANT_MUSTFUSE: the exported module has no MUST_FUSE call site"
+            )
+        artifact = shlo.serialize_portable_artifact_str(
+            module.operation.get_asm(enable_debug_info=False), shlo.get_current_version()
+        )
+    logger.info(
+        "TPU_SE_PREQUANT_MUSTFUSE: MUST_FUSE on %d inner ops of %d call site(s)",
+        tagged,
+        len(callee_attrs),
+    )
+    return dataclasses.replace(exported, mlir_module_serialized=artifact)
+
+
+@contextlib.contextmanager
+def _must_fuse_inner_export():
+    """While a jax_op is built, its jax.export callable returns modules with
+    MUST_FUSE pushed inward (`_push_must_fuse_inward`); torch_tpu fingerprints
+    and registers that module."""
+    import jax.export as jax_export
+
+    orig = jax_export.export
+
+    def export(fn, *args, **kwargs):
+        exported_fn = orig(fn, *args, **kwargs)
+
+        @functools.wraps(exported_fn)
+        def call(*a, **k):
+            return _push_must_fuse_inward(exported_fn(*a, **k))
+
+        return call
+
+    jax_export.export = export
+    try:
+        yield
+    finally:
+        jax_export.export = orig
+
+
+def _get_norm_fp8_gate_and_se_op(
+    eps: float, fuse_id: int | None = None, prequant: int | None = None
+) -> Callable:
     """GemmaRMSNorm(x + residual) and `_fp8_gate_and_se_jax` of it as one op:
-    (router logits, shared-expert output, normed rows, residual out)."""
-    key = float(eps)
+    (router logits, shared-expert output, normed rows, residual out).
+
+    ``fuse_id`` (TPU_SE_PREQUANT_KERNEL >= 2): the MoE layer's own must-fuse id,
+    so XLA fuses its kernel call with the producer side of its input and the
+    kernel reads the residual sum in the producer's tiling (no relayout copy);
+    the ids must differ between layers of one program. ``prequant`` overrides
+    TPU_SE_PREQUANT_KERNEL (mode 4 keeps a mode-2 op per layer as its fallback)."""
+    if prequant is None:
+        prequant = int(envs.TPU_SE_PREQUANT_KERNEL)
+    if not prequant:
+        key = float(eps)
+    elif fuse_id is None or prequant < 2:
+        key = (float(eps), prequant)
+    else:
+        key = (float(eps), prequant, int(fuse_id))
     op = _norm_fp8_gate_and_se_ops.get(key)
     if op is None:
-        fn = functools.partial(_norm_fp8_gate_and_se_jax, eps=key)
-        op = pallas.jax_op(
-            f"pallas::qwen3_next_norm_fp8_gate_se_bf16_{_eps_op_tag(key)}", fn
-        )
+        if not prequant:
+            fn = functools.partial(_norm_fp8_gate_and_se_jax, eps=key)
+            name = f"pallas::qwen3_next_norm_fp8_gate_se_bf16_{_eps_op_tag(key)}"
+        else:
+            extra = {} if len(key) == 2 else {"fuse_id": key[2]}
+            if prequant == 4:
+                fn = functools.partial(
+                    _norm_fp8_gate_and_se_mo3b_jax, eps=float(eps), **extra
+                )
+            else:
+                fn = functools.partial(
+                    _norm_fp8_gate_and_se_jax,
+                    eps=float(eps),
+                    prequant=prequant,
+                    **extra,
+                )
+            name = (
+                "pallas::qwen3_next_norm_fp8_gate_se_bf16_"
+                f"{_eps_op_tag(float(eps))}_pq{prequant}"
+                + ("" if len(key) == 2 else f"_f{key[2]}")
+            )
+        if (
+            isinstance(key, tuple)
+            and len(key) == 3
+            and envs.TPU_SE_PREQUANT_MUSTFUSE
+        ):
+            with _must_fuse_inner_export():
+                op = pallas.jax_op(name + "_mfi", fn)
+        else:
+            op = pallas.jax_op(name, fn)
+        # The schema's outputs must be the function's (fail at load, not in a segfault).
+        overload = getattr(op, "_opoverload", None)
+        n_out = 5 if prequant == 4 else 4
+        if overload is not None and len(overload._schema.returns) != n_out:
+            raise RuntimeError(
+                f"{name}: schema has {len(overload._schema.returns)} outputs, the "
+                f"function returns {n_out}"
+            )
 
         def _fake(
             x: torch.Tensor,
@@ -731,6 +921,16 @@ def _get_norm_fp8_gate_and_se_op(eps: float) -> Callable:
             n_inter = int(w_down_fp8.shape[0])
             n_gate = int(w_gate_gu_fp8.shape[1]) - 2 * n_inter
             hidden_dim = int(w_down_fp8.shape[1])
+            if prequant == 4:
+                return (
+                    x.new_empty((n_tokens, n_gate), dtype=torch.bfloat16),
+                    x.new_empty((n_tokens, hidden_dim), dtype=torch.bfloat16),
+                    x.new_empty(
+                        (n_tokens, hidden_dim // 128, 128), dtype=torch.float8_e4m3fn
+                    ),
+                    x.new_empty((n_tokens, 1), dtype=torch.float32),
+                    x.new_empty((n_tokens, hidden_dim), dtype=torch.bfloat16),
+                )
             return (
                 x.new_empty((n_tokens, n_gate), dtype=torch.bfloat16),
                 x.new_empty((n_tokens, hidden_dim), dtype=torch.bfloat16),
@@ -743,11 +943,55 @@ def _get_norm_fp8_gate_and_se_op(eps: float) -> Callable:
     return op
 
 
+def _mo3b_prequant_target(mlp: Any, prequant: int, fuse_id: int | None) -> Any | None:
+    """MO3b (TPU_SE_PREQUANT_KERNEL=4): the routed-experts layer to stage the kernel's MoE
+    route quant for, or None (then the mode-2 op runs). Load-time state only -- it takes
+    no tensor, so a traced forward never branches on the token count (r1pdnse4b: a row-count
+    test here made the MTP draft's dynamic graph assume rows % 256 == 0); the kernel's
+    row tile is chosen inside the op, per concrete shape."""
+    if prequant != 4 or fuse_id is None:
+        return None
+    from vllm_torchtpu.layers.adapter.fused_moe_ep import (
+        fused_moe_ep_prequant_target,
+        fused_moe_ep_supported,
+    )
+
+    target = fused_moe_ep_prequant_target(mlp)
+    if target is None:
+        # Fail closed where MO3b should engage: a layer on the fused-EP kernel without the
+        # prequant variant would otherwise run mode 2 and make a "mode 4" arm a silent no-op.
+        experts = getattr(mlp, "experts", None)
+        owner = getattr(getattr(experts, "routed_experts", experts), "quant_method", None)
+        if owner is not None and envs.USE_MOE_FUSED_EP_KERNEL and fused_moe_ep_supported(owner):
+            raise RuntimeError(
+                "MO3b: TPU_SE_PREQUANT_KERNEL=4 on a fused-EP MoE layer without the prequant "
+                "variant (needs MOE_FUSED_EP_V2_PREQUANT=1; a refusal logs 'not in effect')"
+            )
+        logger.warning_once(
+            "MO3b: a MoE layer is not on the fused-EP kernel; it runs TPU_SE_PREQUANT_KERNEL=2."
+        )
+    return target
+
+
+def _se_norm_eps(model: Any) -> list[float]:
+    """Every GemmaRMSNorm epsilon in ``model`` (the post-attention norm's is among them)."""
+    return sorted(
+        {
+            float(getattr(m, "variance_epsilon", 1e-6))
+            for m in model.modules()
+            if isinstance(m, GemmaRMSNorm)
+        }
+    )
+
+
 def _prebuild_norm_ops(eps: float) -> None:
     """Build the fused norm ops for `eps` before any trace."""
     _get_norm_quantize_rows_with_res_op(eps)
     _get_norm_quantize_rows_no_res_op(eps)
     _get_norm_fp8_gate_and_se_op(eps)
+    if int(envs.TPU_SE_PREQUANT_KERNEL) == 4:
+        # mode 4's fallback for a layer without a must-fuse id
+        _get_norm_fp8_gate_and_se_op(eps, None, prequant=2)
 
 
 def _cpu_fp8_gate_and_se(
@@ -1172,7 +1416,18 @@ def setup_qwen3_next_v6_after_loading(model: Any) -> None:
             if w_plus_one.device.type == "tpu":
                 hoisted_norm_tensors.append(w_plus_one)
         if isinstance(module, qwen3_next.Qwen3NextSparseMoeBlock):
-            maybe_setup_fused_gate_se(module)
+            if (
+                maybe_setup_fused_gate_se(module)
+                and int(envs.TPU_SE_PREQUANT_KERNEL) >= 2
+                and getattr(module, "_tpu_se_fuse_id", None) is None
+            ):
+                module._tpu_se_fuse_id = next(_se_fuse_ids)
+                for se_eps in _se_norm_eps(model):
+                    _get_norm_fp8_gate_and_se_op(se_eps, module._tpu_se_fuse_id)
+                    if int(envs.TPU_SE_PREQUANT_KERNEL) == 4:  # its per-layer fallback
+                        _get_norm_fp8_gate_and_se_op(
+                            se_eps, module._tpu_se_fuse_id, prequant=2
+                        )
         elif isinstance(module, qwen3_next.Qwen3NextAttention):
             _get_sigmoid_gate_quant_op()
             o_proj = getattr(module, "o_proj", None)
@@ -1433,7 +1688,21 @@ def _fused_post_attn_norm_moe(
     orig_shape = hidden_states.shape
     hidden_dim = orig_shape[-1]
     eps = float(getattr(norm, "variance_epsilon", 1e-6))
-    logits, se_out, h_bf16, res_out = _get_norm_fp8_gate_and_se_op(eps)(
+    fuse_id = getattr(mlp, "_tpu_se_fuse_id", None)
+    prequant = int(envs.TPU_SE_PREQUANT_KERNEL)
+    if (
+        fuse_id is not None
+        and prequant >= 2
+        and (eps, prequant, int(fuse_id)) not in _norm_fp8_gate_and_se_ops
+    ):
+        # Not prebuilt for this epsilon: an op cannot be registered while tracing.
+        logger.warning_once(
+            "TPU_SE_PREQUANT_KERNEL: no per-layer op for eps %s; the kernel runs "
+            "without its must-fuse id (a relayout copy of its input).",
+            eps,
+        )
+        fuse_id = None
+    args = (
         hidden_states.reshape(-1, hidden_dim),
         residual.reshape(-1, hidden_dim),
         _norm_weight_plus_one(norm),
@@ -1443,14 +1712,36 @@ def _fused_post_attn_norm_moe(
         mlp._fused_se_down_fp8_weight,
         mlp._fused_se_down_fp8_scale,
     )
+    target = _mo3b_prequant_target(mlp, prequant, fuse_id)
+    if target is not None:
+        from vllm_torchtpu.layers.adapter.fused_moe_ep import (
+            stage_fused_moe_ep_prequant,
+        )
+
+        logits, se_out, moe_q, moe_s, res_out = _get_norm_fp8_gate_and_se_op(
+            eps, fuse_id, prequant=4
+        )(*args)
+        stage_fused_moe_ep_prequant(target, moe_q, moe_s)
+        moe_in = res_out  # shape stand-in only: the MoE program never reads it
+    else:
+        logits, se_out, moe_in, res_out = _get_norm_fp8_gate_and_se_op(
+            eps, fuse_id, prequant=2 if prequant == 4 else None
+        )(*args)
     # The MoE block's own forward, called directly: only it reads the fused
     # gate/shared-expert weights.
     hidden_states = patched_sparse_moe_forward(
         mlp,
-        h_bf16.view(orig_shape),
+        moe_in.view(orig_shape),
         already_sequence_parallel=bool(layer.use_attn_reduce_scatter_for_moe),
         prenorm_outputs=(logits, se_out),
     )
+    if target is not None:
+        from vllm_torchtpu.layers.adapter.fused_moe_ep import (
+            fused_moe_ep_prequant_pending,
+        )
+
+        if fused_moe_ep_prequant_pending(target):
+            raise RuntimeError("MO3b: staged MoE prequant was not consumed")
     return hidden_states, res_out.view(orig_shape)
 
 

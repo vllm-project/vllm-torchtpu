@@ -109,6 +109,9 @@ if TYPE_CHECKING:
     TPU_RPA_NATIVE_FP8: str = ""
     TPU_RPA_NATIVE_FP8_PREFILL: str = ""
     TPU_RPA_PREFILL_BLOCKS: str = ""
+    TPU_PCP_HISTORY_RPA: bool = False
+    TPU_PCP_CURRENT_RPA: bool = False
+    TPU_PCP_ENTRY_BARRIER: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
     USE_MOE_FUSED_EP_KERNEL: bool = False
@@ -118,6 +121,26 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
     MOE_FUSED_EP_SORTED_GATHER: bool = False
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
+    MOE_FUSED_EP_V2_TILE_M: int = 0
+    MOE_FUSED_EP_V2_FORCE_ONE_HOP: bool = False
+    MOE_FUSED_EP_V2_SCOPES: int = 0
+    MOE_FUSED_EP_V2_TEST_MUTANT: str = ""
+    MOE_FUSED_EP_V2_INTERPRET: bool = False
+    MOE_FUSED_EP_V2_GATHER_LOOKAHEAD: bool = False
+    MOE_FUSED_EP_V2_SORTED_PLAN: bool = False
+    MOE_FUSED_EP_V2_PLAN_KERNEL: bool = False
+    MOE_FUSED_EP_V2_QUANT_KERNEL: bool = False
+    MOE_FUSED_EP_V2_ROUTE_KERNEL: bool = False
+    MOE_FUSED_EP_V2_COMBINE_TOKENS: int = 0
+    MOE_FUSED_EP_V2_COMBINE_LEAD: int = 0
+    MOE_FUSED_EP_V2_COMBINE_PARITIES: int = 0
+    MOE_FUSED_EP_V2_FLAT_HANDOFF: int = 0
+    MOE_FUSED_EP_V2_AG_IN_PLAN: bool = False
+    MOE_FUSED_EP_V2_PAIR_SCALE: bool = False
+    MOE_FUSED_EP_V2_PLAN_CUMSUM_DOT: bool = False
+    MOE_FUSED_EP_V2_PREQUANT: bool = False
+    MOE_FUSED_EP_V2_STAGE_SCALES: bool = False
+    MOE_FUSED_EP_V2_SLAB_BASE_T: bool = False
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_TOKEN_BUCKET_HALF_STEPS: bool = False
@@ -129,6 +152,8 @@ if TYPE_CHECKING:
     TPU_PP_LAZY_PUSH: bool = False
     TPU_PP_EXTRA_STEPS_IN_FLIGHT: int = 0
     TPU_PREFILL_ONLY_STATIC_GUARDS: bool = False
+    TPU_PP_HANDOFF: str = "wave"
+    TPU_PP_RING_DEPTH: int = 2
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
@@ -138,9 +163,16 @@ if TYPE_CHECKING:
     TPU_SAMPLER_TOPK_MAX_K: int = 0
     TPU_FUSE_PRE_ATTN_NORM_QUANT: bool = True
     TPU_FUSE_POST_ATTN_NORM_MOE: bool = True
+    TPU_SE_PREQUANT_KERNEL: int = 0
+    TPU_SE_PREQUANT_VMEM_MIB: int = 0
+    TPU_SE_PREQUANT_MUSTFUSE: bool = False
     TPU_GDN_FUSED_NORM_QUANT_MIN_ROWS: int = 16
     TPU_FUSED_QK_NORM_ROPE: bool = True
     TPU_FUSED_QK_NORM_ROPE_MIN_ROWS: int = 0
+    TPU_QK_NORM_ROPE_INPLACE_TILE: int = 0
+    TPU_QK_NORM_ROPE_Q_PACKED: bool = False
+    TPU_QMM_ACT_F32_AMAX: bool = False
+    TPU_PCP_Q_PACK_OUTSIDE: bool = False
     TPU_RPA_DECODE_BATCHED: bool = False
     TPU_RPA_DECODE_LANES: int = 0
     TPU_RPA_DECODE_V2: bool = False
@@ -989,6 +1021,99 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE": lambda: int(
         os.getenv("MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE", "0") or 0
     ),
+    # The tile height (and so the ragged-stride unit) the serving adapter
+    # passes fused EP MoE v2 as its capacity. Zero keeps the adapter's 128.
+    # The tail-tile height rungs and push_from_vmem are built only while the
+    # shard slab bound fits ep * local experts * tile height, which a larger
+    # tile keeps true at larger steps (256 covers 8,704-token PCP steps).
+    # A power of two from 128 to 512; anything else refuses at op build.
+    "MOE_FUSED_EP_V2_TILE_M": lambda: int(
+        os.getenv("MOE_FUSED_EP_V2_TILE_M", "0") or 0
+    ),
+    # Bench-only: build fused EP MoE v2 with the height rungs and
+    # push_from_vmem whatever the slab bound says (both are exact for any
+    # tile count; the bound is a performance choice). Read at BUILD time.
+    "MOE_FUSED_EP_V2_FORCE_ONE_HOP": env_bool("MOE_FUSED_EP_V2_FORCE_ONE_HOP"),
+    # Named device scopes inside the fused EP MoE v2 kernel body (0 = off,
+    # 1 = phases). Visible on the XLA TraceMe line only with
+    # --xla_enable_custom_call_region_trace=true. Read at BUILD time; a
+    # scoped build is not a numerics reference.
+    "MOE_FUSED_EP_V2_SCOPES": lambda: int(
+        os.getenv("MOE_FUSED_EP_V2_SCOPES", "0") or 0
+    ),
+    # Test-only fused EP MoE v2 build mutants (default empty = none). Read at
+    # BUILD time. "mirror_stride": a tile above 128 rows addresses its scale
+    # mirror rows with stride 1 instead of tile_m / 128, so scales land on
+    # the wrong rows; numerics must fail. "la_scale" / "la_window" (with
+    # MOE_FUSED_EP_V2_GATHER_LOOKAHEAD): the next expert's first tile takes
+    # the current expert's activation-scale window / reads its token rows
+    # through the wrong index window. (Same bytes, so no semaphore hangs.)
+    "MOE_FUSED_EP_V2_TEST_MUTANT": env_str("MOE_FUSED_EP_V2_TEST_MUTANT", ""),
+    # Test-only: build the fused EP MoE v2 kernel in Pallas' TPU interpret mode
+    # (runs on the host). Read at BUILD time.
+    "MOE_FUSED_EP_V2_INTERPRET": env_bool("MOE_FUSED_EP_V2_INTERPRET"),
+    # Fused EP MoE v2: issue each expert's first-tile row gather at the head
+    # of the previous expert's last tile (under its matmuls) instead of after
+    # it. Read at BUILD time; default off.
+    "MOE_FUSED_EP_V2_GATHER_LOOKAHEAD": env_bool("MOE_FUSED_EP_V2_GATHER_LOOKAHEAD"),
+    # With MOE_FUSED_EP_V2_SHARDED_PLAN: build the shard's routing tables from
+    # two stable sorts of the expert ids instead of one-hot rank passes
+    # (host.build_routing_tables_sorted; same tables on every live pair).
+    "MOE_FUSED_EP_V2_SORTED_PLAN": env_bool("MOE_FUSED_EP_V2_SORTED_PLAN"),
+    # With MOE_FUSED_EP_V2_SHARDED_PLAN: build the routing plan's per-pair
+    # tables (pos, mirror_pos, slab_row) with the Pallas plan kernel
+    # (kernels/fused_moe/v2/plan_kernel.py), reading the gathered exchange in
+    # place, instead of the XLA one-hot passes. Same tables on every live
+    # pair. Read at TRACE time; default off; shapes it does not take fall back.
+    "MOE_FUSED_EP_V2_PLAN_KERNEL": env_bool("MOE_FUSED_EP_V2_PLAN_KERNEL"),
+    # Fused EP MoE v2: quantize the layer's activation rows with the Pallas
+    # row-quant kernel (kernels/fused_moe/v2/quant_kernel.py: one pass, fp8
+    # rows written in the all-gather's per-token tiles) instead of XLA's
+    # abs-max / quantize / re-tile chain. Same bits. Read at TRACE time.
+    "MOE_FUSED_EP_V2_QUANT_KERNEL": env_bool("MOE_FUSED_EP_V2_QUANT_KERNEL"),
+    # Fused EP MoE v2: the router epilogue (top-k, row routes and the routing
+    # exchange's per-expert count) as one Pallas pass over the softmax scores
+    # (kernels/fused_moe/v2/route_kernel.py) instead of the row-major selector,
+    # XLA's finite guard and the pair histogram. Same bits. Softmax scoring and
+    # the plan kernel path only. Read at TRACE time; default off.
+    "MOE_FUSED_EP_V2_ROUTE_KERNEL": env_bool("MOE_FUSED_EP_V2_ROUTE_KERNEL"),
+    # Bench-only tuning of the fused EP MoE v2 arrival combine (0 = the kernel's
+    # COMBINE_TOKENS / COMBINE_LEAD / COMBINE_PARITIES). Read at BUILD time.
+    "MOE_FUSED_EP_V2_COMBINE_TOKENS": lambda: int(os.getenv("MOE_FUSED_EP_V2_COMBINE_TOKENS", "0") or 0),
+    "MOE_FUSED_EP_V2_COMBINE_LEAD": lambda: int(os.getenv("MOE_FUSED_EP_V2_COMBINE_LEAD", "0") or 0),
+    "MOE_FUSED_EP_V2_COMBINE_PARITIES": lambda: int(os.getenv("MOE_FUSED_EP_V2_COMBINE_PARITIES", "0") or 0),
+    # Fused EP MoE v2 (plan-kernel path, fp8 wire, combine kernel): build the
+    # routing hand-offs on flat, lane-dense pair tables instead of [tokens, topk]
+    # ones. 1: the combine coefficient from a 1-D gather of the scale mirror.
+    # 2: also the activation scale slab from the token-gather scatter (token + 1)
+    # and a gather, instead of a repeat and a second scatter. Same bits on every
+    # table the kernels read. Read at TRACE time; default 0 (off).
+    "MOE_FUSED_EP_V2_FLAT_HANDOFF": lambda: int(os.getenv("MOE_FUSED_EP_V2_FLAT_HANDOFF", "0") or 0),
+    # Fused EP MoE v2 (plan-kernel path, whole fused layer): the activation all-gather as DMAs at the
+    # plan kernel's head, waited at its tail, instead of XLA's (synchronous) all-gather, so the rows
+    # move under the plan's own compute. Same bits. Read at TRACE time; default off.
+    "MOE_FUSED_EP_V2_AG_IN_PLAN": env_bool("MOE_FUSED_EP_V2_AG_IN_PLAN"),
+    # Fused EP MoE v2 (plan-kernel path, fp8 wire): each routed pair's activation-scale bits for the
+    # scale-slab scatter come from one exact one-hot matmul over the exchange's scale rows (byte planes),
+    # already in the pairs' lane-dense order, instead of a repeat through a [tokens, topk] array and a
+    # relayout. Same bits. Read at TRACE time; default off.
+    "MOE_FUSED_EP_V2_PAIR_SCALE": env_bool("MOE_FUSED_EP_V2_PAIR_SCALE"),
+    # Fused EP MoE v2 plan bases: the expert-axis prefix sums as exact HIGHEST-precision triangular
+    # matmuls instead of XLA cumsums (reduce-window). Integer-exact below 2**24. Read at TRACE time; default off.
+    "MOE_FUSED_EP_V2_PLAN_CUMSUM_DOT": env_bool("MOE_FUSED_EP_V2_PLAN_CUMSUM_DOT"),
+    # Fused EP MoE v2 (MO3b, whole fused layer, fp8 wire): prebuild also builds the op variant that
+    # takes the activation rows already quantized (q, row scale) from the post-attention norm/SE op
+    # (fused_moe_ep.stage_fused_moe_ep_prequant), so the layer skips its own quant. The producer must
+    # reproduce the in-program quant bit for bit. Read at WEIGHT LOAD; default off.
+    "MOE_FUSED_EP_V2_PREQUANT": env_bool("MOE_FUSED_EP_V2_PREQUANT"),
+    # Fused EP MoE v2, fp8 weights: prebuild stages each per-channel weight scale once as an [E, N] base
+    # buffer (the 4-D [E, 1, 1, N] parameter becomes a view of it) and the call hands the op the base, so
+    # the step no longer relayouts the padded 4-D scales on every call. Same values. Read at WEIGHT LOAD.
+    "MOE_FUSED_EP_V2_STAGE_SCALES": env_bool("MOE_FUSED_EP_V2_STAGE_SCALES"),
+    # Fused EP MoE v2 plan bases: the per-source slab bases from the exchanged count table in its own
+    # [ep, e_total] orientation instead of transposing the [e_total, ep] run starts. Integer-exact, same
+    # bits. Read at TRACE time; default off.
+    "MOE_FUSED_EP_V2_SLAB_BASE_T": env_bool("MOE_FUSED_EP_V2_SLAB_BASE_T"),
     # Shard Kimi K3's latent-MoE down/up projections across the cores of a
     # chip instead of replicating them. They are unquantized [7168, 3584] and
     # [3584, 7168] matmuls run at full HBM bandwidth, ~22% of decode device
@@ -1034,6 +1159,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_FUSE_POST_ATTN_NORM_MOE": env_bool(
         "TPU_FUSE_POST_ATTN_NORM_MOE", default=True
     ),
+    # Qwen3.5 fused post-attention norm + router + shared expert (R1 push DN1):
+    # 1 runs the x absmax + fp8 convert as one Pallas pass over the residual
+    # sum; 2 runs norm, x quant, the router/gate_up matmul, silu*u and the
+    # inter quant as one kernel with the weight resident in VMEM; 3 is 2 with
+    # the shared-expert gate GEMV in the kernel too. All are meant
+    # bit-identical to 0 (kernels/experimental/se_prequant).
+    "TPU_SE_PREQUANT_KERNEL": env_nonnegative_int("TPU_SE_PREQUANT_KERNEL", 0),
+    # Scoped VMEM limit (MiB) of the TPU_SE_PREQUANT_KERNEL >= 2 kernel; 0 keeps the
+    # kernel's 56 MiB. The kernel needs ~14.5 MiB at 256-row tiles (AOT, tpu7x);
+    # a smaller limit leaves VMEM to neighbouring ops (r1pdnskb5: 40 MiB -5.7
+    # us/call, bit-identical).
+    "TPU_SE_PREQUANT_VMEM_MIB": env_nonnegative_int("TPU_SE_PREQUANT_VMEM_MIB", 0),
+    # TPU_SE_PREQUANT_KERNEL=4 with per-layer ids: the kernel reads x as the
+    # must-fuse group of its convert and call (the out_proj producer's tiling, no
+    # relayout copy), with MUST_FUSE pushed onto the callee's ops so it survives
+    # torch_tpu's embedding. Off: mode 4's bf16 x input (a relayout copy).
+    "TPU_SE_PREQUANT_MUSTFUSE": env_bool("TPU_SE_PREQUANT_MUSTFUSE", default=False),
     "TPU_GDN_FUSED_NORM_QUANT_MIN_ROWS": env_nonnegative_int(
         "TPU_GDN_FUSED_NORM_QUANT_MIN_ROWS", 16
     ),
@@ -1043,6 +1185,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_FUSED_QK_NORM_ROPE_MIN_ROWS": env_nonnegative_int(
         "TPU_FUSED_QK_NORM_ROPE_MIN_ROWS", 0
     ),
+    # R1 push DN3: N > 0 runs the fused q/k norm + rope kernel on the whole
+    # qkv projection output read in place (no sliced copy of q_gate at the
+    # jax_op boundary) with row tiles of up to N (VMEM limit raised above 128).
+    # Bit-identical to 0 (kernels/experimental/qk_norm_rope_gate v2).
+    "TPU_QK_NORM_ROPE_INPLACE_TILE": env_nonnegative_int(
+        "TPU_QK_NORM_ROPE_INPLACE_TILE", 0
+    ),
+    # ATS (R1 push): the in-place q/k norm kernel writes q in RPAm's packed kv-major order
+    # [Hk, T, G/2, 2, D]; the adapter hands torch the same values token-major.
+    "TPU_QK_NORM_ROPE_Q_PACKED": lambda: os.getenv("TPU_QK_NORM_ROPE_Q_PACKED", "0") == "1",
+    # xla_quantized_matmul's per-row activation quant takes its row max on f32
+    # instead of bf16 for bf16 rows: the same values bit for bit, a faster TPU
+    # fusion (the prefill FA projection's bf16 row max is ~15.8 us/call).
+    "TPU_QMM_ACT_F32_AMAX": env_bool("TPU_QMM_ACT_F32_AMAX", default=False),
+    # ATS (R1 push): the PCP all-RPA entry packs q (the RPA's T<->kv swapaxes) outside its
+    # shard_map and exchanges the packed q, so XLA folds the q permutations.
+    "TPU_PCP_Q_PACK_OUTSIDE": lambda: os.getenv("TPU_PCP_Q_PACK_OUTSIDE", "0") == "1",
     # Run batched RPA in token buckets of up to 64 rows with half the chip's
     # VMEM and a decode batch of min(8, max_num_seqs), at max_model_len <= 16k.
     "TPU_RPA_DECODE_BATCHED": env_bool("TPU_RPA_DECODE_BATCHED"),
@@ -1058,6 +1217,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Decode steps split the KV read over the tensor-parallel ranks that share
     # a KV head (layers/adapter/kv_split_attention.py).
     "TPU_RPA_KV_SPLIT": env_bool("TPU_RPA_KV_SPLIT"),
+    # PCP prefill: attend the cached history with the batched RPA kernel
+    # (CACHE_ONLY over each rank's pages, f32 LSE merge) instead of the
+    # streaming kernel's history pass. See pcp_streaming_rpa/history_rpa.py.
+    "TPU_PCP_HISTORY_RPA": env_bool("TPU_PCP_HISTORY_RPA"),
+    # With TPU_PCP_HISTORY_RPA: also run the current chunk (causal, plus the
+    # history-boundary page) on batched RPA instead of the streaming current
+    # pass. See history_rpa.pcp_attention_all_rpa.
+    "TPU_PCP_CURRENT_RPA": env_bool("TPU_PCP_CURRENT_RPA"),
+    # PCP kernels that copy into the peer at entry (GDN fused projection +
+    # exchange, streaming attention current/history) first barrier the PCP
+    # ring on the runtime barrier semaphore (collective ids 13/14/15). The
+    # kernels read os.environ directly; listed here for discoverability.
+    "TPU_PCP_ENTRY_BARRIER": env_bool("TPU_PCP_ENTRY_BARRIER"),
     # Extra token buckets added to the default list of buckets.
     "TPU_TOKEN_BUCKET_EXTRA": lambda: [
         int(v) for v in os.getenv("TPU_TOKEN_BUCKET_EXTRA", "").split(",") if v.strip()
@@ -1095,6 +1267,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_PREFILL_ONLY_STATIC_GUARDS": env_bool(
         "TPU_PREFILL_ONLY_STATIC_GUARDS", default=False
     ),
+    # How pipeline stages hand activations on: "wave" runs one collective
+    # launch on every stage per forward (distributed/pp_wave.py), "ring"
+    # sends each forward's output point to point (distributed/pp_ring.py).
+    # Goes once the ring replaces the wave.
+    "TPU_PP_HANDOFF": env_with_choices("TPU_PP_HANDOFF", "wave", ["wave", "ring"]),
+    # With TPU_PP_HANDOFF=ring: the forwards a stage may queue for sending
+    # to the next stage before end_forward waits for room.
+    "TPU_PP_RING_DEPTH": env_int("TPU_PP_RING_DEPTH", 2),
     # Enable pre-compile rotation to speed up the startup time.
     "TPU_PARALLEL_PRECOMPILE": env_bool("TPU_PARALLEL_PRECOMPILE", default=False),
     # Under TPU_PARALLEL_PRECOMPILE, take a subgraph's ranges biggest first,

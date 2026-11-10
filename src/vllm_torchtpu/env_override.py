@@ -357,6 +357,26 @@ if _sc_offload_bytes is not None:
         if not _user_has_flag(_flag_name):
             _libtpu_extra_args.append(f"{_flag_name}={_sc_offload_bytes}")
 
+# TPU_PCP_MSA_MOE_AG_FIRST=1 (PCP, default off until measured): memory-space
+# assignment considers the fused-EP MoE input relayout copy (f8[N,8,32,128] in
+# the T(32,128) layout that feeds the EP all-gather) first, so it lands in
+# alternate memory (S(1)). With the PCP pair exchange on, MSA otherwise put the
+# producing fusion there instead and left the copy (the all-gather operand) in
+# HBM: all-gather 0.029 -> 0.166 ms per call, +70 ms per round (glpe
+# j-a98cd7fc run03/05 vs run02). A soft sort-order hint, not a strict pin, so it
+# cannot fail compilation. No spaces: LIBTPU_INIT_ARGS is whitespace-split.
+PCP_MOE_AG_MSA_SORT_OVERRIDE = (
+    r'overrides{hlo_position_matcher{instruction_regex:'
+    r'".*f8e4m3fn\\[[0-9]+,8,32,128\\]\\{3,2,1,0:T\\(32,128\\)\\(4,1\\)\\}.copy\\(.*"}'
+    r'override_options{assign_first:true}}'
+)
+if os.environ.get("TPU_PCP_MSA_MOE_AG_FIRST", "0") == "1" and not _user_has_flag(
+    "--xla_tpu_msa_sort_order_overrides"
+):
+    _libtpu_extra_args.append(
+        "--xla_tpu_msa_sort_order_overrides=" + PCP_MOE_AG_MSA_SORT_OVERRIDE
+    )
+
 CHANGES.extend(["libtpu_add", tok] for tok in _libtpu_extra_args)
 if _libtpu_extra_args or _existing_libtpu_args:
     _assembled = " ".join(x for x in [" ".join(_libtpu_extra_args), _existing_libtpu_args] if x)

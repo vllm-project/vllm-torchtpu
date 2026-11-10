@@ -54,6 +54,14 @@ that many steps to the count, so the chain runs a wave earlier and stage
 0's next forward is queued on its device behind the current one. The
 pushes a wait sends count the later steps that exist, so the deeper queue
 changes none of them.
+
+With ``TPU_PP_HANDOFF=ring`` the stages hand each forward on point to point
+as soon as it is done (``pp_ring``), so no step waits for later ones and
+the engine sends no pushes or settles. The engine keeps vLLM's ``stages``
+steps in flight plus ``TPU_PP_EXTRA_STEPS_IN_FLIGHT``, as with the wave,
+and the rings are widened as for the wave.
+``patch_executor_for_pp_handoff`` installs the engine side the flag
+selects.
 """
 
 import contextlib
@@ -326,6 +334,87 @@ def raise_steps_in_flight(extra: int) -> None:
     cls._tpu_pp_extra_steps = extra
 
 
+def ring_handoff() -> bool:
+    """Whether pipeline stages hand forwards on point to point (``pp_ring``)
+    rather than with the collective wave (``pp_wave``)."""
+    from vllm_torchtpu import envs
+
+    return envs.TPU_PP_HANDOFF == "ring"
+
+
+def _install_take_draft_token_ids(executor_cls: Any) -> None:
+    """Have a pipeline executor's ``take_draft_token_ids`` return None
+    without asking the workers; an executor without a pipeline keeps the
+    class's own method.
+
+    A pipeline admits prefill-only MTP alone (pp_validation): its drafts
+    exist to fill the draft layer's KV, and no step consumes them. The
+    engine asks with a blocking RPC right after dispatching a step, which
+    the last stage answers only once that step is done; under the wave,
+    asking the workers would also deadlock, as a stage can still sit in that
+    step's hand-off, waiting for a push that only a wait on the step's
+    future sends.
+    """
+    if getattr(executor_cls, "_tpu_pp_take_draft_patch", False):
+        return
+    orig = getattr(executor_cls, "take_draft_token_ids", None)
+
+    def take_draft_token_ids(self: Any) -> Any:
+        if int(self.vllm_config.parallel_config.pipeline_parallel_size) > 1:
+            return None
+        return orig(self) if orig is not None else None
+
+    executor_cls.take_draft_token_ids = take_draft_token_ids
+    executor_cls._tpu_pp_take_draft_patch = True
+
+
+def _rides_the_wave(executor: Any) -> bool:
+    """Whether an executor's steps go through the wave: a pipeline whose
+    stages hand off with it. Executors of other depths share the class."""
+    stages = int(executor.vllm_config.parallel_config.pipeline_parallel_size)
+    return stages > 1 and not ring_handoff()
+
+
+def patch_executor_for_pp_handoff(vllm_config: Any) -> None:
+    """Install the engine side of the hand-off ``TPU_PP_HANDOFF`` selects."""
+    if ring_handoff():
+        patch_executor_for_pp_ring(vllm_config)
+    else:
+        patch_executor_for_pp_wave(vllm_config)
+
+
+def patch_executor_for_pp_ring(vllm_config: Any) -> None:
+    """Install the ring hand-off's engine side: the wider ring buffers, the
+    extra steps in flight ``TPU_PP_EXTRA_STEPS_IN_FLIGHT`` asks for (as the
+    wave does; they shorten the engine's chain to stage 0 either way), and
+    draft tokens taken without asking the workers.
+
+    Does nothing without a pipeline; safe to call more than once per
+    process.
+    """
+    if vllm_config is None:
+        return
+    stages = int(vllm_config.parallel_config.pipeline_parallel_size)
+    if stages <= 1:
+        return
+    _widen_rpc_ring(stages)
+    extra = extra_steps_in_flight()
+    if extra > 0:
+        raise_steps_in_flight(extra)
+    from vllm.v1.executor.multiproc_executor import MultiprocExecutor
+
+    if getattr(MultiprocExecutor, "_tpu_pp_ring_patch", False):
+        return
+    _install_take_draft_token_ids(MultiprocExecutor)
+    MultiprocExecutor._tpu_pp_ring_patch = True
+    logger.info(
+        "PP ring: engine side installed (no push, no settle), message ring "
+        "%d chunks, %d steps in flight beyond the pipeline depth",
+        _ring_chunks_needed,
+        extra,
+    )
+
+
 def patch_executor_for_pp_wave(vllm_config: Any) -> None:
     """Install the push, the settle and the wider ring buffer on
     ``MultiprocExecutor``.
@@ -351,6 +440,8 @@ def patch_executor_for_pp_wave(vllm_config: Any) -> None:
     orig_profile = MultiprocExecutor.profile
 
     def execute_model(self, scheduler_output, non_block=False):
+        if not _rides_the_wave(self):
+            return orig_execute(self, scheduler_output, non_block=non_block)
         state = wave_state(self)
         if scheduler_output.total_num_scheduled_tokens <= 0:
             return orig_execute(self, scheduler_output, non_block=non_block)
@@ -362,21 +453,14 @@ def patch_executor_for_pp_wave(vllm_config: Any) -> None:
         return future if non_block else future.result()
 
     def sample_tokens(self, grammar_output, non_block=False):
+        if not _rides_the_wave(self):
+            return orig_sample(self, grammar_output, non_block=non_block)
         state = wave_state(self)
         inner = cast(Future, orig_sample(self, grammar_output, non_block=True))
         # Sampling belongs to the last dispatched step, whatever pushes
         # went out since.
         future = _PushFuture(inner, self, state, state.last_step, state.real_steps)
         return future if non_block else future.result()
-
-    def take_draft_token_ids(self):
-        # A pipeline admits prefill-only MTP alone (pp_validation): its
-        # drafts exist to fill the draft layer's KV, and no step consumes
-        # them. Asking the workers would also deadlock. The engine asks with
-        # a blocking RPC right after dispatching a step, while a stage can
-        # still sit in that step's hand-off, waiting for a push that only a
-        # wait on the step's future sends.
-        return None
 
     def profile(self, is_start=True, profile_prefix=None):
         # A blocking RPC that every worker answers, sent while steps are in
@@ -385,12 +469,13 @@ def patch_executor_for_pp_wave(vllm_config: Any) -> None:
         # that only a push or a settle sends, which the engine sends only
         # when it waits on a step's future. The settle goes out first, so
         # every stage runs through its queued forwards and answers.
-        wave_state(self).settle(self)
+        if _rides_the_wave(self):
+            wave_state(self).settle(self)
         return orig_profile(self, is_start, profile_prefix)
 
     MultiprocExecutor.execute_model = execute_model
     MultiprocExecutor.sample_tokens = sample_tokens
-    MultiprocExecutor.take_draft_token_ids = take_draft_token_ids
+    _install_take_draft_token_ids(MultiprocExecutor)
     MultiprocExecutor.profile = profile
     MultiprocExecutor._tpu_pp_wave_patch = True
     logger.info(

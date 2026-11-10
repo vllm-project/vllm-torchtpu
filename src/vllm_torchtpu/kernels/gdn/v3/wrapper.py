@@ -703,8 +703,14 @@ def _lazy_conv_state(
     cfg: config.GDNConfig,
 ) -> None:
     """Conv state of a PER_SEQ chunked tile from its compact rows: the static
-    tail on a full tile, the per-row masked select only on the partial last
-    tile of a sequence."""
+    tail on a full tile, the per-row masked select on a partial tile.
+
+    A partial tile is not always its sequence's last: PCP splits GDN tiles at
+    rank-slot boundaries, so a request that starts mid communication chunk
+    gets a partial FIRST tile. The next tile takes its conv lookback from
+    ``carry_conv_scratch_ref``, so a partial tile must carry the rows that end
+    at its last real token (``lazy_conv_carry_rows``), never the static tail
+    past it. Full tiles are unchanged."""
     chunk, kprev = cfg.chunk_size, cfg.prev_kernel_size
     rs = real_sizes[0]
     is_last = metadata_ref.p_id_is_last_tile[p_id, 0]
@@ -717,9 +723,16 @@ def _lazy_conv_state(
 
     @pl.when(rs < chunk)
     def _partial():
-        _store_conv_state_tile(
-            conv_state_out_slot_ref, cfg, compute_conv1d.conv_state_rows(lhs, rs, cfg)
-        )
+        rows = lazy_conv_carry_rows(lhs, rs, cfg)
+        carry_conv_scratch_ref[0] = rows
+        _store_conv_state_tile(conv_state_out_slot_ref, cfg, rows)
+
+
+def lazy_conv_carry_rows(lhs: jax.Array, real_size: jax.Array, cfg: config.GDNConfig) -> jax.Array:
+    """Conv rows a lazily-converted tile hands to the next tile of its sequence:
+    rows ``[real_size, real_size + prev_kernel_size)`` of ``lhs`` (the inputs
+    ending at the tile's last real token). Equals the static tail for a full tile."""
+    return compute_conv1d.conv_state_rows(lhs, real_size, cfg)
 
 
 class _ManualCkptDma:

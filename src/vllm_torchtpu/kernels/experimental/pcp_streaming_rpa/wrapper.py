@@ -19,9 +19,13 @@ from vllm_torchtpu.kernels.experimental.batched_rpa import (
     wrapper as batched_rpa_wrapper,
 )
 from vllm_torchtpu.kernels.experimental.batched_rpa.utils import get_dtype_packing
+from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa import history_rpa
+from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa import meta_pack
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.kernel import (
     PCP_STREAMING_RPA_LOCAL_COMPILE_TOKEN_MULTIPLE,
     pcp_streaming_attention_page_groups_packed_local_from_metadata,
+    pcp_streaming_current_state_from_metadata,
+    write_captured_kv_to_local_cache,
 )
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.schedule import (
     _reshape_metadata_page_indices_jax,
@@ -300,12 +304,14 @@ def _compute_pcp_local_query_row_mapping(
     row_valid = local_token_indices < total_local_tokens
     max_num_reqs = int(q_lens.shape[0])
     safe_req_indices = jnp.minimum(token_req_indices, max_num_reqs - 1)
-    req_local_starts = req_ends[safe_req_indices] - local_counts[safe_req_indices]
+    # TPU_PCP_META_ONEHOT: per-row lookups of the per-request tables without gathers.
+    take = history_rpa.onehot_take if history_rpa.meta_onehot_enabled() else (lambda t, i: t[i])
+    req_local_starts = take(req_ends, safe_req_indices) - take(local_counts, safe_req_indices)
     req_rank_offsets = local_token_indices - req_local_starts
 
     cycle = pcp_size * interleave_size
-    req_owner_starts = token_owner_starts[safe_req_indices]
-    req_owner_ends = token_owner_ends[safe_req_indices]
+    req_owner_starts = take(token_owner_starts, safe_req_indices)
+    req_owner_ends = take(token_owner_ends, safe_req_indices)
     rank_chunk_offset = pcp_rank * interleave_size
     first_chunk = (req_owner_starts // cycle) * cycle + rank_chunk_offset
     first_chunk = jnp.where(
@@ -330,7 +336,7 @@ def _compute_pcp_local_query_row_mapping(
         req_rank_offsets < first_overlap_len, positions_in_first, positions_after_first
     )
     request_offsets = owner_positions - req_owner_starts
-    absolute_positions = request_absolute_starts[safe_req_indices] + request_offsets
+    absolute_positions = take(request_absolute_starts, safe_req_indices) + request_offsets
     absolute_positions = jnp.where(row_valid, absolute_positions, -1).astype(jnp.int32)
     request_indices = jnp.where(row_valid, safe_req_indices, -1).astype(jnp.int32)
     return _PCPQueryRowMapping(
@@ -614,6 +620,135 @@ def _select_replicated_query_row_mapping_for_pcp_rank(
     )
 
 
+def _pcp_wrapper_meta(
+    kv_lens,
+    page_indices,
+    cu_q_lens,
+    distribution,
+    *,
+    local_padded_tokens: int,
+    local_kv_cache_num_blocks: int,
+    page_size: int,
+    pcp_size: int,
+    interleave_size: int,
+    kv_layout: KVLayout,
+) -> dict:
+    """The wrapper's metadata-only work for this rank (inside shard_map)."""
+    rank_major_query_rows = _compute_pcp_rank_major_query_row_mapping_from_metadata(
+        kv_lens,
+        cu_q_lens,
+        distribution,
+        local_padded_tokens=local_padded_tokens,
+        pcp_size=pcp_size,
+        interleave_size=interleave_size,
+    )
+    local_query_rows = _select_replicated_query_row_mapping_for_pcp_rank(
+        rank_major_query_rows,
+        PCP_AXIS_NAME,
+        pcp_size,
+    )
+    cache_rank = local_query_rows.source_ranks[0]
+    block_tables = _reshape_metadata_page_indices_jax(page_indices, kv_lens.shape[0])
+    writeback_mapping = _compute_pcp_kv_writeback_mapping(
+        rank_major_query_rows,
+        block_tables,
+        local_kv_cache_num_blocks=local_kv_cache_num_blocks,
+        page_size=page_size,
+        pcp_size=pcp_size,
+        interleave_size=interleave_size,
+    )
+    compact_slot_ids = _compact_writeback_slot_ids_for_cache_rank(
+        writeback_mapping, cache_rank
+    )
+    writeback_count = writeback_mapping.writeback_counts[cache_rank]
+    segment_descriptors, num_segments = _build_writeback_segment_descriptors(
+        compact_slot_ids,
+        writeback_count,
+        kv_layout=kv_layout,
+        page_size=page_size,
+    )
+    return dict(
+        local_positions=local_query_rows.absolute_positions,
+        local_requests=local_query_rows.request_indices,
+        local_valid=local_query_rows.is_valid,
+        cache_rank=cache_rank,
+        capture_offsets=writeback_mapping.capture_offsets,
+        cache_owner_ranks=writeback_mapping.cache_owner_ranks,
+        rm_valid=rank_major_query_rows.is_valid,
+        segment_descriptors=segment_descriptors,
+        num_segments=num_segments,
+    )
+
+
+def sharded_pcp_all_rpa_metadata(
+    mesh: Mesh,
+    q: jax.Array,
+    k: jax.Array,
+    kv_cache: jax.Array,
+    kv_lens: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+    sm_scale: float,
+    k_scale: float | None = None,
+    v_scale: float | None = None,
+    cp_kv_cache_interleave_size: int = 0,
+    kv_layout: KVLayout = KVLayout.HEAD_ALONG_SUBLANE,
+):
+    """Per-step metadata of the all-RPA PCP path, computed once per forward
+    pass and passed to every layer's ``sharded_pcp_ragged_paged_attention``
+    as ``precomputed`` (TPU_PCP_RPA_HOIST_META).
+
+    ``q``, ``k`` and ``kv_cache`` give shapes and dtypes only. Returns a
+    pytree whose leaves carry a leading PCP-rank axis.
+    """
+    pcp_size = mesh.shape[PCP_AXIS_NAME]
+    page_size = _kv_cache_page_size(kv_cache, kv_layout)
+    if TP_AXIS_NAME in mesh.axis_names:
+        qkv_spec = P(PCP_AXIS_NAME, TP_AXIS_NAME)
+        kv_cache_spec = P(PCP_AXIS_NAME, None, TP_AXIS_NAME)
+    else:
+        qkv_spec = P(PCP_AXIS_NAME)
+        kv_cache_spec = P(PCP_AXIS_NAME)
+    raw = history_rpa.raw_merge_enabled()
+    rpa_kw = dict(
+        sm_scale=sm_scale, k_scale=k_scale, v_scale=v_scale, kv_layout=kv_layout, raw=raw
+    )
+
+    def body(q_local, k_local, kv_cache, kv_lens, page_indices, cu_q_lens, distribution):
+        wm = _pcp_wrapper_meta(
+            kv_lens, page_indices, cu_q_lens, distribution,
+            local_padded_tokens=q_local.shape[0],
+            local_kv_cache_num_blocks=kv_cache.shape[0], page_size=page_size,
+            pcp_size=pcp_size, interleave_size=cp_kv_cache_interleave_size,
+            kv_layout=kv_layout,
+        )
+        lt_pad = _prepare_packed_kv_for_cache(
+            k_local, k_local, kv_cache, kv_layout=kv_layout
+        ).shape[-1]
+        attention_kv_cache = _reshape_packed_kv_cache_for_attention(kv_cache, kv_layout)
+        all_rpa = history_rpa.pcp_all_rpa_meta(
+            q_local, k_local, attention_kv_cache, kv_lens, page_indices, cu_q_lens,
+            distribution,
+            (wm["local_positions"], wm["local_requests"], wm["local_valid"]),
+            (wm["capture_offsets"], wm["cache_owner_ranks"], wm["rm_valid"], wm["cache_rank"]),
+            lt_pad=lt_pad, pcp_size=pcp_size,
+            interleave_size=cp_kv_cache_interleave_size, page_size=page_size,
+            current_fn=history_rpa.batched_rpa_current_fn(
+                **rpa_kw, q_block=cp_kv_cache_interleave_size
+            ),
+            history_fn=history_rpa.batched_rpa_history_fn(**rpa_kw),
+        )
+        out = dict(wrap=wm, all_rpa=all_rpa)
+        return jax.tree.map(lambda x: jnp.asarray(x)[None], out)
+
+    in_specs = (qkv_spec, qkv_spec, kv_cache_spec, P(), P(), P(), P())
+    # One spec for every leaf: each carries a leading PCP-rank axis.
+    return jax.shard_map(
+        body, mesh=mesh, in_specs=in_specs, out_specs=P(PCP_AXIS_NAME), check_vma=False
+    )(q, k, kv_cache, kv_lens, page_indices, cu_q_lens, distribution)
+
+
 def sharded_pcp_ragged_paged_attention(
     mesh: Mesh,
     q: jax.Array,
@@ -635,8 +770,29 @@ def sharded_pcp_ragged_paged_attention(
     q_block_size: int = PCP_STREAMING_RPA_LOCAL_COMPILE_TOKEN_MULTIPLE,
     q_compute_size: int | None = None,
     kv_layout: KVLayout = KVLayout.HEAD_ALONG_SUBLANE,
+    history_rpa_mode: bool = False,
+    current_rpa_mode: bool = False,
+    precomputed=None,
+    final_rows_history: bool = False,
 ):
-    """Runs streaming PCP RPA over local Q/K/V shards."""
+    """Runs streaming PCP RPA over local Q/K/V shards.
+
+    ``final_rows_history`` (TPU_PCP_MTP_FINAL_ROWS_HISTORY; the prefill-only
+    MTP draft layer, all-RPA, per-call metadata): the history pass attends
+    only each request's last-position row (history_rpa.final_rows_meta); the
+    current pass and the cache write-back are unchanged.
+
+    With ``history_rpa_mode`` the cached history is attended by the batched
+    RPA kernel instead of the streaming history pass (``history_rpa``).
+    ``precomputed`` (all-RPA only) is ``sharded_pcp_all_rpa_metadata``'s
+    result for this step, shared by every layer of the forward pass.
+    """
+    if precomputed is not None and not (history_rpa_mode and current_rpa_mode):
+        raise ValueError("precomputed PCP metadata needs the all-RPA path.")
+    if final_rows_history and (precomputed is not None or not (history_rpa_mode and current_rpa_mode)):
+        raise ValueError(
+            "TPU_PCP_MTP_FINAL_ROWS_HISTORY needs the all-RPA path with per-call metadata."
+        )
     if attention_sink is not None:
         raise NotImplementedError("PCP RPA does not support attention sinks.")
     if q.shape[-1] == 64:
@@ -718,6 +874,43 @@ def sharded_pcp_ragged_paged_attention(
         cu_q_lens,
         distribution,
     )
+    meta_layout = None
+    if isinstance(precomputed, meta_pack.PackedMeta):  # TPU_PCP_META_BODY_UNPACK
+        meta_layout, precomputed = precomputed.layout, precomputed.packed
+    if precomputed is not None:
+        in_specs = in_specs + (P(PCP_AXIS_NAME),)
+        args = args + (precomputed,)
+    # TPU_PCP_Q_PACK_OUTSIDE: pack q into RPAm's kv-major layout outside the shard_map, where
+    # XLA can fold it against the producer's permutation (TPU_QK_NORM_ROPE_Q_PACKED); inside,
+    # the unpack folds against the unchanged per-call packs.
+    q_packing = get_dtype_packing(q.dtype)
+    q_packed_in = (
+        history_rpa.q_pack_outside_enabled()
+        and current_rpa_mode and history_rpa_mode and not final_rows_history
+        and TP_AXIS_NAME not in mesh.axis_names
+        and kv_layout == KVLayout.SEQ_ALONG_LANE
+        and q.shape[1] % k.shape[1] == 0
+        and (q.shape[1] // k.shape[1]) % q_packing == 0
+        and q.shape[2] % 128 == 0
+    )
+    if q_packed_in:
+        args = (history_rpa.q_pack(q, k.shape[1], q_packing),) + args[1:]
+        in_specs = (P(None, PCP_AXIS_NAME),) + in_specs[1:]
+    # TPU_PCP_O_TOKEN_MAJOR: the all-RPA merge kernel writes o as [T, H * D] and the shard_map returns
+    # it in that shape; the reshape to [T, H, D] below, outside the shard_map, folds with vLLM's
+    # [T, H * D] view of the output, so o is not relaid out before its consumer.
+    from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa import merge_kernel
+
+    o_token_major = (
+        merge_kernel.o_token_major_enabled()
+        and current_rpa_mode and history_rpa_mode and not final_rows_history
+        and history_rpa.raw_merge_enabled()
+        # The served mesh always carries a TP axis (get_pcp_streaming_mesh builds
+        # ("pcp", "tp")), of size 1 at TP1: gate on its size, not its presence.
+        and mesh.shape.get(TP_AXIS_NAME, 1) == 1
+        and q.shape[1] % k.shape[1] == 0
+        and (q.shape[1] // k.shape[1]) % q_packing == 0
+    )
 
     def _pcp_ragged_paged_attention(
         q_local,
@@ -728,37 +921,27 @@ def sharded_pcp_ragged_paged_attention(
         page_indices,
         cu_q_lens,
         distribution,
+        precomputed_local=None,
     ):
-        rank_major_query_rows = _compute_pcp_rank_major_query_row_mapping_from_metadata(
-            kv_lens,
-            cu_q_lens,
-            distribution,
-            local_padded_tokens=q_local.shape[0],
-            pcp_size=pcp_size,
-            interleave_size=cp_kv_cache_interleave_size,
-        )
-        local_query_rows = _select_replicated_query_row_mapping_for_pcp_rank(
-            rank_major_query_rows,
-            PCP_AXIS_NAME,
-            pcp_size,
-        )
-        query_row_valid = local_query_rows.is_valid
-        cache_rank = local_query_rows.source_ranks[0]
-        block_tables = _reshape_metadata_page_indices_jax(
-            page_indices, kv_lens.shape[0]
-        )
-        writeback_mapping = _compute_pcp_kv_writeback_mapping(
-            rank_major_query_rows,
-            block_tables,
-            local_kv_cache_num_blocks=kv_cache.shape[0],
-            page_size=page_size,
-            pcp_size=pcp_size,
-            interleave_size=cp_kv_cache_interleave_size,
-        )
-        compact_slot_ids = _compact_writeback_slot_ids_for_cache_rank(
-            writeback_mapping, cache_rank
-        )
-        writeback_count = writeback_mapping.writeback_counts[cache_rank]
+        if q_packed_in:
+            q_local = history_rpa.q_unpack(q_local)
+        if precomputed_local is None:
+            wm = _pcp_wrapper_meta(
+                kv_lens, page_indices, cu_q_lens, distribution,
+                local_padded_tokens=q_local.shape[0],
+                local_kv_cache_num_blocks=kv_cache.shape[0], page_size=page_size,
+                pcp_size=pcp_size, interleave_size=cp_kv_cache_interleave_size,
+                kv_layout=kv_layout,
+            )
+            all_rpa_meta = None
+        else:
+            if meta_layout is not None:  # TPU_PCP_META_BODY_UNPACK: this rank's [1, W] row
+                pre = meta_pack.unpack_local(precomputed_local, meta_layout)
+            else:
+                pre = jax.tree.map(lambda x: x[0], precomputed_local)
+            wm, all_rpa_meta = pre["wrap"], pre["all_rpa"]
+        query_row_valid = wm["local_valid"]
+        cache_rank = wm["cache_rank"]
         packed_current_kv = _prepare_packed_kv_for_cache(
             k_local, v_local, kv_cache, kv_layout=kv_layout
         )
@@ -782,47 +965,149 @@ def sharded_pcp_ragged_paged_attention(
                 constant_values=0,
             )
         attention_kv_cache = _reshape_packed_kv_cache_for_attention(kv_cache, kv_layout)
-        segment_descriptors, num_segments = _build_writeback_segment_descriptors(
-            compact_slot_ids,
-            writeback_count,
-            kv_layout=kv_layout,
-            page_size=page_size,
+        segment_descriptors = wm["segment_descriptors"]
+        num_segments = wm["num_segments"]
+        streaming_args = (
+            q_streaming,
+            packed_current_kv,
+            attention_kv_cache,
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            distribution,
+            segment_descriptors,
+            num_segments,
         )
-        output, kv_cache = (
-            pcp_streaming_attention_page_groups_packed_local_from_metadata(
-                q_streaming,
+        streaming_kwargs = dict(
+            pcp_size=pcp_size,
+            interleave_size=cp_kv_cache_interleave_size,
+            sm_scale=sm_scale,
+            q_block_size=q_block_size,
+            q_compute_size=q_compute_size,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            kv_layout=kv_layout,
+            mesh_axis_names=tuple(mesh.axis_names),
+            pcp_axis_name=PCP_AXIS_NAME,
+        )
+        if current_rpa_mode:
+            if not history_rpa_mode:
+                raise ValueError("TPU_PCP_CURRENT_RPA requires TPU_PCP_HISTORY_RPA.")
+            raw = history_rpa.raw_merge_enabled()
+            rpa_kw = dict(
+                sm_scale=sm_scale, k_scale=k_scale, v_scale=v_scale,
+                kv_layout=kv_layout, raw=raw,
+            )
+            output, kv_cache = history_rpa.pcp_attention_all_rpa(
+                q_local,
+                k_local,
+                v_local,
                 packed_current_kv,
                 attention_kv_cache,
                 kv_lens,
                 page_indices,
                 cu_q_lens,
                 distribution,
-                segment_descriptors,
-                num_segments,
+                (wm["local_positions"], wm["local_requests"], wm["local_valid"]),
+                (wm["capture_offsets"], wm["cache_owner_ranks"], wm["rm_valid"], cache_rank),
                 pcp_size=pcp_size,
                 interleave_size=cp_kv_cache_interleave_size,
-                sm_scale=sm_scale,
-                q_block_size=q_block_size,
-                q_compute_size=q_compute_size,
-                k_scale=k_scale,
-                v_scale=v_scale,
-                kv_layout=kv_layout,
-                mesh_axis_names=tuple(mesh.axis_names),
+                page_size=page_size,
                 pcp_axis_name=PCP_AXIS_NAME,
+                current_fn=history_rpa.batched_rpa_current_fn(
+                    **rpa_kw, q_block=cp_kv_cache_interleave_size
+                ),
+                history_fn=history_rpa.batched_rpa_history_fn(**rpa_kw),
+                write_fn=lambda cache, captured: write_captured_kv_to_local_cache(
+                    cache,
+                    captured,
+                    segment_descriptors,
+                    num_segments,
+                    kv_layout=kv_layout,
+                ),
+                raw=raw,
+                meta=all_rpa_meta,
+                # TPU_PCP_CAPTURE_DIRECT: write from the gathered stream.
+                write_direct_fn=lambda cache, gathered, flat, has: write_captured_kv_to_local_cache(
+                    cache,
+                    gathered,
+                    *history_rpa.direct_write_segments(
+                    segment_descriptors, num_segments, flat, has,
+                    row_width=gathered.shape[-1] if gathered.ndim == 5 else None,
+                ),
+                    kv_layout=kv_layout,
+                ),
+                final_rows=final_rows_history,
+                history_fn_sub=(
+                    history_rpa.batched_rpa_history_fn(**rpa_kw, lse_compact=False)
+                    if final_rows_history else None
+                ),
+                **({"o_token_major": True} if o_token_major else {}),
             )
-        )
+            if o_token_major:  # [T, H * D]; the raw merge already wrote invalid rows as zeros
+                return output.astype(q_local.dtype), kv_cache
+            output = output.reshape(
+                output.shape[0], k_local.shape[1], q_per_kv, output.shape[-1]
+            ).astype(q_local.dtype)
+            if q_per_kv_padded != q_per_kv:
+                output = jnp.pad(
+                    output, ((0, 0), (0, 0), (0, q_per_kv_padded - q_per_kv), (0, 0))
+                )
+        elif history_rpa_mode:
+            with jax.named_scope("pcp_current_pass"):
+                m_state, l_state, acc_state, kv_cache, _ = (
+                    pcp_streaming_current_state_from_metadata(
+                        *streaming_args, **streaming_kwargs
+                    )
+                )
+            output, kv_cache = history_rpa.pcp_history_attention(
+                q_local,
+                k_local,
+                v_local,
+                kv_cache,
+                m_state,
+                l_state,
+                acc_state,
+                kv_lens,
+                page_indices,
+                cu_q_lens,
+                distribution,
+                pcp_size=pcp_size,
+                interleave_size=cp_kv_cache_interleave_size,
+                page_size=page_size,
+                pcp_axis_name=PCP_AXIS_NAME,
+                history_fn=history_rpa.batched_rpa_history_fn(
+                    sm_scale=sm_scale,
+                    k_scale=k_scale,
+                    v_scale=v_scale,
+                    kv_layout=kv_layout,
+                ),
+                rank=cache_rank,
+            )
+            output = output.astype(q_local.dtype)
+        else:
+            output, kv_cache = (
+                pcp_streaming_attention_page_groups_packed_local_from_metadata(
+                    *streaming_args, **streaming_kwargs
+                )
+            )
         output = output[:, :, :q_per_kv, :]
-        valid_output_rows = query_row_valid.reshape(
-            (query_row_valid.shape[0],) + (1,) * (output.ndim - 1)
-        )
-        output = jnp.where(valid_output_rows, output, jnp.zeros_like(output))
+        if not (current_rpa_mode and history_rpa.raw_merge_enabled()):
+            # The raw all-RPA merge already wrote invalid rows as zeros.
+            valid_output_rows = query_row_valid.reshape(
+                (query_row_valid.shape[0],) + (1,) * (output.ndim - 1)
+            )
+            output = jnp.where(valid_output_rows, output, jnp.zeros_like(output))
         output = output.reshape(q_local.shape)
         return output, kv_cache
 
-    return jax.shard_map(
+    output, new_kv_cache = jax.shard_map(
         _pcp_ragged_paged_attention,
         mesh=mesh,
         in_specs=in_specs,
         out_specs=out_specs,
         check_vma=False,
     )(*args)
+    if o_token_major:
+        output = output.reshape(q.shape)
+    return output, new_kv_cache

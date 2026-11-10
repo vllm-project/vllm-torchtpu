@@ -22,6 +22,16 @@ prompt so the kernel never overruns its SMEM. The cost model
 arrives after the engine core has built its executor and scheduler; until
 then chunks are cut by token count alone.
 
+With the ring hand-off (``TPU_PP_HANDOFF=ring``) the engine sends no pushes
+or settles, so the steps in flight are never aged or cleared outside
+scheduler steps, and a burst after a wait is costed against steps that left
+the pipeline long ago. ``TPU_PP_RING_INFLIGHT_RESET=1`` (default off) has the
+scheduler track the steps it launched and drop each one, with every older
+one, when the engine hands its output back (``update_from_output``): under
+the ring a step's output returns once the last stage has run it, so the
+history holds exactly the steps still in the pipeline and is empty once the
+pipeline has drained, as a settle leaves it under the wave.
+
 On a hybrid attention + GDN model the scheduler also keeps the GDN state
 snapshots a later turn hits on (``core/hybrid_retention.py``) and writes
 them inside a chunk rather than at an extra step end
@@ -30,6 +40,7 @@ a single-stage engine: the retention stops are applied to a chunk after the
 time budget has clipped it.
 """
 
+import collections
 import math
 import os
 import time
@@ -86,6 +97,18 @@ def _prefill_end(request: Any) -> int:
 def _env_switch(name: str) -> bool:
     """An ix-unified-port switch: on unless the variable is set to 0 / false / off."""
     return os.environ.get(name, "1").strip().lower() not in ("0", "false", "off")
+
+
+# Steps (scheduler outputs) tracked for TPU_PP_RING_INFLIGHT_RESET at most; the
+# engine keeps stages + TPU_PP_EXTRA_STEPS_IN_FLIGHT of them in flight, so the
+# cap only bounds the history if outputs ever stop coming back.
+_RING_TRACK_CAP = 64
+
+
+def ring_inflight_reset_requested() -> bool:
+    """TPU_PP_RING_INFLIGHT_RESET: off unless set to 1 / true / on."""
+    value = os.environ.get("TPU_PP_RING_INFLIGHT_RESET", "0").strip().lower()
+    return value in ("1", "true", "on")
 
 
 class TpuPipelineChunkScheduler(Scheduler):
@@ -180,6 +203,13 @@ class TpuPipelineChunkScheduler(Scheduler):
         self._promote_waiting = _env_switch("TPU_SCHED_PAW_PROMOTE_WARMEST")
         self._quad = _env_switch("TPU_PP_QUAD_COST")
         self._inflight_cost = _env_switch("TPU_PP_INFLIGHT_COST")
+        # TPU_PP_RING_INFLIGHT_RESET (default off): under the ring hand-off the
+        # in-flight history follows the steps whose outputs have not come back
+        # (_track_step / _step_completed) instead of the pushes and settles the
+        # ring never sends. Off, or under the wave, nothing below changes.
+        self._ring_steps: collections.deque = collections.deque()
+        self._ring_drains = 0
+        self._ring_reset = self._ring_reset_wanted()
         logger.info(
             "Pipeline chunk scheduler: waiting for the step cost model "
             "(hybrid_state_retention=%s, single_step_prefill=%s, "
@@ -413,6 +443,74 @@ class TpuPipelineChunkScheduler(Scheduler):
         for _ in range(max(int(pushes), 0)):
             self._enter(0.0)
 
+    def _ring_reset_wanted(self) -> bool:
+        """Whether TPU_PP_RING_INFLIGHT_RESET applies: asked for, under the
+        ring hand-off, with in-flight costing on."""
+        if not ring_inflight_reset_requested():
+            return False
+        if envs.TPU_PP_HANDOFF != "ring":
+            logger.warning(
+                "TPU_PP_RING_INFLIGHT_RESET ignored: TPU_PP_HANDOFF=%s, not "
+                "ring; the wave's pushes and settles keep the history.",
+                envs.TPU_PP_HANDOFF,
+            )
+            return False
+        if not getattr(self, "_inflight_cost", True):
+            logger.warning(
+                "TPU_PP_RING_INFLIGHT_RESET ignored: TPU_PP_INFLIGHT_COST=0 "
+                "keeps no in-flight history."
+            )
+            return False
+        logger.info(
+            "Pipeline chunk scheduler: ring in-flight reset on step completion "
+            "(TPU_PP_RING_INFLIGHT_RESET=1)"
+        )
+        return True
+
+    def _sync_ring_history(self) -> None:
+        """The in-flight history from the tracked steps: the estimates of the
+        steps still in the pipeline, newest first, at most a stage count
+        minus one, as ``_enter`` keeps them."""
+        live = [ms for _, ms in reversed(self._ring_steps) if ms is not None]
+        had = bool(self._inflight_ms)
+        self._inflight_ms = live[: max(self._pp_size - 1, 0)]
+        if had and not self._inflight_ms:
+            self._ring_drains += 1
+            if self._ring_drains <= 20 or self._ring_drains % 100 == 0:
+                logger.info(
+                    "Pipeline chunk scheduler: ring pipeline drained, in-flight "
+                    "history empty (drain %d)",
+                    self._ring_drains,
+                )
+
+    def _track_step(self, output: Any, estimate_ms: float | None) -> None:
+        """Records a launched step (an empty one with no estimate) behind the
+        steps already in flight."""
+        steps = self._ring_steps
+        steps.append((output, estimate_ms))
+        while len(steps) > _RING_TRACK_CAP:
+            steps.popleft()
+        self._sync_ring_history()
+
+    def _step_completed(self, scheduler_output: Any) -> None:
+        """The engine handed a step's output back: under the ring the step
+        has left the last stage, and the engine reads outputs in launch
+        order, so every step launched before it has left too."""
+        steps = self._ring_steps
+        if not any(output is scheduler_output for output, _ in steps):
+            return
+        while steps:
+            output, _ = steps.popleft()
+            if output is scheduler_output:
+                break
+        self._sync_ring_history()
+
+    def update_from_output(self, scheduler_output, model_runner_output):
+        result = super().update_from_output(scheduler_output, model_runner_output)
+        if getattr(self, "_ring_reset", False):
+            self._step_completed(scheduler_output)
+        return result
+
     def _account(self, tokens: int, prefix: int) -> None:
         self._step_tokens += tokens
         self._step_pairs += float(tokens) * prefix
@@ -528,7 +626,12 @@ class TpuPipelineChunkScheduler(Scheduler):
                 # checkpoint blocks these name.
                 output.tpu_mamba_seg_cuts = cuts
                 self._n_single_step_reqs += len(cuts)
-        if self._cost is not None and output.total_num_scheduled_tokens > 0:
+        if getattr(self, "_ring_reset", False):
+            estimate = None
+            if self._cost is not None and output.total_num_scheduled_tokens > 0:
+                estimate = self.step_estimate_ms(output)
+            self._track_step(output, estimate)
+        elif self._cost is not None and output.total_num_scheduled_tokens > 0:
             estimate = self.step_estimate_ms(output)
             assert estimate is not None
             self._enter(estimate)
@@ -784,6 +887,11 @@ def patch_engine_core_for_pp_chunks(vllm_config: Any) -> None:
         orig_init(self, *args, **kwargs)
         profile_and_install_cost_model(self.scheduler, self.model_executor)
         attach_pipeline_listener(self.scheduler, self.model_executor)
+        # W7 P1b (TPU_PP_EMPTY_STEP_GRACE_MS, default off): empty steps take no
+        # batch-queue slot under the ring hand-off (core/pp_ring_step.py).
+        from vllm_torchtpu.core.pp_ring_step import install_empty_step_grace
+
+        install_empty_step_grace(self)
 
     EngineCore.__init__ = __init__
     EngineCore._tpu_pp_chunks_patch = True

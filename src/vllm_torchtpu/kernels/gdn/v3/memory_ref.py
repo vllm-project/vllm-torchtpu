@@ -722,6 +722,7 @@ def create_allocs(
     cfg: config.GDNConfig,
     conv_state_output_ref: jax.Array | None = None,
     recurrent_state_output_ref: jax.Array | None = None,
+    ba_metadata_ref: MetadataRef | None = None,
 ) -> tuple[
     pltpu.BufferedRef,
     pltpu.BufferedRef,
@@ -785,8 +786,14 @@ def create_allocs(
         metadata_ref=metadata_ref,
     )
     qkv_alloc = in_buffered_partial(spec=qkv_spec, dtype_or_type=qkv_ref)
-    b_alloc = in_buffered_partial(spec=b_spec, dtype_or_type=b_ref)
-    a_alloc = in_buffered_partial(spec=a_spec, dtype_or_type=a_ref)
+    if ba_metadata_ref is None:
+        b_alloc = in_buffered_partial(spec=b_spec, dtype_or_type=b_ref)
+        a_alloc = in_buffered_partial(spec=a_spec, dtype_or_type=a_ref)
+    else:
+        # b/a read from their own row map (PCP TPU_PCP_GDN_BA_DIRECT: packed rows).
+        ba_partial = functools.partial(in_buffered_partial, metadata_ref=ba_metadata_ref)
+        b_alloc = ba_partial(spec=b_spec, dtype_or_type=b_ref)
+        a_alloc = ba_partial(spec=a_spec, dtype_or_type=a_ref)
 
     out_alloc = OutBufferedRef.output(
         spec=block_spec_partial(block_shape=out_shape),

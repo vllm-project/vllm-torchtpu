@@ -34,6 +34,10 @@ from vllm_torchtpu.kernels.experimental.qk_norm_rope_gate import (
     qk_norm_rope_gate,
     reference as qk_norm_rope_gate_reference,
 )
+from vllm_torchtpu.kernels.experimental.qk_norm_rope_gate.kernel import (
+    qk_norm_rope_gate_v2,
+    v2_supported,
+)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -46,6 +50,8 @@ MAX_ROWS = 16384
 _HOISTED_WEIGHT_ATTR = "_tpu_weight_plus_one"
 
 _ops: dict[tuple[int, int, int, int, float], Callable] = {}
+_inplace_ops: dict[tuple[int, int, int, int, float, int], Callable] = {}
+_INPLACE_VMEM_LIMIT = 48 * 1024 * 1024
 
 
 def _op_key(layer: torch.nn.Module) -> tuple[int, int, int, int, float]:
@@ -103,6 +109,58 @@ def _build_op(key: tuple[int, int, int, int, float]) -> None:
     _ops[key] = op
 
 
+def _build_inplace_op(key: tuple[int, int, int, int, float], tile: int) -> None:
+    """TPU_QK_NORM_ROPE_INPLACE_TILE (DN3): the op takes the whole qkv and the
+    kernel reads q_gate and k in place, so torch_tpu materializes no sliced
+    copy of q_gate for the call. Same math, element for element."""
+    if key + (tile,) in _inplace_ops:
+        return
+    heads, kv_heads, dim, rot, eps = key
+    qg_cols, k_cols = heads * 2 * dim, kv_heads * dim
+
+    def fn(
+        qkv: jax.Array, q_w: jax.Array, k_w: jax.Array, cos_sin: jax.Array
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        rows = qkv.shape[0]
+        kw = dict(heads=heads, kv_heads=kv_heads, dim=dim, rot=rot, eps=eps)
+        if envs.TPU_FUSED_QK_NORM_ROPE_MIN_ROWS <= rows <= MAX_ROWS:
+            packed = envs.TPU_QK_NORM_ROPE_Q_PACKED and heads % kv_heads == 0 and (heads // kv_heads) % 2 == 0
+            q, k, g = qk_norm_rope_gate_v2(
+                qkv,
+                q_w,
+                k_w,
+                cos_sin,
+                tile=tile,
+                rope="concat",
+                vmem_limit=_INPLACE_VMEM_LIMIT if tile > 128 else 0,
+                name="qk_norm_rope_gate",
+                q_packed=packed,
+                **kw,
+            )
+            if packed:
+                # TPU_QK_NORM_ROPE_Q_PACKED: the kernel wrote q in RPAm's packed kv-major order; hand
+                # torch the same values token-major. XLA folds this permutation against the PCP entry's
+                # re-pack (TPU_PCP_Q_PACK_OUTSIDE), so q is never relayouted.
+                q = q.swapaxes(0, 1).reshape(rows, heads * dim)
+            return q, k, g
+        return qk_norm_rope_gate_reference(
+            qkv[:, :qg_cols], qkv[:, qg_cols : qg_cols + k_cols], q_w, k_w, cos_sin, **kw
+        )
+
+    op = pallas.jax_op(f"pallas::qk_norm_rope_gate_inplace{tile}_{len(_inplace_ops)}", fn)
+
+    def fake(qkv, q_w, k_w, cos_sin):
+        rows = qkv.shape[0]
+        return (
+            qkv.new_empty((rows, heads * dim)),
+            qkv.new_empty((rows, k_cols)),
+            qkv.new_empty((rows, heads * dim)),
+        )
+
+    op.register_fake(fake)
+    _inplace_ops[key + (tile,)] = op
+
+
 def _weight_plus_one(norm: torch.nn.Module) -> torch.Tensor:
     hoisted = getattr(norm, _HOISTED_WEIGHT_ATTR, None)
     if hoisted is None:
@@ -152,6 +210,23 @@ def _prebuild(layer: torch.nn.Module, model_config) -> bool:
     _weight_plus_one(layer.q_norm)
     _weight_plus_one(layer.k_norm)
     _build_op(_op_key(layer))
+    tile = envs.TPU_QK_NORM_ROPE_INPLACE_TILE
+    if tile:
+        if v2_supported(layer.num_heads, layer.num_kv_heads, layer.head_dim, rot, "concat"):
+            _build_inplace_op(_op_key(layer), tile)
+            logger.info_once(
+                "[Attention] TPU_QK_NORM_ROPE_INPLACE_TILE=%d: the q/k norm + rope "
+                "kernel reads q_gate and k in place from qkv.",
+                tile,
+            )
+        else:
+            logger.warning_once(
+                "[Attention] TPU_QK_NORM_ROPE_INPLACE_TILE ignored: %d heads, %d kv "
+                "heads of %d do not tile in place.",
+                layer.num_heads,
+                layer.num_kv_heads,
+                layer.head_dim,
+            )
     _log_armed_rows(get_current_vllm_config())
     return True
 
@@ -165,6 +240,16 @@ def project_qkv_gate(
         # Text-only M-RoPE: the three position rows agree.
         positions = positions[0]
     cos_sin = layer.rotary_emb.cos_sin_cache.index_select(0, positions.to(torch.int64))
+    tile = envs.TPU_QK_NORM_ROPE_INPLACE_TILE
+    if tile and _op_key(layer) + (tile,) in _inplace_ops:
+        # Built by _prebuild. The op reads q_gate and k inside qkv; v stays a view.
+        q, k, gate = _inplace_ops[_op_key(layer) + (tile,)](
+            qkv,
+            _weight_plus_one(layer.q_norm),
+            _weight_plus_one(layer.k_norm),
+            cos_sin,
+        )
+        return q, k, v, gate
     # Built by _prebuild: registering an op inside a traced forward is not allowed.
     q, k, gate = _ops[_op_key(layer)](
         q_gate,

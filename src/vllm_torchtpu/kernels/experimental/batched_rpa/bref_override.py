@@ -548,8 +548,11 @@ class BatchingLSERef(_BypassRef):
         slot: int | jax.Array,
         total_steps: int | jax.Array,
     ):
-        # dst_ref: (lse_hbm, schedule_ref)
+        # dst_ref: (lse_hbm, schedule_ref); compact LSE: (VMEM accumulator, schedule_ref)
         is_no_op, block_idx = _step_guard(step, total_steps)
+        if self.cfgs.serve.lse_compact:
+            self._place_compact(step, slot, is_no_op, block_idx)
+            return
         lse_hbm, schedule_ref = self.dst_ref
         sem = self.sem_sends.at[slot]
         vmem_src = self.window_ref.at[slot]
@@ -566,12 +569,34 @@ class BatchingLSERef(_BypassRef):
                 sem,
             ).start()
 
+    def _place_compact(self, step, slot, is_no_op, block_idx):
+        """Compact LSE: place each finished q block's lane-dense rows (window
+        [batch, kv_heads, bq * Gp // 128, 128]) into the call's VMEM
+        accumulator at flat offset q_src * Gp (utils.place_lane_dense)."""
+        del step
+        acc_ref, schedule_ref = self.dst_ref
+        vmem_src = self.window_ref.at[slot]
+        gp = self.cfgs.aligned_num_q_heads_per_kv_head
+        for b in range(self.cfgs.batch_size):
+            is_last_k = schedule_ref.is_last_k[block_idx, b] == 1
+            q_src, q_sz = schedule_ref.get_dma_q(block_idx, b)
+            live = jnp.logical_and(jnp.logical_not(is_no_op), is_last_k) & (q_sz > 0)
+
+            @pl.when(live)
+            def _place(b=b, q_src=q_src, q_sz=q_sz):
+                for kv_h in range(self.cfgs.model.num_kv_heads):
+                    utils.place_lane_dense(
+                        acc_ref.at[kv_h], vmem_src[b, kv_h], q_src * gp, q_sz * gp
+                    )
+
     def wait_out(
         self,
         step: int | jax.Array,
         slot: int | jax.Array,
         total_steps: int | jax.Array,
     ):
+        if self.cfgs.serve.lse_compact:
+            return  # copy_out wrote the accumulator directly; no DMA to wait on
         is_no_op, block_idx = _step_guard(step, total_steps)
         lse_hbm, schedule_ref = self.dst_ref
         sem = self.sem_sends.at[slot]

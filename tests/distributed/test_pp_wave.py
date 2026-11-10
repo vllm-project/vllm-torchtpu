@@ -553,6 +553,14 @@ def test_a_stage_of_several_chips_drains_before_every_hand_off(monkeypatch):
     wave.start_forward(16)
     assert drains == [None] * 3 and wave.launches == 3
 
+    # A one-chip stage of two columns (PCP2) drains too (7c07e66fa, as in
+    # 96f078e78); only VLLM_PP_WAVE_ALWAYS_DRAIN=0 restores the pipelined launch.
+    wave, drains = _column_wave(monkeypatch, stage=1, column=0, received=1)
+    wave.warmup()
+    wave.start_forward(16)
+    assert drains == [None] * 3 and wave.launches == 3
+
+    monkeypatch.setenv("VLLM_PP_WAVE_ALWAYS_DRAIN", "0")
     wave, drains = _column_wave(monkeypatch, stage=1, column=0, received=1)
     wave.warmup()
     wave.start_forward(16)
@@ -564,7 +572,11 @@ def test_only_a_first_stage_of_several_chips_launches_from_the_helper_thread(
 ):
     wave, _ = _column_wave(monkeypatch, stage=0, column=0, received=1, chips=2)
     assert wave.async_handoff
+    # One chip, two columns: drains, so stage 0 launches from the helper too.
     wave, _ = _column_wave(monkeypatch, stage=0, column=0, received=1)
-    assert not wave.async_handoff
+    assert wave.async_handoff
     wave, _ = _column_wave(monkeypatch, stage=1, column=0, received=1, chips=2)
+    assert not wave.async_handoff
+    monkeypatch.setenv("VLLM_PP_WAVE_ALWAYS_DRAIN", "0")
+    wave, _ = _column_wave(monkeypatch, stage=0, column=0, received=1)
     assert not wave.async_handoff

@@ -1188,6 +1188,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         from vllm_torchtpu.layers.adapter.fused_moe_ep import (
             fused_moe_ep,
             fused_moe_ep_supported,
+            fused_scale_operands,
             score_bias_operand,
         )
         from vllm_torchtpu.layers.adapter.fused_moe_ep_v3 import (
@@ -1200,8 +1201,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 x,
                 layer.w13_weight,
                 layer.w2_weight,
-                layer.w13_weight_scale_inv,
-                layer.w2_weight_scale_inv,
+                *fused_scale_operands(layer),
                 router_logits,
                 score_bias_operand(layer),
             )

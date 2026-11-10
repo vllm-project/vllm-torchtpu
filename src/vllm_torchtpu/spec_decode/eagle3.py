@@ -2781,6 +2781,13 @@ class Eagle3Proposer:
                 draft_input_ids,
                 gather_indices,
                 num_valid_gathers=num_reqs,
+                # Non-blocking staged uploads (TPU_PCP_LOCALIZE_SYNC_UPLOAD=1
+                # restores the synchronous torch.tensor copies for A/B).
+                upload=(
+                    None
+                    if os.environ.get("TPU_PCP_LOCALIZE_SYNC_UPLOAD", "0") == "1"
+                    else (lambda host: _h2d_temp(runner, torch.from_numpy(host)))
+                ),
             )
         )
 

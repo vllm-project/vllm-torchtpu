@@ -503,7 +503,7 @@ def _compute_waits(
             cfgs.model.num_kv_heads
             * cfgs.aligned_num_q_heads_per_kv_head
             * 128
-            * jnp.dtype(cfgs.serve.dtype_out).itemsize
+            * cfgs.serve.lse_dtype.itemsize
         )
         schedule.total_wait_lse_out[step] = (
             o_out_tokens * lse_bytes_per_token

@@ -32,7 +32,6 @@ owned chunk == one kernel page), and both peers run the same
 
 import dataclasses
 import hashlib
-import importlib.metadata
 import json
 import math
 from collections.abc import Callable, Mapping, Sequence
@@ -1007,7 +1006,11 @@ def measured_sol_layout_fingerprint(
             "seq-on-lane FA layout failed E0' element-size "
             f"gate: measured={element_bits} expected=8"
         )
-    version = package_version or importlib.metadata.version
+    from vllm_torchtpu.distributed.kv_transfer.raiden.layout_fingerprint import (
+        fingerprint_package_version,
+    )
+
+    version = fingerprint_package_version(package_version)
     qk_pair = bool(getattr(tpu_envs, "TPU_GDN_CONV_QK_PAIR_LAYOUT", True))
     payload = {
         "schema": SOL_FINGERPRINT_SCHEMA,

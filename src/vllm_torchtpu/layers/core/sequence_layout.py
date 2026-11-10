@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Protocol, cast
 
+from collections.abc import Callable
+
 import numpy as np
 import torch
 
@@ -108,8 +110,18 @@ class SequenceLayoutPlan:
         request_major_gather_indices: torch.Tensor,
         *,
         num_valid_gathers: int,
+        upload: "Callable[[np.ndarray], torch.Tensor] | None" = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Localize request-major tokens and request-aligned gather values."""
+        """Localize request-major tokens and request-aligned gather values.
+
+        ``upload`` (optional) moves the two host index arrays to the device.
+        The default, ``torch.tensor(..., device=...)``, is a synchronous copy
+        on torch_tpu, so on the last pipeline stage the MTP draft's input prep
+        blocks until the stage forward drains (about 134 ms of host time per
+        step in job F), and the device then idles while the host finishes the
+        draft and the next step. Passing the runner's non-blocking staged
+        upload (``tpu_runner._h2d_temp``) keeps the host ahead of the device.
+        """
         if self.kind is SequenceLayoutKind.ALL:
             return request_major_token_tensor, request_major_gather_indices
 
@@ -147,6 +159,7 @@ class SequenceLayoutPlan:
             padded_request_to_packed,
             local_start,
             local_end,
+            upload=upload,
         )
 
     def aggregate_request_aligned_tensor(
@@ -175,13 +188,16 @@ def _localize_token_tensor_and_gather_indices(
     request_to_packed: np.ndarray,
     local_start: int,
     local_end: int,
+    *,
+    upload: "Callable[[np.ndarray], torch.Tensor] | None" = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pure tensor transform shared by all partial sequence layout plans."""
-    source_indices = torch.tensor(
-        local_packed_to_request,
-        dtype=torch.long,
-        device=request_major_token_tensor.device,
-    )
+    if upload is None:
+
+        def upload(host: np.ndarray, device=request_major_token_tensor.device):
+            return torch.tensor(host, dtype=torch.long, device=device)
+
+    source_indices = upload(np.ascontiguousarray(local_packed_to_request, dtype=np.int64))
     source_valid = source_indices.ge(0)
     safe_source_indices = source_indices.clamp_min(0)
     local_tokens = torch.index_select(
@@ -194,11 +210,7 @@ def _localize_token_tensor_and_gather_indices(
         torch.zeros_like(local_tokens),
     )
 
-    request_to_packed_tensor = torch.tensor(
-        request_to_packed,
-        dtype=torch.long,
-        device=request_major_gather_indices.device,
-    )
+    request_to_packed_tensor = upload(np.ascontiguousarray(request_to_packed, dtype=np.int64))
     request_gathers = request_major_gather_indices.to(torch.long)
     gather_valid = request_gathers.ge(0)
     safe_request_gathers = request_gathers.clamp_min(0)
@@ -242,6 +254,15 @@ class SequenceLayoutPlanner(Protocol):
         padded_num_reqs: int,
     ) -> SequenceLayoutPlan: ...
 
+    def padded_num_tokens(
+        self,
+        *,
+        runner: Any,
+        scheduler_output: Any,
+        start_index: int,
+        num_scheduled_tokens_per_req: Any,
+    ) -> int: ...
+
     def prepare_dummy(
         self,
         *,
@@ -273,6 +294,18 @@ def _first_ge(paddings: list[int] | tuple[int, ...], value: int) -> int:
             f"max_compile_bucket={paddings[-1] if paddings else None}."
         )
     return int(paddings[index])
+
+
+def _all_padded_num_tokens(runner: Any, total_num_scheduled_tokens: int) -> int:
+    """The token bucket of a chunk every device holds whole, raised to the
+    data-parallel step's bucket."""
+    padded_num_tokens = _first_ge(
+        runner.num_tokens_paddings, int(total_num_scheduled_tokens)
+    )
+    dp_target_bucket = runner._dp_target_bucket
+    if dp_target_bucket is not None and dp_target_bucket > padded_num_tokens:
+        padded_num_tokens = int(dp_target_bucket)
+    return padded_num_tokens
 
 
 class AllSequenceLayoutPlanner:
@@ -315,12 +348,9 @@ class AllSequenceLayoutPlanner:
             target_num_reqs,
             padded_num_reqs,
         )
-        padded_num_tokens = _first_ge(
-            runner.num_tokens_paddings, int(total_num_scheduled_tokens)
+        padded_num_tokens = _all_padded_num_tokens(
+            runner, int(total_num_scheduled_tokens)
         )
-        dp_target_bucket = runner._dp_target_bucket
-        if dp_target_bucket is not None and dp_target_bucket > padded_num_tokens:
-            padded_num_tokens = int(dp_target_bucket)
 
         return SequenceLayoutPlan(
             descriptor=DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR,
@@ -330,6 +360,19 @@ class AllSequenceLayoutPlanner:
             local_num_tokens=int(total_num_scheduled_tokens),
             local_padded_num_tokens=padded_num_tokens,
         )
+
+    def padded_num_tokens(
+        self,
+        *,
+        runner: Any,
+        scheduler_output: Any,
+        start_index: int,
+        num_scheduled_tokens_per_req: Any,
+    ) -> int:
+        """The ``local_padded_num_tokens`` of the plan ``prepare_real``
+        builds for this chunk, computed without staging anything."""
+        del scheduler_output, start_index
+        return _all_padded_num_tokens(runner, int(num_scheduled_tokens_per_req.sum()))
 
     def prepare_dummy(
         self,

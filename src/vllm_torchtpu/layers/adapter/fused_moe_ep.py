@@ -75,6 +75,29 @@ logger = init_logger(__name__)
 # rounds to. The kernel's routing tables are built against this value, so it
 # is not free to change here alone.
 _TILE_M = 128
+# The tile heights MOE_FUSED_EP_V2_TILE_M may select: powers of two, so the
+# kernel's tile shift exists, and each a whole number of the four rung steps.
+_TILE_M_CHOICES = (128, 256, 512)
+
+
+def _tile_m() -> int:
+    """The capacity this process builds the fused op at.
+
+    MOE_FUSED_EP_V2_TILE_M=0 (the default) is `_TILE_M`, the value every
+    deployment ran before the knob existed. A larger tile keeps the kernel's
+    tail-tile rungs and push_from_vmem on at larger steps: both are built
+    only while the shard slab bound, about tokens * topk, fits ep * local
+    experts * tile. Anything outside `_TILE_M_CHOICES` refuses by name rather
+    than building a kernel nobody measured.
+    """
+    tile_m = envs.MOE_FUSED_EP_V2_TILE_M or _TILE_M
+    if tile_m not in _TILE_M_CHOICES:
+        raise ValueError(
+            f"MOE_FUSED_EP_V2_TILE_M={envs.MOE_FUSED_EP_V2_TILE_M} is not one "
+            f"of {_TILE_M_CHOICES} (or 0 for {_TILE_M})"
+        )
+    return tile_m
+
 
 # SMEM used by the resident routing tables and Mosaic's scalar working set,
 # excluding the two fixed token-gather windows. Measured by subtracting the
@@ -118,6 +141,13 @@ _RANK_BUFFER: Any = None
 # (`Fp8Config.get_quant_method`), so this is per-layer state without a registry
 # that has to be torn down between models in one process.
 FUSED_MOE_EP_OP_ATTR = "_fused_moe_ep_op"
+# MO3b (MOE_FUSED_EP_V2_PREQUANT): the op variant that takes the activation rows
+# already quantized, recorded by prebuild on the LAYER it was asked about (the
+# routed experts module), and the per-call hand-off the post-attention norm/SE
+# op stages on the layer's quant method for `fused_moe_ep` to consume. See
+# `stage_fused_moe_ep_prequant`.
+FUSED_MOE_EP_PREQUANT_OP_ATTR = "_fused_moe_ep_prequant_op"
+_STAGED_PREQUANT_ATTR = "_fused_moe_ep_staged_prequant"
 
 
 def _squeeze_channel_scale(
@@ -181,15 +211,26 @@ def _build_op(
     *,
     token_replica_groups=None,
     sorted_gather=None,
+    has_prequant=False,
 ):
     """The op for this closure, built once per distinct closure and reused.
 
     `sorted_gather` is `ep_sorted_gather_group()`'s (group, positions), or
     None for the single fused program. With it the op is a `_SortedGatherOp`.
+
+    `has_prequant` builds the MO3b variant: two more operands after the
+    others, the activation rows already quantized ([T, H/128, 128] fp8) and
+    their row scale ([T, 1] f32), sharded like x; the kernel skips its own
+    quant and x is dead in the program. Only the single fused program takes
+    them.
     """
+    if has_prequant and sorted_gather is not None:
+        raise ValueError("prequant needs the single fused program, not route/compute")
     from vllm_torchtpu.kernels.fused_moe.v2 import WeightFormat, fused_ep_moe_v2
 
+    tile_m = _tile_m()
     key = (
+        tile_m,
         topk,
         renormalize,
         activation,
@@ -203,6 +244,7 @@ def _build_op(
         has_hash_ids,
         token_replica_groups,
         None if sorted_gather is None else sorted_gather[1],
+        has_prequant,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -235,7 +277,7 @@ def _build_op(
             topk=topk,
             renormalize=renormalize,
             mesh=mesh,
-            capacity=_TILE_M,
+            capacity=tile_m,
             block=None,
             ragged_stride=None,
             weight_format=WeightFormat(weight_format),
@@ -303,6 +345,76 @@ def _build_op(
             hash_topk_ids=hash_ids.astype(jnp.int32),
         )
 
+    def moe_prequant(
+        x: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array,
+        w2_scale: jax.Array,
+        gating: jax.Array,
+        rank: jax.Array,
+        pq_rows: jax.Array,
+        pq_scale: jax.Array,
+    ) -> jax.Array:
+        return call(
+            x,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            gating,
+            rank,
+            prequant=(pq_rows, pq_scale),
+        )
+
+    def moe_with_score_bias_prequant(
+        x: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array,
+        w2_scale: jax.Array,
+        gating: jax.Array,
+        rank: jax.Array,
+        score_bias: jax.Array,
+        pq_rows: jax.Array,
+        pq_scale: jax.Array,
+    ) -> jax.Array:
+        return call(
+            x,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            gating,
+            rank,
+            score_bias=score_bias.astype(jnp.float32),
+            prequant=(pq_rows, pq_scale),
+        )
+
+    def moe_with_hash_ids_prequant(
+        x: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array,
+        w2_scale: jax.Array,
+        gating: jax.Array,
+        rank: jax.Array,
+        hash_ids: jax.Array,
+        pq_rows: jax.Array,
+        pq_scale: jax.Array,
+    ) -> jax.Array:
+        return call(
+            x,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            gating,
+            rank,
+            hash_topk_ids=hash_ids.astype(jnp.int32),
+            prequant=(pq_rows, pq_scale),
+        )
+
     assert not (has_score_bias and has_hash_ids)
     spec = PartitionSpec(EP_AXIS_NAME)
     # The score-correction bias is indexed by GLOBAL expert id and read by
@@ -317,6 +429,7 @@ def _build_op(
         (spec,) * 7
         + ((PartitionSpec(),) if has_score_bias else ())
         + ((spec,) if has_hash_ids else ())
+        + ((spec, spec) if has_prequant else ())
     )
     # Stock jax_op. It used to size its outputs from the export's avals, where
     # a shard_map result is recorded as replicated, so this rank's 2048 rows
@@ -325,17 +438,18 @@ def _build_op(
     # takes output_partition_specs itself now, which is the same information
     # without a copy of anyone's source.
     if has_score_bias:
-        fn = moe_with_score_bias
+        fn = moe_with_score_bias_prequant if has_prequant else moe_with_score_bias
     elif has_hash_ids:
-        fn = moe_with_hash_ids
+        fn = moe_with_hash_ids_prequant if has_prequant else moe_with_hash_ids
     else:
-        fn = moe
+        fn = moe_prequant if has_prequant else moe
     op = jax_op(
         name,
         fn,
         mesh=mesh,
         # x, w1, w2, w1_scale, w2_scale, gating, rank [, score_bias | hash_ids]
-        # -- and the single output is sharded on axis 0 like x.
+        # [, pq_rows, pq_scale] -- and the single output is sharded on axis 0
+        # like x.
         input_partition_specs=input_specs,
         output_partition_specs=spec,
     )
@@ -576,8 +690,27 @@ def fused_moe_ep(
     thing on the layer -- prebuild built the op's signature around that.
     Getting it wrong is a torch arity error at the first call, not a wrong
     answer.
+
+    A hand-off staged by `stage_fused_moe_ep_prequant` is consumed here, on
+    this call and only this one: the prequant op variant serves it, with the
+    staged rows and scale as its last two operands, and `hidden_states` is
+    then only a shape stand-in.
     """
-    op = getattr(owner, FUSED_MOE_EP_OP_ATTR)
+    staged = getattr(owner, _STAGED_PREQUANT_ATTR, None)
+    if staged is None:
+        op = getattr(owner, FUSED_MOE_EP_OP_ATTR)
+        prequant = ()
+    else:
+        # Cleared before anything can fail, so a stale hand-off can never
+        # serve a later call or another layer.
+        setattr(owner, _STAGED_PREQUANT_ATTR, None)
+        op, pq_rows, pq_scale = staged
+        if pq_rows.dtype != torch.float8_e4m3fn or pq_scale.dtype != torch.float32:
+            raise TypeError(
+                "fused_moe_ep prequant takes float8_e4m3fn rows and a float32 row "
+                f"scale; got {pq_rows.dtype} and {pq_scale.dtype}"
+            )
+        prequant = (pq_rows, pq_scale)
     if w1.dtype == torch.float4_e2m1fn_x2:
         # FP4 scales are already [E, K/block, N]. Even a single block must
         # retain its axis; the per-channel helper would incorrectly drop it.
@@ -595,7 +728,74 @@ def fused_moe_ep(
     if envs.TPU_MOE_SKIP_PADDED_TOKENS:
         router_logits = token_padding.mask_router_logits_for_padding(router_logits)
     extra = tuple(t for t in (score_bias, hash_ids) if t is not None)
-    return op(hidden_states, w1, w2, *scales, router_logits, _RANK_BUFFER, *extra)
+    return op(
+        hidden_states, w1, w2, *scales, router_logits, _RANK_BUFFER, *extra, *prequant
+    )
+
+
+def fused_moe_ep_prequant_target(moe_block: Any) -> Any | None:
+    """The routed-experts layer to hand pre-quantized rows to, or None.
+
+    `moe_block` is the model's sparse MoE block (`layer.mlp`). Non-None only
+    where serving this block's experts will reach `fused_moe_ep` with an
+    owner that prebuild armed AND gave the prequant variant
+    (MOE_FUSED_EP_V2_PREQUANT): only then may the caller pass a shape
+    stand-in as the experts' hidden states. Takes no tensor, so a traced
+    forward decides it once per layer, from load-time state.
+    """
+    experts = getattr(moe_block, "experts", None)
+    routed = getattr(experts, "routed_experts", experts)
+    if getattr(routed, FUSED_MOE_EP_PREQUANT_OP_ATTR, None) is None:
+        return None
+    owner = getattr(routed, "quant_method", None)
+    # fp8's apply_monolithic serves the adaptive kernel before it asks about
+    # this one; that path would read the stand-in as real rows.
+    if (
+        owner is None
+        or not envs.USE_MOE_FUSED_EP_KERNEL
+        or not fused_moe_ep_supported(owner)
+        or getattr(owner, "_use_adaptive_fused_moe", False)
+    ):
+        return None
+    return routed
+
+
+def stage_fused_moe_ep_prequant(
+    target: Any, rows: torch.Tensor, scale: torch.Tensor
+) -> None:
+    """Hand this call's pre-quantized activation rows to the next `fused_moe_ep`.
+
+    `target` is `fused_moe_ep_prequant_target`'s answer. `rows` is
+    [T, H/128, 128] float8_e4m3fn and `scale` [T, 1] float32 for exactly the
+    rows the experts are then called with, computed bit for bit as the
+    kernel's own row quant would (MO3b spec: the pod's fused norm + quant, K1).
+    Staged on the layer's quant method -- the owner `fused_moe_ep` is handed
+    -- and consumed by the very next call; check with
+    `fused_moe_ep_prequant_pending` after the experts ran.
+    """
+    setattr(
+        target.quant_method,
+        _STAGED_PREQUANT_ATTR,
+        (getattr(target, FUSED_MOE_EP_PREQUANT_OP_ATTR), rows, scale),
+    )
+
+
+def fused_moe_ep_prequant_pending(target: Any) -> bool:
+    """True if a staged hand-off was not consumed (a caller bug: fail on it)."""
+    return getattr(target.quant_method, _STAGED_PREQUANT_ATTR, None) is not None
+
+
+def _prequant_refusal(weight_format, token_replica_groups, sorted_gather) -> str | None:
+    """Why the prequant variant cannot serve this deployment, or None."""
+    if weight_format != "fp8":
+        return f"its rows are the fp8 row quant; weight format is {weight_format}"
+    if sorted_gather is not None:
+        return "MOE_FUSED_EP_SORTED_GATHER splits the layer into route/compute"
+    if token_replica_groups and len(token_replica_groups[0]) > 1:
+        return "token replica groups split each shard's rows inside the program"
+    if envs.MOE_FUSED_EP_V2_QUANT_KERNEL:
+        return "MOE_FUSED_EP_V2_QUANT_KERNEL quantizes inside the program"
+    return None
 
 
 def _simulated_routing_operands(
@@ -662,6 +862,46 @@ def register_fused_scale_buffers(layer) -> None:
         tables.append(table)
     if tables[0].device.type == "tpu":
         synchronize_tensors(tables)
+
+
+# MOE_FUSED_EP_V2_STAGE_SCALES: the [E, N] bases `register_fp8_scale_buffers`
+# stages the fp8 per-channel weight scales under; `fused_scale_operands` hands
+# them to `fused_moe_ep`.
+FUSED_FP8_SCALE_ATTRS = ("_tpu_fused_fp8_w13_scale", "_tpu_fused_fp8_w2_scale")
+
+
+def register_fp8_scale_buffers(layer) -> None:
+    """Stage the fp8 per-channel weight scales as the `[E, N]` tables the op takes.
+
+    The loader's scales are `[E, 1, 1, N]` f32. Handed to the op as they are,
+    `fused_moe_ep` squeezes them inside the step, and the padded 4-D layout is
+    compacted for the kernel on every call: measured on base13 (r1pmoe5, PP0
+    rank0) as two copies, f32[256,1,1,4096] and f32[256,1,1,2048], 3.8 ms per
+    round. As `register_fused_scale_buffers` does for fp4, each table is copied
+    once into a base tensor of its own and the 4-D parameter becomes a view of
+    it, so other readers see the same shape and values and no second copy is
+    kept; callers then hand the op the base (`fused_scale_operands`).
+    """
+    tables = []
+    for param, buf in zip(("w13_weight_scale_inv", "w2_weight_scale_inv"), FUSED_FP8_SCALE_ATTRS):
+        scale = getattr(layer, param)
+        table = fresh_buffer(_squeeze_channel_scale_checked(scale))
+        if table.ndim != 2:
+            raise ValueError(f"{param} {tuple(scale.shape)} is not a per-channel [E, 1, 1, N] scale")
+        layer.register_buffer(buf, table, persistent=False)
+        setattr(layer, param, torch.nn.Parameter(table.view(scale.shape), requires_grad=False))
+        tables.append(table)
+    if tables[0].device.type == "tpu":
+        synchronize_tensors(tables)
+
+
+def fused_scale_operands(layer) -> tuple[torch.Tensor, torch.Tensor]:
+    """The (w13, w2) scales to hand `fused_moe_ep` for an fp8 layer: the staged
+    `[E, N]` bases where prebuild staged them, else the layer's parameters."""
+    w13 = getattr(layer, FUSED_FP8_SCALE_ATTRS[0], None)
+    if w13 is None:
+        return layer.w13_weight_scale_inv, layer.w2_weight_scale_inv
+    return w13, getattr(layer, FUSED_FP8_SCALE_ATTRS[1])
 
 
 # The buffer `register_score_bias_buffer` stages the bias operand under, and
@@ -833,7 +1073,7 @@ def prebuild_fused_moe_ep(
         ep_sorted_gather_group() if envs.MOE_FUSED_EP_SORTED_GATHER else None
     )
 
-    gather_bytes = token_gather_smem_bytes(_TILE_M)
+    gather_bytes = token_gather_smem_bytes(_tile_m())
     needed_smem = _SMEM_OVERHEAD_BYTES + gather_bytes
     smem = _smem_capacity_bytes()
     if needed_smem > smem:
@@ -857,6 +1097,7 @@ def prebuild_fused_moe_ep(
     )
     mesh_expert_order = _mesh_expert_order(ep)
 
+    weights_are_layers = weights is None
     if weights is None:
         if weight_format == "fp4":
             weights = (
@@ -958,7 +1199,7 @@ def prebuild_fused_moe_ep(
         ep,
         pcp,
         topk,
-        _TILE_M,
+        _tile_m(),
         sharded_plan,
         weight_format,
         rhs_qb,
@@ -979,6 +1220,34 @@ def prebuild_fused_moe_ep(
             "its own program.",
             envs.TPU_MOE_COLLECTION_CHUNK_SIZE,
         )
+    if envs.MOE_FUSED_EP_V2_STAGE_SCALES and weight_format == "fp8" and weights_are_layers:
+        register_fp8_scale_buffers(layer)
+    if envs.MOE_FUSED_EP_V2_PREQUANT:
+        why = _prequant_refusal(weight_format, token_replica_groups, sorted_gather)
+        if why is None:
+            pq_op = _build_op(
+                mesh,
+                topk,
+                renormalize,
+                activation,
+                mesh_expert_order,
+                sharded_plan,
+                weight_format,
+                rhs_qb,
+                scoring_fn,
+                has_score_bias,
+                routed_scale,
+                has_hash_ids,
+                token_replica_groups=token_replica_groups,
+                sorted_gather=sorted_gather,
+                has_prequant=True,
+            )
+            setattr(layer, FUSED_MOE_EP_PREQUANT_OP_ATTR, pq_op)
+            logger.info_once("Fused EP MoE: prequant op variant built (MO3b)")
+        else:
+            logger.warning_once(
+                "Fused EP MoE: MOE_FUSED_EP_V2_PREQUANT not in effect: %s", why
+            )
     return op
 
 

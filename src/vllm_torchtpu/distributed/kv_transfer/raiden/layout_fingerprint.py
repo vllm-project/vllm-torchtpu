@@ -12,10 +12,12 @@ from __future__ import annotations
 import hashlib
 import importlib.metadata
 import json
+import os
 from collections.abc import Callable, Mapping
 from typing import Any
 
 from vllm_torchtpu import envs as tpu_envs
+from vllm_torchtpu.logger import init_logger
 
 from .pool_manifest import (
     TAG_DSA_IDX,
@@ -49,6 +51,83 @@ FA_LAYOUT_FINGERPRINT_SCHEMA = "qwen35-fa-raw-layout-fingerprint-v1"
 GLM_MLA_LAYOUT_FINGERPRINT_SCHEMA = "glm-mla-raw-layout-fingerprint-v1"
 KIMI_K3_LAYOUT_FINGERPRINT_SCHEMA = "kimi-k3-row-layout-fingerprint-v1"
 DSV4_LAYOUT_FINGERPRINT_SCHEMA = "dsv4-raw-layout-fingerprint-v1"
+
+logger = init_logger(__name__)
+
+# Producer-side escape hatch for a P/D pair whose legs run different runtime
+# builds (default off). Set on the producer only, to the consumer's versions.
+FINGERPRINT_VERSION_OVERRIDE_ENV = "TPU_RAIDEN_FINGERPRINT_VERSION_OVERRIDE"
+_FINGERPRINT_VERSION_PACKAGES = ("torch_tpu", "libtpu")
+
+
+def parse_fingerprint_version_override(value: str | None) -> dict[str, str] | None:
+    """Parse ``torch_tpu=<version>,libtpu=<version>``; None when unset or blank.
+
+    Fails closed: a malformed value raises rather than being ignored, so a typo
+    can neither fall back to the installed versions nor half-override them.
+    """
+    if value is None or not value.strip():
+        return None
+    usage = (
+        f"{FINGERPRINT_VERSION_OVERRIDE_ENV} must be "
+        f"'torch_tpu=<version>,libtpu=<version>'; got {value!r}"
+    )
+    parsed: dict[str, str] = {}
+    for item in value.split(","):
+        name, sep, ver = item.partition("=")
+        name, ver = name.strip(), ver.strip()
+        if not sep or not ver or name in parsed:
+            raise ValueError(usage)
+        if name not in _FINGERPRINT_VERSION_PACKAGES:
+            raise ValueError(usage)
+        parsed[name] = ver
+    if set(parsed) != set(_FINGERPRINT_VERSION_PACKAGES):
+        raise ValueError(usage)
+    return parsed
+
+
+def _log_version_override(
+    override: Mapping[str, str], installed: Callable[[str], str]
+) -> None:
+    actual: dict[str, str] = {}
+    for name in _FINGERPRINT_VERSION_PACKAGES:
+        try:
+            actual[name] = installed(name)
+        except Exception as exc:  # noqa: BLE001 - logging only
+            actual[name] = f"<unavailable: {type(exc).__name__}>"
+    logger.warning(
+        "[RAIDEN_FP_VERSION_OVERRIDE] %s is set: the layout fingerprint reports "
+        "torch_tpu=%s libtpu=%s instead of the installed torch_tpu=%s libtpu=%s. "
+        "Layout facts are still measured and gated; the GDN pool layouts and "
+        "the cross-version data plane are NOT covered by the fingerprint and "
+        "must be validated end to end.",
+        FINGERPRINT_VERSION_OVERRIDE_ENV,
+        override["torch_tpu"],
+        override["libtpu"],
+        actual["torch_tpu"],
+        actual["libtpu"],
+    )
+
+
+def fingerprint_package_version(
+    package_version: Callable[[str], str] | None = None,
+) -> Callable[[str], str]:
+    """Version source for every layout fingerprint payload.
+
+    The installed versions (or the injected ``package_version``) unless
+    ``TPU_RAIDEN_FINGERPRINT_VERSION_OVERRIDE`` is set. The override replaces
+    only the ``torch_tpu`` / ``libtpu`` strings: every layout fact is still
+    measured, gated and hashed, so a peer with a different physical layout
+    still fails closed at plan time.
+    """
+    installed = package_version or importlib.metadata.version
+    override = parse_fingerprint_version_override(
+        os.environ.get(FINGERPRINT_VERSION_OVERRIDE_ENV)
+    )
+    if override is None:
+        return installed
+    _log_version_override(override, installed)
+    return lambda name: override[name] if name in override else installed(name)
 
 
 def canonical_layout_fingerprint(value: str | Mapping[str, Any]) -> str:
@@ -166,7 +245,7 @@ def measured_fa_layout_fingerprint(
             f"measured={element_bits} expected=8"
         )
 
-    version = package_version or importlib.metadata.version
+    version = fingerprint_package_version(package_version)
     payload = {
         "schema": FA_LAYOUT_FINGERPRINT_SCHEMA,
         "torch_tpu": version("torch_tpu"),
@@ -198,11 +277,14 @@ __all__ = [
     "KIMI_K3_LAYOUT_FINGERPRINT_SCHEMA",
     "canonical_layout_fingerprint",
     "expected_fa_minor_to_major",
+    "FINGERPRINT_VERSION_OVERRIDE_ENV",
     "fa_page_tokens",
+    "fingerprint_package_version",
     "measured_dsv4_layout_fingerprint",
     "measured_fa_layout_fingerprint",
     "measured_glm_layout_fingerprint",
     "measured_kimi_k3_layout_fingerprint",
+    "parse_fingerprint_version_override",
 ]
 
 
@@ -222,7 +304,7 @@ def measured_kimi_k3_layout_fingerprint(
         raise ValueError("state_fragments must be positive")
     if not any(pool.tag == TAG_FA for pool in manifest.pools):
         raise ValueError("Kimi layout fingerprint requires an FA pool")
-    version = package_version or importlib.metadata.version
+    version = fingerprint_package_version(package_version)
     payload: dict[str, Any] = {
         "schema": KIMI_K3_LAYOUT_FINGERPRINT_SCHEMA,
         "torch_tpu": version("torch_tpu"),
@@ -289,7 +371,7 @@ def measured_glm_layout_fingerprint(
     )
     if not hash_indexer:
         layouts.pop(TAG_DSA_IDX, None)
-    version = package_version or importlib.metadata.version
+    version = fingerprint_package_version(package_version)
     payload = {
         "schema": GLM_MLA_LAYOUT_FINGERPRINT_SCHEMA,
         "torch_tpu": version("torch_tpu"),
@@ -314,7 +396,7 @@ def measured_dsv4_layout_fingerprint(
     layouts = _measure_packed_row_layouts(
         manifest, page_tokens=None, layout_getter=layout_getter, include_page_shape=True
     )
-    version = package_version or importlib.metadata.version
+    version = fingerprint_package_version(package_version)
     payload = {
         "schema": DSV4_LAYOUT_FINGERPRINT_SCHEMA,
         "torch_tpu": version("torch_tpu"),

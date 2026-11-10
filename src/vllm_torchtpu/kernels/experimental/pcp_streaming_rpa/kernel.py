@@ -21,6 +21,7 @@ the same schedule and communication once per head pair.
 """
 
 import functools
+import os
 import math
 
 import jax
@@ -64,6 +65,7 @@ def _copy_hnd_token_slice(
     *,
     source_hbm,
     destination_hbm,
+    partial_only=False,
 ):
     """Copy HND tokens using aligned DMA and bit-preserving VMEM stitching.
 
@@ -71,6 +73,9 @@ def _copy_hnd_token_slice(
     destination tiles are read-modify-written sequentially: other segments
     may share a tile, and bytes outside this slice must survive unchanged.
     Only three 128-token scratch tiles are needed, independent of cache size.
+    ``partial_only``: the caller only passes unaligned slices, so the aligned
+    branch is not emitted (it is dead there; it also has the only dynamic-size
+    DMA, which interpret mode cannot run).
     """
     alignment = TPU_KV_DMA_ALIGNMENT
     aligned = (
@@ -79,18 +84,20 @@ def _copy_hnd_token_slice(
         & (length % alignment == 0)
     )
 
-    @pl.when(aligned & (length > 0))
-    def _aligned_copy():
-        src = pl.multiple_of(source_start, alignment)
-        dst = pl.multiple_of(destination_start, alignment)
-        size = pl.multiple_of(length, alignment)
-        op = pltpu.make_async_copy(
-            src_ref.at[:, :, :, pl.ds(src, size)],
-            dst_ref.at[:, :, :, pl.ds(dst, size)],
-            sem,
-        )
-        op.start()
-        op.wait()
+    if not partial_only:
+
+        @pl.when(aligned & (length > 0))
+        def _aligned_copy():
+            src = pl.multiple_of(source_start, alignment)
+            dst = pl.multiple_of(destination_start, alignment)
+            size = pl.multiple_of(length, alignment)
+            op = pltpu.make_async_copy(
+                src_ref.at[:, :, :, pl.ds(src, size)],
+                dst_ref.at[:, :, :, pl.ds(dst, size)],
+                sem,
+            )
+            op.start()
+            op.wait()
 
     @pl.when(~aligned & (length > 0))
     def _partial_copy():
@@ -199,10 +206,16 @@ def _pcp_write_captured_kv_seq_along_lane_kernel(
     kv_cache_out_ref,
     dma_sem,
 ):
-    """Scatter HND segments, preserving partial tiles and earlier segments."""
+    """Scatter HND segments, preserving partial tiles and earlier segments.
+
+    A 5-D ``captured_kv_ref`` [R, A, B, C, W] is a row stack (the raw PCP
+    all-gather): source column ``s`` is row ``s // W``, lane ``s % W``, and no
+    segment may cross a row.
+    """
     del kv_cache_in_ref
     num_segments = jnp.clip(num_segments_ref[0], 0, segment_descriptors_ref.shape[1])
     page_size = kv_cache_out_ref.shape[-1]
+    stacked = len(captured_kv_ref.shape) == 5
 
     @pl.loop(0, num_segments)
     def _write_segment(segment_idx):
@@ -211,8 +224,14 @@ def _pcp_write_captured_kv_seq_along_lane_kernel(
         segment_len = segment_descriptors_ref[2, segment_idx]
         page = destination_start // page_size
         offset = destination_start % page_size
+        source_ref = captured_kv_ref
+        if stacked:
+            width = captured_kv_ref.shape[-1]
+            row = source_start // width
+            source_ref = captured_kv_ref.at[row]
+            source_start = source_start - row * width
         _copy_hnd_token_slice(
-            captured_kv_ref,
+            source_ref,
             kv_cache_out_ref.at[page],
             source_start,
             offset,
@@ -223,6 +242,215 @@ def _pcp_write_captured_kv_seq_along_lane_kernel(
         )
 
 
+def write_batch_enabled() -> bool:
+    """The SEQ_ALONG_LANE write kernel starts every aligned (whole-tile) segment's DMA
+    back to back on its own semaphore and waits for them all at the end, instead of
+    start-then-wait per segment; partial (read-modify-write) segments stay serialized
+    on the other semaphore. On with TPU_PCP_WRITE_BATCH=1 or TPU_PCP_PAGE_MAJOR_FRESH_KV=1
+    (whose page-row source makes every aligned tile one contiguous page copy).
+    Segments write disjoint cache cells and stop at page boundaries, so an aligned
+    segment owns its whole tile and no partial segment touches it."""
+    return (os.environ.get("TPU_PCP_WRITE_BATCH", "0") == "1"
+            or os.environ.get("TPU_PCP_PAGE_MAJOR_FRESH_KV", "0") == "1")
+
+
+def _pcp_write_captured_kv_seq_along_lane_batched_kernel(
+    num_segments_ref,
+    segment_descriptors_ref,
+    captured_kv_ref,
+    kv_cache_in_ref,
+    kv_cache_out_ref,
+    dma_sem,
+    batch_sem,
+):
+    """Aligned tiles batched on ``batch_sem``; partial segments read-modify-written
+    one at a time on ``dma_sem`` (a DMA semaphore counts bytes, so the serialized
+    waits must not share it with the batch)."""
+    del kv_cache_in_ref
+    num_segments = jnp.clip(num_segments_ref[0], 0, segment_descriptors_ref.shape[1])
+    page_size = kv_cache_out_ref.shape[-1]
+    stacked = len(captured_kv_ref.shape) == 5
+    align = TPU_KV_DMA_ALIGNMENT
+
+    def _segment(segment_idx):
+        source_start = segment_descriptors_ref[0, segment_idx]
+        destination_start = segment_descriptors_ref[1, segment_idx]
+        segment_len = segment_descriptors_ref[2, segment_idx]
+        page = destination_start // page_size
+        offset = destination_start % page_size
+        source_ref = captured_kv_ref
+        if stacked:
+            width = captured_kv_ref.shape[-1]
+            row = source_start // width
+            source_ref = captured_kv_ref.at[row]
+            source_start = source_start - row * width
+        aligned = (
+            (source_start % align == 0)
+            & (offset % align == 0)
+            & (segment_len % align == 0)
+            & (segment_len > 0)
+        )
+        return source_ref, source_start, page, offset, segment_len, aligned
+
+    def _tiles(segment_idx, start):
+        source_ref, source_start, page, offset, segment_len, aligned = _segment(segment_idx)
+
+        @pl.when(aligned)
+        def _():
+            @pl.loop(0, segment_len // align)
+            def _tile(k):
+                src = pl.multiple_of(source_start + k * align, align)
+                dst = pl.multiple_of(offset + k * align, align)
+                op = pltpu.make_async_copy(
+                    source_ref.at[:, :, :, pl.ds(src, align)],
+                    kv_cache_out_ref.at[page, :, :, :, pl.ds(dst, align)],
+                    batch_sem,
+                )
+                if start:
+                    op.start()
+                else:
+                    op.wait()
+
+    @pl.loop(0, num_segments)
+    def _start_aligned(segment_idx):
+        _tiles(segment_idx, start=True)
+
+    @pl.loop(0, num_segments)
+    def _partials(segment_idx):
+        source_ref, source_start, page, offset, segment_len, aligned = _segment(segment_idx)
+
+        @pl.when(jnp.logical_not(aligned) & (segment_len > 0))
+        def _():
+            _copy_hnd_token_slice(
+                source_ref,
+                kv_cache_out_ref.at[page],
+                source_start,
+                offset,
+                segment_len,
+                dma_sem,
+                source_hbm=True,
+                destination_hbm=True,
+                partial_only=True,
+            )
+
+    @pl.loop(0, num_segments)
+    def _wait_aligned(segment_idx):
+        _tiles(segment_idx, start=False)
+
+
+PAGE_ROW_RING_SLOTS = 4
+
+
+def page_rows_staged_write_enabled() -> bool:
+    """TPU_PCP_PAGE_MAJOR_FRESH_KV=1: a page-row source (row width == page) is written by
+    ``_pcp_write_page_rows_staged_kernel``: whole aligned pages go HBM -> VMEM -> HBM through a
+    small ring instead of hbm-to-hbm DMAs (l2wb j-4ea29090: 34 pages 139.5 -> 20.9 us/call)."""
+    return os.environ.get("TPU_PCP_PAGE_MAJOR_FRESH_KV", "0") == "1"
+
+
+def _pcp_write_page_rows_staged_kernel(
+    num_segments_ref,
+    segment_descriptors_ref,
+    captured_kv_ref,
+    kv_cache_in_ref,
+    kv_cache_out_ref,
+    dma_sem,
+    ring,
+    in_sem,
+    out_sem,
+    rows_ref,
+    pages_ref,
+):
+    """Write segments from a page-row stack [R, A, B, C, page] (row width == page).
+
+    1. Collect the aligned segments: with one-page rows an aligned segment is exactly one whole
+       row going to one whole cache page (segments never cross a row), so at most R of them.
+    2. Copy those pages row -> VMEM ring slot -> cache page; a slot is reused only after its
+       previous page has left VMEM. hbm-to-hbm DMAs run several times slower than this.
+    3. Read-modify-write the partial segments one at a time (as the other kernels do). Segments
+       write disjoint cache cells, so no partial segment touches a page the ring writes.
+    """
+    del kv_cache_in_ref
+    num_segments = jnp.clip(num_segments_ref[0], 0, segment_descriptors_ref.shape[1])
+    page_size = kv_cache_out_ref.shape[-1]
+    width = captured_kv_ref.shape[-1]
+    align = TPU_KV_DMA_ALIGNMENT
+    nbuf = ring.shape[0]
+
+    def _segment(segment_idx):
+        source_start = segment_descriptors_ref[0, segment_idx]
+        destination_start = segment_descriptors_ref[1, segment_idx]
+        segment_len = segment_descriptors_ref[2, segment_idx]
+        row = source_start // width
+        lane = source_start - row * width
+        page = destination_start // page_size
+        offset = destination_start % page_size
+        aligned = (lane % align == 0) & (offset % align == 0) & (segment_len % align == 0) & (segment_len > 0)
+        return row, lane, page, offset, segment_len, aligned
+
+    def _collect(segment_idx, count):
+        row, _, page, _, _, aligned = _segment(segment_idx)
+
+        @pl.when(aligned)
+        def _():
+            rows_ref[count] = row
+            pages_ref[count] = page
+
+        return count + aligned.astype(jnp.int32)
+
+    n_pages = lax.fori_loop(0, num_segments, _collect, jnp.int32(0))
+
+    def _in(j, slot):
+        return pltpu.make_async_copy(captured_kv_ref.at[rows_ref[j]], ring.at[slot], in_sem.at[slot])
+
+    def _out(j, slot):
+        return pltpu.make_async_copy(ring.at[slot], kv_cache_out_ref.at[pages_ref[j]], out_sem.at[slot])
+
+    @pl.loop(0, n_pages)
+    def _ring(j):
+        slot = j % nbuf
+
+        @pl.when(j >= nbuf)
+        def _():
+            _out(j - nbuf, slot).wait()
+
+        _in(j, slot).start()
+
+        @pl.when(j >= 1)
+        def _():
+            prev = (j - 1) % nbuf
+            _in(j - 1, prev).wait()
+            _out(j - 1, prev).start()
+
+    @pl.when(n_pages >= 1)
+    def _():
+        last = (n_pages - 1) % nbuf
+        _in(n_pages - 1, last).wait()
+        _out(n_pages - 1, last).start()
+
+    @pl.loop(jnp.maximum(n_pages - nbuf, 0), n_pages)
+    def _drain(j):
+        _out(j, j % nbuf).wait()
+
+    @pl.loop(0, num_segments)
+    def _partials(segment_idx):
+        row, lane, page, offset, segment_len, aligned = _segment(segment_idx)
+
+        @pl.when(jnp.logical_not(aligned) & (segment_len > 0))
+        def _():
+            _copy_hnd_token_slice(
+                captured_kv_ref.at[row],
+                kv_cache_out_ref.at[page],
+                lane,
+                offset,
+                segment_len,
+                dma_sem,
+                source_hbm=True,
+                destination_hbm=True,
+                partial_only=True,
+            )
+
+
 def write_captured_kv_to_local_cache(
     kv_cache: jax.Array,
     captured_kv: jax.Array,
@@ -230,12 +458,19 @@ def write_captured_kv_to_local_cache(
     num_segments: jax.Array,
     *,
     kv_layout: KVLayout = KVLayout.HEAD_ALONG_SUBLANE,
+    interpret: bool = False,
 ) -> jax.Array:
-    """Write ring-captured KV with one single-output donated Pallas call."""
+    """Write ring-captured KV with one single-output donated Pallas call.
+
+    SEQ_ALONG_LANE also accepts a row-stacked ``captured_kv`` [R, A, B, C, W]
+    (sources are flat columns ``row * W + lane``; segments must stay in a row).
+    """
     if kv_cache.ndim < 2:
         raise ValueError(f"KV cache must have at least two dims: {kv_cache.shape}.")
     if kv_layout == KVLayout.SEQ_ALONG_LANE:
-        if captured_kv.shape[:-1] != kv_cache.shape[1:-1]:
+        if captured_kv.ndim == kv_cache.ndim and captured_kv.shape[1:-1] == kv_cache.shape[1:-1]:
+            pass  # row stack
+        elif captured_kv.shape[:-1] != kv_cache.shape[1:-1]:
             raise ValueError(
                 "SEQ_ALONG_LANE captured KV prefix must match the paged cache "
                 f"head layout: {captured_kv.shape[:-1]} vs "
@@ -254,8 +489,26 @@ def write_captured_kv_to_local_cache(
 
     num_segments = jnp.asarray(num_segments, dtype=jnp.int32).reshape((1,))
     segment_descriptors = jnp.asarray(segment_descriptors, dtype=jnp.int32)
+    sems = (pltpu.SemaphoreType.DMA,)
+    kernel_name = "pcp_write_captured_kv_to_local_cache"
     if kv_layout == KVLayout.SEQ_ALONG_LANE:
         write_kernel = _pcp_write_captured_kv_seq_along_lane_kernel
+        page_rows = captured_kv.ndim == kv_cache.ndim and captured_kv.shape[-1] == kv_cache.shape[-1]
+        if page_rows and page_rows_staged_write_enabled():
+            write_kernel = _pcp_write_page_rows_staged_kernel
+            sems = (
+                pltpu.SemaphoreType.DMA,
+                pltpu.VMEM((PAGE_ROW_RING_SLOTS,) + captured_kv.shape[1:], captured_kv.dtype),
+                pltpu.SemaphoreType.DMA((PAGE_ROW_RING_SLOTS,)),
+                pltpu.SemaphoreType.DMA((PAGE_ROW_RING_SLOTS,)),
+                pltpu.SMEM((captured_kv.shape[0],), jnp.int32),
+                pltpu.SMEM((captured_kv.shape[0],), jnp.int32),
+            )
+            kernel_name = "pcp_write_captured_kv_to_local_cache_staged"
+        elif write_batch_enabled():
+            write_kernel = _pcp_write_captured_kv_seq_along_lane_batched_kernel
+            sems = (pltpu.SemaphoreType.DMA, pltpu.SemaphoreType.DMA)
+            kernel_name = "pcp_write_captured_kv_to_local_cache_batched"
         writeback_cache = kv_cache
     else:
         write_kernel = _pcp_write_captured_kv_kernel
@@ -270,14 +523,17 @@ def write_captured_kv_to_local_cache(
                 pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
             ),
             out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
-            scratch_shapes=(pltpu.SemaphoreType.DMA,),
+            scratch_shapes=sems,
             grid=(1,),
         ),
         input_output_aliases={3: 0},
-        compiler_params=pltpu.CompilerParams(
-            vmem_limit_bytes=pltpu.get_tpu_info().vmem_capacity_bytes
+        compiler_params=(
+            None if interpret else pltpu.CompilerParams(
+                vmem_limit_bytes=pltpu.get_tpu_info().vmem_capacity_bytes
+            )
         ),
-        name="pcp_write_captured_kv_to_local_cache",
+        interpret=interpret,
+        name=kernel_name,
     )(num_segments, segment_descriptors, captured_kv, writeback_cache)
     return updated_cache.reshape(kv_cache.shape)
 
@@ -1324,6 +1580,17 @@ def _load_local_current_or_boundary_kv_all_heads_packed(
         load.wait()
 
 
+# Entry-barrier collective ids (GDN PCP kernel 13; fused EP v3 0/3, dense slots 5/6).
+PCP_CURRENT_COLLECTIVE_ID = 14
+PCP_HISTORY_COLLECTIVE_ID = 15
+
+
+def pcp_entry_barrier_enabled() -> bool:
+    """TPU_PCP_ENTRY_BARRIER=1: barrier the PCP ring on the runtime's barrier
+    semaphore before the first remote copy (see gdn/v3/pcp_wrapper.py)."""
+    return os.environ.get("TPU_PCP_ENTRY_BARRIER", "0") == "1"
+
+
 def _mesh_device_id(mesh_axis_names, pcp_axis_name, pcp_rank):
     return tuple(
         pcp_rank if axis_name == pcp_axis_name else lax.axis_index(axis_name)
@@ -1377,9 +1644,22 @@ def _run_pcp_page_groups_multi_head(
     mesh_axis_names,
     pcp_axis_name,
     state_mode,
+    entry_barrier=False,
 ):
     if state_mode not in ("current", "history"):
         raise ValueError(f"Unsupported PCP state mode: {state_mode}")
+    if entry_barrier:
+        # The first ring round copies into the peer's VMEM and signals its
+        # scratch semaphores: the peer must already be inside this kernel.
+        barrier = pltpu.get_barrier_semaphore()
+        for peer in range(pcp_size):
+            pl.semaphore_signal(
+                barrier,
+                inc=1,
+                device_id=_mesh_device_id(mesh_axis_names, pcp_axis_name, peer),
+                device_id_type=pl.DeviceIdType.MESH,
+            )
+        pl.semaphore_wait(barrier, pcp_size)
     causal = state_mode == "current"
     my_id = lax.axis_index(pcp_axis_name)
     next_rank = lax.rem(my_id + 1, pcp_size)
@@ -1773,6 +2053,7 @@ def _pcp_streaming_attention_current_state_page_groups_multi_head_kernel(
     v_scale,
     mesh_axis_names,
     pcp_axis_name,
+    entry_barrier=False,
 ):
     """Current-chunk causal PCP body that only materializes online state."""
     for lane in range(num_lanes):
@@ -1823,6 +2104,7 @@ def _pcp_streaming_attention_current_state_page_groups_multi_head_kernel(
             mesh_axis_names=mesh_axis_names,
             pcp_axis_name=pcp_axis_name,
             state_mode="current",
+            entry_barrier=entry_barrier,
         )
 
 
@@ -1869,6 +2151,7 @@ def _pcp_streaming_attention_history_output_page_groups_multi_head_kernel(
     v_scale,
     mesh_axis_names,
     pcp_axis_name,
+    entry_barrier=False,
 ):
     """History no-causal PCP body initialized from current state.
 
@@ -1925,6 +2208,7 @@ def _pcp_streaming_attention_history_output_page_groups_multi_head_kernel(
             mesh_axis_names=mesh_axis_names,
             pcp_axis_name=pcp_axis_name,
             state_mode="history",
+            entry_barrier=entry_barrier,
         )
 
 
@@ -2105,6 +2389,7 @@ def _pcp_streaming_attention_current_state_page_groups_multi_head_pallas_call(
         ONLINE_STATE_PADDED_LANES,
     )
     state_acc_scratch_shape = (kv_heads, q_block_size, q_per_kv, head_dim)
+    entry_barrier = pcp_entry_barrier_enabled()
     return pl.pallas_call(
         functools.partial(
             _pcp_streaming_attention_current_state_page_groups_multi_head_kernel,
@@ -2122,6 +2407,7 @@ def _pcp_streaming_attention_current_state_page_groups_multi_head_pallas_call(
             v_scale=v_scale,
             mesh_axis_names=mesh_axis_names,
             pcp_axis_name=pcp_axis_name,
+            entry_barrier=entry_barrier,
         ),
         out_shape=(
             jax.ShapeDtypeStruct(state_lm_hbm_shape, jnp.float32),
@@ -2173,7 +2459,8 @@ def _pcp_streaming_attention_current_state_page_groups_multi_head_pallas_call(
             grid=(1,),
         ),
         compiler_params=pltpu.CompilerParams(
-            vmem_limit_bytes=pltpu.get_tpu_info().vmem_capacity_bytes
+            vmem_limit_bytes=pltpu.get_tpu_info().vmem_capacity_bytes,
+            **({"collective_id": PCP_CURRENT_COLLECTIVE_ID} if entry_barrier else {}),
         ),
         name="pcp_streaming_attention_current_state_page_groups_multi_head",
     )(
@@ -2236,6 +2523,7 @@ def _pcp_streaming_attention_history_output_page_groups_multi_head_pallas_call(
         ONLINE_STATE_PADDED_LANES,
     )
     state_acc_scratch_shape = (kv_heads, q_block_size, q_per_kv, head_dim)
+    entry_barrier = pcp_entry_barrier_enabled()
     return pl.pallas_call(
         functools.partial(
             _pcp_streaming_attention_history_output_page_groups_multi_head_kernel,
@@ -2253,6 +2541,7 @@ def _pcp_streaming_attention_history_output_page_groups_multi_head_pallas_call(
             v_scale=v_scale,
             mesh_axis_names=mesh_axis_names,
             pcp_axis_name=pcp_axis_name,
+            entry_barrier=entry_barrier,
         ),
         out_shape=jax.ShapeDtypeStruct(q_multi_head.shape, q_multi_head.dtype),
         grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -2295,7 +2584,8 @@ def _pcp_streaming_attention_history_output_page_groups_multi_head_pallas_call(
             grid=(1,),
         ),
         compiler_params=pltpu.CompilerParams(
-            vmem_limit_bytes=pltpu.get_tpu_info().vmem_capacity_bytes
+            vmem_limit_bytes=pltpu.get_tpu_info().vmem_capacity_bytes,
+            **({"collective_id": PCP_HISTORY_COLLECTIVE_ID} if entry_barrier else {}),
         ),
         input_output_aliases={1: 0},
         name="pcp_streaming_attention_history_output_page_groups_multi_head",
@@ -2390,7 +2680,7 @@ def _pcp_streaming_attention_zero_history_output_multi_head_pallas_call(
     )
 
 
-def pcp_streaming_attention_page_groups_packed_local_from_metadata(
+def pcp_streaming_current_state_from_metadata(
     q_local,
     current_kv_local,
     kv_cache_local,
@@ -2413,7 +2703,16 @@ def pcp_streaming_attention_page_groups_packed_local_from_metadata(
     mesh_axis_names: tuple[str, ...] = (AXIS,),
     pcp_axis_name: str = AXIS,
 ):
-    """Generate the narrow metadata schedule and run split PCP RPA.
+    """Run only the PCP current pass and its KV write-back.
+
+    Returns ``(m_state, l_state, acc_state, kv_cache_local, schedule)``,
+    where the state covers every active local query row over its current
+    chunk and history-boundary page, and ``schedule`` is the tile plan tuple
+    the history pass consumes. See
+    ``pcp_streaming_attention_page_groups_packed_local_from_metadata`` for the
+    arguments.
+
+    Generate the narrow metadata schedule and run split PCP RPA.
 
     The current causal pass consumes freshly packed local KV directly and
     captures passing rows on their request-absolute cache owner. The captured
@@ -2537,6 +2836,129 @@ def pcp_streaming_attention_page_groups_packed_local_from_metadata(
         writeback_segment_descriptors,
         writeback_num_segments,
         kv_layout=kv_layout,
+    )
+    schedule = (
+        tile_plan,
+        block_tables,
+        current_tile_ids,
+        current_group_starts,
+        current_meta,
+        history_tile_ids,
+        history_group_starts,
+        history_meta,
+    )
+    return m_state, l_state, acc_state, kv_cache_local, schedule
+
+
+def pcp_streaming_attention_page_groups_packed_local_from_metadata(
+    q_local,
+    current_kv_local,
+    kv_cache_local,
+    kv_lens,
+    page_indices,
+    cu_q_lens,
+    distribution,
+    writeback_segment_descriptors,
+    writeback_num_segments,
+    *,
+    pcp_size: int,
+    interleave_size: int,
+    q_block_size: int = PCP_STREAMING_RPA_LOCAL_COMPILE_TOKEN_MULTIPLE,
+    sm_scale: float,
+    q_compute_size: int | None = None,
+    num_lanes: int = 1,
+    k_scale: float | None = None,
+    v_scale: float | None = None,
+    kv_layout: KVLayout = KVLayout.HEAD_ALONG_SUBLANE,
+    mesh_axis_names: tuple[str, ...] = (AXIS,),
+    pcp_axis_name: str = AXIS,
+):
+    """Generate the narrow metadata schedule and run split PCP RPA.
+
+    The current causal pass consumes freshly packed local KV directly and
+    captures passing rows on their request-absolute cache owner. The captured
+    KV is written to the local cache immediately after the current pass, ending
+    the capture buffer lifetime before the history/output pass.
+    The history no-causal pass reads only tokens before the current request
+    chunk, so it is unaffected by the newly written current rows.
+
+    Args:
+        q_local: [local_tokens, kv_heads, q_per_kv, head_dim] compact Q rows
+            for the current PCP rank.
+        current_kv_local: Freshly computed packed KV rows. Legacy layout is
+            [local_tokens, packed_kv_heads_x2, kv_packing, head_dim];
+            SEQ_ALONG_LANE is
+            [2 * kv_heads, head_dim / kv_packing, kv_packing, local_tokens].
+        kv_cache_local: Local packed KV-cache shard. Legacy layout is
+            [pages, page_size, packed_kv_heads_x2, kv_packing, head_dim];
+            SEQ_ALONG_LANE is
+            [pages, 2 * kv_heads, head_dim / kv_packing, kv_packing,
+            page_size].
+        kv_lens: [max_num_seqs]. Total KV length for each request, including
+            the query tokens in the current prefill chunk.
+        page_indices: Flattened or 2D vLLM block table. Entries are reduced
+            modulo the local KV-cache block count before local page loads.
+        cu_q_lens: [max_num_seqs + 1]. Cumulative query-token offsets for the
+            current batch.
+        distribution: [3] vLLM request distribution metadata. The third entry
+            is the number of active requests considered by the schedule.
+        writeback_segment_descriptors: [3, max_segments] dense-source to
+            flat-cache copy descriptors for this cache rank.
+        writeback_num_segments: Number of active writeback descriptors.
+        pcp_size: Number of ranks in the PCP ring.
+        interleave_size: Number of consecutive global tokens assigned to one
+            rank before rotating to the next PCP rank. Must divide the KV page
+            size.
+        q_block_size: Static local Q tile size used by the Pallas kernel.
+        q_compute_size: Static Q rows consumed per multi-head softmax compute
+            step. Defaults to `q_block_size`.
+        sm_scale: Softmax scale applied to QK scores.
+        num_lanes: Number of independent schedule lanes. The metadata path
+            currently supports one lane.
+        k_scale: Optional dequantization scale for K.
+        v_scale: Optional dequantization scale for V.
+        mesh_axis_names: Names of the active JAX mesh axes.
+        pcp_axis_name: Mesh axis used as the PCP ring axis.
+
+    Returns:
+        A pair of local attention output and updated local KV cache.
+    """
+    (
+        m_state,
+        l_state,
+        acc_state,
+        kv_cache_local,
+        (
+            tile_plan,
+            block_tables,
+            current_tile_ids,
+            current_group_starts,
+            current_meta,
+            history_tile_ids,
+            history_group_starts,
+            history_meta,
+        ),
+    ) = pcp_streaming_current_state_from_metadata(
+        q_local,
+        current_kv_local,
+        kv_cache_local,
+        kv_lens,
+        page_indices,
+        cu_q_lens,
+        distribution,
+        writeback_segment_descriptors,
+        writeback_num_segments,
+        pcp_size=pcp_size,
+        interleave_size=interleave_size,
+        q_block_size=q_block_size,
+        sm_scale=sm_scale,
+        q_compute_size=q_compute_size,
+        num_lanes=num_lanes,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        kv_layout=kv_layout,
+        mesh_axis_names=mesh_axis_names,
+        pcp_axis_name=pcp_axis_name,
     )
     history_output = (
         _pcp_streaming_attention_history_output_page_groups_multi_head_pallas_call(

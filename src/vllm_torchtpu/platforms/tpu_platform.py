@@ -863,11 +863,11 @@ class TpuPlatform(Platform):
         validate_decode_context_parallel_config(vllm_config)
         if vllm_config.parallel_config.pipeline_parallel_size > 1:
             # Engines built in this process (VLLM_ENABLE_V1_MULTIPROCESSING=0)
-            # get the hand-off push here; engine-core processes install it
-            # again on their side.
-            from vllm_torchtpu.distributed.pp_push import patch_executor_for_pp_wave
+            # get the hand-off's engine side here; engine-core processes
+            # install it again on their side.
+            from vllm_torchtpu.distributed.pp_push import patch_executor_for_pp_handoff
 
-            patch_executor_for_pp_wave(vllm_config)
+            patch_executor_for_pp_handoff(vllm_config)
             _configure_pipeline_chunks(vllm_config)
             from vllm_torchtpu.core.pp_lazy_step import patch_engine_core_for_lazy_push
 
@@ -1018,6 +1018,7 @@ class TpuPlatform(Platform):
             ep_size = int(parallel_config.tensor_parallel_size) * int(
                 parallel_config.data_parallel_size
             )
+            _drop_default_expert_placement(parallel_config, os.environ)
             if "TPU_EXPERT_PLACEMENT" not in os.environ and ep_size == 8:
                 from vllm_torchtpu import expert_placement
 
@@ -1697,3 +1698,34 @@ def _configure_sequence_parallel_moe(vllm_config: VllmConfig) -> None:
             tp,
         )
     cc.compile_sizes = cast(list[int | str], kept)
+
+
+def _drop_default_expert_placement(parallel_config, environ) -> bool:
+    """Turn off the built-in expert placement table for an EP group it does not fit.
+
+    TPU_EXPERT_PLACEMENT defaults (envs.py) to a DP8/EP8 table. An EP group of
+    another size, e.g. the EP2 group of a PP4 x PCP2 prefill stage
+    (EP = TP * DP * PCP), would fail in apply_expert_map ("the table is for 8
+    ranks x 512 experts; this layer has 2 ranks x 512"), and the router-row
+    permutation and loader filter would follow the wrong table. An explicitly
+    set TPU_EXPERT_PLACEMENT is left alone. Returns True when it turned the
+    table off; set before the workers spawn so they inherit it.
+    """
+    if "TPU_EXPERT_PLACEMENT" in environ or not getattr(
+        parallel_config, "enable_expert_parallel", False
+    ):
+        return False
+    ep_group = (
+        int(parallel_config.tensor_parallel_size)
+        * int(parallel_config.data_parallel_size)
+        * int(getattr(parallel_config, "prefill_context_parallel_size", 1) or 1)
+    )
+    if ep_group == 8:
+        return False
+    environ["TPU_EXPERT_PLACEMENT"] = ""
+    logger.info(
+        "Qwen3.5-397B: no expert placement table for an EP group of %d "
+        "(the built-in table is EP8); TPU_EXPERT_PLACEMENT set empty.",
+        ep_group,
+    )
+    return True

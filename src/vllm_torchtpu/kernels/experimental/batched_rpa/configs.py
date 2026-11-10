@@ -161,6 +161,14 @@ NUM_INPUT_SLOTS = 3
 NUM_OUTPUT_SLOTS = 2
 
 
+def skip_kv_no_new_dma_enabled() -> bool:
+    """TPU_RPA_SKIP_KV_NO_NEW_DMA=1 (default off): calls with skip_kv_update carry
+    one zero-size new-KV DMA entry per step instead of bkv_p + 1 (they never fetch
+    or write new KV), which shrinks their schedules and the kernel's per-step
+    bookkeeping. Bitwise: every dropped entry had size zero."""
+    return os.environ.get("TPU_RPA_SKIP_KV_NO_NEW_DMA", "0") == "1"
+
+
 @dataclasses.dataclass(frozen=True)
 class ServingConfigs:
     """Serving config that can change depending on use cases."""
@@ -184,6 +192,11 @@ class ServingConfigs:
     cp_group_size: int | None = None
     attention_scope: AttentionScope = AttentionScope.FULL
     return_lse: bool = False
+    # Dtype of the LSE output. None keeps dtype_out (the historical
+    # behavior). float32 is needed when the LSE weights a merge with partial
+    # results computed elsewhere (PCP history), where a bf16 LSE (spacing
+    # 0.125 at magnitude 16-32) mis-weights the parts by several percent.
+    dtype_lse: jnp.dtype | None = None
     skip_kv_update: bool = False
     # Run the DECODE kernel's matmuls natively in the fp8 KV dtype instead of
     # dequantizing K / V: "qk" quantizes q per (token, head) row, "pv"
@@ -200,6 +213,27 @@ class ServingConfigs:
     # inside the e4m3 range); "pvs" casts the softmax weights times a fixed
     # power of two (flash_attention.P_SCALE) and divides it out with l.
     native_fp8_prefill: str = ""
+    # Compact (lane-dense) LSE output (TPU_PCP_LSE_COMPACT): [kv_heads,
+    # max_tokens * Gp // 128, 128] f32, flat index t * Gp + g, kept in a VMEM
+    # accumulator for the whole call and written once, instead of one
+    # lane-replicated 128-lane row per (token, head) DMAed per q block. Needs
+    # float32 LSE (one head per row). Default off: the historical layout.
+    lse_compact: bool = False
+
+    @property
+    def lse_dtype(self) -> jnp.dtype:
+        return jnp.dtype(self.dtype_out if self.dtype_lse is None else self.dtype_lse)
+
+    @property
+    def lse_packing(self) -> int:
+        """Q heads packed per u32 row of the LSE buffer.
+
+        The historical layout (dtype_lse None) packs like Q; an explicit
+        dtype packs by its own width, so float32 stores one head per row.
+        """
+        if self.dtype_lse is None:
+            return self.packing_q
+        return utils.get_dtype_packing(self.lse_dtype)
 
     def native_fp8_split(self, which: str) -> bool:
         """Whether the native fp8 `which` operand is split into hi/lo halves."""
@@ -365,6 +399,12 @@ class RpaConfigs:
 
     @property
     def bkv_p_new(self) -> int:
+        if self.serve.skip_kv_update and skip_kv_no_new_dma_enabled():
+            # skip_kv_update reads every KV token from the cache, so the new-KV
+            # fetch / writeback entries are all zero-size: keep one (zero-size)
+            # entry instead of bkv_p + 1. Not zero: a zero-size schedule output
+            # aborts XLA memory-space assignment.
+            return 1
         if self.mode == RpaCase.DECODE or self.block.bq_sz == 1:
             return min(self.serve.max_decode_bkv_p_new, self.bkv_p)
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
@@ -552,13 +592,38 @@ class RpaConfigs:
     @property
     def lse_vmem_shape(self):
         num_lanes = _get_tpu_info().num_lanes
-        q_per_kv_packing = self.aligned_num_q_heads_per_kv_head // self.serve.packing_q
+        packing = self.serve.lse_packing
+        if self.serve.lse_compact:
+            # One q block's lane-dense LSE rows (flat index t * Gp + g).
+            rows = self.block.bq_sz * self.aligned_num_q_heads_per_kv_head
+            if packing != 1 or (rows % num_lanes and rows > num_lanes):
+                raise ValueError(
+                    f"compact LSE needs float32 LSE and bq * Gp % {num_lanes} == 0 (or one short "
+                    f"block), got packing {packing}, bq * Gp = {rows}"
+                )
+            return (
+                self.block.batch_size,
+                self.model.num_kv_heads,
+                -(-rows // num_lanes),
+                num_lanes,
+            )
+        if packing == 1:
+            # One head per row: no packing axis, so the minor two dims stay
+            # (heads, lanes) and the flat u32 view needs no sub-tile merge.
+            return (
+                self.block.batch_size,
+                self.model.num_kv_heads,
+                self.block.bq_sz,
+                self.aligned_num_q_heads_per_kv_head,
+                num_lanes,
+            )
+        q_per_kv_packing = self.aligned_num_q_heads_per_kv_head // packing
         return (
             self.block.batch_size,
             self.model.num_kv_heads,
             self.block.bq_sz,
             q_per_kv_packing,
-            self.serve.packing_q,
+            packing,
             num_lanes,
         )
 

@@ -385,3 +385,161 @@ def test_the_executor_patch_raises_the_queue_depth_when_asked(monkeypatch, queue
     _install_on_fake_executor(monkeypatch, 8)
     assert _Config(8).max_concurrent_batches == 9
     assert queue(1, 1).kwargs["max_chunks"] == 44
+
+
+# The ring hand-off (TPU_PP_HANDOFF=ring): no pushes or settles, vLLM's
+# dispatch depth, rings widened as for the wave.
+
+
+@pytest.fixture
+def ring(monkeypatch):
+    monkeypatch.setenv("TPU_PP_HANDOFF", "ring")
+    monkeypatch.delenv("TPU_PP_RING_DEPTH", raising=False)
+
+
+def test_the_hand_off_flags_parse(monkeypatch):
+    from vllm_torchtpu import envs
+
+    monkeypatch.delenv("TPU_PP_HANDOFF", raising=False)
+    monkeypatch.delenv("TPU_PP_RING_DEPTH", raising=False)
+    assert envs.TPU_PP_HANDOFF == "wave" and not pp_push.ring_handoff()
+    assert envs.TPU_PP_RING_DEPTH == 2
+    monkeypatch.setenv("TPU_PP_HANDOFF", "ring")
+    monkeypatch.setenv("TPU_PP_RING_DEPTH", "3")
+    assert pp_push.ring_handoff() and envs.TPU_PP_RING_DEPTH == 3
+    monkeypatch.setenv("TPU_PP_HANDOFF", "wave")
+    assert not pp_push.ring_handoff()
+    for value in ("Ring", "p2p"):
+        monkeypatch.setenv("TPU_PP_HANDOFF", value)
+        with pytest.raises(ValueError, match="TPU_PP_HANDOFF"):
+            pp_push.ring_handoff()
+    monkeypatch.setenv("TPU_PP_RING_DEPTH", "two")
+    with pytest.raises(ValueError, match="TPU_PP_RING_DEPTH"):
+        _ = envs.TPU_PP_RING_DEPTH
+
+
+def test_the_ring_widens_the_rings_as_the_wave_does(monkeypatch, ring, queue):
+    pp_push.widen_message_rings(_config(4))
+    assert queue(1, 1).kwargs["max_chunks"] == pp_push.rpc_ring_chunks(4)
+    # the depth caps a stage's send queue, not the engine's steps in flight
+    monkeypatch.setenv("TPU_PP_RING_DEPTH", "4")
+    pp_push.widen_message_rings(_config(8))
+    assert queue(1, 1).kwargs["max_chunks"] == pp_push.rpc_ring_chunks(8)
+
+
+def _bare_executor_cls(monkeypatch):
+    """A MultiprocExecutor stand-in that neither patch has touched yet."""
+    from vllm.v1.executor import multiproc_executor
+
+    class _FakeExecutor:
+        def __init__(self):
+            self.vllm_config = _config(4)
+            self.output_rank = 3
+            self.calls = []
+
+        def execute_model(self, scheduler_output, non_block=False):
+            future = _done(("forward", scheduler_output.step))
+            return future if non_block else future.result()
+
+        def sample_tokens(self, grammar_output, non_block=False):
+            future = _done(("sample", grammar_output))
+            return future if non_block else future.result()
+
+        def take_draft_token_ids(self):
+            raise AssertionError("asked the workers for draft tokens")
+
+        def profile(self, is_start=True, profile_prefix=None):
+            # cand4's wave patch wraps the profiler RPC with a settle.
+            self.calls.append(("profile", {"args": (is_start, profile_prefix)}))
+
+        def collective_rpc(self, method, **kwargs):
+            self.calls.append((method, kwargs))
+
+    monkeypatch.setattr(multiproc_executor, "MultiprocExecutor", _FakeExecutor)
+    return _FakeExecutor
+
+
+def test_the_ring_installs_no_push_or_settle(monkeypatch, ring, queue):
+    from vllm.config import VllmConfig
+
+    dispatch_depth = VllmConfig.max_concurrent_batches
+    executor_cls = _bare_executor_cls(monkeypatch)
+    pp_push.patch_executor_for_pp_handoff(_config(4))
+    executor = executor_cls()
+    future = executor.execute_model(_step(16, 1), non_block=True)
+    assert not isinstance(future, pp_push._PushFuture)
+    assert future.result() == ("forward", 1)
+    assert executor.take_draft_token_ids() is None
+    assert executor.calls == []
+    assert not getattr(executor_cls, "_tpu_pp_wave_patch", False)
+    assert queue(1, 1).kwargs["max_chunks"] == pp_push.rpc_ring_chunks(4)
+    # the engine keeps vLLM's steps in flight
+    assert VllmConfig.max_concurrent_batches is dispatch_depth
+
+
+def test_an_executor_without_a_pipeline_keeps_its_own_calls(monkeypatch, queue):
+    monkeypatch.delenv("TPU_PP_HANDOFF", raising=False)
+    executor_cls = _bare_executor_cls(monkeypatch)
+    asked = []
+    executor_cls.take_draft_token_ids = lambda self: asked.append(self) or "drafts"
+    pp_push.patch_executor_for_pp_handoff(_config(4))
+    # an engine of one stage built in the same process after a pipeline's
+    single = executor_cls()
+    single.vllm_config = _config(1)
+    future = single.execute_model(_step(16, 1), non_block=True)
+    assert not isinstance(future, pp_push._PushFuture)
+    assert future.result() == ("forward", 1)
+    sampled = single.sample_tokens("g", non_block=True)
+    assert not isinstance(sampled, pp_push._PushFuture)
+    assert single.take_draft_token_ids() == "drafts" and asked == [single]
+    assert single.calls == []
+    deep = executor_cls()
+    pushed = deep.execute_model(_step(16, 1), non_block=True)
+    assert isinstance(pushed, pp_push._PushFuture)
+    assert deep.take_draft_token_ids() is None and asked == [single]
+
+
+def test_the_ring_leaves_an_executor_without_a_pipeline_its_draft_tokens(
+    monkeypatch, ring, queue
+):
+    executor_cls = _bare_executor_cls(monkeypatch)
+    executor_cls.take_draft_token_ids = lambda self: "drafts"
+    pp_push.patch_executor_for_pp_handoff(_config(4))
+    single = executor_cls()
+    single.vllm_config = _config(1)
+    assert single.take_draft_token_ids() == "drafts"
+    assert executor_cls().take_draft_token_ids() is None
+
+
+def test_the_wave_flag_installs_the_wave(monkeypatch, queue):
+    monkeypatch.delenv("TPU_PP_HANDOFF", raising=False)
+    executor_cls = _bare_executor_cls(monkeypatch)
+    pp_push.patch_executor_for_pp_handoff(_config(4))
+    executor = executor_cls()
+    assert isinstance(
+        executor.execute_model(_step(16, 1), non_block=True), pp_push._PushFuture
+    )
+    assert executor_cls._tpu_pp_wave_patch
+    assert not getattr(executor_cls, "_tpu_pp_ring_patch", False)
+    assert queue(1, 1).kwargs["max_chunks"] == pp_push.rpc_ring_chunks(4)
+
+
+def test_the_ring_keeps_the_extra_steps_in_flight(monkeypatch, ring, queue):
+    # Ported onto the IX tree, where the PCP bench runs with
+    # TPU_PP_EXTRA_STEPS_IN_FLIGHT=1: the ring keeps the engine's extra
+    # steps, so ring and wave differ only in the hand-off.
+    class _Config(_FakeVllmConfig):
+        pass
+
+    monkeypatch.setattr(pp_push, "_vllm_config_class", lambda: _Config)
+    monkeypatch.setattr(pp_push.envs, "TPU_PP_EXTRA_STEPS_IN_FLIGHT", 1)
+    executor_cls = _bare_executor_cls(monkeypatch)
+    pp_push.patch_executor_for_pp_handoff(_config(4))
+    executor = executor_cls()
+    assert not isinstance(
+        executor.execute_model(_step(16, 1), non_block=True), pp_push._PushFuture
+    )
+    assert executor_cls._tpu_pp_ring_patch
+    assert not getattr(executor_cls, "_tpu_pp_wave_patch", False)
+    assert _Config(4).max_concurrent_batches == 5
+    assert queue(1, 1).kwargs["max_chunks"] == pp_push.rpc_ring_chunks(4, extra=1)

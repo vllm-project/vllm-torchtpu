@@ -45,6 +45,7 @@ _DEFAULT_RELOAD_MODULES = (
     "vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.schedule",
     "vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.kernel",
     "vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.reference",
+    "vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.history_rpa",
     "vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.wrapper",
     "vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter",
 )

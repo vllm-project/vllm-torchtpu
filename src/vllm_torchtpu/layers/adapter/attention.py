@@ -61,12 +61,19 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
 from vllm_torchtpu.kernels.experimental.batched_rpa import (
     configs as batched_rpa_configs,
 )
+from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa import (
+    history_rpa as pcp_history_rpa,
+)
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
+    PCP_META_INPUT_PARTITION_SPECS,
+    PCP_META_PACKED_PARTITION_SPEC,
     PCP_STREAMING_RPA_INPUT_PARTITION_SPECS,
     PCP_STREAMING_RPA_OUTPUT_PARTITION_SPECS,
     get_pcp_streaming_mesh,
     invoke_pcp_streaming_op,
+    make_pcp_meta_kernel,
     make_pcp_streaming_rpa_kernel,
+    pcp_meta_jax_op,
     pcp_streaming_jax_op,
 )
 from vllm_torchtpu.kernels.mla import kv_cache_utils
@@ -150,6 +157,26 @@ TPU_STR_DTYPE_TO_TORCH_DTYPE = {
     "int8": torch.int8,
     "uint8": torch.uint8,
 }
+
+
+def _pcp_meta_token_cap(vllm_config) -> int:
+    """TPU_PCP_RPA_HOIST_META: the global token cap the packed metadata is
+    padded to (so the meta op's output shape does not depend on the dynamic
+    token count): each PCP rank's tokens, ceil(max_num_batched_tokens / pcp) or
+    the largest compile size if larger, rounded up to the PCP compile multiple.
+    A step past the cap fails loudly at trace time (vllm_adapter._meta_width_cap)."""
+    from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.kernel import (
+        PCP_STREAMING_RPA_LOCAL_COMPILE_TOKEN_MULTIPLE as multiple,
+    )
+
+    pcp = vllm_config.parallel_config.prefill_context_parallel_size
+    max_tokens = getattr(getattr(vllm_config, "scheduler_config", None), "max_num_batched_tokens", None)
+    if not max_tokens:
+        raise ValueError("TPU_PCP_RPA_HOIST_META needs scheduler_config.max_num_batched_tokens")
+    local = -(-max_tokens // pcp)
+    sizes = getattr(getattr(vllm_config, "compilation_config", None), "compile_sizes", None) or ()
+    local = max([local] + [int(x) for x in sizes])
+    return -(-local // multiple) * multiple * pcp
 
 
 def _is_fp8_kv_cache_dtype(cache_dtype_str: str) -> bool:
@@ -1212,6 +1239,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
         use_pcp_streaming: bool = False,
         cp_kv_cache_interleave_size: int = 0,
         block_major: bool = False,
+        pcp_hoisted: bool = False,
     ):
         ctx = get_vllm_model_wrapper_context()
         vllm_config = cast("VllmConfig | None", ctx.vllm_config)
@@ -1226,6 +1254,17 @@ class PallasAttentionBackendImpl(AttentionImpl):
             else batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
         )
         fp8_off = native_fp8_scope.draft_off(self.native_fp8_draft)
+        # TPU_PCP_MTP_FINAL_ROWS_HISTORY: the speculative draft's attention
+        # layer under PCP (a prefill-only MTP draft, TPUModelRunner._prefill_only_mtp)
+        # attends history only from each request's last-position row, the
+        # only row the draft reads (eagle3 gathers it). The runner marks draft
+        # layers (native_fp8_draft) before their kernels are built.
+        mtp_final_rows = bool(
+            use_pcp_streaming
+            and not pcp_hoisted
+            and self.native_fp8_draft
+            and os.environ.get("TPU_PCP_MTP_FINAL_ROWS_HISTORY", "0").strip() == "1"
+        )
         config_key = (
             self._kernel_op_prefix,
             self.sliding_window,
@@ -1240,7 +1279,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
             self.decode_tuning,
             block_major,
             fp8_off,
-        )
+            pcp_hoisted,
+        ) + ((("mtp_final_rows",)) if mtp_final_rows else ())
         existing = self._kernel_config_cache.get(config_key)
         if existing is not None:
             return existing
@@ -1262,6 +1302,10 @@ class PallasAttentionBackendImpl(AttentionImpl):
             cache_spec = P(cache_spec[0], None, *cache_spec[1:])
             input_partition_specs = (cache_spec, *input_partition_specs[1:])
             output_partition_specs = (cache_spec, output_partition_specs[1])
+        if pcp_hoisted:
+            # TPU_PCP_RPA_HOIST_META: a ninth tensor, the packed per-forward
+            # metadata ([pcp, total] int32, one row per PCP rank).
+            input_partition_specs = (*input_partition_specs, PCP_META_PACKED_PARTITION_SPEC)
         registry_key = (
             self._kernel_op_prefix,
             self.sliding_window,
@@ -1281,7 +1325,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
             self.decode_tuning,
             block_major,
             fp8_off,
-        )
+            pcp_hoisted,
+        ) + ((("mtp_final_rows",)) if mtp_final_rows else ())
         existing = self._kernel_registry.get(registry_key)
         if existing is not None:
             self._kernel_config_cache[config_key] = existing
@@ -1304,7 +1349,16 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
                 kv_layout=pcp_kv_layout,
                 block_major=block_major,
+                hoisted=pcp_hoisted,
             )
+            if pcp_hoisted:
+                pcp_make_kwargs["meta_max_tokens"] = _pcp_meta_token_cap(vllm_config)
+            if mtp_final_rows:
+                pcp_make_kwargs["final_rows_history"] = True
+                logger.info(
+                    "PCP MTP draft attention: history from each request's last-position "
+                    "row only (TPU_PCP_MTP_FINAL_ROWS_HISTORY=1)"
+                )
             wrapped_fn = make_pcp_streaming_rpa_kernel(**pcp_make_kwargs)
         else:
             entry_params = inspect.signature(self._kernel_entry).parameters
@@ -1367,6 +1421,10 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 mesh=op_mesh,
                 input_partition_specs=input_partition_specs,
                 output_partition_specs=output_partition_specs,
+                # The hoisted entry must keep every tensor in its exported
+                # module (see build_pcp_streaming_callable); the plain entry
+                # keeps jax.jit's default, so its module is unchanged.
+                keep_unused=pcp_hoisted,
             )
             if envs.TPU_KERNEL_ITER_MODE:
                 from vllm_torchtpu.compilation import kernel_reload
@@ -1378,6 +1436,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
                     specs=input_partition_specs,
                     out_specs=output_partition_specs,
                     donate=rpa_donate_argnums,
+                    keep_unused=pcp_hoisted,
                 ):
                     import importlib
 
@@ -1393,6 +1452,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
                         mesh=op_mesh,
                         input_partition_specs=specs,
                         output_partition_specs=out_specs,
+                        keep_unused=keep_unused,
                     )
 
                 kernel_reload.register_builder(op_name, _rebuild_pcp_callable)
@@ -1649,6 +1709,28 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 cp_kv_cache_interleave_size=parallel_config.cp_kv_cache_interleave_size,
                 block_major=self._bm_kernel,
             )
+            if pcp_history_rpa.hoist_meta_enabled() and not skip_kv_update:
+                # TPU_PCP_RPA_HOIST_META: build the per-forward metadata op and
+                # the hoisted entry now. Building them inside the traced
+                # forward reaches the PCP mesh lookup, which Dynamo skips
+                # ("Attempted to call function marked as skipped", glgt
+                # j-63e998e3 run03).
+                self._build_pcp_meta_op(
+                    k_scale,
+                    v_scale,
+                    parallel_config.cp_kv_cache_interleave_size,
+                    block_major=self._bm_kernel,
+                )
+                self._build_rpa_kernel(
+                    q_scale,
+                    k_scale,
+                    v_scale,
+                    skip_kv_update=skip_kv_update,
+                    use_pcp_streaming=True,
+                    cp_kv_cache_interleave_size=parallel_config.cp_kv_cache_interleave_size,
+                    block_major=self._bm_kernel,
+                    pcp_hoisted=True,
+                )
             return
 
         dcp_configured = (
@@ -1733,6 +1815,67 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 skip_kv_update=skip_kv_update,
                 block_major=self._bm_kernel,
             )
+
+    def _build_pcp_meta_op(
+        self,
+        k_scale: float | None,
+        v_scale: float | None,
+        cp_kv_cache_interleave_size: int,
+        block_major: bool = False,
+    ):
+        """TPU_PCP_RPA_HOIST_META: the op that computes the all-RPA PCP metadata
+        (row maps, write-back mapping, current-pool indices, history metadata,
+        capture index and the three MIXED RPA schedules) once per forward."""
+        config_key = (
+            "pallas::pcp_all_rpa_meta",
+            self.scale,
+            k_scale,
+            v_scale,
+            cp_kv_cache_interleave_size,
+            self.kv_layout,
+            block_major,
+        )
+        existing = self._kernel_config_cache.get(config_key)
+        if existing is not None:
+            return existing
+        if envs.TPU_KERNEL_ITER_MODE:
+            raise NotImplementedError(
+                "TPU_PCP_RPA_HOIST_META does not support TPU_KERNEL_ITER_MODE hot reload."
+            )
+        ctx = get_vllm_model_wrapper_context()
+        mesh, op_mesh, _ = self._select_kernel_mesh(ctx.mesh, True)
+        registry_key = config_key + (id(mesh),)
+        existing = self._kernel_registry.get(registry_key)
+        if existing is not None:
+            self._kernel_config_cache[config_key] = existing
+            return existing
+        input_partition_specs = PCP_META_INPUT_PARTITION_SPECS
+        if block_major:
+            cache_spec = input_partition_specs[0]
+            cache_spec = P(cache_spec[0], None, *cache_spec[1:])
+            input_partition_specs = (cache_spec, *input_partition_specs[1:])
+        kernel_instance_id = self._allocate_kernel_instance_id()
+        op_name = f"pallas::pcp_all_rpa_meta_{kernel_instance_id}"
+        # pcp_meta_jax_op: keep_unused (glgt2) and a fake that never reads the
+        # dynamic token dim (stagebc), the output padded to the token cap.
+        meta_op = pcp_meta_jax_op(
+            op_name,
+            make_pcp_meta_kernel(
+                k_scale=k_scale,
+                v_scale=v_scale,
+                mesh=mesh,
+                sm_scale=self.scale,
+                cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
+                kv_layout=self.kv_layout,
+                block_major=block_major,
+                max_tokens=_pcp_meta_token_cap(ctx.vllm_config),
+            ),
+            mesh=op_mesh,
+            input_partition_specs=input_partition_specs,
+        )
+        self._kernel_registry[registry_key] = meta_op
+        self._kernel_config_cache[config_key] = meta_op
+        return meta_op
 
     def _build_rpa_schedule_op(self, block_major: bool = False):
         config_key = (
@@ -2177,6 +2320,69 @@ class PallasAttentionBackendImpl(AttentionImpl):
                     block_tables, pool_index, layout.num_pools, layout.split
                 )
             if (
+                use_pcp_streaming
+                and pcp_history_rpa.hoist_meta_enabled()
+                and _ACTIVE_RPA_SCHEDULE_CACHE is not None
+                and not skip_kv_update
+            ):
+                # TPU_PCP_RPA_HOIST_META: one metadata op per forward, shared by
+                # every PCP attention layer of the same geometry (like PP8's
+                # hoisted RPA schedule below).
+                k_scale = layer._k_scale_float if self.kv_cache_quantized_dtype else None
+                v_scale = layer._v_scale_float if self.kv_cache_quantized_dtype else None
+                meta_key = (
+                    "pcp_all_rpa_meta",
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.head_size,
+                    kv_cache.dtype,
+                    tuple(kv_cache.shape[1:]),
+                    self.scale,
+                    k_scale,
+                    v_scale,
+                    cp_kv_cache_interleave_size,
+                    self.kv_layout,
+                    self._bm_kernel,
+                )
+                meta_packed = _ACTIVE_RPA_SCHEDULE_CACHE.get(meta_key)
+                if meta_packed is None:
+                    meta_op = self._build_pcp_meta_op(
+                        k_scale, v_scale, cp_kv_cache_interleave_size,
+                        block_major=self._bm_kernel,
+                    )
+                    meta_packed = meta_op(
+                        kv_cache,
+                        query,
+                        key,
+                        attn_metadata.seq_lens,
+                        block_tables,
+                        attn_metadata.query_start_loc,
+                        attn_metadata.request_distribution,
+                    )
+                    _ACTIVE_RPA_SCHEDULE_CACHE[meta_key] = meta_packed
+                hoisted_rpa_kernel = self._build_rpa_kernel(
+                    None,
+                    k_scale,
+                    v_scale,
+                    skip_kv_update=skip_kv_update,
+                    use_pcp_streaming=True,
+                    cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
+                    block_major=self._bm_kernel,
+                    pcp_hoisted=True,
+                )
+                outputs = hoisted_rpa_kernel(
+                    kv_cache,
+                    query,
+                    key,
+                    value,
+                    attn_metadata.seq_lens,
+                    block_tables,
+                    attn_metadata.query_start_loc,
+                    attn_metadata.request_distribution,
+                    sink,
+                    meta_packed,
+                )
+            elif (
                 _ACTIVE_RPA_SCHEDULE_CACHE is not None
                 and self.supports_hoisted_rpa_schedule()
                 and not use_pcp_streaming

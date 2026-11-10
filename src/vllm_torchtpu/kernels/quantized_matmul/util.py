@@ -66,6 +66,32 @@ def get_kernel_name(tuned_value: TunedValue):
     )
 
 
+def _quantize_activation(x: jax.Array, dtype) -> tuple[jax.Array, jax.Array]:
+    """`quantize_tensor(x, dtype)`; with TPU_QMM_ACT_F32_AMAX, bf16 rows quantized
+    to a float dtype take their row max on f32. Same values bit for bit: bf16 ->
+    f32 is exact and order-preserving, so max(|f32(x)|) = f32(max(|x|)), and
+    `quantize_block` converts that max (and the rows) to f32 before every later
+    op. The bf16 row max lowers to a slow TPU fusion (~15.8 us/call at
+    [4352, 4096] in the pod, against ~2.8 us for an f32 row reduction)."""
+    from vllm_torchtpu import envs
+
+    if not (
+        envs.TPU_QMM_ACT_F32_AMAX
+        and x.dtype == jnp.bfloat16
+        and x.ndim == 2
+        and jnp.issubdtype(dtype, jnp.floating)
+    ):
+        return quantize_tensor(x, dtype)
+    dtype_max, dtype_min = get_max_min(dtype)
+    x_f32 = x.astype(jnp.float32)
+    abs_max = jnp.max(jnp.abs(x_f32), axis=-1, keepdims=True)
+    scale = abs_max / dtype_max
+    scale = jnp.where(scale == 0, 1.0, scale)
+    inv_scale = jnp.float32(1.0) / scale
+    x_q = jnp.clip(x_f32 * inv_scale, dtype_min, dtype_max).astype(dtype)
+    return x_q, scale.astype(jnp.float32)
+
+
 def xla_quantized_matmul(
     x: jax.Array,
     w_q: jax.Array,
@@ -94,7 +120,7 @@ def xla_quantized_matmul(
         if quantize_activation and jnp.issubdtype(w_q.dtype, jnp.integer):
             acc_dtype = jnp.int32
 
-        x_q, x_scale = quantize_tensor(x, w_q.dtype)
+        x_q, x_scale = _quantize_activation(x, w_q.dtype)
         out = jax.lax.dot_general(
             x_q,
             w_q,

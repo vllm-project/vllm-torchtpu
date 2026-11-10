@@ -321,6 +321,43 @@ def _ep_dp_worker(monkeypatch, dp_size, expert_parallel, local, peer):
     return worker
 
 
+class _RunnerWithRingReserve(MagicMock):
+    """A mock runner whose ring hand-off reserves ``_reserve`` bytes (the
+    method is defined on the class, where the worker looks it up)."""
+
+    def pp_handoff_hbm_reserve_bytes(self):
+        return self._reserve
+
+
+def _ring_runner(reserve):
+    runner = _RunnerWithRingReserve(is_pooling_model=False)
+    runner._reserve = reserve
+    return runner
+
+
+def test_determine_available_memory_reserves_the_pp_hand_off_buffers(monkeypatch):
+    """The ring hand-off allocates its buffers after profile_run, so the KV
+    cache leaves room for them (port of upstream PR 2527 712a5873b)."""
+    worker = _ep_dp_worker(
+        monkeypatch, dp_size=1, expert_parallel=False, local=7 * utils.GBYTES, peer=0
+    )
+    worker.model_runner = _ring_runner(utils.GBYTES)
+    assert worker.determine_available_memory() == 6 * utils.GBYTES
+    worker.model_runner = _ring_runner(0)
+    assert worker.determine_available_memory() == 7 * utils.GBYTES
+
+
+def test_explicit_kv_bytes_ignore_the_ring_reserve(monkeypatch):
+    """With kv_cache_memory_bytes set (the PCP microbench A line), the KV cache
+    is exactly that size: the ring reserve does not change it."""
+    worker = _ep_dp_worker(
+        monkeypatch, dp_size=1, expert_parallel=False, local=7 * utils.GBYTES, peer=0
+    )
+    worker.cache_config.kv_cache_memory_bytes = 25_000_000_000
+    worker.model_runner = _ring_runner(utils.GBYTES)
+    assert worker.determine_available_memory() == 25_000_000_000
+
+
 @pytest.mark.parametrize(
     "dp_size, expert_parallel, coupled",
     [(2, True, True), (1, True, False), (2, False, False)],

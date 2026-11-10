@@ -1195,24 +1195,29 @@ def run_jax_gdn_attention_pooled_pcp_prefill_projection(
         packed_ba_shard = _exchange_pcp_token_shards_for_head_shards(
             local_ba, pcp_axis, pcp_size
         )
-        # PCP ownership follows the batch-flat request-major coordinate.
-        # State semantics remain request-absolute through ``seq_lens_`` below.
-        token_owner_starts = query_start_loc_[:-1]
-        full_reorder = _derive_pcp_rank_major_reorder_indices(
-            query_start_loc_,
-            token_owner_starts,
-            pcp_size=pcp_size,
-            interleave_size=interleave_size,
-            local_padded_num_tokens=local_hidden_states.shape[0],
-        )
-        valid_mask = full_reorder >= 0
-        scatter_indices = jnp.where(valid_mask, full_reorder, full_reorder.size)
-        ba_shard = (
-            jnp.zeros_like(packed_ba_shard)
-            .at[scatter_indices]
-            .set(packed_ba_shard, mode="drop")
-        )
-        ba_shard = ba_shard.reshape(ba_shard.shape[0], local_n_v, 2)
+        if gdn_v3_pcp_wrapper.pcp_gdn_ba_direct():
+            # TPU_PCP_GDN_BA_DIRECT: keep the all_to_all's rank-major packed order;
+            # the kernel reads each tile's b/a at its packed rows (bitwise).
+            ba_shard = packed_ba_shard.reshape(packed_ba_shard.shape[0], local_n_v, 2)
+        else:
+            # PCP ownership follows the batch-flat request-major coordinate.
+            # State semantics remain request-absolute through ``seq_lens_`` below.
+            token_owner_starts = query_start_loc_[:-1]
+            full_reorder = _derive_pcp_rank_major_reorder_indices(
+                query_start_loc_,
+                token_owner_starts,
+                pcp_size=pcp_size,
+                interleave_size=interleave_size,
+                local_padded_num_tokens=local_hidden_states.shape[0],
+            )
+            valid_mask = full_reorder >= 0
+            scatter_indices = jnp.where(valid_mask, full_reorder, full_reorder.size)
+            ba_shard = (
+                jnp.zeros_like(packed_ba_shard)
+                .at[scatter_indices]
+                .set(packed_ba_shard, mode="drop")
+            )
+            ba_shard = ba_shard.reshape(ba_shard.shape[0], local_n_v, 2)
         b_shard = ba_shard[:, :, 0]
         a_shard = ba_shard[:, :, 1]
 
@@ -1338,6 +1343,7 @@ def run_jax_gdn_attention_pooled_pcp_prefill(
     pcp_size: int,
     interleave_size: int,
     mesh: jax.sharding.Mesh,
+    recurrent_state_dtype: jnp.dtype = jnp.float32,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """GDN PCP prefill over the unified block pool.
 
@@ -1504,6 +1510,7 @@ def run_jax_gdn_attention_pooled_pcp_prefill(
             d_v=d_v,
             kernel_size=kernel_size,
             pool_block_tokens=pool_block_tokens,
+            recurrent_state_dtype=recurrent_state_dtype,
         )
 
         seq_output_shard = seq_output_shard.reshape(

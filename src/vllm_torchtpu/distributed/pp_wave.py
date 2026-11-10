@@ -131,6 +131,25 @@ def pp_rank_flags(parallel_config: Any) -> tuple[bool, bool]:
     return bool(group.is_first_rank), bool(group.is_last_rank)
 
 
+def drain_before_handoff(chips: int, columns: int, environ=None) -> bool:
+    """Whether a stage drains its in-flight programs before each hand-off.
+
+    A stage spanning more than one chip must (see the module docstring). A
+    one-chip stage with PCP > 1 (columns > 1) has the same hazard: an in-flight
+    stage program races the slice-wide hand-off, which halts the device or
+    corrupts outputs (Qwen3.5 PP4xPCP2; Jincheng Chen's 96f078e78 has the same
+    rule). Only one-chip, one-column stages keep the pipelined launch.
+    VLLM_PP_WAVE_ALWAYS_DRAIN=0/1 overrides.
+    """
+    import os
+
+    env = os.environ if environ is None else environ
+    override = env.get("VLLM_PP_WAVE_ALWAYS_DRAIN")
+    if override is not None:
+        return override == "1"
+    return chips > 1 or columns > 1
+
+
 def stage_chips() -> int:
     """How many chips this worker's pipeline stage spans."""
     from vllm_torchtpu.distributed.chip_topology import get_chip_topology
@@ -227,7 +246,7 @@ class PPWave:
         self.max_rows = int(max_rows)
         self.op = pp_permute_op(get_or_create_pp_mesh(), num_tensors=len(self.carried))
         # See the module docstring.
-        self.drain_before_handoff = stage_chips() > 1
+        self.drain_before_handoff = drain_before_handoff(stage_chips(), self.columns)
         self.async_handoff = (
             self.rank == 0 and self.size > 1 and self.drain_before_handoff
         )
@@ -271,6 +290,7 @@ class PPWave:
             ),
             ", launched from a helper thread" if self.async_handoff else "",
         )
+        logger.info("PP wave: drain_before_handoff=%s (stage chips %d, columns %d)", self.drain_before_handoff, stage_chips(), self.columns)
 
     def _launch_blocking(
         self, carried: tuple[torch.Tensor, ...]

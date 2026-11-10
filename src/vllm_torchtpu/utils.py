@@ -463,6 +463,9 @@ def synchronize_tensors(
     sync.synchronize(tensors=tensors, wait=wait)
 
 
+_FRESH_BUFFER_FALLBACK_LOGGED = False
+
+
 def fresh_buffer(t: torch.Tensor) -> torch.Tensor:
     """Return a copy of `t` backed by a fresh device buffer of its own shape.
 
@@ -480,5 +483,49 @@ def fresh_buffer(t: torch.Tensor) -> torch.Tensor:
     """
     out = torch.clone(t, memory_format=torch.contiguous_format)
     if out.device.type == "tpu":
-        out = out + 0
+        try:
+            out = out + 0
+        except NotImplementedError:
+            # torch_tpu 0.2.1.dev nightlies have no `add` kernel for float8
+            # dtypes ("add(): not implemented for float8_e4m3fn"), which kills
+            # every FP8 checkpoint in process_weights_after_loading; 0.2.0 has
+            # one. The same no-op on the bytes, reinterpreted back, is
+            # bit-exact and still yields a buffer of `t`'s own shape.
+            if out.element_size() != 1:
+                raise
+            out = _float8_fresh_copy(out)
+    return out
+
+
+def _float8_fresh_copy(t: torch.Tensor) -> torch.Tensor:
+    """A copy of the 1-byte tensor `t` in a buffer of its own dtype and shape,
+    for torch_tpu builds without a float8 `add`.
+
+    The bytes must not come back as a uint8 buffer viewed as float8: torch_tpu
+    hands a compiled executable the buffer behind each argument, so that view
+    is re-materialized by a `tt_jit_as_strided` program (an XLA
+    bitcast-convert copy of the whole weight) on every forward, which is the
+    per-step cost fresh_buffer exists to remove. Measured on the PCP prefill
+    stage (job MV): 3,168 such copies per round per core, 83 ms.
+
+    Round-tripping through bfloat16 is bit-exact for every non-NaN float8
+    value (e4m3fn and e5m2 both fit in bfloat16's exponent and mantissa).
+    TPU_FRESH_BUFFER_FP8_UINT8_VIEW=1 restores the old uint8 view (A/B only).
+    """
+    global _FRESH_BUFFER_FALLBACK_LOGGED
+    uint8_view = os.environ.get("TPU_FRESH_BUFFER_FP8_UINT8_VIEW", "0") == "1"
+    if not t.dtype.is_floating_point:
+        uint8_view = True  # no float round trip for 1-byte integer dtypes
+    if not uint8_view:
+        try:
+            out = t.to(torch.bfloat16).to(t.dtype)
+        except (NotImplementedError, RuntimeError):
+            uint8_view = True  # no float8 convert either: keep loading
+    if uint8_view:
+        out = (t.view(torch.uint8) + 0).view(t.dtype)
+    if not _FRESH_BUFFER_FALLBACK_LOGGED:
+        _FRESH_BUFFER_FALLBACK_LOGGED = True
+        logger.warning(
+            "fresh_buffer: float8 add unsupported, using %s (%s)",
+            "a uint8 view" if uint8_view else "a bfloat16 round trip", t.dtype)
     return out

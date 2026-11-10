@@ -220,6 +220,27 @@ def arrival_mirror_rows(recv_rows, e_total, tile_m):
     return recv_rows // tile_m + 2 * e_total + 2
 
 
+def mirror_rows_per_tile(tile_m):
+    """128-lane rows one tile's row scales take in the scale mirror.
+
+    The mirror moves a tile's scales -- tile_m f32 -- as one unit. On a
+    128-lane row that unit is one HBM row: a contiguous 512-byte run inside
+    its (8, 128) tile, which a DMA may address alone. A wider row spans two
+    (8, 128) tiles and Mosaic refuses a one-row slice of it, so a tile above
+    128 rows keeps its scales as this many 128-lane rows instead: the same
+    f32 in the same flat order, so every table that addresses the mirror
+    flat is unchanged.
+    """
+    if tile_m <= HIDDEN_LANE_BLOCK:
+        return 1
+    if tile_m % HIDDEN_LANE_BLOCK:
+        raise ValueError(
+            f"a tile of {tile_m} rows above {HIDDEN_LANE_BLOCK} has to be a whole "
+            f"number of {HIDDEN_LANE_BLOCK}-lane mirror rows"
+        )
+    return tile_m // HIDDEN_LANE_BLOCK
+
+
 def row_lane_blocks(hidden):
     """Lane blocks one token row is staged as: a row is (this many, 128)."""
     return hidden // HIDDEN_LANE_BLOCK
@@ -979,6 +1000,151 @@ def build_routing_tables_sharded(
     )
 
 
+def _stable_rank(keys, start):
+    """``#{j < i : keys[j] == keys[i]}`` for a flat key array, from one stable
+    sort: a key's pairs are contiguous in sorted order, starting at
+    ``start[key]``, so a pair's rank is its sorted position minus that start,
+    scattered back to the pair's own position."""
+    n = keys.shape[0]
+    order = jnp.argsort(keys, stable=True)
+    rank_sorted = jnp.arange(n, dtype=jnp.int32) - start[keys[order]]
+    return jnp.zeros((n,), jnp.int32).at[order].set(rank_sorted)
+
+
+def build_routing_tables_sorted(
+    me,
+    *,
+    e_total,
+    ep,
+    t_local,
+    block,
+    tile_m,
+    shard_stride,
+    gathered,
+):
+    """`build_routing_tables_sharded`'s tables from two stable sorts.
+
+    The sharded builder resolves each pair's rank among same-expert pairs by
+    one-hot passes: a per-block histogram over every expert bin, a rank
+    inside the routing block, and a lookup of the per-block prefix table at
+    the pair's expert -- for this shard's pairs over all experts (arrival
+    rows) and for every pair over this shard's experts (slab rows). A pair's
+    per-block prefix plus its in-block rank is its rank among all earlier
+    same-expert pairs, which a stable argsort of the expert ids gives
+    directly; what is left are gathers on [e_total]- and [ep * e_total]-entry
+    tables. Pairs arrive source-major (shard d's tokens are a contiguous run
+    of blocks), so a pair's rank within its source's run of an expert is its
+    global rank less the same expert's count on earlier sources.
+
+    Every table this returns equals the sharded builder's on every live pair
+    (expert id < e_total) and every small table equals it exactly; padding
+    pairs (expert id e_total) route nowhere and are masked by the combine,
+    and their `slab_row` is the off-shard sentinel in both.
+    Selected by MOE_FUSED_EP_V2_SORTED_PLAN (with the sharded plan).
+    """
+    T, K = gathered.n_tokens, gathered.topk
+    n = T * K
+    g_local = e_total // ep
+    _refuse_bad_plan_args(
+        T, K, e_total=e_total, ep=ep, t_local=t_local, block=block, tile_m=tile_m
+    )
+    if shard_stride % tile_m:
+        raise ValueError(
+            f"the per-shard slab stride {shard_stride} is not a "
+            f"whole number of {tile_m}-row tiles"
+        )
+    rows_by_dest = gathered.rows_by_dest  # [ep, e_total]: pairs of e from source d
+
+    # The small tables: identical arithmetic to the sharded builder.
+    run_rows = rows_by_dest.T
+    run_rows_aligned = (run_rows + (ROWBLK - 1)) & jnp.int32(-ROWBLK)
+    run_start_aligned = jnp.cumsum(run_rows_aligned, axis=1) - run_rows_aligned
+    expert_rows_aligned = run_rows_aligned.sum(axis=1)
+    rows_by_shard = expert_rows_aligned.reshape(ep, g_local)
+    local_base = jnp.cumsum(rows_by_shard, axis=1) - rows_by_shard
+    expert_base = (
+        local_base + (jnp.arange(ep, dtype=jnp.int32)[:, None] * shard_stride)
+    ).reshape(e_total)
+    region_rows = run_rows_aligned.reshape(ep, g_local, ep)
+    rows_per_dest = region_rows.transpose(2, 0, 1).reshape(ep, ep * g_local)
+    recv_base = (jnp.cumsum(rows_per_dest, axis=1) - rows_per_dest).reshape(
+        ep, ep, g_local
+    )
+    recv_rows = rows_per_dest.sum(axis=1)
+    run_tiles = mirror_run_tiles(run_start_aligned, run_rows_aligned, tile_m)
+    shift = pow2_shift(tile_m, "tile_m")
+
+    # Arrival rows of this shard's pairs: rank among this shard's pairs of the
+    # same expert, plus the destination receive base (pos) or the mirror base.
+    my_pairs = gathered.local_blocks.reshape(-1).astype(jnp.int32)
+    my_counts = jnp.concatenate(
+        [rows_by_dest[me], jnp.full((1,), t_local * K, jnp.int32)]
+    )  # the padding bin's start is all live pairs; its count is never read
+    my_start = jnp.cumsum(my_counts) - my_counts
+    my_rank = _stable_rank(my_pairs, my_start)
+    my_recv_base = lax.dynamic_slice(recv_base, (me, 0, 0), (1, ep, g_local)).reshape(
+        e_total
+    )
+    my_run_start = lax.dynamic_slice(run_start_aligned, (0, me), (e_total, 1)).reshape(
+        e_total
+    )
+    zero = jnp.zeros((1,), jnp.int32)
+    pos_table = jnp.concatenate([my_recv_base, zero])
+    mirror_table = jnp.concatenate(
+        [
+            (
+                jnp.right_shift(my_recv_base, shift)
+                + 2 * jnp.arange(e_total, dtype=jnp.int32)
+            )
+            * tile_m
+            + (my_run_start & (tile_m - 1)),
+            zero,
+        ]
+    )
+    pos = (pos_table[my_pairs] + my_rank).reshape(t_local, K)
+    mirror_pos = (mirror_table[my_pairs] + my_rank).reshape(t_local, K)
+
+    # Slab rows of every pair on this shard's experts: global stable rank,
+    # less the same expert's pairs on earlier sources, plus the run's base.
+    all_pairs = gathered.expert_blocks.reshape(-1).astype(jnp.int32)
+    all_counts = jnp.concatenate(
+        [rows_by_dest.sum(axis=0), jnp.full((1,), n, jnp.int32)]
+    )
+    all_start = jnp.cumsum(all_counts) - all_counts
+    rank_all = _stable_rank(all_pairs, all_start)
+    before = jnp.cumsum(rows_by_dest, axis=0) - rows_by_dest  # [ep, e_total]
+    first = me * g_local
+    src = jnp.arange(n, dtype=jnp.int32) // (t_local * K)
+    on_me = (all_pairs >= first) & (all_pairs < first + g_local)
+    row_table = (
+        expert_base[None, :] + run_start_aligned.T - before
+    ).reshape(-1)  # [ep * e_total], indexed source * e_total + expert
+    idx = jnp.where(on_me, src * e_total + all_pairs, 0)
+    slab_row = jnp.where(
+        on_me,
+        row_table[idx] + rank_all,
+        jnp.int32(off_shard_slab_row(shard_stride, ep)),
+    )
+
+    return ShardRoutingTables(
+        pos=pos,
+        mirror_pos=mirror_pos,
+        run_tiles=run_tiles,
+        slab_row=slab_row,
+        run_rows=run_rows,
+        run_rows_aligned=run_rows_aligned,
+        run_start_aligned=run_start_aligned,
+        region_rows=region_rows,
+        recv_base=recv_base,
+        recv_rows=recv_rows,
+        expert_rows_aligned=expert_rows_aligned,
+        expert_base=expert_base,
+        rows_alloc=ep * shard_stride,
+        n_tokens=T,
+        topk=K,
+    )
+
+
 def shard_expert_slabs(routing, me, *, e_total, ep):
     """Shard `me`'s local experts: (rows, slab start) i32 [G], in row units."""
     g_local = e_total // ep
@@ -1451,7 +1617,13 @@ def vmem_scratch_arrays(
             (OUT_PARITIES, tile_m, lane_blocks, HIDDEN_LANE_BLOCK),
             form.wire_dtype,
         ),
-        ("oscl_vm", (OUT_PARITIES, 1, capacity), jnp.float32),
+        (
+            "oscl_vm",
+            (OUT_PARITIES, 1, capacity)
+            if mirror_rows_per_tile(capacity) == 1
+            else (OUT_PARITIES, mirror_rows_per_tile(capacity), HIDDEN_LANE_BLOCK),
+            jnp.float32,
+        ),
     ]
 
 

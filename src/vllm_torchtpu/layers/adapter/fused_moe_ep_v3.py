@@ -524,7 +524,7 @@ def fused_moe_ep(
         w2,
         _squeeze_channel_scale_checked(w1_scale),
         _squeeze_channel_scale_checked(w2_scale),
-        _to_mesh_expert_order(router_logits),
+        _to_mesh_expert_order(_simulated_router_logits(router_logits)),
     )
     if _SKIP_PADDED_TOKENS:
         from vllm_torchtpu.layers.adapter import token_padding
@@ -659,18 +659,34 @@ def check_kernel_threshold(ep: int, tp: int) -> None:
 def _unsupported_simulation_reason() -> str | None:
     """Why a routing simulation strategy rules out v3, or None.
 
-    v2 hands a `uniform_random` draw to its kernel as routing operands; v3
-    has no such operand and always routes on the real router logits, so it
-    refuses every strategy rather than quietly ignore one.
+    `uniform_random` is served like v2 serves it (`_simulated_router_logits`):
+    the kernel's own top-k runs on uniform noise, which is a uniform-random
+    expert draw. Every other strategy is refused rather than quietly ignored.
     """
     from vllm_torchtpu.layers.adapter import moe_routing
 
-    if moe_routing._SIMULATION_STRATEGY is not None:
+    if (
+        moe_routing._SIMULATION_STRATEGY is not None
+        and not moe_routing.is_uniform_random_simulation()
+    ):
         return (
-            "VLLM_MOE_ROUTING_SIMULATION_STRATEGY is set; the v3 kernel "
-            "routes on the real router logits"
+            "VLLM_MOE_ROUTING_SIMULATION_STRATEGY is set to a strategy other "
+            "than uniform_random; the v3 kernel routes on its own top-k"
         )
     return None
+
+
+def _simulated_router_logits(router_logits: torch.Tensor) -> torch.Tensor:
+    """The logits v3's top-k runs on: under `uniform_random` simulation,
+    `moe_routing.uniform_random_logits` (f32 noise anchored to the logits'
+    mean), whose top-k is a uniform-random expert draw, the same gating v2's
+    `_simulated_routing_operands` hands its kernel. Profiling only: the
+    model's output is meaningless. Unchanged when no simulation is set."""
+    from vllm_torchtpu.layers.adapter import moe_routing
+
+    if not moe_routing.is_uniform_random_simulation():
+        return router_logits
+    return moe_routing.uniform_random_logits(router_logits)
 
 
 def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool, activation: str) -> None:

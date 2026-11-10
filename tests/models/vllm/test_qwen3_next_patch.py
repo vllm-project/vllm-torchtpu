@@ -1000,7 +1000,9 @@ def _fake_fused_norm_ops(monkeypatch, moe_calls):
             torch.ones(x.shape[0], 1),
         )
 
-    def gate_se(eps):
+    def gate_se(eps, fuse_id=None, prequant=None):
+        # `_get_norm_fp8_gate_and_se_op(eps, fuse_id)` since DN1c (the layer's
+        # must-fuse id; `prequant` overrides TPU_SE_PREQUANT_KERNEL in later trees).
         def op(x, residual, w_plus_one, *weights):
             assert len(weights) == 5
             s = x + residual

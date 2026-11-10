@@ -38,6 +38,28 @@ from vllm_torchtpu.kernels.experimental.batched_rpa import (
 )
 
 
+def glue_flag(name: str) -> bool:
+    """A PCP glue-trim piece's switch: ``name``=1/0 decides; unset follows the
+    group switch TPU_PCP_GLUE_TRIMS (default off)."""
+    v = os.environ.get(name, "")
+    if v in ("0", "1"):
+        return v == "1"
+    return os.environ.get("TPU_PCP_GLUE_TRIMS", "0") == "1"
+
+
+def lse_lane0_barrier_enabled() -> bool:
+    """TPU_RPA_LSE_LANE0_BARRIER (glue trims): read lane 0 of the kernel's
+    128-lane LSE buffer behind an optimization barrier. Without it, layout
+    assignment relayouts the whole buffer (f32[kv, T, q_per_kv, 128] to a
+    lanes-major layout, 71 MB per call at T=4352) just to slice lane 0; with it
+    XLA emits a lane-0 windowed copy (AOT tpu7x compile of the PCP layer: 3 full
+    relayout copies -> 0). The barrier is an identity, so values are unchanged."""
+    v = os.environ.get("TPU_RPA_LSE_LANE0_BARRIER", "")
+    if v in ("0", "1"):
+        return v == "1"
+    return glue_flag("TPU_RPA_LSE_LANE0_BARRIER") or os.environ.get("TPU_PCP_GLUE2", "0") == "1"
+
+
 def hoist_schedule_enabled() -> bool:
     """Whether cross-layer hoisting of `rpa_metadata_schedule_kernel` is enabled."""
     return os.environ.get("TPU_RPA_HOIST_SCHEDULE", "1") not in (
@@ -190,6 +212,43 @@ def prepare_outputs(out: jax.Array) -> jax.Array:
     return out.reshape(kv_heads, max_tokens, q_per_kv_packed * q_packing, d)
 
 
+def standard_from_raw(
+    o_raw: jax.Array,
+    lse_raw: jax.Array | None,
+    *,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    max_tokens: int,
+) -> tuple[jax.Array, jax.Array | None]:
+    """The kernel's own output/LSE buffers -> [T, H, D] and [T, H] views.
+
+    o_raw: [kv_heads, max_tokens, q_per_kv_aligned // q_packing, q_packing,
+    d_aligned]; lse_raw: [kv_heads, max_tokens, ..., num_lanes] whose first
+    lane holds the value (q_per_kv_aligned entries per token and KV head).
+    """
+    # before: [kv_heads, max_tokens, q_per_kv // q_packing, q_packing, d]
+    o_hbm = prepare_outputs(o_raw)
+    # after: [kv_heads, max_tokens, q_per_kv, d]
+
+    # slice back to original shape if padded
+    num_q_heads_per_kv_head = num_q_heads // num_kv_heads
+    o_hbm = o_hbm[:, :, :num_q_heads_per_kv_head, :head_dim]
+    o_hbm = o_hbm.swapaxes(1, 0).reshape(max_tokens, num_q_heads, head_dim)
+    if lse_raw is None:
+        return o_hbm, None
+
+    # Reshape LSE from [num_kv_heads, max_tokens, q_per_kv(_aligned), num_lanes]
+    # to [max_tokens, num_q_heads]; the first lane holds the value.
+    num_lanes = lse_raw.shape[-1]
+    lse_buf = lse_raw.reshape(num_kv_heads, max_tokens, -1, num_lanes)
+    if lse_lane0_barrier_enabled():
+        lse_buf = jax.lax.optimization_barrier(lse_buf)
+    lse = lse_buf[:, :max_tokens, :num_q_heads_per_kv_head, 0]
+    lse = lse.swapaxes(0, 1).reshape(max_tokens, num_q_heads)
+    return o_hbm, lse
+
+
 def get_kv_cache_shape(
     total_num_pages,
     page_size,
@@ -330,7 +389,7 @@ def calculate_block_sizes(
 
         if serve_cfgs.return_lse:
             lse_array_size = bq_sz * aligned_num_q_heads * num_lanes
-            lse_bytes = lse_array_size * out_bytes * 2
+            lse_bytes = lse_array_size * serve_cfgs.lse_dtype.itemsize * 2
             buffer_bytes += lse_bytes
 
         # Step 2: Calculate worst case memory usage during computation.
@@ -837,8 +896,14 @@ def build_rpa_schedules(
         "cp_group_size",
         "attention_scope",
         "return_lse",
+        "lse_dtype",
+        "lse_compact",
+        "raw_outputs",
+        "schedule_only",
         "native_fp8",
         "native_fp8_prefill",
+        "alias_q",
+        "skip_decode",
     ),
     # Donation of transient inputs can fail for some runtime buffer layouts in
     # the experimental tuning path. Keep donation only for kv_cache, which is
@@ -882,11 +947,18 @@ def ragged_paged_attention(
     cp_rank: jax.Array | None = None,
     attention_scope: configs.AttentionScope = configs.AttentionScope.FULL,
     return_lse: bool = False,
+    lse_dtype: jnp.dtype | None = None,
+    lse_compact: bool = False,
+    raw_outputs: bool = False,
+    schedule_only: bool = False,
+    mixed_schedule_leaves: tuple[jax.Array, ...] | None = None,
     native_fp8: str | None = None,
     native_fp8_prefill: str | None = None,
     precomputed_schedules: (
         tuple[tuple[jax.Array, ...], tuple[jax.Array, ...]] | None
     ) = None,
+    alias_q: bool = True,
+    skip_decode: bool = False,
 ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
     """Perform batched ragged paged attention.
 
@@ -945,6 +1017,24 @@ def ragged_paged_attention(
             tokens. Defaults to FULL.
         return_lse: If True, return log-sum-exp (lse) values along with the
             output. Defaults to False.
+        lse_dtype: Dtype of the returned LSE. Defaults to the output dtype.
+            Pass float32 when the LSE weights a merge with partial results
+            from another kernel.
+        raw_outputs: With return_lse, return the kernel's own buffers instead
+            of the [max_num_tokens, num_q_heads, ...] views: out as
+            [num_kv_heads, max_num_tokens, q_per_kv_aligned // q_packing,
+            q_packing, head_dim_aligned] and lse as [num_kv_heads,
+            max_num_tokens, q_per_kv_aligned, num_lanes] (lane 0 holds the
+            value). A caller that merges partials can then read them in place
+            and skip the per-call relayout copies. Defaults to False.
+        schedule_only: Return only the leaves of the MIXED-mode schedule this
+            call would build (`tree_leaves` order), without running attention.
+            Layers that make the same call (same static arguments and
+            metadata) can share them through `mixed_schedule_leaves`.
+        mixed_schedule_leaves: Leaves from a `schedule_only` call with the same
+            static arguments and metadata; the MIXED kernel uses them instead
+            of building its own schedule. Their shapes must match this call's
+            schedule (the kernel runs without bounds checks), else ValueError.
         native_fp8: Run the DECODE kernel's QK and/or PV matmuls natively in
             the fp8 KV dtype ("qk", "pv", "qkpv", with hi/lo split operands
             "qk2", "pv2", "qk2pv2", or with static operand scales "qks",
@@ -959,6 +1049,13 @@ def ragged_paged_attention(
             forward pass. Used only for the configuration `build_rpa_schedules`
             assumes (no CP, FULL scope, KV update, no LSE, no per-token scale,
             output in the query dtype); any other call builds its own schedule.
+
+        alias_q: False: the kernel output is a fresh buffer, not an alias of the
+            padded q (q stays read-only, so calls sharing one q need no copy).
+            Rows the kernel does not write are undefined. Needs skip_decode.
+        skip_decode: The caller has no decode-range sequences
+            (distribution[0] == 0): skip the DECODE call, which would schedule
+            nothing, and run MIXED only.
 
     Returns:
         out: [max_num_tokens, num_q_heads, head_dim]. Output of self attention.
@@ -976,6 +1073,8 @@ def ragged_paged_attention(
         raise ValueError("Specifying chunk prefill size is not supported.")
     if debug_mode:
         raise ValueError("Debug mode is not supported.")
+    if raw_outputs and not return_lse:
+        raise ValueError("raw_outputs requires return_lse=True.")
 
     # update_kv_cache (as passed by tpu-inference) overrides skip_kv_update when
     # set; update_kv_cache=False (KV-share) is the same as skip_kv_update=True.
@@ -1065,9 +1164,16 @@ def ragged_paged_attention(
         cp_group_size=cp_group_size,
         attention_scope=attention_scope,
         return_lse=return_lse,
+        dtype_lse=None if lse_dtype is None else jnp.dtype(lse_dtype),
         skip_kv_update=skip_kv_update,
+        lse_compact=bool(lse_compact and return_lse),
     )
 
+    if not alias_q and not skip_decode:
+        raise ValueError(
+            "alias_q=False needs skip_decode=True: the DECODE + MIXED chain hands q to "
+            "the MIXED call through the DECODE call's aliased output."
+        )
     q_hbm, new_kv_hbm = prepare_inputs(
         queries,
         keys,
@@ -1097,17 +1203,37 @@ def ragged_paged_attention(
             num_q_heads_per_kv_head, q_packing
         )
         max_tokens = queries.shape[0]
-        lse_hbm_init = jnp.full(
-            [
-                num_kv_heads,
-                max_tokens,
-                aligned_num_q_heads_per_kv_head // q_packing,
-                q_packing,
-                num_lanes,
-            ],
-            -jnp.inf,
-            dtype=out_dtype,
+        lse_packing = serve_cfgs.lse_packing
+        lse_head_dims = (
+            [aligned_num_q_heads_per_kv_head]
+            if lse_packing == 1
+            else [aligned_num_q_heads_per_kv_head // lse_packing, lse_packing]
         )
+        if serve_cfgs.lse_compact:
+            # Lane-dense: flat index t * Gp + g (the kernel keeps it in VMEM).
+            if serve_cfgs.lse_dtype != jnp.float32 or (
+                max_tokens * aligned_num_q_heads_per_kv_head
+            ) % num_lanes:
+                raise ValueError(
+                    "lse_compact needs lse_dtype=float32 and max_tokens * Gp % 128 == 0, got "
+                    f"{serve_cfgs.lse_dtype}, {max_tokens} x {aligned_num_q_heads_per_kv_head}"
+                )
+            lse_hbm_init = jnp.full(
+                [num_kv_heads, max_tokens * aligned_num_q_heads_per_kv_head // num_lanes, num_lanes],
+                -jnp.inf,
+                dtype=jnp.float32,
+            )
+        else:
+            lse_hbm_init = jnp.full(
+                [
+                    num_kv_heads,
+                    max_tokens,
+                    *lse_head_dims,
+                    num_lanes,
+                ],
+                -jnp.inf,
+                dtype=serve_cfgs.lse_dtype,
+            )
 
     # Compute per-sequence length parameters for the kernel.
     q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
@@ -1200,6 +1326,26 @@ def ragged_paged_attention(
                 schedule_hbm = jax.tree_util.tree_unflatten(
                     template_def, list(precomputed_leaves)
                 )
+        if (
+            schedule_hbm is None
+            and mode == configs.RpaCase.MIXED
+            and mixed_schedule_leaves is not None
+        ):
+            template_leaves, template_def = jax.tree_util.tree_flatten(
+                computer_cls.get_rpa_schedule(
+                    cfgs, multiplier=cfgs.max_schedule_size_multiplier
+                )
+            )
+            got = [tuple(x.shape) for x in mixed_schedule_leaves]
+            want = [tuple(x.shape) for x in template_leaves]
+            if got != want:
+                raise ValueError(
+                    "mixed_schedule_leaves do not match this call's schedule: "
+                    f"{got} vs {want}"
+                )
+            schedule_hbm = jax.tree_util.tree_unflatten(
+                template_def, list(mixed_schedule_leaves)
+            )
         if schedule_hbm is None:
             schedule_hbm = schedule.generate_rpa_metadata(
                 cu_q_lens,
@@ -1211,6 +1357,8 @@ def ragged_paged_attention(
                 computer_cls=computer_cls,
                 extra_scalars=extra_scalars,
             )
+        if schedule_only:
+            return schedule_hbm
         result = kernel.rpa_kernel(
             cu_q_lens,
             q_offsets,
@@ -1224,6 +1372,7 @@ def ragged_paged_attention(
             lse_hbm_in,
             cfgs=cfgs,
             computer_cls=computer_cls,
+            **({} if alias_q else {"alias_q": False}),
         )
         if return_lse:
             o_out, kv_out, lse_out = result
@@ -1232,8 +1381,15 @@ def ragged_paged_attention(
             lse_out = None
         return o_out, kv_out, lse_out
 
+    if schedule_only:
+        return tuple(
+            jax.tree_util.tree_leaves(
+                run_rpa_kernel(configs.RpaCase.MIXED, q_hbm, kv_cache, lse_hbm_init)
+            )
+        )
+
     effective_decode_blocks = decode_block_sizes or default_decode
-    if (
+    if not skip_decode and (
         serve_cfgs.total_q_tokens
         <= min(decode_query_size, effective_decode_blocks.bq_sz)
         and cp_group_size is None
@@ -1243,9 +1399,14 @@ def ragged_paged_attention(
             configs.RpaCase.DECODE, q_hbm, kv_cache, lse_hbm_init, decode_dist
         )
     else:
-        o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
-            configs.RpaCase.DECODE, q_hbm, kv_cache, lse_hbm_init
-        )
+        if skip_decode:
+            # The caller has no decode-range sequences (distribution[0] == 0), so
+            # the DECODE call would schedule nothing: skip it.
+            o_hbm_alias_q_hbm, lse_hbm = q_hbm, lse_hbm_init
+        else:
+            o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
+                configs.RpaCase.DECODE, q_hbm, kv_cache, lse_hbm_init
+            )
         # "cond" skips the MIXED call when its sequence range
         # [distribution[0], distribution[2]) (`configs.RpaConfigs.seq_range`)
         # is empty.
@@ -1253,9 +1414,12 @@ def ragged_paged_attention(
         # directly (kernels/static_guards.py).
         rpa_skip_mode = (
             "never"
-            if static_guards.prefill_only()
+            if static_guards.prefill_only() or skip_decode
             else os.environ.get("TPU_RPA_SKIP_MIXED", "cond")
         )
+        # skip_decode callers (the PCP history / current calls) always have a MIXED
+        # range; calling it directly also keeps q's relayout outside any cond branch,
+        # where it can be shared and offloaded (a branch would relayout it again).
         if rpa_skip_mode == "cond":
             if return_lse:
 
@@ -1290,25 +1454,36 @@ def ragged_paged_attention(
                 configs.RpaCase.MIXED, o_hbm_alias_q_hbm, kv_cache, lse_hbm
             )
 
-    # before: [kv_heads, max_tokens, q_per_kv // q_packing, q_packing, d]
-    o_hbm = prepare_outputs(o_hbm_alias_q_hbm)
-    # after: [kv_heads, max_tokens, q_per_kv, d]
+    if return_lse and serve_cfgs.lse_compact:
+        lse_c = cast(jax.Array, lse_hbm)  # [kv_heads, T * Gp // 128, 128], flat t * Gp + g
+        if raw_outputs:
+            return o_hbm_alias_q_hbm, kv_cache, lse_c
+        o_std, _ = standard_from_raw(
+            o_hbm_alias_q_hbm, None, num_q_heads=num_q_heads, num_kv_heads=num_kv_heads,
+            head_dim=head_dim, max_tokens=queries.shape[0],
+        )
+        g = num_q_heads // num_kv_heads
+        lse_std = lse_c.reshape(num_kv_heads, queries.shape[0], -1)[:, :, :g]
+        lse_std = lse_std.swapaxes(0, 1).reshape(queries.shape[0], num_q_heads)
+        return o_std, kv_cache, lse_std
 
-    # slice back to original shape if padded
-    num_q_heads_per_kv_head = num_q_heads // num_kv_heads
-    o_hbm = o_hbm[:, :, :num_q_heads_per_kv_head, :head_dim]
-    o_hbm = o_hbm.swapaxes(1, 0).reshape(queries.shape)
+    if raw_outputs:
+        lse_lanes = pltpu.get_tpu_info().num_lanes
+        lse_raw = cast(jax.Array, lse_hbm)
+        return (
+            o_hbm_alias_q_hbm,
+            kv_cache,
+            lse_raw.reshape(lse_raw.shape[0], lse_raw.shape[1], -1, lse_lanes),
+        )
 
+    o_hbm, lse = standard_from_raw(
+        o_hbm_alias_q_hbm,
+        cast(jax.Array, lse_hbm) if return_lse else None,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        max_tokens=queries.shape[0],
+    )
     if not return_lse:
         return o_hbm, kv_cache
-
-    # Reshape LSE from [num_kv_heads, max_tokens, q_per_kv // q_packing, q_packing
-    # , num_lanes] to [max_tokens, num_q_heads].
-    max_tokens = queries.shape[0]
-    # Extract first lane (scalar LSE value per token-head pair).
-    lse = cast(jax.Array, lse_hbm).reshape(
-        num_kv_heads, max_tokens, aligned_num_q_heads_per_kv_head, num_lanes
-    )[:, :max_tokens, :num_q_heads_per_kv_head, 0]
-    lse = lse.swapaxes(0, 1).reshape(max_tokens, num_q_heads)
-
     return o_hbm, kv_cache, lse

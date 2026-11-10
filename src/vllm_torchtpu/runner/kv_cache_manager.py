@@ -835,10 +835,14 @@ class KVCacheManager:
         budget = utils.compute_hbm_budget(
             [self.runner.device], self.runner.cache_config.gpu_memory_utilization
         )
+        pp_reserve = getattr(type(self.runner), "pp_handoff_hbm_reserve_bytes", None)
         return utils.min_across_ep_dp(
             self.runner.vllm_config.parallel_config,
             budget.available
-            - utils.estimate_kv_connector_hbm_reserve(self.runner.vllm_config),
+            - utils.estimate_kv_connector_hbm_reserve(self.runner.vllm_config)
+            # The ring hand-off's buffers (upstream PR 2527 commit 712a5873b),
+            # as TPUWorker.determine_available_memory subtracts them.
+            - (int(pp_reserve(self.runner)) if pp_reserve is not None else 0),
         )
 
     def _maybe_set_compact_mamba_num_blocks_override(

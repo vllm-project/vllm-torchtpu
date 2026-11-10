@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import collections
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -699,3 +700,164 @@ def test_running_srpf_orders_by_quadratic_effective_cost():
     with patch.object(Scheduler, "schedule", return_value=_EMPTY_STEP):
         scheduler.schedule()
     assert [r.request_id for r in scheduler.running] == ["shallow", "deep"]
+
+
+# TPU_PP_RING_INFLIGHT_RESET (W7 P1): under the ring hand-off the engine sends no
+# pushes or settles, so the in-flight history follows step completions instead.
+
+# The PP4 x PCP2 base's cost model as job j-0f5046d0 run05 logged it
+# (pp_chunk_scheduler.py:393): 8,704-token steps, granularity 5,120.
+_PCP_LINEAR = {1024: 29.4, 2048: 33.3, 3072: 39.2, 4096: 42.5, 4352: 45.3,
+               5120: 47.1, 6144: 53.2, 7168: 74.7, 8192: 83.8, 8704: 89.7}
+
+
+def _pcp_model() -> StepCostModel:
+    return StepCostModel(sorted(_PCP_LINEAR), dict(_PCP_LINEAR), 3.371e-08, 136.5, 5120)
+
+
+def _ring_scheduler(cost=None, running=()) -> TpuPipelineChunkScheduler:
+    scheduler = _scheduler(cost=cost, running=running)
+    scheduler._pp_size = 4
+    scheduler._ring_reset = True
+    scheduler._ring_steps = collections.deque()
+    scheduler._ring_drains = 0
+    return scheduler
+
+
+def _steps(n: int, tokens: int = 4096, req: str = "a") -> list[SimpleNamespace]:
+    return [
+        SimpleNamespace(num_scheduled_tokens={req: tokens}, total_num_scheduled_tokens=tokens)
+        for _ in range(n)
+    ]
+
+
+def _launch(scheduler, steps) -> None:
+    for step in steps:
+        with patch.object(Scheduler, "schedule", return_value=step):
+            scheduler.schedule()
+
+
+def _complete(scheduler, step) -> None:
+    with patch.object(Scheduler, "update_from_output", return_value="out") as base:
+        assert scheduler.update_from_output(step, None) == "out"
+    base.assert_called_once_with(step, None)
+
+
+def test_ring_reset_drops_each_step_when_its_output_comes_back():
+    model = _model()
+    scheduler = _ring_scheduler(cost=model)
+    scheduler.requests = {"a": _request(4096, 32768, "a")}
+    estimate = model.step_ms(4096, 0.0, float(4096**2))
+    steps = _steps(5)
+    _launch(scheduler, steps)
+    # Five steps in flight: the newest stage-count-minus-one are costed.
+    assert scheduler._inflight_ms == [estimate] * 3
+    for done, left in zip(steps, (3, 3, 2, 1, 0)):
+        _complete(scheduler, done)
+        assert scheduler._inflight_ms == [estimate] * left
+    # Drained: a new burst is costed against an empty pipeline, as after a settle.
+    assert scheduler._inflight_ms == []
+    assert scheduler._ring_drains == 1
+    assert len(scheduler._ring_steps) == 0
+
+
+def test_ring_reset_a_completion_releases_every_older_step():
+    model = _model()
+    scheduler = _ring_scheduler(cost=model)
+    scheduler.requests = {"a": _request(4096, 32768, "a")}
+    steps = _steps(4)
+    _launch(scheduler, steps)
+    # The engine reads outputs in launch order: the third step's output means
+    # the first two have left the pipeline as well.
+    _complete(scheduler, steps[2])
+    assert [s for s, _ in scheduler._ring_steps] == [steps[3]]
+    assert len(scheduler._inflight_ms) == 1
+    # An output the scheduler never tracked changes nothing.
+    _complete(scheduler, _steps(1)[0])
+    assert [s for s, _ in scheduler._ring_steps] == [steps[3]]
+
+
+def test_ring_reset_empty_steps_hold_a_place_but_cost_nothing():
+    model = _model()
+    scheduler = _ring_scheduler(cost=model)
+    scheduler.requests = {"a": _request(4096, 32768, "a")}
+    real = _steps(2)
+    empty = [SimpleNamespace(total_num_scheduled_tokens=0) for _ in range(2)]
+    _launch(scheduler, [real[0], empty[0], real[1], empty[1]])
+    estimate = model.step_ms(4096, 0.0, float(4096**2))
+    assert scheduler._inflight_ms == [estimate] * 2
+    assert len(scheduler._ring_steps) == 4
+    # An empty step's output follows every step launched before it.
+    _complete(scheduler, empty[0])
+    assert scheduler._inflight_ms == [estimate]
+    # The trailing empty step's output follows the last real one: everything left.
+    _complete(scheduler, empty[1])
+    assert scheduler._inflight_ms == []
+    assert len(scheduler._ring_steps) == 0
+
+
+def test_ring_reset_opens_the_next_round_against_an_empty_pipeline():
+    # The bench's round: 8,704 new tokens per request behind 95,744 cached.
+    # A round ends on three full steps; when their outputs are back and the
+    # next round's first request is alone, the spread over the stages wins
+    # (5,120-token limit; the 2,176-token mamba alignment makes it 4,352).
+    # Costed against the finished steps instead, a whole 8,704-token step wins.
+    model = _pcp_model()
+    full_step = _steps(3, tokens=8704, req="prev")
+
+    def round_end_then_open(scheduler):
+        scheduler.requests = {"prev": _request(95744 + 8704, 104448, "prev")}
+        _launch(scheduler, full_step)
+        for step in full_step:
+            _complete(scheduler, step)
+        scheduler.running = [_request(95744, 104448, "next")]
+        with patch.object(Scheduler, "schedule", return_value=_EMPTY_STEP):
+            scheduler.schedule()
+        return scheduler._step_limit
+
+    assert round_end_then_open(_ring_scheduler(cost=model)) == 5120
+    stale = _scheduler(cost=model)
+    stale._pp_size = 4
+    assert round_end_then_open(stale) == 8704
+    full = model.step_ms(8704, 8704.0 * 95744, 8704.0**2)
+    assert stale._inflight_ms == [full] * 3
+
+
+def test_ring_reset_is_off_by_default_and_completions_leave_the_history():
+    model = _model()
+    scheduler = _scheduler(cost=model)
+    scheduler._pp_size = 4
+    scheduler.requests = {"a": _request(4096, 32768, "a")}
+    estimate = model.step_ms(4096, 0.0, float(4096**2))
+    steps = _steps(3)
+    _launch(scheduler, steps)
+    for step in steps:
+        _complete(scheduler, step)
+    assert scheduler._inflight_ms == [estimate] * 3
+    assert not hasattr(scheduler, "_ring_steps")
+
+
+@pytest.mark.parametrize(
+    "value,handoff,inflight,want",
+    [
+        (None, "ring", True, False),
+        ("0", "ring", True, False),
+        ("1", "ring", True, True),
+        ("true", "ring", True, True),
+        ("1", "wave", True, False),
+        ("1", "ring", False, False),
+    ],
+)
+def test_ring_reset_applies_only_when_asked_under_the_ring_with_costing(
+    monkeypatch, value, handoff, inflight, want
+):
+    if value is None:
+        monkeypatch.delenv("TPU_PP_RING_INFLIGHT_RESET", raising=False)
+    else:
+        monkeypatch.setenv("TPU_PP_RING_INFLIGHT_RESET", value)
+    # setenv, not setattr on envs: envs resolves through os.environ, and a setattr
+    # would leave a module attribute behind that shadows it for later tests.
+    monkeypatch.setenv("TPU_PP_HANDOFF", handoff)
+    scheduler = _scheduler()
+    scheduler._inflight_cost = inflight
+    assert scheduler._ring_reset_wanted() is want

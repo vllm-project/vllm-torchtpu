@@ -61,6 +61,33 @@ class PcpStageMetadata:
     projection_catchup_count: jax.Array
     projection_work_offset: jax.Array
     projection_work_offset_end: jax.Array
+    # TPU_PCP_GDN_BA_DIRECT (lane r1p GDN): first row of each tile's b/a in the
+    # rank-major packed BA shard (the all_to_all's output order). None when off,
+    # so the kernel's operand list is unchanged.
+    tile_ba_row: jax.Array | None = None
+
+
+def with_packed_ba_rows(
+    stage_metadata: "PcpStageMetadata",
+    num_tiles: jax.Array,
+    *,
+    local_rows: int,
+    comm_chunk_size: int,
+) -> "PcpStageMetadata":
+    """Add ``tile_ba_row``: tile t of stage s that reads rank r's rows
+    ``[off, off + n)`` of the stage reads packed BA rows
+    ``r * local_rows + rank_row_start[s, r] + off`` (rank r's valid rows are
+    contiguous in its local shard from ``rank_row_start``). Inactive tiles get 0."""
+    i32 = jnp.int32
+    tile_stage = stage_metadata.tile_stage.astype(i32)
+    row_in_stage = stage_metadata.tile_row_in_stage.astype(i32)
+    src_rank = row_in_stage // comm_chunk_size
+    offset = row_in_stage - src_rank * comm_chunk_size
+    rank_rows = stage_metadata.rank_row_start
+    rank_start = rank_rows.reshape(-1)[tile_stage * rank_rows.shape[1] + src_rank]
+    t = jnp.arange(tile_stage.shape[0], dtype=i32)
+    rows = jnp.where(t < num_tiles, src_rank * local_rows + rank_start + offset, 0).astype(i32)
+    return dataclasses.replace(stage_metadata, tile_ba_row=rows)
 
 
 @jax.tree_util.register_dataclass
@@ -121,6 +148,170 @@ def _schedule_capacities(
     # smaller than one GDN tile.
     max_tiles = pl.cdiv(cfg.batch_size, cfg.tile_size) + pcp_size * max_stages
     return max_stages, max_tiles
+
+
+def pcp_vectorized_metadata_enabled() -> bool:
+    """TPU_PCP_GDN_VEC_METADATA=1: build the PCP stage/tile schedule with
+    closed-form vector ops instead of nested scalar while loops (same arrays).
+    The loops cost ~0.5 ms of scalar XLA work per computation on TPU."""
+    import os
+
+    return os.environ.get("TPU_PCP_GDN_VEC_METADATA", "0") == "1"
+
+
+def _vectorized_schedule(
+    cfg: config.GDNConfig,
+    query_start_loc: jax.Array,
+    start_seq: jax.Array,
+    end_seq: jax.Array,
+    token_owner_starts: jax.Array,
+    *,
+    pcp_size: int,
+    comm_chunk_size: int,
+    max_stages: int,
+    max_tiles: int,
+) -> _BuilderState:
+    """Closed-form equivalent of the request/window/rank/tile loops."""
+    i32 = jnp.int32
+    P = pcp_size
+    C = comm_chunk_size
+    T = cfg.tile_size
+    round_size = P * C
+    R = token_owner_starts.size
+    ranks = jnp.arange(P, dtype=i32)
+    req = jnp.arange(R, dtype=i32)
+    qb = query_start_loc[:-1]
+    qe = query_start_loc[1:]
+    ql = qe - qb
+    ob = token_owner_starts
+    oe = ob + ql
+    visited = req < end_seq
+    emit = visited & (req >= start_seq) & (ql > 0)
+
+    def count_before(pos):  # pos [...], -> [..., P]
+        return _rank_token_count_before(
+            pos[..., None], ranks, pcp_size=P, comm_chunk_size=C
+        )
+
+    rank_counts = jnp.where(visited[:, None], count_before(oe) - count_before(ob), 0)
+    req_rank_start = jnp.cumsum(rank_counts, axis=0, dtype=i32) - rank_counts
+    first_window = (ob // round_size) * round_size
+    nwin = jnp.where(emit, pl.cdiv(oe - first_window, round_size), 0).astype(i32)
+    win_incl = jnp.cumsum(nwin, dtype=i32)
+    active_stages = win_incl[-1] if R > 0 else jnp.asarray(0, i32)
+
+    s = jnp.arange(max_stages, dtype=i32)
+    s_active = s < active_stages
+    r_of_s = jnp.minimum(
+        jnp.searchsorted(win_incl, s, side="right", method="compare_all").astype(i32),
+        R - 1,
+    )
+    k = s - (win_incl[r_of_s] - nwin[r_of_s])
+    window = first_window[r_of_s] + k * round_size
+    s_ob = ob[r_of_s]
+    s_oe = oe[r_of_s]
+    rcb = window[:, None] + ranks[None, :] * C
+    valid = jnp.maximum(
+        jnp.minimum(rcb + C, s_oe[:, None]) - jnp.maximum(rcb, s_ob[:, None]), 0
+    )
+    valid = jnp.where(s_active[:, None], valid, 0).astype(i32)
+    consumed = count_before(jnp.clip(window, s_ob, s_oe)) - count_before(s_ob)
+    rank_row_start = jnp.where(
+        s_active[:, None], req_rank_start[r_of_s] + consumed, 0
+    ).astype(i32)
+    dense_starts = jnp.cumsum(valid, axis=1, dtype=i32) - valid
+    stage_query_begin = qb[r_of_s] + jnp.maximum(window, s_ob) - s_ob
+    stage_tokens = jnp.sum(valid, axis=1, dtype=i32)
+
+    ntiles = pl.cdiv(valid, T).astype(i32)  # [S, P], 0 when inactive
+    flat = ntiles.reshape(-1)
+    tile_incl = jnp.cumsum(flat, dtype=i32)
+    tile_excl = tile_incl - flat
+    active_tiles = tile_incl[-1]
+    first_tile = jnp.where(s_active, tile_excl.reshape(max_stages, P)[:, 0], 0)
+    stage_num_tiles = jnp.sum(ntiles, axis=1, dtype=i32)
+
+    t = jnp.arange(max_tiles, dtype=i32)
+    t_active = t < active_tiles
+    sp = jnp.minimum(
+        jnp.searchsorted(tile_incl, t, side="right", method="compare_all").astype(i32),
+        max_stages * P - 1,
+    )
+    ts = sp // P
+    tp = sp % P
+    ti = t - tile_excl[sp]
+    t_rows = valid[ts, tp]
+    off = ti * T
+    real_size = jnp.minimum(t_rows - off, T)
+    t_req = r_of_s[ts]
+    query_row = stage_query_begin[ts] + dense_starts[ts, tp] + off
+
+    def tz(x, dtype=i32):
+        return jnp.where(t_active, x, jnp.zeros((), dtype)).astype(dtype)
+
+    def sz(x):
+        return jnp.where(s_active, x, 0).astype(i32)
+
+    stage_row_end = jnp.where(s_active[:, None], rank_row_start + valid, 0)
+    rank_active_row_end = jnp.maximum(jnp.max(stage_row_end, axis=0), 0).astype(i32)
+    return _BuilderState(
+        request_index=jnp.asarray(0, i32),
+        active_stages=active_stages.astype(i32),
+        active_tiles=active_tiles.astype(i32),
+        rank_row_offsets=jnp.zeros((P,), i32),
+        rank_active_row_end=rank_active_row_end,
+        request_id=sz(r_of_s),
+        query_row_start=sz(stage_query_begin),
+        num_tokens=sz(stage_tokens),
+        rank_row_start=rank_row_start,
+        rank_valid_rows=valid,
+        rank_recv_start=jnp.where(
+            s_active[:, None], jnp.broadcast_to(ranks * C, (max_stages, P)), 0
+        ).astype(i32),
+        first_tile=first_tile.astype(i32),
+        stage_num_tiles=sz(stage_num_tiles),
+        tile_stage=tz(ts),
+        tile_row_in_stage=tz(tp * C + off),
+        tile_request_id=tz(t_req),
+        tile_query_row_start=tz(query_row),
+        tile_num_tokens=tz(real_size),
+        tile_is_first=tz(query_row == qb[t_req], jnp.bool_),
+        tile_is_last=tz(query_row + real_size == qe[t_req], jnp.bool_),
+    )
+
+
+def _vectorized_projection_plan(
+    result: _BuilderState,
+    *,
+    max_stages: int,
+    pcp_size: int,
+    projection_token_block_size: int,
+    num_qkv_out_blocks: int,
+    num_projection_out_blocks: int,
+):
+    """Closed form of the catch-up recurrence: cum_s = max(cum_{s-1}, req_s - launch_s)."""
+    i32 = jnp.int32
+    num_z = num_projection_out_blocks - num_qkv_out_blocks
+    s = jnp.arange(max_stages, dtype=i32)
+    s_active = (s < result.active_stages)[:, None]
+    stage_row_end = result.rank_row_start + result.rank_valid_rows
+    blocks = pl.cdiv(stage_row_end, projection_token_block_size)
+    required = jnp.where(
+        blocks <= 1, 0, num_z + (blocks - 2) * num_projection_out_blocks + num_qkv_out_blocks
+    )
+    prev_first = jnp.concatenate([jnp.zeros((1,), i32), result.first_tile[:-1]])
+    launch = jnp.where(s == 0, 0, prev_first)[:, None]
+    need = jnp.where(s_active, required - launch, 0)
+    cum = jnp.maximum(jax.lax.cummax(need, axis=0), 0).astype(i32)
+    cum = jnp.where(s_active, cum, 0)
+    cum_prev = jnp.concatenate([jnp.zeros((1, pcp_size), i32), cum[:-1]], axis=0)
+    catchup_start = jnp.where(s_active, launch + cum_prev, 0).astype(i32)
+    catchup_count = jnp.where(s_active, cum - cum_prev, 0).astype(i32)
+    last = jnp.maximum(result.active_stages - 1, 0)
+    work_offset_end = jnp.where(result.active_stages > 0, cum[last], 0).astype(i32)
+    nxt = jnp.minimum(s + 1, last)
+    work_offset = jnp.where(s_active, cum[nxt], 0).astype(i32)
+    return catchup_start, catchup_count, work_offset, work_offset_end
 
 
 def compute_pcp_stage_metadata(
@@ -434,8 +625,47 @@ def _compute_pcp_stage_metadata_from_coordinates(
             rank_row_offsets=next_rank_offsets,
         )
 
-    result = jax.lax.while_loop(_requests_pending, _emit_request, initial)
+    vectorized = pcp_vectorized_metadata_enabled()
+    if vectorized:
+        result = _vectorized_schedule(
+            cfg,
+            query_start_loc,
+            start_seq,
+            end_seq,
+            token_owner_starts,
+            pcp_size=pcp_size,
+            comm_chunk_size=comm_chunk_size,
+            max_stages=max_stages,
+            max_tiles=max_tiles,
+        )
+    else:
+        result = jax.lax.while_loop(_requests_pending, _emit_request, initial)
     has_initial_state = request_absolute_starts > 0
+
+    if vectorized:
+        (
+            projection_catchup_start,
+            projection_catchup_count,
+            projection_work_offset,
+            projection_work_offset_end,
+        ) = _vectorized_projection_plan(
+            result,
+            max_stages=max_stages,
+            pcp_size=pcp_size,
+            projection_token_block_size=projection_token_block_size,
+            num_qkv_out_blocks=num_qkv_out_blocks,
+            num_projection_out_blocks=num_projection_out_blocks,
+        )
+        return _finish_metadata(
+            cfg,
+            result,
+            has_initial_state,
+            state_indices,
+            projection_catchup_start,
+            projection_catchup_count,
+            projection_work_offset,
+            projection_work_offset_end,
+        )
 
     num_z_out_blocks = num_projection_out_blocks - num_qkv_out_blocks
     projection_catchup_count = jnp.zeros(
@@ -530,6 +760,28 @@ def _compute_pcp_stage_metadata_from_coordinates(
         projection_work_offset,
     )
 
+    return _finish_metadata(
+        cfg,
+        result,
+        has_initial_state,
+        state_indices,
+        projection_catchup_start,
+        projection_catchup_count,
+        projection_work_offset,
+        projection_work_offset_end,
+    )
+
+
+def _finish_metadata(
+    cfg,
+    result,
+    has_initial_state,
+    state_indices,
+    projection_catchup_start,
+    projection_catchup_count,
+    projection_work_offset,
+    projection_work_offset_end,
+):
     gdn_metadata = memory_ref.MetadataRef.create(
         cfgs=cfg,
         num_tiles=result.active_tiles,
