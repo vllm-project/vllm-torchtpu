@@ -193,4 +193,3 @@ def test_topk_mask_max_k_parity_with_ties():
     expected = sampling.apply_top_k_top_p(logits, top_k, top_p, max_k=0)
     result = sampling.apply_top_k_top_p(logits, top_k, top_p, max_k=32)
     torch.testing.assert_close(result, expected, rtol=0, atol=0)
-
