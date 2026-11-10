@@ -259,9 +259,11 @@ def _prepare_publish_swa(
     positions: jax.Array,
     minimum: jax.Array,
     values: jax.Array,
+    page_stride: int,
+    row_offset: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     metadata, bounds, records = _metadata(
-        table, starts, positions, minimum, 64, 64, 0, False
+        table, starts, positions, minimum, 64, page_stride, row_offset, False
     )
     owner = write_swa_word_pool(raw, records, values, page_size=64)
     return owner, metadata, bounds, records
@@ -275,20 +277,22 @@ def _prepare_publish_swa_banked(
     positions: jax.Array,
     minimum: jax.Array,
     values: jax.Array,
+    page_stride: int,
+    row_offset: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     metadata, bounds, records = _metadata(
-        table, starts, positions, minimum, 64, 64, 0, False
+        table, starts, positions, minimum, 64, page_stride, row_offset, False
     )
     owner = write_swa_word_pool((raw, high), records, values, page_size=64)
     return *owner, metadata, bounds, records
 
 
-def _fake_prepare_publish_swa(raw, table, starts, positions, minimum, values):
+def _fake_prepare_publish_swa(raw, table, starts, positions, minimum, values, *_):
     return torch.empty_like(raw), *_fake_metadata(table, starts, positions, minimum, 64)
 
 
 def _fake_prepare_publish_swa_banked(
-    raw, high, table, starts, positions, minimum, values
+    raw, high, table, starts, positions, minimum, values, *_
 ):
     return (
         torch.empty_like(raw),
@@ -354,13 +358,13 @@ def initialize_csa2_ops() -> None:
         (
             "prepare_publish_swa",
             _prepare_publish_swa,
-            (P(),) * 6,
+            (P(),) * 6 + (None,) * 2,
             _fake_prepare_publish_swa,
         ),
         (
             "prepare_publish_swa_banked",
             _prepare_publish_swa_banked,
-            (P(),) * 7,
+            (P(),) * 7 + (None,) * 2,
             _fake_prepare_publish_swa_banked,
         ),
         (
@@ -646,7 +650,15 @@ def prepare_publish_swa(
     values: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Publish into the shared word pool while creating the shared metadata."""
-    args = (table.int(), starts.int(), positions.int(), minimum.int(), values)
+    args = (
+        table.int(),
+        starts.int(),
+        positions.int(),
+        minimum.int(),
+        values,
+        cache.page_stride,
+        cache.row_offset,
+    )
     if cache.raw_hi is None:
         raw, metadata, bounds, records = _ops["prepare_publish_swa"](cache.raw, *args)
         cache.raw.copy_(raw)

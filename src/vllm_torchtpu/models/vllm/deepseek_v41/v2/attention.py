@@ -2,6 +2,7 @@
 
 import contextlib
 import dataclasses
+import math
 from collections.abc import Callable
 from typing import Any, cast
 
@@ -21,6 +22,7 @@ from vllm.models.deepseek_v41 import attention as upstream
 from vllm.models.deepseek_v41 import compressor as compressor_upstream
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 
+from vllm_torchtpu.kernels.experimental import decode_preparation
 from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
@@ -36,6 +38,8 @@ from .attention_kernels import (
     sparse_fp8_attention_qo,
 )
 from .cache import (
+    BLOCK_STRIDE_ALIGNMENT,
+    SWA_PAGE_TOKENS,
     IndexCacheRows,
     NativeCacheView,
     PagedCacheRows,
@@ -242,6 +246,12 @@ class CompressorStateCache(NativeCacheView, compressor_upstream.CompressorStateC
     def get_attn_backend(self):
         return AttentionBackend
 
+    def get_kv_cache_spec(self, vllm_config):
+        return dataclasses.replace(
+            super().get_kv_cache_spec(vllm_config),
+            block_stride_alignment=BLOCK_STRIDE_ALIGNMENT,
+        )
+
 
 def save_compress_norm(
     kv_score,
@@ -413,7 +423,10 @@ class AttentionBackend(compressor_upstream.CompressorBackend):
 
 class SWACache(NativeCacheView, DeepseekV4SWACache):
     def __init__(self, *args, **kwargs):
-        kwargs["block_size"] = kwargs["cache_config"].block_size
+        # SWA pages keep CSA2's 64-token word-pool geometry, independent of the
+        # compressed caches' `--block-size`: a larger compressed block then
+        # packs several SWA layers into one block-outer cache group.
+        kwargs["block_size"] = SWA_PAGE_TOKENS
         # Upstream ties bounded replay to its V2 model runner; the TPU model
         # implements the replay itself (see `prefix_replay_enabled`).
         kwargs["bounded_replay"] = prefix_replay_enabled(get_current_vllm_config())
@@ -421,6 +434,12 @@ class SWACache(NativeCacheView, DeepseekV4SWACache):
         kwargs["dtype"] = torch.bfloat16
         kwargs["backend_cls"] = AttentionBackend
         super().__init__(*args, **kwargs)
+
+    def get_kv_cache_spec(self, vllm_config):
+        return dataclasses.replace(
+            super().get_kv_cache_spec(vllm_config),
+            block_stride_alignment=BLOCK_STRIDE_ALIGNMENT,
+        )
 
 
 def _value(output):
@@ -456,6 +475,20 @@ def _row_slots(cache, block_table, requests, logical):
         dim=1,
     ).long()
     return blocks * cache.shape[1] + safe % cache.shape[1]
+
+
+def _bound_geometry(module) -> tuple[int, int, int] | None:
+    """``(records per page, page stride, row offset)`` of a bound native cache.
+
+    Read from the allocator layout in record units, like `PagedCacheRows`, so
+    it is available before the first forward builds a cache view.
+    """
+    layout = getattr(module, "_tpu_cache_layout", None)
+    if layout is None:
+        return None
+    shape, dtype, stride_bytes, offset_bytes = layout
+    record_bytes = math.prod(shape[2:]) * dtype.itemsize
+    return shape[1], stride_bytes // record_bytes, offset_bytes // record_bytes
 
 
 def _index_page_records(index_cache):
@@ -529,6 +562,9 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
     _fused_preprocess = False
     _packed_compressor_op: Any = None
     _address_compressor_op: Any = None
+    # `CompressorLayout` fields the fused compressor ops were built for, set
+    # once the KV cache is bound (`bind_compressor_layout`).
+    _compressor_layout_fields: tuple[int, ...] | None = None
     _swa_query_group_size = 1
 
     @classmethod
@@ -630,7 +666,10 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
 
     def get_kv_cache_spec(self, vllm_config):
         spec = super().get_kv_cache_spec(vllm_config)
-        if spec is None or not self._fp8_kv:
+        if spec is None:
+            return spec
+        spec = dataclasses.replace(spec, block_stride_alignment=BLOCK_STRIDE_ALIGNMENT)
+        if not self._fp8_kv:
             return spec
         return dataclasses.replace(spec, dtype=torch.uint8, page_size_padded=None)
 
@@ -872,7 +911,41 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 main_offset=main_cache.row_offset,
                 index_capacity=index_cache.shape[1],
             )
-        return preprocess_ops.compressor_layout_admitted(region, **fields)
+        return preprocess_ops.compressor_layout_admitted(
+            region, self._compressor_layout_fields, **fields
+        )
+
+    def bind_compressor_layout(self) -> None:
+        """Rebuild the fused ratio-2 compressor ops for the bound cache geometry.
+
+        Weights load before the KV cache is bound, so the ops built in
+        `process_weights_after_loading` carry the default layout. Block-outer
+        groups give every layer its own state/main offsets, so each layer's
+        kernels are specialized for its own pages here, before any forward.
+        """
+        if self._packed_compressor_op is None or self.compressor is None:
+            return
+        state = _bound_geometry(self.compressor.state_cache)
+        main = _bound_geometry(self)
+        index = _bound_geometry(self.indexer.k_cache)
+        if state is None or main is None or index is None:
+            return
+        layout = decode_preparation.CompressorLayout(
+            state_capacity=state[0],
+            state_stride=state[1],
+            state_offset=state[2],
+            window=self.window_size,
+            main_capacity=main[0],
+            main_stride=main[1],
+            main_offset=main[2],
+            index_capacity=index[0],
+        )
+        eps = self.compressor.rms_norm_eps
+        self._packed_compressor_op = preprocess_ops.compress_rope_packed(eps, layout)
+        self._address_compressor_op = preprocess_ops.compress_rope_addresses(
+            eps, layout
+        )
+        self._compressor_layout_fields = dataclasses.astuple(layout)
 
     def _write_csa2_global_kv(self, hidden_states, positions):
         """Fused compressor: one kernel projects, pools (reading and writing the
@@ -1226,8 +1299,10 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 if (
                     self._fused_preprocess
                     and swa_cache.swa_words
-                    and rows_per_page == swa_cache.page_stride == 64
-                    and swa_cache.row_offset == 0
+                    # Stride and offset are whole pages (`PagedCacheRows`
+                    # checks this for word-pool owners); block-outer groups
+                    # place each SWA layer at its own page of the block.
+                    and rows_per_page == SWA_PAGE_TOKENS
                     and not non_causal
                 ):
                     csa2_metadata, csa2_bounds, csa2_write_records = (
