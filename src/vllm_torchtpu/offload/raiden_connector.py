@@ -98,6 +98,7 @@ from vllm.v1.request import Request
 
 from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.offload import contiguous_alloc
 from vllm_torchtpu.offload.raiden_store import (
     AdmissionOp,
     RaidenLoadStoreSpec,
@@ -264,6 +265,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
     # (class defaults also cover instances built without __init__).
     _write_back: WriteBackPolicy | None = None
     _block_pool = None
+    _contiguous_alloc_scan_factor = 3
 
     def __init__(
         self,
@@ -275,8 +277,12 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         assert isinstance(self.manager, RaidenOffloadingManager)
         self._raiden_manager: RaidenOffloadingManager = self.manager
         self._fence_pending: dict[int, _ParkedStore] = {}
-        self._write_back = WriteBackPolicy.from_extra_config(
-            getattr(spec, "extra_config", None) or {}
+        extra_config = getattr(spec, "extra_config", None) or {}
+        self._write_back = WriteBackPolicy.from_extra_config(extra_config)
+        # How deep into the oldest free blocks an allocation of n blocks may
+        # look for consecutive ids (`contiguous_alloc`); <= 1 turns it off.
+        self._contiguous_alloc_scan_factor = int(
+            extra_config.get("contiguous_alloc_scan_factor", 3)
         )
         # Write-back state: finished requests whose chunks are not stored yet
         # (their finish is deferred), the blocks each one would store, and
@@ -288,8 +294,21 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
 
     def attach_block_pool(self, block_pool) -> None:
         """`EvictionAwareConnector`: the scheduler's block pool, whose free
-        queue tells write-back which finished requests near eviction."""
+        queue tells write-back which finished requests near eviction. Its
+        fresh blocks come out as consecutive runs (`contiguous_alloc`)."""
         self._block_pool = block_pool
+        # No deeper than the write-back window looks for requests to flush, so
+        # a held request's blocks are reused no earlier than write-back can see
+        # them coming (one it has not flushed yet is dropped, as before).
+        contiguous_alloc.install(
+            block_pool,
+            scan_factor=self._contiguous_alloc_scan_factor,
+            max_scan=(
+                self._write_back.window_blocks
+                if self._write_back
+                else WriteBackPolicy.window_blocks
+            ),
+        )
 
     def _wb_unregister(self, req_id: str) -> None:
         for bid in self._wb_blocks.pop(req_id, ()):
@@ -523,7 +542,9 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         just allocated for the load hold nothing yet, so which key lands in
         which of them is free: sort them, and hand the lowest one to the key
         with the lowest host block. The request's block list is permuted in
-        place, so its block table and later prefix caching follow.
+        place, so its block table and later prefix caching follow: `blocks`
+        must wrap the KV cache manager's own lists, as the scheduler's
+        `get_blocks()` does on the async-load path this connector takes.
         """
         req_status = self._req_status.get(request.request_id)
         if req_status is None or len(req_status.transfer_jobs) != 1:
