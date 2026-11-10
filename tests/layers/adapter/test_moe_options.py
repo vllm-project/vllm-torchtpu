@@ -71,3 +71,8 @@ def test_the_section_is_registered_and_hashed():
     assert mo.SECTION in sections.KNOWN_SECTIONS
     sections.check({mo.SECTION: {"lowtok_fused_fp8_dispatch": False}})
     assert mo.SECTION not in HASH_IGNORED_ADDITIONAL_CONFIG_KEYS
+
+
+def test_no_engine_config_gives_the_defaults():
+    """Outside an engine the config getter returns None."""
+    assert mo.get(None) == mo.MoeOptions()

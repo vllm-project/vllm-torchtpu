@@ -1095,13 +1095,14 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             self._moe_lowtok_scores_op is not None
             and layer.moe_config.moe_parallel_config.use_ep
         ):
-            from vllm.config import get_current_vllm_config
+            from vllm.config import get_current_vllm_config_or_none
 
             from vllm_torchtpu.layers.adapter import moe_lowtok_fused_op
 
             # Under the loader's config context, for the tpu_moe options.
             moe_lowtok_fused_op.prebuild(
-                get_current_vllm_config(), int(layer.moe_config.experts_per_token)
+                get_current_vllm_config_or_none(),
+                int(layer.moe_config.experts_per_token),
             )
         if self._use_adaptive_fused_moe:
             self._adaptive_fused_moe_op = adaptive_moe.prebuild_adaptive_fused_moe(

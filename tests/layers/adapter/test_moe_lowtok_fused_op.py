@@ -272,3 +272,10 @@ def test_v3_entry_keeps_vllms_dispatch_otherwise(monkeypatch, v3_method):
     apply.assert_not_called()
     ep.dispatch_router_logits.assert_called_once()
     method.apply_monolithic_external_dispatch.assert_called_once()
+
+
+def test_prebuild_without_an_engine_config_uses_the_default_options(monkeypatch, fresh):
+    _layout(monkeypatch, dp=4, tp=2)
+    op.prebuild(None, TOPK)
+    assert op._ARMED is True
+    assert op._FP8_DISPATCH is True
