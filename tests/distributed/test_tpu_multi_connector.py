@@ -235,9 +235,10 @@ class TestTPUMultiConnectorHybridHitForwarding:
     """The prefix-hit hooks PrefixAwareScheduler calls on the connector."""
 
     @staticmethod
-    def _multi(*children):
+    def _multi(*children, producer_divergent_hits=True):
         connector = object.__new__(TPUMultiConnector)
         connector._connectors = list(children)
+        connector._producer_divergent_hits = producer_divergent_hits
         return connector
 
     def test_divergent_hits_claimed_when_any_child_supports_them(self):
@@ -277,3 +278,43 @@ class TestTPUMultiConnectorHybridHitForwarding:
         assert multi.poll_and_complete_transfers(scheduler) == (15, 1, 2, True)
         first.poll_and_complete_transfers.assert_called_once_with(scheduler)
         second.poll_and_complete_transfers.assert_called_once_with(scheduler)
+
+
+class TestProducerDivergentHitsOption:
+    """producer_divergent_hits is opt-in: unset, upstream's every-child rule
+    decides, which on a producer is False (the transfer child never loads)."""
+
+    @staticmethod
+    def _config(kv_role, option):
+        cfg = _make_vllm_config(kv_role, children=("_IncapableChild", "_CapableChild"))
+        if option is not None:
+            cfg.kv_transfer_config.kv_connector_extra_config[
+                "producer_divergent_hits"
+            ] = option
+        return cfg
+
+    @pytest.mark.parametrize(
+        ("kv_role", "option", "expected"),
+        [
+            ("kv_producer", None, False),
+            ("kv_producer", False, False),
+            ("kv_producer", True, True),
+            # On a consumer the option changes nothing: every child must agree.
+            ("kv_consumer", True, False),
+            ("kv_consumer", None, False),
+        ],
+    )
+    def test_capability(self, kv_role, option, expected):
+        connector = TPUMultiConnector(
+            self._config(kv_role, option), KVConnectorRole.SCHEDULER, MagicMock()
+        )
+        assert connector.supports_divergent_local_hybrid_hits is expected
+
+    @pytest.mark.parametrize("value", ["true", 1, "1"])
+    def test_option_must_be_a_json_boolean(self, value):
+        with pytest.raises(ValueError, match="producer_divergent_hits"):
+            TPUMultiConnector(
+                self._config("kv_producer", value),
+                KVConnectorRole.SCHEDULER,
+                MagicMock(),
+            )

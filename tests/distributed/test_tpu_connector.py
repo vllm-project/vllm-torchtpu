@@ -21,6 +21,7 @@ queries) are mocked at construction time so that all tests run without a real
 TPU.
 """
 
+import concurrent.futures
 import contextlib
 import sys
 import threading
@@ -388,6 +389,7 @@ def _make_raiden_worker(
     kv_ports: Any = 9100,
     send_completion: bool = False,
     load_failure_policy: str = "recompute",
+    extra_config: dict[str, Any] | None = None,
 ) -> TPURaidenConnectorWorker:
     cfg = _make_vllm_config(
         is_producer=is_producer,
@@ -403,6 +405,7 @@ def _make_raiden_worker(
     cfg.additional_config = {"raiden_pd_send_completion": send_completion}
     cfg.kv_transfer_config.kv_connector = "TPURaidenConnector"
     cfg.kv_transfer_config.kv_load_failure_policy = load_failure_policy
+    cfg.kv_transfer_config.kv_connector_extra_config = dict(extra_config or {})
     with (
         patch(f"{_MOD}.get_tensor_model_parallel_rank", return_value=tp_rank),
         patch(f"{_MOD}.get_tensor_model_parallel_world_size", return_value=tp_size),
@@ -8597,11 +8600,7 @@ class TestStage3AsyncRegister:
             patch.object(
                 worker, "_new_raiden_controller_facade", return_value=MagicMock()
             ),
-            patch(
-                f"{_MOD}.tpu_envs.TPU_RAIDEN_STAGE3_ASYNC_REGISTER_DELAY_MS",
-                5000.0,
-                create=True,
-            ),
+            patch(f"{_MOD}._STAGE3_ASYNC_REGISTER_DELAY_S", 5.0),
         ):
             worker._submit_stage3_registration(meta)
             assert not started.wait(0.1)
@@ -8671,3 +8670,101 @@ class TestStage3AsyncRegister:
             worker._submit_stage3_registration(meta)
             with pytest.raises(RuntimeError, match="boom"):
                 worker._reap_stage3_registrations({"r1"})
+
+
+class TestStage3ConnectorOptions:
+    """async_complete, async_register and late_poll are opt-in
+    kv_connector_extra_config options: unset, the connector behaves as before."""
+
+    def test_options_default_off(self):
+        worker = _make_raiden_worker(is_producer=True)
+        assert not worker._async_complete
+        assert not worker._async_register
+        assert not worker.late_poll_enabled
+
+    def test_options_follow_the_connector_extra_config(self):
+        worker = _make_raiden_worker(
+            is_producer=False,
+            extra_config={"async_complete": True, "late_poll": True},
+        )
+        assert worker._async_complete
+        assert worker.late_poll_enabled
+        assert not worker._async_register
+
+    @pytest.mark.parametrize("value", ["1", 1, "true", None])
+    def test_option_must_be_a_json_boolean(self, value):
+        with pytest.raises(ValueError, match="async_register"):
+            _make_raiden_worker(extra_config={"async_register": value})
+
+    @pytest.mark.parametrize("async_register", [False, True])
+    def test_producer_registration_runs_inline_unless_async_register(
+        self, async_register
+    ):
+        worker = _make_raiden_worker(
+            tp_rank=0,
+            tp_size=1,
+            is_producer=True,
+            extra_config={"async_register": async_register},
+        )
+        worker.vllm_config.speculative_config = None
+        meta = SimpleNamespace(reqs_to_send={"r1": object()}, reqs_to_release={})
+        with (
+            patch.object(worker, "_ensure_raiden_transfer_engine"),
+            patch.object(worker, "_raiden_stage3_enabled", return_value=True),
+            patch(f"{_MOD}._use_raiden_dsv4_admission", return_value=False),
+            patch(f"{_MOD}._use_raiden_glm_admission", return_value=False),
+            patch(f"{_MOD}._uses_tp_stage3_source", return_value=False),
+            patch.object(worker, "_register_stage3_request_blocks") as inline,
+            patch.object(worker, "_submit_stage3_registration") as side,
+        ):
+            worker.process_send_load(meta)
+        assert side.called is async_register
+        assert inline.called is not async_register
+
+
+class TestStage3AsyncComplete:
+    """async_complete hands complete_request_blocks to one background thread
+    with its own controller client and retries a failed RPC."""
+
+    def _producer(self, facade):
+        worker = _make_raiden_worker(
+            tp_rank=0,
+            tp_size=1,
+            is_producer=True,
+            extra_config={"async_complete": True},
+        )
+        worker._raiden_controller_address = "10.0.0.1:27000"
+        worker._raiden_work_unit = "unit"
+        worker._new_raiden_controller_facade = MagicMock(return_value=facade)
+        return worker
+
+    def test_complete_runs_on_the_side_thread_with_its_own_client(self):
+        threads: list[str] = []
+        facade = MagicMock()
+        facade.complete_request_blocks.side_effect = lambda **kw: threads.append(
+            threading.current_thread().name
+        )
+        worker = self._producer(facade)
+        worker._submit_stage3_async_complete("r1", 7)
+        future, uuid, attempts = worker._stage3_complete_futures["r1"]
+        future.result(timeout=5)
+        assert (uuid, attempts) == (7, 0)
+        facade.complete_request_blocks.assert_called_once_with(
+            req_id="r1", uuid=7, unit="unit"
+        )
+        worker._new_raiden_controller_facade.assert_called_once_with("10.0.0.1:27000")
+        assert threads and threads[0].startswith("raiden-complete")
+        worker._reap_stage3_async_completes()
+        assert not worker._stage3_complete_futures
+
+    def test_failed_complete_is_retried_then_raised(self):
+        facade = MagicMock()
+        facade.complete_request_blocks.side_effect = RuntimeError("rpc down")
+        worker = self._producer(facade)
+        worker._submit_stage3_async_complete("r1", 7)
+        with pytest.raises(RuntimeError, match="rpc down"):
+            for _ in range(10):
+                future, _, _ = worker._stage3_complete_futures["r1"]
+                concurrent.futures.wait([future], timeout=5)
+                worker._reap_stage3_async_completes()
+        assert facade.complete_request_blocks.call_count == 5

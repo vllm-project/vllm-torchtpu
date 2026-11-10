@@ -149,16 +149,21 @@ _STAGE3_REGISTRY_STATUS_CANCELLED = 4
 _STAGE3_REGISTRATION_REATTEMPT_MIN_INTERVAL_S = 0.05
 _STAGE3_REGISTRATION_CANCELLED_ERROR = "Request block registration was cancelled"
 
-# Attempts per complete_request_blocks RPC under TPU_RAIDEN_ASYNC_COMPLETE (see
+# Attempts per complete_request_blocks RPC under the async_complete option (see
 # _submit_stage3_async_complete) before the failure is raised.
 _STAGE3_ASYNC_COMPLETE_MAX_ATTEMPTS = 5
+# complete_request_blocks calls slower than this are logged, sync or async.
+_STAGE3_COMPLETE_SLOW_MS = 100.0
+# The async_register side thread starts once the step's forward is dispatched,
+# or after this long, whichever comes first.
+_STAGE3_ASYNC_REGISTER_DELAY_S = 0.010
 
 
 def _log_slow_stage3_complete(
     rank: int, req_id: str, start: float, *, asynchronous: bool
 ) -> None:
     elapsed_ms = (time.perf_counter() - start) * 1000
-    if elapsed_ms >= tpu_envs.TPU_RAIDEN_COMPLETE_SLOW_MS:
+    if elapsed_ms >= _STAGE3_COMPLETE_SLOW_MS:
         logger.info(
             "TPURaidenConnectorWorker rank%d --> complete_request_blocks "
             "took %.1f ms req_id=%s async=%s",
@@ -530,6 +535,29 @@ def _get_extra_config(vllm_config: VllmConfig) -> dict[str, Any]:
     if config is None:
         return {}
     return config.kv_connector_extra_config or {}
+
+
+def _connector_option(vllm_config: VllmConfig, key: str) -> bool:
+    """Reads an opt-in Raiden connector option from kv_connector_extra_config.
+
+    An absent key is False, which keeps the connector's default behaviour. The
+    value must be a JSON boolean, so a typo such as "1" fails at start-up
+    instead of silently leaving the option off.
+
+    Options (set per connector in --kv-transfer-config):
+      async_complete: issue the producer's post-transfer
+        complete_request_blocks RPC on a background thread.
+      async_register: register a producer step's request blocks on a side
+        thread that overlaps the step's forward.
+      late_poll: on a KV consumer, report Stage-3 loads that land during a
+        step with that step's output.
+    """
+    value = _get_extra_config(vllm_config).get(key, False)
+    if not isinstance(value, bool):
+        raise ValueError(
+            f"kv_connector_extra_config[{key!r}] must be true or false, got {value!r}"
+        )
+    return value
 
 
 def _as_bool(value: Any, default: bool = False) -> bool:
@@ -2708,8 +2736,12 @@ class TPURaidenConnectorWorker:
         self._stage3_registered_sends: dict[str, _Stage3RegisteredSend] = {}
         self._stage3_terminal_sends: dict[str, _Stage3RegisteredSend] = {}
         self._stage3_terminal_cleanup: dict[str, bool] = {}
-        # TPU_RAIDEN_ASYNC_COMPLETE: complete_request_blocks RPCs in flight on
-        # a background thread, keyed by req_id -> (future, uuid, attempts).
+        # Opt-in connector options; off keeps the synchronous behaviour.
+        self._async_complete = _connector_option(vllm_config, "async_complete")
+        self._async_register = _connector_option(vllm_config, "async_register")
+        self.late_poll_enabled = _connector_option(vllm_config, "late_poll")
+        # async_complete: complete_request_blocks RPCs in flight on a
+        # background thread, keyed by req_id -> (future, uuid, attempts).
         self._stage3_complete_futures: dict[str, tuple[Any, int, int]] = {}
         self._stage3_complete_executor: Any | None = None
         self._stage3_complete_local = threading.local()
@@ -2802,8 +2834,8 @@ class TPURaidenConnectorWorker:
         self._stage3_late_native: list[tuple[list, list, list]] = []
         # Unix time each load was staged, for the per-request event log.
         self._stage3_load_staged_ts: dict[str, float] = {}
-        # Producer registrations handed to the side thread
-        # (TPU_RAIDEN_STAGE3_ASYNC_REGISTER): one future per step, the
+        # Producer registrations handed to the side thread (the
+        # async_register option): one future per step, the
         # request ids it carries, and the thread's own controller client.
         self._stage3_register_executor: concurrent.futures.ThreadPoolExecutor | None = (
             None
@@ -4213,7 +4245,7 @@ class TPURaidenConnectorWorker:
                     self.vllm_config
                 ):
                     self._register_stage3_request_row_spans(metadata)
-                elif tpu_envs.TPU_RAIDEN_STAGE3_ASYNC_REGISTER:
+                elif self._async_register:
                     self._submit_stage3_registration(metadata)
                 else:
                     self._register_stage3_request_blocks(metadata)
@@ -4341,7 +4373,7 @@ class TPURaidenConnectorWorker:
         this step dispatches instead of delaying it. The work holds the GIL,
         so the thread starts only once the model-runner thread has dispatched
         the forward (get_finished sets the gate) or after
-        TPU_RAIDEN_STAGE3_ASYNC_REGISTER_DELAY_MS, whichever comes first.
+        _STAGE3_ASYNC_REGISTER_DELAY_S, whichever comes first.
         Steps keep their order on the one worker thread. The thread uses its
         own controller client; the bookkeeping it writes is taken under
         _stage3_poll_lock, and get_finished waits for the registration of a
@@ -4355,7 +4387,7 @@ class TPURaidenConnectorWorker:
         req_ids = frozenset(metadata.reqs_to_send) | frozenset(metadata.reqs_to_release)
         gate = threading.Event()
         self._stage3_register_gate = gate
-        delay_s = float(tpu_envs.TPU_RAIDEN_STAGE3_ASYNC_REGISTER_DELAY_MS) / 1e3
+        delay_s = _STAGE3_ASYNC_REGISTER_DELAY_S
 
         def _run() -> None:
             gate.wait(delay_s)
@@ -7077,7 +7109,7 @@ class TPURaidenConnectorWorker:
                 # release. Active ranks may race the idempotent aggregate
                 # cleanup RPC after genuine native completion.
                 if force_release:
-                    if tpu_envs.TPU_RAIDEN_ASYNC_COMPLETE:
+                    if self._async_complete:
                         self._submit_stage3_async_complete(req_id, registration.uuid)
                     else:
                         start = time.perf_counter()
