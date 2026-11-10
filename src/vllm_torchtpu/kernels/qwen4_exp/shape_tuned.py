@@ -46,3 +46,21 @@ DCP_PREFILL_TILES: tuple = ()
 
 def dcp_prefill_tiles(tokens: int):
     return _lookup(DCP_PREFILL_TILES, tokens)
+
+
+# QSA indexer, decode/verify StreamIndex (pooled_qsa.select_blocks shared
+# stream): query rows -> (VLLM_TPU_QSA_DECODE_KV_BLOCK, _QUERY_BLOCK).
+INDEXER_DECODE_TILES: tuple = ()
+
+
+def indexer_decode_tiles(rows: int):
+    return _lookup(INDEXER_DECODE_TILES, rows)
+
+
+# QSA indexer, ragged prefill StreamIndex: per-rank query rows (chunk / SP) ->
+# (PREFILL_INDEXER_BKV keys, BQ, chunk tokens; chunk == rows means one call).
+INDEXER_PREFILL_TILES: tuple = ()
+
+
+def indexer_prefill_tiles(rows: int):
+    return _lookup(INDEXER_PREFILL_TILES, rows)
