@@ -4310,13 +4310,12 @@ class TPUModelRunner(GPUModelRunner):
                 # transfer that runs after they are freed (e.g. behind a long
                 # step or a runtime compile) would pin garbage positions into
                 # the cache (same failure as the substitution-index cache).
-                # Concatenate both 1-D int32 index arrays so a miss pays a
-                # single synchronous H2D transfer instead of two.
-                packed_sub_dev = torch.from_numpy(
-                    np.concatenate((seq_idx_np, pos_idx_np))
-                ).to(self.device)
-                seq_idx_dev = packed_sub_dev[:target_num_reqs]
-                pos_idx_dev = packed_sub_dev[target_num_reqs:]
+                # Upload two base tensors rather than slices of one packed
+                # buffer: a slice view is re-materialized by a
+                # tt_jit_execute_as_strided program on every compiled call
+                # that consumes it, while a miss is rare in steady state.
+                seq_idx_dev = torch.from_numpy(seq_idx_np).to(self.device)
+                pos_idx_dev = torch.from_numpy(pos_idx_np).to(self.device)
                 sub_cache[sub_key] = (seq_idx_dev, pos_idx_dev, qx_sub_mask)
             num_rejected_dev = self._pre_async_results.spec_decode_num_rejected_tokens
             if (
