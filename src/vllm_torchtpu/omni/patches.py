@@ -825,6 +825,8 @@ def _patch_wan_vae_halo_allgather() -> None:
 
 def _patch_distributed_vae_host_metadata_collectives() -> None:
     # TODO: Remove once ProcessGroupTpu lowers ReduceOp.MAX and integer metadata.
+    # Uses DistributedVaeExecutor._sync_errors and the host _error_group of
+    # vLLM-Omni 0.32.0rc1; without them the upstream methods are kept.
     if not envs.VLLM_TORCHTPU_OMNI_WAN_VAE_HALO_ALLGATHER:
         return
 
@@ -846,13 +848,33 @@ def _patch_distributed_vae_host_metadata_collectives() -> None:
             "_compute_global_padding_shape/gather_tensors."
         )
         return
+    if not callable(getattr(executor_cls, "_sync_errors", None)):
+        logger.warning(
+            "Skipping TPU patch: DistributedVaeExecutor has no _sync_errors."
+        )
+        return
     executor_cls._tpu_orig_compute_global_padding_shape = orig_compute
     executor_cls._tpu_orig_gather_tensors = orig_gather
     dist = distributed_vae_executor.dist
+    warned_no_host_group = False
+
+    def _no_host_group(self: Any) -> bool:
+        nonlocal warned_no_host_group
+        if getattr(self, "_error_group", None) is not None:
+            return False
+        if not warned_no_host_group:
+            warned_no_host_group = True
+            logger.warning(
+                "DistributedVaeExecutor has no _error_group; keeping the "
+                "upstream device-group metadata collectives."
+            )
+        return True
 
     def _compute_global_padding_shape(
         self: Any, local_results: Any, output_ndim: int, device: Any
     ) -> list[int]:
+        if _no_host_group(self):
+            return orig_compute(self, local_results, output_ndim, device)
         with self._sync_errors("shape preparation"):
             local_tile_max_dims = [0] * output_ndim
             for _, tile_tensor in local_results:
@@ -869,7 +891,9 @@ def _patch_distributed_vae_host_metadata_collectives() -> None:
         return local_shape_stat.tolist()
 
     def _gather_tensors(self: Any, tensor: torch.Tensor) -> Any:
-        if tensor.is_floating_point() or self._error_group is None:
+        if _no_host_group(self):
+            return orig_gather(self, tensor)
+        if tensor.is_floating_point():
             with self._sync_errors("gather allocation"):
                 gather_list = [torch.empty_like(tensor) for _ in range(self.world_size)]
             dist.all_gather(gather_list, tensor, group=self.group)
@@ -897,7 +921,7 @@ def _patch_distributed_vae_host_metadata_collectives() -> None:
             output_device: Any,
             output_dtype: torch.dtype,
         ) -> torch.Tensor:
-            if self._error_group is None:
+            if _no_host_group(self):
                 return orig_sync_fn(
                     self, rank0_result, output_ndim, output_device, output_dtype
                 )

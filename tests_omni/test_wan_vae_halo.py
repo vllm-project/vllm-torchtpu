@@ -137,6 +137,16 @@ def test_patch_idempotent_and_kill_switch_on_real_omni(wan_vae_modules, monkeypa
     assert torch.equal(recv_bottom, torch.zeros_like(recv_bottom))
 
 
+def _record_warnings(monkeypatch) -> list[str]:
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        patches.logger,
+        "warning",
+        lambda msg, *args: warnings.append(msg % args if args else msg),
+    )
+    return warnings
+
+
 def _drifted_halo_exchange_p2p(
     *, rank, world_size, group, top_ref, bottom_ref, recv_top_buf, recv_bottom_buf
 ):
@@ -671,6 +681,87 @@ def test_sync_final_result_broadcasts_shape_on_host_group(wan_vae_modules, monke
     assert tuple(out.shape) == (1, 16, 2, 4, 4)
     assert len(sync_calls) == 1 and sync_calls[0][0][0] is out
     assert sync_calls[0][1] is False
+
+
+def test_host_metadata_patch_skips_without_sync_errors(wan_vae_modules, monkeypatch):
+    from vllm_omni.diffusion.distributed.autoencoders import (
+        distributed_vae_executor,
+    )
+
+    class _ExecutorWithoutSyncErrors:
+        def _compute_global_padding_shape(self, local_results, output_ndim, device):
+            return [0] * (output_ndim + 1)
+
+        def gather_tensors(self, tensor):
+            return None
+
+    executor_cls = _ExecutorWithoutSyncErrors
+    orig_compute = executor_cls._compute_global_padding_shape
+    orig_gather = executor_cls.gather_tensors
+    monkeypatch.setattr(
+        distributed_vae_executor, "DistributedVaeExecutor", executor_cls
+    )
+    monkeypatch.setenv("VLLM_TORCHTPU_OMNI_WAN_VAE_HALO_ALLGATHER", "1")
+    warnings = _record_warnings(monkeypatch)
+
+    patches._patch_distributed_vae_host_metadata_collectives()
+    assert len(warnings) == 1 and "_sync_errors" in warnings[0]
+    assert executor_cls._compute_global_padding_shape is orig_compute
+    assert executor_cls.gather_tensors is orig_gather
+    assert not hasattr(executor_cls, "_tpu_orig_compute_global_padding_shape")
+
+
+def test_host_metadata_patch_falls_back_without_error_group(
+    wan_vae_modules, monkeypatch
+):
+    from contextlib import nullcontext
+
+    from vllm_omni.diffusion.distributed.autoencoders import (
+        distributed_vae_executor,
+    )
+
+    calls = []
+
+    class _ExecutorWithoutErrorGroup:
+        def _sync_errors(self, stage):
+            return nullcontext()
+
+        def _compute_global_padding_shape(self, local_results, output_ndim, device):
+            calls.append("compute")
+            return [0] * (output_ndim + 1)
+
+        def gather_tensors(self, tensor):
+            calls.append("gather")
+
+        def _sync_final_result(
+            self, rank0_result, output_ndim, output_device, output_dtype
+        ):
+            calls.append("sync")
+            return rank0_result
+
+    def _forbid_collective(*args, **kwargs):
+        raise AssertionError("the upstream method must run the collective")
+
+    for name in ("all_reduce", "all_gather", "broadcast"):
+        monkeypatch.setattr(distributed_vae_executor.dist, name, _forbid_collective)
+    monkeypatch.setattr(
+        distributed_vae_executor,
+        "DistributedVaeExecutor",
+        _ExecutorWithoutErrorGroup,
+    )
+    monkeypatch.setenv("VLLM_TORCHTPU_OMNI_WAN_VAE_HALO_ALLGATHER", "1")
+    warnings = _record_warnings(monkeypatch)
+
+    patches._patch_distributed_vae_host_metadata_collectives()
+    assert hasattr(_ExecutorWithoutErrorGroup, "_tpu_orig_compute_global_padding_shape")
+    executor = _ExecutorWithoutErrorGroup()
+    result = torch.zeros(2)
+    assert executor._compute_global_padding_shape([], 5, "cpu") == [0] * 6
+    assert executor.gather_tensors(torch.zeros(2, dtype=torch.int64)) is None
+    assert executor.gather_tensors(result) is None
+    assert executor._sync_final_result(result, 1, "cpu", torch.float32) is result
+    assert calls == ["compute", "gather", "gather", "sync"]
+    assert len(warnings) == 1 and "_error_group" in warnings[0]
 
 
 @pytest.mark.parametrize("num_frames", [1, 5])
