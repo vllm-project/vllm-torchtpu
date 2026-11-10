@@ -250,6 +250,7 @@ def _kernel(
     return_lse: bool = False,
     dcp_world: int = 1,
     vpu: tuple = (),
+    page_copies: bool = False,
 ):
     # DCP: a fourth scalar operand holds this rank; its KV tiles are its owned
     # page-sized blocks only (local tile t is global block t * dcp_world + rank).
@@ -306,6 +307,10 @@ def _kernel(
         # One mask word covers ratio * 32 tokens. Split there because a
         # shared pool page may contain an odd number of these segments.
         copy_rows = min(kv_tile, physical_page_size, ratio * 32)
+        if page_copies:
+            # VLLM_TPU_QSA_PREFILL_PAGE_COPIES: tiles and pages nest, so one
+            # copy per page-sized run moves the same rows in fewer DMAs.
+            copy_rows = min(kv_tile, physical_page_size)
         for offset in range(0, kv_tile, copy_rows):
             # Local rows: under DCP the tiles walk this rank's own pages.
             logical = tile * kv_tile + offset
@@ -1107,6 +1112,19 @@ def _block_sparse_gqa_prefill(
         min_lengths = jnp.min(
             live_lengths.reshape(nblocks, query_block), axis=1
         ).astype(jnp.int32)
+    # VLLM_TPU_QSA_PREFILL_PAGE_COPIES needs KV tiles and pages that nest.
+    page_copies = (
+        envs.VLLM_TPU_QSA_PREFILL_PAGE_COPIES
+        and physical_page_size % (ratio * 32) == 0
+        and (kv_tile % physical_page_size == 0 or physical_page_size % kv_tile == 0)
+    )
+    if page_copies:
+        logger.info_once(
+            "QSA sparse prefill page-sized KV copies on "
+            "(VLLM_TPU_QSA_PREFILL_PAGE_COPIES, %d-row pages, %d-row tiles)",
+            physical_page_size,
+            kv_tile,
+        )
     bf16_mxu = (
         not vpu
         and envs.VLLM_TPU_QSA_PREFILL_BF16_MXU
@@ -1146,6 +1164,7 @@ def _block_sparse_gqa_prefill(
             **({"return_lse": True} if return_lse else {}),
             **({"dcp_world": dcp_world} if dcp else {}),
             **({"vpu": vpu} if vpu else {}),
+            **({"page_copies": True} if page_copies else {}),
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=3 + int(dcp) + int(bool(vpu)),
