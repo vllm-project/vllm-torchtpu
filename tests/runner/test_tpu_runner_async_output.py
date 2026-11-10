@@ -384,3 +384,126 @@ def test_compiled_async_spec_helpers_match_eager(device):
     # Chunk 1 req 2 (prefill) at bucketed index B0=4 -> offset 4*(1+3)=16
     assert chunks2[0][16:20].cpu().tolist() == [301, 31, 32, 33]
     assert int(spec_rej2[4].cpu()) == 0
+
+
+def test_subtract_and_substitute_draft_token_ids_and_two_chunk_mamba_offsets():
+    """Verify fused `_compiled_subtract_and_substitute_draft_token_ids`,
+    `_compiled_subtract_and_substitute_placeholder_token`, and 2-chunk Mamba
+    read-offset fusion match the separate reference operations."""
+    from vllm_torchtpu.runner.tpu_runner import (
+        _compiled_assemble_two_chunks_spec_rejected_and_read_offsets,
+    )
+    from vllm_torchtpu.runner.tpu_runner_async_output import (
+        _compiled_subtract_and_substitute_draft_token_ids,
+        _compiled_subtract_and_substitute_placeholder_token,
+        extract_draft_token_ids,
+        subtract_and_substitute_draft_token_ids,
+        subtract_and_substitute_placeholder_token,
+        subtract_num_rejected_tokens,
+    )
+
+    seq_lens = torch.tensor([12, 24, 0, 0], dtype=torch.int32)
+    positions_1d = torch.tensor([8, 9, 10, 11, 20, 21, 22, 23], dtype=torch.int32)
+    positions_2d = positions_1d.unsqueeze(0).expand(3, -1).clone()
+    num_rejected = torch.tensor([1, 2, 0, 0, 0, 0, 0, 0], dtype=torch.int32)
+    seq_idx = torch.tensor([0, 1, -1, -1], dtype=torch.int32)
+    pos_idx = torch.tensor([0, 0, 0, 0, 1, 1, 1, 1], dtype=torch.int32)
+
+    from vllm_torchtpu.runner.tpu_runner import _padded_substitution_indices
+
+    input_ids = torch.tensor([-1, -1, -1, -1, -1, -1, 777, 888], dtype=torch.int32)
+    # Req 0 occupies tokens 0..3 (from next_tokens_tpu[0..3]), Req 1 occupies 4..5 (from next_tokens_tpu[4..5]), slots 6..7 are padded
+    subst_indices = torch.from_numpy(
+        _padded_substitution_indices(
+            8,
+            np.array([0, 1, 2, 3, 4, 5], dtype=np.int32),
+            np.array([0, 1, 2, 3, 4, 5], dtype=np.int32),
+        )
+    )
+    next_tokens_tpu = torch.tensor(
+        [100, 101, 102, 103, 200, 201, 202, 203] + [999] * 24, dtype=torch.int32
+    )
+    logits_indices = torch.tensor([0, 1, 2, 3, 4, 5, 6, 7], dtype=torch.int32)
+    target_logits_indices = torch.tensor([0, 1, 2, 4, 0, 0, 0, 0], dtype=torch.int32)
+
+    ref_sl, ref_pos1 = subtract_num_rejected_tokens(
+        seq_lens.clone(), positions_1d.clone(), num_rejected, seq_idx, pos_idx
+    )
+    _, ref_pos2 = subtract_num_rejected_tokens(
+        seq_lens.clone(), positions_2d.clone(), num_rejected, seq_idx, pos_idx
+    )
+    ref_ids = torch.tensor([100, 101, 102, 103, 200, 201, 777, 888], dtype=torch.int32)
+    ref_drafts = extract_draft_token_ids(ref_ids, logits_indices, target_logits_indices)
+
+    for fn_pl, fn_dr in (
+        (
+            subtract_and_substitute_placeholder_token,
+            subtract_and_substitute_draft_token_ids,
+        ),
+        (
+            _compiled_subtract_and_substitute_placeholder_token.__wrapped__._torchdynamo_orig_callable,
+            _compiled_subtract_and_substitute_draft_token_ids.__wrapped__._torchdynamo_orig_callable,
+        ),
+    ):
+        sl_a, pos_a, ids_a = fn_pl(
+            seq_lens.clone(),
+            positions_1d.clone(),
+            num_rejected,
+            seq_idx,
+            pos_idx,
+            input_ids.clone(),
+            subst_indices,
+            next_tokens_tpu,
+        )
+        assert torch.equal(sl_a, ref_sl)
+        assert torch.equal(pos_a, ref_pos1)
+        assert torch.equal(ids_a, ref_ids)
+
+        sl_b, pos_b, ids_b, drafts_b = fn_dr(
+            seq_lens.clone(),
+            positions_2d.clone(),
+            num_rejected,
+            seq_idx,
+            pos_idx,
+            input_ids.clone(),
+            subst_indices,
+            next_tokens_tpu,
+            logits_indices,
+            target_logits_indices,
+        )
+        assert torch.equal(sl_b, ref_sl)
+        assert torch.equal(pos_b, ref_pos2)
+        assert torch.equal(ids_b, ref_ids)
+        assert torch.equal(drafts_b, ref_drafts)
+
+    # Verify 2-chunk fused assembly + mamba read offsets
+    nt0 = torch.tensor(
+        [[50, 51, -1, -1], [60, -1, -1, -1], [0, -1, -1, -1], [0, -1, -1, -1]],
+        dtype=torch.int32,
+    )
+    d0 = torch.zeros((8, 3), dtype=torch.int32)
+    d0[0] = torch.tensor([501, 502, 503], dtype=torch.int32)
+    d0[1] = torch.tensor([601, 602, 603], dtype=torch.int32)
+    dl0 = torch.tensor([3, 3, 0, 0], dtype=torch.int32)
+    nt1 = torch.tensor(
+        [[70, -1, -1, -1], [0, -1, -1, -1], [0, -1, -1, -1], [0, -1, -1, -1]],
+        dtype=torch.int32,
+    )
+    d1 = torch.zeros((8, 3), dtype=torch.int32)
+    d1[0] = torch.tensor([701, 702, 703], dtype=torch.int32)
+    dl1 = torch.tensor([0, 0, 0, 0], dtype=torch.int32)
+    read_offsets = torch.zeros((8,), dtype=torch.int32)
+    mamba_idx = torch.tensor([[2, 5, 0, 0]], dtype=torch.int32)
+
+    flat2, rej2 = (
+        _compiled_assemble_two_chunks_spec_rejected_and_read_offsets.__wrapped__._torchdynamo_orig_callable(
+            nt0, d0, dl0, nt1, d1, dl1, read_offsets, mamba_idx, 32, 8
+        )
+    )
+    assert flat2[:4].tolist() == [51, 501, 502, 503]
+    assert flat2[4:8].tolist() == [60, 601, 602, 603]
+    assert flat2[16:20].tolist() == [70, 701, 702, 703]
+    assert rej2[:2].tolist() == [2, 3]
+    # Accepted counts - 1: req 0 accepted 2 tokens -> offset 1; req 1 accepted 1 token -> offset 0
+    assert int(read_offsets[2]) == 1
+    assert int(read_offsets[5]) == 0

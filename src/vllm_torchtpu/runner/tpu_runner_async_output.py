@@ -334,6 +334,66 @@ def extract_draft_token_ids(
     return input_ids[logits_indices[target_logits_indices + 1]]
 
 
+def subtract_and_substitute_placeholder_token(
+    seq_lens: torch.Tensor,
+    positions: torch.Tensor,
+    num_rejected: torch.Tensor,
+    seq_lens_subtract_indices: torch.Tensor,
+    positions_subtract_indices: torch.Tensor,
+    input_ids: torch.Tensor,
+    substitution_indices: torch.Tensor,
+    next_tokens_tpu: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused rejected-draft subtraction and placeholder token substitution."""
+    seq_lens, positions = subtract_num_rejected_tokens(
+        seq_lens,
+        positions,
+        num_rejected,
+        seq_lens_subtract_indices,
+        positions_subtract_indices,
+    )
+    token_in_tpu_cur_input_indices = substitution_indices[0]
+    token_in_tpu_pre_next_tokens_indices = substitution_indices[1]
+    mask = token_in_tpu_pre_next_tokens_indices > -1
+    safe_idx = torch.clamp_min(token_in_tpu_pre_next_tokens_indices, 0)
+    new_token_values = next_tokens_tpu[safe_idx].to(input_ids.dtype)
+    original_values = input_ids[token_in_tpu_cur_input_indices]
+    update_values = torch.where(mask, new_token_values, original_values)
+    input_ids = input_ids.scatter(0, token_in_tpu_cur_input_indices, update_values)
+    return seq_lens, positions, input_ids
+
+
+def subtract_and_substitute_draft_token_ids(
+    seq_lens: torch.Tensor,
+    positions: torch.Tensor,
+    num_rejected: torch.Tensor,
+    seq_lens_subtract_indices: torch.Tensor,
+    positions_subtract_indices: torch.Tensor,
+    input_ids: torch.Tensor,
+    substitution_indices: torch.Tensor,
+    next_tokens_tpu: torch.Tensor,
+    logits_indices: torch.Tensor,
+    target_logits_indices: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused rejected-draft subtraction, placeholder token substitution, and
+    draft token extraction in a single compiled TPU graph.
+    """
+    seq_lens, positions, input_ids = subtract_and_substitute_placeholder_token(
+        seq_lens,
+        positions,
+        num_rejected,
+        seq_lens_subtract_indices,
+        positions_subtract_indices,
+        input_ids,
+        substitution_indices,
+        next_tokens_tpu,
+    )
+    draft_token_ids = extract_draft_token_ids(
+        input_ids, logits_indices, target_logits_indices
+    )
+    return seq_lens, positions, input_ids, draft_token_ids
+
+
 def compute_num_rejected(
     next_tokens: torch.Tensor, num_draft: torch.Tensor
 ) -> torch.Tensor:
@@ -385,6 +445,58 @@ def _compiled_pad_non_spec_next_tokens(
 ) -> torch.Tensor:
     col0 = selected.reshape(-1, 1).to(torch.int32)
     return torch.nn.functional.pad(col0, (0, k), value=INVALID_TOKEN_ID)
+
+
+@_static_shape_args
+@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+def _compiled_subtract_and_substitute_placeholder_token(
+    seq_lens: torch.Tensor,
+    positions: torch.Tensor,
+    num_rejected: torch.Tensor,
+    seq_lens_subtract_indices: torch.Tensor,
+    positions_subtract_indices: torch.Tensor,
+    input_ids: torch.Tensor,
+    substitution_indices: torch.Tensor,
+    next_tokens_tpu: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return subtract_and_substitute_placeholder_token(
+        seq_lens,
+        positions,
+        num_rejected,
+        seq_lens_subtract_indices,
+        positions_subtract_indices,
+        input_ids,
+        substitution_indices,
+        next_tokens_tpu,
+    )
+
+
+@_static_shape_args
+@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+def _compiled_subtract_and_substitute_draft_token_ids(
+    seq_lens: torch.Tensor,
+    positions: torch.Tensor,
+    num_rejected: torch.Tensor,
+    seq_lens_subtract_indices: torch.Tensor,
+    positions_subtract_indices: torch.Tensor,
+    input_ids: torch.Tensor,
+    substitution_indices: torch.Tensor,
+    next_tokens_tpu: torch.Tensor,
+    logits_indices: torch.Tensor,
+    target_logits_indices: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    return subtract_and_substitute_draft_token_ids(
+        seq_lens,
+        positions,
+        num_rejected,
+        seq_lens_subtract_indices,
+        positions_subtract_indices,
+        input_ids,
+        substitution_indices,
+        next_tokens_tpu,
+        logits_indices,
+        target_logits_indices,
+    )
 
 
 @_static_shape_args
