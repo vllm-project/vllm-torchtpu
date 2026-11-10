@@ -3256,3 +3256,180 @@ def test_run_mtp_fused_loop_records_row_form_and_proposes_step0(
     assert input_ids is None
     assert hidden_shape == (8, 4)
     assert seq_lens_arg is seq_lens
+
+
+def _check_prep_emits_padded_step0_gather_indices(
+    proposer, device, seed_source, pad_len
+):
+    proposer.runner = SimpleNamespace(
+        input_batch=SimpleNamespace(req_ids=["r0", "r1"]),
+        device=device,
+        requests={},
+        num_tokens_paddings=[16, 32, 64, 128],
+        _dp_lockstep_enabled=lambda: False,
+    )
+    chunk = _make_chunk(
+        input_ids=torch.arange(8, dtype=torch.int32, device=device),
+        position_ids=torch.arange(8, dtype=torch.int32, device=device),
+        query_start_loc_np=np.array([0, 4, 8], dtype=np.int32),
+        start_index=0,
+        num_reqs=2,
+        device=device,
+        draft_lengths=torch.tensor([3, 3], dtype=torch.int32, device=device),
+        attn_ctx=SimpleNamespace(
+            query_start_loc=torch.tensor([0, 4, 8], dtype=torch.int32, device=device)
+        ),
+    )
+    if seed_source == "host":
+        kwargs = dict(
+            sampled_token_ids=[[201], [202]],
+            num_rejected_tokens_np=np.array([1, 3], dtype=np.int32),
+        )
+    elif seed_source == "device_seed":
+        kwargs = dict(
+            sampled_token_ids=None,
+            num_rejected_tokens_np=None,
+            device_seed=torch.tensor([201, 202], dtype=torch.int32, device=device),
+        )
+    else:
+        kwargs = dict(
+            sampled_token_ids=None,
+            num_rejected_tokens_np=None,
+            next_tokens_device=torch.tensor(
+                [[91, 92, 201, -1], [202, -1, -1, -1]], dtype=torch.int32, device=device
+            ),
+        )
+    proposer._step0_pad_len = pad_len
+    proposer._last_step0_gather_indices = None
+
+    _, _, gather_indices, _ = proposer._prepare_draft_inputs(
+        chunk,
+        discard_sampled_tokens_req_indices=[],
+        scheduler_output=SimpleNamespace(
+            num_scheduled_tokens={}, scheduled_spec_decode_tokens={}
+        ),
+        **kwargs,
+    )
+
+    step0 = proposer._last_step0_gather_indices
+    assert step0 is not None and step0.shape == (pad_len,)
+    torch.testing.assert_close(
+        step0.cpu(), _maybe_pad_dim0(gather_indices, pad_len).cpu()
+    )
+    if pad_len == gather_indices.shape[0] and seed_source != "next_tokens_device":
+        # No second upload when the loop bucket is the chunk's own bucket.
+        assert step0 is gather_indices
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("seed_source", ["host", "device_seed", "next_tokens_device"])
+@pytest.mark.parametrize("pad_len", [16, 32])
+def test_prepare_draft_inputs_emits_padded_step0_gather_indices(
+    device, seed_source, pad_len
+):
+    """Asked for them (`_step0_pad_len`), the prep also leaves the MTP step-0
+    gather indices padded to the loop bucket: its gather indices zero-padded,
+    as propose() would pad them itself, from the same program or upload."""
+    proposer = _make_proposer(draft_tp=1, method="mtp")
+    _check_prep_emits_padded_step0_gather_indices(
+        proposer, device, seed_source, pad_len
+    )
+
+
+@pytest.mark.parametrize("seed_source", ["host", "device_seed"])
+@pytest.mark.parametrize("pad_len", [16, 32])
+def test_prepare_draft_inputs_emits_padded_step0_gather_indices_cpu(
+    seed_source, pad_len
+):
+    """The host-built step-0 indices, on CPU: the compiled seed scatter (TPU
+    backend) is stubbed; it does not touch the gather indices."""
+    proposer = _make_proposer(draft_tp=1, method="mtp")
+    proposer._draft_seed_input_ids = lambda input_ids, *_: input_ids
+    _check_prep_emits_padded_step0_gather_indices(
+        proposer, torch.device("cpu"), seed_source, pad_len
+    )
+
+
+def test_propose_takes_step0_gather_indices_from_the_prep():
+    """propose() decides the MTP step-0 post-attn gather before the prep, from
+    the fused-loop decision, has the prep emit the indices padded to the loop
+    bucket, and hands exactly those to the step-0 forward (ALL layout)."""
+    device = torch.device("cpu")
+    proposer = _make_proposer(draft_tp=1, method="mtp")
+    proposer.speculative_config.num_speculative_tokens = 1
+    proposer.runner = SimpleNamespace(
+        input_batch=SimpleNamespace(num_reqs=2, req_ids=["r0", "r1"]),
+        device=device,
+        requests={},
+        num_tokens_paddings=[16, 32],
+        max_num_reqs=20,
+        uses_mrope=False,
+        _dp_lockstep_enabled=lambda: False,
+    )
+    chunk = _make_chunk(
+        input_ids=torch.zeros(3, dtype=torch.int32, device=device),
+        position_ids=torch.zeros(3, dtype=torch.int32, device=device),
+        query_start_loc_np=np.array([0, 1, 2], dtype=np.int32),
+        start_index=0,
+        num_reqs=2,
+        hidden=1,
+        device=device,
+        hidden_states=torch.zeros((3, 1), device=device),
+        attn_ctx=SimpleNamespace(use_max_model_len=True),
+    )
+    proposer.draft_chunks = [chunk]
+    proposer.draft_model = SimpleNamespace(
+        model=SimpleNamespace(use_aux_hidden_state=False)
+    )
+    decisions = []
+
+    def use_step0_gather(_chunk, *, can_use_post_step0_fused):
+        decisions.append(can_use_post_step0_fused)
+        return True
+
+    proposer._use_mtp_step0_post_attn_gather = use_step0_gather
+    padded = torch.arange(32, dtype=torch.int64, device=device)
+
+    def prepare(*_args, **_kwargs):
+        assert proposer._step0_pad_len == 32  # the loop bucket of max_num_reqs
+        proposer._last_step0_gather_indices = padded
+        return (
+            torch.zeros(3, dtype=torch.int32, device=device),
+            chunk.position_ids,
+            torch.tensor([0, 2], dtype=torch.int64, device=device),
+            np.zeros(2, dtype=np.int32),
+        )
+
+    proposer._prepare_draft_inputs = prepare
+    forwarded = {}
+
+    def forward_draft(**kwargs):
+        forwarded.update(kwargs)
+        return (
+            torch.tensor([[7.0], [20.0]], device=device),
+            torch.zeros((2, 1), device=device),
+        )
+
+    proposer._forward_draft = forward_draft
+    proposer._draft_gather_carries = lambda hidden, positions, last_hidden, *_: (
+        hidden,
+        positions[:2],
+        last_hidden,
+    )
+    proposer._draft_propose_token = lambda last_hidden: last_hidden[:, 0].to(
+        torch.int32
+    )
+
+    drafts = proposer.propose(
+        sampled_token_ids=[[101], [202]],
+        discard_sampled_tokens_req_indices=[],
+        num_rejected_tokens_np=None,
+        scheduler_output=SimpleNamespace(num_scheduled_tokens={}),
+    )
+
+    # K=1 runs no fused loop.
+    assert decisions == [False]
+    assert forwarded["step0_gather_indices"] is padded
+    assert proposer._step0_pad_len == 0
+    assert proposer._last_step0_gather_indices is None
+    assert drafts == [[7], [20]]
