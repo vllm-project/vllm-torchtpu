@@ -11,18 +11,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The KV-only pass (spec_decode/mtp_kv_only.py) mirrors the hot-path code it
-does not share: every latent it writes must be bit-identical to what the full
-MTP forward hands the attention / indexer writers.
+"""The MLA KV write op (`MlaKvWriteOp`, the MTP KV-only pass) and its parts:
+every latent it writes must be bit-identical to what the full forward hands
+the attention / indexer writers.
 
-* `mla_kv_latents` vs `VllmTPUMultiHeadLatentAttentionWrapper.forward`'s
+* `VllmTPUMultiHeadLatentAttentionWrapper.kv_latents` vs `forward`'s
   `(kv_c_normed, k_pe)` (bf16 and fp8 projections, both rope classes);
-* `indexer_k_packed` vs `VllmTPUIndexer.forward` + the packing in
+* `VllmTPUIndexer.k_packed` vs `VllmTPUIndexer.forward` + the packing in
   `VllmTPUSparseAttnIndexer.forward_oot`;
-* `mtp_layer_input` vs the upstream `DeepSeekMultiTokenPredictor` ->
-  `DeepSeekMultiTokenPredictorLayer` -> `DeepseekV2DecoderLayer` prefix;
+* `mtp_layer_input` (spec_decode/mtp_kv_only.py) vs the upstream
+  `DeepSeekMultiTokenPredictor` -> `DeepSeekMultiTokenPredictorLayer` ->
+  `DeepseekV2DecoderLayer` prefix;
 * the non-DCP XLA indexer-K append, read back slot by slot;
-* the DCP and non-DCP cache-write ops against the writers' CPU goldens.
+* the DCP and non-DCP cache writers against the writers' CPU goldens.
 
 Runs on CPU; the projections are stand-ins in the processed runtime layouts.
 """
@@ -202,40 +203,40 @@ def _inputs(num_tokens, seed=1):
 @pytest.mark.parametrize("layout", ["flipped", "fp8"])
 @pytest.mark.parametrize("scaling", [False, True], ids=["rope", "deepseek_scaling"])
 @pytest.mark.parametrize("num_tokens", [16, 96])
-def test_mla_kv_latents_match_the_wrapper(layout, scaling, num_tokens):
+def test_kv_latents_match_the_wrapper(layout, scaling, num_tokens):
     w = _wrapper(layout=layout, rope=_rope(scaling=scaling))
     hidden, positions = _inputs(num_tokens)
     want_kv, want_pe = _wrapper_latents(w, hidden, positions)
-    got_kv, got_pe = mtp_kv_only.mla_kv_latents(w, positions, hidden)
+    got_kv, got_pe = w.kv_latents(positions, hidden)
     assert torch.equal(got_kv, want_kv)
     assert got_pe.shape == want_pe.shape
     assert torch.equal(got_pe, want_pe)
 
 
-def test_mla_kv_latents_without_q_lora():
+def test_kv_latents_without_q_lora():
     w = _wrapper(q_lora=False)
     hidden, positions = _inputs(16)
     want_kv, want_pe = _wrapper_latents(w, hidden, positions)
-    got_kv, got_pe = mtp_kv_only.mla_kv_latents(w, positions, hidden)
+    got_kv, got_pe = w.kv_latents(positions, hidden)
     assert torch.equal(got_kv, want_kv)
     assert torch.equal(got_pe, want_pe)
 
 
-def test_mla_kv_latents_with_fused_gate():
+def test_kv_latents_with_fused_gate():
     w = _wrapper(gate_is_fused=True)
     hidden, positions = _inputs(16)
     want_kv, want_pe = _wrapper_latents(w, hidden, positions)
-    got_kv, got_pe = mtp_kv_only.mla_kv_latents(w, positions, hidden)
+    got_kv, got_pe = w.kv_latents(positions, hidden)
     assert torch.equal(got_kv, want_kv)
     assert torch.equal(got_pe, want_pe)
 
 
-def test_mla_kv_latents_positive_control():
+def test_kv_latents_positive_control():
     """Different positions must change k_pe: the comparison above can fail."""
     w = _wrapper()
     hidden, positions = _inputs(16)
     want_kv, want_pe = _wrapper_latents(w, hidden, positions)
-    _, got_pe = mtp_kv_only.mla_kv_latents(w, positions + 1, hidden)
+    _, got_pe = w.kv_latents(positions + 1, hidden)
     assert not torch.equal(got_pe, want_pe)
 
 
@@ -343,7 +344,7 @@ def _packed_by_the_indexer_op(hidden, q_fp8, k, weights):
 
 @pytest.mark.parametrize("num_tokens", [16, 96])
 @pytest.mark.parametrize("scaling", [False, True], ids=["rope", "deepseek_scaling"])
-def test_indexer_k_packed_matches_the_indexer(num_tokens, scaling):
+def test_k_packed_matches_the_indexer(num_tokens, scaling):
     ind = _indexer()
     rope = _rope(scaling=scaling)
     hidden, positions = _inputs(num_tokens)
@@ -352,7 +353,7 @@ def test_indexer_k_packed_matches_the_indexer(num_tokens, scaling):
     with torch.no_grad():
         h, q_fp8, k, weights = ind(hidden, qr, positions, rope)
         want = _packed_by_the_indexer_op(h, q_fp8, k, weights)
-        got = mtp_kv_only.indexer_k_packed(ind, hidden, positions, rope)
+        got = ind.k_packed(hidden, positions, rope)
     assert got.dtype == want.dtype == torch.uint8
     assert torch.equal(got, want)
 
@@ -455,6 +456,15 @@ def test_kv_only_supported_for_a_dsa_mtp():
     assert mtp_kv_only.kv_only_unsupported_reason(_supported_mtp()) is None
 
 
+def test_kv_only_supported_for_a_subclass_that_keeps_the_forwards():
+    """Pass 1 shares the wrapper's projections, so a subclass that keeps
+    `forward` computes the same entries."""
+    mtp = _supported_mtp()
+    w = mtp.model.layers["78"].mtp_block.self_attn.mla_attn
+    w.__class__ = type("_Sub", (type(w),), {})
+    assert mtp_kv_only.kv_only_unsupported_reason(mtp) is None
+
+
 def test_kv_only_cache_layer_names_are_read_without_building_the_op():
     mtp = _supported_mtp()
     wrapper = mtp.model.layers["78"].mtp_block.self_attn.mla_attn
@@ -474,7 +484,8 @@ def test_kv_only_cache_layer_names_are_read_without_building_the_op():
         "plain_wrapper",
         "dense",
         "kimi",
-        "wrapper_subclass",
+        "wrapper_forward_overridden",
+        "indexer_forward_overridden",
         "indexer_op_stub",
         "impl_stub",
         "patched_layer_forward",
@@ -491,9 +502,12 @@ def test_kv_only_unsupported_reasons(breakage):
         mtp.model.layers["78"].mtp_block.self_attn.mla_attn.is_sparse = False
     elif breakage == "kimi":
         mtp.model.layers["78"].mtp_block.self_attn.mla_attn.kimi_preprocess = object()
-    elif breakage == "wrapper_subclass":
+    elif breakage == "wrapper_forward_overridden":
         w = mtp.model.layers["78"].mtp_block.self_attn.mla_attn
-        w.__class__ = type("_Sub", (type(w),), {})
+        w.__class__ = type("_Sub", (type(w),), {"forward": lambda *a: a})
+    elif breakage == "indexer_forward_overridden":
+        ind = mtp.model.layers["78"].mtp_block.self_attn.mla_attn.indexer
+        ind.__class__ = type("_Sub", (type(ind),), {"forward": lambda *a: a})
     elif breakage == "indexer_op_stub":
         w = mtp.model.layers["78"].mtp_block.self_attn.mla_attn
         w.indexer._modules.pop("indexer_op")
@@ -516,7 +530,7 @@ def test_kv_only_unsupported_reasons(breakage):
 # ---------------------------------------------------------------------------
 
 
-def test_indexer_k_append_local_xla_writes_every_row_in_place():
+def test_indexer_k_append_xla_writes_every_row_in_place():
     from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
         KVLayout,
         get_kv_cache_shape,
@@ -533,8 +547,14 @@ def test_indexer_k_append_local_xla_writes_every_row_in_place():
     rng = np.random.default_rng(0)
     k_packed = jnp.asarray(rng.integers(1, 255, (8, width), dtype=np.uint8))
     out = np.asarray(
-        mtp_kv_only._indexer_k_append_local(
-            cache, k_packed, seq_lens, pages, cu_q_lens, "xla"
+        mla_op.indexer_k_append(
+            cache,
+            k_packed,
+            seq_lens,
+            pages,
+            cu_q_lens,
+            writer="xla",
+            kv_layout=KVLayout.HEAD_ALONG_SUBLANE,
         )
     )
     kv_packing = shape[2]
@@ -618,6 +638,7 @@ def _write_inputs(layout="tensorcore"):
 
 
 def _golden(inp, *, dcp):
+    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import KVLayout
     from vllm_torchtpu.kernels.mla import kv_cache_utils
 
     nope_spec, rope_spec = inp["specs"]
@@ -643,13 +664,14 @@ def _golden(inp, *, dcp):
         nope, rope = kv_cache_utils.update_sparse_mla_kv_cache_jax(
             *args, nope_spec=nope_spec, rope_spec=rope_spec
         )
-    idx = mtp_kv_only._indexer_k_append_local(
+    idx = mla_op.indexer_k_append(
         inp["idx_cache"],
         inp["k_packed"],
         inp["idx_seq_lens"],
         inp["idx_pages"],
         inp["idx_cu"],
-        "xla",
+        writer="xla",
+        kv_layout=KVLayout.HEAD_ALONG_SUBLANE,
     )
     return nope, rope, idx
 
@@ -691,12 +713,12 @@ def test_write_caches_dcp_matches_the_writers(monkeypatch, layout):
     from vllm_torchtpu.kernels.mla import kv_cache_utils
 
     monkeypatch.setattr(
-        kv_cache_utils,
+        mla_op,
         "update_sparse_mla_kv_cache_dcp",
         kv_cache_utils.update_sparse_mla_kv_cache_dcp_jax,
     )
     inp = _write_inputs(layout)
-    got = mtp_kv_only.write_caches_dcp(
+    got = mla_op.mla_kv_write_caches_dcp(
         *_ordered(inp),
         mla_kv_spec=inp["specs"],
         mesh=get_or_create_dcp_mesh(),
@@ -714,25 +736,25 @@ def test_write_caches_matches_the_writers(monkeypatch, layout):
     from vllm_torchtpu.kernels.mla import kv_cache_utils
 
     monkeypatch.setattr(
-        kv_cache_utils,
+        mla_op,
         "update_sparse_mla_kv_cache",
         kv_cache_utils.update_sparse_mla_kv_cache_jax,
     )
     inp = _write_inputs(layout)
     mesh = jax.sharding.Mesh(np.asarray(jax.local_devices()[:1]), ("x",))
-    got = mtp_kv_only.write_caches(
+    got = mla_op.mla_kv_write_caches(
         *_ordered(inp), mla_kv_spec=inp["specs"], mesh=mesh, kv_cache_mode="xla"
     )
     _assert_caches_equal(got, _golden(inp, dcp=False))
 
 
 def _write_op(quantized=True):
-    """A `_KvOnlyWriteOp` around a real wrapper + indexer, its jax op replaced
+    """A `MlaKvWriteOp` around a real wrapper + indexer, its jax op replaced
     by a recorder."""
     w = _wrapper()
     w.indexer = _indexer()
     w.indexer_rope_emb = _rope()
-    op = mtp_kv_only._KvOnlyWriteOp.__new__(mtp_kv_only._KvOnlyWriteOp)
+    op = mla_op.MlaKvWriteOp.__new__(mla_op.MlaKvWriteOp)
     op.wrapper = w
     op.indexer = w.indexer
     op.mla_layer = SimpleNamespace(
@@ -769,16 +791,14 @@ def _md(n):
 
 @contextlib.contextmanager
 def _contexts(kv_cache, md_mla, md_idx):
-    import vllm.model_executor.layers.attention.attention as attn_mod
-
     with (
         patch.object(
-            attn_mod,
+            mla_op,
             "get_attention_context",
             lambda name: (md_mla if name == "mtp.attn" else None, None, kv_cache, None),
         ),
         patch.object(
-            mtp_kv_only,
+            mla_op,
             "get_forward_context",
             lambda: SimpleNamespace(attn_metadata={"mtp.indexer.k_cache": md_idx}),
         ),
@@ -797,10 +817,8 @@ def test_write_op_operands(quantized):
     hidden, positions = _inputs(16)
     with torch.no_grad(), _contexts((nope, rope), md_mla, md_idx):
         op(positions, hidden)
-        kv_c, k_pe = mtp_kv_only.mla_kv_latents(op.wrapper, positions, hidden)
-        k_packed = mtp_kv_only.indexer_k_packed(
-            op.indexer, hidden, positions, op.wrapper.indexer_rope_emb
-        )
+        kv_c, k_pe = op.wrapper.kv_latents(positions, hidden)
+        k_packed = op.indexer.k_packed(hidden, positions, op.wrapper.indexer_rope_emb)
     if quantized:
         kv_c, _ = quantize_kv(torch.float8_e4m3fn, kv_c, value=None, k_scale=0.5)
         k_pe, _ = quantize_kv(torch.float8_e4m3fn, k_pe, value=None, k_scale=0.5)
@@ -932,7 +950,7 @@ def test_write_caches_dcp_two_ranks_keep_their_own_rows(monkeypatch, layout):
     if len(jax.devices()) < 2:
         pytest.skip("needs 2 devices")
     monkeypatch.setattr(
-        kv_cache_utils,
+        mla_op,
         "update_sparse_mla_kv_cache_dcp",
         kv_cache_utils.update_sparse_mla_kv_cache_dcp_jax,
     )
@@ -955,7 +973,7 @@ def test_write_caches_dcp_two_ranks_keep_their_own_rows(monkeypatch, layout):
     inp["idx_cache"] = jax.device_put(
         jnp.zeros((dcp * idx_shape[0], *idx_shape[1:]), jnp.uint8), sharded
     )
-    got = mtp_kv_only.write_caches_dcp(
+    got = mla_op.mla_kv_write_caches_dcp(
         *_ordered(inp),
         mla_kv_spec=(nope_spec, rope_spec),
         mesh=mesh,
