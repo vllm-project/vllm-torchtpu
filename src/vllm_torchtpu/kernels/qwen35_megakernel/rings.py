@@ -716,8 +716,8 @@ class ExpertWeightRing:
                     lambda i=i, w=w: self._es_start(i, w, l)
                 )
 
-    def fetch_loop(self, nf, l):
-        """Initial ring fill: units 0..nf-1 (nf <= NBE) in ONE bswitch walk (loop in the arm)."""
+    def fetch_loop(self, nf, l, k0=0):
+        """Initial ring fill: units k0..nf-1 (nf <= NBE) in ONE bswitch walk (loop in the arm)."""
         W = self.ctx.W
 
         def arm(r13, r2):
@@ -727,7 +727,7 @@ class ExpertWeightRing:
                 pl.when(td == 0)(lambda: self._es_start(i, w, l))
                 return carry
 
-            lax.fori_loop(0, nf, body, 0)
+            lax.fori_loop(k0, nf, body, 0)
 
         bswitch(l, [lambda a=a, b=b: arm(a, b) for a, b in zip(W["e13"], W["e2"])])
 

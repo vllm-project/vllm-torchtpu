@@ -250,13 +250,17 @@ def apply(layer, x: torch.Tensor, router_logits: torch.Tensor) -> torch.Tensor:
                 is_padding[:, None], torch.full_like(logits, float("-inf")), logits
             )
     op = _build_op(int(layer.moe_config.experts_per_token))
+    from vllm_torchtpu.layers.adapter.fused_moe_ep_v3 import fep_scales_4d
+
+    # TPU_MOE_FEP_STAGE_SCALES: views of the staged [E, N] bases (same values), else the parameters.
+    s13, s2 = fep_scales_4d(layer)
     return op(
         x,
         logits,
         layer.w13_weight,
         layer.w2_weight,
-        layer.w13_weight_scale_inv,
-        layer.w2_weight_scale_inv,
+        s13,
+        s2,
         layer._experts_start.reshape(1),
         _RANK,
     )

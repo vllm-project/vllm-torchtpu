@@ -85,6 +85,7 @@ from vllm.distributed import (
     tensor_model_parallel_reduce_scatter,
 )
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
+from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.model_loader import base_loader
 from vllm.model_executor.models import qwen3_next, qwen3_next_mtp
 from vllm.sequence import IntermediateTensors
@@ -95,6 +96,7 @@ from vllm_torchtpu.layers.adapter import (
     linear_common,
     sequence_parallel,
     small_all_reduce_op,
+    tp2_sp_collectives,
 )
 from vllm_torchtpu.layers.adapter.attention import batched_rpa_schedule_scope
 from vllm_torchtpu.layers.adapter.linear_common import (
@@ -1144,6 +1146,85 @@ def _speculative_decoding_configured() -> bool:
         return True
 
 
+def _assemble_replicated_rows(
+    shards: list[torch.Tensor], starts: list[int], nums: list[int], org_vocab: int
+) -> torch.Tensor:
+    """The full [org_vocab, dim] table from every rank's (padded) shard: rank r's first
+    nums[r] rows are global rows starts[r] ..; padding rows are dropped. Then + 0.0, which
+    turns -0.0 into +0.0 exactly as the vocab-parallel lookup's all-reduce (owner row plus
+    zeros) does, so the replicated lookup returns the all-reduced bits."""
+    dim = shards[0].shape[1]
+    full = torch.zeros(org_vocab, dim, dtype=shards[0].dtype)
+    for shard, start, num in zip(shards, starts, nums):
+        full[start : start + num] = shard[:num]
+    return full.add_(0.0)  # in place (no second 2 GB copy); -0.0 + 0.0 = +0.0
+
+
+def _gather_replicated_embedding(emb: Any) -> torch.Tensor:
+    """All ranks' embedding shards gathered on the host over the TP CPU group (the bf16 bytes
+    as uint8: gloo has no int16 / bfloat16), assembled into the replicated table (on the host)."""
+    import torch.distributed as dist
+    from vllm.distributed import get_tp_group
+
+    group = get_tp_group().cpu_group
+    world = get_tensor_model_parallel_world_size()
+    si = emb.shard_indices
+    if si.added_vocab_end_index - si.added_vocab_start_index > 0:
+        raise NotImplementedError("TPU_REPLICATED_EMBED: added vocabulary is not supported")
+    local = emb.weight.data.detach().to("cpu").contiguous()
+    meta = torch.tensor(
+        [si.org_vocab_start_index, si.org_vocab_end_index - si.org_vocab_start_index],
+        dtype=torch.int64,
+    )
+    metas = [torch.empty_like(meta) for _ in range(world)]
+    dist.all_gather(metas, meta, group=group)
+    bits = local.view(torch.uint8)  # [rows, 2 * dim]: exact bytes, a gloo dtype
+    gathered = [torch.empty_like(bits) for _ in range(world)]
+    dist.all_gather(gathered, bits, group=group)
+    shards = [g.view(local.dtype) for g in gathered]
+    return _assemble_replicated_rows(
+        shards, [int(m[0]) for m in metas], [int(m[1]) for m in metas], int(emb.org_vocab_size)
+    )
+
+
+def replicated_embed_extra_bytes(vocab: int, hidden: int, tp: int, itemsize: int = 2) -> int:
+    """HBM a replicated embedding adds per rank over its vocab shard (0 when off or tp 1)."""
+    if not envs.TPU_REPLICATED_EMBED or tp <= 1:
+        return 0
+    return int(vocab) * int(hidden) * int(itemsize) * (int(tp) - 1) // int(tp)
+
+
+def _maybe_replicate_target_embedding(model: Any) -> bool:
+    """TPU_REPLICATED_EMBED: swap the target's vocab-parallel embed_tokens for a replicated
+    nn.Embedding (the draft, which shares the target's embed_tokens, and the megakernel
+    adapter pick it up after this hook)."""
+    if not envs.TPU_REPLICATED_EMBED or get_tensor_model_parallel_world_size() <= 1:
+        return False
+    lm = model.get_language_model() if hasattr(model, "get_language_model") else model
+    inner = getattr(lm, "model", None)
+    emb = getattr(inner, "embed_tokens", None)
+    if not isinstance(emb, VocabParallelEmbedding):
+        return False
+    device, dtype = emb.weight.device, emb.weight.dtype
+    full = _gather_replicated_embedding(emb)
+    if envs.TPU_REPLICATED_EMBED_MUTANT:  # test-only: wrong rows, must change the tokens
+        full = torch.roll(full, shifts=1, dims=0)
+        logger.warning("TPU_REPLICATED_EMBED_MUTANT: replicated table rolled by one row (test only)")
+    full = full.to(dtype).to(device)
+    new = torch.nn.Embedding(full.shape[0], full.shape[1], _weight=full)
+    new.weight.requires_grad_(False)
+    inner.embed_tokens = new
+    if device.type == "tpu":
+        synchronize_tensors(new.weight)
+    logger.info(
+        "TPU_REPLICATED_EMBED: target embed_tokens replicated (%d x %d per worker); "
+        "no embedding all-reduce",
+        full.shape[0],
+        full.shape[1],
+    )
+    return True
+
+
 def setup_qwen3_next_v6_after_loading(model: Any) -> None:
     """Post-weight-load setup for fused router/shared-expert FP8 weights, Pallas
     sigmoid-gate o_proj, GDN weight layout, and FP8 LM head."""
@@ -1160,6 +1241,8 @@ def setup_qwen3_next_v6_after_loading(model: Any) -> None:
         "Qwen3_5MTP",
         "Qwen3_5MoeMTP",
     )
+    if not is_mtp_wrapper:
+        _maybe_replicate_target_embedding(model)
     quant_shared_lm_head = os.environ.get(
         "TPU_QUANTIZE_SHARED_LM_HEAD", "1"
     ).strip().lower() not in ("0", "false", "no", "off")
@@ -1454,6 +1537,30 @@ def _fused_post_attn_norm_moe(
     return hidden_states, res_out.view(orig_shape)
 
 
+def _rank_tensors_ride_on(positions: torch.Tensor, sp_rank) -> torch.Tensor:
+    """``positions`` plus a zero read of every rank tensor a layer's kernels may take (the SP rank, the small
+    all-reduce's mesh rank, TPU_SP_TP2_PALLAS's pair rank), so that every trace of every token-count range lifts the
+    same buffers whether or not its branch calls the kernel: the warmup hands a bucket over only between traces with
+    equal inputs (shape_variants.ShapeSpecializationError otherwise)."""
+    if isinstance(sp_rank, torch.Tensor):
+        positions = positions + (sp_rank * 0)[0]
+    if small_all_reduce_op._RANK is not None:
+        positions = positions + (small_all_reduce_op._RANK * 0)[0]
+    if tp2_sp_collectives._RANK is not None:
+        positions = positions + (tp2_sp_collectives._RANK * 0)[0]
+    return positions
+
+
+def _sp_gather_q_s(x_q: torch.Tensor, x_s: torch.Tensor):
+    """XLA's SP all-gather of the fp8 rows and their scales (the TPU_SP_TP2_PALLAS fallback)."""
+    return tensor_model_parallel_all_gather(x_q, 0), tensor_model_parallel_all_gather(x_s, 0)
+
+
+def _sp_reduce_scatter(hidden_states: torch.Tensor) -> torch.Tensor:
+    """XLA's SP reduce-scatter (the TPU_SP_TP2_PALLAS fallback)."""
+    return tensor_model_parallel_reduce_scatter(hidden_states, 0)
+
+
 def patched_decoder_layer_forward(
     self,
     hidden_states: torch.Tensor,
@@ -1470,11 +1577,7 @@ def patched_decoder_layer_forward(
     input_is_sliced = sp and residual is not None
 
     # Rank tensors enter every layer's graph, so all layers trace alike.
-    sp_rank = getattr(self, "_tpu_sp_rank", None)
-    if isinstance(sp_rank, torch.Tensor):
-        positions = positions + (sp_rank * 0)[0]
-    if small_all_reduce_op._RANK is not None:
-        positions = positions + (small_all_reduce_op._RANK * 0)[0]
+    positions = _rank_tensors_ride_on(positions, getattr(self, "_tpu_sp_rank", None))
 
     prequant = None
     # A PCP-streaming GDN layer takes bf16 rows, so skip the FP8 pre-gather.
@@ -1488,8 +1591,7 @@ def patched_decoder_layer_forward(
             self.input_layernorm, hidden_states, residual
         )
         if input_is_sliced:
-            x_q = tensor_model_parallel_all_gather(x_q, 0)
-            x_s = tensor_model_parallel_all_gather(x_s, 0)
+            x_q, x_s = tp2_sp_collectives.gather_q_s_or(x_q, x_s, _sp_gather_q_s)
         prequant = (x_q, x_s)
         hidden_states = x_q
     else:
@@ -1505,8 +1607,7 @@ def patched_decoder_layer_forward(
             and not pcp_streaming_gdn
         ):
             x_q, x_s = linear_common.quantize_rows(hidden_states)
-            x_q = tensor_model_parallel_all_gather(x_q, 0)
-            x_s = tensor_model_parallel_all_gather(x_s, 0)
+            x_q, x_s = tp2_sp_collectives.gather_q_s_or(x_q, x_s, _sp_gather_q_s)
             prequant = (x_q, x_s)
             hidden_states = x_q
         elif input_is_sliced:
@@ -1534,7 +1635,7 @@ def patched_decoder_layer_forward(
 
     if self.use_attn_reduce_scatter_for_moe:
         if sp:
-            hidden_states = tensor_model_parallel_reduce_scatter(hidden_states, 0)
+            hidden_states = tp2_sp_collectives.reduce_scatter_or(hidden_states, _sp_reduce_scatter)
             if not input_is_sliced:
                 residual = _sp_chunk(self, residual)
         else:
@@ -1637,6 +1738,16 @@ def patched_model_forward(
     return hidden_states
 
 
+def _fc_column_block(fc: Any, x: torch.Tensor) -> torch.Tensor:
+    """DC3d: `fc(x)` before its all-gather, i.e. ColumnParallelLinear.forward's matmul:
+    this TP rank's output_size_per_partition columns ([r * n, (r + 1) * n) on rank r)."""
+    assert getattr(fc, "gather_output", False) and not getattr(fc, "return_bias", True), (
+        "TPU_MTP_MK_FC_SHARD expects the MTP fc (gather_output=True, return_bias=False)"
+    )
+    bias = fc.bias if not fc.skip_bias_add else None
+    return fc.quant_method.apply(fc, x, bias)
+
+
 def patched_mtp_forward(
     self,
     input_ids: torch.Tensor,
@@ -1656,7 +1767,11 @@ def patched_mtp_forward(
         inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
         hidden_states = self.pre_fc_norm_hidden(hidden_states)
         hidden_states = torch.cat([inputs_embeds, hidden_states], dim=-1)
-        hidden_states = self.fc(hidden_states)
+        if _mtp_megakernel is not None and getattr(_mtp_megakernel, "fc_shard", False):
+            # DC3d: the megakernel gathers the fc column blocks in-kernel.
+            hidden_states = _fc_column_block(self.fc, hidden_states)
+        else:
+            hidden_states = self.fc(hidden_states)
         residual = None
     else:
         hidden_states = intermediate_tensors["hidden_states"]

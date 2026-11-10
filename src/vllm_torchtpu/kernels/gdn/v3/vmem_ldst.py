@@ -107,6 +107,39 @@ def _region_rows_per_block(
     return rows_pb, out_lanes
 
 
+_P1_LOGGED = False
+
+
+def _p1_engaged(tiles_per_tap: int) -> None:
+    """DGDN P1 engagement line, once per process (trace time; no numerics)."""
+    global _P1_LOGGED
+    if not _P1_LOGGED:
+        _P1_LOGGED = True
+        from vllm_torchtpu.logger import init_logger
+
+        init_logger(__name__).info(
+            "TPU_GDN_DEC_CONV_PERM_LANE: conv-state QK-pair permutation on 128-lane tiles "
+            "(%d tiles per tap)", tiles_per_tap)
+
+
+def _tap_tile_perm(rows_perm: tuple[int, ...], rows_per_tap: int) -> list[int] | None:
+    """DGDN P1: the per-tap tile pattern of ``rows_perm`` (logical tile j of
+    every tap is stored tile ``pat[j]`` of the same tap), or None if the
+    permutation is not tap-uniform."""
+    if rows_per_tap <= 0 or len(rows_perm) % rows_per_tap:
+        return None
+    pat = list(rows_perm[:rows_per_tap])
+    if sorted(pat) != list(range(rows_per_tap)):
+        return None
+    for t in range(len(rows_perm) // rows_per_tap):
+        base = t * rows_per_tap
+        if [p - base for p in rows_perm[base : base + rows_per_tap]] != pat:
+            return None
+    if config.dec_conv_perm_lane_mutant():
+        pat = pat[::-1]  # test only: wrong tile order
+    return pat
+
+
 def load_state_region(
     slot_ref: jax.Ref, region: config.StateRegion, shape: tuple[int, ...]
 ) -> jax.Array:
@@ -153,6 +186,15 @@ def load_state_region(
     elif region.pack == 8:
         assert region.rows_perm is None
         arr = typed_ldst.unpack_fp4_octets(arr).astype(jnp.float32)
+    if region.rows_perm is not None and config.dec_conv_perm_lane():
+        # DGDN P1: reshape in stored order, then move whole 128-lane tiles
+        # (one vreg each in the compact (taps, 1, dim) layout) per tap.
+        w = arr.shape[-1]
+        pat = _tap_tile_perm(region.rows_perm, shape[-1] // w) if shape[-1] % w == 0 else None
+        if pat is not None:
+            _p1_engaged(len(pat))
+            x = arr.reshape(shape)
+            return jnp.concatenate([x[..., p * w : (p + 1) * w] for p in pat], axis=-1)
     if region.rows_perm is not None:
         # Static row gather from the stored order to the logical order;
         # sublane-dim slices + concat only, no lane crossing.
@@ -169,6 +211,24 @@ def store_state_region(
     region has deterministic bytes when copied out.
     """
     rows_pb, out_lanes = _region_rows_per_block(slot_ref, region)
+    perm_done = False
+    if region.rows_perm is not None and region.pack == 1 and config.dec_conv_perm_lane():
+        # DGDN P1: inverse per-tap tile move on the logical values, then the
+        # plain stored-order reshape below (no typed-row gather).
+        pat = (
+            _tap_tile_perm(region.rows_perm, values.shape[-1] // out_lanes)
+            if values.shape[-1] % out_lanes == 0
+            and values.size == region.rows_used * out_lanes
+            else None
+        )
+        if pat is not None:
+            inv = [0] * len(pat)
+            for j, p in enumerate(pat):
+                inv[p] = j
+            values = jnp.concatenate(
+                [values[..., i * out_lanes : (i + 1) * out_lanes] for i in inv], axis=-1
+            )
+            perm_done = True
     if region.pack == 2:
         assert region.rows_perm is None
         arr = typed_ldst.pack_bf16_pairs(
@@ -186,7 +246,7 @@ def store_state_region(
         )
     else:
         arr = values.astype(region.view_dtype).reshape(-1, out_lanes)
-    if region.rows_perm is not None:
+    if region.rows_perm is not None and not perm_done:
         # Inverse of the load-side gather: logical row i is stored at
         # typed row rows_perm[i].
         inverse = [0] * len(region.rows_perm)

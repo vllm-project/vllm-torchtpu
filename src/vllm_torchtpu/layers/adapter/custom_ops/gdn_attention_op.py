@@ -78,7 +78,13 @@ from vllm_torchtpu.layers.core.sequence_layout import (
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     get_vllm_model_wrapper_context,
 )
+from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.utils import fresh_buffer
+
+from vllm_torchtpu.logger import init_logger as _cw_init_logger
+
+_CW_PREP_LOGGED = False  # CW-prep engagement line, once per process
+_cw_logger = _cw_init_logger(__name__)
 
 _GDN_PCP_AXIS_NAME = "pcp"
 _GDN_TP_AXIS_NAME = "tp"
@@ -561,6 +567,34 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         del act_dtype
         w = self.conv1d.weight
         self.conv1d.weight.data = fresh_buffer(w)
+        if tpu_envs.TPU_GDN_CONV_W_PREP and tpu_envs.TPU_GDN_CONV_W_PREP_BF16:
+            # L1-bf16: ONE persistent buffer. conv1d.weight is re-backed in the pooled kernel's (K, 1, dim_local)
+            # layout in its own dtype; the batched kernel casts it to f32 on load (exact). Other callers permute back.
+            wk = self.conv1d.weight.data.detach().permute(2, 1, 0)
+            if tpu_envs.TPU_GDN_CONV_W_PREP_MUTANT:  # test only: taps reversed, must change tokens
+                wk = wk.flip(0)
+            self.conv1d.weight.data = fresh_buffer(wk.contiguous())
+            self._conv_w_prep = self.conv1d.weight
+        elif tpu_envs.TPU_GDN_CONV_W_PREP:
+            # CW-prep: the pooled kernel's (K, 1, dim_local) f32 operand, built once here instead of
+            # swapaxes + astype(f32) in every forward. conv1d.weight stays for the other callers.
+            wk = self.conv1d.weight.data.detach().permute(2, 1, 0).to(torch.float32)
+            if tpu_envs.TPU_GDN_CONV_W_PREP_MUTANT:  # test only: taps reversed, must change tokens
+                wk = wk.flip(0)
+            self._conv_w_prep = fresh_buffer(wk.contiguous())
+            global _CW_PREP_LOGGED
+            if not _CW_PREP_LOGGED:
+                _CW_PREP_LOGGED = True
+                _cw_logger.info("TPU_GDN_CONV_W_PREP: pooled GDN conv weight prepared at load as %s %s "
+                            "(no per-step swapaxes/astype; single copy: %s)", tuple(self._conv_w_prep.shape),
+                            self._conv_w_prep.dtype, bool(tpu_envs.TPU_GDN_CONV_W_PREP_BF16))
+
+    def _conv_w_orig(self) -> torch.Tensor:
+        """The (dim, 1, K) conv weight for the non-pooled / PCP callers (a view under L1-bf16)."""
+        w = self.conv1d.weight
+        if tpu_envs.TPU_GDN_CONV_W_PREP and tpu_envs.TPU_GDN_CONV_W_PREP_BF16:
+            return w.permute(2, 1, 0)
+        return w
 
     def get_state_shape(
         self,
@@ -1146,7 +1180,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             b,
             a,
             state_pool,
-            self.conv1d.weight,
+            self._conv_w_orig(),
             self.conv1d.bias,
             self.A_log,
             self.dt_bias,
@@ -1283,7 +1317,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                     b,
                     a,
                     recurrent_state,
-                    self.conv1d.weight,
+                    self._conv_w_prep if tpu_envs.TPU_GDN_CONV_W_PREP else self.conv1d.weight,
                     self.conv1d.bias,
                     self.A_log,
                     self.dt_bias,
@@ -1346,7 +1380,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                         a,
                         conv_state,
                         recurrent_state,
-                        self.conv1d.weight,
+                        self._conv_w_orig(),
                         self.conv1d.bias,
                         self.A_log,
                         self.dt_bias,
@@ -1369,7 +1403,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                         a,
                         conv_state,
                         recurrent_state,
-                        self.conv1d.weight,
+                        self._conv_w_orig(),
                         self.conv1d.bias,
                         self.A_log,
                         self.dt_bias,

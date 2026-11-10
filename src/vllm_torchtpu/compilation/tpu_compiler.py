@@ -160,6 +160,10 @@ _TPU_COMPILE_ENV_IGNORED = {
     "RAY_USAGE_STATS_ENABLED",
     "TPU_NAME",
     "USE_PHASED_PROFILER",
+    # R-HOST measurement (SYS): host-side per-step trace windows, log lines only; never in a compiled graph.
+    "VLLM_TPU_T3_STEP_TRACE",
+    "VLLM_TPU_T3_STEP_TRACE_EVERY_S",
+    "VLLM_TPU_T3_STEP_TRACE_WINDOW_S",
     # Raiden KV-transfer orchestration/identity only; consumed at serving time
     # by the KV connector and never affect the compiled graph.
     "TPU_RAIDEN_CONTROLLER_ADDRESS",

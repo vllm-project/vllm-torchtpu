@@ -95,6 +95,13 @@ if TYPE_CHECKING:
     TPU_MLA_MASKED_DENSE_MAX_KV_LEN: int | None = None
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
+    TPU_GDN_DEC_CKPT_FAST: bool = False
+    TPU_GDN_DEC_ROWPICK: bool = False
+    TPU_GDN_CONV_W_PREP: bool = False
+    TPU_GDN_CONV_W_PREP_MUTANT: bool = False
+    TPU_GDN_CONV_W_PREP_BF16: bool = False
+    TPU_GDN_DEC_CONV_PERM_LANE: bool = False
+    TPU_GDN_DEC_CONV_PERM_LANE_MUTANT: bool = False
     TPU_ENABLE_GDN_DYNAMIC_TILING: bool = False
     TPU_GDN_PREFILL_DOT_PRECISION: str = ""
     TPU_GDN_PREFILL_CHUNK: int = 0
@@ -139,6 +146,8 @@ if TYPE_CHECKING:
     TPU_FUSE_PRE_ATTN_NORM_QUANT: bool = True
     TPU_FUSE_POST_ATTN_NORM_MOE: bool = True
     TPU_GDN_FUSED_NORM_QUANT_MIN_ROWS: int = 16
+    TPU_GDN_OUT_PROJ_PAD32: bool = False
+    TPU_GDN_OUT_PROJ_PAD32_MUTANT: bool = False
     TPU_FUSED_QK_NORM_ROPE: bool = True
     TPU_FUSED_QK_NORM_ROPE_MIN_ROWS: int = 0
     TPU_RPA_DECODE_BATCHED: bool = False
@@ -149,6 +158,7 @@ if TYPE_CHECKING:
     TPU_PRECOMPILE_BIGGEST_FIRST: bool = False
     TPU_PRECOMPILE_PEER_REPLAY: bool = False
     TPU_WORKER_NUMA_BIND: bool = True
+    VLLM_TPU_MK_FRESH_BUFFER: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_DCP_INDEXER_A2A_MERGE: bool = False
     TPU_DCP_INDEXER_A2A_MIN_TOKENS: int = 64
@@ -262,7 +272,16 @@ if TYPE_CHECKING:
     TPU_MOE_FUSED_EP_V3_CONFIG: str = ""
     TPU_MOE_FUSED_EP_V3_TILE_ROWS: int = 128
     TPU_SP_MIN_ROWS: int = 512
+    TPU_SP_TP2_PALLAS: bool = False
+    TPU_SP_TP2_PALLAS_MUTANT: bool = False
+    TPU_SP_TP2_PALLAS_PARTS: str = "both"
+    TPU_SP_TP2_PALLAS_RS_MUTANT: bool = False
+    TPU_SP_TP2_PALLAS_MAX_STEP_ROWS: int = 0
     TPU_SP_FP8_GATHER: bool = True
+    TPU_MTP_MK_FC_SHARD: bool = False
+    TPU_MTP_MK_FC_SHARD_MUTANT: bool = False
+    TPU_REPLICATED_EMBED: bool = False
+    TPU_REPLICATED_EMBED_MUTANT: bool = False
     TPU_SCHED_SRPF_RUNNING: bool = True
     TPU_SCHED_COLD_CHUNK_CAP: int = 2048
     TPU_SCHED_COLD_THRESHOLD: int = 8192
@@ -288,7 +307,17 @@ if TYPE_CHECKING:
     VLLM_TPU_QWEN35_MK_WIDE_MB: int = 0
     VLLM_TPU_QWEN35_MK_WIDE_MIN_ROWS: int = 160
     VLLM_TPU_QWEN35_MK_DCP_KV_HEADROOM: bool = False
+    VLLM_TPU_QWEN35_MK_ATT_PMG: bool = False
+    VLLM_TPU_QWEN35_MK_ATT_PMG_MUTANT: bool = False
     TPU_RAIDEN_PP_MAX_CPU_BYTES: int | None = None
+    VLLM_TPU_QWEN35_MK_TP_EARLY_FETCH: str = "0"
+    VLLM_TPU_QWEN35_MK_TP_EARLY_FETCH_MUTANT: str = ""
+    VLLM_TPU_QWEN35_MK_SH_AT: str = ""
+    VLLM_TPU_QWEN35_MK_SH_AT_MAX_ROWS: str = ""
+    VLLM_TPU_QWEN35_MK_SH_AT_MUTANT: str = ""
+    VLLM_TPU_T3_STEP_TRACE: str = ""
+    VLLM_TPU_T3_STEP_TRACE_EVERY_S: str = "60"
+    VLLM_TPU_T3_STEP_TRACE_WINDOW_S: str = "2"
 
 
 def env_with_choices(
@@ -539,6 +568,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_GDN_CONV_QK_PAIR_LAYOUT": env_bool(
         "TPU_GDN_CONV_QK_PAIR_LAYOUT", default=False
     ),
+    # DGDN L1: batched GDN decode stores full-window conv checkpoints as static row
+    # slices, with a partial-window fixup at the end of the body (bitwise identical).
+    "TPU_GDN_DEC_CKPT_FAST": env_bool("TPU_GDN_DEC_CKPT_FAST", default=False),
+    # DGDN L6: fused-1dot GDN chain reads k.S / q.S as dot rows 0 / 1 plus +0.0
+    # instead of a masked sublane sum (bitwise identical).
+    "TPU_GDN_DEC_ROWPICK": env_bool("TPU_GDN_DEC_ROWPICK", default=False),
+    # GDN pooled path (CW-prep): build the kernel's (K, 1, dim) f32 conv weight once at load instead of
+    # swapaxes + astype(f32) in every forward (kernels/gdn/v3/wrapper.py). Same values, same layout.
+    "TPU_GDN_CONV_W_PREP": env_bool("TPU_GDN_CONV_W_PREP", default=False),
+    # Test only: with TPU_GDN_CONV_W_PREP, reverse the prepared conv taps (wrong conv) so an in-job
+    # token comparison can show it sees the lever's path. Never serve it.
+    "TPU_GDN_CONV_W_PREP_MUTANT": env_bool("TPU_GDN_CONV_W_PREP_MUTANT", default=False),
+    # GDN seat L1-bf16: with TPU_GDN_CONV_W_PREP, keep ONE persistent conv weight: conv1d.weight re-backed in the
+    # prepared (K, 1, dim) layout in its own dtype (the kernel casts to f32 on load, exact); other callers permute back.
+    "TPU_GDN_CONV_W_PREP_BF16": env_bool("TPU_GDN_CONV_W_PREP_BF16", default=False),
+    # DGDN P1: the QK-pair conv-state permutation moves whole 128-lane tiles of the (taps, 1, dim) state instead
+    # of single typed rows of the packed bf16 view (load and store). Same bytes, same values.
+    "TPU_GDN_DEC_CONV_PERM_LANE": env_bool("TPU_GDN_DEC_CONV_PERM_LANE", default=False),
+    # Test only: with TPU_GDN_DEC_CONV_PERM_LANE, reverse the per-tap tile pattern (wrong state). Never serve it.
+    "TPU_GDN_DEC_CONV_PERM_LANE_MUTANT": env_bool("TPU_GDN_DEC_CONV_PERM_LANE_MUTANT", default=False),
     # Size GDN v3 decode tiles and prefill chunks from per-rank heads, active
     # sequences and the VMEM estimate (kernels/gdn/v3/tiling.py) instead of
     # the fixed defaults.
@@ -923,6 +972,33 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Skip padded tokens from MoE, otherwise they will route like
     # real tokens and activate experts whose output is thrown away.
     "TPU_MOE_SKIP_PADDED_TOKENS": env_bool("TPU_MOE_SKIP_PADDED_TOKENS", default=True),
+    # Fused EP v3 (decode push, DMOE L5): stage the fp8 per-channel scales once at weight load as [E, N]
+    # bases; every MoE branch of a staged layer reads them (the fused kernel directly, the lowtok / GMM
+    # paths through [E, 1, 1, N] views), so the step stops relayouting the padded 4-D tables per call.
+    "TPU_MOE_FEP_STAGE_SCALES": env_bool("TPU_MOE_FEP_STAGE_SCALES", default=False),
+    "TPU_MOE_FEP_STAGE_SCALES_ALIAS": env_bool("TPU_MOE_FEP_STAGE_SCALES_ALIAS", default=False),
+    # Fused EP v3 (decode push, DMOE L7): reindex the router logits' expert axis from EP-rank order to mesh
+    # order inside the fused op with a static block permutation, instead of a per-layer torch-side
+    # relayout + gather (identical values; no-op when the orders already agree).
+    "TPU_MOE_FEP_STATIC_EXPERT_ORDER": env_bool("TPU_MOE_FEP_STATIC_EXPERT_ORDER", default=False),
+    # Test-only mutants for the two flags above (identity-check power; registered so a mutant phase never
+    # reuses a cached non-mutant program): "perturb" scales the staged w13 base by (1 + 2^-6); "reverse"
+    # applies the static expert order reversed. Empty (default) = off. Never set in serving.
+    "TPU_MOE_FEP_STAGE_SCALES_MUTANT": lambda: os.getenv("TPU_MOE_FEP_STAGE_SCALES_MUTANT", ""),
+    "TPU_MOE_FEP_STATIC_EXPERT_ORDER_MUTANT": lambda: os.getenv("TPU_MOE_FEP_STATIC_EXPERT_ORDER_MUTANT", ""),
+    # Fused EP v3 dense-slots program knobs (decode push, DMOE #2 + DATT #4), read by kernels/fused_moe/v3/dense_slots.py
+    # when the program is built; registered here so they enter the compile hash. All default off = the frozen program.
+    # TPU_MOE_FEP_DS_HIER=1: hierarchical (chip-level) row exchange (each rows / scales block once per remote chip,
+    # forwarded on-chip; bit-identical). TPU_MOE_DS_VMEM_TRIM / TPU_MOE_DS_COL_PASS / TPU_MOE_DS_PREFETCH_ALL (with
+    # dense_slots_weight_slots=4 in TPU_MOE_FUSED_EP_V3_CONFIG): DATT's w4 package (bit-identical). SCOPES / SEND_ORDER:
+    # profiling / experiment knobs. TPU_MOE_FEP_DS_HIER_MUTANT: test-only ("rotfwd"), never set in serving.
+    "TPU_MOE_FEP_DS_HIER": lambda: os.getenv("TPU_MOE_FEP_DS_HIER", "0"),
+    "TPU_MOE_FEP_DS_HIER_MUTANT": lambda: os.getenv("TPU_MOE_FEP_DS_HIER_MUTANT", ""),
+    "TPU_MOE_DS_VMEM_TRIM": lambda: os.getenv("TPU_MOE_DS_VMEM_TRIM", "0"),
+    "TPU_MOE_DS_COL_PASS": lambda: os.getenv("TPU_MOE_DS_COL_PASS", "0"),
+    "TPU_MOE_DS_PREFETCH_ALL": lambda: os.getenv("TPU_MOE_DS_PREFETCH_ALL", "0"),
+    "TPU_MOE_FEP_DS_SCOPES": lambda: os.getenv("TPU_MOE_FEP_DS_SCOPES", "0"),
+    "TPU_MOE_FEP_DS_SEND_ORDER": lambda: os.getenv("TPU_MOE_FEP_DS_SEND_ORDER", "0"),
     # Runs the batched RPA prefill / mixed kernel's QK and/or PV matmul with
     # fp8 operands against the fp8 KV cache: "qk", "pv" or "qkpv", each
     # operand optionally suffixed "s" for its static scale (e.g. "qkpvs").
@@ -1034,6 +1110,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_FUSE_POST_ATTN_NORM_MOE": env_bool(
         "TPU_FUSE_POST_ATTN_NORM_MOE", default=True
     ),
+    # GDN fused out_proj (L3-B): pad the rows to a multiple of 32 before gated_norm_quant + the fp8 dot and
+    # slice the result back (row-independent, bitwise; a faster dot fusion at non-32-multiple row counts).
+    "TPU_GDN_OUT_PROJ_PAD32": env_bool("TPU_GDN_OUT_PROJ_PAD32", default=False),
+    # Test only: with TPU_GDN_OUT_PROJ_PAD32, slice the wrong rows so an in-job token comparison can show
+    # it sees the lever's path. Never serve it.
+    "TPU_GDN_OUT_PROJ_PAD32_MUTANT": env_bool("TPU_GDN_OUT_PROJ_PAD32_MUTANT", default=False),
     "TPU_GDN_FUSED_NORM_QUANT_MIN_ROWS": env_nonnegative_int(
         "TPU_GDN_FUSED_NORM_QUANT_MIN_ROWS", 16
     ),
@@ -1113,6 +1195,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # c16 int90 99.6 vs 96.6). It only narrows the inherited CPU set and is a
     # logged no-op when ranks do not map onto chips or sysfs has no node.
     "TPU_WORKER_NUMA_BIND": env_bool("TPU_WORKER_NUMA_BIND", default=True),
+    # Qwen3.5 megakernel weight packing: give `_fresh` leaves (final_norm, TP
+    # expert scales) a buffer of their own shape through a real op instead of
+    # empty().copy_(), which torch_tpu may alias to the source's base buffer
+    # (one tt_jit_execute_as_strided launch per executable call). Bit-exact.
+    "VLLM_TPU_MK_FRESH_BUFFER": env_bool("VLLM_TPU_MK_FRESH_BUFFER", default=False),
     # Token-axis chunk size for the GLM-5.2 / DSv4 StreamIndex top-k kernel.
     # Cutting the flat token axis into `chunk_tokens`-sized pieces lets each
     # chunk's SparseCore top-k overlap the next chunk's TensorCore scoring.
@@ -1557,7 +1644,38 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Fused EP v3 FFN tile height (the kernel's tile_rows), a multiple of 8.
     "TPU_MOE_FUSED_EP_V3_TILE_ROWS": env_int("TPU_MOE_FUSED_EP_V3_TILE_ROWS", 128),
     "TPU_SP_MIN_ROWS": lambda: int(os.getenv("TPU_SP_MIN_ROWS", "512")),
+    # DP x TP2 decoder layers (L2): the sequence-parallel x_q/x_s all-gather and reduce-scatter as Pallas
+    # kernels over the TP pair (layers/adapter/tp2_sp_collectives.py). Pure copies / two-term sums: same bits.
+    "TPU_SP_TP2_PALLAS": env_bool("TPU_SP_TP2_PALLAS", default=False),
+    # Test only: with TPU_SP_TP2_PALLAS, the pair gather swaps the two ranks' rows so an in-job token
+    # comparison can show it sees the lever's path. Never serve it.
+    "TPU_SP_TP2_PALLAS_MUTANT": env_bool("TPU_SP_TP2_PALLAS_MUTANT", default=False),
+    # Bisect knob for TPU_SP_TP2_PALLAS: which pair kernel(s) it takes -- "both" (default, L2 as kept), "gather"
+    # (the x_q/x_s pair gather only) or "rs" (the reduce-scatter only); the other side keeps XLA's collective.
+    # Part of the compile key (not in _TPU_COMPILE_ENV_IGNORED). An unknown value raises at startup.
+    "TPU_SP_TP2_PALLAS_PARTS": env_with_choices(
+        "TPU_SP_TP2_PALLAS_PARTS", "both", ["both", "gather", "rs"]
+    ),
+    # Test only: with TPU_SP_TP2_PALLAS, the pair reduce-scatter reverses its output rows on each core, so an
+    # in-job token comparison can show it sees the reduce-scatter path (PARTS=rs). Never serve it.
+    "TPU_SP_TP2_PALLAS_RS_MUTANT": env_bool("TPU_SP_TP2_PALLAS_RS_MUTANT", default=False),
+    # Step-row cap for TPU_SP_TP2_PALLAS: > 0 takes the pair kernels only at steps of at most this many rows
+    # (gather 2h <= cap, reduce-scatter R <= cap); 0 keeps the built-in limits (gather 256 rows/rank, RS 512 rows).
+    "TPU_SP_TP2_PALLAS_MAX_STEP_ROWS": env_int("TPU_SP_TP2_PALLAS_MAX_STEP_ROWS", 0),
     "TPU_SP_FP8_GATHER": env_bool("TPU_SP_FP8_GATHER", default=True),
+    # Qwen3.5 MTP megakernel (DC3d): the MTP fc skips its all-gather and the megakernel
+    # gathers this rank's column block in-kernel (pure copies, the same bits).
+    "TPU_MTP_MK_FC_SHARD": env_bool("TPU_MTP_MK_FC_SHARD", default=False),
+    # Test only: with TPU_MTP_MK_FC_SHARD, assemble the gathered blocks rotated by one (wrong
+    # columns) so a token comparison can show it sees the draft's bits. Never serve it.
+    "TPU_MTP_MK_FC_SHARD_MUTANT": env_bool("TPU_MTP_MK_FC_SHARD_MUTANT", default=False),
+    # Qwen3.5: replicate the target's embed_tokens on every TP rank after loading (no
+    # per-step embedding all-reduce; the same bits) and take its extra bytes out of the
+    # auto KV budget (models/vllm/qwen3_next_patch.py, platforms/tpu_platform.py).
+    "TPU_REPLICATED_EMBED": env_bool("TPU_REPLICATED_EMBED", default=False),
+    # Test only: with TPU_REPLICATED_EMBED, roll the replicated table by one row (every token embeds as
+    # its predecessor) so an in-job token comparison can show it sees the lever's path. Never serve it.
+    "TPU_REPLICATED_EMBED_MUTANT": env_bool("TPU_REPLICATED_EMBED_MUTANT", default=False),
     # --- PrefixAwareScheduler SRPF & cold-prefill chunk capping ---
     # Sort prefilling requests in `running` by fewest remaining prompt tokens.
     "TPU_SCHED_SRPF_RUNNING": env_bool("TPU_SCHED_SRPF_RUNNING", default=True),
@@ -1675,10 +1793,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_QWEN35_MK_DCP_KV_HEADROOM": env_bool(
         "VLLM_TPU_QWEN35_MK_DCP_KV_HEADROOM", default=False
     ),
+    # Megakernel attention (GQ DCP merge): send each finished KV row's partial softmax state to its
+    # group peers from inside the KV loop instead of all at once after it (same bytes, slots and
+    # waits; bit-exact). Registered so it is a compute_tpu_compilation_hash factor.
+    "VLLM_TPU_QWEN35_MK_ATT_PMG": env_bool("VLLM_TPU_QWEN35_MK_ATT_PMG", default=False),
+    # Test-only mutant for VLLM_TPU_QWEN35_MK_ATT_PMG (wrong row in the per-row merge send; tokens must differ).
+    "VLLM_TPU_QWEN35_MK_ATT_PMG_MUTANT": env_bool("VLLM_TPU_QWEN35_MK_ATT_PMG_MUTANT", default=False),
     # Host bytes of the Raiden offload tier on a pipeline-parallel engine,
     # replacing the connector's cpu_bytes_to_use (which TPU_RAIDEN_MAX_CPU_BYTES
     # only caps). Unset: the cap applies as on a TP engine.
     "TPU_RAIDEN_PP_MAX_CPU_BYTES": env_optional_int("TPU_RAIDEN_PP_MAX_CPU_BYTES"),
+    # DECINT (lead rule 11-03): program-side flags read via os.environ, registered (raw string) for the compile hash.
+    "VLLM_TPU_QWEN35_MK_TP_EARLY_FETCH": lambda: os.environ.get("VLLM_TPU_QWEN35_MK_TP_EARLY_FETCH", "0"),
+    "VLLM_TPU_QWEN35_MK_TP_EARLY_FETCH_MUTANT": lambda: os.environ.get("VLLM_TPU_QWEN35_MK_TP_EARLY_FETCH_MUTANT", ""),
+    "VLLM_TPU_QWEN35_MK_SH_AT": lambda: os.environ.get("VLLM_TPU_QWEN35_MK_SH_AT", ""),
+    "VLLM_TPU_QWEN35_MK_SH_AT_MAX_ROWS": lambda: os.environ.get("VLLM_TPU_QWEN35_MK_SH_AT_MAX_ROWS", ""),
+    "VLLM_TPU_QWEN35_MK_SH_AT_MUTANT": lambda: os.environ.get("VLLM_TPU_QWEN35_MK_SH_AT_MUTANT", ""),
+    "VLLM_TPU_T3_STEP_TRACE": lambda: os.environ.get("VLLM_TPU_T3_STEP_TRACE", ""),
+    "VLLM_TPU_T3_STEP_TRACE_EVERY_S": lambda: os.environ.get("VLLM_TPU_T3_STEP_TRACE_EVERY_S", "60"),
+    "VLLM_TPU_T3_STEP_TRACE_WINDOW_S": lambda: os.environ.get("VLLM_TPU_T3_STEP_TRACE_WINDOW_S", "2"),
 }
 
 

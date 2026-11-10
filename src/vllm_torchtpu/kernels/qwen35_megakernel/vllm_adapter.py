@@ -206,8 +206,28 @@ def _build_tp_rank_mesh(tp_size: int) -> jax.sharding.Mesh:
 # that consumes it. Same idiom as `torch.empty(...).copy_(...)` in
 # `layers/adapter/quantization/fp8.py`.
 def _fresh(x: torch.Tensor) -> torch.Tensor:
-    """Copy `x` into a newly allocated buffer of exactly `x.shape`."""
+    """Copy `x` into a newly allocated buffer of exactly `x.shape`.
+
+    VLLM_TPU_MK_FRESH_BUFFER=1 (default off): torch_tpu may satisfy the
+    same-shape `copy_` below by aliasing the new tensor to `x`'s base buffer
+    (see `vllm_torchtpu.utils.fresh_buffer`), which keeps the shape mismatch:
+    `final_norm` ([1, H] from a [H] float32 norm weight) then costs one
+    `tt_jit_execute_as_strided` launch per call of the target, MTP and MTP-loop
+    executables (3 per decode step, ~50 us of host time each). A real op gives
+    the leaf a buffer of its own shape; `* 1` keeps every bit (-0.0 included).
+    """
+    if _real_op_fresh(x):
+        logger.info("VLLM_TPU_MK_FRESH_BUFFER: real-op buffer for a %s %s leaf", tuple(x.shape), x.dtype)
+        return torch.clone(x, memory_format=torch.contiguous_format) * 1
     return torch.empty(x.shape, dtype=x.dtype, device=x.device).copy_(x)
+
+
+def _real_op_fresh(x: torch.Tensor) -> bool:
+    return (
+        envs.VLLM_TPU_MK_FRESH_BUFFER
+        and x.device.type == "tpu"
+        and x.dtype in (torch.float32, torch.bfloat16, torch.float16)
+    )
 
 
 def _stack(xs: Sequence[torch.Tensor]) -> torch.Tensor:

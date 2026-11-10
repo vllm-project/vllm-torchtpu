@@ -882,7 +882,7 @@ def run_jax_gdn_attention_pooled_local(
     kernel's state operands, so the kernel itself never sees the pool layout.
     """
 
-    conv_dim = conv_weight.shape[0]
+    conv_dim = conv_weight.shape[2] if tpu_envs.TPU_GDN_CONV_W_PREP else conv_weight.shape[0]
     # Fused conv+GDN kernel: both state regions stream directly
     # between the pool and the kernel's double-buffered pipeline (one
     # contiguous DMA per slot per region) — no external gather/scatter
@@ -926,6 +926,7 @@ def run_jax_gdn_attention_pooled_local(
         num_spec_tokens=num_spec_tokens,
         seg_bounds=seg_bounds,
         seg_state_indices=seg_state_indices,
+        conv_weight_prepped=bool(tpu_envs.TPU_GDN_CONV_W_PREP),
     )
     return recurrent_state, output
 
@@ -1001,7 +1002,8 @@ def run_jax_gdn_attention_pooled(
         P(None, "model"),  # j_b
         P(None, "model"),  # j_a
         pool_spec,  # recurrent_state (attention-shaped pool)
-        P("model", None, None),  # j_conv_weight
+        # j_conv_weight: (dim, 1, K) sharded on dim; CW-prep hands (K, 1, dim) f32, sharded on axis 2
+        P(None, None, "model") if tpu_envs.TPU_GDN_CONV_W_PREP else P("model", None, None),
         P("model") if j_conv_bias is not None else None,  # j_conv_bias
         P("model"),  # j_A_log
         P("model"),  # j_dt_bias

@@ -203,6 +203,9 @@ def prebuild() -> None:
     global _AR_OP, _RS_OP, _RANK, _CORES, _MESH_RANKS, _DP_COMBINE, MAX_ROWS
     global _AR_TP_OP, _TP_RANK, _TP_RANKS
     MAX_ROWS = envs.TPU_SMALL_ALL_REDUCE_MAX_ROWS
+    from vllm_torchtpu.layers.adapter import tp2_sp_collectives  # L2: its own flag, its own no-op
+
+    tp2_sp_collectives.prebuild()
     if not envs.TPU_SMALL_ALL_REDUCE or _AR_OP is not None:
         return
     mesh = build_ep_mesh()

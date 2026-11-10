@@ -160,6 +160,11 @@ class PagedAttentionBlock:
         AE, B, T, NS, G, H = ctx.AE, ctx.B, ctx.T, ctx.NS, ctx.G, ctx.H
         nh, HD, NHH, QR, TQ = ctx.nh, ctx.HD, ctx.NHH, ctx.QR, ctx.TQ
         SPLIT, VER, PACK, QV, GQ = ctx.SPLIT, ctx.VER, ctx.PACK, ctx.QV, ctx.GQ
+        # VLLM_TPU_QWEN35_MK_ATT_PMG (registered, default off): per-sequence pipelined merge sends (att_core)
+        from vllm_torchtpu import envs as _envs_pm
+        PMG = bool(getattr(_envs_pm, "VLLM_TPU_QWEN35_MK_ATT_PMG", False) and GQ and SPLIT and c.paged_kv
+                   and ctx.tiles.pair_kv and not ctx.interpret)
+        PMG_MUT = bool(PMG and getattr(_envs_pm, "VLLM_TPU_QWEN35_MK_ATT_PMG_MUTANT", False))  # test-only mutant
         SR, QG, MLW, NBP, PB, PW = ctx.SR, ctx.QG, ctx.MLW, ctx.NBP, ctx.PB, ctx.PW
         BLK, SUB, NKV, NKVR, KVE = ctx.BLK, ctx.SUB, ctx.NKV, ctx.NKVR, ctx.KVE
         KV_ITEM, EBROWS, PAIR_KV = ctx.KV_ITEM, ctx.EBROWS, ctx.PAIR_KV
@@ -692,7 +697,57 @@ class PagedAttentionBlock:
                 kv_start(i1 + KR)
                 return carry
 
-            if PAIR_KV:
+            if PAIR_KV and PMG:
+                # PMG: KV rows' items are listed in row order, so row s's softmax state (aacc[s], am[s],
+                # al[s]) is final once items [0, end_s) are done; its aacc rows for group rank g are then
+                # sent to g here, inside att_core, instead of all at once after it. Same bytes, same
+                # destination slots and semaphores as the one-shot send: the merge waits are unchanged.
+                me_, gs_, TS_ = ctx.me, ctx.gs, ctx.TS
+
+                def seq_items(b):  # init_worklist's item count of KV row b (dynamic b)
+                    plen_b = self.kv_len(pos_ref[b * T] if VER else pos_ref[b])
+                    nb_ = jnp.minimum(jnp.maximum((plen_b + BLK - 1) // BLK, 0), ctx.max_nb)
+                    t0_ = lax.rem(gs_ + (TS_ - lax.rem(b, TS_)), TS_) if SPLIT else jnp.int32(0)
+                    return jnp.maximum(nb_ - t0_ + TS_ - 1, 0) // TS_
+
+                def send_row(sq):
+                    for off in range(1, G):
+                        pltpu.make_async_remote_copy(
+                            src_ref=scr["aacc"].at[(jnp.minimum(sq + 1, NS - 1) if PMG_MUT else sq), pl.ds(pl.multiple_of((gi ^ off) * QG, 8), QG)],
+                            dst_ref=scr["pri"].at[gi, sq],
+                            send_sem=scr["sp_ssem"].at[off - 1],
+                            recv_sem=scr["sp_rsem"].at[off - 1],
+                            device_id=(me_ ^ off,),
+                            device_id_type=pl.DeviceIdType.MESH,
+                        ).start()
+
+                def flush(carry, done):
+                    def cond(cr):
+                        return jnp.logical_and(cr[0] < NS, cr[1] <= done)
+
+                    def body(cr):
+                        sq, end = cr
+                        send_row(sq)
+                        nx = sq + 1
+                        add = jnp.where(nx < NS, seq_items(jnp.minimum(nx, NS - 1)), 0)
+                        return nx, end + add
+
+                    return lax.while_loop(cond, body, carry)
+
+                def pair_pmg(p, carry):
+                    item_pair(p, 0)
+                    return flush(carry, 2 * p + 2)
+
+                pmg_carry = lax.fori_loop(
+                    0, lax.div(n_items, 2), pair_pmg, (jnp.int32(0), seq_items(jnp.int32(0)))
+                )
+
+                @pl.when(lax.rem(n_items, 2) == 1)
+                def _():
+                    item(n_items - 1, 0)
+
+                flush(pmg_carry, n_items)  # the rows completed by the tail item (and any empty rows)
+            elif PAIR_KV:
                 lax.fori_loop(0, lax.div(n_items, 2), item_pair, 0)
 
                 @pl.when(lax.rem(n_items, 2) == 1)
@@ -711,14 +766,38 @@ class PagedAttentionBlock:
                 lane = lax.broadcasted_iota(I32, (QG, 128), 1)
                 for g in range(G):
                     rs = slice(g * QG, (g + 1) * QG)
-                    for s_ in range(NS):
-                        psend[g, s_] = aacc[s_, rs]
+                    if not PMG:  # PMG: the aacc blocks went out from att_core
+                        for s_ in range(NS):
+                            psend[g, s_] = aacc[s_, rs]
                     xm, xl = am[0, rs], al[0, rs]
                     for s_ in range(1, NS):
                         hi = lane >= s_ * MLW
                         xm = jnp.where(hi, am[s_, rs], xm)
                         xl = jnp.where(hi, al[s_, rs], xl)
                     psend[g, NS] = jnp.concatenate((xm, xl), axis=-1)
+                if PMG:
+                    mx = self.group_copies(
+                        lambda off: psend.at[gi ^ off],
+                        pri.at[gi],
+                        scr["sp_ssem"],
+                        scr["sp_rsem"],
+                    )
+                    # own rows' blocks and (m, l) tile locally; the (m, l) tile to the peers now. The
+                    # full-message descriptors mx are only waited on (DMA semaphores count bytes: the
+                    # NS row sends + this tile = one full message per peer).
+                    for s_ in range(NS):
+                        pri[gi, s_] = aacc[s_, pl.ds(pl.multiple_of(gi * QG, 8), QG)]
+                    pri[gi, NS] = psend[gi, NS]
+                    for off in range(1, G):
+                        pltpu.make_async_remote_copy(
+                            src_ref=psend.at[gi ^ off, NS],
+                            dst_ref=pri.at[gi, NS],
+                            send_sem=scr["sp_ssem"].at[off - 1],
+                            recv_sem=scr["sp_rsem"].at[off - 1],
+                            device_id=(ctx.me ^ off,),
+                            device_id_type=pl.DeviceIdType.MESH,
+                        ).start()
+                    return mx
                 pri[gi] = psend[gi]
                 mx = self.group_copies(
                     lambda off: psend.at[gi ^ off],

@@ -416,6 +416,34 @@ def kt_xpose() -> bool:
     )
 
 
+def dec_ckpt_fast() -> bool:
+    """DGDN L1 (TPU_GDN_DEC_CKPT_FAST): pooled batched decode tiles store the
+    conv checkpoints as static row slices instead of the per-row select chain.
+    Checkpoints below the real size equal the chain's (no select fires there);
+    those at or past it are never copied back to HBM. Bitwise identical
+    (decgdn6/decgdn7)."""
+    return bool(envs.TPU_GDN_DEC_CKPT_FAST)
+
+
+def dec_rowpick() -> bool:
+    """DGDN L6 (TPU_GDN_DEC_ROWPICK): the fused-1dot chain reads k.S and q.S
+    as rows 0 / 1 of the dot plus +0.0 instead of a masked sublane sum, which
+    equals row + 0.0 exactly. Bitwise identical (decgdn6/decgdn7)."""
+    return bool(envs.TPU_GDN_DEC_ROWPICK)
+
+
+def dec_conv_perm_lane() -> bool:
+    """DGDN P1 (TPU_GDN_DEC_CONV_PERM_LANE): apply a tap-uniform QK-pair conv
+    row permutation on whole 128-lane tiles of the reshaped (taps, 1, dim)
+    state instead of on single typed rows. Pure data movement."""
+    return bool(envs.TPU_GDN_DEC_CONV_PERM_LANE)
+
+
+def dec_conv_perm_lane_mutant() -> bool:
+    """Test only: reverse P1's per-tap tile pattern (must change results)."""
+    return bool(envs.TPU_GDN_DEC_CONV_PERM_LANE_MUTANT)
+
+
 def trace_scopes() -> bool:
     """Whether the kernel body wraps its phases in named scopes
     (TPU_GDN_TRACE_SCOPES), which the TPU profiler records in TRACE_COMPUTE

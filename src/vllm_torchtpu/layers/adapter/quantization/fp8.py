@@ -1263,8 +1263,10 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             "hidden_states": x,
             "w1": layer.w13_weight,
             "w2": layer.w2_weight,
-            "w1_scale": layer.w13_weight_scale_inv,
-            "w2_scale": layer.w2_weight_scale_inv,
+            # TPU_MOE_FEP_STAGE_SCALES: views of the staged bases (same values), so this branch lifts the
+            # same graph inputs as the fused one; else the parameters.
+            "w1_scale": _fep_scales_4d(layer)[0],
+            "w2_scale": _fep_scales_4d(layer)[1],
             "w1_bias": getattr(layer, "w13_bias", None),
             "w2_bias": getattr(layer, "w2_bias", None),
             "topk_weights": topk_weights,
@@ -1297,6 +1299,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
 
         from vllm_torchtpu.layers.adapter import small_all_reduce_op
         from vllm_torchtpu.layers.adapter.fused_moe_ep_v3 import (
+            fep_scale_operands,
             fused_moe_ep,
             fused_moe_ep_supported,
             retain_fused_ep_graph_inputs,
@@ -1307,12 +1310,9 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         if use_fused_kernel and (
             fused_moe_ep_supported(self) or fused_moe_ep_supported(layer)
         ):
-            w13, w2, s13, s2 = (
-                layer.w13_weight,
-                layer.w2_weight,
-                layer.w13_weight_scale_inv,
-                layer.w2_weight_scale_inv,
-            )
+            w13, w2 = layer.w13_weight, layer.w2_weight
+            # TPU_MOE_FEP_STAGE_SCALES: the staged [E, N] bases (no per-call relayout), else the parameters.
+            s13, s2 = fep_scale_operands(layer)
             if (
                 getattr(layer, "_lowtok_has_copies", False)
                 and getattr(layer, "_lowtok_tables", None) is not None
@@ -1388,8 +1388,10 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             "hidden_states": x,
             "w1": layer.w13_weight,
             "w2": layer.w2_weight,
-            "w1_scale": layer.w13_weight_scale_inv,
-            "w2_scale": layer.w2_weight_scale_inv,
+            # TPU_MOE_FEP_STAGE_SCALES: views of the staged bases (same values), so this branch lifts the
+            # same graph inputs as the fused one; else the parameters.
+            "w1_scale": _fep_scales_4d(layer)[0],
+            "w2_scale": _fep_scales_4d(layer)[1],
             "w1_bias": getattr(layer, "w13_bias", None),
             "w2_bias": getattr(layer, "w2_bias", None),
             "topk_weights": topk_weights,
@@ -1925,6 +1927,12 @@ def resolve_online_fp8(
     method.online_fp8_policy = policy
     policy.selected[prefix] = aliases
     return method
+
+
+def _fep_scales_4d(layer):
+    from vllm_torchtpu.layers.adapter.fused_moe_ep_v3 import fep_scales_4d
+
+    return fep_scales_4d(layer)
 
 
 def _fused_kernel_takes(rows: int, gate: int) -> bool:

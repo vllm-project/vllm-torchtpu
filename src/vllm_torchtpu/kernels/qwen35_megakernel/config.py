@@ -221,6 +221,10 @@ class MKConfig:
     # p // dcp (vLLM's DCP layout, the batched RPA kernel's and Raiden's tp{T}dcp{D}_decode rule);
     # the page table is the rank-local one. 1: the pool is replicated over the group.
     dcp: int = 1
+    # DC3d (TPU_MTP_MK_FC_SHARD): 1 = `hidden` arrives as this rank's [M, H / R] column block
+    # (the MTP fc output before its all-gather) and the kernel gathers the R blocks in-kernel
+    # after its entry barrier; 2 = the same with the blocks rotated by one (test-only mutant).
+    hid_shard: int = 0
 
     @property
     def wide(self) -> bool:
@@ -366,6 +370,10 @@ class MKConfig:
         assert self.E % 128 == 0 and self.E <= 1024 and self.H % self.PC == 0 and self.nh <= 8
         assert self.ROT % 2 == 0 and self.R & (self.R - 1) == 0 and self.VH % self.KH == 0
         assert self.T >= 1 and self.B % self.T == 0, (self.B, self.T)
+        assert self.hid_shard in (0, 1, 2), self.hid_shard
+        assert not self.hid_shard or (
+            self.R > 1 and not self.wide and self.H % (self.R * 128) == 0
+        ), (self.hid_shard, self.R, self.mb_rows, self.H)
         assert self.e_slots == 0 or self.e_slots >= (self.E if self.moe_tp else self.ER)
         if self.paged_kv:
             assert self.page_size == 128 and self.num_pages >= 1 and self.max_pages_per_seq >= 1

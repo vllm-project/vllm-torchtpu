@@ -82,6 +82,39 @@ from .pool_dma import GDNPoolDMA, GprRecIn, KVPoolDMA
 from .rings import DenseWeightRing, ExpertWeightRing, WeightRings
 
 
+def _gather_hid_shards(ctx: MKBuildContext):
+    """DC3d: this rank's [M, H / R] `hidden` block to block `me` of every peer's `hidg`
+    (R - 1 remote copies plus a local one, after the entry barrier, so every peer is inside
+    the kernel), then the [MB, H] rows with block r = TP rank r's columns: the order of the
+    XLA all-gather this replaces. Pure copies. A peer's copy to this rank uses the same
+    offset `me ^ off`, so it lands on the same receive semaphore and size."""
+    scr, me, R, MB, hid_ref = ctx.scr, ctx.me, ctx.R, ctx.MB, ctx.hid_ref
+    sends = [
+        pltpu.make_async_remote_copy(
+            src_ref=hid_ref,
+            dst_ref=scr["hidg"].at[me],
+            send_sem=scr["hg_ssem"].at[i],
+            recv_sem=scr["hg_rsem"].at[i],
+            device_id=(me ^ off,),
+            device_id_type=pl.DeviceIdType.MESH,
+        )
+        for i, off in enumerate(range(1, R))
+    ]
+    for d in sends:
+        d.start()
+    own = pltpu.make_async_copy(hid_ref, scr["hidg"].at[me], scr["hg_lsem"])
+    own.start()
+    own.wait()
+    for d in sends:
+        d.wait_recv()
+    for d in sends:
+        d.wait_send()
+    rot = 1 if ctx.HID_SHARD == 2 else 0  # test-only mutant: wrong column order
+    return jnp.concatenate(
+        [scr["hidg"][(r + rot) % R, :MB] for r in range(R)], axis=-1
+    )
+
+
 def build(
     c: MKConfig,
     tiles: Tiles | None = None,
@@ -259,7 +292,8 @@ def build(
                     device_id_type=pl.DeviceIdType.MESH,
                 )
             pl.semaphore_wait(barrier, R - 1)
-        scr["res"][...] = jnp.where(live, hid_ref[:MB].astype(F32), 0.0)
+        hid_rows = _gather_hid_shards(ctx) if ctx.HID_SHARD else hid_ref[:MB]
+        scr["res"][...] = jnp.where(live, hid_rows.astype(F32), 0.0)
         scr["mix"][...] = jnp.zeros(scr["mix"].shape, F32)
         if c.paged_kv:
             scr["knew_o"][...] = jnp.zeros((MR, ctx.HD), FP8)

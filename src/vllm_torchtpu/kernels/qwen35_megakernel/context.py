@@ -604,6 +604,16 @@ class MKBuildContext:
         else:
             scratch["dpool"] = pltpu.VMEM((NBD * BROWS, 128), U8)
             scratch["epool"] = pltpu.VMEM((NBE * EBROWS, 128), U8)
+        HID_SHARD = int(c.hid_shard)
+        if HID_SHARD:
+            # DC3d: block r of the MTP fc output (TP rank r's H / R columns); block me is
+            # this rank's own, the other R - 1 arrive by remote copy after the entry barrier.
+            assert R > 1 and not WIDE_MB and H % (R * 128) == 0, (R, WIDE_MB, H)
+            scratch["hidg"] = pltpu.VMEM((R, M, H // R), BF16)
+            scratch["hg_ssem"] = pltpu.SemaphoreType.DMA((R - 1,))
+            scratch["hg_rsem"] = pltpu.SemaphoreType.DMA((R - 1,))
+            scratch["hg_lsem"] = pltpu.SemaphoreType.DMA(())
+        self.HID_SHARD = HID_SHARD
         s_names = list(scratch)
         if FUSED:
             st_names = ("raw", "page_table", "ckpt_indices", "read_offsets") + (

@@ -40,7 +40,9 @@ scale has to travel with them. The same per-row math as v3 with bf16 result
 rows, so the output can be compared bit for bit against v3 run with
 result_rows="bf16" (and elementwise float32, where every compilation agrees).
 """
+import contextlib
 import functools
+import os
 
 import jax
 import jax.numpy as jnp
@@ -64,6 +66,50 @@ ROW_ALIGN = 32
 GATHER_ROWS = 32
 INTERPRET = None  # tests set a pltpu.InterpretParams()
 VMEM_LIMIT = None  # tests (no TPU to ask) set a byte count
+# DATT w4 VMEM trim (default off): the combine's weighted sums go to result slot 0 (dead once every slot is drained)
+# as the bf16 output rows instead of to their own f32 [R * LB, 128] buffer (1 MiB at 64 rows). Each sum is the same
+# f32 value cast to the output dtype once, at the store instead of at the final copy: same output bits.
+VMEM_TRIM = None  # tests set True / False; None: env TPU_MOE_DS_VMEM_TRIM
+
+
+def _vmem_trim():
+    if VMEM_TRIM is not None:
+        return bool(VMEM_TRIM)
+    import os as _os_vt
+    return _os_vt.environ.get("TPU_MOE_DS_VMEM_TRIM", "0") == "1"
+
+
+# With the trim on, a 4-slot program may claim this share of VMEM instead of device.VMEM_FRACTION (0.98): at 448 / 512
+# rows the trimmed w4 program (with TPU_MOE_DS_COL_PASS=1024) fits the chip (63.67 of 63.94 MiB) but not 0.98 of it.
+W4_VMEM_FRACTION = 0.995
+
+
+# DATT prologue fill (default off): the prologue starts weight_prefetch (= weight_slots - 1) refills, so one weight slot
+# sits empty through the whole row exchange and its expert only starts streaming at list position 0. With this on the
+# prologue fills every slot (one more expert streams during the exchange) and position 0 skips the refill it would
+# have started. Same experts in the same slots, waited on the same semaphores: only one DMA starts earlier.
+PREFETCH_ALL = None  # tests set True / False; None: env TPU_MOE_DS_PREFETCH_ALL
+
+
+def _prefetch_all():
+    if PREFETCH_ALL is not None:
+        return bool(PREFETCH_ALL)
+    import os as _os_pa
+    return _os_pa.environ.get("TPU_MOE_DS_PREFETCH_ALL", "0") == "1"
+
+
+# DATT hidden-column passes (default 0 = one pass over the whole hidden width): the tile gather's one-hot matmul and
+# the down matmul (with its scaling and bf16 result rows) are formed `n` hidden columns at a time and stored pass by
+# pass, so their f32 [rows, H] values never exist whole (they are register-allocator spill slots in VMEM). Every
+# output column is the same contraction; only the column tiling of the matmuls' outputs changes.
+COL_PASS = None  # tests set an int; None: env TPU_MOE_DS_COL_PASS
+
+
+def _col_pass():
+    if COL_PASS is not None:
+        return int(COL_PASS)
+    import os as _os_dc
+    return int(_os_dc.environ.get("TPU_MOE_DS_COL_PASS", "0"))
 # The combine inside the program (arrivals and the exchange in VMEM).
 FUSED = False
 # The index exchange and the tables as one Pallas program instead of XLA ops.
@@ -93,6 +139,79 @@ SKIP_UNROUTED = False
 SKIP_MUTANT = ""
 # Tests only: the program's weight slots (0: Config.dense_slots_weight_slots, else 3).
 WEIGHT_SLOTS = 0
+# Opt-in device trace scopes for profiling (default off): TPU_MOE_FEP_DS_SCOPES=1 wraps the
+# program's phases (ds_pro prologue, ds_bar barrier, ds_send sends, ds_idxw index wait, ds_tab
+# tables, ds_rowsw row wait, ds_prep, ds_list live-list scan, ds_exp expert loop, ds_tail drains,
+# ds_comb combine) in jax.named_scope; =2 also each expert's ds_ww weight wait, ds_gat one-hot
+# gather, ds_ffn FFN, ds_push pushes and ds_dr slot drain. With the libtpu flag
+# --xla_enable_custom_call_region_trace=true they show on the device planes' "XLA TraceMe" line.
+# Off (0) the program is unchanged.
+SCOPES_ENV = "TPU_MOE_FEP_DS_SCOPES"
+
+
+def scope_level() -> int:
+    return int(os.environ.get(SCOPES_ENV, "0") or 0)
+
+
+# Exchange send order (decode push, default 0 = frozen), read when the program is built. Shard s sends
+# its block to its D - 1 peers; order 0 is s+1, s+2, ..., s+D-1, so an even shard reaches its on-chip
+# partner (s ^ 1, shards 2k and 2k+1 share a chip in the device-id mesh order) first and an odd shard
+# last, and the odd receivers' last arrival is an off-chip copy. Order 1 sends every shard's partner
+# copy last, order 2 first; the other peers keep their relative order. Same copies, same bytes, same
+# destinations: the output is bit-identical. Needs an even shard count (else order 0).
+SEND_ORDER_ENV = "TPU_MOE_FEP_DS_SEND_ORDER"
+# Tests only: "halfswap" sends the last peer the two 32-row halves of the sender's rows block into
+# swapped halves of its slot (same bytes, whole fp8 tiles, needs Tp % 64 == 0): every real row lands
+# in the wrong place whatever the memory held before, so the output must move.
+SEND_ORDER_MUTANT = ""
+
+
+def send_order_level() -> int:
+    return int(os.environ.get(SEND_ORDER_ENV, "0") or 0)
+
+
+# Hierarchical (chip-level) row exchange (decode push, DMOE #2; default 0 = frozen), read when the program is
+# built; fused + merged programs with an even shard count of at least 4, where shards 2k and 2k+1 share a chip
+# (the device-id mesh order; see ep_mesh). Every shard needs every shard's block (rows_all is all-gathered), so
+# the flat exchange sends each block across the inter-chip links twice per remote chip, once to each of its
+# cores. With hier = 1 a shard sends its rows / scales block once per remote chip -- to the core of its own
+# parity -- plus to its on-chip partner, and forwards each block it receives from another chip to its partner
+# as soon as it lands (on-chip). Off-chip row bytes per shard: D/2 - 1 blocks instead of D - 2. The index
+# blocks stay flat and go first (the tables wait on them alone). Every block still lands in the same slot of
+# every shard with the same bytes: the output is bit-identical. Total sends per shard stay D - 1 blocks.
+HIER_ENV = "TPU_MOE_FEP_DS_HIER"
+# Tests only: "rotfwd" forwards the block from chip offset j into the partner's slot for offset j + 1 (real
+# rows, rotated destinations): every forwarded block lands in the wrong slot, so the output must move.
+HIER_MUTANT = ""
+
+
+def hier_level() -> int:
+    return int(os.environ.get(HIER_ENV, "0") or 0)
+
+
+# The engine's test-only mutant switch (registered in envs.py so a mutant phase never reuses a cached program):
+# TPU_MOE_FEP_DS_HIER_MUTANT=rotfwd; tests may still set HIER_MUTANT directly.
+HIER_MUTANT_ENV = "TPU_MOE_FEP_DS_HIER_MUTANT"
+
+
+def hier_mutant() -> str:
+    return os.environ.get(HIER_MUTANT_ENV, "") or HIER_MUTANT
+
+
+class _Scopes:
+    """begin / end pairs of jax.named_scope at or below the build's level (no-ops above it)."""
+
+    def __init__(self, level):
+        self.level = int(level)
+        self.open = []
+
+    def begin(self, name, level=1):
+        cm = jax.named_scope(name) if self.level >= level else contextlib.nullcontext()
+        cm.__enter__()
+        self.open.append(cm)
+
+    def end(self):
+        self.open.pop().__exit__(None, None, None)
 
 
 def _align(n, m):
@@ -332,7 +451,8 @@ def build_kernel(*, num_shards, tokens_per_shard, hidden, inter,
                  columns_per_pass, weight_slots=3, weight_prefetch=2,
                  result_slots=3, vmem_limit=None, fused=False,
                  out_dtype=jnp.bfloat16, merged=False, num_experts=None,
-                 real_rows=None, skip_unrouted=False):
+                 real_rows=None, skip_unrouted=False, scopes=0, send_order=0, hier=0,
+                 vmem_trim=False, prefetch_all=False, col_pass=0, hier_mutant=""):
     """The per-shard Pallas program (a callable of the tables and operands).
 
     merged (fused only): the index exchange and the tables run inside this
@@ -350,6 +470,8 @@ def build_kernel(*, num_shards, tokens_per_shard, hidden, inter,
         raise ValueError(f"real_rows {real_rows}: merged only, a multiple of 8, "
                          f"at most {tokens_per_shard}")
     unpadded = real_rows is not None
+    NC = num_shards // 2  # chips (2 shards per chip)
+    hx = bool(hier) and fused and merged and num_shards % 2 == 0 and num_shards >= 4
     D, Tp, H, I, G, K, T = (num_shards, tokens_per_shard, hidden, inter,
                             experts_per_shard, top_k, tile_rows)
     N = D * Tp
@@ -360,11 +482,21 @@ def build_kernel(*, num_shards, tokens_per_shard, hidden, inter,
     if not 1 <= weight_prefetch < weight_slots:
         raise ValueError("weight_prefetch must be in [1, weight_slots)")
     n_arrival = Tp * K
+    # DATT w4 VMEM trim (see _vmem_trim): the fused program with bf16 output rows that fit one result slot.
+    trim_sums = bool(vmem_trim and fused and R <= T and jnp.dtype(out_dtype) == jnp.dtype(jnp.bfloat16))
+    # DATT prologue fill (see _prefetch_all): experts the prologue starts; position i refills i + weight_prefetch
+    # only when the prologue did not already start it. Needs the ring rule prefetch = slots - 1.
+    pro = min(weight_slots if (prefetch_all and weight_prefetch == weight_slots - 1) else weight_prefetch, G)
+    HC = int(col_pass)
+    if HC and (HC % LANES or H % HC):
+        raise ValueError(f"hidden column pass {HC}: a multiple of {LANES} dividing hidden {H}")
+    HC = HC if HC and HC < H else 0
     passes = T // GATHER_ROWS
 
     E = num_experts if num_experts is not None else G * D
 
     def kernel(*refs):
+        sc = _Scopes(scopes)
         it = iter(refs)
         if merged:
             me_ref = next(it)
@@ -385,7 +517,10 @@ def build_kernel(*, num_shards, tokens_per_shard, hidden, inter,
                                                         for _ in range(3))
         (xq_vmem, xs_vmem, rows_all, scales_all, tile_vmem, w1_vmem, w2_vmem,
          result_vmem, xs_tile) = (next(it) for _ in range(9))
-        if fused:
+        if fused and trim_sums:
+            arrivals_ref, coef_vmem = (next(it) for _ in range(2))
+            sum_vmem = None  # the sums go to result slot 0 (see _vmem_trim)
+        elif fused:
             arrivals_ref, coef_vmem, sum_vmem = (next(it) for _ in range(3))
         if merged:
             (idx_all, mp_v, tab_v, pos_v, misc_v, tab_s, pos_s,
@@ -399,6 +534,7 @@ def build_kernel(*, num_shards, tokens_per_shard, hidden, inter,
             me = me_ref[0]
         else:
             me = misc_ref[0, 0]
+        sem_ag_off = next(it) if hx else None
 
         def w_copy(e, slot):
             return (pltpu.make_async_copy(w1_ref.at[e], w1_vmem.at[slot],
@@ -408,7 +544,8 @@ def build_kernel(*, num_shards, tokens_per_shard, hidden, inter,
 
         # Weight refills depend on nothing but the expert: they start first
         # and stream while the rows are exchanged.
-        for i in range(min(weight_prefetch, G)):
+        sc.begin("ds_pro")
+        for i in range(pro):
             for cp in w_copy(i, i):
                 cp.start()
 
@@ -448,7 +585,11 @@ def build_kernel(*, num_shards, tokens_per_shard, hidden, inter,
             xs_vmem[...] = jnp.broadcast_to(xs, (Tp, LANES))
             ag_src = (xq_vmem, xs_vmem)
             ag_dst = (landing_ref.at[block], landing_s_ref.at[block])
+        sc.end()
+        sc.begin("ds_bar")
         _barrier(D, mesh_axes)
+        sc.end()
+        sc.begin("ds_send")
         if not fused:
             local_rows = pltpu.make_async_copy(ag_src[0], ag_dst[0],
                                                sem_ag_local)
@@ -456,23 +597,80 @@ def build_kernel(*, num_shards, tokens_per_shard, hidden, inter,
                                                  sem_ag_local)
             local_rows.start()
             local_scales.start()
-        for i in range(1, D):
-            peer = lax.rem(me + i, jnp.int32(D))
+        def send_to(peer, dsts):
             if merged:  # the indices first: the tables wait on them alone
                 pltpu.make_async_remote_copy(
                     src_ref=idx_all.at[block], dst_ref=idx_all.at[block],
                     send_sem=sem_idx_send, recv_sem=sem_idx_recv,
                     device_id=device_coords(peer, mesh_axes),
                     device_id_type=pl.DeviceIdType.MESH).start()
-            for src, dst in zip(ag_src, ag_dst):
+            for src, dst in zip(ag_src, dsts):
                 pltpu.make_async_remote_copy(
                     src_ref=src, dst_ref=dst, send_sem=sem_ag_send,
                     recv_sem=sem_ag_recv,
                     device_id=device_coords(peer, mesh_axes),
                     device_id_type=pl.DeviceIdType.MESH).start()
+
+        if hx:
+            c = lax.rem(me, jnp.int32(2))
+            chip = lax.div(me, jnp.int32(2))
+            partner = jnp.bitwise_xor(me, jnp.int32(1))
+            # the index blocks flat, first, in frozen peer order: the tables wait on them alone
+            for i in range(1, D):
+                pltpu.make_async_remote_copy(
+                    src_ref=idx_all.at[block], dst_ref=idx_all.at[block],
+                    send_sem=sem_idx_send, recv_sem=sem_idx_recv,
+                    device_id=device_coords(lax.rem(me + i, jnp.int32(D)), mesh_axes),
+                    device_id_type=pl.DeviceIdType.MESH).start()
+            # rows / scales: the on-chip partner (lands on its main recv semaphore) ...
+            for src in ag_src:
+                pltpu.make_async_remote_copy(
+                    src_ref=src, dst_ref=src, send_sem=sem_ag_send, recv_sem=sem_ag_recv,
+                    device_id=device_coords(partner, mesh_axes),
+                    device_id_type=pl.DeviceIdType.MESH).start()
+            # ... and the same-parity core of every other chip (lands on that receiver's off slot j - 1)
+            for j in range(1, NC):
+                peer = lax.rem(chip + j, jnp.int32(NC)) * 2 + c
+                for src in ag_src:
+                    pltpu.make_async_remote_copy(
+                        src_ref=src, dst_ref=src, send_sem=sem_ag_send, recv_sem=sem_ag_off.at[j - 1],
+                        device_id=device_coords(peer, mesh_axes),
+                        device_id_type=pl.DeviceIdType.MESH).start()
+        elif send_order in (1, 2) and D % 2 == 0 and D > 2:
+            # The D - 2 non-partner peers in frozen relative order, then (1) or before (2) the partner.
+            partner = jnp.bitwise_xor(me, jnp.int32(1))
+            shift = jnp.int32(2) - lax.rem(me, jnp.int32(2))  # even: skip s+1 (the partner)
+            others = [lax.rem(me + shift + j, jnp.int32(D)) for j in range(D - 2)]
+            peers = others + [partner] if send_order == 1 else [partner] + others
+            for pi, peer in enumerate(peers):
+                if (SEND_ORDER_MUTANT == "halfswap" and pi == len(peers) - 1 and fused and merged
+                        and Tp % 64 == 0):
+                    h = Tp // 2
+                    lo = pl.ds(pl.multiple_of(me * Tp, ROW_ALIGN), h)
+                    hi = pl.ds(pl.multiple_of(me * Tp + h, ROW_ALIGN), h)
+                    pltpu.make_async_remote_copy(
+                        src_ref=idx_all.at[block], dst_ref=idx_all.at[block],
+                        send_sem=sem_idx_send, recv_sem=sem_idx_recv,
+                        device_id=device_coords(peer, mesh_axes),
+                        device_id_type=pl.DeviceIdType.MESH).start()
+                    for src, dst in ((rows_all.at[lo], rows_all.at[hi]), (rows_all.at[hi], rows_all.at[lo]),
+                                     (scales_all.at[block], scales_all.at[block])):
+                        pltpu.make_async_remote_copy(
+                            src_ref=src, dst_ref=dst, send_sem=sem_ag_send, recv_sem=sem_ag_recv,
+                            device_id=device_coords(peer, mesh_axes),
+                            device_id_type=pl.DeviceIdType.MESH).start()
+                else:
+                    send_to(peer, ag_dst)
+        else:
+            for i in range(1, D):
+                send_to(lax.rem(me + i, jnp.int32(D)), ag_dst)
+        sc.end()
         if merged:
+            sc.begin("ds_idxw")
             if D > 1:
                 _wait_rows(sem_idx_recv, idx_all, (D - 1) * Tp)
+            sc.end()
+            sc.begin("ds_tab")
             own_idx = idx_all[block, :] if unpadded else idx_ref[...]
             mp, tab, pos, misc = _tables_math(me, idx_all[...], own_idx,
                                               D=D, Tp=Tp, G=G, K=K, E=E)
@@ -490,6 +688,27 @@ def build_kernel(*, num_shards, tokens_per_shard, hidden, inter,
             for cp in to_smem:
                 cp.wait()
             tab_ref, pos_ref, misc_ref, mp_ref = tab_s, pos_s, misc_s, mp_v
+            sc.end()
+        if hx:
+            sc.begin("ds_fwd")
+            # forward each block that came from another chip to the partner, as soon as it lands
+            for j in range(1, NC):
+                src_chip = lax.rem(chip - j + NC, jnp.int32(NC))
+                sblk = pl.ds(pl.multiple_of((src_chip * 2 + c) * Tp, ROW_ALIGN), Tp)
+                if hier_mutant == "rotfwd":
+                    d_chip = lax.rem(chip - (j % (NC - 1)) - 1 + NC, jnp.int32(NC))
+                    dblk = pl.ds(pl.multiple_of((d_chip * 2 + c) * Tp, ROW_ALIGN), Tp)
+                else:
+                    dblk = sblk
+                _wait_rows(sem_ag_off.at[j - 1], rows_all, Tp)
+                _wait_rows(sem_ag_off.at[j - 1], scales_all, Tp)
+                for ref in (rows_all, scales_all):
+                    pltpu.make_async_remote_copy(
+                        src_ref=ref.at[sblk], dst_ref=ref.at[dblk], send_sem=sem_ag_send,
+                        recv_sem=sem_ag_recv, device_id=device_coords(partner, mesh_axes),
+                        device_id_type=pl.DeviceIdType.MESH).start()
+            sc.end()
+        sc.begin("ds_rowsw")
         recv_remote = misc_ref[0, 1]
         own_local = misc_ref[0, 2]
         wait_ref = rows_all if fused else landing_ref
@@ -498,8 +717,11 @@ def build_kernel(*, num_shards, tokens_per_shard, hidden, inter,
             local_rows.wait()
             local_scales.wait()
         if D > 1:
-            _wait_rows(sem_ag_recv, wait_ref, (D - 1) * Tp)
-            _wait_rows(sem_ag_recv, wait_s_ref, (D - 1) * Tp)
+            # hier: the main semaphore takes the partner's own block and the NC - 1 it forwards (the off
+            # slots were consumed before forwarding); flat: all D - 1 blocks.
+            n_main = NC * Tp if hx else (D - 1) * Tp
+            _wait_rows(sem_ag_recv, wait_ref, n_main)
+            _wait_rows(sem_ag_recv, wait_s_ref, n_main)
         if not fused:
             load_rows = pltpu.make_async_copy(landing_ref, rows_all, sem_load)
             load_scales = pltpu.make_async_copy(landing_s_ref, scales_all,
@@ -508,10 +730,13 @@ def build_kernel(*, num_shards, tokens_per_shard, hidden, inter,
             load_scales.start()
             load_rows.wait()
             load_scales.wait()
+        sc.end()
+        sc.begin("ds_prep")
         # The scales as one lane-major row: column t is token t's scale.
         scale_row = jnp.transpose(scales_all[...])[0:1, :]  # [1, N]
         tile_vmem[...] = jnp.zeros_like(tile_vmem)
         xs_tile[...] = jnp.zeros_like(xs_tile)
+        sc.end()
 
         def push_tile(e, j, live, rs):
             """Pushes the tile's rows of each (expert, destination) run."""
@@ -562,7 +787,10 @@ def build_kernel(*, num_shards, tokens_per_shard, hidden, inter,
             for i in range(1, result_slots):
                 pr = jnp.where(rs == i, pend_r[i], pr)
                 plc = jnp.where(rs == i, pend_l[i], plc)
+            sc.begin("ds_dr", 2)
             drain_slot(rs, pr, plc)
+            sc.end()
+            sc.begin("ds_gat", 2)
             live = jnp.minimum(n_rows - j * T, T)
             mp_row = mp_ref[pl.ds(e, 1), :]  # [1, N]
             for p in range(passes):
@@ -573,34 +801,69 @@ def build_kernel(*, num_shards, tokens_per_shard, hidden, inter,
                         jnp.int32, (GATHER_ROWS, N), 0))
                     hit = mp_row == want  # [GATHER_ROWS, N], one hit a live row
                     onehot = jnp.where(hit, 1.0, 0.0).astype(FP8)
-                    picked = lax.dot_general(
-                        onehot, rows_all[...], (((1, ), (0, )), ((), ())),
-                        preferred_element_type=jnp.float32)
-                    tile_vmem[p * GATHER_ROWS:(p + 1) * GATHER_ROWS, :] = (
-                        picked.astype(FP8))
+                    if HC:  # one nonzero term per output value: exact in any column tiling
+                        for lo in range(0, H, HC):
+                            picked = lax.dot_general(
+                                onehot, rows_all[:, lo:lo + HC], (((1, ), (0, )), ((), ())),
+                                preferred_element_type=jnp.float32)
+                            tile_vmem[p * GATHER_ROWS:(p + 1) * GATHER_ROWS, lo:lo + HC] = (
+                                picked.astype(FP8))
+                    else:
+                        picked = lax.dot_general(
+                            onehot, rows_all[...], (((1, ), (0, )), ((), ())),
+                            preferred_element_type=jnp.float32)
+                        tile_vmem[p * GATHER_ROWS:(p + 1) * GATHER_ROWS, :] = (
+                            picked.astype(FP8))
                     s = jnp.sum(jnp.where(hit, scale_row, 0.0), axis=1,
                                 keepdims=True)
                     tile_s = jnp.broadcast_to(s, (GATHER_ROWS, LANES))
                     xs_tile[p * GATHER_ROWS:(p + 1) * GATHER_ROWS, :] = tile_s
 
+            sc.end()
+            sc.begin("ds_ffn", 2)
             row_scales = xs_tile[:, 0:1]
-            acc2, mid_scales = ffn.expert_ffn_fp8(
-                tile_vmem[...], row_scales, w1_vmem[wslot], w2_vmem[wslot],
-                w1s_ref[pl.ds(e, 1), :], activation="silu", w1_bias=None,
-                no_gate=False, block=0, elementwise=elementwise,
-                columns_per_pass=columns_per_pass, token_block=0)
-            result, _ = ffn.result_rows(acc2, mid_scales,
-                                        w2_scales=w2s_ref[pl.ds(e, 1), :],
-                                        w2_bias=None, dtype=jnp.bfloat16,
-                                        elementwise=elementwise)
-            result = result.reshape(T, LB, LANES)
-            for i in range(result_slots):
+            if HC:
+                # expert_ffn_fp8 (token_block 0, block 0) with the down matmul in output-column passes.
+                acc1 = lax.dot_general(tile_vmem[...], w1_vmem[wslot], ffn.DOT_ROWS_BY_COLUMNS,
+                                       preferred_element_type=jnp.float32)
+                mid, mid_scales = ffn.intermediate_rows(
+                    acc1, row_scales, I, w1_scales=w1s_ref[pl.ds(e, 1), :], activation="silu",
+                    w1_bias=None, no_gate=False, block=0, dtype=elementwise,
+                    columns_per_pass=columns_per_pass)
+                for lo in range(0, H, HC):
+                    acc2 = lax.dot_general(mid, w2_vmem[wslot, :, lo:lo + HC], ffn.DOT_ROWS_BY_COLUMNS,
+                                           preferred_element_type=jnp.float32)
+                    part, _ = ffn.result_rows(acc2, mid_scales,
+                                              w2_scales=w2s_ref[pl.ds(e, 1), lo:lo + HC],
+                                              w2_bias=None, dtype=jnp.bfloat16,
+                                              elementwise=elementwise)
+                    part = part.reshape(T, HC // LANES, LANES)
+                    for i in range(result_slots):
 
-                @pl.when(rs == i)
-                def _(i=i):
-                    result_vmem[i] = result
+                        @pl.when(rs == i)
+                        def _(i=i, part=part, lo=lo):
+                            result_vmem[i, :, lo // LANES:(lo + HC) // LANES, :] = part
+            else:
+                acc2, mid_scales = ffn.expert_ffn_fp8(
+                    tile_vmem[...], row_scales, w1_vmem[wslot], w2_vmem[wslot],
+                    w1s_ref[pl.ds(e, 1), :], activation="silu", w1_bias=None,
+                    no_gate=False, block=0, elementwise=elementwise,
+                    columns_per_pass=columns_per_pass, token_block=0)
+                result, _ = ffn.result_rows(acc2, mid_scales,
+                                            w2_scales=w2s_ref[pl.ds(e, 1), :],
+                                            w2_bias=None, dtype=jnp.bfloat16,
+                                            elementwise=elementwise)
+                result = result.reshape(T, LB, LANES)
+                for i in range(result_slots):
 
+                    @pl.when(rs == i)
+                    def _(i=i):
+                        result_vmem[i] = result
+
+            sc.end()
+            sc.begin("ds_push", 2)
             n_r, n_l = push_tile(e, j, live, rs)
+            sc.end()
             pend_r = tuple(jnp.where(rs == i, n_r, pend_r[i])
                            for i in range(result_slots))
             pend_l = tuple(jnp.where(rs == i, n_l, pend_l[i])
@@ -609,10 +872,13 @@ def build_kernel(*, num_shards, tokens_per_shard, hidden, inter,
 
         def expert_step(e, carry):
             wslot = lax.rem(e, jnp.int32(weight_slots))
+            sc.begin("ds_ww", 2)
             for cp in w_copy(e, wslot):
                 cp.wait()
+            sc.end()
 
-            @pl.when(e + weight_prefetch < G)
+            @pl.when(e + weight_prefetch < G if pro <= weight_prefetch else
+                     jnp.logical_and(e + weight_prefetch < G, e + weight_prefetch >= pro))
             def _():
                 ahead = e + weight_prefetch
                 for cp in w_copy(ahead, lax.rem(ahead,
@@ -632,7 +898,7 @@ def build_kernel(*, num_shards, tokens_per_shard, hidden, inter,
             # list position i uses weight slot i % weight_slots, which for
             # i < P is the slot the prologue filled. A store at every position
             # and a conditional advance keep the scan branch-free.
-            P = min(weight_prefetch, G)
+            P = pro
             for i in range(P):
                 order_s[i] = jnp.int32(i)
 
@@ -643,15 +909,20 @@ def build_kernel(*, num_shards, tokens_per_shard, hidden, inter,
                 order_s[n] = e
                 return n + jnp.where(live, 1, 0)
 
+            sc.begin("ds_list")
             n_list = lax.fori_loop(P, G, collect, jnp.int32(P))
+            sc.end()
 
             def listed_step(i, carry):
                 e = order_s[i]
                 wslot = lax.rem(i, jnp.int32(weight_slots))
+                sc.begin("ds_ww", 2)
                 for cp in w_copy(e, wslot):
                     cp.wait()
+                sc.end()
 
-                @pl.when(i + weight_prefetch < n_list)
+                @pl.when(i + weight_prefetch < n_list if P <= weight_prefetch else
+                         jnp.logical_and(i + weight_prefetch < n_list, i + weight_prefetch >= P))
                 def _():
                     ahead = i + weight_prefetch
                     for cp in w_copy(order_s[ahead],
@@ -666,11 +937,16 @@ def build_kernel(*, num_shards, tokens_per_shard, hidden, inter,
                     0, n_tiles,
                     lambda j, c: tile_step(e, cslot, n_rows, j, c), carry)
 
+            sc.begin("ds_exp")
             _, pend_r, pend_l = lax.fori_loop(0, n_list, listed_step,
                                               (jnp.int32(0), zeros, zeros))
+            sc.end()
         else:
+            sc.begin("ds_exp")
             _, pend_r, pend_l = lax.fori_loop(0, G, expert_step,
                                               (jnp.int32(0), zeros, zeros))
+            sc.end()
+        sc.begin("ds_tail")
         for i in range(result_slots):
             drain_slot(i, pend_r[i], pend_l[i])
         if D > 1:
@@ -684,7 +960,9 @@ def build_kernel(*, num_shards, tokens_per_shard, hidden, inter,
             _wait_rows(sem_push_recv, arrivals_ref, recv_remote)
 
         del own_local  # local pushes are drained per slot above
+        sc.end()
         if fused:
+            sc.begin("ds_comb")
             # v3's weighted_sum body on the arrivals in place: per token the
             # top_k rows (looked up by pair), k in order, each times its
             # coefficient, a zero coefficient's term dropped.
@@ -700,12 +978,20 @@ def build_kernel(*, num_shards, tokens_per_shard, hidden, inter,
                         jnp.float32) * coef
                     term = jnp.where(coef != 0, term, jnp.zeros_like(term))
                     acc = term if k == 0 else acc + term
-                row0 = pl.multiple_of(t * LB, 8)
-                sum_vmem[pl.ds(row0, LB), :] = acc
+                if trim_sums:
+                    result_vmem[0, t] = acc.astype(out_ref.dtype)
+                else:
+                    row0 = pl.multiple_of(t * LB, 8)
+                    sum_vmem[pl.ds(row0, LB), :] = acc
                 return carry
 
             lax.fori_loop(0, R, token, 0, unroll=8)
-            out_ref[...] = sum_vmem[...].reshape(R, H).astype(out_ref.dtype)
+            if trim_sums:
+                out_ref[...] = result_vmem[0, 0:R].reshape(R, H)
+            else:
+                out_ref[...] = sum_vmem[...].reshape(R, H).astype(out_ref.dtype)
+            sc.end()
+        assert not sc.open, "unbalanced trace scopes"
 
     hbm = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
     vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
@@ -724,8 +1010,9 @@ def build_kernel(*, num_shards, tokens_per_shard, hidden, inter,
         scratch += [
             pltpu.VMEM((n_arrival, LB, LANES), jnp.bfloat16),  # arrivals
             pltpu.VMEM((R, K), jnp.float32),  # coefficients
+        ] + ([] if trim_sums else [
             pltpu.VMEM((R * LB, LANES), jnp.float32),  # weighted sums
-        ]
+        ])
     if merged:
         scratch += [
             pltpu.VMEM((N, LANES), jnp.int32),  # idx_all
@@ -752,6 +1039,8 @@ def build_kernel(*, num_shards, tokens_per_shard, hidden, inter,
     ]
     if merged:
         scratch += [pltpu.SemaphoreType.DMA] * 3  # idx send / recv, smem
+    if hx:
+        scratch += [pltpu.SemaphoreType.DMA((NC - 1, ))]  # off-chip arrivals, one per source chip offset
     if fused:
         out_shape = [jax.ShapeDtypeStruct((R, H), out_dtype)]
         out_specs = [vmem]
@@ -765,7 +1054,8 @@ def build_kernel(*, num_shards, tokens_per_shard, hidden, inter,
         ]
         out_specs = [hbm, hbm, hbm]
         in_specs = [vmem, vmem, hbm, hbm, vmem, vmem]
-    limit = vmem_limit or VMEM_LIMIT or device.vmem_limit()
+    limit = vmem_limit or VMEM_LIMIT or (device.vmem_limit(W4_VMEM_FRACTION) if (trim_sums and weight_slots == 4)
+                                         else device.vmem_limit())
     params = dict(collective_id=COLLECTIVE_ID_DENSE, vmem_limit_bytes=limit)
     if layout.SIDE_EFFECTS:
         params["has_side_effects"] = True
@@ -783,7 +1073,10 @@ def build_kernel(*, num_shards, tokens_per_shard, hidden, inter,
         name=(f"fused_ep_dense_slots{'_f' if fused else ''}"
               f"{'m' if merged else ''}{'u' if unpadded else ''}"
               f"{'s' if skip_unrouted else ''}"
-              f"{'' if weight_slots == 3 else f'_w{weight_slots}'}_g{G}_t{T}_n{N}"))
+              f"{'' if weight_slots == 3 else f'_w{weight_slots}'}"
+              f"{f'_so{send_order}' if send_order in (1, 2) and D % 2 == 0 and D > 2 and not hx else ''}"
+              f"{'_hx' if hx else ''}{'m' if hx and hier_mutant else ''}"
+              f"_g{G}_t{T}_n{N}"))
     return program
 
 
@@ -835,13 +1128,17 @@ def dense_slots_moe(x, w1, w2, w1_scales, w2_scales, router_logits, *, top_k,
                            num_experts=num_experts,
                            real_rows=real if unpadded else None,
                            skip_unrouted=bool(skip_unrouted),
+                           vmem_trim=_vmem_trim(), prefetch_all=_prefetch_all(),
+                           col_pass=_col_pass(),
                            weight_slots=wslots, weight_prefetch=wslots - 1,
                            num_shards=num_shards, tokens_per_shard=Tp,
                            hidden=hidden, inter=inter, experts_per_shard=G,
                            top_k=K, tile_rows=tile_rows,
                            mesh_axes=tuple(mesh.axis_names),
                            elementwise=elementwise,
-                           columns_per_pass=config.activation_columns_per_pass)
+                           columns_per_pass=config.activation_columns_per_pass,
+                           scopes=scope_level(), send_order=send_order_level(),
+                           hier=hier_level(), hier_mutant=hier_mutant())
     with_valid = valid_tokens is not None
 
     def body(x_l, logits_l, w1_l, w2_l, s1_l, s2_l, shard_l, *rest):

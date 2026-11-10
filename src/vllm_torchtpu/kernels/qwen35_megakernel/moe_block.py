@@ -1,6 +1,7 @@
 """MoE router, top-k / dedup / Po2C, shared expert, and routed expert pipelines."""
 
 import functools
+import os
 
 import jax
 from jax import lax
@@ -19,6 +20,16 @@ from .config import (
 )
 from . import config as _cfg
 from .context import MKBuildContext
+
+# tp-mode early first fetch (decode push DM3a, default off; read when the kernel is built):
+# VLLM_TPU_QWEN35_MK_TP_EARLY_FETCH=1 issues the ring-fill units of the first hit expert (elist[0] is
+# always row 0's first pick) as soon as the hit ids reach SMEM, before the scalar dedup, instead of after
+# it; route_fetch then issues the remaining fill units. Same units, banks, descriptors and order of use:
+# the output is bit-identical. tp mode without the vector route, row_mask or forced routing only.
+TP_EARLY_FETCH_ENV = "VLLM_TPU_QWEN35_MK_TP_EARLY_FETCH"
+# Tests only: "wrong" fetches row 0's SECOND pick into the first expert's banks (the loop then multiplies
+# elist[0]'s rows by another expert's weights: the output must move).
+TP_EARLY_FETCH_MUTANT = ""
 
 
 class MoEBlock:
@@ -122,6 +133,8 @@ class MoEBlock:
                 for t, w in enumerate(w2s):
                     p_ = mm(scr["xb2"][:, t * t2 : (t + 1) * t2], w[...])
                     ysh = p_ if ysh is None else ysh + p_
+                if os.environ.get("VLLM_TPU_QWEN35_MK_SH_AT_MUTANT", "") == "half":
+                    ysh = ysh * 0.5  # test-only mutant (R-B2-SHAT): must change tokens when the SH_AT 1/2 path runs
                 scr["part"][...] = ysh * sm(slot, "sh2_s") * scr["sg"][:, 0:1]
 
         if SH_PRE and SH_AT == 0:
@@ -331,6 +344,27 @@ class MoEBlock:
             if during_dma is not None:  # SH_AT == 1: shared expert under the copy's round trip
                 during_dma()
             cp.wait()
+        # DM3a: the first hit expert's fill units, before the dedup (see TP_EARLY_FETCH_ENV)
+        EF0 = (
+            os.environ.get(TP_EARLY_FETCH_ENV, "0") == "1"
+            and c.moe_tp
+            and not VEC
+            and not row_mask
+            and not forced_routing
+            and "experts" not in skip
+        )
+        TE0 = min(TE, NBE) if EF0 else 0
+        if EF0:
+            with sc("route_fetch0", 2):
+                scr["elist"][0] = scr["hits"][0, 1 if TP_EARLY_FETCH_MUTANT == "wrong" else 0]
+                if c.stack_e:
+                    for k in range(TE0):
+                        fetch_e(k, l)
+                elif c.B <= 40:
+                    fetch_loop(TE0, l)
+                else:
+                    for k in range(TE0):
+                        fetch_e(k, l)
         stamp = l + 1
         n_fill0 = jnp.int32(0)
         RSHRINK = (
@@ -612,16 +646,16 @@ class MoEBlock:
             if VEC and EARLY_FILL:
                 self.rings.fetch_range(n_fill0, jnp.minimum(NBE, n_hit * TE), l)
             elif c.stack_e:
-                for k in range(NBE):
+                for k in range(TE0, NBE):
                     @pl.when(k < n_hit * TE)
                     def _(k=k):
                         fetch_e(k, l)
             else:
                 if c.B <= 40:
-                    fetch_loop(jnp.minimum(NBE, n_hit * TE), l)
+                    fetch_loop(jnp.minimum(NBE, n_hit * TE), l, k0=TE0)
                 else:
                     lax.fori_loop(
-                        0,
+                        TE0,
                         jnp.minimum(NBE, n_hit * TE),
                         lambda k, _: (fetch_e(k, l), 0)[1],
                         0,

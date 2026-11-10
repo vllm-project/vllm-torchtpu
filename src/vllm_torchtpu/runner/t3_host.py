@@ -192,6 +192,62 @@ def flush(force: bool = False) -> None:
         )
 
 
+# VLLM_TPU_T3_STEP_TRACE=1 (default off; needs VLLM_TPU_T3_TIMERS=1): per-step wall-clock event
+# trace for the engine-core -> worker handoff (R-HOST). Events are captured only inside short
+# capture windows aligned to wall-clock time -- the first VLLM_TPU_T3_STEP_TRACE_WINDOW_S (default
+# 2 s) of every VLLM_TPU_T3_STEP_TRACE_EVERY_S (default 60 s) -- so every process on the host traces
+# the same steps. Each window is logged as one line:
+#   [t3trace]<tag> win=<index> base=<wall s of the first event> n=<events> ev=<code>:<us>,...
+# Codes, start/end of a call: engine core Q/q step_with_batch_queue, S/s schedule, X/x submit
+# execute_model, Y/y submit sample_tokens, U/u update_from_output; worker E/e execute_model,
+# P/p sample_tokens. Times are per-event offsets in us from base (unsorted; readers sort).
+# Measurement only: it never changes what runs.
+def _step_trace_env() -> bool:
+    return os.environ.get("VLLM_TPU_T3_STEP_TRACE", "0").strip() == "1"
+
+
+STEP_TRACE = _step_trace_env()
+_TRACE_EVERY_S = float(os.environ.get("VLLM_TPU_T3_STEP_TRACE_EVERY_S", "60") or 60)
+_TRACE_WINDOW_S = float(os.environ.get("VLLM_TPU_T3_STEP_TRACE_WINDOW_S", "2") or 2)
+_TRACE_MAX = 50000
+_trace_state: dict[str, Any] = {"win": None, "ev": [], "off": 0.0}
+
+
+def _trace_window(now_wall: float) -> Any:
+    if now_wall % _TRACE_EVERY_S < _TRACE_WINDOW_S:
+        return int(now_wall // _TRACE_EVERY_S)
+    return None
+
+
+def _emit_trace() -> None:
+    ev = _trace_state["ev"]
+    if not ev:
+        return
+    t_first = min(t for _, t in ev)
+    base = t_first + _trace_state["off"]
+    logger.info(
+        "[t3trace]%s win=%s base=%.6f n=%d ev=%s",
+        _tag[0], _trace_state["win"], base, len(ev),
+        ",".join(f"{c}:{int(round((t - t_first) * 1e6))}" for c, t in ev),
+    )
+
+
+def trace(code: str, t_perf: float) -> None:
+    """Record one step event (perf_counter time) if a capture window is open."""
+    if not STEP_TRACE:
+        return
+    now = _time.time()
+    w = _trace_window(now)
+    if w != _trace_state["win"]:
+        if _trace_state["win"] is not None:
+            _emit_trace()
+        _trace_state["win"] = w
+        _trace_state["ev"] = []
+        _trace_state["off"] = now - _time.perf_counter()
+    if w is not None and len(_trace_state["ev"]) < _TRACE_MAX:
+        _trace_state["ev"].append((code, t_perf))
+
+
 def record(key: str, ms: float) -> None:
     if AB_PERIOD_MS > 0:
         key = key + (".on" if ab_on() else ".off")
@@ -201,11 +257,12 @@ def record(key: str, ms: float) -> None:
     a.add(ms)
 
 
-def _wrap_method(owner: Any, name: str, key: str, after: Any = None) -> bool:
+def _wrap_method(owner: Any, name: str, key: str, after: Any = None, codes: Any = None) -> bool:
     fn = getattr(owner, name, None)
     if fn is None or getattr(fn, "_t3_timed", False):
         return False
     pc = _time.perf_counter
+    codes = codes if STEP_TRACE else None
 
     @_functools.wraps(fn)
     def timed(*a: Any, **k: Any) -> Any:
@@ -215,6 +272,9 @@ def _wrap_method(owner: Any, name: str, key: str, after: Any = None) -> bool:
         finally:
             t1 = pc()
             record(key, (t1 - t0) * 1e3)
+            if codes is not None:
+                trace(codes[0], t0)
+                trace(codes[1], t1)
             if after is not None:
                 after(t0, t1)
 
@@ -227,6 +287,8 @@ def install_runner_timers(runner_cls: Any) -> None:
     """Worker-side timers on the TPU model runner (and, when importable, the
     drafter and KV connector worker)."""
     if not TIMERS:
+        if STEP_TRACE:
+            logger.warning("VLLM_TPU_T3_STEP_TRACE=1 needs VLLM_TPU_T3_TIMERS=1; no step trace")
         return
     _tag[0] = f"[worker pid={os.getpid()}]"
     state = {"exec_t0": None, "samp_t1": None, "fwd_t0": None, "exec_entry": None}
@@ -249,8 +311,8 @@ def install_runner_timers(runner_cls: Any) -> None:
             record("w.forward_start_period", (t0 - state["fwd_t0"]) * 1e3)
         state["fwd_t0"] = t0
 
-    _wrap_method(runner_cls, "execute_model", "w.execute_model", after_exec)
-    _wrap_method(runner_cls, "sample_tokens", "w.sample_tokens", after_sample)
+    _wrap_method(runner_cls, "execute_model", "w.execute_model", after_exec, codes=("E", "e"))
+    _wrap_method(runner_cls, "sample_tokens", "w.sample_tokens", after_sample, codes=("P", "p"))
     _wrap_method(runner_cls, "forward_model", "w.forward_model", after_fwd)
     for name in (
         "_prepare_inputs",
@@ -287,7 +349,8 @@ def install_runner_timers(runner_cls: Any) -> None:
                 logger.warning("VLLM_TPU_T3_TIMERS_EXTRA: could not wrap %s", spec)
         except Exception as e:  # noqa: BLE001
             logger.warning("VLLM_TPU_T3_TIMERS_EXTRA: %s: %r", spec, e)
-    logger.info("VLLM_TPU_T3_TIMERS: worker timers installed (period %.0f s)", _PERIOD_S)
+    logger.info("VLLM_TPU_T3_TIMERS: worker timers installed (period %.0f s)%s", _PERIOD_S,
+                " + step trace (%.0f s every %.0f s)" % (_TRACE_WINDOW_S, _TRACE_EVERY_S) if STEP_TRACE else "")
 
 
 def install_engine_core_timers() -> None:
@@ -313,12 +376,12 @@ def install_engine_core_timers() -> None:
         _tag[0] = f"[engine_core pid={os.getpid()}]"
         sch = getattr(self, "scheduler", None)
         if sch is not None:
-            _wrap_method(sch, "schedule", "ec.schedule")
-            _wrap_method(sch, "update_from_output", "ec.update_from_output")
+            _wrap_method(sch, "schedule", "ec.schedule", codes=("S", "s"))
+            _wrap_method(sch, "update_from_output", "ec.update_from_output", codes=("U", "u"))
         ex = getattr(self, "model_executor", None)
         if ex is not None:
-            _wrap_method(ex, "execute_model", "ec.submit_execute_model")
-            _wrap_method(ex, "sample_tokens", "ec.submit_sample_tokens")
+            _wrap_method(ex, "execute_model", "ec.submit_execute_model", codes=("X", "x"))
+            _wrap_method(ex, "sample_tokens", "ec.submit_sample_tokens", codes=("Y", "y"))
         logger.info("VLLM_TPU_T3_TIMERS: engine-core timers installed (period %.0f s)", _PERIOD_S)
 
     @_functools.wraps(fn)
@@ -333,6 +396,9 @@ def install_engine_core_timers() -> None:
             t1 = pc()
             st["t1"] = t1
             record("ec.step_with_batch_queue", (t1 - t0) * 1e3)
+            if STEP_TRACE:
+                trace("Q", t0)
+                trace("q", t1)
         try:
             if out is not None and out[0] is not None:
                 record("ec.step_with_output", (t1 - t0) * 1e3)

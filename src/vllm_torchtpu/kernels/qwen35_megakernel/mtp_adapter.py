@@ -111,6 +111,14 @@ def _fit(x: jax.Array, rows: int) -> jax.Array:
     return jnp.pad(x, [(0, rows - x.shape[0])] + [(0, 0)] * (x.ndim - 1))
 
 
+def _fc_shard_mode() -> int:
+    """DC3d `MKConfig.hid_shard` from the env: 0 off, 1 the MTP fc column block is
+    gathered in the megakernel (TPU_MTP_MK_FC_SHARD), 2 its test-only mutant."""
+    if not envs.TPU_MTP_MK_FC_SHARD:
+        return 0
+    return 2 if envs.TPU_MTP_MK_FC_SHARD_MUTANT else 1
+
+
 def _step_operands(
     c: K.MKConfig,
     hidden: jax.Array,
@@ -230,6 +238,7 @@ class Qwen35MtpMegakernel:
             e_slots=0,
             paged_kv=True,
             dcp=self.dcp_size,
+            hid_shard=_fc_shard_mode(),
         )
         attn = layer.self_attn.attn
         for name in ("_k_scale_float", "_v_scale_float"):
@@ -271,6 +280,16 @@ class Qwen35MtpMegakernel:
         self.mesh = mesh
         self.layer = layer
         self.base_cfg = base_cfg
+        # DC3d: the patched MTP forward hands `forward_layer` this rank's fc column block.
+        self.fc_shard = bool(base_cfg.hid_shard)
+        if self.fc_shard:
+            logger.info(
+                "TPU_MTP_MK_FC_SHARD: MTP fc column block gathered in the megakernel "
+                "(%d x %d columns per rank, mode %d)",
+                self.tp_size,
+                base_cfg.H // self.tp_size,
+                base_cfg.hid_shard,
+            )
         self.tiles = K.default_tiles(base_cfg)
         self.tk = K.plan(base_cfg, self.tiles)["tk"]
         max_reqs = int(getattr(runner, "max_num_reqs", 0) or 0)
@@ -547,10 +566,12 @@ class Qwen35MtpMegakernel:
         ns: dict[str, Any] = {"jax": jax, "_impl": impl}
         exec(compile(src, f"<{fn_name}>", "exec"), ns)  # noqa: S102
 
+        h_out = self.base_cfg.H
+
         def fake(hidden: torch.Tensor, *args: torch.Tensor):
             rows = args[3].shape[0] if gather else hidden.shape[0]
             return (
-                hidden.new_empty((rows, hidden.shape[1])),
+                hidden.new_empty((rows, h_out)),
                 torch.empty_like(args[-1]),
             )
 

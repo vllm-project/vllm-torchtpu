@@ -254,6 +254,7 @@ def inner_kernel(
         conv_bias = weights_ref.conv.bias[...].astype(jnp.float32)
 
     dense_act = None
+    ckpt_fast = False
     if dense:
         dense_act = _dense_conv_silu(
             qkv_slot_ref=qkv_slot_ref,
@@ -299,6 +300,15 @@ def inner_kernel(
             and cfg.window_size == 1
             and cfg.seq_tile_size == 1
         )
+        ckpt_fast = (
+            config.dec_ckpt_fast()
+            and not lazy_state
+            and stub != "conv"
+            and cfg.state_plan is not None
+            and carry_conv_scratch_ref is None
+            and cfg.seq_tile_size == 1
+            and cfg.prev_kernel_size == cfg.kernel_size - 1
+        )
         if stub == "conv":
             # Attribution stand-in: no taps, the tail rows are the state.
             qkv_out_compact = qkv_in_compact[:, cfg.prev_kernel_size :]
@@ -319,6 +329,13 @@ def inner_kernel(
                 p_id=p_id,
                 cfg=cfg,
             )
+        elif ckpt_fast:
+            # DGDN L1: same output rows as causal_conv1d (start_idx == c_idx
+            # when prev_kernel_size == kernel_size - 1); checkpoints below.
+            qkv_out_compact = compute_conv1d.causal_conv1d_out(
+                qkv_in_compact, conv_weight, conv_bias, cfg
+            )
+            new_conv_state = None
         else:
             qkv_out_compact, new_conv_state = compute_conv1d.causal_conv1d(
                 real_sizes=real_sizes,
@@ -328,7 +345,20 @@ def inner_kernel(
                 cfg=cfg,
             )
 
-    if dense or new_conv_state is None:
+    if ckpt_fast and not dense:
+        # DGDN L1: checkpoint t is lhs rows [last_row, last_row + kprev). For
+        # t below the real size no select of causal_conv1d's chain can fire
+        # (c <= t < real size), so the value is exact; positions at or past
+        # the real size are never copied back to HBM.
+        first_ckpt = cfg.window_size - config.bench_ckpt_writes(cfg.window_size)
+        for t in range(first_ckpt, cfg.window_size):
+            last_row = 1 + cfg.chunk_size - cfg.window_size + t
+            vmem_ldst.store_state_region(
+                conv_state_out_slot_ref.at[0, t],
+                cfg.state_plan.conv,
+                qkv_in_compact[0, last_row : last_row + cfg.prev_kernel_size],
+            )
+    elif dense or new_conv_state is None:
         # The conv state was stored by the dense or lazy path.
         pass
     elif cfg.state_plan is None:
@@ -921,6 +951,7 @@ def outer_kernel(
         "attention_mode",
         "gate_lower_bound",
         "bf16_qkv_mode",
+        "conv_weight_prepped",
     ),
 )
 def fused_conv1d_gdn(
@@ -960,6 +991,7 @@ def fused_conv1d_gdn(
     seg_bounds: jax.Array | None = None,  # [num_seqs, 2]
     seg_state_indices: jax.Array | None = None,  # [num_seqs, 2]
     bf16_qkv_mode: int | None = None,
+    conv_weight_prepped: bool = False,  # CW-prep: conv_weight is already the kernel's (K, 1, dim) f32
 ) -> tuple[tuple[jax.Array, jax.Array], jax.Array] | tuple[jax.Array, jax.Array]:
     """Execute depthwise causal Conv1d, SiLU activation, L2 normalization, and
     recurrent Gated DeltaNet state update in a single fused Pallas kernel.
@@ -1103,7 +1135,12 @@ def fused_conv1d_gdn(
 
     num_seqs = state_indices.size
     batch_size, dim = qkv.shape
-    assert conv_weight.shape == (dim, 1, kernel_size)
+    if conv_weight_prepped:
+        # f32 (L1) or the weight's own dtype (L1-bf16); the batched kernel casts to f32 on load (exact)
+        assert conv_weight.shape == (kernel_size, 1, dim) and conv_weight.dtype in (jnp.float32, jnp.bfloat16), (
+            conv_weight.shape, conv_weight.dtype)
+    else:
+        assert conv_weight.shape == (dim, 1, kernel_size)
     if conv_bias is not None:
         assert conv_bias.shape == (dim,)
     assert query_start_loc.shape == (num_seqs + 1,)
@@ -1292,7 +1329,8 @@ def fused_conv1d_gdn(
     if not pooled:
         conv_state_shape = cast(jax.Array, conv_state).shape
         conv_state = cast(jax.Array, conv_state).reshape(-1, kernel_size - 1, 1, dim)
-    conv_weight = conv_weight.swapaxes(0, 2).astype(jnp.float32)
+    if not conv_weight_prepped:  # CW-prep hands the (K, 1, dim) f32 operand in already
+        conv_weight = conv_weight.swapaxes(0, 2).astype(jnp.float32)
     conv_bias = conv_bias.astype(jnp.float32) if conv_bias is not None else None
 
     # Step 4: Wrap inputs for the kernel.

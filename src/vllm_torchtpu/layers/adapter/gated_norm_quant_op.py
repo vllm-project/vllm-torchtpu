@@ -26,6 +26,7 @@ FP8 quantization.
 from collections.abc import Callable
 
 import jax
+import jax.numpy as jnp
 import torch
 from torch_tpu._internal import pallas
 from vllm.distributed import tensor_model_parallel_all_reduce
@@ -81,11 +82,23 @@ def _build_ops(eps: float) -> None:
             min_rows = envs.TPU_GDN_FUSED_NORM_QUANT_MIN_ROWS
             if min_rows > 0 and o.shape[0] < min_rows:
                 q, s = gnq.reference(o, z, w_norm, eps)
-            else:
-                q, s = gnq.gated_norm_quant(o, z, w_norm, eps)
-            return linear_common._prequant_matmul_jax(
+                return linear_common._prequant_matmul_jax(
+                    q.reshape(o.shape[0], -1), s, w_proj, w_scale
+                )
+            m = o.shape[0]
+            mp = -(-m // 32) * 32 if envs.TPU_GDN_OUT_PROJ_PAD32 else m
+            if mp != m:  # L3-B: zero rows to a multiple of 32, sliced off below (row-independent)
+                o = jnp.pad(o, ((0, mp - m),) + ((0, 0),) * (o.ndim - 1))
+                z = jnp.pad(z, ((0, mp - m),) + ((0, 0),) * (z.ndim - 1))
+            q, s = gnq.gated_norm_quant(o, z, w_norm, eps)
+            out = linear_common._prequant_matmul_jax(
                 q.reshape(o.shape[0], -1), s, w_proj, w_scale
             )
+            if mp != m:
+                if envs.TPU_GDN_OUT_PROJ_PAD32_MUTANT:  # test only: wrong rows, must change tokens
+                    return out[1 : m + 1]
+                out = out[:m]
+            return out
 
         proj_op = pallas.jax_op(
             f"pallas::gdn_gated_norm_out_proj_{len(_out_proj_ops)}",
@@ -97,6 +110,9 @@ def _build_ops(eps: float) -> None:
 
         proj_op.register_fake(fake_out_proj)
         _out_proj_ops[eps] = proj_op
+        if envs.TPU_GDN_OUT_PROJ_PAD32:
+            logger.info("TPU_GDN_OUT_PROJ_PAD32: GDN fused out_proj rows padded to a multiple of 32 "
+                        "(eps %g)", eps)
         _ = norm_fn
     linear_common._get_prequant_matmul_op()
 

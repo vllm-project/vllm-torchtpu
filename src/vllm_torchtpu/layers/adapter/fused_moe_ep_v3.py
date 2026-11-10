@@ -249,8 +249,13 @@ def run_moe_v3(
     hidden: int,
     inter: int,
     experts_per_shard: int,
+    expert_order: tuple[int, ...] | None = None,
 ):
-    """The `run_moe` the adapter's op wraps, on the latest kernel."""
+    """The `run_moe` the adapter's op wraps, on the latest kernel.
+
+    `expert_order` (TPU_MOE_FEP_STATIC_EXPERT_ORDER): which EP rank's expert block sits at each mesh index;
+    when given, the op reindexes the gating's expert axis itself (`mesh_order_gating`), so the caller hands
+    the router logits in vLLM's EP-rank order. None: the caller already did (`_to_mesh_expert_order`)."""
     # The torch bridge exports the whole op as one jitted function; the
     # layer's own inner jit is what the export path's SPMD partitioner
     # refuses. The same partitioner wants a sharding on every side-effecting
@@ -341,7 +346,52 @@ def run_moe_v3(
             valid_tokens=valid_tokens,
         )
 
+    if expert_order is not None:
+        return with_mesh_expert_order(run_moe, expert_order, experts_per_shard)
     return run_moe
+
+
+def mesh_order_gating(gating: jax.Array, order: tuple[int, ...], experts_per_shard: int) -> jax.Array:
+    """`gating` with its expert axis reindexed from EP-rank order to mesh order: block m of the result is
+    block order[m] of the input. The same values as the torch-side `_to_mesh_expert_order` index_select,
+    as static slices XLA can fold into the consumer (no gather, no relayout op of its own)."""
+    e = experts_per_shard
+    return jnp.concatenate([gating[..., r * e:(r + 1) * e] for r in order], axis=-1)
+
+
+def with_mesh_expert_order(run_moe, order: tuple[int, ...], experts_per_shard: int):
+    """`run_moe` that first puts the gating's expert axis in mesh order (see `mesh_order_gating`)."""
+    order = tuple(int(r) for r in order)
+    if envs.TPU_MOE_FEP_STATIC_EXPERT_ORDER_MUTANT == "reverse":  # test-only: must change tokens
+        order = tuple(reversed(order))
+
+    def run(x, w1, w2, w1_scale, w2_scale, gating, rank, valid_tokens):
+        return run_moe(
+            x, w1, w2, w1_scale, w2_scale, mesh_order_gating(gating, order, experts_per_shard), rank, valid_tokens
+        )
+
+    return run
+
+
+def torch_side_expert_order(ep: int, device):
+    """The device tensor `_to_mesh_expert_order` gathers with, or None: None whenever the op applies the order
+    itself (TPU_MOE_FEP_STATIC_EXPERT_ORDER), so the logits are never reordered twice and no branch lifts it."""
+    if _STATIC_EXPERT_ORDER is not None:
+        return None
+    return _expert_block_permutation(ep, device)
+
+
+def static_expert_order(ep: int) -> tuple[int, ...] | None:
+    """The static block order the op applies under TPU_MOE_FEP_STATIC_EXPERT_ORDER, or None (flag off, or
+    the EP ranks already in mesh order)."""
+    if not envs.TPU_MOE_FEP_STATIC_EXPERT_ORDER:
+        return None
+    order = ep_rank_order()
+    if order is None or tuple(order) == tuple(range(ep)):
+        return None
+    if sorted(order) != list(range(ep)):
+        raise ValueError(f"EP rank order {order} is not a permutation of range({ep})")
+    return tuple(int(r) for r in order)
 
 
 # One op for every shape: the v3 kernel derives its routing block from the operands when they are not given, so nothing here has to vary
@@ -366,6 +416,9 @@ _RANK_BUFFER: Any = None
 # Which EP rank's expert block sits at each mesh index, or None for the
 # identity. See `_to_mesh_expert_order`.
 _EXPERT_ORDER: Any = None
+# TPU_MOE_FEP_STATIC_EXPERT_ORDER: the order the op applies itself (then `_EXPERT_ORDER` stays None, so no
+# branch lifts it and the torch side does no reindexing). Set by `_build_op`.
+_STATIC_EXPERT_ORDER: tuple[int, ...] | None = None
 
 
 def fused_moe_ep_supported(owner: Any = None) -> bool:
@@ -399,6 +452,14 @@ def _build_op(
     inter: int,
     local_experts: int,
 ):
+    global _STATIC_EXPERT_ORDER
+    _STATIC_EXPERT_ORDER = static_expert_order(mesh.shape[MESH_AXIS])
+    if _STATIC_EXPERT_ORDER is not None:
+        logger.info_once(
+            "Fused EP MoE: expert axis reindexed to mesh order inside the op "
+            "(TPU_MOE_FEP_STATIC_EXPERT_ORDER=1) | ep_rank_at_mesh_index=%s",
+            _STATIC_EXPERT_ORDER,
+        )
     run_moe = run_moe_v3(
         mesh,
         topk,
@@ -407,6 +468,7 @@ def _build_op(
         hidden=hidden,
         inter=inter,
         experts_per_shard=local_experts,
+        expert_order=_STATIC_EXPERT_ORDER,
     )
 
     # Add the valid-prefix operand only when padding is skipped.
@@ -498,9 +560,67 @@ def maybe_fused_moe_ep(
         return None
     w1 = layer.w13_weight
     w2 = layer.w2_weight
-    w1_scale = layer.w13_weight_scale_inv
-    w2_scale = layer.w2_weight_scale_inv
+    w1_scale, w2_scale = fep_scale_operands(layer)
     return fused_moe_ep(x, w1, w2, w1_scale, w2_scale, router_logits)
+
+
+# TPU_MOE_FEP_STAGE_SCALES (decode push, DMOE L5; read at weight load, default off). The loader's fp8
+# per-channel scales are 4-D [E, 1, 1, N] parameters; the fused kernel wants [E, N], and squeezing the padded
+# 4-D table costs a relayout copy per MoE call (#1: f32[64,1,1,4096] + [2048], ~0.15 ms/step). Staging keeps
+# [E, N] bases beside the parameters, made once at load with the same values, and EVERY MoE branch of a
+# staged layer reads only the bases: the fused kernel directly (`fep_scale_operands`), the lowtok / GMM paths
+# through [E, 1, 1, N] views of them (`fep_scales_4d`). All token-count branches therefore lift the same graph
+# inputs (the bases; never the 4-D parameters), with no retain marker.
+FEP_SCALE_BASE_ATTRS = ("_tpu_fep_w13_scale", "_tpu_fep_w2_scale")
+
+
+def stage_fep_scale_bases(layer) -> bool:
+    """Stage the fp8 per-channel scales as [E, N] base buffers (same values); True if staged."""
+    if not envs.TPU_MOE_FEP_STAGE_SCALES or getattr(layer, FEP_SCALE_BASE_ATTRS[0], None) is not None:
+        return False
+    from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
+
+    bases = []
+    for param, attr in zip(("w13_weight_scale_inv", "w2_weight_scale_inv"), FEP_SCALE_BASE_ATTRS):
+        p = getattr(layer, param)
+        if p.ndim != 4 or p.shape[1] != 1 or p.shape[2] != 1:
+            raise ValueError(f"{param} {tuple(p.shape)} is not a per-channel [E, 1, 1, N] scale")
+        base = fresh_buffer(p.detach().reshape(p.shape[0], p.shape[3]))
+        if envs.TPU_MOE_FEP_STAGE_SCALES_MUTANT == "perturb" and attr == FEP_SCALE_BASE_ATTRS[0]:
+            base = base * (1.0 + 2.0**-6)  # test-only: must change tokens
+        layer.register_buffer(attr, base, persistent=False)
+        bases.append(base)
+    if bases[0].device.type == "tpu":
+        synchronize_tensors(bases)
+    if envs.TPU_MOE_FEP_STAGE_SCALES_ALIAS:
+        # L5b (memory-neutral): the [E, 1, 1, N] parameters become views of the staged bases (same values), so their
+        # original storage has no reference left and is freed: persistent HBM delta ~0 instead of +1.5 MiB per layer.
+        # No branch reads the parameters while staged (fep_scale_operands / fep_scales_4d hand out the bases).
+        for param, base in zip(("w13_weight_scale_inv", "w2_weight_scale_inv"), bases):
+            p = getattr(layer, param)
+            p.data = base.view(p.shape)
+        logger.info_once("Fused EP MoE: 4-D fp8 scale parameters aliased to the staged bases "
+                         "(TPU_MOE_FEP_STAGE_SCALES_ALIAS=1)")
+    logger.info_once("Fused EP MoE: fp8 scales staged as [E, N] bases (TPU_MOE_FEP_STAGE_SCALES=1)")
+    return True
+
+
+def fep_scale_operands(layer) -> tuple[torch.Tensor, torch.Tensor]:
+    """The (w13, w2) scales for the fused-EP v3 op: the staged [E, N] bases, else the 4-D parameters."""
+    w13 = getattr(layer, FEP_SCALE_BASE_ATTRS[0], None)
+    if w13 is None:
+        return layer.w13_weight_scale_inv, layer.w2_weight_scale_inv
+    return w13, getattr(layer, FEP_SCALE_BASE_ATTRS[1])
+
+
+def fep_scales_4d(layer) -> tuple[torch.Tensor, torch.Tensor]:
+    """The (w13, w2) scales as [E, 1, 1, N] for the paths that take the 4-D form (lowtok, GMM): views of the
+    staged bases when staged (so no branch lifts the 4-D parameters), else the parameters themselves."""
+    w13 = getattr(layer, FEP_SCALE_BASE_ATTRS[0], None)
+    if w13 is None:
+        return layer.w13_weight_scale_inv, layer.w2_weight_scale_inv
+    w2 = getattr(layer, FEP_SCALE_BASE_ATTRS[1])
+    return w13.view(w13.shape[0], 1, 1, w13.shape[1]), w2.view(w2.shape[0], 1, 1, w2.shape[1])
 
 
 def fused_moe_ep(
@@ -838,7 +958,8 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool, activation: str) 
     _RANK_BUFFER = torch.tensor(
         [[idx]], dtype=torch.int32, device=layer.w13_weight.device
     )
-    _EXPERT_ORDER = _expert_block_permutation(ep, layer.w13_weight.device)
+    _EXPERT_ORDER = torch_side_expert_order(ep, layer.w13_weight.device)
+    stage_fep_scale_bases(layer)
     layer._tpu_fused_ep_eligible = True
     logger.info_once(
         "Fused EP MoE armed | kernel=%s hidden=%d inter=%d local_experts=%d "

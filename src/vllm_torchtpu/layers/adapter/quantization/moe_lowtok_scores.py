@@ -514,14 +514,18 @@ def apply(
                 torch.full_like(logits, float("-inf")),
                 logits,
             )
+    from vllm_torchtpu.layers.adapter.fused_moe_ep_v3 import fep_scales_4d
+
+    # TPU_MOE_FEP_STAGE_SCALES: views of the staged [E, N] bases (same values), else the parameters.
+    s13, s2 = fep_scales_4d(layer)
     if getattr(layer, "_lowtok_has_copies", False):
         return op(
             x,
             logits,
             layer.w13_weight,
             layer.w2_weight,
-            layer.w13_weight_scale_inv,
-            layer.w2_weight_scale_inv,
+            s13,
+            s2,
             layer._experts_start,
             layer._lowtok_tables,
             layer._lowtok_prim,
@@ -533,7 +537,7 @@ def apply(
         logits,
         layer.w13_weight,
         layer.w2_weight,
-        layer.w13_weight_scale_inv,
-        layer.w2_weight_scale_inv,
+        s13,
+        s2,
         layer._experts_start,
     )

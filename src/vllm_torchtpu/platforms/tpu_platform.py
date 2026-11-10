@@ -1047,6 +1047,19 @@ class TpuPlatform(Platform):
                 max_ablat_kv = 39_539_797_760
             credit, slots = _expert_slot_kv_credit(model_config, parallel_config)
             safe_kv += credit
+            # TPU_REPLICATED_EMBED: the replicated target embedding's extra weight bytes come
+            # out of the KV budget, so the calibrated HBM headroom is unchanged.
+            if envs.TPU_REPLICATED_EMBED:
+                from vllm_torchtpu.models.vllm.qwen3_next_patch import (
+                    replicated_embed_extra_bytes,
+                )
+
+                _text = model_config.hf_text_config
+                safe_kv -= replicated_embed_extra_bytes(
+                    int(_text.vocab_size),
+                    int(_text.hidden_size),
+                    int(parallel_config.tensor_parallel_size),
+                )
             if os.environ.get("TPU_DISABLE_PR989_KERNELS", "0").strip().lower() in (
                 "1",
                 "true",
