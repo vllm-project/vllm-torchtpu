@@ -33,6 +33,7 @@ from vllm_torchtpu.kernels.experimental.small_collectives import (
     all_reduce,
     reduce_scatter,
 )
+from vllm_torchtpu.kernels.experimental.small_collectives import common as sc_common
 from vllm_torchtpu.kernels.experimental.small_collectives.common import LANES
 from vllm_torchtpu.logger import init_logger
 
@@ -49,6 +50,14 @@ COMBINE_MAX_ROWS = 40
 
 _AR_OP = None
 _RS_OP = None
+# The TP all-reduce over a TP group that is a sub-group of the mesh (DP x TP
+# engines): the kernel over the "tp" axis of a (dp, tp) view of the mesh, this
+# core's TP index as data, and the TP group's ranks it serves.
+_AR_TP_OP = None
+_TP_RANK = None
+_TP_RANKS: tuple[int, ...] = ()
+# The form of the TP-pair all-reduce: every DP x TP decode leg ran "oneshot".
+TP_PAIR_FORM = "oneshot"
 # This core's mesh index as an int32 [1] device tensor: the kernels take it as
 # data (see small_collectives/common.py).
 _RANK = None
@@ -103,6 +112,65 @@ def _build_all_reduce(mesh):
     )
 
 
+def _build_tp_all_reduce(mesh, tp: int, form: str | None):
+    """The all-reduce over the TP pairs of the mesh seen as (dp, tp): mesh
+    index i is the TP partner of i ^ (tp - 1) group-wise, which `prebuild`
+    checks against the torch TP group before arming."""
+    import numpy as np
+    from jax.sharding import Mesh
+
+    n = mesh.shape[EP_AXIS_NAME]
+    mesh2 = Mesh(np.asarray(mesh.devices).reshape(n // tp, tp), axis_names=("dp_", "tp_"))
+    spec = PartitionSpec(("dp_", "tp_"))
+
+    def body(block, rank):
+        # A forced region (force_small_all_reduce) reaches here with any row
+        # count; blocks above the cap take XLA's all-reduce inside the op.
+        if block.shape[0] > MAX_ROWS:
+            return jax.lax.psum(block, axis_name="tp_")
+        with sc_common.mesh_axes(("dp_", "tp_")):
+            return all_reduce.small_all_reduce(
+                block, num_cores=tp, axis="tp_", rank=rank, form=form or None
+            )
+
+    def fn(x: jax.Array, rank: jax.Array) -> jax.Array:
+        return jax.shard_map(
+            body, mesh=mesh2, in_specs=(spec, spec), out_specs=spec, check_vma=False
+        )(x, rank)
+
+    def fake(x, rank):
+        return torch.empty_like(x)
+
+    return sharded_jax_op(
+        "pallas::small_all_reduce_tp",
+        fn,
+        mesh=mesh2,
+        input_partition_specs=(spec, spec),
+        output_partition_specs=spec,
+        fake=fake,
+    )
+
+
+def _tp_pairs_match_mesh(mesh_index: int, tp: int) -> bool:
+    """Whether every core's TP group is the block of `tp` consecutive mesh
+    indices it sits in, agreed over the EP group."""
+    import torch.distributed as dist
+    from vllm.distributed.parallel_state import get_tp_group
+
+    from vllm_torchtpu.distributed.ep_mesh import ep_rank_order
+
+    order = ep_rank_order()
+    tp_ranks = tuple(int(r) for r in get_tp_group().ranks)
+    block = mesh_index - mesh_index % tp
+    mine = order is not None and len(tp_ranks) == tp and all(
+        order[block + j] in tp_ranks for j in range(tp)
+    )
+    group = get_ep_group()
+    verdicts = [None] * group.world_size
+    dist.all_gather_object(verdicts, bool(mine), group=group.cpu_group)
+    return all(verdicts)
+
+
 def _build_reduce_scatter(mesh):
     n = mesh.shape[EP_AXIS_NAME]
     spec = PartitionSpec(EP_AXIS_NAME)
@@ -136,6 +204,7 @@ def prebuild(vllm_config: Any) -> None:
     ``tpu_collectives.small_all_reduce`` option is on (it is off by default,
     see ``distributed/collectives_options.py``)."""
     global _AR_OP, _RS_OP, _RANK, _CORES, _MESH_RANKS, _DP_COMBINE
+    global _AR_TP_OP, _TP_RANK, _TP_RANKS
     if _AR_OP is not None or not collectives_options.get(vllm_config).small_all_reduce:
         return
     mesh = build_ep_mesh()
@@ -158,16 +227,27 @@ def prebuild(vllm_config: Any) -> None:
     # is the mesh, DP rank r's rows go to mesh core r.
     _DP_COMBINE = tuple(int(r) for r in get_dp_group().ranks) == _MESH_RANKS
     tp_all_reduce = tuple(int(r) for r in get_tp_group().ranks) == _MESH_RANKS
+    tp = int(get_tp_group().world_size)
+    if (
+        not tp_all_reduce
+        and 1 < tp < _CORES
+        and _CORES % tp == 0
+        and _tp_pairs_match_mesh(ep_mesh_index(), tp)
+    ):
+        _TP_RANKS = tuple(int(r) for r in get_tp_group().ranks)
+        _TP_RANK = torch.tensor([ep_mesh_index() % tp], dtype=torch.int32, device="tpu")
+        _AR_TP_OP = _build_tp_all_reduce(mesh, tp, TP_PAIR_FORM)
     logger.info(
         "Small collectives armed | cores=%d | max_rows=%d | "
         "combine_max_rows=%d | one_shot_max_bytes=%d | tp_all_reduce=%s | "
-        "dp_combine=%s",
+        "dp_combine=%s | tp_pair_all_reduce=%s",
         _CORES,
         MAX_ROWS,
         COMBINE_MAX_ROWS,
         all_reduce.ONE_SHOT_MAX_BYTES,
         tp_all_reduce,
         _DP_COMBINE,
+        _AR_TP_OP is not None,
     )
 
 
@@ -182,20 +262,28 @@ def _fits(x: torch.Tensor, width_multiple: int, *, allow_forced: bool = False) -
     )
 
 
-def retain(out: torch.Tensor) -> torch.Tensor:
-    """``out`` plus a zero read from the rank buffer, for a token-count branch
-    that skips the kernel while its other side calls it: the warmup hands a
-    bucket over only between traces that lift the same buffers. A read whose
-    result is dead would be eliminated, so the zero rides on ``out``."""
-    if _RANK is None or not shape_variants.in_warmup():
+def retain(out: torch.Tensor, rank: torch.Tensor | None = None) -> torch.Tensor:
+    """``out`` plus a zero read from the rank buffer (``rank``, default the
+    mesh rank), for a token-count branch that skips the kernel while its other
+    side calls it: the warmup hands a bucket over only between traces that
+    lift the same buffers. A read whose result is dead would be eliminated, so
+    the zero rides on ``out``."""
+    rank = _RANK if rank is None else rank
+    if rank is None or not shape_variants.in_warmup():
         return out
-    value = _RANK[0].to(out.dtype)
+    value = rank[0].to(out.dtype)
     return out + (value - value)
 
 
 def all_reduce_or(x: torch.Tensor, ranks, fallback) -> torch.Tensor:
     """The sum of ``x`` over the group ``ranks``: the kernel for a small block
     when the group is the mesh, ``fallback(x)`` otherwise."""
+    if _AR_TP_OP is not None and tuple(ranks) == _TP_RANKS:
+        if not _fits(x, len(_TP_RANKS) * LANES, allow_forced=True):
+            return fallback(x)
+        if _FORCE_SMALL_AR or x.shape[0] <= MAX_ROWS:
+            return _AR_TP_OP(x, _TP_RANK)
+        return retain(fallback(x), _TP_RANK)
     if _AR_OP is None or tuple(ranks) != _MESH_RANKS:
         return fallback(x)
     if not _fits(x, _CORES * LANES, allow_forced=True):
