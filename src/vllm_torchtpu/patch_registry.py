@@ -157,6 +157,7 @@ PATCHES = (
     Patch(
         "vllm_torchtpu.models.vllm.qwen3_next_patch:maybe_patch_qwen3_next",
         ("platform_activation", "model_load"),
+        model_config=True,
     ),
     Patch(
         "vllm_torchtpu.models.vllm.qwen2_patch:maybe_patch_qwen2",
