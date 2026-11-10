@@ -1014,6 +1014,19 @@ def _pack_delta(runner, ctx, entries, num_reqs_padded, table_geom, flat):
     return staged_dev
 
 
+def _record_ro_group_shapes(runner, ctx, groups) -> None:
+    """VLLM_TPU_VERIFY_RO_INGRAPH: remember the read-offset slot-group shapes
+    each walk width produces, so the verify warmup compiles the fused
+    verify + scatter program at the shapes serving passes."""
+    if not envs.VLLM_TPU_VERIFY_RO_INGRAPH or ctx.unified_mamba_state_indices is None:
+        return
+    shapes = tuple(tuple(g.shape) for g in groups)
+    if shapes:
+        runner.__dict__.setdefault("_ro_group_shapes", {}).setdefault(
+            shapes[0][-1], set()
+        ).add(shapes)
+
+
 def _issue_walk_products(
     runner,
     ctx,
@@ -1116,6 +1129,7 @@ def _issue_walk_products(
                     state_stacks[c], ckpt_stacks[c], k
                 )
         ctx.staged_mamba_products = refs
+        _record_ro_group_shapes(runner, ctx, state_stacks)
         if not runner.__dict__.get("_staged_walk_stacked_logged"):
             runner._staged_walk_stacked_logged = True
             logger.info(
@@ -1134,3 +1148,4 @@ def _issue_walk_products(
             entries[ei][0]: (states[j], ckpts[j] if has_ckpt else None)
             for j, ei in enumerate(mamba_entry_indices)
         }
+        _record_ro_group_shapes(runner, ctx, states)
