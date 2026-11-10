@@ -84,6 +84,7 @@ def _fake_runner(method, is_async, verify, propose, fence=False):
             mamba_boundary_plans=None,
             pooler_output_list=[],
             top_tokens=False,
+            topk_candidates_packed=False,
             kv_save_nan_check=None,
         ),
         input_batch=SimpleNamespace(
