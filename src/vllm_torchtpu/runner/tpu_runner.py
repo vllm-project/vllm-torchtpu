@@ -234,7 +234,9 @@ from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
 from vllm_torchtpu.spec_decode.utils import (
     DraftChunkInputs,
     _static_shape_args,
+    fast_token_substitution_enabled,
     fit_rows,
+    greedy_top_tokens_enabled,
     handoff_seed_tokens,
     normalize_draft_config,
 )
@@ -1484,8 +1486,8 @@ class TPUModelRunner(GPUModelRunner):
         self.sliding_window = self.model_config.get_sliding_window()
         self.block_size = cache_config.block_size
         self.most_model_len = envs.VLLM_TPU_MOST_MODEL_LEN
-        self._fast_token_substitution: bool = bool(
-            envs.VLLM_TPU_FAST_TOKEN_SUBSTITUTION
+        self._fast_token_substitution: bool = fast_token_substitution_enabled(
+            vllm_config
         )
         # Sync max_num_blocks_per_req with the underlying GPUInputBatch's
         # block_table capacity if already created during super().__init__().
@@ -7963,7 +7965,7 @@ class TPUModelRunner(GPUModelRunner):
         if envs.TPU_MOE_HASH_TABLE_ROW_MAJOR:
             runner_utils.relayout_hash_tables(self.model)
         if (
-            envs.TPU_GREEDY_TOP_TOKENS
+            greedy_top_tokens_enabled(self.vllm_config)
             and self._pp_is_last
             and not self.is_pooling_model
         ):

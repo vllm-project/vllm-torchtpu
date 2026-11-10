@@ -7,14 +7,13 @@ on) quantizes the target's head to W8A8 FP8 in place, which used to leave the
 draft sharing an FP8 head, and the draft's greedy head defaulted to an FP8
 proxy on top. These tests pin the compliant behaviour: the target's head is
 FP8, the draft gets a BF16 twin holding the checkpoint weight, and the draft's
-greedy head uses that twin with no quantized proxy unless explicitly asked.
+greedy head uses that twin; no quantized draft head exists.
 """
 
 from __future__ import annotations
 
 from types import SimpleNamespace
 
-import pytest
 import torch
 
 from vllm_torchtpu.runner import greedy_top_tokens as gtt
@@ -174,14 +173,9 @@ def _fake_qwen3_next_model(head: torch.nn.Module) -> torch.nn.Module:
     return model
 
 
-@pytest.mark.parametrize("env", [None, "1"])
-def test_post_load_hook_keeps_a_bf16_twin_by_default(monkeypatch, env):
+def test_post_load_hook_keeps_a_bf16_twin_by_default(monkeypatch):
     from vllm_torchtpu.models.vllm import qwen3_next_patch
 
-    if env is None:
-        monkeypatch.delenv("TPU_DRAFT_LM_HEAD_BF16", raising=False)
-    else:
-        monkeypatch.setenv("TPU_DRAFT_LM_HEAD_BF16", env)
     monkeypatch.delenv("TPU_QUANTIZE_SHARED_LM_HEAD", raising=False)
     monkeypatch.setattr(
         qwen3_next_patch, "_speculative_decoding_configured", lambda: True
@@ -205,21 +199,11 @@ def test_post_load_hook_keeps_a_bf16_twin_by_default(monkeypatch, env):
     assert gtt.head_precision(draft.lm_head) == "bf16"
 
 
-def test_post_load_hook_opt_out_and_no_draft(monkeypatch):
+def test_post_load_hook_keeps_no_twin_without_a_draft(monkeypatch):
     from vllm_torchtpu.models.vllm import qwen3_next_patch
 
     monkeypatch.delenv("TPU_QUANTIZE_SHARED_LM_HEAD", raising=False)
-    # Opt-out: the draft would share the FP8 head (the old behaviour).
-    monkeypatch.setenv("TPU_DRAFT_LM_HEAD_BF16", "0")
-    monkeypatch.setattr(
-        qwen3_next_patch, "_speculative_decoding_configured", lambda: True
-    )
-    head = ParallelLMHead()
-    qwen3_next_patch.setup_qwen3_next_v6_after_loading(_fake_qwen3_next_model(head))
-    assert head._quant_mode == "fp8" and gtt.draft_bf16_head_of(head) is None
-
     # No speculative decoding: no twin, so no extra memory.
-    monkeypatch.delenv("TPU_DRAFT_LM_HEAD_BF16", raising=False)
     monkeypatch.setattr(
         qwen3_next_patch, "_speculative_decoding_configured", lambda: False
     )
@@ -252,6 +236,7 @@ def _init_greedy_head(draft: torch.nn.Module):
 
     proposer = SimpleNamespace(
         draft_model=draft,
+        vllm_config=None,
         runner=SimpleNamespace(_dp_lockstep_enabled=lambda: False),
     )
     Eagle3Proposer._init_draft_greedy_head(proposer)
@@ -270,14 +255,12 @@ def _shared_draft() -> tuple[_Draft, SimpleNamespace]:
 
 def test_draft_greedy_head_defaults_to_bf16_with_no_proxy(monkeypatch):
     monkeypatch.setenv("TPU_GREEDY_TOP_TOKENS", "1")
-    monkeypatch.delenv("TPU_DRAFT_LM_HEAD_QUANT", raising=False)
     draft, target = _shared_draft()
 
     owner = _init_greedy_head(draft)
 
     assert owner is not None
     assert owner.lm_head is draft.lm_head  # the twin itself, no proxy
-    assert not isinstance(owner.lm_head, gtt._QuantizedLMHeadProxy)
     assert getattr(owner.lm_head, "_quant_desc", "bf16") == "bf16"
     assert owner.lm_head.weight.dtype == torch.bfloat16
 
@@ -286,21 +269,3 @@ def test_draft_greedy_head_defaults_to_bf16_with_no_proxy(monkeypatch):
     tokens = owner.logits_processor.get_top_tokens(owner.lm_head, x)
     ref = (x @ draft.lm_head.weight.t()).argmax(dim=-1)
     assert torch.equal(tokens, ref)
-
-
-@pytest.mark.parametrize("value", ["bf16", "none"])
-def test_draft_greedy_head_explicit_bf16_has_no_proxy(monkeypatch, value):
-    monkeypatch.setenv("TPU_GREEDY_TOP_TOKENS", "1")
-    monkeypatch.setenv("TPU_DRAFT_LM_HEAD_QUANT", value)
-    draft, _ = _shared_draft()
-    owner = _init_greedy_head(draft)
-    assert owner.lm_head is draft.lm_head
-
-
-def test_draft_greedy_head_quant_is_an_explicit_opt_in(monkeypatch):
-    monkeypatch.setenv("TPU_GREEDY_TOP_TOKENS", "1")
-    monkeypatch.setenv("TPU_DRAFT_LM_HEAD_QUANT", "fp8")
-    draft, _ = _shared_draft()
-    owner = _init_greedy_head(draft)
-    assert isinstance(owner.lm_head, gtt._QuantizedLMHeadProxy)
-    assert owner.lm_head._quant_desc == "w8a8"
