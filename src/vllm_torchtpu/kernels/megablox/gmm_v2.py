@@ -227,6 +227,18 @@ class RhsStreamRef:
 
 RHS_STREAM_SLOTS = 3
 
+# Stream whole-expert rhs slabs by hand (use_rhs_stream). Off by default, so
+# every model keeps emit_pipeline's rhs path; a model rule turns it on before
+# its kernels are traced (set_rhs_stream). It can be on for every model once
+# the two paths are shown bit-exact on TPU.
+RHS_STREAM: bool = False
+
+
+def set_rhs_stream(enabled: bool) -> None:
+    """Stream whole-expert rhs slabs by hand (True) or by emit_pipeline."""
+    global RHS_STREAM
+    RHS_STREAM = bool(enabled)
+
 
 def use_rhs_stream(cfgs: "GmmConfigs") -> bool:
     """Whether rhs slabs are streamed by hand instead of by emit_pipeline.
@@ -234,9 +246,10 @@ def use_rhs_stream(cfgs: "GmmConfigs") -> bool:
     Covers whole-expert tiles (one n tile, one k tile) on non-fused projections
     (GMM2), where every grid step of a group needs the same slab. Streaming them
     by hand lets the first slab's DMA start before fill_metadata instead of
-    after it, and queues the second slab after the first LHS copy.
+    after it, and queues the second slab after the first LHS copy. Only while
+    RHS_STREAM is set.
     """
-    return (
+    return RHS_STREAM and (
         cfgs.fuse_act is None
         and cfgs.tiles.tile_n == cfgs.out_size_n
         and cfgs.tiles.tile_k == cfgs.dims.size_k
