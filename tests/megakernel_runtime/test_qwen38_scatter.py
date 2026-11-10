@@ -57,6 +57,7 @@ NMB = 1 + NL * NS * T
         (False, 8, 128, 3),
         (True, 8, 128, 7),
         (False, 12, 128, 6),
+        (True, 16, 128, 12),  # VLLM_TPU_MK_SCATTER_DEEP
         (True, 4, 512, 3),
     ],
 )

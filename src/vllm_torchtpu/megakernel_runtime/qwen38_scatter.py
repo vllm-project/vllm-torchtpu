@@ -31,6 +31,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.megakernel.models.qwen38_gdn_pool import (
     CONV_ROWS,
     SSM_BLOCKS,
@@ -49,6 +50,10 @@ RING = 4
 # size).
 AUTO_MIN_CKPTS = 144
 AUTO_RING, AUTO_PREFETCH = 12, 6
+# VLLM_TPU_MK_SCATTER_DEEP: the whole-step call scatters 33 GDN layers' checkpoints
+# (132 at 4 rows, 528 at 16). j-eaee59c4 (NL 33): 4 rows r4/p1 96 us -> r16/p12 46;
+# 16 rows r12/p6 156 -> r16/p12 140. Deep ring from 64 checkpoints.
+DEEP_MIN_CKPTS, DEEP_RING, DEEP_PREFETCH = 64, 16, 12
 
 
 def _store_typed(ref: Any, vals: Any, interpret: bool) -> None:
@@ -89,6 +94,8 @@ def scatter_gdn_ckpts_fast(
     """
     NL, NS, T = write_blocks.shape
     n = NL * NS * T
+    if ring is None and prefetch is None and envs.VLLM_TPU_MK_SCATTER_DEEP and n >= DEEP_MIN_CKPTS:
+        ring, prefetch = DEEP_RING, DEEP_PREFETCH
     if ring is None and prefetch is None:
         ring, prefetch = (
             (AUTO_RING, AUTO_PREFETCH) if n >= AUTO_MIN_CKPTS else (RING, 1)
