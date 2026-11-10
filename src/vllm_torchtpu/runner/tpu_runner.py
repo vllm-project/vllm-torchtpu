@@ -5997,6 +5997,10 @@ class TPUModelRunner(GPUModelRunner):
                         device=self.device,
                     )
 
+        from vllm_torchtpu.layers.adapter.quantization import moe_lowtok_scores
+
+        moe_lowtok_scores.log_summary()
+
         # After the drafter: every placed MoE layer, the drafter's too, must
         # have had its router renumbered with its experts.
         expert_placement.check_routers_permuted()
