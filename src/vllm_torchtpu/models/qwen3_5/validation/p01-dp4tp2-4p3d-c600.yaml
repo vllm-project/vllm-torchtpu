@@ -108,6 +108,8 @@ legs:
       - "{\"method\":\"mtp\",\"num_speculative_tokens\":1}"
       - "--renderer-num-workers"
       - "4"
+      - "--cpu-distributed-timeout-seconds"
+      - "10800"
     env:
       MOE_FUSED_EP_KERNEL_MIN_TOKENS: "1024"
       ONEHOT_MOE_PERMUTE_THRESHOLD: "2048"
@@ -138,8 +140,14 @@ legs:
     additional_config:
       qwen3_5:
         native_fp8_attention: true
+      tpu_frontend:
+        detok_prompt_tail: true
+        tokenize_prefix_cache: true
+        tokenize_prefix_cache_max_tokens: 64000000
       tpu_runner:
         stage_timing: false
+      tpu_worker:
+        numa_bind: true
   decode:
     replicas: 3
     chips_per_replica: 4
@@ -217,6 +225,8 @@ legs:
       - "{\"method\":\"mtp\",\"num_speculative_tokens\":3,\"rejection_sample_method\":\"synthetic\",\"synthetic_acceptance_length\":3.39}"
       - "--renderer-num-workers"
       - "4"
+      - "--cpu-distributed-timeout-seconds"
+      - "10800"
     env:
       MOE_FUSED_EP_KERNEL_IMPL: "v3"
       MOE_FUSED_EP_KERNEL_MIN_TOKENS: "1024"
@@ -251,5 +261,9 @@ legs:
       qwen3_5:
         exp2_softmax: true
         native_fp8_attention: true
+      tpu_frontend:
+        tokenize_prefix_cache: true
       tpu_runner:
         stage_timing: false
+      tpu_worker:
+        numa_bind: true
