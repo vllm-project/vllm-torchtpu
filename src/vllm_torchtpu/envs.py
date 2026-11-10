@@ -276,6 +276,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MAMBA_TAIL_FOLD: bool = False
     VLLM_TPU_MAMBA_TAIL_FOLD_UNIT: int = 0
     VLLM_TPU_MAMBA_TAIL_FOLD_DCP: bool = False
+    VLLM_TPU_MAMBA_TAIL_FOLD_NOBOUNDARY: bool = False
     VLLM_TORCHTPU_IPC_KEY: str = ""
     TPU_SHARDED_LOAD_SYNC_EVERY: int = 512
     VLLM_TPU_MXFP4_DEVICE_DEQUANT: bool = True
@@ -1828,6 +1829,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # itself off under any context parallelism. vLLM DCP / PCP stay off.
     "VLLM_TPU_MAMBA_TAIL_FOLD_DCP": env_bool(
         "VLLM_TPU_MAMBA_TAIL_FOLD_DCP", default=False
+    ),
+    # With VLLM_TPU_MAMBA_TAIL_FOLD (and speculative decoding): also fold a
+    # prompt's last chunk when it holds no Mamba block boundary, e.g. a prefix
+    # hit at 82944 and a 473-token rest that the fine unit would split 256 +
+    # 217. The checkpoint goes to the request's first speculative scratch
+    # block and is moved to its own block before the next forward
+    # (core/mamba_tail_fold.py).
+    "VLLM_TPU_MAMBA_TAIL_FOLD_NOBOUNDARY": env_bool(
+        "VLLM_TPU_MAMBA_TAIL_FOLD_NOBOUNDARY", default=False
     ),
     # Secret for the KV-transfer IPC socket; "" derives one from the host.
     # Read raw, not through env_str: a secret's bytes must not be trimmed.
