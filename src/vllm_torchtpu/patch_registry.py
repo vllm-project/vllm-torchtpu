@@ -162,6 +162,11 @@ PATCHES = (
         model_config=True,
     ),
     Patch(
+        "vllm_torchtpu.models.vllm.qwen3_vl_patch:maybe_patch_qwen3_vl_video_prompt",
+        ("platform_activation", "model_load"),
+        model_config=True,
+    ),
+    Patch(
         "vllm_torchtpu.models.vllm.qwen3_next_patch:maybe_patch_qwen3_next",
         ("platform_activation", "model_load"),
     ),

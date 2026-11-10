@@ -415,3 +415,38 @@ def maybe_patch_qwen3_vl(model_config: Optional["ModelConfig"] = None) -> bool |
     _patch_qwen3_vl_vision_attention(modeling)
     _patch_qwen3_vl_vision_transformer(modeling)
     return None
+
+
+def _has_qwen3_vl_vision(model_config: "ModelConfig") -> bool:
+    """Whether the model has a Qwen3-VL vision tower (Qwen3-VL, its MoE, Cosmos3)."""
+    vision_config = getattr(model_config.hf_config, "vision_config", None)
+    return "qwen3_vl" in str(getattr(vision_config, "model_type", ""))
+
+
+def maybe_patch_qwen3_vl_video_prompt(
+    model_config: Optional["ModelConfig"] = None,
+) -> bool | None:
+    """Expand Qwen3-VL videos in the prompt format the models were trained on.
+
+    The chat template writes a video as ``<|vision_start|><|video_pad|><|vision_end|>``.
+    The processor Qwen3-VL and Cosmos3 were trained with (transformers < 5.10)
+    replaces that whole triple with ``<t seconds><|vision_start|>...<|vision_end|>``
+    per frame. vLLM follows transformers >= 5.10, which replaces only the bare
+    video token and so leaves an outer ``<|vision_start|>``/``<|vision_end|>``
+    pair around every video, two tokens the model never saw (Cosmos3-Super: 474
+    prompt tokens vs the official 472, and a different answer).
+    """
+    if model_config is None or not _has_qwen3_vl_vision(model_config):
+        return False
+    from vllm.model_executor.models import qwen3_vl
+
+    processor_cls = qwen3_vl.Qwen3VLMultiModalProcessor
+    if not getattr(processor_cls, "_tpu_trained_video_prompt", False):
+        processor_cls._expands_only_video_token = staticmethod(
+            lambda hf_processor: False
+        )
+        processor_cls._tpu_trained_video_prompt = True
+        logger.info(
+            "Applied TPU patch: Qwen3-VL videos expand in the trained prompt format."
+        )
+    return None
