@@ -580,12 +580,46 @@ def calculate_block_sizes(
     return decode_block_sizes, prefill_block_sizes
 
 
+# Prefill/mixed tiles (bq, bq_c, bkv, batch) tuned for one layer shape:
+# (q heads, KV heads, head_dim, fp8 KV) per device. The heuristic grows bq and
+# bkv together, so with many q heads per KV head (32 q / 2 KV heads on a PP=8
+# stage of Qwen3.5-397B) VMEM stops both at 256 and every 256-key block pays a
+# full accumulator rescale. A 1024-key block with a small q sub-chunk fits:
+_TUNED_PREFILL_TILES: dict[tuple[int, int, int, bool], tuple[int, int, int, int]] = {
+    (32, 2, 256, True): (256, 16, 1024, 1),
+}
+# Tiles that produced wrong outputs at the tuned shape: 128,16,1024,1 scored
+_UNSAFE_PREFILL_TILES = frozenset({(128, 16, 1024, 1)})
+
+
+def tuned_prefill_block_sizes(
     default: configs.BlockSizes,
+    model_cfgs: configs.ModelConfigs,
     serve_cfgs: configs.ServingConfigs,
     mxu_column_size: int,
 ) -> configs.BlockSizes:
+    """The prefill tiles from `_TUNED_PREFILL_TILES` for this layer shape, or
 
+    bq is clamped to the aligned token count as the heuristic does, and bq_c
+    to a divisor of bq.
     """
+    is_fp8_kv = jnp.dtype(serve_cfgs.dtype_kv) in (
+        jnp.dtype(jnp.float8_e4m3fn),
+        jnp.dtype(jnp.float8_e5m2),
+    )
+    key = (
+        model_cfgs.num_q_heads,
+        model_cfgs.num_kv_heads,
+        model_cfgs.head_dim,
+        is_fp8_kv,
+    )
+    tiles = _TUNED_PREFILL_TILES.get(key)
+    if tiles is None:
+        return default
+    if tiles in _UNSAFE_PREFILL_TILES:
+        raise ValueError(f"prefill tiles {tiles} for {key} are known to be wrong")
+    bq, bq_c, bkv, batch = tiles
+    if bkv % serve_cfgs.page_size:
         return default
     max_useful_bq_sz = max(
         mxu_column_size, utils.align_to(serve_cfgs.total_q_tokens, mxu_column_size)

@@ -509,6 +509,9 @@ def block_fully_visible(
 
 
 def _q_tail_rungs(cfgs: configs.RpaConfigs) -> tuple[int, ...]:
+    """Query-row rungs of a prefill/mixed q block: a rung past the first is
+    skipped when no lane of the step has query rows in it."""
+    if cfgs.mode == configs.RpaCase.DECODE or cfgs.bq_sz < 256:
         return (cfgs.bq_sz,)
     candidates = (128, 256, 512, 1024)
     return tuple(r for r in candidates if r < cfgs.bq_sz) + (cfgs.bq_sz,)
