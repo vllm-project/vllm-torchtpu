@@ -93,6 +93,29 @@ def qkvg_operand(attn: Any, g: Any, R: int) -> torch.Tensor:
     return torch.cat([q, k, v], dim=1)
 
 
+def _fp8_columns(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """`w [..., K, N]` as FP8 E4M3 with per-column (`N`) f32 scales `[..., N]`."""
+    wf = w.float()
+    amax = wf.abs().amax(dim=-2)
+    scale = torch.where(amax > 0, amax / 448.0, torch.ones_like(amax))
+    return (wf / scale.unsqueeze(-2)).to(torch.float8_e4m3fn), scale
+
+
+def _hc_fp8(w: dict, row: Any, prefix: str, nhc: int, layer_js: list[int]) -> None:
+    """Quantize `<prefix>_hdn` / `<prefix>_hup<b>` in `w` (FP8 HC weights, target layers)."""
+    q, s = _fp8_columns(w[f"{prefix}_hdn"])
+    w[f"{prefix}_hdn"] = q
+    ups = []
+    for b in range(nhc):
+        qb, sb = _fp8_columns(w[f"{prefix}_hup{b}"])
+        w[f"{prefix}_hup{b}"] = qb
+        ups.append(sb)
+    up_s = torch.cat(ups, dim=-1)
+    for i, j in enumerate(layer_js):
+        row(f"{prefix}_hdn_s", j, s[i])
+        row(f"{prefix}_hup_s", j, up_s[i])
+
+
 def pack_wholestep_operands(
     model: Any,
     g: Qwen38Geometry,
@@ -194,6 +217,12 @@ def pack_wholestep_operands(
         row("sh_gate", j, layer.mlp.shared_expert_gate.weight.data)
         row("sh13_s", j, torch.ones(2 * (gi.IS // ex.R), device=dev))
         row("sh2_s", j, torch.ones(g.H, device=dev))
+
+    if "moe_hdn_s" in p.smalls_layout:  # VLLM_TPU_MK_HC_FP8 (spec hc_fp8)
+        _hc_fp8(w, row, "qsa_full", g.NHC, att)
+        if gdn_j:
+            _hc_fp8(w, row, "gdn", g.NHC, gdn_j)
+        _hc_fp8(w, row, "moe", g.NHC, list(range(L)))
 
     smalls = torch.zeros((L, 1, p.smalls_width), dtype=torch.float32, device=dev)
     for name, val in sm.items():
