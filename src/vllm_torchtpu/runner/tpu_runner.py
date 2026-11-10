@@ -5887,13 +5887,30 @@ class TPUModelRunner(GPUModelRunner):
             seed = int(self.model_config.seed or 0)
             gen = torch.Generator(device=self.device)
             gen.manual_seed(seed)
-            if getattr(self.device, "type", None) == "tpu":
+            if self._sampler_draws_in_graph():
+                # The candidate samplers draw inside their compiled graphs,
+                # which torch_tpu compiles against the device's default
+                # generator; seed it the same way on every rank.
                 dev_idx = self.device.index or 0
                 default_gens = getattr(torch.tpu, "default_generators", ())
                 if dev_idx < len(default_gens):
                     default_gens[dev_idx].manual_seed(seed)
             self._sampling_generator = gen
         return self._sampling_generator
+
+    def _sampler_draws_in_graph(self) -> bool:
+        """Whether the candidate samplers draw their uniforms in-graph.
+
+        On TPU, the packed top-k and candidate-block samplers call torch.rand
+        inside their compiled graphs (one launch fewer per sampled step) when
+        TPU_SAMPLER_TOPK_CANDIDATES enables them. Every other sampler keeps
+        drawing from the dedicated generator, so without the candidate
+        samplers the random stream is unchanged.
+        """
+        return (
+            getattr(self.device, "type", None) == "tpu"
+            and envs.TPU_SAMPLER_TOPK_CANDIDATES > 0
+        )
 
     @torch.no_grad()
     def _update_mamba_slot_read_offsets(
@@ -6231,11 +6248,10 @@ class TPUModelRunner(GPUModelRunner):
                 logits,
                 padded_num_reqs=padded_num_reqs,
             )
-            if (
-                logits.device.type == "tpu"
-                and isinstance(self.rejection_sampler, RejectionSampler)
-                and os.environ.get("VLLM_TPU_MTP_OPT", "1") != "0"
+            if logits.device.type == "tpu" and isinstance(
+                self.rejection_sampler, RejectionSampler
             ):
+                # Drawn inside the compiled sampler (see _get_sampling_generator).
                 u_both = None
             else:
                 num_cand = logits.shape[-1] // 2
@@ -6297,11 +6313,10 @@ class TPUModelRunner(GPUModelRunner):
                         padded_num_reqs=padded_num_reqs,
                     )
                 )
-                if (
-                    logits.device.type == "tpu"
-                    and isinstance(self.rejection_sampler, RejectionSampler)
-                    and os.environ.get("VLLM_TPU_MTP_OPT", "1") != "0"
+                if logits.device.type == "tpu" and isinstance(
+                    self.rejection_sampler, RejectionSampler
                 ):
+                    # Drawn inside the compiled sampler (see _get_sampling_generator).
                     u_both = None
                 else:
                     num_cand = topk_candidates * CANDIDATE_BLOCK
@@ -6624,8 +6639,8 @@ class TPUModelRunner(GPUModelRunner):
                                 logits.device.type == "tpu"
                                 and "sample_from_packed_candidates"
                                 not in getattr(self, "__dict__", {})
-                                and os.environ.get("VLLM_TPU_MTP_OPT", "1") != "0"
                             ):
+                                # Drawn inside the compiled sampler (see _get_sampling_generator).
                                 u = None
                             else:
                                 u = torch.rand(
@@ -6739,8 +6754,8 @@ class TPUModelRunner(GPUModelRunner):
                             logits.device.type == "tpu"
                             and "sample_from_packed_candidates"
                             not in getattr(self, "__dict__", {})
-                            and os.environ.get("VLLM_TPU_MTP_OPT", "1") != "0"
                         ):
+                            # Drawn inside the compiled sampler (see _get_sampling_generator).
                             u = None
                         else:
                             u = torch.rand(
@@ -8413,7 +8428,7 @@ class TPUModelRunner(GPUModelRunner):
                     )
                     dummy_u_cand = (
                         None
-                        if os.environ.get("VLLM_TPU_MTP_OPT", "1") != "0"
+                        if self._sampler_draws_in_graph()
                         else torch.zeros(
                             (num_reqs, num_packed_cand),
                             dtype=torch.float32,
@@ -8749,7 +8764,7 @@ class TPUModelRunner(GPUModelRunner):
                     )
                     warm_u_all = (
                         None
-                        if os.environ.get("VLLM_TPU_MTP_OPT", "1") != "0"
+                        if self._sampler_draws_in_graph()
                         else torch.zeros(
                             (num_reqs + num_tokens, num_cand + 1),
                             dtype=torch.float32,
@@ -8817,7 +8832,7 @@ class TPUModelRunner(GPUModelRunner):
                     )
                     warm_u_all_packed = (
                         None
-                        if os.environ.get("VLLM_TPU_MTP_OPT", "1") != "0"
+                        if self._sampler_draws_in_graph()
                         else torch.zeros(
                             (num_reqs + num_tokens, num_packed_cand + 1),
                             dtype=torch.float32,
@@ -9069,7 +9084,10 @@ class TPUModelRunner(GPUModelRunner):
                 self._warmup_spec_decode()
                 if self._adaptive_verification is not None:
                     self._init_adaptive_verification()
-        self._sampling_generator = None
+        if self._sampler_draws_in_graph():
+            # The warmup drew from both generators; serving starts every rank
+            # from the seeded state again.
+            self._sampling_generator = None
 
     def _check_draft_buckets(self) -> None:
         """Refuses to start a producer whose draft lacks a target bucket.
