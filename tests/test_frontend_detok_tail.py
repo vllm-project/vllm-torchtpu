@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """QX_DETOK_PROMPT_TAIL: a DecodeStream primed with a safe prompt tail must
 emit byte-identical text to one primed with the whole prompt."""
 
@@ -14,7 +26,9 @@ tokenizers = pytest.importorskip("tokenizers")
 try:
     from vllm_torchtpu import frontend_fix as ff
 except Exception:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src" / "vllm_torchtpu"))
+    sys.path.insert(
+        0, str(Path(__file__).resolve().parents[1] / "src" / "vllm_torchtpu")
+    )
     import frontend_fix as ff
 
 from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
@@ -81,7 +95,9 @@ def test_tail_priming_is_byte_identical(tok):
 
     bu = bytes_to_unicode()
     byte_ids = [vocab[bu[b]] for b in range(0x80, 0x100) if bu[b] in vocab]
-    special_ids = [tok.token_to_id(s) for s in SPECIALS if tok.token_to_id(s) is not None]
+    special_ids = [
+        tok.token_to_id(s) for s in SPECIALS if tok.token_to_id(s) is not None
+    ]
     assert byte_ids and special_ids
     n_tail = n_full = 0
     for i in range(300):
