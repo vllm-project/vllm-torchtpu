@@ -156,6 +156,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_DECODE_TOKEN_SHARD: bool = False
     VLLM_TPU_PLE_LOOKUP_CHUNK_TOKENS: int = 8
     VLLM_TPU_PLE_FUSED_GATE: bool = False
+    VLLM_TPU_PLE_CONV_HISTORY_FAST: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
@@ -963,6 +964,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # query gate dot (norm weights, BF16 products, FP32 reduction) instead of
     # two grouped RMS norms and a Torch product/sum. Reduction order differs.
     "VLLM_TPU_PLE_FUSED_GATE": env_bool("VLLM_TPU_PLE_FUSED_GATE"),
+    # qwen4_exp PLE short conv (request-owned history): skip the history read
+    # for the zero-distance tap and gather only each request's first
+    # `distance` history rows for the others, instead of one history row per
+    # token per tap (bit-identical).
+    "VLLM_TPU_PLE_CONV_HISTORY_FAST": env_bool("VLLM_TPU_PLE_CONV_HISTORY_FAST"),
     "VLLM_TPU_PLE_LOOKUP_CHUNK_TOKENS": env_nonnegative_int(
         "VLLM_TPU_PLE_LOOKUP_CHUNK_TOKENS", 8
     ),
