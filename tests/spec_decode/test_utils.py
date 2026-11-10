@@ -201,3 +201,65 @@ def test_fit_rows_returns_slices_or_pads_the_leading_dim():
     out = utils.fit_rows(t, 6, value=-1)
     assert out.dtype == torch.int32 and out.shape == (6, 2)
     assert torch.equal(out[:4], t) and out[4:].eq(-1).all()
+
+
+def _qwen35_mtp_config(arch="Qwen3_5MoeForConditionalGeneration", method="mtp"):
+    from types import SimpleNamespace as NS
+
+    return NS(
+        model_config=NS(architectures=[arch]),
+        speculative_config=None if method is None else NS(method=method),
+    )
+
+
+@pytest.mark.parametrize(
+    ("arch", "method", "expected"),
+    [
+        ("Qwen3_5MoeForConditionalGeneration", "mtp", True),
+        ("Qwen3_5MoeForConditionalGeneration", "eagle3", False),
+        ("Qwen3_5MoeForConditionalGeneration", None, False),
+        ("Qwen3NextForCausalLM", "mtp", False),
+        ("DeepseekV3ForCausalLM", "mtp", False),
+    ],
+)
+def test_qwen3_5_mtp_rules_follow_the_model_and_draft(
+    monkeypatch, arch, method, expected
+):
+    """Greedy top tokens, fast token substitution and the fused draft loop
+    run by rule only for a Qwen3.5 target with an MTP draft; every other
+    configuration keeps main's opt-in env keys (default off)."""
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.spec_decode import utils
+
+    for key in (
+        "TPU_GREEDY_TOP_TOKENS",
+        "VLLM_TPU_FAST_TOKEN_SUBSTITUTION",
+        "VLLM_TPU_FUSED_DRAFT_LOOP",
+    ):
+        monkeypatch.setattr(envs, key, False)
+    config = _qwen35_mtp_config(arch, method)
+    assert utils.qwen3_5_mtp(config) is expected
+    assert utils.greedy_top_tokens_enabled(config) is expected
+    assert utils.fast_token_substitution_enabled(config) is expected
+    assert (
+        utils.fused_draft_loop_enabled(config, draft_kv_shared=False, dp_lockstep=False)
+        is expected
+    )
+
+
+def test_qwen3_5_fused_draft_loop_rule_exceptions(monkeypatch):
+    """The fused loop rule stays off for a KV-sharing draft and under EP-DP
+    lockstep; main's key still turns it on anywhere."""
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.spec_decode import utils
+
+    monkeypatch.setattr(envs, "VLLM_TPU_FUSED_DRAFT_LOOP", False)
+    config = _qwen35_mtp_config()
+    on = utils.fused_draft_loop_enabled
+    assert on(config, draft_kv_shared=True, dp_lockstep=False) is False
+    assert on(config, draft_kv_shared=False, dp_lockstep=True) is False
+    monkeypatch.setattr(envs, "VLLM_TPU_FUSED_DRAFT_LOOP", True)
+    other = _qwen35_mtp_config("Qwen3NextForCausalLM")
+    assert on(other, draft_kv_shared=False, dp_lockstep=False) is True
+    monkeypatch.setattr(envs, "TPU_GREEDY_TOP_TOKENS", True)
+    assert utils.greedy_top_tokens_enabled(other) is True
