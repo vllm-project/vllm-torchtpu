@@ -257,11 +257,12 @@ class RejectionSampler:
         req_top_k: torch.Tensor,
         req_top_p: torch.Tensor,
         accept_u: torch.Tensor | None,
-        u_all: torch.Tensor,
+        u_all: torch.Tensor | None,
         topk_candidates: int,
     ) -> torch.Tensor:
         """With ``accept_u=None``, ``u_all`` is the [rows, num_cand + 1]
-        uniform buffer whose column 0 holds the draft accept draws."""
+        uniform buffer whose column 0 holds the draft accept draws (or ``None``
+        to draw inside the compiled TPU graph)."""
         return _fused_spec_verify_and_sample_candidates(
             logits,
             draft_token_ids,
@@ -767,15 +768,12 @@ def _fused_spec_verify_and_sample_candidates(
     req_top_k: torch.Tensor,
     req_top_p: torch.Tensor,
     accept_u: torch.Tensor | None,
-    u_all: torch.Tensor,
+    u_all: torch.Tensor | None,
     synthetic_conditional_rates: torch.Tensor | None,
     synthetic_mode: bool,
     topk_candidates: int,
 ) -> torch.Tensor:
     """Fused candidate-space bonus sampling + speculative rejection sampling."""
-    if accept_u is None:
-        accept_u = u_all[: draft_token_ids.shape[0], 0]
-        u_all = u_all[:, 1:]
     batch_size = num_draft_tokens.shape[0]
     if topk_candidates > 0:
         cand_logits, cand_token_ids = extract_topk_candidates(
@@ -785,6 +783,15 @@ def _fused_spec_verify_and_sample_candidates(
         num_cand = logits.shape[-1] // 2
         cand_logits = logits[:, :num_cand]
         cand_token_ids = logits[:, num_cand:].to(torch.int32)
+    if u_all is None:
+        u_all = torch.rand(
+            (batch_size + draft_token_ids.shape[0], cand_logits.shape[-1] + 1),
+            dtype=torch.float32,
+            device=logits.device,
+        )
+    if accept_u is None:
+        accept_u = u_all[: draft_token_ids.shape[0], 0]
+        u_all = u_all[:, 1:]
     all_row_indices = torch.cat(
         [
             bonus_logits_indices.to(torch.int64),
@@ -810,7 +817,11 @@ def _fused_spec_verify_and_sample_candidates(
     scaled_cand = all_cand_logits.to(torch.float32) / (
         all_temps.to(torch.float32) + TEMPERATURE_EPS
     )
-    masked_cand = apply_top_k_top_p(scaled_cand, all_top_k, all_top_p)
+    max_k = min(
+        32 if topk_candidates == 0 else topk_candidates,
+        scaled_cand.shape[-1],
+    )
+    masked_cand = apply_top_k_top_p(scaled_cand, all_top_k, all_top_p, max_k=max_k)
     probs = torch.softmax(masked_cand, dim=-1, dtype=torch.float32)
 
     tiny = torch.finfo(torch.float32).tiny

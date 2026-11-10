@@ -180,3 +180,17 @@ def test_rejection_sampler_topk_candidates_cpu_parity():
     expected = sampling.apply_top_k_top_p(logits, top_k, top_p, topk_candidates=0)
     result = sampling.apply_top_k_top_p(logits, top_k, top_p, topk_candidates=64)
     torch.testing.assert_close(result, expected, rtol=0, atol=0)
+
+
+def test_topk_mask_max_k_parity_with_ties():
+    gen = torch.Generator().manual_seed(7)
+    logits = torch.randn(16, 256, generator=gen)
+    # Introduce multi-way ties at and below the top-k boundary.
+    logits[:, :50] = torch.round(logits[:, :50] * 2.0) / 2.0
+    top_k = torch.randint(0, 33, (16, 1), generator=gen, dtype=torch.int32)
+    top_p = torch.tensor([[0.85 if i % 2 == 0 else 1.0] for i in range(16)])
+
+    expected = sampling.apply_top_k_top_p(logits, top_k, top_p, max_k=0)
+    result = sampling.apply_top_k_top_p(logits, top_k, top_p, max_k=32)
+    torch.testing.assert_close(result, expected, rtol=0, atol=0)
+
