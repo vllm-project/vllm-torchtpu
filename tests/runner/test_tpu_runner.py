@@ -4277,3 +4277,37 @@ def test_kv_transfer_uses_stage_timing():
         )
     )
     assert TPUModelRunner._kv_transfer_uses_stage_timing(cfg_multi_with_tpu) is True
+
+
+def test_update_states_clears_prev_draft_len_of_scheduled_cached_requests():
+    """The base runner's async draft correction reads prev_num_draft_len of
+    every scheduled cached request; one scheduled without drafts after
+    drafting in the previous step must be cleared too."""
+    from vllm.v1.core.sched.output import SchedulerOutput
+
+    runner = object.__new__(TPUModelRunner)
+    states = {
+        rid: SimpleNamespace(prev_num_draft_len=3)
+        for rid in ("drafting", "budget_cut", "unscheduled")
+    }
+    runner.requests = states
+    runner.speculative_config = SimpleNamespace(num_speculative_tokens=3)
+    runner.scheduler_config = SimpleNamespace(async_scheduling=True)
+    runner._pre_async_results = None
+    runner._install_spec_token_room_guard = lambda: None
+    runner._mamba_state_pos = {}
+    runner._mamba_offset_seeded = set()
+    runner._mamba_slot_by_req_id = {}
+    runner._free_mamba_slots = []
+    output = SchedulerOutput.make_empty()
+    output.scheduled_cached_reqs.req_ids = ["drafting", "budget_cut"]
+    output.scheduled_spec_decode_tokens = {"drafting": [-1, -1, -1]}
+    seen: dict[str, int] = {}
+
+    def base_update(_output):
+        seen.update({rid: s.prev_num_draft_len for rid, s in states.items()})
+
+    with patch.object(GPUModelRunner, "_update_states", side_effect=base_update):
+        runner._update_states(output)
+
+    assert seen == {"drafting": 0, "budget_cut": 0, "unscheduled": 3}
