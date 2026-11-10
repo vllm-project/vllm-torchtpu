@@ -299,6 +299,7 @@ if TYPE_CHECKING:
     VLLM_TPU_CPU_PIN: str = "off"
     VLLM_TPU_HOST_PHASES: int = 0
     VLLM_TPU_PROMPT_IDS_NDARRAY: bool = False
+    VLLM_TPU_PAW_SKIP_FULL: bool = False
     VLLM_TPU_SERIALIZE_COPY_WAIT: bool = False
     VLLM_TPU_PINNED_TOKEN_COPY: bool = False
     VLLM_TPU_SAMPLING_PARAMS_REUSE: bool = False
@@ -1902,6 +1903,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # unpickle plus a list->numpy copy into token_ids_cpu on the admit step's
     # critical path (core/prefix_aware_scheduler.py). Same token values.
     "VLLM_TPU_PROMPT_IDS_NDARRAY": env_bool("VLLM_TPU_PROMPT_IDS_NDARRAY"),
+    # PrefixAwareScheduler: skip the warmth scoring (one prefix-cache lookup
+    # per waiting request, every step) when no seat is free and the whole
+    # queue fits the window; the admission order is unchanged.
+    "VLLM_TPU_PAW_SKIP_FULL": env_bool("VLLM_TPU_PAW_SKIP_FULL"),
     # Let only one thread synchronize a sampled-token copy at a time (the
     # async-output thread and the deferred previous-results wait share one).
     "VLLM_TPU_SERIALIZE_COPY_WAIT": env_bool("VLLM_TPU_SERIALIZE_COPY_WAIT"),
