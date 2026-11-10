@@ -340,6 +340,7 @@ if TYPE_CHECKING:
     VLLM_TPU_SUBST_FRESH_IDS: bool = False
     VLLM_TPU_ZERO_PADDED_SEQ_LENS: bool = False
     VLLM_TPU_DRAFT_ROWS_FRESH: bool = False
+    VLLM_TPU_DRAFT_CARRY_ROWS_FRESH: bool = False
     VLLM_TPU_DRAFT_SEED_EXTRAS: bool = False
     VLLM_TPU_DRAFT_SEED_BOOTSTRAP_PAD: bool = False
     VLLM_TPU_CPU_PIN_RESERVE: int = 2
@@ -2068,6 +2069,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # before the propose and the fused loop (same values; off with
     # VLLM_TPU_DRAFT_CARRY_FUSED, which takes precedence).
     "VLLM_TPU_DRAFT_ROWS_FRESH": env_bool("VLLM_TPU_DRAFT_ROWS_FRESH"),
+    # With VLLM_TPU_DRAFT_CARRY_FUSED and MTP_DRAFT_ROWS: the carry program
+    # takes step 0's untrimmed [capacity] outputs, trims inside and returns
+    # the hidden carry as a buffer of its own (no execute_as_strided views
+    # before the carry and the fused loop). Same values.
+    "VLLM_TPU_DRAFT_CARRY_ROWS_FRESH": env_bool("VLLM_TPU_DRAFT_CARRY_ROWS_FRESH"),
     # With VLLM_TPU_VERIFY_FUSED: compute the mamba read offsets inside the
     # fused verify program and apply them with one eager scatter.
     "VLLM_TPU_VERIFY_FUSED_READ_OFFSETS": env_bool("VLLM_TPU_VERIFY_FUSED_READ_OFFSETS"),
