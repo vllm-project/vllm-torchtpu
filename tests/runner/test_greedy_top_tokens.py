@@ -744,12 +744,19 @@ def test_topk_candidates_step_eligible():
 
 
 def test_log_topk_candidates_step_path_logs_each_path_once():
-    vllm_logger._print_info_once.cache_clear()
+    if hasattr(vllm_logger, "_print_info_once"):
+        vllm_logger._print_info_once.cache_clear()
     records = []
     handler = logging.Handler()
     handler.emit = records.append
     logger = logging.getLogger("vllm")
+    # As in test_log_step_path_logs_each_path_once: the record must reach the
+    # "vllm" logger whatever level or logging.disable() another test left.
+    old_level = logger.level
+    old_disable = logging.root.manager.disable
     logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    logging.disable(logging.NOTSET)
     try:
         greedy_top_tokens.log_topk_candidates_step_path(
             True, ["__spec_warmup_0__", None]
@@ -762,6 +769,8 @@ def test_log_topk_candidates_step_path_logs_each_path_once():
             )
     finally:
         logger.removeHandler(handler)
+        logger.setLevel(old_level)
+        logging.disable(old_disable)
     assert [r.getMessage() for r in records] == [
         "TPU_GREEDY_TOP_TOKENS: a speculative verify step took vocab-parallel "
         "top-32 candidates",
@@ -782,8 +791,8 @@ def test_runner_selected_logits_lengths_includes_spec_verify_buckets():
     runner.max_num_reqs = 16
     runner.num_reqs_paddings = [1, 2, 4, 8, 16]
     runner.num_tokens_paddings = [16, 24, 32, 40, 48, 56, 64, 128]
-    runner._pcp_enabled = False
-    runner._mtp_enabled = False
+    runner._pp_is_last = True
+    runner._mtp_prefill_only = False
     lengths = runner._selected_logits_lengths(64)
     for expected_len in (16, 24, 32, 40, 48, 56, 64):
         assert expected_len in lengths
