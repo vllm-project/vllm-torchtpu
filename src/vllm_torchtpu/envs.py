@@ -151,6 +151,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MK_HC_FP8: bool = False
     VLLM_TPU_MK_SCATTER_DEEP: bool = False
     VLLM_TPU_MK_WHOLE_L47: bool = False
+    VLLM_TPU_MK_WHOLE_L45: bool = False
     VLLM_TPU_HC_PREFILL_UP_T: bool = False
     VLLM_TPU_HC_PREFILL_COMBINE_MIX: bool = False
     VLLM_TPU_HC_PREFILL_WIDE_TILE: int = 0
@@ -1037,6 +1038,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # call, as a one-layer kernel after layers 3..46, its step tokens written with theirs;
     # the stock L47 attention core and last segment kernel are skipped.
     "VLLM_TPU_MK_WHOLE_L47": env_bool("VLLM_TPU_MK_WHOLE_L47"),
+    # Whole-step megakernel: layers 3..47 in ONE kernel (L = 45, a partial last cycle of
+    # its QSA layer) instead of VLLM_TPU_MK_WHOLE_L47's second one-layer kernel; implies
+    # the L47 plumbing (cache writes, stock L47 skipped).
+    "VLLM_TPU_MK_WHOLE_L45": env_bool("VLLM_TPU_MK_WHOLE_L45"),
     # Prefill HC full mix: take the up projection as its [low rank, width]
     # transpose. The checkpoint weight is held column-major, so the transpose
     # is a bitcast and the per-call relayout copy before the kernel goes away

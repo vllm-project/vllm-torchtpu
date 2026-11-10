@@ -80,9 +80,10 @@ class _WholeKind:
         write: bool,
         tag: str,
         tail: bool = False,
+        L: int = L_WHOLE,
     ) -> None:
         self.mesh, self.g, self.layout, self.qsa = mesh, g, layout, qsa
-        self.tail = tail
+        self.tail, self.L = tail, L
         self.kw = dict(
             budget=budget,
             max_groups=max_groups,
@@ -123,7 +124,7 @@ class _WholeKind:
                 B,
                 self.layout,
                 self.qsa,
-                L=L_WHOLE,
+                L=self.L,
                 tiles=wholestep_tiles(B, self.kw["max_groups"]),
                 tail=self.tail,
                 **self.kw,
@@ -173,10 +174,17 @@ class Qwen38WholeStep(nn.Module):
         # `tail` (VLLM_TPU_MK_WHOLE_L47): model layer LAST_LAYER (the last QSA layer) as a
         # one-layer kernel in the same call; its operands follow the main kernel's.
         self.tail = envs.VLLM_TPU_MK_WHOLE_L47 if tail is None else tail
+        # VLLM_TPU_MK_WHOLE_L45: layer LAST_LAYER in the main kernel itself (L = 45, a
+        # partial last cycle of its QSA layer) instead of a second one-layer kernel.
+        # `tail` keeps meaning "L47 ran in the call" (the model skips its stock path).
+        self.fused = bool(envs.VLLM_TPU_MK_WHOLE_L45)
+        self.tail = self.tail or self.fused
         if self.tail:
             assert self.layers[LAST_LAYER].layer_type == "full_attention", LAST_LAYER
             assert LAST_LAYER == len(self.layers) - 1, (LAST_LAYER, len(self.layers))
-        tail_ids = [LAST_LAYER] if self.tail else []
+        if self.fused:
+            ids = ids + [LAST_LAYER]
+        tail_ids = [LAST_LAYER] if self.tail and not self.fused else []
         self.qsa_ids = [
             i for i in ids + tail_ids if self.layers[i].layer_type == "full_attention"
         ]
@@ -206,7 +214,8 @@ class Qwen38WholeStep(nn.Module):
                 hc_fp8=envs.VLLM_TPU_MK_HC_FP8,
             )
 
-        spec = spec_for(L_WHOLE, n_att)
+        self.L = len(ids)
+        spec = spec_for(self.L, n_att)
         ex = ExecSpec(
             R=R,
             B=buckets[0],
@@ -273,7 +282,7 @@ class Qwen38WholeStep(nn.Module):
         # requests.
         self.union_stats = (
             torch.zeros(
-                (len(self.qsa_ids) - int(self.tail), UNION_STATS_REQS, 1, 128),
+                (len(self.qsa_ids) - int(self.tail and not self.fused), UNION_STATS_REQS, 1, 128),
                 dtype=torch.int32,
                 device=pool.device,
             )
@@ -291,7 +300,8 @@ class Qwen38WholeStep(nn.Module):
             rotary_dim=self.rotary_dim,
             write=self.write,
             tag=self.tag,
-            tail=self.tail,
+            tail=self.tail and not self.fused,
+            L=self.L,
         )
         self.kind.pool_index = self.n_w
 
