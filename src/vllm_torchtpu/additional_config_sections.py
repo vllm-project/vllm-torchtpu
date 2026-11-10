@@ -37,6 +37,7 @@ KNOWN_SECTIONS: frozenset[str] = frozenset(
         "tpu_frontend",  # frontend_options.py
         "tpu_multiport_dp",  # distributed/tpu_multiport_dp.py
         "tpu_online_fp8",  # layers/adapter/quantization/online_fp8.py
+        "tpu_runner",  # runner/runner_options.py
         "tpu_scheduler",  # core/scheduler_options.py
         "tpu_worker",  # worker/worker_options.py
         # keep-sorted end

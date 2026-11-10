@@ -74,3 +74,9 @@ def test_options_come_from_the_tpu_runner_section():
 def test_parse_is_strict(raw, match):
     with pytest.raises(ValueError, match=match):
         runner_options.parse(raw)
+
+
+def test_section_is_registered():
+    from vllm_torchtpu import additional_config_sections
+
+    assert runner_options.SECTION in additional_config_sections.KNOWN_SECTIONS
