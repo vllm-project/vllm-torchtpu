@@ -359,7 +359,11 @@ def _apply_core(rank: int, local_rank: int, node: int, slot: int, slots: int):
     others = node_cpus - reserved
     n = pin_all_threads(others)
     main_tid = threading.get_native_id()
-    os.sched_setaffinity(0, {mine[0]})
+    try:
+        os.sched_setaffinity(0, {mine[0]})
+    except OSError as e:
+        logger.warning("CPU pin core: rank %d cannot use cpu %d (%s)", rank, mine[0], e)
+        return
     threading.Thread(
         target=_repin_new_threads,
         args=(main_tid, others, 10.0),
