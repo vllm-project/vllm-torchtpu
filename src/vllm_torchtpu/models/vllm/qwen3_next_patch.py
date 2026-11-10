@@ -287,6 +287,7 @@ def _get_sigmoid_gate_quant_op() -> Callable:
         _sigmoid_gate_quant_op = op
     linear_common._get_prequant_matmul_op()
     _get_sigmoid_gate_o_proj_op()
+    assert _sigmoid_gate_quant_op is not None
     return _sigmoid_gate_quant_op
 
 
@@ -321,6 +322,7 @@ def _get_sigmoid_gate_o_proj_op() -> Callable:
 
         op.register_fake(_fake)
         _sigmoid_gate_o_proj_op = op
+    assert _sigmoid_gate_o_proj_op is not None
     return _sigmoid_gate_o_proj_op
 
 
@@ -359,8 +361,8 @@ def maybe_flip_gdn_in_proj_qkvz_weight(gdn_layer: Any) -> bool:
         return False
     if hasattr(proj, "weight_scale_inv"):
         return False
-    weight = getattr(proj, "weight", None)
-    weight_scale = getattr(proj, "weight_scale", None)
+    weight: Any = getattr(proj, "weight", None)
+    weight_scale: Any = getattr(proj, "weight_scale", None)
     if not isinstance(weight, torch.Tensor) or weight.ndim != 2:
         return False
     if weight.dtype != torch.float8_e4m3fn:
@@ -551,6 +553,7 @@ def _get_fp8_gate_and_se_op() -> Callable:
         op.register_fake(_fake)
         _fp8_gate_and_se_op = op
 
+    assert _fp8_gate_and_se_op is not None
     return _fp8_gate_and_se_op
 
 
@@ -891,18 +894,8 @@ def maybe_setup_fused_gate_se(moe: Any) -> bool:
     w_seg_buf = torch.empty_like(w_seg_1d).copy_(w_seg_1d)
     w_down_buf = torch.empty_like(w_down_cat).copy_(w_down_cat)
     s_down_buf = torch.empty_like(s_down_cat).copy_(s_down_cat)
-    del (
-        w_gate,
-        w_se_gate,
-        w_gate_f32,
-        w_gate_fp8_kn,
-        s_gate_1d,
-        w_gu_cat,
-        s_gu_cat,
-        w_seg_1d,
-        w_down_cat,
-        s_down_cat,
-    )
+    del w_gate, w_se_gate, w_gate_f32, w_gate_fp8_kn, s_gate_1d
+    del w_gu_cat, s_gu_cat, w_seg_1d, w_down_cat, s_down_cat
 
     p_w_gu = torch.nn.Parameter(w_gu_buf, requires_grad=False)
     p_s_gu = torch.nn.Parameter(s_gu_buf, requires_grad=False)
@@ -1162,8 +1155,8 @@ def _takes_prequant_rows(proj: Any) -> bool:
     """Whether `proj` is an FP8 linear with per-channel scales whose
     `apply_prequant` takes `linear_common.quantize_rows` rows, reproducing
     what its plain forward computes from the bf16 rows."""
-    weight = getattr(proj, "weight", None)
-    weight_scale = getattr(proj, "weight_scale", None)
+    weight: Any = getattr(proj, "weight", None)
+    weight_scale: Any = getattr(proj, "weight_scale", None)
     return bool(
         isinstance(weight, torch.Tensor)
         and weight.dtype == torch.float8_e4m3fn
@@ -1397,11 +1390,12 @@ def patched_decoder_layer_forward(
     input_is_sliced = sp and residual is not None
 
     # Rank tensors enter every layer's graph, so all layers trace alike.
-    sp_rank = getattr(self, "_tpu_sp_rank", None)
+    sp_rank: Any = getattr(self, "_tpu_sp_rank", None)
     if isinstance(sp_rank, torch.Tensor):
         positions = positions + (sp_rank * 0)[0]
-    if small_all_reduce_op._RANK is not None:
-        positions = positions + (small_all_reduce_op._RANK * 0)[0]
+    collective_rank: Any = small_all_reduce_op._RANK
+    if collective_rank is not None:
+        positions = positions + (collective_rank * 0)[0]
 
     prequant = None
     # A PCP-streaming GDN layer takes bf16 rows, so skip the FP8 pre-gather.
@@ -1618,7 +1612,8 @@ def _with_rank_tensor(original_init: Callable) -> Callable:
             device=self.input_layernorm.weight.device,
         )
 
-    __init__._tpu_sp_rank_init = True
+    # A marker attribute on the wrapper (pyrefly does not model function attributes).
+    __init__.__dict__["_tpu_sp_rank_init"] = True
     return __init__
 
 
