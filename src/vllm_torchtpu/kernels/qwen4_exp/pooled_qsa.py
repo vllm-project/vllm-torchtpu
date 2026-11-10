@@ -520,6 +520,87 @@ def compressed_pairs(
     return pair, write, mask, values
 
 
+def write_compressed_pairs(pool, pair, write, mask, values):
+    """``write_compressed``'s per-pair writer for ``compressed_pairs`` outputs.
+
+    Rows are written in order, so a destination listed twice keeps its last
+    value; callers may concatenate several layers' pairs into one call.
+    """
+    packing = 4 if pool.dtype == jnp.float8_e4m3fn else 2
+    width = pool.shape[-1]
+    view = pool.reshape(-1, packing, width)
+
+    def per_pair_kernel(indices, active, row_mask, values_ref, old, updated):
+        t = pl.program_id(0)
+
+        @pl.when(active[t] != 0)
+        def store():
+            def copy(tile, semaphore):
+                target = updated.at[indices[t]]
+                bf = tile.bitcast(jnp.bfloat16) if pool.dtype != jnp.bfloat16 else tile
+                full_pair = (row_mask[t, 0] != 0) & (row_mask[t, 1] != 0)
+
+                @pl.when(full_pair)
+                def initialize_full_pair():
+                    # Both BF16 rows cover every byte in the packed carrier;
+                    # no old value is semantically observable.
+                    bf[...] = values_ref[0]
+
+                @pl.when(~full_pair)
+                def merge_partial_pair():
+                    pltpu.async_copy(target, tile, semaphore).wait()
+                    row = jnp.broadcast_to(jnp.arange(2)[:, None], (2, width))
+                    mask = jnp.where(row == 0, row_mask[t, 0], row_mask[t, 1]) != 0
+                    bf[...] = jnp.where(mask, values_ref[0], bf[...])
+
+                pltpu.async_copy(tile, target, semaphore).wait()
+
+            pl.run_scoped(
+                copy, pltpu.VMEM((packing, width), pool.dtype), pltpu.SemaphoreType.DMA
+            )
+
+    def update(view, indices, active, row_mask, rows):
+        return pl.pallas_call(
+            per_pair_kernel,
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=3,
+                grid=(len(indices),),
+                in_specs=[
+                    pl.BlockSpec((1, 2, width), lambda t, *args: (t, 0, 0)),
+                    pl.BlockSpec(memory_space=pltpu.HBM),
+                ],
+                out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+            ),
+            out_shape=jax.ShapeDtypeStruct(view.shape, view.dtype),
+            input_output_aliases={4: 0},
+        )(indices, active, row_mask, rows, view)
+
+    pair = pair.astype(jnp.int32)
+    write = write.astype(jnp.int32)
+    mask = mask.astype(jnp.int32)
+    # The compiler prefetches the rows operand into SMEM. A 4K-token step
+    # makes it 2 MiB, above v7's 1 MiB limit. Bound each write to 512 KiB.
+    bytes_per_token = 2 * width * jnp.dtype(jnp.bfloat16).itemsize
+    max_rows = max(1, (512 * 1024) // bytes_per_token)
+    chunk_size = min(len(pair), 512, 1 << (max_rows.bit_length() - 1))
+    if len(pair) <= chunk_size:
+        view = update(view, pair, write, mask, values)
+    else:
+        padding = (-len(pair)) % chunk_size
+
+        def split(x):
+            x = jnp.pad(x, ((0, padding),) + ((0, 0),) * (x.ndim - 1))
+            return x.reshape(-1, chunk_size, *x.shape[1:])
+
+        chunks = tuple(map(split, (pair, write, mask, values)))
+
+        def step(owner, inputs):
+            return update(owner, *inputs), None
+
+        view, _ = jax.lax.scan(step, view, chunks)
+    return view.reshape(pool.shape)
+
+
 def write_compressed(
     pool, keys, complete, req, logical, starts, context, table, ratio, slot=0, dcp=None
 ):
@@ -665,75 +746,7 @@ def write_compressed(
         )
         return view.reshape(pool.shape)
 
-    def per_pair_kernel(indices, active, row_mask, values_ref, old, updated):
-        t = pl.program_id(0)
-
-        @pl.when(active[t] != 0)
-        def store():
-            def copy(tile, semaphore):
-                target = updated.at[indices[t]]
-                bf = tile.bitcast(jnp.bfloat16) if pool.dtype != jnp.bfloat16 else tile
-                full_pair = (row_mask[t, 0] != 0) & (row_mask[t, 1] != 0)
-
-                @pl.when(full_pair)
-                def initialize_full_pair():
-                    # Both BF16 rows cover every byte in the packed carrier;
-                    # no old value is semantically observable.
-                    bf[...] = values_ref[0]
-
-                @pl.when(~full_pair)
-                def merge_partial_pair():
-                    pltpu.async_copy(target, tile, semaphore).wait()
-                    row = jnp.broadcast_to(jnp.arange(2)[:, None], (2, width))
-                    mask = jnp.where(row == 0, row_mask[t, 0], row_mask[t, 1]) != 0
-                    bf[...] = jnp.where(mask, values_ref[0], bf[...])
-
-                pltpu.async_copy(tile, target, semaphore).wait()
-
-            pl.run_scoped(
-                copy, pltpu.VMEM((packing, width), pool.dtype), pltpu.SemaphoreType.DMA
-            )
-
-    def update(view, indices, active, row_mask, rows):
-        return pl.pallas_call(
-            per_pair_kernel,
-            grid_spec=pltpu.PrefetchScalarGridSpec(
-                num_scalar_prefetch=3,
-                grid=(len(indices),),
-                in_specs=[
-                    pl.BlockSpec((1, 2, width), lambda t, *args: (t, 0, 0)),
-                    pl.BlockSpec(memory_space=pltpu.HBM),
-                ],
-                out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
-            ),
-            out_shape=jax.ShapeDtypeStruct(view.shape, view.dtype),
-            input_output_aliases={4: 0},
-        )(indices, active, row_mask, rows, view)
-
-    pair = pair.astype(jnp.int32)
-    write = write.astype(jnp.int32)
-    mask = mask.astype(jnp.int32)
-    # The compiler prefetches the rows operand into SMEM. A 4K-token step
-    # makes it 2 MiB, above v7's 1 MiB limit. Bound each write to 512 KiB.
-    bytes_per_token = 2 * width * jnp.dtype(jnp.bfloat16).itemsize
-    max_rows = max(1, (512 * 1024) // bytes_per_token)
-    chunk_size = min(len(keys), 512, 1 << (max_rows.bit_length() - 1))
-    if len(keys) <= chunk_size:
-        view = update(view, pair, write, mask, values)
-    else:
-        padding = (-len(keys)) % chunk_size
-
-        def split(x):
-            x = jnp.pad(x, ((0, padding),) + ((0, 0),) * (x.ndim - 1))
-            return x.reshape(-1, chunk_size, *x.shape[1:])
-
-        chunks = tuple(map(split, (pair, write, mask, values)))
-
-        def step(owner, inputs):
-            return update(owner, *inputs), None
-
-        view, _ = jax.lax.scan(step, view, chunks)
-    return view.reshape(pool.shape)
+    return write_compressed_pairs(pool, pair, write, mask, values)
 
 
 def _request_window(t0, size, starts, context):
