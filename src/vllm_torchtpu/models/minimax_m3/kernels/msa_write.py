@@ -41,8 +41,8 @@ _UINT_BY_BITS = {16: jnp.uint16, 8: jnp.uint8}
 # one-run-at-a-time pipeline (~0.5 us per run and cache in the c48 twins,
 # j-efdac848).
 _DEPTH = 4
-# Rows of a 32-bit sublane tile: row windows start at a multiple.
-_ROW_TILE = 8
+# Rows of an 8-bit sublane tile: row windows start at a multiple.
+_ROW_ALIGN = 32
 _LANES = 128
 
 
@@ -93,15 +93,17 @@ def _kernel(
     num_tokens: int,
     has_lanes: bool,
 ):
-    """In (HBM): each `Rows` target's 32-bit slot values ``[F, T, 128]``
-    (row ``t``'s lanes ``[128 f, 128 (f + 1))`` at ``[f, t]``), the lane
-    values ``[T, 128]`` (if any), then the caches; out: the caches, aliased.
+    """In (HBM): each `Rows` target's rows ``[T, W]`` as unsigned ints of its
+    slot width (8 bits for 4-bit slots), the lane values ``[T, 128]`` (if
+    any), then the caches; out: the caches, aliased.
 
     A run's tokens ``tok0 + i`` take slots ``lo + i`` of its page: slot ``s``
     reads batch row ``tok0 - lo + s``. Each run copies in a window of
-    ``S + 8`` batch rows holding all of its tokens (clamped into the batch;
-    rows past its tokens are never selected) to row ``S`` of a ``3S + 8``-row
-    buffer, so slot 0's row there is ``S + tok0 - lo - start`` >= 1."""
+    ``S + 32`` batch rows holding all of its tokens (clamped into the batch;
+    rows past its tokens are never selected), widened to 32 bits at row
+    ``S`` of a ``[W / 128, 2S + window + 8, 128]`` staging buffer (Mosaic's
+    strided loads need 32-bit 128-lane rows), so slot 0's row there is
+    ``S + tok0 - lo - start`` >= 1."""
     num_rows = sum(isinstance(s, _RowsSpec) for s in specs)
     it = iter(refs)
     words_hbm = [next(it) for _ in range(num_rows)]
@@ -110,32 +112,34 @@ def _kernel(
         next(it)
     caches = [next(it) for _ in specs]
     windows = [next(it) for _ in range(num_rows)]
+    staging = [next(it) for _ in range(num_rows)]
     lane_window = next(it) if has_lanes else None
     in_bufs = [next(it) for _ in specs]
     out_bufs = [next(it) for _ in specs]
     in_sem, out_sem = next(it), next(it)
-    window = page_size + _ROW_TILE
+    window = _window(page_size)
 
     def placement(r):
         base = run_tok0_ref[r] - run_lo_ref[r]
         start = jnp.minimum(
-            jnp.maximum(base, 0) // _ROW_TILE * _ROW_TILE, num_tokens - window
+            jnp.maximum(base, 0) // _ROW_ALIGN * _ROW_ALIGN, num_tokens - window
         )
-        return start, page_size + base - start
+        return pl.multiple_of(start, _ROW_ALIGN), page_size + base - start
 
     def in_copies(r, slot):
         start, _ = placement(r)
         page = run_page_ref[r]
         rows = pl.ds(start, window)
-        to = pl.ds(page_size, window)
         copies = [
-            pltpu.make_async_copy(w.at[:, rows], buf.at[slot, :, to], in_sem.at[slot])
+            pltpu.make_async_copy(w.at[rows], buf.at[slot], in_sem.at[slot])
             for w, buf in zip(words_hbm, windows)
         ]
         if has_lanes:
             copies.append(
                 pltpu.make_async_copy(
-                    lanes_hbm.at[rows], lane_window.at[slot, to], in_sem.at[slot]
+                    lanes_hbm.at[rows],
+                    lane_window.at[slot, pl.ds(page_size, window)],
+                    in_sem.at[slot],
                 )
             )
         copies += [
@@ -156,7 +160,7 @@ def _kernel(
         _, row0 = placement(r)
         # [lane value, slot]: the run's lane values, one row per value.
         by_slot = lane_window[slot, pl.ds(row0, page_size), :].T if has_lanes else None
-        windows_left = iter(windows)
+        windows_left = iter(zip(windows, staging))
         for spec, in_buf, out_buf in zip(specs, in_bufs, out_bufs):
             if isinstance(spec, _ValuesSpec):
                 page = in_buf[slot]
@@ -167,7 +171,14 @@ def _kernel(
                 values = pltpu.bitcast(by_slot[:rows], jnp.float32)
                 out_buf[slot] = jnp.where(take, values, page)
                 continue
-            buf = next(windows_left)
+            raw, buf = next(windows_left)
+            new_rows = raw[slot].astype(jnp.uint32)
+            if spec.bits == 4:
+                new_rows = new_rows & 0xF
+            for f in range(spec.folds):
+                buf[f, pl.ds(page_size, window)] = new_rows[
+                    :, f * _LANES : (f + 1) * _LANES
+                ]
             words = in_buf.bitcast(jnp.uint32)[slot, :, 0, :]
             rows, width = words.shape
             packing = 32 // spec.bits
@@ -181,7 +192,7 @@ def _kernel(
                 # Slots j, p + j, ...: rows at stride p.
                 new = jnp.concatenate(
                     [
-                        buf.at[slot, f][pl.ds(row0 + j, spec.data_rows, stride=packing)]
+                        buf.at[f][pl.ds(row0 + j, spec.data_rows, stride=packing)]
                         for f in range(spec.folds)
                     ],
                     axis=1,
@@ -236,9 +247,18 @@ def _kernel(
     jax.lax.fori_loop(jnp.maximum(num_runs - _DEPTH, 0), num_runs, drain, 0)
 
 
+def _window(page_size: int) -> int:
+    """Batch rows a run copies: its page's slots and the alignment slack,
+    a multiple of `_ROW_ALIGN` so that a window clamped to the batch's end
+    starts aligned too."""
+    return -(-page_size // _ROW_ALIGN) * _ROW_ALIGN + _ROW_ALIGN
+
+
 def _slot_words(target: Rows) -> tuple[jax.Array, _RowsSpec, int]:
-    """A `Rows` target's 32-bit slot values ``[T, W]``, its spec (no scale
-    lane yet) and its page's slot count."""
+    """A `Rows` target's rows ``[T, W]`` as unsigned ints of its slot width
+    (uint8 nibbles for 4-bit slots; the kernel widens a run's window to 32
+    bits, so XLA moves the rows at their own width), its spec (no scale lane
+    yet) and its page's slot count."""
     cache = target.cache
     _, rows_per_page, word_bytes, width = cache.shape
     bits = target.bits or 32 // word_bytes
@@ -252,11 +272,9 @@ def _slot_words(target: Rows) -> tuple[jax.Array, _RowsSpec, int]:
     if width % _LANES:
         raise ValueError(f"cache rows must be whole 128-lane blocks, got {cache.shape}")
     if bits == 4:
-        words = target.rows.astype(jnp.uint32) & 0xF
+        words = target.rows.astype(jnp.uint8)
     else:
-        words = jax.lax.bitcast_convert_type(target.rows, _UINT_BY_BITS[bits]).astype(
-            jnp.uint32
-        )
+        words = jax.lax.bitcast_convert_type(target.rows, _UINT_BY_BITS[bits])
     data_rows = rows_per_page - 1 if folded else rows_per_page
     spec = _RowsSpec(bits, width // _LANES, data_rows, None)
     return words, spec, data_rows * 32 // bits
@@ -319,12 +337,10 @@ def write_runs(
     has_lanes = lane_values is not None or bool(scale_lanes)
     if has_lanes and page_size != _LANES:
         raise ValueError(f"per-slot values need {_LANES}-slot pages, got {page_size}")
-    window = page_size + _ROW_TILE
-    padded = max(-(-num_tokens // _ROW_TILE) * _ROW_TILE, window)
+    window = _window(page_size)
+    padded = max(-(-num_tokens // _ROW_ALIGN) * _ROW_ALIGN, window)
     pad = ((0, padded - num_tokens), (0, 0))
-    inputs = [
-        jnp.pad(w, pad).reshape(padded, -1, _LANES).transpose(1, 0, 2) for w in words
-    ]
+    inputs = [jnp.pad(w, pad) for w in words]
     if has_lanes:  # one elementwise fusion: no column concatenates
         if lane_values is None:
             lanes = jnp.zeros((num_tokens, _LANES), jnp.uint32)
@@ -335,28 +351,22 @@ def write_runs(
             lanes = jnp.where(lane == i, bits[:, None], lanes)
         inputs.append(jnp.pad(lanes, pad))
     caches = [t.cache for t in targets]
-    buffer_rows = 3 * page_size + _ROW_TILE
-    scratch = [
-        pltpu.VMEM((_DEPTH, s.folds, buffer_rows, _LANES), jnp.uint32)
-        for s in specs
-        if isinstance(s, _RowsSpec)
+    buffer_rows = 2 * page_size + window + 8
+    scratch = [pltpu.VMEM((_DEPTH, window) + w.shape[1:], w.dtype) for w in words]
+    scratch += [
+        pltpu.VMEM((w.shape[1] // _LANES, buffer_rows, _LANES), jnp.uint32)
+        for w in words
     ]
     if has_lanes:
         scratch.append(pltpu.VMEM((_DEPTH, buffer_rows, _LANES), jnp.uint32))
     pages_scratch = [pltpu.VMEM((_DEPTH,) + c.shape[1:], c.dtype) for c in caches]
     scratch += pages_scratch + pages_scratch
     scratch += [pltpu.SemaphoreType.DMA((_DEPTH,))] * 2
-    vmem_bytes = (
-        sum(
-            _DEPTH
-            * buffer_rows
-            * _LANES
-            * 4
-            * (s.folds if isinstance(s, _RowsSpec) else 0)
-            for s in specs
-        )
-        + _DEPTH * buffer_rows * _LANES * 4 * has_lanes
+    vmem_bytes = sum(
+        (_DEPTH * window * w.dtype.itemsize + buffer_rows * 4) * w.shape[1]
+        for w in words
     )
+    vmem_bytes += _DEPTH * buffer_rows * _LANES * 4 * has_lanes
     vmem_bytes += 2 * sum(_DEPTH * c[0].size * c.dtype.itemsize for c in caches)
     any_spec = pl.BlockSpec(memory_space=pl.ANY)
     first_cache = 5 + len(inputs)

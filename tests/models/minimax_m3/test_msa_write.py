@@ -266,3 +266,29 @@ def test_write_runs_targets_match_single_writes(q_lens, ctx_lens, pad_tokens):
     ]
     for g, e in zip(got, expected):
         np.testing.assert_array_equal(np.asarray(g), np.asarray(e))
+
+
+def test_small_pages_match_xla_scatter():
+    """16-slot pages (the TP index shards'): run windows round up to the
+    row alignment and clamp at the batch's end."""
+    page, num_pages = 16, 40
+    rng = np.random.default_rng(16)
+    q_lens, ctx_lens = [70, 3, 29], [5, 30, 0]
+    perm = rng.permutation(np.arange(1, num_pages))
+    pages, pos, used = [], [], 0
+    for q, c in zip(q_lens, ctx_lens):
+        n = -(-(q + c) // page)
+        p = np.arange(c, c + q)
+        pages.append(perm[used : used + n][p // page])
+        pos.append(p)
+        used += n
+    pages = jnp.asarray(np.concatenate(pages + [[DROPPED] * 2]), jnp.int32)
+    pos = jnp.asarray(np.concatenate(pos + [[0, 0]]), jnp.int32)
+    dtype = jnp.float8_e4m3fn
+    cache = pack(rng.standard_normal((num_pages, page, 128)).astype(np.float32), dtype)
+    rows = jnp.asarray(rng.standard_normal((pages.shape[0], 128))).astype(jnp.bfloat16)
+    expected = msa.write_rows_xla(cache, rows, pages, pos)
+    got = msa.write_rows(cache, rows, pages, pos, max_num_seqs=3, interpret=True)
+    np.testing.assert_array_equal(
+        np.asarray(got.astype(jnp.float32)), np.asarray(expected.astype(jnp.float32))
+    )
