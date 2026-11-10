@@ -137,15 +137,45 @@ def test_vote_codes_add_a_plugin_s_codes_before_other(fake_tp_group: Any) -> Non
     assert agreement_mod._decline_vote(mine, codes) == codes.index("my_code") + 1
 
 
-def test_declined_driver_joins_the_bind_agreement(fake_tp_group: Any) -> None:
+def test_declined_driver_joins_the_bind_agreement(
+    fake_tp_group: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import logging
     from types import SimpleNamespace
 
+    monkeypatch.setattr(logging.getLogger("vllm"), "propagate", True)
     g = fake_tp_group([0])
     dd = agreement_mod.DeclinedDriver(
-        EligibilityResult(False, "pallas_mesh_unavailable", "m")
+        EligibilityResult(False, "pallas_mesh_unavailable", "m"),
+        display_name="Toy",
     )
-    dd.bind_and_warmup(SimpleNamespace())
+    with caplog.at_level(logging.INFO):
+        dd.bind_and_warmup(SimpleNamespace())
     assert g.calls == 1
+    assert len(caplog.records) == 1
+    assert caplog.records[0].levelno == logging.WARNING
+    assert "Toy megakernel declined (pallas_mesh_unavailable): m" in caplog.text
+
+    # Non-zero TP ranks join the agreement without duplicating the log, and
+    # info-level declines stay at INFO on rank 0.
+    caplog.clear()
+    dd_r1 = agreement_mod.DeclinedDriver(
+        EligibilityResult(False, "pallas_mesh_unavailable", "m"), tp_rank=1
+    )
+    with caplog.at_level(logging.INFO):
+        dd_r1.bind_and_warmup(SimpleNamespace())
+    assert g.calls == 2 and not caplog.records
+
+    dd_info = agreement_mod.DeclinedDriver(
+        EligibilityResult(False, "empty_buckets", "off", "info"),
+        display_name="Toy",
+    )
+    with caplog.at_level(logging.INFO):
+        dd_info.bind_and_warmup(SimpleNamespace())
+    assert len(caplog.records) == 1
+    assert caplog.records[0].levelno == logging.INFO
 
 
 def test_declined_driver_counts_stock_steps(
@@ -158,14 +188,6 @@ def test_declined_driver_counts_stock_steps(
 
     from vllm_torchtpu.megakernel.adapter import hooks, testing
 
-    try:
-        agreement_mod.logger._resolve()
-    except ModuleNotFoundError:
-        monkeypatch.setattr(
-            agreement_mod.logger,
-            "_logger",
-            logging.getLogger(agreement_mod.logger._name),
-        )
     monkeypatch.setattr(logging.getLogger("vllm"), "propagate", True)
     dd = agreement_mod.DeclinedDriver(
         EligibilityResult(False, "pallas_mesh_unavailable", "m"),

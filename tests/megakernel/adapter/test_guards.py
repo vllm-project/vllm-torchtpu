@@ -132,51 +132,6 @@ def test_kv_connector_names_share_one_helper() -> None:
     assert guards_mod.kv_connector_names(None) == ()
 
 
-def _mm_cfg(lm_only: bool = False, limits: dict[str, Any] | None = None) -> Any:
-    return SimpleNamespace(language_model_only=lm_only, limit_per_prompt=limits or {})
-
-
-@pytest.mark.parametrize(
-    "supports, mm, possible",
-    [
-        (False, None, False),
-        (True, None, True),
-        (True, _mm_cfg(), True),
-        (True, _mm_cfg(lm_only=True), False),
-        (True, _mm_cfg(limits={"image": 0, "video": 0}), False),
-        (
-            True,
-            _mm_cfg(limits={"image": {"count": 0}, "video": SimpleNamespace(count=0)}),
-            False,
-        ),
-        (True, _mm_cfg(limits={"image": 1, "video": 0}), True),
-    ],
-)
-def test_multimodal_inputs_possible(supports: bool, mm: Any, possible: bool) -> None:
-    runner = testing.fake_runner(supports_mm_inputs=supports, multimodal_config=mm)
-    assert guards_mod._multimodal_inputs_possible(runner) is possible
-
-
-def test_kv_offload_on_a_text_only_server_is_not_a_multimodal_decline() -> None:
-    """vLLM 0.32 turns on `enable_mm_embeds` for a `kv_both` offload
-    connector, so a language-model-only server reports
-    `supports_mm_inputs=True`; the megakernel still serves it. A server that
-    really accepts multimodal inputs still declines."""
-    offload = _kv("TPURaidenOffloadingConnector")
-    text_only = _mm_cfg(lm_only=True, limits={"image": 0, "video": 0})
-    runner = testing.fake_runner(
-        kv_transfer_config=offload, supports_mm_inputs=True, multimodal_config=text_only
-    )
-    assert guards_mod.check_runner_features(runner, _QWEN_CAPS) is None
-    runner = testing.fake_runner(
-        kv_transfer_config=offload,
-        supports_mm_inputs=True,
-        multimodal_config=_mm_cfg(limits={"image": 1, "video": 0}),
-    )
-    res = guards_mod.check_runner_features(runner, _QWEN_CAPS)
-    assert res is not None and res.code == "multimodal_inputs"
-
-
 @pytest.mark.parametrize(
     "kw, code, cap",
     [
@@ -310,11 +265,12 @@ def test_chip_and_tp_size_guards(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "(8,)" in res.message
     assert _check(runner, tp_sizes=(1, 8)) is None
     # Chip before TP size before parallelism.
-    runner.parallel_config.data_parallel_size = 2
+    runner.parallel_config.decode_context_parallel_size = 2
     assert _check(runner, chips=("TPU7x",), tp_sizes=(8,)).code == (
         "unsupported_tpu_chip"
     )
     assert _check(runner, tp_sizes=(8,)).code == "unsupported_tp_size"
+    assert _check(runner).code == "parallelism_unsupported:dcp"
 
 
 @pytest.mark.parametrize(

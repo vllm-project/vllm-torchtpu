@@ -13,9 +13,8 @@
 # limitations under the License.
 """Step routing: the batch shape a step is inspected as, `try_forward`
 (suppression, the step context, unconsumed model inputs), the routing
-decision with its declines, the `can_run` / `__call__` hand-off, the
-text-token promotion, the A/B calibrator's arms, and the runner shapes a
-bucket is warmed up with."""
+decision with its declines, the `can_run` / `__call__` hand-off, the A/B
+calibrator's arms, and the runner shapes a bucket is warmed up with."""
 
 from __future__ import annotations
 
@@ -311,10 +310,9 @@ class _Driver(stepping.StepRouting):
         ab: bool = False,
         bound: bool = True,
         backbone: Any = None,
-        text_embeds: bool = False,
     ) -> None:
         self.program, self.tp_rank, self._display_name = program, 0, "Stub"
-        self._backbone, self._text_embeds = backbone, text_embeds
+        self._backbone = backbone
         self._steps, self._bound = {(1, 4): lambda x: x}, bound
         self._pending = self._inspect = self._inspect_runner = None
         self.step_mix_tracker = StepMixTracker(period_s=3600.0)
@@ -474,30 +472,3 @@ def test_ab_alternates_the_arms_of_an_eligible_key(fwd_ctx: None) -> None:
     assert len(runner.stock_calls) == 1
     assert drv.step_mix_tracker.counts == {"mk_t1_b4_ab_mk": 1, "mk_t1_b4_ab_stock": 1}
     assert set(drv.ab_calibrator._cumulative["mk_t1_b4_p3"]) == {"mk", "stock"}
-
-
-@pytest.mark.parametrize(
-    ("text_embeds", "token_ids", "served"),
-    [(True, True, True), (False, True, False), (True, False, False)],
-)
-def test_text_embeds_step_is_served_from_its_token_ids(
-    fwd_ctx: None, text_embeds: bool, token_ids: bool, served: bool
-) -> None:
-    """With `_text_embeds`, a step the runner embedded from text tokens alone
-    is served from `ctx.token_ids`; otherwise `inputs_embeds` sends it to the
-    stock model."""
-    prog = _Program(_MK)
-    drv = _Driver(prog, text_embeds=text_embeds)
-    ctx = StepContext(
-        None,
-        _POS,
-        inputs_embeds=torch.zeros(3, 2),
-        token_ids=_IDS if token_ids else None,
-    )
-    hit, out = drv.try_forward(_stock_runner(), ctx)
-    if served:
-        assert hit and torch.equal(out, _IDS.float() * 10)
-        seen = prog.calls[0][1]
-        assert seen.input_ids is _IDS and seen.inputs_embeds is None
-    else:
-        assert (hit, out) == (False, None) and prog.calls == []

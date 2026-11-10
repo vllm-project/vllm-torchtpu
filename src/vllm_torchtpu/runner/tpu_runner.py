@@ -3994,15 +3994,6 @@ class TPUModelRunner(GPUModelRunner):
                 chunk_mm_inputs = (chunk_embeds, is_mm_chunk)
 
             self._record_input_staging_fence()
-            # The megakernel serves from token ids: hand them over when a
-            # multimodal-capable model embeds this chunk's text tokens alone.
-            mk_token_ids = None
-            if (
-                self._megakernel is not None
-                and self.supports_mm_inputs
-                and not (chunk_mm_inputs is not None and chunk_mm_inputs[0])
-            ):
-                mk_token_ids = input_ids
             if self._pp_is_first:
                 input_ids, inputs_embeds = self._get_model_inputs(
                     input_ids, chunk_mm_inputs
@@ -4087,7 +4078,6 @@ class TPUModelRunner(GPUModelRunner):
                     positions=self.position_ids,
                     inputs_embeds=inputs_embeds,
                     intermediate_tensors=intermediate_tensors,
-                    megakernel_token_ids=mk_token_ids,
                 )
 
             if nan_check is not None:
@@ -7739,7 +7729,6 @@ class TPUModelRunner(GPUModelRunner):
         positions,
         inputs_embeds=None,
         intermediate_tensors=None,
-        megakernel_token_ids=None,
     ):
         hit, out = False, None
         if self._megakernel is not None:
@@ -7752,7 +7741,6 @@ class TPUModelRunner(GPUModelRunner):
                     positions=positions,
                     inputs_embeds=inputs_embeds,
                     intermediate_tensors=intermediate_tensors,
-                    token_ids=megakernel_token_ids,
                 ),
             )
 

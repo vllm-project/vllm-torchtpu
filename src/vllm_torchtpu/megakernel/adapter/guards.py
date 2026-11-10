@@ -17,7 +17,6 @@ config, before `create`. Config and local device facts only: no collective."""
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from typing import Any
 
 from vllm_torchtpu import _OFFLOADING_CONNECTORS
@@ -95,45 +94,6 @@ def _runner_backbone(runner: Any) -> Any:
 
 def _decline(code: str, detail: str) -> EligibilityResult:
     return EligibilityResult(False, code, f"Megakernel {detail}; skipping.")
-
-
-def _mm_limit_count(limit: Any) -> int:
-    """Item count of one `limit_mm_per_prompt` entry (an int, or vLLM's
-    per-modality options object / dict with a `count`)."""
-    if isinstance(limit, Mapping):
-        limit = limit.get("count", 1)
-    else:
-        limit = getattr(limit, "count", limit)
-    try:
-        return int(limit)
-    except (TypeError, ValueError):
-        return 1
-
-
-def _multimodal_inputs_possible(runner: Any) -> bool:
-    """Whether a request on this server can carry multimodal inputs.
-
-    `runner.supports_mm_inputs` alone over-reports: vLLM 0.32 turns on
-    `enable_mm_embeds` for every KV connector with a consumer role (CPU KV
-    offload uses `kv_role="kv_both"`), which makes a language-model-only
-    server look multimodal. Inputs can't occur when the model config is
-    language-model-only or every `limit_mm_per_prompt` entry is 0; the
-    per-step `inputs_embeds` check (`ProgramDriver._text_ctx`) stays as the
-    safety net either way.
-    """
-    if not bool(getattr(runner, "supports_mm_inputs", False)):
-        return False
-    vcfg = getattr(runner, "vllm_config", None)
-    m_cfg = getattr(vcfg, "model_config", None) or getattr(runner, "model_config", None)
-    mm_cfg = getattr(m_cfg, "multimodal_config", None)
-    if mm_cfg is None:
-        return True
-    if bool(getattr(mm_cfg, "language_model_only", False)):
-        return False
-    limits = getattr(mm_cfg, "limit_per_prompt", None)
-    if isinstance(limits, Mapping) and limits:
-        return any(_mm_limit_count(v) > 0 for v in limits.values())
-    return True
 
 
 _PARALLELISM_DETAIL = {
@@ -247,7 +207,8 @@ def check_runner_features(
     caps = frozenset(features)
     rules: list[tuple[bool, str, str]] = [
         (
-            _multimodal_inputs_possible(runner) and "multimodal" not in caps,
+            bool(getattr(runner, "supports_mm_inputs", False))
+            and "multimodal" not in caps,
             "multimodal_inputs",
             "requires text-only input_ids (multimodal inputs)",
         ),

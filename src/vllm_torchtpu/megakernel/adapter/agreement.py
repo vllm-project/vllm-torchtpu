@@ -179,12 +179,14 @@ class DeclinedDriver:
         # Join the bind-time agreement the serving drivers on other ranks run.
         group = agreement_group(self._domain, runner)
         agree_on_decline(self.decline, group=group, codes=self._codes)
-        logger.warning(
-            "%s megakernel declined (%s): %s",
-            self._display_name,
-            self.decline.code,
-            self.decline.message,
-        )
+        if self.tp_rank == 0:
+            log = logger.info if self.decline.level == "info" else logger.warning
+            log(
+                "%s megakernel declined (%s): %s",
+                self._display_name,
+                self.decline.code,
+                self.decline.message,
+            )
 
     def reset_stats(self) -> None:
         self.step_mix_tracker.reset()

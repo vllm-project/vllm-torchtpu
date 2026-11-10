@@ -48,7 +48,6 @@ from vllm_torchtpu.megakernel.adapter.fingerprint import (
     source_hash,
 )
 from vllm_torchtpu.megakernel.adapter.guards import (
-    _multimodal_inputs_possible,
     _runner_backbone,
     check_runner_features,
     check_spec,
@@ -77,8 +76,7 @@ logger = init_logger(__name__)
 _VLLM_STARTUP_MESSAGES: dict[str, str] = {
     "multimodal_inputs": (
         "Megakernel serves text-only requests, and this server accepts "
-        "multimodal inputs; pass --language-model-only (or "
-        '--limit-mm-per-prompt \'{"image":0,"video":0}\') for text-only '
+        "multimodal inputs; pass --language-model-only for text-only "
         "serving; skipping."
     ),
     "lora_enabled": "Megakernel does not support LoRA adapters; skipping.",
@@ -267,14 +265,10 @@ class ProgramDriver(StepRouting):
         fingerprint: str = "",
         codes: Sequence[str] = DECLINE_VOTE_CODES,
         backbone: Any = None,
-        text_embeds: bool = False,
         domain: str = DOMAIN_TP,
     ) -> None:
         self.program, self.view = program, view
         self._domain = domain
-        # The runner embeds text tokens for a multimodal-capable model that
-        # can't receive multimodal inputs here (see `_text_ctx`).
-        self._text_embeds = bool(text_embeds)
         self.tp_rank = int(tp_rank)
         self._display_name = str(getattr(program, "display_name", "") or "megakernel")
         self.fingerprint = fingerprint
@@ -398,8 +392,6 @@ class ProgramDriver(StepRouting):
             fingerprint=fprint,
             codes=codes,
             backbone=_runner_backbone(runner),
-            text_embeds=bool(getattr(runner, "supports_mm_inputs", False))
-            and not _multimodal_inputs_possible(runner),
             domain=domain,
         )
 

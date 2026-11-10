@@ -17,7 +17,6 @@ step-mix log; plus the runner input shapes a bucket is warmed up with."""
 
 from __future__ import annotations
 
-import dataclasses
 import functools
 import time
 from collections.abc import Sequence
@@ -176,8 +175,6 @@ class StepRouting:
     _inspect_runner: Any
     step_mix_tracker: _stats.StepMixTracker
     ab_calibrator: _stats.MKABCalibrator
-    # See `_text_ctx`; the driver sets it per instance from the runner.
-    _text_embeds = False
 
     @classmethod
     def _inspect_step_detail(
@@ -210,20 +207,6 @@ class StepRouting:
         """Return `True` if the current forward step should run on the megakernel."""
         ctx = StepContext(input_ids, positions, inputs_embeds, intermediate_tensors)
         return self._route(ctx, runner)
-
-    def _text_ctx(self, ctx: StepContext) -> StepContext:
-        """The step as the megakernel sees it: from its token ids when the
-        runner built `inputs_embeds` from text tokens alone (`ctx.token_ids`
-        set) on a server that can't receive multimodal inputs. Otherwise the
-        step is unchanged, and `inputs_embeds` sends it to the stock model."""
-        if (
-            self._text_embeds
-            and ctx.input_ids is None
-            and ctx.inputs_embeds is not None
-            and ctx.token_ids is not None
-        ):
-            return dataclasses.replace(ctx, input_ids=ctx.token_ids, inputs_embeds=None)
-        return ctx
 
     def _route(self, ctx: StepContext, runner: Any) -> bool:
         self._pending = None
@@ -313,13 +296,12 @@ class StepRouting:
         input_ids, positions = ctx.input_ids, ctx.positions
         inputs_embeds = ctx.inputs_embeds
         intermediate_tensors = ctx.intermediate_tensors
-        mk_ctx = self._text_ctx(ctx)
-        use_mk = self._route(mk_ctx, runner)
+        use_mk = self._route(ctx, runner)
         ab_t0 = time.perf_counter() if self.ab_calibrator.enabled else None
         if use_mk:
-            assert mk_ctx.input_ids is not None and positions is not None
+            assert input_ids is not None and positions is not None
             num_tok = int(positions.shape[-1])
-            out = self(mk_ctx.input_ids, positions, num_tokens=num_tok, runner=runner)
+            out = self(input_ids, positions, num_tokens=num_tok, runner=runner)
             if ab_t0 is not None:
                 if getattr(getattr(runner, "device", None), "type", None) == "tpu":
                     from vllm_torchtpu.utils import synchronize_tensors

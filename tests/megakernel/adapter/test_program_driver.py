@@ -367,41 +367,6 @@ def _spec(**kw: Any) -> TpuMonoSpec:
     return TpuMonoSpec("t", "1", create="m:c", **kw)
 
 
-def _mm_cfg(lm_only: bool = False, limits: dict[str, Any] | None = None) -> Any:
-    return SimpleNamespace(language_model_only=lm_only, limit_per_prompt=limits or {})
-
-
-def test_text_only_server_serves_from_token_ids(
-    toy: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """With `supports_mm_inputs=True` the runner feeds the stock model
-    `inputs_embeds`; on a text-only server the megakernel serves the step
-    from `ctx.token_ids`, and without them (multimodal embeddings in the
-    step) the step stays on the stock model."""
-    _no_group(monkeypatch)
-    _fwd_ctx(monkeypatch)
-    runner = _runner(
-        {"scale": 3.0},
-        supports_mm_inputs=True,
-        multimodal_config=_mm_cfg(lm_only=True),
-    )
-    drv = driver_mod.ProgramDriver.maybe_create(runner)
-    assert isinstance(drv, driver_mod.ProgramDriver) and drv._text_embeds
-    runner._megakernel = drv
-    drv.bind_and_warmup(runner)
-    ids = torch.arange(3, dtype=torch.int32)
-    emb = torch.zeros(3, 4)
-    pos = torch.zeros(3)
-    hit, out = drv.try_forward(runner, StepContext(None, pos, emb, token_ids=ids))
-    assert hit and torch.equal(out, ids.float() * 3.0 + 4)
-    assert drv.try_forward(runner, StepContext(None, pos, emb)) == (False, None)
-    assert drv.step_mix_tracker.counts == {"mk_t1_b4": 1}
-    # A driver for a server that may get multimodal inputs never swaps.
-    drv._text_embeds = False
-    ctx = StepContext(None, pos, emb, token_ids=ids)
-    assert drv.try_forward(runner, ctx) == (False, None)
-
-
 def test_unknown_requires_key_fails_at_spec_load(
     toy: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
