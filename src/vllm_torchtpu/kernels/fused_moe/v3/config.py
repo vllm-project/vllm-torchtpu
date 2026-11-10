@@ -69,6 +69,9 @@ SCATTER_RING_DEFAULT = 4
 # Tokens per grid step of the combine's weighted sum, and its token loop's
 # unroll.
 COMBINE_TOKENS_PER_TILE_DEFAULT = 128
+# Config.compact_message: the most rows per shard whose routing message is
+# compacted, and the message's tokens per top-k slot then (half a lane row).
+COMPACT_MESSAGE_TOKENS = LANES // 2
 COMBINE_UNROLL_DEFAULT = 32
 # Columns of the intermediate the FFN kernel activates and requantizes per
 # pass, so the live bf16 intermediate stays small.
@@ -210,6 +213,18 @@ class Config:
       sort_index_compare: the sorted-rows gather's live-row mask as one
         compare of every row against the (expert, shard) runs, instead
         of two scatter-adds and a running sum. The same mask.
+      compact_message: a shard of at most COMPACT_MESSAGE_TOKENS rows
+        sends a routing message of that many tokens per top-k slot rather
+        than a whole 128-lane row per slot: the select still runs on the
+        128-token block, and its per-slot index rows are cut to the
+        message's tokens and laid end to end. The routed pairs per shard
+        halve (DP4xTP2 decode at 48-64 rows per core: 1280 -> 640 real
+        and padding slots, 2048 -> 1024 after the tables' step padding),
+        and so do the shard-tables and row-tables programs' pair work. The
+        pairs keep their order (slot-major, then token), so every table,
+        the expert kernel's rows and the combine are the same: the output
+        is bit-identical. Routing handed in by the caller is not
+        compacted.
     """
 
     result_slots: int = RESULT_SLOTS_DEFAULT
@@ -241,6 +256,7 @@ class Config:
     sorted_rows: object = None
     combine_real_tokens: bool = False
     sort_index_compare: bool = False
+    compact_message: bool = False
 
     @property
     def token_dtype(self):
