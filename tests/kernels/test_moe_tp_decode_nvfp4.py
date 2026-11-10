@@ -18,6 +18,7 @@ Covers:
 import functools
 import importlib
 import importlib.util
+import inspect
 import pathlib
 import sys
 import types
@@ -1848,6 +1849,76 @@ def _ensure_layers_core_pkg(monkeypatch):
     return sys.modules[mod_name]
 
 
+def _new_routed_experts(rt, cls):
+    """A ``RoutedExperts`` (or subclass) instance without running its constructor.
+
+    vLLM's ``RoutedExperts.__init__`` needs the full layer arguments; the tests
+    only need a bare module whose attributes they set themselves.
+    """
+    layer = cls.__new__(cls)
+    rt.torch.nn.Module.__init__(layer)
+    return layer
+
+
+def _set_runner_quant_method(runner, quant_method):
+    """Point ``runner._quant_method`` at ``quant_method``.
+
+    vLLM's ``MoERunner._quant_method`` is a read-only property that returns
+    ``routed_experts.quant_method``; the pure-JAX fallback runner stores it as a
+    plain attribute.
+    """
+    if isinstance(
+        inspect.getattr_static(type(runner), "_quant_method", None), property
+    ):
+        # vLLM's MoERunner._fused_output_is_reduced reads quant_method.moe_kernel,
+        # which FusedMoEMethodBase.__init__ sets; methods built without it get
+        # the default here.
+        if not hasattr(quant_method, "moe_kernel"):
+            quant_method.moe_kernel = None
+        routed = getattr(runner, "routed_experts", None)
+        if routed is None:
+            runner.routed_experts = SimpleNamespace(quant_method=quant_method)
+        else:
+            routed.quant_method = quant_method
+    else:
+        runner._quant_method = quant_method
+    assert runner._quant_method is quant_method
+
+
+def _set_runner_shared_experts(runner, shared):
+    """Set the runner's shared experts. vLLM's ``MoERunner.shared_experts`` is a
+    read-only property over ``_shared_experts``; the fallback runner has none."""
+    runner._shared_experts = shared
+    attr = inspect.getattr_static(type(runner), "shared_experts", None)
+    if not (isinstance(attr, property) and attr.fset is None):
+        runner.shared_experts = shared
+
+
+def _scalar(x) -> float:
+    """Value of a one-element real or fallback tensor."""
+    try:
+        return float(x)
+    except TypeError:
+        return float(np.asarray(x._arr).reshape(-1)[0])
+
+
+def _f32_vec(t, value):
+    """One-element float32 tensor, real torch or the fallback ``Tensor``."""
+    if hasattr(t, "tensor"):
+        return t.tensor([float(value)], dtype=t.float32)
+    return t.Tensor(np.array([float(value)], dtype=np.float32), dtype=t.float32)
+
+
+def _zeros_fp4(t, *shape):
+    """Zero ``float4_e2m1fn_x2`` tensor. Real torch has no CPU fill kernel for
+    that dtype, so build it as zero bytes and reinterpret; the pure-JAX fallback
+    torch creates it directly."""
+    try:
+        return t.zeros(*shape, dtype=t.float4_e2m1fn_x2)
+    except NotImplementedError:
+        return t.zeros(*shape, dtype=t.uint8).view(t.float4_e2m1fn_x2)
+
+
 def _load_runtime_modules(monkeypatch):
     """Load real ``nvfp4``, ``moe_runner``, and ``moe_tp_decode_nvfp4`` modules.
 
@@ -2368,7 +2439,7 @@ def _make_nvfp4_moe_layer(
     class _Layer(rt.nvfp4.RoutedExperts):
         pass
 
-    layer = _Layer()
+    layer = _new_routed_experts(rt, _Layer)
     layer.activation = "silu"
     layer.expert_placement_strategy = "linear"
     layer.global_num_experts = e * (ep_size if use_ep else 1)
@@ -2525,7 +2596,7 @@ def test_nvfp4_prepare_moe_weights_flag_off_vs_on(monkeypatch):
     assert tuple(layer_ep2.w13_weight_scale.shape) == (2, 12, 1, 1024)
     assert tuple(layer_ep2.w2_weight.shape) == (2, 512, 3072)
     assert tuple(layer_ep2.w2_weight_scale.shape) == (2, 1, 1, 6144)
-    assert int(layer_ep2._experts_start._arr) == 2
+    assert _scalar(layer_ep2._experts_start) == 2
 
     # 4. Flag ON when MOE_REQUANTIZE_BLOCK_SIZE is unset: defaults block to 512
     #    so both TP8 (512/256) and EP2xTP4 (512/512) still prepare unpadded
@@ -2626,7 +2697,7 @@ def test_moe_runner_fused_output_is_reduced_and_should_arm(monkeypatch):
     assert adapter.moe_tp_decode_nvfp4_supported(qm) is False
 
     runner: Any = VllmMoERunner.__new__(VllmMoERunner)
-    runner._quant_method = qm
+    _set_runner_quant_method(runner, qm)
     runner.moe_config = SimpleNamespace(skip_final_all_reduce=False)
     monkeypatch.setenv("USE_MOE_FUSED_EP_KERNEL", "0")
     assert runner._fused_output_is_reduced is False
@@ -2685,10 +2756,10 @@ def test_arm_target_nvfp4_and_refuse_bf16_drafter(monkeypatch):
     )
 
     def _build_runner(layer_name: str, quant_method):
-        layer = rt.nvfp4.RoutedExperts()
+        layer = _new_routed_experts(rt, rt.nvfp4.RoutedExperts)
         layer.quant_method = quant_method
-        layer.w13_weight = t.zeros(256, 6144, 256, dtype=t.float4_e2m1fn_x2)
-        layer.w2_weight = t.zeros(256, 256, 3072, dtype=t.float4_e2m1fn_x2)
+        layer.w13_weight = _zeros_fp4(t, 256, 6144, 256)
+        layer.w2_weight = _zeros_fp4(t, 256, 256, 3072)
         layer.w13_weight_scale = t.ones(256, 12, 1, 512, dtype=t.float32)
         layer.w2_weight_scale = t.ones(256, 1, 1, 6144, dtype=t.float32)
         layer.e_score_correction_bias = t.zeros(256, dtype=t.float32)
@@ -2705,7 +2776,7 @@ def test_arm_target_nvfp4_and_refuse_bf16_drafter(monkeypatch):
         t.nn.Module.__init__(r)
         r.layer_name = layer_name
         r.routed_experts = layer
-        r._quant_method = quant_method
+        _set_runner_quant_method(r, quant_method)
         r.moe_config = SimpleNamespace(
             experts_per_token=8,
             is_sequence_parallel=False,
@@ -2725,8 +2796,7 @@ def test_arm_target_nvfp4_and_refuse_bf16_drafter(monkeypatch):
         r.routed_output_transform = None
         r.router = object()
         r.routed_scaling_factor = 2.5
-        r._shared_experts = "shared_mlp"
-        r.shared_experts = "shared_mlp"
+        _set_runner_shared_experts(r, "shared_mlp")
         return r
 
     nvfp4_qm = rt.nvfp4.VllmNvfp4MoEMethod(
@@ -2800,17 +2870,13 @@ def test_arm_ep2_tp4_and_forward_dispatch(monkeypatch):
     monkeypatch.setattr(
         adapter.fp8_decode,
         "_rank_tensor",
-        lambda _dev, r: t.Tensor(
-            np.array([float(r)], dtype=np.float32), dtype=t.float32
-        ),
+        lambda _dev, r: _f32_vec(t, r),
         raising=False,
     )
     monkeypatch.setattr(
         adapter.fp8_decode,
         "_e0_tensor",
-        lambda _dev, e0: t.Tensor(
-            np.array([float(e0)], dtype=np.float32), dtype=t.float32
-        ),
+        lambda _dev, e0: _f32_vec(t, e0),
         raising=False,
     )
     shared_tensors = (
@@ -2850,11 +2916,11 @@ def test_arm_ep2_tp4_and_forward_dispatch(monkeypatch):
         )
         qm._tpu_activation_str = "silu"
 
-        layer = rt.nvfp4.RoutedExperts()
+        layer = _new_routed_experts(rt, rt.nvfp4.RoutedExperts)
         layer.quant_method = qm
         # EP2xTP4: El=128, I_rank=512 (packed 256), b13=512 (12 blk), b2=512 (1 blk)
-        layer.w13_weight = t.zeros(local_experts, 6144, 512, dtype=t.float4_e2m1fn_x2)
-        layer.w2_weight = t.zeros(local_experts, 512, 3072, dtype=t.float4_e2m1fn_x2)
+        layer.w13_weight = _zeros_fp4(t, local_experts, 6144, 512)
+        layer.w2_weight = _zeros_fp4(t, local_experts, 512, 3072)
         layer.w13_weight_scale = t.ones(local_experts, 12, 1, 1024, dtype=t.float32)
         layer.w2_weight_scale = t.ones(local_experts, 1, 1, 6144, dtype=t.float32)
         layer.e_score_correction_bias = t.zeros(global_experts, dtype=t.float32)
@@ -2881,7 +2947,7 @@ def test_arm_ep2_tp4_and_forward_dispatch(monkeypatch):
         t.nn.Module.__init__(r)
         r.layer_name = "model.layers.3.mlp"
         r.routed_experts = layer
-        r._quant_method = qm
+        _set_runner_quant_method(r, qm)
         r.moe_config = SimpleNamespace(
             experts_per_token=8,
             is_sequence_parallel=False,
@@ -2897,8 +2963,7 @@ def test_arm_ep2_tp4_and_forward_dispatch(monkeypatch):
         r.routed_output_transform = None
         r.router = object()
         r.routed_scaling_factor = 2.5
-        r._shared_experts = "shared_mlp"
-        r.shared_experts = "shared_mlp"
+        _set_runner_shared_experts(r, "shared_mlp")
         return r, qm, layer
 
     # 1. Refusal when ep_size * tp_size != n_ranks or local_E * ep_size != global_E.
@@ -2951,8 +3016,8 @@ def test_arm_ep2_tp4_and_forward_dispatch(monkeypatch):
     assert r_ep1._shared_experts is None
     assert r_ep1.routed_scaling_factor == 1.0
     assert r_ep1._fused_output_is_reduced is True
-    assert float(layer_ep1._moe_tp_decode_nvfp4_rank._arr[0]) == 5.0
-    assert float(layer_ep1._moe_tp_decode_nvfp4_e0._arr[0]) == 128.0
+    assert _scalar(layer_ep1._moe_tp_decode_nvfp4_rank) == 5.0
+    assert _scalar(layer_ep1._moe_tp_decode_nvfp4_e0) == 128.0
 
     x = t.zeros(16, 6144, dtype=t.bfloat16)
     logits = t.zeros(16, 256, dtype=t.bfloat16)
@@ -2996,6 +3061,13 @@ def _load_precedence_modules(monkeypatch):
         silu_cls = importlib.import_module(
             "vllm.model_executor.layers.activation"
         ).SiluAndMul
+        # Admission asks for the TP world size; no process group exists on a
+        # CPU test host, so answer as the fallback stubs below do.
+        monkeypatch.setattr(
+            importlib.import_module("vllm.distributed"),
+            "get_tensor_model_parallel_world_size",
+            lambda: N_RANKS,
+        )
         return SimpleNamespace(
             torch=rt.torch,
             nvfp4=rt.nvfp4,
@@ -3322,7 +3394,7 @@ def _build_precedence_harness(monkeypatch):
             in_dtype=t.bfloat16,
             moe_parallel_config=par,
         )
-        layer = pm.nvfp4.RoutedExperts()
+        layer = _new_routed_experts(pm, pm.nvfp4.RoutedExperts)
         layer.moe_config = cfg
         layer.moe_parallel_config = par
         layer.global_num_experts = global_e
@@ -3344,8 +3416,8 @@ def _build_precedence_harness(monkeypatch):
             qm._tpu_activation_str = "silu"
             qm._use_adaptive_fused_moe = False
             b2 = 512 if inter >= 512 else 256
-            layer.w13_weight = t.zeros(e_local, h, inter, dtype=t.float4_e2m1fn_x2)
-            layer.w2_weight = t.zeros(e_local, inter, h // 2, dtype=t.float4_e2m1fn_x2)
+            layer.w13_weight = _zeros_fp4(t, e_local, h, inter)
+            layer.w2_weight = _zeros_fp4(t, e_local, inter, h // 2)
             layer.w13_weight_scale = t.ones(
                 e_local, h // 512, 1, 2 * inter, dtype=t.float32
             )
@@ -3384,7 +3456,7 @@ def _build_precedence_harness(monkeypatch):
         t.nn.Module.__init__(r)
         r.layer_name = name
         r.routed_experts = layer
-        r._quant_method = qm
+        _set_runner_quant_method(r, qm)
         r.moe_config = cfg
         r.gate = object()
         r.shared_expert_gate = None
@@ -3628,12 +3700,7 @@ def test_flag_precedence_fused_ep_and_token_count_dispatch(monkeypatch):
         pm.nvfp4,
         "requant_load_kmajor_fp4",
         lambda w_u8, _scale_f, block: (
-            t.zeros(
-                w_u8.shape[0],
-                w_u8.shape[2] * 2,
-                w_u8.shape[1] // 2,
-                dtype=t.float4_e2m1fn_x2,
-            ),
+            _zeros_fp4(t, w_u8.shape[0], w_u8.shape[2] * 2, w_u8.shape[1] // 2),
             t.ones(
                 w_u8.shape[0],
                 (w_u8.shape[2] * 2) // block,
@@ -3646,9 +3713,7 @@ def test_flag_precedence_fused_ep_and_token_count_dispatch(monkeypatch):
     monkeypatch.setattr(
         pm.nvfp4,
         "load_kmajor_fp4",
-        lambda w: t.zeros(
-            w.shape[0], w.shape[2] * 2, w.shape[1] // 2, dtype=t.float4_e2m1fn_x2
-        ),
+        lambda w: _zeros_fp4(t, w.shape[0], w.shape[2] * 2, w.shape[1] // 2),
     )
     monkeypatch.setattr(
         pm.nvfp4,
@@ -3690,7 +3755,7 @@ def test_flag_precedence_fused_ep_and_token_count_dispatch(monkeypatch):
         "model.layers.0.mlp", "nvfp4", use_ep=True, ep_size=N_RANKS, tp_size=1
     )
     ep_nvfp4_runner.routed_experts = ep_nvfp4_layer
-    ep_nvfp4_runner._quant_method = ep_nvfp4_qm
+    _set_runner_quant_method(ep_nvfp4_runner, ep_nvfp4_qm)
 
     ep_fp8_runner = h.make_runner(
         "model.layers.1.mlp", "fp8", use_ep=True, ep_size=N_RANKS, tp_size=1
