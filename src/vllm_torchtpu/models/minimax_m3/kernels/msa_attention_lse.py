@@ -279,6 +279,7 @@ def _attention_call(
     head,
     tile_offset,
     out,
+    work,
     *,
     q_per_head,
     sm_scale,
@@ -287,43 +288,49 @@ def _attention_call(
     interpret,
     scale_cache=None,
     scale_rows=None,
-    work=None,
 ):
-    """One kernel call over the tokens of `selected` (a multiple of block_q),
-    which start at tile ``tile_offset`` (``int32[1]``) of the head-major
-    ``q [G * Hg, T, D]``, ``local_page`` and ``local_limit [T, 1]``, for
-    query heads ``[b * Hg, (b + 1) * Hg)`` attending cache-row KV head ``k``,
-    ``head = (k, b)`` (``int32[2]``: a scalar-prefetch input, not a static,
-    so one kernel serves every head).
+    """One kernel call over the tiles ``tile_offset + [0, tiles)`` of the
+    head-major ``q [G * Hg, T, D]``, ``selected [G, T, K]``, ``local_page``
+    and ``local_limit [T, 1]``, for query heads ``[b * Hg, (b + 1) * Hg)``
+    attending cache-row KV head ``k``, ``head = (k, b)`` (``int32[2]``) with
+    ``tile_offset`` (``int32[1]``): scalar-prefetch inputs, not statics, so
+    one kernel serves every head and chunk, and no call slices its inputs.
+
+    ``work = (packed, num_groups)``: the call's `msa_attention._work_list`
+    as `_packed_work` packs it, and its group count.
 
     Writes those heads' and tokens' rows of ``(out [G * Hg, T, D], lse
     [G, T / Bq, 1, Hg * Bq])`` (a tile's lse a lane-dense row, ``h * Bq +
     t``): into `out` in place when given (an earlier call's
     result), else into new arrays whose other rows are unset. A 4-bit
     `kv_cache` takes its `scale_cache` and `scale_rows` (`_kernel`'s
-    `fp4_rows`). `work` is `selected`'s `msa_attention._work_list` when the
-    caller built it."""
+    `fp4_rows`)."""
     num_q_heads, num_tokens, head_dim = q.shape
     num_heads = q_per_head
     _, rows_per_page, packing, _ = kv_cache.shape
     # One KV head's [K | V] slice of each row.
     row_width = 2 * head_dim
-    topk = selected.shape[1]
-    if work is None:
-        work = msa_attention._work_list(selected, block_q, pages_per_step)
-    pages, meta, num_groups, counts = work
-
+    topk = selected.shape[2]
+    packed, num_groups = work
     groups_per_tile = msa_attention._groups_per_tile(block_q, topk, pages_per_step)
+    max_groups = packed.shape[0] // (pages_per_step + 2)
+    union_len = max_groups * pages_per_step
 
-    def call_tile_block(w, pages, meta, *_):
-        return (msa_attention._meta_tile(meta[w], groups_per_tile), 0)
+    def kernel(packed_ref, *refs, **kwargs):
+        return _kernel(
+            packed_ref.at[pl.ds(0, union_len)],
+            packed_ref.at[pl.ds(union_len, max_groups)],
+            packed_ref.at[pl.ds(union_len + max_groups, max_groups)],
+            *refs,
+            **kwargs,
+        )
 
-    def tile_block(w, pages, meta, counts, table, head_idx, offset):
-        tile = offset[0] + msa_attention._meta_tile(meta[w], groups_per_tile)
-        return (tile, 0)
+    def tile_block(w, packed, table, heads, offset):
+        meta = packed[union_len + w]
+        return (offset[0] + msa_attention._meta_tile(meta, groups_per_tile), 0)
 
-    def head_major_block(w, pages, meta, counts, table, heads, offset):
-        return (heads[1], *tile_block(w, pages, meta, counts, table, heads, offset))
+    def head_major_block(w, *prefetch):
+        return (prefetch[2][1], *tile_block(w, *prefetch))
 
     def lse_block(w, *prefetch):
         return (*head_major_block(w, *prefetch), 0)
@@ -341,11 +348,11 @@ def _attention_call(
         else ()
     )
     grid_spec = pltpu.PrefetchScalarGridSpec(
-        num_scalar_prefetch=6,
+        num_scalar_prefetch=4,
         grid=(num_groups,),
         in_specs=[
             pl.BlockSpec((num_heads, block_q, head_dim), head_major_block),
-            pl.BlockSpec((block_q, topk), call_tile_block),
+            pl.BlockSpec((None, block_q, topk), head_major_block),
             pl.BlockSpec((block_q, 1), tile_block),
             pl.BlockSpec((block_q, 1), tile_block),
             pl.BlockSpec(memory_space=pl.ANY),
@@ -368,10 +375,10 @@ def _attention_call(
             *scale_scratch,
         ],
     )
-    num_inputs = 6 + 5 + len(scale_inputs)
+    num_inputs = 4 + 5 + len(scale_inputs)
     return pl.pallas_call(
         functools.partial(
-            _kernel,
+            kernel,
             sm_scale=sm_scale,
             aliased=aliased,
             **({"fp4_rows": scale_rows} if fp4 else {}),
@@ -401,9 +408,7 @@ def _attention_call(
         interpret=interpret,
         name="minimax_m3_msa_sparse_attention_lse",
     )(
-        pages,
-        meta,
-        counts,
+        packed,
         page_table,
         head,
         tile_offset,
@@ -415,6 +420,19 @@ def _attention_call(
         *scale_inputs,
         *(out if aliased else ()),
     )
+
+
+def _packed_work(selected, block_q, pages_per_step):
+    """`msa_attention._work_list` of each call's ``selected [C, T, K]`` as
+    one int32 row per call, ``[unions | meta words | counts]``, and each
+    call's group count: a call then takes one slice of its work list, not
+    one per array (each an XLA op of ~1.3 us, x 4 calls x G per layer)."""
+    pages, meta, ends, counts = jax.vmap(
+        functools.partial(
+            msa_attention._work_list, block_q=block_q, pages_per_step=pages_per_step
+        )
+    )(selected)
+    return jnp.concatenate([pages, meta, counts], axis=1), ends
 
 
 def _chunked_call(
@@ -479,30 +497,27 @@ def _chunked_call(
     # Every call's work list in one batched pass ahead of the loop: built
     # per call inside it, each call paid its own two union sorts and glue
     # (~9 us per call, x G x 4 calls per layer).
-    work = jax.vmap(
-        functools.partial(
-            msa_attention._work_list, block_q=block_q, pages_per_step=pages_per_step
-        )
-    )(selected.reshape(num_heads * num_chunks, step, selected.shape[2]))
+    packed, ends = _packed_work(
+        selected.reshape(num_heads * num_chunks, step, selected.shape[2]),
+        block_q,
+        pages_per_step,
+    )
 
     def head_chunk(i, out):
         h, c = i // num_chunks, i % num_chunks
         offset = jnp.full((1,), c * (step // block_q), jnp.int32)
-        sel = jax.lax.dynamic_slice(
-            selected, (h, c * step, 0), (1, step, selected.shape[2])
-        )[0]
         heads = jnp.stack([first_head + h, h]).astype(jnp.int32)
         return call(
             q,
             kv_cache,
-            sel,
+            selected,
             local_page,
             local_limit,
             page_table,
             heads,
             offset,
             out,
-            work=tuple(x[i] for x in work),
+            (packed[i], ends[i]),
         )
 
     out = head_chunk(0, None)
