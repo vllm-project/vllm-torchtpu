@@ -329,3 +329,47 @@ class TestCompressorStateAndGlobalKvAddressingCache:
         # 5. Non-dict metadata early exit
         forward_ctx.attn_metadata = None
         assert comp.forward(torch.ones(count, 10), positions) is None
+
+
+@pytest.mark.parametrize("seed", range(8))
+def test_shift_swa_metadata_matches_direct_offsets(seed):
+    """Block-outer SWA layers share one cached metadata, shifted per row offset."""
+    from vllm_torchtpu.kernels.deepseek_v41.csa2.cache import prepare_swa_metadata
+
+    page, width = 64, 40
+    rng = np.random.default_rng(seed)
+    requests = int(rng.integers(1, 9))
+    stride = page * int(rng.choice([7, 8, 16]))
+    table = rng.permutation(np.arange(1, 1 + requests * width))
+    table = table.reshape(requests, width).astype(np.int32)
+    queries = rng.integers(0, 7, requests)
+    queries[0] = max(queries[0], 1)
+    starts = np.concatenate(([0], np.cumsum(queries))).astype(np.int32)
+    positions = np.zeros(int(starts[-1]) + int(rng.integers(0, 5)), np.int32)
+    for r in range(requests):
+        first = int(rng.integers(0, width * page - 16))
+        positions[starts[r] : starts[r + 1]] = first + np.arange(queries[r])
+        table[r, : max(first - 127, 0) // page] = 0  # freed out-of-window pages
+    minimum = np.zeros(requests, np.int32)
+
+    def direct(offset):
+        return tuple(
+            torch.from_numpy(np.asarray(x))
+            for x in prepare_swa_metadata(
+                jnp.asarray(table),
+                jnp.asarray(starts),
+                jnp.asarray(positions),
+                jnp.asarray(minimum),
+                page_size=page,
+                page_stride=stride,
+                row_offset=offset,
+            )
+        )
+
+    base = direct(0)
+    for offset in (page, stride - page):
+        want = direct(offset)
+        metadata, records = v2_attn._shift_swa_metadata(base[0], base[2], offset, page)
+        assert torch.equal(metadata, want[0])
+        assert torch.equal(base[1], want[1])
+        assert torch.equal(records, want[2])
