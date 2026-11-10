@@ -905,6 +905,12 @@ class Qwen4ExpBackbone(nn.Module):
             )
             hidden = segment_call.head(h, hidden)
         hidden = whole(hidden, positions, query_start_loc, context_lens)
+        if getattr(whole, "tail", False):  # VLLM_TPU_MK_WHOLE_L47: L47 ran in the call
+            assert not with_pre_last, "wholecheck needs the stock last QSA layer"
+            mixed = self.hyper_connection_mixer.mix(hidden, small_rows=True)[0]
+            if self.emit_mtp_hidden:
+                return mixed, hidden
+            return mixed
         pre_last = hidden
         qsa_layers = [i for i, layer in enumerate(layers) if layer.layer_type == "full_attention"]
         last = layers[qsa_layers[-1]]
