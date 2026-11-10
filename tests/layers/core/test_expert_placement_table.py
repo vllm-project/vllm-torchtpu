@@ -178,6 +178,17 @@ def test_replicate_is_the_eplb_greedy_above_the_guard():
     assert counts[nxt] / (many[nxt] + 1) < floor
 
 
+@pytest.mark.parametrize("max_replicas", [1, 2, 7])
+def test_replicate_caps_the_replicas_per_expert(max_replicas):
+    counts, _ = _skewed_layer(2)
+    counts[0] *= 50  # one expert would take most redundant slots
+    capped = ep.replicate(counts, EP, max_replicas)
+    assert capped.max() <= max_replicas + 1
+    assert ep.replicate(counts, EP).max() > max_replicas + 1
+    # Without the cap the result is the uncapped rule's.
+    np.testing.assert_array_equal(ep.replicate(counts, EP, 0), ep.replicate(counts, EP))
+
+
 def test_guard_makes_no_replicas_from_flat_counts():
     flat = np.random.default_rng(3).uniform(0.9, 1.1, size=E) * 1000
     np.testing.assert_array_equal(ep.replicate(flat, EP), np.ones(E))

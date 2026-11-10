@@ -24,6 +24,11 @@ computes the same integers from the gathered words in VMEM, in one launch.
 Each token's EP ranks are kept as a bitmask (one bit per rank) and its routes
 per rank as 4-bit counters, both built over the top-k route slabs; the counts
 the plan needs are lane sums and popcounts of those.
+
+With redundant expert slots the kernel can also choose, every step, which
+instance of a replicated expert serves each route (``replica_plan``): every
+rank derives the same choice from the same gathered routing, so the plan, the
+row sends and the owners' expected rows agree on all of them.
 """
 
 import functools
@@ -40,6 +45,16 @@ _LANES = 128
 _SUBLANES = 8
 # The word an empty route slot holds: id field -1.
 _EMPTY_WORD = -1 << 16
+# The balanced replica choice: instances of one expert (primary and replicas)
+# on sublanes, replicated experts on lanes, instances one rank holds, slots.
+REPLICA_INSTANCES = 8
+REPLICA_GROUPS = 128
+_RANK_INSTANCES = 16
+_PLAN_SLOTS = 1024
+REPLICA_PLAN_SHAPE = (40, 128)
+# Rounds of the per-step split, and bits of a route's key.
+_SPLIT_ROUNDS = 8
+_KEY_BITS = 9
 
 
 class ExchangePlan(NamedTuple):
@@ -55,6 +70,7 @@ class ExchangePlan(NamedTuple):
     src_rows: jax.Array  # [1]: rows received in all
     send_index: jax.Array  # [rows]: token of each send row below ``count``
     in_row: jax.Array  # [D, S]: receive row of each token that reaches this rank
+    serving: jax.Array | None = None  # [K, D, S]: serving slots (replica_plan)
 
 
 def _divider(divisor: int, limit: int):
@@ -153,21 +169,242 @@ def _column_mask(column: int, tp_size: int) -> int:
     return mask - (1 << 32) if mask >= 1 << 31 else mask
 
 
+def replica_plan_table(
+    replicas: np.ndarray, *, slots_per_rank: int, ep_size: int
+) -> np.ndarray:
+    """One layer's table [40, 128] int32 for the balanced replica choice, from
+    its replica table ``replicas`` [3, C] (`expert_placement.replica_table`:
+    per redundant slot its own slot, its primary slot or -1, its replica
+    index), in physical slots of ``slots_per_rank`` per rank.
+
+    Group g = the g-th replicated expert by its first redundant slot. Lane g of
+    rows 0-7: the rank of its instance j (primary first, then its replicas by
+    replica index; -1 none), rows 8-15: that instance's slot. Lane r of rows
+    16-31: the instances rank r holds, as 128 j + g (-1 none). Rows 32-39: the
+    group of slot s at [32 + s // 128, s % 128] (-1: not replicated). Raises
+    when the layer does not fit the table."""
+    own, primary, index = (np.asarray(a, dtype=np.int64) for a in replicas)
+    instances: dict[int, dict[int, int]] = {}
+    for q in np.flatnonzero(primary >= 0):
+        instances.setdefault(int(primary[q]), {0: int(primary[q])})[int(index[q])] = (
+            int(own[q])
+        )
+    num_slots = ep_size * slots_per_rank
+    worst = max((len(v) for v in instances.values()), default=1)
+    if worst > REPLICA_INSTANCES:
+        raise ValueError(
+            f"an expert has {worst} instances; the balanced replica choice takes "
+            f"at most {REPLICA_INSTANCES} (its primary and "
+            f"{REPLICA_INSTANCES - 1} replicas)"
+        )
+    if len(instances) > REPLICA_GROUPS or num_slots > _PLAN_SLOTS or ep_size > 128:
+        raise ValueError(
+            f"{len(instances)} replicated experts over {num_slots} slots and "
+            f"{ep_size} ranks: the balanced replica choice takes at most "
+            f"{REPLICA_GROUPS}, {_PLAN_SLOTS} and 128"
+        )
+    table = np.full(REPLICA_PLAN_SHAPE, -1, np.int64)
+    held: dict[int, list[int]] = {}
+    for g, p in enumerate(instances):
+        for j, slot in sorted(instances[p].items()):
+            table[j, g] = slot // slots_per_rank
+            table[8 + j, g] = slot
+            held.setdefault(slot // slots_per_rank, []).append(128 * j + g)
+        table[32 + p // 128, p % 128] = g
+    for r, entries in held.items():
+        if len(entries) > _RANK_INSTANCES:
+            raise ValueError(
+                f"rank {r} holds {len(entries)} instances of replicated experts; "
+                f"the balanced replica choice takes at most {_RANK_INSTANCES}"
+            )
+        table[16 : 16 + len(entries), r] = entries
+    return table.astype(np.int32)
+
+
+def _nibble_totals(counters):
+    """Totals over all elements of 4-bit counters (bin 8 w + f in nibble f of
+    word w, each at most 15, summing over at most 17 sublanes in a byte):
+    [1, 128] with bin b in lane b."""
+    parts = []
+    for c in counters:
+        for nibbles in (c & 0x0F0F0F0F, (c >> 4) & 0x0F0F0F0F):
+            per_lane = nibbles.sum(axis=0, keepdims=True)
+            parts += [per_lane & 0x00FF00FF, (per_lane >> 8) & 0x00FF00FF]
+    totals = jnp.concatenate(parts, axis=0).sum(axis=1, keepdims=True)
+    lane = jax.lax.broadcasted_iota(I32, (1, _LANES), 1)
+    out = jnp.zeros((1, _LANES), I32)
+    # Part (even nibbles, low bytes) holds bins 8 w + {0, 4}, (even, high)
+    # {2, 6}, (odd, low) {1, 5}, (odd, high) {3, 7}: first bin in the low half.
+    for w in range(len(counters)):
+        for i, (b0, b1) in enumerate(((0, 4), (2, 6), (1, 5), (3, 7))):
+            v = totals[4 * w + i : 4 * w + i + 1, :]
+            out = jnp.where(lane == 8 * w + b0, v & 0xFFFF, out)
+            out = jnp.where(lane == 8 * w + b1, v >> 16, out)
+    return out
+
+
+def _sublane_sum(x):
+    """Sum over the sublanes, in every sublane."""
+    d = 1
+    while d < x.shape[0]:
+        x = x + pltpu.roll(x, d, 0)
+        d *= 2
+    return x
+
+
+def _sublane_scan(x):
+    """Inclusive prefix sum along the sublanes."""
+    row = jax.lax.broadcasted_iota(I32, x.shape, 0)
+    d = 1
+    while d < x.shape[0]:
+        x = x + jnp.where(row >= d, pltpu.roll(x, d, 0), 0)
+        d *= 2
+    return x
+
+
+def _lookup(table_rows, index, members):
+    """``table_rows[index // 128][index % 128]`` per element of ``index``
+    [members, 128] (0 <= index < 128 * len(table_rows)), by lane gathers."""
+    hi = index >> 7
+    lo = index & (_LANES - 1)
+    parts = []
+    for blk in range(members // _SUBLANES):
+        part = jnp.zeros((_SUBLANES, _LANES), I32)
+        lo8 = lo[blk * _SUBLANES : (blk + 1) * _SUBLANES]
+        hi8 = hi[blk * _SUBLANES : (blk + 1) * _SUBLANES]
+        for i, row in enumerate(table_rows):
+            got = jnp.take_along_axis(
+                jnp.broadcast_to(row, (_SUBLANES, _LANES)), lo8, axis=1
+            )
+            part = jnp.where(hi8 == i, got, part)
+        parts.append(part)
+    return jnp.concatenate(parts, axis=0) if len(parts) > 1 else parts[0]
+
+
+def _serving_slots(slabs_ref, tab_ref, serve_ref, *, members, topk, slots_per_rank,
+                   num_slots, order_bits, groups):  # fmt: skip
+    """The balanced replica choice: the serving slot of every gathered route
+    into ``serve_ref`` [K, members, 128].
+
+    1. Each route's group (from its primary slot, ``tab_ref`` rows 32-39) and
+       key: ((T * 1031 + p * 7) >> 3) mod 512 for its primary p and the sum T of
+       its token's primaries, the token's routing alone.
+    2. Routes per group and per primary rank (4-bit counters); a rank's base
+       load = its primaries' routes minus those of replicated experts.
+    3. Rounds of a simultaneous split: each group, against one snapshot of the
+       rank loads without its own share, finds by bisection the highest level
+       its routes can fill the instance ranks to (left over units to the
+       instances at that level, in instance order), then moves halfway to that
+       split. Starts from the even split; integers throughout.
+    4. A route of group g takes instance j where cum[j - 1, g] <= (key * n_g) >>
+       9 < cum[j, g], cum the split's prefix sums."""
+    shape = (members, _LANES)
+    div = _divider(slots_per_rank, num_slots)
+    assert div is not None  # exchange_plan_supported found one
+    group_rows = [tab_ref[32 + i : 33 + i, :] for i in range(-(-num_slots // _LANES))]
+    prims, gids = [], []
+    total = jnp.zeros(shape, I32)
+    for k in range(topk):
+        prim = (slabs_ref[k] >> 16) >> order_bits
+        prim = jnp.where(prim < num_slots, prim, -1)
+        prims.append(prim)
+        total = total + jnp.maximum(prim, 0)
+    num_counters = -(-num_slots // slots_per_rank // 8)
+    group_counters = -(-groups // 8)
+    rank_count = [jnp.zeros(shape, I32) for _ in range(num_counters)]
+    group_count = [jnp.zeros(shape, I32) for _ in range(group_counters)]
+    for k in range(topk):
+        prim = prims[k]
+        routed = prim >= 0
+        g = jnp.where(routed, _lookup(group_rows, jnp.maximum(prim, 0), members), -1)
+        gids.append(g)
+        rank = jnp.where(routed, div(jnp.maximum(prim, 0)), 8 * num_counters)
+        one = jnp.left_shift(1, (rank & 7) << 2)
+        for j in range(num_counters):
+            rank_count[j] = rank_count[j] + jnp.where((rank >> 3) == j, one, 0)
+        gw = jnp.where(g >= 0, g >> 3, group_counters)
+        gone = jnp.left_shift(1, (g & 7) << 2)
+        for j in range(group_counters):
+            group_count[j] = group_count[j] + jnp.where(gw == j, gone, 0)
+    prim_load = _nibble_totals(rank_count)  # [1, 128]: lane = rank
+    n_g = _nibble_totals(group_count)  # [1, 128]: lane = group
+    sub = jax.lax.broadcasted_iota(I32, (_SUBLANES, _LANES), 0)
+    inst_rank = tab_ref[0:8, :]
+    inst_slot = tab_ref[8:16, :]
+    valid = inst_rank >= 0
+    held = [tab_ref[16 + i : 17 + i, :] for i in range(_RANK_INSTANCES)]
+    n8 = jnp.broadcast_to(n_g, (_SUBLANES, _LANES))
+
+    def rank_share(x):
+        """[1, 128], lane r: the routes x[j, g] of the instances rank r holds."""
+        out = jnp.zeros((1, _LANES), I32)
+        for entry in held:
+            col = jnp.take_along_axis(
+                x, jnp.broadcast_to(entry & (_LANES - 1), (_SUBLANES, _LANES)), axis=1
+            )
+            out = out + jnp.where((sub == (entry >> 7)) & (entry >= 0), col, 0).sum(
+                axis=0, keepdims=True
+            )
+        return out
+
+    base = prim_load - rank_share(jnp.where(sub == 0, n8, 0))
+    ninst = jnp.maximum(_sublane_sum(valid.astype(I32)), 1)
+    x = jnp.where(valid, n8 // ninst, 0)
+    x = x + jnp.where(sub == 0, n8 - _sublane_sum(x), 0)
+    far = 1 << 20
+    for _ in range(_SPLIT_ROUNDS):
+        load = jnp.broadcast_to(base + rank_share(x), (_SUBLANES, _LANES))
+        others = jnp.take_along_axis(load, jnp.maximum(inst_rank, 0), axis=1) - x
+        others = jnp.where(valid, others, far)
+        lo = jnp.broadcast_to(
+            jnp.min(others, axis=0, keepdims=True), (_SUBLANES, _LANES)
+        )
+        hi = lo + n8
+        for _ in range(12):
+            mid = (lo + hi + 1) >> 1
+            fits = _sublane_sum(jnp.maximum(mid - others, 0)) <= n8
+            lo = jnp.where(fits, mid, lo)
+            hi = jnp.where(fits, hi, mid - 1)
+        target = jnp.maximum(lo - others, 0)
+        left = n8 - _sublane_sum(target)
+        level = (others <= lo) & valid
+        target = target + jnp.where(
+            level & (_sublane_scan(level.astype(I32)) <= left), 1, 0
+        )
+        x = (x + target) >> 1
+        x = x + jnp.where(sub == 0, n8 - _sublane_sum(x), 0)
+    cum = _sublane_scan(x)
+    cum_rows = [
+        jnp.broadcast_to(cum[j : j + 1, :], (_SUBLANES, _LANES)) for j in range(7)
+    ]
+    slot_rows = [
+        jnp.broadcast_to(inst_slot[j : j + 1, :], (_SUBLANES, _LANES)) for j in range(8)
+    ]
+    n_row = jnp.broadcast_to(n_g, (_SUBLANES, _LANES))
+    for k in range(topk):
+        prim, g = prims[k], gids[k]
+        key = ((total * 1031 + prim * 7) >> 3) & ((1 << _KEY_BITS) - 1)
+        parts = []
+        for blk in range(members // _SUBLANES):
+            rows8 = slice(blk * _SUBLANES, (blk + 1) * _SUBLANES)
+            g8 = jnp.maximum(g[rows8], 0)
+            kk = (key[rows8] * jnp.take_along_axis(n_row, g8, axis=1)) >> _KEY_BITS
+            j = jnp.zeros((_SUBLANES, _LANES), I32)
+            for jj in range(7):
+                j = j + (jnp.take_along_axis(cum_rows[jj], g8, axis=1) <= kk).astype(
+                    I32
+                )
+            slot = prim[rows8]
+            for jj in range(1, 8):
+                slot = jnp.where(
+                    j == jj, jnp.take_along_axis(slot_rows[jj], g8, axis=1), slot
+                )
+            parts.append(jnp.where(g[rows8] >= 0, slot, prim[rows8]))
+        serve_ref[k] = jnp.concatenate(parts, axis=0) if len(parts) > 1 else parts[0]
+
+
 def _plan_kernel(
-    rank_ref,
-    words_ref,
-    start_ref,
-    size_ref,
-    land_ref,
-    rsize_ref,
-    over_ref,
-    count_ref,
-    src_ref,
-    index_ref,
-    inrow_ref,
-    slabs_ref,
-    reach_ref,
-    *,
+    *refs,
     num_members,
     tp_size,
     num_tokens,
@@ -176,7 +413,17 @@ def _plan_kernel(
     rows,
     routes,
     order_bits,
+    groups,
 ):
+    # Inputs (the table with the replica choice), outputs (the serving slots
+    # with it), then the scratch.
+    refs = list(refs)
+    rank_ref, words_ref = refs[:2]
+    tab_ref = refs.pop(2) if groups else None
+    (start_ref, size_ref, land_ref, rsize_ref, over_ref, count_ref, src_ref,
+     index_ref, inrow_ref) = refs[2:11]  # fmt: skip
+    serve_ref = refs.pop(11) if groups else None
+    slabs_ref, reach_ref = refs[11:13]
     members, ranks, num_words, num_counters = _shapes(
         num_members, tp_size, num_tokens, topk
     )
@@ -191,15 +438,30 @@ def _plan_kernel(
     for k in range(topk):
         slabs_ref[k] = jnp.full(shape, _EMPTY_WORD, I32)
         slabs_ref[k, :num_members, :num_tokens] = words_ref[:, k, :]
+    if groups:
+        _serving_slots(
+            slabs_ref,
+            tab_ref,
+            serve_ref,
+            members=members,
+            topk=topk,
+            slots_per_rank=slots_per_rank,
+            num_slots=ranks * slots_per_rank,
+            order_bits=order_bits,
+            groups=groups,
+        )
 
     # Per token: the EP ranks it reaches (bit r of word r // 32) and its routes
     # per rank (4-bit counter r % 8 of word r // 8).
     reach = [jnp.zeros(shape, I32) for _ in range(num_words)]
     counters = [jnp.zeros(shape, I32) for _ in range(num_counters)]
     for k in range(topk):
-        slot = slabs_ref[k] >> 16
-        if order_bits:
-            slot = slot >> order_bits
+        if serve_ref is not None:
+            slot = serve_ref[k]
+        else:
+            slot = slabs_ref[k] >> 16
+            if order_bits:
+                slot = slot >> order_bits
         routed = (slot >= 0) & (slot < ranks * slots_per_rank)
         # Unrouted slots take a rank past every counter word.
         rank = jnp.where(routed, div(jnp.maximum(slot, 0)), 8 * num_counters)
@@ -340,6 +602,7 @@ def exchange_plan(
     rows: int,
     routes: int,
     order_bits: int = 0,
+    replica_plan=None,
     interpret: bool = False,
 ) -> ExchangePlan:
     """The capacity exchange's plan from the gathered packed routing.
@@ -351,7 +614,11 @@ def exchange_plan(
     expert slots of a rank (rank = slot // slots_per_rank). ``rows`` /
     ``routes``: the capacity buffers. Same integers as the capacity
     exchange's XLA ops (`_capacity_overflow` and the planned branch of
-    `_capacity_exchange`), for every input."""
+    `_capacity_exchange`), for every input.
+
+    ``replica_plan`` [40, 128] (`replica_plan_table`): the id fields carry the
+    routes' primary slots instead, and the kernel chooses the serving slots
+    (``serving``) with the balanced replica choice; the plan follows them."""
     num_members, topk, num_tokens = words.shape
     if not exchange_plan_supported(
         num_members=num_members,
@@ -368,6 +635,30 @@ def exchange_plan(
     index_rows = -(-rows // (_SUBLANES * _LANES)) * _SUBLANES
     vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
     smem = pl.BlockSpec(memory_space=pltpu.SMEM)
+    # Group lanes the choice reads: at most the redundant slots, whole words.
+    groups = 0
+    if replica_plan is not None:
+        if replica_plan.shape != REPLICA_PLAN_SHAPE:
+            raise ValueError(
+                f"replica_plan must be {REPLICA_PLAN_SHAPE}, got {replica_plan.shape}"
+            )
+        groups = REPLICA_GROUPS
+    out_shape = (
+        [jax.ShapeDtypeStruct((num_members,), I32)] * 4
+        + [jax.ShapeDtypeStruct((1,), I32)] * 3
+        + [
+            jax.ShapeDtypeStruct((index_rows, _LANES), I32),
+            jax.ShapeDtypeStruct((members, _LANES), I32),
+        ]
+    )
+    out_specs = [vmem] * 4 + [smem] * 3 + [vmem] * 2
+    in_specs = [smem, vmem]
+    operands = [ep_rank, words]
+    if groups:
+        in_specs.append(vmem)
+        operands.append(replica_plan)
+        out_shape.append(jax.ShapeDtypeStruct((topk, members, _LANES), I32))
+        out_specs.append(vmem)
     plan = pl.pallas_call(
         functools.partial(
             _plan_kernel,
@@ -379,23 +670,21 @@ def exchange_plan(
             rows=rows,
             routes=routes,
             order_bits=order_bits,
+            groups=groups,
         ),
-        out_shape=[jax.ShapeDtypeStruct((num_members,), I32)] * 4
-        + [jax.ShapeDtypeStruct((1,), I32)] * 3
-        + [
-            jax.ShapeDtypeStruct((index_rows, _LANES), I32),
-            jax.ShapeDtypeStruct((members, _LANES), I32),
-        ],
-        in_specs=[smem, vmem],
-        out_specs=[vmem] * 4 + [smem] * 3 + [vmem] * 2,
+        out_shape=out_shape,
+        in_specs=in_specs,
+        out_specs=out_specs,
         scratch_shapes=[
             pltpu.VMEM((topk, members, _LANES), I32),
             pltpu.VMEM((num_words, members, _LANES), I32),
         ],
         interpret=interpret,
-        name=f"exchange_plan-d_{num_members}-t_{tp_size}-s_{num_tokens}-r_{rows}",
-    )(ep_rank, words)
-    start, sizes, landing, recv, over, count, src, index, in_row = plan
+        name=f"exchange_plan-d_{num_members}-t_{tp_size}-s_{num_tokens}-r_{rows}"
+        + ("-balanced" if groups else ""),
+    )(*operands)
+    start, sizes, landing, recv, over, count, src, index, in_row = plan[:9]
+    serving = plan[9][:, :num_members, :num_tokens] if groups else None
     return ExchangePlan(
         overflow=over[0] != 0,
         send_start=start,
@@ -406,4 +695,5 @@ def exchange_plan(
         src_rows=src,
         send_index=index.reshape(-1)[:rows],
         in_row=in_row[:num_members, :num_tokens],
+        serving=serving,
     )

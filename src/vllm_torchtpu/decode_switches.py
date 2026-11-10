@@ -97,6 +97,12 @@ PATHS: tuple[Path, ...] = (
         "check, sizes, offsets, send index and receive rows",
     ),
     Path(
+        "a2a_replica_balance",
+        RAGGED_A2A,
+        "with a2a_plan_kernel and redundant expert slots, the plan kernel "
+        "chooses each route's replica every step to even the ranks' loads",
+    ),
+    Path(
         "a2a_unquantized",
         RAGGED_A2A,
         "unquantized layers without expert biases take the exchange",
@@ -236,6 +242,17 @@ def exchange_keywords(sw: Switches, *, owner_combine: bool) -> dict[str, object]
         send_index_rows_minor=sw.path("a2a_row_scatter")
         and sw.path("a2a_send_rows_minor"),
         plan_kernel=sw.path("a2a_sorted_plan") and sw.path("a2a_plan_kernel"),
+        replica_balance=replica_balance(sw),
+    )
+
+
+def replica_balance(sw: Switches) -> bool:
+    """Whether a layer with redundant expert slots takes the plan kernel's
+    balanced replica choice."""
+    return (
+        sw.path("a2a_sorted_plan")
+        and sw.path("a2a_plan_kernel")
+        and sw.path("a2a_replica_balance")
     )
 
 

@@ -297,3 +297,328 @@ def test_plan_kernel_matches_the_xla_plan_on_tpu(layout, num_tokens):
     """Compiled for TPU: the same cases at every rank."""
     _require_tpu()
     _run(layout, num_tokens, lambda n, rng: range(n), interpret=False)
+
+
+# The balanced replica choice.
+
+
+def balanced_reference(prim, table, *, slots_per_rank, num_slots):
+    """numpy form of the kernel's choice: the serving slot of every route
+    (``prim`` [...] primary slots, -1 unrouted, last axis the token's
+    routes)."""
+    prim = np.where((prim >= 0) & (prim < num_slots), prim, -1).astype(np.int64)
+    table = table.astype(np.int64)
+    inst_rank, inst_slot, held = table[0:8], table[8:16], table[16:32]
+    group_of = table[32:40].reshape(-1)
+    routed = prim >= 0
+    g = np.where(routed, group_of[np.maximum(prim, 0)], -1)
+    total = np.maximum(prim, 0).sum(-1, keepdims=True)
+    key = ((total * 1031 + prim * 7) >> 3) & 511
+    rank = np.where(routed, prim // slots_per_rank, -1)
+    prim_load = np.bincount(rank[routed], minlength=128)[:128]
+    n_g = np.bincount(g[g >= 0], minlength=128)[:128]
+    valid = inst_rank >= 0
+    sub = np.arange(8)[:, None]
+
+    def rank_share(x):
+        out = np.zeros(128, np.int64)
+        for entry in held:
+            col = x[:, entry & 127]
+            out += np.where((sub == entry >> 7) & (entry >= 0), col, 0).sum(0)
+        return out
+
+    n8 = np.broadcast_to(n_g, (8, 128))
+    base = prim_load - rank_share(np.where(sub == 0, n8, 0))
+    ninst = np.maximum(valid.sum(0), 1)
+    x = np.where(valid, n8 // ninst, 0)
+    x[0] += n_g - x.sum(0)
+    for _ in range(8):
+        load = base + rank_share(x)
+        others = np.where(valid, load[np.maximum(inst_rank, 0)] - x, 1 << 20)
+        lo = np.broadcast_to(others.min(0), (8, 128)).copy()
+        hi = lo + n8
+        for _ in range(12):
+            mid = (lo + hi + 1) >> 1
+            fits = np.maximum(mid - others, 0).sum(0) <= n8
+            lo, hi = np.where(fits, mid, lo), np.where(fits, hi, mid - 1)
+        target = np.maximum(lo - others, 0)
+        left = n8 - target.sum(0)
+        level = (others <= lo) & valid
+        target = target + (level & (np.cumsum(level, 0) <= left))
+        x = (x + target) >> 1
+        x[0] += n_g - x.sum(0)
+    cum = np.cumsum(x, 0)
+    g0 = np.maximum(g, 0)
+    kk = (key * n_g[g0]) >> 9
+    j = sum((cum[jj][g0] <= kk).astype(np.int64) for jj in range(7))
+    slot = np.where(j > 0, inst_slot[np.minimum(j, 7), g0], prim)
+    return np.where(g >= 0, slot, prim)
+
+
+def _replica_layout(num_members, tp_size, slots, redundant_per_rank, seed=0):
+    """A balanced placement with replicas of the busiest experts from skewed
+    counts: (physical primary of each expert, replica table, plan table)."""
+    from vllm_torchtpu.kernels.megablox.exchange_plan import replica_plan_table
+    from vllm_torchtpu.layers.core import expert_placement as core
+
+    ranks = num_members * tp_size
+    experts = ranks * slots
+    rng = np.random.default_rng(seed)
+    counts = rng.zipf(1.6, experts).astype(np.float64)
+    placed = core.balance(counts, ranks)
+    extra = ranks * redundant_per_rank
+    redundant = core.place_replicas(
+        counts, placed, ranks, redundant_per_rank, core.replicate(counts, extra, 7)
+    )
+    table = core.replica_table(placed, redundant, ranks)
+    plan = replica_plan_table(
+        table, slots_per_rank=slots + redundant_per_rank, ep_size=ranks
+    )
+    primary = core.physical_slots(placed, ranks, redundant_per_rank)
+    return counts, primary, table, plan
+
+
+def _balanced_words(rng, counts, primary, num_members, num_tokens, padded=False):
+    """Gathered words [D, K, S] with primaries and owner orders in the id
+    fields, experts drawn by their counts, and the primaries [D, S, K]."""
+    p = counts / counts.sum()
+    ids = np.stack(
+        [
+            rng.choice(len(counts), TOPK, replace=False, p=p)
+            for _ in range(num_members * num_tokens)
+        ]
+    ).reshape(num_members, num_tokens, TOPK)
+    prim = primary[ids]
+    if padded:
+        prim[:, -max(1, num_tokens // 6) :] = -1
+    order = np.argsort(np.argsort(prim, axis=-1), axis=-1)
+    field = np.where(prim >= 0, prim << ROUTE_ORDER_BITS | order, -1)
+    words = (field.astype(np.int64) << 16) | rng.integers(0, 1 << 16, prim.shape)
+    return np.swapaxes(words, 1, 2).astype(np.int32), prim, order
+
+
+BALANCED_LAYOUTS = [(16, 4, 8, 1), (8, 4, 16, 1), (2, 4, 8, 1), (4, 2, 8, 1)]
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("layout", BALANCED_LAYOUTS)
+@pytest.mark.parametrize("num_tokens", [8, 26, 128])
+def test_balanced_choice_matches_the_numpy_form_on_every_rank(layout, num_tokens):
+    """Interpret mode: every rank's kernel chooses the same serving slots, the
+    numpy form's; each serves the route's expert; the plan is the XLA ops' on
+    those slots, fallback decision included; and every rank's sends to a member
+    are what that member expects to receive."""
+    num_members, tp_size, slots, redundant = layout
+    counts, primary, table, plan_table = _replica_layout(
+        num_members, tp_size, slots, redundant
+    )
+    slots_per_rank = slots + redundant
+    num_slots = num_members * tp_size * slots_per_rank
+    rng = np.random.default_rng(num_tokens)
+    rows, routes = _capacity(num_members, tp_size, num_tokens, slots, 2.0)
+    if rows >= num_members * num_tokens:
+        rows = max(32, num_members * num_tokens // 2 // 32 * 32)
+    for padded in (False, True):
+        words, prim, order = _balanced_words(
+            rng, counts, primary, num_members, num_tokens, padded
+        )
+        want = balanced_reference(
+            prim, plan_table, slots_per_rank=slots_per_rank, num_slots=num_slots
+        )
+        # Every serving slot holds the route's expert.
+        held_by = dict(enumerate(range(num_slots)))
+        for q in np.flatnonzero(table[1] >= 0):
+            held_by[int(table[0][q])] = int(table[1][q])
+        assert all(held_by[s] == p for s, p in zip(want[prim >= 0], prim[prim >= 0]))
+        served_words = (
+            np.where(want >= 0, want << ROUTE_ORDER_BITS | order, -1).astype(np.int64)
+            << 16
+        )
+        served_words = np.swapaxes(served_words, 1, 2).astype(np.int32)
+        common = dict(
+            tp_size=tp_size,
+            slots_per_rank=slots_per_rank,
+            rows=rows,
+            routes=routes,
+            order_bits=ROUTE_ORDER_BITS,
+        )
+        plans = {}
+        for ep in range(num_members * tp_size):
+            got = exchange_plan(
+                jnp.asarray(words),
+                jnp.array([ep], jnp.int32),
+                replica_plan=jnp.asarray(plan_table),
+                interpret=True,
+                **common,
+            )
+            np.testing.assert_array_equal(
+                np.moveaxis(np.asarray(got.serving), 0, -1), want
+            )
+            check(got, reference(jnp.asarray(served_words), ep, **common), num_tokens)
+            plans[ep] = got
+        for ep, got in plans.items():
+            col, dp_pos = ep % tp_size, ep // tp_size
+            for m in range(num_members):
+                peer = plans[m * tp_size + col]
+                assert int(got.send_sizes[m]) == int(peer.recv_sizes[dp_pos])
+
+
+@pytest.mark.cpu_test
+def test_balanced_choice_decides_the_fallback_on_its_own_slots():
+    """Capacity between the busiest rank under the primaries and under the
+    balanced choice: the step fits with the choice, and the kernel says so."""
+    num_members, tp_size, slots, redundant = 16, 4, 8, 1
+    counts, primary, table, plan_table = _replica_layout(
+        num_members, tp_size, slots, redundant, seed=3
+    )
+    slots_per_rank = slots + redundant
+    num_slots = num_members * tp_size * slots_per_rank
+    rng = np.random.default_rng(11)
+    words, prim, order = _balanced_words(rng, counts, primary, num_members, 128)
+    want = balanced_reference(
+        prim, plan_table, slots_per_rank=slots_per_rank, num_slots=num_slots
+    )
+    busiest_primary = np.bincount(prim[prim >= 0] // slots_per_rank).max()
+    busiest_served = np.bincount(want[want >= 0] // slots_per_rank).max()
+    assert busiest_served < busiest_primary
+    routes = int(busiest_served + busiest_primary) // 2
+    common = dict(
+        tp_size=tp_size,
+        slots_per_rank=slots_per_rank,
+        rows=num_members * 128,
+        routes=routes,
+        order_bits=ROUTE_ORDER_BITS,
+    )
+    got = exchange_plan(
+        jnp.asarray(words),
+        jnp.array([0], jnp.int32),
+        replica_plan=jnp.asarray(plan_table),
+        interpret=True,
+        **common,
+    )
+    assert not bool(got.overflow)
+    primaries = exchange_plan(
+        jnp.asarray(words), jnp.array([0], jnp.int32), interpret=True, **common
+    )
+    assert bool(primaries.overflow)
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("layout", [(16, 4, 8, 1), (2, 4, 8, 1)])
+def test_owners_expect_the_rows_the_expert_ranks_send(layout):
+    """With the kernel's serving slots, the routes each expert rank's route plan
+    sends to an owner rank, summed over the other ranks, are the rows that owner
+    expects (its owned routes served elsewhere)."""
+    num_members, tp_size, slots, redundant = layout
+    counts, primary, table, plan_table = _replica_layout(
+        num_members, tp_size, slots, redundant, seed=5
+    )
+    slots_per_rank = slots + redundant
+    ranks = num_members * tp_size
+    num_tokens = 26
+    rng = np.random.default_rng(2)
+    words, prim, order = _balanced_words(
+        rng, counts, primary, num_members, num_tokens, padded=True
+    )
+    got = exchange_plan(
+        jnp.asarray(words),
+        jnp.array([0], jnp.int32),
+        tp_size=tp_size,
+        slots_per_rank=slots_per_rank,
+        rows=num_members * num_tokens,
+        routes=num_members * num_tokens * TOPK,
+        order_bits=ROUTE_ORDER_BITS,
+        replica_plan=jnp.asarray(plan_table),
+        interpret=True,
+    )
+    serving = np.moveaxis(np.asarray(got.serving), 0, -1)  # [D, S, K]
+    mesh = dict(dp_size=num_members, tp_size=tp_size, local_num_experts=slots_per_rank)
+    blk = -(-num_tokens // tp_size)
+    weights = np.where(prim >= 0, 1.0, 0.0).astype(np.float32)
+    sent = np.zeros(ranks, np.int64)
+    for r in range(ranks):
+        dests = functools.partial(
+            ram.owner_dests, order=jnp.asarray(np.moveaxis(order, -1, 0)), **mesh
+        )
+        member, _, _, _ = dests(jnp.asarray(np.moveaxis(serving, -1, 0)))
+        local = serving - r * slots_per_rank
+        mine = (local >= 0) & (local < slots_per_rank)
+        owners = np.broadcast_to(np.asarray(member)[:, :, None], serving.shape)
+        np.add.at(sent, owners[mine & (owners != r)], 1)
+    for o in range(ranks):
+        s, t0 = o // tp_size, (o % tp_size) * blk
+        owned = slice(t0, min(t0 + blk, num_tokens))
+        expected = ram.owner_remote_routes(
+            jnp.asarray(prim[s, owned]),
+            jnp.asarray(weights[s, owned]),
+            jnp.asarray(serving[s, owned]),
+            o,
+            skip_padded_tokens=False,
+            dtype=jnp.float32,
+            **mesh,
+        )
+        assert int(expected) == int(sent[o]), o
+
+
+@pytest.mark.cpu_test
+def test_replica_plan_table_refuses_more_instances_than_it_takes():
+    from vllm_torchtpu.kernels.megablox.exchange_plan import (
+        REPLICA_INSTANCES,
+        replica_plan_table,
+    )
+
+    ranks, slots = 16, 9
+    own = np.arange(ranks) * slots + 8
+    primary = np.full(ranks, -1)
+    primary[:REPLICA_INSTANCES] = 0  # expert slot 0 with 8 replicas: 9 instances
+    index = np.where(primary >= 0, np.cumsum(primary >= 0), 0)
+    table = np.stack([own, primary, index]).astype(np.int32)
+    with pytest.raises(ValueError, match="instances"):
+        replica_plan_table(table, slots_per_rank=slots, ep_size=ranks)
+    primary[REPLICA_INSTANCES - 1] = -1  # 7 replicas: 8 instances
+    index = np.where(primary >= 0, np.cumsum(primary >= 0), 0)
+    table = np.stack([own, primary, index]).astype(np.int32)
+    plan = replica_plan_table(table, slots_per_rank=slots, ep_size=ranks)
+    assert (plan[0:8, 0] >= 0).sum() == REPLICA_INSTANCES
+    assert plan[32, 0] == 0 and (plan[32, 1:] == -1).all()
+
+
+@pytest.mark.parametrize("layout", BALANCED_LAYOUTS)
+@pytest.mark.parametrize("num_tokens", [8, 128])
+def test_balanced_choice_matches_the_numpy_form_on_tpu(layout, num_tokens):
+    """Compiled for TPU: the serving slots and every rank's plan."""
+    _require_tpu()
+    num_members, tp_size, slots, redundant = layout
+    counts, primary, table, plan_table = _replica_layout(
+        num_members, tp_size, slots, redundant
+    )
+    slots_per_rank = slots + redundant
+    num_slots = num_members * tp_size * slots_per_rank
+    rng = np.random.default_rng(num_tokens)
+    rows, routes = _capacity(num_members, tp_size, num_tokens, slots, 2.0)
+    if rows >= num_members * num_tokens:
+        rows = max(32, num_members * num_tokens // 2 // 32 * 32)
+    words, prim, order = _balanced_words(rng, counts, primary, num_members, num_tokens)
+    want = balanced_reference(
+        prim, plan_table, slots_per_rank=slots_per_rank, num_slots=num_slots
+    )
+    served_words = (
+        np.where(want >= 0, want << ROUTE_ORDER_BITS | order, -1).astype(np.int64) << 16
+    )
+    served_words = np.swapaxes(served_words, 1, 2).astype(np.int32)
+    common = dict(
+        tp_size=tp_size,
+        slots_per_rank=slots_per_rank,
+        rows=rows,
+        routes=routes,
+        order_bits=ROUTE_ORDER_BITS,
+    )
+    for ep in range(num_members * tp_size):
+        got = exchange_plan(
+            jnp.asarray(words),
+            jnp.array([ep], jnp.int32),
+            replica_plan=jnp.asarray(plan_table),
+            **common,
+        )
+        np.testing.assert_array_equal(np.moveaxis(np.asarray(got.serving), 0, -1), want)
+        check(got, reference(jnp.asarray(served_words), ep, **common), num_tokens)

@@ -241,6 +241,45 @@ def test_buffers_with_replicas_hold_physical_slots(slots, redundant):
     assert plain._expert_slots is None and plain._expert_replicas is None
 
 
+def test_the_balanced_replica_choice_gets_the_replica_plan(
+    slots, redundant, monkeypatch
+):
+    from vllm_torchtpu.kernels.megablox.exchange_plan import replica_plan_table
+
+    monkeypatch.setenv("TPU_MOE_RAGGED_A2A", "1")
+    layer = _with_expert_tensors(_layer(2), E // EP + 1)
+    expert_placement.place_experts(layer)
+    expert_placement.register_slots_buffer(layer, device=torch.device("cpu"))
+    table = core.replica_table(slots, redundant, EP)
+    want = replica_plan_table(table, slots_per_rank=E // EP + 1, ep_size=EP)
+    np.testing.assert_array_equal(layer._expert_replica_plan.numpy(), want)
+    # With the choice off the layer keeps the hash rule: no plan.
+    monkeypatch.setenv("TPU_DECODE_FAST_PATHS_OFF", "a2a_replica_balance")
+    expert_placement.register_slots_buffer(layer, device=torch.device("cpu"))
+    assert layer._expert_replica_plan is None
+
+
+def test_the_balanced_replica_choice_refuses_too_many_instances(slots, monkeypatch):
+    # One expert replicated on every other rank: 8 instances fit, 9 do not.
+    local = E // EP
+    hot = int(np.argsort(slots)[0])
+    redundant = np.full(EP, hot, np.int32)
+    redundant[0] = -1
+    monkeypatch.setattr(expert_placement, "_REDUNDANT_PER_RANK", 1)
+    monkeypatch.setattr(envs, "TPU_MOE_RAGGED_A2A", True, raising=False)
+    monkeypatch.setenv("TPU_MOE_RAGGED_A2A", "1")
+    table = core.replica_table(slots, redundant, EP)
+    layer = SimpleNamespace(layer_name=NAME, global_num_experts=E)
+    assert int((table[1] >= 0).sum()) + 1 == EP  # 8 instances
+    expert_placement._replica_plan(layer, table, EP, 1)
+    # One more replica of the same expert, in a redundant slot of its own.
+    wide = np.concatenate([table, table[:, 1:2]], axis=1)
+    wide[0, -1] = EP * (local + 1)
+    wide[2, -1] = wide[2].max() + 1
+    with pytest.raises(ValueError, match="--max-replicas 7.*a2a_replica_balance"):
+        expert_placement._replica_plan(layer, wide, EP, 1)
+
+
 def test_empty_redundant_slots_are_zeroed(slots, redundant):
     for rank in (3, 4):  # rank 3's redundant slot is empty, rank 4's is not
         layer = _with_expert_tensors(_layer(rank), E // EP + 1)

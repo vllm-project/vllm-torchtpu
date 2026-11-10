@@ -1551,8 +1551,10 @@ def ragged_a2a_moe_local(
     routing_dma: bool = False,
     send_index_rows_minor: bool = False,
     plan_kernel: bool = False,
+    replica_balance: bool = False,
     shared: jax.Array | None = None,
     replicas: jax.Array | None = None,
+    replica_plan: jax.Array | None = None,
 ) -> jax.Array:
     """Per-rank body (inside shard_map over the (dp, tp) mesh).
 
@@ -1616,7 +1618,12 @@ def ragged_a2a_moe_local(
     (from the primaries) into the gathered routing, so the owner places and
     sums every output as the primaries would; the full-size exchange, and
     every other path, serves primaries. The capacities are those of the
-    primaries.
+    primaries. ``replica_balance`` with ``replica_plan`` [40, 128]
+    (`replica_plan_table`, where the plan kernel runs): the sender packs the
+    primary slot instead, and the plan kernel chooses every route's serving
+    slot from the whole group's routing, evening the ranks' loads; every rank
+    derives the same choice, which the plan, the row sends, the route plan and
+    the owners' expected rows all follow.
     """
     assert shared is None or owner_combine
     assert not owner_tail or owner_combine
@@ -1668,22 +1675,44 @@ def ragged_a2a_moe_local(
             rhs_quant_dtype=rhs_quant_dtype,
         )
 
+    use_plan_kernel = (
+        plan_kernel
+        and sorted_plan
+        and topk_weights.dtype == jnp.bfloat16
+        and exchange_plan_supported(
+            num_members=dp_size,
+            tp_size=tp_size,
+            num_tokens=num_tokens,
+            topk=topk,
+            slots_per_rank=local_num_experts,
+        )
+    )
     serving = None
     routed = topk_ids
-    if replicas is not None and rows < slots and fused(rows, routes):
-        serving = serving_slots(topk_ids, replicas)
+    # The packed fields carry the owner order (and the serving or, with the
+    # balanced choice, the primary slot).
+    replica_fields = replicas is not None and rows < slots and fused(rows, routes)
+    balanced = (
+        replica_fields
+        and replica_balance
+        and replica_plan is not None
+        and use_plan_kernel
+    )
+    if replica_fields:
+        if not balanced:
+            serving = serving_slots(topk_ids, replicas)
         order = owner_order(
             topk_ids,
             dp_size=dp_size,
             tp_size=tp_size,
             local_num_experts=local_num_experts,
         )
-        routed = pack_served_routes(serving, order)
+        routed = pack_served_routes(topk_ids if balanced else serving, order)
     gathered_ids, read_routes, packed_routes, gathered_words = _gather_routing(
         routed, topk_weights, dma_members=dp_size if routing_dma else 0
     )
     gathered_order = None
-    if serving is not None:
+    if replica_fields:
         gathered_ids, gathered_order = unpack_served_routes(gathered_ids)
     ep_rank = experts_start[0] // local_num_experts
     member_index = functools.partial(
@@ -1801,7 +1830,13 @@ def ragged_a2a_moe_local(
 
     def full():
         ids, read = gathered_ids, read_routes
-        if serving is not None:
+        if balanced:
+            # The fields carry the primaries.
+            def read(source_rows):
+                fields, weights = read_routes(source_rows)
+                return unpack_served_routes(fields)[0], weights
+
+        elif serving is not None:
             # Every route at its primary (inside the conditional only).
             ids = primary_slots(gathered_ids, replicas)
 
@@ -1834,20 +1869,9 @@ def ragged_a2a_moe_local(
 
     # The capacity exchange runs outside the conditional, so the schedule
     # around it (weight prefetches for the following layers) is unchanged.
-    capacity_streamed = streamed(rows, routes, 2, serving)
     planned = None
-    if (
-        plan_kernel
-        and capacity_streamed is not None
-        and plan is not None
-        and exchange_plan_supported(
-            num_members=dp_size,
-            tp_size=tp_size,
-            num_tokens=num_tokens,
-            topk=topk,
-            slots_per_rank=local_num_experts,
-        )
-    ):
+    capacity_ids = gathered_ids
+    if use_plan_kernel and plan is not None and fused(rows, routes):
         planned = exchange_plan(
             gathered_words,
             (experts_start // local_num_experts).astype(jnp.int32),
@@ -1855,9 +1879,17 @@ def ragged_a2a_moe_local(
             slots_per_rank=local_num_experts,
             rows=rows,
             routes=routes,
-            order_bits=ROUTE_ORDER_BITS if serving is not None else 0,
+            order_bits=ROUTE_ORDER_BITS if replica_fields else 0,
+            replica_plan=replica_plan if balanced else None,
         )
         overflow = planned.overflow
+        if balanced:
+            # The routes' serving slots: the group's [D, S, K] and this
+            # engine's own [S, K].
+            capacity_ids = jnp.moveaxis(planned.serving, 0, -1)
+            serving = jax.lax.dynamic_index_in_dim(
+                capacity_ids, ep_rank // tp_size, keepdims=False
+            )
     else:
         overflow = _capacity_overflow(
             gathered_ids,
@@ -1866,8 +1898,9 @@ def ragged_a2a_moe_local(
             rows=rows,
             routes=routes,
         )
+    capacity_streamed = streamed(rows, routes, 2, serving)
     capacity_plan = plan
-    if serving is not None and plan is not None:
+    if replica_fields and plan is not None:
         # The owners place each output by its sender's order.
         dests = functools.partial(
             owner_dests,
@@ -1881,7 +1914,7 @@ def ragged_a2a_moe_local(
         x,
         w1,
         topk_ids if serving is None else serving,
-        gathered_ids,
+        capacity_ids,
         read_routes,
         packed_routes,
         experts_start,
@@ -1931,13 +1964,16 @@ def ragged_a2a_moe(
     routing_dma: bool = False,
     send_index_rows_minor: bool = False,
     plan_kernel: bool = False,
+    replica_balance: bool = False,
     shared: jax.Array | None = None,
     replicas: jax.Array | None = None,
+    replica_plan: jax.Array | None = None,
 ) -> jax.Array:
     """Global-view entry: every operand is the ranks' local arrays stacked on
     two leading axes [dp, tp, ...], and so is the result [dp, tp, S, H]
-    (``shared``, the shared-expert partials, and ``replicas``, the same
-    redundant slots on every rank, likewise). Unscaled (bf16) experts pass
+    (``shared``, the shared-expert partials, ``replicas``, the same
+    redundant slots on every rank, and ``replica_plan``, their table for the
+    balanced choice, likewise). Unscaled (bf16) experts pass
     ``None`` for both scales."""
     spec = P(DP_AXIS, TP_AXIS)
     local = functools.partial(
@@ -1962,6 +1998,7 @@ def ragged_a2a_moe(
         routing_dma=routing_dma,
         send_index_rows_minor=send_index_rows_minor,
         plan_kernel=plan_kernel,
+        replica_balance=replica_balance,
     )
 
     scaled = w1_scale is not None
@@ -1971,6 +2008,8 @@ def ragged_a2a_moe(
     extra = {}
     if replicas is not None:
         extra["replicas"] = replicas
+    if replica_plan is not None:
+        extra["replica_plan"] = replica_plan
     if shared is not None:
         extra["shared"] = shared
     operands += tuple(extra.values())

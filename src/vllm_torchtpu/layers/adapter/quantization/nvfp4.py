@@ -589,6 +589,8 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
                 placed=expert_placement.host_slots(layer) is not None,
                 owner_combine=decode_switches.arm_owner_combine(layer),
                 replicas=expert_placement.redundant_slots_per_rank(layer) > 0,
+                balanced=expert_placement.redundant_slots_per_rank(layer) > 0
+                and decode_switches.replica_balance(decode_switches.get()),
             )
 
         if self._use_adaptive_fused_moe:
@@ -696,6 +698,7 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
                 layer, decode_switches.OWNER_COMBINE_ATTR, False
             )
             kwargs["replicas"] = getattr(layer, "_expert_replicas", None)
+            kwargs["replica_plan"] = getattr(layer, "_expert_replica_plan", None)
             return ragged_a2a_fused_moe_gmm(**kwargs)
         if enable_pipelined_collective_and_compute():
             return pipelined_fused_moe_gmm(**kwargs)

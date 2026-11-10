@@ -149,6 +149,7 @@ def _get_op(
     placed=False,
     owner_combine=False,
     replicas=False,
+    balanced=False,
 ):
     key = (
         topk,
@@ -160,6 +161,7 @@ def _get_op(
         placed,
         owner_combine,
         replicas,
+        balanced,
     )
     op = _OPS.get(key)
     if op is not None:
@@ -168,6 +170,12 @@ def _get_op(
     keywords = decode_switches.exchange_keywords(switches, owner_combine=owner_combine)
     if replicas:
         _check_replicas(switches, scaled=scaled, owner_combine=owner_combine)
+    if balanced and not (replicas and keywords["replica_balance"]):
+        raise ValueError(
+            "a replica plan needs redundant slots and the paths a2a_plan_kernel and "
+            "a2a_replica_balance"
+        )
+    keywords["replica_balance"] = balanced
     mesh = get_dp_tp_mesh()
     # The full-size exchange receives into one region per DP member, sized for
     # all of that member's tokens: the local permute sees the all-gather
@@ -304,7 +312,61 @@ def _get_op(
             shared=shared_output,
         )
 
-    if replicas:
+    def fn_replicas_plan(
+        x: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array,
+        w2_scale: jax.Array,
+        topk_weights: jax.Array,
+        topk_ids: jax.Array,
+        experts_start: jax.Array,
+        replica_table: jax.Array,
+        replica_plan: jax.Array,
+    ) -> jax.Array:
+        return run(
+            x,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            topk_weights,
+            topk_ids,
+            experts_start,
+            replicas=replica_table,
+            replica_plan=replica_plan,
+        )
+
+    def fn_replicas_plan_shared(
+        x: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array,
+        w2_scale: jax.Array,
+        topk_weights: jax.Array,
+        topk_ids: jax.Array,
+        experts_start: jax.Array,
+        replica_table: jax.Array,
+        replica_plan: jax.Array,
+        shared_output: jax.Array,
+    ) -> jax.Array:
+        return run(
+            x,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            topk_weights,
+            topk_ids,
+            experts_start,
+            replicas=replica_table,
+            replica_plan=replica_plan,
+            shared=shared_output,
+        )
+
+    if balanced:
+        body = fn_replicas_plan_shared if shared else fn_replicas_plan
+    elif replicas:
         body = fn_replicas_shared if shared else fn_replicas
     elif scaled:
         body = fn_shared if shared else fn
@@ -316,7 +378,7 @@ def _get_op(
         f"pallas::ragged_a2a_moe_{len(_OPS)}",
         body,
         mesh=mesh,
-        input_partition_specs=(spec,) * (6 + 2 * scaled + shared + replicas),
+        input_partition_specs=(spec,) * (6 + 2 * scaled + shared + replicas + balanced),
         # A tuple of per-output specs: a bare PartitionSpec is not a tuple, so
         # torch_tpu would read its first axis name as the whole spec.
         output_partition_specs=(spec,),
@@ -329,7 +391,8 @@ def _get_op(
         "permute threshold %d routed rows (full decode step: %d routed rows) | "
         "streamed combine %s, owner combine %s, row gather %s, row scatter %s, "
         "owner tail %s, "
-        "routing dma %s, send index rows minor %s, plan kernel %s",
+        "routing dma %s, send index rows minor %s, plan kernel %s, replica "
+        "balance %s",
         topk,
         activation,
         mesh.shape[DP_AXIS],
@@ -344,6 +407,7 @@ def _get_op(
         "on" if keywords["routing_dma"] else "off",
         "on" if keywords["send_index_rows_minor"] else "off",
         "on" if keywords["plan_kernel"] else "off",
+        "on" if balanced else "off",
     )
     _log_capacity(
         mesh, topk, onehot_threshold, step_routed_rows, capacity_factor, route_factor
@@ -408,12 +472,14 @@ def prebuild_ragged_a2a_moe(
     placed=False,
     owner_combine=False,
     replicas=False,
+    balanced=False,
 ) -> None:
     """Build the mesh and op at weight load, outside the traced forward.
     ``scaled=False``: the op for unscaled (bf16) experts; ``placed``: for a
     layer TPU_MOE_EXPERT_PLACEMENT places; ``owner_combine``: for a layer
     whose owner combine is armed (``decode_switches.arm_owner_combine``);
-    ``replicas``: one whose file has redundant slots.
+    ``replicas``: one whose file has redundant slots; ``balanced``: and
+    takes the balanced replica choice (``decode_switches.replica_balance``).
 
     Padded tokens reach the op unrouted (TPU_MOE_SKIP_PADDED_TOKENS
     drops their routes at top-k), so the op never skips routes by weight."""
@@ -428,6 +494,7 @@ def prebuild_ragged_a2a_moe(
             placed=placed,
             owner_combine=owner_combine,
             replicas=replicas,
+            balanced=balanced,
         )
 
 
@@ -449,6 +516,7 @@ def ragged_a2a_fused_moe_gmm(
     placed: bool = False,
     owner_combine: bool = False,
     replicas: torch.Tensor | None = None,
+    replica_plan: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Same contract as ``fused_moe_gmm`` with local tokens in and out; the
     result still needs vLLM's TP all-reduce, except with ``owner_combine``
@@ -457,7 +525,9 @@ def ragged_a2a_fused_moe_gmm(
     partial) when given. Unscaled (bf16) experts pass ``None`` for both
     scales; ``placed``: the layer's experts are placed by
     TPU_MOE_EXPERT_PLACEMENT; ``replicas``: its redundant slots
-    (``layer._expert_replicas``) when the file has them."""
+    (``layer._expert_replicas``) when the file has them; ``replica_plan``:
+    their table for the balanced replica choice
+    (``layer._expert_replica_plan``) when that choice is on."""
     if w1_bias is not None or w2_bias is not None:
         raise NotImplementedError("TPU_MOE_RAGGED_A2A does not take expert biases")
     if experts_start is None:
@@ -477,6 +547,7 @@ def ragged_a2a_fused_moe_gmm(
         placed=placed,
         owner_combine=owner_combine,
         replicas=replicas is not None,
+        balanced=replica_plan is not None,
     )
     scales = (w1_scale, w2_scale) if scaled else ()
     stacked = (
@@ -490,6 +561,8 @@ def ragged_a2a_fused_moe_gmm(
     )
     if replicas is not None:
         stacked += (replicas,)
+    if replica_plan is not None:
+        stacked += (replica_plan,)
     if shared_output is not None:
         stacked += (shared_output.to(hidden_states.dtype),)
     out = op(*(t.reshape(1, 1, *t.shape) for t in stacked))

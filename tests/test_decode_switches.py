@@ -46,12 +46,13 @@ EXCHANGE_OF_THE_NEW_LINE = {
     "routing_dma": True,
     "send_index_rows_minor": True,
     "plan_kernel": True,
+    "replica_balance": True,
 }
 
 
 def test_the_path_table_names_are_short_lowercase_and_unique():
     names = [p.name for p in ds.PATHS]
-    assert len(names) == len(set(names)) == 16
+    assert len(names) == len(set(names)) == 17
     assert all(n == n.lower() and " " not in n and len(n) <= 20 for n in names)
 
 
@@ -77,6 +78,7 @@ def test_the_launch_line_turns_every_path_on():
                 "a2a_send_rows_minor",
                 "a2a_routing_dma",
                 "a2a_plan_kernel",
+                "a2a_replica_balance",
                 "a2a_unquantized",
                 "a2a_owner_combine",
                 "a2a_owner_tail",
@@ -146,6 +148,16 @@ def test_the_plan_kernel_follows_the_sorted_plan():
     assert not ds.exchange_keywords(ds.resolve(env), owner_combine=True)["plan_kernel"]
     env["TPU_DECODE_FAST_PATHS_OFF"] = "a2a_sorted_plan,a2a_row_gather,a2a_row_scatter"
     assert not ds.exchange_keywords(ds.resolve(env), owner_combine=True)["plan_kernel"]
+
+
+def test_the_replica_balance_follows_the_plan_kernel():
+    env = {"TPU_MOE_RAGGED_A2A": "1"}
+    assert ds.exchange_keywords(ds.resolve(env), owner_combine=True)["replica_balance"]
+    for off in ("a2a_replica_balance", "a2a_plan_kernel"):
+        env["TPU_DECODE_FAST_PATHS_OFF"] = off
+        sw = ds.resolve(env)
+        assert not ds.exchange_keywords(sw, owner_combine=True)["replica_balance"]
+        assert not ds.replica_balance(sw)
 
 
 def test_the_exchange_keywords_follow_the_layer_not_the_switch():

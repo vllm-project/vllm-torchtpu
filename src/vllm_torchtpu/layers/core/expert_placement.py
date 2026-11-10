@@ -105,18 +105,22 @@ def balance(counts: np.ndarray, ep_size: int) -> np.ndarray:
     return slots
 
 
-def replicate(counts: np.ndarray, extra: int) -> np.ndarray:
+def replicate(counts: np.ndarray, extra: int, max_replicas: int = 0) -> np.ndarray:
     """Replicas of each logical expert [E] (int64, >= 1) for ``extra`` more
     slots of one layer: each goes to the expert with the largest count per
     replica (ties to the lower id), and none to a replica that would carry
     less than ``REPLICA_GUARD`` times the mean count, so near-uniform counts
-    get no replicas."""
+    get no replicas. ``max_replicas`` > 0: no expert gets more than that many
+    besides its primary."""
     counts = np.asarray(counts, dtype=np.float64)
     replicas = np.ones(counts.shape[0], dtype=np.int64)
     floor = REPLICA_GUARD * counts.mean()
     for _ in range(extra):
-        e = int(np.argmax(counts / replicas))
-        if counts[e] / (replicas[e] + 1) < floor:
+        share = counts / replicas
+        if max_replicas > 0:
+            share = np.where(replicas > max_replicas, -np.inf, share)
+        e = int(np.argmax(share))
+        if share[e] == -np.inf or counts[e] / (replicas[e] + 1) < floor:
             break
         replicas[e] += 1
     return replicas
@@ -367,6 +371,13 @@ def main(argv=None) -> None:
         "busiest experts (0: none)",
     )
     parser.add_argument(
+        "--max-replicas",
+        type=int,
+        default=0,
+        help="replicas per expert at most, besides its primary (0: no limit; "
+        "the plan kernel's balanced replica choice takes at most 7)",
+    )
+    parser.add_argument(
         "--slots-from",
         help="placement file whose slots to keep (replicas come from the counts)",
     )
@@ -380,8 +391,8 @@ def main(argv=None) -> None:
             f"no routes counted for {len(empty)} of {len(names)} layers "
             f"({empty[0]} first)"
         )
-    if args.redundant_per_rank < 0:
-        raise ValueError("--redundant-per-rank must be >= 0")
+    if args.redundant_per_rank < 0 or args.max_replicas < 0:
+        raise ValueError("--redundant-per-rank and --max-replicas must be >= 0")
     if args.slots_from:
         kept, kept_ep_size = load(args.slots_from)
         missing = [name for name in names if name not in kept]
@@ -403,7 +414,7 @@ def main(argv=None) -> None:
                     placed,
                     args.ep_size,
                     args.redundant_per_rank,
-                    replicate(row, extra),
+                    replicate(row, extra, args.max_replicas),
                 )
                 for row, placed in zip(counts, slots)
             ]

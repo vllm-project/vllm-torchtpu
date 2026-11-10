@@ -13,6 +13,7 @@ import numpy as np
 import pytest
 from jax.sharding import Mesh
 
+from vllm_torchtpu.kernels.megablox.exchange_plan import replica_plan_table
 from vllm_torchtpu.layers.core import expert_placement as core
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
     quantize_to_native_fp4_kmajor,
@@ -196,6 +197,15 @@ def _run_owner(
         kwargs["replicas"] = jnp.asarray(tiled).reshape(
             dp_size, tp_size, *replicas.shape
         )
+        if knobs.get("replica_balance"):
+            plan = replica_plan_table(
+                replicas,
+                slots_per_rank=EXPERTS // RANKS + replicas.shape[1] // RANKS,
+                ep_size=RANKS,
+            )
+            kwargs["replica_plan"] = jnp.asarray(np.tile(plan, (RANKS, 1))).reshape(
+                dp_size, tp_size, *plan.shape
+            )
     run = functools.partial(
         ragged_a2a_moe,
         mesh=mesh,
@@ -228,6 +238,22 @@ REPLICA_OPTIONS = {
         row_gather=True, row_scatter=True, routing_dma=True, owner_tail=True
     ),
     "plain": {},
+    # The plan kernel's balanced replica choice instead of the hash rule.
+    "balanced": dict(
+        row_gather=True,
+        row_scatter=True,
+        routing_dma=True,
+        plan_kernel=True,
+        replica_balance=True,
+    ),
+    "balanced_tail": dict(
+        row_gather=True,
+        row_scatter=True,
+        routing_dma=True,
+        plan_kernel=True,
+        replica_balance=True,
+        owner_tail=True,
+    ),
 }
 REPLICA_CASES = (
     [
@@ -249,6 +275,15 @@ REPLICA_CASES = (
     + [((2, 4, 112), "spread", "fits", "plain", False)]
     + [((4, 2, 56), "greedy", "fits", "served_tail", True)]
     + [((2, 4, 112), "spread", "full", "served", False)]
+    + [
+        (layout, table, capacity, options, False)
+        for layout in ((2, 4, 112), (4, 2, 56))
+        for table in ("spread", "greedy", "greedy2")
+        for capacity in ("fits", "overflow")
+        for options in ("balanced", "balanced_tail")
+    ]
+    + [((4, 2, 56), "greedy", "fits", "balanced_tail", True)]
+    + [((2, 4, 112), "spread", "overflow_sc", "balanced", False)]
 )
 _REPLICA_BASE = {}
 
@@ -308,7 +343,9 @@ def test_replicas_keep_every_output_bit(layout, table, capacity, options, padded
         overflow = _capacity_overflow(
             serving, tp_size=tp_size, local_num_experts=local, rows=rows, routes=routes
         )
-        assert bool(overflow) == capacity.startswith("overflow")
+        # The balanced choice decides its own branch from its own slots.
+        if not options.startswith("balanced"):
+            assert bool(overflow) == capacity.startswith("overflow")
     assert (np.asarray(serving) != np.asarray(engine_ids)).mean() > 0.01
 
     key = (layout, capacity, options, padded)  # the same slots for every table

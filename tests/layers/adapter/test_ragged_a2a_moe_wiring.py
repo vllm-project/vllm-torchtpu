@@ -334,12 +334,35 @@ def test_replicas_reach_the_exchange_in_their_own_ops(monkeypatch):
     ragged_a2a.prebuild_ragged_a2a_moe(**build)
     ragged_a2a.prebuild_ragged_a2a_moe(replicas=True, **build)
     assert len(ragged_a2a._OPS) == 4
-    assert [key[-1] for key in ragged_a2a._OPS] == [True, True, False, False]
+    assert [key[-2] for key in ragged_a2a._OPS] == [True, True, False, False]
+    assert not any(key[-1] for key in ragged_a2a._OPS)
     assert operands == [9, 10, 8, 9]
     assert seen[0]["replicas"] == 8 and "shared" not in seen[0]
     assert seen[1]["replicas"] == 8 and seen[1]["shared"] == 9
     assert "replicas" not in seen[2] and "replicas" not in seen[3]
     assert all(kw["owner_combine"] and kw["sorted_plan"] for kw in seen)
+
+
+@pytest.mark.cpu_test
+def test_the_balanced_replica_choice_takes_its_own_ops(monkeypatch):
+    """With the replica plan the ops take it as the operand after the replica
+    table and run the balanced choice; without the path they refuse it."""
+    seen, operands = _record_ops(monkeypatch)
+    monkeypatch.setenv("TPU_MOE_RAGGED_A2A", "1")
+    monkeypatch.delenv("TPU_DECODE_FAST_PATHS_OFF", raising=False)
+    build = dict(topk=10, activation="silu", placed=True, owner_combine=True)
+    ragged_a2a.prebuild_ragged_a2a_moe(replicas=True, balanced=True, **build)
+    assert operands == [10, 11]
+    assert [key[-1] for key in ragged_a2a._OPS] == [True, True]
+    assert seen[0]["replicas"] == 8 and seen[0]["replica_plan"] == 9
+    assert seen[1]["replica_plan"] == 9 and seen[1]["shared"] == 10
+    assert all(kw["replica_balance"] and kw["plan_kernel"] for kw in seen)
+    monkeypatch.setattr(ragged_a2a, "_OPS", {})
+    monkeypatch.setenv("TPU_DECODE_FAST_PATHS_OFF", "a2a_replica_balance")
+    with pytest.raises(ValueError, match="a replica plan needs"):
+        ragged_a2a.prebuild_ragged_a2a_moe(replicas=True, balanced=True, **build)
+    ragged_a2a.prebuild_ragged_a2a_moe(replicas=True, **build)
+    assert all(not kw["replica_balance"] for kw in seen[2:])
 
 
 NO_SORTED_PLAN = "a2a_sorted_plan,a2a_row_gather,a2a_row_scatter,a2a_send_rows_minor"
@@ -374,8 +397,9 @@ def test_replicas_refuse_paths_that_do_not_serve_them(
 
 
 @pytest.mark.cpu_test
+@pytest.mark.parametrize("balanced", [False, True])
 @pytest.mark.parametrize("shared", [False, True])
-def test_replica_table_is_passed_to_the_op(monkeypatch, shared):
+def test_replica_table_is_passed_to_the_op(monkeypatch, shared, balanced):
     import torch
 
     built, calls = [], []
@@ -386,6 +410,7 @@ def test_replica_table_is_passed_to_the_op(monkeypatch, shared):
 
     monkeypatch.setattr(ragged_a2a, "_get_op", _get_op)
     table = torch.arange(3 * 64, dtype=torch.int32).reshape(3, 64)
+    plan = torch.arange(40 * 128, dtype=torch.int32).reshape(40, 128)
     x = torch.zeros(4, 8)
     ragged_a2a.ragged_a2a_fused_moe_gmm(
         x,
@@ -404,9 +429,13 @@ def test_replica_table_is_passed_to_the_op(monkeypatch, shared):
         placed=True,
         owner_combine=True,
         replicas=table,
+        replica_plan=plan if balanced else None,
     )
     assert built[0]["replicas"] is True and built[0]["shared"] is shared
+    assert built[0]["balanced"] is balanced
     (operands,) = calls
-    assert len(operands) == 9 + shared
+    assert len(operands) == 9 + balanced + shared
     assert torch.equal(operands[8].reshape(3, 64), table)
     assert operands[8].shape == (1, 1, 3, 64)
+    if balanced:
+        assert torch.equal(operands[9].reshape(40, 128), plan)

@@ -50,6 +50,11 @@ import numpy as np
 import torch
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu import decode_switches
+from vllm_torchtpu.kernels.megablox.exchange_plan import (
+    REPLICA_INSTANCES,
+    replica_plan_table,
+)
 from vllm_torchtpu.layers.adapter import token_padding
 from vllm_torchtpu.layers.core import expert_placement as core
 from vllm_torchtpu.logger import init_logger
@@ -181,10 +186,25 @@ def place_experts(layer) -> None:
     setattr(layer, _HOST_SLOTS, slots)
 
 
+def _replica_plan(layer, table, ep_size: int, redundant_per_rank: int) -> np.ndarray:
+    """The layer's table for the balanced replica choice
+    (``replica_plan_table``); refuses a file the choice does not take."""
+    slots_per_rank = layer.global_num_experts // ep_size + redundant_per_rank
+    try:
+        return replica_plan_table(table, slots_per_rank=slots_per_rank, ep_size=ep_size)
+    except ValueError as err:
+        raise ValueError(
+            f"{layer.layer_name} ({envs.TPU_MOE_EXPERT_PLACEMENT}): {err}. Rebuild "
+            f"the file with --max-replicas {REPLICA_INSTANCES - 1}, or add "
+            f"a2a_replica_balance to {decode_switches.FAST_PATHS_OFF}"
+        ) from err
+
+
 def register_slots_buffer(layer, *, device: torch.device) -> None:
     """Register ``layer._expert_slots`` (None for layers not placed), with
     replicas ``layer._expert_replicas`` (``core.replica_table``, the same on every
-    rank), and the routing counts of a layer ``place_experts`` marked."""
+    rank) and, for the balanced replica choice, ``layer._expert_replica_plan``,
+    and the routing counts of a layer ``place_experts`` marked."""
     global _placed_layers, _redundant_bytes
     slots = host_slots(layer)
     if slots is None and _file_slots(layer) is not None:
@@ -192,7 +212,7 @@ def register_slots_buffer(layer, *, device: torch.device) -> None:
             f"{layer.layer_name}: TPU_MOE_EXPERT_PLACEMENT is implemented for "
             "the NVFP4 grouped-matmul MoE path only"
         )
-    buffer = replicas = None
+    buffer = replicas = plan = None
     redundant_per_rank = redundant_slots_per_rank(layer)
     if slots is not None:
         ep_size = layer.moe_config.moe_parallel_config.ep_size
@@ -201,6 +221,9 @@ def register_slots_buffer(layer, *, device: torch.device) -> None:
             placed = core.physical_slots(slots, ep_size, redundant_per_rank)
             table = core.replica_table(slots, _REDUNDANT[layer.layer_name], ep_size)
             replicas = torch.from_numpy(table).to(device)
+            if decode_switches.replica_balance(decode_switches.get()):
+                plan = _replica_plan(layer, table, ep_size, redundant_per_rank)
+                plan = torch.from_numpy(plan).to(device)
             _redundant_bytes += redundant_per_rank * sum(
                 t.numel() * t.element_size() // t.shape[0]
                 for t in _expert_tensors(layer)
@@ -208,6 +231,7 @@ def register_slots_buffer(layer, *, device: torch.device) -> None:
         buffer = torch.from_numpy(placed.astype(np.int32)).to(device)
     layer.register_buffer("_expert_slots", buffer, persistent=False)
     layer.register_buffer("_expert_replicas", replicas, persistent=False)
+    layer.register_buffer("_expert_replica_plan", plan, persistent=False)
     if slots is not None and _PLACEMENT is not None:
         _placed_layers += 1
         if _placed_layers == len(_PLACEMENT):
