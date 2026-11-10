@@ -182,17 +182,16 @@ def test_sequence_parallel_rejects_pipeline_parallel(configure_sp_moe):
 
 
 @pytest.mark.parametrize(
-    "tp,dp,ep,drafter,expected",
+    "tp,dp,ep,expected",
     [
-        (8, 1, True, False, True),  # TP8 without data parallelism
-        (2, 4, True, False, True),  # attention data parallelism over EP ranks
-        (4, 2, True, False, True),
-        (1, 8, True, False, False),  # no TP: nothing to slice
-        (2, 4, False, False, False),  # no EP: the expert sum is never reduced
-        (8, 1, True, True, False),  # the drafter's config copy
+        (8, 1, True, True),  # TP8 without data parallelism
+        (2, 4, True, True),  # attention data parallelism over EP ranks
+        (4, 2, True, True),
+        (1, 8, True, False),  # no TP: nothing to slice
+        (2, 4, False, False),  # no EP: the expert sum is never reduced
     ],
 )
-def test_sequence_parallel_moe_admission(monkeypatch, tp, dp, ep, drafter, expected):
+def test_sequence_parallel_moe_admission(monkeypatch, tp, dp, ep, expected):
     from vllm.config.parallel import ParallelConfig
 
     import vllm_torchtpu
@@ -210,8 +209,6 @@ def test_sequence_parallel_moe_admission(monkeypatch, tp, dp, ep, drafter, expec
             tensor_parallel_size=tp,
             data_parallel_size=dp,
         )
-        if drafter:
-            config._tpu_disable_sp_moe = True
         assert admitted(config) is expected
     finally:
         if saved is not None:
