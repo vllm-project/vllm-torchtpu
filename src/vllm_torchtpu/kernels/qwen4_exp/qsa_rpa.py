@@ -541,6 +541,58 @@ def _prefill_attention(
 ):
     """With ``return_lse`` returns ``(out, lse, cache)`` (see
     ``block_sparse_gqa_attention``)."""
+    union_group = envs.VLLM_TPU_QSA_PREFILL_UNION_WALK
+    if union_group and (128 % union_group or union_group < 8):
+        raise ValueError(
+            "VLLM_TPU_QSA_PREFILL_UNION_WALK must be a divisor of 128, at least 8"
+        )
+    if (
+        union_group
+        and dcp is None
+        and not return_lse
+        and kv_head_offset == 0
+        and ratio == 4
+        and cache.dtype == jnp.float8_e4m3fn
+        and cache.shape[1] % 128 == 0
+        and tuple(cache.shape[2:]) == (1, 4, 256)
+        # Unsharded Q24/KV2, or a TP rank's one KV head with 24 / TP queries.
+        and (query.shape[1], kv_heads) in ((24, 2), (12, 1), (6, 1), (3, 1))
+        and query.shape[2] == 256
+        and query.shape[0] % union_group == 0
+        and query.shape[0] >= 1024
+    ):
+        from vllm_torchtpu.kernels.qwen4_exp.qsa_union_dense import union_walk_prefill
+
+        return union_walk_prefill(
+            query,
+            gate,
+            blocks,
+            lengths,
+            table,
+            cache,
+            starts,
+            kv_heads=kv_heads,
+            ratio=ratio,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            group=union_group,
+            kv_tile=envs.VLLM_TPU_QSA_PREFILL_UNION_KV_TILE,
+            union_cap=envs.VLLM_TPU_QSA_PREFILL_UNION_CAP,
+            min_context=envs.VLLM_TPU_QSA_PREFILL_UNION_MIN_CONTEXT,
+            lean=envs.VLLM_TPU_QSA_PREFILL_LEAN,
+            listed=envs.VLLM_TPU_QSA_PREFILL_UNION_LISTED or None,
+            share_bits=envs.VLLM_TPU_QSA_PREFILL_UNION_SHARE_BITS,
+            union_alpha=envs.VLLM_TPU_QSA_PREFILL_UNION_ALPHA,
+            qk16=envs.VLLM_TPU_QSA_PREFILL_UNION_QK16,
+            run_tables=envs.VLLM_TPU_QSA_PREFILL_UNION_RUN_TABLES,
+            lazy_share=envs.VLLM_TPU_QSA_PREFILL_UNION_LAZY_SHARE,
+            gathered=envs.VLLM_TPU_QSA_PREFILL_UNION_GATHERED or None,
+            gather_chunks=envs.VLLM_TPU_QSA_PREFILL_UNION_GATHER_CHUNKS,
+            gather_growth=envs.VLLM_TPU_QSA_PREFILL_UNION_GATHER_GROWTH,
+            compact_reqs=envs.VLLM_TPU_QSA_PREFILL_UNION_COMPACT_REQS,
+            compact_copy_method=envs.VLLM_TPU_QSA_PREFILL_UNION_COMPACT_COPY,
+            sc_bitset=envs.VLLM_TPU_QSA_PREFILL_UNION_SC_BITSET,
+        )
     from vllm_torchtpu.kernels.qwen4_exp.block_sparse_gqa_prefill import (
         block_sparse_gqa_attention,
     )
