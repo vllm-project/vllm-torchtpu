@@ -936,6 +936,7 @@ def rpa_kernel(
             # we initiallize scratch memory with non-zero values. Even if the scratch
             # memory is storing kv cache from previous step, as long as the data is
             # not NaNs, there will be no numeric concerns.
+            # call) are not zeroed.
 
             q_alloc, kv_cache_alloc, o_alloc, lse_alloc = final_allocs
 
