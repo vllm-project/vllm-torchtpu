@@ -273,6 +273,8 @@ legs:
         detok_prompt_tail: true
         lazy_reasoning_count: true
         tokenize_prefix_cache: true
+      tpu_multiport_dp:
+        enabled: true
       tpu_runner:
         stage_timing: false
       tpu_worker:
