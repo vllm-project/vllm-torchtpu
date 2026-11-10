@@ -399,9 +399,21 @@ def test_omni_ring_dispatch_and_env_knobs(monkeypatch: pytest.MonkeyPatch) -> No
 
 
 @pytest.mark.tpu_test
-@pytest.mark.parametrize("ring_size,shard_len", [(2, 390), (4, 390), (4, 4290)])
+@pytest.mark.parametrize(
+    "ring_size,shard_len,block_kv",
+    [
+        (2, 390, None),
+        (4, 390, None),
+        (4, 4290, None),
+        # block_kv=1024 splits each hop into 5 KV blocks with a ragged tail, so
+        # the multi-block DMA pipeline (_reload_own, credit semaphores) runs.
+        (4, 4290, 1024),
+        # Tuned Wan 2.2 shard: several KV blocks per hop, ragged tail.
+        (4, 18900, None),
+    ],
+)
 def test_sharded_ring_on_device_matches_fp32_reference(
-    ring_size: int, shard_len: int
+    ring_size: int, shard_len: int, block_kv: int | None
 ) -> None:
     import jax
     import jax.numpy as jnp
@@ -424,7 +436,15 @@ def test_sharded_ring_on_device_matches_fp32_reference(
     q_bf16 = jnp.asarray(q_np, dtype=jnp.bfloat16)
     k_bf16 = jnp.asarray(k_np, dtype=jnp.bfloat16)
     v_bf16 = jnp.asarray(v_np, dtype=jnp.bfloat16)
-    ref = _fp32_attention_reference(q_bf16, k_bf16, v_bf16, scale)
+    # A full fp32 (seq x seq) score matrix does not fit host memory at 75600
+    # rows, so long cases check a fixed sample of query rows.
+    rows = (
+        np.arange(seq_len)
+        if seq_len <= 20_000
+        else np.sort(rng.choice(seq_len, size=2048, replace=False))
+    )
+    ref = _fp32_attention_reference(q_bf16[:, rows], k_bf16, v_bf16, scale)
+    pinned = None if block_kv is None else {"block_kv": block_kv}
 
     axis_names = ("batch", "ring", "uly")
     mesh = Mesh(
@@ -455,6 +475,7 @@ def test_sharded_ring_on_device_matches_fp32_reference(
                     axis_names=axis_names,
                     scale=scale,
                     use_fixed_m=use_fixed_m,
+                    pinned=pinned,
                 ),
                 mesh=mesh,
                 in_specs=(spec, spec, spec),
@@ -462,9 +483,14 @@ def test_sharded_ring_on_device_matches_fp32_reference(
                 check_vma=False,
             )
         )
+        if pinned is not None or shard_len == 18900:
+            blocks = ring_kernel.Blocks.for_shard(
+                shard_len, ring_size, pinned, use_fixed_m=use_fixed_m
+            )
+            assert blocks.block_kv < shard_len
         out = np.asarray(fn(q_in, k_in, v_in), dtype=np.float32)[0, :, 0, 0].reshape(
             1, seq_len, 4, head_dim
-        )
+        )[:, rows]
         assert np.all(np.isfinite(out))
         rel_l2 = float(np.linalg.norm(out - ref) / np.linalg.norm(ref))
         assert rel_l2 < 7e-3
