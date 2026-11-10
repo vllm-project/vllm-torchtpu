@@ -108,20 +108,26 @@ def gdn_blocks(
     def inside(x):
         return x if n_blocks is None else jnp.where((x >= 0) & (x < n_blocks), x, 0)
 
-    def one(st, off, ck, qsl, seq):
-        st = _fit(st, NS)
+    def one(idx, ck, qsl, seq):  # idx: this layer's `off[st]`
         ck = _fit(ck[:, :T_VERIFY], NS)
         qsl = _fit(qsl, NS + 1)
         q_len = qsl[1:] - qsl[:-1]
         live = q_len > 0
-        rb = jnp.take_along_axis(ck, off[st][:, None], axis=1)[:, 0]
+        rb = jnp.take_along_axis(ck, idx[:, None], axis=1)[:, 0]
         return (
             inside(jnp.where(live, rb, 0)),
             inside(jnp.where(live[:, None] & write, ck, 0)),
             live & ((_fit(seq, NS) - q_len) > 0),
         )
 
-    layers = [meta[i : i + GDN_META] for i in range(0, len(meta), GDN_META)]
+    # (idx, ck, qsl, seq) per layer. The slot-offset table is one [num_slots] array that
+    # every GDN layer passes; gathered per layer, never stacked (33 x 113728 copied).
+    layers = [
+        (off[_fit(st, NS)], ck, qsl, seq)
+        for st, off, ck, qsl, seq in (
+            meta[i : i + GDN_META] for i in range(0, len(meta), GDN_META)
+        )
+    ]
     if (
         envs.VLLM_TPU_MK_WHOLE_BATCHED_INPUTS
         and len(layers) > 1
