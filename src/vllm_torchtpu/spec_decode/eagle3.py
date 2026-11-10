@@ -481,9 +481,12 @@ class Eagle3Proposer:
             and not self._share_mtp_indices
             and not self._draft_kv_shared
             and self.speculative_config.num_speculative_tokens > 1
+            and not self._dp_lockstep_sharded()
         ):
             # Step 0 traces with the post-attention gather baked in, so the
-            # per-step loop's steps 1..K-1 need a program of their own.
+            # per-step loop's steps 1..K-1 need a program of their own. Under
+            # EP-DP lockstep the gather stays off (see
+            # _use_mtp_step0_post_attn_gather) and every step runs the draft.
             self._build_mtp_step0_gather_loop_model()
 
         # IndexShare assumes the draft owns its KV cache and advances
@@ -1576,7 +1579,8 @@ class Eagle3Proposer:
         # Fused on-device async first-pass input prep at bucketed shapes:
         #   input_ids: [T]
         #   next_tokens_device: [B, K+1]
-        #   draft_lengths: [B] (padded rows [num_reqs:B] are 0)
+        #   draft_lengths: [B] (rows past num_reqs never reach the rejected
+        #     count, see below)
         #   query_start_loc: [knr + 1]
         #   pad_req_idx: [p] (clamped to num_reqs - 1 so the padded tail
         #     repeats the last valid request idempotently)
@@ -1601,6 +1605,13 @@ class Eagle3Proposer:
         num_rejected_b = (num_draft_dev - accepted_drafts).to(torch.int32)
         qsl_end = query_start_loc[1 : eff_b + 1].to(torch.int64)
         last_token_indices_b = qsl_end - 1 - num_rejected_b.to(torch.int64)
+        # Rows past the last real request (pad_req_idx[-1] == num_reqs - 1)
+        # report no rejections, whatever their draft_lengths rows hold.
+        # num_reqs enters as a value, not a shape.
+        is_real_row = torch.arange(eff_b, device=pad_req_idx.device) <= pad_req_idx[-1]
+        num_rejected_b = torch.where(
+            is_real_row, num_rejected_b, torch.zeros_like(num_rejected_b)
+        )
 
         gather_indices = torch.index_select(last_token_indices_b, 0, pad_req_idx)
         seed_token_ids = torch.index_select(next_token_ids_b, 0, pad_req_idx)
@@ -1986,13 +1997,16 @@ class Eagle3Proposer:
                 )
                 assert knr is not None
                 if is_async:
-                    # nr is at the sampler's request-padding width, which can
-                    # sit above a chunk's kernel_num_reqs; the rows past the
-                    # chunk's requests are zeros either way.
+                    # _draft_async_prepare_inputs returns nr at the chunk's
+                    # kernel_num_reqs width; a count at the sampler's wider
+                    # request-padding width is cut to it. The rows past the
+                    # chunk's requests are zeros either way. Only a wider nr
+                    # is sliced: a slice reaching a compiled call costs an
+                    # extra as_strided program.
+                    if nr is not None and nr.shape[0] > knr:
+                        nr = nr[:knr]
                     rejected_dev_per_chunk.append(
-                        _maybe_pad_dim0(cast(torch.Tensor, nr)[:knr], knr)
-                        if nr is not None
-                        else None
+                        _maybe_pad_dim0(nr, knr) if nr is not None else None
                     )
                 elif nr is not None and np.any(nr):
                     padded_nr = np.zeros(knr, dtype=np.int32)
@@ -2836,12 +2850,21 @@ class Eagle3Proposer:
         *,
         can_use_post_step0_fused: bool = True,
     ) -> bool:
+        """Whether this chunk's MTP step 0 runs the post-attention gather.
+
+        Off under EP-DP lockstep: the padding chunks and idle-rank replays
+        (_dp_dummy_draft_step, run_dp_dummy_draft) run the plain step-0
+        forward over the coordinated bucket, and a real chunk whose MoE ran
+        over the gathered loop-bucket rows would enter the cross-DP
+        collectives with a different shape.
+        """
         if (
             not envs.TPU_MTP_STEP0_POST_ATTN_GATHER
             or self.speculative_config.method != "mtp"
             or self._share_mtp_indices
             or self._draft_kv_shared
             or "_forward_draft" in getattr(self, "__dict__", {})
+            or self._dp_lockstep_sharded()
         ):
             return False
         if (
@@ -3179,7 +3202,7 @@ class Eagle3Proposer:
                 and self.speculative_config.method == "mtp"
                 and not self._share_mtp_indices
                 and not self._draft_kv_shared
-                and not runner._dp_lockstep_enabled()
+                and not self._dp_lockstep_sharded()
                 and is_step0_post_attn_gather_installed(self.draft_model)
             )
             else 0
@@ -3293,7 +3316,7 @@ class Eagle3Proposer:
                 and self.speculative_config.method == "mtp"
                 and not self._share_mtp_indices
                 and not self._draft_kv_shared
-                and not runner._dp_lockstep_enabled()
+                and not self._dp_lockstep_sharded()
                 and is_step0_post_attn_gather_installed(self.draft_model)
             )
             if self._mtp_fused_loop is not None or step0_post_attn_gather:
