@@ -103,6 +103,13 @@ class Qwen4ExpPooledPLE(Qwen4ExpPLELayer):
         self.storage.finalize_weights()
         self._finalized = True
 
+    def lookup_partial(
+        self, inputs: PLEInputs, valid_tokens: torch.Tensor
+    ) -> torch.Tensor:
+        """This rank's raw n-gram rows before `parallel.combine` (resident table)."""
+        assert not self.cpu_offload and not self.parallel.across_dp
+        return self.storage.lookup_raw(self._lookup_ids(inputs, valid_tokens))
+
     def bind_history(self, history: torch.Tensor) -> None:
         if history.ndim != 3 or history.shape[1:] != self.state_shape:
             raise ValueError(f"PLE history must have shape [slots,{self.state_shape}]")
@@ -185,6 +192,7 @@ class Qwen4ExpPooledPLE(Qwen4ExpPLELayer):
         speculative: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
         sequence_parallel: bool = False,
         prefill_ckpt: tuple[torch.Tensor, torch.Tensor] | None = None,
+        combined_raw: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """``speculative`` is (read_ids, ckpt_ids, windowed) on the unified pool
         with speculative decoding; see ``pooled_short_conv_speculative``.
@@ -202,7 +210,10 @@ class Qwen4ExpPooledPLE(Qwen4ExpPLELayer):
         )
         assert self._finalized and self._conv is not None
         assert len(self.cache_owners) == 1
-        if self.cpu_offload:
+        if combined_raw is not None:
+            # `lookup_partial` rows already combined (merged_embed_all_reduce).
+            raw = combined_raw
+        elif self.cpu_offload:
             assert raw_embeddings is not None, "Host PLE requires prepared raw rows"
             # Own narrow-type inputs before in-place collective dtype views.
             raw = raw_embeddings.reshape(
@@ -213,7 +224,8 @@ class Qwen4ExpPooledPLE(Qwen4ExpPLELayer):
             ).clone()
         else:
             raw = self.storage.lookup_raw(self._lookup_ids(inputs, valid_tokens))
-        raw = self.parallel.combine(raw, num_tokens)
+        if combined_raw is None:
+            raw = self.parallel.combine(raw, num_tokens)
         gated = self.gated_values(
             hidden_states,
             self.storage.decode(raw),
