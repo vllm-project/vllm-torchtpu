@@ -50,8 +50,12 @@ class _HostOp:
         pass
 
     def __call__(self, *args):
+        # Static arguments (main's quantized matmul takes its W8A16 row cap as
+        # an int) pass through unchanged.
         arrays = [
             jnp.asarray(a.detach().float().numpy(), dtype=_TO_JAX[a.dtype])
+            if isinstance(a, torch.Tensor)
+            else a
             for a in args
         ]
         return jax.tree.map(
@@ -122,6 +126,10 @@ def _sigmoid_gate(attention):
     attention.norm.activation = "sigmoid"
 
 
+def _w8a16(attention):
+    attention.out_proj.quant_method.w8a16_max_rows = 64
+
+
 def _bias(attention):
     attention.out_proj.bias = torch.nn.Parameter(
         torch.zeros(attention.out_proj.weight.shape[1]), requires_grad=False
@@ -135,6 +143,7 @@ def _bias(attention):
         ("fp8_channel", _block_scales, "not per-channel"),
         ("fp8_channel", _sigmoid_gate, "gates with sigmoid"),
         ("fp8_channel", _bias, "has a bias"),
+        ("fp8_channel", _w8a16, "W8A16"),
     ],
 )
 def test_install_refuses_an_unsupported_layer(
@@ -155,6 +164,7 @@ def test_install_refuses_an_unsupported_layer(
         ("fp8_channel", _block_scales),
         ("fp8_channel", _sigmoid_gate),
         ("fp8_channel", _bias),
+        ("fp8_channel", _w8a16),
     ],
 )
 def test_install_if_supported_keeps_an_unsupported_layer_unfused(
