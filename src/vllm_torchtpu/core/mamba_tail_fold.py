@@ -37,6 +37,16 @@ of the request's own speculative scratch blocks, which the next step does
 not read (a step after a prefill chunk resumes from the state block). What
 it must never do is miss a reserved one, so it errs on that side.
 
+``VLLM_TPU_MAMBA_TAIL_FOLD_NOBOUNDARY=1`` also folds a last chunk that holds
+no Mamba block boundary (``cdiv(end, B) - 2`` is the column of the chunk's
+initial state, so upstream has no free column for the checkpoint and splits
+at the hash boundary). The checkpoint goes to the request's first
+speculative scratch block, column ``cdiv(end, B)``; the manager reserves and
+hashes it there exactly as upstream does its own column (``_NoBoundary``),
+and before the next forward, which may write verify checkpoints into that
+scratch block, the hash moves to a fresh block filled by a queued block copy
+(the move upstream does for a running request's partial-tail CoW).
+
 ``VLLM_TPU_MAMBA_TAIL_FOLD=1`` enables it; off, nothing here is installed and
 the specs are unchanged.
 """
@@ -138,11 +148,33 @@ def with_prefill_checkpoint(spec):
     )
 
 
+def nobound_valid(
+    start: int,
+    end: int,
+    position: int,
+    hash_block_size: int,
+    block_size: int,
+    alignment: int,
+) -> bool:
+    """VLLM_TPU_MAMBA_TAIL_FOLD_NOBOUNDARY: ``is_mamba_prefill_checkpoint_valid``
+    for the one case it rejects for want of a column: the chunk holds no Mamba
+    block boundary, so ``cdiv(end, B) - 2`` is the chunk's initial-state
+    column. The checkpoint then goes to column ``cdiv(end, B)``."""
+    return (
+        start % hash_block_size == 0
+        and -(-end // block_size) - 2 == (start - 1) // block_size
+        and start + hash_block_size <= position
+        and start < position < end
+        and (position - start) % alignment == 0
+    )
+
+
 def prefill_checkpoints(
     num_computed: np.ndarray,
     num_scheduled: np.ndarray,
     block_size: int,
     hash_block_size: int | None = None,
+    num_speculative_blocks: int = 0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Per request: (offset in the step's query, block-table column).
 
@@ -152,6 +184,8 @@ def prefill_checkpoints(
     ``hash_block_size`` (the fold unit; default ``block_size``), Mamba block
     ``block_size`` and no EAGLE block drop (``patch_mamba_tail_fold`` turns
     the fold off for any other geometry). Offset 0 means no checkpoint.
+    ``num_speculative_blocks`` > 0 with VLLM_TPU_MAMBA_TAIL_FOLD_NOBOUNDARY
+    adds ``nobound_valid``'s case at column ``cdiv(end, B)``.
     """
     unit = block_size if hash_block_size is None else hash_block_size
     start = num_computed.astype(np.int64)
@@ -168,6 +202,19 @@ def prefill_checkpoints(
         & (position < end)
         & (column >= 0)
     )
+    if envs.VLLM_TPU_MAMBA_TAIL_FOLD_NOBOUNDARY and num_speculative_blocks > 0:
+        # ``nobound_valid``: no free column in the positional range, so the
+        # first speculative scratch block, cdiv(end, B), takes it.
+        nobound = (
+            (num_scheduled > 0)
+            & (start % unit == 0)
+            & (column == initial_column)
+            & (start + unit <= position)
+            & (start < position)
+            & (position < end)
+        )
+        column = np.where(nobound, column + 2, column)
+        valid = valid | nobound
     offsets = np.where(valid, position - start, 0).astype(np.int32)
     columns = np.where(valid, column, 0).astype(np.int32)
     return offsets, columns
@@ -222,6 +269,7 @@ class _Counter:
 
 SCHEDULER_COUNTER = _Counter("folded", ("tails", "splits"))
 WORKER_COUNTER = _Counter("exported", ("checkpoints", "prefill rows"))
+NOBOUND_COUNTER = _Counter("moved", ("no-boundary checkpoints", "no-boundary folds"))
 
 
 def _geometry_mismatch(scheduler) -> str | None:
@@ -318,6 +366,210 @@ def _verify(scheduler) -> bool:
     return ok
 
 
+def _num_speculative_blocks(scheduler) -> int:
+    """The Mamba managers' speculative scratch blocks per request (0: none)."""
+    cached = scheduler.__dict__.get("_tpu_tail_fold_spec_blocks")
+    if cached is not None:
+        return cached
+    from vllm.v1.core.single_type_kv_cache_manager import MambaManager
+
+    try:
+        managers = [
+            m
+            for m in scheduler.kv_cache_manager.coordinator.single_type_managers
+            if isinstance(m, MambaManager)
+        ]
+    except AttributeError:
+        managers = []
+    value = min((int(m.num_speculative_blocks) for m in managers), default=0)
+    scheduler._tpu_tail_fold_spec_blocks = value
+    return value
+
+
+def _nobound_folds(scheduler, start: int, stop: int, end: int, prefill_end: int):
+    """VLLM_TPU_MAMBA_TAIL_FOLD_NOBOUNDARY: keep a last chunk whole that the
+    split cut at the prompt's checkpoint only because no column was free.
+
+    Only when the split's stop is that checkpoint (a junction or block stop
+    keeps its split), the chunk reaches the prefill end and
+    ``nobound_valid`` holds; the manager then reserves the scratch column."""
+    from vllm.v1.kv_cache_interface import get_mamba_prefill_checkpoint_position
+
+    if not envs.VLLM_TPU_MAMBA_TAIL_FOLD_NOBOUNDARY or end < prefill_end:
+        return False
+    if not getattr(scheduler, "mamba_has_prefill_checkpoint_blocks", False):
+        return False
+    if _num_speculative_blocks(scheduler) <= 0:
+        return False
+    ckpt_block = (
+        scheduler.hash_block_size
+        if scheduler.mamba_partial_cache_hit
+        else scheduler.block_size
+    )
+    position = get_mamba_prefill_checkpoint_position(
+        prefill_end, ckpt_block, drop_eagle_block=scheduler.use_eagle_block_drop
+    )
+    alignment = scheduler.mamba_prefill_checkpoint_alignment
+    return (
+        stop == position
+        and alignment is not None
+        and nobound_valid(
+            start,
+            end,
+            position,
+            scheduler.hash_block_size,
+            scheduler.cache_config.block_size,
+            alignment,
+        )
+    )
+
+
+class _NoBoundary:
+    """MambaManager side of VLLM_TPU_MAMBA_TAIL_FOLD_NOBOUNDARY.
+
+    ``needs``: reserve the checkpoint in column ``cdiv(end, B)``, the first
+    speculative scratch block, when ``nobound_valid`` holds and that block is
+    still exclusively owned (a new request's block, or a running request's
+    unhashed scratch block). ``fix``: point upstream's recorded checkpoint at
+    that column. Upstream ``_cache_partial_tail_block`` then hashes it at the
+    checkpoint, before the step's forward writes it (same-step hits are
+    deferred by ``cached_blocks_this_step``). ``relocate`` (next
+    ``new_step_starts``, before any allocation and before the next forward):
+    the scratch block will take verify checkpoints, so its hash moves to a
+    fresh block that a queued block copy fills first, as upstream's CoW does
+    for a running request's partial tail.
+    """
+
+    @staticmethod
+    def needs(mgr, request_id, query_start, query_end, position, prefill_end):
+        from vllm.v1.core.single_type_kv_cache_manager import MambaManager
+
+        assert isinstance(mgr, MambaManager)
+        spec = mgr.kv_cache_spec
+        nsb = int(mgr.num_speculative_blocks)
+        if not (
+            mgr.has_prefill_checkpoint_blocks
+            and nsb > 0
+            and query_end >= prefill_end
+            and spec.prefill_checkpoint_alignment is not None
+            and nobound_valid(
+                query_start,
+                query_end,
+                position,
+                mgr.block_pool.hash_block_size,
+                mgr.block_size,
+                spec.prefill_checkpoint_alignment,
+            )
+        ):
+            return False
+        column = -(-query_end // mgr.block_size)
+        blocks = mgr.req_to_blocks[request_id]
+        if column >= len(blocks):
+            return True
+        return (
+            request_id in mgr._allocated_block_reqs
+            and column >= len(blocks) - nsb
+            and mgr.block_pool.is_block_writable(blocks[column])
+        )
+
+    @staticmethod
+    def relocate(mgr) -> None:
+        pending = mgr.__dict__.pop("_tpu_nobound_pending", None)
+        if not pending:
+            return
+        for request_id, block, position in pending:
+            entry = mgr._checkpoints.get(request_id)
+            if entry is not None and entry[0] == position:
+                mgr._checkpoints.pop(request_id, None)
+            if block.block_hash is None or block.block_hash_num_tokens != position:
+                continue
+            owned = any(b is block for b in mgr.req_to_blocks.get(request_id, ()))
+            if not owned:
+                # Freed with its hash: nothing writes it any more.
+                continue
+            if mgr.block_pool.get_num_free_blocks() < 1:
+                # No block for the copy: drop the entry rather than let the
+                # next verify step overwrite a hashed state.
+                mgr.block_pool._maybe_evict_cached_block(block)
+                continue
+            (cow,) = mgr.block_pool.get_new_blocks(1)
+            mgr.block_pool.move_block_hashes(block, cow)
+            mgr._pending_cow_copies.append((block, cow))
+            block.ref_cnt += 1
+            if cow.block_hash is not None:
+                mgr.cached_blocks_this_step.add(cow.block_hash)
+            NOBOUND_COUNTER.add(1, 1)
+
+
+def _patch_nobound_manager() -> None:
+    from vllm.v1.core.single_type_kv_cache_manager import MambaManager
+
+    if getattr(MambaManager._needs_internal_checkpoint, _PATCH_FLAG, False):
+        return
+    original_needs = MambaManager._needs_internal_checkpoint
+    original_count = MambaManager.get_num_blocks_to_allocate
+    original_cache = MambaManager.cache_blocks
+    original_step = MambaManager.new_step_starts
+
+    @wraps(original_needs)
+    def needs(self, request_id, query_start, query_end, position, prefill_end):
+        marks = self.__dict__.setdefault("_tpu_nobound", {})
+        marks.pop(request_id, None)
+        if original_needs(
+            self, request_id, query_start, query_end, position, prefill_end
+        ):
+            return True
+        if _NoBoundary.needs(
+            self, request_id, query_start, query_end, position, prefill_end
+        ):
+            marks[request_id] = (position, -(-query_end // self.block_size))
+            return True
+        return False
+
+    @wraps(original_count)
+    def count(self, request_id, *args, **kwargs):
+        result = original_count(self, request_id, *args, **kwargs)
+        mark = self.__dict__.get("_tpu_nobound", {}).get(request_id)
+        entry = self._checkpoints.get(request_id)
+        if mark is not None and entry is not None and entry[0] == mark[0]:
+            self._checkpoints[request_id] = mark
+        return result
+
+    @wraps(original_cache)
+    def cache(self, request, *args, **kwargs):
+        result = original_cache(self, request, *args, **kwargs)
+        rid = request.request_id
+        mark = self.__dict__.get("_tpu_nobound", {}).get(rid)
+        if mark is not None and self._checkpoints.get(rid) == mark:
+            position, column = mark
+            blocks = self.req_to_blocks[rid]
+            if column < len(blocks):
+                block = blocks[column]
+                if block.block_hash_num_tokens == position:
+                    pending = self.__dict__.setdefault("_tpu_nobound_pending", [])
+                    if not any(b is block for _, b, _ in pending):
+                        pending.append((rid, block, position))
+        return result
+
+    @wraps(original_step)
+    def step(self, *args, **kwargs):
+        result = original_step(self, *args, **kwargs)
+        _NoBoundary.relocate(self)
+        return result
+
+    for fn in (needs, count, cache, step):
+        setattr(fn, _PATCH_FLAG, True)
+    MambaManager._needs_internal_checkpoint = needs
+    MambaManager.get_num_blocks_to_allocate = count
+    MambaManager.cache_blocks = cache
+    MambaManager.new_step_starts = step
+    logger.info(
+        "VLLM_TPU_MAMBA_TAIL_FOLD_NOBOUNDARY: a last chunk without a Mamba "
+        "block boundary folds; its checkpoint goes to the first speculative "
+        "scratch block and moves to its own block before the next forward."
+    )
+
+
 def patch_mamba_tail_fold() -> None:
     if not envs.VLLM_TPU_MAMBA_TAIL_FOLD:
         return
@@ -343,6 +595,10 @@ def patch_mamba_tail_fold() -> None:
         prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
         if start >= prefill_end or start + num_new_tokens < prefill_end:
             return folded
+        if folded < num_new_tokens and _nobound_folds(
+            self, start, start + folded, start + num_new_tokens, prefill_end
+        ):
+            folded = num_new_tokens
         # The chunk reaches the prefill end: count whether the split without
         # an internal checkpoint would have stopped it short. Pure function;
         # schedule() calls it synchronously on the EngineCore thread.
@@ -357,4 +613,6 @@ def patch_mamba_tail_fold() -> None:
 
     setattr(split, _PATCH_FLAG, True)
     Scheduler._mamba_block_aligned_split = split
+    if envs.VLLM_TPU_MAMBA_TAIL_FOLD_NOBOUNDARY:
+        _patch_nobound_manager()
     logger.info("VLLM_TPU_MAMBA_TAIL_FOLD: scheduler patch installed.")

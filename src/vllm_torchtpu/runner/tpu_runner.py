@@ -2304,6 +2304,11 @@ class TPUModelRunner(GPUModelRunner):
             and bool(plan)
             and all(spec.num_prefill_checkpoint_blocks > 0 for spec in mamba_specs)
         )
+        # VLLM_TPU_MAMBA_TAIL_FOLD_NOBOUNDARY targets the first speculative
+        # scratch block; without one that case stays off.
+        self._mamba_spec_blocks = min(
+            (int(spec.num_speculative_blocks) for spec in mamba_specs), default=0
+        )
         if self._mamba_tail_fold:
             try:
                 cp_world_size = get_pcp_group().world_size
@@ -2377,6 +2382,7 @@ class TPUModelRunner(GPUModelRunner):
             num_scheduled_tokens_per_req[:num_reqs],
             self._mamba_state_block_size,
             fold_unit(self._mamba_state_block_size),
+            num_speculative_blocks=getattr(self, "_mamba_spec_blocks", 0),
         )
         exported = int(np.count_nonzero(offsets))
         WORKER_COUNTER.add(
