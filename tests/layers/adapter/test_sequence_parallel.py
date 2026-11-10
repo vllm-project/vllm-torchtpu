@@ -46,9 +46,27 @@ def groups(monkeypatch):
     return set_layout
 
 
+@pytest.fixture
+def threshold_512(monkeypatch):
+    """The row threshold a model that follows each step's form would use."""
+    monkeypatch.setattr(sp, "DEFAULT_MIN_ROWS", 512)
+
+
 def test_min_rows_defaults_before_the_groups_exist(monkeypatch):
     monkeypatch.setattr(parallel_state, "model_parallel_is_initialized", lambda: False)
-    assert sp.min_rows() == sp.DEFAULT_MIN_ROWS == 512
+    assert sp.min_rows() == sp.DEFAULT_MIN_ROWS == 0
+
+
+def test_a_small_step_stays_sliced_until_a_model_follows_the_form(groups, monkeypatch):
+    """No model reads a step's form yet, so a 16-row sequence-parallel step
+    must stay sliced: the model slices it, and the communicator must not treat
+    it as replicated."""
+    groups(1, 8)
+    monkeypatch.setattr(envs, "TPU_MOE_SEQUENCE_PARALLEL", True)
+    monkeypatch.setattr(sp, "_ACTIVE", False)
+    assert sp.step_is_sequence_parallel(16) is True
+    sp.set_active(sp.step_is_sequence_parallel(16))
+    assert sp.rows_are_replicated(True) is False
 
 
 @pytest.mark.parametrize("layout", [(1, 8), (4, 2), (2, 4)])
@@ -72,6 +90,7 @@ def test_a_layout_entry_applies_to_that_layout_only(groups, monkeypatch):
     "enabled,rows,expected",
     [(True, 511, False), (True, 512, True), (True, 4096, True), (False, 4096, False)],
 )
+@pytest.mark.usefixtures("threshold_512")
 def test_step_is_sequence_parallel_from_the_row_count(
     groups, monkeypatch, enabled, rows, expected
 ):
@@ -96,6 +115,7 @@ def test_fp8_gather_is_always_on():
     assert sp.fp8_gather() is True
 
 
+@pytest.mark.usefixtures("threshold_512")
 def test_check_buckets_refuses_an_uneven_sliced_bucket(groups):
     groups(1, 8)
     sp.check_buckets([8, 256, 512, 1024], tp_size=8)
