@@ -28,7 +28,11 @@ Each leg (`prefill`, `decode`) lists:
 - `replicas` and `chips_per_replica` (one tpu7x host, 8 devices, per
   replica); `chips` is their total over both legs.
 - `serve_args`: the `vllm serve` arguments the record run's leg used.
-  `$MODEL` and `$SERVED_MODEL` are the model path and served name.
+  `$MODEL` and `$SERVED_MODEL` are the model path and served name. The
+  prefill legs name no `--scheduler-cls`: the record runs named
+  PrefixAwareScheduler there, but their platform replaced it with the
+  pipeline chunk scheduler for the PP > 1 leg, which is what ran. On this
+  tree the platform installs that scheduler only when no class is named.
 - `env`: the environment the leg set, limited to variables this package
   declares in `envs.py`. `$EXPERT_PLACEMENT_TABLE` is the path of the
   decode leg's expert placement table, which `not_yet_supported` describes.
