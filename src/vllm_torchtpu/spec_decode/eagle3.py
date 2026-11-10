@@ -24,7 +24,6 @@ import contextlib
 import copy
 import dataclasses
 import functools
-import os
 from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING, Any, cast
 
@@ -38,13 +37,13 @@ from vllm.model_executor.model_loader import get_model_loader
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
-    fixed_moe_collection_chunks,
-)
 from vllm_torchtpu.layers.adapter import (
     sequence_parallel,
     small_all_reduce_op,
     token_padding,
+)
+from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
+    fixed_moe_collection_chunks,
 )
 from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadata,
@@ -60,6 +59,8 @@ from vllm_torchtpu.spec_decode.utils import (
     DraftChunkInputs,
     _force_draft_tp1,
     dp_lockstep_num_reqs,
+    fused_draft_loop_enabled,
+    greedy_top_tokens_enabled,
     iter_mtp_shared_heads,
     maybe_share_embeddings,
     maybe_share_lm_head,
@@ -479,7 +480,6 @@ class Eagle3Proposer:
         if (
             self._mtp_fused_loop is None
             and self._mtp_loop_model is None
-            and envs.TPU_MTP_STEP0_POST_ATTN_GATHER
             and self.speculative_config.method == "mtp"
             and not self._share_mtp_indices
             and not self._draft_kv_shared
@@ -508,27 +508,21 @@ class Eagle3Proposer:
             )
 
     def _init_draft_greedy_head(self) -> None:
-        """Resolve the draft's greedy head for TPU_GREEDY_TOP_TOKENS.
+        """Resolve the draft's greedy head (greedy_top_tokens_enabled).
 
         The draft's tokens then come from the vocab-parallel argmax
         (`LogitsProcessor.get_top_tokens`, patched by greedy_top_tokens), as
-        the target's do. The draft's head runs at the precision it holds,
-        which is the checkpoint's BF16 by default (the draft gets a BF16 copy
-        when the target's head is quantized in place; see
-        greedy_top_tokens.keep_bf16_head_for_draft). TPU_DRAFT_LM_HEAD_QUANT
-        is an explicit opt-in to a quantized lm-head proxy for the draft only
-        (read with os.environ; unset, "none" or "bf16" keep the head as is;
-        see greedy_top_tokens.parse_draft_lm_head_quant). That runs the draft
-        head below its shipped precision; it changes draft tokens, and so the
-        acceptance rate, never the verified output. A draft with a
-        draft->target id map, or one the argmax cannot serve, keeps
-        compute_logits + argmax.
+        the target's do. The draft's head runs at the checkpoint's BF16
+        precision: the draft gets a BF16 copy when the target's head is
+        quantized in place (greedy_top_tokens.keep_bf16_head_for_draft). A
+        draft with a draft->target id map, or one the argmax cannot serve,
+        keeps compute_logits + argmax.
         """
         self._draft_greedy_head_owner = None
         draft_model = self.draft_model
         if (
             draft_model is None
-            or not envs.TPU_GREEDY_TOP_TOKENS
+            or not greedy_top_tokens_enabled(self.vllm_config)
             or getattr(draft_model, "draft_id_to_target_id", None) is not None
         ):
             return
@@ -543,34 +537,15 @@ class Eagle3Proposer:
             )
         except NotImplementedError:
             return
-        draft_head = owner.lm_head
-        head_quant = getattr(draft_head, "_quant_mode", None)
-        quant_env = os.environ.get("TPU_DRAFT_LM_HEAD_QUANT")
-        quant_mode, group_size = greedy_top_tokens.parse_draft_lm_head_quant(
-            quant_env
-        )
-        if quant_mode is not None and head_quant != quant_mode:
-            logger.warning(
-                "TPU_DRAFT_LM_HEAD_QUANT=%s quantizes the draft's lm_head below "
-                "the checkpoint's BF16 precision.",
-                quant_env,
-            )
-            proxy_head = greedy_top_tokens._QuantizedLMHeadProxy(
-                draft_head, mode=quant_mode, group_size=group_size or 128
-            )
-            owner = greedy_top_tokens._DraftHeadOwnerProxy(
-                owner.logits_processor, proxy_head
-            )
-        elif (
-            head_quant is None
+        if (
+            getattr(owner.lm_head, "_quant_mode", None) is None
             and self.runner._dp_lockstep_enabled()
-            and greedy_top_tokens.draft_vocab_parallel_enabled()
             and self._dp_lockstep_sharded()
             and not self._draft_replicated
         ):
             # EP-DP lockstep, TP-sharded draft: every rank runs every draft
-            # pass at the same loop bucket, so the BF16 head can be split
-            # over the whole DP x TP group (TPU_DRAFT_VOCAB_PARALLEL=0 opts out).
+            # pass at the same loop bucket, so the BF16 head is split over the
+            # whole DP x TP group.
             owner = greedy_top_tokens.vocab_parallel_draft_owner(owner)
         self._draft_greedy_head_owner = owner
         logger.info(
@@ -799,7 +774,8 @@ class Eagle3Proposer:
 
     def _build_mtp_step0_gather_loop_model(self) -> None:
         """Build a separately compiled loop-step program for steps 1..K-1 when
-        `TPU_MTP_STEP0_POST_ATTN_GATHER=1` and `VLLM_TPU_FUSED_DRAFT_LOOP=0`,
+        the model patch installs the step-0 post-attention gather and the
+        fused draft loop is off,
         so step 0 traces with `_step0_gather_indices` set while steps 1..K-1
         trace with `_step0_gather_indices=None` using the draft's own
         `_dynamic_arg_dims` (e.g. `positions=-1` on Qwen3.5 MRoPE)."""
@@ -848,7 +824,9 @@ class Eagle3Proposer:
     def _build_mtp_fused_loop(self) -> None:
         """Compile an MTP draft's loop steps 1..K-1 as one program, so the
         host dispatches once per propose for them instead of twice per step.
-        Opt-in with `VLLM_TPU_FUSED_DRAFT_LOOP=1`; off, the per-step loop runs.
+        On with `VLLM_TPU_FUSED_DRAFT_LOOP=1`, and by rule for a Qwen3.5
+        target with an MTP draft (fused_draft_loop_enabled); off, the per-step
+        loop runs.
 
         Only for the plain case: IndexShare restores top-k rows between steps
         on the host, a draft->target id map would need its gather in the
@@ -863,7 +841,11 @@ class Eagle3Proposer:
         draft_model = self.draft_model
         if (
             draft_model is None
-            or not envs.VLLM_TPU_FUSED_DRAFT_LOOP
+            or not fused_draft_loop_enabled(
+                self.vllm_config,
+                draft_kv_shared=self._draft_kv_shared,
+                dp_lockstep=self.runner._dp_lockstep_enabled(),
+            )
             or self.speculative_config.method != "mtp"
             or self._share_mtp_indices
             or not self.advance_draft_positions
@@ -883,8 +865,7 @@ class Eagle3Proposer:
             from vllm_torchtpu.spec_decode.mtp_fused_loop import build_mtp_fused_loop
 
             step0_gather = (
-                envs.TPU_MTP_STEP0_POST_ATTN_GATHER
-                and not self._draft_kv_shared
+                not self._draft_kv_shared
                 and not self.runner._dp_lockstep_enabled()
                 and is_step0_post_attn_gather_installed(draft_model)
             )
@@ -3006,8 +2987,7 @@ class Eagle3Proposer:
         collectives with a different shape.
         """
         if (
-            not envs.TPU_MTP_STEP0_POST_ATTN_GATHER
-            or self.speculative_config.method != "mtp"
+            self.speculative_config.method != "mtp"
             or self._share_mtp_indices
             or self._draft_kv_shared
             or "_forward_draft" in getattr(self, "__dict__", {})
@@ -3345,8 +3325,7 @@ class Eagle3Proposer:
         step0_pad_warm = (
             self._loop_bucket(runner.max_num_reqs)
             if (
-                envs.TPU_MTP_STEP0_POST_ATTN_GATHER
-                and self.speculative_config.method == "mtp"
+                self.speculative_config.method == "mtp"
                 and not self._share_mtp_indices
                 and not self._draft_kv_shared
                 and not self._dp_lockstep_sharded()
@@ -3490,8 +3469,7 @@ class Eagle3Proposer:
             )
 
             step0_post_attn_gather = (
-                envs.TPU_MTP_STEP0_POST_ATTN_GATHER
-                and self.speculative_config.method == "mtp"
+                self.speculative_config.method == "mtp"
                 and not self._share_mtp_indices
                 and not self._draft_kv_shared
                 and not self._dp_lockstep_sharded()

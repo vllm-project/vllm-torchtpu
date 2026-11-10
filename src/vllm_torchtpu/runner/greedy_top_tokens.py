@@ -904,21 +904,6 @@ class _DraftHeadOwnerProxy(torch.nn.Module):
         self.lm_head = lm_head
 
 
-def draft_vocab_parallel_enabled() -> bool:
-    """``TPU_DRAFT_VOCAB_PARALLEL`` (default on): under expert-parallel data
-    parallelism with a tensor-parallel draft, the draft's BF16 greedy head is
-    split over the whole DP x TP group instead of within each TP group (see
-    ``_VocabParallelDraftHead``). ``0`` keeps the per-TP-group head."""
-    import os
-
-    return os.environ.get("TPU_DRAFT_VOCAB_PARALLEL", "1").strip().lower() not in (
-        "0",
-        "false",
-        "no",
-        "off",
-    )
-
-
 class _VocabParallelDraftHead(torch.nn.Module):
     """The draft's BF16 greedy head split over all DP x TP ranks.
 
@@ -997,9 +982,7 @@ class _VocabParallelDraftHead(torch.nn.Module):
         # Pairs arrive in EP-group order (rank dp * tp_size + tp, checked in
         # vocab_parallel_draft_owner); slice k belongs to tp = k // dp_size,
         # dp = k % dp_size. perm[k] is that rank's position in the gather.
-        perm = [
-            (k % dp_size) * tp_size + k // dp_size for k in range(self.num_slices)
-        ]
+        perm = [(k % dp_size) * tp_size + k // dp_size for k in range(self.num_slices)]
         self.register_buffer(
             "vp_slice_order",
             torch.tensor(perm, dtype=torch.int64, device=device),
@@ -1122,24 +1105,6 @@ def vocab_parallel_draft_owner(owner: torch.nn.Module) -> torch.nn.Module:
 _DRAFT_BF16_HEAD_ATTR = "_tpu_draft_bf16_head"
 
 
-def draft_lm_head_bf16_enabled() -> bool:
-    """``TPU_DRAFT_LM_HEAD_BF16`` (default on): a draft that borrows the
-    target's LM head keeps the head at its shipped BF16 precision, even when
-    ``TPU_QUANTIZE_SHARED_LM_HEAD`` quantizes the target's head to FP8.
-
-    ``0`` lets the draft share the quantized target head, which runs the
-    draft's head below the checkpoint's precision.
-    """
-    import os
-
-    return os.environ.get("TPU_DRAFT_LM_HEAD_BF16", "1").strip().lower() not in (
-        "0",
-        "false",
-        "no",
-        "off",
-    )
-
-
 def bf16_head_twin(head: torch.nn.Module) -> torch.nn.Module:
     """A second ``ParallelLMHead`` holding ``head``'s current BF16 weight.
 
@@ -1157,9 +1122,7 @@ def bf16_head_twin(head: torch.nn.Module) -> torch.nn.Module:
         if table in state:
             state[table] = type(state[table])(state[table])
     if "_non_persistent_buffers_set" in state:
-        state["_non_persistent_buffers_set"] = set(
-            state["_non_persistent_buffers_set"]
-        )
+        state["_non_persistent_buffers_set"] = set(state["_non_persistent_buffers_set"])
     state.pop(_DRAFT_BF16_HEAD_ATTR, None)
     for name in ("_w8a8_weight_kn", "_w8a8_scale"):
         state.get("_buffers", {}).pop(name, None)

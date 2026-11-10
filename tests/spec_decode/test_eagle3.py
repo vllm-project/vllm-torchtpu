@@ -1187,7 +1187,6 @@ def _lockstep_draft_trace(
     if step0_gather:
         import vllm_torchtpu.models.vllm.qwen3_next_patch as qwen3_next_patch
 
-        monkeypatch.setenv("TPU_MTP_STEP0_POST_ATTN_GATHER", "1")
         monkeypatch.setattr(
             qwen3_next_patch, "is_step0_post_attn_gather_installed", lambda _m: True
         )
@@ -1281,7 +1280,6 @@ def test_mtp_step0_post_attn_gather_off_under_dp_lockstep(monkeypatch, lockstep)
     lockstep pads its draft steps."""
     import vllm_torchtpu.models.vllm.qwen3_next_patch as qwen3_next_patch
 
-    monkeypatch.setenv("TPU_MTP_STEP0_POST_ATTN_GATHER", "1")
     monkeypatch.setattr(
         qwen3_next_patch, "is_step0_post_attn_gather_installed", lambda _m: True
     )
@@ -1301,7 +1299,6 @@ def test_load_model_skips_step0_gather_loop_model_under_dp_lockstep(
 ):
     """load_model builds the step-0 gather's loop-step program only where the
     gather can run, so under EP-DP lockstep steps 1..K-1 run the draft."""
-    monkeypatch.setenv("TPU_MTP_STEP0_POST_ATTN_GATHER", "1")
     monkeypatch.setenv("VLLM_TPU_FUSED_DRAFT_LOOP", "0")
     proposer = _make_proposer(draft_tp=1, target_tp=1, method="mtp")
     proposer.speculative_config.num_speculative_tokens = 2

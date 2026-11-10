@@ -169,7 +169,6 @@ def _step0_effective_gather_indices(
     return gather_idx
 
 
-
 def is_step0_post_attn_gather_installed(draft_model: Any) -> bool:
     """Return True if `draft_model` executes the step-0 post-attn gather path."""
     if draft_model is None:
@@ -1205,9 +1204,7 @@ def setup_qwen3_next_v6_after_loading(model: Any) -> None:
             # A draft that borrows this head (Qwen3.5 MTP has none of its
             # own) must keep the checkpoint's BF16 head: keep a BF16 twin
             # before the in-place quantization drops the weight.
-            if greedy_top_tokens.draft_lm_head_bf16_enabled() and (
-                _speculative_decoding_configured()
-            ):
+            if _speculative_decoding_configured():
                 greedy_top_tokens.keep_bf16_head_for_draft(module)
             greedy_top_tokens.quantize_lm_head(module, mode="fp8", in_place=True)
     if hoisted_norm_tensors:

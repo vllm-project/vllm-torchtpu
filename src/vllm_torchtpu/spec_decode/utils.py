@@ -27,6 +27,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.models.utils import PPMissingLayer
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.layers.core.sequence_layout import (
     AllSequenceLayoutPlanner,
     SequenceLayoutPlan,
@@ -48,6 +49,48 @@ _DEFAULT_DRAFT_SEQUENCE_LAYOUT_PLAN = AllSequenceLayoutPlanner().prepare_dummy(
     num_reqs=0,
     kv_cache_initialized=False,
 )
+
+
+def qwen3_5_mtp(vllm_config: Any) -> bool:
+    """A Qwen3.5 target with an MTP draft.
+
+    Main keeps the greedy top tokens, fast token substitution and the fused
+    MTP draft loop opt-in (TPU_GREEDY_TOP_TOKENS,
+    VLLM_TPU_FAST_TOKEN_SUBSTITUTION, VLLM_TPU_FUSED_DRAFT_LOOP). This
+    configuration runs them by rule: the Qwen3.5 PD deployments ran all three
+    on every leg.
+    """
+    from vllm_torchtpu.models.qwen3_5 import settings as qwen3_5_settings
+
+    spec = getattr(vllm_config, "speculative_config", None)
+    return (
+        spec is not None
+        and getattr(spec, "method", None) == "mtp"
+        and qwen3_5_settings.is_qwen3_5(getattr(vllm_config, "model_config", None))
+    )
+
+
+def greedy_top_tokens_enabled(vllm_config: Any) -> bool:
+    """TPU_GREEDY_TOP_TOKENS, or the Qwen3.5 MTP rule. Greedy steps (all
+    requests greedy, no logprobs, no grammar) then take the vocab-parallel
+    argmax; the tokens are those of the full-logits argmax."""
+    return bool(envs.TPU_GREEDY_TOP_TOKENS) or qwen3_5_mtp(vllm_config)
+
+
+def fast_token_substitution_enabled(vllm_config: Any) -> bool:
+    """VLLM_TPU_FAST_TOKEN_SUBSTITUTION, or the Qwen3.5 MTP rule."""
+    return bool(envs.VLLM_TPU_FAST_TOKEN_SUBSTITUTION) or qwen3_5_mtp(vllm_config)
+
+
+def fused_draft_loop_enabled(
+    vllm_config: Any, *, draft_kv_shared: bool, dp_lockstep: bool
+) -> bool:
+    """VLLM_TPU_FUSED_DRAFT_LOOP, or the Qwen3.5 MTP rule: on unless the
+    draft shares the target's KV cache or EP-DP runs in lockstep (main lists
+    both as unsupported by the fused loop)."""
+    if envs.VLLM_TPU_FUSED_DRAFT_LOOP:
+        return True
+    return qwen3_5_mtp(vllm_config) and not draft_kv_shared and not dp_lockstep
 
 
 def fit_rows(t: torch.Tensor, rows: int, value: int = 0) -> torch.Tensor:

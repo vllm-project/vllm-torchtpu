@@ -63,7 +63,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
     MultiKVConnectorStats,
 )
 from vllm.forward_context import set_forward_context
-from vllm_torchtpu.runner import decode_carry as _decode_carry
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.rotary_embedding import (
@@ -175,6 +174,7 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
 )
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.tpu_block_size_utils import unified_kv_layout_enabled
+from vllm_torchtpu.runner import decode_carry as _decode_carry
 from vllm_torchtpu.runner import (
     greedy_top_tokens,
     prompt_logprobs,
@@ -227,7 +227,9 @@ from vllm_torchtpu.spec_decode.dspark import DSparkProposer
 from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer, _static_shape_args
 from vllm_torchtpu.spec_decode.utils import (
     DraftChunkInputs,
+    fast_token_substitution_enabled,
     fit_rows,
+    greedy_top_tokens_enabled,
     handoff_seed_tokens,
     normalize_draft_config,
 )
@@ -1427,8 +1429,8 @@ class TPUModelRunner(GPUModelRunner):
         self.sliding_window = self.model_config.get_sliding_window()
         self.block_size = cache_config.block_size
         self.most_model_len = envs.VLLM_TPU_MOST_MODEL_LEN
-        self._fast_token_substitution: bool = bool(
-            envs.VLLM_TPU_FAST_TOKEN_SUBSTITUTION
+        self._fast_token_substitution: bool = fast_token_substitution_enabled(
+            vllm_config
         )
         # Sync max_num_blocks_per_req with the underlying GPUInputBatch's
         # block_table capacity if already created during super().__init__().
@@ -7481,7 +7483,6 @@ class TPUModelRunner(GPUModelRunner):
         is_async = bool(self.scheduler_config.async_scheduling)
         defer_modify_prev = (
             is_async
-            and os.environ.get("VLLM_TPU_MTP_OPT", "1") != "0"
             and self._is_async_drafter
             and bool(combined_selected_tokens)
             and not discard_sampled_tokens_req_indices
@@ -7892,7 +7893,7 @@ class TPUModelRunner(GPUModelRunner):
         if envs.TPU_MOE_HASH_TABLE_ROW_MAJOR:
             runner_utils.relayout_hash_tables(self.model)
         if (
-            envs.TPU_GREEDY_TOP_TOKENS
+            greedy_top_tokens_enabled(self.vllm_config)
             and self._pp_is_last
             and not self.is_pooling_model
         ):
