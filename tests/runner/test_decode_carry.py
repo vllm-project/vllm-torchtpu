@@ -1,6 +1,20 @@
-# SPDX-License-Identifier: Apache-2.0
-"""hostov IT2: the steady-state device carry must reproduce the upload path exactly, and the
-host-side check must refuse every step where it would not."""
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""hostov IT2: the steady-state device carry must reproduce the upload path exactly,
+and the host-side check must refuse every step where it would not.
+"""
+
 import types
 
 import numpy as np
@@ -37,19 +51,32 @@ def _indices(num_reqs, target, padded_total):
     return torch.from_numpy(seq_idx), torch.from_numpy(pos_idx), torch.from_numpy(subst)
 
 
-@pytest.mark.parametrize("num_reqs,target,padded_total,mrope", [
-    (1, 4, 4, False), (2, 4, 8, True), (3, 4, 16, True), (3, 8, 16, False),
-])
-def test_carry_matches_upload_path_over_many_steps(num_reqs, target, padded_total, mrope):
+@pytest.mark.parametrize(
+    "num_reqs,target,padded_total,mrope",
+    [
+        (1, 4, 4, False),
+        (2, 4, 8, True),
+        (3, 4, 16, True),
+        (3, 8, 16, False),
+    ],
+)
+def test_carry_matches_upload_path_over_many_steps(
+    num_reqs, target, padded_total, mrope
+):
     rng = np.random.default_rng(num_reqs * 100 + padded_total)
     total = num_reqs * D
     seq_idx, pos_idx, subst = _indices(num_reqs, target, padded_total)
-    stale = np.array([0] * num_reqs + list(rng.integers(5, 50, target - num_reqs)), dtype=np.int32)
+    stale = np.array(
+        [0] * num_reqs + list(rng.integers(5, 50, target - num_reqs)), dtype=np.int32
+    )
     logits_idx = torch.arange(padded_total, dtype=torch.int32)
-    target_logits_idx = torch.tensor([0, 1, 2] * max(1, padded_total // 3), dtype=torch.int32)[: padded_total - 1]
+    target_logits_idx = torch.tensor(
+        [0, 1, 2] * max(1, padded_total // 3), dtype=torch.int32
+    )[: padded_total - 1]
 
     def host_arrays(S):
-        seq = stale.copy(); seq[:num_reqs] = S
+        seq = stale.copy()
+        seq[:num_reqs] = S
         nc = S - D
         pos = np.zeros(padded_total, dtype=np.int32)
         pos[:total] = np.repeat(nc, D) + np.tile(np.arange(D), num_reqs)
@@ -63,18 +90,49 @@ def test_carry_matches_upload_path_over_many_steps(num_reqs, target, padded_tota
     ids0 = torch.zeros(padded_total, dtype=torch.int32)
     nt = torch.from_numpy(rng.integers(1, 1000, num_reqs * D).astype(np.int32))
     prev = subtract_and_substitute_draft_token_ids(
-        seq_h, pos_h, torch.from_numpy(r_prev), seq_idx, pos_idx, ids0, subst, nt, logits_idx, target_logits_idx)
+        seq_h,
+        pos_h,
+        torch.from_numpy(r_prev),
+        seq_idx,
+        pos_idx,
+        ids0,
+        subst,
+        nt,
+        logits_idx,
+        target_logits_idx,
+    )
     for step in range(30):
         r_now = rng.integers(0, D, num_reqs).astype(np.int32)
-        S = S + D - r_prev  # the scheduler's optimistic advance, corrected by last step's rejections
+        S = (
+            S + D - r_prev
+        )  # the scheduler's optimistic advance, corrected by last step's rejections
         seq_h, pos_h = host_arrays(S)
         nt = torch.from_numpy(rng.integers(1, 1000, num_reqs * D).astype(np.int32))
         ref = subtract_and_substitute_draft_token_ids(
-            seq_h, pos_h, torch.from_numpy(r_now), seq_idx, pos_idx, torch.zeros(padded_total, dtype=torch.int32),
-            subst, nt, logits_idx, target_logits_idx)
+            seq_h,
+            pos_h,
+            torch.from_numpy(r_now),
+            seq_idx,
+            pos_idx,
+            torch.zeros(padded_total, dtype=torch.int32),
+            subst,
+            nt,
+            logits_idx,
+            target_logits_idx,
+        )
         got = carry_subtract_and_substitute_draft_token_ids(
-            prev[0], prev[1], D, torch.from_numpy(r_now), seq_idx, pos_idx, prev[2], subst, nt,
-            logits_idx, target_logits_idx)
+            prev[0],
+            prev[1],
+            D,
+            torch.from_numpy(r_now),
+            seq_idx,
+            pos_idx,
+            prev[2],
+            subst,
+            nt,
+            logits_idx,
+            target_logits_idx,
+        )
         for a, b in zip(got, ref):
             assert torch.equal(a, b), (step, a, b)
         prev = got
@@ -92,7 +150,7 @@ def _runner(req_ids, target=4):
     r = types.SimpleNamespace()
     r.input_batch = types.SimpleNamespace(req_ids=list(req_ids), num_reqs=len(req_ids))
     r.seq_lens_np = np.zeros(16, dtype=np.int32)
-    r.seq_lens_np[len(req_ids):target] = 77  # stale padding
+    r.seq_lens_np[len(req_ids) : target] = 77  # stale padding
     r.positions_np = np.zeros(64, dtype=np.int32)
     r.uses_mrope = False
     r._pcp_enabled = False
@@ -110,7 +168,8 @@ def _set_host(r, S):
 
 
 def _steady(req_ids=("a", "b"), r_prev=(1, 0), advance=None):
-    """Runner after a recorded step N, with step N+1's host arrays set; returns (runner, kwargs)."""
+    """Runner after a recorded step N, with step N+1's host arrays set; returns
+    (runner, kwargs)."""
     n = len(req_ids)
     r = _runner(req_ids)
     S = np.array([5000, 7000][:n], dtype=np.int32)
@@ -118,10 +177,19 @@ def _steady(req_ids=("a", "b"), r_prev=(1, 0), advance=None):
     pre_n = _Pre(req_ids)
     dc.tag_results(r, pre_n)
     r._pre_async_results = pre_n
-    kw = dict(start_index=0, num_reqs=n, num_scheduled_tokens_per_req_list=[D] * n,
-              total_num_scheduled_tokens=n * D, padded_total_num_scheduled_tokens=n * D, target_num_reqs=4)
-    assert dc.record(r, sub_pairs=tuple((i, D) for i in range(n)), seq_lens=torch.zeros(4), **kw)
-    # sample_tokens(N): _modify_prev_results reads back step N-1's rejections (the ones subtracted at N)
+    kw = dict(
+        start_index=0,
+        num_reqs=n,
+        num_scheduled_tokens_per_req_list=[D] * n,
+        total_num_scheduled_tokens=n * D,
+        padded_total_num_scheduled_tokens=n * D,
+        target_num_reqs=4,
+    )
+    assert dc.record(
+        r, sub_pairs=tuple((i, D) for i in range(n)), seq_lens=torch.zeros(4), **kw
+    )
+    # sample_tokens(N): _modify_prev_results reads back step N-1's rejections
+    # (the ones subtracted at N)
     dc.record_rejected(r, pre_n, dict(zip(req_ids, r_prev)))
     pre_n1 = _Pre(req_ids)
     dc.tag_results(r, pre_n1)
@@ -139,7 +207,9 @@ def test_check_accepts_the_steady_state():
 
 
 def test_check_refuses_when_the_scheduler_advanced_differently():
-    r, kw = _steady(advance=[D, D])  # a ignores its rejected draft (e.g. capped near max_model_len)
+    r, kw = _steady(
+        advance=[D, D]
+    )  # a ignores its rejected draft (e.g. capped near max_model_len)
     assert dc.check(r, **kw) is None
 
 
@@ -182,4 +252,6 @@ def test_disabled_never_carries_the_steady_state(monkeypatch):
     monkeypatch.setattr(dc, "enabled", lambda runner: False)
     assert dc.check(r, **kw) is None
     kw.pop("layout_plan")
-    assert dc.record(r, sub_pairs=((0, D), (1, D)), seq_lens=torch.zeros(4), **kw) is False
+    assert (
+        dc.record(r, sub_pairs=((0, D), (1, D)), seq_lens=torch.zeros(4), **kw) is False
+    )
