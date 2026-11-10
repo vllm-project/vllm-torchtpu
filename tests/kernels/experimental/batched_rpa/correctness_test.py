@@ -955,6 +955,7 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         ],
         dtype=[jnp.float32, jnp.bfloat16],
         test_case=["decode", "partial_query_block"],
+    )
     def test_ragged_paged_attention_unattended_nan_in_v(
         self,
         kv_layout: configs.KVLayout,
@@ -973,9 +974,23 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             else [(37, 50)]  # Partial query block where q_len < bq_sz (e.g. 37 < 64)
         )
 
+        self._test_ragged_paged_attention(
+            seq_lens,
+            num_heads,
+            head_dim,
+            page_size,
+            dtype,
+            dtype,
+            num_pages,
+            kv_layout=kv_layout,
             bkv_sz=128,
         )
+
     @parameterized.product(
+        kv_layout=[
+            configs.KVLayout.HEAD_ALONG_SUBLANE,
+            configs.KVLayout.SEQ_ALONG_LANE,
+        ],
     )
     def test_ragged_paged_attention_1m_context(self, kv_layout):
         kv_len = 1024 * 1024
