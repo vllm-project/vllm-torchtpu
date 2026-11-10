@@ -243,6 +243,47 @@ def test_norm_then_linear_is_unchanged_without_install(make_gdn_attention, host_
     )
 
 
+@pytest.mark.parametrize("rows, uses_kernel", [(8, False), (16, True)])
+def test_steps_below_16_rows_run_the_reference(
+    host_ops, monkeypatch, rows, uses_kernel
+):
+    """A step of fewer than 16 rows (MIN_ROWS; small decode steps) runs the JAX
+    reference inside both ops, and a 16-row step runs the kernel. The ops are
+    traced for their shapes only."""
+    host_ops()
+    monkeypatch.setattr(gated_norm_quant_op, "_out_proj_ops", {})
+    paths: list[str] = []
+    kernel, reference = gnq.gated_norm_quant, gnq.reference
+
+    def tracked_kernel(*args, **kwargs):
+        paths.append("kernel")
+        return kernel(*args, **kwargs)
+
+    def tracked_reference(*args, **kwargs):
+        paths.append("reference")
+        return reference(*args, **kwargs)
+
+    monkeypatch.setattr(gnq, "gated_norm_quant", tracked_kernel)
+    monkeypatch.setattr(gnq, "reference", tracked_reference)
+    gated_norm_quant_op._build_ops(1e-6)
+
+    heads, dim, n = 2, 128, 256
+    o = jax.ShapeDtypeStruct((rows, heads, dim), jnp.bfloat16)
+    z = jax.ShapeDtypeStruct((rows, heads * dim), jnp.bfloat16)
+    w = jax.ShapeDtypeStruct((dim,), jnp.float32)
+    jax.eval_shape(gated_norm_quant_op._norm_ops[1e-6].fn, o, z, w)
+    jax.eval_shape(
+        gated_norm_quant_op._out_proj_ops[1e-6].fn,
+        o,
+        z,
+        w,
+        jax.ShapeDtypeStruct((heads * dim, n), jnp.float8_e4m3fn),
+        jax.ShapeDtypeStruct((n,), jnp.float32),
+    )
+    path = "kernel" if uses_kernel else "reference"
+    assert paths == [path, path]
+
+
 def test_prequant_matmul_equals_the_quantizing_matmul():
     generator = torch.Generator().manual_seed(3)
     x = jnp.asarray(torch.randn(16, 256, generator=generator).numpy(), jnp.bfloat16)
