@@ -21,6 +21,8 @@ At startup, `vllm-torchtpu` reports set environment variables that neither vLLM 
 | `TORCH_TPU_MP_RENDEZVOUS_PORT` | `None` | Optional explicit TCP port for multi-host `mp` `TCPStore` rendezvous. |
 | `TPU_ACCELERATOR_TYPE` | `None` | Explicit accelerator type override (e.g., `"tpu7x"`, `"v6e-8"`) when running offline compilation or CPU tests. |
 | `TPU_LIBRARY_PATH` | `None` | `libtpu.so` loaded by the TPU runtime. `import libtpu` sets it to the pip package's own library. A custom path (any other file) takes precedence over an installed `libtpu` package: a fingerprint of that file replaces the package version in the compile and Raiden layout cache keys, and the minimum libtpu version check is skipped. |
+| `VLLM_TPU_USE_RUST` | `False` | Opt-in. Serves models with the native Rust runtime (`rvllm`) directly behind `vllm serve` (covers both HTTP frontend and engine backend). Off by default until feature parity. |
+| `VLLM_TPU_RVLLM_BINARY` | `""` | Path or command name for the `rvllm` binary when `VLLM_TPU_USE_RUST` is enabled; falls back to `PATH` when unset. |
 
 ---
 
