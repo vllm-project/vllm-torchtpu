@@ -39,7 +39,7 @@ from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.kv_cache_interface import MambaSpec
 from vllm.v1.request import Request, RequestStatus
 
-from tests.platforms.test_same_step_prefix_hits_patch import _start_step, patched
+from tests.platforms.test_same_step_prefix_hits_patch import patched
 from tests.runner.test_qwen4_exp_pool import pool_config
 from vllm_torchtpu.distributed.kv_transfer import tpu_connector
 from vllm_torchtpu.models.vllm.qwen4_exp.pd import TransferExtent, build_transfer_groups
@@ -151,7 +151,6 @@ def prime(native_plan, cache, length):
     assert cache.allocate_slots(req, length) is not None
     req.num_computed_tokens = length
     cache.cache_blocks(req, length)
-    _start_step(cache)
     cache.new_step_starts()
     cache.free(req)
 
@@ -354,7 +353,6 @@ def test_native_fixture_reuses_only_scheduler_retained_producer_and_consumer_sta
         assert producer.allocate_slots(req, scheduled) is not None
         req.num_computed_tokens += scheduled
         producer.cache_blocks(req, req.num_computed_tokens)
-        _start_step(producer)
         producer.new_step_starts()
         chunks.append(scheduled)
     producer.free(req)
@@ -373,12 +371,10 @@ def test_native_fixture_reuses_only_scheduler_retained_producer_and_consumer_sta
     )
     req.num_computed_tokens = 2 * n.block
     consumer.cache_blocks(req, req.num_computed_tokens)
-    _start_step(consumer)
     consumer.new_step_starts()
     assert consumer.allocate_slots(req, 1) is not None
     req.num_computed_tokens += 1
     consumer.cache_blocks(req, req.num_computed_tokens)
-    _start_step(consumer)
     consumer.new_step_starts()
     consumer.free(req)
     repeated = request(n, "consumer-repeat", 2 * n.block + 1)
