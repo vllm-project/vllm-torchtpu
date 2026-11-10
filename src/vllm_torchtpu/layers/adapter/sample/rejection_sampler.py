@@ -817,8 +817,11 @@ def _fused_spec_verify_and_sample_candidates(
     scaled_cand = all_cand_logits.to(torch.float32) / (
         all_temps.to(torch.float32) + TEMPERATURE_EPS
     )
+    # The runner takes the candidate-block path only when every request has
+    # 1 <= top_k <= topk_candidates // 2 (TPUModelRunner._sampler_topk_candidates),
+    # so the k-th value never needs a wider top-k than that.
     max_k = min(
-        32 if topk_candidates == 0 else topk_candidates,
+        32 if topk_candidates == 0 else max(1, topk_candidates // 2),
         scaled_cand.shape[-1],
     )
     masked_cand = apply_top_k_top_p(scaled_cand, all_top_k, all_top_p, max_k=max_k)
