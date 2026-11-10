@@ -582,15 +582,23 @@ def _pallas_step(
             + run_start.astype(jnp.int32) * ROW_BLOCK
         ).reshape(-1)
         ends = starts + push_rows.reshape(-1).astype(jnp.int32)
-        edges = (
-            jnp.zeros((n_sorted + 1,), jnp.int32)
-            .at[jnp.minimum(starts, n_sorted)]
-            .add(1)
-            .at[jnp.minimum(ends, n_sorted)]
-            .add(-1)
-        )
-        live = jnp.cumsum(edges)[:n_sorted] > 0
         row = jnp.arange(n_sorted, dtype=jnp.int32)
+        if config.sort_index_compare:
+            # Runs never overlap and an empty run (start == end) covers no
+            # row, so "inside some run" is exactly the running sum's > 0.
+            live = jnp.any(
+                (row[:, None] >= starts[None, :]) & (row[:, None] < ends[None, :]),
+                axis=1,
+            )
+        else:
+            edges = (
+                jnp.zeros((n_sorted + 1,), jnp.int32)
+                .at[jnp.minimum(starts, n_sorted)]
+                .add(1)
+                .at[jnp.minimum(ends, n_sorted)]
+                .add(-1)
+            )
+            live = jnp.cumsum(edges)[:n_sorted] > 0
         index = jnp.where(live, index, row % gathered_rows.shape[0])
         # The table is sized to its bound (every shard's pairs); the FFN
         # kernel reads only the used prefix, so only that is sorted.
