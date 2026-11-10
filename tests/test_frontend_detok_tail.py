@@ -11,27 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""QX_DETOK_PROMPT_TAIL: a DecodeStream primed with a safe prompt tail must
-emit byte-identical text to one primed with the whole prompt."""
+"""tpu_frontend.detok_prompt_tail: a DecodeStream primed with a safe prompt
+tail must emit byte-identical text to one primed with the whole prompt."""
 
-import os
 import random
-import sys
-from pathlib import Path
 
 import pytest
-
-tokenizers = pytest.importorskip("tokenizers")
-
-try:
-    from vllm_torchtpu import frontend_fix as ff
-except Exception:
-    sys.path.insert(
-        0, str(Path(__file__).resolve().parents[1] / "src" / "vllm_torchtpu")
-    )
-    import frontend_fix as ff
-
+import tokenizers
 from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
+
+from vllm_torchtpu import frontend_fix as ff
 
 SPECIALS = ["<|endoftext|>", "<|im_start|>", "<|im_end|>", "<think>", "</think>"]
 CORPUS = [
@@ -46,9 +35,6 @@ CORPUS = [
 
 @pytest.fixture(scope="module")
 def tok():
-    qwen_dir = os.environ.get("QWEN35_TOKENIZER_DIR")
-    if qwen_dir and os.path.isfile(os.path.join(qwen_dir, "tokenizer.json")):
-        return Tokenizer.from_file(os.path.join(qwen_dir, "tokenizer.json"))
     t = Tokenizer(models.BPE())
     t.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
     t.decoder = decoders.ByteLevel()
@@ -165,17 +151,13 @@ def test_install_patches_vllm_detokenizer(monkeypatch):
     detok = pytest.importorskip("vllm.v1.engine.detokenizer")
     cls = detok.FastIncrementalDetokenizer
     orig = cls.__init__
-    monkeypatch.setenv("QX_DETOK_PROMPT_TAIL", "8")
     monkeypatch.setattr(ff, "_DETOK_INSTALLED", False)
     try:
         assert ff.maybe_install_detok_prompt_tail()
         assert getattr(cls.__init__, "__qx_detok_tail__", False)
+        # A second install leaves the first patch in place.
+        assert ff.maybe_install_detok_prompt_tail() is False
+        assert cls.__init__.__wrapped__ is orig
     finally:
         cls.__init__ = orig
         ff._DETOK_INSTALLED = False
-
-
-def test_kill_switch(monkeypatch):
-    monkeypatch.setenv("QX_DETOK_PROMPT_TAIL", "0")
-    monkeypatch.setattr(ff, "_DETOK_INSTALLED", False)
-    assert ff.maybe_install_detok_prompt_tail() is False

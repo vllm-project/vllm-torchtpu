@@ -11,19 +11,25 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""API-server patches for reasoning-token counting and incremental detokenizer priming.
+"""API-server patches for reasoning-token counting and detokenizer priming.
 
-* ``QX_LAZY_REASONING_COUNT=1``: skips per-delta ``DelegatingParser.count_reasoning_tokens``
-  recomputation on intermediate streaming chunks when ``continuous_usage_stats`` is
-  disabled, and short-circuits to 0 when the ``StreamingParserEngine`` state machine
-  has no reachable ``REASONING_CHUNK`` transition or state.
-* ``QX_DETOK_PROMPT_TAIL=8``: primes ``FastIncrementalDetokenizer``'s Rust
-  ``DecodeStream`` with a UTF-8 boundary-verified prompt suffix instead of decoding
-  the full prompt twice on the first emitted token.
+Both are off by default and installed by ``additional_config["tpu_frontend"]``
+(see ``frontend_options``):
+
+* ``lazy_reasoning_count``: skips per-delta
+  ``DelegatingParser.count_reasoning_tokens`` recomputation on intermediate
+  streaming chunks when ``continuous_usage_stats`` is disabled, and
+  short-circuits to 0 when the ``StreamingParserEngine`` state machine has no
+  reachable ``REASONING_CHUNK`` transition or state.
+* ``detok_prompt_tail``: primes ``FastIncrementalDetokenizer``'s Rust
+  ``DecodeStream`` with a UTF-8 boundary-verified suffix of the last
+  ``DETOK_PROMPT_TAIL_TOKENS`` prompt tokens instead of decoding the full prompt
+  twice on the first emitted token.
 """
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import multiprocessing
 import os
@@ -32,6 +38,7 @@ import time
 logger = logging.getLogger("vllm.qx_fe_fix")
 _P = "[QX_LAZY_REASONING_COUNT]"
 _INSTALLED = False
+_LAZY_REASONING_COUNT_LOG_S = 60.0
 
 
 class _Stats:
@@ -100,7 +107,7 @@ def _provably_zero(rp) -> bool:
 
 def maybe_install_lazy_reasoning_count() -> bool:
     global _INSTALLED
-    if _INSTALLED or os.environ.get("QX_LAZY_REASONING_COUNT", "1") != "1":
+    if _INSTALLED:
         return False
     pname = multiprocessing.current_process().name
     if not (pname == "MainProcess" or pname.startswith("ApiServer")):
@@ -114,7 +121,7 @@ def maybe_install_lazy_reasoning_count() -> bool:
 
     orig_parse_delta = DelegatingParser.parse_delta
     orig_count = DelegatingParser.count_reasoning_tokens
-    log_s = float(os.environ.get("QX_LAZY_REASONING_COUNT_LOG_S", "60"))
+    log_s = _LAZY_REASONING_COUNT_LOG_S
     _Stats.last_log = time.monotonic()
 
     def parse_delta(self, *args, **kwargs):
@@ -165,11 +172,9 @@ def maybe_install_lazy_reasoning_count() -> bool:
         n = orig_count(self, token_ids)
         _Stats.computed += 1
         _Stats.compute_s += time.perf_counter() - t0
-        try:
+        with contextlib.suppress(Exception):
             self._qx_last_count = n
             _maybe_log()
-        except Exception:
-            pass
         return n
 
     parse_delta.__qx_lazy__ = True
@@ -188,7 +193,7 @@ def maybe_install_lazy_reasoning_count() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Detokenizer prompt tail (QX_DETOK_PROMPT_TAIL).
+# Detokenizer prompt tail (tpu_frontend.detok_prompt_tail).
 #
 # vLLM's FastIncrementalDetokenizer primes ``tokenizers.decoders.DecodeStream``
 # with the *whole* prompt.  The first ``step()`` then decodes the prompt twice
@@ -210,6 +215,9 @@ def maybe_install_lazy_reasoning_count() -> bool:
 
 _DT = "[QX_DETOK_PROMPT_TAIL]"
 _DETOK_INSTALLED = False
+# Prompt tokens the detokenizer is primed with when the tail is safe.
+DETOK_PROMPT_TAIL_TOKENS = 8
+_DETOK_PROMPT_TAIL_LOG_S = 300.0
 
 
 class _DetokStats:
@@ -258,12 +266,7 @@ def maybe_install_detok_prompt_tail() -> bool:
     global _DETOK_INSTALLED
     if _DETOK_INSTALLED:
         return False
-    try:
-        tail_n = int(os.environ.get("QX_DETOK_PROMPT_TAIL", "8"))
-    except ValueError:
-        tail_n = 8
-    if tail_n <= 0:
-        return False
+    tail_n = DETOK_PROMPT_TAIL_TOKENS
     pname = multiprocessing.current_process().name
     if not (pname == "MainProcess" or pname.startswith("ApiServer")):
         return False
@@ -288,11 +291,11 @@ def maybe_install_detok_prompt_tail() -> bool:
         return False
 
     orig_init = cls.__init__
-    log_s = float(os.environ.get("QX_DETOK_PROMPT_TAIL_LOG_S", "300"))
+    log_s = _DETOK_PROMPT_TAIL_LOG_S
     _DetokStats.last_log = time.monotonic()
 
     def __init__(self, tokenizer, request):
-        try:
+        with contextlib.suppress(Exception):
             ids = request.prompt_token_ids
             if ids is not None and len(ids) > tail_n:
                 sp = request.sampling_params
@@ -316,8 +319,6 @@ def maybe_install_detok_prompt_tail() -> bool:
                     _DetokStats.full_fallback,
                     _DetokStats.short,
                 )
-        except Exception:
-            pass
         orig_init(self, tokenizer, request)
 
     __init__.__qx_detok_tail__ = True
