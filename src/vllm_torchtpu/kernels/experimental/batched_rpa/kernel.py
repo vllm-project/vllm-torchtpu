@@ -19,7 +19,6 @@ softmax accumulation, and output writeback across decode and mixed batches.
 """
 
 import dataclasses
-import os
 from collections.abc import Callable
 from typing import cast
 
@@ -584,17 +583,10 @@ def block_fully_visible(
     return full
 
 
-def q_tail_trim_enabled() -> bool:
-    """Whether to trim redundant q-tail sub-tiles in partially filled bq blocks."""
-    return os.environ.get("TPU_RPA_Q_TAIL_TRIM", "1") == "1"
-
-
 def _q_tail_rungs(cfgs: configs.RpaConfigs) -> tuple[int, ...]:
-    if (
-        not q_tail_trim_enabled()
-        or cfgs.mode == configs.RpaCase.DECODE
-        or cfgs.bq_sz < 256
-    ):
+    """Query-row rungs of a prefill/mixed q block: a rung past the first is
+    skipped when no lane of the step has query rows in it."""
+    if cfgs.mode == configs.RpaCase.DECODE or cfgs.bq_sz < 256:
         return (cfgs.bq_sz,)
     candidates = (128, 256, 512, 1024)
     return tuple(r for r in candidates if r < cfgs.bq_sz) + (cfgs.bq_sz,)

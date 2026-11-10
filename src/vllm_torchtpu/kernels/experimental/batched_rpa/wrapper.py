@@ -26,7 +26,6 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.experimental.batched_rpa import (
     configs,
     kernel,
@@ -544,43 +543,63 @@ def calculate_block_sizes(
     prefill_batch_size = 2
 
     decode_block_sizes = find_best_block_sizes(decode_batch_size, decode_query_size)
-    prefill_block_sizes = prefill_block_override(
-        find_best_block_sizes(prefill_batch_size), serve_cfgs, mxu_column_size
+    prefill_block_sizes = tuned_prefill_block_sizes(
+        find_best_block_sizes(prefill_batch_size),
+        model_cfgs,
+        serve_cfgs,
+        mxu_column_size,
     )
 
     return decode_block_sizes, prefill_block_sizes
 
 
-def prefill_block_override(
+# Prefill/mixed tiles (bq, bq_c, bkv, batch) tuned for one layer shape:
+# (q heads, KV heads, head_dim, fp8 KV) per device. The heuristic grows bq and
+# bkv together, so with many q heads per KV head (32 q / 2 KV heads on a PP=8
+# stage of Qwen3.5-397B) VMEM stops both at 256 and every 256-key block pays a
+# full accumulator rescale. A 1024-key block with a small q sub-chunk fits:
+# 256,32,1024,1 ran the prefill kernel ~20% faster at 87K context
+# (rpa_prefill_bench, j-10897a30), and 256,16,1024,1 cut the PP8 prefill
+# engine step a further 4.8% (137.5 -> 130.9 ms, j-9222ac3c; GSM8K 97.80%,
+# j-839e2703).
+_TUNED_PREFILL_TILES: dict[tuple[int, int, int, bool], tuple[int, int, int, int]] = {
+    (32, 2, 256, True): (256, 16, 1024, 1),
+}
+# Tiles that produced wrong outputs at the tuned shape: 128,16,1024,1 scored
+# 78.01% on GSM8K (gate 97%, j-332a20f2). No table entry may use them.
+_UNSAFE_PREFILL_TILES = frozenset({(128, 16, 1024, 1)})
+
+
+def tuned_prefill_block_sizes(
     default: configs.BlockSizes,
+    model_cfgs: configs.ModelConfigs,
     serve_cfgs: configs.ServingConfigs,
     mxu_column_size: int,
 ) -> configs.BlockSizes:
-    """Applies TPU_RPA_PREFILL_BLOCKS ("bq,bq_c,bkv,batch") to the prefill tiles.
+    """The prefill tiles from `_TUNED_PREFILL_TILES` for this layer shape, or
+    `default` (the heuristic's) for any other shape.
 
-    The heuristic grows bq and bkv together, so with many q heads per KV head
-    (32 q / 2 KV heads on a PP=8 stage) VMEM stops both at 256 and every
-    256-key block pays a full accumulator rescale. A 1024-key block with a
-    small q sub-chunk (256,32,1024,1) fits and runs the prefill kernel ~20%
-    faster at 87K context (rpa_prefill_bench.py, j-10897a30). Every caller of
-    calculate_block_sizes (the kernel, build_rpa_schedules and the schedule
-    shapes) sees the same tiles. bq is clamped to the aligned token count as
-    the heuristic does, and bq_c to a divisor of bq. Empty: the heuristic.
+    bq is clamped to the aligned token count as the heuristic does, and bq_c
+    to a divisor of bq.
     """
-    raw = (envs.TPU_RPA_PREFILL_BLOCKS or "").strip()
-    if not raw:
+    is_fp8_kv = jnp.dtype(serve_cfgs.dtype_kv) in (
+        jnp.dtype(jnp.float8_e4m3fn),
+        jnp.dtype(jnp.float8_e5m2),
+    )
+    key = (
+        model_cfgs.num_q_heads,
+        model_cfgs.num_kv_heads,
+        model_cfgs.head_dim,
+        is_fp8_kv,
+    )
+    tiles = _TUNED_PREFILL_TILES.get(key)
+    if tiles is None:
         return default
-    try:
-        bq, bq_c, bkv, batch = (int(x) for x in raw.split(","))
-    except ValueError as e:
-        raise ValueError(
-            f"TPU_RPA_PREFILL_BLOCKS must be 'bq,bq_c,bkv,batch'; got {raw!r}"
-        ) from e
-    if min(bq, bq_c, bkv, batch) <= 0 or bkv % serve_cfgs.page_size:
-        raise ValueError(
-            f"TPU_RPA_PREFILL_BLOCKS={raw!r}: sizes must be positive and bkv a "
-            f"multiple of the page size {serve_cfgs.page_size}"
-        )
+    if tiles in _UNSAFE_PREFILL_TILES:
+        raise ValueError(f"prefill tiles {tiles} for {key} are known to be wrong")
+    bq, bq_c, bkv, batch = tiles
+    if bkv % serve_cfgs.page_size:
+        return default
     max_useful_bq_sz = max(
         mxu_column_size, utils.align_to(serve_cfgs.total_q_tokens, mxu_column_size)
     )
@@ -666,7 +685,7 @@ def ragged_paged_attention(
     return_lse: bool = False,
     mask_invalid_v: bool | None = None,
     native_fp8: str = "",
-    native_fp8_prefill: str | None = None,
+    native_fp8_prefill: str = "",
     decode_exp2: bool = False,
 ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
     """Perform batched ragged paged attention.
@@ -743,7 +762,7 @@ def ragged_paged_attention(
         native_fp8_prefill: The same for the PREFILL and MIXED kernels ("qk",
             "pv", "qkpv", each operand optionally with "s" for its static
             scale, e.g. "qkpvs"); see `configs.ServingConfigs`. Defaults to
-            the TPU_RPA_NATIVE_FP8_PREFILL environment variable (unset: off).
+            "" (off).
         decode_exp2: Run the DECODE softmax in base 2; see
             `configs.ServingConfigs.decode_exp2`. Defaults to False.
 
@@ -821,8 +840,6 @@ def ragged_paged_attention(
             f"native_fp8 must match (qk[2s])(pv[2s]), e.g. qkpv, qk2pv2 or pvs; "
             f"got {native_fp8!r}"
         )
-    if native_fp8_prefill is None:
-        native_fp8_prefill = envs.TPU_RPA_NATIVE_FP8_PREFILL
     if native_fp8_prefill not in ("", "0") and not re.fullmatch(
         r"(qks?)?(pvs?)?", native_fp8_prefill
     ):
