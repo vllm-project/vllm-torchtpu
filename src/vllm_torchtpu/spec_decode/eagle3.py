@@ -360,6 +360,7 @@ class Eagle3Proposer:
         self._seed_checks_done = 0
         self._seed_extras: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         self._carry_checks_done = 0
+        self._draft_rows_fresh_logged = False
         self._carry_mismatches: torch.Tensor | None = None
         self._seed_mismatches: torch.Tensor | None = None
         # DSA MTP IndexShare (GLM-5.2 / DeepSeek-V3.2). Resolved in load_model.
@@ -1292,6 +1293,11 @@ class Eagle3Proposer:
         # torch-tpu DEFER_AND_FUSE path fuses with per-step-varying neighbors in
         # the K-step propose loop -> a fresh fused program per context. Enclosing
         # them makes a fixed, bucketed program per [n, hidden] shape.
+        return self._propose_token_body(hidden)
+
+    def _propose_token_body(self, hidden: torch.Tensor) -> torch.Tensor:
+        """`_draft_propose_token`'s traced body (also traced by
+        `_draft_token_and_rows`)."""
         assert self.draft_model is not None
         d2t = getattr(self.draft_model, "draft_id_to_target_id", None)
         if d2t is None:
@@ -1343,6 +1349,17 @@ class Eagle3Proposer:
             pos_carry,
             torch.index_select(last_hidden, 0, indices),
         )
+
+    @_static_shape_args
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def _draft_token_and_rows(
+        self, last_hidden: torch.Tensor, hidden: torch.Tensor, rows: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """VLLM_TPU_DRAFT_ROWS_FRESH: `_draft_propose_token(last_hidden[:rows])`
+        plus `hidden[:rows]` as a buffer of its own, from the untrimmed step-0
+        outputs (same shapes into the lm-head, same values)."""
+        token = self._propose_token_body(last_hidden[:rows])
+        return token, hidden[:rows].clone()
 
     @_static_shape_args
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
@@ -1554,9 +1571,18 @@ class Eagle3Proposer:
                 ),
             )
             host_phases.mark("dp_forward0")
+            # VLLM_TPU_DRAFT_ROWS_FRESH: (untrimmed last_hidden, hidden, rows)
+            # when step 0's outputs are trimmed by a view below.
+            untrimmed = None
             if self._draft_rows:
                 # Back from the fixed draft_rows length to the p carry rows.
                 rows = last_token_indices.shape[0]
+                if (
+                    envs.VLLM_TPU_DRAFT_ROWS_FRESH
+                    and last_hidden.shape[0] > rows
+                    and hidden.shape[0] > rows
+                ):
+                    untrimmed = (last_hidden, hidden, rows)
                 last_hidden = self._fit_draft_rows_output(last_hidden, rows)
                 hidden = self._fit_draft_rows_output(hidden, rows)
             # [p, h] / [p] carries + first-pass draft token, computed in compiled
@@ -1599,6 +1625,22 @@ class Eagle3Proposer:
             elif self._draft_rows:
                 # The draft already returned one row per last token.
                 hidden_carry, last_hidden_carry = hidden, last_hidden
+                if untrimmed is not None and not has_non_default_layout:
+                    # The [:rows] views would each be re-materialized by an
+                    # execute_as_strided program before the propose and the
+                    # fused loop: trim inside the propose program instead.
+                    with set_model_tag("eagle_head"):
+                        fused_token0, hidden_carry = self._draft_token_and_rows(
+                            *untrimmed
+                        )
+                    if not getattr(self, "_draft_rows_fresh_logged", False):
+                        self._draft_rows_fresh_logged = True
+                        logger.info(
+                            "DRAFT_ROWS_FRESH: draft step 0 token and carry "
+                            "trimmed in one program (%d of %d rows)",
+                            untrimmed[2],
+                            untrimmed[0].shape[0],
+                        )
                 positions_carry = self._draft_gather_positions(
                     positions, gather_indices
                 )
@@ -2976,6 +3018,26 @@ class Eagle3Proposer:
                 out = self._draft_propose_token(dummy_hidden)
                 synchronize_tensors(out)
                 logger.info("  -- drafter compute_logits n: %d", n)
+            if envs.VLLM_TPU_DRAFT_ROWS_FRESH and self._draft_rows:
+                # Step 0's untrimmed outputs are [capacity, hidden] (see
+                # _draft_rows_len); the carry rows are a num_reqs bucket.
+                caps = {
+                    int(c)
+                    for c in (
+                        runner.num_reqs_max_model_len,
+                        runner.num_reqs_most_model_len,
+                    )
+                    if c is not None
+                }
+                for cap in caps:
+                    full = torch.zeros(
+                        (cap, hidden_size), dtype=runner._hidden_states_dtype
+                    ).to(runner.device)
+                    for rows in runner.num_reqs_paddings:
+                        if rows < cap:
+                            synchronize_tensors(
+                                self._draft_token_and_rows(full, full, rows)
+                            )
 
     def run_dp_dummy_draft(self, num_chunks: int) -> None:
         """Replay a busy rank's DRAFT collective trace on an idle/padding rank,
