@@ -73,7 +73,6 @@ from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.attention.backend import AttentionLayer
-from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheConfig,
@@ -2839,6 +2838,8 @@ class TPUModelRunner(GPUModelRunner):
         self._repetition_penalty.discard(scheduler_output.finished_req_ids)
         for new_req in scheduler_output.scheduled_new_reqs:
             self._min_tokens.add(new_req.req_id, new_req.sampling_params)
+            # A streaming-input continuation reuses its request id with new
+            # params and a new prompt, so drop the old entry first.
             self._repetition_penalty.discard((new_req.req_id,))
             params = new_req.sampling_params
             if params is None or params.repetition_penalty == 1.0:
@@ -2846,16 +2847,9 @@ class TPUModelRunner(GPUModelRunner):
             if not self._repetition_penalty_supported():
                 self._warn_repetition_penalty_unsupported()
                 continue
-            req_state = self.requests.get(new_req.req_id)
-            prompt_ids = (
-                req_state.prompt_token_ids
-                if req_state is not None
-                else (
-                    new_req.prompt_token_ids
-                    if isinstance(new_req, NewRequestData)
-                    else None
-                )
-            )
+            # The base _update_states above put every new request (new or
+            # streaming continuation) in self.requests.
+            prompt_ids = self.requests[new_req.req_id].prompt_token_ids
             self._repetition_penalty.add(new_req.req_id, params, prompt_ids)
         # Copy after the base zeroes new blocks (the CoW dst is one of them).
         if use_page_local_copy:
@@ -4988,7 +4982,6 @@ class TPUModelRunner(GPUModelRunner):
 
     def _repetition_penalty_batch_state(
         self,
-        scheduler_output: "SchedulerOutput | None" = None,
     ) -> repetition_penalty_ops.RepetitionPenaltyState:
         """This step's batch rows with ``repetition_penalty != 1.0``.
 
@@ -4997,24 +4990,10 @@ class TPUModelRunner(GPUModelRunner):
         """
         if not self._repetition_penalty:
             return {}
-        state = self._repetition_penalty.batch_state(
+        return self._repetition_penalty.batch_state(
             self.input_batch.req_id_to_index,
             self._lookup_repetition_penalty_output,
         )
-        if scheduler_output is not None and state:
-            num_scheduled = scheduler_output.num_scheduled_tokens
-            req_ids = self.input_batch.req_ids
-            for idx in list(state):
-                req_id = req_ids[idx]
-                req_state = self.requests.get(req_id)
-                sched = num_scheduled.get(req_id)
-                if (
-                    req_state is not None
-                    and sched is not None
-                    and req_state.num_computed_tokens + sched < req_state.num_tokens
-                ):
-                    del state[idx]
-        return state
 
     def _repetition_penalty_supported(self) -> bool:
         """Whether this runner mode applies ``repetition_penalty``."""
@@ -5233,7 +5212,7 @@ class TPUModelRunner(GPUModelRunner):
         state = self.execute_model_state
         scheduler_output = state.scheduler_output
         self.execute_model_state = None
-        rep_pen = self._repetition_penalty_batch_state(scheduler_output)
+        rep_pen = self._repetition_penalty_batch_state()
         min_toks = self._min_tokens_batch_state()
 
         # Used to keep rand draws consistent across TP ranks.

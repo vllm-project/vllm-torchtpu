@@ -298,22 +298,6 @@ class TestRunnerIntegration:
         assert out.sampled_token_ids == [[2]]
         assert seen_logprob_logits[0][0, 4].item() == pytest.approx(3.0)
 
-    def test_intermediate_chunked_prefill_skipped_in_batch_state(self):
-        logits = torch.zeros(1, 8)
-        runner = _plain_runner(logits)
-        runner._repetition_penalty.add(
-            "r0", SamplingParams(repetition_penalty=1.5), [4, 5, 6, 7]
-        )
-        # 4 prompt tokens, 1 computed, 1 scheduled -> intermediate chunk.
-        runner.requests["r0"].num_computed_tokens = 1
-        runner.requests["r0"].num_tokens = 4
-        so = SimpleNamespace(num_scheduled_tokens={"r0": 1})
-        assert runner._repetition_penalty_batch_state(so) == {}
-
-        # Final prefill chunk (3 computed + 1 scheduled == 4 tokens) is included.
-        runner.requests["r0"].num_computed_tokens = 3
-        assert list(runner._repetition_penalty_batch_state(so)) == [0]
-
     def test_batch_reorder_and_top_tokens_gate(self):
         batch = InputBatch(
             max_num_reqs=4,
@@ -424,6 +408,46 @@ class TestRunnerIntegration:
         assert not runner._repetition_penalty
         log.warning_once.assert_called_once()
         assert "async_scheduling=False" in log.warning_once.call_args.args[0]
+
+    def test_update_states_retracks_streaming_continuation(self):
+        """A streaming-input continuation arrives as a new request with the
+        same id, a new prompt and new params, and no finish in between."""
+        runner = object.__new__(TPUModelRunner)
+        runner._min_tokens = min_tokens.MinTokensTracker()
+        runner._repetition_penalty = rep_pen.RepetitionPenaltyTracker()
+        runner._mamba_state_pos, runner._mamba_slot_by_req_id = {}, {}
+        runner._free_mamba_slots, runner._mamba_offset_seeded = [], set()
+        runner._pre_async_results = None
+        runner.scheduler_config = SimpleNamespace(async_scheduling=False)
+        runner.speculative_config = None
+        runner._install_spec_token_room_guard = lambda: None
+        runner._repetition_penalty.add("s", SamplingParams(repetition_penalty=1.5), [2])
+
+        def step(penalty, prompt_ids):
+            runner.requests = {"s": SimpleNamespace(prompt_token_ids=prompt_ids)}
+            so = SimpleNamespace(
+                finished_req_ids=set(),
+                preempted_req_ids=None,
+                scheduled_cached_reqs=SimpleNamespace(resumed_req_ids=set()),
+                kv_cache_block_copies=None,
+                scheduled_new_reqs=[
+                    SimpleNamespace(
+                        req_id="s",
+                        sampling_params=SamplingParams(repetition_penalty=penalty),
+                    )
+                ],
+            )
+            with patch.object(GPUModelRunner, "_update_states", return_value=None):
+                TPUModelRunner._update_states(runner, so)
+
+        # New params and prompt replace the old entry.
+        step(1.2, [2, 9, 4])
+        entry = runner._repetition_penalty.requests["s"]
+        assert entry.penalty == pytest.approx(1.2)
+        assert entry.prompt_ids.tolist() == [2, 9, 4]
+        # A continuation without a penalty drops the old entry.
+        step(1.0, [2, 9, 4, 7])
+        assert not runner._repetition_penalty
 
     @pytest.mark.parametrize(
         ("async_scheduling", "spec", "expected"),

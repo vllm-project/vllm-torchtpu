@@ -111,19 +111,18 @@ class RepetitionPenaltyTracker:
         self,
         req_id: str,
         params: SamplingParams | None,
-        prompt_token_ids: Sequence[int] | None = None,
+        prompt_ids: Sequence[int] | None = None,
     ) -> None:
         self.requests.pop(req_id, None)
         if params is None or params.repetition_penalty == 1.0:
             return
-        prompt_arr = (
-            np.asarray(prompt_token_ids, dtype=np.int64)
-            if prompt_token_ids is not None and len(prompt_token_ids) > 0
-            else np.empty((0,), dtype=np.int64)
-        )
         self.requests[req_id] = RepetitionPenaltyRequest(
             penalty=float(params.repetition_penalty),
-            prompt_ids=prompt_arr,
+            prompt_ids=(
+                np.asarray(prompt_ids, dtype=np.int64)
+                if prompt_ids is not None and len(prompt_ids) > 0
+                else np.empty((0,), dtype=np.int64)
+            ),
         )
 
     def discard(self, req_ids: Iterable[str]) -> None:
