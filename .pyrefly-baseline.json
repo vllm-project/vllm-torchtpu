@@ -311,11 +311,6 @@
       "concise_description": "Expected a callable, got `object`"
     },
     {
-      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/dspark.py",
-      "name": "bad-return",
-      "concise_description": "Returned type `dict[str, tuple[int] | tuple[int, int]]` is not assignable to declared return type `dict[str, tuple[int, ...]]`"
-    },
-    {
       "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/pools.py",
       "name": "not-callable",
       "concise_description": "Expected a callable, got `object`"
