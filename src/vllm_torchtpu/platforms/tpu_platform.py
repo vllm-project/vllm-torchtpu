@@ -851,6 +851,12 @@ class TpuPlatform(Platform):
         )
         _validate_phased_profiling_config(vllm_config)
         _validate_peer_replay_config()
+        # API-server patches from additional_config["tpu_frontend"] (all off by
+        # default). This runs in every process that builds the engine config,
+        # including each API server, before the renderer exists.
+        from vllm_torchtpu import frontend_options
+
+        frontend_options.install(vllm_config)
         if "USE_MOE_EP_KERNEL" in os.environ:
             raise ValueError(
                 "USE_MOE_EP_KERNEL is no longer supported and enables "

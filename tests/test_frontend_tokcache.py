@@ -11,17 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import sys
 import unittest
-from pathlib import Path
 
-try:
-    from vllm_torchtpu import frontend_tokcache as tokcache_mod
-except Exception:
-    sys.path.insert(
-        0, str(Path(__file__).resolve().parents[1] / "src" / "vllm_torchtpu")
-    )
-    import frontend_tokcache as tokcache_mod
+from vllm_torchtpu import frontend_tokcache as tokcache_mod
 
 
 class TestFrontendTokCache(unittest.TestCase):
@@ -82,6 +74,35 @@ class TestFrontendTokCache(unittest.TestCase):
         edited = prompt + "extra text without boundary"
         self.assertEqual(cache.encode(edited), self.encode_fn(edited))
         self.assertFalse(cache.disabled)
+
+
+def _toy_hf_tokenizer():
+    from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
+    from transformers import PreTrainedTokenizerFast
+
+    t = Tokenizer(models.BPE())
+    t.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    t.decoder = decoders.ByteLevel()
+    trainer = trainers.BpeTrainer(
+        vocab_size=400,
+        initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
+        special_tokens=[tokcache_mod.BOUNDARY, "<|im_end|>"],
+        show_progress=False,
+    )
+    t.train_from_iterator(["user hi assistant hello world"] * 20, trainer)
+    return PreTrainedTokenizerFast(tokenizer_object=t)
+
+
+def test_installed_cache_uses_the_deployed_sizes():
+    """2048 entries and 64M tokens: what every IX prefill leg ran."""
+    cache = tokcache_mod._build_cache_for(_toy_hf_tokenizer())
+    assert cache is not None
+    assert (cache._max_entries, cache._max_tokens) == (2048, 64_000_000)
+    assert (cache._min_tokens, cache._verify_first, cache._verify_every) == (
+        2048,
+        8,
+        0,
+    )
 
 
 if __name__ == "__main__":
