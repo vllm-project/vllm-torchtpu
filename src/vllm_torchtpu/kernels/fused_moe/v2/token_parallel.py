@@ -31,6 +31,8 @@ def replica_wire_rows(input_rows, width, row_alignment):
     once for every token bucket and refuses a graph that assumes any bound on
     the token count.
     """
+    if width == 1:
+        return input_rows
     share = (input_rows + width - 1) // width
     return (share + row_alignment - 1) // row_alignment * row_alignment
 
@@ -41,8 +43,7 @@ class TokenReplicaLayout:
 
     Every member supplies identical input rows. Each computes one contiguous
     slice, then all members recover the original row order. Singleton groups
-    pad their rows to an aligned tile like wider groups, and restore slices
-    the output back to input_rows.
+    leave the input and output unchanged, including unaligned row counts.
     """
 
     groups: tuple[tuple[int, ...], ...]
@@ -86,18 +87,19 @@ class TokenReplicaLayout:
         local_rows = (input_rows + width - 1) // width
         # Pallas routing tiles need aligned row blocks. Below one block,
         # keep a power-of-two whole-array tile rather than widening to eight.
-        alignment = min(row_alignment, 1 << (local_rows - 1).bit_length())
+        alignment = (
+            min(row_alignment, 1 << (local_rows - 1).bit_length()) if width > 1 else 1
+        )
         local_rows = (local_rows + alignment - 1) // alignment * alignment
         return cls(groups, tuple(slots), input_rows, local_rows)
 
     def split(
         self, rows: jax.Array, rank: jax.Array, *, fill_value: float = 0
     ) -> jax.Array:
-        padding = self.local_rows * len(self.groups[0]) - self.input_rows
-        if padding:
-            rows = jnp.pad(rows, ((0, padding), (0, 0)), constant_values=fill_value)
         if len(self.groups[0]) == 1:
             return rows
+        padding = self.local_rows * len(self.groups[0]) - self.input_rows
+        rows = jnp.pad(rows, ((0, padding), (0, 0)), constant_values=fill_value)
         slot = jnp.asarray(self.slots, dtype=jnp.int32)[rank]
         return lax.dynamic_slice_in_dim(
             rows, slot * self.local_rows, self.local_rows, axis=0
@@ -105,7 +107,7 @@ class TokenReplicaLayout:
 
     def restore(self, rows: jax.Array, axis: str) -> jax.Array:
         if len(self.groups[0]) == 1:
-            return rows[: self.input_rows]
+            return rows
         gathered = lax.all_gather(
             rows, axis, axis=0, tiled=True, axis_index_groups=self.groups
         )
