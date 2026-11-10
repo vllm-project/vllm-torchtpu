@@ -3967,11 +3967,15 @@ class TPUModelRunner(GPUModelRunner):
                 continue
             n_sampled = len(sampled_ids)
             if carry_rej is not None:
-                carry_rej[req_id] = 1 + (
-                    pre_num_draft_per_req.get(pre_req_idx, 0)
-                    if pre_num_draft_per_req
-                    else 0
-                ) - n_sampled
+                carry_rej[req_id] = (
+                    1
+                    + (
+                        pre_num_draft_per_req.get(pre_req_idx, 0)
+                        if pre_num_draft_per_req
+                        else 0
+                    )
+                    - n_sampled
+                )
 
             # The previous step optimistically appended (1 + num_draft)
             # placeholder tokens to output_token_ids, assuming every draft was
@@ -4925,9 +4929,9 @@ class TPUModelRunner(GPUModelRunner):
                 self.device, non_blocking=True
             )
             if self.uses_mrope:
-                self.position_ids = self.mrope_positions.cpu[
-                    :, local_token_slice
-                ].to(self.device, non_blocking=True)
+                self.position_ids = self.mrope_positions.cpu[:, local_token_slice].to(
+                    self.device, non_blocking=True
+                )
             else:
                 self.position_ids = self.positions_cpu[local_token_slice].to(
                     self.device, non_blocking=True
@@ -5087,7 +5091,11 @@ class TPUModelRunner(GPUModelRunner):
 
         carry_recorded = False
         if carry is not None and not _decode_carry.will_take_fused_draft_path(
-            self, _pending_rejected_sub, seq_lens, cur_input_indices, spec_decode_metadata
+            self,
+            _pending_rejected_sub,
+            seq_lens,
+            cur_input_indices,
+            spec_decode_metadata,
         ):
             # The early check assumed the fused draft-token path; it is not taken.
             seq_lens = _upload_seq_pos_ids()

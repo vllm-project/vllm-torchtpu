@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Steady-state device carry for async speculative decode.
 
 Every async-spec decode step uploads three small host arrays (input_ids, positions,
@@ -71,13 +83,15 @@ class CarryState:
 
 
 def tag_results(runner: Any, results: Any) -> None:
-    """Number each AsyncPreResults so a carry can tell which step's rejections it saw."""
+    """Number each AsyncPreResults, so a carry can tell which step's rejections
+    it saw."""
     if results is not None and enabled(runner):
         results._decode_carry_seq = next(_SEQ)
 
 
 def record_rejected(runner: Any, results: Any, rejected: dict[str, int]) -> None:
-    """Called by `_modify_prev_results` with the per-request rejected count it read back."""
+    """Called by `_modify_prev_results` with the per-request rejected count it
+    read back."""
     runner._decode_carry_rej = (getattr(results, "_decode_carry_seq", None), rejected)
 
 
@@ -123,14 +137,29 @@ def check(
         return None
     st = runner.__dict__.get("_decode_carry_state")
     return _check(
-        runner, st, start_index, num_reqs, num_scheduled_tokens_per_req_list,
-        total_num_scheduled_tokens, padded_total_num_scheduled_tokens, target_num_reqs,
+        runner,
+        st,
+        start_index,
+        num_reqs,
+        num_scheduled_tokens_per_req_list,
+        total_num_scheduled_tokens,
+        padded_total_num_scheduled_tokens,
+        target_num_reqs,
         layout_plan,
     )
 
 
-def _check(runner, st, start_index, num_reqs, nsched_list, total, padded_total, target,
-           layout_plan):
+def _check(
+    runner,
+    st,
+    start_index,
+    num_reqs,
+    nsched_list,
+    total,
+    padded_total,
+    target,
+    layout_plan,
+):
     if st is None:
         return None
     pre = runner._pre_async_results
@@ -180,9 +209,11 @@ def _check(runner, st, start_index, num_reqs, nsched_list, total, padded_total, 
     return st
 
 
-def will_take_fused_draft_path(runner, pending_rejected_sub, seq_lens, cur_input_indices,
-                               spec_decode_metadata) -> bool:
-    """Mirror of `_prepare_inputs`' conditions for the fused draft-token subtract path."""
+def will_take_fused_draft_path(
+    runner, pending_rejected_sub, seq_lens, cur_input_indices, spec_decode_metadata
+) -> bool:
+    """Mirror of `_prepare_inputs`' conditions for the fused draft-token
+    subtract path."""
     return (
         pending_rejected_sub is not None
         and seq_lens.device.type == "tpu"
@@ -191,7 +222,8 @@ def will_take_fused_draft_path(runner, pending_rejected_sub, seq_lens, cur_input
         and runner._pre_async_results.next_tokens_tpu is not None
         and "_apply_async_token_substitution" not in getattr(runner, "__dict__", {})
         and spec_decode_metadata is not None
-        and spec_decode_metadata.final_logits_indices.shape[0] == runner.input_ids.shape[0]
+        and spec_decode_metadata.final_logits_indices.shape[0]
+        == runner.input_ids.shape[0]
     )
 
 
@@ -207,7 +239,8 @@ def record(
     sub_pairs: Any,
     seq_lens: Any,
 ) -> bool:
-    """After a fused draft-token subtract: keep its corrected device tensors for the next step."""
+    """After a fused draft-token subtract: keep its corrected device tensors
+    for the next step."""
     if not enabled(runner):
         return False
     pre = runner._pre_async_results
