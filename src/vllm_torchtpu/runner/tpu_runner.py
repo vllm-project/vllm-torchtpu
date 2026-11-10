@@ -7274,7 +7274,15 @@ class TPUModelRunner(GPUModelRunner):
                     spec_logprobs=spec_logprobs_chunks,
                 )
 
-        if self.scheduler_config.async_scheduling:
+        is_async = bool(self.scheduler_config.async_scheduling)
+        defer_modify_prev = (
+            is_async
+            and os.environ.get("VLLM_TPU_MTP_OPT", "1") != "0"
+            and self._is_async_drafter
+            and bool(combined_selected_tokens)
+            and not discard_sampled_tokens_req_indices
+        )
+        if is_async and not defer_modify_prev:
             self._modify_prev_results()
 
         # Unified eagle3 draft propose -- ONE call serving both sync and async
@@ -7391,6 +7399,13 @@ class TPUModelRunner(GPUModelRunner):
             if isinstance(eagle3_drafts, torch.Tensor):
                 synchronize_tensors([eagle3_drafts], wait=False)
             copy_state.fence_pending_device_work()
+
+        # Runs once the drafter is dispatched, so the wait on the previous
+        # step's sampled-token copy does not hold the draft back. It must still
+        # precede _update_placeholder below, which advances from the
+        # rolled-back num_tokens_no_spec.
+        if defer_modify_prev:
+            self._modify_prev_results()
 
         # Save, poll and clear the KV connector only after the drafter. Its
         # forward above writes the draft layers' KV into the blocks the target
