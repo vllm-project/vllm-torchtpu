@@ -21,6 +21,11 @@ from collections.abc import Callable, Sequence
 
 import torch
 
+try:
+    from vllm_torchtpu.layers.adapter.router_topk import rowmax_select
+except ImportError:  # no torch_tpu (host-side unit tests)
+    rowmax_select = None
+
 MASKED_LOGIT_VALUE = -1e12
 # 128 matches the native TPU (8, 128) vector tile / 128-element lane width
 # and evenly divides standard padded vocabs (e.g. 248,320 = 1,940 * 128;
@@ -194,7 +199,11 @@ def topk_mask(
     """
     k = k.squeeze(-1)
     if 0 < max_k <= logits.shape[-1]:
-        top_vals = torch.topk(logits, k=max_k, dim=-1, sorted=True).values
+        if rowmax_select is not None and logits.device.type == "tpu":
+            # Values descending, duplicates included, like torch.topk's.
+            top_vals = rowmax_select(logits.float(), max_k)[0].to(logits.dtype)
+        else:
+            top_vals = torch.topk(logits, k=max_k, dim=-1, sorted=True).values
         idx = (k.clamp(min=1, max=max_k) - 1).to(torch.int64).unsqueeze(-1)
         cutoff = torch.gather(top_vals, -1, idx)
         replace_tensor = torch.full_like(logits, replace_val)
