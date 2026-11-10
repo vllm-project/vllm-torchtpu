@@ -90,6 +90,7 @@ def _groups_match_mesh(mesh_index: int, dp: int, tp: int) -> bool:
         and dp_ranks == {order[j * tp + t] for j in range(dp)}
     )
     group = get_ep_group()
+    assert group is not None  # the caller found the EP mesh
     verdicts = [None] * group.world_size
     dist.all_gather_object(verdicts, bool(mine), group=group.cpu_group)
     return all(verdicts)
@@ -116,11 +117,13 @@ def prebuild(vllm_config: Any, topk: int) -> None:
     tp = int(get_tp_group().world_size)
     dp = int(get_dp_group().world_size)
     forms = (DISPATCH_FORM, COMBINE_FORM)
+    index = ep_mesh_index()
+    assert index is not None  # build_ep_mesh found the EP group
     if (
         dp * tp != cores
         or dp < 2
         or (tp != 2 and "hier" in forms)
-        or not _groups_match_mesh(ep_mesh_index(), dp, tp)
+        or not _groups_match_mesh(index, dp, tp)
     ):
         logger.debug(
             "moe_lowtok fused collectives not armed: dp=%d x tp=%d is not the "
@@ -133,7 +136,6 @@ def prebuild(vllm_config: Any, topk: int) -> None:
         return
     _DP, _TP = dp, tp
     _FP8_DISPATCH = fp8_dispatch
-    index = ep_mesh_index()
     _RANK = torch.tensor([index // tp, index % tp], dtype=torch.int32, device="tpu")
     _ARMED = True
     logger.info(
@@ -156,6 +158,7 @@ def _build_op(topk: int) -> torch.library.CustomOpDef:
     if op is not None:
         return op
     mesh = build_ep_mesh()
+    assert mesh is not None  # prebuild armed the op on this mesh
     dp, tp = _DP, _TP
     mesh2 = Mesh(np.asarray(mesh.devices).reshape(dp, tp), axis_names=("dp", "tp"))
     rows = PartitionSpec("dp")

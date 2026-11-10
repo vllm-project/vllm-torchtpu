@@ -173,6 +173,7 @@ def _tp_pairs_match_mesh(mesh_index: int, tp: int) -> bool:
         and all(order[block + j] in tp_ranks for j in range(tp))
     )
     group = get_ep_group()
+    assert group is not None  # the caller found the EP mesh
     verdicts = [None] * group.world_size
     dist.all_gather_object(verdicts, bool(mine), group=group.cpu_group)
     return all(verdicts)
@@ -237,15 +238,17 @@ def prebuild(vllm_config: Any) -> None:
     _DP_COMBINE = tuple(int(r) for r in get_dp_group().ranks) == _MESH_RANKS
     tp_all_reduce = tuple(int(r) for r in get_tp_group().ranks) == _MESH_RANKS
     tp = int(get_tp_group().world_size)
+    index = ep_mesh_index()
+    assert index is not None  # build_ep_mesh found the EP group
     if (
         not tp_all_reduce
         and tp == TP_PAIR_SIZE
         and tp < _CORES
         and _CORES % tp == 0
-        and _tp_pairs_match_mesh(ep_mesh_index(), tp)
+        and _tp_pairs_match_mesh(index, tp)
     ):
         _TP_RANKS = tuple(int(r) for r in get_tp_group().ranks)
-        _TP_RANK = torch.tensor([ep_mesh_index() % tp], dtype=torch.int32, device="tpu")
+        _TP_RANK = torch.tensor([index % tp], dtype=torch.int32, device="tpu")
         _AR_TP_OP = _build_tp_all_reduce(mesh, tp, TP_PAIR_FORM)
     logger.info(
         "Small collectives armed | cores=%d | max_rows=%d | "
