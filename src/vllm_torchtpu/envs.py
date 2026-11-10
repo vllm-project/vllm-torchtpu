@@ -293,6 +293,7 @@ if TYPE_CHECKING:
     VLLM_TPU_DRAFT_CARRY_FUSED: bool = False
     VLLM_TPU_VERIFY_FUSED_READ_OFFSETS: bool = False
     VLLM_TPU_VERIFY_ONE_DRAW: bool = False
+    VLLM_TPU_SUBST_FRESH_IDS: bool = False
     VLLM_TPU_DRAFT_SEED_EXTRAS: bool = False
     VLLM_TPU_DRAFT_SEED_BOOTSTRAP_PAD: bool = False
     VLLM_TPU_CPU_PIN_RESERVE: int = 2
@@ -1705,6 +1706,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Strip dynamic-dim stamps from the async token substitution's inputs so it
     # does not recompile mid-run (tpu_runner._apply_async_token_substitution).
     "VLLM_TPU_SUBST_STATIC_ARGS": env_bool("VLLM_TPU_SUBST_STATIC_ARGS"),
+    # With VLLM_TPU_FAST_TOKEN_SUBSTITUTION: the 1:1 steady-decode input ids
+    # come from one compiled slice of the previous step's source (a buffer of
+    # their own) instead of an eager view of it, which torch_tpu copies with an
+    # execute_as_strided program before every compiled consumer (same values).
+    "VLLM_TPU_SUBST_FRESH_IDS": env_bool("VLLM_TPU_SUBST_FRESH_IDS"),
     # Async spec decode: the per-step rejected-count correction of seq_lens and
     # positions as one compiled program (precompiled per request bucket).
     "VLLM_TPU_SUBTRACT_REJECTED_COMPILED": env_bool(
