@@ -13,4 +13,5 @@
 # limitations under the License.
 """Kernels the Qwen3.5 model rules run: the fused q/k norm + rope + gate and the
 GDN gated norm + FP8 quantization, with their custom-op bridges and the rule
-that says where they run."""
+that says where they run. A file copied from another kernel carries a
+provenance header naming its source path and commit."""

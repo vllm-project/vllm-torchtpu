@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Dense-slots fused EP layer (v3/dense_slots.py) against fused EP v4 at the DP4xTP2 decode
+"""Dense-slots fused EP layer (models/qwen3_5/kernels/dense_slots.py) against fused EP v4 at the DP4xTP2 decode
 shapes: numerics vs the dense reference, bit identity vs v3 with bf16 result rows (the same
 per-row math), and per-layer time, interleaved with v4 in the same process.
 
@@ -41,7 +41,7 @@ import jax.numpy as jnp  # noqa: E402
 from jax.sharding import PartitionSpec as P  # noqa: E402
 
 from vllm_torchtpu.kernels.fused_moe.v3 import MESH_AXIS, Config, fused_ep_moe  # noqa: E402
-from vllm_torchtpu.kernels.fused_moe.v3 import dense_slots as DS  # noqa: E402
+from vllm_torchtpu.models.qwen3_5.kernels import dense_slots as DS  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import test_p3_fused_ep_scale as S  # noqa: E402

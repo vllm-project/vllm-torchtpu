@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The dense-slots layer (v3/dense_slots.py) on CPU, every program in Pallas TPU interpret mode
+"""The dense-slots layer (models/qwen3_5/kernels/dense_slots.py) on CPU, every program in Pallas TPU interpret mode
 (remote DMAs, semaphores and barriers simulated) over 8 fake devices, against a per-token reference
 of the same math: v3's select, fused EP v3's per-row FFN (ffn.expert_ffn_fp8 / result_rows with
 bf16 result rows) and its k-ordered weighted sum.
@@ -29,7 +29,7 @@ from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.kernels.fused_moe.v3 import Config
-from vllm_torchtpu.kernels.fused_moe.v3 import dense_slots as DS
+from vllm_torchtpu.models.qwen3_5.kernels import dense_slots as DS
 from vllm_torchtpu.kernels.fused_moe.v3 import device as DEV
 from vllm_torchtpu.kernels.fused_moe.v3 import ffn
 from vllm_torchtpu.kernels.fused_moe.v3 import layer as v3_layer

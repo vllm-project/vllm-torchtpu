@@ -21,6 +21,7 @@ from types import SimpleNamespace
 import pytest
 
 from vllm_torchtpu.layers.adapter import fused_moe_ep_v3 as A
+from vllm_torchtpu.models.qwen3_5.kernels import dense_slots as DS
 
 SHAPE = dict(hidden=4096, inter=1024, experts_per_shard=64)
 EP = 8
@@ -43,7 +44,7 @@ def _run(monkeypatch, rows, overrides):
         calls.append(("v3", a, k))
         return "v3"
 
-    monkeypatch.setattr(A._dense_slots, "dense_slots_moe", dense)
+    monkeypatch.setattr(DS, "dense_slots_moe", dense)
     monkeypatch.setattr(A, "fused_ep_moe", v3)
     run = A.run_moe_v3(_Mesh(), 10, True, "silu", **SHAPE)
     x = SimpleNamespace(shape=(rows, 4096))
