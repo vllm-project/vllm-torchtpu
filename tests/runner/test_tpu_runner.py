@@ -2035,6 +2035,33 @@ class TestReorderBatchForRpa:
         assert runner._reorder_batch_for_rpa(sched) == (1, 2)
         assert runner._num_static_verify_reqs == 0
 
+    def test_ordered_batches_recount_static_verify_windows(self):
+        """Already-ordered batches skip the partition passes; the static
+        verify count must still be this step's, not the previous step's."""
+        runner = self._make_runner()
+        runner._static_verify_q_len = 4
+        self._batch(runner, ["dc", "full", "short", "full2"])
+        sched = self._sched(
+            {"dc": 1, "full": 4, "short": 2, "full2": 4},
+            spec_reqs=("full", "short", "full2"),
+        )
+        assert runner._reorder_batch_for_rpa(sched) == (1, 4)
+        assert runner._num_static_verify_reqs == 2
+        ids = runner.input_batch.req_ids
+        assert set(ids[1:3]) == {"full", "full2"} and ids[3] == "short"
+        # Ordered verify step whose full-length windows already lead.
+        self._batch(runner, ["dc", "full", "full2"])
+        sched = self._sched(
+            {"dc": 1, "full": 4, "full2": 4}, spec_reqs=("full", "full2")
+        )
+        assert runner._reorder_batch_for_rpa(sched) == (1, 3)
+        assert runner._num_static_verify_reqs == 2
+        # Ordered step without verify windows.
+        self._batch(runner, ["d1", "d2", "pf"])
+        sched = self._sched({"d1": 1, "d2": 1, "pf": 8})
+        assert runner._reorder_batch_for_rpa(sched) == (2, 2)
+        assert runner._num_static_verify_reqs == 0
+
     def test_masked_dense_orders_by_kv_length(self):
         runner = self._make_runner(groups_requests=True)
         self._batch(

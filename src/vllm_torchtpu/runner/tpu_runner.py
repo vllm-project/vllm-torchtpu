@@ -2009,9 +2009,16 @@ class TPUModelRunner(GPUModelRunner):
         req_ids = self.input_batch.req_ids
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         spec_decode_tokens = scheduler_output.scheduled_spec_decode_tokens
+        # Pass 3 below counts the static-length verify windows; the fast paths
+        # return before it, so a step they handle must not keep the previous
+        # step's count.
+        self._num_static_verify_reqs = 0
 
         # Fast single-pass scan when the batch is already monotonically
         # ordered across segments 0 -> 1 -> 2 (the steady-state decode case).
+        # With a static verify length the full-length windows must also lead
+        # the verify segment, which this scan does not check, so such a step
+        # takes the full passes.
         if not spec_decode_tokens:
             num_decode = 0
             prev_seg = 0
@@ -2031,7 +2038,7 @@ class TPUModelRunner(GPUModelRunner):
                     self, num_decode, num_reqs, scheduler_output, spec_decode_tokens
                 )
                 return num_decode, num_decode
-        else:
+        elif getattr(self, "_static_verify_q_len", None) is None:
             num_decode = 0
             num_windowed = 0
             prev_seg = 0
