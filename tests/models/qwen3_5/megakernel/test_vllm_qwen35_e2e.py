@@ -1911,18 +1911,24 @@ def test_can_run_real_tpu_runner_metadata(monkeypatch: pytest.MonkeyPatch) -> No
     spec = replace(qwen_plugin.SPEC, chips=(), tp_sizes=(), requires={})
     view = RunnerView(runner, tp_rank=0)
     assert driver_mod.check_spec(runner, spec, view=view) is None
-    for attr, val, code in (
-        ("supports_mm_inputs", True, "multimodal_inputs"),
-        ("lora_config", object(), "lora_enabled"),
-        ("_pp_is_last", False, "parallelism_unsupported:pp"),
-        ("_pcp_enabled", True, "parallelism_unsupported:pcp"),
-        ("_dp_lockstep_enabled", lambda: True, "parallelism_unsupported:dp_lockstep"),
+    v_cfg = runner.vllm_config
+    for obj, attr, val, code in (
+        (runner, "supports_mm_inputs", True, "multimodal_inputs"),
+        (v_cfg, "lora_config", object(), "lora_enabled"),
+        (runner, "_pp_is_last", False, "parallelism_unsupported:pp"),
+        (runner, "_pcp_enabled", True, "parallelism_unsupported:pcp"),
+        (
+            runner,
+            "_dp_lockstep_enabled",
+            lambda: True,
+            "parallelism_unsupported:dp_lockstep",
+        ),
     ):
-        old = getattr(runner, attr)
-        setattr(runner, attr, val)
+        old = getattr(obj, attr)
+        setattr(obj, attr, val)
         res = driver_mod.check_spec(runner, spec, view=view)
         assert res is not None and res.code == code, (attr, res)
-        setattr(runner, attr, old)
+        setattr(obj, attr, old)
 
     backbone.aux_hidden_state_layers = (1,)
     assert not driver.can_run(ids_2, pos_2, runner=runner)

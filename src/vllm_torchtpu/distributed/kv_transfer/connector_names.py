@@ -25,9 +25,11 @@ def kv_connector_names(
     kv_transfer_config: Any, multi_connectors: Container[str] = MULTI_CONNECTORS
 ) -> list[str]:
     """The connector a config names, or the children of a multi-connector (a
-    name in `multi_connectors`)."""
+    name in `multi_connectors`); empty when the config names no connector."""
     name = kv_transfer_config.kv_connector
+    if not name:
+        return []
     if name not in multi_connectors:
         return [name]
     extra = getattr(kv_transfer_config, "kv_connector_extra_config", None) or {}
-    return [child["kv_connector"] for child in extra.get("connectors", [])]
+    return [c for child in extra.get("connectors", []) if (c := child["kv_connector"])]

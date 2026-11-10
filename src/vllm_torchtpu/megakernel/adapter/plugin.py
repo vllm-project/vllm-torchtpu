@@ -34,7 +34,7 @@ import os
 import pkgutil
 from collections.abc import Callable, Mapping
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.megakernel.core.runtime import contract as _contract
@@ -141,6 +141,23 @@ def shorthands() -> dict[str, Shorthand]:
     for name, entry in discovered_shorthands().items():
         merged.setdefault(name, entry)
     return merged
+
+
+class RunnerProtocol(Protocol):
+    """The runner the adapter reads at startup: `TPUModelRunner` (and
+    `testing.fake_runner`). `RunnerView` wraps it for programs; the startup
+    guards read it directly. Config comes from `vllm_config`; the rest are
+    attributes the TPU model runner always sets."""
+
+    vllm_config: Any
+    model: Any
+    supports_mm_inputs: bool
+    uses_mrope: bool
+    _pp_is_first: bool
+    _pp_is_last: bool
+    _pcp_enabled: bool
+
+    def _dp_lockstep_enabled(self) -> bool: ...
 
 
 class RunnerView:
@@ -313,6 +330,7 @@ __all__ = [
     "MODELS_PACKAGE",
     "SHORTHANDS",
     "ForwardView",
+    "RunnerProtocol",
     "RunnerView",
     "Shorthand",
     "discovered_shorthands",

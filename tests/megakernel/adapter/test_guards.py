@@ -97,6 +97,18 @@ def test_kv_connector_guard(kv: Any, code: str | None) -> None:
         assert guards_mod.check_runner_features(runner, caps) is None
 
 
+@pytest.mark.parametrize("name", [None, ""])
+def test_kv_transfer_config_without_a_connector_is_no_decline(name: Any) -> None:
+    """A KV transfer config that names no connector puts none in effect: no
+    connector decline (not `kv_connector_unsupported:None`)."""
+    kv = SimpleNamespace(kv_connector=name, kv_connector_extra_config={})
+    assert connector_names.kv_connector_names(kv) == []
+    assert guards_mod.kv_connector_names(kv) == ()
+    runner = testing.fake_runner(kv_transfer_config=kv)
+    assert guards_mod.check_runner_features(runner, frozenset()) is None
+    assert _check(runner, features=_QWEN_CAPS) is None
+
+
 @pytest.mark.parametrize("multi", ["MultiConnector", "TPUMultiConnector"])
 def test_mixed_kv_connector_needs_offload_and_transfer(multi: str) -> None:
     """Offloading and transfer are checked separately: a multi-connector with
@@ -172,7 +184,7 @@ def test_undeclared_parallelism_is_a_named_decline(
 ) -> None:
     runner = testing.fake_runner(**kw)
     for k, v in par.items():
-        setattr(runner.parallel_config, k, v)
+        setattr(runner.vllm_config.parallel_config, k, v)
     assert guards_mod.detect_parallelism(runner, 1) == [kind]
     res = _check(runner)
     assert res is not None and res.code == f"parallelism_unsupported:{kind}"
@@ -265,7 +277,7 @@ def test_chip_and_tp_size_guards(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "(8,)" in res.message
     assert _check(runner, tp_sizes=(1, 8)) is None
     # Chip before TP size before parallelism.
-    runner.parallel_config.decode_context_parallel_size = 2
+    runner.vllm_config.parallel_config.decode_context_parallel_size = 2
     assert _check(runner, chips=("TPU7x",), tp_sizes=(8,)).code == (
         "unsupported_tpu_chip"
     )

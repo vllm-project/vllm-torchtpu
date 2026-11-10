@@ -24,7 +24,7 @@ from vllm_torchtpu.distributed.kv_transfer.connector_names import (
     kv_connector_names as _connector_names,
 )
 from vllm_torchtpu.megakernel.adapter.backbone import find_backbone
-from vllm_torchtpu.megakernel.adapter.plugin import RunnerView
+from vllm_torchtpu.megakernel.adapter.plugin import RunnerProtocol, RunnerView
 from vllm_torchtpu.megakernel.core.runtime.contract import (
     DOMAIN_TP,
     PARALLELISM_UNSUPPORTED,
@@ -65,29 +65,25 @@ def _dp_size(parallel_config: Any) -> int:
     return get_dp_size(parallel_config)
 
 
-def _runner_cfg(runner: Any, name: str) -> Any:
-    v_cfg = getattr(runner, "vllm_config", None)
-    cfg = getattr(v_cfg, name, None) if v_cfg is not None else None
-    return cfg if cfg is not None else getattr(runner, name, None)
-
-
 def kv_connector_names(kv_transfer_config: Any) -> tuple[str, ...]:
     """The KV connector names in effect: the configured connector, or the
     children of a `MultiConnector` / `TPUMultiConnector` (the multi-connector
-    itself when it lists none)."""
+    itself when it lists none). Empty without a config or a connector name."""
     if kv_transfer_config is None:
         return ()
-    names = _connector_names(kv_transfer_config)
-    return tuple(str(n) for n in names) or (str(kv_transfer_config.kv_connector),)
+    if names := _connector_names(kv_transfer_config):
+        return tuple(names)
+    name = kv_transfer_config.kv_connector
+    return (name,) if name else ()
 
 
 def _aux_hidden_layers(backbone: Any) -> Any:
     return getattr(backbone, "aux_hidden_state_layers", ()) if backbone else ()
 
 
-def _runner_backbone(runner: Any) -> Any:
+def _runner_backbone(runner: RunnerProtocol) -> Any:
     try:
-        return find_backbone(getattr(runner, "model", None))
+        return find_backbone(runner.model)
     except ValueError:
         return None
 
@@ -109,28 +105,22 @@ _PARALLELISM_DETAIL = {
 }
 
 
-def detect_parallelism(runner: Any, tp_size: int) -> list[str]:
+def detect_parallelism(runner: RunnerProtocol, tp_size: int) -> list[str]:
     """The parallelism kinds (beyond "tp") the runner uses, in check order.
     Reads config and group sizes only: no collective."""
-    p_cfg = _runner_cfg(runner, "parallel_config")
+    p_cfg = runner.vllm_config.parallel_config
     dp = _dp_size(p_cfg)
-    ep = bool(getattr(p_cfg, "enable_expert_parallel", False))
+    ep = p_cfg.enable_expert_parallel
     # Only expert parallelism runs MoE collectives over vLLM's EP group.
     ep_wide = ep and _ep_group_size() > max(1, tp_size)
-    dp_fn = getattr(runner, "_dp_lockstep_enabled", None)
-    pp_multi = not (
-        getattr(runner, "_pp_is_first", True) and getattr(runner, "_pp_is_last", True)
-    )
-    dcp = int(getattr(p_cfg, "decode_context_parallel_size", 1) or 1) > 1
-    pcp = (
-        bool(getattr(runner, "_pcp_enabled", False))
-        or int(getattr(p_cfg, "prefill_context_parallel_size", 1) or 1) > 1
-    )
+    pp_multi = not (runner._pp_is_first and runner._pp_is_last)
+    dcp = p_cfg.decode_context_parallel_size > 1
+    pcp = runner._pcp_enabled or p_cfg.prefill_context_parallel_size > 1
     ep_in_tp = ep and not ep_wide
     flags = (
         ("dp", dp > 1),
         ("ep_wider_than_tp", ep_wide),
-        ("dp_lockstep", bool(callable(dp_fn) and dp_fn())),
+        ("dp_lockstep", runner._dp_lockstep_enabled()),
         ("pp", pp_multi),
         ("dcp", dcp),
         ("pcp", pcp),
@@ -139,16 +129,18 @@ def detect_parallelism(runner: Any, tp_size: int) -> list[str]:
     return [kind for kind, on in flags if on]
 
 
-def _requires_value(runner: Any, key: str) -> str:
+def _requires_value(runner: RunnerProtocol, key: str) -> str:
     """The server's value for a `requires` key, as a lowercase string."""
     section, _, attr = REQUIRES_KEYS[key].partition(".")
-    value = getattr(_runner_cfg(runner, section), attr, None)
+    value = getattr(getattr(runner.vllm_config, section), attr)
     if isinstance(value, bool):
         return "true" if value else "false"
     return str(value).lower().removeprefix("torch.")
 
 
-def check_spec(runner: Any, spec: Any, *, view: RunnerView) -> EligibilityResult | None:
+def check_spec(
+    runner: RunnerProtocol, spec: Any, *, view: RunnerView
+) -> EligibilityResult | None:
     """Enforce a spec's declarative fields before `create`: `chips`,
     `tp_sizes`, `collective_domain`, `parallelism`, `features`, then
     `requires`. Returns the first
@@ -200,19 +192,19 @@ def check_spec(runner: Any, spec: Any, *, view: RunnerView) -> EligibilityResult
 
 
 def check_runner_features(
-    runner: Any, features: frozenset[str]
+    runner: RunnerProtocol, features: frozenset[str]
 ) -> EligibilityResult | None:
     """The first framework feature that is on but not declared, as a named
     decline (`None` if all are covered). Config only: no collective."""
+    v_cfg = runner.vllm_config
     rules: list[tuple[bool, str, str]] = [
         (
-            bool(getattr(runner, "supports_mm_inputs", False))
-            and "multimodal" not in features,
+            runner.supports_mm_inputs and "multimodal" not in features,
             "multimodal_inputs",
             "requires text-only input_ids (multimodal inputs)",
         ),
         (
-            getattr(runner, "lora_config", None) is not None and "lora" not in features,
+            v_cfg.lora_config is not None and "lora" not in features,
             "lora_enabled",
             "does not support LoRA adapters",
         ),
@@ -226,30 +218,27 @@ def check_runner_features(
     for bad, code, detail in rules:
         if bad:
             return _decline(code, detail)
-    spec_cfg = getattr(runner, "speculative_config", None)
-    c_cfg = _runner_cfg(runner, "cache_config")
-    kv_cfg = _runner_cfg(runner, "kv_transfer_config")
-    par_cfg = _runner_cfg(runner, "parallel_config")
-    m_cfg = _runner_cfg(runner, "model_config")
+    spec_cfg = v_cfg.speculative_config
     # Offloading and transfer are separate features: a multi-connector may
     # mix an offloading child with a transfer child.
-    kv_names = kv_connector_names(kv_cfg)
+    kv_names = kv_connector_names(v_cfg.kv_transfer_config)
     offload = any(n in _OFFLOADING_CONNECTORS for n in kv_names)
     other_kv = next((n for n in kv_names if n not in _OFFLOADING_CONNECTORS), None)
     rules = [
         (
-            int(getattr(spec_cfg, "num_speculative_tokens", 0) or 0) > 0
+            spec_cfg is not None
+            and spec_cfg.num_speculative_tokens > 0
             and "spec_decode" not in features,
             "spec_decode_unsupported",
             "plugin does not declare speculative decoding",
         ),
         (
-            bool(getattr(runner, "uses_mrope", False)) and "mrope" not in features,
+            runner.uses_mrope and "mrope" not in features,
             "mrope_unsupported",
             "plugin does not declare M-RoPE",
         ),
         (
-            bool(getattr(c_cfg, "enable_prefix_caching", False))
+            v_cfg.cache_config.enable_prefix_caching
             and "prefix_caching" not in features,
             "prefix_caching_unsupported",
             "plugin does not declare prefix caching",
@@ -265,15 +254,13 @@ def check_runner_features(
             f"plugin does not declare KV transfer (connector {other_kv})",
         ),
         (
-            bool(getattr(par_cfg, "enable_eplb", False))
-            and "eplb_dynamic" not in features,
+            v_cfg.parallel_config.enable_eplb and "eplb_dynamic" not in features,
             "eplb_dynamic_unsupported",
             "plugin does not declare dynamic EPLB",
         ),
         # vLLM's `ModelConfig.enable_sleep_mode`.
         (
-            bool(getattr(m_cfg, "enable_sleep_mode", False))
-            and "sleep_mode" not in features,
+            v_cfg.model_config.enable_sleep_mode and "sleep_mode" not in features,
             "sleep_mode_unsupported",
             "plugin does not declare sleep mode",
         ),
