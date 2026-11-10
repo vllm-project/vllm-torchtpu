@@ -11,35 +11,32 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Fused EP MoE v3 (``kernels/fused_moe/v3``) end to end on CPU.
+"""Fused EP MoE v3 (``kernels/fused_moe/v3``) end to end on an eight-core
+TPU7x host.
 
-``fused_ep_moe`` runs over an 8-shard expert-parallel mesh of CPU devices with
-every Pallas program in TPU interpret mode (remote DMAs, semaphores and
-barriers simulated, the race detector on), against a per-token reference of
-the same math: the layer's own top-k selection on each shard's rows, each
-selected expert's FP8 FFN on the FP8-quantized row (``ffn.expert_ffn_fp8`` and
-``ffn.result_rows`` with bf16 result rows), and the k-ordered weighted sum.
+``fused_ep_moe`` runs over an 8-shard expert-parallel mesh against a per-token
+reference of the same math: the layer's own top-k selection on each shard's
+rows, each selected expert's FP8 FFN on the FP8-quantized row
+(``ffn.expert_ffn_fp8`` and ``ffn.result_rows`` with bf16 result rows), and
+the k-ordered weighted sum.
 
 The routing tables, the token exchange, the FFN and the combine are the
 kernel's; only the per-expert arithmetic is shared with the reference, so a
 row routed to the wrong expert, dropped, or combined with the wrong weight
-moves most of the output. The SparseCore row gather has no interpreter, so
-these cases run the kernel's Pallas transport (``Config.sorted_rows=False``);
-the sorted-rows path is covered on TPU only.
+moves most of the output. Both row paths run: the SparseCore row gather
+(``Config.sorted_rows``, the serving default) and the Pallas transport.
 
-The kernel runs in a subprocess with 8 CPU devices, so the suite needs no
-XLA flags of its own. Small shapes keep the interpreter fast: hidden 1024,
+The layer does not run in the TPU interpreter on CPU: its token exchange
+returns DMA semaphores from one Pallas program to the next, which the
+interpreter cannot do. ``test_fused_ep_moe_v3_programs.py`` runs the
+selection and combine programs on CPU. Small shapes: hidden 1024,
 intermediate 128, 16 or 32 experts, top-k 4.
 """
 
-import contextlib
-import io
-import json
-import os
-import sys
-
 import numpy as np
 import pytest
+
+pytestmark = pytest.mark.multichip
 
 D, H, INTER, K = 8, 1024, 128, 4
 TILE_ROWS = 32
@@ -50,12 +47,28 @@ CASES = {
     "hot": (16, 24, "hot", 0),
     "short_shards": (32, 32, "spread", 5),
 }
+# The serving bridge passes each shard's index as an operand
+# (layout.SHARD_INDEX_OPERAND, no side effects); the kernel's own mode reads
+# the mesh axis. mode: (shard index operand, sorted rows, cases)
+MODES = {
+    "bridge_sorted": (True, True, list(CASES)),
+    "bridge_transport": (True, False, list(CASES)),
+    "kernel_sorted": (False, True, ["spread"]),
+}
 
 
-def _tpu7x():
-    from jax.experimental.pallas import tpu as pltpu
+@pytest.fixture(scope="module", autouse=True)
+def _require_eight_tpu7x_cores():
+    """Skip the module unless this host has eight cores of a generation the
+    kernel supports. A fixture rather than a `skipif`: a `skipif` builds the
+    PJRT client while pytest collects, before markers deselect anything
+    (see tests/kernels/fused_moe/test_fused_ep_moe_v2.py)."""
+    import jax
 
-    return pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+    from vllm_torchtpu.kernels.fused_moe.v3 import supported_on
+
+    if jax.device_count() < D or not supported_on(jax.devices()[0]):
+        pytest.skip("fused EP MoE v3 needs eight TPU7x cores")
 
 
 def _world(experts, real, routing, seed=0):
@@ -140,24 +153,24 @@ def _reference(x, logits, w1, w2, s1, s2, real, valid):
     return out
 
 
-def _run_case(name):
+def _run_case(name, mode):
     import jax
     import jax.numpy as jnp
-    from jax._src.pallas.mosaic.interpret import interpret_pallas_call
-    from jax.experimental.pallas import tpu as pltpu
     from jax.sharding import Mesh, NamedSharding
     from jax.sharding import PartitionSpec as P
 
     from vllm_torchtpu.kernels.fused_moe.v3 import MESH_AXIS, Config, fused_ep_moe
+    from vllm_torchtpu.kernels.fused_moe.v3 import layout as v3_layout
 
+    bridge, sorted_rows, _ = MODES[mode]
     experts, real, routing, short = CASES[name]
     x, logits, w1, w2, s1, s2 = _world(experts, real, routing)
-    devices = sorted(jax.devices("cpu"), key=lambda d: d.id)[:D]
-    mesh = Mesh(np.asarray(devices), (MESH_AXIS,))
+    mesh = Mesh(np.asarray(jax.devices()[:D]), (MESH_AXIS,))
     sharded = NamedSharding(mesh, P(MESH_AXIS))
     args = [jax.device_put(a, sharded) for a in (x, w1, w2, s1, s2, logits)]
     valid = [real - (short if d % 2 else 0) for d in range(D)]
-    config = Config(result_rows="bf16", sorted_rows=False)
+    config = Config(result_rows="bf16", sorted_rows=sorted_rows)
+    shard_index = jnp.arange(D, dtype=jnp.int32).reshape(D, 1) if bridge else None
 
     def run(x, w1, w2, s1, s2, logits):
         return fused_ep_moe(
@@ -175,15 +188,17 @@ def _run_case(name):
             activation="silu",
             config=config,
             experts_per_shard=experts // D,
-            shard_index=jnp.arange(D, dtype=jnp.int32).reshape(D, 1),
+            shard_index=shard_index,
             valid_tokens=jnp.asarray(valid, jnp.int32),
             drop_nan_rows=True,
         )
 
-    pltpu.reset_tpu_interpret_mode_state()
-    with contextlib.redirect_stdout(io.StringIO()):
+    saved = (v3_layout.SHARD_INDEX_OPERAND, v3_layout.SIDE_EFFECTS)
+    v3_layout.SHARD_INDEX_OPERAND, v3_layout.SIDE_EFFECTS = bridge, not bridge
+    try:
         got = np.asarray(jax.block_until_ready(jax.jit(run)(*args)))
-    races = bool(interpret_pallas_call.races.races_found)
+    finally:
+        v3_layout.SHARD_INDEX_OPERAND, v3_layout.SIDE_EFFECTS = saved
     got = got.astype(np.float32)
     want = _reference(x, logits, w1, w2, s1, s2, real, valid)
     rows = np.concatenate([np.arange(d * real, d * real + valid[d]) for d in range(D)])
@@ -194,65 +209,19 @@ def _run_case(name):
         "off_fraction": float(off.mean()),
         "max_abs_diff": float(np.abs(got_valid - want_valid).max()),
         "want_rms": float(np.sqrt((want_valid**2).mean())),
-        "races_found": races,
     }
 
 
-def _worker(names):
-    from jax._src.pallas.mosaic import tpu_info
-    from jax.experimental.pallas import tpu as pltpu
-
-    pltpu.get_tpu_info = _tpu7x
-    tpu_info.get_tpu_info = _tpu7x
-    print("RESULT " + json.dumps({n: _run_case(n) for n in names}))
+RUNS = [(mode, name) for mode, (_, _, names) in MODES.items() for name in names]
 
 
-def _run_worker(names):
-    import subprocess
-
-    flags = os.environ.get("XLA_FLAGS", "")
-    env = dict(
-        os.environ,
-        JAX_PLATFORMS="cpu",
-        XLA_FLAGS=f"{flags} --xla_force_host_platform_device_count={D}",
-    )
-    proc = subprocess.run(
-        [sys.executable, __file__, *names],
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=1800,
-    )
-    lines = [ln for ln in proc.stdout.splitlines() if ln.startswith("RESULT ")]
-    assert proc.returncode == 0 and lines, proc.stdout[-3000:] + proc.stderr[-3000:]
-    return json.loads(lines[-1][len("RESULT ") :])
-
-
-@pytest.fixture(scope="module")
-def results():
-    return _run_worker(list(CASES))
-
-
-@pytest.mark.parametrize("name", list(CASES))
-def test_fused_ep_moe_matches_the_per_token_reference(results, name):
-    """CPU matmuls of different shapes (a tile against one row) can round an
-    f32 sum differently, and an FP8 requantization can carry that to a few bf16
+@pytest.mark.parametrize("mode,name", RUNS)
+def test_fused_ep_moe_matches_the_per_token_reference(mode, name):
+    """Matmuls of different shapes (a tile against one row) can round an f32
+    sum differently, and an FP8 requantization can carry that to a few bf16
     steps on a handful of values; a misrouted or dropped row moves most of its
     output, so the bound is one value in a thousand."""
-    case = results[name]
+    case = _run_case(name, mode)
     assert case["finite"], case
     assert case["off_fraction"] < 1e-3, case
     assert case["want_rms"] > 0, case
-
-
-@pytest.mark.parametrize("name", list(CASES))
-def test_fused_ep_moe_has_no_dma_races(results, name):
-    assert not results[name]["races_found"], results[name]
-
-
-if __name__ == "__main__":
-    from jax.experimental.pallas import tpu as pltpu
-
-    # Around everything: pallas_call reads the mode when it is built.
-    with pltpu.force_tpu_interpret_mode(pltpu.InterpretParams(detect_races=True)):
-        _worker(sys.argv[1:])
