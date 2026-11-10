@@ -427,8 +427,9 @@ def attend_pages(
     rows = q_block * group
     keys = num_cols * page_size
     bits = jax.dtypes.itemsize_bits(kv_cache.dtype)
-    # 8- and 16-bit caches hold bf16-exact values: the MXU takes them as bf16
-    # with the scales applied to the f32 products.
+    # 8- and 16-bit caches hold bf16-exact values: QK^T takes them as bf16
+    # with the scales applied to the f32 products; PV stays f32 (P is not
+    # bf16-exact, and the kernel is VPU-bound, not MXU-bound).
     mxu_dtype = jnp.bfloat16 if bits <= 16 else jnp.float32
     k_mult = sm_scale * (1.0 if k_scale is None else k_scale)
     v_mult = 1.0 if v_scale is None else v_scale
@@ -493,6 +494,8 @@ def attend_pages(
             & (q_tok < qlen_ref[r])
         )
         cached = k_pos_col < cache_len
+        # One additive mask per request, shared by every KV head.
+        bias = jnp.where(visible, 0.0, _NEG_INF)
         # Moves a [rows, 1] column to a [1, rows] row (sublanes to lanes).
         diag = jax.lax.broadcasted_iota(
             jnp.int32, (rows, rows), 0
@@ -513,8 +516,8 @@ def attend_pages(
             k_word, k_slot = divmod(2 * g, packing)
             v_word, v_slot = divmod(2 * g + 1, packing)
             k = unpack(load_word(k_word), k_slot)[:, :head_dim].astype(mxu_dtype)
-            v = unpack(load_word(v_word), v_slot)[:, :head_dim].astype(mxu_dtype)
-            v = jnp.where(cached, v, jnp.zeros_like(v))
+            v = unpack(load_word(v_word), v_slot)[:, :head_dim].astype(jnp.float32)
+            v = jnp.where(cached, v, 0.0)
             # [Q, X, D] -> [Q * X, D]: row q * X + x is token q, head g * X + x.
             qv = q_ref[0, :, g * group : (g + 1) * group, :].reshape(rows, head_dim)
             s = jax.lax.dot_general(
@@ -523,13 +526,13 @@ def attend_pages(
                 (((1,), (1,)), ((), ())),
                 preferred_element_type=jnp.float32,
             )
-            s = jnp.where(visible, s * k_mult, _NEG_INF)
+            s = s * k_mult + bias
             m = jnp.max(s, axis=-1, keepdims=True)
             m_safe = jnp.where(m > _NEG_INF, m, 0.0)
             p = jnp.exp(s - m_safe)
             denom = jnp.sum(p, axis=-1, keepdims=True)
             safe = jnp.where(denom > 0, denom, 1.0)
-            out = jnp.dot(p.astype(mxu_dtype), v, preferred_element_type=jnp.float32)
+            out = jnp.dot(p, v, preferred_element_type=jnp.float32)
             out = out * (v_mult / safe)
             o_ref[0, :, g * group : (g + 1) * group, :] = out.reshape(
                 q_block, group, head_dim
@@ -855,30 +858,6 @@ def _block_op(max_query_len: int, sm_scale: float, causal: bool):
     return op
 
 
-def gather_group(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    group: Any,
-    dcp: int,
-    kv_head_replicas: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Every rank's query heads, and the K/V of the group's KV heads.
-
-    A group no wider than a KV head's replicas shares one KV head, so only
-    the queries are gathered; a wider one gathers ``[q | k | v]`` once.
-    """
-    from vllm_torchtpu.distributed.dcp import split_group_heads
-
-    if dcp <= kv_head_replicas:
-        return group.all_gather(query.contiguous(), dim=1), key, value
-    gathered = group.all_gather(torch.cat([query, key, value], dim=1).contiguous(), dim=1)
-    q_all, (k_all, v_all) = split_group_heads(
-        gathered, dcp, query.shape[1], kv_head_replicas, per_kv_head=2
-    )
-    return q_all, k_all, v_all
-
-
 def write_with_dcp(
     *,
     key: torch.Tensor,
@@ -932,8 +911,11 @@ def forward_with_dcp(
     from vllm_torchtpu.distributed.dcp import get_dcp_group
     from vllm_torchtpu.distributed.dcp_comm import cp_lse_ag_out_rs
 
+    del dcp, kv_head_replicas  # shared layer args (`write_with_dcp` uses them)
     group = get_dcp_group()
-    q_all, k_all, _ = gather_group(query, key, value, group, dcp, kv_head_replicas)
+    # Every query head of the group; the window's K/V come from the cache and
+    # the block's own K/V stay on this rank, so only the queries cross.
+    q_all = group.all_gather(query.contiguous(), dim=1)
     ctx_out, ctx_lse = ops["attend"](
         q_all,
         kv_cache,
