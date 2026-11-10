@@ -31,6 +31,12 @@ _CACHE: dict[tuple, Any] = {}
 _MAX = 256
 
 
+def enabled() -> bool:
+    """Whether call sites should use fast_set_forward_context. Off, they call their own
+    set_forward_context exactly as before the port (ix-unified-port)."""
+    return _ENABLED
+
+
 def _key(vllm_config: Any, num_tokens: int | None, num_tokens_across_dp: Any) -> tuple | None:
     if num_tokens_across_dp is None:
         dp = None
