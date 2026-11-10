@@ -1798,9 +1798,14 @@ _WORKER_START_FAILED = "WorkerProc failed to start"
 # PRE_START_SESSION_BARRIER and init_process_group then fails with this. It
 # hits a fresh server now and then on CI whatever the change under test (build
 # 3390, a typing-only commit whose next run passed), and a new launch on fresh
-# ports comes up, so it gets one more attempt. Any other startup failure is
-# reported as is.
-_TPU_INIT_RACE = "PjRtClient is not initialized"
+# ports comes up, so it gets one more attempt. PjRt can also fail to start its
+# gRPC server in one DP worker (build 8072) while the others come up; a
+# relaunch on fresh ports comes up too. Any other startup failure is reported
+# as is.
+_TPU_INIT_RACES = (
+    "PjRtClient is not initialized",
+    "Failed to start the gRPC server",
+)
 DP_SERVER_START_ATTEMPTS = 2
 
 # Prometheus renders the same counters the in-process reader exposes, with a
@@ -2001,7 +2006,7 @@ def _startup_error(log_path: str, message: str) -> _ServeStartupError:
         f"{message}\n--- full log: {kept} ---\n"
         "--- error lines ---\n" + "\n".join(errors[-40:]) + "\n"
         "--- tail ---\n" + "\n".join(lines[-40:]),
-        retryable=_TPU_INIT_RACE in text,
+        retryable=any(race in text for race in _TPU_INIT_RACES),
     )
 
 
