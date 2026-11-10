@@ -96,24 +96,40 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
             dp_group = self._replicated_dp_group(is_sequence_parallel)
             if dp_group is None:
                 return hidden_states, router_logits
-            if _packs_router_gather(hidden_states, router_logits):
-                # One DP all-gather instead of two (each is latency-bound at
-                # decode sizes): pack the logits after the hidden columns and
-                # split the gathered rows. The values are unchanged.
-                width = hidden_states.shape[-1]
-                packed = dp_group.all_gather(
-                    torch.cat([hidden_states, router_logits], dim=-1), dim=0
+
+            def _gather_replicated_dp(h: torch.Tensor, lg: torch.Tensor):
+                if _packs_router_gather(h, lg):
+                    # One DP all-gather instead of two (each is latency-bound at
+                    # decode sizes): pack the logits after the hidden columns
+                    # and split the gathered rows. The values are unchanged.
+                    width = h.shape[-1]
+                    packed = dp_group.all_gather(
+                        torch.cat([h, lg], dim=-1), dim=0
+                    )
+                    return packed[:, :width], packed[:, width:]
+                return dp_group.all_gather(h, dim=0), dp_group.all_gather(
+                    lg, dim=0
                 )
-                return packed[:, :width], packed[:, width:]
-            hidden_states = dp_group.all_gather(hidden_states, dim=0)
-            router_logits = dp_group.all_gather(router_logits, dim=0)
-            return hidden_states, router_logits
+
+            return small_all_reduce_op.dp_dispatch_or(
+                hidden_states, router_logits, _gather_replicated_dp
+            )
         group = self._moe_group(is_sequence_parallel)
         if group is None:
             return hidden_states, router_logits
-        hidden_states = group.all_gather(hidden_states, dim=0)
-        router_logits = group.all_gather(router_logits, dim=0)
-        return hidden_states, router_logits
+        if is_sequence_parallel:
+            hidden_states = group.all_gather(hidden_states, dim=0)
+            router_logits = group.all_gather(router_logits, dim=0)
+            return hidden_states, router_logits
+        # DP-only dispatch: the fused Pallas all-gather when armed for the DP mesh.
+        return small_all_reduce_op.dp_dispatch_or(
+            hidden_states,
+            router_logits,
+            lambda h, lg: (
+                group.all_gather(h, dim=0),
+                group.all_gather(lg, dim=0),
+            ),
+        )
 
     def dispatch(
         self,

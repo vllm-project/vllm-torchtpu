@@ -37,10 +37,17 @@ from .oracle import (
 pytestmark = pytest.mark.multichip
 
 
-def _reduce_scatter(mesh, per_core, ranks, *, rank_operand=True):
+def _reduce_scatter(
+    mesh, per_core, ranks, *, rank_operand=True, rank_of_core=None, form=None
+):
     def body(x, r):
         return rs.small_reduce_scatter(
-            x, num_cores=N, axis=AXIS, rank=r if rank_operand else None
+            x,
+            num_cores=N,
+            axis=AXIS,
+            rank=r if rank_operand else None,
+            rank_of_core=rank_of_core,
+            form=form,
         )
 
     return run_sharded(mesh, body, per_core, ranks)
@@ -90,6 +97,18 @@ def test_a_wrong_rank_order_fails_the_oracle(mesh):
         assert not within(got[core], exact_sum(terms), sum_tolerance(terms)).all()
 
 
+@pytest.mark.parametrize("form", ["hier", "flat"])
+def test_permuted_rank_of_core_delivers_each_ranks_block(mesh, form):
+    order = (0, 1, 6, 7, 2, 3, 4, 5)
+    per_core = blocks((N, N * 8, 4096), seed=21)
+    got = _reduce_scatter(
+        mesh, per_core, range(N), rank_of_core=order, form=form
+    )
+    for core in range(N):
+        terms = _own_blocks(per_core, order[core])
+        assert within(got[core], exact_sum(terms), sum_tolerance(terms)).all()
+
+
 def test_refuses_a_width_off_the_lane_tile():
     with pytest.raises(ValueError, match="lanes"):
         rs.small_reduce_scatter(
@@ -101,4 +120,21 @@ def test_refuses_rows_that_do_not_split():
     with pytest.raises(ValueError, match="split"):
         rs.small_reduce_scatter(
             jnp.zeros((12, 4096), jnp.bfloat16), num_cores=N, axis=AXIS
+        )
+
+
+def test_refuses_unknown_form_or_non8_hier():
+    with pytest.raises(ValueError, match="unknown form"):
+        rs.small_reduce_scatter(
+            jnp.zeros((16, 4096), jnp.bfloat16),
+            num_cores=N,
+            axis=AXIS,
+            form="bogus",
+        )
+    with pytest.raises(ValueError, match="requires num_cores=8"):
+        rs.small_reduce_scatter(
+            jnp.zeros((8, 4096), jnp.bfloat16),
+            num_cores=4,
+            axis=AXIS,
+            form="hier",
         )

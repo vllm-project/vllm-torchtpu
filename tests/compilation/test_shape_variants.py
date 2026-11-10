@@ -68,6 +68,18 @@ _lib.impl("small_collective", lambda x, rank: x.clone(), "CPU")
 torch.library.register_fake(
     "tpu_shape_variants_test::small_collective", lambda x, rank: torch.empty_like(x)
 )
+_lib.define(
+    "small_collective_pair(Tensor x, Tensor logits, Tensor rank) -> (Tensor, Tensor)"
+)
+_lib.impl(
+    "small_collective_pair",
+    lambda x, logits, rank: (x.clone(), logits.clone()),
+    "CPU",
+)
+torch.library.register_fake(
+    "tpu_shape_variants_test::small_collective_pair",
+    lambda x, logits, rank: (torch.empty_like(x), torch.empty_like(logits)),
+)
 
 
 @support_torch_compile(dynamic_arg_dims={"x": 0})
@@ -134,6 +146,23 @@ class SmallCombineModel(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = small_all_reduce_op.dp_combine_or(_small_collective_input(x), WAVE)
         return y.float()[:, :HIDDEN]
+
+
+@support_torch_compile(dynamic_arg_dims={"x": 0})
+class SmallDispatchModel(nn.Module):
+    """The same for the DP dispatch pair, with ``wave`` standing in for XLA's
+    all-gather."""
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        super().__init__()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        inp = _small_collective_input(x)
+        logits = inp.float()
+        y, lg = small_all_reduce_op.dp_dispatch_or(
+            inp, logits, lambda h, r: (WAVE(h), r)
+        )
+        return (y.float() + lg)[:, :HIDDEN]
 
 
 @dataclasses.dataclass
@@ -748,6 +777,9 @@ def test_input_delta_names_the_int_input_one_trace_dropped():
 def _arm_small_collectives():
     small_all_reduce_op._AR_OP = torch.ops.tpu_shape_variants_test.small_collective
     small_all_reduce_op._RS_OP = torch.ops.tpu_shape_variants_test.small_collective
+    small_all_reduce_op._AG_OP = (
+        torch.ops.tpu_shape_variants_test.small_collective_pair
+    )
     small_all_reduce_op._RANK = torch.tensor([0], dtype=torch.int32)
     small_all_reduce_op._CORES = 1
     small_all_reduce_op._MESH_RANKS = (0,)
@@ -757,26 +789,33 @@ def _arm_small_collectives():
 def _small_collective_fork_hands_buckets_over(cache_root, model_name, retain):
     config, backend = prepare(cache_root)
     _arm_small_collectives()
-    if not retain:
-        small_all_reduce_op.retain = lambda out: out
-    model = build(globals()[model_name], config)
-    if not retain:
-        # Positive control: the fallback trace lifts no rank buffer, so the
-        # bucket the kernel trace compiled cannot be handed to it.
-        with pytest.raises(Exception, match="token-count branch"):
-            warm(model, config)
-        return
-    assert warm(model, config) == 1
-    # 16 rows took the kernel, 2048 and 4096 vLLM's collective (one wave op).
-    assert backend.compiled == [(16, 0), (2048, 1), (4096, 1)]
-    CALLS.clear()
-    for num_tokens in BUCKETS:
-        assert run(model, config, num_tokens).shape[0] == num_tokens
-    assert CALLS == [(16, 0), (2048, 1), (4096, 1)]
+    saved_retain = small_all_reduce_op.retain
+    try:
+        if not retain:
+            small_all_reduce_op.retain = lambda out, rank=None: out
+        model = build(globals()[model_name], config)
+        if not retain:
+            # Positive control: the fallback trace lifts no rank buffer, so the
+            # bucket the kernel trace compiled cannot be handed to it.
+            with pytest.raises(Exception, match="token-count branch"):
+                warm(model, config)
+            return
+        assert warm(model, config) == 1
+        # 16 rows took the kernel, 2048 and 4096 vLLM's collective (one wave op).
+        assert backend.compiled == [(16, 0), (2048, 1), (4096, 1)]
+        CALLS.clear()
+        for num_tokens in BUCKETS:
+            assert run(model, config, num_tokens).shape[0] == num_tokens
+        assert CALLS == [(16, 0), (2048, 1), (4096, 1)]
+    finally:
+        small_all_reduce_op.retain = saved_retain
 
 
 @pytest.mark.parametrize("retain", [True, False], ids=["retain", "no_retain"])
-@pytest.mark.parametrize("model_name", ["SmallAllReduceModel", "SmallCombineModel"])
+@pytest.mark.parametrize(
+    "model_name",
+    ["SmallAllReduceModel", "SmallCombineModel", "SmallDispatchModel"],
+)
 def test_small_collective_row_fork_hands_buckets_over(tmp_path, model_name, retain):
     """Both sides of the small-collective row fork lift the rank buffer."""
     in_child(

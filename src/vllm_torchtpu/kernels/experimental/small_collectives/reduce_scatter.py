@@ -24,8 +24,8 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu.kernels.experimental.small_collectives.common import (
     LANES,
     barrier,
-    barrier_peers,
     call,
+    normalize_rank_of_core,
     push,
     split_rank,
     sum_slots,
@@ -47,38 +47,48 @@ def reference(blocks, core):
 
 
 def small_reduce_scatter(
-    x, *, num_cores, axis, rank=None, form=None, collective_id=COLLECTIVE_ID
+    x,
+    *,
+    num_cores,
+    axis,
+    rank=None,
+    rank_of_core=None,
+    form=None,
+    collective_id=COLLECTIVE_ID,
 ):
-    """Block r of ``x`` summed onto core r of mesh axis ``axis``, inside a
-    shard_map over that axis; ``rank`` as in ``small_all_reduce``."""
+    """Block ``order[c]`` of ``x`` summed onto mesh core ``c`` of axis ``axis``
+    (default ``order = 0..num_cores - 1``), inside a shard_map over that axis."""
     total, hidden = x.shape
     n = num_cores
     if hidden % LANES:
         raise ValueError(f"hidden {hidden} is not a multiple of {LANES} lanes")
     if total % n:
         raise ValueError(f"{total} rows do not split over {n} cores")
+    order = normalize_rank_of_core(rank_of_core, n)
     rows = total // n
     padded = -(-rows // SUBLANES) * SUBLANES
-    impl = (
-        _hier_reduce_scatter
-        if (form or ("hier" if n == 8 else "flat")) == "hier"
-        else _reduce_scatter
-    )
+    resolved_form = form or ("hier" if n == 8 else "flat")
+    if resolved_form not in ("hier", "flat"):
+        raise ValueError(f"unknown form {form!r}; expected 'hier' or 'flat'")
+    if resolved_form == "hier" and n != 8:
+        raise ValueError(f"form='hier' requires num_cores=8, got {n}")
+    impl = _hier_reduce_scatter if resolved_form == "hier" else _reduce_scatter
     if padded == rows:
-        return impl(x, n, axis, rank, collective_id)
+        return impl(x, n, axis, rank, order, collective_id)
     x = jnp.pad(x.reshape(n, rows, hidden), ((0, 0), (0, padded - rows), (0, 0)))
-    out = impl(x.reshape(n * padded, hidden), n, axis, rank, collective_id)
+    out = impl(x.reshape(n * padded, hidden), n, axis, rank, order, collective_id)
     return out[:rows]
 
 
-def _hier_reduce_scatter(x, n, axis, rank, collective_id):
+def _hier_reduce_scatter(x, n, axis, rank, order, collective_id):
     """2-stage topology-aware Reduce-Scatter on 8 cores (4 chips x 2 cores/chip):
-    Stage 1 (Intra-chip): Core `me` pushes the 4 blocks belonging to `partner = me ^ 1`'s
-      subcore parity (`r = 2*c + (1 - subcore)` for c in 0..3) to `s1_recv` on `partner`,
-      and sums its own 4 parity blocks (`r = 2*c + subcore`) with `s1_recv` into `chip_blocks`.
+    Stage 1 (Intra-chip): Core `me` pushes the 4 blocks belonging to
+      `partner = me ^ 1`'s subcore parity (`order[2*c + (1 - subcore)]`) to
+      `s1_recv` on `partner`, and sums its own 4 parity blocks
+      (`order[2*c + subcore]`) with `s1_recv` into `chip_blocks`.
     Stage 2 (Inter-chip): Core `me` pushes `chip_blocks[c]` for `c != chip` to
-      `(c << 1) | subcore` (3 inter-chip DMAs vs 6 in flat reduce-scatter) and sums the 4
-      chip blocks into `o_ref`.
+      `(c << 1) | subcore` (3 inter-chip DMAs vs 6 in flat reduce-scatter) and
+      sums the 4 chip blocks into `o_ref`.
     """
     total, hidden = x.shape
     rows = total // n
@@ -107,7 +117,7 @@ def _hier_reduce_scatter(x, n, axis, rank, collective_id):
         def _():
             for c in range(4):
                 push(
-                    x_ref.at[pl.ds((2 * c + 1) * rows, rows)],
+                    x_ref.at[pl.ds(order[2 * c + 1] * rows, rows)],
                     s1_recv.at[c],
                     send1,
                     recv1,
@@ -120,7 +130,7 @@ def _hier_reduce_scatter(x, n, axis, rank, collective_id):
         def _():
             for c in range(4):
                 push(
-                    x_ref.at[pl.ds((2 * c) * rows, rows)],
+                    x_ref.at[pl.ds(order[2 * c] * rows, rows)],
                     s1_recv.at[c],
                     send1,
                     recv1,
@@ -135,7 +145,9 @@ def _hier_reduce_scatter(x, n, axis, rank, collective_id):
         def _():
             for c in range(4):
                 chip_blocks[c] = (
-                    x_ref[pl.ds((2 * c) * rows, rows), :].astype(jnp.float32)
+                    x_ref[pl.ds(order[2 * c] * rows, rows), :].astype(
+                        jnp.float32
+                    )
                     + s1_recv[c].astype(jnp.float32)
                 ).astype(x_ref.dtype)
 
@@ -143,7 +155,9 @@ def _hier_reduce_scatter(x, n, axis, rank, collective_id):
         def _():
             for c in range(4):
                 chip_blocks[c] = (
-                    x_ref[pl.ds((2 * c + 1) * rows, rows), :].astype(jnp.float32)
+                    x_ref[pl.ds(order[2 * c + 1] * rows, rows), :].astype(
+                        jnp.float32
+                    )
                     + s1_recv[c].astype(jnp.float32)
                 ).astype(x_ref.dtype)
 
@@ -186,7 +200,7 @@ def _hier_reduce_scatter(x, n, axis, rank, collective_id):
     )
 
 
-def _reduce_scatter(x, n, axis, rank, collective_id):
+def _reduce_scatter(x, n, axis, rank, order, collective_id):
     total, hidden = x.shape
     rows = total // n
     dict_ids = rank is not None
@@ -196,26 +210,28 @@ def _reduce_scatter(x, n, axis, rank, collective_id):
             refs, dict_ids, axis
         )
         barrier(n, axis, dict_ids)
-        # block r into slot `me` of core r's slices
-        for r in range(n):
+        # block order[c] into slot `me` of core c's slices
+        for c in range(n):
+            r = order[c]
 
-            @pl.when(jnp.int32(r) != me)
-            def _(r=r):
+            @pl.when(jnp.int32(c) != me)
+            def _(c=c, r=r):
                 push(
                     x_ref.at[pl.ds(r * rows, rows)],
                     slices.at[me],
                     send_sem,
                     recv_sem,
-                    r,
+                    c,
                     axis,
                     dict_ids,
                 )
 
         # my own block: a static row slice picked by a scalar compare
-        for r in range(n):
+        for c in range(n):
+            r = order[c]
 
-            @pl.when(jnp.int32(r) == me)
-            def _(r=r):
+            @pl.when(jnp.int32(c) == me)
+            def _(c=c, r=r):
                 slices[pl.ds(me, 1)] = x_ref[pl.ds(r * rows, rows), :][None]
 
         wait_bytes_of(slices.at[pl.ds(0, n - 1)], recv_sem)
