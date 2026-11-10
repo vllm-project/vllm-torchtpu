@@ -16,6 +16,7 @@
 Streams blockwise-quantized expert weight tiles through VMEM double buffers
 while overlapping HBM weight DMAs with MXU matmuls.
 """
+
 import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
@@ -34,51 +35,60 @@ def unit_copies(ctx, expert, blk, slot):
     issue."""
     b, operands, scratch, sems = ctx.b, ctx.operands, ctx.scratch, ctx.sems
     col = pl.multiple_of(blk * b.stream_block, b.stream_block)
-    halves = [(0, col)] if b.no_gate else [(0, col),
-                                           (b.stream_block, b.inter + col)]
+    halves = [(0, col)] if b.no_gate else [(0, col), (b.stream_block, b.inter + col)]
     copies = []
     for dst_col, src_col in halves:
         copies.append(
             pltpu.make_async_copy(
-                operands.w1.at[expert, :,
-                               pl.ds(src_col, b.stream_block)],
+                operands.w1.at[expert, :, pl.ds(src_col, b.stream_block)],
                 scratch.w1.at[slot, :, pl.ds(dst_col, b.stream_block)],
-                sems.w1.at[slot]))
+                sems.w1.at[slot],
+            )
+        )
         if b.form.has_scales:
-            src = (operands.w1_scales.at[expert, :,
-                                         pl.ds(src_col, b.stream_block)]
-                   if b.form.block_scaled else
-                   operands.w1_scales.at[pl.ds(expert, 1),
-                                         pl.ds(src_col, b.stream_block)])
+            src = (
+                operands.w1_scales.at[expert, :, pl.ds(src_col, b.stream_block)]
+                if b.form.block_scaled
+                else operands.w1_scales.at[
+                    pl.ds(expert, 1), pl.ds(src_col, b.stream_block)
+                ]
+            )
             copies.append(
                 pltpu.make_async_copy(
-                    src, scratch.w1_scales.at[slot, :,
-                                              pl.ds(dst_col, b.stream_block)],
-                    sems.w1.at[slot]))
+                    src,
+                    scratch.w1_scales.at[slot, :, pl.ds(dst_col, b.stream_block)],
+                    sems.w1.at[slot],
+                )
+            )
         if b.has_w1_bias:
             copies.append(
                 pltpu.make_async_copy(
-                    operands.w1_bias.at[pl.ds(expert, 1),
-                                        pl.ds(src_col, b.stream_block)],
-                    scratch.w1_bias.at[slot, :,
-                                       pl.ds(dst_col, b.stream_block)],
-                    sems.w1.at[slot]))
+                    operands.w1_bias.at[
+                        pl.ds(expert, 1), pl.ds(src_col, b.stream_block)
+                    ],
+                    scratch.w1_bias.at[slot, :, pl.ds(dst_col, b.stream_block)],
+                    sems.w1.at[slot],
+                )
+            )
     packed = FP4_PER_WORD if b.form.packed else 1
-    row = pl.multiple_of(blk * (b.stream_block // packed),
-                         b.stream_block // packed)
+    row = pl.multiple_of(blk * (b.stream_block // packed), b.stream_block // packed)
     copies.append(
         pltpu.make_async_copy(
-            operands.w2.at[expert,
-                           pl.ds(row, b.stream_block // packed)],
-            scratch.w2.at[slot], sems.w2.at[slot]))
+            operands.w2.at[expert, pl.ds(row, b.stream_block // packed)],
+            scratch.w2.at[slot],
+            sems.w2.at[slot],
+        )
+    )
     if b.form.block_scaled:
         scale_rows = b.stream_block // b.weight_block
         scale_row = pl.multiple_of(blk * scale_rows, scale_rows)
         copies.append(
             pltpu.make_async_copy(
-                operands.w2_scales.at[expert,
-                                      pl.ds(scale_row, scale_rows)],
-                scratch.w2_scales.at[slot], sems.w2.at[slot]))
+                operands.w2_scales.at[expert, pl.ds(scale_row, scale_rows)],
+                scratch.w2_scales.at[slot],
+                sems.w2.at[slot],
+            )
+        )
     return copies
 
 
@@ -112,8 +122,9 @@ def units_ahead(ctx, visit_i, g, blk, steps):
         wrap = blk == n_blocks
         blk = jnp.where(wrap, 0, blk)
         g = jnp.where(wrap, g + 1, g)
-        expert = ctx.tables.visit_order[jnp.clip(
-            visit_i, 0, jnp.maximum(ctx.n_visit - 1, 0))]
+        expert = ctx.tables.visit_order[
+            jnp.clip(visit_i, 0, jnp.maximum(ctx.n_visit - 1, 0))
+        ]
         advance = jnp.logical_and(wrap, g == groups_of(ctx, expert))
         g = jnp.where(advance, 0, g)
         visit_i = jnp.where(advance, visit_i + 1, visit_i)
@@ -125,22 +136,25 @@ def start_units_ahead(ctx, visit_i, g, blk, unit_count):
     after (visit_i, g, blk), unit number unit_count, into the slot that
     unit takes."""
     b = ctx.b
-    ahead_i, _, ahead_blk = units_ahead(ctx, visit_i, g, blk,
-                                        b.weight_prefetch)
+    ahead_i, _, ahead_blk = units_ahead(ctx, visit_i, g, blk, b.weight_prefetch)
 
     @pl.when(ahead_i < ctx.n_visit)
     def _():
         start_unit(
-            ctx, ctx.tables.visit_order[ahead_i], ahead_blk,
-            lax.rem(unit_count + b.weight_prefetch, jnp.int32(b.weight_slots)))
+            ctx,
+            ctx.tables.visit_order[ahead_i],
+            ahead_blk,
+            lax.rem(unit_count + b.weight_prefetch, jnp.int32(b.weight_slots)),
+        )
 
 
 def first_refills(ctx):
     """The first weight refills of the streamed sequence, each guarded on
     the visit count."""
     for u in range(ctx.b.weight_prefetch):
-        ahead_i, _, ahead_blk = units_ahead(ctx, jnp.int32(0), jnp.int32(0),
-                                            jnp.int32(-1), u + 1)
+        ahead_i, _, ahead_blk = units_ahead(
+            ctx, jnp.int32(0), jnp.int32(0), jnp.int32(-1), u + 1
+        )
 
         @pl.when(ahead_i < ctx.n_visit)
         def _(u=u, ahead_i=ahead_i, ahead_blk=ahead_blk):
@@ -149,8 +163,9 @@ def first_refills(ctx):
 
 def group_rows(ctx, expert, g):
     """The live rows of the expert's g-th row group."""
-    return jnp.minimum(ctx.tables.expert_rows[expert] - g * ctx.b.stream_rows,
-                       ctx.b.stream_rows)
+    return jnp.minimum(
+        ctx.tables.expert_rows[expert] - g * ctx.b.stream_rows, ctx.b.stream_rows
+    )
 
 
 def following(ctx, visit_i, g):
@@ -167,10 +182,12 @@ def start_group_window(ctx, visit_i, g, buf):
     buf's window."""
     b, tables, scratch, sems = ctx.b, ctx.tables, ctx.scratch, ctx.sems
     expert = tables.visit_order[jnp.minimum(visit_i, b.experts_per_shard - 1)]
-    body.start_token_window(ctx,
-                            tables.expert_base[expert] + g * b.stream_rows,
-                            scratch.token_window.at[buf],
-                            sems.token_window.at[buf])
+    body.start_token_window(
+        ctx,
+        tables.expert_base[expert] + g * b.stream_rows,
+        scratch.token_window.at[buf],
+        sems.token_window.at[buf],
+    )
 
 
 def issue_group(ctx, expert, g, buf):
@@ -193,7 +210,8 @@ def issue_group(ctx, expert, g, buf):
                 lambda i, t=t: scratch.rows.at[buf, t * b.tile_rows + i],
                 lambda plane, t=t: scratch.row_scales.at[buf, t, plane],
                 sems.rows.at[buf],
-                body.window_tokens(window, offset + t * b.tile_rows))
+                body.window_tokens(window, offset + t * b.tile_rows),
+            )
 
 
 def issue_first(ctx):
@@ -213,28 +231,34 @@ def issue_first(ctx):
 def wait_group(ctx, live, n_tiles, buf):
     """Wait for a row group's rows and row scales to land in buf."""
     scratch, sems = ctx.scratch, ctx.sems
-    pltpu.make_async_copy(scratch.rows.at[buf, pl.ds(0, live)],
-                          scratch.rows.at[buf, pl.ds(0, live)],
-                          sems.rows.at[buf]).wait()
-    pltpu.make_async_copy(scratch.row_scales.at[buf, pl.ds(0, n_tiles)],
-                          scratch.row_scales.at[buf, pl.ds(0, n_tiles)],
-                          sems.rows.at[buf]).wait()
+    pltpu.make_async_copy(
+        scratch.rows.at[buf, pl.ds(0, live)],
+        scratch.rows.at[buf, pl.ds(0, live)],
+        sems.rows.at[buf],
+    ).wait()
+    pltpu.make_async_copy(
+        scratch.row_scales.at[buf, pl.ds(0, n_tiles)],
+        scratch.row_scales.at[buf, pl.ds(0, n_tiles)],
+        sems.rows.at[buf],
+    ).wait()
 
 
 def group_tile(ctx, expert, g, buf, t):
     """Tile t of the group as (rows [tile_rows, hidden], row scales
     [tile_rows, planes], its first routed row)."""
     b, scratch = ctx.b, ctx.scratch
-    row_base = (ctx.tables.expert_base[expert] + g * b.stream_rows +
-                t * b.tile_rows)
+    row_base = ctx.tables.expert_base[expert] + g * b.stream_rows + t * b.tile_rows
     lo = pl.multiple_of(t * b.tile_rows, b.tile_rows)
-    rows = scratch.rows[buf,
-                        pl.ds(lo, b.tile_rows)].reshape(b.tile_rows, b.hidden)
-    scales = jnp.concatenate([
-        body.tile_scale_column(scratch.row_scales[buf, t, plane], row_base,
-                               b.tile_rows) for plane in range(b.scale_planes)
-    ],
-                             axis=1)
+    rows = scratch.rows[buf, pl.ds(lo, b.tile_rows)].reshape(b.tile_rows, b.hidden)
+    scales = jnp.concatenate(
+        [
+            body.tile_scale_column(
+                scratch.row_scales[buf, t, plane], row_base, b.tile_rows
+            )
+            for plane in range(b.scale_planes)
+        ],
+        axis=1,
+    )
     return rows, scales, lo
 
 
@@ -268,7 +292,8 @@ def streamed_group(ctx, expert, visit_i, g, buf, n_tiles, carry):
             @pl.when(blk > 0)
             def _():
                 scratch.acc[pl.ds(lo, b.tile_rows), :] = (
-                    scratch.acc[pl.ds(lo, b.tile_rows), :] + part)
+                    scratch.acc[pl.ds(lo, b.tile_rows), :] + part
+                )
 
             return c
 
@@ -293,15 +318,14 @@ def streamed_group(ctx, expert, visit_i, g, buf, n_tiles, carry):
         def _():
             body.wait_commits(ctx, slot, pending_here)
 
-        live = jnp.minimum(
-            group_rows(ctx, expert, g) - t * b.tile_rows, b.tile_rows)
+        live = jnp.minimum(group_rows(ctx, expert, g) - t * b.tile_rows, b.tile_rows)
         live_blocks = live // ROW_BLOCK
         tile_block_base = (g * b.stream_rows + t * b.tile_rows) // ROW_BLOCK
         body.stage_tile(ctx, slot, result, result_scales)
         body.commit_tile(ctx, expert, slot, tile_block_base, live_blocks)
-        return (c[0] + 1, ) + tuple(
-            jnp.where(slot == i, live_blocks, c[1 + i])
-            for i in range(b.result_slots))
+        return (c[0] + 1,) + tuple(
+            jnp.where(slot == i, live_blocks, c[1 + i]) for i in range(b.result_slots)
+        )
 
     staging = lax.fori_loop(0, n_tiles, last_tile, tuple(staging))
     return (*staging, unit_count + 1)
@@ -327,29 +351,28 @@ def expert_step(ctx, expert, visit_i, carry):
             issue_group(ctx, expert, g + 1, other)
 
         @pl.when(
-            jnp.logical_and(g + 1 == groups_of(ctx, expert), visit_i + 1
-                            < ctx.n_visit))
+            jnp.logical_and(g + 1 == groups_of(ctx, expert), visit_i + 1 < ctx.n_visit)
+        )
         def _():
-            issue_group(ctx, tables.visit_order[visit_i + 1], jnp.int32(0),
-                        other)
+            issue_group(ctx, tables.visit_order[visit_i + 1], jnp.int32(0), other)
 
         # The window of the group after the one just issued, into this
         # group's buffer (its own window was consumed when it was issued).
         visit_1, g_1, ok_1 = following(ctx, visit_i, g)
-        visit_2, g_2, ok_2 = following(ctx,
-                                       jnp.minimum(visit_1, ctx.n_visit - 1),
-                                       g_1)
+        visit_2, g_2, ok_2 = following(ctx, jnp.minimum(visit_1, ctx.n_visit - 1), g_1)
 
         @pl.when(jnp.logical_and(ok_1, ok_2))
         def _():
             start_group_window(ctx, visit_2, g_2, buf)
 
-        *staging, unit_count = streamed_group(ctx, expert, visit_i, g, buf,
-                                              n_tiles, (*staging, unit_count))
+        *staging, unit_count = streamed_group(
+            ctx, expert, visit_i, g, buf, n_tiles, (*staging, unit_count)
+        )
         return (*staging, unit_count, group_count + 1)
 
-    return lax.fori_loop(0, groups_of(ctx, expert), group_step,
-                         (*staging, unit_count, group_count))
+    return lax.fori_loop(
+        0, groups_of(ctx, expert), group_step, (*staging, unit_count, group_count)
+    )
 
 
 def visit(ctx, visit_i, carry):
@@ -357,8 +380,7 @@ def visit(ctx, visit_i, carry):
     the push. The carry is the staging carry, the unit counter and the
     group counter."""
     expert = ctx.tables.visit_order[visit_i]
-    *staging, unit_count, group_count = expert_step(ctx, expert, visit_i,
-                                                    carry)
+    *staging, unit_count, group_count = expert_step(ctx, expert, visit_i, carry)
     staging = body.drain_commits(ctx, tuple(staging))
     body.push_expert(ctx, expert)
     return (*staging, unit_count, group_count)
@@ -366,5 +388,8 @@ def visit(ctx, visit_i, carry):
 
 def initial_carry(ctx):
     """The loop carry at start: tiles, pending commits, units, groups."""
-    return ((jnp.int32(0), ) + (jnp.int32(0), ) * ctx.b.result_slots +
-            (jnp.int32(0), jnp.int32(0)))  # units, groups
+    return (
+        (jnp.int32(0),)
+        + (jnp.int32(0),) * ctx.b.result_slots
+        + (jnp.int32(0), jnp.int32(0))
+    )  # units, groups
