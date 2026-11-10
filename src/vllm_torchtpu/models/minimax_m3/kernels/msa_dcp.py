@@ -490,13 +490,6 @@ def merge_head_candidates(
     return out[:num_tokens].reshape(num_tokens, num_heads, topk)
 
 
-def _per_tile(tile_seq: jax.Array, table: jax.Array) -> jax.Array:
-    """``table[tile_seq]`` for a per-request table, by a one-hot over the
-    requests (a gather from a small table lowers to a compare chain)."""
-    onehot = tile_seq[:, None] == jnp.arange(table.shape[0], dtype=jnp.int32)
-    return jnp.sum(jnp.where(onehot, table[None, :], 0), axis=1)
-
-
 def _class_candidates(
     index_q: jax.Array,
     index_cache: jax.Array,
@@ -552,7 +545,7 @@ def _class_candidates(
     ):
         # A column's query row sits at offset o of its request's folded rows,
         # token o mod q_len of it: position = len - q_len + o mod q_len.
-        per_tile = functools.partial(_per_tile, scored.tile_seq)
+        per_tile = functools.partial(msa_indexer.lookup, index=scored.tile_seq)
         row = scored.tile_row0[:, None] + jnp.arange(block_q, dtype=jnp.int32)[None, :]
         offset = row - per_tile(folded_cu[:-1])[:, None]
         q_len = jnp.maximum(per_tile(q_lens), 1)[:, None]
@@ -567,14 +560,18 @@ def _class_candidates(
         )
         picks.append(pack_candidates(s, b))
         # Each head's and token's column in this class (`_class_scores`).
-        start = scored.tile_start[seq_of_token][None]
+        start = msa_indexer.lookup(scored.tile_start, seq_of_token)[None]
         off = rows - start
-        col = (scored.first_tile[seq_of_token][None] + off // block_q) * block_q
+        col = (
+            msa_indexer.lookup(scored.first_tile, seq_of_token)[None] + off // block_q
+        ) * block_q
         cols.append(jnp.clip(col + off % block_q, 0, picks[-1].shape[0] - 1))
     # A head's and token's picks: its large-class column if its request is
     # large, else its small-class one.
     col = jnp.where(
-        plan.is_large[seq_of_token][None], picks[0].shape[0] + cols[1], cols[0]
+        msa_indexer.lookup(plan.is_large, seq_of_token)[None],
+        picks[0].shape[0] + cols[1],
+        cols[0],
     )
     packed = jnp.concatenate(picks, axis=0)[col.reshape(-1)]  # [G * T, 2 * topk]
     return (
