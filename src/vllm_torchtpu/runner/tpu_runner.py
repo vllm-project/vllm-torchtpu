@@ -971,9 +971,10 @@ class TPUModelRunner(GPUModelRunner):
                 )
             except (IndexError, TypeError, AttributeError, KeyError):
                 pass
+        most_model_len = self.most_model_len
         self.num_blocks_per_most_len_req = (
-            cdiv(self.most_model_len, self.block_size)
-            if self.most_model_len is not None
+            cdiv(most_model_len, self.block_size)
+            if most_model_len is not None
             else None
         )
         # InputBatch needs to work with sampling tensors greater than padding
