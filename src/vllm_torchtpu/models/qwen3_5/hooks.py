@@ -88,8 +88,14 @@ def _is_calibrated(model_config) -> bool:
 
 def _expert_slots_and_layers(model_config, parallel_config) -> tuple[int, int]:
     """(slots, layers): the expert slots each EP rank holds and the MoE layers
-    that hold them. Main's placement (TPU_EXPERT_PLACEMENT) only permutes
-    experts, so every rank holds num_experts / EP of them in every layer."""
+    that hold them. With a placement table (TPU_EXPERT_PLACEMENT), its slots
+    per rank (primaries and copy slots) over its placed layers; without one,
+    num_experts / EP in every layer."""
+    from vllm_torchtpu.layers.adapter import expert_placement
+
+    placement = expert_placement.current()
+    if placement is not None:
+        return placement.slots_per_rank, len(placement.layers)
     text = model_config.hf_text_config
     ep = int(parallel_config.tensor_parallel_size) * int(
         parallel_config.data_parallel_size
@@ -108,10 +114,22 @@ def _expert_slot_kv_credit(model_config, parallel_config) -> tuple[int, object]:
         hidden = int(text.hidden_size)
         inter = int(text.moe_intermediate_size)
         slots, layers = _expert_slots_and_layers(model_config, parallel_config)
+        copies = _copy_slots_per_rank()
     except Exception as e:  # noqa: BLE001 - never block startup on the credit
         logger.warning("expert-slot KV credit unavailable (%s); using 0.", e)
         return 0, "?"
-    return (_QWEN35_SAFE_KV_SLOTS - slots) * layers * 3 * hidden * inter, slots
+    # A table with copies also budgets the drafter's MoE layer for its copy
+    # slots, as the measured budgets did.
+    slot_layers = (_QWEN35_SAFE_KV_SLOTS - slots) * layers - copies
+    return slot_layers * 3 * hidden * inter, slots
+
+
+def _copy_slots_per_rank() -> int:
+    """The placement table's copy slots per rank, 0 without a table."""
+    from vllm_torchtpu.layers.adapter import expert_placement
+
+    placement = expert_placement.current()
+    return placement.copies_per_rank if placement is not None else 0
 
 
 def _apply_prefix_match_unit(vllm_config: VllmConfig) -> None:

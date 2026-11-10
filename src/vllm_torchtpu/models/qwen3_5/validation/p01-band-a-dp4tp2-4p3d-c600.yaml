@@ -219,7 +219,7 @@ legs:
       RAGGED_GATHER_REDUCE_VERSION: "v3"
       TPU_ENABLE_GDN_DYNAMIC_TILING: "1"
       TPU_EVICT_WEIGHTS_PAGE_CACHE: "1"
-      TPU_EXPERT_PLACEMENT: "/workspace/vllm-torchtpu/expert_placement/expert_placement_dp8_ep8.json"
+      TPU_EXPERT_PLACEMENT: "/workspace/vllm-torchtpu/src/vllm_torchtpu/models/qwen3_5/validation/expert_placement_dp8_ep8.json"
       TPU_GDN_CONV_QK_PAIR_LAYOUT: "1"
       TPU_KV_SHM_POOL_GB: "8"
       TPU_MOE_SEQUENCE_PARALLEL: "1"
@@ -243,4 +243,5 @@ legs:
       USE_MOE_SPARSE_CORE: "1"
       VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP: "1"
       VLLM_XLA_CHECK_RECOMPILATION: "0"
-    additional_config: {}
+    additional_config:
+      tpu_collectives: {small_all_reduce: true}
