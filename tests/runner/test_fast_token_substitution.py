@@ -93,6 +93,35 @@ def test_substitution_enabled_fast_path():
         assert torch.equal(out, torch.tensor([201, 202, 203, 204], dtype=torch.int32))
 
 
+def test_spec_verify_step_skips_the_fast_slice():
+    """A spec-verify step (spec_decode_metadata set) goes through the
+    substitution kernel even when the fast slice would apply: the verify path
+    needs the substituted ids (and, on TPU, the fused draft-token extract), not
+    a slice view of the previous step's tokens."""
+    runner = SimpleNamespace(
+        _fast_token_substitution=True,
+        device=torch.device("cpu"),
+        _pre_async_results=SimpleNamespace(
+            next_tokens_tpu=torch.tensor([201, 202, 203, 204], dtype=torch.int64)
+        ),
+    )
+    input_ids = torch.tensor([-1, -1, -1, -1], dtype=torch.int32)
+    indices = np.array([0, 1, 2, 3], dtype=np.int32)
+    metadata = SimpleNamespace(
+        final_logits_indices=torch.arange(4, dtype=torch.int32),
+        target_logits_indices=torch.arange(4, dtype=torch.int32),
+    )
+
+    with patch(
+        "vllm_torchtpu.runner.tpu_runner._substitute_placeholder_token"
+    ) as mock_kernel:
+        mock_kernel.return_value = torch.tensor([201, 202, 203, 204], dtype=torch.int32)
+        TPUModelRunner._apply_async_token_substitution(
+            runner, input_ids, indices, indices.copy(), spec_decode_metadata=metadata
+        )
+        assert mock_kernel.called
+
+
 def test_substitute_placeholder_token_rejects_mismatched_lengths():
     """The shape check names the index rows' shape and the input length."""
     with (
