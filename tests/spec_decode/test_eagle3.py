@@ -137,6 +137,8 @@ def test_draft_tp_defaults_to_target_tp():
 
 @pytest.mark.parametrize("draft_tp,target_tp", [(1, 1), (1, 8), (8, 8)])
 def test_load_model_vocab_weights_follow_tp_layout(draft_tp, target_tp, monkeypatch):
+    # The draft model here is a plain namespace, not a module tree.
+    monkeypatch.setenv("TPU_FUSED_ADD_RMSNORM", "0")
     proposer = _make_proposer(draft_tp=draft_tp, target_tp=target_tp, method="mtp")
     draft, target = _make_vocab_models()
     draft_head = draft.lm_head

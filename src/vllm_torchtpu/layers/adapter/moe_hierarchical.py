@@ -34,9 +34,9 @@ def ep_tp_size() -> int:
     """``TPU_MOE_EP_TP_SIZE`` as it applies to this deployment.
 
     An explicit value is returned as is (and refuses an unsupported deployment
-    downstream). The default (1, flat EP) would apply above 1 only where it
-    was measured -- GLM-5.2 with EP over the whole TP group -- and stays 1
-    (flat) elsewhere. Decided
+    downstream). The default applies only where it was measured -- the
+    architectures above with EP over the whole TP group -- and stays 1 (flat)
+    elsewhere. Decided
     once, from the vLLM config current when the first FusedMoE is built, so
     the MoE split and the EP weight filter at load time always agree.
     """

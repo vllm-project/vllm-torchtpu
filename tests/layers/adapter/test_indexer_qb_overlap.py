@@ -155,9 +155,11 @@ def test_operands_refuse_anything_else(overrides):
     assert mla_op._qb_overlap_operands(_qb_layer(**overrides)) is None
 
 
-def test_indexer_hands_the_op_q_c_and_the_q_b_weights():
+def test_indexer_hands_the_op_q_c_and_the_q_b_weights(monkeypatch):
     """`VllmTPUIndexer.forward(..., q_b_layer=)` passes `(q_c, w_q, w_s)` and
     returns the op's pair; a layer it cannot take yields `(topk, None)`."""
+    # The q_b layer here is not query-replicated.
+    monkeypatch.setenv("TPU_MLA_DECODE_LOCAL_Q_AG", "0")
     n_head, head_dim, t = 2, 128, 16
     idx = VllmTPUIndexer.__new__(VllmTPUIndexer)
     torch.nn.Module.__init__(idx)

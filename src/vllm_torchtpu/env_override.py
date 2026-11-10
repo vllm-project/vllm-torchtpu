@@ -193,13 +193,13 @@ _sc_offload_bytes = _resolve_sc_offload_threshold_bytes()
 # own all-reduce took that place and acceptance was normal; what goes wrong
 # in the first case is not identified. So while that kernel is on, the
 # chip-family all-reduce threshold is lowered to 1 MiB -- only when
-# FUSED_MOE_PREFILL_KERNEL is set explicitly. On by default, the kernel arms
-# only layers shaped like GLM-5.2's (TP experts, an ungated shared expert), but this
-# runs at import, before the model is known, so lowering it by default would
-# move every model's all-reduces onto the SparseCore. With the default, the
-# layers the kernel arms log a warning instead when the floor is above their
-# smallest all-reduce (fused_moe_decode.arm_fused_moe_decode); the GLM-5.2
-# AgentX launch passes 2 MiB in LIBTPU_INIT_ARGS. An explicit
+# FUSED_MOE_PREFILL_KERNEL is set explicitly. The kernel is off by default
+# and arms only layers shaped like GLM-5.2's (TP experts, an ungated shared
+# expert), but this runs at import, before the model is known, so lowering it
+# without an explicit setting would move every model's all-reduces onto the
+# SparseCore. Without one, the layers the kernel arms log a warning instead
+# when the floor is above their smallest all-reduce
+# (fused_moe_decode.arm_fused_moe_decode). An explicit
 # SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES or all-reduce flag is kept as
 # given: keep it at or below the kernel's smallest all-reduce (3 MiB for
 # GLM-5.2 at its 256-token minimum).

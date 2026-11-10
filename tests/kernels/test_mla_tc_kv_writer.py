@@ -397,9 +397,11 @@ class TcKvWriterContractTest(parameterized.TestCase):
         _, rope_spec = _specs(rope_layout)
         self.assertFalse(tc_scatter.supports(nope_spec, rope_spec, 16))
 
-    def test_flag_defaults_off(self):
+    def test_flag_defaults_on_and_zero_turns_it_off(self):
         from vllm_torchtpu import envs
 
         with mock.patch.dict(os.environ):
             os.environ.pop(FLAG, None)
+            self.assertTrue(envs.TPU_MLA_TC_KV_WRITER)
+            os.environ[FLAG] = "0"
             self.assertFalse(envs.TPU_MLA_TC_KV_WRITER)

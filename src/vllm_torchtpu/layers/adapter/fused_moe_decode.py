@@ -592,8 +592,9 @@ def _check_same_arming_on_every_rank(signature: tuple, what: str) -> None:
 
 
 def _warn_sc_all_reduce_floor(min_tokens: int, hidden: int) -> None:
-    """With the prefill kernel on by default (env_override.py lowers the
-    SparseCore all-reduce floor only when FUSED_MOE_PREFILL_KERNEL is set),
+    """With the prefill kernel on without an explicit setting (env_override.py
+    lowers the SparseCore all-reduce floor only when FUSED_MOE_PREFILL_KERNEL
+    is set),
     warn when the effective floor would keep the kernel's smallest all-reduce
     (bf16 [min_tokens, hidden]) on the TensorCore, where MTP draft acceptance
     collapsed with GLM-5.2."""

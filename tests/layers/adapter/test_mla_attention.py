@@ -2003,7 +2003,7 @@ def test_sparse_page_size_drops_the_rope_padding_with_packed_rope(monkeypatch):
     )
     assert padded == 640 * block_size
 
-    monkeypatch.delenv("TPU_SPARSE_MLA_PACKED_ROPE", raising=False)
+    monkeypatch.setenv("TPU_SPARSE_MLA_PACKED_ROPE", "0")
     assert not envs.TPU_SPARSE_MLA_PACKED_ROPE
     assert (
         PallasMLAttentionBackend.get_sparse_kv_cache_page_size_bytes(

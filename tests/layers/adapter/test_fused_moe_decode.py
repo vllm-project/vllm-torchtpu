@@ -73,9 +73,9 @@ def test_prefill_kernel_serves_buckets_above_the_cap(
 ):
     """prefill_kernel=True: buckets above the cap run the prefill kernel, with
     the layer's expert range, ungated shared expert and routed scale; False,
-    the GMM fallback as before. FUSED_MOE_PREFILL_KERNEL is on by default
-    (trial 4); the dispatch reads only the prefill_kernel argument."""
-    monkeypatch.delenv("FUSED_MOE_PREFILL_KERNEL", raising=False)
+    the GMM fallback as before. FUSED_MOE_PREFILL_KERNEL is set explicitly;
+    the dispatch reads only the prefill_kernel argument."""
+    monkeypatch.setenv("FUSED_MOE_PREFILL_KERNEL", "1")
     assert envs.FUSED_MOE_PREFILL_KERNEL is True
     calls = []
 
@@ -122,10 +122,10 @@ def test_prefill_kernel_serves_buckets_above_the_cap(
 def test_prefill_kernel_serves_tp_experts_only(monkeypatch):
     """FUSED_MOE_PREFILL_KERNEL arms the prefill kernel for TP-expert layers
     only; EP layers keep the GMM path above the cap."""
-    monkeypatch.setenv("FUSED_MOE_PREFILL_KERNEL", "0")
+    monkeypatch.delenv("FUSED_MOE_PREFILL_KERNEL", raising=False)  # off by default
     assert not bridge._serves_prefill_kernel(expert_parallel=False)
     assert not bridge._serves_prefill_kernel(expert_parallel=True)
-    monkeypatch.delenv("FUSED_MOE_PREFILL_KERNEL", raising=False)  # on by default
+    monkeypatch.setenv("FUSED_MOE_PREFILL_KERNEL", "1")
     assert bridge._serves_prefill_kernel(expert_parallel=False)
     assert not bridge._serves_prefill_kernel(expert_parallel=True)
 

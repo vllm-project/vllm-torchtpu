@@ -276,6 +276,7 @@ def test_prebuild_builds_the_sized_op_only_with_the_draft_flag(monkeypatch, draf
 
     monkeypatch.setattr(op.envs, "TPU_SMALL_ALL_REDUCE", True)
     monkeypatch.setattr(op.envs, "TPU_SMALL_ALL_REDUCE_DRAFT", draft)
+    monkeypatch.setattr(op.envs, "TPU_SMALL_ALL_REDUCE_VALID_ROWS", False)
     monkeypatch.setattr(op.envs, "TPU_SMALL_ALL_REDUCE_MAX_ROWS", 32)
     # On by default (trial 5); its fused matmul + all-reduce op is covered below.
     monkeypatch.setattr(op.envs, "TPU_FUSED_OPROJ_AR", False)
@@ -664,6 +665,7 @@ def test_prebuild_one_row_build_needs_the_padding_flag(monkeypatch, skip_padded)
 
     monkeypatch.setattr(op.envs, "TPU_SMALL_ALL_REDUCE", True)
     monkeypatch.setattr(op.envs, "TPU_SMALL_ALL_REDUCE_DRAFT", False)
+    monkeypatch.setattr(op.envs, "TPU_SMALL_ALL_REDUCE_VALID_ROWS", False)
     monkeypatch.setattr(op.envs, "TPU_FUSED_OPROJ_AR", True)
     monkeypatch.setattr(op.envs, "TPU_ONE_ROW_ALL_REDUCE", True)
     monkeypatch.setattr(op.envs, "TPU_MOE_SKIP_PADDED_TOKENS", skip_padded)
@@ -696,8 +698,10 @@ def test_prebuild_one_row_build_needs_the_padding_flag(monkeypatch, skip_padded)
     assert op._MM_AR_ONE_ROW and op._MM_AR_OP == "mm_ar_one_row"
 
 
-def test_one_row_flag_defaults_off(monkeypatch):
+def test_one_row_flag_defaults_on_and_zero_turns_it_off(monkeypatch):
     from vllm_torchtpu import envs
 
     monkeypatch.delenv("TPU_ONE_ROW_ALL_REDUCE", raising=False)
+    assert envs.environment_variables["TPU_ONE_ROW_ALL_REDUCE"]() is True
+    monkeypatch.setenv("TPU_ONE_ROW_ALL_REDUCE", "0")
     assert envs.environment_variables["TPU_ONE_ROW_ALL_REDUCE"]() is False

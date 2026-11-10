@@ -534,20 +534,23 @@ def test_default_ep_tp_applies_only_where_measured(monkeypatch, kwargs, expected
     assert moe_hierarchical._default_ep_tp_for(_vllm_config(**kwargs)) == expected
 
 
-def test_shipped_default_ep_tp_is_flat_for_glm(monkeypatch):
-    """The GLM-5.2 AgentX trial-4 configuration was served and accuracy-gated
-    with flat EP (TPU_MOE_EP_TP_SIZE unset on a stack whose default was 1), so
-    the shipped default keeps GLM-5.2 flat too."""
+def test_shipped_default_ep_tp_splits_glm(monkeypatch):
+    """The shipped default splits the experts EP x TP where the default
+    applies, and an explicit 1 keeps flat EP."""
     from vllm_torchtpu import envs
     from vllm_torchtpu.layers.adapter import moe_hierarchical
 
     monkeypatch.delenv("TPU_MOE_EP_TP_SIZE", raising=False)
     monkeypatch.setattr(envs, "TPU_MOE_HIERARCHICAL_EP", False)
-    assert envs.environment_variables["TPU_MOE_EP_TP_SIZE"]() == 1
+    assert envs.environment_variables["TPU_MOE_EP_TP_SIZE"]() == 2
     monkeypatch.setattr(
         envs, "TPU_MOE_EP_TP_SIZE", envs.environment_variables["TPU_MOE_EP_TP_SIZE"]()
     )
-    assert moe_hierarchical._default_ep_tp_for(_vllm_config()) == 1
+    assert moe_hierarchical._default_ep_tp_for(_vllm_config()) == 2
+
+    monkeypatch.setenv("TPU_MOE_EP_TP_SIZE", "1")
+    monkeypatch.setattr(envs, "TPU_MOE_EP_TP_SIZE", 1)
+    assert moe_hierarchical.ep_tp_size() == 1
 
 
 def test_default_ep_tp_yields_to_hierarchical_ep(monkeypatch):

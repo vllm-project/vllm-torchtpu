@@ -878,6 +878,8 @@ def test_qwen_wrappers_are_installed_once_across_model_loads(
     import transformers.models.qwen3_vl.modeling_qwen3_vl as modeling
 
     reg = isolated_registry
+    # The model configs below carry only what the Qwen patches read.
+    monkeypatch.setenv("TPU_MOE_PREFILL_SEQUENCE_PARALLEL", "0")
     monkeypatch.setattr(reg, "PATCHES", tuple(p for p in reg.PATCHES if p.model_config))
     targets = [
         (modeling.Qwen3VLModel, "get_rope_index"),

@@ -255,7 +255,8 @@ def _build(layer, **stubs):
     return op, seen
 
 
-def test_op_takes_own_tokens_and_a_bf16_wire_without_arming_the_layer():
+def test_op_takes_own_tokens_and_a_bf16_wire_without_arming_the_layer(monkeypatch):
+    monkeypatch.setenv("TPU_MOE_PREFILL_SP_FP8_WIRE", "0")
     layer = _experts()
     op, seen = _build(layer)
     assert op == "op"
