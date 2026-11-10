@@ -1951,6 +1951,7 @@ class Eagle3Proposer:
                     if chunk.attn_ctx.use_max_model_len
                     else runner.num_reqs_most_model_len
                 )
+                assert knr is not None
                 if (
                     cached_prep_step1 is not None
                     and step0_gather_indices is not None
@@ -2441,6 +2442,7 @@ class Eagle3Proposer:
             # (no D2H). num_rejected stays 0 (num_rejected_tokens_np is None ->
             # num_rejected_np is zeros) and last_token_indices = qsl_end-1 (set
             # above) is the last prompt position -- the correct prefill seed.
+            # pyrefly: ignore[unbound-name]
             num_rejected_out = num_rejected_np
             # Partial-prefill (discard) reqs: override seed from host req_state.
             ov_i = (
@@ -2461,6 +2463,7 @@ class Eagle3Proposer:
                     )
                     for i in ov_i
                 ]
+                # pyrefly: ignore[unbound-name]
                 lti_p_np = np.full(p, last_token_indices_np[-1], dtype=np.int64)
                 lti_p_np[:num_reqs] = last_token_indices_np
                 ntids_p_np = np.full(p, ov_v[-1], dtype=np.int32)
@@ -2496,16 +2499,20 @@ class Eagle3Proposer:
                         pad_req_idx = torch.from_numpy(pad_req_idx_np).to(runner.device)
                         self._async_pad_req_idx_cache[pad_key] = pad_req_idx
                     next_token_ids = torch.index_select(next_token_ids, 0, pad_req_idx)
+                    # pyrefly: ignore[unbound-name]
                     lti_p_np = np.full(p, last_token_indices_np[-1], dtype=np.int64)
                     lti_p_np[:num_reqs] = last_token_indices_np
                     last_token_indices = _h2d_temp(runner, torch.from_numpy(lti_p_np))
                 else:
                     last_token_indices = _h2d_temp(
-                        runner, torch.from_numpy(last_token_indices_np)
+                        runner,
+                        # pyrefly: ignore[unbound-name]
+                        torch.from_numpy(last_token_indices_np),
                     )
         else:
             assert sampled_token_ids is not None
             req_ids = runner.input_batch.req_ids[start : start + num_reqs]
+            # pyrefly: ignore[unbound-name]
             num_rejected_out = num_rejected_np
             next_token_ids_np = np.zeros(num_reqs, dtype=np.int32)
             for i in range(num_reqs):
@@ -2534,6 +2541,7 @@ class Eagle3Proposer:
         if next_tokens_device is None and device_seed is None:
             # Pure sync: build the padded index + values on the host (free H2D,
             # no recompile), then scatter at the constant [p] shape.
+            # pyrefly: ignore[unbound-name]
             lti_p_np = np.full(p, last_token_indices_np[-1], dtype=np.int64)
             lti_p_np[:num_reqs] = last_token_indices_np
             ntids_p_np = np.full(
@@ -2562,12 +2570,14 @@ class Eagle3Proposer:
             # for every new (token bucket, num_reqs) pair while serving.
             if last_token_indices.shape[0] < p:
                 last_token_indices = _pad_dim0_repeat_last(last_token_indices, p)
+            # pyrefly: ignore[unbound-name]
             if next_token_ids.shape[0] < p:
                 next_token_ids = _pad_dim0_repeat_last(next_token_ids, p)
             draft_input_ids = self._draft_seed_input_ids(
                 chunk.input_ids, last_token_indices, next_token_ids
             )
             padded_lti_np = np.zeros(p, dtype=np.int64)
+            # pyrefly: ignore[unbound-name]
             padded_lti_np[:num_reqs] = last_token_indices_np
             gather_indices = _h2d_temp(runner, torch.from_numpy(padded_lti_np))
             step0_pad_len = int(getattr(self, "_step0_pad_len", 0) or 0)
@@ -2582,7 +2592,9 @@ class Eagle3Proposer:
 
         draft_input_ids, gather_indices = (
             chunk.sequence_layout_plan.localize_token_tensor_and_gather_indices(
+                # pyrefly: ignore[unbound-name]
                 draft_input_ids,
+                # pyrefly: ignore[unbound-name]
                 gather_indices,
                 num_valid_gathers=num_reqs,
             )
@@ -3299,7 +3311,7 @@ class Eagle3Proposer:
             getattr(runner, "most_model_len", None) is not None
             and getattr(runner, "num_reqs_most_model_len", None) is not None
         ):
-            knr_buckets.add(runner.num_reqs_most_model_len)
+            knr_buckets.add(int(runner.num_reqs_most_model_len))
         req_loop_pairs = sorted(
             {
                 (
@@ -3451,7 +3463,7 @@ class Eagle3Proposer:
             getattr(runner, "most_model_len", None) is not None
             and getattr(runner, "num_reqs_most_model_len", None) is not None
         ):
-            knr_buckets.add(runner.num_reqs_most_model_len)
+            knr_buckets.add(int(runner.num_reqs_most_model_len))
         with (
             set_model_tag("eagle_head"),
             runner._precompile_timed("drafter compute_logits"),

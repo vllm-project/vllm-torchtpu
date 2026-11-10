@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import bisect
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import torch
@@ -143,12 +143,13 @@ class SpeculativeDecodingManager:
         # step at steady state. Only draft_token_ids carries per-step values.
         self._meta_cache_key: tuple | None = None
         self._meta_cache: SpecDecodeMetadata | None = None
-        # (logits_indices, target_logits_indices, padded_logits_length) from
-        # the cached build — needed to re-extract draft_token_ids on a hit.
-        self._meta_cache_np: tuple[np.ndarray, np.ndarray, int] | None = None
+        # (logits_indices, target_logits_indices, padded_logits_length,
+        # draft_input_indices) from the cached build — needed to re-extract
+        # draft_token_ids on a hit.
+        self._meta_cache_np: tuple[np.ndarray, np.ndarray, int, Any] | None = None
         self._meta_lru_cache: dict[
             tuple[bytes, bytes, int],
-            tuple[SpecDecodeMetadata, tuple[np.ndarray, np.ndarray, int]],
+            tuple[SpecDecodeMetadata, tuple[np.ndarray, np.ndarray, int, Any]],
         ] = {}
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:

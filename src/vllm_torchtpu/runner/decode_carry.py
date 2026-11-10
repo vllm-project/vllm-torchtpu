@@ -65,6 +65,20 @@ def enabled(runner: Any) -> bool:
 
 
 class CarryState:
+    req_ids: tuple[str, ...]
+    nsched: tuple[int, ...]
+    target: int
+    padded_total: int
+    total: int
+    src_seq: Any
+    S: np.ndarray
+    seq_pad: np.ndarray
+    pos: np.ndarray
+    seq_lens: Any
+    positions: Any
+    input_ids: Any
+    step_delta: int
+
     __slots__ = (
         "req_ids",
         "nsched",
