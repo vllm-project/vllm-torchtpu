@@ -12,23 +12,92 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Source provenance: inferact/k3-megakernel@30c9ba966b src/vllm_torchtpu/megakernel/compilation.py
+# Source provenance: inferact/k3-megakernel@30c9ba966b
+# src/vllm_torchtpu/megakernel/compilation.py
 """Compile independent torch_tpu graphs before their ordered warmup execution."""
 
+from __future__ import annotations
+
+import importlib
 import time
-from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Protocol
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterable
+
+_MAX_PENDING_COMPILES = 8
+_POLL_INTERVAL_SECONDS = 0.01
+
+
+class _CompileHandle(Protocol):
+    """Protocol for an async ``torch_tpu`` compilation handle."""
+
+    def is_ready(self) -> bool:
+        """Return ``True`` when the async compilation has completed."""
+        ...
+
+    def get(self) -> object:
+        """Materialize and raise any compilation error from the handle."""
+        ...
 
 
 @dataclass(frozen=True)
 class CompileCall:
     """One tuple-returning op and the exact eager compiler options it uses."""
 
-    op: Any
-    operands: tuple
+    op: Callable[..., tuple[object, ...]]
+    operands: tuple[object, ...]
     options: dict[str, str]
     priority: int = 0  # Larger independent graphs are submitted first.
+
+
+def _pop_ready_compile(
+    pending: list[tuple[_CompileHandle, tuple[object, ...], tuple[object, ...]]],
+) -> None:
+    """Wait until any pending compile handle is ready, pop it, and materialize it.
+
+    The first submitted graph may be the slowest; reusing any completed slot
+    keeps it from holding back the rest of the independent schedule.
+
+    Args:
+        pending: In-flight ``(handle, inputs, outputs)`` compilation entries.
+    """
+    while True:
+        for index, (handle, _inputs, _outputs) in enumerate(pending):
+            if handle.is_ready():
+                entry = pending.pop(index)
+                entry[0].get()
+                return
+        time.sleep(_POLL_INTERVAL_SECONDS)
+
+
+def _drain_pending_compiles(
+    pending: list[tuple[_CompileHandle, tuple[object, ...], tuple[object, ...]]],
+) -> Exception | None:
+    """Drain all remaining in-flight compiles and return the first error, if any.
+
+    Args:
+        pending: In-flight ``(handle, inputs, outputs)`` compilation entries.
+
+    Returns:
+        First ``Exception`` raised while draining handles, or ``None``.
+    """
+    drain_error: Exception | None = None
+    while pending:
+        try:
+            _pop_ready_compile(pending)
+        except (
+            RuntimeError,
+            ValueError,
+            TypeError,
+            OSError,
+            LookupError,
+            AssertionError,
+        ) as exc:
+            if drain_error is None:
+                drain_error = exc
+    return drain_error
 
 
 def compile_ops(calls: Iterable[CompileCall]) -> None:
@@ -39,34 +108,30 @@ def compile_ops(calls: Iterable[CompileCall]) -> None:
     replace the warmup, which executes the graphs and the programs left out of
     this schedule. The bound also caps compiler memory on hosts shared by eight
     workers. Submitted work drains before a failure propagates.
+
+    Args:
+        calls: Iterable of :class:`CompileCall` specifications to compile.
     """
-    from torch_tpu._internal import execution_mode
-    from torch_tpu._internal.compile import tpu_torch_compile
-    from torch_tpu._internal.compiler_options import custom_compiler_options
+    execution_mode = importlib.import_module("torch_tpu._internal.execution_mode")
+    tpu_torch_compile = importlib.import_module(
+        "torch_tpu._internal.compile.tpu_torch_compile"
+    )
+    compiler_options = importlib.import_module("torch_tpu._internal.compiler_options")
+    custom_compiler_options = compiler_options.custom_compiler_options
 
-    pending: list[tuple[Any, tuple, Any]] = []
-
-    def finish() -> None:
-        # The first submitted graph may be the slowest. Reuse any completed
-        # slot so it cannot hold the rest of the independent schedule back.
-        while True:
-            for index, (handle, _inputs, _outputs) in enumerate(pending):
-                if handle.is_ready():
-                    entry = pending.pop(index)
-                    entry[0].get()
-                    return
-            time.sleep(0.01)
-
+    pending: list[tuple[_CompileHandle, tuple[object, ...], tuple[object, ...]]] = []
     eager_mode = (
         getattr(execution_mode.EagerMode, "INTERNAL_COMPILE_FX_GRAPH", None)
         or execution_mode.EagerMode._INTERNAL_COMPILE_FX_GRAPH
     )
-    failure: BaseException | None = None
+    body_succeeded = False
     try:
         for call in calls:
-            if len(pending) == 8:
-                finish()
-            inputs = tuple(tpu_torch_compile.placeholder_like(t) for t in call.operands)
+            if len(pending) == _MAX_PENDING_COMPILES:
+                _pop_ready_compile(pending)
+            inputs = tuple(
+                tpu_torch_compile.placeholder_like(operand) for operand in call.operands
+            )
             with execution_mode.set_eager_mode(eager_mode):
                 outputs = call.op(*inputs)
             with custom_compiler_options(call.options):
@@ -74,14 +139,8 @@ def compile_ops(calls: Iterable[CompileCall]) -> None:
                     list(outputs), list(inputs), fast_compile=True
                 )
             pending.append((handle, inputs, outputs))
-    except BaseException as exc:
-        failure = exc
+        body_succeeded = True
     finally:
-        while pending:
-            try:
-                finish()
-            except BaseException as exc:
-                if failure is None:
-                    failure = exc
-    if failure is not None:
-        raise failure
+        drain_error = _drain_pending_compiles(pending)
+    if body_succeeded and drain_error is not None:
+        raise drain_error

@@ -12,10 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Source provenance: inferact/k3-megakernel@30c9ba966b src/vllm_torchtpu/megakernel/backend.py
-"""Selecting the megakernel backend from vLLM's configuration::
+# Source provenance: inferact/k3-megakernel@30c9ba966b
+# src/vllm_torchtpu/megakernel/backend.py
+r"""Select the Kimi-K3 megakernel backend from vLLM configuration.
 
-    --load-format megakernel \\
+Example CLI invocation::
+
+    --load-format megakernel \
     --model-loader-extra-config '{"presharded": "/path/to/kimi-k3-tp32"}'
 
 ``presharded`` is the program's TP32 pre-shard directory. A KV producer runs
@@ -27,8 +30,12 @@ patches call it.
 
 from __future__ import annotations
 
+import importlib
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .program import Capabilities
 
 LOAD_FORMAT = "megakernel"
 # Model architectures with a megakernel program.
@@ -39,48 +46,82 @@ _LOADER_KEYS = {
     "decode": {
         "presharded",
         "attention_dp",
-        "shared_blocks",
         "synthetic_acceptance_lengths",
     },
 }
 
 
-def role(vllm_config: Any) -> str | None:
-    """``"prefill"`` or ``"decode"`` when the backend is selected
-    (``--load-format megakernel``), else None. Raises on a configuration the
-    backend can't serve."""
-    load_config = getattr(vllm_config, "load_config", None)
-    if getattr(load_config, "load_format", None) != LOAD_FORMAT:
+def role(vllm_config: object) -> str | None:
+    """Return ``"prefill"`` or ``"decode"`` when the megakernel backend is active.
+
+    Args:
+        vllm_config: Active vLLM engine configuration object.
+
+    Returns:
+        ``"prefill"`` for a KV producer, ``"decode"`` for a KV consumer, or
+        ``None`` when ``--load-format megakernel`` is not selected.
+
+    Raises:
+        ValueError: If the KV role, model architecture, or loader config is invalid.
+    """
+    vllm_attrs = vars(vllm_config)
+    load_config = vllm_attrs.get("load_config")
+    if load_config is None or vars(load_config).get("load_format") != LOAD_FORMAT:
         return None
-    kv = getattr(vllm_config, "kv_transfer_config", None)
+    kv = vllm_attrs.get("kv_transfer_config")
     if kv is None or kv.is_kv_producer == kv.is_kv_consumer:
-        raise ValueError(
+        msg = (
             "the megakernel backend serves one role of a P/D pair: "
             "a KV transfer config with "
             "kv_role kv_producer (prefill) or kv_consumer (decode)"
         )
-    model_config = getattr(vllm_config, "model_config", None)
-    architectures = (
-        getattr(getattr(model_config, "hf_config", None), "architectures", None) or []
+        raise ValueError(msg)
+    model_config = vllm_attrs.get("model_config")
+    hf_config = (
+        vars(model_config).get("hf_config") if model_config is not None else None
     )
-    if model_config is not None and not any(a in ARCHITECTURES for a in architectures):
-        raise ValueError(
+    architectures = (
+        vars(hf_config).get("architectures") if hf_config is not None else None
+    ) or []
+    if model_config is not None and not any(
+        arch in ARCHITECTURES for arch in architectures
+    ):
+        msg = (
             f"no megakernel program for {architectures}; "
             f"supported: {list(ARCHITECTURES)}"
         )
+        raise ValueError(msg)
     selected = "prefill" if kv.is_kv_producer else "decode"
     _loader_config(vllm_config, selected)
     return selected
 
 
-def _loader_config(vllm_config: Any, selected: str) -> dict:
-    """The validated ``--model-loader-extra-config`` of role ``selected``."""
-    value = vllm_config.load_config.model_loader_extra_config or {}
+def _loader_config(vllm_config: object, selected: str) -> dict[str, object]:
+    """Return the validated ``--model-loader-extra-config`` dictionary for ``selected``.
+
+    Args:
+        vllm_config: Active vLLM engine configuration object.
+        selected: Role name (``"prefill"`` or ``"decode"``).
+
+    Returns:
+        Validated loader configuration mapping for ``selected``.
+
+    Raises:
+        TypeError: If ``model_loader_extra_config`` is not a ``dict``.
+        ValueError: If unknown keys are present or ``"presharded"`` is missing.
+    """
+    load_config = vars(vllm_config).get("load_config")
+    value = (
+        vars(load_config).get("model_loader_extra_config")
+        if load_config is not None
+        else None
+    ) or {}
     if not isinstance(value, dict):
-        raise ValueError(
+        msg = (
             "--load-format megakernel takes --model-loader-extra-config as a "
             'dict, e.g. {"presharded": "<dir>"}'
         )
+        raise TypeError(msg)
     unknown = set(value) - _LOADER_KEYS[selected]
     if unknown:
         hint = (
@@ -89,124 +130,122 @@ def _loader_config(vllm_config: Any, selected: str) -> dict:
             if "draft" in unknown
             else ""
         )
-        raise ValueError(
+        msg = (
             f"--model-loader-extra-config for the megakernel {selected} role "
             f"takes {sorted(_LOADER_KEYS[selected])}, not {sorted(unknown)}{hint}"
         )
+        raise ValueError(msg)
     if not value.get("presharded"):
-        raise ValueError(
+        msg = (
             "--load-format megakernel needs --model-loader-extra-config "
             '\'{"presharded": "<dir>"}\': the TP32 pre-shard directory '
             "(e.g. /path/to/kimi-k3-tp32)"
         )
+        raise ValueError(msg)
     return value
 
 
-def presharded(vllm_config: Any) -> Path:
+def presharded(vllm_config: object) -> Path:
+    """Return the TP32 pre-sharded weight directory path from ``vllm_config``.
+
+    Args:
+        vllm_config: Active vLLM engine configuration object.
+
+    Returns:
+        Filesystem ``Path`` to the pre-sharded weight directory.
+
+    Raises:
+        ValueError: If the megakernel backend is not selected.
+    """
     selected = role(vllm_config)
     if selected is None:
-        raise ValueError("the megakernel backend is not selected (--load-format)")
-    return Path(_loader_config(vllm_config, selected)["presharded"])
+        msg = "the megakernel backend is not selected (--load-format)"
+        raise ValueError(msg)
+    return Path(str(_loader_config(vllm_config, selected)["presharded"]))
 
 
-def draft(vllm_config: Any) -> Path | None:
-    """The DSpark speculator checkpoint whose ring the prefill role computes
-    (``draft`` in its loader config; None on the decode role)."""
+def draft(vllm_config: object) -> Path | None:
+    """Return the DSpark speculator checkpoint path for the prefill role, if configured.
+
+    Args:
+        vllm_config: Active vLLM engine configuration object.
+
+    Returns:
+        ``Path`` to the ``draft`` checkpoint on the prefill role, or ``None``.
+    """
     if role(vllm_config) != "prefill":
         return None
     path = _loader_config(vllm_config, "prefill").get("draft")
-    return Path(path) if path else None
+    return Path(str(path)) if path else None
 
 
-def mla_draft(vllm_config: Any) -> Path | None:
-    """The MLA DSpark draft checkpoint (``model_type`` ``k3_dspark``,
-    ``Inferact/Kimi-K3-DSpark``) of either role -- the prefill's ``draft``,
-    the decoder's speculative model -- or None. Its latent layers are KV cache
-    layers of both roles (``megakernel.runner``), so the transfer carries them."""
-    import json
+def attention_dp(vllm_config: object) -> int:
+    """Return the decoder attention data-parallel degree (default ``1``).
 
-    selected = role(vllm_config)
-    if selected == "prefill":
-        path = draft(vllm_config)
-    elif selected == "decode":
-        spec = vllm_config.speculative_config
-        path = (
-            Path(str(spec.model))
-            if spec is not None and spec.method == "dspark" and spec.model
-            else None
-        )
-    else:
-        return None
-    if path is None or not (path / "config.json").is_file():
-        return None
-    config = json.loads((path / "config.json").read_text())
-    return path if config.get("model_type") == "k3_dspark" else None
+    The decode role runs ``--decode-context-parallel-size`` equal to
+    ``TP / attention_dp``.
 
+    Args:
+        vllm_config: Active vLLM engine configuration object.
 
-def attention_dp(vllm_config: Any) -> int:
-    """The decoder's attention data parallelism (``attention_dp`` in the
-    decode role's loader config, default 1): the decode role then runs
-    ``--decode-context-parallel-size`` TP / attention_dp."""
+    Returns:
+        Attention data-parallel degree (``1`` when not on the decode role).
+    """
     if role(vllm_config) != "decode":
         return 1
-    return int(_loader_config(vllm_config, "decode").get("attention_dp", 1))
+    raw_dp = _loader_config(vllm_config, "decode").get("attention_dp", 1)
+    return int(str(raw_dp))
 
 
-def shared_blocks(vllm_config: Any) -> int | None:
-    """The decode role's shared KV block region under attention DP
-    (``shared_blocks`` in its loader config; None: the default size,
-    ``megakernel.dp_blocks``)."""
-    if role(vllm_config) != "decode":
-        return None
-    value = _loader_config(vllm_config, "decode").get("shared_blocks")
-    return None if value is None else int(value)
+def synthetic_acceptance_lengths(vllm_config: object) -> dict[int, float] | None:
+    """Return the decoder's synthetic mean acceptance length per draft width.
 
+    Configured via ``synthetic_acceptance_lengths`` in the decode loader config,
+    for example ``{"3": 2.87, "7": 3.78}``.
 
-def synthetic_acceptance_lengths(vllm_config: Any) -> dict[int, float] | None:
-    """The decoder's synthetic mean acceptance length per draft width
-    (``synthetic_acceptance_lengths`` in its loader config, e.g.
-    ``{"3": 2.87, "7": 3.78}``; None: vLLM's one rate vector, truncated to
-    each width)."""
+    Args:
+        vllm_config: Active vLLM engine configuration object.
+
+    Returns:
+        Mapping from draft width to mean acceptance length, or ``None``.
+
+    Raises:
+        TypeError: If ``synthetic_acceptance_lengths`` is not a ``dict``.
+        ValueError: If ``synthetic_acceptance_lengths`` is empty.
+    """
     if role(vllm_config) != "decode":
         return None
     value = _loader_config(vllm_config, "decode").get("synthetic_acceptance_lengths")
     if value is None:
         return None
-    if not isinstance(value, dict) or not value:
-        raise ValueError(
+    if not isinstance(value, dict):
+        msg = (
             "synthetic_acceptance_lengths maps draft widths to mean acceptance "
             'lengths, e.g. {"3": 2.87, "7": 3.78}'
         )
+        raise TypeError(msg)
+    if not value:
+        msg = (
+            "synthetic_acceptance_lengths maps draft widths to mean acceptance "
+            'lengths, e.g. {"3": 2.87, "7": 3.78}'
+        )
+        raise ValueError(msg)
     return {int(width): float(length) for width, length in value.items()}
 
 
-def draft_ring_rows(vllm_config: Any) -> int:
-    """KDA state-block rows the KV transfer carries for the DSpark draft ring
-    (0 without one): on the prefill role when it computes rings (``draft``),
-    on the decode role when it speculates with DSpark. The peers' pool
-    manifests, and so their layout fingerprints, differ unless both agree."""
-    selected = role(vllm_config)
-    if selected == "prefill":
-        carries = draft(vllm_config) is not None
-    elif selected == "decode":
-        spec = vllm_config.speculative_config
-        carries = spec is not None and spec.method == "dspark"
-    else:
-        return 0
-    if not carries or mla_draft(vllm_config) is not None:
-        return 0  # (the MLA draft's context is in its own KV cache layers)
-    from vllm_torchtpu.models.kimi_k3.megakernel.layout import LAYOUT
+def capabilities(vllm_config: object) -> Capabilities | None:
+    """Return the selected program's :class:`Capabilities`, or ``None`` if inactive.
 
-    return LAYOUT.region("draft").rows
+    Args:
+        vllm_config: Active vLLM engine configuration object.
 
-
-def capabilities(vllm_config: Any):
-    """The selected program's :class:`Capabilities` (None: backend not selected)."""
+    Returns:
+        Program :class:`Capabilities` when the megakernel backend is active,
+        else ``None``.
+    """
     if role(vllm_config) is None:
         return None
-    from vllm_torchtpu.models.kimi_k3.megakernel import program
-    from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim.config import (
-        MegakernelEngineConfig,
-    )
-
-    return program.capabilities(MegakernelEngineConfig.from_vllm_config(vllm_config))
+    program_mod = importlib.import_module("..program", __package__)
+    config_mod = importlib.import_module(".config", __package__)
+    engine_config = config_mod.MegakernelEngineConfig.from_vllm_config(vllm_config)
+    return program_mod.capabilities(engine_config)

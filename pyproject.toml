@@ -228,9 +228,6 @@ ignore = [
 "src/vllm_torchtpu/kernels/**" = ["B023"]
 # The Kimi-K3 megakernel is moved as-is from its source branch across 7 slices;
 # each slice adds strictly its own file/folder rules and removes them in its cleanup PR.
-"src/vllm_torchtpu/models/kimi_k3/megakernel/{__init__,config,layout}.py" = ["E501"]
-"src/vllm_torchtpu/models/kimi_k3/megakernel/common/**" = ["B023", "E501"]
-"src/vllm_torchtpu/models/kimi_k3/megakernel/runtime_shim/**" = ["E501", "S110"]
 "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/{__init__,load,mla_dcp,decode_megakernel,paged}.py" = ["B023", "E501", "E702", "T20"]
 "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/{helpers,prefill_megakernel}.py" = ["B023", "E501"]
 "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_moe/**" = ["E501"]
@@ -247,7 +244,6 @@ ignore = [
 [tool.ruff.format]
 docstring-code-format = true
 exclude = [
-    "src/vllm_torchtpu/models/kimi_k3/megakernel/common/**",
     "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/{load,mla_dcp,decode_megakernel,paged}.py",
     "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_megakernel.py",
     "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_moe/**",
