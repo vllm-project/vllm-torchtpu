@@ -32,9 +32,9 @@ L, T, MAX_GROUPS, PAGES = 11, 4, 32768, 1024
 
 def _case(nreq, n_req, seed=0):
     rng = np.random.default_rng(seed)
-    blocks = 2048
-    pool = jax.random.randint(
-        jax.random.PRNGKey(seed), (blocks, 512, 1, 4, 256), 0, 255, jnp.uint8
+    blocks = 512
+    pool = jnp.asarray(
+        rng.integers(0, 256, size=(blocks, 512, 1, 4, 256), dtype=np.uint8)
     ).view(jnp.float8_e4m3fn)
     tables = [
         (
@@ -52,10 +52,10 @@ def _case(nreq, n_req, seed=0):
     ctx = rng.integers(0, 100_000, size=n_req).astype(np.int32)
     ctx[-1] = 0  # a fresh request: no ring yet
     trig = jnp.asarray(rng.standard_normal((262144, 128)), jnp.bfloat16)
-    args = (pool, tables, slots, trig, jnp.arange(nreq * T, dtype=jnp.int32), starts,
+    args = (pool, tables, trig, jnp.arange(nreq * T, dtype=jnp.int32), starts,
             jnp.asarray(ctx))
     kw = dict(M=nreq * T, T=T, pages_per_seq=PAGES, max_groups=MAX_GROUPS,
-              layer_major_tables=True)
+              layer_major_tables=True, slots=slots)
     return args, kw
 
 
@@ -63,8 +63,11 @@ def _run(batched, args, kw, monkeypatch):
     monkeypatch.setattr(envs, "VLLM_TPU_MK_WHOLE_BATCHED_INPUTS", batched, raising=False)
     names = None
 
-    def fn(*a):
-        out = qsa_step_inputs(*a, **kw)
+    kw = dict(kw)
+    slots = kw.pop("slots")  # static: the layers' slots, not traced
+
+    def fn(pool, tables, *a):
+        out = qsa_step_inputs(pool, tables, slots, *a, **kw)
         out = {k: v for k, v in out.items() if k not in ("qsa_pool", "qsa_ck")}
         nonlocal names
         names = sorted(out)
