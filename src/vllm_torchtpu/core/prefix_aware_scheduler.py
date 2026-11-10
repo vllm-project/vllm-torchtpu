@@ -51,6 +51,33 @@ def _host_phases_every() -> int:
 
     return envs.VLLM_TPU_HOST_PHASES
 
+
+def _prompt_ids_ndarray() -> bool:
+    from vllm_torchtpu import envs
+
+    return envs.VLLM_TPU_PROMPT_IDS_NDARRAY
+
+
+def ship_prompt_ids_as_ndarray(scheduler_output, requests) -> None:
+    """Replace each new request's ``prompt_token_ids`` list in the scheduler
+    output by the int32 ndarray cached on its ``Request`` at add time.
+
+    Only the IPC copy changes: the engine's ``Request`` keeps its list. The
+    workers' consumers (``len``, slicing into ``token_ids_cpu``, indexing)
+    see the same values; the copy into ``token_ids_cpu`` becomes a memcpy
+    and the pickle carries one buffer instead of ~100K int objects.
+    """
+    for new_req in scheduler_output.scheduled_new_reqs:
+        ids = new_req.prompt_token_ids
+        if ids is None or not isinstance(ids, list):
+            continue
+        request = requests.get(new_req.req_id)
+        arr = getattr(request, "_prompt_ids_np", None)
+        # A streaming-input request may have grown its list since add time.
+        if arr is None or request.prompt_token_ids is not ids or len(arr) != len(ids):
+            continue
+        new_req.prompt_token_ids = arr
+
 _LOG_EVERY = 1000
 
 # Priority tiers: lower values admit earlier.
@@ -69,6 +96,7 @@ class PrefixAwareScheduler(AsyncScheduler):
     _hp_every = 0
     _hp_n = 0
     _hp_promote_ns = 0
+    _prompt_np = False
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -81,6 +109,7 @@ class PrefixAwareScheduler(AsyncScheduler):
         self._hp_samples: dict[str, list[float]] = {}
         self._hp_n = 0
         self._hp_promote_ns = 0
+        self._prompt_np = _prompt_ids_ndarray()
 
         logger.info("PrefixAwareScheduler ACTIVE (window=%d)", self.WINDOW)
 
@@ -123,13 +152,17 @@ class PrefixAwareScheduler(AsyncScheduler):
 
     def schedule(self, throttle_prefills: bool = False):
         if self._hp_every:
-            return self._schedule_timed(throttle_prefills)
-        queue = getattr(self, "kv_holding_waiting", None) or getattr(
-            self, "waiting", None
-        )
-        if queue is not None:
-            self._promote_warmest(queue)
-        return super().schedule(throttle_prefills)
+            out = self._schedule_timed(throttle_prefills)
+        else:
+            queue = getattr(self, "kv_holding_waiting", None) or getattr(
+                self, "waiting", None
+            )
+            if queue is not None:
+                self._promote_warmest(queue)
+            out = super().schedule(throttle_prefills)
+        if self._prompt_np and out.scheduled_new_reqs:
+            ship_prompt_ids_as_ndarray(out, self.requests)
+        return out
 
     # ---- VLLM_TPU_HOST_PHASES instrumentation (off by default) ----
     def _hp_note(self, name: str, us: float) -> None:
@@ -167,11 +200,13 @@ class PrefixAwareScheduler(AsyncScheduler):
         return out
 
     def add_request(self, request: Request) -> None:
-        if not self._hp_every:
-            return super().add_request(request)
-        t0 = time.perf_counter_ns()
+        t0 = time.perf_counter_ns() if self._hp_every else 0
+        if self._prompt_np and isinstance(request.prompt_token_ids, list):
+            # Once per request, at arrival (usually off the admit step).
+            request._prompt_ids_np = np.asarray(request.prompt_token_ids, np.int32)
         super().add_request(request)
-        self._hp_note("add_request", (time.perf_counter_ns() - t0) / 1e3)
+        if self._hp_every:
+            self._hp_note("add_request", (time.perf_counter_ns() - t0) / 1e3)
 
     def _hp_tick(self) -> None:
         self._hp_n += 1
