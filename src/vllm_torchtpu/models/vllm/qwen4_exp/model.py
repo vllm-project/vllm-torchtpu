@@ -42,6 +42,7 @@ from vllm.v1.kv_cache_interface import MambaSpec
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.compilation import bucket_filter
+from vllm_torchtpu.core.mamba_tail_fold import prefill_checkpoint_targets
 from vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op import (
     GdnStepMetadataCache,
 )
@@ -426,6 +427,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
             return hidden
         ple_slots = state_slots
         speculative = None
+        prefill_ckpt = None
         if self.pooled:
             per_layer = cast(
                 dict[str, AttentionMetadata], get_forward_context().attn_metadata
@@ -434,6 +436,12 @@ class Qwen4ExpDecoderLayer(nn.Module):
             ple_slots = ple_metadata.mamba_state_indices
             assert ple_slots is not None
             speculative = ple_speculative_state(ple_metadata)
+            ckpt = getattr(ple_metadata, "mamba_prefill_ckpt", None)
+            if ckpt is not None:
+                # VLLM_TPU_MAMBA_TAIL_FOLD: this PLE group's checkpoint blocks.
+                prefill_ckpt = prefill_checkpoint_targets(
+                    ckpt, ple_metadata.block_tables, ple_slots.shape[0]
+                )
         source = hidden
         if sp_pad:
             source = sp.unpad(hidden, input_ids.shape[0] // sp.tp_world_size())
@@ -446,6 +454,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
             ple_raw_embeddings,
             speculative,
             sequence_parallel=sequence_parallel,
+            prefill_ckpt=prefill_ckpt,
         )
         return hidden + sp.pad_shard(addend, sp_pad)
 

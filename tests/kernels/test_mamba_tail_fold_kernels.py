@@ -19,6 +19,12 @@ import numpy as np
 import pytest
 
 from vllm_torchtpu.kernels.gdn.v3 import metadata
+from vllm_torchtpu.kernels.qwen4_exp.ple import short_conv
+from vllm_torchtpu.kernels.qwen4_exp.pool import (
+    prefill_checkpoint_history,
+    read_region,
+    write_prefill_checkpoint,
+)
 
 
 def _per_seq(lens, start_seq, chunk, prefill_ckpt=None):
@@ -79,6 +85,54 @@ def test_per_seq_metadata_skips_null_or_misaligned_checkpoints():
         folded = _per_seq(lens, 0, chunk, (jnp.asarray(offsets), jnp.asarray(blocks)))
         n = int(folded.num_tiles)
         assert not np.asarray(folded.p_id_to_state_override.data)[:n].any()
+
+
+def test_ple_checkpoint_history_matches_the_split_chunk():
+    rng = np.random.default_rng(5)
+    channels, state_len, dilation = 64, 9, 3
+    lens = (1000, 700, 40)
+    starts = jnp.asarray(np.concatenate([[0], np.cumsum(lens)]), jnp.int32)
+    offsets = jnp.asarray([512, 512, 0], jnp.int32)
+    x = jnp.asarray(rng.normal(size=(sum(lens), channels)), jnp.bfloat16)
+    weight = jnp.asarray(rng.normal(size=(channels, 4)), jnp.bfloat16)
+    history = jnp.asarray(rng.normal(size=(3, state_len, channels)), jnp.bfloat16)
+    got = np.asarray(prefill_checkpoint_history(x, starts, offsets, state_len))
+    for r in range(2):
+        # The split's first step: the chunk's first `offset` tokens.
+        start, offset = int(starts[r]), int(offsets[r])
+        for initial in (False, True):
+            _, updated = short_conv(
+                x[start : start + offset],
+                weight,
+                history[r : r + 1],
+                jnp.asarray([0, offset], jnp.int32),
+                jnp.asarray([0], jnp.int32),
+                jnp.asarray([initial]),
+                dilation=dilation,
+                request_owned_history=True,
+            )
+            np.testing.assert_array_equal(got[r], np.asarray(updated)[0])
+
+
+@pytest.mark.tpu_test
+def test_ple_prefill_checkpoint_writes_only_checkpoint_blocks():
+    rng = np.random.default_rng(6)
+    channels, state_len = 128, 9
+    pool = jnp.asarray(rng.integers(-100, 100, size=(7, 1664, 1, 2, 256)), jnp.bfloat16)
+    before = np.asarray(pool).view(np.uint8).copy()
+    starts = jnp.asarray([0, 1000, 1700, 1740], jnp.int32)
+    offsets = jnp.asarray([512, 0, 512], jnp.int32)
+    ids = jnp.asarray([3, 4, 0], jnp.int32)  # row 1: no offset; row 2: null
+    x = jnp.asarray(rng.normal(size=(1740, channels)), jnp.bfloat16)
+    pool = jax.jit(
+        write_prefill_checkpoint, donate_argnums=(0,), static_argnames="state_len"
+    )(pool, x, starts, offsets, ids, state_len=state_len)
+    restored = read_region(
+        pool, jnp.asarray([3]), elements=state_len * channels, dtype=jnp.bfloat16
+    ).reshape(state_len, channels)
+    np.testing.assert_array_equal(np.asarray(restored), np.asarray(x[503:512]))
+    after = np.asarray(pool).view(np.uint8)
+    np.testing.assert_array_equal(after[[0, 1, 2, 4, 5, 6]], before[[0, 1, 2, 4, 5, 6]])
 
 
 # --- GDN kernel on the unified pool (TPU) ---------------------------------

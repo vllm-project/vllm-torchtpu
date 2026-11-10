@@ -100,6 +100,51 @@ def pooled_short_conv(
     return pool, output
 
 
+def prefill_checkpoint_history(
+    x: jax.Array, starts: jax.Array, offsets: jax.Array, state_len: int
+) -> jax.Array:
+    """``[requests, state_len, channels]``: the ``state_len`` inputs before
+    chunk token ``offsets[r]`` of each request, oldest first.
+
+    That is the history ``short_conv`` carries when a chunk ends there. It
+    reads only the current chunk, so it needs ``offsets[r] >= state_len``.
+    """
+    token_count = x.shape[0]
+    positions = (
+        starts[:-1, None].astype(jnp.int32)
+        + offsets.astype(jnp.int32)[:, None]
+        - state_len
+        + jnp.arange(state_len, dtype=jnp.int32)[None]
+    )
+    return x[jnp.clip(positions, 0, max(token_count - 1, 0))]
+
+
+def write_prefill_checkpoint(
+    pool: jax.Array,
+    x: jax.Array,
+    starts: jax.Array,
+    offsets: jax.Array,
+    ids: jax.Array,
+    *,
+    state_len: int,
+) -> jax.Array:
+    """Write each request's history at an internal prefill checkpoint.
+
+    Request ``r`` with ``offsets[r] > 0`` and ``ids[r] > 0`` stores its
+    history before chunk token ``offsets[r]`` (``prefill_checkpoint_history``)
+    to pool block ``ids[r]`` (VLLM_TPU_MAMBA_TAIL_FOLD). Offsets are whole
+    Mamba blocks, far longer than ``state_len``.
+    """
+    count = ids.shape[0]
+    if state_len == 0 or x.shape[0] == 0 or count == 0:
+        return pool
+    values = prefill_checkpoint_history(x, starts, offsets, state_len)
+    write = (offsets >= state_len) & (ids > 0)
+    return write_region(
+        pool, values.reshape(count, -1), jnp.where(write, ids, 0)
+    )
+
+
 def speculative_history_windows(
     x: jax.Array,
     history: jax.Array,
