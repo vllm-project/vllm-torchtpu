@@ -49,7 +49,7 @@ def _small_steps_block_scores(
     interp,
     scale_cache=None,
     scale_row=None,
-    num_heads=1,
+    index_heads=1,
 ):
     """`msa._block_scores` with 4 pages per grid step in both tile classes.
 
@@ -66,8 +66,11 @@ def _small_steps_block_scores(
         tables,
         cu_q,
         n,
-        pages_per_step=4,
-        small_pages_per_step=4,
+        **{
+            **msa.block_score_options(index_heads),
+            "pages_per_step": 4,
+            "small_pages_per_step": 4,
+        },
         interpret=interp,
         scale_cache=scale_cache,
         scale_row=scale_row,

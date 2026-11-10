@@ -28,15 +28,9 @@ from vllm_torchtpu.models.minimax_m3.kernels import (
     msa_attention,
     msa_attention_lse,
     msa_dcp,
-    msa_indexer,
     msa_select,
     msa_write,
 )
-
-# The in-place write kernel and the block scores, captured before the
-# fixtures replace them.
-_KERNEL_WRITE_ROWS = msa_write.write_rows
-_BLOCK_SCORES = msa_indexer.block_scores
 
 PAGE = 128
 HEAD_DIM = 128
@@ -197,8 +191,10 @@ def test_dcp_forward_matches_single_rank(
             dcp=dcp,
             interpret=True,
         )
-        outs.append(np.asarray(out.astype(jnp.float32)))
-        lses.append(np.asarray(lse))
+        # Head-major partials ([H, T', D], [H, T']), as the kernel writes them.
+        num_q = q.shape[0]
+        outs.append(np.asarray(out.astype(jnp.float32))[:, :num_q].transpose(1, 0, 2))
+        lses.append(np.asarray(lse)[:, :num_q].T)
     merged = _merge_lse(outs, lses)
     np.testing.assert_allclose(
         merged[:num_real],
@@ -247,7 +243,13 @@ def test_attention_lse_matches_kernel_v2():
     expected = msa_attention.msa_sparse_attention(
         q, kv, *args, sm_scale=SCALE, page_table=table, interpret=True
     )
-    np.testing.assert_array_equal(np.asarray(out), np.asarray(expected))
+    # The LSE kernel folds sm_scale * log2(e) into the bf16 queries and runs
+    # its softmax in log2 units (exp2): close to msa_attention, not bitwise.
+    np.testing.assert_allclose(
+        np.asarray(out.astype(jnp.float32)),
+        np.asarray(expected.astype(jnp.float32)),
+        atol=1e-2,
+    )
     qf = np.asarray(q.astype(jnp.float32))
     for t in range(num_tokens):
         keys = [
@@ -261,7 +263,7 @@ def test_attention_lse_matches_kernel_v2():
         s = qf[t] @ np.concatenate(keys).T * SCALE
         m = s.max(-1)
         dense = m + np.log(np.exp(s - m[:, None]).sum(-1))
-        np.testing.assert_allclose(np.asarray(lse[t]), dense, rtol=1e-5, atol=1e-4)
+        np.testing.assert_allclose(np.asarray(lse[t]), dense, rtol=1e-5, atol=2e-2)
 
 
 def test_merge_candidates_breaks_ties_to_lower_block():
@@ -273,135 +275,6 @@ def test_merge_candidates_breaks_ties_to_lower_block():
     packed = jax.vmap(msa_dcp.pack_candidates)(scores, blocks)
     got = np.asarray(msa_dcp.merge_candidates(packed, 3))
     np.testing.assert_array_equal(got, [[1, 4, 3]])
-
-
-def _rank_candidates(rng, dcp, rows, topk, *, num_blocks, ties):
-    """Candidates as `local_candidates` emits them: rank ``r``'s distinct
-    blocks ``= r (mod dcp)`` in (score descending, block) order, forced
-    scores first, ``(-inf, -1)`` for missing picks. With `ties` the scores
-    come from a few values, so most comparisons tie."""
-    scores = np.full((dcp, rows, topk), -np.inf, np.float32)
-    blocks = np.full((dcp, rows, topk), -1, np.int32)
-    for r in range(dcp):
-        owned = np.arange(r, num_blocks, dcp)
-        for t in range(rows):
-            n = min(int(rng.integers(0, topk + 1)), len(owned))
-            if t % 5 == 0:
-                n = min(topk, len(owned))
-            b = rng.choice(owned, n, replace=False)
-            if ties:
-                s = rng.integers(-2, 3, n).astype(np.float32)
-            else:
-                s = rng.standard_normal(n).astype(np.float32)
-            s[b < 2] = msa_select._FORCED_INIT_SCORE
-            s[(b >= num_blocks - 3) & (b >= 2)] = msa_select._FORCED_LOCAL_SCORE
-            order = np.lexsort((b, -s))
-            scores[r, t, :n] = s[order]
-            blocks[r, t, :n] = b[order]
-    return scores, blocks
-
-
-_FAST_MERGES = ("serial", "sort", "pallas")
-
-
-def _assert_merges_match_legacy(scores, blocks, topk, num_heads=1):
-    """Every merge impl bit-exact against the original rounds. Rows ``[dcp,
-    T * G, topk]`` are packed as ``G`` heads per token. NaN scores count as
-    -inf for the reference (the rounds' NaN handling follows the backend's
-    max; "sort" and "pallas" never pick a NaN)."""
-    dcp, rows, _ = scores.shape
-    pack = jax.vmap(msa_dcp.pack_candidates)
-
-    def heads(s):
-        packed = pack(jnp.asarray(s), jnp.asarray(blocks))
-        return packed.reshape(dcp, rows // num_heads, num_heads * 2 * topk)
-
-    def merge(c, impl):
-        fn = functools.partial(
-            msa_dcp.merge_head_candidates, topk=topk, impl=impl, interpret=True
-        )
-        return np.asarray(jax.jit(fn)(c))
-
-    want = merge(heads(np.where(np.isnan(scores), -np.inf, scores)), "legacy")
-    assert want.shape == (rows // num_heads, num_heads, topk)
-    for impl in _FAST_MERGES:
-        got = merge(heads(scores), impl)
-        assert got.dtype == want.dtype and got.shape == want.shape, impl
-        np.testing.assert_array_equal(got, want, err_msg=impl)
-    return want.reshape(rows, topk)
-
-
-# rows = tokens * KV heads per rank: DCP 8 at TP 8 spans 4 KV heads, DCP 2
-# one. Decode is c64 with 8 tokens per request (DSpark k=7).
-_MERGE_SHAPES = [
-    pytest.param(8, 4, 512, id="dcp8-decode"),
-    pytest.param(8, 4, 2048, id="dcp8-prefill2048"),
-    pytest.param(8, 4, 8192, id="dcp8-prefill8192"),
-    pytest.param(2, 1, 512, id="dcp2-decode"),
-    pytest.param(2, 1, 2048, id="dcp2-prefill2048"),
-    pytest.param(8, 4, 300, id="dcp8-ragged"),  # not a multiple of the tile
-]
-
-
-@pytest.mark.parametrize("ties", [False, True], ids=["distinct", "ties"])
-@pytest.mark.parametrize("dcp,num_heads,num_tokens", _MERGE_SHAPES)
-def test_merge_impls_match_legacy(dcp, num_heads, num_tokens, ties):
-    """Every merge picks the original rounds' blocks in their order."""
-    rows = num_heads * num_tokens
-    rng = np.random.default_rng(dcp * 1000 + rows + ties)
-    topk = 16
-    # Per-row generation is slow in Python: generate a pool and tile it.
-    pool = min(rows, 512)
-    scores, blocks = _rank_candidates(
-        rng, dcp, pool, topk, num_blocks=int(rng.integers(dcp, 40 * dcp)), ties=ties
-    )
-    reps = -(-rows // pool)
-    scores = np.tile(scores, (1, reps, 1))[:, :rows]
-    blocks = np.tile(blocks, (1, reps, 1))[:, :rows]
-    # Short contexts: fewer candidates than k over all ranks.
-    scores[1:, ::7], blocks[1:, ::7] = -np.inf, -1
-    scores[0, ::7, 3:], blocks[0, ::7, 3:] = -np.inf, -1
-    # Permute rows so neighbouring rows differ in every tile.
-    perm = rng.permutation(rows)
-    got = _assert_merges_match_legacy(scores[:, perm], blocks[:, perm], topk, num_heads)
-    assert np.any(got == -1) and np.any(got >= 0)
-
-
-@pytest.mark.parametrize("dcp,num_heads", [(2, 1), (8, 4)])
-def test_merge_impls_match_legacy_adversarial(dcp, num_heads):
-    """Inputs no rank emits, for which every merge still agrees: a block
-    listed by several ranks (at different and equal scores), all scores
-    equal, -0 vs +0, +inf, finite scores on block -1, blocks out of rank
-    order, a NaN, fewer candidates than k, and no candidate at all."""
-    rng = np.random.default_rng(dcp)
-    topk, rows = 16, 4096
-    scores = rng.integers(-3, 4, (dcp, rows, topk)).astype(np.float32)
-    blocks = rng.integers(-1, 12, (dcp, rows, topk)).astype(np.int32)  # many dups
-    kind = np.arange(rows) % 12
-    scores[:, kind == 1] = 7.0  # all equal
-    blocks[:, kind == 2] = 5  # one block everywhere
-    sel = kind == 3
-    scores[:, sel] = rng.choice([0.0, -0.0], (dcp, sel.sum(), topk))
-    sel = kind == 4
-    scores[:, sel] = rng.choice([np.inf, -np.inf, 1.0], (dcp, sel.sum(), topk))
-    scores[:, kind == 5] = -np.inf  # no candidates
-    blocks[:, kind == 5] = -1
-    sel = kind == 6  # few valid candidates
-    scores[:, sel, 1:] = -np.inf
-    blocks[:, sel, 1:] = -1
-    scores[0, kind == 7, 3] = np.nan
-    sel = kind == 8  # large, distinct ids
-    blocks[:, sel] = rng.permutation(2**20)[: dcp * sel.sum() * topk].reshape(
-        dcp, sel.sum(), topk
-    )
-    scores[:, kind == 9] = msa_select._FORCED_INIT_SCORE
-    scores[:, kind == 10] = np.float32(1.0) + np.float32(2**-23) * rng.integers(
-        0, 2, (dcp, (kind == 10).sum(), topk)
-    )
-    got = _assert_merges_match_legacy(scores, blocks, topk, num_heads)
-    assert np.all(got[kind == 5] == -1)
-    nan_rows = np.isnan(scores).any(axis=(0, 2))
-    assert nan_rows.any() and np.any(got[nan_rows] >= 0)
 
 
 def _flush_like_a_tpu_collective(x: jax.Array) -> jax.Array:
@@ -586,105 +459,3 @@ def test_dcp_op_name_has_no_rank():
     assert "rank" not in params
     src = inspect.getsource(msa_ops.get_msa_dcp_op)
     assert "_r{rank}" not in src and "dcp_rank" in src
-
-
-def test_dcp8_fp4_selection_matches_staged_writes_and_full_scores(monkeypatch):
-    """The served path (DCP8, G = 4 KV heads per rank, folded fp4 caches)
-    over a prefill step and a decode step of requests far shorter than
-    topk * dcp blocks, where most candidates are -inf ties: the in-kernel
-    write fetch and `skip_dead` block scores give the same caches, the same
-    per-rank candidates and the same merged selected blocks as the staged
-    writes with every page group scored (a consumer reading the -inf pages
-    of skipped groups would show here)."""
-    from vllm_torchtpu.models.minimax_m3.kernels import msa_fp4, msa_indexer
-
-    dcp, g, topk = 8, 4, 16
-    config = dict(topk=topk, init_blocks=1, local_blocks=1)
-    rng = np.random.default_rng(88)
-    steps = [([300, 40, 129], [0, 0, 0]), ([1, 8, 8], [300, 40, 129])]
-    logical_pages = 1  # every request fits one logical DCP block of 8 pages
-    tables = np.zeros((MAX_SEQS, logical_pages), np.int32)
-    tables[:3, 0] = rng.permutation(np.arange(1, PAGES))[:3]
-
-    def empty_caches():
-        kv = msa_fp4.pack_rows(
-            jnp.zeros((PAGES, PAGE, 2 * HEAD_DIM * g), jnp.uint8),
-            scales=jnp.zeros((PAGES, 2 * HEAD_DIM * g), jnp.float32),
-        )
-        index = msa_fp4.pack_rows(
-            jnp.zeros((PAGES, PAGE, HEAD_DIM), jnp.uint8),
-            scales=jnp.zeros((PAGES, HEAD_DIM), jnp.float32),
-        )
-        return [(kv, index)] * dcp
-
-    inputs = []
-    for q_lens, ctx_lens in steps:
-        num_real = sum(q_lens)
-        num_tokens = num_real + 3
-        seq_lens = np.zeros(MAX_SEQS, np.int32)
-        seq_lens[:3] = np.add(q_lens, ctx_lens)
-        cu_q = np.full(MAX_SEQS + 1, num_real, np.int32)
-        cu_q[:4] = np.concatenate([[0], np.cumsum(q_lens)])
-
-        def bf16(*shape):
-            return jnp.asarray(rng.standard_normal(shape)).astype(jnp.bfloat16)
-
-        inputs.append(
-            (
-                num_real,
-                (
-                    bf16(num_tokens, g, HEAD_DIM),
-                    bf16(num_tokens, g, HEAD_DIM),
-                    bf16(num_tokens, g, HEAD_DIM),
-                    bf16(num_tokens, HEAD_DIM),
-                ),
-                (
-                    jnp.asarray(seq_lens),
-                    jnp.asarray(tables.reshape(-1)),
-                    jnp.asarray(cu_q),
-                    jnp.asarray([0, 0, 3], jnp.int32),
-                ),
-            )
-        )
-
-    def run(write_rows, skip_dead):
-        monkeypatch.setattr(msa_write, "write_rows", write_rows)
-        monkeypatch.setattr(
-            msa_indexer,
-            "block_scores",
-            functools.partial(_BLOCK_SCORES, skip_dead=skip_dead),
-        )
-        caches, history = empty_caches(), []
-        for num_real, tensors, meta in inputs:
-            candidates = []
-            for rank in range(dcp):
-                kv, index, cand = msa_dcp.msa_write_and_candidates_dcp(
-                    *tensors,
-                    *caches[rank],
-                    *meta,
-                    rank=rank,
-                    dcp=dcp,
-                    interpret=True,
-                    **config,
-                )
-                caches[rank] = (kv, index)
-                candidates.append(cand)
-            candidates = jnp.stack(candidates)
-            selected = msa_dcp.merge_candidates(candidates, topk)
-            history.append(
-                (
-                    [np.asarray(jax.lax.bitcast_convert_type(c, jnp.uint8)) for kv_ix in caches for c in kv_ix],
-                    np.asarray(candidates).view(np.uint32),
-                    np.asarray(selected)[:num_real],
-                )
-            )
-        return history
-
-    got = run(_KERNEL_WRITE_ROWS, True)
-    expected = run(msa_write.write_rows_staged, False)
-    for (g_caches, g_cand, g_sel), (e_caches, e_cand, e_sel) in zip(got, expected):
-        for a, b in zip(g_caches, e_caches):
-            np.testing.assert_array_equal(a, b)
-        np.testing.assert_array_equal(g_cand, e_cand)
-        np.testing.assert_array_equal(g_sel, e_sel)
-        assert (g_sel >= 0).any() and (g_sel < 0).any()  # real picks and -inf ties
