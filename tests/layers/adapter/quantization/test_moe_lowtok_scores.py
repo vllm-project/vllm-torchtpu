@@ -96,6 +96,11 @@ def test_disabled_builds_and_logs_nothing(monkeypatch):
     scores.log_summary()
 
 
+def test_layer_without_expert_parallelism_is_declined_not_refused(enabled):
+    assert scores.prebuild(method(), make_layer(use_ep=False), "silu") is None
+    scores.log_summary()
+
+
 def test_plain_softmax_router_moves_into_the_kernel(enabled):
     assert scores.prebuild(method(), make_layer(), "silu") is enabled
     scores._build_op.assert_called_once_with(10)
