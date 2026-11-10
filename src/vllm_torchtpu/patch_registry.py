@@ -109,6 +109,8 @@ PATCHES = (
         "patch_mamba_checkpoint_retention",
         _ENGINE,
     ),
+    # Outermost split wrapper: counts what the wrapped split folds.
+    Patch("vllm_torchtpu.core.mamba_tail_fold:patch_mamba_tail_fold", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_kimi_kda_layer_counts", _ACTIVE),
     # Process setup and runner selection.
     Patch("vllm_torchtpu:_patch_multiproc_worker_global_rank_env", _ACTIVE),
