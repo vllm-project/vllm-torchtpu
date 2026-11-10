@@ -33,7 +33,11 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from vllm.config import CacheConfig, VllmConfig
-from vllm.distributed import tensor_model_parallel_all_gather
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
+)
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -211,6 +215,19 @@ def _flipped_weight(linear: nn.Module) -> torch.Tensor | None:
     return linear.weight
 
 
+def _column_parallel(linear: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    """``linear(x)`` for a TP-replicated linear: each rank computes 1/tp of the
+    output columns, reading 1/tp of the weight, then the ranks all-gather."""
+    weight = _flipped_weight(linear)
+    tp = get_tensor_model_parallel_world_size()
+    if weight is None or tp == 1 or weight.shape[1] % tp:
+        return linear(x)
+    cols = weight.shape[1] // tp
+    start = get_tensor_model_parallel_rank() * cols
+    part = torch.matmul(x, weight[:, start : start + cols])
+    return tensor_model_parallel_all_gather(part, dim=-1)
+
+
 def _context_kv(attn: nn.Module, context: torch.Tensor):
     """A draft layer's K and V of the context tokens. Only the qkv_proj's K/V
     columns when its weight is a plain matrix: the Q rows (4/5 of this rank's
@@ -254,7 +271,9 @@ class MiniMaxM3DSparkModel(Qwen3DSparkModel):
         roped at the context positions. Runs every projection through its
         layer, so the MXFP8 linears keep their checkpoint numerics.
         """
-        context = self.hidden_norm(self.fc(target_hidden_states))
+        # fc's weight is replicated on every TP rank (360 MiB): split its
+        # columns over the ranks rather than read it whole on each.
+        context = self.hidden_norm(_column_parallel(self.fc, target_hidden_states))
         num_tokens = context.shape[0]
         for layer, layer_metadata in zip(self.layers, metadata, strict=True):
             attn = layer.self_attn
