@@ -844,9 +844,10 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
 
         return (
             enable_pipelined_collective_and_compute()
-            or (envs.USE_MOE_FUSED_EP_KERNEL and (
-                fused_moe_ep_v3_supported(self) or fused_moe_ep_v2_supported(self)
-            ))
+            or (
+                envs.USE_MOE_FUSED_EP_KERNEL
+                and (fused_moe_ep_v3_supported(self) or fused_moe_ep_v2_supported(self))
+            )
             or adaptive_moe.adaptive_fused_moe_supported(self)
             or envs.TPU_MOE_FP8_ALL_GATHER
         )
@@ -1079,8 +1080,13 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         )
         if layer.moe_config.moe_parallel_config.use_ep:
             moe_routing.validate_linear_ep_placement(layer)
+            from vllm.config import get_current_vllm_config
+
             from vllm_torchtpu.layers.adapter import small_all_reduce_op
-            small_all_reduce_op.prebuild()
+
+            # Under the loader's config context; a no-op unless the
+            # tpu_collectives.small_all_reduce option is on.
+            small_all_reduce_op.prebuild(get_current_vllm_config())
         moe_routing.register_experts_start_buffer(layer, device=layer.w13_weight.device)
         self._moe_lowtok_scores_op = moe_lowtok_scores.prebuild(
             self, layer, activation_str
@@ -1209,6 +1215,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         from vllm_torchtpu.layers.adapter.fused_moe_ep_v3 import (
             fused_moe_ep_supported as fused_moe_ep_v3_supported,
         )
+        from vllm_torchtpu.layers.adapter.fused_moe_ep_v3 import step_min_tokens
 
         if fused_moe_ep_supported(self):
             return fused_moe_ep(
@@ -1238,9 +1245,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 x,
                 router_logits,
                 activation_str,
-                use_fused_kernel=_fused_kernel_takes(
-                    x.shape[0], envs.TPU_MOE_FUSED_EP_STEP_MIN_TOKENS
-                ),
+                use_fused_kernel=_fused_kernel_takes(x.shape[0], step_min_tokens()),
             )
         if moe_lowtok_scores.serves(self._moe_lowtok_scores_op, x):
             op = self._moe_lowtok_scores_op
@@ -1323,9 +1328,10 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 layer.w13_weight_scale_inv,
                 layer.w2_weight_scale_inv,
             )
-            if getattr(layer, "_lowtok_has_copies", False) and getattr(
-                layer, "_lowtok_tables", None
-            ) is not None:
+            if (
+                getattr(layer, "_lowtok_has_copies", False)
+                and getattr(layer, "_lowtok_tables", None) is not None
+            ):
                 zero = (
                     layer._lowtok_tables[:1]
                     + layer._lowtok_prim[:1]
@@ -1345,9 +1351,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         sequence_parallel_flag = getattr(
             layer.moe_config, "is_sequence_parallel", False
         )
-        dispatched = ep.dispatch_router_logits(
-            x, router_logits, sequence_parallel_flag
-        )
+        dispatched = ep.dispatch_router_logits(x, router_logits, sequence_parallel_flag)
         assert len(dispatched) == 2
         gathered_x, gathered_logits = dispatched
         out = self.apply_monolithic_external_dispatch(
@@ -1366,14 +1370,16 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         from vllm_torchtpu.layers.adapter.fused_moe_ep_v3 import (
             retain_fused_ep_graph_inputs,
         )
+
         if moe_lowtok_scores.serves(self._moe_lowtok_scores_op, x):
             op = self._moe_lowtok_scores_op
             out = moe_lowtok_scores.apply(op, layer, x, router_logits)
             return retain_fused_ep_graph_inputs(out)
         topk_weights, topk_ids = moe_routing.route(layer, x, router_logits)
-        if getattr(layer, "_lowtok_has_copies", False) and getattr(
-            layer, "_lowtok_tables", None
-        ) is not None:
+        if (
+            getattr(layer, "_lowtok_has_copies", False)
+            and getattr(layer, "_lowtok_tables", None) is not None
+        ):
             zero = (
                 layer._lowtok_tables[:1]
                 + layer._lowtok_prim[:1]
@@ -1402,7 +1408,6 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         }
         out = fused_moe_gmm(**kwargs)
         return retain_fused_ep_graph_inputs(out)
-
 
 
 class ChannelQuantScaleParameterTPU(ChannelQuantScaleParameter):
@@ -1886,7 +1891,6 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         setattr(layer, KEEP_VLLM_LAYOUT_ATTR, True)
         return layer
 
-
     def apply_prequant(
         self,
         layer: torch.nn.Module,
@@ -1957,6 +1961,7 @@ def _fused_kernel_takes(rows: int, gate: int) -> bool:
     tp = tensor_parallel_size()
     if tp > 1:
         from vllm_torchtpu.layers.adapter import sequence_parallel as _sp
+
         if not _sp.is_active():
             return False
         if _sp.min_rows() // tp >= gate:
