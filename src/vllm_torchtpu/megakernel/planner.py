@@ -91,8 +91,11 @@ def _discover_schedule(
 ]:
     """Derive repeating cycle `(period, branch_counts)`, layer counts, and AR slots.
 
-    Note: `SwitchSlot` currently models repeating periodic schedules
-    (`L % period == 0`) with at most 2 active branches per slot. Non-repeating
+    Note: `SwitchSlot` currently models repeating periodic schedules with at most 2
+    active branches per slot. `L % period != 0` is a partial last cycle: the first
+    `L % period` layers of the cycle (whole branches in branch order, so every
+    cycle-relative mapping still holds; e.g. Qwen3.8 layers 3..47, the cycle QSA, GDN,
+    GDN, GDN ending on its QSA layer). Non-repeating
     prefix layouts (e.g. GLM's 3 dense + 75 MoE layers) will be represented by a
     per-layer schedule table when GLM lands.
     """
@@ -117,8 +120,7 @@ def _discover_schedule(
                         "period and branch_counts"
                     )
 
-    assert L % period == 0, (L, period)
-    n_cycles = L // period
+    n_cycles, rem = divmod(L, period)
 
     block_layer_counts: dict[str, int] = {}
     block_branch_idx: dict[str, int | None] = {}
@@ -143,8 +145,11 @@ def _discover_schedule(
                 block_layer_counts[b.name] = L
                 block_branch_idx[b.name] = None
             else:
+                start = 0
                 for b_idx, (b, c_b) in enumerate(zip(active, counts)):
-                    block_layer_counts[b.name] = n_cycles * c_b
+                    tail = min(c_b, max(0, rem - start))  # partial last cycle
+                    block_layer_counts[b.name] = n_cycles * c_b + tail
+                    start += c_b
                     block_branch_idx[b.name] = b_idx
         else:
             red = s.reduction
@@ -326,6 +331,10 @@ def plan(
 
     t_cycle = sum(c_b * t_b for c_b, t_b in zip(branch_counts, branch_tiles_list))
     T_TOTAL = (g.L // period) * t_cycle
+    rem, lo = g.L % period, 0
+    for c_b, t_b in zip(branch_counts, branch_tiles_list):  # partial last cycle
+        T_TOTAL += min(c_b, max(0, rem - lo)) * t_b
+        lo += c_b
 
     lay: dict[str, tuple[int, int]] = {}
     offset = 0

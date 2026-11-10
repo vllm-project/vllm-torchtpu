@@ -103,7 +103,7 @@ def main():
     g = qwen38.FULL
     tp, rep = NamedSharding(mesh, P("tp")), NamedSharding(mesh, P())
     L = a.L
-    n_att = max(1, L // 4)
+    n_att = max(1, -(-L // 4))  # --L 45: layers 3..47 (VLLM_TPU_MK_WHOLE_L45)
     n_gdn = L - n_att
     n_qsa = n_att + int(a.tail)
     layers = [
