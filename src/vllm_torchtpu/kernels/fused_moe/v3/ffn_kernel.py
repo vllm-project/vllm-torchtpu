@@ -16,6 +16,7 @@
 import dataclasses
 import logging
 import threading
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -515,8 +516,8 @@ def build_ffn_kernel(
                 )
             operands = dataclasses.replace(
                 operands,
-                w1=operands.w1.bitcast(jnp.uint32),
-                w2=operands.w2.bitcast(jnp.uint32),
+                w1=cast(Any, operands.w1).bitcast(jnp.uint32),
+                w2=cast(Any, operands.w2).bitcast(jnp.uint32),
             )
         outputs = Outputs(*(next(it) for _ in dataclasses.fields(Outputs)))
         scratch = Scratch(**take_fields(it, scratch_present))
@@ -596,7 +597,7 @@ def build_ffn_kernel(
                     operands.transport_send_sem,
                     operands.transport_receive_sems,
                     ctx.me,
-                    operands.tokens.shape[0] // num_shards,
+                    cast(Any, operands.tokens).shape[0] // num_shards,
                     num_shards,
                     mesh_axes=build.mesh_axes,
                 )
