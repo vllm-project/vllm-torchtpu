@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# ruff: noqa: E501
 """Gated q split + per-head RMS norm + partial NeoX RoPE in one Pallas call.
 
 Inputs, tiled along rows in VMEM:
