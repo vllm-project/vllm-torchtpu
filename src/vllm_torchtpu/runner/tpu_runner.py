@@ -9182,44 +9182,21 @@ class TPUModelRunner(GPUModelRunner):
                         synchronize_tensors([out_i32, *out_sub_ext, *out_sub_ext_i64])
                     logger.info("  -- num_tokens: %d, next_len: %d", num_tokens, nlen)
 
-    def _precompile_rejection_sampler(self) -> None:
-        """Warm the spec-decode verify path so it doesn't recompile at runtime.
+    def _precompile_async_spec_assembly(self) -> None:
+        """Warm the async-spec assembly and fused rejection bookkeeping.
 
-        The rejection sampler is ``@torch.compile(backend="tpu",
-        dynamic=False)`` -> a fresh graph per input shape, and the
-        ``logits[...]`` gathers around it are eager. None are covered by
-        ``_precompile_sampling_subgraphs`` (non-spec sampling only) or
-        ``drafter.precompile()`` (draft forward only), so they recompile every
-        time the verify length (``padded_logits_length``) lands in a new
-        num-tokens bucket as requests finish and the batch shrinks. Replay the
-        verify inner body (``_sample_spec_verify_chunk``) at every
-        ``(padded_logits_length, padded_num_reqs)`` bucket the runtime can
-        produce so the real call is a cache hit. Shared sync + async.
-
-        Both verify sub-branches are distinct ``dynamic=False`` graphs, so warm
-        each: greedy (``do_sampling=False`` ->
-        ``_greedy_rejection_sample_with_segment``, prelude
-        ``spec_bonus_and_target_logits``) and non-greedy (``do_sampling=True``
-        -> ``_random_rejection_sample_with_segment``, prelude
-        ``spec_gather_bonus_and_target_logits``). Which one runs is decided per
-        step by ``input_batch.all_greedy`` and ``grammar_output``, so both are
-        reachable and must be pre-compiled here; the greedy + structured-output
-        combination reuses graphs warmed by these two passes.
+        Under async scheduling, the step after a spec-verify step assembles
+        the substitution source and the rejected-draft counts on device (one
+        chunk, two chunks, or the prefill bootstrap), and subtracts the
+        rejected drafts with placeholder or draft-token substitution in one
+        program. Each is ``dynamic=False``, so warm every request and token
+        bucket the runtime can produce. Runs before
+        ``_precompile_rejection_sampler``, as part of the same drafter warmup.
         """
-        if not (self._is_async_drafter):
+        if not self._is_async_drafter:
             return
         assert self.speculative_config is not None
-        assert self.rejection_sampler is not None
         k = self.speculative_config.num_speculative_tokens
-        # The verify chunk samples at most num_reqs*(K+1) positions; bound the
-        # padded_logits_length sweep to the bucket that covers the full batch.
-        # Use min here because num_reqs*(K+1) can exceed max_num_batched_tokens
-        # (which is the largest bucket), and logits rows never exceed the largest
-        # bucket.
-        max_logits_len = _get_padded_token_len(
-            self.num_tokens_paddings,
-            min(self.max_num_reqs * (k + 1), self.num_tokens_paddings[-1]),
-        )
         from vllm_torchtpu.runner.tpu_runner_async_output import (
             _compiled_assemble_prefill_bootstrap,
             _compiled_assemble_spec_and_rejected,
@@ -9382,6 +9359,45 @@ class TPUModelRunner(GPUModelRunner):
                             logits_idx_warm,
                         )
                         synchronize_tensors((*out_sub, *out_sub_pl, *out_sub_dr))
+
+    def _precompile_rejection_sampler(self) -> None:
+        """Warm the spec-decode verify path so it doesn't recompile at runtime.
+
+        The rejection sampler is ``@torch.compile(backend="tpu",
+        dynamic=False)`` -> a fresh graph per input shape, and the
+        ``logits[...]`` gathers around it are eager. None are covered by
+        ``_precompile_sampling_subgraphs`` (non-spec sampling only) or
+        ``drafter.precompile()`` (draft forward only), so they recompile every
+        time the verify length (``padded_logits_length``) lands in a new
+        num-tokens bucket as requests finish and the batch shrinks. Replay the
+        verify inner body (``_sample_spec_verify_chunk``) at every
+        ``(padded_logits_length, padded_num_reqs)`` bucket the runtime can
+        produce so the real call is a cache hit. Shared sync + async.
+
+        Both verify sub-branches are distinct ``dynamic=False`` graphs, so warm
+        each: greedy (``do_sampling=False`` ->
+        ``_greedy_rejection_sample_with_segment``, prelude
+        ``spec_bonus_and_target_logits``) and non-greedy (``do_sampling=True``
+        -> ``_random_rejection_sample_with_segment``, prelude
+        ``spec_gather_bonus_and_target_logits``). Which one runs is decided per
+        step by ``input_batch.all_greedy`` and ``grammar_output``, so both are
+        reachable and must be pre-compiled here; the greedy + structured-output
+        combination reuses graphs warmed by these two passes.
+        """
+        if not (self._is_async_drafter):
+            return
+        assert self.speculative_config is not None
+        assert self.rejection_sampler is not None
+        k = self.speculative_config.num_speculative_tokens
+        # The verify chunk samples at most num_reqs*(K+1) positions; bound the
+        # padded_logits_length sweep to the bucket that covers the full batch.
+        # Use min here because num_reqs*(K+1) can exceed max_num_batched_tokens
+        # (which is the largest bucket), and logits rows never exceed the largest
+        # bucket.
+        max_logits_len = _get_padded_token_len(
+            self.num_tokens_paddings,
+            min(self.max_num_reqs * (k + 1), self.num_tokens_paddings[-1]),
+        )
         # The (padded_logits_length, padded_num_reqs) shapes, in the order
         # the runtime buckets follow.
         pairs = []
@@ -9857,6 +9873,7 @@ class TPUModelRunner(GPUModelRunner):
                 self._check_draft_buckets()
             elif self._is_async_drafter:
                 self._async_drafter.precompile()
+                self._precompile_async_spec_assembly()
                 self._precompile_rejection_sampler()
                 self._precompile_spec_logprobs()
                 # The isolated precompiles above emit standalone fused

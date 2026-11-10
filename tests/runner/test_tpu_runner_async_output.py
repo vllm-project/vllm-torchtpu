@@ -12,11 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 import torch
 from vllm.v1.outputs import LogprobsTensors, ModelRunnerOutput
 
+from vllm_torchtpu.runner import tpu_runner
+from vllm_torchtpu.runner import tpu_runner_async_output as async_output
 from vllm_torchtpu.runner.tpu_runner import _spec_logprob_row_tokens
 from vllm_torchtpu.runner.tpu_runner_async_output import (
     INVALID_TOKEN_ID,
@@ -512,3 +517,80 @@ def test_subtract_and_substitute_draft_token_ids_and_two_chunk_mamba_offsets():
     # 1 token -> offset 0
     assert int(read_offsets[2]) == 1
     assert int(read_offsets[5]) == 0
+
+
+_ASSEMBLY_PROGRAMS = (
+    "_compiled_pad_non_spec_next_tokens",
+    "_compiled_assemble_prefill_bootstrap",
+    "_compiled_assemble_spec_and_rejected",
+    "_compiled_assemble_two_chunks_spec_and_rejected",
+    "_compiled_subtract_num_rejected_tokens",
+    "_compiled_subtract_and_substitute_placeholder_token",
+    "_compiled_subtract_and_substitute_draft_token_ids",
+)
+
+
+def _assembly_warmup_calls(monkeypatch, *, async_scheduling=True, most=None):
+    """Run _precompile_async_spec_assembly on a stub runner and record the
+    shapes each assembly program was warmed with."""
+    calls: dict[str, list[tuple]] = {name: [] for name in _ASSEMBLY_PROGRAMS}
+
+    def recorder(name):
+        def record(*args):
+            calls[name].append(
+                tuple(
+                    tuple(a.shape) if isinstance(a, torch.Tensor) else a for a in args
+                )
+            )
+            return (torch.zeros(1),)
+
+        return record
+
+    for name in _ASSEMBLY_PROGRAMS:
+        monkeypatch.setattr(async_output, name, recorder(name))
+    monkeypatch.setattr(tpu_runner, "synchronize_tensors", lambda *a, **k: None)
+    runner = SimpleNamespace(
+        _is_async_drafter=True,
+        speculative_config=SimpleNamespace(num_speculative_tokens=3),
+        scheduler_config=SimpleNamespace(async_scheduling=async_scheduling),
+        max_num_reqs=8,
+        num_reqs_paddings=[2, 4, 8],
+        num_tokens_paddings=[8, 16, 32],
+        num_reqs_max_model_len=8,
+        most_model_len=None if most is None else 128,
+        num_reqs_most_model_len=most,
+        uses_mrope=False,
+        device=torch.device("cpu"),
+        _precompile_timed=lambda name: contextlib.nullcontext(),
+    )
+    tpu_runner.TPUModelRunner._precompile_async_spec_assembly(runner)  # type: ignore[arg-type]
+    return calls
+
+
+def test_async_spec_assembly_warmup_covers_every_bucket(monkeypatch):
+    """The assembly programs the step after a spec verify runs are warmed at
+    every request bucket, every two-chunk split that fits max_num_reqs, and
+    every token bucket for each request-count layout."""
+    calls = _assembly_warmup_calls(monkeypatch, most=4)
+    k, max_num_reqs, bound = 3, 8, 8 * (1 + 3)
+    assert calls["_compiled_pad_non_spec_next_tokens"] == [
+        ((n, 1), k) for n in (2, 4, 8)
+    ]
+    boot_reqs = {c[0][0] for c in calls["_compiled_assemble_prefill_bootstrap"]}
+    assert boot_reqs == {2, 4, 8}
+    assert all(c[2] == bound for c in calls["_compiled_assemble_prefill_bootstrap"])
+    asm_reqs = {c[0][0] for c in calls["_compiled_assemble_spec_and_rejected"]}
+    assert asm_reqs == {2, 4, 8}
+    two = calls["_compiled_assemble_two_chunks_spec_and_rejected"]
+    assert two and all(c[0][0] + c[3][0] <= max_num_reqs for c in two)
+    assert {(c[0][0], c[3][0]) for c in two} >= {(2, 2), (2, 4), (4, 4)}
+    for name in _ASSEMBLY_PROGRAMS[4:]:
+        warmed = {(c[0][0], c[1][-1]) for c in calls[name]}
+        # Every token bucket, for both the max-model-len and the
+        # most-model-len request layouts.
+        assert warmed == {(knr, t) for knr in (8, 4) for t in (8, 16, 32)}, name
+
+
+def test_async_spec_assembly_warmup_needs_async_scheduling(monkeypatch):
+    calls = _assembly_warmup_calls(monkeypatch, async_scheduling=False)
+    assert all(not c for c in calls.values())
