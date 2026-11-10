@@ -284,3 +284,9 @@ def test_device_ids_patch_is_installed_once(monkeypatch):
     mpdp.install_device_ids_patch()
     assert arg_utils.EngineArgs._resolve_device_ids is first
     assert first._tpu_multiport_dp_patch
+
+
+def test_section_is_registered():
+    from vllm_torchtpu import additional_config_sections
+
+    assert mpdp.SECTION in additional_config_sections.KNOWN_SECTIONS
