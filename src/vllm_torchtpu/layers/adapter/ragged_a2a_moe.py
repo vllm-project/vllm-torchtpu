@@ -329,7 +329,7 @@ def _get_op(
         "permute threshold %d routed rows (full decode step: %d routed rows) | "
         "streamed combine %s, owner combine %s, row gather %s, row scatter %s, "
         "owner tail %s, "
-        "routing dma %s, send index rows minor %s",
+        "routing dma %s, send index rows minor %s, plan kernel %s",
         topk,
         activation,
         mesh.shape[DP_AXIS],
@@ -343,6 +343,7 @@ def _get_op(
         "on" if keywords["owner_tail"] else "off",
         "on" if keywords["routing_dma"] else "off",
         "on" if keywords["send_index_rows_minor"] else "off",
+        "on" if keywords["plan_kernel"] else "off",
     )
     _log_capacity(
         mesh, topk, onehot_threshold, step_routed_rows, capacity_factor, route_factor

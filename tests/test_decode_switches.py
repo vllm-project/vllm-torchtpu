@@ -45,12 +45,13 @@ EXCHANGE_OF_THE_NEW_LINE = {
     "owner_tail": True,
     "routing_dma": True,
     "send_index_rows_minor": True,
+    "plan_kernel": True,
 }
 
 
 def test_the_path_table_names_are_short_lowercase_and_unique():
     names = [p.name for p in ds.PATHS]
-    assert len(names) == len(set(names)) == 15
+    assert len(names) == len(set(names)) == 16
     assert all(n == n.lower() and " " not in n and len(n) <= 20 for n in names)
 
 
@@ -75,6 +76,7 @@ def test_the_launch_line_turns_every_path_on():
                 "a2a_row_scatter",
                 "a2a_send_rows_minor",
                 "a2a_routing_dma",
+                "a2a_plan_kernel",
                 "a2a_unquantized",
                 "a2a_owner_combine",
                 "a2a_owner_tail",
@@ -135,6 +137,15 @@ def test_the_send_index_layout_follows_the_row_scatter():
     env["TPU_DECODE_FAST_PATHS_OFF"] = "a2a_send_rows_minor"
     kw = ds.exchange_keywords(ds.resolve(env), owner_combine=True)
     assert kw["row_scatter"] is True and kw["send_index_rows_minor"] is False
+
+
+def test_the_plan_kernel_follows_the_sorted_plan():
+    env = {"TPU_MOE_RAGGED_A2A": "1"}
+    assert ds.exchange_keywords(ds.resolve(env), owner_combine=True)["plan_kernel"]
+    env["TPU_DECODE_FAST_PATHS_OFF"] = "a2a_plan_kernel"
+    assert not ds.exchange_keywords(ds.resolve(env), owner_combine=True)["plan_kernel"]
+    env["TPU_DECODE_FAST_PATHS_OFF"] = "a2a_sorted_plan,a2a_row_gather,a2a_row_scatter"
+    assert not ds.exchange_keywords(ds.resolve(env), owner_combine=True)["plan_kernel"]
 
 
 def test_the_exchange_keywords_follow_the_layer_not_the_switch():

@@ -61,6 +61,10 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.kernels.collectives.dma_all_gather import dma_all_gather
+from vllm_torchtpu.kernels.megablox.exchange_plan import (
+    exchange_plan,
+    exchange_plan_supported,
+)
 from vllm_torchtpu.kernels.megablox.gmm_v2 import owner_token_sum
 from vllm_torchtpu.kernels.megablox.row_copy import copy_send_rows
 from vllm_torchtpu.layers.core.expert_placement import ROUTE_ORDER_BITS
@@ -146,7 +150,8 @@ def _gather_routing(topk_ids: jax.Array, topk_weights: jax.Array, *, dma_members
 
     Returns the gathered ids [D, S, K], a function that reads the routes of
     the given flat (member, token) rows (an out-of-range row reads expert id
-    -1 with weight 0), and the packed routes [D * S, K] (None unpacked).
+    -1 with weight 0), and the packed routes [D * S, K] and [D, K, S] (None
+    unpacked).
     """
     if topk_weights.dtype != jnp.bfloat16:
         ids = jax.lax.all_gather(topk_ids, DP_AXIS)
@@ -160,21 +165,27 @@ def _gather_routing(topk_ids: jax.Array, topk_weights: jax.Array, *, dma_members
                 flat_weights.at[rows].get(mode="fill", fill_value=0),
             )
 
-        return ids, read, None
+        return ids, read, None, None
     bits = jax.lax.bitcast_convert_type(topk_weights, jnp.uint16).astype(jnp.int32)
     routes = jnp.left_shift(topk_ids, 16) | bits
     if dma_members:
         # One [K, S] block per member: the tokens fill the lanes.
-        packed = dma_all_gather(routes.T, axis=DP_AXIS, num_members=dma_members)
-        packed = jnp.swapaxes(packed, 1, 2)
+        words = dma_all_gather(routes.T, axis=DP_AXIS, num_members=dma_members)
+        packed = jnp.swapaxes(words, 1, 2)
     else:
         packed = jax.lax.all_gather(routes, DP_AXIS)
+        words = jnp.swapaxes(packed, 1, 2)
 
     def read(rows):
         routes = packed.reshape(-1, packed.shape[-1])
         return _unpack_routes(routes.at[rows].get(mode="fill", fill_value=_EMPTY_ROUTE))
 
-    return jnp.right_shift(packed, 16), read, packed.reshape(-1, packed.shape[-1])
+    return (
+        jnp.right_shift(packed, 16),
+        read,
+        packed.reshape(-1, packed.shape[-1]),
+        words,
+    )
 
 
 def _unpack_routes(routes: jax.Array):
@@ -826,6 +837,7 @@ def _capacity_exchange(
     row_gather=False,
     row_scatter=False,
     send_index_rows_minor=False,
+    planned=None,
 ):
     """Send and receive buffers of ``rows`` rows, filled without gaps.
 
@@ -844,7 +856,9 @@ def _capacity_exchange(
     sources and routes are never materialized; with ``row_gather`` it copies
     their rows out of the receive buffer, and ``row_scatter`` writes the send
     buffer with `copy_send_rows` (its send index laid out rows-minor with
-    ``send_index_rows_minor``).
+    ``send_index_rows_minor``). ``planned`` (an `ExchangePlan`, with
+    ``streamed`` and ``plan``): the sizes, offsets, send index and receive
+    rows come from the plan kernel instead (same integers).
     """
     num_tokens, hidden = x.shape
     local_num_experts = w1.shape[0]
@@ -890,6 +904,10 @@ def _capacity_exchange(
             out_row_t[None] == row[:, None, None], token[None, None, :], 0
         ).sum(axis=(1, 2))
         in_row = recv_start[:, None] + jnp.cumsum(need_in, axis=1, dtype=jnp.int32) - 1
+        if planned is not None:
+            send_start, send_sizes = planned.send_start, planned.send_sizes
+            send_landing, recv_sizes = planned.send_landing, planned.recv_sizes
+            send_index, in_row = planned.send_index, planned.in_row
         dests, gathered_weights = plan
         routes_plan = route_plan(
             gathered_ids,
@@ -902,7 +920,9 @@ def _capacity_exchange(
             rows=rows,
             gathered_weights=gathered_weights,
         )
-        if row_scatter:
+        if row_scatter and planned is not None:
+            sent = copy_send_rows(x, send_index, planned.count, rows)
+        elif row_scatter:
             # Written before the overflow flag is known: a step that does not
             # fit sends nothing, and rows past the buffer are dropped.
             out_row = (
@@ -931,6 +951,8 @@ def _capacity_exchange(
             received = received.reshape(rows, hidden)
         # The received rows fill the buffer from row 0.
         src_rows = jnp.sum(recv_sizes, dtype=jnp.int32)[None]
+        if planned is not None:
+            src_rows = planned.src_rows
         return streamed(
             received,
             None,
@@ -1528,6 +1550,7 @@ def ragged_a2a_moe_local(
     owner_tail: bool = False,
     routing_dma: bool = False,
     send_index_rows_minor: bool = False,
+    plan_kernel: bool = False,
     shared: jax.Array | None = None,
     replicas: jax.Array | None = None,
 ) -> jax.Array:
@@ -1580,6 +1603,10 @@ def ragged_a2a_moe_local(
     token each send row copies) sums its compare over [S, D, rows] instead
     of [rows, S, D], so XLA keeps the send rows on a vector tile axis
     instead of reducing each row across the lanes (same index).
+    ``plan_kernel`` (with ``sorted_plan``): where the capacity exchange runs the
+    fused kernel and `exchange_plan_supported` holds, one kernel computes the
+    fit check, sizes, offsets, send index and receive rows from the gathered
+    routing (`exchange_plan`) instead of XLA's ops (same integers).
 
     ``replicas`` [3, C] (with ``owner_combine`` and ``sorted_plan``): the
     redundant slots of `serving_slots`, ``C // (dp_size * tp_size)`` per rank
@@ -1652,7 +1679,7 @@ def ragged_a2a_moe_local(
             local_num_experts=local_num_experts,
         )
         routed = pack_served_routes(serving, order)
-    gathered_ids, read_routes, packed_routes = _gather_routing(
+    gathered_ids, read_routes, packed_routes, gathered_words = _gather_routing(
         routed, topk_weights, dma_members=dp_size if routing_dma else 0
     )
     gathered_order = None
@@ -1805,16 +1832,40 @@ def ragged_a2a_moe_local(
         # (the full exchange already runs the local-routes path over all routes).
         return full()
 
-    overflow = _capacity_overflow(
-        gathered_ids,
-        tp_size=tp_size,
-        local_num_experts=local_num_experts,
-        rows=rows,
-        routes=routes,
-    )
     # The capacity exchange runs outside the conditional, so the schedule
     # around it (weight prefetches for the following layers) is unchanged.
     capacity_streamed = streamed(rows, routes, 2, serving)
+    planned = None
+    if (
+        plan_kernel
+        and capacity_streamed is not None
+        and plan is not None
+        and exchange_plan_supported(
+            num_members=dp_size,
+            tp_size=tp_size,
+            num_tokens=num_tokens,
+            topk=topk,
+            slots_per_rank=local_num_experts,
+        )
+    ):
+        planned = exchange_plan(
+            gathered_words,
+            (experts_start // local_num_experts).astype(jnp.int32),
+            tp_size=tp_size,
+            slots_per_rank=local_num_experts,
+            rows=rows,
+            routes=routes,
+            order_bits=ROUTE_ORDER_BITS if serving is not None else 0,
+        )
+        overflow = planned.overflow
+    else:
+        overflow = _capacity_overflow(
+            gathered_ids,
+            tp_size=tp_size,
+            local_num_experts=local_num_experts,
+            rows=rows,
+            routes=routes,
+        )
     capacity_plan = plan
     if serving is not None and plan is not None:
         # The owners place each output by its sender's order.
@@ -1845,6 +1896,7 @@ def ragged_a2a_moe_local(
         row_gather=row_gather,
         row_scatter=row_scatter,
         send_index_rows_minor=send_index_rows_minor,
+        planned=planned,
     )
     out = finish(out, capacity_streamed is not None)
     return jax.lax.cond(overflow, full, lambda: out)
@@ -1878,6 +1930,7 @@ def ragged_a2a_moe(
     owner_tail: bool = False,
     routing_dma: bool = False,
     send_index_rows_minor: bool = False,
+    plan_kernel: bool = False,
     shared: jax.Array | None = None,
     replicas: jax.Array | None = None,
 ) -> jax.Array:
@@ -1908,6 +1961,7 @@ def ragged_a2a_moe(
         owner_tail=owner_tail,
         routing_dma=routing_dma,
         send_index_rows_minor=send_index_rows_minor,
+        plan_kernel=plan_kernel,
     )
 
     scaled = w1_scale is not None

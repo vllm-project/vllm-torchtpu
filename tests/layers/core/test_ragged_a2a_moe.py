@@ -101,7 +101,7 @@ def test_gather_routing_reads_rows_and_empty_slots(weight_dtype):
     rows = jnp.asarray([[11, 0, 12, 5, 6, 13]] * 2, jnp.int32)
 
     def body(i, w, r):
-        gathered_ids, read, _ = _gather_routing(i[0], w[0])
+        gathered_ids, read, *_ = _gather_routing(i[0], w[0])
         got_ids, got_weights = read(r[0])
         return gathered_ids[None], got_ids[None], got_weights[None]
 

@@ -95,6 +95,18 @@ CASES += [
     for option in ("send_index_rows_minor", "send_index_rows_minor_served")
     for combine in ("owner", "streamed")
 ]
+# The plan kernel computes the capacity exchange's plan, with the sorted plan
+# alone and with the served options (the owner tail only with the owner combine).
+OPTIONS["plan_kernel"] = dict(sorted_plan=True, plan_kernel=True)
+OPTIONS["plan_kernel_served"] = dict(
+    OPTIONS["send_index_rows_minor_served"], plan_kernel=True
+)
+OPTIONS["plan_kernel_owner_tail"] = dict(OPTIONS["plan_kernel_served"], owner_tail=True)
+CASES += [
+    (option, combine)
+    for option in ("plan_kernel", "plan_kernel_served")
+    for combine in ("owner", "streamed")
+] + [("plan_kernel_owner_tail", "owner")]
 
 
 def _routing(rng, dp_size, num_tokens, num_experts, topk, skew):

@@ -91,6 +91,12 @@ PATHS: tuple[Path, ...] = (
         "one kernel of remote DMAs all-gathers the packed routing",
     ),
     Path(
+        "a2a_plan_kernel",
+        RAGGED_A2A,
+        "with a2a_sorted_plan, one kernel computes the capacity exchange's fit "
+        "check, sizes, offsets, send index and receive rows",
+    ),
+    Path(
         "a2a_unquantized",
         RAGGED_A2A,
         "unquantized layers without expert biases take the exchange",
@@ -229,6 +235,7 @@ def exchange_keywords(sw: Switches, *, owner_combine: bool) -> dict[str, object]
         routing_dma=sw.path("a2a_routing_dma"),
         send_index_rows_minor=sw.path("a2a_row_scatter")
         and sw.path("a2a_send_rows_minor"),
+        plan_kernel=sw.path("a2a_sorted_plan") and sw.path("a2a_plan_kernel"),
     )
 
 

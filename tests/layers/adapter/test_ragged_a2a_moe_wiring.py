@@ -256,6 +256,40 @@ def test_routing_dma_knob_reaches_the_exchange(monkeypatch, routing_dma):
     assert seen["routing_dma"] is routing_dma
 
 
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("plan_kernel", [False, True])
+def test_plan_kernel_path_reaches_the_exchange(monkeypatch, plan_kernel):
+    monkeypatch.setattr(vllm.config, "get_current_vllm_config_or_none", lambda: None)
+    monkeypatch.setattr(
+        ragged_a2a, "get_dp_tp_mesh", lambda: SimpleNamespace(shape={"dp": 16, "tp": 4})
+    )
+    monkeypatch.setattr(ragged_a2a, "_OPS", {})
+    monkeypatch.setattr(ragged_a2a, "_routed_rows_per_decode_step", lambda topk: 0)
+    seen = {}
+
+    def _ragged_a2a_moe(*args, **kwargs):
+        seen.update(kwargs)
+
+    monkeypatch.setattr(ragged_a2a, "ragged_a2a_moe", _ragged_a2a_moe)
+
+    class _Op:
+        def register_fake(self, fn):
+            pass
+
+    def _jax_op(name, fn, **kwargs):
+        fn(*([None] * 8))
+        return _Op()
+
+    monkeypatch.setattr(ragged_a2a.pallas, "jax_op", _jax_op)
+    monkeypatch.setenv("TPU_MOE_RAGGED_A2A", "1")
+    if not plan_kernel:
+        monkeypatch.setenv("TPU_DECODE_FAST_PATHS_OFF", "a2a_plan_kernel")
+    ragged_a2a._get_op(
+        topk=10, activation="silu", rhs_quant_dtype=None, skip_padded_tokens=False
+    )
+    assert seen["plan_kernel"] is plan_kernel
+
+
 def _record_ops(monkeypatch, dp=16, tp=4):
     """Build ops against a stub mesh: returns the exchange's kwargs and the
     operand count of each op built."""
