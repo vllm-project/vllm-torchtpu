@@ -116,7 +116,8 @@ class BuildContext:
     ci_pr_push_cpu_only: bool = False
     ci_extras: tuple[str, ...] = ()
     mq_extras: tuple[str, ...] = ()
-    # A key of TPU_VERSIONS on a build started by hand, to run one generation.
+    # TPU_VERSION_ALL on a build that also runs the generations outside
+    # DEFAULT_TPU_GENERATIONS; empty runs those alone.
     tpu_version: str = ""
 
     @property
@@ -423,14 +424,13 @@ TPU_GENERATION_FILES: Mapping[str, tuple[TpuGeneration, ...]] = {
     ".buildkite/pipeline_integration.yml": (TPU_V6E, TPU_V7X),
     ".buildkite/pipeline_perf.yml": (TPU_V6E, TPU_V7X),
 }
-# Lanes uploaded once whose own script (upload_models_and_features.sh) generates
-# per-generation groups and reads TPU_VERSION on nightly builds.
-SCRIPT_TPU_GENERATION_LANES: tuple[str, ...] = ("verify",)
-# What a build started by hand sets TPU_VERSION to, to run one generation of
-# the files above and of those lanes alone, by the names tpu-inference gives
-# them. The generation brings its shapes, so the build names no KUBE_SHAPE_*
-# of its own. Without TPU_VERSION every generation runs.
-TPU_VERSIONS: Mapping[str, TpuGeneration] = {"tpu6e": TPU_V6E, "tpu7x": TPU_V7X}
+# The generations those files go up for when TPU_VERSION is unset.
+DEFAULT_TPU_GENERATIONS: tuple[TpuGeneration, ...] = (TPU_V7X,)
+# What a build sets TPU_VERSION to so those files also go up for the rest of
+# their generations, side by side with the default ones. No value runs a
+# non-default generation alone. The generation brings its shapes, so the build
+# names no KUBE_SHAPE_* of its own.
+TPU_VERSION_ALL = "all"
 
 
 def choose_suite(ctx: BuildContext) -> Suite:
@@ -456,65 +456,48 @@ def choose_suite(ctx: BuildContext) -> Suite:
     return SUITES["full"] if ctx.nightly_env or ctx.is_release else SUITES["default"]
 
 
-def tpu_version_note(ctx: BuildContext, suite: Suite, *, nightly: bool) -> str | None:
+def tpu_version_note(ctx: BuildContext, suite: Suite) -> str | None:
     """Check `ctx.tpu_version` against the build; return its annotation, if any.
 
-    TPU_VERSION runs one TPU generation alone, for a build started by hand:
-    each file in TPU_GENERATION_FILES goes up for it only (see upload_envs),
-    and a lane in SCRIPT_TPU_GENERATION_LANES sends up only its group.
-    Integration, scheduled, release and merge-queue builds run every
-    generation: LKG promotion and a merge must not pass on one generation, and
-    a schedule or a release checks them all. A nightly started by hand may run
-    one; the nightly report, which waits on every generation's steps, leaves
-    itself out (see pipeline_verify.yml). A build with no lane that follows
-    TPU_VERSION would ignore it, so it is refused too.
+    Files in TPU_GENERATION_FILES go up for DEFAULT_TPU_GENERATIONS only, or
+    for every generation they list when TPU_VERSION is TPU_VERSION_ALL (see
+    upload_envs). Any build may set it. Any other value is refused, as is a
+    build with no lane in TPU_GENERATION_FILES, which would ignore it.
     """
     if not ctx.tpu_version:
         return None
-    if ctx.tpu_version not in TPU_VERSIONS:
+    if ctx.tpu_version != TPU_VERSION_ALL:
         raise BootstrapError(
-            f"ERROR: TPU_VERSION is '{ctx.tpu_version}'; "
-            f"TPU versions are: {' '.join(TPU_VERSIONS)}"
+            f"ERROR: TPU_VERSION is '{ctx.tpu_version}'; set "
+            f"TPU_VERSION={TPU_VERSION_ALL} to run every TPU generation, or "
+            "leave it unset to run the default ones"
         )
-    if (
-        ctx.is_integration
-        or ctx.is_merge_queue
-        or ctx.is_release
-        or ctx.source == "schedule"
-        or ctx.tag
-    ):
-        raise BootstrapError(
-            "ERROR: TPU_VERSION runs one TPU generation; integration, scheduled, "
-            "release and merge-queue builds run every generation"
-        )
-    # A lane's script runs only on the nightly builds its steps run on.
     in_build = [
         lane
         for stage in suite.stages
         for lane in stage
         if f".buildkite/pipeline_{lane}.yml" in TPU_GENERATION_FILES
-        or (nightly and lane in SCRIPT_TPU_GENERATION_LANES)
     ]
     if not in_build:
         per_generation = [
-            *(
-                pathlib.Path(p).stem.removeprefix("pipeline_")
-                for p in TPU_GENERATION_FILES
-            ),
-            *SCRIPT_TPU_GENERATION_LANES,
+            pathlib.Path(p).stem.removeprefix("pipeline_") for p in TPU_GENERATION_FILES
         ]
         raise BootstrapError(
-            "ERROR: TPU_VERSION picks the TPU generation of the "
+            f"ERROR: TPU_VERSION={TPU_VERSION_ALL} adds TPU generations to the "
             f"{_and_list(per_generation)} lanes, and this build runs none"
         )
-    note = (
-        f"Runs only the TPU {TPU_VERSIONS[ctx.tpu_version].name} steps of the "
+    extra = [
+        gen.name
+        for gen in dict.fromkeys(
+            g for gens in TPU_GENERATION_FILES.values() for g in gens
+        )
+        if gen not in DEFAULT_TPU_GENERATIONS
+    ]
+    return (
+        f"Also runs the TPU {_and_list(extra)} steps of the "
         f"{_and_list(in_build)} lane{'s' if len(in_build) > 1 else ''} "
-        f"(`TPU_VERSION={ctx.tpu_version}`)."
+        f"(`TPU_VERSION={TPU_VERSION_ALL}`)."
     )
-    if "verify" in in_build:
-        note += " The nightly report is left out: it needs every generation."
-    return note
 
 
 # Build kind -> (Buildkite job priority, Kueue workload priority class).
@@ -989,16 +972,16 @@ def upload_with_priority(
 def upload_envs(path: str, tpu_version: str = "") -> tuple[dict[str, str], ...]:
     """Return the extra variables of each upload of `path`, in upload order.
 
-    A file in TPU_GENERATION_FILES goes up once per TPU generation, with that
-    generation's variables - or, when `tpu_version` (a key of TPU_VERSIONS)
-    names one, for that generation alone; any other file goes up once, with
-    none.
+    A file in TPU_GENERATION_FILES goes up once per generation in
+    DEFAULT_TPU_GENERATIONS, with that generation's variables - or, when
+    `tpu_version` is TPU_VERSION_ALL, once per generation it lists; any other
+    file goes up once, with none.
     """
     if path not in TPU_GENERATION_FILES:
         return ({},)
     generations = TPU_GENERATION_FILES[path]
-    if tpu_version:
-        generations = tuple(g for g in generations if g is TPU_VERSIONS[tpu_version])
+    if tpu_version != TPU_VERSION_ALL:
+        generations = tuple(g for g in generations if g in DEFAULT_TPU_GENERATIONS)
     return tuple(generation.upload_env() for generation in generations)
 
 
@@ -1014,8 +997,8 @@ def upload_stages(
     The `wait` step gates `rest` on every step uploaded in `stages[0]` (including
     both Docker image builds in `pipeline_build.yml`, such as `-omni`, and all
     `pipeline_cpu.yml` checks); a retried uploader skips lanes it already uploaded.
-    A file in TPU_GENERATION_FILES goes up once per TPU generation, or only for
-    the one TPU_VERSION names.
+    A file in TPU_GENERATION_FILES goes up once per default TPU generation, or
+    once per generation it lists when TPU_VERSION is TPU_VERSION_ALL.
     """
     for stage in stages:
         for lane in stage:
@@ -1293,7 +1276,7 @@ def run_bootstrap(
         env=child_env,
     )
     try:
-        tpu_note = tpu_version_note(ctx, suite, nightly=nightly)
+        tpu_note = tpu_version_note(ctx, suite)
     except BootstrapError as exc:
         _agent(
             "annotate",

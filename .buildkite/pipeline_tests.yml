@@ -14,8 +14,9 @@
 
 # The TPU unit test suite on the Kueue fleet; bootstrap.py uploads it with the
 # image build from pipeline_build.yml (CPU checks live in pipeline_cpu.yml).
-# It goes up once per TPU generation, v6e and v7x side
-# by side, with the same steps and tests on each: TPU_GENERATION_FILES in
+# It goes up for v7x alone, or once per TPU generation, v6e and v7x side by
+# side, on a build that sets TPU_VERSION=all, with the same steps and tests on
+# each: TPU_GENERATION_FILES in
 # bootstrap.py fills in the generation's name, which the group name and every
 # label start with, its shapes, its key prefix and soft_fail.
 

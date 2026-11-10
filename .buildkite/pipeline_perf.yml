@@ -13,8 +13,9 @@
 # limitations under the License.
 
 # The perf/eval suite on the Kueue fleet; bootstrap.sh uploads it with the image
-# build from pipeline_build.yml. Like pipeline_tests.yml, it goes up once per
-# TPU generation, v6e and v7x side by side: TPU_GENERATION_FILES in
+# build from pipeline_build.yml. Like pipeline_tests.yml, it goes up for v7x
+# alone, or once per TPU generation, v6e and v7x side by side, on a build that
+# sets TPU_VERSION=all: TPU_GENERATION_FILES in
 # bootstrap.py fills in the generation's name, which the group name and every
 # label start with, its shapes, its accelerator type, soft_fail, and whether
 # the perf gate applies. A v6e 2x4 slice holds 256 GB of HBM to a v7x-8's

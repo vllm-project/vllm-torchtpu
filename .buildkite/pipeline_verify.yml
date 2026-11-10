@@ -30,12 +30,8 @@ steps:
       - bash .buildkite/scripts/upload_models_and_features.sh
 
   - label: "Support matrices and verified commit"
+    <<: *run-on-nightly-or-tag
     key: "nightly_report"
-    # The run condition above, except on a build that runs one TPU generation
-    # (TPU_VERSION): the other generation's steps it waits on never go up, and
-    # Buildkite fails a build whose step waits on a key no step has. Nor do one
-    # generation's results make the matrices or a verified commit.
-    if: '"${TPU_VERSION:-}" == "" && (build.env("NIGHTLY") == "1" || build.tag =~ /^v?[0-9]+(\.[a-zA-Z0-9]+)*([a-zA-Z]+[0-9]*)?$/)'
     # The suites the matrices are built from, and the nightly tests-lane steps a
     # verified commit pair also needs passed. It runs whatever their outcome.
     depends_on:

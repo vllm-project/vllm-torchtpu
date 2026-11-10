@@ -150,11 +150,12 @@ def _same_test(step: dict[str, Any]) -> dict[str, Any]:
     return rest
 
 
-# The uploads of a lane in TPU_GENERATION_FILES, as _RunRecorder tags them:
-# one per generation, v6e's first, so v7x's shows (and queues) first.
-_TESTS = ("tests:v6e", "tests:v7x")
-_INTEGRATION = ("integration:v6e", "integration:v7x")
-_PERF = ("perf:v6e", "perf:v7x")
+# The uploads of a lane in TPU_GENERATION_FILES, as _RunRecorder tags them: one
+# per default generation (v7x). TPU_VERSION=all adds v6e's, first, so v7x's
+# still shows (and queues) first.
+_TESTS = ("tests:v7x",)
+_INTEGRATION = ("integration:v7x",)
+_PERF = ("perf:v7x",)
 
 
 # (extras, actor, error) as returned by `_merge_queue_pr_extras`.
@@ -1337,18 +1338,17 @@ class TestBootstrapUnits(unittest.TestCase):
             pr_stage1.meta,
             [
                 ("upload-stages:upload_stage_1:verify", "1"),
-                ("upload-stages:upload_stage_1:integration:v6e", "1"),
                 ("upload-stages:upload_stage_1:integration:v7x", "1"),
-                ("upload-stages:upload_stage_1:tests:v6e", "1"),
                 ("upload-stages:upload_stage_1:tests:v7x", "1"),
             ],
         )
         self.assertIn(
-            "--- :pipeline: Uploading .buildkite/pipeline_tests.yml for TPU v6e "
+            "--- :pipeline: Uploading .buildkite/pipeline_tests.yml for TPU v7x "
             "with priority 6",
             pr_stage1.stdout,
         )
-        # Every TPU upload, v6e's as well as v7x's, is in the author's group.
+        self.assertNotIn("for TPU v6e", pr_stage1.stdout)
+        # Every TPU upload is in the author's group.
         for tag, content, _ in pr_stage1.uploads[1:]:
             self.assertIn("tpu-pr/alice@example.com", content, tag)
 
@@ -1374,7 +1374,11 @@ class TestBootstrapUnits(unittest.TestCase):
             self.assertEqual(
                 bp.upload_stages(
                     (("tests", "integration", "verify"),),
-                    {"JOB_PRIORITY": "6", "BUILDKITE_STEP_KEY": "upload_stage_1"},
+                    {
+                        "JOB_PRIORITY": "6",
+                        "BUILDKITE_STEP_KEY": "upload_stage_1",
+                        "TPU_VERSION": "all",
+                    },
                     repo_root=_REPO_ROOT,
                 ),
                 0,
@@ -2108,108 +2112,130 @@ class TestBootstrapUnits(unittest.TestCase):
         )
         self.assertEqual(set(scanned.stdout.split()), report_deps)
 
-    def test_tpu_version_runs_one_generation(self) -> None:
+    def test_tpu_version_all_adds_v6e(self) -> None:
         bp = self.bp
-        self.assertEqual(
-            {version: gen.name for version, gen in bp.TPU_VERSIONS.items()},
-            {"tpu6e": "v6e", "tpu7x": "v7x"},
-        )
-        # Unset, a per-generation file goes up once per generation; set, once,
-        # for the generation it names. Any other file goes up once, as it is.
+        self.assertEqual([g.name for g in bp.DEFAULT_TPU_GENERATIONS], ["v7x"])
+        self.assertEqual(bp.TPU_VERSION_ALL, "all")
+        # Unset, a per-generation file goes up for v7x only; with
+        # TPU_VERSION=all, once per generation it lists, v6e's first. Any other
+        # file goes up once, as it is.
         for path, generations in bp.TPU_GENERATION_FILES.items():
+            self.assertEqual(bp.upload_envs(path), (bp.TPU_V7X.upload_env(),))
             self.assertEqual(
-                bp.upload_envs(path), tuple(g.upload_env() for g in generations)
+                bp.upload_envs(path, "all"), tuple(g.upload_env() for g in generations)
             )
-            for version, gen in bp.TPU_VERSIONS.items():
-                self.assertEqual(bp.upload_envs(path, version), (gen.upload_env(),))
-        for version in ("", *bp.TPU_VERSIONS):
+        for version in ("", "all"):
             self.assertEqual(
                 bp.upload_envs(".buildkite/pipeline_cpu.yml", version), ({},)
             )
 
-        def note(rec: _RunRecorder) -> str:
-            (body,) = [
-                n for _, context, n in rec.annotations if context == "tpu-version"
+        def note(rec: _RunRecorder) -> tuple[str, str]:
+            ((style, body),) = [
+                (s, n) for s, context, n in rec.annotations if context == "tpu-version"
             ]
-            return body
+            return style, body
 
-        # A build started by hand: the default suite's tests and integration
-        # lanes go up for v6e alone, and its other lanes as they are.
-        manual = self._run_bootstrap({"TPU_VERSION": "tpu6e"})
+        # Unset: v7x alone, and nothing is said.
+        default = self._run_bootstrap({})
         self.assertEqual(
-            [u[0] for u in manual.uploads],
-            ["verify", "integration:v6e", "tests:v6e", "cpu", "build"],
+            [u[0] for u in default.uploads],
+            ["verify", "integration:v7x", "tests:v7x", "cpu", "build"],
         )
-        self.assertIn("TPU v6e steps of the tests and integration lanes", note(manual))
-        # A nightly started by hand: verify's script follows it too, as does
-        # every other lane, and the nightly report leaves itself out.
-        one_nightly = self._run_bootstrap({"TPU_VERSION": "tpu7x", "NIGHTLY": "1"})
+        self.assertNotIn("tpu-version", [c for _, c, _ in default.annotations])
+        # Set: v6e beside v7x in each per-generation lane of the suite.
+        both = self._run_bootstrap({"TPU_VERSION": "all"})
         self.assertEqual(
-            [u[0] for u in one_nightly.uploads],
-            ["verify", "perf:v7x", "integration:v7x", "tests:v7x", "cpu", "build"],
+            [u[0] for u in both.uploads],
+            [
+                "verify",
+                "integration:v6e",
+                "integration:v7x",
+                "tests:v6e",
+                "tests:v7x",
+                "cpu",
+                "build",
+            ],
         )
-        self.assertIn(
-            "TPU v7x steps of the tests, integration, perf and verify lanes",
-            note(one_nightly),
+        self.assertEqual(
+            note(both),
+            (
+                "info",
+                "Also runs the TPU v6e steps of the tests and integration lanes "
+                "(`TPU_VERSION=all`).",
+            ),
         )
-        self.assertIn("nightly report is left out", note(one_nightly))
-        # The perf suite alone, between nightlies, for one generation.
-        perf_only = self._run_bootstrap({"TPU_VERSION": "tpu6e", "CI_SUITE": "perf"})
-        self.assertEqual([u[0] for u in perf_only.uploads], ["perf:v6e", "build"])
-        self.assertIn("TPU v6e steps of the perf lane ", note(perf_only))
-        # Unset, nothing changes and nothing is said.
-        nightly = self._run_bootstrap({"NIGHTLY": "1"})
-        self.assertNotIn("tpu-version", [c for _, c, _ in nightly.annotations])
+        both_nightly = self._run_bootstrap({"TPU_VERSION": "all", "NIGHTLY": "1"})
+        self.assertEqual(
+            [u[0] for u in both_nightly.uploads],
+            [
+                "verify",
+                "perf:v6e",
+                "perf:v7x",
+                "integration:v6e",
+                "integration:v7x",
+                "tests:v6e",
+                "tests:v7x",
+                "cpu",
+                "build",
+            ],
+        )
 
         # A later stage's uploader reads it as well, from the build's env.
-        stage_rec = _RunRecorder(bp)
-        with (
-            mock.patch.object(bp, "_agent", side_effect=stage_rec.agent),
-            mock.patch.object(
-                bp, "upload_with_priority", side_effect=stage_rec.upload_with_priority
+        for env, expected in (
+            ({}, ["verify", "integration:v7x", "tests:v7x"]),
+            (
+                {"TPU_VERSION": "all"},
+                [
+                    "verify",
+                    "integration:v6e",
+                    "integration:v7x",
+                    "tests:v6e",
+                    "tests:v7x",
+                ],
             ),
-            contextlib.redirect_stdout(stage_rec.stdout_buf),
         ):
-            bp.upload_stages(
-                (("tests", "integration", "verify"),),
-                {"TPU_VERSION": "tpu6e", "BUILDKITE_STEP_KEY": "upload_stage_1"},
-                repo_root=_REPO_ROOT,
-            )
-        self.assertEqual(
-            [u[0] for u in stage_rec.uploads],
-            ["verify", "integration:v6e", "tests:v6e"],
-        )
+            stage_rec = _RunRecorder(bp)
+            with (
+                mock.patch.object(bp, "_agent", side_effect=stage_rec.agent),
+                mock.patch.object(
+                    bp,
+                    "upload_with_priority",
+                    side_effect=stage_rec.upload_with_priority,
+                ),
+                contextlib.redirect_stdout(stage_rec.stdout_buf),
+            ):
+                bp.upload_stages(
+                    (("tests", "integration", "verify"),),
+                    {**env, "BUILDKITE_STEP_KEY": "upload_stage_1"},
+                    repo_root=_REPO_ROOT,
+                )
+            self.assertEqual([u[0] for u in stage_rec.uploads], expected, env)
 
-        # The nightly report waits on every generation's steps, so it leaves
-        # itself out of a build that runs one.
-        def report_if(env: dict[str, str]) -> str:
-            steps = _render_doc(".buildkite/pipeline_verify.yml", env)["steps"]
-            return next(s["if"] for s in steps if s.get("key") == "nightly_report")
-
-        self.assertTrue(report_if({}).startswith('"" == "" && '))
-        self.assertTrue(
-            report_if({"TPU_VERSION": "tpu6e"}).startswith('"tpu6e" == "" && ')
-        )
-
-        # Refused, with an error annotation and before any upload: a name it
-        # does not know, builds that must run every generation, and a build
-        # with no lane that follows it.
+        # Running more generations cannot let a build pass on fewer, so any
+        # build may: scheduled, tag, release, integration (LKG) and merge queue.
         for env in (
-            {"TPU_VERSION": "v6e"},
-            {"TPU_VERSION": "tpu6e", "NIGHTLY": "1", "BUILDKITE_SOURCE": "schedule"},
-            {"TPU_VERSION": "tpu7x", "BUILDKITE_TAG": "v0.33.0"},
-            {"TPU_VERSION": "tpu7x", "BUILDKITE_BRANCH": "releases/v0.33.0"},
+            {"NIGHTLY": "1", "BUILDKITE_SOURCE": "schedule"},
+            {"BUILDKITE_TAG": "v0.33.0"},
+            {"BUILDKITE_BRANCH": "releases/v0.33.0"},
+            {"BUILDKITE_PIPELINE_SLUG": "vllm-torchtpu-integration"},
             {
-                "TPU_VERSION": "tpu7x",
-                "BUILDKITE_PIPELINE_SLUG": "vllm-torchtpu-integration",
-            },
-            {
-                "TPU_VERSION": "tpu6e",
                 "BUILDKITE_BRANCH": "gh-readonly-queue/main/pr-42-deadbeef",
                 "BUILDKITE_MERGE_QUEUE_BASE_BRANCH": "main",
             },
+        ):
+            with self.subTest(env=env):
+                rec = self._run_bootstrap({"TPU_VERSION": "all", **env})
+                self.assertEqual(note(rec)[0], "info")
+
+        # Refused, with an error annotation and before any upload: any other
+        # value - no value runs v6e alone - and a build with no lane in
+        # TPU_GENERATION_FILES, which would ignore it.
+        for env in (
+            {"TPU_VERSION": "tpu6e"},
+            {"TPU_VERSION": "tpu7x"},
+            {"TPU_VERSION": "v6e"},
             {
-                "TPU_VERSION": "tpu6e",
+                "TPU_VERSION": "all",
                 "BUILDKITE_PULL_REQUEST": "42",
                 "BUILDKITE_PULL_REQUEST_LABELS": "skip-tpu-ci",
             },
@@ -2219,9 +2245,10 @@ class TestBootstrapUnits(unittest.TestCase):
                 self.assertEqual(refused.annotations[-1][:2], ("error", "tpu-version"))
                 self.assertEqual(refused.uploads, [])
 
-    def test_verify_upload_honors_tpu_version(self) -> None:
-        # upload_models_and_features.sh sends up each generation's group, or
-        # only the one TPU_VERSION names; run here on a scratch .buildkite.
+    def test_verify_upload_runs_every_generation(self) -> None:
+        # upload_models_and_features.sh sends up each generation's group, as on
+        # main, whether or not the build sets TPU_VERSION=all; run here on a
+        # scratch .buildkite.
         script = _SCRIPTS_DIR / "upload_models_and_features.sh"
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
@@ -2271,8 +2298,7 @@ class TestBootstrapUnits(unittest.TestCase):
                 return re.findall(r'group: "TPU (\w+) nightly', text)
 
             self.assertEqual(groups(""), ["v6e", "v7x"])
-            self.assertEqual(groups("tpu6e"), ["v6e"])
-            self.assertEqual(groups("tpu7x"), ["v7x"])
+            self.assertEqual(groups("all"), ["v6e", "v7x"])
 
     def test_every_generation_file_keeps_generations_apart(self) -> None:
         # A file in TPU_GENERATION_FILES - and so under TPU_VERSION - goes up

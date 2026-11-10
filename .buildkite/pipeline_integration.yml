@@ -13,7 +13,8 @@
 # limitations under the License.
 
 # The integration suite on the Kueue fleet. Like pipeline_tests.yml, it goes up
-# once per TPU generation, v6e and v7x side by side: TPU_GENERATION_FILES in
+# for v7x alone, or once per TPU generation, v6e and v7x side by side, on a
+# build that sets TPU_VERSION=all: TPU_GENERATION_FILES in
 # bootstrap.py fills in the generation's name, which the group name and every
 # label start with, its shapes, its key prefix and soft_fail. A step that runs
 # only on v7x as written - one that goes through run_multihost.sh, whose
