@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Per-tile candidate selection (`msa_dcp._tile_candidates`, the DCP prefill
-path of `msa_dcp.msa_write_and_candidates_dcp` at `TILE_SELECT_MIN_TOKENS`)
-against the class path it replaces (`msa_dcp._class_candidates`: head-major
+path of `msa_dcp.msa_write_and_candidates_dcp` at `TILE_SELECT_MIN_TOKENS`,
+which writes the all-gather's slots in place) against the class path it
+replaces (`msa_dcp._class_candidates`: head-major
 fold, `local_candidates` per tile class), in interpret mode: the candidates
 of every real token must match bit for bit, ties and forced blocks
 included; padding tokens get none."""
@@ -160,10 +161,15 @@ def _check(monkeypatch, q_lens, ctx_lens, dcp, dtype, *, ranks=None, seed=0, **c
 _MIXED = ([300, 1, 8, 130], [3000, 2500, 500, 0])
 _FRESH = ([260, 129, 40], [0, 0, 0])
 _DECODE = ([1, 8, 4, 1], [3000, 128, 127, 4000])
+# Requests 1-7 rows apart around a long chunk: their slot columns share
+# 128-lane groups with the chunk's tiles.
+_ADJACENT = ([5, 300, 3, 134], [2000, 1500, 100, 0])
 
 
 @pytest.mark.parametrize("dcp", [2, 4, 8])
-@pytest.mark.parametrize("batch", [_MIXED, _FRESH, _DECODE], ids=["mixed", "fresh", "decode"])
+@pytest.mark.parametrize(
+    "batch", [_MIXED, _FRESH, _DECODE, _ADJACENT], ids=["mixed", "fresh", "decode", "adjacent"]
+)
 def test_tile_select_matches_rows_bf16(monkeypatch, dcp, batch):
     _check(monkeypatch, *batch, dcp, jnp.bfloat16, ranks=[0, dcp - 1], seed=dcp)
 
@@ -214,13 +220,39 @@ def test_tile_select_faults_are_caught(monkeypatch, _retrace, fault):
         _check(monkeypatch, *_MIXED, 2, jnp.bfloat16, ranks=[0, 1], seed=4)
 
 
-def test_tile_select_column_fault_is_caught(monkeypatch, _retrace):
-    real = msa_dcp._piecewise
+def _faulty_place(old, new):
+    src = inspect.getsource(msa_dcp._place)
+    assert old in src
+    namespace = dict(vars(msa_dcp))
+    exec(compile(src.replace(old, new), "<fault>", "exec"), namespace)
+    return namespace["_place"]
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        ("one column too many", ("lane < off + n", "lane <= off + n")),
+        ("window shifted", ("(off - src0 + window)", "(off - src0 + window + 1)")),
+    ],
+    ids=lambda f: f[0],
+)
+def test_tile_select_placement_faults_are_caught(monkeypatch, _retrace, fault):
+    """The slots are written in place at unaligned columns; a placement that
+    writes one column too many or one lane off fails the comparison."""
+    _, (old, new) = fault
+    monkeypatch.setattr(msa_dcp, "_place", _faulty_place(old, new))
+    with pytest.raises(AssertionError):
+        _check(monkeypatch, *_ADJACENT, 2, jnp.bfloat16, ranks=[0], seed=5)
+
+
+def test_tile_select_small_placement_fault_is_caught(monkeypatch, _retrace):
     monkeypatch.setattr(
-        msa_dcp, "_piecewise", lambda x, s, v: real(x, s, v) + (x % 7 == 3)
+        msa_dcp,
+        "_tile_select_kernel",
+        _faulty_kernel("src - group, lo,", "src - group + 1, lo,"),
     )
     with pytest.raises(AssertionError):
-        _check(monkeypatch, *_MIXED, 2, jnp.bfloat16, ranks=[0], seed=5)
+        _check(monkeypatch, *_ADJACENT, 2, jnp.bfloat16, ranks=[0], seed=5)
 
 
 def test_tile_select_threshold(monkeypatch):
@@ -229,14 +261,6 @@ def test_tile_select_threshold(monkeypatch):
     assert not msa_dcp.tile_select(256)
     assert msa_dcp.tile_select(1024) and msa_dcp.tile_select(8192, 4)
     assert not msa_dcp.tile_select(8192, 3)
-
-
-def test_piecewise():
-    x = jnp.arange(12, dtype=jnp.int32)
-    starts = jnp.asarray([0, 3, 3, 7], jnp.int32)
-    values = jnp.asarray([5, 9, -2, 4], jnp.int32)
-    want = np.asarray([5, 5, 5, -2, -2, -2, -2, 4, 4, 4, 4, 4])
-    np.testing.assert_array_equal(msa_dcp._piecewise(x, starts, values), want)
 
 
 # (dcp, G, tokens, index cache): the served prefill buckets of DCP 2, 4 and
