@@ -2405,12 +2405,12 @@ class TPUModelRunner(GPUModelRunner):
         """
         # A scheduling gap does not release the request's recurrent state.
         # Preemption/resume invalidation is handled by _update_states.
-        live_req_ids = self.requests
+        live_requests = self.requests
         slot_by_req_id = self._mamba_slot_by_req_id
         # Free slots for requests that left the batch.
         if slot_by_req_id:
             dead_req_ids = [
-                req_id for req_id in slot_by_req_id if req_id not in live_req_ids
+                req_id for req_id in slot_by_req_id if req_id not in live_requests
             ]
             if dead_req_ids:
                 for req_id in dead_req_ids:
@@ -2523,8 +2523,8 @@ class TPUModelRunner(GPUModelRunner):
         # after draft rejection. Retain it while the request still owns KV.
         state_pos = self._mamba_state_pos
         if state_pos:
-            live_req_ids = self.requests
-            dead_pos = [req_id for req_id in state_pos if req_id not in live_req_ids]
+            live_requests = self.requests
+            dead_pos = [req_id for req_id in state_pos if req_id not in live_requests]
             for req_id in dead_pos:
                 del state_pos[req_id]
 
@@ -2545,6 +2545,11 @@ class TPUModelRunner(GPUModelRunner):
             if self.scheduler_config.async_scheduling and self.speculative_config
             else None
         )
+        # Batch row of each request in the previous step. num_draft_per_req
+        # and the sampled rows are keyed by it. req_id_to_index_copy holds the
+        # substitution source position, which runs past the row for every
+        # chunk after the first when chunks keep their padded rows.
+        previous_rows: dict[str, int] | None = None
         sampled_cpu: torch.Tensor | None = None
         for i, computed in enumerate(num_computed_list):
             row = start_index + i
@@ -2553,7 +2558,15 @@ class TPUModelRunner(GPUModelRunner):
             scheduled = num_scheduled_tokens[req_id]
             end_position = computed + scheduled - 1
             if previous is not None and previous.num_draft_per_req:
-                previous_row = previous.req_id_to_index_copy.get(req_id)
+                if previous_rows is None:
+                    previous_rows = {
+                        record[3]: record[0] for record in previous.request_seq_lens
+                    }
+                previous_row = (
+                    previous_rows.get(req_id)
+                    if req_id in previous.req_id_to_index_copy
+                    else None
+                )
                 drafts = (
                     previous.num_draft_per_req.get(previous_row, 0)
                     if previous_row is not None
@@ -3434,16 +3447,15 @@ class TPUModelRunner(GPUModelRunner):
             ]
         # Disable vLLM's native GPU async spec-decode num_computed_tokens
         # correction. The TPU runner does its own async rejection correction,
-        # so letting the base also correct would double-count.
-        if (
-            self.speculative_config is not None
-            and self.scheduler_config.async_scheduling
-            and scheduler_output.scheduled_spec_decode_tokens
-        ):
-            for req_id in scheduler_output.scheduled_spec_decode_tokens:
-                req_state = self.requests.get(req_id)
-                if req_state is not None:
-                    req_state.prev_num_draft_len = 0
+        # so letting the base also correct would double-count. The base reads
+        # prev_num_draft_len only for the scheduled cached requests, including
+        # those scheduled without drafts this step after drafting in the
+        # previous one.
+        requests = self.requests
+        for req_id in scheduler_output.scheduled_cached_reqs.req_ids:
+            req_state = requests.get(req_id)
+            if req_state is not None:
+                req_state.prev_num_draft_len = 0
         if (
             invalidated_req_ids
             or scheduler_output.scheduled_new_reqs
@@ -4073,14 +4085,12 @@ class TPUModelRunner(GPUModelRunner):
                 positions_np + req_indices * self.input_batch.token_ids_cpu.shape[1]
             )
             if num_reqs <= 512:
-                input_ids_np = getattr(self, "input_ids_np", None)
-                if input_ids_np is None:
-                    input_ids_np = self.input_ids_cpu.numpy()
-                    self.input_ids_np = input_ids_np
+                # The view is taken per step: the sequence layout planner can
+                # reallocate input_ids_cpu in reserve_host_token_capacity.
                 np.take(
                     self.input_batch.token_ids_cpu.ravel(),
                     token_indices,
-                    out=input_ids_np[:num_reqs],
+                    out=self.input_ids_cpu.numpy()[:num_reqs],
                 )
             else:
                 torch.index_select(
@@ -4146,14 +4156,10 @@ class TPUModelRunner(GPUModelRunner):
             # Get token indices in-place without per-step heap allocation.
             np.add(positions_np, req_row_offsets, out=token_indices)
             if total_num_scheduled_tokens <= 512:
-                input_ids_np = getattr(self, "input_ids_np", None)
-                if input_ids_np is None:
-                    input_ids_np = self.input_ids_cpu.numpy()
-                    self.input_ids_np = input_ids_np
                 np.take(
                     self.input_batch.token_ids_cpu.ravel(),
                     token_indices,
-                    out=input_ids_np[:total_num_scheduled_tokens],
+                    out=self.input_ids_cpu.numpy()[:total_num_scheduled_tokens],
                 )
             else:
                 torch.index_select(
@@ -7849,10 +7855,7 @@ class TPUModelRunner(GPUModelRunner):
                 lengths.append(num_reqs)
             if num_reqs >= min(num_tokens, self.max_num_reqs):
                 break
-        if getattr(self, "_is_async_drafter", False) and not (
-            getattr(self, "_pcp_enabled", False)
-            and getattr(self, "_mtp_enabled", False)
-        ):
+        if self._is_async_drafter and not self._mtp_prefill_only:
             k = self.speculative_config.num_speculative_tokens
             max_logits_len = _get_padded_token_len(
                 self.num_tokens_paddings,
@@ -7872,10 +7875,7 @@ class TPUModelRunner(GPUModelRunner):
     def _from_hidden_states_lengths(self) -> list[int]:
         lengths = list(self.num_reqs_paddings)
         seen = set(lengths)
-        if getattr(self, "_is_async_drafter", False) and not (
-            getattr(self, "_pcp_enabled", False)
-            and getattr(self, "_mtp_enabled", False)
-        ):
+        if self._is_async_drafter and not self._mtp_prefill_only:
             k = self.speculative_config.num_speculative_tokens
             max_logits_len = _get_padded_token_len(
                 self.num_tokens_paddings,
