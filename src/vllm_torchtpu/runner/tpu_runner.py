@@ -115,6 +115,7 @@ from vllm_torchtpu.kernels.experimental.batched_rpa import wrapper as rpa_batche
 from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
 from vllm_torchtpu.layers.adapter import (
     dp_vocab_parallel,
+    expert_count_tap,
     expert_placement,
     token_padding,
 )
@@ -4166,6 +4167,7 @@ class TPUModelRunner(GPUModelRunner):
             # Before anything reads the step layout, the DP token sync
             # included: the rest of the step runs on the trimmed copy.
             scheduler_output = self._adaptive_verification.trim(scheduler_output)
+        expert_count_tap.maybe_dump()
         # Update cached state
         self._update_states(scheduler_output)
         if self.scheduler_config.async_scheduling:
