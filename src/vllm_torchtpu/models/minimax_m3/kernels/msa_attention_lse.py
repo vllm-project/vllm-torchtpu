@@ -31,6 +31,10 @@ from vllm_torchtpu.models.minimax_m3.kernels import msa_attention, msa_fp4
 
 # Page counts a kernel step may run at besides the full group (`_kernel`).
 _STEP_WIDTHS = (4, 8)
+# Tiles per grid step: a step runs the groups of this many tiles in a loop.
+# One step per group paid a per-step cost worth ~2-3% of the call (pool48
+# selections, 1-2 groups a tile; bench j-caec1354).
+TILES_PER_STEP = 4
 _LOG2_E = math.log2(math.e)
 _LN_2 = math.log(2.0)
 
@@ -54,6 +58,9 @@ def _kernel(
     sm_scale: float,
     aliased: bool = False,
     fp4_rows: tuple[int, int] | str | None = None,
+    block_start_ref=None,
+    tiles_per_step: int = 1,
+    groups_per_tile: int = 1,
 ):
     """`msa_attention._kernel_v2` that also writes ``lse = m + log(l)``
     (``-inf`` for a row that sees no slot; its output is 0). Scores, the
@@ -76,197 +83,229 @@ def _kernel(
 
     A 4-bit cache (`fp4_rows`: static K / V scale-page rows, or ``"head"``
     for rows ``2k, 2k + 1`` of the cache-row KV head ``k``) copies each
-    page's scale page beside it."""
+    page's scale page beside it.
+
+    Grid step ``b`` runs the groups ``block_start_ref[b] ..
+    block_start_ref[b + 1] - 1`` of its `tiles_per_step` tiles in a loop
+    (the last entry is the call's group count); the query, selection and
+    output blocks hold those tiles."""
     fp4 = fp4_rows is not None
     tail = refs[len(refs) - (9 if fp4 else 7) :]
     o_ref, lse_ref, m_ref, l_ref, acc_ref, buf_ref, sem_ref = tail[:7]
     scale_hbm_ref = refs[0] if fp4 else None
     scale_buf_ref, scale_sem_ref = tail[7:] if fp4 else (None, None)
     pages_per_step = buf_ref.shape[1]
-    w = pl.program_id(0)
-    meta = work_meta_ref[w]
-    count = work_count_ref[w]
-    num_heads, block_q, head_dim = q_ref.shape
-    rows_per_page, packing, row_width = buf_ref.shape[3:]
-    page_size = rows_per_page * (msa_fp4.TOKENS_PER_WORD if fp4 else packing)
-    half = w % 2
-    first = (meta & msa_attention._FIRST_BIT) != 0
-    last = (meta & msa_attention._LAST_BIT) != 0
+    num_groups = block_start_ref[pl.num_programs(0)]
 
-    def page_copies(half, g, page):
-        src = kv_hbm_ref.at[
-            pl.ds(page, 1), :, :, pl.ds(head_ref[0] * row_width, row_width)
-        ]
-        copies = [pltpu.make_async_copy(src, buf_ref.at[half, g], sem_ref.at[half, g])]
-        if fp4:
-            copies.append(
-                pltpu.make_async_copy(
-                    scale_hbm_ref.at[pl.ds(page, 1)],
-                    scale_buf_ref.at[half, g],
-                    scale_sem_ref.at[half, g],
+    def group(
+        w,
+        q_ref=q_ref,
+        o_ref=o_ref,
+        lse_ref=lse_ref,
+        selected_ref=selected_ref,
+        local_page_ref=local_page_ref,
+        local_limit_ref=local_limit_ref,
+    ):
+        if tiles_per_step > 1:
+            tile = msa_attention._meta_tile(work_meta_ref[w], groups_per_tile)
+            bq = q_ref.shape[1] // tiles_per_step
+            rows = pl.ds(pl.multiple_of(tile % tiles_per_step * bq, bq), bq)
+            q_ref = q_ref.at[:, rows, :]
+            o_ref = o_ref.at[:, rows, :]
+            selected_ref = selected_ref.at[rows, :]
+            local_page_ref = local_page_ref.at[rows, :]
+            local_limit_ref = local_limit_ref.at[rows, :]
+            lse_ref = lse_ref.at[:, pl.ds(tile % tiles_per_step, 1)]
+        meta = work_meta_ref[w]
+        count = work_count_ref[w]
+        num_heads, block_q, head_dim = q_ref.shape
+        rows_per_page, packing, row_width = buf_ref.shape[3:]
+        page_size = rows_per_page * (msa_fp4.TOKENS_PER_WORD if fp4 else packing)
+        half = w % 2
+        first = (meta & msa_attention._FIRST_BIT) != 0
+        last = (meta & msa_attention._LAST_BIT) != 0
+
+        def page_copies(half, g, page):
+            src = kv_hbm_ref.at[
+                pl.ds(page, 1), :, :, pl.ds(head_ref[0] * row_width, row_width)
+            ]
+            copies = [pltpu.make_async_copy(src, buf_ref.at[half, g], sem_ref.at[half, g])]
+            if fp4:
+                copies.append(
+                    pltpu.make_async_copy(
+                        scale_hbm_ref.at[pl.ds(page, 1)],
+                        scale_buf_ref.at[half, g],
+                        scale_sem_ref.at[half, g],
+                    )
                 )
-            )
-        return copies
+            return copies
 
-    def start_group(group, half):
-        base = msa_attention._slot(work_meta_ref[group], pages_per_step, 0)
+        def start_group(group, half):
+            base = msa_attention._slot(work_meta_ref[group], pages_per_step, 0)
 
-        def start(g, carry):
-            for copy in page_copies(half, g, page_table_ref[work_page_ref[base + g]]):
-                copy.start()
+            def start(g, carry):
+                for copy in page_copies(half, g, page_table_ref[work_page_ref[base + g]]):
+                    copy.start()
+                return carry
+
+            jax.lax.fori_loop(0, work_count_ref[group], start, 0)
+
+        @pl.when(w == 0)
+        def _first():
+            start_group(0, 0)
+
+        @pl.when(w + 1 < num_groups)
+        def _next():
+            start_group(w + 1, 1 - half)
+
+        def wait(g, carry):
+            for copy in page_copies(half, g, 0):  # the source only sizes the wait
+                copy.wait()
             return carry
 
-        jax.lax.fori_loop(0, work_count_ref[group], start, 0)
+        jax.lax.fori_loop(0, count, wait, 0)
 
-    @pl.when(w == 0)
-    def _first():
-        start_group(0, 0)
+        kv_refs = [buf_ref.at[half, g] for g in range(pages_per_step)]
 
-    @pl.when(w + 1 < pl.num_programs(0))
-    def _next():
-        start_group(w + 1, 1 - half)
+        @pl.when(first & jnp.logical_not(last))
+        def _init():
+            m_ref[...] = jnp.full_like(m_ref, msa_attention._MASK_VALUE)
+            l_ref[...] = jnp.zeros_like(l_ref)
+            acc_ref[...] = jnp.zeros_like(acc_ref)
 
-    def wait(g, carry):
-        for copy in page_copies(half, g, 0):  # the source only sizes the wait
-            copy.wait()
+        def write(out, lse):
+            o_ref[...] = out.reshape(num_heads, block_q, head_dim).astype(o_ref.dtype)
+            lse_ref[...] = lse.T.reshape(lse_ref.shape)  # lane-dense row
+
+        def finish(m, denom, acc):
+            """Output and lse from a tile's softmax state (log2 units, ``m``
+            finite). A row that saw no slot has ``denom = 0`` and ``acc = 0``:
+            its output is 0 and its lse ``m + log(0) = -inf`` with no select (a
+            seen row has ``denom >= 1``)."""
+            write(acc * (1.0 / jnp.maximum(denom, 1.0)), m * _LN_2 + jnp.log(denom))
+
+        def attend(width, single):
+            """One softmax update over the group's first `width` slots; a
+            `single` group (the tile's only one) needs no carried state."""
+            # int4 and fp8 pages unpack in slot order; bf16 in the bitcast's order.
+            row_slots = (
+                jax.lax.broadcasted_iota(jnp.int32, (page_size, 1), 0)
+                if fp4 or packing == 4
+                else msa_attention._bitcast_slots(rows_per_page, packing)
+            )  # [S, 1]
+            slots = row_slots.T  # [1, S]
+            selected = selected_ref[...]
+            local_page = local_page_ref[...]
+            local_limit = local_limit_ref[...]
+            keys, values, masks, k_scales, v_scales = [], [], [], [], []
+            for g, kv_ref in enumerate(kv_refs[:width]):
+                page = work_page_ref[msa_attention._slot(meta, pages_per_step, g)]
+                is_selected = jnp.max(
+                    (selected == page).astype(jnp.int32), axis=1, keepdims=True
+                )
+                limit = jnp.where(local_page == page, local_limit, page_size)
+                limit = jnp.where(page >= 0, limit * is_selected, 0)  # [Bq, 1]
+                seen = jnp.max(limit)
+                if fp4:
+                    # Stale or unwritten slots hold finite int4 values and
+                    # scales that `_fp4_page` reads as 0 when non-finite, so
+                    # their p = 0 contributes nothing.
+                    if fp4_rows == "head":
+                        k_row = 2 * head_ref[0]
+                        v_row = k_row + 1
+                    else:
+                        k_row, v_row = fp4_rows
+                    rows, sk, sv = msa_attention._fp4_page(
+                        kv_ref, scale_buf_ref.at[half, g], k_row, v_row
+                    )
+                    values.append(rows[:, head_dim:])
+                    k_scales.append(sk)
+                    v_scales.append(sv)
+                elif packing == 4:
+                    # The packed [S / 4, 4, 2D] page read as [S, 2D] rows: slot
+                    # r * 4 + j at row r * 4 + j, and a cheaper relayout than the
+                    # 32-bit words' bitcast (16 vs 30 bundles a page, AOT).
+                    rows = kv_ref[0].reshape(page_size, -1).astype(jnp.bfloat16)
+                    values.append(jnp.where(row_slots < seen, rows[:, head_dim:], 0))
+                else:
+                    rows = msa_attention._page_rows(kv_ref, seen)
+                    values.append(rows[:, head_dim:])
+                keys.append(rows[:, :head_dim])
+                masks.append(slots < limit)  # [Bq, S]
+            k = jnp.concatenate(keys, axis=0)
+            v = jnp.concatenate(values, axis=0)
+            mask = jnp.concatenate(masks, axis=1)
+            mask = jnp.concatenate([mask] * num_heads, axis=0)
+
+            scale = sm_scale * _LOG2_E
+            q = q_ref[...].reshape(num_heads * block_q, head_dim)
+            if not fp4:
+                q = (q.astype(jnp.float32) * scale).astype(q.dtype)
+            s = jax.lax.dot_general(
+                q, k, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
+            )
+            if fp4:  # x = int4 * scale: K scales the score columns, V scales p
+                s = s * (jnp.concatenate(k_scales, axis=1) * scale)
+            s = jnp.where(mask, s, -jnp.inf)
+
+            # The running max starts at a finite floor (`_MASK_VALUE`), so a row
+            # with no visible slot gets p = exp2(-inf) = 0, not exp2(nan).
+            m_prev = m_ref[...] if not single else msa_attention._MASK_VALUE
+            m_new = jnp.maximum(m_prev, jnp.max(s, axis=1, keepdims=True))
+            p = jnp.exp2(s - m_new)
+            l_cur = jnp.sum(p, axis=1, keepdims=True)
+            p_v = p * jnp.concatenate(v_scales, axis=1) if fp4 else p
+            pv = jax.lax.dot_general(
+                p_v.astype(v.dtype),
+                v,
+                (((1,), (0,)), ((), ())),
+                preferred_element_type=jnp.float32,
+            )
+            if single:
+                finish(m_new, l_cur, pv)
+                return
+            alpha = jnp.exp2(m_prev - m_new)
+            l_new = alpha * l_ref[...] + l_cur
+            acc_new = alpha * acc_ref[...] + pv
+
+            @pl.when(last)
+            def _finalize():
+                finish(m_new, l_new, acc_new)
+
+            @pl.when(jnp.logical_not(last))
+            def _carry():
+                m_ref[...] = m_new
+                l_ref[...] = l_new
+                acc_ref[...] = acc_new
+
+        # Slots past the group's pages hold stale bytes: their limits are 0, so
+        # their scores are masked and their value rows zeroed.
+        # Run at the narrowest width holding the group's pages. A step costs per
+        # score column, filled or not (~2.3 us at 16 pages, ~1.1 us at 4, twin
+        # standalone j-952e8a64), and a 16-token tile's union is ~8-12 of its
+        # rank's pages at DCP 2, ~2-8 at DCP 8.
+        single = first & last
+        widths = [n for n in _STEP_WIDTHS if n < pages_per_step] + [pages_per_step]
+        for i, width in enumerate(widths):
+            fits = count > (widths[i - 1] if i else 0)
+            if width < pages_per_step:
+                fits = fits & (count <= width)
+            pl.when(fits & single)(functools.partial(attend, width, True))
+            pl.when(fits & jnp.logical_not(single))(functools.partial(attend, width, False))
+
+        @pl.when(count == 0)
+        def _empty():  # a tile of padding tokens: its only group holds no page
+            write(
+                jnp.zeros((num_heads * block_q, head_dim), jnp.float32),
+                jnp.full((num_heads * block_q, 1), -jnp.inf, jnp.float32),
+            )
+
+    def loop(w, carry):
+        group(w)
         return carry
 
-    jax.lax.fori_loop(0, count, wait, 0)
-
-    kv_refs = [buf_ref.at[half, g] for g in range(pages_per_step)]
-
-    @pl.when(first & jnp.logical_not(last))
-    def _init():
-        m_ref[...] = jnp.full_like(m_ref, msa_attention._MASK_VALUE)
-        l_ref[...] = jnp.zeros_like(l_ref)
-        acc_ref[...] = jnp.zeros_like(acc_ref)
-
-    def write(out, lse):
-        o_ref[...] = out.reshape(num_heads, block_q, head_dim).astype(o_ref.dtype)
-        lse_ref[...] = lse.T.reshape(lse_ref.shape)  # lane-dense row
-
-    def finish(m, denom, acc):
-        """Output and lse from a tile's softmax state (log2 units, ``m``
-        finite). A row that saw no slot has ``denom = 0`` and ``acc = 0``:
-        its output is 0 and its lse ``m + log(0) = -inf`` with no select (a
-        seen row has ``denom >= 1``)."""
-        write(acc * (1.0 / jnp.maximum(denom, 1.0)), m * _LN_2 + jnp.log(denom))
-
-    def attend(width, single):
-        """One softmax update over the group's first `width` slots; a
-        `single` group (the tile's only one) needs no carried state."""
-        # int4 and fp8 pages unpack in slot order; bf16 in the bitcast's order.
-        row_slots = (
-            jax.lax.broadcasted_iota(jnp.int32, (page_size, 1), 0)
-            if fp4 or packing == 4
-            else msa_attention._bitcast_slots(rows_per_page, packing)
-        )  # [S, 1]
-        slots = row_slots.T  # [1, S]
-        selected = selected_ref[...]
-        local_page = local_page_ref[...]
-        local_limit = local_limit_ref[...]
-        keys, values, masks, k_scales, v_scales = [], [], [], [], []
-        for g, kv_ref in enumerate(kv_refs[:width]):
-            page = work_page_ref[msa_attention._slot(meta, pages_per_step, g)]
-            is_selected = jnp.max(
-                (selected == page).astype(jnp.int32), axis=1, keepdims=True
-            )
-            limit = jnp.where(local_page == page, local_limit, page_size)
-            limit = jnp.where(page >= 0, limit * is_selected, 0)  # [Bq, 1]
-            seen = jnp.max(limit)
-            if fp4:
-                # Stale or unwritten slots hold finite int4 values and
-                # scales that `_fp4_page` reads as 0 when non-finite, so
-                # their p = 0 contributes nothing.
-                if fp4_rows == "head":
-                    k_row = 2 * head_ref[0]
-                    v_row = k_row + 1
-                else:
-                    k_row, v_row = fp4_rows
-                rows, sk, sv = msa_attention._fp4_page(
-                    kv_ref, scale_buf_ref.at[half, g], k_row, v_row
-                )
-                values.append(rows[:, head_dim:])
-                k_scales.append(sk)
-                v_scales.append(sv)
-            elif packing == 4:
-                # The packed [S / 4, 4, 2D] page read as [S, 2D] rows: slot
-                # r * 4 + j at row r * 4 + j, and a cheaper relayout than the
-                # 32-bit words' bitcast (16 vs 30 bundles a page, AOT).
-                rows = kv_ref[0].reshape(page_size, -1).astype(jnp.bfloat16)
-                values.append(jnp.where(row_slots < seen, rows[:, head_dim:], 0))
-            else:
-                rows = msa_attention._page_rows(kv_ref, seen)
-                values.append(rows[:, head_dim:])
-            keys.append(rows[:, :head_dim])
-            masks.append(slots < limit)  # [Bq, S]
-        k = jnp.concatenate(keys, axis=0)
-        v = jnp.concatenate(values, axis=0)
-        mask = jnp.concatenate(masks, axis=1)
-        mask = jnp.concatenate([mask] * num_heads, axis=0)
-
-        scale = sm_scale * _LOG2_E
-        q = q_ref[...].reshape(num_heads * block_q, head_dim)
-        if not fp4:
-            q = (q.astype(jnp.float32) * scale).astype(q.dtype)
-        s = jax.lax.dot_general(
-            q, k, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
-        )
-        if fp4:  # x = int4 * scale: K scales the score columns, V scales p
-            s = s * (jnp.concatenate(k_scales, axis=1) * scale)
-        s = jnp.where(mask, s, -jnp.inf)
-
-        # The running max starts at a finite floor (`_MASK_VALUE`), so a row
-        # with no visible slot gets p = exp2(-inf) = 0, not exp2(nan).
-        m_prev = m_ref[...] if not single else msa_attention._MASK_VALUE
-        m_new = jnp.maximum(m_prev, jnp.max(s, axis=1, keepdims=True))
-        p = jnp.exp2(s - m_new)
-        l_cur = jnp.sum(p, axis=1, keepdims=True)
-        p_v = p * jnp.concatenate(v_scales, axis=1) if fp4 else p
-        pv = jax.lax.dot_general(
-            p_v.astype(v.dtype),
-            v,
-            (((1,), (0,)), ((), ())),
-            preferred_element_type=jnp.float32,
-        )
-        if single:
-            finish(m_new, l_cur, pv)
-            return
-        alpha = jnp.exp2(m_prev - m_new)
-        l_new = alpha * l_ref[...] + l_cur
-        acc_new = alpha * acc_ref[...] + pv
-
-        @pl.when(last)
-        def _finalize():
-            finish(m_new, l_new, acc_new)
-
-        @pl.when(jnp.logical_not(last))
-        def _carry():
-            m_ref[...] = m_new
-            l_ref[...] = l_new
-            acc_ref[...] = acc_new
-
-    # Slots past the group's pages hold stale bytes: their limits are 0, so
-    # their scores are masked and their value rows zeroed.
-    # Run at the narrowest width holding the group's pages. A step costs per
-    # score column, filled or not (~2.3 us at 16 pages, ~1.1 us at 4, twin
-    # standalone j-952e8a64), and a 16-token tile's union is ~8-12 of its
-    # rank's pages at DCP 2, ~2-8 at DCP 8.
-    single = first & last
-    widths = [n for n in _STEP_WIDTHS if n < pages_per_step] + [pages_per_step]
-    for i, width in enumerate(widths):
-        fits = count > (widths[i - 1] if i else 0)
-        if width < pages_per_step:
-            fits = fits & (count <= width)
-        pl.when(fits & single)(functools.partial(attend, width, True))
-        pl.when(fits & jnp.logical_not(single))(functools.partial(attend, width, False))
-
-    @pl.when(count == 0)
-    def _empty():  # a tile of padding tokens: its only group holds no page
-        write(
-            jnp.zeros((num_heads * block_q, head_dim), jnp.float32),
-            jnp.full((num_heads * block_q, 1), -jnp.inf, jnp.float32),
-        )
+    b = pl.program_id(0)
+    jax.lax.fori_loop(block_start_ref[b], block_start_ref[b + 1], loop, 0)
 
 
 def _attention_call(
@@ -311,9 +350,10 @@ def _attention_call(
     # One KV head's [K | V] slice of each row.
     row_width = 2 * head_dim
     topk = selected.shape[2]
-    packed, num_groups = work
+    packed, tiles, tiles_per_step = work
     groups_per_tile = msa_attention._groups_per_tile(block_q, topk, pages_per_step)
-    max_groups = packed.shape[0] // (pages_per_step + 2)
+    num_steps = tiles // tiles_per_step
+    max_groups = tiles * groups_per_tile
     union_len = max_groups * pages_per_step
 
     def kernel(packed_ref, *refs, **kwargs):
@@ -322,12 +362,12 @@ def _attention_call(
             packed_ref.at[pl.ds(union_len, max_groups)],
             packed_ref.at[pl.ds(union_len + max_groups, max_groups)],
             *refs,
+            block_start_ref=packed_ref.at[pl.ds(union_len + 2 * max_groups, num_steps + 1)],
             **kwargs,
         )
 
-    def tile_block(w, packed, table, heads, offset):
-        meta = packed[union_len + w]
-        return (offset[0] + msa_attention._meta_tile(meta, groups_per_tile), 0)
+    def tile_block(b, packed, table, heads, offset):
+        return (offset[0] // tiles_per_step + b, 0)
 
     def head_major_block(w, *prefetch):
         return (prefetch[2][1], *tile_block(w, *prefetch))
@@ -349,19 +389,19 @@ def _attention_call(
     )
     grid_spec = pltpu.PrefetchScalarGridSpec(
         num_scalar_prefetch=4,
-        grid=(num_groups,),
+        grid=(num_steps,),
         in_specs=[
-            pl.BlockSpec((num_heads, block_q, head_dim), head_major_block),
-            pl.BlockSpec((None, block_q, topk), head_major_block),
-            pl.BlockSpec((block_q, 1), tile_block),
-            pl.BlockSpec((block_q, 1), tile_block),
+            pl.BlockSpec((num_heads, tiles_per_step * block_q, head_dim), head_major_block),
+            pl.BlockSpec((None, tiles_per_step * block_q, topk), head_major_block),
+            pl.BlockSpec((tiles_per_step * block_q, 1), tile_block),
+            pl.BlockSpec((tiles_per_step * block_q, 1), tile_block),
             pl.BlockSpec(memory_space=pl.ANY),
             *(pl.BlockSpec(memory_space=pl.ANY) for _ in scale_inputs),
             *in_place,
         ],
         out_specs=[
-            pl.BlockSpec((num_heads, block_q, head_dim), head_major_block),
-            pl.BlockSpec((1, 1, 1, num_heads * block_q), lse_block),
+            pl.BlockSpec((num_heads, tiles_per_step * block_q, head_dim), head_major_block),
+            pl.BlockSpec((1, tiles_per_step, 1, num_heads * block_q), lse_block),
         ],
         scratch_shapes=[
             pltpu.VMEM((num_heads * block_q, 1), jnp.float32),
@@ -381,6 +421,8 @@ def _attention_call(
             kernel,
             sm_scale=sm_scale,
             aliased=aliased,
+            tiles_per_step=tiles_per_step,
+            groups_per_tile=groups_per_tile,
             **({"fp4_rows": scale_rows} if fp4 else {}),
         ),
         grid_spec=grid_spec,
@@ -422,17 +464,33 @@ def _attention_call(
     )
 
 
+def _tiles_per_step(num_tiles: int) -> int:
+    """The most tiles (up to `TILES_PER_STEP`) a grid step can take evenly."""
+    return next(n for n in range(TILES_PER_STEP, 0, -1) if num_tiles % n == 0)
+
+
 def _packed_work(selected, block_q, pages_per_step):
     """`msa_attention._work_list` of each call's ``selected [C, T, K]`` as
-    one int32 row per call, ``[unions | meta words | counts]``, and each
-    call's group count: a call then takes one slice of its work list, not
-    one per array (each an XLA op of ~1.3 us, x 4 calls x G per layer)."""
+    one int32 row per call, ``[unions | meta words | counts | step
+    starts]``, and the tiles each grid step takes: a call then takes one
+    slice of its work list, not one per array (each an XLA op of ~1.3 us,
+    x 4 calls x G per layer). Step ``b``'s first group is its
+    ``tiles_per_step * b``-th tile's; the last entry is the group count."""
     pages, meta, ends, counts = jax.vmap(
         functools.partial(
             msa_attention._work_list, block_q=block_q, pages_per_step=pages_per_step
         )
     )(selected)
-    return jnp.concatenate([pages, meta, counts], axis=1), ends
+    num_tiles = selected.shape[1] // block_q
+    tiles_per_step = _tiles_per_step(num_tiles)
+    groups_per_tile = msa_attention._groups_per_tile(
+        block_q, selected.shape[2], pages_per_step
+    )
+    live = jnp.arange(meta.shape[1], dtype=jnp.int32)[None] < ends[:, None]
+    tile = jnp.where(live, msa_attention._meta_tile(meta, groups_per_tile), num_tiles)
+    bounds = jnp.arange(0, num_tiles + 1, tiles_per_step, dtype=jnp.int32)
+    starts = jnp.sum(tile[:, None, :] < bounds[None, :, None], axis=2, dtype=jnp.int32)
+    return jnp.concatenate([pages, meta, counts, starts], axis=1), tiles_per_step
 
 
 def _chunked_call(
@@ -497,7 +555,7 @@ def _chunked_call(
     # Every call's work list in one batched pass ahead of the loop: built
     # per call inside it, each call paid its own two union sorts and glue
     # (~9 us per call, x G x 4 calls per layer).
-    packed, ends = _packed_work(
+    packed, tiles_per_step = _packed_work(
         selected.reshape(num_heads * num_chunks, step, selected.shape[2]),
         block_q,
         pages_per_step,
@@ -517,7 +575,7 @@ def _chunked_call(
             heads,
             offset,
             out,
-            (packed[i], ends[i]),
+            (packed[i], step // block_q, tiles_per_step),
         )
 
     out = head_chunk(0, None)
