@@ -173,7 +173,13 @@ class PrefixTokenCache:
                     break
 
         b: bytes | None = None
+        # Read below only when matched_entry is set, which also sets them.
+        p0 = 0
+        suf_text = ""
+        suf_b = b""
         if matched_entry is not None:
+            # The match loop above takes only entries that have a hash.
+            assert matched_entry.prefix_hash is not None
             cpos0 = len(matched_entry.prefix_str)
             p0 = matched_entry.bpos[-1]
             suf_text = text[cpos0:]
@@ -496,6 +502,7 @@ def maybe_install_tokenize_prefix_cache() -> bool:
             logger.warning("[QX_TOKCACHE] error %r; falling back", e)
         return orig(self, prompt, params)
 
+    # pyrefly: ignore[missing-attribute]
     _tokenize_prompt.__qx_tokcache__ = True
     rbase.BaseRenderer._tokenize_prompt = _tokenize_prompt
     _INSTALLED = True
