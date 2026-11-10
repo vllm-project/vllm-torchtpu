@@ -124,8 +124,10 @@ from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadata,
     AttentionMetadataBuilder,
     AttentionMetadataBuilderContext,
+    MambaStackRef,
     attention_block_table_width,
     stage_block_table_uploads,
+    stacked_mamba_metadata,
     stage_h2d_upload,
     zeros_h2d_source,
 )
@@ -265,7 +267,7 @@ def _update_read_offsets_impl(
     sampler output ([>= num_reqs, K+1], INVALID_TOKEN_ID-padded); `num_reqs`
     a 0-d tensor, so it enters as a value, not a shape. Rows past it take
     offset 0 (their slots are the null block)."""
-    width = groups[0].shape[0]
+    width = groups[0].shape[-1]
     rows = next_tokens.shape[0]
     if rows >= width:
         next_tokens = next_tokens[:width]
@@ -276,8 +278,25 @@ def _update_read_offsets_impl(
     num_valid = (next_tokens != INVALID_TOKEN_ID).sum(dim=1)
     valid = torch.arange(width, device=read_offsets.device) < num_reqs
     offsets = torch.where(valid, (num_valid - 1).clamp(min=0), 0).to(read_offsets.dtype)
+    if any(g.ndim == 2 for g in groups):
+        # VLLM_TPU_STAGED_WALK_STACKED: [G, width] stacks; row-major flattening
+        # is the per-group concatenation order.
+        indices = torch.cat([g.reshape(-1) for g in groups], dim=0).long()
+        read_offsets.index_put_(
+            (indices,), offsets.repeat(sum(g.numel() // width for g in groups))
+        )
+        return
     indices = torch.cat(groups, dim=0).long() if len(groups) > 1 else groups[0].long()
     read_offsets.index_put_((indices,), offsets.repeat(len(groups)))
+
+
+def _flat_mamba_groups(groups: list[torch.Tensor]) -> list[torch.Tensor]:
+    """Per-group [width] slot tensors; a VLLM_TPU_STAGED_WALK_STACKED
+    [G, width] stack is split into its rows (eager views: only the rare
+    non-default read-offset paths take this)."""
+    if not any(g.ndim == 2 for g in groups):
+        return groups
+    return [r for g in groups for r in (g.unbind(0) if g.ndim == 2 else (g,))]
 
 
 def _spec_seed_rows_impl(
@@ -1991,13 +2010,20 @@ class TPUModelRunner(GPUModelRunner):
                 ckpt = None
                 if compact is not None:
                     state = compact
-                elif unified:
-                    state, ckpt = products[gid]
                 else:
                     state = None
+                ref = None
+                if unified and isinstance(products[gid], MambaStackRef):
+                    # VLLM_TPU_STAGED_WALK_STACKED: a row of the walk's stack.
+                    ref, state, ckpt = products[gid], None, None
+                elif compact is None and unified:
+                    state, ckpt = products[gid]
                 if unified and ctx.unified_mamba_state_indices is not None:
-                    ctx.unified_mamba_state_indices.append(state)
-                built = AttentionMetadata(
+                    if ref is None:
+                        ctx.unified_mamba_state_indices.append(state)
+                    elif ref.row == 0:
+                        ctx.unified_mamba_state_indices.append(ref.state_stack)
+                md_kwargs = dict(
                     block_tables=staged[gid],
                     mamba_state_indices=state,
                     mamba_slot_read_offsets=ctx.mamba_slot_read_offsets,
@@ -2005,6 +2031,11 @@ class TPUModelRunner(GPUModelRunner):
                     mamba_request_distribution=ctx.mamba_request_distribution,
                     mamba_prefill_ckpt=ctx.mamba_prefill_ckpt,
                     **shared,
+                )
+                built = (
+                    AttentionMetadata(**md_kwargs)
+                    if ref is None
+                    else stacked_mamba_metadata(ref, **md_kwargs)
                 )
             else:
                 built = AttentionMetadata(block_tables=staged[gid], **shared)
@@ -4899,6 +4930,7 @@ class TPUModelRunner(GPUModelRunner):
                 self._num_reqs_tensor(num_reqs),
             )
             return
+        indices_per_group = _flat_mamba_groups(indices_per_group)
         offsets = torch.zeros(
             indices_per_group[0].shape[0],
             dtype=torch.int32,
@@ -4998,6 +5030,11 @@ class TPUModelRunner(GPUModelRunner):
         groups = self._mamba_state_index_groups()
         if not groups:
             return
+        stacks = None
+        if any(g.ndim == 2 for g in groups):
+            # VLLM_TPU_STAGED_WALK_STACKED: already [G, width] per class.
+            stacks = groups
+            groups = [g[0] if g.ndim == 2 else g for g in groups[:1]]
         req_ids = self.input_batch.req_ids
         self._mamba_offset_seeded.intersection_update(self.requests)
 
@@ -5018,7 +5055,16 @@ class TPUModelRunner(GPUModelRunner):
             return
         keep_dev.copy_(keep, non_blocking=True)
         # Stack groups and reset offsets across all groups in one compiled program.
-        stacked = torch.stack(groups) if len(groups) > 1 else groups[0].unsqueeze(0)
+        if stacks is not None:
+            stacked = (
+                torch.cat([g if g.ndim == 2 else g.unsqueeze(0) for g in stacks])
+                if len(stacks) > 1
+                else stacks[0]
+            )
+        else:
+            stacked = (
+                torch.stack(groups) if len(groups) > 1 else groups[0].unsqueeze(0)
+            )
         _reset_read_offsets(self.mamba_slot_read_offsets, keep_dev, stacked, null)
 
     def _read_offset_reset_scratch(
@@ -5327,7 +5373,7 @@ class TPUModelRunner(GPUModelRunner):
             # Pad/truncate to the slot groups' width and scatter eagerly, instead
             # of a compiled program that mutates the slot buffer (and its aot
             # mutation epilogue). Padded rows' slots are the null block.
-            groups = list(ro_groups)
+            groups = _flat_mamba_groups(list(ro_groups))
             width = groups[0].shape[0]
             rows = row_offsets.shape[0]
             vals = (
