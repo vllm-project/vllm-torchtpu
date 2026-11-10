@@ -10977,7 +10977,7 @@ class TPUModelRunner(GPUModelRunner):
         output_token_ids under the runner's optimistic placeholders.
         """
         sched = getattr(self, "scheduler_config", None)
-        if sched is None or not sched.async_scheduling:
+        if not getattr(sched, "async_scheduling", False):
             return 1
         assert self.speculative_config is not None
         return 1 + self.speculative_config.num_speculative_tokens

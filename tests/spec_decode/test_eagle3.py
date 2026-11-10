@@ -3262,6 +3262,7 @@ def test_draft_post_step0_fused_matches_unfused_carries_and_step1_inputs(advance
     assert torch.equal(torch.stack(steps, dim=1), stacked[:, 1:])
 
 
+@pytest.mark.tpu_test
 def test_prepare_draft_inputs_device_seed_pure_partial_prefill_uses_bucketed_fast_path(
     device, monkeypatch
 ):
