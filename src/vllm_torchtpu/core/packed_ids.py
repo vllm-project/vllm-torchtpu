@@ -78,9 +78,7 @@ def _safe_to_pack(new_req) -> bool:
         return False
     if getattr(sp, "prompt_logprobs", None) is not None:
         return False
-    if getattr(sp, "extra_args", None):
-        return False
-    return True
+    return not getattr(sp, "extra_args", None)
 
 
 def pack_new_request_prompt_ids(scheduler_output, min_len: int = 1024) -> int:

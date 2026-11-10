@@ -11,8 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""TPU_SCHED_PAW_MEMO_XSTEP: a find_longest_cache_hit result reused across
-scheduler steps must equal a fresh lookup exactly.
+"""Cross-step memo: a find_longest_cache_hit result reused across scheduler
+steps must equal a fresh lookup exactly.
 
 Drives a real vLLM v0.29 hybrid KVCacheManager (full attention + 2 Mamba
 "align" groups, fine-grained hash block 2 < block 4, eagle drop on) through
@@ -21,7 +21,6 @@ clears and prefix-cache resets, and compares every memoized lookup with a fresh
 one."""
 
 import random
-from types import SimpleNamespace
 
 import pytest
 
@@ -35,7 +34,6 @@ from vllm.v1.core.kv_cache_utils import (  # noqa: E402
     get_request_block_hasher,
     init_none_hash,
 )
-from vllm.v1.core.sched.scheduler import Scheduler  # noqa: E402
 from vllm.v1.kv_cache_interface import (  # noqa: E402
     FullAttentionSpec,
     KVCacheConfig,
@@ -45,6 +43,7 @@ from vllm.v1.kv_cache_interface import (  # noqa: E402
 from vllm.v1.request import Request  # noqa: E402
 
 import vllm_torchtpu  # noqa: E402
+from vllm_torchtpu.core import prefix_change_log  # noqa: E402
 from vllm_torchtpu.core.prefix_aware_scheduler import (  # noqa: E402
     PrefixAwareScheduler,
     _hit_signature,
@@ -55,13 +54,9 @@ BS = 4
 
 
 def _begin_step(pool_owner_mgr):
-    """Run the real (patched) Scheduler.schedule prologue: change-log wrapper,
-    then the plugin's unwritten-block clear. The upstream body fails on its
-    first attribute access of the stand-in scheduler, before touching state."""
-    try:
-        Scheduler.schedule(SimpleNamespace(kv_cache_manager=pool_owner_mgr))
-    except AttributeError:
-        pass
+    """Step prologue before ``new_step_starts``: nothing to do on main, where
+    the same-step patch clears the unwritten set in ``new_step_starts`` (the
+    simulation calls it right after this)."""
 
 
 @pytest.fixture
@@ -73,15 +68,16 @@ def patched_pool():
         "get_cached_block",
     )
     saved_pool = {k: BlockPool.__dict__[k] for k in names}
-    saved_sched = Scheduler.__dict__["schedule"]
+    saved_new_step = KVCacheManager.__dict__["new_step_starts"]
     vllm_torchtpu._patch_vllm_same_step_prefix_hits()
+    prefix_change_log.install_epoch()
     init_none_hash(sha256)
     try:
         yield _begin_step
     finally:
         for k, v in saved_pool.items():
             setattr(BlockPool, k, v)
-        Scheduler.schedule = saved_sched
+        KVCacheManager.new_step_starts = saved_new_step
 
 
 def _manager(num_blocks):
@@ -166,10 +162,14 @@ def _simulate(begin_step, seed, steps, verify=0, num_blocks=160):
         nonlocal n
         c = rng.randrange(len(convs))
         if rng.random() < 0.6:
-            convs[c] = convs[c] + [rng.randrange(1000) for _ in range(rng.randint(1, 12))]
+            convs[c] = convs[c] + [
+                rng.randrange(1000) for _ in range(rng.randint(1, 12))
+            ]
         base = convs[c][: rng.randint(1, len(convs[c]))]
         n += 1
-        return _req(f"w{n}", base + [rng.randrange(1000) for _ in range(rng.randint(1, 9))])
+        return _req(
+            f"w{n}", base + [rng.randrange(1000) for _ in range(rng.randint(1, 9))]
+        )
 
     for _ in range(8):
         waiting.append(new_waiting())
@@ -196,8 +196,10 @@ def _simulate(begin_step, seed, steps, verify=0, num_blocks=160):
                 req = waiting.pop(rng.randrange(len(waiting)))
                 blocks, num_hit, _ = mgr.get_computed_blocks(req)
                 remaining = req.num_tokens - num_hit
-                chunk = remaining if rng.random() < 0.5 else max(
-                    1, min(remaining, BS * rng.randint(1, 3))
+                chunk = (
+                    remaining
+                    if rng.random() < 0.5
+                    else max(1, min(remaining, BS * rng.randint(1, 3)))
                 )
                 if mgr.allocate_slots(req, chunk, num_hit, blocks) is not None:
                     req.num_computed_tokens = num_hit + chunk
@@ -251,19 +253,7 @@ def test_runtime_verifier_agrees(patched_pool):
     assert s._memo_xstep and s._memo_verified > 100 and s._memo_hits == 0
 
 
-def test_kill_switch(patched_pool, monkeypatch):
-    monkeypatch.setenv("TPU_SCHED_PAW_MEMO_XSTEP", "0")
-    mgr = _manager(32)
-    s = PrefixAwareScheduler.__new__(PrefixAwareScheduler)
-    s.kv_cache_manager = mgr
-    s._enable_memo_xstep()
-    assert not s._memo_xstep
-    assert "_tpu_prefix_change_log" not in mgr.block_pool.__dict__
-
-
 def test_init_py_untouched_and_install_idempotent(patched_pool):
-    from vllm_torchtpu.core import prefix_change_log
-
     assert prefix_change_log.install()
     wrapped = BlockPool._insert_block_hash
     assert prefix_change_log.install()
@@ -271,3 +261,38 @@ def test_init_py_untouched_and_install_idempotent(patched_pool):
     # The plugin patch must not re-apply on top (it keys on get_cached_block).
     vllm_torchtpu._patch_vllm_same_step_prefix_hits()
     assert BlockPool._insert_block_hash is wrapped
+
+
+def test_epoch_moves_on_every_prefix_cache_mutation(patched_pool):
+    mgr = _manager(32)
+    d = mgr.block_pool.__dict__
+    req = _req("e1", list(range(13)))
+    blocks, num_hit, _ = mgr.get_computed_blocks(req)
+    e0 = d.get("_tpu_prefix_cache_epoch", 0)
+    assert mgr.allocate_slots(req, req.num_tokens, num_hit, blocks) is not None
+    e1 = d["_tpu_prefix_cache_epoch"]
+    assert e1 > e0  # hashes inserted
+    assert d.get("_tpu_unwritten_block_ids")
+    mgr.new_step_starts()
+    assert d["_tpu_prefix_cache_epoch"] == e1 + 1  # the unwritten set cleared
+    assert not d.get("_tpu_unwritten_block_ids")
+    mgr.new_step_starts()
+    assert d["_tpu_prefix_cache_epoch"] == e1 + 1  # nothing to clear
+    mgr.free(req)
+    assert mgr.reset_prefix_cache()
+    assert d["_tpu_prefix_cache_epoch"] > e1 + 1  # hashes removed, then reset
+
+
+def test_without_epoch_counters_there_is_no_memo(monkeypatch):
+    init_none_hash(sha256)
+    mgr = _manager(32)
+    s = PrefixAwareScheduler.__new__(PrefixAwareScheduler)
+    s.kv_cache_manager = mgr
+    s._paw_scoring_broken = False
+    monkeypatch.setattr(prefix_change_log, "epoch_installed", lambda: False)
+    assert s._get_prefix_cache_epoch() is None
+    req = _req("n1", list(range(13)))
+    s._prefix_warmth(req)
+    s._prefix_warmth(req)
+    assert s._memo_computes == 2  # nothing was reused
+    assert getattr(req, "_paw_hit_cache", None) is None
