@@ -15,6 +15,7 @@
 import jax
 import jax.numpy as jnp
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.gdn.v3 import config
 
 
@@ -41,6 +42,12 @@ def invert_triangular_matrix(t: jax.Array, block_size=16) -> jax.Array:
     out_dtype = t.dtype
     chunk = t.shape[-1]
     block_size = min(block_size, chunk)
+    if envs.VLLM_TPU_GDN_MIXED_TILE_POW2:
+        # The blocked solve covers exactly num_blocks * block_size rows; a
+        # remainder would be dropped and surface later as a shape error.
+        assert chunk % block_size == 0, (
+            f"chunk ({chunk}) must be divisible by block_size ({block_size})"
+        )
     num_blocks = chunk // block_size
 
     def local_forward_sub(t_mat, b_mat):

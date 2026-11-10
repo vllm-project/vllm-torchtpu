@@ -776,6 +776,12 @@ def fused_conv1d_gdn(
     padded_batch_size = pl.cdiv(batch_size, packing) * packing
     decode_tile_size = min(decode_tile_size, batch_size)
     mixed_tile_size = min(mixed_tile_size, batch_size)
+    if envs.VLLM_TPU_GDN_MIXED_TILE_POW2 and mixed_tile_size > 1:
+        # Round the static clip down to a power of two so a non-power-of-two
+        # token bucket (24, 40 rows) stays divisible by the triangular
+        # solver's block size (port of PR #2821 ece3d83b5 / PR #2438).
+        # Dynamic tiling already picks powers of two.
+        mixed_tile_size = 1 << (mixed_tile_size.bit_length() - 1)
     aligned_num_v_heads = pl.cdiv(n_v, num_lanes) * num_lanes
     window_size = num_spec_tokens + 1
     decode_vmem_limit_bytes = config.GDNConfig.get_vmem_limit_bytes(window_size)
