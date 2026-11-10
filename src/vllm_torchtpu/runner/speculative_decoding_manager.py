@@ -11,6 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Speculative decoding lifecycle and draft-step orchestration for TPU Runner.
+
+Manages Eagle3 and Qwen3.5 MTP draft model invocation, token verification
+metadata construction, and accepted-token state compaction.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -26,10 +32,6 @@ from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 
 if TYPE_CHECKING:
     from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
-
-
-def _max_index(indices: np.ndarray) -> int:
-    return int(indices.max()) if indices.size > 0 else 0
 
 
 @dataclass
@@ -101,6 +103,10 @@ class SpeculativeDecodingManager:
         # (logits_indices, target_logits_indices, padded_logits_length) from
         # the cached build — needed to re-extract draft_token_ids on a hit.
         self._meta_cache_np: tuple[np.ndarray, np.ndarray, int] | None = None
+        self._meta_lru_cache: dict[
+            tuple[bytes, bytes, int],
+            tuple[SpecDecodeMetadata, tuple[np.ndarray, np.ndarray, int]],
+        ] = {}
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         if self._staged_draft_copy is not None:
@@ -306,19 +312,30 @@ class SpeculativeDecodingManager:
           A SpecDecodeMetadata object containing the necessary indices for
           speculative decoding.
         """
+        # Function-local (tpu_runner imports this module). Bound before the
+        # cache-hit path below uses it too.
+        from vllm_torchtpu.runner.tpu_runner import _h2d_temp
+
         cache_key = (
             num_draft_tokens.tobytes(),
             cu_num_scheduled_tokens.tobytes(),
             padded_num_reqs,
         )
-        if cache_key == self._meta_cache_key:
-            assert self._meta_cache is not None
-            assert self._meta_cache_np is not None
-            logits_indices, target_logits_indices, padded_logits_length = (
-                self._meta_cache_np
-            )
+        cached_entry = (
+            (self._meta_cache, self._meta_cache_np)
+            if cache_key == self._meta_cache_key and self._meta_cache is not None
+            else self._meta_lru_cache.get(cache_key)
+        )
+        if cached_entry is not None:
+            cached_meta, cached_np = cached_entry
+            assert cached_meta is not None
+            assert cached_np is not None
+            self._meta_cache_key = cache_key
+            self._meta_cache = cached_meta
+            self._meta_cache_np = cached_np
+            logits_indices, target_logits_indices, padded_logits_length = cached_np
             # draft_token_ids depends on this step's input_ids_cpu content —
-            # always re-extracted and re-transferred.
+            # always re-extracted; uploaded unless deferred.
             all_token_ids = self.runner.input_ids_cpu.numpy()
             draft_input_indices = logits_indices[target_logits_indices + 1]
             draft_token_ids = all_token_ids[draft_input_indices]
@@ -328,21 +345,21 @@ class SpeculativeDecodingManager:
                 draft_token_ids=(
                     None
                     if defer_draft_token_ids
-                    else stage_h2d_upload(
+                    else _h2d_temp(
                         self.runner, torch.from_numpy(padded_draft_token_ids)
                     )
                 ),
-                draft_lengths=self._meta_cache.draft_lengths,
-                draft_lengths_cpu=self._meta_cache.draft_lengths_cpu,
-                target_logits_indices=self._meta_cache.target_logits_indices,
-                bonus_logits_indices=self._meta_cache.bonus_logits_indices,
-                final_logits_indices=self._meta_cache.final_logits_indices,
-                segment_ids=self._meta_cache.segment_ids,
-                group_indices=self._meta_cache.group_indices,
+                draft_lengths=cached_meta.draft_lengths,
+                draft_lengths_cpu=cached_meta.draft_lengths_cpu,
+                target_logits_indices=cached_meta.target_logits_indices,
+                bonus_logits_indices=cached_meta.bonus_logits_indices,
+                final_logits_indices=cached_meta.final_logits_indices,
+                segment_ids=cached_meta.segment_ids,
+                group_indices=cached_meta.group_indices,
                 deferred_draft_token_ids_cpu=(
                     padded_draft_token_ids if defer_draft_token_ids else None
                 ),
-                max_draft_input_index=_max_index(draft_input_indices),
+                max_draft_input_index=cached_meta.max_draft_input_index,
             )
 
         # [num_reqs]
@@ -389,6 +406,9 @@ class SpeculativeDecodingManager:
         all_token_ids = self.runner.input_ids_cpu.numpy()
         draft_input_indices = logits_indices[target_logits_indices + 1]
         draft_token_ids = all_token_ids[draft_input_indices]
+        max_draft_input_index = (
+            int(draft_input_indices.max()) if draft_input_indices.size > 0 else 0
+        )
 
         # Padding
         from vllm_torchtpu.runner.tpu_runner import _get_padded_token_len
@@ -433,40 +453,35 @@ class SpeculativeDecodingManager:
         padded_group_indices = np.zeros(padded_logits_length, dtype=np.int32)
         padded_group_indices[: group_indices.shape[0]] = group_indices
 
-        # CPU -> TPU copies of per-call host arrays: staged, so each array
-        # stays alive until the transfer has finished (the index tensors are
-        # cached and reused by later steps).
+        # CPU -> TPU copy. _h2d_temp keeps the temporaries alive until the
+        # runner's input-staging fence (the metadata is cached and reused).
         metadata = SpecDecodeMetadata(
             draft_token_ids=(
                 None
                 if defer_draft_token_ids
-                else stage_h2d_upload(
-                    self.runner, torch.from_numpy(padded_draft_token_ids)
-                )
+                else _h2d_temp(self.runner, torch.from_numpy(padded_draft_token_ids))
             ),
-            draft_lengths=stage_h2d_upload(
+            draft_lengths=_h2d_temp(
                 self.runner, torch.from_numpy(padded_num_draft_tokens)
             ),
             draft_lengths_cpu=num_draft_tokens,
-            target_logits_indices=stage_h2d_upload(
+            target_logits_indices=_h2d_temp(
                 self.runner, torch.from_numpy(padded_target_logits_indices)
             ),
-            bonus_logits_indices=stage_h2d_upload(
+            bonus_logits_indices=_h2d_temp(
                 self.runner, torch.from_numpy(padded_bonus_logits_indices)
             ),
-            final_logits_indices=stage_h2d_upload(
+            final_logits_indices=_h2d_temp(
                 self.runner, torch.from_numpy(padded_logits_indices)
             ),
-            segment_ids=stage_h2d_upload(
-                self.runner, torch.from_numpy(padded_segment_ids)
-            ),
-            group_indices=stage_h2d_upload(
+            segment_ids=_h2d_temp(self.runner, torch.from_numpy(padded_segment_ids)),
+            group_indices=_h2d_temp(
                 self.runner, torch.from_numpy(padded_group_indices)
             ),
             deferred_draft_token_ids_cpu=(
                 padded_draft_token_ids if defer_draft_token_ids else None
             ),
-            max_draft_input_index=_max_index(draft_input_indices),
+            max_draft_input_index=max_draft_input_index,
         )
         # draft_lengths_cpu aliases the caller's array; copy so a later caller
         # mutation can't diverge the cache from its key.
@@ -477,5 +492,11 @@ class SpeculativeDecodingManager:
             logits_indices,
             target_logits_indices,
             padded_logits_length,
+        )
+        if len(self._meta_lru_cache) >= 32:
+            self._meta_lru_cache.pop(next(iter(self._meta_lru_cache)))
+        self._meta_lru_cache[cache_key] = (
+            metadata,
+            self._meta_cache_np,
         )
         return metadata
