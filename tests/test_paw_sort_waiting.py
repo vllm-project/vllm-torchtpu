@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""TPU_SCHED_PAW_SORT_WAITING: the waiting queue is sorted inside schedule().
+"""The waiting-queue sort: the waiting queue is sorted inside schedule().
 
 These tests check the order the base scheduler sees when it starts admitting,
 i.e. inside ``AsyncScheduler.schedule``. The warmest-first promotion that
@@ -44,11 +44,12 @@ def _req(
 
 
 def _scheduler(monkeypatch, requests, warmth, sort="1", aging="0", window=None):
-    monkeypatch.setenv("TPU_SCHED_PAW_SORT_WAITING", sort)
-    monkeypatch.setenv("TPU_SCHED_PAW_AGING_TOK_PER_S", aging)
-    if window is not None:
-        monkeypatch.setenv("TPU_SCHED_PAW_SORT_WINDOW", str(window))
     s = PrefixAwareScheduler.__new__(PrefixAwareScheduler)
+    # The sort is on for a KV producer; the aging rate is set by the
+    # scheduler that borrows the sort.
+    s._paw_aging_tok_per_s = float(aging)
+    if window is not None:
+        s._PAW_SORT_WINDOW = window
     q = FCFSRequestQueue()
     for r in requests:
         q.add_request(r)
@@ -60,8 +61,7 @@ def _scheduler(monkeypatch, requests, warmth, sort="1", aging="0", window=None):
     s._paw_cold_tokens = 0
     s._paw_prompt_tokens = 0
     s._paw_scoring_broken = False
-    s._mk_max_running = 0
-    s._is_kv_producer = False
+    s._is_kv_producer = sort == "1"
     s._is_kv_consumer = False
     s._kv_prefetch_n = 0
     s._kv_prefetch_cap = None
@@ -184,7 +184,6 @@ def test_external_hit_counts_when_it_fits(monkeypatch):
     s = _scheduler(monkeypatch, reqs, {"hbm_mid": 22_000, "dram_small": 10_000})
     s._is_kv_consumer = False
     s._is_kv_producer = True
-    s._cold_threshold = 8192
     s.connector = SimpleNamespace(
         estimate_external_hit_tokens=lambda r, local: 88_000
         if r.request_id == "dram_small"
