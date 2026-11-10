@@ -127,3 +127,55 @@ def test_batched_gdn_blocks_bitwise_on_tpu(ns, monkeypatch):
           f"vmapped {res[True][1]:.1f} us/call")
     for a, b in zip(res[False][0], res[True][0], strict=True):
         np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+
+
+def test_gdn_blocks_shared_offsets_timing(monkeypatch):
+    """Served shape: every GDN layer reads the same [113728] slot-offset table (one
+    program parameter). Times the loop, the flag's vmapped pass, and (reference only) a
+    vmapped pass that gathers the shared table once; checks all three agree."""
+    from vllm_torchtpu.megakernel_runtime import qwen38_segment_call as sc
+
+    rng = np.random.default_rng(5)
+    NL, ns, slots = 33, 4, 113728
+    st = jnp.asarray(rng.integers(0, slots, size=(NL, ns)), jnp.int32)
+    off = jnp.asarray(rng.integers(0, 4, size=slots), jnp.int32)
+    ck = jnp.asarray(rng.integers(0, slots, size=(NL, ns, 4)), jnp.int32)
+    qsl = jnp.asarray(np.arange(ns + 1) * 4, jnp.int32)
+    seq = jnp.asarray(rng.integers(0, 9000, size=(NL, ns)), jnp.int32)
+
+    def meta_of(st, off, ck, qsl, seq):
+        m = []
+        for i in range(NL):
+            m += [st[i], off, ck[i], qsl, seq[i]]
+        return m
+
+    def shared(st, off, ck, qsl, seq):
+        live = (qsl[1:] - qsl[:-1]) > 0
+        rb = jnp.take_along_axis(ck, off[st][..., None], axis=2)[..., 0]
+        rb = jnp.where(live[None], rb, 0)
+        rb = jnp.where((rb >= 0) & (rb < slots), rb, 0)
+        wb = jnp.where(live[None, :, None], ck, 0)
+        wb = jnp.where((wb >= 0) & (wb < slots), wb, 0)
+        return rb, wb, live[None] & ((seq - (qsl[1:] - qsl[:-1])[None]) > 0)
+
+    def timed(f):
+        f = jax.jit(f)
+        out = jax.block_until_ready(f(st, off, ck, qsl, seq))
+        for _ in range(5):
+            jax.block_until_ready(f(st, off, ck, qsl, seq))
+        t0 = time.perf_counter()
+        for _ in range(50):
+            out = f(st, off, ck, qsl, seq)
+        jax.block_until_ready(out)
+        return out, (time.perf_counter() - t0) / 50 * 1e6
+
+    res = {}
+    for batched in (False, True):
+        monkeypatch.setattr(envs, "VLLM_TPU_MK_WHOLE_BATCHED_INPUTS", batched, raising=False)
+        res[batched] = timed(lambda *a: sc.gdn_blocks(meta_of(*a), ns, True, slots))
+    res["shared"] = timed(shared)
+    print(f"\ngdn_blocks served-shape x{NL}: loop {res[False][1]:.1f}, vmapped {res[True][1]:.1f}, "
+          f"shared-table ref {res['shared'][1]:.1f} us/call")
+    for k in (True, "shared"):
+        for a, b in zip(res[False][0], res[k][0], strict=True):
+            np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
