@@ -387,28 +387,33 @@ def write_runs(
 
 
 def token_runs(pages: jax.Array, slots: jax.Array, num_pages: int, max_runs: int):
-    """Token runs: maximal spans of consecutive tokens writing one page."""
+    """Token runs: maximal spans of consecutive tokens writing one page;
+    ``(count, page, first slot, end slot, first token)`` (unset past `count`).
+
+    Compares of every run against every token (``[max_runs, T]``, fused into
+    reductions) and two small gathers: XLA's scatters of each token to its run
+    cost ~27 us each per step at 8K tokens (twins j-a4c2ab21, j-0a66fa2e).
+    """
     num_tokens = pages.shape[0]
-    tok = jnp.arange(num_tokens, dtype=jnp.int32)
+    if num_tokens == 0:
+        zeros = jnp.zeros((max_runs,), jnp.int32)
+        return jnp.int32(0), zeros, zeros, zeros, zeros
     valid = (pages >= 0) & (pages < num_pages)
     prev_page = jnp.concatenate([jnp.full((1,), -1, pages.dtype), pages[:-1]])
     prev_slot = jnp.concatenate([jnp.full((1,), -2, slots.dtype), slots[:-1]])
     start = valid & ((pages != prev_page) | (slots != prev_slot + 1))
-    run_id = jnp.cumsum(start.astype(jnp.int32)) - 1
-    num_runs = jnp.minimum(jnp.sum(start.astype(jnp.int32)), max_runs)
-    at_start = jnp.where(start, run_id, max_runs)
-    run_page = jnp.zeros(max_runs, jnp.int32).at[at_start].set(pages, mode="drop")
-    run_lo = jnp.zeros(max_runs, jnp.int32).at[at_start].set(slots, mode="drop")
-    run_tok0 = jnp.zeros(max_runs, jnp.int32).at[at_start].set(tok, mode="drop")
-    count = (
-        jnp.zeros(max_runs, jnp.int32)
-        .at[jnp.where(valid, run_id, max_runs)]
-        .add(1, mode="drop")
+    # Starts up to each token: token t is in run starts[t] - 1 (if valid).
+    starts = jnp.cumsum(start.astype(jnp.int32))
+    num_runs = jnp.minimum(starts[-1], max_runs)
+    run = jnp.arange(max_runs, dtype=jnp.int32)[:, None]
+    # Run r starts after every token with at most r starts up to it.
+    run_tok0 = jnp.sum(starts[None, :] <= run, axis=1, dtype=jnp.int32)
+    count = jnp.sum(
+        valid[None, :] & (starts[None, :] == run + 1), axis=1, dtype=jnp.int32
     )
-    last = run_page[jnp.maximum(num_runs - 1, 0)]
-    padding = jnp.arange(max_runs) >= num_runs
-    run_page = jnp.where(padding, last, run_page)
-    return num_runs, run_page, run_lo, run_lo + count, run_tok0
+    first = jnp.minimum(run_tok0, num_tokens - 1)
+    run_lo = slots[first].astype(jnp.int32)
+    return num_runs, pages[first].astype(jnp.int32), run_lo, run_lo + count, run_tok0
 
 
 @functools.partial(jax.jit, static_argnames=("max_runs", "bits", "interpret"))
