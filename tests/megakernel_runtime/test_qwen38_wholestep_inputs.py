@@ -152,3 +152,49 @@ def test_shared_addressing_is_the_former_inline_stock_formula():
             np.testing.assert_array_equal(
                 compressed_kernel_pages(pages, pool, slot), want
             )
+
+
+@pytest.mark.parametrize("layer_major", [False, True])
+def test_layer_batched_inputs_match_the_per_layer_loop(layer_major, monkeypatch):
+    """VLLM_TPU_MK_WHOLE_BATCHED_INPUTS: every output equals the per-layer loop's, for
+    several layers with their own tables and slots, an idle request and a fresh one."""
+    from vllm_torchtpu import envs
+
+    def fake_read(pool, ids, n, m):  # ring rows that name the page they were read from
+        rows = ids.astype(jnp.float32)[:, None] + jnp.arange(n, dtype=jnp.float32)[None] / n
+        return rows.astype(jnp.bfloat16), None
+
+    monkeypatch.setattr(wsi, "read_ring_and_tags", fake_read)
+    pool = jnp.zeros((256, 512, 1, 4, 256), jnp.float8_e4m3fn)
+    n_req, nreq, T, max_groups, L = 3, 4, 4, 1024, 5
+    rng = np.random.default_rng(2)
+    tables = [
+        (
+            jnp.asarray(rng.integers(1, 250, size=(n_req, 1)), jnp.int32),
+            jnp.asarray(rng.integers(1, 250, size=(n_req, 40)), jnp.int32),
+            jnp.asarray(rng.integers(1, 250, size=(n_req, 6)), jnp.int32),
+        )
+        for _ in range(L)
+    ]
+    slots = [(o % 2 if o % 3 else -1, o % 2) for o in range(L)]
+    starts = jnp.asarray([0, 4, 4, 8], jnp.int32)  # request 1 idle
+    args = (
+        pool,
+        tables,
+        slots,
+        jnp.asarray(rng.standard_normal((8192, 128)), jnp.bfloat16),
+        jnp.arange(nreq * T, dtype=jnp.int32),
+        starts,
+        jnp.asarray([3000, 100, 0], jnp.int32),  # request 2 fresh (no ring yet)
+    )
+    kw = dict(M=nreq * T, T=T, pages_per_seq=64, max_groups=max_groups,
+              layer_major_tables=layer_major)
+    monkeypatch.setattr(envs, "VLLM_TPU_MK_WHOLE_BATCHED_INPUTS", False, raising=False)
+    want = qsa_step_inputs(*args, **kw)
+    monkeypatch.setattr(envs, "VLLM_TPU_MK_WHOLE_BATCHED_INPUTS", True, raising=False)
+    got = qsa_step_inputs(*args, **kw)
+    assert want.keys() == got.keys()
+    for k in want:
+        a, b = np.asarray(want[k]), np.asarray(got[k])
+        assert a.shape == b.shape and a.dtype == b.dtype, k
+        np.testing.assert_array_equal(a.view(np.uint8), b.view(np.uint8), err_msg=k)
