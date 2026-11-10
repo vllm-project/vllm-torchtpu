@@ -56,7 +56,7 @@ def test_hook_extends_vllms_qwen3_5_hook():
 
 
 # Qwen3.5-397B-A17B's text config. hidden x moe_intermediate = 4096 x 1024 is
-# what the candidate4 decode legs' logged budget implies: 33.5e9 B plus
+# what the IX record jobs' TP8 decode legs logged as their budget: 33.5e9 B plus
 # 716 slot-layers x 3 x 4096 x 1024 B = 42,509,364,992 B.
 HIDDEN, INTER, EXPERTS, LAYERS = 4096, 1024, 512, 60
 SLOT_LAYER_BYTES = 3 * HIDDEN * INTER
