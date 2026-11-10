@@ -310,6 +310,7 @@ if TYPE_CHECKING:
     VLLM_TPU_VERIFY_FUSED_READ_OFFSETS: bool = False
     VLLM_TPU_VERIFY_ONE_DRAW: bool = False
     VLLM_TPU_SUBST_FRESH_IDS: bool = False
+    VLLM_TPU_ZERO_PADDED_SEQ_LENS: bool = False
     VLLM_TPU_DRAFT_ROWS_FRESH: bool = False
     VLLM_TPU_DRAFT_SEED_EXTRAS: bool = False
     VLLM_TPU_DRAFT_SEED_BOOTSTRAP_PAD: bool = False
@@ -1816,6 +1817,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # their own) instead of an eager view of it, which torch_tpu copies with an
     # execute_as_strided program before every compiled consumer (same values).
     "VLLM_TPU_SUBST_FRESH_IDS": env_bool("VLLM_TPU_SUBST_FRESH_IDS"),
+    # Runner: zero the padded request slots' sequence lengths each step (they
+    # otherwise keep earlier steps' lengths). Kernels mask padded slots by their
+    # zero query length; batch-wide maxima (the QSA visible-group bypass) do not.
+    "VLLM_TPU_ZERO_PADDED_SEQ_LENS": env_bool("VLLM_TPU_ZERO_PADDED_SEQ_LENS"),
     # Async spec decode: the per-step rejected-count correction of seq_lens and
     # positions as one compiled program (precompiled per request bucket).
     "VLLM_TPU_SUBTRACT_REJECTED_COMPILED": env_bool(
