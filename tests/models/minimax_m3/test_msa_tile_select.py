@@ -41,6 +41,7 @@ PAGES = 96  # physical pages per rank
 TOPK = 16
 # The served write kernel, captured before the fixture replaces it.
 _KERNEL_WRITE_ROWS = msa_write.write_rows
+_KERNEL_WRITE_ROWS_MANY = msa_write.write_rows_many
 NUM_TOKENS = 448
 MAX_LEN = 4500
 
@@ -51,9 +52,14 @@ def _xla_write_rows(cache, rows, pages, slots, *, max_runs, bits=None, interpret
     return cache.at[pages, slots // packing, slots % packing].set(rows, mode="drop")
 
 
+def _xla_write_rows_many(caches, rows, pages, slots, **kw):
+    return tuple(_xla_write_rows(c, r, pages, slots, **kw) for c, r in zip(caches, rows))
+
+
 @pytest.fixture(autouse=True)
 def _scatter_writes(monkeypatch):
     monkeypatch.setattr(msa_write, "write_rows", _xla_write_rows)
+    monkeypatch.setattr(msa_write, "write_rows_many", _xla_write_rows_many)
 
 
 @pytest.fixture
@@ -331,6 +337,7 @@ def test_tile_select_compiles_for_tpu7x(monkeypatch, dcp, heads, num_tokens, cac
         pytest.skip(f"no deviceless tpu7x topology: {e}")
     sharding = SingleDeviceSharding(topology.devices[0])
     monkeypatch.setattr(msa_write, "write_rows", _KERNEL_WRITE_ROWS)
+    monkeypatch.setattr(msa_write, "write_rows_many", _KERNEL_WRITE_ROWS_MANY)
 
     def spec(shape, dt):
         return jax.ShapeDtypeStruct(shape, dt, sharding=sharding)

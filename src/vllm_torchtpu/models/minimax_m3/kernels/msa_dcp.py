@@ -1159,13 +1159,6 @@ def msa_write_and_candidates_dcp(
         rank=rank,
         dcp=dcp,
     )
-    write = functools.partial(
-        msa.write_rows,
-        pages=pages,
-        pos=pos,
-        max_num_seqs=max_num_seqs,
-        interpret=interpret,
-    )
     fp4 = scale_cache is not None
     scale_row = msa_fp4.index_scale_row(num_heads) if fp4 else None
     if fp4:
@@ -1176,7 +1169,6 @@ def msa_write_and_candidates_dcp(
             k,
             v,
             index_k,
-            write,
             pages,
             pos,
             max_num_seqs=max_num_seqs,
@@ -1184,9 +1176,16 @@ def msa_write_and_candidates_dcp(
         )
         index_q = msa_fp4.rotate_queries(index_q)
     else:
-        kv_rows = jnp.concatenate([k, v], axis=-1).reshape(num_tokens, -1)
-        kv_cache = write(kv_cache, kv_rows)
-        index_cache = write(index_cache, index_k)
+        kv_cache, index_cache = msa.write_kv_and_index(
+            kv_cache,
+            index_cache,
+            jnp.concatenate([k, v], axis=-1).reshape(num_tokens, -1),
+            index_k,
+            pages,
+            pos,
+            max_num_seqs=max_num_seqs,
+            interpret=interpret,
+        )
     local_lens = local_seq_lens(seq_lens, block_size=block_size, rank=rank, dcp=dcp)
     candidates = functools.partial(
         local_candidates,

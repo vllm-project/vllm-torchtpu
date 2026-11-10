@@ -74,8 +74,6 @@ def test_scale_page_rows():
 
 
 def test_write_fp4_stores_rotated_quantized_rows_and_scales():
-    import functools
-
     from vllm_torchtpu.models.minimax_m3.kernels import msa
 
     rng = np.random.default_rng(4)
@@ -93,11 +91,8 @@ def test_write_fp4_stores_rotated_quantized_rows_and_scales():
     pages = jnp.asarray([3, 3, 3, 1, 1, 2**30], jnp.int32)  # last token dropped
     pos = jnp.asarray([126, 127, 128 + 0, 5, 6, 0], jnp.int32) % 256
     pages = pages.at[2].set(4)
-    write = functools.partial(
-        msa.write_rows, pages=pages, pos=pos, max_num_seqs=3, interpret=True
-    )
     kv_cache, index_cache, scale_cache = msa.write_fp4(
-        kv_cache, index_cache, scale_cache, k, v, ik, write, pages, pos,
+        kv_cache, index_cache, scale_cache, k, v, ik, pages, pos,
         max_num_seqs=3, interpret=True,
     )
     kv = np.asarray(msa_fp4.unpack_rows(kv_cache))
@@ -141,8 +136,6 @@ def test_write_fp4_multi_head_rows_and_scale_rows():
     """G = 4 KV heads per rank (DCP wider than a head's replicas): rows
     [K_0 | V_0 | ... | K_3 | V_3], scale rows 2h / 2h + 1, index scales in
     the index page."""
-    import functools
-
     from vllm_torchtpu.models.minimax_m3.kernels import msa
 
     rng = np.random.default_rng(5)
@@ -157,11 +150,8 @@ def test_write_fp4_multi_head_rows_and_scale_rows():
     ik = jnp.asarray(rng.standard_normal((t, d)), jnp.float32)
     pages = jnp.asarray([1, 1, 1], jnp.int32)
     pos = jnp.asarray([10, 11, 12], jnp.int32)
-    write = functools.partial(
-        msa.write_rows, pages=pages, pos=pos, max_num_seqs=1, interpret=True
-    )
     kv_cache, index_cache, scale_cache = msa.write_fp4(
-        kv_cache, index_cache, scale_cache, k, v, ik, write, pages, pos,
+        kv_cache, index_cache, scale_cache, k, v, ik, pages, pos,
         max_num_seqs=1, interpret=True,
     )
     kv = np.asarray(msa_fp4.unpack_rows(kv_cache))

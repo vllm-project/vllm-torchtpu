@@ -237,3 +237,100 @@ def test_traced_grid_check_catches_a_dropped_run(num_tokens, monkeypatch):
             _check_grid("int4", num_tokens, "full")
     finally:
         jax.clear_caches()
+
+
+# --- One kernel for every cache of a step (`write_fp4_caches`, `write_rows_many`)
+# against the per-cache writes and against a numpy oracle.
+
+
+def _oracle(config, inputs, pages, slots):
+    """Expected caches as uint8 / uint32 views: each valid token's row (and
+    scales) at its page and slot, everything else as before."""
+    from vllm_torchtpu.models.minimax_m3.kernels import msa_fp4
+
+    pages, slots = np.asarray(pages), np.asarray(slots)
+    live = [(t, p, s) for t, (p, s) in enumerate(zip(pages, slots)) if p < _GRID_PAGES]
+    if config == "int4":
+        kv, idx, sc, kv_rows, idx_rows, idx_scales, sc_values = inputs
+        kv_n = np.asarray(msa_fp4.unpack_rows(kv)).copy()
+        idx_n = np.asarray(msa_fp4.unpack_rows(idx)).copy()
+        idx_s = np.asarray(jax.lax.bitcast_convert_type(msa_fp4.folded_scales(idx), jnp.uint32)).copy()
+        sc_b = np.asarray(jax.lax.bitcast_convert_type(sc, jnp.uint32)).copy()
+        idx_scale_bits = np.asarray(jax.lax.bitcast_convert_type(idx_scales, jnp.uint32))
+        sc_bits = np.asarray(jax.lax.bitcast_convert_type(sc_values, jnp.uint32))
+        n = sc_bits.shape[1]
+        for t, p, s in live:
+            kv_n[p, s] = np.asarray(kv_rows[t])
+            idx_n[p, s] = np.asarray(idx_rows[t])
+            idx_s[p, s] = idx_scale_bits[t]
+            sc_b[p, :n, s] = sc_bits[t]
+        return kv_n, idx_n, idx_s, sc_b
+    out = []
+    for cache, rows in ((inputs[0], inputs[2]), (inputs[1], inputs[3])):
+        c = np.asarray(jax.lax.bitcast_convert_type(cache, jnp.uint8)).copy()
+        r = np.asarray(jax.lax.bitcast_convert_type(rows, jnp.uint8))
+        for t, p, s in live:
+            c[p, s // 4, s % 4] = r[t]
+        out.append(c)
+    return out
+
+
+def _as_oracle(config, caches):
+    from vllm_torchtpu.models.minimax_m3.kernels import msa_fp4
+
+    if config == "int4":
+        kv, idx, sc = caches
+        return (
+            np.asarray(msa_fp4.unpack_rows(kv)),
+            np.asarray(msa_fp4.unpack_rows(idx)),
+            np.asarray(jax.lax.bitcast_convert_type(msa_fp4.folded_scales(idx), jnp.uint32)),
+            np.asarray(jax.lax.bitcast_convert_type(sc, jnp.uint32)),
+        )
+    return [np.asarray(jax.lax.bitcast_convert_type(c, jnp.uint8)) for c in caches]
+
+
+def _write_fused(config, inputs, pages, slots, max_runs, **kw):
+    if config == "int4":
+        out = msa_write.write_fp4_caches(*inputs, pages, slots, max_runs=max_runs, interpret=True, **kw)
+        return [np.asarray(out[0]), np.asarray(out[1]),
+                np.asarray(jax.lax.bitcast_convert_type(out[2], jnp.uint32))], out
+    out = msa_write.write_rows_many(inputs[:2], inputs[2:], pages, slots, max_runs=max_runs, interpret=True, **kw)
+    return [np.asarray(jax.lax.bitcast_convert_type(c, jnp.uint8)) for c in out], out
+
+
+def _check_fused(config, num_tokens, case, seed=0):
+    rng = np.random.default_rng(seed + num_tokens)
+    lens, pad, max_runs = _grid_case(case, num_tokens, rng)
+    pages, slots = _runs_batch(rng, lens, pad)
+    inputs = _grid_inputs(config, num_tokens, rng)
+    fused, caches = _write_fused(config, inputs, pages, slots, max_runs)
+    for got, want in zip(_as_oracle(config, caches), _oracle(config, inputs, pages, slots)):
+        np.testing.assert_array_equal(got, want)
+    for traced in (True, False):
+        separate = _write_all(config, inputs, pages, slots, max_runs, traced_grid=traced)
+        for f, s in zip(fused, separate):
+            np.testing.assert_array_equal(f, s)
+
+
+@pytest.mark.parametrize("config", ["int4", "fp8"])
+@pytest.mark.parametrize("num_tokens", [40, 640])
+@pytest.mark.parametrize("case", ["some", "none", "full"])
+def test_fused_write_matches_oracle_and_separate_writes(config, num_tokens, case):
+    _check_fused(config, num_tokens, case)
+
+
+@pytest.mark.parametrize("num_tokens", [40, 640])
+def test_fused_oracle_catches_a_misplaced_scale(num_tokens, monkeypatch):
+    """Fault injection: K/V scales one lane off in the scale page must fail."""
+    for name in ("_slot_scales_by_token", "_slot_scales_by_page"):
+        real = getattr(msa_write, name)
+        monkeypatch.setattr(
+            msa_write, name,
+            functools.partial(lambda lo, hi, *a, real, **k: real(lo + 1, hi + 1, *a, **k), real=real),
+        )
+    jax.clear_caches()
+    try:
+        with pytest.raises(AssertionError):
+            _check_fused("int4", num_tokens, "some")
+    finally:
+        jax.clear_caches()
