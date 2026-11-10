@@ -8502,7 +8502,10 @@ class TestSpecSourceFenceRegisterAhead:
 
 
 @pytest.mark.parametrize("policy", ["fail", "recompute"])
-def test_pd_native_load_failure_retains_identity_across_cleanup(policy, monkeypatch):
+@pytest.mark.parametrize("grouped", [False, True])
+def test_pd_native_load_failure_retains_identity_across_cleanup(
+    policy, grouped, monkeypatch
+):
     tpu_envs.__dict__.pop("TPU_KV_RESHARD_TRANSPORT", None)
     monkeypatch.setenv("TPU_KV_RESHARD_TRANSPORT", "raiden")
     monkeypatch.setattr(f"{_MOD}.dist_utils.get_raiden_inline_load", lambda: False)
@@ -8515,10 +8518,51 @@ def test_pd_native_load_failure_retains_identity_across_cleanup(policy, monkeypa
     worker._stage3_submitted_loads = {"destination": 123}
     worker._stage3_controller_accepted = {"destination"}
     worker._load_block_ids = {"destination": [41]}
-    results = worker.get_transfer_results(set())
+    connector = TPURaidenConnector.__new__(TPURaidenConnector)
+    connector.connector_worker = worker
+    connector.use_raiden = True
+    connector._kv_cache_config = (
+        _make_stage3_hybrid_kv_cache_config()
+        if grouped
+        else _make_test_kv_cache_config()
+    )
+    connector._stage3_fa_group_index = 2 if grouped else 0
+
+    # The runner reads both channels before scheduler-finished cleanup. A flat
+    # block ID is usable for one group; grouped caches report request failures.
+    results = connector.get_transfer_results(set())
     assert results.finished_sending == set()
     assert results.finished_recving == {"destination"}
     assert results.failed_recving == {"destination"}
+    assert connector.get_block_ids_with_load_errors() == (set() if grouped else {41})
     assert worker.get_block_ids_with_load_errors() == set()
-    assert worker.get_transfer_results({"destination"}).failed_recving == set()
+    assert connector.get_transfer_results({"destination"}).failed_recving == set()
+    assert connector.get_block_ids_with_load_errors() == set()
     assert "destination" not in worker._failed_recving
+    assert "destination" not in worker._load_block_ids
+    assert worker._stage3_source_req_ids == {}
+    assert worker._stage3_destination_req_ids == {}
+
+    # Reusing the physical block does not make an old native terminal belong to
+    # the new request. Its own failure must still reach both applicable channels.
+    worker._stage3_source_req_ids = {"next-destination": "next-source"}
+    worker._stage3_destination_req_ids = {"next-source": "next-destination"}
+    worker._stage3_submitted_loads = {"next-destination": 456}
+    worker._stage3_controller_accepted = {"next-destination"}
+    worker._load_block_ids = {"next-destination": [41]}
+    engine.poll_results = [([], [], ["source"]), ([], [], ["next-source"])]
+    stale = connector.get_transfer_results(set())
+    assert stale.finished_recving == set()
+    assert stale.failed_recving == set()
+    assert connector.get_block_ids_with_load_errors() == set()
+    results = connector.get_transfer_results(set())
+    assert results.finished_recving == {"next-destination"}
+    assert results.failed_recving == {"next-destination"}
+    assert connector.get_block_ids_with_load_errors() == (set() if grouped else {41})
+    assert worker.get_block_ids_with_load_errors() == set()
+    assert connector.get_transfer_results({"next-destination"}).failed_recving == set()
+    assert connector.get_block_ids_with_load_errors() == set()
+    assert worker._failed_recving == set()
+    assert worker._load_block_ids == {}
+    assert worker._stage3_source_req_ids == {}
+    assert worker._stage3_destination_req_ids == {}
