@@ -696,17 +696,11 @@ def _spec_warmup_num_output_tokens(requests: Any, req_ids: list[str]) -> list[in
 def _h2d_temp(runner, host: torch.Tensor) -> torch.Tensor:
     """non_blocking upload of a temporary host tensor for ``runner``.
 
-    torch-tpu's non_blocking H2D reads host memory when the transfer runs,
-    not when it is enqueued. A temporary freed before then (the transfer can
-    sit behind a long step or a runtime compile) uploads whatever reuses that
-    memory. Keep the host tensor alive until the input-staging fence recorded
-    after it has been waited on (see ``_record_input_staging_fence``).
+    An alias of ``stage_h2d_upload``, which keeps ``host`` alive until the
+    runner's next input-staging fence has been synchronized (TorchTPU reads
+    the source when the transfer runs, not when it is enqueued).
     """
-    keep = runner.__dict__.get("_h2d_keepalive")
-    if keep is None:
-        keep = runner.__dict__["_h2d_keepalive"] = []
-    keep.append(host)
-    return host.to(runner.device, non_blocking=True)
+    return stage_h2d_upload(runner, host)
 
 
 def _spec_warmup_all_token_ids(
@@ -4652,13 +4646,6 @@ class TPUModelRunner(GPUModelRunner):
         self._input_staging_fence = fence
         self._fenced_h2d_sources.extend(self._unfenced_h2d_sources)
         self._unfenced_h2d_sources.clear()
-        # Temporaries uploaded before this record are released once a fence
-        # recorded after them has been waited on; later ones wait for the next
-        # fence. Appended, not replaced, so a second record before a wait
-        # cannot drop an older batch whose transfers may still be in flight.
-        pending = self.__dict__.setdefault("_h2d_fenced", [])
-        pending.append(self.__dict__.get("_h2d_keepalive") or [])
-        self.__dict__["_h2d_keepalive"] = []
 
     def _wait_input_staging_fence(self) -> None:
         fence = self._input_staging_fence
@@ -4668,17 +4655,6 @@ class TPUModelRunner(GPUModelRunner):
             for _, release_cb in self._fenced_h2d_sources:
                 release_cb()
             self._fenced_h2d_sources.clear()
-            # The device queue is in order: the newest fence completing means
-            # every earlier one has too.
-            self.__dict__["_h2d_fenced"] = []
-        elif len(self.__dict__.get("_h2d_keepalive") or ()) > 4096:
-            # No fence was recorded (non-forward paths): bound the list, but
-            # only after an explicit fence behind those transfers completes.
-            drain = torch.tpu.Event()
-            drain.record()
-            drain.synchronize()
-            self.__dict__["_h2d_keepalive"] = []
-            self.__dict__["_h2d_fenced"] = []
 
     def _upload_unless_unchanged(self, slot: str, host: torch.Tensor) -> torch.Tensor:
         """`host.to(self.device)`, reusing `slot`'s previous upload when the
