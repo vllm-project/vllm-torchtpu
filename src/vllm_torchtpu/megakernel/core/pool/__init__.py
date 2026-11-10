@@ -29,6 +29,7 @@ from .backend import (
     check_ckpt_bounds,
     make_pool_backend,
 )
+from .checks import check_step_pool_metadata, safe_kv_page, safe_page_base
 from .config import (
     ACT_MODE_VALUES,
     DEFAULT_CACHE_EXEC,
@@ -75,6 +76,7 @@ __all__ = [
     "allocate_test_layout",
     "can_pool_gather",
     "check_ckpt_bounds",
+    "check_step_pool_metadata",
     "conv_to_raw_page",
     "derive_pool_layout",
     "gather_gdn_states",
@@ -84,6 +86,8 @@ __all__ = [
     "raw_page_to_conv",
     "raw_page_to_kv",
     "raw_pages_to_ssm",
+    "safe_kv_page",
+    "safe_page_base",
     "scatter_pool_states",
     "ssm_to_raw_pages",
     "states_to_pool",
