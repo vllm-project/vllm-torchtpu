@@ -43,7 +43,7 @@ quantize_tensor = util.quantize_tensor
 TunedValue = tuned_block_sizes.TunedValue
 
 
-def _require_tpu_v7() -> None:
+def _get_tpu_version() -> tuple[int, str]:
     try:
         backend = jax.default_backend()
     except Exception as exc:
@@ -53,8 +53,21 @@ def _require_tpu_v7() -> None:
 
     device_kind = jax.devices()[0].device_kind
     match = re.match(r"^TPU[^\d]*(\d+)", device_kind)
-    if match is None or int(match.group(1)) < 7:
-        pytest.fail(f"Expected TPU v7+, got {device_kind}.")
+    if match is None:
+        pytest.fail(f"Expected TPU device, got {device_kind}.")
+    return int(match.group(1)), device_kind
+
+
+def _require_tpu_v6() -> None:
+    version, device_kind = _get_tpu_version()
+    if version < 6:
+        pytest.fail(f"Expected TPU v6+, got {device_kind}.")
+
+
+def _skip_unless_tpu_v7() -> None:
+    version, _ = _get_tpu_version()
+    if version < 7:
+        pytest.skip("Requires TPU v7+")
 
 
 def _assert_allclose(actual, expected, atol=0.5, rtol=0.5) -> None:
@@ -107,7 +120,7 @@ def _test_quantized_matmul(
     block_size: int | None = None,
     x_q_dtype: jnp.dtype | None = None,
 ) -> None:
-    _require_tpu_v7()
+    _require_tpu_v6()
 
     prng_key = jax.random.key(1234)
     k0, k1 = jax.random.split(prng_key, 2)
@@ -303,7 +316,7 @@ def test_quantized_matmul_blockwise_w8a8(
 
 
 def test_quantized_matmul_blockwise_rejects_unaligned_input_features() -> None:
-    _require_tpu_v7()
+    _require_tpu_v6()
 
     x = jnp.ones((512, 768), dtype=jnp.bfloat16)
     w_q = jnp.ones((512, 768), dtype=jnp.float8_e4m3fn)
@@ -321,7 +334,7 @@ def test_quantized_matmul_blockwise_rejects_unaligned_input_features() -> None:
 
 
 def test_quantized_matmul_blockwise_rejects_mismatched_scale_blocks() -> None:
-    _require_tpu_v7()
+    _require_tpu_v6()
 
     x = jnp.ones((512, 1024), dtype=jnp.bfloat16)
     w_q = jnp.ones((512, 1024), dtype=jnp.float8_e4m3fn)
@@ -359,6 +372,7 @@ def test_quantized_matmul_blockwise_w4a8(
     n_input_features: int,
     n_output_features: int,
 ) -> None:
+    _skip_unless_tpu_v7()
     _test_quantized_matmul(
         dtype,
         jnp.float4_e2m1fn,
@@ -393,6 +407,7 @@ def test_quantized_matmul_blockwise_int4_fp8(
     n_input_features: int,
     n_output_features: int,
 ) -> None:
+    _skip_unless_tpu_v7()
     _test_quantized_matmul(
         dtype,
         jnp.int4,

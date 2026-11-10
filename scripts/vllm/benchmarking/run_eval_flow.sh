@@ -25,7 +25,10 @@ RUN_CODE_EVAL=0
 RUN_MM_EVAL=0
 START_SERVER=1
 SKIP_DB_UPLOAD_FLAG=0
-SKIP_PERF_CHECK=0
+# Also from the environment, for a CI step on a TPU generation whose perf
+# baselines do not exist yet: it reports the numbers without gating on
+# baselines measured on another chip.
+SKIP_PERF_CHECK="${SKIP_PERF_CHECK:-0}"
 SKIP_BENCHMARK=0
 BASELINE_CONFIG=""
 

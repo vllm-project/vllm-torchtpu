@@ -20,6 +20,14 @@ BUILDKITE_DIR=".buildkite"
 MODEL_LIST_KEY="model-list"
 FEATURE_LIST_KEY="feature-list"
 
+# Build-level TPU_VERSION (tpu6e or tpu7x, matching tpu-inference and checked
+# by bootstrap.py) selects a single generation on manual builds; when unset,
+# both groups go up. Capture it into ONLY_TPU_VERSION here because the upload
+# blocks below overwrite TPU_VERSION per group for upload-time interpolation in
+# models/*.yml (which must use ${TPU_VERSION:-tpu6e}, never build.env("TPU_VERSION")
+# or runtime $$TPU_VERSION, since normal nightlies leave build-level TPU_VERSION unset).
+ONLY_TPU_VERSION="${TPU_VERSION:-}"
+
 # A TPU step in models/*.yml runs through the Kueue launcher with
 # SHAPE=${MODEL_SHAPE_MULTI} or ${MODEL_SHAPE_SINGLE}; each generation's group
 # below exports the pod shapes those name before its upload interpolates them.
@@ -132,7 +140,9 @@ fi
 
 # --- Upload Dynamic Pipeline ---
 # Final Uploads (Two separate calls to handle variables) ---
-if [[ "${#pipeline_v6e_fragments[@]}" -gt 0 ]]; then
+if [[ "${ONLY_TPU_VERSION}" == "tpu7x" ]]; then
+  echo "--- Skipping TPU v6e Pipeline Group (TPU_VERSION=tpu7x)"
+elif [[ "${#pipeline_v6e_fragments[@]}" -gt 0 ]]; then
   echo "--- Uploading TPU v6e Pipeline Group"
   # Export v6e specific variables
   export MODEL_SHAPE_SINGLE="ct6e-standard-1t/1x1"
@@ -155,7 +165,9 @@ else
   exit 0
 fi
 
-if [[ "${#pipeline_v7x_fragments[@]}" -gt 0 ]]; then
+if [[ "${ONLY_TPU_VERSION}" == "tpu6e" ]]; then
+  echo "--- Skipping TPU v7x Pipeline Group (TPU_VERSION=tpu6e)"
+elif [[ "${#pipeline_v7x_fragments[@]}" -gt 0 ]]; then
   echo "--- Uploading TPU v7x Pipeline Group"
   # Export v7x specific variables
   export MODEL_SHAPE_SINGLE="tpu7x-standard-1t/1x1x1"
