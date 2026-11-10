@@ -2226,7 +2226,9 @@ class Eagle3Proposer:
         skip_cat = self._skip_next_multi_chunk_draft_cat
         self._skip_next_multi_chunk_draft_cat = False
         if return_device:
-            if len(per_chunk_stacked) == 1 or skip_cat:
+            if skip_cat:
+                out = per_chunk_stacked[0]
+            elif len(per_chunk_stacked) == 1:
                 out = per_chunk_stacked[0][: chunks[0].num_reqs]
             else:
                 out = torch.cat(
