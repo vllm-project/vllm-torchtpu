@@ -11,8 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Quantization format descriptors and blockwise scale layout helpers for Fused EP MoE v3.
-"""
+"""Quantization format descriptors and blockwise scale layout helpers for Fused
+EP MoE v3."""
+
 import enum
 from typing import NamedTuple
 
@@ -26,7 +27,8 @@ from .rowquant import FP8
 FP4 = jnp.float4_e2m1fn
 INT4 = jnp.int4
 PACKED_DTYPES = (
-    FP4, INT4
+    FP4,
+    INT4,
 )  # four-bit weights: packed in 32-bit words, widened to fp8 in the kernel
 # Contraction rows one four-bit weight scale covers, by default.
 WEIGHT_BLOCK_DEFAULT = 512
@@ -35,6 +37,7 @@ WEIGHT_BLOCK_DEFAULT = 512
 class WeightFormat(str, enum.Enum):
     """A weight format's name, as written in logs, cache keys and error
     messages."""
+
     FP8 = "fp8"
     FP8_BLOCK = "fp8_block"
     FP4 = "fp4"
@@ -57,6 +60,7 @@ class WeightForm(NamedTuple):
     form the DeepSeek-family checkpoints ship in), or none for unscaled
     bf16 weights. Config selects the token and result row formats and
     token quantization block within the supported weight-format combinations."""
+
     name: WeightFormat
     weight_dtype: object
     scale_layout: str
@@ -70,9 +74,7 @@ class WeightForm(NamedTuple):
     def packed(self):
         """Four-bit weights (fp4 or int4): stored packed in 32-bit words
         and widened to fp8 in the kernel (an int4 value is exact in fp8)."""
-        return any(
-            jnp.dtype(self.weight_dtype) == jnp.dtype(d)
-            for d in PACKED_DTYPES)
+        return any(jnp.dtype(self.weight_dtype) == jnp.dtype(d) for d in PACKED_DTYPES)
 
     @property
     def has_scales(self):
@@ -81,16 +83,13 @@ class WeightForm(NamedTuple):
 
 
 WEIGHT_FORMS = {
-    WeightFormat.FP8:
-    WeightForm(WeightFormat.FP8, FP8, "per_channel"),
-    WeightFormat.FP8_BLOCK:
-    WeightForm(WeightFormat.FP8_BLOCK, FP8, "per_contraction_block"),
-    WeightFormat.FP4:
-    WeightForm(WeightFormat.FP4, FP4, "per_contraction_block"),
-    WeightFormat.INT4:
-    WeightForm(WeightFormat.INT4, INT4, "per_contraction_block"),
-    WeightFormat.BF16:
-    WeightForm(WeightFormat.BF16, jnp.bfloat16, "none"),
+    WeightFormat.FP8: WeightForm(WeightFormat.FP8, FP8, "per_channel"),
+    WeightFormat.FP8_BLOCK: WeightForm(
+        WeightFormat.FP8_BLOCK, FP8, "per_contraction_block"
+    ),
+    WeightFormat.FP4: WeightForm(WeightFormat.FP4, FP4, "per_contraction_block"),
+    WeightFormat.INT4: WeightForm(WeightFormat.INT4, INT4, "per_contraction_block"),
+    WeightFormat.BF16: WeightForm(WeightFormat.BF16, jnp.bfloat16, "none"),
 }
 WEIGHT_FORMAT_NAMES = tuple(WEIGHT_FORMS)
 # Rows of packed four-bit weights one addressable block is a whole number
@@ -107,7 +106,8 @@ def weight_form(weight_format):
     except ValueError:
         raise ValueError(
             f"the fused EP MoE kernel takes weight formats "
-            f"{WEIGHT_FORMAT_NAMES}. Got {weight_format!r}") from None
+            f"{WEIGHT_FORMAT_NAMES}. Got {weight_format!r}"
+        ) from None
 
 
 def weight_format_of_dtype(dtype):
