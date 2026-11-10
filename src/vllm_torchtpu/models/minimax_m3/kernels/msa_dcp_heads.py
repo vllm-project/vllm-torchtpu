@@ -153,6 +153,31 @@ def _exchange_pages(kv_cache, scale_cache, pages, *, dcp, replicas, head_width, 
     return recv, recv_sc
 
 
+def _own_selection(candidates, *, dcp, replicas, topk, axis, interpret):
+    """The selection ``[T, topk]`` of this rank's KV head, from every rank's
+    packed ``candidates [T, G * 2 * topk]``. Each replica of the head merges
+    the candidates of a ``1 / replicas`` share of the tokens (an all-to-all
+    of that share) and the replicas all-gather the merged selections, which
+    are 1/8 the candidates' bytes."""
+    num_tokens = candidates.shape[0]
+    heads = dcp // replicas
+    split = replicas if num_tokens % replicas == 0 else 1
+    part = num_tokens // split
+    per_head = candidates.reshape(num_tokens, heads, 2 * topk).transpose(1, 0, 2)
+    # Destination rank d = h * replicas + j gets head h's tokens of share j
+    # (every share, when the tokens do not split).
+    send = per_head.reshape(heads, split, part, 2 * topk)
+    send = jnp.repeat(send, replicas // split, axis=1).reshape(dcp, part, 2 * topk)
+    own = jax.lax.all_to_all(send, axis, 0, 0, tiled=True)  # [dcp, T / split, 2K]
+    selected = msa_dcp.merge_head_candidates(own, topk, interpret)[:, 0]
+    if split > 1:
+        groups = [list(range(h * replicas, (h + 1) * replicas)) for h in range(heads)]
+        selected = jax.lax.all_gather(
+            selected, axis, axis_index_groups=groups, tiled=True
+        )
+    return selected
+
+
 def _head_parallel_attend(
     q,
     kv_cache,
@@ -188,13 +213,15 @@ def _head_parallel_attend(
     replicas = kv_head_replicas
     part = -(-capacity // replicas)  # each replica's share of the buffer
     buffer_pages = part * replicas
-    num_heads = candidates.shape[1] // (2 * topk)
 
-    # This rank's KV head's candidates from every rank -> its selection.
-    per_rank = candidates.reshape(num_tokens, num_heads, 2 * topk).transpose(1, 0, 2)
-    send = jnp.repeat(per_rank, replicas, axis=0)  # rank d gets head d // replicas
-    own = jax.lax.all_to_all(send, axis, 0, 0, tiled=True)  # [dcp, T, 2 * topk]
-    selected = msa_dcp.merge_head_candidates(own, topk, interpret)[:, 0]  # [T, topk]
+    selected = _own_selection(
+        candidates,
+        dcp=dcp,
+        replicas=replicas,
+        topk=topk,
+        axis=axis,
+        interpret=interpret,
+    )
 
     seq_id, pos, valid = tokens
     seq_blocks = -(-seq_lens // (block_size * dcp))
