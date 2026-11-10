@@ -284,7 +284,8 @@ def run_moe_v3(
     if dense_on:
         logger.info_once(
             "Fused EP MoE: dense-slots layer ON for calls of <= %d rows per shard "
-            "(fused=%s, pallas_tables=%s, merged=%s, skip_unrouted=%s, weight_slots=%s); "
+            "(fused=%s, pallas_tables=%s, merged=%s, skip_unrouted=%s, "
+            "weight_slots=%s); "
             "larger calls keep the v3 layer",
             dense_max,
             dense_fused,
