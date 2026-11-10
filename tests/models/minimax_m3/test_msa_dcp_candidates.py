@@ -49,6 +49,7 @@ def _reference(scores, pos, rank, dcp, init_blocks, local_blocks):
     return out_s, out_b
 
 
+@pytest.mark.parametrize("pretransposed", [False, True])
 @pytest.mark.parametrize("pick_widths", [True, False])
 @pytest.mark.parametrize(
     "num_tokens,num_cols,dcp,rank,max_pos,init_blocks,local_blocks",
@@ -69,6 +70,7 @@ def test_candidates_match_reference(
     init_blocks,
     local_blocks,
     pick_widths,
+    pretransposed,
     monkeypatch,
 ):
     if pick_widths:  # per-row-block widths, as for a prefill batch
@@ -78,7 +80,8 @@ def test_candidates_match_reference(
     scores = rng.integers(0, 6, (num_tokens, num_cols)).astype(np.float32)
     pos = np.sort(rng.integers(0, max_pos, num_tokens)).astype(np.int32)
     got_s, got_b = local_candidates(
-        jnp.asarray(scores)[:, None, :],
+        # [P, T] as the large tile class scores, or [T, 1, P]
+        jnp.asarray(scores).T if pretransposed else jnp.asarray(scores)[:, None, :],
         jnp.asarray(pos),
         block_size=BLOCK,
         topk=TOPK,
