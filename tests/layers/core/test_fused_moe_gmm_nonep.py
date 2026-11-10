@@ -374,7 +374,7 @@ def _fused_mlp_case(monkeypatch, *, use_ep=False, split=1, e1=2, e2=0, fused=Tru
     log_lines = []
 
     class _Log:  # the engine logger needs vLLM; record the once-lines instead
-        def info_once(self, msg, *args):
+        def info_once(self, msg, *args, **kwargs):  # int6 passes scope="process"
             log_lines.append(msg % args if args else msg)
 
     monkeypatch.setattr(fused_moe_gmm, "logger", _Log())
@@ -1046,7 +1046,7 @@ def _sc_fp8_case(monkeypatch, *, fused=True, bias=False, bf16_weights=False, no_
                    pack_out=pack_out)
 
     class _Log:
-        def info_once(self, msg, *args):
+        def info_once(self, msg, *args, **kwargs):  # int6 passes scope="process"
             seen["log"].append(msg % args if args else msg)
 
     from jax._src import tpu_info as ti
@@ -1176,7 +1176,7 @@ def _ep_case(monkeypatch, *, tokens=640, ep_gather="sc", stack=False, fused=True
         return _fallback_implementation(unpack_halves(rows) if x_packed else rows, rev, wts, valid, reduce_group_size)
 
     class _Log:
-        def info_once(self, msg, *args):
+        def info_once(self, msg, *args, **kwargs):  # int6 passes scope="process"
             seen["log"].append(msg % args if args else msg)
 
     info = ti.get_tpu_info_for_chip(ti.ChipVersion.TPU_7X, 1)
