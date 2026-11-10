@@ -15,6 +15,7 @@
 Qwen3.5 layout table's entry for this engine, read once at prebuild, changes
 the named fields (and only those); an unknown field or a refused value
 raises."""
+
 import dataclasses
 from types import SimpleNamespace
 
@@ -47,8 +48,14 @@ def test_overrides_only_named_fields(monkeypatch):
         {"sorted_rows": False, "weight_slots": 4, "weight_prefetch": 3},
     )
     got, base = A.served_config(**SHAPE), Config.for_shape(**SHAPE)
-    assert got.sorted_rows is False and got.weight_slots == 4 and got.weight_prefetch == 3
-    changed = {f.name for f in dataclasses.fields(Config) if getattr(got, f.name) != getattr(base, f.name)}
+    assert (
+        got.sorted_rows is False and got.weight_slots == 4 and got.weight_prefetch == 3
+    )
+    changed = {
+        f.name
+        for f in dataclasses.fields(Config)
+        if getattr(got, f.name) != getattr(base, f.name)
+    }
     assert changed == {"sorted_rows", "weight_slots", "weight_prefetch"}
 
 
@@ -63,12 +70,17 @@ def test_opt_in_kernel_flags_default_off():
     """The TP8 layouts serve the fused EP v3 kernel with these flags unset:
     each changes the kernel's programs, so each must stay opt-in (through
     the layout table), and an empty override keeps them off."""
-    flags = ("combine_real_tokens", "sort_index_compare", "compact_message",
-             "reorder_chain")
+    flags = (
+        "combine_real_tokens",
+        "sort_index_compare",
+        "compact_message",
+        "reorder_chain",
+    )
     for config in (Config(), A.apply_config_overrides(Config(), {})):
         assert {f: getattr(config, f) for f in flags} == dict.fromkeys(flags, False)
     on = A.apply_config_overrides(
-        Config(), {"compact_message": True, "reorder_chain": True})
+        Config(), {"compact_message": True, "reorder_chain": True}
+    )
     assert on.compact_message is True and on.reorder_chain is True
 
 
@@ -95,7 +107,13 @@ def test_qwen3_5_dp4_tp2_takes_the_decode_entry():
         _engine("DeepseekV3ForCausalLM", 4, 2),
         None,
     ],
-    ids=["qwen3_5_tp8", "qwen3_5_dp8", "qwen3_moe_dp4_tp2", "deepseek_dp4_tp2", "no_engine"],
+    ids=[
+        "qwen3_5_tp8",
+        "qwen3_5_dp8",
+        "qwen3_moe_dp4_tp2",
+        "deepseek_dp4_tp2",
+        "no_engine",
+    ],
 )
 def test_other_engines_keep_the_shape_defaults(engine):
     assert A.layout_overrides(engine) == {}
@@ -129,7 +147,7 @@ def test_prebuild_reads_the_entry_under_the_loader_config(monkeypatch, engine, w
     monkeypatch.setattr(A, "_pcp_size", lambda layer: 2)
     A.prebuild_fused_moe_ep(SimpleNamespace(), 10, True, "silu")
     assert bool(A._CONFIG_OVERRIDES) is want
-    assert A._CONFIG_OVERRIDES == A.layout_overrides(engine)
+    assert A.layout_overrides(engine) == A._CONFIG_OVERRIDES
 
 
 def test_prebuild_off_leaves_no_overrides(monkeypatch):

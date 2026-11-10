@@ -11,17 +11,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Config.dense_slots_skip_unrouted / dense_slots_weight_slots (default off / 3 slots): the
+"""Config.dense_slots_skip_unrouted / dense_slots_weight_slots (default off / 3 slots):
+the
 adapter's Config overrides reach the dense-slots call, and dense_slots_moe hands both
 settings to the program builder (CPU, no kernel is built)."""
+
 from types import SimpleNamespace
 
 import pytest
 
 from vllm_torchtpu.kernels.fused_moe.v3 import Config
-from vllm_torchtpu.models.qwen3_5.kernels import dense_slots as DS
 from vllm_torchtpu.kernels.fused_moe.v3.layout import MESH_AXIS
 from vllm_torchtpu.layers.adapter import fused_moe_ep_v3 as A
+from vllm_torchtpu.models.qwen3_5.kernels import dense_slots as DS
 
 SHAPE = dict(hidden=4096, inter=1024, experts_per_shard=64)
 EP = 8
@@ -36,19 +38,25 @@ class _Mesh:
 def _adapter_config(monkeypatch, fields):
     monkeypatch.setattr(A, "_CONFIG_OVERRIDES", dict(fields))
     calls = []
-    monkeypatch.setattr(DS, "dense_slots_moe",
-                        lambda *a, **k: calls.append(k) or "dense")
+    monkeypatch.setattr(
+        DS, "dense_slots_moe", lambda *a, **k: calls.append(k) or "dense"
+    )
     monkeypatch.setattr(A, "fused_ep_moe", lambda *a, **k: "v3")
-    run = A.run_moe_v3(SimpleNamespace(axis_names=("d",), shape={"d": EP}), 10, True, "silu",
-                       **SHAPE)
-    got = run(SimpleNamespace(shape=(8 * 48, 4096)), "w1", "w2", "s1", "s2", "g", "r", "v")
+    run = A.run_moe_v3(
+        SimpleNamespace(axis_names=("d",), shape={"d": EP}), 10, True, "silu", **SHAPE
+    )
+    got = run(
+        SimpleNamespace(shape=(8 * 48, 4096)), "w1", "w2", "s1", "s2", "g", "r", "v"
+    )
     assert got == "dense"
     return calls[0]["config"]
 
 
 def test_override_fields_reach_the_dense_call(monkeypatch):
-    cfg = _adapter_config(monkeypatch, {**DENSE, "dense_slots_skip_unrouted": True,
-                                        "dense_slots_weight_slots": 4})
+    cfg = _adapter_config(
+        monkeypatch,
+        {**DENSE, "dense_slots_skip_unrouted": True, "dense_slots_weight_slots": 4},
+    )
     assert cfg.dense_slots_skip_unrouted is True
     assert cfg.dense_slots_weight_slots == 4
 
@@ -76,18 +84,34 @@ def _builder_kwargs(monkeypatch, config, **kw):
     x = SimpleNamespace(shape=(EP * 48, 4096), dtype="bfloat16")
     w1 = SimpleNamespace(shape=(EP * 64, 4096, 2048))
     with pytest.raises(_Stop):
-        DS.dense_slots_moe(x, w1, None, None, None, None, top_k=10, renormalize=True,
-                           mesh=_Mesh(), config=config, fused=True, merged=True,
-                           unpadded=True, **kw)
+        DS.dense_slots_moe(
+            x,
+            w1,
+            None,
+            None,
+            None,
+            None,
+            top_k=10,
+            renormalize=True,
+            mesh=_Mesh(),
+            config=config,
+            fused=True,
+            merged=True,
+            unpadded=True,
+            **kw,
+        )
     return got
 
 
-@pytest.mark.parametrize("fields,skip,slots", [
-    ({}, False, 3),
-    ({"dense_slots_skip_unrouted": True}, True, 3),
-    ({"dense_slots_weight_slots": 4}, False, 4),
-    ({"dense_slots_skip_unrouted": True, "dense_slots_weight_slots": 2}, True, 2),
-])
+@pytest.mark.parametrize(
+    "fields,skip,slots",
+    [
+        ({}, False, 3),
+        ({"dense_slots_skip_unrouted": True}, True, 3),
+        ({"dense_slots_weight_slots": 4}, False, 4),
+        ({"dense_slots_skip_unrouted": True, "dense_slots_weight_slots": 2}, True, 2),
+    ],
+)
 def test_builder_gets_the_settings(monkeypatch, fields, skip, slots):
     k = _builder_kwargs(monkeypatch, Config(**fields))
     assert k["skip_unrouted"] is skip

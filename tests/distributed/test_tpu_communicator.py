@@ -320,7 +320,9 @@ def test_packed_router_gather_only_on_replicated_dp_same_dtype(
     monkeypatch.setattr(comm.sequence_parallel, "_ACTIVE", active)
     hidden = torch.ones(8, 16, dtype=torch.bfloat16)
     logits = torch.ones(8, 4, dtype=logits_dtype)
-    h, lg = communicator.dispatch_router_logits(hidden, logits, is_sequence_parallel=True)
+    h, lg = communicator.dispatch_router_logits(
+        hidden, logits, is_sequence_parallel=True
+    )
     assert lg.dtype == logits_dtype and lg.shape[-1] == 4 and h.shape[-1] == 16
     if active:
         assert ep_group.all_gather.call_count == 2
