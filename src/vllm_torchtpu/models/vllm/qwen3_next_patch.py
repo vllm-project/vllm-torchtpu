@@ -1517,7 +1517,10 @@ def patched_mtp_forward(
     inputs_embeds: torch.Tensor | None = None,
     spec_step_idx: int = 0,
 ) -> torch.Tensor | IntermediateTensors:
-    if get_pp_group().is_first_rank:
+    # The draft runs whole on one stage (the last one under PP), so the
+    # embedding branch is the one without intermediate tensors, not the one on
+    # the first PP rank (vllm-project/vllm#46994).
+    if intermediate_tensors is None:
         if inputs_embeds is None:
             inputs_embeds = self.embed_input_ids(input_ids)
         assert hidden_states.shape[-1] == inputs_embeds.shape[-1]
@@ -1527,11 +1530,6 @@ def patched_mtp_forward(
         hidden_states = self.fc(hidden_states)
         residual = None
     else:
-        if intermediate_tensors is None:
-            raise RuntimeError(
-                "intermediate_tensors must not be None when "
-                "pipeline parallelism is active"
-            )
         hidden_states = intermediate_tensors["hidden_states"]
         residual = intermediate_tensors["residual"]
 
@@ -1607,6 +1605,11 @@ def maybe_patch_qwen3_next(*args: object, **kwargs: object) -> None:
     # rows, so they are installed together.
     qwen3_next.Qwen3NextDecoderLayer.forward = patched_decoder_layer_forward
     qwen3_next.Qwen3NextModel.forward = patched_model_forward
+    # vllm_torchtpu.models.vllm.qwen3_5_mtp assigns its own predictor forward
+    # at import time; importing it here keeps that assignment ahead of this one
+    # instead of letting a later draft load replace patched_mtp_forward.
+    import vllm_torchtpu.models.vllm.qwen3_5_mtp  # noqa: F401
+
     qwen3_next_mtp.Qwen3NextMultiTokenPredictor.forward = patched_mtp_forward
     qwen3_5_mtp.Qwen3_5MultiTokenPredictor.forward = patched_mtp_forward
     if envs.TPU_MOE_SEQUENCE_PARALLEL:
