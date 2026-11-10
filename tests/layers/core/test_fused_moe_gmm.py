@@ -478,7 +478,6 @@ def test_prepare_routed_gmm_inputs_keeps_original_combine_metadata():
         topk_weights_flat,
         valid_mask,
         token_indices_sorted,
-        _,
     ) = prepare_routed_gmm_inputs(
         hidden_states,
         topk_indices,
