@@ -593,6 +593,7 @@ def _plain_step_runner(num_output, logits, req_id="r0"):
             mamba_boundary_plans=None,
             pooler_output_list=[],
             top_tokens=False,
+            topk_candidates_packed=False,
             kv_save_nan_check=None,
             prompt_logprobs_chunks=[],
         ),

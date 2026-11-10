@@ -6577,7 +6577,7 @@ class TPUModelRunner(GPUModelRunner):
                             sampling_generator,
                             state.top_tokens,
                             min_toks,
-                            topk_candidates_packed=state.topk_candidates_packed,
+                            state.topk_candidates_packed,
                         )
                     combined_selected_tokens.append(next_tokens)
                     combined_selected_tokens_real_lens.append(num_reqs)
@@ -8259,6 +8259,7 @@ class TPUModelRunner(GPUModelRunner):
     def _precompile_compute_top_tokens(self) -> None:
         if self._greedy_head_owner is None:
             return
+        self._precompile_compute_topk_candidates()
         hsize = self.model_config.get_hidden_size()
         with self._precompile_timed("compute_selected_top_tokens"):
             for num_tokens in self.num_tokens_paddings:
@@ -8616,6 +8617,11 @@ class TPUModelRunner(GPUModelRunner):
                 if num_reqs >= min(num_tokens, self.max_num_reqs):
                     break
         pairs = _rotate_precompile_sweep(pairs, "rejection_sampler")
+        # As at runtime (_sample_spec_verify_chunk): the fused greedy verify
+        # runs on TPU with the stock rejection sampler.
+        fused_greedy_verify = getattr(
+            self.device, "type", None
+        ) == "tpu" and isinstance(self.rejection_sampler, RejectionSampler)
         with self._precompile_timed("rejection_sampler"):
             # padded_logits_length-shaped inputs, rebuilt when the length
             # changes; dtypes mirror get_spec_decode_metadata so the graph is
@@ -8790,21 +8796,26 @@ class TPUModelRunner(GPUModelRunner):
                         topk_candidates=blocks,
                     )
                     synchronize_tensors(out)
-                # Fused greedy verify from logits (the all-greedy TPU path).
-                out = _fused_greedy_verify_from_logits(
-                    dummy_logits,
-                    bonus_logits_indices,
-                    target_logits_indices,
-                    draft_token_ids,
-                    draft_lengths,
-                    segment_ids,
-                    group_indices,
-                    k,
-                    (warm_accept_u if self.rejection_sampler.synthetic_mode else None),
-                    self.rejection_sampler.synthetic_conditional_rates,
-                    self.rejection_sampler.synthetic_mode,
-                )
-                synchronize_tensors(out)
+                if fused_greedy_verify:
+                    # Fused greedy verify from logits (the all-greedy TPU path).
+                    out = _fused_greedy_verify_from_logits(
+                        dummy_logits,
+                        bonus_logits_indices,
+                        target_logits_indices,
+                        draft_token_ids,
+                        draft_lengths,
+                        segment_ids,
+                        group_indices,
+                        k,
+                        (
+                            warm_accept_u
+                            if self.rejection_sampler.synthetic_mode
+                            else None
+                        ),
+                        self.rejection_sampler.synthetic_conditional_rates,
+                        self.rejection_sampler.synthetic_mode,
+                    )
+                    synchronize_tensors(out)
                 if (
                     self._greedy_head_owner is not None
                     and envs.TPU_SAMPLER_TOPK_CANDIDATES > 0
@@ -8922,7 +8933,6 @@ class TPUModelRunner(GPUModelRunner):
         if self.get_pcp_planner().uses_selected_logits_hidden_states:
             self._precompile_compute_logits_from_hidden_states()
         self._precompile_compute_top_tokens()
-        self._precompile_compute_topk_candidates()
         self._precompile_structured_decoding()
         self._precompile_min_tokens_mask()
         self._precompile_sample_from_logits()
