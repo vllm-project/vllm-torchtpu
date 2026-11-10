@@ -260,7 +260,9 @@ legs:
         lazy_reasoning_count: true
         tokenize_prefix_cache: true
       tpu_runner:
+        gc_freeze: true
         stage_timing: false
+        switch_interval_us: 200
       tpu_scheduler:
         promote_warmest: false
       tpu_worker:
