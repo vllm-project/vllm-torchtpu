@@ -199,6 +199,7 @@ def _engine_plan(cache):
     import copy
 
     from vllm.v1.core.kv_cache_planning import (
+        get_global_kv_cache_groups,
         get_kv_cache_configs,
     )
     from vllm.v1.core.kv_cache_utils import (
@@ -213,7 +214,9 @@ def _engine_plan(cache):
         * cache.layout.page_bytes
         * max(len(group.layer_names) for group in cache.groups)
     )
-    plans = get_kv_cache_configs(cfg, [copy.deepcopy(cache.specs)], [memory])
+    specs = [copy.deepcopy(cache.specs)]
+    groups = get_global_kv_cache_groups(cfg, specs)
+    plans = get_kv_cache_configs(cfg, specs, [memory], groups)
     final = plans[0]
     final.kv_cache_layout = cfg.cache_config.kv_cache_layout
     scheduler = generate_scheduler_kv_cache_config(plans)

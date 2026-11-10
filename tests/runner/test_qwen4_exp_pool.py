@@ -35,6 +35,10 @@ from vllm_torchtpu.models.vllm.qwen4_exp.pool_layout import pooled_cache_specs
 
 
 def pool_config(tp=1, kv="fp8_e4m3", ssm="bfloat16"):
+    from vllm.model_executor.models.interfaces import supports_kv_cache_grouping
+
+    from vllm_torchtpu.models.vllm.qwen4_exp.model import Qwen4ExpForCausalLM
+
     cache = CacheConfig(
         block_size=128,
         cache_dtype=kv,
@@ -48,7 +52,10 @@ def pool_config(tp=1, kv="fp8_e4m3", ssm="bfloat16"):
         attention_config=AttentionConfig(),
         cache_config=cache,
         model_config=NS(
-            hf_text_config=q4exp_text_config(), max_model_len=9216, dtype=torch.bfloat16
+            hf_text_config=q4exp_text_config(),
+            max_model_len=9216,
+            dtype=torch.bfloat16,
+            supports_kv_cache_grouping=supports_kv_cache_grouping(Qwen4ExpForCausalLM),
         ),
         parallel_config=NS(
             tensor_parallel_size=tp,
