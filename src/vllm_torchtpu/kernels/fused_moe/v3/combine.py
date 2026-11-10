@@ -75,7 +75,7 @@ def _weighted_sum_body(
         acc = None
         for k in range(top_k):
             coef = c[:, k : k + 1]
-            term = rows_ref[t, k].astype(dtype) * coef
+            term = rows_ref[t * top_k + k].astype(dtype) * coef
             # A route of weight zero points at a row nobody wrote this
             # call: its term is dropped, not multiplied, so a NaN or Inf
             # there cannot reach the token.
@@ -104,11 +104,13 @@ def weighted_sum(
     unroll=COMBINE_UNROLL_DEFAULT,
     dtype=jnp.float32,
 ):
-    """rows [tokens * top_k, lane blocks, LANES] fp8 or bf16 in pair order
-    (token-major: pair t * top_k + k is token t's slot k), scales
-    [tokens * top_k] f32 the same or None, weights [tokens, top_k] f32 ->
-    [tokens, hidden] out_dtype. The rows' blocks are the true width padded
-    to whole SUBLANES (zero blocks past `hidden`)."""
+    """rows [n_rows, lane blocks, LANES] fp8 or bf16 in pair order
+    (token-major: pair t * top_k + k is token t's slot k, with
+    n_rows >= tokens * top_k; trailing padding rows past tokens * top_k
+    are never read), scales [n_scales] f32 (n_scales >= tokens * top_k) or
+    None, weights [tokens, top_k] f32 -> [tokens, hidden] out_dtype. The
+    rows' blocks are the true width padded to whole SUBLANES (zero blocks
+    past `hidden`)."""
     n_rows, lane_blocks, lanes = rows.shape
     if not 0 < hidden <= lane_blocks * lanes:
         raise ValueError(
@@ -123,24 +125,31 @@ def weighted_sum(
         raise ValueError(
             f"gathered rows of {lanes} lanes. A row is staged as {LANES}-lane blocks"
         )
-    if n_rows % tokens_per_shard:
-        raise ValueError(
-            f"{n_rows} gathered rows is not a whole number of "
-            f"slots of {tokens_per_shard} tokens"
-        )
-    top_k = n_rows // tokens_per_shard
-    with_scales = scales is not None
-    if (with_scales and scales.shape != (n_rows,)) or weights.shape != (
-        tokens_per_shard,
-        top_k,
+    if (
+        weights.ndim != 2
+        or weights.shape[0] != tokens_per_shard
+        or weights.shape[1] <= 0
     ):
         raise ValueError(
-            f"scales {None if scales is None else scales.shape} "
-            f"and weights {weights.shape} "
-            f"do not match {n_rows} rows as {tokens_per_shard} "
-            f"tokens x {top_k} slots"
+            f"weights {weights.shape} do not match {tokens_per_shard} "
+            "tokens x a positive slot count"
         )
-    if (with_scales and scales.dtype != jnp.float32) or weights.dtype != jnp.float32:
+    top_k = weights.shape[1]
+    num_pairs = tokens_per_shard * top_k
+    if n_rows < num_pairs:
+        raise ValueError(
+            f"{n_rows} gathered rows is fewer than {tokens_per_shard} "
+            f"tokens x {top_k} slots ({num_pairs})"
+        )
+    with_scales = scales is not None
+    if scales is not None and (scales.ndim != 1 or scales.shape[0] < num_pairs):
+        raise ValueError(
+            f"scales {scales.shape} do not cover {tokens_per_shard} "
+            f"tokens x {top_k} slots ({num_pairs})"
+        )
+    if (
+        scales is not None and scales.dtype != jnp.float32
+    ) or weights.dtype != jnp.float32:
         raise ValueError(
             f"scales {None if scales is None else scales.dtype} "
             f"and weights {weights.dtype}: "
@@ -169,8 +178,9 @@ def weighted_sum(
     vmem_limit = min(2 * needed, device.vmem_limit())
     table = pl.BlockSpec((tokens_per_tile, top_k), lambda i: (i, 0))
     tables = [weights]
-    if with_scales:
-        tables = [scales.reshape(tokens_per_shard, top_k)] + tables
+    if scales is not None:
+        active_scales = scales[:num_pairs] if scales.shape[0] > num_pairs else scales
+        tables = [active_scales.reshape(tokens_per_shard, top_k)] + tables
 
     def body(*refs):
         return _weighted_sum_body(
@@ -184,9 +194,8 @@ def weighted_sum(
             dtype=dtype,
         )
 
-    rows = rows.reshape(tokens_per_shard, top_k, lane_blocks, lanes)
     rows_spec = pl.BlockSpec(
-        (tokens_per_tile, top_k, lane_blocks, lanes), lambda i: (i, 0, 0, 0)
+        (tokens_per_tile * top_k, lane_blocks, lanes), lambda i: (i, 0, 0)
     )
     out_spec = pl.BlockSpec((tokens_per_tile, hidden), lambda i: (i, 0))
     coefficients = pltpu.VMEM((tokens_per_tile, top_k), jnp.float32)
@@ -225,8 +234,9 @@ def combine(
     it: arrivals [R, result blocks, LANES] fp8 or bf16 (the true `hidden`
     padded with zero blocks to whole SUBLANES), arrival_scales [R] f32 (a
     word per row) or None for bf16 rows, arrival_rows
-    [tokens * top_k] int32 in pair order (token-major: pair t * top_k + k
-    is token t's slot k), weights [tokens, top_k] -> [tokens, hidden]."""
+    [n_gather] int32 (n_gather >= tokens * top_k, with trailing gather-block
+    padding) in pair order (token-major: pair t * top_k + k is token t's
+    slot k), weights [tokens, top_k] -> [tokens, hidden]."""
     tokens_per_shard, top_k = weights.shape
     n_pairs = tokens_per_shard * top_k
     if arrival_rows.ndim != 1 or arrival_rows.shape[0] < n_pairs:
@@ -238,11 +248,6 @@ def combine(
     rows, scales = gather.gather_rows_and_scales(
         arrivals, arrival_scales, arrival_rows, block_rows=block_rows, ring=ring
     )
-    if arrival_rows.shape[0] > n_pairs:
-        # The pair list was padded to whole gather blocks; the real pairs
-        # come first (the padding sits past the last token's pairs).
-        rows = rows[:n_pairs]
-        scales = None if scales is None else scales[:n_pairs]
     return weighted_sum(
         rows,
         scales,
