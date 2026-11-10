@@ -1,0 +1,221 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# IX point #10 (band G): the serve arguments and
+# environment each leg of the record job ran, for the main-based stack.
+# See README.md in this directory for how to read and use it.
+name: p10-band-g-tp8-2p5d-cap3-c208
+point: 10
+sheet: ix-tpu-pd-cand4-llmd-oct28
+record:
+  job: j-cb36cb31-be62-4eff-a4be
+  tree: f0e45f67708ea2132e9eb14eaee098d5875fdf30
+  mtok_per_dollar: 105.88
+  p90_interactivity: 626.44
+  decode_megakernel: "on (mode tp)"
+recipe:
+  repository: cloud-devkit-recipes
+  commit: 90863fb2
+  path: recipes/inferencex/qwen-3.5/pd-cand4/qwen35-pd-cand4-llmd-10-band-g-tp8-2p5d-cap3-c208.jsonnet
+  base: agentx-397b-pd-baseline
+decode_layout: "TP8 + DCP4"
+concurrency: 208
+chips: 28
+legs:
+  prefill:
+    replicas: 2
+    chips_per_replica: 4
+    serve_args:
+      - "$MODEL"
+      - "--served-model-name"
+      - "$SERVED_MODEL"
+      - "Qwen/$SERVED_MODEL"
+      - "--default-chat-template-kwargs"
+      - "{\"enable_thinking\":true}"
+      - "--tool-call-parser=qwen3_coder"
+      - "--reasoning-parser=qwen3"
+      - "--api-server-count"
+      - "1"
+      - "--trust-remote-code"
+      - "--seed"
+      - "42"
+      - "--max-model-len"
+      - "262144"
+      - "--disable-custom-all-reduce"
+      - "--gpu-memory-utilization"
+      - "0.92"
+      - "--kv-cache-dtype"
+      - "fp8"
+      - "--quantization"
+      - "fp8"
+      - "--language-model-only"
+      - "--limit-mm-per-prompt"
+      - "{\"image\":0,\"video\":0}"
+      - "--max-num-batched-tokens"
+      - "8192"
+      - "--long-prefill-token-threshold"
+      - "262144"
+      - "--max-num-seqs"
+      - "32"
+      - "--no-disable-hybrid-kv-cache-manager"
+      - "--attention-backend"
+      - "CUSTOM"
+      - "--mamba-cache-mode"
+      - "align"
+      - "--enable-prompt-tokens-details"
+      - "--no-enable-log-requests"
+      - "--compilation-config"
+      - "{\"backend\":\"vllm_torchtpu.compilation.tpu_compiler.TpuCompilerAdaptor\",\"compile_sizes\":[2176, 4352, 6528, 8192],\"inductor_compile_config\":{\"enable_auto_functionalized_v2\":false,\"size_asserts\":false,\"alignment_asserts\":false,\"scalar_asserts\":false}}"
+      - "--enable-prefix-caching"
+      - "--scheduler-cls"
+      - "vllm_torchtpu.core.prefix_aware_scheduler.PrefixAwareScheduler"
+      - "--block-size"
+      - "2176"
+      - "--disable-sliding-window"
+      - "--tensor-parallel-size"
+      - "1"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8000"
+      - "--prefill-context-parallel-size"
+      - "1"
+      - "--pipeline-parallel-size"
+      - "8"
+      - "--cp-kv-cache-interleave-size"
+      - "1"
+      - "--data-parallel-size"
+      - "1"
+      - "--data-parallel-size-local"
+      - "1"
+      - "--kv-transfer-config"
+      - "{\"kv_connector\":\"TPUMultiConnector\",\"kv_connector_module_path\":\"vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector\",\"kv_role\":\"kv_producer\",\"kv_connector_extra_config\":{\"connectors\":[{\"kv_connector\":\"TPURaidenConnector\",\"kv_connector_module_path\":\"vllm_torchtpu.distributed.kv_transfer.tpu_connector\",\"kv_role\":\"kv_producer\",\"kv_port\":14579,\"kv_connector_extra_config\":{\"destination_decode_context_parallel_size\":4}},{\"kv_connector\":\"TPURaidenOffloadingConnector\",\"kv_connector_module_path\":\"vllm_torchtpu.offload.raiden_connector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"cpu_bytes_to_use\":550000000000,\"raiden_controller_port\":47800}}]}}"
+      - "--speculative-config"
+      - "{\"method\":\"mtp\",\"num_speculative_tokens\":1}"
+    env:
+      MOE_FUSED_EP_KERNEL_MIN_TOKENS: "1024"
+      ONEHOT_MOE_PERMUTE_THRESHOLD: "2048"
+      TPU_ENABLE_GDN_DYNAMIC_TILING: "1"
+      TPU_EVICT_WEIGHTS_PAGE_CACHE: "1"
+      TPU_GDN_CONV_QK_PAIR_LAYOUT: "1"
+      TPU_KV_SHM_POOL_GB: "8"
+      TPU_MOE_SEQUENCE_PARALLEL: "0"
+      TPU_P2P_WAIT_PULL_TIMEOUT: "300"
+      TPU_PP_CHUNK_SLACK: "0.5"
+      TPU_RAIDEN_DST_SHARDS: "8"
+      TPU_RAIDEN_JOB_NAME: "prefill"
+      TPU_RAIDEN_MAX_TRANSFER_TOKENS: "262144"
+      TPU_RAIDEN_POOL_TAGS_PER_LAYER: "1"
+      TPU_RAIDEN_PREFIX_AWARE_LOAD: "1"
+      TPU_RAIDEN_QWEN35_ADMISSION: "1"
+      TPU_RAIDEN_RESHARD_IMPL: "store"
+      TPU_RAIDEN_TRANSFER_PARALLELISM: "8"
+      TPU_USE_RAIDEN_KV_CACHE_MANAGER: "1"
+      TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: "1"
+      USE_MOE_SPARSE_CORE: "1"
+      VLLM_XLA_CHECK_RECOMPILATION: "0"
+    additional_config: {}
+  decode:
+    replicas: 5
+    chips_per_replica: 4
+    serve_args:
+      - "$MODEL"
+      - "--served-model-name"
+      - "$SERVED_MODEL"
+      - "Qwen/$SERVED_MODEL"
+      - "--default-chat-template-kwargs"
+      - "{\"enable_thinking\":true}"
+      - "--tool-call-parser=qwen3_coder"
+      - "--reasoning-parser=qwen3"
+      - "--api-server-count"
+      - "1"
+      - "--trust-remote-code"
+      - "--seed"
+      - "42"
+      - "--max-model-len"
+      - "262144"
+      - "--enable-expert-parallel"
+      - "--disable-custom-all-reduce"
+      - "--gpu-memory-utilization"
+      - "0.92"
+      - "--kv-cache-dtype"
+      - "fp8"
+      - "--quantization"
+      - "fp8"
+      - "--language-model-only"
+      - "--limit-mm-per-prompt"
+      - "{\"image\":0,\"video\":0}"
+      - "--max-num-batched-tokens"
+      - "2048"
+      - "--max-num-seqs"
+      - "3"
+      - "--no-disable-hybrid-kv-cache-manager"
+      - "--attention-backend"
+      - "CUSTOM"
+      - "--mamba-cache-mode"
+      - "align"
+      - "--enable-prompt-tokens-details"
+      - "--no-enable-log-requests"
+      - "--compilation-config"
+      - "{\"backend\":\"vllm_torchtpu.compilation.tpu_compiler.TpuCompilerAdaptor\",\"compile_sizes\":[4, 8, 16, 24, 32, 48, 64, 96, 128, 160, 192, 256, 320, 384, 448, 512, 2048],\"inductor_compile_config\":{\"enable_auto_functionalized_v2\":false,\"size_asserts\":false,\"alignment_asserts\":false,\"scalar_asserts\":false}}"
+      - "--enable-prefix-caching"
+      - "--async-scheduling"
+      - "--scheduler-cls"
+      - "vllm_torchtpu.core.prefix_aware_scheduler.PrefixAwareScheduler"
+      - "--block-size"
+      - "640"
+      - "--disable-sliding-window"
+      - "--tensor-parallel-size"
+      - "8"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "7200"
+      - "--prefill-context-parallel-size"
+      - "1"
+      - "--decode-context-parallel-size"
+      - "4"
+      - "--cp-kv-cache-interleave-size"
+      - "128"
+      - "--data-parallel-size"
+      - "1"
+      - "--data-parallel-size-local"
+      - "1"
+      - "--kv-transfer-config"
+      - "{\"kv_connector\":\"TPURaidenConnector\",\"kv_connector_module_path\":\"vllm_torchtpu.distributed.kv_transfer.tpu_connector\",\"kv_role\":\"kv_consumer\",\"kv_port\":14579,\"kv_connector_extra_config\":{\"destination_decode_context_parallel_size\":4}}"
+      - "--speculative-config"
+      - "{\"method\":\"mtp\",\"num_speculative_tokens\":3,\"rejection_sample_method\":\"synthetic\",\"synthetic_acceptance_length\":3.39}"
+    env:
+      MOE_FUSED_EP_KERNEL_MIN_TOKENS: "1024"
+      ONEHOT_MOE_PERMUTE_THRESHOLD: "2048"
+      TPU_ENABLE_GDN_DYNAMIC_TILING: "1"
+      TPU_EVICT_WEIGHTS_PAGE_CACHE: "1"
+      TPU_EXPERT_PLACEMENT: "/workspace/vllm-torchtpu/expert_placement/expert_placement_tp8_ep8_agentx_corr_c32.json"
+      TPU_GDN_CONV_QK_PAIR_LAYOUT: "1"
+      TPU_KV_SHM_POOL_GB: "8"
+      TPU_MOE_SEQUENCE_PARALLEL: "1"
+      TPU_P2P_WAIT_PULL_TIMEOUT: "300"
+      TPU_RAIDEN_DST_SHARDS: "8"
+      TPU_RAIDEN_JOB_NAME: "decode"
+      TPU_RAIDEN_MAX_TRANSFER_TOKENS: "262144"
+      TPU_RAIDEN_POOL_TAGS_PER_LAYER: "1"
+      TPU_RAIDEN_PREFIX_AWARE_LOAD: "1"
+      TPU_RAIDEN_QWEN35_ADMISSION: "1"
+      TPU_RAIDEN_RESHARD_IMPL: "store"
+      TPU_RAIDEN_TRANSFER_PARALLELISM: "8"
+      TPU_SAMPLER_TOPK_CANDIDATES: "40"
+      TPU_USE_RAIDEN_KV_CACHE_MANAGER: "1"
+      TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: "1"
+      USE_MOE_SPARSE_CORE: "1"
+      VLLM_XLA_CHECK_RECOMPILATION: "0"
+    additional_config: {}
