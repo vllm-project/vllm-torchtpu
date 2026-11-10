@@ -11,13 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The Qwen3.5 rule for the quantized-matmul quantize arithmetic: the
-reciprocal scale for Qwen3.5, main's arithmetic for every other model."""
+"""The Qwen3.5 rule for kernel numerics and code paths: the quantize
+helpers' reciprocal scale and the grouped matmul's hand-streamed whole-expert
+slabs for Qwen3.5, main's arithmetic and code for every other model."""
 
 from types import SimpleNamespace
 
 import pytest
 
+from vllm_torchtpu.kernels.megablox import gmm_v2
 from vllm_torchtpu.kernels.quantized_matmul import util
 from vllm_torchtpu.models.qwen3_5 import hooks
 
@@ -27,26 +29,30 @@ pytestmark = pytest.mark.cpu_test
 @pytest.fixture(autouse=True)
 def _mains_default(monkeypatch):
     monkeypatch.setattr(util, "RECIPROCAL_SCALE", False)
+    monkeypatch.setattr(gmm_v2, "RHS_STREAM", False)
 
 
 def _model(arch):
     return SimpleNamespace(architectures=[arch])
 
 
-def test_qwen3_5_quantizes_with_the_reciprocal_scale():
+def test_qwen3_5_takes_the_reciprocal_scale_and_streamed_slabs():
     assert (
         hooks.apply_kernel_numerics(_model("Qwen3_5MoeForConditionalGeneration"))
         is None
     )
     assert util.RECIPROCAL_SCALE is True
+    assert gmm_v2.RHS_STREAM is True
 
 
 @pytest.mark.parametrize("arch", ["DeepseekV3ForCausalLM", "Qwen3MoeForCausalLM"])
-def test_other_models_keep_mains_arithmetic(arch):
+def test_other_models_keep_mains_arithmetic_and_code(arch):
     assert hooks.apply_kernel_numerics(_model(arch)) is None
     assert util.RECIPROCAL_SCALE is False
+    assert gmm_v2.RHS_STREAM is False
 
 
 def test_waits_for_a_model_config():
     assert hooks.apply_kernel_numerics(None) is False
     assert util.RECIPROCAL_SCALE is False
+    assert gmm_v2.RHS_STREAM is False
