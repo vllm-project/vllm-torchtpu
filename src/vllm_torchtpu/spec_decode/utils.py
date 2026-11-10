@@ -76,18 +76,22 @@ def _static_shape_args(fn):
     untouched.
     """
 
+    def _unmark(a):
+        if isinstance(a, torch.Tensor) and getattr(a, "_dynamo_dynamic_indices", None):
+            return a[:]
+        return a
+
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
-        def unmark(a):
-            if isinstance(a, torch.Tensor) and getattr(
-                a, "_dynamo_dynamic_indices", None
-            ):
-                return a[:]
-            return a
-
-        return fn(
-            *[unmark(a) for a in args], **{k: unmark(v) for k, v in kwargs.items()}
-        )
+        if any(
+            isinstance(a, torch.Tensor) and getattr(a, "_dynamo_dynamic_indices", None)
+            for a in args
+        ):
+            args = tuple(_unmark(a) for a in args)
+        if kwargs:
+            kwargs = {k: _unmark(v) for k, v in kwargs.items()}
+            return fn(*args, **kwargs)
+        return fn(*args)
 
     return wrapper
 
