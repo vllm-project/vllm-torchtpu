@@ -342,6 +342,7 @@ if TYPE_CHECKING:
     VLLM_TPU_CPU_PIN_MIGRATE: bool = False
     VLLM_TPU_SAMPLING_PARAMS_MEMO: bool = False
     VLLM_TPU_MAMBA_INDICES_REUSE: bool = False
+    VLLM_TPU_GC_THRESHOLD: str = ""
     VLLM_TPU_FUSED_READ_OFFSET_UPDATE: bool = True
     VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE: bool = False
     VLLM_TPU_BLOCK_TABLE_PACK_DELTA: bool = False
@@ -2067,6 +2068,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Reuse the compact mamba_state_indices upload while the chunk's slot
     # list repeats (target prep and each draft forward rebuild it).
     "VLLM_TPU_MAMBA_INDICES_REUSE": env_bool("VLLM_TPU_MAMBA_INDICES_REUSE"),
+    # "g0,g1[,g2]": the worker's gc.set_threshold after warmup (empty = keep
+    # CPython's 700,10,10). A step allocates thousands of container objects,
+    # so the default runs several young-generation passes per step;
+    # HOST_PHASES reports them as x_gc0/1/2.
+    "VLLM_TPU_GC_THRESHOLD": env_str("VLLM_TPU_GC_THRESHOLD", ""),
     # Async scheduling: wait for the previous step's sampled-token copy after
     # launching this step's draft rather than before it (sample_tokens).
     "VLLM_TPU_DEFER_PREV_RESULTS_WAIT": env_bool(

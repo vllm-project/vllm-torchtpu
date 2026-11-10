@@ -40,6 +40,28 @@ _cur_info = ""
 def set_rank(rank: int) -> None:
     global _rank
     _rank = rank
+    if _EVERY:
+        _install_gc_timer()
+
+
+_gc_start = 0
+
+
+def _gc_callback(phase: str, info: dict) -> None:
+    """Charge each cyclic-GC pass to ``x_gc<generation>`` of the current step."""
+    global _gc_start
+    if phase == "start":
+        _gc_start = time.perf_counter_ns()
+    elif _gc_start:
+        note(f"x_gc{info.get('generation', '?')}", (time.perf_counter_ns() - _gc_start) / 1e3)
+        _gc_start = 0
+
+
+def _install_gc_timer() -> None:
+    import gc
+
+    if _gc_callback not in gc.callbacks:
+        gc.callbacks.append(_gc_callback)
 
 
 def enabled() -> bool:
