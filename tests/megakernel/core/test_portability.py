@@ -236,3 +236,14 @@ def test_core_never_imports_the_adapter():
                     f"{rel}:{_ln(node)} imports '{name}'; megakernel/core does "
                     "not import megakernel/adapter"
                 )
+
+
+def test_collectives_package_is_framework_free():
+    """`megakernel/core/collectives/` imports only stdlib, jax, numpy and core
+    spec modules.
+
+    Collectives stay model-free and below the kernel builder: no `models/`,
+    `modules/`, `vmem`, `kernel` or cache imports, so any model or runtime can
+    reuse them.
+    """
+    _assert_package_is_framework_free("collectives")
