@@ -113,7 +113,11 @@ from vllm_torchtpu.gdn_pool_layout import (
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs as rpa_configs
 from vllm_torchtpu.kernels.experimental.batched_rpa import wrapper as rpa_batched
 from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
-from vllm_torchtpu.layers.adapter import dp_vocab_parallel, token_padding
+from vllm_torchtpu.layers.adapter import (
+    dp_vocab_parallel,
+    expert_placement,
+    token_padding,
+)
 from vllm_torchtpu.layers.adapter.attention import (
     KV_LAYOUT_BY_VLLM_LAYOUT,
     TPU_STR_DTYPE_TO_TORCH_DTYPE,
@@ -5774,6 +5778,9 @@ class TPUModelRunner(GPUModelRunner):
         )
         self.vllm_config.quant_config = get_tpu_quantization_config(self.vllm_config)
 
+        # No placed layers or target depth left over from an earlier load.
+        expert_placement.reset_model_state()
+
         model_loader = get_model_loader(self.load_config)
         logger.info("Loading model from scratch...")
         with (
@@ -5858,6 +5865,10 @@ class TPUModelRunner(GPUModelRunner):
                         dtype=torch.float32,
                         device=self.device,
                     )
+
+        # After the drafter: every placed MoE layer, the drafter's too, must
+        # have had its router renumbered with its experts.
+        expert_placement.check_routers_permuted()
 
         # After the drafter, so its MTP layer is armed too.
         if envs.FUSED_MOE_DECODE_KERNEL:

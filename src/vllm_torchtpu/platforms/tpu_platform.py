@@ -498,6 +498,9 @@ class TpuPlatform(Platform):
         "TPU_DP_VOCAB_PARALLEL",
         "MOE_FUSED_EP_ENABLE_W4A8",
         "MOE_FUSED_EP_KERNEL_IMPL",
+        # Every EP rank must hold the same placement: a rank that served
+        # without it would route to experts its peers no longer hold.
+        "TPU_EXPERT_PLACEMENT",
         "VLLM_TPU_INDEXER_KV_CACHE_MODE",
         "TPU_DCP_INDEXER_A2A_MERGE",
         "TPU_DCP_INDEXER_A2A_MIN_TOKENS",
