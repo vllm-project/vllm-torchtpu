@@ -37,7 +37,7 @@ arms:
   tradeoffs_off:
     additional_config: {}
   tradeoffs_on:
-    additional_config: {}
+    additional_config: {qwen3_5: {quantize_target_lm_head: true}}
 suite:
   gsm8k: {samples: 1319, chat_template_kwargs: {enable_thinking: true}, metric: strict-match}
   longbench: {}
