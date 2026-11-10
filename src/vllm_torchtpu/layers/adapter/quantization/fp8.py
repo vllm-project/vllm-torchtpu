@@ -75,11 +75,11 @@ from vllm.model_executor.parameter import (
 )
 from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 
-from vllm_torchtpu import envs, expert_placement
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import (
     vllm_adapter as adaptive_moe,
 )
-from vllm_torchtpu.layers.adapter import moe_routing, token_padding
+from vllm_torchtpu.layers.adapter import expert_placement, moe_routing, token_padding
 from vllm_torchtpu.layers.adapter.fused_moe import (
     TpuMoEActivationMixin,
     fused_moe_gmm,
@@ -1312,6 +1312,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         use_fused_kernel: bool = True,
     ) -> torch.Tensor:
         from vllm.distributed.parallel_state import get_ep_group
+
         from vllm_torchtpu.layers.adapter import small_all_reduce_op
         from vllm_torchtpu.layers.adapter.fused_moe_ep_v3 import (
             fused_moe_ep,

@@ -13,11 +13,13 @@
 # limitations under the License.
 """Small-batch MoE with the router in the kernel, for the FP8 MoE method.
 
-With TPU_MOE_LOWTOK=1, a layer whose routing is a plain softmax top-k with
-renormalized weights hands its router scores to `pallas::moe_lowtok_scores_k{k}`
-(or `pallas::moe_lowtok_scores_copies_k{k}_r{r}_o{o}` when placed by a
-copy-enabled `TPU_EXPERT_PLACEMENT` table). Inside the JAX op, shapes at or
-below `TPU_MOE_LOWTOK_MAX_TOKENS` dispatch to `moe_lowtok` (which selects
+On a Qwen3.5 model's expert-parallel MoE layers (`enabled`), a layer whose
+routing is a plain softmax top-k with renormalized weights hands its router
+scores to `pallas::moe_lowtok_scores_k{k}` (or
+`pallas::moe_lowtok_scores_copies_k{k}_r{r}_o{o}` when placed by a
+`TPU_EXPERT_PLACEMENT` table with copy slots). Inside the JAX op, shapes at or
+below the expert-parallel size's row cap (`max_tokens`) dispatch to
+`moe_lowtok` (which selects
 experts in-kernel and, for copy-enabled layers, greedily picks the less-loaded
 holder per hit copied expert), while shapes above the cap run top-k +
 renormalization in JAX and dispatch to `fused_moe_func`. Keeping the row-count
@@ -37,7 +39,7 @@ import numpy as np
 import torch
 from torch_tpu._internal.pallas import jax_op
 
-from vllm_torchtpu import envs, expert_placement
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.experimental.moe_lowtok import (
     MOE_LOWTOK_MAX_TOKENS,
     can_use_moe_lowtok,
@@ -48,13 +50,14 @@ from vllm_torchtpu.kernels.experimental.moe_lowtok import (
     slot_table,
 )
 from vllm_torchtpu.kernels.router_topk import router_topk
-from vllm_torchtpu.layers.adapter import moe_routing, token_padding
+from vllm_torchtpu.layers.adapter import expert_placement, moe_routing, token_padding
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
     enable_pipelined_collective_and_compute,
 )
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
     fused_moe_func,
     resolve_onehot_permute_threshold,
+    set_lowtok_max_tokens,
 )
 from vllm_torchtpu.logger import init_logger
 
@@ -82,6 +85,42 @@ def _jax_dtype(dtype: torch.dtype) -> jnp.dtype:
 
 def _struct(t: torch.Tensor | None) -> jax.ShapeDtypeStruct | None:
     return None if t is None else jax.ShapeDtypeStruct(t.shape, _jax_dtype(t.dtype))
+
+
+# Largest step, in rows per MoE call across the node, the few-token kernel
+# serves, keyed on the expert-parallel size; other sizes use the default. EP8
+# is the Qwen3.5 decode layout.
+DEFAULT_MAX_TOKENS = 256
+MAX_TOKENS_BY_EP: dict[int, int] = {8: 448}
+assert max(MAX_TOKENS_BY_EP.values()) <= MOE_LOWTOK_MAX_TOKENS
+# The cap this process armed the kernel with (0: not armed), for the JAX op
+# body, which is traced after the weights load.
+_ARMED_MAX_TOKENS = 0
+
+
+def max_tokens(ep_size: int) -> int:
+    """The row cap for an expert-parallel size."""
+    return MAX_TOKENS_BY_EP.get(int(ep_size), DEFAULT_MAX_TOKENS)
+
+
+def enabled(vllm_config: Any) -> bool:
+    """Whether the few-token kernel serves this engine's MoE layers: a Qwen3.5
+    model with expert parallelism. Other models keep the default MoE path
+    until the kernel is validated on them."""
+    from vllm_torchtpu.models.qwen3_5 import settings as qwen3_5_settings
+
+    model_config = getattr(vllm_config, "model_config", None)
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    return bool(
+        model_config is not None
+        and qwen3_5_settings.is_qwen3_5(model_config)
+        and getattr(parallel_config, "enable_expert_parallel", False)
+    )
+
+
+def armed_max_tokens() -> int:
+    """The row cap the kernel is armed with in this process, 0 if it is not."""
+    return _ARMED_MAX_TOKENS
 
 
 def _layer_has_placement_copies(layer: RoutedExperts) -> bool:
@@ -247,7 +286,7 @@ def _moe_scores_fn(
     owned: int = 64,
     has_copies: bool = False,
 ) -> jax.Array:
-    if x.shape[0] <= envs.TPU_MOE_LOWTOK_MAX_TOKENS:
+    if x.shape[0] <= _ARMED_MAX_TOKENS:
         if has_copies:
             return moe_lowtok(
                 x,
@@ -407,12 +446,23 @@ def _build_copies_op(
 def prebuild(
     method: Any, layer: RoutedExperts, activation: str
 ) -> torch.library.CustomOpDef | None:
-    """Record the layer's entry under TPU_MOE_LOWTOK; the scores op if routing
-    moves into the kernel. log_summary() reports and refuses once all MoE
-    layers, draft included, are loaded.
+    """Record the layer's entry when the few-token kernel is enabled; the
+    scores op if routing moves into the kernel. log_summary() reports once all
+    MoE layers, draft included, are loaded.
     """
-    if not envs.TPU_MOE_LOWTOK:
+    from vllm.config import get_current_vllm_config
+
+    global _ARMED_MAX_TOKENS
+    if not enabled(get_current_vllm_config()):
         return None
+    cap = max_tokens(int(layer.moe_config.ep_size))
+    if _ARMED_MAX_TOKENS not in (0, cap):
+        raise ValueError(
+            f"moe_lowtok: MoE layers of one model have row caps {_ARMED_MAX_TOKENS} "
+            f"and {cap}; one expert-parallel size per process is supported"
+        )
+    _ARMED_MAX_TOKENS = cap
+    set_lowtok_max_tokens(cap)
     unsupported = _unsupported_reason(layer, activation)
     routing = None
     if not unsupported:
@@ -469,10 +519,12 @@ def log_summary() -> None:
     total = len(_LAYERS)
     _LAYERS.clear()
     if unservable:
-        raise NotImplementedError(
-            "TPU_MOE_LOWTOK=1 cannot serve these MoE layers: "
-            + "; ".join(unservable)
-            + ". Unset TPU_MOE_LOWTOK for this model."
+        # The kernel is on by rule, not by request, so a layer it cannot
+        # serve keeps the default MoE path.
+        logger.warning(
+            "moe_lowtok cannot serve these MoE layers, which keep the default "
+            "MoE path: %s",
+            "; ".join(unservable),
         )
     reasons = "".join(f"; {n} x {reason}" for reason, n in sorted(declined.items()))
     logger.info(
@@ -482,7 +534,7 @@ def log_summary() -> None:
         armed["scores"],
         armed["ids"],
         reasons,
-        envs.TPU_MOE_LOWTOK_MAX_TOKENS,
+        _ARMED_MAX_TOKENS,
     )
 
 

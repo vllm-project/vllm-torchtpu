@@ -29,18 +29,16 @@ import functools
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
-import numpy as np
 
-from vllm_torchtpu import envs
-
-# Rows per call at or below which the MoE dispatcher selects this kernel,
-# matching the empirical latency crossover against dense-expert MoE. At 128 rows
-# it wins 1.14x (scores) / 1.09x (ids) on recorded skew; at 256 it is parity
-# on recorded skew (1.01x / 0.93x) and loses on uniform routing (0.95x / 0.90x).
-# Configurable via TPU_MOE_LOWTOK_MAX_TOKENS (default 128).
-MOE_LOWTOK_MAX_TOKENS = envs.TPU_MOE_LOWTOK_MAX_TOKENS
+# The most rows per call the kernel is built for: the largest row cap the
+# adapter selects it at (moe_lowtok_scores.MAX_TOKENS_BY_EP). Against
+# dense-expert MoE it wins 1.14x (scores) / 1.09x (ids) at 128 rows on recorded
+# skew and is at parity at 256 (1.01x / 0.93x). The Qwen3.5 EP8 decode legs
+# run it up to 448 rows.
+MOE_LOWTOK_MAX_TOKENS = 448
 HOT_SLOTS = 128
 _MAX_LOCAL_EXPERTS = 128
 _TABLE_LANES = 512

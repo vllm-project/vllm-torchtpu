@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Load-time selection and forward wiring of the small-batch MoE scores entry."""
 
+import re
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -50,9 +51,20 @@ def method(owner=None):
     return SimpleNamespace(_use_adaptive_fused_moe=owner == "adaptive", owner=owner)
 
 
+@pytest.fixture(autouse=True)
+def _no_engine_config(monkeypatch):
+    """prebuild reads the engine config only through `enabled`, which the tests
+    set; the armed row cap starts unset."""
+    import vllm.config
+
+    monkeypatch.setattr(vllm.config, "get_current_vllm_config", SimpleNamespace)
+    monkeypatch.setattr(scores, "_ARMED_MAX_TOKENS", 0)
+    monkeypatch.setattr(scores, "set_lowtok_max_tokens", Mock())
+
+
 @pytest.fixture
 def enabled(monkeypatch):
-    monkeypatch.setenv("TPU_MOE_LOWTOK", "1")
+    monkeypatch.setattr(scores, "enabled", lambda vllm_config: True)
     monkeypatch.setattr(
         scores, "enable_pipelined_collective_and_compute", lambda: False
     )
@@ -66,7 +78,7 @@ def enabled(monkeypatch):
 
 
 def test_disabled_builds_and_logs_nothing(monkeypatch):
-    monkeypatch.setenv("TPU_MOE_LOWTOK", "0")
+    monkeypatch.setattr(scores, "enabled", lambda vllm_config: False)
     monkeypatch.setattr(scores, "_LAYERS", [])
     assert scores.prebuild(method(), make_layer(use_ep=False), "gelu") is None
     scores.log_summary()
@@ -86,12 +98,17 @@ def test_plain_softmax_router_moves_into_the_kernel(enabled):
         (make_layer(), "gelu", "envelope"),
     ],
 )
-def test_layer_the_kernel_cannot_serve_is_refused_at_the_summary(
-    enabled, layer, activation, match
+def test_layer_the_kernel_cannot_serve_is_reported_at_the_summary(
+    enabled, monkeypatch, layer, activation, match
 ):
+    """The kernel is on by rule, so a layer it cannot serve keeps the default
+    MoE path and is named in a warning."""
+    warning = Mock()
+    monkeypatch.setattr(scores.logger, "warning", warning)
     assert scores.prebuild(method(), layer, activation) is None
-    with pytest.raises(NotImplementedError, match=f"TPU_MOE_LOWTOK.*{match}"):
-        scores.log_summary()
+    scores.log_summary()
+    (message, *args), _ = warning.call_args
+    assert re.search(f"cannot serve.*{match}", message % tuple(args))
 
 
 @pytest.mark.parametrize("owner", ["adaptive", "v2"])
@@ -174,7 +191,7 @@ def test_serves_checks_only_op_presence(rows):
 def test_in_op_row_cap_dispatches_lowtok_or_fused_moe_func(
     monkeypatch, rows, lowtok, has_copies
 ):
-    monkeypatch.setenv("TPU_MOE_LOWTOK_MAX_TOKENS", "64")
+    monkeypatch.setattr(scores, "_ARMED_MAX_TOKENS", 64)
     monkeypatch.setenv("TPU_MOE_ROUTER_TOPK", "sort")
     monkeypatch.setattr(scores, "moe_lowtok", Mock(return_value="lowtok"))
     monkeypatch.setattr(scores, "fused_moe_func", Mock(return_value="gmm"))
@@ -338,7 +355,7 @@ def test_copy_enabled_placement_arms_60_backbone_plus_1_mtp_draft_layer(
 def test_in_op_row_cap_dispatches_copy_aware_lowtok_or_fused_moe_func(
     monkeypatch, rows, lowtok
 ):
-    monkeypatch.setenv("TPU_MOE_LOWTOK_MAX_TOKENS", "64")
+    monkeypatch.setattr(scores, "_ARMED_MAX_TOKENS", 64)
     monkeypatch.setenv("TPU_MOE_ROUTER_TOPK", "sort")
     monkeypatch.setattr(scores, "moe_lowtok", Mock(return_value="lowtok_copies"))
     monkeypatch.setattr(scores, "fused_moe_func", Mock(return_value="gmm_copies"))
@@ -413,4 +430,3 @@ def test_apply_passes_holder_tables_when_layer_has_copies(monkeypatch):
         layer._lowtok_copy,
         layer._lowtok_hot1h,
     )
-
