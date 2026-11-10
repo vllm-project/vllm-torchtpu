@@ -737,19 +737,24 @@ def _patch_wan_vae_halo_allgather() -> None:
         return
     orig_halo_exchange_p2p = getattr(wan_spatial_shard, "_halo_exchange_p2p", None)
     if orig_halo_exchange_p2p is None:
-        raise RuntimeError(
-            "vLLM-Omni wan_spatial_shard has no _halo_exchange_p2p; update "
+        logger.warning(
+            "Skipping TPU patch: vLLM-Omni wan_spatial_shard has no "
+            "_halo_exchange_p2p; update "
             "vllm_torchtpu.omni.patches._patch_wan_vae_halo_allgather."
         )
+        return
     import inspect
 
     params = tuple(inspect.signature(orig_halo_exchange_p2p).parameters)
     if params != _HALO_EXCHANGE_P2P_PARAMS:
-        raise RuntimeError(
-            f"vLLM-Omni wan_spatial_shard._halo_exchange_p2p has parameters "
-            f"{params}, expected {_HALO_EXCHANGE_P2P_PARAMS}; update "
-            "vllm_torchtpu.omni.patches._patch_wan_vae_halo_allgather."
+        logger.warning(
+            "Skipping TPU patch: vLLM-Omni wan_spatial_shard._halo_exchange_p2p "
+            "has parameters %s, expected %s; update "
+            "vllm_torchtpu.omni.patches._patch_wan_vae_halo_allgather.",
+            params,
+            _HALO_EXCHANGE_P2P_PARAMS,
         )
+        return
     wan_spatial_shard._tpu_orig_halo_exchange_p2p = orig_halo_exchange_p2p
 
     def _halo_exchange_allgather(

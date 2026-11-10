@@ -154,7 +154,7 @@ def _drifted_halo_exchange_p2p(
 
 
 @pytest.mark.parametrize("drift", ["renamed_keyword", "missing_symbol"])
-def test_patch_raises_on_upstream_drift(wan_vae_modules, monkeypatch, drift):
+def test_patch_warns_and_skips_on_upstream_drift(wan_vae_modules, monkeypatch, drift):
     wan_spatial_shard = wan_vae_modules.wan_spatial_shard
     monkeypatch.delattr(wan_spatial_shard, "_tpu_orig_halo_exchange_p2p", raising=False)
     if drift == "renamed_keyword":
@@ -164,9 +164,13 @@ def test_patch_raises_on_upstream_drift(wan_vae_modules, monkeypatch, drift):
     else:
         monkeypatch.delattr(wan_spatial_shard, "_halo_exchange_p2p")
     monkeypatch.setenv("VLLM_TORCHTPU_OMNI_WAN_VAE_HALO_ALLGATHER", "1")
+    before = getattr(wan_spatial_shard, "_halo_exchange_p2p", None)
+    warnings = _record_warnings(monkeypatch)
 
-    with pytest.raises(RuntimeError, match="update .*_patch_wan_vae_halo_allgather"):
-        patches._patch_wan_vae_halo_allgather()
+    patches._patch_wan_vae_halo_allgather()
+    expected = "update vllm_torchtpu.omni.patches._patch_wan_vae_halo_allgather"
+    assert len(warnings) == 1 and expected in warnings[0]
+    assert getattr(wan_spatial_shard, "_halo_exchange_p2p", None) is before
     assert not hasattr(wan_spatial_shard, "_tpu_orig_halo_exchange_p2p")
 
 
