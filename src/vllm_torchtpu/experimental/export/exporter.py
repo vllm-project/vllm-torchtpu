@@ -1274,15 +1274,35 @@ def _export_draft(
     return variants
 
 
+# `serving_config` key and file name of each checkpoint file the artifact carries
+# verbatim when the checkpoint has it.
+_COPIED_HF_FILES = (
+    ("generation_config", "generation_config.json"),
+    ("hf_config", "config.json"),
+    ("hf_tokenizer_config", "tokenizer_config.json"),
+)
+
+# The checkpoint files export reads: `tokenizer.json` and `_COPIED_HF_FILES`.
+HF_COMPANION_FILES = (
+    "config.json",
+    "tokenizer.json",
+    "generation_config.json",
+    "tokenizer_config.json",
+)
+
+
 def _emit_model_companion_files(
     cfg: api.TextOnlyLLMExportConfig, output_dir: str
 ) -> dict[str, Any]:
     """Copies companion files into the artifact; returns their `serving_config` entries.
 
     `tokenizer.json` (required unless a byte tokenizer is emitted),
-    `generation_config.json`, and the chat template (as `chat_template.jinja`), the
-    latter two when the checkpoint has them, are written and declared in
-    `serving_config` by path; the runtime reads no other file.
+    `generation_config.json`, the chat template (as `chat_template.jinja`), and the
+    HuggingFace `config.json` and `tokenizer_config.json`, the others when the
+    checkpoint has them, are written and declared in `serving_config` by path; the
+    runtime reads no other file. With the HuggingFace files the artifact directory
+    also loads as a HuggingFace model directory, which a frontend reads for the
+    model type and the tokenizer's special tokens.
     """
     serving_config: dict[str, Any] = {}
 
@@ -1329,11 +1349,11 @@ def _emit_model_companion_files(
         )
 
     if cfg.hf_checkpoint_dir and os.path.isdir(cfg.hf_checkpoint_dir):
-        src_gen = os.path.join(cfg.hf_checkpoint_dir, "generation_config.json")
-        if os.path.isfile(src_gen):
-            dst_gen = os.path.join(output_dir, "generation_config.json")
-            shutil.copyfile(src_gen, dst_gen)
-            serving_config["generation_config"] = {"path": "generation_config.json"}
+        for key, name in _COPIED_HF_FILES:
+            src = os.path.join(cfg.hf_checkpoint_dir, name)
+            if os.path.isfile(src):
+                shutil.copyfile(src, os.path.join(output_dir, name))
+                serving_config[key] = {"path": name}
 
         chat_template = _hf_chat_template(cfg.hf_checkpoint_dir)
         if chat_template is not None:
