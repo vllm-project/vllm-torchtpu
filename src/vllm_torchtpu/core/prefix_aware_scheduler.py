@@ -24,8 +24,18 @@ prioritizes requests with the fewest uncached prompt tokens. It modifies only
 the admission ordering; memory management, eviction, and preemption policies
 remain untouched.
 
+On a prefill/decode-disaggregated decode leg (a KV consumer) it also runs
+decoding requests ahead of partial prefills, promotes the warmest request of
+both waiting queues (``kv_holding_waiting`` and ``waiting``), memoises
+``find_longest_cache_hit`` across steps, ships long prompts to the workers as
+packed int32 and trims re-sent token ids. Its helpers are shared with the
+pipeline-parallel prefill scheduler.
+
 Enable with:
     --scheduler-cls vllm_torchtpu.core.prefix_aware_scheduler.PrefixAwareScheduler
+
+Do not name it on a pipeline-parallel (PP > 1) leg: the platform then keeps
+the configured class and turns pipeline chunk sizing off.
 """
 
 import math
@@ -44,12 +54,16 @@ from vllm.v1.core.sched.request_queue import (
 )
 from vllm.v1.request import Request
 
+from vllm_torchtpu.core import prefix_change_log
 from vllm_torchtpu.core.packed_ids import pack_new_request_prompt_ids
 
 logger = init_logger("vllm." + __name__)
 
 _LOG_EVERY = 1000
+# New requests whose prompt has at least this many tokens ship it packed.
+_PACK_PROMPT_IDS_MIN_TOKENS = 1024
 # Telemetry counts a step of at most this many Mamba blocks of tokens, taken
+# while requests wait, as a small step.
 _SMALL_STEP_BLOCKS = 2
 
 # Priority tiers: lower values admit earlier.
@@ -136,7 +150,6 @@ def format_counts(counts: dict[str, int]) -> str:
     return ",".join(f"{k}:{v}" for k, v in counts.items()) or "-"
 
 
-
 class PrefixAwareScheduler(AsyncScheduler):
     """Admit ready requests prioritizing fewest uncached prompt tokens."""
 
@@ -154,20 +167,25 @@ class PrefixAwareScheduler(AsyncScheduler):
         )
         kv_role = getattr(kv_transfer_cfg, "kv_role", None)
         self._is_disagg = (
-            kv_transfer_cfg is not None
-            or getattr(self, "connector", None) is not None
+            kv_transfer_cfg is not None or getattr(self, "connector", None) is not None
         )
         self._is_kv_producer = self._is_disagg and kv_role == "kv_producer"
         self._is_kv_consumer = self._is_disagg and not self._is_kv_producer
+        prefix_change_log.install_epoch()
         self._enable_memo_xstep()
 
         logger.info(
             "PrefixAwareScheduler ACTIVE (window=%d, decoders first, "
+            "kv_role=%s, memo_xstep=%s)",
             self.WINDOW,
+            "consumer"
+            if self._is_kv_consumer
+            else ("producer" if self._is_kv_producer else "none"),
             getattr(self, "_memo_xstep", False),
         )
 
     # ------------------------------------------------------------------
+    # Cross-step memo of find_longest_cache_hit.
     #
     # The epoch-keyed memo below was invalidated by *any* prefix-cache
     # mutation (every hash insert, every eviction, every schedule start with
@@ -181,15 +199,18 @@ class PrefixAwareScheduler(AsyncScheduler):
     # change (insert, removal, unwritten-flag flip, reset) on top of the
     # same-step patch. A memo is reused iff none of its probed hashes was
     # logged after its epoch, so the reused result equals a fresh lookup
+    # exactly. The first _MEMO_VERIFY_REUSES cross-step reuses are re-checked
     # against a fresh lookup; any mismatch disables the cross-step memo.
     # ------------------------------------------------------------------
     _MEMO_LOG_CAP = 65536
+    _MEMO_VERIFY_REUSES = 64
 
     def _enable_memo_xstep(self) -> None:
         self._memo_xstep = False
         self._memo_hits = 0
         self._memo_computes = 0
         self._memo_verified = 0
+        self._memo_verify_left = self._MEMO_VERIFY_REUSES
         try:
             from vllm.v1.core.block_pool import BlockPool
 
@@ -223,10 +244,7 @@ class PrefixAwareScheduler(AsyncScheduler):
             return False
         probes = cached[4]
         start = bisect_right(log, e0, key=itemgetter(0))
-        for i in range(start, len(log)):
-            if log[i][1] in probes:
-                return False
-        return True
+        return all(log[i][1] not in probes for i in range(start, len(log)))
 
     def _memo_get(self, request: Request, epoch: int | None, max_len: int):
         """Return a still-exact memo tuple for ``request`` or None."""
@@ -249,6 +267,7 @@ class PrefixAwareScheduler(AsyncScheduler):
             if _hit_signature(fresh[2]) != _hit_signature(cached[2]):
                 logger.error(
                     "PrefixAwareScheduler: cross-step memo mismatch for %s "
+                    "(memo=%s fresh=%s); disabling the cross-step memo.",
                     getattr(request, "request_id", "?"),
                     _hit_signature(cached[2])[:2],
                     _hit_signature(fresh[2])[:2],
@@ -286,8 +305,13 @@ class PrefixAwareScheduler(AsyncScheduler):
             request._paw_hit_cache = cached
         return cached
 
+    def _get_paw_aging_rate(self) -> float:
+        """Uncached prompt tokens credited per second a request has waited.
 
+        0 (no aging) unless a scheduler that borrows these helpers sets
+        ``_paw_aging_tok_per_s``.
         """
+        return float(getattr(self, "_paw_aging_tok_per_s", 0.0) or 0.0)
 
     def _now(self) -> float:
         """Wall-clock time of the current schedule() call."""
@@ -303,7 +327,11 @@ class PrefixAwareScheduler(AsyncScheduler):
             self._step_wait_event = reason
 
     def _maybe_pack_prompt_ids(self, out) -> None:
+        """Ship new requests' prompt ids to the workers as packed int32 (see
+        core/packed_ids.py)."""
         if getattr(self, "_pack_ids", None) is None:
+            self._pack_ids = True
+            self._pack_ids_min = _PACK_PROMPT_IDS_MIN_TOKENS
         if not self._pack_ids:
             return
         try:
@@ -317,6 +345,7 @@ class PrefixAwareScheduler(AsyncScheduler):
     def _make_cached_request_data(self, *args, **kwargs):
         cached = super()._make_cached_request_data(*args, **kwargs)
         if getattr(self, "_trim_resend", None) is None:
+            self._trim_resend = True
             self._trim_resend_n = 0
             self._trim_resend_saved = 0
             self._trim_resend_log_t = time.monotonic()
@@ -348,6 +377,7 @@ class PrefixAwareScheduler(AsyncScheduler):
             poll_fn = getattr(connector, "poll_and_complete_transfers", None)
             if callable(poll_fn):
                 try:
+                    poll_fn(self)
                 except Exception:
                     logger.exception(
                         "PrefixAwareScheduler: poll_and_complete_transfers failed."
@@ -356,10 +386,12 @@ class PrefixAwareScheduler(AsyncScheduler):
         # Decoders first: vLLM schedules ``running`` in list order and a
         # partial prefill takes min(remaining, budget), so a prefill ahead of
         # a decoder can leave it no tokens. Stably move every decoding request
+        # ahead of every prefilling one.
         now_wall = time.time()
         self._step_wall_time = now_wall
         decoding = [r for r in self.running if _is_decoding(r)]
         prefilling = [r for r in self.running if not _is_decoding(r)]
+        if prefilling and decoding:
             self.running[:] = decoding + prefilling
         self._step_wait_event = None
         waiting_at_start = len(getattr(self, "waiting", ()) or ())
@@ -379,6 +411,7 @@ class PrefixAwareScheduler(AsyncScheduler):
                 self._last_sched_log_t = now
                 logger.info(
                     "prefix-scheduler telemetry: running=%d waiting=%d decoding=%d "
+                    "prefilling=%d free_blocks=%s sched_tokens=%d %s",
                     len(self.running),
                     len(getattr(self, "waiting", ())),
                     len(decoding),
@@ -406,6 +439,12 @@ class PrefixAwareScheduler(AsyncScheduler):
     def _waiting_loop_stop_reason(self, out, waiting_at_start: int) -> str:
         """Names what ended vLLM's waiting loop on this step.
 
+        ``align0`` / ``lookahead0``: the chunk of the request at the head came
+        out 0 tokens (the Mamba block-aligned split, the MTP lookahead
+        reserve). Otherwise ``idle`` (nothing was waiting), ``preempted`` (the
+        loop did not run), ``max_running``, ``budget`` (no token budget left),
+        ``drained`` (every waiting request was admitted or skipped) or
+        ``other``.
         """
         event = getattr(self, "_step_wait_event", None)
         if event is not None:
@@ -414,6 +453,7 @@ class PrefixAwareScheduler(AsyncScheduler):
             return "idle"
         if getattr(out, "preempted_req_ids", None):
             return "preempted"
+        # The admission check the scan stops at.
         max_active = getattr(self, "max_num_active_reqs", None)
         num_active = len(self.running) + int(
             getattr(self, "num_waiting_for_streaming_input", 0) or 0
@@ -500,12 +540,14 @@ class PrefixAwareScheduler(AsyncScheduler):
         num_new_local_computed_tokens: int = 0,
         num_external_computed_tokens: int = 0,
     ) -> int:
+        aligned = super()._mamba_block_aligned_split(
             request,
             num_new_tokens,
             num_new_local_computed_tokens,
             num_external_computed_tokens,
         )
         if aligned <= 0:
+            self._note_waiting_stop(request, "align0")
         return aligned
 
     def _reserve_prefill_lookahead(
@@ -518,6 +560,7 @@ class PrefixAwareScheduler(AsyncScheduler):
             request, num_computed_tokens, num_new_tokens
         )
         if reserved <= 0:
+            self._note_waiting_stop(request, "lookahead0")
         return reserved
 
     def _get_block_size(self) -> int:
@@ -594,6 +637,10 @@ class PrefixAwareScheduler(AsyncScheduler):
         d = getattr(block_pool, "__dict__", None)
         if not isinstance(d, dict) or "cached_block_hash_to_block" not in d:
             return None
+        # Without the epoch counters the epoch never moves, and a same-epoch
+        # memo would be reused after the cache changed.
+        if not prefix_change_log.epoch_installed():
+            return None
         return d.get("_tpu_prefix_cache_epoch", 0)
 
     def _prefix_warmth(self, request: Request) -> int:
@@ -619,6 +666,7 @@ class PrefixAwareScheduler(AsyncScheduler):
             return 0
 
     def _get_local_prefix_cache_hit(
+        self, request: Request, max_cache_hit_length: int | None = None
     ) -> tuple[object, int, int, bool]:
         connector = getattr(self, "connector", None)
         if connector is None or not connector.supports_divergent_local_hybrid_hits:
@@ -633,6 +681,11 @@ class PrefixAwareScheduler(AsyncScheduler):
                 )
                 and kvm.prefix_cache_lookup_enabled(request)
             ):
+                max_len = (
+                    request.num_tokens - 1
+                    if max_cache_hit_length is None
+                    else max_cache_hit_length
+                )
                 cached = self._memo_get(request, epoch, max_len)
                 if cached is not None:
                     hit = cached[2]
@@ -657,10 +710,12 @@ class PrefixAwareScheduler(AsyncScheduler):
                         False,
                     )
         blocks, num_local, shared_prefix_boundary, hit_diverged = (
+            super()._get_local_prefix_cache_hit(request, max_cache_hit_length)
         )
         if hit_diverged and hasattr(connector, "resolve_divergent_local_hit_tokens"):
             kvm = self.kv_cache_manager
             reconciled_blocks, num_reconciled, reconciled_boundary = (
+                kvm.get_computed_blocks(request, max_cache_hit_length)
             )
             block_size = self._get_block_size()
             target_local = connector.resolve_divergent_local_hit_tokens(
@@ -704,7 +759,6 @@ class PrefixAwareScheduler(AsyncScheduler):
         except Exception:
             return 0
 
-
     def _rank_and_warmth(
         self,
         request: Request,
@@ -713,6 +767,8 @@ class PrefixAwareScheduler(AsyncScheduler):
     ) -> tuple[tuple[int, float, float], int]:
         """Return (sort_key, warmth). Lower sort_key is admitted first.
 
+        ``_promote_warmest`` also passes ``free_blocks_for_fit`` and ``now``,
+        which the pipeline-parallel prefill scheduler's own ranking uses.
         """
         warmth = self._prefix_warmth(request)
         cold_tokens = float(request.num_tokens - warmth)

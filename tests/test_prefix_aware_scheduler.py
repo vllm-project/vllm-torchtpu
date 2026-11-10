@@ -20,6 +20,7 @@ from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.request_queue import FCFSRequestQueue, SchedulingPolicy
 from vllm.v1.request import RequestStatus
 
+from vllm_torchtpu.core import prefix_change_log
 from vllm_torchtpu.core.prefix_aware_scheduler import PrefixAwareScheduler
 
 
@@ -225,10 +226,14 @@ def test_coordinator_failure_falls_back_to_fcfs():
     assert s._paw_scoring_broken is True
 
 
+def test_epoch_cache_reuses_longest_cache_hit_and_invalidates_on_epoch_change(
+    monkeypatch,
+):
     now = time.time()
     r1 = _make_request("r1", num_tokens=1000, arrival_time=now - 10)
     r2 = _make_request("r2", num_tokens=1000, arrival_time=now - 5)
     s = _make_scheduler([r1, r2], {"r1": 128, "r2": 640})
+    monkeypatch.setattr(prefix_change_log, "epoch_installed", lambda: True)
 
     class DummyBlockPool:
         def __init__(self):
@@ -301,6 +306,8 @@ def test_decoders_first_moves_decoders_ahead_of_partial_prefills(monkeypatch):
 
     assert s.schedule(True) == "out"
 
+    # Decoders come first in stable order; prefilling requests keep FCFS order.
+    assert seen["order"] == ["d1", "d2", "p1", "new", "p2"]
     assert s.running is running_list
     assert seen["args"] == ((True,), {})
 
@@ -338,11 +345,14 @@ def test_waiting_loop_stop_reason_and_admission_telemetry():
     out = SimpleNamespace(total_num_scheduled_tokens=640, num_scheduled_tokens={})
 
     s._step_wait_event = None
+    assert s._waiting_loop_stop_reason(out, 1) == "other"
 
     # The first stop of a waiting request wins; running requests are ignored.
     s._note_waiting_stop(SimpleNamespace(status=RequestStatus.RUNNING), "align0")
     assert s._step_wait_event is None
+    s._note_waiting_stop(SimpleNamespace(status=RequestStatus.WAITING), "lookahead0")
     s._note_waiting_stop(SimpleNamespace(status=RequestStatus.WAITING), "align0")
+    assert s._waiting_loop_stop_reason(out, 1) == "lookahead0"
 
     s._step_wait_event = None
     assert s._waiting_loop_stop_reason(out, 1) == "other"
@@ -362,9 +372,61 @@ def test_waiting_loop_stop_reason_and_admission_telemetry():
     s.kv_holding_waiting = []
 
     s.waiting = [object()]
+    s._record_step_telemetry(out, 3, "lookahead0")
+    s._record_step_telemetry(out, 3, "lookahead0")
     s._record_step_telemetry(full, 0, "idle")
     # Every waiting request got in: a short step is not a small step then.
     s.waiting = []
     s._record_step_telemetry(out, 2, "drained")
+    text = s._admission_telemetry("lookahead0")
+    assert "stop=lookahead0" in text
+    assert "min_steps=4 min_small_steps_waiting=2" in text
+    assert "min_stops=lookahead0:2,drained:1" in text
     # The per-minute counters restart after each telemetry line.
     text = s._admission_telemetry("idle")
+    assert "min_steps=0" in text and "min_stops=-" in text
+
+
+def test_local_prefix_hit_forwards_max_cache_hit_length(monkeypatch):
+    """vLLM 0.33 passes ``max_cache_hit_length`` (an aux-output connector's
+    bound); the override must take it, pass it on, and never reuse a memo
+    computed for a different bound."""
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    seen = []
+
+    def base_hit(self, request, max_cache_hit_length=None):
+        seen.append(max_cache_hit_length)
+        return "blocks", 7, 0, False
+
+    monkeypatch.setattr(Scheduler, "_get_local_prefix_cache_hit", base_hit)
+    monkeypatch.setattr(prefix_change_log, "epoch_installed", lambda: True)
+    r = _make_request("r", num_tokens=1000)
+    s = _make_scheduler([r], {"r": 640})
+    s.connector = None
+    pool = SimpleNamespace(cached_block_hash_to_block={}, _tpu_prefix_cache_epoch=3)
+    s.kv_cache_manager.block_pool = pool
+    s.kv_cache_manager.enable_kv_cache_events = False
+    s.kv_cache_manager.prefix_cache_lookup_enabled = lambda req: True
+    s.kv_cache_manager.create_kv_cache_blocks = lambda blocks: blocks
+
+    # A memo for the default bound (num_tokens - 1) exists ...
+    assert s._prefix_warmth(r) == 640
+    # ... so the default lookup reuses it without calling the base ...
+    assert s._get_local_prefix_cache_hit(r)[1] == 640
+    assert seen == []
+    # ... but a lookup with another bound goes to the base with that bound.
+    assert s._get_local_prefix_cache_hit(r, 500)[1] == 7
+    assert seen == [500]
+    assert r._tpu_local_hit_tokens == 7
+
+
+def test_external_warmth_is_zero_on_a_kv_consumer():
+    r = _make_request("r", num_tokens=4096)
+    s = _make_scheduler([r], {})
+    s.block_size = 16
+    s.connector = SimpleNamespace(estimate_external_hit_tokens=lambda req, local: 2048)
+    s._is_kv_consumer = False
+    assert s._external_warmth(r, 0) == 2048
+    s._is_kv_consumer = True
+    assert s._external_warmth(r, 0) == 0
