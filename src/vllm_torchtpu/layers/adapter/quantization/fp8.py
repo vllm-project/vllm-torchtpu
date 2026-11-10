@@ -1099,6 +1099,10 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         self._moe_lowtok_scores_op = moe_lowtok_scores.prebuild(
             self, layer, activation_str
         )
+        if self._moe_lowtok_scores_op is not None and layer.moe_config.moe_parallel_config.use_ep:
+            from vllm_torchtpu.layers.adapter import moe_lowtok_fused_op
+
+            moe_lowtok_fused_op.prebuild(int(layer.moe_config.experts_per_token))
         if self._use_adaptive_fused_moe:
             self._adaptive_fused_moe_op = adaptive_moe.prebuild_adaptive_fused_moe(
                 layer,
@@ -1360,6 +1364,8 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             retain_fused_ep_graph_inputs,
         )
 
+        from vllm_torchtpu.layers.adapter import moe_lowtok_fused_op
+
         if use_fused_kernel and fused_moe_ep_supported(self):
             w13, w2, s13, s2 = (
                 layer.w13_weight,
@@ -1374,17 +1380,25 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 value = experts_start.to(out.dtype)
                 out = out + (value - value)
             out = small_all_reduce_op.retain(out)
+            out = moe_lowtok_fused_op.retain(out)
             return token_padding.retain_padding_graph_input(out)
 
         ep = get_ep_group()
         sequence_parallel_flag = layer.moe_config.is_sequence_parallel
+        if moe_lowtok_fused_op.serves(
+            layer, self._moe_lowtok_scores_op, sequence_parallel_flag
+        ):
+            out = moe_lowtok_fused_op.apply(layer, x, router_logits)
+            out = small_all_reduce_op.retain(out)
+            return retain_fused_ep_graph_inputs(out)
         dispatched = ep.dispatch_router_logits(x, router_logits, sequence_parallel_flag)
         assert len(dispatched) == 2
         gathered_x, gathered_logits = dispatched
         out = self.apply_monolithic_external_dispatch(
             layer, gathered_x, gathered_logits
         )
-        return retain_fused_ep_graph_inputs(ep.combine(out, sequence_parallel_flag))
+        out = moe_lowtok_fused_op.retain(ep.combine(out, sequence_parallel_flag))
+        return retain_fused_ep_graph_inputs(out)
 
     def apply_monolithic_external_dispatch(
         self,
