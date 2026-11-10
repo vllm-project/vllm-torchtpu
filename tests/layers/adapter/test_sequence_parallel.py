@@ -77,13 +77,42 @@ def test_unlisted_layouts_use_the_default(groups, layout):
 
 
 def test_a_layout_entry_applies_to_that_layout_only(groups, monkeypatch):
-    monkeypatch.setitem(sp._MIN_ROWS_BY_LAYOUT, (4, 2), 64)
-    groups(4, 2)
-    assert sp.min_rows() == 64
-    groups(1, 8)
-    assert sp.min_rows() == sp.DEFAULT_MIN_ROWS
+    monkeypatch.setattr(sp, "_FOLLOWS_STEP_FORM", True)
+    monkeypatch.setitem(sp._MIN_ROWS_BY_LAYOUT, (2, 4), 96)
+    groups(2, 4)
+    assert sp.min_rows() == 96
+    groups(2, 2)
+    assert sp.min_rows() == sp.STEP_FORM_MIN_ROWS
     # An explicit parallel config wins over the process's groups.
-    assert sp.min_rows(_parallel(4, 2)) == 64
+    assert sp.min_rows(_parallel(2, 4)) == 96
+
+
+@pytest.mark.parametrize(
+    "layout,threshold", [((4, 2), 64), ((1, 8), 512), ((2, 4), 512), ((1, 2), 512)]
+)
+def test_a_model_that_follows_the_form_raises_the_threshold(
+    groups, monkeypatch, layout, threshold
+):
+    """The Qwen3.5 decode crossovers: 64 rows at DP4 x TP2, 512 at TP8 and on
+    unlisted layouts. Before a model follows the form, every layout keeps 0."""
+    groups(*layout)
+    monkeypatch.setattr(sp, "_FOLLOWS_STEP_FORM", False)
+    assert sp.min_rows() == 0
+    sp.follow_step_form()
+    assert sp.follows_step_form()
+    assert sp.min_rows() == threshold
+    assert sp.min_rows(_parallel(*layout)) == threshold
+
+
+def test_a_step_is_sliced_only_for_a_model_that_follows_the_form(groups, monkeypatch):
+    groups(1, 8)
+    monkeypatch.setattr(envs, "TPU_MOE_SEQUENCE_PARALLEL", True)
+    monkeypatch.setattr(sp, "_FOLLOWS_STEP_FORM", False)
+    assert sp.step_is_sequence_parallel(512) is True
+    assert sp.step_rows_are_sliced(512) is False
+    monkeypatch.setattr(sp, "_FOLLOWS_STEP_FORM", True)
+    assert sp.step_rows_are_sliced(512) is True
+    assert sp.step_rows_are_sliced(511) is False
 
 
 @pytest.mark.parametrize(
