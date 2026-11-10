@@ -35,6 +35,10 @@ _STEP_WIDTHS = (4, 8)
 # One step per group paid a per-step cost worth ~2-3% of the call (pool48
 # selections, 1-2 groups a tile; bench j-caec1354).
 TILES_PER_STEP = 4
+# Groups whose pages are in flight ahead of the running one: 4-bit groups
+# (a page and a scale page each) gain from 2 (bench j-caec1354: c64 shared
+# 2206 -> 2026, forced 2150 -> 2075 us per call), 8/16-bit ones do not.
+_FP4_PREFETCH = 2
 _LOG2_E = math.log2(math.e)
 _LN_2 = math.log(2.0)
 
@@ -71,8 +75,8 @@ def _kernel(
     whole head-major query outside the kernel was not fused, ~40 us per layer
     in the c4 twin, j-18e7ec75).
 
-    Each step copies the next group's pages into the other half of a
-    double buffer itself, one loop iteration per page it holds: unrolled
+    Each group copies a later group's pages into a free slot of the page
+    ring itself, one loop iteration per page it holds: unrolled
     per-slot copies run predicated, so every step paid all slots' address
     arithmetic and checks (~800 scalar bundles of a ~2,200-bundle 4-page
     step in the LLO).
@@ -95,6 +99,7 @@ def _kernel(
     scale_hbm_ref = refs[0] if fp4 else None
     scale_buf_ref, scale_sem_ref = tail[7:] if fp4 else (None, None)
     pages_per_step = buf_ref.shape[1]
+    ring = buf_ref.shape[0]  # prefetched groups + the running one
     num_groups = block_start_ref[pl.num_programs(0)]
 
     def group(
@@ -121,7 +126,7 @@ def _kernel(
         num_heads, block_q, head_dim = q_ref.shape
         rows_per_page, packing, row_width = buf_ref.shape[3:]
         page_size = rows_per_page * (msa_fp4.TOKENS_PER_WORD if fp4 else packing)
-        half = w % 2
+        half = w % ring
         first = (meta & msa_attention._FIRST_BIT) != 0
         last = (meta & msa_attention._LAST_BIT) != 0
 
@@ -129,7 +134,9 @@ def _kernel(
             src = kv_hbm_ref.at[
                 pl.ds(page, 1), :, :, pl.ds(head_ref[0] * row_width, row_width)
             ]
-            copies = [pltpu.make_async_copy(src, buf_ref.at[half, g], sem_ref.at[half, g])]
+            copies = [
+                pltpu.make_async_copy(src, buf_ref.at[half, g], sem_ref.at[half, g])
+            ]
             if fp4:
                 copies.append(
                     pltpu.make_async_copy(
@@ -144,7 +151,9 @@ def _kernel(
             base = msa_attention._slot(work_meta_ref[group], pages_per_step, 0)
 
             def start(g, carry):
-                for copy in page_copies(half, g, page_table_ref[work_page_ref[base + g]]):
+                for copy in page_copies(
+                    half, g, page_table_ref[work_page_ref[base + g]]
+                ):
                     copy.start()
                 return carry
 
@@ -152,11 +161,12 @@ def _kernel(
 
         @pl.when(w == 0)
         def _first():
-            start_group(0, 0)
+            for d in range(ring - 1):
+                pl.when(d < num_groups)(functools.partial(start_group, d, d))
 
-        @pl.when(w + 1 < num_groups)
+        @pl.when(w + ring - 1 < num_groups)
         def _next():
-            start_group(w + 1, 1 - half)
+            start_group(w + ring - 1, (w + ring - 1) % ring)
 
         def wait(g, carry):
             for copy in page_copies(half, g, 0):  # the source only sizes the wait
@@ -229,7 +239,9 @@ def _kernel(
             p = jnp.exp2(s - m_new)
             l_cur = jnp.sum(p, axis=0, keepdims=True)
             pv = jax.lax.dot_general(
-                v, p.astype(v.dtype), (((0,), (0,)), ((), ())),
+                v,
+                p.astype(v.dtype),
+                (((0,), (0,)), ((), ())),
                 preferred_element_type=jnp.float32,
             )  # [D, rows]
             if single:
@@ -363,7 +375,9 @@ def _kernel(
                 fits = fits & (count <= width)
             body = attend if fp4 else attend_t
             pl.when(fits & single)(functools.partial(body, width, True))
-            pl.when(fits & jnp.logical_not(single))(functools.partial(body, width, False))
+            pl.when(fits & jnp.logical_not(single))(
+                functools.partial(body, width, False)
+            )
 
         @pl.when(count == 0)
         def _empty():  # a tile of padding tokens: its only group holds no page
@@ -434,7 +448,9 @@ def _attention_call(
             packed_ref.at[pl.ds(union_len, max_groups)],
             packed_ref.at[pl.ds(union_len + max_groups, max_groups)],
             *refs,
-            block_start_ref=packed_ref.at[pl.ds(union_len + 2 * max_groups, num_steps + 1)],
+            block_start_ref=packed_ref.at[
+                pl.ds(union_len + 2 * max_groups, num_steps + 1)
+            ],
             **kwargs,
         )
 
@@ -451,10 +467,11 @@ def _attention_call(
     in_place = (pl.BlockSpec(memory_space=pl.ANY),) * 2 if aliased else ()
     fp4 = scale_rows is not None
     scale_inputs = (scale_cache,) if fp4 else ()
+    ring = 1 + (_FP4_PREFETCH if fp4 else 1)
     scale_scratch = (
         (
-            pltpu.VMEM((2, pages_per_step, 1) + scale_cache.shape[1:], jnp.float32),
-            pltpu.SemaphoreType.DMA((2, pages_per_step)),
+            pltpu.VMEM((ring, pages_per_step, 1) + scale_cache.shape[1:], jnp.float32),
+            pltpu.SemaphoreType.DMA((ring, pages_per_step)),
         )
         if fp4
         else ()
@@ -463,7 +480,9 @@ def _attention_call(
         num_scalar_prefetch=4,
         grid=(num_steps,),
         in_specs=[
-            pl.BlockSpec((num_heads, tiles_per_step * block_q, head_dim), head_major_block),
+            pl.BlockSpec(
+                (num_heads, tiles_per_step * block_q, head_dim), head_major_block
+            ),
             pl.BlockSpec((None, tiles_per_step * block_q, topk), head_major_block),
             pl.BlockSpec((tiles_per_step * block_q, 1), tile_block),
             pl.BlockSpec((tiles_per_step * block_q, 1), tile_block),
@@ -472,7 +491,9 @@ def _attention_call(
             *in_place,
         ],
         out_specs=[
-            pl.BlockSpec((num_heads, tiles_per_step * block_q, head_dim), head_major_block),
+            pl.BlockSpec(
+                (num_heads, tiles_per_step * block_q, head_dim), head_major_block
+            ),
             pl.BlockSpec((1, tiles_per_step, 1, num_heads * block_q), lse_block),
         ],
         scratch_shapes=[
@@ -491,10 +512,10 @@ def _attention_call(
                 ]
             ),
             pltpu.VMEM(
-                (2, pages_per_step, 1, rows_per_page, packing, row_width),
+                (ring, pages_per_step, 1, rows_per_page, packing, row_width),
                 kv_cache.dtype,
             ),
-            pltpu.SemaphoreType.DMA((2, pages_per_step)),
+            pltpu.SemaphoreType.DMA((ring, pages_per_step)),
             *scale_scratch,
         ],
     )
