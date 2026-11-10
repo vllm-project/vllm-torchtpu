@@ -589,6 +589,25 @@ _verify_fused_one_draw_compiled = _static_shape_args(
 )
 
 
+def _verify_one_draw_ro_impl(
+    read_offsets: torch.Tensor,
+    groups: list[torch.Tensor],
+    ro_num_reqs: torch.Tensor,
+    *args,
+):
+    """VLLM_TPU_VERIFY_RO_INGRAPH: `_verify_fused_one_draw_impl` plus the
+    post-verify `_update_read_offsets_impl` scatter in one program (the
+    offsets are a function of the verify output only). Same ops."""
+    out = _verify_fused_one_draw_impl(*args)
+    _update_read_offsets_impl(read_offsets, groups, out, ro_num_reqs)
+    return out
+
+
+_verify_one_draw_ro_compiled = _static_shape_args(
+    _tpu_compile(_verify_one_draw_ro_impl)
+)
+
+
 def _reset_read_offsets(
     read_offsets: torch.Tensor,
     keep_dev: torch.Tensor,
@@ -5797,7 +5816,32 @@ class TPUModelRunner(GPUModelRunner):
             and envs.VLLM_TPU_FUSED_READ_OFFSET_UPDATE
             and self.mamba_slot_read_offsets.device.type == "tpu"
         )
-        if fold_ro:
+        ingraph_ro = bool(
+            envs.VLLM_TPU_VERIFY_RO_INGRAPH
+            and not fold_ro
+            and flat_u is not None
+            and self.mamba_slot_read_offsets is not None
+            and ro_groups
+            and envs.VLLM_TPU_FUSED_READ_OFFSET_UPDATE
+            and self.mamba_slot_read_offsets.device.type == "tpu"
+        )
+        if ingraph_ro:
+            out = _verify_one_draw_ro_compiled(
+                self.mamba_slot_read_offsets,
+                list(ro_groups),
+                self._num_reqs_tensor(ro_num_reqs),
+                *call_args,
+            )
+            self._fused_read_offsets_applied = True
+            if not getattr(self, "_verify_ro_ingraph_logged", False):
+                self._verify_ro_ingraph_logged = True
+                logger.info(
+                    "VERIFY_RO_INGRAPH: verify and the read-offset scatter in one "
+                    "program (%d slot groups of shape %s)",
+                    len(ro_groups),
+                    [tuple(g.shape) for g in ro_groups],
+                )
+        elif fold_ro:
             out, row_offsets = verify(self._num_reqs_tensor(ro_num_reqs))
             # Pad/truncate to the slot groups' width and scatter eagerly, instead
             # of a compiled program that mutates the slot buffer (and its aot
@@ -6026,6 +6070,7 @@ class TPUModelRunner(GPUModelRunner):
                     host_phases.mark("sample_setup")
                     self._fused_read_offsets = (mamba_indices, num_reqs)
                     self._fused_read_offsets_applied = False
+
                     with self._stage_timing.stage("sample"):
                         next_tokens = self._sample_spec_verify_chunk(
                             logits,
@@ -7996,6 +8041,27 @@ class TPUModelRunner(GPUModelRunner):
                 synchronize_tensors(fn(*args, self._num_reqs_tensor(1)))
                 continue
             synchronize_tensors(fn(*args))
+            if (
+                envs.VLLM_TPU_VERIFY_RO_INGRAPH
+                and envs.VLLM_TPU_VERIFY_ONE_DRAW
+                and self.mamba_slot_read_offsets is not None
+            ):
+                # Slot-group shapes the staged walk produced at this width
+                # (recorded by the backbone warmup walks); scatter into a scratch
+                # copy so warmup leaves the live offsets untouched.
+                scratch = self.mamba_slot_read_offsets.clone()
+                for shapes in self.__dict__.get("_ro_group_shapes", {}).get(
+                    num_reqs, ()
+                ):
+                    groups = [
+                        torch.zeros(sh, dtype=torch.int32, device=self.device)
+                        for sh in shapes
+                    ]
+                    synchronize_tensors(
+                        _verify_one_draw_ro_compiled(
+                            scratch, groups, self._num_reqs_tensor(1), *args
+                        )
+                    )
         if envs.VLLM_TPU_VERIFY_ONE_DRAW and not getattr(
             self, "_verify_one_draw_stream_checked", False
         ):
