@@ -34,7 +34,9 @@ EP = 2
 @pytest.fixture
 def groups(monkeypatch):
     def set_layout(dp, tp):
-        monkeypatch.setattr(parallel_state, "model_parallel_is_initialized", lambda: True)
+        monkeypatch.setattr(
+            parallel_state, "model_parallel_is_initialized", lambda: True
+        )
         monkeypatch.setattr(
             parallel_state, "get_dp_group", lambda: SimpleNamespace(world_size=dp)
         )
@@ -56,7 +58,9 @@ def test_step_gate_defaults_before_the_groups_exist(monkeypatch):
 def test_step_gate_follows_the_layout(groups, layout, gate):
     groups(*layout)
     assert v3.step_min_tokens() == gate
-    explicit = SimpleNamespace(data_parallel_size=layout[0], tensor_parallel_size=layout[1])
+    explicit = SimpleNamespace(
+        data_parallel_size=layout[0], tensor_parallel_size=layout[1]
+    )
     assert v3.step_min_tokens(explicit) == gate
 
 

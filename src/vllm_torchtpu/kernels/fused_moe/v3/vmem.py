@@ -11,16 +11,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""VMEM scratchpad allocation and alignment helpers for Fused EP MoE v3 kernels.
-"""
+"""VMEM scratchpad allocation and alignment helpers for Fused EP MoE v3 kernels."""
+
 import jax.numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
 
 from . import device
 from .config import RESULT_SLOTS_DEFAULT, WEIGHT_SLOTS_DEFAULT
 from .formats import WEIGHT_BLOCK_DEFAULT, WeightFormat, weight_form
-from .layout import (FP4_PER_WORD, LANES, ROW_BLOCK, result_lane_blocks,
-                     row_lane_blocks, scale_window_rows)
+from .layout import (
+    FP4_PER_WORD,
+    LANES,
+    ROW_BLOCK,
+    result_lane_blocks,
+    row_lane_blocks,
+    scale_window_rows,
+)
 from .rowquant import FP8
 
 # The result scales travel one f32 word per row, packed ROW_BLOCK words to
@@ -32,25 +38,27 @@ SCALE_WORDS = ROW_BLOCK
 WIDENED_BLOCK_BUFFERS = 2
 
 
-def scratch_arrays(experts_per_shard,
-                   tile_rows,
-                   hidden,
-                   inter,
-                   *,
-                   intermediate="fp8",
-                   weight_slots=WEIGHT_SLOTS_DEFAULT,
-                   result_slots=RESULT_SLOTS_DEFAULT,
-                   weight_format=WeightFormat.FP8,
-                   weight_block=WEIGHT_BLOCK_DEFAULT,
-                   has_w1_bias=False,
-                   has_w2_bias=False,
-                   no_gate=False,
-                   activation_block=0,
-                   result_dtype=FP8,
-                   stream_block=0,
-                   stream_rows=0,
-                   token_block=None,
-                   token_dtype=FP8):
+def scratch_arrays(
+    experts_per_shard,
+    tile_rows,
+    hidden,
+    inter,
+    *,
+    intermediate="fp8",
+    weight_slots=WEIGHT_SLOTS_DEFAULT,
+    result_slots=RESULT_SLOTS_DEFAULT,
+    weight_format=WeightFormat.FP8,
+    weight_block=WEIGHT_BLOCK_DEFAULT,
+    has_w1_bias=False,
+    has_w2_bias=False,
+    no_gate=False,
+    activation_block=0,
+    result_dtype=FP8,
+    stream_block=0,
+    stream_rows=0,
+    token_block=None,
+    token_dtype=FP8,
+):
     """The kernel's VMEM scratch, as (name, shape, dtype), in the order the
     kernel body unpacks it. activation_block: the row scales come in
     hidden // activation_block planes (one at 0), a window of each per
@@ -84,10 +92,8 @@ def scratch_arrays(experts_per_shard,
         # Four-bit weights stream as packed 32-bit words, half the bytes
         # of the fp8 form.
         weights = [
-            ("w1_vmem", (weight_slots, hidden // FP4_PER_WORD, w1_cols),
-             jnp.uint32),
-            ("w2_vmem", (weight_slots, slot_inter // FP4_PER_WORD, hidden),
-             jnp.uint32),
+            ("w1_vmem", (weight_slots, hidden // FP4_PER_WORD, w1_cols), jnp.uint32),
+            ("w2_vmem", (weight_slots, slot_inter // FP4_PER_WORD, hidden), jnp.uint32),
         ]
         if not stream_block:
             # Widen the current expert's weights to fp8 once when its
@@ -105,10 +111,12 @@ def scratch_arrays(experts_per_shard,
             # The down matmul's bf16 copy of the current expert's w2:
             # one buffer, filled after w2 lands and reused by every tile
             # to limit VMEM use independently of the weight-slot count.
-            weights.append(
-                ("w2_bf16_vmem", (slot_inter, hidden), jnp.bfloat16))
-        if (jnp.dtype(token_dtype) == jnp.dtype(jnp.bfloat16)
-                and form.has_scales and not form.block_scaled):
+            weights.append(("w2_bf16_vmem", (slot_inter, hidden), jnp.bfloat16))
+        if (
+            jnp.dtype(token_dtype) == jnp.dtype(jnp.bfloat16)
+            and form.has_scales
+            and not form.block_scaled
+        ):
             # bf16 token rows against fp8 weights: the up matmul runs in
             # bf16 on the CURRENT expert's copy of w1 (whole-expert builds).
             weights.append(("w1_bf16_vmem", (hidden, w1_cols), jnp.bfloat16))
@@ -117,68 +125,106 @@ def scratch_arrays(experts_per_shard,
         # streamed.
         if stream_block:
             weights += [
-                ("w1_scales_vmem", (weight_slots, hidden // weight_block,
-                                    w1_cols), jnp.float32),
-                ("w2_scales_vmem", (weight_slots, slot_inter // weight_block,
-                                    hidden), jnp.float32),
+                (
+                    "w1_scales_vmem",
+                    (weight_slots, hidden // weight_block, w1_cols),
+                    jnp.float32,
+                ),
+                (
+                    "w2_scales_vmem",
+                    (weight_slots, slot_inter // weight_block, hidden),
+                    jnp.float32,
+                ),
             ]
         else:
             weights += [
-                ("w1_scales_vmem", (experts_per_shard, hidden // weight_block,
-                                    all_cols), jnp.float32),
-                ("w2_scales_vmem", (experts_per_shard, inter // weight_block,
-                                    hidden), jnp.float32),
+                (
+                    "w1_scales_vmem",
+                    (experts_per_shard, hidden // weight_block, all_cols),
+                    jnp.float32,
+                ),
+                (
+                    "w2_scales_vmem",
+                    (experts_per_shard, inter // weight_block, hidden),
+                    jnp.float32,
+                ),
             ]
     elif form.has_scales:
         weights += [
-            ("w1_scales_vmem", (weight_slots, 1, w1_cols) if stream_block else
-             (experts_per_shard, all_cols), jnp.float32),
+            (
+                "w1_scales_vmem",
+                (weight_slots, 1, w1_cols)
+                if stream_block
+                else (experts_per_shard, all_cols),
+                jnp.float32,
+            ),
             ("w2_scales_vmem", (experts_per_shard, hidden), jnp.float32),
         ]
     biases = []
     if has_w1_bias:
         biases.append(
-            ("w1_bias_vmem", (weight_slots, 1, w1_cols) if stream_block else
-             (experts_per_shard, all_cols), jnp.float32))
+            (
+                "w1_bias_vmem",
+                (weight_slots, 1, w1_cols)
+                if stream_block
+                else (experts_per_shard, all_cols),
+                jnp.float32,
+            )
+        )
     if has_w2_bias:
-        biases.append(
-            ("w2_bias_vmem", (experts_per_shard, hidden), jnp.float32))
+        biases.append(("w2_bias_vmem", (experts_per_shard, hidden), jnp.float32))
     if stream_block:
         tiles_per_group = stream_rows // tile_rows
-        rows = [("rows_vmem", (2, stream_rows, lane_blocks, LANES),
-                 token_dtype)]
-        row_scales = [("row_scales_vmem", (2, tiles_per_group, scale_planes,
-                                           scale_window_rows(tile_rows),
-                                           LANES), jnp.int32)]
+        rows = [("rows_vmem", (2, stream_rows, lane_blocks, LANES), token_dtype)]
+        row_scales = [
+            (
+                "row_scales_vmem",
+                (2, tiles_per_group, scale_planes, scale_window_rows(tile_rows), LANES),
+                jnp.int32,
+            )
+        ]
         running_sum = [("acc_vmem", (stream_rows, hidden), jnp.float32)]
     else:
-        rows = [("rows_vmem", (result_slots, tile_rows, lane_blocks, LANES),
-                 token_dtype)]
-        row_scales = [("row_scales_vmem", (result_slots, scale_planes,
-                                           scale_window_rows(tile_rows),
-                                           LANES), jnp.int32)]
+        rows = [
+            ("rows_vmem", (result_slots, tile_rows, lane_blocks, LANES), token_dtype)
+        ]
+        row_scales = [
+            (
+                "row_scales_vmem",
+                (result_slots, scale_planes, scale_window_rows(tile_rows), LANES),
+                jnp.int32,
+            )
+        ]
         running_sum = []
     return [
         *rows,
         *weights,
         *biases,
         *row_scales,
-        ("result_rows_vmem", (result_slots, tile_rows, result_blocks, LANES),
-         result_dtype),
-        ("result_scales_vmem", (result_slots, tile_blocks, 1, SCALE_WORDS),
-         jnp.float32),
+        (
+            "result_rows_vmem",
+            (result_slots, tile_rows, result_blocks, LANES),
+            result_dtype,
+        ),
+        (
+            "result_scales_vmem",
+            (result_slots, tile_blocks, 1, SCALE_WORDS),
+            jnp.float32,
+        ),
         *running_sum,
     ]
 
 
-def tile_body_arrays(tile_rows,
-                     hidden,
-                     inter,
-                     *,
-                     weight_format=WeightFormat.FP8,
-                     weight_block=WEIGHT_BLOCK_DEFAULT,
-                     no_gate=False,
-                     stream_block=0):
+def tile_body_arrays(
+    tile_rows,
+    hidden,
+    inter,
+    *,
+    weight_format=WeightFormat.FP8,
+    weight_block=WEIGHT_BLOCK_DEFAULT,
+    no_gate=False,
+    stream_block=0,
+):
     """One tile body's live values besides the scratch, as (name, shape,
     dtype): the first accumulator, the bf16 intermediate column slices,
     their fp8
@@ -198,65 +244,78 @@ def tile_body_arrays(tile_rows,
         ("result_rows", (tile_rows, hidden), FP8),
     ]
     if form.packed:
-        arrays.append(("upcast_block", (WIDENED_BLOCK_BUFFERS, weight_block,
-                                        max(w1_cols, hidden)), FP8))
+        arrays.append(
+            (
+                "upcast_block",
+                (WIDENED_BLOCK_BUFFERS, weight_block, max(w1_cols, hidden)),
+                FP8,
+            )
+        )
     if not form.has_scales:
         # bf16 weights contract the rows and the intermediate upcast to bf16.
-        arrays += [("rows_bf16", (tile_rows, hidden), jnp.bfloat16),
-                   ("mid_bf16", (tile_rows, inter), jnp.bfloat16)]
+        arrays += [
+            ("rows_bf16", (tile_rows, hidden), jnp.bfloat16),
+            ("mid_bf16", (tile_rows, inter), jnp.bfloat16),
+        ]
     return arrays
 
 
-def estimate_bytes(experts_per_shard,
-                   tile_rows,
-                   hidden,
-                   inter,
-                   *,
-                   intermediate="fp8",
-                   weight_slots=WEIGHT_SLOTS_DEFAULT,
-                   result_slots=RESULT_SLOTS_DEFAULT,
-                   weight_format=WeightFormat.FP8,
-                   weight_block=WEIGHT_BLOCK_DEFAULT,
-                   has_w1_bias=False,
-                   has_w2_bias=False,
-                   no_gate=False,
-                   activation_block=0,
-                   result_dtype=FP8,
-                   stream_block=0,
-                   stream_rows=0,
-                   info=None,
-                   token_block=None,
-                   token_dtype=FP8):
+def estimate_bytes(
+    experts_per_shard,
+    tile_rows,
+    hidden,
+    inter,
+    *,
+    intermediate="fp8",
+    weight_slots=WEIGHT_SLOTS_DEFAULT,
+    result_slots=RESULT_SLOTS_DEFAULT,
+    weight_format=WeightFormat.FP8,
+    weight_block=WEIGHT_BLOCK_DEFAULT,
+    has_w1_bias=False,
+    has_w2_bias=False,
+    no_gate=False,
+    activation_block=0,
+    result_dtype=FP8,
+    stream_block=0,
+    stream_rows=0,
+    info=None,
+    token_block=None,
+    token_dtype=FP8,
+):
     """VMEM one built kernel occupies, an upper bound from the arrays it
     declares and the values its tile body holds. Reads the chip's lane
     count and sublane tiling off the device record."""
     if info is None:
         info = pltpu.get_tpu_info()
-    arrays = scratch_arrays(experts_per_shard,
-                            tile_rows,
-                            hidden,
-                            inter,
-                            intermediate=intermediate,
-                            weight_slots=weight_slots,
-                            result_slots=result_slots,
-                            weight_format=weight_format,
-                            weight_block=weight_block,
-                            has_w1_bias=has_w1_bias,
-                            has_w2_bias=has_w2_bias,
-                            no_gate=no_gate,
-                            activation_block=activation_block,
-                            result_dtype=result_dtype,
-                            stream_block=stream_block,
-                            stream_rows=stream_rows,
-                            token_block=token_block,
-                            token_dtype=token_dtype)
-    arrays += tile_body_arrays(tile_rows,
-                               hidden,
-                               inter,
-                               weight_format=weight_format,
-                               weight_block=weight_block,
-                               no_gate=no_gate,
-                               stream_block=stream_block)
+    arrays = scratch_arrays(
+        experts_per_shard,
+        tile_rows,
+        hidden,
+        inter,
+        intermediate=intermediate,
+        weight_slots=weight_slots,
+        result_slots=result_slots,
+        weight_format=weight_format,
+        weight_block=weight_block,
+        has_w1_bias=has_w1_bias,
+        has_w2_bias=has_w2_bias,
+        no_gate=no_gate,
+        activation_block=activation_block,
+        result_dtype=result_dtype,
+        stream_block=stream_block,
+        stream_rows=stream_rows,
+        token_block=token_block,
+        token_dtype=token_dtype,
+    )
+    arrays += tile_body_arrays(
+        tile_rows,
+        hidden,
+        inter,
+        weight_format=weight_format,
+        weight_block=weight_block,
+        no_gate=no_gate,
+        stream_block=stream_block,
+    )
     return sum(
-        device.array_vmem_bytes(shape, dtype, info)
-        for _, shape, dtype in arrays)
+        device.array_vmem_bytes(shape, dtype, info) for _, shape, dtype in arrays
+    )

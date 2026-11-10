@@ -16,6 +16,7 @@
 Dispatches active local experts to streamed or whole-expert VMEM Pallas kernels
 based on batch size and expert activation density.
 """
+
 import jax
 import jax.numpy as jnp
 from jax import lax
@@ -27,7 +28,7 @@ from .rowquant import FP8, apply_row_scale, quantize_rows, row_scale
 # Contraction dimension numbers of a plain [m, k] @ [k, n] matmul.
 # The dot dimension numbers of every matmul in the package: the rows'
 # last axis against the weight's first, no batch axes.
-DOT_ROWS_BY_COLUMNS = (((1, ), (0, )), ((), ()))
+DOT_ROWS_BY_COLUMNS = (((1,), (0,)), ((), ()))
 # GPT-OSS's clamped swiglu: sigmoid(alpha * gate) with the GELU
 # approximation's alpha, and the clip its models ship with (config
 # swiglu_limit); the limit is the model's, passed by the caller.
@@ -44,11 +45,7 @@ def swigluoai(gate, up, *, alpha=SWIGLU_ALPHA, limit=SWIGLU_LIMIT_DEFAULT):
     return (up + 1.0) * (gate * jax.nn.sigmoid(alpha * gate))
 
 
-def apply_activation(gate,
-                     up,
-                     activation,
-                     *,
-                     swiglu_limit=SWIGLU_LIMIT_DEFAULT):
+def apply_activation(gate, up, activation, *, swiglu_limit=SWIGLU_LIMIT_DEFAULT):
     """The gated activation on the post-scale gate and up halves."""
     if activation == "silu":
         return jax.nn.silu(gate) * up
@@ -67,8 +64,7 @@ def apply_activation_no_gate(x, activation):
         return jax.nn.gelu(x)
     if activation == "relu":
         return jax.nn.relu(x)
-    raise ValueError(
-        f"activation {activation!r} is not one of {NO_GATE_ACTIVATIONS}")
+    raise ValueError(f"activation {activation!r} is not one of {NO_GATE_ACTIVATIONS}")
 
 
 def blocked_rows_dot(rows, weight, row_scales, block, *, upcast=None):
@@ -79,30 +75,34 @@ def blocked_rows_dot(rows, weight, row_scales, block, *, upcast=None):
     are cast to first (bf16 weights)."""
     acc = None
     for b in range(row_scales.shape[-1]):
-        lhs = rows[:, b * block:(b + 1) * block]
+        lhs = rows[:, b * block : (b + 1) * block]
         if upcast is not None:
             lhs = lhs.astype(upcast)
-        part = lax.dot_general(lhs,
-                               weight[b * block:(b + 1) * block],
-                               DOT_ROWS_BY_COLUMNS,
-                               preferred_element_type=jnp.float32)
-        part = part * row_scales[:, b:b + 1]
+        part = lax.dot_general(
+            lhs,
+            weight[b * block : (b + 1) * block],
+            DOT_ROWS_BY_COLUMNS,
+            preferred_element_type=jnp.float32,
+        )
+        part = part * row_scales[:, b : b + 1]
         acc = part if acc is None else acc + part
     return acc
 
 
-def intermediate_rows(acc1,
-                      row_scales,
-                      inter,
-                      *,
-                      w1_scales,
-                      activation,
-                      w1_bias,
-                      no_gate,
-                      block=0,
-                      dtype=jnp.float32,
-                      swiglu_limit=SWIGLU_LIMIT_DEFAULT,
-                      columns_per_pass=ACTIVATION_COLUMNS_PER_PASS_DEFAULT):
+def intermediate_rows(
+    acc1,
+    row_scales,
+    inter,
+    *,
+    w1_scales,
+    activation,
+    w1_bias,
+    no_gate,
+    block=0,
+    dtype=jnp.float32,
+    swiglu_limit=SWIGLU_LIMIT_DEFAULT,
+    columns_per_pass=ACTIVATION_COLUMNS_PER_PASS_DEFAULT,
+):
     """The first matmul's accumulator through the activation, requantized
     to fp8 as the second matmul's left-hand side.
 
@@ -143,10 +143,12 @@ def intermediate_rows(acc1,
         if no_gate:
             chunk = apply_activation_no_gate(half(lo, hi), activation)
         else:
-            chunk = apply_activation(half(lo, hi),
-                                     half(inter + lo, inter + hi),
-                                     activation,
-                                     swiglu_limit=swiglu_limit)
+            chunk = apply_activation(
+                half(lo, hi),
+                half(inter + lo, inter + hi),
+                activation,
+                swiglu_limit=swiglu_limit,
+            )
         return chunk.astype(jnp.bfloat16)
 
     if block:
@@ -157,8 +159,7 @@ def intermediate_rows(acc1,
             scale, inverse, scalable = row_scale(amax)
             chunks.append(apply_row_scale(chunk, inverse, scalable, dtype))
             scales.append(scale)
-        return (jnp.concatenate(chunks,
-                                axis=-1), jnp.concatenate(scales, axis=-1))
+        return (jnp.concatenate(chunks, axis=-1), jnp.concatenate(scales, axis=-1))
 
     chunks, amax = [], None
     for lo in range(0, inter, columns_per_pass):
@@ -169,18 +170,14 @@ def intermediate_rows(acc1,
         amax = slice_amax if amax is None else jnp.maximum(amax, slice_amax)
     scale, inverse, scalable = row_scale(amax)
     quantized = jnp.concatenate(
-        [apply_row_scale(chunk, inverse, scalable, dtype) for chunk in chunks],
-        axis=-1)
+        [apply_row_scale(chunk, inverse, scalable, dtype) for chunk in chunks], axis=-1
+    )
     return quantized, scale
 
 
-def result_rows(acc2,
-                mid_scales,
-                *,
-                w2_scales,
-                w2_bias,
-                dtype=FP8,
-                elementwise=jnp.float32):
+def result_rows(
+    acc2, mid_scales, *, w2_scales, w2_bias, dtype=FP8, elementwise=jnp.float32
+):
     """The second matmul's accumulator as result rows: fp8 rows and their
     scales, or (dtype bf16) bf16 rows and None. `elementwise` is the
     element type the fp8 scaling product is formed in.
@@ -203,20 +200,22 @@ def result_rows(acc2,
     return quantize_rows(down.astype(jnp.bfloat16), dtype=elementwise)
 
 
-def expert_ffn_fp8(rows,
-                   row_scales,
-                   w1,
-                   w2,
-                   w1_scales,
-                   *,
-                   activation,
-                   w1_bias,
-                   no_gate,
-                   block=0,
-                   elementwise=jnp.float32,
-                   swiglu_limit=SWIGLU_LIMIT_DEFAULT,
-                   columns_per_pass=ACTIVATION_COLUMNS_PER_PASS_DEFAULT,
-                   token_block=None):
+def expert_ffn_fp8(
+    rows,
+    row_scales,
+    w1,
+    w2,
+    w1_scales,
+    *,
+    activation,
+    w1_bias,
+    no_gate,
+    block=0,
+    elementwise=jnp.float32,
+    swiglu_limit=SWIGLU_LIMIT_DEFAULT,
+    columns_per_pass=ACTIVATION_COLUMNS_PER_PASS_DEFAULT,
+    token_block=None,
+):
     """One expert's FFN on fp8 weights with per-channel scales. `block` is
     the intermediate's rounding block (0: one scale per row), `token_block`
     the token rows' (None: the same as `block`). Returns the down matmul's
@@ -228,39 +227,41 @@ def expert_ffn_fp8(rows,
         acc1 = blocked_rows_dot(rows, w1, row_scales, token_block)
         row_scales = None  # applied block by block above
     else:
-        acc1 = lax.dot_general(rows,
-                               w1,
-                               DOT_ROWS_BY_COLUMNS,
-                               preferred_element_type=jnp.float32)
-    mid, mid_scales = intermediate_rows(acc1,
-                                        row_scales,
-                                        inter,
-                                        w1_scales=w1_scales,
-                                        activation=activation,
-                                        w1_bias=w1_bias,
-                                        no_gate=no_gate,
-                                        block=block,
-                                        dtype=elementwise,
-                                        swiglu_limit=swiglu_limit,
-                                        columns_per_pass=columns_per_pass)
+        acc1 = lax.dot_general(
+            rows, w1, DOT_ROWS_BY_COLUMNS, preferred_element_type=jnp.float32
+        )
+    mid, mid_scales = intermediate_rows(
+        acc1,
+        row_scales,
+        inter,
+        w1_scales=w1_scales,
+        activation=activation,
+        w1_bias=w1_bias,
+        no_gate=no_gate,
+        block=block,
+        dtype=elementwise,
+        swiglu_limit=swiglu_limit,
+        columns_per_pass=columns_per_pass,
+    )
     if block:
         return blocked_rows_dot(mid, w2, mid_scales, block), None
-    acc2 = lax.dot_general(mid,
-                           w2,
-                           DOT_ROWS_BY_COLUMNS,
-                           preferred_element_type=jnp.float32)
+    acc2 = lax.dot_general(
+        mid, w2, DOT_ROWS_BY_COLUMNS, preferred_element_type=jnp.float32
+    )
     return acc2, mid_scales
 
 
-def activated_rows_bf16(acc1,
-                        row_scales,
-                        inter,
-                        *,
-                        w1_scales,
-                        activation,
-                        w1_bias,
-                        no_gate,
-                        swiglu_limit=SWIGLU_LIMIT_DEFAULT):
+def activated_rows_bf16(
+    acc1,
+    row_scales,
+    inter,
+    *,
+    w1_scales,
+    activation,
+    w1_bias,
+    no_gate,
+    swiglu_limit=SWIGLU_LIMIT_DEFAULT,
+):
     """The first matmul's accumulator through the activation as bfloat16
     rows [rows, inter], no requantization: the "bf16" intermediate."""
 
@@ -277,25 +278,29 @@ def activated_rows_bf16(acc1,
     if no_gate:
         mid = apply_activation_no_gate(half(0, inter), activation)
     else:
-        mid = apply_activation(half(0, inter),
-                               half(inter, 2 * inter),
-                               activation,
-                               swiglu_limit=swiglu_limit)
+        mid = apply_activation(
+            half(0, inter),
+            half(inter, 2 * inter),
+            activation,
+            swiglu_limit=swiglu_limit,
+        )
     return mid.astype(jnp.bfloat16)
 
 
-def expert_ffn_bf16_intermediate(rows,
-                                 row_scales,
-                                 w1,
-                                 w2_bf16,
-                                 w1_scales,
-                                 *,
-                                 activation,
-                                 w1_bias,
-                                 no_gate,
-                                 swiglu_limit=SWIGLU_LIMIT_DEFAULT,
-                                 token_block=None,
-                                 weights_bf16=False):
+def expert_ffn_bf16_intermediate(
+    rows,
+    row_scales,
+    w1,
+    w2_bf16,
+    w1_scales,
+    *,
+    activation,
+    w1_bias,
+    no_gate,
+    swiglu_limit=SWIGLU_LIMIT_DEFAULT,
+    token_block=None,
+    weights_bf16=False,
+):
     """One expert's FFN with the intermediate kept in bfloat16: the up
     matmul as expert_ffn_fp8's (fp8 rows against fp8 w1; bf16 rows against
     bf16 w1 when weights_bf16), the activated rows cast to bf16 with no
@@ -304,55 +309,61 @@ def expert_ffn_bf16_intermediate(rows,
     None: there are no intermediate scales."""
     inter = w1.shape[-1] // (1 if no_gate else 2)
     if weights_bf16:
-        acc1 = lax.dot_general(rows.astype(jnp.bfloat16),
-                               w1,
-                               DOT_ROWS_BY_COLUMNS,
-                               preferred_element_type=jnp.float32)
-        mid = activated_rows_bf16(acc1,
-                                  row_scales,
-                                  inter,
-                                  w1_scales=None,
-                                  activation=activation,
-                                  w1_bias=w1_bias,
-                                  no_gate=no_gate,
-                                  swiglu_limit=swiglu_limit)
+        acc1 = lax.dot_general(
+            rows.astype(jnp.bfloat16),
+            w1,
+            DOT_ROWS_BY_COLUMNS,
+            preferred_element_type=jnp.float32,
+        )
+        mid = activated_rows_bf16(
+            acc1,
+            row_scales,
+            inter,
+            w1_scales=None,
+            activation=activation,
+            w1_bias=w1_bias,
+            no_gate=no_gate,
+            swiglu_limit=swiglu_limit,
+        )
     else:
         if token_block:
             acc1 = blocked_rows_dot(rows, w1, row_scales, token_block)
             row_scales = None
         else:
-            acc1 = lax.dot_general(rows,
-                                   w1,
-                                   DOT_ROWS_BY_COLUMNS,
-                                   preferred_element_type=jnp.float32)
-        mid = activated_rows_bf16(acc1,
-                                  row_scales,
-                                  inter,
-                                  w1_scales=w1_scales,
-                                  activation=activation,
-                                  w1_bias=w1_bias,
-                                  no_gate=no_gate,
-                                  swiglu_limit=swiglu_limit)
-    acc2 = lax.dot_general(mid,
-                           w2_bf16,
-                           DOT_ROWS_BY_COLUMNS,
-                           preferred_element_type=jnp.float32)
+            acc1 = lax.dot_general(
+                rows, w1, DOT_ROWS_BY_COLUMNS, preferred_element_type=jnp.float32
+            )
+        mid = activated_rows_bf16(
+            acc1,
+            row_scales,
+            inter,
+            w1_scales=w1_scales,
+            activation=activation,
+            w1_bias=w1_bias,
+            no_gate=no_gate,
+            swiglu_limit=swiglu_limit,
+        )
+    acc2 = lax.dot_general(
+        mid, w2_bf16, DOT_ROWS_BY_COLUMNS, preferred_element_type=jnp.float32
+    )
     return acc2, None
 
 
-def expert_ffn_bf16(rows,
-                    row_scales,
-                    w1,
-                    w2,
-                    *,
-                    activation,
-                    w1_bias,
-                    no_gate,
-                    block=0,
-                    elementwise=jnp.float32,
-                    swiglu_limit=SWIGLU_LIMIT_DEFAULT,
-                    columns_per_pass=ACTIVATION_COLUMNS_PER_PASS_DEFAULT,
-                    token_block=None):
+def expert_ffn_bf16(
+    rows,
+    row_scales,
+    w1,
+    w2,
+    *,
+    activation,
+    w1_bias,
+    no_gate,
+    block=0,
+    elementwise=jnp.float32,
+    swiglu_limit=SWIGLU_LIMIT_DEFAULT,
+    columns_per_pass=ACTIVATION_COLUMNS_PER_PASS_DEFAULT,
+    token_block=None,
+):
     """One expert's FFN on unscaled bf16 weights. The fp8 token rows and
     the fp8 intermediate are upcast to bf16 for the matrix unit, which is
     exact, so the row scales are the only scales in the body. `block` and
@@ -362,57 +373,57 @@ def expert_ffn_bf16(rows,
     inter = w1.shape[-1] // (1 if no_gate else 2)
     token_block = block if token_block is None else token_block
     if token_block:
-        acc1 = blocked_rows_dot(rows,
-                                w1,
-                                row_scales,
-                                token_block,
-                                upcast=jnp.bfloat16)
+        acc1 = blocked_rows_dot(rows, w1, row_scales, token_block, upcast=jnp.bfloat16)
         row_scales = None
     else:
-        acc1 = lax.dot_general(rows.astype(jnp.bfloat16),
-                               w1,
-                               DOT_ROWS_BY_COLUMNS,
-                               preferred_element_type=jnp.float32)
-    mid, mid_scales = intermediate_rows(acc1,
-                                        row_scales,
-                                        inter,
-                                        w1_scales=None,
-                                        activation=activation,
-                                        w1_bias=w1_bias,
-                                        no_gate=no_gate,
-                                        block=block,
-                                        dtype=elementwise,
-                                        swiglu_limit=swiglu_limit,
-                                        columns_per_pass=columns_per_pass)
+        acc1 = lax.dot_general(
+            rows.astype(jnp.bfloat16),
+            w1,
+            DOT_ROWS_BY_COLUMNS,
+            preferred_element_type=jnp.float32,
+        )
+    mid, mid_scales = intermediate_rows(
+        acc1,
+        row_scales,
+        inter,
+        w1_scales=None,
+        activation=activation,
+        w1_bias=w1_bias,
+        no_gate=no_gate,
+        block=block,
+        dtype=elementwise,
+        swiglu_limit=swiglu_limit,
+        columns_per_pass=columns_per_pass,
+    )
     if block:
-        return blocked_rows_dot(mid,
-                                w2,
-                                mid_scales,
-                                block,
-                                upcast=jnp.bfloat16), None
-    acc2 = lax.dot_general(mid.astype(jnp.bfloat16),
-                           w2,
-                           DOT_ROWS_BY_COLUMNS,
-                           preferred_element_type=jnp.float32)
+        return blocked_rows_dot(mid, w2, mid_scales, block, upcast=jnp.bfloat16), None
+    acc2 = lax.dot_general(
+        mid.astype(jnp.bfloat16),
+        w2,
+        DOT_ROWS_BY_COLUMNS,
+        preferred_element_type=jnp.float32,
+    )
     return acc2, mid_scales
 
 
-def expert_ffn_fp4(rows,
-                   row_scales,
-                   w1_block,
-                   w2_block,
-                   w1_scales,
-                   w2_scales,
-                   *,
-                   block=WEIGHT_BLOCK_DEFAULT,
-                   activation,
-                   w1_bias,
-                   no_gate,
-                   activation_block=0,
-                   elementwise=jnp.float32,
-                   swiglu_limit=SWIGLU_LIMIT_DEFAULT,
-                   columns_per_pass=ACTIVATION_COLUMNS_PER_PASS_DEFAULT,
-                   token_block=None):
+def expert_ffn_fp4(
+    rows,
+    row_scales,
+    w1_block,
+    w2_block,
+    w1_scales,
+    w2_scales,
+    *,
+    block=WEIGHT_BLOCK_DEFAULT,
+    activation,
+    w1_bias,
+    no_gate,
+    activation_block=0,
+    elementwise=jnp.float32,
+    swiglu_limit=SWIGLU_LIMIT_DEFAULT,
+    columns_per_pass=ACTIVATION_COLUMNS_PER_PASS_DEFAULT,
+    token_block=None,
+):
     """One expert's FFN on block-scaled four-bit weights: each matmul summed
     over contraction blocks carrying their own scales, w1_scales [blocks,
     columns] and w2_scales [blocks, hidden].
@@ -425,45 +436,48 @@ def expert_ffn_fp4(rows,
     contraction block then carries its row scales as well).
     """
     token_block = activation_block if token_block is None else token_block
-    for name, value in (("activation", activation_block), ("token",
-                                                           token_block)):
+    for name, value in (("activation", activation_block), ("token", token_block)):
         if value and value != block:
-            raise ValueError(f"{name} block {value} against a weight block "
-                             f"of {block}: the four-bit path scales its "
-                             "contraction per weight block, so a nonzero "
-                             "block has to be that block")
+            raise ValueError(
+                f"{name} block {value} against a weight block "
+                f"of {block}: the four-bit path scales its "
+                "contraction per weight block, so a nonzero "
+                "block has to be that block"
+            )
     inter = w1_scales.shape[-1] // (1 if no_gate else 2)
 
     def blocked_dot(lhs, block_of, scales, lhs_scales):
         acc = None
         for b in range(scales.shape[0]):
-            part = lax.dot_general(lhs[:, b * block:(b + 1) * block],
-                                   block_of(b),
-                                   DOT_ROWS_BY_COLUMNS,
-                                   preferred_element_type=jnp.float32)
+            part = lax.dot_general(
+                lhs[:, b * block : (b + 1) * block],
+                block_of(b),
+                DOT_ROWS_BY_COLUMNS,
+                preferred_element_type=jnp.float32,
+            )
             part = part * scales[b][None, :]
             if lhs_scales is not None:
-                part = part * lhs_scales[:, b:b + 1]
+                part = part * lhs_scales[:, b : b + 1]
             acc = part if acc is None else acc + part
         return acc
 
     blocked = bool(activation_block)
     token_blocked = bool(token_block)
-    acc1 = blocked_dot(rows, w1_block, w1_scales,
-                       row_scales if token_blocked else None)
-    mid, mid_scales = intermediate_rows(acc1,
-                                        None if token_blocked else row_scales,
-                                        inter,
-                                        w1_scales=None,
-                                        activation=activation,
-                                        w1_bias=w1_bias,
-                                        no_gate=no_gate,
-                                        block=activation_block,
-                                        dtype=elementwise,
-                                        swiglu_limit=swiglu_limit,
-                                        columns_per_pass=columns_per_pass)
-    acc2 = blocked_dot(mid, w2_block, w2_scales,
-                       mid_scales if blocked else None)
+    acc1 = blocked_dot(rows, w1_block, w1_scales, row_scales if token_blocked else None)
+    mid, mid_scales = intermediate_rows(
+        acc1,
+        None if token_blocked else row_scales,
+        inter,
+        w1_scales=None,
+        activation=activation,
+        w1_bias=w1_bias,
+        no_gate=no_gate,
+        block=activation_block,
+        dtype=elementwise,
+        swiglu_limit=swiglu_limit,
+        columns_per_pass=columns_per_pass,
+    )
+    acc2 = blocked_dot(mid, w2_block, w2_scales, mid_scales if blocked else None)
     return acc2, (None if blocked else mid_scales)
 
 
@@ -472,6 +486,7 @@ def widen_packed_slab(ref, slot, dtype=FP4):
     `dtype` (fp4 or int4) and widened to fp8 whole: the current expert's
     working copy, made once per expert."""
     from jax.experimental.pallas import tpu as pltpu
+
     return pltpu.bitcast(ref[slot], dtype).astype(FP8)
 
 
@@ -481,5 +496,6 @@ def upcast_packed_block_to_fp8(ref, slot, block_rows, b, dtype=FP4):
     only four-bit-specific line in the kernel."""
     from jax.experimental import pallas as pl
     from jax.experimental.pallas import tpu as pltpu
+
     packed = ref[slot, pl.ds(b * block_rows, block_rows), :]
     return pltpu.bitcast(packed, dtype).astype(FP8)
