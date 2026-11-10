@@ -254,6 +254,12 @@ def test_omni_ring_dispatch_and_env_knobs(monkeypatch: pytest.MonkeyPatch) -> No
             return SimpleNamespace(type="tpu")
 
     calls: list[tuple[str, tuple[object, ...]]] = []
+    # Cases 1-6 run as TPU v7; case 7 covers the other side of the gate.
+    monkeypatch.setattr(omni_attn, "_ici_ring_kernel_hw_ok", None)
+    monkeypatch.setattr(
+        omni_attn.hardware, "get_tpu_version", lambda: omni_attn.hardware.TpuVersion.V7
+    )
+    assert omni_attn._ici_ring_kernel_hw_supported() is True
 
     monkeypatch.setattr(
         omni_attn,
@@ -360,6 +366,36 @@ def test_omni_ring_dispatch_and_env_knobs(monkeypatch: pytest.MonkeyPatch) -> No
     )
     assert torch.all(out_tiny == 3)
     assert calls == [("fallback_ppermute", (2, 4, 1, False))]
+
+    # 7. Other TPU generations (and hosts without a known TPU) use the ppermute
+    # ring path; the generation is probed once and cached.
+    calls.clear()
+    probes: list[str] = []
+
+    def _v6e():
+        probes.append("v6e")
+        return omni_attn.hardware.TpuVersion.V6E
+
+    monkeypatch.setattr(omni_attn, "_ici_ring_kernel_hw_ok", None)
+    monkeypatch.setattr(omni_attn.hardware, "get_tpu_version", _v6e)
+    out_v6e = omni_attn.tpu_ring_flash_attention(
+        q_long, k_long, k_long, 0.125, ring_size=4, uly_size=1, outer_size=2
+    )
+    out_v6e_short = omni_attn.tpu_ring_flash_attention(
+        q_short, q_short, q_short, 0.125, ring_size=4, uly_size=1, outer_size=2
+    )
+    assert torch.all(out_v6e == 3)
+    assert torch.all(out_v6e_short == 3)
+    assert calls == [("fallback_ppermute", (2, 4, 1, False))] * 2
+    assert probes == ["v6e"]
+
+    monkeypatch.setattr(omni_attn, "_ici_ring_kernel_hw_ok", None)
+    monkeypatch.setattr(
+        omni_attn.hardware,
+        "get_tpu_version",
+        lambda: omni_attn.hardware.TpuVersion.UNKNOWN,
+    )
+    assert omni_attn._ici_ring_kernel_hw_supported() is False
 
 
 @pytest.mark.tpu_test

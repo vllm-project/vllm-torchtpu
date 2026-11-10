@@ -31,6 +31,7 @@ import numpy as np
 import torch
 from jax.sharding import PartitionSpec
 from torch_tpu._internal import pallas
+from torch_tpu._internal.utils import hardware
 from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend, SDPAImpl
 from vllm_omni.diffusion.forward_context import get_ulysses_mode
 
@@ -458,6 +459,30 @@ def _ring_ulysses_attention_op(
 # intra-chip D2D all_to_all + bulk ppermute.
 _SHORT_SHARD_2D_RING_MAX = 4096
 
+# The ICI-DMA ring kernel asks for 64 MiB of scoped VMEM and its tile tables
+# were tuned on TPU v7x. Other TPU generations use the ppermute ring path.
+_ICI_RING_KERNEL_TPU_VERSION = hardware.TpuVersion.V7
+_ici_ring_kernel_hw_ok: bool | None = None
+
+
+def _ici_ring_kernel_hw_supported() -> bool:
+    """Whether the attached TPU is the generation the ICI ring kernel targets."""
+    global _ici_ring_kernel_hw_ok
+    supported = _ici_ring_kernel_hw_ok
+    if supported is None:
+        # PCI scan only; it does not start a TPU runtime.
+        version = hardware.get_tpu_version()
+        supported = version is _ICI_RING_KERNEL_TPU_VERSION
+        _ici_ring_kernel_hw_ok = supported
+        if not supported:
+            logger.info(
+                "Pallas ICI-DMA ring attention kernel is tuned for %s; using the "
+                "ppermute ring path on %s.",
+                _ICI_RING_KERNEL_TPU_VERSION.value,
+                version.value,
+            )
+    return supported
+
 
 @functools.cache
 def _pallas_ring_attention_op(
@@ -643,6 +668,8 @@ def _can_use_ici_ring_kernel(
     if not envs.VLLM_TORCHTPU_OMNI_RING_KERNEL or ring_size < 2:
         return False
     if query.device.type != "tpu":
+        return False
+    if not _ici_ring_kernel_hw_supported():
         return False
     if query.ndim != 4 or key.ndim != 4 or value.ndim != 4:
         return False
