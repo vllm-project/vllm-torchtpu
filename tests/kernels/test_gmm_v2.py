@@ -529,7 +529,7 @@ def test_gmm_fp4_block_matches_reference(batch_size, group_sizes, block_size):
 @pytest.mark.parametrize(
     "size_m, decode",
     # MiniMax-M3.1 routed experts under EP8: c4 b4 .. c64 decode, 8k prefill.
-    [(96, False), (128, True), (384, True), (2048, True), (32768, False)],
+    [(96, False), (128, False), (384, False), (1536, True), (2048, True), (32768, False)],
 )
 def test_calculate_tiling_fp4_decode_tiles(size_m, decode):
     _require_tpu()
@@ -551,6 +551,8 @@ def test_calculate_tiling_fp4_decode_tiles(size_m, decode):
     vmem_limit = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.9)
     tiles = calculate_tiling(dims, lhs_cfgs, rhs_cfgs, vmem_limit, "swigluoai")
     assert (tiles.bucket_sizes == FP8_DECODE_BUCKETS) == decode
+    if 96 <= size_m <= 512:
+        assert tiles.bucket_sizes == (16, 32)
 
 
 @pytest.mark.tpu_test

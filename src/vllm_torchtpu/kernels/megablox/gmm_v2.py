@@ -161,6 +161,9 @@ FP8_RHS_TILE_M = 32
 # binding, so finer bf16 buckets would only grow the program.
 FP8_DECODE_TILE_M = 128
 FP8_DECODE_BUCKETS = (16, 32, 48, FP8_DECODE_TILE_M)
+# Up to this size_m local groups stay within FP8_RHS_TILE_M rows, so the
+# small-m tiles (2 fp8 buckets, a third of the program) serve them.
+FP8_SMALL_DECODE_MAX_M = 512
 
 # Define data classes.
 
@@ -1292,6 +1295,13 @@ def calculate_tiling(
         and num_k_tiles == 1
         and fp8_rhs_feed_dtype(lhs_cfgs, rhs_cfgs) is not None
     ):
+        if dims.size_m <= FP8_SMALL_DECODE_MAX_M:
+            return TileSizes(
+                tile_m=FP8_RHS_TILE_M,
+                tile_k=tile_k,
+                tile_n=tile_n,
+                bucket_base=FP8_RHS_TILE_M // 2,
+            )
         return TileSizes(
             tile_m=FP8_DECODE_TILE_M,
             tile_k=tile_k,
