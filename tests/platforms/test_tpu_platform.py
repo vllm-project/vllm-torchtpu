@@ -476,6 +476,30 @@ class TestTpuPlatform:
             with pytest.raises(NotImplementedError, match=message):
                 TpuPlatform.check_and_update_config(vllm_config)
 
+    @pytest.mark.parametrize("dcp,refused", [(8, True), (4, False)])
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_decode_context_parallelism_is_validated(
+        self, mock_prepare_env, mock_apply_patches, vllm_config, dcp, refused
+    ):
+        """The platform runs the DCP admission: at TP8 with 2 KV heads a DCP
+        group of 8 would span both heads and is refused; DCP 4 is admitted."""
+        vllm_config.model_config.get_total_num_kv_heads = lambda: 2
+        vllm_config.parallel_config.tensor_parallel_size = 8
+        vllm_config.parallel_config.decode_context_parallel_size = dcp
+        if refused:
+            with pytest.raises(ValueError, match="share one KV head"):
+                TpuPlatform.check_and_update_config(vllm_config)
+        else:
+            from vllm_torchtpu.platforms import dcp_validation
+
+            admitted = dcp_validation.validate_decode_context_parallel_config(
+                vllm_config
+            )
+            assert admitted.dcp_size == 4
+
     @pytest.mark.parametrize("head_size,refused", [(64, True), (128, False)])
     @patch("vllm_torchtpu.patch_registry.apply")
     @patch(
