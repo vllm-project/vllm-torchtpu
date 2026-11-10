@@ -35,6 +35,7 @@ import numpy as np
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.megakernel import kernel
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec
 from vllm_torchtpu.megakernel.models import qwen38
@@ -138,6 +139,7 @@ def main():
                 n_layers=n_att,
                 **indexed_options(),
             ),
+            hc_fp8=envs.VLLM_TPU_MK_HC_FP8,
         )
         ex = ExecSpec(R=R, B=B, T=4, ctx=128, tiles=segment_tiles(B))
         _, info = kernel.make_step(mesh, spec, ex)
