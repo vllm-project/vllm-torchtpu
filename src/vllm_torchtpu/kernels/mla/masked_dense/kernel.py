@@ -46,20 +46,13 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.mla.masked_dense import csa_mask
-
-
-def cdiv(a, b):
-    assert b != 0
-    return (a + b - 1) // b
-
-
-def align_to(x, a):
-    return cdiv(x, a) * a
-
-
-def get_dtype_packing(dtype):
-    return 32 // jax.dtypes.itemsize_bits(dtype)
-
+from vllm_torchtpu.kernels.pallas_util import (
+    align_to,
+    async_copy,
+    broadcast_minor,
+    cdiv,
+    get_dtype_packing,
+)
 
 DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.dtype("float32")).max)
 
@@ -222,13 +215,6 @@ def _mla_ragged_paged_attention_kernel(
         o_curr = broadcast_minor(exp_m_diff, o_prev.shape) * o_prev + pv
         head_acc_ref[...] = o_curr
 
-    def _async_copy(src, dst, sem, wait):
-        cp = pltpu.make_async_copy(src, dst, sem)
-        if wait:
-            cp.wait()
-        else:
-            cp.start()
-
     def _fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx, *, wait=False):
         sem_nope = sems.at[0, bkv_sem_idx]
         sem_rope = sems.at[4, bkv_sem_idx]
@@ -261,7 +247,7 @@ def _mla_ragged_paged_attention_kernel(
                 # garbage data, which is safely masked out later by bq_mask_in.
                 page_idx = jnp.minimum(page_indices_offset + i, num_page_indices - 1)
 
-                _async_copy(
+                async_copy(
                     reshaped_cache_nope_hbm_ref.at[
                         pl.ds(
                             page_indices_ref[page_idx] * page_size,
@@ -272,7 +258,7 @@ def _mla_ragged_paged_attention_kernel(
                     sem_nope,
                     wait,
                 )
-                _async_copy(
+                async_copy(
                     reshaped_cache_rope_hbm_ref.at[
                         pl.ds(
                             page_indices_ref[page_idx] * page_size,
@@ -287,9 +273,9 @@ def _mla_ragged_paged_attention_kernel(
             # When we wait, we can use a dummy copy to wait for DMAs to complete
             # where src == dst. However, the dma size must be correct.
             dst_nope_kv = bkv_nope_vmem_ref.at[pl.ds(0, bkv_sz_per_kv_packing)]
-            _async_copy(src=dst_nope_kv, dst=dst_nope_kv, sem=sem_nope, wait=True)
+            async_copy(src=dst_nope_kv, dst=dst_nope_kv, sem=sem_nope, wait=True)
             dst_rope_kv = bkv_rope_vmem_ref.at[pl.ds(0, bkv_sz_per_kv_packing)]
-            _async_copy(src=dst_rope_kv, dst=dst_rope_kv, sem=sem_rope, wait=True)
+            async_copy(src=dst_rope_kv, dst=dst_rope_kv, sem=sem_rope, wait=True)
 
     def _fetch_bq(seq_idx, bq_idx, bq_sem_idx, *, wait=False):
         sem = sems.at[1, bq_sem_idx]
@@ -299,7 +285,7 @@ def _mla_ragged_paged_attention_kernel(
         q_end = cu_q_lens_ref[seq_idx + 1]
         sz = jnp.minimum(bq_sz, q_end - q_len_start)
 
-        _async_copy(
+        async_copy(
             q_hbm_ref.at[pl.ds(q_len_start, sz)],
             bq_vmem_ref.at[pl.ds(0, sz)],
             sem,
@@ -313,7 +299,7 @@ def _mla_ragged_paged_attention_kernel(
         q_end = cu_q_lens_ref[seq_idx + 1]
         sz = jnp.minimum(bq_sz, q_end - q_len_start)
 
-        _async_copy(
+        async_copy(
             vmem_ref.at[pl.ds(0, sz)],
             o_hbm_ref.at[pl.ds(q_len_start, sz)],
             sem,
@@ -334,7 +320,7 @@ def _mla_ragged_paged_attention_kernel(
         # query rows are padding whose output is discarded.
         sz = jnp.minimum(bq_sz, q_end - q_len_start)
 
-        _async_copy(
+        async_copy(
             mask_hbm_ref.at[pl.ds(q_len_start, sz), bkv_idx, pl.ds(0, bkv_sz)],
             vmem_ref.at[pl.ds(0, sz), 0, pl.ds(0, bkv_sz)],
             sem,
@@ -402,17 +388,6 @@ def _mla_ragged_paged_attention_kernel(
         k_span = bkv_idx * bkv_sz + lax.broadcasted_iota(jnp.int32, bkv.shape, 0)
         bkv = jnp.where(k_span < kv_len, bkv, 0)
         return bkv
-
-    def broadcast_minor(src, shape):
-        if src.shape == shape:
-            return src
-        assert src.shape[:-1] == shape[:-1]
-        assert src.shape[-1] % 128 == 0
-        target_minor = align_to(shape[-1], src.shape[-1])
-        # no-op concatenation.
-        return jnp.concatenate(
-            [src for _ in range(target_minor // src.shape[-1])], axis=-1
-        )[..., : shape[-1]]
 
     def process():
         # Force at least one bkv block and one bq block per sequence: the

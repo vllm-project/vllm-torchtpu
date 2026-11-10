@@ -23,7 +23,8 @@ import pytest
 from absl.testing import absltest, parameterized
 from jax._src import test_util as jtu
 
-from vllm_torchtpu.kernels.experimental.batched_rpa import configs, utils, wrapper
+from vllm_torchtpu.kernels import pallas_util as utils
+from vllm_torchtpu.kernels.experimental.batched_rpa import configs, wrapper
 
 pytestmark = pytest.mark.tpu_test
 

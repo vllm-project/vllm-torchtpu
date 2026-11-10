@@ -16,7 +16,8 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
-from vllm_torchtpu.kernels.experimental.batched_rpa import configs, utils
+from vllm_torchtpu.kernels import pallas_util
+from vllm_torchtpu.kernels.experimental.batched_rpa import configs
 from vllm_torchtpu.kernels.experimental.batched_rpa.schedule import SmemWrapper
 
 
@@ -96,7 +97,7 @@ def flash_attention_qk_softmax(
         m_prev = jnp.where(is_last_k[step, b_idx], -jnp.inf, m_next_b)
 
     m_next = jnp.stack(m_next_list, axis=0)
-    p = jnp.exp(qk - utils.broadcast_minor(m_next, qk.shape))
+    p = jnp.exp(qk - pallas_util.broadcast_minor(m_next, qk.shape))
     p_rowsum = jnp.sum(p, axis=-1, keepdims=True, dtype=cfgs.serve.dtype_out)
 
     l_next_list = []
@@ -167,7 +168,7 @@ def flash_attention_pv(
 
     o_next_list = []
     for b_idx in range(cfgs.block.batch_size):
-        alpha_b = utils.broadcast_minor(alpha_list[b_idx], o_prev.shape)
+        alpha_b = pallas_util.broadcast_minor(alpha_list[b_idx], o_prev.shape)
         o_next_b = alpha_b * o_prev + pv[b_idx]
         o_next_list.append(o_next_b)
         if cfgs.fuse_accum:

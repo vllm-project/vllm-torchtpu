@@ -11,24 +11,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Utility functions for Ragged Paged Attention."""
+"""Batched-RPA span, CP cache-length, and bitwidth-unpacking helpers."""
 
 import jax
-import jax.experimental.pallas as pl
 import jax.experimental.pallas.tpu as pltpu
 import jax.numpy as jnp
 
-
-def align_to(a, b):
-    """Returns 'a' aligned to 'b'."""
-    return pl.cdiv(a, b) * b
+from vllm_torchtpu.kernels.pallas_util import pl_align_to
 
 
 def align_span(start, size, align):
     """Returns (aligned_start, lead, aligned_size) for [start, start + size)."""
     # Grows the span out to 'align'; an 'align' of 1 is the identity.
     lead = start % align
-    return start - lead, lead, align_to(lead + size, align)
+    return start - lead, lead, pl_align_to(lead + size, align)
 
 
 def cp_local_cache_len(global_kv_cache_len, cp_group_size, cp_rank, page_size):
@@ -45,69 +41,6 @@ def cp_local_cache_len(global_kv_cache_len, cp_group_size, cp_rank, page_size):
         ),
     )
     return full_tokens + rem_tokens
-
-
-def broadcast_minor(src, shape):
-    """Broadcasts 'src' to 'shape' in the minor dimension."""
-    if src.shape == shape:
-        return src
-    num_lanes = pltpu.get_tpu_info().num_lanes
-    assert src.shape[:-1] == shape[:-1]
-    assert src.shape[-1] % num_lanes == 0
-    target_minor = align_to(shape[-1], src.shape[-1])
-    # no-op concatenation.
-    broadcasted = jnp.tile(src, (target_minor // src.shape[-1],))
-    return broadcasted[..., : shape[-1]]
-
-
-def get_dtype_packing(dtype):
-    return 32 // jax.dtypes.itemsize_bits(dtype)
-
-
-def get_dtype_bits(dtype):
-    return jax.dtypes.itemsize_bits(dtype)
-
-
-def strided_load(ref, start_row, num_rows, step, *, dtype=None):
-    """Loads data from HBM with strided access, handling 128-lane alignment."""
-    _, row_width = ref.shape
-    num_lanes = pltpu.get_tpu_info().num_lanes
-    num_sub_lanes = row_width // num_lanes
-    ref_flat = ref.reshape(-1, num_lanes)
-
-    # scale indices to match flattened arraw.
-    v_start = start_row * num_sub_lanes
-    v_num = num_rows * num_sub_lanes
-    v_step = step * num_sub_lanes
-
-    # Gather the chunks into the original head dimension.
-    chunks = [
-        ref_flat[pl.ds(v_start + i, v_num // v_step, v_step)]
-        for i in range(num_sub_lanes)
-    ]
-    vec = jnp.concat(chunks, axis=1)
-
-    return pltpu.bitcast(vec, dtype) if dtype is not None else vec
-
-
-def strided_store(ref, start, sz, step, val):
-    """Stores data to HBM with strided access, handling 128-lane alignment."""
-    assert get_dtype_packing(ref.dtype) == 1
-    assert ref.dtype == val.dtype
-    assert ref.shape == val.shape
-    assert ref.ndim == 2
-    rows, cols = ref.shape
-    num_lanes = pltpu.get_tpu_info().num_lanes
-    assert cols % num_lanes == 0
-    folds = cols // num_lanes
-    ref = ref.reshape(rows * folds, num_lanes)
-    start *= folds
-    sz *= folds
-    step *= folds
-    assert sz % step == 0
-    for i in range(folds):
-        val_slice = val[:, i * num_lanes : (i + 1) * num_lanes]
-        ref[pl.ds(start + i, sz // step, step)] = val_slice
 
 
 def convert_to_target_bitwidth(val, target_bitwidth: int, kv_dtype: jnp.dtype):
@@ -142,21 +75,10 @@ def convert_to_target_bitwidth(val, target_bitwidth: int, kv_dtype: jnp.dtype):
         k = pltpu.bitcast(left, kv_dtype)
         v = pltpu.bitcast(right, kv_dtype)
         return [(k, v)]
-    else:
-        left_out = convert_to_target_bitwidth(
-            left, target_bitwidth=target_bitwidth, kv_dtype=kv_dtype
-        )
-        right_out = convert_to_target_bitwidth(
-            right, target_bitwidth=target_bitwidth, kv_dtype=kv_dtype
-        )
-        return left_out + right_out
-
-
-def has_bank_conflicts(stride: int, distance=24, num_banks=32) -> bool:
-    banks = set()
-    for i in range(distance):
-        bank = (i * stride) % num_banks
-        if bank in banks:
-            return True
-        banks.add(bank)
-    return False
+    left_out = convert_to_target_bitwidth(
+        left, target_bitwidth=target_bitwidth, kv_dtype=kv_dtype
+    )
+    right_out = convert_to_target_bitwidth(
+        right, target_bitwidth=target_bitwidth, kv_dtype=kv_dtype
+    )
+    return left_out + right_out
