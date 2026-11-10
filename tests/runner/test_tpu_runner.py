@@ -39,6 +39,7 @@ from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     FullAttentionSpec,
     MambaSpec,
+    UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
@@ -317,6 +318,13 @@ def test_spec_warmup_clamps_circular_buffer_group_blocks():
 
     assert tpu_runner._spec_warmup_group_num_blocks(runner, attn_group, 2060) == 9
     assert tpu_runner._spec_warmup_group_num_blocks(runner, ring_group, 2060) == 1
+    # Block-outer layouts wrap the ring layers in a uniform-type group spec.
+    uniform_ring = SimpleNamespace(
+        kv_cache_spec=UniformTypeKVCacheSpecs(
+            block_size=8, kv_cache_specs={"ring0": ring_spec, "ring1": ring_spec}
+        )
+    )
+    assert tpu_runner._spec_warmup_group_num_blocks(runner, uniform_ring, 2060) == 1
 
     assert TPUModelRunner._warmup_one_spec_request(runner, 2048, idx=0) is True
     first_prefill = executed[0].scheduled_new_reqs[0]
