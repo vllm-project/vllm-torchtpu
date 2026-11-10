@@ -204,7 +204,6 @@ if TYPE_CHECKING:
     DEBUG_TPU_LOCAL_RANK_OFFSET: int = 0
     TORCH_TPU_BASE_PORT: int = 8070
     TORCH_TPU_MP_RENDEZVOUS_PORT: int | None = None
-    TPU_MULTIPORT_DP_LOCAL_SIZE: int = 0
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
@@ -1240,12 +1239,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # TCPStore port for the mp multihost rendezvous; unset means the vLLM
     # coordination port plus one.
     "TORCH_TPU_MP_RENDEZVOUS_PORT": env_optional_int("TORCH_TPU_MP_RENDEZVOUS_PORT"),
-    # Number of DP ranks of a `vllm serve --data-parallel-multi-port-external-lb`
-    # server that share this host (must equal --data-parallel-size; one host
-    # only). 0 = off. See distributed/tpu_multiport_dp.py.
-    "TPU_MULTIPORT_DP_LOCAL_SIZE": env_nonnegative_int(
-        "TPU_MULTIPORT_DP_LOCAL_SIZE", 0
-    ),
     # Directory for the on-disk TorchTPU compilation cache; read raw because
     # env_override.py copies it verbatim into the TORCH_TPU_INTERNAL_* vars.
     "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT": lambda: os.getenv(

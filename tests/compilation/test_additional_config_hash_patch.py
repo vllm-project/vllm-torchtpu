@@ -203,12 +203,15 @@ def test_patch_is_idempotent(patched_compute_hash):
 
 
 def test_ignored_keys_match_the_keys_the_runner_reads():
+    from vllm_torchtpu.distributed import tpu_multiport_dp
+
     assert {
         KEY,
         PREFILL_KEY,
         FRONTEND_OPTIONS_SECTION,
         RUNNER_OPTIONS_SECTION,
         WORKER_OPTIONS_SECTION,
+        tpu_multiport_dp.SECTION,
     } == HASH_IGNORED_ADDITIONAL_CONFIG_KEYS
 
 

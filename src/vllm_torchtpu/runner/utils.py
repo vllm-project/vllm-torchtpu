@@ -56,10 +56,15 @@ FRONTEND_OPTIONS_SECTION = "tpu_frontend"
 RUNNER_OPTIONS_SECTION = "tpu_runner"
 WORKER_OPTIONS_SECTION = "tpu_worker"
 
-# Diagnostics-only knobs and host-only sections: they steer profiling or the
-# host and never change the compiled graph, so
-# `_patch_vllm_config_hash_ignore_diagnostics` keeps them out of the TPU compile
-# cache key.
+# Launch topology of a single-host multi-port DP server
+# (distributed/tpu_multiport_dp.py): each engine compiles the same programs as
+# under internal-LB DP.
+MULTIPORT_DP_ADDITIONAL_CONFIG_KEY = "tpu_multiport_dp"
+
+# Diagnostics-only knobs, host-only sections and the multi-port launch
+# topology: they steer profiling, the host or the launch and never change the
+# compiled graph, so `_patch_vllm_config_hash_ignore_diagnostics` keeps them out
+# of the TPU compile cache key.
 HASH_IGNORED_ADDITIONAL_CONFIG_KEYS = frozenset(
     {
         PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY,
@@ -67,6 +72,7 @@ HASH_IGNORED_ADDITIONAL_CONFIG_KEYS = frozenset(
         FRONTEND_OPTIONS_SECTION,
         RUNNER_OPTIONS_SECTION,
         WORKER_OPTIONS_SECTION,
+        MULTIPORT_DP_ADDITIONAL_CONFIG_KEY,
     }
 )
 

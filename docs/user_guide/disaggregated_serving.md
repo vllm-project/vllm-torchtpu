@@ -98,6 +98,12 @@ vllm serve Qwen/Qwen3.5-35B-A3B-FP8 \
   }'
 ```
 
+To expose each DP rank of the decode instance on its own port (one API server
+per rank, for an external load balancer such as llm-d), add
+`--data-parallel-multi-port-external-lb --data-parallel-size-local 4` and
+`--additional-config '{"tpu_multiport_dp": {"enabled": true}}'`. Rank `r`
+then serves on `--port + r`. All ranks must run on one host.
+
 ### Step 4: Launch the Disaggregated Proxy Server
 
 ```bash
