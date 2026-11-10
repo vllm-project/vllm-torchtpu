@@ -19,7 +19,7 @@ import importlib
 import inspect
 import sys
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -41,7 +41,10 @@ from vllm_torchtpu.models.vllm.qwen3_next_patch import (
     UPSTREAM_DECODER_LAYER_FORWARD,
     UPSTREAM_MODEL_FORWARD,
     UPSTREAM_MTP_FORWARD,
+    _check_tokens_divide_by_tp,
     compute_fused_gate_and_shared_expert,
+    entry_chunk_decoder_layer_forward,
+    entry_chunk_model_forward,
     maybe_flip_gdn_in_proj_qkvz_weight,
     maybe_patch_qwen3_next,
     maybe_setup_fused_gate_se,
@@ -187,7 +190,10 @@ def test_moe_block_accepts_already_sequence_parallel():
     assert "already_sequence_parallel" in params
 
 
-def test_patched_decoder_layer_forward_parity():
+@pytest.mark.parametrize(
+    "forward", [patched_decoder_layer_forward, entry_chunk_decoder_layer_forward]
+)
+def test_patched_decoder_layer_forward_parity(forward):
     """Verify patched forward matches upstream output on the non-SP branch."""
 
     class DummyLayer:
@@ -215,9 +221,7 @@ def test_patched_decoder_layer_forward_parity():
     residual = torch.randn(8, 64)
     positions = torch.arange(8)
 
-    patched_h, patched_r = patched_decoder_layer_forward(
-        layer, hidden, residual, positions
-    )
+    patched_h, patched_r = forward(layer, hidden, residual, positions)
     upstream_h, upstream_r = UPSTREAM_DECODER_LAYER_FORWARD(
         layer, hidden, residual, positions
     )
@@ -555,6 +559,156 @@ def test_patched_mtp_forward_sequence_parallel(monkeypatch, with_step0_gather):
     assert out.shape == (num_tokens, 4)
 
 
+def test_entry_chunk_decoder_layer_forward_sequence_parallel(monkeypatch):
+    """Verify the SP branch runs all-gather, narrow, reduce-scatter, and SP MLP."""
+
+    tp = 2
+    monkeypatch.setattr(
+        patch_mod,
+        "tensor_model_parallel_all_gather",
+        lambda x, dim=0: torch.cat([x] * tp, dim=dim),
+    )
+    monkeypatch.setattr(
+        patch_mod,
+        "tensor_model_parallel_reduce_scatter",
+        lambda x, dim=0: x.narrow(dim, 0, x.shape[dim] // tp) * tp,
+    )
+    monkeypatch.setattr(
+        patch_mod,
+        "get_tensor_model_parallel_world_size",
+        lambda: tp,
+    )
+
+    mlp_kwargs: list[dict[str, object]] = []
+
+    class DummyLayer:
+        use_attn_reduce_scatter_for_moe = True
+        layer_type = "linear_attention"
+        layer_scale = False
+
+        def input_layernorm(self, x, residual=None):
+            return x * 1.05 if residual is None else (x * 1.05, residual + x * 0.05)
+
+        def linear_attn(self, hidden_states):
+            return hidden_states + 1.0
+
+        def post_attention_layernorm(self, x, residual):
+            return x * 1.1, residual + x * 0.1
+
+        def mlp(self, x, **kwargs):
+            mlp_kwargs.append(kwargs)
+            return x * 2.0
+
+    layer = DummyLayer()
+    num_tokens = 8
+    hidden = torch.randn(num_tokens // tp, 64)
+    residual = torch.randn(num_tokens // tp, 64)
+    positions = torch.arange(num_tokens)
+
+    patched_h, patched_r = entry_chunk_decoder_layer_forward(
+        layer, hidden, residual, positions
+    )
+
+    normed = hidden * 1.05
+    expected_r = residual + hidden * 0.05
+    attn_shard = (normed + 1.0) * tp
+    expected_h = (attn_shard * 1.1) * 2.0
+    expected_r = expected_r + attn_shard * 0.1
+
+    assert patched_h.shape == (num_tokens // tp, 64)
+    assert patched_r.shape == (num_tokens // tp, 64)
+    torch.testing.assert_close(patched_h, expected_h)
+    torch.testing.assert_close(patched_r, expected_r)
+    assert mlp_kwargs == [{"already_sequence_parallel": True}]
+
+
+def test_check_tokens_divide_by_tp():
+    """Divisibility check passes when divisible, raises RuntimeError when not."""
+    patch_target = (
+        "vllm_torchtpu.models.vllm.qwen3_next_patch."
+        "get_tensor_model_parallel_world_size"
+    )
+    with patch(patch_target, return_value=8):
+        _check_tokens_divide_by_tp(16)
+        _check_tokens_divide_by_tp(8)
+        with pytest.raises(RuntimeError):
+            _check_tokens_divide_by_tp(7)
+
+
+def test_entry_chunk_model_forward_sequence_parallel(monkeypatch):
+    """The model-entry forward chunks the rows before the first layer, so every
+    layer gets this rank's slice, and gathers the final norm's output back to
+    the step's rows."""
+
+    tp = 2
+    _fake_tp_collectives(monkeypatch, tp)
+    gathered = _record_all_gathers(monkeypatch)
+    monkeypatch.setattr(
+        patch_mod.qwen3_next,
+        "sequence_parallel_chunk",
+        lambda x: x.narrow(0, 0, x.shape[0] // tp),
+    )
+    monkeypatch.setattr(
+        patch_mod,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    seen: list[tuple[int, bool]] = []
+
+    def layer(positions, hidden_states, residual):
+        seen.append((hidden_states.shape[0], residual is None))
+        return hidden_states + 1.0, hidden_states if residual is None else residual
+
+    num_tokens = 8
+    chunk = num_tokens // tp
+    embeds = torch.randn(num_tokens, 64)
+    model = SimpleNamespace(
+        use_sequence_parallel=True,
+        start_layer=0,
+        end_layer=2,
+        layers=[layer, layer],
+        embed_input_ids=lambda ids: embeds,
+        norm=lambda h, r: (h + r, r),
+        _maybe_add_hidden_state=lambda aux, *args: aux,
+    )
+
+    hidden = entry_chunk_model_forward(
+        model, torch.zeros(num_tokens, dtype=torch.long), torch.arange(num_tokens)
+    )
+
+    assert seen == [(chunk, True), (chunk, False)]
+    assert gathered == [chunk]
+    assert hidden.shape == (num_tokens, 64)
+    torch.testing.assert_close(hidden[:chunk], embeds[:chunk] * 2 + 2.0)
+
+
+def test_forward_patch_skipped_with_flag_off(monkeypatch):
+    """When TPU_MOE_SEQUENCE_PARALLEL=0, methods remain the upstream objects."""
+    monkeypatch.setattr(envs, "TPU_MOE_SEQUENCE_PARALLEL", False)
+    result = maybe_patch_qwen3_next(QWEN3_NEXT)
+    assert result is None
+    assert qwen3_next.Qwen3NextDecoderLayer.forward is UPSTREAM_DECODER_LAYER_FORWARD
+    assert qwen3_next.Qwen3NextModel.forward is UPSTREAM_MODEL_FORWARD
+
+
+def test_forward_patch_applied(monkeypatch):
+    """With the flag on, the inherited Qwen3Next forwards are replaced."""
+    monkeypatch.setattr(envs, "TPU_MOE_SEQUENCE_PARALLEL", True)
+    monkeypatch.setattr(
+        qwen3_next.Qwen3NextDecoderLayer,
+        "forward",
+        UPSTREAM_DECODER_LAYER_FORWARD,
+    )
+    monkeypatch.setattr(qwen3_next.Qwen3NextModel, "forward", UPSTREAM_MODEL_FORWARD)
+
+    result = maybe_patch_qwen3_next(QWEN3_NEXT)
+    assert result is None
+    assert (
+        qwen3_next.Qwen3NextDecoderLayer.forward is not UPSTREAM_DECODER_LAYER_FORWARD
+    )
+    assert qwen3_next.Qwen3NextModel.forward is not UPSTREAM_MODEL_FORWARD
+
+
 def test_forward_patch_skipped_for_other_models_without_sp(
     restore_forwards, v6_install
 ):
@@ -583,21 +737,45 @@ def test_forward_patch_waits_for_a_model_config(restore_forwards, v6_install):
     assert not patch_mod.sequence_parallel.follows_step_form()
 
 
-def test_other_models_take_only_mains_sp_forwards(restore_forwards, v6_install):
-    """Under TPU_MOE_SEQUENCE_PARALLEL=1 another model gets the trace-stable
-    forwards (main's opt-in), without the FP8 fusions and without row gating:
-    every sequence-parallel step stays sliced."""
+@pytest.mark.parametrize(
+    "architecture",
+    [
+        "Qwen3NextForCausalLM",
+        # Qwen3.5 classes outside models/qwen3_5/settings.ARCHITECTURES.
+        "Qwen3_5MoeForCausalLM",
+        "Qwen3_5ForConditionalGeneration",
+    ],
+)
+def test_other_models_keep_the_entry_chunk_forwards(
+    restore_forwards, v6_install, architecture
+):
+    """Under TPU_MOE_SEQUENCE_PARALLEL=1 another model takes the model-entry
+    forwards, not the Qwen3.5 ones. It gets no FP8 fusion, no row gating
+    (every sequence-parallel step stays sliced), no rank tensor on its decoder
+    layers and no FP8 gather ops, and both drafter forwards stay as they are."""
     restore_forwards.setattr(envs, "TPU_MOE_SEQUENCE_PARALLEL", True)
-    restore_forwards.setattr(patch_mod.sequence_parallel, "fp8_gather", lambda: False)
     restore_forwards.setattr(patch_mod.sequence_parallel, "_FOLLOWS_STEP_FORM", False)
-    assert maybe_patch_qwen3_next(QWEN3_NEXT) is None
+    prebuild = MagicMock()
+    restore_forwards.setattr(patch_mod.linear_common, "prebuild_prequant_ops", prebuild)
+    restore_forwards.setattr(patch_mod, "_prebuild_norm_ops", prebuild)
+
+    model_config = SimpleNamespace(architectures=[architecture])
+    assert maybe_patch_qwen3_next(model_config) is None
     v6_install.assert_not_called()
-    assert qwen3_next.Qwen3NextDecoderLayer.forward is patched_decoder_layer_forward
+    prebuild.assert_not_called()
     assert not patch_mod.sequence_parallel.follows_step_form()
+    assert qwen3_next.Qwen3NextDecoderLayer.forward is entry_chunk_decoder_layer_forward
+    assert qwen3_next.Qwen3NextModel.forward is entry_chunk_model_forward
+    assert qwen3_next_mtp.Qwen3NextMultiTokenPredictor.forward is UPSTREAM_MTP_FORWARD
+    assert (
+        qwen3_5_mtp.Qwen3_5MultiTokenPredictor.forward is UNPATCHED_QWEN3_5_MTP_FORWARD
+    )
+    for layer_cls in (qwen3_next.Qwen3NextDecoderLayer, qwen3_5.Qwen3_5DecoderLayer):
+        assert not getattr(layer_cls.__init__, "_tpu_sp_rank_init", False)
 
 
 @pytest.mark.parametrize("sequence_parallel", [True, False])
-def test_forward_patch_applied(restore_forwards, v6_install, sequence_parallel):
+def test_qwen3_5_forward_patch_applied(restore_forwards, v6_install, sequence_parallel):
     """On a Qwen3.5 target the FP8 fusions are installed and the inherited
     Qwen3.5 forwards and the drafter forwards are replaced, with or without
     sequence parallelism (the MTP step-0 gather needs them); row gating
@@ -611,7 +789,7 @@ def test_forward_patch_applied(restore_forwards, v6_install, sequence_parallel):
     v6_install.assert_called_once_with()
     assert patch_mod.sequence_parallel.follows_step_form() is sequence_parallel
     assert qwen3_next.Qwen3NextDecoderLayer.forward is patched_decoder_layer_forward
-    assert qwen3_next.Qwen3NextModel.forward is not UPSTREAM_MODEL_FORWARD
+    assert qwen3_next.Qwen3NextModel.forward is patched_model_forward
     assert qwen3_next_mtp.Qwen3NextMultiTokenPredictor.forward is patched_mtp_forward
     assert qwen3_5_mtp.Qwen3_5MultiTokenPredictor.forward is patched_mtp_forward
     assert (
