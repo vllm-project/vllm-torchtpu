@@ -3185,9 +3185,11 @@ class TestInputStagingFence:
             TPUModelRunner._dummy_run(
                 runner, num_tokens=16, num_reqs=4, num_blocks=4, dp_lockstep=dp_lockstep
             )
-            # Only this run's staged table is still held, by its own fence.
+            # At most this run's staged table is still held, by its own fence.
+            # A run whose staged table equals the previous upload reuses that
+            # device tensor and stages nothing, so buffers never accumulate.
             assert runner._unfenced_h2d_sources == []
-            assert len(runner._fenced_h2d_sources) == 1
+            assert len(runner._fenced_h2d_sources) <= 1
             assert runner._input_staging_fence is _FakeTpuEvent.instances[-1]
         assert len(_FakeTpuEvent.instances) == 3
         assert all(fence.synchronized == 1 for fence in _FakeTpuEvent.instances[:-1])
