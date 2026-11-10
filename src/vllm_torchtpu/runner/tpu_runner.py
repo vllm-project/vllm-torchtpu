@@ -63,6 +63,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
     MultiKVConnectorStats,
 )
 from vllm.forward_context import set_forward_context
+from vllm_torchtpu.runner import decode_carry as _decode_carry
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.rotary_embedding import (
@@ -3795,11 +3796,18 @@ class TPUModelRunner(GPUModelRunner):
             else None
         )
 
+        carry_rej = {} if _decode_carry.ENABLED else None
         for pre_req_idx, req_state, seq_len, req_id in pre_request_seq_lens:
             sampled_ids = valid_sampled_token_ids[pre_req_idx]
             if not sampled_ids:
                 continue
             n_sampled = len(sampled_ids)
+            if carry_rej is not None:
+                carry_rej[req_id] = 1 + (
+                    pre_num_draft_per_req.get(pre_req_idx, 0)
+                    if pre_num_draft_per_req
+                    else 0
+                ) - n_sampled
 
             # The previous step optimistically appended (1 + num_draft)
             # placeholder tokens to output_token_ids, assuming every draft was
@@ -3850,6 +3858,8 @@ class TPUModelRunner(GPUModelRunner):
                 ]
             else:
                 token_ids_cpu[req_idx, start_idx:end_tok_idx] = sampled_ids
+        if carry_rej is not None:
+            _decode_carry.record_rejected(self, self._pre_async_results, carry_rej)
 
     _ZERO_PLACEHOLDERS: tuple[tuple[int, ...], ...] = tuple((0,) * k for k in range(33))
 
@@ -4746,32 +4756,51 @@ class TPUModelRunner(GPUModelRunner):
             self.input_ids_cpu[
                 total_num_scheduled_tokens:padded_total_num_scheduled_tokens
             ] = 0
-        self.input_ids = self.input_ids_cpu[local_token_slice].to(
-            self.device, non_blocking=True
-        )
-        if self.uses_mrope:
-            if zero_pad_tail:
+            if self.uses_mrope:
                 self.mrope_positions.cpu[
                     :, total_num_scheduled_tokens:padded_total_num_scheduled_tokens
                 ] = 0
-            self.position_ids = self.mrope_positions.cpu[:, local_token_slice].to(
-                self.device, non_blocking=True
-            )
-        else:
-            self.position_ids = self.positions_cpu[local_token_slice].to(
-                self.device, non_blocking=True
-            )
         if use_max_model_len:
-            seq_lens = self.seq_lens_cpu[: self.num_reqs_max_model_len].to(
-                self.device, non_blocking=True
-            )
             target_num_reqs = self.num_reqs_max_model_len
         else:
             assert self.num_reqs_most_model_len is not None
-            seq_lens = self.seq_lens_cpu[: self.num_reqs_most_model_len].to(
+            target_num_reqs = self.num_reqs_most_model_len
+
+        def _upload_seq_pos_ids() -> torch.Tensor:
+            self.input_ids = self.input_ids_cpu[local_token_slice].to(
                 self.device, non_blocking=True
             )
-            target_num_reqs = self.num_reqs_most_model_len
+            if self.uses_mrope:
+                self.position_ids = self.mrope_positions.cpu[
+                    :, local_token_slice
+                ].to(self.device, non_blocking=True)
+            else:
+                self.position_ids = self.positions_cpu[local_token_slice].to(
+                    self.device, non_blocking=True
+                )
+            return self.seq_lens_cpu[:target_num_reqs].to(
+                self.device, non_blocking=True
+            )
+
+        # Steady async-spec decode: the previous step's corrected device tensors
+        # plus a constant advance equal what this upload would produce (checked
+        # on the host, see decode_carry), so skip the three H2D copies.
+        carry = _decode_carry.check(
+            self,
+            start_index=start_index,
+            num_reqs=num_reqs,
+            num_scheduled_tokens_per_req_list=num_scheduled_tokens_per_req_list,
+            total_num_scheduled_tokens=int(total_num_scheduled_tokens),
+            padded_total_num_scheduled_tokens=int(padded_total_num_scheduled_tokens),
+            target_num_reqs=target_num_reqs,
+            layout_plan=layout_plan,
+        )
+        if carry is None:
+            seq_lens = _upload_seq_pos_ids()
+        else:
+            seq_lens = carry.seq_lens
+            self.position_ids = carry.positions
+            self.input_ids = carry.input_ids
 
         # Async spec: seq_lens/positions were advanced optimistically (every
         # draft from the previous step assumed accepted). Subtract the real
@@ -4917,6 +4946,13 @@ class TPUModelRunner(GPUModelRunner):
                         )
                     )
 
+        carry_recorded = False
+        if carry is not None and not _decode_carry.will_take_fused_draft_path(
+            self, _pending_rejected_sub, seq_lens, cur_input_indices, spec_decode_metadata
+        ):
+            # The early check assumed the fused draft-token path; it is not taken.
+            seq_lens = _upload_seq_pos_ids()
+            carry = None
         if _pending_rejected_sub is not None:
             from vllm_torchtpu.runner.tpu_runner_async_output import (
                 _compiled_subtract_and_substitute_draft_token_ids,
@@ -4959,22 +4995,77 @@ class TPUModelRunner(GPUModelRunner):
                         and spec_decode_metadata.final_logits_indices.shape[0]
                         == self.input_ids.shape[0]
                     ):
-                        (
-                            seq_lens,
-                            self.position_ids,
-                            self.input_ids,
-                            spec_decode_metadata.draft_token_ids,
-                        ) = _compiled_subtract_and_substitute_draft_token_ids(
-                            seq_lens,
-                            self.position_ids,
-                            num_rejected_dev,
-                            seq_idx_dev,
-                            pos_idx_dev,
-                            self.input_ids,
-                            substitution_indices,
-                            self._pre_async_results.next_tokens_tpu,
-                            spec_decode_metadata.final_logits_indices,
-                            spec_decode_metadata.target_logits_indices,
+                        if carry is not None:
+                            from vllm_torchtpu.runner.tpu_runner_async_output import (
+                                _compiled_carry_subtract_and_substitute_draft_token_ids,
+                            )
+
+                            carry_out = (
+                                _compiled_carry_subtract_and_substitute_draft_token_ids(
+                                    seq_lens,
+                                    self.position_ids,
+                                    carry.step_delta,
+                                    num_rejected_dev,
+                                    seq_idx_dev,
+                                    pos_idx_dev,
+                                    self.input_ids,
+                                    substitution_indices,
+                                    self._pre_async_results.next_tokens_tpu,
+                                    spec_decode_metadata.final_logits_indices,
+                                    spec_decode_metadata.target_logits_indices,
+                                )
+                            )
+                            if _decode_carry.CHECK:
+                                ref_seq_lens = _upload_seq_pos_ids()
+                                ref_out = _compiled_subtract_and_substitute_draft_token_ids(
+                                    ref_seq_lens,
+                                    self.position_ids,
+                                    num_rejected_dev,
+                                    seq_idx_dev,
+                                    pos_idx_dev,
+                                    self.input_ids,
+                                    substitution_indices,
+                                    self._pre_async_results.next_tokens_tpu,
+                                    spec_decode_metadata.final_logits_indices,
+                                    spec_decode_metadata.target_logits_indices,
+                                )
+                                _decode_carry.compare(carry_out, ref_out)
+                            (
+                                seq_lens,
+                                self.position_ids,
+                                self.input_ids,
+                                spec_decode_metadata.draft_token_ids,
+                            ) = carry_out
+                        else:
+                            (
+                                seq_lens,
+                                self.position_ids,
+                                self.input_ids,
+                                spec_decode_metadata.draft_token_ids,
+                            ) = _compiled_subtract_and_substitute_draft_token_ids(
+                                seq_lens,
+                                self.position_ids,
+                                num_rejected_dev,
+                                seq_idx_dev,
+                                pos_idx_dev,
+                                self.input_ids,
+                                substitution_indices,
+                                self._pre_async_results.next_tokens_tpu,
+                                spec_decode_metadata.final_logits_indices,
+                                spec_decode_metadata.target_logits_indices,
+                            )
+                        carry_recorded = _decode_carry.record(
+                            self,
+                            start_index=start_index,
+                            num_reqs=num_reqs,
+                            num_scheduled_tokens_per_req_list=num_scheduled_tokens_per_req_list,
+                            total_num_scheduled_tokens=int(total_num_scheduled_tokens),
+                            padded_total_num_scheduled_tokens=int(
+                                padded_total_num_scheduled_tokens
+                            ),
+                            target_num_reqs=target_num_reqs,
+                            sub_pairs=sub_pairs,
+                            seq_lens=seq_lens,
                         )
                     else:
                         (
@@ -5011,6 +5102,8 @@ class TPUModelRunner(GPUModelRunner):
                     pos_idx_dev,
                 )
 
+        if not carry_recorded:
+            _decode_carry.clear(self)
 
         # Default decode layouts keep logits_indices stable for a fixed
         # (num_reqs, padded_num_reqs) bucket. PCP streaming layouts provide
@@ -7635,6 +7728,7 @@ class TPUModelRunner(GPUModelRunner):
                     spec_decode_num_rejected_tokens=spec_num_rejected,
                     num_draft_per_req=num_draft_per_req,
                 )
+                _decode_carry.tag_results(self._pre_async_results)
             else:
                 self._pre_async_results = None
 
