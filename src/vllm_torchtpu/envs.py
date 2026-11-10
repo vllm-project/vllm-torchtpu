@@ -122,6 +122,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_DCP_FINE_PREFIX: bool = False
     VLLM_TPU_QSA_DCP_FINE_PREFIX_SEQ_TAIL: bool = False
     VLLM_TPU_QSA_PREFILL_LEAN: bool = False
+    VLLM_TPU_QSA_PREFILL_VPU: str = ""
     VLLM_TPU_QSA_PREFILL_UNION_WALK: int = 0
     VLLM_TPU_QSA_PREFILL_UNION_MIN_CONTEXT: int = 32768
     VLLM_TPU_QSA_PREFILL_UNION_CAP: int = 12288
@@ -897,6 +898,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # qwen4_exp QSA sparse prefill: skip the FP8 key finite/written guard,
     # which the score mask select already covers (bit-identical output).
     "VLLM_TPU_QSA_PREFILL_LEAN": env_bool("VLLM_TPU_QSA_PREFILL_LEAN"),
+    # qwen4_exp QSA sparse prefill: cut the per-score vector (VPU) work of the
+    # block-sparse kernel's inner loop (block_sparse_gqa_prefill, with or
+    # without DCP). "" / "0" = off; "1" = the default set (mask,qk16,pv16); or
+    # a comma list of: mask (always on: per-segment selection bits, causal and
+    # written guards only on the diagonal KV tile; exact), qk16 (one BF16 QK
+    # MXU pass; exact when the score scale is a power of two), pv16 (BF16
+    # probabilities into the PV dot; bit-identical on v7x, where Mosaic
+    # already runs the FP32 dot as one BF16 pass).
+    # Precedence: VLLM_TPU_QSA_PREFILL_UNION_WALK replaces the block-sparse
+    # kernel where it applies; this flag acts on every remaining call (DCP,
+    # kv_head_offset layers, short contexts, small steps, the union walk's
+    # shared fallback).
+    "VLLM_TPU_QSA_PREFILL_VPU": env_str("VLLM_TPU_QSA_PREFILL_VPU", ""),
     # Qwen4-exp QSA prefill: union-walk attention (qsa_union_dense.
     # union_walk_prefill) with query groups of this many rows (a divisor of 128,
     # at least 8; 0, the default, keeps the block-sparse kernel). Each group of
