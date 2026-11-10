@@ -34,7 +34,7 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import AbstractDevice, AbstractMesh, use_abstract_mesh
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.models.qwen3_5.kernels.gdn import wrapper
+from vllm_torchtpu.models.qwen3_5.kernels.gdn import tiling, wrapper
 
 N_KQ, N_V, D_K, D_V, KERNEL_SIZE = 1, 2, 128, 128, 4
 DIM = 2 * N_KQ * D_K + N_V * D_V
@@ -164,6 +164,19 @@ def test_mode_2_falls_back_below_16_tokens():
     assert all(dtype != jnp.bfloat16 or len(shape) != 2 for shape, dtype in operands)
 
 
+def test_mode_2_falls_back_when_the_tiler_picks_a_short_chunk():
+    """The dynamic tiler can cap the prefill chunk below 8 rows; the 2D rows
+    need a multiple of 8, so the call falls back to f32 rows."""
+    inputs = _verify_window_batch()
+    with (
+        mock.patch.object(envs, "TPU_ENABLE_GDN_DYNAMIC_TILING", True),
+        mock.patch.object(wrapper.tiling, "get_tile_sizes", return_value=(2, 4)),
+    ):
+        operands = _pallas_operands(inputs, 2)
+    assert ((16, 1, DIM), jnp.dtype(jnp.float32)) in operands
+    assert ((16, DIM), jnp.dtype(jnp.bfloat16)) not in operands
+
+
 def test_mode_2_matches_mode_0_on_verify_windows():
     """W=4 verify windows at decode tile 2: bit-identical outputs and states."""
     results = {}
@@ -183,6 +196,80 @@ def test_mode_2_matches_mode_0_on_verify_windows():
 def test_unknown_modes_are_refused():
     with pytest.raises(ValueError, match="bf16_qkv_mode"):
         wrapper.fused_conv1d_gdn.__wrapped__(**_verify_window_batch(), **_kwargs(1, 4))
+
+
+# Qwen3.5-397B GDN heads per rank: (kq heads, v heads) at TP1, TP2 and TP8.
+_LAYOUTS = {"tp1": (16, 64), "tp2": (8, 32), "tp8": (2, 8)}
+
+
+def _shape(n_kq, n_v):
+    dim = 2 * n_kq * D_K + n_v * D_V
+    return dict(
+        n_kq=n_kq,
+        n_v=n_v,
+        d_k=D_K,
+        d_v=D_V,
+        kernel_size=KERNEL_SIZE,
+        num_lanes=128,
+        conv_state_dim_size=dim,
+    )
+
+
+@pytest.mark.parametrize("layout", sorted(_LAYOUTS))
+def test_2d_rows_widen_only_the_prefill_vmem_estimate(layout):
+    """136 bytes per qkv column for a PER_SEQ tile, nothing for BATCHED."""
+    shape = _shape(*_LAYOUTS[layout])
+    dim = shape["conv_state_dim_size"]
+    for is_decode, extra in ((False, dim * 136), (True, 0)):
+        est = [
+            tiling.get_vmem_estimate_bytes(
+                tile_b=1,
+                chunk_sz=1 if is_decode else 64,
+                act_out_bytes=2,
+                rec_state_bytes=2,
+                is_decode=is_decode,
+                qkv_2d=qkv_2d,
+                **shape,
+            )
+            for qkv_2d in (False, True)
+        ]
+        assert est[1] - est[0] == extra
+
+
+@pytest.mark.parametrize("layout", sorted(_LAYOUTS))
+def test_the_tiler_sizes_the_prefill_chunk_with_the_2d_term(layout):
+    """Under a limit between the f32 and 2D estimates of a 128-token chunk,
+    the f32 rows keep 128 and the 2D rows get a smaller chunk that fits."""
+    shape = _shape(*_LAYOUTS[layout])
+
+    def est(chunk, qkv_2d):
+        return tiling.get_vmem_estimate_bytes(
+            tile_b=1,
+            chunk_sz=chunk,
+            act_out_bytes=2,
+            rec_state_bytes=2,
+            is_decode=False,
+            qkv_2d=qkv_2d,
+            **shape,
+        )
+
+    limit = (est(128, False) + est(128, True)) // 2
+    picks = {}
+    for qkv_2d in (False, True):
+        _, picks[qkv_2d] = tiling.get_tile_sizes(
+            batch_size=8192,
+            num_seqs=1,
+            padded_batch_size=8192,
+            act_out_dtype=jnp.dtype(jnp.bfloat16),
+            recurrent_state_dtype=jnp.dtype(jnp.bfloat16),
+            decode_vmem_limit_bytes=limit,
+            mixed_vmem_limit_bytes=limit,
+            qkv_2d=qkv_2d,
+            **shape,
+        )
+    assert picks[False] == 128
+    assert picks[True] < 128
+    assert est(picks[True], True) <= limit
 
 
 @pytest.mark.tpu_test
