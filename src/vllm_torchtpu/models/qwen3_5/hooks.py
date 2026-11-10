@@ -37,8 +37,82 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+# Baseline expert-slot count per EP rank (64 primary + 16 replicated slots)
+# used as the reference point when computing per-rank HBM KV capacity credit.
+_QWEN35_SAFE_KV_SLOTS = 80
+
+
+def _expert_slots_and_layers(model_config, parallel_config) -> tuple[int, int]:
+    """(slots, layers): the expert slots each EP rank holds and the MoE layers
+    that hold them. Main's placement (TPU_EXPERT_PLACEMENT) only permutes
+    experts, so every rank holds num_experts / EP of them in every layer."""
+    text = model_config.hf_text_config
+    ep = int(parallel_config.tensor_parallel_size) * int(
+        parallel_config.data_parallel_size
+    )
+    return int(text.num_experts) // max(ep, 1), int(text.num_hidden_layers)
+
+
+def _expert_slot_kv_credit(model_config, parallel_config) -> tuple[int, object]:
+    """(credit, slots): HBM bytes per device freed (positive) or taken
+    (negative) by the expert placement holding fewer (more) slots per rank
+    than the placement the Qwen3.5 safe_kv budgets were measured with: one FP8
+    expert (gate|up and down, 3 x hidden x moe_intermediate bytes) per slot
+    per placed MoE layer; and the slot count (for logging)."""
+    try:
+        text = model_config.hf_text_config
+        hidden = int(text.hidden_size)
+        inter = int(text.moe_intermediate_size)
+        slots, layers = _expert_slots_and_layers(model_config, parallel_config)
+    except Exception as e:  # noqa: BLE001 - never block startup on the credit
+        logger.warning("expert-slot KV credit unavailable (%s); using 0.", e)
+        return 0, "?"
+    return (_QWEN35_SAFE_KV_SLOTS - slots) * layers * 3 * hidden * inter, slots
+
+
+def _apply_prefix_match_unit(vllm_config: VllmConfig) -> None:
+    cache_config = vllm_config.cache_config
+    if cache_config.prefix_match_unit is None:
+        cache_config.prefix_match_unit = 128
+
+
+def _apply_kv_budget(vllm_config: VllmConfig) -> None:
+    cache_config = vllm_config.cache_config
+    scheduler_config = vllm_config.scheduler_config
+    parallel_config = vllm_config.parallel_config
+    dcp_size = int(getattr(parallel_config, "decode_context_parallel_size", 1) or 1)
+    # Calibrated for 80 expert slots per rank (64 primary + 16 replicated slots)
+    # while reserving ~2.5 GiB of HBM headroom for runtime activations
+    # and program-load scratch buffers under DCP=1 and DCP>1.
+    if dcp_size == 1 and scheduler_config.max_num_seqs > 16:
+        safe_kv = 32_500_000_000
+    else:
+        safe_kv = 33_500_000_000
+    credit, slots = _expert_slot_kv_credit(vllm_config.model_config, parallel_config)
+    safe_kv += credit
+    # Apply the shape-calibrated HBM KV memory budget unless the caller
+    # passed --kv-cache-memory-bytes.
+    requested = cache_config.kv_cache_memory_bytes
+    keep = requested is not None
+    if keep or requested != safe_kv:
+        logger.warning(
+            "Qwen3.5-397B kv_cache_memory_bytes %s: requested %s, "
+            "auto %d (slots=%s, dcp=%d, seqs=%d).",
+            "kept (explicit)" if keep else "set to auto",
+            requested,
+            safe_kv,
+            slots,
+            dcp_size,
+            scheduler_config.max_num_seqs,
+        )
+    if not keep:
+        cache_config.kv_cache_memory_bytes = safe_kv
+
+
 def apply_serving_defaults(vllm_config: VllmConfig) -> None:
     """Fill the Qwen3.5 TPU serving defaults the user did not set."""
+    _apply_prefix_match_unit(vllm_config)
+    _apply_kv_budget(vllm_config)
 
 
 class TPUQwen35MoeConfig(Qwen3_5ForConditionalGenerationConfig):
