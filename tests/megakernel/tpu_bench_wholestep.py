@@ -44,10 +44,15 @@ from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.megakernel import kernel
 from vllm_torchtpu.megakernel.blocks.hc import RESIDUAL_OUT
-from vllm_torchtpu.megakernel.exec_spec import ExecSpec, Tiles
+from vllm_torchtpu.megakernel.exec_spec import DebugOptions, ExecSpec, Tiles
 from vllm_torchtpu.megakernel.models import qwen38
 from vllm_torchtpu.megakernel.wholestep import inputs as wi
 from vllm_torchtpu.megakernel.wholestep.spec import wholestep_spec
+
+
+def _debug() -> DebugOptions:
+    """`MKB_SKIP=comm,experts`: ablate those kernel phases (timing only)."""
+    return DebugOptions(skip=frozenset(os.environ.get("MKB_SKIP", "").split(",")) - {""})
 
 
 def tiles_for(B: int, nbd: int | None, nbe: int | None) -> Tiles:
@@ -95,7 +100,7 @@ def run(
         if (tiny or small)
         else tiles_for(B, nbd, nbe)
     )
-    ex = ExecSpec(R=R, B=B, T=T, ctx=128, tiles=tiles, interpret=tiny)
+    ex = ExecSpec(R=R, B=B, T=T, ctx=128, tiles=tiles, interpret=tiny, debug=_debug())
     spec = wholestep_spec(g, R, L=L, qsa=dict(budget=budget, slots=slots))
     n_pages = -(-(ex.M * (budget + 1) * 4) // 128) + 1
 
@@ -225,7 +230,7 @@ def run_step(
         if small
         else tiles_for(B, None, None)
     )
-    ex = ExecSpec(R=R, B=B, T=T, ctx=128, tiles=tiles)
+    ex = ExecSpec(R=R, B=B, T=T, ctx=128, tiles=tiles, debug=_debug())
     n_pages = 8
 
     Lg = repeat_from or L  # timing at large L: generate one block of layers, repeat it
