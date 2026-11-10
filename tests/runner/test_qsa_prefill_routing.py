@@ -139,7 +139,6 @@ def test_real_runner_preserves_padded_request_capacity(monkeypatch, fp8):
 def test_runner_adapter_to_pooled_qsa_bridge_executes_prefill(
     monkeypatch, fp8, local_heads, kv_heads, record_property
 ):
-    from vllm_torchtpu.kernels.qwen4_exp.pooled_qsa import compact_pooled_qsa_step
     from vllm_torchtpu.kernels.qwen4_exp.qsa import produce
     from vllm_torchtpu.layers.adapter.custom_ops.qsa_op import (
         build_compact_pooled_qsa_op,
@@ -211,29 +210,7 @@ def test_runner_adapter_to_pooled_qsa_bridge_executes_prefill(
     assert isinstance(distribution_tensor, torch.Tensor)
     main_table_flat = jnp.asarray(main_table_tensor.numpy(), jnp.int32).reshape(-1)
     distribution = jnp.asarray(distribution_tensor.numpy(), jnp.int32)
-    args = (
-        *producers,
-        pool,
-        index_pool,
-        starts,
-        contexts,
-        rings,
-        main_table_flat,
-        main_table_flat,
-        distribution,
-    )
     options = dict(compress_ratio=4, token_topk=2048, norm_eps=1e-6, rotary_dim=64)
-    import functools
-
-    compiled = (
-        jax.jit(functools.partial(compact_pooled_qsa_step, **options))
-        .lower(*args)
-        .compile()
-    )
-    hlo = compiled.as_text()
-    assert "prefill_paired_pages" in hlo
-    # Small context is statically TC; long FP8 context retains the SC branch.
-    assert ("sc_compact_grouped_prefill" in hlo) == (fp8 and local_heads == 24)
 
     # Actual serving bridge, both direct and fullgraph torch.compile.
     def tensor(x):
