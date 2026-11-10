@@ -244,6 +244,7 @@ def test_get_output_attaches_spec_logprobs():
     assert out.logprobs.slice_request(2, 1).logprobs[:, 0].tolist() == [-6.0]
 
 
+@pytest.mark.tpu_test
 def test_compiled_async_spec_helpers_match_eager(device):
     if device.type != "tpu":
         pytest.skip("TPU compiled helpers require TPU device")

@@ -10781,7 +10781,7 @@ class TPUModelRunner(GPUModelRunner):
         max_seqs = int(self.scheduler_config.max_num_seqs)
         room = self.max_model_len - P
         n_decode = min(3 if short else max(5, K + 2), max(0, room // (1 + K) - 1))
-        stride = self._spec_warmup_nct_stride()
+        stride = TPUModelRunner._spec_warmup_nct_stride(self)
         # The mixed verify+prefill steps after the decode run advance the
         # batch's requests up to two more steps.
         n_steps = n_decode + (2 if mixed else 0)
@@ -10958,7 +10958,8 @@ class TPUModelRunner(GPUModelRunner):
         (_spec_warmup_num_output_tokens), so vLLM's _update_states never trims
         output_token_ids under the runner's optimistic placeholders.
         """
-        if not self.scheduler_config.async_scheduling:
+        sched = getattr(self, "scheduler_config", None)
+        if sched is None or not sched.async_scheduling:
             return 1
         assert self.speculative_config is not None
         return 1 + self.speculative_config.num_speculative_tokens
@@ -10989,7 +10990,7 @@ class TPUModelRunner(GPUModelRunner):
         # near the prefill.
         room = self.max_model_len - P
         n_dec = min(max(5, K + 2), max(0, room // (1 + K) - 1))
-        stride = self._spec_warmup_nct_stride()
+        stride = TPUModelRunner._spec_warmup_nct_stride(self)
         decode_ncts = [P + t * stride for t in range(n_dec)]
         # Reuse low physical block ids, as in _warmup_spec_batch and vLLM's
         # LIFO reuse of freed blocks, rather than exercising the SC2-sensitive end

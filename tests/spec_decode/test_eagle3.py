@@ -3437,6 +3437,10 @@ def _check_prep_emits_padded_step0_gather_indices(
         requests={},
         num_tokens_paddings=[16, 32, 64, 128],
         _dp_lockstep_enabled=lambda: False,
+        # The runner's input-staging fence (stage_h2d_upload).
+        _unfenced_h2d_sources=[],
+        _registered_h2d_sources=set(),
+        _free_h2d_sources={},
     )
     chunk = _make_chunk(
         input_ids=torch.arange(8, dtype=torch.int32, device=device),
