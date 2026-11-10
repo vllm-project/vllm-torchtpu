@@ -1,6 +1,20 @@
-# SPDX-License-Identifier: Apache-2.0
-"""Prefill-only MTP: the worker strips draft-placeholder rows vLLM padded onto a final prompt token
-(band-A crash: computed 126208, scheduled 2, prompt 126209), prefill-kernel agent."""
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Prefill-only MTP: the worker strips draft-placeholder rows vLLM padded onto a
+final prompt token (a serving crash: computed 126208, scheduled 2, prompt
+126209)."""
+
 import types
 
 import numpy as np
@@ -10,23 +24,35 @@ from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 def _so(num_sched, spec, new=(), cached=None):
     return types.SimpleNamespace(
-        num_scheduled_tokens=dict(num_sched), total_num_scheduled_tokens=sum(num_sched.values()),
-        scheduled_spec_decode_tokens=dict(spec), scheduled_new_reqs=list(new),
-        scheduled_cached_reqs=cached or types.SimpleNamespace(req_ids=[], num_computed_tokens=[]))
+        num_scheduled_tokens=dict(num_sched),
+        total_num_scheduled_tokens=sum(num_sched.values()),
+        scheduled_spec_decode_tokens=dict(spec),
+        scheduled_new_reqs=list(new),
+        scheduled_cached_reqs=cached
+        or types.SimpleNamespace(req_ids=[], num_computed_tokens=[]),
+    )
 
 
 def _runner(prompts=()):
     ids = {r: i for i, (r, _) in enumerate(prompts)}
-    ib = types.SimpleNamespace(req_id_to_index=ids, num_prompt_tokens=np.array([p for _, p in prompts] or [0]))
+    ib = types.SimpleNamespace(
+        req_id_to_index=ids, num_prompt_tokens=np.array([p for _, p in prompts] or [0])
+    )
     return types.SimpleNamespace(input_batch=ib)
 
 
 def _new(rid, computed, prompt_len):
-    return types.SimpleNamespace(req_id=rid, num_computed_tokens=computed, prompt_token_ids=[0] * prompt_len)
+    return types.SimpleNamespace(
+        req_id=rid, num_computed_tokens=computed, prompt_token_ids=[0] * prompt_len
+    )
 
 
 def test_strips_padding_on_new_request():
-    so = _so({"crash": 2, "other": 4096}, {"crash": [-1]}, new=[_new("crash", 126208, 126209), _new("other", 0, 9000)])
+    so = _so(
+        {"crash": 2, "other": 4096},
+        {"crash": [-1]},
+        new=[_new("crash", 126208, 126209), _new("other", 0, 9000)],
+    )
     assert TPUModelRunner._strip_prefill_only_padding(_runner(), so) == 1
     assert so.num_scheduled_tokens == {"crash": 1, "other": 4096}
     assert so.total_num_scheduled_tokens == 4097
@@ -41,7 +67,8 @@ def test_strips_padding_on_resumed_cached_request():
 
 
 def test_leaves_real_drafts_and_in_prompt_steps_alone():
-    # Real draft ids (not placeholders): untouched (the runner's guard still refuses them).
+    # Real draft ids (not placeholders): untouched (the runner's guard still
+    # refuses them).
     so = _so({"a": 2}, {"a": [17]}, new=[_new("a", 126208, 126209)])
     assert TPUModelRunner._strip_prefill_only_padding(_runner(), so) == 0
     # Placeholders but the step stays inside the prompt: untouched.
