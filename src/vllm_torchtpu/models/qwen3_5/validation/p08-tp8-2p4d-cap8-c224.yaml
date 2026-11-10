@@ -136,6 +136,12 @@ legs:
         detok_prompt_tail: true
         tokenize_prefix_cache: true
         tokenize_prefix_cache_max_tokens: 64000000
+      tpu_pp_scheduler:
+        paw_aging_tok_per_s: 3000
+        prefix_aware: true
+        quadratic_cost: true
+      tpu_scheduler:
+        promote_warmest: false
       tpu_worker:
         numa_bind: true
   decode:
