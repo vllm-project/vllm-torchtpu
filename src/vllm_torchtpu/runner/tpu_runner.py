@@ -641,6 +641,128 @@ def _fused_greedy_verify_from_logits(
     )
 
 
+@_static_shape_args
+@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+def _compiled_assemble_spec_rejected_and_read_offsets(
+    next_tokens: torch.Tensor,
+    drafts: torch.Tensor,
+    draft_lengths: torch.Tensor,
+    read_offsets: torch.Tensor,
+    stacked_groups: torch.Tensor,
+    bound: int,
+    max_num_reqs: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused bucketed on-device substitution source assembly + num_rejected +
+    mamba slot read-offset scatter in a single TPU program."""
+    B = next_tokens.shape[0]
+    D = drafts.shape[0]
+    num_valid = (next_tokens != INVALID_TOKEN_ID).sum(dim=1)
+    last_valid_col = num_valid.clamp(min=1) - 1
+    bonus = next_tokens.gather(1, last_valid_col.unsqueeze(1))
+    if D < B:
+        drafts_padded = torch.nn.functional.pad(drafts, (0, 0, 0, B - D))
+    elif D > B:
+        drafts_padded = drafts[:B]
+    else:
+        drafts_padded = drafts
+    src = torch.cat([bonus.to(drafts_padded.dtype), drafts_padded], dim=1).reshape(-1)
+    if src.shape[0] < bound:
+        src = torch.nn.functional.pad(src, (0, bound - src.shape[0]))
+    num_rejected = (draft_lengths - num_valid + 1).clamp(min=0).to(torch.int32)
+    if max_num_reqs > B:
+        num_rejected = torch.nn.functional.pad(num_rejected, (0, max_num_reqs - B))
+
+    if stacked_groups.ndim == 1:
+        stacked_groups = stacked_groups.unsqueeze(0)
+    width = stacked_groups.shape[1]
+    offsets = last_valid_col.to(read_offsets.dtype)
+    if offsets.shape[0] < width:
+        offsets = torch.nn.functional.pad(offsets, (0, width - offsets.shape[0]))
+    elif offsets.shape[0] > width:
+        offsets = offsets[:width]
+    all_indices = stacked_groups.reshape(-1).long()
+    zero = torch.zeros((), dtype=read_offsets.dtype, device=read_offsets.device)
+    all_offsets = torch.where(
+        all_indices != 0,
+        offsets.unsqueeze(0).expand_as(stacked_groups).reshape(-1),
+        zero,
+    )
+    read_offsets.index_put_((all_indices,), all_offsets)
+    return src, num_rejected
+
+
+@_static_shape_args
+@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+def _compiled_assemble_two_chunks_spec_rejected_and_read_offsets(
+    nt0: torch.Tensor,
+    drafts0: torch.Tensor,
+    dl0: torch.Tensor,
+    nt1: torch.Tensor,
+    drafts1: torch.Tensor,
+    dl1: torch.Tensor,
+    read_offsets: torch.Tensor,
+    stacked_groups: torch.Tensor,
+    bound: int,
+    max_num_reqs: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused 2-chunk bucketed on-device substitution source assembly +
+    num_rejected + chunk-0 mamba slot read-offset scatter in one TPU program."""
+    B0 = nt0.shape[0]
+    D0 = drafts0.shape[0]
+    nv0 = (nt0 != INVALID_TOKEN_ID).sum(dim=1)
+    lvc0 = nv0.clamp(min=1) - 1
+    bonus0 = nt0.gather(1, lvc0.unsqueeze(1))
+    if D0 < B0:
+        d0_pad = torch.nn.functional.pad(drafts0, (0, 0, 0, B0 - D0))
+    elif D0 > B0:
+        d0_pad = drafts0[:B0]
+    else:
+        d0_pad = drafts0
+    src0 = torch.cat([bonus0.to(d0_pad.dtype), d0_pad], dim=1).reshape(-1)
+    nr0 = (dl0 - nv0 + 1).clamp(min=0).to(torch.int32)
+
+    B1 = nt1.shape[0]
+    D1 = drafts1.shape[0]
+    nv1 = (nt1 != INVALID_TOKEN_ID).sum(dim=1)
+    lvc1 = nv1.clamp(min=1) - 1
+    bonus1 = nt1.gather(1, lvc1.unsqueeze(1))
+    if D1 < B1:
+        d1_pad = torch.nn.functional.pad(drafts1, (0, 0, 0, B1 - D1))
+    elif D1 > B1:
+        d1_pad = drafts1[:B1]
+    else:
+        d1_pad = drafts1
+    src1 = torch.cat([bonus1.to(d1_pad.dtype), d1_pad], dim=1).reshape(-1)
+    nr1 = (dl1 - nv1 + 1).clamp(min=0).to(torch.int32)
+
+    src = torch.cat([src0, src1], dim=0)
+    if src.shape[0] < bound:
+        src = torch.nn.functional.pad(src, (0, bound - src.shape[0]))
+    num_rejected = torch.cat([nr0, nr1], dim=0)
+    if num_rejected.shape[0] < max_num_reqs:
+        num_rejected = torch.nn.functional.pad(
+            num_rejected, (0, max_num_reqs - num_rejected.shape[0])
+        )
+
+    if stacked_groups.ndim == 1:
+        stacked_groups = stacked_groups.unsqueeze(0)
+    width = stacked_groups.shape[1]
+    offsets = lvc0.to(read_offsets.dtype)
+    if offsets.shape[0] < width:
+        offsets = torch.nn.functional.pad(offsets, (0, width - offsets.shape[0]))
+    elif offsets.shape[0] > width:
+        offsets = offsets[:width]
+    all_indices = stacked_groups.reshape(-1).long()
+    zero = torch.zeros((), dtype=read_offsets.dtype, device=read_offsets.device)
+    all_offsets = torch.where(
+        all_indices != 0,
+        offsets.unsqueeze(0).expand_as(stacked_groups).reshape(-1),
+        zero,
+    )
+    read_offsets.index_put_((all_indices,), all_offsets)
+    return src, num_rejected
+
+
 @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
 def _substitute_placeholder_token(
     input_ids: torch.Tensor,
@@ -3907,7 +4029,25 @@ class TPUModelRunner(GPUModelRunner):
         )
         return scheduler_output, num_decode_reqs, num_windowed_reqs
 
-    def _assemble_async_spec_substitution(self, drafts, next_tokens_per_chunk, state):
+    def _get_zero_draft_lengths(self, b: int) -> torch.Tensor:
+        cache = getattr(self, "_zero_draft_lengths_cache", None)
+        if cache is None:
+            cache = {}
+            self._zero_draft_lengths_cache = cache
+        key = (b, str(self.device))
+        t = cache.get(key)
+        if t is None:
+            t = torch.zeros(b, dtype=torch.int32, device=self.device)
+            cache[key] = t
+        return t
+
+    def _assemble_async_spec_substitution(
+        self,
+        drafts,
+        next_tokens_per_chunk,
+        state,
+        deferred_mamba_indices: list[torch.Tensor] | None = None,
+    ):
         """Async-spec substitution assembler.
 
         From the already-proposed on-device ``drafts`` (the unified eagle3
@@ -3918,6 +4058,8 @@ class TPUModelRunner(GPUModelRunner):
         spec_decode_num_rejected_tokens, num_draft_per_req)``.
         """
         from vllm_torchtpu.runner.tpu_runner_async_output import (
+            _compiled_assemble_spec_and_rejected,
+            _compiled_assemble_two_chunks_spec_and_rejected,
             assemble_spec_next_tokens,
             compute_num_rejected,
         )
@@ -3926,6 +4068,172 @@ class TPUModelRunner(GPUModelRunner):
             "async spec substitution requires the eagle3 drafts proposed "
             "earlier in sample_tokens"
         )
+        drafter = getattr(self, "drafter", None)
+        padded_drafts = getattr(drafter, "_last_padded_drafts_per_chunk", None)
+        if (
+            len(next_tokens_per_chunk) == 1
+            and drafts is getattr(drafter, "_last_propose_device_out", None)
+            and padded_drafts is not None
+            and len(padded_drafts) == 1
+            and getattr(self, "max_num_reqs", None) is not None
+            and next_tokens_per_chunk[0].device.type == "tpu"
+            and padded_drafts[0].shape[0] >= next_tokens_per_chunk[0].shape[0]
+        ):
+            nt_chunk = next_tokens_per_chunk[0]
+            num_reqs = state.num_reqs_list[0]
+            md = state.spec_decode_metadata_list[0]
+            bound = self.max_num_reqs * (
+                1 + self.speculative_config.num_speculative_tokens
+            )
+            dl_dev = (
+                md.draft_lengths
+                if md is not None
+                else self._get_zero_draft_lengths(nt_chunk.shape[0])
+            )
+            if (
+                deferred_mamba_indices is not None
+                and self.mamba_slot_read_offsets is not None
+                and len(deferred_mamba_indices) > 0
+                and "_update_mamba_slot_read_offsets"
+                not in getattr(self, "__dict__", {})
+            ):
+                stacked_groups = _stack_or_single_mamba_groups(deferred_mamba_indices)
+                src_padded, spec_num_rejected = (
+                    _compiled_assemble_spec_rejected_and_read_offsets(
+                        nt_chunk,
+                        padded_drafts[0],
+                        dl_dev,
+                        self.mamba_slot_read_offsets,
+                        stacked_groups,
+                        bound,
+                        self.max_num_reqs,
+                    )
+                )
+            else:
+                if deferred_mamba_indices is not None:
+                    self._update_mamba_slot_read_offsets(
+                        deferred_mamba_indices, nt_chunk, num_reqs
+                    )
+                src_padded, spec_num_rejected = _compiled_assemble_spec_and_rejected(
+                    nt_chunk,
+                    padded_drafts[0],
+                    dl_dev,
+                    bound,
+                    self.max_num_reqs,
+                )
+            num_draft_per_req = (
+                dict(enumerate(md.draft_lengths_cpu[:num_reqs].tolist()))
+                if md is not None
+                else {}
+            )
+            next_token_indices = {r: r for r in range(num_reqs)}
+            return (
+                [src_padded],
+                next_token_indices,
+                spec_num_rejected,
+                num_draft_per_req,
+            )
+        if (
+            len(next_tokens_per_chunk) == 2
+            and drafts is getattr(drafter, "_last_propose_device_out", None)
+            and padded_drafts is not None
+            and len(padded_drafts) == 2
+            and getattr(self, "max_num_reqs", None) is not None
+            and next_tokens_per_chunk[0].device.type == "tpu"
+            and padded_drafts[0].shape[0] >= next_tokens_per_chunk[0].shape[0]
+            and padded_drafts[1].shape[0] >= next_tokens_per_chunk[1].shape[0]
+            and (
+                next_tokens_per_chunk[0].shape[0] + next_tokens_per_chunk[1].shape[0]
+                <= self.max_num_reqs
+            )
+        ):
+            nt0, nt1 = next_tokens_per_chunk[0], next_tokens_per_chunk[1]
+            B0, B1 = nt0.shape[0], nt1.shape[0]
+            nr0, nr1 = state.num_reqs_list[0], state.num_reqs_list[1]
+            md0, md1 = (
+                state.spec_decode_metadata_list[0],
+                state.spec_decode_metadata_list[1],
+            )
+            dl0 = (
+                md0.draft_lengths
+                if md0 is not None
+                else self._get_zero_draft_lengths(B0)
+            )
+            dl1 = (
+                md1.draft_lengths
+                if md1 is not None
+                else self._get_zero_draft_lengths(B1)
+            )
+            bound = self.max_num_reqs * (
+                1 + self.speculative_config.num_speculative_tokens
+            )
+            if (
+                deferred_mamba_indices is not None
+                and self.mamba_slot_read_offsets is not None
+                and len(deferred_mamba_indices) > 0
+                and "_update_mamba_slot_read_offsets"
+                not in getattr(self, "__dict__", {})
+            ):
+                stacked_groups = _stack_or_single_mamba_groups(deferred_mamba_indices)
+                src_padded, spec_num_rejected = (
+                    _compiled_assemble_two_chunks_spec_rejected_and_read_offsets(
+                        nt0,
+                        padded_drafts[0],
+                        dl0,
+                        nt1,
+                        padded_drafts[1],
+                        dl1,
+                        self.mamba_slot_read_offsets,
+                        stacked_groups,
+                        bound,
+                        self.max_num_reqs,
+                    )
+                )
+            else:
+                if deferred_mamba_indices is not None:
+                    self._update_mamba_slot_read_offsets(
+                        deferred_mamba_indices,
+                        nt0,
+                        nr0,
+                    )
+                src_padded, spec_num_rejected = (
+                    _compiled_assemble_two_chunks_spec_and_rejected(
+                        nt0,
+                        padded_drafts[0],
+                        dl0,
+                        nt1,
+                        padded_drafts[1],
+                        dl1,
+                        bound,
+                        self.max_num_reqs,
+                    )
+                )
+            num_draft_per_req: dict[int, int] = {}
+            if md0 is not None:
+                for r, d in enumerate(md0.draft_lengths_cpu[:nr0].tolist()):
+                    num_draft_per_req[r] = d
+            if md1 is not None:
+                for r, d in enumerate(md1.draft_lengths_cpu[:nr1].tolist(), start=nr0):
+                    num_draft_per_req[r] = d
+            next_token_indices: dict[int, int] = {}
+            for r in range(nr0):
+                next_token_indices[r] = r
+            for r in range(nr1):
+                next_token_indices[nr0 + r] = B0 + r
+            return (
+                [src_padded],
+                next_token_indices,
+                spec_num_rejected,
+                num_draft_per_req,
+            )
+
+        if deferred_mamba_indices is not None:
+            self._update_mamba_slot_read_offsets(
+                deferred_mamba_indices,
+                next_tokens_per_chunk[0],
+                state.num_reqs_list[0],
+            )
+
         drafts_per_chunk = self._drafts_per_chunk(drafts, state.num_reqs_list)
         # Bucketed drafters keep the sampler's padded rows (an exact-count slice
         # would compile a program per request count); others keep exact rows.
@@ -4007,6 +4315,37 @@ class TPUModelRunner(GPUModelRunner):
             "async prefill bootstrap requires the eagle3 drafts proposed "
             "earlier in sample_tokens"
         )
+        drafter = getattr(self, "drafter", None)
+        padded_drafts = getattr(drafter, "_last_padded_drafts_per_chunk", None)
+        if (
+            len(combined_selected_tokens) == 1
+            and drafts is getattr(drafter, "_last_propose_device_out", None)
+            and padded_drafts
+            and len(padded_drafts) == 1
+            and padded_drafts[0].shape[0] >= combined_selected_tokens[0].shape[0]
+            and getattr(self, "max_num_reqs", None) is not None
+            and combined_selected_tokens[0].device.type == "tpu"
+        ):
+            from vllm_torchtpu.runner.tpu_runner_async_output import (
+                _compiled_assemble_prefill_bootstrap,
+            )
+
+            n = combined_real_lens[0]
+            sel = combined_selected_tokens[0]
+            d_chunk = padded_drafts[0]
+            k = d_chunk.shape[1]
+            bound = self.max_num_reqs * (1 + k)
+            next_tokens_tpu = _compiled_assemble_prefill_bootstrap(sel, d_chunk, bound)
+            spec_num_rejected = self._get_zero_draft_lengths(self.max_num_reqs)
+            next_token_indices = {r: r for r in range(n)}
+            num_draft_per_req = {r: 0 for r in range(n)}
+            return (
+                [next_tokens_tpu],
+                next_token_indices,
+                spec_num_rejected,
+                num_draft_per_req,
+            )
+
         drafts_per_chunk = self._drafts_per_chunk(drafts, combined_real_lens)
         bucketed = getattr(getattr(self, "drafter", None), "bucketed_drafts", False)
         next_tokens_tpu_chunks: list[torch.Tensor] = []
@@ -6566,12 +6905,23 @@ class TPUModelRunner(GPUModelRunner):
         # Per-chunk device rejection outputs, kept for the async-spec
         # producer below.
         next_tokens_per_chunk: list[torch.Tensor] = []
+        deferred_mamba_indices: list[torch.Tensor] | None = None
         if self.is_pooling_model:
             req_ids = cast(
                 list[str], self.input_batch.req_ids[: self.input_batch.num_reqs]
             )
             self._update_num_xla_graphs("pooling_step")
         elif is_spec_step:
+            can_defer_mamba_offsets = (
+                self.scheduler_config.async_scheduling
+                and len(state.logits_list) == 1
+                and state.spec_decode_metadata_list[0] is not None
+                and self._is_async_drafter
+                and "_assemble_async_spec_substitution"
+                not in getattr(self, "__dict__", {})
+                and "_update_mamba_slot_read_offsets"
+                not in getattr(self, "__dict__", {})
+            )
             cur_start_idx = 0
             all_greedy = self.input_batch.all_greedy
             for logits, num_reqs, md, mamba_indices, boundary_plan in zip(
@@ -6600,10 +6950,24 @@ class TPUModelRunner(GPUModelRunner):
                     combined_selected_tokens.append(next_tokens)
                     combined_selected_tokens_real_lens.append(num_reqs)
                     next_tokens_per_chunk.append(next_tokens)
-                    read_offsets = self._update_mamba_slot_read_offsets(
-                        mamba_indices, next_tokens, num_reqs
-                    )
-                    spec_boundary_state.copy_states(self, boundary_plan, read_offsets)
+                    if (
+                        can_defer_mamba_offsets
+                        and boundary_plan is None
+                        and mamba_indices
+                        and self.mamba_slot_read_offsets is not None
+                        and next_tokens.device.type == "tpu"
+                        and self.mamba_slot_read_offsets.device.type == "tpu"
+                    ):
+                        # No boundary-state copy reads the offsets this step,
+                        # so the async assembly program scatters them.
+                        deferred_mamba_indices = mamba_indices
+                    else:
+                        read_offsets = self._update_mamba_slot_read_offsets(
+                            mamba_indices, next_tokens, num_reqs
+                        )
+                        spec_boundary_state.copy_states(
+                            self, boundary_plan, read_offsets
+                        )
                     if needs_logprobs:
                         # Raw verify logits, one row per draft slot and bonus
                         # slot; each row paired with the token its slot chose.
@@ -7068,14 +7432,27 @@ class TPUModelRunner(GPUModelRunner):
             spec_num_rejected = None
             num_draft_per_req = None
             if is_spec_step:
-                (
-                    next_tokens_tpu_chunks,
-                    next_token_indices,
-                    spec_num_rejected,
-                    num_draft_per_req,
-                ) = self._assemble_async_spec_substitution(
-                    eagle3_drafts, next_tokens_per_chunk, state
-                )
+                if deferred_mamba_indices is not None:
+                    (
+                        next_tokens_tpu_chunks,
+                        next_token_indices,
+                        spec_num_rejected,
+                        num_draft_per_req,
+                    ) = self._assemble_async_spec_substitution(
+                        eagle3_drafts,
+                        next_tokens_per_chunk,
+                        state,
+                        deferred_mamba_indices=deferred_mamba_indices,
+                    )
+                else:
+                    (
+                        next_tokens_tpu_chunks,
+                        next_token_indices,
+                        spec_num_rejected,
+                        num_draft_per_req,
+                    ) = self._assemble_async_spec_substitution(
+                        eagle3_drafts, next_tokens_per_chunk, state
+                    )
             elif self._is_async_drafter and next_tokens_tpu_chunks:
                 # Prefill / pure-non-spec eagle3 bootstrap: the non-spec sampling
                 # branch parked a stride-1 source (sampled token only). Rebuild
@@ -8623,6 +9000,124 @@ class TPUModelRunner(GPUModelRunner):
             self.num_tokens_paddings,
             min(self.max_num_reqs * (k + 1), self.num_tokens_paddings[-1]),
         )
+        from vllm_torchtpu.runner.tpu_runner_async_output import (
+            _compiled_assemble_prefill_bootstrap,
+            _compiled_assemble_spec_and_rejected,
+            _compiled_assemble_two_chunks_spec_and_rejected,
+            _compiled_pad_non_spec_next_tokens,
+            _compiled_subtract_num_rejected_tokens,
+        )
+
+        knr_buckets = {self.num_reqs_max_model_len}
+        if (
+            getattr(self, "most_model_len", None) is not None
+            and getattr(self, "num_reqs_most_model_len", None) is not None
+        ):
+            knr_buckets.add(self.num_reqs_most_model_len)
+        bound = self.max_num_reqs * (1 + k)
+        req_loop_pairs = sorted(
+            {
+                (
+                    self.num_reqs_paddings[
+                        bisect.bisect_left(self.num_reqs_paddings, r)
+                    ],
+                    _get_padded_token_len(
+                        self.num_tokens_paddings,
+                        max(r, self.num_reqs_paddings[0]),
+                    ),
+                )
+                for r in range(1, self.max_num_reqs + 1)
+            }
+            | {
+                (
+                    b,
+                    _get_padded_token_len(self.num_tokens_paddings, b),
+                )
+                for b in self.num_reqs_paddings
+            }
+        )
+        if self.scheduler_config.async_scheduling:
+            with self._precompile_timed("async_spec_assembly"):
+                for num_reqs in self.num_reqs_paddings:
+                    sel_warm = torch.zeros(
+                        (num_reqs, 1), dtype=torch.int64, device=self.device
+                    )
+                    out_pad = _compiled_pad_non_spec_next_tokens(sel_warm, k)
+                    synchronize_tensors((out_pad,))
+                for num_reqs, p in req_loop_pairs:
+                    sel_warm = torch.zeros(
+                        (num_reqs, 1), dtype=torch.int64, device=self.device
+                    )
+                    nt_warm = torch.zeros(
+                        (num_reqs, k + 1), dtype=torch.int32, device=self.device
+                    )
+                    drafts_warm = torch.zeros(
+                        (p, k), dtype=torch.int32, device=self.device
+                    )
+                    out_boot = _compiled_assemble_prefill_bootstrap(
+                        sel_warm, drafts_warm, bound
+                    )
+                    synchronize_tensors((out_boot,))
+                    dl_warm = torch.zeros(
+                        num_reqs, dtype=torch.int32, device=self.device
+                    )
+                    out_asm = _compiled_assemble_spec_and_rejected(
+                        nt_warm, drafts_warm, dl_warm, bound, self.max_num_reqs
+                    )
+                    synchronize_tensors(out_asm)
+                for b0, p0 in req_loop_pairs:
+                    nt0_w = torch.zeros(
+                        (b0, k + 1), dtype=torch.int32, device=self.device
+                    )
+                    d0_w = torch.zeros((p0, k), dtype=torch.int32, device=self.device)
+                    dl0_w = torch.zeros(b0, dtype=torch.int32, device=self.device)
+                    for b1, p1 in req_loop_pairs:
+                        if b0 + b1 > self.max_num_reqs:
+                            continue
+                        nt1_w = torch.zeros(
+                            (b1, k + 1), dtype=torch.int32, device=self.device
+                        )
+                        d1_w = torch.zeros(
+                            (p1, k), dtype=torch.int32, device=self.device
+                        )
+                        dl1_w = torch.zeros(b1, dtype=torch.int32, device=self.device)
+                        out_asm2 = _compiled_assemble_two_chunks_spec_and_rejected(
+                            nt0_w,
+                            d0_w,
+                            dl0_w,
+                            nt1_w,
+                            d1_w,
+                            dl1_w,
+                            bound,
+                            self.max_num_reqs,
+                        )
+                        synchronize_tensors(out_asm2)
+                rej_warm = torch.zeros(
+                    self.max_num_reqs, dtype=torch.int32, device=self.device
+                )
+                for num_tokens in self.num_tokens_paddings:
+                    pos_shape = (3, num_tokens) if self.uses_mrope else (num_tokens,)
+                    pos_warm = torch.zeros(
+                        pos_shape, dtype=torch.int32, device=self.device
+                    )
+                    pos_idx_warm = torch.full(
+                        (num_tokens,), -1, dtype=torch.int32, device=self.device
+                    )
+                    for knr in sorted(knr_buckets):
+                        sl_warm = torch.zeros(
+                            knr, dtype=torch.int32, device=self.device
+                        )
+                        sl_idx_warm = torch.full(
+                            (knr,), -1, dtype=torch.int32, device=self.device
+                        )
+                        out_sub = _compiled_subtract_num_rejected_tokens(
+                            sl_warm,
+                            pos_warm,
+                            rej_warm,
+                            sl_idx_warm,
+                            pos_idx_warm,
+                        )
+                        synchronize_tensors(out_sub)
         # The (padded_logits_length, padded_num_reqs) shapes, in the order
         # the runtime buckets follow.
         pairs = []
@@ -9460,7 +9955,144 @@ class TPUModelRunner(GPUModelRunner):
                 dst = torch.zeros(n, dtype=torch.long).to(offsets.device)
                 _rollback_offsets_seed_compiled(offsets, dst)
                 _rollback_offsets_migrate_compiled(offsets, src, dst)
+                if self.speculative_config is not None:
+                    ckpt = torch.zeros(
+                        (n, self.speculative_config.num_speculative_tokens + 1),
+                        dtype=torch.int32,
+                        device=offsets.device,
+                    )
+                    with torch.no_grad():
+                        out_seed = _spec_seed_and_rollback_compiled(
+                            offsets, src, ckpt, dst
+                        )
+                    synchronize_tensors(out_seed)
                 n *= 4
+            if self.speculative_config is not None:
+                k = self.speculative_config.num_speculative_tokens
+                k_plus_1 = k + 1
+                bound = self.max_num_reqs * k_plus_1
+                num_idx_groups = len(self._mamba_copy_plan) or 1
+                widths = sorted(
+                    {
+                        w
+                        for w in (
+                            *self.num_reqs_paddings,
+                            getattr(self, "num_reqs_max_model_len", None),
+                            getattr(self, "num_reqs_most_model_len", None),
+                        )
+                        if w is not None
+                    }
+                )
+                for width in widths:
+                    if num_idx_groups > 1:
+                        dummy_groups = [
+                            torch.zeros(width, dtype=torch.int32, device=offsets.device)
+                            for _ in range(num_idx_groups)
+                        ]
+                        stacked = _stack_mamba_groups_compiled(*dummy_groups)
+                    else:
+                        stacked = torch.zeros(
+                            width, dtype=torch.int32, device=offsets.device
+                        )
+                    _, _, keep_zero_dev, null = self._read_offset_reset_scratch(
+                        width, offsets.device
+                    )
+                    _reset_read_offsets_compiled(offsets, keep_zero_dev, stacked, null)
+                    _clear_read_offsets_compiled(offsets, stacked)
+                    req_loop_pairs = sorted(
+                        {
+                            (
+                                self.num_reqs_paddings[
+                                    bisect.bisect_left(self.num_reqs_paddings, r)
+                                ],
+                                _get_padded_token_len(
+                                    self.num_tokens_paddings,
+                                    max(r, self.num_reqs_paddings[0]),
+                                ),
+                            )
+                            for r in range(1, self.max_num_reqs + 1)
+                        }
+                        | {
+                            (
+                                b,
+                                _get_padded_token_len(self.num_tokens_paddings, b),
+                            )
+                            for b in self.num_reqs_paddings
+                        }
+                    )
+                    for num_reqs in self.num_reqs_paddings:
+                        if num_reqs > width:
+                            continue
+                        if stacked.shape[-1] == num_reqs:
+                            for tok_dtype in (torch.int32, torch.int64):
+                                dummy_next = torch.full(
+                                    (num_reqs, k_plus_1),
+                                    INVALID_TOKEN_ID,
+                                    dtype=tok_dtype,
+                                    device=offsets.device,
+                                )
+                                _update_read_offsets_verify_compiled(
+                                    offsets, stacked, dummy_next
+                                )
+                    if (
+                        self.scheduler_config.async_scheduling
+                        and self._is_async_drafter
+                    ):
+                        for num_reqs, p in req_loop_pairs:
+                            if num_reqs > width:
+                                continue
+                            nt_warm = torch.full(
+                                (num_reqs, k_plus_1),
+                                INVALID_TOKEN_ID,
+                                dtype=torch.int32,
+                                device=offsets.device,
+                            )
+                            drafts_warm = torch.zeros(
+                                (p, k), dtype=torch.int32, device=offsets.device
+                            )
+                            dl_warm = torch.zeros(
+                                num_reqs, dtype=torch.int32, device=offsets.device
+                            )
+                            out_asm_off = (
+                                _compiled_assemble_spec_rejected_and_read_offsets(
+                                    nt_warm,
+                                    drafts_warm,
+                                    dl_warm,
+                                    offsets,
+                                    stacked,
+                                    bound,
+                                    self.max_num_reqs,
+                                )
+                            )
+                            synchronize_tensors(list(out_asm_off))
+                            for b1, p1 in req_loop_pairs:
+                                if num_reqs + b1 > self.max_num_reqs:
+                                    continue
+                                nt1_warm = torch.full(
+                                    (b1, k_plus_1),
+                                    INVALID_TOKEN_ID,
+                                    dtype=torch.int32,
+                                    device=offsets.device,
+                                )
+                                drafts1_warm = torch.zeros(
+                                    (p1, k), dtype=torch.int32, device=offsets.device
+                                )
+                                dl1_warm = torch.zeros(
+                                    b1, dtype=torch.int32, device=offsets.device
+                                )
+                                out_asm2_off = _compiled_assemble_two_chunks_spec_rejected_and_read_offsets(  # noqa: E501
+                                    nt_warm,
+                                    drafts_warm,
+                                    dl_warm,
+                                    nt1_warm,
+                                    drafts1_warm,
+                                    dl1_warm,
+                                    offsets,
+                                    stacked,
+                                    bound,
+                                    self.max_num_reqs,
+                                )
+                                synchronize_tensors(list(out_asm2_off))
 
     def _precompile_spec_boundary_copies(self) -> None:
         """Run the boundary copies at every entries shape
