@@ -363,6 +363,7 @@ if TYPE_CHECKING:
     VLLM_TPU_SAMPLER_CANDIDATES_ONLY: bool = False
     VLLM_TPU_GDN_MIXED_TILE_POW2: bool = False
     VLLM_TPU_SPEC_BOUNDARY_STATE_COPY: bool = False
+    VLLM_TPU_CANDIDATE_SAMPLING: bool = False
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
     VLLM_TPU_STATIC_POOLER: bool = True
     VLLM_TPU_POOLING_KV_CACHE_TOKENS: int = -1
@@ -2197,6 +2198,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_SPEC_BOUNDARY_STATE_COPY": env_bool(
         "VLLM_TPU_SPEC_BOUNDARY_STATE_COPY"
     ),
+    # Non-greedy MTP verify steps whose requests all keep top_k <= 48 (or are
+    # greedy) keep each rank's LM-head vocab shard instead of all-gathering
+    # the logits: one program takes each shard's 64 largest logits per row,
+    # all-gathers those (64 x TP per row) and runs temperature, top-k/top-p,
+    # the accept test and recovery on them with one uniform per candidate; a
+    # row whose candidates miss a kept token falls back to the gathered
+    # vocabulary in the same program. Same distributions, different draws
+    # (PR #2821 049bb029b). Takes precedence over VLLM_TPU_VERIFY_FUSED and
+    # TPU_SAMPLER_TOPK_CANDIDATES on the steps it serves; logprob, grammar
+    # and all-greedy steps keep their paths.
+    "VLLM_TPU_CANDIDATE_SAMPLING": env_bool("VLLM_TPU_CANDIDATE_SAMPLING"),
     # Chunk the vision encoder over video frames to bound peak VMEM: encode at
     # most this many patches (t*h*w) per vision forward, then concatenate the
     # per-chunk outputs. 0 disables (encode the whole video in one batch).
