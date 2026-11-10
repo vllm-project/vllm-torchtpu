@@ -106,11 +106,6 @@
       "concise_description": "`estimate` may be uninitialized"
     },
     {
-      "path": "src/vllm_torchtpu/kernels/experimental/batched_rpa/kernel.py",
-      "name": "unbound-name",
-      "concise_description": "`m_next` may be uninitialized"
-    },
-    {
       "path": "src/vllm_torchtpu/kernels/experimental/batched_rpa/schedule.py",
       "name": "bad-override",
       "concise_description": "Class member `SmemArrayOfStructs.create_shape_dtype` overrides parent class `SmemWrapper` in an inconsistent manner"
