@@ -1514,6 +1514,27 @@ class TestCompactMambaSlotPool:
         # Padded tail points at the null slot (0).
         assert idx[2] == 0 and idx[3] == 0
 
+    def test_indices_reuse_returns_same_upload_while_slots_repeat(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("VLLM_TPU_MAMBA_INDICES_REUSE", "1")
+        runner = self._make_runner(max_num_reqs=4, mamba_num_blocks=5)
+        runner._init_mamba_slot_pool(5)
+        self._set_batch(runner, ["a", "b"])
+        first = runner._build_mamba_state_indices(0, 2, 4)
+        again = runner._build_mamba_state_indices(0, 2, 4)
+        assert again is first
+        # A new request changes the slot list: fresh upload, same allocator.
+        self._set_batch(runner, ["a", "b", "c"])
+        third = runner._build_mamba_state_indices(0, 3, 4)
+        assert third is not first
+        assert [int(v) for v in third[:2]] == [int(v) for v in first[:2]]
+        assert int(third[2]) not in (0, int(first[0]), int(first[1]))
+        assert int(third[3]) == 0
+        monkeypatch.delenv("VLLM_TPU_MAMBA_INDICES_REUSE")
+        off = runner._build_mamba_state_indices(0, 3, 4)
+        assert off is not third and off.tolist() == third.tolist()
+
     def test_idle_dp_rank_gets_all_null_slots(self):
         """An idle DP rank asks for the coordinated shape with an empty batch.
 
