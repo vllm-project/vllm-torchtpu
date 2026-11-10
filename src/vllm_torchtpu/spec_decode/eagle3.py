@@ -899,6 +899,11 @@ class Eagle3Proposer:
             return False
         # EP-DP lockstep replays a peer's draft trace on idle ranks
         # (run_dp_dummy_draft), which only knows the single pass.
+        # TODO: take the two-pass path under EP-DP lockstep too, the usual
+        # DeepSeek-V3.2 / GLM-5.2 deployment: `_dp_dummy_draft_step` has to
+        # replay pass 1 at the coordinated token bucket and pass 2 at p when
+        # that bucket is at or above the gate, so idle ranks emit the same
+        # collectives as the busy ones.
         if self._dp_lockstep_sharded():
             return False
         # Pass 2 derives its metadata from the target's own step-0 entries;
