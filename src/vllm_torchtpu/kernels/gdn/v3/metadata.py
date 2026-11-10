@@ -98,6 +98,7 @@ def compute_per_seq_metadata(
     end_seq: jax.Array,
     ckpt_indices: jax.Array | None = None,
     prerolled: bool = False,
+    prefill_ckpt: tuple[jax.Array, jax.Array] | None = None,
 ) -> memory_ref.MetadataRef:
     """Metadata for computing single sequence per tile.
 
@@ -110,6 +111,14 @@ def compute_per_seq_metadata(
 
     With `prerolled`, the per-sequence inputs already went through
     `roll_per_seq_inputs` with this `start_seq`.
+
+    `prefill_ckpt` is `(offsets, blocks)`, both `[max_seqs]` and indexed like
+    `seq_lens` (never prerolled): sequence `s` also writes the state after
+    its first `offsets[s]` query tokens to source block `blocks[s]`, an
+    internal prefill checkpoint (VLLM_TPU_MAMBA_TAIL_FOLD). The offset must be
+    a multiple of `cfg.chunk_size`: the tile ending there is marked as a last
+    tile with that block as its destination, and the next tile still resumes
+    from the carry. Offset or block 0 means none.
     """
     max_seqs = seq_lens.size
     max_tokens = cfg.batch_size
@@ -171,6 +180,20 @@ def compute_per_seq_metadata(
     has_initial_state = (seq_lens - query_lens) > 0
     p_id_is_first_tile = p_id_to_t_id == 0
     p_id_is_last_tile = p_id_to_t_id == (s_idx_to_num_tiles[p_id_to_s_idx] - 1)
+    p_id_to_state_override = None
+    if prefill_ckpt is not None:
+        ckpt_offsets, ckpt_blocks = (
+            jnp.roll(x.astype(jnp.int32), shift=-start_seq) for x in prefill_ckpt
+        )
+        tile_offset = ckpt_offsets[p_id_to_s_idx]
+        tile_block = ckpt_blocks[p_id_to_s_idx]
+        is_ckpt_tile = (
+            (tile_offset > 0)
+            & (tile_block > 0)
+            & ((p_id_to_t_id + 1) * cfg.chunk_size == tile_offset)
+        )
+        p_id_is_last_tile = p_id_is_last_tile | is_ckpt_tile
+        p_id_to_state_override = jnp.where(is_ckpt_tile, tile_block, 0)
 
     # NOTE: Since query_lens[i] = 0 where i >= num_seqs, s_idx_to_num_tiles[i]
     # where i >= num_seqs will also be 0. Therefore, s_idx_to_num_tiles.sum()
@@ -189,4 +212,5 @@ def compute_per_seq_metadata(
         s_idx_to_state_indices=state_indices,
         s_idx_to_read_offset=read_offsets,
         s_idx_to_ckpt_indices=ckpt_indices,
+        p_id_to_state_override=p_id_to_state_override,
     )

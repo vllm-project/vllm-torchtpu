@@ -95,6 +95,12 @@ class MetadataRef:
     # kernel writes (see GDNConfig.zero_out_from). None otherwise.
     zero_out_query_start_loc: Any = None
     zero_out_distribution: Any = None
+    # Internal prefill checkpoints (VLLM_TPU_MAMBA_TAIL_FOLD), PER_SEQ only:
+    # per tile, the source block that receives the state after this tile
+    # instead of the sequence's own checkpoint block (0: none). Such a tile
+    # also has `p_id_is_last_tile` set, though its sequence goes on. None
+    # without internal checkpoints.
+    p_id_to_state_override: Any = None
 
     @classmethod
     def create(
@@ -110,6 +116,7 @@ class MetadataRef:
         s_idx_to_state_indices: jax.Array,
         s_idx_to_read_offset: jax.Array,
         s_idx_to_ckpt_indices: jax.Array | None = None,
+        p_id_to_state_override: jax.Array | None = None,
     ):
         # NOTE: First dim does not matter when it comes to calculating stride.
         shape = (1, cfgs.seq_tile_size)
@@ -124,7 +131,19 @@ class MetadataRef:
             s_idx_to_state_indices=s_idx_to_state_indices,
             s_idx_to_read_offset=s_idx_to_read_offset,
             s_idx_to_ckpt_indices=s_idx_to_ckpt_indices,
+            p_id_to_state_override=(
+                None
+                if p_id_to_state_override is None
+                else SmemWrapper(p_id_to_state_override, shape)
+            ),
         )
+
+    def state_override(self, p_id, idx, state_idx):
+        """`state_idx`, or the tile's internal checkpoint block if it has one."""
+        if self.p_id_to_state_override is None:
+            return state_idx
+        override = self.p_id_to_state_override[p_id, idx]
+        return jnp.where(override > 0, override, state_idx)
 
     def __len__(self) -> int:
         return len(jax.tree_util.tree_leaves(self))
@@ -380,7 +399,9 @@ class StateOutBufferedRef(BaseBufferedRef):
         for idx in range(self.cfg.seq_tile_size):
             is_last_tile = self.metadata_ref.p_id_is_last_tile[p_id, idx]
             s_idx = self.metadata_ref.p_id_to_s_idx[p_id, idx]
-            state_idx = self.metadata_ref.s_idx_to_state_indices[s_idx]
+            state_idx = self.metadata_ref.state_override(
+                p_id, idx, self.metadata_ref.s_idx_to_state_indices[s_idx]
+            )
             # Write one checkpoint per valid window position, starting at the
             # group's base slot. `r_size` never exceeds `window_size` for
             # windowed sequences; the clamp is for PER_SEQ tiles, which hold
@@ -583,6 +604,9 @@ class ExternalStateOutBufferedRef(StateOutBufferedRef):
         assert self.sem_sends is not None
         assert self.window_ref is not None
         assert self.compact_output_ref is not None
+        assert self.metadata_ref.p_id_to_state_override is None, (
+            "compact state outputs have no internal prefill checkpoints"
+        )
         slot = self.current_copy_out_slot
         sem = self.sem_sends.at[slot]
         vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
@@ -624,7 +648,9 @@ class ExternalStateOutBufferedRef(StateOutBufferedRef):
             for t in range(self.cfg.window_size):
                 should_write = jnp.logical_and(is_last_tile, t < num_ckpts)
                 nblocks = jnp.where(should_write, self.region.nblocks, 0)
-                state_idx = self._ckpt_state_idx(s_idx, t)
+                state_idx = self.metadata_ref.state_override(
+                    p_id, idx, self._ckpt_state_idx(s_idx, t)
+                )
                 pltpu.make_async_copy(
                     vmem_ref.at[idx, t, pl.ds(0, nblocks)],
                     self._region_slice(dst_ref, state_idx, nblocks),

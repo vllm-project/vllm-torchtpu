@@ -41,6 +41,7 @@ from vllm_torchtpu.block_major_pool import (
     kernel_view,
     unified_block_major_enabled,
 )
+from vllm_torchtpu.core.mamba_tail_fold import prefill_checkpoint_targets
 from vllm_torchtpu.distributed.pcp import (
     get_or_create_pcp_mesh,
     get_pcp_rank,
@@ -204,6 +205,7 @@ def gdn_attention_pooled_core_tpu(
     num_spec_tokens: int = 0,
     conv_weight_kmajor: bool = False,
     step_metadata: tuple[jax.Array, ...] | None = None,
+    prefill_ckpt: tuple[jax.Array, jax.Array] | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     return run_jax_gdn_attention_pooled(
         mixed_qkv,
@@ -232,6 +234,7 @@ def gdn_attention_pooled_core_tpu(
         num_spec_tokens=num_spec_tokens,
         conv_weight_kmajor=conv_weight_kmajor,
         step_metadata=step_metadata,
+        prefill_ckpt=prefill_ckpt,
     )
 
 
@@ -460,6 +463,13 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         )
         self.gdn_op = self._build_gdn_op()
         self.gdn_pooled_op = self._build_pooled_gdn_op(block_major=self._bm_kernel)
+        # VLLM_TPU_MAMBA_TAIL_FOLD: used on steps whose metadata carries
+        # internal prefill checkpoints (core/mamba_tail_fold.py).
+        self.gdn_pooled_ckpt_op = (
+            self._build_pooled_gdn_op(block_major=self._bm_kernel, prefill_ckpt=True)
+            if envs.VLLM_TPU_MAMBA_TAIL_FOLD
+            else None
+        )
         # Block-major state ids are per layer (pool_index), so only the
         # plain unified pool can share one step's metadata across layers.
         self.gdn_pooled_hoisted_op = (
@@ -810,7 +820,15 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         """Keep the ordinary projection input unchanged."""
         return mixed_qkv
 
-    def _build_pooled_gdn_op(self, *, block_major: bool = False, hoisted: bool = False):
+    def _build_pooled_gdn_op(
+        self,
+        *,
+        block_major: bool = False,
+        hoisted: bool = False,
+        prefill_ckpt: bool = False,
+    ):
+        """The pooled GDN op. ``prefill_ckpt``: the variant taking internal
+        prefill checkpoint offsets and blocks (VLLM_TPU_MAMBA_TAIL_FOLD)."""
         vllm_context = get_vllm_model_wrapper_context()
         local_num_v_heads = self.num_v_heads // self.tp_size
         vllm_config = cast(VllmConfig, vllm_context.vllm_config)
@@ -847,6 +865,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             slot_read_offsets,
             ckpt_indices,
             step_metadata=None,
+            prefill_ckpt=None,
         ):
             # Fold the `(num_blocks, rows_per_block, *page)` block-major pool so
             # pool adapters index flat kernel blocks along dim 0; both reshapes
@@ -886,6 +905,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 num_spec_tokens=num_spec_tokens,
                 conv_weight_kmajor=conv_weight_kmajor,
                 step_metadata=step_metadata,
+                prefill_ckpt=prefill_ckpt,
             )
             if not block_major:
                 return result
@@ -974,6 +994,42 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 ),
             )
 
+        def wrapped_ckpt_fn(
+            mixed_qkv: jax.Array,
+            b: jax.Array,
+            a: jax.Array,
+            recurrent_state: jax.Array,
+            conv_weight: jax.Array,
+            conv_bias: jax.Array | None,
+            A_log: jax.Array,
+            dt_bias: jax.Array,
+            state_indices: jax.Array,
+            query_start_loc: jax.Array,
+            distribution: jax.Array,
+            seq_lens: jax.Array,
+            slot_read_offsets: jax.Array | None,
+            ckpt_indices: jax.Array | None,
+            ckpt_offsets: jax.Array,
+            ckpt_blocks: jax.Array,
+        ) -> tuple[jax.Array, jax.Array]:
+            return run(
+                mixed_qkv,
+                b,
+                a,
+                recurrent_state,
+                conv_weight,
+                conv_bias,
+                A_log,
+                dt_bias,
+                state_indices,
+                query_start_loc,
+                distribution,
+                seq_lens,
+                slot_read_offsets,
+                ckpt_indices,
+                prefill_ckpt=(ckpt_offsets, ckpt_blocks),
+            )
+
         def _fake_gdn(mixed_qkv, _b, _a, recurrent_state, *args, **kwargs):
             num_tokens = mixed_qkv.size(0)
             out_shape = (num_tokens, local_num_v_heads, d_v)
@@ -988,17 +1044,23 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             # ~pool-sized update is not double-counted at compile.
             op = pallas.jax_op(
                 op_name,
-                wrapped_hoisted_fn if hoisted else wrapped_fn,
+                wrapped_hoisted_fn
+                if hoisted
+                else wrapped_ckpt_fn
+                if prefill_ckpt
+                else wrapped_fn,
                 donate_argnums=(3,),
             )
             op.register_fake(_fake_gdn)
             return op
 
         if hoisted:
-            assert not block_major
+            assert not block_major and not prefill_ckpt
             kind = "gdn_attention_pooled_hoisted"
         else:
             kind = "gdn_attention_pooled_bm" if block_major else "gdn_attention_pooled"
+            if prefill_ckpt:
+                kind += "_ckpt"
         gdn_jax_op = _get_shared_gdn_op(
             kind,
             (
@@ -1037,8 +1099,9 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         ) -> torch.Tensor:
             # Hoisted: `slot_read_offsets` / `ckpt_indices` are the step's
             # read offsets / int32 checkpoint ids, followed by the rolled
-            # per-sequence inputs (see gdn_step_metadata).
-            assert len(step_metadata) == (5 if hoisted else 0)
+            # per-sequence inputs (see gdn_step_metadata). Checkpoint variant:
+            # followed by the checkpoint offsets and blocks.
+            assert len(step_metadata) == (5 if hoisted else 2 if prefill_ckpt else 0)
             new_rec, outputs = gdn_jax_op(
                 mixed_qkv,
                 b,
@@ -1428,7 +1491,25 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 ckpt_indices = getattr(attn_metadata, "mamba_ckpt_indices", None)
                 step_metadata: tuple[torch.Tensor, ...] = ()
                 pooled_op = self.gdn_pooled_op
-                if (
+                prefill_ckpt = getattr(attn_metadata, "mamba_prefill_ckpt", None)
+                if prefill_ckpt is not None:
+                    assert self.gdn_pooled_ckpt_op is not None, (
+                        "mamba_prefill_ckpt without VLLM_TPU_MAMBA_TAIL_FOLD"
+                    )
+                    ckpt_offsets, ckpt_blocks = prefill_checkpoint_targets(
+                        prefill_ckpt,
+                        attn_metadata.block_tables,
+                        state_indices.shape[0],
+                    )
+                    # Same id space as the state ids (block-major pools).
+                    ckpt_blocks = torch.where(
+                        ckpt_blocks > 0,
+                        self._bm_state_ids(ckpt_blocks),
+                        torch.zeros_like(ckpt_blocks),
+                    )
+                    step_metadata = (ckpt_offsets, ckpt_blocks)
+                    pooled_op = self.gdn_pooled_ckpt_op
+                elif (
                     gdn_step_metadata_cache is not None
                     and self.gdn_pooled_hoisted_op is not None
                     and self.gdn_step_metadata_op is not None

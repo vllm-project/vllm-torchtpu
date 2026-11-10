@@ -462,6 +462,7 @@ def kernel_metadata(
     distribution: jax.Array,
     ckpt_indices: jax.Array | None,
     per_seq_inputs: tuple[jax.Array, ...] | None = None,
+    prefill_ckpt: tuple[jax.Array, jax.Array] | None = None,
 ) -> memory_ref.MetadataRef:
     """The scalar-prefetch metadata of one `fused_conv1d_gdn` kernel call."""
     if cfg.mode != config.GDNMode.PER_SEQ:
@@ -486,6 +487,7 @@ def kernel_metadata(
             end_seq=distribution[-1],
             ckpt_indices=ps_ckpt,
             prerolled=True,
+            prefill_ckpt=prefill_ckpt,
         )
     return metadata.compute_per_seq_metadata(
         cfg=cfg,
@@ -496,6 +498,7 @@ def kernel_metadata(
         start_seq=distribution[0],
         end_seq=distribution[-1],
         ckpt_indices=ckpt_indices,
+        prefill_ckpt=prefill_ckpt,
     )
 
 
@@ -518,6 +521,7 @@ def kernel_metadata(
         "state_plan",
         "attention_mode",
         "gate_lower_bound",
+        "prefill_ckpt_alignment",
     ),
 )
 def fused_conv1d_gdn(
@@ -556,6 +560,8 @@ def fused_conv1d_gdn(
     decode_tile_size: int = 4,
     mixed_tile_size: int = 64,
     per_seq_inputs: tuple[jax.Array, ...] | None = None,
+    prefill_ckpt: tuple[jax.Array, jax.Array] | None = None,
+    prefill_ckpt_alignment: int = 0,
 ) -> tuple[tuple[jax.Array, jax.Array], jax.Array] | tuple[jax.Array, jax.Array]:
     """Perform conv1d and gdn in a single fused kernel.
 
@@ -633,6 +639,13 @@ def fused_conv1d_gdn(
             Ignored when TPU_ENABLE_GDN_DYNAMIC_TILING is set.
         mixed_tile_size: Tile size along token/chunk dimension for prefill/mixed
             sequences. Ignored when TPU_ENABLE_GDN_DYNAMIC_TILING is set.
+        prefill_ckpt: Optional `(offsets, blocks)`, int32 [num_seqs] each:
+            internal prefill checkpoints (VLLM_TPU_MAMBA_TAIL_FOLD). A PER_SEQ
+            sequence also writes its state after its first `offsets[s]` query
+            tokens to checkpoint block `blocks[s]`; 0 means none. See
+            `metadata.compute_per_seq_metadata`.
+        prefill_ckpt_alignment: Every nonzero checkpoint offset is a multiple
+            of this; the PER_SEQ tile must divide it.
 
     Returns:
         (new_conv_state, new_recurrent_state): Updated convolution state cache and
@@ -940,6 +953,19 @@ def fused_conv1d_gdn(
         # Step 6: Metadata preprocessing. Runs once per layer: each layer's
         # op is its own program, so XLA does not share it across layers
         # (pass `per_seq_inputs` to hoist the PER_SEQ roll).
+        ckpt = prefill_ckpt if mode == config.GDNMode.PER_SEQ else None
+        if ckpt is not None:
+            if prefill_ckpt_alignment <= 0:
+                raise ValueError("prefill_ckpt needs a prefill_ckpt_alignment")
+            # A checkpoint needs a query longer than one alignment unit, so
+            # smaller buckets (and their odd tile sizes) never carry one.
+            if padded_batch_size <= prefill_ckpt_alignment:
+                ckpt = None
+            elif prefill_ckpt_alignment % cfg.chunk_size:
+                raise ValueError(
+                    f"GDN prefill tile {cfg.chunk_size} does not divide the "
+                    f"checkpoint alignment {prefill_ckpt_alignment}"
+                )
         metadata_obj = kernel_metadata(
             cfg,
             seq_lens=seq_lens,
@@ -949,6 +975,7 @@ def fused_conv1d_gdn(
             distribution=distribution,
             ckpt_indices=ckpt_indices,
             per_seq_inputs=per_seq_inputs,
+            prefill_ckpt=ckpt,
         )
 
         if cfg.kernel_zero_out:
