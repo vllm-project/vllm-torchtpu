@@ -307,3 +307,38 @@ def test_the_copy_serves_only_the_qwen3_5_moe_architectures():
     assert others
     for architecture in others:
         assert gdn_attention.gdn_kernel_wrapper(architecture) is main_gdn_wrapper
+
+
+def _layer(architecture):
+    return SimpleNamespace(model_config=SimpleNamespace(architecture=architecture))
+
+
+@pytest.mark.parametrize(
+    ("architecture", "views"),
+    [(QWEN, True), ("Qwen3NextForCausalLM", False), (KIMI, False), (None, False)],
+)
+def test_ba_halves_are_views_only_for_the_qwen3_5_moe_architectures(
+    architecture, views
+):
+    """The Qwen3.5 MoE architectures hand the b and a halves to the GDN op as
+    chunk views; every other architecture keeps main's contiguous copies."""
+    import torch
+
+    ba = torch.arange(24, dtype=torch.float32).reshape(3, 8)
+    b, a = gdn_attention_op._split_ba(_layer(architecture), ba)
+    assert torch.equal(b, ba[:, :4]) and torch.equal(a, ba[:, 4:])
+    assert (b.data_ptr() == ba.data_ptr()) is views
+    assert (not b.is_contiguous()) is views
+
+
+def test_ba_split_follows_the_layer_not_the_engine():
+    """The layer's own model config decides, as it does for the kernel."""
+    import torch
+
+    ba = torch.arange(24, dtype=torch.float32).reshape(3, 8)
+    with set_vllm_model_wrapper_context(mesh=None, vllm_config=_vllm_config(KIMI)):
+        b, _ = gdn_attention_op._split_ba(_layer(QWEN), ba)
+    assert b.data_ptr() == ba.data_ptr()
+    with set_vllm_model_wrapper_context(mesh=None, vllm_config=_vllm_config(QWEN)):
+        b, _ = gdn_attention_op._split_ba(_layer(KIMI), ba)
+    assert b.is_contiguous() and b.data_ptr() != ba.data_ptr()
