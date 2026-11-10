@@ -86,6 +86,9 @@ class GDNConfig:
     # qkv streams as 2D bf16 rows [tokens, dim_size] in 16-row aligned DMA
     # windows (fused_conv1d_gdn bf16_qkv_mode=2) rather than f32 rows.
     qkv_2d: bool = False
+    # Token-recurrent GDN computes k S and q S with one dot against the
+    # undecayed state and decays the products (fused_conv1d_gdn fused_1dot).
+    fused_1dot: bool = False
 
     @property
     def conv_hbm_offset(self) -> int:
