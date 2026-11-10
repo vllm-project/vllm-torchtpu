@@ -30,6 +30,7 @@ from tests.models.qwen3_5.test_qwen3_5_hooks import (
 from vllm_torchtpu.distributed import collectives_options
 from vllm_torchtpu.layers.adapter import expert_placement
 from vllm_torchtpu.models import qwen3_5
+from vllm_torchtpu.models.qwen3_5 import hooks
 
 pytestmark = pytest.mark.cpu_test
 
@@ -37,6 +38,14 @@ VALIDATION = pathlib.Path(qwen3_5.__file__).parent / "validation"
 TP8_TABLE = VALIDATION / "expert_placement_tp8_ep8_agentx_corr_c32.json"
 DP8_TABLE = VALIDATION / "expert_placement_dp8_ep8.json"
 POINTS = sorted(VALIDATION.glob("p*.yaml"))
+
+
+@pytest.fixture(autouse=True)
+def _tpu7x(monkeypatch):
+    """The record jobs ran on TPU7x. Where the hook applies the calibrated KV
+    budget only on a TPU7x device, the device reads as TPU7x here too."""
+    if hasattr(hooks, "_chip_family"):
+        monkeypatch.setattr(hooks, "_chip_family", lambda: "7x")
 
 
 @pytest.fixture
