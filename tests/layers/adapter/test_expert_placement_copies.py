@@ -371,6 +371,31 @@ def test_a_placed_layer_is_sized_to_its_primaries_and_copies(tmp_path, monkeypat
     assert manager._expert_map.tolist() == expected
 
 
+@pytest.mark.parametrize("rank", [0, 3, 7])
+def test_a_tp8_layer_is_sized_to_68_slots_with_its_copies(monkeypatch, rank):
+    """The TP8 table: 64 primaries and 4 copies per rank, so a placed layer gets
+    68 local slots and its expert map places the rank's copies in slots
+    64-67."""
+    monkeypatch.setenv("TPU_EXPERT_PLACEMENT", str(TP8_TABLE))
+    placement = ep.current()
+    manager = SimpleNamespace(
+        use_ep=True,
+        ep_size=8,
+        ep_rank=rank,
+        global_num_experts=512,
+        num_fused_shared_experts=0,
+        _local_num_experts=64,
+        _expert_map=torch.arange(512, dtype=torch.int32),
+    )
+    ep._size_copy_slots(manager, "language_model.model.layers.17.mlp.experts")
+    assert manager._local_num_experts == 68
+    held = placement.ranks(17)[rank]
+    expert_map = manager._expert_map.tolist()
+    assert [expert_map[e] for e in held] == list(range(68))
+    assert [expert_map[e] for e in held[64:]] == [64, 65, 66, 67]
+    assert sum(slot >= 0 for slot in expert_map) == 68
+
+
 def test_other_layers_keep_vllms_map(tmp_path, monkeypatch):
     _use(tmp_path, monkeypatch, _copies())
     for prefix in ("model.layers.2.mlp.experts", ""):
