@@ -11,17 +11,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""PyTorch custom operator wrapper for the low-latency Pallas ICI all-reduce kernel.
-"""
+"""PyTorch custom operator wrapper for the low-latency Pallas ICI all-reduce kernel."""
 
 import contextlib
+from typing import Any
 
 import jax
 import torch
 from jax.sharding import PartitionSpec
 
-from vllm_torchtpu import envs
 from vllm_torchtpu.compilation import shape_variants
+from vllm_torchtpu.distributed import collectives_options
 from vllm_torchtpu.distributed.ep_mesh import (
     EP_AXIS_NAME,
     build_ep_mesh,
@@ -40,8 +40,7 @@ logger = init_logger(__name__)
 
 # Largest TP all-reduce, in rows, the kernel takes: at H=4096 bf16 on 8 cores
 # 2-stage hierarchical all-reduce beats XLA through 128 rows (j-c8c95322).
-# Configurable via TPU_SMALL_ALL_REDUCE_MAX_ROWS (default 128).
-MAX_ROWS = envs.TPU_SMALL_ALL_REDUCE_MAX_ROWS
+MAX_ROWS = 128
 # Largest DP combine, in rows per engine, the reduce-scatter takes: measured
 # crossover between 40 and 48 (j-a8d66cde, j-e6f25e61, j-de6349e8). The win
 # relies on XLA lowering psum_scatter to a full all-reduce when rows per engine
@@ -131,19 +130,20 @@ def _build_reduce_scatter(mesh):
     )
 
 
-def prebuild() -> None:
+def prebuild(vllm_config: Any) -> None:
     """Build the ops and this core's rank tensor, outside any traced region:
-    the mesh comes from a collective. A no-op unless TPU_SMALL_ALL_REDUCE."""
-    global _AR_OP, _RS_OP, _RANK, _CORES, _MESH_RANKS, _DP_COMBINE, MAX_ROWS
-    MAX_ROWS = envs.TPU_SMALL_ALL_REDUCE_MAX_ROWS
-    if not envs.TPU_SMALL_ALL_REDUCE or _AR_OP is not None:
+    the mesh comes from a collective. A no-op unless the
+    ``tpu_collectives.small_all_reduce`` option is on (it is off by default,
+    see ``distributed/collectives_options.py``)."""
+    global _AR_OP, _RS_OP, _RANK, _CORES, _MESH_RANKS, _DP_COMBINE
+    if _AR_OP is not None or not collectives_options.get(vllm_config).small_all_reduce:
         return
     mesh = build_ep_mesh()
     if mesh is None:
         raise NotImplementedError(
-            "TPU_SMALL_ALL_REDUCE=1 builds its kernels over the expert-parallel "
-            "mesh, and this deployment has no expert-parallel group (a dense "
-            "model or one core). Unset TPU_SMALL_ALL_REDUCE."
+            "tpu_collectives.small_all_reduce builds its kernels over the "
+            "expert-parallel mesh, and this deployment has no expert-parallel "
+            "group (a dense model or one core). Turn the option off."
         )
     from vllm.distributed.parallel_state import get_dp_group, get_tp_group
 
