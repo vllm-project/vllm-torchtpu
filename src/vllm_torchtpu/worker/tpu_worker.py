@@ -18,6 +18,7 @@ import vllm_torchtpu.env_override  # noqa: F401  # isort: skip
 
 import ctypes
 import os
+import sys
 import time
 from typing import Any, cast
 from urllib.parse import urlparse
@@ -798,6 +799,10 @@ class TPUWorker(WorkerBase):
             set_torch_threads_for_runtime()
         self.model_runner.capture_model()
         compilation_time = time.perf_counter() - start
+        # Debug only (minimax_msa_dump_keys): save MSA selections from here on.
+        keys_dump = sys.modules.get("vllm_torchtpu.models.minimax_m3.keys_dump")
+        if keys_dump is not None:
+            keys_dump.arm()
         self.compilation_config.compilation_time = compilation_time
         set_torch_threads_for_runtime()
         # torch records every compile artifact for save_cache_artifacts(), which

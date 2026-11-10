@@ -18,9 +18,10 @@ With ``--additional-config '{"minimax_msa_dump_keys": <layer>}'`` the DCP MSA
 op of that layer copies this rank's selected page keys into a device buffer
 (`attention.MiniMaxM3SparseAttention.keys_dump`); `maybe_dump` runs after a
 forward, outside the compiled graph, and saves the buffer for the first
-`MAX_DUMPS` prefill forwards (more than `SMALL_BATCH_TOKENS` tokens) of the
-ranks in `DUMP_RANKS`. Each file holds ``packed [T, 3 + G * topk]`` int32
-(local_key, pos, valid, keys; ``-1`` = not held on this rank).
+`MAX_DUMPS` of every `STRIDE`-th served prefill forward (more than
+`SMALL_BATCH_TOKENS` tokens, after `arm`) of the ranks in `DUMP_RANKS`.
+Each file holds ``packed [T, 3 + G * topk]`` int32 (local_key, pos, valid,
+keys; ``-1`` = not held on this rank).
 """
 
 import logging
@@ -32,6 +33,8 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 MAX_DUMPS = int(os.environ.get("MINIMAX_MSA_DUMP_MAX", "40"))
+# Save every STRIDE-th served prefill forward, to sample the whole run.
+STRIDE = int(os.environ.get("MINIMAX_MSA_DUMP_STRIDE", "10"))
 DUMP_RANKS = tuple(
     int(r) for r in os.environ.get("MINIMAX_MSA_DUMP_RANKS", "0,3").split(",")
 )
@@ -40,7 +43,20 @@ SMALL_BATCH_TOKENS = 1024  # msa_attention.SMALL_BATCH_TOKENS
 # Attention modules holding a keys-dump buffer (registered at init).
 LAYERS: list[Any] = []
 
-_state = {"dumps": 0, "forwards": 0, "rank": None, "dir": None}
+_state = {
+    "dumps": 0,
+    "forwards": 0,
+    "prefills": 0,
+    "armed": False,
+    "rank": None,
+    "dir": None,
+}
+
+
+def arm() -> None:
+    """Start saving: called once warm-up is over, so its dummy requests are
+    never saved."""
+    _state["armed"] = True
 
 
 def _rank() -> int:
@@ -67,10 +83,13 @@ def maybe_dump(
     num_tokens_padded: int, num_reqs: int, extra: dict | None = None
 ) -> None:
     """Save the dump buffers after a real (served) forward."""
-    if not LAYERS:
+    if not LAYERS or not _state["armed"]:
         return
     _state["forwards"] += 1
     if _state["dumps"] >= MAX_DUMPS or num_tokens_padded <= SMALL_BATCH_TOKENS:
+        return
+    _state["prefills"] += 1
+    if (_state["prefills"] - 1) % STRIDE:
         return
     rank = _rank()
     if rank not in DUMP_RANKS:
@@ -88,6 +107,7 @@ def maybe_dump(
             num_tokens_padded=np.int64(num_tokens_padded),
             num_reqs=np.int64(num_reqs),
             forward_index=np.int64(_state["forwards"]),
+            prefill_index=np.int64(_state["prefills"]),
             rank=np.int64(rank),
             dcp_rank=np.int64(layer.dump_dcp_rank),
             layer=layer.dump_layer_prefix,
