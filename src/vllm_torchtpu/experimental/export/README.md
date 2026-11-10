@@ -106,12 +106,26 @@ tokens; the artifact keeps its own draft count). Each window slot costs one more
 recurrent state per request. Whenever these windows span more than one token
 (`--speculative-config`, or `--max-verify-tokens` above 1), `req_dist` grows
 from 3 to 6 int32 elements: the first three are the attention kernel's request
-distribution, as without windows, and the last three are the recurrent kernels'
-distribution, in which a request's verify window counts as one windowed
-segment rather than as a mixed sequence. Without windows `req_dist` keeps its 3
-elements. These layers keep this per-layer layout rather than vLLM's unified KV
+distribution (see [Attention request distribution](#attention-request-distribution)),
+and the last three are the recurrent kernels' distribution, in which a
+request's verify window counts as one windowed segment. Without windows
+`req_dist` keeps its 3 elements. These layers keep this per-layer layout rather than vLLM's unified KV
 block pool, and the export runs with prefix caching off. The recurrent state
 bytes come off the KV budget before it is divided among KV blocks.
+
+### Attention request distribution
+
+The first three `req_dist` elements are the attention kernel's request
+distribution. Its decode segment takes every leading request whose query is at
+most `serving_config.attention_decode_query_size` tokens, single-token decodes
+and verify windows alike; longer queries and prefill chunks fall in the mixed
+segment. `attention_decode_query_size` is the width the TPU runner gives
+`reorder_batch_threshold`: the narrowest decode stage of the model's Pallas
+attention layers, target and draft. With `--attention-backend CUSTOM` and
+`--speculative-config` of `K` tokens the batched kernel decodes `K + 1` tokens
+(for head sizes other than 64), so it is `K + 1` unless a draft layer runs the
+1-token local kernel of a tp=1 draft. Otherwise, and for models without Pallas
+attention layers, it is 1.
 
 ### MTP drafting
 

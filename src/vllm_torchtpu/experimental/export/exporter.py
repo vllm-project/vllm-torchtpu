@@ -393,8 +393,13 @@ def _io_entry(
 
 def _req_dist_len(model: api.ExportableTextOnlyLLM) -> int:
     """Elements of `req_dist`: 3 for the attention kernel, and 3 more for the
-    recurrent kernels of a speculating recurrent model, whose windowed segment
-    also takes the verify windows that attention runs as mixed sequences."""
+    recurrent kernels of a speculating recurrent model.
+
+    The attention kernel's decode segment takes every leading request whose
+    query is at most `attention_decode_query_size` tokens, single-token decodes
+    and verify windows alike; longer queries and prefill chunks are mixed. The
+    recurrent kernels' windowed segment takes each verify window as one
+    segment."""
     recurrent = any(n == "mamba_state_indices" for n, _ in _extra_user_inputs(model))
     return 6 if recurrent and model.export_config.recurrent_window > 1 else 3
 
