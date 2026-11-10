@@ -164,7 +164,12 @@ class Module:
         raw_outputs: dict[str, Any],
     ) -> dict[str, Any]:
         """Host-side state update inside `shard_map` after `pallas_call` returns."""
-        return {}
+        del pos, states
+        return {
+            od.name: raw_outputs[od.name]
+            for od in self.outputs(g, ex)
+            if od.name in raw_outputs
+        }
 
     @classmethod
     def _validate_options(cls, options: Mapping[str, Any]) -> None:
@@ -266,8 +271,51 @@ class Module:
     def cache_decl(self, g: Any = None) -> KVCacheDecl | RecurrentCacheDecl | None:
         return None
 
+    def with_cache_layout(self, layout: Any) -> Module:
+        """Return this module bound to `layout` (identity by default)."""
+        del layout
+        return self
+
+    def init_logical_states(
+        self, key: Any, g: Any, ex: ExecSpec, n_layers: int
+    ) -> dict[str, Any]:
+        """Return initial unfolded logical state arrays (`[R, n_layers, ...]`)."""
+        del key, g, ex, n_layers
+        return {}
+
+    def pack_logical_states(
+        self, logical_states: Mapping[str, Any], g: Any, ex: ExecSpec
+    ) -> dict[str, Any]:
+        """Pack logical state arrays into rank-folded kernel state layout."""
+        del logical_states, g, ex
+        return {}
+
+    def unpack_kernel_states(
+        self, raw_states: Mapping[str, Any], g: Any, ex: ExecSpec
+    ) -> dict[str, Any]:
+        """Unpack rank-folded kernel state outputs into `[R, ...]` reference states."""
+        del raw_states, g, ex
+        return {}
+
+    def next_logical_states(
+        self, out_states: Mapping[str, Any], g: Any, ex: ExecSpec
+    ) -> dict[str, Any]:
+        """Extract next-step unfolded logical states (`[R, n_layers, NS, ...]`)."""
+        del out_states, g, ex
+        return {}
+
     def reference(self, *args: Any, **kwargs: Any) -> Any:
         raise NotImplementedError(f"{type(self).__name__}.reference is not implemented")
+
+    @property
+    def has_reference(self) -> bool:
+        """Return True if this module overrides `Module.reference`."""
+        return type(self).reference is not Module.reference
+
+    @property
+    def has_hf_params(self) -> bool:
+        """Return True if this module overrides `Module.hf_params`."""
+        return type(self).hf_params is not Module.hf_params
 
 
 __all__ = ["Module"]
