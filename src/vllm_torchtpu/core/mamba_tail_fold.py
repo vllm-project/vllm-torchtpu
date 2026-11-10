@@ -87,6 +87,39 @@ def fold_unit(block_size: int) -> int:
     return unit
 
 
+_DCP_LOGGED: set[str] = set()
+
+
+def fold_blocked_by_context_parallel(cfg, main_kv_dcp: int) -> str | None:
+    """Why the fold must stay off for this deployment (None: allowed).
+
+    Any context parallelism turns it off: vLLM DCP / PCP, or the Qwen4Exp
+    main-KV DCP (``VLLM_TPU_QSA_MAIN_KV_DCP``). Under main-KV DCP the
+    scheduler block is ``dcp x`` the Mamba block, so the scheduler guard
+    rejects the geometry, but the worker still saw checkpoint-carrying specs
+    and ran the fold's metadata path (za5 c48 j-5378b21d). Leaving the
+    checkpoint off the specs keeps both sides off consistently. Logged once
+    per reason and process.
+    """
+    p = getattr(cfg, "parallel_config", None)
+    reason = None
+    if main_kv_dcp > 1:
+        reason = f"VLLM_TPU_QSA_MAIN_KV_DCP={main_kv_dcp}"
+    elif int(getattr(p, "decode_context_parallel_size", 1) or 1) > 1:
+        reason = f"decode_context_parallel_size={p.decode_context_parallel_size}"
+    elif int(getattr(p, "prefill_context_parallel_size", 1) or 1) > 1:
+        reason = f"prefill_context_parallel_size={p.prefill_context_parallel_size}"
+    if reason is not None and reason not in _DCP_LOGGED:
+        _DCP_LOGGED.add(reason)
+        logger.warning(
+            "VLLM_TPU_MAMBA_TAIL_FOLD: disabled, %s (context parallelism); the "
+            "Mamba specs carry no prefill checkpoint block and prefills keep "
+            "the block-aligned tail split.",
+            reason,
+        )
+    return reason
+
+
 def with_prefill_checkpoint(spec):
     """``spec`` with one internal prefill checkpoint block per request.
 
