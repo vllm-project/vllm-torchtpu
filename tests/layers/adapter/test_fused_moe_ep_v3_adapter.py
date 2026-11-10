@@ -96,6 +96,25 @@ def test_tensor_parallel_gate_is_checked_at_the_first_sliced_bucket(
     v3.check_kernel_threshold(ep=8, tp=8, lowtok_cap=448)
 
 
+@pytest.mark.parametrize("layout", [(1, 8), (4, 2)])
+def test_a_model_that_follows_the_step_form_meets_the_few_token_kernel(
+    groups, monkeypatch, layout
+):
+    """With the threshold at 0 (no model follows each step's form) the fused
+    kernel and the few-token kernel (448-row cap) leave rows to neither under
+    TP; once the Qwen3.5 model patch follows the form, the per-layout
+    thresholds (512 at TP8, 64 at DP4 x TP2) meet the step gates (33, 32)."""
+    from vllm_torchtpu.layers.adapter import sequence_parallel
+
+    groups(*layout)
+    dp, tp = layout
+    monkeypatch.setattr(sequence_parallel, "_FOLLOWS_STEP_FORM", False)
+    with pytest.raises(ValueError):
+        v3.check_kernel_threshold(ep=dp * tp, tp=tp, lowtok_cap=448)
+    sequence_parallel.follow_step_form()
+    v3.check_kernel_threshold(ep=dp * tp, tp=tp, lowtok_cap=448)
+
+
 def _layer(slots, primaries=None, hidden=128, inter=256):
     layer = SimpleNamespace(
         w13_weight=torch.zeros(slots, hidden, 2 * inter, dtype=torch.float8_e4m3fn),
