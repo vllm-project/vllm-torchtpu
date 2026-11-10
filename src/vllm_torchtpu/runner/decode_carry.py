@@ -75,8 +75,24 @@ def clear(runner: Any) -> None:
     runner.__dict__["_decode_carry_state"] = None
 
 
+# VLLM_TPU_T3_CARRY_FAST (IX track 3; default: the VLLM_TPU_T3_HOST master
+# switch): read the mrope position buffer through a cached numpy view of the
+# whole CPU tensor instead of a torch slice per call. Same values, same dtype.
+_T3_FAST = os.environ.get(
+    "VLLM_TPU_T3_CARRY_FAST", os.environ.get("VLLM_TPU_T3_HOST", "0")
+).strip() == "1"
+
+
 def _host_positions(runner: Any, total: int) -> np.ndarray:
     if runner.uses_mrope:
+        if _T3_FAST:
+            cpu = runner.mrope_positions.cpu
+            cached = runner.__dict__.get("_t3_mrope_np")
+            key = (id(cpu), cpu.data_ptr(), tuple(cpu.shape), cpu.dtype)
+            if cached is None or cached[0] != key:
+                cached = (key, cpu.numpy())
+                runner.__dict__["_t3_mrope_np"] = cached
+            return np.asarray(cached[1][:, :total], dtype=np.int64)
         return np.asarray(runner.mrope_positions.cpu[:, :total].numpy(), dtype=np.int64)
     return np.asarray(runner.positions_np[:total], dtype=np.int64)
 
