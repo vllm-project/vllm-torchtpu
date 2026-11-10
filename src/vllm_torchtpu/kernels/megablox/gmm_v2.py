@@ -155,6 +155,12 @@ FP8_RHS_MAX_BUCKET_M = 48
 # Decode tile_m on the fp8 rhs feed (replaces tile_m 64): on tpu7x, rows up to
 # it cost no more than one row.
 FP8_RHS_TILE_M = 32
+# Decode buffers past FP8_RHS_TILE_M hold few rows per local expert (EP leaves
+# each core ~1/EP of size_m), so tiles keep the fp8 feed for small groups and
+# one bf16 bucket for the rest: bf16 rows are free until the weight push stops
+# binding, so finer bf16 buckets would only grow the program.
+FP8_DECODE_TILE_M = 128
+FP8_DECODE_BUCKETS = (16, 32, 48, FP8_DECODE_TILE_M)
 
 # Define data classes.
 
@@ -235,6 +241,16 @@ class TileSizes:
     tile_k: int
     tile_n: int
     bucket_base: int
+    # Ascending row counts a tile's matmul is compiled for, ending at tile_m;
+    # empty means the multiples of bucket_base.
+    buckets: tuple[int, ...] = ()
+
+    @property
+    def bucket_sizes(self) -> tuple[int, ...]:
+        if self.buckets:
+            return self.buckets
+        num = self.tile_m // self.bucket_base
+        return tuple(self.bucket_base * (i + 1) for i in range(num))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -658,8 +674,10 @@ def inner_kernel(
         else:
             acc_ref[:acc_m] = acc
 
+    bucket_sizes = cfgs.tiles.bucket_sizes
+
     def run_matmul_step(bucket_idx: int):
-        bucket_m = cfgs.tiles.bucket_base * (bucket_idx + 1)
+        bucket_m = bucket_sizes[bucket_idx]
 
         @jax.named_scope(f"bm{bucket_m}_first_last")
         def matmul_first_last():
@@ -692,11 +710,17 @@ def inner_kernel(
             # partial m is only invoked at last matmul.
             lax.cond(is_first_k_step, matmul_first_last, matmul_last)
 
-    branches = []
-    for bucket_idx in range(cfgs.tiles.tile_m // cfgs.tiles.bucket_base):
-        branches.append(functools.partial(run_matmul_step, bucket_idx=bucket_idx))
+    branches = [
+        functools.partial(run_matmul_step, bucket_idx=i)
+        for i in range(len(bucket_sizes))
+    ]
     # Smallest bucket covering rows [0, m_end_local); m_end_local >= 1.
-    bucket_idx = (m_end_local - 1) // cfgs.tiles.bucket_base
+    if cfgs.tiles.buckets:
+        bucket_idx = sum(
+            (m_end_local > b).astype(jnp.int32) for b in bucket_sizes[:-1]
+        )
+    else:
+        bucket_idx = (m_end_local - 1) // cfgs.tiles.bucket_base
     lax.switch(bucket_idx, branches)
 
 
@@ -1258,6 +1282,24 @@ def calculate_tiling(
             break
         tile_m = new_tile_m
 
+    # Decode-sized buffer (a group holding all of size_m / size_group rows fits
+    # one tile): keep small groups on the fp8 feed instead of a >= 64-row
+    # bf16 bucket. Partial buckets assume a single k tile (run_matmul_step).
+    if (
+        tile_m > bucket_base
+        and tile_m >= FP8_DECODE_TILE_M
+        and dims.size_m <= FP8_DECODE_TILE_M * dims.size_group
+        and num_k_tiles == 1
+        and fp8_rhs_feed_dtype(lhs_cfgs, rhs_cfgs) is not None
+    ):
+        return TileSizes(
+            tile_m=FP8_DECODE_TILE_M,
+            tile_k=tile_k,
+            tile_n=tile_n,
+            bucket_base=FP8_DECODE_BUCKETS[0],
+            buckets=FP8_DECODE_BUCKETS,
+        )
+
     # A small-size_m tile_m that did not grow makes every group pay for tile_m
     # rows, and rows cost MXU time on the fp8 rhs feed: use fp8-sized tiles in
     # two buckets. Two such tiles cost what one bf16 tile does, and more
@@ -1679,6 +1721,15 @@ _HAS_PIPELINE_PREFETCH = "prefetched_count" in {
 } and hasattr(pltpu, "emit_pipeline_with_allocations")
 
 
+def _decode_tiles(cfgs: GmmConfigs) -> bool:
+    """Decode-sized tiles whose smallest bucket takes the fp8 rhs feed."""
+    tiles = cfgs.tiles
+    return (
+        tiles.tile_m <= FP8_DECODE_TILE_M
+        and cfgs.fp8_rhs_dtype(tiles.bucket_sizes[0]) is not None
+    )
+
+
 def _mlp_fusable(cfgs1: GmmConfigs, cfgs2: GmmConfigs, vmem_limit_bytes: int) -> bool:
     """Whether kernel_mlp can run both gmms on one fill_metadata layout."""
 
@@ -1713,10 +1764,10 @@ def _mlp_fusable(cfgs1: GmmConfigs, cfgs2: GmmConfigs, vmem_limit_bytes: int) ->
     return (
         fits
         and
-        # Decode-sized (fp8 rhs feed) tiles only: the fused program holds both
-        # gmms' bucket bodies, and large ones would bloat it.
-        cfgs1.fp8_rhs_dtype(cfgs1.tiles.tile_m) is not None
-        and cfgs2.fp8_rhs_dtype(cfgs2.tiles.tile_m) is not None
+        # Decode-sized tiles only: the fused program holds both gmms' bucket
+        # bodies, and large ones would bloat it.
+        _decode_tiles(cfgs1)
+        and _decode_tiles(cfgs2)
         and not cfgs1.zero_init
         and not cfgs2.zero_init
         and cfgs1.tiles.tile_m == cfgs2.tiles.tile_m
