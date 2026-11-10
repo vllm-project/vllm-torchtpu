@@ -1849,6 +1849,40 @@ class TestOffloadConnectorOptions(unittest.TestCase):
         self.assertEqual(unset._max_async_load_reqs, 0)
         self.assertEqual(capped._max_async_load_reqs, 16)
 
+    def test_worker_reads_fence_after_draft_off_by_default(self):
+        from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorRole
+        from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+            KVConnectorBase_V1,
+        )
+
+        from vllm_torchtpu.offload import raiden_connector
+
+        def worker_connector(extra_config):
+            spec = SimpleNamespace(extra_config=extra_config)
+            with (
+                patch.object(KVConnectorBase_V1, "__init__", lambda *args: None),
+                patch.object(
+                    raiden_connector.offloading_config_module,
+                    "build_offloading_config",
+                ),
+                patch.object(
+                    raiden_connector,
+                    "TPURaidenStoreOffloadingSpec",
+                    return_value=spec,
+                ),
+                patch.object(raiden_connector, "OffloadingConnectorWorker"),
+                # The connector pins RAIDEN_DISABLE_SINGLETON_WORKER in os.environ.
+                patch.dict(os.environ),
+            ):
+                return raiden_connector.TPURaidenOffloadingConnector(
+                    None, KVConnectorRole.WORKER, None
+                )
+
+        self.assertIs(worker_connector({})._fence_after_draft, False)
+        self.assertIs(
+            worker_connector({"fence_after_draft": True})._fence_after_draft, True
+        )
+
     def test_no_cap_by_default(self):
         self.assertEqual(self._capped(0), ((8, True), True))
 
