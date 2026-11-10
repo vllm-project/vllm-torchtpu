@@ -5753,8 +5753,8 @@ class TPUModelRunner(GPUModelRunner):
 
             pallas_all_reduce.arm(self.model_config.get_hidden_size(), self.device)
 
-            # One small-AR path at a time: the env path (annyan's, at the
-            # device communicator) replaces additional_config
+            # One small-AR path at a time: the env path (at the device
+            # communicator) replaces additional_config
             # tp_small_all_reduce (at GroupCoordinator.all_reduce).
             additional = self.vllm_config.additional_config
             if isinstance(additional, dict) and additional.get(
