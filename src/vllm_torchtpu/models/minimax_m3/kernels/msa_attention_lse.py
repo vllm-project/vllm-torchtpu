@@ -65,6 +65,7 @@ def _kernel(
     block_start_ref=None,
     tiles_per_step: int = 1,
     groups_per_tile: int = 1,
+    transposed: bool = False,
 ):
     """`msa_attention._kernel_v2` that also writes ``lse = m + log(l)``
     (``-inf`` for a row that sees no slot; its output is 0). Scores, the
@@ -199,8 +200,10 @@ def _kernel(
             rows]``: the max and sum over keys are sublane reductions, the
             output accumulates as ``acc^T [D, rows]`` across the p @ v
             contraction, and ``m``, ``l`` are lane vectors over rows (fewer
-            spills and pops: bench j-9081937a, c4 pool48 -5.4%; 4-bit pages
-            keep `attend`, whose per-key scales are lane vectors there)."""
+            spills and pops: bench j-9081937a, c4 pool48 -5.4%). 4-bit pages
+            keep `attend`, whose per-key scales are lane vectors there, and
+            so do 8-token (decode) tiles: c4 b3 decode +0.4 ms per step
+            transposed (twin j-fa6121d0 vs glue-only j-2abe5011)."""
             row_slots = (
                 jax.lax.broadcasted_iota(jnp.int32, (page_size, 1), 0)
                 if packing == 4
@@ -373,7 +376,7 @@ def _kernel(
             fits = count > (widths[i - 1] if i else 0)
             if width < pages_per_step:
                 fits = fits & (count <= width)
-            body = attend if fp4 else attend_t
+            body = attend_t if transposed else attend
             pl.when(fits & single)(functools.partial(body, width, True))
             pl.when(fits & jnp.logical_not(single))(
                 functools.partial(body, width, False)
@@ -466,6 +469,7 @@ def _attention_call(
     aliased = out is not None
     in_place = (pl.BlockSpec(memory_space=pl.ANY),) * 2 if aliased else ()
     fp4 = scale_rows is not None
+    transposed = not fp4 and block_q >= msa_attention.DEFAULT_BLOCK_Q
     scale_inputs = (scale_cache,) if fp4 else ()
     ring = 1 + (_FP4_PREFETCH if fp4 else 1)
     scale_scratch = (
@@ -497,14 +501,14 @@ def _attention_call(
             pl.BlockSpec((1, tiles_per_step, 1, num_heads * block_q), lse_block),
         ],
         scratch_shapes=[
-            # m, l, acc: rows on sublanes for `attend` (4-bit), lanes for `attend_t`.
+            # m, l, acc: rows on sublanes for `attend`, lanes for `attend_t`.
             *(
                 [
                     pltpu.VMEM((num_heads * block_q, 1), jnp.float32),
                     pltpu.VMEM((num_heads * block_q, 1), jnp.float32),
                     pltpu.VMEM((num_heads * block_q, head_dim), jnp.float32),
                 ]
-                if fp4
+                if not transposed
                 else [
                     pltpu.VMEM((1, num_heads * block_q), jnp.float32),
                     pltpu.VMEM((1, num_heads * block_q), jnp.float32),
@@ -527,6 +531,7 @@ def _attention_call(
             aliased=aliased,
             tiles_per_step=tiles_per_step,
             groups_per_tile=groups_per_tile,
+            transposed=transposed,
             **({"fp4_rows": scale_rows} if fp4 else {}),
         ),
         grid_spec=grid_spec,
