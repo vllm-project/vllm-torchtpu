@@ -13,6 +13,7 @@
 # limitations under the License.
 """Exercise model projection/HC integration and mutable QSA state together."""
 
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -79,14 +80,32 @@ def test_projected_decode_preserves_indices_and_cache(
             layer.load_weights(weights.items())
             initial, layout = qsa_test_pools(layer, 20, block_size=pool_block_size)
             layer.finalize_weights(block_size=initial[0].shape[1])
-            prefetch = layout.block_size == 1664
+            from vllm_torchtpu.kernels.qwen4_exp.tuned_block_sizes import (
+                output_projection_tile,
+            )
+
+            weight = layer.o_proj.weight
+            tile = output_projection_tile(tuple(weight.shape))
+            prefetch = (
+                tile is not None
+                and layer.tp_size == 1
+                and weight.dtype == torch.bfloat16
+            )
             if prefetch:
-                assert layer.output_weight_tiles.shape == (5, 6144, 512)
+                assert tile is not None
+                expected_shape = (
+                    math.ceil(weight.shape[1] / tile),
+                    weight.shape[0],
+                    tile,
+                )
+                assert layer.output_weight_tiles.shape == expected_shape
                 storage = layer.output_weight_tiles.data_ptr()
                 layer.finalize_weights(block_size=layout.block_size)
                 assert layer.output_weight_tiles.data_ptr() == storage
                 torch.testing.assert_close(
-                    layer.output_weight_tiles.permute(1, 0, 2).reshape(6144, 2560),
+                    layer.output_weight_tiles.permute(1, 0, 2).reshape(
+                        weight.shape[0], -1
+                    )[:, : weight.shape[1]],
                     layer.o_proj.weight,
                     rtol=0,
                     atol=0,
