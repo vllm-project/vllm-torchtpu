@@ -3115,6 +3115,44 @@ def test_mtp_draft_borrows_target_head_before_loading_weights(
     assert "load_weights" not in proposer.draft_model.__dict__
 
 
+def test_draft_async_prepare_inputs_padding_rows_report_no_rejections():
+    """Rows past the last real request (pad_req_idx[-1]) report no rejected
+    drafts, whatever their next-token and draft_lengths rows hold: the
+    sampler's padded request width can exceed num_reqs, and a stale row must
+    not shorten the draft's seq_lens."""
+    proposer = _make_proposer(draft_tp=1)
+    invalid = -1
+    # Two real requests and two padding rows (B = knr = 4). The padding rows
+    # look like fully rejected requests: no valid token, three drafts.
+    next_tokens = torch.tensor(
+        [
+            [11, 12, invalid, invalid],
+            [21, invalid, invalid, invalid],
+            [invalid] * 4,
+            [invalid] * 4,
+        ],
+        dtype=torch.int32,
+    )
+    draft_lengths = torch.tensor([3, 3, 3, 3], dtype=torch.int32)
+    query_start_loc = torch.tensor([0, 4, 8, 8, 8], dtype=torch.int32)
+    input_ids = torch.arange(8, dtype=torch.int32)
+    pad_req_idx = torch.tensor([0, 1, 1, 1], dtype=torch.int64)
+
+    _, _, num_rejected = (
+        Eagle3Proposer._draft_async_prepare_inputs.__wrapped__.__wrapped__(
+            proposer,
+            input_ids,
+            next_tokens,
+            draft_lengths,
+            query_start_loc,
+            pad_req_idx,
+        )
+    )
+
+    # Request 0 accepted one of its three drafts, request 1 none.
+    assert num_rejected.tolist() == [2, 3, 0, 0]
+
+
 @pytest.mark.parametrize("advance_pos", [True, False])
 def test_draft_post_step0_fused_matches_unfused_carries_and_step1_inputs(advance_pos):
     """_draft_post_step0_fused must produce identical hidden_carry, pos_step1,
