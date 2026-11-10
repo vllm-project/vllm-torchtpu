@@ -56,7 +56,7 @@ from jax.experimental.pallas import tpu
 from vllm_torchtpu.models.kimi_k3.megakernel.common import collectives32
 
 from . import mla_dcp
-from .decode_megakernel import PHASE_SCOPES, _dot, _phase_end, _phase_start
+from .decode_megakernel import PHASE_SCOPES, dot, phase_end, phase_start
 from .dspark import (
     NEG,
     OUT_BONUS,
@@ -116,7 +116,7 @@ class _Scalars:
 
 def _rope(x_bf16, rot_bf16, cos32, sin32):
     """Interleaved-pair RoPE in FP32 (``x * cos2 + (x @ R) * sin2``), BF16 out."""
-    rotated = _dot(x_bf16, rot_bf16)  # exact: one +-1 term per lane
+    rotated = dot(x_bf16, rot_bf16)  # exact: one +-1 term per lane
     return _bf16(_f32(x_bf16) * cos32 + rotated * sin32)
 
 
@@ -213,16 +213,16 @@ def _make_body(c: MlaDraftConfig, block: int, requests: int, rows: int, pages: i
         def host_reduce_gather(chunk32, slot, tag="fc"):
             """FP32 [T, 896] partial of this host lane -> the [T, 7168] sum over
             hosts, BF16-rounded."""
-            scope = _phase_start(f"ar_{tag}_host")
+            scope = phase_start(f"ar_{tag}_host")
             host_packed[slot, host] = pack(_bf16(chunk32))
             exchange(lambda o: host_packed.at[slot, host], lambda o: host_packed.at[slot, host], (8, 16, 24), SEM_HOST, slot)
             reduced = sum(unpack(host_packed[slot, h], T, CHUNK) for h in range(4))
-            _phase_end(scope)
-            scope = _phase_start(f"ar_{tag}_gather")
+            phase_end(scope)
+            scope = phase_start(f"ar_{tag}_gather")
             gather_recv[slot, lane] = pack(_bf16(reduced))
             exchange(lambda o: gather_recv.at[slot, lane], lambda o: gather_recv.at[slot, lane], range(1, 8), SEM_GATHER, slot)
             result = jnp.concatenate([unpack(gather_recv[slot, j], T, CHUNK) for j in range(8)], axis=1)
-            _phase_end(scope)
+            phase_end(scope)
             return result
 
         def all_reduce(lhs_bf16, weight_ref, slot, refill=None, refill_sems=(7, 7), tag=""):
@@ -232,7 +232,7 @@ def _make_body(c: MlaDraftConfig, block: int, requests: int, rows: int, pages: i
             reduction and gather. ``refill``: the HBM weight, streamed a chunk
             at a time through ``weight_ref``'s two slots (``[2, K, 896]``,
             chunk 0 already in slot 0), the next chunk in flight."""
-            scope = _phase_start(f"ar_{tag}_local")
+            scope = phase_start(f"ar_{tag}_local")
             copies = []
             own = None
             loading = None
@@ -248,7 +248,7 @@ def _make_body(c: MlaDraftConfig, block: int, requests: int, rows: int, pages: i
                     operand = weight_ref[k % 2]
                 else:
                     operand = weight_ref[:, pl.ds(k * CHUNK, CHUNK)]
-                partial = _dot(lhs_bf16, operand)  # [T, 896] FP32
+                partial = dot(lhs_bf16, operand)  # [T, 896] FP32
                 stage[slot, k] = pack(_bf16(partial))
                 if k == 0:
                     own = copy(stage.at[slot, 0], local_recv.at[slot, lane], SEM_OWN)
@@ -257,14 +257,14 @@ def _make_body(c: MlaDraftConfig, block: int, requests: int, rows: int, pages: i
                     item = remote(stage.at[slot, k], local_recv.at[slot, lane], slot * SEMS_PER_SLOT + SEM_RS + k, rank ^ k)
                     item.start()
                     copies.append(item)
-            _phase_end(scope)
-            scope = _phase_start(f"ar_{tag}_rs")
+            phase_end(scope)
+            scope = phase_start(f"ar_{tag}_rs")
             for item in copies:
                 item.wait()
             assert own is not None
             own.wait()
             chunk = sum(unpack(local_recv[slot, k], T, CHUNK) for k in range(8))
-            _phase_end(scope)
+            phase_end(scope)
             return host_reduce_gather(chunk, slot, tag)
 
         def gather_tiles(tile_bf16, slot, count):
@@ -314,7 +314,7 @@ def _make_body(c: MlaDraftConfig, block: int, requests: int, rows: int, pages: i
             item.start()
 
         # ---------------- verify acceptance (as kernels.dspark) ----------------
-        scope = _phase_start("d_accept")
+        scope = phase_start("d_accept")
         for item in small_copies:
             item.wait()
         logits_copy.wait()
@@ -420,10 +420,10 @@ def _make_body(c: MlaDraftConfig, block: int, requests: int, rows: int, pages: i
                 for item in copies:
                     item.wait_send()
 
-        _phase_end(scope)
+        phase_end(scope)
 
         # ---------------- context features ----------------
-        scope = _phase_start("d_context")
+        scope = phase_start("d_context")
         aux_ref = small["aux"]  # [aux layers, T, hidden]
         spans = []
         for h in range(4):
@@ -453,7 +453,7 @@ def _make_body(c: MlaDraftConfig, block: int, requests: int, rows: int, pages: i
                             a, b = max(offset, p * part_rows), min(offset + hi - lo, (p + 1) * part_rows)
                             if a >= b:
                                 continue
-                            part = _dot(aux_ref[layer_index, :, lo + a - offset:lo + b - offset],
+                            part = dot(aux_ref[layer_index, :, lo + a - offset:lo + b - offset],
                                         fc_buf[pl.ds(a - p * part_rows, b - a), :])
                             total = part if total is None else total + part
                         if total is not None:
@@ -462,10 +462,10 @@ def _make_body(c: MlaDraftConfig, block: int, requests: int, rows: int, pages: i
         pl.run_scoped(fc_phase, tpu.VMEM((part_rows, CHUNK), jnp.bfloat16))
         context = _rms_norm(_bf16(host_reduce_gather(fc_part[...], 0)), small["context_norm"][...], eps)  # [T, 7168]
 
-        _phase_end(scope)
+        phase_end(scope)
 
         # ---------------- RoPE rows and block input ----------------
-        scope = _phase_start("d_input")
+        scope = phase_start("d_input")
         for item in rope_copies:
             item.wait()
         rope_block = jnp.concatenate([_select_rows(rope_blk[0, j], anchor_position[j] % 8, rows) for j in range(R)], axis=0)
@@ -489,7 +489,7 @@ def _make_body(c: MlaDraftConfig, block: int, requests: int, rows: int, pages: i
 
         # The context rows' kv_a for every layer: one tile per rank, one exchange.
         tile_copies[1].wait()
-        context_tiles = gather_tiles(_bf16(_dot(context, tile_buf[1])), 0, L * CONTEXT_TILES)
+        context_tiles = gather_tiles(_bf16(dot(context, tile_buf[1])), 0, L * CONTEXT_TILES)
         if L > 1:
             tile_copies[1] = tile_copy(weights["qkv_tile"].at[1], 1)
             tile_copies[1].start()
@@ -539,13 +539,13 @@ def _make_body(c: MlaDraftConfig, block: int, requests: int, rows: int, pages: i
             if layer + 1 < L:
                 pending[name] = layer_copy(name, layer + 1)
 
-        _phase_end(scope)
+        phase_end(scope)
         for layer in range(L):
-            scope = _phase_start("d_qkv")
+            scope = phase_start("d_qkv")
             h = _rms_norm(x, small["ln1"][layer], eps)
             slot = layer % 2
             tile_copies[slot].wait()
-            tiles = gather_tiles(_bf16(_dot(h, tile_buf[slot])), (layer + 1) % 2, QKV_TILES)
+            tiles = gather_tiles(_bf16(dot(h, tile_buf[slot])), (layer + 1) % 2, QKV_TILES)
             if layer + 2 < L:
                 tile_copies[slot] = tile_copy(weights["qkv_tile"].at[layer + 2], slot)
                 tile_copies[slot].start()
@@ -558,17 +558,17 @@ def _make_body(c: MlaDraftConfig, block: int, requests: int, rows: int, pages: i
                 keys_vmem[j] = jnp.concatenate(
                     (_f32(context_latents[j * rows:(j + 1) * rows]), _f32(block_latents[j * rows:(j + 1) * rows])), axis=0)
 
-            _phase_end(scope)
-            scope = _phase_start("d_query")
+            phase_end(scope)
+            scope = phase_start("d_query")
             pending["q_b"].wait()
-            q = _bf16(_dot(q_c, q_buf[...]))  # [group rows, dp Q_WIDTH]: each held shard's columns
+            q = _bf16(dot(q_c, q_buf[...]))  # [group rows, dp Q_WIDTH]: each held shard's columns
             refill("q_b", layer)
             pending["w_uk"].wait()
             queries = []
             for head in range(heads):
                 shard, within = divmod(head, HEADS_PER_RANK)
                 nope = shard * q_shard + within * c.nope
-                q_abs = _bf16(_dot(q[:, nope:nope + c.nope], w_uk_buf[head]))  # [group rows, 512]
+                q_abs = _bf16(dot(q[:, nope:nope + c.nope], w_uk_buf[head]))  # [group rows, 512]
                 pe = shard * q_shard + HEADS_PER_RANK * c.nope + within * 128
                 q_pe = _rope(q[:, pe:pe + c.rope], small["rot"][...], cos_query, sin_query)
                 queries.append(jnp.concatenate(
@@ -576,8 +576,8 @@ def _make_body(c: MlaDraftConfig, block: int, requests: int, rows: int, pages: i
                     axis=1))
             queries = jnp.stack(queries, axis=1)  # [group rows, heads, 640]
             refill("w_uk", layer)
-            _phase_end(scope)
-            scope = _phase_start("d_attend")
+            phase_end(scope)
+            scope = phase_start("d_attend")
             attention = mla_dcp.DcpAttention(
                 dataclasses.replace(cache, layer=jnp.int32(layer)), workspace,
                 _Scalars(scalars, first_request, rows), group_rows, sequence_rows=rows, heads=heads, chunk_rows=rows,
@@ -596,39 +596,39 @@ def _make_body(c: MlaDraftConfig, block: int, requests: int, rows: int, pages: i
             attention.prime()
             merged = attention.attend(queries, jnp.zeros((group_rows, LANES), jnp.float32), layer % 2,
                                       keys=keys_vmem, key_valid=valid_vmem)  # [group rows, heads, 512]
-            _phase_end(scope)
-            scope = _phase_start("d_o")
-            wuv_scope = _phase_start("d_wuv")
+            phase_end(scope)
+            scope = phase_start("d_o")
+            wuv_scope = phase_start("d_wuv")
             pending["w_uv"].wait()
             # [T, heads 128]: the other groups' rows are zero (their ranks add theirs).
             attended = place_group(jnp.concatenate(
-                [_bf16(_dot(_bf16(merged[:, head]), w_uv_buf[head])) for head in range(heads)], axis=1))
+                [_bf16(dot(_bf16(merged[:, head]), w_uv_buf[head])) for head in range(heads)], axis=1))
             refill("w_uv", layer)
             pending["o"].wait()
-            _phase_end(wuv_scope)
+            phase_end(wuv_scope)
             x = _bf16(_f32(x) + all_reduce(attended, o_buf, 1, refill=weights["o"].at[layer] if streamed_o else None, refill_sems=(5, SEM_O2),
                                            tag="o"))
             refill("o", layer)
 
-            _phase_end(scope)
-            scope = _phase_start("d_mlp")
+            phase_end(scope)
+            scope = phase_start("d_mlp")
             h2 = _rms_norm(x, small["ln2"][layer], eps)
             pending["gate"].wait()
             pending["up"].wait()
-            gate = _f32(_bf16(_dot(h2, gate_buf[...])))
-            up = _bf16(_dot(h2, up_buf[...]))
+            gate = _f32(_bf16(dot(h2, gate_buf[...])))
+            up = _bf16(dot(h2, up_buf[...]))
             refill("gate", layer)
             refill("up", layer)
             activation = _bf16(_f32(_bf16(gate * jax.nn.sigmoid(gate))) * _f32(up))
-            _phase_end(scope)
-            scope = _phase_start("d_down")
+            phase_end(scope)
+            scope = phase_start("d_down")
             pending["down"].wait()
             mlp = all_reduce(activation, down_buf, 0, refill=weights["down"].at[layer] if streamed else None,
                              refill_sems=(SEM_DOWN, SEM_DOWN2), tag="down")
             refill("down", layer)
             x = _bf16(_f32(x) + mlp)
-            _phase_end(scope)
-        scope = _phase_start("d_lm")
+            phase_end(scope)
+        scope = phase_start("d_lm")
         latents_copy = copy(latents_vmem, latents_out, SEM_LAT)
         latents_copy.start()
 
@@ -647,17 +647,17 @@ def _make_body(c: MlaDraftConfig, block: int, requests: int, rows: int, pages: i
             copies = [chunk_copy(0), chunk_copy(1)]
             for k in range(LM_CHUNKS):
                 copies[k % 2].wait()
-                logits = _f32(_bf16(_dot(hidden_rows, buffers[k % 2][...])))
+                logits = _f32(_bf16(dot(hidden_rows, buffers[k % 2][...])))
                 if k + 2 < LM_CHUNKS:
                     copies[k % 2] = chunk_copy(k + 2)
                 logits_vmem[:, pl.ds(k * LM_CHUNK, LM_CHUNK)] = logits
 
         pl.run_scoped(lm_phase, tpu.VMEM((hidden, LM_CHUNK), jnp.bfloat16), tpu.VMEM((hidden, LM_CHUNK), jnp.bfloat16))
 
-        _phase_end(scope)
+        phase_end(scope)
 
         # ---------------- exact Markov sampling ----------------
-        scope = _phase_start("d_markov")
+        scope = phase_start("d_markov")
         w2t_copy.wait()
         vocab_lane = jax.lax.broadcasted_iota(jnp.int32, (1, vocab), 1)
         tokens = tokens_v[...]
@@ -667,7 +667,7 @@ def _make_body(c: MlaDraftConfig, block: int, requests: int, rows: int, pages: i
         for slot in range(block):
             for item in w1_copies[slot % 2]:
                 item.wait()
-            bias = _dot(w1_rows_for(previous, slot % 2), w2t_buf[...])  # [R, 5120]
+            bias = dot(w1_rows_for(previous, slot % 2), w2t_buf[...])  # [R, 5120]
             scores = jnp.concatenate([logits_vmem[j * rows + slot:j * rows + slot + 1, :] for j in range(R)], axis=0) + bias
             best_value = jnp.max(scores, axis=1, keepdims=True)
             best_id = jnp.min(jnp.where(scores == best_value, vocab_lane, vocab), axis=1, keepdims=True)
@@ -687,7 +687,7 @@ def _make_body(c: MlaDraftConfig, block: int, requests: int, rows: int, pages: i
         out.start()
         out.wait()
         latents_copy.wait()
-        _phase_end(scope)
+        phase_end(scope)
 
     return body
 

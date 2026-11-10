@@ -72,7 +72,8 @@ class KernelConfig:
     decode_no_hlo_calls: bool = True  # no deduplicated HLO calls at B8..B128, DP B2/B4
     shard_routing: bool = False
     kda_staged: bool = False
-    weight_streams: tuple[tuple[str, tuple], ...] = ()  # (weight, (axis, streams))
+    # Note Shape (weight, (axis, streams))
+    weight_streams: tuple[tuple[str, tuple[object, ...]], ...] = ()
     # VMEM and compiler settings.
     vmem_limit_mb: int = 64
     vmem_spill_reserve_mb: float = 5.0

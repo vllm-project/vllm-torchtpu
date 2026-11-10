@@ -45,7 +45,13 @@ from .common.constants import (
     CONV_TAPS as CONV_TAPS,
 )
 from .common.constants import (
+    DP2_GROUPS as DP2_GROUPS,
+)
+from .common.constants import (
     HEAD_DIM as HEAD_DIM,
+)
+from .common.constants import (
+    HIDDEN_SIZE as HIDDEN_SIZE,
 )
 from .common.constants import (
     KDA_HEADS as KDA_HEADS,
