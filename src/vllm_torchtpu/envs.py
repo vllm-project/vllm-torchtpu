@@ -62,6 +62,7 @@ if TYPE_CHECKING:
     QWEN4_EXP_PREFILL_SP_MOE: bool = False
     VLLM_TPU_MK_HOST_PLE: bool = False
     VLLM_TPU_MK_WHOLE_BATCHED_INPUTS: bool = False
+    VLLM_TPU_MK_PLE_TRIM: bool = False
     QWEN4_EXP_PREFILL_SP_SHARED_LOCAL: bool = False
     QWEN4_EXP_PREFILL_SP_PAD_HC: bool = False
     TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
@@ -1343,6 +1344,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Qwen3.8 whole-step megakernel: build the QSA layers' page tables and read their rings
     # for all layers at once (one ring-read call) instead of per layer; same values.
     "VLLM_TPU_MK_WHOLE_BATCHED_INPUTS": env_bool("VLLM_TPU_MK_WHOLE_BATCHED_INPUTS"),
+    # Qwen4Exp PLE decode trims, same bytes: on steps of <= 8 tokens the head
+    # groups' n-gram rows ride the token-embedding all-reduce as integer-valued
+    # BF16 lanes (one collective instead of two), and the n-gram hash constants
+    # are trace-time Python ints instead of int64 buffers.
+    "VLLM_TPU_MK_PLE_TRIM": env_bool("VLLM_TPU_MK_PLE_TRIM"),
     # With QWEN4_EXP_PREFILL_SP_MOE=1: the shared expert of sequence-parallel steps runs on
     # this rank's own rows with a replicated copy of its weights (loaded next to the TP slices,
     # which decode keeps), so it needs no all-gather or reduce-scatter. Costs one full shared
