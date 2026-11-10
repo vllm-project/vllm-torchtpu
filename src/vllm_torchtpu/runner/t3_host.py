@@ -45,6 +45,17 @@ def _flag(name: str) -> bool:
 
 AOT_SKIP_GUARDS = _flag("VLLM_TPU_T3_AOT_SKIP_GUARDS")
 
+# VLLM_TPU_T3_CONN_STATS_EVERY=N: poll the KV connector's stats every N decode
+# steps instead of every step (default 1 = every step; 16 under
+# VLLM_TPU_T3_HOST=1 unless set explicitly).
+CONN_STATS_EVERY = int(
+    os.environ.get(
+        "VLLM_TPU_T3_CONN_STATS_EVERY",
+        "16" if _flag("VLLM_TPU_T3_CONN_STATS") else "1",
+    )
+    or 1
+)
+
 _done: set[int] = set()
 
 
