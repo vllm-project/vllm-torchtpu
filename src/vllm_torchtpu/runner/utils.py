@@ -49,11 +49,12 @@ PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY = (
     "phased_profiler_prefill_only_kv_len_threshold"
 )
 
-# Host-only sections: the API-server patches (`frontend_options`) and the
-# runner's telemetry options (`runner_options`) never change a compiled
-# program.
+# Host-only sections: the API-server patches (`frontend_options`), the runner's
+# telemetry options (`runner_options`) and the worker's process placement
+# (`worker.worker_options`) never change a compiled program.
 FRONTEND_OPTIONS_SECTION = "tpu_frontend"
 RUNNER_OPTIONS_SECTION = "tpu_runner"
+WORKER_OPTIONS_SECTION = "tpu_worker"
 
 # Diagnostics-only knobs and host-only sections: they steer profiling or the
 # host and never change the compiled graph, so
@@ -65,6 +66,7 @@ HASH_IGNORED_ADDITIONAL_CONFIG_KEYS = frozenset(
         PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY,
         FRONTEND_OPTIONS_SECTION,
         RUNNER_OPTIONS_SECTION,
+        WORKER_OPTIONS_SECTION,
     }
 )
 
