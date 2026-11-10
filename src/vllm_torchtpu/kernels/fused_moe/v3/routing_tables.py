@@ -11,8 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Host/device routing table interfaces and expert-to-rank mapping for Fused EP MoE v3.
-"""
+"""Host/device routing table interfaces and expert-to-rank mapping for Fused EP
+MoE v3."""
+
 from typing import NamedTuple
 
 import jax
@@ -38,6 +39,7 @@ COUNT_ROWS = 5
 
 class RoutingTables(NamedTuple):
     """The tables the kernel indexes: per pair, per expert, per push."""
+
     arrival_row: jax.Array  # [T, K] arrival row of token t's k-th pair
     routed_row: jax.Array  # [T * K] routed row each pair computes on
     run_rows: jax.Array  # [E, num_shards] true rows of expert e for shard d
@@ -57,8 +59,8 @@ def routed_rows_bound(num_tokens, top_k, num_experts, tile_rows):
     tail-read window. A whole number of tiles. Part of the built kernel's
     cache key, so a program is compiled per token bucket."""
     return align_up(
-        num_tokens * top_k + (ROW_BLOCK - 1) * num_experts + tile_rows,
-        tile_rows)
+        num_tokens * top_k + (ROW_BLOCK - 1) * num_experts + tile_rows, tile_rows
+    )
 
 
 def routing_block(tokens_per_shard, top_k):
@@ -82,19 +84,29 @@ def check_routing_shape(*, num_tokens, top_k, num_experts, num_shards):
     if num_tokens < 1:
         raise ValueError("the routing tables need at least one token")
     if num_shards < 1 or num_experts % num_shards:
-        raise ValueError(f"expert count {num_experts} is not divisible by "
-                         f"the expert-parallel width {num_shards}")
+        raise ValueError(
+            f"expert count {num_experts} is not divisible by "
+            f"the expert-parallel width {num_shards}"
+        )
     field = alignment_slot_field(num_shards)
     max_position = num_tokens * top_k + (ROW_BLOCK - 1) * num_experts
     if max_position * field >= INT32_LIMIT:
         raise ValueError(
             f"up to {max_position} arrival rows per shard, packed beside a "
-            f"{field}-wide alignment slot, overflow an int32")
+            f"{field}-wide alignment slot, overflow an int32"
+        )
 
 
-def build_routing_tables(top_k_indices, *, num_experts, num_shards,
-                         tokens_per_shard, block, tile_rows,
-                         routed_rows_per_shard):
+def build_routing_tables(
+    top_k_indices,
+    *,
+    num_experts,
+    num_shards,
+    tokens_per_shard,
+    block,
+    tile_rows,
+    routed_rows_per_shard,
+):
     """Assigns every routed pair the routed row it computes on: the five
     O(pairs x experts) passes as dense jnp ops.
 
@@ -103,21 +115,23 @@ def build_routing_tables(top_k_indices, *, num_experts, num_shards,
     """
     T, K = top_k_indices.shape
     n = T * K
-    check_routing_shape(num_tokens=T,
-                        top_k=K,
-                        num_experts=num_experts,
-                        num_shards=num_shards)
+    check_routing_shape(
+        num_tokens=T, top_k=K, num_experts=num_experts, num_shards=num_shards
+    )
     if n % block or (tokens_per_shard * K) % block:
         raise ValueError(
             f"{n} routed pairs, {tokens_per_shard * K} per shard, "
-            f"are not whole {block}-pair blocks")
+            f"are not whole {block}-pair blocks"
+        )
     if tile_rows % ROW_BLOCK:
-        raise ValueError(f"tile height {tile_rows} is not a whole number of "
-                         f"{ROW_BLOCK}-row blocks")
+        raise ValueError(
+            f"tile height {tile_rows} is not a whole number of {ROW_BLOCK}-row blocks"
+        )
     if routed_rows_per_shard % tile_rows:
         raise ValueError(
             f"the routed rows stride {routed_rows_per_shard} is not a whole "
-            f"number of {tile_rows}-row tiles")
+            f"number of {tile_rows}-row tiles"
+        )
     experts_per_shard = num_experts // num_shards
     slot_field = alignment_slot_field(num_shards)
     expert_of_pair = top_k_indices.reshape(-1).astype(jnp.int32)
@@ -127,58 +141,63 @@ def build_routing_tables(top_k_indices, *, num_experts, num_shards,
     one_hot = expert_blocks[:, :, None] == bins[None, None, :]
     block_hist = jnp.sum(one_hot.astype(jnp.int32), axis=1)  # [blocks, E]
     block_offset = jnp.cumsum(block_hist, axis=0) - block_hist
-    base_per_slot = jnp.sum(jnp.where(one_hot, block_offset[:, None, :], 0),
-                            axis=2)
+    base_per_slot = jnp.sum(jnp.where(one_hot, block_offset[:, None, :], 0), axis=2)
     same = expert_blocks[:, :, None] == expert_blocks[:, None, :]
     earlier = jnp.tril(jnp.ones((block, block), dtype=jnp.bool_), k=-1)
     rank = jnp.sum((same & earlier[None]).astype(jnp.int32), axis=2)
     pair_rank = (base_per_slot + rank).reshape(-1)
     blocks_per_shard = (tokens_per_shard * K) // block
-    run_rows = block_hist.reshape(num_shards, blocks_per_shard,
-                                  num_experts).sum(axis=1).T  # [E, num_shards]
+    run_rows = (
+        block_hist.reshape(num_shards, blocks_per_shard, num_experts).sum(axis=1).T
+    )  # [E, num_shards]
     run_start = jnp.cumsum(run_rows, axis=1) - run_rows
     run_rows_aligned = (run_rows + (ROW_BLOCK - 1)) & jnp.int32(-ROW_BLOCK)
-    run_start_aligned = (jnp.cumsum(run_rows_aligned, axis=1) -
-                         run_rows_aligned)
+    run_start_aligned = jnp.cumsum(run_rows_aligned, axis=1) - run_rows_aligned
     slot_shift = run_start_aligned - run_start
     expert_rows_aligned = run_rows_aligned.sum(axis=1)
     rows_by_shard = expert_rows_aligned.reshape(num_shards, experts_per_shard)
     local_base = jnp.cumsum(rows_by_shard, axis=1) - rows_by_shard
-    expert_base = (local_base +
-                   jnp.arange(num_shards, dtype=jnp.int32)[:, None] *
-                   routed_rows_per_shard).reshape(num_experts)
-    region_rows = run_rows_aligned.reshape(num_shards, experts_per_shard,
-                                           num_shards)
+    expert_base = (
+        local_base
+        + jnp.arange(num_shards, dtype=jnp.int32)[:, None] * routed_rows_per_shard
+    ).reshape(num_experts)
+    region_rows = run_rows_aligned.reshape(num_shards, experts_per_shard, num_shards)
     rows_per_dest = region_rows.transpose(2, 0, 1).reshape(
-        num_shards, num_shards * experts_per_shard)
+        num_shards, num_shards * experts_per_shard
+    )
     recv_base = (jnp.cumsum(rows_per_dest, axis=1) - rows_per_dest).reshape(
-        num_shards, num_shards, experts_per_shard)
+        num_shards, num_shards, experts_per_shard
+    )
     recv_rows = rows_per_dest.sum(axis=1)
     position_shift = (
-        recv_base.transpose(1, 2, 0).reshape(num_experts, num_shards) -
-        run_start)
-    shard_of_block = (jnp.arange(n_blocks, dtype=jnp.int32) * block //
-                      (tokens_per_shard * K))
+        recv_base.transpose(1, 2, 0).reshape(num_experts, num_shards) - run_start
+    )
+    shard_of_block = (
+        jnp.arange(n_blocks, dtype=jnp.int32) * block // (tokens_per_shard * K)
+    )
     packed = position_shift * slot_field + slot_shift
     packed_blocks = jnp.take(packed.T, shard_of_block, axis=0)
-    packed_shift = jnp.sum(jnp.where(one_hot, packed_blocks[:, None, :], 0),
-                           axis=2).reshape(-1)
-    base_of_pair = jnp.sum(jnp.where(one_hot, expert_base[None, None, :], 0),
-                           axis=2).reshape(-1)
-    position = pair_rank + jnp.right_shift(packed_shift,
-                                           slot_field.bit_length() - 1)
+    packed_shift = jnp.sum(
+        jnp.where(one_hot, packed_blocks[:, None, :], 0), axis=2
+    ).reshape(-1)
+    base_of_pair = jnp.sum(
+        jnp.where(one_hot, expert_base[None, None, :], 0), axis=2
+    ).reshape(-1)
+    position = pair_rank + jnp.right_shift(packed_shift, slot_field.bit_length() - 1)
     slot = pair_rank + (packed_shift & (slot_field - 1))
-    return RoutingTables(arrival_row=position.reshape(T, K),
-                         routed_row=base_of_pair + slot,
-                         run_rows=run_rows,
-                         run_rows_aligned=run_rows_aligned,
-                         run_start_aligned=run_start_aligned,
-                         region_rows=region_rows,
-                         recv_base=recv_base,
-                         recv_rows=recv_rows,
-                         expert_rows_aligned=expert_rows_aligned,
-                         expert_base=expert_base,
-                         routed_rows=num_shards * routed_rows_per_shard)
+    return RoutingTables(
+        arrival_row=position.reshape(T, K),
+        routed_row=base_of_pair + slot,
+        run_rows=run_rows,
+        run_rows_aligned=run_rows_aligned,
+        run_start_aligned=run_start_aligned,
+        region_rows=region_rows,
+        recv_base=recv_base,
+        recv_rows=recv_rows,
+        expert_rows_aligned=expert_rows_aligned,
+        expert_base=expert_base,
+        routed_rows=num_shards * routed_rows_per_shard,
+    )
 
 
 def local_routed_rows(routing, shard, *, routed_rows_per_shard):
@@ -187,9 +206,11 @@ def local_routed_rows(routing, shard, *, routed_rows_per_shard):
     shard is sent to routed_rows_per_shard, past the end, which a scatter with
     mode="drop" ignores (never negative: that would wrap)."""
     base = shard * routed_rows_per_shard
-    return jnp.where(routing.routed_row < base,
-                     jnp.int32(routed_rows_per_shard),
-                     routing.routed_row - base)
+    return jnp.where(
+        routing.routed_row < base,
+        jnp.int32(routed_rows_per_shard),
+        routing.routed_row - base,
+    )
 
 
 def shard_token_table(routing, shard, *, routed_rows_per_shard):
@@ -199,24 +220,26 @@ def shard_token_table(routing, shard, *, routed_rows_per_shard):
     with bounds checks off."""
     T, K = routing.arrival_row.shape
     token_of_pair = jnp.broadcast_to(
-        jnp.arange(T, dtype=jnp.int32)[:, None], (T, K)).reshape(-1)
-    row = local_routed_rows(routing,
-                            shard,
-                            routed_rows_per_shard=routed_rows_per_shard)
-    table = jnp.zeros((routed_rows_per_shard, ),
-                      jnp.int32).at[row].add(token_of_pair, mode="drop")
+        jnp.arange(T, dtype=jnp.int32)[:, None], (T, K)
+    ).reshape(-1)
+    row = local_routed_rows(routing, shard, routed_rows_per_shard=routed_rows_per_shard)
+    table = (
+        jnp.zeros((routed_rows_per_shard,), jnp.int32)
+        .at[row]
+        .add(token_of_pair, mode="drop")
+    )
     return jnp.clip(table, jnp.int32(0), jnp.int32(max(T - 1, 0)))
 
 
 def shard_expert_rows(routing, shard, *, num_experts, num_shards):
     """This shard's local experts: (padded rows, start row) int32 [G]."""
     experts_per_shard = num_experts // num_shards
-    rows = lax.dynamic_slice(routing.expert_rows_aligned,
-                             (shard * experts_per_shard, ),
-                             (experts_per_shard, ))
-    base = lax.dynamic_slice(routing.expert_base,
-                             (shard * experts_per_shard, ),
-                             (experts_per_shard, ))
+    rows = lax.dynamic_slice(
+        routing.expert_rows_aligned, (shard * experts_per_shard,), (experts_per_shard,)
+    )
+    base = lax.dynamic_slice(
+        routing.expert_base, (shard * experts_per_shard,), (experts_per_shard,)
+    )
     return rows.astype(jnp.int32), (base - base[0]).astype(jnp.int32)
 
 
@@ -226,14 +249,16 @@ def visit_order(expert_rows, experts_per_shard):
     order = jnp.arange(experts_per_shard, dtype=jnp.int32)
     key = order - expert_rows.astype(jnp.int32) * experts_per_shard
     return jnp.minimum(
-        jnp.argsort(key).astype(jnp.int32), jnp.int32(experts_per_shard - 1))
+        jnp.argsort(key).astype(jnp.int32), jnp.int32(experts_per_shard - 1)
+    )
 
 
 def _receive_base_row(routing, shard, *, num_shards, experts_per_shard):
     """Where shard `shard`'s runs land in every destination's arrival rows,
     int32 [G, num_shards]."""
-    received = lax.dynamic_slice(routing.recv_base, (0, shard, 0),
-                                 (num_shards, 1, experts_per_shard))
+    received = lax.dynamic_slice(
+        routing.recv_base, (0, shard, 0), (num_shards, 1, experts_per_shard)
+    )
     return received[:, 0].T
 
 
@@ -242,13 +267,14 @@ def shard_push_tables(routing, shard, *, num_experts, num_shards):
     destination) run and the arrival row it lands on, int32 [G, num_shards]
     each."""
     experts_per_shard = num_experts // num_shards
-    push_rows = lax.dynamic_slice(routing.run_rows,
-                                  (shard * experts_per_shard, 0),
-                                  (experts_per_shard, num_shards))
-    arrival_offset = _receive_base_row(routing,
-                                       shard,
-                                       num_shards=num_shards,
-                                       experts_per_shard=experts_per_shard)
+    push_rows = lax.dynamic_slice(
+        routing.run_rows,
+        (shard * experts_per_shard, 0),
+        (experts_per_shard, num_shards),
+    )
+    arrival_offset = _receive_base_row(
+        routing, shard, num_shards=num_shards, experts_per_shard=experts_per_shard
+    )
     return push_rows.astype(jnp.int32), arrival_offset.astype(jnp.int32)
 
 
@@ -260,28 +286,38 @@ def shard_transport_tables(routing, shard, *, num_experts, num_shards):
     push source), the blocks a push carries and the arrival block it lands
     on."""
     experts_per_shard = num_experts // num_shards
-    run_rows = lax.dynamic_slice(routing.run_rows_aligned,
-                                 (shard * experts_per_shard, 0),
-                                 (experts_per_shard, num_shards))
-    run_start = lax.dynamic_slice(routing.run_start_aligned,
-                                  (shard * experts_per_shard, 0),
-                                  (experts_per_shard, num_shards))
-    region_rows = lax.dynamic_slice(routing.region_rows, (shard, 0, 0),
-                                    (1, experts_per_shard, num_shards))[0]
+    run_rows = lax.dynamic_slice(
+        routing.run_rows_aligned,
+        (shard * experts_per_shard, 0),
+        (experts_per_shard, num_shards),
+    )
+    run_start = lax.dynamic_slice(
+        routing.run_start_aligned,
+        (shard * experts_per_shard, 0),
+        (experts_per_shard, num_shards),
+    )
+    region_rows = lax.dynamic_slice(
+        routing.region_rows, (shard, 0, 0), (1, experts_per_shard, num_shards)
+    )[0]
     per_dest = region_rows.sum(axis=0)
     dest_base = jnp.cumsum(per_dest) - per_dest
-    outgoing_offset = dest_base[None, :] + (jnp.cumsum(region_rows, axis=0) -
-                                            region_rows)
-    push_destination = _receive_base_row(routing,
-                                         shard,
-                                         num_shards=num_shards,
-                                         experts_per_shard=experts_per_shard)
+    outgoing_offset = dest_base[None, :] + (
+        jnp.cumsum(region_rows, axis=0) - region_rows
+    )
+    push_destination = _receive_base_row(
+        routing, shard, num_shards=num_shards, experts_per_shard=experts_per_shard
+    )
 
     def blocks(rows):
         return jnp.right_shift(rows, ROW_BLOCK_SHIFT).astype(jnp.int32)
 
-    return (blocks(run_start), blocks(run_rows), blocks(outgoing_offset),
-            blocks(region_rows), blocks(push_destination))
+    return (
+        blocks(run_start),
+        blocks(run_rows),
+        blocks(outgoing_offset),
+        blocks(region_rows),
+        blocks(push_destination),
+    )
 
 
 def shard_counts(routing, expert_rows, shard, *, num_experts, num_shards):
@@ -291,15 +327,20 @@ def shard_counts(routing, expert_rows, shard, *, num_experts, num_shards):
     in padded rows, and the experts visited."""
     experts_per_shard = num_experts // num_shards
     true_rows = lax.dynamic_slice(
-        routing.run_rows, (shard * experts_per_shard, 0),
-        (experts_per_shard, num_shards)).astype(jnp.int32)
+        routing.run_rows,
+        (shard * experts_per_shard, 0),
+        (experts_per_shard, num_shards),
+    ).astype(jnp.int32)
     aligned = lax.dynamic_slice(
-        routing.run_rows_aligned, (shard * experts_per_shard, 0),
-        (experts_per_shard, num_shards)).astype(jnp.int32)
+        routing.run_rows_aligned,
+        (shard * experts_per_shard, 0),
+        (experts_per_shard, num_shards),
+    ).astype(jnp.int32)
     mine = (jnp.arange(num_shards, dtype=jnp.int32) == shard).astype(jnp.int32)
     other = 1 - mine
-    first = (jnp.arange(experts_per_shard,
-                        dtype=jnp.int32) == 0).astype(jnp.int32)[:, None]
+    first = (jnp.arange(experts_per_shard, dtype=jnp.int32) == 0).astype(jnp.int32)[
+        :, None
+    ]
     received = routing.run_rows.sum(axis=0).astype(jnp.int32)
     received_aligned = routing.recv_rows.astype(jnp.int32)
     active = (expert_rows > 0).astype(jnp.int32)[:, None]
@@ -307,13 +348,17 @@ def shard_counts(routing, expert_rows, shard, *, num_experts, num_shards):
     def over_experts(term):
         return term.sum(axis=0, keepdims=True)
 
-    return jnp.concatenate([
-        over_experts(true_rows * other[None, :]),
-        over_experts((received * mine)[None, :] * first -
-                     true_rows * mine[None, :]),
-        over_experts(aligned * other[None, :]),
-        over_experts((received_aligned * mine)[None, :] * first -
-                     aligned * mine[None, :]),
-        over_experts(active * mine[None, :]),
-    ],
-                           axis=0).astype(jnp.int32)
+    return jnp.concatenate(
+        [
+            over_experts(true_rows * other[None, :]),
+            over_experts(
+                (received * mine)[None, :] * first - true_rows * mine[None, :]
+            ),
+            over_experts(aligned * other[None, :]),
+            over_experts(
+                (received_aligned * mine)[None, :] * first - aligned * mine[None, :]
+            ),
+            over_experts(active * mine[None, :]),
+        ],
+        axis=0,
+    ).astype(jnp.int32)

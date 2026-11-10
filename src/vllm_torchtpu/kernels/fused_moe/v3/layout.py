@@ -11,8 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Weight tensor relayout and lane-aligned packing utilities for Fused EP MoE v3.
-"""
+"""Weight tensor relayout and lane-aligned packing utilities for Fused EP MoE v3."""
 
 # Lane count of the vector unit: a token row is a whole number of LANES-wide
 # blocks, and every (SUBLANES, LANES) tile of 32-bit words the tables, the
@@ -60,12 +59,13 @@ SIDE_EFFECTS = True
 SHARD_INDEX_OPERAND = False
 
 
-def device_coords(peer, mesh_axes=(MESH_AXIS, )):
+def device_coords(peer, mesh_axes=(MESH_AXIS,)):
     """The mesh coordinates of shard `peer` of the expert-parallel axis, as
     a remote copy or signal takes them (pl.DeviceIdType.MESH): `peer` on
     MESH_AXIS and this core's own index on every other axis, so the cores
     of one replica only ever address each other."""
     from jax import lax
+
     if SHARD_INDEX_OPERAND:
         # The dict form, keyed by axis name: it names the mesh axis to Pallas
         # (a NamedAxisEffect) without an axis lookup, so the program's mesh
@@ -77,8 +77,9 @@ def device_coords(peer, mesh_axes=(MESH_AXIS, )):
             axis: (peer if axis == MESH_AXIS else lax.axis_index(axis))
             for axis in mesh_axes
         }
-    return tuple(peer if axis == MESH_AXIS else lax.axis_index(axis)
-                 for axis in mesh_axes)
+    return tuple(
+        peer if axis == MESH_AXIS else lax.axis_index(axis) for axis in mesh_axes
+    )
 
 
 # A barrier semaphore is shared by every kernel built with the same
@@ -129,8 +130,10 @@ def power_of_two_shift(value, name):
     """The shift a division by `value` is. Raises ValueError for a value
     that is not a power of two."""
     if value <= 0 or value & (value - 1):
-        raise ValueError(f"{name} is {value}, not a power of two. The routing "
-                         "tables write divisions by it as shifts")
+        raise ValueError(
+            f"{name} is {value}, not a power of two. The routing "
+            "tables write divisions by it as shifts"
+        )
     return value.bit_length() - 1
 
 
