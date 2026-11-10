@@ -66,6 +66,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheSpec,
     MambaSpec,
+    UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
@@ -373,10 +374,14 @@ def _spec_warmup_group_num_blocks(runner: Any, group: Any, max_pos: int) -> int:
     compressor state ring, ``block_size=8``) hold 1 block per request for their
     entire lifetime (``max_num_blocks_per_req == 1``), and their worker
     ``BlockTable`` is sized to that cap rather than ``cdiv(max_model_len, gbs)``.
+    Block-outer layouts wrap such groups in ``UniformTypeKVCacheSpecs``; the
+    cap is read from the wrapped layer spec.
     """
     spec = group.kv_cache_spec
     max_len = min(max_pos, runner.max_model_len)
     g_nblk = cdiv(max_len, int(spec.block_size))
+    if isinstance(spec, UniformTypeKVCacheSpecs):
+        spec = spec.first_spec
     if isinstance(spec, CircularBufferSpec):
         return min(
             g_nblk,
