@@ -82,9 +82,16 @@ def test_few_token_cap_must_reach_the_fused_gate_across_the_node(groups, cap, me
             v3.check_kernel_threshold(ep=8, tp=1, lowtok_cap=cap)
 
 
-def test_tensor_parallel_gate_is_checked_at_the_first_sliced_bucket(groups):
-    """TP8 at the default 512-row threshold: 64 rows per rank at the first
-    sliced bucket, which meets the TP8 gate of 33."""
+def test_tensor_parallel_gate_is_checked_at_the_first_sliced_bucket(
+    groups, monkeypatch
+):
+    """TP8 at a 512-row sequence-parallel threshold (the value the TP8 decode
+    legs ran; the threshold defaults to 0 until a model follows each step's
+    form): 64 rows per rank at the first sliced bucket, which meets the TP8
+    gate of 33."""
+    from vllm_torchtpu.layers.adapter import sequence_parallel
+
+    monkeypatch.setattr(sequence_parallel, "DEFAULT_MIN_ROWS", 512)
     groups(1, 8)
     v3.check_kernel_threshold(ep=8, tp=8, lowtok_cap=448)
 
