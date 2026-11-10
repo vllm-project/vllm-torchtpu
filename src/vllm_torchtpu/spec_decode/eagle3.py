@@ -262,6 +262,14 @@ class Eagle3Proposer:
         # Zero [kernel_num_reqs] rejected counts per (knr, device), for the
         # post-step-0 bridge on an all-accept sync step.
         self._zero_rej_dev_cache: dict[tuple, torch.Tensor] = {}
+        # The last propose's per-chunk padded [p, K] drafts and its returned
+        # device tensor; tpu_runner's async substitution reads them to skip a
+        # re-pad when `drafts is _last_propose_device_out`.
+        self._last_padded_drafts_per_chunk: list[torch.Tensor] | None = None
+        self._last_propose_device_out: torch.Tensor | None = None
+        # Set by tpu_runner for one propose: return chunk 0's slice instead of
+        # concatenating chunks (the runner substitutes both chunks itself).
+        self._skip_next_multi_chunk_draft_cat: bool = False
         # Base copies of RPA's request_distribution for draft step 0, keyed on
         # the id of the runner's packed slice (_with_base_request_distribution).
         self._base_request_distribution_cache: dict[
@@ -2214,13 +2222,17 @@ class Eagle3Proposer:
             )
             for toks in draft_tokens_per_chunk
         ]
+        self._last_padded_drafts_per_chunk = per_chunk_stacked
+        skip_cat = self._skip_next_multi_chunk_draft_cat
+        self._skip_next_multi_chunk_draft_cat = False
         if return_device:
-            if len(per_chunk_stacked) == 1:
+            if len(per_chunk_stacked) == 1 or skip_cat:
                 out = per_chunk_stacked[0][: chunks[0].num_reqs]
             else:
                 out = torch.cat(
                     [s[: c.num_reqs] for s, c in zip(per_chunk_stacked, chunks)], dim=0
                 )
+            self._last_propose_device_out = out
             return out
         result = []
         for s, c in zip(per_chunk_stacked, chunks):
