@@ -69,7 +69,7 @@ def _no_engine_config(monkeypatch):
     set; the armed row cap starts unset."""
     import vllm.config
 
-    monkeypatch.setattr(vllm.config, "get_current_vllm_config", SimpleNamespace)
+    monkeypatch.setattr(vllm.config, "get_current_vllm_config_or_none", SimpleNamespace)
     monkeypatch.setattr(scores, "_ARMED_MAX_TOKENS", 0)
     monkeypatch.setattr(scores, "set_lowtok_max_tokens", Mock())
 
@@ -311,30 +311,25 @@ def test_copy_enabled_placement_arms_60_backbone_plus_1_mtp_draft_layer(
     scores op, giving 61/61 scores armed."""
     import json
 
+    # Rank r holds its 64 primaries, then copies of rank r + 1's first four.
     table = {
-        "shards": 8,
         "experts": 512,
-        "owned_per_core": 64,
-        "extra_slots": 4,
-        "slots_per_core": 68,
-        "copies": True,
+        "shards": 8,
+        "copies_per_rank": 4,
         "layers": {
-            str(lidx): {
-                "cores": [
-                    list(range(r * 64, (r + 1) * 64))
-                    + [((r + 1) % 8) * 64 + j for j in range(4)]
-                    for r in range(8)
-                ],
-                "copies": {
-                    str(((r + 1) % 8) * 64 + j): r for r in range(8) for j in range(4)
-                },
-            }
+            str(lidx): [
+                list(range(r * 64, (r + 1) * 64))
+                + [((r + 1) % 8) * 64 + j for j in range(4)]
+                for r in range(8)
+            ]
             for lidx in range(60)
         },
     }
     pfile = tmp_path / "opt_copies32.json"
     pfile.write_text(json.dumps(table))
     monkeypatch.setenv("TPU_EXPERT_PLACEMENT", str(pfile))
+    # A 60-layer target: the drafter's MoE layer is table layer 60, unlisted.
+    monkeypatch.setattr(scores.expert_placement, "_target_layers", lambda: 60)
 
     copies_op = Mock(name="copies_op")
     monkeypatch.setattr(scores, "_build_copies_op", Mock(return_value=copies_op))
