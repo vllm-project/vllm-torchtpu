@@ -11,7 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""TPU_RPA_PREFILL_BLOCKS overrides the batched RPA prefill tiles (and only those)."""
+"""Tuned batched RPA prefill tiles: the table entry, the heuristic elsewhere, and
+the refusal of tiles known to be wrong."""
 
 from unittest.mock import MagicMock, patch
 
