@@ -17,6 +17,7 @@ projection matches RMSNormGated followed by the fp8 linear. The torch<->JAX op
 bridge runs the JAX functions on the host."""
 
 import functools
+from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
@@ -77,8 +78,15 @@ def host_ops(monkeypatch):
         "gated_norm_quant",
         functools.partial(gnq.gated_norm_quant, interpret=True),
     )
+
+    def use_host_ops():
+        # Only these modules' bindings: a module first imported during a test
+        # (one that builds a pallas op at import) must keep the real jax_op.
+        for module in (gated_norm_quant_op, linear_common):
+            monkeypatch.setattr(module, "pallas", SimpleNamespace(jax_op=_HostOp))
+
     with jax.default_device(jax.devices("cpu")[0]):
-        yield lambda: monkeypatch.setattr(gated_norm_quant_op.pallas, "jax_op", _HostOp)
+        yield use_host_ops
 
 
 def _loaded_gdn(make_gdn_attention, host_ops, quantization="fp8_channel", tp_size=1):
