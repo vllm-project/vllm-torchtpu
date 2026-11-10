@@ -15,13 +15,15 @@
 
 from __future__ import annotations
 
-from .gdn import GDNLinInLayout, GDNParams
+from .gdn import GDN, GDNLinInLayout, GDNModule, GDNParams
 from .norm import Embedding, EmbeddingModule, Norm, NormModule
 
 __all__ = [
     "Embedding",
     "EmbeddingModule",
+    "GDN",
     "GDNLinInLayout",
+    "GDNModule",
     "GDNParams",
     "Norm",
     "NormModule",
