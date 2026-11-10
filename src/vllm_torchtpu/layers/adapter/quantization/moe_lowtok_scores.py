@@ -440,10 +440,12 @@ def prebuild(
     scores op if routing moves into the kernel. log_summary() reports once all
     MoE layers, draft included, are loaded.
     """
-    from vllm.config import get_current_vllm_config
+    from vllm.config import get_current_vllm_config_or_none
 
     global _ARMED_MAX_TOKENS
-    if not enabled(get_current_vllm_config()):
+    # A layer built outside an engine has no current config; the rule then
+    # does not apply.
+    if not enabled(get_current_vllm_config_or_none()):
         return None
     cap = max_tokens(int(layer.moe_config.ep_size))
     if _ARMED_MAX_TOKENS not in (0, cap):

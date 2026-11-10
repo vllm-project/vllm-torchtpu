@@ -86,7 +86,7 @@ def armed_state(monkeypatch):
 def test_prebuild_arms_the_cap_by_the_rule(monkeypatch, armed_state, config, cap):
     import vllm.config
 
-    monkeypatch.setattr(vllm.config, "get_current_vllm_config", lambda: config)
+    monkeypatch.setattr(vllm.config, "get_current_vllm_config_or_none", lambda: config)
     # This layer is not expert-parallel, so no op is built either way; what
     # the rule decides is whether the kernel is armed at all.
     assert scores.prebuild(SimpleNamespace(), _layer(), "silu") is None
