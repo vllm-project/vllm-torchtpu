@@ -272,3 +272,211 @@ def test_geometry_guard_turns_the_fold_off(hash_block, eagle_drop):
     assert not mamba_tail_fold._verify(scheduler)
     assert not scheduler.mamba_has_prefill_checkpoint_blocks
     assert not any(m.has_prefill_checkpoint_blocks for m in managers)
+
+
+# --- VLLM_TPU_MAMBA_TAIL_FOLD_UNIT: checkpoint and hit at a finer unit -------
+
+U, MB = 256, 512
+
+
+def test_fold_unit_defaults_and_validation(monkeypatch):
+    monkeypatch.delenv("VLLM_TPU_MAMBA_TAIL_FOLD_UNIT", raising=False)
+    assert mamba_tail_fold.fold_unit(MB) == MB
+    monkeypatch.setenv("VLLM_TPU_MAMBA_TAIL_FOLD_UNIT", "512")
+    assert mamba_tail_fold.fold_unit(MB) == MB
+    monkeypatch.setenv("VLLM_TPU_MAMBA_TAIL_FOLD_UNIT", "256")
+    monkeypatch.setenv("TPU_GDN_CHUNK_PAIR", "1")
+    assert mamba_tail_fold.fold_unit(MB) == U
+    # 128 is not a whole chunk-pair tile (256 rows).
+    monkeypatch.setenv("VLLM_TPU_MAMBA_TAIL_FOLD_UNIT", "128")
+    with pytest.raises(ValueError, match="GDN prefill tile"):
+        mamba_tail_fold.fold_unit(MB)
+    monkeypatch.setenv("TPU_GDN_CHUNK_PAIR", "0")
+    assert mamba_tail_fold.fold_unit(MB) == 128
+    # Must divide the Mamba block.
+    monkeypatch.setenv("VLLM_TPU_MAMBA_TAIL_FOLD_UNIT", "384")
+    with pytest.raises(ValueError, match="divide"):
+        mamba_tail_fold.fold_unit(MB)
+
+
+def test_worker_mirror_matches_vllm_rule_fine_unit():
+    b, u = 16, 8
+    for start in range(0, 8 * b, 4):
+        for scheduled in range(0, 8 * b):
+            end = start + scheduled
+            position = get_mamba_prefill_checkpoint_position(end, u, False)
+            valid = scheduled > 0 and is_mamba_prefill_checkpoint_valid(
+                query_start=start,
+                query_end=end,
+                checkpoint_position=position,
+                hash_block_size=u,
+                mamba_block_size=b,
+                checkpoint_alignment=u,
+            )
+            want = (position - start, cdiv(end, b) - 2) if valid else (0, 0)
+            got = prefill_checkpoints(np.array([start]), np.array([scheduled]), b, u)
+            assert (int(got[0][0]), int(got[1][0])) == want, (start, scheduled)
+
+
+def test_worker_mirror_fine_unit_typical_tail():
+    # 1000-token prompt: the checkpoint moves from 512 to 768 (unit 256),
+    # still into column 0 (the running state sits in column 1).
+    offsets, columns = prefill_checkpoints(np.array([0]), np.array([1000]), MB, U)
+    assert (offsets[0], columns[0]) == (768, 0)
+    # A turn resuming at a 256-aligned hit (768) of a 6000-token prompt.
+    offsets, columns = prefill_checkpoints(np.array([768]), np.array([5232]), MB, U)
+    assert (offsets[0] + 768, columns[0]) == (5888, 10)
+
+
+def _fine_manager(monkeypatch) -> KVCacheManager:
+    monkeypatch.setenv("VLLM_TPU_MAMBA_TAIL_FOLD_UNIT", str(U))
+    monkeypatch.setenv("TPU_GDN_CHUNK_PAIR", "1")
+    init_none_hash(sha256)
+    attention = FullAttentionSpec(
+        block_size=MB, num_kv_heads=1, head_size=64, dtype=torch.float32
+    )
+    state = with_prefill_checkpoint(
+        MambaSpec(
+            block_size=MB,
+            shapes=((1, 64),),
+            dtypes=(torch.float32,),
+            mamba_cache_mode="align",
+            page_size_padded=attention.page_size_bytes,
+        )
+    )
+    assert state.prefill_checkpoint_alignment == U
+    config = KVCacheConfig(
+        num_blocks=256,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["state"], state),
+            KVCacheGroupSpec(["attention"], attention),
+        ],
+        prefix_cache_retention_interval=0,
+    )
+    manager = KVCacheManager(
+        config,
+        max_model_len=16384,
+        scheduler_block_size=MB,
+        hash_block_size=U,
+        enable_caching=True,
+    )
+    assert manager.coordinator.enable_partial_hash_hits
+    return manager
+
+
+def _fine_request(request_id: str, tokens: list[int]) -> Request:
+    return Request(
+        request_id,
+        tokens,
+        SamplingParams(max_tokens=16),
+        None,
+        block_hasher=get_request_block_hasher(U, sha256),
+    )
+
+
+@pytest.mark.parametrize("prompt_len", [1000, 1300, 2047, 3000])
+def test_fine_unit_next_turn_hits_the_last_unit_of_the_prior_prompt(
+    monkeypatch, prompt_len
+):
+    """Turn 1 folds its tail and checkpoints at the last 256 boundary; turn 2
+    (turn 1's prompt + new tokens) then hits that boundary, not the last 512.
+    The block the manager hashes there is the one the worker writes."""
+    manager = _fine_manager(monkeypatch)
+    state_manager = manager.coordinator.single_type_managers[0]
+    prompt = list(range(prompt_len))
+    first = _fine_request("t1", prompt)
+    manager.new_step_starts()
+    blocks, hit = manager.get_computed_blocks(first)[:2]
+    assert hit == 0
+    new = manager.allocate_slots(first, prompt_len, 0, blocks)
+    assert new is not None
+    worker_table = new.get_block_ids()[0]
+    offset, column = prefill_checkpoints(np.array([0]), np.array([prompt_len]), MB, U)
+    position, index = state_manager._checkpoints["t1"]
+    assert (int(offset[0]), int(column[0])) == (position, index)
+    assert position == (prompt_len - 1) // U * U
+    assert worker_table[index] == state_manager.req_to_blocks["t1"][index].block_id
+    first.num_computed_tokens = prompt_len
+    manager.free(first)
+
+    second = _fine_request("t2", prompt + list(range(50000, 50000 + 777)))
+    manager.new_step_starts()
+    _, hit = manager.get_computed_blocks(second)[:2]
+    assert hit == position
+    assert prompt_len - hit < U
+
+
+def test_geometry_guard_fine_unit(monkeypatch):
+    monkeypatch.setenv("VLLM_TPU_MAMBA_TAIL_FOLD_UNIT", str(U))
+    monkeypatch.setenv("TPU_GDN_CHUNK_PAIR", "1")
+    scheduler, managers = _geometry_scheduler(U)
+    assert mamba_tail_fold._verify(scheduler)
+    # The unit is set but prompts still hash at 512: the worker would write
+    # positions the manager never reserves, so the fold must turn off.
+    scheduler, managers = _geometry_scheduler(512)
+    assert not mamba_tail_fold._verify(scheduler)
+    assert not any(m.has_prefill_checkpoint_blocks for m in managers)
+
+
+def test_config_sets_prefix_match_unit(monkeypatch):
+    from vllm_torchtpu.models.vllm.qwen4_exp.config import _apply_tail_fold_unit
+
+    def cache(unit=None):
+        return SimpleNamespace(
+            enable_prefix_caching=True, mamba_cache_mode="align", prefix_match_unit=unit
+        )
+
+    monkeypatch.setenv("TPU_GDN_CHUNK_PAIR", "1")
+    monkeypatch.setenv("VLLM_TPU_MAMBA_TAIL_FOLD_UNIT", str(U))
+    monkeypatch.delenv("VLLM_TPU_MAMBA_TAIL_FOLD", raising=False)
+    c = cache()
+    _apply_tail_fold_unit(c, MB)
+    assert c.prefix_match_unit is None  # fold off: untouched
+    monkeypatch.setenv("VLLM_TPU_MAMBA_TAIL_FOLD", "1")
+    _apply_tail_fold_unit(c, MB)
+    assert c.prefix_match_unit == U
+    c = cache(64)
+    _apply_tail_fold_unit(c, MB)
+    assert c.prefix_match_unit == 64  # explicit value kept (guard decides)
+    monkeypatch.setenv("VLLM_TPU_MAMBA_TAIL_FOLD_UNIT", "0")
+    c = cache()
+    _apply_tail_fold_unit(c, MB)
+    assert c.prefix_match_unit is None
+
+
+def test_fine_unit_turn_resuming_mid_block_folds_and_chains(monkeypatch):
+    """Turn 2 resumes at an odd-256 hit (768) and folds a long chunk; its
+    checkpoint is the block the worker writes, and turn 3 hits it."""
+    manager = _fine_manager(monkeypatch)
+    state_manager = manager.coordinator.single_type_managers[0]
+    turn1 = list(range(1000))
+    first = _fine_request("t1", turn1)
+    manager.new_step_starts()
+    blocks, _ = manager.get_computed_blocks(first)[:2]
+    assert manager.allocate_slots(first, 1000, 0, blocks) is not None
+    first.num_computed_tokens = 1000
+    manager.free(first)
+
+    turn2 = turn1 + list(range(60000, 65000))
+    second = _fine_request("t2", turn2)
+    manager.new_step_starts()
+    blocks, hit = manager.get_computed_blocks(second)[:2]
+    assert hit == 768
+    scheduled = len(turn2) - hit
+    assert manager.allocate_slots(second, scheduled, hit, blocks) is not None
+    offset, column = prefill_checkpoints(np.array([hit]), np.array([scheduled]), MB, U)
+    position, index = state_manager._checkpoints["t2"]
+    assert (hit + int(offset[0]), int(column[0])) == (position, index)
+    assert position == (len(turn2) - 1) // U * U
+    # A sub-block Mamba hit copies the hit state into a fresh block (CoW), so
+    # the request's table (what a new request's block ids carry) is the
+    # manager's, not the computed blocks plus the new ones.
+    assert not state_manager.req_to_blocks["t2"][index].is_null
+    second.num_computed_tokens = len(turn2)
+    manager.free(second)
+
+    third = _fine_request("t3", turn2 + [7] * 300)
+    manager.new_step_starts()
+    _, hit = manager.get_computed_blocks(third)[:2]
+    assert hit == position

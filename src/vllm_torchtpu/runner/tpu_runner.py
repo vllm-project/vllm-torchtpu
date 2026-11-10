@@ -85,7 +85,11 @@ from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorOutput
 from vllm_torchtpu import envs, stall_watchdog, utils
 from vllm_torchtpu.block_major_pool import BlockMajorPoolLayout
 from vllm_torchtpu.compilation import shape_variants
-from vllm_torchtpu.core.mamba_tail_fold import WORKER_COUNTER, prefill_checkpoints
+from vllm_torchtpu.core.mamba_tail_fold import (
+    WORKER_COUNTER,
+    fold_unit,
+    prefill_checkpoints,
+)
 from vllm_torchtpu.distributed import utils as dist_utils
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
     TpuKVConnectorStats,
@@ -2273,6 +2277,7 @@ class TPUModelRunner(GPUModelRunner):
             ],
             num_scheduled_tokens_per_req[:num_reqs],
             self._mamba_state_block_size,
+            fold_unit(self._mamba_state_block_size),
         )
         exported = int(np.count_nonzero(offsets))
         WORKER_COUNTER.add(

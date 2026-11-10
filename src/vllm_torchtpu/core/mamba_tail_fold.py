@@ -57,42 +57,78 @@ _PATCH_FLAG = "_tpu_mamba_tail_fold_patch"
 _LOG_INTERVAL_S = 60.0
 
 
+def gdn_max_prefill_tile() -> int:
+    """Largest GDN PER_SEQ prefill tile (rows) the kernel can pick.
+
+    Dynamic tiling picks at most 128 rows (``tiling.MIXED_TILE_SIZES``), the
+    static default is 64, and ``TPU_GDN_CHUNK_PAIR`` doubles the tile.
+    """
+    return 256 if envs.TPU_GDN_CHUNK_PAIR else 128
+
+
+def fold_unit(block_size: int) -> int:
+    """Checkpoint / prefix-hit granularity of the fold for a Mamba block.
+
+    ``VLLM_TPU_MAMBA_TAIL_FOLD_UNIT`` (0: the block itself, the original
+    geometry). A finer unit must divide the block, so a hit still maps to one
+    state block, and be a multiple of the largest GDN prefill tile, so the
+    checkpoint offset always ends a tile and the kernel needs no change.
+    """
+    unit = envs.VLLM_TPU_MAMBA_TAIL_FOLD_UNIT
+    if unit <= 0 or unit == block_size:
+        return block_size
+    tile = gdn_max_prefill_tile()
+    if block_size % unit or unit % tile:
+        raise ValueError(
+            f"VLLM_TPU_MAMBA_TAIL_FOLD_UNIT={unit} must divide the Mamba block "
+            f"({block_size}) and be a multiple of the largest GDN prefill tile "
+            f"({tile}{', TPU_GDN_CHUNK_PAIR=1' if tile == 256 else ''})."
+        )
+    return unit
+
+
 def with_prefill_checkpoint(spec):
     """``spec`` with one internal prefill checkpoint block per request.
 
-    The alignment is the spec's block size: the scheduler only keeps a tail
-    when the chunk starts on a hash block, which here is the Mamba block, so
-    the checkpoint offset is always a whole number of blocks. That makes it
-    a multiple of every GDN prefill tile (at most 256 rows).
+    The alignment is the fold unit (``fold_unit``; the spec's block size by
+    default). The scheduler only keeps a tail when the chunk starts on a hash
+    block, and the guard requires the hash block to equal the unit, so the
+    checkpoint offset is always a whole number of units. That makes it a
+    multiple of every GDN prefill tile (at most 256 rows).
     """
     return replace(
         spec,
         num_prefill_checkpoint_blocks=1,
-        prefill_checkpoint_alignment=spec.block_size,
+        prefill_checkpoint_alignment=fold_unit(spec.block_size),
     )
 
 
 def prefill_checkpoints(
-    num_computed: np.ndarray, num_scheduled: np.ndarray, block_size: int
+    num_computed: np.ndarray,
+    num_scheduled: np.ndarray,
+    block_size: int,
+    hash_block_size: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Per request: (offset in the step's query, block-table column).
 
     Mirrors ``MambaManager._needs_internal_checkpoint`` and
     ``get_mamba_prefill_checkpoint_position`` with the hash block, the cache
-    hit alignment and the Mamba block all equal to ``block_size`` and no
-    EAGLE block drop (``patch_mamba_tail_fold`` turns the fold off for any
-    other geometry). Offset 0 means no checkpoint.
+    hit alignment and the checkpoint alignment all equal to
+    ``hash_block_size`` (the fold unit; default ``block_size``), Mamba block
+    ``block_size`` and no EAGLE block drop (``patch_mamba_tail_fold`` turns
+    the fold off for any other geometry). Offset 0 means no checkpoint.
     """
+    unit = block_size if hash_block_size is None else hash_block_size
     start = num_computed.astype(np.int64)
     end = start + num_scheduled.astype(np.int64)
-    position = np.maximum((end - 1) // block_size * block_size, 0)
+    position = np.maximum((end - 1) // unit * unit, 0)
     column = -(-end // block_size) - 2
     initial_column = (start - 1) // block_size
     valid = (
         (num_scheduled > 0)
-        & (start % block_size == 0)
+        & (start % unit == 0)
         & (column > initial_column)
-        & (start + block_size <= position)
+        & (start + unit <= position)
         & (start < position)
         & (position < end)
         & (column >= 0)
@@ -170,27 +206,37 @@ def _geometry_mismatch(scheduler) -> str | None:
     if len(sizes) != 1:
         return f"Mamba groups with different block sizes {sorted(sizes)}"
     (block,) = sizes
+    # The worker mirrors the manager with hash == cache-hit alignment ==
+    # checkpoint alignment == the fold unit (the Mamba block by default).
+    unit = fold_unit(block)
+    what = "Mamba block" if unit == block else "VLLM_TPU_MAMBA_TAIL_FOLD_UNIT"
+    hint = "" if unit == block else f" (set --prefix-match-unit {unit})"
     for m in managers:
         if not m.has_prefill_checkpoint_blocks:
             return "a Mamba group without a prefill checkpoint block"
         if m.drop_eagle_checkpoint_block:
             return "a Mamba group drops the EAGLE block"
-        if m.block_pool.hash_block_size != block:
-            return f"hash block {m.block_pool.hash_block_size} != Mamba block {block}"
-        if m.cache_hit_alignment_tokens != block:
+        alignment = getattr(
+            getattr(m, "kv_cache_spec", None), "prefill_checkpoint_alignment", unit
+        )
+        if alignment != unit:
+            return f"checkpoint alignment {alignment} != {what} {unit}"
+        if m.block_pool.hash_block_size != unit:
+            return f"hash block {m.block_pool.hash_block_size} != {what} {unit}{hint}"
+        if m.cache_hit_alignment_tokens != unit:
             return (
                 f"cache hit alignment {m.cache_hit_alignment_tokens} != "
-                f"Mamba block {block}"
+                f"{what} {unit}{hint}"
             )
-    if scheduler.hash_block_size != block:
-        return f"scheduler hash block {scheduler.hash_block_size} != {block}"
+    if scheduler.hash_block_size != unit:
+        return f"scheduler hash block {scheduler.hash_block_size} != {unit}{hint}"
     checkpoint_block = (
         scheduler.hash_block_size
         if scheduler.mamba_partial_cache_hit
         else scheduler.block_size
     )
-    if checkpoint_block != block:
-        return f"scheduler checkpoint block {checkpoint_block} != {block}"
+    if checkpoint_block != unit:
+        return f"scheduler checkpoint block {checkpoint_block} != {unit}"
     return None
 
 
@@ -222,8 +268,9 @@ def _verify(scheduler) -> bool:
         else:
             logger.info(
                 "VLLM_TPU_MAMBA_TAIL_FOLD: on; a prefill that fits one chunk "
-                "keeps its tail and checkpoints its Mamba state at block %d "
-                "inside the step.",
+                "keeps its tail and checkpoints its Mamba state at a %d-token "
+                "boundary inside the step (Mamba block %d).",
+                scheduler.hash_block_size,
                 scheduler.cache_config.block_size,
             )
     else:
