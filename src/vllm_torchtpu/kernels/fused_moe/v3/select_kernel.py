@@ -92,6 +92,7 @@ def _select_body(
     logits = jnp.where(is_nan, UNROUTABLE_LOGIT, raw_logits)
     expert_iota = jax.lax.broadcasted_iota(jnp.int32, logits.shape, 1)
     index_out = scratch[0] if message_rows else indices_ref
+    selected = slot_iota = None
     if renormalize:
         selected = jnp.full((logits.shape[0], top_k), UNROUTABLE_LOGIT, jnp.float32)
         slot_iota = jax.lax.broadcasted_iota(jnp.int32, selected.shape, 1)
@@ -107,12 +108,14 @@ def _select_body(
         # last expert, so every index returned is a real expert.
         index = jnp.min(jnp.where(is_max, expert_iota, num_experts - 1), axis=1)
         if renormalize:
+            assert selected is not None and slot_iota is not None
             selected = jnp.where(slot_iota == k, row_max, selected)
         else:
             weights_ref[:, k] = row_max[:, 0]
         index_out[:, k] = index.astype(jnp.int32)
         logits = jnp.where(expert_iota == index[:, None], UNROUTABLE_LOGIT, logits)
     if renormalize:
+        assert selected is not None
         if drop_nan_rows:
             routes = jnp.logical_and(
                 jnp.logical_not(jnp.any(is_nan, axis=1, keepdims=True)), routes
