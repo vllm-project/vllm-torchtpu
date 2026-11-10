@@ -81,6 +81,10 @@ _GCS_READ_TIMEOUT_S = 120
 EXPERT_ORDER_ATTR = "_tpu_expert_order"
 # Set on a placed RoutedExperts layer once its router is in slot order.
 ROUTER_RENUMBERED_ATTR = "_tpu_router_renumbered"
+# Set on a RoutedExperts layer whose weights carry redundant expert copies after
+# the rank's primary experts: the number of primary slots. Unset, every slot is
+# a primary (main's permutation tables never set it).
+PRIMARY_EXPERTS_ATTR = "_tpu_primary_experts"
 
 # Layer index -> the EP rank whose slots this process's expert map holds, for
 # every layer whose expert map follows the placement. The fetch-time filter
