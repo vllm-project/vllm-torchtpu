@@ -24,9 +24,10 @@ import pytest
 import torch
 from einops import rearrange
 
-from vllm_torchtpu.kernels.experimental import gated_norm_quant as gnq
+from vllm_torchtpu.models.qwen3_5.kernels import gated_norm_quant as gnq
 from vllm_torchtpu.kernels.quantized_matmul.util import quantize_tensor
-from vllm_torchtpu.layers.adapter import gated_norm_quant_op, linear_common
+from vllm_torchtpu.layers.adapter import linear_common
+from vllm_torchtpu.models.qwen3_5.kernels import gated_norm_quant_op
 
 pytestmark = pytest.mark.cpu_test
 

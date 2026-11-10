@@ -19,8 +19,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from vllm_torchtpu.kernels.experimental import gated_norm_quant as gnq
-from vllm_torchtpu.kernels.experimental.gated_norm_quant import kernel
+from vllm_torchtpu.models.qwen3_5.kernels import gated_norm_quant as gnq
+from vllm_torchtpu.models.qwen3_5.kernels.gated_norm_quant import kernel
 
 pytestmark = pytest.mark.cpu_test
 
