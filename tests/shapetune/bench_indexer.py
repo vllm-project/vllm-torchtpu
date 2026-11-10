@@ -236,7 +236,9 @@ def decode_configs(rows):
     """Served default first. KV blocks: multiples of 128 (and of 32 keys/page)."""
     base = [_dec(3328, 4), _dec(1664, 4), _dec(6656, 4), _dec(3328, 2), _dec(3328, 8)]
     if rows >= 64:
-        base += [_dec(2560, 4), _dec(4992, 4), _dec(6656, 8)]
+        # _CHUNK=64: two shared-stream windows (v7x SMEM gives 128 at served
+        # max_model_len, so rows <= 128 are one window by default).
+        base += [_dec(2560, 4), _dec(4992, 4), _dec(6656, 8), _dec(3328, 4, _CHUNK=64)]
     return base
 
 
