@@ -3841,6 +3841,136 @@
       "concise_description": "Object of class `NoneType` has no attribute `write_packed`"
     },
     {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/tools/bench.py",
+      "name": "bad-argument-type",
+      "concise_description": "Unpacked keyword argument `ndarray` is not assignable to parameter `allow_pickle` with type `bool` in function `numpy.lib._npyio_impl.savez`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/tools/bench.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `list[ndarray[tuple[int], dtype[signedinteger[_32Bit]]]]` is not assignable to parameter `kda` with type `list[list[int]]` in function `vllm_torchtpu.models.kimi_k3.megakernel.tools.k3.Pools.tables`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/tools/bench.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `KimiDecoder` has no attribute `program`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/tools/bench.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `KimiDecoder` has no attribute `program`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/tools/bench.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `KimiDecoder` has no attribute `program`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/tools/bench.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `KimiDecoder` has no attribute `program`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/tools/check.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `Tensor | None` is not assignable to parameter `tensor` with type `Tensor` in function `vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim.bridge.materialize`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/tools/check.py",
+      "name": "not-iterable",
+      "concise_description": "Type `None` is not iterable"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/tools/check.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `KimiDecoder` has no attribute `program`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/tools/check.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `KimiDecoder` has no attribute `program`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/tools/check.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `KimiDecoder` has no attribute `ring`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/tools/check.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `object` has no attribute `weights`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/tools/check.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `KimiDecoder` has no attribute `program`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/tools/check.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `KimiDecoder` has no attribute `program`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/tools/check.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `KimiDecoder` has no attribute `slots`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/tools/check.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `KimiDecoder` has no attribute `slots`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/tools/check.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `KimiDecoder` has no attribute `cp_rank`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/tools/check.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `KimiDecoder` has no attribute `_writer`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/tools/check.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `KimiDecoder` has no attribute `ring`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/tools/check.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `KimiDecoder` has no attribute `_writer`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/tools/check.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `object` has no attribute `config`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/tools/check.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/tools/check.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/tools/coverage.py",
+      "name": "unsupported-operation",
+      "concise_description": "`<=` is not supported between `int` and `None`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/tools/coverage.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/tools/coverage.py",
+      "name": "unsupported-operation",
+      "concise_description": "`-` is not supported between `None` and `int`"
+    },
+    {
       "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/attention.py",
       "name": "bad-assignment",
       "concise_description": "`(*args: Unknown, **kwargs: Unknown) -> None` is not assignable to attribute `Event` with type `type[Event]`"

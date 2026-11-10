@@ -15,15 +15,60 @@
 
 from __future__ import annotations
 
+import sys
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
-from vllm_torchtpu.envs import env_str
+from vllm_torchtpu.envs import env_int, env_str
 
 if TYPE_CHECKING:
-    SLURM_NODEID: str = "0"
+    JOBID: str = ""
+    K3_VENV_DIR: str = ""
+    LIBTPU_INIT_ARGS: str = ""
+    MEGAKERNEL_TOOL_WORKER: str = ""
+    SLURM_JOB_ID: str = ""
+    SLURM_LOCALID: str = ""
+    SLURM_NODEID: str = ""
+    SLURM_PROCID: int = 0
+    TORCH_TPU_BASE_PORT: int = 8070
+    TP32_HOST_IPS: str = ""
+    TP32_SESSION: str = ""
+    TRACE_RANKS: str = "0"
 
-environment_variables = {
+
+def _required(name: str) -> Callable[[], str]:
+    """A string knob that must be set; reading it unset raises ``KeyError``."""
+    read = env_str(name, "")
+
+    def _get() -> str:
+        """Return the value, or raise when the variable is unset or empty."""
+        value = read()
+        if not value:
+            raise KeyError(name)
+        return value
+
+    return _get
+
+
+environment_variables: dict[str, Callable[[], Any]] = {
+    # Four-host allocation the bring-up tools launch on.
+    "JOBID": env_str("JOBID", ""),
+    # Python environment the launched workers run; defaults to this one.
+    "K3_VENV_DIR": env_str("K3_VENV_DIR", sys.prefix),
+    # libtpu flags the profile command extends with its LLO dump flags.
+    "LIBTPU_INIT_ARGS": env_str("LIBTPU_INIT_ARGS", ""),
+    # "1" in a process the harness launched as a worker.
+    "MEGAKERNEL_TOOL_WORKER": env_str("MEGAKERNEL_TOOL_WORKER", ""),
+    # Launcher variables, set per worker.
+    "SLURM_JOB_ID": env_str("SLURM_JOB_ID", ""),
+    "SLURM_LOCALID": _required("SLURM_LOCALID"),
     "SLURM_NODEID": env_str("SLURM_NODEID", "0"),
+    "SLURM_PROCID": env_int("SLURM_PROCID", 0),
+    "TORCH_TPU_BASE_PORT": env_int("TORCH_TPU_BASE_PORT", 8070),
+    "TP32_HOST_IPS": _required("TP32_HOST_IPS"),
+    "TP32_SESSION": _required("TP32_SESSION"),
+    # Ranks that save an xprof trace in `bench`, comma separated.
+    "TRACE_RANKS": env_str("TRACE_RANKS", "0"),
 }
 
 
