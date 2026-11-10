@@ -11,8 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Dynamic per-token activation quantization kernels for Fused EP MoE v3.
-"""
+"""Dynamic per-token activation quantization kernels for Fused EP MoE v3."""
+
 import jax.numpy as jnp
 
 FP8 = jnp.float8_e4m3fn
@@ -69,14 +69,14 @@ def quantize_rows(rows, scale_dtype=jnp.float32, block=0, dtype=jnp.float32):
         return apply_row_scale(rows, inverse, scalable, dtype), scale
     width = rows.shape[-1]
     if width % block:
-        raise ValueError(f"a row of {width} values is not a whole number of "
-                         f"{block}-value blocks")
+        raise ValueError(
+            f"a row of {width} values is not a whole number of {block}-value blocks"
+        )
     quantized, scales = [], []
     for lo in range(0, width, block):
-        chunk = rows[:, lo:lo + block]
+        chunk = rows[:, lo : lo + block]
         amax = jnp.max(jnp.abs(chunk), axis=-1, keepdims=True)
         scale, inverse, scalable = row_scale(amax, scale_dtype)
         quantized.append(apply_row_scale(chunk, inverse, scalable, dtype))
         scales.append(scale)
-    return (jnp.concatenate(quantized,
-                            axis=-1), jnp.concatenate(scales, axis=-1))
+    return (jnp.concatenate(quantized, axis=-1), jnp.concatenate(scales, axis=-1))

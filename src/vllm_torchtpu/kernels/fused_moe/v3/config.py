@@ -16,6 +16,7 @@
 Specifies token tile (`bt`), intermediate dimension tile (`bf`), hidden dimension
 tile (`bd`), and VMEM double-buffering parameters.
 """
+
 import dataclasses
 
 import jax.numpy as jnp
@@ -193,12 +194,14 @@ class Config:
         False: one copy per row from the token buffer, whose rows are in
         token order. The copies overlap the result push.
         True: a sparse-core gather sorts the routed rows into expert
-        order first, and the kernel fetches each tile as one copy. Whole-expert builds only: a streamed build keeps
+        order first, and the kernel fetches each tile as one copy.
+        Whole-expert builds only: a streamed build keeps
         the per-row fetch, and so does a width the gather cannot move or
         a table whose sort program is over the sparse core's program
         size. None (the default): sorted_rows_by_shape decides from the
         shard's experts and tokens.
     """
+
     result_slots: int = RESULT_SLOTS_DEFAULT
     row_fetch_ahead: int = ROW_FETCH_AHEAD_DEFAULT
     weight_slots: int = WEIGHT_SLOTS_DEFAULT
@@ -236,16 +239,14 @@ class Config:
     def token_rows_block(self):
         """The token rows' rounding block: token_block, or activation_block
         when token_block is None."""
-        return (self.activation_block
-                if self.token_block is None else self.token_block)
+        return self.activation_block if self.token_block is None else self.token_block
 
     @classmethod
     def for_shape(cls, *, hidden, inter, experts_per_shard, top_k):
         """The record for a layer shape: the defaults, with the fields
         TUNED_BY_SHAPE holds for (hidden, inter, experts_per_shard, top_k)
         on top."""
-        tuned = TUNED_BY_SHAPE.get((hidden, inter, experts_per_shard, top_k),
-                                   {})
+        tuned = TUNED_BY_SHAPE.get((hidden, inter, experts_per_shard, top_k), {})
         return cls(**tuned)
 
     @property
@@ -260,101 +261,148 @@ class Config:
 
     def __post_init__(self):
         if not any(self.sorted_rows is v for v in (None, True, False)):
-            raise ValueError(f"sorted_rows {self.sorted_rows!r}: True, False "
-                             "or None for the choice by shape")
+            raise ValueError(
+                f"sorted_rows {self.sorted_rows!r}: True, False "
+                "or None for the choice by shape"
+            )
         if self.result_slots < 2:
-            raise ValueError(f"result_slots {self.result_slots}: one slot "
-                             "computes while another drains, so at least 2")
+            raise ValueError(
+                f"result_slots {self.result_slots}: one slot "
+                "computes while another drains, so at least 2"
+            )
         if not 1 <= self.row_fetch_ahead < self.result_slots:
             raise ValueError(
                 f"row_fetch_ahead {self.row_fetch_ahead} has to be between 1 "
                 f"and result_slots - 1 = {self.result_slots - 1}: a "
-                "tile's rows land in the slot its results are staged in")
+                "tile's rows land in the slot its results are staged in"
+            )
         if self.weight_slots < 2:
-            raise ValueError(f"weight_slots {self.weight_slots}: one slot is "
-                             "read while another fills, so at least 2")
+            raise ValueError(
+                f"weight_slots {self.weight_slots}: one slot is "
+                "read while another fills, so at least 2"
+            )
         if not 1 <= self.weight_prefetch < self.weight_slots:
             raise ValueError(
                 f"weight_prefetch {self.weight_prefetch} has to be between 1 "
                 f"and weight_slots - 1 = {self.weight_slots - 1}: the refill "
-                "must not land in a slot an earlier expert still reads")
+                "must not land in a slot an earlier expert still reads"
+            )
         if self.tables_blocks_per_step < 0:
-            raise ValueError(f"tables_blocks_per_step "
-                             f"{self.tables_blocks_per_step}: a count of "
-                             "routing blocks, or 0 for the layer's choice")
+            raise ValueError(
+                f"tables_blocks_per_step "
+                f"{self.tables_blocks_per_step}: a count of "
+                "routing blocks, or 0 for the layer's choice"
+            )
         if self.stream_block < 0 or self.stream_block % LANES:
-            raise ValueError(f"stream_block {self.stream_block}: 0 (the "
-                             f"layer's choice) or a multiple of {LANES}")
+            raise ValueError(
+                f"stream_block {self.stream_block}: 0 (the "
+                f"layer's choice) or a multiple of {LANES}"
+            )
         if not 0.0 < self.vmem_fraction <= 1.0:
-            raise ValueError(f"vmem_fraction {self.vmem_fraction}: a share of "
-                             "the chip's VMEM, above 0 and at most 1")
+            raise ValueError(
+                f"vmem_fraction {self.vmem_fraction}: a share of "
+                "the chip's VMEM, above 0 and at most 1"
+            )
         if self.stream_rows < ROW_BLOCK or self.stream_rows % ROW_BLOCK:
-            raise ValueError(f"stream_rows {self.stream_rows}: a whole number "
-                             f"of {ROW_BLOCK}-row blocks")
+            raise ValueError(
+                f"stream_rows {self.stream_rows}: a whole number "
+                f"of {ROW_BLOCK}-row blocks"
+            )
         if self.combine_dtype not in ELEMENTWISE_DTYPES:
-            raise ValueError(f"combine_dtype {self.combine_dtype!r} is not "
-                             f"one of {ELEMENTWISE_DTYPES}")
+            raise ValueError(
+                f"combine_dtype {self.combine_dtype!r} is not "
+                f"one of {ELEMENTWISE_DTYPES}"
+            )
         if self.elementwise_dtype not in ELEMENTWISE_DTYPES:
-            raise ValueError(f"elementwise_dtype {self.elementwise_dtype!r} "
-                             f"is not one of {ELEMENTWISE_DTYPES}")
+            raise ValueError(
+                f"elementwise_dtype {self.elementwise_dtype!r} "
+                f"is not one of {ELEMENTWISE_DTYPES}"
+            )
         if self.intermediate not in INTERMEDIATES:
             raise ValueError(
-                f"intermediate {self.intermediate!r} is not one of "
-                f"{INTERMEDIATES}")
+                f"intermediate {self.intermediate!r} is not one of {INTERMEDIATES}"
+            )
         if self.result_rows not in RESULT_ROWS:
-            raise ValueError(f"result_rows {self.result_rows!r} is not one of "
-                             f"{RESULT_ROWS}")
+            raise ValueError(
+                f"result_rows {self.result_rows!r} is not one of {RESULT_ROWS}"
+            )
         if self.token_rows not in TOKEN_ROWS:
-            raise ValueError(f"token_rows {self.token_rows!r} is not one of "
-                             f"{TOKEN_ROWS}")
+            raise ValueError(
+                f"token_rows {self.token_rows!r} is not one of {TOKEN_ROWS}"
+            )
         if self.activation_block < 0 or self.activation_block % LANES:
-            raise ValueError(f"activation_block {self.activation_block}: 0 "
-                             f"(one scale per row) or a multiple of {LANES}")
+            raise ValueError(
+                f"activation_block {self.activation_block}: 0 "
+                f"(one scale per row) or a multiple of {LANES}"
+            )
         if self.token_block is not None and (
-                not isinstance(self.token_block, int) or self.token_block < 0
-                or self.token_block % LANES):
-            raise ValueError(f"token_block {self.token_block}: None (the "
-                             f"activation block), 0 (one scale per row) or a "
-                             f"multiple of {LANES}")
+            not isinstance(self.token_block, int)
+            or self.token_block < 0
+            or self.token_block % LANES
+        ):
+            raise ValueError(
+                f"token_block {self.token_block}: None (the "
+                f"activation block), 0 (one scale per row) or a "
+                f"multiple of {LANES}"
+            )
         dtypes = [jnp.dtype(d) for d in ROW_SCALE_DTYPES]
         if jnp.dtype(self.row_scale_dtype) not in dtypes:
-            raise ValueError(f"row_scale_dtype {self.row_scale_dtype} is not "
-                             f"one of {[d.name for d in dtypes]}")
+            raise ValueError(
+                f"row_scale_dtype {self.row_scale_dtype} is not "
+                f"one of {[d.name for d in dtypes]}"
+            )
         if self.gather_block_rows <= 0 or self.gather_block_rows % SUBLANES:
-            raise ValueError(f"gather_block_rows {self.gather_block_rows}: a "
-                             f"whole number of {SUBLANES}-row blocks")
+            raise ValueError(
+                f"gather_block_rows {self.gather_block_rows}: a "
+                f"whole number of {SUBLANES}-row blocks"
+            )
         if self.gather_ring < 1:
-            raise ValueError(f"gather_ring {self.gather_ring}: at least one "
-                             "gather DMA in flight")
+            raise ValueError(
+                f"gather_ring {self.gather_ring}: at least one gather DMA in flight"
+            )
         if self.scatter_chunk_pairs <= 0 or self.scatter_chunk_pairs % LANES:
             raise ValueError(
-                f"scatter_chunk_pairs {self.scatter_chunk_pairs}: "
-                f"a multiple of {LANES}")
+                f"scatter_chunk_pairs {self.scatter_chunk_pairs}: a multiple of {LANES}"
+            )
         if self.scatter_ring < 1:
-            raise ValueError(f"scatter_ring {self.scatter_ring}: at least one "
-                             "scatter chunk in flight")
-        if (self.combine_tokens_per_tile <= 0
-                or self.combine_tokens_per_tile % SUBLANES):
-            raise ValueError(f"combine_tokens_per_tile "
-                             f"{self.combine_tokens_per_tile}: a whole number "
-                             f"of {SUBLANES}-row blocks")
-        if (self.combine_unroll < 1
-                or self.combine_tokens_per_tile % self.combine_unroll):
-            raise ValueError(f"combine_unroll {self.combine_unroll}: at least "
-                             "1, dividing combine_tokens_per_tile "
-                             f"{self.combine_tokens_per_tile}")
-        if (self.activation_columns_per_pass <= 0
-                or self.activation_columns_per_pass % LANES):
-            raise ValueError(f"activation_columns_per_pass "
-                             f"{self.activation_columns_per_pass}: a multiple "
-                             f"of {LANES}")
-        if (self.tables_zero_words <= 0
-                or self.tables_zero_words % (SUBLANES * LANES)):
-            raise ValueError(f"tables_zero_words {self.tables_zero_words}: a "
-                             f"whole number of {SUBLANES * LANES}-word tiles")
+            raise ValueError(
+                f"scatter_ring {self.scatter_ring}: at least one "
+                "scatter chunk in flight"
+            )
+        if self.combine_tokens_per_tile <= 0 or self.combine_tokens_per_tile % SUBLANES:
+            raise ValueError(
+                f"combine_tokens_per_tile "
+                f"{self.combine_tokens_per_tile}: a whole number "
+                f"of {SUBLANES}-row blocks"
+            )
+        if (
+            self.combine_unroll < 1
+            or self.combine_tokens_per_tile % self.combine_unroll
+        ):
+            raise ValueError(
+                f"combine_unroll {self.combine_unroll}: at least "
+                "1, dividing combine_tokens_per_tile "
+                f"{self.combine_tokens_per_tile}"
+            )
+        if (
+            self.activation_columns_per_pass <= 0
+            or self.activation_columns_per_pass % LANES
+        ):
+            raise ValueError(
+                f"activation_columns_per_pass "
+                f"{self.activation_columns_per_pass}: a multiple "
+                f"of {LANES}"
+            )
+        if self.tables_zero_words <= 0 or self.tables_zero_words % (SUBLANES * LANES):
+            raise ValueError(
+                f"tables_zero_words {self.tables_zero_words}: a "
+                f"whole number of {SUBLANES * LANES}-word tiles"
+            )
         if self.weight_dma_priority not in WEIGHT_DMA_PRIORITIES:
-            raise ValueError(f"weight_dma_priority {self.weight_dma_priority} "
-                             f"is not one of {WEIGHT_DMA_PRIORITIES}")
+            raise ValueError(
+                f"weight_dma_priority {self.weight_dma_priority} "
+                f"is not one of {WEIGHT_DMA_PRIORITIES}"
+            )
 
 
 def sorted_rows_by_shape(experts_per_shard, tokens_per_shard):
@@ -364,5 +412,7 @@ def sorted_rows_by_shape(experts_per_shard, tokens_per_shard):
     fetch otherwise: with many experts per shard or few tokens the sort
     pays for itself, with few experts and many tokens the per-row copies
     hide under the result push and the sort is exposed."""
-    return (experts_per_shard >= SORTED_ROWS_EXPERTS_PER_SHARD
-            or tokens_per_shard <= SORTED_ROWS_TOKENS_PER_SHARD)
+    return (
+        experts_per_shard >= SORTED_ROWS_EXPERTS_PER_SHARD
+        or tokens_per_shard <= SORTED_ROWS_TOKENS_PER_SHARD
+    )
