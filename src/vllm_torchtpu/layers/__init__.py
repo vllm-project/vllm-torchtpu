@@ -21,5 +21,11 @@ from vllm_torchtpu.tokenizers import register_tokenizers
 
 
 def register_layers() -> None:
+    from vllm_torchtpu.distributed.tpu_multiport_dp import install_device_ids_patch
+
     register_models()
     register_tokenizers()
+    # vLLM loads general plugins in EngineArgs.__post_init__, before
+    # create_engine_config resolves --device-ids, which a multi-port DP child
+    # receives as TPU core indices; see tpu_multiport_dp.
+    install_device_ids_patch()
