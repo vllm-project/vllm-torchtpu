@@ -159,7 +159,11 @@ def test_section_is_registered_and_kept_out_of_the_compile_cache_key():
 
 
 def _built(
-    additional=None, kv_role="kv_producer", retention_enabled=True, equal_cost=True
+    additional=None,
+    kv_role="kv_producer",
+    retention_enabled=True,
+    architecture="Qwen3_5MoeForConditionalGeneration",
+    equal_cost=True,
 ):
     """Runs TpuPipelineChunkScheduler.__init__ over a stub base __init__, with
     main's equal-cost chunking ``equal_cost``; returns the scheduler and the
@@ -173,6 +177,7 @@ def _built(
                 None if kv_role is None else SimpleNamespace(kv_role=kv_role)
             ),
             parallel_config=SimpleNamespace(pipeline_parallel_size=8),
+            model_config=SimpleNamespace(architectures=[architecture]),
         )
         self.need_mamba_block_aligned_split = False
         self.kv_cache_manager = SimpleNamespace()
@@ -260,6 +265,23 @@ def test_retention_follows_the_kv_producer_rule():
     assert s._retention is None
     s, _ = _built(kv_role="kv_producer", retention_enabled=False)
     assert s._retention is None
+
+
+@pytest.mark.parametrize(
+    "architecture, retained",
+    [
+        ("Qwen3_5MoeForConditionalGeneration", True),
+        ("Qwen3_5MoeForCausalLM", True),
+        # Other hybrid (GDN or Mamba + attention) models keep main's scheduler.
+        ("Qwen3NextForCausalLM", False),
+        ("Qwen3_5ForConditionalGeneration", False),
+        ("JambaForCausalLM", False),
+    ],
+)
+def test_retention_is_scoped_to_the_qwen3_5_moe_architectures(architecture, retained):
+    s, calls = _built(kv_role="kv_producer", architecture=architecture)
+    assert (s._retention is not None) is retained
+    assert ("retention" in calls) is retained
 
 
 # -- default behaviour: the scheduler as it was without options ----------------
