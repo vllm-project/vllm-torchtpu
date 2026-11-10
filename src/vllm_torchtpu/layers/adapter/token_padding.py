@@ -30,9 +30,7 @@ class TokenPaddingState:
     # (valid, padded) counts the mask was last written for.
     _last_counts: tuple[int, int] | None = field(default=None, init=False)
     _mask_has_true: bool = field(default=True, init=False)
-    _zero_mask_dev: torch.Tensor | None = field(
-        default=None, init=False, repr=False
-    )
+    _zero_mask_dev: torch.Tensor | None = field(default=None, init=False, repr=False)
     _mask_cache: dict[tuple[int, int], torch.Tensor] = field(
         default_factory=dict, init=False, repr=False
     )
@@ -70,9 +68,7 @@ class TokenPaddingState:
         if need_true:
             mask_dev = self._mask_cache.get(counts)
             if mask_dev is None:
-                host = torch.zeros(
-                    self.local_padding_mask.shape[0], dtype=torch.bool
-                )
+                host = torch.zeros(self.local_padding_mask.shape[0], dtype=torch.bool)
                 host[valid:padded] = True
                 mask_dev = host.to(device=dev)
                 if len(self._mask_cache) < 128:
@@ -87,9 +83,7 @@ class TokenPaddingState:
         if self.local_valid_tokens is not None:
             valid_dev = self._valid_cache.get(valid)
             if valid_dev is None:
-                valid_dev = torch.tensor(
-                    [valid], dtype=torch.int32, device=dev
-                )
+                valid_dev = torch.tensor([valid], dtype=torch.int32, device=dev)
                 if len(self._valid_cache) < 256:
                     self._valid_cache[valid] = valid_dev
             self.local_valid_tokens.copy_(valid_dev)
