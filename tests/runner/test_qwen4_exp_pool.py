@@ -704,6 +704,33 @@ def dcp_config(monkeypatch, *, pair=False, compressed=False, dcp="2", tp=8):
     return cfg
 
 
+@pytest.mark.parametrize("dcp", ["1", "2"])
+def test_tail_fold_turns_off_under_main_kv_dcp(monkeypatch, caplog, dcp):
+    """za5 c48 (VLLM_TPU_QSA_MAIN_KV_DCP=2) ran the fold's worker path while
+    the scheduler guard rejected the doubled scheduler block. Under any
+    context parallelism the state specs carry no checkpoint block, so the
+    scheduler, the manager and the worker all see the fold off, and the
+    reason is logged."""
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    from vllm_torchtpu.core import mamba_tail_fold
+
+    monkeypatch.setenv("VLLM_TPU_MAMBA_TAIL_FOLD", "1")
+    monkeypatch.delenv("VLLM_TPU_MAMBA_TAIL_FOLD_UNIT", raising=False)
+    monkeypatch.setattr(mamba_tail_fold, "_DCP_LOGGED", set())
+    cfg = dcp_config(monkeypatch, dcp=dcp)
+    cfg.cache_config.enable_prefix_caching = True
+    _, specs = pooled_cache_specs(cfg)
+    states = [s for s in specs.values() if isinstance(s, MambaSpec)]
+    assert states
+    folded = {s.num_prefill_checkpoint_blocks > 0 for s in states}
+    assert folded == {dcp == "1"}
+    blocked = mamba_tail_fold.fold_blocked_by_context_parallel(cfg, int(dcp))
+    assert (blocked is None) == (dcp == "1")
+    cfg.parallel_config.decode_context_parallel_size = 2
+    assert mamba_tail_fold.fold_blocked_by_context_parallel(cfg, 1)
+
+
 @pytest.mark.parametrize(
     "raw,want", [(None, 1), ("0", 1), ("1", 1), ("2", 2), ("3", None)]
 )
