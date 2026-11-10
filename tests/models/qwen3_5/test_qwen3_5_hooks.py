@@ -255,3 +255,39 @@ def test_our_model_resolves_through_the_hook(restore_config_map):
     cfg = _vllm_config()
     VllmConfig.try_verify_and_update_config(cfg)
     assert cfg.cache_config.kv_cache_memory_bytes == 33_500_000_000 + CREDIT_EP8
+
+
+@pytest.mark.parametrize(
+    "key", ["tpu_pp_scheduler", "tpu_scheduler", "tpu_multiport_dp", "tpu_typo"]
+)
+def test_unread_tpu_section_fails_at_engine_start(key):
+    """A tpu_* section no reader in this build claims would be ignored by
+    vLLM; the hook refuses it and names the sections it reads."""
+    with pytest.raises(ValueError, match=rf"section\(s\) \['{key}'\].*qwen3_5"):
+        _run_hook(_vllm_config(additional={key: {"x": 1}}))
+
+
+def test_known_and_foreign_sections_pass():
+    cfg = _vllm_config(
+        additional={
+            "qwen3_5": {},
+            "tpu_online_fp8": {},
+            # Outside the qwen3_5 / tpu_* namespaces: main's keys and other
+            # plugins' keys keep vLLM's pass-through behaviour.
+            "abort_on_preemption": False,
+            "megakernel": {},
+            "phased_profiler_decode_only_kv_len_threshold": 1,
+            "some_other_plugin": {"a": 1},
+        }
+    )
+    _run_hook(cfg)
+    assert cfg.cache_config.kv_cache_memory_bytes == 33_500_000_000 + CREDIT_EP8
+
+
+@pytest.mark.parametrize("arch", OTHER_ARCHS)
+def test_other_models_are_not_checked(restore_config_map, arch):
+    from vllm.config import VllmConfig
+
+    register_models()
+    cfg = _vllm_config(arch, additional={"tpu_typo": {}})
+    VllmConfig.try_verify_and_update_config(cfg)
