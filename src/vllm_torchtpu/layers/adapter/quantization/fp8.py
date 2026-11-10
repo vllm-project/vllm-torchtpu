@@ -79,7 +79,7 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import (
     vllm_adapter as adaptive_moe,
 )
-from vllm_torchtpu.layers.adapter import moe_routing, token_padding
+from vllm_torchtpu.layers.adapter import expert_placement, moe_routing, token_padding
 from vllm_torchtpu.layers.adapter.fused_moe import (
     TpuMoEActivationMixin,
     fused_moe_gmm,
@@ -1077,10 +1077,20 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 activation=activation_str,
             )
             return
+        layer._gmm_primary_experts = (
+            (
+                int(expert_placement.owned())
+                if expert_placement.placed(getattr(layer, "layer_name", ""))
+                else int(layer.w13_weight.shape[0])
+            )
+            if expert_placement.has_copies()
+            else None
+        )
         prebuild_fused_moe_kernel(
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
             use_ep=layer.moe_config.moe_parallel_config.use_ep,
+            num_primary_experts=layer._gmm_primary_experts,
         )
         # Resolve the EP mesh here, not on the first forward: it maps ranks to
         # TPU device ids with an all_gather_object, and Dynamo cannot trace a
@@ -1213,6 +1223,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             "experts_start": layer._experts_start,
             "topk": layer.moe_config.experts_per_token,
             "activation": activation_str,
+            "num_primary_experts": getattr(layer, "_gmm_primary_experts", None),
         }
         if owns_collectives:
             return pipelined_fused_moe_gmm(**kwargs)

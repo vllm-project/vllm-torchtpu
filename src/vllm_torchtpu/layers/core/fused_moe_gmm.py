@@ -707,6 +707,7 @@ def moe_gmm(
         "rhs_quant_dtype",
         "skip_padded_tokens",
         "lowtok_max_tokens",
+        "num_primary_experts",
     ),
 )
 def fused_moe_func(
@@ -728,6 +729,7 @@ def fused_moe_func(
     rhs_quant_dtype: jnp.dtype | None = None,
     skip_padded_tokens: bool = False,
     lowtok_max_tokens: int = 0,
+    num_primary_experts: int | None = None,
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
 
@@ -751,6 +753,13 @@ def fused_moe_func(
     ``lowtok_max_tokens`` (static) arms the few-token kernel for EP calls of at
     most that many rows (0, the default: off); the fused MoE op passes the cap
     armed when it was built (``set_lowtok_max_tokens``).
+
+    ``num_primary_experts`` bounds the shard's local interval when the weight
+    tensors hold more slots than the shard owns (an expert placement with copy
+    slots after the primaries, ``expert_placement``): without it the interval
+    is every local slot, and the next shard's first ids would be taken as
+    local and summed a second time. ``None`` (the default) is the full slot
+    count, the behaviour without a placement.
     """
 
     # Convert 3D scale [experts, blocks, N] to 4D [experts, blocks, 1, N]
@@ -785,9 +794,13 @@ def fused_moe_func(
         hidden_states = jnp.where(jnp.isfinite(hidden_states), hidden_states, 0)
         topk_weights = jnp.where(jnp.isfinite(topk_weights), topk_weights, 0)
 
+    owned = w1.shape[0]
     if use_ep and experts_start is not None:
+        owned = w1.shape[0] if num_primary_experts is None else num_primary_experts
+        if not 0 < owned <= w1.shape[0]:
+            raise ValueError("num_primary_experts must fit the local weight slots")
         local_ids = topk_ids - experts_start
-        valid = (local_ids >= 0) & (local_ids < w1.shape[0])
+        valid = (local_ids >= 0) & (local_ids < owned)
         topk_weights = jnp.where(valid, topk_weights, jnp.zeros_like(topk_weights))
         topk_ids = jnp.where(valid, local_ids, jnp.full_like(local_ids, -1))
 
@@ -812,7 +825,7 @@ def fused_moe_func(
             "Selected the experimental few-token MoE kernel (max tokens %d)",
             lowtok_max_tokens,
         )
-        route = moe_lowtok_routing_table(topk_ids, topk_weights, w1.shape[0])
+        route = moe_lowtok_routing_table(topk_ids, topk_weights, owned)
         return moe_lowtok(hidden_states, route, w1, w1_scale, w2, w2_scale)
 
     # Decode services also compile large prefill buckets. Apply the token
@@ -831,7 +844,14 @@ def fused_moe_func(
     ):
         logger.info_once("Selected experimental dense-expert decode MoE")
         return dense_expert_moe(
-            hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids
+            hidden_states,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            topk_weights,
+            topk_ids,
+            num_primary_experts=owned,
         )
 
     (
@@ -845,7 +865,7 @@ def fused_moe_func(
         hidden_states,
         topk_ids,
         topk_weights,
-        local_num_experts=w1.shape[0],
+        local_num_experts=owned,
         topk=topk,
         use_ep=use_ep,
         use_sparse_core=use_sparse_core,
