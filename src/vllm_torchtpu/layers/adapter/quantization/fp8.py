@@ -1392,6 +1392,10 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
                 topk_ids, topk_weights
             )
+        activation_str = self._tpu_activation_str
+        assert activation_str is not None, (
+            "[moe] process_weights_after_loading did not run for this layer"
+        )
         kwargs = {
             "hidden_states": x,
             "w1": layer.w13_weight,
@@ -1405,7 +1409,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             "experts_start": layer._experts_start,
             "num_primary_experts": getattr(layer, "_gmm_primary_experts", None),
             "topk": layer.moe_config.experts_per_token,
-            "activation": self._tpu_activation_str,
+            "activation": activation_str,
         }
         out = fused_moe_gmm(**kwargs)
         return retain_fused_ep_graph_inputs(out)
