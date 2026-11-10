@@ -201,7 +201,7 @@ def resolve_hf_checkpoint_dir(model: str | None) -> str | None:
         raise FileNotFoundError(hint) from e
     if config_path is None:
         raise FileNotFoundError(hint)
-    # A missing tokenizer.json is reported by the exporter, which requires it.
+    # The exporter reports a missing tokenizer.json or tokenizer_config.json.
     for name in exporter.HF_COMPANION_FILES:
         if name != "config.json":
             cached_file(model, name, _raise_exceptions_for_missing_entries=False)
