@@ -19,6 +19,7 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.core.mamba_tail_fold import with_prefill_checkpoint
 from vllm_torchtpu.gdn_pool_layout import derive_pooled_gdn_state_layout
 
 from .config import first_qsa_layer_index, mtp_layer_prefixes, native_cache_specs
@@ -331,6 +332,11 @@ def pooled_cache_specs(cfg):
                 dtypes=dtypes,
                 mamba_cache_mode=mamba_mode,
             )
+            if mamba_mode == "align" and envs.VLLM_TPU_MAMBA_TAIL_FOLD:
+                # The GDN kernel and the PLE layer write the state at the
+                # prompt's last block boundary from inside the step, so the
+                # scheduler need not split the tail off (core/mamba_tail_fold.py).
+                pooled[name] = with_prefill_checkpoint(pooled[name])
         else:
             assert isinstance(spec, AttentionSpec)
             if name.endswith(".compressed_k"):
