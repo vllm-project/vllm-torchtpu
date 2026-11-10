@@ -1175,12 +1175,35 @@ def test_fused_serialized_rmw_aliased_kv_write_page(case: str):
     np.testing.assert_array_equal(
         np.asarray(out_f).view(np.uint8), np.asarray(out_s).view(np.uint8)
     )
-    for r_f, r_s in zip(raw_f, raw_s):
+    kv_pages = sorted({int(p) for p in np.asarray(pt).flat if int(p) > 0})
+    ckpt_pages = {
+        int(sl) * play.pages_per_slot + off
+        for sl in np.asarray(ckpt).flat
+        if int(sl) > 0
+        for off in range(play.pages_per_slot)
+    }
+    num_pages = mk.pool.cache_exec(ex).num_pages
+    unreferenced_pages = [
+        pg
+        for pg in range(play.reserved_pages, num_pages)
+        if pg not in kv_pages and pg not in ckpt_pages
+    ]
+    assert kv_pages and unreferenced_pages
+    for r_before, r_f, r_s in zip(base_pools, raw_f, raw_s):
+        u_before = r_before.reshape(R, -1, *r_before.shape[1:])
         uf = np.asarray(r_f).reshape(R, -1, *r_f.shape[1:])
         us = np.asarray(r_s).reshape(R, -1, *r_s.shape[1:])
         np.testing.assert_array_equal(
-            uf[:, play.reserved_pages :].view(np.uint8),
-            us[:, play.reserved_pages :].view(np.uint8),
+            uf[:, kv_pages].view(np.uint8),
+            us[:, kv_pages].view(np.uint8),
+        )
+        np.testing.assert_array_equal(
+            uf[:, unreferenced_pages].view(np.uint8),
+            u_before[:, unreferenced_pages].view(np.uint8),
+        )
+        np.testing.assert_array_equal(
+            us[:, unreferenced_pages].view(np.uint8),
+            u_before[:, unreferenced_pages].view(np.uint8),
         )
     st_f = mk.pool.pool_to_states(play, ex, raw_f, pt, ckpt)
     st_s = mk.pool.pool_to_states(play, ex, raw_s, pt, ckpt)
