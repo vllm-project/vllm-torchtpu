@@ -28,22 +28,74 @@ helpers so the bytes they exchange are identical.
 
 import jax
 import jax.numpy as jnp
+from jax.experimental.pallas import tpu as pltpu
 
 
-def _typed_view(block_ref, view_dtype, lane_split: int):
+def _typed_view(
+    block_ref,
+    view_dtype,
+    lane_split: int,
+    row0: int = 0,
+    rows: int | None = None,
+):
     """Raw block ref as a ``(rows, lanes // lane_split)`` view_dtype ref."""
     if jnp.dtype(block_ref.dtype) != jnp.dtype(view_dtype):
         block_ref = block_ref.bitcast(jnp.dtype(view_dtype))
-    return block_ref.reshape(-1, block_ref.shape[-1] // lane_split)
+    ref = block_ref.reshape(-1, block_ref.shape[-1] // lane_split)
+    return ref if rows is None else ref.at[row0 : row0 + rows]
 
 
-def load_typed(block_ref, *, view_dtype, lane_split: int = 1) -> jax.Array:
+def load_typed(
+    block_ref,
+    *,
+    view_dtype,
+    lane_split: int = 1,
+    row0: int = 0,
+    rows: int | None = None,
+) -> jax.Array:
     """Reads a raw block ref as ``(rows, lanes // lane_split)`` view_dtype."""
-    return _typed_view(block_ref, view_dtype, lane_split)[...]
+    return _typed_view(block_ref, view_dtype, lane_split, row0, rows)[...]
 
 
-def store_typed(block_ref, values: jax.Array, *, lane_split: int = 1) -> None:
+def store_typed(
+    block_ref,
+    values: jax.Array,
+    *,
+    lane_split: int = 1,
+    row0: int = 0,
+    rows: int | None = None,
+) -> None:
     """Inverse of ``load_typed``: stores ``values`` through a typed view of
-    the raw block ref, which is fully written."""
-    ref = _typed_view(block_ref, values.dtype, lane_split)
+    the raw block ref."""
+    ref = _typed_view(block_ref, values.dtype, lane_split, row0, rows)
     ref[...] = values.reshape(ref.shape)
+
+
+def pack_bf16_pairs(values: jax.Array) -> jax.Array:
+    """``(2 * rows, lanes)`` bf16 -> ``(rows, lanes)`` uint32 of BF16 pairs."""
+    return pltpu.bitcast(values.astype(jnp.bfloat16), jnp.uint32)
+
+
+def unpack_bf16_pairs(words: jax.Array) -> jax.Array:
+    """Inverse of ``pack_bf16_pairs``: ``(rows, lanes)`` uint32 -> ``(2 * rows, lanes)`` bf16."""
+    return pltpu.bitcast(words, jnp.bfloat16)
+
+
+def pack_fp8_quads(values: jax.Array) -> jax.Array:
+    """``(4 * rows, lanes)`` float8_e4m3fn -> ``(rows, lanes)`` uint32 of FP8 quads."""
+    return pltpu.bitcast(values.astype(jnp.float8_e4m3fn), jnp.uint32)
+
+
+def unpack_fp8_quads(words: jax.Array) -> jax.Array:
+    """Inverse of ``pack_fp8_quads``: ``(rows, lanes)`` uint32 -> ``(4 * rows, lanes)`` float8_e4m3fn."""
+    return pltpu.bitcast(words, jnp.float8_e4m3fn)
+
+
+def pack_fp4_octets(values: jax.Array) -> jax.Array:
+    """``(8 * rows, lanes)`` float4_e2m1fn -> ``(rows, lanes)`` uint32 of FP4 octets."""
+    return pltpu.bitcast(values.astype(jnp.float4_e2m1fn), jnp.uint32)
+
+
+def unpack_fp4_octets(words: jax.Array) -> jax.Array:
+    """Inverse of ``pack_fp4_octets``: ``(rows, lanes)`` uint32 -> ``(8 * rows, lanes)`` float4_e2m1fn."""
+    return pltpu.bitcast(words, jnp.float4_e2m1fn)
