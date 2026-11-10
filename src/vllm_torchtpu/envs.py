@@ -190,6 +190,8 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_INDEXER_SHARD_SKIP_SP: bool = False
     VLLM_TPU_QSA_INDEXER_TOKEN_SHARD: bool = False
     VLLM_TPU_QSA_DECODE_TOKEN_SHARD: bool = False
+    VLLM_TPU_QSA_PREFILL_REPLICATED_TOKEN_SHARD: bool = False
+    VLLM_TPU_QSA_PREFILL_REPLICATED_TOKEN_SHARD_MIN_TOKENS: int = 256
     VLLM_TPU_PLE_LOOKUP_CHUNK_TOKENS: int = 8
     VLLM_TPU_PLE_FUSED_GATE: bool = False
     VLLM_TPU_PLE_CONV_HISTORY_FAST: bool = False
@@ -1189,6 +1191,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # selection is the replicated indexer's.
     "VLLM_TPU_QSA_DECODE_TOKEN_SHARD": env_bool(
         "VLLM_TPU_QSA_DECODE_TOKEN_SHARD", default=False
+    ),
+    # Qwen4-exp pooled QSA, prefill buckets that do not take the
+    # sequence-parallel graph (e.g. 256 / 512 / 3072 at TP8): route them to a
+    # third compiled graph (Qwen4ExpBackboneRP), the replicated backbone whose
+    # QSA layers run the token-sharded indexer of
+    # VLLM_TPU_QSA_INDEXER_TOKEN_SHARD: each TP rank scores and selects one
+    # contiguous 1/TP of the step's rows and the selected blocks are
+    # all-gathered. The selection is the replicated indexer's. A bucket takes
+    # it when it has at least ..._MIN_TOKENS rows, divides by TP and leaves
+    # each rank more rows than request slots. Not with
+    # VLLM_TPU_QSA_COMPRESSED_DCP (there VLLM_TPU_QSA_DECODE_TOKEN_SHARD
+    # shards the replicated backbone's indexer over the DCP pairs).
+    "VLLM_TPU_QSA_PREFILL_REPLICATED_TOKEN_SHARD": env_bool(
+        "VLLM_TPU_QSA_PREFILL_REPLICATED_TOKEN_SHARD", default=False
+    ),
+    "VLLM_TPU_QSA_PREFILL_REPLICATED_TOKEN_SHARD_MIN_TOKENS": env_nonnegative_int(
+        "VLLM_TPU_QSA_PREFILL_REPLICATED_TOKEN_SHARD_MIN_TOKENS", 256
     ),
     # Qwen4-exp resident PLE table: tokens per gather in the raw embedding
     # lookup (a multiple of 8). 8 is the originally validated chunk; an
