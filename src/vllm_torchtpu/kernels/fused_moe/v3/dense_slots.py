@@ -78,6 +78,21 @@ MERGED_POS_SHIFT = 0
 # Merged program on the unpadded rows (padding and valid-row masks inside).
 UNPADDED = False
 TAB_LANES = 32
+# Skip the weight stream of local experts no row is routed to: after the
+# tables, the program walks a compacted list of its live experts (the first
+# weight_prefetch experts, whose refills start before the tables exist, stay
+# in the list whatever their rows). Same math on the same rows, so the output
+# is bit-identical; only zero-row experts' weight DMAs disappear.
+# Config.dense_slots_skip_unrouted turns it on; tests may set this instead.
+SKIP_UNROUTED = False
+# Tests only (mutation checks of the skip path): "slot" computes with the
+# weight slot of the old expert-indexed rule instead of the list position's
+# (wrong weights, no hang); "drop" leaves the first live expert after the
+# prefetched ones out of the list (its rows never arrive: a hang or a wrong
+# output, so run it under a timeout).
+SKIP_MUTANT = ""
+# Tests only: the program's weight slots (0: Config.dense_slots_weight_slots, else 3).
+WEIGHT_SLOTS = 0
 
 
 def _align(n, m):
@@ -317,7 +332,7 @@ def build_kernel(*, num_shards, tokens_per_shard, hidden, inter,
                  columns_per_pass, weight_slots=3, weight_prefetch=2,
                  result_slots=3, vmem_limit=None, fused=False,
                  out_dtype=jnp.bfloat16, merged=False, num_experts=None,
-                 real_rows=None):
+                 real_rows=None, skip_unrouted=False):
     """The per-shard Pallas program (a callable of the tables and operands).
 
     merged (fused only): the index exchange and the tables run inside this
@@ -375,6 +390,7 @@ def build_kernel(*, num_shards, tokens_per_shard, hidden, inter,
         if merged:
             (idx_all, mp_v, tab_v, pos_v, misc_v, tab_s, pos_s,
              misc_s) = (next(it) for _ in range(8))
+        order_s = next(it) if skip_unrouted else None
         (sem_w1, sem_w2, sem_ag_send, sem_ag_recv, sem_ag_local, sem_load,
          sem_push_send, sem_push_local, sem_push_recv) = (next(it)
                                                           for _ in range(9))
@@ -610,8 +626,51 @@ def build_kernel(*, num_shards, tokens_per_shard, hidden, inter,
                 lambda j, c: tile_step(e, wslot, n_rows, j, c), carry)
 
         zeros = tuple(jnp.int32(0) for _ in range(result_slots))
-        _, pend_r, pend_l = lax.fori_loop(0, G, expert_step,
-                                          (jnp.int32(0), zeros, zeros))
+        if skip_unrouted:
+            # The live experts in order. The first P are in the list whatever
+            # their rows: their refills started before the tables existed, and
+            # list position i uses weight slot i % weight_slots, which for
+            # i < P is the slot the prologue filled. A store at every position
+            # and a conditional advance keep the scan branch-free.
+            P = min(weight_prefetch, G)
+            for i in range(P):
+                order_s[i] = jnp.int32(i)
+
+            def collect(e, n):
+                live = tab_ref[e, 3 * D] > 0
+                if SKIP_MUTANT == "drop":
+                    live = jnp.logical_and(live, n != P)
+                order_s[n] = e
+                return n + jnp.where(live, 1, 0)
+
+            n_list = lax.fori_loop(P, G, collect, jnp.int32(P))
+
+            def listed_step(i, carry):
+                e = order_s[i]
+                wslot = lax.rem(i, jnp.int32(weight_slots))
+                for cp in w_copy(e, wslot):
+                    cp.wait()
+
+                @pl.when(i + weight_prefetch < n_list)
+                def _():
+                    ahead = i + weight_prefetch
+                    for cp in w_copy(order_s[ahead],
+                                     lax.rem(ahead, jnp.int32(weight_slots))):
+                        cp.start()
+
+                cslot = (lax.rem(e, jnp.int32(weight_slots))
+                         if SKIP_MUTANT == "slot" else wslot)
+                n_rows = tab_ref[e, 3 * D]
+                n_tiles = (n_rows + T - 1) // T
+                return lax.fori_loop(
+                    0, n_tiles,
+                    lambda j, c: tile_step(e, cslot, n_rows, j, c), carry)
+
+            _, pend_r, pend_l = lax.fori_loop(0, n_list, listed_step,
+                                              (jnp.int32(0), zeros, zeros))
+        else:
+            _, pend_r, pend_l = lax.fori_loop(0, G, expert_step,
+                                              (jnp.int32(0), zeros, zeros))
         for i in range(result_slots):
             drain_slot(i, pend_r[i], pend_l[i])
         if D > 1:
@@ -678,6 +737,8 @@ def build_kernel(*, num_shards, tokens_per_shard, hidden, inter,
             pltpu.SMEM((Tp, K), jnp.int32),  # pos
             pltpu.SMEM((8, LANES), jnp.int32),  # misc
         ]
+    if skip_unrouted:
+        scratch += [pltpu.SMEM((G, ), jnp.int32)]  # the live-expert list
     scratch += [
         pltpu.SemaphoreType.DMA((weight_slots, )),
         pltpu.SemaphoreType.DMA((weight_slots, )),
@@ -720,7 +781,9 @@ def build_kernel(*, num_shards, tokens_per_shard, hidden, inter,
         compiler_params=pltpu.CompilerParams(**params),
         interpret=INTERPRET if INTERPRET is not None else False,
         name=(f"fused_ep_dense_slots{'_f' if fused else ''}"
-              f"{'m' if merged else ''}{'u' if unpadded else ''}_g{G}_t{T}_n{N}"))
+              f"{'m' if merged else ''}{'u' if unpadded else ''}"
+              f"{'s' if skip_unrouted else ''}"
+              f"{'' if weight_slots == 3 else f'_w{weight_slots}'}_g{G}_t{T}_n{N}"))
     return program
 
 
@@ -728,7 +791,8 @@ def dense_slots_moe(x, w1, w2, w1_scales, w2_scales, router_logits, *, top_k,
                     renormalize, mesh, tile_rows=128, config=None,
                     experts_per_shard=None, shard_index=None,
                     valid_tokens=None, drop_nan_rows=False, fused=None,
-                    pallas_tables=None, merged=None, unpadded=None):
+                    pallas_tables=None, merged=None, unpadded=None,
+                    skip_unrouted=None):
     """The dense-slots layer: same operands and result as v3's fused_ep_moe
     with fp8 weights, per-channel scales and silu (the DP4xTP2 decode
     binding). x [tokens, hidden] bf16 sharded over the mesh axis; router
@@ -760,6 +824,9 @@ def dense_slots_moe(x, w1, w2, w1_scales, w2_scales, router_logits, *, top_k,
     if unpadded is None:
         unpadded = UNPADDED
     unpadded = unpadded and merged and real % 8 == 0
+    if skip_unrouted is None:
+        skip_unrouted = SKIP_UNROUTED or getattr(config, "dense_slots_skip_unrouted", False)
+    wslots = WEIGHT_SLOTS or getattr(config, "dense_slots_weight_slots", 0) or 3
     tables_program = (build_tables_kernel(
         num_shards=num_shards, tokens_per_shard=Tp, experts_per_shard=G,
         top_k=K, num_experts=num_experts, mesh_axes=tuple(mesh.axis_names))
@@ -767,6 +834,8 @@ def dense_slots_moe(x, w1, w2, w1_scales, w2_scales, router_logits, *, top_k,
     program = build_kernel(fused=fused, out_dtype=x.dtype, merged=merged,
                            num_experts=num_experts,
                            real_rows=real if unpadded else None,
+                           skip_unrouted=bool(skip_unrouted),
+                           weight_slots=wslots, weight_prefetch=wslots - 1,
                            num_shards=num_shards, tokens_per_shard=Tp,
                            hidden=hidden, inter=inter, experts_per_shard=G,
                            top_k=K, tile_rows=tile_rows,
