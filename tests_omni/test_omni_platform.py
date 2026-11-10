@@ -1244,6 +1244,11 @@ def test_ltx2_v2a_patch_dispatch_and_fallbacks(monkeypatch):
     installed = attn_cls._forward_impl
     patches._patch_ltx2_v2a_local_kv_attn()
     assert attn_cls._forward_impl is installed
+    decline_log = MagicMock()
+    monkeypatch.setattr(patches, "logger", decline_log)
+    monkeypatch.setattr(
+        attn_cls, patches._LTX2_V2A_DECLINE_LOGGED, False, raising=False
+    )
 
     fake_pg = SimpleNamespace(world_size=2)
     sp_group = SimpleNamespace(
@@ -1288,6 +1293,7 @@ def test_ltx2_v2a_patch_dispatch_and_fallbacks(monkeypatch):
     )
     out = layer._forward_impl(q, k, v, None)
     assert len(called_local) == 1 and out.shape == q.shape
+    assert decline_log.info.call_count == 0
 
     # Masked metadata falls back to upstream _forward_impl -> strategy / local attn.
     fallback_calls = []
@@ -1301,9 +1307,15 @@ def test_ltx2_v2a_patch_dispatch_and_fallbacks(monkeypatch):
     masked_meta = AttentionMetadata(attn_mask=torch.ones(1, 6, dtype=torch.bool))
     layer._forward_impl(q, k, v, masked_meta)
     assert len(called_local) == 1 and len(fallback_calls) == 1
+    # The decline is logged once at info level, not on every call.
+    layer._forward_impl(q, k, v, masked_meta)
+    assert len(fallback_calls) == 2
+    assert decline_log.info.call_count == 1
+    assert decline_log.info.call_args.args[1] is True
 
     # Non-v2a mode falls back untouched.
     layer.ltx_sp_mode = "video_self"
     layer._get_active_parallel_strategy = lambda: layer._no_parallel_strategy
     layer._forward_impl(q, k, v, None)
-    assert len(called_local) == 1 and len(fallback_calls) == 2
+    assert len(called_local) == 1 and len(fallback_calls) == 3
+    assert decline_log.info.call_count == 1
