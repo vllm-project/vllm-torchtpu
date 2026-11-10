@@ -8,6 +8,7 @@ import jax
 import torch
 from torch_tpu._internal import pallas
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.qwen4_exp.gated_residual import gated_residual_fn
 from vllm_torchtpu.kernels.qwen4_exp.hc_decode import hc_decode_mix
 from vllm_torchtpu.kernels.qwen4_exp.hc_full import _combine_full_mix, _full_mix
@@ -27,6 +28,11 @@ def build_gated_residual_op(branches: int, hidden: int, token_tile: int):
         return residual.new_empty(residual.shape)
 
     return op
+
+
+def _hc_prefill_norm() -> str:
+    """TPU_QWEN4_HC_PREFILL_NORM, lower-cased (the full-mix norm variant)."""
+    return (envs.TPU_QWEN4_HC_PREFILL_NORM or "vpu").lower()
 
 
 def _up_operand(up_t: bool):
@@ -54,8 +60,14 @@ def build_full_mix_op(
     projection [tokens, branches] in place of the normalized input."""
     eps_tag = hashlib.sha1(repr(eps).encode()).hexdigest()[:8]
 
+    norm_impl = _hc_prefill_norm()
     static = dict(
-        branches=branches, hidden=hidden, eps=eps, token_tile=token_tile, up_t=up_t
+        branches=branches,
+        hidden=hidden,
+        eps=eps,
+        token_tile=token_tile,
+        up_t=up_t,
+        norm_impl=norm_impl,
     )
     _up = _up_operand(up_t)
     # torch.library.infer_schema takes explicit tensor parameters only.
@@ -79,7 +91,8 @@ def build_full_mix_op(
 
     op = pallas.jax_op(
         f"qwen4_exp::hc_full_c{branches}_h{hidden}_m{token_tile}_e{eps_tag}"
-        f"{'_upt' if up_t else ''}{'_inj' if inject else ''}_v1",
+        f"{'_upt' if up_t else ''}{'_inj' if inject else ''}"
+        f"{'' if norm_impl == 'vpu' else '_n' + norm_impl}_v1",
         core,
     )
 
@@ -108,8 +121,14 @@ def build_combine_full_mix_op(
     (``inject``: the gate projection in place of ``norm``, as ``build_full_mix_op``)."""
     eps_tag = hashlib.sha1(repr(eps).encode()).hexdigest()[:8]
 
+    norm_impl = _hc_prefill_norm()
     static = dict(
-        branches=branches, hidden=hidden, eps=eps, token_tile=token_tile, up_t=up_t
+        branches=branches,
+        hidden=hidden,
+        eps=eps,
+        token_tile=token_tile,
+        up_t=up_t,
+        norm_impl=norm_impl,
     )
     _up = _up_operand(up_t)
     if inject:
@@ -143,7 +162,8 @@ def build_combine_full_mix_op(
 
     op = pallas.jax_op(
         f"qwen4_exp::hc_combine_full_c{branches}_h{hidden}_m{token_tile}_e{eps_tag}"
-        f"{'_upt' if up_t else ''}{'_inj' if inject else ''}_v1",
+        f"{'_upt' if up_t else ''}{'_inj' if inject else ''}"
+        f"{'' if norm_impl == 'vpu' else '_n' + norm_impl}_v1",
         core,
     )
 

@@ -13,8 +13,51 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+# RMS-norm variants of the norm loop (TPU_QWEN4_HC_PREFILL_NORM).
+NORM_IMPLS = ("vpu", "rows64", "gram", "gram64", "bf16ep", "bf16ep64")
 
-def _kernel(*refs, token_tile, tokens, hidden, branches, eps, up_t, combine, inject):
+
+def norm_rows_per_step(norm_impl: str, rows: int) -> int:
+    """Rows one norm loop step covers (64 for the *64 variants when it divides)."""
+    return 64 if norm_impl.endswith("64") and rows % 64 == 0 else 32
+
+
+def branch_variance(values, xb, hidden: int, norm_impl: str):
+    """mean(x^2) over one branch's rows: ``values`` f32 [r, hidden], ``xb`` the
+    same rows in bf16. vpu / rows64 / bf16ep* keep ``jnp.mean`` (bitwise);
+    gram / gram64 take the sum of squares from the MXU (diag of xb xb^T)."""
+    if not norm_impl.startswith("gram"):
+        return jnp.mean(values * values, axis=-1, keepdims=True)
+    gram = jax.lax.dot_general(
+        xb, xb, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
+    )
+    r = gram.shape[0]
+    eye = jax.lax.broadcasted_iota(jnp.int32, (r, r), 0) == jax.lax.broadcasted_iota(
+        jnp.int32, (r, r), 1
+    )
+    return jnp.sum(jnp.where(eye, gram, 0.0), axis=1, keepdims=True) / hidden
+
+
+def norm_epilogue(values, variance, weight_f32, weight_bf16, eps: float, norm_impl: str):
+    """bf16(n + bf16(n * w)), n = bf16(values * rsqrt(variance + eps)), for one
+    branch's rows; ``weight_f32`` / ``weight_bf16`` are its [1, hidden] weights.
+
+    bf16ep*: n * w and n + . in bf16 arithmetic. Bitwise with the f32 form: a
+    bf16 x bf16 product is exact in f32, and an f32 sum of two bf16 values is
+    exact unless their exponents differ by more than 16, where both forms round
+    to the larger operand.
+    """
+    normalized = (values * jax.lax.rsqrt(variance + eps)).astype(jnp.bfloat16)
+    if norm_impl.startswith("bf16ep"):
+        return normalized + normalized * weight_bf16
+    n32 = normalized.astype(jnp.float32)
+    scaled = (n32 * weight_f32).astype(jnp.bfloat16).astype(jnp.float32)
+    return (n32 + scaled).astype(jnp.bfloat16)
+
+
+def _kernel(
+    *refs, token_tile, tokens, hidden, branches, eps, up_t, combine, inject, norm_impl="vpu"
+):
     refs = iter(refs)
     take = lambda n: [next(refs) for _ in range(n)]  # noqa: E731
     x_hbm, *extra_hbm = take(3 if combine else 1)
@@ -134,11 +177,31 @@ def _kernel(*refs, token_tile, tokens, hidden, branches, eps, up_t, combine, inj
             def _wait_prior_norm_output():
                 wait_norm_output(parity)
 
+            step_rows = norm_rows_per_step(norm_impl, token_tile)
+
             def normalize_rows(index, carry):
-                offset = index * 32
-                weight = weight_vm[...].astype(jnp.float32)
+                offset = index * step_rows
+                if norm_impl == "vpu":
+                    weight = weight_vm[...].astype(jnp.float32)
                 for branch in range(branches):
                     start = branch * hidden
+                    if norm_impl != "vpu":
+                        # TPU_QWEN4_HC_PREFILL_NORM variants.
+                        xb = x_vm[parity, pl.ds(offset, step_rows), pl.ds(start, hidden)]
+                        values = xb.astype(jnp.float32)
+                        variance = branch_variance(values, xb, hidden, norm_impl)
+                        w_bf16 = weight_vm[pl.ds(start, hidden)][None, :]
+                        norm_vm[
+                            parity, pl.ds(offset, step_rows), pl.ds(start, hidden)
+                        ] = norm_epilogue(
+                            values,
+                            variance,
+                            w_bf16.astype(jnp.float32),
+                            w_bf16,
+                            eps,
+                            norm_impl,
+                        )
+                        continue
                     values = x_vm[
                         parity, pl.ds(offset, 32), pl.ds(start, hidden)
                     ].astype(jnp.float32)
@@ -158,7 +221,7 @@ def _kernel(*refs, token_tile, tokens, hidden, branches, eps, up_t, combine, inj
                     ).astype(jnp.bfloat16)
                 return carry
 
-            jax.lax.fori_loop(0, token_tile // 32, normalize_rows, jnp.int32(0))
+            jax.lax.fori_loop(0, token_tile // step_rows, normalize_rows, jnp.int32(0))
             norm = norm_vm[parity]
         else:
             x = x_vm[parity].astype(jnp.float32)
@@ -271,7 +334,19 @@ def _kernel(*refs, token_tile, tokens, hidden, branches, eps, up_t, combine, inj
 
 
 def _pallas_mix(
-    x, weight, down, up, extra, inject, *, branches, hidden, eps, token_tile, up_t
+    x,
+    weight,
+    down,
+    up,
+    extra,
+    inject,
+    *,
+    branches,
+    hidden,
+    eps,
+    token_tile,
+    up_t,
+    norm_impl="vpu",
 ):
     """The full mix over ``x`` (``extra``: (block, gates) to combine into it first).
 
@@ -289,6 +364,8 @@ def _pallas_mix(
         or any(a.dtype != jnp.bfloat16 for a in (x, weight, down, up))
     ):
         raise ValueError("HC full mix requires even BF16 token tiles")
+    if norm_impl not in NORM_IMPLS:
+        raise ValueError(f"unknown HC norm_impl {norm_impl!r}")
     combine = bool(extra)
     if combine:
         block, gates = extra
@@ -346,6 +423,7 @@ def _pallas_mix(
             up_t=up_t,
             combine=combine,
             inject=bool(inject),
+            norm_impl=norm_impl,
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=0,
@@ -356,15 +434,28 @@ def _pallas_mix(
         ),
         out_shape=tuple(out_shape),
         compiler_params=pltpu.CompilerParams(vmem_limit_bytes=60 << 20),
-        name=f"qwen4exp_hc_{'combine_' if combine else ''}branchstore32_m{token_tile}",
+        name=f"qwen4exp_hc_{'combine_' if combine else ''}branchstore32_m{token_tile}"
+        + ("" if norm_impl == "vpu" else f"_n{norm_impl}"),
     )(*inputs)
 
 
 @functools.partial(
-    jax.jit, static_argnames=("branches", "hidden", "eps", "token_tile", "up_t")
+    jax.jit,
+    static_argnames=("branches", "hidden", "eps", "token_tile", "up_t", "norm_impl"),
 )
 def _full_mix(
-    x, weight, down, up, inject=None, *, branches, hidden, eps, token_tile, up_t=False
+    x,
+    weight,
+    down,
+    up,
+    inject=None,
+    *,
+    branches,
+    hidden,
+    eps,
+    token_tile,
+    up_t=False,
+    norm_impl="vpu",
 ):
     """``up_t``: ``up`` is given as its [low rank, width] transpose. ``inject``: the
     second output is the gate projection (see ``_pallas_mix``)."""
@@ -380,11 +471,13 @@ def _full_mix(
         eps=eps,
         token_tile=token_tile,
         up_t=up_t,
+        norm_impl=norm_impl,
     )
 
 
 @functools.partial(
-    jax.jit, static_argnames=("branches", "hidden", "eps", "token_tile", "up_t")
+    jax.jit,
+    static_argnames=("branches", "hidden", "eps", "token_tile", "up_t", "norm_impl"),
 )
 def _combine_full_mix(
     residual,
@@ -400,6 +493,7 @@ def _combine_full_mix(
     eps,
     token_tile,
     up_t,
+    norm_impl="vpu",
 ):
     """``_full_mix(gated_residual(residual, block, gates), ...)`` in one kernel.
 
@@ -418,4 +512,5 @@ def _combine_full_mix(
         eps=eps,
         token_tile=token_tile,
         up_t=up_t,
+        norm_impl=norm_impl,
     )
