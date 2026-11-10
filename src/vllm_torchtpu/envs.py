@@ -97,6 +97,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
     TPU_GDN_QKVZ_KERNEL_LAYOUT: bool = False
+    TPU_GDN_PACK_QKVZ: bool = False
     TPU_ENABLE_GDN_DYNAMIC_TILING: bool = False
     TPU_GDN_PREFILL_CHECKPOINT: bool = True
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
@@ -492,6 +493,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # checkpoint-FP8 and per-channel paths are verified and the export mapper
     # reads the layer's layout marker, make it the default and delete the flag.
     "TPU_GDN_QKVZ_KERNEL_LAYOUT": env_bool("TPU_GDN_QKVZ_KERNEL_LAYOUT", default=False),
+    # Split GDN in_proj_qkvz and pack (qkv, z) into their target (float32
+    # [tokens, 1, qkv_size], [tokens, local_num_v_heads, head_v_dim]) layouts in
+    # a single Pallas pass when aligned, avoiding intermediate HBM re-tiling.
+    # Opt-in while measured on v7x Qwen3.5; once validated across v6e/v5p and
+    # KDA/GQA hybrid models, make it the default and remove the flag.
+    "TPU_GDN_PACK_QKVZ": env_bool("TPU_GDN_PACK_QKVZ", default=False),
     # Size GDN v3 decode tiles and prefill chunks from per-rank heads, active
     # sequences and the VMEM estimate (kernels/gdn/v3/tiling.py) instead of
     # the fixed defaults.
