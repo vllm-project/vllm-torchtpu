@@ -11,11 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Experimental gated RMS norm fused with the next linear's fp8 quantization."""
+"""Experimental fused q/k norm, partial rope and gate split for attention."""
 
-from vllm_torchtpu.kernels.experimental.gated_norm_quant.kernel import (
-    gated_norm_quant,
+from vllm_torchtpu.models.qwen3_5.kernels.qk_norm_rope_gate.kernel import (
+    qk_norm_rope_gate,
     reference,
 )
 
-__all__ = ["gated_norm_quant", "reference"]
+__all__ = ["qk_norm_rope_gate", "reference"]
