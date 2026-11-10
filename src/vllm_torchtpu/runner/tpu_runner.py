@@ -62,6 +62,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
     MultiKVConnectorStats,
 )
 from vllm.forward_context import set_forward_context
+from vllm_torchtpu.runner.fast_forward_context import fast_set_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.rotary_embedding import (
@@ -5445,7 +5446,7 @@ class TPUModelRunner(GPUModelRunner):
                     num_reqs=num_reqs,
                     **trace_kwargs,
                 ),
-                set_forward_context(
+                fast_set_forward_context(
                     attn_metadata,
                     self.vllm_config,
                     num_tokens=num_tokens_padded,
