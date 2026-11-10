@@ -225,6 +225,13 @@ class Config:
         the expert kernel's rows and the combine are the same: the output
         is bit-identical. Routing handed in by the caller is not
         compacted.
+      reorder_chain: (sorted rows) the dispatch chain's index-independent
+        work is formed as programs of its own so the compiler can run it
+        in the sparse cores' waits: the sort's live-row fill and gathered
+        prefix during the row-tables scatter, the combine's pair index
+        before the FFN kernel; and the exchange's finish is ordered after
+        the shard tables instead of after the scatter, so its waits overlap
+        the scatter. Only the schedule changes: the same values.
     """
 
     result_slots: int = RESULT_SLOTS_DEFAULT
@@ -257,6 +264,7 @@ class Config:
     combine_real_tokens: bool = False
     sort_index_compare: bool = False
     compact_message: bool = False
+    reorder_chain: bool = False
 
     @property
     def token_dtype(self):
