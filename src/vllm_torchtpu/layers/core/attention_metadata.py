@@ -69,6 +69,7 @@ def attention_block_table_width(
         "mamba_slot_read_offsets",
         "mamba_ckpt_indices",
         "mamba_request_distribution",
+        "mamba_prefill_ckpt",
     ],
     meta_fields=[
         "sequence_layout_kind",
@@ -120,6 +121,11 @@ class AttentionMetadata:
     # the first two groups. None unless the model has mamba layers and spec
     # decoding is enabled.
     mamba_request_distribution: jax.Array | torch.Tensor | None = None
+    # (2, max_num_seqs) int32 — VLLM_TPU_MAMBA_TAIL_FOLD only: row 0 is each
+    # request's internal prefill checkpoint offset into its query (0: none),
+    # row 1 the block-table column whose block receives the state at that
+    # offset. Mamba groups only; None otherwise. See core/mamba_tail_fold.py.
+    mamba_prefill_ckpt: jax.Array | torch.Tensor | None = None
     sequence_layout_kind: str = SequenceLayoutKind.ALL.value
     sequence_layout_protocol: str = DEFAULT_SEQUENCE_LAYOUT_PROTOCOL
     sequence_layout_version: int = 1
@@ -159,6 +165,8 @@ class AttentionMetadataBuilderContext:
     # emits no `mamba_ckpt_indices`.
     mamba_ckpt_window: int = 1
     mamba_request_distribution: torch.Tensor | None = None
+    # VLLM_TPU_MAMBA_TAIL_FOLD only; see AttentionMetadata.mamba_prefill_ckpt.
+    mamba_prefill_ckpt: torch.Tensor | None = None
     # Unified pool + spec decode only: the runner seeds this with an empty
     # list and each mamba group's builder appends the per-request state
     # block ids it derived from its block table, so the post-sampling
@@ -622,9 +630,11 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
         if self.is_mamba_group:
             mamba_slot_read_offsets = ctx.mamba_slot_read_offsets
             mamba_request_distribution = ctx.mamba_request_distribution
+            mamba_prefill_ckpt = ctx.mamba_prefill_ckpt
         else:
             mamba_slot_read_offsets = None
             mamba_request_distribution = None
+            mamba_prefill_ckpt = None
 
         return AttentionMetadata(
             input_positions=input_positions,
@@ -636,6 +646,7 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             mamba_slot_read_offsets=mamba_slot_read_offsets,
             mamba_ckpt_indices=mamba_ckpt_indices,
             mamba_request_distribution=mamba_request_distribution,
+            mamba_prefill_ckpt=mamba_prefill_ckpt,
             sequence_layout_kind=ctx.sequence_layout_descriptor.kind.value,
             sequence_layout_protocol=(ctx.sequence_layout_descriptor.protocol),
             sequence_layout_version=ctx.sequence_layout_descriptor.version,

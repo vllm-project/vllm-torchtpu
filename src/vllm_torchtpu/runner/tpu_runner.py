@@ -85,6 +85,7 @@ from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorOutput
 from vllm_torchtpu import envs, stall_watchdog, utils
 from vllm_torchtpu.block_major_pool import BlockMajorPoolLayout
 from vllm_torchtpu.compilation import shape_variants
+from vllm_torchtpu.core.mamba_tail_fold import WORKER_COUNTER, prefill_checkpoints
 from vllm_torchtpu.distributed import utils as dist_utils
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
     TpuKVConnectorStats,
@@ -1061,6 +1062,12 @@ class TPUModelRunner(GPUModelRunner):
         # `initialize_kv_cache` once the mamba pool size is known. See
         # `AttentionMetadata.mamba_slot_read_offsets`.
         self.mamba_slot_read_offsets: torch.Tensor | None = None
+        # VLLM_TPU_MAMBA_TAIL_FOLD with Mamba specs that carry a prefill
+        # checkpoint block (set in `_build_mamba_copy_plan`): every walk then
+        # hands the mamba groups a `(2, num_reqs)` checkpoint offset/column
+        # tensor; see `_mamba_prefill_ckpt`.
+        self._mamba_tail_fold: bool = False
+        self._mamba_prefill_ckpt_zeros: dict[int, torch.Tensor] = {}
         # req_ids whose current state storage has an initialized read offset;
         # see `_reset_read_offsets_for_new_requests`.
         self._mamba_offset_seeded: set[str] = set()
@@ -1992,6 +1999,7 @@ class TPUModelRunner(GPUModelRunner):
                     mamba_slot_read_offsets=ctx.mamba_slot_read_offsets,
                     mamba_ckpt_indices=ckpt,
                     mamba_request_distribution=ctx.mamba_request_distribution,
+                    mamba_prefill_ckpt=ctx.mamba_prefill_ckpt,
                     **shared,
                 )
             else:
@@ -2162,6 +2170,7 @@ class TPUModelRunner(GPUModelRunner):
         if self.cache_config.mamba_cache_mode != "align":
             self._mamba_copy_plan = []
             self._mamba_state_block_size = None
+            self._mamba_tail_fold = False
             return
         plan: list[tuple[int, list[torch.Tensor]]] = []
         state_block_size: int | None = None
@@ -2182,6 +2191,29 @@ class TPUModelRunner(GPUModelRunner):
                 manager_page_bytes = group.kv_cache_spec.page_size_bytes
         self._mamba_state_block_size = state_block_size
         self._mamba_copy_plan = plan
+        mamba_specs = [
+            group.kv_cache_spec
+            for group in kv_cache_config.kv_cache_groups
+            if isinstance(group.kv_cache_spec, MambaSpec)
+        ]
+        self._mamba_tail_fold = (
+            envs.VLLM_TPU_MAMBA_TAIL_FOLD
+            and bool(plan)
+            and all(spec.num_prefill_checkpoint_blocks > 0 for spec in mamba_specs)
+        )
+        if self._mamba_tail_fold:
+            try:
+                cp_world_size = get_pcp_group().world_size
+            except Exception:
+                cp_world_size = 1
+            if cp_world_size != 1:
+                raise ValueError("VLLM_TPU_MAMBA_TAIL_FOLD does not support PCP")
+            logger.info(
+                "VLLM_TPU_MAMBA_TAIL_FOLD: worker exports Mamba prefill "
+                "checkpoints at %d-token block boundaries (%d groups).",
+                state_block_size,
+                len(mamba_specs),
+            )
         if bm_pool_layout is not None:
             # Merged block-major pool rows correspond 1:1 to manager blocks, so
             # state seed copies index rows directly by manager block ID without
@@ -2209,6 +2241,52 @@ class TPUModelRunner(GPUModelRunner):
                 )
                 self._pool_block_split = manager_page_bytes // pool_block_bytes
                 break
+
+    def _mamba_prefill_ckpt_zero(self, num_reqs: int) -> torch.Tensor:
+        """A cached device `(2, num_reqs)` all-zero checkpoint tensor."""
+        zeros = self._mamba_prefill_ckpt_zeros.get(num_reqs)
+        if zeros is None:
+            zeros = torch.zeros((2, num_reqs), dtype=torch.int32).to(self.device)
+            self._mamba_prefill_ckpt_zeros[num_reqs] = zeros
+        return zeros
+
+    def _mamba_prefill_ckpt(
+        self,
+        start_index: int,
+        num_reqs: int,
+        num_scheduled_tokens_per_req: np.ndarray,
+        target_num_reqs: int,
+    ) -> torch.Tensor | None:
+        """VLLM_TPU_MAMBA_TAIL_FOLD: this walk's internal prefill checkpoints.
+
+        Row 0 is each request's checkpoint offset in its query (0: none),
+        row 1 the block-table column the state goes to. Every mamba group
+        reads its own destination block from its table at that column, in
+        the compiled forward. See `core/mamba_tail_fold.py`.
+        """
+        if not self._mamba_tail_fold:
+            return None
+        assert self._mamba_state_block_size is not None
+        offsets, columns = prefill_checkpoints(
+            self.input_batch.num_computed_tokens_cpu[
+                start_index : start_index + num_reqs
+            ],
+            num_scheduled_tokens_per_req[:num_reqs],
+            self._mamba_state_block_size,
+        )
+        exported = int(np.count_nonzero(offsets))
+        WORKER_COUNTER.add(
+            exported,
+            int(np.count_nonzero(num_scheduled_tokens_per_req[:num_reqs] > 1)),
+        )
+        if not exported:
+            return self._mamba_prefill_ckpt_zero(target_num_reqs)
+        host = torch.zeros(
+            (2, target_num_reqs), dtype=torch.int32, pin_memory=PIN_MEMORY
+        )
+        host[0, :num_reqs] = torch.from_numpy(offsets)
+        host[1, :num_reqs] = torch.from_numpy(columns)
+        return stage_h2d_upload(self, host)
 
     def _collect_mamba_state_seed_copies(
         self, scheduler_output, start_index: int, num_reqs: int
@@ -3765,6 +3843,9 @@ class TPUModelRunner(GPUModelRunner):
             mamba_slot_read_offsets=self.mamba_slot_read_offsets,
             mamba_ckpt_window=self._mamba_ckpt_window,
             mamba_request_distribution=mamba_request_distribution,
+            mamba_prefill_ckpt=self._mamba_prefill_ckpt(
+                start_index, num_reqs, num_scheduled_tokens_per_req, target_num_reqs
+            ),
             # Unified pool + spec decode: the mamba group builders append
             # their per-request state block ids here for the post-sampling
             # read-offset scatter.
@@ -6357,6 +6438,11 @@ class TPUModelRunner(GPUModelRunner):
                 mamba_slot_read_offsets=self.mamba_slot_read_offsets,
                 mamba_ckpt_window=self._mamba_ckpt_window,
                 mamba_request_distribution=dummy_mamba_request_distribution,
+                mamba_prefill_ckpt=(
+                    self._mamba_prefill_ckpt_zero(num_reqs)
+                    if self._mamba_tail_fold
+                    else None
+                ),
                 sequence_layout_descriptor=dummy_layout_plan.descriptor,
             )
             slot_mappings = self.empty_slot_mappings
