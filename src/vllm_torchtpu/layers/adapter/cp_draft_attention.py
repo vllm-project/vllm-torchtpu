@@ -370,16 +370,15 @@ def attend_cached(
         dcp=dcp,
         rank=rank,
     )
-    # Query tokens padded per request: [R, Q, H, D].
-    tok = cu_q_lens[:-1, None] + jnp.arange(max_query_len)[None, :]
-    qr = q[jnp.minimum(tok, num_tokens - 1)]
     out, lse = attend_pages(
-        qr,
+        q,
         kv_cache,
         pages,
         blocks,
         cache_lens,
         q_lens,
+        cu_q_lens[:-1],
+        max_query_len=max_query_len,
         kv_heads=kv_heads,
         sliding_window=sliding_window,
         sm_scale=sm_scale,
@@ -390,7 +389,7 @@ def attend_cached(
     # Back to token order.
     seq, _, valid = _token_layout(seq_lens, cu_q_lens, num_tokens)
     col = jnp.clip(jnp.arange(num_tokens) - cu_q_lens[seq], 0, max_query_len - 1)
-    out_t = jnp.where(valid[:, None, None], out[seq, col], 0.0)
+    out_t = jnp.where(valid[:, None, None], out, 0.0)
     lse_t = jnp.where(valid[:, None], lse[seq, col], _NEG_INF)
     return out_t.astype(q.dtype), lse_t
 
@@ -402,7 +401,9 @@ def attend_pages(
     blocks: jax.Array,
     cache_lens: jax.Array,
     q_lens: jax.Array,
+    q_starts: jax.Array,
     *,
+    max_query_len: int,
     kv_heads: int,
     sliding_window: int,
     sm_scale: float,
@@ -410,18 +411,22 @@ def attend_pages(
     v_scale: float | None = None,
     interpret: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
-    """Each request's query block ``q [R, Q, H, D]`` over its window pages
+    """Each request's query tokens (``q [T, H, D]`` rows ``q_starts[r]`` on,
+    ``q_lens[r]`` of at most ``max_query_len``) over its window pages
     ``pages [R, L]`` (global blocks ``blocks [R, L]``), read straight from the
-    paged cache: one grid step per request DMAs its L pages into VMEM (the
-    next request's while this one computes) and attends every KV head's query
-    group to them. Returns ``(out [R, Q, H, D] f32, lse [R, Q, H] f32)``.
+    paged cache: one grid step per request DMAs its L pages and query rows into
+    VMEM (the next request's while this one computes), attends every KV
+    head's query group to them and DMAs the output rows back. Returns
+    ``(out [T, H, D] f32, lse [R, Q, H] f32)``; rows of ``out`` no request
+    owns are undefined.
 
     Replaces a page gather to HBM plus XLA attention over the gathered,
     re-laid-out and f32-converted window (~0.35 us per page of grid overhead
     and several full-window copies per request and layer).
     """
-    num_reqs, q_block, num_heads, head_dim = q.shape
-    num_cols = pages.shape[1]
+    num_tokens, num_heads, head_dim = q.shape
+    num_reqs, num_cols = pages.shape
+    q_block = max_query_len
     page_size, words, packing, width = kv_cache.shape[1:]
     group = num_heads // kv_heads
     rows = q_block * group
@@ -445,38 +450,77 @@ def attend_pages(
         blocks_ref,
         cache_ref,
         qlen_ref,
-        q_ref,
+        qstart_ref,
+        q_hbm,
         kv_hbm,
-        o_ref,
+        o_hbm,
         lse_ref,
         buf,
+        q_buf,
+        o_buf,
         sem,
+        q_sem,
+        o_sem,
     ):
         r = pl.program_id(0)
         slot = r % 2
 
         def copies(req, dst):
-            return [
-                pltpu.make_async_copy(
-                    kv_hbm.at[pages_ref[req * num_cols + c]],
-                    buf.at[dst, c],
-                    sem.at[dst],
+            """(condition or None for always, copy) pairs fetching a request's
+            pages and query rows."""
+            pages = [
+                (
+                    None,
+                    pltpu.make_async_copy(
+                        kv_hbm.at[pages_ref[req * num_cols + c]],
+                        buf.at[dst, c],
+                        sem.at[dst],
+                    ),
                 )
                 for c in range(num_cols)
             ]
+            # A full block is one copy; a shorter request copies its rows one
+            # by one (rows past its tokens stay stale and are masked).
+            full = qlen_ref[req] == q_block
+            rows_in = [
+                (
+                    full,
+                    pltpu.make_async_copy(
+                        q_hbm.at[pl.ds(qstart_ref[req], q_block)],
+                        q_buf.at[dst],
+                        q_sem.at[dst],
+                    ),
+                )
+            ] + [
+                (
+                    jnp.logical_not(full) & (j < qlen_ref[req]),
+                    pltpu.make_async_copy(
+                        q_hbm.at[pl.ds(qstart_ref[req] + j, 1)],
+                        q_buf.at[dst, pl.ds(j, 1)],
+                        q_sem.at[dst],
+                    ),
+                )
+                for j in range(q_block)
+            ]
+            return pages + rows_in
+
+        def run(pairs, method):
+            for todo, cp in pairs:
+                op = getattr(cp, method)
+                if todo is None:
+                    op()
+                else:
+                    pl.when(todo)(op)
 
         @pl.when(r == 0)
         def _():
-            for cp in copies(0, 0):
-                cp.start()
+            run(copies(0, 0), "start")
 
         @pl.when(r + 1 < pl.num_programs(0))
         def _():
-            for cp in copies(r + 1, 1 - slot):
-                cp.start()
+            run(copies(r + 1, 1 - slot), "start")
 
-        for cp in copies(r, slot):
-            cp.wait()
+        run(copies(r, slot), "wait")
 
         cache_len = cache_ref[r]
         col = jax.lax.broadcasted_iota(jnp.int32, (1, keys), 1)
@@ -519,7 +563,7 @@ def attend_pages(
             v = unpack(load_word(v_word), v_slot)[:, :head_dim].astype(jnp.float32)
             v = jnp.where(cached, v, 0.0)
             # [Q, X, D] -> [Q * X, D]: row q * X + x is token q, head g * X + x.
-            qv = q_ref[0, :, g * group : (g + 1) * group, :].reshape(rows, head_dim)
+            qv = q_buf[slot, :, g * group : (g + 1) * group, :].reshape(rows, head_dim)
             s = jax.lax.dot_general(
                 qv.astype(mxu_dtype),
                 k,
@@ -534,38 +578,59 @@ def attend_pages(
             safe = jnp.where(denom > 0, denom, 1.0)
             out = jnp.dot(p, v, preferred_element_type=jnp.float32)
             out = out * (v_mult / safe)
-            o_ref[0, :, g * group : (g + 1) * group, :] = out.reshape(
+            o_buf[:, g * group : (g + 1) * group, :] = out.reshape(
                 q_block, group, head_dim
             )
             lse = jnp.where(denom > 0, m_safe + jnp.log(safe), _NEG_INF)
             lse_ref[0, g] = jnp.sum(jnp.where(diag, lse, 0.0), axis=0, keepdims=True)
+        full = qlen_ref[r] == q_block
+        rows_out = [
+            (
+                full,
+                pltpu.make_async_copy(
+                    o_buf, o_hbm.at[pl.ds(qstart_ref[r], q_block)], o_sem.at[0]
+                ),
+            )
+        ] + [
+            (
+                jnp.logical_not(full) & (j < qlen_ref[r]),
+                pltpu.make_async_copy(
+                    o_buf.at[pl.ds(j, 1)],
+                    o_hbm.at[pl.ds(qstart_ref[r] + j, 1)],
+                    o_sem.at[0],
+                ),
+            )
+            for j in range(q_block)
+        ]
+        run(rows_out, "start")
+        run(rows_out, "wait")
 
     out, lse = pl.pallas_call(
         kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=4,
+            num_scalar_prefetch=5,
             grid=(num_reqs,),
             in_specs=[
-                pl.BlockSpec(
-                    (1, q_block, num_heads, head_dim), lambda r, *_: (r, 0, 0, 0)
-                ),
+                pl.BlockSpec(memory_space=pltpu.HBM),
                 pl.BlockSpec(memory_space=pltpu.HBM),
             ],
             out_specs=[
-                pl.BlockSpec(
-                    (1, q_block, num_heads, head_dim), lambda r, *_: (r, 0, 0, 0)
-                ),
+                pl.BlockSpec(memory_space=pltpu.HBM),
                 pl.BlockSpec((1, kv_heads, 1, rows), lambda r, *_: (r, 0, 0, 0)),
             ],
             scratch_shapes=[
                 pltpu.VMEM(
                     (2, num_cols, page_size, words, packing, width), kv_cache.dtype
                 ),
+                pltpu.VMEM((2, q_block, num_heads, head_dim), q.dtype),
+                pltpu.VMEM((q_block, num_heads, head_dim), jnp.float32),
                 pltpu.SemaphoreType.DMA((2,)),
+                pltpu.SemaphoreType.DMA((2,)),
+                pltpu.SemaphoreType.DMA((1,)),
             ],
         ),
         out_shape=[
-            jax.ShapeDtypeStruct((num_reqs, q_block, num_heads, head_dim), jnp.float32),
+            jax.ShapeDtypeStruct((num_tokens, num_heads, head_dim), jnp.float32),
             jax.ShapeDtypeStruct((num_reqs, kv_heads, 1, rows), jnp.float32),
         ],
         # The next request's pages are fetched in the current step.
@@ -579,6 +644,7 @@ def attend_pages(
         blocks.reshape(-1).astype(jnp.int32),
         cache_lens.astype(jnp.int32),
         q_lens.astype(jnp.int32),
+        q_starts.astype(jnp.int32),
         q,
         kv_cache,
     )
