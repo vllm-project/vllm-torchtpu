@@ -29,6 +29,28 @@ os.environ.setdefault("TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS", "fals
 os.environ.setdefault("TORCHINDUCTOR_AUTOGRAD_CACHE", "0")
 
 
+def maybe_run_rust() -> bool:
+    """If VLLM_TPU_USE_RUST is set and the command is `serve`, run rvllm."""
+    if len(sys.argv) <= 1 or sys.argv[1] != "serve":
+        return False
+    prog = os.path.basename(sys.argv[0])
+    if prog.endswith("-omni"):
+        return False
+
+    from vllm_torchtpu import envs
+
+    if not envs.VLLM_TPU_USE_RUST:
+        return False
+
+    from vllm_torchtpu.experimental.rust.launcher import main as rust_main
+
+    rust_main(sys.argv[1:])
+    return True
+
+
+maybe_run_rust_backend = maybe_run_rust
+
+
 class _PostExecLoader(importlib.abc.Loader):
     """Wraps a module loader to attach compatibility aliases after execution."""
 
@@ -159,6 +181,66 @@ class _VllmOmniCompatFinder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
             launchers_pkg_any.cli_args = target
 
 
+class _RustFinder(importlib.abc.MetaPathFinder):
+    """Hooks vLLM CLI startup to delegate `vllm serve` to the Rust runtime.
+
+    Upstream vLLM does not provide a plugin hook or entrypoint for CLI
+    subcommand delegation before argument parsing (R-3.4). We wrap
+    `vllm.entrypoints.common.startup.cli_env_setup`, which is called at the
+    beginning of `vllm.entrypoints.cli.main.main()` before subcommands and
+    arguments are parsed.
+    """
+
+    _STARTUP_MODULE = "vllm.entrypoints.common.startup"
+
+    @classmethod
+    def patch_startup(cls, module: types.ModuleType) -> None:
+        orig = getattr(module, "cli_env_setup", None)
+        if (
+            orig is None
+            or getattr(orig, "_rust_wrapped", False)
+            or getattr(orig, "_rust_backend_wrapped", False)
+        ):
+            return
+
+        def _wrapped_cli_env_setup(*args: Any, **kwargs: Any) -> Any:
+            res = orig(*args, **kwargs)
+            maybe_run_rust()
+            return res
+
+        _wrapped_cli_env_setup._rust_wrapped = True  # type: ignore[attr-defined]
+        _wrapped_cli_env_setup._rust_backend_wrapped = True  # type: ignore[attr-defined]
+        module_any: Any = module
+        module_any.cli_env_setup = _wrapped_cli_env_setup
+
+    def find_spec(
+        self,
+        fullname: str,
+        path: Sequence[str] | None,
+        target: types.ModuleType | None = None,
+    ) -> importlib.machinery.ModuleSpec | None:
+        if fullname == self._STARTUP_MODULE:
+            spec = importlib.machinery.PathFinder.find_spec(fullname, path, target)
+            if spec is not None and spec.loader is not None:
+                spec.loader = _PostExecLoader(spec.loader, self.patch_startup)
+            return spec
+        return None
+
+    @classmethod
+    def apply_to_loaded_modules(cls) -> None:
+        startup = sys.modules.get(cls._STARTUP_MODULE)
+        if startup is not None:
+            cls.patch_startup(startup)
+
+
+_RustBackendFinder = _RustFinder
+
 if not any(type(f).__name__ == "_VllmOmniCompatFinder" for f in sys.meta_path):
     sys.meta_path.insert(0, _VllmOmniCompatFinder())
 _VllmOmniCompatFinder.apply_to_loaded_modules()
+
+if not any(
+    type(f).__name__ in ("_RustFinder", "_RustBackendFinder") for f in sys.meta_path
+):
+    sys.meta_path.insert(0, _RustFinder())
+_RustFinder.apply_to_loaded_modules()

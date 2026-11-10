@@ -32,14 +32,15 @@ Both commands are printed before they run. `bench ...` replaces this process
 with `vllm bench ...`; other subcommands (`proxy`, `--version`) with the rvllm
 binary.
 
-`--rvllm-binary` (required) names the rvllm binary, which is not part of this
-repository: a local binary, used as is, or a location holding `rvllm` and a
-`metadata.json` whose `sha256` entry is the binary's SHA-256 in lowercase hex
-(`gs://...`, `https://...` or a local directory). A downloaded binary is checked
-against the sha256 and cached. The launcher takes it out before the split, as
-`--rvllm-binary VALUE` or `--rvllm-binary=VALUE`; `vllm serve` has no
-`--rvllm-*` options, and any other one fails. Downloads and exports are cached
-under `~/.cache/rvllm`.
+The rvllm binary can be specified via `--rvllm-binary`, the
+`VLLM_TPU_RVLLM_BINARY` environment variable, or discovered on `PATH`. It is
+not part of this repository: a local binary, used as is, or a location holding
+`rvllm` and a `metadata.json` whose `sha256` entry is the binary's SHA-256 in
+lowercase hex (`gs://...`, `https://...` or a local directory). A downloaded
+binary is checked against the sha256 and cached. The launcher takes
+`--rvllm-binary` out before the split, as `--rvllm-binary VALUE` or
+`--rvllm-binary=VALUE`; `vllm serve` has no `--rvllm-*` options, and any other
+one fails. Downloads and exports are cached under `~/.cache/rvllm`.
 """
 
 from __future__ import annotations
@@ -59,6 +60,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.experimental.export import cli as export_cli
 
 PROG = "python -m vllm_torchtpu.experimental.rust"
@@ -314,20 +316,32 @@ def _fetch(location: str, name: str, dest: Path) -> None:
 
 
 def resolve_binary(location: str) -> Path:
-    """The rvllm binary `--rvllm-binary` names, downloaded and verified if needed."""
+    """The rvllm binary resolved from `--rvllm-binary`, env var, or PATH."""
+    source = "--rvllm-binary"
+    if not location:
+        env_val = envs.VLLM_TPU_RVLLM_BINARY
+        if env_val:
+            location = env_val
+            source = "VLLM_TPU_RVLLM_BINARY"
+        else:
+            which_path = shutil.which("rvllm")
+            if which_path:
+                location = which_path
+                source = "PATH"
     if not location:
         raise LauncherError(
             "pass --rvllm-binary: an rvllm binary, or a location (gs://, https:// "
-            "or a directory) holding rvllm and its metadata.json"
+            "or a directory) holding rvllm and its metadata.json; alternatively "
+            "set VLLM_TPU_RVLLM_BINARY or ensure rvllm is on PATH"
         )
     path = Path(location)
     if path.is_file():
         if not os.access(path, os.X_OK):
-            raise LauncherError(f"--rvllm-binary {location} is not executable")
+            raise LauncherError(f"{source} {location} is not executable")
         return path
     if not location.startswith(("gs://", "http://", "https://")) and not path.is_dir():
         raise LauncherError(
-            f"--rvllm-binary {location} is neither a file, a directory nor a URL"
+            f"{source} {location} is neither a file, a directory nor a URL"
         )
     with tempfile.TemporaryDirectory() as tmp:
         meta = Path(tmp) / "metadata.json"

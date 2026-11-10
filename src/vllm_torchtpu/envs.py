@@ -211,6 +211,8 @@ if TYPE_CHECKING:
     VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS: int = 8
     VLLM_TPU_SRPT_ATTN_WORK_CAP: int = 0
     VLLM_TPU_SRPT_ATTN_TILE_TOKENS: int = 32
+    VLLM_TPU_USE_RUST: bool = False
+    VLLM_TPU_RVLLM_BINARY: str = ""
 
 
 def env_with_choices(
@@ -1297,6 +1299,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_SRPT_ATTN_TILE_TOKENS": env_nonnegative_int(
         "VLLM_TPU_SRPT_ATTN_TILE_TOKENS", 32
     ),
+    # Opt in to serving models with the native Rust runtime (rvllm) behind `vllm serve`.
+    # Encompasses both HTTP frontend and engine backend.
+    # Experimental, off by default until rvllm reaches feature parity.
+    "VLLM_TPU_USE_RUST": env_bool("VLLM_TPU_USE_RUST", default=False),
+    # Path or command name for the rvllm binary. When unset, falls back to PATH.
+    "VLLM_TPU_RVLLM_BINARY": env_str("VLLM_TPU_RVLLM_BINARY", default=""),
 }
 
 
