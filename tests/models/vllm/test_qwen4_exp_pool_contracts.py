@@ -187,7 +187,9 @@ def test_dummy_adapter_caps_live_rows_and_pads_the_bucket(
         for position in range(context, context + length)
     ]
     expected += [0] * (tokens - live)
-    assert captured["positions"].tolist() == expected
+    assert captured["positions"].shape == (3, tokens)
+    for axis in captured["positions"]:
+        assert axis.tolist() == expected
     assert {"state_slots", "main_block_table", "compressed_block_table"}.isdisjoint(
         kwargs
     )

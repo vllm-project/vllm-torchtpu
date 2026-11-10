@@ -48,7 +48,10 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.request import Request
 from vllm.v1.structured_output import StructuredOutputManager
 
-from vllm_torchtpu import _patch_vllm_dcp_fine_prefix_hits
+from vllm_torchtpu import (
+    _patch_vllm_dcp_fine_prefix_hits,
+    _patch_vllm_hybrid_pcp_block_sizes,
+)
 
 BLOCK_SIZE = 256
 DCP = 16
@@ -59,6 +62,8 @@ UNIT = 256
 @pytest.fixture(autouse=True)
 def patched(monkeypatch):
     """Apply the patch on top of upstream, restoring everything afterwards."""
+    # Install the stable predecessor before temporarily replacing its resolver.
+    _patch_vllm_hybrid_pcp_block_sizes()
     cls = kv_cache_coordinator.UnitaryKVCacheCoordinator
     monkeypatch.setattr(cls, "__init__", inspect.unwrap(cls.__init__))
     monkeypatch.setattr(

@@ -18,8 +18,7 @@ predicate, and the construction of the byte-range request plan from
 safetensors metadata. No TPU, no network: the Run:AI streamer is faked.
 """
 
-import sys
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -59,30 +58,13 @@ def test_local_expert_ids_use_loader_ownership_mapping():
     chip_aware_ids = set(range(56))
 
     compute_ids = MagicMock(return_value=chip_aware_ids)
-    vllm = ModuleType("vllm")
-    vllm.__path__ = []
-    config_module = ModuleType("vllm.config")
-    config_module.get_current_vllm_config = MagicMock(return_value=config)
-    model_executor = ModuleType("vllm.model_executor")
-    model_executor.__path__ = []
-    loader_module = ModuleType("vllm.model_executor.model_loader")
-    loader_module.default_loader = SimpleNamespace(compute_local_expert_ids=compute_ids)
-    distributed_module = ModuleType("vllm.distributed")
-    distributed_module.get_dp_group = MagicMock()
-    distributed_module.get_pcp_group = MagicMock()
-    distributed_module.get_tensor_model_parallel_rank = MagicMock(return_value=11)
-    logger_module = ModuleType("vllm.logger")
-    logger_module.init_logger = MagicMock(return_value=MagicMock())
+    from vllm.model_executor.model_loader import default_loader
 
-    fake_modules = {
-        "vllm": vllm,
-        "vllm.config": config_module,
-        "vllm.model_executor": model_executor,
-        "vllm.model_executor.model_loader": loader_module,
-        "vllm.distributed": distributed_module,
-        "vllm.logger": logger_module,
-    }
-    with patch.dict(sys.modules, fake_modules):
+    with (
+        patch("vllm.config.get_current_vllm_config", return_value=config),
+        patch.object(default_loader, "compute_local_expert_ids", compute_ids),
+        patch("vllm.distributed.get_tensor_model_parallel_rank", return_value=11),
+    ):
         assert _compute_local_expert_ids() == chip_aware_ids
 
     compute_ids.assert_called_once_with(896, 32, 11, placement="linear")

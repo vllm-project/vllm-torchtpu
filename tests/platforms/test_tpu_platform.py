@@ -1499,7 +1499,7 @@ class TestQwen3VLModelPatches:
         class MockTPUTensor(torch.Tensor):
             @property
             def device(self):
-                return torch.device("tpu")
+                return SimpleNamespace(type="tpu")
 
         inp = torch.zeros(4).as_subclass(MockTPUTensor)
         mask = torch.tensor([True, True, True, False])
