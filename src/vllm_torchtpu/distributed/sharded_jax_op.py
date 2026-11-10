@@ -14,26 +14,23 @@
 """Register a torch custom op backed by a multi-device JAX/Pallas function.
 
 ``torch_tpu``'s ``pallas.jax_op`` accepts ``mesh`` and
-``input_partition_specs`` and exports a real multi-device SPMD module, but it
-sizes the torch output tensors from ``lowered.out_avals``, where ``jax.export``
-records ``shard_map`` results as *replicated*. A caller whose outputs are
-genuinely sharded therefore gets tensors sized for the global array instead of
-this rank's shard -- for an EP MoE at 2048 tokens a rank, an output claiming
-16384 rows.
+``input_partition_specs`` and exports a real multi-device SPMD module. In
+``torch_tpu >= 0.2.0``, ``JaxCallable`` natively sizes output placeholders from
+``output_partition_specs``. When provided with the flattened output partition
+specs, stock ``JaxCallable`` sizes sharded output placeholders per rank rather
+than globally.
 
-``pcp_streaming_rpa``'s adapter solved that by reimplementing ``__call__``, and
-that copy has since fallen behind -- stock has gained an eager wrapper-tensor
-branch and MLIR-fingerprint-based kernel caching that it does not have. So
-instead of forking the method, this derives it from the installed one and
-changes the single line that builds the output placeholders. If upstream
-reworks that line the derivation no-ops and the caller falls back to stock,
-which is wrong only in the way described above and fails loudly on a shape
-mismatch rather than silently.
+For backward compatibility with older ``torch_tpu`` versions that lacked
+``output_partition_specs``, this module previously derived a patched class
+replacing the placeholder construction line. In ``torch_tpu >= 0.2.0``, that line
+is absent, and ``_build_sharded_callable_cls`` falls back to stock
+``JaxCallable``, which correctly sizes sharded outputs using the passed
+``output_partition_specs``.
 """
 
 import inspect
 from collections.abc import Callable, Sequence
-from typing import Any
+from typing import Any, cast
 
 import jax
 import torch
@@ -103,11 +100,12 @@ def _build_sharded_callable_cls():
     """
     src = inspect.getsource(pallas_impl.JaxCallable.__call__)
     if _STOCK_PLACEHOLDER_LINE not in src:
-        logger.warning(
-            "torch_tpu's JaxCallable.__call__ no longer builds its output "
-            "placeholders the way this adapter expects; sharded outputs will "
-            "be sized globally. Sharded multi-device ops will fail on a shape "
-            "mismatch until this is re-derived."
+        # torch_tpu builds the placeholders from ``output_partition_specs``
+        # itself (sharded_jax_op passes them), so the stock call sizes sharded
+        # outputs correctly.
+        logger.debug(
+            "torch_tpu's JaxCallable.__call__ sizes outputs from their "
+            "partition specs; using it unchanged."
         )
         return pallas_impl.JaxCallable
     patched = "class _Holder:\n" + src.replace(
@@ -140,6 +138,7 @@ def sharded_jax_op(
     input_partition_specs: Sequence[PartitionSpec],
     output_partition_specs: Any,
     donate_argnums: Sequence[int] | None = None,
+    configure_callable: Callable[[Any], None] | None = None,
 ):
     """A torch custom op for ``fn`` run as an SPMD program over ``mesh``.
 
@@ -154,6 +153,9 @@ def sharded_jax_op(
     here, but a one-tuple gives the op the schema ``-> ((Tensor))``, and torch
     ``guard_int``s every symbolic input dimension of an op with that schema, so
     a caller under ``torch.compile`` loses its dynamic batch dimension.
+
+    ``configure_callable``, if given, is called with the op's torch_tpu
+    ``JaxCallable`` before the op is registered.
     """
     global _SHARDED_CALLABLE_CLS
     if _SHARDED_CALLABLE_CLS is None:
@@ -197,9 +199,23 @@ def sharded_jax_op(
         trace_key=trace_key,
         mesh=mesh,
         input_partition_specs=input_partition_specs,
+        # One spec per output leaf, in the export's order: torch_tpu sizes
+        # each output's placeholder from its spec.
+        output_partition_specs=cast(
+            Any,
+            tuple(
+                jax.tree.leaves(
+                    output_partition_specs,
+                    is_leaf=lambda s: isinstance(s, PartitionSpec),
+                )
+            ),
+        ),
         static_argnums=static_argnums,
         donate_argnums=donate_argnums,
     )
+
+    if configure_callable is not None:
+        configure_callable(wrapped_fn)
 
     op = torch.library.custom_op(name, wrapped_fn, mutates_args=())
 
