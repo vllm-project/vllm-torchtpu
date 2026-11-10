@@ -1011,13 +1011,37 @@ def ragged_paged_attention(
         )
     else:
         )
+        # Skip the MIXED call when its sequence range
         # [distribution[0], distribution[2]) (`configs.RpaConfigs.seq_range`)
         # is empty.
+        if return_lse:
 
-        else:
-                )
+            def _do_mixed_lse(args):
+                o_in, kv_in, lse_in = args
+                return run_rpa_kernel(configs.RpaCase.MIXED, o_in, kv_in, lse_in)
 
+            o_hbm_alias_q_hbm, kv_cache, lse_hbm = jax.lax.cond(
+                distribution[0] < distribution[2],
+                _do_mixed_lse,
+                lambda args: args,
+                (o_hbm_alias_q_hbm, kv_cache, lse_hbm),
             )
+        else:
+
+            def _do_mixed(args):
+                o_in, kv_in = args
+                o_out, kv_out, _ = run_rpa_kernel(
+                    configs.RpaCase.MIXED, o_in, kv_in, None
+                )
+                return o_out, kv_out
+
+            o_hbm_alias_q_hbm, kv_cache = jax.lax.cond(
+                distribution[0] < distribution[2],
+                _do_mixed,
+                lambda args: args,
+                (o_hbm_alias_q_hbm, kv_cache),
+            )
+            lse_hbm = None
 
     num_q_heads_per_kv_head = num_q_heads // num_kv_heads
     if return_raw_output:
