@@ -18,6 +18,7 @@ tests/kernels/experimental/small_collectives; the warmup hand-over between the
 two sides of the row fork in tests/compilation/test_shape_variants.py.
 """
 
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -166,22 +167,46 @@ def test_unarmed_is_the_fallback(monkeypatch):
     assert op.dp_combine_or(x, fallback) is fallback.return_value
 
 
-def test_prebuild_is_a_no_op_with_the_flag_off(monkeypatch):
-    monkeypatch.setattr(op.envs, "TPU_SMALL_ALL_REDUCE", False)
+def _config(additional_config):
+    return SimpleNamespace(additional_config=additional_config)
+
+
+ON = _config({"tpu_collectives": {"small_all_reduce": True}})
+
+
+@pytest.mark.parametrize(
+    "additional_config",
+    [
+        {},
+        {"tpu_collectives": {}},
+        {"tpu_collectives": {"small_all_reduce": False}},
+        {"other": {"small_all_reduce": True}},
+    ],
+    ids=["empty", "no_key", "off", "other_subsystem"],
+)
+def test_prebuild_is_a_no_op_unless_the_setting_is_on(monkeypatch, additional_config):
+    """Off by default: main's collectives stay untouched for every model."""
     build = Mock()
     monkeypatch.setattr(op, "build_ep_mesh", build)
     monkeypatch.setattr(op, "_AR_OP", None)
-    op.prebuild()
+    op.prebuild(_config(additional_config))
     build.assert_not_called()
     assert op._AR_OP is None
 
 
 def test_prebuild_refuses_a_deployment_without_an_ep_group(monkeypatch):
-    monkeypatch.setattr(op.envs, "TPU_SMALL_ALL_REDUCE", True)
     monkeypatch.setattr(op, "build_ep_mesh", lambda: None)
     monkeypatch.setattr(op, "_AR_OP", None)
-    with pytest.raises(NotImplementedError, match="TPU_SMALL_ALL_REDUCE"):
-        op.prebuild()
+    with pytest.raises(NotImplementedError, match="small_all_reduce"):
+        op.prebuild(ON)
+
+
+def test_prebuild_builds_the_ops_when_the_setting_is_on(monkeypatch):
+    """The setting reaches the mesh build (the 'on' control for the no-op test)."""
+    monkeypatch.setattr(op, "build_ep_mesh", Mock(side_effect=RuntimeError("built")))
+    monkeypatch.setattr(op, "_AR_OP", None)
+    with pytest.raises(RuntimeError, match="built"):
+        op.prebuild(ON)
 
 
 def test_retain_is_the_identity_when_unarmed_or_outside_the_warmup(monkeypatch):

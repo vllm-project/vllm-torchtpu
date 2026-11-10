@@ -1554,14 +1554,12 @@ def _get_token_paddings(
     return paddings
 
 
-def _is_sequence_parallel_bucket(size: int, tp: int) -> bool:
-    from vllm_torchtpu.layers.adapter import sequence_parallel
-
+def _is_sequence_parallel_bucket(size: int, tp: int, min_rows: int) -> bool:
     # A bucket below min_rows runs replicated, so any size serves. From there
     # each rank receives size // tp rows; require 8-token alignment or
     # validated power-of-two decode sizes (2, 4) with at least 2 rows per rank
     # to avoid single-token shape specialization in Dynamo.
-    if size < sequence_parallel.min_rows():
+    if size < min_rows:
         return True
     rows, rem = divmod(size, tp)
     return rem == 0 and (rows % 8 == 0 or rows in (2, 4))
@@ -1608,8 +1606,12 @@ def _configure_sequence_parallel_moe(vllm_config: VllmConfig) -> None:
     cc = vllm_config.compilation_config
     if cc.compile_sizes is None:
         return
+    from vllm_torchtpu.layers.adapter import sequence_parallel
+
+    # The engine's layout, not this process's groups: none exist yet here.
+    min_rows = sequence_parallel.min_rows(parallel_config)
     original = [int(s) for s in cc.compile_sizes]
-    kept = [s for s in original if _is_sequence_parallel_bucket(s, tp)]
+    kept = [s for s in original if _is_sequence_parallel_bucket(s, tp, min_rows)]
     if not kept:
         raise ValueError(
             f"TPU_MOE_SEQUENCE_PARALLEL=1 left no valid compile sizes "
