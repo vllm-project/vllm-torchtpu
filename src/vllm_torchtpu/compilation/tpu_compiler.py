@@ -321,6 +321,7 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # K3 custom-op registration, sharding, and Attention Residual bridges.
     "vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
     "vllm_torchtpu/models/vllm/kimi_k3/layers.py",
+    "vllm_torchtpu/models/vllm/qwen3_next_patch.py",
     # Registers the pallas::*_fused_max and pallas::w8a8_fused_topk32*_v2 jax
     # ops (behind a torch custom-op boundary) that get_top_tokens and the
     # packed top-k candidates run inside the AOT-cached fused MTP draft loop
