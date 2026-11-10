@@ -269,6 +269,8 @@ legs:
         fast_compiled_call: true
       tpu_frontend:
         tokenize_prefix_cache: true
+      tpu_multiport_dp:
+        enabled: true
       tpu_runner:
         stage_timing: false
       tpu_worker:
