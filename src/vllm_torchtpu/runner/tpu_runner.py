@@ -5705,6 +5705,11 @@ class TPUModelRunner(GPUModelRunner):
 
             gmm_v2.set_skinny_gmm_path(additional["moe_skinny_gmm"])
             logger.info("MoE skinny gmm path: %s", gmm_v2.skinny_gmm_path())
+        if isinstance(additional, dict) and "msa_index_int4_fp8" in additional:
+            from vllm_torchtpu.models.minimax_m3.kernels import msa_indexer
+
+            msa_indexer.set_int4_fp8_keys(additional["msa_index_int4_fp8"])
+            logger.info("MSA indexer int4 keys as fp8: %s", msa_indexer.int4_fp8_keys())
 
         # Set TPU-specific quantization config before model loading.
         # This ensures that TPU-compatible quantization methods are used

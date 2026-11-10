@@ -237,3 +237,39 @@ def test_fp4_lowers_for_tpu(kernel):
     with use_abstract_mesh(tpu7x):
         lowered = jax.jit(f).trace(*args).lower(lowering_platforms=("tpu",))
     assert "tpu_custom_call" in lowered.as_text()
+
+
+@pytest.mark.parametrize("folded_tile_q", [8, 16])
+def test_int4_fp8_keys_match_bf16_keys(monkeypatch, folded_tile_q):
+    """`set_int4_fp8_keys`: transposed folded 4-bit scoring with the int4 keys
+    fed as fp8 gives the same scores as feeding them as bf16."""
+    from vllm_torchtpu.models.minimax_m3.kernels import msa_fp4, msa_indexer
+
+    rng = np.random.default_rng(11)
+    q_lens, ctx_lens = [4, 4, 2], [600, 250, 900]
+    num_seqs, num_real = len(q_lens), sum(q_lens)
+    num_tokens = num_real + 2
+    seq_lens = np.zeros(MAX_SEQS, np.int32)
+    seq_lens[:num_seqs] = np.array(ctx_lens) + np.array(q_lens)
+    cu_q = np.full(MAX_SEQS + 1, num_real, np.int32)
+    cu_q[: num_seqs + 1] = np.concatenate([[0], np.cumsum(q_lens)])
+    tables = np.zeros((MAX_SEQS, PAGES_PER_SEQ), np.int32)
+    tables[:num_seqs] = rng.permutation(np.arange(1, NUM_PAGES))[
+        : num_seqs * PAGES_PER_SEQ
+    ].reshape(num_seqs, PAGES_PER_SEQ)
+    raw = rng.standard_normal((NUM_PAGES, PAGE, HEAD_DIM))
+    nib, scale = msa_fp4.quantize(msa_fp4.rotate_keys(jnp.asarray(raw, jnp.float32)))
+    cache = msa_fp4.pack_rows(nib, scales=scale)
+    q = msa_fp4.rotate_queries(
+        jnp.asarray(rng.standard_normal((num_tokens, 1, HEAD_DIM))).astype(jnp.bfloat16)
+    )
+    args = (q, cache, jnp.asarray(seq_lens), jnp.asarray(tables.reshape(-1)), jnp.asarray(cu_q), jnp.int32(num_seqs))
+    kw = dict(folded_tile_q=folded_tile_q, pages_per_step=4, small_pages_per_step=4, interpret=True)
+    out = {}
+    for enabled in (False, True):
+        monkeypatch.setattr(msa_indexer, "_int4_fp8_keys", enabled)
+        out[enabled] = np.asarray(block_scores.__wrapped__(*args, **kw))[:, 0]
+    for r in range(num_seqs):
+        live = -(-seq_lens[r] // PAGE)
+        rows = slice(cu_q[r], cu_q[r + 1])
+        np.testing.assert_array_equal(out[True][rows, :live], out[False][rows, :live])

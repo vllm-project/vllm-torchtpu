@@ -222,6 +222,22 @@ _DMA_ISSUE_CHUNKS = 2
 # token-major with the slot scales folded into the keys (maxima across
 # sublanes, as the other caches).
 _FOLDED_TRANSPOSED_MAX_ROWS = 64
+# Transposed folded 4-bit scoring feeds the MXU the int4 keys as fp8 rather
+# than bf16: int4 values are exact in e4m3 and bf16 x fp8 is native on tpu7x,
+# so the scores are unchanged, and the cheaper unpack makes the c64 decode
+# indexer 9-17% faster (DCP8 / DCP4, bit-identical scores, j-fd386dc1).
+# Set with --additional-config '{"msa_index_int4_fp8": true}'
+# (`set_int4_fp8_keys`), before the model's first trace.
+_int4_fp8_keys = False
+
+
+def set_int4_fp8_keys(enabled: bool) -> None:
+    global _int4_fp8_keys
+    _int4_fp8_keys = bool(enabled)
+
+
+def int4_fp8_keys() -> bool:
+    return _int4_fp8_keys
 
 
 def _paired_query(q: jax.Array) -> jax.Array:
@@ -278,7 +294,9 @@ def _folded_chunk_maxima_t(q_pair, buf, first, chunk, live, issue) -> jax.Array:
         issue(j)
         pair = []
         for side, p in enumerate((first + j, first + half + j)):
-            k = pltpu.bitcast(buf[p, : rows - 1], jnp.int4).astype(jnp.bfloat16)
+            k = pltpu.bitcast(buf[p, : rows - 1], jnp.int4).astype(
+                jnp.float8_e4m3fn if _int4_fp8_keys else jnp.bfloat16
+            )
             pair.append(k)
             s = pltpu.bitcast(buf[p, rows - 1 :], jnp.float32)  # [1, S]
             # Stale VMEM past the request's end, unwritten slots: scale 0.
