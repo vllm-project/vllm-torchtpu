@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Static admission of decode context parallelism (DCP) on TPU.
 
 Mirrors pcp_validation.py for the decode axis. vLLM itself only checks that
@@ -11,11 +23,11 @@ answer rather than an error:
    dcp ranks inside TP, so dcp must divide tp / num_kv_heads. Qwen3.5-397B
    (2 KV heads): TP8 admits DCP 1, 2, 4; TP16 up to 8; TP32 up to 16. TP8 with
    DCP8 would attend head-1 queries against head-0 pages on ranks 0..3.
-2. The Qwen3.5 decode megakernel reads `MKConfig.dcp` from this size: its
-   KV-head group of tp / num_kv_heads ranks holds dcp page-interleaved shards
-   (page p on DCP rank p % dcp at column p // dcp, the rule of the batched RPA
-   kernels and of Raiden's tp{T}dcp{D}_decode landing), so the head rule above
-   is the whole admission for it as well.
+2. A decode megakernel serving DCP must place each KV-head group's pages by
+   the same page-interleaved rule (page p on DCP rank p % dcp at column
+   p // dcp, the rule of the batched RPA kernels and of Raiden's
+   tp{T}dcp{D}_decode landing), so the head rule above is the whole admission
+   for it as well.
 3. The Raiden Stage-3 admission names consumer layouts tp{T}dcp{D}_decode
    only for dp == 1; with attention-DP it returns dp{N}[tp{T}]_decode without
    reading DCP, so the producer and consumer would disagree on the page owner.
