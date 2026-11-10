@@ -10457,18 +10457,21 @@ class TPUModelRunner(GPUModelRunner):
         self,
         num_tokens_padded: int,
         num_valid_tokens: int | None = None,
-        rows_sliced: bool = False,
+        rows_sliced: bool | None = None,
     ) -> None:
         """Record which of this step's token rows are padding.
 
         `rows_sliced` says whether the forward about to run slices its rows
         over TP (each rank owns `num_tokens_padded // tp` rows), in which case
         the mask is this rank's slice; otherwise every rank holds all
-        `num_tokens_padded` rows and the mask covers them all. It defaults to
-        the full mask, as on main: no model follows each step's form yet, and
-        the MoE paths read the mask over all of the step's rows. Writing the
-        per-rank slice for a forward that reads every row marks real rows of
-        other ranks as padding, and the MoE then drops their experts.
+        `num_tokens_padded` rows and the mask covers them all. None takes the
+        decision the target forward makes, `sequence_parallel.step_rows_are_sliced`:
+        sliced only when the step is sequence-parallel and the model follows
+        each step's form. A model that does not (main's forwards) gets the full
+        mask, as on main, because its MoE paths read the mask over all of the
+        step's rows: writing the per-rank slice for a forward that reads every
+        row marks real rows of other ranks as padding, and the MoE then drops
+        their experts.
         """
         padding_state = getattr(self, "_token_padding_state", None)
         if padding_state is None:
@@ -10483,6 +10486,8 @@ class TPUModelRunner(GPUModelRunner):
                 # Padding-mask support is currently limited to the ALL layout.
                 valid_tokens = num_tokens_padded
         tp_size = self.parallel_config.tensor_parallel_size
+        if rows_sliced is None:
+            rows_sliced = sequence_parallel.step_rows_are_sliced(num_tokens_padded)
         if rows_sliced and tp_size > 1:
             from vllm.distributed import get_tensor_model_parallel_rank
 

@@ -26,16 +26,22 @@ _ACTIVE = False
 
 # Smallest step, in rows, that runs sequence-parallel. Below it the step keeps
 # its rows replicated over TP: slicing a few rows saves less in the MoE than the
-# extra all-gather and reduce-scatter cost. A layout measured to cross over at a
-# different row count gets an entry in _MIN_ROWS_BY_LAYOUT, keyed on
-# (data_parallel_size, tensor_parallel_size).
+# extra all-gather and reduce-scatter cost.
 #
-# 0 until a model reads each step's form (rows_are_sliced): with it, every
+# Only a model whose forward follows each step's form (it slices a step's rows
+# exactly when the runner marks the step sequence-parallel) can run a step
+# replicated, so the threshold applies once such a model calls
+# follow_step_form(). Until then it is DEFAULT_MIN_ROWS, 0: every
 # sequence-parallel step stays sliced and every compile size follows main's
-# alignment rule, as on main. The change that makes the model follow the
-# step's form raises the threshold.
+# alignment rule, as on main.
 DEFAULT_MIN_ROWS = 0
-_MIN_ROWS_BY_LAYOUT: dict[tuple[int, int], int] = {}
+# The threshold for a model that follows the step's form: STEP_FORM_MIN_ROWS,
+# or the entry of a layout measured to cross over at a different row count,
+# keyed on (data_parallel_size, tensor_parallel_size). The values are the
+# Qwen3.5-397B decode crossovers: 64 rows at DP4 x TP2 and 512 at TP8.
+STEP_FORM_MIN_ROWS = 512
+_MIN_ROWS_BY_LAYOUT: dict[tuple[int, int], int] = {(4, 2): 64, (1, 8): 512}
+_FOLLOWS_STEP_FORM = False
 
 
 def parallel_layout(parallel_config: Any = None) -> tuple[int, int] | None:
@@ -57,13 +63,33 @@ def parallel_layout(parallel_config: Any = None) -> tuple[int, int] | None:
     )
 
 
+def follow_step_form() -> None:
+    """Record that the model's forward follows each step's form.
+
+    Called by a model patch that slices a step's rows only when the runner
+    marks the step sequence-parallel (``set_active``); from then on a step
+    below ``min_rows()`` runs replicated, and the runner writes the per-rank
+    padding mask only for a sliced step (``step_rows_are_sliced``).
+    """
+    global _FOLLOWS_STEP_FORM
+    _FOLLOWS_STEP_FORM = True
+
+
+def follows_step_form() -> bool:
+    return _FOLLOWS_STEP_FORM
+
+
 def min_rows(parallel_config: Any = None) -> int:
     """The row threshold for the layout of ``parallel_config``, or of this
-    process's model-parallel groups when it is None."""
+    process's model-parallel groups when it is None: DEFAULT_MIN_ROWS until a
+    model follows each step's form, then the layout's entry or
+    STEP_FORM_MIN_ROWS."""
+    if not _FOLLOWS_STEP_FORM:
+        return DEFAULT_MIN_ROWS
     layout = parallel_layout(parallel_config)
     if layout is None:
-        return DEFAULT_MIN_ROWS
-    return _MIN_ROWS_BY_LAYOUT.get(layout, DEFAULT_MIN_ROWS)
+        return STEP_FORM_MIN_ROWS
+    return _MIN_ROWS_BY_LAYOUT.get(layout, STEP_FORM_MIN_ROWS)
 
 
 def enabled() -> bool:
@@ -88,6 +114,13 @@ def fp8_gather() -> bool:
 
 def step_is_sequence_parallel(full_num_tokens: int) -> bool:
     return enabled() and int(full_num_tokens) >= min_rows()
+
+
+def step_rows_are_sliced(full_num_tokens: int) -> bool:
+    """Whether the forward about to run slices this step's rows over TP: the
+    step is sequence-parallel and the model follows each step's form. A model
+    that does not hands its MoE layers every row of the step."""
+    return _FOLLOWS_STEP_FORM and step_is_sequence_parallel(full_num_tokens)
 
 
 def set_active(active: bool) -> None:

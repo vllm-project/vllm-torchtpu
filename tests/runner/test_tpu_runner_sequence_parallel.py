@@ -107,6 +107,33 @@ def test_an_sp_step_writes_the_full_mask_until_a_model_follows_the_form(
     assert runner._token_padding_state.get_local_valid_tokens().item() == 300
 
 
+@pytest.mark.parametrize("tp_rank,rank_valid", [(0, 128), (2, 44), (3, 0)])
+def test_a_model_that_follows_the_form_gets_the_slice_by_default(
+    sp_on, monkeypatch, tp_rank, rank_valid
+):
+    """Once the model follows each step's form (the Qwen3.5 model patch), the
+    default decision is the target forward's: a 512-row sequence-parallel step
+    is sliced, so each rank's mask is its own slice."""
+    monkeypatch.setattr(sequence_parallel, "_FOLLOWS_STEP_FORM", True)
+    monkeypatch.setattr(
+        vllm.distributed, "get_tensor_model_parallel_rank", lambda: tp_rank
+    )
+    runner = _padding_runner(tp=4)
+    TPUModelRunner._token_padding_update(runner, 512, num_valid_tokens=300)
+    assert _mask(runner, 128) == [i >= rank_valid for i in range(128)]
+    assert runner._token_padding_state.get_local_valid_tokens().item() == rank_valid
+
+
+def test_a_small_step_of_a_model_that_follows_the_form_masks_every_row(
+    sp_on, monkeypatch
+):
+    monkeypatch.setattr(sequence_parallel, "_FOLLOWS_STEP_FORM", True)
+    monkeypatch.setattr(vllm.distributed, "get_tensor_model_parallel_rank", lambda: 3)
+    runner = _padding_runner(tp=4)
+    TPUModelRunner._token_padding_update(runner, 16, num_valid_tokens=5)
+    assert _mask(runner, 16) == [i >= 5 for i in range(16)]
+
+
 def test_a_replicated_step_masks_every_row(sp_on, monkeypatch):
     monkeypatch.setattr(vllm.distributed, "get_tensor_model_parallel_rank", lambda: 3)
     runner = _padding_runner(tp=4)

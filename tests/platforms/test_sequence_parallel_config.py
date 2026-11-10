@@ -139,6 +139,7 @@ def test_sequence_parallel_buckets_follow_the_engines_layout(
     before any model-parallel group exists, so it must pass its config."""
     from vllm_torchtpu.layers.adapter import sequence_parallel
 
+    monkeypatch.setattr(sequence_parallel, "_FOLLOWS_STEP_FORM", True)
     monkeypatch.setitem(sequence_parallel._MIN_ROWS_BY_LAYOUT, (4, 2), 64)
     parallel_config = SimpleNamespace(
         use_sequence_parallel_moe=True,
