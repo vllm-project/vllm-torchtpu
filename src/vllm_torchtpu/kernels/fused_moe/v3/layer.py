@@ -637,15 +637,29 @@ def _pallas_step(
     # row, a padding pair) has weight zero and would take arrival row zero
     # from the tables; thousands of reads of one row serialize in the
     # sparse cores, so every such pair reads a row of its own instead.
-    n_pairs = top_k * message_tokens
+    # combine_real_tokens: only the real tokens' pairs (padded to a sublane
+    # tile) are gathered and summed; the message's padding tokens route
+    # nowhere and their output rows are sliced off below anyway.
+    combine_tokens = message_tokens
+    combine_tile = config.combine_tokens_per_tile
+    if config.combine_real_tokens:
+        combine_tokens = min(message_tokens, align_up(real_tokens, SUBLANES))
+        if combine_tokens % combine_tile:
+            combine_tile = max(
+                t
+                for t in range(SUBLANES, combine_tokens + 1, SUBLANES)
+                if combine_tokens % t == 0 and t <= combine_tile
+            )
+    n_pairs = top_k * combine_tokens
     n_gather = align_up(n_pairs, gather.gather_rows_multiple(config.gather_block_rows))
     pair_index = (
-        arrival_rows_own.reshape(-1)[:n_pairs]
-        .reshape(top_k, message_tokens)
+        arrival_rows_own.reshape(-1)[: top_k * message_tokens]
+        .reshape(top_k, message_tokens)[:, :combine_tokens]
         .T.reshape(-1)
     )
     pair_index = jnp.pad(pair_index, (0, n_gather - n_pairs))
-    live = weights.reshape(-1) > 0
+    combine_weights = weights[:combine_tokens]
+    live = combine_weights.reshape(-1) > 0
     live = jnp.pad(live, (0, n_gather - live.shape[0]))
     pair_index = jnp.where(
         live, pair_index, jnp.arange(n_gather, dtype=jnp.int32) % arrival_rows
@@ -654,7 +668,7 @@ def _pallas_step(
         arrivals,
         arrival_scales,
         pair_index,
-        weights,
+        combine_weights,
         x.dtype,
         hidden=hidden,
         block_rows=config.gather_block_rows,
@@ -664,9 +678,10 @@ def _pallas_step(
             ring=config.gather_ring,
             block_rows=config.gather_block_rows,
         ),
-        tokens_per_tile=config.combine_tokens_per_tile,
-        unroll=config.combine_unroll,
+        tokens_per_tile=combine_tile,
+        unroll=math.gcd(config.combine_unroll, combine_tile),
         dtype=combine_dtype,
+        in_place=config.combine_real_tokens,
     )
     return out[:real_tokens]
 

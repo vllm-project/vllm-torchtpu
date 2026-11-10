@@ -201,6 +201,12 @@ class Config:
         a table whose sort program is over the sparse core's program
         size. None (the default): sorted_rows_by_shape decides from the
         shard's experts and tokens.
+      combine_real_tokens: the combine gathers and sums only the real
+        tokens' pairs (padded to a sublane tile) rather than the routing
+        message's whole token padding (a multiple of 128 tokens), and
+        reads the gathered rows without copying the real prefix out.
+        The same per-token sum, so the output is bit-identical; it pays
+        off when a shard has far fewer tokens than the message holds.
     """
 
     result_slots: int = RESULT_SLOTS_DEFAULT
@@ -230,6 +236,7 @@ class Config:
     tables_zero_words: int = TABLES_ZERO_WORDS_DEFAULT
     weight_dma_priority: int = WEIGHT_DMA_PRIORITY_DEFAULT
     sorted_rows: object = None
+    combine_real_tokens: bool = False
 
     @property
     def token_dtype(self):
