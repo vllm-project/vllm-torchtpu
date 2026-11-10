@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """The MTP draft's LM head runs at the checkpoint's BF16 precision.
 
 Qwen3.5-397B-A17B-FP8 ships ``lm_head`` in BF16, and its MTP draft has no head
@@ -192,8 +204,10 @@ def test_post_load_hook_keeps_a_bf16_twin_by_default(monkeypatch):
     # End to end: the draft that borrows the head gets the BF16 twin.
     draft = _Draft()
     utils.maybe_share_lm_head(
-        draft, SimpleNamespace(model=SimpleNamespace(), lm_head=head),
-        draft_replicated=False, tp_layout_matches=True,
+        draft,
+        SimpleNamespace(model=SimpleNamespace(), lm_head=head),
+        draft_replicated=False,
+        tp_layout_matches=True,
     )
     assert draft.lm_head is twin
     assert gtt.head_precision(draft.lm_head) == "bf16"
@@ -313,4 +327,3 @@ def test_quantize_target_lm_head_follows_the_qwen3_5_setting(monkeypatch):
     for config, expected in cases:
         monkeypatch.setattr(vllm.config, "get_current_vllm_config", lambda c=config: c)
         assert qwen3_next_patch._quantize_target_lm_head() is expected
-

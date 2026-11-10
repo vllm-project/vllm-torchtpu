@@ -42,7 +42,7 @@ def _get_padded_token_len(paddings: list[int], x: int) -> int:
     return paddings[index]
 
 
-def _h2d_temp(runner: "TPUModelRunner", host: torch.Tensor) -> torch.Tensor:
+def _h2d_temp(runner: TPUModelRunner, host: torch.Tensor) -> torch.Tensor:
     """non_blocking upload of a temporary host tensor for ``runner``.
 
     An alias of ``stage_h2d_upload``, as in the runner: ``host`` stays alive
@@ -100,9 +100,7 @@ class SpecDecodeMetadata:
             )
             if val is not None:
                 return val
-            lazy = object.__getattribute__(self, "__dict__").get(
-                "_lazy_draft_extract"
-            )
+            lazy = object.__getattribute__(self, "__dict__").get("_lazy_draft_extract")
             if lazy is not None:
                 runner, draft_input_indices, padded_logits_length = lazy
                 all_token_ids = runner.input_ids_cpu.numpy()
@@ -112,9 +110,7 @@ class SpecDecodeMetadata:
                 object.__getattribute__(self, "__dict__")[
                     "deferred_draft_token_ids_cpu"
                 ] = padded
-                object.__getattribute__(self, "__dict__")[
-                    "_lazy_draft_extract"
-                ] = None
+                object.__getattribute__(self, "__dict__")["_lazy_draft_extract"] = None
                 return padded
             return None
         return object.__getattribute__(self, name)
@@ -122,9 +118,7 @@ class SpecDecodeMetadata:
     def upload_deferred_draft_token_ids(self, device: torch.device) -> torch.Tensor:
         cpu_arr = self.deferred_draft_token_ids_cpu
         assert cpu_arr is not None
-        return torch.from_numpy(cpu_arr).to(
-            device, non_blocking=True
-        )
+        return torch.from_numpy(cpu_arr).to(device, non_blocking=True)
 
 
 class SpeculativeDecodingManager:

@@ -248,9 +248,11 @@ def test_compiled_async_spec_helpers_match_eager(device):
     if device.type != "tpu":
         pytest.skip("TPU compiled helpers require TPU device")
     from types import SimpleNamespace
+
     from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
-    # 1. _compiled_assemble_spec_and_rejected (B=4, p=8, num_reqs=2, K=3, max_num_reqs=8)
+    # 1. _compiled_assemble_spec_and_rejected
+    #    (B=4, p=8, num_reqs=2, K=3, max_num_reqs=8)
     next_tokens = torch.tensor(
         [
             [10, 11, 99, -1],
@@ -412,7 +414,8 @@ def test_subtract_and_substitute_draft_token_ids_and_two_chunk_mamba_offsets():
     from vllm_torchtpu.runner.tpu_runner import _padded_substitution_indices
 
     input_ids = torch.tensor([-1, -1, -1, -1, -1, -1, 777, 888], dtype=torch.int32)
-    # Req 0 occupies tokens 0..3 (from next_tokens_tpu[0..3]), Req 1 occupies 4..5 (from next_tokens_tpu[4..5]), slots 6..7 are padded
+    # Req 0 occupies tokens 0..3 (from next_tokens_tpu[0..3]), Req 1 occupies
+    # 4..5 (from next_tokens_tpu[4..5]), slots 6..7 are padded
     subst_indices = torch.from_numpy(
         _padded_substitution_indices(
             8,
@@ -504,6 +507,7 @@ def test_subtract_and_substitute_draft_token_ids_and_two_chunk_mamba_offsets():
     assert flat2[4:8].tolist() == [60, 601, 602, 603]
     assert flat2[16:20].tolist() == [70, 701, 702, 703]
     assert rej2[:2].tolist() == [2, 3]
-    # Accepted counts - 1: req 0 accepted 2 tokens -> offset 1; req 1 accepted 1 token -> offset 0
+    # Accepted counts - 1: req 0 accepted 2 tokens -> offset 1; req 1 accepted
+    # 1 token -> offset 0
     assert int(read_offsets[2]) == 1
     assert int(read_offsets[5]) == 0
