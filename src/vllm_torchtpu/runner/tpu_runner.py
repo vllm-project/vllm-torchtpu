@@ -128,7 +128,11 @@ from vllm_torchtpu.layers.adapter.custom_ops.mamba_state_copy_op import (
 )
 from vllm_torchtpu.layers.adapter.quantization import get_tpu_quantization_config
 from vllm_torchtpu.layers.adapter.quantization.online_fp8 import validate_online_fp8
-from vllm_torchtpu.layers.adapter.sample.rejection_sampler import RejectionSampler
+from vllm_torchtpu.layers.adapter.sample.rejection_sampler import (
+    RejectionSampler,
+    synthetic_sample_and_assemble,
+    synthetic_verify_rows,
+)
 from vllm_torchtpu.layers.adapter.sample.top_k_top_p import (
     CANDIDATE_BLOCK,
     apply_top_k_top_p,
@@ -4041,6 +4045,9 @@ class TPUModelRunner(GPUModelRunner):
         draft_chunks: list[DraftChunkInputs] = []
         is_draft_model = self._is_async_drafter
         top_tokens = self._greedy_top_tokens_this_step()
+        synthetic_verify = not top_tokens and self._synthetic_verify_this_step(
+            scheduler_output
+        )
 
         # NOTE: setup current batch's metadata for kv connector.
         # Verified with TPURaidenConnector, TPUConnector, OffloadingConnector
@@ -4295,6 +4302,11 @@ class TPUModelRunner(GPUModelRunner):
                     if top_tokens:
                         logits = self.compute_selected_top_tokens(
                             hidden_states, logits_indices
+                        )
+                    elif synthetic_verify and spec_decode_metadata is not None:
+                        logits = self.compute_selected_logits(
+                            hidden_states,
+                            self._plan_synthetic_verify(spec_decode_metadata),
                         )
                     else:
                         logits = self.compute_selected_logits(
@@ -4721,6 +4733,84 @@ class TPUModelRunner(GPUModelRunner):
             return logits
         return min_tokens_mask.apply_stop_table(logits, *table)
 
+    def _synthetic_verify_this_step(self, scheduler_output: "SchedulerOutput") -> bool:
+        """Whether this step's verify chunks take the synthetic one-row path:
+        synthetic rejection sampling with nothing that needs every verify
+        row's logits (grammar masks, logprobs, min_tokens masks)."""
+        return (
+            envs.TPU_SPEC_SYNTHETIC_ONE_ROW_VERIFY
+            and self.rejection_sampler is not None
+            and self.rejection_sampler.synthetic_mode
+            and not scheduler_output.has_structured_output_requests
+            and self.input_batch.max_num_logprobs is None
+            and not self._min_tokens.any_in(self.input_batch.req_id_to_index)
+        )
+
+    def _plan_synthetic_verify(self, md: SpecDecodeMetadata) -> torch.Tensor:
+        """Decide the chunk's synthetic accepts and return the hidden-state
+        row to compute logits for, one per padded request."""
+        assert md.draft_token_ids is not None
+        assert self.rejection_sampler is not None
+        assert self.rejection_sampler.synthetic_conditional_rates is not None
+        accept_u = torch.rand(
+            md.draft_token_ids.shape,
+            dtype=torch.float32,
+            device=md.draft_token_ids.device,
+            generator=self._get_sampling_generator(),
+        )
+        accepted_count, rows, recover_draft = synthetic_verify_rows(
+            md.draft_token_ids,
+            md.draft_lengths,
+            md.segment_ids,
+            md.group_indices,
+            md.target_logits_indices,
+            md.bonus_logits_indices,
+            md.final_logits_indices,
+            accept_u,
+            self.rejection_sampler.synthetic_conditional_rates,
+        )
+        md.synthetic_verify = (accepted_count, recover_draft)
+        return rows
+
+    def _sample_synthetic_verify(
+        self,
+        logits: torch.Tensor,
+        md: SpecDecodeMetadata,
+        cur_start_idx: int,
+        cur_end_idx: int,
+        sampling_generator: torch.Generator | None,
+    ) -> torch.Tensor:
+        """`_sample_spec_verify_chunk` for a chunk planned by
+        `_plan_synthetic_verify`: ``logits`` holds one row per request."""
+        assert md.synthetic_verify is not None and md.draft_token_ids is not None
+        assert self.speculative_config is not None
+        accepted_count, recover_draft = md.synthetic_verify
+        temperatures, top_k, top_p = self._build_padded_sampling_params(
+            cur_start_idx, cur_end_idx, logits
+        )
+        recover_u = torch.rand_like(
+            logits, dtype=torch.float32, generator=sampling_generator
+        )
+        return synthetic_sample_and_assemble(
+            logits,
+            recover_draft,
+            accepted_count,
+            temperatures,
+            top_k,
+            top_p,
+            recover_u,
+            md.draft_token_ids,
+            md.draft_lengths,
+            md.segment_ids,
+            md.group_indices,
+            self.speculative_config.num_speculative_tokens,
+            topk_candidates=self._sampler_topk_candidates(
+                cur_start_idx, cur_end_idx, None
+            ),
+            apply_topk_topp=self._sampler_applies_topk_topp(),
+            apply_top_k=self._sampler_applies_top_k(),
+        )
+
     def _sample_spec_verify_chunk(
         self,
         logits: torch.Tensor,
@@ -4741,6 +4831,10 @@ class TPUModelRunner(GPUModelRunner):
         each row's greedy token instead (no request is below min_tokens then).
         """
         assert md.draft_token_ids is not None, "deferred draft_token_ids never filled"
+        if md.synthetic_verify is not None:
+            return self._sample_synthetic_verify(
+                logits, md, cur_start_idx, cur_end_idx, sampling_generator
+            )
         if top_tokens:
             assert self.rejection_sampler is not None
             assert self.speculative_config is not None
@@ -6844,11 +6938,90 @@ class TPUModelRunner(GPUModelRunner):
                         topk_candidates=blocks,
                     )
                     synchronize_tensors(out)
+                if (
+                    envs.TPU_SPEC_SYNTHETIC_ONE_ROW_VERIFY
+                    and self.rejection_sampler.synthetic_mode
+                ):
+                    self._precompile_synthetic_verify(
+                        draft_token_ids,
+                        target_logits_indices,
+                        segment_ids,
+                        group_indices,
+                        draft_lengths,
+                        bonus_logits_indices,
+                        warm_accept_u,
+                    )
                 logger.info(
                     "  -- padded_logits_length: %d, num_seqs: %d",
                     num_tokens,
                     num_reqs,
                 )
+
+    def _precompile_synthetic_verify(
+        self,
+        draft_token_ids: torch.Tensor,
+        target_logits_indices: torch.Tensor,
+        segment_ids: torch.Tensor,
+        group_indices: torch.Tensor,
+        draft_lengths: torch.Tensor,
+        bonus_logits_indices: torch.Tensor,
+        warm_accept_u: torch.Tensor,
+    ) -> None:
+        """The synthetic one-row verify (`_plan_synthetic_verify`,
+        `_sample_synthetic_verify`) at one (padded_logits_length,
+        padded_num_reqs) pair, in every sampler variant the step can pick.
+        Its logits come from compute_selected_logits at padded_num_reqs rows,
+        which `_precompile_compute_selected_logits` warms."""
+        assert self.rejection_sampler is not None
+        assert self.rejection_sampler.synthetic_conditional_rates is not None
+        assert self.speculative_config is not None
+        num_reqs = draft_lengths.shape[0]
+        accepted_count, _, recover_draft = synthetic_verify_rows(
+            draft_token_ids,
+            draft_lengths,
+            segment_ids,
+            group_indices,
+            target_logits_indices,
+            bonus_logits_indices,
+            target_logits_indices,
+            warm_accept_u,
+            self.rejection_sampler.synthetic_conditional_rates,
+        )
+        logits = torch.zeros(
+            (num_reqs, self.vocab_size), dtype=self._hidden_states_dtype
+        ).to(self.device)
+        temps = torch.ones((num_reqs, 1), dtype=self._hidden_states_dtype).to(
+            self.device
+        )
+        top_k = torch.zeros((num_reqs, 1), dtype=torch.int32).to(self.device)
+        top_p = torch.ones((num_reqs, 1), dtype=torch.float32).to(self.device)
+        recover_u = torch.zeros((num_reqs, self.vocab_size), dtype=torch.float32).to(
+            self.device
+        )
+        variants: list[dict] = [
+            {},
+            {"apply_topk_topp": False},
+            {"apply_top_k": False},
+        ]
+        if blocks := self._topk_candidate_blocks():
+            variants.append({"topk_candidates": blocks})
+        for variant in variants:
+            out = synthetic_sample_and_assemble(
+                logits,
+                recover_draft,
+                accepted_count,
+                temps,
+                top_k,
+                top_p,
+                recover_u,
+                draft_token_ids,
+                draft_lengths,
+                segment_ids,
+                group_indices,
+                self.speculative_config.num_speculative_tokens,
+                **variant,
+            )
+            synchronize_tensors(out)
 
     def _precompile_top_token_verify(
         self,

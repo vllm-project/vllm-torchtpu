@@ -25,6 +25,8 @@ import torch._dynamo
 from vllm_torchtpu.layers.adapter.sample.rejection_sampler import (
     PLACEHOLDER_TOKEN_ID,
     RejectionSampler,
+    synthetic_sample_and_assemble,
+    synthetic_verify_rows,
 )
 from vllm_torchtpu.layers.adapter.sample.top_k_top_p import (
     MASKED_LOGIT_VALUE,
@@ -410,6 +412,82 @@ def test_rejection_sampler_synthetic_rejects_placeholder_draft(device):
 
     expected = torch.tensor([[3, -1]], dtype=torch.int32, device=device)
     assert torch.equal(output, expected)
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_synthetic_one_row_verify_matches_rejection_sampler(device, seed):
+    """`synthetic_verify_rows` + `synthetic_sample_and_assemble` on one logits
+    row per request return the greedy synthetic sampler's tokens, padding
+    requests and placeholder drafts included."""
+    gen = torch.Generator().manual_seed(seed)
+    k, vocab, padded_reqs, padded_rows = 4, 64, 4, 24
+    rates = [0.9, 0.7, 0.6, 0.5]
+    sampler = _synthetic_sampler(rates, device)
+    lengths = [k, 0, 2]  # the 4th request is padding
+    target, segment, group, bonus = [], [], [], []
+    row = 0
+    for r, n in enumerate(lengths):
+        target += [row + j for j in range(n)]
+        segment += [r] * n
+        group += list(range(n))
+        bonus.append(row + n)
+        row += n + 1
+    pad = padded_rows - len(target)
+    target += [0] * pad
+    segment += [len(lengths)] * pad
+    group += [0] * pad
+    bonus += [0] * (padded_reqs - len(lengths))
+    draft = torch.randint(0, vocab, (padded_rows,), generator=gen, dtype=torch.int32)
+    draft[1] = -1
+    accept_u = torch.rand(padded_rows, generator=gen)
+    final = torch.randperm(padded_rows, generator=gen).to(torch.int32)
+    hidden_logits = torch.randn(padded_rows, vocab, generator=gen)
+    logits = hidden_logits[final.long()]
+    to = lambda x, dt=None: x.to(device=device, dtype=dt or x.dtype)  # noqa: E731
+    i32 = torch.int32
+    num_draft = torch.tensor(lengths + [0], dtype=i32)
+    target_i = torch.tensor(target, dtype=i32)
+    bonus_i = torch.tensor(bonus, dtype=i32)
+    segment_i = torch.tensor(segment, dtype=torch.int64)
+    group_i = torch.tensor(group, dtype=i32)
+
+    expected = sampler(
+        draft_token_ids=to(draft),
+        num_draft_tokens=to(num_draft),
+        target_logits=to(logits[target_i.long()]),
+        bonus_token_ids=to(logits[bonus_i.long()].argmax(-1)),
+        segment_ids=to(segment_i),
+        group_indices=to(group_i),
+        max_draft_tokens=k,
+        accept_u=to(accept_u),
+    )
+    accepted, rows, recover_draft = synthetic_verify_rows(
+        to(draft),
+        to(num_draft),
+        to(segment_i),
+        to(group_i),
+        to(target_i),
+        to(bonus_i),
+        to(final),
+        to(accept_u),
+        sampler.synthetic_conditional_rates,
+    )
+    output = synthetic_sample_and_assemble(
+        to(hidden_logits)[rows.long()],
+        recover_draft,
+        accepted,
+        torch.zeros((padded_reqs, 1), device=device),
+        torch.zeros((padded_reqs, 1), dtype=i32, device=device),
+        torch.ones((padded_reqs, 1), device=device),
+        torch.rand((padded_reqs, vocab), device=device),
+        to(draft),
+        to(num_draft),
+        to(segment_i),
+        to(group_i),
+        k,
+    )
+    n = len(lengths)
+    assert torch.equal(output[:n], expected[:n])
 
 
 @pytest.mark.parametrize("padding_token_id", [-1, 0])

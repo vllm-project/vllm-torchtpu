@@ -797,3 +797,142 @@ def _random_rejection_sample_with_segment(
     selected_tokens[batch_range, accepted_count] = bonus_token_at_accepted_count
 
     return selected_tokens[:batch_size]
+
+
+# ---------------------------------------------------------------------------
+# Synthetic verification on one logits row per request
+#
+# Under `rejection_sample_method=synthetic` the accept decisions depend only
+# on the schedule's uniforms, not on the target logits. Each request then
+# needs the target distribution at exactly one position: its first rejected
+# draft slot, or its bonus slot when every draft is accepted. Deciding first
+# lets the runner compute the LM head, the logits all-gather and the sampler
+# on padded_num_reqs rows instead of every verify row (1 + K per request).
+# ---------------------------------------------------------------------------
+
+
+@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+def synthetic_verify_rows(
+    draft_token_ids: torch.Tensor,
+    num_draft_tokens: torch.Tensor,
+    segment_ids: torch.Tensor,
+    group_indices: torch.Tensor,
+    target_logits_indices: torch.Tensor,
+    bonus_logits_indices: torch.Tensor,
+    final_logits_indices: torch.Tensor,
+    accept_u: torch.Tensor,
+    synthetic_conditional_rates: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Per request: (accepted count, the hidden-state row to sample, the
+    rejected draft token or -1 when every draft is accepted).
+
+    Same decisions as the synthetic rejection samplers above: a slot is
+    accepted iff its uniform is below the schedule's conditional rate and its
+    draft is a real token; a request stops at its first rejected slot.
+    """
+    total_tokens = draft_token_ids.shape[0]
+    batch_size = num_draft_tokens.shape[0]
+    device = draft_token_ids.device
+    draft_token_ids = draft_token_ids.to(torch.int64)
+    group_indices = group_indices.to(torch.int64)
+
+    accepted = (accept_u < synthetic_conditional_rates[group_indices]) & (
+        draft_token_ids >= 0
+    )
+    match_mask = segment_ids.unsqueeze(0) == torch.arange(
+        batch_size, device=device
+    ).unsqueeze(1)
+    valid_slot_mask = torch.any(
+        match_mask
+        & (group_indices.unsqueeze(0) < num_draft_tokens.to(torch.int64).unsqueeze(1)),
+        dim=0,
+    )
+    rejected_slot = match_mask & (valid_slot_mask & ~accepted).unsqueeze(0)
+    large_value = torch.tensor(total_tokens, dtype=torch.int64, device=device)
+    # Slots of a request are consecutive with increasing group index, so its
+    # first rejected slot is the smallest position.
+    positions = torch.arange(total_tokens, dtype=torch.int64, device=device)
+    first_rejected_pos = torch.min(
+        torch.where(rejected_slot, positions.unsqueeze(0), large_value), dim=1
+    ).values
+    any_rejected = first_rejected_pos < total_tokens
+    safe_pos = torch.clamp(first_rejected_pos, max=total_tokens - 1)
+    accepted_count = torch.where(
+        any_rejected, group_indices[safe_pos], num_draft_tokens.to(torch.int64)
+    )
+    logits_row = torch.where(
+        any_rejected,
+        target_logits_indices.to(torch.int64)[safe_pos],
+        bonus_logits_indices.to(torch.int64),
+    )
+    rows = final_logits_indices[logits_row].to(torch.int32)
+    recover_draft = torch.where(
+        any_rejected,
+        draft_token_ids[safe_pos],
+        torch.full_like(accepted_count, -1),
+    )
+    return accepted_count, rows, recover_draft
+
+
+@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+def synthetic_sample_and_assemble(
+    logits: torch.Tensor,
+    recover_draft: torch.Tensor,
+    accepted_count: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
+    recover_u: torch.Tensor,
+    draft_token_ids: torch.Tensor,
+    num_draft_tokens: torch.Tensor,
+    segment_ids: torch.Tensor,
+    group_indices: torch.Tensor,
+    max_draft_tokens: int,
+    topk_candidates: int = 0,
+    apply_topk_topp: bool = True,
+    apply_top_k: bool = True,
+) -> torch.Tensor:
+    """Sample each request's token at its `synthetic_verify_rows` row and
+    lay out ``[padded_num_reqs, 1 + K]`` like the rejection samplers: the
+    accepted drafts, then the sampled token, then placeholders.
+
+    A rejected row samples the target distribution with the rejected draft
+    removed (`_recover_tokens`, draft one-hot); a bonus row (`recover_draft`
+    -1) samples the full target distribution, as the bonus sampler does.
+    """
+    batch_size = num_draft_tokens.shape[0]
+    device = draft_token_ids.device
+    sampled = _recover_tokens(
+        logits,
+        recover_draft,
+        temperatures,
+        top_k,
+        top_p,
+        recover_u,
+        topk_candidates,
+        apply_topk_topp,
+        None,
+        apply_top_k=apply_top_k,
+    )
+    segment_ids = segment_ids.to(torch.int64)
+    group_indices = group_indices.to(torch.int64)
+    safe_segment_ids = segment_ids.clamp(min=0, max=batch_size - 1)
+    keep = (
+        (segment_ids < batch_size)
+        & (group_indices < num_draft_tokens.to(torch.int64)[safe_segment_ids])
+        & (group_indices < accepted_count[safe_segment_ids])
+    )
+    # Padding and dropped slots go to an extra sink row.
+    selected_tokens = torch.full(
+        (batch_size + 1, max_draft_tokens + 1),
+        PLACEHOLDER_TOKEN_ID,
+        dtype=torch.int32,
+        device=device,
+    )
+    selected_tokens[
+        torch.where(keep, segment_ids, torch.full_like(segment_ids, batch_size)),
+        torch.where(keep, group_indices, torch.zeros_like(group_indices)),
+    ] = draft_token_ids.to(torch.int32)
+    batch_range = torch.arange(batch_size, dtype=torch.int64, device=device)
+    selected_tokens[batch_range, accepted_count] = sampled
+    return selected_tokens[:batch_size]

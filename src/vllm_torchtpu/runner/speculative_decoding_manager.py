@@ -59,6 +59,10 @@ class SpecDecodeMetadata:
     # scheduling execute_model re-sources the drafts from the device and
     # uploads this only for a chunk with nothing substituted.
     deferred_draft_token_ids_cpu: np.ndarray | None = None
+    # Synthetic one-row verify (`TPU_SPEC_SYNTHETIC_ONE_ROW_VERIFY`): per
+    # request (accepted count, rejected draft token or -1), decided before the
+    # LM head; the step's logits then hold one row per request.
+    synthetic_verify: tuple[torch.Tensor, torch.Tensor] | None = None
 
     def upload_deferred_draft_token_ids(self, device: torch.device) -> torch.Tensor:
         assert self.deferred_draft_token_ids_cpu is not None
