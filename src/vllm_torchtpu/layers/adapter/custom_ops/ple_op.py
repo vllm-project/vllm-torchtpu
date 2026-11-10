@@ -15,6 +15,7 @@ from vllm_torchtpu.kernels.qwen4_exp.ple import (
 from vllm_torchtpu.kernels.qwen4_exp.pool import (
     pooled_short_conv,
     pooled_short_conv_speculative,
+    write_prefill_checkpoint,
 )
 
 
@@ -131,5 +132,23 @@ def build_pooled_speculative_short_conv_op(dilation, state_len):
         )
         pool.copy_(updated)
         return output
+
+    return run
+
+
+@functools.cache
+def build_pooled_prefill_checkpoint_op(state_len):
+    """Pooled PLE history at internal prefill checkpoints (tail fold)."""
+    fn = functools.partial(write_prefill_checkpoint, state_len=state_len)
+    op = pallas.jax_op(
+        f"qwen4_exp::pooled_prefill_ckpt_{state_len}", fn, donate_argnums=(0,)
+    )
+
+    @op.register_fake
+    def fake(pool, x, starts, offsets, ids):
+        return torch.empty_like(pool)
+
+    def run(pool, x, starts, offsets, ids):
+        pool.copy_(op(pool, x, starts, offsets, ids))
 
     return run
