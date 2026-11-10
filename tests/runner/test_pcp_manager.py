@@ -28,6 +28,7 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.layers.core.pcp_workspace import pcp_chunk_pages
 from vllm_torchtpu.runner.pcp.head_tail_sharding_plan import HeadTailPcpShardingPlan
 from vllm_torchtpu.runner.pcp.manager import (
+    PcpShardingPlanName,
     mla_kv_page_size,
     validate_pcp_manager_config,
     validate_pcp_manager_layers,
@@ -168,9 +169,13 @@ def test_pcp_manager_layers_must_opt_in():
     class _Unsupported:
         pass
 
-    validate_pcp_manager_layers({"a": _Supported(), "b": _Supported()})
+    validate_pcp_manager_layers(
+        {"a": _Supported(), "b": _Supported()}, PcpShardingPlanName.HEADTAIL
+    )
     with pytest.raises(NotImplementedError, match="_Unsupported"):
-        validate_pcp_manager_layers({"a": _Supported(), "b": _Unsupported()})
+        validate_pcp_manager_layers(
+            {"a": _Supported(), "b": _Unsupported()}, PcpShardingPlanName.HEADTAIL
+        )
 
 
 def test_glm_attention_layers_support_the_pcp_manager():

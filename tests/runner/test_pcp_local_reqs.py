@@ -65,6 +65,8 @@ def _runner(num_computed, num_prompt, q_lens, capacity):
         arange_np=np.arange(cap, dtype=np.int64),
         query_start_loc_np=qsl,
         seq_lens_np=seq_lens,
+        supports_mm_inputs=False,
+        uses_mrope=False,
     )
 
 
