@@ -107,6 +107,7 @@ class _MtpFusedLoop(nn.Module):
         tokens = []
         if self.propose_step0:
             assert input_ids is None, "propose_step0 proposes step 0's token"
+            hidden_states = hidden_states[: positions.shape[-1]]
             input_ids = self._propose(hidden_states)
             tokens.append(input_ids)
         assert input_ids is not None
