@@ -11,6 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# Moved from src/vllm_torchtpu/kernels/fused_moe/v3/dense_slots.py, where it was
+# added by 79400d892 and extended by 3d13f5df7 (candidate4 5a1c82686). Only the
+# Qwen3.5 DP4 x TP2 decode layout runs it (fused_moe_ep_v3.QWEN3_5_CONFIG_BY_LAYOUT
+# turns it on); it builds on the fused EP v3 package (kernels/fused_moe/v3), whose
+# changes it does not pick up automatically.
 """Fused EP MoE with landing rows fixed by the routing alone ("dense slots";
 DP4xTP2 decode, experimental, default off).
 
@@ -48,11 +53,11 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from . import device, ffn, layout
-from .combine import weighted_sum
-from .config import Config
-from .layout import LANES, MESH_AXIS, device_coords
-from .rowquant import FP8, quantize_rows
+from vllm_torchtpu.kernels.fused_moe.v3 import device, ffn, layout
+from vllm_torchtpu.kernels.fused_moe.v3.combine import weighted_sum
+from vllm_torchtpu.kernels.fused_moe.v3.config import Config
+from vllm_torchtpu.kernels.fused_moe.v3.layout import LANES, MESH_AXIS, device_coords
+from vllm_torchtpu.kernels.fused_moe.v3.rowquant import FP8, quantize_rows
 
 # A barrier semaphore is shared by kernels with the same collective id.
 COLLECTIVE_ID_DENSE = 5
