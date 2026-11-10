@@ -94,17 +94,22 @@ def test_use_kv_only_two_pass_needs_the_program(monkeypatch):
     assert proposer._use_kv_only_two_pass(object(), 4096, 16) is False
 
 
+BUCKETS = [16, 32, 64, 128, 1024, 4096]
+
+
 def _build_proposer(monkeypatch, *, min_tokens=1024, method="mtp"):
     monkeypatch.setattr(envs, "TPU_MTP_PREFILL_KV_ONLY_MIN_TOKENS", min_tokens)
     proposer = _make_proposer(method)
     proposer.draft_model = object()
-    proposer.draft_vllm_config = object()
+    proposer.draft_vllm_config = SimpleNamespace(
+        compilation_config=SimpleNamespace(compile_sizes=list(BUCKETS))
+    )
     proposer.runner = SimpleNamespace(
         _pcp_enabled=False,
         mesh=object(),
         _dp_lockstep_enabled=lambda: False,
         # Loop buckets up to 32 (max_num_reqs 32).
-        num_tokens_paddings=[16, 32, 64, 128, 1024, 4096],
+        num_tokens_paddings=list(BUCKETS),
         max_num_reqs=32,
     )
     proposer._draft_attn_layer_names = {"mtp.attn", "mtp.indexer.k_cache"}
@@ -133,10 +138,12 @@ def _patch_builder(monkeypatch, reason=None, raises=False):
                 raise RuntimeError("boom")
             built.append(kwargs)
 
-        def cache_layer_names(self):
-            return ("mtp.attn", "mtp.indexer.k_cache")
-
     monkeypatch.setattr(kv_only, "kv_only_unsupported_reason", lambda mtp: reason)
+    monkeypatch.setattr(
+        kv_only,
+        "kv_only_cache_layer_names",
+        lambda mtp: ("mtp.attn", "mtp.indexer.k_cache"),
+    )
     monkeypatch.setattr(kv_only, "MtpKvOnlyModel", _FakeModel)
     for name in ("set_model_tag", "set_vllm_model_wrapper_context"):
         monkeypatch.setattr(e3, name, lambda *a, **k: contextlib.nullcontext())
@@ -154,7 +161,7 @@ def test_build_kv_only_model_off_by_default(monkeypatch):
     assert built == []
 
 
-def test_build_kv_only_model_builds_with_draft_config_and_own_prefix(monkeypatch):
+def test_build_kv_only_model_compiles_only_the_buckets_it_dispatches(monkeypatch):
     proposer = _build_proposer(monkeypatch)
     built = _patch_builder(monkeypatch)
     logs = _record_logs(monkeypatch)
@@ -165,10 +172,32 @@ def test_build_kv_only_model_builds_with_draft_config_and_own_prefix(monkeypatch
     assert [lvl for lvl, _ in logs] == ["info"]
     assert ">= 1024 tokens" in logs[0][1]
     (kwargs,) = built
-    assert kwargs["vllm_config"] is proposer.draft_vllm_config
+    config = kwargs["vllm_config"]
+    assert config is proposer._mtp_kv_only_vllm_config
+    assert config.compilation_config.compile_sizes == [1024, 4096]
+    # The draft's own programs still compile every bucket.
+    assert proposer.draft_vllm_config.compilation_config.compile_sizes == BUCKETS
     assert kwargs["mtp"] is proposer.draft_model
     assert kwargs["mesh"] is proposer.runner.mesh
     assert kwargs["prefix"] == "mtp_prefill_kv_only"
+
+
+def test_set_draft_compile_sizes_keeps_the_kv_only_copy_at_its_gate(monkeypatch):
+    """Pipeline chunks add token buckets after load: the draft compiles all
+    of them, the KV-only pass only those at or above its gate."""
+    proposer = _build_proposer(monkeypatch)
+    _patch_builder(monkeypatch)
+    proposer._build_mtp_kv_only_model()
+    proposer.set_draft_compile_sizes([16, 512, 1024, 2048, 4096])
+    assert proposer.draft_vllm_config.compilation_config.compile_sizes == [
+        16,
+        512,
+        1024,
+        2048,
+        4096,
+    ]
+    kv_only_config = proposer._mtp_kv_only_vllm_config
+    assert kv_only_config.compilation_config.compile_sizes == [1024, 2048, 4096]
 
 
 @pytest.mark.parametrize("min_tokens", [1, 16, 32])
@@ -178,11 +207,17 @@ def test_build_kv_only_model_raises_the_gate_above_the_loop_buckets(
     """A step 0 no larger than the largest loop bucket keeps the single pass:
     the warmup's single-request specs at those sizes warm the draft at p = T."""
     proposer = _build_proposer(monkeypatch, min_tokens=min_tokens)
-    _patch_builder(monkeypatch)
+    built = _patch_builder(monkeypatch)
     logs = _record_logs(monkeypatch)
     proposer._build_mtp_kv_only_model()
     assert proposer._mtp_kv_only_model is not None
     assert proposer._mtp_kv_only_min_tokens == 33
+    assert built[0]["vllm_config"].compilation_config.compile_sizes == [
+        64,
+        128,
+        1024,
+        4096,
+    ]
     ((lvl, msg), (lvl2, msg2)) = logs
     assert lvl == "warning" and "largest draft loop bucket (32)" in msg
     assert lvl2 == "info" and ">= 33 tokens" in msg2
@@ -202,11 +237,15 @@ def test_build_kv_only_model_raises_the_gate_above_the_loop_buckets(
         "unsupported",
         "build_fails",
         "not_draft_layers",
+        "above_every_bucket",
+        "loop_bucket_is_the_largest",
     ],
 )
 def test_build_kv_only_model_refusals_keep_the_single_pass(monkeypatch, setup):
     proposer = _build_proposer(
-        monkeypatch, method="eagle3" if setup == "eagle3" else "mtp"
+        monkeypatch,
+        method="eagle3" if setup == "eagle3" else "mtp",
+        min_tokens=8192 if setup == "above_every_bucket" else 1024,
     )
     built = _patch_builder(
         monkeypatch,
@@ -219,6 +258,10 @@ def test_build_kv_only_model_refusals_keep_the_single_pass(monkeypatch, setup):
         proposer.runner._pcp_enabled = True
     if setup == "lockstep":
         proposer._dp_lockstep_sharded = lambda: True
+    if setup == "loop_bucket_is_the_largest":
+        # max_num_reqs pads to the largest bucket, so the gate is raised to
+        # one past it and no chunk could ever reach it.
+        proposer.runner.max_num_reqs = 4096
     logs = _record_logs(monkeypatch)
     if setup == "not_draft_layers":
         # The indexer cache is not among the draft's attention layers, so the
@@ -227,13 +270,16 @@ def test_build_kv_only_model_refusals_keep_the_single_pass(monkeypatch, setup):
     proposer._build_mtp_kv_only_model()
     assert proposer._mtp_kv_only_model is None
     assert proposer._mtp_kv_only_min_tokens == 0
-    if setup != "not_draft_layers":
-        assert built == []
+    assert proposer._mtp_kv_only_vllm_config is None
+    # Every refusal is decided before the op is built (and registered).
+    assert built == []
     # The log says why, and never claims the two-pass step 0 is active.
     assert logs[-1][0] == "warning" and "keeps the single full pass" in logs[-1][1]
     assert not any(lvl == "info" for lvl, _ in logs)
     if setup == "lockstep":
         assert "EP-DP lockstep" in logs[-1][1]
+    if setup in ("above_every_bucket", "loop_bucket_is_the_largest"):
+        assert "largest is 4096" in logs[-1][1]
 
 
 # ---------------------------------------------------------------------------
@@ -681,6 +727,7 @@ def _run(
     kv_only = _ToyKvOnly(world)
     proposer._mtp_kv_only_model = kv_only if two_pass else None
     proposer._mtp_kv_only_min_tokens = GATE if two_pass else 0
+    proposer._mtp_kv_only_vllm_config = object() if two_pass else None
 
     @contextlib.contextmanager
     def fake_forward_context(attn_metadata, *_a, **_k):

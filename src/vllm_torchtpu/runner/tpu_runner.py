@@ -6580,9 +6580,7 @@ class TPUModelRunner(GPUModelRunner):
             # hidden states it drafts from to these buckets, so the draft
             # needs a graph for every one of them.
             if isinstance(self.drafter, Eagle3Proposer):
-                self.drafter.draft_vllm_config.compilation_config.compile_sizes = list(
-                    self.num_tokens_paddings
-                )
+                self.drafter.set_draft_compile_sizes(self.num_tokens_paddings)
         logger.info(
             "Pipeline chunks: granularity %d tokens (KV block %d, block "
             "aligned %s), buckets added %s",

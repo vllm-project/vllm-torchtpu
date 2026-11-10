@@ -289,6 +289,8 @@ class Eagle3Proposer:
         # The gate it runs under: the flag, raised above the largest loop
         # bucket (see _build_mtp_kv_only_model). 0 while not built.
         self._mtp_kv_only_min_tokens = 0
+        # Its copy of draft_vllm_config: compile_sizes at or above the gate.
+        self._mtp_kv_only_vllm_config: VllmConfig | None = None
 
     @property
     def advance_draft_positions(self) -> bool:
@@ -698,56 +700,21 @@ class Eagle3Proposer:
         """
         self._mtp_kv_only_model = None
         self._mtp_kv_only_min_tokens = 0
+        self._mtp_kv_only_vllm_config = None
         if envs.TPU_MTP_PREFILL_KV_ONLY_MIN_TOKENS <= 0:
             return
-        reason = None
-        if self.speculative_config.method != "mtp":
-            reason = f"the draft method is {self.speculative_config.method!r}"
-        elif self._draft_kv_shared:
-            reason = "the draft reads the target's KV cache"
-        elif self.runner._pcp_enabled:
-            reason = "prefill context parallelism is on"
-        elif self._dp_lockstep_sharded():
-            # Same rule as _use_kv_only_two_pass: the idle ranks' replay of a
-            # peer's draft trace (run_dp_dummy_draft) knows only the single
-            # pass, so the program would never run.
-            reason = "EP-DP lockstep replays the draft as the single pass"
-        else:
-            from vllm_torchtpu.spec_decode.mtp_kv_only import (
-                kv_only_unsupported_reason,
-            )
-
-            reason = kv_only_unsupported_reason(self.draft_model)
+        reason = self._kv_only_unsupported_reason()
+        min_tokens = 0
         if reason is None:
-            # kv_only_unsupported_reason refuses a missing draft.
-            assert self.draft_model is not None
-            try:
-                from vllm_torchtpu.spec_decode.mtp_kv_only import MtpKvOnlyModel
-
-                with (
-                    set_model_tag("eagle_head"),
-                    set_vllm_model_wrapper_context(
-                        mesh=self.runner.mesh, vllm_config=self.draft_vllm_config
-                    ),
-                    set_current_vllm_config(self.draft_vllm_config),
-                ):
-                    self._mtp_kv_only_model = MtpKvOnlyModel(
-                        vllm_config=self.draft_vllm_config,
-                        prefix="mtp_prefill_kv_only",
-                        mtp=self.draft_model,
-                        mesh=self.runner.mesh,
-                    )
-            except Exception as e:
-                logger.warning("Could not build the MTP KV-only pass.", exc_info=True)
-                reason = f"build failed ({type(e).__name__})"
-        if reason is None and self._mtp_kv_only_model is not None:
-            # Pass 1 reads the step-0 entries `_target_draft_attn_metadata`
-            # keeps, which are the draft's attention layers only.
-            names = set(self._mtp_kv_only_model.cache_layer_names())
-            missing = names - (self._draft_attn_layer_names or set())
-            if missing:
-                reason = f"{sorted(missing)} are not draft attention layers"
-                self._mtp_kv_only_model = None
+            min_tokens = self._kv_only_gate()
+            largest_bucket = max(self.runner.num_tokens_paddings)
+            if min_tokens > largest_bucket:
+                reason = (
+                    f"no token bucket reaches the {min_tokens}-token gate (the "
+                    f"largest is {largest_bucket})"
+                )
+        if reason is None:
+            reason = self._build_kv_only_program(min_tokens)
         if reason is not None:
             logger.warning(
                 "TPU_MTP_PREFILL_KV_ONLY_MIN_TOKENS=%d is set, but %s; draft "
@@ -756,28 +723,113 @@ class Eagle3Proposer:
                 reason,
             )
             return
-        min_tokens = envs.TPU_MTP_PREFILL_KV_ONLY_MIN_TOKENS
-        max_loop_bucket = self._max_loop_bucket()
-        if min_tokens <= max_loop_bucket:
-            # A step 0 of at most `max_loop_bucket` tokens is also a loop-step
-            # shape: the warmup's single-request specs at those sizes are what
-            # warm the draft at p = T, and two-pass would run it at a smaller
-            # p instead. It would save nearly nothing there anyway (pass 2
-            # runs at p ~ T), so keep those sizes on the single pass.
-            logger.warning(
-                "TPU_MTP_PREFILL_KV_ONLY_MIN_TOKENS=%d is not above the largest "
-                "draft loop bucket (%d); the two-pass step 0 starts at %d tokens.",
-                min_tokens,
-                max_loop_bucket,
-                max_loop_bucket + 1,
-            )
-            min_tokens = max_loop_bucket + 1
         self._mtp_kv_only_min_tokens = min_tokens
         logger.info(
             "MTP draft step 0 of chunks with >= %d tokens runs a KV-only pass "
             "over every row, then the full layer on one row per request.",
             min_tokens,
         )
+
+    def _kv_only_unsupported_reason(self) -> str | None:
+        """Why this draft cannot take the two-pass step 0, or None."""
+        from vllm_torchtpu.spec_decode.mtp_kv_only import (
+            kv_only_cache_layer_names,
+            kv_only_unsupported_reason,
+        )
+
+        if self.speculative_config.method != "mtp":
+            return f"the draft method is {self.speculative_config.method!r}"
+        if self._draft_kv_shared:
+            return "the draft reads the target's KV cache"
+        if self.runner._pcp_enabled:
+            return "prefill context parallelism is on"
+        if self._dp_lockstep_sharded():
+            # Same rule as _use_kv_only_two_pass: the idle ranks' replay of a
+            # peer's draft trace (run_dp_dummy_draft) knows only the single
+            # pass, so the program would never run.
+            return "EP-DP lockstep replays the draft as the single pass"
+        reason = kv_only_unsupported_reason(self.draft_model)
+        if reason is not None:
+            return reason
+        # Pass 1 reads the step-0 entries `_target_draft_attn_metadata` keeps,
+        # which are the draft's attention layers only.
+        names = set(kv_only_cache_layer_names(self.draft_model))
+        missing = names - (self._draft_attn_layer_names or set())
+        if missing:
+            return f"{sorted(missing)} are not draft attention layers"
+        return None
+
+    def _kv_only_gate(self) -> int:
+        """The smallest padded step 0 that takes the two-pass path."""
+        min_tokens = envs.TPU_MTP_PREFILL_KV_ONLY_MIN_TOKENS
+        max_loop_bucket = self._max_loop_bucket()
+        if min_tokens > max_loop_bucket:
+            return min_tokens
+        # A step 0 of at most `max_loop_bucket` tokens is also a loop-step
+        # shape: the warmup's single-request specs at those sizes are what
+        # warm the draft at p = T, and two-pass would run it at a smaller p
+        # instead. It would save nearly nothing there anyway (pass 2 runs at
+        # p ~ T), so keep those sizes on the single pass.
+        logger.warning(
+            "TPU_MTP_PREFILL_KV_ONLY_MIN_TOKENS=%d is not above the largest "
+            "draft loop bucket (%d); the two-pass step 0 starts at %d tokens.",
+            min_tokens,
+            max_loop_bucket,
+            max_loop_bucket + 1,
+        )
+        return max_loop_bucket + 1
+
+    def _build_kv_only_program(self, min_tokens: int) -> str | None:
+        """Build `MtpKvOnlyModel`; returns why it could not be built, or None.
+
+        It compiles under its own copy of the draft's config whose
+        `compile_sizes` keeps only the buckets at or above the gate, the only
+        ones `_use_kv_only_two_pass` dispatches.
+        """
+        from vllm_torchtpu.spec_decode.mtp_kv_only import MtpKvOnlyModel
+
+        assert self.draft_model is not None
+        config = copy.copy(self.draft_vllm_config)
+        config.compilation_config = copy.copy(self.draft_vllm_config.compilation_config)
+        self._mtp_kv_only_vllm_config = config
+        self._set_kv_only_compile_sizes(min_tokens)
+        try:
+            with (
+                set_model_tag("eagle_head"),
+                set_vllm_model_wrapper_context(
+                    mesh=self.runner.mesh, vllm_config=config
+                ),
+                set_current_vllm_config(config),
+            ):
+                self._mtp_kv_only_model = MtpKvOnlyModel(
+                    vllm_config=config,
+                    prefix="mtp_prefill_kv_only",
+                    mtp=self.draft_model,
+                    mesh=self.runner.mesh,
+                )
+        except Exception as e:
+            logger.warning("Could not build the MTP KV-only pass.", exc_info=True)
+            self._mtp_kv_only_vllm_config = None
+            return f"build failed ({type(e).__name__})"
+        return None
+
+    def _set_kv_only_compile_sizes(self, min_tokens: int) -> None:
+        config = self._mtp_kv_only_vllm_config
+        assert config is not None
+        draft_sizes = self.draft_vllm_config.compilation_config.compile_sizes or ()
+        config.compilation_config.compile_sizes = [
+            size for size in draft_sizes if size >= min_tokens
+        ]
+
+    def set_draft_compile_sizes(self, sizes: list[int]) -> None:
+        """Set the token buckets the draft's programs compile for.
+
+        The runner adds pipeline-chunk buckets after the draft is loaded; the
+        KV-only pass keeps its own copy, filtered to its gate.
+        """
+        self.draft_vllm_config.compilation_config.compile_sizes = list(sizes)
+        if self._mtp_kv_only_vllm_config is not None:
+            self._set_kv_only_compile_sizes(self._mtp_kv_only_min_tokens)
 
     def _max_loop_bucket(self) -> int:
         """The largest loop bucket p `_loop_bucket` can return."""
@@ -935,6 +987,8 @@ class Eagle3Proposer:
         computed.
         """
         assert self._mtp_kv_only_model is not None
+        kv_only_config = self._mtp_kv_only_vllm_config
+        assert kv_only_config is not None
         runner = self.runner
         target_md = self._target_draft_attn_metadata(chunk)
         assert target_md is not None
@@ -943,12 +997,12 @@ class Eagle3Proposer:
             set_model_tag("eagle_head"),
             set_forward_context(
                 target_md,
-                self.draft_vllm_config,
+                kv_only_config,
                 num_tokens=num_tokens,
                 num_tokens_across_dp=runner._dp_num_tokens_across_dp(num_tokens),
             ),
             set_vllm_model_wrapper_context(
-                mesh=runner.mesh, vllm_config=self.draft_vllm_config
+                mesh=runner.mesh, vllm_config=kv_only_config
             ),
         ):
             self._mtp_kv_only_model(input_ids, positions, target_hidden_states)

@@ -455,6 +455,17 @@ def test_kv_only_supported_for_a_dsa_mtp():
     assert mtp_kv_only.kv_only_unsupported_reason(_supported_mtp()) is None
 
 
+def test_kv_only_cache_layer_names_are_read_without_building_the_op():
+    mtp = _supported_mtp()
+    wrapper = mtp.model.layers["78"].mtp_block.self_attn.mla_attn
+    wrapper.mla_attn.layer_name = "model.layers.78.mtp_block.self_attn.attn"
+    wrapper.indexer.indexer_op.k_cache = SimpleNamespace(prefix="mtp.k_cache")
+    assert mtp_kv_only.kv_only_cache_layer_names(mtp) == (
+        "model.layers.78.mtp_block.self_attn.attn",
+        "mtp.k_cache",
+    )
+
+
 @pytest.mark.parametrize(
     "breakage",
     [

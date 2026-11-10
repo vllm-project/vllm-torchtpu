@@ -255,6 +255,10 @@ _TPU_COMPILE_ENV_IGNORED = {
     # backbone graph, and the KV cap reaches the hash through num_gpu_blocks.
     "VLLM_TPU_STATIC_POOLER",
     "VLLM_TPU_POOLING_KV_CACHE_TOKENS",
+    # Host-side dispatch of the MTP draft's two-pass step 0: it picks which
+    # chunks run the KV-only program, which compiles under its own prefix
+    # (`mtp_prefill_kv_only`); the target and draft programs are unchanged.
+    "TPU_MTP_PREFILL_KV_ONLY_MIN_TOKENS",
     # `import torch_tpu` (via libtpu.configure_library_path()) sets this to
     # <site-packages>/libtpu/libtpu.so, so the raw path would change the key
     # with the venv prefix or mount path. get_libtpu_cache_key() already

@@ -115,6 +115,15 @@ def kv_only_unsupported_reason(mtp: Any) -> str | None:
     return _not_the_mirrored_classes(mtp, layer, wrapper)
 
 
+def kv_only_cache_layer_names(mtp: Any) -> tuple[str, str]:
+    """The MLA layer and indexer cache whose step-0 metadata pass 1 reads,
+    for a draft `kv_only_unsupported_reason` accepts."""
+    layer = _single_mtp_layer(mtp)
+    assert layer is not None
+    wrapper = layer.mtp_block.self_attn.mla_attn
+    return wrapper.mla_attn.layer_name, wrapper.indexer.indexer_op.k_cache.prefix
+
+
 def _not_the_mirrored_classes(mtp: Any, layer: Any, wrapper: Any):
     """Pass 1 duplicates the forwards of these exact classes (pinned bit-exact
     by tests/layers/adapter/test_mla_kv_only.py). A subclass or a patched
@@ -621,10 +630,6 @@ class _KvOnlyWriteOp:
         idx_cache.copy_(new_idx)
         return k_pe
 
-    def cache_layer_names(self) -> tuple[str, str]:
-        """The two forward-context keys this op reads its metadata from."""
-        return self.mla_layer.layer_name, self.indexer_op.k_cache.prefix
-
 
 def mtp_layer_input(
     mtp: Any,
@@ -670,10 +675,6 @@ class MtpKvOnlyModel(nn.Module):
         layer = _single_mtp_layer(mtp)
         assert layer is not None
         self._write = _KvOnlyWriteOp(layer.mtp_block.self_attn.mla_attn, mesh)
-
-    def cache_layer_names(self) -> tuple[str, str]:
-        """The MLA layer and indexer cache whose step-0 metadata pass 1 reads."""
-        return self._write.cache_layer_names()
 
     def forward(
         self,
