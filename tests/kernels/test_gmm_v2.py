@@ -25,10 +25,15 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.megablox.gmm_v2 import (
+    FP8_DECODE_BUCKETS,
+    Dimensions,
+    InputConfigs,
     TileSizes,
     apply_act_fn,
+    calculate_tiling,
     gmm_v2,
     gmm_v2_mlp,
     interleave_lane,
@@ -477,6 +482,10 @@ def test_gmm_v2_int4_packed_matches_reference():
         (40, [0, 2, 0, 1, 0, 0, 3, 0, 0, 0, 2, 0, 0, 1, 0, 25], 128),
         # Sub-lane blocks keep the bf16 dequantize-before-matmul path.
         (32, [0, 2, 0, 1, 0, 0, 3, 0, 0, 0, 2, 0, 0, 1, 0, 0], 32),
+        # Decode tiles (128 rows, buckets 16/32/48 fp8 + 128 bf16): every
+        # bucket, and a group spanning two tiles.
+        (128, [3, 0, 14, 0, 1, 30, 0, 0, 44, 0, 0, 0, 2, 0, 0, 1], 128),
+        (2048, [9, 60, 0, 17, 200, 0, 31, 2, 0, 0, 120, 0, 47, 0, 0, 5], 128),
     ],
 )
 def test_gmm_fp4_block_matches_reference(batch_size, group_sizes, block_size):
@@ -518,12 +527,43 @@ def test_gmm_fp4_block_matches_reference(batch_size, group_sizes, block_size):
 
 @pytest.mark.tpu_test
 @pytest.mark.parametrize(
+    "size_m, decode",
+    # MiniMax-M3.1 routed experts under EP8: c4 b4 .. c64 decode, 8k prefill.
+    [(96, False), (128, True), (384, True), (2048, True), (32768, False)],
+)
+def test_calculate_tiling_fp4_decode_tiles(size_m, decode):
+    _require_tpu()
+    dims = Dimensions(
+        size_m=size_m,
+        size_k=6144,
+        size_n=6144,
+        size_group=16,
+        size_lhs_group=16,
+        size_lhs_sublane=16,
+    )
+    lhs_cfgs = InputConfigs(quant_dtype=None, quant_block_size=512, dtype=jnp.bfloat16)
+    rhs_cfgs = InputConfigs(
+        quant_dtype=jnp.float4_e2m1fn,
+        quant_block_size=128,
+        dtype=jnp.float4_e2m1fn,
+        has_scale=True,
+    )
+    vmem_limit = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.9)
+    tiles = calculate_tiling(dims, lhs_cfgs, rhs_cfgs, vmem_limit, "swigluoai")
+    assert (tiles.bucket_sizes == FP8_DECODE_BUCKETS) == decode
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize(
     "batch_size, group_sizes",
     [
         (32, [0, 2, 0, 1, 0, 0, 3, 0, 0, 0, 20, 0, 0, 1, 0, 0]),
         (96, [0, 2, 0, 1, 0, 0, 3, 0, 0, 0, 20, 0, 0, 1, 0, 0]),
         # No local rows: the prefetch is never started nor waited on.
         (32, [0] * 16),
+        # Decode tiles: fused across the fp8 and bf16 buckets.
+        (128, [3, 0, 14, 0, 1, 30, 0, 0, 44, 0, 0, 0, 2, 0, 0, 1]),
+        (384, [9, 60, 0, 17, 130, 0, 31, 2, 0, 0, 20, 0, 47, 0, 0, 5]),
     ],
 )
 def test_gmm_v2_mlp_matches_two_gmms(batch_size, group_sizes):
