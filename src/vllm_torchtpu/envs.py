@@ -108,6 +108,7 @@ if TYPE_CHECKING:
     TPU_MOE_NONEP_GATHER: str = "xla"
     TPU_MOE_EP_GATHER: str = "sc"
     TPU_MOE_EP_GMM_STACK: bool = False
+    TPU_MOE_EP_COMBINE: str = "served"
     TPU_MOE_NONEP_GATHER_COLS: int = 0
     TPU_MOE_NONEP_GATHER_CHUNK: int = 16384
     TPU_MOE_NONEP_PERMUTE: str = "sorts"
@@ -1907,6 +1908,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # The non-EP GMM knobs (TPU_MOE_NONEP_GMM_EXPERTS_PER_VISIT, _GMM2_..., _GMM_BUCKET,
     # _FUSED_MLP) also on the EP path. Same output bits.
     "TPU_MOE_EP_GMM_STACK": env_bool("TPU_MOE_EP_GMM_STACK"),
+    # EP combine: "served" (valid-mask SparseCore combine) or "dense" (all-valid
+    # routes, non-local ones on a zeroed row with weight 0: the dense run-table
+    # path, packed with TPU_MOE_NONEP_COMBINE_PACKED). Same output bits.
+    "TPU_MOE_EP_COMBINE": env_with_choices(
+        "TPU_MOE_EP_COMBINE", "served", ["served", "dense"], case_sensitive=False
+    ),
     # Columns per block for "xla_colchunk". 0 picks the widest block (a
     # multiple of 128 dividing the hidden size) whose source table is at most
     # 3200 x 2560 bf16 bytes, the largest size measured in VMEM; a step whose

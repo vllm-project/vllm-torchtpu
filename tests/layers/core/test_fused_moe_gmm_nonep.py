@@ -1118,7 +1118,8 @@ def test_ep_knobs_are_registered_choices(monkeypatch):
     assert envs.TPU_MOE_EP_GMM_STACK is True
 
 
-def _ep_case(monkeypatch, *, tokens=640, ep_gather="sc", stack=False, fused=True, threshold=0, counting=False):
+def _ep_case(monkeypatch, *, tokens=640, ep_gather="sc", stack=False, fused=True, threshold=0, counting=False,
+             combine="served", packed=False):
     """fused_moe_func on the EP path (rank 0 of 2: 8 local experts of 16, path D's argsort positions) with stand-ins
     for the SparseCore kernels, pack_fp8_rows and the GMMs, recording what reaches the gather and the GMMs."""
     from jax._src import tpu_info as ti
@@ -1134,7 +1135,7 @@ def _ep_case(monkeypatch, *, tokens=640, ep_gather="sc", stack=False, fused=True
     rng = np.random.default_rng(5)
     ids = jnp.asarray(np.stack([rng.choice(experts, topk, replace=False) for _ in range(tokens)]), jnp.int32)
     w = jnp.asarray(rng.random((tokens, topk)), jnp.bfloat16)
-    seen = dict(gather=[], gmm=[], mlp=[], log=[])
+    seen = dict(gather=[], gmm=[], mlp=[], log=[], combine=[])
 
     def fake_sc_gather(src, idx, start, end, trim_rows=True, copy_mode="vector", **kw):
         seen["gather"].append(dict(dtype=str(src.dtype), cols=src.shape[1], copy_mode=copy_mode, trim_rows=trim_rows))
@@ -1159,7 +1160,19 @@ def _ep_case(monkeypatch, *, tokens=640, ep_gather="sc", stack=False, fused=True
         seen["mlp"].append(dict(lp=lhs_packed_dtype, e=experts_per_visit, bucket=bucket, pack=pack_out))
         h = ref(dequant(x_, lhs_packed_dtype), w1_, s1_, None, gs_, jnp.array([0], jnp.int32),
                 fuse_act=fuse_act)[:, : w2_.shape[1]]
-        return ref(h, w2_, s2_, None, gs_, jnp.array([0], jnp.int32), preferred_element_type=h.dtype)
+        return ref(h, w2_, s2_, None, gs_, jnp.array([0], jnp.int32), preferred_element_type=h.dtype,
+                   pack_out=pack_out)
+
+    from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v3 import _fallback_implementation
+
+    def served_combine(rows, rev, wts, valid, reduce_group_size):
+        seen["combine"].append("served")
+        return _fallback_implementation(rows, rev, wts, valid, reduce_group_size)
+
+    def v3_combine(rows, rev, wts, valid, reduce_group_size, x_packed=False):
+        from vllm_torchtpu.kernels.megablox.gmm_v2 import unpack_halves
+        seen["combine"].append(dict(v3=True, packed=x_packed, all_valid=bool(np.asarray(valid).all())))
+        return _fallback_implementation(unpack_halves(rows) if x_packed else rows, rev, wts, valid, reduce_group_size)
 
     class _Log:
         def info_once(self, msg, *args):
@@ -1173,14 +1186,15 @@ def _ep_case(monkeypatch, *, tokens=640, ep_gather="sc", stack=False, fused=True
     monkeypatch.setattr(fused_moe_gmm, "pack_fp8_rows", _carrier_ref)
     monkeypatch.setattr(fused_moe_gmm, "gmm_wrapper", gmm)
     monkeypatch.setattr(fused_moe_gmm, "mlp_wrapper", mlp)
-    monkeypatch.setattr(fused_moe_gmm, "ragged_gather_reduce",
-                        lambda rows, rev, wts, valid, reduce_group_size: _ref_combine(
-                            rows, rev, wts, valid, reduce_group_size))
+    monkeypatch.setattr(fused_moe_gmm, "ragged_gather_reduce", served_combine)
+    monkeypatch.setattr(fused_moe_gmm, "ragged_gather_reduce_v3", v3_combine)
+    monkeypatch.setattr(fused_moe_gmm, "_local_ragged_combine_eligible",
+                        lambda *a, use_ep, **k: not use_ep)   # the non-EP combine is eligible; EP keeps its own
     out = fused_moe_gmm.fused_moe_func.__wrapped__(
         x, w1, w2, s1, s2, None, None, w, ids, experts_start=jnp.array(0, jnp.int32), topk=topk,
         activation="silu", use_ep=True, use_sparse_core=True, onehot_moe_permute_threshold=threshold,
         ep_counting_sort=counting, ep_gather=ep_gather, ep_gmm_stack=stack, nonep_fused_mlp=fused,
-        nonep_gmm_experts_per_visit=2, nonep_gmm_bucket=64)
+        nonep_gmm_experts_per_visit=2, nonep_gmm_bucket=64, ep_combine=combine, nonep_combine_packed=packed)
     return out, seen
 
 
@@ -1235,3 +1249,56 @@ def test_ep_knobs_leave_the_non_ep_program_unchanged():
         return str(jax.make_jaxpr(fn)(x, ids, w))
 
     assert jaxpr(ep_gather="sc_fp8") == jaxpr() == jaxpr(ep_gather="sc_padded")
+
+
+def test_ep_all_valid_routes_is_exact_and_never_reads_unwritten_rows():
+    """ep_all_valid_routes: invalid routes read the zeroed last row with weight 0, every route becomes valid, and the
+    valid-mask combine's output is reproduced bit for bit, even with NaN in the rows the GMMs never wrote."""
+    rng = np.random.default_rng(3)
+    tokens, topk, hidden = 96, 10, 256
+    routes = tokens * topk
+    valid = rng.random(routes) < 0.5
+    n_valid = int(valid.sum())
+    rows = rng.standard_normal((routes + 64, hidden)).astype(np.float32)
+    rows[n_valid:] = np.nan                                   # unwritten rows past the computed prefix
+    rows[:n_valid][rng.random((n_valid, hidden)) < 0.05] = -0.0
+    rows = jnp.asarray(rows, jnp.bfloat16)
+    rev = np.empty(routes, np.int32)
+    rev[valid] = rng.permutation(n_valid)                     # valid routes -> computed rows
+    rev[~valid] = n_valid + rng.integers(0, routes - n_valid, int((~valid).sum()))   # invalid -> garbage rows
+    rev = jnp.asarray(rev)
+    wts = jnp.asarray(rng.random(routes), jnp.bfloat16)
+    valid = jnp.asarray(valid)
+    from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v3 import _fallback_implementation
+
+    ref = _fallback_implementation(rows, rev, wts, valid, topk)
+    r2, rev2, w2, v2 = fused_moe_gmm.ep_all_valid_routes(rows, rev, wts, valid)
+    assert bool(np.asarray(v2).all())
+    z = rows.shape[0] - 1
+    assert (np.asarray(rev2)[~np.asarray(valid)] == z).all() and (np.asarray(w2)[~np.asarray(valid)] == 0).all()
+    np.testing.assert_array_equal(_bits(r2[z]), np.zeros(hidden, np.uint16))
+    np.testing.assert_array_equal(_bits(r2[:z]), _bits(rows[:z]))
+    got = _fallback_implementation(r2, rev2, w2, v2, topk)
+    assert np.isfinite(np.asarray(got, np.float32)).all()
+    np.testing.assert_array_equal(_bits(got), _bits(ref))
+    # all valid: nothing changes
+    allv = jnp.ones_like(valid)
+    r3, rev3, w3, _ = fused_moe_gmm.ep_all_valid_routes(rows, rev, wts, allv)
+    np.testing.assert_array_equal(_bits(r3), _bits(rows))
+    np.testing.assert_array_equal(np.asarray(rev3), np.asarray(rev))
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_ep_combine_dense_runs_the_non_ep_combine_on_all_valid_routes(monkeypatch, packed):
+    ref, seen0 = _ep_case(monkeypatch, stack=True)
+    assert seen0["combine"] == ["served"], seen0["combine"]
+    out, seen = _ep_case(monkeypatch, stack=True, combine="dense", packed=packed)
+    assert seen["combine"] == [dict(v3=True, packed=packed, all_valid=True)], seen["combine"]
+    assert seen["mlp"] == [dict(lp=None, e=2, bucket=64, pack=packed)], seen["mlp"]
+    np.testing.assert_array_equal(_bits(out), _bits(ref))
+
+
+def test_ep_combine_dense_stays_served_on_the_one_hot_path(monkeypatch):
+    out, seen = _ep_case(monkeypatch, tokens=64, stack=True, combine="dense", packed=True, threshold=2048)
+    assert all(c == "served" or not isinstance(c, dict) for c in seen["combine"]), seen["combine"]
+    assert all(not c["pack"] for c in seen["mlp"]), seen["mlp"]

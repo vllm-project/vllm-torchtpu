@@ -753,6 +753,28 @@ def _local_ragged_combine_eligible(
     return num_tokens >= alignment and padded_tokens * 2 <= num_tokens * 3
 
 
+def ep_all_valid_routes(rows, revert, weights, valid):
+    """The EP combine's routes made all valid (TPU_MOE_EP_COMBINE=dense).
+
+    Non-local routes (and skipped padded tokens) read row z = rows.shape[0] - 1
+    with weight 0, and z is set to zeros when any route is invalid; then every
+    destination block is all-valid, so the SparseCore combine takes its dense
+    run-table path (and, with packed rows, half the gather bytes), as on the
+    non-EP path. z is never a computed row while a route is invalid: the GMMs
+    write only the valid-route prefix, which is then shorter than the route
+    count <= rows.shape[0]. Same output bits as the valid-mask combine: each
+    destination's f32 accumulator starts at +0.0 and adds its routes in route
+    order; an accumulator that starts at +0.0 is never -0.0 under round-to-
+    nearest, so the extra terms (0 * +0.0 = +0.0) leave every value and sign
+    unchanged, and a zero row cannot carry a stale NaN into them (0 * NaN)."""
+    z = rows.shape[0] - 1
+    any_invalid = jnp.logical_not(jnp.all(valid))
+    rows = rows.at[z].set(jnp.where(any_invalid, jnp.zeros_like(rows[z]), rows[z]))
+    revert = jnp.where(valid, revert, z).astype(revert.dtype)
+    weights = jnp.where(valid, weights, jnp.zeros_like(weights))
+    return rows, revert, weights, jnp.ones_like(valid)
+
+
 def moe_gmm(
     x: jax.Array,
     w1: jax.Array,
@@ -785,6 +807,7 @@ def moe_gmm(
     nonep_fused_mlp: bool = False,
     nonep_lhs_packed_dtype: jnp.dtype | None = None,
     ep_gmm_stack: bool = False,
+    ep_combine: str = "served",
 ) -> jax.Array:
     """Run grouped GEMM for routed tokens and reduce back to tokens.
 
@@ -792,6 +815,9 @@ def moe_gmm(
     per visit, gmm2's experts per visit, row bucket, fused expert MLP) apply on
     the EP path too. EP keeps group offset 0 and every local group, which is
     what they need; the combine stays the EP combine. Same output bits.
+    ``ep_combine="dense"`` (``TPU_MOE_EP_COMBINE``): the EP combine runs the
+    non-EP SparseCore combine (packed with TPU_MOE_NONEP_COMBINE_PACKED) on
+    all-valid routes (ep_all_valid_routes). Same output bits.
 
     ``nonep_lhs_packed_dtype`` set: ``x`` is the packed fp8 carrier of routed
     rows of that dtype (``TPU_MOE_NONEP_GATHER=sc_fp8``); gmm1 reads it as is.
@@ -870,9 +896,17 @@ def moe_gmm(
     topk_weights = topk_weights_flat.reshape((num_tokens, topk))
     valid_mask = valid_mask_flat.reshape((num_tokens, topk))
 
+    # TPU_MOE_EP_COMBINE=dense: the EP combine on all-valid routes, through the
+    # non-EP combine selection below (above the one-hot cutoff only).
+    ep_dense = (
+        use_ep
+        and ep_combine == "dense"
+        and use_sparse_core
+        and argsort_revert_indices.size > onehot_moe_permute_threshold
+    )
     combine_kw = dict(
         use_sparse_core=use_sparse_core,
-        use_ep=use_ep,
+        use_ep=use_ep and not ep_dense,
         topk=topk,
         num_routes=argsort_revert_indices.size,
         onehot_moe_permute_threshold=onehot_moe_permute_threshold,
@@ -925,7 +959,7 @@ def moe_gmm(
     # gather bytes, the same values and sums.
     packed = (
         nonep_combine_packed
-        and not use_ep
+        and (not use_ep or ep_dense)
         and w2_bias is None
         and rhs_split == 1
         and act_dtype == jnp.bfloat16
@@ -976,6 +1010,13 @@ def moe_gmm(
             pack_out=packed,
             bucket=bucket,
         )
+    if ep_dense and _local_ragged_combine_eligible(
+        gmm2_res.shape[0], size_n, act_dtype, packed=packed, **combine_kw
+    ):
+        gmm2_res, argsort_revert_indices, topk_weights_flat, valid_mask_flat = (
+            ep_all_valid_routes(gmm2_res, argsort_revert_indices, topk_weights_flat, valid_mask_flat)
+        )
+        logger.info_once("EP MoE combine runs on all-valid routes (dense%s).", ", packed" if packed else "")
     if packed:
         return ragged_gather_reduce_v3(
             gmm2_res,
@@ -1090,6 +1131,7 @@ def moe_gmm(
         "ep_counting_sort",
         "ep_gather",
         "ep_gmm_stack",
+        "ep_combine",
     ),
 )
 def fused_moe_func(
@@ -1126,6 +1168,7 @@ def fused_moe_func(
     ep_counting_sort: bool = True,
     ep_gather: str = "sc",
     ep_gmm_stack: bool = False,
+    ep_combine: str = "served",
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
 
@@ -1284,5 +1327,6 @@ def fused_moe_func(
         nonep_fused_mlp=nonep_fused_mlp,
         nonep_lhs_packed_dtype=lhs_packed_dtype,
         ep_gmm_stack=ep_gmm_stack,
+        ep_combine=ep_combine,
     )
     return x[:num_tokens, :hidden_size]

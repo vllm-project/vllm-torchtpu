@@ -197,6 +197,7 @@ def _build_fused_moe_custom_op(
         nonep_fused_mlp=envs.TPU_MOE_NONEP_FUSED_MLP,
         **({"ep_gather": envs.TPU_MOE_EP_GATHER.lower()} if envs.TPU_MOE_EP_GATHER.lower() != "sc" else {}),
         **({"ep_gmm_stack": True} if envs.TPU_MOE_EP_GMM_STACK else {}),
+        **({"ep_combine": "dense"} if envs.TPU_MOE_EP_COMBINE.lower() == "dense" else {}),
     )
 
     fused_moe_kernel_impl = pallas.jax_op(op_name, wrapped_fn)
