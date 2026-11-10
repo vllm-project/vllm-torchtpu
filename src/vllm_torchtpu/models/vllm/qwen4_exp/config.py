@@ -137,7 +137,9 @@ def native_cache_specs(cfg) -> dict[str, KVCacheSpec]:
 
 def native_cache_capacity(cfg, specs):
     """Return the full-concurrency demand ceiling from native cache groups."""
-    from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
+    from vllm.v1.core.kv_cache_planning import (
+        get_kv_cache_groups,
+    )
 
     groups = get_kv_cache_groups(cfg, specs)
     blocks_per_request = sum(

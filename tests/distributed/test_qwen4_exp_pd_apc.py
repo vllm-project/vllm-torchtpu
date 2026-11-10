@@ -25,9 +25,11 @@ from vllm import SamplingParams
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_manager import KVCacheManager
-from vllm.v1.core.kv_cache_utils import (
+from vllm.v1.core.kv_cache_planning import (
     get_kv_cache_config_from_groups,
     get_kv_cache_groups,
+)
+from vllm.v1.core.kv_cache_utils import (
     get_request_block_hasher,
     init_none_hash,
     resolve_cache_hit_alignment_tokens,

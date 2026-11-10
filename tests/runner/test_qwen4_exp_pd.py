@@ -19,7 +19,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 from vllm.config.cache import CacheConfig
-from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
+from vllm.v1.core.kv_cache_planning import (
+    get_kv_cache_groups,
+)
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     FullAttentionSpec,

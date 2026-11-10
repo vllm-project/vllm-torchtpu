@@ -19,7 +19,7 @@ import pytest
 import torch
 from vllm.config.attention import AttentionConfig
 from vllm.config.cache import CacheConfig
-from vllm.v1.core.kv_cache_utils import (
+from vllm.v1.core.kv_cache_planning import (
     get_kv_cache_config_from_groups,
     get_kv_cache_groups,
 )

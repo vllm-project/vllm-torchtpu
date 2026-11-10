@@ -38,7 +38,9 @@ def test_real_worker_selects_budgeted_capacity_before_profile_and_freezes_owners
     cfg.model_config.max_model_len = 8 * layout.block_size + 1
     layout, specs = pooled_cache_specs(cfg)
     ceiling = native_cache_capacity(cfg, specs)
-    from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
+    from vllm.v1.core.kv_cache_planning import (
+        get_kv_cache_groups,
+    )
 
     groups = get_kv_cache_groups(cfg, specs)
     bytes_per_block = layout.page_bytes * max(len(g.layer_names) for g in groups)
@@ -131,7 +133,9 @@ def test_budgeted_cache_uses_existing_allocator_admission_and_reuse(monkeypatch)
     bytes_per_block = layout.page_bytes * max(len(g.layer_names) for g in cache.groups)
     cache.get_specs(available_memory=capacity * bytes_per_block)
     assert cache.pages == capacity
-    from vllm.v1.core.kv_cache_utils import get_kv_cache_config_from_groups
+    from vllm.v1.core.kv_cache_planning import (
+        get_kv_cache_config_from_groups,
+    )
 
     plan = get_kv_cache_config_from_groups(
         cfg, cache.groups, capacity * bytes_per_block
@@ -175,7 +179,9 @@ def test_worker_budget_coordinates_actual_tp_then_ep_dp_minimum(monkeypatch):
     cfg.model_config.max_model_len = 8 * layout.block_size + 1
     layout, specs = pooled_cache_specs(cfg)
     ceiling = native_cache_capacity(cfg, specs)
-    from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
+    from vllm.v1.core.kv_cache_planning import (
+        get_kv_cache_groups,
+    )
 
     groups = get_kv_cache_groups(cfg, specs)
     stride = layout.page_bytes * max(len(g.layer_names) for g in groups)

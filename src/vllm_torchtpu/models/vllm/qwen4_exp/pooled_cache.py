@@ -17,10 +17,12 @@ from dataclasses import replace
 
 import torch
 from vllm.distributed.parallel_state import get_tp_group
-from vllm.v1.core.kv_cache_utils import (
+from vllm.v1.core.kv_cache_planning import (
     check_enough_kv_cache_memory,
     get_kv_cache_config_from_groups,
     get_kv_cache_groups,
+)
+from vllm.v1.core.kv_cache_utils import (
     resolve_cache_hit_alignment_tokens,
     resolve_kv_cache_block_sizes,
 )

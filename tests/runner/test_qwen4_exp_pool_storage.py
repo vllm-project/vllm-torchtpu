@@ -198,9 +198,11 @@ def _startup_cache(
 def _engine_plan(cache):
     import copy
 
+    from vllm.v1.core.kv_cache_planning import (
+        get_kv_cache_configs,
+    )
     from vllm.v1.core.kv_cache_utils import (
         generate_scheduler_kv_cache_config,
-        get_kv_cache_configs,
         resolve_cache_hit_alignment_tokens,
         resolve_kv_cache_block_sizes,
     )

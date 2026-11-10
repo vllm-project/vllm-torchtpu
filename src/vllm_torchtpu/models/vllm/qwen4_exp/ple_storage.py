@@ -22,10 +22,7 @@ import numpy as np
 import torch
 from vllm.distributed import GroupCoordinator
 from vllm.models.qwen4_exp.common.ngram_embedding import Qwen4ExpPLEEmbeddingMethod
-from vllm.models.qwen4_exp.common.ple import (
-    PLEVocabParallelEmbedding,
-    compute_ple_shard_overlap,
-)
+from vllm.models.qwen4_exp.common.ple import PLEVocabParallelEmbedding
 
 from vllm_torchtpu.kernels.qwen4_exp.host_lookup import host_table_num_words
 from vllm_torchtpu.layers.adapter.custom_ops.ple_op import (
@@ -112,11 +109,9 @@ class _LoadedPLETable(PLEVocabParallelEmbedding):
         if key in self._loaded_ranges:
             raise ValueError("Duplicate PLE checkpoint row range")
         self._copy_checkpoint(param, loaded_weight, checkpoint_start)
-        overlap = compute_ple_shard_overlap(
+        overlap = self._compute_shard_overlap(
             checkpoint_start=checkpoint_start,
             checkpoint_rows=loaded_weight.shape[0],
-            tp_start=self.shard_indices.org_vocab_start_index,
-            tp_end=self.shard_indices.org_vocab_end_index,
         )
         if overlap is not None:
             self._owned_ranges.append(
