@@ -56,7 +56,10 @@ _RS_OP = None
 _AR_TP_OP = None
 _TP_RANK = None
 _TP_RANKS: tuple[int, ...] = ()
-# The form of the TP-pair all-reduce: every DP x TP decode leg ran "oneshot".
+# The TP-pair all-reduce serves a TP group of this many cores inside a larger
+# mesh (so DP > 1): the two cores of a chip, the only layout it was measured
+# on (DP4 x TP2 decode). Its form: every such decode leg ran "oneshot".
+TP_PAIR_SIZE = 2
 TP_PAIR_FORM = "oneshot"
 # This core's mesh index as an int32 [1] device tensor: the kernels take it as
 # data (see small_collectives/common.py).
@@ -202,7 +205,9 @@ def prebuild(vllm_config: Any) -> None:
     """Build the ops and this core's rank tensor, outside any traced region:
     the mesh comes from a collective. A no-op unless the
     ``tpu_collectives.small_all_reduce`` option is on (it is off by default,
-    see ``distributed/collectives_options.py``)."""
+    see ``distributed/collectives_options.py``). On a DP x TP layout whose TP
+    groups are the chips' core pairs (TP = 2, DP > 1), it also builds the
+    TP-pair all-reduce."""
     global _AR_OP, _RS_OP, _RANK, _CORES, _MESH_RANKS, _DP_COMBINE
     global _AR_TP_OP, _TP_RANK, _TP_RANKS
     if _AR_OP is not None or not collectives_options.get(vllm_config).small_all_reduce:
@@ -230,7 +235,8 @@ def prebuild(vllm_config: Any) -> None:
     tp = int(get_tp_group().world_size)
     if (
         not tp_all_reduce
-        and 1 < tp < _CORES
+        and tp == TP_PAIR_SIZE
+        and tp < _CORES
         and _CORES % tp == 0
         and _tp_pairs_match_mesh(ep_mesh_index(), tp)
     ):
@@ -277,7 +283,8 @@ def retain(out: torch.Tensor, rank: torch.Tensor | None = None) -> torch.Tensor:
 
 def all_reduce_or(x: torch.Tensor, ranks, fallback) -> torch.Tensor:
     """The sum of ``x`` over the group ``ranks``: the kernel for a small block
-    when the group is the mesh, ``fallback(x)`` otherwise."""
+    when the group is the mesh or the armed TP pair, ``fallback(x)``
+    otherwise."""
     if _AR_TP_OP is not None and tuple(ranks) == _TP_RANKS:
         if not _fits(x, len(_TP_RANKS) * LANES, allow_forced=True):
             return fallback(x)
