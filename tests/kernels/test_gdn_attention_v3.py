@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import sys
+from types import SimpleNamespace
 from unittest import mock
 
 import jax
@@ -727,12 +728,31 @@ class GDNAttentionTest(parameterized.TestCase):
             q_loc=[0, 256, 384, 512],
             distribution=[0, 3, 3],
         ),
+        # 3 and 5 head groups: triangular_block_size 4 and 2.
+        dict(
+            testcase_name="prefill_24_v_heads",
+            max_reqs=1,
+            lengths=[1024],
+            q_loc=[0, 1024],
+            distribution=[0, 0, 1],
+            n_kq=8,
+            n_v=24,
+        ),
+        dict(
+            testcase_name="prefill_40_v_heads",
+            max_reqs=1,
+            lengths=[1024],
+            q_loc=[0, 1024],
+            distribution=[0, 0, 1],
+            n_kq=8,
+            n_v=40,
+        ),
     )
-    def test_run_jax_gdn_attention_local(self, max_reqs, lengths, q_loc, distribution):
+    def test_run_jax_gdn_attention_local(
+        self, max_reqs, lengths, q_loc, distribution, n_kq=2, n_v=8
+    ):
         kq_head_dim = 128
         v_head_dim = 128
-        n_kq = 2
-        n_v = 8
         kernel_size = 4
 
         num_tokens = sum(lengths)
@@ -1870,12 +1890,22 @@ class GDNAttentionTest(parameterized.TestCase):
     ("num_v_heads", "expected"),
     [(8, 16), (16, 8), (24, 4), (32, 4), (40, 2), (48, 2), (64, 2), (96, 2)],
 )
-def test_gdn_triangular_block_size_is_a_power_of_two(num_v_heads, expected):
+def test_gdn_triangular_block_size_values(num_v_heads, expected):
     # 3 head groups (e.g. 24 value heads per rank) gave 16 // 3 = 5 and 5 head
     # groups gave 3; neither divides the chunk.
-    from types import SimpleNamespace
-
-    from vllm_torchtpu.kernels.gdn.v3.config import GDNConfig
-
     cfg = SimpleNamespace(num_v_heads=num_v_heads, is_kda=False)
-    assert GDNConfig.triangular_block_size.fget(cfg) == expected
+    assert config.GDNConfig.triangular_block_size.fget(cfg) == expected
+
+
+@pytest.mark.parametrize("block_size", [2, 4, 8])
+def test_invert_triangular_matrix_block_sizes_agree(block_size):
+    # Every power-of-two block size that divides the chunk gives the same
+    # inverse as the default 16-wide blocks.
+    chunk = 64
+    with jax.default_device(jax.devices("cpu")[0]):
+        t = jax.random.normal(jax.random.key(0), (2, chunk, chunk)) * 0.1
+        t = jnp.tril(t, -1) + jnp.eye(chunk)
+        ref = compute_gdn.invert_triangular_matrix(t, block_size=16)
+        out = compute_gdn.invert_triangular_matrix(t, block_size=block_size)
+    assert out.shape == ref.shape == (2, chunk, chunk)
+    np.testing.assert_allclose(out, ref, rtol=0, atol=1e-6)
