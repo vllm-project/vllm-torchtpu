@@ -159,7 +159,11 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
 )
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.tpu_block_size_utils import unified_kv_layout_enabled
-from vllm_torchtpu.runner import greedy_top_tokens, spec_boundary_state
+from vllm_torchtpu.runner import (
+    greedy_top_tokens,
+    prompt_logprobs,
+    spec_boundary_state,
+)
 from vllm_torchtpu.runner import min_tokens as min_tokens_mask
 from vllm_torchtpu.runner import utils as runner_utils
 from vllm_torchtpu.runner.kernel_block_table import install_kernel_block_tables
@@ -248,6 +252,9 @@ class ExecuteModelState:
     # (TPU_GREEDY_TOP_TOKENS).
     top_tokens: bool = False
     kv_save_nan_check: KVSaveNanCheck | None = None
+    prompt_logprobs_chunks: list[prompt_logprobs.PromptLogprobsChunk] = field(
+        default_factory=list
+    )
 
 
 # Per-step mamba read-offset operations, consolidated into single cached
@@ -4294,6 +4301,7 @@ class TPUModelRunner(GPUModelRunner):
         mamba_state_indices_list: list[list[torch.Tensor] | None] = []
         mamba_boundary_plans: list[spec_boundary_state.SpecBoundaryPlan | None] = []
         draft_chunks: list[DraftChunkInputs] = []
+        prompt_logprobs_chunks: list[prompt_logprobs.PromptLogprobsChunk] = []
         is_draft_model = self._is_async_drafter
         top_tokens = self._greedy_top_tokens_this_step()
 
@@ -4563,6 +4571,13 @@ class TPUModelRunner(GPUModelRunner):
                     logits = self.compute_logits_from_hidden_states(
                         sample_hidden_states
                     )
+                if self.num_prompt_logprobs:
+                    assert isinstance(hidden_states, torch.Tensor)
+                    prompt_chunk = self._prompt_logprobs_chunk(
+                        scheduler_output, hidden_states, start_index, num_reqs
+                    )
+                    if prompt_chunk is not None:
+                        prompt_logprobs_chunks.append(prompt_chunk)
 
             logits_list.append(logits)
             num_reqs_list.append(num_reqs)
@@ -4629,11 +4644,80 @@ class TPUModelRunner(GPUModelRunner):
             mamba_boundary_plans=mamba_boundary_plans,
             top_tokens=top_tokens,
             kv_save_nan_check=nan_check,
+            prompt_logprobs_chunks=prompt_logprobs_chunks,
         )
 
         if self.is_pooling_model:
             return self.sample_tokens(None)
         return None
+
+    def _prompt_logprobs_chunk(
+        self,
+        scheduler_output: "SchedulerOutput",
+        hidden_states: torch.Tensor,
+        start_index: int,
+        num_reqs: int,
+    ) -> prompt_logprobs.PromptLogprobsChunk | None:
+        """Score the prompt rows of this chunk's prompt-logprob requests.
+
+        The rows go through compute_selected_logits and gather_logprobs in
+        slices of at most the request bucket both precompile for this token
+        bucket, so a step with prompt logprobs compiles nothing new.
+        """
+        end_index = start_index + num_reqs
+        spans = prompt_logprobs.plan_chunk(
+            cast(list[str], self.input_batch.req_ids[start_index:end_index]),
+            self.query_start_loc_np[: num_reqs + 1],
+            self.input_batch.num_computed_tokens_cpu[start_index:end_index],
+            scheduler_output.num_scheduled_tokens,
+            self.requests,
+            self.num_prompt_logprobs,
+            self.model_config.max_logprobs,
+        )
+        if not spans:
+            return None
+        if self._dp_vocab_logits:
+            unsupported = "TPU_DP_VOCAB_PARALLEL=1; unset it"
+        elif self.speculative_config is not None:
+            unsupported = "speculative decoding; serve without --speculative-config"
+        elif _get_sequence_layout_planner_for_runner(
+            self
+        ).uses_selected_logits_hidden_states:
+            unsupported = (
+                "prefill context parallelism; serve with "
+                "--prefill-context-parallel-size 1"
+            )
+        else:
+            unsupported = None
+        if unsupported is not None:
+            # TODO: a DP-sharded lm_head needs every DP engine to run the same
+            # logits programs; context parallelism selects the logits rows on
+            # each rank; speculative decoding is not covered by tests yet.
+            raise NotImplementedError(
+                "prompt_logprobs (also set by echo=True with logprobs) is not "
+                f"supported with {unsupported}."
+            )
+
+        chunk = prompt_logprobs.PromptLogprobsChunk(spans)
+        rows, targets = prompt_logprobs.rows_and_targets(spans, self.requests)
+        max_slice = _get_padded_num_reqs_with_upper_limit(
+            min(hidden_states.shape[0], self.max_num_reqs), self.max_num_reqs
+        )
+        for lo in range(0, rows.shape[0], max_slice):
+            n = min(max_slice, rows.shape[0] - lo)
+            padded = _get_padded_num_reqs_with_upper_limit(n, self.max_num_reqs)
+            indices = np.zeros(padded, dtype=np.int32)
+            indices[:n] = rows[lo : lo + n]
+            target_ids = np.zeros((padded, 1), dtype=np.int64)
+            target_ids[:n, 0] = targets[lo : lo + n]
+            logits = self.compute_selected_logits(
+                hidden_states, torch.from_numpy(indices).to(self.device)
+            )
+            tensors = self.gather_logprobs(
+                logits, torch.from_numpy(target_ids).to(self.device)
+            )
+            chunk.slices.append((tensors, n))
+        return chunk
 
     def _pool_chunk(
         self,
@@ -5733,7 +5817,11 @@ class TPUModelRunner(GPUModelRunner):
                 req_id_to_index=dict(self.input_batch.req_id_to_index),
                 sampled_token_ids=[],  # Filled in AsyncTPUModelRunnerOutput get_output
                 logprobs=logprobs,
-                prompt_logprobs_dict={req_id: None for req_id in req_ids},
+                prompt_logprobs_dict=prompt_logprobs.emit(
+                    state.prompt_logprobs_chunks,
+                    self.requests,
+                    self.num_prompt_logprobs,
+                ),
                 pooler_output=pooler_output,
                 kv_connector_output=kv_connector_output,
             )

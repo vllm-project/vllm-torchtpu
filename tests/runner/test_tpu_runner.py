@@ -3729,6 +3729,7 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         runner = SimpleNamespace(
             _pp_wave=None,
             _dp_step_other_decode=False,
+            num_prompt_logprobs={},
             execute_model_state=SimpleNamespace(
                 scheduler_output=scheduler_output,
                 draft_chunks=[],
@@ -3740,6 +3741,7 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
                 pooler_output_list=[],
                 top_tokens=False,
                 kv_save_nan_check=None,
+                prompt_logprobs_chunks=[],
             ),
             input_batch=SimpleNamespace(
                 max_num_logprobs=None,
