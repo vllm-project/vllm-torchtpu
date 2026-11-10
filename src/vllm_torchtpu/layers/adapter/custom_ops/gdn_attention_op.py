@@ -52,7 +52,6 @@ from vllm_torchtpu.kernels.gdn.head_geometry import (
     GdnHeadGeometry,
     derive_gdn_head_geometry,
 )
-from vllm_torchtpu.layers.adapter import gated_norm_quant_op
 from vllm_torchtpu.layers.adapter.gdn_linear import (
     GdnColumnParallelLinear,
     GdnInterleavedColumnParallelLinear,
@@ -68,6 +67,7 @@ from vllm_torchtpu.layers.core.sequence_layout import (
     is_pcp_streaming_attention_metadata,
 )
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.models.qwen3_5.kernels import gated_norm_quant_op
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     get_vllm_model_wrapper_context,
 )
