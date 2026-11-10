@@ -625,9 +625,10 @@ def fused_conv1d_gdn(
             to 0 otherwise.
         decode_tile_override: When positive, the decode tile T, in place of
             the dynamic or static pick (capped at the batch and the sequence
-            count). Callers set it for a layout whose measured best tile the
-            tiler does not pick. It is also capped at the decode VMEM
-            ceilings (tiling.select_decode_tile_size), so it can choose a
+            count). Callers set it, or 0 takes the layout's entry in
+            tiling.DECODE_TILE_BY_LAYOUT if any, for a layout whose measured
+            best tile the tiler does not pick. It is also capped at the decode
+            VMEM ceilings (tiling.select_decode_tile_size), so it can choose a
             smaller tile but not one that overflows VMEM.
 
     Returns:
@@ -840,6 +841,9 @@ def fused_conv1d_gdn(
         rec_state_bytes=jnp.dtype(recurrent_dtype).itemsize,
         act_out_bytes=jnp.dtype(act_out_dtype).itemsize,
     )
+    # The layout's measured tile (tiling.DECODE_TILE_BY_LAYOUT) when the caller
+    # passes none; like an explicit override it takes the caps at every shape.
+    decode_tile_override = decode_tile_override or tiling.layout_decode_tile()
     if not tiler_shape:
         # main's decode tile: its dynamic pick, or the caller's tile under the
         # window cap; KDA verify windows keep one sequence per tile.
