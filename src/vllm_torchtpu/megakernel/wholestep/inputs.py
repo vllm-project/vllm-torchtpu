@@ -256,10 +256,36 @@ def wholestep_reference(
     return x, jnp.stack(kv_new, axis=1)
 
 
+def _fp8_columns(w: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """`w [..., K, N]` as FP8 E4M3 with per-column f32 scales `[..., N]` (the
+    `VLLM_TPU_MK_HC_FP8` packing)."""
+    wf = w.astype(F32)
+    amax = jnp.max(jnp.abs(wf), axis=-2)
+    scale = jnp.where(amax > 0, amax / 448.0, 1.0)
+    return (wf / scale[..., None, :]).astype(jnp.float8_e4m3fn), scale
+
+
+def _hc_fp8(weights: dict, smalls: dict, name: str, g: Any, rows: Any, L: int) -> None:
+    q, s = _fp8_columns(weights[f"{name}_hdn"])
+    weights[f"{name}_hdn"] = q
+    ups = []
+    for b in range(g.NHC):
+        qb, sb = _fp8_columns(weights[f"{name}_hup{b}"])
+        weights[f"{name}_hup{b}"] = qb
+        ups.append(sb)
+    up = jnp.concatenate(ups, axis=-1)
+    smalls[f"{name}_hdn_s"] = s if rows is None else _rows(s, rows, L)
+    smalls[f"{name}_hup_s"] = up if rows is None else _rows(up, rows, L)
+
+
 def pack_wholestep(
-    spec: Any, g: Qwen38Geometry, ex: ExecSpec, d: dict[str, Any], L: int
+    spec: Any, g: Qwen38Geometry, ex: ExecSpec, d: dict[str, Any], L: int,
+    hc_fp8: bool = False,
 ) -> tuple[dict, dict]:
-    """`(weights, states)` per-rank operands (leading `R`, not yet folded)."""
+    """`(weights, states)` per-rank operands (leading `R`, not yet folded).
+
+    `hc_fp8`: the layers' HC mix weights as FP8 + per-column scales (a spec built with
+    `hc_fp8=True`)."""
     R, T = ex.R, ex.T
     hc, w_l, st_l = d["hc"], d["inp"].w_l, d["inp"].st_l
     att_rows = att_layers(g, L, d.get("first", "gdn"))
@@ -325,6 +351,11 @@ def pack_wholestep(
             else {}
         ),
     }
+    if hc_fp8:
+        _hc_fp8(weights, smalls, "moe", g, None, L)
+        _hc_fp8(weights, smalls, "qsa_full", g, att_rows, L)
+        if gdn_rows:
+            _hc_fp8(weights, smalls, "gdn", g, gdn_rows, L)
     if not gdn_rows:
         return pack_weights(spec, ex, weights, smalls), {}
     lay = GDNBlock.lin_in_layout(g.inner(R, L), ex)
