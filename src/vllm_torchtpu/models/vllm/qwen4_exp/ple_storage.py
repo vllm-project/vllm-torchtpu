@@ -2,6 +2,7 @@
 """PLE storage extensions using the common table and checkpoint shard loader."""
 
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -19,6 +20,9 @@ from vllm_torchtpu.layers.adapter.custom_ops.ple_op import (
 
 from .ple import Qwen4ExpPLETable
 from .ple_host import SharedPLETable
+
+# VLLM_TPU_PLE_HOST_GATHER_WORKERS: rows each extra gather worker must cover.
+_GATHER_ROWS_PER_WORKER = 1 << 14
 
 
 @dataclass(frozen=True)
@@ -274,13 +278,13 @@ class HostPLETable(ResidentPLETable):
                     .view(torch.int16 if dtype == np.int16 else torch.uint8)
                     .numpy()
                 )
-                np.take(table, indices - start, axis=0, out=output, mode="clip")
+                self._take_rows(table, indices - start, output)
             else:
                 with self._shared_table.buffer() as buffer:
                     table = np.frombuffer(buffer, dtype=dtype).reshape(
                         -1, self.embedding_dim
                     )
-                    np.take(table, indices - start, axis=0, out=output, mode="clip")
+                    self._take_rows(table, indices - start, output)
                     del table
             output[~owned] = 0
             raw = torch.from_numpy(output)
@@ -318,23 +322,57 @@ class HostPLETable(ResidentPLETable):
             if table is None:
                 table = self.weight.detach().view(buf.dtype).numpy()
                 self._np_table = table
-            np.take(table, local, axis=0, out=output, mode="clip")
+            self._take_rows(table, local, output)
         else:
             with self._shared_table.buffer() as buffer:
                 table = np.frombuffer(buffer, dtype=dtype).reshape(
                     -1, self.embedding_dim
                 )
-                np.take(table, local, axis=0, out=output, mode="clip")
+                self._take_rows(table, local, output)
                 del table
         stray = (local < 0) | (local >= end - start)
         if stray.any():
             output[stray] = 0
         return out_t
 
+    def _take_rows(
+        self, table: np.ndarray, rows: np.ndarray, output: np.ndarray
+    ) -> None:
+        """``np.take(table, rows, out=output, mode="clip")``, split over up to
+        VLLM_TPU_PLE_HOST_GATHER_WORKERS threads (disjoint output ranges) for
+        large prefill lookups. Small lookups stay serial."""
+        max_workers = envs.VLLM_TPU_PLE_HOST_GATHER_WORKERS
+        workers = min(max_workers, rows.size // _GATHER_ROWS_PER_WORKER)
+        if workers <= 1:
+            np.take(table, rows, axis=0, out=output, mode="clip")
+            return
+        pool = self.__dict__.get("_gather_pool")
+        if pool is None:
+            pool = ThreadPoolExecutor(
+                max_workers=max_workers, thread_name_prefix="q4exp-ple-gather"
+            )
+            self._gather_pool = pool
+        bounds = np.linspace(0, rows.size, workers + 1, dtype=np.int64)
+
+        def take(index):
+            start, end = bounds[index], bounds[index + 1]
+            np.take(table, rows[start:end], axis=0, out=output[start:end], mode="clip")
+
+        pending = [pool.submit(take, index) for index in range(workers)]
+        try:
+            for future in pending:
+                future.result()
+        finally:
+            # Every task finishes before the caller releases a borrowed view.
+            wait(pending)
+
     def lookup_raw(self, ids: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError("Host PLE requires the explicit host lookup boundary")
 
     def close(self) -> None:
+        pool = self.__dict__.pop("_gather_pool", None)
+        if pool is not None:
+            pool.shutdown(wait=True, cancel_futures=True)
         if self._shared_table is not None:
             self._shared_table.close()
         self.weight.data = torch.empty(

@@ -264,6 +264,7 @@ if TYPE_CHECKING:
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     VLLM_TPU_WARM_SPEC_LOGITS_LENGTHS: bool = True
     VLLM_TPU_PLE_HOST_FAST_LOOKUP: bool = False
+    VLLM_TPU_PLE_HOST_GATHER_WORKERS: int = 0
     VLLM_TPU_PLE_HOST_TIMING: bool = False
     VLLM_TPU_PLE_HOST_OVERLAP: bool = False
     VLLM_TPU_PLE_HOST_OVERLAP_CHECK: int = 0
@@ -1705,6 +1706,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Host PLE (CPU offload): gather into two reused, pinned-if-possible
     # buffers and copy them to the device without staging (ple_storage.py).
     "VLLM_TPU_PLE_HOST_FAST_LOOKUP": env_bool("VLLM_TPU_PLE_HOST_FAST_LOOKUP"),
+    # Host-offloaded PLE table: split lookups of at least 2 * 16384 rows over
+    # up to this many threads (disjoint output ranges; 0/1 = serial). Prefill
+    # chunks only; the gathered rows are identical.
+    "VLLM_TPU_PLE_HOST_GATHER_WORKERS": env_nonnegative_int(
+        "VLLM_TPU_PLE_HOST_GATHER_WORKERS", 0
+    ),
     # Log the host PLE lookup's D2H / gather / H2D host time every 1000 calls.
     "VLLM_TPU_PLE_HOST_TIMING": env_bool("VLLM_TPU_PLE_HOST_TIMING"),
     # Host PLE: start the ids' copy before the decoder layers that precede the
