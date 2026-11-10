@@ -127,6 +127,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_COMPRESSED_PAIR_SHIFT: bool = False
     VLLM_TPU_MK_STACKED_QSA_WRITES: bool = False
     VLLM_TPU_MK_COMPRESSED_UNIQUE_WRITE: bool = False
+    VLLM_TPU_MK_HC_FP8: bool = False
     VLLM_TPU_HC_PREFILL_UP_T: bool = False
     VLLM_TPU_HC_PREFILL_COMBINE_MIX: bool = False
     VLLM_TPU_HC_PREFILL_WIDE_TILE: int = 0
@@ -862,6 +863,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # kernel step with concurrent DMAs (`write_compressed_pairs_unique`) instead
     # of one ordered grid step per row. Same pool bytes.
     "VLLM_TPU_MK_COMPRESSED_UNIQUE_WRITE": env_bool("VLLM_TPU_MK_COMPRESSED_UNIQUE_WRITE"),
+    # Whole-step megakernel: the target model's HC mix weights (layers 3..46, HC of
+    # the mixer and the MoE) stream as FP8 E4M3 with per-output-column scales. The
+    # draft (MTP) and the layers outside the whole-step kernel keep BF16 HC.
+    "VLLM_TPU_MK_HC_FP8": env_bool("VLLM_TPU_MK_HC_FP8"),
     # Prefill HC full mix: take the up projection as its [low rank, width]
     # transpose. The checkpoint weight is held column-major, so the transpose
     # is a bitcast and the per-call relayout copy before the kernel goes away

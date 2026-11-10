@@ -205,6 +205,7 @@ def build_wholestep_call(
             n_layers=n_att,
             **indexed_options(),
         ),
+        hc_fp8=envs.VLLM_TPU_MK_HC_FP8,
     )
     stats = union_stats_on()
     fn, k_specs, _, n_w = make_flat_segment_step(
