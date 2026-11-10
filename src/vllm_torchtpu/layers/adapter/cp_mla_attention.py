@@ -223,7 +223,7 @@ def vspace_fused_applies(num_tokens: int, is_backbone: bool) -> bool:
         and num_tokens <= envs.TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS
     ):
         return False
-    return _merge_chunks(num_tokens) > 1
+    return _merge_chunks(num_tokens) > 1 or envs.TPU_DCP_MERGE_VSPACE_FUSED_UNCHUNKED
 
 
 def merge_lse_partials_scatter_heads_vspace(
@@ -242,6 +242,19 @@ def merge_lse_partials_scatter_heads_vspace(
     narrow = envs.TPU_DCP_RS_OUT_PRECISION
     rs_dtype = (wire_dtype or output.dtype) if narrow else None
     chunks = _merge_chunks(output.shape[0])
+    if chunks == 1:
+        # TPU_DCP_MERGE_VSPACE_FUSED_UNCHUNKED: the unsplit merge, one lse
+        # gather and one V-space reduce-scatter.
+        lse_f32 = lse.to(torch.float32)
+        merged = _weighted_reduce_scatter(
+            output,
+            lse_f32,
+            _gather_lse(lse_f32, group),
+            group,
+            rs_dtype,
+            vspace=(w_uv, w_uv_scale),
+        )
+        return _retain_rank(merged)
     merged = _merge_chunked(
         output, lse, group, chunks, rs_dtype=rs_dtype, vspace=(w_uv, w_uv_scale)
     )
