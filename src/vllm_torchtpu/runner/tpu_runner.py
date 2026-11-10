@@ -63,6 +63,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
 )
 from vllm.forward_context import set_forward_context
 from vllm_torchtpu.runner import fast_forward_context as _ffc
+from vllm_torchtpu.runner import t3_host as _t3_host
 from vllm_torchtpu.runner.fast_forward_context import fast_set_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.abstract import MambaBase
@@ -1665,8 +1666,23 @@ class TPUModelRunner(GPUModelRunner):
         # forever -> the engine busy-spins / hangs. Mirrors
         # KVConnectorModelRunnerMixin._get_kv_connector_output.
         worker_meta = kv_connector.build_connector_worker_meta()
-        kv_connector_stats = kv_connector.get_kv_connector_stats()
+        if _t3_host.CONN_STATS_EVERY > 1:
+            # IX track 3 (default off): poll connector stats every N steps.
+            # Samples accumulate in the connector until the next poll, so the
+            # totals the scheduler sees are unchanged; only their cadence is.
+            n = self.__dict__.get("_t3_conn_stats_n", 0) + 1
+            self.__dict__["_t3_conn_stats_n"] = n
+            t3_stats_due = n % _t3_host.CONN_STATS_EVERY == 0
+            kv_connector_stats = (
+                kv_connector.get_kv_connector_stats() if t3_stats_due else None
+            )
+        else:
+            t3_stats_due = True
+            kv_connector_stats = kv_connector.get_kv_connector_stats()
         cpu_samples, device_samples = self._stage_timing.take_samples()
+        if not t3_stats_due and (cpu_samples or device_samples):
+            # Runner timings ride on the connector stats: poll them now.
+            kv_connector_stats = kv_connector.get_kv_connector_stats()
         if cpu_samples or device_samples:
             # Preserve connector-owned stats; discard timings without a TPU sink.
             stats_to_visit = [kv_connector_stats]
