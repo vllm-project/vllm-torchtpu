@@ -86,6 +86,7 @@ class QSAFullIndexedBlock(QSAFullBlock):
         loop_requests: bool = False,
         dcp: int = 1,
         compressed_dcp: bool = False,
+        async_dma: bool = False,
         **kw: Any,
     ) -> None:
         """`carrier`: "" = prototype contiguous keys `[requests, max_groups, 128]`;
@@ -165,6 +166,9 @@ class QSAFullIndexedBlock(QSAFullBlock):
         self.hbm_tables, self.per_request_scores = hbm_tables, per_request_scores
         self.bounded_chunks = bounded_chunks
         self.shard_index = shard_index
+        # Selection-path DMAs to distinct destinations issued together and waited once
+        # (row ids into SMEM, the new group's loads/stores) instead of start-wait pairs.
+        self.async_dma = bool(async_dma)
         assert not shard_index or per_request_scores, (
             "the sharded indexer selects per request"
         )
