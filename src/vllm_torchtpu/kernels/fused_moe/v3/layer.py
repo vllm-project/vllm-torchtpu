@@ -607,11 +607,47 @@ def _pallas_step(
         landing = pltpu.with_memory_space_constraint(
             gathered_rows, pltpu.MemorySpace.HBM
         )
+        reorder = config.reorder_chain
+        if reorder:
+            # Config.reorder_chain: the index-independent halves of the
+            # sort's index (the live-row fill) and the gathered prefix are
+            # formed as programs of their own, so they can run while the
+            # sparse cores scatter the row tables instead of after; and the
+            # finish is ordered after the shard tables rather than the
+            # scatter, so its waits overlap the scatter too. Same values.
+            run_start, push_rows = ffn_tables[0], ffn_tables[5]
+            starts = (
+                expert_base.astype(jnp.int32)[:, None]
+                + run_start.astype(jnp.int32) * ROW_BLOCK
+            ).reshape(-1)
+            ends = starts + push_rows.reshape(-1).astype(jnp.int32)
+            row = jnp.arange(n_sorted, dtype=jnp.int32)
+            if config.sort_index_compare:
+                live = jnp.any(
+                    (row[:, None] >= starts[None, :]) & (row[:, None] < ends[None, :]),
+                    axis=1,
+                )
+            else:
+                edges = (
+                    jnp.zeros((n_sorted + 1,), jnp.int32)
+                    .at[jnp.minimum(starts, n_sorted)]
+                    .add(1)
+                    .at[jnp.minimum(ends, n_sorted)]
+                    .add(-1)
+                )
+                live = jnp.cumsum(edges)[:n_sorted] > 0
+            # -1 on a live row (it reads its table entry), else the row of
+            # its own a padding row reads (never negative).
+            fill = jnp.where(live, jnp.int32(-1), row % gathered_rows.shape[0])
+            used = jnp.max(
+                expert_base.astype(jnp.int32) + expert_rows.astype(jnp.int32)
+            )
+            fill, used = lax.optimization_barrier((fill, used))
         done = transport.finish_call(
             landing,
             send_sem,
             receive_sems,
-            index[:LANES],
+            (routed_row.reshape(-1)[:LANES] if reorder else index[:LANES]),
             num_shards=num_shards,
             mesh_axes=mesh_axes,
             rows_per_shard=gathered_rows.shape[0] // num_shards,
@@ -619,41 +655,47 @@ def _pallas_step(
         )
         landed, done = lax.optimization_barrier((gathered_rows, done))
         index = jnp.where(done[0, 0] > 0, index, 0)
-        # A padding row (the tail of an (expert, shard) run, the tail slack,
-        # the alignment) carries token zero in the table; thousands of
-        # reads of one row serialize in the sparse cores, so every such row
-        # reads a row of its own. The
-        # live rows are the first push_rows of each run, the run starting
-        # run_start blocks into its expert's rows, which start at
-        # expert_base: +1 at each run's start, -1 at its end, summed along
-        # the rows, a row is live where the running sum is positive.
-        run_start, push_rows = ffn_tables[0], ffn_tables[5]
-        starts = (
-            expert_base.astype(jnp.int32)[:, None]
-            + run_start.astype(jnp.int32) * ROW_BLOCK
-        ).reshape(-1)
-        ends = starts + push_rows.reshape(-1).astype(jnp.int32)
-        row = jnp.arange(n_sorted, dtype=jnp.int32)
-        if config.sort_index_compare:
-            # Runs never overlap and an empty run (start == end) covers no
-            # row, so "inside some run" is exactly the running sum's > 0.
-            live = jnp.any(
-                (row[:, None] >= starts[None, :]) & (row[:, None] < ends[None, :]),
-                axis=1,
-            )
+        if reorder:
+            index = jnp.where(fill < 0, index, fill)
         else:
-            edges = (
-                jnp.zeros((n_sorted + 1,), jnp.int32)
-                .at[jnp.minimum(starts, n_sorted)]
-                .add(1)
-                .at[jnp.minimum(ends, n_sorted)]
-                .add(-1)
+            # A padding row (the tail of an (expert, shard) run, the tail
+            # slack, the alignment) carries token zero in the table;
+            # thousands of reads of one row serialize in the sparse cores,
+            # so every such row reads a row of its own. The live rows are
+            # the first push_rows of each run, the run starting run_start
+            # blocks into its expert's rows, which start at expert_base: +1
+            # at each run's start, -1 at its end, summed along the rows, a
+            # row is live where the running sum is positive.
+            run_start, push_rows = ffn_tables[0], ffn_tables[5]
+            starts = (
+                expert_base.astype(jnp.int32)[:, None]
+                + run_start.astype(jnp.int32) * ROW_BLOCK
+            ).reshape(-1)
+            ends = starts + push_rows.reshape(-1).astype(jnp.int32)
+            row = jnp.arange(n_sorted, dtype=jnp.int32)
+            if config.sort_index_compare:
+                # Runs never overlap and an empty run (start == end) covers
+                # no row, so "inside some run" is exactly the running
+                # sum's > 0.
+                live = jnp.any(
+                    (row[:, None] >= starts[None, :]) & (row[:, None] < ends[None, :]),
+                    axis=1,
+                )
+            else:
+                edges = (
+                    jnp.zeros((n_sorted + 1,), jnp.int32)
+                    .at[jnp.minimum(starts, n_sorted)]
+                    .add(1)
+                    .at[jnp.minimum(ends, n_sorted)]
+                    .add(-1)
+                )
+                live = jnp.cumsum(edges)[:n_sorted] > 0
+            index = jnp.where(live, index, row % gathered_rows.shape[0])
+            # The table is sized to its bound (every shard's pairs); the FFN
+            # kernel reads only the used prefix, so only that is sorted.
+            used = jnp.max(
+                expert_base.astype(jnp.int32) + expert_rows.astype(jnp.int32)
             )
-            live = jnp.cumsum(edges)[:n_sorted] > 0
-        index = jnp.where(live, index, row % gathered_rows.shape[0])
-        # The table is sized to its bound (every shard's pairs); the FFN
-        # kernel reads only the used prefix, so only that is sorted.
-        used = jnp.max(expert_base.astype(jnp.int32) + expert_rows.astype(jnp.int32))
         rows_in = gather.gather_rows_prefix(
             landed,
             index,
@@ -669,27 +711,6 @@ def _pallas_step(
         kernel_sems = None
     else:
         rows_in, kernel_sems = gathered_rows, (send_sem, receive_sems)
-    arrivals, arrival_scales = run_kernel(
-        ffn_tables,
-        token_of_row,
-        expert_rows,
-        expert_base,
-        visit_order,
-        counts,
-        rows_in,
-        token_scales,
-        w1,
-        w2,
-        w1_scales,
-        w2_scales,
-        w1_bias,
-        w2_bias,
-        arrival_rows=arrival_rows,
-        transport_sems=kernel_sems,
-        shard_index=shard_index,
-    )
-    if result_rows == "bf16":
-        arrival_scales = None
     # The gather's index: the arrival row of every (token, slot) pair the
     # combine sums, token-major (the tables hold it slot-major), in whole
     # gather blocks. A pair that routes nowhere (a padding token, a dropped
@@ -724,6 +745,34 @@ def _pallas_step(
     pair_index = jnp.where(
         live, pair_index, jnp.arange(n_gather, dtype=jnp.int32) % arrival_rows
     )
+    if config.reorder_chain and sorted_rows:
+        # Config.reorder_chain: the combine's index is formed before the
+        # FFN kernel as a program of its own (it needs only the tables and
+        # the weights), so it can run in the sort's wait. Same values.
+        pair_index, combine_weights = lax.optimization_barrier(
+            (pair_index, combine_weights)
+        )
+    arrivals, arrival_scales = run_kernel(
+        ffn_tables,
+        token_of_row,
+        expert_rows,
+        expert_base,
+        visit_order,
+        counts,
+        rows_in,
+        token_scales,
+        w1,
+        w2,
+        w1_scales,
+        w2_scales,
+        w1_bias,
+        w2_bias,
+        arrival_rows=arrival_rows,
+        transport_sems=kernel_sems,
+        shard_index=shard_index,
+    )
+    if result_rows == "bf16":
+        arrival_scales = None
     out = combine_lib.combine(
         arrivals,
         arrival_scales,
