@@ -3077,7 +3077,14 @@ class TPUModelRunner(GPUModelRunner):
         # Wait even when there is nothing to roll back: both callers drop these
         # results afterwards, and on non-output TP ranks they can be the only
         # owner of the in-flight D2H copy (#985).
-        pre_next_tokens_cpu = self._pre_async_results.wait_for_copy()
+        if host_phases.enabled():
+            t_wait = time.perf_counter_ns()
+            pre_next_tokens_cpu = self._pre_async_results.wait_for_copy()
+            host_phases.note(
+                "x_prev_copy_wait", (time.perf_counter_ns() - t_wait) / 1e3
+            )
+        else:
+            pre_next_tokens_cpu = self._pre_async_results.wait_for_copy()
         assert pre_next_tokens_cpu is not None
 
         pre_next_tokens_cpu = pre_next_tokens_cpu[: len(pre_req_ids)]
@@ -4248,6 +4255,7 @@ class TPUModelRunner(GPUModelRunner):
             ]
             if not getattr(self, "_host_phases_wrapped", False):
                 targets.append((self, "_zero_block_ids", "x_zero_block_ids"))
+                targets.extend(self._host_phases_fine_targets())
                 self._host_phases_wrapped = True
             for obj, attr, label in targets:
                 fn = getattr(obj, attr, None)
@@ -4261,6 +4269,67 @@ class TPUModelRunner(GPUModelRunner):
             host_phases.note("x_sched_promote", promote_us)
             host_phases.note("x_sched_total", sched_us)
             host_phases.note("x_sched_to_runner", (time.time() - t_end) * 1e6)
+
+    def _host_phases_fine_targets(self) -> list[tuple[Any, str, str]]:
+        """Calls inside the big phases, each timed as its own ``x_`` entry
+        (not summed into total_mean), so one served run splits
+        prep_host_and_uploads / prep_attention_metadata / model_inputs_padding
+        / sample_tail / the draft phases by callee."""
+        import sys
+
+        out: list[tuple[Any, str, str]] = [
+            (self, name, "x_" + name.lstrip("_"))
+            for name in (
+                "_wait_input_staging_fence",
+                "_record_input_staging_fence",
+                "_token_padding_update",
+                "_build_mamba_state_indices",
+                "_mamba_prefill_ckpt",
+                "_build_attention_metadata_staged",
+                "_prepare_async_token_substitution_indices",
+                "_collect_mamba_state_seed_copies",
+                "_flush_mamba_state_seed_copies",
+                "_reset_read_offsets_for_new_requests",
+                "_apply_async_token_substitution",
+                "_check_attention_schedule",
+                "_padded_sampling_params",
+                "_sampler_topk_candidates",
+                "_get_sampling_generator",
+                "_update_mamba_slot_read_offsets",
+                "_assemble_async_spec_substitution",
+                "_update_placeholder",
+                "_sync_replicated_drafts_across_tp",
+                "get_finished_kv_transfers",
+                "maybe_wait_for_kv_save",
+                "forward_model",
+            )
+        ]
+        out.append(
+            (
+                self.spec_decode_manager,
+                "get_spec_decode_metadata",
+                "x_get_spec_decode_metadata",
+            )
+        )
+        out.append(
+            (sys.modules[__name__], "stage_block_table_uploads", "x_stage_block_tables")
+        )
+        if self.model_adapter is not None:
+            out.append((self.model_adapter, "prepare_inputs", "x_adapter_prepare"))
+            out.append((self.model_adapter, "begin_step", "x_adapter_begin"))
+        megakernel = getattr(self, "_megakernel", None)
+        if megakernel is not None:
+            out.append((megakernel, "try_forward", "x_mk_try_forward"))
+        drafter = getattr(self, "_async_drafter", None)
+        if drafter is not None:
+            for name in (
+                "_prepare_draft_inputs",
+                "_forward_draft",
+                "_run_mtp_fused_loop",
+                "_draft_rows_carry_and_token",
+            ):
+                out.append((drafter, name, "x_dp" + name))
+        return out
 
     @torch.no_grad()
     @_pp_step
