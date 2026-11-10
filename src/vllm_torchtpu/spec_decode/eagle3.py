@@ -2412,6 +2412,40 @@ class Eagle3Proposer:
             return None
         return result
 
+    def _with_base_request_distribution(
+        self, md_dict: dict[str, AttentionMetadata]
+    ) -> dict[str, AttentionMetadata]:
+        """Step-0 metadata whose request_distribution is a base device tensor.
+
+        The runner passes RPA's distribution as a slice of one packed [6]
+        upload shared with GDN (see `_combined_request_distribution_cpu`).
+        torch-tpu re-materializes a slice with a tt_jit_execute_as_strided
+        program on every compiled call that takes it, and with the target
+        forward on the megakernel the draft is its first consumer. Draft
+        layers only read the RPA half, so they get a cached copy instead.
+        """
+        cache = self.__dict__.setdefault("_base_request_distribution_cache", {})
+        replaced: dict[int, AttentionMetadata] = {}
+        result = {}
+        for name, md in md_dict.items():
+            new_md = replaced.get(id(md))
+            if new_md is None:
+                rd = md.request_distribution
+                if rd is None or rd.device.type != "tpu":
+                    return md_dict
+                hit = cache.get(id(rd))
+                if hit is None or hit[0] is not rd:
+                    while len(cache) >= 64:
+                        cache.pop(next(iter(cache)))
+                    base = torch.empty(rd.shape, dtype=rd.dtype, device=rd.device)
+                    base.copy_(rd)
+                    hit = (rd, base)
+                    cache[id(rd)] = hit
+                new_md = dataclasses.replace(md, request_distribution=hit[1])
+                replaced[id(md)] = new_md
+            result[name] = new_md
+        return result
+
     def _loop_step_attn_inputs(
         self,
         chunk: DraftChunkInputs,
@@ -2555,7 +2589,7 @@ class Eagle3Proposer:
         target_md = self._target_draft_attn_metadata(chunk)
         if target_md is not None:
             if step_idx == 0:
-                return target_md
+                return self._with_base_request_distribution(target_md)
             seq_lens, query_start_loc, request_distribution = (
                 self._loop_step_attn_inputs(
                     chunk,
