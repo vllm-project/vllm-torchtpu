@@ -59,6 +59,57 @@ def _patch_vllm_compact_mamba_streaming_input() -> None:
     InputProcessor.process_inputs = process_inputs
 
 
+def _patch_vllm_resolve_mm_embedding_inputs() -> None:
+    """Keep text-only KV consumers in text-only mode unless --enable-mm-embeds.
+
+    Upstream ``VllmConfig._resolve_mm_embedding_inputs`` enables
+    ``allow_missing_mm_embeddings`` and ``enable_mm_embeds`` for every KV
+    consumer (including ``kv_both`` offloading connectors) unless
+    ``language_model_only`` is set, turning ``supports_multimodal_inputs`` back
+    on even when all supported modalities were disabled via
+    ``--limit-mm-per-prompt``. Check ``model_config.supports_multimodal_inputs``
+    before enabling embedding inputs.
+    """
+    from functools import wraps
+
+    from vllm.config import VllmConfig
+
+    original = getattr(VllmConfig, "_resolve_mm_embedding_inputs", None)
+    marker = "_tpu_resolve_mm_embedding_inputs_patch"
+    if original is None or original.__dict__.get(marker, False):
+        return
+
+    @wraps(original)
+    def _resolve_mm_embedding_inputs(self) -> None:
+        model_config = self.model_config
+        mm_config = model_config.multimodal_config if model_config is not None else None
+        if mm_config is None:
+            return
+        ec_config = self.ec_transfer_config
+        kv_config = self.kv_transfer_config
+        is_ec_consumer = ec_config is not None and ec_config.is_ec_consumer
+        is_kv_consumer = kv_config is not None and kv_config.is_kv_consumer
+        if (
+            not is_ec_consumer
+            and is_kv_consumer
+            and not mm_config.enable_mm_embeds
+            and (
+                mm_config.language_model_only
+                or not bool(model_config.supports_multimodal_inputs)
+            )
+        ):
+            mm_config.allow_missing_mm_embeddings = False
+            return
+        original(self)
+
+    _resolve_mm_embedding_inputs.__dict__[marker] = True
+    VllmConfig._resolve_mm_embedding_inputs = _resolve_mm_embedding_inputs
+    logger.info(
+        "Applied TPU patch: preserve text-only mode in "
+        "VllmConfig._resolve_mm_embedding_inputs."
+    )
+
+
 def _patch_vllm_hybrid_kv_load_failure_recovery() -> None:
     """Backport hybrid KV cache load failure recovery from vLLM #50388.
 

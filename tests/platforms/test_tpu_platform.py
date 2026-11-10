@@ -99,6 +99,74 @@ def test_compact_mamba_rejects_resumable_input_before_admission(
         assert calls == ["request"]
 
 
+@pytest.mark.parametrize(
+    (
+        "is_ec_consumer",
+        "is_kv_consumer",
+        "language_model_only",
+        "supports_mm_inputs",
+        "enable_mm_embeds",
+        "expected",
+    ),
+    [
+        (False, True, False, True, False, True),
+        (False, True, True, False, False, False),
+        (False, True, False, False, False, False),
+        (False, True, True, True, True, True),
+        (False, True, False, True, True, True),
+        (True, False, True, False, False, True),
+        (False, False, False, True, False, False),
+    ],
+)
+def test_resolve_mm_embedding_inputs_patch_preserves_text_only_kv_consumer(
+    monkeypatch,
+    is_ec_consumer,
+    is_kv_consumer,
+    language_model_only,
+    supports_mm_inputs,
+    enable_mm_embeds,
+    expected,
+):
+    from vllm.config import VllmConfig
+
+    def unpatched(self):
+        mm = self.model_config.multimodal_config
+        if mm is None:
+            return
+        ec_ok = self.ec_transfer_config is not None and (
+            self.ec_transfer_config.is_ec_consumer
+        )
+        kv_ok = self.kv_transfer_config is not None and (
+            self.kv_transfer_config.is_kv_consumer
+        )
+        mm.allow_missing_mm_embeddings = ec_ok or kv_ok
+        if mm.allow_missing_mm_embeddings:
+            mm.enable_mm_embeds = True
+
+    monkeypatch.setattr(VllmConfig, "_resolve_mm_embedding_inputs", unpatched)
+    plugin._patch_vllm_resolve_mm_embedding_inputs()
+    wrapped = VllmConfig._resolve_mm_embedding_inputs
+    plugin._patch_vllm_resolve_mm_embedding_inputs()
+    assert VllmConfig._resolve_mm_embedding_inputs is wrapped
+
+    mm_cfg = SimpleNamespace(
+        language_model_only=language_model_only,
+        enable_mm_embeds=enable_mm_embeds,
+        allow_missing_mm_embeddings=True,
+    )
+    cfg = object.__new__(VllmConfig)
+    cfg.model_config = SimpleNamespace(
+        multimodal_config=mm_cfg,
+        supports_multimodal_inputs=supports_mm_inputs,
+    )
+    cfg.ec_transfer_config = SimpleNamespace(is_ec_consumer=is_ec_consumer)
+    cfg.kv_transfer_config = SimpleNamespace(is_kv_consumer=is_kv_consumer)
+
+    cfg._resolve_mm_embedding_inputs()
+    assert mm_cfg.allow_missing_mm_embeddings is expected
+    assert mm_cfg.enable_mm_embeds is expected
+
+
 def test_grouped_topk_dynamic_compile_wrapper_is_unwrapped(monkeypatch):
     target = "vllm.model_executor.layers.fused_moe.router.grouped_topk_router"
 

@@ -132,6 +132,7 @@ PATCHES = (
         _ENGINE,
         refresh="vllm_torchtpu:_patch_vllm_merge_multimodal_embeddings",
     ),
+    Patch("vllm_torchtpu:_patch_vllm_resolve_mm_embedding_inputs", _ENGINE),
     Patch("vllm_torchtpu.layers.adapter.vision_attention", _ACTIVE),
     # Out-of-tree FP32 rotary embedding (CUDA numerics). Must be registered
     # before any RotaryEmbedding is constructed at model load.
