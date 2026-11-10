@@ -20,12 +20,39 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+import contextlib
+
 LANES = 128
 MESH = pl.DeviceIdType.MESH
 
+# Axis names of the mesh the kernels are traced under, in mesh order, when it has more
+# axes than the collective's own: a mesh device id names every axis, so the peer id
+# carries this core's index on each other axis. () is a one-axis mesh.
+_MESH_AXES: tuple = ()
+
+
+@contextlib.contextmanager
+def mesh_axes(axes):
+    """Trace the enclosed collective calls for a mesh with these axes (mesh order)."""
+    global _MESH_AXES
+    prev = _MESH_AXES
+    _MESH_AXES = tuple(axes)
+    try:
+        yield
+    finally:
+        _MESH_AXES = prev
+
 
 def peer(j, axis, dict_ids):
-    return {axis: jnp.int32(j)} if dict_ids else (jnp.int32(j),)
+    others = [a for a in _MESH_AXES if a != axis]
+    if dict_ids:
+        ids = {axis: jnp.int32(j)}
+        for a in others:
+            ids[a] = lax.axis_index(a)
+        return ids
+    if not others:
+        return (jnp.int32(j),)
+    return tuple(jnp.int32(j) if a == axis else lax.axis_index(a) for a in _MESH_AXES)
 
 
 def barrier(num_cores, axis, dict_ids):
