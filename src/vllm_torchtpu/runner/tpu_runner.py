@@ -3595,7 +3595,6 @@ class TPUModelRunner(GPUModelRunner):
             )
         return substitution_indices
 
-
     def _flush_disjoint_async_results(self) -> None:
         if self._pre_async_results is None:
             return
@@ -5026,7 +5025,6 @@ class TPUModelRunner(GPUModelRunner):
                     seq_idx_dev,
                     pos_idx_dev,
                 )
-
 
         # Default decode layouts keep logits_indices stable for a fixed
         # (num_reqs, padded_num_reqs) bucket. PCP streaming layouts provide
@@ -9537,23 +9535,19 @@ class TPUModelRunner(GPUModelRunner):
                                 next_tpu_warm,
                             )
                         )
-                        out_sub_dr = (
-                            _compiled_subtract_and_substitute_draft_token_ids(
-                                sl_warm,
-                                pos_warm,
-                                rej_warm,
-                                sl_idx_warm,
-                                pos_idx_warm,
-                                ids_warm,
-                                subst_idx_warm,
-                                next_tpu_warm,
-                                logits_idx_warm,
-                                logits_idx_warm,
-                            )
+                        out_sub_dr = _compiled_subtract_and_substitute_draft_token_ids(
+                            sl_warm,
+                            pos_warm,
+                            rej_warm,
+                            sl_idx_warm,
+                            pos_idx_warm,
+                            ids_warm,
+                            subst_idx_warm,
+                            next_tpu_warm,
+                            logits_idx_warm,
+                            logits_idx_warm,
                         )
-                        synchronize_tensors(
-                            (*out_sub, *out_sub_pl, *out_sub_dr)
-                        )
+                        synchronize_tensors((*out_sub, *out_sub_pl, *out_sub_dr))
         # The (padded_logits_length, padded_num_reqs) shapes, in the order
         # the runtime buckets follow.
         pairs = []
