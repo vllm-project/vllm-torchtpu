@@ -1097,3 +1097,141 @@ def test_sc_fp8_falls_back_to_sc_padded_where_it_does_not_apply(monkeypatch, kw)
     assert any("not applicable" in m for m in seen["log"])
     ref, _, _ = _sc_fp8_case(monkeypatch, gather="sc_padded", **kw)
     np.testing.assert_array_equal(_bits(out), _bits(ref))
+
+
+# --- TPU_MOE_EP_GATHER / TPU_MOE_EP_GMM_STACK (the P-MOE stack on the EP path) ----------------
+
+
+def test_ep_knobs_are_registered_choices(monkeypatch):
+    from vllm_torchtpu import envs
+
+    for name in ("TPU_MOE_EP_GATHER", "TPU_MOE_EP_GMM_STACK"):
+        assert name in envs.environment_variables, name
+    monkeypatch.setenv("TPU_MOE_EP_GATHER", "SC_FP8")
+    assert envs.TPU_MOE_EP_GATHER.lower() == "sc_fp8"
+    monkeypatch.setenv("TPU_MOE_EP_GATHER", "xla")
+    with pytest.raises(Exception):
+        envs.TPU_MOE_EP_GATHER
+    monkeypatch.delenv("TPU_MOE_EP_GMM_STACK", raising=False)
+    assert envs.TPU_MOE_EP_GMM_STACK is False
+    monkeypatch.setenv("TPU_MOE_EP_GMM_STACK", "1")
+    assert envs.TPU_MOE_EP_GMM_STACK is True
+
+
+def _ep_case(monkeypatch, *, tokens=640, ep_gather="sc", stack=False, fused=True, threshold=0, counting=False):
+    """fused_moe_func on the EP path (rank 0 of 2: 8 local experts of 16, path D's argsort positions) with stand-ins
+    for the SparseCore kernels, pack_fp8_rows and the GMMs, recording what reaches the gather and the GMMs."""
+    from jax._src import tpu_info as ti
+    from jax._src.pallas.mosaic import tpu_info as pti
+    from jax.experimental.pallas import tpu as pltpu
+    from vllm_torchtpu.kernels.megablox.gmm_v2 import LHS_QUANT_BLOCK, unpack_fp8_rows
+
+    experts, local, hidden, inter, topk = 16, 8, 512, 128, 4
+    k1, k2, k3 = jax.random.split(jax.random.key(31), 3)
+    w1, s1 = _fp8_per_channel(k1, (local, hidden, 2 * inter))
+    w2, s2 = _fp8_per_channel(k2, (local, inter, hidden))
+    x = (jax.random.normal(k3, (tokens, hidden), jnp.float32) / 4).astype(jnp.bfloat16)
+    rng = np.random.default_rng(5)
+    ids = jnp.asarray(np.stack([rng.choice(experts, topk, replace=False) for _ in range(tokens)]), jnp.int32)
+    w = jnp.asarray(rng.random((tokens, topk)), jnp.bfloat16)
+    seen = dict(gather=[], gmm=[], mlp=[], log=[])
+
+    def fake_sc_gather(src, idx, start, end, trim_rows=True, copy_mode="vector", **kw):
+        seen["gather"].append(dict(dtype=str(src.dtype), cols=src.shape[1], copy_mode=copy_mode, trim_rows=trim_rows))
+        pad = -idx.shape[0] % 2048
+        out = src[jnp.pad(idx, (0, pad))]
+        return out[: idx.shape[0]] if trim_rows else out
+
+    def dequant(lhs, lp):
+        if lp is None:
+            return lhs
+        q, sc = unpack_fp8_rows(lhs, (lhs.shape[1] - 128) * 4, jnp.float8_e4m3fn)
+        return (q.astype(jnp.float32) * jnp.repeat(sc, LHS_QUANT_BLOCK, axis=1)).astype(lp)
+
+    ref = _ref_gmm([])
+
+    def gmm(lhs, rhs, rhs_scale, rhs_bias, gs, off, *a, lhs_packed_dtype=None, experts_per_visit=1, bucket=0, **k):
+        seen["gmm"].append(dict(lp=lhs_packed_dtype, e=experts_per_visit, bucket=bucket))
+        return ref(dequant(lhs, lhs_packed_dtype), rhs, rhs_scale, rhs_bias, gs, off, *a, **k)
+
+    def mlp(x_, w1_, s1_, w2_, s2_, gs_, *, fuse_act, rhs_quant_dtype=None, tile_m=0, bucket=0,
+            experts_per_visit=1, pack_out=False, lhs_packed_dtype=None):
+        seen["mlp"].append(dict(lp=lhs_packed_dtype, e=experts_per_visit, bucket=bucket, pack=pack_out))
+        h = ref(dequant(x_, lhs_packed_dtype), w1_, s1_, None, gs_, jnp.array([0], jnp.int32),
+                fuse_act=fuse_act)[:, : w2_.shape[1]]
+        return ref(h, w2_, s2_, None, gs_, jnp.array([0], jnp.int32), preferred_element_type=h.dtype)
+
+    class _Log:
+        def info_once(self, msg, *args):
+            seen["log"].append(msg % args if args else msg)
+
+    info = ti.get_tpu_info_for_chip(ti.ChipVersion.TPU_7X, 1)
+    for mod in (pltpu, ti, pti):
+        monkeypatch.setattr(mod, "get_tpu_info", lambda: info, raising=False)
+    monkeypatch.setattr(fused_moe_gmm, "logger", _Log())
+    monkeypatch.setattr(fused_moe_gmm, "ragged_gather_v2", fake_sc_gather)
+    monkeypatch.setattr(fused_moe_gmm, "pack_fp8_rows", _carrier_ref)
+    monkeypatch.setattr(fused_moe_gmm, "gmm_wrapper", gmm)
+    monkeypatch.setattr(fused_moe_gmm, "mlp_wrapper", mlp)
+    monkeypatch.setattr(fused_moe_gmm, "ragged_gather_reduce",
+                        lambda rows, rev, wts, valid, reduce_group_size: _ref_combine(
+                            rows, rev, wts, valid, reduce_group_size))
+    out = fused_moe_gmm.fused_moe_func.__wrapped__(
+        x, w1, w2, s1, s2, None, None, w, ids, experts_start=jnp.array(0, jnp.int32), topk=topk,
+        activation="silu", use_ep=True, use_sparse_core=True, onehot_moe_permute_threshold=threshold,
+        ep_counting_sort=counting, ep_gather=ep_gather, ep_gmm_stack=stack, nonep_fused_mlp=fused,
+        nonep_gmm_experts_per_visit=2, nonep_gmm_bucket=64)
+    return out, seen
+
+
+def test_ep_knobs_off_keep_the_served_ep_path(monkeypatch):
+    out, seen = _ep_case(monkeypatch)
+    assert seen["gather"] == [dict(dtype="bfloat16", cols=512, copy_mode="vector", trim_rows=True)], seen
+    assert seen["mlp"] == [] and seen["gmm"] == [dict(lp=None, e=1, bucket=0)] * 2, seen
+    assert out.dtype == jnp.bfloat16 and np.isfinite(np.asarray(out, np.float32)).all()
+
+
+def test_ep_gather_sc_padded_keeps_padded_blocks_and_the_output(monkeypatch):
+    ref, _ = _ep_case(monkeypatch)
+    out, seen = _ep_case(monkeypatch, ep_gather="sc_padded")
+    assert seen["gather"] == [dict(dtype="bfloat16", cols=512, copy_mode="vector", trim_rows=False)], seen
+    np.testing.assert_array_equal(_bits(out), _bits(ref))
+
+
+def test_ep_gmm_stack_runs_the_fused_mlp_with_the_non_ep_knobs(monkeypatch):
+    ref, _ = _ep_case(monkeypatch)
+    out, seen = _ep_case(monkeypatch, stack=True)
+    assert seen["mlp"] == [dict(lp=None, e=2, bucket=64, pack=False)] and seen["gmm"] == [], seen
+    np.testing.assert_array_equal(_bits(out), _bits(ref))   # stand-ins are per-row exact either way
+    out2, seen2 = _ep_case(monkeypatch, stack=True, fused=False)
+    assert seen2["mlp"] == [] and seen2["gmm"] == [dict(lp=None, e=2, bucket=64)] * 2, seen2
+
+
+def test_ep_gather_sc_fp8_feeds_the_gmm_packed_rows(monkeypatch):
+    from vllm_torchtpu.kernels.megablox.gmm_v2 import lhs_packed_width
+
+    out, seen = _ep_case(monkeypatch, ep_gather="sc_fp8", stack=True)
+    assert seen["gather"] == [dict(dtype="float32", cols=lhs_packed_width(512), copy_mode="dma",
+                                   trim_rows=False)], seen
+    assert seen["mlp"] == [dict(lp=jnp.bfloat16, e=2, bucket=64, pack=False)], seen
+    ref, _ = _ep_case(monkeypatch, stack=True)
+    np.testing.assert_allclose(np.asarray(out, np.float32), np.asarray(ref, np.float32), rtol=0.1, atol=0.02)
+
+
+def test_ep_gather_sc_fp8_stays_bf16_on_the_one_hot_path(monkeypatch):
+    # 64 tokens x top-4 = 256 routes <= threshold 2,048: the rows come from the one-hot matmul, never packed
+    out, seen = _ep_case(monkeypatch, tokens=64, ep_gather="sc_fp8", stack=True, threshold=2048)
+    assert seen["gather"] == [] and all(c["lp"] is None for c in seen["mlp"] + seen["gmm"]), seen
+
+
+def test_ep_knobs_leave_the_non_ep_program_unchanged():
+    tokens = 640
+    x = _hidden(tokens, HIDDEN)
+    ids, w = _routing(tokens)
+
+    def jaxpr(**kw):
+        fn = lambda a, b, c: prepare_routed_gmm_inputs(  # noqa: E731
+            a, b, c, local_num_experts=EXPERTS, topk=TOPK, use_ep=False, use_sparse_core=False, **kw)
+        return str(jax.make_jaxpr(fn)(x, ids, w))
+
+    assert jaxpr(ep_gather="sc_fp8") == jaxpr() == jaxpr(ep_gather="sc_padded")

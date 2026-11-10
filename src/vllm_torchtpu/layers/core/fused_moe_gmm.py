@@ -334,14 +334,16 @@ def nonep_fp8_dispatch_ok(
     hidden_states, w1, w1_scale, w1_bias, w2_bias, *, activation, use_ep, use_sparse_core,
     rhs_quant_dtype, padded_hidden_size,
 ) -> bool:
-    """Whether TPU_MOE_NONEP_GATHER=sc_fp8 can serve this call: the non-EP
-    SparseCore path with fp8 E4M3 weights carrying scales (so gmm_v2 quantizes
-    its lhs to fp8 per LHS_QUANT_BLOCK columns), bf16 activations whose width
-    needs no padding, and no biases. Otherwise the caller uses sc_padded (the
-    same routed rows, bf16)."""
+    """Whether the packed fp8 dispatch (TPU_MOE_NONEP_GATHER=sc_fp8 on the
+    non-EP path, TPU_MOE_EP_GATHER=sc_fp8 on the EP path) can serve this call:
+    the SparseCore path with fp8 E4M3 weights carrying scales (so gmm_v2
+    quantizes its lhs to fp8 per LHS_QUANT_BLOCK columns), bf16 activations
+    whose width needs no padding, and no biases. Otherwise the caller uses
+    sc_padded (the same routed rows, bf16). use_ep is accepted for the
+    caller's convenience; the conditions are the same on both paths."""
+    del use_ep
     return (
-        not use_ep
-        and use_sparse_core
+        use_sparse_core
         and activation is not None
         and w1_bias is None
         and w2_bias is None
@@ -452,8 +454,15 @@ def prepare_routed_gmm_inputs(
     nonep_gather: str = "xla",
     nonep_gather_cols: int = 0,
     nonep_gather_chunk: int = 16384,
+    ep_counting_sort: bool = True,
+    ep_gather: str = "sc",
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """Prepare the local-only routing layout using already-local expert ids.
+
+    ``ep_counting_sort=False`` (``TPU_MOE_EP_ARGSORT_PERMUTE``) builds the EP
+    SparseCore path's positions and group sizes with argsort instead of the
+    counting sort, keeping the SparseCore gather: the counting sort's rank
+    matmul returns wrong positions at some route counts on TPU (q38 G2M-2).
 
     ``nonep_permute`` and ``nonep_gather`` select how the non-EP path above the
     single-sort row cap builds its permutation and gathers the routed rows
@@ -490,7 +499,7 @@ def prepare_routed_gmm_inputs(
     )
     argsort_revert_indices, bucket_counts = (
         _counting_sort_positions(sort_keys, local_num_experts + 1)
-        if ragged_permute
+        if ragged_permute and ep_counting_sort
         else (None, None)
     )
     token_bits = max(1, (num_tokens_local - 1).bit_length())
@@ -583,11 +592,23 @@ def prepare_routed_gmm_inputs(
             # expert prefix through SparseCore ragged_gather. Invalid
             # non-local rows are sorted after the valid prefix.
             valid_count = group_sizes_local.sum(dtype=jnp.int32)
+            # TPU_MOE_EP_GATHER: "sc" trims the kernel's padded row blocks (a
+            # copy of the whole output); "sc_padded" keeps them, as the non-EP
+            # sc_padded does (the GMMs visit only the valid prefix's groups and
+            # the combine reads rows by index); "sc_fp8" gathers the packed fp8
+            # carrier rows DMA-only (the caller checks nonep_fp8_dispatch_ok and
+            # passes lhs_packed_dtype to the GMM). Same rows read either way.
+            src, gkw = hidden_states_local, {}
+            if ep_gather == "sc_padded":
+                gkw = dict(trim_rows=False)
+            elif ep_gather == "sc_fp8":
+                src, gkw = pack_fp8_rows(hidden_states_local), dict(trim_rows=False, copy_mode="dma")
             x = ragged_gather_v2(
-                hidden_states_local,
+                src,
                 token_indices_sorted,
                 jnp.array([0], dtype=jnp.int32),
                 valid_count[None],
+                **gkw,
             )
     elif not use_ep and nonep_gather == "sc_fp8":
         # The routed rows already quantized: each token row is quantized once
@@ -763,8 +784,14 @@ def moe_gmm(
     nonep_gmm2_experts_per_visit: int = 0,
     nonep_fused_mlp: bool = False,
     nonep_lhs_packed_dtype: jnp.dtype | None = None,
+    ep_gmm_stack: bool = False,
 ) -> jax.Array:
     """Run grouped GEMM for routed tokens and reduce back to tokens.
+
+    ``ep_gmm_stack`` (``TPU_MOE_EP_GMM_STACK``): the non-EP GMM knobs (experts
+    per visit, gmm2's experts per visit, row bucket, fused expert MLP) apply on
+    the EP path too. EP keeps group offset 0 and every local group, which is
+    what they need; the combine stays the EP combine. Same output bits.
 
     ``nonep_lhs_packed_dtype`` set: ``x`` is the packed fp8 carrier of routed
     rows of that dtype (``TPU_MOE_NONEP_GATHER=sc_fp8``); gmm1 reads it as is.
@@ -788,21 +815,24 @@ def moe_gmm(
     hoist = nonep_gmm_hoist_quant and not use_ep
     # gmm2's weight tile as this many concurrent column-part DMAs (non-EP).
     rhs_split = 1 if use_ep else nonep_gmm2_rhs_split
-    # Consecutive experts per gmm_v2 pipeline step in both GMMs (non-EP: all
-    # groups local, no group offset).
-    epv = 1 if use_ep else nonep_gmm_experts_per_visit
+    # The GMM stack knobs below apply on the non-EP path, and on the EP path
+    # with ep_gmm_stack (TPU_MOE_EP_GMM_STACK).
+    stack = not use_ep or ep_gmm_stack
+    # Consecutive experts per gmm_v2 pipeline step in both GMMs (all groups
+    # local, no group offset).
+    epv = nonep_gmm_experts_per_visit if stack else 1
     # gmm2's own experts per step (TPU_MOE_NONEP_GMM2_EXPERTS_PER_VISIT); 0 =
     # gmm1's. gmm2's per-expert weight block is half gmm1's, so it streams
     # slower; more experts per step give it larger blocks.
-    epv2 = epv if use_ep or not nonep_gmm2_experts_per_visit else nonep_gmm2_experts_per_visit
-    # Finer row buckets for both non-EP GMMs (TPU_MOE_NONEP_GMM_BUCKET); 0 = default.
-    bucket = 0 if use_ep else nonep_gmm_bucket
+    epv2 = epv if not stack or not nonep_gmm2_experts_per_visit else nonep_gmm2_experts_per_visit
+    # Finer row buckets for both GMMs (TPU_MOE_NONEP_GMM_BUCKET); 0 = default.
+    bucket = nonep_gmm_bucket if stack else 0
 
     # TPU_MOE_NONEP_FUSED_MLP: both GMMs in one kernel (one weight step of w1 +
     # w2 per expert visit), bit-identical to the two calls below.
     fused_mlp = (
         nonep_fused_mlp
-        and not use_ep
+        and stack
         and activation is not None
         and w1_bias is None
         and w2_bias is None
@@ -1057,6 +1087,9 @@ def moe_gmm(
         "nonep_gmm_bucket",
         "nonep_gmm2_experts_per_visit",
         "nonep_fused_mlp",
+        "ep_counting_sort",
+        "ep_gather",
+        "ep_gmm_stack",
     ),
 )
 def fused_moe_func(
@@ -1090,6 +1123,9 @@ def fused_moe_func(
     nonep_gmm_bucket: int = 0,
     nonep_gmm2_experts_per_visit: int = 0,
     nonep_fused_mlp: bool = False,
+    ep_counting_sort: bool = True,
+    ep_gather: str = "sc",
+    ep_gmm_stack: bool = False,
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
 
@@ -1171,7 +1207,14 @@ def fused_moe_func(
     # TPU_MOE_NONEP_GATHER=sc_fp8 where it applies; elsewhere sc_padded, which
     # gathers the same routed rows in bf16.
     lhs_packed_dtype = None
-    if nonep_gather == "sc_fp8":
+    # On the EP path the SparseCore gather runs only above the one-hot permute
+    # threshold (below it the routed rows come from a matmul, in bf16).
+    ep_fp8 = (
+        use_ep and ep_gather == "sc_fp8" and num_tokens * topk > onehot_moe_permute_threshold
+    )
+    if use_ep and ep_gather == "sc_fp8" and not ep_fp8:
+        ep_gather = "sc_padded"
+    if (nonep_gather == "sc_fp8" and not use_ep) or ep_fp8:
         if nonep_fp8_dispatch_ok(
             hidden_states, w1, w1_scale, w1_bias, w2_bias, activation=activation,
             use_ep=use_ep, use_sparse_core=use_sparse_core,
@@ -1180,7 +1223,8 @@ def fused_moe_func(
             lhs_packed_dtype = hidden_states.dtype
             log_nonep_fp8_choice(True)
         else:
-            nonep_gather = "sc_padded"
+            nonep_gather = "sc_padded" if nonep_gather == "sc_fp8" else nonep_gather
+            ep_gather = "sc_padded" if ep_gather == "sc_fp8" else ep_gather
             log_nonep_fp8_choice(False)
 
     (
@@ -1204,6 +1248,8 @@ def fused_moe_func(
         nonep_gather=nonep_gather,
         nonep_gather_cols=nonep_gather_cols,
         nonep_gather_chunk=nonep_gather_chunk,
+        ep_counting_sort=ep_counting_sort,
+        ep_gather=ep_gather,
     )
     if lhs_packed_dtype is None:
         x = jnp.pad(x, ((0, 0), (0, padded_hidden_size - hidden_size)))
@@ -1237,5 +1283,6 @@ def fused_moe_func(
         nonep_gmm2_experts_per_visit=nonep_gmm2_experts_per_visit,
         nonep_fused_mlp=nonep_fused_mlp,
         nonep_lhs_packed_dtype=lhs_packed_dtype,
+        ep_gmm_stack=ep_gmm_stack,
     )
     return x[:num_tokens, :hidden_size]

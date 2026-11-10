@@ -106,6 +106,8 @@ if TYPE_CHECKING:
     FUSED_MOE_DECODE_KERNEL_PADDING_MASK: bool = False
     TPU_MOE_SINGLE_SORT: bool = True
     TPU_MOE_NONEP_GATHER: str = "xla"
+    TPU_MOE_EP_GATHER: str = "sc"
+    TPU_MOE_EP_GMM_STACK: bool = False
     TPU_MOE_NONEP_GATHER_COLS: int = 0
     TPU_MOE_NONEP_GATHER_CHUNK: int = 16384
     TPU_MOE_NONEP_PERMUTE: str = "sorts"
@@ -1894,6 +1896,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ["xla", "xla_colchunk", "xla_chunked", "sc", "sc_padded", "sc_fp8"],
         case_sensitive=False,
     ),
+    # EP path's SparseCore dispatch gather (above the one-hot permute
+    # threshold): "sc" (served: trims the padded row blocks), "sc_padded"
+    # (keeps them; the same rows are read), "sc_fp8" (sc_padded on packed fp8
+    # rows, as TPU_MOE_NONEP_GATHER=sc_fp8; falls back to sc_padded where it
+    # does not apply). Same output bits.
+    "TPU_MOE_EP_GATHER": env_with_choices(
+        "TPU_MOE_EP_GATHER", "sc", ["sc", "sc_padded", "sc_fp8"], case_sensitive=False
+    ),
+    # The non-EP GMM knobs (TPU_MOE_NONEP_GMM_EXPERTS_PER_VISIT, _GMM2_..., _GMM_BUCKET,
+    # _FUSED_MLP) also on the EP path. Same output bits.
+    "TPU_MOE_EP_GMM_STACK": env_bool("TPU_MOE_EP_GMM_STACK"),
     # Columns per block for "xla_colchunk". 0 picks the widest block (a
     # multiple of 128 dividing the hidden size) whose source table is at most
     # 3200 x 2560 bf16 bytes, the largest size measured in VMEM; a step whose
