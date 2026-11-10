@@ -60,10 +60,11 @@ def parse(raw: Any) -> RunnerOptions:
             f"valid keys: {sorted(fields)}"
         )
     for name, value in raw.items():
-        if type(value) is not fields[name]:
+        expected = fields[name]
+        if type(value) is not expected:
+            kind = expected.__name__ if isinstance(expected, type) else expected
             raise ValueError(
-                f"additional_config.{SECTION}.{name} must be a "
-                f"{fields[name].__name__}, got {value!r}"
+                f"additional_config.{SECTION}.{name} must be a {kind}, got {value!r}"
             )
     return RunnerOptions(**raw)
 

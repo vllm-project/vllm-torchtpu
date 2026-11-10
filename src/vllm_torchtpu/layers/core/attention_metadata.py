@@ -209,6 +209,11 @@ class AttentionMetadataBuilderContext:
     # block column `(seq_len - 1) // block_size` is invariant across
     # `[seq_lens_hi - max_rejected, seq_lens_hi]`.
     mamba_seq_lens_bounds: tuple[Any, ...] | None = None
+    # The walk's mamba group state indices stacked as one [G, num_reqs]
+    # tensor (more than one group), and the ids of the per-group tensors it
+    # was stacked from, for the runner's read-offset reset to reuse.
+    _stacked_mamba_groups: Any = None
+    _stacked_mamba_groups_ids: tuple[int, ...] | None = None
 
 
 def _gather_prefill_ckpt_ids(
@@ -902,6 +907,7 @@ def stage_block_table_uploads(
         ctx.staged_block_tables = {gid: staged_dev[:length]}
         return
 
+    bt_views_key = None
     if not mamba_geom:
         bt_views_key = (
             id(staged_dev),
