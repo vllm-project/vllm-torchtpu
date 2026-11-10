@@ -51,10 +51,10 @@ def _strided_rows(ref, start, count: int, stride: int, folds: int) -> jax.Array:
 def _kernel(
     # Scalar prefetch
     num_runs_ref,  # [1]
-    run_page_ref,  # [R] page of each run (padding runs repeat the last one)
-    run_lo_ref,  # [R] first slot of each run within its page
-    run_hi_ref,  # [R] one past the last slot
-    row0_ref,  # [R] row of the run page's slot 0 in `new_ref`'s array
+    run_page_ref,  # [R + 1] page of each run (padding runs repeat the last one)
+    run_lo_ref,  # [R + 1] first slot of each run within its page
+    run_hi_ref,  # [R + 1] one past the last slot
+    row0_ref,  # [R + 1] row of the run page's slot 0 in `new_ref`'s array
     # In
     new_ref,  # [(S + 8) * W / 128, 128] uint32: the run page's slot s at row
     # row0 % 8 + s of the [S + 8, W] rows (`_strided_rows`)
@@ -112,10 +112,10 @@ def _kernel(
 def _kernel_by_token(
     # Scalar prefetch
     num_runs_ref,  # [1]
-    run_page_ref,  # [R] page of each run (padding runs repeat the last one)
-    run_lo_ref,  # [R] first slot of each run within its page
-    run_hi_ref,  # [R] one past the last slot
-    run_tok0_ref,  # [R] first token of each run
+    run_page_ref,  # [R + 1] page of each run (padding runs repeat the last one)
+    run_lo_ref,  # [R + 1] first slot of each run within its page
+    run_hi_ref,  # [R + 1] one past the last slot
+    run_tok0_ref,  # [R + 1] first token of each run
     # In
     rows_ref,  # [T, W] uint32: every token's row, one value per word
     page_ref,  # [1, S / p, p, W] the page before the write
@@ -176,13 +176,27 @@ _SCALE_BLOCK_LANES = 128
 _ROW_TILE = 8
 
 
+def _grid(num_runs: jax.Array, max_runs: int, traced_grid: bool) -> tuple:
+    """One grid step per run (`traced_grid`), else `max_runs` steps of which
+    those past `num_runs` write nothing. A traced grid keeps one step when
+    there is no run, which writes the page back unchanged (the kernels'
+    ``run == 0`` branch)."""
+    return (jnp.maximum(num_runs, 1),) if traced_grid else (max_runs,)
+
+
+def _at(ref, r):
+    """Entry `r` of a run array, clamped to its last (padding) entry: the
+    pipeline evaluates the index maps of the step after the last one."""
+    return ref[jnp.minimum(r, ref.shape[0] - 1)]
+
+
 def _kernel_slot_scales(
     # Scalar prefetch
     num_runs_ref,  # [1]
-    run_page_ref,  # [R] page of each run (padding runs repeat the last one)
-    run_lo_ref,  # [R] first slot of each run within its page
-    run_hi_ref,  # [R] one past the last slot
-    run_tok0_ref,  # [R] first token of each run
+    run_page_ref,  # [R + 1] page of each run (padding runs repeat the last one)
+    run_lo_ref,  # [R + 1] first slot of each run within its page
+    run_hi_ref,  # [R + 1] one past the last slot
+    run_tok0_ref,  # [R + 1] first token of each run
     # In
     values_ref,  # [T, rows, S] f32: every token's values, broadcast over lanes
     page_ref,  # [1, rows, S] the scale page before the write
@@ -217,10 +231,10 @@ def _kernel_slot_scales(
 def _kernel_slot_scales_by_page(
     # Scalar prefetch
     num_runs_ref,  # [1]
-    run_page_ref,  # [R] page of each run (padding runs repeat the last one)
-    run_lo_ref,  # [R] first slot of each run within its page
-    run_hi_ref,  # [R] one past the last slot
-    row0_ref,  # [R] row of the run page's slot 0 in `values_ref`'s array
+    run_page_ref,  # [R + 1] page of each run (padding runs repeat the last one)
+    run_lo_ref,  # [R + 1] first slot of each run within its page
+    run_hi_ref,  # [R + 1] one past the last slot
+    row0_ref,  # [R + 1] row of the run page's slot 0 in `values_ref`'s array
     # In
     values_ref,  # [S + 8, 128] f32: slot s's values in lanes [0, n) of row row0 % 8 + s
     page_ref,  # [1, rows, S] the scale page before the write
@@ -250,7 +264,7 @@ def _kernel_slot_scales_by_page(
 
 
 def _write_slot_scales_by_page(
-    scale_cache, values, num_runs, run_page, run_lo, run_hi, run_tok0, *, interpret
+    scale_cache, values, num_runs, run_page, run_lo, run_hi, run_tok0, *, grid, interpret
 ):
     """`write_slot_scales` of a large batch: each run reads its page's worth
     of value rows straight from the batch (as `write_rows`)."""
@@ -263,18 +277,18 @@ def _write_slot_scales_by_page(
     )
     row0 = run_tok0 - run_lo + lanes
     page_block = pl.BlockSpec(
-        (1, rows, lanes), lambda r, n, run_page, *_: (run_page[r], 0, 0)
+        (1, rows, lanes), lambda r, n, run_page, *_: (_at(run_page, r), 0, 0)
     )
     return pl.pallas_call(
         functools.partial(_kernel_slot_scales_by_page, num_values=num_values),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=5,
-            grid=(run_page.shape[0],),
+            grid=grid,
             in_specs=[
                 pl.BlockSpec(
                     (pl.Element(lanes + tile), pl.Element(_SCALE_BLOCK_LANES)),
                     lambda r, n, run_page, lo, hi, row0: (
-                        pl.multiple_of(row0[r] // tile * tile, tile),
+                        pl.multiple_of(_at(row0, r) // tile * tile, tile),
                         0,
                     ),
                 ),
@@ -291,7 +305,9 @@ def _write_slot_scales_by_page(
     )(num_runs[None], run_page, run_lo, run_hi, row0, padded, scale_cache)
 
 
-@functools.partial(jax.jit, static_argnames=("max_runs", "interpret"))
+@functools.partial(
+    jax.jit, static_argnames=("max_runs", "traced_grid", "interpret")
+)
 def write_slot_scales(
     scale_cache: jax.Array,
     values: jax.Array,
@@ -299,6 +315,7 @@ def write_slot_scales(
     slots: jax.Array,
     *,
     max_runs: int,
+    traced_grid: bool = True,
     interpret: bool = False,
 ) -> jax.Array:
     """Write f32 ``values [T, n]`` into rows ``[0, n)`` of the ``[pages, rows,
@@ -315,6 +332,7 @@ def write_slot_scales(
     num_runs, run_page, run_lo, run_hi, run_tok0 = token_runs(
         pages, slots, num_pages, max_runs
     )
+    grid = _grid(num_runs, max_runs, traced_grid)
     if num_tokens > _BY_TOKEN_MAX_TOKENS:
         return _write_slot_scales_by_page(
             scale_cache,
@@ -324,18 +342,19 @@ def write_slot_scales(
             run_lo,
             run_hi,
             run_tok0,
+            grid=grid,
             interpret=interpret,
         )
     padded = jnp.pad(values.astype(jnp.float32), ((0, 0), (0, rows - num_values)))
     broadcast = jnp.broadcast_to(padded[:, :, None], (num_tokens, rows, lanes))
     page_block = pl.BlockSpec(
-        (1, rows, lanes), lambda r, n, run_page, *_: (run_page[r], 0, 0)
+        (1, rows, lanes), lambda r, n, run_page, *_: (_at(run_page, r), 0, 0)
     )
     return pl.pallas_call(
         functools.partial(_kernel_slot_scales, num_values=num_values),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=5,
-            grid=(max_runs,),
+            grid=grid,
             in_specs=[
                 pl.BlockSpec((num_tokens, rows, lanes), lambda r, *_: (0, 0, 0)),
                 page_block,
@@ -352,7 +371,13 @@ def write_slot_scales(
 
 
 def token_runs(pages: jax.Array, slots: jax.Array, num_pages: int, max_runs: int):
-    """Token runs: maximal spans of consecutive tokens writing one page."""
+    """Token runs: maximal spans of consecutive tokens writing one page.
+
+    Returns ``num_runs`` and ``[max_runs + 1]`` arrays of each run's page,
+    first slot, end slot and first token. Entries from ``num_runs`` on
+    repeat the last run, so that the pipeline's look-ahead past the last grid
+    step (entry ``num_runs``, at most ``max_runs``) neither reads out of
+    bounds nor fetches a new block."""
     num_tokens = pages.shape[0]
     tok = jnp.arange(num_tokens, dtype=jnp.int32)
     valid = (pages >= 0) & (pages < num_pages)
@@ -361,22 +386,28 @@ def token_runs(pages: jax.Array, slots: jax.Array, num_pages: int, max_runs: int
     start = valid & ((pages != prev_page) | (slots != prev_slot + 1))
     run_id = jnp.cumsum(start.astype(jnp.int32)) - 1
     num_runs = jnp.minimum(jnp.sum(start.astype(jnp.int32)), max_runs)
-    at_start = jnp.where(start, run_id, max_runs)
-    run_page = jnp.zeros(max_runs, jnp.int32).at[at_start].set(pages, mode="drop")
-    run_lo = jnp.zeros(max_runs, jnp.int32).at[at_start].set(slots, mode="drop")
-    run_tok0 = jnp.zeros(max_runs, jnp.int32).at[at_start].set(tok, mode="drop")
+    size = max_runs + 1
+    at_start = jnp.where(start & (run_id < max_runs), run_id, size)
+    run_page = jnp.zeros(size, jnp.int32).at[at_start].set(pages, mode="drop")
+    run_lo = jnp.zeros(size, jnp.int32).at[at_start].set(slots, mode="drop")
+    run_tok0 = jnp.zeros(size, jnp.int32).at[at_start].set(tok, mode="drop")
     count = (
-        jnp.zeros(max_runs, jnp.int32)
-        .at[jnp.where(valid, run_id, max_runs)]
+        jnp.zeros(size, jnp.int32)
+        .at[jnp.where(valid & (run_id < max_runs), run_id, size)]
         .add(1, mode="drop")
     )
-    last = run_page[jnp.maximum(num_runs - 1, 0)]
-    padding = jnp.arange(max_runs) >= num_runs
-    run_page = jnp.where(padding, last, run_page)
-    return num_runs, run_page, run_lo, run_lo + count, run_tok0
+    run_hi = run_lo + count
+    last = jnp.maximum(num_runs - 1, 0)
+    padding = jnp.arange(size) >= num_runs
+    return (
+        num_runs,
+        *(jnp.where(padding, a[last], a) for a in (run_page, run_lo, run_hi, run_tok0)),
+    )
 
 
-@functools.partial(jax.jit, static_argnames=("max_runs", "bits", "interpret"))
+@functools.partial(
+    jax.jit, static_argnames=("max_runs", "bits", "traced_grid", "interpret")
+)
 def write_rows(
     cache: jax.Array,
     rows: jax.Array,
@@ -386,6 +417,7 @@ def write_rows(
     max_runs: int,
     bits: int | None = None,
     scales: jax.Array | None = None,
+    traced_grid: bool = True,
     interpret: bool = False,
 ) -> jax.Array:
     """Write ``rows [T, W]`` (cache dtype) at ``(pages[t], slots[t])``.
@@ -393,7 +425,9 @@ def write_rows(
     Tokens with a page outside the cache are dropped. Consecutive tokens of a
     run must take consecutive slots of one page, as a request's new tokens do;
     a run boundary is wherever that breaks. `max_runs` bounds the number of
-    runs (see `max_write_runs`).
+    runs (see `max_write_runs`). The grid has one step per run
+    (`traced_grid`); ``traced_grid=False`` runs all `max_runs` steps, the
+    reference the traced grid is checked against.
 
     `bits` per slot defaults to the cache dtype's width. With ``bits=4`` (the
     uint8 4-bit caches of `msa_fp4`) `rows` are uint8 values below 16, and
@@ -430,8 +464,9 @@ def write_rows(
         )
     page_block = pl.BlockSpec(
         (1, rows_per_page, word_bytes, width),
-        lambda r, n, run_page, *_: (run_page[r], 0, 0, 0),
+        lambda r, n, run_page, *_: (_at(run_page, r), 0, 0, 0),
     )
+    grid = _grid(num_runs, max_runs, traced_grid)
     if num_tokens <= _BY_TOKEN_MAX_TOKENS:
         tokens_block = pl.BlockSpec((num_tokens, width), lambda r, *_: (0, 0))
         extra = []
@@ -441,7 +476,7 @@ def write_rows(
             functools.partial(_kernel_by_token, bits=bits),
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=5,
-                grid=(max_runs,),
+                grid=grid,
                 in_specs=[tokens_block, page_block, *([tokens_block] * len(extra))],
                 out_specs=page_block,
             ),
@@ -468,7 +503,7 @@ def write_rows(
         return pl.BlockSpec(
             (pl.Element((page_size + tile) * folds), pl.Element(lanes)),
             lambda r, n, run_page, lo, hi, row0: (
-                pl.multiple_of(row0[r] // tile * tile * folds, tile),
+                pl.multiple_of(_at(row0, r) // tile * tile * folds, tile),
                 0,
             ),
         )
@@ -489,7 +524,7 @@ def write_rows(
         functools.partial(_kernel, bits=bits),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=5,
-            grid=(max_runs,),
+            grid=grid,
             in_specs=[rows_block, page_block, *extra_specs],
             out_specs=page_block,
         ),
