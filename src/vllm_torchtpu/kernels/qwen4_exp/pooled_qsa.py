@@ -601,6 +601,106 @@ def write_compressed_pairs(pool, pair, write, mask, values):
     return view.reshape(pool.shape)
 
 
+def write_compressed_pairs_unique(pool, pair, write, mask, values):
+    """``write_compressed_pairs`` for steps whose writers hit distinct pairs.
+
+    The writers (``write``) are compacted to the front in order and handled by
+    one kernel step: all partial pairs are read with concurrent DMAs, merged in
+    VMEM, then all pairs written with concurrent DMAs, instead of one grid step
+    and two serial DMAs per row. Distinct destinations make the order of the
+    writes unobservable, so the pool ends with ``write_compressed_pairs``'
+    bytes. If two writers share a pair the ordered writer runs instead.
+    """
+    packing = 4 if pool.dtype == jnp.float8_e4m3fn else 2
+    width = pool.shape[-1]
+    n = len(pair)
+    write = write.astype(jnp.bool_)
+    order = jnp.argsort(~write, stable=True)
+    count = jnp.sum(write, dtype=jnp.int32)
+    pair_c = pair.astype(jnp.int32)[order]
+    mask_c = mask.astype(jnp.int32)[order]
+    values_c = values[order]
+    live = jnp.arange(n) < count
+    dup = (pair_c[:, None] == pair_c[None, :]) & live[:, None] & live[None, :]
+    unique = ~jnp.any(dup & ~jnp.eye(n, dtype=jnp.bool_))
+    view = pool.reshape(-1, packing, width)
+
+    def kernel(scalars, pair_ref, smask_ref, vmask_ref, values_ref, _old, out, buf, sem):
+        bf = buf.bitcast(jnp.bfloat16) if pool.dtype != jnp.bfloat16 else buf
+
+        def partial(i):
+            return (smask_ref[i, 0] == 0) | (smask_ref[i, 1] == 0)
+
+        def copy(i, read):
+            src, dst = out.at[pair_ref[i]], buf.at[i]
+            # Equal-sized copies share one semaphore: each wait retires one copy.
+            return pltpu.make_async_copy(*((src, dst) if read else (dst, src)), sem)
+
+        def each(fn):
+            def body(i, c):
+                fn(i)
+                return c
+
+            jax.lax.fori_loop(0, scalars[0], body, 0)
+
+        def if_partial(fn):
+            def run(i):
+                @pl.when(partial(i))
+                def _():
+                    fn(i)
+
+            return run
+
+        def merge_row(i):
+            rows = jnp.broadcast_to(jnp.arange(2)[:, None], (2, width))
+            keep = jnp.where(rows == 0, vmask_ref[i, 0], vmask_ref[i, 1]) != 0
+            bf[i] = jnp.where(keep, values_ref[i], bf[i])
+
+        @pl.when(scalars[1] != 0)
+        def concurrent():
+            each(if_partial(lambda i: copy(i, True).start()))
+            each(if_partial(lambda i: copy(i, True).wait()))
+            each(merge_row)
+            each(lambda i: copy(i, False).start())
+            each(lambda i: copy(i, False).wait())
+
+        @pl.when(scalars[1] == 0)
+        def ordered():
+            def row(i):
+                @pl.when(partial(i))
+                def _():
+                    copy(i, True).start()
+                    copy(i, True).wait()
+
+                merge_row(i)
+                copy(i, False).start()
+                copy(i, False).wait()
+
+            each(row)
+
+    view = pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=3,
+            grid=(1,),
+            in_specs=[
+                pl.BlockSpec((n, 2), lambda i, *_: (0, 0)),
+                pl.BlockSpec((n, 2, width), lambda i, *_: (0, 0, 0)),
+                pl.BlockSpec(memory_space=pltpu.HBM),
+            ],
+            out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+            scratch_shapes=[
+                pltpu.VMEM((n, packing, width), pool.dtype),
+                pltpu.SemaphoreType.DMA,
+            ],
+        ),
+        out_shape=jax.ShapeDtypeStruct(view.shape, view.dtype),
+        input_output_aliases={5: 0},
+        name="qwen4_exp_compressed_kv_unique_pairs",
+    )(jnp.stack([count, unique.astype(jnp.int32)]), pair_c, mask_c, mask_c, values_c, view)
+    return view.reshape(pool.shape)
+
+
 def write_compressed(
     pool, keys, complete, req, logical, starts, context, table, ratio, slot=0, dcp=None
 ):

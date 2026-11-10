@@ -126,6 +126,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_DCP_SHARD_MERGE: bool = False
     VLLM_TPU_QSA_COMPRESSED_PAIR_SHIFT: bool = False
     VLLM_TPU_MK_STACKED_QSA_WRITES: bool = False
+    VLLM_TPU_MK_COMPRESSED_UNIQUE_WRITE: bool = False
     VLLM_TPU_HC_PREFILL_UP_T: bool = False
     VLLM_TPU_HC_PREFILL_COMBINE_MIX: bool = False
     VLLM_TPU_HC_PREFILL_WIDE_TILE: int = 0
@@ -857,6 +858,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # instead of one writer sequence per layer. Steps that are not a multiple of
     # 128 tokens only; same pool bytes.
     "VLLM_TPU_MK_STACKED_QSA_WRITES": env_bool("VLLM_TPU_MK_STACKED_QSA_WRITES"),
+    # With the stacked writes: the compressed keys of all layers go out in one
+    # kernel step with concurrent DMAs (`write_compressed_pairs_unique`) instead
+    # of one ordered grid step per row. Same pool bytes.
+    "VLLM_TPU_MK_COMPRESSED_UNIQUE_WRITE": env_bool("VLLM_TPU_MK_COMPRESSED_UNIQUE_WRITE"),
     # Prefill HC full mix: take the up projection as its [low rank, width]
     # transpose. The checkpoint weight is held column-major, so the transpose
     # is a bitcast and the per-call relayout copy before the kernel goes away

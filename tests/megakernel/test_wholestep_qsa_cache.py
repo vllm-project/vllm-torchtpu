@@ -256,8 +256,9 @@ ACCEPTED = [1, 4, 2, 0, 3, 1, 0, 4]
     [(False, False, False), (False, True, False), (True, False, False), (False, True, True)],
 )  # the fused writer keeps the per-layer sequence (batched is ignored there)
 @pytest.mark.parametrize("pad", [0, 4])
+@pytest.mark.parametrize("unique", [False, True])
 def test_wholestep_qsa_writes_match_stock_over_two_steps(
-    interpret, monkeypatch, fused, batched, stacked, pad
+    interpret, monkeypatch, fused, batched, stacked, pad, unique
 ):
     """`pad` idle requests past the kernel's request count (the runner's max_num_seqs
     rows):
@@ -265,7 +266,10 @@ def test_wholestep_qsa_writes_match_stock_over_two_steps(
     `stacked`: the layer-stacked writer (VLLM_TPU_MK_STACKED_QSA_WRITES); both paired
     layers name one main group."""
     monkeypatch.setattr(envs, "VLLM_TPU_QSA_FUSED_KV_WRITE", fused)
+    if unique and not stacked:
+        pytest.skip("the unique compressed writer runs under the stacked writes only")
     monkeypatch.setattr(envs, "VLLM_TPU_MK_STACKED_QSA_WRITES", stacked)
+    monkeypatch.setattr(envs, "VLLM_TPU_MK_COMPRESSED_UNIQUE_WRITE", unique)
     if stacked:
         monkeypatch.setattr(
             sys.modules[__name__],
