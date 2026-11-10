@@ -17,8 +17,6 @@ cross-turn Mamba boundary + partial-tail LRU retention."""
 from types import SimpleNamespace
 from typing import NamedTuple
 
-import pytest
-
 from vllm.v1.request import RequestStatus
 
 from vllm_torchtpu.core.hybrid_retention import HybridStateRetention, _ConvLRUEntry
@@ -112,14 +110,28 @@ POOL = None
 
 class FakeMambaManager:
     @classmethod
-    def find_longest_cache_hit(cls, block_hashes, max_length, kv_cache_group_ids,
-                               block_pool, kv_cache_spec, drop_eagle_block,
-                               alignment_tokens, dcp_world_size=1, pcp_world_size=1):
+    def find_longest_cache_hit(
+        cls,
+        block_hashes,
+        max_length,
+        kv_cache_group_ids,
+        block_pool,
+        kv_cache_spec,
+        drop_eagle_block,
+        alignment_tokens,
+        dcp_world_size=1,
+        pcp_world_size=1,
+    ):
         for fine_idx in range(min(max_length // HB, len(block_hashes)) - 1, -1, -1):
-            found = [block_pool.cached.get((block_hashes[fine_idx], g)) for g in kv_cache_group_ids]
+            found = [
+                block_pool.cached.get((block_hashes[fine_idx], g))
+                for g in kv_cache_group_ids
+            ]
             if all(found):
                 n = (fine_idx * HB) // BS
-                return tuple([block_pool.null] * n + [b] for b in found), (fine_idx + 1) * HB
+                return tuple([block_pool.null] * n + [b] for b in found), (
+                    fine_idx + 1
+                ) * HB
         return tuple([] for _ in kv_cache_group_ids), 0
 
 
@@ -136,12 +148,21 @@ def _setup(prompt=1000, osl=600, mamba=True, max_conversations=None, bs=BS):
     if mamba:
         groups.append(SpecGroup(MambaSpec(), [1], FakeMambaManager, False))
         managers.append(mamba_mgr)
-    coord = SimpleNamespace(attention_groups=groups, single_type_managers=managers,
-                            block_pool=pool, _cache_hit_alignment_tokens=HB)
+    coord = SimpleNamespace(
+        attention_groups=groups,
+        single_type_managers=managers,
+        block_pool=pool,
+        _cache_hit_alignment_tokens=HB,
+    )
     kvm = SimpleNamespace(coordinator=coord, enable_caching=True)
     total = prompt + osl
-    req = SimpleNamespace(request_id="r", num_prompt_tokens=prompt, num_tokens=total,
-                          num_computed_tokens=total, block_hashes=list(range(total // HB)))
+    req = SimpleNamespace(
+        request_id="r",
+        num_prompt_tokens=prompt,
+        num_tokens=total,
+        num_computed_tokens=total,
+        block_hashes=list(range(total // HB)),
+    )
     # Attention blocks: all full blocks hashed, owned by the request.
     attn = [Block(i, block_hash=("a", i)) for i in range(-(-total // bs))]
     for b in attn:
@@ -253,18 +274,21 @@ def test_dense_retention_demotes_nothing():
 
 
 def test_pins_both_full_boundary_and_partial_tail_blocks():
-    # BS=640, HB=128, prompt=800 -> full boundary at 640 (idx 4), partial tail at 768 (idx 5).
+    # BS=640, HB=128, prompt=800 -> full boundary at 640 (idx 4), partial tail at
+    # 768 (idx 5).
     r, pool, req, attn, partial_state, other = _setup(prompt=800, osl=200, bs=640)
     full_state = Block(99, block_hash=("s_full", 640 // HB - 1))
     pool.cached[(640 // HB - 1, 1)] = full_state
     pool.free_block_queue.q.insert(0, full_state)
 
-    # Suppose full_state is released at prefill end, while partial_state is held 1 step by CoW.
+    # Suppose full_state is released at prefill end, while partial_state is held 1
+    # step by CoW.
     pool.free_block_queue.q.remove(partial_state)
     partial_state.ref_cnt = 1
 
     r.pin_running([req])
-    # full_state is pinned immediately; req stays in _pending_partial waiting for partial_state.
+    # full_state is pinned immediately; req stays in _pending_partial waiting for
+    # partial_state.
     assert full_state.ref_cnt == 1 and full_state not in pool.free_block_queue.q
     assert "r" in r._pinned and "r" in r._pending_partial
 
@@ -285,7 +309,9 @@ def test_pins_both_full_boundary_and_partial_tail_blocks():
 
 
 def test_cross_turn_lru_replaces_old_turn_and_auto_evicts_on_get_new_blocks():
-    r, pool, req1, attn1, state1, other = _setup(prompt=1000, osl=600, max_conversations=2)
+    r, pool, req1, attn1, state1, other = _setup(
+        prompt=1000, osl=600, max_conversations=2
+    )
     req1.request_id = "convA_turn1"
     r.coordinator.single_type_managers[0].req_to_blocks["convA_turn1"] = attn1
 
@@ -295,7 +321,8 @@ def test_cross_turn_lru_replaces_old_turn_and_auto_evicts_on_get_new_blocks():
     r.on_request_freed(req1, snap1)
     assert state1.ref_cnt == 1 and len(r._conv_lru) == 1
 
-    # Turn 2 of convA finishes at a deeper boundary: state1 is unpinned, state2 is retained.
+    # Turn 2 of convA finishes at a deeper boundary: state1 is unpinned, state2 is
+    # retained.
     prompt2, total2 = 2000, 2400
     req2 = SimpleNamespace(
         request_id="convA_turn2",
@@ -312,7 +339,8 @@ def test_cross_turn_lru_replaces_old_turn_and_auto_evicts_on_get_new_blocks():
     assert state1.ref_cnt == 0 and state1 in pool.free_block_queue.q
     assert state2.ref_cnt == 1 and len(r._conv_lru) == 1
 
-    # Allocating all blocks in the pool (+1 for state2) automatically evicts state2 from _conv_lru.
+    # Allocating all blocks in the pool (+1 for state2) automatically evicts
+    # state2 from _conv_lru.
     total_available_with_lru = pool.get_num_free_blocks() + 1
     allocated = pool.get_new_blocks(total_available_with_lru)
     assert len(allocated) == total_available_with_lru
@@ -321,7 +349,8 @@ def test_cross_turn_lru_replaces_old_turn_and_auto_evicts_on_get_new_blocks():
 
 
 def test_safe_prompt_tail_offset_handles_qwen_think_4_token_overwrite():
-    # prompt=3201 (3201 % 640 == 1 < 4): eff_prompt=3197 -> full=2560, fine=3072, pre_full=1920.
+    # prompt=3201 (3201 % 640 == 1 < 4): eff_prompt=3197 -> full=2560, fine=3072,
+    # pre_full=1920.
     r, pool, req, attn, _, _ = _setup(prompt=3201, osl=200, bs=640)
     req.shared_prefix_boundary = 0
     pre_state = Block(301, block_hash=("s_pre", 1920 // HB - 1))
@@ -412,7 +441,8 @@ def test_compact_prior_turn_retains_full_block_and_frees_partial_tail():
     assert r.num_pinned_blocks() == 2
 
     # Turn 2 of convB finishes at 1440 (full2=1280, partial2=1408):
-    # Turn 1 is compacted in-place -> partial1 is freed (ref_cnt=0), full1 stays pinned (ref_cnt=1).
+    # Turn 1 is compacted in-place -> partial1 is freed (ref_cnt=0), full1 stays
+    # pinned (ref_cnt=1).
     prm2, tot2 = 1440, 1640
     req2 = SimpleNamespace(
         request_id="convB_turn2",
@@ -476,7 +506,8 @@ def test_mamba_manager_cache_partial_tail_hook_with_safe_tail_offset():
     kvm = SimpleNamespace(coordinator=coord, enable_caching=True)
     r = HybridStateRetention(kvm)
 
-    # prompt=2817 (2817 % 128 == 1 < 4) -> safe fine boundary is 2688, tainted boundary is 2816.
+    # prompt=2817 (2817 % 128 == 1 < 4) -> safe fine boundary is 2688, tainted
+    # boundary is 2816.
     req = SimpleNamespace(
         request_id="r_safe",
         num_prompt_tokens=2817,
@@ -489,8 +520,6 @@ def test_mamba_manager_cache_partial_tail_hook_with_safe_tail_offset():
     assert r._tracked_blocks["r_safe"][(1, 2688)] == (partial_blk, 2688)
     # Tainted 2816 boundary is ignored and does not overwrite 2688.
     assert mamba_mgr._cache_partial_tail_block(req, 2816) is None
-
-
 
 
 # ---------------------------------------------------------------- v20: fork
@@ -541,8 +570,9 @@ def _decisions_and_keys(rids):
     out.append(r._is_fork_candidate(root, 0))
     r.prepare_prefill_split(root, 0, 6500)
     out.append(root.shared_prefix_boundary)
-    _finish(r, pool, root, {o: Block(next(bid), block_hash=("s", o))
-                            for o in (5760, 6400)})
+    _finish(
+        r, pool, root, {o: Block(next(bid), block_hash=("s", o)) for o in (5760, 6400)}
+    )
 
     cont = _req(rids[1], 8000)  # same prefix as root, more tokens
     out.append(r._is_fork_candidate(cont, 6400))
@@ -553,8 +583,7 @@ def _decisions_and_keys(rids):
     out.append(r._is_fork_candidate(inner, 3840))
     for q, stops in ((cont, (7680, 7936)), (sib, (8960,))):
         out.append(r.prefill_checkpoint_stops(q, 6400))
-        _finish(r, pool, q, {o: Block(next(bid), block_hash=("s", o))
-                             for o in stops})
+        _finish(r, pool, q, {o: Block(next(bid), block_hash=("s", o)) for o in stops})
     return out, list(r._fork_lru.keys()), list(r._conv_lru.keys())
 
 
@@ -584,9 +613,7 @@ def test_fork_decisions_and_keys_independent_of_request_id_format():
     # Fork anchors are keyed by block hash: root's pre_full 5760 (idx 44)
     # and root's tail 6400 (idx 49), promoted from the conversation LRU once
     # it fell beyond keep_prior.
-    assert fork_keys == [
-        ("fork_hash", 44, 44), ("fork_hash", 49, 49)
-    ]
+    assert fork_keys == [("fork_hash", 44, 44), ("fork_hash", 49, 49)]
 
 
 def test_fork_decision_is_taken_at_first_chunk_and_dropped_at_finish():
@@ -776,3 +803,47 @@ def test_retention_guard_counts_async_admission_and_running_refusals():
     assert ret.step_waiting_none == []
 
 
+def test_retention_is_for_a_kv_producer():
+    from vllm_torchtpu.core.hybrid_retention import retention_wanted
+
+    def cfg(role):
+        kv = None if role is None else SimpleNamespace(kv_role=role)
+        return SimpleNamespace(kv_transfer_config=kv)
+
+    assert retention_wanted(cfg("kv_producer"))
+    assert not retention_wanted(cfg("kv_consumer"))
+    assert not retention_wanted(cfg("kv_both"))
+    assert not retention_wanted(cfg(None))
+
+
+def test_default_bounds_are_the_values_the_points_ran():
+    ret = HybridStateRetention(SimpleNamespace(enable_caching=False, coordinator=None))
+    assert (ret.max_conversations, ret.max_pinned_blocks) == (96, 360)
+    assert (ret.smart_fork, ret.safe_tail_offset) == (True, 4)
+    assert ret._get_keep_prior_turns() == 1
+    assert not ret.enabled
+
+
+def test_partial_tail_hook_passes_vllm_arguments_through():
+    """vLLM 0.33's MambaManager._cache_partial_tail_block takes the retention
+    interval as a third argument; the retention hook must pass it on."""
+    kvm = _GuardKVM(free=100, need=1)
+    seen = []
+
+    def cache_partial(request, num_tokens, retention_interval):
+        seen.append((num_tokens, retention_interval))
+
+    kvm.mamba_mgr._cache_partial_tail_block = cache_partial
+    ret = HybridStateRetention(kvm)
+    assert ret.enabled
+    req = SimpleNamespace(request_id="r", num_prompt_tokens=1000)
+    kvm.mamba_mgr._cache_partial_tail_block(req, 896, 0)
+    assert seen == [(896, 0)]
+
+
+def test_compacted_prior_turn_is_evicted_before_the_oldest_conversation():
+    kvm, ret = _guarded(free=100, need=1, n_convs=2)
+    newer = ("c", 1)
+    ret._conv_lru[newer] = ret._conv_lru[newer]._replace(is_prior=True)
+    assert ret.evict_oldest_conversation()
+    assert list(ret._conv_lru) == [("c", 0)]

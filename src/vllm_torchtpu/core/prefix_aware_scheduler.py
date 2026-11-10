@@ -59,6 +59,7 @@ from vllm.v1.core.sched.request_queue import (
 from vllm.v1.request import Request, RequestStatus
 
 from vllm_torchtpu.core import prefix_change_log, scheduler_options
+from vllm_torchtpu.core.hybrid_retention import format_counts, is_waiting_status
 from vllm_torchtpu.core.packed_ids import pack_new_request_prompt_ids
 
 if TYPE_CHECKING:
@@ -141,20 +142,6 @@ def trim_resend_token_ids(cached_reqs) -> int:
         saved += len(toks) - len(trimmed)
         all_ids[req_id] = trimmed
     return saved
-
-
-_WAITING_STATUS_NAMES = frozenset(("WAITING", "PREEMPTED"))
-
-
-def is_waiting_status(request: Request) -> bool:
-    """Returns whether ``request`` sits in the waiting queue (WAITING or PREEMPTED)."""
-    status = getattr(request, "status", None)
-    return getattr(status, "name", None) in _WAITING_STATUS_NAMES
-
-
-def format_counts(counts: dict[str, int]) -> str:
-    """Formats a reason -> count map as ``a:1,b:2`` for a telemetry field."""
-    return ",".join(f"{k}:{v}" for k, v in counts.items()) or "-"
 
 
 class PrefixAwareScheduler(AsyncScheduler):
