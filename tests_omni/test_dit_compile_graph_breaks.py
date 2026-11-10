@@ -248,7 +248,7 @@ def tiny_wan_block(monkeypatch):
     # The Pallas ops, as built eagerly before the first compiled forward.
     monkeypatch.setattr(patches, "_optimization_barrier", _optimization_barrier)
     monkeypatch.setattr(omni_rope, "_qk_norm_rope", _wan_qk_norm_rope)
-    monkeypatch.setattr(omni_attention, "_flash_attention_op", lambda: _flash_attention)
+    monkeypatch.setattr(omni_attention, "_flash_attention", _flash_attention)
     patches._patch_wan_pair_swap_rope()
     patches._patch_wan_ffn_gelu_fence()
     patches._patch_wan_fused_qk_norm_rope()
@@ -317,20 +317,45 @@ def test_tiny_wan_block_does_not_recompile_across_steps(tiny_wan_block):
 
 def test_op_accessors_are_not_functools_caches():
     # Dynamo ignores functools.cache wrappers and re-traces the op builder
-    # (pallas.jax_op) inside the compiled forward, which breaks the graph.
+    # (pallas.jax_op) or tensor factory inside the compiled forward.
     assert not hasattr(patches._optimization_barrier_op, "cache_info")
     assert not hasattr(omni_rope._qk_norm_rope_op, "cache_info")
+    assert not hasattr(omni_attention._flash_attention_op, "cache_info")
+    assert not hasattr(omni_rope._pair_swap_matrix, "cache_info")
+    assert not hasattr(omni_rope._first_half_lanes, "cache_info")
 
 
 def test_op_accessors_build_once(monkeypatch):
     built = []
     monkeypatch.setattr(omni_rope, "_qk_norm_rope", None)
     monkeypatch.setattr(
-        omni_rope, "_build_qk_norm_rope_op", lambda: built.append(1) or "op"
+        omni_rope, "_build_qk_norm_rope_op", lambda: built.append("rope") or "rope_op"
     )
-    assert omni_rope._qk_norm_rope_op() == "op"
-    assert omni_rope._qk_norm_rope_op() == "op"
-    assert built == [1]
+    assert omni_rope._qk_norm_rope_op() == "rope_op"
+    assert omni_rope._qk_norm_rope_op() == "rope_op"
+
+    monkeypatch.setattr(omni_attention, "_flash_attention", None)
+    monkeypatch.setattr(
+        omni_attention,
+        "_build_flash_attention_op",
+        lambda: built.append("flash") or "flash_op",
+    )
+    assert omni_attention._flash_attention_op() == "flash_op"
+    assert omni_attention._flash_attention_op() == "flash_op"
+    assert built == ["rope", "flash"]
+
+    eager_built = []
+    monkeypatch.setattr(
+        patches, "_optimization_barrier_op", lambda: eager_built.append("barrier")
+    )
+    monkeypatch.setattr(
+        omni_rope, "_qk_norm_rope_op", lambda: eager_built.append("rope")
+    )
+    monkeypatch.setattr(
+        omni_attention, "_flash_attention_op", lambda: eager_built.append("flash")
+    )
+    patches._build_dit_ops_eagerly()
+    assert eager_built == ["barrier", "rope", "flash"]
 
 
 def test_tiny_flux_tp_single_block_traces_as_one_graph(tiny_wan_block):

@@ -234,9 +234,10 @@ def _register_tpu_dynamo_backend() -> None:
 def _build_dit_ops_eagerly() -> None:
     # Build the Pallas custom ops the DiT patches call before the first
     # compiled forward: building one while Dynamo traces is a graph break.
+    from vllm_torchtpu.omni.attention import _flash_attention_op
     from vllm_torchtpu.omni.rope import _qk_norm_rope_op
 
-    for build in (_optimization_barrier_op, _qk_norm_rope_op):
+    for build in (_optimization_barrier_op, _qk_norm_rope_op, _flash_attention_op):
         try:
             build()
         except Exception as e:

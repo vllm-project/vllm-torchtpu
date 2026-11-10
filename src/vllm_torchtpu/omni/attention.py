@@ -19,7 +19,6 @@ sequence lengths. Masked, causal, or non-bf16 calls fall back with a
 one-time warning to ``TpuSDPAImpl`` (PyTorch SDPA).
 """
 
-from functools import cache as run_once
 from typing import Any
 
 import jax
@@ -60,10 +59,23 @@ class TpuSDPABackend(SDPABackend):
         return TpuSDPAImpl
 
 
-@run_once
-def _flash_attention_op():
-    """Builds the torch custom op wrapping the Pallas kernel (once, eagerly)."""
+_flash_attention: Any = None
 
+
+def _flash_attention_op():
+    """Builds the torch custom op wrapping the Pallas kernel (once).
+
+    Not functools.cache: Dynamo ignores that wrapper and re-traces the op
+    builder inside compiled DiT forwards (a graph break). After the first
+    eager call, Dynamo reads the built op from this global.
+    """
+    global _flash_attention
+    if _flash_attention is None:
+        _flash_attention = _build_flash_attention_op()
+    return _flash_attention
+
+
+def _build_flash_attention_op():
     def diffusion_flash_attention(
         q: jax.Array, k: jax.Array, v: jax.Array, scale: float
     ) -> jax.Array:
