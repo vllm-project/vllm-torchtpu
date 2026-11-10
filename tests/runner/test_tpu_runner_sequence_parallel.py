@@ -87,9 +87,24 @@ def test_a_sliced_step_masks_this_ranks_slice(sp_on, monkeypatch, tp_rank, rank_
         vllm.distributed, "get_tensor_model_parallel_rank", lambda: tp_rank
     )
     runner = _padding_runner(tp=4)
-    TPUModelRunner._token_padding_update(runner, 512, num_valid_tokens=300)
+    TPUModelRunner._token_padding_update(
+        runner, 512, num_valid_tokens=300, rows_sliced=True
+    )
     assert _mask(runner, 128) == [i >= rank_valid for i in range(128)]
     assert runner._token_padding_state.get_local_valid_tokens().item() == rank_valid
+
+
+def test_an_sp_step_writes_the_full_mask_until_a_model_follows_the_form(
+    sp_on, monkeypatch
+):
+    """No model follows each step's form yet, so a sequence-parallel step of
+    512 rows (at the 512-row threshold) still gets main's full mask: a path
+    that reads every row must not see other ranks' real rows as padding."""
+    monkeypatch.setattr(vllm.distributed, "get_tensor_model_parallel_rank", lambda: 2)
+    runner = _padding_runner(tp=4)
+    TPUModelRunner._token_padding_update(runner, 512, num_valid_tokens=300)
+    assert _mask(runner, 512) == [i >= 300 for i in range(512)]
+    assert runner._token_padding_state.get_local_valid_tokens().item() == 300
 
 
 def test_a_replicated_step_masks_every_row(sp_on, monkeypatch):
