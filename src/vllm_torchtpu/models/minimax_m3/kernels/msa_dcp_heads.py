@@ -33,6 +33,8 @@ the ranks' candidates) over the same 4-bit pages; the head-parallel one
 normalizes in one pass instead of merging bf16 partials.
 """
 
+import functools
+
 import jax
 import jax.numpy as jnp
 
@@ -246,41 +248,41 @@ def _head_parallel_attend(
         lo = cu[jnp.min(jnp.where(in_round, seq_idx, max_num_seqs - 1))]
         hi = cu[jnp.max(jnp.where(in_round, seq_idx + 1, 0))]
 
+        attend = functools.partial(
+            msa_attention_lse.msa_sparse_attention_lse,
+            sm_scale=sm_scale,
+            block_q=msa_attention.DEFAULT_BLOCK_Q,
+            pages_per_step=msa_attention.DEFAULT_PAGES_PER_STEP,
+            head=0,
+            scale_cache=sc,
+            k_scale_row=0,
+            v_scale_row=1,
+            head_major=True,
+            interpret=interpret,
+        )
+        if not merge:
+            # One call over every row: the kernel chunks the rows and writes
+            # its output in place; rows outside the round see no page and
+            # come back zero (cheap empty tiles).
+            out, _ = attend(q, kv, keys, local, limit, page_table)
+            return nxt, out
+
         def window_body(i, acc):
             start = jnp.minimum(lo + i * window, num_tokens - window)
 
             def sl(x):
                 return jax.lax.dynamic_slice_in_dim(x, start, window, 0)
 
-            out, _ = msa_attention_lse.msa_sparse_attention_lse(
-                sl(q),
-                kv,
-                sl(keys),
-                sl(local),
-                sl(limit),
-                page_table,
-                sm_scale=sm_scale,
-                block_q=msa_attention.DEFAULT_BLOCK_Q,
-                pages_per_step=msa_attention.DEFAULT_PAGES_PER_STEP,
-                head=0,
-                scale_cache=sc,
-                k_scale_row=0,
-                v_scale_row=1,
-                head_major=True,
-                interpret=interpret,
-            )
-            if merge:  # keep earlier rounds' rows
-                old = jax.lax.dynamic_slice_in_dim(acc, start, window, 1)
-                out = jnp.where(sl(mine)[None, :, None], out, old)
-            # Rows outside the round come back zero (no selected page).
+            out, _ = attend(sl(q), kv, sl(keys), sl(local), sl(limit), page_table)
+            old = jax.lax.dynamic_slice_in_dim(acc, start, window, 1)
+            out = jnp.where(sl(mine)[None, :, None], out, old)  # earlier rounds
             return jax.lax.dynamic_update_slice_in_dim(acc, out, start, 1)
 
         acc = jax.lax.fori_loop(0, -(-(hi - lo) // window), window_body, acc)
         return nxt, acc
 
-    acc = jnp.zeros((num_q_heads, num_tokens, head_dim), q.dtype)
     first = jnp.min(jnp.where(hp_req, seq_idx, max_num_seqs))
-    first, acc = attend_round(first, acc, merge=False)
+    first, acc = attend_round(first, None, merge=False)
 
     # Further rounds sit under a cond: a while loop that reads the cache
     # makes XLA copy the whole cache ahead of it (0.45 ms per layer at c64).
