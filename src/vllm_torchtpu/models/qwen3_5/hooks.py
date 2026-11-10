@@ -23,8 +23,10 @@ unset, so an explicit command-line value always wins. It also refuses a
 ``qwen3_5`` or ``tpu_*`` section of ``additional_config`` that no reader in
 this build claims (``additional_config_sections``).
 
-- ``kv_cache_memory_bytes``: a shape-calibrated budget, except on a
-  ``kv_producer`` (prefill) leg, which stays on ``gpu_memory_utilization``.
+- ``kv_cache_memory_bytes``: a calibrated budget, only for the checkpoint
+  shape and device it was measured on (Qwen3.5-397B-A17B on TPU7x) and not on
+  a ``kv_producer`` (prefill) leg. Every other engine stays on
+  ``gpu_memory_utilization``, as on main.
 - ``prefix_match_unit``: 128 tokens on a ``kv_producer`` leg.
 """
 
@@ -47,6 +49,37 @@ logger = init_logger(__name__)
 # Baseline expert-slot count per EP rank (64 primary + 16 replicated slots)
 # used as the reference point when computing per-rank HBM KV capacity credit.
 _QWEN35_SAFE_KV_SLOTS = 80
+
+# The budget was measured for this checkpoint shape (Qwen3.5-397B-A17B's text
+# config) on TPU7x devices, the per-device HBM the IX record jobs ran on.
+_CALIBRATED_SHAPE = {"num_experts": 512, "hidden_size": 4096, "num_hidden_layers": 60}
+_CALIBRATED_CHIP = "7x"
+
+
+def _chip_family() -> str | None:
+    """The TPU chip family from the accelerator type ("7x" for tpu7x-8), or
+    None when it cannot be read. Never claims the chips."""
+    try:
+        from vllm_torchtpu import tpu_info
+
+        accelerator_type = tpu_info.get_tpu_type()
+    except Exception:  # noqa: BLE001 - an unknown device is not calibrated
+        return None
+    if not accelerator_type:
+        return None
+    name = accelerator_type.strip().lower().split("-")[0].removeprefix("tpu")
+    return {"v7x": "7x"}.get(name, name)
+
+
+def _is_calibrated(model_config) -> bool:
+    """Whether the KV budget below was measured for this engine: the
+    calibrated checkpoint shape on a TPU7x device. Any other shape, a smaller
+    device or an unknown device keeps main's ``gpu_memory_utilization``."""
+    text = getattr(model_config, "hf_text_config", None)
+    for key, value in _CALIBRATED_SHAPE.items():
+        if getattr(text, key, None) != value:
+            return False
+    return _chip_family() == _CALIBRATED_CHIP
 
 
 def _expert_slots_and_layers(model_config, parallel_config) -> tuple[int, int]:
@@ -117,6 +150,13 @@ def _apply_kv_budget(vllm_config: VllmConfig) -> None:
             "leg (requested %s; mixed-engine auto would be %d).",
             requested,
             safe_kv,
+        )
+        keep = True
+    elif not keep and not _is_calibrated(vllm_config.model_config):
+        logger.info(
+            "Qwen3.5 kv_cache_memory_bytes left to gpu_memory_utilization: the "
+            "calibrated budget is for Qwen3.5-397B-A17B on TPU7x (chip %s).",
+            _chip_family(),
         )
         keep = True
     elif keep or requested != safe_kv:
