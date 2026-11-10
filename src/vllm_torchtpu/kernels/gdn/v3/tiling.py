@@ -351,7 +351,9 @@ def get_tile_sizes(
         )
         mixed_tile_size = vmem_fit
 
-    # Guarantee strictly positive tile sizes (>= 1) for Pallas grid compilation.
-    decode_tile_size = max(1, min(decode_tile_size, padded_batch_size))
+    # Guarantee strictly positive tile sizes (>= 1) for Pallas grid compilation,
+    # and cap decode_tile_size to active_num_seqs so a mixed batch with many
+    # tokens but few sequence slots never sizes a decode tile past num_seqs.
+    decode_tile_size = max(1, min(decode_tile_size, active_num_seqs))
     mixed_tile_size = max(1, min(mixed_tile_size, batch_size))
     return decode_tile_size, mixed_tile_size
