@@ -1,0 +1,54 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# Accuracy gate, DP4 x TP2 decode (the layout of point #1), one prefill and one
+# decode replica. See README.md in this directory.
+name: gate-dp4tp2-1p1d
+purpose: >-
+  Accuracy of the main-based stack at the DP4 x TP2 decode layout, and the
+  cost of the Qwen3.5 FP8 trade-off settings, measured as an on/off pair.
+  The submission tree's own gate at this layout showed a real acceptance
+  length 2.9% below the previous candidate's, cause not isolated.
+base_point: 1
+chips: 8
+legs:
+  prefill:
+    replicas: 1
+    from: "the prefill leg of base_point"
+  decode:
+    replicas: 1
+    from: "the decode leg of base_point"
+    serve_args_override:
+      # Real rejection sampling: drop the point's synthetic acceptance length.
+      "--speculative-config": "{\"method\":\"mtp\",\"num_speculative_tokens\":3}"
+decode_megakernel: "off"
+arms:
+  # The changes that add the FP8 trade-off settings add them to tradeoffs_on.
+  tradeoffs_off:
+    additional_config: {}
+  tradeoffs_on:
+    additional_config: {}
+suite:
+  gsm8k: {samples: 1319, chat_template_kwargs: {enable_thinking: true}, metric: strict-match}
+  longbench: {}
+  mtp_acceptance_length: real
+  logprob_drift:
+    against: tradeoffs_off
+    prompts: fixed greedy prompt set
+    report: [mean_abs_delta_logprob, max_abs_delta_logprob, top1_agreement]
+noise:
+  gsm8k_1319_samples: "+-0.42%"
+references:
+  - {job: j-47daeba0, tree: f0e45f677, layout: "DP4 x TP2, submission tree", gsm8k: "97.73%", real_acceptance_length: 3.2528}
+  - {job: j-e4fb560f, tree: infx-qwen35-agentx-disagg-candidate3, layout: "DP4 x TP2", gsm8k: "97.50%", real_acceptance_length: 3.3498}
+  - {job: j-09687ab0, tree: dp4tp2 frozen, layout: "DP4 x TP2", gsm8k: "97.80%", longbench_job: j-180bd829, longbench: "65.41%"}
