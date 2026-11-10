@@ -132,6 +132,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MK_STACKED_QSA_WRITES: bool = False
     VLLM_TPU_MK_COMPRESSED_UNIQUE_WRITE: bool = False
     VLLM_TPU_MK_HC_FP8: bool = False
+    VLLM_TPU_MK_WHOLE_L47: bool = False
     VLLM_TPU_HC_PREFILL_UP_T: bool = False
     VLLM_TPU_HC_PREFILL_COMBINE_MIX: bool = False
     VLLM_TPU_HC_PREFILL_WIDE_TILE: int = 0
@@ -889,6 +890,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the mixer and the MoE) stream as FP8 E4M3 with per-output-column scales. The
     # draft (MTP) and the layers outside the whole-step kernel keep BF16 HC.
     "VLLM_TPU_MK_HC_FP8": env_bool("VLLM_TPU_MK_HC_FP8"),
+    # Whole-step megakernel: also run the last QSA layer (model layer 47) in the whole-step
+    # call, as a one-layer kernel after layers 3..46, its step tokens written with theirs;
+    # the stock L47 attention core and last segment kernel are skipped.
+    "VLLM_TPU_MK_WHOLE_L47": env_bool("VLLM_TPU_MK_WHOLE_L47"),
     # Prefill HC full mix: take the up projection as its [low rank, width]
     # transpose. The checkpoint weight is held column-major, so the transpose
     # is a bitcast and the per-call relayout copy before the kernel goes away

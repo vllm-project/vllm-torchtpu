@@ -1668,12 +1668,15 @@ class Qwen38SegmentDriver:
                     segments=self.segments,
                     whole=whole,
                 )
-            if self.wholecheck_left > 0:
+            if self.wholecheck_left > 0 and whole.tail:
+                logger.warning("Qwen3.8 whole-step: wholecheck skipped with VLLM_TPU_MK_WHOLE_L47")
+            elif self.wholecheck_left > 0:
                 self._attach_whole_shadow(runner, whole)
             logger.info(
-                "Qwen3.8 whole-step megakernel attached: layers 3..46, context cap "
+                "Qwen3.8 whole-step megakernel attached: layers 3..%d, context cap "
                 "%d, rows <= %d, "
                 "budget %d, max_groups %d, %d operands, hold %s",
+                47 if whole.tail else 46,
                 self.whole_cap,
                 self.whole_max_rows,
                 budget,
