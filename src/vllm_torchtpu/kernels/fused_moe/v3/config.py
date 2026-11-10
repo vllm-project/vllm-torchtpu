@@ -176,6 +176,9 @@ class Config:
         reads the gathered rows without copying the real prefix out.
         The same per-token sum, so the output is bit-identical; it pays
         off when a shard has far fewer tokens than the message holds.
+      sort_index_compare: the sorted-rows gather's live-row mask as one
+        compare of every row against the (expert, shard) runs, instead
+        of two scatter-adds and a running sum. The same mask.
     """
 
     result_slots: int = RESULT_SLOTS_DEFAULT
@@ -202,6 +205,7 @@ class Config:
     weight_dma_priority: int = WEIGHT_DMA_PRIORITY_DEFAULT
     sorted_rows: bool | None = None
     combine_real_tokens: bool = False
+    sort_index_compare: bool = False
 
     @property
     def token_rows_block(self):
