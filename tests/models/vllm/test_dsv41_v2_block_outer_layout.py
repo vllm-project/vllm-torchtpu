@@ -225,3 +225,36 @@ def test_compressor_admission_uses_the_layer_layout(monkeypatch):
     assert not preprocess_ops.compressor_layout_admitted(
         "compressor_addresses", None, **LAYER_8_GEOMETRY
     )
+
+
+@pytest.mark.parametrize(
+    "impl,user_block,expected,warns",
+    [
+        ("v2", None, 256, False),
+        ("v1", None, 16, False),
+        ("v2", 256, 256, False),
+        ("v2", 64, 64, True),
+        ("v1", 64, 64, False),
+    ],
+)
+def test_v41_block_size_default(monkeypatch, caplog, impl, user_block, expected, warns):
+    """v2 defaults its compressed caches to 256-token blocks and warns below."""
+    pytest.importorskip("torch_tpu")
+    import vllm_torchtpu.platforms.tpu_platform as tpu_platform
+
+    monkeypatch.setattr(
+        tpu_platform, "envs", SimpleNamespace(TPU_DEEPSEEK_V41_IMPL=impl)
+    )
+    cache_config = SimpleNamespace(
+        block_size=user_block or 16, user_specified_block_size=user_block is not None
+    )
+    vllm_config = SimpleNamespace(
+        cache_config=cache_config,
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["DeepseekV41ForCausalLM"])
+        ),
+    )
+    with caplog.at_level("WARNING"):
+        tpu_platform.TpuPlatform.update_block_size_for_backend(vllm_config)
+    assert cache_config.block_size == expected
+    assert ("no block-outer packing" in caplog.text) is warns
