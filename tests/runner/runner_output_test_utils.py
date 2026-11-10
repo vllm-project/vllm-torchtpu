@@ -53,6 +53,7 @@ def _sample_tokens_runner(logits_list, num_reqs_list, **overrides):
             mamba_boundary_plans=None,
             pooler_output_list=[],
             top_tokens=False,
+            topk_candidates_packed=False,
             kv_save_nan_check=None,
             prompt_logprobs_chunks=[],
         ),
