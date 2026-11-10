@@ -4112,6 +4112,9 @@ class TPUModelRunner(GPUModelRunner):
         if (
             len(next_tokens_per_chunk) == 1
             and drafts is getattr(drafter, "_last_propose_device_out", None)
+            # The general path below counts a draft trimmed by adaptive
+            # verification as rejected; these programs do not.
+            and getattr(self, "_adaptive_verification", None) is None
             and padded_drafts is not None
             and len(padded_drafts) == 1
             and getattr(self, "max_num_reqs", None) is not None
@@ -4175,6 +4178,9 @@ class TPUModelRunner(GPUModelRunner):
         if (
             len(next_tokens_per_chunk) == 2
             and drafts is getattr(drafter, "_last_propose_device_out", None)
+            # The general path below counts a draft trimmed by adaptive
+            # verification as rejected; these programs do not.
+            and getattr(self, "_adaptive_verification", None) is None
             and padded_drafts is not None
             and len(padded_drafts) == 2
             and getattr(self, "max_num_reqs", None) is not None
