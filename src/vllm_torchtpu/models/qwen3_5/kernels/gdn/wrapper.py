@@ -94,26 +94,13 @@ def inner_kernel(
     if p_id is None:
         p_id = pl.program_id(0)
 
-    # Prepare states.
-    real_sizes, prev_conv, prev_recurrent = vmem_ldst.load_and_select_states(
-        metadata_ref=metadata_ref,
-        p_id=p_id,
-        conv_state_in_slot_ref=conv_state_in_slot_ref,
-        recurrent_in_slot_ref=recurrent_in_slot_ref,
-        carry_conv_scratch_ref=carry_conv_scratch_ref,
-        carry_recurrent_scratch_ref=carry_recurrent_scratch_ref,
-        cfg=cfg,
-    )
-
-    # Step 1: Conv1D.
-    # NOTE: Conv1D requires performing sliding window where inputs are slided
-    # across rows. If typical 2D layout was used, multiple rows are stored in a
-    # single register which necessitate costly shuffling for every sliding.
-    # Therefore, it is extremely important to leverage compact layout that
-    # ensures 1 register only stores data from 1 row.
+    # 2D bf16 qkv: shift each sequence's rows out of their 16-row aligned DMA
+    # window into the f32 scratch. This runs before load_and_select_states so
+    # the unpack's bf16 load and f32 cast are dead before the selected states
+    # become live. Ordered after it, the unpack temporaries add to the VMEM
+    # peak: 4.0 MiB more for the per_seq b1 c64 kernel at dim 12288 on TPU7x.
+    qkv_work_ref = qkv_slot_ref
     if qkv_slot_ref.ndim == 3:
-        # 2D bf16 qkv: shift each sequence's rows out of their 16-row aligned
-        # DMA window into the f32 scratch.
         assert act_scratch_ref is not None
         aligned_chunk = pl.cdiv(cfg.chunk_size, 16) * 16
         for idx in range(cfg.seq_tile_size):
@@ -134,10 +121,28 @@ def inner_kernel(
             if aligned_chunk == cfg.chunk_size
             else act_scratch_ref.at[:, : cfg.chunk_size]
         )
+
+    # Prepare states.
+    real_sizes, prev_conv, prev_recurrent = vmem_ldst.load_and_select_states(
+        metadata_ref=metadata_ref,
+        p_id=p_id,
+        conv_state_in_slot_ref=conv_state_in_slot_ref,
+        recurrent_in_slot_ref=recurrent_in_slot_ref,
+        carry_conv_scratch_ref=carry_conv_scratch_ref,
+        carry_recurrent_scratch_ref=carry_recurrent_scratch_ref,
+        cfg=cfg,
+    )
+
+    # Step 1: Conv1D.
+    # NOTE: Conv1D requires performing sliding window where inputs are slided
+    # across rows. If typical 2D layout was used, multiple rows are stored in a
+    # single register which necessitate costly shuffling for every sliding.
+    # Therefore, it is extremely important to leverage compact layout that
+    # ensures 1 register only stores data from 1 row.
+    if qkv_slot_ref.ndim == 3:
         qkv_in_compact = qkv_work_ref[...]
     else:
         qkv_in_compact = qkv_slot_ref[...].astype(jnp.float32)
-        qkv_work_ref = qkv_slot_ref
     qkv_in_compact = jnp.concat([prev_conv, qkv_in_compact], axis=1)
 
     # Prepare conv1d weights.
@@ -698,7 +703,16 @@ def fused_conv1d_gdn(
             decode_vmem_limit_bytes=decode_vmem_limit_bytes,
             mixed_vmem_limit_bytes=config.GDNConfig.get_vmem_limit_bytes(),
             window_size=window_size,
+            qkv_2d=qkv_2d,
         )
+        if qkv_2d and mixed_tile_size % 8:
+            # The bf16 qkv layout runs only on multiple-of-8 chunks, and the
+            # VMEM fit can cap the chunk below the one checked above.
+            # padded_batch_size stays a multiple of 16, which f32 rows accept.
+            bf16_qkv_mode = 0
+            qkv_2d = False
+            qkv = qkv.astype(kernel_act_dtype)
+            act_in_dtype = qkv.dtype
         logger.info_once(
             "GDN dynamic tiling: num_seqs=%d batch=%d window=%d -> T=%d C=%d",
             num_seqs,
