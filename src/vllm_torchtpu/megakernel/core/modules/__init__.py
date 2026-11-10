@@ -15,13 +15,15 @@
 
 from __future__ import annotations
 
-from .moe import MoEDebug, MoEParams
+from .moe import MoE, MoEDebug, MoEModule, MoEParams
 from .norm import Embedding, EmbeddingModule, Norm, NormModule
 
 __all__ = [
     "Embedding",
     "EmbeddingModule",
+    "MoE",
     "MoEDebug",
+    "MoEModule",
     "MoEParams",
     "Norm",
     "NormModule",
