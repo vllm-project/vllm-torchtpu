@@ -130,7 +130,9 @@ legs:
       USE_MOE_SPARSE_CORE: "1"
       VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP: "1"
       VLLM_XLA_CHECK_RECOMPILATION: "0"
-    additional_config: {}
+    additional_config:
+      tpu_runner:
+        stage_timing: false
   decode:
     replicas: 5
     chips_per_replica: 4
@@ -234,4 +236,6 @@ legs:
       USE_MOE_SPARSE_CORE: "1"
       VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP: "1"
       VLLM_XLA_CHECK_RECOMPILATION: "0"
-    additional_config: {}
+    additional_config:
+      tpu_runner:
+        stage_timing: false
