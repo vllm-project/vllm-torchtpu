@@ -82,19 +82,20 @@ def test_import_without_frameworks(module: str, blocked: tuple[str, ...]) -> Non
 
 
 def test_bucket_list_parsing_and_selection() -> None:
-    assert parse_mk_buckets("8, 32, 8, 16") == (8, 16, 32)
+    assert parse_mk_buckets("8, 32, 16") == (8, 16, 32)
     assert parse_mk_buckets("8:16") == (8, 16)
     assert parse_mk_buckets("none") == ()
-    assert parse_mk_buckets(x for x in (16, 8, 16)) == (8, 16)
+    assert parse_mk_buckets(x for x in (16, 8)) == (8, 16)
     assert parse_mk_buckets({32, 8, 16}) == (8, 16, 32)
     assert parse_mk_verify_buckets("16, 32") == (16, 32)
     assert parse_mk_verify_buckets(x for x in (32, 16)) == (16, 32)
     assert parse_mk_verify_buckets({32, 16}) == (16, 32)
-    for bad in ("65", "0, 8", b"8"):
+    for bad in ("65", "0, 8", "8, 8", "8, abc", b"8", (8, 8), [True], [8.5]):
         with pytest.raises(ValueError, match="decode buckets"):
             parse_mk_buckets(bad)
-    with pytest.raises(ValueError, match="verify_buckets"):
-        parse_mk_verify_buckets("6")
+    for bad in ("6", "16, 16", "16, abc", (16, 16), [True], [16.5]):
+        with pytest.raises(ValueError, match="verify_buckets"):
+            parse_mk_verify_buckets(bad)
     assert select_bucket(5, (8, 16, 32)) == 8
     assert select_bucket(32, (8, 16, 32)) == 32
     with pytest.raises(ValueError, match="exceeds max bucket"):
@@ -131,13 +132,27 @@ def test_bucket_policy_resolve_select_and_out_rows() -> None:
     assert (pol.max_bucket, pol.max_verify_bucket) == (16, 0)
     assert pol.select(5, 1) == 8
 
-    pol_pad = BucketPolicy((8, 16), (16, 32), token_paddings=(16, 32, 64))
+    # Both direct construction and resolve() validate buckets (even when
+    # speculative_tokens drops an implicit list).
+    with pytest.raises(ValueError, match="decode buckets"):
+        BucketPolicy((8, 8), ())
+    with pytest.raises(ValueError, match="verify_buckets"):
+        BucketPolicy((8,), (6,))
+    bad_prof = Profile(name="t-bad-verify", numerics="exact", verify_buckets=(6,))
+    with pytest.raises(ValueError, match="verify_buckets"):
+        BucketPolicy.resolve(bad_prof, speculative_tokens=0)
+
+    pol_pad = BucketPolicy((8, 16), (16, 32), token_paddings=(64, 16, 32))
+    assert pol_pad.token_paddings == (16, 32, 64)
     assert pol_pad.out_rows(8, 16) == 16
     assert pol_pad.out_rows(32, 32) == 32
     assert BucketPolicy((8,), ()).out_rows(8) == 16
     assert pol_pad.select(16, 4) == 16
     assert pol_pad.select(64, 4, clamp=True) == 32
     assert list(pol_pad.iter_buckets()) == [(1, 8), (1, 16), (4, 16), (4, 32)]
+    for bad_pad in ((0, 16), (True,), "16"):
+        with pytest.raises(ValueError, match="token_paddings"):
+            BucketPolicy((8,), (), token_paddings=bad_pad)
 
 
 @pytest.mark.parametrize(
@@ -268,7 +283,6 @@ def test_step_eligibility_cases():
     bs_runner = BatchShape(True, 2, 4, "ok")
     pol = BucketPolicy((8, 16), (16, 32), token_paddings=(16, 32))
     steps = {(1, 8): object(), (1, 16): object(), (4, 16): object(), (4, 32): object()}
-    out_rows = {(1, 8): 16, (1, 16): 16, (4, 16): 16, (4, 32): 32}
 
     cases = [
         (
@@ -362,7 +376,6 @@ def test_step_eligibility_cases():
             bs_case,
             pol,
             steps,
-            out_rows,
             input_rows=kw["input_rows"],
             mrope_ok=kw.get("mrope_ok", True),
         )
@@ -375,7 +388,6 @@ def test_step_eligibility_cases():
         BatchShape(True, 4, 1, "ok"),
         pol,
         {8: object()},
-        out_rows,
         input_rows=16,
     )
     assert not dec_nobkt.eligible and dec_nobkt.reason == "stock_t1_nobkt"
