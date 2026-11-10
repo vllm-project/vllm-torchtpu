@@ -10,7 +10,7 @@ Qwen3.5 TP8 per device: 4 q heads, 1 KV head, head_dim 256, fp8 SEQ_ALONG_LANE
   reach 160k tokens.
 * The DCP passes (CACHE_ONLY / NEW_TOKENS_ONLY with return_lse), with and
   without a 4-way interleaved context-parallel cache shard.
-* TPU_RPA_VPU_DIET (scale folded into q, mask skipped for KV blocks below the
+* The VPU diet (scale folded into q, mask skipped for KV blocks below the
   causal diagonal) against the original path: must be bit-identical when the
   folded scale is a power of two, and tight otherwise.
 
@@ -22,7 +22,11 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from vllm_torchtpu.kernels.experimental.batched_rpa import configs, wrapper
+from vllm_torchtpu.kernels.experimental.batched_rpa import (
+    configs,
+    flash_attention,
+    wrapper,
+)
 
 pytestmark = pytest.mark.tpu_test
 
@@ -118,7 +122,7 @@ def _setup(kv_dtype, seqs, seed=0, cp=1, rank=0):
 
 
 def _run(monkeypatch, inputs, diet, k_scale=None, prefill_blocks=None, **kw):
-    monkeypatch.setenv("TPU_RPA_VPU_DIET", "1" if diet else "0")
+    monkeypatch.setattr(flash_attention, "vpu_diet_enabled", lambda: diet)
     jax.clear_caches()
     if inputs["cp"] > 1:
         kw.update(

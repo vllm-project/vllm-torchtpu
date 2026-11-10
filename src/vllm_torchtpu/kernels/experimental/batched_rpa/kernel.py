@@ -20,7 +20,6 @@ softmax accumulation, and output writeback across decode and mixed batches.
 
 import dataclasses
 import functools
-import os
 from collections.abc import Callable
 from typing import cast
 
@@ -1122,8 +1121,7 @@ def rpa_kernel(
             # (`mask_invalid_v` or `_mask_unattended_v`), and NaNs in
             # unattended K only reach masked scores, which `jnp.where` replaces.
             # So the KV buffers (~27 MB of VMEM for decode, a fixed few us per
-            # call) stay unzeroed unless TPU_RPA_ZERO_KV_VMEM=1.
-            zero_kv_vmem = os.environ.get("TPU_RPA_ZERO_KV_VMEM", "0") == "1"
+            # call) are not zeroed.
 
             q_alloc, kv_cache_alloc, o_alloc, lse_alloc = final_allocs
 
@@ -1135,17 +1133,8 @@ def rpa_kernel(
                 q_ref_flat = q_alloc.window_ref.bitcast(jnp.uint32).reshape(
                     -1, num_lanes
                 )
-                zero_refs = [scratches[1], scratches[2], q_ref_flat]
-                if zero_kv_vmem:
-                    zero_refs.append(
-                        kv_cache_alloc.window_ref.bitcast(jnp.uint32).reshape(
-                            -1, num_lanes
-                        )
-                    )
-
-                # Explicitly zero out scratches and the Q (and optionally KV)
-                # buffers.
-                for ref in zero_refs:
+                # Explicitly zero out scratches and the Q buffer.
+                for ref in (scratches[1], scratches[2], q_ref_flat):
                     ref[...] = jnp.zeros_like(ref)
 
                 def execute_schedule_chunk(start_step, num_steps):

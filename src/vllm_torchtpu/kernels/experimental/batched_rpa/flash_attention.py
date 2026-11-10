@@ -19,7 +19,6 @@ with optional native FP8 KV cache dequantization in VMEM.
 """
 
 import math
-import os
 
 import jax
 import jax.numpy as jnp
@@ -71,13 +70,14 @@ def _merge_split(y: jax.Array, rows: int) -> jax.Array:
 
 
 def vpu_diet_enabled() -> bool:
-    """A/B switch for the score-tile VPU savings (scale folding, mask skip).
+    """Whether to take the score-tile VPU savings (scale folding, mask skip).
 
-    Read at trace time, like TPU_RPA_SKIP_MIXED. Both paths are numerically
-    equivalent: the mask skip is exact, and the scale folding is exact when the
-    folded scale is a power of two (sm_scale=1/16, k_scale=1 for head_dim 256).
+    Always on; a function so tests can compare it with the plain path. Both
+    paths are numerically equivalent: the mask skip is exact, and the scale
+    folding is exact when the folded scale is a power of two (sm_scale=1/16,
+    k_scale=1 for head_dim 256).
     """
-    return os.environ.get("TPU_RPA_VPU_DIET", "1") == "1"
+    return True
 
 
 def q_folded_scale(cfgs: configs.RpaConfigs) -> float | None:

@@ -17,7 +17,6 @@ Validates tensor shapes, selects tuned block sizes, builds DMA schedule tables,
 and invokes the Pallas Batched RPA kernel.
 """
 
-import os
 import re
 from typing import cast
 
@@ -601,7 +600,7 @@ def ragged_paged_attention(
     attention_scope: configs.AttentionScope = configs.AttentionScope.FULL,
     return_lse: bool = False,
     mask_invalid_v: bool | None = None,
-    native_fp8: str | None = None,
+    native_fp8: str = "",
 ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
     """Perform batched ragged paged attention.
 
@@ -667,8 +666,7 @@ def ragged_paged_attention(
         native_fp8: Run the DECODE kernel's QK and/or PV matmuls natively in
             the fp8 KV dtype ("qk", "pv", "qkpv", or with hi/lo split operands
             "qk2", "pv2", "qk2pv2"); see
-            `configs.ServingConfigs.native_fp8`. Defaults to the
-            TPU_RPA_NATIVE_FP8 environment variable (unset: off).
+            `configs.ServingConfigs.native_fp8`. Defaults to "" (off).
 
     Returns:
         out: [max_num_tokens, num_q_heads, head_dim]. Output of self attention.
@@ -735,8 +733,6 @@ def ragged_paged_attention(
     k_scale_tensor = dynamic_k_scale
     v_scale_tensor = dynamic_v_scale
 
-    if native_fp8 is None:
-        native_fp8 = os.environ.get("TPU_RPA_NATIVE_FP8", "")
     if native_fp8 in ("1", "true", "True"):
         native_fp8 = "qkpv"
     if native_fp8 not in ("", "0") and not re.fullmatch(r"(qk2?)?(pv2?)?", native_fp8):
@@ -913,43 +909,37 @@ def ragged_paged_attention(
         o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
             configs.RpaCase.DECODE, q_hbm, kv_cache, lse_hbm_init
         )
-        # "cond" skips the MIXED call when its sequence range
+        # Skip the MIXED call when its sequence range
         # [distribution[0], distribution[2]) (`configs.RpaConfigs.seq_range`)
         # is empty.
-        rpa_skip_mode = os.environ.get("TPU_RPA_SKIP_MIXED", "cond")
-        if rpa_skip_mode == "cond":
-            if return_lse:
+        if return_lse:
 
-                def _do_mixed_lse(args):
-                    o_in, kv_in, lse_in = args
-                    return run_rpa_kernel(configs.RpaCase.MIXED, o_in, kv_in, lse_in)
+            def _do_mixed_lse(args):
+                o_in, kv_in, lse_in = args
+                return run_rpa_kernel(configs.RpaCase.MIXED, o_in, kv_in, lse_in)
 
-                o_hbm_alias_q_hbm, kv_cache, lse_hbm = jax.lax.cond(
-                    distribution[0] < distribution[2],
-                    _do_mixed_lse,
-                    lambda args: args,
-                    (o_hbm_alias_q_hbm, kv_cache, lse_hbm),
-                )
-            else:
-
-                def _do_mixed(args):
-                    o_in, kv_in = args
-                    o_out, kv_out, _ = run_rpa_kernel(
-                        configs.RpaCase.MIXED, o_in, kv_in, None
-                    )
-                    return o_out, kv_out
-
-                o_hbm_alias_q_hbm, kv_cache = jax.lax.cond(
-                    distribution[0] < distribution[2],
-                    _do_mixed,
-                    lambda args: args,
-                    (o_hbm_alias_q_hbm, kv_cache),
-                )
-                lse_hbm = None
-        else:
-            o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
-                configs.RpaCase.MIXED, o_hbm_alias_q_hbm, kv_cache, lse_hbm
+            o_hbm_alias_q_hbm, kv_cache, lse_hbm = jax.lax.cond(
+                distribution[0] < distribution[2],
+                _do_mixed_lse,
+                lambda args: args,
+                (o_hbm_alias_q_hbm, kv_cache, lse_hbm),
             )
+        else:
+
+            def _do_mixed(args):
+                o_in, kv_in = args
+                o_out, kv_out, _ = run_rpa_kernel(
+                    configs.RpaCase.MIXED, o_in, kv_in, None
+                )
+                return o_out, kv_out
+
+            o_hbm_alias_q_hbm, kv_cache = jax.lax.cond(
+                distribution[0] < distribution[2],
+                _do_mixed,
+                lambda args: args,
+                (o_hbm_alias_q_hbm, kv_cache),
+            )
+            lse_hbm = None
 
     # before: [kv_heads, max_tokens, q_per_kv // q_packing, q_packing, d]
     o_hbm = prepare_outputs(o_hbm_alias_q_hbm)
