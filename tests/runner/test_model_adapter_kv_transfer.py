@@ -156,9 +156,11 @@ def test_qwen_pool_adapter_registers_materialized_carriers(monkeypatch, ssm_dtyp
     )
     monkeypatch.setattr(pooled_cache, "AttentionMetadataBuilder", lambda *a, **kw: None)
     adapter = Qwen4ExpAdapter(runner)
-    adapter.bind_model(SimpleNamespace(model=SimpleNamespace(layers=layers)))
+    language_model = SimpleNamespace(model=SimpleNamespace(layers=layers))
+    adapter.bind_model(SimpleNamespace(get_language_model=lambda: language_model))
     cache = adapter.cache
     assert cache is not None
+    assert cache.model is language_model
     cache.get_specs()
     cfg.cache_config.num_gpu_blocks_override = cache.pages
     cfg.cache_config.mamba_block_size = cfg.model_config.max_model_len

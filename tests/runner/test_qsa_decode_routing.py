@@ -38,7 +38,10 @@ from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 
 @pytest.mark.parametrize("decode", [False, True])
-def test_equal_padded_buckets_follow_request_boundaries(monkeypatch, decode):
+@pytest.mark.parametrize("padded_tokens,uniform", [(8, True), (16, False)])
+def test_equal_padded_buckets_follow_request_boundaries(
+    monkeypatch, decode, padded_tokens, uniform
+):
     from vllm_torchtpu.kernels.qwen4_exp import qsa_rpa
 
     counts = np.array([1, 1] if decode else [3, 5], np.int32)
@@ -47,7 +50,7 @@ def test_equal_padded_buckets_follow_request_boundaries(monkeypatch, decode):
         num_computed_tokens=contexts,
         prompt_tokens=[c + int(n) for c, n in zip(contexts, counts, strict=True)],
         scheduled_tokens=counts.tolist(),
-        token_paddings=[8],
+        token_paddings=[padded_tokens],
         pcp_size=1,
     )
     prepared = TPUModelRunner._prepare_inputs(
@@ -62,18 +65,29 @@ def test_equal_padded_buckets_follow_request_boundaries(monkeypatch, decode):
     starts = jnp.asarray(metadata.query_start_loc.numpy(), jnp.int32)
     distribution = jnp.asarray(metadata.request_distribution.numpy(), jnp.int32)
     np.testing.assert_array_equal(distribution, [2, 2, 2] if decode else [0, 0, 2])
-    lengths = jnp.array([37, 1659] + [0] * 6 if decode else list(range(1, 9)))
-    query = jnp.arange(128, dtype=jnp.float32).reshape(8, 2, 8)
+    lengths = jnp.array(
+        [37, 1659] + [0] * (padded_tokens - 2)
+        if decode
+        else list(range(1, padded_tokens + 1))
+    )
+    query = jnp.arange(padded_tokens * 16, dtype=jnp.float32).reshape(
+        padded_tokens, 2, 8
+    )
     gate = jnp.full_like(query, 0.25)
-    blocks = jnp.arange(8, dtype=jnp.int32)[:, None]
-    table = jnp.arange(8, dtype=jnp.int32)[:, None]
+    blocks = jnp.arange(padded_tokens, dtype=jnp.int32)[:, None]
+    table = jnp.arange(padded_tokens, dtype=jnp.int32)[:, None]
     cache = jnp.arange(16, dtype=jnp.float32).reshape(2, 8)
+    cache_before = np.array(cache, copy=True)
     seen = []
+    assert (len(query) <= len(starts) - 1) == uniform
 
-    def attend(kind, q, g, ids, lens, pages, owner, *args, **kwargs):
+    def attend(
+        kind, q, g, ids, lens, pages, owner, *args, initial_output=None, **kwargs
+    ):
+        np.testing.assert_array_equal(ids, blocks)
         seen.extend([kind] * int(np.count_nonzero(np.asarray(lens))))
         result = q + 2 * g + pages[:, :1, None]
-        inactive = kwargs["initial_output"] if kind == "decode" else 0
+        inactive = 0 if initial_output is None else initial_output
         return jnp.where((lens > 0)[:, None, None], result, inactive), owner
 
     monkeypatch.setattr(
@@ -100,11 +114,12 @@ def test_equal_padded_buckets_follow_request_boundaries(monkeypatch, decode):
             kv_heads=1,
             ratio=4,
         )
-    assert seen == ["decode" if decode else "prefill"] * int(counts.sum())
-    expected = np.asarray(query) + 0.5 + np.arange(8)[:, None, None]
+    assert seen == ["decode" if decode or uniform else "prefill"] * int(counts.sum())
+    expected = np.asarray(query) + 0.5 + np.arange(padded_tokens)[:, None, None]
     expected[int(counts.sum()) :] = 0
     np.testing.assert_array_equal(output, expected)
     assert owner is cache
+    np.testing.assert_array_equal(cache, cache_before)
 
 
 @pytest.mark.tpu_test
