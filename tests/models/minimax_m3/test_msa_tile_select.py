@@ -222,7 +222,9 @@ def test_tile_select_column_fault_is_caught(monkeypatch, _retrace):
         _check(monkeypatch, *_MIXED, 2, jnp.bfloat16, ranks=[0], seed=5)
 
 
-def test_tile_select_threshold():
+def test_tile_select_threshold(monkeypatch):
+    assert not msa_dcp.tile_select(8192, 4)  # off by default
+    monkeypatch.setattr(msa_dcp, "TILE_SELECT_ENABLED", True)
     assert not msa_dcp.tile_select(256)
     assert msa_dcp.tile_select(1024) and msa_dcp.tile_select(8192, 4)
     assert not msa_dcp.tile_select(8192, 3)
