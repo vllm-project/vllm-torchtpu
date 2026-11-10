@@ -184,6 +184,77 @@ def _kernel(
             seen row has ``denom >= 1``)."""
             write(acc * (1.0 / jnp.maximum(denom, 1.0)), m * _LN_2 + jnp.log(denom))
 
+        def attend_t(width, single):
+            """`attend` for 8/16-bit caches on transposed scores ``s^T [keys,
+            rows]``: the max and sum over keys are sublane reductions, the
+            output accumulates as ``acc^T [D, rows]`` across the p @ v
+            contraction, and ``m``, ``l`` are lane vectors over rows (fewer
+            spills and pops: bench j-9081937a, c4 pool48 -5.4%; 4-bit pages
+            keep `attend`, whose per-key scales are lane vectors there)."""
+            row_slots = (
+                jax.lax.broadcasted_iota(jnp.int32, (page_size, 1), 0)
+                if packing == 4
+                else msa_attention._bitcast_slots(rows_per_page, packing)
+            )  # [S, 1]
+            sel_t = selected_ref[...].T  # [K, Bq]
+            local_page = local_page_ref[...].T  # [1, Bq]
+            local_limit = local_limit_ref[...].T
+            keys, values, masks = [], [], []
+            for g, kv_ref in enumerate(kv_refs[:width]):
+                page = work_page_ref[msa_attention._slot(meta, pages_per_step, g)]
+                hit = jnp.max((sel_t == page).astype(jnp.int32), axis=0, keepdims=True)
+                limit = jnp.where(local_page == page, local_limit, page_size)
+                limit = jnp.where(page >= 0, limit * hit, 0)  # [1, Bq]
+                seen = jnp.max(limit)
+                if packing == 4:
+                    rows = kv_ref[0].reshape(page_size, -1).astype(jnp.bfloat16)
+                    values.append(jnp.where(row_slots < seen, rows[:, head_dim:], 0))
+                else:
+                    rows = msa_attention._page_rows(kv_ref, seen)
+                    values.append(rows[:, head_dim:])
+                keys.append(rows[:, :head_dim])
+                # Rows are head-major (h * Bq + t): every head shares a token's mask.
+                masks.append(row_slots < jnp.tile(limit, (1, num_heads)))  # [S, rows]
+            k = jnp.concatenate(keys, axis=0)
+            v = jnp.concatenate(values, axis=0)
+            mask = jnp.concatenate(masks, axis=0)
+            q = q_ref[...].reshape(num_heads * block_q, head_dim)
+            q = (q.astype(jnp.float32) * (sm_scale * _LOG2_E)).astype(q.dtype)
+            s = jax.lax.dot_general(
+                k, q, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
+            )  # [W * S, rows]
+            s = jnp.where(mask, s, -jnp.inf)
+            m_prev = m_ref[...] if not single else msa_attention._MASK_VALUE
+            m_new = jnp.maximum(m_prev, jnp.max(s, axis=0, keepdims=True))
+            p = jnp.exp2(s - m_new)
+            l_cur = jnp.sum(p, axis=0, keepdims=True)
+            pv = jax.lax.dot_general(
+                v, p.astype(v.dtype), (((0,), (0,)), ((), ())),
+                preferred_element_type=jnp.float32,
+            )  # [D, rows]
+            if single:
+                finish_t(m_new, l_cur, pv)
+                return
+            alpha = jnp.exp2(m_prev - m_new)
+            l_new = alpha * l_ref[...] + l_cur
+            acc_new = alpha * acc_ref[...] + pv
+
+            @pl.when(last)
+            def _finalize():
+                finish_t(m_new, l_new, acc_new)
+
+            @pl.when(jnp.logical_not(last))
+            def _carry():
+                m_ref[...] = m_new
+                l_ref[...] = l_new
+                acc_ref[...] = acc_new
+
+        def finish_t(m, denom, acc_t):
+            """`finish` for `attend_t`'s lane-vector state."""
+            out = (acc_t * (1.0 / jnp.maximum(denom, 1.0))).T
+            o_ref[...] = out.reshape(num_heads, block_q, head_dim).astype(o_ref.dtype)
+            lse_ref[...] = (m * _LN_2 + jnp.log(denom)).reshape(lse_ref.shape)
+
         def attend(width, single):
             """One softmax update over the group's first `width` slots; a
             `single` group (the tile's only one) needs no carried state."""
@@ -290,8 +361,9 @@ def _kernel(
             fits = count > (widths[i - 1] if i else 0)
             if width < pages_per_step:
                 fits = fits & (count <= width)
-            pl.when(fits & single)(functools.partial(attend, width, True))
-            pl.when(fits & jnp.logical_not(single))(functools.partial(attend, width, False))
+            body = attend if fp4 else attend_t
+            pl.when(fits & single)(functools.partial(body, width, True))
+            pl.when(fits & jnp.logical_not(single))(functools.partial(body, width, False))
 
         @pl.when(count == 0)
         def _empty():  # a tile of padding tokens: its only group holds no page
@@ -404,9 +476,20 @@ def _attention_call(
             pl.BlockSpec((1, tiles_per_step, 1, num_heads * block_q), lse_block),
         ],
         scratch_shapes=[
-            pltpu.VMEM((num_heads * block_q, 1), jnp.float32),
-            pltpu.VMEM((num_heads * block_q, 1), jnp.float32),
-            pltpu.VMEM((num_heads * block_q, head_dim), jnp.float32),
+            # m, l, acc: rows on sublanes for `attend` (4-bit), lanes for `attend_t`.
+            *(
+                [
+                    pltpu.VMEM((num_heads * block_q, 1), jnp.float32),
+                    pltpu.VMEM((num_heads * block_q, 1), jnp.float32),
+                    pltpu.VMEM((num_heads * block_q, head_dim), jnp.float32),
+                ]
+                if fp4
+                else [
+                    pltpu.VMEM((1, num_heads * block_q), jnp.float32),
+                    pltpu.VMEM((1, num_heads * block_q), jnp.float32),
+                    pltpu.VMEM((head_dim, num_heads * block_q), jnp.float32),
+                ]
+            ),
             pltpu.VMEM(
                 (2, pages_per_step, 1, rows_per_page, packing, row_width),
                 kv_cache.dtype,
