@@ -81,7 +81,7 @@ from vllm_torchtpu.layers.core.quant_methods import MXFP4, get_tpu_quant_method
 from vllm_torchtpu.layers.core.quantization import (
     dequantize_mxfp4_packed,
     dequantize_tensor,
-    e8m0_to_fp32,
+    e8m0_to_fp32_bits,
 )
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import synchronize_tensors
@@ -169,14 +169,12 @@ def _dequantize_mxfp4_packed_on_device(
     axis: int,
     out_dtype: torch.dtype,
 ) -> torch.Tensor:
-    """`dequantize_mxfp4_packed`, bit for bit, without leaving the device.
+    """Dequantize packed FP4 weights and scales on their current device.
 
-    The e8m0 scales are decoded on CPU, since `torch.ldexp` overflows on TPU
-    (see `e8m0_to_fp32`); they are 1/16 of the packed bytes. The fp4 nibbles
-    are decoded with selects rather than a LUT gather. Every product is an
-    fp4 value times a power of two, so it is exact in fp32 and in bf16.
+    Scales retain the CPU decoder's float32 bit patterns. The FP4 nibbles
+    are decoded with selects rather than a LUT gather.
     """
-    scale = e8m0_to_fp32(scale_u8.to("cpu")).to(weight_packed.device)
+    scale = e8m0_to_fp32_bits(scale_u8)
 
     def decode(nibble: torch.Tensor) -> torch.Tensor:
         exponent = (nibble >> 1) & 3

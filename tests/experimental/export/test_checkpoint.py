@@ -15,10 +15,14 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+import portpicker
 import pytest
 import torch
 import torch.nn as nn
@@ -142,7 +146,79 @@ def test_per_rank_tensors_are_sharded_over_tensor_parallel_ranks(
     assert sharding == ["tp"] + [None] * (len(shape) - 1)
 
 
-def test_save_checkpoint_writes_zarr_v2_arrays(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "name,shape,expected",
+    [
+        # The MTP predictor's fc is column-parallel; FP8 requantization drops the
+        # attributes that say so, so the name has to.
+        ("model.fc.weight", [4096, 2048], [None, "tp"]),
+        ("model.fc.weight_scale", [2048], ["tp"]),
+        ("model.layers.0.mlp.fc1.weight", [4096, 2048], [None, None]),
+    ],
+)
+def test_the_mtp_fc_is_sharded_like_a_column_parallel_layer(
+    name: str, shape: list[int], expected: list[str | None]
+) -> None:
+    from vllm_torchtpu.experimental.export import weight_mapper
+
+    assert weight_mapper.infer_weight_sharding(name, shape, tp_size_hint=2) == expected
+
+
+@pytest.mark.parametrize(
+    "name,expected",
+    [
+        # Muse Spark's MoE projects to and from the expert width with column- and
+        # row-parallel layers whose shard attributes processing drops.
+        ("model.language_model.layers.0.mlp.pre_expert_proj.weight", [None, "tp"]),
+        ("model.language_model.layers.0.mlp.post_expert_proj.weight", ["tp", None]),
+    ],
+)
+def test_muse_expert_projections_are_sharded_like_their_parallel_layers(
+    name: str, expected: list[str | None]
+) -> None:
+    from vllm_torchtpu.experimental.export import weight_mapper
+
+    sharding = weight_mapper.infer_weight_sharding(name, [8192, 4096], tp_size_hint=8)
+    assert sharding == expected
+
+
+def test_qkvz_kernel_layout_is_rejected_when_tensor_parallel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The mapper shards in_proj_qkvz as [n_out, n_in], which the flag flips."""
+    from vllm_torchtpu.experimental.export import weight_mapper
+
+    name = "model.layers.0.linear_attn.in_proj_qkvz.weight"
+    monkeypatch.delenv("TPU_GDN_QKVZ_KERNEL_LAYOUT", raising=False)
+    sharding = weight_mapper.infer_weight_sharding(name, [4608, 2048], tp_size_hint=4)
+    assert sharding == ["tp", None]
+
+    monkeypatch.setenv("TPU_GDN_QKVZ_KERNEL_LAYOUT", "1")
+    # Nothing is sharded at TP = 1, so the layout does not matter.
+    sharding = weight_mapper.infer_weight_sharding(name, [2048, 18432])
+    assert sharding == [None, None]
+    with pytest.raises(NotImplementedError, match="TPU_GDN_QKVZ_KERNEL_LAYOUT"):
+        weight_mapper.infer_weight_sharding(name, [2048, 4608], tp_size_hint=4)
+
+
+def _ocdbt(data_dir: Path) -> dict[str, Any]:
+    """The TensorStore kvstore spec of the OCDBT database in `data_dir`."""
+    return {"driver": "ocdbt", "base": f"file://{data_dir}"}
+
+
+def _zarray(ts: Any, data_dir: Path, i: int) -> dict[str, Any]:
+    kv = ts.KvStore.open(_ocdbt(data_dir)).result()
+    return json.loads(kv.read(f"array_{i}/.zarray").result().value)
+
+
+def _read_array(ts: Any, data_dir: Path, i: int) -> np.ndarray:
+    spec = {"driver": "zarr", "kvstore": {**_ocdbt(data_dir), "path": f"array_{i}/"}}
+    return np.asarray(ts.open(spec).result().read().result())
+
+
+def test_save_checkpoint_writes_zarr_v2_arrays_in_an_ocdbt_database(
+    tmp_path: Path,
+) -> None:
     pytest.importorskip("orbax.checkpoint")
     ts = pytest.importorskip("tensorstore")
     import jax
@@ -171,26 +247,137 @@ def _save_and_check(tmp_path: Path, ts: Any) -> None:
     data_dir = tmp_path / "serving_checkpoint" / "data"
     checkpoint.save_checkpoint(inputs, shards, single, str(data_dir))
 
+    # The format the artifact declares (serving_config.checkpoint_config).
+    assert checkpoint.CHECKPOINT_FORMAT == "zarr2_ocdbt"
     assert (data_dir / "_CHECKPOINT_METADATA").is_file()
+    assert (data_dir / "manifest.ocdbt").is_file()
+    assert not (data_dir / "array_0").exists(), "chunks live in the database"
     for i, (spec, shard) in enumerate(zip(inputs, shards, strict=True)):
-        array_dir = data_dir / f"array_{i}"
-        header = json.loads((array_dir / ".zarray").read_text())
+        header = _zarray(ts, data_dir, i)
         assert header["zarr_format"] == 2 and header["shape"] == spec["shape"]
         assert header["compressor"]["id"] == "zstd"
-        value = (
-            ts.open(
-                {
-                    "driver": "zarr",
-                    "kvstore": {"driver": "file", "path": str(array_dir)},
-                }
-            )
-            .result()
-            .read()
-            .result()
-        )
-        assert np.asarray(value).tobytes() == shard.tobytes(), spec["name"]
-    dtypes = [
-        json.loads((data_dir / f"array_{i}" / ".zarray").read_text())["dtype"]
-        for i in range(3)
-    ]
+        value = _read_array(ts, data_dir, i)
+        assert value.tobytes() == shard.tobytes(), spec["name"]
+    dtypes = [_zarray(ts, data_dir, i)["dtype"] for i in range(3)]
     assert dtypes == ["bfloat16", "float8_e4m3fn", "<i8"]
+
+
+def test_declare_checkpoint_format_updates_only_checkpoint_config(
+    tmp_path: Path,
+) -> None:
+    # `--export-mode checkpoint` fills an artifact exported earlier, possibly before
+    # it declared a format; the artifact must then declare what was written.
+    meta = {"format_version": 2, "serving_config": {"vocab_size": 32}, "functions": {}}
+    (tmp_path / "metadata.json").write_text(json.dumps(meta))
+    checkpoint.declare_checkpoint_format(str(tmp_path))
+    updated = json.loads((tmp_path / "metadata.json").read_text())
+    assert updated["serving_config"] == {
+        "vocab_size": 32,
+        "checkpoint_config": {"format": "zarr2_ocdbt"},
+    }
+    assert {k: v for k, v in updated.items() if k != "serving_config"} == {
+        "format_version": 2,
+        "functions": {},
+    }
+
+
+# One tensor-parallel rank of a two-process save (see the test below).
+_TWO_RANK_SAVE = r"""
+import sys
+
+import numpy as np
+
+from vllm_torchtpu.experimental.export import checkpoint
+
+rank, coordinator, data_dir = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+checkpoint.init_jax(rank, 2, coordinator)
+norm = np.arange(16, dtype=np.float32).reshape(2, 8)
+weight = np.arange(256, dtype=np.float32).reshape(4, 64) * 0.5
+bias = np.arange(6, dtype=np.float32)
+scale = np.arange(512, dtype=np.float32)
+inputs = [
+    {"name": "norm", "shape": [2, 8], "dtype": "f32", "sharding": ["model", None]},
+    {"name": "weight", "shape": [4, 64], "dtype": "f32", "sharding": [None, "model"]},
+    {"name": "bias", "shape": [6], "dtype": "f32", "sharding": [None]},
+    {"name": "scale", "shape": [512], "dtype": "f32", "sharding": [None]},
+]
+shards = [norm[rank : rank + 1], weight[:, 32 * rank : 32 * rank + 32], bias, scale]
+checkpoint.save_checkpoint(
+    inputs, shards, {"data": 1, "model": 2}, data_dir, small_array_bytes=512
+)
+"""
+
+
+def _wait_all_or_kill(
+    procs: list[subprocess.Popen[bytes]], timeout: float = 120
+) -> list[int]:
+    try:
+        return [proc.wait(timeout=timeout) for proc in procs]
+    finally:
+        for proc in procs:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+
+
+def test_wait_all_or_kill_stops_remaining_ranks_on_failure() -> None:
+    procs = [
+        subprocess.Popen([sys.executable, "-c", "raise SystemExit(1)"]),
+        subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"]),
+    ]
+    assert _wait_all_or_kill([procs[0]]) == [1]
+    with pytest.raises(subprocess.TimeoutExpired):
+        _wait_all_or_kill(procs, timeout=0.05)
+    assert all(proc.poll() is not None for proc in procs)
+
+
+def test_small_sharded_arrays_are_saved_as_one_chunk(tmp_path: Path) -> None:
+    """Two ranks save small arrays as one chunk; larger ones as before.
+
+    Orbax writes one chunk per shard and splits a replicated array among its
+    replicas; both apply only above `small_array_bytes` (512 here).
+    """
+    pytest.importorskip("orbax.checkpoint")
+    ts = pytest.importorskip("tensorstore")
+
+    data_dir = tmp_path / "serving_checkpoint" / "data"
+    coordinator = f"localhost:{portpicker.pick_unused_port()}"
+    env = dict(os.environ, **checkpoint.CPU_ENV)
+    procs = [
+        subprocess.Popen(
+            [sys.executable, "-c", _TWO_RANK_SAVE, str(r), coordinator, str(data_dir)],
+            env=env,
+        )
+        for r in range(2)
+    ]
+    assert _wait_all_or_kill(procs) == [0, 0]
+
+    keys = [
+        k.decode() for k in ts.KvStore.open(_ocdbt(data_dir)).result().list().result()
+    ]
+
+    def chunks(i: int) -> list[str]:
+        prefix = f"array_{i}/"
+        return sorted(
+            k[len(prefix) :]
+            for k in keys
+            if k.startswith(prefix) and not k[len(prefix) :].startswith(".")
+        )
+
+    def read(i: int) -> np.ndarray:
+        return _read_array(ts, data_dir, i)
+
+    # 64 bytes in all: one chunk. 1 KiB, over the limit: one chunk per shard.
+    assert chunks(0) == ["0.0"]
+    assert chunks(1) == ["0.0", "0.1"]
+    # Replicated, 24 bytes: one chunk, not one per replica. 2 KiB: split as before.
+    assert chunks(2) == ["0"]
+    assert chunks(3) == ["0", "1"]
+    np.testing.assert_array_equal(
+        read(0), np.arange(16, dtype=np.float32).reshape(2, 8)
+    )
+    np.testing.assert_array_equal(
+        read(1), np.arange(256, dtype=np.float32).reshape(4, 64) * 0.5
+    )
+    np.testing.assert_array_equal(read(2), np.arange(6, dtype=np.float32))
+    np.testing.assert_array_equal(read(3), np.arange(512, dtype=np.float32))

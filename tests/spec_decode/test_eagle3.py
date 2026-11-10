@@ -993,6 +993,7 @@ def _lockstep_draft_trace(monkeypatch, method, K, num_chunks, num_real):
     proposer.runner = SimpleNamespace(
         input_batch=SimpleNamespace(num_reqs=num_real * reqs),
         _dp_target_bucket=bucket,
+        _dp_step_max_reqs=reqs,
         _dp_step_num_chunks=num_chunks,
         num_reqs_max_model_len=reqs,
         num_reqs_most_model_len=None,
@@ -1082,18 +1083,25 @@ def test_dp_lockstep_draft_trace_independent_of_real_chunk_count(
         assert padded == full, f"{num_real} of {num_chunks} chunks real"
 
 
-def test_loop_bucket_constant_under_sharded_lockstep():
-    """Sharded EP-DP lockstep pins the loop bucket to pad(max_num_reqs) so
-    collective shapes match across DP ranks regardless of per-rank load;
-    the replicated draft keeps the per-chunk bucket."""
+def test_loop_bucket_follows_dp_step_max_reqs_under_sharded_lockstep():
+    """Sharded EP-DP lockstep sizes the loop bucket from the step's DP-wide max
+    per-chunk request count, not max_num_reqs; the replicated draft keeps the
+    per-chunk bucket."""
     proposer = _make_proposer(draft_tp=2, target_tp=2)
     proposer.runner = SimpleNamespace(
         num_tokens_paddings=[16, 32, 64, 128],
-        max_num_reqs=50,
+        max_num_reqs=128,
+        _dp_step_max_reqs=10,
         _dp_lockstep_enabled=lambda: True,
     )
+    assert proposer._loop_bucket(1) == 16
+    assert proposer._loop_bucket(10) == 16
+    assert proposer._loop_bucket(0) == 16
+    proposer.runner._dp_step_max_reqs = 50
     assert proposer._loop_bucket(1) == 64
     assert proposer._loop_bucket(33) == 64
+    with pytest.raises(AssertionError, match="DP-coordinated"):
+        proposer._loop_bucket(51)
 
     rep = _make_proposer(draft_tp=1, target_tp=2)
     rep.runner = SimpleNamespace(
@@ -1116,6 +1124,7 @@ def test_run_dp_dummy_draft_sharded_replays_propose_trace(monkeypatch):
     proposer.speculative_config.num_speculative_tokens = 3
     proposer.runner = SimpleNamespace(
         _dp_target_bucket=64,
+        _dp_step_max_reqs=16,
         num_reqs_max_model_len=16,
         max_num_reqs=16,
         num_tokens_paddings=[16, 32, 64],
@@ -1151,7 +1160,7 @@ def test_run_dp_dummy_draft_sharded_replays_propose_trace(monkeypatch):
     assert len(combine) == 2
     assert all(t.shape == (64, 8) for t in combine[0])
     # Both chunks' first passes @bucket=64, then each of the K-1 loop steps
-    # @p=16 across both (constant loop bucket = pad(max_num_reqs)).
+    # @p=16 across both (p = pad(_dp_step_max_reqs)).
     assert [f["num_tokens_padded"] for f in fwd] == [64, 64, 16, 16, 16, 16]
     assert [f["step_idx"] for f in fwd] == [0, 0, 1, 1, 2, 2]
     # Loop steps carry the loop metadata tensors (shape parity with propose).
@@ -1179,6 +1188,7 @@ def test_run_dp_dummy_draft_mtp_replays_no_combine(monkeypatch):
     proposer.speculative_config.num_speculative_tokens = 3
     proposer.runner = SimpleNamespace(
         _dp_target_bucket=64,
+        _dp_step_max_reqs=16,
         num_reqs_max_model_len=16,
         max_num_reqs=16,
         num_tokens_paddings=[16, 32, 64],
@@ -1217,6 +1227,55 @@ def test_run_dp_dummy_draft_mtp_replays_no_combine(monkeypatch):
     assert tok_shapes == [(16, 8)] * 6
 
 
+def test_run_dp_dummy_draft_loop_bucket_below_num_reqs_max_model_len(monkeypatch):
+    """An idle rank's loop steps run at the peers' coordinated p, which can be
+    below num_reqs_max_model_len; the loop metadata must fit inside p."""
+    import vllm_torchtpu.spec_decode.eagle3 as e3
+
+    monkeypatch.setattr(e3, "synchronize_tensors", lambda *a, **k: None)
+
+    proposer = _make_proposer(draft_tp=1, target_tp=1, method="qwen3_next_mtp")
+    proposer.speculative_config.num_speculative_tokens = 2
+    proposer.runner = SimpleNamespace(
+        _dp_target_bucket=64,
+        _dp_step_max_reqs=5,
+        num_reqs_max_model_len=64,
+        max_num_reqs=64,
+        num_tokens_paddings=[16, 32, 64],
+        device=torch.device("cpu"),
+        _hidden_states_dtype=torch.float32,
+        uses_mrope=False,
+        _dp_lockstep_enabled=lambda: True,
+    )
+    proposer.draft_model = SimpleNamespace(
+        config=SimpleNamespace(hidden_size=8),
+        model=SimpleNamespace(use_aux_hidden_state=False),
+    )
+    proposer._draft_has_moe_cache = True
+
+    fwd, tok_shapes = [], []
+
+    def fake_forward(**kw):
+        fwd.append(kw)
+        return (torch.zeros((kw["num_tokens_padded"], 8)), None)
+
+    proposer._forward_draft = fake_forward
+
+    def fake_propose_token(h):
+        tok_shapes.append(tuple(h.shape))
+        return torch.zeros(h.shape[0], dtype=torch.int32)
+
+    proposer._draft_propose_token = fake_propose_token
+
+    proposer.run_dp_dummy_draft(1)
+
+    assert [f["num_tokens_padded"] for f in fwd] == [64, 16]
+    assert tok_shapes == [(16, 8)] * 2
+    loop = fwd[1]
+    assert int(loop["loop_query_start_loc"].max()) == 16
+    assert loop["loop_request_distribution"].tolist() == [16, 16, 16]
+
+
 @pytest.mark.parametrize("uses_mrope", [False, True])
 def test_run_dp_dummy_draft_positions_match_draft_graph_rank(monkeypatch, uses_mrope):
     """Dummy positions must carry the rank the draft graph was compiled for.
@@ -1235,6 +1294,7 @@ def test_run_dp_dummy_draft_positions_match_draft_graph_rank(monkeypatch, uses_m
     proposer.speculative_config.num_speculative_tokens = 3
     proposer.runner = SimpleNamespace(
         _dp_target_bucket=64,
+        _dp_step_max_reqs=16,
         num_reqs_max_model_len=16,
         max_num_reqs=16,
         num_tokens_paddings=[16, 32, 64],
@@ -2011,6 +2071,7 @@ def test_propose_index_share_survives_dp_padding_first_pass(monkeypatch):
         _dp_lockstep_enabled=lambda: True,
         _dp_step_num_chunks=2,
         _dp_target_bucket=2,
+        _dp_step_max_reqs=2,
     )
     proposer.vllm_config.scheduler_config = SimpleNamespace(max_num_batched_tokens=8)
 
