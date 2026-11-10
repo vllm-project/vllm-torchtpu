@@ -7522,7 +7522,6 @@ class TPUModelRunner(GPUModelRunner):
         is_async = bool(self.scheduler_config.async_scheduling)
         defer_modify_prev = (
             is_async
-            and os.environ.get("VLLM_TPU_MTP_OPT", "1") != "0"
             and self._is_async_drafter
             and bool(combined_selected_tokens)
             and not discard_sampled_tokens_req_indices
