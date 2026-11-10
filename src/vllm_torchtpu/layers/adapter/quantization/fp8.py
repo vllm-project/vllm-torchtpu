@@ -1316,6 +1316,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         use_fused_kernel: bool = True,
     ) -> torch.Tensor:
         from vllm.distributed.parallel_state import get_ep_group
+
         from vllm_torchtpu.layers.adapter import small_all_reduce_op
         from vllm_torchtpu.layers.adapter.fused_moe_ep_v3 import (
             fused_moe_ep,
