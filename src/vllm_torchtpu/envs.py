@@ -294,6 +294,7 @@ if TYPE_CHECKING:
     VLLM_TPU_VERIFY_FUSED_READ_OFFSETS: bool = False
     VLLM_TPU_VERIFY_ONE_DRAW: bool = False
     VLLM_TPU_SUBST_FRESH_IDS: bool = False
+    VLLM_TPU_DRAFT_ROWS_FRESH: bool = False
     VLLM_TPU_DRAFT_SEED_EXTRAS: bool = False
     VLLM_TPU_DRAFT_SEED_BOOTSTRAP_PAD: bool = False
     VLLM_TPU_CPU_PIN_RESERVE: int = 2
@@ -1778,6 +1779,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Row-selected draft step 0: position carry + first draft token as one
     # program (eagle3._draft_rows_carry_and_token).
     "VLLM_TPU_DRAFT_CARRY_FUSED": env_bool("VLLM_TPU_DRAFT_CARRY_FUSED"),
+    # With VLLM_TPU_MTP_DRAFT_ROWS: draft step 0's first token and hidden carry
+    # from one program over the untrimmed [capacity] outputs, instead of eager
+    # [:rows] views that torch_tpu copies with an execute_as_strided program
+    # before the propose and the fused loop (same values; off with
+    # VLLM_TPU_DRAFT_CARRY_FUSED, which takes precedence).
+    "VLLM_TPU_DRAFT_ROWS_FRESH": env_bool("VLLM_TPU_DRAFT_ROWS_FRESH"),
     # With VLLM_TPU_VERIFY_FUSED: compute the mamba read offsets inside the
     # fused verify program and apply them with one eager scatter.
     "VLLM_TPU_VERIFY_FUSED_READ_OFFSETS": env_bool("VLLM_TPU_VERIFY_FUSED_READ_OFFSETS"),
