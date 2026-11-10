@@ -70,8 +70,7 @@ def _stitch_decode_lane(
         rolled = pltpu.roll(src_vreg, dst_rel - src_tok_idx % num_lanes, axis=1)
         # A block without the new token (CACHE_ONLY, or a lane with no
         # sequence) leaves `dst_rel` zero like the lanes after it: the source
-        # lane is unfetched VMEM there, and nothing else zeroes this column
-        # (see kernel._zero_unattended_v_lanes).
+        # lane is unfetched VMEM there.
         new_tok = jnp.logical_and(lane_idx == dst_rel, bkv_sz_new > 0)
         merged_dst_vreg = lax.select(
             new_tok, rolled, jnp.where(lane_idx < dst_rel, dst_vreg, 0)

@@ -555,6 +555,7 @@ def calculate_block_sizes(
         "cp_group_size",
         "attention_scope",
         "return_lse",
+        "mask_invalid_v",
         "native_fp8",
     ),
     # Donation of transient inputs can fail for some runtime buffer layouts in
@@ -599,6 +600,7 @@ def ragged_paged_attention(
     cp_rank: jax.Array | None = None,
     attention_scope: configs.AttentionScope = configs.AttentionScope.FULL,
     return_lse: bool = False,
+    mask_invalid_v: bool | None = None,
     native_fp8: str | None = None,
 ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
     """Perform batched ragged paged attention.
@@ -658,6 +660,10 @@ def ragged_paged_attention(
             tokens. Defaults to FULL.
         return_lse: If True, return log-sum-exp (lse) values along with the
             output. Defaults to False.
+        mask_invalid_v: If True, zero out invalid V token slices before the pv
+            matmul so NaNs in unused VMEM or shared new-KV pages cannot propagate via
+            0.0 * NaN. Defaults to None (True for SEQ_ALONG_LANE, False for
+            HEAD_ALONG_SUBLANE).
         native_fp8: Run the DECODE kernel's QK and/or PV matmuls natively in
             the fp8 KV dtype ("qk", "pv", "qkpv", or with hi/lo split operands
             "qk2", "pv2", "qk2pv2"); see
@@ -868,6 +874,7 @@ def ragged_paged_attention(
             kv_cache_lens,
             kv_new_lens,
             dist,
+            page_indices,
             cfgs=cfgs,
             computer_cls=computer_cls,
             extra_scalars=extra_scalars,
