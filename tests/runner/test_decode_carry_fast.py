@@ -7,14 +7,12 @@ import numpy as np
 import torch
 
 
-def test_carry_fast_positions_match(monkeypatch):
+def test_carry_fast_positions_match():
     from vllm_torchtpu.runner import decode_carry as dc
 
     buf = torch.arange(3 * 16, dtype=torch.int64).reshape(3, 16)
     runner = types.SimpleNamespace(uses_mrope=True, mrope_positions=types.SimpleNamespace(cpu=buf))
-    monkeypatch.setattr(dc, "_T3_FAST", False)
-    ref = dc._host_positions(runner, 5)
-    monkeypatch.setattr(dc, "_T3_FAST", True)
+    ref = np.asarray(buf[:, :5].numpy(), dtype=np.int64)
     fast = dc._host_positions(runner, 5)
     assert fast.dtype == ref.dtype == np.int64 and np.array_equal(fast, ref)
     buf[1, 2] = 999  # the cached view sees in-place updates
