@@ -19,27 +19,37 @@ previous step's corrected device tensors to
 takes the normal upload path. Padding slots keep their previous values, which the
 host also left unchanged (checked).
 
-Default off on this branch (the unified gates ran without it); VLLM_TPU_DECODE_CARRY=1
-enables it, as the hostov stack (band H j-81e043bf) ran it. VLLM_TPU_DECODE_CARRY_CHECK=1 also runs the
-upload path on every carried step and compares both results on the host (debug only:
-it synchronizes).
+It runs by rule on a Qwen3.5 MTP engine with batch-1 asynchronous decode
+(max_num_seqs == 1), the configuration that ran it (the band H batch-1 decode
+legs); every other engine keeps the uploads.
 """
 
 from __future__ import annotations
 
 import itertools
-import os
-import time
 from typing import Any
 
 import numpy as np
 
-ENABLED = os.environ.get("VLLM_TPU_DECODE_CARRY", "0") == "1"
-CHECK = os.environ.get("VLLM_TPU_DECODE_CARRY_CHECK", "0") == "1"
-
 _SEQ = itertools.count(1)
-STATS = {"carried": 0, "uploaded": 0, "check_ok": 0, "check_bad": 0}
-_LAST_LOG = [0.0]
+
+
+def enabled(runner: Any) -> bool:
+    """The carry's rule, decided once per runner: a Qwen3.5 target with an
+    MTP draft, asynchronous scheduling and max_num_seqs == 1."""
+    cached = runner.__dict__.get("_decode_carry_enabled")
+    if cached is None:
+        from vllm_torchtpu.spec_decode.utils import qwen3_5_mtp
+
+        sched = getattr(runner, "scheduler_config", None)
+        cached = bool(
+            sched is not None
+            and getattr(sched, "async_scheduling", False)
+            and getattr(sched, "max_num_seqs", 0) == 1
+            and qwen3_5_mtp(getattr(runner, "vllm_config", None))
+        )
+        runner.__dict__["_decode_carry_enabled"] = cached
+    return cached
 
 
 class CarryState:
@@ -60,9 +70,9 @@ class CarryState:
     )
 
 
-def tag_results(results: Any) -> None:
+def tag_results(runner: Any, results: Any) -> None:
     """Number each AsyncPreResults so a carry can tell which step's rejections it saw."""
-    if ENABLED and results is not None:
+    if results is not None and enabled(runner):
         results._decode_carry_seq = next(_SEQ)
 
 
@@ -75,25 +85,19 @@ def clear(runner: Any) -> None:
     runner.__dict__["_decode_carry_state"] = None
 
 
-# VLLM_TPU_T3_CARRY_FAST (IX track 3; default: the VLLM_TPU_T3_HOST master
-# switch): read the mrope position buffer through a cached numpy view of the
-# whole CPU tensor instead of a torch slice per call. Same values, same dtype.
-_T3_FAST = os.environ.get(
-    "VLLM_TPU_T3_CARRY_FAST", os.environ.get("VLLM_TPU_T3_HOST", "0")
-).strip() == "1"
+# The mrope position buffer is read through a cached numpy view of the whole
+# CPU tensor instead of a torch slice per call. Same values, same dtype.
 
 
 def _host_positions(runner: Any, total: int) -> np.ndarray:
     if runner.uses_mrope:
-        if _T3_FAST:
-            cpu = runner.mrope_positions.cpu
-            cached = runner.__dict__.get("_t3_mrope_np")
-            key = (id(cpu), cpu.data_ptr(), tuple(cpu.shape), cpu.dtype)
-            if cached is None or cached[0] != key:
-                cached = (key, cpu.numpy())
-                runner.__dict__["_t3_mrope_np"] = cached
-            return np.asarray(cached[1][:, :total], dtype=np.int64)
-        return np.asarray(runner.mrope_positions.cpu[:, :total].numpy(), dtype=np.int64)
+        cpu = runner.mrope_positions.cpu
+        cached = runner.__dict__.get("_t3_mrope_np")
+        key = (id(cpu), cpu.data_ptr(), tuple(cpu.shape), cpu.dtype)
+        if cached is None or cached[0] != key:
+            cached = (key, cpu.numpy())
+            runner.__dict__["_t3_mrope_np"] = cached
+        return np.asarray(cached[1][:, :total], dtype=np.int64)
     return np.asarray(runner.positions_np[:total], dtype=np.int64)
 
 
@@ -101,13 +105,6 @@ def _layout_is_all(layout_plan: Any) -> bool:
     from vllm_torchtpu.layers.core.sequence_layout import SequenceLayoutKind
 
     return getattr(layout_plan, "kind", None) is SequenceLayoutKind.ALL
-
-
-def _maybe_log() -> None:
-    now = time.monotonic()
-    if now - _LAST_LOG[0] >= 60.0:
-        _LAST_LOG[0] = now
-        print(f"[decode_carry] {STATS}", flush=True)
 
 
 def check(
@@ -122,17 +119,14 @@ def check(
     layout_plan: Any,
 ) -> CarryState | None:
     """The carried state if this step may skip the uploads, else None."""
-    if not ENABLED:
+    if not enabled(runner):
         return None
     st = runner.__dict__.get("_decode_carry_state")
-    res = _check(
+    return _check(
         runner, st, start_index, num_reqs, num_scheduled_tokens_per_req_list,
         total_num_scheduled_tokens, padded_total_num_scheduled_tokens, target_num_reqs,
         layout_plan,
     )
-    STATS["carried" if res is not None else "uploaded"] += 1
-    _maybe_log()
-    return res
 
 
 def _check(runner, st, start_index, num_reqs, nsched_list, total, padded_total, target,
@@ -214,7 +208,7 @@ def record(
     seq_lens: Any,
 ) -> bool:
     """After a fused draft-token subtract: keep its corrected device tensors for the next step."""
-    if not ENABLED:
+    if not enabled(runner):
         return False
     pre = runner._pre_async_results
     src_seq = getattr(pre, "_decode_carry_seq", None) if pre is not None else None
@@ -245,17 +239,3 @@ def record(
     st.step_delta = 1 + int(runner.speculative_config.num_speculative_tokens)
     runner.__dict__["_decode_carry_state"] = st
     return True
-
-
-def compare(carry_out, ref_out) -> None:
-    """Debug: both paths' (seq_lens, positions, input_ids, draft_token_ids) must match."""
-    import torch
-
-    ok = all(torch.equal(a.cpu(), b.cpu()) for a, b in zip(carry_out, ref_out))
-    STATS["check_ok" if ok else "check_bad"] += 1
-    if not ok:
-        print(
-            "[decode_carry] CHECK MISMATCH "
-            + " | ".join(f"{a.cpu().tolist()} vs {b.cpu().tolist()}" for a, b in zip(carry_out, ref_out)),
-            flush=True,
-        )
