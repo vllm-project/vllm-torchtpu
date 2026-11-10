@@ -263,5 +263,7 @@ legs:
         tokenize_prefix_cache: true
       tpu_runner:
         stage_timing: false
+      tpu_scheduler:
+        promote_warmest: false
       tpu_worker:
         numa_bind: true

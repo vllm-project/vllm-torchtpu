@@ -259,5 +259,7 @@ legs:
         fast_compiled_call: true
       tpu_frontend:
         tokenize_prefix_cache: true
+      tpu_scheduler:
+        promote_warmest: false
       tpu_worker:
         numa_bind: true
