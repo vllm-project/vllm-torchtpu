@@ -35,6 +35,7 @@ from vllm.model_executor.layers.quantization.base_config import QuantizationConf
 from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.layers.core.attention_metadata import mamba_ckpt_of, mamba_state_of
 from vllm_torchtpu.block_major_pool import (
     BlockMajorPoolLayout,
     flat_manager_ids,
@@ -1374,7 +1375,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         b = b.contiguous()
         a = a.contiguous()
 
-        state_indices = attn_metadata.mamba_state_indices
+        state_indices = mamba_state_of(attn_metadata)
         assert state_indices is not None
         state_indices = self._bm_state_ids(state_indices.to(torch.int32))
         core_attn_out, z = gdn_pooled_pcp_op(
@@ -1465,10 +1466,9 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 # ssm and conv byte-regions; state ids come from the pool
                 # metadata builder.
                 (recurrent_state,) = kv_cache
-                assert attn_metadata.mamba_state_indices is not None
-                state_indices = self._bm_state_ids(
-                    attn_metadata.mamba_state_indices.to(torch.int32)
-                )
+                md_state = mamba_state_of(attn_metadata)
+                assert md_state is not None
+                state_indices = self._bm_state_ids(md_state.to(torch.int32))
                 # Speculative decoding: the GDN kernel's windowed segment
                 # covers both 1-token decodes and speculative verify
                 # windows (the batch is ordered [decode][verify][prefill]);
@@ -1488,7 +1488,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                         "Speculative decoding with GDN layers requires "
                         "mamba_slot_read_offsets in the attention metadata."
                     )
-                ckpt_indices = getattr(attn_metadata, "mamba_ckpt_indices", None)
+                ckpt_indices = mamba_ckpt_of(attn_metadata)
                 step_metadata: tuple[torch.Tensor, ...] = ()
                 pooled_op = self.gdn_pooled_op
                 prefill_ckpt = getattr(attn_metadata, "mamba_prefill_ckpt", None)
@@ -1562,8 +1562,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 # derived from the attention `block_tables[:, 0]`. Fall back to
                 # `block_tables[:, 0]` only when compact sizing was skipped and
                 # mamba shares the attention block pool (uniform layout).
-                if attn_metadata.mamba_state_indices is not None:
-                    state_indices = attn_metadata.mamba_state_indices.to(torch.int32)
+                if mamba_state_of(attn_metadata) is not None:
+                    state_indices = mamba_state_of(attn_metadata).to(torch.int32)
                 else:
                     max_reqs = attn_metadata.seq_lens.shape[0]
                     max_blocks_per_req = attn_metadata.block_tables.shape[0] // max_reqs

@@ -36,6 +36,7 @@ import torch
 from torch import nn
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.layers.core.attention_metadata import mamba_ckpt_of, mamba_state_of
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.megakernel.wholestep.qsa_full_c import UNION_STATS_REQS
 
@@ -311,9 +312,9 @@ class Qwen38WholeStep(nn.Module):
         for i in self.gdn_ids:
             m = md[self.layers[i].linear_attn.prefix]
             meta += [
-                m.mamba_state_indices.to(torch.int32),
+                mamba_state_of(m).to(torch.int32),
                 m.mamba_slot_read_offsets.to(torch.int32),
-                m.mamba_ckpt_indices.to(torch.int32),
+                mamba_ckpt_of(m).to(torch.int32),
                 m.query_start_loc.to(torch.int32),
                 m.seq_lens.to(torch.int32),
             ]
