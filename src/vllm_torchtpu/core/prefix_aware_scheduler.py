@@ -28,8 +28,11 @@ Enable with:
     --scheduler-cls vllm_torchtpu.core.prefix_aware_scheduler.PrefixAwareScheduler
 """
 
+import time
 from itertools import islice
 from typing import cast
+
+import numpy as np
 
 from vllm.logger import init_logger
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
@@ -41,6 +44,12 @@ from vllm.v1.core.sched.request_queue import (
 from vllm.v1.request import Request
 
 logger = init_logger("vllm." + __name__)
+
+
+def _host_phases_every() -> int:
+    from vllm_torchtpu import envs
+
+    return envs.VLLM_TPU_HOST_PHASES
 
 _LOG_EVERY = 1000
 
@@ -55,12 +64,23 @@ class PrefixAwareScheduler(AsyncScheduler):
     #: Lookahead window of ready requests to evaluate for cached prefix length.
     WINDOW = 64
 
+    # VLLM_TPU_HOST_PHASES instrumentation; class defaults keep it off for
+    # instances built without __init__.
+    _hp_every = 0
+    _hp_n = 0
+    _hp_promote_ns = 0
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._paw_n = 0
         self._paw_cold_tokens = 0
         self._paw_prompt_tokens = 0
         self._paw_scoring_broken = False
+        # VLLM_TPU_HOST_PHASES: engine-side host time per scheduler call.
+        self._hp_every = _host_phases_every()
+        self._hp_samples: dict[str, list[float]] = {}
+        self._hp_n = 0
+        self._hp_promote_ns = 0
 
         logger.info("PrefixAwareScheduler ACTIVE (window=%d)", self.WINDOW)
 
@@ -102,6 +122,8 @@ class PrefixAwareScheduler(AsyncScheduler):
         return queue
 
     def schedule(self, throttle_prefills: bool = False):
+        if self._hp_every:
+            return self._schedule_timed(throttle_prefills)
         queue = getattr(self, "kv_holding_waiting", None) or getattr(
             self, "waiting", None
         )
@@ -109,7 +131,76 @@ class PrefixAwareScheduler(AsyncScheduler):
             self._promote_warmest(queue)
         return super().schedule(throttle_prefills)
 
+    # ---- VLLM_TPU_HOST_PHASES instrumentation (off by default) ----
+    def _hp_note(self, name: str, us: float) -> None:
+        self._hp_samples.setdefault(name, []).append(us)
+
+    def _schedule_timed(self, throttle_prefills: bool):
+        t0 = time.perf_counter_ns()
+        self._hp_promote_ns = 0
+        queue = getattr(self, "kv_holding_waiting", None) or getattr(
+            self, "waiting", None
+        )
+        if queue is not None:
+            self._promote_warmest(queue)
+        out = super().schedule(throttle_prefills)
+        sched_us = (time.perf_counter_ns() - t0) / 1e3
+        promote_us = self._hp_promote_ns / 1e3
+        kind = "admit" if out.scheduled_new_reqs else "other"
+        self._hp_note(f"{kind}.schedule", sched_us)
+        self._hp_note(f"{kind}.promote", promote_us)
+        self._hp_note(f"{kind}.waiting", float(len(queue) if queue is not None else 0))
+        # Read by the runner's host phases (pickled with the dataclass).
+        try:
+            out._host_phases_stamp = (time.time(), promote_us, sched_us)
+        except AttributeError:  # a slotted SchedulerOutput: no stamp
+            pass
+        self._hp_tick()
+        return out
+
+    def update_from_output(self, scheduler_output, model_runner_output):
+        if not self._hp_every:
+            return super().update_from_output(scheduler_output, model_runner_output)
+        t0 = time.perf_counter_ns()
+        out = super().update_from_output(scheduler_output, model_runner_output)
+        self._hp_note("update_from_output", (time.perf_counter_ns() - t0) / 1e3)
+        return out
+
+    def add_request(self, request: Request) -> None:
+        if not self._hp_every:
+            return super().add_request(request)
+        t0 = time.perf_counter_ns()
+        super().add_request(request)
+        self._hp_note("add_request", (time.perf_counter_ns() - t0) / 1e3)
+
+    def _hp_tick(self) -> None:
+        self._hp_n += 1
+        if self._hp_n % self._hp_every:
+            return
+        parts = []
+        for name, values in sorted(self._hp_samples.items()):
+            v = np.asarray(values, dtype=np.float64)
+            parts.append(
+                f"{name}={np.percentile(v, 50):.0f}/{np.percentile(v, 90):.0f}"
+                f"/{v.max():.0f}/n{len(v)}"
+            )
+        logger.info(
+            "SCHEDPHASES calls=%d host us (p50/p90/max/count) %s",
+            self._hp_n,
+            " ".join(parts),
+        )
+        self._hp_samples.clear()
+
     def _promote_warmest(self, queue: RequestQueue) -> None:
+        if not self._hp_every:
+            return self._promote_warmest_impl(queue)
+        t0 = time.perf_counter_ns()
+        try:
+            return self._promote_warmest_impl(queue)
+        finally:
+            self._hp_promote_ns += time.perf_counter_ns() - t0
+
+    def _promote_warmest_impl(self, queue: RequestQueue) -> None:
         """Promote the request with the fewest uncached tokens within WINDOW."""
         if self.policy != SchedulingPolicy.FCFS or len(queue) < 2:
             return
