@@ -1,0 +1,391 @@
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: "{{ .JOB_NAME | default `golden-vllm-torchtpu-qwen35-397b-ix-8k1k` }}"
+  namespace: cloud-devkit-jobs
+spec:
+  successPolicy:
+    operator: All
+    targetReplicatedJobs:
+      - ray-node
+  replicatedJobs:
+    - name: ray-node
+      replicas: 1
+      template:
+        metadata: {}
+        spec:
+          backoffLimit: 0
+          template:
+            spec:
+              restartPolicy: Never
+              nodeSelector:
+                cloud.google.com/gke-tpu-topology: "2x2x1"
+                cloud.google.com/gke-tpu-accelerator: "tpu7x"
+                cloud.google.com/gke-accelerator-count: "4"
+                cloud.google.com/gke-nodepool: "tpu7x-singlehost-2025"
+              volumes:
+                - name: shared-signal
+                  emptyDir: {}
+                - name: dshm
+                  emptyDir:
+                    medium: Memory
+                    sizeLimit: "300Gi"
+                - name: vllm-shared-cache
+                  persistentVolumeClaim:
+                    claimName: vllm-shared-cache-rox-pvc
+                    readOnly: true
+                - name: hf-token-volume
+                  secret:
+                    defaultMode: 420
+                    optional: true
+                    items:
+                      - key: token
+                        path: token
+                    secretName: vllm-hf-token
+
+              containers:
+                # =========================================================================
+                # Container 1: vLLM TorchTPU Inference Server
+                # =========================================================================
+                - name: vllm-node
+                  image: "{{ .IMAGE | default `us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu/torchtpu-vllm-prod:latest` }}"
+                  imagePullPolicy: Always
+                  securityContext:
+                    privileged: true
+                  env:
+                    # --- 1. Model & Server Core Config ---
+                    - name: MODEL_PATH
+                      value: "{{ .MODEL_PATH | default `Qwen/Qwen3.5-397B-A17B-FP8` }}"
+                    - name: SERVED_MODEL_NAME
+                      value: "{{ .SERVED_MODEL_NAME | default `Qwen/Qwen3.5-397B-A17B-FP8` }}"
+                    - name: PORT
+                      value: "8000"
+                    - name: HF_HOME
+                      value: "/vllm-cache"
+                    - name: HF_HUB_OFFLINE
+                      value: "1"
+                    - name: VLLM_LOGGING_LEVEL
+                      value: "INFO"
+                    - name: TF_CPP_MIN_LOG_LEVEL
+                      value: "3"
+                    - name: VLLM_ENGINE_READY_TIMEOUT_S
+                      value: "7200"
+
+                    # --- 2. Ultra-Fast In-Memory (/dev/shm) Caches ---
+                    - name: TMPDIR
+                      value: "/dev/shm"
+                    - name: RAY_TMPDIR
+                      value: "/dev/shm/ray_tmp"
+                    - name: TRITON_CACHE_DIR
+                      value: "/dev/shm/triton_cache"
+                    - name: VLLM_CACHE_ROOT
+                      value: "/dev/shm/vllm_cache"
+                    - name: VLLM_CONFIG_ROOT
+                      value: "/dev/shm/vllm_config"
+                    - name: XDG_CACHE_HOME
+                      value: "/dev/shm/xdg_cache"
+                    - name: TORCH_TPU_CACHE_DIR
+                      value: "/dev/shm/torch_tpu_cache"
+                    - name: TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE
+                      value: "/dev/shm/torch_tpu_cache"
+                    - name: JAX_COMPILER_CACHE_DIR
+                      value: "/dev/shm/jax_cache"
+                    - name: JAX_COMPILATION_CACHE_DIR
+                      value: "/dev/shm/jax_cache"
+                    - name: TPU_LOG_DIR
+                      value: "/dev/shm/tpu_logs"
+                    - name: TPU_PARALLEL_PRECOMPILE
+                      value: "1"
+
+                    # --- 3. TPU Hardware & XLA Optimization Knobs ---
+                    - name: TPU_VMODULE
+                      value: "tpu_pjrt_client=1,pjrt_stream_executor_client=1,tpu_pjrt_compiler_utils=1"
+                    - name: TPU_STDERR_LOG_LEVEL
+                      value: "0"
+                    - name: TPU_PREMAPPED_BUFFER_SIZE
+                      value: "17179869184"
+                    - name: TPU_PREMAPPED_BUFFER_TRANSFER_THRESHOLD_BYTES
+                      value: "17179869184"
+                    - name: TPU_PROCESS_PORT
+                      value: "8471"
+                    - name: TPU_WORKER_ID
+                      value: "0"
+                    - name: CLOUD_TPU_TASK_ID
+                      value: "0"
+                    - name: TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL
+                      value: "0"
+                    - name: VLLM_XLA_CHECK_RECOMPILATION
+                      value: "0"
+                    - name: LIBTPU_INIT_ARGS
+                      value: " --xla_tpu_use_minor_sharding_for_major_trivial_input=true --xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=false --xla_tpu_ars_combiner_threshold_in_bytes=0 --xla_tpu_enable_async_collective_merger=false --xla_tpu_enable_sparse_core_collective_offload_all_reduce=true --xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=true --xla_tpu_enable_sparse_core_collective_offload_all_gather=true --xla_tpu_enable_sparse_core_collective_offload_2d_all_gather=true --xla_tpu_enable_async_collective_fusion_fuse_all_gather=false"
+
+                    # --- 4. MoE Architecture & Attention Kernels ---
+                    - name: TPU_TOKEN_BUCKET_EXTRA
+                      value: "4,8,48"
+                    - name: TPU_ROPE_CACHE_TRUNCATE
+                      value: "1"
+                    - name: TPU_MOE_SKIP_PADDED_TOKENS
+                      value: "1"
+                    - name: MOE_LOCAL_EXPERT_AFFINITY_EPSILON
+                      value: "0.01"
+                    - name: ATTN_BUCKETIZED_NUM_REQS
+                      value: "true"
+                    - name: ATTN_CUSTOM_NUM_REQS_BUCKETS
+                      value: "8,16,32,64"
+                    - name: VLLM_MOE_CHUNK_SIZE
+                      value: "256"
+                    - name: ONEHOT_MOE_PERMUTE_THRESHOLD
+                      value: "32768"
+                    - name: DP_SCHED_BATCH_PREFILL
+                      value: "1"
+                    - name: NEW_MODEL_DESIGN
+                      value: "0"
+                    - name: USE_MOE_EP_KERNEL
+                      value: "0"
+                    - name: RAGGED_GATED_DELTA_RULE_IMPL
+                      value: "chunked_kernel_v3_pd"
+                    - name: MODEL_IMPL_TYPE
+                      value: "vllm"
+                    - name: USE_MOE_SPARSE_CORE
+                      value: "1"
+
+                    # --- 5. Optional Profiling Knobs (Perfetto / XProf) ---
+                    {{- if or (eq (.ENABLE_XPROF | default "false") "true") (eq (.ENABLE_PERFETTO | default "false") "true") }}
+                    - name: TPU_PJRT_EVENT_TRACE_ENABLE
+                      value: "1"
+                    {{- end }}
+
+                  volumeMounts:
+                    - name: shared-signal
+                      mountPath: /tmp/signal
+                    - name: vllm-shared-cache
+                      mountPath: /vllm-cache
+                      readOnly: true
+                    - name: dshm
+                      mountPath: /dev/shm
+                    - name: hf-token-volume
+                      mountPath: /root/.cache/huggingface/token
+                      readOnly: true
+                      subPath: token
+
+                  command: [ "/bin/bash", "-c" ]
+                  args:
+                    - |
+                      set -eo pipefail
+                      export PYTHONUNBUFFERED=1
+
+                      # Initialize ramdisk cache folders
+                      mkdir -p /dev/shm/{jax,torch_tpu,triton,vllm,ray,tpu_logs,xprof}_cache /dev/shm/{vllm_config,xdg_cache,xprof}
+
+                      CONCURRENCY="{{ .CONCURRENCY | default `32` }}"
+
+                      # Concurrency-adaptive Parallelism & Batching Auto-Tuning
+                      case "$CONCURRENCY" in
+                        4)   TP=8; DP=1; MAX_SEQS=8;  MAX_BATCH=16384 ;;
+                        8)   TP=8; DP=1; MAX_SEQS=16; MAX_BATCH=16384 ;;
+                        16)  TP=8; DP=1; MAX_SEQS=32; MAX_BATCH=16384 ;;
+                        32)  TP=8; DP=1; MAX_SEQS=64; MAX_BATCH=16384 ;;
+                        64)  TP=2; DP=4; MAX_SEQS=32; MAX_BATCH=4096  ;;
+                        128) TP=1; DP=8; MAX_SEQS=32; MAX_BATCH=2048  ;;
+                        256) TP=1; DP=8; MAX_SEQS=64; MAX_BATCH=2048  ;;
+                        *)   TP=8; DP=1; MAX_SEQS=32; MAX_BATCH=16384 ;;
+                      esac
+
+                      # Dynamic DP optimization flags
+                      if [ "$DP" -gt 1 ]; then
+                        export DP_SCHED_ENABLED=1
+                        export TPU_TOKEN_BUCKET_LINEAR_UNTIL=64
+                        export TPU_TOKEN_BUCKET_LINEAR_INTERVAL=16
+                      fi
+
+                      # Background listener for benchmark completion signal
+                      (
+                        rm -rf /tmp/signal/* && mkdir -p /tmp/signal
+                        while [ ! -f /tmp/signal/done ]; do sleep 2; done
+                        echo "Signal received! Gracefully terminating vLLM server..."
+                        python3 -c "import os, signal; [os.kill(int(p), signal.SIGTERM) for p in os.listdir('/proc') if p.isdigit() and int(p) > 1 and 'python' in open(f'/proc/{p}/cmdline', errors='ignore').read()]" || true
+                        exit 0
+                      ) &
+
+                      VLLM_ARGS=(
+                        --model "$MODEL_PATH"
+                        --served-model-name "$SERVED_MODEL_NAME"
+                        --host 0.0.0.0
+                        --port "$PORT"
+                        --tensor-parallel-size "$TP"
+                        --data-parallel-size "$DP"
+                        --max-model-len "{{ .MAX_MODEL_LEN | default "16384" }}"
+                        --quantization "{{ .QUANTIZATION | default "fp8" }}"
+                        --max-num-batched-tokens "$MAX_BATCH"
+                        --max-num-seqs "$MAX_SEQS"
+                        --async-scheduling
+                        --prefill-schedule-interval 256
+                        --no-enable-prefix-caching
+                        --gpu-memory-utilization 0.9
+                        --kv-cache-dtype fp8
+                        --language-model-only
+                        --enable-expert-parallel
+                        --attention-backend CUSTOM
+                        --block-size 256
+                        --limit-mm-per-prompt '{"image":0,"video":0}'
+                        --default-chat-template-kwargs '{"enable_thinking":false}'
+                      )
+
+                      {{- if or (eq (.ENABLE_XPROF | default "false") "true") (eq (.ENABLE_PERFETTO | default "false") "true") }}
+                      VLLM_ARGS+=(
+                        --profiler-config.profiler=torch
+                        --profiler-config.torch_profiler_dir=/dev/shm/xprof
+                        --profiler-config.ignore_frontend=true
+                      )
+                      {{- end }}
+
+                      echo "Starting vLLM TPU server (model=$MODEL_PATH, conc=$CONCURRENCY, TP=$TP, DP=$DP, max_seqs=$MAX_SEQS, max_batch=$MAX_BATCH)..."
+                      vllm serve "${VLLM_ARGS[@]}" || true
+                      exit 0
+
+                  resources:
+                    limits:
+                      google.com/tpu: 4
+                      memory: "900Gi"
+                      cpu: "200"
+                      ephemeral-storage: "100Gi"
+                    requests:
+                      google.com/tpu: 4
+                      memory: "900Gi"
+                      cpu: "200"
+                      ephemeral-storage: "100Gi"
+
+                # =========================================================================
+                # Container 2: InferenceX Benchmark Client
+                # =========================================================================
+                - name: bench-client
+                  image: "{{ .BENCH_IMAGE | default `us-central1-docker.pkg.dev/cloud-tpu-inference-test/inferencex/inferencex-bench:latest` }}"
+                  imagePullPolicy: Always
+                  env:
+                    - name: MODEL_PATH
+                      value: "{{ .MODEL_PATH | default `Qwen/Qwen3.5-397B-A17B-FP8` }}"
+                    - name: SERVED_MODEL_NAME
+                      value: "{{ .SERVED_MODEL_NAME | default `Qwen/Qwen3.5-397B-A17B-FP8` }}"
+                    - name: PORT
+                      value: "8000"
+                    - name: CONCURRENCY
+                      value: "{{ .CONCURRENCY | default `32` }}"
+                    - name: BENCH_NAME
+                      value: "{{ .BENCH_NAME | default `golden-vllm-torchtpu-qwen3.5-397b-ix-8k1k` }}"
+                    - name: TPU_CHIPS
+                      value: "4"
+
+                  volumeMounts:
+                    - name: shared-signal
+                      mountPath: /tmp/signal
+                    - name: dshm
+                      mountPath: /dev/shm
+
+                  command: [ "/bin/bash", "-c" ]
+                  args:
+                    - |
+                      set -o pipefail
+                      trap 'mkdir -p /tmp/signal && touch /tmp/signal/done' EXIT
+                      export PYTHONUNBUFFERED=1
+
+                      : "${CDK_OUTPUT_DIR:=/tmp/cdk-outputs}"
+                      export CDK_OUTPUT_DIR
+                      mkdir -p "$CDK_OUTPUT_DIR"
+
+                      OUTPUT_DIR=/tmp/bench_results
+                      mkdir -p "$OUTPUT_DIR"
+
+                      # Locate benchmark_serving.py
+                      if [ ! -f "benchmark_serving.py" ]; then
+                        BENCH_LOC="$(find / -name benchmark_serving.py 2>/dev/null | head -n 1)"
+                        if [ -n "$BENCH_LOC" ]; then
+                          cd "$(dirname "$BENCH_LOC")"
+                        fi
+                      fi
+
+                      num_prompts=$((CONCURRENCY * 10))
+                      num_warmups=$((CONCURRENCY * 2))
+
+                      echo "============================================================"
+                      echo "=== Running Benchmark: Concurrency=$CONCURRENCY, Prompts=$num_prompts, Warmups=$num_warmups ==="
+                      echo "============================================================"
+
+                      # Wait for server readiness
+                      echo "Waiting for vLLM server to be ready on port $PORT..."
+                      while ! curl -sf "http://localhost:$PORT/health" >/dev/null 2>&1; do
+                        sleep 5
+                      done
+                      echo "vLLM server ready!"
+
+                      result_file="result_c${CONCURRENCY}_8k1k.json"
+
+                      {{- if or (eq (.ENABLE_XPROF | default "false") "true") (eq (.ENABLE_PERFETTO | default "false") "true") }}
+                      echo "Triggering Profiler / Perfetto start via HTTP..."
+                      curl -sf -X POST "http://localhost:$PORT/start_profile" || true
+                      {{- end }}
+
+                      echo "trace-start-event: name=benchmark-c${CONCURRENCY} ts=$(date +%s.%N) pid=bench tid=bench"
+
+                      python3 benchmark_serving.py \
+                          --backend vllm \
+                          --model "$MODEL_PATH" \
+                          --tokenizer "$MODEL_PATH" \
+                          --served-model-name "$SERVED_MODEL_NAME" \
+                          --host localhost \
+                          --port "$PORT" \
+                          --dataset-name random \
+                          --random-input-len 8192 \
+                          --random-output-len 1024 \
+                          --random-range-ratio 0.8 \
+                          --num-prompts "$num_prompts" \
+                          --num-warmups "$num_warmups" \
+                          --max-concurrency "$CONCURRENCY" \
+                          --request-rate inf \
+                          --ignore-eos \
+                          --save-result \
+                          --result-dir "$OUTPUT_DIR" \
+                          --result-filename "$result_file" \
+                          --percentile-metrics 'ttft,tpot,itl,e2el' 2>&1 | tee "/tmp/bench.log"
+                      bench_exit=${PIPESTATUS[0]}
+
+                      echo "trace-end-event: name=benchmark-c${CONCURRENCY} ts=$(date +%s.%N) pid=bench tid=bench"
+
+                      {{- if or (eq (.ENABLE_XPROF | default "false") "true") (eq (.ENABLE_PERFETTO | default "false") "true") }}
+                      echo "Triggering Profiler / Perfetto stop via HTTP..."
+                      curl -sf -X POST "http://localhost:$PORT/stop_profile" || true
+                      echo "Copying profile / Perfetto traces to CDK output dirs..."
+                      sleep 5
+                      mkdir -p "$CDK_OUTPUT_DIR/xprof" "$CDK_OUTPUT_DIR/outputs/xprof" /cdk-outputs/outputs/xprof /cdk-outputs/xprof 2>/dev/null || true
+                      find /dev/shm/xprof -type f -exec cp {} "$CDK_OUTPUT_DIR/outputs/xprof/" \; 2>/dev/null || true
+                      find /dev/shm/xprof -type f -exec cp {} "$CDK_OUTPUT_DIR/xprof/" \; 2>/dev/null || true
+                      find /dev/shm/xprof -type f -exec cp {} /cdk-outputs/outputs/xprof/ \; 2>/dev/null || true
+                      find /dev/shm/xprof -type f -exec cp {} /cdk-outputs/xprof/ \; 2>/dev/null || true
+                      {{- end }}
+
+                      # Parse JSON output and compute Per-Chip Throughput & Interactivity
+                      bench_metrics=$(python3 -c "
+                      import json, os
+                      p = '$OUTPUT_DIR/$result_file'
+                      if os.path.exists(p):
+                          with open(p) as f:
+                              d = json.load(f)
+                          chips = int(os.environ.get('TPU_CHIPS', 4))
+                          d['num_chips'] = chips
+                          tot = d.get('total_token_throughput_tok_s') or d.get('total_token_throughput') or 0
+                          if tot:
+                              d['token_throughput_per_chip'] = round(float(tot) / chips, 2)
+                          tpot = d.get('median_tpot_ms') or d.get('mean_tpot_ms') or 0
+                          if tpot and float(tpot) > 0:
+                              d['interactivity'] = round(1000.0 / float(tpot), 2)
+                          print(json.dumps(d, separators=(',', ':')))
+                      else:
+                          print('{}')
+                      " 2>/dev/null || echo "{}")
+
+                      echo "Parsed Metrics: $bench_metrics"
+
+                      result-updater "{\"exit_code\": $bench_exit, \"bench\": \"${BENCH_NAME}-c${CONCURRENCY}\", \"metrics\": $bench_metrics}" || echo "WARNING: result-updater failed"
+
+                      echo "Benchmark completed (exit=$bench_exit). Signaling server to shutdown..."
+                      mkdir -p /tmp/signal && touch /tmp/signal/done
+                      exit "$bench_exit"
