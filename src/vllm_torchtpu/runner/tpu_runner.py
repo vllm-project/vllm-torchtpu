@@ -1481,11 +1481,11 @@ class TPUModelRunner(GPUModelRunner):
     ) -> bool:
         """Whether to record the KV-transfer stage timings.
 
-        Only with ``tpu_runner.stage_timing`` on, and only when the KV connector
-        has a `TpuKVConnectorStats` sink, since the timings feed nothing else.
-        Off by default: their per-stage TpuEvent records cost about 0.4-0.5 ms
-        per served decode step at batch 1-2 under P/D (chunk median 3.99 ->
-        3.56 ms, j-d4cdaa23 vs j-a0ce6156).
+        Only with ``tpu_runner.stage_timing`` on (the default), and only when the
+        KV connector has a `TpuKVConnectorStats` sink, since the timings feed
+        nothing else. Turning it off saves their per-stage TpuEvent records,
+        about 0.4-0.5 ms per served decode step at batch 1-2 under P/D (chunk
+        median 3.99 -> 3.56 ms, j-d4cdaa23 vs j-a0ce6156).
         """
         return options.stage_timing and kv_uses_stage_timing
 

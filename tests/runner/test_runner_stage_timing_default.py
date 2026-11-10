@@ -11,8 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The KV-transfer stage timings are off by default; ``tpu_runner.stage_timing``
-turns them on when the KV connector has a stats sink to feed."""
+"""The KV-transfer stage timings are on by default, as on main, when the KV
+connector has a stats sink to feed; ``tpu_runner.stage_timing`` turns them
+off."""
 
 from types import SimpleNamespace
 
@@ -26,7 +27,7 @@ from vllm_torchtpu.runner.utils import RUNNER_OPTIONS_SECTION
 @pytest.mark.parametrize(
     "stage_timing,kv_uses,want",
     [
-        (False, True, False),  # off by default under P/D
+        (False, True, False),  # turned off under P/D
         (False, False, False),
         (True, True, True),
         (True, False, False),  # no stats sink, nothing to feed
@@ -37,21 +38,28 @@ def test_stage_timing_enabled(stage_timing, kv_uses, want):
     assert TPUModelRunner._stage_timing_enabled(options, kv_uses) is want
 
 
-def test_the_former_environment_switches_have_no_effect(monkeypatch):
-    monkeypatch.setenv("TPU_RUNNER_STAGE_TIMING_MODE", "on")
-    monkeypatch.setenv("TPU_RUNNER_STAGE_TIMING", "1")
+def test_stage_timing_is_on_by_default_as_on_main():
     options = runner_options.get(SimpleNamespace(additional_config={}))
-    assert TPUModelRunner._stage_timing_enabled(options, True) is False
+    assert options.stage_timing is True
+    assert TPUModelRunner._stage_timing_enabled(options, True) is True
+    assert TPUModelRunner._stage_timing_enabled(options, False) is False
+
+
+def test_the_former_environment_switches_have_no_effect(monkeypatch):
+    monkeypatch.setenv("TPU_RUNNER_STAGE_TIMING_MODE", "off")
+    monkeypatch.setenv("TPU_RUNNER_STAGE_TIMING", "0")
+    options = runner_options.get(SimpleNamespace(additional_config={}))
+    assert TPUModelRunner._stage_timing_enabled(options, True) is True
 
 
 def test_options_come_from_the_tpu_runner_section():
     assert runner_options.SECTION == RUNNER_OPTIONS_SECTION == "tpu_runner"
-    on = SimpleNamespace(additional_config={"tpu_runner": {"stage_timing": True}})
-    assert runner_options.get(on).stage_timing is True
+    off = SimpleNamespace(additional_config={"tpu_runner": {"stage_timing": False}})
+    assert runner_options.get(off).stage_timing is False
     assert runner_options.get(SimpleNamespace(additional_config=None)) == (
         runner_options.RunnerOptions()
     )
-    assert runner_options.get(SimpleNamespace()).stage_timing is False
+    assert runner_options.get(SimpleNamespace()).stage_timing is True
 
 
 @pytest.mark.parametrize(
