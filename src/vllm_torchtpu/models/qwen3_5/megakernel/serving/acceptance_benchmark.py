@@ -252,6 +252,9 @@ def _common_vllm_serve_args(
         "--async-scheduling",
         "--prefill-schedule-interval",
         "1",
+        # Text-only: the megakernel declines a server that accepts multimodal
+        # inputs, and zeroed limits alone still leave the runner multimodal.
+        "--language-model-only",
         "--limit-mm-per-prompt",
         '{"image":0,"video":0}',
         "--speculative-config",

@@ -131,6 +131,7 @@ def test_arm_commands_and_env_match_candidate30_specs():
     assert cmd_a_c16[cmd_a_c16.index("--max-num-seqs") + 1] == "16"
     assert "--enable-prefix-caching" in cmd_a_c16
     assert "--async-scheduling" in cmd_a_c16
+    assert "--language-model-only" in cmd_a_c16
     assert "--mamba-ssm-cache-dtype" not in cmd_a_c16
     kv_cfg_c16 = json.loads(cmd_a_c16[cmd_a_c16.index("--kv-transfer-config") + 1])
     assert kv_cfg_c16["kv_connector_extra_config"]["cpu_bytes_to_use"] == 400 * 1024**3
@@ -140,6 +141,7 @@ def test_arm_commands_and_env_match_candidate30_specs():
         mod.CONCURRENCY_SPECS["c32"],
     )
     assert cmd_b_c32[:2] == ["vllm", "serve"]
+    assert "--language-model-only" in cmd_b_c32
     assert cmd_b_c32[cmd_b_c32.index("--mamba-ssm-cache-dtype") + 1] == "bfloat16"
     assert cmd_b_c32[cmd_b_c32.index("--max-num-seqs") + 1] == "32"
     spec_cfg = json.loads(cmd_b_c32[cmd_b_c32.index("--speculative-config") + 1])
