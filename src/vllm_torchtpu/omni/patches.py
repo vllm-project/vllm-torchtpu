@@ -659,7 +659,8 @@ def _patch_ltx2_per_sample_timestep() -> None:
     # token, and every block materializes its AdaLN scale/shift/gate tables
     # per token ((1, 3520, 6, 4096) for the video self-attention and FFN
     # alone at 704x1280x121 under Ulysses 4) plus relayout copies of them:
-    # ~80 ms of the ~470 ms of device time per step on a v7x core. The
+    # ~80 ms of the ~470 ms of device time per step on a v7x core in a
+    # profile (58 ms per step end to end). The
     # transformer also takes per-sample (1-D) timesteps, which the SP hook
     # leaves unsplit; their (1, 1, ...) tables broadcast over the tokens.
     # Conditioned requests still replace the video timestep with their

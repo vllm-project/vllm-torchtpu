@@ -948,6 +948,20 @@ def test_supports_talker_mtp_graph_capture_disabled():
     assert OmniTpuPlatform().supports_talker_mtp_graph_capture() is False
 
 
+def _ltx2_denoise_ctx(conditioning_mask, batch=2, video_tokens=7, audio_tokens=3):
+    # The real vLLM-Omni denoise context, so a renamed conditioning_mask
+    # field fails here (TypeError) instead of passing with a stand-in.
+    from vllm_omni.diffusion.models.ltx2.ltx2_denoise import LTXDenoiseContext
+
+    return LTXDenoiseContext(
+        latents=torch.zeros(batch, video_tokens, 4),
+        audio_latents=torch.zeros(batch, audio_tokens, 4),
+        video_coords=torch.zeros(batch, 3, video_tokens, 2),
+        audio_coords=torch.zeros(batch, 1, audio_tokens, 2),
+        conditioning_mask=conditioning_mask,
+    )
+
+
 def test_ltx2_per_sample_timestep_patch(monkeypatch):
     runtime_cls = ltx2_runtime.LTXRuntime
     monkeypatch.setattr(
@@ -970,14 +984,14 @@ def test_ltx2_per_sample_timestep_patch(monkeypatch):
     ts = torch.tensor([500.0, 250.0])
     counts = {"video_token_count": 7, "audio_token_count": 3}
 
-    unconditioned = SimpleNamespace(conditioning_mask=None)
+    unconditioned = _ltx2_denoise_ctx(None)
     kwargs = runtime._denoise_timestep_kwargs(ts, None, unconditioned, **counts)
     assert kwargs["timestep"].shape == (2,)
     assert kwargs["audio_timestep"].shape == (2,)
     torch.testing.assert_close(kwargs["timestep"], ts)
     torch.testing.assert_close(kwargs["sigma"], ts)
 
-    conditioned = SimpleNamespace(conditioning_mask=torch.ones(2, 7))
+    conditioned = _ltx2_denoise_ctx(torch.ones(2, 7))
     kwargs = runtime._denoise_timestep_kwargs(ts, None, conditioned, **counts)
     assert kwargs["timestep"].shape == (2, 7)
     assert kwargs["audio_timestep"].shape == (2, 3)
