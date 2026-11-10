@@ -178,7 +178,7 @@ def main():
                 len(wsh[n]) if kernel.is_tupled_weight(wsh[n]) else 1
                 for n in p.w_names[:i_sm]
             )
-            sm = np.asarray(ws[k_sm]).reshape(R, L, 1, -1)
+            sm = np.array(ws[k_sm]).reshape(R, L, 1, -1)
             sm[:, :, 0, o : o + w_] = rows[None, :, :w_]
             ws[k_sm] = jax.device_put(jnp.asarray(sm.reshape(R * L, 1, -1)), tp)
         rng = np.random.default_rng(0)
