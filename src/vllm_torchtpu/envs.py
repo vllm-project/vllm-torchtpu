@@ -272,6 +272,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MAMBA_DECODE_CHECKPOINT: bool = True
     VLLM_TPU_MAMBA_TAIL_FOLD: bool = False
     VLLM_TPU_MAMBA_TAIL_FOLD_UNIT: int = 0
+    VLLM_TPU_MAMBA_TAIL_FOLD_DCP: bool = False
     VLLM_TORCHTPU_IPC_KEY: str = ""
     TPU_SHARDED_LOAD_SYNC_EVERY: int = 512
     VLLM_TPU_MXFP4_DEVICE_DEQUANT: bool = True
@@ -1807,6 +1808,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # stops at most unit - 1 tokens short of the prior prompt instead of up
     # to 511. Also sets --prefix-match-unit to the unit when it is unset.
     "VLLM_TPU_MAMBA_TAIL_FOLD_UNIT": env_int("VLLM_TPU_MAMBA_TAIL_FOLD_UNIT", 0),
+    # With VLLM_TPU_MAMBA_TAIL_FOLD: also fold under the Qwen4Exp main-KV DCP
+    # (VLLM_TPU_QSA_MAIN_KV_DCP > 1), which shards only the target QSA main KV;
+    # the Mamba specs, tables and states are not sharded. Off: the fold turns
+    # itself off under any context parallelism. vLLM DCP / PCP stay off.
+    "VLLM_TPU_MAMBA_TAIL_FOLD_DCP": env_bool(
+        "VLLM_TPU_MAMBA_TAIL_FOLD_DCP", default=False
+    ),
     # Secret for the KV-transfer IPC socket; "" derives one from the host.
     # Read raw, not through env_str: a secret's bytes must not be trimmed.
     "VLLM_TORCHTPU_IPC_KEY": lambda: os.getenv("VLLM_TORCHTPU_IPC_KEY", ""),

@@ -47,9 +47,9 @@ from functools import wraps
 
 import numpy as np
 import torch
-from vllm.logger import init_logger
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
 
@@ -93,17 +93,19 @@ _DCP_LOGGED: set[str] = set()
 def fold_blocked_by_context_parallel(cfg, main_kv_dcp: int) -> str | None:
     """Why the fold must stay off for this deployment (None: allowed).
 
-    Any context parallelism turns it off: vLLM DCP / PCP, or the Qwen4Exp
-    main-KV DCP (``VLLM_TPU_QSA_MAIN_KV_DCP``). Under main-KV DCP the
-    scheduler block is ``dcp x`` the Mamba block, so the scheduler guard
-    rejects the geometry, but the worker still saw checkpoint-carrying specs
-    and ran the fold's metadata path (za5 c48 j-5378b21d). Leaving the
-    checkpoint off the specs keeps both sides off consistently. Logged once
-    per reason and process.
+    By default any context parallelism turns it off: vLLM DCP / PCP, or the
+    Qwen4Exp main-KV DCP (``VLLM_TPU_QSA_MAIN_KV_DCP``). Leaving the
+    checkpoint off the specs keeps the scheduler, the manager and the worker
+    off together. ``VLLM_TPU_MAMBA_TAIL_FOLD_DCP=1`` allows main-KV DCP: it
+    shards only the target QSA main KV (2B-token entries); the Mamba specs
+    keep block B, their tables and states are not sharded, and the
+    scheduler geometry (hash B, partial hits on the 2B scheduler block) is
+    the one the scheduler guard accepts. vLLM DCP / PCP stay off. Logged
+    once per reason and process.
     """
     p = getattr(cfg, "parallel_config", None)
     reason = None
-    if main_kv_dcp > 1:
+    if main_kv_dcp > 1 and not envs.VLLM_TPU_MAMBA_TAIL_FOLD_DCP:
         reason = f"VLLM_TPU_QSA_MAIN_KV_DCP={main_kv_dcp}"
     elif int(getattr(p, "decode_context_parallel_size", 1) or 1) > 1:
         reason = f"decode_context_parallel_size={p.decode_context_parallel_size}"
