@@ -14,5 +14,20 @@
 """StreamIndex top-k for the QSA (query-sparse attention) indexer."""
 
 from .streamindex_topk import get_kv_cache_shape, streamindex_topk
+from .topk_backend import (
+    BisectTopK,
+    SparseCoreTopK,
+    TensorCoreTopK,
+    TopKBackend,
+    default_topk_backend,
+)
 
-__all__ = ["get_kv_cache_shape", "streamindex_topk"]
+__all__ = [
+    "BisectTopK",
+    "SparseCoreTopK",
+    "TensorCoreTopK",
+    "TopKBackend",
+    "default_topk_backend",
+    "get_kv_cache_shape",
+    "streamindex_topk",
+]

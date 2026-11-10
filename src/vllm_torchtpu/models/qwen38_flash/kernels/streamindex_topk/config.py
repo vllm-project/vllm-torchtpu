@@ -103,10 +103,12 @@ DEFAULT_BUFFER_COUNT: tuple[int, int, int] = (4, 3, 3)
 # the counter restarts for every program, the ids, and with them the key,
 # depend on which programs this process traced before, and two ranks building
 # the same bucket in a different order miss each other's cached executable.
-# `TpuCompiler` restarts only the reference kernel's counter today. When the
-# QSA custom ops are wired into the model, it must also call this copy's
-# `reset_scheduling_group_ids()` and hash `models/qwen38_flash/kernels/` into
-# the cache key.
+# Only a selector that overlaps scoring reserves ids: `BisectTopK`
+# (`overlaps_scoring=False`) never does, so programs that select with it carry
+# no ids. `TpuCompiler` restarts only the reference kernel's counter today.
+# When the QSA custom ops are wired into the model, it must also call this
+# copy's `reset_scheduling_group_ids()` and hash `models/qwen38_flash/kernels/`
+# into the cache key.
 _scheduling_group_ids = itertools.count(1)
 _scheduling_group_ids_lock = threading.Lock()
 
