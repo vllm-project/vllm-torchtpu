@@ -316,3 +316,47 @@ def test_conn_stats_throttled(monkeypatch):
 def test_conn_stats_polled_when_runner_timings_pending(monkeypatch):
     outs, n = _get_finished(monkeypatch, 4, samples=([1.0], []))
     assert n == 8 and all(o is not None for o in outs)
+
+
+# --- VLLM_TPU_T3_SWITCH_US / VLLM_TPU_T3_GC step knobs ------------------------
+
+
+def test_step_knobs_off_by_default():
+    assert t3_host.STEP_HOOK is (t3_host.SWITCH_US > 0 or t3_host.GC_MODE == "freeze")
+
+
+def test_switch_interval_applied_from_the_first_step(monkeypatch):
+    import gc as gc_mod
+
+    orig = sys.getswitchinterval()
+    monkeypatch.setattr(t3_host, "SWITCH_US", 200.0)
+    monkeypatch.setattr(t3_host, "GC_MODE", "")
+    monkeypatch.setattr(t3_host, "_hook", {"n": 0, "applied": False, "frozen": False})
+    try:
+        t3_host.on_step()
+        assert abs(sys.getswitchinterval() - 200e-6) < 1e-9
+        t3_host.on_step()
+        assert abs(sys.getswitchinterval() - 200e-6) < 1e-9
+    finally:
+        sys.setswitchinterval(orig)
+        gc_mod.set_threshold(*t3_host._DEFAULT_GC_THRESH)
+
+
+def test_gc_freeze_after_n_steps(monkeypatch):
+    import gc as gc_mod
+
+    orig = gc_mod.get_threshold()
+    monkeypatch.setattr(t3_host, "SWITCH_US", 0.0)
+    monkeypatch.setattr(t3_host, "GC_MODE", "freeze")
+    monkeypatch.setattr(t3_host, "_GC_AFTER", 3)
+    monkeypatch.setattr(t3_host, "_GC_GEN0", 12345)
+    monkeypatch.setattr(t3_host, "_hook", {"n": 0, "applied": False, "frozen": False})
+    try:
+        t3_host.on_step(); t3_host.on_step()
+        assert gc_mod.get_threshold()[0] == orig[0] and not t3_host._hook["frozen"]
+        t3_host.on_step()
+        assert t3_host._hook["frozen"] and gc_mod.get_threshold()[0] == 12345
+        assert gc_mod.get_freeze_count() > 0
+    finally:
+        gc_mod.unfreeze()
+        gc_mod.set_threshold(*orig)
