@@ -14,7 +14,6 @@
 
 import contextlib
 import copy
-import functools
 import inspect
 import weakref
 from collections import defaultdict
@@ -111,7 +110,9 @@ def _spec_warmup_runner(spec, config, captured, *, async_scheduling):
     runner = SimpleNamespace(
         max_model_len=40960,
         speculative_config=SimpleNamespace(num_speculative_tokens=3),
-        scheduler_config=SimpleNamespace(async_scheduling=async_scheduling),
+        scheduler_config=SimpleNamespace(
+            async_scheduling=async_scheduling, max_num_seqs=8
+        ),
         kv_cache_config=SimpleNamespace(
             num_blocks=4096, kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec)]
         ),
@@ -122,9 +123,6 @@ def _spec_warmup_runner(spec, config, captured, *, async_scheduling):
         _warmup_spec_decode_cleanup=lambda rids: True,
         requests=_warmup_requests(),
     )
-    runner._spec_warmup_nct_stride = functools.partial(
-        TPUModelRunner._spec_warmup_nct_stride, runner
-    )
     return runner
 
 
@@ -132,7 +130,9 @@ def _spec_warmup_runner(spec, config, captured, *, async_scheduling):
 def test_spec_warmup_nct_stride_follows_the_scheduler(async_scheduling, stride):
     runner = SimpleNamespace(
         speculative_config=SimpleNamespace(num_speculative_tokens=3),
-        scheduler_config=SimpleNamespace(async_scheduling=async_scheduling),
+        scheduler_config=SimpleNamespace(
+            async_scheduling=async_scheduling, max_num_seqs=8
+        ),
     )
     assert TPUModelRunner._spec_warmup_nct_stride(runner) == stride
 
