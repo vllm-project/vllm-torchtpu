@@ -172,6 +172,7 @@ from vllm_torchtpu.platforms.tpu_block_size_utils import unified_kv_layout_enabl
 from vllm_torchtpu.runner import (
     greedy_top_tokens,
     prompt_logprobs,
+    runner_options,
     spec_boundary_state,
 )
 from vllm_torchtpu.runner import min_tokens as min_tokens_mask
@@ -1467,31 +1468,26 @@ class TPUModelRunner(GPUModelRunner):
         self._greedy_head_owner: torch.nn.Module | None = None
 
         self._init_phased_profiling()
-        _st_enabled, _st_mode = self._stage_timing_enabled(
-            self._kv_transfer_uses_stage_timing(self.vllm_config)
+        stage_timing = self._stage_timing_enabled(
+            runner_options.get(self.vllm_config),
+            self._kv_transfer_uses_stage_timing(self.vllm_config),
         )
-        logger.info("Runner stage timing: %s (TPU_RUNNER_STAGE_TIMING_MODE=%s)",
-                    "on" if _st_enabled else "off", _st_mode)
-        self._stage_timing = RunnerStageTiming(profiler_rank, enabled=_st_enabled)
+        logger.info("Runner stage timing: %s", "on" if stage_timing else "off")
+        self._stage_timing = RunnerStageTiming(profiler_rank, enabled=stage_timing)
 
     @staticmethod
-    def _stage_timing_enabled(kv_uses_stage_timing: bool) -> tuple[bool, str]:
-        """(enabled, mode) for the KV-transfer stage timings.
+    def _stage_timing_enabled(
+        options: runner_options.RunnerOptions, kv_uses_stage_timing: bool
+    ) -> bool:
+        """Whether to record the KV-transfer stage timings.
 
-        TPU_RUNNER_STAGE_TIMING_MODE: auto (default), on, or off. The timings feed
-        KV-transfer telemetry only. Under auto they are off (R5, D-mid): their
-        per-stage TpuEvent records and collector thread cost ~0.4-0.5 ms per served
-        decode step at B 1-2 (P/D cap 2: chunk median 3.99 -> 3.56 ms, j-d4cdaa23 vs
-        j-a0ce6156). TPU_RUNNER_STAGE_TIMING=1 restores the previous auto behaviour:
-        on whenever the KV connector has a TpuKVConnectorStats sink.
+        Only with ``tpu_runner.stage_timing`` on, and only when the KV connector
+        has a `TpuKVConnectorStats` sink, since the timings feed nothing else.
+        Off by default: their per-stage TpuEvent records cost about 0.4-0.5 ms
+        per served decode step at batch 1-2 under P/D (chunk median 3.99 ->
+        3.56 ms, j-d4cdaa23 vs j-a0ce6156).
         """
-        mode = os.environ.get("TPU_RUNNER_STAGE_TIMING_MODE", "auto").strip().lower()
-        if mode in ("on", "1", "true"):
-            return True, mode
-        if mode in ("off", "0", "false"):
-            return False, mode
-        legacy = os.environ.get("TPU_RUNNER_STAGE_TIMING", "0").strip().lower()
-        return kv_uses_stage_timing and legacy in ("1", "true"), mode
+        return options.stage_timing and kv_uses_stage_timing
 
     @staticmethod
     def _kv_transfer_uses_stage_timing(vllm_config: Any) -> bool:
