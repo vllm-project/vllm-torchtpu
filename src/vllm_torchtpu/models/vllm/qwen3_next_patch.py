@@ -76,6 +76,7 @@ forwards restructured so torch.compile serves every bucket:
 import contextlib
 import functools
 import gc
+import os
 from collections.abc import Callable
 from itertools import islice
 from typing import TYPE_CHECKING, Any, cast
@@ -1126,6 +1127,14 @@ def setup_qwen3_next_v6_after_loading(model: Any) -> None:
         for module in model.modules()
     ):
         return
+    is_mtp_wrapper = type(model).__name__ in (
+        "Qwen3NextMTP",
+        "Qwen3_5MTP",
+        "Qwen3_5MoeMTP",
+    )
+    quant_shared_lm_head = os.environ.get(
+        "TPU_QUANTIZE_SHARED_LM_HEAD", "1"
+    ).strip().lower() not in ("0", "false", "no", "off")
     hoisted_norm_tensors: list[torch.Tensor] = []
     for module in model.modules():
         if isinstance(module, GemmaRMSNorm):
@@ -1172,6 +1181,14 @@ def setup_qwen3_next_v6_after_loading(model: Any) -> None:
             module, "_pcp_streaming_configured"
         ):
             maybe_flip_gdn_in_proj_qkvz_weight(module)
+        elif (
+            type(module).__name__ == "ParallelLMHead"
+            and not is_mtp_wrapper
+            and quant_shared_lm_head
+        ):
+            from vllm_torchtpu.runner import greedy_top_tokens
+
+            greedy_top_tokens.quantize_lm_head(module, mode="fp8", in_place=True)
     if hoisted_norm_tensors:
         synchronize_tensors(hoisted_norm_tensors)
     # Reclaim what the weight rewrites above left behind before the KV cache
