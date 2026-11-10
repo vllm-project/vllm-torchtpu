@@ -435,6 +435,10 @@ def _admit(runner, n_ranks: int) -> tuple[tuple, bool, float] | None:
     # here would strip the runner's shared expert and routed scale for an op
     # that never runs.
     if qm._use_adaptive_fused_moe or fused_moe_ep_supported(qm):
+        logger.info_once(
+            "FUSED_MOE_DECODE_KERNEL: a fused EP MoE kernel serves this layer; "
+            "the fused MoE decode kernel stands down on it."
+        )
         return None
     if getattr(layer, "w13_bias", None) is not None or (
         getattr(layer, "w2_bias", None) is not None
