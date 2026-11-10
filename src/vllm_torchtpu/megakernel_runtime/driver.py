@@ -51,6 +51,7 @@ except ImportError:
 
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.layers.core.attention_metadata import mamba_ckpt_of, mamba_state_of
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.megakernel.blocks.gqa import GQABlock, GQATunables
 from vllm_torchtpu.megakernel.cache import (
@@ -803,8 +804,8 @@ def _extract_group_mamba_tensors(
     m_md: Any,
     fallback_1d: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool, bool]:
-    state_ids_raw = getattr(m_md, "mamba_state_indices", None)
-    ckpt_raw = getattr(m_md, "mamba_ckpt_indices", None)
+    state_ids_raw = mamba_state_of(m_md)
+    ckpt_raw = mamba_ckpt_of(m_md)
     roff = getattr(m_md, "mamba_slot_read_offsets", None)
 
     if state_ids_raw is not None:
@@ -2165,8 +2166,8 @@ class MegakernelDriver:
             return False
 
         if (
-            getattr(m0, "mamba_state_indices", None) is None
-            and getattr(m0, "mamba_ckpt_indices", None) is None
+            mamba_state_of(m0) is None
+            and mamba_ckpt_of(m0) is None
         ):
             return False
 
@@ -2328,22 +2329,22 @@ class MegakernelDriver:
                 (max(1, num_reqs),), dtype=torch.int32, device=input_ids.device
             )
 
-        s0 = getattr(m0, "mamba_state_indices", None)
-        c0 = getattr(m0, "mamba_ckpt_indices", None)
+        s0 = mamba_state_of(m0)
+        c0 = mamba_ckpt_of(m0)
         if s0 is None:
             s0 = c0 if c0 is not None else fb_1d
         if c0 is None:
             c0 = s0
 
-        s1 = getattr(m1, "mamba_state_indices", None)
-        c1 = getattr(m1, "mamba_ckpt_indices", None)
+        s1 = mamba_state_of(m1)
+        c1 = mamba_ckpt_of(m1)
         if s1 is None:
             s1 = c1 if c1 is not None else fb_1d
         if c1 is None:
             c1 = s1
 
-        s2 = getattr(m2, "mamba_state_indices", None)
-        c2 = getattr(m2, "mamba_ckpt_indices", None)
+        s2 = mamba_state_of(m2)
+        c2 = mamba_ckpt_of(m2)
         if s2 is None:
             s2 = c2 if c2 is not None else fb_1d
         if c2 is None:

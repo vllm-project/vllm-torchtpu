@@ -493,6 +493,8 @@ class TestAttentionMetadataBuilderPlumbing:
         read-offset list carries the stack once (same flattened ids)."""
         from vllm_torchtpu.layers.core.attention_metadata import (
             StackedMambaAttentionMetadata,
+            mamba_ckpt_of,
+            mamba_state_of,
         )
         from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
@@ -560,9 +562,14 @@ class TestAttentionMetadataBuilderPlumbing:
             assert a.mamba_ckpt_stack.shape == (3, num_reqs, window)
             assert a.mamba_stack_row == k - 1
             assert a.mamba_state_stack is stk[1].mamba_state_stack
-            for f in ("mamba_state_indices", "mamba_ckpt_indices"):
-                x, y = getattr(a, f), getattr(b, f)
+            assert a.mamba_state_indices is None and a.mamba_ckpt_indices is None
+            for get, f in (
+                (mamba_state_of, "mamba_state_indices"),
+                (mamba_ckpt_of, "mamba_ckpt_indices"),
+            ):
+                x, y = get(a), getattr(b, f)
                 assert x.dtype == y.dtype and torch.equal(x, y), (k, f)
+                assert torch.equal(get(b), y)
             assert torch.equal(a.block_tables, b.block_tables)
         assert stk[0].mamba_state_indices is None
         assert len(c_stk.unified_mamba_state_indices) == 1

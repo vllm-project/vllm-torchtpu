@@ -47,6 +47,7 @@ from vllm.model_executor.parameter import BasevLLMParameter
 from vllm.v1.kv_cache_interface import MambaSpec
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.layers.core.attention_metadata import mamba_ckpt_of, mamba_state_of
 from vllm_torchtpu.compilation import bucket_filter
 from vllm_torchtpu.core.mamba_tail_fold import prefill_checkpoint_targets
 from vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op import (
@@ -170,10 +171,10 @@ def ple_speculative_state(metadata):
     (decodes and verify windows) and its final history to checkpoint 0
     otherwise; the same contract the pooled GDN kernel follows.
     """
-    ckpt = metadata.mamba_ckpt_indices
+    ckpt = mamba_ckpt_of(metadata)
     if ckpt is None:
         return None
-    state = cast(torch.Tensor, metadata.mamba_state_indices)
+    state = cast(torch.Tensor, mamba_state_of(metadata))
     offsets = cast(torch.Tensor, metadata.mamba_slot_read_offsets)
     distribution = cast(torch.Tensor, metadata.mamba_request_distribution)
     assert offsets is not None and distribution is not None
@@ -443,7 +444,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 dict[str, AttentionMetadata], get_forward_context().attn_metadata
             )
             ple_metadata = per_layer[self.ple.prefix]
-            ple_slots = ple_metadata.mamba_state_indices
+            ple_slots = mamba_state_of(ple_metadata)
             assert ple_slots is not None
             speculative = ple_speculative_state(ple_metadata)
             ckpt = getattr(ple_metadata, "mamba_prefill_ckpt", None)
