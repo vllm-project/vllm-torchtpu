@@ -202,6 +202,24 @@ def test_patch_forks_on_the_token_bucket(
     assert len(_HostOp.reference_calls) == int(uses_op and not uses_kernel)
 
 
+@pytest.mark.parametrize("rows, uses_kernel", [(16384, True), (16385, False)])
+def test_buckets_up_to_16384_rows_take_the_kernel(rows, uses_kernel):
+    """A 16384-row bucket (MAX_ROWS) runs the kernel and a 16385-row bucket
+    the JAX reference. The op is traced for its shapes only."""
+    layer = _layer()
+    fn = fused._ops[fused._op_key(layer)].fn
+    jax.eval_shape(
+        fn,
+        jax.ShapeDtypeStruct((rows, 2 * HEADS * HEAD_DIM), jnp.bfloat16),
+        jax.ShapeDtypeStruct((rows, KV_HEADS * HEAD_DIM), jnp.bfloat16),
+        jax.ShapeDtypeStruct((HEAD_DIM,), jnp.float32),
+        jax.ShapeDtypeStruct((HEAD_DIM,), jnp.float32),
+        jax.ShapeDtypeStruct((rows, ROT), jnp.float32),
+    )
+    assert _HostOp.kernel_calls == ([rows] if uses_kernel else [])
+    assert _HostOp.reference_calls == ([] if uses_kernel else [rows])
+
+
 @pytest.fixture
 def restore_attention(monkeypatch):
     """Undo whatever a test installs on Qwen3NextAttention."""
