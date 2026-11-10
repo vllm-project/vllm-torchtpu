@@ -43,7 +43,7 @@ import threading
 import time
 import types
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import TYPE_CHECKING, Protocol, TypedDict, Unpack
+from typing import TYPE_CHECKING, Protocol, cast
 
 import jax
 import jax.numpy as jnp
@@ -213,19 +213,8 @@ class OpRegistrationSpec:
     export_key: str | None = None
 
 
-class _LegacyOpKwargs(TypedDict, total=False):
-    """Keyword form of the donation and cache fields of :class:`OpRegistrationSpec`.
-
-    Transitional: program callers still pass these next to a
-    ``(in_specs, out_specs)`` pair until they move to :class:`OpRegistrationSpec`.
-
-    Attributes:
-        donate_argnums: Zero-based input indices donated in-place to XLA.
-        export_key: Static export-cache key prefix, or ``None`` to bypass cache.
-    """
-
-    donate_argnums: tuple[int, ...]
-    export_key: str | None
+type RegisteredOp = Callable[..., tuple[torch.Tensor, ...]]
+"""Torch custom op returned by :func:`register_op`; returns one tensor per output."""
 
 
 def _build_typed_op(
@@ -283,7 +272,6 @@ def _build_typed_op(
 def _resolve_op_spec(
     in_specs: OpRegistrationSpec | tuple[PartitionSpec, ...],
     out_specs: tuple[PartitionSpec, ...] | None,
-    legacy_kwargs: _LegacyOpKwargs,
 ) -> OpRegistrationSpec:
     """Normalize an :class:`OpRegistrationSpec` or ``(in_specs, out_specs)`` pair.
 
@@ -292,35 +280,23 @@ def _resolve_op_spec(
             tuple.
         out_specs: Output ``PartitionSpec`` tuple when ``in_specs`` is a tuple,
             or ``None`` when ``in_specs`` is an :class:`OpRegistrationSpec`.
-        legacy_kwargs: ``donate_argnums`` / ``export_key`` passed next to a
-            ``(in_specs, out_specs)`` pair; empty with an
-            :class:`OpRegistrationSpec`.
 
     Returns:
         Resolved :class:`OpRegistrationSpec` instance.
 
     Raises:
-        TypeError: If ``out_specs`` is omitted for a tuple ``in_specs``, or
-            ``out_specs`` or a legacy keyword is supplied alongside an
-            :class:`OpRegistrationSpec`.
+        TypeError: If ``out_specs`` is omitted for a tuple ``in_specs`` or
+            supplied alongside an :class:`OpRegistrationSpec`.
     """
     if isinstance(in_specs, OpRegistrationSpec):
         if out_specs is not None:
             msg = "out_specs must be omitted when passing OpRegistrationSpec"
             raise TypeError(msg)
-        if legacy_kwargs:
-            msg = "donate_argnums/export_key belong in the OpRegistrationSpec"
-            raise TypeError(msg)
         return in_specs
     if out_specs is None:
         msg = "out_specs is required when in_specs is a PartitionSpec tuple"
         raise TypeError(msg)
-    return OpRegistrationSpec(
-        in_specs=in_specs,
-        out_specs=out_specs,
-        donate_argnums=legacy_kwargs.get("donate_argnums", ()),
-        export_key=legacy_kwargs.get("export_key"),
-    )
+    return OpRegistrationSpec(in_specs=in_specs, out_specs=out_specs)
 
 
 def register_op(
@@ -329,8 +305,7 @@ def register_op(
     body: Callable[..., object],
     in_specs: OpRegistrationSpec | tuple[PartitionSpec, ...],
     out_specs: tuple[PartitionSpec, ...] | None = None,
-    **legacy_kwargs: Unpack[_LegacyOpKwargs],
-) -> object:
+) -> RegisteredOp:
     """Register a torch custom op running ``shard_map(body)`` over ``mesh``.
 
     ``torch_tpu`` derives the op schema from annotated positional parameters, so
@@ -346,13 +321,11 @@ def register_op(
             tuple.
         out_specs: Output ``PartitionSpec`` tuple when ``in_specs`` is a tuple,
             or ``None`` when ``in_specs`` is an :class:`OpRegistrationSpec`.
-        **legacy_kwargs: Transitional ``donate_argnums`` / ``export_key``
-            keywords for a ``(in_specs, out_specs)`` pair.
 
     Returns:
         Registered torch custom op callable.
     """
-    spec = _resolve_op_spec(in_specs, out_specs, legacy_kwargs)
+    spec = _resolve_op_spec(in_specs, out_specs)
     mapped = jax.shard_map(
         body,
         mesh=mesh,
@@ -378,14 +351,19 @@ def register_op(
         in_count=len(spec.in_specs),
         out_count=len(spec.out_specs),
     )
-    return sharded_jax_op(
-        name,
-        typed_op,
-        mesh=mesh,
-        input_partition_specs=spec.in_specs,
-        output_partition_specs=spec.out_specs,
-        donate_argnums=spec.donate_argnums or None,
-        configure_callable=export_cache.hook(_keyed_on_kernel_config(spec.export_key)),
+    return cast(
+        "RegisteredOp",
+        sharded_jax_op(
+            name,
+            typed_op,
+            mesh=mesh,
+            input_partition_specs=spec.in_specs,
+            output_partition_specs=spec.out_specs,
+            donate_argnums=spec.donate_argnums or None,
+            configure_callable=export_cache.hook(
+                _keyed_on_kernel_config(spec.export_key)
+            ),
+        ),
     )
 
 
@@ -395,8 +373,7 @@ def register_global_op(
     fn: Callable[..., object],
     in_specs: OpRegistrationSpec | tuple[PartitionSpec, ...],
     out_specs: tuple[PartitionSpec, ...] | None = None,
-    **legacy_kwargs: Unpack[_LegacyOpKwargs],
-) -> object:
+) -> RegisteredOp:
     """Register a torch custom op for a global-view JAX function over ``mesh``.
 
     ``fn`` sees global arrays (``in_specs`` describe how each worker's tensor is
@@ -411,13 +388,11 @@ def register_global_op(
             tuple.
         out_specs: Output ``PartitionSpec`` tuple when ``in_specs`` is a tuple,
             or ``None`` when ``in_specs`` is an :class:`OpRegistrationSpec`.
-        **legacy_kwargs: Transitional ``donate_argnums`` / ``export_key``
-            keywords for a ``(in_specs, out_specs)`` pair.
 
     Returns:
         Registered torch custom op callable.
     """
-    spec = _resolve_op_spec(in_specs, out_specs, legacy_kwargs)
+    spec = _resolve_op_spec(in_specs, out_specs)
 
     def traced(*args: jax.Array) -> object:
         """Trace ``fn`` under ``spmd_safe_axis_index``.
@@ -436,14 +411,19 @@ def register_global_op(
         in_count=len(spec.in_specs),
         out_count=len(spec.out_specs),
     )
-    return sharded_jax_op(
-        name,
-        typed_op,
-        mesh=mesh,
-        input_partition_specs=spec.in_specs,
-        output_partition_specs=spec.out_specs,
-        donate_argnums=spec.donate_argnums or None,
-        configure_callable=export_cache.hook(_keyed_on_kernel_config(spec.export_key)),
+    return cast(
+        "RegisteredOp",
+        sharded_jax_op(
+            name,
+            typed_op,
+            mesh=mesh,
+            input_partition_specs=spec.in_specs,
+            output_partition_specs=spec.out_specs,
+            donate_argnums=spec.donate_argnums or None,
+            configure_callable=export_cache.hook(
+                _keyed_on_kernel_config(spec.export_key)
+            ),
+        ),
     )
 
 
