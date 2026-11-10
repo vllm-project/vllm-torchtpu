@@ -117,19 +117,43 @@ def inner_kernel(
     if weights_ref.conv.bias is not None:
         conv_bias = weights_ref.conv.bias[...].astype(jnp.float32)
 
-    qkv_out_compact, new_conv_state = compute_conv1d.causal_conv1d(
-        real_sizes=real_sizes,
-        lhs=qkv_in_compact,
-        conv_weight=conv_weight,
-        conv_bias=conv_bias,
-        cfg=cfg,
+    lazy_state = (
+        cfg.mode == config.GDNMode.PER_SEQ
+        and not cfg.use_recurrent
+        and carry_conv_scratch_ref is not None
+        and cfg.window_size == 1
+        and cfg.seq_tile_size == 1
     )
+    if lazy_state:
+        assert carry_conv_scratch_ref is not None
+        qkv_out_compact = compute_conv1d.causal_conv1d_out(
+            qkv_in_compact, conv_weight, conv_bias, cfg
+        )
+        _lazy_conv_state(
+            lhs=qkv_in_compact[0],
+            real_sizes=real_sizes,
+            conv_state_out_slot_ref=conv_state_out_slot_ref,
+            carry_conv_scratch_ref=carry_conv_scratch_ref,
+            metadata_ref=metadata_ref,
+            p_id=p_id,
+            cfg=cfg,
+        )
+    else:
+        qkv_out_compact, new_conv_state = compute_conv1d.causal_conv1d(
+            real_sizes=real_sizes,
+            lhs=qkv_in_compact,
+            conv_weight=conv_weight,
+            conv_bias=conv_bias,
+            cfg=cfg,
+        )
 
-    conv_state_out_slot_ref[...] = new_conv_state.astype(conv_state_out_slot_ref.dtype)
-    if carry_conv_scratch_ref is not None:
-        # The next tile resumes from the state after this tile's last token,
-        # which is the final checkpoint.
-        carry_conv_scratch_ref[...] = new_conv_state[:, -1]
+        conv_state_out_slot_ref[...] = new_conv_state.astype(
+            conv_state_out_slot_ref.dtype
+        )
+        if carry_conv_scratch_ref is not None:
+            # The next tile resumes from the state after this tile's last
+            # token, which is the final checkpoint.
+            carry_conv_scratch_ref[...] = new_conv_state[:, -1]
 
     # Apply activation function.
     qkv_out_compact = jax.nn.silu(qkv_out_compact)
@@ -211,6 +235,42 @@ def inner_kernel(
 
     if carry_recurrent_scratch_ref is not None:
         carry_recurrent_scratch_ref[...] = new_recurrent_state[:, -1]
+
+
+def _store_conv_state_tile(conv_state_out_slot_ref: jax.Ref, state3: jax.Array) -> None:
+    """Stores one PER_SEQ tile's conv state ([prev_kernel_size, 1, dim]) into
+    window position 0 of slot 0."""
+    conv_state_out_slot_ref[0, 0] = state3.astype(conv_state_out_slot_ref.dtype)
+
+
+def _lazy_conv_state(
+    *,
+    lhs: jax.Array,  # [prev_kernel_size + chunk, 1, dim] f32
+    real_sizes: jax.Array,  # [1]
+    conv_state_out_slot_ref: jax.Ref,
+    carry_conv_scratch_ref: jax.Ref,
+    metadata_ref: memory_ref.MetadataRef,
+    p_id: jax.Array,
+    cfg: config.GDNConfig,
+) -> None:
+    """Conv state of a PER_SEQ chunked tile from its compact rows: the static
+    tail on a full tile, the per-row masked select only on the partial last
+    tile of a sequence."""
+    chunk, kprev = cfg.chunk_size, cfg.prev_kernel_size
+    rs = real_sizes[0]
+    is_last = metadata_ref.p_id_is_last_tile[p_id, 0]
+    tail = lhs[chunk : chunk + kprev]
+    carry_conv_scratch_ref[0] = tail
+
+    @pl.when(jnp.logical_and(is_last, rs == chunk))
+    def _full():
+        _store_conv_state_tile(conv_state_out_slot_ref, tail)
+
+    @pl.when(rs < chunk)
+    def _partial():
+        _store_conv_state_tile(
+            conv_state_out_slot_ref, compute_conv1d.conv_state_rows(lhs, rs, cfg)
+        )
 
 
 def outer_kernel(

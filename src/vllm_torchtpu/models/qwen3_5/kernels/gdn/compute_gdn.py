@@ -162,12 +162,16 @@ def chunked_gdn_per_seq(
     k_beta_repeat = k_repeat * beta_large
 
     # [num_v_heads, chunk, chunk]
-    beta_k_k_t = jax.lax.dot(
-        k_beta_repeat,
-        k_repeat,
+    # (beta k) k^T = diag(beta) (k k^T): one dot per kq head, the rows
+    # scaled per value head.
+    kk_t = jax.lax.dot(
+        k_large,
+        k_large,
         dimension_numbers=(((2,), (2,)), ((0,), (0,))),
         preferred_element_type=jnp.float32,
-    ).astype(cfg.dtypes.compute)
+    )
+    beta_k_k_t = jnp.repeat(kk_t.astype(cfg.dtypes.compute), cfg.v_per_kq_head, axis=0)
+    beta_k_k_t = (beta_k_k_t * beta_large).astype(cfg.dtypes.compute)
     gating_beta_k_k_t = gating_map_masked * beta_k_k_t
     t = jnp.where(identity_mask, 1, gating_beta_k_k_t)
 
@@ -332,7 +336,7 @@ def chunked_gdn(
 def recurrent_gdn_per_seq(
     q_compact: jax.Array,  # [num_kq_heads, chunk, 1, kq_head_dim]
     k_compact: jax.Array,  # [num_kq_heads, chunk, 1, kq_head_dim]
-    k_compact_t: jax.Array,  # [num_kq_heads, chunk, kq_head_dim, 1]
+    k_compact_t: jax.Array | None,  # [num_kq_heads, chunk, kq_head_dim, 1]
     v_compact: jax.Array,  # [num_v_heads, chunk, 1, v_head_dim]
     gating_log: jax.Array,  # [num_v_heads, chunk, 1, 1]
     beta: jax.Array,  # [num_v_heads, chunk, 1, 1]
@@ -359,9 +363,22 @@ def recurrent_gdn_per_seq(
         # [num_v_heads, 1, v_head_dim]
         v_curr = v_compact[:, c_idx]
 
-        # [num_v_heads, kq_head_dim, 1]
-        k_curr_t = k_compact_t[:, c_idx]
-        k_curr_t = jnp.repeat(k_curr_t, cfgs.v_per_kq_head, axis=0)
+        if k_compact_t is None:
+            # kb[h, r, :] = k[h, r]: k^T already broadcast along lanes, one
+            # sublane broadcast and XLU transpose per kq head, shared by its
+            # value heads through the free leading-dim repeat.
+            k_rows = k_compact[:, c_idx]  # [num_kq_heads, 1, kq_head_dim]
+            kb = jnp.broadcast_to(
+                k_rows, (cfgs.num_kq_heads, cfgs.v_head_dim, cfgs.kq_head_dim)
+            )
+            # [num_v_heads, kq_head_dim, v_head_dim]
+            k_curr_t = jnp.repeat(
+                jnp.transpose(kb, (0, 2, 1)), cfgs.v_per_kq_head, axis=0
+            )
+        else:
+            # [num_v_heads, kq_head_dim, 1]
+            k_curr_t = k_compact_t[:, c_idx]
+            k_curr_t = jnp.repeat(k_curr_t, cfgs.v_per_kq_head, axis=0)
 
         # [num_v_heads, 1, 1]
         beta_curr = beta[:, c_idx]
@@ -451,7 +468,6 @@ def recurrent_gdn(
     q_scale = cfg.kq_head_dim**-0.5
     q_compact *= q_scale
     k_compact = l2_norm(k_compact)
-    k_compact_t = fused_transpose_broadcast(k_compact, src_dim=4, dst_dim=3)
 
     beta = jax.nn.sigmoid(b_compact)
     gating_log = -jnp.exp(a_log) * jax.nn.softplus(a_compact + dt_bias)
@@ -469,6 +485,7 @@ def recurrent_gdn(
     gating_log = gating_log[:, : cfg.num_v_heads]
 
     if cfg.chunk_size == 1 and cfg.window_size == 1:
+        k_compact_t = fused_transpose_broadcast(k_compact, src_dim=4, dst_dim=3)
         # Optimized decode path: fused [k, q] projection against state.
         # Shapes:
         #   q_compact:    [B, n_kq, 1, 1, d_k] -> q_curr:      [B, n_v, 1, d_k]
@@ -537,7 +554,8 @@ def recurrent_gdn(
         out, state = recurrent_gdn_per_seq(
             q_compact[idx],
             k_compact[idx],
-            k_compact_t[idx],
+            # The per-token transposed broadcast is built inside the chain.
+            None,
             v_compact[idx],
             gating_log[idx],
             beta[idx],
