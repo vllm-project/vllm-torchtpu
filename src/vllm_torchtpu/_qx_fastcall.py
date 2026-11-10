@@ -106,7 +106,8 @@ def _wrap(compiled: Any, fn: types.FunctionType) -> Any:
         else:
             f_locals = dict(zip(arg_names, args))
         if freevars:
-            for name, cell in zip(freevars, closure):
+            # A function with free variables always has a closure.
+            for name, cell in zip(freevars, closure or ()):
                 f_locals[name] = cell.cell_contents
         return f_locals
 
