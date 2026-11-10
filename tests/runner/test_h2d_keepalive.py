@@ -49,8 +49,7 @@ def test_no_non_blocking_upload_of_a_temporary_remains():
     assert not pat.findall(src)
     assert "- 1\n                ).to(self.device, non_blocking=True)" not in src
     assert (
-        "reshape(-1).to(\n                runner.device, non_blocking=True"
-        not in src
+        "reshape(-1).to(\n                runner.device, non_blocking=True" not in src
     )
     assert "unsqueeze(1).to(logits.device, non_blocking=True)" not in src
 
@@ -122,7 +121,7 @@ def test_cached_subtract_indices_upload_synchronously():
 
 def test_cached_subst_indices_fifo_256_and_synchronous():
     src = SRC.read_text()
-    i = src.index("subst_cache = getattr(self, \"_async_subst_dev_cache\"")
+    i = src.index('subst_cache = getattr(self, "_async_subst_dev_cache"')
     block = src[i : src.index("subst_cache[subst_key] = substitution_indices", i)]
     assert "non_blocking=" not in block
     assert "_h2d_temp(" not in block
