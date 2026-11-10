@@ -71,7 +71,6 @@ from vllm_torchtpu.distributed.ep_mesh import (
 )
 from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
 from vllm_torchtpu.kernels.fused_moe.v3 import MESH_AXIS, Config, fused_ep_moe
-from vllm_torchtpu.kernels.fused_moe.v3 import dense_slots as _dense_slots
 from vllm_torchtpu.kernels.fused_moe.v3 import layer as _latest_layer
 from vllm_torchtpu.kernels.fused_moe.v3 import layout as _latest_layout
 from vllm_torchtpu.layers.adapter.fused_moe_ep import (
@@ -310,7 +309,11 @@ def run_moe_v3(
                 x.shape[0],
                 x.shape[0] // ep,
             )
-            return _dense_slots.dense_slots_moe(
+            # Only the Qwen3.5 layout table turns the dense-slots layer on,
+            # and the layer lives with the Qwen3.5 kernels.
+            from vllm_torchtpu.models.qwen3_5.kernels import dense_slots
+
+            return dense_slots.dense_slots_moe(
                 x,
                 w1,
                 w2,

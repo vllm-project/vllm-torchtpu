@@ -52,7 +52,7 @@ import jax.numpy as jnp  # noqa: E402
 from jax.sharding import PartitionSpec as P  # noqa: E402
 
 from vllm_torchtpu.kernels.fused_moe.v3 import MESH_AXIS, Config  # noqa: E402
-from vllm_torchtpu.kernels.fused_moe.v3 import dense_slots as DS  # noqa: E402
+from vllm_torchtpu.models.qwen3_5.kernels import dense_slots as DS  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import test_p3_fused_ep_scale as S  # noqa: E402

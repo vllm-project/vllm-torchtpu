@@ -19,7 +19,7 @@ from types import SimpleNamespace
 import pytest
 
 from vllm_torchtpu.kernels.fused_moe.v3 import Config
-from vllm_torchtpu.kernels.fused_moe.v3 import dense_slots as DS
+from vllm_torchtpu.models.qwen3_5.kernels import dense_slots as DS
 from vllm_torchtpu.kernels.fused_moe.v3.layout import MESH_AXIS
 from vllm_torchtpu.layers.adapter import fused_moe_ep_v3 as A
 
@@ -36,7 +36,7 @@ class _Mesh:
 def _adapter_config(monkeypatch, fields):
     monkeypatch.setattr(A, "_CONFIG_OVERRIDES", dict(fields))
     calls = []
-    monkeypatch.setattr(A._dense_slots, "dense_slots_moe",
+    monkeypatch.setattr(DS, "dense_slots_moe",
                         lambda *a, **k: calls.append(k) or "dense")
     monkeypatch.setattr(A, "fused_ep_moe", lambda *a, **k: "v3")
     run = A.run_moe_v3(SimpleNamespace(axis_names=("d",), shape={"d": EP}), 10, True, "silu",

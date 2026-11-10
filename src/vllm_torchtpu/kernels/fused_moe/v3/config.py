@@ -233,7 +233,8 @@ class Config:
         the shard tables instead of after the scatter, so its waits overlap
         the scatter. Only the schedule changes: the same values.
       dense_slots: (adapter binding) calls of at most dense_slots_max_tokens
-        rows per shard run the dense-slots layer (dense_slots.py) instead:
+        rows per shard run the dense-slots layer
+        (models/qwen3_5/kernels/dense_slots.py) instead:
         every result row lands at a row fixed by the routing alone, so no
         packed tables, sparse-core scatter or sort. bf16 result rows; the
         same per-row math as this layer with result_rows "bf16".
