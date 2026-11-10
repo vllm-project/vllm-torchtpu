@@ -45,6 +45,7 @@ scale has to travel with them. The same per-row math as v3 with bf16 result
 rows, so the output can be compared bit for bit against v3 run with
 result_rows="bf16" (and elementwise float32, where every compilation agrees).
 """
+
 import functools
 
 import jax
@@ -104,8 +105,9 @@ def _align(n, m):
     return -(-n // m) * m
 
 
-def shard_tables(idx_all, me, *, experts_per_shard, num_shards, tokens_per_shard,
-                 num_experts):
+def shard_tables(
+    idx_all, me, *, experts_per_shard, num_shards, tokens_per_shard, num_experts
+):
     """The routing tables of shard `me`, from every token's top-k.
 
     idx_all: [num_shards * tokens_per_shard, top_k] int32 global expert ids
@@ -143,27 +145,33 @@ def shard_tables(idx_all, me, *, experts_per_shard, num_shards, tokens_per_shard
     by_dest = shard_of.reshape(D, Tp * K)
     s_iota = jnp.arange(D, dtype=jnp.int32)
     # c[s, d]: pairs of destination d's tokens whose expert is on shard s
-    c = jnp.sum((by_dest[None, :, :] == s_iota[:, None, None]).astype(jnp.int32),
-                axis=2)
+    c = jnp.sum(
+        (by_dest[None, :, :] == s_iota[:, None, None]).astype(jnp.int32), axis=2
+    )
     base = jnp.sum(jnp.where((s_iota < me)[:, None], c, 0), axis=0)  # [D]
     dst_row = base[None, :] + jnp.cumsum(run_len, axis=0) - run_len
     own = lax.dynamic_slice_in_dim(idx_all, me * Tp, Tp, 0).reshape(-1)
     valid = (own >= 0) & (own < num_experts)
     key = jnp.where(valid, own, num_experts)
     tok = jnp.arange(Tp * K, dtype=jnp.int32) // K
-    less = (key[None, :] < key[:, None]) | ((key[None, :] == key[:, None]) &
-                                           (tok[None, :] < tok[:, None]))
+    less = (key[None, :] < key[:, None]) | (
+        (key[None, :] == key[:, None]) & (tok[None, :] < tok[:, None])
+    )
     pos = jnp.sum((less & valid[None, :]).astype(jnp.int32), axis=1)
     pos = jnp.where(valid, pos, 0)
     n_valid = jnp.sum(valid.astype(jnp.int32))
     own_local = jnp.sum(jnp.where(s_iota == me, run_len, 0))
-    misc = jnp.stack([
-        jnp.asarray(me, jnp.int32), n_valid - own_local, own_local,
-        jnp.sum(cnt) - own_local
-    ]).astype(jnp.int32)
+    misc = jnp.stack(
+        [
+            jnp.asarray(me, jnp.int32),
+            n_valid - own_local,
+            own_local,
+            jnp.sum(cnt) - own_local,
+        ]
+    ).astype(jnp.int32)
     tab = jnp.zeros((G, TAB_LANES), jnp.int32)
-    tab = tab.at[:, 0:D].set(run_start).at[:, D:2 * D].set(run_len)
-    tab = tab.at[:, 2 * D:3 * D].set(dst_row).at[:, 3 * D].set(cnt)
+    tab = tab.at[:, 0:D].set(run_start).at[:, D : 2 * D].set(run_len)
+    tab = tab.at[:, 2 * D : 3 * D].set(dst_row).at[:, 3 * D].set(cnt)
     misc_t = jnp.zeros((8, LANES), jnp.int32).at[0, 0:4].set(misc)
     return dict(mp=mp, tab=tab, pos=pos.reshape(Tp, K), misc=misc_t)
 
@@ -176,9 +184,12 @@ def _tables_math(me, allv, own, *, D, Tp, G, K, E):
     N = D * Tp
 
     def dot(a, b):
-        return lax.dot_general(a.astype(jnp.bfloat16), b.astype(jnp.bfloat16),
-                               (((1, ), (0, )), ((), ())),
-                               preferred_element_type=jnp.float32)
+        return lax.dot_general(
+            a.astype(jnp.bfloat16),
+            b.astype(jnp.bfloat16),
+            (((1,), (0,)), ((), ())),
+            preferred_element_type=jnp.float32,
+        )
 
     lane = lax.broadcasted_iota(jnp.int32, (N, LANES), 1)
     valid_all = (allv >= 0) & (allv < E) & (lane < K)
@@ -186,29 +197,46 @@ def _tables_math(me, allv, own, *, D, Tp, G, K, E):
     e_iota = lax.broadcasted_iota(jnp.int32, (G, N), 0)
     m = loc_t[0:1, :] == e_iota
     for k in range(1, K):
-        m = m | (loc_t[k:k + 1, :] == e_iota)
-    upper = (lax.broadcasted_iota(jnp.int32, (N, N), 0) <=
-             lax.broadcasted_iota(jnp.int32, (N, N), 1))
+        m = m | (loc_t[k : k + 1, :] == e_iota)
+    upper = lax.broadcasted_iota(jnp.int32, (N, N), 0) <= lax.broadcasted_iota(
+        jnp.int32, (N, N), 1
+    )
     incl = dot(m.astype(jnp.float32), upper.astype(jnp.float32)).astype(
-        jnp.int32)  # [G, N]
+        jnp.int32
+    )  # [G, N]
     mp = jnp.where(m, incl - 1, -1)
-    ends = [incl[:, (d + 1) * Tp - 1:(d + 1) * Tp] for d in range(D)]
+    ends = [incl[:, (d + 1) * Tp - 1 : (d + 1) * Tp] for d in range(D)]
     zero_col = jnp.zeros((G, 1), jnp.int32)
     run_start = jnp.concatenate([zero_col] + ends[:-1], axis=1)  # [G, D]
     run_len = jnp.concatenate(ends, axis=1) - run_start
     shard_of = jnp.where(valid_all, allv // G, D)
-    base = jnp.concatenate([
-        jnp.sum((shard_of[d * Tp:(d + 1) * Tp, :] < me).astype(jnp.int32),
-                keepdims=True).reshape(1, 1) for d in range(D)
-    ], axis=1)  # [1, D]
-    lower = (lax.broadcasted_iota(jnp.int32, (G, G), 1) <
-             lax.broadcasted_iota(jnp.int32, (G, G), 0))
-    dst_row = base + dot(lower.astype(jnp.float32),
-                         run_len.astype(jnp.float32)).astype(jnp.int32)
+    base = jnp.concatenate(
+        [
+            jnp.sum(
+                (shard_of[d * Tp : (d + 1) * Tp, :] < me).astype(jnp.int32),
+                keepdims=True,
+            ).reshape(1, 1)
+            for d in range(D)
+        ],
+        axis=1,
+    )  # [1, D]
+    lower = lax.broadcasted_iota(jnp.int32, (G, G), 1) < lax.broadcasted_iota(
+        jnp.int32, (G, G), 0
+    )
+    dst_row = base + dot(lower.astype(jnp.float32), run_len.astype(jnp.float32)).astype(
+        jnp.int32
+    )
     cnt = ends[-1]
     tab = jnp.concatenate(
-        [run_start, run_len, dst_row, cnt,
-         jnp.zeros((G, TAB_LANES - 3 * D - 1), jnp.int32)], axis=1)
+        [
+            run_start,
+            run_len,
+            dst_row,
+            cnt,
+            jnp.zeros((G, TAB_LANES - 3 * D - 1), jnp.int32),
+        ],
+        axis=1,
+    )
     # Arrival row of each own pair: own pairs with a smaller expert, plus
     # earlier own tokens with the same expert.
     own_lane = lax.broadcasted_iota(jnp.int32, (Tp, LANES), 1)
@@ -217,25 +245,30 @@ def _tables_math(me, allv, own, *, D, Tp, G, K, E):
     ohs = []
     member = jnp.zeros((Tp, E), jnp.float32)
     for k in range(K):
-        ohk = ((own[:, k:k + 1] == x_iota) &
-               own_valid[:, k:k + 1]).astype(jnp.float32)
+        ohk = ((own[:, k : k + 1] == x_iota) & own_valid[:, k : k + 1]).astype(
+            jnp.float32
+        )
         ohs.append(ohk)
         member = member + ohk
     hist = jnp.broadcast_to(jnp.sum(member, axis=0, keepdims=True), (8, E))
-    strict_x = (lax.broadcasted_iota(jnp.int32, (E, E), 0) <
-                lax.broadcasted_iota(jnp.int32, (E, E), 1))
+    strict_x = lax.broadcasted_iota(jnp.int32, (E, E), 0) < lax.broadcasted_iota(
+        jnp.int32, (E, E), 1
+    )
     smaller = dot(hist, strict_x.astype(jnp.float32))[0:1, :]  # [1, E]
-    strict_t = (lax.broadcasted_iota(jnp.int32, (Tp, Tp), 1) <
-                lax.broadcasted_iota(jnp.int32, (Tp, Tp), 0))
+    strict_t = lax.broadcasted_iota(jnp.int32, (Tp, Tp), 1) < lax.broadcasted_iota(
+        jnp.int32, (Tp, Tp), 0
+    )
     earlier = dot(strict_t.astype(jnp.float32), member)  # [Tp, E]
     rank = smaller + earlier
     pos = jnp.concatenate(
-        [jnp.sum(ohk * rank, axis=1, keepdims=True) for ohk in ohs], axis=1)
+        [jnp.sum(ohk * rank, axis=1, keepdims=True) for ohk in ohs], axis=1
+    )
     pos = pos.astype(jnp.int32)
     n_valid = jnp.sum(own_valid.astype(jnp.int32), keepdims=True).reshape(1, 1)
     d_iota = lax.broadcasted_iota(jnp.int32, (G, D), 1)
-    own_local = jnp.sum(jnp.where(d_iota == me, run_len, 0),
-                        keepdims=True).reshape(1, 1)
+    own_local = jnp.sum(jnp.where(d_iota == me, run_len, 0), keepdims=True).reshape(
+        1, 1
+    )
     n_rows = jnp.sum(cnt, keepdims=True).reshape(1, 1)
     ml = lax.broadcasted_iota(jnp.int32, (8, LANES), 1)
     ms = lax.broadcasted_iota(jnp.int32, (8, LANES), 0)
@@ -247,9 +280,10 @@ def _tables_math(me, allv, own, *, D, Tp, G, K, E):
     return mp, tab, pos, misc
 
 
-@functools.lru_cache(maxsize=None)
-def build_tables_kernel(*, num_shards, tokens_per_shard, experts_per_shard,
-                        top_k, num_experts, mesh_axes):
+@functools.cache
+def build_tables_kernel(
+    *, num_shards, tokens_per_shard, experts_per_shard, top_k, num_experts, mesh_axes
+):
     """The index exchange and shard_tables as one Pallas program: every
     shard's top-k (lane-padded [Tp, LANES] int32, num_experts for none) to
     every peer by remote DMA, then the same tables as shard_tables, with the
@@ -257,19 +291,28 @@ def build_tables_kernel(*, num_shards, tokens_per_shard, experts_per_shard,
     tokens_per_shard * top_k, every bf16 operand at most tokens_per_shard).
     Returns a callable (me [1] int32, idx [Tp, LANES]) -> (mp, tab, pos, misc).
     """
-    D, Tp, G, K, E = (num_shards, tokens_per_shard, experts_per_shard, top_k,
-                      num_experts)
+    D, Tp, G, K, E = (
+        num_shards,
+        tokens_per_shard,
+        experts_per_shard,
+        top_k,
+        num_experts,
+    )
     N = D * Tp
     if K > LANES or 4 * D > TAB_LANES or Tp % 8:
         raise ValueError(f"top_k {K}, shards {D}, tokens {Tp}")
 
     def dot(a, b):
-        return lax.dot_general(a.astype(jnp.bfloat16), b.astype(jnp.bfloat16),
-                               (((1, ), (0, )), ((), ())),
-                               preferred_element_type=jnp.float32)
+        return lax.dot_general(
+            a.astype(jnp.bfloat16),
+            b.astype(jnp.bfloat16),
+            (((1,), (0,)), ((), ())),
+            preferred_element_type=jnp.float32,
+        )
 
-    def kernel(me_ref, idx_ref, mp_ref, tab_ref, pos_ref, misc_ref, idx_all,
-               sem_send, sem_recv):
+    def kernel(
+        me_ref, idx_ref, mp_ref, tab_ref, pos_ref, misc_ref, idx_all, sem_send, sem_recv
+    ):
         me = me_ref[0]
         block = pl.ds(pl.multiple_of(me * Tp, 8), Tp)
         own = idx_ref[...]
@@ -278,14 +321,18 @@ def build_tables_kernel(*, num_shards, tokens_per_shard, experts_per_shard,
         for i in range(1, D):
             peer = lax.rem(me + i, jnp.int32(D))
             pltpu.make_async_remote_copy(
-                src_ref=idx_all.at[block], dst_ref=idx_all.at[block],
-                send_sem=sem_send, recv_sem=sem_recv,
+                src_ref=idx_all.at[block],
+                dst_ref=idx_all.at[block],
+                send_sem=sem_send,
+                recv_sem=sem_recv,
                 device_id=device_coords(peer, mesh_axes),
-                device_id_type=pl.DeviceIdType.MESH).start()
+                device_id_type=pl.DeviceIdType.MESH,
+            ).start()
         if D > 1:
             _wait_rows(sem_recv, idx_all, (D - 1) * Tp)
-        mp, tab, pos, misc = _tables_math(me, idx_all[...], own, D=D, Tp=Tp,
-                                          G=G, K=K, E=E)
+        mp, tab, pos, misc = _tables_math(
+            me, idx_all[...], own, D=D, Tp=Tp, G=G, K=K, E=E
+        )
         mp_ref[...] = mp
         tab_ref[...] = tab
         pos_ref[...] = pos
@@ -294,17 +341,25 @@ def build_tables_kernel(*, num_shards, tokens_per_shard, experts_per_shard,
             _wait_rows(sem_send, idx_all, (D - 1) * Tp)
 
     vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
-    params = dict(collective_id=COLLECTIVE_ID_TABLES,
-                  vmem_limit_bytes=VMEM_LIMIT or device.vmem_limit())
+    params = dict(
+        collective_id=COLLECTIVE_ID_TABLES,
+        vmem_limit_bytes=VMEM_LIMIT or device.vmem_limit(),
+    )
     if layout.SIDE_EFFECTS:
         params["has_side_effects"] = True
     return pl.pallas_call(
         kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=1, in_specs=[vmem], out_specs=[vmem] * 4,
-            scratch_shapes=(pltpu.VMEM((N, LANES), jnp.int32),
-                            pltpu.SemaphoreType.DMA, pltpu.SemaphoreType.DMA),
-            grid=()),
+            num_scalar_prefetch=1,
+            in_specs=[vmem],
+            out_specs=[vmem] * 4,
+            scratch_shapes=(
+                pltpu.VMEM((N, LANES), jnp.int32),
+                pltpu.SemaphoreType.DMA,
+                pltpu.SemaphoreType.DMA,
+            ),
+            grid=(),
+        ),
         out_shape=[
             jax.ShapeDtypeStruct((G, N), jnp.int32),
             jax.ShapeDtypeStruct((G, TAB_LANES), jnp.int32),
@@ -313,31 +368,51 @@ def build_tables_kernel(*, num_shards, tokens_per_shard, experts_per_shard,
         ],
         compiler_params=pltpu.CompilerParams(**params),
         interpret=INTERPRET if INTERPRET is not None else False,
-        name=f"fused_ep_dense_slots_tables_g{G}_n{N}")
+        name=f"fused_ep_dense_slots_tables_g{G}_n{N}",
+    )
 
 
 def _wait_rows(sem, ref, rows):
     """Waits until `rows` rows' worth of copies on `sem` have landed."""
-    pltpu.make_async_copy(ref.at[pl.ds(0, rows)], ref.at[pl.ds(0, rows)],
-                          sem).wait()
+    pltpu.make_async_copy(ref.at[pl.ds(0, rows)], ref.at[pl.ds(0, rows)], sem).wait()
 
 
 def _barrier(num_shards, mesh_axes):
     barrier = pltpu.get_barrier_semaphore()
     for i in range(num_shards):
-        pl.semaphore_signal(barrier, inc=1,
-                            device_id=device_coords(jnp.int32(i), mesh_axes),
-                            device_id_type=pl.DeviceIdType.MESH)
+        pl.semaphore_signal(
+            barrier,
+            inc=1,
+            device_id=device_coords(jnp.int32(i), mesh_axes),
+            device_id_type=pl.DeviceIdType.MESH,
+        )
     pl.semaphore_wait(barrier, num_shards)
 
 
-@functools.lru_cache(maxsize=None)
-def build_kernel(*, num_shards, tokens_per_shard, hidden, inter,
-                 experts_per_shard, top_k, tile_rows, mesh_axes, elementwise,
-                 columns_per_pass, weight_slots=3, weight_prefetch=2,
-                 result_slots=3, vmem_limit=None, fused=False,
-                 out_dtype=jnp.bfloat16, merged=False, num_experts=None,
-                 real_rows=None, skip_unrouted=False):
+@functools.cache
+def build_kernel(
+    *,
+    num_shards,
+    tokens_per_shard,
+    hidden,
+    inter,
+    experts_per_shard,
+    top_k,
+    tile_rows,
+    mesh_axes,
+    elementwise,
+    columns_per_pass,
+    weight_slots=3,
+    weight_prefetch=2,
+    result_slots=3,
+    vmem_limit=None,
+    fused=False,
+    out_dtype=jnp.bfloat16,
+    merged=False,
+    num_experts=None,
+    real_rows=None,
+    skip_unrouted=False,
+):
     """The per-shard Pallas program (a callable of the tables and operands).
 
     merged (fused only): the index exchange and the tables run inside this
@@ -351,17 +426,28 @@ def build_kernel(*, num_shards, tokens_per_shard, hidden, inter,
     # and weights unpadded, plus the valid-row count, and does the padding and
     # the valid-row masking itself (no XLA pads or masks around it).
     R = tokens_per_shard if real_rows is None else real_rows
-    if real_rows is not None and (not merged or R % 8 or R > tokens_per_shard):
-        raise ValueError(f"real_rows {real_rows}: merged only, a multiple of 8, "
-                         f"at most {tokens_per_shard}")
+    if real_rows is not None and (not merged or R % 8 or tokens_per_shard < R):
+        raise ValueError(
+            f"real_rows {real_rows}: merged only, a multiple of 8, "
+            f"at most {tokens_per_shard}"
+        )
     unpadded = real_rows is not None
-    D, Tp, H, I, G, K, T = (num_shards, tokens_per_shard, hidden, inter,
-                            experts_per_shard, top_k, tile_rows)
+    D, Tp, H, INTER, G, K, T = (
+        num_shards,
+        tokens_per_shard,
+        hidden,
+        inter,
+        experts_per_shard,
+        top_k,
+        tile_rows,
+    )
     N = D * Tp
     LB = H // LANES
     if Tp % ROW_ALIGN or T % GATHER_ROWS or H % LANES:
-        raise ValueError(f"tokens_per_shard {Tp} (x{ROW_ALIGN}), tile {T} "
-                         f"(x{GATHER_ROWS}), hidden {H} (x{LANES})")
+        raise ValueError(
+            f"tokens_per_shard {Tp} (x{ROW_ALIGN}), tile {T} "
+            f"(x{GATHER_ROWS}), hidden {H} (x{LANES})"
+        )
     if not 1 <= weight_prefetch < weight_slots:
         raise ValueError("weight_prefetch must be in [1, weight_slots)")
     n_arrival = Tp * K
@@ -386,19 +472,36 @@ def build_kernel(*, num_shards, tokens_per_shard, hidden, inter,
             out_ref = next(it)
             landing_ref = landing_s_ref = arrivals_ref = None
         else:
-            landing_ref, landing_s_ref, arrivals_ref = (next(it)
-                                                        for _ in range(3))
-        (xq_vmem, xs_vmem, rows_all, scales_all, tile_vmem, w1_vmem, w2_vmem,
-         result_vmem, xs_tile) = (next(it) for _ in range(9))
+            landing_ref, landing_s_ref, arrivals_ref = (next(it) for _ in range(3))
+        (
+            xq_vmem,
+            xs_vmem,
+            rows_all,
+            scales_all,
+            tile_vmem,
+            w1_vmem,
+            w2_vmem,
+            result_vmem,
+            xs_tile,
+        ) = (next(it) for _ in range(9))
         if fused:
             arrivals_ref, coef_vmem, sum_vmem = (next(it) for _ in range(3))
         if merged:
-            (idx_all, mp_v, tab_v, pos_v, misc_v, tab_s, pos_s,
-             misc_s) = (next(it) for _ in range(8))
+            (idx_all, mp_v, tab_v, pos_v, misc_v, tab_s, pos_s, misc_s) = (
+                next(it) for _ in range(8)
+            )
         order_s = next(it) if skip_unrouted else None
-        (sem_w1, sem_w2, sem_ag_send, sem_ag_recv, sem_ag_local, sem_load,
-         sem_push_send, sem_push_local, sem_push_recv) = (next(it)
-                                                          for _ in range(9))
+        (
+            sem_w1,
+            sem_w2,
+            sem_ag_send,
+            sem_ag_recv,
+            sem_ag_local,
+            sem_load,
+            sem_push_send,
+            sem_push_local,
+            sem_push_recv,
+        ) = (next(it) for _ in range(9))
         if merged:
             sem_idx_send, sem_idx_recv, sem_smem = (next(it) for _ in range(3))
             me = me_ref[0]
@@ -406,10 +509,10 @@ def build_kernel(*, num_shards, tokens_per_shard, hidden, inter,
             me = misc_ref[0, 0]
 
         def w_copy(e, slot):
-            return (pltpu.make_async_copy(w1_ref.at[e], w1_vmem.at[slot],
-                                          sem_w1.at[slot]),
-                    pltpu.make_async_copy(w2_ref.at[e], w2_vmem.at[slot],
-                                          sem_w2.at[slot]))
+            return (
+                pltpu.make_async_copy(w1_ref.at[e], w1_vmem.at[slot], sem_w1.at[slot]),
+                pltpu.make_async_copy(w2_ref.at[e], w2_vmem.at[slot], sem_w2.at[slot]),
+            )
 
         # Weight refills depend on nothing but the expert: they start first
         # and stream while the rows are exchanged.
@@ -455,41 +558,47 @@ def build_kernel(*, num_shards, tokens_per_shard, hidden, inter,
             ag_dst = (landing_ref.at[block], landing_s_ref.at[block])
         _barrier(D, mesh_axes)
         if not fused:
-            local_rows = pltpu.make_async_copy(ag_src[0], ag_dst[0],
-                                               sem_ag_local)
-            local_scales = pltpu.make_async_copy(ag_src[1], ag_dst[1],
-                                                 sem_ag_local)
+            local_rows = pltpu.make_async_copy(ag_src[0], ag_dst[0], sem_ag_local)
+            local_scales = pltpu.make_async_copy(ag_src[1], ag_dst[1], sem_ag_local)
             local_rows.start()
             local_scales.start()
         for i in range(1, D):
             peer = lax.rem(me + i, jnp.int32(D))
             if merged:  # the indices first: the tables wait on them alone
                 pltpu.make_async_remote_copy(
-                    src_ref=idx_all.at[block], dst_ref=idx_all.at[block],
-                    send_sem=sem_idx_send, recv_sem=sem_idx_recv,
+                    src_ref=idx_all.at[block],
+                    dst_ref=idx_all.at[block],
+                    send_sem=sem_idx_send,
+                    recv_sem=sem_idx_recv,
                     device_id=device_coords(peer, mesh_axes),
-                    device_id_type=pl.DeviceIdType.MESH).start()
+                    device_id_type=pl.DeviceIdType.MESH,
+                ).start()
             for src, dst in zip(ag_src, ag_dst):
                 pltpu.make_async_remote_copy(
-                    src_ref=src, dst_ref=dst, send_sem=sem_ag_send,
+                    src_ref=src,
+                    dst_ref=dst,
+                    send_sem=sem_ag_send,
                     recv_sem=sem_ag_recv,
                     device_id=device_coords(peer, mesh_axes),
-                    device_id_type=pl.DeviceIdType.MESH).start()
+                    device_id_type=pl.DeviceIdType.MESH,
+                ).start()
         if merged:
             if D > 1:
                 _wait_rows(sem_idx_recv, idx_all, (D - 1) * Tp)
             own_idx = idx_all[block, :] if unpadded else idx_ref[...]
-            mp, tab, pos, misc = _tables_math(me, idx_all[...], own_idx,
-                                              D=D, Tp=Tp, G=G, K=K, E=E)
+            mp, tab, pos, misc = _tables_math(
+                me, idx_all[...], own_idx, D=D, Tp=Tp, G=G, K=K, E=E
+            )
             if MERGED_POS_SHIFT:
                 pos = jnp.minimum(pos + MERGED_POS_SHIFT, n_arrival - 1)
             mp_v[...] = mp
             tab_v[...] = tab
             pos_v[...] = pos
             misc_v[...] = misc
-            to_smem = [pltpu.make_async_copy(v, s_, sem_smem)
-                       for v, s_ in ((tab_v, tab_s), (pos_v, pos_s),
-                                     (misc_v, misc_s))]
+            to_smem = [
+                pltpu.make_async_copy(v, s_, sem_smem)
+                for v, s_ in ((tab_v, tab_s), (pos_v, pos_s), (misc_v, misc_s))
+            ]
             for cp in to_smem:
                 cp.start()
             for cp in to_smem:
@@ -507,8 +616,7 @@ def build_kernel(*, num_shards, tokens_per_shard, hidden, inter,
             _wait_rows(sem_ag_recv, wait_s_ref, (D - 1) * Tp)
         if not fused:
             load_rows = pltpu.make_async_copy(landing_ref, rows_all, sem_load)
-            load_scales = pltpu.make_async_copy(landing_s_ref, scales_all,
-                                                sem_load)
+            load_scales = pltpu.make_async_copy(landing_s_ref, scales_all, sem_load)
             load_rows.start()
             load_scales.start()
             load_rows.wait()
@@ -529,22 +637,23 @@ def build_kernel(*, num_shards, tokens_per_shard, hidden, inter,
                 hi = jnp.minimum(start + length, j * T + live)
                 n = jnp.maximum(hi - lo, 0)
                 src = result_vmem.at[rs, pl.ds(lo - j * T, n)]
-                dst = arrivals_ref.at[pl.ds(tab_ref[e, 2 * D + d] + lo - start,
-                                            n)]
+                dst = arrivals_ref.at[pl.ds(tab_ref[e, 2 * D + d] + lo - start, n)]
                 is_me = jnp.int32(d) == me
 
                 @pl.when(jnp.logical_and(n > 0, jnp.logical_not(is_me)))
                 def _(src=src, dst=dst, d=d):
                     pltpu.make_async_remote_copy(
-                        src_ref=src, dst_ref=dst,
-                        send_sem=sem_push_send.at[rs], recv_sem=sem_push_recv,
+                        src_ref=src,
+                        dst_ref=dst,
+                        send_sem=sem_push_send.at[rs],
+                        recv_sem=sem_push_recv,
                         device_id=device_coords(jnp.int32(d), mesh_axes),
-                        device_id_type=pl.DeviceIdType.MESH).start()
+                        device_id_type=pl.DeviceIdType.MESH,
+                    ).start()
 
                 @pl.when(jnp.logical_and(n > 0, is_me))
                 def _(src=src, dst=dst):
-                    pltpu.make_async_copy(src, dst,
-                                          sem_push_local.at[rs]).start()
+                    pltpu.make_async_copy(src, dst, sem_push_local.at[rs]).start()
 
                 n_remote = n_remote + jnp.where(is_me, 0, n)
                 n_local = n_local + jnp.where(is_me, n, 0)
@@ -574,30 +683,49 @@ def build_kernel(*, num_shards, tokens_per_shard, hidden, inter,
 
                 @pl.when(j * T + p * GATHER_ROWS < n_rows)
                 def _(p=p):
-                    want = (j * T + p * GATHER_ROWS + lax.broadcasted_iota(
-                        jnp.int32, (GATHER_ROWS, N), 0))
+                    want = (
+                        j * T
+                        + p * GATHER_ROWS
+                        + lax.broadcasted_iota(jnp.int32, (GATHER_ROWS, N), 0)
+                    )
                     hit = mp_row == want  # [GATHER_ROWS, N], one hit a live row
                     onehot = jnp.where(hit, 1.0, 0.0).astype(FP8)
                     picked = lax.dot_general(
-                        onehot, rows_all[...], (((1, ), (0, )), ((), ())),
-                        preferred_element_type=jnp.float32)
-                    tile_vmem[p * GATHER_ROWS:(p + 1) * GATHER_ROWS, :] = (
-                        picked.astype(FP8))
-                    s = jnp.sum(jnp.where(hit, scale_row, 0.0), axis=1,
-                                keepdims=True)
+                        onehot,
+                        rows_all[...],
+                        (((1,), (0,)), ((), ())),
+                        preferred_element_type=jnp.float32,
+                    )
+                    tile_vmem[p * GATHER_ROWS : (p + 1) * GATHER_ROWS, :] = (
+                        picked.astype(FP8)
+                    )
+                    s = jnp.sum(jnp.where(hit, scale_row, 0.0), axis=1, keepdims=True)
                     tile_s = jnp.broadcast_to(s, (GATHER_ROWS, LANES))
-                    xs_tile[p * GATHER_ROWS:(p + 1) * GATHER_ROWS, :] = tile_s
+                    xs_tile[p * GATHER_ROWS : (p + 1) * GATHER_ROWS, :] = tile_s
 
             row_scales = xs_tile[:, 0:1]
             acc2, mid_scales = ffn.expert_ffn_fp8(
-                tile_vmem[...], row_scales, w1_vmem[wslot], w2_vmem[wslot],
-                w1s_ref[pl.ds(e, 1), :], activation="silu", w1_bias=None,
-                no_gate=False, block=0, elementwise=elementwise,
-                columns_per_pass=columns_per_pass, token_block=0)
-            result, _ = ffn.result_rows(acc2, mid_scales,
-                                        w2_scales=w2s_ref[pl.ds(e, 1), :],
-                                        w2_bias=None, dtype=jnp.bfloat16,
-                                        elementwise=elementwise)
+                tile_vmem[...],
+                row_scales,
+                w1_vmem[wslot],
+                w2_vmem[wslot],
+                w1s_ref[pl.ds(e, 1), :],
+                activation="silu",
+                w1_bias=None,
+                no_gate=False,
+                block=0,
+                elementwise=elementwise,
+                columns_per_pass=columns_per_pass,
+                token_block=0,
+            )
+            result, _ = ffn.result_rows(
+                acc2,
+                mid_scales,
+                w2_scales=w2s_ref[pl.ds(e, 1), :],
+                w2_bias=None,
+                dtype=jnp.bfloat16,
+                elementwise=elementwise,
+            )
             result = result.reshape(T, LB, LANES)
             for i in range(result_slots):
 
@@ -606,10 +734,12 @@ def build_kernel(*, num_shards, tokens_per_shard, hidden, inter,
                     result_vmem[i] = result
 
             n_r, n_l = push_tile(e, j, live, rs)
-            pend_r = tuple(jnp.where(rs == i, n_r, pend_r[i])
-                           for i in range(result_slots))
-            pend_l = tuple(jnp.where(rs == i, n_l, pend_l[i])
-                           for i in range(result_slots))
+            pend_r = tuple(
+                jnp.where(rs == i, n_r, pend_r[i]) for i in range(result_slots)
+            )
+            pend_l = tuple(
+                jnp.where(rs == i, n_l, pend_l[i]) for i in range(result_slots)
+            )
             return tile_count + 1, pend_r, pend_l
 
         def expert_step(e, carry):
@@ -620,15 +750,14 @@ def build_kernel(*, num_shards, tokens_per_shard, hidden, inter,
             @pl.when(e + weight_prefetch < G)
             def _():
                 ahead = e + weight_prefetch
-                for cp in w_copy(ahead, lax.rem(ahead,
-                                                jnp.int32(weight_slots))):
+                for cp in w_copy(ahead, lax.rem(ahead, jnp.int32(weight_slots))):
                     cp.start()
 
             n_rows = tab_ref[e, 3 * D]
             n_tiles = (n_rows + T - 1) // T
             return lax.fori_loop(
-                0, n_tiles,
-                lambda j, c: tile_step(e, wslot, n_rows, j, c), carry)
+                0, n_tiles, lambda j, c: tile_step(e, wslot, n_rows, j, c), carry
+            )
 
         zeros = tuple(jnp.int32(0) for _ in range(result_slots))
         if skip_unrouted:
@@ -659,23 +788,29 @@ def build_kernel(*, num_shards, tokens_per_shard, hidden, inter,
                 @pl.when(i + weight_prefetch < n_list)
                 def _():
                     ahead = i + weight_prefetch
-                    for cp in w_copy(order_s[ahead],
-                                     lax.rem(ahead, jnp.int32(weight_slots))):
+                    for cp in w_copy(
+                        order_s[ahead], lax.rem(ahead, jnp.int32(weight_slots))
+                    ):
                         cp.start()
 
-                cslot = (lax.rem(e, jnp.int32(weight_slots))
-                         if SKIP_MUTANT == "slot" else wslot)
+                cslot = (
+                    lax.rem(e, jnp.int32(weight_slots))
+                    if SKIP_MUTANT == "slot"
+                    else wslot
+                )
                 n_rows = tab_ref[e, 3 * D]
                 n_tiles = (n_rows + T - 1) // T
                 return lax.fori_loop(
-                    0, n_tiles,
-                    lambda j, c: tile_step(e, cslot, n_rows, j, c), carry)
+                    0, n_tiles, lambda j, c: tile_step(e, cslot, n_rows, j, c), carry
+                )
 
-            _, pend_r, pend_l = lax.fori_loop(0, n_list, listed_step,
-                                              (jnp.int32(0), zeros, zeros))
+            _, pend_r, pend_l = lax.fori_loop(
+                0, n_list, listed_step, (jnp.int32(0), zeros, zeros)
+            )
         else:
-            _, pend_r, pend_l = lax.fori_loop(0, G, expert_step,
-                                              (jnp.int32(0), zeros, zeros))
+            _, pend_r, pend_l = lax.fori_loop(
+                0, G, expert_step, (jnp.int32(0), zeros, zeros)
+            )
         for i in range(result_slots):
             drain_slot(i, pend_r[i], pend_l[i])
         if D > 1:
@@ -700,9 +835,8 @@ def build_kernel(*, num_shards, tokens_per_shard, hidden, inter,
                 c = coef_vmem[pl.ds(t, 1), :]
                 acc = None
                 for k in range(K):
-                    coef = c[:, k:k + 1]
-                    term = arrivals_ref[pos_ref[t, k]].astype(
-                        jnp.float32) * coef
+                    coef = c[:, k : k + 1]
+                    term = arrivals_ref[pos_ref[t, k]].astype(jnp.float32) * coef
                     term = jnp.where(coef != 0, term, jnp.zeros_like(term))
                     acc = term if k == 0 else acc + term
                 row0 = pl.multiple_of(t * LB, 8)
@@ -720,8 +854,8 @@ def build_kernel(*, num_shards, tokens_per_shard, hidden, inter,
         pltpu.VMEM((N, H), FP8),  # rows_all
         pltpu.VMEM((N, LANES), jnp.float32),  # scales_all
         pltpu.VMEM((T, H), FP8),  # tile_vmem
-        pltpu.VMEM((weight_slots, H, 2 * I), FP8),  # w1_vmem
-        pltpu.VMEM((weight_slots, I, H), FP8),  # w2_vmem
+        pltpu.VMEM((weight_slots, H, 2 * INTER), FP8),  # w1_vmem
+        pltpu.VMEM((weight_slots, INTER, H), FP8),  # w2_vmem
         pltpu.VMEM((result_slots, T, LB, LANES), jnp.bfloat16),  # result
         pltpu.VMEM((T, LANES), jnp.float32),  # xs_tile
     ]
@@ -743,16 +877,16 @@ def build_kernel(*, num_shards, tokens_per_shard, hidden, inter,
             pltpu.SMEM((8, LANES), jnp.int32),  # misc
         ]
     if skip_unrouted:
-        scratch += [pltpu.SMEM((G, ), jnp.int32)]  # the live-expert list
+        scratch += [pltpu.SMEM((G,), jnp.int32)]  # the live-expert list
     scratch += [
-        pltpu.SemaphoreType.DMA((weight_slots, )),
-        pltpu.SemaphoreType.DMA((weight_slots, )),
+        pltpu.SemaphoreType.DMA((weight_slots,)),
+        pltpu.SemaphoreType.DMA((weight_slots,)),
         pltpu.SemaphoreType.DMA,  # ag send
         pltpu.SemaphoreType.DMA,  # ag recv
         pltpu.SemaphoreType.DMA,  # ag local
         pltpu.SemaphoreType.DMA,  # load
-        pltpu.SemaphoreType.DMA((result_slots, )),  # push send
-        pltpu.SemaphoreType.DMA((result_slots, )),  # push local
+        pltpu.SemaphoreType.DMA((result_slots,)),  # push send
+        pltpu.SemaphoreType.DMA((result_slots,)),  # push local
         pltpu.SemaphoreType.DMA,  # push recv
     ]
     if merged:
@@ -760,8 +894,11 @@ def build_kernel(*, num_shards, tokens_per_shard, hidden, inter,
     if fused:
         out_shape = [jax.ShapeDtypeStruct((R, H), out_dtype)]
         out_specs = [vmem]
-        in_specs = ([vmem, vmem, vmem, hbm, hbm, vmem, vmem] if merged else
-                    [vmem, vmem, vmem, hbm, hbm, vmem, vmem])
+        in_specs = (
+            [vmem, vmem, vmem, hbm, hbm, vmem, vmem]
+            if merged
+            else [vmem, vmem, vmem, hbm, hbm, vmem, vmem]
+        )
     else:
         out_shape = [
             jax.ShapeDtypeStruct((N, H), FP8),
@@ -777,39 +914,63 @@ def build_kernel(*, num_shards, tokens_per_shard, hidden, inter,
     program = pl.pallas_call(
         kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=(2 if unpadded else 1) if merged else (3 if fused else 2),
+            num_scalar_prefetch=(2 if unpadded else 1)
+            if merged
+            else (3 if fused else 2),
             in_specs=in_specs,
             out_specs=out_specs,
             scratch_shapes=tuple(scratch),
-            grid=()),
+            grid=(),
+        ),
         out_shape=out_shape,
         compiler_params=pltpu.CompilerParams(**params),
         interpret=INTERPRET if INTERPRET is not None else False,
-        name=(f"fused_ep_dense_slots{'_f' if fused else ''}"
-              f"{'m' if merged else ''}{'u' if unpadded else ''}"
-              f"{'s' if skip_unrouted else ''}"
-              f"{'' if weight_slots == 3 else f'_w{weight_slots}'}_g{G}_t{T}_n{N}"))
+        name=(
+            f"fused_ep_dense_slots{'_f' if fused else ''}"
+            f"{'m' if merged else ''}{'u' if unpadded else ''}"
+            f"{'s' if skip_unrouted else ''}"
+            f"{'' if weight_slots == 3 else f'_w{weight_slots}'}_g{G}_t{T}_n{N}"
+        ),
+    )
     return program
 
 
-def dense_slots_moe(x, w1, w2, w1_scales, w2_scales, router_logits, *, top_k,
-                    renormalize, mesh, tile_rows=128, config=None,
-                    experts_per_shard=None, shard_index=None,
-                    valid_tokens=None, drop_nan_rows=False, fused=None,
-                    pallas_tables=None, merged=None, unpadded=None,
-                    skip_unrouted=None):
+def dense_slots_moe(
+    x,
+    w1,
+    w2,
+    w1_scales,
+    w2_scales,
+    router_logits,
+    *,
+    top_k,
+    renormalize,
+    mesh,
+    tile_rows=128,
+    config=None,
+    experts_per_shard=None,
+    shard_index=None,
+    valid_tokens=None,
+    drop_nan_rows=False,
+    fused=None,
+    pallas_tables=None,
+    merged=None,
+    unpadded=None,
+    skip_unrouted=None,
+):
     """The dense-slots layer: same operands and result as v3's fused_ep_moe
     with fp8 weights, per-channel scales and silu (the DP4xTP2 decode
     binding). x [tokens, hidden] bf16 sharded over the mesh axis; router
     logits [tokens, num_experts]."""
     from . import layer as v3_layer  # the select kernel
+
     if config is None:
         config = Config()
     tokens, hidden = x.shape
     num_experts_w, _, cols = w1.shape
     inter = cols // 2
     num_shards = mesh.shape[MESH_AXIS]
-    if tuple(mesh.axis_names) != (MESH_AXIS, ):
+    if tuple(mesh.axis_names) != (MESH_AXIS,):
         raise ValueError(f"a mesh of the one axis {MESH_AXIS!r}")
     G = experts_per_shard or num_experts_w // num_shards
     num_experts = G * num_shards
@@ -830,23 +991,42 @@ def dense_slots_moe(x, w1, w2, w1_scales, w2_scales, router_logits, *, top_k,
         unpadded = UNPADDED
     unpadded = unpadded and merged and real % 8 == 0
     if skip_unrouted is None:
-        skip_unrouted = SKIP_UNROUTED or getattr(config, "dense_slots_skip_unrouted", False)
+        skip_unrouted = SKIP_UNROUTED or getattr(
+            config, "dense_slots_skip_unrouted", False
+        )
     wslots = WEIGHT_SLOTS or getattr(config, "dense_slots_weight_slots", 0) or 3
-    tables_program = (build_tables_kernel(
-        num_shards=num_shards, tokens_per_shard=Tp, experts_per_shard=G,
-        top_k=K, num_experts=num_experts, mesh_axes=tuple(mesh.axis_names))
-                      if pallas_tables else None)
-    program = build_kernel(fused=fused, out_dtype=x.dtype, merged=merged,
-                           num_experts=num_experts,
-                           real_rows=real if unpadded else None,
-                           skip_unrouted=bool(skip_unrouted),
-                           weight_slots=wslots, weight_prefetch=wslots - 1,
-                           num_shards=num_shards, tokens_per_shard=Tp,
-                           hidden=hidden, inter=inter, experts_per_shard=G,
-                           top_k=K, tile_rows=tile_rows,
-                           mesh_axes=tuple(mesh.axis_names),
-                           elementwise=elementwise,
-                           columns_per_pass=config.activation_columns_per_pass)
+    tables_program = (
+        build_tables_kernel(
+            num_shards=num_shards,
+            tokens_per_shard=Tp,
+            experts_per_shard=G,
+            top_k=K,
+            num_experts=num_experts,
+            mesh_axes=tuple(mesh.axis_names),
+        )
+        if pallas_tables
+        else None
+    )
+    program = build_kernel(
+        fused=fused,
+        out_dtype=x.dtype,
+        merged=merged,
+        num_experts=num_experts,
+        real_rows=real if unpadded else None,
+        skip_unrouted=bool(skip_unrouted),
+        weight_slots=wslots,
+        weight_prefetch=wslots - 1,
+        num_shards=num_shards,
+        tokens_per_shard=Tp,
+        hidden=hidden,
+        inter=inter,
+        experts_per_shard=G,
+        top_k=K,
+        tile_rows=tile_rows,
+        mesh_axes=tuple(mesh.axis_names),
+        elementwise=elementwise,
+        columns_per_pass=config.activation_columns_per_pass,
+    )
     with_valid = valid_tokens is not None
 
     def body(x_l, logits_l, w1_l, w2_l, s1_l, s2_l, shard_l, *rest):
@@ -854,28 +1034,48 @@ def dense_slots_moe(x, w1, w2, w1_scales, w2_scales, router_logits, *, top_k,
         n_valid = rest[0].reshape(-1)[0] if with_valid else None
         if unpadded:
             weights, indices = v3_layer._select(
-                logits_l, top_k=K, tokens_per_shard=real,
-                renormalize=renormalize, drop_nan_rows=drop_nan_rows,
+                logits_l,
+                top_k=K,
+                tokens_per_shard=real,
+                renormalize=renormalize,
+                drop_nan_rows=drop_nan_rows,
                 message_rows=None,
-                valid_tokens=None if n_valid is None else n_valid.reshape(1))
-            nv = (jnp.full((1, ), real, jnp.int32) if n_valid is None else
-                  n_valid.astype(jnp.int32).reshape(1))
-            out, = program(me.reshape(1), nv, x_l.astype(jnp.bfloat16),
-                           indices.astype(jnp.int32), weights.astype(jnp.float32),
-                           w1_l[:G], w2_l[:G], s1_l[:G].astype(jnp.float32),
-                           s2_l[:G].astype(jnp.float32))
+                valid_tokens=None if n_valid is None else n_valid.reshape(1),
+            )
+            nv = (
+                jnp.full((1,), real, jnp.int32)
+                if n_valid is None
+                else n_valid.astype(jnp.int32).reshape(1)
+            )
+            (out,) = program(
+                me.reshape(1),
+                nv,
+                x_l.astype(jnp.bfloat16),
+                indices.astype(jnp.int32),
+                weights.astype(jnp.float32),
+                w1_l[:G],
+                w2_l[:G],
+                s1_l[:G].astype(jnp.float32),
+                s2_l[:G].astype(jnp.float32),
+            )
             return out
         if Tp > real:
             x_l = jnp.pad(x_l, ((0, Tp - real), (0, 0)))
-            logits_l = jnp.pad(logits_l, ((0, Tp - real), (0, 0)),
-                               constant_values=jnp.nan)
+            logits_l = jnp.pad(
+                logits_l, ((0, Tp - real), (0, 0)), constant_values=jnp.nan
+            )
         if n_valid is not None:
             keep = jnp.arange(Tp, dtype=jnp.int32) < n_valid
             x_l = jnp.where(keep[:, None], x_l, 0)
         weights, indices = v3_layer._select(
-            logits_l, top_k=K, tokens_per_shard=Tp, renormalize=renormalize,
-            drop_nan_rows=drop_nan_rows, message_rows=None,
-            valid_tokens=None if n_valid is None else n_valid.reshape(1))
+            logits_l,
+            top_k=K,
+            tokens_per_shard=Tp,
+            renormalize=renormalize,
+            drop_nan_rows=drop_nan_rows,
+            message_rows=None,
+            valid_tokens=None if n_valid is None else n_valid.reshape(1),
+        )
         # A row with no finite logit gets weight zero from the select.
         indices = jnp.where(weights != 0, indices, num_experts)
         if n_valid is not None:
@@ -883,51 +1083,91 @@ def dense_slots_moe(x, w1, w2, w1_scales, w2_scales, router_logits, *, top_k,
             indices = jnp.where(keep, indices, num_experts)
             weights = jnp.where(keep, weights, 0.0)
         if merged:
-            idx_pad = jnp.pad(indices.astype(jnp.int32), ((0, 0), (0, LANES - K)),
-                              constant_values=num_experts)
-            out, = program(me.reshape(1), x_l.astype(jnp.bfloat16), idx_pad,
-                           weights.astype(jnp.float32), w1_l[:G], w2_l[:G],
-                           s1_l[:G].astype(jnp.float32),
-                           s2_l[:G].astype(jnp.float32))
+            idx_pad = jnp.pad(
+                indices.astype(jnp.int32),
+                ((0, 0), (0, LANES - K)),
+                constant_values=num_experts,
+            )
+            (out,) = program(
+                me.reshape(1),
+                x_l.astype(jnp.bfloat16),
+                idx_pad,
+                weights.astype(jnp.float32),
+                w1_l[:G],
+                w2_l[:G],
+                s1_l[:G].astype(jnp.float32),
+                s2_l[:G].astype(jnp.float32),
+            )
             return out[:real]
         if pallas_tables:
-            idx_pad = jnp.pad(indices.astype(jnp.int32), ((0, 0), (0, LANES - K)),
-                              constant_values=num_experts)
+            idx_pad = jnp.pad(
+                indices.astype(jnp.int32),
+                ((0, 0), (0, LANES - K)),
+                constant_values=num_experts,
+            )
             mp, tab, pos, misc_t = tables_program(me.reshape(1), idx_pad)
             t = dict(mp=mp, tab=tab, pos=pos, misc=misc_t)
         else:
-            idx_all = lax.all_gather(indices.astype(jnp.int32), MESH_AXIS,
-                                     tiled=True)
-            t = shard_tables(idx_all, me, experts_per_shard=G,
-                             num_shards=num_shards, tokens_per_shard=Tp,
-                             num_experts=num_experts)
+            idx_all = lax.all_gather(indices.astype(jnp.int32), MESH_AXIS, tiled=True)
+            t = shard_tables(
+                idx_all,
+                me,
+                experts_per_shard=G,
+                num_shards=num_shards,
+                tokens_per_shard=Tp,
+                num_experts=num_experts,
+            )
         if TABLE_HOOK is not None:
             t = TABLE_HOOK(t)
-        operands = (x_l.astype(jnp.bfloat16), w1_l[:G], w2_l[:G],
-                    s1_l[:G].astype(jnp.float32), s2_l[:G].astype(jnp.float32))
+        operands = (
+            x_l.astype(jnp.bfloat16),
+            w1_l[:G],
+            w2_l[:G],
+            s1_l[:G].astype(jnp.float32),
+            s2_l[:G].astype(jnp.float32),
+        )
         if fused:
-            out, = program(t["tab"], t["misc"], t["pos"], t["mp"], operands[0],
-                           weights.astype(jnp.float32), *operands[1:])
+            (out,) = program(
+                t["tab"],
+                t["misc"],
+                t["pos"],
+                t["mp"],
+                operands[0],
+                weights.astype(jnp.float32),
+                *operands[1:],
+            )
             return out[:real]
         _, _, arrivals = program(t["tab"], t["misc"], t["mp"], *operands)
         rows = jnp.take(arrivals, t["pos"].reshape(-1), axis=0)
-        out = weighted_sum(rows, None, weights.astype(jnp.float32),
-                           tokens_per_shard=Tp, hidden=hidden,
-                           out_dtype=x.dtype,
-                           tokens_per_tile=min(Tp, 128),
-                           dtype=config.combine)
+        out = weighted_sum(
+            rows,
+            None,
+            weights.astype(jnp.float32),
+            tokens_per_shard=Tp,
+            hidden=hidden,
+            out_dtype=x.dtype,
+            tokens_per_tile=min(Tp, 128),
+            dtype=config.combine,
+        )
         return out[:real]
 
     if shard_index is None:
-        shard_index = jnp.arange(num_shards, dtype=jnp.int32).reshape(
-            num_shards, 1)
+        shard_index = jnp.arange(num_shards, dtype=jnp.int32).reshape(num_shards, 1)
     rows_spec = jax.sharding.PartitionSpec(MESH_AXIS)
-    args = [x, router_logits, w1, w2, w1_scales, w2_scales,
-            shard_index.astype(jnp.int32).reshape(num_shards, 1)]
+    args = [
+        x,
+        router_logits,
+        w1,
+        w2,
+        w1_scales,
+        w2_scales,
+        shard_index.astype(jnp.int32).reshape(num_shards, 1),
+    ]
     specs = [rows_spec] * 7
     if with_valid:
         args.append(valid_tokens.astype(jnp.int32).reshape(num_shards, 1))
         specs.append(rows_spec)
-    sm = jax.shard_map(body, mesh=mesh, in_specs=tuple(specs),
-                       out_specs=rows_spec, check_vma=False)
+    sm = jax.shard_map(
+        body, mesh=mesh, in_specs=tuple(specs), out_specs=rows_spec, check_vma=False
+    )
     return sm(*args)

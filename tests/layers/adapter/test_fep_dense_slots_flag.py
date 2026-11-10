@@ -16,6 +16,7 @@ the Config field dense_slots (set by the Qwen3.5 DP4 x TP2 layout table), calls
 of at most dense_slots_max_tokens rows per shard (default 64) take the
 dense-slots layer with the caller's operands, larger calls keep v3; a bad
 threshold raises."""
+
 from types import SimpleNamespace
 
 import pytest
@@ -61,8 +62,13 @@ def test_default_is_v3(monkeypatch):
 
 def test_on_takes_dense_up_to_the_threshold(monkeypatch):
     on = {"dense_slots": True}
-    for rows, want in ((8 * 48, "dense"), (8 * 56, "dense"), (8 * 64, "dense"),
-                       (8 * 72, "v3"), (8 * 1024, "v3")):
+    for rows, want in (
+        (8 * 48, "dense"),
+        (8 * 56, "dense"),
+        (8 * 64, "dense"),
+        (8 * 72, "v3"),
+        (8 * 1024, "v3"),
+    ):
         got, calls = _run(monkeypatch, rows, on)
         assert got == want, (rows, got)
     got, calls = _run(monkeypatch, 8 * 56, on)
@@ -70,12 +76,18 @@ def test_on_takes_dense_up_to_the_threshold(monkeypatch):
     assert a[1:6] == ("w1", "w2", "s1", "s2", "gating")
     assert k["shard_index"] == "rank" and k["valid_tokens"] == "valid"
     assert k["drop_nan_rows"] is True and k["fused"] is False and k["top_k"] == 10
-    assert k["pallas_tables"] is False and k["merged"] is False and k["unpadded"] is False
+    assert (
+        k["pallas_tables"] is False and k["merged"] is False and k["unpadded"] is False
+    )
 
 
 def test_threshold_and_fused(monkeypatch):
-    fields = {"dense_slots": True, "dense_slots_max_tokens": 128,
-              "dense_slots_fused": True, "dense_slots_pallas_tables": True}
+    fields = {
+        "dense_slots": True,
+        "dense_slots_max_tokens": 128,
+        "dense_slots_fused": True,
+        "dense_slots_pallas_tables": True,
+    }
     got, calls = _run(monkeypatch, 8 * 128, fields)
     assert got == "dense" and calls[0][2]["fused"] is True
     assert calls[0][2]["pallas_tables"] is True
@@ -86,8 +98,7 @@ def test_threshold_and_fused(monkeypatch):
 @pytest.mark.parametrize("bad", [0, 60, -8])
 def test_bad_threshold_raises(monkeypatch, bad):
     with pytest.raises(ValueError):
-        _run(monkeypatch, 8 * 56, {"dense_slots": True,
-                                   "dense_slots_max_tokens": bad})
+        _run(monkeypatch, 8 * 56, {"dense_slots": True, "dense_slots_max_tokens": bad})
 
 
 def test_other_fields_leave_it_off(monkeypatch):
@@ -96,7 +107,11 @@ def test_other_fields_leave_it_off(monkeypatch):
 
 
 def test_merged(monkeypatch):
-    fields = {"dense_slots": True, "dense_slots_fused": True, "dense_slots_merged": True}
+    fields = {
+        "dense_slots": True,
+        "dense_slots_fused": True,
+        "dense_slots_merged": True,
+    }
     got, calls = _run(monkeypatch, 8 * 56, fields)
     assert got == "dense"
     k = calls[0][2]
