@@ -228,7 +228,6 @@ ignore = [
 "src/vllm_torchtpu/kernels/**" = ["B023"]
 # The Kimi-K3 megakernel is moved as-is from its source branch across 7 slices;
 # each slice adds strictly its own file/folder rules and removes them in its cleanup PR.
-"src/vllm_torchtpu/models/kimi_k3/megakernel/{kernels/rank_loader,tools/__init__}.py" = ["E501"]
 "src/vllm_torchtpu/models/kimi_k3/megakernel/{decode,decode_ops,draft,draft_layers,draft_mla,draft_mla_prefill,draft_ring,pools,prefill,program,sampling}.py" = ["E501"]
 "src/vllm_torchtpu/models/kimi_k3/megakernel/tools/{__main__,coverage,harness}.py" = ["E501", "T20"]
 
@@ -240,7 +239,6 @@ ignore = [
 [tool.ruff.format]
 docstring-code-format = true
 exclude = [
-    "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/rank_loader.py",
 ]
 
 [tool.pymarkdown]
