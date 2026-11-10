@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Config.dense_slots_skip_unrouted / dense_slots_weight_slots (default off / 3 slots): the
-TPU_MOE_FUSED_EP_V3_CONFIG JSON reaches the dense-slots call, and dense_slots_moe hands both
+adapter's Config overrides reach the dense-slots call, and dense_slots_moe hands both
 settings to the program builder (CPU, no kernel is built)."""
 from types import SimpleNamespace
 
@@ -25,7 +25,7 @@ from vllm_torchtpu.layers.adapter import fused_moe_ep_v3 as A
 
 SHAPE = dict(hidden=4096, inter=1024, experts_per_shard=64)
 EP = 8
-DENSE = '"dense_slots":true,"dense_slots_fused":true,"dense_slots_merged":true'
+DENSE = {"dense_slots": True, "dense_slots_fused": True, "dense_slots_merged": True}
 
 
 class _Mesh:
@@ -33,12 +33,8 @@ class _Mesh:
     shape = {MESH_AXIS: EP}
 
 
-def _adapter_config(monkeypatch, json_fields):
-    for k in ("TPU_MOE_FEP_DENSE_SLOTS", "TPU_MOE_FEP_DENSE_SLOTS_MAX_TOKENS",
-              "TPU_MOE_FEP_DENSE_SLOTS_FUSED", "TPU_MOE_FEP_DENSE_SLOTS_PALLAS_TABLES",
-              "TPU_MOE_FEP_DENSE_SLOTS_MERGED"):
-        monkeypatch.delenv(k, raising=False)
-    monkeypatch.setenv("TPU_MOE_FUSED_EP_V3_CONFIG", "{" + json_fields + "}")
+def _adapter_config(monkeypatch, fields):
+    monkeypatch.setattr(A, "_CONFIG_OVERRIDES", dict(fields))
     calls = []
     monkeypatch.setattr(A._dense_slots, "dense_slots_moe",
                         lambda *a, **k: calls.append(k) or "dense")
@@ -50,14 +46,14 @@ def _adapter_config(monkeypatch, json_fields):
     return calls[0]["config"]
 
 
-def test_json_fields_reach_the_dense_call(monkeypatch):
-    cfg = _adapter_config(monkeypatch, DENSE + ',"dense_slots_skip_unrouted":true,'
-                          '"dense_slots_weight_slots":4')
+def test_override_fields_reach_the_dense_call(monkeypatch):
+    cfg = _adapter_config(monkeypatch, {**DENSE, "dense_slots_skip_unrouted": True,
+                                        "dense_slots_weight_slots": 4})
     assert cfg.dense_slots_skip_unrouted is True
     assert cfg.dense_slots_weight_slots == 4
 
 
-def test_json_default_is_off(monkeypatch):
+def test_override_default_is_off(monkeypatch):
     cfg = _adapter_config(monkeypatch, DENSE)
     assert cfg.dense_slots_skip_unrouted is False
     assert cfg.dense_slots_weight_slots == 0
