@@ -137,6 +137,7 @@ class _Entry:
     # physically exists (and holds its host block) but is invisible to
     # lookup. A same-hash insert reclaims it; nothing else brings it back.
     is_candidate: bool = False
+    host_block_id: int = -1
 
 
 @dataclass
@@ -221,7 +222,7 @@ class FakeKVCacheStore:
                     SimpleNamespace(
                         status=entry.status,
                         device_block_id=entry.device_block_id,
-                        host_block_id=-1,
+                        host_block_id=entry.host_block_id,
                     ),
                 )
             )
@@ -726,6 +727,18 @@ class TestStoreJobLifecycle(unittest.TestCase):
         (save_call,) = self.store.calls_named("save")
         self.assertEqual(save_call.args[0], hashes)
 
+    def test_submit_inserts_in_device_block_order(self):
+        # Host blocks follow insert order, so device order makes runs of
+        # consecutive device blocks land on consecutive host blocks.
+        self._admit([_key(0), _key(1)], [9, 5])
+
+        (call,) = self.store.calls_named("insert")
+        hashes, slices, _ = call.args
+        self.assertEqual(hashes, sub_hashes(_key(1)) + sub_hashes(_key(0)))
+        self.assertEqual(
+            [s.device_block_id for s in slices], [20, 21, 22, 23, 36, 37, 38, 39]
+        )
+
     def test_success_spends_every_pin_and_marks_stored(self):
         self._admit([_key(0)], [5])
         self.assertTrue(self.manager.has_pending_work())
@@ -868,6 +881,24 @@ class TestLoadJobLifecycle(unittest.TestCase):
         self.assertEqual(finished_job.failed_device_block_ids, [])
         for h in batch:
             self.assertEqual(self.store.entries[h].pin_count, 0)
+
+    def test_load_transfer_runs_in_host_block_order(self):
+        for host_base, key in ((100, _key(0)), (0, _key(1))):
+            for i, h in enumerate(sub_hashes(key)):
+                self.store.entries[h].host_block_id = host_base + i
+        spec = self.manager.prepare_load([_key(0), _key(1)], _ctx("r1"))
+        self.assertEqual(spec.host_block_ids, [100, 101, 102, 103, 0, 1, 2, 3])
+
+        self.manager.submit_load_job(
+            3, [_key(0), _key(1)], [10, 11], "r1", host_block_ids=spec.host_block_ids
+        )
+        (load,) = self.store.calls_named("load")
+        self.assertEqual(load.args[0], sub_hashes(_key(1)) + sub_hashes(_key(0)))
+        self.assertEqual(load.args[1], [44, 45, 46, 47, 40, 41, 42, 43])
+
+        self.store.complete_load(sub_hashes(_key(0)) + sub_hashes(_key(1)))
+        (finished_job,) = self.manager.poll_finished_jobs()
+        self.assertTrue(finished_job.success)
 
     def test_load_failure_reports_dst_device_blocks_and_keeps_host(self):
         self.manager.prepare_load([_key(0)], _ctx("r1"))
@@ -1338,6 +1369,57 @@ class _FakeFinishedRequest:
         if name.startswith("__") and name.endswith("__"):
             raise AttributeError(name)
         return None
+
+
+class TestLoadBlockAlignment(unittest.TestCase):
+    """TPURaidenOffloadingScheduler hands a load's fresh blocks to its keys in
+    host-block order, permuting the request's block list in place."""
+
+    def _setup(self, host_block_ids, dst=(10, 20, 30)):
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
+            TransferJob,
+        )
+        from vllm.v1.core.kv_cache_utils import KVCacheBlock
+
+        from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingScheduler
+        from vllm_torchtpu.offload.raiden_store import RaidenLoadStoreSpec
+
+        sched = object.__new__(TPURaidenOffloadingScheduler)
+        sched.config = SimpleNamespace(kv_group_configs=[SimpleNamespace(group_idx=0)])
+        sched._req_status = {"r1": SimpleNamespace(transfer_jobs={7})}
+        keys = [_key(i) for i in range(len(dst))]
+        dst_spec = GPULoadStoreSpec(
+            list(dst), group_sizes=[len(dst)], block_indices=[1]
+        )
+        sched._current_batch_load_jobs = {
+            7: TransferJob(
+                req_id="r1",
+                src_spec=RaidenLoadStoreSpec(keys, host_block_ids=host_block_ids),
+                dst_spec=dst_spec,
+            )
+        }
+        head = KVCacheBlock(5)  # a local prefix hit, ahead of the load
+        fresh = [KVCacheBlock(b) for b in dst]
+        for b in [head, *fresh]:
+            b.ref_cnt = 1
+        group_blocks = [head, *fresh]
+        blocks = SimpleNamespace(blocks=(group_blocks,))
+        sched._align_load_blocks_to_host_order(SimpleNamespace(request_id="r1"), blocks)
+        return group_blocks, dst_spec
+
+    def test_lowest_host_block_gets_lowest_device_block(self):
+        group_blocks, dst_spec = self._setup([7, 3, 5])
+        self.assertEqual([b.block_id for b in group_blocks], [5, 30, 10, 20])
+        self.assertEqual(dst_spec.block_ids.tolist(), [30, 10, 20])
+
+    def test_sub_hashes_order_by_their_key_first_host_block(self):
+        group_blocks, _ = self._setup([8, 9, 0, 1, 4, 5])
+        self.assertEqual([b.block_id for b in group_blocks], [5, 30, 10, 20])
+
+    def test_peer_or_storage_bytes_leave_blocks_alone(self):
+        group_blocks, dst_spec = self._setup([7, -1, 5])
+        self.assertEqual([b.block_id for b in group_blocks], [5, 10, 20, 30])
+        self.assertEqual(dst_spec.block_ids.tolist(), [10, 20, 30])
 
 
 class TestFinishedRequestStoreBuild(unittest.TestCase):

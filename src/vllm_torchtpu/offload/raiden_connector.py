@@ -56,6 +56,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.utils import yield_req_data
@@ -81,6 +82,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker import (
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
     OffloadingConnector,
 )
+from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.kv_offload.base import (
@@ -454,6 +456,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 device_block_ids,
                 job.req_id,
                 pinned=src_spec.pinned,
+                host_block_ids=src_spec.host_block_ids,
             )
 
         # Handle jobs_to_flush (source blocks are about to be recycled):
@@ -501,6 +504,60 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             finished_store_job_ids=finished_store_ids,
             finished_load_jobs=finished_loads,
             failed_load_req_ids=failed_load_req_ids,
+        )
+
+    def update_state_after_alloc(
+        self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int
+    ) -> None:
+        super().update_state_after_alloc(request, blocks, num_external_tokens)
+        if num_external_tokens:
+            self._align_load_blocks_to_host_order(request, blocks)
+
+    def _align_load_blocks_to_host_order(
+        self, request: Request, blocks: KVCacheBlocks
+    ) -> None:
+        """Give the load's fresh blocks to its keys in host-block order.
+
+        A load moves fastest into device blocks that ascend with the host
+        blocks it reads (`raiden_store._dma_order`). The blocks the scheduler
+        just allocated for the load hold nothing yet, so which key lands in
+        which of them is free: sort them, and hand the lowest one to the key
+        with the lowest host block. The request's block list is permuted in
+        place, so its block table and later prefix caching follow.
+        """
+        req_status = self._req_status.get(request.request_id)
+        if req_status is None or len(req_status.transfer_jobs) != 1:
+            return
+        job = self._current_batch_load_jobs.get(next(iter(req_status.transfer_jobs)))
+        if job is None or len(self.config.kv_group_configs) != 1:
+            return
+        src_spec, dst_spec = job.src_spec, job.dst_spec
+        assert isinstance(src_spec, RaidenLoadStoreSpec)
+        num_blocks = len(dst_spec.block_ids)
+        host_ids = src_spec.host_block_ids
+        if not src_spec.pinned or not host_ids or num_blocks < 2:
+            return
+        if len(src_spec.keys) != num_blocks or len(host_ids) % num_blocks:
+            return
+        if min(host_ids) < 0:
+            return  # some bytes come from a peer or the storage tier
+        # Every key expands to the same number of sub-hashes, which travel
+        # together: order keys by their first one. Any assignment of the fresh
+        # blocks is correct; the order only decides how well the copy coalesces.
+        key_host_ids = host_ids[:: len(host_ids) // num_blocks]
+        start = dst_spec.block_indices[0]
+        group_blocks = blocks.blocks[self.config.kv_group_configs[0].group_idx]
+        fresh = group_blocks[start : start + num_blocks]
+        if [b.block_id for b in fresh] != dst_spec.block_ids.tolist() or any(
+            b.block_hash is not None or b.ref_cnt != 1 for b in fresh
+        ):
+            return
+        by_host = sorted(range(num_blocks), key=key_host_ids.__getitem__)
+        block_at = dict(zip(by_host, sorted(fresh, key=lambda b: b.block_id)))
+        aligned = [block_at[pos] for pos in range(num_blocks)]
+        group_blocks[start : start + num_blocks] = aligned
+        dst_spec.block_ids = np.array(
+            [b.block_id for b in aligned], dtype=dst_spec.block_ids.dtype
         )
 
     def peek_external_prefix_tokens(
