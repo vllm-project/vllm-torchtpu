@@ -131,6 +131,7 @@ def gdn_attention_core_tpu(
     d_v: int,
     kernel_size: int,
     num_spec_tokens: int = 0,
+    architecture: str | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     # Speculative decoding: vLLM's MambaSpec widens the conv state by
     # `num_spec` columns per slot. The extra columns are unused on TPU
@@ -166,6 +167,7 @@ def gdn_attention_core_tpu(
         kernel_size=kernel_size,
         mesh=mesh,
         num_spec_tokens=num_spec_tokens,
+        architecture=architecture,
     )
     if state_len > kernel_size - 1:
         # Write the kernel result into the first kernel_size - 1 columns of the
@@ -206,6 +208,7 @@ def gdn_attention_pooled_core_tpu(
     pool_block_tokens: int,
     recurrent_state_dtype: jnp.dtype,
     num_spec_tokens: int = 0,
+    architecture: str | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     return run_jax_gdn_attention_pooled(
         mixed_qkv,
@@ -233,6 +236,7 @@ def gdn_attention_pooled_core_tpu(
         recurrent_state_dtype=recurrent_state_dtype,
         mesh=mesh,
         num_spec_tokens=num_spec_tokens,
+        architecture=architecture,
     )
 
 
@@ -259,6 +263,7 @@ def gdn_attention_core_tpu_pcp_prefill(
     kernel_size: int,
     pcp_size: int,
     interleave_size: int,
+    architecture: str | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     state_len = conv_state.shape[1]
     if state_len > kernel_size - 1:
@@ -289,6 +294,7 @@ def gdn_attention_core_tpu_pcp_prefill(
             pcp_size=pcp_size,
             interleave_size=interleave_size,
             mesh=mesh,
+            architecture=architecture,
         )
     )
     if state_len > kernel_size - 1:
@@ -355,6 +361,18 @@ def _localize_gdn_mamba_spec_for_pcp(
 # (and re-lowered) the identical kernel for every layer at every compile bucket.
 _shared_gdn_ops: dict[tuple, Any] = {}
 _shared_gdn_op_ids = itertools.count()
+
+
+def _model_architecture(layer: object, vllm_config: object) -> str | None:
+    """The model architecture that selects ``layer``'s GDN kernel
+    (`gdn_attention.gdn_kernel_wrapper`): the layer's model config, else the
+    engine's. None when neither names one."""
+    for owner in (layer, vllm_config):
+        model_config = getattr(owner, "model_config", None)
+        architecture = getattr(model_config, "architecture", None)
+        if isinstance(architecture, str):
+            return architecture
+    return None
 
 
 def _get_shared_gdn_op(kind: str, key: tuple, build: Callable[[str], Any]) -> Any:
@@ -610,6 +628,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         local_num_kq_heads = self.tp_head_geometry.local_num_kq_heads
         has_conv_bias = self.conv1d.bias is not None
         vllm_context = get_vllm_model_wrapper_context()
+        architecture = _model_architecture(self, vllm_context.vllm_config)
         # The non-PCP op uses num_spec_tokens for verify/rollback. PCP is a
         # prefill-only path admitted at the platform boundary; its widened
         # conv-state tail is preserved by gdn_attention_core_tpu_pcp_prefill.
@@ -658,6 +677,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 kernel_size=self.conv_kernel_size,
                 pcp_size=pcp_size,
                 interleave_size=interleave_size,
+                architecture=architecture,
             )
             input_partition_specs = (
                 PartitionSpec(_GDN_PCP_AXIS_NAME, _GDN_TP_AXIS_NAME),  # mixed_qkv
@@ -706,6 +726,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 d_v=self.head_v_dim,
                 kernel_size=self.conv_kernel_size,
                 num_spec_tokens=num_spec_tokens,
+                architecture=architecture,
             )
             gdn_jax_op = pallas.jax_op(op_name, wrapped_fn, donate_argnums=(3, 4))
 
@@ -758,6 +779,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         vllm_context = get_vllm_model_wrapper_context()
         local_num_v_heads = self.num_v_heads // self.tp_size
         vllm_config = cast(VllmConfig, vllm_context.vllm_config)
+        architecture = _model_architecture(self, vllm_config)
         mesh = vllm_context.mesh
         n_kq = self.tp_head_geometry.local_num_kq_heads
         d_k = self.head_k_dim
@@ -827,6 +849,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 pool_block_tokens=vllm_config.cache_config.block_size,
                 recurrent_state_dtype=recurrent_state_dtype,
                 num_spec_tokens=num_spec_tokens,
+                architecture=architecture,
             )
             if not block_major:
                 return result
@@ -861,6 +884,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 kernel_size,
                 recurrent_state_dtype,
                 num_spec_tokens,
+                architecture,
             ),
             build_op,
         )
