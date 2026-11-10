@@ -199,6 +199,31 @@ class MiniMaxM3DSparkDecoderLayer(DFlashQwen3DecoderLayer):
         self.post_attention_layernorm = GemmaRMSNorm(hidden_size, eps=eps)
 
 
+def _flipped_weight(linear: nn.Module) -> torch.Tensor | None:
+    """The ``[n_in, n_out]`` weight of a bias-free unquantized TPU linear
+    (`TpuUnquantizedLinearMethod` flips it after loading), else None."""
+    from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
+
+    if getattr(linear, "bias", None) is not None:
+        return None
+    if not getattr(linear, WEIGHT_FLIPPED_ATTR, False):
+        return None
+    return linear.weight
+
+
+def _context_kv(attn: nn.Module, context: torch.Tensor):
+    """A draft layer's K and V of the context tokens. Only the qkv_proj's K/V
+    columns when its weight is a plain matrix: the Q rows (4/5 of this rank's
+    qkv columns) would be discarded."""
+    weight = _flipped_weight(attn.qkv_proj)
+    if weight is None:
+        qkv, _ = attn.qkv_proj(context)
+        kv = qkv[:, attn.q_size :]
+    else:
+        kv = torch.matmul(context, weight[:, attn.q_size :])
+    return kv.split([attn.kv_size, attn.kv_size], dim=-1)
+
+
 class MiniMaxM3DSparkModel(Qwen3DSparkModel):
     decoder_layer_cls = MiniMaxM3DSparkDecoderLayer
 
@@ -233,8 +258,7 @@ class MiniMaxM3DSparkModel(Qwen3DSparkModel):
         num_tokens = context.shape[0]
         for layer, layer_metadata in zip(self.layers, metadata, strict=True):
             attn = layer.self_attn
-            qkv, _ = attn.qkv_proj(context)
-            k, v = qkv[:, attn.q_size :].split([attn.kv_size, attn.kv_size], dim=-1)
+            k, v = _context_kv(attn, context)
             k = _per_head_norm(k, attn.k_norm, attn.head_dim)
             k, _ = attn.rotary_emb(positions, k, None)
             impl = attn.attn.impl
