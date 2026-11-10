@@ -1010,6 +1010,7 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         self.assertAllClose(actual, expected, atol=0.2, rtol=0.2)
         self.assertTrue(_assert_cache_equal(actual_kvc, expected_kvc).item())
 
+    @parameterized.product(
         kv_layout=[
             configs.KVLayout.HEAD_ALONG_SUBLANE,
             configs.KVLayout.SEQ_ALONG_LANE,
