@@ -15,6 +15,11 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from vllm_torchtpu.kernels.experimental.batched_rpa import (
+    configs,
+    flash_attention,
+    wrapper,
+)
 
 pytestmark = pytest.mark.tpu_test
 
@@ -110,6 +115,7 @@ def _setup(kv_dtype, seqs, seed=0, cp=1, rank=0):
 
 
 def _run(monkeypatch, inputs, diet, k_scale=None, prefill_blocks=None, **kw):
+    monkeypatch.setattr(flash_attention, "vpu_diet_enabled", lambda: diet)
     jax.clear_caches()
     if inputs["cp"] > 1:
         kw.update(
