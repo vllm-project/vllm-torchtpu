@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Segment-level chat message tokenization cache for OpenAI-compatible serving.
 
 Caches tokenized message segments across multi-turn agentic conversations to
@@ -7,12 +19,12 @@ avoid redundant re-tokenization of shared conversation prefixes.
 
 from __future__ import annotations
 
-from collections import OrderedDict
 import hashlib
 import logging
 import os
 import threading
 import time
+from collections import OrderedDict
 
 logger = logging.getLogger("vllm.qx_tokcache")
 
@@ -47,10 +59,10 @@ class _Entry:
         prefix_str: str = "",
         prefix_hash=None,
     ):
-        self.ids = ids          # list[int] of token ids for the full prompt
-        self.bounds = bounds    # [(byte_pos, tok_idx)] for each boundary (pos>0)
+        self.ids = ids  # list[int] of token ids for the full prompt
+        self.bounds = bounds  # [(byte_pos, tok_idx)] for each boundary (pos>0)
         self.bpos = bpos if bpos is not None else [bp for bp, _ in bounds]
-        self.keys = keys        # prefix keys registered for this entry
+        self.keys = keys  # prefix keys registered for this entry
         self.ntok = len(ids)
         self.prefix_str = prefix_str
         self.prefix_hash = prefix_hash
@@ -59,11 +71,19 @@ class _Entry:
 class PrefixTokenCache:
     """Thread-safe LRU of tokenized prompts addressable by boundary prefixes."""
 
-    def __init__(self, encode_fn, boundary_id: int, *, max_entries: int = 64,
-                 max_tokens: int = 16_000_000, min_tokens: int = 2048,
-                 verify_first: int = 8, verify_every: int = 0,
-                 log_period_s: float = 60.0):
-        self._encode = encode_fn            # str -> list[int] (full, no truncation)
+    def __init__(
+        self,
+        encode_fn,
+        boundary_id: int,
+        *,
+        max_entries: int = 64,
+        max_tokens: int = 16_000_000,
+        min_tokens: int = 2048,
+        verify_first: int = 8,
+        verify_every: int = 0,
+        log_period_s: float = 60.0,
+    ):
+        self._encode = encode_fn  # str -> list[int] (full, no truncation)
         self._bid = boundary_id
         self._max_entries = max_entries
         self._max_tokens = max_tokens
@@ -73,7 +93,9 @@ class PrefixTokenCache:
         self._log_period = log_period_s
         self._lock = threading.Lock()
         self._entries: OrderedDict[int, _Entry] = OrderedDict()
-        self._index: dict[bytes, tuple[int, int, int]] = {}  # key -> (eid, tok_idx, bidx)
+        self._index: dict[
+            bytes, tuple[int, int, int]
+        ] = {}  # key -> (eid, tok_idx, bidx)
         self._next_eid = 0
         self._total_tokens = 0
         self.disabled = False
@@ -225,15 +247,19 @@ class PrefixTokenCache:
             self.hits += 1
             self.tokens_reused += tok_idx
             self.tokens_encoded += len(suf_ids)
-            if (self.verified < self._verify_first
-                    or (self._verify_every and self.hits % self._verify_every == 0)):
+            if self.verified < self._verify_first or (
+                self._verify_every and self.hits % self._verify_every == 0
+            ):
                 full = self._encode(text)
                 self.verified += 1
                 if full != ids:
                     self.disabled = True
                     logger.error(
                         "[QX_TOKCACHE] VERIFY MISMATCH (len %d vs %d); disabling "
-                        "the tokenize prefix cache permanently", len(full), len(ids))
+                        "the tokenize prefix cache permanently",
+                        len(full),
+                        len(ids),
+                    )
                     return full
             self.time_hit_s += time.perf_counter() - t0
         else:
@@ -302,8 +328,10 @@ class PrefixTokenCache:
             idx = self._index
             for j, k in enumerate(keys):
                 idx[k] = (eid, bounds[j][1], j)
-            while self._entries and (len(self._entries) > self._max_entries
-                                     or self._total_tokens > self._max_tokens):
+            while self._entries and (
+                len(self._entries) > self._max_entries
+                or self._total_tokens > self._max_tokens
+            ):
                 old_eid, old = self._entries.popitem(last=False)
                 self._total_tokens -= old.ntok
                 for k in old.keys:
@@ -312,16 +340,25 @@ class PrefixTokenCache:
                         del idx[k]
 
     def stats(self) -> dict:
-        ns_per_tok = (self.time_miss_s / self.miss_tokens * 1e9) if self.miss_tokens else 0.0
+        ns_per_tok = (
+            (self.time_miss_s / self.miss_tokens * 1e9) if self.miss_tokens else 0.0
+        )
         saved = self.tokens_reused * ns_per_tok / 1e9
-        return dict(calls=self.calls, hits=self.hits, misses=self.misses,
-                    hit_rate=round(self.hits / max(1, self.hits + self.misses), 3),
-                    tokens_reused=self.tokens_reused, tokens_encoded=self.tokens_encoded,
-                    est_time_saved_s=round(saved, 2),
-                    miss_ms_per_1k_tok=round(ns_per_tok / 1e3, 3),
-                    hit_time_s=round(self.time_hit_s, 2), entries=len(self._entries),
-                    cached_tokens=self._total_tokens, verified=self.verified,
-                    disabled=self.disabled)
+        return dict(
+            calls=self.calls,
+            hits=self.hits,
+            misses=self.misses,
+            hit_rate=round(self.hits / max(1, self.hits + self.misses), 3),
+            tokens_reused=self.tokens_reused,
+            tokens_encoded=self.tokens_encoded,
+            est_time_saved_s=round(saved, 2),
+            miss_ms_per_1k_tok=round(ns_per_tok / 1e3, 3),
+            hit_time_s=round(self.time_hit_s, 2),
+            entries=len(self._entries),
+            cached_tokens=self._total_tokens,
+            verified=self.verified,
+            disabled=self.disabled,
+        )
 
     def _maybe_log(self):
         now = time.monotonic()
@@ -340,10 +377,14 @@ def _build_cache_for(tokenizer) -> PrefixTokenCache | None:
         from tokenizers import Tokenizer
     except Exception:  # pragma: no cover
         return None
-    backend = getattr(tokenizer, "backend_tokenizer", None) or getattr(tokenizer, "_tokenizer", None)
+    backend = getattr(tokenizer, "backend_tokenizer", None) or getattr(
+        tokenizer, "_tokenizer", None
+    )
     if backend is None or not isinstance(backend, Tokenizer):
-        logger.warning("[QX_TOKCACHE] tokenizer %s has no Rust backend; not enabled",
-                       type(tokenizer).__name__)
+        logger.warning(
+            "[QX_TOKCACHE] tokenizer %s has no Rust backend; not enabled",
+            type(tokenizer).__name__,
+        )
         return None
     boundary_id = tokenizer.convert_tokens_to_ids(BOUNDARY)
     if not isinstance(boundary_id, int) or boundary_id < 0:
@@ -372,13 +413,17 @@ def _build_cache_for(tokenizer) -> PrefixTokenCache | None:
     # Safety checks: boundary token is atomic and post-processor adds nothing.
     probe = "x<|im_start|>user\nhi<|im_end|>\n"
     t = get_tok()
-    if (t.encode("a", add_special_tokens=True).ids != t.encode("a", add_special_tokens=False).ids
-            or encode(probe) != tokenizer(probe, add_special_tokens=False)["input_ids"]
-            or encode(probe).count(boundary_id) != 1):
+    if (
+        t.encode("a", add_special_tokens=True).ids
+        != t.encode("a", add_special_tokens=False).ids
+        or encode(probe) != tokenizer(probe, add_special_tokens=False)["input_ids"]
+        or encode(probe).count(boundary_id) != 1
+    ):
         logger.warning("[QX_TOKCACHE] tokenizer safety probe failed; not enabled")
         return None
     return PrefixTokenCache(
-        encode, boundary_id,
+        encode,
+        boundary_id,
         max_entries=_env_int("QX_TOKENIZE_PREFIX_CACHE_ENTRIES", 2048),
         max_tokens=_env_int("QX_TOKENIZE_PREFIX_CACHE_MAX_TOKENS", 256_000_000),
         min_tokens=_env_int("QX_TOKENIZE_PREFIX_CACHE_MIN_TOKENS", 2048),
@@ -397,9 +442,7 @@ def maybe_install_tokenize_prefix_cache() -> bool:
         from vllm.engine.arg_utils import EngineArgs
 
         if getattr(EngineArgs, "renderer_num_workers", None) == 1:
-            EngineArgs.renderer_num_workers = _env_int(
-                "QX_RENDERER_NUM_WORKERS", 4
-            )
+            EngineArgs.renderer_num_workers = _env_int("QX_RENDERER_NUM_WORKERS", 4)
     except Exception:
         pass
     try:
@@ -422,25 +465,33 @@ def maybe_install_tokenize_prefix_cache() -> bool:
                     global _CACHE
                     _CACHE = state["cache"]
                     if state["cache"] is not None:
-                        logger.warning("[QX_TOKCACHE] active: incremental prompt "
-                                       "tokenization at %s boundaries (pid %d)",
-                                       BOUNDARY, os.getpid())
+                        logger.warning(
+                            "[QX_TOKCACHE] active: incremental prompt "
+                            "tokenization at %s boundaries (pid %d)",
+                            BOUNDARY,
+                            os.getpid(),
+                        )
         return state["cache"]
 
     def _tokenize_prompt(self, prompt, params):
         try:
-            if (isinstance(self, HfRenderer)
-                    and not self._wants_offsets(prompt, params)
-                    and not prompt.get("multi_modal_data")
-                    and isinstance(prompt.get("prompt"), str)):
+            if (
+                isinstance(self, HfRenderer)
+                and not self._wants_offsets(prompt, params)
+                and not prompt.get("multi_modal_data")
+                and isinstance(prompt.get("prompt"), str)
+            ):
                 kw = params.get_encode_kwargs()
                 if set(kw) <= {"truncation", "max_length", "add_special_tokens"}:
                     cache = _get_cache(self)
                     if cache is not None and not cache.disabled:
                         ids = cache.encode(prompt["prompt"])
                         max_len = kw.get("max_length")
-                        if not (kw.get("truncation") and max_len is not None
-                                and len(ids) > max_len):
+                        if not (
+                            kw.get("truncation")
+                            and max_len is not None
+                            and len(ids) > max_len
+                        ):
                             return self._build_tokens_prompt(ids, prompt)
         except Exception as e:  # never break serving
             logger.warning("[QX_TOKCACHE] error %r; falling back", e)
@@ -449,6 +500,9 @@ def maybe_install_tokenize_prefix_cache() -> bool:
     _tokenize_prompt.__qx_tokcache__ = True
     rbase.BaseRenderer._tokenize_prompt = _tokenize_prompt
     _INSTALLED = True
-    logger.warning("[QX_TOKCACHE] installed BaseRenderer._tokenize_prompt patch "
-                   "(QX_TOKENIZE_PREFIX_CACHE=1, pid %d)", os.getpid())
+    logger.warning(
+        "[QX_TOKCACHE] installed BaseRenderer._tokenize_prompt patch "
+        "(QX_TOKENIZE_PREFIX_CACHE=1, pid %d)",
+        os.getpid(),
+    )
     return True

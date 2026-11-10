@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """API-server patches for reasoning-token counting and incremental detokenizer priming.
 
 * ``QX_LAZY_REASONING_COUNT=1``: skips per-delta ``DelegatingParser.count_reasoning_tokens``
@@ -64,8 +76,11 @@ def _provably_zero(rp) -> bool:
     try:
         pe = rp._parser_engine
         from vllm.parser.engine.parser_engine import ParserEngine
-        if (type(pe).count_reasoning_tokens is not ParserEngine.count_reasoning_tokens
-                or type(pe._engine).__name__ != "StreamingParserEngine"):
+
+        if (
+            type(pe).count_reasoning_tokens is not ParserEngine.count_reasoning_tokens
+            or type(pe._engine).__name__ != "StreamingParserEngine"
+        ):
             return False
         cfg = pe.parser_engine_config
     except Exception:
@@ -118,16 +133,23 @@ def maybe_install_lazy_reasoning_count() -> bool:
         now = time.monotonic()
         if now - _Stats.last_log >= log_s:
             _Stats.last_log = now
-            logger.warning("%s stats zero=%d skipped=%d computed=%d compute_s=%.2f", _P,
-                           _Stats.zero, _Stats.skipped, _Stats.computed, _Stats.compute_s)
+            logger.warning(
+                "%s stats zero=%d skipped=%d computed=%d compute_s=%.2f",
+                _P,
+                _Stats.zero,
+                _Stats.skipped,
+                _Stats.computed,
+                _Stats.compute_s,
+            )
 
     def count_reasoning_tokens(self, token_ids):
         skip = False
         try:
             skip = self.__dict__.pop("_qx_skip_count", False)
             rp = getattr(self, "_reasoning_parser", None)
-            if (isinstance(rp, ParserEngineReasoningAdapter)
-                    and not getattr(rp, "_streaming_count_valid", True)):
+            if isinstance(rp, ParserEngineReasoningAdapter) and not getattr(
+                rp, "_streaming_count_valid", True
+            ):
                 if _provably_zero(rp):
                     _Stats.zero += 1
                     _maybe_log()
@@ -155,8 +177,13 @@ def maybe_install_lazy_reasoning_count() -> bool:
     DelegatingParser.parse_delta = parse_delta
     DelegatingParser.count_reasoning_tokens = count_reasoning_tokens
     _INSTALLED = True
-    logger.warning("%s installed DelegatingParser.parse_delta/count_reasoning_tokens "
-                   "patch (pid %d, %s)", _P, os.getpid(), pname)
+    logger.warning(
+        "%s installed DelegatingParser.parse_delta/count_reasoning_tokens "
+        "patch (pid %d, %s)",
+        _P,
+        os.getpid(),
+        pname,
+    )
     return True
 
 
@@ -244,17 +271,20 @@ def maybe_install_detok_prompt_tail() -> bool:
         import inspect
 
         from vllm.v1.engine import detokenizer as detok_mod
+
         cls = detok_mod.FastIncrementalDetokenizer
         src = inspect.getsource(cls.__init__)
     except Exception as e:
-        logger.warning("%s cannot import FastIncrementalDetokenizer (%r); not enabled",
-                       _DT, e)
+        logger.warning(
+            "%s cannot import FastIncrementalDetokenizer (%r); not enabled", _DT, e
+        )
         return False
     # Only patch the upstream shape we have proven equivalent: a DecodeStream
     # primed with ``ids=request.prompt_token_ids``.
     if "DecodeStream(" not in src or "ids=request.prompt_token_ids" not in src:
-        logger.warning("%s FastIncrementalDetokenizer.__init__ changed upstream; "
-                       "not enabled", _DT)
+        logger.warning(
+            "%s FastIncrementalDetokenizer.__init__ changed upstream; not enabled", _DT
+        )
         return False
 
     orig_init = cls.__init__
@@ -279,9 +309,13 @@ def maybe_install_detok_prompt_tail() -> bool:
             now = time.monotonic()
             if now - _DetokStats.last_log >= log_s:
                 _DetokStats.last_log = now
-                logger.warning("%s stats tail=%d full_fallback=%d short=%d", _DT,
-                               _DetokStats.tail, _DetokStats.full_fallback,
-                               _DetokStats.short)
+                logger.warning(
+                    "%s stats tail=%d full_fallback=%d short=%d",
+                    _DT,
+                    _DetokStats.tail,
+                    _DetokStats.full_fallback,
+                    _DetokStats.short,
+                )
         except Exception:
             pass
         orig_init(self, tokenizer, request)
@@ -290,6 +324,12 @@ def maybe_install_detok_prompt_tail() -> bool:
     __init__.__wrapped__ = orig_init
     cls.__init__ = __init__
     _DETOK_INSTALLED = True
-    logger.warning("%s installed FastIncrementalDetokenizer prompt-tail priming "
-                   "(tail=%d, pid %d, %s)", _DT, tail_n, os.getpid(), pname)
+    logger.warning(
+        "%s installed FastIncrementalDetokenizer prompt-tail priming "
+        "(tail=%d, pid %d, %s)",
+        _DT,
+        tail_n,
+        os.getpid(),
+        pname,
+    )
     return True
