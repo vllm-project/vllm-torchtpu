@@ -355,6 +355,21 @@ def nonep_fp8_dispatch_ok(
     )
 
 
+def log_nonep_fp8_choice(applied: bool) -> None:
+    """Log the TPU_MOE_NONEP_GATHER=sc_fp8 outcome once per process.
+
+    scope="process", not vLLM's default "local": "local" prints only on each
+    host's local rank 0, so on a one-host PP8 prefill only PP0 showed the line
+    and PP1-PP7 could not be checked (Q38 FR9 arm A read). Every worker
+    decides sc_fp8 for its own stage, so every worker reports it."""
+    if applied:
+        logger.info_once("MoE dispatch gathers packed fp8 rows (sc_fp8).", scope="process")
+    else:
+        logger.info_once(
+            "MoE sc_fp8 dispatch not applicable here; sc_padded.", scope="process"
+        )
+
+
 # Rows per block of the rank contraction: the triangular matmul is B x B, so this
 # trades that against the number of blocks.
 _COUNTING_SORT_BLOCK = 512
@@ -1163,10 +1178,10 @@ def fused_moe_func(
             rhs_quant_dtype=rhs_quant_dtype, padded_hidden_size=padded_hidden_size,
         ):
             lhs_packed_dtype = hidden_states.dtype
-            logger.info_once("MoE dispatch gathers packed fp8 rows (sc_fp8).")
+            log_nonep_fp8_choice(True)
         else:
             nonep_gather = "sc_padded"
-            logger.info_once("MoE sc_fp8 dispatch not applicable here; sc_padded.")
+            log_nonep_fp8_choice(False)
 
     (
         x,
