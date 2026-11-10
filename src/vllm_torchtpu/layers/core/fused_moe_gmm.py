@@ -379,15 +379,7 @@ def prepare_routed_gmm_inputs(
     onehot_moe_permute_threshold: int = 0,
     skip_padded_tokens: bool = False,
     nonep_permute: str = "sorts",
-) -> tuple[
-    jax.Array,
-    jax.Array,
-    jax.Array,
-    jax.Array,
-    jax.Array,
-    jax.Array,
-    jax.Array | None,
-]:
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """Prepare the local-only routing layout using already-local expert ids.
 
     For non-EP runs `topk_indices_local` is always non-negative, so the
@@ -400,9 +392,7 @@ def prepare_routed_gmm_inputs(
     ``nonep_permute`` selects the metadata construction of the non-EP path
     above the single-sort row cap: "sorts" (the forward permutation, its
     inverse and a packed sort for the token ids) or "two_sorts" (the token
-    ids by division of the forward permutation). The last return value is
-    the forward permutation (sorted slot to routed row) when the path
-    computed one, else ``None``.
+    ids by division of the forward permutation).
     """
     if nonep_permute not in _NONEP_PERMUTES:
         raise ValueError(f"unknown non-EP permute {nonep_permute!r}")
@@ -552,7 +542,6 @@ def prepare_routed_gmm_inputs(
         topk_weights_flat,
         valid_mask,
         token_indices_sorted,
-        sorted_indices,
     )
 
 
@@ -890,7 +879,6 @@ def fused_moe_func(
         topk_weights_flat,
         valid_mask,
         token_indices_sorted,
-        _,
     ) = prepare_routed_gmm_inputs(
         hidden_states,
         topk_ids,

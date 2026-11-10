@@ -90,7 +90,7 @@ def test_two_sorts_give_the_three_sorts_metadata(num_tokens, padded, skip):
     args = _inputs(num_tokens, seed=num_tokens + padded, padded_tokens=padded)
     three = _prepare("sorts", *args, skip_padded_tokens=skip)
     two = _prepare("two_sorts", *args, skip_padded_tokens=skip)
-    assert len(three) == len(two) == 7
+    assert len(three) == len(two) == 6
     for a, b in zip(three, two, strict=True):
         np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
 
