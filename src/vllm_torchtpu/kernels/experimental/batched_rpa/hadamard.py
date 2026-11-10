@@ -29,6 +29,7 @@ KV caches. Because the rotation of Q and the inverse rotation of the output
 happen outside the Pallas kernel (but inside the same jit), the attention
 kernel itself is unchanged.
 
+
 The torch-side counterpart used at quantization time lives in
 `vllm_torchtpu.layers.common.quantization` and must produce a bitwise
 identical matrix; both build the same +-1 Sylvester pattern in float32 and
