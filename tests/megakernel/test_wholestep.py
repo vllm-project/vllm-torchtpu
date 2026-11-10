@@ -47,6 +47,7 @@ def _run(
     T: int = 4,
     zero: tuple[str, ...] = (),
     identical_experts: bool = False,
+    hc_fp8: bool = False,
 ):
     R = 2
     ex = ExecSpec(R=R, B=2 * T, T=T, ctx=128, interpret=True, tiles=_TILES)
@@ -64,9 +65,15 @@ def _run(
         zero=zero,
         identical_experts=identical_experts,
     )
+    if hc_fp8:  # the reference sees the FP8-rounded HC weights
+        for name in ("moe", "qsa_full", "gdn"):
+            for k in ("down", "inj", "up"):
+                w = d["hc"][name][k]
+                q, sc = wi._fp8_columns(w)
+                d["hc"][name][k] = (q.astype(jnp.float32) * sc[..., None, :]).astype(w.dtype)
     ref, kv_ref = wi.wholestep_reference(G, ex, d, L)
-    spec = wholestep_spec(G, R, L=L, qsa=dict(budget=BUDGET))
-    w_mk, states = wi.pack_wholestep(spec, G, ex, d, L)
+    spec = wholestep_spec(G, R, L=L, qsa=dict(budget=BUDGET), hc_fp8=hc_fp8)
+    w_mk, states = wi.pack_wholestep(spec, G, ex, d, L, hc_fp8=hc_fp8)
     mesh = Mesh(np.array(jax.devices()[:R]), ("tp",))
     pos_mk, hid_mk, w_mk, st_mk = shard_step_inputs(
         mesh, ex, d["inp"].pos, d["inp"].x, w_mk, states
@@ -127,6 +134,16 @@ def test_two_groups_identical_experts_match_reference():
     for o in range(kv.shape[1]):
         for r in range(kv.shape[0]):  # per-rank projections: per-rank references
             _assert_within_budget(kv[r : r + 1, o], kv_ref[r, o], layers=4 * (o + 1))
+
+
+def test_two_groups_fp8_hc_weights_match_reference():
+    """VLLM_TPU_MK_HC_FP8: with FP8 E4M3 HC mix weights (per-column scales) the kernel
+    matches a reference built from the same FP8-rounded weights inside the BF16
+    budget, and differs from the BF16-weight kernel (the FP8 path is live)."""
+    res8, ref8, _, _, _ = _run(identical_experts=True, hc_fp8=True)
+    res, _, _, _, _ = _run(identical_experts=True)
+    assert not np.array_equal(res8, res)
+    _assert_within_budget(res8, ref8)
 
 
 def test_two_groups_random_experts_statistical():

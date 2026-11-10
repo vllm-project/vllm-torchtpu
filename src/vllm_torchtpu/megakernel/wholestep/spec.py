@@ -50,9 +50,13 @@ def wholestep_spec(
     step: bool = False,
     first: str = "gdn",
     tail: dict[str, Any] | None = None,
+    hc_fp8: bool = False,
 ) -> ModelSpec:
     """`L` (a multiple of `att_every`) layers starting at a group boundary (layer 0 =
     GDN).
+
+    `hc_fp8`: FP8 mix weights for the layers' HC(mixer) and HC(MoE) sublayers
+    (`HCSublayer(fp8_weights=True)`); the tail's HC (`tail`) stays BF16.
 
     `indexed`: `QSAFullIndexedBlock` options (`max_groups`, `pages_per_seq`) — the
     indexer,
@@ -65,7 +69,8 @@ def wholestep_spec(
         gdn_cls = Qwen38GDN
     gi = g.inner(R, L)  # L = 1: one QSA layer, no GDN
     hc = dict(inner_geometry=gi, nhc=g.NHC, lowrank=g.LOWRANK)
-    gdn = HCSublayer(gdn_cls(geometry=gi), ar_slot=0, **hc)
+    hcl = dict(hc, fp8_weights=hc_fp8)  # the layers' sublayers (not the tail)
+    gdn = HCSublayer(gdn_cls(geometry=gi), ar_slot=0, **hcl)
     if indexed is not None and step:  # stage C: + the step's own tokens and group
         from .qsa_full_c import QSAFullStepBlock
 
@@ -76,7 +81,7 @@ def wholestep_spec(
         qsa_block = QSAFullIndexedBlock(**indexed, **(qsa or {}))
     else:
         qsa_block = QSAFullBlock(**(qsa or {}))
-    attn = HCSublayer(qsa_block, ar_slot=0, **hc)
+    attn = HCSublayer(qsa_block, ar_slot=0, **hcl)
     # Counts are per cycle (period = att_every): branch 0 runs at l % period < c0.
     # `first="qsa"`
     # starts the kernel at a QSA layer (model layers 3 .. 3+L-1: the cycle QSA, GDN,
@@ -93,7 +98,7 @@ def wholestep_spec(
             "mixer", branches=(gdn, attn), branch_counts=(g.att_every - 1, 1)
         )
     moe = HCSublayer(
-        Qwen38MoE(geometry=gi, moe_tp=False), ar_slot=1, emit_residual=True, **hc
+        Qwen38MoE(geometry=gi, moe_tp=False), ar_slot=1, emit_residual=True, **hcl
     )
     slots: tuple = (mixer, moe)
     if (

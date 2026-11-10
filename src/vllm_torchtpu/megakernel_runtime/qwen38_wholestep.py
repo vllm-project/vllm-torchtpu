@@ -35,6 +35,7 @@ from typing import Any
 import torch
 from torch import nn
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.megakernel.wholestep.qsa_full_c import UNION_STATS_REQS
 
@@ -187,6 +188,7 @@ class Qwen38WholeStep(nn.Module):
                 n_layers=n_att,
                 **indexed_options(),
             ),
+            hc_fp8=envs.VLLM_TPU_MK_HC_FP8,
         )
         ex = ExecSpec(
             R=R,
@@ -196,6 +198,13 @@ class Qwen38WholeStep(nn.Module):
             tiles=wholestep_tiles(buckets[0], max_groups),
         )
         ops = pack_wholestep_operands(model, g, spec, ex, ids)
+        if envs.VLLM_TPU_MK_HC_FP8:
+            logger.info(
+                "Qwen3.8 whole-step: VLLM_TPU_MK_HC_FP8 converts the HC mix weights of "
+                "target layers %d..%d (attn/linear-attn HC + MLP HC) to FP8 E4M3 with "
+                "per-column scales; the draft (MTP) HC and layers outside the kernel "
+                "stay BF16", FIRST_LAYER, LAST_LAYER - 1,
+            )
         # Host round-trip of the small packed operands (operand_hold): w08r c1's
         # whole-step
         # steps ran 18 per-call execute_as_strided programs more than stock (+0.85
