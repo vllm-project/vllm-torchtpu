@@ -46,7 +46,7 @@ from vllm.config import (
     get_layers_from_vllm_config,
     set_current_vllm_config,
 )
-from vllm.distributed import get_pcp_group
+from vllm.distributed import get_pcp_group, get_world_group
 from vllm.distributed.kv_transfer import (
     get_kv_transfer_group,
     has_kv_transfer_group,
@@ -5981,6 +5981,25 @@ class TPUModelRunner(GPUModelRunner):
 
         return async_output
 
+    def _draft_load_barrier(self) -> None:
+        """Aligns every rank of the world group before the draft model load."""
+        world = get_world_group()
+        if world.world_size <= 1:
+            return
+        # The draft load creates a process group (the runai streamer's
+        # new_group), and torch_tpu's new_group waits a fixed 300 s for every
+        # rank's store key. Ranks can finish streaming the target weights
+        # further apart than that, so they meet first on the gloo group, whose
+        # timeout is the CPU distributed timeout.
+        logger.info("Rank %d waiting at the draft load barrier", world.rank)
+        start = time.perf_counter()
+        torch.distributed.barrier(group=world.cpu_group)
+        logger.info(
+            "Rank %d passed the draft load barrier after %.1f s",
+            world.rank,
+            time.perf_counter() - start,
+        )
+
     def load_model(self) -> None:
         self.device_config.device = torch.device("tpu")
         self.device = self.device_config.device
@@ -6056,6 +6075,7 @@ class TPUModelRunner(GPUModelRunner):
         # If using eagle3/mtp or dflash speculative decoding, load the draft model and
         # share the target's embeddings / LM head (if the draft requires it).
         if self._is_async_drafter:
+            self._draft_load_barrier()
             self._async_drafter.load_model(self.model)
             # The draft reuses the target's Pallas ops (cached by op name),
             # which were traced against the target's relayouted tables. Its
