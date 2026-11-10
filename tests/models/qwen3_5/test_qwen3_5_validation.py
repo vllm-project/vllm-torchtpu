@@ -20,7 +20,7 @@ import pathlib
 import pytest
 import yaml
 
-from vllm_torchtpu import envs
+from vllm_torchtpu import additional_config_sections, envs
 from vllm_torchtpu.models import qwen3_5
 from vllm_torchtpu.models.qwen3_5 import settings
 
@@ -88,6 +88,17 @@ def test_qwen3_5_settings_in_entries_exist(path):
     """A qwen3_5 section may only name settings this tree implements."""
     for section in _qwen3_5_sections(_load(path)):
         settings.parse(section)
+
+
+@pytest.mark.parametrize("path", POINTS + GATES, ids=lambda p: p.stem)
+def test_entry_sections_are_read_by_this_tree(path):
+    """Every qwen3_5 / tpu_* section an entry passes has a reader in this tree;
+    the config hook would refuse it at engine start otherwise."""
+    entry = _load(path)
+    configs = [leg.get("additional_config", {}) for leg in entry["legs"].values()]
+    configs += [arm["additional_config"] for arm in entry.get("arms", {}).values()]
+    for config in configs:
+        assert not additional_config_sections.unknown_sections(config)
 
 
 @pytest.mark.parametrize("path", GATES, ids=lambda p: p.stem)
