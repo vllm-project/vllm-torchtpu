@@ -54,10 +54,17 @@ def test_kernel_matches_the_two_step_path():
     _assert_matches_reference(*_inputs(), tile=16)
 
 
+def test_kernel_2d_z_matches_the_two_step_path():
+    o, z, w = _inputs(tokens=128, heads=4, dim=128)
+    _assert_matches_reference(o, z.reshape(128, -1), w, tile=64)
+
+
 # 36, 44 and 52 have no multiple-of-8 divisor and run as one block.
 @pytest.mark.parametrize("tokens", [4, 12, 20, 36, 40, 44, 48, 52, 80])
 def test_row_counts_the_tile_does_not_divide(tokens):
-    _assert_matches_reference(*_inputs(tokens=tokens, heads=2), tile=32)
+    o, z, w = _inputs(tokens=tokens, heads=2)
+    _assert_matches_reference(o, z, w, tile=32)
+    _assert_matches_reference(o, z.reshape(tokens, -1), w, tile=32)
 
 
 @pytest.mark.parametrize(
