@@ -1491,6 +1491,44 @@ class Eagle3Proposer:
 
     @_static_shape_args
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def _draft_rows_carry_token_fresh(
+        self,
+        positions: torch.Tensor,
+        indices: torch.Tensor,
+        last_hidden: torch.Tensor,
+        hidden: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # VLLM_TPU_DRAFT_CARRY_ROWS_FRESH: `_draft_rows_carry_and_token` on
+        # step 0's untrimmed [capacity, h] outputs. Trimming to the p carry
+        # rows happens here, and the hidden carry leaves as its own buffer,
+        # so neither [:p] view is re-materialized by an execute_as_strided
+        # program (one before this call, one before the fused loop).
+        rows = indices.shape[0]
+        positions_carry, token = self._carry_and_token_body(
+            positions, indices, last_hidden[:rows]
+        )
+        return positions_carry, token, hidden[:rows].clone()
+
+    def _carry_and_token_body(
+        self, positions: torch.Tensor, indices: torch.Tensor, last_hidden: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert self.draft_model is not None
+        indices = indices.clamp_min(0)
+        positions_carry = torch.index_select(positions, positions.ndim - 1, indices)
+        d2t = getattr(self.draft_model, "draft_id_to_target_id", None)
+        if d2t is None:
+            token = (
+                self.draft_model.compute_logits(last_hidden).argmax(dim=-1).to(torch.int32)
+            )
+        else:
+            draft_id = self.draft_model.logits_processor(
+                self.draft_model.lm_head, last_hidden
+            ).argmax(dim=-1)
+            token = (draft_id + d2t[draft_id]).to(torch.int32)
+        return positions_carry, token
+
+    @_static_shape_args
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def _draft_combine_hidden_states(
         self, aux0: torch.Tensor, aux1: torch.Tensor, aux2: torch.Tensor
     ) -> torch.Tensor:
@@ -1686,7 +1724,10 @@ class Eagle3Proposer:
                 # Back from the fixed draft_rows length to the p carry rows.
                 rows = last_token_indices.shape[0]
                 if (
-                    envs.VLLM_TPU_DRAFT_ROWS_FRESH
+                    (
+                        envs.VLLM_TPU_DRAFT_ROWS_FRESH
+                        or envs.VLLM_TPU_DRAFT_CARRY_ROWS_FRESH
+                    )
                     and last_hidden.shape[0] > rows
                     and hidden.shape[0] > rows
                 ):
@@ -1721,10 +1762,35 @@ class Eagle3Proposer:
             ):
                 # Position carry + first draft token in one program.
                 hidden_carry, last_hidden_carry = hidden, last_hidden
-                with set_model_tag("eagle_head"):
-                    positions_carry, fused_token0 = self._draft_rows_carry_and_token(
-                        positions, last_token_indices, last_hidden
-                    )
+                if (
+                    envs.VLLM_TPU_DRAFT_CARRY_ROWS_FRESH
+                    and untrimmed is not None
+                    and untrimmed[2] == last_token_indices.shape[0]
+                ):
+                    with set_model_tag("eagle_head"):
+                        positions_carry, fused_token0, hidden_carry = (
+                            self._draft_rows_carry_token_fresh(
+                                positions,
+                                last_token_indices,
+                                untrimmed[0],
+                                untrimmed[1],
+                            )
+                        )
+                    if not getattr(self, "_carry_rows_fresh_logged", False):
+                        self._carry_rows_fresh_logged = True
+                        logger.info(
+                            "DRAFT_CARRY_ROWS_FRESH: step 0 carry, token and "
+                            "hidden trimmed in one program (%d of %d rows)",
+                            untrimmed[2],
+                            untrimmed[0].shape[0],
+                        )
+                else:
+                    with set_model_tag("eagle_head"):
+                        positions_carry, fused_token0 = (
+                            self._draft_rows_carry_and_token(
+                                positions, last_token_indices, last_hidden
+                            )
+                        )
                 if self._carry_checks_done < envs.VLLM_TPU_VERIFY_FUSED_CHECK:
                     self._check_carry_fused(
                         positions, last_token_indices, last_hidden,
@@ -3094,6 +3160,34 @@ class Eagle3Proposer:
                     ).to(runner.device)
                     out = self._draft_rows_carry_and_token(positions, idx, hid)
                     synchronize_tensors(out)
+            if envs.VLLM_TPU_DRAFT_CARRY_ROWS_FRESH:
+                # Step 0's untrimmed outputs are [capacity, hidden]; the carry
+                # rows p are a bucket below it (see _draft_rows_len).
+                caps = {
+                    int(c)
+                    for c in (
+                        runner.num_reqs_max_model_len,
+                        runner.num_reqs_most_model_len,
+                    )
+                    if c is not None
+                }
+                for cap in caps:
+                    full = torch.zeros(
+                        (cap, hidden_size), dtype=runner._hidden_states_dtype
+                    ).to(runner.device)
+                    for T in runner.num_tokens_paddings:
+                        for p in idx_sizes:
+                            if p > T or p >= cap:
+                                continue
+                            positions = torch.zeros(T, dtype=torch.int32).to(
+                                runner.device
+                            )
+                            idx = torch.zeros(p, dtype=torch.int64).to(runner.device)
+                            synchronize_tensors(
+                                self._draft_rows_carry_token_fresh(
+                                    positions, idx, full, full
+                                )
+                            )
 
     def _precompile_compute_logits(self) -> None:
         from vllm_torchtpu.runner.tpu_runner import _get_padded_token_len
