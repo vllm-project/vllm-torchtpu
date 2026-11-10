@@ -203,14 +203,18 @@ class MiniMaxM3DSparkDecoderLayer(DFlashQwen3DecoderLayer):
         self.post_attention_layernorm = GemmaRMSNorm(hidden_size, eps=eps)
 
 
-def _flipped_weight(linear: nn.Module) -> torch.Tensor | None:
-    """The ``[n_in, n_out]`` weight of a bias-free unquantized TPU linear
-    (`TpuUnquantizedLinearMethod` flips it after loading), else None."""
+def _flipped_weight(linear: nn.Module, dtype: torch.dtype) -> torch.Tensor | None:
+    """The ``[n_in, n_out]`` weight of a bias-free linear whose apply is a
+    plain ``matmul(x, weight)`` (unquantized, or MXFP8 dequantized to
+    ``dtype`` at load, both flipped after loading), else None."""
     from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
 
     if getattr(linear, "bias", None) is not None:
         return None
     if not getattr(linear, WEIGHT_FLIPPED_ATTR, False):
+        return None
+    # A quantized weight keeps a separate scale (e.g. the fp8 method).
+    if hasattr(linear, "weight_scale") or linear.weight.dtype != dtype:
         return None
     return linear.weight
 
@@ -218,7 +222,7 @@ def _flipped_weight(linear: nn.Module) -> torch.Tensor | None:
 def _column_parallel(linear: nn.Module, x: torch.Tensor) -> torch.Tensor:
     """``linear(x)`` for a TP-replicated linear: each rank computes 1/tp of the
     output columns, reading 1/tp of the weight, then the ranks all-gather."""
-    weight = _flipped_weight(linear)
+    weight = _flipped_weight(linear, x.dtype)
     tp = get_tensor_model_parallel_world_size()
     if weight is None or tp == 1 or weight.shape[1] % tp:
         return linear(x)
@@ -230,9 +234,9 @@ def _column_parallel(linear: nn.Module, x: torch.Tensor) -> torch.Tensor:
 
 def _context_kv(attn: nn.Module, context: torch.Tensor):
     """A draft layer's K and V of the context tokens. Only the qkv_proj's K/V
-    columns when its weight is a plain matrix: the Q rows (4/5 of this rank's
-    qkv columns) would be discarded."""
-    weight = _flipped_weight(attn.qkv_proj)
+    columns when its weight is a plain matrix: the Q columns would be
+    discarded (1024 of this rank's 1280 for MiniMax-M3's draft at TP8)."""
+    weight = _flipped_weight(attn.qkv_proj, context.dtype)
     if weight is None:
         qkv, _ = attn.qkv_proj(context)
         kv = qkv[:, attn.q_size :]
@@ -268,8 +272,10 @@ class MiniMaxM3DSparkModel(Qwen3DSparkModel):
 
         context = Gemma-norm(fc(concat(aux states))); per layer, K/V are that
         layer's qkv_proj rows of the context, with K Gemma-normed per head and
-        roped at the context positions. Runs every projection through its
-        layer, so the MXFP8 linears keep their checkpoint numerics.
+        roped at the context positions. fc and the K/V columns of qkv_proj
+        contract against their flipped weights directly when those are plain
+        matrices (`_flipped_weight`, the same matmul the layers apply), and run
+        through their layers otherwise.
         """
         # fc's weight is replicated on every TP rank (360 MiB): split its
         # columns over the ranks rather than read it whole on each.
