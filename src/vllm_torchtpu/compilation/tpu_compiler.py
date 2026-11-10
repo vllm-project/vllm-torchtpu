@@ -280,6 +280,8 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/layers/adapter/custom_ops",
     "vllm_torchtpu/layers/adapter/fused_moe.py",
     # Small fused-kernel bridges, behind torch custom-op boundaries.
+    "vllm_torchtpu/layers/adapter/fused_qk_norm_rope.py",
+    "vllm_torchtpu/layers/adapter/gated_norm_quant_op.py",
     "vllm_torchtpu/layers/adapter/small_all_reduce_op.py",
     # The fused EP MoE op and the helper that registers it. Both sit behind a
     # torch custom-op boundary Dynamo cannot see through, and the kernel they
