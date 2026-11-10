@@ -54,6 +54,39 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+
+@contextlib.contextmanager
+def _without_layerwise_kv_connector():
+    """Hide the KV connector from a draft forward when its per-layer hooks do
+    nothing (whole-step offloading, `OffloadingConnector`).
+
+    The draft's attention layers go through vLLM's KV-transfer wrapper, which
+    branches on whether a connector exists and has metadata bound; the
+    compiled draft forward guards on both, so serving (connector bound) built
+    a second program per draft bucket mid-run (~3.7 s each, 12-16 per c48/c64
+    run). With no-op hooks both branches compute the same thing; the check
+    relies on OffloadingConnector's hooks staying no-ops in the pinned vLLM.
+    """
+    from vllm.distributed.kv_transfer import kv_transfer_state
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
+        OffloadingConnector,
+    )
+
+    agent = kv_transfer_state._KV_CONNECTOR_AGENT
+    hooks_noop = agent is not None and all(
+        getattr(type(agent), hook) is getattr(OffloadingConnector, hook)
+        for hook in ("wait_for_layer_load", "save_kv_layer")
+    )
+    if not hooks_noop:
+        yield
+        return
+    kv_transfer_state._KV_CONNECTOR_AGENT = None
+    try:
+        yield
+    finally:
+        kv_transfer_state._KV_CONNECTOR_AGENT = agent
+
+
 # --additional-config key: keep an opted-in drafter's KV DCP-sharded or whole
 # per rank (`_shards_draft_kv_over_dcp`). Part of the compile-cache key.
 DRAFT_KV_OVER_DCP_KEY = "draft_kv_over_dcp"
@@ -731,6 +764,7 @@ class DFlashProposer:
                 set_vllm_model_wrapper_context(
                     mesh=self.runner.mesh, vllm_config=self.vllm_config
                 ),
+                _without_layerwise_kv_connector(),
             ):
                 draft_tokens_chunk, draft_aux = self._dflash_forward_and_sample(
                     input_ids, positions, block_size
@@ -954,6 +988,7 @@ class DFlashProposer:
             set_vllm_model_wrapper_context(
                 mesh=self.runner.mesh, vllm_config=self.vllm_config
             ),
+            _without_layerwise_kv_connector(),
         ):
             draft_tokens_chunk, _ = self._dflash_forward_and_sample(
                 input_ids, positions, block_size
