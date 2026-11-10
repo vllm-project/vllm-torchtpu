@@ -14,12 +14,19 @@
 """Direct guard-checked cache-entry dispatch and GLOBAL_STATE guard filtering
 for ``torch.compile(backend="tpu", fullgraph=True, dynamic=False)`` functions.
 
-* ``QX_FAST_COMPILED_CALL=1``: wraps compiled plain functions to evaluate each
-  cached entry's ``guard_manager.check(f_locals)`` in MRU order and invoke the
-  transformed Python code object directly on a guard hit.
-* ``QX_TPU_DROP_GLOBAL_STATE_GUARD=1``: filters out Dynamo ``GLOBAL_STATE``
-  guards (CPU intra-op ``num_threads``, ``grad_mode``) so warmup entries are
-  reused across threads while preserving all tensor and value guards.
+The hook is installed when the TPU platform module loads, before any module
+applies its torch.compile decorators, and does nothing until the worker
+arms it from ``additional_config["tpu_compile"]`` (``compilation.compile_options``;
+both options default to off):
+
+* ``fast_compiled_call``: compiled plain functions evaluate each cached
+  entry's ``guard_manager.check(f_locals)`` in MRU order and invoke the
+  transformed Python code object directly on a guard hit. Off, the wrapper
+  calls the compiled function and nothing else.
+* ``drop_global_state_guard``: the guard filter drops Dynamo's
+  ``GLOBAL_STATE`` guards (CPU intra-op ``num_threads``, ``grad_mode``) so
+  warmup entries are reused across threads while preserving all tensor and
+  value guards. Off, the filter keeps every guard.
 """
 
 from __future__ import annotations
@@ -39,6 +46,23 @@ logger = init_logger(__name__)
 _STATS = [0, 0]  # [fast, slow]
 _LOG_EVERY = 20000
 _INSTALLED = False
+# Armed by configure(); both off until the worker applies tpu_compile.
+_CONFIG = {"fast": False, "drop_global_state": False}
+
+
+def configure(fast: bool, drop_global_state: bool) -> None:
+    """Arm (or disarm) the installed hook. Called by the worker before any
+    compiled function runs: a guard filter is consulted when Dynamo compiles
+    a frame, and the fast path is checked on every call."""
+    _CONFIG["fast"] = bool(fast)
+    _CONFIG["drop_global_state"] = bool(drop_global_state)
+    if fast or drop_global_state:
+        logger.info(
+            "tpu_compile: fast_compiled_call=%s drop_global_state_guard=%s for "
+            "torch.compile(backend='tpu', fullgraph=True, dynamic=False) functions",
+            bool(fast),
+            bool(drop_global_state),
+        )
 
 
 def _region_entries(code: types.CodeType, region: int) -> list:
@@ -109,7 +133,7 @@ def _wrap(compiled: Any, fn: types.FunctionType) -> Any:
                 ):
                     state["disabled"] = True
                     logger.info(
-                        "QX_FAST_COMPILED_CALL: %s disabled (transformed code "
+                        "fast_compiled_call: %s disabled (transformed code "
                         "signature/closure differs)",
                         fn.__qualname__,
                     )
@@ -134,16 +158,18 @@ def _wrap(compiled: Any, fn: types.FunctionType) -> Any:
         except Exception:  # noqa: BLE001 - fall back to dynamo for good
             state["disabled"] = True
             logger.warning(
-                "QX_FAST_COMPILED_CALL: %s disabled", fn.__qualname__, exc_info=True
+                "fast_compiled_call: %s disabled", fn.__qualname__, exc_info=True
             )
 
     def _note(fast: bool) -> None:
         _STATS[0 if fast else 1] += 1
         if (_STATS[0] + _STATS[1]) % _LOG_EVERY == 0:
-            logger.info("QX_FAST_COMPILED_CALL: fast=%d slow=%d", _STATS[0], _STATS[1])
+            logger.info("fast_compiled_call: fast=%d slow=%d", _STATS[0], _STATS[1])
 
     @functools.wraps(fn)
     def qx_fast_compiled(*args: Any, **kwargs: Any) -> Any:
+        if not _CONFIG["fast"]:
+            return compiled(*args, **kwargs)
         if not state["disabled"]:
             entries = state["entries"]
             if (
@@ -167,7 +193,7 @@ def _wrap(compiled: Any, fn: types.FunctionType) -> Any:
                             if not state["logged"]:
                                 state["logged"] = True
                                 logger.info(
-                                    "QX_FAST_COMPILED_CALL: first direct dispatch of %s",
+                                    "fast_compiled_call: first direct dispatch of %s",
                                     fn.__qualname__,
                                 )
                             _note(True)
@@ -191,15 +217,16 @@ def _wrap(compiled: Any, fn: types.FunctionType) -> Any:
 
 
 def _drop_global_state(entries: Any) -> list[bool]:
-    return [e.guard_type != "GLOBAL_STATE" for e in entries]
+    keep_all = not _CONFIG["drop_global_state"]
+    return [keep_all or e.guard_type != "GLOBAL_STATE" for e in entries]
 
 
-def install(fast: bool = True, drop_global_state: bool = False) -> None:
+def install() -> None:
     """Hook ``torch.compile`` for ``backend="tpu", fullgraph=True,
-    dynamic=False`` plain functions. Idempotent.
+    dynamic=False`` plain functions. Idempotent. Inert until ``configure``.
 
-    fast (QX_FAST_COMPILED_CALL=1): guard-checked direct dispatch (above).
-    drop_global_state (QX_TPU_DROP_GLOBAL_STATE_GUARD=1): compile them with a
+    fast (``fast_compiled_call``): guard-checked direct dispatch (above).
+    drop_global_state (``drop_global_state_guard``): compile them with a
     ``guard_filter_fn`` that drops only the GLOBAL_STATE guard (grad mode,
     num_threads, autocast, default dtype, ...). Warmup entries are then
     reused by serving even when the serving thread's num_threads/grad mode
@@ -238,24 +265,14 @@ def install(fast: bool = True, drop_global_state: bool = False) -> None:
         if not _eligible(model, kwargs):
             return orig_compile(model, **kwargs)
         ckw = dict(kwargs)
-        if drop_global_state:
-            # torch.compile pops guard_filter_fn; the emptied dict is falsy,
-            # so the backend still gets no options kwarg.
-            ckw["options"] = {"guard_filter_fn": _drop_global_state}
+        # torch.compile pops guard_filter_fn; the emptied dict is falsy, so the
+        # backend still gets no options kwarg. The filter keeps every guard
+        # unless drop_global_state_guard is on when Dynamo compiles the frame.
+        ckw["options"] = {"guard_filter_fn": _drop_global_state}
         out = orig_compile(model, **ckw)
-        if fast and callable(out):
+        if callable(out):
             return _wrap(out, model)
         return out
 
     torch.compile = qx_compile
-    if fast:
-        logger.info(
-            "QX_FAST_COMPILED_CALL=1: torch.compile(backend='tpu', fullgraph=True, "
-            "dynamic=False) functions dispatch guard-checked cache entries directly"
-        )
-    if drop_global_state:
-        logger.info(
-            "QX_TPU_DROP_GLOBAL_STATE_GUARD=1: torch.compile(backend='tpu', "
-            "fullgraph=True, dynamic=False) functions compile without the "
-            "GLOBAL_STATE guard (num_threads/grad_mode no longer force recompiles)"
-        )
+    logger.debug("torch.compile hook installed; inert until tpu_compile arms it")
