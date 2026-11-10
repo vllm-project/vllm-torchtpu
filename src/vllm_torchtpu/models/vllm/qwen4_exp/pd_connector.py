@@ -51,7 +51,7 @@ from .pd import (
     skipped_source_pages,
     suffix_pages,
 )
-from .pd_identity import canonical_rank_identity
+from .pd_identity import canonical_rank_identity, merged_identity
 from .pd_manifest import build_transfer_manifest, measure_transfer_layout
 
 logger = init_logger(__name__)
@@ -370,12 +370,25 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
         config = model.config.to_dict()
         for name in ("_name_or_path", "_commit_hash", "transformers_version"):
             config.pop(name, None)
+        checkpoint = model.pd_loaded_weight_identity
+        ple_checkpoint = model.pd_loaded_ple_identity
+        weight_records = model.pd_loaded_weight_records
+        if weight_records is not None and group.world_size > 1:
+            # Under --enable-ep-weight-filter each rank loads only its own
+            # experts: identify the union the group loaded, not each share.
+            gathered: list[Any] = [None] * group.world_size
+            torch.distributed.all_gather_object(
+                gathered, weight_records, group=group.cpu_group
+            )
+            checkpoint = merged_identity(gathered)
+            ple_checkpoint = merged_identity(gathered, name_fragment=".ple.")
+            del gathered
         record = dict(
             rank=group.rank_in_group,
             tp_rank=self.tp_rank,
             tp_size=self.tp_size,
-            checkpoint=model.pd_loaded_weight_identity,
-            ple_checkpoint=model.pd_loaded_ple_identity,
+            checkpoint=checkpoint,
+            ple_checkpoint=ple_checkpoint,
             config=config,
             kv_scales=scales,
             state_flags=dict(
