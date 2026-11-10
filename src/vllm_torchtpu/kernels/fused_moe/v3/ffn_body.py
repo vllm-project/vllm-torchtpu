@@ -11,8 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Inner MXU tile loop for quantized gate/up, SwiGLU, and down projections in Fused EP MoE v3.
-"""
+"""Inner MXU tile loop for quantized gate/up, SwiGLU, and down projections in
+Fused EP MoE v3."""
+
 import dataclasses
 
 import jax.numpy as jnp
@@ -26,8 +27,13 @@ from .routing_tables import COUNT_ROWS
 
 # Rows of the count table, in the order routing_tables.shard_counts writes
 # them. The kernel closes each one's sum over the shards on its scalar core.
-(COUNT_SEND_ROWS, COUNT_RECEIVE_ROWS, COUNT_SEND_ALIGNED_ROWS,
- COUNT_RECEIVE_ALIGNED_ROWS, COUNT_VISITS) = range(COUNT_ROWS)
+(
+    COUNT_SEND_ROWS,
+    COUNT_RECEIVE_ROWS,
+    COUNT_SEND_ALIGNED_ROWS,
+    COUNT_RECEIVE_ALIGNED_ROWS,
+    COUNT_VISITS,
+) = range(COUNT_ROWS)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -35,6 +41,7 @@ class Build:
     """Everything static a program body reads: the shape, the format, the
     depths, the rounding, the streaming and the geometry of one built
     kernel."""
+
     tile_rows: int
     hidden: int
     inter: int
@@ -61,7 +68,9 @@ class Build:
     stream_rows: int
     activation_columns_per_pass: int
     weight_dma_priority: int
-    sorted_rows: bool  # each tile fetched as one copy from rows sorted into expert order (no token windows)
+    # each tile fetched as one copy from rows sorted into expert order (no token
+    # windows)
+    sorted_rows: bool
     intermediate: str  # "fp8" (requantized between the matmuls) or "bf16"
     lane_blocks: int
     result_blocks: int
@@ -70,7 +79,8 @@ class Build:
     scale_lanes: int
     window_rows: int
     mesh_axes: tuple = (
-        MESH_AXIS, )  # the mesh's axes; MESH_AXIS is the expert-parallel one
+        MESH_AXIS,
+    )  # the mesh's axes; MESH_AXIS is the expert-parallel one
     token_dtype: object = jnp.float8_e4m3fn  # the token rows' element type on the wire
 
     @property
@@ -93,6 +103,7 @@ class Build:
 class Context:
     """One program invocation: the build and its refs, plus the two scalars
     every step reads (the visit count and this shard's index)."""
+
     b: Build
     tables: object
     operands: object
@@ -105,8 +116,7 @@ class Context:
 
 def wait_rows(sem, ref, rows):
     """Waits until `rows` rows' worth of DMAs on `sem` have landed."""
-    pltpu.make_async_copy(ref.at[pl.ds(0, rows)], ref.at[pl.ds(0, rows)],
-                          sem).wait()
+    pltpu.make_async_copy(ref.at[pl.ds(0, rows)], ref.at[pl.ds(0, rows)], sem).wait()
 
 
 def and_nonempty(predicate, count):
@@ -131,8 +141,9 @@ def tile_scale_column(window, row_base, tile_rows):
     rotated = pltpu.roll(window, LANES - resid, 1)
     lane = lax.broadcasted_iota(jnp.int32, rotated[:-1].shape, 1)
     rows = jnp.where(lane < LANES - resid, rotated[:-1], rotated[1:])
-    return jnp.concatenate([rows[i][:, None] for i in range(rows.shape[0])],
-                           axis=0)[:tile_rows]
+    return jnp.concatenate([rows[i][:, None] for i in range(rows.shape[0])], axis=0)[
+        :tile_rows
+    ]
 
 
 def count(ctx, row):
@@ -144,8 +155,9 @@ def count(ctx, row):
 
 
 def resident_copy(ctx, src, dst):
-    """Copy src to dst on the resident semaphore and wait for it. A source with more leading entries than the
-    destination (a placement's copy slots after the shard's primaries) contributes its head only."""
+    """Copy src to dst on the resident semaphore and wait for it. A source with
+    more leading entries than the destination (a placement's copy slots after
+    the shard's primaries) contributes its head only."""
     if src.shape[0] != dst.shape[0]:
         src = src.at[pl.ds(0, dst.shape[0])]
     copy = pltpu.make_async_copy(src, dst, ctx.sems.copy)
@@ -175,20 +187,27 @@ def upcast_blocks(ctx, slot):
     `slot` in a streamed one."""
     block = ctx.b.weight_block
     if ctx.scratch.w1_fp8 is not None:
-        return (lambda blk: ctx.scratch.w1_fp8[pl.ds(blk * block, block), :],
-                lambda blk: ctx.scratch.w2_fp8[pl.ds(blk * block, block), :])
+        return (
+            lambda blk: ctx.scratch.w1_fp8[pl.ds(blk * block, block), :],
+            lambda blk: ctx.scratch.w2_fp8[pl.ds(blk * block, block), :],
+        )
     if not ctx.b.form.packed:
         # Block-scaled fp8: the weights sit in their slot as the matmul
         # reads them.
-        return (lambda blk: ctx.scratch.w1[
-            slot, pl.ds(blk * block, block), :], lambda blk: ctx.scratch.w2[
-                slot, pl.ds(blk * block, block), :])
+        return (
+            lambda blk: ctx.scratch.w1[slot, pl.ds(blk * block, block), :],
+            lambda blk: ctx.scratch.w2[slot, pl.ds(blk * block, block), :],
+        )
     packed_rows = block // FP4_PER_WORD
     dtype = ctx.b.form.weight_dtype
-    return (lambda blk: ffn.upcast_packed_block_to_fp8(
-        ctx.scratch.w1, slot, packed_rows, blk, dtype),
-            lambda blk: ffn.upcast_packed_block_to_fp8(
-                ctx.scratch.w2, slot, packed_rows, blk, dtype))
+    return (
+        lambda blk: ffn.upcast_packed_block_to_fp8(
+            ctx.scratch.w1, slot, packed_rows, blk, dtype
+        ),
+        lambda blk: ffn.upcast_packed_block_to_fp8(
+            ctx.scratch.w2, slot, packed_rows, blk, dtype
+        ),
+    )
 
 
 # ---- the row streams ----
@@ -215,8 +234,8 @@ def start_token_window(ctx, row_base, window_ref, sem):
     row_base (the window's whole length, one descriptor)."""
     start = window_start(ctx, row_base, window_ref)
     pltpu.make_async_copy(
-        ctx.operands.token_of_row.at[pl.ds(start, window_ref.shape[0])],
-        window_ref, sem).start()
+        ctx.operands.token_of_row.at[pl.ds(start, window_ref.shape[0])], window_ref, sem
+    ).start()
 
 
 def wait_token_window(window_ref, sem):
@@ -244,8 +263,7 @@ def window_tokens(window_ref, offset):
     return tokens_of
 
 
-def issue_rows(ctx, row_base, live_blocks, row_ref_of, window_ref_of, sem,
-               tokens_of):
+def issue_rows(ctx, row_base, live_blocks, row_ref_of, window_ref_of, sem, tokens_of):
     """Issues one tile's row stream (row i of the tile into row_ref_of(i))
     and its scale windows (plane p into window_ref_of(p)) on `sem`.
     tokens_of(i)(r) is the token of row r of the tile's block i, read from
@@ -255,33 +273,35 @@ def issue_rows(ctx, row_base, live_blocks, row_ref_of, window_ref_of, sem,
     def issue_block(i, carry):
         token_of = tokens_of(i)
         for r in range(ROW_BLOCK):
-            pltpu.make_async_copy(ctx.operands.tokens.at[token_of(r)],
-                                  row_ref_of(i * ROW_BLOCK + r), sem).start()
+            pltpu.make_async_copy(
+                ctx.operands.tokens.at[token_of(r)], row_ref_of(i * ROW_BLOCK + r), sem
+            ).start()
         return carry
 
     lax.fori_loop(0, live_blocks, issue_block, jnp.int32(0))
     for plane in range(b.scale_planes):
         pltpu.make_async_copy(
-            ctx.operands.token_scales.at[plane,
-                                         pl.ds(row_base //
-                                               LANES, b.window_rows)],
-            window_ref_of(plane), sem).start()
+            ctx.operands.token_scales.at[
+                plane, pl.ds(row_base // LANES, b.window_rows)
+            ],
+            window_ref_of(plane),
+            sem,
+        ).start()
 
 
 # ---- commits and staging ----
 def wait_commits(ctx, slot, live_blocks):
     """Wait for a slot's committed result rows and their scales."""
-    wait_rows(ctx.sems.commit.at[slot], ctx.outputs.outgoing,
-              live_blocks * ROW_BLOCK)
+    wait_rows(ctx.sems.commit.at[slot], ctx.outputs.outgoing, live_blocks * ROW_BLOCK)
     if ctx.b.has_result_scales:
-        wait_rows(ctx.sems.commit_scales.at[slot], ctx.outputs.outgoing_scales,
-                  live_blocks)
+        wait_rows(
+            ctx.sems.commit_scales.at[slot], ctx.outputs.outgoing_scales, live_blocks
+        )
 
 
 def commit_tile(ctx, expert, slot, tile_block_base, live_blocks):
     """Commits the tile's part of each (expert, destination) run."""
-    tables, scratch, outputs, sems = (ctx.tables, ctx.scratch, ctx.outputs,
-                                      ctx.sems)
+    tables, scratch, outputs, sems = (ctx.tables, ctx.scratch, ctx.outputs, ctx.sems)
     for d in range(ctx.b.num_shards):
         start = tables.run_start[expert, d]
         length = tables.run_blocks[expert, d]
@@ -295,18 +315,18 @@ def commit_tile(ctx, expert, slot, tile_block_base, live_blocks):
         @pl.when(overlap > 0)
         def _(src_block=src_block, dst_block=dst_block, overlap=overlap):
             pltpu.make_async_copy(
-                scratch.result_rows.at[slot,
-                                       pl.ds(src_block * ROW_BLOCK, overlap *
-                                             ROW_BLOCK)],
-                outputs.outgoing.at[pl.ds(dst_block * ROW_BLOCK,
-                                          overlap * ROW_BLOCK)],
-                sems.commit.at[slot]).start()
+                scratch.result_rows.at[
+                    slot, pl.ds(src_block * ROW_BLOCK, overlap * ROW_BLOCK)
+                ],
+                outputs.outgoing.at[pl.ds(dst_block * ROW_BLOCK, overlap * ROW_BLOCK)],
+                sems.commit.at[slot],
+            ).start()
             if ctx.b.has_result_scales:
                 pltpu.make_async_copy(
-                    scratch.result_scales.at[slot,
-                                             pl.ds(src_block, overlap)],
+                    scratch.result_scales.at[slot, pl.ds(src_block, overlap)],
                     outputs.outgoing_scales.at[pl.ds(dst_block, overlap)],
-                    sems.commit_scales.at[slot]).start()
+                    sems.commit_scales.at[slot],
+                ).start()
 
 
 def stage_tile(ctx, slot, result, result_scales):
@@ -315,12 +335,15 @@ def stage_tile(ctx, slot, result, result_scales):
     b = ctx.b
     result = result.reshape(b.tile_rows, b.lane_blocks, LANES)
     if b.result_blocks != b.lane_blocks:
-        result = jnp.concatenate([
-            result,
-            jnp.zeros((b.tile_rows, b.result_blocks - b.lane_blocks, LANES),
-                      result.dtype)
-        ],
-                                 axis=1)
+        result = jnp.concatenate(
+            [
+                result,
+                jnp.zeros(
+                    (b.tile_rows, b.result_blocks - b.lane_blocks, LANES), result.dtype
+                ),
+            ],
+            axis=1,
+        )
     if b.has_result_scales:
         # The tile's scales, a [tile rows, 1] column, packed a block's
         # ROW_BLOCK words to a lane row: [tile blocks, 1, ROW_BLOCK].
@@ -354,7 +377,7 @@ def drain_commits(ctx, carry):
         def _(i=i):
             wait_commits(ctx, i, pending[i])
 
-    return (tile_count, ) + (jnp.int32(0), ) * ctx.b.result_slots
+    return (tile_count,) + (jnp.int32(0),) * ctx.b.result_slots
 
 
 # ---- the arithmetic of one tile ----
@@ -390,8 +413,11 @@ def down_product(ctx, expert, weight_slot, rows, row_scales):
     w1_up = scratch.w1_bf16[...] if w1_widened else scratch.w1[weight_slot]
     if b.form.block_scaled:
         w1_block, w2_block = upcast_blocks(ctx, weight_slot)
-        w2_scales = (scratch.w2_scales[weight_slot]
-                     if b.stream_block else scratch.w2_scales[expert])
+        w2_scales = (
+            scratch.w2_scales[weight_slot]
+            if b.stream_block
+            else scratch.w2_scales[expert]
+        )
         return ffn.expert_ffn_fp4(
             rows,
             row_scales,
@@ -407,7 +433,8 @@ def down_product(ctx, expert, weight_slot, rows, row_scales):
             elementwise=b.elementwise,
             swiglu_limit=b.swiglu_limit,
             columns_per_pass=b.activation_columns_per_pass,
-            token_block=b.token_block)
+            token_block=b.token_block,
+        )
     if b.intermediate == "bf16":
         return ffn.expert_ffn_bf16_intermediate(
             rows,
@@ -420,7 +447,8 @@ def down_product(ctx, expert, weight_slot, rows, row_scales):
             no_gate=b.no_gate,
             swiglu_limit=b.swiglu_limit,
             token_block=b.token_block,
-            weights_bf16=not b.form.has_scales)
+            weights_bf16=not b.form.has_scales,
+        )
     if not b.form.has_scales:
         return ffn.expert_ffn_bf16(
             rows,
@@ -434,35 +462,43 @@ def down_product(ctx, expert, weight_slot, rows, row_scales):
             elementwise=b.elementwise,
             swiglu_limit=b.swiglu_limit,
             columns_per_pass=b.activation_columns_per_pass,
-            token_block=b.token_block)
-    return ffn.expert_ffn_fp8(rows,
-                              row_scales,
-                              w1_up,
-                              scratch.w2[weight_slot],
-                              w1_scales,
-                              activation=b.activation,
-                              w1_bias=w1_bias,
-                              no_gate=b.no_gate,
-                              block=b.activation_block,
-                              elementwise=b.elementwise,
-                              swiglu_limit=b.swiglu_limit,
-                              columns_per_pass=b.activation_columns_per_pass,
-                              token_block=b.token_block)
+            token_block=b.token_block,
+        )
+    return ffn.expert_ffn_fp8(
+        rows,
+        row_scales,
+        w1_up,
+        scratch.w2[weight_slot],
+        w1_scales,
+        activation=b.activation,
+        w1_bias=w1_bias,
+        no_gate=b.no_gate,
+        block=b.activation_block,
+        elementwise=b.elementwise,
+        swiglu_limit=b.swiglu_limit,
+        columns_per_pass=b.activation_columns_per_pass,
+        token_block=b.token_block,
+    )
 
 
 def finish_rows(ctx, expert, acc2, mid_scales):
     """The down accumulator as result rows: the expert's down scales (fp8
     weights) and bias applied, then the rows quantized."""
     b, scratch = ctx.b, ctx.scratch
-    w2_scales = (scratch.w2_scales[pl.ds(expert, 1), :]
-                 if b.form.has_scales and not b.form.block_scaled else None)
+    w2_scales = (
+        scratch.w2_scales[pl.ds(expert, 1), :]
+        if b.form.has_scales and not b.form.block_scaled
+        else None
+    )
     w2_bias = scratch.w2_bias[pl.ds(expert, 1), :] if b.has_w2_bias else None
-    return ffn.result_rows(acc2,
-                           mid_scales,
-                           w2_scales=w2_scales,
-                           w2_bias=w2_bias,
-                           dtype=b.result_dtype,
-                           elementwise=b.elementwise)
+    return ffn.result_rows(
+        acc2,
+        mid_scales,
+        w2_scales=w2_scales,
+        w2_bias=w2_bias,
+        dtype=b.result_dtype,
+        elementwise=b.elementwise,
+    )
 
 
 # ---- the push and the drains ----
@@ -482,53 +518,60 @@ def push_expert(ctx, expert):
 
             def push_run():
                 pltpu.make_async_remote_copy(
-                    src_ref=outputs.outgoing.at[pl.ds(
-                        tables.outgoing_offset[expert, d] * ROW_BLOCK, rows)],
-                    dst_ref=outputs.arrivals.at[pl.ds(
-                        tables.arrival_offset[expert, d], rows)],
+                    src_ref=outputs.outgoing.at[
+                        pl.ds(tables.outgoing_offset[expert, d] * ROW_BLOCK, rows)
+                    ],
+                    dst_ref=outputs.arrivals.at[
+                        pl.ds(tables.arrival_offset[expert, d], rows)
+                    ],
                     send_sem=sems.push_send,
                     recv_sem=sems.push_receive,
                     device_id=device_coords(jnp.int32(d), b.mesh_axes),
-                    device_id_type=pl.DeviceIdType.MESH).start()
+                    device_id_type=pl.DeviceIdType.MESH,
+                ).start()
 
             pl.when(rows > 0)(push_run)  # a run can be empty
             if b.has_result_scales:
                 pltpu.make_async_remote_copy(
-                    src_ref=outputs.outgoing_scales.at[pl.ds(
-                        src_block, blocks)],
-                    dst_ref=outputs.arrival_scales.at[pl.ds(dst_block,
-                                                            blocks)],
+                    src_ref=outputs.outgoing_scales.at[pl.ds(src_block, blocks)],
+                    dst_ref=outputs.arrival_scales.at[pl.ds(dst_block, blocks)],
                     send_sem=sems.push_send_scales,
                     recv_sem=sems.push_receive_scales,
                     device_id=device_coords(jnp.int32(d), b.mesh_axes),
-                    device_id_type=pl.DeviceIdType.MESH).start()
+                    device_id_type=pl.DeviceIdType.MESH,
+                ).start()
 
         @pl.when(and_nonempty(is_me, blocks))
         def _():
             pltpu.make_async_copy(
-                outputs.outgoing.at[pl.ds(src_block * ROW_BLOCK,
-                                          blocks * ROW_BLOCK)],
-                outputs.arrivals.at[pl.ds(dst_block * ROW_BLOCK,
-                                          blocks * ROW_BLOCK)],
-                sems.local_hop).start()
+                outputs.outgoing.at[pl.ds(src_block * ROW_BLOCK, blocks * ROW_BLOCK)],
+                outputs.arrivals.at[pl.ds(dst_block * ROW_BLOCK, blocks * ROW_BLOCK)],
+                sems.local_hop,
+            ).start()
             if b.has_result_scales:
                 pltpu.make_async_copy(
                     outputs.outgoing_scales.at[pl.ds(src_block, blocks)],
                     outputs.arrival_scales.at[pl.ds(dst_block, blocks)],
-                    sems.local_hop_scales).start()
+                    sems.local_hop_scales,
+                ).start()
 
 
 def drain_transport(ctx):
     """Consumes every push and the commits the per-tile waits left."""
     b, tables, outputs, sems = ctx.b, ctx.tables, ctx.outputs, ctx.sems
     wait_rows(sems.push_send, outputs.outgoing, count(ctx, COUNT_SEND_ROWS))
-    wait_rows(sems.push_receive, outputs.arrivals,
-              count(ctx, COUNT_RECEIVE_ROWS))
+    wait_rows(sems.push_receive, outputs.arrivals, count(ctx, COUNT_RECEIVE_ROWS))
     if b.has_result_scales:
-        wait_rows(sems.push_send_scales, outputs.outgoing_scales,
-                  count(ctx, COUNT_SEND_ALIGNED_ROWS) // ROW_BLOCK)
-        wait_rows(sems.push_receive_scales, outputs.arrival_scales,
-                  count(ctx, COUNT_RECEIVE_ALIGNED_ROWS) // ROW_BLOCK)
+        wait_rows(
+            sems.push_send_scales,
+            outputs.outgoing_scales,
+            count(ctx, COUNT_SEND_ALIGNED_ROWS) // ROW_BLOCK,
+        )
+        wait_rows(
+            sems.push_receive_scales,
+            outputs.arrival_scales,
+            count(ctx, COUNT_RECEIVE_ALIGNED_ROWS) // ROW_BLOCK,
+        )
     own_blocks = tables.push_blocks[0, ctx.me]
     for g in range(1, b.experts_per_shard):
         own_blocks = own_blocks + tables.push_blocks[g, ctx.me]
