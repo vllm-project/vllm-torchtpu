@@ -7,11 +7,13 @@ import jax
 import torch
 from torch_tpu._internal import pallas
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.qwen4_exp.ple import (
     decode_embeddings,
     resident_lookup_raw,
     short_conv,
 )
+from vllm_torchtpu.kernels.qwen4_exp.ple_gate import normalized_gate_dot
 from vllm_torchtpu.kernels.qwen4_exp.pool import (
     pooled_short_conv,
     pooled_short_conv_speculative,
@@ -152,3 +154,70 @@ def build_pooled_prefill_checkpoint_op(state_len):
         pool.copy_(op(pool, x, starts, offsets, ids))
 
     return run
+
+
+@functools.cache
+def build_normalized_gate_dot_op(streams: int):
+    """Fused per-stream RMS-normalized key . query gate dot, BF16 [T, S]."""
+
+    def fn(
+        key: jax.Array,
+        query: jax.Array,
+        key_inv: jax.Array,
+        query_inv: jax.Array,
+        key_weight: jax.Array,
+        query_weight: jax.Array,
+    ) -> jax.Array:
+        return normalized_gate_dot(
+            key, query, key_inv, query_inv, key_weight, query_weight, streams=streams
+        )
+
+    op = pallas.jax_op(f"qwen4_exp::ple_gate_dot_s{streams}", fn)
+
+    @op.register_fake
+    def fake(key, query, key_inv, query_inv, key_weight, query_weight):
+        return key.new_empty((key.shape[0], streams), dtype=torch.bfloat16)
+
+    @op.register_kernel("cpu")
+    def cpu(key, query, key_inv, query_inv, key_weight, query_weight):
+        raise NotImplementedError("The fused PLE gate requires TPU tensors")
+
+    return op
+
+
+def build_normalized_gate_dot_dispatch(streams: int, hidden: int):
+    """PLE gate dot ``[T, S, 1]``, chosen when the layer is constructed.
+
+    Default: the Torch path (two grouped RMS norms, BF16 products, FP32 sum).
+    VLLM_TPU_PLE_FUSED_GATE: one Pallas kernel applies the norm weights,
+    multiplies and reduces per stream without materializing the normalized
+    key and query; only the per-stream inverse RMS is computed outside.
+    """
+    if not envs.VLLM_TPU_PLE_FUSED_GATE:
+
+        def dot(key, query, norm_key, norm_query):
+            key = norm_key(key).unflatten(-1, (streams, hidden))
+            query = norm_query(query).unflatten(-1, (streams, hidden))
+            # As in upstream's gate kernel, the products are rounded to the
+            # activation dtype and then summed in fp32.
+            return (key * query).float().sum(dim=-1, keepdim=True).to(key.dtype)
+
+        return dot
+
+    native = build_normalized_gate_dot_op(streams)
+
+    def inverse_rms(raw, norm):
+        grouped = raw.float().unflatten(-1, (streams, hidden))
+        return torch.rsqrt(grouped.square().mean(dim=-1) + norm.variance_epsilon)
+
+    def dispatch(key, query, norm_key, norm_query):
+        return native(
+            key,
+            query,
+            inverse_rms(key, norm_key),
+            inverse_rms(query, norm_query),
+            norm_key.weight,
+            norm_query.weight,
+        ).unsqueeze(-1)
+
+    return dispatch

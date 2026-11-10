@@ -155,6 +155,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_INDEXER_TOKEN_SHARD: bool = False
     VLLM_TPU_QSA_DECODE_TOKEN_SHARD: bool = False
     VLLM_TPU_PLE_LOOKUP_CHUNK_TOKENS: int = 8
+    VLLM_TPU_PLE_FUSED_GATE: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
@@ -958,6 +959,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Qwen4-exp resident PLE table: tokens per gather in the raw embedding
     # lookup (a multiple of 8). 8 is the originally validated chunk; an
     # 8192-token prefill step then runs 1024 sequential gathers.
+    # qwen4_exp PLE: one Pallas kernel for the per-stream normalized key .
+    # query gate dot (norm weights, BF16 products, FP32 reduction) instead of
+    # two grouped RMS norms and a Torch product/sum. Reduction order differs.
+    "VLLM_TPU_PLE_FUSED_GATE": env_bool("VLLM_TPU_PLE_FUSED_GATE"),
     "VLLM_TPU_PLE_LOOKUP_CHUNK_TOKENS": env_nonnegative_int(
         "VLLM_TPU_PLE_LOOKUP_CHUNK_TOKENS", 8
     ),
