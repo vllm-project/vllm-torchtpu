@@ -649,7 +649,6 @@ def _scenario(mode: str, num_chunks: int):
 _COMPILED_DRAFT_HELPERS = (
     "_draft_seed_input_ids",
     "_draft_combine_hidden_states",
-    "_draft_gather_carries",
     "_draft_gather_rows",
     "_draft_propose_token",
 )

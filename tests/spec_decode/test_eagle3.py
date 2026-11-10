@@ -579,7 +579,7 @@ def test_propose_delegates_carry_aggregation_after_gather():
         assert gather_indices.cpu().tolist() == [0, 2]
         return (hidden[:2], positions[:2], last_hidden[gather_indices])
 
-    proposer._draft_gather_carries = record_gather
+    proposer._draft_gather_rows = record_gather
 
     def record_token(last_hidden):
         events.append("propose_token")
@@ -1027,7 +1027,7 @@ def _lockstep_draft_trace(monkeypatch, method, K, num_chunks, num_real):
     proposer._draft_combine_hidden_states = combine
     proposer._forward_draft = forward
     proposer._draft_propose_token = propose_token
-    proposer._draft_gather_carries = lambda h, pos, lh, _idx: (
+    proposer._draft_gather_rows = lambda h, pos, lh, _idx: (
         h[:reqs],
         pos[:reqs],
         lh[:reqs],
@@ -2026,7 +2026,7 @@ def test_propose_index_share_order_across_two_chunks():
         return (torch.zeros((2, 1), device=device), torch.zeros((2, 1), device=device))
 
     proposer._forward_draft = fake_forward
-    proposer._draft_gather_carries = lambda h, p, lh, gi: (h[:2], p[:2], lh[:2])
+    proposer._draft_gather_rows = lambda h, p, lh, gi: (h[:2], p[:2], lh[:2])
     proposer._draft_propose_token = lambda lh: torch.zeros(
         2, dtype=torch.int32, device=device
     )
@@ -2118,7 +2118,7 @@ def test_propose_index_share_survives_dp_padding_first_pass(monkeypatch):
         return (torch.zeros((2, 1), device=device), torch.zeros((2, 1), device=device))
 
     proposer._forward_draft = fake_forward
-    proposer._draft_gather_carries = lambda h, p, lh, gi: (h[:2], p[:2], lh[:2])
+    proposer._draft_gather_rows = lambda h, p, lh, gi: (h[:2], p[:2], lh[:2])
     proposer._draft_propose_token = lambda lh: torch.zeros(
         lh.shape[0], dtype=torch.int32, device=device
     )
