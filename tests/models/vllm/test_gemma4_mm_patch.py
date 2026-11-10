@@ -169,35 +169,58 @@ def test_patch_registry_contains_gemma4_mm_patch():
     refresh_gemma4_mm()
 
 
-def test_patch_gemma4_layer_config():
+def test_patch_gemma4_layer_config(monkeypatch):
+    import importlib
     import sys
     import types
 
+    from vllm_torchtpu.models.vllm import gemma4_mm_patch
     from vllm_torchtpu.models.vllm.gemma4_mm_patch import patch_gemma4_layer_config
 
-    # Mock vllm.transformers_utils.configs.gemma4 if not present in test environment
-    if "vllm.transformers_utils.configs.gemma4" not in sys.modules:
-        vllm_mock = types.ModuleType("vllm")
-        tu_mock = types.ModuleType("vllm.transformers_utils")
-        cfg_mock = types.ModuleType("vllm.transformers_utils.configs")
-        g4_cfg_mock = types.ModuleType("vllm.transformers_utils.configs.gemma4")
-        g4_cfg_mock.gemma4_layer_config = (
-            lambda text_config, layer_idx: SimpleNamespace(
-                head_dim=256, num_key_value_heads=8
-            )
-        )
-        cfg_mock.gemma4 = g4_cfg_mock
-        tu_mock.configs = cfg_mock
-        vllm_mock.transformers_utils = tu_mock
-        sys.modules["vllm"] = vllm_mock
-        sys.modules["vllm.transformers_utils"] = tu_mock
-        sys.modules["vllm.transformers_utils.configs"] = cfg_mock
-        sys.modules["vllm.transformers_utils.configs.gemma4"] = g4_cfg_mock
+    # The patch rewrites module globals, so every module it touches is a stub
+    # registered through monkeypatch, which restores them after the test.
+    # Replacing sys.modules entries directly leaked into every later test.
+    configs_pkg = importlib.import_module("vllm.transformers_utils.configs")
+    g4_cfg_mod = types.ModuleType("vllm.transformers_utils.configs.gemma4")
+    g4_cfg_mod.gemma4_layer_config = lambda text_config, layer_idx: SimpleNamespace(
+        head_dim=256, num_key_value_heads=8
+    )
+    monkeypatch.setitem(
+        sys.modules, "vllm.transformers_utils.configs.gemma4", g4_cfg_mod
+    )
+    monkeypatch.setattr(configs_pkg, "gemma4", g4_cfg_mod, raising=False)
+
+    class MockAttention:
+        def __init__(
+            self,
+            config,
+            hidden_size,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            *args,
+            **kwargs,
+        ):
+            self.head_dim = head_dim
+            self.num_kv_heads = num_kv_heads
+
+    g4_mod_mock = types.ModuleType("vllm.model_executor.models.gemma4")
+    g4_mod_mock.extract_layer_index = lambda prefix: 5
+    g4_mod_mock.Gemma4Attention = MockAttention
+    monkeypatch.setitem(sys.modules, "vllm.model_executor.models.gemma4", g4_mod_mock)
+
+    for mod_name in (
+        "vllm.model_executor.models.gemma4_mtp",
+        "vllm.model_executor.models.gemma4_dspark",
+        "vllm.transformers_utils.model_arch_config_convertor",
+    ):
+        mod = sys.modules.get(mod_name)
+        if mod is not None and hasattr(mod, "gemma4_layer_config"):
+            monkeypatch.setattr(mod, "gemma4_layer_config", mod.gemma4_layer_config)
+    monkeypatch.setattr(gemma4_mm_patch, "_orig_gemma4_layer_config", None)
 
     patch_gemma4_layer_config()
     patch_gemma4_layer_config()
-
-    import vllm.transformers_utils.configs.gemma4 as g4_cfg_mod
 
     text_cfg = SimpleNamespace(
         layer_types=[
@@ -222,30 +245,7 @@ def test_patch_gemma4_layer_config():
     assert l5.head_dim == 512
     assert l5.num_key_value_heads == 2
 
-    # Also test Gemma4Attention __init__ patching
-    g4_mod_mock = types.ModuleType("vllm.model_executor.models.gemma4")
-    g4_mod_mock.extract_layer_index = lambda prefix: 5
-
-    class MockAttention:
-        def __init__(
-            self,
-            config,
-            hidden_size,
-            num_heads,
-            num_kv_heads,
-            head_dim,
-            *args,
-            **kwargs,
-        ):
-            self.head_dim = head_dim
-            self.num_kv_heads = num_kv_heads
-
-    g4_mod_mock.Gemma4Attention = MockAttention
-    sys.modules["vllm.model_executor.models.gemma4"] = g4_mod_mock
-    if "vllm.model_executor.models" in sys.modules:
-        setattr(sys.modules["vllm.model_executor.models"], "gemma4", g4_mod_mock)  # noqa: B010
-
-    patch_gemma4_layer_config()
+    # The same call also patches Gemma4Attention.__init__ for full layers.
     attn = g4_mod_mock.Gemma4Attention(
         text_cfg, 1024, 8, 8, 256, prefix="model.layers.5.self_attn"
     )
