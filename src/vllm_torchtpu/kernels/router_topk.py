@@ -11,7 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Fused MoE router scoring, group-limited top-k selection, and weight normalization."""
+"""Sort-free top-k expert selection for the MoE router (Pallas).
+
+``torch.topk`` lowers to a full ``stablehlo.sort`` of every expert plus a
+slice, so at 512 experts it runs a 45-stage bitonic network over three arrays
+to keep 10 values. This kernel selects the same 10 with ``k`` max-and-mask
+passes over one VMEM-resident block: ``O(k*N)`` instead of ``O(N*log^2 N)``.
+A block of at most 64 rows finds each pass's index with one argmax instead of
+a max followed by a min over the matching columns.
+"""
 
 import functools
 

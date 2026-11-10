@@ -11,11 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Blockwise-quantized FP8/INT8 matrix multiplication Pallas kernels on TPU.
-
-Implements tiled activation-weight matmuls with sub-channel scale broadcast
-in VMEM for dense and shared-expert linear layers.
-"""
+"""Quantized matmul kernel."""
 
 import functools
 
