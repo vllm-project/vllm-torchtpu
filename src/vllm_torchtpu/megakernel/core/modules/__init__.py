@@ -15,12 +15,15 @@
 
 from __future__ import annotations
 
+from .gdn import GDNLinInLayout, GDNParams
 from .moe import MoEDebug, MoEParams
 from .norm import Embedding, EmbeddingModule, Norm, NormModule
 
 __all__ = [
     "Embedding",
     "EmbeddingModule",
+    "GDNLinInLayout",
+    "GDNParams",
     "MoEDebug",
     "MoEParams",
     "Norm",
