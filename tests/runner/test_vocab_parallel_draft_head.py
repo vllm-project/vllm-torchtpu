@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """The vocab-parallel draft head: the draft's BF16 greedy head split over all
 DP x TP ranks returns, for every DP engine's rows, the full-logits argmax
 (ties to the lowest id), the same tokens as the per-TP-group head, and every
@@ -62,13 +74,17 @@ def _tp_shards(weight, tp_size, dp_size):
     the mask were missing. Shard size is a multiple of dp_size."""
     vocab, hidden = weight.shape
     per_rank = math.ceil(vocab / (tp_size * dp_size)) * dp_size
-    pad_rows = torch.full((per_rank * tp_size - vocab, hidden), 50.0, dtype=weight.dtype)
+    pad_rows = torch.full(
+        (per_rank * tp_size - vocab, hidden), 50.0, dtype=weight.dtype
+    )
     padded = torch.cat([weight, pad_rows])
     shards = []
     for t in range(tp_size):
         start = t * per_rank
         num_pad = min(per_rank, max(0, start + per_rank - vocab))
-        shards.append(_Shard(padded[start : start + per_rank].clone(), start, tp_size, num_pad))
+        shards.append(
+            _Shard(padded[start : start + per_rank].clone(), start, tp_size, num_pad)
+        )
     return shards
 
 
@@ -84,7 +100,9 @@ class _Group:
 
 def _patch_groups(monkeypatch, dp, tp, d, t, dp_gather, ep_gather, ep_rank=None):
     ep_rank = d * tp + t if ep_rank is None else ep_rank
-    monkeypatch.setattr(parallel_state, "get_dp_group", lambda: _Group(dp, d, dp_gather))
+    monkeypatch.setattr(
+        parallel_state, "get_dp_group", lambda: _Group(dp, d, dp_gather)
+    )
     monkeypatch.setattr(parallel_state, "get_tp_group", lambda: _Group(tp, t))
     monkeypatch.setattr(
         parallel_state, "get_ep_group", lambda: _Group(dp * tp, ep_rank, ep_gather)
@@ -164,7 +182,9 @@ def _pair_path(weight, hidden, tp, dp, monkeypatch):
     for s in shards:
         _Owner(s).logits_processor.get_top_tokens(s, hidden)
     monkeypatch.setattr(
-        lp_module, "tensor_model_parallel_all_gather", lambda x, dim=-1: torch.cat(recorded, 0)
+        lp_module,
+        "tensor_model_parallel_all_gather",
+        lambda x, dim=-1: torch.cat(recorded, 0),
     )
     return _Owner(shards[0]).logits_processor.get_top_tokens(shards[0], hidden)
 
@@ -175,7 +195,9 @@ def _pair_path(weight, hidden, tp, dp, monkeypatch):
 def test_matches_full_logits_argmax_and_pair_path(monkeypatch, dp, tp, rows, vocab):
     gen = torch.Generator().manual_seed(dp * 100 + tp * 10 + rows + vocab)
     weight = torch.randn(vocab, 32, generator=gen).to(torch.bfloat16)
-    hiddens = [torch.randn(rows, 32, generator=gen).to(torch.bfloat16) for _ in range(dp)]
+    hiddens = [
+        torch.randn(rows, 32, generator=gen).to(torch.bfloat16) for _ in range(dp)
+    ]
 
     tokens, _ = _run_vp(monkeypatch, weight, hiddens, dp, tp)
 
