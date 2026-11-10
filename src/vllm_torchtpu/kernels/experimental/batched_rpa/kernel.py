@@ -974,6 +974,8 @@ def rpa_kernel(
 
                     total_steps = num_steps + prefix_steps
                     kv_bound = kv_cache_alloc.bind(
+                        src_ref=(kv_cache_hbm_ref, new_kv_hbm_ref, schedule_ref),
+                        dst_ref=(kv_cache_hbm_ref, new_kv_hbm_ref, schedule_ref),
                     )
                     q_bound = q_alloc.bind(src_ref=(q_hbm_ref, schedule_ref))
                     o_bound = o_alloc.bind(dst_ref=(o_hbm_ref, schedule_ref))
