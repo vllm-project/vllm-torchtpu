@@ -77,25 +77,30 @@ def pack_bf16_pairs(values: jax.Array) -> jax.Array:
 
 
 def unpack_bf16_pairs(words: jax.Array) -> jax.Array:
-    """Inverse of ``pack_bf16_pairs``: ``(rows, lanes)`` uint32 -> ``(2 * rows, lanes)`` bf16."""
+    """Inverse of ``pack_bf16_pairs``: ``(rows, lanes)`` uint32 ->
+    ``(2 * rows, lanes)`` bf16."""
     return pltpu.bitcast(words, jnp.bfloat16)
 
 
 def pack_fp8_quads(values: jax.Array) -> jax.Array:
-    """``(4 * rows, lanes)`` float8_e4m3fn -> ``(rows, lanes)`` uint32 of FP8 quads."""
+    """``(4 * rows, lanes)`` float8_e4m3fn -> ``(rows, lanes)`` uint32 of FP8
+    quads."""
     return pltpu.bitcast(values.astype(jnp.float8_e4m3fn), jnp.uint32)
 
 
 def unpack_fp8_quads(words: jax.Array) -> jax.Array:
-    """Inverse of ``pack_fp8_quads``: ``(rows, lanes)`` uint32 -> ``(4 * rows, lanes)`` float8_e4m3fn."""
+    """Inverse of ``pack_fp8_quads``: ``(rows, lanes)`` uint32 ->
+    ``(4 * rows, lanes)`` float8_e4m3fn."""
     return pltpu.bitcast(words, jnp.float8_e4m3fn)
 
 
 def pack_fp4_octets(values: jax.Array) -> jax.Array:
-    """``(8 * rows, lanes)`` float4_e2m1fn -> ``(rows, lanes)`` uint32 of FP4 octets."""
+    """``(8 * rows, lanes)`` float4_e2m1fn -> ``(rows, lanes)`` uint32 of FP4
+    octets."""
     return pltpu.bitcast(values.astype(jnp.float4_e2m1fn), jnp.uint32)
 
 
 def unpack_fp4_octets(words: jax.Array) -> jax.Array:
-    """Inverse of ``pack_fp4_octets``: ``(rows, lanes)`` uint32 -> ``(8 * rows, lanes)`` float4_e2m1fn."""
+    """Inverse of ``pack_fp4_octets``: ``(rows, lanes)`` uint32 ->
+    ``(8 * rows, lanes)`` float4_e2m1fn."""
     return pltpu.bitcast(words, jnp.float4_e2m1fn)

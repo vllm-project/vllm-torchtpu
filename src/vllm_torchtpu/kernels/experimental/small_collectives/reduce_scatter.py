@@ -24,7 +24,6 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu.kernels.experimental.small_collectives.common import (
     LANES,
     barrier,
-    barrier_peers,
     call,
     push,
     split_rank,
@@ -73,28 +72,32 @@ def small_reduce_scatter(
 
 def _hier_reduce_scatter(x, n, axis, rank, collective_id):
     """2-stage topology-aware Reduce-Scatter on 8 cores (4 chips x 2 cores/chip):
-    Stage 1 (Intra-chip): Core `me` pushes the 4 blocks belonging to `partner = me ^ 1`'s
-      subcore parity (`r = 2*c + (1 - subcore)` for c in 0..3) to `s1_recv` on `partner`,
-      and sums its own 4 parity blocks (`r = 2*c + subcore`) with `s1_recv` into `chip_blocks`.
+    Stage 1 (Intra-chip): Core `me` pushes the 4 blocks belonging to
+      `partner = me ^ 1`'s subcore parity (`r = 2*c + (1 - subcore)` for c in
+      0..3) to `s1_recv` on `partner`, and sums its own 4 parity blocks
+      (`r = 2*c + subcore`) with `s1_recv` into `chip_blocks`.
     Stage 2 (Inter-chip): Core `me` pushes `chip_blocks[c]` for `c != chip` to
-      `(c << 1) | subcore` (3 inter-chip DMAs vs 6 in flat reduce-scatter) and sums the 4
-      chip blocks into `o_ref`.
+      `(c << 1) | subcore` (3 inter-chip DMAs vs 6 in flat reduce-scatter) and
+      sums the 4 chip blocks into `o_ref`.
     """
     total, hidden = x.shape
     rows = total // n
     dict_ids = rank is not None
 
     def kernel(*refs):
-        me, (
-            x_ref,
-            o_ref,
-            s1_recv,
-            chip_blocks,
-            s2_recv,
-            send1,
-            recv1,
-            send2,
-            recv2,
+        (
+            me,
+            (
+                x_ref,
+                o_ref,
+                s1_recv,
+                chip_blocks,
+                s2_recv,
+                send1,
+                recv1,
+                send2,
+                recv2,
+            ),
         ) = split_rank(refs, dict_ids, axis)
         barrier(n, axis, dict_ids)
 
