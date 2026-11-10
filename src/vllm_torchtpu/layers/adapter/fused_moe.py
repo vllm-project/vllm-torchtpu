@@ -26,6 +26,7 @@ import torch
 from torch_tpu._internal import pallas
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.layers.core import fused_moe_gmm as moe_gmm_core
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
     fused_moe_func,
     quantize_to_native_fp4_kmajor,
@@ -36,7 +37,7 @@ from vllm_torchtpu.layers.core.fused_moe_gmm import (
 
 _kernel_instance_counter = 0
 _fused_moe_kernel_cache: dict[
-    tuple[int, str, bool, Any, bool, int | None], Callable
+    tuple[int, str, bool, Any, bool, int | None, str], Callable
 ] = {}
 _load_kmajor_fp4_op = None
 _requant_kmajor_fp4_ops: dict[int, Callable] = {}
@@ -167,6 +168,8 @@ def _build_fused_moe_custom_op(
 ):
     kernel_instance_id = _allocate_kernel_instance_id()
     op_name = f"pallas::fused_moe_kernel_{kernel_instance_id}"
+    # Process-wide, set by a model rule before its kernels are built.
+    nonep_permute = moe_gmm_core.NONEP_PERMUTE
 
     # TODO: once the pod's vLLM includes --moe-backend (added upstream in
     # vLLM PR #33807, 2026-03-01; absent in the 0.19.0 we run), register the
@@ -189,6 +192,7 @@ def _build_fused_moe_custom_op(
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
         num_primary_experts=num_primary_experts,
+        nonep_permute=nonep_permute,
     )
 
     fused_moe_kernel_impl = pallas.jax_op(op_name, wrapped_fn)
@@ -207,6 +211,7 @@ def _build_fused_moe_custom_op(
         rhs_quant_dtype,
         skip_padded_tokens,
         num_primary_experts,
+        nonep_permute,
     )
     _fused_moe_kernel_cache[cache_key] = fused_moe_kernel_impl
     return fused_moe_kernel_impl
@@ -239,6 +244,7 @@ def _get_fused_moe_custom_op(
         rhs_quant_dtype,
         skip_padded_tokens,
         num_primary_experts,
+        moe_gmm_core.NONEP_PERMUTE,
     )
     kernel = _fused_moe_kernel_cache.get(cache_key)
     if kernel is not None:

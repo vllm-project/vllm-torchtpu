@@ -104,6 +104,22 @@ _COUNTING_SORT_SCATTER_MAX_ROWS = _COUNTING_SORT_BLOCK
 # low-token MoE adapter sets it at weight load (set_lowtok_max_tokens), before
 # anything is traced.
 _MOE_LOWTOK_MAX_TOKENS = 0
+# The routing metadata construction of the non-EP path above the single-sort
+# row cap (prepare_routed_gmm_inputs' nonep_permute) that the grouped-matmul
+# MoE op is built with: "sorts" by default, so every model keeps the three
+# sorts; a model rule selects "two_sorts" before its kernels are built
+# (set_nonep_permute).
+NONEP_PERMUTE = "sorts"
+_NONEP_PERMUTES = ("sorts", "two_sorts")
+
+
+def set_nonep_permute(permute: str) -> None:
+    """Build the grouped-matmul MoE op with this non-EP routing metadata
+    construction ("sorts" or "two_sorts")."""
+    global NONEP_PERMUTE
+    if permute not in _NONEP_PERMUTES:
+        raise ValueError(f"unknown non-EP permute {permute!r}")
+    NONEP_PERMUTE = permute
 
 
 def set_lowtok_max_tokens(rows: int) -> None:
@@ -388,7 +404,7 @@ def prepare_routed_gmm_inputs(
     the forward permutation (sorted slot to routed row) when the path
     computed one, else ``None``.
     """
-    if nonep_permute not in ("sorts", "two_sorts"):
+    if nonep_permute not in _NONEP_PERMUTES:
         raise ValueError(f"unknown non-EP permute {nonep_permute!r}")
     num_tokens_local = hidden_states_local.shape[0]
     topk_indices_flat = topk_indices_local.flatten()
