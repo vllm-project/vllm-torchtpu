@@ -32,7 +32,6 @@ either via the dedicated ``TPUConnectorHMA`` connector class or via
 import dataclasses
 import importlib
 import json
-import os
 import queue
 import threading
 import time
@@ -111,6 +110,7 @@ from vllm_torchtpu.kernels.gdn.head_geometry import (
     derive_gdn_head_geometry,
 )
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.runner import host_trims
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.utils import synchronize_tensors
 
@@ -593,21 +593,17 @@ def stage3_fa_raiden_id_fields(
     }
 
 
-# VLLM_TPU_T3_ENV_CACHE=1 (default off): the per-step connector hot path asks
-# these process-constant env predicates several times per decode step; cache
-# each one's first answer for the life of the process.
-_T3_ENV_CACHE = (
-    os.environ.get("VLLM_TPU_T3_ENV_CACHE", os.environ.get("VLLM_TPU_T3_HOST", "0"))
-    == "1"
-)
-_t3_env_cache: dict[str, bool] = {}
+# Under the batch-1 rule (runner.host_trims) the per-step connector hot path
+# asks these process-constant env predicates several times per decode step;
+# cache each one's first answer for the life of the process.
+_env_predicate_cache: dict[str, bool] = {}
 
 
 def _use_raiden_stage3_transport() -> bool:
-    if _T3_ENV_CACHE:
-        v = _t3_env_cache.get("stage3")
+    if host_trims.ENABLED:
+        v = _env_predicate_cache.get("stage3")
         if v is None:
-            v = _t3_env_cache["stage3"] = (
+            v = _env_predicate_cache["stage3"] = (
                 str(tpu_envs.TPU_KV_RESHARD_TRANSPORT).strip().lower() == "raiden"
             )
         return v
@@ -723,10 +719,10 @@ def _resolved_reshard_controller_address(dp_rank: int) -> str:
 
 
 def _use_raiden_glm_admission() -> bool:
-    if _T3_ENV_CACHE:
-        v = _t3_env_cache.get("glm")
+    if host_trims.ENABLED:
+        v = _env_predicate_cache.get("glm")
         if v is None:
-            v = _t3_env_cache["glm"] = bool(tpu_envs.use_raiden_glm_admission())
+            v = _env_predicate_cache["glm"] = bool(tpu_envs.use_raiden_glm_admission())
         return v
     return tpu_envs.use_raiden_glm_admission()
 
