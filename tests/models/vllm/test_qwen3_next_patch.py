@@ -15,7 +15,9 @@
 patch and the FP8 fusions."""
 
 import hashlib
+import importlib
 import inspect
+import sys
 from types import SimpleNamespace
 
 import numpy as np
@@ -51,8 +53,10 @@ from vllm_torchtpu.models.vllm.qwen3_next_patch import (
     step0_post_attn_gather_context,
 )
 
-# Captured before any test installs the patch.
-UPSTREAM_QWEN3_5_MTP_FORWARD = qwen3_5_mtp.Qwen3_5MultiTokenPredictor.forward
+# The Qwen3.5 drafter forward maybe_patch_qwen3_next replaces, captured before
+# any test installs the patch and after the qwen3_5_mtp.py import above, which
+# installs its own copy over upstream's.
+UNPATCHED_QWEN3_5_MTP_FORWARD = qwen3_5_mtp.Qwen3_5MultiTokenPredictor.forward
 
 # The patched copies track vLLM v0.33.0 (pyproject.toml pin).
 PINNED_VLLM_VERSION = "0.33.0"
@@ -62,15 +66,17 @@ PINNED_DECODER_LAYER_HASH = (
 PINNED_MODEL_FORWARD_HASH = (
     "a9c1265f14e88e54138394b9038db621813bb6357a9077ad50d1691db0ac4398"
 )
-# patched_mtp_forward copies this drafter forward (Qwen3Next and Qwen3.5 share
-# its source), and tpu_platform admits MTP under SP because its layer slices
-# the rows after attention and it all-gathers after the final norm.
+# patched_mtp_forward copies this Qwen3Next drafter forward, and tpu_platform
+# admits MTP under SP because its layer slices the rows after attention and it
+# all-gathers after the final norm.
 PINNED_MTP_FORWARD_HASH = (
     "54034d76e48fccf2cd98bcf05b831207580ad9e8886e6e387193e1bd70e9e472"
 )
 # qwen3_5_mtp.py replaces this upstream drafter forward with a copy that
 # keeps its SP chunk before the MTP layer and all-gather after the final
 # norm, which is what lets tpu_platform admit MTP under SP.
+# maybe_patch_qwen3_next replaces it with patched_mtp_forward when either of
+# its flags is on.
 PINNED_QWEN3_5_MTP_FORWARD_HASH = (
     "af988ccd1ba49bf2953bb9858d7a2082c405d260d2ebb64413c6707c34a80d22"
 )
@@ -86,7 +92,7 @@ def _source_hash(fn) -> str:
 
 @pytest.fixture
 def restore_forwards(monkeypatch):
-    """Start from the upstream forwards and undo whatever the patch installs."""
+    """Start from the unpatched forwards and undo whatever the patch installs."""
     monkeypatch.setattr(
         qwen3_next.Qwen3NextDecoderLayer, "forward", UPSTREAM_DECODER_LAYER_FORWARD
     )
@@ -95,7 +101,7 @@ def restore_forwards(monkeypatch):
         qwen3_next_mtp.Qwen3NextMultiTokenPredictor, "forward", UPSTREAM_MTP_FORWARD
     )
     monkeypatch.setattr(
-        qwen3_5_mtp.Qwen3_5MultiTokenPredictor, "forward", UPSTREAM_QWEN3_5_MTP_FORWARD
+        qwen3_5_mtp.Qwen3_5MultiTokenPredictor, "forward", UNPATCHED_QWEN3_5_MTP_FORWARD
     )
     for layer_cls in (qwen3_next.Qwen3NextDecoderLayer, qwen3_5.Qwen3_5DecoderLayer):
         if "__init__" in vars(layer_cls):
@@ -123,28 +129,24 @@ def test_upstream_qwen3_next_forward_unchanged():
 
 @requires_pinned_vllm
 def test_upstream_mtp_forwards_unchanged():
-    """Pin the drafter forwards patched_mtp_forward copies and replaces."""
+    """Pin the Qwen3Next drafter forward patched_mtp_forward copies and replaces."""
     assert _source_hash(UPSTREAM_MTP_FORWARD) == PINNED_MTP_FORWARD_HASH, (
         "Upstream Qwen3NextMultiTokenPredictor.forward has drifted. "
         "Re-sync patched_mtp_forward in qwen3_next_patch.py."
-    )
-    assert _source_hash(UPSTREAM_QWEN3_5_MTP_FORWARD) == PINNED_MTP_FORWARD_HASH, (
-        "Upstream Qwen3_5MultiTokenPredictor.forward has drifted. Re-sync "
-        "patched_mtp_forward and re-check that its layer still slices and it "
-        "all-gathers under SP before admitting MTP in tpu_platform.py."
     )
 
 
 @requires_pinned_vllm
 def test_upstream_qwen3_5_mtp_forward_unchanged():
-    """Pin the upstream Qwen3.5 drafter forward that qwen3_5_mtp.py copies."""
+    """Pin the upstream Qwen3.5 drafter forward that qwen3_5_mtp.py copies and
+    patched_mtp_forward replaces."""
     source = inspect.getsource(UPSTREAM_PREDICTOR_FORWARD)
     actual_hash = hashlib.sha256(source.encode("utf-8")).hexdigest()
     assert actual_hash == PINNED_QWEN3_5_MTP_FORWARD_HASH, (
         "Upstream Qwen3_5MultiTokenPredictor.forward has drifted. Re-sync "
-        "src/vllm_torchtpu/models/vllm/qwen3_5_mtp.py and re-check that it "
-        "still chunks and all-gathers under SP before admitting MTP in "
-        "tpu_platform.py."
+        "src/vllm_torchtpu/models/vllm/qwen3_5_mtp.py and patched_mtp_forward "
+        "in qwen3_next_patch.py, and re-check that they still chunk or slice "
+        "and all-gather under SP before admitting MTP in tpu_platform.py."
     )
 
 
@@ -501,7 +503,7 @@ def test_forward_patch_skipped_with_flags_off(restore_forwards):
     assert qwen3_next.Qwen3NextModel.forward is UPSTREAM_MODEL_FORWARD
     assert qwen3_next_mtp.Qwen3NextMultiTokenPredictor.forward is UPSTREAM_MTP_FORWARD
     assert (
-        qwen3_5_mtp.Qwen3_5MultiTokenPredictor.forward is UPSTREAM_QWEN3_5_MTP_FORWARD
+        qwen3_5_mtp.Qwen3_5MultiTokenPredictor.forward is UNPATCHED_QWEN3_5_MTP_FORWARD
     )
 
 
@@ -523,6 +525,22 @@ def test_forward_patch_applied(restore_forwards, sequence_parallel):
         getattr(qwen3_next.Qwen3NextDecoderLayer.__init__, "_tpu_sp_rank_init", False)
         is sequence_parallel
     )
+
+
+def test_mtp_draft_module_import_keeps_patched_forward(restore_forwards):
+    """Loading a Qwen3.5 MTP draft imports vllm_torchtpu.models.vllm.qwen3_5_mtp,
+    whose module-level forward assignment must not replace patched_mtp_forward."""
+    import vllm_torchtpu.models.vllm as tpu_models
+
+    restore_forwards.setattr(envs, "TPU_MOE_SEQUENCE_PARALLEL", False)
+    restore_forwards.setattr(envs, "TPU_MTP_STEP0_POST_ATTN_GATHER", True)
+    restore_forwards.setattr(patch_mod.sequence_parallel, "fp8_gather", lambda: False)
+    restore_forwards.setattr(tpu_models, "qwen3_5_mtp", tpu_models.qwen3_5_mtp)
+    restore_forwards.delitem(sys.modules, "vllm_torchtpu.models.vllm.qwen3_5_mtp")
+
+    maybe_patch_qwen3_next()
+    importlib.import_module("vllm_torchtpu.models.vllm.qwen3_5_mtp")
+    assert qwen3_5_mtp.Qwen3_5MultiTokenPredictor.forward is patched_mtp_forward
 
 
 def test_pal_gate_q_interpreter_parity():
