@@ -439,6 +439,29 @@ def decode_causal_mask_enabled() -> bool:
     return os.environ.get("TPU_RPA_DECODE_CAUSAL_MASK", "0") == "1"
 
 
+def cache_only_colmask_mode() -> str:
+    """TPU_RPA_CACHE_ONLY_COLMASK (ATT K1, default off; read at trace time): the
+    CACHE_ONLY masked body's mask is the column test alone.
+
+    In a CACHE_ONLY call every attended key is cached and every query is new, so
+    the causal test admits every key below the cached length (the PCP history
+    call relies on this: "no causal mask", history_rpa.py). The mask then reduces
+    to `kv_iota < min(n_valid, local_k_end)`, one compare instead of the 3-D
+    q/kv iota, the divide, the subtract and up to three compares and ands.
+    Values: "" / "0" off; "1" = one compare over the full (heads, rows, s) iota;
+    "b" = one compare over a (1, 1, s) lane iota, broadcast to the tile.
+    TPU_RPA_CACHE_ONLY_COLMASK_MUT=1 (test only) admits one key too many.
+    """
+    from vllm_torchtpu import envs as _envs_k1  # registered keys (envs.py), read at trace time
+
+    v = str(getattr(_envs_k1, "TPU_RPA_CACHE_ONLY_COLMASK", "") or "").strip().lower()
+    if v in ("", "0"):
+        return ""
+    if v not in ("1", "b"):
+        raise ValueError(f"TPU_RPA_CACHE_ONLY_COLMASK={v}: expected 0, 1 or b")
+    return v
+
+
 def decode_mask_bias_enabled() -> bool:
     """TPU_RPA_DECODE_MASK_BIAS=1 masks the FULL-scope DECODE kernel's scores
     with an additive tile kept in VMEM instead of a compare and select over
@@ -584,6 +607,31 @@ def generate_mask(
         and step_meta.local_k_start is None
         and step_meta.local_k_end is None
     )
+
+    colmask = cache_only_colmask_mode()
+    if (
+        colmask
+        and cfgs.serve.attention_scope == configs.AttentionScope.CACHE_ONLY
+        and cfgs.model.sliding_window is None
+        and step_meta.local_k_start is None
+        and step_meta.local_k_end is not None
+    ):
+        from vllm_torchtpu import envs as _envs_k1
+
+        mut = 1 if getattr(_envs_k1, "TPU_RPA_CACHE_ONLY_COLMASK_MUT", False) else 0
+        col_shape = (1, 1, s) if colmask == "b" else (k_heads, tq, s)
+        kv_col = lax.broadcasted_iota(jnp.int32, col_shape, 2)
+        col_masks = []
+        for b_idx in range(b):
+            n_valid = (
+                stitch_meta.bkv_sz_frm_cache[b_idx] + stitch_meta.bkv_sz_frm_new[b_idx]
+            )
+            limit = jnp.minimum(n_valid, step_meta.local_k_end[b_idx]) + mut
+            m = kv_col < limit
+            if colmask == "b":
+                m = jnp.broadcast_to(m, (k_heads, tq, s))
+            col_masks.append(m)
+        return col_masks
 
     kv_iota = lax.broadcasted_iota(jnp.int32, (k_heads, tq, s), 2)
     q_iota = lax.broadcasted_iota(jnp.int32, (k_heads, tq, s), 1)

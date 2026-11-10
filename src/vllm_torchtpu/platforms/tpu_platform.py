@@ -129,6 +129,7 @@ def _log_effective_config(vllm_config: VllmConfig) -> None:
         "dcp": vllm_config.parallel_config.decode_context_parallel_size,
         "speculative": str(vllm_config.speculative_config),
         "scheduler_cls": sched.scheduler_cls,
+        "pp_chunk_attn_fit": envs.TPU_PP_CHUNK_ATTN_FIT,
         "max_num_seqs": sched.max_num_seqs,
         "max_num_batched_tokens": sched.max_num_batched_tokens,
         "stream_interval": sched.stream_interval,

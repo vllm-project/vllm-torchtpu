@@ -41,15 +41,31 @@ _CONFIG_FIELDS = frozenset({"num_spec_tokens_to_schedule"})
 # dataclass of request dicts, truthy even when every dict is empty), and the
 # steps with tokens in flight poll the connector's finished transfers too.
 _CONNECTOR_META_FIELDS = frozenset({"kv_connector_metadata"})
+# vLLM's MultiConnector (TPUMultiConnector, the serving prefill's disagg +
+# offloading pair) wraps its children's metadata in a dataclass whose
+# ``metadata`` field is a tuple of them: a non-empty tuple, so truthy even when
+# every child is empty. Without looking inside it, every empty serving step
+# read as stateful and P1b never dropped one (E3, PREFILL Phase 0 Z2).
+_CHILD_METADATA_FIELD = "metadata"
 
 
 def _empty_metadata(value: Any) -> bool:
-    """A dataclass connector metadata whose every field is empty."""
+    """A dataclass connector metadata whose every field is empty; the tuple of
+    children a MultiConnector's metadata holds is empty when every child is
+    (a child of None counts as empty)."""
     import dataclasses
 
-    return dataclasses.is_dataclass(value) and not any(
-        getattr(value, field.name) for field in dataclasses.fields(value)
-    )
+    if not dataclasses.is_dataclass(value):
+        return False
+    for field in dataclasses.fields(value):
+        item = getattr(value, field.name)
+        if field.name == _CHILD_METADATA_FIELD and isinstance(item, tuple):
+            if all(child is None or _empty_metadata(child) for child in item):
+                continue
+            return False
+        if item:
+            return False
+    return True
 # sha256[:16] of the vLLM step this one re-implements (vLLM 0.31.0, both the
 # PCP shadow image and the R12p image); any other source keeps vLLM's step.
 _VLLM_STEP_SHA = "65c2c7342d075e70"

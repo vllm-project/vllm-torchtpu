@@ -854,6 +854,7 @@ def profile_and_install_cost_model(scheduler: Any, executor: Any) -> None:
         granularity,
         # Each worker reports its kernel schedule as (pairs, bq, bkv).
         cast(tuple[int, int, int], min(schedules)) if schedules else None,
+        attn_fit=envs.TPU_PP_CHUNK_ATTN_FIT,
     )
     scheduler.install_cost_model(model)
 

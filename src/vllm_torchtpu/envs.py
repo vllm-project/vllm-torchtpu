@@ -149,6 +149,7 @@ if TYPE_CHECKING:
     TPU_TOKEN_BUCKET_LINEAR: bool = False
     TPU_PP_DYNAMIC_CHUNKS: bool = True
     TPU_PP_CHUNK_SLACK: float = 0.1
+    TPU_PP_CHUNK_ATTN_FIT: str = "max"
     TPU_PP_LAZY_PUSH: bool = False
     TPU_PP_EXTRA_STEPS_IN_FLIGHT: int = 0
     TPU_PREFILL_ONLY_STATIC_GUARDS: bool = False
@@ -320,6 +321,8 @@ if TYPE_CHECKING:
     VLLM_TPU_QWEN35_MK_WIDE_MB: int = 0
     VLLM_TPU_QWEN35_MK_WIDE_MIN_ROWS: int = 160
     VLLM_TPU_QWEN35_MK_DCP_KV_HEADROOM: bool = False
+    TPU_RPA_CACHE_ONLY_COLMASK: str = ""
+    TPU_RPA_CACHE_ONLY_COLMASK_MUT: bool = False
     TPU_RAIDEN_PP_MAX_CPU_BYTES: int | None = None
 
 
@@ -1245,6 +1248,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Fraction above the time of a full prefix-free step that a step may
     # take before its chunks are shortened.
     "TPU_PP_CHUNK_SLACK": lambda: float(os.getenv("TPU_PP_CHUNK_SLACK", "0.1")),
+    # How the step cost model combines the per-rank attention slopes it
+    # profiles: "max" (default) or "median". The slopes come from step time
+    # differences of a millisecond or two, so the max swings with noise and
+    # with it the prefix at which a full step is shortened.
+    "TPU_PP_CHUNK_ATTN_FIT": lambda: os.getenv("TPU_PP_CHUNK_ATTN_FIT", "max")
+    .strip()
+    .lower(),
     # Pipeline parallelism over more than two stages: the engine core pushes
     # the pipeline only when stage 0 would otherwise idle and drops empty
     # steps, so requests share the pipeline (core/pp_lazy_step.py).
@@ -1851,6 +1861,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_QWEN35_MK_WIDE_MIN_ROWS": env_nonnegative_int("VLLM_TPU_QWEN35_MK_WIDE_MIN_ROWS", 160),
     # Qwen3.5-397B with the megakernel under DCP > 1 and more than 16
     # sequences: size the auto KV budget with the DCP 1 headroom (1 GiB less
+    # ATT K1 (prefill_81k_plan s3 K1): column-only mask in the CACHE_ONLY masked body of the batched RPA kernel
+    # (kernel.py cache_only_colmask_mode). "" / "0" off; "1" one compare over the full iota; "b" lane iota +
+    # broadcast. Read at trace time; it changes the Mosaic body, so the compiled program differs when set.
+    "TPU_RPA_CACHE_ONLY_COLMASK": env_str("TPU_RPA_CACHE_ONLY_COLMASK", ""),
+    # Test only: TPU_RPA_CACHE_ONLY_COLMASK admits one key too many (outputs must change). Default off.
+    "TPU_RPA_CACHE_ONLY_COLMASK_MUT": env_bool("TPU_RPA_CACHE_ONLY_COLMASK_MUT", default=False),
     # KV than the DCP > 1 budget) for the program-load scratch of wide steps.
     "VLLM_TPU_QWEN35_MK_DCP_KV_HEADROOM": env_bool(
         "VLLM_TPU_QWEN35_MK_DCP_KV_HEADROOM", default=False

@@ -265,3 +265,71 @@ def test_grace_rejects_garbage(monkeypatch):
     monkeypatch.setenv("TPU_PP_EMPTY_STEP_GRACE_MS", "soon")
     with pytest.raises(ValueError):
         pp_ring_step.grace_ms()
+
+
+# E3 (PREFILL Phase 0 Z2): the serving prefill's TPUMultiConnector wraps its
+# children's metadata in vLLM's MultiKVConnectorMetadata, a tuple that is
+# truthy even when every child is empty, so P1b kept every empty serving step.
+
+
+def _multi(*children, extra=None):
+    from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
+        MultiKVConnectorMetadata,
+    )
+
+    return MultiKVConnectorMetadata(metadata=tuple(children), extra_async_saves=extra)
+
+
+def _raiden(**kw):
+    from vllm_torchtpu.offload.raiden_connector import RaidenOffloadingConnectorMetadata
+
+    return RaidenOffloadingConnectorMetadata(load_jobs={}, store_jobs={}, **kw)
+
+
+def _tpu(**kw):
+    from vllm_torchtpu.distributed.kv_transfer.connector_metadata import TPUConnectorMetadata
+
+    return TPUConnectorMetadata(**kw)
+
+
+def _second_step(meta):
+    core = _core([_real("s0"), _Out(kv_connector_metadata=meta)])
+    st, clock = _stepper(core)
+    assert st.step() == (None, True)
+    st.last_arrival = clock() - 10.0
+    return core, st, st.step()
+
+
+def test_empty_multi_connector_metadata_leaves_an_empty_step_stateless():
+    core, st, (out, _) = _second_step(_multi(_tpu(), _raiden()))
+    assert out == {0: "s0"} and core.model_executor.dispatched == ["s0"]
+    assert st.dropped == 1 and st.kept == 0
+
+
+def test_multi_connector_metadata_with_a_none_child_is_empty():
+    core, st, _ = _second_step(_multi(_tpu(), None))
+    assert st.dropped == 1 and st.kept == 0
+
+
+@pytest.mark.parametrize(
+    "child",
+    [
+        lambda: _raiden(fence_job_ids={3}),
+        lambda: _raiden(finished_load_jobs={4: "r"}),
+        lambda: _tpu(reqs_to_release={"r": 7}),
+    ],
+)
+def test_multi_connector_metadata_with_child_work_keeps_the_empty_step(child):
+    core, st, step = _second_step(_multi(_tpu(), _raiden(), child()))
+    assert step == (None, False)
+    assert core.model_executor.dispatched == ["s0", "empty"] and st.kept == 1
+
+
+def test_multi_connector_extra_async_saves_keep_the_empty_step():
+    core, st, step = _second_step(_multi(_tpu(), _raiden(), extra={"offload": 1}))
+    assert step == (None, False) and st.kept == 1
+
+
+def test_metadata_that_is_not_a_dataclass_still_counts_as_state():
+    core, st, step = _second_step(SimpleNamespace(metadata=()))
+    assert step == (None, False) and st.kept == 1

@@ -135,6 +135,11 @@ class StepCostModel:
     granularity: int
     # (pairs, bq, bkv) the attention kernel schedules per step, or None.
     schedule: tuple[int, int, int] | None = None
+    # How the per-rank attention slopes were combined (TPU_PP_CHUNK_ATTN_FIT):
+    # "max" (the default) or "median"; rank_attn keeps the per-rank slopes
+    # of a median fit for the log line.
+    attn_fit: str = "max"
+    rank_attn: tuple[float, ...] = ()
 
     @classmethod
     def fit(
@@ -143,12 +148,20 @@ class StepCostModel:
         slack: float,
         granularity: int,
         schedule: tuple[int, int, int] | None = None,
+        attn_fit: str = "max",
     ) -> "StepCostModel":
         """``stage_samples`` holds one list of (tokens, prefix, ms) per
         stage. Every stage yields a ladder and a slope; the model keeps the
-        slowest ladder entry per bucket and the largest slope."""
+        slowest ladder entry per bucket and the largest slope, or with
+        ``attn_fit="median"`` the median slope. Each slope comes from step
+        time differences of a millisecond or two, so the largest of eight is
+        mostly noise; the median does not swing the step clip with it."""
         if slack < 0:
             raise ValueError(f"the chunk slack must not be negative: {slack}")
+        if attn_fit not in ("max", "median"):
+            raise ValueError(
+                f"TPU_PP_CHUNK_ATTN_FIT must be 'max' or 'median': {attn_fit!r}"
+            )
         if not stage_samples:
             raise ValueError("no stage reported step timings")
         ladders: list[dict[int, float]] = []
@@ -184,11 +197,18 @@ class StepCostModel:
                 + ", ".join(str(sorted(ladder)) for ladder in ladders)
             )
         linear = {b: max(ladder[b] for ladder in ladders) for b in buckets}
-        attn = max(slopes)
+        attn = max(slopes) if attn_fit == "max" else median(slopes)
         top = buckets[-1]
         full_step = linear[top] + attn * top * top / 2
         return cls(
-            buckets, linear, attn, full_step * (1.0 + slack), int(granularity), schedule
+            buckets,
+            linear,
+            attn,
+            full_step * (1.0 + slack),
+            int(granularity),
+            schedule,
+            attn_fit=attn_fit,
+            rank_attn=() if attn_fit == "max" else tuple(slopes),
         )
 
     def pairs(self, chunk: int, prefix: int) -> int:
@@ -289,4 +309,10 @@ class StepCostModel:
         if self.schedule is not None:
             pairs, bq, bkv = self.schedule
             text += f", at most {pairs} attention pairs ({bq}x{bkv}) per step"
+        if self.attn_fit != "max":
+            ranks = " ".join(f"{a:.3e}" for a in self.rank_attn)
+            text += (
+                f", attention fit {self.attn_fit} of {len(self.rank_attn)} ranks "
+                f"(max {max(self.rank_attn, default=0.0):.3e}; per rank {ranks})"
+            )
         return text

@@ -213,6 +213,7 @@ _TPU_COMPILE_ENV_IGNORED = {
     # are keyed by shape inside the same cache.
     "TPU_PP_DYNAMIC_CHUNKS",
     "TPU_PP_CHUNK_SLACK",
+    "TPU_PP_CHUNK_ATTN_FIT",  # INT 11-06 (E2 bundle): chunk-boundary only, same class as TPU_PP_CHUNK_SLACK; keeps base17's compile hash
     "TPU_TOKEN_BUCKET_HALF_STEPS",
     # Engine-side timing of the pipeline pushes; the workers' programs are
     # the same either way.
