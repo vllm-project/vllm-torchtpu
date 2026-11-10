@@ -1577,7 +1577,11 @@ class RaidenOffloadingManager(OffloadingManager):
         # transition (cleanup, finished-job report).
         self._admissions.pop(admission.job_id, None)
         for sub_hash in admission.sub_hashes:
-            self._hash_to_admission.pop(sub_hash, None)
+            # Only this admission's own entries: a concurrent job on the same
+            # sub-hash (another request's load the store refused this one for)
+            # still needs its mapping, or its completions are dropped.
+            if self._hash_to_admission.get(sub_hash) is admission:
+                del self._hash_to_admission[sub_hash]
         success = not (admission.failed or admission.poisoned)
         self._tel_account(admission, success)
         # Give back only what the job still holds. A transfer that landed
