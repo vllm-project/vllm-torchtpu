@@ -273,23 +273,28 @@ def test_dcp_scopes_match_reference(monkeypatch, seqs, scope, cp):
         _check_writeback(cache, inputs, logical, seqs, page_table)
 
 
+# Explicit tiles keep bq_sz=1024. With bkv_sz=2048 a two-lane MIXED step needs
+# 68-80 MiB of VMEM (fp8 / bf16 KV), more than TPU7x's 64 MiB, so those cases
+# run one lane: still a KV block wider than the q block.
 @pytest.mark.parametrize(
-    "seqs, bkv, bq_c",
+    "seqs, bkv, bq_c, batch",
     [
-        (_SHORT, None, None),
-        (_LONG, None, None),
-        (_SHORT, 2048, 64),
-        (_SHORT, 1024, 128),
-        (_LONG, 2048, 128),
+        (_SHORT, None, None, None),
+        (_LONG, None, None, None),
+        (_SHORT, 2048, 64, 1),
+        (_SHORT, 1024, 128, 2),
+        (_LONG, 2048, 128, 1),
     ],
 )
 @pytest.mark.parametrize("kv_dtype", [jnp.float8_e4m3fn, jnp.bfloat16])
-def test_vpu_diet_bit_exact(monkeypatch, kv_dtype, seqs, bkv, bq_c):
+def test_vpu_diet_bit_exact(monkeypatch, kv_dtype, seqs, bkv, bq_c, batch):
     inputs, logical, _ = _setup(kv_dtype, seqs, seed=1)
     total = int(inputs["cu_q_lens"][-1])
     blocks = None
     if bkv is not None:
-        blocks = configs.BlockSizes(bq_sz=1024, bq_c_sz=bq_c, bkv_sz=bkv, batch_size=2)
+        blocks = configs.BlockSizes(
+            bq_sz=1024, bq_c_sz=bq_c, bkv_sz=bkv, batch_size=batch
+        )
     old, old_cache = _run(monkeypatch, inputs, diet=False, prefill_blocks=blocks)
     new, new_cache = _run(monkeypatch, inputs, diet=True, prefill_blocks=blocks)
     np.testing.assert_array_equal(new[:total], old[:total])
