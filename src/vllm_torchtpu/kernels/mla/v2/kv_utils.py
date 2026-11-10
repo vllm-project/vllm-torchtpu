@@ -15,10 +15,14 @@
 
 import math
 
-import jax
 import jax.numpy as jnp
 from jax import lax
 from jax.experimental.pallas import tpu as pltpu
+
+from vllm_torchtpu.kernels.pallas_util import (
+    get_dtype_bitwidth,
+    get_dtype_packing,
+)
 
 
 def unsigned_mod(a, b):
@@ -52,20 +56,6 @@ def unsigned_align_to(a, b):
         return (a + b - 1) & (-int(b))
 
     return unsigned_cdiv(a, b) * b
-
-
-# Need to explicitly multiply with 128 to avoid TPU compile error. (async_copy)
-def align_to(a, b):
-    return ((a + b - 1) // b) * b
-
-
-def get_dtype_bitwidth(dtype):
-    return jax.dtypes.itemsize_bits(dtype)
-
-
-def get_dtype_packing(dtype):
-    bits = get_dtype_bitwidth(dtype)
-    return 32 // bits
 
 
 def pack_new_kv(

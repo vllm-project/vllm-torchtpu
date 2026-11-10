@@ -15,7 +15,7 @@
 
 import jax.numpy as jnp
 
-from vllm_torchtpu.kernels.ragged_paged_attention.v3.util import (
+from vllm_torchtpu.kernels.pallas_util import (
     align_to,
     get_dtype_packing,
     get_tpu_version,

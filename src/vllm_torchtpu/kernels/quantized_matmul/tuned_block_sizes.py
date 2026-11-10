@@ -13,11 +13,9 @@
 # limitations under the License.
 """Tuned block sizes for quantized matmul kernel."""
 
-import re
 from typing import NamedTuple
 
-import jax
-
+from vllm_torchtpu.kernels.pallas_util import get_tpu_version
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -549,15 +547,6 @@ def get_device_vmem_limit() -> int:
         )
         return 96 * 1024 * 1024
     return DEVICE_VMEM_LIMIT[tpu_version]
-
-
-def get_tpu_version() -> int:
-    """Returns the numeric version of the TPU, or -1 if not on TPU."""
-    kind = jax.devices()[0].device_kind
-    match = re.match(r"^TPU[^\d]*(\d+)", kind)
-    if match is None:
-        return -1
-    return int(match.group(1))
 
 
 def get_key(

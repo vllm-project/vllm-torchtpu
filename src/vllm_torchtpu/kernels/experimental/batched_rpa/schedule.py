@@ -24,6 +24,7 @@ import numpy as np
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels import pallas_util
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs, utils
 
 
@@ -372,7 +373,7 @@ def _write_schedule_to_hbm(
         element_size = s.shape[0] // cfgs.max_steps_ub
         if h.shape[0] > 1:
             write_size = num_steps * element_size
-            write_size = utils.align_to(write_size, 128)
+            write_size = pallas_util.pl_align_to(write_size, 128)
             output_offset = hbm_offset_aligned * element_size
         else:
             write_size = h.shape[0]
@@ -476,7 +477,7 @@ def flush_to_hbm(
     *,
     cfgs: configs.RpaConfigs,
 ):
-    last_step = utils.align_to(count, cfgs.batch_size)
+    last_step = pallas_util.pl_align_to(count, cfgs.batch_size)
 
     @pl.loop(count, last_step)
     @jax.named_scope("mask_out_steps")
@@ -635,7 +636,7 @@ class BaseMetadataComputer:
 
             schedule.dma_kv_cache[step, target_lane, i, 0] = src_hbm
             schedule.dma_kv_cache[step, target_lane, i, 1] = dst_vmem
-            schedule.dma_kv_cache[step, target_lane, i, 2] = utils.align_to(
+            schedule.dma_kv_cache[step, target_lane, i, 2] = pallas_util.pl_align_to(
                 dma_sz, cfgs.kv_token_align
             )
 
@@ -660,7 +661,9 @@ class BaseMetadataComputer:
                 if i == 0:
                     src, _, fetch_val = utils.align_span(src_hbm, new_sz, align)
                     dma_entry.fetch_hbm[...] = src
-                    dma_entry.fetch_vmem[...] = utils.align_to(bkv_sz_cache, align)
+                    dma_entry.fetch_vmem[...] = pallas_util.pl_align_to(
+                        bkv_sz_cache, align
+                    )
                     fetch_val = jnp.where(new_sz > 0, fetch_val, 0)
                 else:
                     fetch_val = 0

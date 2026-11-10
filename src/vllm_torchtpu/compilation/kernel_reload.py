@@ -50,6 +50,7 @@ logger = init_logger(__name__)
 # earlier ones). Overridable via TPU_KERNEL_RELOAD_MODULES or per reload
 # request.
 _DEFAULT_RELOAD_MODULES = (
+    "vllm_torchtpu.kernels.pallas_util",
     "vllm_torchtpu.kernels.experimental.batched_rpa.utils",
     "vllm_torchtpu.kernels.experimental.batched_rpa.kernel",
     "vllm_torchtpu.kernels.experimental.batched_rpa.wrapper",

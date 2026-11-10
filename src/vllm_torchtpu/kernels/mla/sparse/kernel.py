@@ -25,6 +25,11 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.mla import kv_cache_utils
 from vllm_torchtpu.kernels.mla.sparse import dsa_gather, native_sc_gather
+from vllm_torchtpu.kernels.pallas_util import (
+    align_to,
+    cdiv,
+    get_dtype_packing,
+)
 
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 TENSORCORE_CACHE_LAYOUT = "tensorcore"
@@ -33,24 +38,6 @@ DEFAULT_GATHER_AND_ATTENTION_CHUNK_SIZE = 64
 DEFAULT_ATTENTION_KERNEL_BATCH_SIZE = 16
 # The native SparseCore gather's unit, which `topk_cap` must be a multiple of.
 GATHER_ATOM_ROWS = native_sc_gather.OCCURRENCES_PER_ATOM
-
-
-def cdiv(a, b):
-    assert b != 0
-    return (a + b - 1) // b
-
-
-def align_to(x, a):
-    return cdiv(x, a) * a
-
-
-def get_dtype_bitwidth(dtype):
-    return jax.dtypes.itemsize_bits(dtype)
-
-
-def get_dtype_packing(dtype):
-    bits = get_dtype_bitwidth(dtype)
-    return 32 // bits
 
 
 def _largest_divisor(x: int, cap: int) -> int:

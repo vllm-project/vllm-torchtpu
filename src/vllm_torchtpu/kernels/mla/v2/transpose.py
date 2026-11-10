@@ -20,7 +20,7 @@ import jax.experimental.pallas.tpu as pltpu
 import jax.numpy as jnp
 from sympy import divisors
 
-from vllm_torchtpu.kernels.ragged_paged_attention.v3.util import get_dtype_packing
+from vllm_torchtpu.kernels.pallas_util import get_dtype_packing
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)

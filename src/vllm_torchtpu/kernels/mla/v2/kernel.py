@@ -28,6 +28,12 @@ from jax.experimental.pallas import tpu as pltpu
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.kernels.mla.v2 import kv_utils
 from vllm_torchtpu.kernels.mla.v2.transpose import xpose_pipeline
+from vllm_torchtpu.kernels.pallas_util import (
+    align_to,
+    async_copy,
+    broadcast_minor,
+    get_dtype_packing,
+)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -66,20 +72,6 @@ def unsigned_align_to(a, b):
         return (a + b - 1) & (-int(b))
 
     return unsigned_cdiv(a, b) * b
-
-
-# Need to explicitly multiply with 128 to avoid TPU compile error. (async_copy)
-def align_to(a, b):
-    return ((a + b - 1) // b) * b
-
-
-def get_dtype_bitwidth(dtype):
-    return jax.dtypes.itemsize_bits(dtype)
-
-
-def get_dtype_packing(dtype) -> int:
-    bits = get_dtype_bitwidth(dtype)
-    return 32 // bits
 
 
 def get_kv_cache_shape(
@@ -737,14 +729,7 @@ def _mla_ragged_paged_attention_kernel(
         head_acc_ref[...] = o_curr
 
     def _async_copy(src, dst, sem, wait):
-        if debug_mode:
-            # Skip DMA if debug mode is enabled.
-            return
-        cp = pltpu.make_async_copy(src, dst, sem)
-        if wait:
-            cp.wait()
-        else:
-            cp.start()
+        async_copy(src, dst, sem, wait, debug_mode=debug_mode)
 
     def _fetch_transposed_bkv(batch_start_seq_idx, bkv_idx, bkv_sem_idx, *, wait=False):
         if not wait:
@@ -1805,17 +1790,6 @@ def _mla_ragged_paged_attention_kernel(
             bkvc_vecs.append(bkvc_vec)
             bkpe_vecs.append(bkpe_vec)
         return jnp.stack(bkvc_vecs), jnp.stack(bkpe_vecs)
-
-    def broadcast_minor(src, shape):
-        if src.shape == shape:
-            return src
-        assert src.shape[:-1] == shape[:-1]
-        assert src.shape[-1] % 128 == 0
-        target_minor = unsigned_align_to(shape[-1], src.shape[-1])
-        # no-op concatenation.
-        return jnp.concatenate(
-            [src for _ in range(target_minor // src.shape[-1])], axis=-1
-        )[..., : shape[-1]]
 
     kv_len_max = kv_lens_ref[batch_start_seq_idx]
     for b in range(1, batch_size):
