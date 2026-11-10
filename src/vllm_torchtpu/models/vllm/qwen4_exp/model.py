@@ -22,13 +22,19 @@ import torch
 from torch import nn
 from vllm.compilation.backends import set_model_tag
 from vllm.compilation.decorators import support_torch_compile
-from vllm.distributed import get_dp_group, get_ep_group, get_tp_group
+from vllm.distributed import (
+    get_dp_group,
+    get_ep_group,
+    get_tp_group,
+    tensor_model_parallel_all_reduce,
+)
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.mamba_utils import MambaStateCopyFuncsByType
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
+    get_masked_input_and_mask,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import (
@@ -59,7 +65,7 @@ from .gdn import Qwen4ExpGatedDeltaNetAttention
 from .hyperconnection import GatedResidual, HyperConnectionConfig
 from .parallel import PLEParallel
 from .pd_identity import LoadedWeightIdentity
-from .ple import PLEInputs
+from .ple import PLEInputs, merged_embed_all_reduce
 from .ple_geometry import ple_state_shape
 from .ple_host import shared_ple_options
 from .ple_storage import SharedPLEOptions
@@ -417,8 +423,12 @@ class Qwen4ExpDecoderLayer(nn.Module):
         ple_raw_embeddings=None,
         sequence_parallel=False,
         sp_pad=0,
+        ple_combined_raw=None,
     ):
         """``hidden`` plus this layer's per-layer embedding (unchanged without PLE).
+
+        ``ple_combined_raw``: this layer's raw n-gram rows already combined across
+        ranks (``Qwen4ExpBackbone._merged_head_embed``).
 
         ``sequence_parallel``: ``hidden`` is this TP rank's token shard, padded
         to a multiple of ``sp_pad`` rows when that is set (see ``pad_shard``).
@@ -455,6 +465,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
             speculative,
             sequence_parallel=sequence_parallel,
             prefill_ckpt=prefill_ckpt,
+            combined_raw=ple_combined_raw,
         )
         return hidden + sp.pad_shard(addend, sp_pad)
 
@@ -742,6 +753,54 @@ class Qwen4ExpBackbone(nn.Module):
             PLEInputs(input_ids, query_start_loc, ngram_context), query_start_loc[-1:]
         )
 
+    def _merged_head_embed(self, input_ids, ids64, query_start_loc, ngram_context, groups):
+        """VLLM_TPU_MK_PLE_TRIM: the token embedding and the resident PLE raw rows of
+        the head groups ``groups`` (lists of layer ids) reduced by ONE all-reduce
+        (``merged_embed_all_reduce``); ``(embedding, {layer: combined raw})``, or
+        None where the layout does not allow it (the separate collectives then run).
+        """
+        emb = self.embed_tokens
+        if (
+            not envs.VLLM_TPU_MK_PLE_TRIM
+            or emb.tp_size == 1
+            or not emb.reduce_results
+            or emb.parallel_group is not None
+            or emb.use_fused_embedding
+            or emb.weight.dtype != torch.bfloat16
+            # Measured (v7x, 8 ranks): one merged all-reduce wins at 4 rows
+            # (19 -> 11 us) and loses from 16 rows on (36 -> 45 us).
+            or input_ids.shape[0] > 8
+        ):
+            return None
+        layers = cast(Sequence[Qwen4ExpDecoderLayer], self.layers)
+        tp = get_tp_group()
+        ples = [
+            (group[0], layers[group[0]].ple)
+            for group in groups
+            if layers[group[0]].ple is not None
+        ]
+        if not ples or any(
+            p.cpu_offload or p.parallel.across_dp or p.parallel.group is not tp
+            for _, p in ples
+        ):
+            return None
+        masked, mask = get_masked_input_and_mask(
+            input_ids,
+            emb.shard_indices.org_vocab_start_index,
+            emb.shard_indices.org_vocab_end_index,
+            emb.shard_indices.num_org_vocab_padding,
+            emb.shard_indices.added_vocab_start_index,
+            emb.shard_indices.added_vocab_end_index,
+        )
+        part = emb.quant_method.embedding(emb, masked.long())
+        part = part.masked_fill(mask.unsqueeze(-1), 0)
+        inputs = PLEInputs(ids64, query_start_loc, ngram_context)
+        raws = [p.lookup_partial(inputs, query_start_loc[-1:]) for _, p in ples]
+        embedding, combined = merged_embed_all_reduce(
+            part, raws, tensor_model_parallel_all_reduce
+        )
+        return embedding, {i: raw for (i, _), raw in zip(ples, combined, strict=True)}
+
     def forward_segments(
         self,
         input_ids,
@@ -769,16 +828,26 @@ class Qwen4ExpBackbone(nn.Module):
         ple_raw = self._megakernel_host_ple(input_ids, query_start_loc, ngram_context)
         positions64 = positions.to(torch.int64)
         ids64 = input_ids.to(torch.int64)
-        hidden = self.embed_tokens(input_ids).repeat(1, self.hc_count)
+        head_groups = getattr(segment_call, "head_groups", None)
+        head_set = getattr(segment_call, "mk_head_set", None)
+        merged = (
+            self._merged_head_embed(
+                input_ids, ids64, query_start_loc, ngram_context,
+                [g for h, g in enumerate(head_groups) if head_set is None or h in head_set],
+            )
+            if head_groups
+            else None
+        )
+        combined = {} if merged is None else merged[1]
+        embedding = self.embed_tokens(input_ids) if merged is None else merged[0]
+        hidden = embedding.repeat(1, self.hc_count)
         layers = cast(Sequence[Qwen4ExpDecoderLayer], self.layers)
         qsa_layers = [
             i for i, layer in enumerate(layers) if layer.layer_type == "full_attention"
         ]
-        head_groups = getattr(segment_call, "head_groups", None)
         if head_groups:
             # Layers before the first QSA layer: one kernel call per group, the
             # per-layer embedding added before the group that starts at its layer.
-            head_set = getattr(segment_call, "mk_head_set", None)
             for h, group in enumerate(head_groups):
                 if head_set is not None and h not in head_set:
                     for stock in layers[group[0] : group[-1] + 1]:
@@ -798,6 +867,7 @@ class Qwen4ExpBackbone(nn.Module):
                 hidden = layers[group[0]].apply_ple(
                     hidden, ids64, query_start_loc, ngram_context, state_slots, context_lens,
                     ple_raw if group[0] == self.host_ple_index else None,
+                    ple_combined_raw=combined.get(group[0]),
                 )
                 hidden = segment_call.head(h, hidden)
         else:
@@ -896,12 +966,18 @@ class Qwen4ExpBackbone(nn.Module):
         ple_raw = self._megakernel_host_ple(input_ids, query_start_loc, ngram_context)
         ids64 = input_ids.to(torch.int64)
         positions64 = positions.to(torch.int64)
-        hidden = self.embed_tokens(input_ids).repeat(1, self.hc_count)
+        merged = self._merged_head_embed(
+            input_ids, ids64, query_start_loc, ngram_context, segment_call.head_groups
+        )
+        combined = {} if merged is None else merged[1]
+        embedding = self.embed_tokens(input_ids) if merged is None else merged[0]
+        hidden = embedding.repeat(1, self.hc_count)
         layers = cast(Sequence[Qwen4ExpDecoderLayer], self.layers)
         for h, group in enumerate(segment_call.head_groups):
             hidden = layers[group[0]].apply_ple(
                 hidden, ids64, query_start_loc, ngram_context, state_slots, context_lens,
                 ple_raw if group[0] == self.host_ple_index else None,
+                ple_combined_raw=combined.get(group[0]),
             )
             hidden = segment_call.head(h, hidden)
         hidden = whole(hidden, positions, query_start_loc, context_lens)
