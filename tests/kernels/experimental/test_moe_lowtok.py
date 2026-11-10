@@ -1,5 +1,16 @@
 # Copyright 2026 Google LLC
-# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Parity, routing edge cases and admission for the small-batch MoE kernel.
 
 TPU tests compile the kernel; the interpreted tests run with JAX_PLATFORMS=cpu
@@ -396,9 +407,7 @@ def test_scores_copies_entry_matches_reference_across_ranks(tokens, extra_slots)
             cores[r].append(g)
             order.append(g)
 
-    hot, hprim, hcopy = (
-        np.asarray(t) for t in kernel.hot_tables(prim, copy, order)
-    )
+    hot, hprim, hcopy = (np.asarray(t) for t in kernel.hot_tables(prim, copy, order))
     hot1h = kernel.hot_onehot(hot)
     prim_j = jnp.asarray(prim, jnp.int32)
     copy_j = jnp.asarray(copy, jnp.int32)
@@ -439,4 +448,3 @@ def test_scores_copies_entry_matches_reference_across_ranks(tokens, extra_slots)
     w, ids = _router(scores, topk)
     want = _reference(x, ids, w, w13_all, s13_all, w2_all, s2_all)
     _assert_close(total_out.astype(jnp.bfloat16), want, 2.5e-2)
-
