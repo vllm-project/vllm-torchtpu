@@ -569,6 +569,7 @@ def _manager_block(pool, mgr):
     return np.asarray(pool[mgr * BENCH_SPLIT : (mgr + 1) * BENCH_SPLIT])
 
 
+@pytest.mark.tpu_test
 class TestProductionShapePrefillCheckpoint:
     """Checkpoint contents at production geometry.
 

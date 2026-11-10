@@ -487,10 +487,6 @@ def fused_conv1d_gdn(
             f"state; got conv={conv_dtype} recurrent={recurrent_dtype}."
         )
 
-    qkv = qkv.astype(kernel_act_dtype)
-    b = b.astype(kernel_act_dtype)
-    a = a.astype(kernel_act_dtype)
-
     # Step 1: Validate inputs.
     is_kda = attention_mode == config.AttentionMode.KDA
     if gate_lower_bound is not None:
