@@ -58,6 +58,12 @@ _FP8 = jnp.float8_e4m3fn
 _FP8_MAX = 448.0
 
 
+def _dot(a, b):
+    return jax.lax.dot_general(
+        a, b, (((1,), (0,)), ((), ())), preferred_element_type=jnp.float32
+    )
+
+
 def can_use_moe_lowtok(hidden, w1, w2, s1, s2, b1, b2, *, activation, rhs_quant_dtype):
     """Check arithmetic and layout support, rows included (at most
     MOE_LOWTOK_MAX_TOKENS). The chip is not checked: the kernel computes with
@@ -249,23 +255,13 @@ def _stream(
 
         @pl.when(part == 0)
         def _gate_half():
-            h = jax.lax.dot_general(
-                x_q,
-                w13_buf[0],
-                (((1,), (0,)), ((), ())),
-                preferred_element_type=jnp.float32,
-            )
+            h = _dot(x_q, w13_buf[0])
             gate = h * x_s * s13_buf[0]
             h_acc[...] = gate * jax.nn.sigmoid(gate)
 
         @pl.when(part == 1)
         def _up_half():
-            h = jax.lax.dot_general(
-                x_q,
-                w13_buf[1],
-                (((1,), (0,)), ((), ())),
-                preferred_element_type=jnp.float32,
-            )
+            h = _dot(x_q, w13_buf[1])
             up = h * x_s * s13_buf[1]
             h_acc[...] = h_acc[...] * up
 
@@ -282,12 +278,7 @@ def _stream(
                 keepdims=True,
             )
             row_scale = a_s * w
-            o = jax.lax.dot_general(
-                a_q,
-                w2_buf[0],
-                (((1,), (0,)), ((), ())),
-                preferred_element_type=jnp.float32,
-            )
+            o = _dot(a_q, w2_buf[0])
             acc[...] += (o * s2_buf[0]) * row_scale
 
         return advance(e_idx, part, 1)
