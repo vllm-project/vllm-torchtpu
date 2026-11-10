@@ -1467,18 +1467,31 @@ class TPUModelRunner(GPUModelRunner):
         self._greedy_head_owner: torch.nn.Module | None = None
 
         self._init_phased_profiling()
-        # TPU_RUNNER_STAGE_TIMING_MODE: auto (default: on whenever the KV connector has a
-        # TpuKVConnectorStats sink), on, or off. The timings feed KV-transfer telemetry only.
-        _st_mode = os.environ.get("TPU_RUNNER_STAGE_TIMING_MODE", "auto").strip().lower()
-        if _st_mode in ("on", "1", "true"):
-            _st_enabled = True
-        elif _st_mode in ("off", "0", "false"):
-            _st_enabled = False
-        else:
-            _st_enabled = self._kv_transfer_uses_stage_timing(self.vllm_config)
+        _st_enabled, _st_mode = self._stage_timing_enabled(
+            self._kv_transfer_uses_stage_timing(self.vllm_config)
+        )
         logger.info("Runner stage timing: %s (TPU_RUNNER_STAGE_TIMING_MODE=%s)",
                     "on" if _st_enabled else "off", _st_mode)
         self._stage_timing = RunnerStageTiming(profiler_rank, enabled=_st_enabled)
+
+    @staticmethod
+    def _stage_timing_enabled(kv_uses_stage_timing: bool) -> tuple[bool, str]:
+        """(enabled, mode) for the KV-transfer stage timings.
+
+        TPU_RUNNER_STAGE_TIMING_MODE: auto (default), on, or off. The timings feed
+        KV-transfer telemetry only. Under auto they are off (R5, D-mid): their
+        per-stage TpuEvent records and collector thread cost ~0.4-0.5 ms per served
+        decode step at B 1-2 (P/D cap 2: chunk median 3.99 -> 3.56 ms, j-d4cdaa23 vs
+        j-a0ce6156). TPU_RUNNER_STAGE_TIMING=1 restores the previous auto behaviour:
+        on whenever the KV connector has a TpuKVConnectorStats sink.
+        """
+        mode = os.environ.get("TPU_RUNNER_STAGE_TIMING_MODE", "auto").strip().lower()
+        if mode in ("on", "1", "true"):
+            return True, mode
+        if mode in ("off", "0", "false"):
+            return False, mode
+        legacy = os.environ.get("TPU_RUNNER_STAGE_TIMING", "0").strip().lower()
+        return kv_uses_stage_timing and legacy in ("1", "true"), mode
 
     @staticmethod
     def _kv_transfer_uses_stage_timing(vllm_config: Any) -> bool:
