@@ -300,7 +300,7 @@ def test_token_cap_dispatch(m, enabled, use_ep, selected, monkeypatch):
     def standard_selected(*args, **kwargs):
         raise StandardSelected
 
-    monkeypatch.setattr(wrapper, "_MOE_LOWTOK", enabled)
+    monkeypatch.setattr(wrapper, "_MOE_LOWTOK_MAX_TOKENS", 128 if enabled else 0)
     monkeypatch.setattr(wrapper, "moe_lowtok", lowtok_selected)
     monkeypatch.setattr(wrapper, "prepare_routed_gmm_inputs", standard_selected)
     wrapper.fused_moe_func.clear_cache()
@@ -360,10 +360,10 @@ def test_fused_moe_func_selects_kernel_and_matches_oracle(monkeypatch, m):
     args = (x, w13, w2, s13, s2, None, None, weights, ids)
     kwargs = dict(experts_start=jnp.array(start, jnp.int32), topk=topk, use_ep=True)
     want = _oracle(x, ids, weights, w13, s13, w2, s2, start)
-    monkeypatch.setattr(wrapper, "_MOE_LOWTOK", False)
+    monkeypatch.setattr(wrapper, "_MOE_LOWTOK_MAX_TOKENS", 0)
     wrapper.fused_moe_func.clear_cache()
     gmm_err = _rel_l2(wrapper.fused_moe_func(*args, **kwargs), want)
-    monkeypatch.setattr(wrapper, "_MOE_LOWTOK", True)
+    monkeypatch.setattr(wrapper, "_MOE_LOWTOK_MAX_TOKENS", 128)
     wrapper.fused_moe_func.clear_cache()
     try:
         assert "moe_lowtok" in wrapper.fused_moe_func.lower(*args, **kwargs).as_text()
