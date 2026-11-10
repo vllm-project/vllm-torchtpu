@@ -3793,6 +3793,8 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
             device=torch.device("cpu"),
             _dummy_logits=lambda n: torch.zeros((n, 16), dtype=torch.bfloat16),
             _topk_candidate_blocks=lambda: 0,
+            # The packed top-k candidate warmup is off.
+            _greedy_head_owner=None,
             _precompile_timed=lambda _name: contextlib.nullcontext(),
             sample_from_logits_func=fake_sample_from_logits,
             speculative_config=speculative_config,
