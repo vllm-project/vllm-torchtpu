@@ -47,6 +47,8 @@ from vllm_torchtpu.omni.patches import (
     _BWE_FILTER_CPU_RESTORE_PATCHED,
     _D2H_STREAM_PATCHED,
     _QWEN_ENCODER_MASK_CACHE_MAXSIZE,
+    _QWEN_IMAGE_FORWARD_PARAMS,
+    _QWEN_IMAGE_FORWARD_SOURCE_SHA256,
     _QWEN_IMAGE_MASK_ONCE_PATCHED,
     _SDPA_FALLBACK_PATCHED,
     _SPLIT_ROPE_PATCHED,
@@ -802,6 +804,74 @@ def test_qwen_image_mask_once_sp_padding_skips_all(monkeypatch, qwen_mask_once):
     )
     assert all_calls == []
     assert all(enc_m is None and sp_m is None for enc_m, sp_m in seen_masks)
+
+
+def test_qwen_image_mask_once_drift_guard(monkeypatch):
+    import hashlib
+    import inspect
+
+    cls = qwen_image_transformer.QwenImageTransformer2DModel
+    warnings_logged: list[str] = []
+    monkeypatch.setattr(
+        "vllm_torchtpu.omni.patches.logger.warning",
+        lambda msg, *args: warnings_logged.append(msg % args if args else msg),
+    )
+
+    # 1. Upstream forward matches expected signature and source hash.
+    assert (
+        tuple(inspect.signature(_UPSTREAM_QWEN_IMAGE_FORWARD).parameters)
+        == _QWEN_IMAGE_FORWARD_PARAMS
+    )
+    assert (
+        hashlib.sha256(
+            inspect.getsource(_UPSTREAM_QWEN_IMAGE_FORWARD).encode("utf-8")
+        ).hexdigest()
+        == _QWEN_IMAGE_FORWARD_SOURCE_SHA256
+    )
+    monkeypatch.setattr(cls, "forward", _UPSTREAM_QWEN_IMAGE_FORWARD)
+    _patch_qwen_image_mask_once()
+    assert getattr(cls.forward, _QWEN_IMAGE_MASK_ONCE_PATCHED, False)
+    assert warnings_logged == []
+
+    # 2. Signature drift logs a warning and leaves upstream forward in place.
+    def _drifted_sig(self, hidden_states, extra_arg=None):
+        return hidden_states
+
+    monkeypatch.setattr(cls, "forward", _drifted_sig)
+    _patch_qwen_image_mask_once()
+    assert cls.forward is _drifted_sig
+    assert not getattr(cls.forward, _QWEN_IMAGE_MASK_ONCE_PATCHED, False)
+    assert len(warnings_logged) == 1
+    assert "drifted from vllm-omni 0.32.0rc1" in warnings_logged[0]
+
+    # 3. Source hash drift with identical signature logs a warning and leaves
+    # upstream forward in place.
+    warnings_logged.clear()
+
+    def _drifted_body(
+        self,
+        hidden_states,
+        encoder_hidden_states=None,
+        encoder_hidden_states_mask=None,
+        timestep=None,
+        img_shapes=None,
+        txt_seq_lens=None,
+        guidance=None,
+        attention_kwargs=None,
+        additional_t_cond=None,
+        return_dict=True,
+    ):
+        return hidden_states
+
+    assert (
+        tuple(inspect.signature(_drifted_body).parameters) == _QWEN_IMAGE_FORWARD_PARAMS
+    )
+    monkeypatch.setattr(cls, "forward", _drifted_body)
+    _patch_qwen_image_mask_once()
+    assert cls.forward is _drifted_body
+    assert not getattr(cls.forward, _QWEN_IMAGE_MASK_ONCE_PATCHED, False)
+    assert len(warnings_logged) == 1
+    assert "drifted from vllm-omni 0.32.0rc1" in warnings_logged[0]
 
 
 @pytest.mark.parametrize(

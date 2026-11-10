@@ -650,6 +650,22 @@ def _patch_ltx2_split_rope() -> None:
 
 _QWEN_IMAGE_MASK_ONCE_PATCHED = "_tpu_qwen_image_mask_once_patched"
 _QWEN_ENCODER_MASK_CACHE_MAXSIZE = 8
+_QWEN_IMAGE_FORWARD_PARAMS = (
+    "self",
+    "hidden_states",
+    "encoder_hidden_states",
+    "encoder_hidden_states_mask",
+    "timestep",
+    "img_shapes",
+    "txt_seq_lens",
+    "guidance",
+    "attention_kwargs",
+    "additional_t_cond",
+    "return_dict",
+)
+_QWEN_IMAGE_FORWARD_SOURCE_SHA256 = (
+    "43b6ce6ba027f9cf7f1439ebf18f35d97b95f8734df6dd80f5cfa747d1cb4027"
+)
 
 
 def _storage_data_ptr(tensor: torch.Tensor) -> int:
@@ -701,7 +717,10 @@ def _resolve_qwen_encoder_mask(
 def _patch_qwen_image_mask_once() -> None:
     # -------------------------------------------------------------------------
     # TODO: Remove once vLLM-Omni resolves Qwen-Image prompt and SP padding
-    # masks without per-step .all() device-to-host synchronizations.
+    # masks without per-step .all() device-to-host synchronizations (mirrors
+    # QwenImageTransformer2DModel.forward from vllm-omni 0.32.0rc1 across
+    # QwenImagePipeline, QwenImageEditPipeline, QwenImageEditPlusPipeline, and
+    # QwenImageLayeredPipeline).
     #
     # Problem: QwenImageTransformer2DModel.forward evaluates
     #   encoder_hidden_states_mask.all() on every denoising step after queueing
@@ -718,14 +737,46 @@ def _patch_qwen_image_mask_once() -> None:
     #   bounded LRU cache so freed addresses are never falsely matched under
     #   torch.inference_mode()), construct/cache the SP padding mask without
     #   calling .all(), and issue a non-blocking step-entry flush with
-    #   synchronize_tensors(..., wait=False).
+    #   synchronize_tensors(..., wait=False) to keep the step-entry graph
+    #   boundary where the blocking .all() previously cut the lazy graph.
     # -------------------------------------------------------------------------
+    import hashlib
+    import inspect
+
     from vllm_omni.diffusion.models.qwen_image import (
         qwen_image_transformer as qwen_mod,
     )
 
     cls = qwen_mod.QwenImageTransformer2DModel
     if getattr(cls.forward, _QWEN_IMAGE_MASK_ONCE_PATCHED, False):
+        return
+
+    try:
+        params = tuple(inspect.signature(cls.forward).parameters)
+        source_sha256 = hashlib.sha256(
+            inspect.getsource(cls.forward).encode("utf-8")
+        ).hexdigest()
+    except (OSError, TypeError, ValueError) as exc:
+        logger.warning(
+            "Skipping TPU patch _patch_qwen_image_mask_once: could not inspect "
+            "QwenImageTransformer2DModel.forward (%s).",
+            exc,
+        )
+        return
+
+    if (
+        params != _QWEN_IMAGE_FORWARD_PARAMS
+        or source_sha256 != _QWEN_IMAGE_FORWARD_SOURCE_SHA256
+    ):
+        logger.warning(
+            "Skipping TPU patch _patch_qwen_image_mask_once: "
+            "QwenImageTransformer2DModel.forward drifted from vllm-omni "
+            "0.32.0rc1 (params=%s, expected=%s; sha256=%s, expected=%s).",
+            params,
+            _QWEN_IMAGE_FORWARD_PARAMS,
+            source_sha256,
+            _QWEN_IMAGE_FORWARD_SOURCE_SHA256,
+        )
         return
 
     def _forward(
