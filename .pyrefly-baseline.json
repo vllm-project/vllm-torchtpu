@@ -591,6 +591,11 @@
       "concise_description": "Cannot set item in `None`"
     },
     {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/dspark.py",
+      "name": "bad-return",
+      "concise_description": "Returned type `dict[str, tuple[int] | tuple[int, int]]` is not assignable to declared return type `dict[str, tuple[int, ...]]`"
+    },
+    {
       "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/mla_dcp.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `DcpAttention` has no attribute `_attend_chunked`"
