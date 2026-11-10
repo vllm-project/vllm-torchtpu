@@ -1119,6 +1119,16 @@ def _get_msa_dcp_fp4_op(
             )
         if attend_rot_op is None and not _packed_step(q.shape[0]):
             assert attend_merge_op is not None
+            if keys_op is not None and keys_dump is not None:
+                _save_keys(
+                    keys_op,
+                    keys_dump,
+                    keys_dump_meta,
+                    kv_cache,
+                    group.all_gather(candidates.unsqueeze(0), dim=0),
+                    metadata,
+                    dcp_rank,
+                )
             return attend_merge_op(
                 dcp_rank,
                 q,

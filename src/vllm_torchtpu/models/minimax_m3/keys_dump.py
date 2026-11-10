@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Torch entry point for the JAX MSA forward."""
 """Debug only: save the MSA prefill selections of one layer to disk.
 
 With ``--additional-config '{"minimax_msa_dump_keys": <layer>}'`` the DCP MSA
@@ -26,6 +25,7 @@ keys; ``-1`` = not held on this rank).
 
 import logging
 import os
+import time
 from typing import Any
 
 import numpy as np
@@ -38,6 +38,8 @@ STRIDE = int(os.environ.get("MINIMAX_MSA_DUMP_STRIDE", "10"))
 DUMP_RANKS = tuple(
     int(r) for r in os.environ.get("MINIMAX_MSA_DUMP_RANKS", "0,3").replace("/", ",").split(",")
 )
+# Save nothing for the first DELAY_S seconds after warm-up (steady state).
+DELAY_S = float(os.environ.get("MINIMAX_MSA_DUMP_DELAY_S", "0"))
 SMALL_BATCH_TOKENS = 1024  # msa_attention.SMALL_BATCH_TOKENS
 
 # Attention modules holding a keys-dump buffer (registered at init).
@@ -48,6 +50,7 @@ _state = {
     "forwards": 0,
     "prefills": 0,
     "armed": False,
+    "armed_at": 0.0,
     "rank": None,
     "dir": None,
 }
@@ -57,6 +60,7 @@ def arm() -> None:
     """Start saving: called once warm-up is over, so its dummy requests are
     never saved."""
     _state["armed"] = True
+    _state["armed_at"] = time.monotonic()
 
 
 def _rank() -> int:
@@ -84,6 +88,8 @@ def maybe_dump(
 ) -> None:
     """Save the dump buffers after a real (served) forward."""
     if not LAYERS or not _state["armed"]:
+        return
+    if time.monotonic() - _state["armed_at"] < DELAY_S:
         return
     _state["forwards"] += 1
     if _state["dumps"] >= MAX_DUMPS or num_tokens_padded <= SMALL_BATCH_TOKENS:
