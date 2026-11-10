@@ -1,0 +1,52 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""The Qwen3.5 rule for the quantized-matmul quantize arithmetic: the
+reciprocal scale for Qwen3.5, main's arithmetic for every other model."""
+
+from types import SimpleNamespace
+
+import pytest
+
+from vllm_torchtpu.kernels.quantized_matmul import util
+from vllm_torchtpu.models.qwen3_5 import hooks
+
+pytestmark = pytest.mark.cpu_test
+
+
+@pytest.fixture(autouse=True)
+def _mains_default(monkeypatch):
+    monkeypatch.setattr(util, "RECIPROCAL_SCALE", False)
+
+
+def _model(arch):
+    return SimpleNamespace(architectures=[arch])
+
+
+def test_qwen3_5_quantizes_with_the_reciprocal_scale():
+    assert (
+        hooks.apply_kernel_numerics(_model("Qwen3_5MoeForConditionalGeneration"))
+        is None
+    )
+    assert util.RECIPROCAL_SCALE is True
+
+
+@pytest.mark.parametrize("arch", ["DeepseekV3ForCausalLM", "Qwen3MoeForCausalLM"])
+def test_other_models_keep_mains_arithmetic(arch):
+    assert hooks.apply_kernel_numerics(_model(arch)) is None
+    assert util.RECIPROCAL_SCALE is False
+
+
+def test_waits_for_a_model_config():
+    assert hooks.apply_kernel_numerics(None) is False
+    assert util.RECIPROCAL_SCALE is False

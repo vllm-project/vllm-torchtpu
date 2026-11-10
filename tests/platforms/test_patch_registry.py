@@ -245,6 +245,7 @@ def test_manifest_preserves_lifecycle_dependencies():
         "maybe_patch_qwen3_next",
         "maybe_patch_qwen2",
         "maybe_patch_qwen3_5_attn_moe_overlap",
+        "apply_kernel_numerics",
     ]
     assert "patch_moe_expert_write_staging" in stages["worker_init"]
 

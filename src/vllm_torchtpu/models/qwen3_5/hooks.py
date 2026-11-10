@@ -195,6 +195,24 @@ def _apply_kv_budget(vllm_config: VllmConfig) -> None:
         cache_config.kv_cache_memory_bytes = safe_kv
 
 
+def apply_kernel_numerics(model_config) -> bool | None:
+    """Qwen3.5's quantized-matmul numerics, in every process that loads it.
+
+    The Qwen3.5 PD stack was tuned and evaluated with the quantize helpers'
+    reciprocal scale (kernels/quantized_matmul/util.RECIPROCAL_SCALE), which
+    is off by default; turn it on before the model's kernels are traced.
+    Other models keep main's arithmetic. Returns False while no model config
+    is available, so the patch registry tries again at model load.
+    """
+    if model_config is None:
+        return False
+    if settings.is_qwen3_5(model_config):
+        from vllm_torchtpu.kernels.quantized_matmul import util
+
+        util.set_reciprocal_scale(True)
+    return None
+
+
 def apply_serving_defaults(vllm_config: VllmConfig) -> None:
     """Fill the Qwen3.5 TPU serving defaults the user did not set."""
     _apply_prefix_match_unit(vllm_config)
