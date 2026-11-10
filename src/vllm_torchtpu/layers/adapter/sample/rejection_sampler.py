@@ -592,6 +592,49 @@ def _random_rejection_sample_with_segment(
     draft_probs: torch.Tensor | None = None,
     apply_top_k: bool = True,
 ) -> torch.Tensor:
+    """Compiled `_random_rejection_sample_with_segment_impl`."""
+    return _random_rejection_sample_with_segment_impl(
+        draft_token_ids,
+        target_logits,
+        num_draft_tokens,
+        bonus_token_ids,
+        segment_ids,
+        group_indices,
+        max_draft_tokens,
+        temperatures,
+        top_k,
+        top_p,
+        accept_u,
+        recover_u,
+        synthetic_conditional_rates,
+        synthetic_mode,
+        topk_candidates,
+        apply_topk_topp,
+        draft_probs,
+        apply_top_k,
+    )
+
+
+def _random_rejection_sample_with_segment_impl(
+    draft_token_ids: torch.Tensor,
+    target_logits: torch.Tensor,
+    num_draft_tokens: torch.Tensor,
+    bonus_token_ids: torch.Tensor,
+    segment_ids: torch.Tensor,
+    group_indices: torch.Tensor,
+    max_draft_tokens: int,
+    temperatures: torch.Tensor,
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
+    accept_u: torch.Tensor,
+    recover_u: torch.Tensor,
+    synthetic_conditional_rates: torch.Tensor | None,
+    synthetic_mode: bool,
+    topk_candidates: int = 0,
+    apply_topk_topp: bool = True,
+    draft_probs: torch.Tensor | None = None,
+    apply_top_k: bool = True,
+) -> torch.Tensor:
     """Vectorized non-greedy speculative decoding validation in Torch.
 
     With `draft_probs` (the distribution q each draft token x was sampled

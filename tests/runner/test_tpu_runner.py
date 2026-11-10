@@ -3621,6 +3621,7 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         _sampler_applies_top_k=lambda: True,
         sample_from_logits_func=fake_sample_from_logits,
         speculative_config=SimpleNamespace(num_speculative_tokens=1),
+        _fused_spec_sampler=False,
     )
     spec_runner.rejection_sampler = MagicMock(side_effect=fake_rejection_sampler)
     spec_runner.rejection_sampler.synthetic_mode = False
