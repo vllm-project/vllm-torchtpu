@@ -29,6 +29,7 @@ Runs on CPU; the projections are stand-ins in the processed runtime layouts.
 """
 
 import contextlib
+import dataclasses
 import math
 import os
 import subprocess
@@ -139,11 +140,12 @@ class _RmsNorm(torch.nn.Module):
         return (xf * self.weight.float()).to(x.dtype)
 
 
-def _wrapper(*, layout="flipped", seed=0, rope=None, gate_is_fused=False, q_lora=True):
+def _wrapper(
+    *, layout="flipped", seed=0, rope=None, gate_is_fused=False, q_lora=True, heads=4
+):
     """A real wrapper with stand-in projections (bypassing the attention
     constructor)."""
     gen = torch.Generator().manual_seed(seed)
-    heads = 4
     cls = mla_op.VllmTPUMultiHeadLatentAttentionWrapper
     w = cls.__new__(cls)
     torch.nn.Module.__init__(w)
@@ -267,9 +269,9 @@ def _default_dtype(dtype):
         torch.set_default_dtype(previous)
 
 
-def _indexer(seed=0):
+def _indexer(seed=0, topk=8, buffer_tokens=16):
     config = SimpleNamespace(
-        index_topk=8,
+        index_topk=topk,
         index_n_heads=IDX_N_HEAD,
         index_head_dim=IDX_HEAD_DIM,
         qk_rope_head_dim=ROPE,
@@ -295,7 +297,9 @@ def _indexer(seed=0):
             q_lora_rank=Q_LORA,
             quant_config=None,
             cache_config=CacheConfig(),
-            topk_indices_buffer=torch.full((16, 8), -1, dtype=torch.int32),
+            topk_indices_buffer=torch.full(
+                (buffer_tokens, topk), -1, dtype=torch.int32
+            ),
             prefix="model.layers.78.self_attn.indexer",
         )
         ind = mla_op.VllmTPUIndexer.rebind(ind)
@@ -1247,3 +1251,263 @@ def _two_ranks_keep_their_own_rows(monkeypatch, layout):
     for cache in got[:2]:
         halves = np.split(np.asarray(cache).view(np.uint8), dcp)
         assert all(h.any() for h in halves)
+
+
+# ---------------------------------------------------------------------------
+# On TPU: the compiled ops, the default writers and an fp8 cache
+# ---------------------------------------------------------------------------
+
+TPU_PAGE = 128  # the default `sal` indexer writer needs a multiple of 128
+TPU_PAGES = 8
+TPU_TOPK = 512  # above every sequence here: the indexer keeps every position
+TPU_HEADS = 8
+TPU_TOKENS = 64  # the padded chunk
+TPU_ROWS = 8  # pass 2's loop bucket p
+TPU_MLA = "model.layers.78.mtp_block.self_attn.mla_attn.mla_attn"
+TPU_IDX = "model.layers.78.mtp_block.self_attn.mla_attn.indexer.k_cache"
+
+
+class _Step0(torch.nn.Module):
+    """Draft step 0 as the full pass runs it, up to the attention output: the
+    MTP prefix, then the wrapper's forward (indexer, sparse MLA)."""
+
+    def __init__(self, mtp):
+        super().__init__()
+        self.predictor = mtp.model
+        self.mtp = mtp
+
+    def forward(self, input_ids, positions, hidden_states):
+        layer, attn_input = mtp_kv_only.mtp_layer_input(
+            self.mtp, input_ids, positions, hidden_states
+        )
+        return layer.mtp_block.self_attn.mla_attn(positions, attn_input)
+
+
+def _tpu_dsa():
+    """A synthetic single-layer DSA MTP draft on one TPU chip: the real
+    wrapper, indexer, indexer op (streamidx top-k + K write), MLA layer and
+    backend impl (sparse MLA + latent write), with stand-in projections and
+    fp8 caches in the default layouts, under the writers' default modes."""
+    import jax
+
+    from vllm_torchtpu.layers.adapter.attention import (
+        PallasMLAttentionBackend,
+        PallasMLAttentionBackendImpl,
+        VllmTPUDeepseekV32IndexerBackend,
+    )
+    from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+        set_vllm_model_wrapper_context,
+    )
+
+    dev = torch.device("tpu")
+    mesh = jax.sharding.Mesh(np.asarray(jax.devices()[:1]), ("model",))
+    w = _wrapper(heads=TPU_HEADS, seed=1)
+    w.skip_topk = False
+    w.indexer = _indexer(seed=2, topk=TPU_TOPK, buffer_tokens=TPU_TOKENS)
+    w.indexer_rope_emb = _rope()
+
+    op = mla_op.VllmTPUSparseAttnIndexer.__new__(mla_op.VllmTPUSparseAttnIndexer)
+    torch.nn.Module.__init__(op)
+    op.topk_tokens = TPU_TOPK
+    op.dcp_size = 1
+    op.topk_op_dcp = None
+    idx_shape = VllmTPUDeepseekV32IndexerBackend.get_kv_cache_shape(
+        TPU_PAGES, TPU_PAGE, 1, IDX_HEAD_DIM
+    )
+    op.k_cache = SimpleNamespace(
+        prefix=TPU_IDX, kv_cache=torch.zeros(idx_shape, dtype=torch.uint8, device=dev)
+    )
+    op.topk_indices_buffer = torch.full(
+        (TPU_TOKENS, TPU_TOPK), -1, dtype=torch.int32, device=dev
+    )
+    op.topk_op = op._build_streamidx_op()
+    op._forward_method = op.forward_oot
+    w.indexer.indexer_op = op
+
+    gen = torch.Generator().manual_seed(3)
+    impl = PallasMLAttentionBackendImpl.__new__(PallasMLAttentionBackendImpl)
+    impl.dcp_size = 1
+    layer = mla_op.VllmTPUMLAAttention.__new__(mla_op.VllmTPUMLAAttention)
+    torch.nn.Module.__init__(layer)
+    layer.layer_name = TPU_MLA
+    layer.impl = impl
+    layer.num_heads = TPU_HEADS
+    layer.kv_lora_rank = KV_LORA
+    layer.qk_rope_head_dim = ROPE
+    layer.v_head_dim = V_DIM
+    layer.scale = QK**-0.5
+    layer.kv_cache_quantized_dtype = torch.float8_e4m3fn
+    layer._k_scale_float = 1.0
+    layer.W_UK_T = (
+        (torch.randn(TPU_HEADS, NOPE, KV_LORA, generator=gen) / math.sqrt(NOPE))
+        .bfloat16()
+        .to(dev)
+    )
+    layer.W_UV = (
+        (torch.randn(TPU_HEADS, KV_LORA, V_DIM, generator=gen) / math.sqrt(KV_LORA))
+        .bfloat16()
+        .to(dev)
+    )
+    specs = PallasMLAttentionBackend.get_sparse_kv_cache_specs(
+        TPU_PAGES, TPU_PAGE, KV_LORA + ROPE, "fp8"
+    )
+    layer.mla_kv_spec = specs
+    layer.kv_cache = tuple(
+        torch.zeros(tuple(spec.shape), dtype=spec.torch_dtype, device=dev)
+        for spec in specs
+    )
+    w.mla_attn = layer
+
+    mtp, _ = _upstream_mtp(hidden=HIDDEN)
+    mtp.model.layers["78"].mtp_block.self_attn = _SelfAttn(w)
+    mtp.model.to(dev)
+    w.topk_indices_buffer = w.topk_indices_buffer.to(dev)
+    assert mtp_kv_only.kv_only_unsupported_reason(mtp) is None
+    with set_vllm_model_wrapper_context(mesh=mesh):
+        # Built eagerly, as the runner does: Dynamo cannot trace an op's
+        # registration.
+        layer.sparse_mla_op = impl._build_sparse_mla_op(layer)
+        kv_only = mtp_kv_only.MtpKvOnlyModel(
+            vllm_config=SimpleNamespace(
+                compilation_config=SimpleNamespace(mode=CompilationMode.NONE)
+            ),
+            prefix="mtp_prefill_kv_only",
+            mtp=mtp,
+            mesh=mesh,
+        )
+    caches = (*layer.kv_cache, op.k_cache.kv_cache)
+    return SimpleNamespace(
+        mesh=mesh, step0=_Step0(mtp), kv_only=kv_only, caches=caches, mla_layer=layer
+    )
+
+
+def _tpu_md(seq_lens, query_start_loc, request_distribution):
+    """The step's metadata; the MLA and indexer caches share one block size
+    and page table here, as their KV cache groups do."""
+    dev = torch.device("tpu")
+
+    def i32(values):
+        return torch.tensor(values, dtype=torch.int32, device=dev)
+
+    md = AttentionMetadata(
+        input_positions=i32([0]),
+        # Two pages per request; each request fits in its first.
+        block_tables=i32([3, 1, 5, 2]),
+        seq_lens=i32(seq_lens),
+        query_start_loc=i32(query_start_loc),
+        request_distribution=i32(request_distribution),
+    )
+    return {TPU_MLA: md, TPU_IDX: dataclasses.replace(md)}
+
+
+def _on_tpu(dsa, program, md, *args):
+    from vllm.forward_context import ForwardContext, override_forward_context
+
+    from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+        set_vllm_model_wrapper_context,
+    )
+
+    ctx = ForwardContext(
+        no_compile_layers={TPU_MLA: dsa.mla_layer},
+        attn_metadata=md,
+        slot_mapping={},
+    )
+    with (
+        torch.no_grad(),
+        override_forward_context(ctx),
+        set_vllm_model_wrapper_context(mesh=dsa.mesh),
+    ):
+        return program(*args)
+
+
+def _compiled(module):
+    return torch.compile(module, backend="tpu", fullgraph=True, dynamic=False)
+
+
+@pytest.fixture(scope="module")
+def tpu_dsa():
+    """One build per module: the ops register under fixed names. Request 0
+    has 16 tokens cached before the step (written here by the full pass);
+    the step is a 64-token chunk: request 0's next 32 tokens, request 1's
+    first 24, 8 padded rows."""
+    torch._dynamo.reset()
+    dsa = _tpu_dsa()
+    dsa.step0_c = _compiled(dsa.step0)
+    dsa.kv_only_c = _compiled(dsa.kv_only)
+    gen = torch.Generator().manual_seed(9)
+    dev = torch.device("tpu")
+
+    def tokens(positions):
+        n = len(positions)
+        return (
+            torch.randint(0, 64, (n,), generator=gen, dtype=torch.int32).to(dev),
+            torch.tensor(positions, dtype=torch.int32, device=dev),
+            torch.randn(n, HIDDEN, generator=gen).bfloat16().to(dev),
+        )
+
+    prefix = tokens(list(range(16)))
+    _on_tpu(dsa, dsa.step0_c, _tpu_md([16, 0], [0, 16, 16], [0, 0, 1]), *prefix)
+    # Host copies: a deferred on-device clone can lose its source to the
+    # next op that donates the cache.
+    dsa.prefix_caches = [c.cpu() for c in dsa.caches]
+    dsa.step = tokens(list(range(16, 48)) + list(range(24)) + [0] * 8)
+    dsa.step_md = lambda: _tpu_md([48, 24], [0, 32, 56], [0, 0, 2])
+    # Pass 2's rows: each request's last row, padded to p with row 0.
+    dsa.last_rows = torch.tensor([31, 55] + [0] * 6, dtype=torch.int64, device=dev)
+    dsa.rows_md = lambda: _tpu_md([48, 24], [0, 1, 2], [2, 2, 2])
+    return dsa
+
+
+def _reset(dsa):
+    for cache, saved in zip(dsa.caches, dsa.prefix_caches):
+        cache.copy_(saved.to(cache.device))
+
+
+def _assert_same_bytes(got, want, what):
+    for name, g, w in zip(("nope", "rope", "indexer K"), got, want):
+        g8 = g.cpu().view(torch.uint8)
+        w8 = w.cpu().view(torch.uint8)
+        diff = (g8 != w8).sum().item()
+        assert diff == 0, f"{what}: {name} cache differs in {diff} bytes"
+
+
+def _single_pass(dsa):
+    _reset(dsa)
+    out = _on_tpu(dsa, dsa.step0_c, dsa.step_md(), *dsa.step)
+    return out.cpu(), [c.cpu() for c in dsa.caches]
+
+
+@pytest.mark.tpu_test
+def test_kv_only_pass_writes_the_full_pass_cache_entries_on_tpu(tpu_dsa):
+    """`MtpKvOnlyModel`, compiled for TPU with the default `sal` indexer
+    writer and an fp8 latent cache, leaves the same MLA and indexer-K caches
+    as the full step-0 forward over the same rows."""
+    _, want = _single_pass(tpu_dsa)
+    assert any(not torch.equal(w, p) for w, p in zip(want, tpu_dsa.prefix_caches)), (
+        "the step wrote nothing"
+    )
+    _reset(tpu_dsa)
+    _on_tpu(tpu_dsa, tpu_dsa.kv_only_c, tpu_dsa.step_md(), *tpu_dsa.step)
+    _assert_same_bytes(tpu_dsa.caches, want, "KV-only pass vs full pass")
+
+
+@pytest.mark.tpu_test
+def test_two_pass_step0_matches_the_single_pass_on_tpu(tpu_dsa):
+    """Pass 1 over every row, then the full forward on one row per request
+    with the narrowed metadata: same caches as the single pass, and each
+    request's last row gets the same attention output."""
+    want_out, want_caches = _single_pass(tpu_dsa)
+    _reset(tpu_dsa)
+    _on_tpu(tpu_dsa, tpu_dsa.kv_only_c, tpu_dsa.step_md(), *tpu_dsa.step)
+    ids, positions, hidden = tpu_dsa.step
+    rows = tpu_dsa.last_rows
+    out = _on_tpu(
+        tpu_dsa,
+        tpu_dsa.step0_c,
+        tpu_dsa.rows_md(),
+        ids.index_select(0, rows),
+        positions.index_select(0, rows),
+        hidden.index_select(0, rows),
+    )
+    _assert_same_bytes(tpu_dsa.caches, want_caches, "two-pass vs single pass")
+    torch.testing.assert_close(out.cpu()[:2], want_out[[31, 55]], rtol=1e-2, atol=1e-2)
