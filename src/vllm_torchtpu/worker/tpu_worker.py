@@ -772,6 +772,13 @@ class TPUWorker(WorkerBase):
         # executables, KV bookkeeping); freezing it keeps a gen-2 collection
         # from scanning those objects mid-step.
         freeze_gc_heap()
+        if envs.VLLM_TPU_GC_THRESHOLD:
+            import gc
+
+            gc.set_threshold(
+                *(int(v) for v in envs.VLLM_TPU_GC_THRESHOLD.split(","))
+            )
+            logger.info("GC thresholds after warmup: %s", gc.get_threshold())
         maybe_attach_gc_debug_callback()
         from vllm_torchtpu.runner.compile_watch import (
             install_post_warmup_compile_log,
