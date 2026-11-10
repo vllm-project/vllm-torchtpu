@@ -34,23 +34,41 @@ from vllm_torchtpu.models.minimax_m3.kernels import msa_attention, msa_fp4
 # sorted prefix of its slots and the padding slots past it (the last group of
 # every tile) are fully masked, yet cost the int4 unpack and the score /
 # softmax work of a real page. 0 computes every slot.
-PAGE_BUCKET = int(os.environ.get("VLLM_TORCHTPU_MSA_PAGE_BUCKET", "4"))
-# Pages per step of the prefill tiles (`_work_tiles`) of DCP attention.
-TILE_PAGES_PER_STEP = int(
-    os.environ.get(
-        "VLLM_TORCHTPU_MSA_TILE_PAGES_PER_STEP",
-        str(msa_attention.DEFAULT_PAGES_PER_STEP),
-    )
-)
+PAGE_BUCKET = 4
+# Pages per step of the prefill tiles (`_work_tiles`) of DCP attention: with
+# PAGE_BUCKET and MANUAL_DMA a tile's union of up to 32 pages takes one grid
+# step (c64 DCP4 shapes, unions 17 / 24: 409 -> 361 / 492 -> 443 us per call,
+# j-dcacb144; unions of ~6 pay 212 -> 266).
+TILE_PAGES_PER_STEP = 32
 
 
 # `msa_sparse_attention_lse_heads` above DECODE_TOKENS runs `_heads_call`
 # (one loop of kernel calls over whole head-major q / out / lse) instead of a
 # `lax.map` over heads and chunks of sliced and restacked operands.
-FUSED_HEADS = os.environ.get("VLLM_TORCHTPU_MSA_FUSED_HEADS", "1") == "1"
+FUSED_HEADS = True
 # Score elementwise work: fold sm_scale into the K scales and broadcast the
 # per-token mask over the query heads (`_kernel`).
 ELEMENT_DIET = os.environ.get("VLLM_TORCHTPU_MSA_ELEMENT_DIET", "1") == "1"
+# 4-bit caches: fetch a step's pages with manual DMAs of its valid pages only
+# (prefetching the next active step's) into a double-buffered VMEM scratch,
+# instead of one pipelined BlockSpec input per page slot (c64 DCP4 shapes,
+# union 17: 490 -> 409 us per call, j-dcacb144). Other caches keep the
+# BlockSpec inputs.
+MANUAL_DMA = True
+
+
+def _fp4_words(words):
+    """`msa_attention._fp4_page` from the block's words (uint32 ``[S / 8 + 1,
+    2D]``) rather than its ref."""
+    rows = pltpu.bitcast(words[:-1], jnp.int4).astype(jnp.bfloat16)
+    scales = pltpu.bitcast(words[-1:], jnp.float32)  # [1, 2D]
+    page_size = rows.shape[0]
+    sk, sv = scales[:, :page_size], scales[:, page_size : 2 * page_size]
+    return (
+        rows,
+        jnp.where(jnp.isfinite(sk), sk, 0.0),
+        jnp.where(jnp.isfinite(sv), sv, 0.0),
+    )
 
 
 def _kernel(
@@ -70,6 +88,8 @@ def _kernel(
     slots_per_tile: int | None = None,
     page_bucket: int = 0,
     aliased: int = 0,
+    manual_pages: int = 0,
+    row_width: int = 0,
 ):
     """`msa_attention._kernel_v2` that also writes ``lse = m + log(l)``
     (``-inf`` for a row that sees no slot; its output is 0).
@@ -85,9 +105,21 @@ def _kernel(
 
     `aliased` inputs (in HBM, never read) follow the KV pages: the outputs'
     previous contents, which the call writes into in place."""
-    pages_per_step = len(refs) - 5 - aliased
-    kv_refs = refs[:pages_per_step]
-    o_ref, lse_ref, m_ref, l_ref, acc_ref = refs[pages_per_step + aliased :]
+    if manual_pages:
+        # refs: the whole cache (HBM), aliased, out, lse, m, l, acc, page
+        # buffer [2 * pages, rows, packing, row_width], DMA semaphores, count
+        pages_per_step = manual_pages
+        kv_hbm = refs[0]
+        (o_ref, lse_ref, m_ref, l_ref, acc_ref, buf_ref, sem_ref, count_ref) = refs[
+            1 + aliased :
+        ]
+        kv_refs = None
+        rows_per_page, packing = buf_ref.shape[1:3]
+    else:
+        pages_per_step = len(refs) - 5 - aliased
+        kv_refs = refs[:pages_per_step]
+        o_ref, lse_ref, m_ref, l_ref, acc_ref = refs[pages_per_step + aliased :]
+        rows_per_page, packing = kv_refs[0].shape[1:3]
     active = None
     if slots_per_tile is None:
         w = pl.program_id(0)
@@ -104,12 +136,63 @@ def _kernel(
         )
         base = tile * slots_per_tile + group * pages_per_step
     num_heads, block_q, head_dim = q_ref.shape
-    rows_per_page, packing = kv_refs[0].shape[1:3]
     page_size = (
         msa_fp4.data_rows(rows_per_page) * msa_fp4.TOKENS_PER_WORD
         if fp4
         else rows_per_page * packing
     )
+
+    slot = None
+    if manual_pages:
+        if slots_per_tile is None:
+            num_steps = pl.num_programs(0)
+            first_step = w == 0
+            has_next = w + 1 < num_steps
+            next_base = base + pages_per_step
+        else:
+            first_step = (tile == 0) & (group == 0)
+            last_group = group + 1 >= groups
+            has_next = jnp.logical_not(last_group) | (tile + 1 < pl.num_programs(0))
+            next_base = jnp.where(
+                last_group, (tile + 1) * slots_per_tile, base + pages_per_step
+            )
+
+        def _copies(step_base, parity, start):
+            for g in range(pages_per_step):
+                key = work_page_ref[step_base + g]
+
+                @pl.when(key >= 0)
+                def _():
+                    page = page_table_ref[jnp.maximum(key, 0)]
+                    copy = pltpu.make_async_copy(
+                        kv_hbm.at[page, :, :, pl.ds(head_ref[0] * row_width, row_width)],
+                        buf_ref.at[parity * pages_per_step + g],
+                        sem_ref.at[parity * pages_per_step + g],
+                    )
+                    if start:
+                        copy.start()
+                    else:
+                        copy.wait()
+
+        def _fetch():
+            @pl.when(first_step)
+            def _():
+                count_ref[0] = 0
+                _copies(base, 0, True)
+
+            parity = count_ref[0] % 2
+
+            @pl.when(has_next)
+            def _():
+                _copies(next_base, 1 - parity, True)
+
+            _copies(base, parity, False)
+
+        if active is None:
+            _fetch()
+        else:
+            pl.when(active)(_fetch)
+        slot = count_ref[0] % 2
 
     @pl.when((meta & msa_attention._FIRST_BIT) != 0)
     def _init():
@@ -128,7 +211,8 @@ def _kernel(
         local_page = local_page_ref[...]
         local_limit = local_limit_ref[...]
         keys, values, masks, k_scales, v_scales = [], [], [], [], []
-        for g, kv_ref in enumerate(kv_refs[:num_pages]):
+        for g in range(num_pages):
+            kv_ref = kv_refs[g] if kv_refs is not None else None
             page = work_page_ref[base + g]
             is_selected = jnp.max(
                 (selected == page).astype(jnp.int32), axis=1, keepdims=True
@@ -136,7 +220,14 @@ def _kernel(
             limit = jnp.where(local_page == page, local_limit, page_size)
             limit = jnp.where(page >= 0, limit * is_selected, 0)  # [Bq, 1]
             seen = jnp.max(limit)
-            if fp4:  # the head's block carries its own K / V scales
+            if fp4 and manual_pages:
+                rows, sk, sv = _fp4_words(
+                    buf_ref.bitcast(jnp.uint32)[slot * pages_per_step + g, :, 0, :]
+                )
+                values.append(rows[:, head_dim:])
+                k_scales.append(sk)
+                v_scales.append(sv)
+            elif fp4:  # the head's block carries its own K / V scales
                 rows, sk, sv = msa_attention._fp4_page(kv_ref)
                 values.append(rows[:, head_dim:])
                 k_scales.append(sk)
@@ -202,6 +293,16 @@ def _kernel(
             if active is not None:
                 run = run & active
             pl.when(run)(functools.partial(_step, hi))
+
+    if manual_pages:
+
+        def _advance():
+            count_ref[0] = count_ref[0] + 1
+
+        if active is None:
+            _advance()
+        else:
+            pl.when(active)(_advance)
 
     @pl.when((meta & msa_attention._LAST_BIT) != 0)
     def _finalize():
@@ -288,6 +389,7 @@ def _attention_call(
         return pl.BlockSpec((1, rows_per_page, packing, row_width), index_map)
 
     fp4 = kv_cache.dtype == jnp.uint8
+    manual = MANUAL_DMA and fp4
 
     grid_spec = pltpu.PrefetchScalarGridSpec(
         num_scalar_prefetch=4,
@@ -297,7 +399,11 @@ def _attention_call(
             pl.BlockSpec((block_q, topk), tile_block),
             pl.BlockSpec((block_q, 1), tile_block),
             pl.BlockSpec((block_q, 1), tile_block),
-            *(page_block(g) for g in range(pages_per_step)),
+            *(
+                [pl.BlockSpec(memory_space=pl.ANY)]
+                if manual
+                else [page_block(g) for g in range(pages_per_step)]
+            ),
         ],
         out_specs=[
             pl.BlockSpec((num_heads, block_q, head_dim), head_major_block),
@@ -307,6 +413,17 @@ def _attention_call(
             pltpu.VMEM((num_heads * block_q, 1), jnp.float32),
             pltpu.VMEM((num_heads * block_q, 1), jnp.float32),
             pltpu.VMEM((num_heads * block_q, head_dim), jnp.float32),
+            *(
+                [
+                    pltpu.VMEM(
+                        (2 * pages_per_step, rows_per_page, packing, row_width), jnp.uint8
+                    ),
+                    pltpu.SemaphoreType.DMA((2 * pages_per_step,)),
+                    pltpu.SMEM((1,), jnp.int32),
+                ]
+                if manual
+                else []
+            ),
         ],
     )
     out, lse = pl.pallas_call(
@@ -315,6 +432,8 @@ def _attention_call(
             sm_scale=sm_scale,
             slots_per_tile=slots,
             page_bucket=PAGE_BUCKET,
+            manual_pages=pages_per_step if manual else 0,
+            row_width=row_width,
             **({"fp4": True} if fp4 else {}),
         ),
         grid_spec=grid_spec,
@@ -337,7 +456,7 @@ def _attention_call(
         selected,
         local_page[:, None],
         local_limit[:, None],
-        *([kv_cache] * pages_per_step),
+        *([kv_cache] * (1 if manual else pages_per_step)),
     )
     return out.transpose(1, 0, 2), lse[:, :, 0].T
 
@@ -588,6 +707,7 @@ def _heads_call(
     tiles_per_chunk = step // block_q
     works = _work_lists(selected, block_q, pages_per_step, tiles)  # [G, chunks, ...]
     fp4 = kv_cache.dtype == jnp.uint8
+    manual = MANUAL_DMA and fp4
 
     if tiles:
 
@@ -639,7 +759,11 @@ def _heads_call(
                 pl.BlockSpec((None, block_q, topk), sel_block),
                 pl.BlockSpec((block_q, 1), row_block),
                 pl.BlockSpec((block_q, 1), row_block),
-                *(page_block(g) for g in range(pages_per_step)),
+                *(
+                    [any_spec]
+                    if manual
+                    else [page_block(g) for g in range(pages_per_step)]
+                ),
                 any_spec,
                 any_spec,
             ],
@@ -651,9 +775,21 @@ def _heads_call(
                 pltpu.VMEM((q_per_head * block_q, 1), jnp.float32),
                 pltpu.VMEM((q_per_head * block_q, 1), jnp.float32),
                 pltpu.VMEM((q_per_head * block_q, head_dim), jnp.float32),
+                *(
+                    [
+                        pltpu.VMEM(
+                            (2 * pages_per_step, rows_per_page, packing, row_width), jnp.uint8
+                        ),
+                        pltpu.SemaphoreType.DMA((2 * pages_per_step,)),
+                        pltpu.SMEM((1,), jnp.int32),
+                    ]
+                    if manual
+                    else []
+                ),
             ],
         )
-        first = 8 + pages_per_step  # operand index of `out` (prefetch included)
+        # operand index of `out` (scalar prefetch included)
+        first = 8 + (1 if manual else pages_per_step)
         return pl.pallas_call(
             functools.partial(
                 _kernel,
@@ -661,6 +797,8 @@ def _heads_call(
                 slots_per_tile=slots,
                 page_bucket=PAGE_BUCKET,
                 aliased=2,
+                manual_pages=pages_per_step if manual else 0,
+                row_width=row_width,
                 **({"fp4": True} if fp4 else {}),
             ),
             grid_spec=grid_spec,
@@ -684,7 +822,7 @@ def _heads_call(
             selected,
             local_page[:, None],
             local_limit[:, None],
-            *([kv_cache] * pages_per_step),
+            *([kv_cache] * (1 if manual else pages_per_step)),
             out,
             lse,
         )
