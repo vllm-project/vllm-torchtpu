@@ -169,11 +169,16 @@ _DECODE = ([1, 8, 4, 1], [3000, 128, 127, 4000])
 # Requests 1-7 rows apart around a long chunk: their slot columns share
 # 128-lane groups with the chunk's tiles.
 _ADJACENT = ([5, 300, 3, 134], [2000, 1500, 100, 0])
+# Two large-class chunks over long context: consecutive large tiles whose
+# scores matter (not only forced blocks).
+_TWO_LONG = ([200, 200, 1, 1], [1500, 2500, 10, 10])
 
 
 @pytest.mark.parametrize("dcp", [2, 4, 8])
 @pytest.mark.parametrize(
-    "batch", [_MIXED, _FRESH, _DECODE, _ADJACENT], ids=["mixed", "fresh", "decode", "adjacent"]
+    "batch",
+    [_MIXED, _FRESH, _DECODE, _ADJACENT, _TWO_LONG],
+    ids=["mixed", "fresh", "decode", "adjacent", "two-long"],
 )
 def test_tile_select_matches_rows_bf16(monkeypatch, dcp, batch):
     _check(monkeypatch, *batch, dcp, jnp.bfloat16, ranks=[0, dcp - 1], seed=dcp)
@@ -258,6 +263,24 @@ def test_tile_select_small_placement_fault_is_caught(monkeypatch, _retrace):
     )
     with pytest.raises(AssertionError):
         _check(monkeypatch, *_ADJACENT, 2, jnp.bfloat16, ranks=[0], seed=5)
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        ("next tile's pages", ("copy_tile(tile + 1, 1 - slot,", "copy_tile(tile, 1 - slot,")),
+        ("one live chunk short", ("return (pages + chunk - 1) // chunk", "return pages // chunk")),
+    ],
+    ids=lambda f: f[0],
+)
+def test_tile_select_copy_faults_are_caught(monkeypatch, _retrace, fault):
+    """Each tile's live pages are copied in while the previous tile picks;
+    copying the wrong tile, or one chunk short, fails the comparison."""
+    _, (old, new) = fault
+    monkeypatch.setattr(msa_dcp, "_tile_select_kernel", _faulty_kernel(old, new))
+    monkeypatch.setattr(msa_dcp, "_select_chunk", lambda num_pages: 8)
+    with pytest.raises(AssertionError):
+        _check(monkeypatch, *_TWO_LONG, 2, jnp.bfloat16, ranks=[1], seed=3)
 
 
 def test_tile_select_threshold(monkeypatch):
