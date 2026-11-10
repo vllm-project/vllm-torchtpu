@@ -135,6 +135,11 @@ class _DeferredNoForwardOutput(AsyncModelRunnerOutput):
                 )
         return output
 
+    def get_kv_connector_output(self):
+        # Salvage path when get_output fails: the step's own connector output,
+        # without polling (records stay with the connector for its next poll).
+        return self._output.kv_connector_output
+
 
 class _LatePollModelRunnerOutput(AsyncModelRunnerOutput):
     """Adds the loads that landed during the step to its output.
@@ -163,6 +168,10 @@ class _LatePollModelRunnerOutput(AsyncModelRunnerOutput):
                     set(kv_output.finished_recving or ()) | ready
                 )
         return output
+
+    def get_kv_connector_output(self):
+        # Salvage path when get_output fails: the wrapped output's, unpolled.
+        return self._inner.get_kv_connector_output()
 
 
 class TPUWorker(WorkerBase):
@@ -755,8 +764,7 @@ class TPUWorker(WorkerBase):
     def execute_model(self, scheduler_output):
         output = self.model_runner.execute_model(scheduler_output)
         if (
-            envs.TPU_RAIDEN_STAGE3_LATE_POLL
-            and output is not None
+            output is not None
             and scheduler_output.total_num_scheduled_tokens == 0
             and self.scheduler_config.async_scheduling
             and self.parallel_config.data_parallel_size > 1
@@ -781,16 +789,19 @@ class TPUWorker(WorkerBase):
 
     def sample_tokens(self, grammar_output):
         output = self.model_runner.sample_tokens(grammar_output)
-        if envs.TPU_RAIDEN_STAGE3_LATE_POLL and isinstance(
-            output, AsyncModelRunnerOutput
-        ):
+        if isinstance(output, AsyncModelRunnerOutput):
             pollers = self._stage3_late_pollers()
             if pollers:
                 return _LatePollModelRunnerOutput(output, pollers)
         return output
 
     def _stage3_late_pollers(self) -> list:
-        """Connector workers that can report Stage-3 loads off the step."""
+        """Connector workers that report Stage-3 loads off the step.
+
+        Only a Raiden connector whose kv_connector_extra_config turns on
+        late_poll is listed, so with the option unset no step output is
+        wrapped.
+        """
         pollers = getattr(self, "_stage3_late_poller_list", None)
         if pollers is not None:
             return pollers
@@ -801,7 +812,7 @@ class TPUWorker(WorkerBase):
             for child in children:
                 worker = getattr(child, "connector_worker", None)
                 fn = getattr(worker, "late_poll_finished_recving", None)
-                if callable(fn):
+                if callable(fn) and getattr(worker, "late_poll_enabled", False):
                     pollers.append(fn)
         self._stage3_late_poller_list = pollers
         return pollers
