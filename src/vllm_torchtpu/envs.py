@@ -485,11 +485,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # linear, instead of vLLM's [n_out, n_in]. On the per-block FP8 path (gmm_v2)
     # the kept layout costs a full weight copy every step. Ignored with prefill
     # context parallelism, whose pooled op reads the weight raw as
-    # [n_out, n_in]. The experimental AOT export rejects it at TP > 1: its
-    # weight mapper assumes the vLLM layout for this weight. Opt-in while the
-    # (k, n) layout is verified only on the per-block FP8 path; once the BF16,
-    # checkpoint-FP8 and per-channel paths are verified and the export mapper
-    # reads the layer's layout marker, make it the default and delete the flag.
+    # [n_out, n_in]. Opt-in while the (k, n) layout is verified only on the
+    # per-block FP8 path; once the BF16, checkpoint-FP8 and per-channel paths
+    # are verified, make it the default and delete the flag.
     "TPU_GDN_QKVZ_KERNEL_LAYOUT": env_bool("TPU_GDN_QKVZ_KERNEL_LAYOUT", default=False),
     # Size GDN v3 decode tiles and prefill chunks from per-rank heads, active
     # sequences and the VMEM estimate (kernels/gdn/v3/tiling.py) instead of
