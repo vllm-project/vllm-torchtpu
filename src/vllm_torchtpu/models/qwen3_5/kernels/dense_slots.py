@@ -962,7 +962,7 @@ def dense_slots_moe(
     with fp8 weights, per-channel scales and silu (the DP4xTP2 decode
     binding). x [tokens, hidden] bf16 sharded over the mesh axis; router
     logits [tokens, num_experts]."""
-    from . import layer as v3_layer  # the select kernel
+    from vllm_torchtpu.kernels.fused_moe.v3 import layer as v3_layer  # select kernel
 
     if config is None:
         config = Config()
