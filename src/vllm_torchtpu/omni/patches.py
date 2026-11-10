@@ -433,25 +433,49 @@ def _patch_wan_host_resident_schedule() -> None:
     from vllm_omni.diffusion.models.schedulers.scheduling_flow_unipc_multistep import (
         FlowUniPCMultistepScheduler,
     )
+    from vllm_omni.diffusion.models.wan2_2 import (
+        pipeline_wan2_2,
+        pipeline_wan2_2_s2v,
+    )
 
     if getattr(
-        FlowUniPCMultistepScheduler.set_timesteps, _HOST_SCHEDULE_PATCHED, False
+        pipeline_wan2_2.FlowUniPCMultistepScheduler,
+        _HOST_SCHEDULE_PATCHED,
+        False,
+    ) and getattr(
+        pipeline_wan2_2_s2v.FlowUniPCMultistepScheduler,
+        _HOST_SCHEDULE_PATCHED,
+        False,
     ):
         return
-    orig_set_timesteps = FlowUniPCMultistepScheduler.set_timesteps
 
-    def _host_set_timesteps(
-        self: Any,
-        num_inference_steps: Any = None,
-        device: Any = None,
-        *args: Any,
-        **kwargs: Any,
-    ) -> None:
-        return orig_set_timesteps(self, num_inference_steps, "cpu", *args, **kwargs)
+    class _WanHostFlowUniPCMultistepScheduler(FlowUniPCMultistepScheduler):
+        def set_timesteps(
+            self,
+            num_inference_steps: Any = None,
+            device: Any = None,
+            *args: Any,
+            **kwargs: Any,
+        ) -> None:
+            return super().set_timesteps(num_inference_steps, "cpu", *args, **kwargs)
 
-    setattr(_host_set_timesteps, _HOST_SCHEDULE_PATCHED, True)
-    FlowUniPCMultistepScheduler.set_timesteps = _host_set_timesteps
-    logger.info("Applied TPU patch: host-resident denoising schedule for FlowUniPC.")
+    setattr(
+        _WanHostFlowUniPCMultistepScheduler,
+        _HOST_SCHEDULE_PATCHED,
+        True,
+    )
+    setattr(
+        _WanHostFlowUniPCMultistepScheduler.set_timesteps,
+        _HOST_SCHEDULE_PATCHED,
+        True,
+    )
+    pipeline_wan2_2.FlowUniPCMultistepScheduler = _WanHostFlowUniPCMultistepScheduler
+    pipeline_wan2_2_s2v.FlowUniPCMultistepScheduler = (
+        _WanHostFlowUniPCMultistepScheduler
+    )
+    logger.info(
+        "Applied TPU patch: host-resident FlowUniPC denoising schedule for Wan."
+    )
 
 
 _SDPA_FALLBACK_PATCHED = "_tpu_sdpa_fallback_patched"

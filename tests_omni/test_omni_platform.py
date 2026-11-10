@@ -32,6 +32,11 @@ from vllm_omni.diffusion.models.qwen_image import qwen_image_transformer
 from vllm_omni.diffusion.models.schedulers.scheduling_flow_unipc_multistep import (
     FlowUniPCMultistepScheduler,
 )
+from vllm_omni.diffusion.models.wan2_2 import (
+    pipeline_wan2_2,
+    pipeline_wan2_2_i2v,
+    pipeline_wan2_2_s2v,
+)
 from vllm_omni.diffusion.models.wan2_2.wan2_2_s2v_transformer import (
     WanS2VTransformer3DModel,
 )
@@ -334,37 +339,72 @@ def test_wan_timestep_host_schedule_transfer(monkeypatch, cls):
 
 
 def test_flow_unipc_schedule_stays_on_host(monkeypatch):
-    # The Wan UniPC schedule is created on the host whatever device the
-    # pipeline asks for, so per-step scalar work never bakes view offsets
-    # into device programs.
+    # The Wan UniPC schedule is created on the host whatever device the Wan
+    # pipeline asks for, while FlowUniPCMultistepScheduler instances created
+    # outside the Wan pipelines keep upstream device behaviour.
     monkeypatch.setattr(
         FlowUniPCMultistepScheduler,
         "set_timesteps",
         _UPSTREAM_FLOW_UNIPC_SET_TIMESTEPS,
     )
+    monkeypatch.setattr(
+        pipeline_wan2_2,
+        "FlowUniPCMultistepScheduler",
+        FlowUniPCMultistepScheduler,
+    )
+    monkeypatch.setattr(
+        pipeline_wan2_2_s2v,
+        "FlowUniPCMultistepScheduler",
+        FlowUniPCMultistepScheduler,
+    )
     _patch_wan_host_resident_schedule()
-    patched = FlowUniPCMultistepScheduler.set_timesteps
-    assert getattr(patched, _HOST_SCHEDULE_PATCHED, False)
+    patched_cls = pipeline_wan2_2.FlowUniPCMultistepScheduler
+    assert getattr(patched_cls, _HOST_SCHEDULE_PATCHED, False)
+    assert getattr(patched_cls.set_timesteps, _HOST_SCHEDULE_PATCHED, False)
+    assert pipeline_wan2_2_s2v.FlowUniPCMultistepScheduler is patched_cls
+    assert (
+        FlowUniPCMultistepScheduler.set_timesteps is _UPSTREAM_FLOW_UNIPC_SET_TIMESTEPS
+    )
     _patch_wan_host_resident_schedule()
-    assert FlowUniPCMultistepScheduler.set_timesteps is patched
+    assert pipeline_wan2_2.FlowUniPCMultistepScheduler is patched_cls
 
-    scheduler = FlowUniPCMultistepScheduler(num_train_timesteps=1000, shift=3.0)
-    scheduler.set_timesteps(4, device="meta", shift=5.0)
-    assert scheduler.timesteps.device.type == "cpu"
-    assert scheduler.num_inference_steps == 4
-
-    want_scheduler = FlowUniPCMultistepScheduler(num_train_timesteps=1000, shift=3.0)
+    want_scheduler = FlowUniPCMultistepScheduler(
+        num_train_timesteps=1000,
+        shift=1.0,
+        prediction_type="flow_prediction",
+    )
     _UPSTREAM_FLOW_UNIPC_SET_TIMESTEPS(want_scheduler, 4, device="cpu", shift=5.0)
-    assert torch.equal(scheduler.timesteps, want_scheduler.timesteps)
-    assert torch.equal(scheduler.sigmas, want_scheduler.sigmas)
 
-    scheduler.set_timesteps(num_inference_steps=3, device=torch.device("meta"))
-    assert scheduler.timesteps.device.type == "cpu"
-    assert len(scheduler.timesteps) == 3
+    for scheduler in (
+        pipeline_wan2_2.build_wan_scheduler("unipc", 5.0),
+        pipeline_wan2_2_i2v.build_wan_scheduler("unipc", 5.0),
+        pipeline_wan2_2_s2v.FlowUniPCMultistepScheduler(
+            num_train_timesteps=1000,
+            shift=1.0,
+            prediction_type="flow_prediction",
+        ),
+    ):
+        assert isinstance(scheduler, FlowUniPCMultistepScheduler)
+        scheduler.set_timesteps(4, device="meta", shift=5.0)
+        assert scheduler.timesteps.device.type == "cpu"
+        assert scheduler.num_inference_steps == 4
+        assert torch.equal(scheduler.timesteps, want_scheduler.timesteps)
+        assert torch.equal(scheduler.sigmas, want_scheduler.sigmas)
 
-    scheduler.set_timesteps(3, "meta")
-    assert scheduler.timesteps.device.type == "cpu"
-    assert scheduler.index_for_timestep(scheduler.timesteps[1]) == 1
+        scheduler.set_timesteps(num_inference_steps=3, device=torch.device("meta"))
+        assert scheduler.timesteps.device.type == "cpu"
+        assert len(scheduler.timesteps) == 3
+
+        scheduler.set_timesteps(3, "meta")
+        assert scheduler.timesteps.device.type == "cpu"
+        assert scheduler.index_for_timestep(scheduler.timesteps[1]) == 1
+
+    # A scheduler instance created outside the Wan pipeline keeps upstream
+    # device behaviour.
+    outside_scheduler = FlowUniPCMultistepScheduler(num_train_timesteps=1000, shift=3.0)
+    outside_scheduler.set_timesteps(4, device="meta", shift=5.0)
+    assert outside_scheduler.timesteps.device.type == "meta"
+    assert outside_scheduler.num_inference_steps == 4
 
 
 def test_device_control_env_var():
