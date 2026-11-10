@@ -15,6 +15,7 @@
 import contextlib
 import copy
 import inspect
+import random
 import weakref
 from collections import defaultdict
 from types import SimpleNamespace
@@ -3423,6 +3424,177 @@ def test_upload_unless_unchanged_reuses_only_identical_values(device):
     assert zf is not z and zf.dtype == torch.float32
     z22 = upload("z", torch.zeros(2, 2, dtype=torch.float32))
     assert z22 is not zf and tuple(z22.shape) == (2, 2)
+
+
+_SAMPLING_VOCAB = 1024
+
+
+class _CountingUploads:
+    """Counts `Tensor.to(device, non_blocking=True)` calls. Each returns a fresh
+    copy, as a host-to-device transfer does, so a reused upload never aliases
+    host memory (a CPU `.to("cpu")` would)."""
+
+    def __init__(self, monkeypatch):
+        self.count = 0
+        real_to = torch.Tensor.to
+
+        def to(tensor, *args, **kwargs):
+            if (
+                kwargs.get("non_blocking")
+                and args
+                and isinstance(args[0], (torch.device, str))
+            ):
+                self.count += 1
+                return real_to(tensor, *args, **kwargs).clone()
+            return real_to(tensor, *args, **kwargs)
+
+        monkeypatch.setattr(torch.Tensor, "to", to)
+
+
+def _sampling_param_runner(max_num_reqs=64):
+    return SimpleNamespace(
+        input_batch=SimpleNamespace(
+            temperature_cpu_tensor=torch.ones(max_num_reqs, dtype=torch.float32),
+            # vLLM stores vocab_size for a request without top-k.
+            top_k_cpu_tensor=torch.full(
+                (max_num_reqs,), _SAMPLING_VOCAB, dtype=torch.int32
+            ),
+            top_p_cpu_tensor=torch.ones(max_num_reqs, dtype=torch.float32),
+        ),
+        vocab_size=_SAMPLING_VOCAB,
+        _sampling_param_uploads={},
+    )
+
+
+def _padded_sampling_params(runner, start, end, logits):
+    return TPUModelRunner._build_padded_sampling_params(runner, start, end, logits)
+
+
+def _fresh_padded_sampling_params(runner, start, end, logits):
+    """What `_build_padded_sampling_params` uploads with nothing cached."""
+    fresh = SimpleNamespace(
+        input_batch=runner.input_batch,
+        vocab_size=runner.vocab_size,
+        _sampling_param_uploads={},
+    )
+    return _padded_sampling_params(fresh, start, end, logits)
+
+
+def _assert_same_tensors(actual, expected):
+    assert len(actual) == len(expected)
+    for got, want in zip(actual, expected, strict=True):
+        assert got.dtype == want.dtype and got.shape == want.shape
+        assert torch.equal(got, want)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_sampling_params_upload_once_per_padded_size_in_rl_decode(monkeypatch, dtype):
+    """RL decode samples every request with the same parameters, so the padded
+    temperature / top-k / top-p rows repeat step after step: they are uploaded
+    once per padded batch size, and every step gets what a fresh upload
+    gives."""
+    uploads = _CountingUploads(monkeypatch)
+    runner = _sampling_param_runner()
+    rng = random.Random(1)
+    num_reqs, seen = 40, set()
+    for step in range(600):
+        if num_reqs > 1 and rng.random() < 0.03:
+            num_reqs -= 1  # a request finishes
+        padded = 16 if num_reqs <= 16 else 32 if num_reqs <= 32 else 64
+        logits = torch.zeros(padded, 8, dtype=dtype)
+        expected = _fresh_padded_sampling_params(runner, 0, num_reqs, logits)
+        before = uploads.count
+        actual = _padded_sampling_params(runner, 0, num_reqs, logits)
+        _assert_same_tensors(actual, expected)
+        assert uploads.count - before == (0 if padded in seen else 3), step
+        seen.add(padded)
+    assert len(seen) > 1
+    assert len(runner._sampling_param_uploads) == len(seen)
+
+
+def test_sampling_param_reuse_with_mixed_and_greedy_rows(monkeypatch):
+    """Requests with their own temperature (greedy included), top-k and top-p
+    join in random slots, and chunks start at different rows: every call
+    matches a fresh upload, repeated rows are reused, and the cache stays
+    bounded."""
+    uploads = _CountingUploads(monkeypatch)
+    runner = _sampling_param_runner()
+    batch = runner.input_batch
+    rng = random.Random(7)
+    reused = 0
+    for step in range(300):
+        if rng.random() < 0.2:
+            slot = rng.randrange(24)
+            batch.temperature_cpu_tensor[slot] = rng.choice([1.0, 0.7, 0.0])
+            batch.top_k_cpu_tensor[slot] = rng.choice([_SAMPLING_VOCAB, 50, 1])
+            batch.top_p_cpu_tensor[slot] = rng.choice([1.0, 0.9])
+        start = rng.randrange(3)
+        end = min(start + rng.randrange(1, 25), 24)
+        padded = 16 if end - start <= 16 else 32
+        dtype = rng.choice([torch.bfloat16, torch.float32])
+        logits = torch.zeros(padded, 4, dtype=dtype)
+        expected = _fresh_padded_sampling_params(runner, start, end, logits)
+        before = uploads.count
+        actual = _padded_sampling_params(runner, start, end, logits)
+        _assert_same_tensors(actual, expected)
+        assert actual[0].dtype == dtype, step
+        if uploads.count == before:
+            reused += 1
+        assert (
+            len(runner._sampling_param_uploads)
+            <= tpu_runner._SAMPLING_PARAM_UPLOAD_CACHE_MAX
+        )
+    assert reused > 0
+
+
+def test_sampling_param_reuse_keys_on_values_not_buffers(monkeypatch):
+    """A cached upload does not follow later writes to the persistent batch: a
+    changed temperature uploads again. Each entry holds the host rows its
+    non-blocking upload reads."""
+    _CountingUploads(monkeypatch)
+    runner = _sampling_param_runner()
+    logits = torch.zeros(16, 4, dtype=torch.float32)
+    first = _padded_sampling_params(runner, 0, 10, logits)
+    runner.input_batch.temperature_cpu_tensor[0] = 0.5
+    second = _padded_sampling_params(runner, 0, 10, logits)
+    third = _padded_sampling_params(runner, 0, 10, logits)
+    assert first[0][0, 0].item() == 1.0
+    assert second[0][0, 0].item() == 0.5
+    assert all(a is b for a, b in zip(second, third, strict=True))
+    assert len(runner._sampling_param_uploads) == 2
+    for uploaded, hosts in runner._sampling_param_uploads.values():
+        for device_rows, host_rows in zip(uploaded, hosts, strict=True):
+            assert torch.equal(device_rows, host_rows.unsqueeze(1))
+
+
+def test_sampling_param_cache_evicts_the_oldest_entry(monkeypatch):
+    uploads = _CountingUploads(monkeypatch)
+    runner = _sampling_param_runner()
+    logits = torch.zeros(16, 4)
+    cache_max = tpu_runner._SAMPLING_PARAM_UPLOAD_CACHE_MAX
+    temperatures = [0.01 * (i + 1) for i in range(cache_max + 12)]
+    for temperature in temperatures:
+        runner.input_batch.temperature_cpu_tensor[0] = temperature
+        _padded_sampling_params(runner, 0, 4, logits)
+    assert uploads.count == 3 * len(temperatures)
+    assert len(runner._sampling_param_uploads) == cache_max
+
+    # The newest `cache_max` entries stay; the older ones went first.
+    before = uploads.count
+    for temperature in temperatures[-cache_max:]:
+        runner.input_batch.temperature_cpu_tensor[0] = temperature
+        _padded_sampling_params(runner, 0, 4, logits)
+    assert uploads.count == before
+    runner.input_batch.temperature_cpu_tensor[0] = temperatures[-cache_max - 1]
+    _padded_sampling_params(runner, 0, 4, logits)
+    assert uploads.count == before + 3
+    assert len(runner._sampling_param_uploads) == cache_max
+
+
+def test_host_bytes_tell_bf16_rows_from_their_float32_values():
+    rows = torch.tensor([1.0, 0.5], dtype=torch.bfloat16)
+    assert tpu_runner._host_bytes(rows) == rows.view(torch.int16).numpy().tobytes()
+    assert tpu_runner._host_bytes(rows) != tpu_runner._host_bytes(rows.float())
 
 
 def test_relayout_tables_reaches_the_draft_model(monkeypatch):

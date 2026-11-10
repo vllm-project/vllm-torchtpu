@@ -403,6 +403,42 @@ def zeros_h2d_source(
     return buf
 
 
+def _release_unused_h2d_source(runner: Any, host: torch.Tensor) -> None:
+    """Hand a `zeros_h2d_source` buffer that no transfer read straight back to
+    the free list (`stage_h2d_upload`'s release_cb without the fence wait:
+    nothing is in flight from it)."""
+    if id(host) not in runner._registered_h2d_sources:
+        return
+    key = (host.numel(), host.dtype)
+    free = runner._free_h2d_sources.pop(key, None)
+    if free is None:
+        free = []
+    free.append(host)
+    runner._free_h2d_sources[key] = free
+
+
+def _stage_block_table_upload(
+    runner: Any, ctx: AttentionMetadataBuilderContext, flat: torch.Tensor
+) -> torch.Tensor:
+    """`stage_h2d_upload(runner, flat)` for the batched block-table buffer,
+    reusing the previous walk's device copy while `flat`'s bytes repeat
+    (decode steps between block-boundary crossings and batch changes).
+    Downstream only reads the staged tensor (the split program clones and
+    gathers from it; the single-group view reaches the attention kernels as
+    read-only metadata), so a reused upload holds the values a fresh upload
+    would. Dummy walks (`position_ids_override`) always upload."""
+    if ctx.position_ids_override is not None:
+        return stage_h2d_upload(runner, flat)
+    key = (flat.numel(), flat.dtype, flat.numpy().tobytes())
+    prev = getattr(runner, "_block_table_upload_reuse", None)
+    if prev is not None and prev[0] == key:
+        _release_unused_h2d_source(runner, flat)
+        return prev[1]
+    staged_dev = stage_h2d_upload(runner, flat)
+    runner._block_table_upload_reuse = (key, staged_dev)
+    return staged_dev
+
+
 class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
     """Single shared metadata builder for every TPU attention group."""
 
@@ -721,7 +757,7 @@ def stage_block_table_uploads(
             offset += num_reqs_padded * target_num_blocks
     # Dummy runs keep the zeroed buffer: same staged layout, null blocks.
 
-    staged_dev = stage_h2d_upload(runner, flat)
+    staged_dev = _stage_block_table_upload(runner, ctx, flat)
 
     # One compiled program splits the staged tensor into per-group tables
     # and derives every unified-pool mamba group's state/checkpoint indices

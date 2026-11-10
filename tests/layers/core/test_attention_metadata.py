@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import random
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -699,6 +700,267 @@ class TestAttentionMetadataBuilderPlumbing:
         )
         stage_block_table_uploads(runner, ctx_preinit, 4)
         assert ctx_preinit.staged_block_tables is None
+
+
+class _CountingUploads:
+    """Counts `Tensor.to(device, non_blocking=True)` calls. Each returns a fresh
+    copy, as a host-to-device transfer does, so a staged table never aliases
+    the host buffer it came from (a CPU `.to("cpu")` would)."""
+
+    def __init__(self, monkeypatch):
+        self.count = 0
+        real_to = torch.Tensor.to
+
+        def to(tensor, *args, **kwargs):
+            if (
+                kwargs.get("non_blocking")
+                and args
+                and isinstance(args[0], (torch.device, str))
+            ):
+                self.count += 1
+                return real_to(tensor, *args, **kwargs).clone()
+            return real_to(tensor, *args, **kwargs)
+
+        monkeypatch.setattr(torch.Tensor, "to", to)
+
+
+def _record_staging_fence(runner):
+    """`TPUModelRunner._record_input_staging_fence` without the device event."""
+    runner._fenced_h2d_sources.extend(runner._unfenced_h2d_sources)
+    runner._unfenced_h2d_sources.clear()
+
+
+def _wait_staging_fence(runner):
+    """`TPUModelRunner._wait_input_staging_fence` without the device event."""
+    for _, release_cb in runner._fenced_h2d_sources:
+        release_cb()
+    runner._fenced_h2d_sources.clear()
+
+
+class _DecodeTrace:
+    """Requests that decode one token per step. Each owns a row in every
+    group's block table and gets a new block every `block_size` tokens; now and
+    then a request finishes and the rows behind it move up."""
+
+    def __init__(self, groups, num_reqs, seed):
+        self.rng = random.Random(seed)
+        self.groups = groups
+        self.seq_lens = [self.rng.randrange(300, 1500) for _ in range(num_reqs)]
+        self.blocks = [[[] for _ in groups] for _ in self.seq_lens]
+        self.next_block = 1
+        self._allocate()
+
+    def _allocate(self):
+        for seq_len, rows in zip(self.seq_lens, self.blocks, strict=True):
+            for row, (_, num_blocks, block_size) in zip(rows, self.groups, strict=True):
+                while len(row) < min(num_blocks, -(-seq_len // block_size)):
+                    row.append(self.next_block)
+                    self.next_block += 1
+
+    def step(self):
+        if len(self.seq_lens) > 1 and self.rng.random() < 0.01:
+            finished = self.rng.randrange(len(self.seq_lens))
+            del self.seq_lens[finished], self.blocks[finished]
+        self.seq_lens = [seq_len + 1 for seq_len in self.seq_lens]
+        self._allocate()
+
+    def write(self, runner):
+        for gid, table in enumerate(runner.input_batch.block_table):
+            cpu = table.get_cpu_tensor()
+            cpu.zero_()
+            for i, rows in enumerate(self.blocks):
+                cpu[i, : len(rows[gid])] = torch.tensor(rows[gid], dtype=torch.int32)
+
+    def ctx(self, num_reqs_padded):
+        seq_lens = torch.zeros(num_reqs_padded, dtype=torch.int32)
+        seq_lens[: len(self.seq_lens)] = torch.tensor(self.seq_lens, dtype=torch.int32)
+        return AttentionMetadataBuilderContext(
+            num_reqs=len(self.seq_lens),
+            start_index=0,
+            use_max_model_len=True,
+            seq_lens=seq_lens,
+            query_start_loc=torch.zeros(num_reqs_padded + 1, dtype=torch.int32),
+            request_distribution=torch.zeros(3, dtype=torch.int32),
+        )
+
+
+class TestBlockTableUploadReuse:
+    """A walk reuses the previous walk's staged block table while the packed
+    host bytes repeat, and uploads whenever they change."""
+
+    def _runner(self, groups, unified=True, max_num_reqs=32):
+        """A runner stand-in with one real builder per `(is_mamba, num_blocks,
+        block_size)` group and the host staging state of `stage_h2d_upload`."""
+        runner = SimpleNamespace(
+            device=torch.device("cpu"),
+            _unified_kv_layout=unified,
+            _unfenced_h2d_sources=[],
+            _fenced_h2d_sources=[],
+            _free_h2d_sources={},
+            _registered_h2d_sources=set(),
+            _block_table_upload_reuse=None,
+        )
+        tables, groups_out = [], []
+        for gid, (is_mamba, num_blocks, block_size) in enumerate(groups):
+            cpu = torch.zeros((max_num_reqs, num_blocks), dtype=torch.int32)
+            tables.append(
+                SimpleNamespace(
+                    max_num_blocks_per_req=num_blocks,
+                    get_cpu_tensor=lambda cpu=cpu: cpu,
+                )
+            )
+            if is_mamba:
+                spec = MambaSpec(
+                    block_size=block_size,
+                    shapes=((4, 128),),
+                    dtypes=(torch.bfloat16,),
+                )
+            else:
+                spec = FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=64,
+                    dtype=torch.bfloat16,
+                )
+            builder = AttentionMetadataBuilder(
+                kv_cache_spec=spec,
+                layer_names=[f"layer.{gid}"],
+                vllm_config=MagicMock(),
+                device=runner.device,
+                runner=runner,
+                kv_cache_group_id=gid,
+            )
+            groups_out.append(
+                [SimpleNamespace(metadata_builders=[builder], layer_names=[])]
+            )
+        runner.input_batch = SimpleNamespace(block_table=tables)
+        runner.attn_groups = groups_out
+        return runner
+
+    def _walk(self, runner, ctx, num_reqs_padded, uploads):
+        """One chunk's staging, between the fence wait and the fence record."""
+        _wait_staging_fence(runner)
+        before = uploads.count
+        stage_block_table_uploads(runner, ctx, num_reqs_padded)
+        _record_staging_fence(runner)
+        return uploads.count - before
+
+    @pytest.mark.parametrize(
+        "groups,unified,steps,seed",
+        [
+            # One attention group and three GDN groups on the unified pool:
+            # the walk derives the mamba indices from the staged tables.
+            ([(False, 9, 512)] + [(True, 9, 512)] * 3, True, 400, 3),
+            # A single attention group: the staged upload is the table itself.
+            ([(False, 9, 128)], False, 400, 5),
+            # 35 blocks of 128 tokens per group: blocks fill faster, so the
+            # tables change more often.
+            ([(False, 35, 128)] + [(True, 35, 128)] * 3, True, 600, 11),
+        ],
+        ids=["unified-mamba", "single-group", "35x128-blocks"],
+    )
+    def test_reuse_matches_uploading_every_walk(
+        self, monkeypatch, groups, unified, steps, seed
+    ):
+        """Over a decode trace with block-boundary crossings and finishing
+        requests, every walk stages exactly what a fresh upload stages, an
+        upload happens exactly when the packed bytes change, and a reused walk
+        hands its unused host buffer back to the free list."""
+        uploads = _CountingUploads(monkeypatch)
+        num_reqs_padded = 16
+        reused = self._runner(groups, unified)
+        fresh = self._runner(groups, unified)
+        trace = _DecodeTrace(groups, num_reqs=10, seed=seed)
+        reused_uploads = fresh_uploads = changes = 0
+        prev_bytes = None
+        for step in range(steps):
+            trace.step()
+            trace.write(reused)
+            trace.write(fresh)
+            ctx_reused = trace.ctx(num_reqs_padded)
+            ctx_fresh = trace.ctx(num_reqs_padded)
+            reused_uploads += self._walk(reused, ctx_reused, num_reqs_padded, uploads)
+            # Dropping the previous upload makes every walk upload, as before
+            # this reuse.
+            fresh._block_table_upload_reuse = None
+            fresh_uploads += self._walk(fresh, ctx_fresh, num_reqs_padded, uploads)
+
+            assert ctx_reused.staged_block_tables.keys() == (
+                ctx_fresh.staged_block_tables.keys()
+            )
+            for gid, table in ctx_fresh.staged_block_tables.items():
+                got = ctx_reused.staged_block_tables[gid]
+                assert got.dtype == table.dtype and got.shape == table.shape
+                assert torch.equal(got, table), (step, gid)
+            if ctx_fresh.staged_mamba_products is None:
+                assert ctx_reused.staged_mamba_products is None
+            else:
+                for gid, products in ctx_fresh.staged_mamba_products.items():
+                    for got, want in zip(
+                        ctx_reused.staged_mamba_products[gid], products, strict=True
+                    ):
+                        assert (got is None) == (want is None), (step, gid)
+                        assert want is None or torch.equal(got, want), (step, gid)
+
+            packed = b"".join(
+                table.get_cpu_tensor()[:num_reqs_padded].numpy().tobytes()
+                for table in reused.input_batch.block_table
+            )
+            if packed != prev_bytes:
+                changes += 1
+            prev_bytes = packed
+            # The host buffer pool stays bounded, and no buffer is both free
+            # and still read by an upload in flight.
+            assert len(reused._registered_h2d_sources) <= 64
+            in_flight = {
+                id(h)
+                for h, _ in reused._unfenced_h2d_sources + reused._fenced_h2d_sources
+            }
+            free = {id(h) for bufs in reused._free_h2d_sources.values() for h in bufs}
+            assert not in_flight & free
+
+        assert fresh_uploads == steps
+        assert reused_uploads == changes
+        assert 0 < reused_uploads < steps // 2
+        assert len(reused._registered_h2d_sources) <= len(fresh._registered_h2d_sources)
+
+    def test_dummy_walks_always_upload(self, monkeypatch):
+        uploads = _CountingUploads(monkeypatch)
+        runner = self._runner([(False, 4, 16), (True, 4, 16)])
+        for _ in range(3):
+            ctx = AttentionMetadataBuilderContext(
+                num_reqs=4,
+                start_index=0,
+                use_max_model_len=True,
+                seq_lens=torch.zeros(8, dtype=torch.int32),
+                query_start_loc=torch.zeros(9, dtype=torch.int32),
+                request_distribution=torch.zeros(3, dtype=torch.int32),
+                position_ids_override=torch.zeros(8, dtype=torch.int32),
+            )
+            assert self._walk(runner, ctx, 8, uploads) == 1
+        assert runner._block_table_upload_reuse is None
+
+    def test_recycled_host_buffer_cannot_corrupt_the_reused_table(self, monkeypatch):
+        """Once its fence is waited on, the host buffer of a staged walk goes
+        back to the free list and a later walk refills it; a walk that reuses
+        the staged table must still read the rows it was staged with."""
+        uploads = _CountingUploads(monkeypatch)
+        groups = [(False, 4, 16)]
+        runner = self._runner(groups, unified=False)
+        trace = _DecodeTrace(groups, num_reqs=3, seed=9)
+        trace.write(runner)
+        assert self._walk(runner, trace.ctx(8), 8, uploads) == 1
+        staged = runner._block_table_upload_reuse[1]
+        expected = staged.clone()
+        _wait_staging_fence(runner)
+        for bufs in runner._free_h2d_sources.values():
+            for buf in bufs:
+                buf.fill_(12345)
+        assert torch.equal(staged, expected)
+
+        ctx = trace.ctx(8)
+        assert self._walk(runner, ctx, 8, uploads) == 0
+        assert torch.equal(ctx.staged_block_tables[0], expected)
 
 
 class TestPrefillCheckpointIds:
