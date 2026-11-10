@@ -122,6 +122,22 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_DCP_FINE_PREFIX: bool = False
     VLLM_TPU_QSA_DCP_FINE_PREFIX_SEQ_TAIL: bool = False
     VLLM_TPU_QSA_PREFILL_LEAN: bool = False
+    VLLM_TPU_QSA_PREFILL_UNION_WALK: int = 0
+    VLLM_TPU_QSA_PREFILL_UNION_MIN_CONTEXT: int = 32768
+    VLLM_TPU_QSA_PREFILL_UNION_CAP: int = 12288
+    VLLM_TPU_QSA_PREFILL_UNION_KV_TILE: int = 1024
+    VLLM_TPU_QSA_PREFILL_UNION_LISTED: str = ""
+    VLLM_TPU_QSA_PREFILL_UNION_SHARE_BITS: bool = False
+    VLLM_TPU_QSA_PREFILL_UNION_ALPHA: float = 0.0
+    VLLM_TPU_QSA_PREFILL_UNION_QK16: bool = False
+    VLLM_TPU_QSA_PREFILL_UNION_RUN_TABLES: bool = False
+    VLLM_TPU_QSA_PREFILL_UNION_LAZY_SHARE: bool = False
+    VLLM_TPU_QSA_PREFILL_UNION_SC_BITSET: bool = False
+    VLLM_TPU_QSA_PREFILL_UNION_GATHERED: str = ""
+    VLLM_TPU_QSA_PREFILL_UNION_GATHER_CHUNKS: int = 4
+    VLLM_TPU_QSA_PREFILL_UNION_GATHER_GROWTH: float = 1.0
+    VLLM_TPU_QSA_PREFILL_UNION_COMPACT_REQS: int = 0
+    VLLM_TPU_QSA_PREFILL_UNION_COMPACT_COPY: str = "vmem"
     VLLM_TPU_QSA_PREFILL_PREFIX_PAGES: bool = False
     VLLM_TPU_QSA_MAIN_KV_DCP: int = 0
     VLLM_TPU_QSA_DCP_PREFILL_QUERY_BLOCK: int = 1024
@@ -878,6 +894,85 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # qwen4_exp QSA sparse prefill: skip the FP8 key finite/written guard,
     # which the score mask select already covers (bit-identical output).
     "VLLM_TPU_QSA_PREFILL_LEAN": env_bool("VLLM_TPU_QSA_PREFILL_LEAN"),
+    # Qwen4-exp QSA prefill: union-walk attention (qsa_union_dense.
+    # union_walk_prefill) with query groups of this many rows (a divisor of 128,
+    # at least 8; 0, the default, keeps the block-sparse kernel). Each group of
+    # rows attends only the union of its rows' selected 4-token groups, DMA'd
+    # straight from the paged pool, instead of every KV tile any row of a
+    # 256-row query block selected. Taken for D256 steps (24/2 or a TP rank's
+    # 3/1, 6/1, 12/1 query/KV heads) on an FP8 pool of 128-aligned (1, 4, 256)
+    # pages, at least 1024 tokens and a multiple of the group, without DCP, a KV
+    # head offset or LSE output. Each step falls back to the block-sparse kernel
+    # when its longest row is below VLLM_TPU_QSA_PREFILL_UNION_MIN_CONTEXT
+    # tokens or a group's union exceeds VLLM_TPU_QSA_PREFILL_UNION_CAP 4-token
+    # groups. Not bitwise against the block-sparse kernel (union-order online
+    # softmax, equal precision); accuracy gated.
+    "VLLM_TPU_QSA_PREFILL_UNION_WALK": env_nonnegative_int(
+        "VLLM_TPU_QSA_PREFILL_UNION_WALK", 0
+    ),
+    "VLLM_TPU_QSA_PREFILL_UNION_MIN_CONTEXT": env_nonnegative_int(
+        "VLLM_TPU_QSA_PREFILL_UNION_MIN_CONTEXT", 32768
+    ),
+    "VLLM_TPU_QSA_PREFILL_UNION_CAP": env_nonnegative_int(
+        "VLLM_TPU_QSA_PREFILL_UNION_CAP", 12288
+    ),
+    # KV tile of the union walk: union groups per tile times 4 (256-2048).
+    "VLLM_TPU_QSA_PREFILL_UNION_KV_TILE": env_nonnegative_int(
+        "VLLM_TPU_QSA_PREFILL_UNION_KV_TILE", 1024
+    ),
+    # Union walk options (all off by default; bitwise unless noted):
+    # LISTED: issue the walk's copies from a union id list instead of scanning
+    # the union bitset; "sparsecore" (union_sc_list, TPU) or "reference" (XLA).
+    # SHARE_BITS: a cap fallback reuses the walk plan's selection bitset.
+    # ALPHA: also fall back when a group's union exceeds this fraction of its
+    # visible groups (0 = off). QK16: QK as one BF16 MXU pass (exact operands,
+    # power-of-two score scales only).
+    "VLLM_TPU_QSA_PREFILL_UNION_LISTED": env_str("VLLM_TPU_QSA_PREFILL_UNION_LISTED", ""),
+    "VLLM_TPU_QSA_PREFILL_UNION_SHARE_BITS": env_bool(
+        "VLLM_TPU_QSA_PREFILL_UNION_SHARE_BITS"
+    ),
+    "VLLM_TPU_QSA_PREFILL_UNION_ALPHA": env_float("VLLM_TPU_QSA_PREFILL_UNION_ALPHA", 0.0),
+    "VLLM_TPU_QSA_PREFILL_UNION_QK16": env_bool("VLLM_TPU_QSA_PREFILL_UNION_QK16"),
+    # RUN_TABLES (with LISTED; parked): the walk issued from SparseCore run tables.
+    "VLLM_TPU_QSA_PREFILL_UNION_RUN_TABLES": env_bool(
+        "VLLM_TPU_QSA_PREFILL_UNION_RUN_TABLES"
+    ),
+    # LAZY_SHARE (with SHARE_BITS): walk on group-aligned rows; only a fallback
+    # builds the block-sparse layout.
+    "VLLM_TPU_QSA_PREFILL_UNION_LAZY_SHARE": env_bool(
+        "VLLM_TPU_QSA_PREFILL_UNION_LAZY_SHARE"
+    ),
+    # SC_BITSET: the union plan's per-row bitset built on the SparseCore (the
+    # same bits), off the TensorCore.
+    "VLLM_TPU_QSA_PREFILL_UNION_SC_BITSET": env_bool(
+        "VLLM_TPU_QSA_PREFILL_UNION_SC_BITSET"
+    ),
+    # GATHERED ("", "reference", "sparsecore"; with LISTED): the walk-free
+    # kernel on chunked SparseCore-gathered union tiles.
+    "VLLM_TPU_QSA_PREFILL_UNION_GATHERED": env_str(
+        "VLLM_TPU_QSA_PREFILL_UNION_GATHERED", ""
+    ),
+    "VLLM_TPU_QSA_PREFILL_UNION_GATHER_CHUNKS": env_int(
+        "VLLM_TPU_QSA_PREFILL_UNION_GATHER_CHUNKS", 4
+    ),
+    # GATHER_GROWTH (>= 1; 1 = even chunks): chunk k of the gathered walk holds
+    # about growth**k as many query groups as chunk 0. Bitwise.
+    "VLLM_TPU_QSA_PREFILL_UNION_GATHER_GROWTH": env_float(
+        "VLLM_TPU_QSA_PREFILL_UNION_GATHER_GROWTH", 1.0
+    ),
+    # COMPACT_REQS (N > 0; with GATHERED): the SparseCore takes at most 16 GiB
+    # per tensor, so the gather reads a per-step compact pool of the first N
+    # requests' pages (whole-page copies); a step with more requests takes the
+    # listed walk on the full pool (bitwise). 0: the gather reads the pool.
+    "VLLM_TPU_QSA_PREFILL_UNION_COMPACT_REQS": env_nonnegative_int(
+        "VLLM_TPU_QSA_PREFILL_UNION_COMPACT_REQS", 0
+    ),
+    # COMPACT_COPY: how the compact pool is copied ("vmem": whole pages staged
+    # through VMEM; "pipe": a Pallas pipeline of 32-bit words; "dma": HBM-to-HBM
+    # DMAs, slow). All byte-exact.
+    "VLLM_TPU_QSA_PREFILL_UNION_COMPACT_COPY": env_str(
+        "VLLM_TPU_QSA_PREFILL_UNION_COMPACT_COPY", "vmem"
+    ),
     # qwen4_exp QSA (unsharded indexer path): when every row's completed groups
     # fit the top-k budget, take all visible groups and skip the StreamIndex
     # scoring call (the sharded path already does). Same selected set; the

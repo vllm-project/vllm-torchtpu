@@ -655,6 +655,7 @@ def block_sparse_gqa_prefill(
     return_lse: bool = False,
     dcp_rank=None,
     dcp_world: int = 1,
+    block_bits=None,
 ):
     """``_block_sparse_gqa_prefill``, optionally on a bounded page-table prefix.
 
@@ -683,9 +684,16 @@ def block_sparse_gqa_prefill(
             return_lse=return_lse,
             dcp_rank=dcp_rank,
             dcp_world=dcp_world,
+            **({"block_bits": block_bits} if block_bits is not None else {}),
         )
 
-    if not envs.VLLM_TPU_QSA_PREFILL_PREFIX_PAGES or dcp_rank is not None:
+    # A precomputed bitset (the union walk's shared fallback) is laid out over
+    # the whole table: no prefix dispatch.
+    if (
+        not envs.VLLM_TPU_QSA_PREFILL_PREFIX_PAGES
+        or dcp_rank is not None
+        or block_bits is not None
+    ):
         return run(page_table)
     return _metadata_prefix_dispatch(
         run,
@@ -719,8 +727,14 @@ def _block_sparse_gqa_prefill(
     return_lse: bool = False,
     dcp_rank=None,
     dcp_world: int = 1,
+    block_bits=None,
 ):
     """Run exact selected-group attention with query-block KV reuse.
+
+    ``block_bits``: this step's selection bitset, already built by the caller
+    in ``_selection_bitset``'s layout ([blocks, words, native width]; one
+    256-row part, no DCP, the bitset kernel on). The union walk's shared
+    fallback passes its plan's bits.
 
     ``return_lse``: also return lse [tokens, heads] (natural log of the scaled
     scores' sum, -inf for a row with no key); the output is then f32.
@@ -821,7 +835,18 @@ def _block_sparse_gqa_prefill(
     # words itself, so the global bitset, its relayout copy and the owned-word
     # gather drop out (bit-identical).
     owned_kernel = dcp and envs.VLLM_TPU_QSA_PREFILL_BITSET_OWNED
-    if envs.VLLM_TPU_QSA_PREFILL_BITSET_KERNEL:
+    if block_bits is not None:
+        if dcp or parts != 1 or not envs.VLLM_TPU_QSA_PREFILL_BITSET_KERNEL:
+            raise ValueError(
+                "a precomputed bitset needs one 256-row part, no DCP and the bitset kernel"
+            )
+        if tuple(block_bits.shape) != (nblocks, words, part_width):
+            raise ValueError(
+                f"block_bits {block_bits.shape} != {(nblocks, words, part_width)}"
+            )
+    if envs.VLLM_TPU_QSA_PREFILL_BITSET_KERNEL and block_bits is not None:
+        block_bits_native = block_bits
+    elif envs.VLLM_TPU_QSA_PREFILL_BITSET_KERNEL:
         block_bits_native = _selection_bitset(
             blocks,
             lengths,
