@@ -30,6 +30,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec, Tiles
 from vllm_torchtpu.megakernel.models import qwen38
 from vllm_torchtpu.megakernel.models.qwen38_step import make_flat_segment_step
@@ -107,18 +108,32 @@ def gdn_blocks(
     def inside(x):
         return x if n_blocks is None else jnp.where((x >= 0) & (x < n_blocks), x, 0)
 
-    rbs, wbs, his = [], [], []
-    for i in range(0, len(meta), GDN_META):
-        st, off, ck, qsl, seq = meta[i : i + GDN_META]
+    def one(st, off, ck, qsl, seq):
         st = _fit(st, NS)
         ck = _fit(ck[:, :T_VERIFY], NS)
         qsl = _fit(qsl, NS + 1)
         q_len = qsl[1:] - qsl[:-1]
         live = q_len > 0
         rb = jnp.take_along_axis(ck, off[st][:, None], axis=1)[:, 0]
-        rbs.append(inside(jnp.where(live, rb, 0)))
-        wbs.append(inside(jnp.where(live[:, None] & write, ck, 0)))
-        his.append(live & ((_fit(seq, NS) - q_len) > 0))
+        return (
+            inside(jnp.where(live, rb, 0)),
+            inside(jnp.where(live[:, None] & write, ck, 0)),
+            live & ((_fit(seq, NS) - q_len) > 0),
+        )
+
+    layers = [meta[i : i + GDN_META] for i in range(0, len(meta), GDN_META)]
+    if (
+        envs.VLLM_TPU_MK_WHOLE_BATCHED_INPUTS
+        and len(layers) > 1
+        and all(
+            (x.shape, x.dtype) == (y.shape, y.dtype)
+            for lay in layers
+            for x, y in zip(lay, layers[0], strict=True)
+        )
+    ):
+        # One vmapped pass instead of ~8 small ops per GDN layer (33 in the whole step).
+        return jax.vmap(one)(*(jnp.stack(f) for f in zip(*layers, strict=True)))
+    rbs, wbs, his = zip(*(one(*lay) for lay in layers), strict=True)
     return jnp.stack(rbs), jnp.stack(wbs), jnp.stack(his)
 
 
