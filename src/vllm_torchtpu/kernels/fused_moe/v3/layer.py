@@ -531,17 +531,14 @@ def _pallas_step(
         # the FFN kernel fetches each tile as one copy. The landing has to
         # be complete before the gather reads the buffer, so the exchange's
         # finish runs here as its own program instead of in the kernel: it
-        # reads the landing buffer where the arrivals land (without the
-        # memory-space constraint the compiler prefetches a copy into its
+        # reads the landing buffer aliased out of `shard_tables_kernel` (without
+        # the memory-space constraint the compiler prefetches a copy into its
         # alternate memory for the call, taken before the arrivals have
-        # landed), after the scatter's wait (by then the arrivals have
-        # landed), and returns a completion word the gather's index and
-        # rows depend on.
+        # landed), overlapping the last round's drain and intra-chip mate
+        # copies on the TensorCore with `scatter_row_tables` on the SparseCore,
+        # and returns a completion word the gather's index and rows depend on.
         n_sorted = align_up(
             token_of_row.shape[0], gather.gather_rows_multiple(config.gather_block_rows)
-        )
-        index = jnp.pad(
-            token_of_row.astype(jnp.int32), (0, n_sorted - token_of_row.shape[0])
         )
         landing = pltpu.with_memory_space_constraint(
             gathered_rows, pltpu.MemorySpace.HBM
@@ -550,13 +547,15 @@ def _pallas_step(
             landing,
             send_sem,
             receive_sems,
-            index[:LANES],
             num_shards=num_shards,
             mesh_axes=mesh_axes,
             rows_per_shard=gathered_rows.shape[0] // num_shards,
             shard_index=shard_index,
         )
         landed, done = lax.optimization_barrier((gathered_rows, done))
+        index = jnp.pad(
+            token_of_row.astype(jnp.int32), (0, n_sorted - token_of_row.shape[0])
+        )
         index = jnp.where(done[0, 0] > 0, index, 0)
         # A padding row (the tail of an (expert, shard) run, the tail slack,
         # the alignment) carries token zero in the table; thousands of

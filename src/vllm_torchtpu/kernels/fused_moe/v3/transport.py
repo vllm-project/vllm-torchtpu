@@ -357,7 +357,6 @@ def finish_call(
     gathered_rows,
     send_sem,
     receive_sems,
-    after,
     *,
     num_shards,
     rows_per_shard,
@@ -372,10 +371,10 @@ def finish_call(
     reads the buffer, and the gather's index is made to depend on the
     word. The buffer is read here, never returned: returning it aliased
     would have the compiler snapshot it, and the snapshot is taken before
-    the arrivals land. `after` is an array the call only depends on: the
-    layer hands in a slice of the scatter's output, so the finish runs
-    once the scatter's wait is over, by which time the arrivals have
-    landed and the finish waits for nothing."""
+    the arrivals land. `gathered_rows` comes back aliased from
+    `shard_tables_kernel`, ordering this call after the middle rounds while
+    letting it overlap on the TensorCore with `scatter_row_tables` on the
+    SparseCore."""
 
     def kernel(*refs):
         if shard_index is not None:
@@ -383,8 +382,7 @@ def finish_call(
             shard = shard_ref[0]
         else:
             shard = lax.axis_index(MESH_AXIS)
-        rows_ref, send_ref, receive_ref, after_ref, done_ref = refs
-        del after_ref  # an ordering operand
+        rows_ref, send_ref, receive_ref, done_ref = refs
         finish(
             Exchange(
                 rows_ref,
@@ -407,7 +405,7 @@ def finish_call(
         in_specs=(
             [pl.BlockSpec(memory_space=pltpu.SMEM)] if shard_index is not None else []
         )
-        + [hbm, sem, sem, hbm],
+        + [hbm, sem, sem],
         out_specs=vmem,
         compiler_params=pltpu.CompilerParams(has_side_effects=layout.SIDE_EFFECTS),
         name="fused_ep_transport_finish",
@@ -416,7 +414,6 @@ def finish_call(
         gathered_rows,
         send_sem,
         receive_sems,
-        after,
     )
 
 
