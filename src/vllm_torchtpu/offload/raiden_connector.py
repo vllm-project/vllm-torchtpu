@@ -107,6 +107,38 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# How long poll_and_complete_transfers waits for a pending host-tier load when
+# a request is blocked on one (at least 5 ms when nothing else is running).
+_LOAD_WAIT_MS = 1.5
+
+
+def _connector_option(extra_config: Mapping[str, Any], key: str, default: Any) -> Any:
+    """Reads an opt-in option from this connector's kv_connector_extra_config.
+
+    An absent key returns ``default``, which keeps the connector's default
+    behaviour. The value must have the default's type exactly (a JSON boolean
+    for a bool, a non-negative JSON integer for an int), so a typo fails at
+    start-up instead of silently leaving the option off.
+
+    Options:
+      max_async_loads (int, default 0 = no cap): host-tier loads in flight
+        before a request with a host-tier hit is deferred to a later step.
+      fence_after_draft (bool, default false): record a step's store fences
+        one get_finished() call later, after the draft model's KV writes.
+    """
+    value = extra_config.get(key, default)
+    if isinstance(default, bool):
+        ok = isinstance(value, bool)
+    else:
+        ok = isinstance(value, int) and not isinstance(value, bool) and value >= 0
+    if not ok:
+        raise ValueError(
+            f"kv_connector_extra_config[{key!r}] must be a "
+            f"{'boolean' if isinstance(default, bool) else 'non-negative integer'}, "
+            f"got {value!r}"
+        )
+    return value
+
 
 def _enqueue_pool_writes(pool_tensors: list[torch.Tensor]) -> None:
     """Asynchronously dispatches graph execution for KV pool buffers without blocking.
@@ -224,6 +256,9 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         self._fence_pending: dict[int, _ParkedStore] = {}
         self._scheduler: Any = None
         self._pending_failed_jobs: list[Any] = []
+        self._max_async_load_reqs: int = _connector_option(
+            spec.extra_config, "max_async_loads", 0
+        )
 
     def _complete_jobs_directly(
         self,
@@ -306,7 +341,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 for r in scheduler.kv_holding_waiting
             )
             if has_waiting_remote:
-                wait_ms = float(tpu_envs.VLLM_TPU_RAIDEN_LOAD_WAIT_MS)
+                wait_ms = _LOAD_WAIT_MS
                 if wait_ms > 0.0:
                     if not getattr(scheduler, "running", None):
                         wait_ms = max(wait_ms, 5.0)
@@ -529,13 +564,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 req_status.update_num_hit_chunks(num_computed_tokens)
                 self._touch(req_status)
             return 0, False
-        max_loads = getattr(self, "_max_async_load_reqs", None)
-        if max_loads is None:
-            try:
-                max_loads = int(os.environ.get("TPU_OFFLOAD_MAX_ASYNC_LOAD_REQS", "4"))
-            except ValueError:
-                max_loads = 4
-            self._max_async_load_reqs = max_loads
+        max_loads = getattr(self, "_max_async_load_reqs", 0)
         if max_loads > 0:
             active_loads = sum(1 for js in self._jobs.values() if not js.is_store)
             if active_loads >= max_loads:
@@ -695,7 +724,6 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                     req_status.req_context,
                 )
 
-
     def update_connector_output(self, connector_output: KVConnectorOutput):
         meta = connector_output.kv_connector_worker_meta
         if isinstance(meta, RaidenOffloadingWorkerMetadata) and meta.fenced_jobs:
@@ -722,9 +750,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         without emitting duplicate lookup events."""
         req_status.num_locally_computed_tokens = base_tokens
         tracker = getattr(self, "_events_tracker", None)
-        orig_record = (
-            getattr(tracker, "record_lookup", None) if tracker else None
-        )
+        orig_record = getattr(tracker, "record_lookup", None) if tracker else None
         orig_partial = (
             getattr(tracker, "record_partial_lookup", None) if tracker else None
         )
@@ -823,7 +849,6 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
             request, num_local, num_reconciled, block_size
         )
 
-
     @classmethod
     def get_required_kvcache_layout(cls, vllm_config: VllmConfig) -> str | None:
         """No layout preference, unlike the `OffloadingConnector` this extends.
@@ -912,21 +937,21 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
             # In-flight fence events awaiting device retirement before acknowledging
             # store jobs, recorded as pairs of (fence_job_ids, event).
             self._pending_fences: list[tuple[set[int], torch.Event]] = []
-            # QX_OFFLOAD_FENCE_AFTER_DRAFT=1: the runner calls get_finished()
-            # after the target forward but BEFORE the speculative (MTP/eagle)
-            # draft propose, which writes the draft layer's KV into the same
-            # pool blocks. Deferring the fence for a step's store jobs to the
-            # next get_finished() call orders it after every KV write of that
-            # step, draft included.
-            self._fence_after_draft: bool = (
-                os.environ.get("QX_OFFLOAD_FENCE_AFTER_DRAFT", "0") == "1"
+            # fence_after_draft: the runner calls get_finished() after the
+            # target forward but BEFORE the speculative (MTP/eagle) draft
+            # propose, which writes the draft layer's KV into the same pool
+            # blocks. Deferring the fence for a step's store jobs to the next
+            # get_finished() call orders it after every KV write of that step,
+            # draft included.
+            self._fence_after_draft: bool = _connector_option(
+                spec.extra_config, "fence_after_draft", False
             )
             self._deferred_fence_ids: set[int] = set()
             if self._fence_after_draft:
                 logger.info(
-                    "TPURaidenOffloadingConnector: QX_OFFLOAD_FENCE_AFTER_DRAFT=1: "
-                    "store fences are recorded one get_finished() call later so "
-                    "they order after the step's draft (MTP) KV writes"
+                    "TPURaidenOffloadingConnector: fence_after_draft: store "
+                    "fences are recorded one get_finished() call later so they "
+                    "order after the step's draft (MTP) KV writes"
                 )
 
     # -- scheduler-side hooks ----------------------------------------------
@@ -1050,9 +1075,7 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
                 "KV pool tensors must be registered before the save fence"
             )
             _enqueue_pool_writes(self._pool_sync_tensors)
-            self._pending_fences.append(
-                (fence_job_ids, _record_fence_event())
-            )
+            self._pending_fences.append((fence_job_ids, _record_fence_event()))
 
         if self._pending_fences:
             # Non-blockingly drain retired events and acknowledge completed fences.
