@@ -5912,8 +5912,14 @@ class TPUModelRunner(GPUModelRunner):
         independent request streams, so they decorrelate, which is fine.)
         """
         if self._sampling_generator is None:
+            seed = int(self.model_config.seed or 0)
             gen = torch.Generator(device=self.device)
-            gen.manual_seed(int(self.model_config.seed or 0))
+            gen.manual_seed(seed)
+            if getattr(self.device, "type", None) == "tpu":
+                dev_idx = self.device.index or 0
+                default_gens = getattr(torch.tpu, "default_generators", ())
+                if dev_idx < len(default_gens):
+                    default_gens[dev_idx].manual_seed(seed)
             self._sampling_generator = gen
         return self._sampling_generator
 
@@ -6253,15 +6259,22 @@ class TPUModelRunner(GPUModelRunner):
                 logits,
                 padded_num_reqs=padded_num_reqs,
             )
-            num_cand = logits.shape[-1] // 2
-            n_draft = md.draft_token_ids.shape[0]
-            total_rows = padded_num_reqs + n_draft
-            u_both = torch.rand(
-                (total_rows, num_cand + 1),
-                dtype=torch.float32,
-                device=logits.device,
-                generator=sampling_generator,
-            )
+            if (
+                logits.device.type == "tpu"
+                and isinstance(self.rejection_sampler, RejectionSampler)
+                and os.environ.get("VLLM_TPU_MTP_OPT", "1") != "0"
+            ):
+                u_both = None
+            else:
+                num_cand = logits.shape[-1] // 2
+                n_draft = md.draft_token_ids.shape[0]
+                total_rows = padded_num_reqs + n_draft
+                u_both = torch.rand(
+                    (total_rows, num_cand + 1),
+                    dtype=torch.float32,
+                    device=logits.device,
+                    generator=sampling_generator,
+                )
             return self.rejection_sampler.fused_verify_and_sample_candidates(
                 logits=logits,
                 draft_token_ids=md.draft_token_ids,
@@ -6312,15 +6325,22 @@ class TPUModelRunner(GPUModelRunner):
                         padded_num_reqs=padded_num_reqs,
                     )
                 )
-                num_cand = topk_candidates * CANDIDATE_BLOCK
-                n_draft = md.draft_token_ids.shape[0]
-                total_rows = padded_num_reqs + n_draft
-                u_both = torch.rand(
-                    (total_rows, num_cand + 1),
-                    dtype=torch.float32,
-                    device=logits.device,
-                    generator=sampling_generator,
-                )
+                if (
+                    logits.device.type == "tpu"
+                    and isinstance(self.rejection_sampler, RejectionSampler)
+                    and os.environ.get("VLLM_TPU_MTP_OPT", "1") != "0"
+                ):
+                    u_both = None
+                else:
+                    num_cand = topk_candidates * CANDIDATE_BLOCK
+                    n_draft = md.draft_token_ids.shape[0]
+                    total_rows = padded_num_reqs + n_draft
+                    u_both = torch.rand(
+                        (total_rows, num_cand + 1),
+                        dtype=torch.float32,
+                        device=logits.device,
+                        generator=sampling_generator,
+                    )
                 return self.rejection_sampler.fused_verify_and_sample_candidates(
                     logits=logits,
                     draft_token_ids=md.draft_token_ids,
@@ -6628,12 +6648,20 @@ class TPUModelRunner(GPUModelRunner):
                                     cur_start_idx, cur_end_idx, logits
                                 )
                             )
-                            u = torch.rand(
-                                (logits.shape[0], logits.shape[-1] // 2),
-                                dtype=torch.float32,
-                                device=logits.device,
-                                generator=sampling_generator,
-                            )
+                            if (
+                                logits.device.type == "tpu"
+                                and "sample_from_packed_candidates"
+                                not in getattr(self, "__dict__", {})
+                                and os.environ.get("VLLM_TPU_MTP_OPT", "1") != "0"
+                            ):
+                                u = None
+                            else:
+                                u = torch.rand(
+                                    (logits.shape[0], logits.shape[-1] // 2),
+                                    dtype=torch.float32,
+                                    device=logits.device,
+                                    generator=sampling_generator,
+                                )
                             selected = self.sample_from_packed_candidates(
                                 logits,
                                 temperatures_tpu,
@@ -6735,12 +6763,20 @@ class TPUModelRunner(GPUModelRunner):
                                 cur_start_idx, cur_end_idx, logits
                             )
                         )
-                        u = torch.rand(
-                            (logits.shape[0], logits.shape[-1] // 2),
-                            dtype=torch.float32,
-                            device=logits.device,
-                            generator=sampling_generator,
-                        )
+                        if (
+                            logits.device.type == "tpu"
+                            and "sample_from_packed_candidates"
+                            not in getattr(self, "__dict__", {})
+                            and os.environ.get("VLLM_TPU_MTP_OPT", "1") != "0"
+                        ):
+                            u = None
+                        else:
+                            u = torch.rand(
+                                (logits.shape[0], logits.shape[-1] // 2),
+                                dtype=torch.float32,
+                                device=logits.device,
+                                generator=sampling_generator,
+                            )
                         selected_token_ids = self.sample_from_packed_candidates(
                             logits,
                             temperatures_tpu,
@@ -8454,10 +8490,14 @@ class TPUModelRunner(GPUModelRunner):
                         dtype=torch.float32,
                         device=self.device,
                     )
-                    dummy_u_cand = torch.zeros(
-                        (num_reqs, num_packed_cand),
-                        dtype=torch.float32,
-                        device=self.device,
+                    dummy_u_cand = (
+                        None
+                        if os.environ.get("VLLM_TPU_MTP_OPT", "1") != "0"
+                        else torch.zeros(
+                            (num_reqs, num_packed_cand),
+                            dtype=torch.float32,
+                            device=self.device,
+                        )
                     )
                     out = self.sample_from_packed_candidates(
                         dummy_packed,
@@ -8786,10 +8826,14 @@ class TPUModelRunner(GPUModelRunner):
                         dtype=torch.float32,
                         device=self.device,
                     )
-                    warm_u_all = torch.zeros(
-                        (num_reqs + num_tokens, num_cand + 1),
-                        dtype=torch.float32,
-                        device=self.device,
+                    warm_u_all = (
+                        None
+                        if os.environ.get("VLLM_TPU_MTP_OPT", "1") != "0"
+                        else torch.zeros(
+                            (num_reqs + num_tokens, num_cand + 1),
+                            dtype=torch.float32,
+                            device=self.device,
+                        )
                     )
                     out = self.rejection_sampler.fused_verify_and_sample_candidates(
                         logits=dummy_logits,
@@ -8850,10 +8894,14 @@ class TPUModelRunner(GPUModelRunner):
                         dtype=torch.float32,
                         device=self.device,
                     )
-                    warm_u_all_packed = torch.zeros(
-                        (num_reqs + num_tokens, num_packed_cand + 1),
-                        dtype=torch.float32,
-                        device=self.device,
+                    warm_u_all_packed = (
+                        None
+                        if os.environ.get("VLLM_TPU_MTP_OPT", "1") != "0"
+                        else torch.zeros(
+                            (num_reqs + num_tokens, num_packed_cand + 1),
+                            dtype=torch.float32,
+                            device=self.device,
+                        )
                     )
                     out = self.rejection_sampler.fused_verify_and_sample_candidates(
                         logits=dummy_packed_cand,
@@ -9100,6 +9148,7 @@ class TPUModelRunner(GPUModelRunner):
                 self._warmup_spec_decode()
                 if self._adaptive_verification is not None:
                     self._init_adaptive_verification()
+        self._sampling_generator = None
 
     def _check_draft_buckets(self) -> None:
         """Refuses to start a producer whose draft lacks a target bucket.
@@ -10958,7 +11007,7 @@ class TPUModelRunner(GPUModelRunner):
         self,
         packed_candidates: torch.Tensor,
         temperatures: torch.Tensor,
-        u: torch.Tensor,
+        u: torch.Tensor | None,
         top_k: torch.Tensor,
         top_p: torch.Tensor,
     ) -> torch.Tensor:
@@ -10966,9 +11015,18 @@ class TPUModelRunner(GPUModelRunner):
         num_cand = packed_candidates.shape[-1] // 2
         cand_logits = packed_candidates[:, :num_cand]
         cand_token_ids = packed_candidates[:, num_cand:].to(torch.int64)
+        if u is None:
+            u = torch.rand(
+                (packed_candidates.shape[0], num_cand),
+                dtype=torch.float32,
+                device=packed_candidates.device,
+            )
         is_greedy = temperatures <= SAMPLING_EPS
         scaled_logits = self._apply_temperature(cand_logits, temperatures)
-        masked_logits = apply_top_k_top_p(scaled_logits, top_k, top_p)
+        max_k = min(32, scaled_logits.shape[-1])
+        masked_logits = apply_top_k_top_p(
+            scaled_logits, top_k, top_p, max_k=max_k
+        )
         u_clamped = torch.clamp(
             u, min=torch.finfo(u.dtype).tiny, max=1.0 - torch.finfo(u.dtype).eps
         )
