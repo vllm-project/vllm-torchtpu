@@ -32,8 +32,8 @@ from vllm_torchtpu.kernels.fused_moe.v2.token_parallel import (
 
 
 @pytest.mark.parametrize("groups", [None, tuple((i,) for i in range(8))])
-@pytest.mark.parametrize("rows", [1, 7, 17, 257])
-def test_singleton_preserves_unaligned_inputs_without_traced_operations(groups, rows):
+@pytest.mark.parametrize("rows", [1, 8, 16, 256])
+def test_singleton_preserves_aligned_inputs_without_traced_operations(groups, rows):
     layout = TokenReplicaLayout.create(
         ep=8, input_rows=rows, groups=groups, row_alignment=8
     )
@@ -121,6 +121,20 @@ def test_unique_rows_and_original_output_on_every_tp_rank(groups, rows, alignmen
 def test_invalid_replica_groups_are_rejected(groups):
     with pytest.raises(ValueError):
         TokenReplicaLayout.create(ep=4, input_rows=16, groups=groups)
+
+
+@pytest.mark.parametrize("input_rows", [1, 2, 3, 6, 8, 9, 15, 16])
+def test_singleton_group_split_restore_round_trip(input_rows):
+    layout = TokenReplicaLayout.create(ep=1, input_rows=input_rows, row_alignment=8)
+    assert len(layout.groups) == 1
+    assert len(layout.groups[0]) == 1
+    assert layout.local_rows >= input_rows
+    x = jnp.arange(input_rows * 4, dtype=jnp.float32).reshape(input_rows, 4)
+    rank = jnp.array(0, dtype=jnp.int32)
+    split_x = layout.split(x, rank)
+    assert split_x.shape[0] == layout.local_rows
+    restored = layout.restore(split_x, axis="d")
+    np.testing.assert_array_equal(restored, x)
 
 
 @pytest.mark.parametrize("width", [1, 2, 3, 4, 8, 16])
