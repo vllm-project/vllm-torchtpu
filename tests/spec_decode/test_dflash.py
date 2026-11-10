@@ -41,6 +41,7 @@ from vllm.v1.request import Request
 from vllm.v1.structured_output import StructuredOutputManager
 
 from vllm_torchtpu import _patch_dflash_drafting_slot_budget
+from vllm_torchtpu.layers.adapter import attention as attention_adapter
 from vllm_torchtpu.layers.adapter import token_padding
 from vllm_torchtpu.layers.adapter.token_padding import TokenPaddingState
 from vllm_torchtpu.platforms.tpu_platform import _get_token_paddings
@@ -1045,3 +1046,81 @@ def test_compiled_input_builders_compile_no_program_per_request_count(device, bu
     assert programs() == before, (
         f"{builder} builder compiled a program per request count"
     )
+
+
+def _fake_attn_impl(cls, decode_query_size, *, kernel_entry=None, built=True):
+    impl = cls.__new__(cls)
+    impl.decode_query_size = decode_query_size
+    impl.rpa_kernel = object() if built else None
+    if kernel_entry is not None:
+        impl._kernel_entry = kernel_entry
+    return impl
+
+
+def _set_draft_impls(proposer, impls):
+    layers = [
+        SimpleNamespace(self_attn=SimpleNamespace(attn=SimpleNamespace(impl=impl)))
+        for impl in impls
+    ]
+    proposer.draft_model = SimpleNamespace(model=SimpleNamespace(layers=layers))
+
+
+def _batched(decode_query_size, **kwargs):
+    return _fake_attn_impl(
+        attention_adapter.PallasBatchedRPAAttentionBackendImpl,
+        decode_query_size,
+        **kwargs,
+    )
+
+
+def test_draft_forward_takes_decode_stage_on_batched_rpa():
+    proposer = _make_proposer()  # K = 4, so 5 queries per request.
+    assert proposer.block_size == 5
+    _set_draft_impls(proposer, [_batched(5), _batched(5)])
+    qsl, rd = proposer._get_static_attn_tensors(3)
+    assert qsl.tolist() == [0, 5, 10, 15]
+    assert rd.tolist() == [3, 3, 3]
+
+
+@pytest.mark.parametrize(
+    "impls",
+    [
+        # RPA v3: its DECODE stage takes one query per request.
+        [_fake_attn_impl(attention_adapter.PallasAttentionBackendImpl, 1)],
+        # One RPA v3 (e.g. hd64-rerouted) layer is enough to keep MIXED.
+        [_batched(5), _fake_attn_impl(attention_adapter.PallasAttentionBackendImpl, 1)],
+        # Replicated draft: the runner moves it to the local RPA v3 kernel.
+        [_batched(1, kernel_entry=attention_adapter._pallas_rpa_kernel_local)],
+        # DECODE tile narrower or wider than the draft block (e.g. dense-layout
+        # DSpark, whose block is K).
+        [_batched(4)],
+        [_batched(6)],
+        # DCP builds separate kernels and no layer-major one.
+        [_batched(5, built=False)],
+        [],
+    ],
+    ids=[
+        "rpa_v3",
+        "one_rpa_v3_layer",
+        "replicated_local",
+        "narrow_tile",
+        "wide_tile",
+        "no_layer_major_kernel",
+        "no_layers",
+    ],
+)
+def test_draft_forward_stays_mixed_without_a_matching_decode_tile(impls):
+    proposer = _make_proposer()
+    _set_draft_impls(proposer, impls)
+    assert proposer._draft_uses_decode_stage() is False
+    _, rd = proposer._get_static_attn_tensors(3)
+    assert rd.tolist() == [0, 0, 3]
+
+
+def test_draft_forward_stays_mixed_without_a_loaded_draft_model():
+    # Stage routing is an optimization: with no draft model loaded (e.g. a
+    # proposer driven directly in tests), the draft forward keeps MIXED.
+    proposer = _make_proposer()
+    assert proposer.draft_model is None
+    _, rd = proposer._get_static_attn_tensors(3)
+    assert rd.tolist() == [0, 0, 3]
