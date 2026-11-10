@@ -707,9 +707,9 @@ def _build_fused_ep_moe_kernel(
     # gate/up matmul and the next visit's first block waits for all of it.
     # Column chunks (W1_/W2_STREAM_CHUNK output columns, whole numbers of the
     # reader's FP4_OUTPUT_CHUNK) let each chunk be refilled as soon as it
-    # is retired and landed as late as its first read, so the wire stays busy
-    # across visits. Smaller chunks lose: every wait is a scheduling fence in
-    # the unrolled matmul chain.
+    # is retired, so the wire stays busy across visits; a slab's chunks are
+    # all waited at its first read. Smaller chunks lose: every wait is a
+    # scheduling fence in the unrolled matmul chain.
     # Only where an expert is expected to fit one tile (the bound the height
     # rungs use): a multi-tile visit re-reads the slab every tile, and the
     # per-chunk predicates then cost more than the refill overlap buys.
@@ -1080,20 +1080,26 @@ def _build_fused_ep_moe_kernel(
 
         def _chunk_hooks(expert, visit_i, slot, first_tile, last_tile):
             """`(before, after)`, each `(which, block, n_start) -> ()`, for a
-            chunk-streamed visit: `before` lands chunk `n_start` at its first
-            block on the expert's first tile; `after` refills it with the next
-            visit's chunk after its last block on the expert's last tile."""
+            chunk-streamed visit: `before` lands every chunk of a slab at the
+            slab's first block on the expert's first tile; `after` refills a
+            chunk with the next visit's after its last block on the expert's
+            last tile."""
             copies = {1: w1_chunk_copy, 2: w2_chunk_copy}
             last_block = {1: hidden // rhs_qb - 1, 2: inter // rhs_qb - 1}
+            n_chunks = {1: n_w1_chunks, 2: n_w2_chunks}
 
             def before(which, block, n_start):
-                if block or n_start % chunk_of[which]:
+                # Every chunk of a slab is waited at the slab's first read. A
+                # wait is a scheduling fence in the unrolled matmul chain, and
+                # the refills (started a whole matmul earlier) have landed by
+                # then, so one fence per slab is cheaper than one per chunk.
+                if block or n_start:
                     return
-                c = n_start // chunk_of[which]
 
                 @pl.when(first_tile)
                 def _():
-                    copies[which](expert, slot, c).wait()
+                    for c in range(n_chunks[which]):
+                        copies[which](expert, slot, c).wait()
 
             def after(which, block, n_start):
                 ends_chunk = (n_start + FP4_OUTPUT_CHUNK) % chunk_of[which] == 0
