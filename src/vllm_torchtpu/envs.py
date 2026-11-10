@@ -362,6 +362,7 @@ if TYPE_CHECKING:
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
     VLLM_TPU_SAMPLER_CANDIDATES_ONLY: bool = False
     VLLM_TPU_GDN_MIXED_TILE_POW2: bool = False
+    VLLM_TPU_SPEC_BOUNDARY_STATE_COPY: bool = False
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
     VLLM_TPU_STATIC_POOLER: bool = True
     VLLM_TPU_POOLING_KV_CACHE_TOKENS: int = -1
@@ -2186,6 +2187,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # assert that divisibility (PR #2821 ece3d83b5). Dynamic tiling
     # (TPU_ENABLE_GDN_DYNAMIC_TILING) already picks powers of two.
     "VLLM_TPU_GDN_MIXED_TILE_POW2": env_bool("VLLM_TPU_GDN_MIXED_TILE_POW2"),
+    # MTP + prefix caching (mamba align mode): after sampling, copy the GDN
+    # state at a mamba block boundary that a verify window reached into the
+    # block the boundary completes. Without it that block keeps checkpoint 0
+    # of the last window that ended inside it, a few tokens short of the
+    # boundary, and a later prefix hit resumes from that state (PR #2821
+    # c5b1c7b67). Only on steps with blocks hashed (prefix caching or a KV
+    # connector).
+    "VLLM_TPU_SPEC_BOUNDARY_STATE_COPY": env_bool(
+        "VLLM_TPU_SPEC_BOUNDARY_STATE_COPY"
+    ),
     # Chunk the vision encoder over video frames to bound peak VMEM: encode at
     # most this many patches (t*h*w) per vision forward, then concatenate the
     # per-chunk outputs. 0 disables (encode the whole video in one batch).
