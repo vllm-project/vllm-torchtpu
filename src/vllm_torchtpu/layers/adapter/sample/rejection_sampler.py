@@ -914,25 +914,27 @@ def synthetic_sample_and_assemble(
         None,
         apply_top_k=apply_top_k,
     )
-    segment_ids = segment_ids.to(torch.int64)
+    # Gathers from per-request tables and the scatter into the output lower to
+    # select chains on TPU (~200 us at 64 requests); masked reductions over
+    # [requests, slots] do the same work vectorized.
+    match = segment_ids.unsqueeze(0) == torch.arange(
+        batch_size, device=device
+    ).unsqueeze(1)
+    limit = torch.minimum(num_draft_tokens.to(torch.int64), accepted_count)
     group_indices = group_indices.to(torch.int64)
-    safe_segment_ids = segment_ids.clamp(min=0, max=batch_size - 1)
-    keep = (
-        (segment_ids < batch_size)
-        & (group_indices < num_draft_tokens.to(torch.int64)[safe_segment_ids])
-        & (group_indices < accepted_count[safe_segment_ids])
+    kept = match & (group_indices.unsqueeze(0) < limit.unsqueeze(1))  # [R, T]
+    column = torch.arange(max_draft_tokens + 1, device=device)
+    at_column = kept.unsqueeze(1) & (
+        group_indices.view(1, 1, -1) == column.view(1, -1, 1)
+    )  # [R, 1 + K, T]
+    drafts = torch.where(
+        at_column,
+        draft_token_ids.to(torch.int32).view(1, 1, -1),
+        torch.tensor(PLACEHOLDER_TOKEN_ID, dtype=torch.int32, device=device),
+    ).amax(dim=-1)
+    selected_tokens = torch.where(
+        column.unsqueeze(0) == accepted_count.unsqueeze(1),
+        sampled.to(torch.int32).unsqueeze(1),
+        drafts,
     )
-    # Padding and dropped slots go to an extra sink row.
-    selected_tokens = torch.full(
-        (batch_size + 1, max_draft_tokens + 1),
-        PLACEHOLDER_TOKEN_ID,
-        dtype=torch.int32,
-        device=device,
-    )
-    selected_tokens[
-        torch.where(keep, segment_ids, torch.full_like(segment_ids, batch_size)),
-        torch.where(keep, group_indices, torch.zeros_like(group_indices)),
-    ] = draft_token_ids.to(torch.int32)
-    batch_range = torch.arange(batch_size, dtype=torch.int64, device=device)
-    selected_tokens[batch_range, accepted_count] = sampled
-    return selected_tokens[:batch_size]
+    return selected_tokens
