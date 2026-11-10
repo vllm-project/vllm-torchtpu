@@ -64,6 +64,10 @@ MULTIPORT_DP_ADDITIONAL_CONFIG_KEY = "tpu_multiport_dp"
 # Host-only section: the scheduler options (`core.scheduler_options`) only
 # decide admission order and never change a compiled program.
 SCHEDULER_OPTIONS_SECTION = "tpu_scheduler"
+# Host-only section: the pipeline chunk scheduler options
+# (`core.pp_scheduler_options`) only decide admission order and how prefill
+# work is priced; none changes a compiled program.
+PP_SCHEDULER_OPTIONS_SECTION = "tpu_pp_scheduler"
 
 # Diagnostics-only knobs, host-only sections and the multi-port launch
 # topology: they steer profiling, the host or the launch and never change the
@@ -78,6 +82,7 @@ HASH_IGNORED_ADDITIONAL_CONFIG_KEYS = frozenset(
         WORKER_OPTIONS_SECTION,
         MULTIPORT_DP_ADDITIONAL_CONFIG_KEY,
         SCHEDULER_OPTIONS_SECTION,
+        PP_SCHEDULER_OPTIONS_SECTION,
     }
 )
 
