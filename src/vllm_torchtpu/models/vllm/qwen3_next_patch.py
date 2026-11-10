@@ -154,32 +154,41 @@ def _legal_tile(rows: int, cap: int) -> int:
     return rows
 
 
-def _select_gate_q_tile(rows: int, cols: int) -> int:
-    """Select multiple-of-32 tile cap for [rows, cols] sigmoid-gate + FP8 quant.
-
-    2D float8_e4m3fn outputs have hardware tiling (32, 128), so any sub-block
-    smaller than `rows` must have `bm % 32 == 0`. Keeps live fp32 arrays within
-    the 64-VREG hardware file (preventing multi-MiB VMEM spills at N=2048 or
-    TP=2 cols=4096) and bounds VMEM DMA windows at decode/verify batch sizes.
-    """
+def _select_gate_q_vreg_step(cols: int) -> int:
     vregs_per_row = max(1, (cols + 1023) // 1024)
-    vreg_cap = max(32, (64 // vregs_per_row // 32) * 32)
+    return max(16, (64 // vregs_per_row // 8) * 8)
+
+
+def _select_gate_q_tile(rows: int, cols: int) -> int:
+    """Select multiple-of-8 VMEM BlockSpec tile cap for [rows, cols] gate + quant.
+
+    For decode/verify batch sizes (rows <= 256), caps tile so grid >= 6 and
+    double-buffered VMEM DMAs overlap with compute. For large prefill shapes
+    (rows > 256), uses a larger VMEM block (up to 512 rows) while the kernel
+    processes VREG-sized sub-tiles internally, avoiding large Pallas grid
+    overhead at T=8192 without spilling VREGs.
+    """
+    vreg_cap = _select_gate_q_vreg_step(cols)
     if rows <= 256:
         dma_cap = max(32, (rows // 6 // 32) * 32)
         return min(vreg_cap, dma_cap)
-    return vreg_cap
+    return max(vreg_cap, 512)
 
 
-def _sigmoid_gate_quant_kernel(attn_ref, gate_ref, q_ref, s_ref):
-    a = attn_ref[...].astype(jnp.float32)
-    g = gate_ref[...].astype(jnp.float32)
-    y = (a * jax.nn.sigmoid(g)).astype(jnp.bfloat16).astype(jnp.float32)
-    amax = jnp.max(jnp.abs(y), axis=1, keepdims=True)
-    scale = amax * jnp.float32(1.0 / 448.0)
-    scale = jnp.where(scale == 0.0, 1.0, scale)
-    scale_inv = jnp.float32(1.0) / scale
-    q_ref[...] = jnp.clip(y * scale_inv, -448.0, 448.0).astype(jnp.float8_e4m3fn)
-    s_ref[...] = scale
+def _sigmoid_gate_quant_kernel(attn_ref, gate_ref, q_ref, s_ref, *, step_m: int):
+    bm = attn_ref.shape[0]
+    step = min(bm, step_m)
+    for r in range(bm // step):
+        sl = slice(r * step, (r + 1) * step)
+        a = attn_ref[sl, :].astype(jnp.float32)
+        g = gate_ref[sl, :].astype(jnp.float32)
+        y = (a * jax.nn.sigmoid(g)).astype(jnp.bfloat16).astype(jnp.float32)
+        amax = jnp.max(jnp.abs(y), axis=1, keepdims=True)
+        scale = amax * jnp.float32(1.0 / 448.0)
+        scale = jnp.where(scale == 0.0, 1.0, scale)
+        scale_inv = jnp.float32(1.0) / scale
+        q_ref[sl, :] = jnp.clip(y * scale_inv, -448.0, 448.0).astype(jnp.float8_e4m3fn)
+        s_ref[sl, :] = scale
 
 
 def pallas_sigmoid_gate_quant(
@@ -196,10 +205,11 @@ def pallas_sigmoid_gate_quant(
         gate = jnp.pad(gate, ((0, pad), (0, 0)))
     m = attn_out.shape[0]
     bm = _legal_tile(m, _select_gate_q_tile(m, k))
+    step_m = _legal_tile(bm, _select_gate_q_vreg_step(k))
     q_spec = pl.BlockSpec((bm, k), lambda i: (i, 0))
     s_spec = pl.BlockSpec((bm, 1), lambda i: (i, 0))
     q, s = pl.pallas_call(
-        _sigmoid_gate_quant_kernel,
+        functools.partial(_sigmoid_gate_quant_kernel, step_m=step_m),
         out_shape=[
             jax.ShapeDtypeStruct((m, k), jnp.float8_e4m3fn),
             jax.ShapeDtypeStruct((m, 1), jnp.float32),
