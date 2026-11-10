@@ -1143,7 +1143,7 @@ class TPUModelRunner(GPUModelRunner):
         # `_read_offset_reset_scratch`.
         self._read_offset_scratch: dict[
             tuple[int, str],
-            tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
         ] = {}
         # DecodeBench fills local state instead of transferring manager blocks,
         # so it can retain the compact request-indexed Mamba layout.
@@ -2696,10 +2696,10 @@ class TPUModelRunner(GPUModelRunner):
                 if spec_entry is None:
                     spec_entry = [raws, [], [], [], True, []]
                     per_raw_spec_inputs[key] = spec_entry
-                spec_entry[1].extend(state_srcs)
-                spec_entry[2].extend(ckpt_rows)
-                spec_entry[3].extend(dsts_g)
-                spec_entry[5].extend(new_owners)
+                cast(list[int], spec_entry[1]).extend(state_srcs)
+                cast(list[list[int]], spec_entry[2]).extend(ckpt_rows)
+                cast(list[int], spec_entry[3]).extend(dsts_g)
+                cast(list[bool], spec_entry[5]).extend(new_owners)
                 if not group_uniform:
                     spec_entry[4] = False
                 continue
@@ -3190,6 +3190,7 @@ class TPUModelRunner(GPUModelRunner):
                     token_in_tpu_cur_input_indices_list.append(cur_input_index)
                     token_in_tpu_pre_next_tokens_indices_list.append(src_start + j)
             else:
+                assert layout_plan is not None
                 for j in range(n_sched):
                     cur_input_index = layout_plan.local_index_for_request_major_token(
                         req_start + j
@@ -7873,6 +7874,7 @@ class TPUModelRunner(GPUModelRunner):
             if num_reqs >= min(num_tokens, self.max_num_reqs):
                 break
         if self._is_async_drafter and not self._mtp_prefill_only:
+            assert self.speculative_config is not None
             k = self.speculative_config.num_speculative_tokens
             max_logits_len = _get_padded_token_len(
                 self.num_tokens_paddings,
@@ -7893,6 +7895,7 @@ class TPUModelRunner(GPUModelRunner):
         lengths = list(self.num_reqs_paddings)
         seen = set(lengths)
         if self._is_async_drafter and not self._mtp_prefill_only:
+            assert self.speculative_config is not None
             k = self.speculative_config.num_speculative_tokens
             max_logits_len = _get_padded_token_len(
                 self.num_tokens_paddings,
