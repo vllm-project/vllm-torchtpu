@@ -1680,9 +1680,7 @@ def gmm_v2(
                 ),
                 scale=None
                 if rhs_scale is None
-                else pltpu.VMEM(
-                    (RHS_STREAM_SLOTS,) + rhs_scale.shape[1:], jnp.float32
-                ),
+                else pltpu.VMEM((RHS_STREAM_SLOTS,) + rhs_scale.shape[1:], jnp.float32),
                 sems=pltpu.SemaphoreType.DMA((RHS_STREAM_SLOTS,)),
                 run_to_group=pltpu.SMEM((dims.size_group,), jnp.int32),
                 run=pltpu.SMEM((2,), jnp.int32),
