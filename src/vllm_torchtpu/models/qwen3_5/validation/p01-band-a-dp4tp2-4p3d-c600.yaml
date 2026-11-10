@@ -106,6 +106,8 @@ legs:
       - "{\"method\":\"mtp\",\"num_speculative_tokens\":1}"
       - "--renderer-num-workers"
       - "4"
+      - "--cpu-distributed-timeout-seconds"
+      - "10800"
     env:
       MOE_FUSED_EP_KERNEL_MIN_TOKENS: "1024"
       ONEHOT_MOE_PERMUTE_THRESHOLD: "2048"
@@ -134,7 +136,13 @@ legs:
       USE_MOE_SPARSE_CORE: "1"
       VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP: "1"
       VLLM_XLA_CHECK_RECOMPILATION: "0"
-    additional_config: {}
+    additional_config:
+      tpu_frontend:
+        detok_prompt_tail: true
+        lazy_reasoning_count: true
+        tokenize_prefix_cache: true
+      tpu_worker:
+        numa_bind: true
   decode:
     replicas: 3
     chips_per_replica: 4
@@ -211,6 +219,8 @@ legs:
       - "{\"method\":\"mtp\",\"num_speculative_tokens\":3,\"rejection_sample_method\":\"synthetic\",\"synthetic_acceptance_length\":3.39}"
       - "--renderer-num-workers"
       - "4"
+      - "--cpu-distributed-timeout-seconds"
+      - "10800"
     env:
       MOE_FUSED_EP_KERNEL_IMPL: "v3"
       MOE_FUSED_EP_KERNEL_MIN_TOKENS: "1024"
@@ -244,3 +254,9 @@ legs:
       VLLM_XLA_CHECK_RECOMPILATION: "0"
     additional_config:
       tpu_collectives: {small_all_reduce: true}
+      tpu_frontend:
+        detok_prompt_tail: true
+        lazy_reasoning_count: true
+        tokenize_prefix_cache: true
+      tpu_worker:
+        numa_bind: true
