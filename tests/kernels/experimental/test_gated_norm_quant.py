@@ -74,6 +74,31 @@ def test_legal_tile(rows, cap, tile):
     assert kernel.legal_tile(rows, cap) == tile
 
 
+@pytest.mark.parametrize(
+    "tokens, cols, cap",
+    [
+        # TP8 GDN width: the 512-row prefill cap and the grid >= 6 decode caps.
+        (2048, 1024, 512),
+        (8192, 1024, 512),
+        (96, 1024, 16),
+        # TP1 width (a pipeline stage): 16 MiB over 10 bytes per element.
+        (2048, 8192, 200),
+        (8192, 8192, 200),
+        (96, 8192, 16),
+    ],
+)
+def test_default_tile_cap_stays_under_the_vmem_budget(tokens, cols, cap):
+    assert kernel.default_tile_cap(tokens, cols) == cap
+    assert cap * cols * kernel.TILE_BYTES_PER_ELEMENT <= kernel.TILE_VMEM_BUDGET_BYTES
+
+
+def test_full_width_2d_z_matches_the_two_step_path():
+    # 64 heads, the width of an unsharded GDN layer; the 2D-z kernel gathers
+    # one strided slice per head.
+    o, z, w = _inputs(tokens=32, heads=64, dim=128)
+    _assert_matches_reference(o, z.reshape(32, -1), w, tile=16)
+
+
 def test_zero_rows_get_unit_scale():
     o, z, w = _inputs(tokens=16, heads=2)
     o = o.at[3].set(0)
