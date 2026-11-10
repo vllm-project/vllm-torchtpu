@@ -512,6 +512,114 @@ def _kernel(
         lse_ref[...] = jnp.concatenate(lse_tiles, axis=0)
 
 
+# Soft cap on one step's selection bitset, for the resident prefix tier.
+METADATA_BITSET_TARGET_BYTES = 16 * 1024**2
+_WORD_BITS = 32
+_NATIVE_ALIGN = 128
+
+
+def _metadata_prefix_pages(
+    tokens: int,
+    selected_groups: int,
+    ratio: int,
+    page_size: int,
+    full_pages: int,
+    kv_tile: int,
+) -> int:
+    """Smallest page prefix covering the step's queries and its selections."""
+    if min(tokens, selected_groups, ratio, page_size, full_pages, kv_tile) <= 0:
+        return full_pages
+    if kv_tile % (ratio * _WORD_BITS):
+        return full_pages
+    pages = min(
+        full_pages, (max(tokens, selected_groups * ratio) + page_size - 1) // page_size
+    )
+    safe_tokens = pages * page_size // kv_tile * kv_tile
+    if safe_tokens < ratio or safe_tokens > jnp.iinfo(jnp.int32).max:
+        return full_pages
+    return pages
+
+
+def _metadata_resident_pages(
+    tokens: int,
+    query_block: int,
+    ratio: int,
+    page_size: int,
+    full_pages: int,
+    kv_tile: int,
+    target_bytes: int = METADATA_BITSET_TARGET_BYTES,
+) -> int:
+    """Largest page prefix whose padded selection bitset fits target_bytes."""
+    if min(tokens, query_block, ratio, page_size, full_pages, kv_tile) <= 0:
+        return full_pages
+    if kv_tile % (ratio * _WORD_BITS) or target_bytes <= 0:
+        return full_pages
+    nblocks = (tokens + query_block - 1) // query_block
+    native_width = (query_block + _NATIVE_ALIGN - 1) // _NATIVE_ALIGN * _NATIVE_ALIGN
+    word_budget = target_bytes // (nblocks * native_width * 4)
+    word_budget = word_budget // _NATIVE_ALIGN * _NATIVE_ALIGN
+    tiles = word_budget // (kv_tile // (ratio * _WORD_BITS))
+    pages = min(full_pages, tiles * kv_tile // page_size)
+    safe_tokens = pages * page_size // kv_tile * kv_tile
+    if safe_tokens < ratio or safe_tokens > jnp.iinfo(jnp.int32).max:
+        return full_pages
+    return pages
+
+
+def _metadata_prefix_fits(blocks, lengths, *, ratio, full_groups, prefix_groups):
+    """Every valid selection and causal length lies inside the prefix."""
+    return jnp.all(
+        (blocks < 0) | (blocks >= full_groups) | (blocks < prefix_groups)
+    ) & jnp.all((lengths >= 0) & (lengths <= prefix_groups * ratio))
+
+
+def _metadata_prefix_dispatch(
+    run, blocks, lengths, page_table, *, tokens, query_block, ratio, page_size, kv_tile
+):
+    """``run(table)`` on the smallest certified page prefix of ``page_table``.
+
+    Two tiers: the step's own extent (queries and selection budget), then the
+    largest prefix whose bitset stays under METADATA_BITSET_TARGET_BYTES; the
+    full table otherwise. Outputs are identical across tiers.
+    """
+    full_pages = page_table.shape[1]
+    small_pages = _metadata_prefix_pages(
+        tokens, blocks.shape[1], ratio, page_size, full_pages, kv_tile
+    )
+    resident_pages = _metadata_resident_pages(
+        tokens, query_block, ratio, page_size, full_pages, kv_tile
+    )
+
+    def fits(pages):
+        # A visited KV tile is DMAed in full, including its masked token rows.
+        return _metadata_prefix_fits(
+            blocks,
+            lengths,
+            ratio=ratio,
+            full_groups=full_pages * page_size // ratio,
+            prefix_groups=pages * page_size // kv_tile * kv_tile // ratio,
+        )
+
+    def fallback(_):
+        if not small_pages < resident_pages < full_pages:
+            return run(page_table)
+        return lax.cond(
+            fits(resident_pages),
+            lambda _: run(page_table[:, :resident_pages]),
+            lambda _: run(page_table),
+            None,
+        )
+
+    if small_pages >= full_pages:
+        return fallback(None)
+    return lax.cond(
+        fits(small_pages),
+        lambda _: run(page_table[:, :small_pages]),
+        fallback,
+        None,
+    )
+
+
 @functools.partial(
     jax.jit,
     static_argnames=(
@@ -529,6 +637,70 @@ def _kernel(
     ),
 )
 def block_sparse_gqa_prefill(
+    query,
+    blocks,
+    lengths,
+    page_table,
+    cache,
+    *,
+    ratio: int,
+    kv_heads: int,
+    query_block: int = 32,
+    kv_tile: int = 128,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    bf16_io: bool = False,
+    kv_head_offset: int = 0,
+    query_tile: int | None = None,
+    return_lse: bool = False,
+    dcp_rank=None,
+    dcp_world: int = 1,
+):
+    """``_block_sparse_gqa_prefill``, optionally on a bounded page-table prefix.
+
+    VLLM_TPU_QSA_PREFILL_PREFIX_PAGES: when every selected group and causal
+    length of the step fits a page prefix, build the selection metadata over
+    that prefix instead of the whole max_model_len table (bit-identical: the
+    same KV tiles are visited; rows outside the prefix were empty anyway).
+    """
+
+    def run(table):
+        return _block_sparse_gqa_prefill(
+            query,
+            blocks,
+            lengths,
+            table,
+            cache,
+            ratio=ratio,
+            kv_heads=kv_heads,
+            query_block=query_block,
+            kv_tile=kv_tile,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            bf16_io=bf16_io,
+            kv_head_offset=kv_head_offset,
+            query_tile=query_tile,
+            return_lse=return_lse,
+            dcp_rank=dcp_rank,
+            dcp_world=dcp_world,
+        )
+
+    if not envs.VLLM_TPU_QSA_PREFILL_PREFIX_PAGES or dcp_rank is not None:
+        return run(page_table)
+    return _metadata_prefix_dispatch(
+        run,
+        blocks,
+        lengths,
+        page_table,
+        tokens=len(query),
+        query_block=query_block,
+        ratio=ratio,
+        page_size=cache.shape[1],
+        kv_tile=kv_tile,
+    )
+
+
+def _block_sparse_gqa_prefill(
     query,
     blocks,
     lengths,
