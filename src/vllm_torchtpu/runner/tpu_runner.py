@@ -6475,8 +6475,6 @@ class TPUModelRunner(GPUModelRunner):
                 device=logits.device,
                 generator=sampling_generator,
             )
-            accept_u = u_both[:n_draft, 0]
-            u_all = u_both[:, 1:]
             return self.rejection_sampler.fused_verify_and_sample_candidates(
                 logits=logits,
                 draft_token_ids=md.draft_token_ids,
@@ -6489,8 +6487,8 @@ class TPUModelRunner(GPUModelRunner):
                 req_temperatures=req_temperatures,
                 req_top_k=req_top_k,
                 req_top_p=req_top_p,
-                accept_u=accept_u,
-                u_all=u_all,
+                accept_u=None,
+                u_all=u_both,
                 topk_candidates=0,
             )
         else:
@@ -6537,8 +6535,6 @@ class TPUModelRunner(GPUModelRunner):
                         device=logits.device,
                         generator=sampling_generator,
                     )
-                    accept_u = u_both[:n_draft, 0]
-                    u_all = u_both[:, 1:]
                     return self.rejection_sampler.fused_verify_and_sample_candidates(
                         logits=logits,
                         draft_token_ids=md.draft_token_ids,
@@ -6551,8 +6547,8 @@ class TPUModelRunner(GPUModelRunner):
                         req_temperatures=req_temperatures,
                         req_top_k=req_top_k,
                         req_top_p=req_top_p,
-                        accept_u=accept_u,
-                        u_all=u_all,
+                        accept_u=None,
+                        u_all=u_both,
                         topk_candidates=topk_candidates,
                     )
             if all_greedy and grammar_output is None and not processors:
@@ -8922,7 +8918,7 @@ class TPUModelRunner(GPUModelRunner):
                         device=self.device,
                     )
                     warm_u_all = torch.zeros(
-                        (num_reqs + num_tokens, num_cand),
+                        (num_reqs + num_tokens, num_cand + 1),
                         dtype=torch.float32,
                         device=self.device,
                     )
@@ -8938,7 +8934,7 @@ class TPUModelRunner(GPUModelRunner):
                         req_temperatures=warm_req_temps,
                         req_top_k=warm_req_top_k,
                         req_top_p=warm_req_top_p,
-                        accept_u=warm_accept_u,
+                        accept_u=None,
                         u_all=warm_u_all,
                         topk_candidates=blocks,
                     )
@@ -8986,7 +8982,7 @@ class TPUModelRunner(GPUModelRunner):
                         device=self.device,
                     )
                     warm_u_all_packed = torch.zeros(
-                        (num_reqs + num_tokens, num_packed_cand),
+                        (num_reqs + num_tokens, num_packed_cand + 1),
                         dtype=torch.float32,
                         device=self.device,
                     )
@@ -9002,7 +8998,7 @@ class TPUModelRunner(GPUModelRunner):
                         req_temperatures=warm_req_temps_f32,
                         req_top_k=warm_req_top_k_cand,
                         req_top_p=warm_req_top_p_cand,
-                        accept_u=warm_accept_u,
+                        accept_u=None,
                         u_all=warm_u_all_packed,
                         topk_candidates=0,
                     )

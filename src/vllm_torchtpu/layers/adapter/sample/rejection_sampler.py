@@ -256,10 +256,12 @@ class RejectionSampler:
         req_temperatures: torch.Tensor,
         req_top_k: torch.Tensor,
         req_top_p: torch.Tensor,
-        accept_u: torch.Tensor,
+        accept_u: torch.Tensor | None,
         u_all: torch.Tensor,
         topk_candidates: int,
     ) -> torch.Tensor:
+        """With ``accept_u=None``, ``u_all`` is the [rows, num_cand + 1]
+        uniform buffer whose column 0 holds the draft accept draws."""
         return _fused_spec_verify_and_sample_candidates(
             logits,
             draft_token_ids,
@@ -764,13 +766,16 @@ def _fused_spec_verify_and_sample_candidates(
     req_temperatures: torch.Tensor,
     req_top_k: torch.Tensor,
     req_top_p: torch.Tensor,
-    accept_u: torch.Tensor,
+    accept_u: torch.Tensor | None,
     u_all: torch.Tensor,
     synthetic_conditional_rates: torch.Tensor | None,
     synthetic_mode: bool,
     topk_candidates: int,
 ) -> torch.Tensor:
     """Fused candidate-space bonus sampling + speculative rejection sampling."""
+    if accept_u is None:
+        accept_u = u_all[: draft_token_ids.shape[0], 0]
+        u_all = u_all[:, 1:]
     batch_size = num_draft_tokens.shape[0]
     if topk_candidates > 0:
         cand_logits, cand_token_ids = extract_topk_candidates(
