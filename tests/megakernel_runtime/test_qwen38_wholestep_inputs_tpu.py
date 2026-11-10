@@ -103,10 +103,11 @@ def test_batched_gdn_blocks_bitwise_on_tpu(ns, monkeypatch):
     rng = np.random.default_rng(4)
     n, slots = ns, 2 * ns + 1
     meta = []
+    off = jnp.asarray(rng.integers(0, 4, size=slots), jnp.int32)  # one runner-wide table
     for _ in range(33):
         meta += [
             jnp.asarray(rng.integers(-1, slots, size=n), jnp.int32),
-            jnp.asarray(rng.integers(0, 4, size=slots), jnp.int32),
+            off,
             jnp.asarray(rng.integers(0, 4096, size=(n, 4)), jnp.int32),
             jnp.asarray(np.arange(n + 1) * 4, jnp.int32),
             jnp.asarray(rng.integers(0, 9000, size=n), jnp.int32),
