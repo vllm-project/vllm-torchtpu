@@ -22,8 +22,9 @@ what `cp_mla_attention._all_to_all_packed` builds from the incumbent kernel's
 
 * per kernel call (one device) at the served geometries -- W=16 ranks x 64
   heads (2x2x2 mirror), W=8 x 64 (2x2x1 twin), W=8 x 32 -- on decode buckets
-  16 / 32 with 1..32 real tokens (incl. capped-overflow and empty rows) and a
-  zero-real-token step;
+  2 / 4 / 8 (`T < W`: lse hi and lo source rows overlap if packed together;
+  T=2 only where the layout admits it, W=8 x 64) and 16 / 32, with 1..32 real
+  tokens (incl. capped-overflow and empty rows) and a zero-real-token step;
 * through `sparse_mla_attention_dcp` on 8 DCP ranks (production env, cache
   writes in the gather): caches bit for bit, sent rows bit for bit on every
   rank, and the merge (`merge_send_layout`, threaded stand-in exchange) equal
@@ -130,7 +131,9 @@ def _kernel_send(p, world, fault=None):
 
 
 GEOMETRIES = ((16, 64), (8, 64), (8, 32))  # (ranks, heads): mirror, twin, test
-DECODE_CELLS = ((4, (3,)), (8, (4, 3))) + tuple(c for c in prologue.CELLS if c[0] <= 32)
+DECODE_CELLS = ((2, (2,)), (4, (3,)), (8, (4, 3))) + tuple(
+    c for c in prologue.CELLS if c[0] <= 32
+)
 
 
 def _problem(query_tokens, seq_q, heads, zero=False):
@@ -149,6 +152,13 @@ def _problem(query_tokens, seq_q, heads, zero=False):
 def test_kernel_send_rows_bit_identical(world, heads, cell):
     prologue._require_tpu()
     query_tokens, seq_q = cell
+    batch = sparse_mla._largest_divisor(query_tokens, 4)
+    if not sparse_mla.send_layout_supported(
+        query_tokens, heads, world, prologue.NOPE_DIM, batch
+    ):
+        pytest.skip(
+            f"send layout does not admit T={query_tokens} at W={world} x {heads}"
+        )
     p = _problem(query_tokens, seq_q, heads, zero=not seq_q)
     real = int(sum(seq_q))
     out, lse = prologue._kernel(p, candidate=True)

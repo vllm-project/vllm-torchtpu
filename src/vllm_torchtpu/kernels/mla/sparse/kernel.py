@@ -1530,10 +1530,11 @@ def send_layout_lanes(num_tokens: int, num_heads: int, world: int) -> int:
 def send_layout_supported(
     num_tokens: int, num_heads: int, world: int, vdim: int, batch_size: int
 ) -> bool:
-    """Whether the kernel can write the send buffer for this geometry: one lse
-    word row per destination (`2 * T * L <= V`), a power-of-two `L`, and grid
-    steps whose `batch_size * L` partial rows fill whole 16-row tiles."""
-    if world < 2 or num_heads % world or vdim % 128:
+    """Whether the kernel can write the send buffer for this geometry: at least
+    one token, one lse word row per destination (`2 * T * L <= V`), a
+    power-of-two `L`, and grid steps whose `batch_size * L` partial rows fill
+    whole 16-row tiles."""
+    if num_tokens <= 0 or world < 2 or num_heads % world or vdim % 128:
         return False
     per = num_heads // world
     rows = num_tokens * per
