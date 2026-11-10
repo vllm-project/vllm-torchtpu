@@ -41,6 +41,7 @@ from jax.sharding import Mesh
 from packaging import version
 from vllm.config import (
     CUDAGraphMode,
+    ModelConfig,
     ParallelConfig,
     VllmConfig,
     get_layers_from_vllm_config,
@@ -158,7 +159,7 @@ from vllm_torchtpu.layers.core.sequence_layout import (
 )
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.lora.lora_manager import TPUWorkerLoRAManager
-from vllm_torchtpu.models.qwen3_5.kernels import gated_norm_quant_op
+from vllm_torchtpu.models.qwen3_5 import settings as qwen3_5_settings
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
 )
@@ -655,6 +656,20 @@ _TOPK_BUFFER_ATTRIBUTE = "topk_indices_buffer"
 # Hand-off tensors that carry indices.
 # -1 is "no token", so such a row attends to nothing.
 _PP_CARRIED_FILL: dict[str, int] = {_TOPK_INDICES: -1}
+
+
+def _install_gdn_fused_norm_quant(
+    model: torch.nn.Module, model_config: ModelConfig | None
+) -> int:
+    """Qwen3.5 rule: route the GDN output projections of a loaded Qwen3.5
+    model through the fused gated norm + FP8 quantization kernel, where every
+    GDN layer allows it. Other models are untouched. Returns the number of
+    layers routed."""
+    if not qwen3_5_settings.is_qwen3_5(model_config):
+        return 0
+    from vllm_torchtpu.models.qwen3_5.kernels import gated_norm_quant_op
+
+    return gated_norm_quant_op.install_if_supported(model)
 
 
 def _find_topk_indices_buffer(model: torch.nn.Module) -> torch.Tensor | None:
@@ -5941,8 +5956,7 @@ class TPUModelRunner(GPUModelRunner):
         ), "TPU_DP_VOCAB_PARALLEL does not support selected logits hidden states"
         if self.is_pooling_model:
             self._resolve_static_pooler()
-        if envs.TPU_GDN_FUSED_NORM_QUANT:
-            gated_norm_quant_op.install(model)
+        _install_gdn_fused_norm_quant(model, self.model_config)
         if self.parallel_config.pipeline_parallel_size > 1:
             # A sparse model's layers share one top-k index table, and under a
             # pipeline the layer that writes it and the layers that reuse it

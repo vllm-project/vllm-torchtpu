@@ -13,8 +13,9 @@
 # limitations under the License.
 """GDN output projection with the gated norm and fp8 quantization fused.
 
-With ``TPU_GDN_FUSED_NORM_QUANT`` set, :func:`install` checks every
-gated-delta-net layer after loading and marks it, and the layer's output
+On a Qwen3.5 engine the runner calls :func:`install_if_supported` after
+loading (a Qwen3.5 rule). :func:`install` checks every gated-delta-net layer
+and marks it, and the layer's output
 projection runs :func:`output_projection`: one kernel produces the out-proj's
 fp8 rows and scales from the GDN output and the gate, and the fp8 matmul runs
 on them, instead of ``RMSNormGated`` followed by the fp8 linear.
@@ -34,13 +35,15 @@ from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     QwenGatedDeltaNetAttention,
 )
 
-from vllm_torchtpu import envs
-from vllm_torchtpu.models.qwen3_5.kernels import gated_norm_quant as gnq
 from vllm_torchtpu.layers.adapter import linear_common
 from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.models.qwen3_5.kernels import gated_norm_quant as gnq
 
 logger = init_logger(__name__)
+
+# Steps of fewer rows run the JAX reference inside the same custom op.
+MIN_ROWS = 16
 
 _norm_ops: dict[float, Callable] = {}
 _out_proj_ops: dict[float, Callable] = {}
@@ -52,8 +55,7 @@ def _build_ops(eps: float) -> None:
         def norm(
             o: jax.Array, z: jax.Array, w: jax.Array
         ) -> tuple[jax.Array, jax.Array]:
-            min_rows = envs.TPU_GDN_FUSED_NORM_QUANT_MIN_ROWS
-            if min_rows > 0 and o.shape[0] < min_rows:
+            if MIN_ROWS > 0 and o.shape[0] < MIN_ROWS:
                 return gnq.reference(o, z, w, eps)
             return gnq.gated_norm_quant(o, z, w, eps)
 
@@ -78,8 +80,7 @@ def _build_ops(eps: float) -> None:
             w_proj: jax.Array,
             w_scale: jax.Array,
         ) -> jax.Array:
-            min_rows = envs.TPU_GDN_FUSED_NORM_QUANT_MIN_ROWS
-            if min_rows > 0 and o.shape[0] < min_rows:
+            if MIN_ROWS > 0 and o.shape[0] < MIN_ROWS:
                 q, s = gnq.reference(o, z, w_norm, eps)
             else:
                 q, s = gnq.gated_norm_quant(o, z, w_norm, eps)
@@ -140,25 +141,53 @@ def install(model: torch.nn.Module) -> int:
     ]
     if not layers:
         raise NotImplementedError(
-            "TPU_GDN_FUSED_NORM_QUANT=1 but the model has no gated-delta-net "
-            "layer; unset TPU_GDN_FUSED_NORM_QUANT."
+            "The fused GDN gated norm + FP8 quantization needs gated-delta-net "
+            "layers, and the model has no gated-delta-net layer."
         )
     for layer in layers:
         reason = unsupported_reason(layer)
         if reason is not None:
             raise NotImplementedError(
-                f"TPU_GDN_FUSED_NORM_QUANT=1 cannot serve {layer.prefix}: "
-                f"{reason}. Unset TPU_GDN_FUSED_NORM_QUANT."
+                f"The fused GDN gated norm + FP8 quantization cannot serve "
+                f"{layer.prefix}: {reason}."
             )
     for layer in layers:
         _build_ops(float(layer.norm.eps))
         layer.fused_norm_quant = True
     logger.info(
-        "[GDN] TPU_GDN_FUSED_NORM_QUANT: %d layers run the gated norm and "
-        "out_proj fp8 quantization as one kernel",
+        "[GDN] %d layers run the gated norm and out_proj fp8 quantization "
+        "as one kernel",
         len(layers),
     )
     return len(layers)
+
+
+def install_if_supported(model: torch.nn.Module) -> int:
+    """:func:`install` when every gated-delta-net layer can take the fused
+    path, else nothing; the number of layers routed.
+
+    The Qwen3.5 rule's entry point. A model without GDN layers (a pipeline
+    stage or a draft without them) or with a layer the kernel cannot serve
+    (for example a BF16 or block-scaled out_proj) keeps the
+    ``RMSNormGated`` + linear path.
+    """
+    layers = [
+        module
+        for module in model.modules()
+        if isinstance(module, QwenGatedDeltaNetAttention)
+    ]
+    if not layers:
+        return 0
+    for layer in layers:
+        reason = unsupported_reason(layer)
+        if reason is not None:
+            logger.info(
+                "[GDN] Fused gated norm + FP8 quantization not used: %s: %s.",
+                layer.prefix,
+                reason,
+            )
+            return 0
+    return install(model)
 
 
 def output_projection(
