@@ -24,9 +24,12 @@ from vllm.model_executor.models.config import (
 )
 
 from vllm_torchtpu import additional_config_sections
-from vllm_torchtpu.models.qwen3_5 import settings
+from vllm_torchtpu.models.qwen3_5 import hooks, settings
 from vllm_torchtpu.models.qwen3_5.hooks import TPUQwen35MoeConfig
 from vllm_torchtpu.models.vllm import register_models
+
+# The real lookup, before the autouse fixture below replaces it.
+_REAL_CHIP_FAMILY = hooks._chip_family
 
 QWEN35 = "Qwen3_5MoeForConditionalGeneration"
 
@@ -114,6 +117,12 @@ def _vllm_config(
         load_config=SimpleNamespace(load_format="auto"),
         additional_config={} if additional is None else additional,
     )
+
+
+@pytest.fixture(autouse=True)
+def _tpu7x(monkeypatch):
+    """The record jobs ran on TPU7x; tests that need another device override."""
+    monkeypatch.setattr(hooks, "_chip_family", lambda: "7x")
 
 
 def _run_hook(cfg) -> SimpleNamespace:
@@ -293,3 +302,45 @@ def test_other_models_are_not_checked(restore_config_map, arch):
     register_models()
     cfg = _vllm_config(arch, additional={"tpu_typo": {}})
     VllmConfig.try_verify_and_update_config(cfg)
+
+
+# The calibrated budget applies only where it was measured: Qwen3.5-397B-A17B's
+# checkpoint shape on TPU7x. Anything else keeps main's gpu_memory_utilization.
+
+
+def test_calibrated_shape_on_tpu7x_gets_the_budget():
+    cfg = _run_hook(_vllm_config())
+    assert cfg.cache_config.kv_cache_memory_bytes == 45_579_595_520
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [("num_experts", 256), ("hidden_size", 2048), ("num_hidden_layers", 40)],
+)
+def test_other_checkpoint_of_the_architecture_keeps_mains_behaviour(field, value):
+    cfg = _vllm_config()
+    setattr(cfg.model_config.hf_text_config, field, value)
+    assert _run_hook(cfg).cache_config.kv_cache_memory_bytes is None
+
+
+@pytest.mark.parametrize("chip", ["v6e", "v5e", "v5p", None])
+def test_smaller_or_unknown_device_keeps_mains_behaviour(monkeypatch, chip):
+    monkeypatch.setattr(hooks, "_chip_family", lambda: chip)
+    assert _run_hook(_vllm_config()).cache_config.kv_cache_memory_bytes is None
+
+
+def test_explicit_budget_is_kept_on_any_device(monkeypatch):
+    monkeypatch.setattr(hooks, "_chip_family", lambda: "v6e")
+    cfg = _run_hook(_vllm_config(kv_cache_memory_bytes=12_000_000_000))
+    assert cfg.cache_config.kv_cache_memory_bytes == 12_000_000_000
+
+
+@pytest.mark.parametrize(
+    "accelerator_type, family",
+    [("tpu7x-8", "7x"), ("v7x-16", "7x"), ("v6e-8", "v6e"), ("", None), (None, None)],
+)
+def test_chip_family_reads_the_accelerator_type(monkeypatch, accelerator_type, family):
+    from vllm_torchtpu import tpu_info
+
+    monkeypatch.setattr(tpu_info, "get_tpu_type", lambda: accelerator_type)
+    assert _REAL_CHIP_FAMILY() == family
