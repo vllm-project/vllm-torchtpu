@@ -13,7 +13,7 @@
 # limitations under the License.
 """Options of the TPU model runner, from ``additional_config["tpu_runner"]``.
 
-    --additional-config '{"tpu_runner": {"stage_timing": true}}'
+    --additional-config '{"tpu_runner": {"stage_timing": false}}'
 
 The options only steer host-side telemetry and never change a compiled
 program, so the section stays out of the compile-cache key
@@ -29,14 +29,15 @@ SECTION = "tpu_runner"
 
 @dataclass(frozen=True)
 class RunnerOptions:
-    stage_timing: bool = False
+    stage_timing: bool = True
     """Record each step's per-stage device and host timings
     (``RunnerStageTiming``) for the KV connector's transfer statistics. It takes
     effect only when the KV connector has a ``TpuKVConnectorStats`` sink
     (``TPUConnector`` or ``TPURaidenConnector``, alone or inside a
-    multi-connector), because nothing else reads the timings. Off by default: a
-    debug switch, since the per-stage event records cost about 0.4-0.5 ms per
-    decode step at batch 1-2 under P/D."""
+    multi-connector), because nothing else reads the timings. On by default, so
+    those connectors' statistics are unchanged; set it to false to save the
+    per-stage event records, which cost about 0.4-0.5 ms per decode step at
+    batch 1-2 under P/D."""
 
 
 def parse(raw: Any) -> RunnerOptions:
