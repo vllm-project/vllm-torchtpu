@@ -32,8 +32,8 @@ from vllm_torchtpu.kernels.fused_moe.v2.token_parallel import (
 
 
 @pytest.mark.parametrize("groups", [None, tuple((i,) for i in range(8))])
-@pytest.mark.parametrize("rows", [1, 8, 16, 256])
-def test_singleton_preserves_aligned_inputs_without_traced_operations(groups, rows):
+@pytest.mark.parametrize("rows", [1, 7, 17, 257])
+def test_singleton_preserves_unaligned_inputs_without_traced_operations(groups, rows):
     layout = TokenReplicaLayout.create(
         ep=8, input_rows=rows, groups=groups, row_alignment=8
     )
@@ -123,26 +123,10 @@ def test_invalid_replica_groups_are_rejected(groups):
         TokenReplicaLayout.create(ep=4, input_rows=16, groups=groups)
 
 
-@pytest.mark.parametrize("input_rows", [1, 2, 3, 6, 8, 9, 15, 16])
-def test_singleton_group_split_restore_round_trip(input_rows):
-    layout = TokenReplicaLayout.create(ep=1, input_rows=input_rows, row_alignment=8)
-    assert len(layout.groups) == 1
-    assert len(layout.groups[0]) == 1
-    assert layout.local_rows >= input_rows
-    x = jnp.arange(input_rows * 4, dtype=jnp.float32).reshape(input_rows, 4)
-    rank = jnp.array(0, dtype=jnp.int32)
-    split_x = layout.split(x, rank)
-    assert split_x.shape[0] == layout.local_rows
-    restored = layout.restore(split_x, axis="d")
-    np.testing.assert_array_equal(restored, x)
-
-
 @pytest.mark.parametrize("width", [1, 2, 3, 4, 8, 16])
 @pytest.mark.parametrize("alignment", [1, 2, 8, 16])
 def test_wire_rows_bound_the_layout_and_match_it_from_one_block(width, alignment):
-    """Never fewer rows than a member computes; the same once a member's share
-    exceeds half a block, singleton groups included (they pad to the block
-    too)."""
+    """Never fewer rows than a member computes; the same from one block up."""
     groups = (
         None
         if width == 1
@@ -154,7 +138,7 @@ def test_wire_rows_bound_the_layout_and_match_it_from_one_block(width, alignment
         ).local_rows
         wire = replica_wire_rows(rows, width, alignment)
         assert wire >= local
-        if -(-rows // width) > alignment // 2:
+        if width == 1 or -(-rows // width) > alignment // 2:
             assert wire == local
 
 
