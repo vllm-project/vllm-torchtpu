@@ -721,6 +721,28 @@ def _subst_prefix_impl(next_tokens: torch.Tensor, num_tokens: int, dtype: torch.
 _subst_prefix_compiled = _static_shape_args(_tpu_compile(_subst_prefix_impl))
 
 
+def _subst_prefix_extract_impl(
+    next_tokens: torch.Tensor,
+    num_tokens: int,
+    dtype: torch.dtype,
+    logits_indices: torch.Tensor,
+    target_logits_indices: torch.Tensor,
+):
+    """VLLM_TPU_SUBST_EXTRACT_FUSED: `_subst_prefix_impl` plus the verified
+    draft tokens `extract_draft_token_ids` gathers from the substituted ids,
+    in one program instead of two (same integer gathers)."""
+    ids = next_tokens.reshape(-1)[:num_tokens].to(dtype)
+    drafts = ids.index_select(
+        0, logits_indices.index_select(0, target_logits_indices + 1)
+    )
+    return ids.clone(), drafts
+
+
+_subst_prefix_extract_compiled = _static_shape_args(
+    _tpu_compile(_subst_prefix_extract_impl)
+)
+
+
 # VLLM_TPU_SUBST_STATIC_ARGS: the input ids reaching the async substitution can
 # carry the forward's dynamic-dim stamp, so the same shape compiled a second
 # time mid-run (~10 live compiles per run, ~70 ms each); strip it.
@@ -3102,6 +3124,24 @@ class TPUModelRunner(GPUModelRunner):
                                 len(input_ids),
                                 next_src.numel(),
                             )
+                        req = self.__dict__.pop("_subst_extract_req", None)
+                        if (
+                            req is not None
+                            and req[0].shape[0] == len(input_ids)
+                            and req[1].shape[0] == len(input_ids)
+                        ):
+                            ids, drafts = _subst_prefix_extract_compiled(
+                                next_src, len(input_ids), input_ids.dtype, *req
+                            )
+                            self._subst_extract_out = drafts
+                            if not getattr(self, "_subst_extract_logged", False):
+                                self._subst_extract_logged = True
+                                logger.info(
+                                    "SUBST_EXTRACT_FUSED: input ids and verified "
+                                    "drafts from one compiled program (%d tokens)",
+                                    len(input_ids),
+                                )
+                            return ids
                         return _subst_prefix_compiled(
                             next_src, len(input_ids), input_ids.dtype
                         )
@@ -4831,9 +4871,23 @@ class TPUModelRunner(GPUModelRunner):
             # offset; clear it before this chunk's forward gathers it.
             self._reset_read_offsets_for_new_requests(start_index, num_reqs)
 
+            fuse_extract = bool(
+                envs.VLLM_TPU_SUBST_EXTRACT_FUSED
+                and self.scheduler_config.async_scheduling
+                and spec_decode_metadata is not None
+                and len(cur_input_indices) > 0
+            )
+            self._subst_extract_out = None
+            if fuse_extract:
+                assert spec_decode_metadata is not None
+                self._subst_extract_req = (
+                    spec_decode_metadata.final_logits_indices,
+                    spec_decode_metadata.target_logits_indices,
+                )
             input_ids = self._apply_async_token_substitution(
                 self.input_ids, cur_input_indices, pre_next_tokens_indices
             )
+            self.__dict__.pop("_subst_extract_req", None)
             host_phases.mark("seed_reset_subst")
             # Async spec: the drafts the target verifies live in the substituted
             # input_ids (host input_ids_cpu holds placeholders), so re-source the
@@ -4847,11 +4901,17 @@ class TPUModelRunner(GPUModelRunner):
                     extract_draft_token_ids,
                 )
 
-                spec_decode_metadata.draft_token_ids = extract_draft_token_ids(
-                    input_ids,
-                    spec_decode_metadata.final_logits_indices,
-                    spec_decode_metadata.target_logits_indices,
-                )
+                if self._subst_extract_out is not None:
+                    # VLLM_TPU_SUBST_EXTRACT_FUSED: gathered by the
+                    # substitution program itself.
+                    spec_decode_metadata.draft_token_ids = self._subst_extract_out
+                    self._subst_extract_out = None
+                else:
+                    spec_decode_metadata.draft_token_ids = extract_draft_token_ids(
+                        input_ids,
+                        spec_decode_metadata.final_logits_indices,
+                        spec_decode_metadata.target_logits_indices,
+                    )
             elif (
                 spec_decode_metadata is not None
                 and spec_decode_metadata.draft_token_ids is None
@@ -7626,6 +7686,21 @@ class TPUModelRunner(GPUModelRunner):
                                     input_ids.dtype,
                                 )
                             )
+                            if envs.VLLM_TPU_SUBST_EXTRACT_FUSED:
+                                # Steady verify: both index vectors are the
+                                # padded logits length, = num_tokens here.
+                                idx = torch.zeros(
+                                    num_tokens, dtype=torch.int32, device=self.device
+                                )
+                                synchronize_tensors(
+                                    _subst_prefix_extract_compiled(
+                                        next_tokens.to(src_dtype),
+                                        num_tokens,
+                                        input_ids.dtype,
+                                        idx,
+                                        idx,
+                                    )
+                                )
                     logger.info("  -- num_tokens: %d, next_len: %d", num_tokens, nlen)
 
     def _precompile_rejection_sampler(self) -> None:
