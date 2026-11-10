@@ -136,6 +136,9 @@ legs:
     additional_config:
       qwen3_5:
         native_fp8_attention: true
+      tpu_compile:
+        drop_global_state_guard: true
+        fast_compiled_call: true
       tpu_frontend:
         detok_prompt_tail: true
         tokenize_prefix_cache: true
@@ -254,6 +257,9 @@ legs:
       qwen3_5:
         exp2_softmax: true
         native_fp8_attention: true
+      tpu_compile:
+        drop_global_state_guard: true
+        fast_compiled_call: true
       tpu_frontend:
         tokenize_prefix_cache: true
       tpu_runner:
