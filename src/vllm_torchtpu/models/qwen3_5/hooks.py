@@ -20,6 +20,10 @@ architectures in ``settings.ARCHITECTURES``, so vLLM calls it from
 Qwen3.5 checks, validates ``additional_config["qwen3_5"]``, and applies
 the TPU defaults below. Each default fills a value only when the user left it
 unset, so an explicit command-line value always wins.
+
+- ``kv_cache_memory_bytes``: a shape-calibrated budget, except on a
+  ``kv_producer`` (prefill) leg, which stays on ``gpu_memory_utilization``.
+- ``prefix_match_unit``: 128 tokens on a ``kv_producer`` leg.
 """
 
 from __future__ import annotations
@@ -71,6 +75,12 @@ def _expert_slot_kv_credit(model_config, parallel_config) -> tuple[int, object]:
 
 
 def _apply_prefix_match_unit(vllm_config: VllmConfig) -> None:
+    # Only a prefill (kv_producer) leg: its prefix hits can then land on any
+    # 128-token boundary inside its large blocks (2176 tokens at the IX
+    # points). A decode leg and a mixed engine keep vLLM's default.
+    kv_cfg = vllm_config.kv_transfer_config
+    if kv_cfg is None or kv_cfg.kv_role != "kv_producer":
+        return
     cache_config = vllm_config.cache_config
     if cache_config.prefix_match_unit is None:
         cache_config.prefix_match_unit = 128
