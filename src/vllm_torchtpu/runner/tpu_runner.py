@@ -116,7 +116,6 @@ from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
 from vllm_torchtpu.layers.adapter import (
     dp_vocab_parallel,
     expert_placement,
-    gated_norm_quant_op,
     sequence_parallel,
     small_all_reduce_op,
     token_padding,
@@ -159,6 +158,7 @@ from vllm_torchtpu.layers.core.sequence_layout import (
 )
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.lora.lora_manager import TPUWorkerLoRAManager
+from vllm_torchtpu.models.qwen3_5.kernels import gated_norm_quant_op
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
 )
