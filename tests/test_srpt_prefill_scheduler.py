@@ -352,8 +352,9 @@ def test_failed_hold_backs_off_exponentially_per_target(shared_model_config):
 @pytest.mark.parametrize(
     ("scheduler_cls", "expected_running", "expected_preempted"),
     [
-        # Admission order leaves `dec` at running[-1], so it is preempted.
-        (PrefixAwareScheduler, ["long", "short"], "dec"),
+        # Decoders first moves `dec` to running[0], which leaves `short`
+        # (behind `long` in admission order) at running[-1] to be preempted.
+        (PrefixAwareScheduler, ["dec", "long"], "short"),
         # SRPT order puts `long` at running[-1], so it is preempted instead.
         (SrptPrefillScheduler, ["dec", "short"], "long"),
     ],

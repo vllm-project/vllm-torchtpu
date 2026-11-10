@@ -43,7 +43,7 @@ import time
 from bisect import bisect_right
 from itertools import islice
 from operator import itemgetter
-from typing import cast
+from typing import Any, cast
 
 from vllm.logger import init_logger
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
@@ -226,7 +226,7 @@ class PrefixAwareScheduler(AsyncScheduler):
         pool = getattr(self.kv_cache_manager, "block_pool", None)
         d = getattr(pool, "__dict__", None)
         log = d.get("_tpu_prefix_change_log") if isinstance(d, dict) else None
-        if log is not None and len(log) > self._MEMO_LOG_CAP:
+        if isinstance(d, dict) and log is not None and len(log) > self._MEMO_LOG_CAP:
             cut = len(log) // 2
             d["_tpu_prefix_change_log_base"] = log[cut - 1][0]
             del log[:cut]
@@ -483,13 +483,16 @@ class PrefixAwareScheduler(AsyncScheduler):
         a step that admitted every waiting request with a short chunk is not
         one.
         """
-        tm = getattr(self, "_tm", None)
+        tm: dict[str, Any] | None = getattr(self, "_tm", None)
         if tm is None:
-            tm = self._tm = {
-                "steps": 0,
-                "small_steps_waiting": 0,
-                "stops": {},
-            }
+            tm = self._tm = cast(
+                dict[str, Any],
+                {
+                    "steps": 0,
+                    "small_steps_waiting": 0,
+                    "stops": {},
+                },
+            )
         tm["steps"] += 1
         if waiting_at_start > 0:
             tokens = getattr(out, "total_num_scheduled_tokens", 0)
