@@ -13,12 +13,14 @@
 # limitations under the License.
 """Fused gated q split + QK RMS norm + RoPE for ``Qwen3NextAttention``.
 
-vLLM fuses these on CUDA only. With ``TPU_FUSED_QK_NORM_ROPE`` set, token
-buckets in ``[TPU_FUSED_QK_NORM_ROPE_MIN_ROWS, MAX_ROWS]`` run the
-``qk_norm_rope_gate`` kernel, which tiles large row counts in VMEM, instead of
-the eager split, per-head norms and rope; buckets outside that range run the
-JAX reference inside the same custom op so the FX trace carries no Python row
-fork and works for both ``backbone`` and ``eagle_head`` graphs.
+vLLM fuses these on CUDA only. On a Qwen3.5 engine (the rule in
+:func:`maybe_install_qk_norm_rope_patch`), token buckets in
+``[MIN_ROWS, MAX_ROWS]`` run the ``qk_norm_rope_gate`` kernel, which tiles
+large row counts in VMEM, instead of the eager split, per-head norms and
+rope; buckets outside that range run the JAX reference inside the same custom
+op so the FX trace carries no Python row fork and works for both ``backbone``
+and ``eagle_head`` graphs. Other models that use ``Qwen3NextAttention``
+(Qwen3-Next) keep vLLM's eager path.
 """
 
 import functools
@@ -27,22 +29,28 @@ from collections.abc import Callable
 import jax
 import torch
 from torch_tpu._internal import pallas
-from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.config import ModelConfig, VllmConfig, get_current_vllm_config
 
-from vllm_torchtpu import envs
+from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.models.qwen3_5 import settings as qwen3_5_settings
 from vllm_torchtpu.models.qwen3_5.kernels.qk_norm_rope_gate import (
     qk_norm_rope_gate,
+)
+from vllm_torchtpu.models.qwen3_5.kernels.qk_norm_rope_gate import (
     reference as qk_norm_rope_gate_reference,
 )
-from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
 
-# The largest token bucket that takes the kernel.
+# The token buckets that take the kernel; the others run the JAX reference.
+MIN_ROWS = 0
 MAX_ROWS = 16384
 
-# The (1 + w) buffer TPU_NORM_WEIGHT_HOIST keeps on each GemmaRMSNorm, when that
-# feature is present and on.
+# Marks the wrapper install_qk_norm_rope_patch puts on Qwen3NextAttention.
+_INSTALLED_ATTR = "_tpu_fused_qk_norm_rope"
+
+# The (1 + w) buffer kept on each GemmaRMSNorm. The Qwen3.5 model patch's norm
+# weight hoist fills it when present; otherwise _weight_plus_one computes it.
 _HOISTED_WEIGHT_ATTR = "_tpu_weight_plus_one"
 
 _ops: dict[tuple[int, int, int, int, float], Callable] = {}
@@ -70,10 +78,9 @@ def _build_op(key: tuple[int, int, int, int, float]) -> None:
         k_w: jax.Array,
         cos_sin: jax.Array,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        min_rows = envs.TPU_FUSED_QK_NORM_ROPE_MIN_ROWS
         impl = (
             qk_norm_rope_gate
-            if min_rows <= q_gate.shape[0] <= MAX_ROWS
+            if MIN_ROWS <= q_gate.shape[0] <= MAX_ROWS
             else qk_norm_rope_gate_reference
         )
         return impl(
@@ -127,7 +134,7 @@ def _log_armed_rows(vllm_config: VllmConfig) -> None:
     rows_per_request = 1 + (spec.num_speculative_tokens if spec is not None else 0)
     max_decode_rows = vllm_config.scheduler_config.max_num_seqs * rows_per_request
     logger.info_once(
-        "[Attention] TPU_FUSED_QK_NORM_ROPE: buckets of <= %d rows run the fused "
+        "[Attention] Fused q/k norm + rope: buckets of <= %d rows run the fused "
         "q/k norm + rope kernel, i.e. decode steps of <= %d requests at %d rows "
         "each; the largest decode step has %d rows and runs the %s path.",
         MAX_ROWS,
@@ -142,7 +149,7 @@ def _prebuild(layer: torch.nn.Module, model_config) -> bool:
     reason = _unsupported_reason(layer, model_config)
     if reason is not None:
         logger.warning_once(
-            "[Attention] TPU_FUSED_QK_NORM_ROPE: %s; running the eager q/k norm "
+            "[Attention] Fused q/k norm + rope: %s; running the eager q/k norm "
             "and rope.",
             reason,
         )
@@ -177,11 +184,16 @@ def project_qkv_gate(
 
 
 def install_qk_norm_rope_patch() -> None:
-    """Route ``Qwen3NextAttention`` to the fused kernel custom op."""
-    if not envs.TPU_FUSED_QK_NORM_ROPE:
-        return
+    """Route ``Qwen3NextAttention`` to the fused kernel custom op.
+
+    Idempotent. Each layer arms the fused path at construction
+    (:func:`_prebuild`) and keeps vLLM's eager path when the kernel cannot
+    compute it.
+    """
     from vllm.model_executor.models.qwen3_next import Qwen3NextAttention
 
+    if getattr(Qwen3NextAttention._project_qkv_gate, _INSTALLED_ATTR, False):
+        return
     original_init = Qwen3NextAttention.__init__
     original_project = Qwen3NextAttention._project_qkv_gate
 
@@ -196,5 +208,22 @@ def install_qk_norm_rope_patch() -> None:
             return project_qkv_gate(self, qkv, positions)
         return original_project(self, qkv, positions)
 
+    setattr(_project_qkv_gate, _INSTALLED_ATTR, True)
     Qwen3NextAttention.__init__ = __init__
     Qwen3NextAttention._project_qkv_gate = _project_qkv_gate
+
+
+def maybe_install_qk_norm_rope_patch(model_config: ModelConfig | None) -> bool | None:
+    """Qwen3.5 rule: a Qwen3.5 engine runs the fused q/k norm + rope.
+
+    Registered as a model-specific patch (``patch_registry``). Returns False
+    until a Qwen3.5 model config is available, so other models, including
+    Qwen3-Next, which shares ``Qwen3NextAttention``, never install it. The
+    patch is class-wide, so the MTP draft's attention, built after the
+    target's config is seen, takes the fused path too.
+    """
+    if not qwen3_5_settings.is_qwen3_5(model_config):
+        return False
+    install_qk_norm_rope_patch()
+    logger.info("Applied TPU patch: Qwen3.5 fused q/k norm + rope.")
+    return None
