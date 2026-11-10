@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The GDN kernel dispatch: the Qwen GDN architectures run the Qwen3.5 copy of
+"""The GDN kernel dispatch: the Qwen3.5 MoE architectures run the Qwen3.5 copy of
 the fused Conv1D-GDN v3 kernel (models/qwen3_5/kernels/gdn), every other
 architecture runs the shared kernel in kernels/gdn/v3, and nothing in the GDN
 layer calls either kernel except through `gdn_kernel_wrapper`."""
@@ -44,7 +44,7 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
 )
 
 OTHER_ARCHITECTURES = [
-    *sorted(POOLED_GDN_ARCHITECTURES - QWEN_GDN_ARCHITECTURES),
+    *sorted(POOLED_GDN_ARCHITECTURES - gdn_attention.QWEN3_5_GDN_COPY_ARCHITECTURES),
     "LlamaForCausalLM",
     None,
 ]
@@ -56,8 +56,10 @@ DIM = 2 * N_KQ * D_K + N_V * D_V
 NUM_TOKENS, NUM_SEQS = 6, 2
 
 
-@pytest.mark.parametrize("architecture", sorted(QWEN_GDN_ARCHITECTURES))
-def test_qwen_gdn_architectures_run_the_copy(architecture):
+@pytest.mark.parametrize(
+    "architecture", sorted(gdn_attention.QWEN3_5_GDN_COPY_ARCHITECTURES)
+)
+def test_qwen3_5_moe_architectures_run_the_copy(architecture):
     assert gdn_attention.gdn_kernel_wrapper(architecture) is qwen3_5_gdn_wrapper
 
 
@@ -203,7 +205,7 @@ def _run_pooled_sharded(architecture):
 )
 @pytest.mark.parametrize(
     ("architecture", "expect_copy"),
-    [(QWEN, True), ("Qwen3NextForCausalLM", True), (KIMI, False), (None, False)],
+    [(QWEN, True), ("Qwen3NextForCausalLM", False), (KIMI, False), (None, False)],
 )
 def test_each_call_path_runs_the_architectures_kernel(
     spies, run, architecture, expect_copy
@@ -287,3 +289,16 @@ def test_the_engine_architecture_is_used_when_the_layer_has_none():
         == "Qwen3NextForCausalLM"
     )
     assert gdn_attention_op._model_architecture(SimpleNamespace(), None) is None
+
+
+def test_the_copy_serves_only_the_qwen3_5_moe_architectures():
+    """Qwen3-Next, dense Qwen3.5 and Qwen4Exp share the GDN pool layout but keep
+    the shared kernel until they are validated on the copy."""
+    assert {
+        "Qwen3_5MoeForCausalLM",
+        "Qwen3_5MoeForConditionalGeneration",
+    } == gdn_attention.QWEN3_5_GDN_COPY_ARCHITECTURES
+    others = QWEN_GDN_ARCHITECTURES - gdn_attention.QWEN3_5_GDN_COPY_ARCHITECTURES
+    assert others
+    for architecture in others:
+        assert gdn_attention.gdn_kernel_wrapper(architecture) is main_gdn_wrapper

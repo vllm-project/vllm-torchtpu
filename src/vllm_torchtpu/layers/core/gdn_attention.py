@@ -26,7 +26,6 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
 from vllm import envs
 
-from vllm_torchtpu.gdn_pool_layout import QWEN_GDN_ARCHITECTURES
 from vllm_torchtpu.kernels.experimental.gdn_pcp_fused import (
     pcp_wrapper as gdn_pcp_fused_wrapper,
 )
@@ -37,19 +36,32 @@ from vllm_torchtpu.kernels.gdn.head_geometry import (
 from vllm_torchtpu.kernels.gdn.v3 import wrapper as gdn_v3_wrapper
 from vllm_torchtpu.utils import get_mesh_shape_product
 
+# The architectures the Qwen3.5 GDN copy is validated for: the Qwen3.5 MoE
+# checkpoints the prefill/decode-disaggregated submission ran. The other Qwen
+# GDN architectures in gdn_pool_layout (Qwen3-Next, dense Qwen3.5, Qwen4Exp)
+# keep the shared kernel until they are validated on the copy; add them here
+# in the change that does so.
+QWEN3_5_GDN_COPY_ARCHITECTURES = frozenset(
+    {
+        "Qwen3_5MoeForCausalLM",
+        "Qwen3_5MoeForConditionalGeneration",
+    }
+)
+
 _GDN_TP_AXIS_NAME = "tp"
 
 
 def gdn_kernel_wrapper(architecture: str | None) -> ModuleType:
     """Return the fused Conv1D-GDN v3 wrapper module that serves `architecture`.
 
-    The Qwen GDN architectures (`QWEN_GDN_ARCHITECTURES`) run the copy in
-    `models/qwen3_5/kernels/gdn`, which carries the Qwen3.5 GDN v3 changes.
+    The Qwen3.5 MoE architectures (`QWEN3_5_GDN_COPY_ARCHITECTURES`) run the
+    copy in `models/qwen3_5/kernels/gdn`, which carries the Qwen3.5 GDN v3
+    changes.
     Every other architecture, and a caller that passes no architecture, runs
     the shared kernel in `kernels/gdn/v3` unchanged. This is the only place
     that chooses between the two; the copy is imported only when chosen.
     """
-    if architecture in QWEN_GDN_ARCHITECTURES:
+    if architecture in QWEN3_5_GDN_COPY_ARCHITECTURES:
         from vllm_torchtpu.models.qwen3_5.kernels.gdn import (
             wrapper as qwen3_5_gdn_wrapper,
         )
