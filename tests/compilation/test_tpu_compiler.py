@@ -1119,3 +1119,17 @@ class TestSingleSizeCompile:
         torch.testing.assert_close(fn(size, x), graph(size, x))
         # Only the compiled copy is rewritten; vLLM keeps its own graph.
         assert len(next(iter(graph.graph.nodes)).users) == 2
+
+
+def test_runtime_cache_key_covers_the_qwen3_5_kernel_copies():
+    """The Qwen3.5 kernel copies run behind custom-op boundaries like the
+    shared kernels, so their source must be part of the runtime cache key."""
+    import vllm_torchtpu
+    from vllm_torchtpu.compilation import tpu_compiler
+
+    repo_root = Path(vllm_torchtpu.__file__).resolve().parent.parent
+    hashed = {
+        p.relative_to(repo_root).as_posix()
+        for p in tpu_compiler._iter_runtime_cache_key_files(repo_root)
+    }
+    assert "vllm_torchtpu/models/qwen3_5/kernels/gdn/wrapper.py" in hashed
