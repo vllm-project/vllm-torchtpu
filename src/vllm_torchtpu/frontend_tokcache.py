@@ -14,7 +14,9 @@
 """Segment-level chat message tokenization cache for OpenAI-compatible serving.
 
 Caches tokenized message segments across multi-turn agentic conversations to
-avoid redundant re-tokenization of shared conversation prefixes.
+avoid redundant re-tokenization of shared conversation prefixes. Installed by
+``additional_config["tpu_frontend"]["tokenize_prefix_cache"]`` (off by
+default; see ``frontend_options``).
 """
 
 from __future__ import annotations
@@ -32,11 +34,16 @@ BOUNDARY = "<|im_start|>"
 _BOUNDARY_B = BOUNDARY.encode("utf-8")
 
 
-def _env_int(name: str, default: int) -> int:
-    try:
-        return int(os.environ.get(name, default))
-    except ValueError:
-        return default
+# Cache sizing of the installed cache. 2048 entries and 64M tokens are what
+# every prefill leg of the IX Qwen3.5 deployment ran.
+MAX_ENTRIES = 2048
+MAX_TOKENS = 64_000_000
+# Prompts shorter than this are encoded directly.
+MIN_TOKENS = 2048
+# The first VERIFY_FIRST cached encodes are checked against a full encode, and
+# any mismatch disables the cache.
+VERIFY_FIRST = 8
+LOG_PERIOD_S = 60.0
 
 
 class _Entry:
@@ -424,27 +431,19 @@ def _build_cache_for(tokenizer) -> PrefixTokenCache | None:
     return PrefixTokenCache(
         encode,
         boundary_id,
-        max_entries=_env_int("QX_TOKENIZE_PREFIX_CACHE_ENTRIES", 2048),
-        max_tokens=_env_int("QX_TOKENIZE_PREFIX_CACHE_MAX_TOKENS", 256_000_000),
-        min_tokens=_env_int("QX_TOKENIZE_PREFIX_CACHE_MIN_TOKENS", 2048),
-        verify_first=_env_int("QX_TOKENIZE_PREFIX_CACHE_VERIFY_FIRST", 8),
-        verify_every=_env_int("QX_TOKENIZE_PREFIX_CACHE_VERIFY_EVERY", 0),
-        log_period_s=float(_env_int("QX_TOKENIZE_PREFIX_CACHE_LOG_S", 60)),
+        max_entries=MAX_ENTRIES,
+        max_tokens=MAX_TOKENS,
+        min_tokens=MIN_TOKENS,
+        verify_first=VERIFY_FIRST,
+        log_period_s=LOG_PERIOD_S,
     )
 
 
 def maybe_install_tokenize_prefix_cache() -> bool:
     """Monkeypatch BaseRenderer._tokenize_prompt (API server). Idempotent."""
     global _INSTALLED
-    if _INSTALLED or os.environ.get("QX_TOKENIZE_PREFIX_CACHE", "1") != "1":
+    if _INSTALLED:
         return False
-    try:
-        from vllm.engine.arg_utils import EngineArgs
-
-        if getattr(EngineArgs, "renderer_num_workers", None) == 1:
-            EngineArgs.renderer_num_workers = _env_int("QX_RENDERER_NUM_WORKERS", 4)
-    except Exception:
-        pass
     try:
         from vllm.renderers import base as rbase
         from vllm.renderers.hf import HfRenderer
@@ -502,7 +501,7 @@ def maybe_install_tokenize_prefix_cache() -> bool:
     _INSTALLED = True
     logger.warning(
         "[QX_TOKCACHE] installed BaseRenderer._tokenize_prompt patch "
-        "(QX_TOKENIZE_PREFIX_CACHE=1, pid %d)",
+        "(tpu_frontend.tokenize_prefix_cache, pid %d)",
         os.getpid(),
     )
     return True
