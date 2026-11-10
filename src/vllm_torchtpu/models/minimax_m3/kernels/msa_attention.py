@@ -387,9 +387,12 @@ def _sorted_unions(per_tile: jax.Array) -> jax.Array:
     `_NO_PAGE`, which the second sort moves past the distinct pages. No
     scatter or gather (`jnp.unique` compacts with both, SparseCore offloads
     of ~25 us per call in the c4 prefill twin, j-3c651507)."""
-    s = jnp.sort(per_tile, axis=1)
+    # Unstable: equal pages are indistinguishable, and a stable sort (jnp.sort)
+    # carries an iota operand through both sorts as its tie-breaker.
+    sort = functools.partial(jax.lax.sort, dimension=1, is_stable=False)
+    s = sort(per_tile)
     dup = jnp.pad(s[:, 1:] == s[:, :-1], ((0, 0), (1, 0)))
-    return jnp.sort(jnp.where(dup, _NO_PAGE, s), axis=1)
+    return sort(jnp.where(dup, _NO_PAGE, s))
 
 
 def _work_list(selected: jax.Array, block_q: int, pages_per_step: int):
