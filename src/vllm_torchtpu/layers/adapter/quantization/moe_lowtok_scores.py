@@ -251,11 +251,9 @@ def _routing_unsupported_reason(layer: RoutedExperts) -> str | None:
         return "VLLM_MOE_ROUTING_SIMULATION_STRATEGY is set"
     if enable_pipelined_collective_and_compute():
         return "MoE chunk pipelining keeps the router input rank-local"
-    if (
-        int(layer.w13_weight.shape[0]) * int(layer.moe_config.ep_size)
-        != int(layer.global_num_experts)
-        and not _layer_has_placement_copies(layer)
-    ):
+    if int(layer.w13_weight.shape[0]) * int(layer.moe_config.ep_size) != int(
+        layer.global_num_experts
+    ) and not _layer_has_placement_copies(layer):
         return "the layer holds extra copy slots"
     return None
 
@@ -323,15 +321,11 @@ def _moe_scores_fn(
     else:
         topk_logits, topk_ids = jax.lax.top_k(logits_f32, topk)
     valid_row = topk_logits[:, :1] > -3.0e38
-    topk_weights = jnp.where(
-        valid_row, jax.nn.softmax(topk_logits, axis=-1), 0.0
-    )
+    topk_weights = jnp.where(valid_row, jax.nn.softmax(topk_logits, axis=-1), 0.0)
     num_primary_experts = (
         owned
         if has_copies
-        else (
-            int(expert_placement.owned()) if expert_placement.has_copies() else None
-        )
+        else (int(expert_placement.owned()) if expert_placement.has_copies() else None)
     )
     return fused_moe_func(
         x,
@@ -392,9 +386,7 @@ def _build_op(topk: int) -> torch.library.CustomOpDef:
     return op
 
 
-def _build_copies_op(
-    topk: int, ranks: int, owned: int
-) -> torch.library.CustomOpDef:
+def _build_copies_op(topk: int, ranks: int, owned: int) -> torch.library.CustomOpDef:
     key = (topk, ranks, owned)
     op = _OPS.get(key)
     if op is not None:
@@ -431,9 +423,7 @@ def _build_copies_op(
             has_copies=True,
         )
 
-    op = jax_op(
-        f"pallas::moe_lowtok_scores_copies_k{topk}_r{ranks}_o{owned}", moe
-    )
+    op = jax_op(f"pallas::moe_lowtok_scores_copies_k{topk}_r{ranks}_o{owned}", moe)
 
     def _fake(x, *_args):
         return torch.empty_like(x)
