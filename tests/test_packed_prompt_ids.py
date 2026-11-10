@@ -115,7 +115,6 @@ def test_worker_input_batch_identical(monkeypatch):
             device=torch.device("cpu"),
             vocab_size=248_077,
             block_sizes=[256],
-            kernel_block_sizes=[256],
             max_num_blocks_per_req=[512],
         )
         st = CachedRequestState(

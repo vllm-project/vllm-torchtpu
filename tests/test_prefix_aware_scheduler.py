@@ -430,3 +430,57 @@ def test_external_warmth_is_zero_on_a_kv_consumer():
     assert s._external_warmth(r, 0) == 2048
     s._is_kv_consumer = True
     assert s._external_warmth(r, 0) == 0
+
+
+def test_schedule_polls_the_connector_before_vllm_schedules(monkeypatch):
+    events = []
+
+    def fake_schedule(self, *args, **kwargs):
+        events.append("schedule")
+        return "out"
+
+    monkeypatch.setattr(AsyncScheduler, "schedule", fake_schedule, raising=False)
+    s = PrefixAwareScheduler.__new__(PrefixAwareScheduler)
+    s.running = []
+    s.connector = SimpleNamespace(
+        poll_and_complete_transfers=lambda sched: events.append(("poll", sched))
+    )
+    assert s.schedule() == "out"
+    assert events == [("poll", s), "schedule"]
+    # A connector without the method (main's Raiden connector today) is skipped.
+    events.clear()
+    s.connector = SimpleNamespace()
+    assert s.schedule() == "out"
+    assert events == ["schedule"]
+
+
+def _init_with(monkeypatch, kv_transfer_config, calls=None):
+    def fake_init(self, *args, **kwargs):
+        self.vllm_config = SimpleNamespace(kv_transfer_config=kv_transfer_config)
+        self.connector = None if kv_transfer_config is None else object()
+        self.kv_cache_manager = MagicMock()
+
+    calls = [] if calls is None else calls
+    monkeypatch.setattr(AsyncScheduler, "__init__", fake_init)
+    monkeypatch.setattr(
+        prefix_change_log, "install_epoch", lambda: calls.append("epoch")
+    )
+    monkeypatch.setattr(
+        PrefixAwareScheduler, "_enable_memo_xstep", lambda self: calls.append("memo")
+    )
+    return PrefixAwareScheduler()
+
+
+def test_kv_role_detection(monkeypatch):
+    s = _init_with(monkeypatch, None)
+    assert (s._is_disagg, s._is_kv_producer, s._is_kv_consumer) == (False,) * 3
+    s = _init_with(monkeypatch, SimpleNamespace(kv_role="kv_producer"))
+    assert (s._is_disagg, s._is_kv_producer, s._is_kv_consumer) == (True, True, False)
+    s = _init_with(monkeypatch, SimpleNamespace(kv_role="kv_consumer"))
+    assert (s._is_disagg, s._is_kv_producer, s._is_kv_consumer) == (True, False, True)
+
+
+def test_init_installs_the_epoch_counters_before_the_memo(monkeypatch):
+    calls = []
+    _init_with(monkeypatch, None, calls)
+    assert calls == ["epoch", "memo"]
