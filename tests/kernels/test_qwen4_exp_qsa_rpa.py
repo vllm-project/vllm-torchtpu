@@ -374,6 +374,11 @@ def test_one_kv_head_rpa_lifecycle(fp8):
 
 @pytest.mark.parametrize("budget", [16, 512, 2048, 4096])
 def test_query_batch_bounds_scalar_page_metadata(budget, monkeypatch):
+    import math
+
+    from vllm_torchtpu.kernels.experimental.batched_rpa import schedule
+    from vllm_torchtpu.kernels.sparse_gqa_decode import planning
+
     info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
     monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
     batch = qsa_rpa.batching.rpa_query_batch_size(
@@ -384,8 +389,24 @@ def test_query_batch_bounds_scalar_page_metadata(budget, monkeypatch):
         ratio=4,
     )
     assert 0 < batch <= 64
-    schedule = (128 * (8 * (5 + 2 + 3 * 64 + 4) + 5) + 1) * 4
-    assert schedule + (batch * (budget + 1 + 4) + 1) * 4 <= info.smem_capacity_bytes
+
+    def allocated_bytes(count):
+        cfg = planning.make_config(
+            count, 24, 256, 2, 4, budget, jnp.dtype(jnp.bfloat16), info=info
+        )
+        scratch = schedule.BaseMetadataComputer.get_rpa_schedule(cfg).scratch_shapes()
+        schedule_bytes = sum(
+            math.prod(ref.shape) * ref.dtype.itemsize
+            for ref in jax.tree.leaves(scratch)
+        )
+        scalar_shapes = ((count + 1,), (count,), (count,), (count,))
+        attention = sum(math.prod(shape) * 4 for shape in scalar_shapes)
+        generation = attention + (3 + 2 * cfg.page_window_slot_len) * 4
+        return schedule_bytes + max(attention, generation)
+
+    assert allocated_bytes(batch) <= info.smem_capacity_bytes
+    if batch < qsa_rpa.batching.RPA_MAX_QUERY_CHUNK:
+        assert allocated_bytes(batch * 2) > info.smem_capacity_bytes
     if budget == 512:
         assert batch == 64
 

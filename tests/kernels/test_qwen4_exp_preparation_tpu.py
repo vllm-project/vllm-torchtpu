@@ -326,40 +326,53 @@ def test_page_metadata_cpu_keeps_generic_gather_without_hardware(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "rows,count,dtype,kind,expected",
+    "rows,count,dtype,expected",
     [
-        (67584, 16, jnp.bfloat16, "TPU_7X", True),
-        (65536, 16, jnp.bfloat16, "TPU_7X", True),
-        (128, 16, jnp.bfloat16, "TPU_7X", True),
-        (65535, 16, jnp.bfloat16, "TPU_7X", False),
-        (0, 16, jnp.bfloat16, "TPU_7X", False),
-        (67584, 8, jnp.bfloat16, "TPU_7X", False),
-        (67584, 32, jnp.bfloat16, "TPU_7X", False),
-        (67584, 16, jnp.float32, "TPU_7X", False),
-        (67584, 16, jnp.bfloat16, "TPU_V6E", False),
+        (67584, 16, jnp.bfloat16, True),
+        (65536, 16, jnp.bfloat16, True),
+        (128, 16, jnp.bfloat16, True),
+        (65535, 16, jnp.bfloat16, False),
+        (0, 16, jnp.bfloat16, False),
+        (67584, 8, jnp.bfloat16, True),
+        (67584, 32, jnp.bfloat16, True),
+        (67584, 0, jnp.bfloat16, False),
+        (67584, 16, jnp.float32, False),
     ],
 )
+@pytest.mark.parametrize("lanes", [64, 128])
 def test_completed_rope_dma_shape_policy(
-    rows, count, dtype, kind, expected, monkeypatch
+    rows, count, dtype, expected, lanes, monkeypatch
 ):
-    from types import SimpleNamespace
+    import dataclasses
 
     from jax.experimental.pallas import tpu as pltpu
 
     from vllm_torchtpu.kernels.qwen4_exp import tuned_block_sizes as policy
 
-    monkeypatch.setattr(
-        policy,
-        "_hardware",
-        lambda: SimpleNamespace(chip_version=getattr(pltpu.ChipVersion, kind)),
+    hardware = dataclasses.replace(
+        policy.DmaHardware.from_tpu_info(
+            pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+        ),
+        lanes=lanes,
     )
+    monkeypatch.setattr(policy, "_hardware", lambda: hardware)
     assert (
         policy.use_completed_rope_dma(
-            jax.ShapeDtypeStruct((rows, 128), dtype),
+            jax.ShapeDtypeStruct((rows, lanes), dtype),
             jax.ShapeDtypeStruct((count,), jnp.int32),
         )
         == expected
     )
+    if expected:
+        assert not policy.use_completed_rope_dma(
+            jax.ShapeDtypeStruct((rows, lanes + 1), dtype),
+            jax.ShapeDtypeStruct((count,), jnp.int32),
+        )
+        hardware = dataclasses.replace(hardware, vmem_bytes=1)
+        assert not policy.use_completed_rope_dma(
+            jax.ShapeDtypeStruct((rows, lanes), dtype),
+            jax.ShapeDtypeStruct((count,), jnp.int32),
+        )
 
 
 @pytest.mark.tpu_test

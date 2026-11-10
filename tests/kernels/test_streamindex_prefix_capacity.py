@@ -59,6 +59,8 @@ module = importlib.import_module(
 
 @pytest.fixture(autouse=True)
 def cpu_tpu_geometry(request, monkeypatch):
+    module._score_call_for_config.cache_clear()
+    module._score_body_for_config.cache_clear()
     if request.node.get_closest_marker("tpu_test") is None:
         monkeypatch.setattr(
             module.pltpu,
@@ -67,6 +69,9 @@ def cpu_tpu_geometry(request, monkeypatch):
                 module.pltpu.ChipVersion.TPU_7X, 1
             ),
         )
+    yield
+    module._score_call_for_config.cache_clear()
+    module._score_body_for_config.cache_clear()
 
 
 @pytest.mark.parametrize("chunk", [None, 8])
@@ -167,10 +172,10 @@ def test_per_query_contract_omits_empty_passes_and_preserves_selection(
 
     def pallas_call(kernel, **kwargs):
         shape = kwargs["out_shape"].shape
-        passes.append((kwargs["name"], kernel.keywords["seq_batch_size"]))
-        pitches.append(shape[1] * shape[2])
 
         def call(*args):
+            passes.append((kwargs["name"], kernel.keywords["seq_batch_size"]))
+            pitches.append(shape[1] * shape[2])
             bits = jnp.arange(shape[1] * 128, dtype=jnp.int32) + 0x3F000000
             return jnp.broadcast_to(bits.reshape(1, shape[1], 128), shape)
 

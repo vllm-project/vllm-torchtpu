@@ -163,7 +163,7 @@ def test_prepared_query_prefix_is_local_to_each_decode_chunk(monkeypatch, info):
         assert cu.shape == (9,)
         # Encode the actual schedule query index so every chunk must restart at zero.
         query = kwargs["query"] + cu[:-1][None, :, None, None, None]
-        return query, kwargs["cache"]
+        return query
 
     monkeypatch.setattr(decode, "decode_kernel", identity_attention)
     output, _ = decode.execute_decode(

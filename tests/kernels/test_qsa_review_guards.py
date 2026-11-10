@@ -13,7 +13,8 @@
 # limitations under the License.
 """Request-local routing, empty ABIs, and public SMEM capacity boundaries."""
 
-from types import SimpleNamespace
+import dataclasses
+import math
 
 import jax
 import jax.numpy as jnp
@@ -22,8 +23,9 @@ import pytest
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels.experimental.batched_rpa import schedule
 from vllm_torchtpu.kernels.qwen4_exp import pooled_qsa, qsa_rpa, qsa_state
-from vllm_torchtpu.kernels.sparse_gqa_decode import batching
+from vllm_torchtpu.kernels.sparse_gqa_decode import batching, planning
 
 
 @pytest.fixture
@@ -216,17 +218,25 @@ def test_rpa_rejects_nonpositive_width(columns):
 
 @pytest.mark.parametrize("lanes,columns", [(128, 513), (64, 41000)])
 def test_rpa_one_row_exact_capacity_boundary(monkeypatch, lanes, columns):
-    # 128 lanes, ratio4: the actual minimum batch8 schedule occupies 834052 B.
-    schedule_bytes = 834052 if lanes == 128 else 417028
-    required = schedule_bytes + 4 + 4 * (columns + 4)
+    hardware = dataclasses.replace(
+        pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1), num_lanes=lanes
+    )
+    monkeypatch.setattr(pltpu, "get_tpu_info", lambda: hardware)
+    cfg = planning.make_config(
+        1, 4, 128, 1, 4, columns - 1, jnp.dtype(jnp.bfloat16), info=hardware
+    )
+    scratch = schedule.BaseMetadataComputer.get_rpa_schedule(cfg).scratch_shapes()
+    schedule_bytes = sum(
+        math.prod(ref.shape) * ref.dtype.itemsize for ref in jax.tree.leaves(scratch)
+    )
+    # Generation holds distribution and two bounded page windows, not the table.
+    scalars = [(2,), (1,), (1,), (1,), (3,), (2 * cfg.page_window_slot_len,)]
+    required = schedule_bytes + sum(math.prod(shape) * 4 for shape in scalars)
+    hardware = dataclasses.replace(hardware, smem_capacity_bytes=required)
     monkeypatch.setattr(
         pltpu,
         "get_tpu_info",
-        lambda: SimpleNamespace(
-            num_lanes=lanes,
-            smem_capacity_bytes=required,
-            vmem_capacity_bytes=32 * 1024 * 1024,
-        ),
+        lambda: hardware,
     )
     assert (
         batching.rpa_query_batch_size(
@@ -238,15 +248,7 @@ def test_rpa_one_row_exact_capacity_boundary(monkeypatch, lanes, columns):
         )
         == 1
     )
-    monkeypatch.setattr(
-        pltpu,
-        "get_tpu_info",
-        lambda: SimpleNamespace(
-            num_lanes=lanes,
-            smem_capacity_bytes=required - 1,
-            vmem_capacity_bytes=32 * 1024 * 1024,
-        ),
-    )
+    hardware = dataclasses.replace(hardware, smem_capacity_bytes=required - 1)
     with pytest.raises(ValueError, match="One QSA page-table row.*SMEM capacity"):
         batching.rpa_query_batch_size(
             columns,
