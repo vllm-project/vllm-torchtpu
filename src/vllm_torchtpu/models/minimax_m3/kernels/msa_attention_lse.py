@@ -30,7 +30,10 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu.models.minimax_m3.kernels import msa_attention, msa_fp4
 
 # Page counts a kernel step may run at besides the full group (`_kernel`).
-_STEP_WIDTHS = (4, 8)
+# A 12-page width saves 4 pages of score columns for the ~9-12-page tile
+# unions of served c64 DCP 4 prefill (-1.8% kernel time over 80 real
+# selections, bitwise equal, j-7ea3ab27).
+_STEP_WIDTHS = (4, 8, 12)
 _LOG2_E = math.log2(math.e)
 _LN_2 = math.log(2.0)
 
