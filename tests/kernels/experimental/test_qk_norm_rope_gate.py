@@ -25,7 +25,7 @@ from vllm_torchtpu.kernels.experimental.qk_norm_rope_gate import (
     reference,
 )
 
-GEOMETRIES = [(4, 1, 256, 64), (2, 2, 128, 128)]
+GEOMETRIES = [(4, 1, 256, 64), (16, 1, 256, 64), (2, 2, 128, 128)]
 
 
 def _operands(seed, tokens, heads, kv_heads, dim, rot):
