@@ -362,7 +362,16 @@ def prepare_routed_gmm_inputs(
     use_sparse_core: bool,
     onehot_moe_permute_threshold: int = 0,
     skip_padded_tokens: bool = False,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    nonep_permute: str = "sorts",
+) -> tuple[
+    jax.Array,
+    jax.Array,
+    jax.Array,
+    jax.Array,
+    jax.Array,
+    jax.Array,
+    jax.Array | None,
+]:
     """Prepare the local-only routing layout using already-local expert ids.
 
     For non-EP runs `topk_indices_local` is always non-negative, so the
@@ -371,7 +380,16 @@ def prepare_routed_gmm_inputs(
     (inside this JIT) and marks non-local entries with a negative id which
     the mask filters out. Always running the masked branch keeps a single
     code path.
+
+    ``nonep_permute`` selects the metadata construction of the non-EP path
+    above the single-sort row cap: "sorts" (the forward permutation, its
+    inverse and a packed sort for the token ids) or "two_sorts" (the token
+    ids by division of the forward permutation). The last return value is
+    the forward permutation (sorted slot to routed row) when the path
+    computed one, else ``None``.
     """
+    if nonep_permute not in ("sorts", "two_sorts"):
+        raise ValueError(f"unknown non-EP permute {nonep_permute!r}")
     num_tokens_local = hidden_states_local.shape[0]
     topk_indices_flat = topk_indices_local.flatten()
     topk_weights_flat = topk_weights_local.flatten()
@@ -434,6 +452,16 @@ def prepare_routed_gmm_inputs(
         and (argsort_revert_indices is None or not packable)
         else None
     )
+    # The whole-expert path above the single-sort cap: one argsort for the
+    # forward permutation, then either a second argsort (its inverse) and a
+    # packed sort (the token ids), or the token ids by division.
+    if (
+        nonep_permute == "two_sorts"
+        and not use_ep
+        and sorted_indices is not None
+        and argsort_revert_indices is None
+    ):
+        token_indices_sorted = sorted_indices // topk
 
     if argsort_revert_indices is not None:
         group_sizes_local = bucket_counts[:local_num_experts]
@@ -508,6 +536,7 @@ def prepare_routed_gmm_inputs(
         topk_weights_flat,
         valid_mask,
         token_indices_sorted,
+        sorted_indices,
     )
 
 
@@ -691,6 +720,7 @@ def moe_gmm(
         "rhs_quant_dtype",
         "skip_padded_tokens",
         "num_primary_experts",
+        "nonep_permute",
     ),
 )
 def fused_moe_func(
@@ -712,6 +742,7 @@ def fused_moe_func(
     rhs_quant_dtype: jnp.dtype | None = None,
     skip_padded_tokens: bool = False,
     num_primary_experts: int | None = None,
+    nonep_permute: str = "sorts",
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
 
@@ -738,6 +769,10 @@ def fused_moe_func(
     is every local slot, and the next shard's first ids would be taken as
     local and summed a second time. ``None`` (the default) is the full slot
     count, the behaviour without a placement.
+
+    ``nonep_permute`` picks the routing metadata construction of the
+    whole-expert (non-EP) path (see ``prepare_routed_gmm_inputs``); the
+    default keeps the three sorts.
     """
 
     # Convert 3D scale [experts, blocks, N] to 4D [experts, blocks, 1, N]
@@ -839,6 +874,7 @@ def fused_moe_func(
         topk_weights_flat,
         valid_mask,
         token_indices_sorted,
+        _,
     ) = prepare_routed_gmm_inputs(
         hidden_states,
         topk_ids,
@@ -849,6 +885,7 @@ def fused_moe_func(
         use_sparse_core=use_sparse_core,
         onehot_moe_permute_threshold=onehot_moe_permute_threshold,
         skip_padded_tokens=skip_padded_tokens,
+        nonep_permute=nonep_permute,
     )
     x = jnp.pad(x, ((0, 0), (0, padded_hidden_size - hidden_size)))
     x = moe_gmm(
