@@ -79,13 +79,29 @@ def min_over_group(value: int, cpu_group: Any) -> int:
     return int(t.item())
 
 
+def dp_engines_in_lockstep(parallel_config) -> bool:
+    """Whether EP couples the DP engines. Their MoE combine reduces partial
+    expert outputs across engines, so every engine must enter the same
+    collectives with matching token buckets each step; uncoupled DP engines
+    stay independently schedulable."""
+    return get_dp_size(parallel_config) > 1 and parallel_config.enable_expert_parallel
+
+
+def ep_rank(
+    *, dp_rank: int, tp_rank: int, tp_size: int, pcp_rank: int = 0, pcp_size: int = 1
+) -> int:
+    """vLLM's EP rank of a DP x PCP x TP rank: the EP group spans all three,
+    DP-major."""
+    return (dp_rank * pcp_size + pcp_rank) * tp_size + tp_rank
+
+
 def min_across_ep_dp(parallel_config, value: int) -> int:
     """Return the minimum of `value` across the DP engines coupled by EP.
 
     EP-coupled engines must compile identical programs, so a value baked into
     them (such as the KV cache size) has to agree; uncoupled engines keep theirs.
     """
-    if get_dp_size(parallel_config) == 1 or not parallel_config.enable_expert_parallel:
+    if not dp_engines_in_lockstep(parallel_config):
         return value
     from vllm.distributed.parallel_state import get_dp_group
 
