@@ -186,7 +186,7 @@ class Bucket:
 
     @property
     def key(self) -> tuple[int, int]:
-        return (int(self.T), int(self.B))
+        return (self.T, self.B)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -273,6 +273,13 @@ class TpuMonoSpec:
     `collective_domain` names the ranks the kernel's collectives span (see
     `COLLECTIVE_DOMAINS`); the runtime's agreements run over that group.
 
+    `architectures` / `model_types` are the checkpoints the folder serves:
+    the runtime picks a folder under `vllm_torchtpu.models` whose `SPEC`
+    lists a checkpoint's HF `architectures` entry or `model_type` (also of
+    its `text_config`), and `hf_fields` (`(field, value)` pairs, read from the
+    HF config or its `text_config`) narrows that to configs with those
+    values; a folder with `hf_fields` is preferred when both match.
+
     `top_level_options` names the `options` keys a user may also set at the
     top level of the megakernel config (e.g. `VLLM_TPU_MEGAKERNEL=
     "mode=ep,buckets=8"`); the runtime forwards those into `options`. It reads
@@ -294,6 +301,9 @@ class TpuMonoSpec:
     decline_codes: tuple[str, ...] = ()
     source_root: str | None = None
     api_version: int = API_VERSION
+    architectures: tuple[str, ...] = ()
+    model_types: tuple[str, ...] = ()
+    hf_fields: tuple[tuple[str, Any], ...] = ()
     top_level_options: frozenset[str] = frozenset()
 
     def __post_init__(self) -> None:
@@ -326,7 +336,7 @@ class TpuMonoSpec:
             )
         if PAR_TP not in self.parallelism:
             raise MegakernelConfigError(f"{where}: parallelism must include 'tp'")
-        if unknown := sorted(set(self.requires) - set(REQUIRES_KEYS)):
+        if unknown := sorted(self.requires.keys() - REQUIRES_KEYS.keys()):
             raise MegakernelConfigError(
                 f"{where}: unknown requires key {unknown[0]!r}; "
                 f"known: {sorted(REQUIRES_KEYS)}"
@@ -341,6 +351,16 @@ class TpuMonoSpec:
                 f"{where}: collective_domain={self.collective_domain!r}; "
                 f"expected one of {sorted(COLLECTIVE_DOMAINS)}"
             )
+        for field in ("architectures", "model_types"):
+            values = _items(where, field, getattr(self, field))
+            fix(field, tuple(str(v) for v in values))
+        fields = self.hf_fields
+        pairs = (
+            fields.items()
+            if isinstance(fields, Mapping)
+            else _items(where, "hf_fields", fields)
+        )
+        fix("hf_fields", tuple((str(k), v) for k, v in pairs))
         values = _items(where, "top_level_options", self.top_level_options)
         fix("top_level_options", frozenset(str(v) for v in values))
 
