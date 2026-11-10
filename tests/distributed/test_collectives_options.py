@@ -59,3 +59,11 @@ def test_malformed_sections_are_rejected(section, match):
 def test_options_are_frozen():
     with pytest.raises(AttributeError):
         co.CollectivesOptions().small_all_reduce = True  # type: ignore[misc]
+
+
+def test_the_section_is_registered():
+    """A tpu_* section the tree does not list is refused at engine start."""
+    from vllm_torchtpu import additional_config_sections as sections
+
+    assert co.SECTION in sections.KNOWN_SECTIONS
+    sections.check({co.SECTION: {"small_all_reduce": True}})
