@@ -7263,9 +7263,23 @@ class TPUModelRunner(GPUModelRunner):
             and self._pp_is_last
             and not self.is_pooling_model
         ):
-            self._greedy_head_owner = greedy_top_tokens.resolve_head_owner(
-                self.model, self._dp_lockstep_enabled()
-            )
+            if (
+                greedy_top_tokens.target_head_dp_mode(
+                    self._dp_lockstep_enabled(),
+                    int(self.parallel_config.tensor_parallel_size),
+                )
+                == "fast"
+            ):
+                self._greedy_head_owner = greedy_top_tokens.resolve_head_owner(
+                    self.model, self._dp_lockstep_enabled()
+                )
+            else:
+                logger.info(
+                    "TPU_GREEDY_TOP_TOKENS under expert-parallel data parallelism "
+                    "with a tensor-parallel LM head: the target keeps full logits "
+                    "(the program idle engines replay); the draft head keeps the "
+                    "vocab-parallel argmax."
+                )
 
         # If using eagle3/mtp or dflash speculative decoding, load the draft model and
         # share the target's embeddings / LM head (if the draft requires it).

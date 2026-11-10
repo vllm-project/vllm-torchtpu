@@ -1361,6 +1361,24 @@ class _DraftHeadOwnerProxy(torch.nn.Module):
         self.lm_head = lm_head
 
 
+def target_head_dp_mode(dp_lockstep: bool, tp_size: int) -> str:
+    """How the target's LM head is served under TPU_GREEDY_TOP_TOKENS.
+
+    ``"fast"``: the vocab-parallel argmax / top-32 candidates. ``"stock"``:
+    full logits (``compute_selected_logits``), the path an idle engine's
+    lockstep dummy replays. Under expert-parallel data parallelism with a
+    tensor-parallel head, busy engines would pick the fast or stock program
+    per step from their own requests' sampling params, while idle engines
+    always replay the stock one; collectives pair across ranks in emission
+    order, so the target stays on the stock path there. The draft is not
+    affected: its tokens are always a greedy argmax, and an idle engine's
+    dummy draft runs the same ``_draft_propose_token`` program.
+    """
+    if dp_lockstep and tp_size > 1:
+        return "stock"
+    return "fast"
+
+
 def resolve_head_owner(model: torch.nn.Module, dp_lockstep: bool) -> torch.nn.Module:
     """The module holding ``lm_head`` and its ``logits_processor``.
 

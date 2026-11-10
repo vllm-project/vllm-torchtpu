@@ -235,6 +235,15 @@ def test_structured_output_falls_back_to_full_logits():
     )
 
 
+def test_target_head_stays_stock_under_ep_dp_with_a_tp_head():
+    # Busy engines would choose fast/stock per step; idle lockstep dummies
+    # always replay the stock logits program.
+    assert greedy_top_tokens.target_head_dp_mode(False, 8) == "fast"
+    assert greedy_top_tokens.target_head_dp_mode(True, 1) == "fast"
+    assert greedy_top_tokens.target_head_dp_mode(True, 2) == "stock"
+    assert greedy_top_tokens.target_head_dp_mode(True, 8) == "stock"
+
+
 def test_resolve_head_owner_finds_the_nested_language_model():
     owner = _Owner(_shards(torch.zeros(8, 2), 2)[0])
     model = torch.nn.Module()
