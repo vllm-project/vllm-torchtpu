@@ -763,3 +763,36 @@ def test_runner_sample_from_packed_candidates_and_verify_chunk(monkeypatch):
             topk_candidates_packed=True,
         )
     assert out.tolist() == [[10, 20, -1], [90, 100, -1]]
+
+
+def test_head_and_vocab_shard_buffers_are_int32():
+    from vllm.model_executor.layers import vocab_parallel_embedding as vpe
+
+    import vllm_torchtpu
+
+    vllm_torchtpu._patch_vllm_vocab_parallel_embedding()
+
+    head = _HeadShard(torch.zeros((16, 8)), start=16, tp_size=4, num_pad=2)
+    greedy_top_tokens._ensure_head_shard_buffers(head)
+    assert head.org_vocab_start_index.dtype == torch.int32
+    assert head.num_org_vocab_padding.dtype == torch.int32
+
+    # Existing int64 buffers are upgraded to int32.
+    head.org_vocab_start_index = torch.tensor(16, dtype=torch.int64)
+    head.num_org_vocab_padding = torch.tensor(2, dtype=torch.int64)
+    greedy_top_tokens._ensure_head_shard_buffers(head)
+    assert head.org_vocab_start_index.dtype == torch.int32
+    assert head.num_org_vocab_padding.dtype == torch.int32
+
+    inp = torch.tensor([0, 16, 17, 30, 31], dtype=torch.int32)
+    masked, mask = vpe.get_masked_input_and_mask(
+        inp,
+        torch.tensor(16, dtype=torch.int32),
+        torch.tensor(30, dtype=torch.int32),
+        torch.tensor(2, dtype=torch.int32),
+        torch.tensor(32, dtype=torch.int32),
+        torch.tensor(32, dtype=torch.int32),
+    )
+    assert masked.dtype == torch.int32
+    assert masked.tolist() == [0, 0, 1, 0, 0]
+    assert mask.tolist() == [True, False, False, True, True]
