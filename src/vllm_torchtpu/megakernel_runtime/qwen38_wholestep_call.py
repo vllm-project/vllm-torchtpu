@@ -192,7 +192,9 @@ def build_wholestep_call(
         R=R, B=B, T=T, ctx=128, tiles=wholestep_tiles(B, max_groups) if tiles is None else tiles,
         interpret=interpret, debug=DebugOptions(scopes=scopes),
     )
-    n_att = L // g.att_every  # QSA layers in the L-layer kernel
+    # QSA layers in the L-layer kernel (first="qsa": a partial last cycle is its QSA
+    # layer, VLLM_TPU_MK_WHOLE_L45).
+    n_att = -(-L // g.att_every)
     n_gdn = L - n_att
     n_qsa = n_att + int(tail)  # QSA layers written by this call
     assert len(qsa_layers) == n_qsa, (len(qsa_layers), n_qsa)

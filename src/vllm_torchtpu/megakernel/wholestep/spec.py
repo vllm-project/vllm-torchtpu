@@ -62,7 +62,12 @@ def wholestep_spec(
     indexer,
     top-K and compaction run in-kernel instead of taking a selection as input.
     """
-    assert L % g.att_every == 0 or (L == 1 and first == "qsa"), (L, g.att_every)
+    # `first="qsa"` may end on a partial cycle of its QSA layer (layers 3..47:
+    # VLLM_TPU_MK_WHOLE_L45).
+    assert L % g.att_every == 0 or (first == "qsa" and L % g.att_every == 1), (
+        L,
+        g.att_every,
+    )
     if pool_gdn:
         from ..models.qwen38_gdn_pool import Qwen38PoolGDN as gdn_cls
     else:
