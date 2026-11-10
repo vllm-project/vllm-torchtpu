@@ -266,6 +266,7 @@ def _stream(
         wait(e_idx, part)
 
         if w13_parts == 2:
+
             @pl.when(part == 0)
             def _gate_half():
                 h = jax.lax.dot_general(
@@ -425,9 +426,7 @@ def _kernel(
         wtab_ref = route_ref
     else:
         wtab_ref, *scratch = scratch
-        wtab_ref[...] = _select_topk(
-            route_ref[...], topk, from_logits=from_logits
-        )
+        wtab_ref[...] = _select_topk(route_ref[...], topk, from_logits=from_logits)
     # Lanes some row routes to; `collect` keeps the ones in this shard's gid.
     hit = jnp.any(wtab_ref[...] != 0, axis=0, keepdims=True)
     hits_v[...] = jnp.where(hit, 1, 0).astype(jnp.int32)
@@ -507,9 +506,9 @@ def _kernel_copies(
     fixed8 = jnp.broadcast_to(
         jnp.where(fixed, 1.0, 0.0).astype(jnp.bfloat16), (8, lanes)
     )
-    loads_mxu = jnp.dot(
-        fixed8, prim_1h_t, preferred_element_type=jnp.float32
-    )[:1].astype(jnp.int32)
+    loads_mxu = jnp.dot(fixed8, prim_1h_t, preferred_element_type=jnp.float32)[
+        :1
+    ].astype(jnp.int32)
 
     nc = hot1h_ref.shape[1]
     max_copies = (n_experts - owned) * ranks if n_experts > owned else nc
@@ -526,7 +525,9 @@ def _kernel_copies(
     pos = jnp.where((hh > 0.5) & (lane_c < n_hot_bound), ps - 1.0, -1.0)
     posm = jnp.transpose(jnp.broadcast_to(pos, (nc, nc)))[:n_hot_bound, :]
     row_i = jax.lax.broadcasted_iota(jnp.int32, (n_hot_bound, nc), 0)
-    lane_p = jax.lax.broadcasted_iota(jnp.int32, (n_hot_bound, nc), 1).astype(jnp.float32)
+    lane_p = jax.lax.broadcasted_iota(jnp.int32, (n_hot_bound, nc), 1).astype(
+        jnp.float32
+    )
     comp = jnp.sum(jnp.where(posm == lane_p, row_i, 0), axis=0, keepdims=True)
 
     cmp_v[...] = jnp.zeros_like(cmp_v)
@@ -626,7 +627,9 @@ def pack_tables(rank, gid, hot, hprim, hcopy, slot):
     )
     slot = np.asarray(slot, np.int32).reshape(-1)
     if slot.size != _TABLE_LANES:
-        raise ValueError(f"the slot table is {_TABLE_LANES} lanes wide, got {slot.size}")
+        raise ValueError(
+            f"the slot table is {_TABLE_LANES} lanes wide, got {slot.size}"
+        )
     if not (hprim.size == hot.size == hcopy.size):
         raise ValueError("hot, hprim and hcopy must be the same length")
     o_gid, o_hot, o_hprim, o_hcopy, o_slot, length = table_offsets(gid.size, hot.size)
@@ -728,8 +731,12 @@ def moe_lowtok(
     lanes = pl.cdiv(route.shape[1], _LANE) * _LANE
     x_rows = jnp.pad(x, ((0, rows - tokens), (0, 0)))
     if from_logits:
-        route_dtype = route.dtype if route.dtype in (jnp.bfloat16, jnp.float32) else jnp.float32
-        pad_val = jnp.asarray(-jnp.inf if route_dtype == jnp.bfloat16 else _NEG, dtype=route_dtype)
+        route_dtype = (
+            route.dtype if route.dtype in (jnp.bfloat16, jnp.float32) else jnp.float32
+        )
+        pad_val = jnp.asarray(
+            -jnp.inf if route_dtype == jnp.bfloat16 else _NEG, dtype=route_dtype
+        )
         route = jnp.pad(
             route.astype(route_dtype),
             ((0, rows - tokens), (0, lanes - route.shape[1])),
