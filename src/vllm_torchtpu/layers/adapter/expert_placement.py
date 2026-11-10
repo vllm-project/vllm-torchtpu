@@ -232,6 +232,8 @@ def parse(table: dict, source: str = "<dict>") -> Placement:
                 f"expert placement {source}: layer {key} must hold each of the "
                 f"{experts} experts exactly once"
             )
+        if copies:
+            _check_copies(source, key, ranks, experts, per_rank)
         layers[layer] = ranks
     copy_order = _parse_copy_order(source, table.get("copy_order"), layers, per_rank)
     return Placement(
@@ -243,8 +245,33 @@ def parse(table: dict, source: str = "<dict>") -> Placement:
     )
 
 
+def _check_copies(source, key, ranks, experts, per_rank) -> None:
+    """Every copy slot holds an in-range expert that its rank does not hold as
+    a primary, and each copied expert has exactly one copy."""
+    copied = []
+    for r, held in enumerate(ranks):
+        own = set(held[:per_rank])
+        for e in held[per_rank:]:
+            if not 0 <= e < experts:
+                raise ValueError(
+                    f"expert placement {source}: layer {key} rank {r} copies "
+                    f"expert {e}, outside 0..{experts - 1}"
+                )
+            if e in own:
+                raise ValueError(
+                    f"expert placement {source}: layer {key} rank {r} copies "
+                    f"its own primary expert {e}"
+                )
+            copied.append(e)
+    if len(copied) != len(set(copied)):
+        raise ValueError(
+            f"expert placement {source}: layer {key} copies an expert twice; "
+            "each copied expert has one copy"
+        )
+
+
 def _parse_copy_order(source, raw, layers, per_rank) -> dict[int, tuple[int, ...]]:
-    """`copy_order`: per listed layer, its copied experts hottest first."""
+    """`copy_order`: per listed layer, exactly its copied experts."""
     if raw is None:
         return {}
     if not isinstance(raw, dict):
@@ -263,7 +290,14 @@ def _parse_copy_order(source, raw, layers, per_rank) -> dict[int, tuple[int, ...
                 f"expert placement {source}: copy_order lists layer {key}, "
                 "which the table does not place"
             )
-        order[layer] = tuple(int(e) for e in experts)
+        experts = tuple(int(e) for e in experts)
+        copied = sorted(e for held in layers[layer] for e in held[per_rank:])
+        if sorted(experts) != copied:
+            raise ValueError(
+                f"expert placement {source}: copy_order for layer {key} must "
+                "list exactly the layer's copied experts"
+            )
+        order[layer] = experts
     return order
 
 
