@@ -77,8 +77,6 @@ legs:
       - "--compilation-config"
       - "{\"backend\":\"vllm_torchtpu.compilation.tpu_compiler.TpuCompilerAdaptor\",\"compile_sizes\":[2176, 4352, 6528, 8192],\"inductor_compile_config\":{\"enable_auto_functionalized_v2\":false,\"size_asserts\":false,\"alignment_asserts\":false,\"scalar_asserts\":false}}"
       - "--enable-prefix-caching"
-      - "--scheduler-cls"
-      - "vllm_torchtpu.core.prefix_aware_scheduler.PrefixAwareScheduler"
       - "--block-size"
       - "2176"
       - "--disable-sliding-window"
