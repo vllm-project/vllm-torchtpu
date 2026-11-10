@@ -167,6 +167,23 @@ def _window_starts():
     return get_forward_context().additional_kwargs.get("deepseek_v41_window_starts")
 
 
+def _shift_swa_metadata(metadata, records, shift, page_size):
+    """Move CSA2 SWA metadata and write records by ``shift`` rows.
+
+    ``prepare_swa_metadata`` adds the row offset to every visible physical
+    page (``offset // page_size``) and to every valid record; hidden pages are
+    0 and padding records -1. A visible page reads 0 only for the null block
+    at offset 0, which holds no KV for any layer.
+    """
+    if not shift:
+        return metadata, records
+    pages = metadata[:, 2:]
+    pages = torch.where(pages > 0, pages + shift // page_size, pages)
+    metadata = torch.cat((metadata[:, :2], pages), dim=1)
+    records = torch.where(records >= 0, records + shift, records)
+    return metadata, records
+
+
 def _replayed(metadata, positions, starts, window):
     """Tokens a prefix hit replays: their prefix-cached KV must stay as is."""
     requests = _token_requests(metadata, positions).clamp(max=starts.shape[0] - 1)
@@ -1253,11 +1270,13 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             elif (window_starts := _window_starts()) is not None:
                 minimum = window_starts
             minimum = minimum[: swa_table.shape[0]]
+            # Block-outer groups give each SWA layer its own row offset within
+            # the block; the metadata is otherwise identical, so the key omits
+            # the offset and _shift_swa_metadata moves the cached result.
             meta_key = (
                 "csa2_swa",
                 rows_per_page,
                 swa_cache.page_stride,
-                swa_cache.row_offset,
                 non_causal,
                 self._ced_decoder,
             )
@@ -1297,12 +1316,19 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 if stage_cache is not None:
                     stage_cache[meta_key] = (
                         swa.block_tables,
+                        swa_cache.row_offset,
                         csa2_metadata,
                         csa2_bounds,
                         csa2_write_records,
                     )
             else:
-                _, csa2_metadata, csa2_bounds, csa2_write_records = cached
+                _, offset, csa2_metadata, csa2_bounds, csa2_write_records = cached
+                csa2_metadata, csa2_write_records = _shift_swa_metadata(
+                    csa2_metadata,
+                    csa2_write_records,
+                    swa_cache.row_offset - offset,
+                    rows_per_page,
+                )
             swa_valid = csa2_write_records >= 0
             swa_invalid_3d = (~swa_valid)[:, None, None]
             requests = _token_requests(swa, positions).clamp(max=swa_table.shape[0] - 1)
