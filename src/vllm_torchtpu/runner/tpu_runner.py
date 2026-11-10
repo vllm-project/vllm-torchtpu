@@ -604,6 +604,19 @@ def _substitute_placeholder_token(
     return input_ids
 
 
+def _subst_prefix_impl(next_tokens: torch.Tensor, num_tokens: int, dtype: torch.dtype):
+    """VLLM_TPU_SUBST_FRESH_IDS: fast token substitution's 1:1 steady-decode
+    source, `next_tokens.flatten()[:num_tokens]`, as its own buffer. The eager
+    slice is a view of the previous step's padded source, and torch_tpu
+    re-materializes that view with an `execute_as_strided` program before
+    every compiled consumer of the input ids (step inputs, target forward,
+    draft). `clone` keeps the output from aliasing the input."""
+    return next_tokens.reshape(-1)[:num_tokens].to(dtype).clone()
+
+
+_subst_prefix_compiled = _static_shape_args(_tpu_compile(_subst_prefix_impl))
+
+
 # VLLM_TPU_SUBST_STATIC_ARGS: the input ids reaching the async substitution can
 # carry the forward's dynamic-dim stamp, so the same shape compiled a second
 # time mid-run (~10 live compiles per run, ~70 ms each); strip it.
@@ -2693,9 +2706,21 @@ class TPUModelRunner(GPUModelRunner):
                     np.arange(len(input_ids), dtype=np.int32),
                 )
             ):
-                next_tpu = self._pre_async_results.next_tokens_tpu.flatten().to(
-                    input_ids.dtype
-                )
+                next_src = self._pre_async_results.next_tokens_tpu
+                if envs.VLLM_TPU_SUBST_FRESH_IDS and next_src.device.type == "tpu":
+                    if next_src.numel() >= len(input_ids):
+                        if not getattr(self, "_subst_fresh_ids_logged", False):
+                            self._subst_fresh_ids_logged = True
+                            logger.info(
+                                "SUBST_FRESH_IDS: steady-decode input ids from one "
+                                "compiled slice (%d of %d source tokens)",
+                                len(input_ids),
+                                next_src.numel(),
+                            )
+                        return _subst_prefix_compiled(
+                            next_src, len(input_ids), input_ids.dtype
+                        )
+                next_tpu = next_src.flatten().to(input_ids.dtype)
                 if len(next_tpu) >= len(input_ids):
                     return next_tpu[: len(input_ids)]
 
@@ -7003,6 +7028,21 @@ class TPUModelRunner(GPUModelRunner):
                         next_tokens,
                     )
                     synchronize_tensors(out)
+                    if (
+                        envs.VLLM_TPU_SUBST_FRESH_IDS
+                        and self._fast_token_substitution
+                        and nlen >= num_tokens
+                    ):
+                        # Steady-decode fast path: the source's dtype is the
+                        # sampler's (int32 spec source, int64 otherwise).
+                        for src_dtype in (torch.int32, torch.int64):
+                            synchronize_tensors(
+                                _subst_prefix_compiled(
+                                    next_tokens.to(src_dtype),
+                                    num_tokens,
+                                    input_ids.dtype,
+                                )
+                            )
                     logger.info("  -- num_tokens: %d, next_len: %d", num_tokens, nlen)
 
     def _precompile_rejection_sampler(self) -> None:
