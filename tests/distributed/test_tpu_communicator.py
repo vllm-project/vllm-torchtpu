@@ -273,21 +273,21 @@ def _replicated_dp4(monkeypatch):
 def test_packed_router_gather_is_one_all_gather_with_identical_values(
     monkeypatch, communicator, rows
 ):
-    # DP4 x TP2 replicated step (B 64: 16 rows per engine x 4 MTP rows):
-    # TPU_DP_PACKED_ROUTER_GATHER gathers hidden rows and router logits in one
-    # DP all-gather, and the split returns bit-identical tensors.
+    # DP4 x TP2 replicated step (B 64: 16 rows per engine x 4 MTP rows): the
+    # hidden rows and router logits go in one DP all-gather, and the split
+    # returns the tensors two gathers would (the reference, packing off).
     gen = torch.Generator().manual_seed(rows)
     hidden = torch.randn(rows * 4, 4096, generator=gen).to(torch.bfloat16)
     logits = torch.randn(rows * 4, 512, generator=gen).to(torch.bfloat16)
 
-    monkeypatch.setattr(comm.envs, "TPU_DP_PACKED_ROUTER_GATHER", False)
-    dp_group = _replicated_dp4(monkeypatch)
-    ref_h, ref_l = communicator.dispatch_router_logits(
-        hidden, logits, is_sequence_parallel=True
-    )
-    assert dp_group.all_gather.call_count == 2
+    with monkeypatch.context() as unpacked:
+        unpacked.setattr(comm, "_packs_router_gather", lambda h, lg: False)
+        dp_group = _replicated_dp4(monkeypatch)
+        ref_h, ref_l = communicator.dispatch_router_logits(
+            hidden, logits, is_sequence_parallel=True
+        )
+        assert dp_group.all_gather.call_count == 2
 
-    monkeypatch.setattr(comm.envs, "TPU_DP_PACKED_ROUTER_GATHER", True)
     dp_group = _replicated_dp4(monkeypatch)
     got_h, got_l = communicator.dispatch_router_logits(
         hidden, logits, is_sequence_parallel=True
@@ -312,7 +312,6 @@ def test_packed_router_gather_only_on_replicated_dp_same_dtype(
 ):
     # Mixed dtypes keep two gathers; a single engine and a sliced (SP-active)
     # step never take the packed path.
-    monkeypatch.setattr(comm.envs, "TPU_DP_PACKED_ROUTER_GATHER", True)
     dp_group = _replicated_dp4(monkeypatch)
     dp_group.world_size = dp_size
     ep_group = Mock(world_size=8)
