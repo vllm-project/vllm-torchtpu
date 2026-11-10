@@ -347,6 +347,7 @@ if TYPE_CHECKING:
     VLLM_TPU_AOT_SKIP_GUARD_CHECK: bool = False
     VLLM_TPU_STAGE_TIMING_ONLY_WITH_SINK: bool = False
     VLLM_TPU_STAGED_WALK_CLASS_GATHER: bool = False
+    VLLM_TPU_STAGED_WALK_STACKED: bool = False
     VLLM_TPU_WARMED_SUBSTITUTE_SOURCE: bool = False
     VLLM_TPU_PROPOSE_DEVICE_CONSTANTS: bool = False
     VLLM_TPU_MTP_DRAFT_ROWS: bool = False
@@ -2095,6 +2096,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_STAGED_WALK_CLASS_GATHER": env_bool(
         "VLLM_TPU_STAGED_WALK_CLASS_GATHER", default=False
     ),
+    # With VLLM_TPU_STAGED_WALK_CLASS_GATHER: the staged walk returns each
+    # block-geometry class's mamba state / checkpoint ids as one [G, n] /
+    # [G, n, W] stack (2 outputs per class instead of 2 per mamba group);
+    # each group's metadata reads its row in-graph
+    # (StackedMambaAttentionMetadata). Same values.
+    "VLLM_TPU_STAGED_WALK_STACKED": env_bool("VLLM_TPU_STAGED_WALK_STACKED"),
     # Async substitution: pad next_tokens to a precompiled source length.
     "VLLM_TPU_WARMED_SUBSTITUTE_SOURCE": env_bool(
         "VLLM_TPU_WARMED_SUBSTITUTE_SOURCE", default=False

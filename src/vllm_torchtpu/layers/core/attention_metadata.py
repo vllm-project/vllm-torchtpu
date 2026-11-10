@@ -33,6 +33,7 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.layers.core.sequence_layout import (
     DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR,
     DEFAULT_SEQUENCE_LAYOUT_PROTOCOL,
@@ -134,6 +135,78 @@ class AttentionMetadata:
     seq_lens_cpu: Any = field(init=False)
 
 
+logger = init_logger(__name__)
+
+
+@dataclass
+class StackedMambaAttentionMetadata(AttentionMetadata):
+    """A mamba group's metadata whose state / checkpoint ids are one row of a
+    walk-wide stack (VLLM_TPU_STAGED_WALK_STACKED).
+
+    `mamba_state_indices` / `mamba_ckpt_indices` read as
+    `mamba_state_stack[mamba_stack_row]` / `mamba_ckpt_stack[...]`, so a
+    consumer traced into the forward slices the row in-graph: the staged walk
+    returns 2 stacked outputs per block-geometry class instead of 2 per mamba
+    group, with the same values. `mamba_state_stack` is `[G, num_reqs]` int32,
+    `mamba_ckpt_stack` `[G, num_reqs, ckpt_window]` int32 (or None), rows in
+    walk order; every group of a class holds the same two tensors. Consumers
+    that can take the whole stack (one operand instead of one per layer) read
+    the stack fields directly.
+    """
+
+    mamba_state_stack: Any = None
+    mamba_ckpt_stack: Any = None
+    mamba_stack_row: int = 0
+
+
+def _stacked_field(name: str, stack: str):
+    own = "_own_" + name
+
+    def get(self):
+        v = getattr(self, own, None)
+        if v is None:
+            st = getattr(self, stack, None)
+            if st is not None:
+                return st[self.mamba_stack_row]
+        return v
+
+    def put(self, value):
+        object.__setattr__(self, own, value)
+
+    return property(get, put)
+
+
+StackedMambaAttentionMetadata.mamba_state_indices = _stacked_field(  # type: ignore[assignment]
+    "mamba_state_indices", "mamba_state_stack"
+)
+StackedMambaAttentionMetadata.mamba_ckpt_indices = _stacked_field(  # type: ignore[assignment]
+    "mamba_ckpt_indices", "mamba_ckpt_stack"
+)
+
+
+@dataclass(frozen=True)
+class MambaStackRef:
+    """One mamba group's place in the staged walk's stacked outputs."""
+
+    state_stack: torch.Tensor
+    ckpt_stack: torch.Tensor | None
+    row: int
+
+
+def stacked_mamba_metadata(ref: "MambaStackRef", **kwargs) -> AttentionMetadata:
+    """`AttentionMetadata(**kwargs)` for a group whose ids live in a stack."""
+    kwargs.pop("mamba_state_indices", None)
+    kwargs.pop("mamba_ckpt_indices", None)
+    return StackedMambaAttentionMetadata(
+        mamba_state_indices=None,
+        mamba_ckpt_indices=None,
+        mamba_state_stack=ref.state_stack,
+        mamba_ckpt_stack=ref.ckpt_stack,
+        mamba_stack_row=ref.row,
+        **kwargs,
+    )
+
+
 @dataclass
 class AttentionMetadataBuilderContext:
     """Per-call inputs the TPU metadata builder reads from the runner.
@@ -203,6 +276,7 @@ def _staged_walk_products(
     ckpt_window: int,
     include_tables: bool = True,
     class_gather: bool = False,
+    stacked: bool = False,
 ) -> tuple:
     """Splits the staged flat block-table buffer into per-group tables and
     derives unified-pool mamba state and checkpoint indices. Without
@@ -235,6 +309,8 @@ def _staged_walk_products(
         return tuple(outs) + tuple(states_g) + tuple(ckpts_g)
     states: list = [None] * len(mamba_geom)
     ckpts: list = [None] * len(mamba_geom)
+    state_stacks: list = []
+    ckpt_stacks: list = []
     if mamba_geom:
         active = seq_lens > 0
         device = seq_lens.device
@@ -269,6 +345,13 @@ def _staged_walk_products(
                 in_row = (ckpt_offsets < t) & active.unsqueeze(1)
                 safe = torch.where(in_row, ckpt_offsets, torch.zeros_like(ckpt_offsets))
                 ck = staged_dev[bases.unsqueeze(2) + safe.unsqueeze(0)] * in_row
+            if stacked:
+                # VLLM_TPU_STAGED_WALK_STACKED: the class's [G, ...] buffers
+                # are the outputs; consumers slice their row in-graph.
+                state_stacks.append(gathered)
+                if ckpt_window > 1:
+                    ckpt_stacks.append(ck)
+                continue
             # Clone each slice: a sliced graph output is a view into the
             # class's [G, ...] buffer, and the model programs compiled for a
             # standalone [n] input reject the larger backing buffer
@@ -278,6 +361,8 @@ def _staged_walk_products(
                 if ckpt_window > 1:
                     assert ck is not None
                     ckpts[j] = ck[k].clone()
+    if stacked:
+        return tuple(outs) + tuple(state_stacks) + tuple(ckpt_stacks)
     if ckpt_window <= 1:
         ckpts = []
     return tuple(outs) + tuple(states) + tuple(ckpts)
@@ -292,6 +377,7 @@ def _staged_walk_products_compiled(
     ckpt_window: int,
     include_tables: bool = True,
     class_gather: bool = False,
+    stacked: bool = False,
 ) -> tuple:
     """One device program for everything the metadata walk consumes:
     per-group block-table splits (graph outputs are distinct buffers, so no
@@ -311,6 +397,7 @@ def _staged_walk_products_compiled(
         ckpt_window,
         include_tables,
         class_gather,
+        stacked,
     )
 
 
@@ -571,6 +658,7 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             input_positions = runner.position_ids
 
         mamba_ckpt_indices = None
+        mamba_stack_ref = None
         if not self.is_mamba_group:
             mamba_state_indices = None
         elif ctx.mamba_state_indices is not None:
@@ -590,7 +678,11 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
                 if ctx.staged_mamba_products is not None
                 else None
             )
-            if staged_products is not None:
+            if isinstance(staged_products, MambaStackRef):
+                # VLLM_TPU_STAGED_WALK_STACKED: a row of the walk's stack.
+                mamba_stack_ref = staged_products
+                mamba_state_indices = mamba_ckpt_indices = None
+            elif staged_products is not None:
                 # Derived in the single `_staged_walk_products_compiled`
                 # program alongside the staged tables.
                 mamba_state_indices, mamba_ckpt_indices = staged_products
@@ -622,8 +714,15 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
                     ) * cast(torch.Tensor, ckpt_in_row)
             if ctx.unified_mamba_state_indices is not None:
                 # Spec decode: expose this group's state blocks for the
-                # post-sampling read-offset scatter.
-                ctx.unified_mamba_state_indices.append(mamba_state_indices)
+                # post-sampling read-offset scatter (with a stack: the
+                # whole [G, n] stack once, from its row-0 group).
+                if mamba_stack_ref is not None:
+                    if mamba_stack_ref.row == 0:
+                        ctx.unified_mamba_state_indices.append(
+                            mamba_stack_ref.state_stack
+                        )
+                else:
+                    ctx.unified_mamba_state_indices.append(mamba_state_indices)
         else:
             mamba_state_indices = None
 
@@ -636,7 +735,10 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             mamba_request_distribution = None
             mamba_prefill_ckpt = None
 
-        return AttentionMetadata(
+        md_cls: Any = AttentionMetadata
+        if mamba_stack_ref is not None:
+            md_cls = functools.partial(stacked_mamba_metadata, mamba_stack_ref)
+        return md_cls(
             input_positions=input_positions,
             block_tables=block_tables_dev,
             seq_lens=ctx.seq_lens,
@@ -961,6 +1063,11 @@ def _issue_walk_products(
     # The upload was reused outright, so the previous walk's table outputs
     # (read-only device tensors) are still exact: derive only the mamba
     # indices, which follow seq_lens, instead of re-emitting every table.
+    stacked = bool(
+        envs.VLLM_TPU_STAGED_WALK_STACKED
+        and envs.VLLM_TPU_STAGED_WALK_CLASS_GATHER
+        and mamba_geom
+    )
     cached = runner.__dict__.get("_block_table_stage_tables")
     if (
         reused_key is not None
@@ -969,10 +1076,14 @@ def _issue_walk_products(
         and cached[0] == reused_key
     ):
         ctx.staged_block_tables = cached[1]
-        products = walk(*args, False, envs.VLLM_TPU_STAGED_WALK_CLASS_GATHER)
+        products = walk(
+            *args, False, envs.VLLM_TPU_STAGED_WALK_CLASS_GATHER, stacked
+        )
         n_tables = 0
     else:
-        products = walk(*args, True, envs.VLLM_TPU_STAGED_WALK_CLASS_GATHER)
+        products = walk(
+            *args, True, envs.VLLM_TPU_STAGED_WALK_CLASS_GATHER, stacked
+        )
         n_tables = len(entries)
         ctx.staged_block_tables = {
             gid: products[i] for i, (gid, _, _) in enumerate(entries)
@@ -983,9 +1094,39 @@ def _issue_walk_products(
                 runner._block_table_stage_tables = (prev[3], ctx.staged_block_tables)
             elif mamba_geom:
                 # Dummy runs warm the tables-free variant serving reuses.
-                walk(*args, False, envs.VLLM_TPU_STAGED_WALK_CLASS_GATHER)
+                walk(*args, False, envs.VLLM_TPU_STAGED_WALK_CLASS_GATHER, stacked)
     n_mamba = len(mamba_geom)
-    if n_mamba:
+    if stacked:
+        # Same class grouping (and order) as `_staged_walk_products`.
+        classes: dict[tuple[int, int], list[int]] = {}
+        for j, (_, t, bs) in enumerate(mamba_geom):
+            classes.setdefault((t, bs), []).append(j)
+        n_cls = len(classes)
+        has_ckpt = ctx.mamba_ckpt_window > 1
+        state_stacks = products[n_tables : n_tables + n_cls]
+        ckpt_stacks = (
+            products[n_tables + n_cls : n_tables + 2 * n_cls]
+            if has_ckpt
+            else (None,) * n_cls
+        )
+        refs: dict = {}
+        for c, members in enumerate(classes.values()):
+            for k, j in enumerate(members):
+                refs[entries[mamba_entry_indices[j]][0]] = MambaStackRef(
+                    state_stacks[c], ckpt_stacks[c], k
+                )
+        ctx.staged_mamba_products = refs
+        if not runner.__dict__.get("_staged_walk_stacked_logged"):
+            runner._staged_walk_stacked_logged = True
+            logger.info(
+                "STAGED_WALK_STACKED: walk emits %d stacked mamba outputs for "
+                "%d groups in %d classes (was %d per-group outputs)",
+                len(products) - n_tables,
+                n_mamba,
+                n_cls,
+                n_mamba * (2 if has_ckpt else 1),
+            )
+    elif n_mamba:
         states = products[n_tables : n_tables + n_mamba]
         has_ckpt = ctx.mamba_ckpt_window > 1
         ckpts = products[n_tables + n_mamba :] if has_ckpt else (None,) * n_mamba

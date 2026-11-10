@@ -484,6 +484,106 @@ class TestAttentionMetadataBuilderPlumbing:
                     == meta_plain.mamba_ckpt_indices.dtype
                 )
 
+    @pytest.mark.parametrize("fast", [False, True])
+    @pytest.mark.parametrize("reuse", [False, True])
+    def test_stacked_walk_matches_per_group_walk(self, fast, reuse):
+        """VLLM_TPU_STAGED_WALK_STACKED: every mamba group's state and
+        checkpoint ids read from the stack equal the per-group clones bit for
+        bit, the walk returns one [G, n] / [G, n, W] stack per class, and the
+        read-offset list carries the stack once (same flattened ids)."""
+        from vllm_torchtpu.layers.core.attention_metadata import (
+            StackedMambaAttentionMetadata,
+        )
+        from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+        window = 3
+        num_reqs = 4
+
+        def make(stacked):
+            env = {
+                "VLLM_TPU_STAGED_WALK_CLASS_GATHER": "1",
+                "VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE": "1" if reuse else "0",
+            }
+            if stacked:
+                env["VLLM_TPU_STAGED_WALK_STACKED"] = "1"
+            with patch.dict(os.environ, env):
+                runner = self._make_runner_mock(num_groups=4, max_num_blocks_per_req=6)
+                runner._unified_kv_layout = True
+                runner._block_table_stage_cpu = None
+                runner._staged_walk_stacked_logged = False
+                attn = self._make_builder(runner, kv_cache_group_id=0)
+                mambas = [
+                    self._make_mamba_builder(runner, kv_cache_group_id=gid)
+                    for gid in (1, 2, 3)
+                ]
+                groups = self._make_attn_groups(runner, [attn] + mambas)
+                for i, (group,) in enumerate(groups):
+                    group.layer_names = [f"layer.{i}"]
+                out = None
+                for _ in range(2 if reuse else 1):
+                    ctx = AttentionMetadataBuilderContext(
+                        num_reqs=num_reqs,
+                        start_index=0,
+                        use_max_model_len=True,
+                        seq_lens=torch.tensor([0, 17, 33, 49], dtype=torch.int32),
+                        query_start_loc=torch.arange(5, dtype=torch.int32),
+                        request_distribution=torch.tensor([4, 4, 4], dtype=torch.int32),
+                        mamba_slot_read_offsets=torch.zeros(8, dtype=torch.int32),
+                        mamba_ckpt_window=window,
+                        mamba_request_distribution=torch.tensor([4, 4, 4]),
+                        unified_mamba_state_indices=[],
+                    )
+                    runner._attn_metadata_builder_ctx = ctx
+                    stage_block_table_uploads(runner, ctx, num_reqs)
+                    if fast:
+                        out = TPUModelRunner._build_attention_metadata_staged(
+                            runner, ctx
+                        )
+                        assert out is not None
+                        metas = [out[f"layer.{i}"] for i in range(4)]
+                    else:
+                        metas = [
+                            b.build(
+                                common_prefix_len=0,
+                                common_attn_metadata=self._make_cm(num_reqs),
+                            )
+                            for b in [attn] + mambas
+                        ]
+                return metas, ctx
+
+        (plain, c_plain), (stk, c_stk) = make(False), make(True)
+        assert not isinstance(plain[1], StackedMambaAttentionMetadata)
+        for k in (1, 2, 3):
+            a, b = stk[k], plain[k]
+            assert isinstance(a, StackedMambaAttentionMetadata)
+            assert a.mamba_state_stack.shape == (3, num_reqs)
+            assert a.mamba_ckpt_stack.shape == (3, num_reqs, window)
+            assert a.mamba_stack_row == k - 1
+            assert a.mamba_state_stack is stk[1].mamba_state_stack
+            for f in ("mamba_state_indices", "mamba_ckpt_indices"):
+                x, y = getattr(a, f), getattr(b, f)
+                assert x.dtype == y.dtype and torch.equal(x, y), (k, f)
+            assert torch.equal(a.block_tables, b.block_tables)
+        assert stk[0].mamba_state_indices is None
+        assert len(c_stk.unified_mamba_state_indices) == 1
+        assert torch.equal(
+            c_stk.unified_mamba_state_indices[0].reshape(-1),
+            torch.cat(c_plain.unified_mamba_state_indices),
+        )
+
+    def test_stacked_read_offset_update_matches_per_group(self):
+        """`_update_read_offsets_impl` on the [G, width] stack writes the
+        same slot buffer as on the per-group list."""
+        from vllm_torchtpu.runner.tpu_runner import _update_read_offsets_impl
+
+        groups = [torch.tensor([3, 5, 0, 0]), torch.tensor([7, 9, 0, 0])]
+        nt = torch.tensor([[1, 2, -1], [4, -1, -1]])
+        a = torch.full((16,), -5, dtype=torch.int32)
+        b = a.clone()
+        _update_read_offsets_impl(a, groups, nt, torch.tensor(2))
+        _update_read_offsets_impl(b, [torch.stack(groups)], nt, torch.tensor(2))
+        assert torch.equal(a, b)
+
     def test_single_group_fast_path(self):
         """Single-group pure attention must stage directly without mamba derivation."""
         runner = self._make_runner_mock(num_groups=1)
