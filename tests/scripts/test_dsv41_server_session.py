@@ -174,6 +174,7 @@ def test_decode_admission_rejects_early_completion(tmp_path, failed):
 )
 @pytest.mark.parametrize("profile", ["disabled", "passed", "failed"])
 @pytest.mark.parametrize("model_uri", [None, "gs://test-bucket/checkpoint"])
+@pytest.mark.parametrize("middle_bucket", [False, True])
 def test_ci_launch_and_optional_profile_share_one_server(
     tmp_path,
     monkeypatch,
@@ -182,6 +183,7 @@ def test_ci_launch_and_optional_profile_share_one_server(
     buckets,
     profile,
     model_uri,
+    middle_bucket,
 ):
     monkeypatch.chdir(tmp_path)
     (tmp_path / "config.json").write_text("{}")
@@ -208,6 +210,17 @@ def test_ci_launch_and_optional_profile_share_one_server(
             "7200",
             *(["--head-address", "127.0.0.1"] if scenario == "decode_dp16" else []),
             *(["--profile"] if profile != "disabled" else []),
+            *(["--compile-sizes", "288", "512", "2048"] if middle_bucket else []),
+            *(
+                [
+                    "--scheduler-cls",
+                    "vllm_torchtpu.core.tpu_scheduler.TpuPrefillWindowScheduler",
+                    "--prefill-schedule-interval",
+                    "8",
+                ]
+                if middle_bucket
+                else []
+            ),
         ],
     )
     monkeypatch.setattr(launcher, "load_frozen_input", lambda _: {})
@@ -235,6 +248,12 @@ def test_ci_launch_and_optional_profile_share_one_server(
 
     def start(command, *, env, **kwargs):
         starts.append(command)
+        if middle_bucket:
+            assert env["DP_SCHED_ENABLED"] == "0"
+            assert command[command.index("--prefill-schedule-interval") + 1] == "8"
+            assert command[command.index("--scheduler-cls") + 1].endswith(
+                ".TpuPrefillWindowScheduler"
+            )
         compiler_roots.append(Path(env["VLLM_CACHE_ROOT"]))
         assert compiler_roots[-1].is_dir()
         assert env["USE_PHASED_PROFILER"] == "0"
@@ -313,9 +332,13 @@ def test_ci_launch_and_optional_profile_share_one_server(
     assert manifest["engram_transfer"] == "raw_dma"
     assert manifest["identity"]["engram_transfer"] == "raw_dma"
     assert manifest["identity"]["model_weights"] == (model_uri or str(tmp_path))
+    assert manifest["identity"]["scheduler"] == manifest["scheduler"]
+    assert manifest["scheduler"]["prefill_schedule_interval"] == (
+        8 if middle_bucket else None
+    )
     command = starts[0]
     assert json.loads(command[command.index("--compilation-config") + 1]) == {
-        "compile_sizes": buckets
+        "compile_sizes": [288, 512, 2048] if middle_bucket else buckets
     }
     assert clients[0][clients[0].index("--rounds") + 1] == str(rounds)
     assert len(audits) == 1 and len(audits[0]) == rounds
@@ -341,6 +364,7 @@ def test_dp16_ci_launch_keeps_local_shapes_and_selects_hbm(tmp_path, monkeypatch
         [288, 2048],
         "disabled",
         "gs://test-bucket/checkpoint",
+        False,
     )
 
 
@@ -372,6 +396,10 @@ def test_dp16_worker_waits_for_shutdown_and_never_runs_client(
             "1",
             "--head-address",
             "127.0.0.1",
+            "--scheduler-cls",
+            "vllm_torchtpu.core.tpu_scheduler.TpuPrefillWindowScheduler",
+            "--prefill-schedule-interval",
+            "8",
         ],
     )
     handlers, commands, stopped = {}, [], []
@@ -383,6 +411,11 @@ def test_dp16_worker_waits_for_shutdown_and_never_runs_client(
 
     def start(command, *, env, **kwargs):
         commands.append(command)
+        assert env["DP_SCHED_ENABLED"] == "0"
+        assert command[command.index("--prefill-schedule-interval") + 1] == "8"
+        assert command[command.index("--scheduler-cls") + 1].endswith(
+            ".TpuPrefillWindowScheduler"
+        )
         assert env["HEADLESS"] == "1" and env["DP"] == "16"
         assert env["HOST"] == "127.0.0.1"
         assert env["MOE_FUSED_EP_KERNEL_IMPL"] == "push"

@@ -216,6 +216,7 @@ def test_manifest_preserves_lifecycle_dependencies():
         "_patch_vllm_hybrid_kv_load_failure_recovery",
         "_patch_vllm_same_step_prefix_hits",
         "_patch_vllm_merge_dsv41_swa_groups",
+        "_patch_dflash_drafting_slot_budget",
         "_patch_vllm_merge_multimodal_embeddings",
         "install_engine_core",
     ]
