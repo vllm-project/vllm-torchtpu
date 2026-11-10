@@ -177,7 +177,10 @@ def maybe_install_lazy_reasoning_count() -> bool:
             _maybe_log()
         return n
 
+    # Markers that the patch is installed (checked on re-install).
+    # pyrefly: ignore[missing-attribute]
     parse_delta.__qx_lazy__ = True
+    # pyrefly: ignore[missing-attribute]
     count_reasoning_tokens.__qx_lazy__ = True
     DelegatingParser.parse_delta = parse_delta
     DelegatingParser.count_reasoning_tokens = count_reasoning_tokens
@@ -321,7 +324,9 @@ def maybe_install_detok_prompt_tail() -> bool:
                 )
         orig_init(self, tokenizer, request)
 
+    # pyrefly: ignore[missing-attribute]
     __init__.__qx_detok_tail__ = True
+    # pyrefly: ignore[missing-attribute]
     __init__.__wrapped__ = orig_init
     cls.__init__ = __init__
     _DETOK_INSTALLED = True

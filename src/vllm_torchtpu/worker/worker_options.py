@@ -58,10 +58,12 @@ def parse(raw: Any) -> WorkerOptions:
             f"valid keys: {sorted(fields)}"
         )
     for name, value in raw.items():
-        if type(value) is not fields[name]:
+        want = fields[name]
+        assert isinstance(want, type)  # the annotations are classes, not strings
+        if type(value) is not want:
             raise ValueError(
                 f"additional_config.{SECTION}.{name} must be a "
-                f"{fields[name].__name__}, got {value!r}"
+                f"{want.__name__}, got {value!r}"
             )
     return WorkerOptions(**raw)
 
