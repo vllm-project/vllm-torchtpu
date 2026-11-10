@@ -147,6 +147,11 @@ def _check(monkeypatch, q_lens, ctx_lens, dcp, dtype, *, ranks=None, seed=0, **c
         assert got.dtype == want.dtype == np.int32
         real = num_real * heads  # folded columns t * G + h of the real tokens
         np.testing.assert_array_equal(got[:, :real], want[:, :real])
+        # Every column's list is sorted, as the network merge needs:
+        # score descending, ties to the lower block, misses last.
+        sc, bl = got[:topk, :real].view(np.float32), got[topk:, :real]
+        ahead = (sc[:-1] > sc[1:]) | ((sc[:-1] == sc[1:]) & (bl[:-1] < bl[1:]))
+        assert np.all(ahead | ((sc[1:] == -np.inf) & (bl[1:] == -1)))
         # Padding tokens: no candidate.
         pad = got[:, real:]
         assert np.all(pad[:topk].view(np.float32) == -np.inf)

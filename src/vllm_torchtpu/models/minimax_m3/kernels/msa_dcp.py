@@ -459,14 +459,107 @@ def _merge_kernel_t(c_ref, o_ref, *, topk: int, sub: int):
     jax.lax.fori_loop(0, block_c // sub, body, 0)
 
 
+def _sublane_partner(x: jax.Array, d: int) -> jax.Array:
+    """``x[i ^ d]`` over the 8 sublanes of ``x [8, N]`` (``d`` in 1, 2, 4)."""
+    row = jax.lax.broadcasted_iota(jnp.int32, x.shape, 0)
+    return jnp.where(row & d, pltpu.roll(x, d, 0), pltpu.roll(x, 8 - d, 0))
+
+
+def _beats(sa, ba, sb, bb):
+    """Candidate a ahead of b in the selection order: higher score, ties to
+    the lower block."""
+    return (sa > sb) | ((sa == sb) & (ba < bb))
+
+
+def _merge_sorted(a, b):
+    """Top ``8 m`` of two candidate lists, each sorted (score descending,
+    ties to the lower block) as ``m`` groups ``(s, b) [8, N]`` of 8 slots
+    (slot ``8 j + i`` is sublane ``i`` of group ``j``), sorted the same way:
+    a bitonic half-cleaner against ``b`` reversed, then a bitonic sort."""
+    m = len(a)
+
+    def reverse(x):
+        for d in (4, 2, 1):
+            x = _sublane_partner(x, d)
+        return x
+
+    rb = [(reverse(s), reverse(k)) for s, k in b[::-1]]
+    out = []
+    for (sa, ka), (sb, kb) in zip(a, rb):
+        take = _beats(sa, ka, sb, kb)
+        out.append((jnp.where(take, sa, sb), jnp.where(take, ka, kb)))
+    # Bitonic clean-up: slot i against slot i + d, i with bit d clear keeps
+    # the leader.
+    d = 4 * m
+    while d >= 8:
+        g = d // 8
+        for j in range(m):
+            if j & g:
+                continue
+            (s0, k0), (s1, k1) = out[j], out[j + g]
+            take = _beats(s0, k0, s1, k1)
+            out[j] = (jnp.where(take, s0, s1), jnp.where(take, k0, k1))
+            out[j + g] = (jnp.where(take, s1, s0), jnp.where(take, k1, k0))
+        d //= 2
+    while d >= 1:
+        for j in range(m):
+            s, k = out[j]
+            ps, pk = _sublane_partner(s, d), _sublane_partner(k, d)
+            row = jax.lax.broadcasted_iota(jnp.int32, s.shape, 0)
+            take = _beats(s, k, ps, pk) == ((row & d) == 0)
+            out[j] = (jnp.where(take, s, ps), jnp.where(take, k, pk))
+        d //= 2
+    return out
+
+
+def _merge_network_kernel(c_ref, o_ref, *, topk: int, sub: int):
+    """`_merge_kernel_t` for per-rank lists that come sorted (score
+    descending, ties to the lower block; every candidate kernel picks in
+    that order): a tree of `_merge_sorted` over the ranks instead of
+    ``topk`` max-extractions over all ``dcp * topk`` candidates, ~3x fewer
+    vector ops at DCP 4, and no cross-sublane reduction."""
+    dcp, _, block_c = c_ref.shape
+
+    def body(i, carry):
+        cols = pl.ds(pl.multiple_of(i * sub, sub), sub)
+        lists = []
+        for r in range(dcp):
+            s = jax.lax.bitcast_convert_type(c_ref[r, :topk, cols], jnp.float32)
+            b = c_ref[r, topk:, cols]
+            lists.append([(s[j : j + 8], b[j : j + 8]) for j in range(0, topk, 8)])
+        while len(lists) > 1:
+            merged = [
+                _merge_sorted(lists[k], lists[k + 1])
+                for k in range(0, len(lists) - 1, 2)
+            ]
+            lists = merged + lists[len(lists) - len(lists) % 2 :]
+        s = jnp.concatenate([g[0] for g in lists[0]], axis=0)
+        b = jnp.concatenate([g[1] for g in lists[0]], axis=0)
+        o_ref[cols, :] = jnp.where(s > _NEG_INF, b, -1).T
+        return carry
+
+    jax.lax.fori_loop(0, block_c // sub, body, 0)
+
+
+def _network_merge(topk: int) -> bool:
+    """Whether `_merge_network_kernel` merges lists of `topk`: whole groups
+    of 8 slots, a power of two of them."""
+    groups = topk // 8
+    return topk % 8 == 0 and groups & (groups - 1) == 0
+
+
 # Merges of more than this many candidates per column (DCP 8: 128) run
 # `_merge_kernel_t`: `merge_candidates`' [n, n, columns] ranking costs ~3 ms
 # per layer in the c64 mixed step (32768 columns; j-c1444339). Narrower
-# merges (DCP 2, as c4/c16/c48 serve) keep the dense ranking, cheap at n = 32.
+# merges keep the dense ranking, cheap at n = 32. A `_network_merge` topk
+# runs `_merge_network_kernel` at every DCP size (one merge at DCP 2).
 _KERNEL_MERGE_MIN_CANDIDATES = 64
 # Columns per grid step, and per loop step inside it (as many as the
 # previous 256-token blocks of G heads held, with a head's live values).
 _MERGE_BLOCK_COLUMNS = 1024
+# DCP sizes the network merge serves (below the min, the dense ranking).
+_NETWORK_MERGE_MIN_DCP = 2
+_NETWORK_MERGE_MAX_DCP = 8
 _MERGE_SUB_COLUMNS = 256
 
 
@@ -476,7 +569,10 @@ def merge_head_candidates(
     """`merge_candidates` per KV head: every rank's `to_slots` candidates,
     ``[dcp, 2 * topk, T * G]`` int32 -> selection ``[T, G, topk]``."""
     dcp, _, num_cols = candidates.shape
-    if dcp * topk < _KERNEL_MERGE_MIN_CANDIDATES:
+    network = _network_merge(topk) and dcp <= _NETWORK_MERGE_MAX_DCP
+    if dcp * topk < _KERNEL_MERGE_MIN_CANDIDATES and not (
+        network and dcp >= _NETWORK_MERGE_MIN_DCP
+    ):
         s = jax.lax.bitcast_convert_type(candidates[:, :topk], jnp.float32)
         b = candidates[:, topk:]
         merged = _rank_merge(
@@ -484,12 +580,15 @@ def merge_head_candidates(
         )
         return merged.T.reshape(-1, num_heads, topk)
     lanes = -(-num_cols // _TRANSPOSED_ROWS) * _TRANSPOSED_ROWS
-    sub = min(_MERGE_SUB_COLUMNS, lanes)
+    # The network holds every rank's list live: 128 columns at a time.
+    sub = min(_TRANSPOSED_ROWS if network else _MERGE_SUB_COLUMNS, lanes)
     block_c = min(_MERGE_BLOCK_COLUMNS, -(-lanes // sub) * sub)
     pad = -num_cols % block_c
     c = jnp.pad(candidates, ((0, 0), (0, 0), (0, pad)))
     out = pl.pallas_call(
-        functools.partial(_merge_kernel_t, topk=topk, sub=sub),
+        functools.partial(
+            _merge_network_kernel if network else _merge_kernel_t, topk=topk, sub=sub
+        ),
         grid=((num_cols + pad) // block_c,),
         in_specs=[pl.BlockSpec((dcp, 2 * topk, block_c), lambda i: (0, 0, i))],
         out_specs=pl.BlockSpec((block_c, topk), lambda i: (i, 0)),

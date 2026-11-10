@@ -378,20 +378,53 @@ def _faulty(fn, old, new):
     return namespace[fn.__name__]
 
 
+@pytest.mark.parametrize("network", [True, False], ids=["network", "extract"])
+def test_slot_merge_paths_match(monkeypatch, network):
+    """The network merge (per-rank sorted lists) and the max-extraction
+    kernel and dense ranking it replaces all give the r5 merge."""
+    monkeypatch.setattr(msa_dcp, "_network_merge", lambda topk: network)
+    for dcp, heads in ((2, 1), (4, 2), (8, 4)):
+        test_slot_merge_matches_row_merge(dcp, heads, True)
+
+
 @pytest.mark.parametrize(
     "dcp,name,old,new",
     [
-        (2, "_rank_merge", "(b_j < b_i)", "(b_j > b_i)"),
+        (2, "_beats", "(ba < bb)", "(ba > bb)"),
+        (4, "_beats", "(ba < bb)", "(ba > bb)"),
+        (8, "_merge_sorted", "for d in (4, 2, 1):", "for d in (4, 2):"),
         (4, "_merge_kernel_t", "best = jnp.min(", "best = jnp.max("),
+        (2, "_rank_merge", "(b_j < b_i)", "(b_j > b_i)"),
     ],
-    ids=["dense", "kernel"],
+    ids=["network-ties-2", "network-ties-4", "network-reverse-8", "extract", "dense"],
 )
 def test_slot_merge_fault_is_caught(monkeypatch, dcp, name, old, new):
-    """Positive control: a merge that breaks ties to the higher block fails
+    """Positive control: a merge that breaks ties to the higher block (or a
+    network that does not reverse its second list) fails
     `test_slot_merge_matches_row_merge`."""
+    if name in ("_merge_kernel_t", "_rank_merge"):
+        monkeypatch.setattr(msa_dcp, "_network_merge", lambda topk: False)
     monkeypatch.setattr(msa_dcp, name, _faulty(getattr(msa_dcp, name), old, new))
     with pytest.raises(AssertionError):
         test_slot_merge_matches_row_merge(dcp, 1, True)
+
+
+def test_candidate_kernels_emit_sorted_lists():
+    """The network merge needs every rank's list sorted (score descending,
+    ties to the lower block, misses last): `local_candidates`' picks are."""
+    rng = np.random.default_rng(11)
+    tokens, cols, dcp, topk = 256, 40, 4, 16
+    scores = jnp.asarray(rng.integers(-3, 4, (tokens, 1, cols)), jnp.float32)
+    pos = jnp.asarray(rng.integers(0, cols * dcp * PAGE, tokens), jnp.int32)
+    s, b = msa_dcp.local_candidates(
+        scores, pos, block_size=PAGE, topk=topk, init_blocks=1, local_blocks=1,
+        rank=1, dcp=dcp, interpret=True,
+    )
+    s, b = np.asarray(s), np.asarray(b)
+    ahead = (s[:, :-1] > s[:, 1:]) | ((s[:, :-1] == s[:, 1:]) & (b[:, :-1] < b[:, 1:]))
+    miss = (s[:, :-1] == -np.inf) & (s[:, 1:] == -np.inf) & (b[:, 1:] == -1)
+    assert np.all(ahead | miss)
+    assert (b == -1).any() and (b >= 0).any()
 
 
 @pytest.mark.parametrize("dtype", CACHE_DTYPES)
