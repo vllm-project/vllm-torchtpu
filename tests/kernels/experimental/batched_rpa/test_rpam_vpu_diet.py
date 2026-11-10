@@ -260,6 +260,16 @@ def test_dcp_scopes_match_reference(monkeypatch, seqs, scope, cp):
     inputs, logical, page_table = _setup(
         jnp.float8_e4m3fn, seqs, seed=5, cp=cp, rank=1 if cp > 1 else 0
     )
+    lse_tol = dict(atol=5e-2, rtol=1e-2)
+    if seqs is _LONG:
+        # The online-softmax m and l carries use the output dtype. In bf16 the
+        # LSE of a 160k-token row drifts with the KV tile width, past the bf16
+        # tolerance, while a dropped or doubled KV block (512-1024 tokens)
+        # moves it by only 0.003-0.006. f32 queries give f32 carries and
+        # output, so the long cases can check the LSE tightly enough to catch
+        # one such block. The bf16 values of q are unchanged.
+        inputs["queries"] = inputs["queries"].astype(jnp.float32)
+        lse_tol = dict(atol=1e-3, rtol=0)
     total = int(inputs["cu_q_lens"][-1])
     ref_o, ref_lse, valid = _reference(inputs, logical, seqs, scope=scope)
     out, cache, lse = _run(
@@ -268,7 +278,7 @@ def test_dcp_scopes_match_reference(monkeypatch, seqs, scope, cp):
     rows = valid  # Rows with at least one visible key.
     assert np.isfinite(out[:total][rows]).all()
     np.testing.assert_allclose(out[:total][rows], ref_o[rows], **_TOL)
-    np.testing.assert_allclose(lse[:total][rows], ref_lse[rows], atol=5e-2, rtol=1e-2)
+    np.testing.assert_allclose(lse[:total][rows], ref_lse[rows], **lse_tol)
     if scope == _NEW:
         _check_writeback(cache, inputs, logical, seqs, page_table)
 
