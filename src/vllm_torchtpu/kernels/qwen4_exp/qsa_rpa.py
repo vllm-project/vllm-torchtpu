@@ -13,6 +13,7 @@ import jax
 import jax.numpy as jnp
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.kernels.qwen4_exp import shape_tuned
 from vllm_torchtpu.kernels.qwen4_exp.decode_indexer import select_decode_blocks
 from vllm_torchtpu.kernels.qwen4_exp.qsa import (
     _token_metadata,
@@ -336,6 +337,13 @@ def rpa_attention(
         # table: a full MTP verify step (24 requests x 4 rows) runs as one
         # RPA call per layer instead of two 64-row chunks.
         batch_size = envs.VLLM_TPU_QSA_DECODE_RPA_MAX_QUERIES
+    bkv_size = envs.VLLM_TPU_QSA_DECODE_RPA_BKV
+    lanes = envs.VLLM_TPU_QSA_DECODE_RPA_LANES
+    tuned = shape_tuned.rpa_decode_tiles(len(q)) if compact else None
+    if tuned is not None:
+        # VLLM_TPU_SHAPE_TUNED: measured tiles for this decode-rows bucket.
+        bkv_size, lanes, max_queries = tuned
+        batch_size = max_queries or batch_size
     attend = functools.partial(
         _rpa_attention_batch,
         kv_heads=kv_heads,
@@ -349,8 +357,8 @@ def rpa_attention(
         **(
             dict(
                 compact=True,
-                bkv_size=envs.VLLM_TPU_QSA_DECODE_RPA_BKV,
-                batch_size=envs.VLLM_TPU_QSA_DECODE_RPA_LANES,
+                bkv_size=bkv_size,
+                batch_size=lanes,
             )
             if compact
             else {}
@@ -669,6 +677,10 @@ def _prefill_attention(
         if envs.VLLM_TPU_QSA_DCP_PREFILL_QUERY_BLOCK:
             query_block = envs.VLLM_TPU_QSA_DCP_PREFILL_QUERY_BLOCK
             query_tile = envs.VLLM_TPU_QSA_DCP_PREFILL_QUERY_TILE or None
+        tuned = shape_tuned.dcp_prefill_tiles(len(query))
+        if tuned is not None:
+            # VLLM_TPU_SHAPE_TUNED: measured tiles for this chunk-size bucket.
+            query_block, query_tile = tuned
         if query_block % 128 or query_block * query.shape[1] > 256 * 24:
             query_block, query_tile = 256, None
         if query_tile and query_block % query_tile:

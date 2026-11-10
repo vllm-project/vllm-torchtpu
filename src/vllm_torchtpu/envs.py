@@ -183,6 +183,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_PREFILL_INDEXER_BKV: int = 256
     VLLM_TPU_QSA_DECODE_RPA_LANES: int = 8
     VLLM_TPU_QSA_DECODE_RPA_MAX_QUERIES: int = 0
+    VLLM_TPU_SHAPE_TUNED: bool = False
     VLLM_TPU_QSA_FUSED_KV_WRITE: bool = False
     VLLM_TPU_QSA_INDEXER_SHARD: bool = False
     VLLM_TPU_QSA_INDEXER_SHARD_A2A_MIN_TOKENS: int = 0
@@ -898,6 +899,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_QSA_DECODE_RPA_MAX_QUERIES": env_nonnegative_int(
         "VLLM_TPU_QSA_DECODE_RPA_MAX_QUERIES", 0
     ),
+    # Per-shape tile tables (kernels/qwen4_exp/shape_tuned.py): kernels look up
+    # measured tiles by their static shape bucket (decode rows, prefill chunk
+    # tokens) and override the env-var tiles. Off keeps every env tile as set.
+    "VLLM_TPU_SHAPE_TUNED": env_bool("VLLM_TPU_SHAPE_TUNED", default=False),
     # Qwen4-exp QSA prefill: build the per-query selection bitset with a
     # compare-and-accumulate Pallas kernel. Off falls back to the vmapped
     # scatter-add, which XLA:TPU lowers to a global sort of every selection.
