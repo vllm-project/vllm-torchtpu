@@ -1099,19 +1099,25 @@ def test_patched_sparse_moe_forward_takes_prenorm_outputs(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("rows", "cols", "expected"),
+    ("rows", "cols", "expected_bm", "expected_step"),
     [
-        (16, 1024, 16),  # < 32: full shape
-        (32, 1024, 32),  # 32-aligned decode bucket (TP=8)
-        (64, 1024, 32),  # 32-aligned sub-block for 2D float8_e4m3fn (32, 128) tiling
-        (512, 1024, 64),  # TP=8 prefill bucket
-        (4096, 4096, 32),  # TP=2 prefill bucket (must stay 32, not 4096)
+        (16, 1024, 16, 16),  # < 32: full shape
+        (32, 1024, 32, 32),  # 32-aligned decode bucket (TP=8)
+        (64, 1024, 32, 32),  # 32-aligned sub-block for float8_e4m3fn (32, 128) tiles
+        (512, 1024, 512, 64),  # TP=8 prefill: 512-row block, 64-row in-kernel steps
+        # TP=2 prefill: the 16-row VREG step is not 32-aligned, so each 512-row
+        # block runs as one step.
+        (4096, 4096, 512, 512),
     ],
 )
-def test_sigmoid_gate_quant_tile_selection(rows, cols, expected):
+def test_sigmoid_gate_quant_tile_selection(rows, cols, expected_bm, expected_step):
+    """The BlockSpec tile `bm` and the in-kernel row step that
+    `pallas_sigmoid_gate_quant` derives from it."""
     bm = patch_mod._legal_tile(rows, patch_mod._select_gate_q_tile(rows, cols))
-    assert bm == expected
+    step = patch_mod._legal_tile(bm, patch_mod._select_gate_q_vreg_step(cols))
+    assert (bm, step) == (expected_bm, expected_step)
     assert bm == rows or (rows % bm == 0 and bm % 32 == 0)
+    assert step == bm or (bm % step == 0 and step % 32 == 0)
 
 
 def test_patched_sparse_moe_forward_v2_owns_combine_no_double_all_reduce(monkeypatch):
