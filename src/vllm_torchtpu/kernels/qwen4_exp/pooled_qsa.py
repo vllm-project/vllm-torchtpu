@@ -1986,9 +1986,11 @@ def _attend(
     main_slot,
     max_query_len,
     dcp=None,
+    ascending=False,
 ):
     """``dcp`` (see ``qsa_cache_writes``): returns ``(pool, out, lse, selected)``
-    with this rank's partial, ungated attention for ``dcp_combine``."""
+    with this rank's partial, ungated attention for ``dcp_combine``.
+    ``ascending``: ``blocks`` rows are ascending (``qsa_rpa.virtual_page_metadata``)."""
     result = qsa_attention(
         q,
         gate,
@@ -2004,6 +2006,7 @@ def _attend(
         **({"kv_head_offset": main_slot} if main_slot > 0 else {}),
         max_query_len=max_query_len,
         **({"dcp": dcp} if dcp is not None else {}),
+        **({"ascending": True} if ascending and dcp is not None else {}),
     )
     selected = selected_tokens(blocks, lengths, token_topk, compress_ratio)
     if dcp is not None:
@@ -2314,6 +2317,9 @@ def _shard_attend(
         main_slot=main_slot,
         max_query_len=max_query_len,
         dcp=dcp,
+        # Merged blocks come from compressed_dcp_blocks (ascending, -1 padded) and
+        # visible_blocks is ascending too; the shard merge's top-k order is not.
+        ascending=merged,
     )
 
 

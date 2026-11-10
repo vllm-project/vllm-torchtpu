@@ -331,6 +331,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_PREFILL_LIVE_MASK_PADDED: bool = False
     VLLM_TPU_QSA_DCP_SPLIT_LSE: bool = False
     VLLM_TPU_QSA_DCP_PACK_LISTS: bool = False
+    VLLM_TPU_QSA_DCP_META_PARTITION: bool = False
     VLLM_TPU_TP_ONESHOT_AR_MAX_ROWS: int = 0
     VLLM_TPU_VERIFY_FUSED: bool = False
     VLLM_TPU_VERIFY_FUSED_CHECK: int = 0
@@ -2068,6 +2069,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # bits) and group ids (int32) as one stacked tensor instead of two
     # gathers; same bits.
     "VLLM_TPU_QSA_DCP_PACK_LISTS": env_bool("VLLM_TPU_QSA_DCP_PACK_LISTS"),
+    # Decode DCP metadata: the owned-first order of an already ascending
+    # selection by a stable partition instead of a [rows, budget] sort.
+    "VLLM_TPU_QSA_DCP_META_PARTITION": env_bool("VLLM_TPU_QSA_DCP_META_PARTITION"),
     # TP all-reduce of BF16 tensors with at most this many rows (0 = off): one-shot
     # all-gather + local f32 sum (tpu_communicator.TpuDeviceCommunicator.all_reduce).
     # Faster for decode-sized tensors; not bit-identical to psum.

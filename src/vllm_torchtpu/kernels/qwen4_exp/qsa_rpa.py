@@ -39,7 +39,7 @@ def pack_rows(key, value, *, fp8, k_scale=1.0, v_scale=1.0):
 
 
 def virtual_page_metadata(
-    blocks, lengths, table, *, ratio=4, page_size=128, dcp=None
+    blocks, lengths, table, *, ratio=4, page_size=128, dcp=None, ascending=False
 ):
     """Map selected logical groups to physical micro-pages; no KV gathering.
 
@@ -48,10 +48,16 @@ def virtual_page_metadata(
     rows ``t % page_size`` of the tokens with ``(t // page_size) % D == rank``.
     Only those groups are kept, ascending at the front of each row, then the
     partial tail group when this rank owns it; ``kv_lens`` counts owned tokens.
+
+    ``ascending``: the caller guarantees each row's valid groups are already in
+    ascending order (e.g. ``compressed_dcp_blocks``); with
+    ``VLLM_TPU_QSA_DCP_META_PARTITION`` the DCP owned-first ordering is then a
+    stable partition instead of a sort (same output).
     """
     if dcp is not None:
         return _dcp_page_metadata(
-            blocks, lengths, table, ratio=ratio, page_size=page_size, dcp=dcp
+            blocks, lengths, table, ratio=ratio, page_size=page_size, dcp=dcp,
+            ascending=ascending,
         )
     batch, budget = blocks.shape
     complete = lengths // ratio
@@ -83,7 +89,40 @@ def virtual_page_metadata(
     return pages, kv_lens, cu_q_lens, jnp.full((3,), batch, jnp.int32)
 
 
-def _dcp_page_metadata(blocks, lengths, table, *, ratio, page_size, dcp):
+_PARTITION_LOGGED = False
+
+
+def _log_partition_once(batch, budget):
+    """Trace-time proof that the partition path was taken (once per process)."""
+    global _PARTITION_LOGGED
+    if not _PARTITION_LOGGED:
+        _PARTITION_LOGGED = True
+        from vllm_torchtpu.logger import init_logger
+
+        init_logger(__name__).info(
+            "VLLM_TPU_QSA_DCP_META_PARTITION: decode DCP metadata uses the stable "
+            "partition (first traced shape [%d, %d])", batch, budget,
+        )
+
+
+def _owned_first(blocks, owned):
+    """Each row's owned entries at the front in their input order (a stable
+    partition), the other columns ``int32 max``. Equal to sorting
+    ``where(owned, blocks, max)`` when the owned entries are ascending."""
+    batch, budget = blocks.shape
+    dest = jnp.where(owned, jnp.cumsum(owned.astype(jnp.int32), axis=1) - 1, budget)
+    rows = jnp.broadcast_to(jnp.arange(batch, dtype=jnp.int32)[:, None], dest.shape)
+    big = jnp.iinfo(jnp.int32).max
+    return (
+        jnp.full((batch, budget), big, jnp.int32)
+        .at[rows, dest]
+        .set(blocks.astype(jnp.int32), mode="drop", unique_indices=True)
+    )
+
+
+def _dcp_page_metadata(
+    blocks, lengths, table, *, ratio, page_size, dcp, ascending=False
+):
     """:func:`virtual_page_metadata` for this DCP rank's owned groups; rows
     with no owned token get ``kv_lens`` 0 and no query (see ``cu_q_lens``)."""
     rank, world = dcp
@@ -96,7 +135,16 @@ def _dcp_page_metadata(blocks, lengths, table, *, ratio, page_size, dcp):
     columns = jnp.arange(budget)[None, :]
     owned = (columns < count[:, None]) & ((blocks // page_groups) % world == rank)
     # Owned groups ascending at the front, the rest after them.
-    groups = jax.lax.sort(jnp.where(owned, blocks, big), dimension=1, is_stable=False)
+    if ascending and envs.VLLM_TPU_QSA_DCP_META_PARTITION:
+        # VLLM_TPU_QSA_DCP_META_PARTITION: the selection is already ascending,
+        # so a stable partition gives the sort's result without the
+        # [rows, budget] sort (~30 us per layer call at 32-128 rows).
+        groups = _owned_first(blocks, owned)
+        _log_partition_once(batch, budget)
+    else:
+        groups = jax.lax.sort(
+            jnp.where(owned, blocks, big), dimension=1, is_stable=False
+        )
     owned_count = jnp.sum(owned, axis=1, dtype=jnp.int32)
     tail = ((lengths % ratio) > 0) & ((complete // page_groups) % world == rank)
     columns = jnp.arange(budget + 1)[None, :]
@@ -146,6 +194,7 @@ def _rpa_attention_batch(
     fast_fetch=False,
     dcp=None,
     return_lse=False,
+    ascending=False,
 ):
     """With ``return_lse`` returns ``(out, lse, cache)``: ``out`` f32 normalized
     over the attended keys and not gated, ``lse`` [rows, heads] (natural log);
@@ -163,7 +212,7 @@ def _rpa_attention_batch(
         table,
         ratio=ratio,
         page_size=cache.shape[1],
-        **({"dcp": dcp} if dcp is not None else {}),
+        **({"dcp": dcp, "ascending": ascending} if dcp is not None else {}),
     )
     # A row has a query when it attends any key: every live row, or under DCP
     # every row this rank owns a key of.
@@ -275,9 +324,11 @@ def rpa_attention(
     fast_fetch=False,
     dcp=None,
     return_lse=False,
+    ascending=False,
 ):
     """With ``return_lse`` returns ``(out, lse, cache)`` (see
-    ``_rpa_attention_batch``); ``dcp`` attends this DCP rank's owned keys."""
+    ``_rpa_attention_batch``); ``dcp`` attends this DCP rank's owned keys.
+    ``ascending``: see ``virtual_page_metadata``."""
     batch_size = rpa_query_batch_size(blocks.shape[1] + 1)
     if compact and envs.VLLM_TPU_QSA_DECODE_RPA_MAX_QUERIES:
         # The compact schedule holds one entry per lane-tile instead of one
@@ -307,6 +358,7 @@ def rpa_attention(
         **({"kv_head_offset": kv_head_offset} if kv_head_offset else {}),
         **({"dcp": dcp} if dcp is not None else {}),
         **({"return_lse": True} if return_lse else {}),
+        **({"ascending": True} if ascending else {}),
     )
     if len(q) <= batch_size:
         return attend(q, gate, blocks, lengths, table, cache)
@@ -415,6 +467,7 @@ def decode_attention(
     shared_schedule=None,
     dcp=None,
     return_lse=False,
+    ascending=False,
 ):
     """Per-row decode attention: fused sparse decode when enabled, else RPA.
 
@@ -471,6 +524,7 @@ def decode_attention(
         decode_only=shared,
         **({"dcp": dcp} if dcp is not None else {}),
         **({"return_lse": True} if return_lse else {}),
+        **({"ascending": True} if ascending else {}),
     )
     *outs, cache = result
     outs = [x[:, : q.shape[1]] if trailing else x for x in outs]
@@ -494,6 +548,7 @@ def _decode_attention(
     decode_only=False,
     dcp=None,
     return_lse=False,
+    ascending=False,
 ):
     options = dict(kv_heads=kv_heads, ratio=ratio, k_scale=k_scale, v_scale=v_scale)
     if kv_head_offset:
@@ -518,6 +573,8 @@ def _decode_attention(
         options["dcp"] = dcp
     if return_lse:
         options["return_lse"] = True
+    if ascending and dcp is not None:
+        options["ascending"] = True
 
     return rpa_attention(q, gate, blocks, lengths, table, cache, **options)
 
@@ -753,6 +810,7 @@ def qsa_attention(
     kv_head_offset=0,
     max_query_len=1,
     dcp=None,
+    ascending=False,
 ):
     """Route a decode prefix to per-row decode and the remaining rows to prefill.
 
@@ -787,6 +845,9 @@ def qsa_attention(
         decode_fn, prefill_fn = wrap(decode_attention), wrap(_prefill_attention)
     else:
         decode_fn, prefill_fn = decode_attention, _prefill_attention
+    if ascending and dcp is not None:
+        # The selection rows are ascending (see virtual_page_metadata).
+        decode_fn = functools.partial(decode_fn, ascending=True)
     if len(query) <= (len(starts) - 1) * max_query_len:
         output, cache = decode_fn(query, gate, blocks, lengths, table, cache, **options)
         return split(output, lengths, cache) if dcp is not None else (output, cache)
