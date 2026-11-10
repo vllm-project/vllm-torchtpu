@@ -129,6 +129,10 @@ def test_complete_layer_dense_context_against_plain_torch(
                 indexer_budget=2048,
                 partial_rotary_factor=0.25,
             )
+            half_rotary = int(cfg.head_dim * cfg.partial_rotary_factor) // 2
+            cfg.rope_parameters["mrope_section"] = [
+                half_rotary // 3 + (axis < half_rotary % 3) for axis in range(3)
+            ]
             model = Qwen4ExpQSA(
                 config=cfg,
                 tp_rank=0,
