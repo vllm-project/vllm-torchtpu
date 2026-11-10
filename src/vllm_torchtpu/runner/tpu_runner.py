@@ -5115,7 +5115,7 @@ class TPUModelRunner(GPUModelRunner):
                                     pos_idx_dev,
                                     self.input_ids,
                                     substitution_indices,
-                                    self._pre_async_results.next_tokens_tpu,
+                                    pre_async.next_tokens_tpu,
                                     spec_decode_metadata.final_logits_indices,
                                     spec_decode_metadata.target_logits_indices,
                                 )
