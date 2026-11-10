@@ -28,9 +28,9 @@ grouped matmuls, the combine, and both collectives.
 
 ``MOE_FUSED_EP_KERNEL_MIN_TOKENS`` decides once, at weight load, against the
 scheduler's largest batch, whether to build this operation for the deployment.
-When it is built, ``TPU_MOE_FUSED_EP_STEP_MIN_TOKENS`` can keep smaller compiled
-token shapes on the few-token kernel or the grouped-matmul path while larger
-shapes use this fully fused path. Its default of zero preserves fused EP for every shape.
+When it is built, ``step_min_tokens()`` (a per-layout table) keeps smaller
+compiled token shapes on the few-token kernel or the grouped-matmul path while
+larger shapes use this fully fused path.
 
 The kernel binding. `kernels/fused_moe/v3` is the kernel's own package, whose
 entry point is `fused_ep_moe`. `_build_op` below gives the op a `run_moe`
@@ -294,8 +294,27 @@ def _build_op(mesh, topk: int, renormalize: bool, activation: str,
     return op
 
 
+# Smallest per-rank row count of a step the kernel takes, keyed on
+# (data_parallel_size, tensor_parallel_size); other layouts use the default.
+# The entries are the values the Qwen3.5 decode layouts ran at: DP4 x TP2
+# (32) and TP8 (33).
+DEFAULT_STEP_MIN_TOKENS = 64
+STEP_MIN_TOKENS_BY_LAYOUT: dict[tuple[int, int], int] = {(4, 2): 32, (1, 8): 33}
+
+
+def step_min_tokens(parallel_config: Any = None) -> int:
+    """The per-rank row gate for the layout of ``parallel_config``, or of this
+    process's model-parallel groups when it is None."""
+    from vllm_torchtpu.layers.adapter import sequence_parallel as _sp
+
+    layout = _sp.parallel_layout(parallel_config)
+    if layout is None:
+        return DEFAULT_STEP_MIN_TOKENS
+    return STEP_MIN_TOKENS_BY_LAYOUT.get(layout, DEFAULT_STEP_MIN_TOKENS)
+
+
 def _step_min_tokens() -> int:
-    return int(envs.TPU_MOE_FUSED_EP_STEP_MIN_TOKENS or 0)
+    return step_min_tokens()
 
 
 def maybe_fused_moe_ep(
@@ -409,19 +428,18 @@ def _expert_block_permutation(ep: int, device) -> torch.Tensor | None:
     return torch.tensor(order, dtype=torch.int32, device=device)
 
 
-def check_kernel_threshold(ep: int, tp: int) -> None:
+def check_kernel_threshold(ep: int, tp: int, lowtok_cap: int = 0) -> None:
     """The fused EP kernel and the few-token kernel meet at one row count, so
     no step falls to the grouped-matmul path between them. Row counts are per
     MoE call across the node: the few-token cap is in those units already (a
     step's rows replicated under tensor parallelism, an engine's rows gathered
-    from every engine under data parallelism). With the few-token kernel off,
-    the grouped-matmul path is the kernel below the fused one by choice."""
-    if not envs.TPU_MOE_LOWTOK:
+    from every engine under data parallelism). ``lowtok_cap`` is the
+    few-token kernel's row cap, 0 when that kernel is not armed; then the
+    grouped-matmul path is the kernel below the fused one by choice."""
+    if lowtok_cap <= 0:
         return
-    cap = int(envs.TPU_MOE_LOWTOK_MAX_TOKENS or 0)
-    if cap <= 0:
-        return
-    gate = int(envs.TPU_MOE_FUSED_EP_STEP_MIN_TOKENS or 0)
+    cap = int(lowtok_cap)
+    gate = _step_min_tokens()
     if tp > 1:
         from vllm_torchtpu.layers.adapter import sequence_parallel as _sp
         start = _sp.min_rows()
@@ -454,9 +472,10 @@ def check_kernel_threshold(ep: int, tp: int) -> None:
                 f"({ep * gate} across the node)")
     if not meets:
         raise ValueError(
-            "The MoE kernel settings leave steps between the two kernels ("
-            f"{rule}). Set them from one threshold, as the Qwen3.5 recipe's "
-            "MOE_KERNEL_THRESHOLD does.")
+            "The MoE kernel thresholds leave steps between the two kernels ("
+            f"{rule}). The few-token cap and this layout's entries in "
+            "STEP_MIN_TOKENS_BY_LAYOUT and sequence_parallel's row table "
+            "must meet.")
     logger.info_once("MoE kernels: %s.", rule)
 
 
@@ -472,8 +491,6 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool,
     layer._tpu_fused_ep_eligible = False
     if not envs.USE_MOE_FUSED_EP_KERNEL:
         return
-    if envs.TPU_MOE_FUSED_EP_STEP_MIN_TOKENS < 0:
-        raise ValueError("TPU_MOE_FUSED_EP_STEP_MIN_TOKENS must be >= 0")
     # Under tensor parallelism the kernel arms for the sequence-parallel steps,
     # where each rank holds its own slice of the batch; a replicated step
     # stays off the kernel (`_fused_kernel_takes` in the FP8 method), since
@@ -518,8 +535,8 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool,
         # With sequence parallelism each rank passes its own rows to the kernel.
         logger.info_once(
             "Fused EP MoE under tensor parallelism (tp_size=%d) with sequence "
-            "parallelism: each rank's own rows, prompt steps of at least "
-            "TPU_MOE_FUSED_EP_STEP_MIN_TOKENS rows.", tp)
+            "parallelism: each rank's own rows, steps of at least %d rows "
+            "per rank.", tp, _step_min_tokens())
 
     mesh = build_ep_mesh()
     if mesh is None:
@@ -535,9 +552,10 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool,
     w2_scale = layer.w2_weight_scale_inv
     # under a copies placement the rank's tensors carry copy slots after its primaries; the prompt path routes
     # to primaries only and streams them alone (the forward passes the same views)
-    from vllm_torchtpu import expert_placement as _placement
-    if _placement.has_copies() and int(_placement.owned()) < int(w1.shape[0]):
-        n_prim = int(_placement.owned())
+    from vllm_torchtpu.layers.adapter import expert_placement as _placement
+    n_prim = getattr(layer, _placement.PRIMARY_EXPERTS_ATTR, None)
+    if n_prim is not None and int(n_prim) < int(w1.shape[0]):
+        n_prim = int(n_prim)
         w1, w2, w1_scale, w2_scale = w1[:
                                         n_prim], w2[:
                                                     n_prim], w1_scale[:
