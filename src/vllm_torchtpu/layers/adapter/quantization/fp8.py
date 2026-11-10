@@ -1091,7 +1091,10 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         self._moe_lowtok_scores_op = moe_lowtok_scores.prebuild(
             self, layer, activation_str
         )
-        if self._moe_lowtok_scores_op is not None and layer.moe_config.moe_parallel_config.use_ep:
+        if (
+            self._moe_lowtok_scores_op is not None
+            and layer.moe_config.moe_parallel_config.use_ep
+        ):
             from vllm.config import get_current_vllm_config
 
             from vllm_torchtpu.layers.adapter import moe_lowtok_fused_op
@@ -1324,14 +1327,15 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         layer = cast("TpuRoutedExperts", layer)
         from vllm.distributed.parallel_state import get_ep_group
 
-        from vllm_torchtpu.layers.adapter import small_all_reduce_op
+        from vllm_torchtpu.layers.adapter import (
+            moe_lowtok_fused_op,
+            small_all_reduce_op,
+        )
         from vllm_torchtpu.layers.adapter.fused_moe_ep_v3 import (
             fused_moe_ep,
             fused_moe_ep_supported,
             retain_fused_ep_graph_inputs,
         )
-
-        from vllm_torchtpu.layers.adapter import moe_lowtok_fused_op
 
         if use_fused_kernel and (
             fused_moe_ep_supported(self) or fused_moe_ep_supported(layer)

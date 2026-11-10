@@ -275,7 +275,11 @@ def _stream_ring(
 
         @pl.when(u < n_units)
         def _prime(u=u):
-            start(jnp.int32(u // units), jnp.int32(u % units), jnp.int32((u // units) % depth))
+            start(
+                jnp.int32(u // units),
+                jnp.int32(u % units),
+                jnp.int32((u // units) % depth),
+            )
 
     before_compute()
     acc[...] = jnp.zeros_like(acc)
@@ -352,7 +356,9 @@ def _stream_ring(
                         h = _dot(x_q, w13_buf[slot])
                         scales = s13_buf[slot]
                         col = p * half
-                        h_acc[:, col : col + half] = h[:, :half] * x_s * scales[:, :half]
+                        h_acc[:, col : col + half] = (
+                            h[:, :half] * x_s * scales[:, :half]
+                        )
                         h_acc[:, inter + col : inter + col + half] = (
                             h[:, half:] * x_s * scales[:, half:]
                         )
@@ -372,12 +378,14 @@ def _stream_ring(
 
 
 def _gather_rows_of(rows):
-    """Rows of the gather-side operands: the routed rows padded to whole 128-row tiles."""
+    """Rows of the gather-side operands: the routed rows padded to whole
+    128-row tiles."""
     return max(_LANE, pl.cdiv(rows, _LANE) * _LANE)
 
 
 def _gather_scratch(sc, rows, hidden, inter, fp8_rows):
-    """The gather formulation's scratch, appended to `sc` in `_gather_prologue`'s order."""
+    """The gather formulation's scratch, appended to `sc` in
+    `_gather_prologue`'s order."""
     g_rows = _gather_rows_of(rows)
     max_pass = pl.cdiv(rows, GATHER_ROWS)
     sc.vmem((g_rows, hidden), jnp.bfloat16)  # the routed rows as the gather operand
@@ -392,7 +400,9 @@ def _gather_scratch(sc, rows, hidden, inter, fp8_rows):
     sc.vmem((max_pass, GATHER_ROWS, _LANE), jnp.float32)  # their scales
     sc.vmem((max_pass, GATHER_ROWS, _LANE), jnp.float32)  # their routing weights
     sc.vmem((max_pass, GATHER_ROWS, inter), jnp.float32)  # gate, then gate * up
-    sc.vmem((_LANE, hidden), jnp.bfloat16)  # the contribution pieces, K rows of the scatter
+    sc.vmem(
+        (_LANE, hidden), jnp.bfloat16
+    )  # the contribution pieces, K rows of the scatter
     return 14
 
 
@@ -420,7 +430,9 @@ def _gather_prologue(gid_s, wtab_ref, x_all, xs_all, g, rows):
     mask_bf = mask.astype(jnp.bfloat16)
     pos[...] = jnp.dot(lower, mask_bf, preferred_element_type=jnp.float32)
     pos_t[...] = jnp.dot(
-        jnp.transpose(mask).astype(jnp.bfloat16), upper, preferred_element_type=jnp.float32
+        jnp.transpose(mask).astype(jnp.bfloat16),
+        upper,
+        preferred_element_type=jnp.float32,
     )
     w_t[...] = jnp.transpose(w_rows)
     counts_v[...] = jnp.sum(mask, axis=0, keepdims=True).astype(jnp.int32)
@@ -439,10 +451,39 @@ def _gather_prologue(gid_s, wtab_ref, x_all, xs_all, g, rows):
 
 
 def _gather_expert(
-    gid_s, g, expert, part, slot_ok, w_gate, w_up, s_gate, s_up, w_down, s_down, acc, *, rows, fp8_rows
+    gid_s,
+    g,
+    expert,
+    part,
+    slot_ok,
+    w_gate,
+    w_up,
+    s_gate,
+    s_up,
+    w_down,
+    s_down,
+    acc,
+    *,
+    rows,
+    fp8_rows,
 ):
     """One expert's unit on its routed rows: gather, matmul, scatter back."""
-    x_g, w_blk, pos, pos_t, w_t, xs_t, counts_v, counts_s, csem, xq_buf, xs_buf, wk_buf, h_g, pieces = g
+    (
+        x_g,
+        w_blk,
+        pos,
+        pos_t,
+        w_t,
+        xs_t,
+        counts_v,
+        counts_s,
+        csem,
+        xq_buf,
+        xs_buf,
+        wk_buf,
+        h_g,
+        pieces,
+    ) = g
     g_rows = x_g.shape[0]
     first = gid_s[0, 0]
     blk = (first >> 7) << 7
@@ -453,7 +494,9 @@ def _gather_expert(
     p_i = lax.broadcasted_iota(jnp.int32, (GATHER_ROWS, g_rows), 0).astype(jnp.float32)
 
     def row_tables():
-        pos_row = jnp.sum(jnp.where(sub_i == lane, pos_t[...], 0.0), axis=0, keepdims=True)
+        pos_row = jnp.sum(
+            jnp.where(sub_i == lane, pos_t[...], 0.0), axis=0, keepdims=True
+        )
         w_row = jnp.sum(jnp.where(sub_i == lane, w_t[...], 0.0), axis=0, keepdims=True)
         return pos_row, w_row
 
@@ -468,10 +511,14 @@ def _gather_expert(
         def pass_k(k, carry):
             sel = one_hot_t(k, pos_row, w_row)
             w_k = jnp.sum(jnp.where(sel != 0, w_row, 0.0), axis=1, keepdims=True)
-            x_rows = jnp.dot(sel.astype(jnp.bfloat16), x_g[...], preferred_element_type=jnp.float32)
+            x_rows = jnp.dot(
+                sel.astype(jnp.bfloat16), x_g[...], preferred_element_type=jnp.float32
+            )
             if fp8_rows:
                 x_q = x_rows.astype(_FP8)
-                x_s = jnp.sum(jnp.where(sel != 0, xs_t[0:1, :], 0.0), axis=1, keepdims=True)
+                x_s = jnp.sum(
+                    jnp.where(sel != 0, xs_t[0:1, :], 0.0), axis=1, keepdims=True
+                )
             else:
                 x_q, x_s = _quantize_rows(x_rows)
             xq_buf[k] = x_q
@@ -496,8 +543,12 @@ def _gather_expert(
 
     @pl.when((part == 2) & slot_ok)
     def _down():
-        pos_col = jnp.sum(jnp.where(lane_i == lane, pos[...], 0.0), axis=1, keepdims=True)
-        w_col = jnp.sum(jnp.where(lane_i == lane, w_blk[...], 0.0), axis=1, keepdims=True)
+        pos_col = jnp.sum(
+            jnp.where(lane_i == lane, pos[...], 0.0), axis=1, keepdims=True
+        )
+        w_col = jnp.sum(
+            jnp.where(lane_i == lane, w_blk[...], 0.0), axis=1, keepdims=True
+        )
         piece_lane = (lane_i & (GATHER_ROWS - 1)).astype(jnp.float32)
         in_pieces = lane_i < _PIECES * GATHER_ROWS
 
@@ -630,7 +681,9 @@ def _kernel_body(
 
             @pl.when(j != d)
             def _(j=j):
-                _push(lg_ref, lg_all.at[_rows_of(d, rows_l)], dsem.at[0], dsem.at[1], j, t)
+                _push(
+                    lg_ref, lg_all.at[_rows_of(d, rows_l)], dsem.at[0], dsem.at[1], j, t
+                )
 
         lg_all[_rows_of(d, rows_l), :] = lg_ref[...]
         mine = _rows_of(d, rows_l)
@@ -644,7 +697,9 @@ def _kernel_body(
 
                 @pl.when(j != d)
                 def _(j=j):
-                    _push(xs_all.at[mine], xs_all.at[mine], dsem.at[5], dsem.at[6], j, t)
+                    _push(
+                        xs_all.at[mine], xs_all.at[mine], dsem.at[5], dsem.at[6], j, t
+                    )
 
         else:
             x_all[mine, :] = x_ref[...]
@@ -748,7 +803,14 @@ def _kernel_body(
 
             @pl.when(j != d)
             def _(j=j):
-                _push(c_send.at[_rows_of(j, rows_l)], c_recv1.at[d], csem.at[0], csem.at[1], j, t)
+                _push(
+                    c_send.at[_rows_of(j, rows_l)],
+                    c_recv1.at[d],
+                    csem.at[0],
+                    csem.at[1],
+                    j,
+                    t,
+                )
 
         _wait_bytes(c_recv1.at[pl.ds(0, dp - 1)], csem.at[1])
         s = acc[_rows_of(d, rows_l), :]
@@ -792,7 +854,14 @@ def _kernel_body(
 
             @pl.when(j != d)
             def _(j=j):
-                _push(c_half.at[_rows_of(j, rows_l)], c_recv2.at[d], csem.at[2], csem.at[3], j, t)
+                _push(
+                    c_half.at[_rows_of(j, rows_l)],
+                    c_recv2.at[d],
+                    csem.at[2],
+                    csem.at[3],
+                    j,
+                    t,
+                )
 
         _wait_bytes(c_recv2.at[pl.ds(0, dp - 1)], csem.at[3])
         fin = c_half[_rows_of(d, rows_l), :].astype(jnp.float32)
@@ -808,7 +877,14 @@ def _kernel_body(
             @pl.when(t == u)
             def _(mine=mine):
                 out_ref[:, mine] = fin
-                _push(out_ref.at[:, mine], out_ref.at[:, mine], csem.at[4], csem.at[5], d, 1 - t)
+                _push(
+                    out_ref.at[:, mine],
+                    out_ref.at[:, mine],
+                    csem.at[4],
+                    csem.at[5],
+                    d,
+                    1 - t,
+                )
 
         _wait_bytes(out_ref.at[:, pl.ds(0, half)], csem.at[5])
         _wait_bytes(c_recv1, csem.at[0])
@@ -822,8 +898,12 @@ def _kernel_body(
         if dispatch_form == "flat":
             _wait_bytes(x_all.at[pl.ds(0, (dp - 1) * rows_l)], dsem.at[2])
         else:
-            _wait_bytes(x_all.at[pl.ds(0, (dp - 1) * rows_l), pl.ds(0, half)], dsem.at[2])
-            _wait_bytes(x_all.at[pl.ds(0, (dp - 1) * rows_l), pl.ds(0, half)], dsem.at[3])
+            _wait_bytes(
+                x_all.at[pl.ds(0, (dp - 1) * rows_l), pl.ds(0, half)], dsem.at[2]
+            )
+            _wait_bytes(
+                x_all.at[pl.ds(0, (dp - 1) * rows_l), pl.ds(0, half)], dsem.at[3]
+            )
 
 
 class _Scratch:
@@ -942,10 +1022,14 @@ def moe_lowtok_fused(
             raise ValueError(f"{tokens} gathered rows do not split over dp={dp}")
         rows_l = tokens // dp
         if rows_l % _ROW_TILE:
-            raise ValueError(f"{rows_l} rows per engine are not a multiple of {_ROW_TILE}")
+            raise ValueError(
+                f"{rows_l} rows per engine are not a multiple of {_ROW_TILE}"
+            )
         rows = tokens
     if dispatch_fp8 and rows_l % 32:
-        raise ValueError(f"dispatch_fp8 needs {rows_l} rows per engine to be a multiple of 32")
+        raise ValueError(
+            f"dispatch_fp8 needs {rows_l} rows per engine to be a multiple of 32"
+        )
     pad_rows = (rows_l if dispatch == "inkernel" else rows) - tokens
     x_rows = jnp.pad(x, ((0, pad_rows), (0, 0)))
     # The router logits keep their dtype, as moe_lowtok's scores entry does.
@@ -989,19 +1073,25 @@ def moe_lowtok_fused(
     if gather_rows:
         _gather_scratch(sc, rows, hidden, inter, dispatch_fp8)
     operand_bytes = (
-        x_rows.size * 2 + lg_rows.size * lg_rows.dtype.itemsize + out_rows * hidden * 2
+        x_rows.size * 2
+        + lg_rows.size * lg_rows.dtype.itemsize
+        + out_rows * hidden * 2
         # x quantized to fp8 and its f32 cast, the dot results
-        + rows * hidden * 5 + rows * 2 * inter * 4
+        + rows * hidden * 5
+        + rows * 2 * inter * 4
     )
     vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+    dispatch_tag = dispatch_form[0] if dispatch == "inkernel" else ""
     name = (
-        f"moe_lowtok_fused_d{dispatch[0]}{dispatch_form[0] if dispatch == 'inkernel' else ''}"
+        f"moe_lowtok_fused_d{dispatch[0]}{dispatch_tag}"
         f"{'q' if dispatch_fp8 else ''}"
         f"_c{combine[0]}{combine_form[0] if combine == 'inkernel' else ''}_r{depth}"
         f"{'_g' if gather_rows else ''}"
     )
-    prefetch = (gid,) if rank is None else (gid, jnp.asarray(rank, jnp.int32).reshape(2))
+    prefetch = (
+        (gid,) if rank is None else (gid, jnp.asarray(rank, jnp.int32).reshape(2))
+    )
     out = pl.pallas_call(
         functools.partial(
             _kernel,

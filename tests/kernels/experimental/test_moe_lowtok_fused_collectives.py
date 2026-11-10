@@ -35,7 +35,7 @@ pytestmark = pytest.mark.cpu_test
 DP, TP = 4, 2
 # Experts per core, hidden, intermediate, top-k: small enough for the
 # interpreter, with every core holding experts some rows route to.
-E, H, I, TOPK = 2, 512, 256, 2
+E, H, INTER, TOPK = 2, 512, 256, 2
 REL_L2 = 1e-2
 # rows per engine, dispatch form, combine form, FP8 dispatch, routed-row
 # gather, rank as data. The first is the served form at a 32-row step.
@@ -113,16 +113,18 @@ def _worker():
     rng = np.random.default_rng(0)
     n_experts = E * DP * TP
     w13 = jnp.asarray(
-        np.clip(rng.standard_normal((n_experts, H, 2 * I)) * 40, -448, 448),
+        np.clip(rng.standard_normal((n_experts, H, 2 * INTER)) * 40, -448, 448),
         kernel._FP8,
     )
     w2 = jnp.asarray(
-        np.clip(rng.standard_normal((n_experts, I, H)) * 40, -448, 448), kernel._FP8
+        np.clip(rng.standard_normal((n_experts, INTER, H)) * 40, -448, 448), kernel._FP8
     )
     s13 = jnp.asarray(
-        rng.random((n_experts, 1, 1, 2 * I)) / (40 * np.sqrt(H)), jnp.float32
+        rng.random((n_experts, 1, 1, 2 * INTER)) / (40 * np.sqrt(H)), jnp.float32
     )
-    s2 = jnp.asarray(rng.random((n_experts, 1, 1, H)) / (40 * np.sqrt(I)), jnp.float32)
+    s2 = jnp.asarray(
+        rng.random((n_experts, 1, 1, H)) / (40 * np.sqrt(INTER)), jnp.float32
+    )
     starts = jnp.asarray(np.arange(DP * TP) * E, jnp.int32)
     ranks = jnp.asarray([[i // TP, i % TP] for i in range(DP * TP)], jnp.int32)
     experts = P(("dp", "tp"))
@@ -130,7 +132,9 @@ def _worker():
     def inputs(rows):
         r = np.random.default_rng(rows)
         x = jnp.asarray(r.standard_normal((DP * rows, H)), jnp.bfloat16)
-        logits = jnp.asarray(r.standard_normal((DP * rows, n_experts)) * 2, jnp.bfloat16)
+        logits = jnp.asarray(
+            r.standard_normal((DP * rows, n_experts)) * 2, jnp.bfloat16
+        )
         return x, logits
 
     def reference(x, logits):
@@ -144,7 +148,7 @@ def _worker():
             w = jnp.sum(jnp.where(ids == e, weights, 0), axis=1)
             h = jnp.dot(x_q, w13[e], preferred_element_type=jnp.float32)
             h = h * x_s * s13[e].reshape(1, -1)
-            a = jax.nn.silu(h[:, :I]) * h[:, I:]
+            a = jax.nn.silu(h[:, :INTER]) * h[:, INTER:]
             a_q, a_s = kernel._quantize_rows(a)
             o = jnp.dot(a_q, w2[e], preferred_element_type=jnp.float32)
             out = out + w[:, None] * (o * a_s * s2[e].reshape(1, -1))
@@ -280,9 +284,9 @@ def _call(rows=32, **kwargs):
     return fc.moe_lowtok_fused(
         jnp.zeros((rows, H), jnp.bfloat16),
         jnp.zeros((rows, E * DP * TP), jnp.bfloat16),
-        jnp.zeros((E, H, 2 * I), jnp.float8_e4m3fn),
-        jnp.zeros((E, 1, 1, 2 * I), jnp.float32),
-        jnp.zeros((E, I, H), jnp.float8_e4m3fn),
+        jnp.zeros((E, H, 2 * INTER), jnp.float8_e4m3fn),
+        jnp.zeros((E, 1, 1, 2 * INTER), jnp.float32),
+        jnp.zeros((E, INTER, H), jnp.float8_e4m3fn),
         jnp.zeros((E, 1, 1, H), jnp.float32),
         **statics,
     )
