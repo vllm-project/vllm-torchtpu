@@ -48,10 +48,13 @@ def _scheduler(
     schedule=None,
     lone_prompt=True,
     equal_cost=True,
+    **options,
 ) -> TpuPipelineChunkScheduler:
     """A scheduler as the engine hook leaves it: with ``cost``, after
     ``install_cost_model``; with only ``granularity``, after
-    ``install_chunk_limits``."""
+    ``install_chunk_limits``. Built without __init__; ``options`` sets option
+    attributes such as ``_quadratic_cost=True`` (all off otherwise, as on an
+    engine that sets no tpu_pp_scheduler option)."""
     scheduler = TpuPipelineChunkScheduler.__new__(TpuPipelineChunkScheduler)
     scheduler._lone_prompt = lone_prompt
     scheduler._equal_cost = equal_cost
@@ -80,6 +83,8 @@ def _scheduler(
     scheduler._waits = 0
     scheduler._retention = None
     scheduler.kv_cache_manager = SimpleNamespace()
+    for name, value in options.items():
+        setattr(scheduler, name, value)
     return scheduler
 
 
@@ -670,10 +675,11 @@ def test_running_srpf_orders_by_quadratic_effective_cost():
     # much higher than r_shallow at prefix 0.
     r_deep = _request(163840, 163840 + 3800, "deep")
     r_shallow = _request(0, 4096, "shallow")
-    scheduler = _scheduler(cost=model, running=[r_deep, r_shallow])
+    scheduler = _scheduler(
+        cost=model, running=[r_deep, r_shallow], _quadratic_cost=True
+    )
     scheduler._srpf_running = True
     scheduler._paw_aging_tok_per_s = 0.0
-    scheduler._paw_max_wait_s = 0.0
     with patch.object(Scheduler, "schedule", return_value=_EMPTY_STEP):
         scheduler.schedule()
     assert [r.request_id for r in scheduler.running] == ["shallow", "deep"]

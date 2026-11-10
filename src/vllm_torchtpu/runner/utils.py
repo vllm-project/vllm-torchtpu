@@ -50,6 +50,11 @@ PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY = (
     "phased_profiler_prefill_only_kv_len_threshold"
 )
 
+# Host-only section: the pipeline chunk scheduler options
+# (`core.pp_scheduler_options`) only decide admission order and how prefill
+# work is priced; none changes a compiled program.
+PP_SCHEDULER_OPTIONS_SECTION = "tpu_pp_scheduler"
+
 # Keys that never change the compiled graph: the diagnostics-only profiler
 # knobs above, which only steer profiling, and the host-only sections, each
 # imported from the module that reads it.
@@ -60,6 +65,7 @@ HASH_IGNORED_ADDITIONAL_CONFIG_KEYS = frozenset(
         PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY,
         PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY,
         SCHEDULER_OPTIONS_SECTION,
+        PP_SCHEDULER_OPTIONS_SECTION,
     }
 )
 

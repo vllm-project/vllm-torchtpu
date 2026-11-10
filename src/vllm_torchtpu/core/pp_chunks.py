@@ -252,8 +252,7 @@ class StepCostModel:
             return float(tokens)
         attn_pairs = float(tokens) * max(prefix, 0) + float(tokens) * tokens / 2.0
         return (
-            float(tokens)
-            + (self.attn_ms_per_token_pair / linear_per_tok) * attn_pairs
+            float(tokens) + (self.attn_ms_per_token_pair / linear_per_tok) * attn_pairs
         )
 
     def chunk(
