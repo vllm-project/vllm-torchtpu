@@ -58,6 +58,7 @@ from vllm_torchtpu.layers.adapter.gdn_linear import (
 )
 from vllm_torchtpu.layers.adapter.linear_common import KEEP_VLLM_LAYOUT_ATTR
 from vllm_torchtpu.layers.core.gdn_attention import (
+    QWEN3_5_GDN_COPY_ARCHITECTURES,
     run_jax_gdn_attention,
     run_jax_gdn_attention_pcp_tp_prefill,
     run_jax_gdn_attention_pooled,
@@ -359,6 +360,22 @@ def _localize_gdn_mamba_spec_for_pcp(
 # (and re-lowered) the identical kernel for every layer at every compile bucket.
 _shared_gdn_ops: dict[tuple, Any] = {}
 _shared_gdn_op_ids = itertools.count()
+
+
+def _split_ba(
+    layer: QwenGatedDeltaNetAttention, ba: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Split in_proj_ba's output into the b and a halves.
+
+    The Qwen3.5 MoE architectures pass the halves as chunk views, because the
+    Qwen3.5 GDN kernel pads and stacks them itself (two fewer copies per GDN
+    layer per step). Every other architecture keeps main's contiguous copies.
+    The layer's own model config decides, as it does for the kernel choice.
+    """
+    b, a = ba.chunk(2, dim=-1)
+    if layer.model_config.architecture in QWEN3_5_GDN_COPY_ARCHITECTURES:
+        return b, a
+    return b.contiguous(), a.contiguous()
 
 
 def _get_shared_gdn_op(kind: str, key: tuple, build: Callable[[str], Any]) -> Any:
@@ -1173,7 +1190,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         assert gdn_pooled_pcp_op is not None
         qkvz_weight, qkvz_weight_scale = self._require_pcp_projection_parameters()
         ba, _ = self.in_proj_ba(hidden_states)
-        b, a = ba.chunk(2, dim=-1)
+        b, a = _split_ba(self, ba)
 
         state_indices = attn_metadata.mamba_state_indices
         assert state_indices is not None
@@ -1232,7 +1249,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             ba, _ = self.in_proj_ba(hidden_states)
             z, _ = self.in_proj_z(hidden_states)
             z = z.reshape(z.size(0), -1, self.head_v_dim)
-            b, a = ba.chunk(2, dim=-1)
+            b, a = _split_ba(self, ba)
         else:
             mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
             ba, _ = self.in_proj_ba(hidden_states)
@@ -1244,7 +1261,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             z_size = self.value_dim // self.tp_size
             mixed_qkv, z = mixed_qkvz.split([qkv_size, z_size], dim=-1)
             z = z.reshape(z.size(0), -1, self.head_v_dim)
-            b, a = ba.chunk(2, dim=-1)
+            b, a = _split_ba(self, ba)
         return mixed_qkv, z, b, a
 
     def forward_projected(
