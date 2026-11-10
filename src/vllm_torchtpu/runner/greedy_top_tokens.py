@@ -343,7 +343,7 @@ def _quantized_head_local_max(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute ``(local_max_vals, local_max_indices)`` for a ``W8A8``
     quantized ``lm_head``."""
-    pad_buf = getattr(lm_head, "num_org_vocab_padding", None)
+    pad_buf: Any = getattr(lm_head, "num_org_vocab_padding", None)
     num_pad_int = int(
         getattr(
             getattr(lm_head, "shard_indices", None),
@@ -462,7 +462,7 @@ def tpu_get_top_tokens(
     if self.scale != 1.0:
         logits = logits * self.scale
 
-    pad_buf = getattr(lm_head, "num_org_vocab_padding", None)
+    pad_buf: Any = getattr(lm_head, "num_org_vocab_padding", None)
     if isinstance(pad_buf, torch.Tensor) and (
         getattr(self, "vocab_size", 0) < getattr(self, "padded_vocab_size", 0)
     ):
@@ -568,7 +568,7 @@ def _quantized_head_local_topk(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute ``(local_topk_vals, local_topk_indices)`` of shape ``[rows, 32]``
     for a ``W8A8`` quantized ``lm_head``."""
-    pad_buf = getattr(lm_head, "num_org_vocab_padding", None)
+    pad_buf: Any = getattr(lm_head, "num_org_vocab_padding", None)
     num_pad_int = int(
         getattr(
             getattr(lm_head, "shard_indices", None),
@@ -663,7 +663,7 @@ def tpu_get_topk_candidates(
         if self.scale != 1.0:
             logits = logits * self.scale
 
-        pad_buf = getattr(lm_head, "num_org_vocab_padding", None)
+        pad_buf: Any = getattr(lm_head, "num_org_vocab_padding", None)
         if isinstance(pad_buf, torch.Tensor) and (
             getattr(self, "vocab_size", 0) < getattr(self, "padded_vocab_size", 0)
         ):
@@ -725,7 +725,7 @@ def _ensure_head_shard_buffers(
     if not isinstance(head, torch.nn.Module):
         return
     if device is None:
-        weight = getattr(head, "weight", None)
+        weight: Any = getattr(head, "weight", None)
         if not isinstance(weight, torch.Tensor):
             weight = getattr(head, "_w8a8_weight_kn", None)
         device = weight.device if isinstance(weight, torch.Tensor) else None
@@ -733,7 +733,7 @@ def _ensure_head_shard_buffers(
     if shard_indices is None:
         return
     if hasattr(shard_indices, "org_vocab_start_index"):
-        existing_start = getattr(head, "org_vocab_start_index", None)
+        existing_start: Any = getattr(head, "org_vocab_start_index", None)
         if not isinstance(existing_start, torch.Tensor):
             head.register_buffer(
                 "org_vocab_start_index",
@@ -747,7 +747,7 @@ def _ensure_head_shard_buffers(
         elif existing_start.dtype != torch.int32:
             head.org_vocab_start_index = existing_start.to(torch.int32)
     if hasattr(shard_indices, "num_org_vocab_padding"):
-        existing_pad = getattr(head, "num_org_vocab_padding", None)
+        existing_pad: Any = getattr(head, "num_org_vocab_padding", None)
         if not isinstance(existing_pad, torch.Tensor):
             head.register_buffer(
                 "num_org_vocab_padding",
@@ -817,7 +817,7 @@ def quantize_lm_head(
         return head
 
     parsed_mode = _parse_lm_head_quant(mode)
-    w = weight if weight is not None else getattr(head, "weight", None)
+    w: Any = weight if weight is not None else getattr(head, "weight", None)
     if not isinstance(w, torch.Tensor) or w.ndim != 2:
         if in_place:
             return head
