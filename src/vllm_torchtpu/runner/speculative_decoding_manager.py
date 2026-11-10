@@ -22,6 +22,7 @@ from vllm.v1.outputs import DraftTokenIds
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
+from vllm_torchtpu.spec_decode.ngram_device import DeviceNgramProposer
 
 if TYPE_CHECKING:
     from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
@@ -130,7 +131,8 @@ class SpeculativeDecodingManager:
 
         `drafts` is either one exact `[num_reqs, K]` tensor (eagle3) or one
         bucketed `[rows, K]` tensor per chunk with `real_lens` giving each
-        chunk's real request count (bucketed-draft proposer, dflash/dspark).
+        chunk's real request count (bucketed-draft proposer: dflash, dspark,
+        ngram_gpu).
         Padded chunks are copied whole and trimmed on the host, so the copy's
         shapes stay bucketed.
         """
@@ -170,8 +172,9 @@ class SpeculativeDecodingManager:
         ``device_seed`` (prefill / non-spec step); ``return_device`` — the
         scheduling mode — only selects the return form (async: raw device
         tensor for the substitution assemblers; sync: host list cached for
-        ``take_draft_token_ids``). ngram has no device path and passes
-        host-materialized ``sampled_token_ids`` from the sync block instead.
+        ``take_draft_token_ids``). The host ngram proposer has no device path
+        and passes host-materialized ``sampled_token_ids`` from the sync block
+        instead; ngram_gpu is its device form.
         See ``Eagle3Proposer.propose`` for what each seed kwarg means.
 
         Args:
@@ -231,7 +234,7 @@ class SpeculativeDecodingManager:
                 sampled_token_ids[:num_reqs] if sampled_token_ids else sampled_token_ids
             )
             discard = discard_sampled_tokens_req_indices or []
-            if isinstance(drafter, DFlashProposer):
+            if isinstance(drafter, (DFlashProposer, DeviceNgramProposer)):
                 # Bucketed drafters take one seed tensor per chunk.
                 assert device_seed is None or isinstance(device_seed, list)
                 result = drafter.propose(

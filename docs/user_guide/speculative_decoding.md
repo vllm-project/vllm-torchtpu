@@ -10,7 +10,7 @@ Speculative decoding accelerates token generation (reducing median TPOT and end-
 | **Multi-Token Prediction (MTP)** | `"mtp"` (or `"qwen3_next_mtp"`) | Built into checkpoint (`Qwen3.5`, `DeepSeek-V3/R1`, `GLM-5`) | Models trained with native MTP heads; zero external draft model management. |
 | **DFlash** | `"dflash"` | Yes (`z-lab/*-DFlash-*`) | Block-diffusion draft heads proposing up to 16 tokens in a single forward pass (`Qwen3`, `Qwen3.5`). |
 | **DSpark** | `"dspark"` | Yes (`deepseek-ai/dspark_*`, `Inferact/Kimi-K3-DSpark`), or built into the checkpoint (`DeepSeek-V4`) | Semi-autoregressive parallel block drafting (DFlash-style non-causal block forward conditioned on target auxiliary hidden states, followed by a sequential Markov head) (`Qwen3`, `DeepSeek-V4`, `Kimi-K3`); optional adaptive verification. |
-| **N-Gram** | `"ngram"` | No | Prompts with repetitive structure, code edits, citations, or RAG extraction. |
+| **N-Gram** | `"ngram"`, or `"ngram_gpu"` under async scheduling | No | Prompts with repetitive structure, code edits, citations, or RAG extraction. |
 | **Suffix Decoding** | `"suffix"` | No | Speculating from a suffix tree built over prompt and prior responses. |
 
 ---
@@ -118,6 +118,19 @@ vllm serve meta-llama/Llama-3.1-8B-Instruct \
   --tensor-parallel-size 2 \
   --speculative-config '{
     "method": "ngram",
+    "num_speculative_tokens": 5,
+    "prompt_lookup_max": 4
+  }'
+```
+
+`"ngram"` drafts on the host from the committed tokens, which async scheduling holds back a step, so it requires `--no-async-scheduling`. `"ngram_gpu"` applies the same matching rule on the TPU to each step's sampled tokens, so it keeps async scheduling (and requires it). It holds each request slot's token history in HBM, 4 bytes per `--max-model-len` token per slot.
+
+```bash
+vllm serve meta-llama/Llama-3.1-8B-Instruct \
+  --tensor-parallel-size 2 \
+  --async-scheduling \
+  --speculative-config '{
+    "method": "ngram_gpu",
     "num_speculative_tokens": 5,
     "prompt_lookup_max": 4
   }'

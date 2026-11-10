@@ -42,6 +42,7 @@ from packaging import version
 from vllm.config import (
     CUDAGraphMode,
     ParallelConfig,
+    SpeculativeConfig,
     VllmConfig,
     get_layers_from_vllm_config,
     set_current_vllm_config,
@@ -214,6 +215,7 @@ from vllm_torchtpu.spec_decode.adaptive_verification import (
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 from vllm_torchtpu.spec_decode.dspark import DSparkProposer
 from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
+from vllm_torchtpu.spec_decode.ngram_device import DeviceNgramProposer
 from vllm_torchtpu.spec_decode.utils import (
     DraftChunkInputs,
     fit_rows,
@@ -694,6 +696,29 @@ def _find_topk_indices_buffer(model: torch.nn.Module) -> torch.Tensor | None:
     return next(iter(found.values()))
 
 
+@contextmanager
+def _base_runner_sees_host_ngram(
+    speculative_config: SpeculativeConfig | None,
+) -> Iterator[None]:
+    """Shows `ngram_gpu` to the GPUModelRunner code inside as `ngram`.
+
+    The base runner keys its CUDA n-gram path on `use_ngram_gpu()`: `__init__`
+    builds and runs `NgramProposerGPU` and allocates its CUDA events and
+    buffers, and `_update_states` trims each step's scheduled drafts to a
+    count only that path writes. The TPU runner drafts with
+    `DeviceNgramProposer` instead, so the base takes its host-ngram path,
+    whose transient `NgramProposer` `_init_speculative_decoding` replaces.
+    """
+    if speculative_config is None or not speculative_config.use_ngram_gpu():
+        yield
+        return
+    speculative_config.method = "ngram"
+    try:
+        yield
+    finally:
+        speculative_config.method = "ngram_gpu"
+
+
 # Recompilation-avoidance contract:
 #   1. Input prep happens on CPU; H2D via `cpu_tensor.to(xla_device)`.
 #   2. Forward is split into 4 `@torch.compile(backend="tpu")` subgraphs
@@ -703,7 +728,9 @@ def _find_topk_indices_buffer(model: torch.nn.Module) -> torch.Tensor | None:
 #      compiled before the first real request.
 class TPUModelRunner(GPUModelRunner):
     # pyrefly: ignore[bad-override-mutable-attribute]
-    drafter: NgramProposer | DFlashProposer | Eagle3Proposer | None
+    drafter: (
+        NgramProposer | DFlashProposer | Eagle3Proposer | DeviceNgramProposer | None
+    )
     # pyrefly: ignore[bad-override-mutable-attribute]
     rejection_sampler: RejectionSampler | None
     # pyrefly: ignore[bad-override-mutable-attribute]
@@ -720,9 +747,11 @@ class TPUModelRunner(GPUModelRunner):
     _tp_rank0_confidence_mask: torch.Tensor | None = None
 
     @property
-    def _async_drafter(self) -> DFlashProposer | Eagle3Proposer:
+    def _async_drafter(self) -> DFlashProposer | Eagle3Proposer | DeviceNgramProposer:
         drafter = self.drafter
-        assert isinstance(drafter, (DFlashProposer, Eagle3Proposer))
+        assert isinstance(
+            drafter, (DFlashProposer, Eagle3Proposer, DeviceNgramProposer)
+        )
         return drafter
 
     @staticmethod
@@ -741,7 +770,8 @@ class TPUModelRunner(GPUModelRunner):
 
     @property
     def _is_async_drafter(self) -> bool:
-        """Whether this worker runs a hidden-state drafter.
+        """Whether this worker drafts on device from the step's sampled tokens:
+        a hidden-state drafter, or the device n-gram drafter.
 
         Under a pipeline only the last stage samples, so only it hosts the
         draft; the other stages hand their hidden states on and never draft.
@@ -750,7 +780,7 @@ class TPUModelRunner(GPUModelRunner):
             return False
         return (
             self.speculative_config.use_eagle()
-            or self.speculative_config.method == "dflash"
+            or self.speculative_config.method in ("dflash", "ngram_gpu")
         )
 
     @property
@@ -826,7 +856,10 @@ class TPUModelRunner(GPUModelRunner):
             normalize_draft_config(
                 vllm_config.speculative_config.draft_model_config.hf_config
             )
-        with _torch_tpu_wrapper():
+        with (
+            _torch_tpu_wrapper(),
+            _base_runner_sees_host_ngram(vllm_config.speculative_config),
+        ):
             super().__init__(vllm_config, device)
         self.pcp_manager = pcp_manager
         self.sequence_layout_planner = sequence_layout_planner
@@ -1489,6 +1522,8 @@ class TPUModelRunner(GPUModelRunner):
             )
             if self.speculative_config.method == "ngram":
                 self.drafter = NgramProposer(self.vllm_config)
+            elif self.speculative_config.use_ngram_gpu():
+                self.drafter = DeviceNgramProposer(self, self.vllm_config)
             elif self.speculative_config.method == "dflash":
                 self.drafter = DFlashProposer(self, self.vllm_config)
             elif self.speculative_config.method == "dspark":
@@ -2932,7 +2967,8 @@ class TPUModelRunner(GPUModelRunner):
             if use_page_local_copy or use_dense_copy
             else scheduler_output
         )
-        result = super()._update_states(base_output)
+        with _base_runner_sees_host_ngram(self.speculative_config):
+            result = super()._update_states(base_output)
         self._min_tokens.discard(scheduler_output.finished_req_ids)
         for new_req in scheduler_output.scheduled_new_reqs:
             self._min_tokens.add(new_req.req_id, new_req.sampling_params)
@@ -8791,7 +8827,9 @@ class TPUModelRunner(GPUModelRunner):
                 cleanup_succeeded = False
                 logger.exception("spec-decode warmup draft cleanup failed")
         try:
-            if isinstance(self.drafter, (DFlashProposer, Eagle3Proposer)):
+            if isinstance(
+                self.drafter, (DFlashProposer, Eagle3Proposer, DeviceNgramProposer)
+            ):
                 self.drafter.draft_chunks = None
         except Exception:
             cleanup_succeeded = False

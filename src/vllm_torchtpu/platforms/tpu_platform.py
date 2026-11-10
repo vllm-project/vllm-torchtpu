@@ -1072,16 +1072,24 @@ class TpuPlatform(Platform):
         is_attention_free = (
             model_config.is_attention_free if model_config is not None else False
         )
-        if (
-            vllm_config.speculative_config is not None
-            and scheduler_config.async_scheduling
-        ):
-            method = vllm_config.speculative_config.method
-            if not vllm_config.speculative_config.use_eagle():
-                # Ngram needs the sampled tokens on the host, which async defers.
+        if speculative_config is not None:
+            method = speculative_config.method
+            ngram_gpu = speculative_config.use_ngram_gpu()
+            if scheduler_config.async_scheduling and not (
+                speculative_config.use_eagle() or ngram_gpu
+            ):
+                # The host ngram proposer needs the sampled tokens on the host,
+                # which async defers; ngram_gpu drafts them on device.
                 raise NotImplementedError(
                     f"Async scheduling with speculative method '{method}' is "
-                    "not supported on TPU; Run with async_scheduling=False."
+                    "not supported on TPU; Run with async_scheduling=False, or "
+                    "use method 'ngram_gpu' in place of 'ngram'."
+                )
+            if not scheduler_config.async_scheduling and ngram_gpu:
+                raise NotImplementedError(
+                    "Speculative method 'ngram_gpu' drafts on device for async "
+                    "scheduling only; enable async scheduling, or use method "
+                    "'ngram' with async_scheduling=False."
                 )
         # Real hybrid prefix hits need pooled Mamba state seed copies.
         # DecodeBench installs synthetic state for each request instead.

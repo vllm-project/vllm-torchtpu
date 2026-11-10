@@ -25,6 +25,7 @@ from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpeculativeDecodingManager,
 )
 from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
+from vllm_torchtpu.spec_decode.ngram_device import DeviceNgramProposer
 
 
 @pytest.mark.tpu_test
@@ -103,14 +104,16 @@ def test_speculative_decoding_manager_metadata_indices(device):
     assert torch.equal(metadata.group_indices, expected_group_indices)
 
 
-def _make_manager_with_eagle3_drafter(num_reqs=2, dynamic_sd=False):
+def _make_manager_with_eagle3_drafter(
+    num_reqs=2, dynamic_sd=False, drafter_cls=Eagle3Proposer, method="eagle3"
+):
     mock_runner = MagicMock()
     mock_runner.input_batch.num_reqs = num_reqs
-    mock_runner.speculative_config.method = "eagle3"
+    mock_runner.speculative_config.method = method
     mock_runner.speculative_config.uses_dynamic_speculative_decoding.return_value = (
         dynamic_sd
     )
-    mock_drafter = MagicMock(spec=Eagle3Proposer)
+    mock_drafter = MagicMock(spec=drafter_cls)
     mock_runner.drafter = mock_drafter
     mock_runner._async_drafter = mock_drafter
     manager = SpeculativeDecodingManager(mock_runner)
@@ -222,11 +225,22 @@ def test_propose_draft_token_ids_async_spec_returns_device_tensor():
     assert kwargs["device_seed"] is None
 
 
-def test_propose_draft_token_ids_async_bootstrap_returns_device_tensor():
-    manager, _, mock_drafter = _make_manager_with_eagle3_drafter(num_reqs=1)
+@pytest.mark.parametrize(
+    ("drafter_cls", "method", "seed"),
+    [
+        (Eagle3Proposer, "eagle3", torch.tensor([7])),
+        # Bucketed drafters take one seed tensor per chunk.
+        (DeviceNgramProposer, "ngram_gpu", [torch.tensor([7, 0])]),
+    ],
+)
+def test_propose_draft_token_ids_async_bootstrap_returns_device_tensor(
+    drafter_cls, method, seed
+):
+    manager, _, mock_drafter = _make_manager_with_eagle3_drafter(
+        num_reqs=1, drafter_cls=drafter_cls, method=method
+    )
     device_tensor = torch.ones((1, 2))
     mock_drafter.propose.return_value = device_tensor
-    seed = torch.tensor([7])
 
     result = manager.propose_draft_token_ids(
         sampled_token_ids=[],

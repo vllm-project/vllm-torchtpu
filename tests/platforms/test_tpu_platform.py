@@ -28,6 +28,7 @@ from vllm.config import (
     LoRAConfig,
     ModelConfig,
     ParallelConfig,
+    SpeculativeConfig,
     VllmConfig,
 )
 from vllm.config.compilation import DynamicShapesType
@@ -429,6 +430,41 @@ class TestTpuPlatform:
         vllm_config.speculative_config = MagicMock(rejection_sample_method=method)
         with pytest.raises(NotImplementedError, match="rejection_sample_method"):
             TpuPlatform.check_and_update_config(vllm_config)
+
+    @pytest.mark.parametrize(
+        ("method", "async_scheduling", "message"),
+        [
+            ("ngram", True, "Async scheduling with speculative method 'ngram'"),
+            ("ngram_gpu", True, None),
+            ("ngram_gpu", False, "async scheduling only"),
+        ],
+    )
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_check_and_update_config_pairs_ngram_with_scheduling(
+        self,
+        mock_prepare_env,
+        mock_apply_patches,
+        vllm_config,
+        method,
+        async_scheduling,
+        message,
+    ):
+        """The host ngram drafter needs sync scheduling, the device one async."""
+        spec = MagicMock(spec=SpeculativeConfig)
+        spec.method = method
+        spec.rejection_sample_method = "standard"
+        spec.use_eagle.return_value = False
+        spec.use_ngram_gpu.return_value = method == "ngram_gpu"
+        vllm_config.speculative_config = spec
+        vllm_config.scheduler_config.async_scheduling = async_scheduling
+        if message is None:
+            TpuPlatform.check_and_update_config(vllm_config)
+        else:
+            with pytest.raises(NotImplementedError, match=message):
+                TpuPlatform.check_and_update_config(vllm_config)
 
     @pytest.mark.parametrize(
         ("mamba_cache_mode", "speculative_config", "async_scheduling", "message"),

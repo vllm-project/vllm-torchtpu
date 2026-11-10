@@ -418,6 +418,7 @@ def test_update_states_tracks_new_requests_and_forgets_finished_ones():
     runner._free_mamba_slots, runner._mamba_offset_seeded = [], set()
     runner._pre_async_results = None
     runner.requests = {}
+    runner.speculative_config = None
     runner._install_spec_token_room_guard = lambda: None
     new_req = SimpleNamespace(
         req_id="new", sampling_params=SamplingParams(min_tokens=2, stop_token_ids=[9])
@@ -451,6 +452,7 @@ def test_update_states_keeps_preempted_and_resumed_requests():
     runner._free_mamba_slots, runner._mamba_offset_seeded = [], set()
     runner._pre_async_results = None
     runner.requests = {}
+    runner.speculative_config = None
     runner._install_spec_token_room_guard = lambda: None
     for preempted, resumed in (({"p"}, set()), (None, {"p"})):
         scheduler_output = SimpleNamespace(
