@@ -315,6 +315,38 @@ def test_runner_step_choice():
     assert not spec._greedy_top_tokens_this_step()
 
 
+
+def test_runner_topk_candidates_step_choice(monkeypatch):
+    from vllm_torchtpu import envs
+
+    sampled = SamplingParams(temperature=0.6, top_k=20)
+    runner = _runner(torch.zeros(8, 2))
+    runner.input_batch, runner.requests = _batch(sampled)
+    # Main's default (no candidate blocks) keeps the full logits.
+    monkeypatch.setattr(envs, "TPU_SAMPLER_TOPK_CANDIDATES", 0)
+    assert not runner._topk_candidates_this_step()
+
+    monkeypatch.setattr(envs, "TPU_SAMPLER_TOPK_CANDIDATES", 40)
+    assert runner._topk_candidates_this_step()
+
+    # A request below min_tokens needs the full logits to mask its stops.
+    runner._min_tokens.add(
+        "r0",
+        SamplingParams(temperature=0.6, top_k=20, min_tokens=4, stop_token_ids=[2]),
+    )
+    assert not runner._topk_candidates_this_step()
+    runner._min_tokens = min_tokens.MinTokensTracker()
+    assert runner._topk_candidates_this_step()
+
+    # A LoRA lm_head: the candidates would drop its delta.
+    runner._greedy_head_owner = _lora_owner(monkeypatch)
+    assert not greedy_top_tokens.topk_candidates_supported(runner._greedy_head_owner)
+    assert not runner._topk_candidates_this_step()
+
+    runner._greedy_head_owner = None
+    assert not runner._topk_candidates_this_step()
+
+
 K = 3
 
 
