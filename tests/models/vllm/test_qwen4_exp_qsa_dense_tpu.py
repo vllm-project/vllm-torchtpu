@@ -24,6 +24,14 @@ import torch.nn.functional as F
 from qwen4_exp_test_utils import q4exp_text_config, qsa_test_pools
 
 
+@pytest.fixture(autouse=True)
+def isolate_dynamo_model_caches():
+    """Independent model tests must not exhaust one shared forward's cache."""
+    torch._dynamo.reset()
+    yield
+    torch._dynamo.reset()
+
+
 def _dense_step(hidden, weights, positions, prior, fp8):
     """CPU-only oracle: no production QSA producer, indexer or attention helper."""
     dim, heads = 128, 2
