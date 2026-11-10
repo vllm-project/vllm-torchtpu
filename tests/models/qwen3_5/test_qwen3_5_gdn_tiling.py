@@ -343,6 +343,8 @@ def test_the_decode_tile_override_reaches_the_kernel():
         (16, 64, 2, True),
         (2, 8, 4, False),
         (8, 32, 1, False),
+        # TP4 (16 value heads per rank) stays below the threshold.
+        (4, 16, 4, False),
     ],
 )
 def test_the_fused_1dot_rule(n_kq, n_v, window, fused):
