@@ -2830,6 +2830,7 @@ def _dummy_run_stand_in(monkeypatch, forward_model):
 
     runner = SimpleNamespace(
         device=torch.device("cpu"),
+        model_adapter=None,
         max_model_len=64,
         max_num_tokens=64,
         max_num_reqs=4,

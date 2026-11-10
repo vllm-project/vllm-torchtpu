@@ -305,6 +305,7 @@ def test_execute_step_snapshots_after_reorder_and_forwards_substituted_ids(
     monkeypatch.setattr(tpu_runner.dist_utils, "get_raiden_inline_load", lambda: False)
     runner = NS(
         execute_model_state=None,
+        _adaptive_verification=None,
         _pp_wave=None,
         _mtp_prefill_only=False,
         scheduler_config=NS(async_scheduling=False),
@@ -338,6 +339,9 @@ def test_execute_step_snapshots_after_reorder_and_forwards_substituted_ids(
     )
     runner._any_decode = lambda scheduled: tpu_runner.TPUModelRunner._any_decode(
         cast(tpu_runner.TPUModelRunner, runner), scheduled
+    )
+    runner._readmit_trimmed_drafts = (
+        tpu_runner.TPUModelRunner._readmit_trimmed_drafts.__get__(runner)
     )
     scheduler = NS(total_num_scheduled_tokens=4, scheduled_encoder_inputs={})
     with pytest.raises(ForwardReached):
