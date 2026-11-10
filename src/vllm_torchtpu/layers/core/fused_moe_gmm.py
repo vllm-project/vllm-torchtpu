@@ -23,6 +23,13 @@ from vllm_torchtpu.kernels.experimental.moe_dense_expert import (
     can_use_dense_expert,
     dense_expert_moe,
 )
+from vllm_torchtpu.kernels.experimental.moe_lowtok import (
+    can_use_moe_lowtok,
+    moe_lowtok,
+)
+from vllm_torchtpu.kernels.experimental.moe_lowtok import (
+    routing_table as moe_lowtok_routing_table,
+)
 from vllm_torchtpu.kernels.megablox.gmm_v2 import get_packing_factor, gmm_v2
 from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
     blockwise_onehot_unpermute,
@@ -93,6 +100,9 @@ _COUNTING_SORT_BLOCK = 512
 # Ragged permute keeps the packed sort so SparseCore gather overlap is
 # unchanged, and past one block the scatter costs more than that sort.
 _COUNTING_SORT_SCATTER_MAX_ROWS = _COUNTING_SORT_BLOCK
+_MOE_LOWTOK = envs.TPU_MOE_LOWTOK
+_MOE_LOWTOK_IDS = envs.TPU_MOE_LOWTOK_IDS
+_MOE_LOWTOK_MAX_TOKENS = envs.TPU_MOE_LOWTOK_MAX_TOKENS
 
 
 def resolve_onehot_permute_threshold() -> int:
@@ -751,6 +761,31 @@ def fused_moe_func(
         valid = (local_ids >= 0) & (local_ids < w1.shape[0])
         topk_weights = jnp.where(valid, topk_weights, jnp.zeros_like(topk_weights))
         topk_ids = jnp.where(valid, local_ids, jnp.full_like(local_ids, -1))
+
+    if (
+        _MOE_LOWTOK
+        and _MOE_LOWTOK_IDS
+        and use_ep
+        and experts_start is not None
+        and 0 < num_tokens <= _MOE_LOWTOK_MAX_TOKENS
+        and can_use_moe_lowtok(
+            hidden_states,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            w1_bias,
+            w2_bias,
+            activation=activation,
+            rhs_quant_dtype=rhs_quant_dtype,
+        )
+    ):
+        logger.info_once(
+            "Selected experimental small-batch MoE (max tokens %d)",
+            _MOE_LOWTOK_MAX_TOKENS,
+        )
+        route = moe_lowtok_routing_table(topk_ids, topk_weights, w1.shape[0])
+        return moe_lowtok(hidden_states, route, w1, w1_scale, w2, w2_scale)
 
     # Decode services also compile large prefill buckets. Apply the token
     # threshold before kernel admission so those buckets retain routed GMM.
