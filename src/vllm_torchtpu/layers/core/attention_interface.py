@@ -391,8 +391,14 @@ def sharded_ragged_paged_attention(
     kv_block_cap: int | None = None,
     use_causal_mask: bool = True,
     kv_layout: batched_rpa_configs.KVLayout | None = None,
+    chunk_prefill_size: int | None = None,
 ):
-    """Shards along KV heads."""
+    """Shards along KV heads.
+
+    `chunk_prefill_size` enables RPA v3's fixed-length PREFILL stage for the
+    requests in [distribution[0], distribution[1]); each must hold exactly that
+    many query tokens. RPA v3 skips those requests when it is None.
+    """
 
     qkv_spec = P(None, "model", None)
     use_hd64 = q.shape[-1] == 64
@@ -419,6 +425,10 @@ def sharded_ragged_paged_attention(
     args = (q, k, v, kv_cache, kv_lens, page_indices, cu_q_lens, distribution)
 
     if use_hd64:
+        if chunk_prefill_size is not None:
+            raise NotImplementedError(
+                "chunk_prefill_size is not supported by the hd64 RPA kernel"
+            )
         # Batched RPA has no hd64 variant; head_dim==64 always uses default.
         func = functools.partial(
             ragged_paged_attention_hd64, strict_sliding_window=True
@@ -463,8 +473,10 @@ def sharded_ragged_paged_attention(
 
         block_kwargs["d_block_sizes"] = _capped(rpa_default.RpaCase.DECODE)
         block_kwargs["m_block_sizes"] = _capped(rpa_default.RpaCase.MIXED)
-        if attention_chunk_size is not None:
+        if attention_chunk_size is not None or chunk_prefill_size is not None:
             block_kwargs["p_block_sizes"] = _capped(rpa_default.RpaCase.PREFILL)
+    if chunk_prefill_size is not None:
+        block_kwargs["chunk_prefill_size"] = chunk_prefill_size
 
     def _ragged_paged_attention(*args):
         return func(
@@ -643,6 +655,7 @@ def attention(
     kv_block_cap: int | None = None,
     use_causal_mask: bool = True,
     kv_layout: batched_rpa_configs.KVLayout | None = None,
+    chunk_prefill_size: int | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     # T: seq_len
     # N: num_heads
@@ -688,6 +701,7 @@ def attention(
         shard=shard,
         kv_block_cap=kv_block_cap,
         use_causal_mask=use_causal_mask,
+        chunk_prefill_size=chunk_prefill_size,
     )
 
     return kv_cache, output

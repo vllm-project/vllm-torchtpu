@@ -16,7 +16,7 @@ import dataclasses
 import functools
 import inspect
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any, ClassVar, cast
 
 import jax
@@ -245,6 +245,7 @@ def _pallas_rpa_kernel_impl(
     use_causal_mask: bool = True,
     kv_layout: batched_rpa_configs.KVLayout | None = None,
     block_major: bool = False,
+    chunk_prefill_size: int | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     pool_shape = kv_cache.shape
     # Fold the block-major pool's `(num_blocks, rows_per_block, *page)` layout so
@@ -314,6 +315,7 @@ def _pallas_rpa_kernel_impl(
         kv_block_cap=kv_block_cap,
         use_causal_mask=use_causal_mask,
         kv_layout=kv_layout,
+        chunk_prefill_size=chunk_prefill_size,
     )
     if len(pool_shape) == 4:
         # A 4-D pool is never block-major, so the ndim == 4 branch set this.
@@ -347,6 +349,7 @@ def _pallas_rpa_kernel_default(
     skip_kv_update: bool,
     use_causal_mask: bool = True,
     block_major: bool = False,
+    chunk_prefill_size: int | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Default Pallas RPA kernel entry — used by `PallasAttentionBackendImpl`.
 
@@ -374,6 +377,7 @@ def _pallas_rpa_kernel_default(
         soft_cap=soft_cap,
         use_causal_mask=use_causal_mask,
         block_major=block_major,
+        chunk_prefill_size=chunk_prefill_size,
     )
 
 
@@ -404,6 +408,7 @@ def _pallas_rpa_kernel_local(
     soft_cap: float | None = None,
     skip_kv_update: bool,
     use_causal_mask: bool = True,
+    chunk_prefill_size: int | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Local (non-shard_map) RPA entry for the tp=1 eagle3 draft.
 
@@ -434,6 +439,7 @@ def _pallas_rpa_kernel_local(
         shard=False,
         kv_block_cap=_DRAFT_KV_BLOCK_CAP,
         use_causal_mask=use_causal_mask,
+        chunk_prefill_size=chunk_prefill_size,
     )
 
 
@@ -816,6 +822,14 @@ class PallasAttentionBackendImpl(AttentionImpl):
     )
     _kernel_op_prefix: ClassVar[str] = "pallas::rpa_kernel"
     decode_query_size: int = 1
+    # Query tokens per request in RPA v3's fixed-length PREFILL stage. Set by a
+    # speculative drafter whose forward holds exactly this many queries per
+    # request (DFlash: one draft block). None leaves the stage out of the
+    # kernel, and RPA v3 then skips requests routed to it.
+    chunk_prefill_size: int | None = None
+    # What the last-built layer-major kernel actually got: only RPA v3 entries
+    # take chunk_prefill_size. Routing must check this, not the request above.
+    _rpa_kernel_chunk_prefill_size: int | None = None
 
     # Bundled (block-major) RPA kernel entry: accepts the full KV cache bundle
     # and a dynamic scalar layer_idx. Registered under a dedicated prefix to avoid
@@ -927,6 +941,20 @@ class PallasAttentionBackendImpl(AttentionImpl):
         cls._kernel_instance_counter += 1
         return kernel_instance_id
 
+    def _kernel_chunk_prefill_size(
+        self, use_pcp_streaming: bool, entry_params: Mapping[str, Any]
+    ) -> int | None:
+        """The chunk_prefill_size the layer-major kernel gets: only RPA v3
+        entries declare it (`entry_params` is the entry's signature), and hd64
+        reroutes to a kernel without the PREFILL stage."""
+        if (
+            use_pcp_streaming
+            or self.head_size == 64
+            or "chunk_prefill_size" not in entry_params
+        ):
+            return None
+        return self.chunk_prefill_size
+
     def _build_rpa_kernel(
         self,
         q_scale: float | None,
@@ -949,6 +977,11 @@ class PallasAttentionBackendImpl(AttentionImpl):
             if use_pcp_streaming
             else batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
         )
+        entry_params = inspect.signature(self._kernel_entry).parameters
+        chunk_prefill_size = self._kernel_chunk_prefill_size(
+            use_pcp_streaming, entry_params
+        )
+        self._rpa_kernel_chunk_prefill_size = chunk_prefill_size
         config_key = (
             self._kernel_op_prefix,
             self.sliding_window,
@@ -961,6 +994,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             pcp_kv_layout,
             self.decode_query_size,
             block_major,
+            chunk_prefill_size,
         )
         existing = self._kernel_config_cache.get(config_key)
         if existing is not None:
@@ -1003,6 +1037,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             pcp_kv_layout,
             self.decode_query_size,
             block_major,
+            chunk_prefill_size,
         )
         existing = self._kernel_registry.get(registry_key)
         if existing is not None:
@@ -1029,7 +1064,6 @@ class PallasAttentionBackendImpl(AttentionImpl):
             )
             wrapped_fn = make_pcp_streaming_rpa_kernel(**pcp_make_kwargs)
         else:
-            entry_params = inspect.signature(self._kernel_entry).parameters
             entry_kwargs: dict[str, Any] = {}
             if "kv_layout" in entry_params:
                 entry_kwargs["kv_layout"] = self.kv_layout
@@ -1043,6 +1077,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 )
             if "decode_query_size" in entry_params:
                 entry_kwargs["decode_query_size"] = self.decode_query_size
+            if chunk_prefill_size is not None:
+                entry_kwargs["chunk_prefill_size"] = chunk_prefill_size
             if block_major:
                 if "block_major" not in entry_params:
                     raise NotImplementedError(
