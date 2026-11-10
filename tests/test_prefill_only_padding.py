@@ -18,6 +18,7 @@ final prompt token (a serving crash: computed 126208, scheduled 2, prompt
 import types
 
 import numpy as np
+import pytest
 
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
@@ -75,3 +76,40 @@ def test_leaves_real_drafts_and_in_prompt_steps_alone():
     so = _so({"b": 2}, {"b": [-1]}, new=[_new("b", 100, 5000)])
     assert TPUModelRunner._strip_prefill_only_padding(_runner(), so) == 0
     assert so.num_scheduled_tokens["b"] == 2
+
+
+class _Stop(Exception):
+    pass
+
+
+def _execute_until_update_states(prefill_only):
+    """Run TPUModelRunner.execute_model on a stub runner up to _update_states,
+    the first step after the strip, and report whether the strip ran first."""
+    calls = []
+    runner = types.SimpleNamespace(
+        _pp_wave=None,
+        execute_model_state=None,
+        _adaptive_verification=None,
+        _mtp_prefill_only=prefill_only,
+        _strip_prefill_only_padding=lambda so: calls.append(("strip", so)),
+    )
+
+    def _update_states(so):
+        calls.append(("update", so))
+        raise _Stop
+
+    runner._update_states = _update_states
+    so = _so({"r": 2}, {"r": [-1]})
+    with pytest.raises(_Stop):
+        TPUModelRunner.execute_model(runner, so)
+    return calls, so
+
+
+def test_execute_model_strips_before_reading_the_step():
+    calls, so = _execute_until_update_states(prefill_only=True)
+    assert calls == [("strip", so), ("update", so)]
+
+
+def test_execute_model_does_not_strip_off_the_prefill_only_path():
+    calls, so = _execute_until_update_states(prefill_only=False)
+    assert calls == [("update", so)]
