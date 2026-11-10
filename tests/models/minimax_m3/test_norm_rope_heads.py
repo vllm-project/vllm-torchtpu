@@ -19,7 +19,7 @@ from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.rotary_embedding import get_rope
 
-from vllm_torchtpu.models.minimax_m3.attention import norm_rope_heads
+from vllm_torchtpu.models.minimax_m3.attention import neox_swap_matrix, norm_rope_heads
 
 D = 128
 
@@ -57,8 +57,12 @@ def test_matches_separate_norms_and_ropes(monkeypatch, nq, nkv):
         qkv = torch.randn(tokens, (nq + 3 * nkv + 1) * D).to(torch.bfloat16)
         positions = torch.tensor([0, 1, 5, 127, 128, 3000, 4095])
         expected = _reference(qkv, positions, nq, nkv, norms, rope)
-        got = norm_rope_heads(qkv, positions, nq, nkv, D, norms, rope)
+        swap = neox_swap_matrix(D, rope.rotary_dim, torch.bfloat16)
+        got = norm_rope_heads(qkv, positions, nq, nkv, D, norms, rope, swap)
     for name, e, g in zip(["q", "k", "v", "index_q", "index_k"], expected, got):
         assert g.shape == e.shape, name
         assert g.dtype == e.dtype, name
         assert torch.equal(g, e), name
+        # bit for bit, signed zeros included (index_q / index_k feed the
+        # indexer and the index-key cache)
+        assert torch.equal(g.view(torch.int16), e.view(torch.int16)), name

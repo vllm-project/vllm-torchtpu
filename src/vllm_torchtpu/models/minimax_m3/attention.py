@@ -203,6 +203,18 @@ def cache_dtype(cache_config: CacheConfig | None) -> torch.dtype:
     )
 
 
+def neox_swap_matrix(head_dim: int, rot: int, dtype: torch.dtype) -> torch.Tensor:
+    """``P`` with ``(x @ P)[j] = x[j + rot/2]``, ``(x @ P)[j + rot/2] = x[j]``
+    for ``j < rot/2`` and zero on the pass-through lanes: one term per
+    output, so a bf16 matmul is exact (up to the sign of a zero input)."""
+    half = rot // 2
+    p = [[0.0] * head_dim for _ in range(head_dim)]
+    for j in range(half):
+        p[j + half][j] = 1.0
+        p[j][j + half] = 1.0
+    return torch.tensor(p, dtype=dtype)
+
+
 def norm_rope_heads(
     qkv: torch.Tensor,
     positions: torch.Tensor,
@@ -211,13 +223,29 @@ def norm_rope_heads(
     head_dim: int,
     norms: tuple[GemmaRMSNorm, GemmaRMSNorm, GemmaRMSNorm, GemmaRMSNorm],
     rotary_emb: nn.Module,
+    swap: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Split ``[q | k | v | index_q | index_k]`` and norm + rotate all but v.
 
+    ``swap`` is `neox_swap_matrix` for the rotary dims, in ``qkv``'s dtype.
+
     The four Gemma RMSNorms differ only in their weights and RoPE acts on each
-    head alone, so one norm over the stacked q, k, index_q and index_k heads
-    with a per-head ``1 + w`` table, then one rotation, gives the same values
-    as four norms and two rotations in fewer, larger ops.
+    head alone, so one norm over all the stacked heads with a per-head
+    ``1 + w`` table, then one rotation, gives the same values as four norms
+    and two rotations in fewer, larger ops. The v heads go through the norm
+    and rotation too (their results are dropped and v is taken from `qkv`):
+    that avoids a concatenation that skips them, which kept XLA from fusing
+    the norm, the rotation and the pass-through lanes into one pass.
+
+    The rotation is `RotaryEmbedding.forward_static` with FP32 compute (the
+    TPU rotary op, `layers.adapter.rotary_embedding`) written without slices
+    or concatenations of the heads: ``x * cos2 + (x @ P) * sin2`` with the
+    half swap ``P`` on the MXU (exact in bf16, one term per output, as in
+    `vllm_torchtpu.omni.rope`) and ``-sin`` on the first half, the same bf16
+    cos/sin cache values and the same FP32 products and sums (``a + b * -s``
+    is ``a - b * s``), so the results are equal value for value. Only an
+    output that is exactly zero can differ, in the sign of that zero, when an
+    input lane is ``-0.0`` (the matmul sums it with ``+0.0``).
 
     Returns ``(q, k, v, index_q, index_k)`` with shapes ``[T, num_heads * D]``,
     ``[T, num_kv_heads * D]`` (x3) and ``[T, D]``.
@@ -225,14 +253,13 @@ def norm_rope_heads(
     num_tokens = qkv.shape[0]
     heads = qkv.view(num_tokens, -1, head_dim)
     nq, nkv = num_heads, num_kv_heads
-    v = heads[:, nq + nkv : nq + 2 * nkv]
-    x = torch.cat([heads[:, : nq + nkv], heads[:, nq + 2 * nkv :]], dim=1)
     q_norm, k_norm, index_q_norm, index_k_norm = norms
     weight = (
         torch.cat(
             [
                 q_norm.weight.expand(nq, head_dim),
                 k_norm.weight.expand(nkv, head_dim),
+                torch.zeros_like(k_norm.weight).expand(nkv, head_dim),
                 index_q_norm.weight.expand(nkv, head_dim),
                 index_k_norm.weight.expand(1, head_dim),
             ]
@@ -241,10 +268,24 @@ def norm_rope_heads(
     )
     eps = q_norm.variance_epsilon
     assert all(n.variance_epsilon == eps for n in norms)
-    x = ir.ops.rms_norm(x, weight, eps)
-    x, _ = rotary_emb(positions, x.reshape(num_tokens, -1), None)
-    x = x.view(num_tokens, -1, head_dim)
-    q, k, index_q, index_k = x.split([nq, nkv, nkv, 1], dim=1)
+    x = ir.ops.rms_norm(heads, weight, eps)
+
+    assert rotary_emb.is_neox_style
+    rot = rotary_emb.rotary_dim
+    cos_sin = rotary_emb._match_cos_sin_cache_dtype(x).index_select(
+        0, positions.flatten()
+    )
+    cos, sin = cos_sin.float().chunk(2, dim=-1)  # [T, rot / 2] each
+    pass_lanes = head_dim - rot
+    ones = cos.new_ones(num_tokens, pass_lanes)
+    # -0.0 on the pass-through lanes: x * 1 + (+0) * (-0) is x, signed zeros too.
+    neg_zeros = cos.new_full((num_tokens, pass_lanes), -0.0)
+    cos2 = torch.cat([cos, cos, ones], dim=-1).unsqueeze(1)
+    sin2 = torch.cat([-sin, sin, neg_zeros], dim=-1).unsqueeze(1)
+    swapped = torch.matmul(x, swap.to(x.dtype))
+    x = (x.float() * cos2 + swapped.float() * sin2).to(x.dtype)
+    q, k, _, index_q, index_k = x.split([nq, nkv, nkv, nkv, 1], dim=1)
+    v = heads[:, nq + nkv : nq + 2 * nkv]
     return (
         q.reshape(num_tokens, -1),
         k.reshape(num_tokens, -1),
@@ -314,6 +355,13 @@ class MiniMaxM3SparseAttention(nn.Module):
                 "rope_theta": config.rope_theta,
                 "partial_rotary_factor": config.partial_rotary_factor,
             },
+        )
+        self.register_buffer(
+            "rope_swap",
+            neox_swap_matrix(
+                self.head_dim, self.rotary_emb.rotary_dim, torch.get_default_dtype()
+            ),
+            persistent=False,
         )
         # With one index head per rank, each rank can keep a 1 / tp share of
         # the index keys (`kernels.msa` index-cache sharding).
@@ -410,6 +458,7 @@ class MiniMaxM3SparseAttention(nn.Module):
             self.head_dim,
             (self.q_norm, self.k_norm, self.index_q_norm, self.index_k_norm),
             self.rotary_emb,
+            self.rope_swap,
         )
 
         num_tokens = hidden_states.shape[0]
