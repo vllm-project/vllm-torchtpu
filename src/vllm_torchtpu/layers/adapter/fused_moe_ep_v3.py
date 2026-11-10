@@ -54,8 +54,7 @@ EP v3 pipeline.
 """
 
 import dataclasses
-import json
-import os
+from collections.abc import Mapping
 from typing import Any
 
 import jax
@@ -137,33 +136,56 @@ def mask_padded_rows(
     return x, gating
 
 
-def apply_config_overrides(config: Config, overrides: str) -> Config:
-    """`config` with the fields of the JSON object `overrides` replaced
-    (TPU_MOE_FUSED_EP_V3_CONFIG). Empty: `config` unchanged. An unknown
-    field or a value the Config refuses raises, so a typo cannot silently
-    run the defaults."""
+# Kernel settings beyond Config.for_shape, per Qwen3.5 decode layout
+# (data_parallel_size, tensor_parallel_size). (4, 2) is what the DP4 x TP2
+# decode legs ran: the combine over real tokens, the sort-index live mask, the
+# compact routing message, the reordered program chain, and the dense-slots
+# layer (fused, merged, skipping unrouted experts) for calls of at most
+# Config.dense_slots_max_tokens rows per shard. Other models, and other
+# layouts, keep for_shape's settings: these paths were validated on Qwen3.5
+# only.
+QWEN3_5_CONFIG_BY_LAYOUT: dict[tuple[int, int], dict[str, Any]] = {
+    (4, 2): {
+        "combine_real_tokens": True,
+        "sort_index_compare": True,
+        "compact_message": True,
+        "reorder_chain": True,
+        "dense_slots": True,
+        "dense_slots_fused": True,
+        "dense_slots_merged": True,
+        "dense_slots_skip_unrouted": True,
+    },
+}
+# The overrides prebuild_fused_moe_ep selected for this process, applied by
+# served_config; empty until then.
+_CONFIG_OVERRIDES: dict[str, Any] = {}
+
+
+def layout_overrides(vllm_config: Any) -> dict[str, Any]:
+    """The Qwen3.5 layout table's entry for this engine: empty for another
+    model, a layout without an entry, or no engine config."""
+    from vllm_torchtpu.layers.adapter import sequence_parallel
+    from vllm_torchtpu.models.qwen3_5 import settings as qwen3_5_settings
+
+    model_config = getattr(vllm_config, "model_config", None)
+    if model_config is None or not qwen3_5_settings.is_qwen3_5(model_config):
+        return {}
+    layout = sequence_parallel.parallel_layout(
+        getattr(vllm_config, "parallel_config", None)
+    )
+    return dict(QWEN3_5_CONFIG_BY_LAYOUT.get(layout, {})) if layout else {}
+
+
+def apply_config_overrides(config: Config, overrides: Mapping[str, Any]) -> Config:
+    """`config` with the named fields replaced. Empty: `config` unchanged. An
+    unknown field, or a value the Config refuses, raises."""
     if not overrides:
         return config
-    fields = json.loads(overrides)
-    if not isinstance(fields, dict):
-        raise ValueError(
-            f"TPU_MOE_FUSED_EP_V3_CONFIG={overrides!r}: a JSON object of Config fields"
-        )
     known = {f.name for f in dataclasses.fields(Config)}
-    unknown = sorted(set(fields) - known)
+    unknown = sorted(set(overrides) - known)
     if unknown:
-        raise ValueError(f"TPU_MOE_FUSED_EP_V3_CONFIG: unknown Config fields {unknown}")
-    if "row_scale_dtype" in fields:
-        fields["row_scale_dtype"] = jnp.dtype(fields["row_scale_dtype"]).type
-    return dataclasses.replace(config, **fields)
-
-
-def tile_rows() -> int:
-    """The FFN tile height: TPU_MOE_FUSED_EP_V3_TILE_ROWS (default TILE_ROWS)."""
-    rows = int(envs.TPU_MOE_FUSED_EP_V3_TILE_ROWS or TILE_ROWS)
-    if rows <= 0 or rows % 8:
-        raise ValueError(f"TPU_MOE_FUSED_EP_V3_TILE_ROWS={rows}: a positive multiple of 8")
-    return rows
+        raise ValueError(f"fused EP v3: unknown Config fields {unknown}")
+    return dataclasses.replace(config, **overrides)
 
 
 def served_config(
@@ -174,7 +196,7 @@ def served_config(
     config = Config.for_shape(
         hidden=hidden, inter=inter, experts_per_shard=experts_per_shard, top_k=top_k
     )
-    config = apply_config_overrides(config, envs.TPU_MOE_FUSED_EP_V3_CONFIG)
+    config = apply_config_overrides(config, _CONFIG_OVERRIDES)
     logger.info_once(
         "Fused EP MoE (latest kernel) settings for hidden=%d inter=%d "
         "experts_per_shard=%d top_k=%d: tile_rows=%d weight_format=%s "
@@ -186,7 +208,7 @@ def served_config(
         inter,
         experts_per_shard,
         top_k,
-        tile_rows(),
+        TILE_ROWS,
         WEIGHT_FORMAT,
         config.token_rows,
         config.intermediate,
@@ -209,44 +231,21 @@ def served_config(
 def dense_slots_settings(
     config: Config | None = None,
 ) -> tuple[bool, int, bool, bool, bool]:
-    """(on, max tokens per shard, fused, pallas tables, merged) of the experimental dense-slots
-    layer (kernels/fused_moe/v3/dense_slots.py): TPU_MOE_FEP_DENSE_SLOTS=1
-    turns it on (default off) for calls of at most
-    TPU_MOE_FEP_DENSE_SLOTS_MAX_TOKENS rows per shard (default 64, the
-    DP4xTP2 decode buckets up to host B 128); larger calls keep the v3
-    layer. TPU_MOE_FEP_DENSE_SLOTS_FUSED=1 takes the variant whose exchange
-    and combine run inside the program; TPU_MOE_FEP_DENSE_SLOTS_PALLAS_TABLES=1
-    builds the index exchange and the tables as one Pallas program instead of
-    XLA ops; TPU_MOE_FEP_DENSE_SLOTS_MERGED=1 (with fused) runs them inside
-    the dense-slots program on the unpadded rows. The same settings are Config
-    fields (dense_slots, dense_slots_max_tokens, dense_slots_fused,
-    dense_slots_pallas_tables, dense_slots_merged),
-    so TPU_MOE_FUSED_EP_V3_CONFIG can carry them where a recipe passes only
-    known env names; a setting is on if either source turns it on, and the
-    env's threshold wins when it is set."""
+    """(on, max tokens per shard, fused, pallas tables, merged) of the
+    dense-slots layer (models/qwen3_5/kernels/dense_slots.py), from the
+    Config fields dense_slots, dense_slots_max_tokens, dense_slots_fused,
+    dense_slots_pallas_tables and dense_slots_merged. Off by default; the
+    Qwen3.5 layout table turns it on at DP4 x TP2 for calls of at most
+    dense_slots_max_tokens rows per shard (default 64), and larger calls keep
+    the v3 layer."""
     c = config if config is not None else Config()
-    on = os.environ.get("TPU_MOE_FEP_DENSE_SLOTS", "0") == "1" or c.dense_slots
-    max_tokens = int(
-        os.environ.get("TPU_MOE_FEP_DENSE_SLOTS_MAX_TOKENS", "")
-        or c.dense_slots_max_tokens
+    return (
+        c.dense_slots,
+        c.dense_slots_max_tokens,
+        c.dense_slots_fused,
+        c.dense_slots_pallas_tables,
+        c.dense_slots_merged,
     )
-    fused = (
-        os.environ.get("TPU_MOE_FEP_DENSE_SLOTS_FUSED", "0") == "1"
-        or c.dense_slots_fused
-    )
-    pallas_tables = (
-        os.environ.get("TPU_MOE_FEP_DENSE_SLOTS_PALLAS_TABLES", "0") == "1"
-        or c.dense_slots_pallas_tables
-    )
-    merged = (
-        os.environ.get("TPU_MOE_FEP_DENSE_SLOTS_MERGED", "0") == "1"
-        or c.dense_slots_merged
-    )
-    if max_tokens <= 0 or max_tokens % 8:
-        raise ValueError(
-            f"TPU_MOE_FEP_DENSE_SLOTS_MAX_TOKENS={max_tokens}: a positive multiple of 8"
-        )
-    return on, max_tokens, fused, pallas_tables, merged
 
 
 def run_moe_v3(
@@ -321,7 +320,7 @@ def run_moe_v3(
                 top_k=topk,
                 renormalize=renormalize,
                 mesh=mesh,
-                tile_rows=tile_rows(),
+                tile_rows=TILE_ROWS,
                 config=config,
                 experts_per_shard=experts_per_shard,
                 shard_index=rank,
@@ -342,7 +341,7 @@ def run_moe_v3(
             top_k=topk,
             renormalize=renormalize,
             mesh=mesh,
-            tile_rows=tile_rows(),
+            tile_rows=TILE_ROWS,
             weight_format=WEIGHT_FORMAT,
             activation=activation,
             drop_nan_rows=drop_nan_rows,
@@ -690,10 +689,14 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool, activation: str) 
     is forbidden inside a compiled forward: mapping EP ranks to TPU device ids
     is an `all_gather_object`, and a `Mesh` cannot survive Dynamo's tracing.
     """
-    global _EP_SIZE, _OP_CONTRACT
+    global _EP_SIZE, _OP_CONTRACT, _CONFIG_OVERRIDES
     layer._tpu_fused_ep_eligible = False
     if not envs.USE_MOE_FUSED_EP_KERNEL:
         return
+    from vllm.config import get_current_vllm_config_or_none
+
+    # Under the loader's config context: the Qwen3.5 layout table's entry.
+    _CONFIG_OVERRIDES = layout_overrides(get_current_vllm_config_or_none())
     # Under tensor parallelism the kernel arms for the sequence-parallel steps,
     # where each rank holds its own slice of the batch; a replicated step
     # stays off the kernel (`_fused_kernel_takes` in the FP8 method), since

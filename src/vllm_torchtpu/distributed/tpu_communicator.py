@@ -37,7 +37,6 @@ from vllm.distributed.device_communicators.base_device_communicator import (
 )
 from vllm.distributed.parallel_state import get_dp_group, get_ep_group, get_tp_group
 
-from vllm_torchtpu import envs
 from vllm_torchtpu.layers.adapter import sequence_parallel, small_all_reduce_op
 
 
@@ -48,12 +47,11 @@ class TpuNullAll2AllManager(All2AllManagerBase):
 def _packs_router_gather(
     hidden_states: torch.Tensor, router_logits: torch.Tensor
 ) -> bool:
-    """Whether a replicated DP dispatch gathers hidden rows and router logits
-    as one packed all-gather (TPU_DP_PACKED_ROUTER_GATHER, same dtype, 2D,
-    same rows)."""
+    """Whether a replicated DP dispatch (DP > 1) gathers hidden rows and router
+    logits as one packed all-gather: same dtype, 2D, same rows. Lossless, and
+    one latency-bound collective instead of two at decode sizes."""
     return (
-        envs.TPU_DP_PACKED_ROUTER_GATHER
-        and hidden_states.dtype == router_logits.dtype
+        hidden_states.dtype == router_logits.dtype
         and hidden_states.dim() == 2
         and router_logits.dim() == 2
         and hidden_states.shape[0] == router_logits.shape[0]
