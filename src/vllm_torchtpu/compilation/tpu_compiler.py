@@ -320,6 +320,7 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # boundary) that get_top_tokens runs inside the AOT-cached fused MTP
     # draft loop (spec_decode/mtp_fused_loop.py).
     "vllm_torchtpu/runner/greedy_top_tokens.py",
+    "vllm_torchtpu/models/vllm/qwen3_next_patch.py",
 )
 
 # vLLM-Omni diffusion code, dropped from the hashed set above. Diffusion
