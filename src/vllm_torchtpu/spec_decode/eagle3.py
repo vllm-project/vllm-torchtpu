@@ -25,6 +25,7 @@ import torch
 from vllm.compilation.backends import set_model_tag
 from vllm.config import VllmConfig, get_layers_from_vllm_config, set_current_vllm_config
 from vllm.forward_context import set_forward_context
+from vllm_torchtpu.runner.fast_forward_context import fast_set_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.v1.kv_cache_interface import FullAttentionSpec
@@ -655,7 +656,7 @@ class Eagle3Proposer:
         num_tokens = input_ids.shape[0]
         with (
             set_model_tag("eagle_head"),
-            set_forward_context(
+            fast_set_forward_context(
                 attn_metadata,
                 self.draft_vllm_config,
                 num_tokens=num_tokens,
@@ -2111,7 +2112,7 @@ class Eagle3Proposer:
         model = self._draft_model_for_step(step_idx)
         with (
             set_model_tag("eagle_head"),
-            set_forward_context(
+            fast_set_forward_context(
                 attn_metadata,
                 self.draft_vllm_config,
                 num_tokens=num_tokens,
