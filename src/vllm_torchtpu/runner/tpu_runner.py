@@ -3045,7 +3045,9 @@ class TPUModelRunner(GPUModelRunner):
             if use_page_local_copy or use_dense_copy
             else scheduler_output
         )
+        host_phases.mark("us_pre")
         result = super()._update_states(base_output)
+        host_phases.mark("us_base")
         # Copy after the base zeroes new blocks (the CoW dst is one of them).
         if use_page_local_copy:
             self._apply_kv_cache_block_copies(copies)
@@ -4201,6 +4203,57 @@ class TPUModelRunner(GPUModelRunner):
             device="cpu",
         )
 
+    def _host_phases_begin_step(self, scheduler_output: "SchedulerOutput") -> None:
+        """VLLM_TPU_HOST_PHASES: start a step bucketed as admit / pf / dec."""
+        new_reqs = scheduler_output.scheduled_new_reqs
+        counts = scheduler_output.num_scheduled_tokens
+        max_tokens = max(counts.values(), default=0)
+        spec = (
+            self.speculative_config.num_speculative_tokens
+            if self.speculative_config is not None
+            else 0
+        )
+        if new_reqs:
+            kind = "admit"
+        elif max_tokens > 1 + spec:
+            kind = "pf"
+        else:
+            kind = "dec"
+        info = ""
+        stamp = getattr(scheduler_output, "_host_phases_stamp", None)
+        if kind == "admit":
+            info = (
+                f"new={len(new_reqs)} prompt="
+                + ",".join(str(len(r.prompt_token_ids or ())) for r in new_reqs)
+                + " cached="
+                + ",".join(str(r.num_computed_tokens) for r in new_reqs)
+                + f" toks={scheduler_output.total_num_scheduled_tokens}"
+                f" reqs={len(counts)}"
+            )
+        host_phases.begin_step(kind, info)
+        batch = self.input_batch
+        if not getattr(batch, "_host_phases_wrapped", False):
+            # Nested timings inside the base _update_states (x_: not summed).
+            targets = [
+                (batch, "add_request", "x_add_request"),
+                (batch, "remove_request", "x_remove_request"),
+            ]
+            if not getattr(self, "_host_phases_wrapped", False):
+                targets.append((self, "_zero_block_ids", "x_zero_block_ids"))
+                self._host_phases_wrapped = True
+            for obj, attr, label in targets:
+                fn = getattr(obj, attr, None)
+                if fn is not None:
+                    setattr(obj, attr, host_phases.timed(fn, label))
+            batch._host_phases_wrapped = True
+        if stamp is not None:
+            # (schedule end wall time, promote us, schedule us) from the
+            # scheduler process; the lag covers batch-queue wait + IPC.
+            t_end, promote_us, sched_us = stamp
+            host_phases.note("x_sched_promote", promote_us)
+            host_phases.note("x_sched_total", sched_us)
+            host_phases.note("x_sched_to_runner", (time.time() - t_end) * 1e6)
+
     @torch.no_grad()
     @_pp_step
     def execute_model(
@@ -4213,7 +4266,8 @@ class TPUModelRunner(GPUModelRunner):
                 "State error: sample_tokens() must be called "
                 "after execute_model() returns None."
             )
-        host_phases.begin_step()
+        if host_phases.enabled():
+            self._host_phases_begin_step(scheduler_output)
         # Update cached state
         self._update_states(scheduler_output)
         host_phases.mark("update_states")
