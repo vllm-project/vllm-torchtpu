@@ -30,7 +30,7 @@ from torch_tpu._internal import pallas
 from vllm.config import VllmConfig, get_current_vllm_config
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.kernels.experimental.qk_norm_rope_gate import (
+from vllm_torchtpu.models.qwen3_5.kernels.qk_norm_rope_gate import (
     qk_norm_rope_gate,
     reference as qk_norm_rope_gate_reference,
 )
