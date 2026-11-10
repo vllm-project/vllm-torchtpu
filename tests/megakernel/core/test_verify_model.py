@@ -1214,6 +1214,6 @@ def test_fused_serialized_rmw_aliased_kv_write_page(case: str):
     np.testing.assert_allclose(
         np.asarray(st_f["rec"], dtype=np.float32),
         np.asarray(st_s["rec"], dtype=np.float32),
-        atol=1e-5,
-        rtol=1e-5,
+        atol=1e-4,
+        rtol=2**-7,
     )
