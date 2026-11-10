@@ -48,6 +48,8 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
     from .modules import (
         Embedding,
         EmbeddingModule,
+        MoEDebug,
+        MoEParams,
         Norm,
         NormModule,
     )
@@ -137,6 +139,8 @@ _LAZY: dict[str, str] = {
     "default_tiles": ".exec_spec",
     "Embedding": ".modules",
     "EmbeddingModule": ".modules",
+    "MoEDebug": ".modules",
+    "MoEParams": ".modules",
     "Norm": ".modules",
     "NormModule": ".modules",
     "col_chunk": ".ops",
@@ -209,6 +213,8 @@ __all__ = [
     "LayerType",
     "MegakernelConfigError",
     "MegakernelLayoutError",
+    "MoEDebug",
+    "MoEParams",
     "ModelSpec",
     "Module",
     "ModuleBinding",
