@@ -621,7 +621,6 @@ def _run_moe_numerical_parity_case(
         in_specs=in_specs,
         out_specs=out_specs,
         scratch_shapes=[scratch[k] for k in s_names],
-        compiler_params=pltpu.CompilerParams(collective_id=0) if R > 1 else None,
         interpret=pltpu.InterpretParams() if interpret else False,
     )
 
@@ -646,24 +645,26 @@ def _run_moe_numerical_parity_case(
         hid_rep = jnp.broadcast_to(hid[None, ...], (R, ex.M, H))
         part_ranks = step(pos, hid_rep, *w_all)[:, :, : ex.B]
 
-    for lyr in range(L):
-        for r in range(R):
-            assert float(jnp.max(jnp.abs(partials_by_layer[lyr][r]))) >= 0.08
+    with jax.default_device(jax.devices("cpu")[0]):
+        part_ranks = jnp.asarray(np.asarray(part_ranks))
+        for lyr in range(L):
+            for r in range(R):
+                assert float(jnp.max(jnp.abs(partials_by_layer[lyr][r]))) >= 0.08
+                assert jnp.allclose(
+                    part_ranks[r, lyr].astype(F32),
+                    partials_by_layer[lyr][r],
+                    atol=2e-2,
+                    rtol=2e-2,
+                )
+            actual_out = (res + jnp.sum(part_ranks[:, lyr].astype(F32), axis=0)).astype(
+                BF16
+            )
             assert jnp.allclose(
-                part_ranks[r, lyr].astype(F32),
-                partials_by_layer[lyr][r],
+                actual_out.astype(F32),
+                ref_outs_by_layer[lyr].astype(F32),
                 atol=2e-2,
                 rtol=2e-2,
             )
-        actual_out = (res + jnp.sum(part_ranks[:, lyr].astype(F32), axis=0)).astype(
-            BF16
-        )
-        assert jnp.allclose(
-            actual_out.astype(F32),
-            ref_outs_by_layer[lyr].astype(F32),
-            atol=2e-2,
-            rtol=2e-2,
-        )
 
 
 @pytest.mark.parametrize(
@@ -794,7 +795,7 @@ def test_moe_module_numerical_parity_on_tpu(
         tpu_devs = []
     if len(tpu_devs) < R:
         pytest.skip(f"{R} TPU device(s) required for interpret=False Pallas execution")
-    with jax.default_device(tpu_devs[0]):
+    with contextlib.nullcontext() if R > 1 else jax.default_device(tpu_devs[0]):
         _run_moe_numerical_parity_case(
             moe_tp=moe_tp,
             R=R,
@@ -1033,7 +1034,6 @@ def test_moe_dynamic_dma_race_invariants(
             in_specs=in_specs,
             out_specs=out_specs,
             scratch_shapes=[scratch[k] for k in s_names],
-            compiler_params=pltpu.CompilerParams(collective_id=0),
             interpret=ex.interpret,
         )
         mesh = Mesh(devs[:R], ("tp",))
