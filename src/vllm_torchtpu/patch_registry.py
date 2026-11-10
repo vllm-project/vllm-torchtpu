@@ -168,6 +168,12 @@ PATCHES = (
         ("platform_activation", "model_load"),
         model_config=True,
     ),
+    Patch(
+        "vllm_torchtpu.models.qwen3_5.kernels.fused_qk_norm_rope:"
+        "maybe_install_qk_norm_rope_patch",
+        ("platform_activation", "model_load"),
+        model_config=True,
+    ),
 )
 
 _applied: set[str] = set()
