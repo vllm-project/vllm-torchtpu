@@ -149,6 +149,8 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_DECODE_POOL_PAGE_DMA: bool = False
     VLLM_TPU_QSA_INDEXER_SC_BOUNDED_COPY: bool = False
     VLLM_TPU_QSA_PREFILL_SC_BOUNDED_COPY: bool = False
+    VLLM_TPU_QSA_PREFILL_SC: bool = False
+    VLLM_TPU_QSA_SC_MIN_CONTEXT: int = 0
     VLLM_TPU_QSA_DECODE_RPA_LANES: int = 8
     VLLM_TPU_QSA_DECODE_RPA_MAX_QUERIES: int = 0
     VLLM_TPU_QSA_FUSED_KV_WRITE: bool = False
@@ -817,6 +819,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # prefill chunks (rows early in a prompt see a short context).
     "VLLM_TPU_QSA_PREFILL_SC_BOUNDED_COPY": env_bool(
         "VLLM_TPU_QSA_PREFILL_SC_BOUNDED_COPY", default=False
+    ),
+    # Qwen4-exp QSA prefill attention on the SparseCore pipeline
+    # (kernels/sparse_gqa_prefill): each query attends only its own selected
+    # groups, gathered by the SparseCore into double-buffered HBM slots while
+    # the TensorCore attends the previous microchunk. Used for a prefill slice
+    # with one request whose page plan certifies; otherwise the TensorCore
+    # prefill kernel runs. Not bit-identical (FP32 sums in another order).
+    "VLLM_TPU_QSA_PREFILL_SC": env_bool("VLLM_TPU_QSA_PREFILL_SC", default=False),
+    # With VLLM_TPU_QSA_PREFILL_SC: use the SparseCore path only when the
+    # longest live causal length in the prefill slice reaches this (inclusive);
+    # 0 uses it for every certified slice.
+    "VLLM_TPU_QSA_SC_MIN_CONTEXT": env_nonnegative_int(
+        "VLLM_TPU_QSA_SC_MIN_CONTEXT", 0
     ),
     "VLLM_TPU_QSA_DECODE_RPA_LANES": env_nonnegative_int(
         "VLLM_TPU_QSA_DECODE_RPA_LANES", 8

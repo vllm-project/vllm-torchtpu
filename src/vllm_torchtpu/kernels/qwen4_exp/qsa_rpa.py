@@ -564,25 +564,63 @@ def _prefill_attention(
             query_block, query_tile = 256, None
         if query_tile and query_block % query_tile:
             query_tile = None
-    return block_sparse_gqa_attention(
-        query,
-        gate,
-        blocks,
-        lengths,
-        table,
-        cache,
-        starts,
-        kv_heads=kv_heads,
-        ratio=ratio,
-        query_block=query_block,
-        kv_tile=kv_tile,
-        k_scale=k_scale,
-        v_scale=v_scale,
-        **({"kv_head_offset": kv_head_offset} if kv_head_offset else {}),
-        **({"query_tile": query_tile} if query_tile else {}),
-        **({"dcp": dcp} if dcp is not None else {}),
-        **({"return_lse": True} if return_lse else {}),
-    )
+    def tensorcore():
+        return block_sparse_gqa_attention(
+            query,
+            gate,
+            blocks,
+            lengths,
+            table,
+            cache,
+            starts,
+            kv_heads=kv_heads,
+            ratio=ratio,
+            query_block=query_block,
+            kv_tile=kv_tile,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            **({"kv_head_offset": kv_head_offset} if kv_head_offset else {}),
+            **({"query_tile": query_tile} if query_tile else {}),
+            **({"dcp": dcp} if dcp is not None else {}),
+            **({"return_lse": True} if return_lse else {}),
+        )
+
+    if envs.VLLM_TPU_QSA_PREFILL_SC:
+        from vllm_torchtpu.kernels.sparse_gqa_prefill import owner_window
+
+        if owner_window.is_supported(
+            query,
+            gate,
+            blocks,
+            lengths,
+            table,
+            cache,
+            starts,
+            kv_heads=kv_heads,
+            ratio=ratio,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            kv_head_offset=kv_head_offset,
+        ):
+            # The cache passes around the conditional: only outputs cross it.
+            output = owner_window.attention(
+                query,
+                gate,
+                blocks,
+                lengths,
+                table,
+                cache,
+                starts,
+                lambda: tensorcore()[:-1] if return_lse else tensorcore()[0],
+                kv_heads=kv_heads,
+                ratio=ratio,
+                kv_head_offset=kv_head_offset,
+                dcp=dcp,
+                return_lse=return_lse,
+                min_context=envs.VLLM_TPU_QSA_SC_MIN_CONTEXT,
+            )
+            return (*output, cache) if return_lse else (output, cache)
+    return tensorcore()
 
 
 def _with_lse_channel(attend):
