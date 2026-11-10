@@ -609,9 +609,10 @@ def install_copy_slot_hook() -> bool:
 
     fused_layer.FusedMoEFactory = FusedMoEFactory
     fused_pkg.FusedMoEFactory = FusedMoEFactory
+    name = "FusedMoEFactory"  # rebound in every model module that imported it
     for module in list(sys.modules.values()):
-        if getattr(module, "FusedMoEFactory", None) is original_factory:
-            module.FusedMoEFactory = FusedMoEFactory
+        if getattr(module, name, None) is original_factory:
+            setattr(module, name, FusedMoEFactory)
     emm.ExpertMapManager._calculate_expert_maps = _calculate_expert_maps
     fused_layer._tpu_copy_slot_hook = True
     logger.info(

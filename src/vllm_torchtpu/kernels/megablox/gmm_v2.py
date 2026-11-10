@@ -260,6 +260,7 @@ def rhs_stream_copies(
         for c in range(num_chunks)
     ]
     if stream_ref.scale is not None:
+        assert rhs_ref.scale is not None  # the stream has scales iff the rhs has
         copies.append(
             pltpu.make_async_copy(
                 rhs_ref.scale.at[group_id],
@@ -935,6 +936,7 @@ def kernel_main(
     rhs_hbm_ref = rhs_ref
     num_chunks = 2 if cfgs.fuse_act is not None else 1
     if stream_ref is not None:
+        stream = stream_ref
         max_active_group = min(cfgs.dims.size_group, cfgs.dims.size_lhs_group)
         with jax.named_scope("gmm_stream_first"):
             group_offset = group_offset_ref[0]
@@ -950,7 +952,7 @@ def kernel_main(
             @pl.when(first_group < max_active_group)
             def _():
                 for copy in rhs_stream_copies(
-                    rhs_hbm_ref, stream_ref, first_group, 0, num_chunks=num_chunks
+                    rhs_hbm_ref, stream, first_group, 0, num_chunks=num_chunks
                 ):
                     copy.start()
 
@@ -962,6 +964,7 @@ def kernel_main(
         cfgs=cfgs,
         run_to_group_ref=None if stream_ref is None else stream_ref.run_to_group,
     )
+    num_runs = 0
     if stream_ref is not None:
         num_gm, num_runs = num_gm
 
@@ -1001,15 +1004,17 @@ def kernel_main(
         )
         pipeline_fn(lhs_in, rhs_ref, out_in, scratches=scratches)
     else:
-        stream_ref.run[1] = num_runs
+        assert stream_ref is not None
+        stream = stream_ref
+        stream.run[1] = num_runs
 
         def slot_rhs_ref(slot) -> RhsRef:
             def view(lo, hi):
                 return WeightsRef(
-                    weight=stream_ref.weight.at[slot, :, lo:hi],
+                    weight=stream.weight.at[slot, :, lo:hi],
                     scale=None
-                    if stream_ref.scale is None
-                    else stream_ref.scale.at[slot, :, :, lo:hi],
+                    if stream.scale is None
+                    else stream.scale.at[slot, :, :, lo:hi],
                     bias=None,
                 )
 
@@ -1026,15 +1031,15 @@ def kernel_main(
 
             @pl.when(is_new_run)
             def _():
-                run = jnp.where(gm_id == 0, 0, stream_ref.run[0] + 1)
-                stream_ref.run[0] = run
+                run = jnp.where(gm_id == 0, 0, stream.run[0] + 1)
+                stream.run[0] = run
 
-                @pl.when(jnp.logical_and(gm_id == 0, stream_ref.run[1] > 1))
+                @pl.when(jnp.logical_and(gm_id == 0, stream.run[1] > 1))
                 def _():
                     for copy in rhs_stream_copies(
                         rhs_hbm_ref,
-                        stream_ref,
-                        stream_ref.run_to_group[1],
+                        stream,
+                        stream.run_to_group[1],
                         1,
                         num_chunks=num_chunks,
                     ):
@@ -1042,12 +1047,12 @@ def kernel_main(
 
                 ahead = run + (RHS_STREAM_SLOTS - 1)
 
-                @pl.when(ahead < stream_ref.run[1])
+                @pl.when(ahead < stream.run[1])
                 def _():
                     for copy in rhs_stream_copies(
                         rhs_hbm_ref,
-                        stream_ref,
-                        stream_ref.run_to_group[ahead],
+                        stream,
+                        stream.run_to_group[ahead],
                         ahead % RHS_STREAM_SLOTS,
                         num_chunks=num_chunks,
                     ):
@@ -1055,14 +1060,14 @@ def kernel_main(
 
                 for copy in rhs_stream_copies(
                     rhs_hbm_ref,
-                    stream_ref,
+                    stream,
                     group_id,
                     run % RHS_STREAM_SLOTS,
                     num_chunks=num_chunks,
                 ):
                     copy.wait()
 
-            slot = stream_ref.run[0] % RHS_STREAM_SLOTS
+            slot = stream.run[0] % RHS_STREAM_SLOTS
             inner_kernel(
                 tiled_lhs_ref,
                 slot_rhs_ref(slot),
