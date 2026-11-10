@@ -105,6 +105,31 @@ def indexed_options() -> dict:
     )
 
 
+# VLLM_TPU_MK_BUCKET_TUNE: knob overrides per row bucket (core `Tiles` fields or
+# `<block>.<field>` tunables), measured with tpu_bench_wholestep_call (~/q38f/d1/BUCKETS.md).
+BUCKET_TUNE: dict[int, dict[str, Any]] = {}
+
+
+def _tile_value(v: Any) -> Any:
+    if not isinstance(v, str):
+        return v
+    if v.lower() in ("true", "false"):
+        return v.lower() == "true"
+    return int(v)
+
+
+def _apply_tile_overrides(t: Tiles, over: dict[str, Any]) -> Tiles:
+    core = {k: _tile_value(v) for k, v in over.items() if "." not in k}
+    blocks: dict[str, dict[str, Any]] = {}
+    for k, v in over.items():
+        if "." in k:
+            blk, field = k.split(".", 1)
+            blocks.setdefault(blk, {})[field] = _tile_value(v)
+    if core:
+        t = dataclasses.replace(t, **core)
+    return t.with_blocks(blocks) if blocks else t
+
+
 def wholestep_tiles(B: int, max_groups: int = 0) -> Tiles:
     """`_wholestep_tiles`; with main-KV DCP-2 up to 32 rows the expert ring drops one more 2 MiB
     slot: the pair exchange buffers and the doubled-head union attention put b32 (f32 state)
@@ -126,6 +151,16 @@ def wholestep_tiles(B: int, max_groups: int = 0) -> Tiles:
     hier = os.environ.get("VLLM_TPU_MK_HIER", "")
     if hier:
         t = dataclasses.replace(t, hier=int(hier))
+    # VLLM_TPU_MK_BUCKET_TUNE: per-bucket core / block knobs (BUCKET_TUNE, by row bucket).
+    if envs.VLLM_TPU_MK_BUCKET_TUNE:
+        t = _apply_tile_overrides(t, BUCKET_TUNE.get(B, {}))
+    # VLLM_TPU_MK_TILES="nbd=14,rel_fetch=1,gdn.gdn_bufs=3" (bench sweeps): any core field or
+    # `<block>.<field>` tunable.
+    over = os.environ.get("VLLM_TPU_MK_TILES", "")
+    if over:
+        t = _apply_tile_overrides(
+            t, dict(kv.split("=", 1) for kv in over.split(",") if kv)
+        )
     # VLLM_TPU_MK_RINGS=nbe:nbd (bench sweeps): override the ring depths.
     rings = os.environ.get("VLLM_TPU_MK_RINGS", "")
     if rings:
