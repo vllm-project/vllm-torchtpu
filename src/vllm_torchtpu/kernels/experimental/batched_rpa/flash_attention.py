@@ -23,8 +23,11 @@ from vllm_torchtpu.kernels.experimental.batched_rpa.schedule import SmemWrapper
 
 
 def vpu_diet_enabled() -> bool:
+    """Whether to take the score-tile VPU savings (scale folding, mask skip).
 
+    Always on; a function so tests can compare it with the plain path. Both
     """
+    return True
 
 
 def q_folded_scale(cfgs: configs.RpaConfigs) -> float | None:
