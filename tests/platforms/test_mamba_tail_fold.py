@@ -480,3 +480,242 @@ def test_fine_unit_turn_resuming_mid_block_folds_and_chains(monkeypatch):
     manager.new_step_starts()
     _, hit = manager.get_computed_blocks(third)[:2]
     assert hit == position
+
+
+# --- VLLM_TPU_MAMBA_TAIL_FOLD_NOBOUNDARY: a last chunk with no block boundary --
+
+
+@pytest.fixture
+def _restore_manager():
+    names = (
+        "_needs_internal_checkpoint",
+        "get_num_blocks_to_allocate",
+        "cache_blocks",
+        "new_step_starts",
+    )
+    saved = {name: getattr(MambaManager, name) for name in names}
+    try:
+        yield
+    finally:
+        for name, fn in saved.items():
+            setattr(MambaManager, name, fn)
+
+
+def _nobound_env(monkeypatch, on: bool):
+    monkeypatch.setenv("VLLM_TPU_MAMBA_TAIL_FOLD", "1")
+    monkeypatch.setenv("VLLM_TPU_MAMBA_TAIL_FOLD_UNIT", str(U))
+    monkeypatch.setenv("TPU_GDN_CHUNK_PAIR", "1")
+    if on:
+        monkeypatch.setenv("VLLM_TPU_MAMBA_TAIL_FOLD_NOBOUNDARY", "1")
+    else:
+        monkeypatch.delenv("VLLM_TPU_MAMBA_TAIL_FOLD_NOBOUNDARY", raising=False)
+
+
+def test_nobound_mirror(monkeypatch):
+    """Cached 1024 (a block boundary), prompt 1497: no 512 boundary inside
+    (1024, 1497), so upstream has no column and splits 256 + 217. The fold
+    puts the checkpoint at 1280 in column cdiv(1497, 512) = 3, the first
+    speculative scratch block."""
+
+    def mirror(start, scheduled, nsb):
+        o, c = prefill_checkpoints(
+            np.array([start]), np.array([scheduled]), MB, U, num_speculative_blocks=nsb
+        )
+        return int(o[0]), int(c[0])
+
+    _nobound_env(monkeypatch, on=False)
+    assert mirror(1024, 473, 3) == (0, 0)
+    _nobound_env(monkeypatch, on=True)
+    assert mirror(1024, 473, 3) == (256, 3)
+    assert mirror(1024, 473, 0) == (0, 0)  # no scratch block: off
+    assert mirror(0, 473, 3) == (256, 1)  # a fresh short prompt
+    assert mirror(1024, 200, 3) == (0, 0)  # no unit inside
+    assert mirror(1280, 217, 3) == (0, 0)  # starts at the checkpoint
+    # A chunk with a boundary keeps upstream's column (unchanged).
+    assert mirror(1024, 1000, 3) == mirror(1024, 1000, 0)
+    assert mirror(1024, 1000, 3)[1] == cdiv(2024, MB) - 2
+    # Exhaustive: the no-boundary case and upstream's cases never overlap,
+    # and the new case is exactly nobound_valid at column cdiv(end, B).
+    for start in range(0, 3 * MB, U // 2):
+        for n in range(1, 2 * MB, 37):
+            end = start + n
+            position = max((end - 1) // U * U, 0)
+            up = (
+                is_mamba_prefill_checkpoint_valid(
+                    query_start=start,
+                    query_end=end,
+                    checkpoint_position=position,
+                    hash_block_size=U,
+                    mamba_block_size=MB,
+                    checkpoint_alignment=U,
+                )
+                and cdiv(end, MB) - 2 >= 0
+            )
+            nb = mamba_tail_fold.nobound_valid(start, end, position, U, MB, U)
+            assert not (up and nb)
+            got = mirror(start, n, 3)
+            if nb:
+                assert got == (position - start, cdiv(end, MB))
+            elif up:
+                assert got == (position - start, cdiv(end, MB) - 2)
+            else:
+                assert got == (0, 0)
+
+
+def _nobound_scheduler(spec_blocks: int):
+    scheduler = _split_scheduler(True)
+    scheduler.hash_block_size = U
+    scheduler.mamba_prefill_checkpoint_alignment = U
+    scheduler._tpu_tail_fold_spec_blocks = spec_blocks
+    return scheduler
+
+
+def test_nobound_split_decision(monkeypatch):
+    _nobound_env(monkeypatch, on=False)
+    mamba_tail_fold.patch_mamba_tail_fold()
+    split = Scheduler._mamba_block_aligned_split
+    # Upstream (and the flag off): split at the 256 checkpoint.
+    assert split(_nobound_scheduler(3), _split_request(1497, 1024), 473) == 256
+    monkeypatch.setenv("VLLM_TPU_MAMBA_TAIL_FOLD_NOBOUNDARY", "1")
+    assert split(_nobound_scheduler(3), _split_request(1497, 1024), 473) == 473
+    assert split(_nobound_scheduler(3), _split_request(473), 473) == 473
+    # No speculative scratch block: keep the split.
+    assert split(_nobound_scheduler(0), _split_request(1497, 1024), 473) == 256
+    # The budget stops the chunk before the prompt end: unchanged.
+    monkeypatch.delenv("VLLM_TPU_MAMBA_TAIL_FOLD_NOBOUNDARY")
+    cut = split(_nobound_scheduler(3), _split_request(1497, 1024), 300)
+    monkeypatch.setenv("VLLM_TPU_MAMBA_TAIL_FOLD_NOBOUNDARY", "1")
+    assert split(_nobound_scheduler(3), _split_request(1497, 1024), 300) == cut
+    # A shared-prefix junction inside the chunk keeps its stop.
+    junction = _split_request(1497, 1024)
+    junction.shared_prefix_boundary = 1100
+    sched = _nobound_scheduler(3)
+    sched.mamba_shared_prefix_checkpoint = True
+    assert split(sched, junction, 473) == 76
+    # The rest after the 256 piece (upstream's second step) is unchanged.
+    assert split(_nobound_scheduler(3), _split_request(1497, 1280), 217) == 217
+
+
+def _nobound_manager(monkeypatch) -> KVCacheManager:
+    init_none_hash(sha256)
+    attention = FullAttentionSpec(
+        block_size=MB, num_kv_heads=1, head_size=64, dtype=torch.float32
+    )
+    state = with_prefill_checkpoint(
+        MambaSpec(
+            block_size=MB,
+            shapes=((1, 64),),
+            dtypes=(torch.float32,),
+            mamba_cache_mode="align",
+            page_size_padded=attention.page_size_bytes,
+            num_speculative_blocks=3,
+        )
+    )
+    config = KVCacheConfig(
+        num_blocks=256,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["state"], state),
+            KVCacheGroupSpec(["attention"], attention),
+        ],
+        prefix_cache_retention_interval=0,
+    )
+    return KVCacheManager(
+        config,
+        max_model_len=16384,
+        scheduler_block_size=MB,
+        hash_block_size=U,
+        enable_caching=True,
+    )
+
+
+def _turn(manager, rid, tokens, chunks=None):
+    """Schedule `tokens` from its prefix hit to the end, in `chunks` (default
+    one chunk), as the scheduler does; returns (hit, worker table, request)."""
+    request = _fine_request(rid, tokens)
+    manager.new_step_starts()
+    blocks, hit = manager.get_computed_blocks(request)[:2]
+    table = [b.block_id for b in blocks.blocks[0]]
+    rest = len(tokens) - hit
+    chunks = chunks or [rest]
+    assert sum(chunks) == rest
+    computed = hit
+    for i, n in enumerate(chunks):
+        if i:
+            manager.new_step_starts()
+        new = (
+            manager.allocate_slots(request, n, hit, blocks)
+            if i == 0
+            else manager.allocate_slots(request, n)
+        )
+        assert new is not None
+        table += new.get_block_ids()[0]
+        computed += n
+        request.num_computed_tokens = computed
+    return hit, table, request
+
+
+@pytest.mark.parametrize("extra", [473, 300, 511])
+def test_nobound_manager_reserves_moves_and_next_turn_hits(
+    monkeypatch, _restore_manager, extra
+):
+    """Turn 2 hits turn 1's 1024 and folds its `extra`-token rest whole: the
+    manager reserves column 3 (the first scratch block) at the last 256, the
+    worker writes that block, the next step moves the hash to a fresh block
+    filled by a queued copy of it, and turn 3 hits there. Flag off, turn 2
+    splits 256 + rest and turn 3 hits the same position."""
+    # Turn 1 checkpoints at 1024 (its last 256 boundary); turn 2 diverges there.
+    turn1 = list(range(1100))
+    turn2 = turn1[:1024] + list(range(50000, 50000 + extra))
+    turn3 = turn2 + [7] * 300
+    position = (len(turn2) - 1) // U * U
+
+    _nobound_env(monkeypatch, on=False)
+    base = _nobound_manager(monkeypatch)
+    _, _, r1 = _turn(base, "t1", turn1)
+    base.free(r1)
+    hit, _, r2 = _turn(base, "t2", turn2, [position - 1024, len(turn2) - position])
+    assert hit == 1024
+    base.free(r2)
+    base_hit = _turn(base, "t3", turn3)[0]
+    assert base_hit == position
+
+    _nobound_env(monkeypatch, on=True)
+    mamba_tail_fold._patch_nobound_manager()
+    manager = _nobound_manager(monkeypatch)
+    state = manager.coordinator.single_type_managers[0]
+    _, _, r1 = _turn(manager, "t1", turn1)
+    manager.free(r1)
+    hit, table, r2 = _turn(manager, "t2", turn2)
+    assert hit == 1024
+    offsets, columns = prefill_checkpoints(
+        np.array([hit]), np.array([extra]), MB, U, num_speculative_blocks=3
+    )
+    column = cdiv(len(turn2), MB)
+    assert (int(offsets[0]), int(columns[0])) == (position - hit, column)
+    assert state._checkpoints["t2"] == (position, column)
+    written = state.req_to_blocks["t2"][column]
+    assert table[column] == written.block_id
+    assert written.block_hash_num_tokens == position
+    # Positional columns hold the hit state (1) and the running state (2).
+    assert len(state.req_to_blocks["t2"]) == column + 3
+
+    # Next step: before any allocation, the hash leaves the scratch block.
+    manager.new_step_starts()
+    copies, retained = manager.take_kv_cache_block_copies()
+    assert written.block_hash is None
+    assert len(copies) == 1 and copies[0].src_block_id == written.block_id
+    cow = next(b for b in retained if b.block_id == copies[0].dst_block_id)
+    assert cow.block_hash_num_tokens == position
+    assert "t2" not in state._checkpoints
+    for block in retained:  # the scheduler's release after the copy ran
+        manager.block_pool.free_blocks([block])
+    manager.free(r2)
+
+    probe = _fine_request("probe", turn3)
+    cached = manager.block_pool.get_cached_block(
+        probe.block_hashes[position // U - 1], [0]
+    )
+    assert cached is not None and cached[0] is cow
+    hit3 = _turn(manager, "t3", turn3)[0]
+    assert hit3 == base_hit == position

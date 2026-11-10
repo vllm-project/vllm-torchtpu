@@ -239,3 +239,50 @@ def test_gdn_fold_writes_the_split_boundary_state(chunk_pair, monkeypatch):
         if block != 1:
             np.testing.assert_array_equal(_block(folded, block), _block(plain, block))
     assert not _block(plain, 1).any()
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("chunk_pair", [False, True])
+def test_gdn_nobound_fold_writes_the_split_boundary_state(chunk_pair, monkeypatch):
+    """VLLM_TPU_MAMBA_TAIL_FOLD_NOBOUNDARY: a prefix hit at 512 and a 473-token
+    rest with no block boundary inside. The split runs [512, 768) then
+    [768, 985); the fold runs [512, 985) with the checkpoint at offset 256 in
+    another block (the first speculative scratch block). Both resume from the
+    hit state seeded into the running block, as serving's seed copy does."""
+    from vllm_torchtpu import envs
+
+    monkeypatch.setattr(envs, "TPU_GDN_CHUNK_PAIR", chunk_pair)
+    tokens = 985
+    x = _gdn_inputs(tokens, seed=11)
+    empty = jnp.zeros((NUM_BLOCKS * SPLIT, KBS) + PAYLOAD + (LANES,), jnp.int8)
+    # The hit: [0, 512) leaves its state in block 1.
+    hit, _ = _gdn(empty, x, slice(0, 512), (512,), (512,), (1,), (0, 1, 1))
+
+    def seeded(dst):
+        return hit.at[dst * SPLIT : (dst + 1) * SPLIT].set(hit[1 * SPLIT : 2 * SPLIT])
+
+    # Split: running block 2 seeded with the hit state.
+    first, head_out = _gdn(
+        seeded(2), x, slice(512, 768), (256,), (768,), (2,), (0, 1, 1)
+    )
+    boundary = _block(first, 2)
+    second, tail_out = _gdn(first, x, slice(768, 985), (217,), (985,), (2,), (0, 1, 1))
+
+    # Fold: running block 5 seeded likewise; checkpoint at 256 into block 6.
+    ckpt = (jnp.asarray([256], jnp.int32), jnp.asarray([6], jnp.int32))
+    args = (x, slice(512, 985), (473,), (985,), (5,), (0, 1, 1))
+    folded, out = _gdn(seeded(5), *args, prefill_ckpt=ckpt)
+    plain, plain_out = _gdn(seeded(5), *args)
+
+    np.testing.assert_array_equal(_block(folded, 6), boundary)
+    np.testing.assert_array_equal(_block(folded, 5), _block(second, 2))
+    np.testing.assert_array_equal(
+        np.asarray(out, np.float32)[:256], np.asarray(head_out, np.float32)
+    )
+    np.testing.assert_array_equal(
+        np.asarray(out, np.float32)[256:], np.asarray(tail_out, np.float32)
+    )
+    np.testing.assert_array_equal(np.asarray(out), np.asarray(plain_out))
+    for block in range(NUM_BLOCKS):
+        if block != 6:
+            np.testing.assert_array_equal(_block(folded, block), _block(plain, block))
