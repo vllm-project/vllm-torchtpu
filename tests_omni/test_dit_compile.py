@@ -665,3 +665,32 @@ def test_sdpa_fallback_warning_skipped_while_compiling(monkeypatch):
     assert warned == []
     assert impl._needs_sdpa_fallback(q, q, None) is True
     assert len(warned) == 1
+
+
+def test_check_env_reads_scopes_compile_cache_vars_to_omni_platform():
+    import importlib.util
+    import pathlib
+
+    tool_path = (
+        pathlib.Path(omni_platform.__file__).resolve().parents[3]
+        / "tools"
+        / "check_env_reads.py"
+    )
+    spec = importlib.util.spec_from_file_location("check_env_reads", tool_path)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    scoped_only = {
+        "LIBTPU_INIT_ARGS",
+        "TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS",
+        "TORCH_TPU_INTERNAL_XLA_OPTIONS",
+        "TPU_CHIPS_PER_PROCESS_BOUNDS",
+        "TPU_PROCESS_BOUNDS",
+        "XLA_FLAGS",
+    }
+    assert scoped_only.isdisjoint(mod.BOOTSTRAP_VARS)
+    assert {
+        mod.PACKAGE / "omni" / "platform.py": scoped_only,
+    } == mod.SCOPED_BOOTSTRAP_VARS
+    assert mod.find_reads() == mod.load_baseline()

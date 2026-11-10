@@ -95,7 +95,6 @@ EXEMPT_PATHS = {
 # read fails this hook with a message pointing here, which is the moment to
 # decide whether it belongs in envs.py instead.
 BOOTSTRAP_VARS = {
-    "LIBTPU_INIT_ARGS",
     "LOCAL_RANK",
     "LOCAL_WORLD_SIZE",
     "MASTER_PORT",
@@ -105,17 +104,25 @@ BOOTSTRAP_VARS = {
     "TORCH_TPU_DP_MASTER_ADDR",
     "TORCH_TPU_DP_MASTER_PORT",
     "TORCH_TPU_DP_SIZE",
-    "TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS",
-    "TORCH_TPU_INTERNAL_XLA_OPTIONS",
     "TORCH_TPU_SLICEBUILDER_ADDRESSES",
     "TORCH_TPU_TOPOLOGY",
     "TORCH_TPU_XPROF_SESSION_ID",
-    "TPU_CHIPS_PER_PROCESS_BOUNDS",
     "TPU_NUM_HOSTS",
-    "TPU_PROCESS_BOUNDS",
     "TPU_VISIBLE_CHIPS",
     "WORLD_SIZE",
-    "XLA_FLAGS",
+}
+
+# Bootstrap / compiler-fingerprint variables scoped to the specific file that
+# reads them, rather than allowed repo-wide.
+SCOPED_BOOTSTRAP_VARS: dict[pathlib.Path, set[str]] = {
+    PACKAGE / "omni" / "platform.py": {
+        "LIBTPU_INIT_ARGS",
+        "TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS",
+        "TORCH_TPU_INTERNAL_XLA_OPTIONS",
+        "TPU_CHIPS_PER_PROCESS_BOUNDS",
+        "TPU_PROCESS_BOUNDS",
+        "XLA_FLAGS",
+    },
 }
 
 
@@ -182,9 +189,10 @@ def find_reads() -> list[str]:
         aliases = _os_aliases(tree)
         if not aliases:
             continue
+        scoped_vars = SCOPED_BOOTSTRAP_VARS.get(path, set())
         for node in ast.walk(tree):
             name = _read_name(node, aliases)
-            if name is None or name in BOOTSTRAP_VARS:
+            if name is None or name in BOOTSTRAP_VARS or name in scoped_vars:
                 continue
             rel = path.relative_to(REPO_ROOT).as_posix()
             found.add(f"{rel}:{name}")
