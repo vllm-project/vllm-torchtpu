@@ -293,7 +293,7 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
         ),
         compute_logits_from_hidden_states=lambda _hs: torch.zeros(1, 8),
         _attn_metadata_builder_ctx=SimpleNamespace(
-            mamba_state_indices=None, unified_mamba_state_indices=None
+            mamba_state_indices=None, unified_mamba_state_indices=None, seq_lens=None
         ),
         mamba_slot_read_offsets=None,
         speculative_config=None,
