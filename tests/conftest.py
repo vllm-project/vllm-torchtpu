@@ -38,6 +38,7 @@ import torch
 HOST_ONLY_TEST_FILES: tuple[str, ...] = (
     "tests/distributed/test_sharded_jax_op.py",
     "tests/layers/adapter/test_small_all_reduce_op.py",
+    "tests/kernels/experimental/test_gated_norm_quant.py",
 )
 
 
