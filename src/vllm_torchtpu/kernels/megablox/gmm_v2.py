@@ -215,6 +215,63 @@ class FusedWeightsRef(RhsRef):
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
+class RhsStreamRef:
+    """Scratch for streaming whole-expert rhs slabs outside emit_pipeline."""
+
+    weight: Any  # [RHS_STREAM_SLOTS, size_k, size_n] VMEM
+    scale: Any | None  # [RHS_STREAM_SLOTS, num_blocks, 1, size_n] VMEM
+    sems: Any  # DMA[RHS_STREAM_SLOTS]
+    run_to_group: Any  # int32[size_group] SMEM, group id of each run of gm tiles
+    run: Any  # int32[2] SMEM, (current run, number of runs)
+
+
+RHS_STREAM_SLOTS = 3
+
+
+def use_rhs_stream(cfgs: "GmmConfigs") -> bool:
+    """Whether rhs slabs are streamed by hand instead of by emit_pipeline.
+
+    Covers whole-expert tiles (one n tile, one k tile) on non-fused projections
+    (GMM2), where every grid step of a group needs the same slab. Streaming them
+    by hand lets the first slab's DMA start before fill_metadata instead of
+    after it, and queues the second slab after the first LHS copy.
+    """
+    return (
+        cfgs.fuse_act is None
+        and cfgs.tiles.tile_n == cfgs.out_size_n
+        and cfgs.tiles.tile_k == cfgs.dims.size_k
+        and not cfgs.rhs_cfgs.has_bias
+        and not cfgs.rhs_cfgs.should_unpack
+    )
+
+
+def rhs_stream_copies(
+    rhs_ref: "WeightsRef", stream_ref: RhsStreamRef, group_id, slot, *, num_chunks: int
+):
+    """DMA descriptors that bring rhs[group_id] into stream slot `slot`."""
+    size_k = rhs_ref.weight.shape[1]
+    chunk_k = size_k // num_chunks
+    copies = [
+        pltpu.make_async_copy(
+            rhs_ref.weight.at[group_id, pl.ds(c * chunk_k, chunk_k)],
+            stream_ref.weight.at[slot, pl.ds(c * chunk_k, chunk_k)],
+            stream_ref.sems.at[slot],
+        )
+        for c in range(num_chunks)
+    ]
+    if stream_ref.scale is not None:
+        copies.append(
+            pltpu.make_async_copy(
+                rhs_ref.scale.at[group_id],
+                stream_ref.scale.at[slot],
+                stream_ref.sems.at[slot],
+            )
+        )
+    return copies
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
 class MetadataRef:
     gm_id_to_group_id: jax.Array
     gm_id_to_m_offset: jax.Array
@@ -511,6 +568,10 @@ def inner_kernel(
             # result of [tile_m, mxu_size] becomes available at the end of every k
             # inner loop which can be used to pipeline subsequent VPU or VST ops with
             # MXU ops for the next [tile_m, mxu_size].
+            hoist_rhs_scale = (
+                cfgs.rhs_cfgs.should_dequantize_after_matmul
+                and rhs_qbs >= cfgs.tiles.tile_k
+            )
             for start_n in range(0, rhs_tile_n, mxu_size):
                 end_n = min(rhs_tile_n, start_n + mxu_size)
                 col_size = end_n - start_n
@@ -550,7 +611,10 @@ def inner_kernel(
                     block_acc *= block_scale.astype(acc_ref.dtype)
 
                     # Apply rhs subchannel scale per quant block.
-                    if cfgs.rhs_cfgs.should_dequantize_after_matmul:
+                    if (
+                        cfgs.rhs_cfgs.should_dequantize_after_matmul
+                        and not hoist_rhs_scale
+                    ):
                         b_id = start_k // rhs_qbs
                         rhs_scale_replicated = tiled_rhs_ref.get_scale(
                             replicate_size=bucket_m
@@ -558,6 +622,11 @@ def inner_kernel(
                         block_acc *= rhs_scale_replicated.astype(acc_ref.dtype)
 
                     acc_n += block_acc
+                if hoist_rhs_scale:
+                    rhs_scale_replicated = tiled_rhs_ref.get_scale(
+                        replicate_size=bucket_m
+                    )[0, :, start_n : start_n + col_size]
+                    acc_n *= rhs_scale_replicated.astype(acc_ref.dtype)
                 acc_list.append(acc_n)
         acc = jnp.concatenate(acc_list, axis=1)
 
@@ -659,6 +728,7 @@ def fill_metadata(
     metadata_ref: MetadataRef,
     *,
     cfgs: GmmConfigs,
+    run_to_group_ref: jax.Array | None = None,
 ) -> jax.Array:
     """Fills the metadata for the given lhs group sizes and group offset.
 
@@ -679,7 +749,9 @@ def fill_metadata(
     """
 
     group_offset = group_offset_ref[0]
-    max_num_group = group_offset + cfgs.dims.size_group
+    max_num_group = jnp.minimum(
+        group_offset + cfgs.dims.size_group, cfgs.dims.size_lhs_group
+    )
     metadata_ref.gm_id_to_m_offset[0] = 0
 
     @jax.named_scope("inner_tm_loop")
@@ -699,7 +771,7 @@ def fill_metadata(
 
     @jax.named_scope("outer_group_loop")
     def outer_group_loop(lhs_group_id, carry):
-        num_gm, start_m_offset = carry
+        num_gm, start_m_offset, num_runs = carry
 
         group_id = lhs_group_id - group_offset
         group_size = lhs_group_sizes_ref[lhs_group_id]
@@ -737,9 +809,17 @@ def fill_metadata(
         )
         lax.fori_loop(num_gm, next_num_gm, tm_loop_fn, start_m_offset)
 
-        return next_num_gm, end_m_offset
+        if run_to_group_ref is not None:
+            run_to_group_ref[jnp.minimum(num_runs, cfgs.dims.size_group - 1)] = group_id
+        num_runs += (curr_num_gm > 0).astype(jnp.int32)
 
-    num_gm, _ = lax.fori_loop(0, max_num_group, outer_group_loop, (0, 0))
+        return next_num_gm, end_m_offset, num_runs
+
+    num_gm, _, num_runs = lax.fori_loop(
+        0, max_num_group, outer_group_loop, (0, 0, jnp.int32(0))
+    )
+    if run_to_group_ref is not None:
+        return num_gm, num_runs
     return num_gm
 
 
@@ -834,34 +914,15 @@ def kernel_main(
     metadata_ref: MetadataRef,
     zero_ref: jax.Array | None,  # [tile_zero_m, num_lanes]
     semaphore_ref: jax.Array | None,  # [1]
+    stream_ref: RhsStreamRef | None,
     *,
     cfgs: GmmConfigs,
 ):
-    """Entry point for GMM kernel.
+    """Entry point for the Pallas grouped matrix multiply (GMM) kernel.
 
-    Computes metadata to determine which rows of lhs needs processing and how
-    they will be tiled. And then, invoke inner kernel using metadata.
-
-    Uses the following notation:
-    - g: rhs group dimension
-    - m: Batch dimension
-    - gm: Batch tiling dimension. Aligned to size_lhs_sublane and has tile size
-        of tile_m. Skips over empty groups and accounts for revisited tiles.
-    - k: in dimension
-    - n: out dimension
-
-    Args:
-        lhs_group_sizes_ref: Reference to the group sizes of lhs.
-        group_offset_ref: Reference to the group offset.
-        lhs_ref: Reference to the lhs.
-        rhs_ref: Reference to the rhs.
-        out_ref: Reference to the out.
-        partial_out_ref: Reference to the partial output.
-        acc_ref: Reference to the accumulator.
-        metadata_ref: Reference to the metadata.
-        zero_ref: Scratch memory for storing zero values used in initialization.
-        semaphore_ref: Semaphore for zero initialization DMAs.
-        cfgs: GmmConfigs.
+    Executes block-pipelined grouped matmul over ragged expert token ranges using
+    precomputed group offsets and tile schedules, with optional fused activation
+    and per-subchannel or per-channel RHS scale application.
     """
 
     num_k = pl.cdiv(cfgs.dims.size_k, cfgs.tiles.tile_k)
@@ -871,13 +932,38 @@ def kernel_main(
         rhs_weight = rhs_ref.weight.bitcast(cfgs.rhs_cfgs.quant_dtype)
         rhs_ref = dataclasses.replace(rhs_ref, weight=rhs_weight)
 
+    rhs_hbm_ref = rhs_ref
+    num_chunks = 2 if cfgs.fuse_act is not None else 1
+    if stream_ref is not None:
+        max_active_group = min(cfgs.dims.size_group, cfgs.dims.size_lhs_group)
+        with jax.named_scope("gmm_stream_first"):
+            group_offset = group_offset_ref[0]
+            first_group = lax.while_loop(
+                lambda g: jnp.logical_and(
+                    g < max_active_group,
+                    lhs_group_sizes_ref[g + group_offset] == 0,
+                ),
+                lambda g: g + 1,
+                jnp.int32(0),
+            )
+
+            @pl.when(first_group < max_active_group)
+            def _():
+                for copy in rhs_stream_copies(
+                    rhs_hbm_ref, stream_ref, first_group, 0, num_chunks=num_chunks
+                ):
+                    copy.start()
+
     # Fill metadata buffer and return number of group & m interations.
     num_gm = fill_metadata(
         lhs_group_sizes_ref,
         group_offset_ref,
         metadata_ref,
         cfgs=cfgs,
+        run_to_group_ref=None if stream_ref is None else stream_ref.run_to_group,
     )
+    if stream_ref is not None:
+        num_gm, num_runs = num_gm
 
     if cfgs.zero_init:
         zero_size = zero_out_start(
@@ -900,23 +986,150 @@ def kernel_main(
             up=rhs_spec,
         )
 
-    # Execute the inner kernel.
-    pipeline_fn = pltpu.emit_pipeline(
-        functools.partial(inner_kernel, cfgs=cfgs),
-        grid=(num_n, num_gm, num_k),
-        in_specs=(lhs_spec, rhs_spec),
-        out_specs=out_spec,
-    )
-
     # Bounded slice requires second last dim to be aligned to the sublane size.
     # rhs_ref uses static tiling thus reshape is not needed.
     lhs_in = lhs_ref.reshape(-1, cfgs.dims.size_lhs_sublane, lhs_ref.shape[-1])
     out_in = out_ref.reshape(-1, cfgs.dims.size_lhs_sublane, out_ref.shape[-1])
     scratches = [partial_out_ref, acc_ref, metadata_ref]
-    pipeline_fn(lhs_in, rhs_ref, out_in, scratches=scratches)
+
+    if stream_ref is None:
+        pipeline_fn = pltpu.emit_pipeline(
+            functools.partial(inner_kernel, cfgs=cfgs),
+            grid=(num_n, num_gm, num_k),
+            in_specs=(lhs_spec, rhs_spec),
+            out_specs=out_spec,
+        )
+        pipeline_fn(lhs_in, rhs_ref, out_in, scratches=scratches)
+    else:
+        stream_ref.run[1] = num_runs
+
+        def slot_rhs_ref(slot) -> RhsRef:
+            def view(lo, hi):
+                return WeightsRef(
+                    weight=stream_ref.weight.at[slot, :, lo:hi],
+                    scale=None
+                    if stream_ref.scale is None
+                    else stream_ref.scale.at[slot, :, :, lo:hi],
+                    bias=None,
+                )
+
+            n = cfgs.out_size_n
+            if cfgs.fuse_act is not None:
+                return FusedWeightsRef(gate=view(0, n), up=view(n, 2 * n))
+            return view(0, n)
+
+        def streamed_kernel(tiled_lhs_ref, tiled_out_ref, *scratch_refs):
+            gm_id = pl.program_id(1)
+            group_id = metadata_ref.gm_id_to_group_id[gm_id]
+            prev_group_id = metadata_ref.gm_id_to_group_id[jnp.maximum(gm_id - 1, 0)]
+            is_new_run = jnp.logical_or(gm_id == 0, group_id != prev_group_id)
+
+            @pl.when(is_new_run)
+            def _():
+                run = jnp.where(gm_id == 0, 0, stream_ref.run[0] + 1)
+                stream_ref.run[0] = run
+
+                @pl.when(jnp.logical_and(gm_id == 0, stream_ref.run[1] > 1))
+                def _():
+                    for copy in rhs_stream_copies(
+                        rhs_hbm_ref,
+                        stream_ref,
+                        stream_ref.run_to_group[1],
+                        1,
+                        num_chunks=num_chunks,
+                    ):
+                        copy.start()
+
+                ahead = run + (RHS_STREAM_SLOTS - 1)
+
+                @pl.when(ahead < stream_ref.run[1])
+                def _():
+                    for copy in rhs_stream_copies(
+                        rhs_hbm_ref,
+                        stream_ref,
+                        stream_ref.run_to_group[ahead],
+                        ahead % RHS_STREAM_SLOTS,
+                        num_chunks=num_chunks,
+                    ):
+                        copy.start()
+
+                for copy in rhs_stream_copies(
+                    rhs_hbm_ref,
+                    stream_ref,
+                    group_id,
+                    run % RHS_STREAM_SLOTS,
+                    num_chunks=num_chunks,
+                ):
+                    copy.wait()
+
+            slot = stream_ref.run[0] % RHS_STREAM_SLOTS
+            inner_kernel(
+                tiled_lhs_ref,
+                slot_rhs_ref(slot),
+                tiled_out_ref,
+                *scratch_refs,
+                cfgs=cfgs,
+            )
+
+        pipeline_fn = pltpu.emit_pipeline(
+            streamed_kernel,
+            grid=(num_n, num_gm, num_k),
+            in_specs=(lhs_spec,),
+            out_specs=out_spec,
+        )
+        pipeline_fn(lhs_in, out_in, scratches=scratches)
 
     if cfgs.zero_init:
         zero_out_end(out_ref, cast(jax.Array, semaphore_ref), zero_size, dims=cfgs.dims)
+
+
+# Empirically tuned (tile_m, bucket_base) schedule on TPU v7x-8 across all
+# 19 Align-8 token buckets (size_m = T * topk, topk = 10) for Qwen3.5 FP8 MoE
+# (GMM1: K=4096, N=2048, fuse_act="silu"; GMM2: K=1024, N=4096, fuse_act=None)
+# under both 80-slot (64 primary + 16 replicated) and 64-slot local expert layouts.
+_FP8_MOE_GMM1_TILES: dict[int, tuple[int, int]] = {
+    40: (16, 8),
+    80: (64, 16),
+    160: (64, 32),
+    240: (64, 32),
+    320: (64, 32),
+    400: (64, 16),
+    480: (256, 64),
+    560: (256, 128),
+    640: (128, 64),
+    720: (64, 16),
+    800: (128, 64),
+    880: (128, 32),
+    960: (128, 64),
+    1120: (128, 128),
+    1280: (128, 64),
+    2560: (256, 64),
+    5120: (256, 64),
+    10240: (256, 64),
+    20480: (256, 128),
+}
+
+_FP8_MOE_GMM2_TILES: dict[int, tuple[int, int]] = {
+    40: (16, 16),
+    80: (16, 16),
+    160: (64, 32),
+    240: (128, 32),
+    320: (32, 32),
+    400: (256, 64),
+    480: (256, 64),
+    560: (256, 64),
+    640: (64, 16),
+    720: (32, 32),
+    800: (512, 128),
+    880: (512, 64),
+    960: (128, 64),
+    1120: (128, 32),
+    1280: (128, 64),
+    2560: (256, 64),
+    5120: (256, 64),
+    10240: (512, 64),
+    20480: (512, 128),
+}
 
 
 def calculate_tiling(
@@ -941,8 +1154,34 @@ def calculate_tiling(
     bf16_bf16_tile_m = 128
     rhs_mod = min(pl.cdiv(16, rhs_bits), 2)
     tile_m = bf16_bf16_tile_m // rhs_mod
+    max_num_buckets = 4
     if lhs_cfgs.should_quantize:
-        tile_m *= 2
+        effective_groups = (
+            min(dims.size_group, 64) if dims.size_group >= 64 else dims.size_group
+        )
+        rows_per_group = dims.size_m // max(1, effective_groups)
+        if dims.size_group >= 16 and rows_per_group < 32:
+            # When avg_tokens_per_expert < 32 (e.g. T <= 128 at topk=10 or
+            # T <= 256 at topk=8), cap at 2 buckets of 64 (tile_m=128) to
+            # avoid 256-row MXU/VMEM tile padding on sparse expert groups.
+            max_num_buckets = 2
+        elif dims.size_group >= 16 and (
+            rows_per_group <= 160 or 640 < rows_per_group <= 1280
+        ):
+            # Keep bucket_base=64 with 4 buckets (tile_m=256) to halve MXU row
+            # padding and VMEM LHS/output buffer size when per-expert token
+            # counts fall in sparse or mid-prefill remainder regimes.
+            pass
+        elif (
+            dims.size_group >= 16
+            and fuse_act is not None
+            and (160 < rows_per_group <= 320 or rows_per_group > 1280)
+        ):
+            # Keep bucket_base=64 with up to 8 buckets (tile_m=512) for fused
+            # gate/up GMM1 so 64-row tail buckets avoid 128-row MXU padding.
+            max_num_buckets = 8
+        else:
+            tile_m *= 2
     tile_m = min(tile_m, dims.size_m)
 
     # To avoid stalling MXU, we add some buffer room where tile_n cannot go
@@ -1007,6 +1246,26 @@ def calculate_tiling(
 
         return lhs_vmem + rhs_vmem + acc_vmem + out_vmem
 
+    if lhs_cfgs.should_quantize and dims.size_group >= 16:
+        table_entry = None
+        if fuse_act is not None and (dims.size_k, dims.size_n) == (4096, 2048):
+            table_entry = _FP8_MOE_GMM1_TILES.get(dims.size_m)
+        elif fuse_act is None and (dims.size_k, dims.size_n) == (1024, 4096):
+            table_entry = _FP8_MOE_GMM2_TILES.get(dims.size_m)
+        if table_entry is not None:
+            cand_tm, cand_bb = table_entry
+            if (
+                cand_bb >= dims.size_lhs_sublane
+                and cand_tm <= dims.size_m
+                and _gmm_vmem_estimate(cand_tm, tile_n, tile_k) <= vmem_limit_bytes
+            ):
+                return TileSizes(
+                    tile_m=cand_tm,
+                    tile_k=tile_k,
+                    tile_n=tile_n,
+                    bucket_base=cand_bb,
+                )
+
     # Multiple k tiles will introduce accumulation overhead. Thus, we first try
     # to fit the tensors into vmem by only adjusting tile_n.
 
@@ -1040,7 +1299,6 @@ def calculate_tiling(
 
     # TODO(alynie, kyuyeunk): max number of bucket was choosen empiirically.
     # Revisit the value to be based on number of instruction memory size.
-    max_num_buckets = 4
     bucket_base = tile_m
     for _ in range(1, max_num_buckets):
         new_tile_m = tile_m + bucket_base
@@ -1068,18 +1326,18 @@ def validate_inputs(
     """Validates the inputs for the GMM kernel."""
 
     size_m = lhs.shape[0]
-    size_group, size_k, size_n = rhs.shape
+    rhs_groups, size_k, size_n = rhs.shape
     size_k *= packing_factor
     size_lhs_group = group_sizes.shape[0]
+    size_group = min(rhs_groups, size_lhs_group)
 
-    assert size_group <= size_lhs_group
     assert lhs.shape == (size_m, size_k)
-    assert rhs.shape == (size_group, size_k // packing_factor, size_n)
+    assert rhs.shape == (rhs_groups, size_k // packing_factor, size_n)
     if rhs_bias is not None:
-        assert rhs_bias.shape == (size_group, 1, size_n)
+        assert rhs_bias.shape == (rhs_groups, 1, size_n)
     if rhs_scale is not None:
         num_quant_blocks = rhs_scale.shape[1]
-        assert rhs_scale.shape == (size_group, num_quant_blocks, 1, size_n)
+        assert rhs_scale.shape == (rhs_groups, num_quant_blocks, 1, size_n)
         assert size_k % num_quant_blocks == 0
 
     assert group_offset.shape == (1,)
@@ -1412,6 +1670,26 @@ def gmm_v2(
         ]
     else:
         scratch_shapes += [None, None]
+
+    if use_rhs_stream(cfgs):
+        rhs_storage = rhs.dtype
+        scratch_shapes.append(
+            RhsStreamRef(
+                weight=pltpu.VMEM(
+                    (RHS_STREAM_SLOTS, dims.size_k, dims.size_n), rhs_storage
+                ),
+                scale=None
+                if rhs_scale is None
+                else pltpu.VMEM(
+                    (RHS_STREAM_SLOTS,) + rhs_scale.shape[1:], jnp.float32
+                ),
+                sems=pltpu.SemaphoreType.DMA((RHS_STREAM_SLOTS,)),
+                run_to_group=pltpu.SMEM((dims.size_group,), jnp.int32),
+                run=pltpu.SMEM((2,), jnp.int32),
+            )
+        )
+    else:
+        scratch_shapes.append(None)
 
     aligned_n = align_to(cfgs.out_size_n, num_lanes)
     out_init = jax.ShapeDtypeStruct((dims.size_m, aligned_n), cfgs.out_dtype)
