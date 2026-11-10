@@ -2139,11 +2139,9 @@ class TPUModelRunner(GPUModelRunner):
                 self._free_mamba_slots.append(self._mamba_slot_by_req_id.pop(req_id))
                 self._mamba_offset_seeded.discard(req_id)
 
-        # Per-call buffer: draft steps rebuild this between fences, so a
-        # shared scratch could be refilled while an upload is in flight.
-        indices = zeros_h2d_source(self, target_num_reqs)
         req_ids = self.input_batch.req_ids
         num_live = max(0, min(num_reqs, len(req_ids) - start_index))
+        slots = []
         for i in range(num_live):
             req_id = req_ids[start_index + i]
             assert req_id is not None
@@ -2153,8 +2151,24 @@ class TPUModelRunner(GPUModelRunner):
                 # preempted owners release their slots in _update_states.
                 slot = self._free_mamba_slots.pop()
                 self._mamba_slot_by_req_id[req_id] = slot
+            slots.append(slot)
+        memo = None
+        if envs.VLLM_TPU_MAMBA_INDICES_REUSE:
+            # Steady decode (and every draft forward of a step) rebuilds the
+            # same slot list: reuse that upload while the values repeat.
+            memo = self.__dict__.setdefault("_mamba_indices_memo", {})
+            hit = memo.get(target_num_reqs)
+            if hit is not None and hit[0] == slots:
+                return hit[1]
+        # Per-call buffer: draft steps rebuild this between fences, so a
+        # shared scratch could be refilled while an upload is in flight.
+        indices = zeros_h2d_source(self, target_num_reqs)
+        for i, slot in enumerate(slots):
             indices[i] = slot
-        return stage_h2d_upload(self, indices)
+        dev = stage_h2d_upload(self, indices)
+        if memo is not None:
+            memo[target_num_reqs] = (slots, dev)
+        return dev
 
     def _build_mamba_copy_plan(
         self,
