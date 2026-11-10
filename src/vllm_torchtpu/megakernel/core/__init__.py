@@ -48,6 +48,7 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
     from .modules import (
         Embedding,
         EmbeddingModule,
+        GQAParams,
         Norm,
         NormModule,
     )
@@ -137,6 +138,7 @@ _LAZY: dict[str, str] = {
     "default_tiles": ".exec_spec",
     "Embedding": ".modules",
     "EmbeddingModule": ".modules",
+    "GQAParams": ".modules",
     "Norm": ".modules",
     "NormModule": ".modules",
     "col_chunk": ".ops",
@@ -204,6 +206,7 @@ __all__ = [
     "ExecSpec",
     "ExtraInput",
     "FrozenDict",
+    "GQAParams",
     "HFParamDecl",
     "KVCacheDecl",
     "LayerType",
