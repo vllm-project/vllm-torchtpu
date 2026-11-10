@@ -25,6 +25,7 @@ from jax._src import dtypes
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels.quantized_matmul import util as quantized_matmul_util
 from vllm_torchtpu.kernels.quantized_matmul.tuned_block_sizes import (
     TunedValue,
     get_device_vmem_limit,
@@ -46,7 +47,10 @@ def quantize_array(
     dtype_info = jnp.finfo(quant_dtype) if is_float else jnp.iinfo(quant_dtype)
     dtype_max = float(dtype_info.max)
 
-    # TODO(kyuyeunk): Investigate performance gain from non xlu transpose.
+    if not quantized_matmul_util.RECIPROCAL_SCALE:
+        # TODO(kyuyeunk): Investigate performance gain from non xlu transpose.
+        scale = jnp.transpose(x_abs_max / dtype_max)
+        return (x / scale).astype(quant_dtype), scale.astype(jnp.float32)
     scale = jnp.transpose(x_abs_max * (1.0 / dtype_max))
     scale = jnp.where(scale == 0, 1.0, scale)
     inv_scale = jnp.float32(1.0) / scale
