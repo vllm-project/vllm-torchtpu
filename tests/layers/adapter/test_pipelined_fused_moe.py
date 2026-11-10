@@ -582,6 +582,7 @@ class TestMoEForwardPrecisionBranches:
         method = MagicMock(spec=VllmFp8MoEMethodTPU)
         # Exercise GMM dispatch; an unset mock attribute would be truthy.
         method._use_adaptive_fused_moe = False
+        method._moe_lowtok_scores_op = None
         method._tpu_activation_str = "silu"
         # A copy-slot layer's bound on the grouped path (the FP8 method's
         # _prebuild_grouped_path sets it from expert_placement.primary_experts).
