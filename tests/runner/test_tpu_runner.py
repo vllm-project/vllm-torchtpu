@@ -4140,7 +4140,9 @@ class TestDpCoordinatedStepProfileStats:
             patch("torch.distributed.all_reduce", side_effect=all_reduce),
             patch(
                 "vllm.distributed.parallel_state.get_dp_group",
-                return_value=SimpleNamespace(cpu_group=None),
+                return_value=SimpleNamespace(
+                    cpu_group=None, rank_in_group=0, world_size=2
+                ),
             ),
         ):
             bucket, _ = TPUModelRunner._dp_coordinated_step(runner, *args, **kwargs)
@@ -4159,7 +4161,7 @@ class TestDpCoordinatedStepProfileStats:
             "total_num_scheduled_tokens": 1023,
             "min_kv_len": 0,
         }
-        other = [1023, 1, 93, 0] + runner_utils_module.encode_dp_profile_stats(
+        other = [1023, 1, 93, 0, 0, 0] + runner_utils_module.encode_dp_profile_stats(
             prefill, True
         )
         runner = self._runner("/tmp/prof", armed=True)
@@ -4175,8 +4177,8 @@ class TestDpCoordinatedStepProfileStats:
     def test_every_rank_sends_the_same_length(self):
         """Armed, unarmed and idle (execute_dummy_batch) ranks must all send
         one length, or the CPU all-reduce mismatches across the slice."""
-        n = 4 + runner_utils_module.DP_PROFILE_STATS_LEN
-        idle = [0, 0, 0, 0] + runner_utils_module.encode_dp_profile_stats(None, True)
+        n = 6 + runner_utils_module.DP_PROFILE_STATS_LEN
+        idle = [0] * 6 + runner_utils_module.encode_dp_profile_stats(None, True)
         stats = {
             "num_reqs": 4,
             "num_prefill_tokens": 0,
@@ -4191,8 +4193,8 @@ class TestDpCoordinatedStepProfileStats:
             _, sent = self._step(runner, idle, 4, 1, 4, **kwargs)
             assert sent == n
 
-    def test_no_phased_profiling_keeps_the_four_field_all_reduce(self):
+    def test_no_phased_profiling_keeps_the_base_all_reduce(self):
         runner = self._runner("", armed=False)
-        _, sent = self._step(runner, [16, 1, 8, 0], 4, 1, 4)
-        assert sent == 4
+        _, sent = self._step(runner, [16, 1, 8, 0, 0, 0], 4, 1, 4)
+        assert sent == 6
         assert runner._dp_step_profile_stats is None
