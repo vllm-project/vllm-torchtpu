@@ -35,10 +35,11 @@ deep in a very long prompt so the kernel never overruns its SMEM. The
 limits arrive after the engine core has built its executor and scheduler;
 until then chunks are cut by token count alone.
 
-On a hybrid attention + GDN model the scheduler also keeps the GDN state
-snapshots a later turn hits on (``core/hybrid_retention.py``) on a KV
-producer: the retention stops are applied to a chunk after the step's
-limits have clipped it.
+On a Qwen3.5 MoE model (``RETENTION_ARCHITECTURES``) the scheduler also
+keeps the GDN state snapshots a later turn hits on
+(``core/hybrid_retention.py``) on a KV producer: the retention stops are
+applied to a chunk after the step's limits have clipped it. Other hybrid
+models keep no snapshots.
 
 The quadratic attention cost and the prefix-aware admission it borrows from
 ``PrefixAwareScheduler`` are options (``core/pp_scheduler_options.py``), each
@@ -76,6 +77,23 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 SCHEDULER_CLS = "vllm_torchtpu.core.pp_chunk_scheduler.TpuPipelineChunkScheduler"
+
+# The architectures whose KV producers keep hybrid-state snapshots: the Qwen3.5
+# MoE models, whose prefill runs used them. Other hybrid models keep the
+# scheduler without retention.
+RETENTION_ARCHITECTURES = frozenset(
+    {"Qwen3_5MoeForCausalLM", "Qwen3_5MoeForConditionalGeneration"}
+)
+
+
+def _retains_hybrid_state(vllm_config: Any) -> bool:
+    """Whether this engine keeps hybrid-state snapshots: a KV producer
+    (``retention_wanted``) serving one of ``RETENTION_ARCHITECTURES``."""
+    model_config = getattr(vllm_config, "model_config", None)
+    architectures = getattr(model_config, "architectures", None) or ()
+    return retention_wanted(vllm_config) and not RETENTION_ARCHITECTURES.isdisjoint(
+        architectures
+    )
 
 
 def uses_dynamic_chunks(vllm_config: Any) -> bool:
@@ -171,7 +189,7 @@ class TpuPipelineChunkScheduler(Scheduler):
             and scheduler_options.get(self.vllm_config).promote_warmest
         )
         self._retention: HybridStateRetention | None = None
-        if retention_wanted(self.vllm_config):
+        if _retains_hybrid_state(self.vllm_config):
             retention = HybridStateRetention(self.kv_cache_manager)
             if retention.enabled:
                 self._retention = retention
