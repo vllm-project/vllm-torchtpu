@@ -39,6 +39,8 @@ from collections.abc import Sequence
 import jax.numpy as jnp
 import torch
 
+from vllm_torchtpu.kernels.quantized_matmul import util as quantized_matmul_util
+
 # MXFP4 block size as stored in checkpoints
 MXFP4_BLOCK_SIZE = 32
 
@@ -75,18 +77,24 @@ def static_per_tensor_quantize_tensor(
     quant_dtype: torch.dtype,
     scale: float,
 ) -> torch.Tensor:
-    """Quantize tensor with a fixed scalar scale and clamp to dtype range."""
+    """Quantize tensor with a fixed scalar scale and clamp to dtype range.
+
+    With quantized_matmul.util.RECIPROCAL_SCALE (off by default) it multiplies
+    by the scale's reciprocal instead of dividing by the scale, and clamps a
+    floating tensor in its own dtype when the scale is 1.0.
+    """
     if scale == 0.0:
         raise ValueError("Quantization scale must be non-zero.")
+    reciprocal = quantized_matmul_util.RECIPROCAL_SCALE
     if quant_dtype.is_floating_point:
         dtype_info = torch.finfo(quant_dtype)
-        if scale == 1.0 and tensor.is_floating_point():
+        if reciprocal and scale == 1.0 and tensor.is_floating_point():
             return torch.clamp(tensor, dtype_info.min, dtype_info.max).to(quant_dtype)
     else:
         dtype_info = torch.iinfo(quant_dtype)
-    quantized = torch.clamp(
-        tensor.to(torch.float32) * (1.0 / scale), dtype_info.min, dtype_info.max
-    )
+    scaled = tensor.to(torch.float32)
+    scaled = scaled * (1.0 / scale) if reciprocal else scaled / scale
+    quantized = torch.clamp(scaled, dtype_info.min, dtype_info.max)
     return quantized.to(quant_dtype)
 
 
