@@ -379,6 +379,17 @@ class Qwen4ExpPooledCache:
             combined = torch.cat([metadata.request_distribution] * 2)
             metadata = replace(metadata, request_distribution=combined[0:3])
             mamba_distribution = combined[3:6]
+        # VLLM_TPU_MAMBA_TAIL_FOLD: serving hands every state group one shared
+        # checkpoint tensor; trace the same input (all zero: no checkpoint).
+        prefill_ckpt = None
+        if any(
+            isinstance(g.kv_cache_spec, MambaSpec)
+            and g.kv_cache_spec.num_prefill_checkpoint_blocks > 0
+            for g in self.groups
+        ):
+            prefill_ckpt = torch.zeros(
+                (2, rows), dtype=torch.int32, device=self.runner.device
+            )
         for group in self.groups:
             spec = group.kv_cache_spec
             state = isinstance(spec, MambaSpec)
@@ -420,6 +431,8 @@ class Qwen4ExpPooledCache:
                     mamba_ckpt_indices=table.clone(),
                     mamba_request_distribution=mamba_distribution,
                 )
+            if state and prefill_ckpt is not None:
+                item = replace(item, mamba_prefill_ckpt=prefill_ckpt)
             result.update({name: item for name in group.layer_names})
         assert next_page <= self.pages, "dummy owner pages exceed the planned pool"
         return result
