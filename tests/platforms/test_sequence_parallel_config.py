@@ -77,11 +77,33 @@ def test_sequence_parallel_compile_sizes(configure_sp_moe, tp, original, expecte
     assert compilation_config.compile_sizes == expected
 
 
+def test_by_default_every_bucket_follows_mains_rule(configure_sp_moe):
+    """Until a model follows each step's form, no step runs replicated, so
+    every compile size must split over TP as on main."""
+    parallel_config = SimpleNamespace(
+        use_sequence_parallel_moe=True,
+        tensor_parallel_size=8,
+        pipeline_parallel_size=1,
+    )
+    model_config = SimpleNamespace(architectures=["Qwen3_5MoeForCausalLM"])
+    compilation_config = SimpleNamespace(
+        compile_sizes=[4, 8, 16, 24, 32, 64, 96, 512, 1024]
+    )
+    vllm_config = SimpleNamespace(
+        parallel_config=parallel_config,
+        model_config=model_config,
+        compilation_config=compilation_config,
+        speculative_config=None,
+    )
+    configure_sp_moe(vllm_config)
+    assert compilation_config.compile_sizes == [16, 32, 64, 512, 1024]
+
+
 @pytest.mark.parametrize(
     "original,expected",
     [
-        # Below sequence_parallel.min_rows() (512 by default) a step runs
-        # replicated, so its bucket need not split over TP.
+        # Below a threshold of 512 rows a step runs replicated, so its bucket
+        # need not split over TP.
         ([4, 8, 24, 48, 96, 512, 1024], [4, 8, 24, 48, 96, 512, 1024]),
         # From the threshold on it must: 520 // 8 = 65 rows per rank.
         ([24, 48, 520, 1024], [24, 48, 1024]),
@@ -90,6 +112,9 @@ def test_sequence_parallel_compile_sizes(configure_sp_moe, tp, original, expecte
 def test_sequence_parallel_keeps_buckets_below_min_rows(
     configure_sp_moe, monkeypatch, original, expected
 ):
+    from vllm_torchtpu.layers.adapter import sequence_parallel
+
+    monkeypatch.setattr(sequence_parallel, "DEFAULT_MIN_ROWS", 512)
     parallel_config = SimpleNamespace(
         use_sequence_parallel_moe=True,
         tensor_parallel_size=8,

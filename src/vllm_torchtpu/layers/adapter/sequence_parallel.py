@@ -29,7 +29,12 @@ _ACTIVE = False
 # extra all-gather and reduce-scatter cost. A layout measured to cross over at a
 # different row count gets an entry in _MIN_ROWS_BY_LAYOUT, keyed on
 # (data_parallel_size, tensor_parallel_size).
-DEFAULT_MIN_ROWS = 512
+#
+# 0 until a model reads each step's form (rows_are_sliced): with it, every
+# sequence-parallel step stays sliced and every compile size follows main's
+# alignment rule, as on main. The change that makes the model follow the
+# step's form raises the threshold.
+DEFAULT_MIN_ROWS = 0
 _MIN_ROWS_BY_LAYOUT: dict[tuple[int, int], int] = {}
 
 

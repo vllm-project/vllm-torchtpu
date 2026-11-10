@@ -673,8 +673,8 @@ def _patch_sequence_parallel_moe_admission() -> None:
 
     logger.info(
         "Applied TPU patch: sequence-parallel MoE %s.",
-        f"admitted (steps below {sequence_parallel.DEFAULT_MIN_ROWS} rows, or "
-        "their layout's own threshold, run replicated)"
+        "admitted (a step below its layout's row threshold runs replicated; "
+        f"the default threshold is {sequence_parallel.DEFAULT_MIN_ROWS} rows)"
         if envs.TPU_MOE_SEQUENCE_PARALLEL
         else "disabled",
     )
