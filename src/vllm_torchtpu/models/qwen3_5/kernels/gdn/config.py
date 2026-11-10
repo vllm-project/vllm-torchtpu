@@ -83,6 +83,9 @@ class GDNConfig:
     window_size: int = 1
     # Indicate the use of unified pool.
     is_shared: bool = False
+    # qkv streams as 2D bf16 rows [tokens, dim_size] in 16-row aligned DMA
+    # windows (fused_conv1d_gdn bf16_qkv_mode=2) rather than f32 rows.
+    qkv_2d: bool = False
 
     @property
     def conv_hbm_offset(self) -> int:
@@ -245,7 +248,17 @@ class GDNConfig:
             carry_conv_scratch = pltpu.VMEM(conv_shape, jnp.float32)
             carry_recurrent_scratch = pltpu.VMEM(recurrent_shape, jnp.float32)
 
+        act_scratch = None
+        if self.dtypes.act_in == jnp.bfloat16.dtype:
+            scratch_chunk = (
+                pl.cdiv(self.chunk_size, 16) * 16 if self.qkv_2d else self.chunk_size
+            )
+            act_scratch = pltpu.VMEM(
+                (self.seq_tile_size, scratch_chunk, 1, self.dim_size), jnp.float32
+            )
+
         return dict(
             carry_conv_scratch_ref=carry_conv_scratch,
             carry_recurrent_scratch_ref=carry_recurrent_scratch,
+            act_scratch_ref=act_scratch,
         )
