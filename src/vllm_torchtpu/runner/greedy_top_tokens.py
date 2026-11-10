@@ -1112,30 +1112,34 @@ def _ensure_head_shard_buffers(
     shard_indices = getattr(head, "shard_indices", None)
     if shard_indices is None:
         return
-    if not hasattr(head, "org_vocab_start_index") and hasattr(
-        shard_indices, "org_vocab_start_index"
-    ):
-        head.register_buffer(
-            "org_vocab_start_index",
-            torch.tensor(
-                shard_indices.org_vocab_start_index,
-                dtype=torch.int64,
-                device=device,
-            ),
-            persistent=False,
-        )
-    if not hasattr(head, "num_org_vocab_padding") and hasattr(
-        shard_indices, "num_org_vocab_padding"
-    ):
-        head.register_buffer(
-            "num_org_vocab_padding",
-            torch.tensor(
-                shard_indices.num_org_vocab_padding,
-                dtype=torch.int64,
-                device=device,
-            ),
-            persistent=False,
-        )
+    if hasattr(shard_indices, "org_vocab_start_index"):
+        existing_start = getattr(head, "org_vocab_start_index", None)
+        if not isinstance(existing_start, torch.Tensor):
+            head.register_buffer(
+                "org_vocab_start_index",
+                torch.tensor(
+                    shard_indices.org_vocab_start_index,
+                    dtype=torch.int32,
+                    device=device,
+                ),
+                persistent=False,
+            )
+        elif existing_start.dtype != torch.int32:
+            head.org_vocab_start_index = existing_start.to(torch.int32)
+    if hasattr(shard_indices, "num_org_vocab_padding"):
+        existing_pad = getattr(head, "num_org_vocab_padding", None)
+        if not isinstance(existing_pad, torch.Tensor):
+            head.register_buffer(
+                "num_org_vocab_padding",
+                torch.tensor(
+                    shard_indices.num_org_vocab_padding,
+                    dtype=torch.int32,
+                    device=device,
+                ),
+                persistent=False,
+            )
+        elif existing_pad.dtype != torch.int32:
+            head.num_org_vocab_padding = existing_pad.to(torch.int32)
 
 
 def _apply_w8a8_lm_head(

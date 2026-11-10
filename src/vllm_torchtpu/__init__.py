@@ -2053,33 +2053,33 @@ def _patch_vllm_vocab_parallel_embedding() -> None:
             self.register_buffer(
                 "org_vocab_start_index",
                 torch.tensor(
-                    self.shard_indices.org_vocab_start_index, dtype=torch.int64
+                    self.shard_indices.org_vocab_start_index, dtype=torch.int32
                 ),
                 persistent=False,
             )
             self.register_buffer(
                 "org_vocab_end_index",
-                torch.tensor(self.shard_indices.org_vocab_end_index, dtype=torch.int64),
+                torch.tensor(self.shard_indices.org_vocab_end_index, dtype=torch.int32),
                 persistent=False,
             )
             self.register_buffer(
                 "num_org_vocab_padding",
                 torch.tensor(
-                    self.shard_indices.num_org_vocab_padding, dtype=torch.int64
+                    self.shard_indices.num_org_vocab_padding, dtype=torch.int32
                 ),
                 persistent=False,
             )
             self.register_buffer(
                 "added_vocab_start_index",
                 torch.tensor(
-                    self.shard_indices.added_vocab_start_index, dtype=torch.int64
+                    self.shard_indices.added_vocab_start_index, dtype=torch.int32
                 ),
                 persistent=False,
             )
             self.register_buffer(
                 "added_vocab_end_index",
                 torch.tensor(
-                    self.shard_indices.added_vocab_end_index, dtype=torch.int64
+                    self.shard_indices.added_vocab_end_index, dtype=torch.int32
                 ),
                 persistent=False,
             )
@@ -2135,12 +2135,13 @@ def _patch_vllm_vocab_parallel_embedding() -> None:
         added_vocab_end_index: int | torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         device = input_.device
-        dtype = input_.dtype
+        if input_.dtype != torch.int32:
+            input_ = input_.to(torch.int32)
 
         def _to_tensor(val: int | torch.Tensor) -> torch.Tensor:
             if isinstance(val, torch.Tensor):
-                return val.to(device=device)
-            return torch.tensor(val, dtype=dtype, device=device)
+                return val.to(device=device, dtype=torch.int32)
+            return torch.tensor(val, dtype=torch.int32, device=device)
 
         start = _to_tensor(org_vocab_start_index)
         end = _to_tensor(org_vocab_end_index)
