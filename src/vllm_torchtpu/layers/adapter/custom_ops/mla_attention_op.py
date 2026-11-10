@@ -22,6 +22,7 @@ import jax.numpy as jnp
 import torch
 from torch.nn import Parameter
 from torch_tpu._internal import pallas
+from vllm.compilation import backends as vllm_compilation_backends
 from vllm.config import CacheConfig, get_current_vllm_config_or_none
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention import mla_attention
@@ -70,6 +71,7 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.config import (
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
     pcp_streaming_jax_op,
 )
+from vllm_torchtpu.kernels.mla.absorb_q import MIN_TOKENS as ABSORB_Q_MIN_TOKENS
 from vllm_torchtpu.kernels.mla.kv_cache_utils import OOB_PAGE, _row_positions
 from vllm_torchtpu.kernels.quantized_matmul import fp8_skinny
 from vllm_torchtpu.layers.adapter import small_all_reduce_op
@@ -1844,10 +1846,32 @@ class VllmTPUMLAAttention(MLAAttention):
         self.sparse_mla_dcp_rope_op = None
         self.sparse_mla_dcp_send_op = None
         self.sparse_mla_dcp_fused_op = None
+        self.sparse_mla_dcp_mil_op = None
+        self.sparse_mla_dcp_rope_mil_op = None
         if dcp_size > 1:
             self.sparse_mla_dcp_op = impl._build_sparse_mla_dcp_op(
                 self, dcp_size, impl.dcp_interleave_size
             )
+            # TPU_DCP_MERGE_INTERLEAVE: the variants that run the V-space merge
+            # piece by piece inside the attention loop.
+            mil = bool(
+                envs.TPU_DCP_MERGE_INTERLEAVE
+                and envs.TPU_DCP_MERGE_VSPACE_FUSED
+                and envs.TPU_DCP_RANK_OPERAND
+                and self.W_UV_dcp_qrep is not None
+            )
+            if mil:
+                self.sparse_mla_dcp_mil_op = impl._build_sparse_mla_dcp_op(
+                    self, dcp_size, impl.dcp_interleave_size, merge_interleave=True
+                )
+                if envs.TPU_MLA_DECODE_PROLOGUE and self.dcp_q_replicate:
+                    self.sparse_mla_dcp_rope_mil_op = impl._build_sparse_mla_dcp_op(
+                        self,
+                        dcp_size,
+                        impl.dcp_interleave_size,
+                        q_rope=True,
+                        merge_interleave=True,
+                    )
             # TPU_MLA_DECODE_PROLOGUE: the variant that takes the raw q head
             # and ropes q_pe in the attention kernel (query replication only).
             if envs.TPU_MLA_DECODE_PROLOGUE and self.dcp_q_replicate:
@@ -2201,23 +2225,48 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
 
         # `dcp_group_size` is 1 unless query replication is on, in which case
         # the projection already returned the whole DCP group's heads.
-        q = q.view(-1, self.num_heads * self.dcp_group_size, self.qk_head_dim)
-        q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-
-        # Add head dim of 1 to k_pe
-        k_pe = k_pe.unsqueeze(1)
-
         q_rope_table = None
         fold_q_rope = (
             getattr(self, "decode_prologue", False)
             and getattr(self, "_rope_neox_permuted", False)
             and llama_4_scaling is None
         )
+        # TPU_MLA_ABSORB_FULL_Q (with the prologue): q stays [T, H * 256] as
+        # q_b wrote it. Viewing it [T, H, 256] is a relayout of all of q, which
+        # XLA runs for whichever op reads that view; here none does: absorb_q
+        # reads q itself and hands the prologue kernel each head's last 128
+        # lanes. Fixed at trace time on the bucket size: decode buckets keep
+        # XLA's einsum. The backbone only: it is traced per bucket, so the
+        # comparison is static; the MTP drafter has one graph for every bucket.
+        absorb_full_q = (
+            envs.TPU_MLA_ABSORB_FULL_Q
+            and fold_q_rope
+            and self.qk_head_dim % 128 == 0
+            and vllm_compilation_backends.model_tag == "backbone"
+            and q.shape[0] > envs.bucket_gate_edge(ABSORB_Q_MIN_TOKENS)
+        )
+        if absorb_full_q:
+            q = q.reshape(q.shape[0], -1)
+            # Only dtype and token count are read from these (the sparse DCP
+            # path takes q_dcp_replicated); no per-head view of q exists.
+            q_nope = q_pe = q
+        else:
+            q = q.view(-1, self.num_heads * self.dcp_group_size, self.qk_head_dim)
+            q_nope, q_pe = q.split(
+                [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+            )
+
+        # Add head dim of 1 to k_pe
+        k_pe = k_pe.unsqueeze(1)
+
         if fold_q_rope:
-            # k_pe exactly as below (the unused q half is dead code to XLA);
+            # k_pe exactly as below (the unused q half is dead code to XLA;
+            # under TPU_MLA_ABSORB_FULL_Q it is k_pe's own, so q is not read);
             # q_pe is roped in the attention kernel from the raw q head.
             k_pe_dtype = k_pe.dtype
-            _, k_pe = rope_half_split(self.rotary_emb, positions, q_pe, k_pe)
+            _, k_pe = rope_half_split(
+                self.rotary_emb, positions, k_pe if absorb_full_q else q_pe, k_pe
+            )
             assert k_pe is not None
             k_pe = k_pe.to(dtype=k_pe_dtype)
             q_rope_table = mla_q_rope_table(self.rotary_emb, positions, q)
@@ -2259,12 +2308,15 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         q_dcp_replicated = None
         if self.dcp_q_replicate:
             if q_rope_table is not None:
-                # The raw q head view (q_pe un-roped) + the rope table.
+                # The raw q head view (q_pe un-roped) + the rope table; under
+                # TPU_MLA_ABSORB_FULL_Q, q [T, H * 256] twice (2-D marks it).
                 q_dcp_replicated = (q_nope, q, q_rope_table)
             elif self.is_sparse:
                 q_dcp_replicated = (q_nope, q_pe)
             q_proj_layer = cast(DCPGroupColumnParallelLinear, self._q_proj_layer())
-            if q_dcp_replicated is not None and topk_indices is not None:
+            if absorb_full_q:
+                pass  # this rank's shard is dead and never sliced
+            elif q_dcp_replicated is not None and topk_indices is not None:
                 # The sparse DCP path reads only q_dcp_replicated, so this
                 # rank's shard is dead. Slice the same heads on every rank: a
                 # rank-dependent slice makes every rank trace a different graph,

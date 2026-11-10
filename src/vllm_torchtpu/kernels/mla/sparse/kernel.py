@@ -14,6 +14,7 @@
 """TPU-Friendly MLA Ragged Paged Attention kernel - GLM5.2 DeepSeek Sparse Attention."""
 
 import functools
+from collections.abc import Callable
 from typing import Any, cast
 
 import jax
@@ -1624,6 +1625,7 @@ def _attention_kernel(
     # (nope 192 | rope 64) and a second input `tab_hbm_ref` f32[tokens, 2, 128]
     # holds per-token C = [cos, cos, cos, cos], S = [-sin, sin, -sin, sin]
     # (each with its own VMEM double buffer, the scratch ref before q_pe's).
+    # (Or only lanes 128:256 of it, `[tokens, heads, 128]`: TPU_MLA_ABSORB_FULL_Q.)
     # `load_bq` takes lanes 128:256 of each head (q_nope[128:192] | q_pe),
     # rotates the NeoX halves of q_pe with lane rolls, forms x*C + rot(x)*S
     # in f32 (bf16 products are exact there; one add, one RNE rounding) and
@@ -2226,7 +2228,7 @@ def _attention_kernel(
                     q_pe_hbm_ref.at[
                         pl.ds(seq_idx_start, batch_size),
                         :,
-                        pl.ds(Q_ROPE_HEAD_DIM - 128, 128),
+                        pl.ds(q_pe_hbm_ref.shape[-1] - 128, 128),
                     ],
                     bq_pe_x2_ref.at[bq_sem_idx, :],
                     sem,
@@ -2362,7 +2364,9 @@ def _attention_kernel(
         if q_rope:
             # The caller's rope + concat + zero pad, rebuilt in VMEM: lanes
             # 128:256 of the raw head are one aligned vreg column.
-            if q128:
+            if q128 or bq_pe_x2_ref.shape[-1] == 128:
+                # (A 128-lane q_pe is already those lanes: absorb_q_full's
+                # tail, TPU_MLA_ABSORB_FULL_Q.)
                 raw = bq_pe_x2_ref.at[bq_sem_idx, batch_idx][...]
             else:
                 raw = bq_pe_x2_ref.at[bq_sem_idx, batch_idx][:, 128:Q_ROPE_HEAD_DIM]
@@ -3343,6 +3347,17 @@ def _attention_kernel(
     ### ------- Kernel end ------- ###
 
 
+# TPU_DCP_MLA_PIECE_ORDER values (see `out_pieces_order`).
+PIECE_ORDERS = ("barrier", "edge", "small_barrier", "none")
+
+
+def _order_zero(x: jax.Array) -> jax.Array:
+    """An int32 0 that XLA cannot fold, read from one element of `x`."""
+    v = lax.slice(x, (0,) * x.ndim, (1,) * x.ndim).reshape(())
+    # False for every float, NaN included; not foldable without knowing v.
+    return ((v != v) & (v == v)).astype(jnp.int32)
+
+
 def merge_pieces_supported(num_tokens: int, chunk_size: int, pieces: int) -> bool:
     """Whether `out_pieces=pieces` applies to a `num_tokens` bucket attended in
     `chunk_size` chunks: several whole chunks, and pieces that are whole chunks
@@ -3439,6 +3454,9 @@ def prepare_outputs(
         "out_pieces_fault",
         "out_pieces_gather_first",
         "packed_rope",
+        "out_pieces_order",
+        "out_pieces_epilogue",
+        "out_pieces_interleave",
     ),
 )
 def sparse_ragged_paged_attention(
@@ -3496,6 +3514,10 @@ def sparse_ragged_paged_attention(
     send_peer: jax.Array | None = None,
     send_recv_in: jax.Array | None = None,
     packed_rope: bool = False,
+    out_pieces_order: str = "barrier",
+    out_pieces_epilogue: Callable[..., tuple[jax.Array, jax.Array]] | None = None,
+    out_pieces_epilogue_args: tuple = (),
+    out_pieces_interleave: int = 0,
 ) -> jax.Array | tuple[jax.Array, ...]:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -3655,6 +3677,28 @@ def sparse_ragged_paged_attention(
       out_pieces_gather_first: With `out_pieces` taken: issue every chunk's
         gather before any attention and tie the gathers of the chunks after
         piece 0 to piece 0's buffers with an optimization barrier. Same values.
+      out_pieces_order: With `out_pieces` taken, how piece k's first attention
+        call waits for piece k-1's (`PIECE_ORDERS`): "edge" adds a zero read
+        from piece k-1's lse to its scalar prefetch (pieces of several chunks;
+        one-chunk pieces keep the barrier); "barrier" (default) and
+        "small_barrier" use optimization barriers; "none" nothing. Same values.
+      out_pieces_epilogue: With `out_pieces` taken, a function (static; a
+        module-level function, so the jit cache key is stable) called as
+        `epilogue(piece_out, piece_lse, *out_pieces_epilogue_args)` once per
+        piece, right after the piece's last attention call. It returns
+        `(result, tie)`: `result` replaces the piece in the output (the call
+        returns `(concat(results), lse)`), and `tie` is what the next piece's
+        first attention call is ordered after (`out_pieces_interleave`).
+        TPU_DCP_MERGE_INTERLEAVE: the DCP V-space merge of the piece, whose
+        `tie` is its reduce-scatter operand.
+      out_pieces_interleave: With `out_pieces_epilogue`: 1 hands the next
+        piece's first call its q through a barrier with the previous call's
+        output and piece's `tie`, so the epilogue up to its reduce-scatter
+        operand runs before that call and the reduce-scatter can be issued
+        under it. 2 also ties chunk j's gather input to the `tie` of the piece
+        two pieces back, so the SparseCore does not queue every gather ahead
+        of the reduce-scatters. Values unchanged: the epilogue's arithmetic is
+        per piece and only the schedule moves.
       packed_rope: SparseCore layout only. `cache_kv_rope` stores each token's
         rope in 16 words, eight tokens per row
         (`SparseMLAKVCacheSpec.packed_rope`); the gather expands it to the
@@ -3671,6 +3715,8 @@ def sparse_ragged_paged_attention(
             f"cache_layout must be {TENSORCORE_CACHE_LAYOUT!r} or "
             f"{SPARSECORE_CACHE_LAYOUT!r}, got {cache_layout!r}"
         )
+    if out_pieces_order not in PIECE_ORDERS:
+        raise ValueError(f"unknown out_pieces_order {out_pieces_order!r}")
     sparsecore_layout = cache_layout == SPARSECORE_CACHE_LAYOUT
     # Tokens per ROPE cache row: four padded 128-byte rows, or eight packed.
     rope_tokens_per_row = 8 if packed_rope else 4
@@ -3738,10 +3784,11 @@ def sparse_ragged_paged_attention(
             "(int32 [2]: rank, lane)"
         )
     if q_rope_table is not None:
-        if q_pe is None or q_pe.shape[-1] != Q_ROPE_HEAD_DIM:
+        # The raw head, or only its last 128 lanes (TPU_MLA_ABSORB_FULL_Q).
+        if q_pe is None or q_pe.shape[-1] not in (Q_ROPE_HEAD_DIM, 128):
             raise ValueError(
                 "q_rope_table needs the raw q head view as q_pe, "
-                f"[tokens, heads, {Q_ROPE_HEAD_DIM}]"
+                f"[tokens, heads, {Q_ROPE_HEAD_DIM}], or its last 128 lanes"
             )
         if q_rope_table.shape != (q.shape[0], 2, 128) or (
             q_rope_table.dtype != jnp.float32
@@ -4066,11 +4113,23 @@ def sparse_ragged_paged_attention(
     piece_outs: list[jax.Array] = []
     piece_lses: list[jax.Array] = []
 
-    def run_chunk(i, chunk_lse, q_in=None, **extra) -> Any:
+    def run_chunk(i, chunk_lse, q_in=None, gather_tie=None, **extra) -> Any:
         # Any: the checker cannot tell the return_lse / kv_write tuple shapes
         # of sparse_attention_chunk apart.
         start_pos = i * gather_and_attention_chunk_size
         end_pos = min(start_pos + gather_and_attention_chunk_size, q.shape[0])
+        chunk_window = (
+            window_indices_all
+            if fused_prep or window_indices_all is None
+            else window_indices_all[i]
+            if isinstance(window_indices_all, tuple)
+            else window_indices_all[
+                i * chunk_window_rows : (i + 1) * chunk_window_rows
+            ]
+        )
+        if gather_tie is not None and chunk_window is not None:
+            # out_pieces_interleave=2: the gather's index input waits for it.
+            chunk_window, _ = lax.optimization_barrier((chunk_window, gather_tie))
         return sparse_attention_chunk(
             q if q_in is None else q_in,
             cache_kv_nope,
@@ -4098,15 +4157,7 @@ def sparse_ragged_paged_attention(
             topk_cap=topk_cap,
             capped_live_rows=capped_live_rows,
             topk_override=topk,
-            window_indices=(
-                window_indices_all
-                if fused_prep or window_indices_all is None
-                else window_indices_all[i]
-                if isinstance(window_indices_all, tuple)
-                else window_indices_all[
-                    i * chunk_window_rows : (i + 1) * chunk_window_rows
-                ]
-            ),
+            window_indices=chunk_window,
             gather_live_in_indices=fused_prep,
             q_pe=q_pe,
             lse_lane_dense=lse_lane_dense,
@@ -4150,6 +4201,18 @@ def sparse_ragged_paged_attention(
     if gather_first:
         pre = [run_chunk(i, None, gather_only=True) for i in range(num_chunks)]
     chunks_per_piece = max(1, piece_rows // gather_and_attention_chunk_size)
+    # "edge" only where a piece spans chunks; one-chunk pieces keep the barrier.
+    edge = out_pieces_order == "edge" and chunks_per_piece > 1
+
+    if out_pieces_epilogue is not None and piece_rows:
+        if out_pieces_interleave not in (0, 1, 2):
+            raise ValueError(f"unknown out_pieces_interleave {out_pieces_interleave}")
+        if piece_rows * out_pieces != q.shape[0] or kv_write is not None:
+            raise ValueError(
+                "out_pieces_epilogue needs pieces covering the bucket exactly"
+            )
+    piece_results: list[jax.Array] = []
+    piece_ties: list[jax.Array] = []
 
     prev_out = None
     for i in range(num_chunks):
@@ -4174,12 +4237,45 @@ def sparse_ragged_paged_attention(
         extra = {"out_piece": out_piece}
         if pre[i] is not None:
             extra["pre_gathered"] = pre[i]
-        if piece_rows and i:
+        interleave = (
+            out_pieces_interleave if piece_rows and out_pieces_epilogue else 0
+        )
+        if interleave >= 2 and pre[i] is None:
+            # Chunk i's gather waits for the reduce-scatter operand of the piece
+            # two back, so it is enqueued on the SparseCore after that
+            # reduce-scatter instead of with every other gather up front.
+            back = start_pos // piece_rows - 2
+            if back >= 0:
+                extra["gather_tie"] = piece_ties[back]
+        if interleave and i and start_pos == offset:
+            # The previous piece's epilogue (V-up, weight: the reduce-scatter
+            # operand) runs before this piece's first attention call, and so
+            # its reduce-scatter can start under it. prev_out keeps the
+            # incumbent's call order.
+            extra["q_in"], _, _ = lax.optimization_barrier(
+                (q, prev_out, piece_ties[-1])
+            )
+        elif (
+            piece_rows
+            and i
+            and (
+                out_pieces_order == "barrier"
+                or (out_pieces_order == "edge" and not edge)
+            )
+        ):
             # Merge pieces leave the attention calls independent, and XLA is
             # then free to run them in any order (it reversed them). Keep the
             # incumbent's order -- the merge's chunk order -- by handing call
             # i its (read-only) q through a barrier with call i-1's output.
             extra["q_in"], _ = lax.optimization_barrier((q, prev_out))
+        elif piece_rows and i and start_pos == offset:
+            # A piece's later chunks already read its lse; order its first.
+            if edge:
+                extra["order_dep"] = _order_zero(piece_lses[-1])
+            elif out_pieces_order == "small_barrier":
+                extra["order_dep"], _ = lax.optimization_barrier(
+                    (jnp.zeros((2,), jnp.int32), piece_lses[-1])
+                )
         result = run_chunk(i, piece_lse, **extra)
         prev_out = result[0]
         if kv_write is not None:
@@ -4187,6 +4283,16 @@ def sparse_ragged_paged_attention(
         if piece_rows:
             piece_outs.append(result[0])
             piece_lses.append(result[1])
+            last_of_piece = (
+                start_pos + gather_and_attention_chunk_size >= offset + piece_rows
+                or i == num_chunks - 1
+            )
+            if out_pieces_epilogue is not None and last_of_piece:
+                merged, tie = out_pieces_epilogue(
+                    result[0], result[1], *out_pieces_epilogue_args
+                )
+                piece_results.append(merged)
+                piece_ties.append(tie)
         elif return_lse:
             q, lse = result
         else:
@@ -4195,8 +4301,14 @@ def sparse_ragged_paged_attention(
     if piece_rows:
         if out_pieces_fault == "swap":
             piece_outs[0], piece_outs[1] = piece_outs[1], piece_outs[0]
-        q = jnp.concatenate(piece_outs, axis=0)
         lse = jnp.concatenate(piece_lses, axis=0)
+        if out_pieces_epilogue is not None:
+            # The pieces' epilogue results (the merged rows), not the partials.
+            return (
+                jnp.concatenate(piece_results, axis=0),
+                lse[:, :actual_num_q_heads],
+            )
+        q = jnp.concatenate(piece_outs, axis=0)
 
     # [max_num_tokens, actual_num_q_heads, actual_head_dim]
     out = prepare_outputs(q, actual_num_q_heads, actual_head_dim)
@@ -4333,6 +4445,7 @@ def sparse_attention_chunk(
     send_peer: jax.Array | None = None,
     send_recv_in: jax.Array | None = None,
     packed_rope: bool = False,
+    order_dep: jax.Array | None = None,
 ):
     """Gathers and attends query rows `[start_pos, min(end_pos, token_end))`.
 
@@ -4379,6 +4492,8 @@ def sparse_attention_chunk(
     `packed_rope` (SparseCore layout only): the rope cache holds 16 words per
     token (and `kv_write` writes 16-word rope tokens); the gather returns the
     same padded rows either way.
+    `order_dep`: int32 zeros (scalar or [2]) added to the kernel's semaphore
+    index prefetch, so the call waits for whatever computed them.
     """
     if kv_write is not None and not gather_live_in_indices:
         raise ValueError("kv_write rides the fused-prep capped gather only")
@@ -4625,7 +4740,9 @@ def sparse_attention_chunk(
             kv_lens,
             jnp.array(bounds, jnp.int32),
             # (bi_sem_idx, bo_sem_idx)
-            jnp.zeros((2,), jnp.int32),
+            jnp.zeros((2,), jnp.int32)
+            if order_dep is None
+            else jnp.zeros((2,), jnp.int32) + order_dep,
         )
         if live_views is not None:
             scalar_prefetches += (group_tab,)

@@ -152,12 +152,14 @@ def _problem(rng, query_tokens, seq_q, topk=2048):
     )
 
 
-def _kernel(p, *, candidate, fault=None, q_pe=None):
+def _kernel(p, *, candidate, fault=None, q_pe=None, tail=False):
     cache = _cos_sin_cache()
     kw = {}
     if candidate:
         kw = dict(
-            q_pe=p["q_raw"],
+            # tail: only the raw head's last 128 lanes, as absorb_q_full
+            # writes them (TPU_MLA_ABSORB_FULL_Q).
+            q_pe=p["q_raw"][..., RAW_HEAD - 128 :] if tail else p["q_raw"],
             q_rope_table=rope_table(p["positions"], cache),
             lse_in_kernel=True,
             prologue_fault=fault,
@@ -228,6 +230,18 @@ class DecodePrologueKernelTest(parameterized.TestCase):
         # at most 16) keep the sentinel the kernel itself laid down.
         rup = -(-real // 16) * 16
         assert np.all(np.asarray(lse)[rup:] == -np.inf)
+
+    @parameterized.parameters((16, (4, 4, 4, 1)), (512, (4, 4, 492)))
+    def test_tail_lanes_bit_identical(self, query_tokens, seq_q):
+        """TPU_MLA_ABSORB_FULL_Q: q_pe as the raw head's last 128 lanes
+        ([T, H, 128]) gives the same bits as the raw head [T, H, 256]."""
+        _require_tpu()
+        p = _problem(np.random.default_rng(2024 + query_tokens), query_tokens, seq_q)
+        ref, ref_lse = _kernel(p, candidate=True)
+        out, lse = _kernel(p, candidate=True, tail=True)
+        np.testing.assert_array_equal(_bits16(out), _bits16(ref))
+        np.testing.assert_array_equal(_bits32(lse), _bits32(ref_lse))
+        assert np.isfinite(np.asarray(out, np.float32)).all()
 
     def test_zero_real_tokens(self):
         """A bucket with no live row: the grid's one step only lays down the

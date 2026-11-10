@@ -59,6 +59,8 @@ if TYPE_CHECKING:
     TPU_DCP_MERGE_CHUNKED_SMALL: int = 2
     TPU_DCP_MLA_MERGE_PIECES: int = 2
     TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS: int = 2048
+    TPU_DCP_MLA_PIECE_ORDER: str = "barrier"
+    TPU_DCP_MERGE_INTERLEAVE: int = 0
     TPU_DCP_MERGE_WEIGHTED_HM: bool = True
     TPU_DCP_MERGE_WEIGHTED_HM_MIN_TOKENS: int = 2048
     TPU_MLA_DECODE_BODY_LEVERS: str = "1"
@@ -204,6 +206,7 @@ if TYPE_CHECKING:
     TPU_SPARSE_MLA_ROPE_LAYOUT: str = "sparsecore"
     TPU_MLA_TC_KV_WRITER: bool = False
     TPU_MLA_DECODE_PROLOGUE: bool = False
+    TPU_MLA_ABSORB_FULL_Q: bool = False
     TPU_MLA_KV_WRITE_IN_GATHER: bool = False
     TPU_INDEXER_QB_OVERLAP: bool = False
     TPU_SPARSE_MLA_PACKED_ROPE: bool = False
@@ -756,6 +759,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS": env_int(
         "TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS", 2048
     ),
+    # Merge-piece attention order (sparse_mla.PIECE_ORDERS); "edge" survives XLA.
+    "TPU_DCP_MLA_PIECE_ORDER": env_str("TPU_DCP_MLA_PIECE_ORDER", "barrier"),
+    # Merge pieces with the V-space merge: run each piece's V-up + lse weight
+    # and issue its reduce-scatter inside the attention loop, right after the
+    # piece's last attention call (sparse_mla.sparse_ragged_paged_attention's
+    # `out_pieces_epilogue`). 0 off; 1 the next piece's attention waits for the
+    # reduce-scatter operand; 2 also holds chunk j's SparseCore gather behind
+    # piece j-2's operand, so the gathers do not queue ahead of the
+    # reduce-scatters on the SparseCore. Same values.
+    "TPU_DCP_MERGE_INTERLEAVE": env_int("TPU_DCP_MERGE_INTERLEAVE", 0),
     # The chunked reduce-scatter merge (TPU_DCP_MERGE_CHUNKED) builds each
     # chunk's weighted operand heads-major in one TensorCore Pallas kernel
     # (`kernels/lse_rescale.py`, as `cp_lse_ag_out_rs`) instead of a
@@ -926,6 +939,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # XLA-initialised aliased lse). Needs TPU_MLA_SPARSE_SPLIT_Q and
     # TPU_MLA_ROPE_NEOX_PERMUTE.
     "TPU_MLA_DECODE_PROLOGUE": env_bool("TPU_MLA_DECODE_PROLOGUE", default=False),
+    # With TPU_MLA_DECODE_PROLOGUE, backbone buckets the Pallas absorb_q takes
+    # (T >= absorb_q.MIN_TOKENS): absorb_q reads the q_b output [T, H * 256]
+    # as written and also hands the prologue kernel each head's last 128
+    # lanes, so nothing views q as [T, H, 256] and XLA no longer relayouts
+    # all of q ahead of the two. Decode buckets and the drafter unchanged.
+    "TPU_MLA_ABSORB_FULL_Q": env_bool("TPU_MLA_ABSORB_FULL_Q", default=False),
     # DCP sparse MLA, fused-prep decode buckets (TPU_DCP_MLA_FUSED_PREP): the
     # SparseCore gather feeding the attention kernel writes the step's KV rows
     # into both caches itself (then fences), instead of a separate cache
