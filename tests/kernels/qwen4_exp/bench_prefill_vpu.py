@@ -51,6 +51,9 @@ VARIANTS = {
     # Suffix _kv2048: 2048-key tiles (16 selection words per tile).
     "base_kv2048": "",
     "vpu1_kv2048": "1",
+    # Suffix _pc: VLLM_TPU_QSA_PREFILL_PAGE_COPIES=1.
+    "base_pc": "",
+    "vpu1_pc": "1",
 }
 
 
@@ -154,16 +157,21 @@ def build(shape, k_scale, stub=False, query_tile=None, kv_tile_override=None):
         def run(*operands):
             # Keep the metadata live: depend on the active counts.
             dep = (operands[2][0] * 0).astype(jnp.float32)
-            return jnp.zeros(out_shape.shape, out_shape.dtype) + dep.astype(
-                out_shape.dtype
-            )
+            shapes = out_shape if isinstance(out_shape, (list, tuple)) else [out_shape]
+            outs = [jnp.zeros(o.shape, o.dtype) + dep.astype(o.dtype) for o in shapes]
+            return outs if isinstance(out_shape, (list, tuple)) else outs[0]
 
         return run
 
     pl.pallas_call = stubbed if stub else original
     extra = {}
     if dcp_world > 1:
-        extra = {"dcp_rank": jnp.zeros((1,), jnp.int32), "dcp_world": dcp_world}
+        # Served DCP returns the LSE for the cross-rank combine.
+        extra = {
+            "dcp_rank": jnp.zeros((1,), jnp.int32),
+            "dcp_world": dcp_world,
+            "return_lse": True,
+        }
     fn = jax.jit(
         functools.partial(
             bsp.block_sparse_gqa_prefill,
@@ -229,6 +237,7 @@ def main():
         restore()
         print(f"META shape={shape_name} meta_us={meta_us:.1f} tile_visits={visits}", flush=True)
         base_out = None
+        base_lse = None
         for variant in args.variants.split(","):
             spec = VARIANTS[variant]
             kv_override = 2048 if variant.endswith("_kv2048") else None
@@ -236,6 +245,9 @@ def main():
                 continue
             bsp.PAIRED_KV_TILES = ORIGINAL_TILES + ((2048,) if kv_override else ())
             os.environ["VLLM_TPU_QSA_PREFILL_VPU"] = spec
+            os.environ["VLLM_TPU_QSA_PREFILL_PAGE_COPIES"] = (
+                "1" if variant.endswith("_pc") else "0"
+            )
             try:
                 fn, restore = build(
                     shape, args.k_scale,
@@ -248,6 +260,17 @@ def main():
                 restore()
                 print(f"BENCH shape={shape_name} variant={variant} FAILED {type(exc).__name__}: {str(exc)[:600]}", flush=True)
                 continue
+            lse = None
+            if isinstance(out, (tuple, list)):
+                out, lse = out
+                lse = np.asarray(lse, np.float64)
+                if variant == "base":
+                    base_lse = lse
+                elif base_lse is not None:
+                    print(f"LSE shape={shape_name} variant={variant} bitexact="
+                          f"{bool(np.array_equal(lse, base_lse))} max_abs="
+                          f"{float(np.nanmax(np.abs(np.where(np.isfinite(base_lse), lse - base_lse, 0)))):.3e}",
+                          flush=True)
             out = np.asarray(out.astype(jnp.float32), np.float64)
             if variant == "base":
                 base_out = out
