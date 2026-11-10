@@ -878,6 +878,7 @@ def run_jax_gdn_attention_pooled_local(
     conv_state_dtype: jnp.dtype = jnp.bfloat16,
     num_spec_tokens: int = 0,
     conv_weight_kmajor: bool = False,
+    prefill_ckpt: tuple[jnp.ndarray, jnp.ndarray] | None = None,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """GDN attention over the unified block pool.
 
@@ -933,6 +934,9 @@ def run_jax_gdn_attention_pooled_local(
         num_spec_tokens=num_spec_tokens,
         conv_weight_kmajor=conv_weight_kmajor,
         per_seq_inputs=per_seq_inputs,
+        prefill_ckpt=prefill_ckpt,
+        # Checkpoint offsets are whole manager blocks (core/mamba_tail_fold.py).
+        prefill_ckpt_alignment=pool_block_tokens if prefill_ckpt is not None else 0,
     )
     return recurrent_state, output
 
@@ -998,6 +1002,7 @@ def run_jax_gdn_attention_pooled(
     num_spec_tokens: int = 0,
     conv_weight_kmajor: bool = False,
     step_metadata: tuple[jnp.ndarray, ...] | None = None,
+    prefill_ckpt: tuple[jnp.ndarray, jnp.ndarray] | None = None,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Runs GDN attention over the unified block pool, sharded on the mesh.
 
@@ -1034,6 +1039,10 @@ def run_jax_gdn_attention_pooled(
         step_metadata: Optional `gdn_step_metadata(...)` output computed once
           for the step; replaces `slot_read_offsets` and `ckpt_indices`
           (pass both as None) and the per-layer index math they feed.
+        prefill_ckpt: Optional `(offsets, blocks)`, int32 `(num_seqs,)` each:
+          internal prefill checkpoints (VLLM_TPU_MAMBA_TAIL_FOLD). Sequence
+          `s` also writes its state after `offsets[s]` query tokens to pool
+          block `blocks[s]`; 0 means none.
 
     Returns:
         A tuple containing:
@@ -1105,8 +1114,20 @@ def run_jax_gdn_attention_pooled(
         conv_state_dtype=conv_state_dtype,
         conv_weight_kmajor=conv_weight_kmajor,
     )
+    local_fn = p_run_jax_gdn_attention_pooled_local
+    if prefill_ckpt is not None:
+        # Two more replicated per-sequence inputs, appended after whichever
+        # optional inputs precede them.
+        in_specs = in_specs + (P(None), P(None))
+
+        def local_fn(*args):
+            *rest, ckpt_offsets, ckpt_blocks = args
+            return p_run_jax_gdn_attention_pooled_local(
+                *rest, prefill_ckpt=(ckpt_offsets, ckpt_blocks)
+            )
+
     mapped_fn = jax.shard_map(
-        p_run_jax_gdn_attention_pooled_local,
+        local_fn,
         mesh=mesh,
         in_specs=in_specs,
         out_specs=out_specs,
@@ -1132,6 +1153,8 @@ def run_jax_gdn_attention_pooled(
         # Already per-sequence (row s names sequence s's checkpoint blocks),
         # so it needs no gather by state_indices.
         extra_args = extra_args + (ckpt_indices,)
+    if prefill_ckpt is not None:
+        extra_args = extra_args + tuple(prefill_ckpt)
     outputs = mapped_fn(
         j_mixed_qkv,
         j_b,
