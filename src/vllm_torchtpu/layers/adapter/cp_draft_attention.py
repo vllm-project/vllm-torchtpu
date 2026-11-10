@@ -113,13 +113,12 @@ def write_kv(
         _quantize(value, kv_cache.dtype, v_scale),
         kv_cache.shape[2:],
     )
-    if num_tokens < _RUN_WRITE_MIN_TOKENS:
-        return kv_cache.at[page, pos % page_size].set(rows, mode="drop")
     from vllm_torchtpu.models.minimax_m3.kernels.msa_write import max_write_runs
 
     # A rank owns whole pages, so a request's tokens break into at most
     # q // page_size + 2 runs, the bound `max_write_runs` takes.
-    return write_runs(
+    write = write_runs if num_tokens >= _RUN_WRITE_MIN_TOKENS else write_runs_batched
+    return write(
         kv_cache,
         rows,
         page,
@@ -128,10 +127,79 @@ def write_kv(
     )
 
 
-# An XLA scatter of the rows costs ~0.1 us per token (0.88 ms per draft layer
-# at 8K tokens, c4 / c64 twins j-872b7276 / j-f020b874); below this a
-# decode-sized batch's scatter is as cheap as the run kernel's grid.
+# Prefill-sized writes take one grid step per run (`write_runs`); a decode
+# batch's many short runs are all issued from one step (`write_runs_batched`),
+# where an XLA scatter cost ~0.12 us per token (65 us per draft layer at 512
+# tokens, c64 twin j-ded092da).
 _RUN_WRITE_MIN_TOKENS = 1024
+
+
+def write_runs_batched(
+    kv_cache: jax.Array,
+    rows: jax.Array,
+    pages: jax.Array,
+    slots: jax.Array,
+    *,
+    max_runs: int,
+    interpret: bool = False,
+) -> jax.Array:
+    """`write_runs` from a single grid step: every run's power-of-two DMA
+    pieces are started back to back, then all are waited for."""
+    from vllm_torchtpu.models.minimax_m3.kernels.msa_write import token_runs
+
+    num_pages, page_size = kv_cache.shape[:2]
+    pieces = [1 << b for b in reversed(range(page_size.bit_length()))]
+    num_runs, run_page, run_lo, run_hi, run_tok0 = token_runs(
+        pages.astype(jnp.int32), slots.astype(jnp.int32), num_pages, max_runs
+    )
+
+    def kernel(
+        n_ref, page_ref, lo_ref, hi_ref, tok0_ref, rows_hbm, cache_in, cache_out, sem
+    ):
+        del cache_in
+
+        def run_copies(r):
+            count = hi_ref[r] - lo_ref[r]
+            copies = []
+            for size in pieces:
+                off = count & ~(2 * size - 1)  # after the larger pieces
+                copy = pltpu.make_async_copy(
+                    rows_hbm.at[pl.ds(tok0_ref[r] + off, size)],
+                    cache_out.at[page_ref[r], pl.ds(lo_ref[r] + off, size)],
+                    sem.at[0],
+                )
+                copies.append(((count & size) != 0, copy))
+            return copies
+
+        def start(r, carry):
+            for todo, copy in run_copies(r):
+                pl.when(todo)(copy.start)
+            return carry
+
+        def wait(r, carry):
+            for todo, copy in run_copies(r):
+                pl.when(todo)(copy.wait)
+            return carry
+
+        jax.lax.fori_loop(0, n_ref[0], start, 0)
+        jax.lax.fori_loop(0, n_ref[0], wait, 0)
+
+    hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+    return pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=5,
+            grid=(1,),
+            in_specs=[hbm, hbm],
+            out_specs=hbm,
+            scratch_shapes=[pltpu.SemaphoreType.DMA((1,))],
+        ),
+        out_shape=jax.ShapeDtypeStruct(kv_cache.shape, kv_cache.dtype),
+        # Operand 6 = the cache (after 5 scalar-prefetch operands and the rows).
+        input_output_aliases={6: 0},
+        interpret=interpret,
+        name="dcp_draft_write_runs_batched",
+    )(num_runs[None], run_page, run_lo, run_hi, run_tok0, rows, kv_cache)
 
 
 def write_runs(

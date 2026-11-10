@@ -17,14 +17,18 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from vllm_torchtpu.layers.adapter.cp_draft_attention import write_runs
+from vllm_torchtpu.layers.adapter.cp_draft_attention import (
+    write_runs,
+    write_runs_batched,
+)
 
 
+@pytest.mark.parametrize("write", [write_runs, write_runs_batched])
 @pytest.mark.parametrize(
     "shape, dtype",
     [((40, 128, 2, 4, 128), jnp.float8_e4m3fn), ((30, 128, 1, 4, 128), jnp.bfloat16)],
 )
-def test_write_runs_matches_scatter(shape, dtype):
+def test_write_runs_matches_scatter(write, shape, dtype):
     rng = np.random.default_rng(0)
     num_pages = shape[0]
     cache = jnp.asarray(rng.standard_normal(shape), jnp.float32).astype(dtype)
@@ -45,7 +49,7 @@ def test_write_runs_matches_scatter(shape, dtype):
         rng.standard_normal((slots.shape[0], *shape[2:])), jnp.float32
     ).astype(dtype)
     expected = cache.at[pages, slots].set(rows, mode="drop")
-    got = write_runs(
+    got = write(
         cache, rows, pages, slots, max_runs=slots.shape[0] // 128 + 16, interpret=True
     )
     np.testing.assert_array_equal(
