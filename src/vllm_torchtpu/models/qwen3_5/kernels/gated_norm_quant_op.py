@@ -35,7 +35,7 @@ from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
 )
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.kernels.experimental import gated_norm_quant as gnq
+from vllm_torchtpu.models.qwen3_5.kernels import gated_norm_quant as gnq
 from vllm_torchtpu.layers.adapter import linear_common
 from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
 from vllm_torchtpu.logger import init_logger
