@@ -39,6 +39,7 @@ from vllm_torchtpu.kernels.qwen4_exp.qsa_rpa import (
     selected_tokens,
     virtual_page_metadata,
 )
+from vllm_torchtpu.kernels.qwen4_exp import shape_tuned
 from vllm_torchtpu.kernels.qwen4_exp.qsa_state import (
     read_ring_and_tags,
     write_ring_and_tags,
@@ -1359,6 +1360,15 @@ def _select_blocks(
         num_decodes = decode_prefix(starts)
         seq_lens = context + query_lens
         chunk_tokens = prefill_indexer_chunk(len(query))
+        prefill_bkv = envs.VLLM_TPU_QSA_PREFILL_INDEXER_BKV
+        prefill_bq = envs.VLLM_TPU_QSA_PREFILL_INDEXER_BQ
+        tuned = shape_tuned.indexer_prefill_tiles(len(query))
+        if tuned is not None:
+            # VLLM_TPU_SHAPE_TUNED: measured (BKV, BQ, chunk) by per-rank rows;
+            # a chunk that does not divide the rows keeps the default chunking.
+            prefill_bkv, prefill_bq, chunk = tuned
+            if chunk and len(query) % chunk == 0:
+                chunk_tokens = None if chunk == len(query) else chunk
         # The scalar-prefetched kernel-page table holds every request slot's
         # whole row (slots x max_model_len / 128 pages). Past the SMEM budget
         # (e.g. 96 slots at 262144 tokens: 768 KiB) hand StreamIndex the
@@ -1384,8 +1394,8 @@ def _select_blocks(
             jnp.asarray([num_decodes, num_decodes, num_seqs], dtype=jnp.int32),
             k=block_topk,
             compression_ratio=ratio,
-            num_kv_pages_per_block=(envs.VLLM_TPU_QSA_PREFILL_INDEXER_BKV // rows,) * 3,
-            num_queries_per_block=(1,) + (envs.VLLM_TPU_QSA_PREFILL_INDEXER_BQ,) * 2,
+            num_kv_pages_per_block=(prefill_bkv // rows,) * 3,
+            num_queries_per_block=(1,) + (prefill_bq,) * 2,
             decode_req_batch_size=8,
             enable_early_exit=True,
             chunk_tokens=chunk_tokens,
@@ -1406,8 +1416,12 @@ def _select_blocks(
         pages_per_query = -(-pages_per_query // shard[1])
     chunk_size = min(len(query), decode_query_chunk_size(pages_per_query))
     query_block = envs.VLLM_TPU_QSA_DECODE_QUERY_BLOCK
+    tuned = shape_tuned.indexer_decode_tiles(len(query)) if query_block else None
     if query_block:
         kv_block = envs.VLLM_TPU_QSA_DECODE_KV_BLOCK
+        if tuned is not None:
+            # VLLM_TPU_SHAPE_TUNED: measured (KV block, query block) by rows.
+            kv_block, query_block = tuned
         # The larger single-token block only pays on steps whose requests
         # carry one token (MTP draft rows, plain decode). On verify steps the
         # one-token decode passes are empty and a larger block makes them
