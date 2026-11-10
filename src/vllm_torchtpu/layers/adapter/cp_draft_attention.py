@@ -417,7 +417,7 @@ def attend_pages(
     paged cache: one grid step per request DMAs its L pages and query rows into
     VMEM (the next request's while this one computes), attends every KV
     head's query group to them and DMAs the output rows back. Returns
-    ``(out [T, H, D] f32, lse [R, Q, H] f32)``; rows of ``out`` no request
+    ``(out [T, H, D] in q's dtype, lse [R, Q, H] f32)``; rows of ``out`` no request
     owns are undefined.
 
     Replaces a page gather to HBM plus XLA attention over the gathered,
@@ -522,6 +522,33 @@ def attend_pages(
 
         run(copies(r, slot), "wait")
 
+        def rows_out(req, src):
+            full = qlen_ref[req] == q_block
+            return [
+                (
+                    full,
+                    pltpu.make_async_copy(
+                        o_buf.at[src],
+                        o_hbm.at[pl.ds(qstart_ref[req], q_block)],
+                        o_sem.at[src],
+                    ),
+                )
+            ] + [
+                (
+                    jnp.logical_not(full) & (j < qlen_ref[req]),
+                    pltpu.make_async_copy(
+                        o_buf.at[src, pl.ds(j, 1)],
+                        o_hbm.at[pl.ds(qstart_ref[req] + j, 1)],
+                        o_sem.at[src],
+                    ),
+                )
+                for j in range(q_block)
+            ]
+
+        @pl.when(r > 1)
+        def _():
+            run(rows_out(r - 2, slot), "wait")
+
         cache_len = cache_ref[r]
         col = jax.lax.broadcasted_iota(jnp.int32, (1, keys), 1)
         row_k = jax.lax.broadcasted_iota(jnp.int32, (keys, 1), 0)
@@ -538,7 +565,9 @@ def attend_pages(
             & (q_tok < qlen_ref[r])
         )
         cached = k_pos_col < cache_len
-        # One additive mask per request, shared by every KV head.
+        # One additive mask per request, shared by every KV head. Masked keys
+        # must hold finite values (the cache is zero-initialised and writes
+        # clip): an add, unlike a select, would carry a NaN score through.
         bias = jnp.where(visible, 0.0, _NEG_INF)
         # Moves a [rows, 1] column to a [1, rows] row (sublanes to lanes).
         diag = jax.lax.broadcasted_iota(
@@ -578,32 +607,22 @@ def attend_pages(
             safe = jnp.where(denom > 0, denom, 1.0)
             out = jnp.dot(p, v, preferred_element_type=jnp.float32)
             out = out * (v_mult / safe)
-            o_buf[:, g * group : (g + 1) * group, :] = out.reshape(
+            o_buf[slot, :, g * group : (g + 1) * group, :] = out.reshape(
                 q_block, group, head_dim
-            )
+            ).astype(o_buf.dtype)
             lse = jnp.where(denom > 0, m_safe + jnp.log(safe), _NEG_INF)
             lse_ref[0, g] = jnp.sum(jnp.where(diag, lse, 0.0), axis=0, keepdims=True)
-        full = qlen_ref[r] == q_block
-        rows_out = [
-            (
-                full,
-                pltpu.make_async_copy(
-                    o_buf, o_hbm.at[pl.ds(qstart_ref[r], q_block)], o_sem.at[0]
-                ),
-            )
-        ] + [
-            (
-                jnp.logical_not(full) & (j < qlen_ref[r]),
-                pltpu.make_async_copy(
-                    o_buf.at[pl.ds(j, 1)],
-                    o_hbm.at[pl.ds(qstart_ref[r] + j, 1)],
-                    o_sem.at[0],
-                ),
-            )
-            for j in range(q_block)
-        ]
-        run(rows_out, "start")
-        run(rows_out, "wait")
+        # The rows go out while the next requests compute; a slot's copies are
+        # waited for before it is refilled, the last two at the end.
+        run(rows_out(r, slot), "start")
+
+        @pl.when(r + 1 == pl.num_programs(0))
+        def _():
+            @pl.when(r > 0)
+            def _():
+                run(rows_out(r - 1, 1 - slot), "wait")
+
+            run(rows_out(r, slot), "wait")
 
     out, lse = pl.pallas_call(
         kernel,
@@ -623,14 +642,14 @@ def attend_pages(
                     (2, num_cols, page_size, words, packing, width), kv_cache.dtype
                 ),
                 pltpu.VMEM((2, q_block, num_heads, head_dim), q.dtype),
-                pltpu.VMEM((q_block, num_heads, head_dim), jnp.float32),
+                pltpu.VMEM((2, q_block, num_heads, head_dim), q.dtype),
                 pltpu.SemaphoreType.DMA((2,)),
                 pltpu.SemaphoreType.DMA((2,)),
-                pltpu.SemaphoreType.DMA((1,)),
+                pltpu.SemaphoreType.DMA((2,)),
             ],
         ),
         out_shape=[
-            jax.ShapeDtypeStruct((num_tokens, num_heads, head_dim), jnp.float32),
+            jax.ShapeDtypeStruct((num_tokens, num_heads, head_dim), q.dtype),
             jax.ShapeDtypeStruct((num_reqs, kv_heads, 1, rows), jnp.float32),
         ],
         # The next request's pages are fetched in the current step.

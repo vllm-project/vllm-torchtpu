@@ -916,7 +916,8 @@ def synthetic_sample_and_assemble(
     )
     # Gathers from per-request tables and the scatter into the output lower to
     # select chains on TPU (~200 us at 64 requests); masked reductions over
-    # [requests, slots] do the same work vectorized.
+    # [requests, slots] do the same work vectorized. The [R, 1 + K, T] mask is
+    # R * (1 + K) * T elements: 64 x 8 x 512 = 256K at max_num_seqs 64.
     match = segment_ids.unsqueeze(0) == torch.arange(
         batch_size, device=device
     ).unsqueeze(1)
