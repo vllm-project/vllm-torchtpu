@@ -839,6 +839,7 @@ def test_async_rejections_seed_only_at_actual_state_crossing(
     fake.scheduler_config = SimpleNamespace(async_scheduling=True)
     fake.speculative_config = SimpleNamespace(num_speculative_tokens=3)
     fake._pre_async_results = SimpleNamespace(
+        request_seq_lens=[(0, None, 0, "a")],
         req_id_to_index_copy={"a": 0},
         num_draft_per_req={0: 3},
         spec_decode_num_rejected_tokens=torch.tensor([rejected]),
@@ -870,6 +871,7 @@ def test_async_state_seed_away_from_boundary_does_not_wait():
     fake.scheduler_config = SimpleNamespace(async_scheduling=True)
     fake.speculative_config = SimpleNamespace(num_speculative_tokens=3)
     fake._pre_async_results = SimpleNamespace(
+        request_seq_lens=[(0, None, 0, "a")],
         req_id_to_index_copy={"a": 0},
         num_draft_per_req={0: 3},
         spec_decode_num_rejected_tokens=torch.tensor([3]),
@@ -892,6 +894,7 @@ def test_async_state_seed_uses_previous_request_order():
     fake.scheduler_config = SimpleNamespace(async_scheduling=True)
     fake.speculative_config = SimpleNamespace(num_speculative_tokens=3)
     fake._pre_async_results = SimpleNamespace(
+        request_seq_lens=[(0, None, 0, "a"), (1, None, 0, "b")],
         req_id_to_index_copy={"a": 0, "b": 1},
         num_draft_per_req={0: 3, 1: 3},
         wait_for_copy=lambda: torch.tensor([[77, -1, -1, -1], [77, 88, 99, 11]]),
@@ -900,6 +903,34 @@ def test_async_state_seed_uses_previous_request_order():
     _collect(fake, _sched({"a": 4, "b": 4}))
     assert fake._pending_mamba_state_copies == []
     np.testing.assert_array_equal(fake.input_batch.num_computed_tokens_cpu, before)
+
+
+def test_async_state_seed_reads_the_previous_batch_row_not_the_source_position():
+    """A later chunk's substitution source position counts the padded rows of
+    the chunks before it, while the previous step's draft counts and sampled
+    rows are keyed by batch row."""
+    fake, _ = _make_self(
+        ["a"],
+        [383],
+        [[[5, 6, 7, 8, 9]]],
+        state_pos={"a": 0},
+        state_block_size=384,
+        ckpt_window=4,
+        read_offsets=torch.zeros(NUM_BLOCKS, dtype=torch.int32),
+    )
+    fake.scheduler_config = SimpleNamespace(async_scheduling=True)
+    fake.speculative_config = SimpleNamespace(num_speculative_tokens=3)
+    # In the previous step's batch "a" sits at row 1, the first row of a
+    # second chunk behind a chunk padded to 8 rows.
+    fake._pre_async_results = SimpleNamespace(
+        request_seq_lens=[(0, None, 0, "b"), (1, None, 0, "a")],
+        req_id_to_index_copy={"b": 0, "a": 8},
+        num_draft_per_req={0: 0, 1: 3},
+        wait_for_copy=lambda: torch.tensor([[77, -1, -1, -1], [77, -1, -1, -1]]),
+    )
+    _collect(fake, _sched({"a": 4}))
+    assert fake._pending_mamba_state_copies == []
+    assert fake._mamba_state_pos["a"] == 0
 
 
 def test_async_state_seed_can_return_to_previous_column_after_rejection():
@@ -916,6 +947,7 @@ def test_async_state_seed_can_return_to_previous_column_after_rejection():
     fake.scheduler_config = SimpleNamespace(async_scheduling=True)
     fake.speculative_config = SimpleNamespace(num_speculative_tokens=3)
     fake._pre_async_results = SimpleNamespace(
+        request_seq_lens=[(0, None, 0, "a")],
         req_id_to_index_copy={"a": 0},
         num_draft_per_req={0: 3},
         wait_for_copy=lambda: torch.tensor([[77, -1, -1, -1]]),
@@ -943,6 +975,7 @@ def test_async_state_seed_keeps_actual_crossing_when_all_drafts_accepted():
     fake.scheduler_config = SimpleNamespace(async_scheduling=True)
     fake.speculative_config = SimpleNamespace(num_speculative_tokens=3)
     fake._pre_async_results = SimpleNamespace(
+        request_seq_lens=[(0, None, 0, "a")],
         req_id_to_index_copy={"a": 0},
         num_draft_per_req={0: 3},
         wait_for_copy=lambda: torch.tensor([[77, 88, 99, 11]]),
