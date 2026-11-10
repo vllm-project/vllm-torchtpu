@@ -101,6 +101,9 @@ def test_swa_bridge_preserves_dynamic_token_dimension(monkeypatch):
         def __init__(self, raw):
             self.raw = raw
             self.raw_hi = None
+            # Second SWA page of a block-outer 512 KiB block.
+            self.page_stride = 512
+            self.row_offset = 64
 
     class Bridge(torch.nn.Module):
         def forward(self, raw, table, starts, positions, minimum, values):
@@ -110,7 +113,7 @@ def test_swa_bridge_preserves_dynamic_token_dimension(monkeypatch):
             )
 
     arrays = (
-        torch.zeros((512, 64, 512), dtype=torch.bfloat16),
+        torch.zeros((512 * 128, 128), dtype=torch.int32),
         torch.ones((48, 1539), dtype=torch.int32),
         torch.arange(49, dtype=torch.int32) * 6,
         torch.arange(288, dtype=torch.int32),

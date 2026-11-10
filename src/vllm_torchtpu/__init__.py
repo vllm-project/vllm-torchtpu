@@ -1635,42 +1635,70 @@ def _patch_vllm_same_step_prefix_hits() -> None:
     )
 
 
-def _patch_vllm_merge_dsv41_swa_groups() -> None:
-    """Give identical DeepSeek-V4.1 SWA layers one KV cache group.
+def _order_pages_by_size(groups: list) -> list:
+    """Place each group's pages largest first inside a block-outer block.
 
-    Upstream grouping assumes every group draws from one shared page pool and
-    so leaves each SWA layer in its own group. The scheduler then walks every
-    SWA manager for every request on every step, although the private pools
-    make those managers issue the same ids. See `swa_cache.merge_swa_groups`.
+    Upstream packs a group's pages in registration order. Every page size of a
+    V4.1 group is a power of two and the block stride is a multiple of the
+    largest one, so largest-first puts every page on a multiple of its own size:
+    CSA2's whole-page SWA and main-record addressing then holds in every block.
+    """
+    import dataclasses
+
+    from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
+
+    ordered_groups = []
+    for group in groups:
+        spec = group.kv_cache_spec
+        if isinstance(spec, UniformTypeKVCacheSpecs):
+            specs = dict(
+                sorted(
+                    spec.kv_cache_specs.items(),
+                    key=lambda item: -item[1].page_size_bytes,
+                )
+            )
+            group = dataclasses.replace(
+                group,
+                layer_names=list(specs),
+                kv_cache_spec=dataclasses.replace(spec, kv_cache_specs=specs),
+            )
+        ordered_groups.append(group)
+    return ordered_groups
+
+
+def _patch_vllm_dsv41_page_order() -> None:
+    """Order DeepSeek-V4.1 v2 pages largest first within each cache group.
+
+    See `_order_pages_by_size`. `get_kv_cache_configs` calls the module
+    attribute, so EngineCore's layout uses the reordered groups as well.
     """
     import functools
-    import sys
 
     from vllm.v1.core import kv_cache_utils
 
-    from vllm_torchtpu.models.vllm.deepseek_v41.v2.swa_cache import (
-        merge_swa_groups,
-    )
+    original = kv_cache_utils.get_kv_cache_groups
+    if getattr(original, "_tpu_dsv41_page_order_patch", False):
+        return
 
-    patched = kv_cache_utils.get_kv_cache_configs
-    if not getattr(patched, "_tpu_merge_swa_groups_patch", False):
-        original = patched
+    @functools.wraps(original)
+    def get_kv_cache_groups(vllm_config, kv_cache_spec):
+        groups = original(vllm_config, kv_cache_spec)
+        model_config = getattr(vllm_config, "model_config", None)
+        architectures = (
+            getattr(getattr(model_config, "hf_config", None), "architectures", None)
+            or []
+        )
+        if (
+            "DeepseekV41ForCausalLM" not in architectures
+            or envs.TPU_DEEPSEEK_V41_IMPL != "v2"
+        ):
+            return groups
+        return _order_pages_by_size(groups)
 
-        @functools.wraps(original)
-        def patched(vllm_config, kv_cache_specs, available_memory):
-            configs = original(vllm_config, kv_cache_specs, available_memory)
-            return [merge_swa_groups(config) for config in configs]
-
-        # pyrefly: ignore[missing-attribute]
-        patched._tpu_merge_swa_groups_patch = True
-        kv_cache_utils.get_kv_cache_configs = patched
-        logger.info("Applied TPU patch: one KV cache group per DeepSeek-V4.1 SWA spec.")
-    # EngineCore imports the function directly and may be imported after the
-    # first application, so rebind it on every refresh.
-    core = sys.modules.get("vllm.v1.engine.core")
-    if core is not None and hasattr(core, "get_kv_cache_configs"):
-        # pyrefly: ignore[missing-attribute]
-        core.get_kv_cache_configs = patched
+    # pyrefly: ignore[missing-attribute]
+    get_kv_cache_groups._tpu_dsv41_page_order_patch = True
+    kv_cache_utils.get_kv_cache_groups = get_kv_cache_groups
+    logger.info("Applied TPU patch: DeepSeek-V4.1 pages ordered largest first.")
 
 
 def _patch_vllm_vocab_parallel_embedding() -> None:

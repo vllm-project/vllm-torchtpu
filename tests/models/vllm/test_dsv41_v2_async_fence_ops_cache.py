@@ -19,7 +19,6 @@ os.environ.setdefault("TPU_SKIP_MDS_QUERY", "true")
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 import pytest
 import torch
 
@@ -210,8 +209,9 @@ class TestCacheSizingAndConfig:
         res_fp8 = v2_cache.materialize_upstream_kv_cache(
             cfg_fp8, torch.device("cpu"), layout_fp8, word_rows=True
         )
-        assert "fp8_layer" in res_fp8.rope_pools
-        # Companion raw_tensor appended
+        # One FP32 CSA2 scale per pool row, appended as a raw tensor.
+        scale = res_fp8.scale_pools["fp8_layer"]
+        assert scale.shape == (16,) and scale.dtype == torch.float32
         assert len(res_fp8.raw_tensors) == 2
 
         # Case 4: split_banks = True when pool_bytes > SPARSECORE_MAX_POOL_BYTES
@@ -224,8 +224,9 @@ class TestCacheSizingAndConfig:
         assert len(res_split.native_raw_cache["fp8_layer"]) == 2
         assert res_split.native_raw_cache["fp8_layer"][0].shape == (12, ROW_WORDS)
         assert res_split.native_raw_cache["fp8_layer"][1].shape == (4, ROW_WORDS)
-        assert isinstance(res_split.rope_pools["fp8_layer"], tuple)
-        assert len(res_split.rope_pools["fp8_layer"]) == 2
+        split_scale = res_split.scale_pools["fp8_layer"]
+        assert isinstance(split_scale, tuple)
+        assert [s.shape for s in split_scale] == [(12,), (4,)]
         assert len(res_split.raw_tensors) == 4
         assert res_split.kv_caches["fp8_layer"].shape == (16, 1, 4, 128)
 
@@ -262,21 +263,16 @@ class TestPagedCacheRows:
         ):
             v2_cache.PagedCacheRows(valid_raw, ((16, 4, 64), torch.int64, 512, 0))
 
-        # 4. FP8 uint8 without companion or wrong shape
+        # 4. FP8 uint8 records need the CSA2 scale companion
         with pytest.raises(
-            ValueError, match="FP8 records are one pool row plus a RoPE companion"
+            ValueError, match="FP8 records are one pool row plus a CSA2 scale"
         ):
-            v2_cache.PagedCacheRows(
-                valid_raw, ((16, 1, 512), torch.uint8, 512, 0), rope=None
-            )
-
-        with pytest.raises(
-            ValueError, match="FP8 records are one pool row plus a RoPE companion"
-        ):
+            v2_cache.PagedCacheRows(valid_raw, ((16, 1, 512), torch.uint8, 512, 0))
+        with pytest.raises(ValueError, match="CSA2 scales must match"):
             v2_cache.PagedCacheRows(
                 valid_raw,
                 ((16, 1, 512), torch.uint8, 512, 0),
-                rope=torch.zeros((2, ROW_WORDS), dtype=torch.int32),
+                scale=torch.zeros((8,), dtype=torch.float32),
             )
 
         # 5. Record bytes must divide or be multiple of 512
@@ -308,25 +304,6 @@ class TestPagedCacheRows:
             ValueError, match="Split native cache requires exactly two banks"
         ):
             v2_cache.PagedCacheRows((valid_raw,), ((16, 4, 64), torch.bfloat16, 512, 0))
-        with pytest.raises(
-            ValueError, match="Split RoPE companion requires exactly two banks"
-        ):
-            v2_cache.PagedCacheRows(
-                (valid_raw, valid_raw),
-                ((16, 1, 512), torch.uint8, 512, 0),
-                rope=(torch.zeros((4, ROW_WORDS), dtype=torch.int32),),
-            )
-        with pytest.raises(
-            ValueError, match="FP8 records are one pool row plus a RoPE companion"
-        ):
-            v2_cache.PagedCacheRows(
-                (valid_raw, valid_raw),
-                ((32, 1, 512), torch.uint8, 512, 0),
-                rope=(
-                    torch.zeros((4, ROW_WORDS), dtype=torch.int32),
-                    torch.zeros((2, ROW_WORDS), dtype=torch.int32),
-                ),
-            )
 
     def test_numel_row_indices_pages(self):
         raw = torch.zeros((64, ROW_WORDS), dtype=torch.int32)
@@ -575,96 +552,6 @@ class TestCacheJaxHelpers:
 
 
 class TestCacheMutationOps:
-    def test_initialize_cache_ops_and_fakes(self, monkeypatch: pytest.MonkeyPatch):
-        from vllm_torchtpu.models.vllm import vllm_model_wrapper_context
-
-        mesh = jax.sharding.Mesh(np.array(jax.devices()[:1]), ("tp",))
-        ctx = SimpleNamespace(mesh=mesh)
-
-        monkeypatch.setattr(
-            vllm_model_wrapper_context,
-            "get_vllm_model_wrapper_context",
-            lambda: ctx,
-        )
-
-        # Intercept jax_op to capture write_values_after (lines 642-643)
-        from torch_tpu._internal import pallas
-
-        captured_ops = {}
-        captured_kwargs = {}
-        orig_jax_op = pallas.jax_op
-
-        def intercept_jax_op(name, fn, *args, **kwargs):
-            captured_ops[name] = fn
-            captured_kwargs[name] = kwargs
-            return orig_jax_op(name, fn, *args, **kwargs)
-
-        monkeypatch.setattr(pallas, "jax_op", intercept_jax_op)
-
-        # Reset global ops to force re-initialization
-        monkeypatch.setattr(v2_cache, "_write_op", None)
-        v2_cache.initialize_cache_ops()
-        assert v2_cache._write_op is not None
-        assert captured_kwargs["pallas::dsv41v2_cache_write"].get("donate_argnums") == (
-            0,
-        )
-
-        # Idempotency check
-        v2_cache.initialize_cache_ops()
-
-        # Exercise real write_values_after (lines 642-643) and read_values_2bank
-        wva = captured_ops.get("pallas::dsv41v2_cache_write_values_after")
-        assert wva is not None
-        c_jax = jnp.zeros((8, ROW_WORDS), dtype=jnp.int32)
-        r_jax = jnp.zeros(2, dtype=jnp.int32)
-        v_jax = jnp.zeros((2, ROW_WORDS), dtype=jnp.int32)
-        after_jax = jnp.zeros(2, dtype=jnp.int32)
-        res_wva = wva(c_jax, r_jax, v_jax, after_jax)
-        assert res_wva.shape == c_jax.shape
-
-        rv2b = captured_ops.get("pallas::dsv41v2_cache_read_values_2bank")
-        assert rv2b is not None
-        res_rv2b = rv2b(c_jax, c_jax, r_jax, 64, False)
-        assert res_rv2b.shape == (2, 64)
-
-        # Exercise registered fake handlers
-        from torch._subclasses.fake_tensor import FakeTensorMode
-
-        with FakeTensorMode():
-            c_fake = torch.empty(16, ROW_WORDS, dtype=torch.int32)
-            r_fake = torch.empty(4, dtype=torch.int32)
-            val_fake = torch.empty(4, 64, dtype=torch.bfloat16)
-
-            # _read_values_op and _read_values_2bank_op fakes
-            out_read = v2_cache._read_values_op(c_fake, r_fake, 64, False)
-            assert out_read.shape == (4, 64)
-            assert out_read.dtype == torch.bfloat16
-            out_read_2b = v2_cache._read_values_2bank_op(
-                c_fake, c_fake, r_fake, 64, False
-            )
-            assert out_read_2b.shape == (4, 64)
-            assert out_read_2b.dtype == torch.bfloat16
-
-            # _write_op fake
-            out_write = v2_cache._write_op(c_fake, r_fake, val_fake)
-            assert out_write.shape == c_fake.shape
-
-            # _write_values_op fake
-            out_wv = v2_cache._write_values_op(c_fake, r_fake, val_fake)
-            assert out_wv.shape == c_fake.shape
-
-            # _write_values_after_op fake
-            out_wva = v2_cache._write_values_after_op(
-                c_fake, r_fake, val_fake, out_read
-            )
-            assert out_wva.shape == c_fake.shape
-
-            # _encode_fp8_op fake
-            lat_fake = torch.empty(4, 512, dtype=torch.bfloat16)
-            w_fake, rp_fake = v2_cache._encode_fp8_op(lat_fake)
-            assert w_fake.shape == (4, ROW_WORDS)
-            assert rp_fake.shape == (4, v2_cache.ROPE_WORDS)
-
     def test_write_cache_dispatch(self, monkeypatch: pytest.MonkeyPatch):
         # 1. PagedCacheRows branch
         mock_paged = MagicMock(spec=v2_cache.PagedCacheRows)

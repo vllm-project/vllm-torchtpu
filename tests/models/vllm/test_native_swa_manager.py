@@ -1,9 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Exercise the DeepSeek-V4.1 SWA pool through the upstream KV-cache control plane."""
+"""Exercise SWA lifecycle through the upstream unified KV-cache pool."""
 
 from collections import deque
-from dataclasses import replace
-from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -12,7 +10,6 @@ from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.kv_cache_utils import (
-    get_kv_cache_configs,
     get_request_block_hasher,
     init_none_hash,
 )
@@ -20,20 +17,10 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
-    MLAAttentionSpec,
+    SlidingWindowMLASpec,
 )
-from vllm.v1.kv_cache_layout import KVCacheLayout
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import Request
-
-from vllm_torchtpu.models.vllm.deepseek_v41.v2.swa_cache import (
-    DeepseekV41SWAManager,
-    DeepseekV41SWASpec,
-    merge_swa_groups,
-    num_physical_blocks,
-    register_swa_specs,
-    swa_pool_bytes,
-)
 
 pytestmark = pytest.mark.cpu_test
 
@@ -43,21 +30,18 @@ WINDOW = 128
 @pytest.fixture(autouse=True)
 def register_specs():
     KVCacheSpecRegistry.check_kv_cache_spec_registry({})
-    register_swa_specs()
     init_none_hash(sha256)
 
 
-def spec(sequences=2, in_flight=512, lookahead=0, block_size=32, bounded=True):
-    return DeepseekV41SWASpec(
+def spec(block_size=32, extra_retained_tokens=0):
+    return SlidingWindowMLASpec(
         block_size=block_size,
         num_kv_heads=1,
         head_size=512,
         dtype=torch.bfloat16,
         sliding_window=WINDOW,
-        bounded_replay=bounded,
-        max_num_seqs=sequences,
-        max_in_flight_tokens=in_flight,
-        num_lookahead_tokens=lookahead,
+        bounded_replay=True,
+        extra_retained_tokens=extra_retained_tokens,
     )
 
 
@@ -84,7 +68,7 @@ def manager(swa_spec=None, *, caching=False, groups=1, num_blocks=4096):
         max_model_len=1 << 20,
         scheduler_block_size=swa_spec.block_size,
         hash_block_size=swa_spec.block_size,
-        max_in_flight_tokens=swa_spec.max_in_flight_tokens,
+        max_in_flight_tokens=4096,
         enable_caching=caching,
     )
 
@@ -103,40 +87,23 @@ def swa_managers(cache):
     return [
         m
         for m in cache.coordinator.single_type_managers
-        if isinstance(m, DeepseekV41SWAManager)
+        if isinstance(m.kv_cache_spec, SlidingWindowMLASpec)
     ]
 
 
-def test_private_pool_is_charged_alone_and_exhaustion_is_an_error():
-    cache = manager(spec(sequences=1, in_flight=32))
-    (swa,) = swa_managers(cache)
-    assert swa.block_pool is not cache.block_pool
-    capacity = spec(sequences=1, in_flight=32).pool_capacity
-    assert swa.block_pool.num_gpu_blocks == capacity
-    free = swa.block_pool.get_num_free_blocks()
-    first = request("first")
-    assert cache.allocate_slots(first, free * 32) is not None
-    assert cache.block_pool.get_num_free_blocks() == 4095 - free
-    assert swa.block_pool.get_num_free_blocks() == 0
-    # Whole-sequence admission never consults the private pool.
-    assert (
-        swa.get_num_blocks_to_allocate(
-            "second",
-            num_tokens=32768,
-            new_computed_blocks=[],
-            total_computed_tokens=0,
-            num_local_computed_tokens=0,
-            num_tokens_main_model=32768,
-            apply_admission_cap=True,
-        )
-        == 0
+@pytest.mark.parametrize("caching", [False, True])
+def test_swa_uses_shared_block_pool(caching):
+    cache = manager(caching=caching, groups=2, num_blocks=32)
+    assert all(
+        m.block_pool is cache.block_pool for m in cache.coordinator.single_type_managers
     )
-    # A shortfall means the capacity bound is wrong: never turn it into
-    # an admission failure that the scheduler would answer with preemption.
-    with pytest.raises(RuntimeError, match="SWA pool exhausted"):
-        cache.allocate_slots(request("third"), 32)
-    cache.free(first)
-    assert cache.allocate_slots(request("third"), 32) is not None
+    free = cache.block_pool.get_num_free_blocks()
+    req = request()
+    assert cache.allocate_slots(req, 128) is not None
+    assert cache.block_pool.get_num_free_blocks() == free - 3 * 4
+    assert cache.allocate_slots(request("too_large"), 512) is None
+    cache.free(req)
+    assert cache.block_pool.get_num_free_blocks() == free
 
 
 def test_swa_reclamation_waits_for_inflight_prefill():
@@ -183,76 +150,15 @@ def test_rejection_preserves_cross_page_history():
     assert history.ref_cnt == 0
 
 
-def test_deferred_free_returns_each_block_to_its_own_pool():
+def test_deferred_free_returns_blocks_to_shared_pool():
     cache = manager(groups=2)
     req = request()
-    pools = [mgr.block_pool for mgr in cache.coordinator.single_type_managers]
-    before = [pool.get_num_free_blocks() for pool in pools]
-    assert len(set(map(id, pools))) == 3
+    before = cache.block_pool.get_num_free_blocks()
     assert cache.allocate_slots(req, 128) is not None
     blocks = cache.pop_blocks_for_free(req)
-    assert [pool.get_num_free_blocks() for pool in pools] == [n - 4 for n in before]
+    assert cache.block_pool.get_num_free_blocks() == before - 12
     cache.block_pool.free_blocks(reversed(blocks))
-    assert [pool.get_num_free_blocks() for pool in pools] == before
-    assert all(pool.null_block.is_null for pool in pools)
-
-
-def test_private_ids_do_not_enter_shared_zeroing_or_copy_commands():
-    cache = manager()
-    req = request()
-    assert cache.allocate_slots(req, 128) is not None
-    (swa,) = swa_managers(cache)
-    assert not swa.records_new_block_ids
-    assert swa.take_new_block_ids() == []
-    assert swa.take_pending_cow_copies() == []
-
-
-@pytest.mark.parametrize("bounded", [False, True])
-@pytest.mark.parametrize("caching", [False, True])
-def test_one_manager_with_and_without_prefix_caching(caching, bounded):
-    swa_spec = spec(bounded=bounded)
-    assert not swa_spec.prefix_cacheable
-    cache = manager(swa_spec, caching=caching)
-    (swa,) = swa_managers(cache)
-    assert type(swa) is DeepseekV41SWAManager
-    if caching:
-        # Only the main KV takes part in prefix-hit lookup.
-        assert [g.group_ids for g in cache.coordinator.attention_groups] == [[0]]
-    req = request(tokens=512)
-    assert cache.allocate_slots(req, 512) is not None
-    assert [b.block_id for b in swa.req_to_blocks[req.request_id]] == list(range(1, 17))
-
-
-def test_prefix_hit_replays_the_window_into_fresh_private_pages():
-    cache = manager(spec(sequences=4, in_flight=2048), caching=True)
-    (swa,) = swa_managers(cache)
-    prompt = list(range(1024))
-    first = request("first", prompt=prompt)
-    assert cache.allocate_slots(first, 1024) is not None
-    first.num_computed_tokens = 1024
-    cache.free(first)
-    assert swa.block_pool.get_num_free_blocks() == swa.block_pool.num_gpu_blocks - 1
-
-    second = request("second", prompt=prompt)
-    hits, hit, _ = cache.get_computed_blocks(second)
-    assert hit > WINDOW and hit % 32 == 0
-    assert hits.blocks[1] == []
-    # The scheduler adopts the main-KV hit and replays its last window; the
-    # replayed tokens are already counted in the hit.
-    assert (
-        cache.allocate_slots(
-            second,
-            1024 - hit,
-            num_new_computed_tokens=hit,
-            new_computed_blocks=hits,
-        )
-        is not None
-    )
-    blocks = swa.req_to_blocks[second.request_id]
-    replay = (hit - WINDOW) // 32
-    assert all(block.is_null for block in blocks[: (hit - WINDOW + 1) // 32])
-    assert not any(block.is_null for block in blocks[replay:])
-    assert len(blocks) == 1024 // 32
+    assert cache.block_pool.get_num_free_blocks() == before
 
 
 @pytest.mark.parametrize("caching", [False, True])
@@ -266,12 +172,7 @@ def test_dspark_c48_schedule_fits_pool_and_keeps_kernel_windows(caching, block_s
     live until the step completes, which is after the next step is scheduled.
     """
     seqs, budget, spec_tokens, depth = 48, 2048, 5, 2
-    swa_spec = spec(
-        sequences=seqs,
-        in_flight=depth * budget,
-        lookahead=spec_tokens,
-        block_size=block_size,
-    )
+    swa_spec = spec(block_size=block_size)
     cache = manager(swa_spec, caching=caching, num_blocks=40000)
     (swa,) = swa_managers(cache)
     rng = np.random.default_rng(block_size + caching)
@@ -352,204 +253,50 @@ def test_dspark_c48_schedule_fits_pool_and_keeps_kernel_windows(caching, block_s
                 running.remove(req)
                 cache.free(req)
     assert swa.block_pool.get_num_free_blocks() == swa.block_pool.num_gpu_blocks - 1
-    assert peak <= swa_spec.pool_capacity - 1
-    # The bound is not grossly loose: at least half the pages were used.
-    assert peak > swa_spec.pool_capacity // 2
+    assert peak < cache.block_pool.num_gpu_blocks
 
 
-def test_capacity_counts_window_lookahead_and_in_flight_tokens():
-    base = spec(sequences=48, in_flight=4096, lookahead=0)
-    dspark = replace(base, num_lookahead_tokens=5)
-    assert base.pool_capacity == 1 + 48 * (4 + 2) + 128
-    assert dspark.pool_capacity == 1 + 48 * (5 + 2) + 128
-    assert num_physical_blocks(dspark, 100000) == dspark.pool_capacity
+def test_prefix_hit_replays_window_into_shared_pages():
+    cache = manager(spec(), caching=True)
+    (swa,) = swa_managers(cache)
+    prompt = list(range(1024))
+    first = request("first", prompt=prompt)
+    assert cache.allocate_slots(first, 1024) is not None
+    first.num_computed_tokens = 1024
+    cache.free(first)
+    assert swa.block_pool.get_num_free_blocks() == swa.block_pool.num_gpu_blocks - 1
+
+    second = request("second", prompt=prompt)
+    hits, hit, _ = cache.get_computed_blocks(second)
+    assert hit > WINDOW and hit % 32 == 0
+    assert hits.blocks[1] == []
+    # The scheduler adopts the main-KV hit and replays its last window; the
+    # replayed tokens are already counted in the hit.
     assert (
-        num_physical_blocks(
-            FullAttentionSpec(
-                block_size=32, num_kv_heads=1, head_size=512, dtype=torch.bfloat16
-            ),
-            100000,
+        cache.allocate_slots(
+            second,
+            1024 - hit,
+            num_new_computed_tokens=hit,
+            new_computed_blocks=hits,
         )
-        == 100000
+        is not None
     )
-    specs = {
-        "a": dspark,
-        "b": dspark,
-        "main": FullAttentionSpec(
-            block_size=32, num_kv_heads=1, head_size=512, dtype=torch.bfloat16
-        ),
-    }
-    assert swa_pool_bytes(specs) == 2 * dspark.pool_capacity * 32 * 1024
+    blocks = swa.req_to_blocks[second.request_id]
+    replay = (hit - WINDOW) // 32
+    assert all(block.is_null for block in blocks[: (hit - WINDOW + 1) // 32])
+    assert not any(block.is_null for block in blocks[replay:])
+    assert len(blocks) == 1024 // 32
 
 
-def test_spec_merge_keeps_pool_inputs():
-    original = spec(lookahead=5)
-    assert DeepseekV41SWASpec.merge([original, original]) == original
-    with pytest.raises(AssertionError):
-        DeepseekV41SWASpec.merge([original, replace(original, num_lookahead_tokens=0)])
-
-
-def test_upstream_grouping_preserves_private_pool_contract():
-    config = SimpleNamespace(
-        model_config=SimpleNamespace(max_model_len=32768, original_max_model_len=32768),
-        parallel_config=SimpleNamespace(
-            tensor_parallel_size=1, decode_context_parallel_size=1
-        ),
-        scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
-        attention_config=SimpleNamespace(hisparse_config=None),
-        speculative_config=None,
-        cache_config=SimpleNamespace(
-            num_gpu_blocks_override=None,
-            prefix_cache_retention_interval=None,
-            get_resolved_kv_cache_layout=lambda: KVCacheLayout.LBHNC,
-        ),
-        max_in_flight_tokens=512,
-        num_prefill_lookahead_tokens=0,
-    )
-    specs = {
-        "main": MLAAttentionSpec(
-            block_size=32,
-            num_kv_heads=1,
-            head_size=512,
-            dtype=torch.uint8,
-            tokens_per_state=2,
-        ),
-        "swa.0": spec(lookahead=5),
-        "swa.1": spec(lookahead=5),
-    }
-    reservation = swa_pool_bytes(specs)
-    result = get_kv_cache_configs(config, [specs], [(256 << 20) - reservation])[0]
-    swa_groups = [
-        g
-        for g in result.kv_cache_groups
-        if isinstance(g.kv_cache_spec, DeepseekV41SWASpec)
-    ]
-    assert sum(len(g.layer_names) for g in swa_groups) == 2
-    assert all(
-        g.kv_cache_spec.pool_capacity == spec(lookahead=5).pool_capacity
-        for g in swa_groups
-    )
-
-
-def _planned(num_swa):
-    config = SimpleNamespace(
-        model_config=SimpleNamespace(max_model_len=32768, original_max_model_len=32768),
-        parallel_config=SimpleNamespace(
-            tensor_parallel_size=1, decode_context_parallel_size=1
-        ),
-        scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
-        attention_config=SimpleNamespace(hisparse_config=None),
-        speculative_config=None,
-        cache_config=SimpleNamespace(
-            num_gpu_blocks_override=None,
-            prefix_cache_retention_interval=None,
-            get_resolved_kv_cache_layout=lambda: KVCacheLayout.LBHNC,
-        ),
-        max_in_flight_tokens=512,
-        num_prefill_lookahead_tokens=0,
-    )
-    specs = {
-        "main": MLAAttentionSpec(
-            block_size=32,
-            num_kv_heads=1,
-            head_size=512,
-            dtype=torch.uint8,
-            tokens_per_state=2,
-        ),
-        **{f"swa.{i}": spec(lookahead=5) for i in range(num_swa)},
-    }
-    reservation = swa_pool_bytes(specs)
-    return get_kv_cache_configs(config, [specs], [(256 << 20) - reservation])[0]
-
-
-def test_merge_folds_swa_layers_and_keeps_the_shared_layout():
-    planned = _planned(5)
-    assert len(planned.kv_cache_groups) > 2
-    merged = merge_swa_groups(planned)
-    swa_groups = [
-        g
-        for g in merged.kv_cache_groups
-        if isinstance(g.kv_cache_spec, DeepseekV41SWASpec)
-    ]
-    assert len(swa_groups) == 1
-    assert swa_groups[0].layer_names == [f"swa.{i}" for i in range(5)]
-    assert swa_groups[0].kv_cache_spec == spec(lookahead=5)
-    assert merged.num_blocks == planned.num_blocks
-    assert merged.kv_cache_tensors == planned.kv_cache_tensors
-    others = [
-        g
-        for g in planned.kv_cache_groups
-        if not isinstance(g.kv_cache_spec, DeepseekV41SWASpec)
-    ]
-    assert [g for g in merged.kv_cache_groups if g not in swa_groups] == others
-    # Every layer is still in exactly one group.
-    names = [n for g in merged.kv_cache_groups for n in g.layer_names]
-    assert sorted(names) == sorted(
-        n for g in planned.kv_cache_groups for n in g.layer_names
-    )
-
-
-def test_merge_keeps_draft_and_mismatched_swa_groups_apart():
-    other = replace(spec(), sliding_window=256)
-    config = KVCacheConfig(
-        num_blocks=64,
-        kv_cache_tensors=[],
-        kv_cache_groups=[
-            KVCacheGroupSpec(["swa.0"], spec()),
-            KVCacheGroupSpec(["swa.1"], spec()),
-            KVCacheGroupSpec(["swa.2"], other),
-            KVCacheGroupSpec(["draft.0"], spec(), is_eagle_group=True),
-        ],
-    )
-    merged = merge_swa_groups(config)
-    assert [(g.layer_names, g.is_eagle_group) for g in merged.kv_cache_groups] == [
-        (["swa.0", "swa.1"], False),
-        (["swa.2"], False),
-        (["draft.0"], True),
-    ]
-    # Already merged configs are returned unchanged.
-    assert merge_swa_groups(merged) is merged
-
-
-def test_merged_manager_issues_the_ids_of_every_per_layer_manager():
-    """One shared table must equal what each per-layer manager would issue."""
-    swa_spec = spec(sequences=4, in_flight=1024, lookahead=5)
-    split = manager(swa_spec, groups=3)
-    merged_config = merge_swa_groups(split.kv_cache_config)
-    assert len(merged_config.kv_cache_groups) == 2
-    merged = KVCacheManager(
-        merged_config,
-        max_model_len=1 << 20,
-        scheduler_block_size=swa_spec.block_size,
-        hash_block_size=swa_spec.block_size,
-        max_in_flight_tokens=swa_spec.max_in_flight_tokens,
-        enable_caching=False,
-    )
-    pairs = [
-        (request(f"r{i}", tokens=600), request(f"r{i}", tokens=600)) for i in range(3)
-    ]
-    # Prefill chunks, then decode steps of K+1 that cross block boundaries and
-    # slide the window, then free one request mid-way.
-    schedule = [256, 256, 88] + [6] * 40
-    for step, count in enumerate(schedule):
-        for i, (a, b) in enumerate(pairs):
-            if a is None:
-                continue
-            for cache, req in ((split, a), (merged, b)):
-                assert cache.allocate_slots(req, count, num_lookahead_tokens=5)
-                req.num_computed_tokens += count
-            split_ids = split.get_block_ids(a.request_id)
-            merged_ids = merged.get_block_ids(b.request_id)
-            assert split_ids[0] == merged_ids[0]
-            for swa_ids in split_ids[1:]:
-                assert swa_ids == merged_ids[1]
-        if step == 20:
-            a, b = pairs[1]
-            split.free(a)
-            merged.free(b)
-            pairs[1] = (None, None)
-    (swa,) = swa_managers(merged)
-    assert all(
-        m.block_pool.get_num_free_blocks() == swa.block_pool.get_num_free_blocks()
-        for m in swa_managers(split)
-    )
+def test_prefill_lookahead_keeps_extra_history():
+    cache = manager(spec(extra_retained_tokens=8))
+    req = request()
+    assert cache.allocate_slots(req, 160) is not None
+    (swa,) = swa_managers(cache)
+    history = swa.req_to_blocks[req.request_id][0]
+    req.num_computed_tokens = 160
+    assert cache.allocate_slots(req, 8) is not None
+    assert history.ref_cnt == 1
+    req.num_computed_tokens = 168
+    assert cache.allocate_slots(req, 1) is not None
+    assert history.ref_cnt == 0

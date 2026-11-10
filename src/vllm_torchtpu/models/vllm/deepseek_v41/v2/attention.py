@@ -2,6 +2,7 @@
 
 import contextlib
 import dataclasses
+import math
 from collections.abc import Callable
 from typing import Any, cast
 
@@ -21,8 +22,8 @@ from vllm.models.deepseek_v41 import attention as upstream
 from vllm.models.deepseek_v41 import compressor as compressor_upstream
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 
+from vllm_torchtpu.kernels.experimental import decode_preparation
 from vllm_torchtpu.layers.adapter.linear_common import (
-    KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
 )
 from vllm_torchtpu.layers.core import table_lookup
@@ -32,10 +33,10 @@ from . import csa2_adapter, preprocess_ops
 from .attention_kernels import (
     gathered_kv_cache_scope,
     paged_attention,
-    sparse_fp8_attention,
-    sparse_fp8_attention_qo,
 )
 from .cache import (
+    BLOCK_STRIDE_ALIGNMENT,
+    SWA_PAGE_TOKENS,
     IndexCacheRows,
     NativeCacheView,
     PagedCacheRows,
@@ -52,7 +53,6 @@ from .ops import (
 )
 from .projection_rope import initialize_projection_rope
 from .sparse_mqa_indexer import SparseMQAIndexer, quantize_query
-from .swa_cache import DeepseekV41SWASpec
 
 logger = init_logger(__name__)
 
@@ -243,6 +243,12 @@ class CompressorStateCache(NativeCacheView, compressor_upstream.CompressorStateC
     def get_attn_backend(self):
         return AttentionBackend
 
+    def get_kv_cache_spec(self, vllm_config):
+        return dataclasses.replace(
+            super().get_kv_cache_spec(vllm_config),
+            block_stride_alignment=BLOCK_STRIDE_ALIGNMENT,
+        )
+
 
 def save_compress_norm(
     kv_score,
@@ -413,10 +419,11 @@ class AttentionBackend(compressor_upstream.CompressorBackend):
 
 
 class SWACache(NativeCacheView, DeepseekV4SWACache):
-    native_pages = False
-
     def __init__(self, *args, **kwargs):
-        kwargs["block_size"] = kwargs["cache_config"].block_size
+        # SWA pages keep CSA2's 64-token word-pool geometry, independent of the
+        # compressed caches' `--block-size`: a larger compressed block then
+        # packs several SWA layers into one block-outer cache group.
+        kwargs["block_size"] = SWA_PAGE_TOKENS
         # Upstream ties bounded replay to its V2 model runner; the TPU model
         # implements the replay itself (see `prefix_replay_enabled`).
         kwargs["bounded_replay"] = prefix_replay_enabled(get_current_vllm_config())
@@ -426,28 +433,9 @@ class SWACache(NativeCacheView, DeepseekV4SWACache):
         super().__init__(*args, **kwargs)
 
     def get_kv_cache_spec(self, vllm_config):
-        spec = super().get_kv_cache_spec(vllm_config)
-        if not self.native_pages:
-            return spec
-        values = {
-            field.name: getattr(spec, field.name) for field in dataclasses.fields(spec)
-        }
-        values["extra_retained_tokens"] = max(
-            0, vllm_config.num_prefill_lookahead_tokens - 1
-        )
-        # One spec with or without prefix caching: bounded replay rebuilds the
-        # window after a hit, so pages live only while their request holds them.
-        if vllm_config.cache_config.enable_prefix_caching and not spec.bounded_replay:
-            # A main-KV hit without replay would read a window never rebuilt.
-            raise ValueError(
-                "DeepSeek-V4.1 CSA2 SWA with prefix caching requires "
-                "--swa-bounded-replay and prefill-context-parallel-size=1"
-            )
-        return DeepseekV41SWASpec(
-            **values,
-            max_num_seqs=vllm_config.scheduler_config.max_num_seqs,
-            max_in_flight_tokens=vllm_config.max_in_flight_tokens,
-            num_lookahead_tokens=vllm_config.num_lookahead_tokens,
+        return dataclasses.replace(
+            super().get_kv_cache_spec(vllm_config),
+            block_stride_alignment=BLOCK_STRIDE_ALIGNMENT,
         )
 
 
@@ -484,6 +472,20 @@ def _row_slots(cache, block_table, requests, logical):
         dim=1,
     ).long()
     return blocks * cache.shape[1] + safe % cache.shape[1]
+
+
+def _bound_geometry(module) -> tuple[int, int, int] | None:
+    """``(records per page, page stride, row offset)`` of a bound native cache.
+
+    Read from the allocator layout in record units, like `PagedCacheRows`, so
+    it is available before the first forward builds a cache view.
+    """
+    layout = getattr(module, "_tpu_cache_layout", None)
+    if layout is None:
+        return None
+    shape, dtype, stride_bytes, offset_bytes = layout
+    record_bytes = math.prod(shape[2:]) * dtype.itemsize
+    return shape[1], stride_bytes // record_bytes, offset_bytes // record_bytes
 
 
 def _index_page_records(index_cache):
@@ -550,13 +552,14 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
     _ced_decoder = False
     _ced_global_from_encoder = False
     _sp_sharded_input = False
-    # True once `_init_local_q_weights` built the gathered weights.
-    _local_q_attn = False
     _q_projection_rope_op: Any = None
     # TP1 FP8-KV layers run the fused Q-A/KV, Q-B and compressor kernels.
     _fused_preprocess = False
     _packed_compressor_op: Any = None
     _address_compressor_op: Any = None
+    # `CompressorLayout` fields the fused compressor ops were built for, set
+    # once the KV cache is bound (`bind_compressor_layout`).
+    _compressor_layout_fields: tuple[int, ...] | None = None
     _swa_query_group_size = 1
 
     @classmethod
@@ -579,26 +582,33 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             raise NotImplementedError(
                 "TPU V4.1 supports --kv-cache-dtype auto, bfloat16 or fp8"
             )
-        # FP8 main KV uses DSV4's packed record (448 e4m3 + 64 e8m0 bytes)
-        # plus a BF16 RoPE companion; see cache.encode_fp8_kv.
+        # FP8 main KV uses CSA2 records: the whole post-RoPE latent in e4m3,
+        # with one FP32 scale per record in a companion (csa2.cache).
         self._fp8_kv = self.kv_cache_torch_dtype == torch.float8_e4m3fn
         speculative = vllm_config.speculative_config
         if speculative is not None and speculative.num_speculative_tokens is not None:
             self._swa_query_group_size = speculative.num_speculative_tokens + 1
-        csa2_supported = (
-            get_tensor_model_parallel_world_size() == 1
-            and self._fp8_kv
-            and self.head_dim == 512
+        # Every FP8 layer, at any TP size, reads and writes CSA2 records.
+        self._csa2 = self._fp8_kv
+        if self._csa2 and not (
+            self.head_dim == 512
             and self.window_size == 128
+            and self.n_local_heads % 8 == 0
+            and 8 <= self.n_local_heads <= 128
+        ):
+            raise NotImplementedError(
+                "FP8 V4.1 KV (CSA2) needs head_dim 512, window 128 and 8-128 "
+                f"local heads divisible by 8, got {self.n_local_heads}"
+            )
+        self._fused_wo_b = False
+        # The fused Q-A/KV, Q-B and compressor kernels are TP1, 64-head kernels;
+        # other TP sizes write the same CSA2 records through the unfused path.
+        self._fused_preprocess = (
+            self._csa2
+            and get_tensor_model_parallel_world_size() == 1
             and self.n_local_heads == 64
         )
-        # Compress-ratio-0 layers (SWA only, and the DSpark draft) run CSA2's
-        # SWA-only form: one attention kernel reads native pages for every layer.
-        self._csa2 = csa2_supported
-        # Set after weight loading, once wo_b's runtime layout is known.
-        self._fused_wo_b = False
-        self._fused_preprocess = csa2_supported
-        self.swa_cache_layer.native_pages = self._csa2
+        self.swa_cache_layer._tpu_swa_words = self._csa2
         if self.compress_ratio:
             logger.info_once(
                 "DeepSeek-V4.1 attention backend: %s",
@@ -620,17 +630,6 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             ),
             persistent=False,
         )
-        self.register_buffer(
-            "_tp_rank_1d",
-            self._tp_rank.reshape(1),
-            persistent=False,
-        )
-        tp_size = get_tensor_model_parallel_world_size()
-        self.register_buffer(
-            "_full_attn_sink",
-            self.attn_sink.detach().float().repeat(tp_size).contiguous(),
-            persistent=False,
-        )
         self._config = vllm_config.model_config.hf_config.to_dict()
         if self.indexer is not None:
             indexer = cast(Any, self.indexer)
@@ -648,19 +647,15 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 candidate_write=getattr(op, "candidate_write", False),
             )
         self._max_model_len = vllm_config.model_config.max_model_len
-        # Branch-free SWA patch (`_attend_window`) only while its static
-        # capacity, 63 tokens per extra request, stays small. Measured
-        # (tpu7x-2): max_num_seqs 1 +4.6%, 4 +1.6%, 8 -4.3% prefill.
-        max_num_seqs = vllm_config.scheduler_config.max_num_seqs
-        self._swa_max_requests = max_num_seqs if max_num_seqs <= 4 else None
-        self._precompact_records = self._fp8_kv
-        self._token_parallel_attn = self._fp8_kv
         object.__setattr__(self, "mla_attn", self)
         self._prepare_and_attn_fn = self._prepare_tpu
 
     def get_kv_cache_spec(self, vllm_config):
         spec = super().get_kv_cache_spec(vllm_config)
-        if spec is None or not self._fp8_kv:
+        if spec is None:
+            return spec
+        spec = dataclasses.replace(spec, block_stride_alignment=BLOCK_STRIDE_ALIGNMENT)
+        if not self._fp8_kv:
             return spec
         return dataclasses.replace(spec, dtype=torch.uint8, page_size_padded=None)
 
@@ -701,18 +696,6 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 hidden_states
             )
             qr, qr_scale, kv = self._split_qkv_and_norm(qr_kv)
-        # This rank's SP token shard of qr, before the gather.
-        swa_kv = getattr(getattr(self, "swa_cache_layer", None), "kv_cache", None)
-        qr_local = (
-            qr
-            if self._sp_sharded_input
-            and getattr(self, "_local_q_attn", False)
-            and (
-                swa_kv is None
-                or (isinstance(swa_kv, PagedCacheRows) and self.window_size % 64 == 0)
-            )
-            else None
-        )
         if self._sp_sharded_input:
             if indexer_weights is not None:
                 assert qr.dtype == kv.dtype == indexer_weights.dtype
@@ -726,10 +709,6 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                         dim=-1,
                     )
                 )
-            elif qr_local is not None:
-                # Non-source encoder layers with local_q do not consume
-                # full-token qr on the host; gather only kv (512 cols vs 2048).
-                kv = sp_all_gather(kv)[:num_tokens]
             else:
                 assert qr.dtype == kv.dtype
                 packed = sp_all_gather(torch.cat((qr, kv), dim=-1))[:num_tokens]
@@ -752,13 +731,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             positions,
             o_padded,
         )
-        if qr_local is not None:
-            projected = self._prepare_and_attn_fn(*args, qr_local=qr_local)
-            if projected is not None:
-                # The fused q/attention/wo_a op already produced wo_b's input.
-                return _value(self.wo_b(projected))
-        else:
-            self._prepare_and_attn_fn(*args)
+        self._prepare_and_attn_fn(*args)
         o = o_padded[:, : self.n_local_heads, :]
         return self._o_proj(o, positions)
 
@@ -907,7 +880,41 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 main_offset=main_cache.row_offset,
                 index_capacity=index_cache.shape[1],
             )
-        return preprocess_ops.compressor_layout_admitted(region, **fields)
+        return preprocess_ops.compressor_layout_admitted(
+            region, self._compressor_layout_fields, **fields
+        )
+
+    def bind_compressor_layout(self) -> None:
+        """Rebuild the fused ratio-2 compressor ops for the bound cache geometry.
+
+        Weights load before the KV cache is bound, so the ops built in
+        `process_weights_after_loading` carry the default layout. Block-outer
+        groups give every layer its own state/main offsets, so each layer's
+        kernels are specialized for its own pages here, before any forward.
+        """
+        if self._packed_compressor_op is None or self.compressor is None:
+            return
+        state = _bound_geometry(self.compressor.state_cache)
+        main = _bound_geometry(self)
+        index = _bound_geometry(self.indexer.k_cache)
+        if state is None or main is None or index is None:
+            return
+        layout = decode_preparation.CompressorLayout(
+            state_capacity=state[0],
+            state_stride=state[1],
+            state_offset=state[2],
+            window=self.window_size,
+            main_capacity=main[0],
+            main_stride=main[1],
+            main_offset=main[2],
+            index_capacity=index[0],
+        )
+        eps = self.compressor.rms_norm_eps
+        self._packed_compressor_op = preprocess_ops.compress_rope_packed(eps, layout)
+        self._address_compressor_op = preprocess_ops.compress_rope_addresses(
+            eps, layout
+        )
+        self._compressor_layout_fields = dataclasses.astuple(layout)
 
     def _write_csa2_global_kv(self, hidden_states, positions):
         """Fused compressor: one kernel projects, pools (reading and writing the
@@ -1207,10 +1214,8 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         index_weights,
         positions,
         output,
-        qr_local=None,
     ):
-        """Attend into ``output``, or return the ``wo_b`` input when the fused
-        q/attention/``wo_a`` op (``qr_local``) ran; else ``None``.
+        """Attend into ``output``.
 
         With ``_fused_preprocess``, ``kv`` already carries its SWA RoPE."""
         metadata = get_forward_context().attn_metadata
@@ -1260,9 +1265,11 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             if cached is None or cached[0] is not swa.block_tables:
                 if (
                     self._fused_preprocess
-                    and swa_cache.native_swa
-                    and rows_per_page == swa_cache.page_stride == 64
-                    and swa_cache.row_offset == 0
+                    and swa_cache.swa_words
+                    # Stride and offset are whole pages (`PagedCacheRows`
+                    # checks this for word-pool owners); block-outer groups
+                    # place each SWA layer at its own page of the block.
+                    and rows_per_page == SWA_PAGE_TOKENS
                     and not non_causal
                 ):
                     csa2_metadata, csa2_bounds, csa2_write_records = (
@@ -1535,23 +1542,12 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 if swa_row_slots is not None
                 else None
             )
-        # Token-local q path: q projection, attention and
-        # wo_a run in one op that picks token-parallel vs head-sharded on
-        # concrete shapes.
-        fused_qo = (
-            qr_local is not None
-            and self._local_q_attn
-            and tiled
-            and self._fp8_kv
-            and bool(self.compress_ratio)
-        )
-        q = None
         if self._fused_preprocess:
             # Shares the step's gathered rows with the Q-A/KV kernel.
             q = preprocess_ops.qb_rope()(
                 qr, self.wq_b.weight, self.wq_b.weight_scale, self._rope_rows(positions)
             )
-        elif not fused_qo:
+        else:
             # V4.1 normalizes qr before projection; neither route renormalizes q.
             if (
                 self._q_projection_rope_op is not None
@@ -1822,71 +1818,21 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 )
                 output.copy_(result)
                 return None
-            assert records is not None
-            if fused_qo:
-                return sparse_fp8_attention_qo(
-                    qr,
-                    qr_local,
-                    self.wq_b.weight,
-                    self.wq_b.weight_scale,
-                    self._wq_b_full,
-                    self._wq_b_full_scale,
-                    positions,
-                    self._tpu_rope_cache,
-                    swa_cache,
-                    main_cache,
-                    records,
-                    main_records,
-                    self.attn_sink,
-                    self._full_attn_sink,
-                    self._tp_rank_1d,
-                    self.wo_a.weight,
-                    self.wo_a.weight_scale,
-                    self._wo_a_full,
-                    self._wo_a_full_scale,
-                    swa_valid,
-                    self.scale,
-                    pages,
-                    starts,
-                    self._swa_max_requests,
-                    self._precompact_records,
-                    int(self.head_dim),
-                )
-            assert q is not None
-            if self._fp8_kv and self.compress_ratio:
-                result = sparse_fp8_attention(
-                    q,
-                    swa_cache,
-                    main_cache,
-                    records,
-                    main_records,
-                    self.attn_sink,
-                    self.scale,
-                    pages,
-                    starts,
-                    self._swa_max_requests,
-                    precompacted=self._precompact_records,
-                    token_parallel=self._token_parallel_attn,
-                    full_sink=self._full_attn_sink,
-                    tp_rank=self._tp_rank_1d,
-                )
-            else:
-                # The op zeroes the invalid rows itself (in the shared DSpark
-                # draft kernel's write-back).
-                result = paged_attention(
-                    q,
-                    swa_cache,
-                    main_cache,
-                    records,
-                    main_records,
-                    self.attn_sink,
-                    self.scale,
-                    self._swa_query_group_size,
-                    row_valid=swa_valid,
-                )
-                output.copy_(result)
-                return None
-            output.copy_(result.masked_fill(swa_invalid_3d, 0))
+            assert records is not None and q is not None
+            # The op zeroes the invalid rows itself (in the shared DSpark
+            # draft kernel's write-back).
+            result = paged_attention(
+                q,
+                swa_cache,
+                main_cache,
+                records,
+                main_records,
+                self.attn_sink,
+                self.scale,
+                self._swa_query_group_size,
+                row_valid=swa_valid,
+            )
+            output.copy_(result)
             return None
         if self._fp8_kv and self.compress_ratio:
             raise NotImplementedError("FP8 V4.1 KV cache requires the tiled path")
@@ -1905,52 +1851,6 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         )[:, 0]
         output.copy_(result.masked_fill(swa_invalid_3d, 0))
         return None
-
-    def _init_local_q_weights(self):
-        """All-gather ``wq_b`` and ``wo_a`` for the token-local q path.
-
-        Column ``r`` blocks of the gathered weights are rank ``r``'s shards, the
-        same rank-major head/group order the token-parallel ``all_to_all``
-        uses, so every per-head/per-group product is computed from identical
-        weights. FP8 tensors are gathered as bytes.
-        """
-        tp_size = get_tensor_model_parallel_world_size()
-        if (
-            not self._token_parallel_attn
-            or tp_size <= 1
-            or getattr(self, "_ced_decoder", False)
-            or not (self._fp8_kv and self.compress_ratio)
-            or self.n_local_groups != 1
-        ):
-            return
-        wq_scale = getattr(self.wq_b, "weight_scale", None)
-        wo_scale = getattr(self.wo_a, "weight_scale", None)
-        if (
-            wq_scale is None
-            or wq_scale.ndim != 1
-            or wo_scale is None
-            or getattr(self.wq_b, KEEP_VLLM_LAYOUT_ATTR, False)
-        ):
-            return
-
-        def gather_columns(weight):
-            weight = weight.contiguous()
-            gathered = tensor_model_parallel_all_gather(weight.view(torch.uint8), dim=1)
-            return gathered.view(weight.dtype).contiguous()
-
-        buffers = {
-            "_wq_b_full": gather_columns(self.wq_b.weight),
-            "_wq_b_full_scale": tensor_model_parallel_all_gather(
-                wq_scale.contiguous(), dim=0
-            ),
-            "_wo_a_full": gather_columns(self.wo_a.weight),
-            "_wo_a_full_scale": tensor_model_parallel_all_gather(
-                wo_scale.reshape(-1).contiguous(), dim=0
-            ),
-        }
-        for name, value in buffers.items():
-            self.register_buffer(name, value, persistent=False)
-        self._local_q_attn = True
 
     def _select_paged_indices(
         self,
@@ -2206,15 +2106,6 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         VllmDeepseekV4MLAAttention.process_weights_after_loading(self, act_dtype)
         self._assert_o_proj_supported()
         tp_size = get_tensor_model_parallel_world_size()
-        if tp_size > 1:
-            self._full_attn_sink.copy_(
-                tensor_model_parallel_all_gather(
-                    self.attn_sink.detach().float().contiguous(), dim=0
-                )
-            )
-        else:
-            self._full_attn_sink.copy_(self.attn_sink.detach().float())
-        self._init_local_q_weights()
         self._q_projection_rope_op = None
         if self._fused_preprocess:
             self._flip_compressor_weight()

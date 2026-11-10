@@ -111,6 +111,8 @@ def _prepare_swa(
             values = jnp.where(
                 physical_page < low_pages, values, swa_kv_ref[block * 2 + 1][0]
             )
+        if values.dtype == jnp.int32:
+            values = pltpu.bitcast(values.reshape(page_size // 2, 512), jnp.bfloat16)
         rows = pl.ds(block * page_size, page_size)
         positions = anchor + block * page_size + 2 * jnp.arange(page_size // 2)
         low = active & (positions >= left) & (positions < right)
@@ -179,8 +181,9 @@ def _csa2_kernel(
     bq = q_buf.shape[1]
     batch = pages_ref.shape[0]
     num_banks = len(swa_hbm)
-    cache_page_size = swa_hbm[0].shape[1]
-    page_size = swa_buf.shape[-2]
+    rows_per_token = 2 if swa_hbm[0].dtype == jnp.int32 else 1
+    cache_page_size = swa_hbm[0].shape[1] // rows_per_token
+    page_size = swa_buf.shape[-2] // rows_per_token
     num_pages = 256 // page_size
     tile_capacity = tile_scratch.shape[0] // 3
     fixed_tiles = batch == 1 and tokens % bq == 0
@@ -286,10 +289,15 @@ def _csa2_kernel(
                         physical -= swa_hbm[0].shape[0]
                 physical = jnp.where(valid, physical, 0)
                 offset = jnp.where(valid, position % cache_page_size, 0)
+                if rows_per_token == 2:
+                    offset = pl.multiple_of(offset, page_size) * 2
                 index = block * num_banks + owner
                 copies.append(
                     pltpu.make_async_copy(
-                        source.at[pl.ds(physical, 1), pl.ds(offset, page_size)],
+                        source.at[
+                            pl.ds(physical, 1),
+                            pl.ds(offset, page_size * rows_per_token),
+                        ],
                         swa_buf.at[bank, index],
                         swa_sems.at[bank, index],
                     )
@@ -320,7 +328,10 @@ def _csa2_kernel(
     def prepare(tile, bank, work_bank):
         tile = safe_tile(tile)
         if num_banks == 1:
-            values = swa_buf[bank].reshape(256, 512)
+            values = swa_buf[bank]
+            if values.dtype == jnp.int32:
+                values = pltpu.bitcast(values.reshape(128, 512), jnp.bfloat16)
+            values = values.reshape(256, 512)
             active = _tile_field(tiles_ref, tile, 0) < batch
             _, left, right, anchor = swa_window(
                 tile,
@@ -759,8 +770,11 @@ def csa2(
     """Ragged CSA2 attention with FP32 scales and independent SWA visibility.
 
     Main KV is query-local packed FP8 [T,512,128], scales are FP32 [T,512].
-    SWA uses one or two native BF16 page owners. starts [B+1] describes
-    requests; repeated boundaries and output padding are supported.
+    SWA accepts BF16 [pages,tokens,512] or shared INT32 [pages,word_rows,128]
+    owners. Four 128-word rows hold a pair of tokens; each word packs the same
+    feature from adjacent token rows in its low/high halves. Physical page
+    geometry stays identical to the main word pool. starts [B+1] describes requests;
+    repeated boundaries and output padding are supported.
     Explicit swa_bounds selects visibility independently of model layer stage.
 
     The T queries are rows [query_offset, query_offset + T) of q [T',H,512].
@@ -823,15 +837,19 @@ def csa2(
         if (
             bank.ndim != 3
             or bank.shape[0] < 1
-            or bank.shape[-1] != 512
-            or bank.dtype != jnp.bfloat16
+            or bank.shape[-1] != (128 if bank.dtype == jnp.int32 else 512)
+            or bank.dtype not in (jnp.bfloat16, jnp.int32)
         ):
-            raise ValueError("SWA requires native BF16 [pages,page_size,512]")
-        if bank.shape[1:] != banks[0].shape[1:]:
+            raise ValueError(
+                "SWA requires BF16 token pages or INT32 [pages,word_rows,128]"
+            )
+        if bank.shape[1:] != banks[0].shape[1:] or bank.dtype != banks[0].dtype:
             raise ValueError("SWA banks must have matching page shapes")
-    cache_page_size = banks[0].shape[1]
-    if cache_page_size not in (8, 16, 32, 64) and (
-        cache_page_size < 128 or cache_page_size % 128
+    rows_per_token = 2 if banks[0].dtype == jnp.int32 else 1
+    cache_page_size = banks[0].shape[1] // rows_per_token
+    if banks[0].shape[1] % rows_per_token or (
+        cache_page_size not in (8, 16, 32, 64)
+        and (cache_page_size < 128 or cache_page_size % 128)
     ):
         raise ValueError("SWA page size must be 8,16,32,64 or a multiple of 128")
     if not has_main:
@@ -952,7 +970,14 @@ def csa2(
                 None if resident_metadata else pltpu.VMEM((4, bq, 2, 128), jnp.float32),
                 None if resident_metadata else pltpu.VMEM((2, bq, 2, 128), jnp.float32),
                 pltpu.VMEM(
-                    (4, num_pages * len(banks), 1, page_size, 512), jnp.bfloat16
+                    (
+                        4,
+                        num_pages * len(banks),
+                        1,
+                        page_size * rows_per_token,
+                        banks[0].shape[-1],
+                    ),
+                    banks[0].dtype,
                 ),
                 pltpu.VMEM((2, bq, heads, 512), jnp.bfloat16),
                 pltpu.VMEM((bq, 512, 512), jnp.bfloat16) if has_main else None,
