@@ -42,6 +42,7 @@ axes are ("dp", "tp") in that order, with TP pairs on one chip.
 """
 
 import functools
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -654,7 +655,18 @@ def _kernel_body(
     hidden = x_ref.shape[1]
     half = hidden // 2
     rows_l = x_ref.shape[0] if dispatch == "inkernel" else x_ref.shape[0] // dp
-    xs_all = None
+    # Bound below only for the dispatch and combine sides and forms that use
+    # them; Any, so the type checker does not narrow them to None or unbound.
+    xs_all: Any = None
+    dsem: Any = None
+    xrecv: Any = None
+    c_send: Any = None
+    c_recv1: Any = None
+    c_pair_send: Any = None
+    c_pair_recv: Any = None
+    c_half: Any = None
+    c_recv2: Any = None
+    csem: Any = None
     if dispatch == "inkernel":
         x_all, lg_all, dsem, xrecv = take(4)
         if dispatch_fp8:
