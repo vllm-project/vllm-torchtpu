@@ -1896,28 +1896,6 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         setattr(layer, KEEP_VLLM_LAYOUT_ATTR, True)
         return layer
 
-    def apply_prequant(
-        self,
-        layer: torch.nn.Module,
-        x_q: torch.Tensor,
-        x_s: torch.Tensor,
-        bias: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """apply with the activation already quantised per row: the
-        sequence-parallel fp8 all-gather hands the projections fp8 rows
-        and their scales (layers/adapter/sequence_parallel)."""
-        from vllm_torchtpu.layers.adapter.linear_common import (
-            quantized_matmul_prequant,
-        )
-
-        weight = layer.weight
-        if getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False):
-            weight = weight.transpose(0, 1)
-        out = quantized_matmul_prequant(x_q, x_s, weight, layer.weight_scale)
-        if bias is not None:
-            out = out + bias
-        return out
-
 
 def resolve_online_fp8(
     config: VllmFp8Config | VllmNvfp4Config,
