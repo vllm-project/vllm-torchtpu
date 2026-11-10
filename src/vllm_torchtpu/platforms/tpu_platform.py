@@ -1555,9 +1555,14 @@ def _get_token_paddings(
 
 
 def _is_sequence_parallel_bucket(size: int, tp: int) -> bool:
-    # Each rank receives size // tp rows; require 8-token alignment or
+    from vllm_torchtpu.layers.adapter import sequence_parallel
+
+    # A bucket below min_rows runs replicated, so any size serves. From there
+    # each rank receives size // tp rows; require 8-token alignment or
     # validated power-of-two decode sizes (2, 4) with at least 2 rows per rank
     # to avoid single-token shape specialization in Dynamo.
+    if size < sequence_parallel.min_rows():
+        return True
     rows, rem = divmod(size, tp)
     return rem == 0 and (rows % 8 == 0 or rows in (2, 4))
 
@@ -1565,8 +1570,10 @@ def _is_sequence_parallel_bucket(size: int, tp: int) -> bool:
 def _configure_sequence_parallel_moe(vllm_config: VllmConfig) -> None:
     """Validate architecture and filter compile buckets for sequence-parallel MoE.
 
-    Keeps compile sizes where each tensor-parallel rank receives an 8-token aligned
-    shard or a validated power-of-two decode shard (2, 4 rows).
+    Keeps compile sizes below sequence_parallel.min_rows(), which run
+    replicated, and from there on those where each tensor-parallel rank
+    receives an 8-token aligned shard or a validated power-of-two decode shard
+    (2, 4 rows).
     """
     parallel_config = vllm_config.parallel_config
     if not parallel_config.use_sequence_parallel_moe:
