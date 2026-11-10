@@ -39,6 +39,20 @@ from vllm_torchtpu.models.qwen3_5.kernels.gdn import (
 
 logger = init_logger(__name__)
 
+# Per-rank value heads from which a verify window runs the fused 1-dot
+# recurrence (compute_gdn: one 8-row dot for k S and q S, decay applied to the
+# products). Qwen3.5-397B has 64 value heads, so this is TP <= 2: the DP4 x TP2
+# decode layout, where it was measured, and TP1. TP8 decode (8 heads per rank)
+# keeps the two-dot form.
+FUSED_1DOT_MIN_V_HEADS = 32
+
+
+def use_fused_1dot(window_size: int, n_v: int) -> bool:
+    """Whether a tile with this window and per-rank value heads runs the fused
+    1-dot recurrence. It reassociates the decay, so its results can differ
+    from the two-dot form in the last bits."""
+    return window_size > 1 and n_v >= FUSED_1DOT_MIN_V_HEADS
+
 
 def inner_kernel(
     # Inputs.
@@ -865,6 +879,7 @@ def fused_conv1d_gdn(
             ),
             is_shared=is_shared,
             qkv_2d=qkv_2d,
+            fused_1dot=use_fused_1dot(window_size, n_v),
         )
 
         # Step 6: Metadata preprocessing. Will be executed multiple times per-layer
