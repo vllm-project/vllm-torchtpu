@@ -26,12 +26,28 @@ that needs it:
 
 - `kernels/`: Qwen3.5-only kernels and model-owned copies of reference kernels
   (each copy records its source path and commit hash in its header).
-- `settings.py`: settings that apply only to Qwen3.5.
-- `hooks.py`: this model's implementation of the shared-core hooks.
+- `settings.py`: settings that apply only to Qwen3.5. They are read from
+  `--additional-config '{"qwen3_5": {...}}'` for
+  `Qwen3_5MoeForConditionalGeneration`; a `qwen3_5` section given to another
+  model is rejected. A setting is added by the change that implements it, and
+  unknown keys fail at engine start (see [Settings](#settings)).
+- `hooks.py`: this model's implementation of the shared-core hooks. Its config
+  hook is registered in vLLM's `MODELS_CONFIG_MAP`: it keeps vLLM's own
+  Qwen3.5 checks, validates the settings, and fills TPU serving defaults the
+  user left unset (see its docstring).
 - `validation/`: serving configs, golden outputs, and accuracy and performance
-  baselines for this model's production configs.
+  baselines for this model's production configs. The first entries are the
+  serving configs of the InferenceX (IX) prefill/decode points and the 1P1D
+  accuracy gates (see `validation/README.md`).
 - `experimental/`: hill-climbing kernels and features that are not yet part of
   the production configs.
+
+## Settings
+
+| Setting | Type | Default | What it does |
+| --- | --- | --- | --- |
+
+No setting exists yet. Each change that adds one adds its row here.
 
 ## Production Configs
 
