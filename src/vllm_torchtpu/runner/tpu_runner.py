@@ -6566,8 +6566,8 @@ class TPUModelRunner(GPUModelRunner):
                     if logits.device.type == "tpu" and isinstance(
                         self.rejection_sampler, RejectionSampler
                     ):
-                        # Drawn inside the compiled sampler (see
-                        # _get_sampling_generator).
+                        # Drawn inside the compiled sampler
+                        # (see _get_sampling_generator).
                         u_both = None
                     else:
                         num_cand = topk_candidates * CANDIDATE_BLOCK
@@ -11185,9 +11185,7 @@ class TPUModelRunner(GPUModelRunner):
         is_greedy = temperatures <= SAMPLING_EPS
         scaled_logits = self._apply_temperature(cand_logits, temperatures)
         max_k = min(32, scaled_logits.shape[-1])
-        masked_logits = apply_top_k_top_p(
-            scaled_logits, top_k, top_p, max_k=max_k
-        )
+        masked_logits = apply_top_k_top_p(scaled_logits, top_k, top_p, max_k=max_k)
         u_clamped = torch.clamp(
             u, min=torch.finfo(u.dtype).tiny, max=1.0 - torch.finfo(u.dtype).eps
         )

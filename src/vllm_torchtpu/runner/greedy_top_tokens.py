@@ -71,7 +71,6 @@ _LOCAL_TOPK_BLOCK_SIZE = 64
 _LOCAL_TOPK_NUM_BLOCKS = LOCAL_TOPK_CANDIDATES
 
 
-
 def _quantize_fp8_per_row(
     tensor: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -83,9 +82,9 @@ def _quantize_fp8_per_row(
     )
     scale = abs_max * dtype_max_recip
     scale_inv = torch.where(scale == 0, torch.zeros_like(scale), 1.0 / scale)
-    q = torch.clamp(
-        t_f32 * scale_inv, min=-_FP8_E4M3_MAX, max=_FP8_E4M3_MAX
-    ).to(torch.float8_e4m3fn)
+    q = torch.clamp(t_f32 * scale_inv, min=-_FP8_E4M3_MAX, max=_FP8_E4M3_MAX).to(
+        torch.float8_e4m3fn
+    )
     return q, scale.squeeze(-1).to(torch.float32)
 
 
@@ -120,9 +119,7 @@ def _ensure_tpu_quant_ops_registered() -> dict[str, Any]:
     # stringified PEP-563 annotations against module globals().
     globals()["jax"] = jax
 
-    def _w8a8_2d_logits_jax(
-        x: jax.Array, w_q: jax.Array, w_s: jax.Array
-    ) -> jax.Array:
+    def _w8a8_2d_logits_jax(x: jax.Array, w_q: jax.Array, w_s: jax.Array) -> jax.Array:
         orig_b = x.shape[0]
         if orig_b == 1:
             x = jnp.pad(x, ((0, 1), (0, 0)))
@@ -278,9 +275,7 @@ def _ensure_tpu_quant_ops_registered() -> dict[str, Any]:
             torch.empty((x.shape[0],), dtype=torch.int32, device=x.device),
         )
 
-    def _fake_topk32_3arg(
-        x: torch.Tensor, w_q: torch.Tensor, w_s: torch.Tensor
-    ):
+    def _fake_topk32_3arg(x: torch.Tensor, w_q: torch.Tensor, w_s: torch.Tensor):
         return (
             torch.empty(
                 (x.shape[0], LOCAL_TOPK_CANDIDATES),
@@ -394,19 +389,12 @@ def _quantized_head_local_max(
     )
 
     if isinstance(pad_buf, torch.Tensor) and (
-        getattr(processor, "vocab_size", 0)
-        < getattr(processor, "padded_vocab_size", 0)
+        getattr(processor, "vocab_size", 0) < getattr(processor, "padded_vocab_size", 0)
     ):
         shard_vocab = logits.shape[-1]
-        col_idx = torch.arange(
-            shard_vocab, device=logits.device, dtype=torch.int32
-        )
-        valid_cols = shard_vocab - pad_buf.to(
-            device=logits.device, dtype=torch.int32
-        )
-        logits = logits.masked_fill(
-            (col_idx >= valid_cols).unsqueeze(0), -float("inf")
-        )
+        col_idx = torch.arange(shard_vocab, device=logits.device, dtype=torch.int32)
+        valid_cols = shard_vocab - pad_buf.to(device=logits.device, dtype=torch.int32)
+        logits = logits.masked_fill((col_idx >= valid_cols).unsqueeze(0), -float("inf"))
     elif num_pad_int > 0:
         logits[..., -num_pad_int:] = -float("inf")
 
@@ -479,15 +467,9 @@ def tpu_get_top_tokens(
         getattr(self, "vocab_size", 0) < getattr(self, "padded_vocab_size", 0)
     ):
         shard_vocab = logits.shape[-1]
-        col_idx = torch.arange(
-            shard_vocab, device=logits.device, dtype=torch.int32
-        )
-        valid_cols = shard_vocab - pad_buf.to(
-            device=logits.device, dtype=torch.int32
-        )
-        logits = logits.masked_fill(
-            (col_idx >= valid_cols).unsqueeze(0), -float("inf")
-        )
+        col_idx = torch.arange(shard_vocab, device=logits.device, dtype=torch.int32)
+        valid_cols = shard_vocab - pad_buf.to(device=logits.device, dtype=torch.int32)
+        logits = logits.masked_fill((col_idx >= valid_cols).unsqueeze(0), -float("inf"))
     else:
         num_pad = lm_head.shard_indices.num_org_vocab_padding
         if num_pad > 0:
@@ -501,9 +483,9 @@ def tpu_get_top_tokens(
     if tp_size == 1:
         local_max_indices = logits.argmax(dim=-1)
         if isinstance(vocab_start, torch.Tensor):
-            local_max_indices = local_max_indices.to(
-                torch.int32
-            ) + vocab_start.to(device=logits.device, dtype=torch.int32)
+            local_max_indices = local_max_indices.to(torch.int32) + vocab_start.to(
+                device=logits.device, dtype=torch.int32
+            )
         elif vocab_start != 0:
             local_max_indices = local_max_indices + vocab_start
         return local_max_indices.to(torch.int64)
@@ -518,9 +500,7 @@ def tpu_get_top_tokens(
         global_indices = local_indices_i32 + int(vocab_start)
     else:
         global_indices = local_indices_i32
-    local_pair = torch.stack(
-        [local_max_vals.float(), global_indices.float()], dim=-1
-    )
+    local_pair = torch.stack([local_max_vals.float(), global_indices.float()], dim=-1)
     rows = hidden_states.shape[0]
     gathered = lp_module.tensor_model_parallel_all_gather(local_pair, dim=0)
     if gathered.shape[0] == tp_size * rows:
@@ -538,7 +518,10 @@ LogitsProcessor.get_top_tokens = tpu_get_top_tokens
 def _extract_local_topk32_torch(
     logits: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Two-stage local Top-32 extraction in PyTorch (matches ``_extract_local_topk32_jax``)."""
+    """Two-stage local Top-32 extraction in PyTorch.
+
+    Matches ``_extract_local_topk32_jax``.
+    """
     t_rows, shard_vocab = logits.shape
     block_size = _LOCAL_TOPK_BLOCK_SIZE
     num_local_blocks = _LOCAL_TOPK_NUM_BLOCKS
@@ -551,16 +534,12 @@ def _extract_local_topk32_torch(
             )
         else:
             logits_pad = logits.float()
-        vals32, ids32 = torch.topk(
-            logits_pad, k=LOCAL_TOPK_CANDIDATES, dim=-1
-        )
+        vals32, ids32 = torch.topk(logits_pad, k=LOCAL_TOPK_CANDIDATES, dim=-1)
         return vals32.float(), ids32.to(torch.int32)
 
     if shard_vocab % block_size != 0:
         pad_cols = block_size - (shard_vocab % block_size)
-        lg_padded = torch.nn.functional.pad(
-            logits, (0, pad_cols), value=-float("inf")
-        )
+        lg_padded = torch.nn.functional.pad(logits, (0, pad_cols), value=-float("inf"))
     else:
         lg_padded = logits
     n_blocks = lg_padded.shape[1] // block_size
@@ -571,15 +550,13 @@ def _extract_local_topk32_torch(
     local_cand512 = torch.gather(blocks, 1, gather_idx).reshape(
         t_rows, num_local_blocks * block_size
     )
-    intra = torch.arange(
-        block_size, device=logits.device, dtype=torch.int32
-    ).view(1, 1, block_size)
-    local_ids512 = (
-        blk_ids.to(torch.int32).unsqueeze(-1) * block_size + intra
-    ).reshape(t_rows, num_local_blocks * block_size)
-    vals32, idx32 = torch.topk(
-        local_cand512.float(), k=LOCAL_TOPK_CANDIDATES, dim=-1
+    intra = torch.arange(block_size, device=logits.device, dtype=torch.int32).view(
+        1, 1, block_size
     )
+    local_ids512 = (blk_ids.to(torch.int32).unsqueeze(-1) * block_size + intra).reshape(
+        t_rows, num_local_blocks * block_size
+    )
+    vals32, idx32 = torch.topk(local_cand512.float(), k=LOCAL_TOPK_CANDIDATES, dim=-1)
     ids32 = torch.gather(local_ids512, 1, idx32)
     return vals32.float(), ids32.to(torch.int32)
 
@@ -638,19 +615,12 @@ def _quantized_head_local_topk(
     logits = logits.to(hidden_states.dtype)
 
     if isinstance(pad_buf, torch.Tensor) and (
-        getattr(processor, "vocab_size", 0)
-        < getattr(processor, "padded_vocab_size", 0)
+        getattr(processor, "vocab_size", 0) < getattr(processor, "padded_vocab_size", 0)
     ):
         shard_vocab = logits.shape[-1]
-        col_idx = torch.arange(
-            shard_vocab, device=logits.device, dtype=torch.int32
-        )
-        valid_cols = shard_vocab - pad_buf.to(
-            device=logits.device, dtype=torch.int32
-        )
-        logits = logits.masked_fill(
-            (col_idx >= valid_cols).unsqueeze(0), -float("inf")
-        )
+        col_idx = torch.arange(shard_vocab, device=logits.device, dtype=torch.int32)
+        valid_cols = shard_vocab - pad_buf.to(device=logits.device, dtype=torch.int32)
+        logits = logits.masked_fill((col_idx >= valid_cols).unsqueeze(0), -float("inf"))
     elif num_pad_int > 0:
         logits[..., -num_pad_int:] = -float("inf")
 
@@ -695,13 +665,10 @@ def tpu_get_topk_candidates(
 
         pad_buf = getattr(lm_head, "num_org_vocab_padding", None)
         if isinstance(pad_buf, torch.Tensor) and (
-            getattr(self, "vocab_size", 0)
-            < getattr(self, "padded_vocab_size", 0)
+            getattr(self, "vocab_size", 0) < getattr(self, "padded_vocab_size", 0)
         ):
             shard_vocab = logits.shape[-1]
-            col_idx = torch.arange(
-                shard_vocab, device=logits.device, dtype=torch.int32
-            )
+            col_idx = torch.arange(shard_vocab, device=logits.device, dtype=torch.int32)
             valid_cols = shard_vocab - pad_buf.to(
                 device=logits.device, dtype=torch.int32
             )
@@ -731,15 +698,11 @@ def tpu_get_topk_candidates(
         global_indices = local_indices_i32
 
     if tp_size == 1:
-        return torch.cat(
-            [local_vals.float(), global_indices.float()], dim=-1
-        )
+        return torch.cat([local_vals.float(), global_indices.float()], dim=-1)
 
     rows = hidden_states.shape[0]
     k = local_vals.shape[1]
-    local_pair = torch.stack(
-        [local_vals.float(), global_indices.float()], dim=-1
-    )
+    local_pair = torch.stack([local_vals.float(), global_indices.float()], dim=-1)
     gathered = lp_module.tensor_model_parallel_all_gather(local_pair, dim=0)
     if gathered.shape[0] == tp_size * rows:
         gathered = gathered.view(tp_size, rows, k, 2).transpose(0, 1)
@@ -859,7 +822,8 @@ def quantize_lm_head(
         if in_place:
             return head
         raise ValueError(
-            f"quantize_lm_head requires a 2D [vocab_shard, hidden_size] weight tensor, got {type(w)}"
+            "quantize_lm_head requires a 2D [vocab_shard, hidden_size] weight "
+            f"tensor, got {type(w)}"
         )
     _ensure_head_shard_buffers(head, device=w.device)
     if parsed_mode is None:
@@ -877,9 +841,7 @@ def quantize_lm_head(
         )
         return head
 
-    w_fp8_nk_cpu, w_scale_f32_cpu = _quantize_fp8_per_row(
-        w.detach().float().cpu()
-    )
+    w_fp8_nk_cpu, w_scale_f32_cpu = _quantize_fp8_per_row(w.detach().float().cpu())
     w_scale_f32_cpu = w_scale_f32_cpu.reshape(vocab_shard).contiguous()
     w_fp8_kn_cpu = w_fp8_nk_cpu.t().contiguous()
     if w.device.type == "tpu":
@@ -1060,9 +1022,7 @@ def topk_candidates(
 ) -> torch.Tensor:
     """Packed ``[rows, 2 * C]`` ``float32`` vocabulary-parallel top-32
     candidates per TP rank (``C = 32 * tp_size``)."""
-    return owner.logits_processor.get_topk_candidates(
-        owner.lm_head, hidden_states
-    )
+    return owner.logits_processor.get_topk_candidates(owner.lm_head, hidden_states)
 
 
 def log_topk_candidates_step_path(
@@ -1073,11 +1033,13 @@ def log_topk_candidates_step_path(
         return
     if is_spec_step:
         logger.info_once(
-            "TPU_GREEDY_TOP_TOKENS: a speculative verify step took vocab-parallel top-32 candidates"
+            "TPU_GREEDY_TOP_TOKENS: a speculative verify step took vocab-parallel "
+            "top-32 candidates"
         )
     else:
         logger.info_once(
-            "TPU_GREEDY_TOP_TOKENS: a non-speculative step took vocab-parallel top-32 candidates"
+            "TPU_GREEDY_TOP_TOKENS: a non-speculative step took vocab-parallel "
+            "top-32 candidates"
         )
 
 

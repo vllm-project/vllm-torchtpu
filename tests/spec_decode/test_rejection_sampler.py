@@ -1211,6 +1211,8 @@ def test_rejection_sampler_greedy_path_ignores_draft_probs(device):
     assert torch.equal(output, expected)
     log.warning_once.assert_called_once()
     assert "ignored" in log.warning_once.call_args.args[0]
+
+
 def test_fused_verify_and_sample_candidates(device):
     """Fused candidate-space bonus sampling + rejection sampling matches full-vocab."""
     vocab_size = 512
