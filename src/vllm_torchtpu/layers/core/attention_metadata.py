@@ -511,7 +511,9 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             return block_table_obj, max_blocks
         most_model_len = runner.most_model_len
         assert most_model_len is not None
-        geom_key = (most_model_len, max_blocks, ctx.mamba_ckpt_window)
+        # Only a mamba group's width depends on the checkpoint window.
+        window = ctx.mamba_ckpt_window if self.is_mamba_group else 1
+        geom_key = (most_model_len, max_blocks, window)
         if getattr(self, "_cached_geom_key", None) == geom_key:
             return block_table_obj, self._cached_target_num_blocks
 

@@ -2949,6 +2949,7 @@ def _dummy_run_stand_in(monkeypatch, forward_model):
         _fenced_h2d_sources=[],
         _free_h2d_sources={},
         _registered_h2d_sources=set(),
+        _h2d_reuse={},
         _token_padding_state=None,
         pcp_manager=None,
         sequence_layout_planner=SimpleNamespace(
@@ -4290,7 +4291,10 @@ def test_update_states_clears_prev_draft_len_of_scheduled_cached_requests():
         rid: SimpleNamespace(prev_num_draft_len=3)
         for rid in ("drafting", "budget_cut", "unscheduled")
     }
+    from vllm_torchtpu.runner.min_tokens import MinTokensTracker
+
     runner.requests = states
+    runner._min_tokens = MinTokensTracker()
     runner.speculative_config = SimpleNamespace(num_speculative_tokens=3)
     runner.scheduler_config = SimpleNamespace(async_scheduling=True)
     runner._pre_async_results = None
