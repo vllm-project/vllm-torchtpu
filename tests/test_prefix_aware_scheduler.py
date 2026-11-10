@@ -230,3 +230,42 @@ def test_prefix_aware_srpt_scheduler_chains_both_layers():
         s.schedule()
     # PAW reorders the waiting queue, then forwards to the SRPT layer.
     assert calls == [("srpt", False)]
+
+
+def test_prompt_ids_shipped_as_ndarray_when_enabled():
+    import numpy as np
+
+    s = _make_scheduler([], {})
+    s._prompt_np = True
+    ids = [5, 7, 2**31 - 1, 0]
+    request = SimpleNamespace(request_id="r", prompt_token_ids=ids)
+    with patch.object(AsyncScheduler, "add_request", return_value=None):
+        s.add_request(request)
+    np.testing.assert_array_equal(request._prompt_ids_np, np.asarray(ids, np.int32))
+    assert request.prompt_token_ids is ids  # the engine keeps its list
+    grown = SimpleNamespace(request_id="g", prompt_token_ids=[1, 2])
+    grown._prompt_ids_np = np.asarray([1], np.int32)  # list grew after add
+    s.requests = {"r": request, "g": grown}
+    new_r = SimpleNamespace(req_id="r", prompt_token_ids=ids)
+    new_g = SimpleNamespace(req_id="g", prompt_token_ids=grown.prompt_token_ids)
+    out = SimpleNamespace(scheduled_new_reqs=[new_r, new_g])
+    with patch.object(AsyncScheduler, "schedule", return_value=out):
+        assert s.schedule() is out
+    assert isinstance(new_r.prompt_token_ids, np.ndarray)
+    assert new_r.prompt_token_ids.tolist() == ids
+    assert new_g.prompt_token_ids == [1, 2]
+
+
+def test_prompt_ids_left_as_list_by_default():
+    s = _make_scheduler([], {})
+    ids = [1, 2, 3]
+    request = SimpleNamespace(request_id="r", prompt_token_ids=ids)
+    with patch.object(AsyncScheduler, "add_request", return_value=None):
+        s.add_request(request)
+    assert not hasattr(request, "_prompt_ids_np")
+    s.requests = {"r": request}
+    new_r = SimpleNamespace(req_id="r", prompt_token_ids=ids)
+    out = SimpleNamespace(scheduled_new_reqs=[new_r])
+    with patch.object(AsyncScheduler, "schedule", return_value=out):
+        s.schedule()
+    assert new_r.prompt_token_ids is ids
