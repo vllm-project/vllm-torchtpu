@@ -160,6 +160,85 @@ def _bitset_kernel(first_ref, end_ref, word_ref, bit_ref, out_ref):
     lax.fori_loop(first_ref[block], end_ref[block], group, None)
 
 
+def _ranged_bitset_kernel(
+    first_ref, end_ref, lo_ref, hi_ref, word_ref, bit_ref, out_ref, *, groups
+):
+    """``_bitset_kernel`` visiting, per eight-word group, only the selection
+    chunks ``[lo, hi)`` that can hold one of its words (``_chunk_ranges``).
+
+    A chunk is eight selection rows of the block. Every chunk outside the
+    range holds no word of the group, so it would only add zeros: the sums
+    are the same integers, added in the same per-chunk order.
+    """
+    block = pl.program_id(0)
+    width = word_ref.shape[2]
+    out_ref[...] = jnp.zeros(out_ref.shape, jnp.int32)
+    sublane = lax.broadcasted_iota(jnp.int32, (8, width), 0)
+
+    def group(index, _):
+        base = index * 8
+        entry = block * groups + index
+
+        def accumulate(chunk, accs):
+            start = pl.multiple_of(chunk * 8, 8)
+            word = word_ref[0, pl.ds(start, 8), :]
+            bit = bit_ref[0, pl.ds(start, 8), :]
+            return tuple(
+                acc + jnp.where(word == base + k, bit, 0) for k, acc in enumerate(accs)
+            )
+
+        accs = lax.fori_loop(
+            lo_ref[entry],
+            hi_ref[entry],
+            accumulate,
+            tuple(jnp.zeros((8, width), jnp.int32) for _ in range(8)),
+        )
+        slab = jnp.zeros((8, width), jnp.int32)
+        for k, acc in enumerate(accs):
+            for shift in (4, 2, 1):
+                acc = acc + pltpu.roll(acc, shift, 0)
+            slab = jnp.where(sublane == k, acc, slab)
+        out_ref[0, pl.ds(pl.multiple_of(base, 8), 8), :] = slab
+        return None
+
+    lax.fori_loop(first_ref[block], end_ref[block], group, None)
+
+
+def _chunk_ranges(word, groups):
+    """Per query block and eight-word group, the selection chunks to visit.
+
+    ``word``: int32[blocks, rows, width] laid out for the bitset kernel (-1
+    invalid), ``rows`` a multiple of 8. Chunk ``c`` is rows ``[8c, 8c + 8)``.
+    Returns flat int32 ``(lo, hi)`` of ``[blocks * groups]``: group ``g``
+    needs chunks ``[lo, hi)`` only.
+
+    With ``M`` the running max of each chunk's largest valid word and ``m``
+    the running min (from the end) of each chunk's smallest, both are
+    nondecreasing, and a chunk holding a word of group ``g`` (``8g <= w <
+    8g + 8``) has ``M[c] >= 8g`` and ``m[c] <= 8g + 7``: ``lo`` counts the
+    chunks with ``M < 8g``, ``hi`` those with ``m <= 8g + 7``. This holds in
+    any selection order; rows sorted by group id (the SparseCore top-k emits
+    ascending ids) make the ranges tight.
+    """
+    nblocks, rows, width = word.shape
+    chunks = word.reshape(nblocks, rows // 8, 8 * width)
+    largest = jnp.max(chunks, axis=2)
+    smallest = jnp.min(
+        jnp.where(chunks >= 0, chunks, jnp.iinfo(jnp.int32).max), axis=2
+    )
+    running_max = lax.cummax(largest, axis=1)
+    running_min = lax.cummin(smallest, axis=1, reverse=True)
+    starts = (jnp.arange(groups, dtype=jnp.int32) * 8)[None, :, None]
+    lo = jnp.sum(running_max[:, None, :] < starts, axis=2, dtype=jnp.int32)
+    hi = jnp.sum(running_min[:, None, :] <= starts + 7, axis=2, dtype=jnp.int32)
+    return lo.reshape(-1), jnp.maximum(hi, lo).reshape(-1)
+
+
+# Scalar-prefetched (lo, hi) chunk-range tables of the ranged bitset kernel;
+# larger steps keep the full compare loop.
+RANGED_BITSET_SMEM_BYTES = 256 * 1024
+
+
 def _selection_bitset(
     blocks,
     lengths,
@@ -171,8 +250,14 @@ def _selection_bitset(
     width,
     interpret=False,
     owned=None,
+    ranged=None,
 ):
     """int32[blocks, words, width] selection bitset without a scatter.
+
+    ``ranged`` (default VLLM_TPU_QSA_PREFILL_BITSET_RANGED): each eight-word
+    group compares only the selection chunks that can hold its words
+    (``_chunk_ranges``), O(selections) per block on sorted rows instead of
+    O(words x selections). Bit-identical.
 
     ``owned=(rank, dcp_world, words_per_tile, live_words)``: keep only this
     DCP rank's words, numbered locally (``own_words`` of the global bitset).
@@ -207,6 +292,36 @@ def _selection_bitset(
     highest = jnp.max(per_block, axis=1)
     first = lowest // 8
     end = jnp.where(highest >= 0, highest // 8 + 1, 0)
+    if ranged is None:
+        ranged = envs.VLLM_TPU_QSA_PREFILL_BITSET_RANGED
+    groups_per_block = words // 8
+    if ranged and words % 8 == 0 and (
+        2 * nblocks * groups_per_block * 4 <= RANGED_BITSET_SMEM_BYTES
+    ):
+        logger.info_once(
+            "QSA prefill selection bitset: ranged kernel on "
+            "(VLLM_TPU_QSA_PREFILL_BITSET_RANGED, %d words, %d selection rows)",
+            words,
+            rows,
+        )
+        word_layout, bit_layout = layout(word, -1), layout(bit, 0)
+        lo, hi = _chunk_ranges(word_layout, groups_per_block)
+        return pl.pallas_call(
+            functools.partial(_ranged_bitset_kernel, groups=groups_per_block),
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=4,
+                grid=(nblocks,),
+                in_specs=[
+                    pl.BlockSpec((1, rows, width), lambda b, *_: (b, 0, 0)),
+                    pl.BlockSpec((1, rows, width), lambda b, *_: (b, 0, 0)),
+                ],
+                out_specs=pl.BlockSpec((1, words, width), lambda b, *_: (b, 0, 0)),
+            ),
+            compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
+            out_shape=jax.ShapeDtypeStruct((nblocks, words, width), jnp.int32),
+            interpret=interpret,
+            name="qsa_prefill_selection_bitset_ranged",
+        )(first, end, lo, hi, word_layout, bit_layout)
     return pl.pallas_call(
         _bitset_kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
