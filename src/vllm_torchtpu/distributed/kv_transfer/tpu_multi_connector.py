@@ -35,6 +35,21 @@ class TPUMultiConnector(MultiConnector):
 
     def __init__(self, vllm_config, role, kv_cache_config):
         super().__init__(vllm_config, role, kv_cache_config)
+        # Opt-in (kv_connector_extra_config["producer_divergent_hits"], JSON
+        # boolean, default false): on a producer, report divergent local
+        # hybrid hits when any child can complete them. See
+        # supports_divergent_local_hybrid_hits.
+        value = (vllm_config.kv_transfer_config.kv_connector_extra_config or {}).get(
+            "producer_divergent_hits", False
+        )
+        if not isinstance(value, bool):
+            raise ValueError(
+                "kv_connector_extra_config['producer_divergent_hits'] must be "
+                f"true or false, got {value!r}"
+            )
+        self._producer_divergent_hits = (
+            value and vllm_config.kv_transfer_config.is_kv_producer
+        )
         # Only a consumer starts from a decode-local hit; on a producer the
         # transfer child always reports False, whatever the other children say.
         if (
@@ -104,8 +119,14 @@ class TPUMultiConnector(MultiConnector):
         a disagg producer next to it (which never loads) must not veto the
         capability. PrefixAwareScheduler then asks that child, through
         ``resolve_divergent_local_hit_tokens``, how much of the hit to keep.
+
+        This applies only on a producer whose kv_connector_extra_config sets
+        producer_divergent_hits; otherwise upstream's every-child rule holds,
+        which on a producer is False because the transfer child never loads.
         """
-        return any(c.supports_divergent_local_hybrid_hits for c in self._connectors)
+        if getattr(self, "_producer_divergent_hits", False):
+            return any(c.supports_divergent_local_hybrid_hits for c in self._connectors)
+        return super().supports_divergent_local_hybrid_hits
 
     def poll_and_complete_transfers(self, scheduler) -> tuple[int, int, int, bool]:
         """Sums every child's schedule-start completion poll."""
