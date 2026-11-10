@@ -38,6 +38,7 @@ from vllm_torchtpu.kernels.qwen4_exp.pooled_qsa import (
     qsa_cache_writes,
     write_compressed,
     write_compressed_pairs,
+    write_compressed_pairs_unique,
     write_main_cache,
 )
 from vllm_torchtpu.kernels.qwen4_exp.qsa import (
@@ -325,7 +326,9 @@ def _stacked_writes(pool, rows, norms, tables, layers, positions, trig, starts, 
         )
     shift = jnp.asarray([lay.compressed_slot * layer_pairs for lay in layers], pair.dtype)
     pair = pair + shift[:, None]
-    pool = write_compressed_pairs(
+    writer = (write_compressed_pairs_unique if envs.VLLM_TPU_MK_COMPRESSED_UNIQUE_WRITE
+              else write_compressed_pairs)
+    pool = writer(
         pool, pair.reshape(-1), write.reshape(-1), mask.reshape(-1, *mask.shape[2:]),
         vals.reshape(-1, *vals.shape[2:]),
     )
