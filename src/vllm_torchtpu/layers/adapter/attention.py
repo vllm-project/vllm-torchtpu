@@ -1738,12 +1738,13 @@ class PallasBatchedRPAAttentionBackendImpl(PallasAttentionBackendImpl):
         # head_dim 64 is rerouted to the hd64 kernel.
         if spec is not None and self.head_size != 64:
             self.decode_query_size = spec.num_speculative_tokens + 1
-        if vllm_config is not None and self.head_size != 64:
+        model_config = vllm_config.model_config if vllm_config is not None else None
+        if model_config is not None and self.head_size != 64:
             self.decode_lanes = batched_rpa_decode.decode_lanes(
                 num_kv_heads=self.num_kv_heads,
                 head_dim=self.head_size,
                 kv_cache_dtype=self.kv_cache_quantized_dtype,
-                max_model_len=vllm_config.model_config.max_model_len,
+                max_model_len=model_config.max_model_len,
             )
 
 
