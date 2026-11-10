@@ -31,7 +31,11 @@ from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     QwenGatedDeltaNetAttention,
 )
 from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
-from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.layers.quantization.base_config import (
+    QuantizationConfig,
+    QuantizeMethodBase,
+)
+from vllm.model_executor.utils import is_weights_pre_processed, replace_parameter
 from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 
 from vllm_torchtpu import envs
@@ -46,6 +50,7 @@ from vllm_torchtpu.distributed.pcp import (
     get_pcp_rank,
     get_pcp_world_size,
 )
+from vllm_torchtpu.experimental.export.weight_mapper import CONV_WEIGHT_TRANSPOSED_ATTR
 from vllm_torchtpu.gdn_pool_layout import prefill_checkpoint_enabled
 from vllm_torchtpu.kernels.experimental.gdn_pcp_fused import projection_scale
 from vllm_torchtpu.kernels.gdn.head_geometry import (
@@ -70,7 +75,7 @@ from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     get_vllm_model_wrapper_context,
 )
-from vllm_torchtpu.utils import fresh_buffer
+from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
 
 _GDN_PCP_AXIS_NAME = "pcp"
 _GDN_TP_AXIS_NAME = "tp"
@@ -131,6 +136,7 @@ def gdn_attention_core_tpu(
     d_v: int,
     kernel_size: int,
     num_spec_tokens: int = 0,
+    conv_weight_transposed: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     # Speculative decoding: vLLM's MambaSpec widens the conv state by
     # `num_spec` columns per slot. The extra columns are unused on TPU
@@ -166,6 +172,7 @@ def gdn_attention_core_tpu(
         kernel_size=kernel_size,
         mesh=mesh,
         num_spec_tokens=num_spec_tokens,
+        conv_weight_transposed=conv_weight_transposed,
     )
     if state_len > kernel_size - 1:
         # Write the kernel result into the first kernel_size - 1 columns of the
@@ -206,6 +213,7 @@ def gdn_attention_pooled_core_tpu(
     pool_block_tokens: int,
     recurrent_state_dtype: jnp.dtype,
     num_spec_tokens: int = 0,
+    conv_weight_transposed: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     return run_jax_gdn_attention_pooled(
         mixed_qkv,
@@ -233,6 +241,7 @@ def gdn_attention_pooled_core_tpu(
         recurrent_state_dtype=recurrent_state_dtype,
         mesh=mesh,
         num_spec_tokens=num_spec_tokens,
+        conv_weight_transposed=conv_weight_transposed,
     )
 
 
@@ -370,6 +379,71 @@ def _get_shared_gdn_op(kind: str, key: tuple, build: Callable[[str], Any]) -> An
     return op
 
 
+def _prepack_conv1d_weights(conv1d: Any) -> None:
+    """Prepack `conv1d.weight` to `[kernel_size, 1, dim]` float32 (and optional
+    `conv1d.bias` to float32) once per loaded parameter."""
+    weight = conv1d.weight
+    if is_weights_pre_processed():
+        setattr(weight, CONV_WEIGHT_TRANSPOSED_ATTR, True)
+        setattr(conv1d, CONV_WEIGHT_TRANSPOSED_ATTR, True)
+        return
+    if getattr(weight, CONV_WEIGHT_TRANSPOSED_ATTR, False):
+        setattr(conv1d, CONV_WEIGHT_TRANSPOSED_ATTR, True)
+        return
+
+    packed_weight = fresh_buffer(weight.transpose(0, 2).to(dtype=torch.float32))
+    if isinstance(conv1d, torch.nn.Module) and isinstance(weight, torch.nn.Parameter):
+        new_weight = torch.nn.Parameter(packed_weight, requires_grad=False)
+        setattr(new_weight, CONV_WEIGHT_TRANSPOSED_ATTR, True)
+        replace_parameter(conv1d, "weight", new_weight)
+    else:
+        weight.data = packed_weight
+        setattr(weight, CONV_WEIGHT_TRANSPOSED_ATTR, True)
+
+    bias = getattr(conv1d, "bias", None)
+    if bias is not None:
+        packed_bias = fresh_buffer(bias.to(dtype=torch.float32))
+        if isinstance(conv1d, torch.nn.Module) and isinstance(bias, torch.nn.Parameter):
+            replace_parameter(
+                conv1d, "bias", torch.nn.Parameter(packed_bias, requires_grad=False)
+            )
+        else:
+            bias.data = packed_bias
+
+    setattr(conv1d, CONV_WEIGHT_TRANSPOSED_ATTR, True)
+    if conv1d.weight.device.type == "tpu":
+        sync_tensors = [conv1d.weight]
+        bias_after = getattr(conv1d, "bias", None)
+        if bias_after is not None:
+            sync_tensors.append(bias_after)
+        synchronize_tensors(sync_tensors)
+
+
+class _Conv1dPrepackQuantMethod(QuantizeMethodBase):
+    """Wraps `conv1d.quant_method` so layerwise weight reload re-prepacks newly
+    materialized `[dim, 1, kernel_size]` weights before copying into kernel
+    storage."""
+
+    def __init__(self, inner: QuantizeMethodBase) -> None:
+        super().__init__()
+        self._inner = inner
+
+    def create_weights(
+        self, layer: torch.nn.Module, *weight_args: Any, **extra_weight_attrs: Any
+    ) -> Any:
+        return self._inner.create_weights(layer, *weight_args, **extra_weight_attrs)
+
+    def apply(self, layer: torch.nn.Module, *args: Any, **kwargs: Any) -> torch.Tensor:
+        return self._inner.apply(layer, *args, **kwargs)
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        self._inner.process_weights_after_loading(layer)
+        _prepack_conv1d_weights(layer)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
 @QwenGatedDeltaNetAttention.register_oot
 class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     # Whether pooled ops consume the merged block-major unified pool, along
@@ -378,6 +452,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     _bm_kernel: bool = False
     _bm_region: tuple[int, BlockMajorPoolLayout] | None = None
     _checkpoint_alignment: int | None = None
+    _prepack_conv_weight: bool = False
 
     # Narrowed to the layer that _create_conv1d installs.
     # pyrefly: ignore[bad-override-mutable-attribute]
@@ -398,11 +473,12 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         self._bm_kernel = vllm_config is not None and unified_block_major_enabled(
             vllm_config
         )
-        self.gdn_op = self._build_gdn_op()
-        self.gdn_pooled_op = self._build_pooled_gdn_op(block_major=self._bm_kernel)
         pcp_enabled = self._pcp_streaming_enabled()
         self._pcp_streaming_configured = pcp_enabled
         self._keep_qkvz_layout(pcp_enabled)
+        self._configure_conv_weight_prepack(pcp_enabled)
+        self.gdn_op = self._build_gdn_op()
+        self.gdn_pooled_op = self._build_pooled_gdn_op(block_major=self._bm_kernel)
         self.gdn_pcp_op = (
             self._build_gdn_op(pcp_streaming=True) if pcp_enabled else None
         )
@@ -411,6 +487,25 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             if pcp_enabled
             else None
         )
+
+    def _configure_conv_weight_prepack(self, pcp_enabled: bool) -> None:
+        """Enable load-time `[kernel_size, 1, dim]` float32 prepacking for
+        `conv1d` when `TPU_GDN_PREPACK_CONV_WEIGHT` is set without PCP.
+        """
+        prepack = envs.TPU_GDN_PREPACK_CONV_WEIGHT
+        if prepack and pcp_enabled:
+            logger.warning_once(
+                "TPU_GDN_PREPACK_CONV_WEIGHT is ignored with prefill context "
+                "parallelism: its ops slice conv1d.weight along axis 0."
+            )
+        self._prepack_conv_weight = prepack and not pcp_enabled
+        conv1d = getattr(self, "conv1d", None)
+        if self._prepack_conv_weight and conv1d is not None:
+            quant_method = getattr(conv1d, "quant_method", None)
+            if isinstance(quant_method, QuantizeMethodBase) and not isinstance(
+                quant_method, _Conv1dPrepackQuantMethod
+            ):
+                conv1d.quant_method = _Conv1dPrepackQuantMethod(quant_method)
 
     def _keep_qkvz_layout(self, pcp_enabled: bool) -> None:
         """Keep `in_proj_qkvz` in vLLM's [n_out, n_in] layout unless
@@ -581,8 +676,14 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         `fresh_buffer` copy at load time removes that per-step program.
         """
         del act_dtype
-        w = self.conv1d.weight
-        self.conv1d.weight.data = fresh_buffer(w)
+        if self._prepack_conv_weight:
+            _prepack_conv1d_weights(self.conv1d)
+            self.gdn_op = self._build_gdn_op(conv_weight_transposed=True)
+            self.gdn_pooled_op = self._build_pooled_gdn_op(
+                block_major=self._bm_kernel, conv_weight_transposed=True
+            )
+        else:
+            self.conv1d.weight.data = fresh_buffer(self.conv1d.weight)
 
     def get_state_shape(
         self,
@@ -605,10 +706,15 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         parallel_config = cast(VllmConfig, vllm_context.vllm_config).parallel_config
         return parallel_config.prefill_context_parallel_size > 1
 
-    def _build_gdn_op(self, *, pcp_streaming: bool = False):
+    def _build_gdn_op(
+        self,
+        *,
+        pcp_streaming: bool = False,
+        conv_weight_transposed: bool = False,
+    ):
         local_num_v_heads = self.num_v_heads // self.tp_size
         local_num_kq_heads = self.tp_head_geometry.local_num_kq_heads
-        has_conv_bias = self.conv1d.bias is not None
+        has_conv_bias = getattr(self.conv1d, "bias", None) is not None
         vllm_context = get_vllm_model_wrapper_context()
         # The non-PCP op uses num_spec_tokens for verify/rollback. PCP is a
         # prefill-only path admitted at the platform boundary; its widened
@@ -696,7 +802,12 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 output_partition_specs=output_partition_specs,
             )
         else:
-            op_name = f"pallas::gdn_attention_{self.prefix.replace('.', '_')}"
+            prefix_slug = self.prefix.replace(".", "_")
+            op_name = (
+                f"pallas::gdn_attention_prepack_{prefix_slug}"
+                if conv_weight_transposed
+                else f"pallas::gdn_attention_{prefix_slug}"
+            )
             wrapped_fn = functools.partial(
                 gdn_attention_core_tpu,
                 mesh=vllm_context.mesh,
@@ -706,6 +817,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 d_v=self.head_v_dim,
                 kernel_size=self.conv_kernel_size,
                 num_spec_tokens=num_spec_tokens,
+                conv_weight_transposed=conv_weight_transposed,
             )
             gdn_jax_op = pallas.jax_op(op_name, wrapped_fn, donate_argnums=(3, 4))
 
@@ -754,7 +866,12 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
         return gdn_impl
 
-    def _build_pooled_gdn_op(self, *, block_major: bool = False):
+    def _build_pooled_gdn_op(
+        self,
+        *,
+        block_major: bool = False,
+        conv_weight_transposed: bool = False,
+    ):
         vllm_context = get_vllm_model_wrapper_context()
         local_num_v_heads = self.num_v_heads // self.tp_size
         vllm_config = cast(VllmConfig, vllm_context.vllm_config)
@@ -827,6 +944,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 pool_block_tokens=vllm_config.cache_config.block_size,
                 recurrent_state_dtype=recurrent_state_dtype,
                 num_spec_tokens=num_spec_tokens,
+                conv_weight_transposed=conv_weight_transposed,
             )
             if not block_major:
                 return result
@@ -861,6 +979,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 kernel_size,
                 recurrent_state_dtype,
                 num_spec_tokens,
+                conv_weight_transposed,
             ),
             build_op,
         )

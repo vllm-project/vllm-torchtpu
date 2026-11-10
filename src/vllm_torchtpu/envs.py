@@ -97,6 +97,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
     TPU_GDN_QKVZ_KERNEL_LAYOUT: bool = False
+    TPU_GDN_PREPACK_CONV_WEIGHT: bool = False
     TPU_ENABLE_GDN_DYNAMIC_TILING: bool = False
     TPU_GDN_PREFILL_CHECKPOINT: bool = True
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
@@ -492,6 +493,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # checkpoint-FP8 and per-channel paths are verified and the export mapper
     # reads the layer's layout marker, make it the default and delete the flag.
     "TPU_GDN_QKVZ_KERNEL_LAYOUT": env_bool("TPU_GDN_QKVZ_KERNEL_LAYOUT", default=False),
+    # Transpose GDN's conv1d.weight from [dim, 1, kernel_size] to
+    # [kernel_size, 1, dim] and cast conv1d.weight (and conv1d.bias when
+    # present) to float32 once in process_weights_after_loading, skipping the
+    # per-step swapaxes and cast inside fused_conv1d_gdn. Ignored with prefill
+    # context parallelism, whose ops slice conv1d.weight along axis 0.
+    "TPU_GDN_PREPACK_CONV_WEIGHT": env_bool(
+        "TPU_GDN_PREPACK_CONV_WEIGHT", default=False
+    ),
     # Size GDN v3 decode tiles and prefill chunks from per-rank heads, active
     # sequences and the VMEM estimate (kernels/gdn/v3/tiling.py) instead of
     # the fixed defaults.

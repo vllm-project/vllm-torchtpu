@@ -73,6 +73,7 @@ def run_jax_gdn_attention(
     kernel_size: int,
     mesh: jax.sharding.Mesh,
     num_spec_tokens: int = 0,
+    conv_weight_transposed: bool = False,
 ) -> tuple[tuple[jnp.ndarray, jnp.ndarray], jnp.ndarray]:
     """Runs the Jax GDN attention mechanism.
 
@@ -87,7 +88,8 @@ def run_jax_gdn_attention(
         recurrent_state: Recurrent state tensor of shape `(num_blocks, n_v, d_k,
           d_v)`.
         j_conv_weight: Convolutional weight tensor of shape `(dim, 1,
-          kernel_size)`.
+          kernel_size)` when `conv_weight_transposed` is False, or
+          `(kernel_size, 1, dim)` when `conv_weight_transposed` is True.
         j_conv_bias: Optional convolutional bias tensor of shape `(dim,)`.
         j_A_log: Log of A parameter tensor of shape `(n_v,)`.
         j_dt_bias: Delta T bias tensor of shape `(n_v,)`.
@@ -122,7 +124,9 @@ def run_jax_gdn_attention(
             P(None, None, "model"),  # states: conv
             P(None, "model", None, None),  # states: recurrent
         ),
-        P("model", None, None),  # j_conv_weight
+        (
+            P(None, None, "model") if conv_weight_transposed else P("model", None, None)
+        ),  # j_conv_weight
         P("model") if j_conv_bias is not None else None,  # j_conv_bias
         P("model"),  # j_A_log
         P("model"),  # j_dt_bias
@@ -154,6 +158,7 @@ def run_jax_gdn_attention(
         d_v=d_v,
         kernel_size=kernel_size,
         num_spec_tokens=num_spec_tokens,
+        conv_weight_transposed=conv_weight_transposed,
     )
 
     mapped_fn = jax.shard_map(
@@ -848,6 +853,7 @@ def run_jax_gdn_attention_pooled_local(
     pool_block_tokens: int,
     recurrent_state_dtype: jnp.dtype = jnp.float32,
     num_spec_tokens: int = 0,
+    conv_weight_transposed: bool = False,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """GDN attention over the unified block pool.
 
@@ -884,6 +890,7 @@ def run_jax_gdn_attention_pooled_local(
         recurrent_dtype=jnp.dtype(recurrent_state_dtype),
         conv_dtype=jnp.dtype(jnp.float32),
         num_spec_tokens=num_spec_tokens,
+        conv_weight_transposed=conv_weight_transposed,
         prefill_ckpt_offsets=prefill_ckpt_offsets,
         prefill_ckpt_indices=prefill_ckpt_indices,
     )
@@ -915,6 +922,7 @@ def run_jax_gdn_attention_pooled(
     mesh: jax.sharding.Mesh,
     recurrent_state_dtype: jnp.dtype = jnp.float32,
     num_spec_tokens: int = 0,
+    conv_weight_transposed: bool = False,
     prefill_ckpt_offsets: jnp.ndarray | None = None,
     prefill_ckpt_indices: jnp.ndarray | None = None,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
@@ -930,7 +938,8 @@ def run_jax_gdn_attention_pooled(
           fixed-BF16 Conv region as token-ranges of each state block. Block 0
           is the null block, only used for padded / invalid tokens.
         j_conv_weight: Convolutional weight tensor of shape `(dim, 1,
-          kernel_size)`.
+          kernel_size)` when `conv_weight_transposed` is False, or
+          `(kernel_size, 1, dim)` when `conv_weight_transposed` is True.
         j_conv_bias: Optional convolutional bias tensor of shape `(dim,)`.
         j_A_log: Log of A parameter tensor of shape `(n_v,)`.
         j_dt_bias: Delta T bias tensor of shape `(n_v,)`.
@@ -965,7 +974,9 @@ def run_jax_gdn_attention_pooled(
         P(None, "model"),  # j_b
         P(None, "model"),  # j_a
         pool_spec,  # recurrent_state (attention-shaped pool)
-        P("model", None, None),  # j_conv_weight
+        (
+            P(None, None, "model") if conv_weight_transposed else P("model", None, None)
+        ),  # j_conv_weight
         P("model") if j_conv_bias is not None else None,  # j_conv_bias
         P("model"),  # j_A_log
         P("model"),  # j_dt_bias
@@ -1025,6 +1036,7 @@ def run_jax_gdn_attention_pooled(
         kernel_size=kernel_size,
         pool_block_tokens=pool_block_tokens,
         num_spec_tokens=num_spec_tokens,
+        conv_weight_transposed=conv_weight_transposed,
         recurrent_state_dtype=recurrent_state_dtype,
     )
     mapped_fn = jax.shard_map(
