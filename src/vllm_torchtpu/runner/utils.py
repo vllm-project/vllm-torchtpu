@@ -55,12 +55,17 @@ PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY = (
 # Host-only section: the scheduler options (`core.scheduler_options`) only
 # decide admission order and never change a compiled program.
 SCHEDULER_OPTIONS_SECTION = "tpu_scheduler"
+# Host-only section: the pipeline chunk scheduler options
+# (`core.pp_scheduler_options`) only decide admission order and how prefill
+# work is priced; none changes a compiled program.
+PP_SCHEDULER_OPTIONS_SECTION = "tpu_pp_scheduler"
 
 HASH_IGNORED_ADDITIONAL_CONFIG_KEYS = frozenset(
     {
         PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY,
         PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY,
         SCHEDULER_OPTIONS_SECTION,
+        PP_SCHEDULER_OPTIONS_SECTION,
     }
 )
 

@@ -29,6 +29,7 @@ from vllm_torchtpu.runner.utils import (
     HASH_IGNORED_ADDITIONAL_CONFIG_KEYS,
     PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY,
     PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY,
+    PP_SCHEDULER_OPTIONS_SECTION,
     SCHEDULER_OPTIONS_SECTION,
 )
 
@@ -205,6 +206,7 @@ def test_ignored_keys_match_the_keys_the_runner_reads():
         KEY,
         PREFILL_KEY,
         SCHEDULER_OPTIONS_SECTION,
+        PP_SCHEDULER_OPTIONS_SECTION,
     } == HASH_IGNORED_ADDITIONAL_CONFIG_KEYS
 
 
@@ -213,6 +215,18 @@ def test_scheduler_section_does_not_change_the_hash(patched_compute_hash):
     not force a recompile."""
     baseline = patched_compute_hash(_StubVllmConfig({"some_plugin_knob": 1}))
     section = {SCHEDULER_OPTIONS_SECTION: {"promote_warmest": False}}
+    assert (
+        patched_compute_hash(_StubVllmConfig({"some_plugin_knob": 1, **section}))
+        == baseline
+    )
+
+
+def test_pp_scheduler_section_does_not_change_the_hash(patched_compute_hash):
+    """The pipeline chunk scheduler options only decide admission order and
+    how prefill work is priced; none changes a compiled program, so none
+    forces a recompile."""
+    baseline = patched_compute_hash(_StubVllmConfig({"some_plugin_knob": 1}))
+    section = {PP_SCHEDULER_OPTIONS_SECTION: {"quadratic_cost": True}}
     assert (
         patched_compute_hash(_StubVllmConfig({"some_plugin_knob": 1, **section}))
         == baseline
