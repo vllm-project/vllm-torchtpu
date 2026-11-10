@@ -23,7 +23,6 @@ import bisect
 import contextlib
 import copy
 import dataclasses
-import os
 from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING, Any, cast
 
@@ -37,13 +36,13 @@ from vllm.model_executor.model_loader import get_model_loader
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
-    fixed_moe_collection_chunks,
-)
 from vllm_torchtpu.layers.adapter import (
     sequence_parallel,
     small_all_reduce_op,
     token_padding,
+)
+from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
+    fixed_moe_collection_chunks,
 )
 from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadata,
@@ -426,7 +425,6 @@ class Eagle3Proposer:
         if (
             self._mtp_fused_loop is None
             and self._mtp_loop_model is None
-            and envs.TPU_MTP_STEP0_POST_ATTN_GATHER
             and self.speculative_config.method == "mtp"
             and not self._share_mtp_indices
             and not self._draft_kv_shared
@@ -459,13 +457,9 @@ class Eagle3Proposer:
 
         The draft's tokens then come from the vocab-parallel argmax
         (`LogitsProcessor.get_top_tokens`, patched by greedy_top_tokens), as
-        the target's do. TPU_DRAFT_LM_HEAD_QUANT picks a quantized lm-head
-        proxy for the draft only (read with os.environ; unset means fp8 for a
-        bf16 head, "none"/"bf16" keep the head as is; see
-        greedy_top_tokens.parse_draft_lm_head_quant). It changes draft tokens,
-        and so the acceptance rate, never the verified output. A draft with a
-        draft->target id map, or one the argmax cannot serve, keeps
-        compute_logits + argmax.
+        the target's do. The draft's head runs at the precision it holds. A
+        draft with a draft->target id map, or one the argmax cannot serve,
+        keeps compute_logits + argmax.
         """
         self._draft_greedy_head_owner = None
         draft_model = self.draft_model
@@ -483,21 +477,6 @@ class Eagle3Proposer:
             )
         except NotImplementedError:
             return
-        draft_head = owner.lm_head
-        head_quant = getattr(draft_head, "_quant_mode", None)
-        quant_env = os.environ.get("TPU_DRAFT_LM_HEAD_QUANT")
-        quant_mode, group_size = greedy_top_tokens.parse_draft_lm_head_quant(
-            quant_env
-            if quant_env is not None
-            else ("fp8" if head_quant is None else None)
-        )
-        if quant_mode is not None and head_quant != quant_mode:
-            proxy_head = greedy_top_tokens._QuantizedLMHeadProxy(
-                draft_head, mode=quant_mode, group_size=group_size or 128
-            )
-            owner = greedy_top_tokens._DraftHeadOwnerProxy(
-                owner.logits_processor, proxy_head
-            )
         self._draft_greedy_head_owner = owner
         logger.info(
             "TPU_GREEDY_TOP_TOKENS enabled for draft proposer (%s, quant=%s).",
@@ -725,7 +704,8 @@ class Eagle3Proposer:
 
     def _build_mtp_step0_gather_loop_model(self) -> None:
         """Build a separately compiled loop-step program for steps 1..K-1 when
-        `TPU_MTP_STEP0_POST_ATTN_GATHER=1` and `VLLM_TPU_FUSED_DRAFT_LOOP=0`,
+        the model patch installs the step-0 post-attention gather and the
+        fused draft loop is off,
         so step 0 traces with `_step0_gather_indices` set while steps 1..K-1
         trace with `_step0_gather_indices=None` using the draft's own
         `_dynamic_arg_dims` (e.g. `positions=-1` on Qwen3.5 MRoPE)."""
@@ -809,8 +789,7 @@ class Eagle3Proposer:
             from vllm_torchtpu.spec_decode.mtp_fused_loop import build_mtp_fused_loop
 
             step0_gather = (
-                envs.TPU_MTP_STEP0_POST_ATTN_GATHER
-                and not self._draft_kv_shared
+                not self._draft_kv_shared
                 and not self.runner._dp_lockstep_enabled()
                 and is_step0_post_attn_gather_installed(draft_model)
             )
@@ -2927,8 +2906,7 @@ class Eagle3Proposer:
         collectives with a different shape.
         """
         if (
-            not envs.TPU_MTP_STEP0_POST_ATTN_GATHER
-            or self.speculative_config.method != "mtp"
+            self.speculative_config.method != "mtp"
             or self._share_mtp_indices
             or self._draft_kv_shared
             or "_forward_draft" in getattr(self, "__dict__", {})
@@ -3266,8 +3244,7 @@ class Eagle3Proposer:
         step0_pad_warm = (
             self._loop_bucket(runner.max_num_reqs)
             if (
-                envs.TPU_MTP_STEP0_POST_ATTN_GATHER
-                and self.speculative_config.method == "mtp"
+                self.speculative_config.method == "mtp"
                 and not self._share_mtp_indices
                 and not self._draft_kv_shared
                 and not self._dp_lockstep_sharded()
@@ -3411,8 +3388,7 @@ class Eagle3Proposer:
             )
 
             step0_post_attn_gather = (
-                envs.TPU_MTP_STEP0_POST_ATTN_GATHER
-                and self.speculative_config.method == "mtp"
+                self.speculative_config.method == "mtp"
                 and not self._share_mtp_indices
                 and not self._draft_kv_shared
                 and not self._dp_lockstep_sharded()
