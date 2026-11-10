@@ -136,6 +136,7 @@ if TYPE_CHECKING:
     VLLM_TPU_HC_PREFILL_COMBINE_MIX: bool = False
     VLLM_TPU_HC_PREFILL_WIDE_TILE: int = 0
     VLLM_TPU_HC_PREFILL_INJECT: bool = False
+    TPU_QWEN4_HC_PREFILL_NORM: str = "vpu"
     VLLM_TPU_QSA_FUSED_DCP_BLOCKS: bool = False
     VLLM_TPU_QSA_DCP_HEAD_EXCHANGE: bool = False
     VLLM_TPU_QSA_DCP_Q_GATHER: bool = False
@@ -919,6 +920,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # weight in the kernel and return that [T, hc] projection instead of writing
     # the normalized [T, hc * H] input for an XLA projection to read back.
     "VLLM_TPU_HC_PREFILL_INJECT": env_bool("VLLM_TPU_HC_PREFILL_INJECT"),
+    # Prefill HC full mix: RMS-norm variant of the kernel's norm loop. vpu (the
+    # default, unchanged program); rows64 (64-row loop steps, bitwise); gram /
+    # gram64 (each branch's sum of squares as the diagonal of x x^T on the MXU;
+    # not bitwise, only the f32 summation order of the variance changes);
+    # bf16ep / bf16ep64 (the epilogue n * w, n + . in bf16 arithmetic, bitwise:
+    # a bf16 x bf16 product is exact in f32 and the bf16 sum rounds the same).
+    "TPU_QWEN4_HC_PREFILL_NORM": env_with_choices(
+        "TPU_QWEN4_HC_PREFILL_NORM",
+        "vpu",
+        ["vpu", "rows64", "gram", "gram64", "bf16ep", "bf16ep64"],
+        case_sensitive=False,
+    ),
     # With VLLM_TPU_QSA_COMPRESSED_DCP: merge a pair's local top-k lists into the
     # global selection with one TensorCore Pallas kernel (radix select, tie
     # cut, bitonic sort) instead of the SparseCore top-k + keep mask + sort
