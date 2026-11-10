@@ -722,3 +722,144 @@ def _candidate_target_dist(
 _random_rejection_sample_with_segment = torch.compile(
     backend="tpu", fullgraph=True, dynamic=False
 )(_random_rejection_sample_impl)
+
+
+# Candidate verify (VLLM_TPU_CANDIDATE_SAMPLING, PR #2821 049bb029b): the tail
+# of _random_rejection_sample_impl as a function of per-slot decisions.
+def assemble_rejection_output(
+    accepted: torch.Tensor,
+    recovered_token_ids: torch.Tensor,
+    draft_token_ids: torch.Tensor,
+    num_draft_tokens: torch.Tensor,
+    bonus_token_ids: torch.Tensor,
+    segment_ids: torch.Tensor,
+    group_indices: torch.Tensor,
+    max_draft_tokens: int,
+) -> torch.Tensor:
+    """[batch_size, max_draft_tokens + 1] tokens from per-slot decisions.
+
+    accepted / recovered_token_ids: per draft slot, whether the draft passed
+    and the token that replaces it at the first rejection.
+    """
+    total_tokens = draft_token_ids.shape[0]
+    batch_size = num_draft_tokens.shape[0]
+    device = draft_token_ids.device
+    batch_indices = torch.arange(batch_size, device=device).unsqueeze(1)
+    match_mask = segment_ids.unsqueeze(0) == batch_indices
+    # Only declared draft slots may participate in rejection sampling.
+    draft_limits = num_draft_tokens.to(group_indices.dtype).unsqueeze(1)
+    valid_slot_mask = torch.any(
+        match_mask & (group_indices.unsqueeze(0) < draft_limits), dim=0
+    )
+    large_value = total_tokens
+
+    if total_tokens > 0:
+        rejection_indices = torch.where(
+            valid_slot_mask & ~accepted,
+            group_indices,
+            torch.tensor(large_value, dtype=torch.int32, device=device),
+        )
+        masked_rejection_indices = torch.where(
+            match_mask,
+            rejection_indices.unsqueeze(0),
+            torch.tensor(large_value, dtype=torch.int32, device=device),
+        )
+        first_rejection_idx_per_segment = torch.min(
+            masked_rejection_indices, dim=1
+        ).values
+    else:
+        first_rejection_idx_per_segment = torch.full(
+            (batch_size,),
+            large_value,
+            dtype=torch.int32,
+            device=device,
+        )
+
+    if total_tokens > 0:
+        # Clamp padding segment sentinels for a safe gather.
+        safe_segment_ids = segment_ids.clamp(min=0, max=batch_size - 1)
+        first_rejection_idx_broadcast = first_rejection_idx_per_segment[
+            safe_segment_ids
+        ]
+        before_rejection = valid_slot_mask & (
+            group_indices < first_rejection_idx_broadcast
+        )
+        at_rejection = valid_slot_mask & (
+            group_indices == first_rejection_idx_broadcast
+        )
+        main_tokens = torch.where(
+            before_rejection,
+            draft_token_ids.to(torch.int32),
+            torch.where(
+                at_rejection,
+                recovered_token_ids,
+                torch.tensor(PLACEHOLDER_TOKEN_ID, dtype=torch.int32, device=device),
+            ),
+        )
+    else:
+        main_tokens = torch.tensor([], dtype=torch.int32, device=device)
+
+    all_accepted = first_rejection_idx_per_segment == large_value
+    no_draft_tokens = num_draft_tokens == 0
+    should_get_bonus = all_accepted | no_draft_tokens
+
+    # Route padding positions to an extra sink row for a safe scatter.
+    selected_tokens = torch.full(
+        (batch_size + 1, max_draft_tokens + 1),
+        PLACEHOLDER_TOKEN_ID,
+        dtype=torch.int32,
+        device=device,
+    )
+
+    segment_ids = segment_ids.to(torch.int64)
+    group_indices = group_indices.to(torch.int64)
+    scatter_segment_ids = torch.where(
+        valid_slot_mask,
+        segment_ids,
+        torch.full_like(segment_ids, batch_size),
+    )
+    scatter_group_indices = torch.where(
+        valid_slot_mask, group_indices, torch.zeros_like(group_indices)
+    )
+    selected_tokens[scatter_segment_ids, scatter_group_indices] = main_tokens
+
+    accepted_count = torch.where(
+        all_accepted,
+        num_draft_tokens,
+        first_rejection_idx_per_segment,
+    ).to(torch.int64)
+
+    batch_range = torch.arange(batch_size, dtype=torch.int64, device=device)
+    bonus_token_at_accepted_count = torch.where(
+        should_get_bonus,
+        bonus_token_ids.to(torch.int32),
+        selected_tokens[batch_range, accepted_count],
+    )
+    selected_tokens[batch_range, accepted_count] = bonus_token_at_accepted_count
+
+    return selected_tokens[:batch_size]
+
+
+@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+def candidate_rejection_output(
+    accepted: torch.Tensor,
+    recovered_token_ids: torch.Tensor,
+    draft_token_ids: torch.Tensor,
+    num_draft_tokens: torch.Tensor,
+    bonus_token_ids: torch.Tensor,
+    segment_ids: torch.Tensor,
+    group_indices: torch.Tensor,
+    max_draft_tokens: int,
+) -> torch.Tensor:
+    """``assemble_rejection_output`` for the int32 decisions of the candidate
+    verify program (layers/core/candidate_sampling.py)."""
+    return assemble_rejection_output(
+        accepted != 0,
+        recovered_token_ids,
+        draft_token_ids,
+        num_draft_tokens,
+        bonus_token_ids,
+        segment_ids,
+        group_indices,
+        max_draft_tokens,
+    )
