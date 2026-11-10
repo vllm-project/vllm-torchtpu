@@ -219,3 +219,9 @@ def test_section_stays_in_the_compile_cache_key():
         _HashStub({compile_options.SECTION: {"fast_compiled_call": True}})
     )
     assert on != off
+
+
+def test_section_is_registered():
+    from vllm_torchtpu import additional_config_sections
+
+    assert compile_options.SECTION in additional_config_sections.KNOWN_SECTIONS
