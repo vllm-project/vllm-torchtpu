@@ -425,3 +425,25 @@ def test_spec_decode_metadata_deferred_draft_token_ids_and_lru_cache(device):
         m1_cached.deferred_draft_token_ids_cpu, m1.draft_token_ids.cpu().numpy()
     )
     assert m1_cached.max_draft_input_index == m1.max_draft_input_index
+
+
+def test_metadata_uploads_are_released_at_the_runner_fence():
+    """The manager's temporary uploads go through the runner's input-staging
+    fence (stage_h2d_upload), which releases each source once the fence is
+    waited on, instead of a keepalive list that nothing clears."""
+    from types import SimpleNamespace
+
+    from vllm_torchtpu.runner import speculative_decoding_manager as sdm
+
+    runner = SimpleNamespace(
+        device=torch.device("cpu"),
+        _unfenced_h2d_sources=[],
+        _registered_h2d_sources=set(),
+        _free_h2d_sources={},
+    )
+    host = torch.arange(4, dtype=torch.int32)
+    out = sdm._h2d_temp(runner, host)
+
+    assert torch.equal(out, host)
+    assert [entry[0] for entry in runner._unfenced_h2d_sources] == [host]
+    assert not hasattr(runner, "_h2d_keepalive")
