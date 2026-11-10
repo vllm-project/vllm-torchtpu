@@ -81,6 +81,7 @@ def _make_runner(
         cp_kv_cache_interleave_size=block_size,
         decode_context_parallel_size=1,
         pipeline_parallel_size=1,
+        tensor_parallel_size=1,
     )
     runner.vllm_config = SimpleNamespace(
         parallel_config=runner.parallel_config,
@@ -168,6 +169,7 @@ def _make_runner(
     runner._collect_mamba_state_seed_copies = (
         TPUModelRunner._collect_mamba_state_seed_copies.__get__(runner)
     )
+    runner._token_padding_update = TPUModelRunner._token_padding_update.__get__(runner)
     runner._prepare_async_token_substitution_indices = lambda *_args, **_kwargs: (
         np.array([], dtype=np.int32),
         np.array([], dtype=np.int32),
