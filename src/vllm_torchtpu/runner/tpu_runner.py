@@ -3798,7 +3798,7 @@ class TPUModelRunner(GPUModelRunner):
             else None
         )
 
-        carry_rej = {} if _decode_carry.ENABLED else None
+        carry_rej = {} if _decode_carry.enabled(self) else None
         for pre_req_idx, req_state, seq_len, req_id in pre_request_seq_lens:
             sampled_ids = valid_sampled_token_ids[pre_req_idx]
             if not sampled_ids:
@@ -5017,21 +5017,6 @@ class TPUModelRunner(GPUModelRunner):
                                     spec_decode_metadata.target_logits_indices,
                                 )
                             )
-                            if _decode_carry.CHECK:
-                                ref_seq_lens = _upload_seq_pos_ids()
-                                ref_out = _compiled_subtract_and_substitute_draft_token_ids(
-                                    ref_seq_lens,
-                                    self.position_ids,
-                                    num_rejected_dev,
-                                    seq_idx_dev,
-                                    pos_idx_dev,
-                                    self.input_ids,
-                                    substitution_indices,
-                                    self._pre_async_results.next_tokens_tpu,
-                                    spec_decode_metadata.final_logits_indices,
-                                    spec_decode_metadata.target_logits_indices,
-                                )
-                                _decode_carry.compare(carry_out, ref_out)
                             (
                                 seq_lens,
                                 self.position_ids,
@@ -7729,7 +7714,7 @@ class TPUModelRunner(GPUModelRunner):
                     spec_decode_num_rejected_tokens=spec_num_rejected,
                     num_draft_per_req=num_draft_per_req,
                 )
-                _decode_carry.tag_results(self._pre_async_results)
+                _decode_carry.tag_results(self, self._pre_async_results)
             else:
                 self._pre_async_results = None
 
