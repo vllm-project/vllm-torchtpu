@@ -106,3 +106,58 @@ def maybe_skip_aot_guards(module: Any) -> bool:
 
 def _reset_for_tests() -> None:
     _done.clear()
+
+
+# ---------------------------------------------------------------------------
+# Per-step process knobs (default off), applied from the worker's
+# execute_model and the engine core's schedule:
+#   VLLM_TPU_T3_SWITCH_US=N : sys.setswitchinterval(N us) instead of Python's
+#                             5 ms default, so a background Python thread
+#                             (output / connector / submit threads) cannot hold
+#                             the GIL for long while the step loop waits on it.
+#   VLLM_TPU_T3_GC=freeze   : after VLLM_TPU_T3_GC_AFTER steps (default 500):
+#                             gc.collect(); gc.freeze(); and raise the gen-0
+#                             threshold to VLLM_TPU_T3_GC_GEN0 (default 50000),
+#                             so cyclic GC runs rarely in the decode loop.
+# ---------------------------------------------------------------------------
+
+import gc as _gc
+import sys as _sys
+
+SWITCH_US = float(os.environ.get("VLLM_TPU_T3_SWITCH_US", "0") or 0)
+GC_MODE = os.environ.get("VLLM_TPU_T3_GC", "").strip().lower()
+_GC_AFTER = int(os.environ.get("VLLM_TPU_T3_GC_AFTER", "500") or 500)
+_GC_GEN0 = int(os.environ.get("VLLM_TPU_T3_GC_GEN0", "50000") or 50000)
+STEP_HOOK = bool(SWITCH_US > 0 or GC_MODE == "freeze")
+_DEFAULT_SWITCH = _sys.getswitchinterval()
+_DEFAULT_GC_THRESH = _gc.get_threshold()
+_hook = {"n": 0, "applied": False, "frozen": False}
+
+
+def _apply() -> None:
+    if SWITCH_US > 0:
+        _sys.setswitchinterval(SWITCH_US / 1e6)
+    if GC_MODE == "freeze" and _hook["frozen"]:
+        _gc.set_threshold(_GC_GEN0, _DEFAULT_GC_THRESH[1], _DEFAULT_GC_THRESH[2])
+
+
+def on_step() -> None:
+    """Cheap per-step hook; only acts when a knob is set."""
+    _hook["n"] += 1
+    if GC_MODE == "freeze" and not _hook["frozen"] and _hook["n"] >= _GC_AFTER:
+        _gc.collect()
+        _gc.freeze()
+        _hook["frozen"] = True
+        _hook["applied"] = False  # re-apply thresholds below
+        logger.info(
+            "VLLM_TPU_T3_GC=freeze: froze %d objects after %d steps; gen-0 threshold %d",
+            _gc.get_freeze_count(), _hook["n"], _GC_GEN0,
+        )
+    if not _hook["applied"]:
+        _hook["applied"] = True
+        _apply()
+        if _hook["n"] < 3:
+            logger.info(
+                "VLLM_TPU_T3 step knobs: switch_us=%s gc=%s (pid %d)",
+                SWITCH_US, GC_MODE or "default", os.getpid(),
+            )
