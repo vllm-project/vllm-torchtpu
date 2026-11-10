@@ -194,3 +194,9 @@ def test_platform_hook_rejects_a_bad_host_only_section(installed, additional):
         VllmConfig(additional_config=additional)
     apply.assert_not_called()
     assert installed == []
+
+
+def test_section_is_registered():
+    from vllm_torchtpu import additional_config_sections
+
+    assert frontend_options.SECTION in additional_config_sections.KNOWN_SECTIONS

@@ -290,3 +290,9 @@ def test_worker_section_is_kept_out_of_the_compile_cache_key():
     from vllm_torchtpu.runner.utils import HASH_IGNORED_ADDITIONAL_CONFIG_KEYS
 
     assert worker_options.SECTION in HASH_IGNORED_ADDITIONAL_CONFIG_KEYS
+
+
+def test_worker_section_is_registered():
+    from vllm_torchtpu import additional_config_sections
+
+    assert worker_options.SECTION in additional_config_sections.KNOWN_SECTIONS
