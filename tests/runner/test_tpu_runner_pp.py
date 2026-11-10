@@ -226,6 +226,7 @@ class TestHandOffConstruction:
     def _runner(self):
         runner = SimpleNamespace(
             _add_pipeline_chunk_buckets=lambda: None,
+            _megakernel=None,
             parallel_config=SimpleNamespace(pipeline_parallel_size=4),
             _pp_wave=None,
             _pp_intermediate_template=None,
