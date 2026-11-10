@@ -79,13 +79,29 @@ def min_over_group(value: int, cpu_group: Any) -> int:
     return int(t.item())
 
 
+def dp_engines_in_lockstep(parallel_config) -> bool:
+    """Whether EP couples the DP engines. Their MoE combine reduces partial
+    expert outputs across engines, so every engine must enter the same
+    collectives with matching token buckets each step; uncoupled DP engines
+    stay independently schedulable."""
+    return get_dp_size(parallel_config) > 1 and parallel_config.enable_expert_parallel
+
+
+def ep_rank(
+    *, dp_rank: int, tp_rank: int, tp_size: int, pcp_rank: int = 0, pcp_size: int = 1
+) -> int:
+    """vLLM's EP rank of a DP x PCP x TP rank: the EP group spans all three,
+    DP-major."""
+    return (dp_rank * pcp_size + pcp_rank) * tp_size + tp_rank
+
+
 def min_across_ep_dp(parallel_config, value: int) -> int:
     """Return the minimum of `value` across the DP engines coupled by EP.
 
     EP-coupled engines must compile identical programs, so a value baked into
     them (such as the KV cache size) has to agree; uncoupled engines keep theirs.
     """
-    if get_dp_size(parallel_config) == 1 or not parallel_config.enable_expert_parallel:
+    if not dp_engines_in_lockstep(parallel_config):
         return value
     from vllm.distributed.parallel_state import get_dp_group
 
@@ -123,8 +139,19 @@ def hbm_usage_bytes(devices: Any) -> list[tuple[int, int]]:
     return usage
 
 
+def local_device_kind() -> str:
+    """The `device_kind` of this process's first local JAX device (e.g.
+    `"TPU7x"`, or `"cpu"` off TPU). No collective."""
+    devices = jax.local_devices()
+    if not devices:
+        raise RuntimeError(
+            "No local JAX devices in this process; can't read the device kind"
+        )
+    return str(devices[0].device_kind)
+
+
 def get_device_name(num_devices: int | None = None):
-    kind = jax.devices()[0].device_kind
+    kind = local_device_kind()
     if "TPU" not in kind:
         raise RuntimeError("Expected TPU devices")
     suffix = ""

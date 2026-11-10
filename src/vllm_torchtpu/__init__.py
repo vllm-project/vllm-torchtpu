@@ -1926,23 +1926,31 @@ def _patch_vllm_same_step_prefix_hits() -> None:
     unwritten and attends over stale KV. Identical prompts admitted together
     (n > 1 sampling, a repeated prompt) then decode garbage.
 
-    Blocks hashed during the current `schedule()` therefore count as misses,
-    and a request that would have hit one recomputes that prefix itself.
-    From the next `schedule()` on they hit normally: the worker runs the
-    steps' forwards in order, so the step that fills a block has run before
-    any later step reads it, with or without async scheduling.
+    Blocks hashed during the current step therefore count as misses, and a
+    request that would have hit one recomputes that prefix itself. From the
+    next step on they hit normally: the worker runs the steps' forwards in
+    order, so the step that fills a block has run before any later step reads
+    it, with or without async scheduling. That relies on blocks being hashed
+    only in the step whose forward fills them, which is what `allocate_slots`
+    does: it caches up to the tokens computed so far plus this step's new
+    tokens, never caches lookahead slots, and defers anything filled later
+    under `delay_cache_blocks`.
+
+    The set is cleared at `KVCacheManager.new_step_starts`, which
+    `Scheduler.schedule` calls once per step before any lookup or allocation,
+    and which an engine driving `KVCacheManager` directly calls each step too.
     """
     import functools
 
     from vllm.v1.core.block_pool import BlockPool
-    from vllm.v1.core.sched.scheduler import Scheduler
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
 
     if getattr(BlockPool.get_cached_block, "_tpu_same_step_prefix_hit_patch", False):
         return
 
     original_insert_block_hash = BlockPool._insert_block_hash
     original_get_cached_block = BlockPool.get_cached_block
-    original_schedule = Scheduler.schedule
+    original_new_step_starts = KVCacheManager.new_step_starts
 
     def unwritten_block_ids(pool) -> set[int]:
         return pool.__dict__.setdefault("_tpu_unwritten_block_ids", set())
@@ -1966,16 +1974,16 @@ def _patch_vllm_same_step_prefix_hits() -> None:
             return None
         return blocks
 
-    @functools.wraps(original_schedule)
-    def schedule(self, *args, **kwargs):
-        unwritten_block_ids(self.kv_cache_manager.block_pool).clear()
-        return original_schedule(self, *args, **kwargs)
+    @functools.wraps(original_new_step_starts)
+    def new_step_starts(self, *args, **kwargs):
+        unwritten_block_ids(self.block_pool).clear()
+        return original_new_step_starts(self, *args, **kwargs)
 
-    for wrapper in (_insert_block_hash, get_cached_block, schedule):
+    for wrapper in (_insert_block_hash, get_cached_block, new_step_starts):
         wrapper._tpu_same_step_prefix_hit_patch = True
     BlockPool._insert_block_hash = _insert_block_hash
     BlockPool.get_cached_block = get_cached_block
-    Scheduler.schedule = schedule
+    KVCacheManager.new_step_starts = new_step_starts
     logger.info(
         "Applied TPU patch: no prefix-cache hits on blocks the "
         "current step has not written."
@@ -1988,9 +1996,17 @@ def _patch_vllm_vocab_parallel_embedding() -> None:
     Prevents TorchTPU from baking rank-specific integer literals into the MLIR
     graph as scalar constants, ensuring identical CompilationCacheKeys across
     all TP ranks.
+
+    Also where TPU_DP_VOCAB_PARALLEL takes effect: stock embeddings and lm_heads
+    built without a parallel group of their own shard over every DP x TP rank
+    instead of the TP group (layers/adapter/dp_vocab_parallel.py).
     """
+    import inspect
+
     import torch
     import vllm.model_executor.layers.vocab_parallel_embedding as vpe
+
+    from vllm_torchtpu.layers.adapter import dp_vocab_parallel
 
     if getattr(
         vpe.VocabParallelEmbedding, "_tpu_vocab_parallel_embedding_patch", False
@@ -1998,9 +2014,34 @@ def _patch_vllm_vocab_parallel_embedding() -> None:
         return
 
     original_init = vpe.VocabParallelEmbedding.__init__
+    init_signature = inspect.signature(original_init)
 
     def patched_init(self, *args, **kwargs):
+        dp_vocab_group = None
+        # Only the stock classes, whose forward and logits path the DP-vocab
+        # module replaces; a subclass may run its own.
+        if envs.TPU_DP_VOCAB_PARALLEL and type(self) in (
+            vpe.VocabParallelEmbedding,
+            vpe.ParallelLMHead,
+        ):
+            call = init_signature.bind(self, *args, **kwargs)
+            call.apply_defaults()
+            arg = call.arguments
+            if (
+                arg["parallel_group"] is None
+                and not arg["disable_tp"]
+                and arg["reduce_results"]
+            ):
+                dp_vocab_group = dp_vocab_parallel.group_for_new_layer(
+                    arg["num_embeddings"],
+                    arg["org_num_embeddings"],
+                    arg["padding_size"],
+                )
+            if dp_vocab_group is not None:
+                kwargs["parallel_group"] = dp_vocab_group
         original_init(self, *args, **kwargs)
+        if dp_vocab_group is not None:
+            setattr(self, dp_vocab_parallel.DP_VOCAB_ATTR, True)
         if not hasattr(self, "org_vocab_start_index"):
             self.register_buffer(
                 "org_vocab_start_index",
@@ -2037,6 +2078,8 @@ def _patch_vllm_vocab_parallel_embedding() -> None:
             )
 
     def patched_forward(self, input_):
+        if getattr(self, dp_vocab_parallel.DP_VOCAB_ATTR, False):
+            return dp_vocab_parallel.embedding_forward(self, input_)
         input_mask = None
         if self.tp_size > 1:
             masked_input, input_mask = vpe.get_masked_input_and_mask(

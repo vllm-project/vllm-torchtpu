@@ -28,6 +28,7 @@ from typing import Any
 from vllm_torchtpu import env_override
 from vllm_torchtpu.experimental.export import (
     api,
+    checkpoint,
     sampling,
     tpu_lowering,
     validator,
@@ -46,7 +47,7 @@ _USER_INPUT_NAMES = (
     "req_dist",
 )
 _NUM_USER_INPUTS = len(_USER_INPUT_NAMES)
-# `mtp_draft_bucket{B}` takes the forward's user inputs, `input_ids` shifted by
+# `draft_bucket{B}` takes the forward's user inputs, `input_ids` shifted by
 # one token, and then the row of each request's last accepted token.
 _MTP_LAST_TOKEN_INDICES = "last_token_indices"
 
@@ -71,11 +72,11 @@ DEBUG_TAPS_MANIFEST = "taps.json"
 
 @dataclasses.dataclass
 class _DebugTaps:
-    """Modules whose outputs the debug variants of `forward` and `mtp_draft`
+    """Modules whose outputs the debug variants of `forward` and `draft`
     return, and the manifest entries those variants add."""
 
     forward: dict[str, Any]
-    mtp_draft: dict[str, Any]
+    draft: dict[str, Any]
     output_dir: str
     functions: dict[str, dict[str, Any]] = dataclasses.field(default_factory=dict)
 
@@ -344,8 +345,42 @@ def _req_dist_len(model: api.ExportableTextOnlyLLM) -> int:
     return 6 if recurrent and model.export_config.recurrent_window > 1 else 3
 
 
+def _kv_cache_groups(model: api.ExportableTextOnlyLLM) -> list[api.KvCacheGroup]:
+    """The model's KV cache groups; none when every layer reads `block_tables`."""
+    groups_fn = getattr(model, "kv_cache_groups", None)
+    return list(groups_fn()) if callable(groups_fn) else []
+
+
+def _block_tables_name(model: api.ExportableTextOnlyLLM) -> str:
+    """The name of the fourth user input: `block_tables`, or with KV cache
+    groups the first group's page table (the others follow the state)."""
+    groups = _kv_cache_groups(model)
+    return f"{groups[0].name}_block_tables" if groups else "block_tables"
+
+
+def _kv_cache_groups_serving_config(
+    model: api.ExportableTextOnlyLLM,
+) -> dict[str, list[dict[str, Any]]]:
+    """`kv_cache_groups` for a model with KV cache groups, else nothing."""
+    groups = _kv_cache_groups(model)
+    if not groups:
+        return {}
+    return {
+        "kv_cache_groups": [
+            {
+                "name": g.name,
+                "retention": "all" if g.window is None else {"window": g.window},
+            }
+            for g in groups
+        ]
+    }
+
+
 def _user_inputs(
-    cfg: api.TextOnlyLLMExportConfig, bucket_size: int, req_dist_len: int = 3
+    cfg: api.TextOnlyLLMExportConfig,
+    bucket_size: int,
+    req_dist_len: int = 3,
+    block_tables_name: str = "block_tables",
 ) -> list[tuple[str, tuple[int, ...]]]:
     """Returns `(name, shape)` of the int32 user inputs of `forward_bucket{B}`."""
     pos_shape = (
@@ -359,7 +394,10 @@ def _user_inputs(
         (cfg.max_cu_seqs,),
         (req_dist_len,),
     )
-    return list(zip(_USER_INPUT_NAMES, shapes, strict=True))
+    names = tuple(
+        block_tables_name if n == "block_tables" else n for n in _USER_INPUT_NAMES
+    )
+    return list(zip(names, shapes, strict=True))
 
 
 def _weight_slots(
@@ -566,7 +604,9 @@ def _params_read_by_forward(
     bucket = min(cfg.token_buckets)
     mlir_text = tpu_lowering.lower_torch_forward_to_mlir(
         model,
-        user_inputs=_user_inputs(cfg, bucket, _req_dist_len(model)),
+        user_inputs=_user_inputs(
+            cfg, bucket, _req_dist_len(model), _block_tables_name(model)
+        ),
         forward_names=names,
         params_map=_norm_params(params_map),
         state_specs=_state_specs(model),
@@ -593,7 +633,7 @@ _MTP_PARAM_PREFIX = "mtp."
 def _mtp_user_inputs(
     model: api.ExportableTextOnlyLLM, bucket_size: int
 ) -> list[tuple[str, tuple[int, ...]]]:
-    """`(name, shape)` of the int32 user inputs of `mtp_draft_bucket{B}`."""
+    """`(name, shape)` of the int32 user inputs of `draft_bucket{B}`."""
     cfg = model.export_config
     return [
         *_user_inputs(cfg, bucket_size, _req_dist_len(model)),
@@ -605,13 +645,14 @@ def _mtp_user_inputs(
 def _mtp_params(
     model: api.ExportableTextOnlyLLM, params: Mapping[str, Any]
 ) -> tuple[dict[str, Any], list[str]]:
-    """The MTP layer's own weights, and every weight `mtp_draft` reads, in order.
+    """The MTP layer's own weights, and every weight the adapter's
+    `mtp_draft()` reads, in order.
 
     The own weights are the `mtp.` ones of `params`, the model's
-    `abstract_params`. The target weights `mtp_draft` shares (embedding, LM
-    head) are read off its graph: the smallest bucket is lowered once with every
-    candidate, as for the forward. A shared weight binds the target's slot, so
-    the artifact stores it once.
+    `abstract_params`. The target weights the adapter's `mtp_draft()` shares
+    (embedding, LM head) are read off its graph: the smallest bucket is lowered
+    once with every candidate, as for the forward. A shared weight binds the
+    target's slot, so the artifact stores it once.
     """
     for method in ("mtp_abstract_states", "mtp_draft"):
         if not callable(getattr(model, method, None)):
@@ -658,8 +699,8 @@ def _export_text_only_llm_functions(
     debug_taps: _DebugTaps | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Lowers `forward`, `compute_logits`, the samplers and, with MTP drafting,
-    `mtp_draft` across all buckets, plus `debug_taps`' variants of `forward`
-    and `mtp_draft` for the smallest bucket."""
+    `draft` across all buckets, plus `debug_taps`' variants of `forward`
+    and `draft` for the smallest bucket."""
     cfg: api.TextOnlyLLMExportConfig = model.export_config
     act_dtype_str = tpu_lowering.dtype_name(cfg.dtype)
     tp_size = cfg.tensor_parallel_size
@@ -700,7 +741,9 @@ def _export_text_only_llm_functions(
 
     forward_variants: dict[str, Any] = {}
     for b_idx, bucket_size in enumerate(cfg.token_buckets):
-        user_inputs = _user_inputs(cfg, bucket_size, _req_dist_len(model))
+        user_inputs = _user_inputs(
+            cfg, bucket_size, _req_dist_len(model), _block_tables_name(model)
+        )
         fwd_mlir = tpu_lowering.lower_torch_forward_to_mlir(
             model,
             user_inputs=user_inputs,
@@ -894,7 +937,7 @@ def _export_text_only_llm_functions(
         **sampler_variants,
     }
     if mtp_weight_names:
-        functions["mtp_draft"] = _export_mtp_draft(
+        functions["draft"] = _export_mtp_draft(
             model,
             params_map,
             layouts,
@@ -922,13 +965,14 @@ def _export_mtp_draft(
     constants: frozenset[str],
     debug_taps: _DebugTaps | None = None,
 ) -> dict[str, Any]:
-    """Lowers `mtp_draft_bucket{B}` for every forward bucket, and `debug_taps`'
+    """Lowers the drafter `draft_bucket{B}` for every forward bucket, and `debug_taps`'
     variant for the smallest.
 
     Inputs: the forward's user inputs with `input_ids` shifted by one token,
-    `last_token_indices`, the weights `mtp_draft` reads (shared ones bound to
-    the target's slots), the MTP layer's paged KV (states numbered after the
-    target's, each donated) and the forward's `hidden_states` intermediate.
+    `last_token_indices`, the weights the adapter's `mtp_draft()` reads (shared
+    ones bound to the target's slots), the MTP layer's paged KV (states numbered
+    after the target's, each donated) and the forward's `hidden_states`
+    intermediate.
     Outputs: the updated states and `draft_tokens` `[max_num_seqs, k]`.
     """
     cfg: api.TextOnlyLLMExportConfig = model.export_config
@@ -963,11 +1007,11 @@ def _export_mtp_draft(
             bucket_size=bucket_size,
             weight_reshapes=reshapes,
         )
-        file = f"mtp_draft_bucket{bucket_size}.mlir"
+        file = f"draft_bucket{bucket_size}.mlir"
         rel = f"{subdir}/{file}" if subdir else file
         with open(os.path.join(target_dir, file), "w") as f:
             f.write(mlir)
-        if debug_taps is not None and debug_taps.mtp_draft and b_idx == 0:
+        if debug_taps is not None and debug_taps.draft and b_idx == 0:
             tap_names: list[str] = []
             debug_mlir = tpu_lowering.lower_torch_mtp_draft_to_mlir(
                 model,
@@ -978,11 +1022,11 @@ def _export_mtp_draft(
                 hidden_states=hidden,
                 bucket_size=bucket_size,
                 weight_reshapes=reshapes,
-                taps=debug_taps.mtp_draft,
+                taps=debug_taps.draft,
                 tap_names=tap_names,
             )
             debug_taps.write(
-                "mtp_draft", bucket_size, debug_mlir, tap_names, len(state_specs) + 1
+                "draft", bucket_size, debug_mlir, tap_names, len(state_specs) + 1
             )
 
         inputs: list[dict[str, Any]] = [
@@ -1174,7 +1218,7 @@ def export(
         output_dir: Artifact directory; created if missing.
         subdir: Subdirectory of `output_dir` for `.mlir` files (default `'subgraphs'`).
         debug_taps: Glob patterns of module names. For the smallest token bucket,
-            `forward` and `mtp_draft` are also exported with the matching
+            `forward` and `draft` are also exported with the matching
             modules' outputs as extra results, under `assets.extra/debug/` with a
             `taps.json` manifest; the serving artifact itself is unchanged.
     """
@@ -1224,8 +1268,8 @@ def export(
     mtp_weight_names: list[str] = []
     if mtp_requested:
         mtp_own, mtp_weight_names = _mtp_params(model, all_params)
-        # Every weight mtp_draft reads needs a slot, a shared one the forward
-        # does not read included.
+        # Every weight the adapter's mtp_draft() reads needs a slot, a shared one
+        # the forward does not read included.
         for name in mtp_weight_names:
             params_map.setdefault(name, all_params[name])
     constant_names_fn = getattr(model, "constant_names", None)
@@ -1287,11 +1331,14 @@ def export(
         "block_size": cfg.block_size,
         "num_blocks": cfg.num_blocks,
         **_recurrent_serving_config(model),
+        **_kv_cache_groups_serving_config(model),
         "max_model_len": cfg.max_model_len,
         "tensor_parallel_size": tp_size,
         "pipeline_parallel_size": pp_size,
         "data_parallel_size": dp_size,
         **_emit_model_companion_files(cfg, output_dir),
+        # How a checkpoint of this artifact is stored (Zarr v2 arrays in OCDBT).
+        "checkpoint_config": {"format": checkpoint.CHECKPOINT_FORMAT},
     }
     if cfg.speculative_config is not None:
         serving_config["speculative_config"] = cfg.speculative_config

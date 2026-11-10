@@ -27,9 +27,9 @@ from typing import Any, cast
 import torch
 import torch.nn as nn
 
+from vllm_torchtpu import rope_patch
 from vllm_torchtpu.experimental.export import (
     api,
-    rope_patch,
     sampling,
     tpu_lowering,
     weight_mapper,
@@ -203,6 +203,33 @@ def resolve_hf_checkpoint_dir(model: str | None) -> str | None:
     return os.path.dirname(config_path)
 
 
+def _detect_target_tpu() -> str:
+    """The TPU generation of this host, as `ChipVersion` names it ('7x', 'v6e').
+
+    The artifact's kernels are tuned for one generation, so an export that
+    cannot tell which one it runs on fails instead of guessing.
+    """
+    from jax.experimental.pallas import tpu as pltpu
+
+    from vllm_torchtpu import tpu_info
+
+    accelerator_type = tpu_info.get_tpu_type()
+    if not accelerator_type:
+        raise RuntimeError(
+            "Cannot detect the TPU generation (neither TPU_ACCELERATOR_TYPE nor "
+            "the GCE metadata accelerator-type is available); pass --target-tpu."
+        )
+    name = accelerator_type.strip().lower().split("-")[0].removeprefix("tpu")
+    name = {"v5litepod": "v5e", "v7x": "7x"}.get(name, name)
+    try:
+        return str(pltpu.ChipVersion(name).value)
+    except ValueError as e:
+        raise RuntimeError(
+            f"Unrecognized TPU accelerator type {accelerator_type!r}; "
+            "pass --target-tpu."
+        ) from e
+
+
 @trace("export.build_export_config")
 def build_export_config_from_vllm(
     vllm_config: Any,
@@ -242,12 +269,7 @@ def build_export_config_from_vllm(
     dp_size, pp_size = check_supported_parallelism(parallel_cfg)
 
     if target_tpu is None:
-        with contextlib.suppress(Exception):
-            from vllm_torchtpu.tpu_info import get_chip_version
-
-            target_tpu = str(get_chip_version().value)
-        if not target_tpu:
-            target_tpu = "v6e"
+        target_tpu = _detect_target_tpu()
 
     vocab_size = int(
         (
@@ -875,6 +897,8 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
 
     # The MTP draft the target was loaded with (`MTP_DRAFT_ATTR`), if any.
     _mtp_draft: nn.Module | None = None
+    # `kv_cache_groups()`, computed on first use.
+    _kv_cache_groups: list[api.KvCacheGroup] | None = None
 
     def __init__(
         self,
@@ -1171,6 +1195,105 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
     def _has_recurrent_layers(self) -> bool:
         return any(_is_recurrent_layer(m) for m in self._attention_layers())
 
+    def kv_cache_groups(self) -> list[api.KvCacheGroup]:
+        """The KV cache groups of a model whose layers vLLM splits into several.
+
+        vLLM's hybrid KV cache manager gives sliding-window and full-attention
+        layers their own page tables (`get_kv_cache_groups`), with layer `j` of
+        every group sharing one KV tensor. The export takes vLLM's groups as they
+        are. A model with one group, or with layers other than paged decoder
+        attention of one KV shape, has none: every layer reads `block_tables`.
+        """
+        if self._kv_cache_groups is None:
+            self._kv_cache_groups = self._compute_kv_cache_groups()
+        return self._kv_cache_groups
+
+    def _compute_kv_cache_groups(self) -> list[api.KvCacheGroup]:
+        # `mtp_draft` takes one page table, so a drafting model keeps every layer
+        # on `block_tables`, as it exported before groups existed.
+        if self._vllm_config is None or self._drafts_with_mtp():
+            return []
+        from vllm.model_executor.layers.attention import Attention
+        from vllm.v1.attention.backend import AttentionType
+        from vllm.v1.core.kv_cache_planning import get_kv_cache_groups
+        from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
+
+        from vllm_torchtpu.kv_cache_spec_normalizer import (
+            normalize_kv_cache_specs_for_tpu,
+        )
+        from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+
+        named_layers = self._named_attention_layers()
+        if not named_layers or not all(
+            isinstance(m, Attention)
+            and m.attn_type == AttentionType.DECODER
+            and m.kv_sharing_target_layer_name is None
+            for _, m in named_layers
+        ):
+            return []
+        # Decoder attention splits into groups only around sliding-window layers.
+        # Without one, nothing below runs, so such a model exports exactly as it
+        # did before groups existed (the spec path touches the backend, which can
+        # shift the KV budget fit by a block).
+        if all(m.sliding_window is None for _, m in named_layers):
+            return []
+        per_layer = self._layer_state_specs([m for _, m in named_layers])
+        if (
+            per_layer is None
+            or len({tuple((t.shape, t.dtype) for t in specs) for specs in per_layer})
+            != 1
+        ):
+            return []
+        # The runner's specs: each layer's own `get_kv_cache_spec`, normalized to
+        # the TPU page geometry (`KVCacheManager.get_kv_cache_spec`), so the export
+        # groups the layers exactly as serving does.
+        from vllm.config import set_current_vllm_config
+
+        specs: dict[str, Any] = {}
+        # The TPU backend's `customize_spec` reads the current config, as it does
+        # in the runner.
+        with set_current_vllm_config(self._vllm_config):
+            for name, layer in named_layers:
+                spec = layer.get_kv_cache_spec(self._vllm_config)
+                if not isinstance(spec, (FullAttentionSpec, SlidingWindowSpec)):
+                    return []
+                specs[name] = spec
+            specs = normalize_kv_cache_specs_for_tpu(
+                specs,
+                tpu_lowering.torch_dtype(per_layer[0][0].dtype),
+                attention_backend=cast(
+                    Any, TpuPlatform._find_non_ssm_backend(self._vllm_config)
+                ),
+            )
+            groups = get_kv_cache_groups(self._vllm_config, specs)
+        if len(groups) <= 1:
+            return []
+        result = []
+        for i, group in enumerate(groups):
+            spec = group.kv_cache_spec
+            if not isinstance(spec, (FullAttentionSpec, SlidingWindowSpec)):
+                raise NotImplementedError(
+                    f"KV cache group {i} has a {type(spec).__name__}; export supports "
+                    "full-attention and sliding-window groups"
+                )
+            window = (
+                spec.sliding_window if isinstance(spec, SlidingWindowSpec) else None
+            )
+            result.append(
+                api.KvCacheGroup(
+                    name=f"kv{i}", layer_names=tuple(group.layer_names), window=window
+                )
+            )
+        return result
+
+    def _kv_cache_slots(self) -> dict[str, int]:
+        """The state tensor each layer of a grouped model keeps its KV in."""
+        return {
+            name: j
+            for group in self.kv_cache_groups()
+            for j, name in enumerate(group.layer_names)
+        }
+
     def _layer_state_specs(
         self, layers: Sequence[Any] | None = None
     ) -> list[list[api.ShapeDtypeStruct]] | None:
@@ -1264,6 +1387,12 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
         `mamba_state_indices`.
         """
         cfg = self._export_config
+        groups = self.kv_cache_groups()
+        if groups:
+            # The first group's page table takes the place of `block_tables`.
+            return [
+                (f"{g.name}_block_tables", (cfg.max_num_pages,)) for g in groups[1:]
+            ]
         if not self._has_recurrent_layers():
             return []
         inputs: list[tuple[str, tuple[int, ...]]] = [
@@ -1279,10 +1408,18 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
         return inputs
 
     def abstract_states(self) -> Sequence[api.ShapeDtypeStruct]:
-        """Returns the state tensors of every attention layer, in layer order."""
+        """Returns the state tensors of every attention layer, in layer order.
+
+        A model with KV cache groups has one KV tensor per layer slot of a group
+        instead, shared by layer `j` of every group.
+        """
         cfg = self._export_config
         act_dtype_str = tpu_lowering.dtype_name(cfg.dtype)
         per_layer = self._layer_state_specs()
+        groups = self.kv_cache_groups()
+        if groups and per_layer is not None:
+            num_slots = max(len(g.layer_names) for g in groups)
+            return [per_layer[0][0]] * num_slots
         if per_layer is not None:
             return [spec for specs in per_layer for spec in specs]
 
@@ -1462,15 +1599,17 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
         input_ids: Any,
         positions: Any,
         kv_lens: Any,
-        block_tables: Any,
         query_start_loc: Any,
         req_dist: Any,
+        block_tables: Any = None,
         **extra_controls: Any,
     ) -> tuple[Sequence[Any], Any]:
         """Executes one flattened continuous-batching forward pass.
 
         A 6-element `req_dist` is the attention kernel's distribution, then the
         recurrent kernels', whose windowed segment takes the verify windows too.
+        A model with KV cache groups takes each group's page table as
+        `{name}_block_tables` instead of `block_tables`.
         """
         num_tokens = int(input_ids.shape[0])
         attention_dist, recurrent_dist = _split_req_dist(req_dist)
@@ -1497,10 +1636,38 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
         named_layers = self._named_attention_layers()
         attn_layers = [m for _, m in named_layers]
         working_kvs = list(kv_caches)
-        per_layer = self._layer_state_specs()
+        groups = self.kv_cache_groups()
+        per_layer = None if groups else self._layer_state_specs()
         # Each recurrent layer binds its `[conv_state, recurrent_state]` list.
         layer_kvs: list[list[Any]] | None = None
-        if per_layer is not None and sum(map(len, per_layer)) == len(working_kvs):
+        # Of a model with KV cache groups, one layer per shared KV tensor and the
+        # metadata of each layer's group.
+        slot_layers: list[Any] = []
+        metadata_by_layer: dict[str, Any] = {}
+        if groups:
+            slots = self._kv_cache_slots()
+            group_metadata = {
+                g.name: make_attention_metadata(
+                    input_positions=positions,
+                    block_tables=extra_controls[f"{g.name}_block_tables"],
+                    seq_lens=kv_lens,
+                    query_start_loc=query_start_loc,
+                    request_distribution=attention_dist,
+                )
+                for g in groups
+            }
+            metadata_by_layer = {
+                name: group_metadata[g.name] for g in groups for name in g.layer_names
+            }
+            # Layers that share a tensor hold the same object, so the in-place KV
+            # write of one is what the next one reads.
+            for name, layer in named_layers:
+                layer.kv_cache = working_kvs[slots[name]]
+            first_by_slot: dict[int, Any] = {}
+            for name, layer in named_layers:
+                first_by_slot.setdefault(slots[name], layer)
+            slot_layers = [first_by_slot[j] for j in range(len(working_kvs))]
+        elif per_layer is not None and sum(map(len, per_layer)) == len(working_kvs):
             it = iter(working_kvs)
             layer_kvs = [[next(it) for _ in specs] for specs in per_layer]
             for layer, bufs in zip(attn_layers, layer_kvs, strict=True):
@@ -1509,7 +1676,9 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
             for layer, kv_buf in zip(attn_layers, working_kvs, strict=True):
                 layer.kv_cache = kv_buf
         forward_metadata: Any = attn_metadata
-        if any(_is_recurrent_layer(m) for m in attn_layers):
+        if groups:
+            forward_metadata = metadata_by_layer
+        elif any(_is_recurrent_layer(m) for m in attn_layers):
             # Recurrent layers look their metadata up by layer name, as the
             # runner's per-layer metadata provides it.
             forward_metadata = {name: attn_metadata for name, _ in named_layers}
@@ -1545,7 +1714,9 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
                 if prev_do_not_compile is not None:
                     backbone.do_not_compile = prev_do_not_compile
 
-            if layer_kvs is not None:
+            if slot_layers:
+                updated_kvs = [layer.kv_cache for layer in slot_layers]
+            elif layer_kvs is not None:
                 updated_kvs = [
                     buf
                     for layer in attn_layers

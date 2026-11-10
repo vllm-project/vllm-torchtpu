@@ -41,6 +41,12 @@ from vllm_torchtpu.experimental.export import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _tpu_accelerator_type(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Gives these CPU tests a TPU generation: the export refuses to guess one."""
+    monkeypatch.setenv("TPU_ACCELERATOR_TYPE", "v6e-8")
+
+
 def _mock_lower_torch_callable_to_mlir(
     fn: Any,
     arg_specs: Sequence[api.ShapeDtypeStruct],
@@ -144,9 +150,7 @@ class _TinyPyTorchCausalLM(nn.Module):
         self.model = _TinyPyTorchBackbone(vocab_size, hidden_size, num_layers)
         self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
         if mrope_section is not None:
-            from tests.experimental.export.test_rope_patch import (
-                _SyntheticRotaryEmbedding,
-            )
+            from tests.test_rope_patch import _SyntheticRotaryEmbedding
 
             self.rotary_emb = _SyntheticRotaryEmbedding(
                 head_size=32,
@@ -576,8 +580,11 @@ def test_metadata_has_one_serving_config_with_what_the_runtime_reads(tmp_path) -
         "pipeline_parallel_size",
         "data_parallel_size",
         "tokenizer_config",
+        "checkpoint_config",
     }
     assert (serving["vocab_size"], serving["num_blocks"]) == (32, 16)
+    # The checkpoint format every export writes (Zarr v2 arrays in an OCDBT database).
+    assert serving["checkpoint_config"] == {"format": "zarr2_ocdbt"}
 
 
 def test_metadata_declares_the_speculative_config_it_was_exported_with(
@@ -720,6 +727,28 @@ def test_parse_args_takes_the_vllm_serve_command_line(capsys) -> None:
         assert flag in ignored, ignored
     for flag in ["--max-model-len", "--block-size", "--output-dir"]:
         assert flag not in ignored, ignored
+
+
+def test_artifact_model_name_records_the_model_id_not_its_location(
+    tmp_path, capsys
+) -> None:
+    snapshot = tmp_path / "hub" / "models--Qwen--Qwen3-0.6B" / "snapshots" / "main"
+    snapshot.mkdir(parents=True)
+    local = tmp_path / "Qwen3.5-0.8B"
+    local.mkdir()
+
+    assert cli.artifact_model_name("Qwen/Qwen3-0.6B") == "Qwen/Qwen3-0.6B"
+    assert cli.artifact_model_name(str(snapshot)) == "Qwen/Qwen3-0.6B"
+    assert cli.artifact_model_name(str(snapshot) + "/") == "Qwen/Qwen3-0.6B"
+    assert capsys.readouterr().err == ""
+    assert cli.artifact_model_name(str(local)) == "Qwen3.5-0.8B"
+    assert "--served-model-name" in capsys.readouterr().err
+    assert cli.artifact_model_name("gs://bucket/ckpt/hf/Kimi-K3") == "Kimi-K3"
+    assert cli.artifact_model_name(str(local), ["Qwen/Qwen3.5-0.8B"]) == (
+        "Qwen/Qwen3.5-0.8B"
+    )
+    assert cli.artifact_model_name(str(snapshot), "my-model") == "my-model"
+    assert cli.artifact_model_name(None) is None
 
 
 def test_export_speculative_config_keeps_vllm_field_names() -> None:
@@ -1442,6 +1471,44 @@ def test_build_export_config_rejects_data_and_pipeline_parallelism(
         )
 
 
+def test_build_export_config_fails_when_the_tpu_generation_is_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The kernels in the artifact are tuned for one TPU generation, so the
+    # export must record the real one rather than guess.
+    from vllm_torchtpu import tpu_info
+
+    monkeypatch.setattr(tpu_info, "get_tpu_type", lambda: None)
+    with pytest.raises(RuntimeError, match="--target-tpu"):
+        universal_adapter.build_export_config_from_vllm(
+            _parallel_vllm_cfg(tmp_path, 1, 1, 1)
+        )
+
+    monkeypatch.setattr(tpu_info, "get_tpu_type", lambda: "foo-8")
+    with pytest.raises(RuntimeError, match=r"foo-8.*--target-tpu"):
+        universal_adapter.build_export_config_from_vllm(
+            _parallel_vllm_cfg(tmp_path, 1, 1, 1)
+        )
+
+
+def test_build_export_config_records_the_detected_tpu_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from vllm_torchtpu import tpu_info
+
+    monkeypatch.setattr(tpu_info, "get_tpu_type", lambda: "tpu7x-8")
+    cfg = universal_adapter.build_export_config_from_vllm(
+        _parallel_vllm_cfg(tmp_path, 1, 1, 1)
+    )
+    assert cfg.target_tpu == "7x"
+    # An explicit --target-tpu is kept as given, with no detection.
+    monkeypatch.setattr(tpu_info, "get_tpu_type", lambda: None)
+    cfg = universal_adapter.build_export_config_from_vllm(
+        _parallel_vllm_cfg(tmp_path, 1, 1, 1), target_tpu="v6e"
+    )
+    assert cfg.target_tpu == "v6e"
+
+
 @pytest.mark.parametrize("tp", [1, 2, 4])
 def test_build_export_config_spans_one_partition_per_tp_rank(
     tmp_path: Path, tp: int
@@ -1787,6 +1854,230 @@ def _bare_layer(cls_path: str) -> Any:
     module_name, cls_name = cls_path.rsplit(".", 1)
     module = __import__(module_name, fromlist=[cls_name])
     return object.__new__(getattr(module, cls_name))
+
+
+def _decoder_attention(window: int | None) -> Any:
+    """A vLLM decoder `Attention` layer with only what the KV cache spec reads."""
+    from vllm.model_executor.layers.attention import Attention
+    from vllm.v1.attention.backend import AttentionType
+
+    layer = object.__new__(Attention)
+    nn.Module.__init__(layer)
+    layer.attn_type = AttentionType.DECODER
+    layer.kv_sharing_target_layer_name = None
+    layer.num_kv_heads, layer.head_size = 2, 128
+    layer.sliding_window = window
+    layer.impl = _pallas_impl(None)
+    layer.get_kv_cache_spec = lambda vllm_config: _kv_cache_spec(window)
+    return layer
+
+
+def _kv_cache_spec(window: int | None) -> Any:
+    """The KV cache spec vLLM's `Attention.get_kv_cache_spec` returns for a layer."""
+    from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
+
+    fields: dict[str, Any] = {
+        "block_size": 16,
+        "num_kv_heads": 2,
+        "head_size": 128,
+        "dtype": torch.bfloat16,
+    }
+    if window is None:
+        return FullAttentionSpec(**fields)
+    return SlidingWindowSpec(**fields, sliding_window=window)
+
+
+def _grouping_vllm_config() -> Any:
+    """The fields of a `VllmConfig` that vLLM's KV cache grouping reads."""
+    return SimpleNamespace(
+        cache_config=SimpleNamespace(
+            block_size=16,
+            get_resolved_kv_cache_layout=lambda: SimpleNamespace(
+                is_block_outermost=False
+            ),
+        ),
+        scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
+        attention_config=SimpleNamespace(hisparse_config=None),
+        speculative_config=None,
+        model_config=None,
+    )
+
+
+def _adapter_with_layers(
+    windows: Sequence[int | None], monkeypatch: pytest.MonkeyPatch
+) -> Any:
+    from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
+    from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+
+    # The runner normalizes specs with the backend of the model's layers.
+    monkeypatch.setattr(
+        TpuPlatform,
+        "_find_non_ssm_backend",
+        classmethod(lambda cls, vllm_config: PallasAttentionBackend),
+    )
+    cfg = api.TextOnlyLLMExportConfig(
+        model_name="tiny", num_blocks=16, block_size=16, max_num_seqs=4
+    )
+    adapter = _adapter_without_model(cfg)
+    adapter._vllm_config = _grouping_vllm_config()
+    layers = [
+        (f"layers.{i}.attn", _decoder_attention(w)) for i, w in enumerate(windows)
+    ]
+    adapter._named_attention_layers = lambda: layers
+    return adapter
+
+
+def test_sliding_window_and_full_layers_export_vllm_kv_cache_groups(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Layers keep vLLM's groups: one page table each, layer `j` of every group
+    sharing KV tensor `j`."""
+    adapter = _adapter_with_layers(
+        [2048, None, 2048, 2048, 2048, None, 2048, 2048], monkeypatch
+    )
+    assert adapter.kv_cache_groups() == [
+        api.KvCacheGroup("kv0", ("layers.0.attn", "layers.4.attn"), 2048),
+        api.KvCacheGroup("kv1", ("layers.2.attn", "layers.6.attn"), 2048),
+        api.KvCacheGroup("kv2", ("layers.3.attn", "layers.7.attn"), 2048),
+        api.KvCacheGroup("kv3", ("layers.1.attn", "layers.5.attn"), None),
+    ]
+    kv = adapter._layer_state_specs([_decoder_attention(None)])[0][0]
+    assert list(adapter.abstract_states()) == [kv, kv]
+    max_pages = adapter.export_config.max_num_pages
+    assert adapter.extra_user_inputs() == [
+        (f"kv{i}_block_tables", (max_pages,)) for i in (1, 2, 3)
+    ]
+    assert exporter._block_tables_name(adapter) == "kv0_block_tables"
+    assert [
+        n
+        for n, _ in exporter._user_inputs(
+            adapter.export_config, 16, 3, "kv0_block_tables"
+        )
+    ] == [
+        "input_ids",
+        "positions",
+        "kv_lens",
+        "kv0_block_tables",
+        "query_start_loc",
+        "req_dist",
+    ]
+    assert exporter._kv_cache_groups_serving_config(adapter) == {
+        "kv_cache_groups": [
+            {"name": "kv0", "retention": {"window": 2048}},
+            {"name": "kv1", "retention": {"window": 2048}},
+            {"name": "kv2", "retention": {"window": 2048}},
+            {"name": "kv3", "retention": "all"},
+        ]
+    }
+
+
+def test_a_model_with_one_kv_cache_group_keeps_block_tables(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for windows in ([None, None], [2048, 2048]):
+        adapter = _adapter_with_layers(windows, monkeypatch)
+        assert adapter.kv_cache_groups() == []
+        assert len(list(adapter.abstract_states())) == 2
+        assert adapter.extra_user_inputs() == []
+        assert exporter._block_tables_name(adapter) == "block_tables"
+        assert exporter._kv_cache_groups_serving_config(adapter) == {}
+
+
+def test_a_model_without_sliding_window_layers_skips_the_spec_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Full-attention models never reach vLLM's spec or grouping code, so their
+    artifacts stay byte-identical to the ones exported before groups existed."""
+    adapter = _adapter_with_layers([None, None, None], monkeypatch)
+    for _, layer in adapter._named_attention_layers():
+        layer.get_kv_cache_spec = lambda vllm_config: pytest.fail("spec path ran")
+    assert adapter.kv_cache_groups() == []
+
+
+def test_a_model_that_drafts_with_mtp_keeps_one_page_table(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _adapter_with_layers([2048, None], monkeypatch)
+    adapter._drafts_with_mtp = lambda: True
+    assert adapter.kv_cache_groups() == []
+    assert adapter.extra_user_inputs() == []
+    assert exporter._block_tables_name(adapter) == "block_tables"
+    assert exporter._kv_cache_groups_serving_config(adapter) == {}
+
+
+def test_kv_cache_groups_come_from_each_layers_own_spec(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The groups follow what each layer reports, as the runner's do: a layer
+    whose spec is full attention joins the full group whatever its attributes."""
+    adapter = _adapter_with_layers([2048, None, 2048, None], monkeypatch)
+    _, layer = adapter._named_attention_layers()[2]
+    layer.get_kv_cache_spec = lambda vllm_config: _kv_cache_spec(None)
+    groups = adapter.kv_cache_groups()
+    window_layers = {n for g in groups if g.window is not None for n in g.layer_names}
+    full_layers = {n for g in groups if g.window is None for n in g.layer_names}
+    assert window_layers == {"layers.0.attn"}
+    assert full_layers == {"layers.1.attn", "layers.2.attn", "layers.3.attn"}
+
+
+class _GroupRecordingBackbone(nn.Module):
+    """Backbone that writes each layer's KV in place, as the attention kernel
+    does, and records the page table each layer reads."""
+
+    def __init__(self, layers: Sequence[tuple[str, Any]]) -> None:
+        super().__init__()
+        self.layers = layers
+        self.tables: dict[str, torch.Tensor] = {}
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        attn_metadata: Any = None,
+    ) -> torch.Tensor:
+        for i, (name, layer) in enumerate(self.layers):
+            self.tables[name] = attn_metadata[name].block_tables
+            layer.kv_cache.copy_(layer.kv_cache + 10**i)
+        return input_ids.float()
+
+
+def test_forward_binds_shared_kv_tensors_and_group_page_tables() -> None:
+    cfg = api.TextOnlyLLMExportConfig(model_name="tiny", num_layers=0)
+    adapter = _adapter_without_model(cfg)
+    layers = [(f"l{i}", SimpleNamespace(kv_cache=None)) for i in range(4)]
+    adapter._named_attention_layers = lambda: layers
+    adapter._kv_cache_groups = [
+        api.KvCacheGroup("kv0", ("l0", "l2"), 2048),
+        api.KvCacheGroup("kv1", ("l1", "l3"), None),
+    ]
+    backbone = _GroupRecordingBackbone(layers)
+    # The export calls the top-level model's forward, as the runner does.
+    adapter._model = backbone
+    kvs = [torch.zeros(2), torch.zeros(2)]
+    tables = {
+        "kv0_block_tables": torch.tensor([1]),
+        "kv1_block_tables": torch.tensor([2]),
+    }
+    updated, _ = adapter.forward(
+        {},
+        kvs,
+        input_ids=torch.tensor([1]),
+        positions=torch.tensor([0]),
+        kv_lens=torch.tensor([1]),
+        query_start_loc=torch.tensor([0, 1]),
+        req_dist=torch.tensor([0, 0, 1]),
+        **tables,
+    )
+    # Layer `j` of both groups writes tensor `j`, on top of the other's write.
+    assert updated[0] is kvs[0] and updated[1] is kvs[1]
+    assert updated[0].tolist() == [11.0, 11.0]  # l0, l1
+    assert updated[1].tolist() == [1100.0, 1100.0]  # l2, l3
+    assert {n: int(t[0]) for n, t in backbone.tables.items()} == {
+        "l0": 1,
+        "l1": 2,
+        "l2": 1,
+        "l3": 2,
+    }
 
 
 @pytest.mark.parametrize(
@@ -2400,10 +2691,11 @@ def test_mtp_draft_follows_the_contract(tmp_path) -> None:
     out_dir = _export_mtp(tmp_path)
     meta = json.loads(Path(out_dir, "metadata.json").read_text())
     functions = meta["functions"]
-    assert set(functions["mtp_draft"]) == set(functions["forward"]) == {"8", "16"}
+    assert set(functions["draft"]) == set(functions["forward"]) == {"8", "16"}
     assert meta["serving_config"]["speculative_config"]["method"] == "mtp"
 
-    variant = functions["mtp_draft"]["16"]
+    variant = functions["draft"]["16"]
+    assert variant["file_path"].endswith("draft_bucket16.mlir"), variant["file_path"]
     by_name = {i["name"]: i for i in variant["inputs"]}
     assert Path(out_dir, variant["file_path"]).is_file()
     # The forward's controls, shifted input_ids, then the last accepted rows.
@@ -2496,7 +2788,7 @@ def test_debug_taps_export_tapped_variants_under_assets_extra(tmp_path) -> None:
     # The smallest token bucket only, after the serving variant's own results:
     # the forward's one state and hidden_states, the draft's state and drafts.
     forward = functions["forward"]["8"]
-    assert set(functions["forward"]) == set(functions["mtp_draft"]) == {"8"}
+    assert set(functions["forward"]) == set(functions["draft"]) == {"8"}
     assert forward["num_outputs"] == 2
     assert forward["taps"] == [
         {"name": "final", "output_index": 2, "shape": [8, 16], "dtype": "bf16"}
@@ -2504,7 +2796,7 @@ def test_debug_taps_export_tapped_variants_under_assets_extra(tmp_path) -> None:
     assert Path(out_dir, forward["file_path"]).is_file()
     assert forward["file_path"].startswith("assets.extra/debug/")
     # A module the chain calls twice records each call.
-    draft_taps = [t["name"] for t in functions["mtp_draft"]["8"]["taps"]]
+    draft_taps = [t["name"] for t in functions["draft"]["8"]["taps"]]
     assert draft_taps == ["mtp.fc_act", "mtp.fc_act#1"]
     # The serving artifact does not name the debug modules.
     meta = Path(out_dir, "metadata.json").read_text()
@@ -2564,17 +2856,22 @@ def test_mtp_needs_the_mtp_layer_among_the_parameters(tmp_path) -> None:
         _export_mtp(tmp_path, model_cls=_TinyMtpWithoutWeights)
 
 
-def test_validator_rejects_mtp_draft_missing_a_bucket(tmp_path) -> None:
+@pytest.mark.parametrize("method", validator.DRAFTER_METHODS)
+def test_validator_rejects_a_draft_missing_a_bucket(tmp_path, method) -> None:
+    # Every drafter method holds the artifact to the same `draft` contract.
     out_dir = _export_mtp(tmp_path)
     meta_path = Path(out_dir, "metadata.json")
     meta = json.loads(meta_path.read_text())
-    del meta["functions"]["mtp_draft"]["8"]
+    meta["serving_config"]["speculative_config"]["method"] = method
+    meta_path.write_text(json.dumps(meta))
+    validator.validate_exported_model_dir(out_dir)
+    del meta["functions"]["draft"]["8"]
     meta_path.write_text(json.dumps(meta))
     with pytest.raises(ValueError, match="differ from forward buckets"):
         validator.validate_exported_model_dir(out_dir)
-    del meta["functions"]["mtp_draft"]
+    del meta["functions"]["draft"]
     meta_path.write_text(json.dumps(meta))
-    with pytest.raises(ValueError, match="exports no mtp_draft"):
+    with pytest.raises(ValueError, match="exports no draft"):
         validator.validate_exported_model_dir(out_dir)
 
 
