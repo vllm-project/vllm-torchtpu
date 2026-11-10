@@ -1628,7 +1628,9 @@ def test_set_additional_forward_context_caches_dp_num_tokens_tpu_tensor(monkeypa
     TpuPlatform.set_additional_forward_context(dp_metadata=dp_metadata_1)
     TpuPlatform.set_additional_forward_context(dp_metadata=dp_metadata_2)
     assert dp_metadata_1.num_tokens_across_dp_cpu.vals == (64,)
-    assert dp_metadata_2.num_tokens_across_dp_cpu is dp_metadata_1.num_tokens_across_dp_cpu
+    assert (
+        dp_metadata_2.num_tokens_across_dp_cpu is dp_metadata_1.num_tokens_across_dp_cpu
+    )
     assert to_calls == [((64,), "tpu")]
 
     TpuPlatform.set_additional_forward_context(dp_metadata=dp_metadata_3)

@@ -3473,10 +3473,7 @@ class TPUModelRunner(GPUModelRunner):
             req_state = requests.get(req_id)
             if req_state is not None:
                 req_state.prev_num_draft_len = 0
-        if (
-            invalidated_req_ids
-            or scheduler_output.scheduled_new_reqs
-        ):
+        if invalidated_req_ids or scheduler_output.scheduled_new_reqs:
             self._cached_output_req_ids_key = None
         self._install_spec_token_room_guard()
         copies = scheduler_output.kv_cache_block_copies
@@ -4124,7 +4121,12 @@ class TPUModelRunner(GPUModelRunner):
                 idx_cache = {}
                 self._prepare_inputs_idx_cache = idx_cache
             idx_cache_key = (
-                (start_index, num_reqs, token_ids_stride, max_num_scheduled_tokens_all_reqs)
+                (
+                    start_index,
+                    num_reqs,
+                    token_ids_stride,
+                    max_num_scheduled_tokens_all_reqs,
+                )
                 if is_uniform_scheduled
                 else (
                     start_index,
@@ -4150,9 +4152,7 @@ class TPUModelRunner(GPUModelRunner):
                 req_row_offsets = (req_indices * token_ids_stride).astype(
                     np.int64, copy=False
                 )
-                token_indices = np.empty(
-                    total_num_scheduled_tokens, dtype=np.int64
-                )
+                token_indices = np.empty(total_num_scheduled_tokens, dtype=np.int64)
                 if len(idx_cache) >= 32:
                     idx_cache.pop(next(iter(idx_cache)))
                 idx_cache[idx_cache_key] = (

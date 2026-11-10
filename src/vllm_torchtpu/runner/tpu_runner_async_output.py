@@ -374,9 +374,7 @@ def _compiled_extract_draft_token_ids(
     logits_indices: torch.Tensor,
     target_logits_indices: torch.Tensor,
 ) -> torch.Tensor:
-    return extract_draft_token_ids(
-        input_ids, logits_indices, target_logits_indices
-    )
+    return extract_draft_token_ids(input_ids, logits_indices, target_logits_indices)
 
 
 @_static_shape_args
