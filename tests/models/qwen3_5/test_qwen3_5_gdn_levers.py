@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """The GDN v3 levers of the Qwen3.5 kernel copy, checked on CPU against main's
-kernel in kernels/gdn/v3: the decode k transpose (bit-identical) and the
+kernel in kernels/gdn/v3: the decode k transpose (bit-identical), the prefill
+shared k k^T (equal up to rounding, one k k^T dot per kq head) and the
 skipped empty PER_SEQ call."""
 
 import jax
@@ -57,6 +58,23 @@ def _cfg(cfg_module, mode, *, tile_size, window_size=1):
     )
 
 
+def _dot_shapes(fn, *args):
+    """(lhs shape, rhs shape, contracting dims) of every dot_general in fn."""
+    jaxpr = jax.make_jaxpr(fn)(*args).jaxpr
+    shapes = []
+    for eqn in jaxpr.eqns:
+        if eqn.primitive.name == "dot_general":
+            contract, _ = eqn.params["dimension_numbers"]
+            shapes.append(
+                (
+                    tuple(eqn.invars[0].aval.shape),
+                    tuple(eqn.invars[1].aval.shape),
+                    tuple(map(tuple, contract)),
+                )
+            )
+    return shapes
+
+
 def _transposes(fn, *args):
     """(input shape, permutation) of every transpose in fn."""
     jaxpr = jax.make_jaxpr(fn)(*args).jaxpr
@@ -65,6 +83,53 @@ def _transposes(fn, *args):
         for e in jaxpr.eqns
         if e.primitive.name == "transpose"
     ]
+
+
+# --- prefill: shared k k^T -----------------------------------------------------
+
+
+def _chunked_inputs(chunk, seed=0):
+    rngs = iter(jax.random.split(jax.random.key(seed), 8))
+    aligned_v = 128
+    q = jax.random.normal(next(rngs), (N_KQ, chunk, D_K), jnp.float32)
+    k = jax.random.normal(next(rngs), (N_KQ, chunk, D_K), jnp.float32)
+    k = k / jnp.linalg.norm(k, axis=-1, keepdims=True)
+    q = q / jnp.linalg.norm(q, axis=-1, keepdims=True) * D_K**-0.5
+    v = jax.random.normal(next(rngs), (N_V, chunk, D_V), jnp.float32)
+    gating_log = -jax.nn.softplus(
+        jax.random.normal(next(rngs), (1, chunk, aligned_v), jnp.float32)
+    )
+    beta = jax.nn.sigmoid(
+        jax.random.normal(next(rngs), (1, chunk, aligned_v), jnp.float32)
+    )
+    state = 0.1 * jax.random.normal(next(rngs), (N_V, D_K, D_V), jnp.float32)
+    return q, k, v, gating_log, beta, state
+
+
+@pytest.mark.parametrize("chunk", [16, 64])
+def test_shared_kkt_chunk_matches_main_up_to_rounding(chunk):
+    args = _chunked_inputs(chunk, seed=chunk)
+    out, state = compute_gdn.chunked_gdn_per_seq(
+        *args, _cfg(config, config.GDNMode.PER_SEQ, tile_size=chunk)
+    )
+    ref_out, ref_state = main_compute_gdn.chunked_gdn_per_seq(
+        *args, _cfg(main_config, main_config.GDNMode.PER_SEQ, tile_size=chunk)
+    )
+    np.testing.assert_allclose(out, ref_out, rtol=1e-4, atol=1e-4)
+    np.testing.assert_allclose(state, ref_state, rtol=1e-4, atol=1e-4)
+
+
+def test_shared_kkt_computes_one_kkt_per_kq_head():
+    """k k^T is a dot over the kq heads; no per-value-head (beta k) k^T dot."""
+    chunk = 16
+    cfg = _cfg(config, config.GDNMode.PER_SEQ, tile_size=chunk)
+    args = _chunked_inputs(chunk)
+    shapes = _dot_shapes(lambda *a: compute_gdn.chunked_gdn_per_seq(*a, cfg), *args)
+    per_v_head = ((N_V, chunk, D_K), (N_V, chunk, D_K), ((2,), (2,)))
+    per_kq_head = ((N_KQ, chunk, D_K), (N_KQ, chunk, D_K), ((2,), (2,)))
+    assert per_v_head not in shapes
+    # k k^T and q k^T.
+    assert shapes.count(per_kq_head) == 2
 
 
 # --- decode: k transpose -------------------------------------------------------
