@@ -186,9 +186,7 @@ def _run_case(name):
     races = bool(interpret_pallas_call.races.races_found)
     got = got.astype(np.float32)
     want = _reference(x, logits, w1, w2, s1, s2, real, valid)
-    rows = np.concatenate(
-        [np.arange(d * real, d * real + valid[d]) for d in range(D)]
-    )
+    rows = np.concatenate([np.arange(d * real, d * real + valid[d]) for d in range(D)])
     got_valid, want_valid = got[rows], want[rows]
     off = np.abs(got_valid - want_valid) > 2.0**-7 * np.abs(want_valid) + 1e-5
     return {
