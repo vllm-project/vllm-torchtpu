@@ -70,6 +70,7 @@ def inner_kernel(
     kv_window_u8 = window_u8.at[0]
     score_window_u8 = window_u8.at[1]
 
+    token_valid = [kv_slot_mapping_ref[global_idx + i] >= 0 for i in range(tile_n)]
     compute.gather_from_page_buffer(
         page_buffer=page_buffer_vmem,
         positions_ref=positions_ref,
@@ -83,6 +84,7 @@ def inner_kernel(
         field_rows=cfgs.field_rows,
         state_rows_per_token=cfgs.state_rows_per_token,
         overlap=cfgs.dims.overlap,
+        token_valid=token_valid,
         is_indexer=cfgs.dims.mode == config.Mode.CSA_INDEXER,
     )
 

@@ -101,7 +101,9 @@ def streamindex_topk_ref(
             q_abs_pos = (S_total - T_seq) + t_idx
 
             for s_idx in range(S_valid):
-                if s_idx * comp_ratio > q_abs_pos:
+                # Group s_idx is complete once its last token, at position
+                # (s_idx + 1) * comp_ratio - 1, is at or before the query.
+                if (s_idx + 1) * comp_ratio > q_abs_pos + 1:
                     continue
 
                 score = 0.0
@@ -504,26 +506,21 @@ def test_streamindex_topk_quantized():
                 lane_idx = s % 4
                 cache_kv[p, w_idx, lane_idx] = record
 
-    # Compute expected top-k using exact dequantized keys
-    seq_kv = np.concatenate([dequantized_kv[p] for p in range(num_pages)], axis=0)
-
-    naive_scores = np.full((T_seq, max(S_valid, k)), -np.inf, dtype=np.float32)
-
-    for t_idx in range(T_seq):
-        for s_idx in range(S_valid):
-            score = 0.0
-            for h in range(H_I):
-                h_kv = h // (H_I // H_KV)
-                inner = np.dot(q[t_idx, h], seq_kv[s_idx, h_kv])
-                score += max(0.0, inner) * weights[t_idx, h]
-            naive_scores[t_idx, s_idx] = score
-
-    expected_topk = np.argsort(-naive_scores, axis=-1)[:, :k]
-    for t_idx in range(T_seq):
-        for i in range(k):
-            idx = expected_topk[t_idx, i]
-            if naive_scores[t_idx, idx] == -np.inf:
-                expected_topk[t_idx, i] = -1
+    # Compute expected top-k using exact dequantized keys. The queries are the
+    # last T_seq tokens, so only the last one completes the final group.
+    expected_topk = streamindex_topk_ref(
+        q,
+        weights,
+        dequantized_kv,
+        [list(range(num_pages))],
+        [T_seq],
+        [S_seq],
+        [0, T_seq],
+        k,
+        comp_ratio,
+        H_I,
+        H_KV,
+    )
 
     # Pallas parameters
     actual_topk = streamindex_topk(
@@ -583,7 +580,7 @@ def _ee_pack_cache(keys):
 
 
 def _ee_inputs(q_lens, seq_lens, seed):
-    """One kernel invocation at ``compression_ratio=1``.
+    """One kernel invocation's inputs.
 
     Every sequence gets a shuffled, disjoint set of physical pages so a bug in
     the page walk cannot hide behind sequential layout.
@@ -616,7 +613,7 @@ def _ee_inputs(q_lens, seq_lens, seed):
     }
 
 
-def _ee_both_paths(q_lens, seq_lens, k, seed=11):
+def _ee_both_paths(q_lens, seq_lens, k, seed=11, compression_ratio=1):
     """Run the same batch with the flag off and on."""
     inputs = _ee_inputs(q_lens, seq_lens, seed)
 
@@ -625,7 +622,7 @@ def _ee_both_paths(q_lens, seq_lens, k, seed=11):
             streamindex_topk(
                 **{name: jnp.asarray(value) for name, value in inputs.items()},
                 k=k,
-                compression_ratio=1,
+                compression_ratio=compression_ratio,
                 num_kv_pages_per_block=_EE_BKV_P,
                 num_queries_per_block=_EE_BQ_SZ,
                 enable_early_exit=enable_early_exit,
@@ -635,16 +632,18 @@ def _ee_both_paths(q_lens, seq_lens, k, seed=11):
     return run(False), run(True)
 
 
-def _ee_visible_counts(q_lens, seq_lens):
+def _ee_visible_counts(q_lens, seq_lens, compression_ratio=1):
     """Causally visible compressed positions per query token.
 
-    At ``compression_ratio=1`` the queries are the tail of their sequence, so
-    query ``i`` of a sequence of length ``S`` sits at absolute position
-    ``S - q_len + i`` and sees every position up to and including it.
+    The queries are the tail of their sequence, so query ``i`` of a sequence of
+    length ``S`` sits at absolute position ``p = S - q_len + i`` and sees the
+    ``(p + 1) // compression_ratio`` groups complete at or before it.
     """
     counts = []
     for q_len, seq_len in zip(q_lens, seq_lens):
-        counts.extend(seq_len - q_len + i + 1 for i in range(q_len))
+        counts.extend(
+            (seq_len - q_len + i + 1) // compression_ratio for i in range(q_len)
+        )
     return counts
 
 
@@ -671,13 +670,14 @@ def _ee_assert_same_selection(early, baseline):
         )
 
 
-def _ee_assert_every_visible_position(actual, q_lens, seq_lens, k):
+def _ee_assert_every_visible_position(actual, q_lens, seq_lens, k, compression_ratio=1):
     """With the whole batch under k the answer is exact, not a ranking.
 
     Every visible position wins, so the expected index set is closed-form and
     the check does not depend on score arithmetic at all.
     """
-    for token, n_visible in enumerate(_ee_visible_counts(q_lens, seq_lens)):
+    counts = _ee_visible_counts(q_lens, seq_lens, compression_ratio)
+    for token, n_visible in enumerate(counts):
         assert n_visible <= k, "test setup: sequence is not short"
         row = actual[token]
         np.testing.assert_array_equal(
@@ -759,6 +759,27 @@ def test_streamindex_topk_early_exit_keeps_causal_mask():
     # positions 60..63, so they keep 61..64 positions respectively.
     kept = [int(np.count_nonzero(row >= 0)) for row in early]
     assert kept == [61, 62, 63, 64], kept
+
+
+def test_streamindex_topk_sees_only_complete_groups():
+    """A token never selects a group that a later token of its forward completes.
+
+    At ratio 4, sequence 0's queries sit at positions 62..65: 63 completes
+    group 15 (positions 60..63), so 62 must stop at 15 groups while 63 sees 16.
+    Sequence 1's queries sit at 0..3 and only 3 completes group 0, so the first
+    three rows are empty although the cache already holds that group. Both the
+    scoring path and the early-exit shortcut must agree.
+    """
+    q_lens, seq_lens, k = (4, 4), (66, 4), 256
+    baseline, early = _ee_both_paths(q_lens, seq_lens, k, compression_ratio=4)
+
+    counts = _ee_visible_counts(q_lens, seq_lens, compression_ratio=4)
+    assert counts == [15, 16, 16, 16, 0, 0, 0, 1], counts
+    for actual in (baseline, early):
+        _ee_assert_every_visible_position(
+            actual, q_lens, seq_lens, k, compression_ratio=4
+        )
+    _ee_assert_same_selection(early, baseline)
 
 
 def test_pallas_smem_oom_when_unclamped(monkeypatch):

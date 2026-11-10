@@ -166,7 +166,7 @@ class _Harness:
         runner = MoERunner(
             layer_name=name,
             moe_config=mcfg,
-            router=SimpleNamespace(),
+            router=SimpleNamespace(prepare_monolithic_logits=lambda logits: logits),
             routed_experts=_RoutedExperts(mcfg, qm, scoring_func),
             gate=_Gate(),
             shared_experts=_SharedMLP() if shared else None,

@@ -60,7 +60,12 @@ class DeepseekV4MoE(nn.Module):
 
         self.gate.e_score_correction_bias = None
         self.gate.tid2eid = None
-        is_hash_moe = extract_layer_index(prefix) < config.num_hash_layers
+        # DSpark draft layers sit past the target's mlp_layer_types.
+        layer_index = extract_layer_index(prefix)
+        is_hash_moe = (
+            layer_index < len(config.mlp_layer_types)
+            and config.mlp_layer_types[layer_index] == "hash_moe"
+        )
         self.hash_indices_dtype = torch.int32
         if is_hash_moe:
             self.gate.tid2eid = nn.Parameter(

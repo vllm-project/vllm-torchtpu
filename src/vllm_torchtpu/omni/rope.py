@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""TPU-friendly interleaved rotary embedding for vLLM-Omni Wan models.
+"""TPU-friendly rotary embeddings for vLLM-Omni Wan and LTX-2 models.
 
 ``RotaryEmbeddingWan.forward_native`` rotates (even, odd) pairs through
 ``x.unflatten(-1, (-1, 2)).unbind(-1)`` and ``torch.stack(..., dim=-1)``.
@@ -84,6 +84,59 @@ def rotary_embedding_wan_forward(
         cos = cos.unsqueeze(0).unsqueeze(2)
         sin = sin.unsqueeze(0).unsqueeze(2)
     return apply_rotary_pair_swap(x, cos, sin)
+
+
+@functools.cache
+def _first_half_lanes(width: int, head_dim: int, device: torch.device) -> torch.Tensor:
+    return (torch.arange(width) % head_dim < head_dim // 2).to(device)
+
+
+def split_rope_natural_tables(
+    cos: torch.Tensor, sin: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """LTX-2 split-RoPE tables ``(B, H, T, D/2) -> (B, 1, T, H * D)``.
+
+    Lays the tables out like q/k (head-major channels): entries ``j`` and
+    ``j + D/2`` of a head share half-dim frequency ``j``, and the sine table
+    carries the sign of each half (``-sin`` then ``sin``). T stays at dim 2,
+    where LTX-2's sequence-parallel plan splits the tables.
+    """
+    b, heads, tokens, half = cos.shape
+
+    def natural(first: torch.Tensor, second: torch.Tensor) -> torch.Tensor:
+        return (
+            torch.cat([first, second], dim=-1)
+            .transpose(1, 2)
+            .reshape(b, 1, tokens, heads * 2 * half)
+        )
+
+    return natural(cos, cos), natural(-sin, sin)
+
+
+def apply_split_rotary_half_swap(
+    x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, head_dim: int
+) -> torch.Tensor:
+    """Split RoPE of ``x`` (B, T, H * D) with ``split_rope_natural_tables`` tables.
+
+    Rolling the channels by -D/2 and +D/2 and selecting per lane puts each
+    head's other half under every entry, so with the signed sine table
+    ``out[j] = x[j] cos[j] - x[j + D/2] sin[j]`` and
+    ``out[j + D/2] = x[j + D/2] cos[j] + x[j] sin[j]`` stay elementwise on
+    q/k's own (B, T, H * D) layout, with no per-head reshape. As in
+    vLLM-Omni's ``apply_split_rotary_emb``, the products and the sum are
+    taken in the promoted dtype of ``x`` and the tables (``addcmul_``); the
+    result is rounded to ``x.dtype`` once, where vLLM-Omni's attention
+    processor casts it.
+    """
+    half = head_dim // 2
+    swapped = torch.where(
+        _first_half_lanes(x.shape[-1], head_dim, x.device),
+        x.roll(-half, dims=-1),
+        x.roll(half, dims=-1),
+    )
+    out = x * cos.squeeze(1)
+    out.addcmul_(swapped, sin.squeeze(1))
+    return out.to(x.dtype)
 
 
 @run_once

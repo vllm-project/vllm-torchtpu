@@ -126,3 +126,23 @@ def test_omni_runner_seed_configuration() -> None:
     r_extra = manager.get_or_create(("model-extra-seed", None, {"seed": 100}))
     assert r_extra.omni.kwargs["seed"] == 100
     manager.close()
+
+
+@pytest.mark.parametrize(
+    "module_name",
+    [
+        "vllm_omni.diffusion.diffusion_engine",
+        "vllm_omni.entrypoints.openai.api_server",
+        "vllm_omni.entrypoints.cli.main",
+    ],
+)
+def test_vllm_omni_cold_import_subprocesses(module_name: str) -> None:
+    import subprocess
+
+    result = subprocess.run(
+        [sys.executable, "-c", f"import {module_name}"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr

@@ -26,11 +26,12 @@ making the consumer consistent rather than by exempting the layer:
                    it that view for the duration of the upstream call; the
                    layer is cleared immediately after and never runs a forward
                    pass, so nothing else observes the layout.
-  in_proj_qkvz     still exempt. `fused_qkvz_projection_pcp_gdn` is a Pallas
-                   kernel whose block specs encode `[n_out, n_in]`; teaching it
-                   (k, n) means reworking index maps and re-tuning block sizes
-                   under a VMEM budget, so the layer keeps the old layout for
-                   now. This is the one remaining marker.
+  in_proj_qkvz     still exempt by default. `fused_qkvz_projection_pcp_gdn`
+                   is a Pallas kernel whose block specs encode `[n_out, n_in]`;
+                   teaching it (k, n) means reworking index maps and re-tuning
+                   block sizes under a VMEM budget, so the layer keeps the old
+                   layout. TPU_GDN_QKVZ_KERNEL_LAYOUT flips it like the rest
+                   when PCP is off. This is the one remaining marker.
 """
 
 import torch

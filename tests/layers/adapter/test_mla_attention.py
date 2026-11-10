@@ -718,6 +718,7 @@ def test_mla_requires_declared_g_proj():
 def test_mla_weight_layout_is_restored_on_error(layout):
     attention = VllmMLAAttention.__new__(VllmMLAAttention)
     torch.nn.Module.__init__(attention)
+    attention.dcp_q_replicate = False
     attention.kv_b_proj = torch.nn.Module()
     weight = torch.arange(6, dtype=torch.float32).reshape(2, 3)
     parameter_name = "weight_packed" if layout == "packed" else "weight"
@@ -742,6 +743,80 @@ def test_mla_weight_layout_is_restored_on_error(layout):
     ):
         attention.process_weights_after_loading(torch.float32)
     torch.testing.assert_close(getattr(attention.kv_b_proj, parameter_name), weight)
+
+
+@pytest.mark.parametrize("with_scale", [False, True])
+def test_qrep_gather_replaces_the_parameter_upstream_registers(with_scale):
+    """Under qrep, upstream MLAAttention.process_weights_after_loading leaves
+    W_UK_T_dcp_qrep registered as a Parameter; the TPU gather must replace it
+    with one, since a module refuses a plain tensor under that name."""
+    attention = VllmMLAAttention.__new__(VllmMLAAttention)
+    torch.nn.Module.__init__(attention)
+    attention.dcp_q_replicate = True
+    w_uk_t = torch.arange(24, dtype=torch.float32).reshape(2, 3, 4)
+    attention.W_UK_T = torch.nn.Parameter(w_uk_t, requires_grad=False)
+    if with_scale:
+        attention.W_UK_T_scale = torch.nn.Parameter(
+            torch.ones(2, 1, 4), requires_grad=False
+        )
+    # What upstream's replace_parameter leaves behind.
+    attention.W_UK_T_dcp_qrep = torch.nn.Parameter(
+        torch.zeros(4, 3, 4), requires_grad=False
+    )
+    group = SimpleNamespace(
+        world_size=2, all_gather=lambda t, dim: torch.cat([t, t + 100], dim=dim)
+    )
+    with patch(
+        "vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op.get_dcp_group",
+        return_value=group,
+    ):
+        attention._gather_dcp_qrep_weights()
+    assert isinstance(attention.W_UK_T_dcp_qrep, torch.nn.Parameter)
+    torch.testing.assert_close(
+        attention.W_UK_T_dcp_qrep, torch.cat([w_uk_t, w_uk_t + 100])
+    )
+    if with_scale:
+        assert isinstance(attention.W_UK_T_dcp_qrep_scale, torch.nn.Parameter)
+        assert attention.W_UK_T_dcp_qrep_scale.shape == (4, 1, 4)
+    else:
+        assert attention.W_UK_T_dcp_qrep_scale is None
+
+
+def test_no_qrep_leaves_no_replicated_weights():
+    attention = VllmMLAAttention.__new__(VllmMLAAttention)
+    torch.nn.Module.__init__(attention)
+    attention.dcp_q_replicate = False
+    attention._gather_dcp_qrep_weights()
+    assert attention.W_UK_T_dcp_qrep is None
+    assert attention.W_UK_T_dcp_qrep_scale is None
+
+
+def test_upstream_weight_processing_runs_without_qrep():
+    """Upstream would gather W_UK_T across DCP as well; it must see the flag
+    off, and the flag must come back whether or not upstream raises."""
+    attention = VllmMLAAttention.__new__(VllmMLAAttention)
+    torch.nn.Module.__init__(attention)
+    attention.kv_b_proj = torch.nn.Module()
+    attention.kv_b_proj.register_parameter(
+        "weight", torch.nn.Parameter(torch.zeros(2, 3))
+    )
+    attention.dcp_q_replicate = True
+    seen = []
+
+    def upstream_process(act_dtype):
+        seen.append(attention.dcp_q_replicate)
+        raise RuntimeError("stop after upstream")
+
+    with (
+        patch(
+            "vllm.model_executor.layers.attention.mla_attention.MLAAttention.process_weights_after_loading",
+            side_effect=upstream_process,
+        ),
+        pytest.raises(RuntimeError, match="stop after upstream"),
+    ):
+        attention.process_weights_after_loading(torch.float32)
+    assert seen == [False]
+    assert attention.dcp_q_replicate is True
 
 
 def test_mla_flipped_projection_requires_weight():
@@ -823,10 +898,8 @@ def test_qrep_local_view_matches_the_head_all_gather_order(monkeypatch):
         )
 
 
-def test_mla_wrapper_qrep_reshapes_group_heads_and_passes_both_views():
-    """With query replication the projection returns the group's heads. Viewing
-    them as `num_heads` would fold the extra heads into the token axis, which is
-    the `dcp_size * num_tokens` shape mismatch qrep used to crash on."""
+def _run_qrep_wrapper(rank_in_group, is_sparse=True, run_forward=True):
+    """Build (and optionally run) the MLA wrapper under query replication."""
     group_size, local_heads, num_tokens = 4, 2, 3
     wrapper = VllmMultiHeadLatentAttentionWrapper.__new__(
         VllmMultiHeadLatentAttentionWrapper
@@ -842,7 +915,7 @@ def test_mla_wrapper_qrep_reshapes_group_heads_and_passes_both_views():
     wrapper.v_head_dim = 2
     wrapper.dcp_q_replicate = True
     wrapper.dcp_group_size = group_size
-    wrapper.is_sparse = True
+    wrapper.is_sparse = is_sparse
     wrapper.indexer = None
     wrapper.skip_topk = True
     wrapper.topk_indices_buffer = torch.zeros((num_tokens, 8), dtype=torch.int32)
@@ -854,7 +927,7 @@ def test_mla_wrapper_qrep_reshapes_group_heads_and_passes_both_views():
     q_values = torch.arange(num_tokens * group_width, dtype=torch.bfloat16).view(
         num_tokens, group_width
     )
-    wrapper.q_proj = _FakeQProj(group_size, rank_in_group=2, out=q_values)
+    wrapper.q_proj = _FakeQProj(group_size, rank_in_group=rank_in_group, out=q_values)
     wrapper.kv_a_layernorm = lambda value: value
     wrapper.rotary_emb = None
     wrapper.g_proj = None
@@ -864,12 +937,22 @@ def test_mla_wrapper_qrep_reshapes_group_heads_and_passes_both_views():
     )
     wrapper.o_proj = lambda value: (value, None)
 
-    VllmMultiHeadLatentAttentionWrapper.forward(
-        wrapper,
-        positions=torch.arange(num_tokens),
-        hidden_states=torch.ones((num_tokens, 8), dtype=torch.bfloat16),
-    )
+    if run_forward:
+        VllmMultiHeadLatentAttentionWrapper.forward(
+            wrapper,
+            positions=torch.arange(num_tokens),
+            hidden_states=torch.ones((num_tokens, 8), dtype=torch.bfloat16),
+        )
 
+    return wrapper
+
+
+def test_mla_wrapper_qrep_reshapes_group_heads_and_passes_both_views():
+    """With query replication the projection returns the group's heads. Viewing
+    them as `num_heads` would fold the extra heads into the token axis, which is
+    the `dcp_size * num_tokens` shape mismatch qrep used to crash on."""
+    local_heads, group_size, num_tokens = 2, 4, 3
+    wrapper = _run_qrep_wrapper(rank_in_group=2)
     (q_nope, q_pe) = wrapper.mla_attn.call_args.args[0]
     rep_nope, rep_pe = wrapper.mla_attn.call_args.kwargs["q_dcp_replicated"]
     # The token axis survives; only the head axis carries the group.
@@ -884,10 +967,78 @@ def test_mla_wrapper_qrep_reshapes_group_heads_and_passes_both_views():
         local_heads * group_size,
         wrapper.qk_rope_head_dim,
     )
-    # And the local view is this rank's block of the replicated tensor.
+    # The sparse DCP path reads only the replicated heads, so the per-rank
+    # tensor is dead: it is the group's first `local_heads` on every rank.
+    torch.testing.assert_close(q_nope, rep_nope[:, :local_heads])
+    torch.testing.assert_close(q_pe, rep_pe[:, :local_heads])
+
+
+def test_mla_wrapper_qrep_dead_shard_is_rank_independent():
+    """A rank-dependent slice of the dead shard bakes the rank into the traced
+    graph, so every rank traces a different program and precompile peer replay
+    refuses every peer artifact."""
+    from vllm_torchtpu.compilation.tpu_compiler import _graph_fingerprint
+
+    passed = []
+    for rank in (0, 2):
+        wrapper = _run_qrep_wrapper(rank_in_group=rank)
+        passed.append(wrapper.mla_attn.call_args.args[0])
+    for got, want in zip(passed[1], passed[0]):
+        torch.testing.assert_close(got, want)
+
+    def _trace_fingerprint(rank: int, *, is_sparse: bool) -> str | None:
+        torch._dynamo.reset()
+        wrapper = _run_qrep_wrapper(
+            rank_in_group=rank, is_sparse=is_sparse, run_forward=False
+        )
+        if is_sparse:
+            wrapper.mla_attn = lambda _q, kv_c, k_pe, **kw: (
+                kw["q_dcp_replicated"][0].sum(dim=(-1, -2), keepdim=False).unsqueeze(-1)
+                + kv_c[:, :1]
+                + k_pe[:, 0, :1]
+            )
+        else:
+            wrapper.mla_attn = lambda q, kv_c, k_pe, **_kw: (
+                q[0].sum(dim=(-1, -2), keepdim=False).unsqueeze(-1)
+                + kv_c[:, :1]
+                + k_pe[:, 0, :1]
+            )
+        captured = []
+
+        def _capture(gm, _example_inputs):
+            captured.append(_graph_fingerprint(gm))
+            return gm.forward
+
+        compiled = torch.compile(wrapper.forward, backend=_capture, fullgraph=True)
+        compiled(
+            positions=torch.arange(3),
+            hidden_states=torch.ones((3, 8), dtype=torch.bfloat16),
+        )
+        assert len(captured) == 1 and captured[0] is not None
+        return captured[0]
+
+    assert _trace_fingerprint(0, is_sparse=True) == _trace_fingerprint(
+        2, is_sparse=True
+    )
+    # Negative control: when the per-rank slice is live (dense layer), ranks 0
+    # and 2 bake different slice offsets into the FX graph.
+    assert _trace_fingerprint(0, is_sparse=False) != _trace_fingerprint(
+        2, is_sparse=False
+    )
+
+
+def test_mla_wrapper_qrep_dense_layer_keeps_its_rank_block():
+    """Without the sparse DCP path nothing replaces the per-rank q, so it stays
+    this rank's block of the group's heads."""
+    local_heads = 2
+    wrapper = _run_qrep_wrapper(rank_in_group=2, is_sparse=False)
+    (q_nope, _) = wrapper.mla_attn.call_args.args[0]
+    assert wrapper.mla_attn.call_args.kwargs["q_dcp_replicated"] is None
+    full = wrapper.q_proj._out.view(q_nope.shape[0], -1, wrapper.qk_head_dim)
     start = 2 * local_heads
-    torch.testing.assert_close(q_nope, rep_nope[:, start : start + local_heads])
-    torch.testing.assert_close(q_pe, rep_pe[:, start : start + local_heads])
+    torch.testing.assert_close(
+        q_nope, full[:, start : start + local_heads, : wrapper.qk_nope_head_dim]
+    )
 
 
 def test_mla_forward_qrep_skips_the_gather_and_absorbs_group_heads(monkeypatch):
@@ -1554,3 +1705,44 @@ def test_indexer_kv_layout_and_op_resolution_raiden_glm_admission(monkeypatch, c
     )
     with pytest.raises(ValueError, match="Raiden GLM admission"):
         mla_attention_op._resolve_indexer_kv_cache_mode(cache_has, k_packed, mode="sal")
+
+
+def test_sparse_page_size_packs_rope_by_default_on_sparsecore(monkeypatch):
+    """SparseCore sparse MLA packs the 64B fp8 RoPE cache to 8 tokens/row
+    (576 B/token total) by default; TensorCore keeps the 128B padded RoPE page
+    (640 B/token total), and TPU_SPARSE_MLA_PACKED_ROPE is removed."""
+    assert not hasattr(envs, "TPU_SPARSE_MLA_PACKED_ROPE")
+    block_size, fp8 = 256, torch.float8_e4m3fn
+    padded = PallasMLAttentionBackend.get_kv_cache_page_size_bytes(
+        block_size, 1, 576, fp8
+    )
+    assert padded == 640 * block_size
+
+    nope, rope = PallasMLAttentionBackend.get_sparse_kv_cache_specs(
+        3, block_size, 576, fp8
+    )
+    assert nope.shape == (3, block_size, 128)
+    assert rope.shape == (3, block_size // 8, 128)
+    assert rope.token_bytes == 64
+    assert rope.tokens_per_row == 8
+    assert (
+        PallasMLAttentionBackend.get_sparse_kv_cache_page_size_bytes(
+            block_size, 576, fp8
+        )
+        == 576 * block_size
+        == padded - 64 * block_size
+    )
+
+    monkeypatch.setenv("TPU_SPARSE_MLA_NOPE_LAYOUT", "tensorcore")
+    monkeypatch.setenv("TPU_SPARSE_MLA_ROPE_LAYOUT", "tensorcore")
+    _, rope_tc = PallasMLAttentionBackend.get_sparse_kv_cache_specs(
+        3, block_size, 576, fp8
+    )
+    assert rope_tc.shape == (3, block_size // 4, 4, 128)
+    assert rope_tc.token_bytes == 128
+    assert (
+        PallasMLAttentionBackend.get_sparse_kv_cache_page_size_bytes(
+            block_size, 576, fp8
+        )
+        == padded
+    )

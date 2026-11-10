@@ -16,7 +16,10 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
+import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -51,18 +54,25 @@ def _parse_int_list(raw: str | Sequence[int] | None) -> tuple[int, ...] | None:
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    """Builds CLI argument parser aligned with `EngineArgs` plus `--output-dir`."""
+    """Builds the `vllm serve` argument parser plus the export options.
+
+    The exporter takes `vllm serve`'s command line 1:1, model tag included: its
+    engine arguments shape the artifact, and its frontend arguments, which do not,
+    are reported and ignored (see `ignored_frontend_args`).
+    """
     try:
-        from vllm.engine.arg_utils import EngineArgs
+        from vllm.entrypoints.launchers.cli_args import make_arg_parser
         from vllm.utils.argparse_utils import FlexibleArgumentParser
 
-        flexible_parser = FlexibleArgumentParser(
-            prog="python -m vllm_torchtpu.experimental.export",
-            description=(
-                "Export a vLLM model to a standardized StableHLO serving directory."
-            ),
+        parser: argparse.ArgumentParser = make_arg_parser(
+            FlexibleArgumentParser(
+                prog="python -m vllm_torchtpu.experimental.export",
+                description=(
+                    "Export a vLLM model to a standardized StableHLO serving "
+                    "directory. Takes the `vllm serve` command line."
+                ),
+            )
         )
-        parser: argparse.ArgumentParser = EngineArgs.add_cli_args(flexible_parser)
     except Exception:
         parser = argparse.ArgumentParser(
             prog="python -m vllm_torchtpu.experimental.export",
@@ -145,7 +155,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--target-tpu",
         type=str,
         default=None,
-        help="Target TPU generation label ('v6e', 'v5p'). Auto-detected if omitted.",
+        help=(
+            "Target TPU generation label ('v6e', '7x'). Detected from "
+            "TPU_ACCELERATOR_TYPE or GCE metadata if omitted; the export fails "
+            "when it cannot be detected."
+        ),
     )
     export_group.add_argument(
         "--token-buckets",
@@ -167,6 +181,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "Override number of paged KV cache blocks per layer. Defaults to the "
             "blocks that fit in --kv-cache-memory-bytes, or else in HBM at "
             "--gpu-memory-utilization."
+        ),
+    )
+    export_group.add_argument(
+        "--max-verify-tokens",
+        type=int,
+        default=0,
+        help=(
+            "The draft tokens a step can verify, such as tokens a grammar forces, "
+            "when more than --speculative-config's num_speculative_tokens (or with "
+            "none): a recurrent model keeps a state checkpoint per verify token, at "
+            "the cost of that much more recurrent state per sequence. Default 0."
+        ),
+    )
+    export_group.add_argument(
+        "--debug-taps",
+        default="",
+        help=(
+            "Comma-separated glob patterns of module names (e.g. "
+            "'model.layers.3.self_attn,mtp.fc'; MTP draft modules start with "
+            "'mtp.'). Also exports forward and draft for the smallest token "
+            "bucket with those modules' outputs as extra results, under "
+            "assets.extra/debug/, for comparing intermediates against vLLM. The "
+            "serving artifact is unchanged."
         ),
     )
     export_group.add_argument(
@@ -193,13 +230,183 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
+# Destinations of the export options and internal flags, which are not
+# `vllm serve` arguments.
+_EXPORT_DESTS = frozenset(
+    {
+        "output_dir",
+        "target_tpu",
+        "token_buckets",
+        "req_buckets",
+        "num_blocks",
+        "export_mode",
+        "export_worker",
+        "jax_coordinator",
+        "checkpoint_data_dir",
+    }
+)
+
+
+def ignored_frontend_args(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> list[str]:
+    """The `vllm serve` frontend options set in `args`, which the export ignores.
+
+    Engine arguments (the fields of vLLM's `AsyncEngineArgs`) shape the artifact;
+    everything else `vllm serve` takes configures its HTTP frontend.
+    """
+    try:
+        from vllm.engine.arg_utils import AsyncEngineArgs
+    except Exception:
+        return []
+    engine_dests = {f.name for f in dataclasses.fields(AsyncEngineArgs)}
+    ignored = []
+    for action in parser._actions:
+        dest = action.dest
+        if (
+            dest in engine_dests
+            or dest in _EXPORT_DESTS
+            or dest in ("help", "model_tag")
+            or not action.option_strings
+        ):
+            continue
+        if getattr(args, dest, action.default) != action.default:
+            # The positive long form, not `--no-...` of a boolean option.
+            names = [
+                o
+                for o in action.option_strings
+                if o.startswith("--") and not o.startswith("--no-")
+            ]
+            ignored.append((names or action.option_strings)[0])
+    return ignored
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """Parses CLI arguments."""
     parser = build_arg_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
+    # `vllm serve MODEL`: the positional model tag names the model, as in vLLM.
+    if getattr(args, "model_tag", None):
+        args.model = args.model_tag
+    if not getattr(args, "export_worker", False):
+        ignored = ignored_frontend_args(parser, args)
+        if ignored:
+            sys.stderr.write(
+                "[export] Ignoring vllm serve frontend options, which do not shape "
+                f"the artifact: {', '.join(ignored)}\n"
+            )
     # Force dummy weight loading so AOT export never reads multi-GB safetensors data.
     args.load_format = "dummy"
     return args
+
+
+# A repository in the HuggingFace hub cache: `.../models--{org}--{name}/snapshots/...`.
+_HF_CACHE_REPO = re.compile(r"(?:^|/)models--([^/]+?)--([^/]+)(?:/|$)")
+
+
+def artifact_model_name(model: str | None, served_model_name: Any = None) -> str | None:
+    """The model id the artifact records as `metadata.json`'s `model_name`.
+
+    `model_name` names the model, not where its checkpoint was read from: two exports
+    of one model must record the same value, since the KV transfer fingerprint
+    covers it. It is the first `--served-model-name` when given; else `model` when
+    that is a hub id; else, for a checkpoint location, the repository of a hub cache
+    path or the location's last component.
+    """
+    if served_model_name:
+        if isinstance(served_model_name, (list, tuple)):
+            return str(served_model_name[0])
+        return str(served_model_name)
+    if not model or ("://" not in model and not os.path.exists(model)):
+        return model
+    path = model.replace(os.sep, "/").rstrip("/")
+    if "://" not in model:
+        path = os.path.abspath(model).replace(os.sep, "/")
+    repo = _HF_CACHE_REPO.search(path)
+    if repo:
+        return f"{repo.group(1)}/{repo.group(2)}"
+    name = path.rsplit("/", 1)[-1]
+    sys.stderr.write(
+        f"[export] model_name {name!r} is the last component of {model}; pass "
+        "--served-model-name <model id> to record the model id instead\n"
+    )
+    return name
+
+
+# Speculative methods the artifact can declare, with the fields each takes: ngram
+# drafts on the host from the sequence itself; mtp drafts with the model's MTP
+# layer (the adapter's `mtp_draft()`), which the export lowers as the drafter
+# `draft` / `draft_bucket{B}`.
+_SPECULATIVE_FIELDS = {
+    "ngram": frozenset(
+        {"method", "num_speculative_tokens", "prompt_lookup_max", "prompt_lookup_min"}
+    ),
+    "mtp": frozenset({"method", "num_speculative_tokens"}),
+}
+SPECULATIVE_METHODS = tuple(_SPECULATIVE_FIELDS)
+
+
+def export_speculative_config(raw: Any) -> dict[str, Any] | None:
+    """The `serving_config.speculative_config` for `--speculative-config`.
+
+    Keeps vLLM's field names. Rejects methods whose drafts the export does not
+    lower (EAGLE, a draft model) and fields the runtime would not honor.
+    """
+    if raw is None:
+        return None
+    cfg = json.loads(raw) if isinstance(raw, str) else dict(raw)
+    method = cfg.get("method")
+    if method not in _SPECULATIVE_FIELDS:
+        raise ValueError(
+            f"--speculative-config method {method!r} is not supported by the "
+            f"exporter; supported: {', '.join(SPECULATIVE_METHODS)}"
+        )
+    fields = _SPECULATIVE_FIELDS[method]
+    unknown = sorted(set(cfg) - fields)
+    if unknown:
+        raise ValueError(
+            f"--speculative-config fields {unknown} are not supported for method "
+            f"{method!r}; supported: {sorted(fields)}"
+        )
+
+    def positive(name: str) -> int:
+        value = cfg.get(name)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ValueError(
+                f"--speculative-config {name} must be a positive integer, got {value!r}"
+            )
+        return value
+
+    out = {
+        "method": method,
+        "num_speculative_tokens": positive("num_speculative_tokens"),
+    }
+    if method == "ngram":
+        lookup_max = positive("prompt_lookup_max")
+        cfg.setdefault("prompt_lookup_min", lookup_max)
+        out["prompt_lookup_max"] = lookup_max
+        out["prompt_lookup_min"] = positive("prompt_lookup_min")
+    return out
+
+
+def verify_window_speculative_config(
+    max_verify_tokens: int, speculative_config: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """The speculative config vLLM loads a model with for `--max-verify-tokens`.
+
+    vLLM keeps a recurrent layer's checkpoints per speculative token, so it loads
+    `speculative_config` (the artifact's, which keeps its own draft count) with
+    `max_verify_tokens` of them. Without one, ngram adds no drafter to the model,
+    and the artifact declares no speculative decoding.
+    """
+    if speculative_config is not None:
+        return {**speculative_config, "num_speculative_tokens": max_verify_tokens}
+    return {
+        "method": "ngram",
+        "num_speculative_tokens": max_verify_tokens,
+        "prompt_lookup_max": 1,
+        "prompt_lookup_min": 1,
+    }
 
 
 def create_vllm_config_from_args(args: argparse.Namespace) -> Any:
@@ -216,7 +423,28 @@ def run_export_from_args(
     model: Any = None,
 ) -> api.TextOnlyLLMExportConfig:
     """Executes the AOT model export given parsed CLI arguments."""
+    speculative_config = export_speculative_config(
+        getattr(args, "speculative_config", None)
+    )
+    max_verify_tokens = int(getattr(args, "max_verify_tokens", 0) or 0)
+    if max_verify_tokens < 0:
+        raise ValueError(f"--max-verify-tokens must be >= 0, got {max_verify_tokens}")
+    drafted = 0
+    if speculative_config is not None:
+        drafted = int(speculative_config["num_speculative_tokens"])
+    if max_verify_tokens and max_verify_tokens <= drafted:
+        raise ValueError(
+            f"--max-verify-tokens ({max_verify_tokens}) must exceed "
+            f"num_speculative_tokens ({drafted}), which the window already covers"
+        )
+    # vLLM loads the model with the speculative config, so recurrent layers keep
+    # a checkpoint per draft token, and builds the MTP draft for `mtp`. ngram
+    # drafts on the host and exports nothing more.
     if vllm_config is None and model is None:
+        if max_verify_tokens:
+            args.speculative_config = verify_window_speculative_config(
+                max_verify_tokens, speculative_config
+            )
         vllm_config = create_vllm_config_from_args(args)
     if vllm_config is not None:
         universal_adapter.check_supported_parallelism(vllm_config.parallel_config)
@@ -241,18 +469,24 @@ def run_export_from_args(
 
     export_cfg = universal_adapter.build_export_config_from_vllm(
         vllm_config,
-        model_name=getattr(args, "model", None),
+        model_name=artifact_model_name(
+            getattr(args, "model", None), getattr(args, "served_model_name", None)
+        ),
         hf_checkpoint_dir=getattr(args, "model", None),
         target_tpu=target_tpu,
         token_buckets=token_buckets,
         req_buckets=req_buckets,
+        max_verify_tokens=max_verify_tokens,
+        num_speculative_tokens=drafted,
     )
     num_blocks_override = getattr(args, "num_blocks", None)
     if num_blocks_override is not None:
-        import dataclasses
-
         export_cfg = dataclasses.replace(
             export_cfg, num_blocks=int(num_blocks_override)
+        )
+    if speculative_config is not None:
+        export_cfg = dataclasses.replace(
+            export_cfg, speculative_config=speculative_config
         )
 
     if isinstance(model, api.ExportableTextOnlyLLM):
@@ -279,7 +513,8 @@ def run_export_from_args(
         if export_mode == "all"
         else None
     )
-    exporter.export(exportable, args.output_dir)
+    debug_taps = [p for p in (getattr(args, "debug_taps", "") or "").split(",") if p]
+    exporter.export(exportable, args.output_dir, debug_taps=debug_taps)
     if weights is not None:
         checkpoint.save_model_checkpoint(
             weights,
@@ -338,9 +573,9 @@ def _launch_workers(
         )
         shutil.rmtree(data_dir, ignore_errors=True)
         worker_flags += [checkpoint.DATA_DIR_FLAG, data_dir]
-    rank_root = tempfile.mkdtemp(
-        prefix=".export_ranks_", dir=os.path.dirname(os.path.abspath(output_dir))
-    )
+    parent_dir = os.path.dirname(os.path.abspath(output_dir))
+    os.makedirs(parent_dir, exist_ok=True)
+    rank_root = tempfile.mkdtemp(prefix=".export_ranks_", dir=parent_dir)
     procs = []
     try:
         for rank in range(tp_size):
