@@ -314,6 +314,10 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # K3 custom-op registration, sharding, and Attention Residual bridges.
     "vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
     "vllm_torchtpu/models/vllm/kimi_k3/layers.py",
+    # Registers the pallas::*_fused_max jax ops (behind a torch custom-op
+    # boundary) that get_top_tokens runs inside the AOT-cached fused MTP
+    # draft loop (spec_decode/mtp_fused_loop.py).
+    "vllm_torchtpu/runner/greedy_top_tokens.py",
 )
 
 # vLLM-Omni diffusion code, dropped from the hashed set above. Diffusion
