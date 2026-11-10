@@ -116,7 +116,8 @@ def write_kv(
         _quantize(value, kv_cache.dtype, v_scale),
         kv_cache.shape[2:],
     )
-    if num_tokens < _RUN_WRITE_MIN_TOKENS:
+    # Off TPU (CPU tests) the scatter is the reference the run kernel matches.
+    if num_tokens < _RUN_WRITE_MIN_TOKENS or jax.default_backend() != "tpu":
         return kv_cache.at[page, pos % page_size].set(rows, mode="drop")
     from vllm_torchtpu.models.minimax_m3.kernels.msa_write import max_write_runs
 
