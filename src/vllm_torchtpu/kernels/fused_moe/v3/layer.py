@@ -370,6 +370,22 @@ def tables_blocks_per_step_for(tokens_per_shard, top_k, num_shards, config):
     return max(c for c in counts if padded[c] == least)
 
 
+def _sorted_gather_index(token_of_row, done, *, n_sorted, num_gathered_rows):
+    """Unbiases 1-based `token_of_row` entries (`> 0`) and spreads unwritten
+    zero slots across distinct rows (`row % num_gathered_rows`) so SparseCore
+    reads do not serialize on row zero."""
+    biased_index = jnp.pad(
+        token_of_row.astype(jnp.int32), (0, n_sorted - token_of_row.shape[0])
+    )
+    biased_index = jnp.where(done[0, 0] > 0, biased_index, 0)
+    row = jnp.arange(n_sorted, dtype=jnp.int32)
+    return jnp.where(
+        biased_index > 0,
+        biased_index - 1,
+        row % num_gathered_rows,
+    )
+
+
 def _pallas_step(
     x,
     logits,
@@ -521,6 +537,8 @@ def _pallas_step(
         message_tokens=message_tokens,
         chunk_max=config.scatter_chunk_pairs,
         ring=config.scatter_ring,
+        valid_rows=routed_rows_per_shard,
+        token_bias=1 if sorted_rows else 0,
     )
     token_scales = token_scales.reshape(n_scales, scale_rows, LANES)
     w1_bias, w2_bias = _shard_biases(
@@ -540,9 +558,6 @@ def _pallas_step(
         n_sorted = align_up(
             token_of_row.shape[0], gather.gather_rows_multiple(config.gather_block_rows)
         )
-        index = jnp.pad(
-            token_of_row.astype(jnp.int32), (0, n_sorted - token_of_row.shape[0])
-        )
         landing = pltpu.with_memory_space_constraint(
             gathered_rows, pltpu.MemorySpace.HBM
         )
@@ -550,38 +565,19 @@ def _pallas_step(
             landing,
             send_sem,
             receive_sems,
-            index[:LANES],
+            token_of_row,
             num_shards=num_shards,
             mesh_axes=mesh_axes,
             rows_per_shard=gathered_rows.shape[0] // num_shards,
             shard_index=shard_index,
         )
         landed, done = lax.optimization_barrier((gathered_rows, done))
-        index = jnp.where(done[0, 0] > 0, index, 0)
-        # A padding row (the tail of an (expert, shard) run, the tail slack,
-        # the alignment) carries token zero in the table; thousands of
-        # reads of one row serialize in the sparse cores, so every such row
-        # reads a row of its own. The
-        # live rows are the first push_rows of each run, the run starting
-        # run_start blocks into its expert's rows, which start at
-        # expert_base: +1 at each run's start, -1 at its end, summed along
-        # the rows, a row is live where the running sum is positive.
-        run_start, push_rows = ffn_tables[0], ffn_tables[5]
-        starts = (
-            expert_base.astype(jnp.int32)[:, None]
-            + run_start.astype(jnp.int32) * ROW_BLOCK
-        ).reshape(-1)
-        ends = starts + push_rows.reshape(-1).astype(jnp.int32)
-        edges = (
-            jnp.zeros((n_sorted + 1,), jnp.int32)
-            .at[jnp.minimum(starts, n_sorted)]
-            .add(1)
-            .at[jnp.minimum(ends, n_sorted)]
-            .add(-1)
+        index = _sorted_gather_index(
+            token_of_row,
+            done,
+            n_sorted=n_sorted,
+            num_gathered_rows=gathered_rows.shape[0],
         )
-        live = jnp.cumsum(edges)[:n_sorted] > 0
-        row = jnp.arange(n_sorted, dtype=jnp.int32)
-        index = jnp.where(live, index, row % gathered_rows.shape[0])
         # The table is sized to its bound (every shard's pairs); the FFN
         # kernel reads only the used prefix, so only that is sorted.
         used = jnp.max(expert_base.astype(jnp.int32) + expert_rows.astype(jnp.int32))

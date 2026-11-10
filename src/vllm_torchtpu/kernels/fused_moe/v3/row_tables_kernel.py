@@ -19,8 +19,9 @@ its own run of the routed pairs. It reads the pair's routed row from HBM,
 computes its token in place, gathers its scale word directly from the
 gathered routing messages, and scatters the token and the scale word by
 index-driven DMA. A pair of another shard carries an index at or past the
-routed rows' end. Clamped to that length, the DMA filters it out (XLA's
-mode="drop"). The tables arrive zeroed from the shard-tables kernel.
+valid row ceiling (`valid_rows`). Clamped to the table length, the DMA filters
+it out (XLA's mode="drop"). The tables arrive zeroed from the shard-tables
+kernel.
 """
 
 import functools
@@ -40,6 +41,39 @@ from .layout import LANES
 # conversion back to int32 floors the exact quotient (no integer divide
 # on the sparse core).
 FLOOR_NUDGE = 0.5
+
+
+def decode_and_clamp_pairs(
+    pair,
+    raw_row,
+    *,
+    inv_pairs,
+    inv_tokens,
+    pairs_per_shard,
+    message_tokens,
+    tokens_per_shard,
+    routed_rows,
+    valid_rows,
+    token_bias,
+):
+    """Decodes each routed pair's `(biased_token, clamped_row, token, shard)`."""
+    shard = ((pair.astype(jnp.float32) + FLOOR_NUDGE) * inv_pairs).astype(jnp.int32)
+    local = pair - shard * jnp.int32(pairs_per_shard)
+    top_k_slot = ((local.astype(jnp.float32) + FLOOR_NUDGE) * inv_tokens).astype(
+        jnp.int32
+    )
+    token = local - top_k_slot * jnp.int32(message_tokens)
+    biased_token = shard * jnp.int32(tokens_per_shard) + token + jnp.int32(token_bias)
+    row = (
+        jnp.minimum(raw_row, jnp.int32(routed_rows))
+        if valid_rows == routed_rows
+        else jnp.where(
+            raw_row < jnp.int32(valid_rows),
+            raw_row,
+            jnp.int32(routed_rows),
+        )
+    )
+    return biased_token, row, token, shard
 
 
 def _scatter_body(
@@ -71,6 +105,8 @@ def _scatter_body(
     scale_words,
     pairs_per_shard,
     message_tokens,
+    valid_rows,
+    token_bias,
 ):
     subcore = lax.axis_index((gather.CORE_AXIS, gather.SUBCORE_AXIS))
     base = subcore * run
@@ -149,16 +185,19 @@ def _scatter_body(
         for vector in range(chunk // lanes):
             span = pl.ds(slot * chunk + vector * lanes, lanes)
             pair = base + c * chunk + vector * lanes + lane
-            shard = ((pair.astype(jnp.float32) + FLOOR_NUDGE) * inv_pairs).astype(
-                jnp.int32
+            biased_token, row, token, shard = decode_and_clamp_pairs(
+                pair,
+                rows_vmem[span],
+                inv_pairs=inv_pairs,
+                inv_tokens=inv_tokens,
+                pairs_per_shard=pairs_per_shard,
+                message_tokens=message_tokens,
+                tokens_per_shard=tokens_per_shard,
+                routed_rows=routed_rows,
+                valid_rows=valid_rows,
+                token_bias=token_bias,
             )
-            local = pair - shard * jnp.int32(pairs_per_shard)
-            top_k_slot = (
-                (local.astype(jnp.float32) + FLOOR_NUDGE) * inv_tokens
-            ).astype(jnp.int32)
-            token = local - top_k_slot * jnp.int32(message_tokens)
-            tokens_vmem[span] = shard * jnp.int32(tokens_per_shard) + token
-            row = jnp.minimum(rows_vmem[span], jnp.int32(routed_rows))
+            tokens_vmem[span] = biased_token
             rows_vmem[span] = row
             scale_word = (
                 shard * jnp.int32(message_words) + jnp.int32(scale_offset) + token
@@ -225,12 +264,14 @@ def scatter_row_tables(
     chunk=None,
     chunk_max=SCATTER_CHUNK_PAIRS_DEFAULT,
     ring=SCATTER_RING_DEFAULT,
+    valid_rows=None,
+    token_bias=0,
 ):
     """Fills the two row tables on the sparse cores, in place.
 
     Args:
       routed_row: [P] int32, routed pair p's row in this shard's routed
-        rows, or any value at or past routed_rows for a pair of another
+        rows, or any value at or past `valid_rows` for a pair of another
         shard. P = num_shards *
         tokens_per_shard * top_k pairs numbered as the words of the
         gathered routing messages.
@@ -255,10 +296,17 @@ def scatter_row_tables(
       chunk: pairs per chunk (whole vectors of whole tokens); None takes
         the largest count up to `chunk_max` that divides a subcore's run.
       ring: chunks in flight per subcore.
+      valid_rows: valid row ceiling in `[0, routed_rows]` (defaults to
+        `routed_rows`). Pairs with `routed_row >= valid_rows` are clamped to
+        the ignored drop row (`routed_rows`) so foreign pairs never write into
+        any alignment slack past `routed_rows_per_shard`.
+      token_bias: non-negative integer offset added to each scattered token id
+        (`0` by default; `1` writes `1 + token` so unwritten zeroed slots stay
+        distinct from shard 0 token 0).
 
     Returns:
-      (token_table, scale_table) filled: the token of each routed row and
-      that token's scale words, zero where no pair lands.
+      (token_table, scale_table) filled: the token (plus `token_bias`) of each
+      routed row and that token's scale words, zero where no pair lands.
     """
     for name, a in (
         ("routed_row", routed_row),
@@ -311,6 +359,32 @@ def scatter_row_tables(
             f"{scale_offset}"
         )
     routed_rows = token_table.shape[0]
+    if valid_rows is None:
+        valid_rows = routed_rows
+    if (
+        isinstance(valid_rows, bool)
+        or not isinstance(valid_rows, int)
+        or not 0 <= valid_rows <= routed_rows
+    ):
+        raise ValueError(
+            f"valid_rows {valid_rows!r} must be an int in [0, {routed_rows}]"
+        )
+    n_shards = n_pairs // pairs_per_shard
+    max_biased_token = (
+        (n_shards - 1) * tokens_per_shard + (message_tokens - 1) + token_bias
+        if isinstance(token_bias, int) and not isinstance(token_bias, bool)
+        else -1
+    )
+    if (
+        isinstance(token_bias, bool)
+        or not isinstance(token_bias, int)
+        or token_bias < 0
+        or max_biased_token >= 2**31
+    ):
+        raise ValueError(
+            f"token_bias {token_bias!r} must be a non-negative int "
+            "without int32 overflow"
+        )
     if scale_table.shape[0] % n_scales:
         raise ValueError(
             f"the scale table ({scale_table.shape[0]} words) is "
@@ -372,6 +446,8 @@ def scatter_row_tables(
             scale_words=scale_words,
             pairs_per_shard=pairs_per_shard,
             message_tokens=message_tokens,
+            valid_rows=valid_rows,
+            token_bias=token_bias,
         ),
         out_types=[
             jax.ShapeDtypeStruct((routed_rows,), jnp.int32),
@@ -391,7 +467,8 @@ def scatter_row_tables(
         ],
         compiler_params=pltpu.CompilerParams(**gather.COMPILER_PARAMS),
         name=f"fused_ep_row_tables_c{chunk}x{ring}"
-        f"{'_p' + str(n_scales) if n_scales > 1 else ''}",
+        f"{'_p' + str(n_scales) if n_scales > 1 else ''}"
+        f"{'_b' + str(token_bias) if token_bias else ''}",
         in_place_outputs=2,
     )
     return program(routed_row, routing_messages, token_table, scale_table)

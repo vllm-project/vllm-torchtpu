@@ -732,6 +732,17 @@ class LayerTest(parameterized.TestCase):
         per_row, sorted_ran = self.sorts(SHAPE, Config(sorted_rows=False))
         self.assertFalse(sorted_ran)
         np.testing.assert_array_equal(out, per_row)
+        # Sub-LANES tile_rows (routed_rows_per_shard=288 < 384 aligned table
+        # rows) with padded message_tokens (8 < 128): verifies valid_rows
+        # clamping on device.
+        sublane_tile_shape = dict(SHAPE, tokens=64, top_k=2, experts=16, tile_rows=32)
+        out_sub = self.check_reference(
+            sublane_tile_shape, Config(sorted_rows=True, bounds_checks=True)
+        )
+        per_row_sub, _ = self.run_layer(
+            sublane_tile_shape, Config(sorted_rows=False, bounds_checks=True)
+        )
+        np.testing.assert_array_equal(out_sub, per_row_sub)
         streamed = dict(
             activation_block=512, stream_block=512, stream_rows=128, token_block=512
         )
