@@ -42,7 +42,7 @@ from .pool_manifest import (
     PoolManifest,
     gdn_state_unit_bytes,
 )
-from .tags import class_tag
+from .tags import class_tag, libtpu_key
 
 
 def _row_major_minor_to_major(rank: int) -> tuple[int, ...]:
@@ -186,7 +186,7 @@ def measured_fa_layout_fingerprint(
     payload: dict[str, Any] = {
         "schema": FA_LAYOUT_FINGERPRINT_SCHEMA,
         "torch_tpu": version("torch_tpu"),
-        "libtpu": version("libtpu"),
+        "libtpu": libtpu_key(package_version),
         "minor_to_major": list(minor_to_major),
         "tiles": [list(tile) for tile in tiles],
         "element_size_in_bits": element_bits,
@@ -238,7 +238,7 @@ def measured_kimi_k3_layout_fingerprint(
     payload: dict[str, Any] = {
         "schema": KIMI_K3_LAYOUT_FINGERPRINT_SCHEMA,
         "torch_tpu": version("torch_tpu"),
-        "libtpu": version("libtpu"),
+        "libtpu": libtpu_key(package_version),
         # The planner splits at destination page boundaries, so Kimi compares
         # physical rows independent of the role's page size.
         "layouts": _measure_packed_row_layouts(
@@ -305,7 +305,7 @@ def measured_glm_layout_fingerprint(
     payload = {
         "schema": GLM_MLA_LAYOUT_FINGERPRINT_SCHEMA,
         "torch_tpu": version("torch_tpu"),
-        "libtpu": version("libtpu"),
+        "libtpu": libtpu_key(package_version),
         "page_tokens": int(page_tokens),
         "layouts": layouts,
     }
@@ -330,7 +330,7 @@ def measured_dsv4_layout_fingerprint(
     payload = {
         "schema": DSV4_LAYOUT_FINGERPRINT_SCHEMA,
         "torch_tpu": version("torch_tpu"),
-        "libtpu": version("libtpu"),
+        "libtpu": libtpu_key(package_version),
         "layouts": layouts,
     }
     return canonical_layout_fingerprint(payload), payload

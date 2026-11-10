@@ -17,15 +17,21 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
+from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
+from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm.model_executor.layers.linear import LinearBase
 
 from vllm_torchtpu.layers.adapter.quantization.configs import (
     VllmQuantConfig,
     should_quantize_on_load,
 )
-from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8LinearMethodTPU
+from vllm_torchtpu.layers.adapter.quantization.fp8 import (
+    VllmFp8LinearMethodTPU,
+    VllmFp8MoEMethodTPU,
+)
 from vllm_torchtpu.layers.adapter.quantization.unquantized import (
     VllmUnquantizedConfig,
+    VllmUnquantizedFusedMoEMethod,
     VllmUnquantizedLinearMethod,
 )
 
@@ -37,6 +43,17 @@ def linear_layer():
     torch.nn.Module.__init__(layer)
     layer.output_size = 32
     layer.input_size = 64
+    return layer
+
+
+@pytest.fixture
+def moe_layer():
+    """A bare RoutedExperts instance for testing get_quant_method dispatch."""
+    layer = RoutedExperts.__new__(RoutedExperts)
+    torch.nn.Module.__init__(layer)
+    layer.moe_config = MagicMock()
+    layer.moe_config.moe_parallel_config.use_ep = False
+    layer.moe_config.has_bias = False
     return layer
 
 
@@ -103,3 +120,46 @@ class TestUnquantizedConfigQuantizeOnLoadDispatch:
             linear_layer, prefix="model.layers.0.mlp.down_proj"
         )
         assert isinstance(method, VllmUnquantizedLinearMethod)
+
+    def test_matching_moe_layer_uses_online_fp8_moe_method(
+        self, monkeypatch, moe_layer
+    ):
+        monkeypatch.setenv("QUANTIZE_ON_LOAD_PREFIXES", "experts")
+        cfg = VllmUnquantizedConfig()
+        method = cfg.get_quant_method(moe_layer, prefix="model.layers.0.mlp.experts")
+        assert isinstance(method, VllmFp8MoEMethodTPU)
+        assert not method.quant_config.is_checkpoint_fp8_serialized
+        assert method.weight_block_size is None
+
+    def test_matching_moe_layer_with_bias_raises(self, monkeypatch, moe_layer):
+        monkeypatch.setenv("QUANTIZE_ON_LOAD_PREFIXES", "experts")
+        moe_layer.moe_config.has_bias = True
+        cfg = VllmUnquantizedConfig()
+        with pytest.raises(NotImplementedError, match="expert bias"):
+            cfg.get_quant_method(moe_layer, prefix="model.layers.0.mlp.experts")
+
+    def test_experts_prefix_leaves_shared_experts_and_attention_unquantized(
+        self, monkeypatch, linear_layer
+    ):
+        monkeypatch.setenv("QUANTIZE_ON_LOAD_PREFIXES", "experts")
+        cfg = VllmUnquantizedConfig()
+        for prefix in (
+            "model.layers.0.mlp.shared_experts.down_proj",
+            "model.layers.0.self_attn.qkv_proj",
+        ):
+            method = cfg.get_quant_method(linear_layer, prefix=prefix)
+            assert isinstance(method, VllmUnquantizedLinearMethod)
+
+    def test_non_matching_moe_layer_uses_unquantized_method(
+        self, monkeypatch, moe_layer
+    ):
+        monkeypatch.setenv("QUANTIZE_ON_LOAD_PREFIXES", "self_attn")
+        cfg = VllmUnquantizedConfig()
+        # CPU CI does not register torch's TPU device type.
+        with set_current_vllm_config(
+            VllmConfig(device_config=DeviceConfig(device="cpu"))
+        ):
+            method = cfg.get_quant_method(
+                moe_layer, prefix="model.layers.0.mlp.experts"
+            )
+        assert isinstance(method, VllmUnquantizedFusedMoEMethod)

@@ -364,7 +364,7 @@ class _A2AGroup:
 
 def _a2a_merge_whole(outputs, lses, monkeypatch, wrong_destination=False):
     """Every rank's all-to-all merge, run in lockstep, reassembled over heads."""
-    monkeypatch.setattr(cp_mla, "_all_to_all", lambda x, group: group.all_to_all(x))
+    monkeypatch.setattr(cp_mla, "all_to_all", lambda x, group: group.all_to_all(x))
     world = outputs.shape[0]
     hub = _ExchangeHub(world, wrong_destination)
 

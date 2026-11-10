@@ -19,6 +19,23 @@ from jax.experimental import pallas as pl
 from vllm_torchtpu.kernels.gdn.v3 import config, memory_ref
 
 
+def prefill_ckpt_offset_is_valid(
+    offsets: jax.Array, query_lens: jax.Array
+) -> jax.Array:
+    """Returns whether offsets lies strictly within (0, query_lens)."""
+    return jnp.logical_and(offsets > 0, offsets < query_lens)
+
+
+def mask_prefill_ckpt_requests(
+    offsets: jax.Array, indices: jax.Array, query_lens: jax.Array
+) -> tuple[jax.Array, jax.Array]:
+    """Normalizes invalid or unreserved prefill checkpoint entries to (0, -1)."""
+    has_ckpt = jnp.logical_and(
+        prefill_ckpt_offset_is_valid(offsets, query_lens), indices >= 0
+    )
+    return jnp.where(has_ckpt, offsets, 0), jnp.where(has_ckpt, indices, -1)
+
+
 def compute_batched_seq_metadata(
     cfg: config.GDNConfig,
     seq_lens: jax.Array,
@@ -72,6 +89,8 @@ def compute_per_seq_metadata(
     start_seq: jax.Array,
     end_seq: jax.Array,
     ckpt_indices: jax.Array | None = None,
+    prefill_ckpt_offsets: jax.Array | None = None,
+    prefill_ckpt_indices: jax.Array | None = None,
 ) -> memory_ref.MetadataRef:
     """Metadata for computing single sequence per tile.
 
@@ -81,6 +100,11 @@ def compute_per_seq_metadata(
     prefix-cache resume on the unified pool may land on a boundary state
     block whose committed state is a non-zero checkpoint from a verify step.
     The final state is always written to checkpoint 0.
+
+    When prefill_ckpt_offsets and prefill_ckpt_indices are provided, sequences
+    with a valid checkpoint split their tile grid at R = query_start + offset
+    into [query_start, R) and [R, query_end), ensuring row R always lands on a
+    tile boundary regardless of chunk_size.
     """
     max_seqs = seq_lens.size
     max_tokens = cfg.batch_size
@@ -96,6 +120,12 @@ def compute_per_seq_metadata(
         # Sequence-major axis only: the checkpoint axis must stay put or the
         # read offset would select another slot's block.
         ckpt_indices = jnp.roll(ckpt_indices, shift=-start_seq, axis=0)
+    has_prefill_ckpt_input = prefill_ckpt_offsets is not None
+    assert has_prefill_ckpt_input == (prefill_ckpt_indices is not None)
+    if prefill_ckpt_offsets is not None:
+        assert prefill_ckpt_indices is not None
+        prefill_ckpt_offsets = jnp.roll(prefill_ckpt_offsets, shift=-start_seq)
+        prefill_ckpt_indices = jnp.roll(prefill_ckpt_indices, shift=-start_seq)
 
     query_lens = query_start_loc[1:] - query_start_loc[:-1]
     # NOTE: query_lens is used for calculating num_tiles. Defensive programming
@@ -104,8 +134,28 @@ def compute_per_seq_metadata(
     num_seqs = end_seq - start_seq
     query_lens = jnp.where(all_seqs < num_seqs, query_lens, 0)
 
+    s_idx_to_prefill_ckpt_row = s_idx_to_prefill_ckpt_index = None
+    ckpt_split_row = s_idx_to_num_pre_ckpt_tiles = None
+    if prefill_ckpt_offsets is not None:
+        assert prefill_ckpt_indices is not None
+        # query_lens is 0 past num_seqs, so padded slots get no checkpoint.
+        prefill_ckpt_offsets, s_idx_to_prefill_ckpt_index = mask_prefill_ckpt_requests(
+            prefill_ckpt_offsets, prefill_ckpt_indices, query_lens
+        )
+        ckpt_split_row = query_start_loc[:-1] + prefill_ckpt_offsets
+        s_idx_to_prefill_ckpt_row = jnp.where(
+            prefill_ckpt_offsets > 0, ckpt_split_row, -1
+        )
+
     # Calculate number of tiles needed for each sequence.
-    s_idx_to_num_tiles = pl.cdiv(query_lens, cfg.chunk_size)
+    if prefill_ckpt_offsets is not None:
+        assert prefill_ckpt_indices is not None
+        s_idx_to_num_pre_ckpt_tiles = pl.cdiv(prefill_ckpt_offsets, cfg.chunk_size)
+        s_idx_to_num_tiles = s_idx_to_num_pre_ckpt_tiles + pl.cdiv(
+            query_lens - prefill_ckpt_offsets, cfg.chunk_size
+        )
+    else:
+        s_idx_to_num_tiles = pl.cdiv(query_lens, cfg.chunk_size)
     # Calculate starting p_id of each sequence.
     s_idx_to_start_p_id = jnp.cumulative_sum(s_idx_to_num_tiles, include_initial=True)
     # Map tile index to seq index.
@@ -125,13 +175,32 @@ def compute_per_seq_metadata(
     )
     # Map program id (p_id) to tile id of a sequence.
     p_id_to_t_id = all_tokens - s_idx_to_start_p_id[p_id_to_s_idx]
-    # Map tile index to starting row of its activation.
-    p_id_to_r_base = query_start_loc[p_id_to_s_idx] + p_id_to_t_id * cfg.chunk_size
-    # Calculate number of rows to calculate / fetch for each tile.
-    p_id_to_r_size = jnp.minimum(
-        query_start_loc[p_id_to_s_idx + 1] - p_id_to_r_base,
-        cfg.tile_size,
-    )
+    if ckpt_split_row is not None and s_idx_to_num_pre_ckpt_tiles is not None:
+        num_pre_ckpt_tiles = s_idx_to_num_pre_ckpt_tiles[p_id_to_s_idx]
+        is_pre_ckpt = p_id_to_t_id < num_pre_ckpt_tiles
+        segment_start = jnp.where(
+            is_pre_ckpt,
+            query_start_loc[p_id_to_s_idx],
+            ckpt_split_row[p_id_to_s_idx],
+        )
+        segment_end = jnp.where(
+            is_pre_ckpt,
+            ckpt_split_row[p_id_to_s_idx],
+            query_start_loc[p_id_to_s_idx + 1],
+        )
+        segment_t_id = jnp.where(
+            is_pre_ckpt, p_id_to_t_id, p_id_to_t_id - num_pre_ckpt_tiles
+        )
+        p_id_to_r_base = segment_start + segment_t_id * cfg.chunk_size
+        p_id_to_r_size = jnp.minimum(segment_end - p_id_to_r_base, cfg.tile_size)
+    else:
+        # Map tile index to starting row of its activation.
+        p_id_to_r_base = query_start_loc[p_id_to_s_idx] + p_id_to_t_id * cfg.chunk_size
+        # Calculate number of rows to calculate / fetch for each tile.
+        p_id_to_r_size = jnp.minimum(
+            query_start_loc[p_id_to_s_idx + 1] - p_id_to_r_base,
+            cfg.tile_size,
+        )
 
     # Calculate predicate used for state DMA. State is read if program id (p_id)
     # is the first tile of a sequence and the sequence had been computed before
@@ -158,4 +227,6 @@ def compute_per_seq_metadata(
         s_idx_to_state_indices=state_indices,
         s_idx_to_read_offset=read_offsets,
         s_idx_to_ckpt_indices=ckpt_indices,
+        s_idx_to_prefill_ckpt_row=s_idx_to_prefill_ckpt_row,
+        s_idx_to_prefill_ckpt_index=s_idx_to_prefill_ckpt_index,
     )

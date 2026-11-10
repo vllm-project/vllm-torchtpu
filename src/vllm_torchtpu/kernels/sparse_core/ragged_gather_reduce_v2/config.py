@@ -19,6 +19,8 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels.sparse_core.support import get_sparse_core_info
+
 
 # ceil up to the nearest multiple of b.
 def _align_to(a, b):
@@ -93,7 +95,7 @@ class Config:
     def should_fallback(self) -> bool:
         # For a small {input + output} both likely fit in TensorCore VMEM, where a
         # plain TC gather-reduce beats routing through SparseCore and HBM.
-        if self.tpu_info.sparse_core is None:
+        if get_sparse_core_info(self.tpu_info) is None:
             return True
         vmem_capacity_threshold = self.tpu_info.vmem_capacity_bytes * 0.6
         source_size = self.source_rows * self.hidden_size * self.in_dtype_bytes
