@@ -431,6 +431,7 @@ def test_deferred_logprobs_from_device_match_a_blocking_cpu_copy(
     ]
 
 
+@pytest.mark.tpu_test
 def test_compiled_async_spec_helpers_match_eager(device):
     if device.type != "tpu":
         pytest.skip("TPU compiled helpers require TPU device")
