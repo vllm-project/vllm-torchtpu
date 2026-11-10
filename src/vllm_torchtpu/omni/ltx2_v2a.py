@@ -22,8 +22,8 @@ collectives and then all-gathers the audio output heads.
 Instead, each Ulysses rank computes attention of the replicated audio queries
 against its local video K/V shard, keeping per-row ``(m_r, l_r)`` softmax
 statistics alongside the unnormalized output ``o_r`` in ``float32``. A single
-``all_gather_into_tensor`` over the tiny audio tensor (packed along rows so the
-``D`` minor dimension stays lane-aligned on TPU) merges the shard outputs with
+``all_gather_into_tensor`` over the small audio tensor (packed along rows into
+one ``(rows, D)`` buffer) merges the shard outputs with
 exact online-softmax rescaling.
 """
 
@@ -162,8 +162,9 @@ def ltx2_v2a_local_kv_attention(
         max_score_elements=max_score_elements,
     )
 
-    # Pack (o_local, m_local, l_local) along rows so the trailing minor
-    # dimension stays `dim` (128 on LTX-2) without minor-lane padding on TPU.
+    # Pack (o_local, m_local, l_local) along rows into one float32 buffer
+    # whose trailing dimension is the head dim (64 for LTX-2's
+    # video-to-audio attention), so a single all-gather moves all three.
     n_rows = bsz * q_heads * s_q
     o_flat = o_local.reshape(n_rows, dim)
     ml_flat = torch.cat((m_local.reshape(-1), l_local.reshape(-1)), dim=0)
