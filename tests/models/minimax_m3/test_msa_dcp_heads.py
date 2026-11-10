@@ -257,12 +257,12 @@ def test_multi_head_dcp_matches_each_heads_single_rank(
             interpret=True,
             **config,
         )
-        assert cand.shape == (num_tokens, kv_heads * 2 * topk)
+        assert cand.shape == (2 * topk, num_tokens * kv_heads)
         caches.append(kv)
         candidates.append(cand)
     candidates = jnp.stack(candidates)
 
-    selected = np.asarray(msa_dcp.merge_head_candidates(candidates, topk))
+    selected = np.asarray(msa_dcp.merge_head_candidates(candidates, topk, kv_heads))
     for h in range(kv_heads):
         np.testing.assert_array_equal(
             selected[:num_real, h], ref_selected[h][:num_real]
@@ -421,7 +421,7 @@ def test_multi_head_dcp_lowers_for_tpu(dtype):
     attend_args = (
         jax.ShapeDtypeStruct((tokens, heads * 16, hd), bf16),
         kv,
-        jax.ShapeDtypeStruct((dcp, tokens, heads * 32), jnp.float32),
+        jax.ShapeDtypeStruct((dcp, 32, tokens * heads), jnp.int32),
         *meta,
     )
     tpu7x = AbstractMesh((), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu"))

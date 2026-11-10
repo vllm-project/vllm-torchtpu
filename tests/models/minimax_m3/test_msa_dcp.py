@@ -16,6 +16,7 @@ selection and the log-sum-exp merge of the ranks' partial attention against
 the single-rank forward over the same context."""
 
 import functools
+import inspect
 
 import jax
 import jax.numpy as jnp
@@ -173,7 +174,7 @@ def test_dcp_forward_matches_single_rank(
     candidates = jnp.stack(candidates)
 
     num_real = sum(q_lens)
-    selected = np.asarray(msa_dcp.merge_candidates(candidates, topk))
+    selected = np.asarray(msa_dcp.merge_head_candidates(candidates, topk))[:, 0]
     np.testing.assert_array_equal(
         selected[:num_real], np.asarray(ref_selected)[:num_real]
     )
@@ -284,31 +285,113 @@ def _flush_like_a_tpu_collective(x: jax.Array) -> jax.Array:
     return jnp.where(jnp.isnan(x), jnp.float32(jnp.nan), x)
 
 
-def test_candidates_survive_a_flushing_collective():
-    """Block ids cross the DCP all-gather inside f32 candidates. Bitcast ids
-    are subnormals (and -1 a NaN): a collective that flushes them decoded
-    every id as block 0, so tokens attended block 0 only (j-301d606e: a few
-    GSM8K requests derailed into garbage, MTP acceptance 1.01 on them)."""
+def _sorted_candidates(rng, dcp, num_cols, topk, num_blocks=4096, ties=False):
+    """Every rank's local top-k as its kernels emit them: distinct blocks of
+    its own (``b % dcp == rank``), score descending, ties to the lower block,
+    then ``(-inf, -1)`` for missing picks. ``[dcp, N, topk]`` each."""
+    scores = np.full((dcp, num_cols, topk), -np.inf, np.float32)
+    blocks = np.full((dcp, num_cols, topk), -1, np.int32)
+    for r in range(dcp):
+        for c in range(num_cols):
+            n = topk if c % 5 else int(rng.integers(0, topk + 1))
+            b = rng.permutation(np.arange(r, num_blocks, dcp))[:n]
+            s = (
+                rng.integers(-3, 4, n).astype(np.float32)
+                if ties
+                else rng.standard_normal(n).astype(np.float32)
+            )
+            if c % 7 == 0 and n:
+                s[0] = 3.0e38  # a forced score
+            order = np.lexsort((b, -s))
+            scores[r, c, :n], blocks[r, c, :n] = s[order], b[order]
+    return scores, blocks
+
+
+def _slots(scores, blocks):
+    """`msa_dcp.to_slots` of each rank's one-head candidates."""
+    packed = jax.vmap(msa_dcp.pack_candidates)(jnp.asarray(scores), jnp.asarray(blocks))
+    return jnp.stack([msa_dcp.to_slots(p, scores.shape[-1]) for p in packed])
+
+
+def test_candidates_cross_as_int32():
+    """Block ids cross the DCP all-gather with the scores. As f32 bit
+    patterns they were subnormals (and -1 a NaN), which a TPU collective
+    flushed (j-301d606e: every id decoded as block 0, a few GSM8K requests
+    derailed). `to_slots` sends int32: scores as bit patterns, ids as ints,
+    which no collective rewrites, and every score bit pattern survives."""
     rng = np.random.default_rng(5)
     dcp, num_tokens, topk = 2, 64, 16
-    scores = rng.standard_normal((dcp, num_tokens, topk)).astype(np.float32)
-    blocks = np.stack(
-        [
-            rng.permutation(np.arange(r, 4096, dcp))[: num_tokens * topk].reshape(
-                num_tokens, topk
-            )
-            for r in range(dcp)
-        ]
-    ).astype(np.int32)
-    scores[:, :5, 10:] = -np.inf  # missing picks
-    blocks[:, :5, 10:] = -1
-    packed = jax.vmap(msa_dcp.pack_candidates)(jnp.asarray(scores), jnp.asarray(blocks))
-    expected = np.asarray(msa_dcp.merge_candidates(packed, topk))
-    got = np.asarray(
-        msa_dcp.merge_candidates(_flush_like_a_tpu_collective(packed), topk)
+    scores, blocks = _sorted_candidates(rng, dcp, num_tokens, topk)
+    scores[0, 3, 2] = np.float32(1e-41)  # a subnormal score
+    slots = np.asarray(_slots(scores, blocks))
+    assert slots.dtype == np.int32 and slots.shape == (dcp, 2 * topk, num_tokens)
+    np.testing.assert_array_equal(
+        slots[:, :topk].view(np.float32).view(np.uint32),
+        scores.transpose(0, 2, 1).view(np.uint32),
     )
-    np.testing.assert_array_equal(got, expected)
-    assert len(np.unique(expected[5:])) > topk  # real, distinct block ids
+    np.testing.assert_array_equal(slots[:, topk:], blocks.transpose(0, 2, 1))
+    # The f32 rows the slots replace do not survive a flushing collective
+    # when the ids are bit patterns: the reason ids never travel as bits.
+    bits = jax.lax.bitcast_convert_type(jnp.asarray(blocks), jnp.float32)
+    flushed = jax.lax.bitcast_convert_type(_flush_like_a_tpu_collective(bits), jnp.int32)
+    assert not np.array_equal(np.asarray(flushed), blocks)
+
+
+def _np_merge(scores, blocks, topk):
+    """Reference merge of ``[dcp, N, topk]`` candidates: the real ones
+    (score > -inf) by score descending, then block ascending; -1 padded."""
+    dcp, num_cols, _ = scores.shape
+    out = np.full((num_cols, topk), -1, np.int32)
+    for c in range(num_cols):
+        s, b = scores[:, c].reshape(-1), blocks[:, c].reshape(-1)
+        real = s > -np.inf
+        order = np.lexsort((b[real], -s[real]))[:topk]
+        out[c, : len(order)] = b[real][order]
+    return out
+
+
+@pytest.mark.parametrize("dcp,heads", [(2, 1), (4, 2), (8, 4), (8, 1)])
+@pytest.mark.parametrize("ties", [False, True], ids=["distinct", "ties"])
+def test_slot_merge_matches_row_merge(dcp, heads, ties):
+    """`merge_head_candidates` of `to_slots` candidates (the dense ranking
+    at DCP 2, the kernel above) equals the r5 merge (`merge_candidates` of
+    `pack_candidates` rows) and a numpy sort, per head, ties, forced scores
+    and missing picks included."""
+    rng = np.random.default_rng(dcp * 10 + heads)
+    num_tokens, topk = 136, 16  # 136 * G columns: a padded last block
+    scores, blocks = _sorted_candidates(rng, dcp, num_tokens * heads, topk, ties=ties)
+    want = _np_merge(scores, blocks, topk)
+    rows = jax.vmap(msa_dcp.pack_candidates)(jnp.asarray(scores), jnp.asarray(blocks))
+    np.testing.assert_array_equal(np.asarray(msa_dcp.merge_candidates(rows, topk)), want)
+    got = np.asarray(
+        msa_dcp.merge_head_candidates(_slots(scores, blocks), topk, heads, interpret=True)
+    )
+    np.testing.assert_array_equal(got, want.reshape(num_tokens, heads, topk))
+    assert (want >= 0).mean() > 0.5
+
+
+def _faulty(fn, old, new):
+    src = inspect.getsource(fn)
+    assert old in src
+    namespace = dict(vars(msa_dcp))
+    exec(compile(src.replace(old, new), "<fault>", "exec"), namespace)
+    return namespace[fn.__name__]
+
+
+@pytest.mark.parametrize(
+    "dcp,name,old,new",
+    [
+        (2, "_rank_merge", "(b_j < b_i)", "(b_j > b_i)"),
+        (4, "_merge_kernel_t", "best = jnp.min(", "best = jnp.max("),
+    ],
+    ids=["dense", "kernel"],
+)
+def test_slot_merge_fault_is_caught(monkeypatch, dcp, name, old, new):
+    """Positive control: a merge that breaks ties to the higher block fails
+    `test_slot_merge_matches_row_merge`."""
+    monkeypatch.setattr(msa_dcp, name, _faulty(getattr(msa_dcp, name), old, new))
+    with pytest.raises(AssertionError):
+        test_slot_merge_matches_row_merge(dcp, 1, True)
 
 
 @pytest.mark.parametrize("dtype", CACHE_DTYPES)
@@ -340,7 +423,7 @@ def test_dcp_forward_lowers_for_tpu(dtype):
     attend_args = (
         jax.ShapeDtypeStruct((tokens, heads, HEAD_DIM), jnp.bfloat16),
         kv,
-        jax.ShapeDtypeStruct((dcp, tokens, 32), jnp.float32),
+        jax.ShapeDtypeStruct((dcp, 32, tokens), jnp.int32),
         *meta,
     )
     tpu7x = AbstractMesh((), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu"))
@@ -427,7 +510,7 @@ def test_dcp_forward_lowers_once_for_every_rank():
     attend_args = (
         jax.ShapeDtypeStruct((tokens, heads, HEAD_DIM), jnp.bfloat16),
         kv,
-        jax.ShapeDtypeStruct((dcp, tokens, 32), jnp.float32),
+        jax.ShapeDtypeStruct((dcp, 32, tokens), jnp.int32),
         *meta,
         rank,
     )

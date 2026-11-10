@@ -141,14 +141,15 @@ def _check(monkeypatch, q_lens, ctx_lens, dcp, dtype, *, ranks=None, seed=0, **c
     for rank in ranks if ranks is not None else range(dcp):
         want = _candidates(monkeypatch, False, caches, tensors, meta, rank, dcp, **config)
         got = _candidates(monkeypatch, True, caches, tensors, meta, rank, dcp, **config)
-        assert got.shape == want.shape
-        np.testing.assert_array_equal(
-            got[:num_real].view(np.uint32), want[:num_real].view(np.uint32)
-        )
-        # Padding tokens: no candidate.
         topk = config["topk"]
-        pad = got[num_real:].reshape(-1, heads, 2 * topk)
-        assert np.all(pad[..., :topk] == -np.inf) and np.all(pad[..., topk:] == -1)
+        assert got.shape == want.shape == (2 * topk, NUM_TOKENS * heads)
+        assert got.dtype == want.dtype == np.int32
+        real = num_real * heads  # folded columns t * G + h of the real tokens
+        np.testing.assert_array_equal(got[:, :real], want[:, :real])
+        # Padding tokens: no candidate.
+        pad = got[:, real:]
+        assert np.all(pad[:topk].view(np.float32) == -np.inf)
+        assert np.all(pad[topk:] == -1)
 
 
 # (q_lens, ctx_lens): a prefill chunk over long context next to decode rows
@@ -318,7 +319,7 @@ def test_tile_select_compiles_for_tpu7x(monkeypatch, dcp, heads, num_tokens, cac
         assert "minimax_m3_msa_tile_select" in text
         # The int32 step-metadata scatter stays; the bf16 head fold must not.
         assert not _bf16_scatters(text)
-        assert lowered.out_info[2].shape == (num_tokens, heads * 2 * TOPK)
+        assert lowered.out_info[2].shape == (2 * TOPK, num_tokens * heads)
         assert lowered.compile() is not None
 
 

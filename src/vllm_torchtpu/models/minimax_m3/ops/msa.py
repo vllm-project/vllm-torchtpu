@@ -482,8 +482,9 @@ def get_msa_dcp_op(
     (`gather_group_heads`), and the LSE merge and reduce-scatter go out.
 
     Two JAX ops: the first writes this rank's tokens and returns its local
-    top-k candidates; an all-gather over the DCP group brings every rank all
-    ``dcp * topk`` candidates and the query heads of the whole group; the
+    top-k candidates (``[2 * topk, T * G]`` int32, `msa_dcp.to_slots`); an
+    all-gather over the DCP group brings every rank all ``dcp * topk``
+    candidates and the query heads of the whole group; the
     second merges the candidates into the exact selection and attends over
     the selected blocks this rank holds; a log-sum-exp merge (shared with the
     MLA DCP path) combines the ranks' partials and keeps this rank's heads.
@@ -572,9 +573,10 @@ def get_msa_dcp_op(
         return (
             torch.empty_like(kv_cache),
             torch.empty_like(index_cache),
+            # `msa_dcp.to_slots`: lane-dense int32 for the all-gather.
             torch.empty(
-                (k.shape[0], k.shape[1] * 2 * topk),
-                dtype=torch.float32,
+                (2 * topk, k.shape[0] * k.shape[1]),
+                dtype=torch.int32,
                 device=k.device,
             ),
         )
@@ -727,9 +729,10 @@ def _get_msa_dcp_fp4_op(
             torch.empty_like(kv_cache),
             torch.empty_like(index_cache),
             torch.empty_like(scale_cache),
+            # `msa_dcp.to_slots`: lane-dense int32 for the all-gather.
             torch.empty(
-                (k.shape[0], k.shape[1] * 2 * topk),
-                dtype=torch.float32,
+                (2 * topk, k.shape[0] * k.shape[1]),
+                dtype=torch.int32,
                 device=k.device,
             ),
             torch.empty_like(args[-1]),
