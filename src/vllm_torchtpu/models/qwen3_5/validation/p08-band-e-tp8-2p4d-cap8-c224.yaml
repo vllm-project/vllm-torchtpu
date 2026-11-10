@@ -144,6 +144,12 @@ legs:
         detok_prompt_tail: true
         lazy_reasoning_count: true
         tokenize_prefix_cache: true
+      tpu_pp_scheduler:
+        quadratic_cost: true
+        prefix_aware: true
+        paw_aging_tok_per_s: 3000
+      tpu_scheduler:
+        promote_warmest: false
       tpu_worker:
         numa_bind: true
   decode:
