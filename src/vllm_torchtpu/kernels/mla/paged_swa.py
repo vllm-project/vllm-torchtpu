@@ -60,6 +60,32 @@ def _publish_swa_sc(raw, records, values, page_size):
         return raw
     banks = raw if isinstance(raw, tuple) else (raw,)
     capacity = sum(bank.shape[0] for bank in banks) // 2
+    info = pltpu.get_tpu_info().sparse_core
+    assert info is not None
+    lanes, cores = info.num_lanes, info.num_cores * info.num_subcores
+    from vllm_torchtpu.kernels.experimental import decode_preparation as prep
+
+    if prep.admit(
+        "swa_pack",
+        None if page_size == 64 else f"SWA page size {page_size}, kernel 64",
+        tokens=records.shape[0],
+        buckets=prep.SWA_PACK_TOKENS,
+    ):
+        padded = -(-records.size // (lanes * cores)) * (lanes * cores)
+        ids, words, masks = prep.swa_word_pool_pack(
+            records, values, capacity=capacity, padded=padded
+        )
+    else:
+        ids, words, masks = _pack_native(records, values, capacity, page_size)
+        padding = -ids.size % (lanes * cores)
+        ids = jnp.pad(ids, (0, padding), constant_values=-1)
+        words = jnp.pad(words, ((0, padding), (0, 0)))
+        masks = jnp.pad(masks, ((0, padding), (0, 0)))
+    return _publish_packed(banks, ids, words, masks, info, raw)
+
+
+def _pack_native(records, values, capacity, page_size):
+    """XLA sort/pair of SWA records into 128-word physical rows (unpadded)."""
     valid = (records >= page_size) & (records < capacity)
     local = jnp.where(valid, records, capacity)
     order = jnp.argsort(local, stable=True)
@@ -85,13 +111,12 @@ def _publish_swa_sc(raw, records, values, page_size):
     )
     physical = pairs[:, None] * 4 + jnp.arange(4, dtype=jnp.int32)[None, :]
     physical = jnp.where(boundary[:, None], physical, -1).reshape(-1)
-    info = pltpu.get_tpu_info().sparse_core
-    assert info is not None
+    return physical, words, masks
+
+
+def _publish_packed(banks, ids, words, masks, info, raw):
+    """Read-modify-write packed SWA rows into the word pool on SparseCore."""
     lanes, cores = info.num_lanes, info.num_cores * info.num_subcores
-    padding = -physical.size % (lanes * cores)
-    ids = jnp.pad(physical, (0, padding), constant_values=-1)
-    words = jnp.pad(words, ((0, padding), (0, 0)))
-    masks = jnp.pad(masks, ((0, padding), (0, 0)))
     mesh = plsc.VectorSubcoreMesh(
         num_cores=info.num_cores,
         num_subcores=info.num_subcores,

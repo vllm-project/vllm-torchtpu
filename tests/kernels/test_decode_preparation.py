@@ -224,3 +224,39 @@ def test_compressor_addresses_match_reference(tokens, requests, main_columns):
     np.testing.assert_array_equal(out[6], np.where(live & valid, rows, -1))
     live, block, slot = _reference_slots(kv, positions, index, 256, requests)
     np.testing.assert_array_equal(out[7], np.where(live, block * 256 + slot, -1))
+
+
+@pytest.mark.parametrize("tokens", sorted(prep.SWA_PACK_TOKENS))
+@pytest.mark.parametrize("case", ["unique", "pairs", "invalid", "shuffled"])
+def test_swa_word_pool_pack_matches_native(tokens, case):
+    from vllm_torchtpu.kernels.mla import paged_swa
+
+    capacity, padded = 4096, -(-tokens // 256) * 256
+    rng = np.random.default_rng(tokens)
+    records = np.arange(64, 64 + 2 * tokens, 2, dtype=np.int32)
+    if case == "pairs":
+        records = 64 + np.arange(tokens, dtype=np.int32)
+    elif case == "invalid":
+        records[::5] = -1
+        records[1::7] = 3  # null page
+        records[2::11] = capacity
+    elif case == "shuffled":
+        records = 64 + rng.permutation(tokens).astype(np.int32)
+    bits = rng.integers(0, 1 << 16, (tokens, 512), dtype=np.uint16)
+    values = jnp.asarray(bits.view(jnp.bfloat16))
+    records = jnp.asarray(records)
+
+    fused = prep.swa_word_pool_pack(
+        records, values, capacity=capacity, padded=padded, interpret=True
+    )
+    ids, words, masks = paged_swa._pack_native(records, values, capacity, 64)
+    pad = 4 * padded - ids.size
+    native = (
+        jnp.pad(ids, (0, pad), constant_values=-1),
+        jnp.pad(words, ((0, pad), (0, 0))),
+        jnp.pad(masks, ((0, pad), (0, 0))),
+    )
+    keep = np.asarray(native[0]) >= 0
+    np.testing.assert_array_equal(np.asarray(fused[0]), np.asarray(native[0]))
+    for got, want in zip(fused[1:], native[1:]):
+        np.testing.assert_array_equal(np.asarray(got)[keep], np.asarray(want)[keep])
