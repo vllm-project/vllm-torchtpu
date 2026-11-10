@@ -11,7 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Ragged token gather and weighted reduction kernels for MoE dispatch and combine."""
+"""Experimental destination-major SparseCore gather-reduce.
+
+The v2 kernel streams valid routes and scatters FP32 partial rows.  This
+prototype instead assigns each core a contiguous block of destination tokens.
+Valid routes are compacted across each block, gathered exactly once, scattered
+into FP32 VMEM with SparseCore vector scatter-add, and emitted as full 16-row
+BF16 tiles. The compaction is one variadic sort that carries the packed route
+metadata and weights along.
+"""
 
 import functools
 
