@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The few-token MoE layer with its dispatch and combine inside the kernel, as a torch op.
+"""The few-token MoE layer with its dispatch and combine in the kernel, as a torch op.
 
 On a DP x TP layout (DP >= 2, TP = 2) whose TP pairs are consecutive cores of
 the EP mesh, a replicated sequence-parallel MoE step of a layer the few-token
@@ -34,6 +34,7 @@ from jax import lax
 from jax.sharding import Mesh, PartitionSpec
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.distributed.ep_mesh import (
     EP_AXIS_NAME,
     build_ep_mesh,
@@ -41,7 +42,6 @@ from vllm_torchtpu.distributed.ep_mesh import (
     ep_rank_order,
     get_ep_group,
 )
-from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
 from vllm_torchtpu.kernels.experimental.moe_lowtok import fused_collectives
 from vllm_torchtpu.layers.adapter import moe_options, token_padding
@@ -194,7 +194,9 @@ def _build_op(topk: int) -> torch.library.CustomOpDef:
         # Above the cap: the served path, inside the op.
         xg = lax.all_gather(x, "dp", axis=0, tiled=True)
         lg = lax.all_gather(scores, "dp", axis=0, tiled=True)
-        out = moe_lowtok_scores._moe_scores_fn(xg, lg, w13, w2, s13, s2, start, topk=topk)
+        out = moe_lowtok_scores._moe_scores_fn(
+            xg, lg, w13, w2, s13, s2, start, topk=topk
+        )
         out = lax.psum_scatter(out, "dp", scatter_dimension=0, tiled=True)
         return lax.psum(out, "tp")
 
@@ -223,7 +225,16 @@ def _build_op(topk: int) -> torch.library.CustomOpDef:
         f"pallas::moe_lowtok_fused_k{topk}",
         fn,
         mesh=mesh2,
-        input_partition_specs=(rows, rows, experts, experts, experts, experts, experts, experts),
+        input_partition_specs=(
+            rows,
+            rows,
+            experts,
+            experts,
+            experts,
+            experts,
+            experts,
+            experts,
+        ),
         output_partition_specs=rows,
         fake=fake,
     )
@@ -260,7 +271,9 @@ def apply(layer, x: torch.Tensor, router_logits: torch.Tensor) -> torch.Tensor:
     logits = router_logits
     if envs.TPU_MOE_SKIP_PADDED_TOKENS:
         # The op takes this engine's own rows, so the mask is the local one.
-        is_padding = token_padding.padding_mask_for(logits.shape[0], is_local_tensor=True)
+        is_padding = token_padding.padding_mask_for(
+            logits.shape[0], is_local_tensor=True
+        )
         if is_padding is not None:
             logits = torch.where(
                 is_padding[:, None], torch.full_like(logits, float("-inf")), logits
