@@ -541,10 +541,13 @@ def _class_scores(
     token_major=False,
     scale_cache=None,
     scale_row=None,
+    q_pad=None,
 ):
     """Transposed scores ``[P, tiles * block_q]`` of one tile class, and the
     column of each token (`ClassScores`); `token_major` (kernel v3) returns
-    them as ``[tiles * block_q, P]`` instead, so a token's scores are one row."""
+    them as ``[tiles * block_q, P]`` instead, so a token's scores are one row.
+    The query rows are padded by ``q_pad >= block_q`` rows (default
+    `block_q`): classes sharing it share one padded copy."""
     num_tokens, _, head_dim = index_q.shape
     _, rows_per_page, packing, _ = index_cache.shape
     page_size = _page_tokens(rows_per_page, index_cache.dtype)
@@ -568,7 +571,8 @@ def _class_scores(
         raise NotImplementedError(
             f"at most {_SEQ_MASK + 1} requests, got {max_num_seqs}"
         )
-    q_rows = jnp.pad(index_q[:, 0].astype(jnp.float32), ((0, block_q), (0, 0)))
+    q_pad = block_q if q_pad is None else q_pad
+    q_rows = jnp.pad(index_q[:, 0].astype(jnp.float32), ((0, q_pad), (0, 0)))
     tile_info = (
         jnp.clip(tile_row0, 0, num_tokens // _ROW_ALIGN * _ROW_ALIGN) << _ROW_SHIFT
     ) | tile_seq
@@ -789,6 +793,9 @@ def class_plan(
         interpret=interpret,
         scale_cache=scale_cache,
         scale_row=scale_row,
+        # One padded f32 copy of the queries for both classes (~32 us per
+        # layer each at DCP 8, c64 twin j-0a66fa2e).
+        q_pad=max(block_q, large_block_q),
     )
     # Large requests have more than block_q tokens each.
     max_large = min(max_num_seqs, num_tokens // (block_q + 1))
