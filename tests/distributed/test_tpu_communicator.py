@@ -211,7 +211,10 @@ def test_replicated_sequence_parallel_rows_under_data_parallelism(
         assert len(result) == count
         for actual, expected in zip(result, tensors):
             torch.testing.assert_close(actual, torch.cat([expected, expected + 10]))
-        assert dp_group.all_gather.call_count == count
+        # Hidden rows and router logits of one dtype travel in one packed
+        # gather under DP > 1 (lossless; see the packed-gather tests).
+        packed = method == "dispatch_router_logits"
+        assert dp_group.all_gather.call_count == (1 if packed else count)
         dp_group.reduce_scatter.assert_not_called()
         tp_group.all_reduce.assert_not_called()
     ep_group.all_reduce.assert_not_called()
