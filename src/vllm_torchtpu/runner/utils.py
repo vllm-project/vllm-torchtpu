@@ -61,6 +61,10 @@ WORKER_OPTIONS_SECTION = "tpu_worker"
 # under internal-LB DP.
 MULTIPORT_DP_ADDITIONAL_CONFIG_KEY = "tpu_multiport_dp"
 
+# Host-only section: the scheduler options (`core.scheduler_options`) only
+# decide admission order and never change a compiled program.
+SCHEDULER_OPTIONS_SECTION = "tpu_scheduler"
+
 # Diagnostics-only knobs, host-only sections and the multi-port launch
 # topology: they steer profiling, the host or the launch and never change the
 # compiled graph, so `_patch_vllm_config_hash_ignore_diagnostics` keeps them out
@@ -73,6 +77,7 @@ HASH_IGNORED_ADDITIONAL_CONFIG_KEYS = frozenset(
         RUNNER_OPTIONS_SECTION,
         WORKER_OPTIONS_SECTION,
         MULTIPORT_DP_ADDITIONAL_CONFIG_KEY,
+        SCHEDULER_OPTIONS_SECTION,
     }
 )
 
