@@ -97,7 +97,7 @@ from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorOutput
 
 from vllm_torchtpu import envs, utils
 from vllm_torchtpu.block_major_pool import BlockMajorPoolLayout
-from vllm_torchtpu.compilation import compile_options, shape_variants
+from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.distributed import utils as dist_utils
 from vllm_torchtpu.distributed.kv_transfer.kv_save_nan_check import (
     KVSaveNanCheck,
@@ -8641,42 +8641,6 @@ class TPUModelRunner(GPUModelRunner):
                 self._warmup_spec_decode()
                 if self._adaptive_verification is not None:
                     self._init_adaptive_verification()
-        self._qx_maybe_disable_aot_guard_checks()
-
-    def _qx_maybe_disable_aot_guard_checks(self) -> None:
-        """With ``tpu_compile.skip_aot_guard_checks`` on (off by default), turn
-        off the per-call guard check of the target's and the MTP drafter's
-        AOT-compiled forward functions once warmup has run every bucket."""
-        if not compile_options.get(self.vllm_config).skip_aot_guard_checks:
-            return
-        roots = [self.model]
-        drafter = getattr(self, "drafter", None)
-        if drafter is not None:
-            for attr in ("draft_model", "_mtp_loop_model", "_mtp_fused_loop"):
-                m = getattr(drafter, attr, None)
-                if m is not None:
-                    roots.append(m)
-        seen: set[int] = set()
-        n = 0
-        for root in roots:
-            if root is None:
-                continue
-            mods = list(root.modules()) if hasattr(root, "modules") else [root]
-            for mod in mods:
-                aot = getattr(mod, "aot_compiled_fn", None)
-                if (
-                    aot is not None
-                    and id(aot) not in seen
-                    and hasattr(aot, "disable_guard_check")
-                ):
-                    seen.add(id(aot))
-                    aot.disable_guard_check = True
-                    n += 1
-        logger.info(
-            "tpu_compile.skip_aot_guard_checks: disabled the guard check of %d "
-            "AOT-compiled functions",
-            n,
-        )
 
     def _check_draft_buckets(self) -> None:
         """Refuses to start a producer whose draft lacks a target bucket.
