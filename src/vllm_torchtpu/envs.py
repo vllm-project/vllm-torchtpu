@@ -107,6 +107,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_KERNEL_IMPL: str | None = None
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
+    TPU_MOE_FUSED_EP_STEP_MIN_TOKENS: int = 0
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
     MOE_FUSED_EP_SORTED_GATHER: bool = False
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
@@ -853,8 +854,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Explicit implementation selection also enables fused EP. When unset,
     # preserve the legacy enable flag and v2 behavior. Adaptive owns its
     # admission, automatically supports FP4 and never falls back to GMM.
+    # v3 is the sorted-rows kernel (kernels/fused_moe/v3) for FP8 layers with
+    # softmax top-k routing; TPU_MOE_FUSED_EP_STEP_MIN_TOKENS can keep small
+    # compiled token shapes on the grouped-matmul path.
     "MOE_FUSED_EP_KERNEL_IMPL": env_with_choices(
-        "MOE_FUSED_EP_KERNEL_IMPL", None, ["v2", "adaptive"]
+        "MOE_FUSED_EP_KERNEL_IMPL", None, ["v2", "adaptive", "v3"]
     ),
     # Opt in to NVFP4 W4A8 in fused EP MoE v2. Requires the fused EP switch
     # above; defaults off so enabling fused EP alone preserves NVFP4 W4A16.
@@ -866,6 +870,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # arming everything. Below the threshold the grouped-matmul path serves.
     "MOE_FUSED_EP_KERNEL_MIN_TOKENS": lambda: int(
         os.getenv("MOE_FUSED_EP_KERNEL_MIN_TOKENS", "1024")
+    ),
+    # With MOE_FUSED_EP_KERNEL_IMPL=v3 only: compiled token shapes of at least
+    # this many rows per rank run the fused kernel, and smaller shapes take
+    # the grouped-matmul path with the layer's own all-gather and
+    # reduce-scatter. The choice is made per compiled shape, so every token
+    # bucket is traced for its side of the threshold. 0 (default) sends every
+    # shape to the fused kernel.
+    "TPU_MOE_FUSED_EP_STEP_MIN_TOKENS": env_nonnegative_int(
+        "TPU_MOE_FUSED_EP_STEP_MIN_TOKENS", 0
     ),
     # Build each rank's two consumed routing-plan slices instead of
     # replicating the full T * topk * experts plan arithmetic on every rank.

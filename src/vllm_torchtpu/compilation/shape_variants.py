@@ -156,16 +156,58 @@ def _signature(graph: fx.GraphModule) -> tuple:
     but a structural difference -- a split graph whose subgraph takes one chunk
     in one variant and two in another -- does not.
     """
+    return tuple(_meta_entry(value) for value in _placeholder_values(graph))
 
-    def shape(value: Any) -> Any:
+
+def _meta_entry(value: Any) -> Any:
+    """A placeholder's comparable form: dtype and shape, "?" for symbolic dims."""
+    if not isinstance(value, torch.Tensor):
+        return type(value).__name__
+    dims = tuple("?" if isinstance(d, torch.SymInt) else int(d) for d in value.shape)
+    return (str(value.dtype), dims)
+
+
+def _handover_inputs(graph: fx.GraphModule) -> list[tuple[str, Any]]:
+    """Every placeholder as (name, comparable form), in runnable argument order.
+
+    Dynamo names a lifted parameter or buffer after where it was read from,
+    so the same tensor carries the same name in every trace of the model. A
+    symbolic size is named by the trace that allocated it, so it is matched
+    by its position among the symbolic sizes instead.
+    """
+    inputs = []
+    sizes = 0
+    for node in graph.graph.nodes:
+        if node.op != "placeholder":
+            break
+        value = _placeholder_value(node)
+        name = node.name
         if not isinstance(value, torch.Tensor):
-            return type(value).__name__
-        dims = tuple(
-            "?" if isinstance(d, torch.SymInt) else int(d) for d in value.shape
-        )
-        return (str(value.dtype), dims)
+            name = f"size {sizes}"
+            sizes += 1
+        inputs.append((name, _meta_entry(value)))
+    return inputs
 
-    return tuple(shape(value) for value in _placeholder_values(graph))
+
+def _input_permutation(
+    stored: list[tuple[str, Any]], current: list[tuple[str, Any]]
+) -> list[int] | None:
+    """For each stored runnable slot, the current argument that fills it.
+
+    None unless the two traces take the same named inputs in some order.
+    """
+    if len(stored) != len(current):
+        return None
+    current_index = {name: i for i, (name, _) in enumerate(current)}
+    if len(current_index) != len(current):
+        return None
+    permutation = []
+    for name, entry in stored:
+        i = current_index.get(name)
+        if i is None or current[i][1] != entry:
+            return None
+        permutation.append(i)
+    return permutation
 
 
 def graph_signature(graph: fx.GraphModule) -> tuple:
@@ -195,7 +237,8 @@ class BucketExecutables:
 
     def __init__(self) -> None:
         self._runnables: dict[
-            tuple[str | None, str], tuple[Callable[..., Any], tuple]
+            tuple[str | None, str],
+            tuple[Callable[..., Any], tuple, list[tuple[str, Any]]],
         ] = {}
         self.refused: set[int] = set()
         self.traces = 0
@@ -206,16 +249,33 @@ class BucketExecutables:
         found = self._runnables.get((cache_dir, key))
         if found is None:
             return None
-        runnable, signature = found
-        if signature != _signature(graph):
+        runnable, signature, stored_inputs = found
+        current_inputs = _handover_inputs(graph)
+        if current_inputs == stored_inputs:
+            return runnable
+        # Two traces that read the same tensors in a different order lift
+        # them in a different order. The executable takes its inputs
+        # positionally, so put the current arguments into its order.
+        permutation = _input_permutation(stored_inputs, current_inputs)
+        if permutation is None:
             raise ShapeSpecializationError(
                 f"{key} was compiled by another trace of this model whose "
                 f"inputs differ ({signature} vs {_signature(graph)}). The "
                 "graph is split, so its subgraph boundaries move with the "
                 "specialization and a bucket cannot be handed between traces; "
-                "unset TPU_KERNEL_ITER_MODE to serve this model."
+                "unset TPU_KERNEL_ITER_MODE (or TPU_MOE_FUSED_EP_STEP_MIN_TOKENS, "
+                "whose two sides must lift the same inputs) to serve this model."
             )
-        return runnable
+        logger.info(
+            "[shape-variants] %s handed over with its %d inputs reordered",
+            key,
+            len(permutation),
+        )
+
+        def reordered(*args: Any) -> Any:
+            return runnable(*[args[i] for i in permutation])
+
+        return reordered
 
     def put(
         self,
@@ -224,7 +284,11 @@ class BucketExecutables:
         graph: fx.GraphModule,
         runnable: Callable[..., Any],
     ) -> None:
-        self._runnables[(cache_dir, key)] = (runnable, _signature(graph))
+        self._runnables[(cache_dir, key)] = (
+            runnable,
+            _signature(graph),
+            _handover_inputs(graph),
+        )
 
     def needs_retrace(self, size: int) -> bool:
         """Whether a graph refused this bucket and no trace has built it yet.
