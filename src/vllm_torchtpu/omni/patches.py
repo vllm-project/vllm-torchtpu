@@ -1013,6 +1013,13 @@ def _patch_parallel_state_device_order() -> None:
         setattr(_tpu_destroy_model_parallel, _PARALLEL_DEVICE_ORDER_PATCHED, True)
         parallel_state.destroy_model_parallel = _tpu_destroy_model_parallel
 
+    # With ring_degree > 1 the cfg/dp groups can list ranks out of ascending
+    # order (e.g. [6, 4]) while torch.distributed.new_group sorts them. In
+    # vLLM-Omni's GroupCoordinator every src/dst argument is mapped through
+    # self.ranks and all_reduce/barrier do not depend on member order, so only
+    # all_gather and gather return data in sorted c10d order; both are reordered
+    # below. test_group_coordinator_methods_are_audited_for_reorder fails when
+    # upstream adds a method that has not been audited.
     if not getattr(
         group_coordinator.GroupCoordinator.all_gather,
         _PARALLEL_DEVICE_ORDER_PATCHED,

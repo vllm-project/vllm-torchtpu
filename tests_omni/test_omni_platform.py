@@ -2226,3 +2226,50 @@ def test_non_ring_attention_layer_skips_ring_dispatch_work(monkeypatch):
         monkeypatch.setattr(layer, "_get_active_parallel_strategy", _fail)
         monkeypatch.setattr(layer, "_with_kv_cache_dtype", _fail)
         assert layer._forward_impl(q, q, q) == "fallback"
+
+
+def test_group_coordinator_methods_are_audited_for_reorder():
+    """Fail when vLLM-Omni adds a GroupCoordinator method nobody audited.
+
+    With ring_degree > 1 the cfg/dp groups can list ranks out of ascending order
+    (for example [6, 4]) while torch.distributed.new_group sorts them. Every
+    method in ``order_safe`` maps a group-local src/dst through ``self.ranks`` or
+    does not depend on member order. ``all_gather`` and ``gather`` return data in
+    sorted c10d order and are reordered by ``_patch_parallel_state_device_order``.
+    """
+    from vllm_omni.diffusion.distributed import group_coordinator
+
+    order_safe = {
+        "first_rank",
+        "last_rank",
+        "is_first_rank",
+        "is_last_rank",
+        "next_rank",
+        "prev_rank",
+        "group_next_rank",
+        "group_prev_rank",
+        "skip_rank",
+        "group_skip_rank",
+        "all_reduce",
+        "broadcast",
+        "broadcast_object",
+        "broadcast_object_list",
+        "send_object",
+        "recv_object",
+        "broadcast_tensor_dict",
+        "isend_tensor_dict",
+        "irecv_tensor_dict",
+        "send_tensor_dict",
+        "recv_tensor_dict",
+        "barrier",
+        "send",
+        "recv",
+        "destroy",
+    }
+    reordered = {"all_gather", "gather"}
+    members = {
+        name
+        for name, attr in vars(group_coordinator.GroupCoordinator).items()
+        if not name.startswith("__") and (callable(attr) or isinstance(attr, property))
+    }
+    assert members == order_safe | reordered
