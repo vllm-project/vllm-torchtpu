@@ -575,6 +575,7 @@ def _extract_profiled_kernel_summary() -> dict[str, object]:
     }
 
 
+@pytest.mark.spawns_tpu_workers
 def test_pcp8_qwen35_397b_history128k_chunk32k_layout_benchmark(tmp_path, capsys):
     _require_benchmark()
     result_dir = _resolve_result_dir(tmp_path)

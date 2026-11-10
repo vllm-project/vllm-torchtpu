@@ -72,8 +72,9 @@ def test_small_indexer_bucket_has_no_segment_dispatch(counts, distribution):
         context=context,
         request_distribution=jnp.asarray(distribution, jnp.int32),
     )
+    scored = select_decode_blocks.lower(*args, **options, topk_backend=SparseCoreTopK())
+    assert "stablehlo.case" not in scored.as_text()
     lowered = select_decode_blocks.lower(*args, **options)
-    assert "stablehlo.case" not in lowered.as_text()
     actual = np.asarray(lowered.compile()(*args, **options))
     live_lengths = jnp.where(jnp.arange(16) < counts.sum(), lengths, 0)
     expected = np.asarray(
