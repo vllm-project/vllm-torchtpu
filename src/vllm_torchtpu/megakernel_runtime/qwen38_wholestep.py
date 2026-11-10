@@ -161,6 +161,9 @@ class Qwen38WholeStep(nn.Module):
 
         from .qwen38_wholestep_weights import pack_wholestep_operands
 
+        from .qwen38_expert_copies import with_expert_copies
+
+        g = with_expert_copies(g, mesh.size)  # VLLM_TPU_MK_EP_REPLICAS
         self.g, self.mesh, self.buckets = g, mesh, buckets
         self.layers = list(model.model.layers)  # plain list: the model owns its layers
         ids = list(range(FIRST_LAYER, LAST_LAYER))

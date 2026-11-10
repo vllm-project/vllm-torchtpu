@@ -27,6 +27,7 @@ time per bucket. Usage (8 cores, one process):
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import time
 
 import jax
@@ -70,6 +71,8 @@ def main():
     ap.add_argument("--phys", action="store_true",
                     help="union ids -> physical page ids per request (VLLM_TPU_MEGAKERNEL wholephys=1)")
     ap.add_argument("--slots", type=int, default=0, help="union attention ring slots (0: default)")
+    ap.add_argument("--copies", type=int, default=0,
+                    help="redundant expert copies per rank (split e13x/e2x, Po2C)")
     ap.add_argument("--profile", default="", help="jax.profiler trace dir for --profile-iters calls")
     ap.add_argument("--profile-iters", type=int, default=5)
     a = ap.parse_args()
@@ -88,6 +91,8 @@ def main():
     )
     R = mesh.size
     g = qwen38.FULL
+    if a.copies:
+        g = dataclasses.replace(g, e_slots=g.E // R + a.copies, e_split=True)
     tp, rep = NamedSharding(mesh, P("tp")), NamedSharding(mesh, P())
     L = a.L
     n_att = max(1, L // 4)
@@ -161,6 +166,21 @@ def main():
                 ws += [rnd((R * x.shape[0],) + tuple(x.shape[1:]), x.dtype) for x in s]
             else:
                 ws.append(rnd((R * s[0][0],) + tuple(s[0][1:]), s[1]))
+        if a.copies:  # the redundant-copy table (`ecopy` smalls): default placement
+            from vllm_torchtpu.megakernel import planner
+            from vllm_torchtpu.megakernel.models import qwen35
+
+            gi = g.inner(R, L)
+            rows = np.asarray(qwen35.encode_eplb_ecopy(gi, R), np.float32)  # [L, E]
+            o, w_ = p.smalls_layout["ecopy"]
+            i_sm = p.w_names.index("smalls")
+            k_sm = sum(
+                len(wsh[n]) if kernel.is_tupled_weight(wsh[n]) else 1
+                for n in p.w_names[:i_sm]
+            )
+            sm = np.asarray(ws[k_sm]).reshape(R, L, 1, -1)
+            sm[:, :, 0, o : o + w_] = rows[None, :, :w_]
+            ws[k_sm] = jax.device_put(jnp.asarray(sm.reshape(R * L, 1, -1)), tp)
         rng = np.random.default_rng(0)
         # GDN ids are manager blocks (4 kernel blocks each), QSA ids are kernel blocks
         # (128 tokens): draw them from disjoint ranges of the kernel-granularity pool.

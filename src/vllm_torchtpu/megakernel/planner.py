@@ -405,6 +405,14 @@ def weight_shapes(
                 )
             else:
                 out[name] = ((l_cnt, *w.lead_dims, *t_shape), w.dtype)
+        elif w.tile_like:
+            t_shape = (p.nt[w.tile_like], p.tk[w.tile_like], w.N)
+            if w.layout == "per_layer":
+                out[name] = tuple(
+                    Spec((*w.lead_dims, *t_shape), w.dtype) for _ in range(l_cnt)
+                )
+            else:
+                out[name] = ((l_cnt, *w.lead_dims, *t_shape), w.dtype)
         else:
             if w.layout == "per_layer":
                 out[name] = tuple(

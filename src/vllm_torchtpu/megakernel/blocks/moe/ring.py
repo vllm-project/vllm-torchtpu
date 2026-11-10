@@ -30,6 +30,33 @@ from ...ops import bswitch
 from .context import MoEEmit
 
 
+def _unit_copy(m: MoEEmit, kind: str, home, copy, w, tile, bank) -> None:
+    """Start one expert weight unit DMA into `bank`; slot `w >= ER` is a redundant
+    copy in `copy` (`e13x` / `e2x`) under split copies, else every slot is in `home`.
+    """
+    mp, stream = m.mp, m.stream
+    if not mp.SPLIT:
+        stream.ecopy(kind, home.at[w, tile], bank).start()
+        return
+
+    @pl.when(w < mp.ER)
+    def _():
+        stream.ecopy(kind, home.at[w, tile], bank).start()
+
+    @pl.when(w >= mp.ER)
+    def _():
+        stream.ecopy(kind, copy.at[w - mp.ER, tile], bank).start()
+
+
+def _layer_refs(m: MoEEmit):
+    """Per-layer `(e13, e2, e13x, e2x)` ref tuples for `bswitch` (copies: None)."""
+    W = m.W
+    n = len(W["e13"])
+    xs13 = W["e13x"] if m.mp.SPLIT else (None,) * n
+    xs2 = W["e2x"] if m.mp.SPLIT else (None,) * n
+    return list(zip(W["e13"], W["e2"], xs13, xs2))
+
+
 def fetch_e(m: MoEEmit, u, l_idx, t=None):
     """Issue routed expert unit `u` into dynamic bank `u % NBE`."""
     W, me, mp, scr, stream = m.W, m.me, m.mp, m.scr, m.stream
@@ -57,8 +84,8 @@ def fetch_e(m: MoEEmit, u, l_idx, t=None):
             bswitch(
                 l_idx,
                 [
-                    lambda r=r: stream.ecopy("e13", r.at[w, tt], bank).start()
-                    for r in W["e13"]
+                    lambda a=a, ax=ax: _unit_copy(m, "e13", a, ax, w, tt, bank)
+                    for a, _, ax, _ in _layer_refs(m)
                 ],
             )
 
@@ -69,8 +96,8 @@ def fetch_e(m: MoEEmit, u, l_idx, t=None):
             bswitch(
                 l_idx,
                 [
-                    lambda r=r: stream.ecopy("e2", r.at[w, tt], bank).start()
-                    for r in W["e2"]
+                    lambda b=b, bx=bx: _unit_copy(m, "e2", b, bx, w, tt, bank)
+                    for _, b, _, bx in _layer_refs(m)
                 ],
             )
 
@@ -148,9 +175,10 @@ def _es_start(m: MoEEmit, i, w, l_idx):
     ).start()
 
 
-def _arm_issue(m: MoEEmit, r13, r2, w, bank, t, td, gate):
-    mp, stream = m.mp, m.stream
+def _arm_issue(m: MoEEmit, refs, w, bank, t, td, gate):
+    mp = m.mp
     T13 = mp.T13
+    r13, r2, x13, x2 = refs
 
     def g(p):
         return p if gate is None else jnp.logical_and(gate, p)
@@ -159,9 +187,9 @@ def _arm_issue(m: MoEEmit, r13, r2, w, bank, t, td, gate):
 
         def go():
             if t < T13:
-                stream.ecopy("e13", r13.at[w, t], bank).start()
+                _unit_copy(m, "e13", r13, x13, w, t, bank)
             else:
-                stream.ecopy("e2", r2.at[w, t - T13], bank).start()
+                _unit_copy(m, "e2", r2, x2, w, t - T13, bank)
 
         if gate is None:
             go()
@@ -171,11 +199,11 @@ def _arm_issue(m: MoEEmit, r13, r2, w, bank, t, td, gate):
 
     @pl.when(g(td < T13))
     def _():
-        stream.ecopy("e13", r13.at[w, td], bank).start()
+        _unit_copy(m, "e13", r13, x13, w, td, bank)
 
     @pl.when(g(td >= T13))
     def _():
-        stream.ecopy("e2", r2.at[w, td - T13], bank).start()
+        _unit_copy(m, "e2", r2, x2, w, td - T13, bank)
 
 
 def egive_group(m: MoEEmit, items, l_idx):
@@ -192,14 +220,11 @@ def egive_group(m: MoEEmit, items, l_idx):
         nt_ = None if t is None else (t + NBE) % TE
         metas.append(_unit_meta(m, nu, nt_) + (nu < st,))
 
-    def arm(r13, r2):
+    def arm(refs):
         for _, w, bank, t, td, gate in metas:
-            _arm_issue(m, r13, r2, w, bank, t, td, gate)
+            _arm_issue(m, refs, w, bank, t, td, gate)
 
-    bswitch(
-        l_idx,
-        [lambda a=a, b=b: arm(a, b) for a, b in zip(W["e13"], W["e2"])],
-    )
+    bswitch(l_idx, [lambda refs=refs: arm(refs) for refs in _layer_refs(m)])
     for i, w, _, t, td, gate in metas:
         if t is not None:
             if t == 0:
@@ -213,19 +238,16 @@ def egive_group(m: MoEEmit, items, l_idx):
 def fetch_loop(m: MoEEmit, nf, l_idx):
     W = m.W
 
-    def arm(r13, r2):
+    def arm(refs):
         def body(k, carry):
             i, w, _, t, td = _unit_meta(m, k, None)
-            _arm_issue(m, r13, r2, w, k, t, td, None)
+            _arm_issue(m, refs, w, k, t, td, None)
             pl.when(td == 0)(lambda: _es_start(m, i, w, l_idx))
             return carry
 
         lax.fori_loop(0, nf, body, 0)
 
-    bswitch(
-        l_idx,
-        [lambda a=a, b=b: arm(a, b) for a, b in zip(W["e13"], W["e2"])],
-    )
+    bswitch(l_idx, [lambda refs=refs: arm(refs) for refs in _layer_refs(m)])
 
 
 def es_wait(m: MoEEmit, i):

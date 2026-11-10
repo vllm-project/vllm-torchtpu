@@ -68,6 +68,9 @@ class WeightDecl:
     stream_ring: Literal["static", "dynamic", "hbm"] = "static"
     layout: Literal["stacked", "per_layer"] = "stacked"
     lead_dims: tuple[int, ...] = ()  # Extra per-layer leading dims (e.g. `(EW,)`)
+    # `hbm` weights only: tile like this streamed weight (`[*lead, nt, tk, N]` with
+    # its `nt` / `tk`), so its units can be DMAed into that weight's ring banks.
+    tile_like: str = ""
 
 
 @dataclass(frozen=True)

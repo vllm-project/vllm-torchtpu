@@ -63,6 +63,10 @@ class Qwen38InnerGeometry(Qwen35Geometry):
     # Gate on the GDN output norm: Qwen3.8's `RMSNormGated` multiplies by
     # sigmoid(z) (Qwen3.5: silu(z)).
     gdn_gate: str = "sigmoid"
+    # Redundant expert copies (`e_slots > ER`) held in their own per-layer arrays
+    # (`e13x` / `e2x`, `EXTRA` slots per rank) next to the model's `ER` experts, so
+    # the routed experts stay zero-copy views of the model parameters.
+    e_split: bool = False
 
     def check(self, ex: ExecSpec) -> None:
         R, B, T, M = ex.R, ex.B, ex.T, ex.M
@@ -102,6 +106,10 @@ class Qwen38Geometry:
     IS: int = 640
     NHC: int = 4
     LOWRANK: int = 320
+    # Per-rank routed-expert slots (0: the ER own experts; ER + EXTRA: EXTRA
+    # redundant copies per rank, Po2C-placed per step) and their split layout.
+    e_slots: int = 0
+    e_split: bool = False
     eps: float = 1e-6
     gdn_l2_eps: float = 1e-6
     theta: float = 10_000_000.0
@@ -140,6 +148,8 @@ class Qwen38Geometry:
             I=self.I,
             IS=self.shared_inter_padded(R),
             moe_tp=False,
+            e_slots=self.e_slots,
+            e_split=self.e_split,
             eps=self.eps,
             gdn_l2_eps=self.gdn_l2_eps,
             theta=self.theta,

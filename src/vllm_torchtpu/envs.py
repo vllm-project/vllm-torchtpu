@@ -125,6 +125,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_COMPRESSED_DCP: bool = False
     VLLM_TPU_QSA_DCP_SHARD_MERGE: bool = False
     VLLM_TPU_QSA_COMPRESSED_PAIR_SHIFT: bool = False
+    VLLM_TPU_MK_EP_REPLICAS: int = 0
     VLLM_TPU_HC_PREFILL_UP_T: bool = False
     VLLM_TPU_HC_PREFILL_COMBINE_MIX: bool = False
     VLLM_TPU_HC_PREFILL_WIDE_TILE: int = 0
@@ -851,6 +852,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # groups of the token) instead of a gather; a lax.cond falls back to the
     # gather when a written row's offset is out of range (bit-identical pool).
     "VLLM_TPU_QSA_COMPRESSED_PAIR_SHIFT": env_bool("VLLM_TPU_QSA_COMPRESSED_PAIR_SHIFT"),
+    # Qwen3.8 whole-step megakernel: N redundant routed-expert copies per rank per
+    # layer (Po2C-placed per step to the less loaded of an expert's two ranks), held
+    # in their own HBM arrays (N x 44 layers x 4.9 MB per rank). 0 = off. Changes the
+    # per-rank partial sums' grouping (not bitwise vs 0).
+    "VLLM_TPU_MK_EP_REPLICAS": env_int("VLLM_TPU_MK_EP_REPLICAS", 0),
     # Prefill HC full mix: take the up projection as its [low rank, width]
     # transpose. The checkpoint weight is held column-major, so the transpose
     # is a bitcast and the per-call relayout copy before the kernel goes away

@@ -35,6 +35,7 @@ call
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Any
 
 import torch
@@ -183,11 +184,31 @@ def pack_wholestep_operands(
     w["sh13"] = torch.stack([sh[0] for sh in shared])
     w["sh2"] = torch.stack([sh[1] for sh in shared])
     e13, e2, es = [], [], []
+    gi_own = dataclasses.replace(gi, e_slots=0, e_split=False)  # the model's ER experts
     for layer in layers:
-        a, b_, c = pack_expert_views_layer(layer.mlp, gi, ex, p.tk["e13"], p.tk["e2"])
+        a, b_, c = pack_expert_views_layer(
+            layer.mlp, gi_own, ex, p.tk["e13"], p.tk["e2"]
+        )
         e13.append(a)
         e2.append(b_)
         es.append(c)
+    if "e13x" in p.weight_decls:  # VLLM_TPU_MK_EP_REPLICAS: split expert copies
+        from vllm.distributed import (
+            get_tensor_model_parallel_rank,
+            tensor_model_parallel_all_gather,
+        )
+
+        from .qwen38_expert_copies import ecopy_rows, gather_copies
+
+        w["e13x"], w["e2x"], esx = gather_copies(
+            [layer.mlp for layer in layers],
+            gi,
+            ex.R,
+            int(get_tensor_model_parallel_rank()),
+            lambda t: tensor_model_parallel_all_gather(t, dim=0),
+        )
+        es = [torch.cat([c, x.to(c.device)], dim=0) for c, x in zip(es, esx, strict=True)]
+        sm["ecopy"] = ecopy_rows(gi, ex.R).to(dev)
     w["e13"], w["e2"], w["es"] = tuple(e13), tuple(e2), torch.stack(es)
     for j, layer in enumerate(layers):
         row("moe_hcn", j, layer.mlp_hyper_connection.hc_norm.weight.data)
@@ -205,7 +226,7 @@ def pack_wholestep_operands(
             out.append(smalls)
         elif name == "final_norm":
             out.append(torch.zeros((1, g.NHC * g.H), dtype=torch.float32, device=dev))
-        elif name in ("e13", "e2"):
+        elif name in ("e13", "e2", "e13x", "e2x"):
             out.extend(w[name])
         elif (
             name == "es"

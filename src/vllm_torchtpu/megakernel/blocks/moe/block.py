@@ -52,6 +52,13 @@ from .reference import moe_reference
 from .routing import route
 
 
+def _split_copies(g: Any, ex: ExecSpec, moe_tp: bool, e_slots: int) -> bool:
+    """Redundant expert copies in their own arrays (`e13x` / `e2x`)."""
+    split = bool(getattr(g, "e_split", False)) and not moe_tp and e_slots > g.E // ex.R
+    assert not (split and ex.stack_e), "split expert copies: per-layer layout only"
+    return split
+
+
 class MoEBlock(Block):
     """Sparse + shared MoE block with dynamic `epool` streaming and `PIPE`."""
 
@@ -164,6 +171,27 @@ class MoEBlock(Block):
         ir = g.I // ex.R if moe_tp else g.I
         ew = e_slots if e_slots > 0 else (g.E if moe_tp else er)
         layout_e = "stacked" if ex.stack_e else "per_layer"
+        split = _split_copies(g, ex, moe_tp, e_slots)
+        # Split copies: the `ER` own experts in `e13` / `e2` (the model's parameters),
+        # the `ew - ER` redundant copies in `e13x` / `e2x`, tiled like them.
+        e_lead = er if split else ew
+        copies = (
+            [
+                WeightDecl(
+                    f"{n}x",
+                    K=k,
+                    N=nn,
+                    dtype=FP8,
+                    stream_ring="hbm",
+                    layout="per_layer",
+                    lead_dims=(ew - er,),
+                    tile_like=n,
+                )
+                for n, k, nn in (("e13", g.H, 2 * ir), ("e2", ir, g.H))
+            ]
+            if split
+            else []
+        )
         return [
             WeightDecl("router", K=g.H, N=g.E, dtype=BF16, stream_ring="static"),
             WeightDecl("sh13", K=g.H, N=2 * isr, dtype=FP8, stream_ring="static"),
@@ -175,7 +203,7 @@ class MoEBlock(Block):
                 dtype=FP8,
                 stream_ring="dynamic",
                 layout=layout_e,
-                lead_dims=(ew,),
+                lead_dims=(e_lead,),
             ),
             WeightDecl(
                 "e2",
@@ -184,7 +212,7 @@ class MoEBlock(Block):
                 dtype=FP8,
                 stream_ring="dynamic",
                 layout=layout_e,
-                lead_dims=(ew,),
+                lead_dims=(e_lead,),
             ),
             WeightDecl(
                 "es",
@@ -194,6 +222,7 @@ class MoEBlock(Block):
                 stream_ring="hbm",
                 lead_dims=(ew,),
             ),
+            *copies,
         ]
 
     def smalls(self, g: Any, ex: ExecSpec) -> list[SmallField]:
@@ -226,6 +255,7 @@ class MoEBlock(Block):
             self.debug_flags(ex),
             moe_tp=moe_tp,
             e_slots=e_slots,
+            split=_split_copies(g, ex, moe_tp, e_slots),
         )
 
     def scratch(self, g: Any, ex: ExecSpec, plan: Any) -> dict[str, Any]:

@@ -47,6 +47,7 @@ class MoEParams:
     N_MOE: int
     ECOPY: bool
     moe_tp: bool
+    SPLIT: bool  # redundant copies in `e13x` / `e2x` (slot `w >= ER`)
     stack_e: bool
     topk_packed: bool
     topk_lanes: bool
@@ -123,6 +124,7 @@ def derive_moe_params(
     *,
     moe_tp: bool,
     e_slots: int,
+    split: bool = False,
 ) -> MoEParams:
     """Resolve `MoEParams` from model geometry, `ExecSpec`, and `StreamPlan`."""
     tiles = ex.resolve_tiles(g)
@@ -180,6 +182,7 @@ def derive_moe_params(
         N_MOE=n_moe,
         ECOPY=ecopy,
         moe_tp=moe_tp,
+        SPLIT=bool(split and ecopy),
         stack_e=ex.stack_e,
         topk_packed=tt.topk,
         topk_lanes=tt.topk_lanes,

@@ -29,7 +29,7 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from .. import kernel
+from .. import kernel, planner
 from ..blocks.gdn import GDNBlock
 from ..blocks.gdn.reference import gdn_reference
 from ..blocks.hc.reference import hc_combine, hc_mix
@@ -44,7 +44,7 @@ from ..models.qwen38_inputs import (
     hc_weight_arrays,
     random_segment_inputs,
 )
-from ..models.qwen38_pack import pack_weights
+from ..models.qwen38_pack import _tile, pack_weights
 from ..ops import BF16, F32, rmsnorm, rnd, rup
 from .qsa_full import project_reference, qkvg_width
 
@@ -256,6 +256,23 @@ def wholestep_reference(
     return x, jnp.stack(kv_new, axis=1)
 
 
+def _split_expert_copies(spec: Any, ex: ExecSpec, w_l: dict, L: int) -> dict:
+    """`e13x` / `e2x` (the redundant expert slots `ER..EW`, tiled like `e13` / `e2`)
+    when the spec splits the copies out; else `{}`."""
+    p = planner.plan(spec, ex)
+    if "e13x" not in p.weight_decls:
+        return {}
+    er = w_l["e13"].shape[2] - p.weight_decls["e13x"].lead_dims[0]
+    out = {}
+    for n in ("e13", "e2"):
+        nt, tk = p.nt[n], p.tk[n]
+        dt = p.weight_decls[n].dtype
+        out[f"{n}x"] = tuple(
+            _tile(w_l[n][:, j, er:], nt, tk).astype(dt) for j in range(L)
+        )
+    return out
+
+
 def pack_wholestep(
     spec: Any, g: Qwen38Geometry, ex: ExecSpec, d: dict[str, Any], L: int
 ) -> tuple[dict, dict]:
@@ -264,12 +281,15 @@ def pack_wholestep(
     hc, w_l, st_l = d["hc"], d["inp"].w_l, d["inp"].st_l
     att_rows = att_layers(g, L, d.get("first", "gdn"))
     gdn_rows = tuple(j for j in range(L) if j not in att_rows)
+    copies = _split_expert_copies(spec, ex, w_l, L)
+    er = g.E // R if copies else w_l["e13"].shape[2]
     weights = {
         "router": _rep(w_l["router"], R),
         "sh13": w_l["sh13"],
         "sh2": w_l["sh2"],
-        "e13": tuple(w_l["e13"][:, j] for j in range(L)),
-        "e2": tuple(w_l["e2"][:, j] for j in range(L)),
+        "e13": tuple(w_l["e13"][:, j, :er] for j in range(L)),
+        "e2": tuple(w_l["e2"][:, j, :er] for j in range(L)),
+        **copies,
         "es": jnp.concatenate([w_l["e13_s"], w_l["e2_s"]], axis=-1)[:, :, :, None, :],
         **hc_weight_arrays("moe", hc["moe"], g, R, mix=True),
         "qkvg": d["qkvg"],
