@@ -73,7 +73,9 @@ class _HostOp:
 
 @pytest.fixture(autouse=True)
 def host_ops(monkeypatch):
-    monkeypatch.setattr(fused.pallas, "jax_op", _HostOp)
+    # Only this module's binding: a module first imported during a test (one
+    # that builds a pallas op at import) must keep the real jax_op.
+    monkeypatch.setattr(fused, "pallas", SimpleNamespace(jax_op=_HostOp))
     monkeypatch.setattr(fused, "_ops", {})
     orig_kernel = fused.qk_norm_rope_gate
     orig_ref = fused.qk_norm_rope_gate_reference
