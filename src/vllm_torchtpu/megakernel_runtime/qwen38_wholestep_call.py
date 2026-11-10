@@ -179,6 +179,7 @@ def build_wholestep_call(
     interpret: bool = False,
     tiles: Tiles | None = None,
     tail: bool = False,
+    stacked_meta: bool = False,
 ) -> tuple[Any, tuple, tuple, tuple]:
     """`tail` (VLLM_TPU_MK_WHOLE_L47): the last QSA layer (model layer 47) runs as a
     second, one-layer kernel (`wholestep_spec(L=1)`) right after the `L`-layer one, in
@@ -272,7 +273,11 @@ def build_wholestep_call(
         lambda r: r[:B], mesh=mesh, in_specs=tp, out_specs=tp, check_vma=False
     )
     pos0 = jnp.zeros((B,), jnp.int32)
-    n_meta = GDN_META * n_gdn
+    # `stacked_meta` (VLLM_TPU_MK_STACKED_MAMBA_OPERANDS): the GDN metadata as six operands,
+    # `(state_stack [G, NS], ckpt_stack [G, NS, W], rows int32 [n_gdn], read_offsets,
+    # query_start_loc, seq_lens)` (the staged walk's stacks, VLLM_TPU_STAGED_WALK_STACKED)
+    # instead of five per GDN layer; the per-layer rows are sliced in the call.
+    n_meta = 6 if stacked_meta else GDN_META * n_gdn
     n_tab = QSA_TABLES * n_qsa
     slots = [(lay.main_slot, lay.compressed_slot) for lay in qsa_layers]
     scales = (qsa_layers[0].k_scale, qsa_layers[0].v_scale)
@@ -386,6 +391,10 @@ def build_wholestep_call(
         pool = args[i]
         meta = args[i + 1 : i + 1 + n_meta]
         i += 1 + n_meta
+        if stacked_meta:
+            st_stack, ck_stack, rows, ro, qsl, seq = meta
+            st, ck = st_stack[rows], ck_stack[rows]
+            meta = [x for o in range(n_gdn) for x in (st[o], ro, ck[o], qsl, seq)]
         tables = args[i : i + n_tab]
         i += n_tab
         positions, starts, context, trig = args[i : i + 4]

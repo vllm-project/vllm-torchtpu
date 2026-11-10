@@ -73,6 +73,9 @@ def main():
     ap.add_argument("--slots", type=int, default=0, help="union attention ring slots (0: default)")
     ap.add_argument("--profile", default="", help="jax.profiler trace dir for --profile-iters calls")
     ap.add_argument("--profile-iters", type=int, default=5)
+    ap.add_argument("--stacked-meta-check", action="store_true",
+                    help="VLLM_TPU_MK_STACKED_MAMBA_OPERANDS: compare the stacked-metadata call "
+                    "with the per-layer one (bitwise) after the first call")
     ap.add_argument("--trace-only", action="store_true",
                     help="CPU check: interpret Pallas, lower the call once, no run")
     ap.add_argument("--tail", action="store_true",
@@ -138,6 +141,11 @@ def main():
             rotary_dim=64,
             tail=a.tail,
         )
+        if a.stacked_meta_check:
+            call_s, _, _, _ = build_wholestep_call(
+                mesh, g, B, layout, layers, L=L, budget=a.budget, max_groups=a.max_groups,
+                norm_eps=1e-6, rotary_dim=64, tail=a.tail, stacked_meta=True,
+            )
         spec = wholestep_spec(
             g,
             R,
@@ -247,6 +255,31 @@ def main():
             out = jax.eval_shape(f, *args)
             print(f"B={B} L={L} tail={a.tail} traced: {[o.shape for o in out]}", flush=True)
             continue
+        if a.stacked_meta_check:
+            # The walk's stacks: rows in a shuffled order plus 4 unused rows (PLE etc.).
+            i0 = 2 + len(ws)
+            per = [np.asarray(m) for m in meta]
+            G = n_gdn + 4
+            order = rng.permutation(G)[:n_gdn]
+            st_stack = np.full((G, NR), 7, np.int32)
+            ck_stack = np.full((G, NR, 4), 7, np.int32)
+            for o in range(n_gdn):
+                st_stack[order[o]] = per[5 * o]
+                ck_stack[order[o]] = per[5 * o + 2]
+            meta_s = [st_stack, ck_stack, order.astype(np.int32), per[1], per[3], per[4]]
+            args_s = args[:i0] + list(map(put, meta_s)) + args[i0 + len(meta):]
+            zero_pool = jax.jit(lambda p: jnp.zeros_like(p), out_shardings=tp)
+            fs = jax.jit(call_s, donate_argnums=donate)
+            args[1 + len(ws)] = zero_pool(pool)
+            r0, p0 = f(*args)
+            args_s[1 + len(ws)] = zero_pool(pool)
+            r1, p1 = fs(*args_s)
+            same = bool(jnp.array_equal(r0, r1)) and bool(
+                jnp.array_equal(jax.lax.bitcast_convert_type(p0, jnp.uint8),
+                                jax.lax.bitcast_convert_type(p1, jnp.uint8)))
+            print(f"B={B} STACKED_META bitwise={same}", flush=True)
+            pool = p0
+            args[1 + len(ws)] = pool
         t0 = time.time()
         res, pool = f(*args)
         jax.block_until_ready(res)
