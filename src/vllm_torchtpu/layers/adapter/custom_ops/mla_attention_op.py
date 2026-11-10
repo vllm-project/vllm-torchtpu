@@ -1600,11 +1600,14 @@ class MlaKvWriteOp:
 
     def __init__(self, wrapper: VllmTPUMultiHeadLatentAttentionWrapper, mesh: Any):
         self.wrapper = wrapper
-        self.mla_layer = wrapper.mla_attn
+        # `mla_kv_spec` is attached when the caches are allocated, so the MLA
+        # layer is read as `Any`, as `_build_sparse_mla_op` reads it.
+        mla_layer: Any = wrapper.mla_attn
+        self.mla_layer = mla_layer
         assert isinstance(wrapper.indexer, VllmTPUIndexer)
         self.indexer = wrapper.indexer
         self.indexer_op = self.indexer.indexer_op
-        impl = self.mla_layer.impl
+        impl = cast(PallasMLAttentionBackendImpl, self.mla_layer.impl)
         self.impl = impl
         dcp_size = int(getattr(impl, "dcp_size", 1))
         if int(getattr(self.indexer_op, "dcp_size", 1)) != dcp_size:
@@ -1613,7 +1616,6 @@ class MlaKvWriteOp:
                 f"{dcp_size} vs {self.indexer_op.dcp_size}"
             )
         self.dcp_size = dcp_size
-        mla_layer = self.mla_layer
         kv_cache_mode = (
             envs.VLLM_TPU_INDEXER_KV_CACHE_MODE
             if envs.is_indexer_kv_cache_mode_explicit()

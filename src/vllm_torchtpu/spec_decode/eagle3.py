@@ -861,7 +861,11 @@ class Eagle3Proposer:
     def _set_kv_only_compile_sizes(self, min_tokens: int) -> None:
         config = self._mtp_kv_only_vllm_config
         assert config is not None
-        draft_sizes = self.draft_vllm_config.compilation_config.compile_sizes or ()
+        # TPUPlatform sets compile_sizes to the token padding buckets (ints).
+        draft_sizes = [
+            int(size)
+            for size in self.draft_vllm_config.compilation_config.compile_sizes or ()
+        ]
         config.compilation_config.compile_sizes = [
             size for size in draft_sizes if size >= min_tokens
         ]
