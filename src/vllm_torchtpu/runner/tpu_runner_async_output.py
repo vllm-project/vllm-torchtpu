@@ -385,3 +385,113 @@ def _compiled_pad_non_spec_next_tokens(
 ) -> torch.Tensor:
     col0 = selected.reshape(-1, 1).to(torch.int32)
     return torch.nn.functional.pad(col0, (0, k), value=INVALID_TOKEN_ID)
+
+
+@_static_shape_args
+@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+def _compiled_assemble_spec_and_rejected(
+    next_tokens: torch.Tensor,
+    drafts: torch.Tensor,
+    draft_lengths: torch.Tensor,
+    bound: int,
+    max_num_reqs: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused bucketed on-device substitution source assembly + num_rejected.
+
+    Operates on bucketed ``next_tokens`` ``[B, K+1]``, ``drafts`` ``[D, K]``
+    (with ``D >= B``), and ``draft_lengths`` ``[B]`` (padded tail rows are 0),
+    returning ``(src_padded [bound], num_rejected_padded [max_num_reqs])`` in a
+    single compiled graph.
+    """
+    B = next_tokens.shape[0]
+    drafts_b = (
+        torch.nn.functional.pad(drafts, (0, 0, 0, B - drafts.shape[0]))
+        if drafts.shape[0] < B
+        else drafts[:B]
+    )
+    num_valid = (next_tokens != INVALID_TOKEN_ID).sum(dim=1)
+    last_valid_col = num_valid.clamp(min=1) - 1
+    bonus = next_tokens.gather(1, last_valid_col.unsqueeze(1))
+    src = torch.cat([bonus.to(drafts_b.dtype), drafts_b], dim=1).reshape(-1)
+    if src.shape[0] < bound:
+        src = torch.nn.functional.pad(src, (0, bound - src.shape[0]))
+    num_rejected = (draft_lengths - num_valid + 1).clamp(min=0).to(torch.int32)
+    if B < max_num_reqs:
+        num_rejected = torch.nn.functional.pad(num_rejected, (0, max_num_reqs - B))
+    return src, num_rejected
+
+
+@_static_shape_args
+@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+def _compiled_assemble_two_chunks_spec_and_rejected(
+    nt0: torch.Tensor,
+    drafts0: torch.Tensor,
+    dl0: torch.Tensor,
+    nt1: torch.Tensor,
+    drafts1: torch.Tensor,
+    dl1: torch.Tensor,
+    bound: int,
+    max_num_reqs: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused 2-chunk bucketed substitution source assembly + num_rejected.
+
+    Packs chunk 0 at request indices ``[0 .. B0 - 1]`` and chunk 1 at bucketed
+    offset ``[B0 .. B0 + B1 - 1]`` so neither chunk slices by unbucketed
+    ``num_reqs``. Requires ``B0 + B1 <= max_num_reqs``.
+    """
+    B0 = nt0.shape[0]
+    d0 = (
+        torch.nn.functional.pad(drafts0, (0, 0, 0, B0 - drafts0.shape[0]))
+        if drafts0.shape[0] < B0
+        else drafts0[:B0]
+    )
+    nv0 = (nt0 != INVALID_TOKEN_ID).sum(dim=1)
+    lvc0 = nv0.clamp(min=1) - 1
+    bonus0 = nt0.gather(1, lvc0.unsqueeze(1))
+    src0 = torch.cat([bonus0.to(d0.dtype), d0], dim=1).reshape(-1)
+    rej0 = (dl0 - nv0 + 1).clamp(min=0).to(torch.int32)
+
+    B1 = nt1.shape[0]
+    d1 = (
+        torch.nn.functional.pad(drafts1, (0, 0, 0, B1 - drafts1.shape[0]))
+        if drafts1.shape[0] < B1
+        else drafts1[:B1]
+    )
+    nv1 = (nt1 != INVALID_TOKEN_ID).sum(dim=1)
+    lvc1 = nv1.clamp(min=1) - 1
+    bonus1 = nt1.gather(1, lvc1.unsqueeze(1))
+    src1 = torch.cat([bonus1.to(d1.dtype), d1], dim=1).reshape(-1)
+    rej1 = (dl1 - nv1 + 1).clamp(min=0).to(torch.int32)
+
+    src = torch.cat([src0, src1], dim=0)
+    if src.shape[0] < bound:
+        src = torch.nn.functional.pad(src, (0, bound - src.shape[0]))
+    rej = torch.cat([rej0, rej1], dim=0)
+    if rej.shape[0] < max_num_reqs:
+        rej = torch.nn.functional.pad(rej, (0, max_num_reqs - rej.shape[0]))
+    return src, rej
+
+
+@_static_shape_args
+@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+def _compiled_assemble_prefill_bootstrap(
+    selected_tokens: torch.Tensor,
+    padded_drafts: torch.Tensor,
+    bound: int,
+) -> torch.Tensor:
+    """Bucketed on-device substitution source assembly for async prefill bootstrap.
+
+    Packs ``selected_tokens`` ``[B, 1]`` and ``padded_drafts`` ``[D, K]`` (with
+    ``D >= B``) into ``src_padded [bound]`` in a single compiled graph.
+    """
+    B = selected_tokens.shape[0]
+    drafts_b = (
+        torch.nn.functional.pad(padded_drafts, (0, 0, 0, B - padded_drafts.shape[0]))
+        if padded_drafts.shape[0] < B
+        else padded_drafts[:B]
+    )
+    bonus = selected_tokens.reshape(B, 1).to(drafts_b.dtype)
+    src = torch.cat([bonus, drafts_b], dim=1).reshape(-1)
+    if src.shape[0] < bound:
+        src = torch.nn.functional.pad(src, (0, bound - src.shape[0]))
+    return src
