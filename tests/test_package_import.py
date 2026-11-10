@@ -83,3 +83,35 @@ def test_sitecustomize_cold_import_serve_api_utils_subprocess():
         "assert VLLM_SUBCMD_PARSER_EPILOG is epilog; "
         "assert cli_env_setup is startup.cli_env_setup"
     )
+
+
+def test_sitecustomize_wraps_startup_cli_env_setup_subprocess():
+    _run_python(
+        "from vllm.entrypoints.common.startup import cli_env_setup; "
+        "assert getattr(cli_env_setup, '_rust_wrapped', False)"
+    )
+
+
+def test_sitecustomize_rust_cli_delegation_subprocess():
+    import os
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "vllm.entrypoints.cli.main",
+            "serve",
+            "m",
+            "--invalid-option-for-rvllm",
+        ],
+        capture_output=True,
+        text=True,
+        env={
+            **dict(os.environ),
+            "VLLM_TPU_USE_RUST": "1",
+            "VLLM_TPU_RVLLM_BINARY": "/bin/true",
+        },
+        timeout=30,
+    )
+    assert result.returncode == 2, (result.stdout, result.stderr)
+    assert "rvllm: error:" in result.stderr
