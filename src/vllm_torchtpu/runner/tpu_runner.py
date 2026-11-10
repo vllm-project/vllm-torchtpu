@@ -6139,17 +6139,20 @@ class TPUModelRunner(GPUModelRunner):
                     # there drops all but one query token per sequence (MTP
                     # acceptance ~0.5% on Qwen3.5 DCP4 + MTP3). Loop steps (one
                     # token) are fine in a K+1 tile.
-                    # A REPLICATED (tp=1) draft under a sharded target moves to
-                    # the LOCAL (non-shard_map) kernel, which is 1-wide; its
-                    # width is folded into the threshold below. When the target
-                    # itself runs at tp=1 (a pipeline stage) the draft shares
-                    # the target's kernel, which reads the pool's KV layout.
+                    # A REPLICATED (tp=1) draft moves to the LOCAL
+                    # (non-shard_map) kernel, which is 1-wide; its width is
+                    # folded into the threshold below. On a pipeline stage
+                    # whose target also runs at tp=1 the draft shares the
+                    # target's kernel, which reads the pool's KV layout.
                     replicated_draft = False
                     if is_draft:
                         assert self.speculative_config is not None
                         replicated_draft = (
                             self.speculative_config.draft_tensor_parallel_size == 1
-                            and self.parallel_config.tensor_parallel_size > 1
+                            and not (
+                                self.parallel_config.tensor_parallel_size == 1
+                                and self.parallel_config.pipeline_parallel_size > 1
+                            )
                         )
                     if replicated_draft:
                         impl.decode_query_size = 1
