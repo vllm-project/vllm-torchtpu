@@ -2196,3 +2196,33 @@ def test_can_fuse_tpu_ring_ulysses_requires_strict_ulysses_mode(monkeypatch):
     with set_forward_context(vllm_config=None, omni_diffusion_config=uaa_cfg):
         assert can_fuse_tpu_ring_ulysses(layer, strategy, q, q, q, None) is False
         assert layer._forward_impl(q, q, q) == "fallback"
+
+
+def test_non_ring_attention_layer_skips_ring_dispatch_work(monkeypatch):
+    """Layers without a ring runner reach upstream before any ring helper runs."""
+    import vllm_torchtpu.omni.attention as omni_attention
+    from vllm_torchtpu.omni.patches import _patch_ring_attention
+
+    def _fail(*args, **kwargs):
+        raise AssertionError("non-ring layer ran ring dispatch work")
+
+    monkeypatch.setattr(omni_attention, "can_fuse_tpu_ring_ulysses", _fail)
+    monkeypatch.setattr(omni_attention, "tpu_ring_flash_attention", _fail)
+    monkeypatch.setattr(
+        Attention, "_forward_impl", lambda self, q, k, v, attn_metadata=None: "fallback"
+    )
+    _patch_ring_attention()
+
+    sp_group = SimpleNamespace(ring_world_size=2, ulysses_world_size=2)
+    runner = RingParallelAttention(sp_group, attn_backend_pref="TPU_FLASH_ATTN")
+    no_runner = _make_ring_attention_layer(ring_runner=None)
+    flag_without_runner = _make_ring_attention_layer(ring_runner=None)
+    flag_without_runner.use_ring = True
+    runner_without_flag = _make_ring_attention_layer(ring_runner=runner)
+    runner_without_flag.use_ring = False
+
+    q = torch.randn(1, 16, 4, 16, dtype=torch.bfloat16)
+    for layer in (no_runner, flag_without_runner, runner_without_flag):
+        monkeypatch.setattr(layer, "_get_active_parallel_strategy", _fail)
+        monkeypatch.setattr(layer, "_with_kv_cache_dtype", _fail)
+        assert layer._forward_impl(q, q, q) == "fallback"

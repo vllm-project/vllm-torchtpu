@@ -710,6 +710,12 @@ def _patch_ring_attention() -> None:
             value: torch.Tensor,
             attn_metadata: Any = None,
         ) -> torch.Tensor:
+            # Layers without a ring runner (every non-ring pipeline) return to
+            # the upstream path before any strategy or metadata work.
+            if not getattr(self, "use_ring", False) or (
+                getattr(self, "ring_runner", None) is None
+            ):
+                return orig_forward_impl(self, query, key, value, attn_metadata)
             strategy = self._get_active_parallel_strategy()
             checked_meta = self._with_kv_cache_dtype(attn_metadata)
             if can_fuse_tpu_ring_ulysses(
