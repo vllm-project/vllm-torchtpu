@@ -28,6 +28,7 @@ import torch
 from vllm.v1.outputs import DraftTokenIds
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 
+from vllm_torchtpu.layers.core.attention_metadata import stage_h2d_upload
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 
 if TYPE_CHECKING:
@@ -42,12 +43,13 @@ def _get_padded_token_len(paddings: list[int], x: int) -> int:
 
 
 def _h2d_temp(runner: "TPUModelRunner", host: torch.Tensor) -> torch.Tensor:
-    """non_blocking upload of a temporary host tensor for ``runner``."""
-    keep = runner.__dict__.get("_h2d_keepalive")
-    if keep is None:
-        keep = runner.__dict__["_h2d_keepalive"] = []
-    keep.append(host)
-    return host.to(runner.device, non_blocking=True)
+    """non_blocking upload of a temporary host tensor for ``runner``.
+
+    An alias of ``stage_h2d_upload``, as in the runner: ``host`` stays alive
+    until the runner's next input-staging fence has been synchronized, and is
+    released then.
+    """
+    return stage_h2d_upload(runner, host)
 
 
 @dataclass
