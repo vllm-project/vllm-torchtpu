@@ -26,6 +26,7 @@ overwrites them.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import sys
 import types
@@ -251,16 +252,26 @@ ACCEPTED = [1, 4, 2, 0, 3, 1, 0, 4]
 
 
 @pytest.mark.parametrize(
-    "fused,batched", [(False, False), (False, True), (True, False)]
+    "fused,batched,stacked",
+    [(False, False, False), (False, True, False), (True, False, False), (False, True, True)],
 )  # the fused writer keeps the per-layer sequence (batched is ignored there)
 @pytest.mark.parametrize("pad", [0, 4])
 def test_wholestep_qsa_writes_match_stock_over_two_steps(
-    interpret, monkeypatch, fused, batched, pad
+    interpret, monkeypatch, fused, batched, stacked, pad
 ):
     """`pad` idle requests past the kernel's request count (the runner's max_num_seqs
     rows):
-    the whole-step writer crops them (`num_requests`) and must still match stock."""
+    the whole-step writer crops them (`num_requests`) and must still match stock.
+    `stacked`: the layer-stacked writer (VLLM_TPU_MK_STACKED_QSA_WRITES); both paired
+    layers name one main group."""
     monkeypatch.setattr(envs, "VLLM_TPU_QSA_FUSED_KV_WRITE", fused)
+    monkeypatch.setattr(envs, "VLLM_TPU_MK_STACKED_QSA_WRITES", stacked)
+    if stacked:
+        monkeypatch.setattr(
+            sys.modules[__name__],
+            "LAYERS",
+            [dataclasses.replace(lay, main_group="main") for lay in LAYERS],
+        )
     rng = np.random.default_rng(7 + fused)
     contexts, active = CONTEXTS + [0] * pad, ACTIVE + [False] * pad
     main, comp, rings = tables(rng, contexts, active)
