@@ -73,6 +73,9 @@ def main():
     ap.add_argument("--slots", type=int, default=0, help="union attention ring slots (0: default)")
     ap.add_argument("--profile", default="", help="jax.profiler trace dir for --profile-iters calls")
     ap.add_argument("--profile-iters", type=int, default=5)
+    ap.add_argument("--hash", action="store_true",
+                    help="print a hash of the first call's outputs (bitwise comparison across "
+                    "VLLM_TPU_MK_TILES / VLLM_TPU_MK_BUCKET_TUNE configs)")
     ap.add_argument("--trace-only", action="store_true",
                     help="CPU check: interpret Pallas, lower the call once, no run")
     ap.add_argument("--tail", action="store_true",
@@ -250,6 +253,12 @@ def main():
         t0 = time.time()
         res, pool = f(*args)
         jax.block_until_ready(res)
+        if a.hash:
+            import hashlib
+
+            hsh = hashlib.sha256(np.asarray(res).tobytes())
+            hsh.update(np.asarray(jax.lax.bitcast_convert_type(pool, jnp.uint8)).tobytes())
+            print(f"B={B} HASH {hsh.hexdigest()[:16]}", flush=True)
         print(
             f"B={B} first call (compile+run) {time.time() - t0:.1f} s, finite "
             f"{float(jnp.isfinite(res.astype(jnp.float32)).mean()):.4f}",
