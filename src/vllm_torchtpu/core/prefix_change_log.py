@@ -14,10 +14,16 @@
 """Prefix-cache change log for PrefixAwareScheduler's cross-step memo.
 
 Layered on top of the same-step prefix-hit patch in ``vllm_torchtpu/__init__``
-(which owns ``_tpu_prefix_cache_epoch`` and ``_tpu_unwritten_block_ids``) and
-kept out of that file on purpose: ``vllm_torchtpu/__init__.py`` also defines a
-patched VocabParallelEmbedding.forward that Dynamo traces, so editing it would
-change vLLM's traced-file code hash and force a full recompile.
+(which owns ``_tpu_unwritten_block_ids`` and clears it in
+``KVCacheManager.new_step_starts``) and kept out of that file on purpose:
+``vllm_torchtpu/__init__.py`` also defines a patched
+VocabParallelEmbedding.forward that Dynamo traces, so editing it would change
+vLLM's traced-file code hash and force a full recompile.
+
+``install_epoch`` adds ``pool._tpu_prefix_cache_epoch``, which moves on every
+prefix-cache mutation. The schedulers that memoise lookups install it when
+they are built, so an engine that runs neither keeps the same-step patch as it
+is.
 
 Once enabled on a BlockPool, every event that can change the answer of
 ``BlockPool.get_cached_block(h, groups)`` appends ``(epoch, h)`` to
@@ -26,9 +32,9 @@ Once enabled on a BlockPool, every event that can change the answer of
 * a key inserted (all keys of the block are logged: the block joining the
   unwritten set flips the answer of every key whose first block it is);
 * a key removed (eviction / re-pointing);
-* the unwritten set cleared at ``Scheduler.schedule`` start (the plugin wrapper
-  bumps the epoch by one and clears; we log the affected keys with that epoch
-  just before);
+* the unwritten set cleared at ``KVCacheManager.new_step_starts`` (the epoch
+  moves by one and the plugin wrapper clears; we log the affected keys with
+  that epoch just before);
 * ``reset_prefix_cache`` drops the log and raises the log base epoch.
 """
 
@@ -56,8 +62,8 @@ def _log_block_keys(d, log, epoch, block, extra_key=None) -> None:
 
 
 def log_unwritten_clear(pool) -> None:
-    """Log keys whose answer flips when the unwritten set is cleared by the
-    plugin's schedule wrapper (which bumps the epoch by exactly one)."""
+    """Log keys whose answer flips when the unwritten set is cleared at
+    ``KVCacheManager.new_step_starts`` (where the epoch moves by exactly one)."""
     d = pool.__dict__
     log = d.get(LOG)
     unwritten = d.get(UNWRITTEN)
@@ -77,7 +83,7 @@ def install_epoch() -> None:
     cleared at the start of a step. Idempotent.
     """
     from vllm.v1.core.block_pool import BlockPool
-    from vllm.v1.core.sched.scheduler import Scheduler
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
 
     if getattr(BlockPool._remove_cached_block_hashes, _EPOCH_MARK, False):
         return
@@ -85,7 +91,7 @@ def install_epoch() -> None:
     original_insert_block_hash = BlockPool._insert_block_hash
     original_remove_cached_block_hashes = BlockPool._remove_cached_block_hashes
     original_reset_prefix_cache = BlockPool.reset_prefix_cache
-    original_schedule = Scheduler.schedule
+    original_new_step_starts = KVCacheManager.new_step_starts
 
     @functools.wraps(original_insert_block_hash)
     def _insert_block_hash(self, block_hash_with_group_id, block, num_tokens):
@@ -95,14 +101,10 @@ def install_epoch() -> None:
 
     @functools.wraps(original_remove_cached_block_hashes)
     def _remove_cached_block_hashes(self, *args, **kwargs):
-        evicted_hashes = original_remove_cached_block_hashes(
-            self, *args, **kwargs
-        )
+        evicted_hashes = original_remove_cached_block_hashes(self, *args, **kwargs)
         if evicted_hashes:
             d = self.__dict__
-            d["_tpu_prefix_cache_epoch"] = (
-                d.get("_tpu_prefix_cache_epoch", 0) + 1
-            )
+            d["_tpu_prefix_cache_epoch"] = d.get("_tpu_prefix_cache_epoch", 0) + 1
         return evicted_hashes
 
     @functools.wraps(original_reset_prefix_cache)
@@ -112,53 +114,63 @@ def install_epoch() -> None:
         d["_tpu_prefix_cache_epoch"] = d.get("_tpu_prefix_cache_epoch", 0) + 1
         return res
 
-    @functools.wraps(original_schedule)
-    def schedule(self, *args, **kwargs):
-        pool = self.kv_cache_manager.block_pool
+    # The same-step patch clears the unwritten set in new_step_starts; the
+    # epoch moves first, so a lookup made before the clear is not reused.
+    @functools.wraps(original_new_step_starts)
+    def new_step_starts(self, *args, **kwargs):
+        pool = self.block_pool
         unwritten = pool.__dict__.get(UNWRITTEN)
         if unwritten:
             d = pool.__dict__
-            d["_tpu_prefix_cache_epoch"] = (
-                d.get("_tpu_prefix_cache_epoch", 0) + 1
-            )
-        return original_schedule(self, *args, **kwargs)
+            d["_tpu_prefix_cache_epoch"] = d.get("_tpu_prefix_cache_epoch", 0) + 1
+        return original_new_step_starts(self, *args, **kwargs)
 
     for wrapper in (
         _insert_block_hash,
         _remove_cached_block_hashes,
         reset_prefix_cache,
-        schedule,
+        new_step_starts,
     ):
         setattr(wrapper, _EPOCH_MARK, True)
-        wrapper._tpu_same_step_prefix_hit_patch = True
     BlockPool._insert_block_hash = _insert_block_hash
     BlockPool._remove_cached_block_hashes = _remove_cached_block_hashes
     BlockPool.reset_prefix_cache = reset_prefix_cache
-    Scheduler.schedule = schedule
+    KVCacheManager.new_step_starts = new_step_starts
+
+
+def epoch_installed() -> bool:
+    """Whether ``install_epoch`` has run in this process."""
+    from vllm.v1.core.block_pool import BlockPool
+
+    return bool(getattr(BlockPool._remove_cached_block_hashes, _EPOCH_MARK, False))
 
 
 def install() -> bool:
-    """Wrap BlockPool/Scheduler (idempotent). Requires the plugin's same-step
-    prefix-hit patch; returns False (memo stays per-step) without it."""
+    """Wrap BlockPool/KVCacheManager (idempotent). Requires the plugin's
+    same-step prefix-hit patch and ``install_epoch``; returns False (memo stays
+    per-step) without them."""
     from vllm.v1.core.block_pool import BlockPool
-    from vllm.v1.core.sched.scheduler import Scheduler
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
 
     if getattr(BlockPool._insert_block_hash, _MARK, False):
         return True
+    if not getattr(
+        BlockPool.get_cached_block, "_tpu_same_step_prefix_hit_patch", False
+    ):
+        return False
     for fn in (
         BlockPool._insert_block_hash,
         BlockPool._remove_cached_block_hashes,
         BlockPool.reset_prefix_cache,
-        BlockPool.get_cached_block,
-        Scheduler.schedule,
+        KVCacheManager.new_step_starts,
     ):
-        if not getattr(fn, "_tpu_same_step_prefix_hit_patch", False):
+        if not getattr(fn, _EPOCH_MARK, False):
             return False
 
     inner_insert = BlockPool._insert_block_hash
     inner_remove = BlockPool._remove_cached_block_hashes
     inner_reset = BlockPool.reset_prefix_cache
-    inner_schedule = Scheduler.schedule
+    inner_new_step_starts = KVCacheManager.new_step_starts
 
     @functools.wraps(inner_insert)
     def _insert_block_hash(self, block_hash_with_group_id, block, num_tokens):
@@ -190,18 +202,23 @@ def install() -> bool:
             d[BASE] = d.get(EPOCH, 0)
         return res
 
-    @functools.wraps(inner_schedule)
-    def schedule(self, *args, **kwargs):
-        log_unwritten_clear(self.kv_cache_manager.block_pool)
-        return inner_schedule(self, *args, **kwargs)
+    @functools.wraps(inner_new_step_starts)
+    def new_step_starts(self, *args, **kwargs):
+        log_unwritten_clear(self.block_pool)
+        return inner_new_step_starts(self, *args, **kwargs)
 
-    for wrapper in (_insert_block_hash, _remove_cached_block_hashes, reset_prefix_cache, schedule):
+    for wrapper in (
+        _insert_block_hash,
+        _remove_cached_block_hashes,
+        reset_prefix_cache,
+        new_step_starts,
+    ):
         setattr(wrapper, _MARK, True)
-        wrapper._tpu_same_step_prefix_hit_patch = True
+        setattr(wrapper, _EPOCH_MARK, True)
     BlockPool._insert_block_hash = _insert_block_hash
     BlockPool._remove_cached_block_hashes = _remove_cached_block_hashes
     BlockPool.reset_prefix_cache = reset_prefix_cache
-    Scheduler.schedule = schedule
+    KVCacheManager.new_step_starts = new_step_starts
     return True
 
 

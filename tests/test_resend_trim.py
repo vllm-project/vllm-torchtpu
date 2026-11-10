@@ -100,7 +100,7 @@ def test_trim_shrinks_payload_at_94k():
     assert dt < 0.01
 
 
-def test_scheduler_override_and_kill_switch(monkeypatch):
+def test_scheduler_override_and_off_switch(monkeypatch):
     calls = []
 
     def fake_super(self, *a, **k):
@@ -122,8 +122,9 @@ def test_scheduler_override_and_kill_switch(monkeypatch):
     out = s._make_cached_request_data([], [], {}, {}, {})
     assert out.all_token_ids == {"a": [4, 5]}
 
-    monkeypatch.setenv("TPU_SCHED_TRIM_RESEND_TOKEN_IDS", "0")
+    # A failed trim turns the trim off for the scheduler's lifetime.
     s2 = PrefixAwareScheduler.__new__(PrefixAwareScheduler)
+    s2._trim_resend = False
     out2 = s2._make_cached_request_data([], [], {}, {}, {})
     assert out2.all_token_ids == {"a": [1, 2, 3, 4, 5]}
     assert len(calls) == 2
