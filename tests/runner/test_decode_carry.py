@@ -21,8 +21,9 @@ D = K + 1
 
 @pytest.fixture(autouse=True)
 def _enabled(monkeypatch):
-    # Default off on ix-unified-port; these tests cover the enabled path (VLLM_TPU_DECODE_CARRY=1).
-    monkeypatch.setattr(dc, "ENABLED", True)
+    # These tests cover the carried path; the rule itself is tested in
+    # test_decode_carry_rule.py.
+    monkeypatch.setattr(dc, "enabled", lambda runner: True)
 
 
 def _indices(num_reqs, target, padded_total):
@@ -115,7 +116,7 @@ def _steady(req_ids=("a", "b"), r_prev=(1, 0), advance=None):
     S = np.array([5000, 7000][:n], dtype=np.int32)
     _set_host(r, S)
     pre_n = _Pre(req_ids)
-    dc.tag_results(pre_n)
+    dc.tag_results(r, pre_n)
     r._pre_async_results = pre_n
     kw = dict(start_index=0, num_reqs=n, num_scheduled_tokens_per_req_list=[D] * n,
               total_num_scheduled_tokens=n * D, padded_total_num_scheduled_tokens=n * D, target_num_reqs=4)
@@ -123,7 +124,7 @@ def _steady(req_ids=("a", "b"), r_prev=(1, 0), advance=None):
     # sample_tokens(N): _modify_prev_results reads back step N-1's rejections (the ones subtracted at N)
     dc.record_rejected(r, pre_n, dict(zip(req_ids, r_prev)))
     pre_n1 = _Pre(req_ids)
-    dc.tag_results(pre_n1)
+    dc.tag_results(r, pre_n1)
     r._pre_async_results = pre_n1
     adv = advance if advance is not None else [D - x for x in r_prev]
     _set_host(r, S + np.array(adv, dtype=np.int32))
@@ -176,9 +177,9 @@ def test_check_refuses_unmapped_request():
 
 
 def test_disabled_never_carries_the_steady_state(monkeypatch):
-    # ix-unified-port: the carry is default off; off must refuse even a step it would carry.
+    # Off (any engine outside the rule) refuses even a step it would carry.
     r, kw = _steady()
-    monkeypatch.setattr(dc, "ENABLED", False)
+    monkeypatch.setattr(dc, "enabled", lambda runner: False)
     assert dc.check(r, **kw) is None
     kw.pop("layout_plan")
     assert dc.record(r, sub_pairs=((0, D), (1, D)), seq_lens=torch.zeros(4), **kw) is False
