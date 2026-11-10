@@ -22,10 +22,13 @@ What `maybe_patch_qwen3_next` installs depends on the model (a Qwen3.5 rule):
   step-0 post-attention gather needs them even without sequence
   parallelism), and, under TPU_MOE_SEQUENCE_PARALLEL=1, row gating
   (`sequence_parallel.follow_step_form`).
-- Any other model on these classes (Qwen3-Next) gets only main's opt-in:
-  TPU_MOE_SEQUENCE_PARALLEL=1 installs the trace-stable forwards, whose
-  fusions stay inert without the Qwen3.5 setup, and every sequence-parallel
-  step stays sliced.
+- Any other model on these classes (Qwen3-Next, for example) keeps the
+  sequence-parallel opt-in it has without this patch: under
+  TPU_MOE_SEQUENCE_PARALLEL=1 the decoder layer and model take
+  `entry_chunk_decoder_layer_forward` and `entry_chunk_model_forward`, the
+  trace-stable forwards that chunk the rows at model entry, unchanged. The
+  drafter forwards stay as they are, nothing below is installed, and every
+  sequence-parallel step stays sliced.
 
 FP8 fusions, installed for a Qwen3.5 target:
 - Fused attention output sigmoid-gate + per-token FP8 quantization
@@ -35,8 +38,8 @@ FP8 fusions, installed for a Qwen3.5 target:
 - 256-column-aligned FP8 router gate + shared_expert weights
   (`maybe_setup_fused_gate_se`).
 
-The sequence-parallel forwards are copies of the upstream vLLM forwards
-restructured so torch.compile serves every bucket:
+The Qwen3.5 sequence-parallel forwards are copies of the upstream vLLM
+forwards restructured so torch.compile serves every bucket:
 - The model and the MTP drafter do not chunk their rows at entry. The first
   decoder layer (residual None) runs attention on the step's replicated rows;
   the reduce-scatter after attention leaves this rank's slice, and the
@@ -49,8 +52,8 @@ restructured so torch.compile serves every bucket:
   input; a row count derived from it ahead of an all-gather can stay symbolic
   in the compiled graph, which torch_tpu fails to lower ("SymIntArrayRef
   expected to contain only concrete integers" at the all-gather's
-  allocation). Main's model-entry chunk hit this at every SP bucket; this
-  structure (from bec1a1c91) compiles.
+  allocation). On the stack this structure comes from (bec1a1c91), the
+  model-entry chunk hit this at every SP bucket and this structure compiles.
 - The pad before the reduce-scatter is eliminated: buckets divide by TP
   (`sequence_parallel.check_buckets`).
 - A step shorter than `sequence_parallel.min_rows()` keeps its rows
@@ -1617,10 +1620,159 @@ def _with_rank_tensor(original_init: Callable) -> Callable:
     return __init__
 
 
+# The forwards every model except a Qwen3.5 target takes under
+# TPU_MOE_SEQUENCE_PARALLEL=1, the trace-stable copies of the upstream forwards
+# that chunk the rows at model entry: every decoder layer all-gathers its slice
+# into attention, narrows it to the step's token count and reduce-scatters after
+# attention, and the final norm's output is gathered back to every row.
+# torch._check(num_tokens % tp == 0) states that buckets divide by TP, so no pad
+# precedes the reduce-scatter.
+
+
+def _check_tokens_divide_by_tp(num_tokens: int) -> None:
+    tp_size = get_tensor_model_parallel_world_size()
+    if tp_size > 1:
+        torch._check(num_tokens % tp_size == 0)
+
+
+def entry_chunk_decoder_layer_forward(
+    self,
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor | None,
+    positions: torch.Tensor,
+    **kwargs: object,
+):
+    full_num_tokens = positions.shape[-1]
+
+    if residual is None:
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+    else:
+        hidden_states, residual = self.input_layernorm(hidden_states, residual)
+
+    if self.use_attn_reduce_scatter_for_moe:
+        hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
+        hidden_states = hidden_states.narrow(0, 0, full_num_tokens)
+
+    if self.layer_type == "linear_attention":
+        hidden_states = self.linear_attn(hidden_states=hidden_states)
+    elif self.layer_type == "full_attention":
+        hidden_states = self.self_attn(
+            hidden_states=hidden_states,
+            positions=positions,
+        )
+    else:
+        raise ValueError("Invalid layer_type")
+
+    if self.layer_scale:
+        if len(hidden_states.shape) == 2:
+            hidden_states = hidden_states * (
+                self.attn_layer_scale.to(hidden_states.dtype)[0] + 1
+            )
+        else:
+            hidden_states = hidden_states * (
+                self.attn_layer_scale.to(hidden_states.dtype) + 1
+            )
+
+    if self.use_attn_reduce_scatter_for_moe:
+        _check_tokens_divide_by_tp(full_num_tokens)
+        hidden_states = tensor_model_parallel_reduce_scatter(hidden_states, 0)
+
+    # Fully Connected
+    hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+    if self.use_attn_reduce_scatter_for_moe:
+        hidden_states = self.mlp(
+            hidden_states,
+            already_sequence_parallel=True,
+        )
+    else:
+        hidden_states = self.mlp(hidden_states)
+
+    if self.layer_scale:
+        if len(hidden_states.shape) == 2:
+            hidden_states = hidden_states * (
+                self.ffn_layer_scale.to(hidden_states.dtype)[0] + 1
+            )
+        else:
+            if len(hidden_states.shape) != len(self.ffn_layer_scale.shape):
+                raise RuntimeError(
+                    f"shape must be the same {len(hidden_states.shape)}, "
+                    f"{len(self.ffn_layer_scale.shape)}"
+                )
+            hidden_states = hidden_states * (
+                self.ffn_layer_scale.to(hidden_states.dtype) + 1
+            )
+
+    return hidden_states, residual
+
+
+def entry_chunk_model_forward(
+    self,
+    input_ids: torch.Tensor | None,
+    positions: torch.Tensor,
+    intermediate_tensors: IntermediateTensors | None = None,
+    inputs_embeds: torch.Tensor | None = None,
+) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+    if get_pp_group().is_first_rank:
+        if inputs_embeds is not None:
+            hidden_states = inputs_embeds
+        else:
+            hidden_states = self.embed_input_ids(input_ids)
+        residual = None
+    else:
+        if intermediate_tensors is None:
+            raise RuntimeError(
+                "intermediate_tensors must not be None when "
+                "pipeline parallelism is active"
+            )
+        hidden_states = intermediate_tensors["hidden_states"]
+        residual = intermediate_tensors["residual"]
+
+    assert isinstance(hidden_states, torch.Tensor)
+    full_num_tokens = positions.shape[-1]
+    if self.use_sequence_parallel:
+        _check_tokens_divide_by_tp(full_num_tokens)
+        hidden_states = qwen3_next.sequence_parallel_chunk(hidden_states)
+
+    aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
+    for layer_idx, layer in enumerate(
+        islice(self.layers, self.start_layer, self.end_layer),
+        start=self.start_layer,
+    ):
+        hidden_states, residual = layer(
+            positions=positions,
+            hidden_states=hidden_states,
+            residual=residual,
+        )
+        self._maybe_add_hidden_state(
+            aux_hidden_states, layer_idx + 1, hidden_states, residual
+        )
+
+    if not get_pp_group().is_last_rank:
+        assert isinstance(residual, torch.Tensor)
+        return IntermediateTensors(
+            {"hidden_states": hidden_states, "residual": residual}
+        )
+    hidden_states, _ = self.norm(hidden_states, residual)
+    if self.use_sequence_parallel:
+        if aux_hidden_states:
+            hidden_size = hidden_states.shape[-1]
+            hidden_states = torch.cat([hidden_states, *aux_hidden_states], dim=-1)
+            hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
+            hidden_states = hidden_states.narrow(0, 0, full_num_tokens)
+            hidden_states, *aux_hidden_states = hidden_states.split(hidden_size, dim=-1)
+        else:
+            hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
+            hidden_states = hidden_states.narrow(0, 0, full_num_tokens)
+    if aux_hidden_states:
+        return hidden_states, aux_hidden_states
+    return hidden_states
+
+
 def maybe_patch_qwen3_next(model_config: "ModelConfig | None" = None) -> bool | None:
     """Install the model patch for the engine's model (see the module
     docstring): everything on a Qwen3.5 target; for any other model only the
-    trace-stable forwards, and only when TPU_MOE_SEQUENCE_PARALLEL=1.
+    model-entry forwards, and only when TPU_MOE_SEQUENCE_PARALLEL=1.
 
     Off sequence-parallel the patched forwards match upstream except for the
     MTP step-0 post-attention gather. Returns False until a model config is
@@ -1629,17 +1781,21 @@ def maybe_patch_qwen3_next(model_config: "ModelConfig | None" = None) -> bool | 
     if model_config is None:
         return False
     is_qwen3_5 = qwen3_5_settings.is_qwen3_5(model_config)
-    if is_qwen3_5:
-        install_qwen3_next_v6_patches()
-    elif not envs.TPU_MOE_SEQUENCE_PARALLEL:
+    if not is_qwen3_5:
+        if envs.TPU_MOE_SEQUENCE_PARALLEL:
+            qwen3_next.Qwen3NextDecoderLayer.forward = entry_chunk_decoder_layer_forward
+            qwen3_next.Qwen3NextModel.forward = entry_chunk_model_forward
+            logger.info(
+                "Applied TPU patch: Qwen3Next trace-stable sequence-parallel forward."
+            )
         return None
+    install_qwen3_next_v6_patches()
     from vllm.model_executor.models import qwen3_5_mtp
 
     if envs.TPU_MOE_SEQUENCE_PARALLEL:
-        if is_qwen3_5:
-            # The patched forwards slice a step's rows exactly when the runner
-            # marks it sequence-parallel, so small steps can run replicated.
-            sequence_parallel.follow_step_form()
+        # The patched forwards slice a step's rows exactly when the runner
+        # marks it sequence-parallel, so small steps can run replicated.
+        sequence_parallel.follow_step_form()
         from vllm.model_executor.models import qwen3_5
 
         for layer_cls in (
