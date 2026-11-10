@@ -140,7 +140,9 @@ def test_singleton_group_split_restore_round_trip(input_rows):
 @pytest.mark.parametrize("width", [1, 2, 3, 4, 8, 16])
 @pytest.mark.parametrize("alignment", [1, 2, 8, 16])
 def test_wire_rows_bound_the_layout_and_match_it_from_one_block(width, alignment):
-    """Never fewer rows than a member computes; the same from one block up."""
+    """Never fewer rows than a member computes; the same once a member's share
+    exceeds half a block, singleton groups included (they pad to the block
+    too)."""
     groups = (
         None
         if width == 1
@@ -152,7 +154,7 @@ def test_wire_rows_bound_the_layout_and_match_it_from_one_block(width, alignment
         ).local_rows
         wire = replica_wire_rows(rows, width, alignment)
         assert wire >= local
-        if width == 1 or -(-rows // width) > alignment // 2:
+        if -(-rows // width) > alignment // 2:
             assert wire == local
 
 
