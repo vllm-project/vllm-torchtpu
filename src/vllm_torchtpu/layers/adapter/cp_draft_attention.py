@@ -359,11 +359,11 @@ def attend_pages(
     rows = q_block * group
     keys = num_cols * page_size
     bits = jax.dtypes.itemsize_bits(kv_cache.dtype)
-    # [R, G, Q * X, D]: row q * X + x is query token q, head g * X + x.
-    qg = q.reshape(num_reqs, q_block, kv_heads, group, head_dim).transpose(
-        0, 2, 1, 3, 4
-    )
-    qg = qg.reshape(num_reqs, kv_heads, rows, head_dim)
+    # 8- and 16-bit caches hold bf16-exact values: the MXU takes them as bf16
+    # with the scales applied to the f32 products.
+    mxu_dtype = jnp.bfloat16 if bits <= 16 else jnp.float32
+    k_mult = sm_scale * (1.0 if k_scale is None else k_scale)
+    v_mult = 1.0 if v_scale is None else v_scale
 
     def unpack(raw, slot):
         if bits == 32:
@@ -425,41 +425,49 @@ def attend_pages(
             & (q_tok < qlen_ref[r])
         )
         cached = k_pos_col < cache_len
+        # Moves a [rows, 1] column to a [1, rows] row (sublanes to lanes).
+        diag = jax.lax.broadcasted_iota(
+            jnp.int32, (rows, rows), 0
+        ) == jax.lax.broadcasted_iota(jnp.int32, (rows, rows), 1)
         # [L * S * words, width] u32: row (token, word), each word `packing`
         # K/V entries (K and V of head h at 2h, 2h + 1), lowest bits first.
         kv_u32 = buf.at[slot].bitcast(jnp.uint32).reshape(keys * words, width)
+        loaded = {}
+
+        def load_word(w):
+            if w not in loaded:
+                loaded[w] = (
+                    kv_u32[pl.ds(w, keys, stride=words)] if words > 1 else kv_u32[...]
+                )
+            return loaded[w]
+
         for g in range(kv_heads):
             k_word, k_slot = divmod(2 * g, packing)
             v_word, v_slot = divmod(2 * g + 1, packing)
-            k_raw = (
-                kv_u32[pl.ds(k_word, keys, stride=words)] if words > 1 else kv_u32[...]
+            k = unpack(load_word(k_word), k_slot)[:, :head_dim].astype(mxu_dtype)
+            v = unpack(load_word(v_word), v_slot)[:, :head_dim].astype(mxu_dtype)
+            v = jnp.where(cached, v, jnp.zeros_like(v))
+            # [Q, X, D] -> [Q * X, D]: row q * X + x is token q, head g * X + x.
+            qv = q_ref[0, :, g * group : (g + 1) * group, :].reshape(rows, head_dim)
+            s = jax.lax.dot_general(
+                qv.astype(mxu_dtype),
+                k,
+                (((1,), (1,)), ((), ())),
+                preferred_element_type=jnp.float32,
             )
-            v_raw = (
-                kv_u32[pl.ds(v_word, keys, stride=words)] if words > 1 else kv_u32[...]
-            )
-            k = unpack(k_raw, k_slot)[:, :head_dim].astype(jnp.float32)
-            v = unpack(v_raw, v_slot)[:, :head_dim].astype(jnp.float32)
-            if k_scale is not None:
-                k = k * k_scale
-            if v_scale is not None:
-                v = v * v_scale
-            v = jnp.where(cached, v, 0.0)
-            qv = q_ref[0, g].astype(jnp.float32)
-            s = (
-                jax.lax.dot_general(
-                    qv, k, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
-                )
-                * sm_scale
-            )
-            s = jnp.where(visible, s, _NEG_INF)
+            s = jnp.where(visible, s * k_mult, _NEG_INF)
             m = jnp.max(s, axis=-1, keepdims=True)
             m_safe = jnp.where(m > _NEG_INF, m, 0.0)
             p = jnp.exp(s - m_safe)
             denom = jnp.sum(p, axis=-1, keepdims=True)
             safe = jnp.where(denom > 0, denom, 1.0)
-            out = jnp.dot(p, v, preferred_element_type=jnp.float32)
-            o_ref[0, g] = out / safe
-            lse_ref[0, g] = jnp.where(denom > 0, m_safe + jnp.log(safe), _NEG_INF)
+            out = jnp.dot(p.astype(mxu_dtype), v, preferred_element_type=jnp.float32)
+            out = out * (v_mult / safe)
+            o_ref[0, :, g * group : (g + 1) * group, :] = out.reshape(
+                q_block, group, head_dim
+            )
+            lse = jnp.where(denom > 0, m_safe + jnp.log(safe), _NEG_INF)
+            lse_ref[0, g] = jnp.sum(jnp.where(diag, lse, 0.0), axis=0, keepdims=True)
 
     out, lse = pl.pallas_call(
         kernel,
@@ -467,12 +475,16 @@ def attend_pages(
             num_scalar_prefetch=4,
             grid=(num_reqs,),
             in_specs=[
-                pl.BlockSpec((1, kv_heads, rows, head_dim), lambda r, *_: (r, 0, 0, 0)),
+                pl.BlockSpec(
+                    (1, q_block, num_heads, head_dim), lambda r, *_: (r, 0, 0, 0)
+                ),
                 pl.BlockSpec(memory_space=pltpu.HBM),
             ],
             out_specs=[
-                pl.BlockSpec((1, kv_heads, rows, head_dim), lambda r, *_: (r, 0, 0, 0)),
-                pl.BlockSpec((1, kv_heads, rows, 1), lambda r, *_: (r, 0, 0, 0)),
+                pl.BlockSpec(
+                    (1, q_block, num_heads, head_dim), lambda r, *_: (r, 0, 0, 0)
+                ),
+                pl.BlockSpec((1, kv_heads, 1, rows), lambda r, *_: (r, 0, 0, 0)),
             ],
             scratch_shapes=[
                 pltpu.VMEM(
@@ -482,8 +494,8 @@ def attend_pages(
             ],
         ),
         out_shape=[
-            jax.ShapeDtypeStruct((num_reqs, kv_heads, rows, head_dim), jnp.float32),
-            jax.ShapeDtypeStruct((num_reqs, kv_heads, rows, 1), jnp.float32),
+            jax.ShapeDtypeStruct((num_reqs, q_block, num_heads, head_dim), jnp.float32),
+            jax.ShapeDtypeStruct((num_reqs, kv_heads, 1, rows), jnp.float32),
         ],
         # The next request's pages are fetched in the current step.
         compiler_params=pltpu.CompilerParams(
@@ -496,17 +508,11 @@ def attend_pages(
         blocks.reshape(-1).astype(jnp.int32),
         cache_lens.astype(jnp.int32),
         q_lens.astype(jnp.int32),
-        qg,
+        q,
         kv_cache,
     )
-    out = out.reshape(num_reqs, kv_heads, q_block, group, head_dim).transpose(
-        0, 2, 1, 3, 4
-    )
     lse = lse.reshape(num_reqs, kv_heads, q_block, group).transpose(0, 2, 1, 3)
-    return (
-        out.reshape(num_reqs, q_block, num_heads, head_dim),
-        lse.reshape(num_reqs, q_block, num_heads),
-    )
+    return out, lse.reshape(num_reqs, q_block, num_heads)
 
 
 def attend_cached_reference(
