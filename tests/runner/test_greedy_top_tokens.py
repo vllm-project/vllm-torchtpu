@@ -315,7 +315,6 @@ def test_runner_step_choice():
     assert not spec._greedy_top_tokens_this_step()
 
 
-
 def test_runner_topk_candidates_step_choice(monkeypatch):
     from vllm_torchtpu import envs
 
@@ -440,6 +439,57 @@ def test_synthetic_verify_on_top_tokens_matches_full_logits(monkeypatch, seed):
     top = _sample(runner, tokens, md, top_tokens=True, seed=seed)
 
     assert torch.equal(top, full)
+
+
+@pytest.mark.parametrize(("synthetic", "seed"), [(False, 0), (True, 0), (True, 3)])
+def test_fused_greedy_verify_matches_the_unfused_path(monkeypatch, synthetic, seed):
+    # On TPU, _sample_spec_verify_chunk runs the greedy verify as one program
+    # from the logits or from the top tokens; same tokens as the two-step path.
+    from vllm_torchtpu.runner import tpu_runner
+
+    runner, logits, tokens, md = _verify_chunk(monkeypatch, synthetic=synthetic)
+    sampler = runner.rejection_sampler
+    accept_u = (
+        torch.rand(
+            md.draft_token_ids.shape, generator=torch.Generator().manual_seed(seed)
+        )
+        if synthetic
+        else None
+    )
+    args = (
+        md.bonus_logits_indices,
+        md.target_logits_indices,
+        md.draft_token_ids,
+        md.draft_lengths,
+        md.segment_ids,
+        md.group_indices,
+        K,
+        accept_u,
+        sampler.synthetic_conditional_rates,
+        sampler.synthetic_mode,
+    )
+    with torch.compiler.set_stance("force_eager"):
+        from_logits = tpu_runner._fused_greedy_verify_from_logits(logits, *args)
+        from_tokens = tpu_runner._fused_greedy_verify_from_top_tokens(tokens, *args)
+
+    full = _sample(runner, logits, md, top_tokens=False, seed=seed)
+    assert torch.equal(from_logits, full)
+    assert torch.equal(from_tokens, full)
+
+
+def test_sampler_draws_in_graph_only_for_the_candidate_samplers_on_tpu(monkeypatch):
+    from vllm_torchtpu import envs
+
+    runner = _runner(torch.zeros(8, 2))
+    monkeypatch.setattr(envs, "TPU_SAMPLER_TOPK_CANDIDATES", 40)
+    runner.device = torch.device("cpu")
+    assert not runner._sampler_draws_in_graph()
+    runner.device = SimpleNamespace(type="tpu", index=0)
+    assert runner._sampler_draws_in_graph()
+    # Without the candidate samplers every draw stays on the sampling
+    # generator, so main's random stream is unchanged.
+    monkeypatch.setattr(envs, "TPU_SAMPLER_TOPK_CANDIDATES", 0)
+    assert not runner._sampler_draws_in_graph()
 
 
 def test_rejection_sampler_refuses_argmax_for_sampling():
@@ -599,8 +649,7 @@ def _vocab_parallel_topk_candidates_dim0(weight, hidden_states, tp_size, monkeyp
     if tp_size > 1:
         assert all(d == 0 for d in seen_dims)
         assert all(
-            t.dtype == torch.float32
-            and t.shape == (hidden_states.shape[0], k_local, 2)
+            t.dtype == torch.float32 and t.shape == (hidden_states.shape[0], k_local, 2)
             for t in recorded
         )
     return out
@@ -702,7 +751,9 @@ def test_log_topk_candidates_step_path_logs_each_path_once():
     logger = logging.getLogger("vllm")
     logger.addHandler(handler)
     try:
-        greedy_top_tokens.log_topk_candidates_step_path(True, ["__spec_warmup_0__", None])
+        greedy_top_tokens.log_topk_candidates_step_path(
+            True, ["__spec_warmup_0__", None]
+        )
         greedy_top_tokens.log_topk_candidates_step_path(False, ["__spec_warmup_b2_0__"])
         assert records == []
         for is_spec_step in (True, False, True, False):
@@ -712,8 +763,10 @@ def test_log_topk_candidates_step_path_logs_each_path_once():
     finally:
         logger.removeHandler(handler)
     assert [r.getMessage() for r in records] == [
-        "TPU_GREEDY_TOP_TOKENS: a speculative verify step took vocab-parallel top-32 candidates",
-        "TPU_GREEDY_TOP_TOKENS: a non-speculative step took vocab-parallel top-32 candidates",
+        "TPU_GREEDY_TOP_TOKENS: a speculative verify step took vocab-parallel "
+        "top-32 candidates",
+        "TPU_GREEDY_TOP_TOKENS: a non-speculative step took vocab-parallel "
+        "top-32 candidates",
     ]
 
 
@@ -767,7 +820,8 @@ def test_runner_sample_from_packed_candidates_and_verify_chunk(monkeypatch):
     runner._greedy_head_owner.lm_head.tp_size = 2
     num_cand = packed.shape[-1] // 2
 
-    # 1. Verify sample_from_packed_candidates picks dominant tokens [10, 20, 30, 90, 100].
+    # 1. sample_from_packed_candidates picks the dominant tokens
+    # [10, 20, 30, 90, 100].
     temps = torch.full((5, 1), 0.6, dtype=torch.float32)
     u = torch.full((5, num_cand), 0.5, dtype=torch.float32)
     top_k = torch.full((5, 1), 20, dtype=torch.int32)
@@ -779,7 +833,8 @@ def test_runner_sample_from_packed_candidates_and_verify_chunk(monkeypatch):
     assert sampled.view(-1).tolist() == [10, 20, 30, 90, 100]
 
     # 2. Verify _sample_spec_verify_chunk with topk_candidates_packed=True:
-    # req 0 drafts [10, 99] -> draft 0 (10) accepted, draft 1 (99) rejected & recovers 20
+    # req 0 drafts [10, 99] -> draft 0 (10) accepted, draft 1 (99) rejected and
+    # recovers 20
     # req 1 drafts [90] -> draft 0 (90) accepted + bonus 100
     md = SimpleNamespace(
         draft_token_ids=torch.tensor([10, 99, 90], dtype=torch.int32),

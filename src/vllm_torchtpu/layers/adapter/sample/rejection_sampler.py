@@ -534,8 +534,6 @@ def _random_rejection_sample_with_segment(
     as one-hot at x: accept iff u < p(x), recover from p with x removed.
     Both are exact for the target distribution p.
     """
-    total_tokens = draft_token_ids.shape[0]
-    batch_size = num_draft_tokens.shape[0]
     device = draft_token_ids.device
     vocab_size = target_logits.shape[-1]
 
@@ -776,9 +774,7 @@ def _fused_spec_verify_and_sample_candidates(
     """Fused candidate-space bonus sampling + speculative rejection sampling."""
     batch_size = num_draft_tokens.shape[0]
     if topk_candidates > 0:
-        cand_logits, cand_token_ids = extract_topk_candidates(
-            logits, topk_candidates
-        )
+        cand_logits, cand_token_ids = extract_topk_candidates(logits, topk_candidates)
     else:
         num_cand = logits.shape[-1] // 2
         cand_logits = logits[:, :num_cand]
@@ -858,22 +854,18 @@ def _fused_spec_verify_and_sample_candidates(
         conditional_rates = synthetic_conditional_rates[group_indices.to(torch.int64)]
         accepted = (accept_u < conditional_rates) & valid_draft_token_ids
     else:
-        target_token_probs = (
-            target_probs * draft_match.to(target_probs.dtype)
-        ).sum(dim=-1)
+        target_token_probs = (target_probs * draft_match.to(target_probs.dtype)).sum(
+            dim=-1
+        )
         accepted = (target_token_probs >= accept_u) & valid_draft_token_ids
 
     recovered_probs = torch.where(
         draft_match, torch.zeros_like(target_probs), target_probs
     )
     recovered_scores = recovered_probs * target_inv_exp_noise
-    max_scores, recovered_cand_idx = torch.max(
-        recovered_scores, dim=-1, keepdim=True
-    )
+    max_scores, recovered_cand_idx = torch.max(recovered_scores, dim=-1, keepdim=True)
     fallback_cand_idx = torch.argmax(target_cand_logits, dim=-1, keepdim=True)
-    chosen_cand_idx = torch.where(
-        max_scores > 0, recovered_cand_idx, fallback_cand_idx
-    )
+    chosen_cand_idx = torch.where(max_scores > 0, recovered_cand_idx, fallback_cand_idx)
     recovered_token_ids = torch.gather(
         target_cand_token_ids, 1, chosen_cand_idx
     ).squeeze(1)
