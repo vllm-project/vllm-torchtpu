@@ -73,13 +73,18 @@ if TYPE_CHECKING:
     MIXED_Q_SPLIT: int | None = None
     MIXED_NUM_QUERIES_PER_BLOCK: int | None = None
     MIXED_NUM_KV_PAGES_PER_BLOCK: int | None = None
+    TPU_BATCHED_RPA_DECODE_BLOCK: tuple[int, int, int] | None = None
+    TPU_BATCHED_RPA_VERIFY_BLOCK: str | tuple[int, int, int] | None = None
+    TPU_BATCHED_RPA_KV_PAGE_RUNS: bool = False
     TPU_MLA_MASKED_DENSE_ENABLED: bool = False
     TPU_MLA_MASKED_DENSE_ANALYTIC_MAX_KV_LEN: int | None = None
     TPU_MLA_MASKED_DENSE_MAX_KV_LEN: int | None = None
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
+    TPU_GDN_TWO_SLOT_CKPT: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
+    TPU_MOE_PACKED_DISPATCH: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
     USE_MOE_FUSED_EP_KERNEL: bool = False
     MOE_FUSED_EP_KERNEL_IMPL: str | None = None
@@ -96,10 +101,21 @@ if TYPE_CHECKING:
     TPU_PP_CHUNK_SLACK: float = 0.1
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
+    TPU_LM_HEAD_HIDDEN_MAJOR: bool = False
+    TPU_EMBED_EP_SHARD: bool = False
+    TPU_TP4_HIER_ALL_REDUCE: bool = False
+    TPU_CANDIDATE_SAMPLING: bool = True
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
+    TPU_MOE_RAGGED_A2A: bool = False
+    TPU_MOE_A2A_CAPACITY: float | None = None
+    TPU_MOE_A2A_ROUTE_CAPACITY: float | None = None
+    TPU_DECODE_FAST_PATHS: bool = False
+    TPU_DECODE_FAST_PATHS_OFF: str = ""
+    TPU_MOE_EXPERT_PLACEMENT: str = ""
+    TPU_MOE_ROUTING_COUNTS_DIR: str = ""
     PCP_FA_KERNEL_BLOCK_SIZE: int | None = None
     PCP_GDN_COMM_CHUNK_SIZE: int | None = None
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
@@ -292,6 +308,20 @@ def env_float(env_name: str, default: float) -> Callable[[], float]:
     return _get_float_env
 
 
+def env_optional_float(env_name: str) -> Callable[[], float | None]:
+    """Same parsing as ``env_float``, but an unset or empty variable reads as
+    ``None`` so callers can tell "explicitly set" from "not configured"."""
+    parse_float = env_float(env_name, 0.0)
+
+    def _get_optional_float_env() -> float | None:
+        value = os.getenv(env_name)
+        if value is None or value.strip() == "":
+            return None
+        return parse_float()
+
+    return _get_optional_float_env
+
+
 def env_str(env_name: str, default: str) -> Callable[[], str]:
     """String knob with a default, surrounding whitespace stripped."""
 
@@ -366,6 +396,38 @@ def env_positive_int_or_none(env_name: str) -> Callable[[], int | None]:
     return _get_positive_int_or_none_env
 
 
+def _get_batched_rpa_decode_block() -> tuple[int, int, int] | None:
+    """Parse TPU_BATCHED_RPA_DECODE_BLOCK as three positive integers."""
+    value = os.getenv("TPU_BATCHED_RPA_DECODE_BLOCK", "").strip()
+    if not value:
+        return None
+    parts = value.split(",")
+    if len(parts) != 3 or not all(p.strip().isdigit() and int(p) > 0 for p in parts):
+        raise ValueError(
+            f"Invalid value '{value}' for TPU_BATCHED_RPA_DECODE_BLOCK: "
+            "expected 'bkv,batch,buffers' with positive integers."
+        )
+    bkv, batch, buffers = (int(p) for p in parts)
+    return bkv, batch, buffers
+
+
+def _get_batched_rpa_verify_block() -> str | tuple[int, int, int] | None:
+    """Parse TPU_BATCHED_RPA_VERIFY_BLOCK as 'window' or three positive integers."""
+    value = os.getenv("TPU_BATCHED_RPA_VERIFY_BLOCK", "").strip()
+    if not value:
+        return None
+    if value == "window":
+        return value
+    parts = value.split(",")
+    if len(parts) != 3 or not all(p.strip().isdigit() and int(p) > 0 for p in parts):
+        raise ValueError(
+            f"Invalid value '{value}' for TPU_BATCHED_RPA_VERIFY_BLOCK: "
+            "expected 'window' or 'bkv,batch,buffers' with positive integers."
+        )
+    bkv, batch, buffers = (int(p) for p in parts)
+    return bkv, batch, buffers
+
+
 def _get_nan_log_level() -> NanLogLevel:
     value = os.getenv("TPU_NAN_LOG_LEVEL", "0")
     if value not in ("0", "1", "2", "3", "4"):
@@ -391,6 +453,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_GDN_CONV_QK_PAIR_LAYOUT": env_bool(
         "TPU_GDN_CONV_QK_PAIR_LAYOUT", default=False
     ),
+    # Speculative decoding on the unified pool: keep two GDN state blocks per
+    # request (the verify window's start state and its last state) instead of
+    # one per window position; a partially accepted window is recomputed from
+    # the start state at the next step (kernels/gdn/v3/window_tile.py). Same
+    # outputs, num_speculative_tokens - 1 fewer blocks per GDN group.
+    "TPU_GDN_TWO_SLOT_CKPT": env_bool("TPU_GDN_TWO_SLOT_CKPT", default=False),
     # Register the DeepSeek-V4 tokenizer that honors continue_final_message.
     # Off by default so tokenizer behavior matches stock vLLM; the DSv4
     # eval config turns it on, since a prefilled assistant turn needs it.
@@ -559,7 +627,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Use one-hot matmuls for MoE permute and unpermute when the routed row
     # count (num_tokens * topk) is <= this threshold. Unset or empty means
     # auto: fused_moe_gmm.resolve_onehot_permute_threshold derives the value
-    # from SparseCore geometry (0 on hosts without SparseCore). 0 keeps every
+    # from SparseCore geometry and, under EP, the full decode step's routed
+    # rows (0 on hosts without SparseCore). 0 keeps every
     # size on the SparseCore path; a positive value forces that
     # threshold. The knob and its row-count semantics come from
     # tpu-inference PR #2674.
@@ -604,6 +673,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MIXED_Q_SPLIT": env_optional_int("MIXED_Q_SPLIT"),
     "MIXED_NUM_QUERIES_PER_BLOCK": env_optional_int("MIXED_NUM_QUERIES_PER_BLOCK"),
     "MIXED_NUM_KV_PAGES_PER_BLOCK": env_optional_int("MIXED_NUM_KV_PAGES_PER_BLOCK"),
+    # Decode block of the batched RPA kernel as "bkv,batch,buffers": KV tokens
+    # per block, sequences per block, buffers. Unset keeps the kernel default.
+    # 8192,4,2 is faster at >= 64K tokens per sequence, slower at 24 x 32K.
+    # Speculative drafts on: the verify block applies instead, so this sets the
+    # decode block of runs without drafts.
+    "TPU_BATCHED_RPA_DECODE_BLOCK": _get_batched_rpa_decode_block,
+    # Decode block of the batched RPA kernel for multi-token verify windows
+    # (speculative decoding), computing the whole window per KV block in one
+    # pass instead of the kernel's split into query chunks. "window" keeps the
+    # kernel's default block (bit-identical outputs); "bkv,batch,buffers" sets
+    # the block as well. Unset keeps the kernel default. Set, it also arms the
+    # one-query draft path (decode_switches.PATHS: draft_one_query).
+    "TPU_BATCHED_RPA_VERIFY_BLOCK": _get_batched_rpa_verify_block,
+    # Batched RPA decode steps copy the kernel pages of each manager block in
+    # one DMA (into a page-major VMEM window) instead of one DMA per page;
+    # outputs are unchanged. Startup refuses configs whose block tables or KV
+    # pool do not keep a manager block's pages at consecutive indices.
+    "TPU_BATCHED_RPA_KV_PAGE_RUNS": env_bool("TPU_BATCHED_RPA_KV_PAGE_RUNS"),
     # Opt in to GLM-5.2's measured masked-dense sparse-MLA prefill routing.
     # Off by default until the model and hardware scope of the cost model is
     # broadened or selected automatically from an explicit model profile.
@@ -630,14 +717,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     if (val := os.getenv("VLLM_TPU_MOST_MODEL_LEN")) is not None
     else None,
     # Skip padded tokens from MoE, otherwise they will route like
-    # real tokens and activate experts whose output is thrown away.
-    "TPU_MOE_SKIP_PADDED_TOKENS": env_bool("TPU_MOE_SKIP_PADDED_TOKENS"),
+    # real tokens and activate experts whose output is thrown away. On by
+    # default with TPU_MOE_RAGGED_A2A, whose exchange would otherwise carry the
+    # padded tokens; an explicit 0 or 1 is honored with or without it.
+    "TPU_MOE_SKIP_PADDED_TOKENS": lambda: env_bool(
+        "TPU_MOE_SKIP_PADDED_TOKENS", default=env_bool("TPU_MOE_RAGGED_A2A")()
+    )(),
     # Hierarchical MoE parallelism: expert-parallel between chips,
     # tensor-parallel between the two chiplets of a chip. Off by
     # default; it helps only at low concurrency, where the MoE is
     # weight-bandwidth bound and the per-device expert load is badly
     # imbalanced. See K3_HIERARCHICAL_EP_PLAN.md.
     "TPU_MOE_HIERARCHICAL_EP": env_bool("TPU_MOE_HIERARCHICAL_EP"),
+    # Under DP + EP, gather the DP group's hidden states and router logits
+    # in one all-gather (packed side by side along the last dim) instead of
+    # one all-gather each. Exact: the packing only moves bytes.
+    "TPU_MOE_PACKED_DISPATCH": env_bool("TPU_MOE_PACKED_DISPATCH"),
     # MoE router top-k implementation: "rowmax" (default) is the sort-free
     # k-pass selection, "sort" is torch.topk, kept as an escape hatch.
     "TPU_MOE_ROUTER_TOPK": env_with_choices(
@@ -691,6 +786,29 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Materialize the rotary cos_sin caches with a row-major ({1,0}) device
     # layout at load, May cost more HBM due to padding.
     "TPU_ROPE_CACHE_ROW_MAJOR": env_bool("TPU_ROPE_CACHE_ROW_MAJOR", default=False),
+    # Store an untied, unquantized LM head as [hidden, vocab shard] row-major,
+    # so the vocab projection is a plain matmul. Changes the accumulation
+    # order of the logits (last-bit differences), hence opt-in.
+    "TPU_LM_HEAD_HIDDEN_MAJOR": env_bool("TPU_LM_HEAD_HIDDEN_MAJOR", default=False),
+    # Split the token embedding over every DP x TP rank instead of each DP
+    # engine's TP ranks (layers/core/ep_sharded_embedding.py): 1/DP of the
+    # table per rank for one DP reduce-scatter per lookup. Bitwise the
+    # vocab-parallel lookup; needs the rank-aligned DP x TP layout. Each rank
+    # sends only the embedding rows it owns to their engines (one all-to-all
+    # over DP) instead of reduce-scattering every engine's mostly-zero
+    # partial (decode_switches.PATHS: embed_rows).
+    "TPU_EMBED_EP_SHARD": env_bool("TPU_EMBED_EP_SHARD", default=False),
+    # Row-parallel linears of a TP group of four cores on two chips reduce
+    # through one Pallas kernel (kernels/collectives/tp4_all_reduce.py) that
+    # sums each chip's pair over the die-to-die link first. Fixed summation
+    # order (P0+P1)+(P2+P3), not XLA's ring order, hence opt-in. Each quarter
+    # is reduced in 4 column blocks; partials above 256 rows use XLA.
+    "TPU_TP4_HIER_ALL_REDUCE": env_bool("TPU_TP4_HIER_ALL_REDUCE", default=False),
+    # Non-greedy spec-decode verify steps whose requests all keep at most 48
+    # tokens (top_k) sample from per-vocab-shard top-k candidates instead of
+    # all-gathered logits (layers/core/candidate_sampling.py). Same
+    # distributions; 0 samples from the all-gathered logits.
+    "TPU_CANDIDATE_SAMPLING": env_bool("TPU_CANDIDATE_SAMPLING", default=True),
     "TPU_MOE_HASH_TABLE_ROW_MAJOR": env_bool(
         "TPU_MOE_HASH_TABLE_ROW_MAJOR", default=False
     ),
@@ -722,6 +840,49 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_COLLECTION_CHUNK_SIZE": lambda: int(
         os.getenv("TPU_MOE_COLLECTION_CHUNK_SIZE") or "0"
     ),
+    # Grouped-matmul MoE under DP + EP: exchange tokens with a ragged
+    # all-to-all inside each DP group (each token once to each member hosting
+    # one of its experts) instead of an all-gather and a reduce-scatter.
+    # Unquantized (bf16) layers without expert biases, such as an MTP draft
+    # layer, take the exchange too. The exchange's bitwise paths are on with
+    # it; decode_switches.PATHS lists them and TPU_DECODE_FAST_PATHS_OFF
+    # turns single ones off. Where the layer allows it, each token's owner TP
+    # rank sums the expert and shared-expert outputs in f32 and the engine
+    # all-gathers the sums, so the MoE output needs no TP all-reduce; the
+    # expert kernel's tail can do that sum itself (a2a_owner_tail).
+    "TPU_MOE_RAGGED_A2A": env_bool("TPU_MOE_RAGGED_A2A"),
+    # Ragged all-to-all exchange: size the per-rank token rows and local routes
+    # at this many times their uniform-routing mean (exact: a step that does
+    # not fit runs the full-size exchange). 0 = always full size. Unset = by the
+    # DP group size: 2.5 up to 8 members (2 with TPU_MOE_EXPERT_PLACEMENT), 4 up
+    # to 16, 7 above (layers.adapter.ragged_a2a_moe.capacity_factors).
+    "TPU_MOE_A2A_CAPACITY": env_optional_float("TPU_MOE_A2A_CAPACITY"),
+    # The local routes' factor (0 = TPU_MOE_A2A_CAPACITY): real routing skews
+    # routes more than rows. Both factors are capped at 2 where the full-size
+    # exchange stays on the one-hot path (its rerun is cheap there). Unset = by
+    # the DP group size and placement (see capacity_factors).
+    "TPU_MOE_A2A_ROUTE_CAPACITY": env_optional_float("TPU_MOE_A2A_ROUTE_CAPACITY"),
+    # Bitwise decode paths of kernels other models share (decode_switches.PATHS:
+    # xla_schedule, gdn_packed, gdn_single_launch, gdn_paired_heads).
+    "TPU_DECODE_FAST_PATHS": env_bool("TPU_DECODE_FAST_PATHS"),
+    # Comma-separated paths of decode_switches.PATHS to leave off although their
+    # parent switch is on. Unknown names refuse to start.
+    "TPU_DECODE_FAST_PATHS_OFF": env_str("TPU_DECODE_FAST_PATHS_OFF", ""),
+    # Place each named MoE layer's experts by this .npz (logical expert ->
+    # physical slot, e.g. balanced on routing counts; see
+    # layers/core/expert_placement.py). A file with redundant slots also
+    # serves replicas of the busiest experts from them (same outputs; needs
+    # TPU_MOE_RAGGED_A2A, its owner combine and sorted plan). Unset = linear
+    # placement.
+    "TPU_MOE_EXPERT_PLACEMENT": lambda: os.getenv("TPU_MOE_EXPERT_PLACEMENT", ""),
+    # Count each MoE layer's routes per logical expert, for the layers
+    # TPU_MOE_EXPERT_PLACEMENT can place (real tokens only), and rewrite
+    # <dir>/routing-counts-*.npz with them, one file per engine and pipeline
+    # stage, at most once a minute and at a clean shutdown: counts and layer
+    # names only, the input of layers/core/expert_placement.py. Outputs do not
+    # change. For a capture window of representative traffic, with <dir> on
+    # local disk. Unset = no counting.
+    "TPU_MOE_ROUTING_COUNTS_DIR": env_str("TPU_MOE_ROUTING_COUNTS_DIR", ""),
     # Override the PCP full-attention kernel page without changing KV manager pages.
     "PCP_FA_KERNEL_BLOCK_SIZE": env_positive_int_or_none("PCP_FA_KERNEL_BLOCK_SIZE"),
     # GDN stage/projection budget; token ownership still follows PCP interleave.

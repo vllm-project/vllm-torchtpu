@@ -23,11 +23,19 @@ from vllm_torchtpu.kernels.experimental.moe_dense_expert import (
     can_use_dense_expert,
     dense_expert_moe,
 )
-from vllm_torchtpu.kernels.megablox.gmm_v2 import get_packing_factor, gmm_v2
+from vllm_torchtpu.kernels.megablox.gmm_v2 import (
+    get_packing_factor,
+    gmm_v2,
+    gmm_v2_mlp,
+    gmm_v2_mlp_scatter,
+    mlp_supported,
+    scatter_rows_supported,
+)
 from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
     blockwise_onehot_unpermute,
     can_use_blockwise_onehot_unpermute,
 )
+from vllm_torchtpu.kernels.megablox.row_copy import gather_rows
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce import (
     ragged_gather_reduce as ragged_gather_reduce_v1,
 )
@@ -61,18 +69,24 @@ def _select_ragged_gather_reduce(version: str):
 ragged_gather_reduce = _select_ragged_gather_reduce(envs.RAGGED_GATHER_REDUCE_VERSION)
 
 _ONEHOT_AUTO_CAP = 512
+# Largest decode step (routed rows) the auto threshold moves to the one-hot
+# path. The one-hot matmuls grow with tokens x routed rows, so larger steps
+# keep the SparseCore kernels.
+_ONEHOT_DECODE_CAP = 3840
 # Fixed at import, like the other MoE algorithm selectors.
 _DENSE_EXPERT_THRESHOLD = envs.TPU_MOE_DENSE_EXPERT_THRESHOLD
 
 
-def resolve_onehot_permute_threshold() -> int:
+def resolve_onehot_permute_threshold(step_routed_rows: int = 0) -> int:
     """Routed-row count at/below which MoE permute+combine run as TensorCore
     one-hot matmuls instead of the SparseCore gather/reduce kernels.
 
     Auto (env unset/empty/negative) resolves to ``min(SC block rows - 1,
-    _ONEHOT_AUTO_CAP)`` on SparseCore TPUs and 0 elsewhere. An explicit
-    ``ONEHOT_MOE_PERMUTE_THRESHOLD`` wins: 0 disables the one-hot path, a
-    positive value forces that threshold.
+    _ONEHOT_AUTO_CAP)`` on SparseCore TPUs and 0 elsewhere, raised to
+    ``step_routed_rows`` (at most ``_ONEHOT_DECODE_CAP``) so a full decode
+    step takes the one-hot path while prefill buckets keep the SparseCore
+    kernels. An explicit ``ONEHOT_MOE_PERMUTE_THRESHOLD`` wins: 0 disables
+    the one-hot path, a positive value forces that threshold.
     """
     explicit = envs.ONEHOT_MOE_PERMUTE_THRESHOLD
     if explicit is not None and explicit >= 0:
@@ -87,7 +101,7 @@ def resolve_onehot_permute_threshold() -> int:
     block_rows = sc_info.num_lanes * sc_info.num_cores * sc_info.num_subcores
     threshold = min(block_rows - 1, _ONEHOT_AUTO_CAP)
 
-    return threshold
+    return max(threshold, min(step_routed_rows, _ONEHOT_DECODE_CAP))
 
 
 def unpack_fp4_to_e2m1(w_packed: jax.Array) -> jax.Array:
@@ -179,6 +193,13 @@ def quantize_to_native_fp4_kmajor(
     return packed, scale
 
 
+def _is_fp4_weight(rhs) -> bool:
+    return (
+        jnp.issubdtype(rhs.dtype, jnp.floating)
+        and jax.dtypes.itemsize_bits(rhs.dtype) == 4
+    )
+
+
 def gmm_wrapper(
     lhs,
     rhs,
@@ -194,10 +215,7 @@ def gmm_wrapper(
     # fp4 weights: keep bf16 activations. Quantizing activations to fp8 collapses
     # fp4 accuracy (error compounds across MoE layers) with no decode speedup
     # (decode is weight-HBM-bound). fp8/int4 weights keep the default fp8 act.
-    is_fp4_weight = (
-        jnp.issubdtype(rhs.dtype, jnp.floating)
-        and jax.dtypes.itemsize_bits(rhs.dtype) == 4
-    )
+    is_fp4_weight = _is_fp4_weight(rhs)
     return gmm_v2(
         lhs=lhs,
         rhs=rhs,
@@ -209,6 +227,86 @@ def gmm_wrapper(
         fuse_act=fuse_act,
         preferred_element_type=preferred_element_type,
         maybe_quantize_lhs=not is_fp4_weight,
+        rhs_quant_dtype=rhs_quant_dtype,
+    )
+
+
+# Largest routed-row count (static GMM rows) that runs gate/up and down as one
+# kernel: decode and verify steps. Prefill chunks keep the two kernels.
+_MLP_KERNEL_MAX_ROWS = 4096
+
+
+def expert_mlp(
+    x,
+    w1,
+    w1_scale,
+    w1_bias,
+    w2,
+    w2_scale,
+    w2_bias,
+    group_sizes,
+    group_offset,
+    *,
+    activation,
+    rhs_quant_dtype=None,
+):
+    """Gate/up GMM with the fused activation, then the down GMM, per routed row.
+
+    Decode-sized steps run both in one kernel (`gmm_v2_mlp`, same results),
+    which streams every expert's weights once and keeps the activation in VMEM.
+    """
+    maybe_quantize_lhs = not _is_fp4_weight(w1)
+    if (
+        x.shape[0] <= _MLP_KERNEL_MAX_ROWS
+        and w1_bias is None
+        and w2_bias is None
+        and w1.dtype == w2.dtype
+        and mlp_supported(
+            x,
+            w1,
+            w1_scale,
+            w2,
+            w2_scale,
+            group_sizes,
+            fuse_act=activation,
+            maybe_quantize_lhs=maybe_quantize_lhs,
+            rhs_quant_dtype=rhs_quant_dtype,
+        )
+    ):
+        return gmm_v2_mlp(
+            x,
+            w1,
+            w2,
+            group_sizes,
+            w1_scale,
+            w2_scale,
+            group_offset[0],
+            fuse_act=activation,
+            maybe_quantize_lhs=maybe_quantize_lhs,
+            rhs_quant_dtype=rhs_quant_dtype,
+        )
+    gmm1_res = gmm_wrapper(
+        x,
+        w1,
+        w1_scale,
+        w1_bias,
+        group_sizes,
+        group_offset,
+        zero_initialize=False,
+        fuse_act=activation,
+        rhs_quant_dtype=rhs_quant_dtype,
+    )
+    packing_factor = get_packing_factor(w2.dtype, rhs_quant_dtype)
+    gmm1_res = gmm1_res[:, : w2.shape[1] * packing_factor]
+    return gmm_wrapper(
+        gmm1_res,
+        w2,
+        w2_scale,
+        w2_bias,
+        group_sizes,
+        group_offset,
+        zero_initialize=False,
+        preferred_element_type=x.dtype,
         rhs_quant_dtype=rhs_quant_dtype,
     )
 
@@ -322,14 +420,24 @@ def prepare_routed_gmm_inputs(
     if argsort_revert_indices is not None:
         group_sizes_local = bucket_counts[:local_num_experts]
     else:
-        argsort_revert_indices = jnp.argsort(sorted_indices)
+        # `sorted_indices` is a permutation: scattering the positions through
+        # it inverts it exactly, without a second sort.
+        assert sorted_indices is not None
+        argsort_revert_indices = (
+            jnp.zeros_like(sorted_indices)
+            .at[sorted_indices]
+            .set(
+                jnp.arange(sorted_indices.shape[0], dtype=sorted_indices.dtype),
+                unique_indices=True,
+            )
+        )
         topk_indices_for_count = jnp.where(valid_mask, topk_indices_flat, 0)
         group_sizes_local = jax.nn.one_hot(
             topk_indices_for_count, local_num_experts, dtype=jnp.int32
         ) * valid_mask[:, None].astype(jnp.int32)
         group_sizes_local = group_sizes_local.sum(axis=0)
 
-    if packable:
+    if sorted_indices is None:
         # Packing (key, token) into one int32 keeps the payload out of the sort
         # and drops the follow-up gather. Equal packed values carry the same
         # token id, so their order cannot matter.
@@ -338,6 +446,8 @@ def prepare_routed_gmm_inputs(
         )
         token_indices_sorted = jnp.bitwise_and(packed, (1 << token_bits) - 1)
     else:
+        # The argsort is stable, so each expert's tokens stay in ascending
+        # token order: the (key, token) order of the packed sort.
         token_indices_sorted = token_indices_flat[sorted_indices]
 
     if use_ep and use_sparse_core:
@@ -401,32 +511,20 @@ def moe_gmm(
     """
     group_offset = jnp.array([0], dtype=jnp.int32)
 
-    gmm1_res = gmm_wrapper(
+    topk_weights = topk_weights_flat.reshape((num_tokens, topk))
+    valid_mask = valid_mask_flat.reshape((num_tokens, topk))
+
+    gmm2_res = expert_mlp(
         x,
         w1,
         w1_scale,
         w1_bias,
-        group_sizes,
-        group_offset,
-        zero_initialize=False,
-        fuse_act=activation,
-        rhs_quant_dtype=rhs_quant_dtype,
-    )
-    packing_factor = get_packing_factor(w2.dtype, rhs_quant_dtype)
-    gmm1_res = gmm1_res[:, : w2.shape[1] * packing_factor]
-
-    topk_weights = topk_weights_flat.reshape((num_tokens, topk))
-    valid_mask = valid_mask_flat.reshape((num_tokens, topk))
-
-    gmm2_res = gmm_wrapper(
-        gmm1_res,
         w2,
         w2_scale,
         w2_bias,
         group_sizes,
         group_offset,
-        zero_initialize=False,
-        preferred_element_type=x.dtype,
+        activation=activation,
         rhs_quant_dtype=rhs_quant_dtype,
     )
     # The destination-major kernel packs source indices into 20 bits and
@@ -540,6 +638,372 @@ def moe_gmm(
     return token_topk_hidden.sum(axis=1).astype(x.dtype)
 
 
+def onehot_moe_local_routes(
+    hidden_states: jax.Array,
+    w1: jax.Array,
+    w1_scale: jax.Array | None,
+    w1_bias: jax.Array | None,
+    w2: jax.Array,
+    w2_scale: jax.Array | None,
+    w2_bias: jax.Array | None,
+    topk_weights: jax.Array,
+    topk_ids: jax.Array,
+    *,
+    max_local_routes: int,
+    padded_hidden_size: int,
+    activation: str,
+    rhs_quant_dtype: jnp.dtype | None = None,
+    skip_padded_tokens: bool = False,
+) -> jax.Array:
+    """One-hot permute, expert GMM and one-hot combine over the first
+    ``max_local_routes`` routes in expert order.
+
+    The caller guarantees that at most ``max_local_routes`` routes are valid
+    (local expert ids, ``topk_ids`` >= 0). Valid routes sort first, so every
+    one of them keeps the position it has in the one-hot path of
+    ``prepare_routed_gmm_inputs`` and ``moe_gmm``, and the permuted rows, GMM
+    rows and combine weights are the ones that path computes; the matmuls skip
+    the rows of the invalid routes. One sort orders (expert, route) keys and
+    carries the weights, so no gather or inverse permutation is needed.
+    """
+    num_tokens = hidden_states.shape[0]
+    local_num_experts = w1.shape[0]
+    topk = topk_ids.shape[1]
+    num_routes = num_tokens * topk
+    ids = topk_ids.reshape(-1)
+    weights = topk_weights.reshape(-1)
+    valid = (ids >= 0) & (weights != 0) if skip_padded_tokens else ids >= 0
+    keys = jnp.where(valid, ids, local_num_experts)
+    route_bits = max(1, (num_routes - 1).bit_length())
+    assert local_num_experts.bit_length() + route_bits < 32
+    route = jnp.arange(num_routes, dtype=jnp.int32)
+    # Keys are unique, so the order is the stable argsort of the expert ids.
+    packed, weights_sorted = jax.lax.sort(
+        (jnp.left_shift(keys, route_bits) | route, weights), num_keys=1
+    )
+    packed = packed[:max_local_routes]
+    weights_sorted = weights_sorted[:max_local_routes]
+    token_sorted = jnp.bitwise_and(packed, (1 << route_bits) - 1) // topk
+    valid_sorted = jnp.right_shift(packed, route_bits) < local_num_experts
+    group_sizes = jax.nn.one_hot(
+        jnp.where(valid, ids, 0), local_num_experts, dtype=jnp.int32
+    ) * valid[:, None].astype(jnp.int32)
+    group_sizes = group_sizes.sum(axis=0)
+
+    onehot = jax.nn.one_hot(token_sorted, num_tokens, dtype=hidden_states.dtype)
+    x = onehot @ hidden_states
+    x = jnp.pad(x, ((0, 0), (0, padded_hidden_size - x.shape[1])))
+    group_offset = jnp.array([0], dtype=jnp.int32)
+    gmm2_res = expert_mlp(
+        x,
+        w1,
+        w1_scale,
+        w1_bias,
+        w2,
+        w2_scale,
+        w2_bias,
+        group_sizes,
+        group_offset,
+        activation=activation,
+        rhs_quant_dtype=rhs_quant_dtype,
+    )
+    # Rows past the computed prefix are never written by the GMM.
+    computed = jnp.arange(gmm2_res.shape[0], dtype=jnp.int32) < group_sizes.sum(
+        dtype=jnp.int32
+    )
+    gmm2_res = jnp.where(computed[:, None], gmm2_res, 0)
+    combine = onehot.T.astype(gmm2_res.dtype) * weights_sorted * valid_sorted
+    return (combine @ gmm2_res).astype(x.dtype)
+
+
+def scatter_moe_supported(
+    hidden_states,
+    w1,
+    w2,
+    w1_scale,
+    w2_scale,
+    *,
+    num_routes: int,
+    max_local_routes: int,
+    activation: str,
+    use_sparse_core: bool,
+    onehot_moe_permute_threshold: int,
+    rhs_quant_dtype=None,
+) -> bool:
+    """Whether `fused_moe_scatter` takes these static shapes: the EP step runs
+    the local-routes one-hot path of `fused_moe_func` with `gmm_v2_mlp`."""
+    if w1_scale is None or w2_scale is None:
+        return False
+    if w1_scale.ndim == 3:
+        w1_scale = jax.ShapeDtypeStruct(
+            w1_scale.shape[:2] + (1,) + w1_scale.shape[2:], w1_scale.dtype
+        )
+    if w2_scale.ndim == 3:
+        w2_scale = jax.ShapeDtypeStruct(
+            w2_scale.shape[:2] + (1,) + w2_scale.shape[2:], w2_scale.dtype
+        )
+    num_tokens, hidden_size = hidden_states.shape
+    local_routes = min(max_local_routes or num_routes, num_routes)
+    if not (
+        use_sparse_core
+        and local_routes <= onehot_moe_permute_threshold
+        and envs.TPU_MOE_OWNER_OUTPUT_MODE.lower() != "on"
+        and not (0 < num_tokens <= _DENSE_EXPERT_THRESHOLD)
+        and local_routes <= _MLP_KERNEL_MAX_ROWS
+        and w1.dtype == w2.dtype
+        and get_packing_factor(w1.dtype, rhs_quant_dtype) == 1
+        and w1.shape[1] == hidden_size
+        and w2.shape[2] == hidden_size
+        and scatter_rows_supported(hidden_states.dtype, hidden_size)
+    ):
+        return False
+    rows = jax.ShapeDtypeStruct((local_routes, hidden_size), hidden_states.dtype)
+    return mlp_supported(
+        rows,
+        w1,
+        w1_scale,
+        w2,
+        w2_scale,
+        jax.ShapeDtypeStruct((w1.shape[0],), jnp.int32),
+        fuse_act=activation,
+        maybe_quantize_lhs=not _is_fp4_weight(w1),
+        rhs_quant_dtype=rhs_quant_dtype,
+    )
+
+
+def scatter_route_plan(
+    topk_weights: jax.Array,
+    topk_ids: jax.Array,
+    experts_start: jax.Array,
+    row_member: jax.Array,
+    row_dest: jax.Array,
+    *,
+    local_num_experts: int,
+    topk: int,
+    skip_padded_tokens: bool,
+    max_local_routes: int,
+    dtype,
+):
+    """The local routes of `fused_moe_scatter`'s rows in expert order: per
+    sorted route, its row and destination (member, row), and the routes per
+    local expert. Sorted entries past the local routes are never computed."""
+    topk_weights = topk_weights.astype(dtype)
+    topk_weights = jnp.where(jnp.isfinite(topk_weights), topk_weights, 0)
+    local_ids = topk_ids - experts_start
+    valid = (local_ids >= 0) & (local_ids < local_num_experts)
+    topk_weights = jnp.where(valid, topk_weights, jnp.zeros_like(topk_weights))
+    topk_ids = jnp.where(valid, local_ids, jnp.full_like(local_ids, -1))
+
+    # onehot_moe_local_routes up to the GMM.
+    num_routes = topk_ids.shape[0] * topk
+    ids = topk_ids.reshape(-1)
+    weights = topk_weights.reshape(-1)
+    valid = (ids >= 0) & (weights != 0) if skip_padded_tokens else ids >= 0
+    keys = jnp.where(valid, ids, local_num_experts)
+    route_bits = max(1, (num_routes - 1).bit_length())
+    assert local_num_experts.bit_length() + route_bits < 32
+    route = jnp.arange(num_routes, dtype=jnp.int32)
+    packed = jax.lax.sort(jnp.left_shift(keys, route_bits) | route)
+    packed = packed[:max_local_routes]
+    route_sorted = jnp.bitwise_and(packed, (1 << route_bits) - 1)
+    token_sorted = route_sorted // topk
+    group_sizes = jax.nn.one_hot(
+        jnp.where(valid, ids, 0), local_num_experts, dtype=jnp.int32
+    ) * valid[:, None].astype(jnp.int32)
+    group_sizes = group_sizes.sum(axis=0)
+    dest_member = row_member[token_sorted]
+    dest_row = row_dest.reshape(-1)[route_sorted]
+    return token_sorted, group_sizes, dest_member, dest_row
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=(
+        "topk",
+        "activation",
+        "rhs_quant_dtype",
+        "skip_padded_tokens",
+        "max_local_routes",
+        "num_recv_rows",
+        "num_extra_recv_rows",
+        "axis",
+        "num_members",
+        "collective_id",
+    ),
+)
+def fused_moe_scatter(
+    hidden_states: jax.Array,
+    w1: jax.Array,
+    w2: jax.Array,
+    w1_scale: jax.Array,
+    w2_scale: jax.Array,
+    topk_weights: jax.Array,
+    topk_ids: jax.Array,
+    experts_start: jax.Array,
+    row_member: jax.Array,
+    row_dest: jax.Array,
+    me: jax.Array,
+    expected: jax.Array,
+    extra=None,
+    tail=None,
+    *,
+    topk: int,
+    activation: str,
+    rhs_quant_dtype=None,
+    skip_padded_tokens: bool = False,
+    max_local_routes: int,
+    num_recv_rows: int,
+    num_extra_recv_rows: int = 0,
+    axis,
+    num_members,
+    collective_id: int,
+):
+    """The EP local-routes path of `fused_moe_func` up to the expert outputs,
+    which go to their owners instead of being combined here.
+
+    Row `r` of ``hidden_states`` belongs to member ``row_member[r]``; its
+    route ``k`` lands at row ``row_dest[r, k]`` of that member's receive
+    buffer, unweighted (the owner applies the routing weights). Returns this
+    member's receive buffer (see `gmm_v2_mlp_scatter`); ``expected`` counts the
+    rows other members send here. Expert outputs are the ones `fused_moe_func`
+    combines (same permute, same GMM rows).
+    """
+    token_sorted, group_sizes, dest_member, dest_row = scatter_route_plan(
+        topk_weights,
+        topk_ids,
+        experts_start,
+        row_member,
+        row_dest,
+        local_num_experts=w1.shape[0],
+        topk=topk,
+        skip_padded_tokens=skip_padded_tokens,
+        max_local_routes=max_local_routes,
+        dtype=hidden_states.dtype,
+    )
+    return fused_moe_scatter_planned(
+        hidden_states,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        token_sorted,
+        group_sizes,
+        dest_member,
+        dest_row,
+        me,
+        expected,
+        extra,
+        tail=tail,
+        activation=activation,
+        rhs_quant_dtype=rhs_quant_dtype,
+        num_recv_rows=num_recv_rows,
+        num_extra_recv_rows=num_extra_recv_rows,
+        axis=axis,
+        num_members=num_members,
+        collective_id=collective_id,
+    )
+
+
+def onehot_permute(hidden_states: jax.Array, token_sorted: jax.Array) -> jax.Array:
+    """Rows ``token_sorted`` of ``hidden_states`` (out of range: a zero row)
+    by a one-hot matmul."""
+    num_tokens = hidden_states.shape[0]
+    # As fused_moe_func's one-hot paths: non-finite values stay with their token.
+    hidden_states = jnp.where(jnp.isfinite(hidden_states), hidden_states, 0)
+    onehot = jax.nn.one_hot(token_sorted, num_tokens, dtype=hidden_states.dtype)
+    return onehot @ hidden_states
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=(
+        "activation",
+        "rhs_quant_dtype",
+        "num_recv_rows",
+        "num_extra_recv_rows",
+        "axis",
+        "num_members",
+        "collective_id",
+        "row_gather",
+    ),
+)
+def fused_moe_scatter_planned(
+    hidden_states: jax.Array,
+    w1: jax.Array,
+    w2: jax.Array,
+    w1_scale: jax.Array,
+    w2_scale: jax.Array,
+    token_sorted: jax.Array,
+    group_sizes: jax.Array,
+    dest_member: jax.Array,
+    dest_row: jax.Array,
+    me: jax.Array,
+    expected: jax.Array,
+    extra=None,
+    src_rows=None,
+    tail=None,
+    *,
+    activation: str,
+    rhs_quant_dtype=None,
+    num_recv_rows: int,
+    num_extra_recv_rows: int = 0,
+    axis,
+    num_members,
+    collective_id: int,
+    row_gather: bool = False,
+):
+    """`fused_moe_scatter` from its route plan (see `scatter_route_plan`):
+    sorted route ``j`` computes row ``token_sorted[j]`` of ``hidden_states``
+    (out of range: a zero row) with the expert its position in
+    ``group_sizes`` names, and its output goes to row ``dest_row[j]`` of
+    member ``dest_member[j]``.
+
+    ``row_gather``: ``hidden_states`` holds whole-tile rows [R, 16, H / 16]
+    and `gather_rows` copies out the computed routes' rows, the same rows
+    the one-hot permute gives; ``src_rows`` [1] (default R) bounds the rows
+    they come from."""
+    if w1_scale.ndim == 3:
+        w1_scale = jnp.expand_dims(w1_scale, 2)
+    if w2_scale.ndim == 3:
+        w2_scale = jnp.expand_dims(w2_scale, 2)
+    if row_gather:
+        # The expert kernel takes rows in whole 16-row tiles; it pads the
+        # same way when the routes are not.
+        pad = -token_sorted.shape[0] % 16
+        if pad:
+            token_sorted, dest_member, dest_row = (
+                jnp.pad(a, (0, pad)) for a in (token_sorted, dest_member, dest_row)
+            )
+        if src_rows is None:
+            src_rows = jnp.full((1,), hidden_states.shape[0], jnp.int32)
+        x = gather_rows(hidden_states, token_sorted, group_sizes, src_rows)
+    else:
+        x = onehot_permute(hidden_states, token_sorted)
+    return gmm_v2_mlp_scatter(
+        x,
+        w1,
+        w2,
+        group_sizes,
+        w1_scale,
+        w2_scale,
+        jnp.array([0], dtype=jnp.int32),
+        dest_member,
+        dest_row,
+        me,
+        expected,
+        extra,
+        tail,
+        num_recv_rows=num_recv_rows,
+        num_extra_recv_rows=num_extra_recv_rows,
+        axis=axis,
+        num_members=num_members,
+        collective_id=collective_id,
+        fuse_act=activation,
+        maybe_quantize_lhs=not _is_fp4_weight(w1),
+        rhs_quant_dtype=rhs_quant_dtype,
+    )
+
+
 @functools.partial(
     jax.jit,
     static_argnames=(
@@ -550,6 +1014,7 @@ def moe_gmm(
         "onehot_moe_permute_threshold",
         "rhs_quant_dtype",
         "skip_padded_tokens",
+        "max_local_routes",
     ),
 )
 def fused_moe_func(
@@ -570,6 +1035,7 @@ def fused_moe_func(
     onehot_moe_permute_threshold: int = 0,
     rhs_quant_dtype: jnp.dtype | None = None,
     skip_padded_tokens: bool = False,
+    max_local_routes: int = 0,
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
 
@@ -589,6 +1055,11 @@ def fused_moe_func(
     weights. Currently, only INT4 logical weights packed inside INT32 or UINT32 carrier
     containers are supported. Weights must be packed along the contracting dimension
     (K-axis) in LSB-first order.
+
+    The one-hot EP path runs as ``onehot_moe_local_routes`` over every route.
+    ``max_local_routes`` > 0 promises that at most that many routes hit a local
+    expert: that path then permutes, multiplies and combines only those rows,
+    with the same results.
     """
 
     # Convert 3D scale [experts, blocks, N] to 4D [experts, blocks, 1, N]
@@ -615,7 +1086,19 @@ def fused_moe_func(
     # callers return FP32 weights and would otherwise promote downstream.
     topk_weights = topk_weights.astype(hidden_states.dtype)
 
-    if use_ep and use_sparse_core and num_tokens * topk <= onehot_moe_permute_threshold:
+    num_routes = num_tokens * topk
+    # The local-routes path materializes only the routes it is promised, so
+    # those (not all routes) decide whether its one-hot matmuls are cheap.
+    local_routes = min(max_local_routes or num_routes, num_routes)
+    local_routes_path = (
+        use_ep
+        and use_sparse_core
+        and local_routes <= onehot_moe_permute_threshold
+        and envs.TPU_MOE_OWNER_OUTPUT_MODE.lower() != "on"
+    )
+    if (
+        use_ep and use_sparse_core and num_routes <= onehot_moe_permute_threshold
+    ) or local_routes_path:
         # The one-hot permute and unpermute are matmuls across all tokens, and
         # 0 * NaN == NaN: one token with a non-finite hidden state or routing
         # weight would turn every token's output into NaN. Zero those values
@@ -647,6 +1130,24 @@ def fused_moe_func(
         return dense_expert_moe(
             hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids
         )
+
+    if local_routes_path:
+        return onehot_moe_local_routes(
+            hidden_states,
+            w1,
+            w1_scale,
+            w1_bias,
+            w2,
+            w2_scale,
+            w2_bias,
+            topk_weights,
+            topk_ids,
+            max_local_routes=local_routes,
+            padded_hidden_size=padded_hidden_size,
+            activation=activation,
+            rhs_quant_dtype=rhs_quant_dtype,
+            skip_padded_tokens=skip_padded_tokens,
+        )[:num_tokens, :hidden_size]
 
     (
         x,

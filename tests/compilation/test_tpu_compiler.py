@@ -89,6 +89,22 @@ class TestTpuCompilerCache:
 
         assert unprofiled == phased
 
+    def test_tpu_hash_keys_routing_counts_on_being_set(self):
+        """A new routing counts directory must not recompile; turning the
+        counts on must."""
+        from vllm_torchtpu.compilation.tpu_compiler import compute_tpu_compilation_hash
+
+        hashes = {}
+        with patch(
+            "vllm_torchtpu.compilation.tpu_compiler._iter_runtime_cache_key_files",
+            return_value=[],
+        ):
+            for value in ("", "/a", "/b"):
+                with patch.dict(os.environ, {"TPU_MOE_ROUTING_COUNTS_DIR": value}):
+                    hashes[value] = compute_tpu_compilation_hash(self._config())
+
+        assert hashes["/a"] == hashes["/b"] != hashes[""]
+
     def test_tpu_hash_covers_native_compile_env(self):
         from vllm_torchtpu.compilation.tpu_compiler import compute_tpu_compilation_hash
 

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import functools
+import math
 
 import jax
 import jax.numpy as jnp
@@ -27,6 +28,7 @@ from vllm_torchtpu.kernels.gdn.v3 import (
     memory_ref,
     metadata,
     vmem_ldst,
+    window_tile,
 )
 
 
@@ -44,9 +46,13 @@ def inner_kernel(
     weights_ref: memory_ref.WeightRefs,
     carry_conv_scratch_ref: jax.Array | None,
     carry_recurrent_scratch_ref: jax.Array | None,
+    window_scratch_refs: tuple[jax.Array, ...] | None = None,
+    packed_scratch_refs: tuple[jax.Array, ...] | None = None,
     *,
     cfg: config.GDNConfig,
     p_id: jax.Array | None = None,
+    conv_state_out_ref: jax.Array | None = None,
+    recurrent_out_ref: jax.Array | None = None,
 ):
     """Orchestrates computation of Conv1D and GDN for a single tile.
 
@@ -70,14 +76,56 @@ def inner_kernel(
             convolution carry.
         carry_recurrent_scratch_ref: Optional VMEM scratch reference for inter-tile
             recurrent state carry.
+        window_scratch_refs: Optional VMEM scratches of window_tile (head
+            states, conv inputs, conv weights); verify-window tiles it
+            supports run there.
+        packed_scratch_refs: With `cfg.packed_tokens` outside window_tile,
+            the VMEM qkv, b and a tiles built from the packed tile in
+            `qkv_slot_ref`.
         cfg: GDN configuration object.
         p_id: Optional explicit tile index. Communication-fused outer kernels
             pass their global compute-tile index because their surrounding
             pipeline owns the Pallas program id.
+        conv_state_out_ref: Optional separate VMEM ref receiving the
+            convolution checkpoints; by default they overwrite
+            conv_state_slot_ref.
+        recurrent_out_ref: Optional separate VMEM ref receiving the
+            recurrent checkpoints; by default they overwrite
+            recurrent_slot_ref.
     """
 
     if p_id is None:
         p_id = pl.program_id(0)
+    if conv_state_out_ref is None:
+        conv_state_out_ref = conv_state_slot_ref
+    if recurrent_out_ref is None:
+        recurrent_out_ref = recurrent_slot_ref
+
+    if window_scratch_refs is not None and window_tile.supported(
+        cfg, recurrent_out_ref.shape[3:], recurrent_out_ref.dtype
+    ):
+        window_tile.run(
+            qkv_slot_ref,
+            b_slot_ref,
+            a_slot_ref,
+            conv_state_slot_ref,
+            recurrent_slot_ref,
+            out_slot_ref,
+            conv_state_out_ref,
+            recurrent_out_ref,
+            metadata_ref,
+            weights_ref,
+            *window_scratch_refs,
+            cfg=cfg,
+            p_id=p_id,
+        )
+        return
+
+    if cfg.packed_tokens:
+        assert packed_scratch_refs is not None
+        qkv_slot_ref, b_slot_ref, a_slot_ref = _unpack_tokens(
+            qkv_slot_ref, packed_scratch_refs, cfg
+        )
 
     # Prepare states.
     real_sizes, prev_conv, prev_recurrent = vmem_ldst.load_and_select_states(
@@ -114,7 +162,7 @@ def inner_kernel(
     )
 
     if cfg.state_plan is None:
-        conv_state_slot_ref[...] = new_conv_state
+        conv_state_out_ref[...] = new_conv_state
     else:
         # External source tiles: encode each window position's checkpoint
         # through the region's typed view; copy_out pushes the raw bytes
@@ -122,7 +170,7 @@ def inner_kernel(
         for idx in range(cfg.seq_tile_size):
             for t in range(cfg.window_size):
                 args = (
-                    conv_state_slot_ref.at[idx, t],
+                    conv_state_out_ref.at[idx, t],
                     cfg.state_plan.conv,
                     new_conv_state[idx, t],
                 )
@@ -219,12 +267,12 @@ def inner_kernel(
     # Store output and recurrent to vmem.
     out_slot_ref[...] = out.astype(out_slot_ref.dtype)
     if cfg.state_plan is None:
-        recurrent_slot_ref[...] = new_recurrent_state.astype(recurrent_slot_ref.dtype)
+        recurrent_out_ref[...] = new_recurrent_state.astype(recurrent_out_ref.dtype)
     else:
         for idx in range(cfg.seq_tile_size):
             for t in range(cfg.window_size):
                 args = (
-                    recurrent_slot_ref.at[idx, t],
+                    recurrent_out_ref.at[idx, t],
                     cfg.state_plan.recurrent,
                     new_recurrent_state[idx, t],
                 )
@@ -237,6 +285,25 @@ def inner_kernel(
 
     if carry_recurrent_scratch_ref is not None:
         carry_recurrent_scratch_ref[...] = new_recurrent_state[:, -1]
+
+
+def _unpack_tokens(
+    packed_ref: jax.Array,  # [seq, chunk, dim_size / 128 + 2, 128]
+    scratch_refs: tuple[jax.Array, jax.Array, jax.Array],
+    cfg: config.GDNConfig,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Copies a packed tile's qkv, b and a rows into the [seq, chunk, 1,
+    width] tiles inner_kernel reads; values are unchanged."""
+    qkv_ref, b_ref, a_ref = scratch_refs
+    lanes = pltpu.get_tpu_info().num_lanes
+    rows = cfg.dim_size // lanes
+    for idx in range(cfg.seq_tile_size):
+        qkv_rows = qkv_ref.at[idx].reshape(-1, lanes)
+        for t in range(cfg.chunk_size):
+            qkv_rows[pl.ds(t * rows, rows)] = packed_ref[idx, t, pl.ds(0, rows)]
+            b_ref[idx, t] = packed_ref[idx, t, pl.ds(rows, 1)]
+            a_ref[idx, t] = packed_ref[idx, t, pl.ds(rows + 1, 1)]
+    return qkv_ref, b_ref, a_ref
 
 
 def outer_kernel(
@@ -256,6 +323,8 @@ def outer_kernel(
     # Scratches.
     carry_conv_scratch_ref: jax.Array | None,
     carry_recurrent_scratch_ref: jax.Array | None,
+    window_scratch_refs: tuple[jax.Array, ...] | None = None,
+    packed_scratch_refs: tuple[jax.Array, ...] | None = None,
     *,
     cfg: config.GDNConfig,
 ):
@@ -267,6 +336,14 @@ def outer_kernel(
         # which rides the conv-state input slot.
         recurrent_state_ref = conv_state_ref
 
+    # Verify-window tiles keep each state's read buffer apart from its
+    # checkpoint buffer, so a tile's checkpoint write-back overlaps the next
+    # tile.
+    split_state_io = (
+        cfg.mode == config.GDNMode.BATCHED
+        and cfg.window_size > 1
+        and config.GDNConfig.SPLIT_BATCHED_STATE_IO
+    )
     qkv_alloc, b_alloc, a_alloc, conv_alloc, recurrent_alloc, out_alloc = (
         memory_ref.create_allocs(
             metadata_ref=metadata_ref,
@@ -277,55 +354,173 @@ def outer_kernel(
             conv_state_ref=conv_state_ref,
             recurrent_state_ref=recurrent_state_ref,
             cfg=cfg,
+            split_state_io=split_state_io,
         )
+    )
+    scratches = (
+        metadata_ref,
+        weights_ref,
+        carry_conv_scratch_ref,
+        carry_recurrent_scratch_ref,
+        window_scratch_refs,
+        packed_scratch_refs,
     )
 
     num_tiles = metadata_ref.num_tiles[...]
 
-    pipeline_func = pltpu.emit_pipeline(
-        body=functools.partial(
-            inner_kernel,
-            cfg=cfg,
-        ),
-        grid=(num_tiles,),
-        in_specs=(
-            qkv_alloc.spec,
-            b_alloc.spec,
-            a_alloc.spec,
-            conv_alloc.spec,
-            recurrent_alloc.spec,
-        ),
-        out_specs=(out_alloc.spec,),
-    )
+    if split_state_io:
+        (conv_in_alloc, conv_out_alloc) = conv_alloc
+        (recurrent_in_alloc, recurrent_out_alloc) = recurrent_alloc
 
-    @pl.with_scoped(
-        allocations=(
+        def body(qkv, b, a, conv_in, recurrent_in, out, conv_out, recurrent_out, *s):
+            inner_kernel(
+                qkv,
+                b,
+                a,
+                conv_in,
+                recurrent_in,
+                out,
+                *s,
+                cfg=cfg,
+                conv_state_out_ref=conv_out,
+                recurrent_out_ref=recurrent_out,
+            )
+
+        allocs = (
             qkv_alloc,
             b_alloc,
             a_alloc,
-            conv_alloc,
-            recurrent_alloc,
+            conv_in_alloc,
+            recurrent_in_alloc,
             out_alloc,
-        ),
-    )
-    def _run(allocations):
-        pipeline_func(
+            conv_out_alloc,
+            recurrent_out_alloc,
+        )
+        refs = (
             qkv_ref,
             b_ref,
             a_ref,
             conv_state_ref,
             recurrent_state_ref,
             out_ref,
-            scratches=(
-                metadata_ref,
-                weights_ref,
-                carry_conv_scratch_ref,
-                carry_recurrent_scratch_ref,
-            ),
-            allocations=allocations,
+            conv_state_ref,
+            recurrent_state_ref,
         )
+    else:
+        body = functools.partial(inner_kernel, cfg=cfg)
+        allocs = (qkv_alloc, b_alloc, a_alloc, conv_alloc, recurrent_alloc, out_alloc)
+        refs = (qkv_ref, b_ref, a_ref, conv_state_ref, recurrent_state_ref, out_ref)
+    # qkv, b, a and the two state reads; the rest are outputs.
+    num_inputs = 5
+    if cfg.packed_tokens:
+        # b and a ride in the packed qkv tile.
+        allocs = (allocs[0], *allocs[3:])
+        refs = (refs[0], *refs[3:])
+        num_inputs = 3
+        unpacked_body = body
+
+        def body(tokens, *rest):
+            unpacked_body(tokens, None, None, *rest)
+
+    pipeline_func = pltpu.emit_pipeline(
+        body=body,
+        grid=(num_tiles,),
+        in_specs=tuple(alloc.spec for alloc in allocs[:num_inputs]),
+        out_specs=tuple(alloc.spec for alloc in allocs[num_inputs:]),
+    )
+
+    @pl.with_scoped(allocations=allocs)
+    def _run(allocations):
+        pipeline_func(*refs, scratches=scratches, allocations=allocations)
 
     _run()
+
+
+def _both_segments_kernel(
+    metadata_refs: tuple[memory_ref.MetadataRef, memory_ref.MetadataRef],
+    qkv_ref: jax.Array,
+    b_ref: jax.Array,
+    a_ref: jax.Array,
+    source_ref: jax.Array,
+    in_act_ref: jax.Array | None,
+    weights_ref: memory_ref.WeightRefs,
+    out_ref: jax.Array,
+    source_out_ref: jax.Array,
+    *,
+    cfgs: tuple[config.GDNConfig, config.GDNConfig],
+):
+    """outer_kernel of the batched segment, then of the per-sequence one,
+    on the same activations, output and state source."""
+    for metadata_ref, cfg in zip(metadata_refs, cfgs, strict=True):
+
+        def segment(metadata_ref=metadata_ref, cfg=cfg, **scratch_refs):
+            outer_kernel(
+                metadata_ref,
+                qkv_ref,
+                b_ref,
+                a_ref,
+                source_ref,
+                None,
+                in_act_ref,
+                weights_ref,
+                out_ref,
+                source_out_ref,
+                None,
+                **scratch_refs,
+                cfg=cfg,
+            )
+
+        pl.run_scoped(segment, **cfg.get_scratch_shape_dict())
+
+
+def _state_region_tile_bytes(
+    state_source: jax.Array, region: config.StateRegion, whole_block_dma: bool
+) -> int:
+    """VMEM bytes of one checkpoint's raw source tile for `region`."""
+    if whole_block_dma:
+        block_elems = math.prod(state_source.shape[1:])
+    else:
+        block_elems = region.nrows * math.prod(state_source.shape[2:])
+    return region.nblocks * block_elems * state_source.dtype.itemsize
+
+
+def windowed_decode_tile_size(
+    decode_tile_size: int,
+    *,
+    window: int,
+    recurrent_ckpt_bytes: int,
+    conv_ckpt_bytes: int,
+    token_bytes: int,
+) -> int:
+    """Sequences per verify-window tile.
+
+    A verify window holds one state checkpoint per window position per
+    sequence in VMEM, which multiplies the per-sequence footprint by the
+    window size. Shrink the tile so the double-buffered windows fit in
+    roughly half the scoped-VMEM budget (the rest goes to weights,
+    activations scratch and compiler temporaries).
+
+    Args:
+        decode_tile_size: Requested sequences per tile.
+        window: Tokens per verify window (= checkpoints per sequence).
+        recurrent_ckpt_bytes: VMEM bytes of one recurrent-state checkpoint
+            in its tile dtype / source layout.
+        conv_ckpt_bytes: VMEM bytes of one conv-state checkpoint.
+        token_bytes: VMEM bytes of one token's qkv, b, a and output.
+    """
+    num_buffers = config.GDNConfig.__dataclass_fields__["num_buffers"].default
+    # Checkpoint buffer plus, with split state buffers, the one-state read
+    # buffer.
+    state_tiles = window + int(config.GDNConfig.SPLIT_BATCHED_STATE_IO)
+    bytes_per_seq = state_tiles * (recurrent_ckpt_bytes + conv_ckpt_bytes) + (
+        window * token_bytes
+    )
+    vmem_budget = int(
+        config.GDNConfig.WINDOWED_VMEM_FRACTION
+        * pltpu.get_tpu_info().vmem_capacity_bytes
+    )
+    spec_tile_budget = (vmem_budget // 2) // num_buffers
+    return max(1, min(decode_tile_size, spec_tile_budget // bytes_per_seq))
 
 
 @jax.jit(
@@ -346,6 +541,10 @@ def outer_kernel(
         "state_plan",
         "attention_mode",
         "gate_lower_bound",
+        "two_slot_ckpts",
+        "packed_tokens",
+        "single_launch",
+        "paired_heads",
     ),
 )
 def fused_conv1d_gdn(
@@ -382,6 +581,10 @@ def fused_conv1d_gdn(
     # TODO(kyuyeunk): Calculate tile size based on input dimensions.
     decode_tile_size: int = 4,
     mixed_tile_size: int = 64,
+    two_slot_ckpts: bool = False,
+    packed_tokens: bool = False,
+    single_launch: bool = False,
+    paired_heads: bool = False,
 ) -> tuple[tuple[jax.Array, jax.Array], jax.Array] | tuple[jax.Array, jax.Array]:
     """Perform conv1d and gdn in a single fused kernel.
 
@@ -453,6 +656,25 @@ def fused_conv1d_gdn(
         decode_tile_size: Tile size along sequence dimension for decode sequences.
         mixed_tile_size: Tile size along token/chunk dimension for prefill/mixed
             sequences.
+        two_slot_ckpts: Speculative decoding with two state blocks per
+            sequence instead of one per window position; `ckpt_indices` is
+            [num_seqs, 4]: the two blocks, then the block a mamba block
+            boundary inside the window completes and the window position
+            whose state it needs (memory_ref.two_slot_boundary).
+            `read_offsets` packs the start block and the number of tokens to
+            recompute (`GDNConfig.two_slot_ckpts`). Needs the pooled source
+            and BF16 activations.
+        packed_tokens: Pass qkv, b and a to both kernels as one [tokens,
+            dim / 128 + 2, 128] array (GDNConfig.packed_tokens) where the
+            verify windows run window_tile, instead of one [tokens, 1, width]
+            array each.
+        single_launch: With a state source, run the batched and the
+            per-sequence segments in one kernel instead of two, so a step
+            without prefill does not launch an empty per-sequence kernel.
+        paired_heads: Where window_tile runs the verify windows, multiply k
+            and q with two value heads of one key head per MXU dot, and
+            select no whole states in its window loop
+            (`GDNConfig.paired_heads`).
 
     Returns:
         (new_conv_state, new_recurrent_state): Updated convolution state cache and
@@ -477,6 +699,14 @@ def fused_conv1d_gdn(
         recurrent_out_dtype = recurrent_state.dtype
         conv_state = conv_state.astype(jnp.float32)
 
+    if two_slot_ckpts:
+        # The start tile keeps each window's inputs, which only round-trip
+        # through its BF16 rows exactly when they arrive as BF16.
+        assert qkv.dtype == b.dtype == a.dtype == jnp.bfloat16, (
+            qkv.dtype,
+            b.dtype,
+            a.dtype,
+        )
     qkv = qkv.astype(jnp.float32)
     b = b.astype(jnp.float32)
     a = a.astype(jnp.float32)
@@ -516,11 +746,18 @@ def fused_conv1d_gdn(
         read_offsets = jnp.zeros((num_seqs,), dtype=jnp.int32)
     assert read_offsets.shape == (num_seqs,)
     read_offsets = read_offsets.astype(jnp.int32)
+    if two_slot_ckpts:
+        assert pooled and num_spec_tokens > 0, (
+            "two-slot checkpoints need a pooled state source and drafts"
+        )
     if ckpt_indices is not None:
         # One source block per checkpoint (vLLM's ssm_state_indices scheme):
         # checkpoint t of sequence s lives at block ckpt_indices[s, t], so
-        # the pool block only ever has to hold a single state.
-        assert ckpt_indices.shape == (num_seqs, num_spec_tokens + 1), (
+        # the pool block only ever has to hold a single state. Two-slot rows
+        # are the pair, then a block boundary's block and window position
+        # (memory_ref.MetadataRef.s_idx_to_ckpt_indices).
+        num_ckpts = 4 if two_slot_ckpts else num_spec_tokens + 1
+        assert ckpt_indices.shape == (num_seqs, num_ckpts), (
             ckpt_indices.shape,
             num_seqs,
             num_spec_tokens,
@@ -533,33 +770,36 @@ def fused_conv1d_gdn(
     packing = 4 // act_in_dtype.itemsize
     padded_batch_size = pl.cdiv(batch_size, packing) * packing
     decode_tile_size = min(decode_tile_size, batch_size)
+    # Round the static clip down to a power of two so a non-power-of-two token
+    # bucket (e.g. 24 or 40 requests per engine) stays divisible by the
+    # triangular solver's block size. Ported from vllm-torchtpu PR #2438.
     mixed_tile_size = min(mixed_tile_size, batch_size)
+    if mixed_tile_size > 1:
+        mixed_tile_size = 1 << (mixed_tile_size.bit_length() - 1)
     aligned_num_v_heads = pl.cdiv(n_v, num_lanes) * num_lanes
 
     if num_spec_tokens > 0:
-        # A verify window holds one state checkpoint per window position per
-        # sequence in VMEM, which multiplies the per-sequence footprint by
-        # the window size. Shrink the tile so the double-buffered windows
-        # fit in roughly half the scoped-VMEM budget (the rest goes to
-        # weights, activations scratch and compiler temporaries).
-        window = num_spec_tokens + 1
-        num_buffers = config.GDNConfig.__dataclass_fields__["num_buffers"].default
-        recurrent_bytes_per_seq = window * n_v * d_k * d_v * 4
-        bytes_per_seq = (
-            # Recurrent checkpoints (fp32) — the dominant term.
-            recurrent_bytes_per_seq
-            # Conv checkpoints (fp32).
-            + window * (kernel_size - 1) * dim * 4
-            # qkv (fp32), b/a (fp32), out (act_out).
-            + window * (dim * 4 + 2 * aligned_num_v_heads * 4 + n_v * d_v * 2)
-        )
-        vmem_budget = int(
-            config.GDNConfig.WINDOWED_VMEM_FRACTION
-            * pltpu.get_tpu_info().vmem_capacity_bytes
-        )
-        spec_tile_budget = (vmem_budget // 2) // num_buffers
-        decode_tile_size = max(
-            1, min(decode_tile_size, spec_tile_budget // bytes_per_seq)
+        if pooled:
+            # The VMEM tile holds each checkpoint's raw source blocks.
+            recurrent_ckpt_bytes = _state_region_tile_bytes(
+                state_source, state_plan.recurrent, state_plan.whole_block_dma
+            )
+            conv_ckpt_bytes = _state_region_tile_bytes(
+                state_source, state_plan.conv, state_plan.whole_block_dma
+            )
+        else:
+            recurrent_ckpt_bytes = n_v * d_k * d_v * recurrent_state.dtype.itemsize
+            conv_ckpt_bytes = (kernel_size - 1) * dim * conv_state.dtype.itemsize
+        decode_tile_size = windowed_decode_tile_size(
+            decode_tile_size,
+            window=num_spec_tokens + 1,
+            recurrent_ckpt_bytes=recurrent_ckpt_bytes,
+            conv_ckpt_bytes=conv_ckpt_bytes,
+            token_bytes=(
+                dim * 4
+                + 2 * aligned_num_v_heads * 4
+                + n_v * d_v * act_out_dtype.itemsize
+            ),
         )
 
         if is_kda and num_spec_tokens > 0:
@@ -584,9 +824,64 @@ def fused_conv1d_gdn(
     b = jnp.pad(b, ((0, batch_padding_size), (0, num_v_padding_size)))
     a = jnp.pad(a, ((0, batch_padding_size), (0, gate_padding_size)))
 
-    qkv = qkv.reshape(padded_batch_size, 1, -1)
-    b = b.reshape(padded_batch_size, 1, -1)
-    a = a.reshape(padded_batch_size, 1, -1)
+    def make_cfg(mode: config.GDNMode, packed: bool = False) -> config.GDNConfig:
+        if mode == config.GDNMode.PER_SEQ:
+            tile_size = mixed_tile_size
+            # Prefill / mixed sequences keep a single state checkpoint.
+            window_size = 1
+        else:
+            tile_size = decode_tile_size
+            window_size = num_spec_tokens + 1
+        return config.GDNConfig(
+            mode=mode,
+            batch_size=padded_batch_size,
+            kernel_size=kernel_size,
+            tile_size=tile_size,
+            window_size=window_size,
+            dim_size=dim,
+            num_kq_heads=n_kq,
+            num_v_heads=n_v,
+            kq_head_dim=d_k,
+            v_head_dim=d_v,
+            attention_mode=attention_mode,
+            gate_lower_bound=gate_lower_bound,
+            two_slot_ckpts=two_slot_ckpts,
+            dtypes=config.Dtypes(
+                act_in=act_in_dtype,
+                act_out=act_out_dtype,
+                compute=compute_precision,
+                recurrent_state=(
+                    jnp.float32.dtype if pooled else recurrent_state.dtype
+                ),
+                conv_state=(jnp.float32.dtype if pooled else conv_state.dtype),
+            ),
+            state_plan=state_plan,
+            packed_tokens=packed,
+            paired_heads=paired_heads,
+        )
+
+    # Packed activations: only where window_tile runs the verify windows.
+    batched_cfg = make_cfg(config.GDNMode.BATCHED)
+    packed = (
+        packed_tokens
+        and pooled
+        and dim % num_lanes == 0
+        and gate_dim <= num_lanes
+        and aligned_num_v_heads == num_lanes
+        and batched_cfg.per_head_windows
+        and window_tile.supported(
+            batched_cfg, state_source.shape[1:], state_source.dtype
+        )
+    )
+    if packed:
+        tokens = jnp.concat([qkv, b, a], axis=1).reshape(
+            padded_batch_size, -1, num_lanes
+        )
+        qkv = b = a = tokens
+    else:
+        qkv = qkv.reshape(padded_batch_size, 1, -1)
+        b = b.reshape(padded_batch_size, 1, -1)
+        a = a.reshape(padded_batch_size, 1, -1)
 
     # Step 3: States and weights pre-processing.
     # TODO(kyuyeunk): To eliminate runtime cost, move this logic into model
@@ -608,51 +903,9 @@ def fused_conv1d_gdn(
     hbm_spec = pl.BlockSpec(memory_space=pltpu.HBM)
     weights_spec = jax.tree.map(lambda _: vmem_spec, weights)
 
-    def call_kernel(
-        in_conv_state: jax.Array,
-        in_recurrent_state: jax.Array | None,
-        in_act: jax.Array | None,
-        mode: config.GDNMode,
-    ) -> tuple[jax.Array, jax.Array, jax.Array | None]:
-        # With a state source, it rides the conv-state slot and the dense
-        # recurrent-state input is absent.
-        if mode == config.GDNMode.PER_SEQ:
-            tile_size = mixed_tile_size
-            # Prefill / mixed sequences keep a single state checkpoint.
-            window_size = 1
-        else:
-            tile_size = decode_tile_size
-            window_size = num_spec_tokens + 1
-
-        cfg = config.GDNConfig(
-            mode=mode,
-            batch_size=padded_batch_size,
-            kernel_size=kernel_size,
-            tile_size=tile_size,
-            window_size=window_size,
-            dim_size=dim,
-            num_kq_heads=n_kq,
-            num_v_heads=n_v,
-            kq_head_dim=d_k,
-            v_head_dim=d_v,
-            attention_mode=attention_mode,
-            gate_lower_bound=gate_lower_bound,
-            dtypes=config.Dtypes(
-                act_in=act_in_dtype,
-                act_out=act_out_dtype,
-                compute=compute_precision,
-                recurrent_state=(
-                    jnp.float32.dtype if pooled else in_recurrent_state.dtype
-                ),
-                conv_state=(jnp.float32.dtype if pooled else in_conv_state.dtype),
-            ),
-            state_plan=state_plan,
-        )
-
-        # Step 6: Metadata preprocessing. Will be executed multiple times per-layer
-        # but will be CSEed by compiler.
-        if mode != config.GDNMode.PER_SEQ:
-            metadata_obj = metadata.compute_batched_seq_metadata(
+    def make_metadata(cfg: config.GDNConfig) -> memory_ref.MetadataRef:
+        if cfg.mode != config.GDNMode.PER_SEQ:
+            return metadata.compute_batched_seq_metadata(
                 cfg=cfg,
                 seq_lens=seq_lens,
                 query_start_loc=query_start_loc,
@@ -661,19 +914,87 @@ def fused_conv1d_gdn(
                 end_seq=distribution[0],
                 ckpt_indices=ckpt_indices,
             )
-        else:
-            metadata_obj = metadata.compute_per_seq_metadata(
-                cfg=cfg,
-                seq_lens=seq_lens,
-                query_start_loc=query_start_loc,
-                state_indices=state_indices,
-                read_offsets=read_offsets,
-                start_seq=distribution[0],
-                end_seq=distribution[-1],
-                ckpt_indices=ckpt_indices,
+        return metadata.compute_per_seq_metadata(
+            cfg=cfg,
+            seq_lens=seq_lens,
+            query_start_loc=query_start_loc,
+            state_indices=state_indices,
+            read_offsets=read_offsets,
+            start_seq=distribution[0],
+            end_seq=distribution[-1],
+            ckpt_indices=ckpt_indices,
+        )
+
+    def call_both(source: jax.Array) -> tuple[jax.Array, jax.Array]:
+        # Pooled batched and per-sequence segments in one kernel, one after
+        # the other, each with the scratch of its own configuration.
+        cfgs = (
+            make_cfg(config.GDNMode.BATCHED, packed),
+            make_cfg(config.GDNMode.PER_SEQ, packed),
+        )
+        metas = tuple(make_metadata(cfg) for cfg in cfgs)
+        if two_slot_ckpts:
+            # Only the window tile recomputes accepted tokens.
+            assert window_tile.supported(cfgs[0], source.shape[1:], source.dtype), (
+                "two-slot checkpoints need window_tile support for this pool"
             )
+        in_act = cfgs[0].get_out_shape()
+        if zero_initialize_out:
+            in_act = jnp.zeros_like(in_act)
+        num_meta = sum(len(m) for m in metas)
+        aliases = {num_meta + 3: 1}
+        if zero_initialize_out:
+            aliases[num_meta + 4] = 0
+        return pl.pallas_call(
+            functools.partial(_both_segments_kernel, cfgs=cfgs),
+            out_shape=(in_act, source),
+            in_specs=(
+                jax.tree.map(lambda _: smem_spec, metas),
+                hbm_spec,
+                hbm_spec,
+                hbm_spec,
+                hbm_spec,
+                hbm_spec if zero_initialize_out else None,
+                weights_spec,
+            ),
+            out_specs=(hbm_spec, hbm_spec),
+            input_output_aliases=aliases,
+            compiler_params=pltpu.CompilerParams(
+                disable_bounds_checks=True,
+                vmem_limit_bytes=max(cfg.get_vmem_limit_bytes() for cfg in cfgs),
+            ),
+            name=f"{cfgs[0].get_kernel_name()}_and_per_seq",
+            metadata=cfgs[0].get_metadata(),
+        )(
+            metas,
+            qkv,
+            b,
+            a,
+            source,
+            in_act if zero_initialize_out else None,
+            weights,
+        )
+
+    def call_kernel(
+        in_conv_state: jax.Array,
+        in_recurrent_state: jax.Array | None,
+        in_act: jax.Array | None,
+        mode: config.GDNMode,
+    ) -> tuple[jax.Array, jax.Array, jax.Array | None]:
+        # With a state source, it rides the conv-state slot and the dense
+        # recurrent-state input is absent.
+        cfg = make_cfg(mode, packed)
+
+        # Step 6: Metadata preprocessing. Will be executed multiple times per-layer
+        # but will be CSEed by compiler.
+        metadata_obj = make_metadata(cfg)
 
         metadata_spec = jax.tree.map(lambda _: smem_spec, metadata_obj)
+        if two_slot_ckpts and mode == config.GDNMode.BATCHED:
+            # Only the window tile recomputes accepted tokens.
+            assert window_tile.supported(
+                cfg, in_conv_state.shape[1:], in_conv_state.dtype
+            ), "two-slot checkpoints need window_tile support for this pool"
 
         # Step 7: Handle case where write needs to be done in existing out.
         # Flat aliasing indices account for the absent recurrent-state
@@ -727,6 +1048,11 @@ def fused_conv1d_gdn(
 
     if batched_only and prefill_only:
         raise ValueError("batched_only and prefill_only are mutually exclusive")
+
+    if pooled and single_launch and not (prefill_only or batched_only):
+        out_act, out_source = call_both(state_source)
+        out_act = out_act.reshape(padded_batch_size, -1)[:batch_size]
+        return out_source, out_act
 
     if pooled:
         out_act, out_source = None, state_source

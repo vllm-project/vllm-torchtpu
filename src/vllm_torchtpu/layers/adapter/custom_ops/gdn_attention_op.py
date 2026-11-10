@@ -47,6 +47,7 @@ from vllm_torchtpu.distributed.pcp import (
 )
 from vllm_torchtpu.gdn_pool_layout import (
     DEFAULT_POOLED_GDN_CONV_STATE_DTYPE,
+    gdn_two_slot_ckpts,
     unified_kv_layout_enabled_for_architecture,
 )
 from vllm_torchtpu.kernels.gdn.head_geometry import (
@@ -184,6 +185,7 @@ def gdn_attention_pooled_core_tpu(
     pool_block_tokens: int,
     recurrent_state_dtype: jnp.dtype,
     num_spec_tokens: int = 0,
+    two_slot_ckpts: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     return run_jax_gdn_attention_pooled(
         mixed_qkv,
@@ -209,6 +211,7 @@ def gdn_attention_pooled_core_tpu(
         recurrent_state_dtype=recurrent_state_dtype,
         mesh=mesh,
         num_spec_tokens=num_spec_tokens,
+        two_slot_ckpts=two_slot_ckpts,
     )
 
 
@@ -467,6 +470,10 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         if spec is None:
             return None
         assert isinstance(spec, MambaSpec)
+        if gdn_two_slot_ckpts(spec.num_speculative_blocks):
+            # The window's start state and its last state; see
+            # GDNConfig.two_slot_ckpts.
+            spec = dataclasses.replace(spec, num_speculative_blocks=1)
         return _localize_gdn_mamba_spec_for_pcp(
             spec,
             _get_pcp_size(vllm_config),
@@ -698,6 +705,9 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         # the request's state block; rejected drafts are rolled back by
         # checkpoint selection (see TPUModelRunner.mamba_slot_read_offsets).
         num_spec_tokens = self.num_spec
+        # Two state blocks per request instead of one per window position;
+        # see get_kv_cache_spec and GDNConfig.two_slot_ckpts.
+        two_slot_ckpts = gdn_two_slot_ckpts(num_spec_tokens)
 
         # Written out rather than functools.partial so pool_block_tokens is
         # read per call instead of at build time; pallas.jax_op requires a
@@ -752,6 +762,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 pool_block_tokens=vllm_config.cache_config.block_size,
                 recurrent_state_dtype=recurrent_state_dtype,
                 num_spec_tokens=num_spec_tokens,
+                two_slot_ckpts=two_slot_ckpts,
             )
             if not block_major:
                 return result
@@ -786,6 +797,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 kernel_size,
                 recurrent_state_dtype,
                 num_spec_tokens,
+                two_slot_ckpts,
             ),
             build_op,
         )

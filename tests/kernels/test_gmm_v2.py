@@ -30,7 +30,9 @@ from vllm_torchtpu.kernels.megablox.gmm_v2 import (
     TileSizes,
     apply_act_fn,
     gmm_v2,
+    gmm_v2_mlp,
     interleave_lane,
+    mlp_supported,
     situ_and_mul,
 )
 
@@ -456,3 +458,242 @@ def test_gmm_v2_int4_packed_matches_reference():
 
     assert actual.shape == (batch_size, out_size)
     _assert_allclose(actual, expected, atol=3e-1, rtol=3e-1)
+
+
+def _mlp_inputs(num_groups, size_k, size_inter, size_n, seed=0, block_size=256):
+    keys = jax.random.split(jax.random.key(seed), 4)
+    w1 = jax.random.uniform(
+        keys[0], (num_groups, size_k, 2 * size_inter), jnp.float32, -6, 6
+    ).astype(jnp.float4_e2m1fn)
+    w2 = jax.random.uniform(
+        keys[1], (num_groups, size_inter, size_n), jnp.float32, -6, 6
+    ).astype(jnp.float4_e2m1fn)
+    s1 = jax.random.uniform(
+        keys[2],
+        (num_groups, size_k // block_size, 1, 2 * size_inter),
+        jnp.float32,
+        0.005,
+        0.02,
+    )
+    s2 = jax.random.uniform(
+        keys[3],
+        (num_groups, size_inter // block_size, 1, size_n),
+        jnp.float32,
+        0.005,
+        0.02,
+    )
+    return w1, s1, w2, s2
+
+
+def _two_call_mlp(lhs, w1, s1, w2, s2, group_sizes, group_offset):
+    inter = gmm_v2(
+        lhs,
+        w1,
+        group_sizes,
+        rhs_scale=s1,
+        group_offset=group_offset,
+        fuse_act="silu",
+        maybe_quantize_lhs=False,
+        zero_initialize=False,
+    )
+    return gmm_v2(
+        inter[:, : w2.shape[1]],
+        w2,
+        group_sizes,
+        rhs_scale=s2,
+        group_offset=group_offset,
+        maybe_quantize_lhs=False,
+        zero_initialize=False,
+        preferred_element_type=lhs.dtype,
+    )
+
+
+def _assert_mlp_bitwise(
+    lhs,
+    w1,
+    s1,
+    w2,
+    s2,
+    sizes,
+    group_offset,
+    num_parts,
+    down_parts=1,
+    buckets=None,
+    tile_rows=None,
+):
+    group_sizes = jnp.asarray(sizes, jnp.int32)
+    offset = jnp.asarray([group_offset], jnp.int32)
+    kwargs = dict(
+        num_parts=num_parts,
+        down_parts=down_parts,
+        buckets=buckets,
+        tile_rows=tile_rows,
+    )
+    assert mlp_supported(lhs, w1, s1, w2, s2, group_sizes, fuse_act="silu", **kwargs)
+    expected = _two_call_mlp(lhs, w1, s1, w2, s2, group_sizes, offset)
+    actual = gmm_v2_mlp(
+        lhs,
+        w1,
+        w2,
+        group_sizes,
+        s1,
+        s2,
+        offset,
+        fuse_act="silu",
+        maybe_quantize_lhs=False,
+        **kwargs,
+    )
+    assert actual.shape == expected.shape
+    # Rows past the routed rows are not written by either path.
+    start = sum(sizes[:group_offset])
+    stop = start + sum(sizes[group_offset:])
+    expected_bits = jax.lax.bitcast_convert_type(expected[start:stop], jnp.uint16)
+    actual_bits = jax.lax.bitcast_convert_type(actual[start:stop], jnp.uint16)
+    np.testing.assert_array_equal(np.asarray(actual_bits), np.asarray(expected_bits))
+
+
+@pytest.mark.parametrize(
+    "num_parts, down_parts, buckets, tile_rows",
+    [
+        (1, 1, None, None),
+        (2, 1, None, None),
+        (4, 1, None, None),
+        (2, 2, None, None),
+        # Row tiles as large as the gate/up kernel's.
+        (2, 1, (64, 128, 192, 256), 256),
+        (4, 2, (16, 32, 256), 256),
+        (2, 1, (16, 256), 256),
+        (2, 1, (16, 32), 32),
+    ],
+)
+@pytest.mark.parametrize(
+    "size_m, sizes, group_offset",
+    [
+        (128, [9, 0, 21, 3, 0, 14, 1, 30], 0),  # empty and uneven groups
+        (128, [1] * 8, 0),  # one row per group
+        (120, [0, 0, 0, 37, 0, 0, 0, 5], 0),  # empty leading groups, padded rows
+        (128, [0] * 8, 0),  # no rows
+        (640, [15, 1, 300, 17, 0, 129, 31, 2], 0),  # groups spanning tiles
+        (128, [4, 6, 9, 3, 0, 14, 1, 30, 2, 5], 2),  # group offset
+    ],
+)
+def test_gmm_v2_mlp_matches_two_calls_bitwise(
+    size_m, sizes, group_offset, num_parts, down_parts, buckets, tile_rows
+):
+    _require_tpu()
+
+    w1, s1, w2, s2 = _mlp_inputs(len(sizes) - group_offset, 1024, 512, 1024)
+    lhs = jax.random.uniform(jax.random.key(1), (size_m, 1024), jnp.bfloat16, -1, 1)
+    _assert_mlp_bitwise(
+        lhs,
+        w1,
+        s1,
+        w2,
+        s2,
+        sizes,
+        group_offset,
+        num_parts,
+        down_parts,
+        buckets,
+        tile_rows,
+    )
+
+
+@pytest.mark.parametrize(
+    "buckets, tile_rows", [(None, None), (None, 128), (16, 128), (64, 128)]
+)
+@pytest.mark.parametrize(
+    "size_m, num_groups, num_rows",
+    [(256, 16, 120), (960, 64, 120), (240, 64, 30)],
+)
+def test_gmm_v2_mlp_matches_two_calls_bitwise_served_shapes(
+    size_m, num_groups, num_rows, buckets, tile_rows
+):
+    _require_tpu()
+
+    w1, s1, w2, s2 = _mlp_inputs(num_groups, 8192, 2048, 8192)
+    rng = np.random.RandomState(num_groups + num_rows)
+    sizes = [
+        int(v) for v in rng.multinomial(num_rows, np.ones(num_groups) / num_groups)
+    ]
+    # Large activations drive some gate pre-activations below the sigmoid's
+    # underflow, so the activation holds signed zeros.
+    lhs = jax.random.uniform(jax.random.key(2), (size_m, 8192), jnp.bfloat16, -50, 50)
+    buckets = (buckets,) if buckets else None
+    _assert_mlp_bitwise(
+        lhs, w1, s1, w2, s2, sizes, 0, 2, buckets=buckets, tile_rows=tile_rows
+    )
+
+
+def test_gmm_v2_mlp_supported_shapes():
+    _require_tpu()
+
+    lhs = jax.ShapeDtypeStruct((128, 1024), jnp.bfloat16)
+    sizes = jax.ShapeDtypeStruct((8,), jnp.int32)
+    w1, s1, w2, s2 = _mlp_inputs(8, 1024, 512, 1024)
+    assert mlp_supported(lhs, w1, s1, w2, s2, sizes, fuse_act="silu")
+    # No fused activation, or the block-16 scales applied before the matmul.
+    assert not mlp_supported(lhs, w1, s1, w2, s2, sizes, fuse_act=None)
+    w1, s1, w2, s2 = _mlp_inputs(8, 1024, 512, 1024, block_size=16)
+    assert not mlp_supported(lhs, w1, s1, w2, s2, sizes, fuse_act="silu")
+    # Activations the gate/up kernel would quantize.
+    w1, s1, w2, s2 = _mlp_inputs(8, 1024, 512, 1024)
+    w1 = w1.astype(jnp.float8_e4m3fn)
+    w2 = w2.astype(jnp.float8_e4m3fn)
+    assert not mlp_supported(
+        lhs, w1, s1, w2, s2, sizes, fuse_act="silu", maybe_quantize_lhs=True
+    )
+
+
+def test_gmm_v2_mlp_row_results_do_not_depend_on_their_neighbours():
+    """A replica of an expert computes a route's row in another group and beside
+    other rows. The same 20 rows give the same bits alone in a group (a 32-row
+    bucket), among 40 more rows (one 64-row tile), across a tile boundary in a
+    300-row group, and in a ninth group holding a replica of the expert's weights
+    (served sizes)."""
+    _require_tpu()
+
+    w1, s1, w2, s2 = _mlp_inputs(8, 8192, 2048, 8192)
+    # Group 8 holds a replica of expert 3.
+    experts = jnp.asarray(list(range(8)) + [3])
+    w1, s1, w2, s2 = (a[experts] for a in (w1, s1, w2, s2))
+    rows = jax.random.uniform(jax.random.key(4), (20, 8192), jnp.bfloat16, -1, 1)
+    other = jax.random.uniform(jax.random.key(5), (320, 8192), jnp.bfloat16, -1, 1)
+
+    def layout(group, before, after):
+        """lhs, group sizes and the first of the 20 rows, which sit in
+        ``group`` after ``before`` and before ``after`` of its other rows."""
+        sizes = [3, 4, 0, 10, 5, 0, 2, 6, 0]
+        sizes[group] = before + 20 + after
+        parts, used = [], 0
+        for g, n in enumerate(sizes):
+            if g == group:
+                parts += [other[used : used + before], rows]
+                parts.append(other[used + before : used + before + after])
+                used += before + after
+            else:
+                parts.append(other[used : used + n])
+                used += n
+        return jnp.concatenate(parts), sizes, sum(sizes[:group]) + before
+
+    results = []
+    for group, before, after in ((3, 0, 0), (3, 20, 20), (3, 120, 160), (8, 0, 0)):
+        lhs, sizes, start = layout(group, before, after)
+        group_sizes = jnp.asarray(sizes, jnp.int32)
+        assert mlp_supported(lhs, w1, s1, w2, s2, group_sizes, fuse_act="silu")
+        out = gmm_v2_mlp(
+            lhs,
+            w1,
+            w2,
+            group_sizes,
+            s1,
+            s2,
+            jnp.zeros((1,), jnp.int32),
+            fuse_act="silu",
+            maybe_quantize_lhs=False,
+        )
+        bits = jax.lax.bitcast_convert_type(out[start : start + 20], jnp.uint16)
+        results.append(np.asarray(bits))
+    assert (results[0] != 0).any()
+    for got in results[1:]:
+        np.testing.assert_array_equal(got, results[0])

@@ -16,7 +16,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from importlib import metadata as importlib_metadata
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 # TODO: Remove this after jax dependency is removed
 import jax
@@ -56,6 +56,7 @@ from vllm.model_executor.layers.rotary_embedding.mrope_interleaved import (
 from vllm.model_executor.layers.rotary_embedding.yarn_scaling_rope import (
     YaRNScalingRotaryEmbedding,
 )
+from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.multimodal.utils import group_and_batch_mm_kwargs
 from vllm.sequence import IntermediateTensors
@@ -93,10 +94,11 @@ from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
     TpuKVConnectorStats,
 )
 from vllm_torchtpu.distributed.pp_wave import PPWave, pp_rank_flags
+from vllm_torchtpu.gdn_pool_layout import gdn_two_slot_ckpts
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs as rpa_configs
 from vllm_torchtpu.kernels.experimental.batched_rpa import wrapper as rpa_batched
 from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
-from vllm_torchtpu.layers.adapter import token_padding
+from vllm_torchtpu.layers.adapter import expert_placement, token_padding
 from vllm_torchtpu.layers.adapter.attention import (
     KV_LAYOUT_BY_VLLM_LAYOUT,
     TPU_STR_DTYPE_TO_TORCH_DTYPE,
@@ -110,8 +112,18 @@ from vllm_torchtpu.layers.adapter.custom_ops.mamba_state_copy_op import (
 )
 from vllm_torchtpu.layers.adapter.quantization import get_tpu_quantization_config
 from vllm_torchtpu.layers.adapter.quantization.online_fp8 import validate_online_fp8
-from vllm_torchtpu.layers.adapter.sample.rejection_sampler import RejectionSampler
+from vllm_torchtpu.layers.adapter.sample.candidate_sampling import (
+    MAX_TOP_K,
+    VocabShardLogits,
+    candidate_verify_decisions,
+    candidate_width,
+)
+from vllm_torchtpu.layers.adapter.sample.rejection_sampler import (
+    RejectionSampler,
+    candidate_rejection_output,
+)
 from vllm_torchtpu.layers.adapter.sample.top_k_top_p import apply_top_k_top_p
+from vllm_torchtpu.layers.adapter.sample.vocab_parallel import vocab_parallel_argmax
 from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadata,
     AttentionMetadataBuilderContext,
@@ -168,9 +180,27 @@ if TYPE_CHECKING:
     from vllm_torchtpu.runner.kv_cache_nan_flags import KVCacheNaNDetector
 
 
+class SpecBoundaryPlan(NamedTuple):
+    """One chunk's verify rows whose accepted tokens may reach a mamba block
+    boundary (`TPUModelRunner._plan_spec_boundary_copies`)."""
+
+    # Device `(row, boundary, num_scheduled, blocks...)` per candidate.
+    entries: torch.Tensor
+    # Device `entries[:, 0]` as row indices.
+    rows: torch.Tensor
+    # The candidates' device sequence lengths this step.
+    seq_lens: torch.Tensor
+    # Logical tokens per mamba block-table column.
+    block_size: int
+    # Host source of `entries`, kept until the upload has been consumed.
+    host_entries: torch.Tensor
+
+
 @dataclass
 class ExecuteModelState:
     scheduler_output: "SchedulerOutput"
+    # Per chunk, the logits, or [n, 1] int64 greedy token ids when the step
+    # samples only greedy tokens (`_samples_greedy_token_ids`).
     logits_list: list[torch.Tensor]
     pooler_output_list: list[Any]
     num_reqs_list: list[int]
@@ -187,6 +217,13 @@ class ExecuteModelState:
     mamba_state_indices_list: list[list[torch.Tensor] | None] = field(
         default_factory=list
     )
+    # Per chunk, the verify rows that may complete a mamba block this step,
+    # for the boundary-state copy after sampling; None when no row can.
+    mamba_boundary_plans: list[SpecBoundaryPlan | None] = field(default_factory=list)
+    # Two-slot GDN checkpoints, per chunk: each request's window position
+    # whose state a mamba block boundary needs, or -1
+    # (`AttentionMetadataBuilderContext.mamba_window_boundary`).
+    mamba_window_boundaries: list[torch.Tensor | None] = field(default_factory=list)
     kv_save_nan_check: KVSaveNanCheck | None = None
 
 
@@ -226,10 +263,46 @@ def _rollback_offsets_migrate_impl(
     read_offsets.index_put_((dst_t,), read_offsets[src_t])
 
 
+def _spec_boundary_pairs_impl(
+    entries: torch.Tensor,
+    seq_lens: torch.Tensor,
+    num_valid: torch.Tensor,
+    block_size: int,
+    width: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """`[num_groups, n]` source and destination state blocks of the boundary
+    copies (see `TPUModelRunner._plan_spec_boundary_copies`); the null block
+    where a candidate's accepted tokens stop short of its boundary.
+
+    `entries` rows are `(row, boundary, num_scheduled, blocks...)`, with
+    `width` block ids per mamba group starting at the boundary's own column.
+    `seq_lens` and `num_valid` are the rows' sequence lengths this step and
+    accepted drafts + 1.
+    """
+    boundary = entries[:, 1]
+    start = seq_lens - entries[:, 2]
+    reached = (start < boundary) & (boundary <= start + num_valid)
+    # Checkpoint t, the state after t + 1 window tokens, lies t columns past
+    # the column of the window's last token.
+    col = (
+        (seq_lens - 1) // block_size
+        + (boundary - 1 - start)
+        - (boundary // block_size - 1)
+    )
+    blocks = entries[:, 3:].reshape(entries.shape[0], -1, width).transpose(0, 1)
+    index = col.clamp(0, width - 1).view(1, -1, 1).expand(blocks.shape[0], -1, 1)
+    src = blocks.gather(2, index).squeeze(2)
+    dst = blocks[:, :, 0]
+    copy = reached & (col >= 0) & (col < width) & (src != 0) & (dst != 0) & (src != dst)
+    null = torch.zeros_like(src)
+    return torch.where(copy, src, null), torch.where(copy, dst, null)
+
+
 _tpu_compile = torch.compile(backend="tpu", fullgraph=True, dynamic=False)
 _reset_read_offsets_compiled = _tpu_compile(_reset_read_offsets_impl)
 _rollback_offsets_seed_compiled = _tpu_compile(_rollback_offsets_seed_impl)
 _rollback_offsets_migrate_compiled = _tpu_compile(_rollback_offsets_migrate_impl)
+_spec_boundary_pairs_compiled = _tpu_compile(_spec_boundary_pairs_impl)
 
 
 def _reset_read_offsets(
@@ -264,6 +337,66 @@ def _rollback_offsets_migrate(
         else _rollback_offsets_migrate_impl
     )
     fn(read_offsets, src_t, dst_t)
+
+
+def _spec_boundary_pairs(
+    entries: torch.Tensor,
+    seq_lens: torch.Tensor,
+    num_valid: torch.Tensor,
+    block_size: int,
+    width: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    fn = (
+        _spec_boundary_pairs_compiled
+        if entries.device.type == "tpu"
+        else _spec_boundary_pairs_impl
+    )
+    return fn(entries, seq_lens, num_valid, block_size, width)
+
+
+def _check_two_slot_ckpts_supported(vllm_config: VllmConfig) -> None:
+    """Refuse two-slot GDN checkpoints (TPU_GDN_TWO_SLOT_CKPT) where they
+    would be wrong: they need the unified KV pool.
+
+    With block hashes (prefix caching or a KV connector) the verify window
+    that completes a mamba block writes the exact boundary state into it
+    (gdn v3 `memory_ref.two_slot_boundary`), the state the one-block-per-
+    position mode copies there after sampling (`_copy_spec_boundary_states`).
+    """
+    if not unified_kv_layout_enabled(vllm_config):
+        raise ValueError(
+            "TPU_GDN_TWO_SLOT_CKPT=1 needs the unified KV pool; remove "
+            "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=0."
+        )
+
+
+def _two_slot_read_codes(
+    codes: torch.Tensor,
+    num_valid: torch.Tensor,
+    drafts: torch.Tensor,
+    window_boundary: torch.Tensor,
+) -> torch.Tensor:
+    """Next read code of each request under two-slot GDN checkpoints.
+
+    A code is `start + 2 * pending`: `start` (0 or 1) names the request's
+    block holding the next window's start state, `pending` how many leading
+    tokens of the last window were accepted but are not in it. A verify
+    window (drafts > 0) read its start state from block `codes & 1`; it
+    wrote its last state to the other block and kept the start one, so all
+    drafts accepted means the other block starts the next window, and
+    otherwise the start block does, with the `accepted + 1` committed tokens
+    pending. A window whose last token completes a mamba block (its
+    `window_boundary` position is `drafts`) wrote its last state to block 0,
+    which that block boundary reuses, and its start state to block 1. One-
+    token windows and prefill chunks wrote their final state to block 0 and
+    leave nothing pending. `codes` may carry a leading group axis;
+    `num_valid` (accepted drafts + 1), `drafts` and `window_boundary`
+    broadcast over it.
+    """
+    accepted = (num_valid - 1).clamp(min=0)
+    start = torch.where(window_boundary == drafts, 1, codes & 1)
+    resumed = torch.where(accepted >= drafts, 1 - start, start + 2 * (accepted + 1))
+    return torch.where(drafts > 0, resumed, torch.zeros_like(resumed))
 
 
 def _spec_logprob_row_tokens(
@@ -515,6 +648,35 @@ def _find_topk_indices_buffer(model: torch.nn.Module) -> torch.Tensor | None:
     return next(iter(found.values()))
 
 
+def _vocab_parallel_greedy_head(
+    model: torch.nn.Module, has_lora: bool
+) -> VocabParallelEmbedding | None:
+    """The LM head whose vocab shards select greedy tokens exactly, or None.
+
+    `compute_logits_local` returns this rank's shard of the logits that
+    `compute_logits` all-gathers and trims to `org_vocab_size`, so the argmax of
+    per-shard (max, first index) pairs, first shard on ties, equals the argmax
+    of the gathered logits. Requires the TPU head's shard-bound buffers, no
+    added or LoRA vocabulary, and token ids exactly representable in fp32.
+    """
+    if has_lora or not hasattr(model, "compute_logits_local"):
+        return None
+    language_model = getattr(model, "language_model", model)
+    head = getattr(language_model, "lm_head", None)
+    processor = getattr(language_model, "logits_processor", None)
+    if (
+        not isinstance(head, VocabParallelEmbedding)
+        or not hasattr(head, "org_vocab_start_index")
+        or processor is None
+        or processor.logits_as_input
+    ):
+        return None
+    vocab = head.org_vocab_size
+    if head.num_embeddings != vocab or processor.org_vocab_size != vocab:
+        return None
+    return head if vocab <= 2**24 else None
+
+
 # Recompilation-avoidance contract:
 #   1. Input prep happens on CPU; H2D via `cpu_tensor.to(xla_device)`.
 #   2. Forward is split into 4 `@torch.compile(backend="tpu")` subgraphs
@@ -667,9 +829,20 @@ class TPUModelRunner(GPUModelRunner):
         #     sized for a single state; holding the whole group in one block
         #     instead would scale `block_size` with `num_spec` (Qwen3.5-397B
         #     at TP=1, K=4: 21760 tokens rather than 4352).
+        # With two-slot checkpoints (TPU_GDN_TWO_SLOT_CKPT) the unified pool
+        # keeps two blocks per request instead: the verify window's start
+        # state and the state after its last token, the read offset packing
+        # which one starts the next window and how many accepted tokens it
+        # must recompute (GDNConfig.two_slot_ckpts).
         num_ckpts = 1
+        num_spec = 0
         if self.vllm_config.speculative_config is not None:
-            num_ckpts = self.vllm_config.speculative_config.num_speculative_tokens + 1
+            num_spec = self.vllm_config.speculative_config.num_speculative_tokens
+            num_ckpts = num_spec + 1
+        self._two_slot_ckpts: bool = gdn_two_slot_ckpts(num_spec)
+        if self._two_slot_ckpts:
+            _check_two_slot_ckpts_supported(self.vllm_config)
+            num_ckpts = 2
         self._mamba_slot_stride: int = num_ckpts
         self._mamba_ckpt_window: int = (
             num_ckpts if unified_kv_layout_enabled(self.vllm_config) else 1
@@ -971,6 +1144,13 @@ class TPUModelRunner(GPUModelRunner):
             if envs.TPU_NAN_LOG_LEVEL >= envs.NanLogLevel.SUMMARY
             else None
         )
+        # LM head whose vocab shards can pick greedy tokens without gathering
+        # full logits; set by load_model, None keeps the full-logit path.
+        self._greedy_head: VocabParallelEmbedding | None = None
+        # [start, end) of this rank's vocab shard when non-greedy verify steps
+        # sample from per-shard candidates (TPU_CANDIDATE_SAMPLING); set by
+        # load_model, None keeps the full-logit path.
+        self._candidate_bounds: torch.Tensor | None = None
 
     def _init_phased_profiling(self) -> None:
         """Resolves whether USE_PHASED_PROFILER is set and where its traces go.
@@ -1694,6 +1874,17 @@ class TPUModelRunner(GPUModelRunner):
                 manager_page_bytes = group.kv_cache_spec.page_size_bytes
         self._mamba_state_block_size = state_block_size
         self._mamba_copy_plan = plan
+        if self._two_slot_ckpts and plan:
+            # A verify window must complete at most the one mamba block
+            # before its state column (gdn v3 memory_ref.two_slot_boundary).
+            assert self.speculative_config is not None
+            window = self.speculative_config.num_speculative_tokens + 1
+            if self._mamba_column_stride() < window:
+                raise ValueError(
+                    "TPU_GDN_TWO_SLOT_CKPT=1 needs mamba blocks of at least "
+                    f"{window} tokens (one verify window), got "
+                    f"{self._mamba_column_stride()}."
+                )
         if bm_pool_layout is not None:
             # Merged block-major pool rows correspond 1:1 to manager blocks, so
             # state seed copies index rows directly by manager block ID without
@@ -1849,6 +2040,8 @@ class TPUModelRunner(GPUModelRunner):
         # the request's new state block.
         offset_pairs: list[tuple[int, int]] = []
         spec_dsts: list[int] = []
+        # Two-slot checkpoints: the destination's read code per crossing.
+        spec_codes: list[torch.Tensor] = []
         for gid, raws in self._mamba_copy_plan:
             bt = self.input_batch.block_table[gid].get_cpu_tensor()
             row_width = bt.shape[1]
@@ -1882,7 +2075,10 @@ class TPUModelRunner(GPUModelRunner):
             if spec_seed:
                 dsts_g = [d for _, d in pairs]
                 spec_dsts.extend(dsts_g)
-                src_t = self._spec_seed_sources(state_srcs, ckpt_rows, new_owners)
+                src_t, code_t = self._spec_seed_sources(
+                    state_srcs, ckpt_rows, new_owners
+                )
+                spec_codes.append(code_t)
                 dst_t = torch.tensor(dsts_g, dtype=torch.int32).to(
                     self.device, non_blocking=True
                 )
@@ -1906,7 +2102,17 @@ class TPUModelRunner(GPUModelRunner):
             entry[1].extend(p[0] for p in pairs)
             entry[2].extend(p[1] for p in pairs)
 
-        if spec_seed and spec_dsts:
+        if spec_seed and spec_dsts and self._two_slot_ckpts:
+            # The seeded block is block 0 of the new pair; tokens still to
+            # recompute come along (they ride in the copied conv tile).
+            dst_t = torch.tensor(self._pad_to_bucket(spec_dsts), dtype=torch.long).to(
+                self.device, non_blocking=True
+            )
+            assert self.mamba_slot_read_offsets is not None
+            self.mamba_slot_read_offsets.index_put_(
+                (dst_t,), self._pad_dev_to_bucket(torch.cat(spec_codes))
+            )
+        elif spec_seed and spec_dsts:
             # The seeded checkpoint is checkpoint 0 of the new group.
             dst_t = torch.tensor(self._pad_to_bucket(spec_dsts), dtype=torch.long).to(
                 self.device, non_blocking=True
@@ -1993,13 +2199,16 @@ class TPUModelRunner(GPUModelRunner):
         state_srcs: list[int],
         ckpt_rows: list[list[int]],
         new_owners: list[bool],
-    ) -> torch.Tensor:
-        """Seed source per crossing: the checkpoint being resumed from.
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Seed source per crossing: the checkpoint being resumed from, and
+        the read code its destination takes (two-slot checkpoints; the
+        others reset the destination's offset to 0).
 
         `mamba_slot_read_offsets` is device-resident and indexed by block
         id, so which of the window's blocks holds the last accepted token's
         state is only known on device — the choice is a gather there rather
-        than a CPU lookup.
+        than a CPU lookup. Under two-slot checkpoints that block is the
+        start block, whose pending tokens the destination inherits.
         """
         offsets = self.mamba_slot_read_offsets
         assert offsets is not None
@@ -2009,7 +2218,11 @@ class TPUModelRunner(GPUModelRunner):
         ckpt_t = torch.tensor(ckpt_rows, dtype=torch.int32).to(
             self.device, non_blocking=True
         )
-        off = offsets[state_t].long().clamp_(0, ckpt_t.shape[1] - 1)
+        code = offsets[state_t]
+        if self._two_slot_ckpts:
+            off = (code & 1).long()
+        else:
+            off = code.long().clamp_(0, ckpt_t.shape[1] - 1)
         # PD and prefix-cache restores provide committed state in checkpoint 0.
         # A recycled source block can retain another request's MTP offset.
         # The first-forward reset clears the destination, after this source
@@ -2019,7 +2232,153 @@ class TPUModelRunner(GPUModelRunner):
             self.device, non_blocking=True
         )
         off = torch.where(new_owner_t, 0, off)
-        return ckpt_t.gather(1, off.unsqueeze(1)).squeeze(1)
+        dst_code = torch.where(new_owner_t, 0, code - (code & 1))
+        return ckpt_t.gather(1, off.unsqueeze(1)).squeeze(1), dst_code
+
+    def _copies_spec_boundary_states(self) -> bool:
+        """Whether verify steps write boundary states into the blocks they
+        complete: speculative decoding on the unified pool in align mode,
+        with block hashes (prefix caching or a KV connector) to reuse them.
+        """
+        return (
+            self._mamba_ckpt_window > 1
+            and self.mamba_slot_read_offsets is not None
+            and bool(self._mamba_copy_plan)
+            and (
+                self.cache_config.enable_prefix_caching
+                or self.vllm_config.kv_transfer_config is not None
+            )
+            # Two-slot checkpoints have no per-position states to copy; their
+            # verify windows write the boundary states themselves (gdn v3
+            # `memory_ref.two_slot_boundary`).
+            and not self._two_slot_ckpts
+        )
+
+    def _mamba_column_stride(self) -> int:
+        """Logical tokens per mamba block-table column, the allocator's stride
+        (see `_collect_mamba_state_seed_copies`)."""
+        try:
+            cp_world_size = get_pcp_group().world_size
+        except Exception:
+            cp_world_size = 1
+        assert self._mamba_state_block_size is not None
+        return self._mamba_state_block_size * cp_world_size
+
+    def _plan_spec_boundary_copies(
+        self,
+        scheduler_output,
+        start_index: int,
+        num_reqs: int,
+        seq_lens: torch.Tensor,
+    ) -> SpecBoundaryPlan | None:
+        """Stage this chunk's candidates for `_copy_spec_boundary_states`.
+
+        A verify window starting at `start` writes checkpoint t, the state
+        after `start + t + 1` tokens, to the block t columns past its state
+        block. The block a boundary T completes therefore holds checkpoint 0
+        of the last window that ended inside it, a few tokens short of T, yet
+        the scheduler hashes it once T tokens are confirmed and prefix hits
+        resume from it. After sampling, checkpoint `T - 1 - start` is copied
+        into it instead.
+
+        Whether a row reaches T depends on its accepted count, known only on
+        device, so every verify row whose window can reach a boundary is
+        staged: its boundary, the block ids from the boundary's column on,
+        and its device sequence length (under async scheduling the host count
+        runs ahead by up to num_speculative_tokens rejected drafts).
+        """
+        if not self._copies_spec_boundary_states():
+            return None
+        spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+        if not spec_tokens:
+            return None
+        block_size = self._mamba_column_stride()
+        slack = 0
+        if self.scheduler_config.async_scheduling:
+            assert self.speculative_config is not None
+            slack = self.speculative_config.num_speculative_tokens
+        num_computed = self.input_batch.num_computed_tokens_cpu
+        req_ids = self.input_batch.req_ids
+        candidates: list[tuple[int, int, int]] = []
+        for i in range(num_reqs):
+            req_id = req_ids[start_index + i]
+            if not spec_tokens.get(req_id):
+                continue
+            computed = int(num_computed[start_index + i])
+            scheduled = scheduler_output.num_scheduled_tokens[req_id]
+            boundary = (max(computed - slack, 0) // block_size + 1) * block_size
+            while boundary <= computed + scheduled:
+                candidates.append((i, boundary, scheduled))
+                boundary += block_size
+        if not candidates:
+            return None
+
+        width = self._mamba_ckpt_window + 1
+        n = len(candidates)
+        # Bounded by max_num_reqs so the copies stay on the precompiled ladder.
+        padded = min(self._bucket_len(n), max(n, self.max_num_reqs))
+        host = torch.zeros(
+            (padded, 3 + len(self._mamba_copy_plan) * width), dtype=torch.int32
+        )
+        host[:n, :3] = torch.tensor(candidates, dtype=torch.int32)
+        for g, (gid, _) in enumerate(self._mamba_copy_plan):
+            bt = self.input_batch.block_table[gid].get_cpu_tensor()
+            row_width = bt.shape[1]
+            base = 3 + g * width
+            for e, (i, boundary, _) in enumerate(candidates):
+                first = boundary // block_size - 1
+                last = min(first + width, row_width)
+                host[e, base : base + last - first] = bt[start_index + i, first:last]
+        entries = host.to(self.device, non_blocking=True)
+        rows = entries[:, 0].long()
+        return SpecBoundaryPlan(
+            entries=entries,
+            rows=rows,
+            seq_lens=seq_lens.index_select(0, rows).to(torch.int32),
+            block_size=block_size,
+            host_entries=host,
+        )
+
+    def _copy_spec_boundary_states(
+        self, plan: SpecBoundaryPlan | None, next_tokens: torch.Tensor
+    ) -> None:
+        """Copy each boundary state this verify chunk reached into the block
+        that boundary completes (the counterpart of upstream vLLM's align-mode
+        ``postprocess_mamba``).
+
+        Runs right after sampling, before any later step can hash, free or
+        reuse the block; the request still owns it, since the manager frees
+        a state block only once later tokens are processed.
+        """
+        if plan is None:
+            return
+        num_valid = (
+            (next_tokens.index_select(0, plan.rows) != INVALID_TOKEN_ID)
+            .sum(dim=1)
+            .to(torch.int32)
+        )
+        src, dst = _spec_boundary_pairs(
+            plan.entries,
+            plan.seq_lens,
+            num_valid,
+            plan.block_size,
+            self._mamba_ckpt_window + 1,
+        )
+        per_raw: dict[
+            tuple[int, ...],
+            tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]],
+        ] = {}
+        for g, (_, raws) in enumerate(self._mamba_copy_plan):
+            src_g, dst_g = self._expand_pool_split(src[g], dst[g])
+            entry = per_raw.setdefault(tuple(id(raw) for raw in raws), (raws, [], []))
+            entry[1].append(src_g)
+            entry[2].append(dst_g)
+        for raws, srcs, dsts in per_raw.values():
+            self._copy_mamba_state_blocks(
+                raws,
+                self._pad_dev_to_bucket(torch.cat(srcs)),
+                self._pad_dev_to_bucket(torch.cat(dsts)),
+            )
 
     def _flush_mamba_state_seed_copies(self) -> None:
         if not self._pending_mamba_state_copies:
@@ -3149,6 +3508,7 @@ class TPUModelRunner(GPUModelRunner):
             mamba_state_indices=mamba_state_indices,
             mamba_slot_read_offsets=self.mamba_slot_read_offsets,
             mamba_ckpt_window=self._mamba_ckpt_window,
+            mamba_two_slot_ckpts=self._two_slot_ckpts,
             mamba_request_distribution=mamba_request_distribution,
             # Unified pool + spec decode: the mamba group builders append
             # their per-request state block ids here for the post-sampling
@@ -3499,6 +3859,8 @@ class TPUModelRunner(GPUModelRunner):
             # safe to do for a zero-token step since no collectives are
             # triggered.
             return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
+        # TPU_MOE_ROUTING_COUNTS_DIR: at most one device read a minute.
+        expert_placement.write_counts()
         if envs.TPU_MTP_PREFILL_ONLY:
             from vllm_torchtpu.spec_decode.prefill_only import validate_prefill_span
 
@@ -3614,8 +3976,12 @@ class TPUModelRunner(GPUModelRunner):
         num_reqs_list = []
         spec_decode_metadata_list = []
         mamba_state_indices_list: list[list[torch.Tensor] | None] = []
+        mamba_boundary_plans: list[SpecBoundaryPlan | None] = []
+        mamba_window_boundaries: list[torch.Tensor | None] = []
         draft_chunks: list[DraftChunkInputs] = []
         is_draft_model = self._is_async_drafter
+        greedy_token_ids = self._samples_greedy_token_ids(scheduler_output)
+        candidate_logits = self._samples_candidates(scheduler_output)
 
         nan_check = (
             begin_kv_save_nan_check(get_kv_transfer_group())
@@ -3887,11 +4253,30 @@ class TPUModelRunner(GPUModelRunner):
                         hidden_states,
                         layout_plan,
                     )
-                    logits = self.compute_selected_logits(hidden_states, logits_indices)
-                else:
-                    logits = self.compute_logits_from_hidden_states(
-                        sample_hidden_states
+                    if candidate_logits and spec_decode_metadata is not None:
+                        logits = VocabShardLogits(
+                            self.compute_selected_local_logits(
+                                hidden_states, logits_indices
+                            )
+                        )
+                    else:
+                        logits = (
+                            self.compute_selected_greedy_token_ids
+                            if greedy_token_ids
+                            else self.compute_selected_logits
+                        )(hidden_states, logits_indices)
+                elif candidate_logits and spec_decode_metadata is not None:
+                    logits = VocabShardLogits(
+                        self.compute_local_logits_from_hidden_states(
+                            sample_hidden_states
+                        )
                     )
+                else:
+                    logits = (
+                        self.compute_greedy_token_ids_from_hidden_states
+                        if greedy_token_ids
+                        else self.compute_logits_from_hidden_states
+                    )(sample_hidden_states)
                 if self._nan_checker is not None:
                     num_valid_rows = (
                         int((spec_decode_metadata.draft_lengths_cpu + 1).sum())
@@ -3914,6 +4299,12 @@ class TPUModelRunner(GPUModelRunner):
                 # Unified pool: one state block per request per mamba group,
                 # captured by the group builders during metadata build.
                 mamba_state_indices_list.append(ctx.unified_mamba_state_indices)
+            mamba_boundary_plans.append(
+                self._plan_spec_boundary_copies(
+                    scheduler_output, start_index, num_reqs, ctx.seq_lens
+                )
+            )
+            mamba_window_boundaries.append(ctx.mamba_window_boundary)
             if is_draft_model:
                 assert isinstance(hidden_states, torch.Tensor)
                 # Capture this chunk's draft inputs while they are valid.
@@ -3962,6 +4353,8 @@ class TPUModelRunner(GPUModelRunner):
             spec_decode_metadata_list=spec_decode_metadata_list,
             draft_chunks=draft_chunks,
             mamba_state_indices_list=mamba_state_indices_list,
+            mamba_boundary_plans=mamba_boundary_plans,
+            mamba_window_boundaries=mamba_window_boundaries,
             kv_save_nan_check=nan_check,
         )
 
@@ -3998,6 +4391,8 @@ class TPUModelRunner(GPUModelRunner):
         indices_per_group: list[torch.Tensor] | None,
         next_tokens: torch.Tensor | None,
         num_reqs: int,
+        draft_lengths: torch.Tensor | None = None,
+        window_boundary: torch.Tensor | None = None,
     ) -> None:
         """Scatter this chunk's mamba read offsets into the slot-indexed buffer.
 
@@ -4013,8 +4408,19 @@ class TPUModelRunner(GPUModelRunner):
         decode) — which also resets a group's offset after prefill. The next
         step's GDN kernel resumes each request from checkpoint `offset` of
         its state block (the checkpoint of its last accepted token).
+
+        Two-slot checkpoints keep a code per request instead (see
+        `_two_slot_read_codes`), derived from the previous code, the chunk's
+        draft counts and its requests' window boundary positions, which
+        their callers pass as `draft_lengths` and `window_boundary`.
         """
         if self.mamba_slot_read_offsets is None or not indices_per_group:
+            return
+        if draft_lengths is not None and next_tokens is not None:
+            assert window_boundary is not None
+            self._update_two_slot_read_codes(
+                indices_per_group, next_tokens, num_reqs, draft_lengths, window_boundary
+            )
             return
         offsets = torch.zeros(
             indices_per_group[0].shape[0],
@@ -4036,6 +4442,35 @@ class TPUModelRunner(GPUModelRunner):
             all_indices = torch.cat(indices_per_group, dim=0).long()
             all_offsets = offsets.repeat(len(indices_per_group))
             self.mamba_slot_read_offsets.index_put_((all_indices,), all_offsets)
+
+    def _update_two_slot_read_codes(
+        self,
+        indices_per_group: list[torch.Tensor],
+        next_tokens: torch.Tensor,
+        num_reqs: int,
+        draft_lengths: torch.Tensor,
+        window_boundary: torch.Tensor,
+    ) -> None:
+        """Two-slot read codes after a verify chunk; see
+        `_two_slot_read_codes`."""
+        offsets = self.mamba_slot_read_offsets
+        assert offsets is not None
+        groups = len(indices_per_group)
+        width = indices_per_group[0].shape[0]
+        all_indices = torch.cat(indices_per_group, dim=0).long()
+        codes = offsets[all_indices].view(groups, width)
+        num_valid = (
+            (next_tokens[:num_reqs] != INVALID_TOKEN_ID).sum(dim=1).to(torch.int32)
+        )
+        new = _two_slot_read_codes(
+            codes[:, :num_reqs],
+            num_valid,
+            draft_lengths[:num_reqs].to(torch.int32),
+            window_boundary[:num_reqs].to(torch.int32),
+        )
+        codes = torch.zeros_like(codes)
+        codes[:, :num_reqs] = new
+        offsets.index_put_((all_indices,), codes.reshape(-1))
 
     def _mamba_state_index_groups(self) -> list[torch.Tensor] | None:
         """This chunk's mamba state slot/block ids, one tensor per group.
@@ -4151,6 +4586,8 @@ class TPUModelRunner(GPUModelRunner):
 
     def _greedy_sample(self, logits: torch.Tensor) -> torch.Tensor:
         """argmax logits, only used when `all_greedy` is True."""
+        if not logits.is_floating_point():
+            return logits  # already [n, 1] greedy token ids
         dummy = torch.empty((1, 1), dtype=logits.dtype, device=logits.device)
         return self.sample_from_logits_func(
             logits,
@@ -4177,6 +4614,10 @@ class TPUModelRunner(GPUModelRunner):
         Returns the rejection sampler's [num_reqs, 1 + num_spec_tokens]
         selected tokens for the chunk.
         """
+        if isinstance(logits, VocabShardLogits):
+            return self._sample_spec_verify_candidates(
+                logits.local, md, cur_start_idx, cur_end_idx, sampling_generator
+            )
         req_temperatures = req_top_k = req_top_p = None
         target_token_ids = None
         if all_greedy and grammar_output is None:
@@ -4185,6 +4626,7 @@ class TPUModelRunner(GPUModelRunner):
             )
             target_logits = logits
         else:
+            assert logits.is_floating_point(), "greedy token ids need all_greedy"
             bonus_logits, target_logits = self.spec_gather_bonus_and_target_logits(
                 logits, md.bonus_logits_indices, md.target_logits_indices
             )
@@ -4263,6 +4705,100 @@ class TPUModelRunner(GPUModelRunner):
             do_sampling=True,
         )
 
+    def _sample_spec_verify_candidates(
+        self,
+        local_logits: torch.Tensor,
+        md: SpecDecodeMetadata,
+        cur_start_idx: int,
+        cur_end_idx: int,
+        sampling_generator: torch.Generator | None,
+    ) -> torch.Tensor:
+        """`_sample_spec_verify_chunk` for a non-greedy step from this rank's
+        logits shard: the same distributions, drawn over per-shard top-k
+        candidates (layers.core.candidate_sampling)."""
+        assert self.rejection_sampler is not None
+        assert self.speculative_config is not None
+        assert self._candidate_bounds is not None
+        assert self._greedy_head is not None
+        num_bonus = md.bonus_logits_indices.shape[0]
+        num_targets = md.target_logits_indices.shape[0]
+        device = local_logits.device
+        # Padding rows keep top_k = 1, so every row has a top-k cutoff.
+        temps, top_k, top_p = self._padded_sampling_params(
+            cur_start_idx,
+            cur_end_idx,
+            num_bonus,
+            local_logits.dtype,
+            device,
+            pad_top_k=1,
+        )
+        width = candidate_width(self._greedy_head.tp_size)
+        # Draw order and dtypes follow _sample_spec_verify_chunk: bonus
+        # uniforms in the logits dtype, then accept and recovery uniforms.
+        bonus_u = torch.rand(
+            (num_bonus, width),
+            dtype=local_logits.dtype,
+            device=device,
+            generator=sampling_generator,
+        )
+        accept_u = torch.rand(
+            md.draft_token_ids.shape,
+            dtype=torch.float32,
+            device=device,
+            generator=sampling_generator,
+        )
+        recover_u = torch.rand(
+            (num_targets, width),
+            dtype=torch.float32,
+            device=device,
+            generator=sampling_generator,
+        )
+        # Key for the full-vocabulary draws of a step whose candidates are
+        # not exact.
+        seed = (
+            torch.rand(2, device=device, generator=sampling_generator) * (1 << 24)
+        ).to(torch.int32)
+        synthetic = self.rejection_sampler.synthetic_mode
+        rates = (
+            self.rejection_sampler.synthetic_conditional_rates[
+                md.group_indices.to(torch.int64)
+            ]
+            if synthetic
+            else accept_u
+        )
+        bonus_rows, target_rows = self.spec_gather_bonus_and_target_logits(
+            local_logits, md.bonus_logits_indices, md.target_logits_indices
+        )
+        bonus_token_ids, accepted, recovered, _ = candidate_verify_decisions(
+            bonus_rows,
+            target_rows,
+            self._candidate_bounds,
+            md.draft_token_ids,
+            temps,
+            top_k,
+            top_p,
+            temps[md.segment_ids],
+            top_k[md.segment_ids],
+            top_p[md.segment_ids],
+            bonus_u,
+            accept_u,
+            recover_u,
+            rates,
+            seed,
+            vocab_size=self._greedy_head.org_vocab_size,
+            synthetic=synthetic,
+        )
+        return candidate_rejection_output(
+            accepted,
+            recovered,
+            md.draft_token_ids,
+            md.draft_lengths,
+            bonus_token_ids,
+            md.segment_ids,
+            md.group_indices,
+            self.speculative_config.num_speculative_tokens,
+        )
+
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncTPUModelRunnerOutput:
@@ -4317,6 +4853,10 @@ class TPUModelRunner(GPUModelRunner):
         mamba_idx_list = state.mamba_state_indices_list or [None] * len(
             state.logits_list
         )
+        boundary_plans = state.mamba_boundary_plans or [None] * len(state.logits_list)
+        window_boundaries = state.mamba_window_boundaries or [None] * len(
+            state.logits_list
+        )
         # Per-chunk device rejection outputs, kept for the async-spec
         # producer below.
         next_tokens_per_chunk: list[torch.Tensor] = []
@@ -4327,11 +4867,20 @@ class TPUModelRunner(GPUModelRunner):
         elif is_spec_step:
             cur_start_idx = 0
             all_greedy = self.input_batch.all_greedy
-            for logits, num_reqs, md, mamba_indices in zip(
+            for (
+                logits,
+                num_reqs,
+                md,
+                mamba_indices,
+                boundary_plan,
+                window_boundary,
+            ) in zip(
                 state.logits_list,
                 state.num_reqs_list,
                 state.spec_decode_metadata_list,
                 mamba_idx_list,
+                boundary_plans,
+                window_boundaries,
             ):
                 cur_end_idx = cur_start_idx + num_reqs
                 if md is not None:
@@ -4350,8 +4899,13 @@ class TPUModelRunner(GPUModelRunner):
                     combined_selected_tokens_real_lens.append(num_reqs)
                     next_tokens_per_chunk.append(next_tokens)
                     self._update_mamba_slot_read_offsets(
-                        mamba_indices, next_tokens, num_reqs
+                        mamba_indices,
+                        next_tokens,
+                        num_reqs,
+                        md.draft_lengths if self._two_slot_ckpts else None,
+                        window_boundary,
                     )
+                    self._copy_spec_boundary_states(boundary_plan, next_tokens)
                     if needs_logprobs:
                         # Raw verify logits, one row per draft slot and bonus
                         # slot; each row paired with the token its slot chose.
@@ -4887,7 +5441,28 @@ class TPUModelRunner(GPUModelRunner):
                 vllm_config=self.vllm_config, model_config=self.model_config
             )
         validate_online_fp8(model, self.vllm_config.quant_config)
+        if envs.TPU_EMBED_EP_SHARD:
+            from vllm_torchtpu.layers.adapter.ep_sharded_embedding import (
+                prebuild_ep_embedding,
+                restore_tp_dummy_rows,
+            )
+
+            load_format = self.load_config.load_format
+            if getattr(load_format, "value", load_format) == "dummy":
+                restore_tp_dummy_rows(model)
+            prebuild_ep_embedding()
         self.model = model
+        self._greedy_head = _vocab_parallel_greedy_head(
+            model, self.lora_config is not None
+        )
+        logger.info(
+            "Greedy target tokens: %s",
+            "vocab-parallel argmax"
+            if self._greedy_head is not None
+            else "argmax of gathered logits",
+        )
+        if envs.TPU_CANDIDATE_SAMPLING:
+            self._candidate_bounds = self._candidate_vocab_bounds()
         if self.parallel_config.pipeline_parallel_size > 1:
             # A sparse model's layers share one top-k index table, and under a
             # pipeline the layer that writes it and the layers that reuse it
@@ -4903,6 +5478,8 @@ class TPUModelRunner(GPUModelRunner):
             runner_utils.relayout_rope_caches(self.model)
         if envs.TPU_MOE_HASH_TABLE_ROW_MAJOR:
             runner_utils.relayout_hash_tables(self.model)
+        if envs.TPU_LM_HEAD_HIDDEN_MAJOR:
+            runner_utils.relayout_lm_head(self.model)
 
         # If using eagle3/mtp or dflash speculative decoding, load the draft model and
         # share the target's embeddings / LM head (if the draft requires it).
@@ -4928,7 +5505,13 @@ class TPUModelRunner(GPUModelRunner):
             )
             for module in self.model.modules()
         )
-        if envs.TPU_MOE_SKIP_PADDED_TOKENS or uses_mxfp4_moe:
+        # Routing counts (TPU_MOE_ROUTING_COUNTS_DIR) leave padded rows out by
+        # the same mask.
+        if (
+            envs.TPU_MOE_SKIP_PADDED_TOKENS
+            or uses_mxfp4_moe
+            or expert_placement.counting_routes()
+        ):
             self._token_padding_state = token_padding.TokenPaddingState.create(
                 self.max_num_tokens, self.device
             )
@@ -5201,6 +5784,7 @@ class TPUModelRunner(GPUModelRunner):
                 mamba_state_indices=dummy_mamba_state_indices,
                 mamba_slot_read_offsets=self.mamba_slot_read_offsets,
                 mamba_ckpt_window=self._mamba_ckpt_window,
+                mamba_two_slot_ckpts=self._two_slot_ckpts,
                 mamba_request_distribution=dummy_mamba_request_distribution,
                 sequence_layout_descriptor=dummy_layout_plan.descriptor,
             )
@@ -5629,6 +6213,14 @@ class TPUModelRunner(GPUModelRunner):
                     indices = torch.zeros(num_reqs, dtype=torch.int32).to(self.device)
                     out = self.compute_selected_logits(dummy_hidden, indices)
                     synchronize_tensors(out)
+                    if self._greedy_head is not None:
+                        out = self.compute_selected_greedy_token_ids(
+                            dummy_hidden, indices
+                        )
+                        synchronize_tensors(out)
+                    if self._candidate_bounds is not None:
+                        out = self.compute_selected_local_logits(dummy_hidden, indices)
+                        synchronize_tensors(out)
                     logger.info(
                         "  -- num_tokens: %d, num_seqs: %d", num_tokens, num_reqs
                     )
@@ -5645,6 +6237,12 @@ class TPUModelRunner(GPUModelRunner):
                 ).to(self.device)
                 out = self.compute_logits_from_hidden_states(dummy_hidden)
                 synchronize_tensors(out)
+                if self._greedy_head is not None:
+                    out = self.compute_greedy_token_ids_from_hidden_states(dummy_hidden)
+                    synchronize_tensors(out)
+                if self._candidate_bounds is not None:
+                    out = self.compute_local_logits_from_hidden_states(dummy_hidden)
+                    synchronize_tensors(out)
                 logger.info("  -- num_seqs: %d", num_reqs)
 
     def _precompile_structured_decoding(self) -> None:
@@ -5847,6 +6445,12 @@ class TPUModelRunner(GPUModelRunner):
                     (num_tokens, self.vocab_size),
                     dtype=self._hidden_states_dtype,
                 ).to(self.device)
+                # Greedy token ids in place of logits (_samples_greedy_token_ids).
+                dummy_ids = (
+                    torch.zeros((num_tokens, 1), dtype=torch.int64).to(self.device)
+                    if self._greedy_head is not None
+                    else None
+                )
                 draft_token_ids = torch.zeros(num_tokens, dtype=torch.int32).to(
                     self.device
                 )
@@ -5877,11 +6481,20 @@ class TPUModelRunner(GPUModelRunner):
                         )
                     )
                     # Structured greedy requests still need the logits path.
-                    for target_ids in (target_ids_warm, None):
+                    warm_targets = [
+                        (dummy_logits, target_ids_warm),
+                        (dummy_logits, None),
+                    ]
+                    if dummy_ids is not None:
+                        _, ids_target_warm = self.spec_bonus_and_target_tokens(
+                            dummy_ids, bonus_logits_indices, target_logits_indices
+                        )
+                        warm_targets.append((dummy_ids, ids_target_warm))
+                    for target_logits, target_ids in warm_targets:
                         out = self.rejection_sampler(
                             draft_token_ids=draft_token_ids,
                             num_draft_tokens=draft_lengths,
-                            target_logits=dummy_logits,
+                            target_logits=target_logits,
                             bonus_token_ids=bonus_token_ids,
                             segment_ids=segment_ids,
                             group_indices=group_indices,
@@ -5928,6 +6541,30 @@ class TPUModelRunner(GPUModelRunner):
                         do_sampling=True,
                     )
                     synchronize_tensors(out)
+                    # --- non-greedy verify from vocab-shard candidates ---
+                    if self._candidate_bounds is not None:
+                        assert self._greedy_head is not None
+                        warm_md = SpecDecodeMetadata(
+                            draft_token_ids=draft_token_ids,
+                            draft_lengths=draft_lengths,
+                            draft_lengths_cpu=np.zeros(num_reqs, dtype=np.int32),
+                            target_logits_indices=target_logits_indices,
+                            bonus_logits_indices=bonus_logits_indices,
+                            final_logits_indices=target_logits_indices,
+                            segment_ids=segment_ids,
+                            group_indices=group_indices,
+                        )
+                        warm_local = torch.zeros(
+                            (
+                                num_tokens,
+                                self._greedy_head.num_embeddings_per_partition,
+                            ),
+                            dtype=self._hidden_states_dtype,
+                        ).to(self.device)
+                        out = self._sample_spec_verify_candidates(
+                            warm_local, warm_md, 0, 0, self._get_sampling_generator()
+                        )
+                        synchronize_tensors(out)
                     logger.info(
                         "  -- padded_logits_length: %d, num_seqs: %d",
                         num_tokens,
@@ -6038,6 +6675,7 @@ class TPUModelRunner(GPUModelRunner):
 
             self._precompile_sampling_subgraphs()
             self._precompile_mamba_rollback_helpers()
+            self._precompile_spec_boundary_pairs()
 
             # Precompile multimodal vision encoder graphs
             self.encoder_cudagraph_manager = maybe_create_mm_encoder_manager(
@@ -6345,6 +6983,28 @@ class TPUModelRunner(GPUModelRunner):
                 _rollback_offsets_seed_compiled(offsets, dst)
                 _rollback_offsets_migrate_compiled(offsets, src, dst)
                 n *= 4
+
+    def _precompile_spec_boundary_pairs(self) -> None:
+        """Warm the boundary-copy pair program at every candidate count
+        `_plan_spec_boundary_copies` pads to; the copies themselves reuse
+        the precompiled seed-copy lengths. All-zero entries name no copy.
+        """
+        if not self._copies_spec_boundary_states():
+            return
+        width = self._mamba_ckpt_window + 1
+        num_cols = 3 + len(self._mamba_copy_plan) * width
+        sizes = {
+            min(self._bucket_len(n), max(n, self.max_num_reqs))
+            for n in range(1, self.max_num_reqs + 1)
+        }
+        with self._precompile_timed("mamba boundary-state pairs"):
+            for n in sorted(sizes):
+                entries = torch.zeros((n, num_cols), dtype=torch.int32).to(self.device)
+                seq_lens = torch.zeros(n, dtype=torch.int32).to(self.device)
+                num_valid = torch.zeros(n, dtype=torch.int32).to(self.device)
+                _spec_boundary_pairs_compiled(
+                    entries, seq_lens, num_valid, self._mamba_column_stride(), width
+                )
 
     def _warmup_spec_decode(self) -> None:
         """Warm the real spec-decode dispatch so the first request doesn't recompile.
@@ -6877,13 +7537,19 @@ class TPUModelRunner(GPUModelRunner):
                 )
         self._refresh_request_caps(kv_cache_config)
 
-    def _token_padding_update(self, num_tokens_padded: int) -> None:
-        """Record which of this step's token rows are padding."""
+    def _token_padding_update(
+        self, num_tokens_padded: int, num_valid_tokens: int | None = None
+    ) -> None:
+        """Record which of this step's token rows are padding: rows from
+        ``num_valid_tokens`` on (a draft forward's count), else past the last
+        target plan's tokens."""
         padding_state = getattr(self, "_token_padding_state", None)
         if padding_state is None:
             return
         plan = self._last_sequence_layout_plan
-        if plan is not None and plan.kind is SequenceLayoutKind.ALL:
+        if num_valid_tokens is not None:
+            num_valid_tokens = min(num_valid_tokens, num_tokens_padded)
+        elif plan is not None and plan.kind is SequenceLayoutKind.ALL:
             num_valid_tokens = min(plan.local_num_tokens, num_tokens_padded)
         else:
             # Padding-mask support is currently limited to the ALL layout.
@@ -7036,12 +7702,24 @@ class TPUModelRunner(GPUModelRunner):
         cur_end_idx: int,
         logits: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self._padded_sampling_params(
+            cur_start_idx, cur_end_idx, logits.shape[0], logits.dtype, logits.device
+        )
+
+    def _padded_sampling_params(
+        self,
+        cur_start_idx: int,
+        cur_end_idx: int,
+        padded_num_reqs: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        pad_top_k: int = 0,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # Stage [padded_num_reqs] on CPU with neutral padding, then use one
         # fixed-shape H2D copy per tensor to keep decode shape-stable.
-        padded_num_reqs = logits.shape[0]
         num_active_reqs = cur_end_idx - cur_start_idx
-        temps_cpu = torch.ones(padded_num_reqs, dtype=logits.dtype)
-        top_k_cpu = torch.zeros(padded_num_reqs, dtype=torch.int32)
+        temps_cpu = torch.ones(padded_num_reqs, dtype=dtype)
+        top_k_cpu = torch.full((padded_num_reqs,), pad_top_k, dtype=torch.int32)
         top_p_cpu = torch.ones(padded_num_reqs, dtype=torch.float32)
 
         temps_cpu[:num_active_reqs].copy_(
@@ -7060,9 +7738,9 @@ class TPUModelRunner(GPUModelRunner):
         )
 
         return (
-            temps_cpu.unsqueeze(1).to(logits.device, non_blocking=True),
-            top_k_cpu.unsqueeze(1).to(logits.device, non_blocking=True),
-            top_p_cpu.unsqueeze(1).to(logits.device, non_blocking=True),
+            temps_cpu.unsqueeze(1).to(device, non_blocking=True),
+            top_k_cpu.unsqueeze(1).to(device, non_blocking=True),
+            top_p_cpu.unsqueeze(1).to(device, non_blocking=True),
         )
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
@@ -7080,6 +7758,109 @@ class TPUModelRunner(GPUModelRunner):
     ) -> torch.Tensor:
         return self.model.compute_logits(hidden_states)
 
+    def _candidate_vocab_bounds(self) -> torch.Tensor | None:
+        """This rank's [start, end) vocab bounds when the greedy head's shards
+        are contiguous equal slices (the full-vocabulary fallback concatenates
+        them), else None."""
+        head = self._greedy_head
+        reason = None
+        if head is None:
+            reason = "no vocab-parallel LM head"
+        elif head.tp_size < 2:
+            reason = "TP size 1"
+        elif self.speculative_config is None:
+            reason = "no speculative decoding"
+        else:
+            si = head.shard_indices
+            width = head.num_embeddings_per_partition
+            if si.org_vocab_start_index != head.tp_rank * width:
+                reason = f"vocab shard {si.org_vocab_start_index} not at rank x {width}"
+        if reason is not None:
+            logger.info("Candidate sampling: off (%s)", reason)
+            return None
+        assert head is not None
+        logger.info(
+            "Candidate sampling: on | vocab %d over %d shards, %d candidates "
+            "per row, top_k <= %d",
+            head.org_vocab_size,
+            head.tp_size,
+            candidate_width(head.tp_size),
+            MAX_TOP_K,
+        )
+        return torch.stack((head.org_vocab_start_index, head.org_vocab_end_index)).to(
+            torch.int32
+        )
+
+    def _samples_candidates(self, scheduler_output: "SchedulerOutput") -> bool:
+        """Whether this step's non-greedy verify chunks sample from per-shard
+        candidates: every request is greedy or keeps at most MAX_TOP_K tokens,
+        and nothing reads the full logits."""
+        if (
+            self._candidate_bounds is None
+            or self.input_batch.all_greedy
+            or self.input_batch.max_num_logprobs is not None
+            or scheduler_output.has_structured_output_requests
+            or self._nan_checker is not None
+        ):
+            return False
+        n = self.input_batch.num_reqs
+        temps = self.input_batch.temperature_cpu_tensor[:n]
+        top_k = self.input_batch.top_k_cpu_tensor[:n]
+        return bool(((temps == 0) | ((top_k >= 1) & (top_k <= MAX_TOP_K))).all())
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def compute_selected_local_logits(
+        self, hidden_states: torch.Tensor, indices_do_sample: torch.Tensor
+    ) -> torch.Tensor:
+        selected = torch.index_select(hidden_states, 0, indices_do_sample)
+        return self.model.compute_logits_local(selected)
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def compute_local_logits_from_hidden_states(
+        self, hidden_states: torch.Tensor
+    ) -> torch.Tensor:
+        return self.model.compute_logits_local(hidden_states)
+
+    def _greedy_token_ids(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """[n, 1] int64 greedy token ids, as `sample_from_logits` returns
+        for an all-greedy batch, from per-shard argmax pairs."""
+        head = self._greedy_head
+        assert head is not None
+        return vocab_parallel_argmax(
+            self.model.compute_logits_local(hidden_states),
+            head.org_vocab_start_index,
+            head.org_vocab_end_index,
+            head.tp_size,
+        ).unsqueeze(-1)
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def compute_selected_greedy_token_ids(
+        self, hidden_states: torch.Tensor, indices_do_sample: torch.Tensor
+    ) -> torch.Tensor:
+        selected = torch.index_select(hidden_states, 0, indices_do_sample)
+        return self._greedy_token_ids(selected)
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def compute_greedy_token_ids_from_hidden_states(
+        self, hidden_states: torch.Tensor
+    ) -> torch.Tensor:
+        return self._greedy_token_ids(hidden_states)
+
+    def _samples_greedy_token_ids(self, scheduler_output: "SchedulerOutput") -> bool:
+        """Whether this step's sampling needs only greedy token ids.
+
+        Then execute_model hands sample_tokens [n, 1] int64 token ids in
+        place of logits: every request is greedy and nothing reads the
+        logits (no logprobs, grammar masks or NaN checks).
+        """
+        return (
+            self._greedy_head is not None
+            and self.input_batch.all_greedy
+            and self.input_batch.max_num_logprobs is None
+            and not scheduler_output.has_structured_output_requests
+            and self._nan_checker is None
+        )
+
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def spec_bonus_and_target_tokens(
         self,
@@ -7087,7 +7868,10 @@ class TPUModelRunner(GPUModelRunner):
         bonus_logits_indices: torch.Tensor,
         target_logits_indices: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        token_ids = logits.argmax(dim=-1)
+        # `logits` may already hold [n, 1] greedy token ids.
+        token_ids = (
+            logits.argmax(dim=-1) if logits.is_floating_point() else logits.view(-1)
+        )
         return (
             torch.index_select(token_ids, 0, bonus_logits_indices),
             torch.index_select(token_ids, 0, target_logits_indices).to(torch.int32),

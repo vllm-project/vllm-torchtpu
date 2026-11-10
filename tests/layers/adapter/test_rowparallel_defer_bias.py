@@ -56,6 +56,7 @@ def _make_layer(
     layer.bias = bias
     layer.return_bias = return_bias
     layer.quant_method = SimpleNamespace(apply=apply)
+    layer._tp4_all_reduce = None
     return layer
 
 

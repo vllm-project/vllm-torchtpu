@@ -53,6 +53,7 @@ def _make_self(
     ckpt_window=1,
     read_offsets=None,
     bm_layout=None,
+    two_slot=False,
 ):
     """Build a minimal fake runner ``self`` for the collector.
 
@@ -93,6 +94,8 @@ def _make_self(
         # 1 = no speculative checkpoint group; > 1 takes the sliding-group
         # path exercised at the bottom of this file.
         _mamba_ckpt_window=ckpt_window,
+        # Two-slot GDN checkpoints (read codes instead of offsets).
+        _two_slot_ckpts=two_slot,
         # The collector reads the manager block size from cache_config, not
         # the runner's init-time snapshot (the executor finalizes it after
         # the runner is constructed).
@@ -593,8 +596,9 @@ def test_non_spec_crossing_keeps_the_state_block_source():
 # --- copy-plan pool split derivation -----------------------------------------
 
 
-def _copy_plan_split(raw_shape, raw_dtype, manager_tokens, page_bytes):
-    """Run `_build_mamba_copy_plan` on a minimal config; return the split."""
+def _copy_plan_split(raw_shape, raw_dtype, manager_tokens, page_bytes, **fields):
+    """Run `_build_mamba_copy_plan` on a minimal config (runner `fields`
+    override the fake's); return the split."""
     from vllm.v1.kv_cache_interface import KVCacheTensor, MambaSpec
 
     spec = MambaSpec(
@@ -624,11 +628,33 @@ def _copy_plan_split(raw_shape, raw_dtype, manager_tokens, page_bytes):
         _mamba_copy_plan=None,
         _mamba_state_block_size=None,
         _pool_block_split=1,
+        _two_slot_ckpts=False,
     )
+    for name, value in fields.items():
+        setattr(fake, name, value)
+    fake._mamba_column_stride = lambda: TPUModelRunner._mamba_column_stride(fake)
     TPUModelRunner._build_mamba_copy_plan(
         fake, kv_cache_config, {"model.layers.0.lin": raw}, None
     )
     return fake._pool_block_split
+
+
+@pytest.mark.parametrize("manager_tokens,allowed", [(256, True), (4, True), (3, False)])
+def test_two_slot_copy_plan_needs_mamba_blocks_of_one_verify_window(
+    manager_tokens, allowed
+):
+    # A verify window of 3 drafts must complete at most one mamba block.
+    kernel_block_bytes = 2 * 64 * 2 * 128 * 2
+    args = ((16, 2, 64, 2, 128), torch.bfloat16, manager_tokens, kernel_block_bytes)
+    fields = dict(
+        _two_slot_ckpts=True,
+        speculative_config=SimpleNamespace(num_speculative_tokens=3),
+    )
+    if allowed:
+        _copy_plan_split(*args, **fields)
+    else:
+        with pytest.raises(ValueError, match="TPU_GDN_TWO_SLOT_CKPT"):
+            _copy_plan_split(*args, **fields)
 
 
 def test_copy_plan_block_major_maps_every_region_to_the_merged_pool():
@@ -684,6 +710,7 @@ def test_copy_plan_block_major_maps_every_region_to_the_merged_pool():
         _mamba_copy_plan=None,
         _mamba_state_block_size=None,
         _pool_block_split=1,
+        _two_slot_ckpts=False,
     )
     TPUModelRunner._build_mamba_copy_plan(
         fake,
@@ -933,3 +960,52 @@ def test_async_state_seed_keeps_actual_crossing_when_all_drafts_accepted():
     _collect(fake, _sched({"a": 4}))
     assert fake._mamba_state_pos["a"] == 1
     assert _real_pairs(fake._pending_mamba_state_copies[0]) == [(8, 6)]
+
+
+@pytest.mark.parametrize(
+    "code,src,dst_code",
+    [
+        (0, 10, 0),  # start state in block 0 of the pair, nothing pending
+        (1, 11, 0),  # start state in block 1, which becomes block 0
+        (2 * 3, 10, 2 * 3),  # three accepted tokens still to recompute
+        (1 + 2 * 2, 11, 2 * 2),
+    ],
+)
+def test_two_slot_crossing_seeds_the_start_block_and_keeps_pending(code, src, dst_code):
+    # Two-slot pair = columns (prev, prev + 1) = blocks (10, 11). The start
+    # block (low bit of the read code) moves into the new state column's
+    # block 11, with the accepted-but-pending tokens (which ride in its conv
+    # tile) still pending; the destination is block 0 of the new pair.
+    offsets = torch.zeros(NUM_BLOCKS, dtype=torch.int32)
+    offsets[10] = offsets[20] = code
+    fake, _ = _make_self(
+        ["a"],
+        [BLOCK_SIZE],
+        [[[10, 11, 12]], [[20, 21, 22]]],
+        state_pos={"a": 0},
+        ckpt_window=2,
+        read_offsets=offsets,
+        two_slot=True,
+    )
+    _collect(fake, _sched({"a": 1}))
+    for staged, base in zip(fake._pending_mamba_state_copies, (0, 10)):
+        assert _real_pairs(staged) == [(src + base, 11 + base)]
+    assert int(offsets[11]) == int(offsets[21]) == dst_code
+    assert int(offsets[10]) == code  # The source keeps its code.
+
+
+def test_two_slot_new_owner_crossing_seeds_block_zero_with_nothing_pending():
+    offsets = torch.zeros(NUM_BLOCKS, dtype=torch.int32)
+    offsets[10] = 1 + 2 * 3  # Left by the block's previous owner.
+    fake, _ = _make_self(
+        ["new"],
+        [BLOCK_SIZE],
+        [[[10, 11, 12]]],
+        ckpt_window=2,
+        read_offsets=offsets,
+        two_slot=True,
+    )
+    fake._mamba_offset_seeded.clear()
+    _collect(fake, _sched({"new": 1}))
+    assert _real_pairs(fake._pending_mamba_state_copies[0]) == [(10, 11)]
+    assert int(offsets[11]) == 0

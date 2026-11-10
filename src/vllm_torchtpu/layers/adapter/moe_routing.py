@@ -17,6 +17,7 @@ import torch
 import vllm.envs as vllm_envs
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.layers.adapter import expert_placement
 from vllm_torchtpu.layers.adapter.router_topk import rowmax_select
 from vllm_torchtpu.logger import init_logger
 
@@ -148,7 +149,24 @@ def route(
     present, else our own ``select_experts``. That decision was previously
     duplicated in each quant method; centralizing it here means the simulation
     hook -- and any future routing-path change -- lives in exactly one place.
+
+    For a layer whose experts ``TPU_MOE_EXPERT_PLACEMENT`` placed, the ids
+    come back as the experts' physical slots; with TPU_MOE_ROUTING_COUNTS_DIR
+    the logical ids are counted first (``expert_placement.count_routes``).
     """
+    topk_weights, topk_ids = _route_logical(
+        layer, hidden_states, router_logits, input_ids
+    )
+    expert_placement.count_routes(layer, topk_ids)
+    return topk_weights, expert_placement.to_slots(layer, topk_ids)
+
+
+def _route_logical(
+    layer,
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    input_ids: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     topk = layer.moe_config.experts_per_token
     simulated = maybe_simulate_routing(hidden_states, router_logits, topk)
     if simulated is not None:
@@ -313,12 +331,17 @@ def get_experts_start(layer) -> int | None:
     placement (``vllm/model_executor/layers/fused_moe/layer.py``), so this is
     a pure function of ``ep_rank``, ``ep_size``, and ``global_num_experts`` --
     known at layer construction time. ``validate_linear_ep_placement`` enforces
-    that the placement is linear before this value is used.
+    that the placement is linear before this value is used. A placement file
+    with redundant slots adds them to every rank's slots.
     """
     if not layer.moe_config.moe_parallel_config.use_ep:
         return None
     base = layer.global_num_experts // layer.moe_config.ep_size
     remainder = layer.global_num_experts % layer.moe_config.ep_size
+    redundant = expert_placement.redundant_slots_per_rank(layer)
+    if redundant:
+        # A placed layer's experts split evenly over the ranks.
+        return layer.moe_config.ep_rank * (base + redundant)
     return layer.moe_config.ep_rank * base + min(layer.moe_config.ep_rank, remainder)
 
 
@@ -348,6 +371,7 @@ def register_experts_start_buffer(layer, *, device: torch.device) -> None:
         else None
     )
     layer.register_buffer("_experts_start", buffer, persistent=False)
+    expert_placement.register_slots_buffer(layer, device=device)
 
 
 def validate_linear_ep_placement(layer) -> None:

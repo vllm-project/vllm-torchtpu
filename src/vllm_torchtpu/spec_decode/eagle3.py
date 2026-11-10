@@ -17,8 +17,9 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
-from vllm_torchtpu import envs
+from vllm_torchtpu import decode_switches, envs
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadataBuilderContext
+from vllm_torchtpu.layers.core.sequence_layout import DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
@@ -260,6 +261,8 @@ class Eagle3Proposer:
         )
         draft_attn_layer_names = set(all_attn_layers.keys()) - target_attn_layer_names
         self._draft_attn_layer_names = draft_attn_layer_names
+        if decode_switches.get().path("draft_one_query"):
+            self._mark_one_query_draft_layers(all_attn_layers, draft_attn_layer_names)
 
         if self.runner._pcp_enabled and self.runner._mtp_enabled:
             self._validate_pcp_draft_model(draft_attn_layer_names)
@@ -334,6 +337,29 @@ class Eagle3Proposer:
                 "advance per draft step, which cross-model KV sharing "
                 "freezes; the combination is unvalidated."
             )
+
+    @staticmethod
+    def _mark_one_query_draft_layers(layers: dict, names: set[str]) -> None:
+        """Give the draft's verify-window attention layers the one-query kernel.
+
+        Draft steps after the first carry one query per request; these layers
+        then pick the one-query decode kernel on device (`_with_one_query_steps`
+        in the attention adapter) instead of the verify-window kernel.
+        """
+        from vllm_torchtpu.layers.adapter.attention import (
+            PallasBatchedRPAAttentionBackendImpl,
+        )
+
+        marked = []
+        for name in sorted(names):
+            impl = getattr(layers[name], "impl", None)
+            if (
+                isinstance(impl, PallasBatchedRPAAttentionBackendImpl)
+                and impl.decode_query_size > 1
+            ):
+                impl.one_query_steps = True
+                marked.append(name)
+        logger.info("Batched RPA one-query draft steps on layers %s", marked)
 
     def _validate_mtp_layer_count(self) -> None:
         """One nextn layer only: the proposer's per-step wiring assumes it.
@@ -621,6 +647,7 @@ class Eagle3Proposer:
         self._draft_md_cache.pop(id(chunk), None)
 
         num_tokens = input_ids.shape[0]
+        self._token_padding_update(chunk, num_tokens, chunk.num_reqs)
         with (
             set_model_tag("eagle_head"),
             set_forward_context(
@@ -1028,7 +1055,10 @@ class Eagle3Proposer:
         # and pre-lm-head hidden in one compiled region. Run raw (advanced
         # indexing), these three gathers are eager ops the DEFER_AND_FUSE path
         # fuses with the step's seq_lens/positions arithmetic into a per-context
-        # program. index_select is value-identical to hidden[indices].
+        # program. index_select is value-identical to hidden[indices]. A
+        # negative index marks a row this rank does not own (PCP); clamped, it
+        # reads row 0 instead of wrapping to the buffer's last row.
+        indices = indices.clamp_min(0)
         pos_carry = (
             torch.index_select(positions, 1, indices)
             if positions.ndim == 2
@@ -1122,6 +1152,7 @@ class Eagle3Proposer:
                 seq_lens_delta=0,
                 num_rejected_np=rejected,
                 num_tokens_padded=ids.shape[0],
+                num_valid_tokens=int(chunk.query_start_loc_np[-1]),
             )
             outputs.append(output)
             if not self.capture_prefill_snapshots:
@@ -1278,28 +1309,29 @@ class Eagle3Proposer:
                 seq_lens_delta=0,
                 num_rejected_np=rejected_np_per_chunk[ci],
                 num_tokens_padded=input_ids.shape[0],
+                num_valid_tokens=int(chunk.query_start_loc_np[-1]),
             )
             # [p, h] / [p] carries + first-pass draft token, computed in compiled
             # regions (the three gathers, then lm-head+argmax) so torch-tpu's
             # eager DEFER_AND_FUSE path can't fuse them into per-context programs.
-            owner_mask = last_token_indices.ge(0)
-            safe_gather_indices = last_token_indices.clamp_min(0)
             if self._share_mtp_indices:
                 # Clamped, not raw: a PCP-localized index is -1 for a row this
                 # rank does not own, and -1 would wrap to the buffer's last row.
                 saved_topk_per_chunk.append(
-                    self._mtp_compact_and_save(safe_gather_indices)
+                    self._mtp_compact_and_save(last_token_indices.clamp_min(0))
                 )
             hidden_carry, positions_carry, last_hidden_carry = (
                 self._draft_gather_carries(
-                    hidden, positions, last_hidden, safe_gather_indices
+                    hidden, positions, last_hidden, last_token_indices
                 )
             )
-            last_hidden_carry = (
-                chunk.sequence_layout_plan.aggregate_request_aligned_tensor(
-                    last_hidden_carry, owner_mask
+            layout_plan = chunk.sequence_layout_plan
+            # The default layout owns every row, and aggregation returns its
+            # input unchanged there.
+            if layout_plan.descriptor != DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR:
+                last_hidden_carry = layout_plan.aggregate_request_aligned_tensor(
+                    last_hidden_carry, last_token_indices.ge(0)
                 )
-            )
             hidden_carry_per_chunk.append(hidden_carry)
             positions_carry_per_chunk.append(positions_carry)
             with set_model_tag("eagle_head"):
@@ -1388,6 +1420,7 @@ class Eagle3Proposer:
                     num_rejected_dev=rejected_dev_per_chunk[ci],
                     loop_query_start_loc=loop_qsl_per_chunk[ci],
                     loop_request_distribution=loop_reqdist_per_chunk[ci],
+                    num_valid_tokens=chunk.num_reqs,
                 )
                 with set_model_tag("eagle_head"):
                     draft_tokens_per_chunk[ci].append(
@@ -1875,6 +1908,21 @@ class Eagle3Proposer:
             last_hidden = hidden = out
         return last_hidden, hidden
 
+    def _token_padding_update(
+        self, chunk: DraftChunkInputs, num_tokens: int, num_valid_tokens: int | None
+    ) -> None:
+        """Mark the padded rows of a draft forward for the MoE layers (every
+        row valid in a chunk whose sequence layout is not the default one)."""
+        if getattr(self.runner, "_token_padding_state", None) is None:
+            return
+        if (
+            num_valid_tokens is None
+            or chunk.sequence_layout_plan.descriptor
+            != DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR
+        ):
+            num_valid_tokens = num_tokens
+        self.runner._token_padding_update(num_tokens, num_valid_tokens)
+
     def _forward_draft(
         self,
         chunk: DraftChunkInputs,
@@ -1888,7 +1936,9 @@ class Eagle3Proposer:
         num_rejected_dev: torch.Tensor | None = None,
         loop_query_start_loc: torch.Tensor | None = None,
         loop_request_distribution: torch.Tensor | None = None,
+        num_valid_tokens: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``num_valid_tokens``: rows from there on are padding (None: none)."""
         attn_metadata = self._build_draft_attn_metadata(
             chunk=chunk,
             step_idx=step_idx,
@@ -1901,6 +1951,7 @@ class Eagle3Proposer:
         )
 
         num_tokens = input_ids.shape[0]
+        self._token_padding_update(chunk, num_tokens, num_valid_tokens)
 
         kwargs: dict[str, torch.Tensor | int] = {
             "input_ids": input_ids,
@@ -2315,6 +2366,7 @@ class Eagle3Proposer:
                         seq_lens_delta=0,
                         num_rejected_np=None,
                         num_tokens_padded=bucket,
+                        num_valid_tokens=0,
                     )
                     last_hidden = first_pass_carry
                 else:
@@ -2329,6 +2381,7 @@ class Eagle3Proposer:
                         num_tokens_padded=p,
                         loop_query_start_loc=loop_qsl,
                         loop_request_distribution=loop_reqdist,
+                        num_valid_tokens=0,
                     )
                 with set_model_tag("eagle_head"):
                     tok = self._draft_propose_token(last_hidden)

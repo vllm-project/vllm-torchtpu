@@ -21,6 +21,21 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs
 
 
+def _column(col, outer_dim: int, lanes_per_col: int, cfgs: configs.RpaConfigs):
+    """Rows of a lane's u32 window, viewed as (-1, num_lanes), that hold
+    128-lane column `col` (tokens [128 * col, 128 * col + 128)) of every row."""
+    if not cfgs.page_runs:
+        return pl.ds(col, outer_dim, lanes_per_col)
+    # Page-major: a page's rows follow one another, each row's columns adjacent.
+    cols_per_page = cfgs.serve.page_size // pltpu.get_tpu_info().num_lanes
+    if cols_per_page == 1:
+        if isinstance(col, int):
+            return pl.ds(col * outer_dim, outer_dim)
+        return pl.ds(pl.multiple_of(col * outer_dim, outer_dim), outer_dim)
+    start = (col // cols_per_page) * (outer_dim * cols_per_page) + col % cols_per_page
+    return pl.ds(start, outer_dim, cols_per_page)
+
+
 def _stitch_decode_lane(
     vmem_u32_ref: jax.Array,
     bkv_sz_cache: jax.Array,
@@ -56,9 +71,11 @@ def _stitch_decode_lane(
     if cfgs.block.bq_sz == 1:
         # A single token needs neither a second destination column nor the
         # wrap-around source column: its source column is unambiguous.
-        dst_vreg = strided_vmem_ref[pl.ds(dst_chunk_idx, outer_dim, lanes_per_col)]
+        dst_vreg = strided_vmem_ref[
+            _column(dst_chunk_idx, outer_dim, lanes_per_col, cfgs)
+        ]
         src_vreg = strided_vmem_ref[
-            pl.ds(src_tok_idx // num_lanes, outer_dim, lanes_per_col)
+            _column(src_tok_idx // num_lanes, outer_dim, lanes_per_col, cfgs)
         ]
         rolled = pltpu.roll(src_vreg, dst_rel - src_tok_idx % num_lanes, axis=1)
         merged_dst_vreg = lax.select(
@@ -74,7 +91,9 @@ def _stitch_decode_lane(
     def rolled_src(j: int) -> jax.Array:
         col = jnp.clip(dst_chunk_idx + j - src_base - 1, 0, max_col)
         return pltpu.roll(
-            strided_vmem_ref[pl.ds(col, outer_dim, lanes_per_col)], shift, axis=1
+            strided_vmem_ref[_column(col, outer_dim, lanes_per_col, cfgs)],
+            shift,
+            axis=1,
         )
 
     n_cols = pl.cdiv(num_lanes - 1 + cfgs.block.bq_sz, num_lanes)
@@ -85,7 +104,7 @@ def _stitch_decode_lane(
     for k in range(n_cols):
         col = jnp.minimum(dst_chunk_idx + k, max_col)
         src_vreg = jnp.where(lane_idx >= shift, rolled[k + 1], rolled[k])
-        dst_vreg = strided_vmem_ref[pl.ds(col, outer_dim, lanes_per_col)]
+        dst_vreg = strided_vmem_ref[_column(col, outer_dim, lanes_per_col, cfgs)]
         rel = k * num_lanes + lane_idx - dst_rel
         cols.append(col)
         merged.append(
@@ -151,10 +170,11 @@ def store_new_kv_lane(
         # padding cannot poison systolic dot products.
         for r_offset in range(k_rows + len(cols) - 1):
             r = dst_page_start + r_offset
-            new_row = strided_vmem_ref[pl.ds(r, outer_dim, lanes_per_col)]
+            rows = _column(r, outer_dim, lanes_per_col, cfgs)
+            new_row = strided_vmem_ref[rows]
             for col, merged_vreg in zip(cols, merged):
                 new_row = jax.lax.select(r < col, new_row, merged_vreg)
-            strided_vmem_ref[pl.ds(r, outer_dim, lanes_per_col)] = new_row
+            strided_vmem_ref[rows] = new_row
 
     else:
         merged_cache_u32 = stitch_result

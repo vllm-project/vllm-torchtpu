@@ -122,6 +122,43 @@ class GDNConfig:
     # shapes and loops can be sized off it unconditionally and the extra axis
     # / iterations fold away in the non-speculative paths.
     window_size: int = 1
+    # Speculative decoding with two state blocks per sequence instead of
+    # `window_size`: block 0 of `ckpt_indices[s]` or block 1, picked by the
+    # low bit of the read offset, holds the verify window's start state, and
+    # the other receives the state after the window's last real token. The
+    # offset's remaining bits count the tokens of the previous window that
+    # were accepted but not yet folded into the start state; the window tile
+    # recomputes them (outputs and checkpoints skipped) before the window.
+    # The tokens of each window ride in the start block's conv tile, past the
+    # conv state. A window that completes a mamba block also leaves the state
+    # at that boundary in the block it completes (`ckpt_indices[s, 2:]`).
+    # See `window_tile` and `memory_ref.ExternalStateBufferedRef`.
+    two_slot_ckpts: bool = False
+    # The activations arrive as one [tokens, dim_size / 128 + 2, 128] FP32
+    # array: each token's qkv rows, then its b row and its a row (lanes
+    # padded with zeros). window_tile reads it directly; per-sequence tiles
+    # build their one-token-per-register tiles from it in VMEM.
+    packed_tokens: bool = False
+    # window_tile multiplies k (and q) with two value heads of one key head
+    # at a time when each key head has an even number of value heads: one
+    # [kq_head_dim, 2 * v_head_dim] MXU weight per dot instead of one
+    # [kq_head_dim, v_head_dim] weight per head. Its window loop selects no
+    # whole states either way (`window_tile`).
+    paired_heads: bool = False
+
+    @property
+    def num_ckpt_tiles(self) -> int:
+        """State tiles per sequence in a tile's checkpoint buffer; two-slot
+        verify tiles hold the start state, the last state and the state at a
+        block boundary inside the window."""
+        if self.two_slot_tiles:
+            return 3
+        return self.window_size
+
+    @property
+    def two_slot_tiles(self) -> bool:
+        """Whether this tile writes back two-slot checkpoints."""
+        return self.two_slot_ckpts and self.mode == GDNMode.BATCHED
 
     @property
     def chunk_size(self) -> int:
@@ -205,6 +242,13 @@ class GDNConfig:
         # Windows of different sizes compile to different kernels; keep them
         # distinguishable in profiles.
         suffix = f"_w{self.window_size}" if self.window_size > 1 else ""
+        if self.two_slot_tiles and self.window_size > 2:
+            suffix += "_2slot"
+        # "_pairs" names the switch: tiles that inner_kernel runs (window_tile
+        # unsupported) and an odd number of value heads per key head keep one
+        # head per dot.
+        if self.paired_heads and self.per_head_windows:
+            suffix += "_pairs"
         if self.is_kda and self.gate_lower_bound is not None:
             suffix += "_bounded"
         return f"fused_conv1d_{self.attention_mode.value}_{self.mode.value}{suffix}"
@@ -232,6 +276,26 @@ class GDNConfig:
     DEFAULT_VMEM_FRACTION = 0.7
     WINDOWED_VMEM_FRACTION = 0.9
 
+    # Verify-window tiles read each state through its own buffer and write
+    # their checkpoints to a separate one (memory_ref.create_allocs). False
+    # keeps one in-out buffer per state, whose next fetch waits for the
+    # previous tile's write-back.
+    SPLIT_BATCHED_STATE_IO = True
+
+    # GDN verify-window tiles run window_tile: one window position and one
+    # value head at a time, with dense activations. False computes them in
+    # wrapper.inner_kernel like every other tile.
+    PER_HEAD_WINDOWS = True
+
+    @property
+    def per_head_windows(self) -> bool:
+        return (
+            self.PER_HEAD_WINDOWS
+            and self.mode == GDNMode.BATCHED
+            and self.window_size > 1
+            and not self.is_kda
+        )
+
     def get_vmem_limit_bytes(self) -> int:
         tpu_info = pltpu.get_tpu_info()
         fraction = (
@@ -257,7 +321,62 @@ class GDNConfig:
             carry_conv_scratch = pltpu.VMEM(conv_shape, jnp.float32)
             carry_recurrent_scratch = pltpu.VMEM(recurrent_shape, jnp.float32)
 
-        return dict(
+        window_scratches = None
+        if self.per_head_windows:
+            num_lanes = pltpu.get_tpu_info().num_lanes
+            window_scratches = (
+                pltpu.VMEM(recurrent_shape, jnp.float32),
+                pltpu.VMEM(
+                    (
+                        self.seq_tile_size,
+                        self.chunk_size + self.prev_kernel_size,
+                        pl.cdiv(self.dim_size, num_lanes),
+                        num_lanes,
+                    ),
+                    jnp.float32,
+                ),
+                pltpu.VMEM(
+                    (
+                        self.kernel_size + 1,
+                        pl.cdiv(self.dim_size, num_lanes),
+                        num_lanes,
+                    ),
+                    jnp.float32,
+                ),
+            )
+            if self.two_slot_ckpts:
+                # The previous window's conv inputs after the start state's
+                # taps, and its b / a rows.
+                window_scratches += (
+                    pltpu.VMEM(
+                        (
+                            self.seq_tile_size,
+                            self.prev_kernel_size + self.window_size - 1,
+                            pl.cdiv(self.dim_size, num_lanes),
+                            num_lanes,
+                        ),
+                        jnp.float32,
+                    ),
+                    pltpu.VMEM(
+                        (self.seq_tile_size, self.window_size - 1, 2, num_lanes),
+                        jnp.float32,
+                    ),
+                )
+
+        packed_scratches = None
+        if self.packed_tokens and not self.per_head_windows:
+            act_shape = (self.seq_tile_size, self.chunk_size, 1)
+            packed_scratches = (
+                pltpu.VMEM((*act_shape, self.dim_size), jnp.float32),
+                pltpu.VMEM((*act_shape, self.aligned_num_v_heads), jnp.float32),
+                pltpu.VMEM((*act_shape, self.aligned_gate_dim), jnp.float32),
+            )
+
+        scratches = dict(
             carry_conv_scratch_ref=carry_conv_scratch,
             carry_recurrent_scratch_ref=carry_recurrent_scratch,
+            window_scratch_refs=window_scratches,
         )
+        if packed_scratches is not None:
+            scratches["packed_scratch_refs"] = packed_scratches
+        return scratches

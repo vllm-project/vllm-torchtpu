@@ -60,10 +60,11 @@ from vllm.model_executor.layers.quantization.modelopt import (
 from vllm.model_executor.utils import replace_parameter
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu import decode_switches
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import (
     vllm_adapter as adaptive_moe,
 )
-from vllm_torchtpu.layers.adapter import moe_routing
+from vllm_torchtpu.layers.adapter import expert_placement, moe_routing, token_padding
 from vllm_torchtpu.layers.adapter.fused_moe import (
     TpuMoEActivationMixin,
     fused_moe_gmm,
@@ -82,6 +83,11 @@ from vllm_torchtpu.layers.adapter.quantization.configs import (
 )
 from vllm_torchtpu.layers.adapter.quantization.fp8 import resolve_online_fp8
 from vllm_torchtpu.layers.adapter.quantization.online_fp8 import map_online_fp8
+from vllm_torchtpu.layers.adapter.ragged_a2a_moe import (
+    prebuild_ragged_a2a_moe,
+    ragged_a2a_enabled,
+    ragged_a2a_fused_moe_gmm,
+)
 from vllm_torchtpu.layers.core.quant_methods import NVFP4, get_tpu_quant_method
 from vllm_torchtpu.layers.core.quantization import (
     dequantize_tensor,
@@ -317,6 +323,7 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
 
         return (
             enable_pipelined_collective_and_compute()
+            or ragged_a2a_enabled()
             or fused_moe_ep_supported(self)
             or adaptive_moe.adaptive_fused_moe_supported(self)
         )
@@ -337,7 +344,8 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
         ModelOptNvFp4FusedMoE.create_weights(
             self,
             layer,
-            num_experts,
+            # A placement file with redundant slots adds them after the experts.
+            num_experts + expert_placement.redundant_slots_per_rank(layer),
             hidden_size,
             intermediate_size_per_partition,
             params_dtype,
@@ -359,6 +367,7 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
                 getattr(layer, name),
                 {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value},
             )
+        expert_placement.place_experts(layer)
 
     def _resolve_tpu_activation(self, layer) -> str:
         activation_str = super()._resolve_tpu_activation(layer)
@@ -385,22 +394,50 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
         if getattr(load_format, "value", load_format) != "dummy":
             return
         seed = zlib.crc32(str(layer.layer_name).encode())
-        seed += (
-            config.model_config.seed
-            + int(self.moe.ep_rank) * 104729
-            + int(self.moe.tp_rank)
+        seed += config.model_config.seed + int(self.moe.tp_rank)
+        generator = torch.Generator(device="cpu").manual_seed(
+            seed + int(self.moe.ep_rank) * 104729
         )
-        generator = torch.Generator(device="cpu").manual_seed(seed)
+        # Experts placed by TPU_MOE_EXPERT_PLACEMENT draw from a generator per
+        # logical expert, so the dummy model is the same under any placement
+        # and a replica gets its primary's values (empty redundant slots draw
+        # none).
+        logical = expert_placement.local_experts(layer)
+        generators: list[torch.Generator | None] = []
+        if logical is not None:
+            generators = [
+                torch.Generator(device="cpu").manual_seed(seed + int(e) * 104729)
+                if e >= 0
+                else None
+                for e in logical
+            ]
         for name, fan_in_multiplier in (("w13", 1), ("w2", self.moe.tp_size)):
             packed = getattr(layer, f"{name}_weight").data
-            values = torch.randint(
-                0,
-                256,
-                packed.shape,
-                dtype=torch.uint8,
-                device="cpu",
-                generator=generator,
-            )
+            if logical is None:
+                values = torch.randint(
+                    0,
+                    256,
+                    packed.shape,
+                    dtype=torch.uint8,
+                    device="cpu",
+                    generator=generator,
+                )
+            else:
+                values = torch.stack(
+                    [
+                        torch.zeros(packed.shape[1:], dtype=torch.uint8)
+                        if g is None
+                        else torch.randint(
+                            0,
+                            256,
+                            packed.shape[1:],
+                            dtype=torch.uint8,
+                            device="cpu",
+                            generator=g,
+                        )
+                        for g in generators
+                    ]
+                )
             # Each E2M1 nibble is independently +0.5 (1) or -0.5 (9).
             values.bitwise_and_(0x88).bitwise_or_(0x11)
             packed.copy_(values)
@@ -427,6 +464,7 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
         activation_str = self._set_tpu_activation(layer)
 
         self._initialize_dummy_quantized_weights(layer)
+        expert_placement.zero_empty_redundant(layer)
 
         # --- fuse E4M3 block scale * FP32 per-tensor global -> FP32 block scale.
         # w13: global is [E, 2] (separate w1/w3 per-tensor scales); apply to the
@@ -506,6 +544,7 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
                     layer.w2_weight_scale,
                 ]
             )
+        expert_placement.check_replicas(layer)
 
         logger.info_once(
             f"NVFP4 MoE weights prepared ({mode}): "
@@ -523,6 +562,35 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
                 topk=layer.moe_config.experts_per_token,
                 activation=activation_str,
                 use_ep=layer.moe_config.moe_parallel_config.use_ep,
+            )
+        if (
+            expert_placement.host_slots(layer) is not None
+            or expert_placement.routing_counts(layer) is not None
+        ) and (op is not None or self._use_adaptive_fused_moe):
+            raise NotImplementedError(
+                "TPU_MOE_EXPERT_PLACEMENT and TPU_MOE_ROUTING_COUNTS_DIR serve the "
+                "grouped-matmul path only (both act in moe_routing.route)"
+            )
+        if ragged_a2a_enabled():
+            if op is not None or self._use_adaptive_fused_moe:
+                raise NotImplementedError(
+                    "TPU_MOE_RAGGED_A2A serves the grouped-matmul path only"
+                )
+            if enable_pipelined_collective_and_compute():
+                raise NotImplementedError(
+                    "TPU_MOE_RAGGED_A2A and TPU_MOE_COLLECTION_CHUNK_SIZE both own "
+                    "the EP exchange; set one"
+                )
+            if not layer.moe_config.moe_parallel_config.use_ep:
+                raise NotImplementedError("TPU_MOE_RAGGED_A2A needs expert parallelism")
+            prebuild_ragged_a2a_moe(
+                topk=layer.moe_config.experts_per_token,
+                activation=activation_str,
+                placed=expert_placement.host_slots(layer) is not None,
+                owner_combine=decode_switches.arm_owner_combine(layer),
+                replicas=expert_placement.redundant_slots_per_rank(layer) > 0,
+                balanced=expert_placement.redundant_slots_per_rank(layer) > 0
+                and decode_switches.replica_balance(decode_switches.get()),
             )
 
         if self._use_adaptive_fused_moe:
@@ -599,6 +667,12 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
         # passes `layer` uniformly, which fixes that -- flagging separately as
         # it's a behavior change, not just a refactor.
         topk_weights, topk_ids = moe_routing.route(layer, x, router_logits)
+        if envs.TPU_MOE_SKIP_PADDED_TOKENS:
+            # A method that owns the EP exchange routes this rank's own tokens;
+            # otherwise vLLM's dispatch hands it the DP group's gathered tokens.
+            topk_ids, topk_weights = token_padding.drop_padded_routes(
+                topk_ids, topk_weights, is_local_tensor=self.supports_internal_mk
+            )
         kwargs = {
             "hidden_states": x,
             "w1": layer.w13_weight,
@@ -613,6 +687,19 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
             "topk": layer.moe_config.experts_per_token,
             "activation": activation_str,
         }
+        if ragged_a2a_enabled():
+            # Set by the MoE runner when the owner combine takes the shared
+            # expert's partial into the routed op.
+            shared_output = getattr(layer, "_tpu_owner_shared_output", None)
+            if shared_output is not None:
+                kwargs["shared_output"] = shared_output
+            kwargs["placed"] = getattr(layer, "_expert_slots", None) is not None
+            kwargs["owner_combine"] = getattr(
+                layer, decode_switches.OWNER_COMBINE_ATTR, False
+            )
+            kwargs["replicas"] = getattr(layer, "_expert_replicas", None)
+            kwargs["replica_plan"] = getattr(layer, "_expert_replica_plan", None)
+            return ragged_a2a_fused_moe_gmm(**kwargs)
         if enable_pipelined_collective_and_compute():
             return pipelined_fused_moe_gmm(**kwargs)
 

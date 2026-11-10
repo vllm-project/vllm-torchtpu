@@ -359,10 +359,14 @@ def generate_block_specs(
         index_map.lhs_index_map,
     )
 
+    # Two weight buffers with lookahead: the next group's weights load while
+    # the current group computes, however many grid steps that group spans.
+    # A third buffer would also issue the group after next at the start of a
+    # call, where that DMA shares HBM bandwidth with the one step 1 waits on.
     rhs_weight_spec = pl.BlockSpec(
         (None, cfgs.tiles.tile_k, cfgs.tiles.tile_n),
         index_map.rhs_weight_index_map,
-        pipeline_mode=pl.Buffered(buffer_count=3),
+        pipeline_mode=pl.Buffered(buffer_count=2, use_lookahead=True),
     )
     rhs_scale_block_spec = rhs_bias_block_spec = None
     if cfgs.rhs_cfgs.has_bias:
@@ -979,7 +983,7 @@ def calculate_tiling(
             lhs_quant_bits = jax.dtypes.itemsize_bits(lhs_cfgs.quant_dtype)
             lhs_vmem += tm * tk * (lhs_quant_bits // 8)
 
-        # 2. RHS tile (triple-buffered, includes scale and bias if present)
+        # 2. RHS tile (budgeted as triple-buffered, includes scale and bias)
         # If fuse_act is enabled, we have both gate and up weights,
         # so RHS memory is doubled.
         rhs_weight_vmem = tk * tn * rhs_bits // 8
@@ -1294,8 +1298,8 @@ def gmm_v2(
     """GMM kernel implemented with emit_pipeline.
 
     Dynamically calculate offset lhs/out tiles to reduce redundant computations.
-    Additionally, it adjusts dma size based on number of valid rows and utilize
-    triple buffering on weights to better utilize memory.
+    Additionally, it adjusts dma size based on number of valid rows and loads
+    the next group's weights while the current group computes.
 
     Args:
         lhs: lhs with shape [size_m, size_k].
@@ -1437,3 +1441,1532 @@ def gmm_v2(
         cost_estimate=get_cost_estimate(cfgs),
         metadata=get_metadata(cfgs),
     )(group_sizes, group_offset, lhs, rhs_weights)[:size_m, : cfgs.out_size_n]
+
+
+# Gate/up and down projections of a MoE layer in one kernel.
+#
+# Each expert's weights stream through VMEM slots by explicit DMAs: the gate/up
+# weights in `num_parts` column parts, then the down weights in `down_parts`
+# column parts. A slot is refilled with the next expert's weights as soon as the
+# matmul that reads it finishes, so every copy overlaps the other parts'
+# matmuls and no expert waits on its own weights after the first. The
+# activation stays in VMEM. Every row gets the arithmetic of `gmm_v2` gate/up
+# (fused activation) followed by `gmm_v2` down: same 256-wide column blocks,
+# same block-scale multiplies and the same f32 accumulation order, and the
+# activation rows are rounded the way the gate/up kernel stores them.
+
+
+# Row buckets of gmm_v2_mlp below the row tile (the tile is always the last).
+DEFAULT_MLP_BUCKETS = (32, 64)
+# Rows per gm tile of gmm_v2_mlp: tiles past it run as more tiles of the same
+# expert, which reuse the expert's weights in VMEM; larger tiles add matmul code
+# for every bucket and outgrow the kernel's instruction memory.
+DEFAULT_MLP_TILE_ROWS = 64
+
+
+@dataclasses.dataclass(frozen=True)
+class MlpConfigs:
+    up: GmmConfigs  # gate/up projection with the fused activation
+    down: GmmConfigs  # down projection
+    num_parts: int  # column parts of the gate/up weights per expert
+    down_parts: int  # column parts of the down weights per expert
+    bucket_ms: tuple[int, ...]  # row buckets of the matmuls, ascending, last = tile_m
+    tile_m: int  # rows per gm tile of this kernel (gate/up kernel: up.tiles.tile_m)
+
+    @property
+    def size_inter(self) -> int:
+        return self.up.out_size_n
+
+    @property
+    def part_size(self) -> int:
+        return self.size_inter // self.num_parts
+
+    @property
+    def down_part_size(self) -> int:
+        return self.down.dims.size_n // self.down_parts
+
+
+def make_mlp_configs(
+    lhs: jax.Array,
+    w1: jax.Array,
+    w1_scale: jax.Array | None,
+    w2: jax.Array,
+    w2_scale: jax.Array | None,
+    group_sizes: jax.Array,
+    group_offset: jax.Array,
+    *,
+    fuse_act: str,
+    num_parts: int,
+    down_parts: int,
+    buckets: tuple[int, ...] | None = None,
+    tile_rows: int | None = None,
+    maybe_quantize_lhs: bool = False,
+    rhs_quant_dtype: jnp.dtype | None = None,
+) -> MlpConfigs | None:
+    """Configs of the fused gate/up + down kernel, or None if it does not apply.
+
+    The two projections keep the tiles `gmm_v2` picks for them; the fused
+    kernel tiles rows like the gate/up kernel. It requires one k and one n tile
+    for each, weights scaled after the matmul per 256+ block, unquantized
+    activations, no bias and no packing.
+    """
+
+    # Tiles as gmm_v2 picks them with its default VMEM limit.
+    vmem_limit_bytes = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.9)
+    up = make_gmm_configs(
+        lhs,
+        w1,
+        w1_scale,
+        None,
+        group_sizes,
+        group_offset,
+        tile_info=calculate_tiling,
+        vmem_limit_bytes=vmem_limit_bytes,
+        out_dtype=None,
+        acc_dtype=None,
+        maybe_quantize_lhs=maybe_quantize_lhs,
+        zero_initialize=False,
+        fuse_act=fuse_act,
+        rhs_quant_dtype=rhs_quant_dtype,
+    )
+    inter = jax.ShapeDtypeStruct((lhs.shape[0], up.out_size_n), up.out_dtype)
+    down = make_gmm_configs(
+        inter,
+        w2,
+        w2_scale,
+        None,
+        group_sizes,
+        group_offset,
+        tile_info=calculate_tiling,
+        vmem_limit_bytes=vmem_limit_bytes,
+        out_dtype=lhs.dtype,
+        acc_dtype=None,
+        maybe_quantize_lhs=maybe_quantize_lhs,
+        zero_initialize=False,
+        fuse_act=None,
+        rhs_quant_dtype=rhs_quant_dtype,
+    )
+    tile_m = min(tile_rows or DEFAULT_MLP_TILE_ROWS, up.tiles.tile_m)
+    if buckets is None:
+        # Decode steps route a few rows to each expert: most tiles fit 32 rows,
+        # larger batches or skewed routing 64.
+        buckets = DEFAULT_MLP_BUCKETS
+    # Buckets of the row tile or larger collapse into the tile.
+    buckets = tuple(sorted({b for b in buckets if b < tile_m})) + (tile_m,)
+    cfgs = MlpConfigs(
+        up=up,
+        down=down,
+        num_parts=num_parts,
+        down_parts=down_parts,
+        bucket_ms=tuple(buckets),
+        tile_m=tile_m,
+    )
+    num_lanes = pltpu.get_tpu_info().num_lanes
+    mxu_size = pltpu.get_tpu_info().mxu_column_size
+    for c in (up, down):
+        if (
+            c.rhs_cfgs.should_unpack
+            or c.rhs_cfgs.has_bias
+            or not c.rhs_cfgs.should_dequantize_after_matmul
+            or c.lhs_cfgs.should_quantize
+            or c.tiles.tile_k != c.dims.size_k
+            or c.tiles.tile_n * (2 if c.fuse_act else 1) != c.dims.size_n
+        ):
+            return None
+    if (
+        down.dims.size_k != up.out_size_n
+        or up.out_size_n % num_parts
+        or down.dims.size_n % down_parts
+        # Each part holds whole 256-wide column blocks (interleaved gate/up).
+        or (2 * cfgs.part_size) % mxu_size
+        or cfgs.part_size % num_lanes
+        or cfgs.down_part_size % mxu_size
+        or any(b <= 0 or b % up.dims.size_lhs_sublane for b in buckets)
+        or up.tiles.tile_m % tile_m
+    ):
+        return None
+    return cfgs
+
+
+def mlp_kernel_main(
+    # Scalar prefetch
+    lhs_group_sizes_ref: jax.Array,  # int32[size_lhs_group]
+    group_offset_ref: jax.Array,  # int32[1]
+    # In
+    lhs_ref: jax.Array,  # [size_m, size_k]
+    w1_ref: jax.Array,  # [size_group, size_k, 2 * size_inter]
+    s1_ref: jax.Array,  # [size_group, num_blocks, 1, 2 * size_inter]
+    w2_ref: jax.Array,  # [size_group, size_inter, size_n]
+    s2_ref: jax.Array,  # [size_group, num_blocks, 1, size_n]
+    # Out
+    out_ref: jax.Array,  # [size_m, size_n]
+    # Scratch memory
+    w1_gate_slots: jax.Array,  # [num_parts, size_k, part_size]
+    w1_up_slots: jax.Array,  # [num_parts, size_k, part_size]
+    s1_gate_slots: jax.Array,  # [num_parts, num_blocks, 1, part_size]
+    s1_up_slots: jax.Array,  # [num_parts, num_blocks, 1, part_size]
+    w2_slots: jax.Array,  # [down_parts, size_inter, down_part_size]
+    s2_slots: jax.Array,  # [down_parts, num_blocks, 1, down_part_size]
+    inter_ref: jax.Array,  # [tile_m // size_lhs_sublane, size_lhs_sublane, size_inter]
+    partial_out_ref: jax.Array,  # [size_lhs_sublane, size_n]
+    metadata_ref: MetadataRef,
+    group_start_ref: jax.Array,  # SMEM int32[1]: first row of the current group
+    sems: jax.Array,  # DMA[num_parts + down_parts]
+    *,
+    cfgs: MlpConfigs,
+):
+    """Entry point of the fused gate/up + down kernel (see MlpConfigs)."""
+    _mlp_kernel(
+        lhs_group_sizes_ref,
+        group_offset_ref,
+        lhs_ref,
+        w1_ref,
+        s1_ref,
+        w2_ref,
+        s2_ref,
+        w1_gate_slots,
+        w1_up_slots,
+        s1_gate_slots,
+        s1_up_slots,
+        w2_slots,
+        s2_slots,
+        inter_ref,
+        metadata_ref,
+        group_start_ref,
+        sems,
+        cfgs=cfgs,
+        out_ref=out_ref,
+        partial_out_ref=partial_out_ref,
+        scatter=None,
+    )
+
+
+@dataclasses.dataclass(frozen=True)
+class ExtraRowRefs:
+    """Refs of the rows `gmm_v2_mlp_scatter` sends once at entry (its `extra`)."""
+
+    rows: jax.Array  # HBM [num_extra, row_sublanes, L]
+    member: jax.Array  # SMEM int32[num_extra]
+    row: jax.Array  # SMEM int32[num_extra]
+    expected: jax.Array  # SMEM int32[2]: landing here, to send
+    recv: jax.Array  # HBM [num_extra_recv, row_sublanes, L]
+    sems: jax.Array  # DMA[3]: send, local, receive
+    counts: jax.Array  # SMEM int32[2]: remote, local sent
+
+
+@dataclasses.dataclass(frozen=True)
+class OwnerTailRefs:
+    """Refs of `gmm_v2_mlp_scatter`'s owner tail (its `tail`)."""
+
+    tp_rank: jax.Array  # SMEM int32[K, blk]: per owner-order route position
+    dp_pos: jax.Array  # SMEM int32[K, blk]
+    sent: jax.Array  # SMEM int32[K, blk]
+    weight: jax.Array  # SMEM float32[K, blk]
+    fits: jax.Array  # SMEM int32[1]: 0 = the step sends nothing
+    out: jax.Array  # HBM [tp * blk, row_sublanes, L]: every TP rank's sums
+    sems: jax.Array  # DMA[7]: loads x2, stores x2, pushes x2, forwards
+    recv_sems: jax.Array  # DMA[1 + chunks]: peer rows, partner chunks
+    tp_size: int
+    chunk: int  # tokens summed per stage slot
+
+
+@dataclasses.dataclass(frozen=True)
+class ScatterRefs:
+    """Refs of `gmm_v2_mlp_scatter`'s row sends (see there)."""
+
+    dest_member: jax.Array  # SMEM int32[size_m]
+    dest_row: jax.Array  # SMEM int32[size_m]
+    me: jax.Array  # SMEM int32[1]
+    expected: jax.Array  # SMEM int32[1]
+    recv: jax.Array  # HBM [num_recv_rows, row_sublanes, size_n / row_sublanes]
+    stage: jax.Array  # VMEM [2, stage_rows, row_sublanes, size_n / row_sublanes]
+    send_sems: jax.Array  # DMA[2]
+    local_sems: jax.Array  # DMA[2]
+    recv_sem: jax.Array  # DMA[1]
+    in_flight: jax.Array  # SMEM int32[4]: rows in flight (remote x2, local x2)
+    axis: str | tuple[str, ...]
+    num_members: int | tuple[int, ...]
+    extra: ExtraRowRefs | None = None
+    tail: OwnerTailRefs | None = None
+
+
+def _axes(axis, num_members):
+    if isinstance(axis, str):
+        return (axis,), (num_members,)
+    return tuple(axis), tuple(num_members)
+
+
+def member_device(index, axis, num_members) -> dict:
+    """Mesh coordinates of member `index`, members numbered row-major over the
+    given axes (other mesh axes keep the caller's coordinate)."""
+    axes, sizes = _axes(axis, num_members)
+    coords = {}
+    for a, n in zip(reversed(axes[1:]), reversed(sizes[1:])):
+        coords[a] = lax.rem(index, n)
+        index = index // n
+    coords[axes[0]] = index
+    return coords
+
+
+def _signal_all(sem, axis, num_members) -> None:
+    axes, sizes = _axes(axis, num_members)
+    total = 1
+    for n in sizes:
+        total *= n
+    for i in range(total):
+        coords, rest = {}, i
+        for a, n in zip(reversed(axes), reversed(sizes)):
+            coords[a] = rest % n
+            rest //= n
+        pl.semaphore_signal(
+            sem, 1, device_id=coords, device_id_type=pl.DeviceIdType.MESH
+        )
+    pl.semaphore_wait(sem, total)
+
+
+def member_barrier(axis, num_members) -> None:
+    """Every member has entered the kernel. A second round on a scoped
+    semaphore keeps back-to-back kernels from consuming each other's signals."""
+    _signal_all(pltpu.get_barrier_semaphore(), axis, num_members)
+
+    @functools.partial(pl.run_scoped, second=pltpu.SemaphoreType.REGULAR)
+    def _(second):
+        _signal_all(second, axis, num_members)
+
+
+# Rows of one semaphore wait: a wait names a row-sized block of the receive
+# buffer for each row it covers.
+_WAIT_ROWS = 64
+
+
+def wait_rows(sem, ref, rows) -> None:
+    """Block until `rows` rows of `ref`'s row size have been counted on `sem`."""
+
+    def body(j, carry):
+        chunk = jnp.minimum(_WAIT_ROWS, rows - j * _WAIT_ROWS)
+        pltpu.make_async_copy(
+            ref.at[pl.ds(0, chunk)], ref.at[pl.ds(0, chunk)], sem
+        ).wait()
+        return carry
+
+    lax.fori_loop(0, (rows + _WAIT_ROWS - 1) // _WAIT_ROWS, body, 0)
+
+
+def owner_token_sum(
+    tp_ref,
+    dp_ref,
+    sent_ref,
+    weight_ref,
+    t,
+    row,
+    shared,
+    *,
+    topk: int,
+    tp_size: int,
+    dtype,
+    row_shape: tuple[int, ...],
+) -> jax.Array:
+    """Owned token ``t``'s MoE output in f32, summed as the owner combine does
+    (``ragged_a2a_moe.owner_sum_kernel``). Per TP rank of the experts: per DP
+    member, its routes weighted and summed in f32 in expert order and rounded
+    once to ``dtype``; the members summed in f32 and rounded once. Then the TP
+    ranks' partials summed in f32 in rank order; with ``shared``, each rank's
+    partial first adds its shared-expert partial with one rounding.
+
+    The [K, N] SMEM refs hold, per owner-order route position ``j`` of token
+    ``t``: the TP rank of its expert (``tp_size``: none), its DP position,
+    whether an output comes for it, its weight in f32. ``row(j)`` reads route
+    ``j``'s output row and ``shared(r)`` TP rank ``r``'s shared partial (or
+    ``shared`` is None), each of ``row_shape``.
+    """
+    acc_m = jnp.zeros(row_shape, jnp.float32)
+    acc_r = jnp.zeros(row_shape, jnp.float32)
+    out = jnp.zeros(row_shape, jnp.float32)
+    parts = [jnp.zeros(row_shape, jnp.float32) for _ in range(tp_size)]
+    for j in range(topk):
+        r = tp_ref[j, t]
+        d = dp_ref[j, t]
+        x = row(j).astype(jnp.float32)
+        prod = jnp.where(sent_ref[j, t] != 0, weight_ref[j, t] * x, 0.0)
+        if j:
+            new_r = r != tp_ref[j - 1, t]
+            new_m = jnp.logical_or(new_r, d != dp_ref[j - 1, t])
+            acc_r = jnp.where(new_r, 0.0, acc_r)
+            acc_m = jnp.where(new_m, 0.0, acc_m)
+        acc_m = acc_m + prod
+        group = r < tp_size
+        if j + 1 < topk:
+            end_r = tp_ref[j + 1, t] != r
+            end_m = jnp.logical_or(end_r, dp_ref[j + 1, t] != d)
+        else:
+            end_r = end_m = True
+        part = acc_m.astype(dtype).astype(jnp.float32)
+        acc_r = acc_r + jnp.where(jnp.logical_and(group, end_m), part, 0.0)
+        part_r = acc_r.astype(dtype).astype(jnp.float32)
+        if shared is None:
+            out = out + jnp.where(jnp.logical_and(group, end_r), part_r, 0.0)
+        else:
+            done = jnp.logical_and(group, end_r)
+            parts = [
+                jnp.where(jnp.logical_and(done, r == rr), part_r, parts[rr])
+                for rr in range(tp_size)
+            ]
+    if shared is not None:
+        for rr in range(tp_size):
+            x = shared(rr).astype(jnp.float32) + parts[rr]
+            out = out + x.astype(dtype).astype(jnp.float32)
+    return out
+
+
+def _owner_tail(sc: ScatterRefs, tl: OwnerTailRefs) -> None:
+    """`gmm_v2_mlp_scatter`'s owner tail, once every row bound here has landed:
+    sums this member's owned tokens in chunks and copies each summed chunk to
+    its rows of `tl.out` here and on the engine's other TP ranks; returns once
+    its own copies have left and the other ranks' rows have landed."""
+    topk, blk = tl.tp_rank.shape
+    tp, chunk = tl.tp_size, tl.chunk
+    row_shape = sc.recv.shape[1:]
+    dtype = sc.stage.dtype
+    me = sc.me[0]
+    my_tp = lax.rem(me, tp)
+    first = me - my_tp  # this engine's TP rank 0
+    # Route position j of owned token i at row j * blk + i; TP rank r's shared
+    # partial of it at row r * blk + i.
+    recv = sc.recv.reshape(topk, blk, *row_shape)
+    shared = None
+    if sc.extra is not None:
+        shared = sc.extra.recv.reshape(tp, blk, *row_shape)
+    # The row stage is free after the last tile. Per slot, in groups of `chunk`
+    # rows: the chunk's rows of each route position, then of each TP rank's
+    # shared partial, then its sums.
+    groups = sc.stage.reshape(2, sc.stage.shape[1] // chunk, chunk, *row_shape)
+    sums = topk + (0 if shared is None else tp)
+    nfull, rest = divmod(blk, chunk)
+    chunks = [(c * chunk, chunk) for c in range(nfull)]
+    if rest:
+        chunks.append((nfull * chunk, rest))
+    forward_sem = tl.sems.at[6]
+    peer_sem = tl.recv_sems.at[0]
+
+    def device(member):
+        return member_device(member, sc.axis, sc.num_members)
+
+    if tp == 4:
+        # Ranks 2k and 2k + 1 are the two cores of chip k: each chunk crosses
+        # to the other chip once, to the partner, which forwards what lands to
+        # the chip's other core.
+        other_core = first + my_tp + 1 - 2 * lax.rem(my_tp, 2)
+        partner_tp = lax.rem(my_tp + 2, 4)
+
+        def pushes(c):
+            return (
+                (first + partner_tp, tl.recv_sems.at[1 + c]),
+                (other_core, peer_sem),
+            )
+
+        expected = 2 * blk  # the other core's rows and its forward of its partner's
+    else:
+        peers = [first + lax.rem(my_tp + k, tp) for k in range(1, tp)]
+
+        def pushes(c):
+            del c
+            return tuple((p, peer_sem) for p in peers)
+
+        expected = (tp - 1) * blk
+
+    def loads(c0, n, slot):
+        sem = tl.sems.at[slot]
+        cps = [
+            pltpu.make_async_copy(
+                recv.at[:, pl.ds(c0, n)],
+                groups.at[slot, pl.ds(0, topk), pl.ds(0, n)],
+                sem,
+            )
+        ]
+        if shared is not None:
+            cps.append(
+                pltpu.make_async_copy(
+                    shared.at[:, pl.ds(c0, n)],
+                    groups.at[slot, pl.ds(topk, tp), pl.ds(0, n)],
+                    sem,
+                )
+            )
+        return cps
+
+    def copies(c, c0, n, slot):
+        src = groups.at[slot, sums, pl.ds(0, n)]
+        dst = tl.out.at[pl.ds(my_tp * blk + c0, n)]
+        out = [pltpu.make_async_copy(src, dst, tl.sems.at[2 + slot])]
+        for member, recv_sem in pushes(c):
+            out.append(
+                pltpu.make_async_remote_copy(
+                    src,
+                    dst,
+                    tl.sems.at[4 + slot],
+                    recv_sem,
+                    device_id=device(member),
+                    device_id_type=pl.DeviceIdType.MESH,
+                )
+            )
+        return out
+
+    def wait_copies(c, c0, n, slot):
+        local, *remote = copies(c, c0, n, slot)
+        local.wait()
+        for d in remote:
+            d.wait_send()
+
+    def compute(c0, n, slot):
+        for i in range(n):
+            out = owner_token_sum(
+                tl.tp_rank,
+                tl.dp_pos,
+                tl.sent,
+                tl.weight,
+                c0 + i,
+                lambda j, i=i: groups[slot, j, i],
+                None if shared is None else (lambda r, i=i: groups[slot, topk + r, i]),
+                topk=topk,
+                tp_size=tp,
+                dtype=dtype,
+                row_shape=row_shape,
+            )
+            groups[slot, sums, i] = out.astype(dtype)
+
+    @pl.when(tl.fits[0] != 0)
+    def _():
+        with jax.named_scope("tail_sum"):
+            for cp in loads(*chunks[0], 0):
+                cp.start()
+
+            def body(c, carry):
+                slot = lax.rem(c, 2)
+                # The next chunk's rows load while this one is summed.
+                if nfull > 1:
+
+                    @pl.when(c + 1 < nfull)
+                    def _():
+                        for cp in loads((c + 1) * chunk, chunk, 1 - slot):
+                            cp.start()
+
+                if rest:
+
+                    @pl.when(c + 1 == nfull)
+                    def _():
+                        for cp in loads(nfull * chunk, rest, 1 - slot):
+                            cp.start()
+
+                for cp in loads(c * chunk, chunk, slot):
+                    cp.wait()
+
+                @pl.when(c >= 2)
+                def _():
+                    # The sums of chunk c - 2 have left this slot.
+                    wait_copies(c - 2, (c - 2) * chunk, chunk, slot)
+
+                compute(c * chunk, chunk, slot)
+                for d in copies(c, c * chunk, chunk, slot):
+                    d.start()
+                return carry
+
+            if nfull:
+                lax.fori_loop(0, nfull, body, 0)
+            if rest:
+                slot = nfull % 2
+                for cp in loads(nfull * chunk, rest, slot):
+                    cp.wait()
+                if nfull >= 2:
+                    wait_copies(nfull - 2, (nfull - 2) * chunk, chunk, slot)
+                compute(nfull * chunk, rest, slot)
+                for d in copies(nfull, nfull * chunk, rest, slot):
+                    d.start()
+        if tp == 4:
+            with jax.named_scope("tail_peers"):
+                # Only after this rank's own chunks are out, so a rank that
+                # forwards never holds back rows another rank waits for.
+                def forward(c, c0, n):
+                    rows = tl.out.at[pl.ds(partner_tp * blk + c0, n)]
+                    wait_rows(tl.recv_sems.at[1 + c], tl.out, n)
+                    pltpu.make_async_remote_copy(
+                        rows,
+                        rows,
+                        forward_sem,
+                        peer_sem,
+                        device_id=device(other_core),
+                        device_id_type=pl.DeviceIdType.MESH,
+                    ).start()
+
+                def forward_full(c, carry):
+                    forward(c, c * chunk, chunk)
+                    return carry
+
+                if nfull:
+                    lax.fori_loop(0, nfull, forward_full, 0)
+                if rest:
+                    forward(nfull, nfull * chunk, rest)
+        with jax.named_scope("tail_push"):
+            for c in range(max(0, len(chunks) - 2), len(chunks)):
+                wait_copies(c, *chunks[c], c % 2)
+            if tp == 4:
+                wait_rows(forward_sem, tl.out, blk)
+        if tp > 1:
+            with jax.named_scope("tail_peers"):
+                wait_rows(peer_sem, tl.out, expected)
+
+
+def _mlp_kernel(
+    lhs_group_sizes_ref,
+    group_offset_ref,
+    lhs_ref,
+    w1_ref,
+    s1_ref,
+    w2_ref,
+    s2_ref,
+    w1_gate_slots,
+    w1_up_slots,
+    s1_gate_slots,
+    s1_up_slots,
+    w2_slots,
+    s2_slots,
+    inter_ref,
+    metadata_ref,
+    group_start_ref,
+    sems,
+    *,
+    cfgs: MlpConfigs,
+    out_ref,
+    partial_out_ref,
+    scatter: ScatterRefs | None,
+):
+    up, down = cfgs.up, cfgs.down
+    dims = up.dims
+    sub = dims.size_lhs_sublane
+    tile_m = cfgs.tile_m
+    size_k = dims.size_k
+    size_inter = cfgs.size_inter
+    part = cfgs.part_size
+    down_part = cfgs.down_part_size
+    size_n = down.dims.size_n
+    mxu_size = pltpu.get_tpu_info().mxu_column_size
+
+    def up_copies(p, group_id):
+        c0 = p * part
+        sem = sems.at[p]
+        return (
+            pltpu.make_async_copy(
+                w1_ref.at[group_id, :, pl.ds(c0, part)], w1_gate_slots.at[p], sem
+            ),
+            pltpu.make_async_copy(
+                w1_ref.at[group_id, :, pl.ds(size_inter + c0, part)],
+                w1_up_slots.at[p],
+                sem,
+            ),
+            pltpu.make_async_copy(
+                s1_ref.at[group_id, :, :, pl.ds(c0, part)], s1_gate_slots.at[p], sem
+            ),
+            pltpu.make_async_copy(
+                s1_ref.at[group_id, :, :, pl.ds(size_inter + c0, part)],
+                s1_up_slots.at[p],
+                sem,
+            ),
+        )
+
+    def down_copies(q, group_id):
+        c0 = q * down_part
+        sem = sems.at[cfgs.num_parts + q]
+        return (
+            pltpu.make_async_copy(
+                w2_ref.at[group_id, :, pl.ds(c0, down_part)], w2_slots.at[q], sem
+            ),
+            pltpu.make_async_copy(
+                s2_ref.at[group_id, :, :, pl.ds(c0, down_part)], s2_slots.at[q], sem
+            ),
+        )
+
+    def start(copies):
+        for c in copies:
+            c.start()
+
+    def wait(copies):
+        for c in copies:
+            c.wait()
+
+    # The first tile's weights start copying before the metadata loop: the
+    # first local group with rows, which fill_metadata assigns to tile 0.
+    group_offset = group_offset_ref[0]
+    max_num_group = group_offset + dims.size_group
+
+    def is_empty(lhs_group_id):
+        size = lhs_group_sizes_ref[jnp.minimum(lhs_group_id, max_num_group - 1)]
+        return jnp.logical_and(lhs_group_id < max_num_group, size <= 0)
+
+    first_lhs_group = lax.while_loop(is_empty, lambda i: i + 1, group_offset)
+
+    @pl.when(first_lhs_group < max_num_group)
+    def _():
+        group_id = first_lhs_group - group_offset
+        for p in range(cfgs.num_parts):
+            start(up_copies(p, group_id))
+        for q in range(cfgs.down_parts):
+            start(down_copies(q, group_id))
+
+    if scatter is not None:
+        # No row may land in a member's receive buffer before that member runs
+        # this kernel.
+        member_barrier(scatter.axis, scatter.num_members)
+        for i in range(4):
+            scatter.in_flight[i] = 0
+
+    tiled = dataclasses.replace(up, tiles=dataclasses.replace(up.tiles, tile_m=tile_m))
+    num_gm = fill_metadata(
+        lhs_group_sizes_ref, group_offset_ref, metadata_ref, cfgs=tiled
+    )
+
+    def scaled_matmul(tiled_lhs, rhs: RhsRef, c: GmmConfigs, bucket_m: int):
+        """Step 2 of `inner_kernel._matmul` on the unquantized-lhs path."""
+        tiled_rhs = rhs.get_weight()
+        rhs_tile_n = tiled_rhs.shape[1]
+        rhs_qbs = c.rhs_cfgs.quant_block_size
+        acc_list = []
+        for start_n in range(0, rhs_tile_n, mxu_size):
+            end_n = min(rhs_tile_n, start_n + mxu_size)
+            col_size = end_n - start_n
+
+            acc_n = jnp.zeros((bucket_m, col_size), dtype=c.acc_dtype)
+            for start_k in range(0, c.tiles.tile_k, rhs_qbs):
+                end_k = min(c.tiles.tile_k, start_k + rhs_qbs)
+
+                block_acc = jnp.matmul(
+                    tiled_lhs[:, start_k:end_k],
+                    tiled_rhs[start_k:end_k, start_n:end_n],
+                    preferred_element_type=jnp.float32,
+                ).astype(c.acc_dtype)
+
+                b_id = start_k // rhs_qbs
+                rhs_scale_replicated = rhs.get_scale(replicate_size=bucket_m)[
+                    b_id, :, start_n : start_n + col_size
+                ]
+                block_acc *= rhs_scale_replicated.astype(c.acc_dtype)
+
+                acc_n += block_acc
+            acc_list.append(acc_n)
+        return jnp.concatenate(acc_list, axis=1)
+
+    def send_extra_rows(sc: ScatterRefs, ex: ExtraRowRefs):
+        """Send every `extra` row to its member's second receive buffer now;
+        the transfers overlap the expert compute."""
+        me = sc.me[0]
+
+        def send(i, counts):
+            member = ex.member[i]
+            src = ex.rows.at[pl.ds(i, 1)]
+            dst = ex.recv.at[pl.ds(ex.row[i], 1)]
+            is_local = member == me
+
+            @pl.when(is_local)
+            def _():
+                pltpu.make_async_copy(src, dst, ex.sems.at[1]).start()
+
+            @pl.when(jnp.logical_not(is_local))
+            def _():
+                pltpu.make_async_remote_copy(
+                    src,
+                    dst,
+                    ex.sems.at[0],
+                    ex.sems.at[2],
+                    device_id=member_device(member, sc.axis, sc.num_members),
+                    device_id_type=pl.DeviceIdType.MESH,
+                ).start()
+
+            local = is_local.astype(jnp.int32)
+            return counts[0] + 1 - local, counts[1] + local
+
+        remote, local = lax.fori_loop(
+            0, ex.expected[1], send, (jnp.int32(0), jnp.int32(0))
+        )
+        ex.counts[0] = remote
+        ex.counts[1] = local
+
+    def send_tile_rows(slot, m_offset, m_start_local, m_end_local):
+        """Send the tile's rows from stage `slot`: row `i` of the block is row
+        `m_offset + i` of lhs, bound for row `dest_row` of member
+        `dest_member`'s receive buffer (a local copy for this member)."""
+        sc = scatter
+        assert sc is not None
+        me = sc.me[0]
+
+        def send(i, counts):
+            row = m_offset + i
+            member = sc.dest_member[row]
+            src = sc.stage.at[slot, pl.ds(i, 1)]
+            dst = sc.recv.at[pl.ds(sc.dest_row[row], 1)]
+            is_local = member == me
+
+            @pl.when(is_local)
+            def _():
+                pltpu.make_async_copy(src, dst, sc.local_sems.at[slot]).start()
+
+            @pl.when(jnp.logical_not(is_local))
+            def _():
+                pltpu.make_async_remote_copy(
+                    src,
+                    dst,
+                    sc.send_sems.at[slot],
+                    sc.recv_sem.at[0],
+                    device_id=member_device(member, sc.axis, sc.num_members),
+                    device_id_type=pl.DeviceIdType.MESH,
+                ).start()
+
+            local = is_local.astype(jnp.int32)
+            return counts[0] + 1 - local, counts[1] + local
+
+        remote, local = lax.fori_loop(
+            m_start_local, m_end_local, send, (jnp.int32(0), jnp.int32(0))
+        )
+        sc.in_flight[slot] = remote
+        sc.in_flight[2 + slot] = local
+
+    def body(tiled_lhs_ref, tiled_out_ref=None):
+        gm_id = pl.program_id(0)
+        slot = lax.rem(gm_id, 2) if scatter is not None else None
+        group_id = metadata_ref.gm_id_to_group_id[gm_id]
+        prev_group_id = metadata_ref.gm_id_to_group_id[jnp.maximum(gm_id - 1, 0)]
+        is_new_group = jnp.logical_or(gm_id == 0, prev_group_id != group_id)
+        has_next = gm_id + 1 < num_gm
+        next_group_id = metadata_ref.gm_id_to_group_id[
+            jnp.minimum(gm_id + 1, num_gm - 1)
+        ]
+        fetch_next = jnp.logical_and(has_next, next_group_id != group_id)
+
+        m_start = metadata_ref.gm_id_to_m_offset[gm_id]
+        m_end = metadata_ref.gm_id_to_m_offset[gm_id + 1]
+        m_offset = m_start - m_start % sub
+        m_start_local = m_start - m_offset
+        m_end_local = m_end - m_offset
+
+        def row_mask(shape):
+            iota = lax.broadcasted_iota(jnp.int32, shape, 0)
+            return jnp.logical_and(m_start_local <= iota, iota < m_end_local)
+
+        def up_part(p: int, bucket_m: int):
+            tiled_lhs = tiled_lhs_ref.reshape(-1, size_k)[:bucket_m]
+            gate = WeightsRef(
+                weight=w1_gate_slots.at[p], scale=s1_gate_slots.at[p], bias=None
+            )
+            up_w = WeightsRef(
+                weight=w1_up_slots.at[p], scale=s1_up_slots.at[p], bias=None
+            )
+            acc = scaled_matmul(
+                tiled_lhs, FusedWeightsRef(gate=gate, up=up_w), up, bucket_m
+            )
+            acc = apply_act_fn(acc, up.fuse_act)
+            acc_masked = jnp.where(row_mask(acc.shape), acc, 0)
+            inter_2d = inter_ref.reshape(-1, size_inter)
+            inter_2d[:bucket_m, p * part : (p + 1) * part] = acc_masked.astype(
+                inter_ref.dtype
+            )
+
+        def down_part_fn(q: int, bucket_m: int):
+            tiled_lhs = inter_ref.reshape(-1, size_inter)[:bucket_m]
+            rhs = WeightsRef(weight=w2_slots.at[q], scale=s2_slots.at[q], bias=None)
+            acc = scaled_matmul(tiled_lhs, rhs, down, bucket_m)
+            acc_masked = jnp.where(row_mask(acc.shape), acc, 0)
+            if scatter is not None:
+                # Rows as whole tiles, so each one can leave at any offset.
+                stage = scatter.stage
+                stage[slot, :bucket_m] = acc_masked.astype(stage.dtype).reshape(
+                    bucket_m, stage.shape[2], stage.shape[3]
+                )
+                return
+            assert tiled_out_ref is not None
+            tiled_out_2d_ref = tiled_out_ref.reshape(-1, size_n)
+            tiled_out_2d_ref[:bucket_m, q * down_part : (q + 1) * down_part] = (
+                acc_masked.astype(tiled_out_ref.dtype)
+            )
+
+        # Smallest bucket holding the rows up to m_end_local.
+        bucket_ms = cfgs.bucket_ms
+        bucket_idx = sum(
+            (m_end_local > b).astype(jnp.int32) for b in bucket_ms[:-1]
+        ) + jnp.int32(0)
+
+        for p in range(cfgs.num_parts):
+            with jax.named_scope(f"mlp_wait_up{p}"):
+
+                @pl.when(is_new_group)
+                def _(p=p):
+                    wait(up_copies(p, group_id))
+
+            with jax.named_scope(f"mlp_up{p}"):
+                lax.switch(
+                    bucket_idx,
+                    [functools.partial(up_part, p, b) for b in bucket_ms],
+                )
+
+            @pl.when(fetch_next)
+            def _(p=p):
+                start(up_copies(p, next_group_id))
+
+        # The gate/up kernel stores its rows with `out[0] += partial` in each of
+        # its gm tiles, and the next tile adds this tile's last partial sublane
+        # block: x + 0 there. Its tiles start where a group starts and every
+        # up.tiles.tile_m rows after the group's first sublane block.
+        @pl.when(is_new_group)
+        def _():
+            group_start_ref[0] = m_start
+
+        group_block = group_start_ref[0] - group_start_ref[0] % sub
+
+        @pl.when(
+            jnp.logical_or(is_new_group, (m_start - group_block) % up.tiles.tile_m == 0)
+        )
+        def _():
+            inter_ref[0] = inter_ref[0] + jnp.zeros_like(inter_ref[0])
+
+        @pl.when(jnp.logical_and(m_end_local % sub != 0, has_next))
+        def _():
+            last_row = m_end_local // sub
+            inter_ref[last_row] = inter_ref[last_row] + jnp.zeros_like(inter_ref[0])
+
+        if scatter is not None:
+            with jax.named_scope("mlp_wait_stage"):
+                # The stage slot's rows from two tiles ago have left.
+                wait_rows(
+                    scatter.send_sems.at[slot], scatter.recv, scatter.in_flight[slot]
+                )
+                wait_rows(
+                    scatter.local_sems.at[slot],
+                    scatter.recv,
+                    scatter.in_flight[2 + slot],
+                )
+
+        for q in range(cfgs.down_parts):
+            with jax.named_scope(f"mlp_wait_down{q}"):
+
+                @pl.when(is_new_group)
+                def _(q=q):
+                    wait(down_copies(q, group_id))
+
+            with jax.named_scope(f"mlp_down{q}"):
+                lax.switch(
+                    bucket_idx,
+                    [functools.partial(down_part_fn, q, b) for b in bucket_ms],
+                )
+
+            @pl.when(fetch_next)
+            def _(q=q):
+                start(down_copies(q, next_group_id))
+
+        if scatter is not None:
+            with jax.named_scope("mlp_send_rows"):
+                send_tile_rows(slot, m_offset, m_start_local, m_end_local)
+            return
+
+        # Output rows as the down kernel stores them (see inner_kernel).
+        assert tiled_out_ref is not None and partial_out_ref is not None
+        partial_out_zeros = jnp.zeros_like(partial_out_ref)
+        tiled_out_ref[0] += jnp.where(
+            gm_id == 0, partial_out_zeros, partial_out_ref[...]
+        )
+        last_row = m_end_local // sub
+        partial_out_ref[...] = jnp.where(
+            m_end_local % sub == 0,
+            partial_out_zeros,
+            tiled_out_ref[last_row],
+        )
+
+    index_maps = MlpIndexMaps(metadata_ref, sub)
+    bounded = pl.BoundedSlice(tile_m // sub)
+    lhs_spec = pl.BlockSpec((bounded, sub, size_k), index_maps.lhs_index_map)
+    lhs_in = lhs_ref.reshape(-1, sub, lhs_ref.shape[-1])
+    if scatter is not None:
+        if scatter.extra is not None:
+            send_extra_rows(scatter, scatter.extra)
+        pipeline_fn = pltpu.emit_pipeline(body, grid=(num_gm,), in_specs=(lhs_spec,))
+        pipeline_fn(lhs_in)
+        # Every row sent from here has left, and every row bound here has landed.
+        for i in range(2):
+            wait_rows(scatter.send_sems.at[i], scatter.recv, scatter.in_flight[i])
+            wait_rows(scatter.local_sems.at[i], scatter.recv, scatter.in_flight[2 + i])
+        wait_rows(scatter.recv_sem.at[0], scatter.recv, scatter.expected[0])
+        ex = scatter.extra
+        if ex is not None:
+            wait_rows(ex.sems.at[0], ex.recv, ex.counts[0])
+            wait_rows(ex.sems.at[1], ex.recv, ex.counts[1])
+            wait_rows(ex.sems.at[2], ex.recv, ex.expected[0])
+        if scatter.tail is not None:
+            _owner_tail(scatter, scatter.tail)
+        return
+    out_spec = pl.BlockSpec((bounded, sub, size_n), index_maps.out_index_map)
+    pipeline_fn = pltpu.emit_pipeline(
+        body, grid=(num_gm,), in_specs=(lhs_spec,), out_specs=out_spec
+    )
+    out_in = out_ref.reshape(-1, sub, out_ref.shape[-1])
+    pipeline_fn(lhs_in, out_in)
+
+
+def mlp_supported(
+    lhs: jax.Array,
+    w1: jax.Array,
+    w1_scale: jax.Array | None,
+    w2: jax.Array,
+    w2_scale: jax.Array | None,
+    group_sizes: jax.Array,
+    *,
+    fuse_act: str | None,
+    num_parts: int = 2,
+    down_parts: int = 1,
+    buckets: tuple[int, ...] | None = None,
+    tile_rows: int | None = None,
+    maybe_quantize_lhs: bool = False,
+    rhs_quant_dtype: jnp.dtype | None = None,
+) -> bool:
+    """Whether `gmm_v2_mlp` takes these inputs (static shapes and dtypes)."""
+
+    if fuse_act is None or w1_scale is None or w2_scale is None:
+        return False
+    if w1_scale.ndim != 4 or w2_scale.ndim != 4:
+        return False
+    sub = _get_lhs_sublane_size(lhs.dtype, lhs.shape[0])
+    padded = jax.ShapeDtypeStruct(
+        (align_to(lhs.shape[0], sub), lhs.shape[1]), lhs.dtype
+    )
+    cfgs = make_mlp_configs(
+        padded,
+        w1,
+        w1_scale,
+        w2,
+        w2_scale,
+        group_sizes,
+        jax.ShapeDtypeStruct((1,), jnp.int32),
+        fuse_act=fuse_act,
+        num_parts=num_parts,
+        down_parts=down_parts,
+        buckets=buckets,
+        tile_rows=tile_rows,
+        maybe_quantize_lhs=maybe_quantize_lhs,
+        rhs_quant_dtype=rhs_quant_dtype,
+    )
+    return cfgs is not None
+
+
+class MlpIndexMaps:
+    """Row windows of the fused kernel's single grid axis (gm tiles)."""
+
+    def __init__(self, metadata_ref: MetadataRef, size_lhs_sublane: int):
+        self.metadata_ref = metadata_ref
+        self.sub = size_lhs_sublane
+
+    def lhs_index_map(self, gm_id: jax.Array):
+        m_start = self.metadata_ref.gm_id_to_m_offset[gm_id]
+        m_end = self.metadata_ref.gm_id_to_m_offset[gm_id + 1]
+        row_start = m_start // self.sub
+        row_end = pl.cdiv(m_end, self.sub)
+        return (pl.ds(row_start, row_end - row_start), 0, 0)
+
+    def out_index_map(self, gm_id: jax.Array):
+        is_last_gm = gm_id == (pl.num_programs(0) - 1)
+        m_start = self.metadata_ref.gm_id_to_m_offset[gm_id]
+        m_end = self.metadata_ref.gm_id_to_m_offset[gm_id + 1]
+        row_start = m_start // self.sub
+        capped_row_end = m_end // self.sub
+        last_row_end = pl.cdiv(m_end, self.sub)
+        row_end = jnp.where(is_last_gm, last_row_end, capped_row_end)
+        return (pl.ds(row_start, row_end - row_start), 0, 0)
+
+
+@jax.jit(
+    static_argnames=[
+        "fuse_act",
+        "num_parts",
+        "down_parts",
+        "buckets",
+        "tile_rows",
+        "vmem_limit_bytes",
+        "maybe_quantize_lhs",
+        "rhs_quant_dtype",
+    ]
+)
+def gmm_v2_mlp(
+    lhs: jax.Array,  # [size_m, size_k]
+    w1: jax.Array,  # [size_group, size_k, 2 * size_inter]
+    w2: jax.Array,  # [size_group, size_inter, size_n]
+    group_sizes: jax.Array,  # int32[size_lhs_group]
+    w1_scale: jax.Array,  # [size_group, num_blocks, 1, 2 * size_inter]
+    w2_scale: jax.Array,  # [size_group, num_blocks, 1, size_n]
+    group_offset: jax.Array | None = None,  # int32[1]
+    *,
+    fuse_act: str,
+    num_parts: int = 2,
+    down_parts: int = 1,
+    buckets: tuple[int, ...] | None = None,
+    tile_rows: int | None = None,
+    vmem_limit_bytes: int | None = None,
+    maybe_quantize_lhs: bool = True,
+    rhs_quant_dtype: jnp.dtype | None = None,
+) -> jax.Array:
+    """`gmm_v2(gmm_v2(lhs, w1, fuse_act), w2)` in one kernel, same results.
+
+    Rows past the routed rows are not written, as in `gmm_v2` without zero
+    initialization. Raises ValueError if the shapes or dtypes are not supported
+    (see `make_mlp_configs`); `mlp_supported` tells beforehand.
+    """
+
+    size_m = lhs.shape[0]
+    size_lhs_sublane = _get_lhs_sublane_size(lhs.dtype, size_m)
+    padded_size_m = align_to(size_m, size_lhs_sublane)
+    if padded_size_m != size_m:
+        lhs = jnp.pad(lhs, ((0, padded_size_m - size_m), (0, 0)))
+
+    if group_offset is None:
+        group_offset = jnp.array([0], dtype=jnp.int32)
+    elif jnp.isscalar(group_offset):
+        group_offset = group_offset[None]
+
+    if vmem_limit_bytes is None:
+        # The weight slots, row tiles and the matmul temporaries of the
+        # 128-row bucket need ~58 MiB at the Qwen3.8 expert shapes.
+        vmem_limit_bytes = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.96)
+
+    cfgs = make_mlp_configs(
+        lhs,
+        w1,
+        w1_scale,
+        w2,
+        w2_scale,
+        group_sizes,
+        group_offset,
+        fuse_act=fuse_act,
+        num_parts=num_parts,
+        down_parts=down_parts,
+        buckets=buckets,
+        tile_rows=tile_rows,
+        maybe_quantize_lhs=maybe_quantize_lhs,
+        rhs_quant_dtype=rhs_quant_dtype,
+    )
+    if cfgs is None:
+        raise ValueError("gmm_v2_mlp does not support these inputs")
+    up, down = cfgs.up, cfgs.down
+    dims = up.dims
+    sub = dims.size_lhs_sublane
+    part = cfgs.part_size
+    down_part = cfgs.down_part_size
+    size_n = down.dims.size_n
+
+    w1_scale = w1_scale.astype(jnp.float32)
+    w2_scale = w2_scale.astype(jnp.float32)
+    nb1 = w1_scale.shape[1]
+    nb2 = w2_scale.shape[1]
+
+    max_num_gm = dims.size_group + pl.cdiv(dims.size_m, cfgs.tile_m) - 1
+    scratch_shapes = [
+        pltpu.VMEM((num_parts, dims.size_k, part), w1.dtype),
+        pltpu.VMEM((num_parts, dims.size_k, part), w1.dtype),
+        pltpu.VMEM((num_parts, nb1, 1, part), jnp.float32),
+        pltpu.VMEM((num_parts, nb1, 1, part), jnp.float32),
+        pltpu.VMEM((down_parts, cfgs.size_inter, down_part), w2.dtype),
+        pltpu.VMEM((down_parts, nb2, 1, down_part), jnp.float32),
+        pltpu.VMEM((cfgs.tile_m // sub, sub, cfgs.size_inter), up.out_dtype),
+        pltpu.VMEM((sub, size_n), down.out_dtype),
+        MetadataRef(
+            gm_id_to_group_id=pltpu.SMEM((max_num_gm,), jnp.int32),
+            gm_id_to_m_offset=pltpu.SMEM((max_num_gm + 1,), jnp.int32),
+        ),
+        pltpu.SMEM((1,), jnp.int32),
+        pltpu.SemaphoreType.DMA((num_parts + down_parts,)),
+    ]
+
+    num_lanes = pltpu.get_tpu_info().num_lanes
+    aligned_n = align_to(size_n, num_lanes)
+    out_init = jax.ShapeDtypeStruct((dims.size_m, aligned_n), down.out_dtype)
+    cost_up = get_cost_estimate(up)
+    cost_down = get_cost_estimate(down)
+    cost = pl.CostEstimate(
+        flops=cost_up.flops + cost_down.flops,
+        bytes_accessed=cost_up.bytes_accessed + cost_down.bytes_accessed,
+        transcendentals=0,
+    )
+    name = (
+        f"gmm_v2_mlp-g_{dims.size_group}-m_{dims.size_m}-k_{dims.size_k}"
+        f"-act_{fuse_act}-n_{dims.size_n}-n2_{size_n}-tm_{cfgs.tile_m}"
+        f"-bm_{'_'.join(map(str, cfgs.bucket_ms))}-p_{num_parts}-q_{down_parts}"
+    )
+    hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+    return pl.pallas_call(
+        functools.partial(mlp_kernel_main, cfgs=cfgs),
+        out_shape=out_init,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=2,
+            in_specs=[hbm] * 5,
+            out_specs=hbm,
+            scratch_shapes=scratch_shapes,
+        ),
+        compiler_params=pltpu.CompilerParams(
+            vmem_limit_bytes=vmem_limit_bytes,
+            disable_bounds_checks=True,
+        ),
+        name=name,
+        cost_estimate=cost,
+    )(group_sizes, group_offset, lhs, w1, w1_scale, w2, w2_scale)[:size_m, :size_n]
+
+
+def mlp_scatter_kernel_main(
+    *refs,
+    cfgs: MlpConfigs,
+    axis,
+    num_members,
+    extra: bool,
+    tail: tuple[int, int] | None = None,
+):
+    """Entry point of `gmm_v2_mlp_scatter` (refs: scalar prefetch, inputs,
+    outputs, scratch; the `extra` ones present when `extra`, the owner tail's
+    when `tail` = (TP ranks, tokens per chunk))."""
+    refs = list(refs)
+
+    def take(n):
+        out = refs[:n]
+        del refs[:n]
+        return out
+
+    group_sizes, group_offset, dest_member, dest_row, me, expected = take(6)
+    extra_prefetch = take(3) if extra else []
+    tail_prefetch = take(5) if tail else []
+    lhs, w1, s1, w2, s2 = take(5)
+    extra_inputs = take(1) if extra else []
+    recv = take(1)[0]
+    extra_outputs = take(1) if extra else []
+    tail_outputs = take(1) if tail else []
+    (
+        w1_gate_slots,
+        w1_up_slots,
+        s1_gate_slots,
+        s1_up_slots,
+        w2_slots,
+        s2_slots,
+        inter_ref,
+        metadata_ref,
+        group_start_ref,
+        sems,
+        stage_ref,
+        send_sems,
+        local_sems,
+        recv_sem,
+        in_flight_ref,
+    ) = take(15)
+    extra_scratch = take(2) if extra else []
+    tail_scratch = take(2) if tail else []
+    assert not refs
+    extra_refs = None
+    if extra:
+        extra_member, extra_row, extra_expected = extra_prefetch
+        (extra_rows,) = extra_inputs
+        (extra_recv,) = extra_outputs
+        extra_sems, extra_counts = extra_scratch
+        extra_refs = ExtraRowRefs(
+            rows=extra_rows,
+            member=extra_member,
+            row=extra_row,
+            expected=extra_expected,
+            recv=extra_recv,
+            sems=extra_sems,
+            counts=extra_counts,
+        )
+    tail_refs = None
+    if tail:
+        tp_rank, dp_pos, sent, weight, fits = tail_prefetch
+        tail_sems, tail_recv_sems = tail_scratch
+        tail_refs = OwnerTailRefs(
+            tp_rank=tp_rank,
+            dp_pos=dp_pos,
+            sent=sent,
+            weight=weight,
+            fits=fits,
+            out=tail_outputs[0],
+            sems=tail_sems,
+            recv_sems=tail_recv_sems,
+            tp_size=tail[0],
+            chunk=tail[1],
+        )
+    _mlp_kernel(
+        group_sizes,
+        group_offset,
+        lhs,
+        w1,
+        s1,
+        w2,
+        s2,
+        w1_gate_slots,
+        w1_up_slots,
+        s1_gate_slots,
+        s1_up_slots,
+        w2_slots,
+        s2_slots,
+        inter_ref,
+        metadata_ref,
+        group_start_ref,
+        sems,
+        cfgs=cfgs,
+        out_ref=None,
+        partial_out_ref=None,
+        scatter=ScatterRefs(
+            dest_member=dest_member,
+            dest_row=dest_row,
+            me=me,
+            expected=expected,
+            recv=recv,
+            stage=stage_ref,
+            send_sems=send_sems,
+            local_sems=local_sems,
+            recv_sem=recv_sem,
+            in_flight=in_flight_ref,
+            axis=axis,
+            num_members=num_members,
+            extra=extra_refs,
+            tail=tail_refs,
+        ),
+    )
+
+
+# Sublanes of one row in the receive buffer: a bf16 row of H elements is one
+# [16, H / 16] block of whole tiles.
+SCATTER_ROW_SUBLANES = 16
+
+
+def scatter_rows_supported(dtype, size_n: int) -> bool:
+    return (
+        jnp.dtype(dtype) == jnp.bfloat16 and size_n % (SCATTER_ROW_SUBLANES * 128) == 0
+    )
+
+
+@jax.jit(
+    static_argnames=[
+        "num_recv_rows",
+        "num_extra_recv_rows",
+        "axis",
+        "num_members",
+        "collective_id",
+        "fuse_act",
+        "num_parts",
+        "buckets",
+        "tile_rows",
+        "vmem_limit_bytes",
+        "maybe_quantize_lhs",
+        "rhs_quant_dtype",
+    ]
+)
+def gmm_v2_mlp_scatter(
+    lhs: jax.Array,  # [size_m, size_k]
+    w1: jax.Array,  # [size_group, size_k, 2 * size_inter]
+    w2: jax.Array,  # [size_group, size_inter, size_n]
+    group_sizes: jax.Array,  # int32[size_lhs_group]
+    w1_scale: jax.Array,  # [size_group, num_blocks, 1, 2 * size_inter]
+    w2_scale: jax.Array,  # [size_group, num_blocks, 1, size_n]
+    group_offset: jax.Array,  # int32[1]
+    dest_member: jax.Array,  # int32[size_m]
+    dest_row: jax.Array,  # int32[size_m]
+    me: jax.Array,  # int32[1]
+    expected: jax.Array,  # int32[1]
+    extra: tuple[jax.Array, ...] | None = None,
+    tail: tuple[jax.Array, ...] | None = None,
+    *,
+    num_recv_rows: int,
+    num_extra_recv_rows: int = 0,
+    axis: str | tuple[str, ...],
+    num_members: int | tuple[int, ...],
+    collective_id: int,
+    fuse_act: str,
+    num_parts: int = 2,
+    buckets: tuple[int, ...] | None = None,
+    tile_rows: int | None = None,
+    vmem_limit_bytes: int | None = None,
+    maybe_quantize_lhs: bool = True,
+    rhs_quant_dtype: jnp.dtype | None = None,
+) -> jax.Array:
+    """`gmm_v2_mlp` whose output rows go to their owners as they are computed.
+
+    A collective kernel over the `num_members` members of mesh axis `axis`
+    (other mesh axes keep the caller's coordinate), or over the members of
+    several axes given as tuples, numbered row-major. Output row `j` (a routed
+    row of lhs) is sent to row `dest_row[j]` of member `dest_member[j]`'s
+    receive buffer as soon as its tile's down projection is done, while the
+    following experts compute; rows for this member (`me`) are local copies.
+    Returns this member's receive buffer `[num_recv_rows, 16, size_n / 16]`
+    once its own rows have left and `expected` rows sent by the other members
+    have landed. Rows nobody writes keep stale data. Row values are the ones
+    `gmm_v2_mlp` returns.
+
+    `extra` = (rows [n, 16, size_n / 16], member [n], row [n], counts [2]):
+    the first `counts[1]` rows are sent once at entry to row `row` of member
+    `member`'s second receive buffer `[num_extra_recv_rows, ...]`, overlapping
+    the expert compute; `counts[0]` rows land here. Then the result is
+    (receive, second receive).
+
+    `tail` = (tp_rank, dp_pos, sent, weight, fits): the owner combine's tail,
+    with the members given over a (DP, TP) pair of axes, an engine's TP ranks
+    along the second. The [K, blk] arrays describe this member's owned tokens
+    as `owner_token_sum` reads them; route position `j` of owned token `i`
+    lands at receive row `j * blk + i` and TP rank `r`'s shared partial of it
+    (with `extra`) at second-receive row `r * blk + i`. Once every row bound
+    here has landed, the kernel sums its owned tokens a few at a time and
+    copies each summed chunk to its rows of the result on every TP rank of
+    its engine (at 4 TP ranks, ranks 2k and 2k + 1 being the cores of one
+    chip, a chunk crosses to the other chip once and is forwarded there).
+    Then the result is the engine's sums `[tp * blk, 16, size_n / 16]`, owned
+    block by owned block, returned once this member's copies have left and
+    the other ranks' blocks have landed. `fits[0]` = 0: no sums, no copies.
+    """
+
+    size_m = lhs.shape[0]
+    size_lhs_sublane = _get_lhs_sublane_size(lhs.dtype, size_m)
+    padded_size_m = align_to(size_m, size_lhs_sublane)
+    if padded_size_m != size_m:
+        lhs = jnp.pad(lhs, ((0, padded_size_m - size_m), (0, 0)))
+        dest_member = jnp.pad(dest_member, (0, padded_size_m - size_m))
+        dest_row = jnp.pad(dest_row, (0, padded_size_m - size_m))
+
+    if vmem_limit_bytes is None:
+        vmem_limit_bytes = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.96)
+
+    cfgs = make_mlp_configs(
+        lhs,
+        w1,
+        w1_scale,
+        w2,
+        w2_scale,
+        group_sizes,
+        group_offset,
+        fuse_act=fuse_act,
+        num_parts=num_parts,
+        down_parts=1,
+        buckets=buckets,
+        tile_rows=tile_rows,
+        maybe_quantize_lhs=maybe_quantize_lhs,
+        rhs_quant_dtype=rhs_quant_dtype,
+    )
+    if cfgs is None or not scatter_rows_supported(lhs.dtype, cfgs.down.dims.size_n):
+        raise ValueError("gmm_v2_mlp_scatter does not support these inputs")
+    up, down = cfgs.up, cfgs.down
+    dims = up.dims
+    sub = dims.size_lhs_sublane
+    part = cfgs.part_size
+    size_n = down.dims.size_n
+    row_sub = SCATTER_ROW_SUBLANES
+
+    w1_scale = w1_scale.astype(jnp.float32)
+    w2_scale = w2_scale.astype(jnp.float32)
+    nb1 = w1_scale.shape[1]
+    nb2 = w2_scale.shape[1]
+
+    tail_cfg = None
+    stage_rows = cfgs.tile_m
+    if tail is not None:
+        tp_size = num_members[-1] if isinstance(num_members, tuple) else 0
+        topk, blk = tail[0].shape
+        if (
+            not isinstance(axis, tuple)
+            or len(axis) != 2
+            or num_recv_rows != topk * blk
+            or (extra is not None and num_extra_recv_rows != tp_size * blk)
+        ):
+            raise ValueError("gmm_v2_mlp_scatter does not support this owner tail")
+        # A stage slot holds a chunk's K route rows, shared rows and sums per
+        # token (grown past a tile only where one token's rows do not fit).
+        per_token = topk + (0 if extra is None else tp_size) + 1
+        chunk = next(
+            c
+            for c in (4, 2, 1)
+            if per_token * c <= max(cfgs.tile_m, per_token) and cfgs.tile_m % c == 0
+        )
+        stage_rows = max(cfgs.tile_m, per_token * chunk)
+        tail_cfg = (tp_size, chunk)
+
+    max_num_gm = dims.size_group + pl.cdiv(dims.size_m, cfgs.tile_m) - 1
+    scratch_shapes = [
+        pltpu.VMEM((num_parts, dims.size_k, part), w1.dtype),
+        pltpu.VMEM((num_parts, dims.size_k, part), w1.dtype),
+        pltpu.VMEM((num_parts, nb1, 1, part), jnp.float32),
+        pltpu.VMEM((num_parts, nb1, 1, part), jnp.float32),
+        pltpu.VMEM((1, cfgs.size_inter, size_n), w2.dtype),
+        pltpu.VMEM((1, nb2, 1, size_n), jnp.float32),
+        pltpu.VMEM((cfgs.tile_m // sub, sub, cfgs.size_inter), up.out_dtype),
+        MetadataRef(
+            gm_id_to_group_id=pltpu.SMEM((max_num_gm,), jnp.int32),
+            gm_id_to_m_offset=pltpu.SMEM((max_num_gm + 1,), jnp.int32),
+        ),
+        pltpu.SMEM((1,), jnp.int32),
+        pltpu.SemaphoreType.DMA((num_parts + 1,)),
+        pltpu.VMEM((2, stage_rows, row_sub, size_n // row_sub), lhs.dtype),
+        pltpu.SemaphoreType.DMA((2,)),
+        pltpu.SemaphoreType.DMA((2,)),
+        pltpu.SemaphoreType.DMA((1,)),
+        pltpu.SMEM((4,), jnp.int32),
+    ]
+    if extra is not None:
+        scratch_shapes += [pltpu.SemaphoreType.DMA((3,)), pltpu.SMEM((2,), jnp.int32)]
+    cost_up = get_cost_estimate(up)
+    cost_down = get_cost_estimate(down)
+    cost = pl.CostEstimate(
+        flops=cost_up.flops + cost_down.flops,
+        bytes_accessed=cost_up.bytes_accessed + cost_down.bytes_accessed,
+        transcendentals=0,
+    )
+    name = (
+        f"gmm_v2_mlp_scatter-g_{dims.size_group}-m_{dims.size_m}-k_{dims.size_k}"
+        f"-act_{fuse_act}-n_{dims.size_n}-n2_{size_n}-tm_{cfgs.tile_m}"
+        f"-bm_{'_'.join(map(str, cfgs.bucket_ms))}-p_{num_parts}-c{collective_id}"
+    )
+    hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+    recv_shape = pltpu.HBM((num_recv_rows, row_sub, size_n // row_sub), lhs.dtype)
+    prefetch = [group_sizes, group_offset, dest_member, dest_row, me, expected]
+    inputs = [lhs, w1, w1_scale, w2, w2_scale]
+    out_shape = recv_shape
+    out_specs = hbm
+    if extra is not None:
+        extra_rows, extra_member, extra_row, extra_expected = extra
+        prefetch += [extra_member, extra_row, extra_expected]
+        inputs += [pltpu.with_memory_space_constraint(extra_rows, pltpu.HBM)]
+        out_shape = (
+            recv_shape,
+            pltpu.HBM((num_extra_recv_rows,) + extra_rows.shape[1:], extra_rows.dtype),
+        )
+        out_specs = (hbm, hbm)
+        name += "-x"
+    if tail is not None and tail_cfg is not None:
+        tp_size, chunk = tail_cfg
+        blk = tail[0].shape[1]
+        prefetch += list(tail)
+        result = pltpu.HBM((tp_size * blk, row_sub, size_n // row_sub), lhs.dtype)
+        out_shape = (out_shape, result) if extra is None else (*out_shape, result)
+        out_specs = (hbm,) * len(out_shape)
+        scratch_shapes += [
+            pltpu.SemaphoreType.DMA((7,)),
+            pltpu.SemaphoreType.DMA((1 + pl.cdiv(blk, chunk),)),
+        ]
+        name += "-t"
+    # The receive buffers and the owner tail's result are pinned to HBM: other
+    # members write into them.
+    out = pl.pallas_call(
+        functools.partial(
+            mlp_scatter_kernel_main,
+            cfgs=cfgs,
+            axis=axis,
+            num_members=num_members,
+            extra=extra is not None,
+            tail=tail_cfg,
+        ),
+        out_shape=out_shape,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=len(prefetch),
+            in_specs=[hbm] * len(inputs),
+            out_specs=out_specs,
+            scratch_shapes=scratch_shapes,
+        ),
+        compiler_params=pltpu.CompilerParams(
+            vmem_limit_bytes=vmem_limit_bytes,
+            disable_bounds_checks=True,
+            collective_id=collective_id,
+        ),
+        name=name,
+        cost_estimate=cost,
+    )(*prefetch, *inputs)
+    return out if tail is None else out[-1]

@@ -30,7 +30,7 @@ import jax
 import jax.numpy as jnp
 
 
-def _typed_view(block_ref, view_dtype, lane_split: int):
+def typed_view(block_ref, view_dtype, lane_split: int):
     """Raw block ref as a ``(rows, lanes // lane_split)`` view_dtype ref."""
     if jnp.dtype(block_ref.dtype) != jnp.dtype(view_dtype):
         block_ref = block_ref.bitcast(jnp.dtype(view_dtype))
@@ -39,11 +39,11 @@ def _typed_view(block_ref, view_dtype, lane_split: int):
 
 def load_typed(block_ref, *, view_dtype, lane_split: int = 1) -> jax.Array:
     """Reads a raw block ref as ``(rows, lanes // lane_split)`` view_dtype."""
-    return _typed_view(block_ref, view_dtype, lane_split)[...]
+    return typed_view(block_ref, view_dtype, lane_split)[...]
 
 
 def store_typed(block_ref, values: jax.Array, *, lane_split: int = 1) -> None:
     """Inverse of ``load_typed``: stores ``values`` through a typed view of
     the raw block ref, which is fully written."""
-    ref = _typed_view(block_ref, values.dtype, lane_split)
+    ref = typed_view(block_ref, values.dtype, lane_split)
     ref[...] = values.reshape(ref.shape)
