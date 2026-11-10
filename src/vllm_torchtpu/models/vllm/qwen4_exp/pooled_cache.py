@@ -394,16 +394,28 @@ class Qwen4ExpPooledCache:
             spec = group.kv_cache_spec
             state = isinstance(spec, MambaSpec)
             ring = isinstance(spec, CircularBufferSpec)
+            # A state group's table is read only through its state and
+            # checkpoint indices, so `window` columns trace it. With the tail
+            # fold, `prefill_checkpoint_targets` also gathers each row's
+            # checkpoint block from the whole table inside the forward, so
+            # the compiled program (no guards) must trace the row width that
+            # serving stages: cdiv(max_model_len, block) + speculative
+            # blocks. A `window`-wide trace made the first served step pass
+            # s32[rows * 515] to a program built for s32[rows * 4]
+            # (RuntimeProgramInputMismatch).
+            wide = not state or prefill_ckpt is not None
             columns = (
-                window
-                if state
-                else get_block_table_width(
+                get_block_table_width(
                     spec.max_num_blocks_per_req(
                         self.runner.vllm_config, self.runner.max_model_len
                     ),
                     spec.block_size,
                 )
+                if wide
+                else window
             )
+            if state:
+                columns = max(columns, window)
             table = torch.zeros((rows, columns), dtype=torch.int32, device="cpu")
             for row in range(active_rows):
                 req_blocks = max(
@@ -428,7 +440,9 @@ class Qwen4ExpPooledCache:
                     item,
                     mamba_state_indices=table[:, 0].clone(),
                     mamba_slot_read_offsets=read_offsets,
-                    mamba_ckpt_indices=table.clone(),
+                    mamba_ckpt_indices=(
+                        table[:, :window].clone() if columns > window else table.clone()
+                    ),
                     mamba_request_distribution=mamba_distribution,
                 )
             if state and prefill_ckpt is not None:
