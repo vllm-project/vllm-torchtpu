@@ -371,6 +371,8 @@ def test_async_substitution_uploads_one_index_tensor(fast):
         _pre_async_results=SimpleNamespace(
             next_tokens_tpu=torch.arange(4, dtype=torch.int64)
         ),
+        _registered_h2d_sources=set(),
+        _unfenced_h2d_sources=[],
     )
     input_ids = torch.zeros(num_tokens, dtype=torch.int32)
     with patch.object(tpu_runner, "_substitute_placeholder_token") as kernel:
@@ -385,3 +387,6 @@ def test_async_substitution_uploads_one_index_tensor(fast):
     np.testing.assert_array_equal(second.numpy(), expected)
     # The fast path's cache hands the same device tensor to the second step.
     assert (first is second) == fast
+    # The uncached path stages each temporary host source until the next
+    # input-staging fence; the cached path uploads synchronously.
+    assert len(runner._unfenced_h2d_sources) == (0 if fast else 2)
