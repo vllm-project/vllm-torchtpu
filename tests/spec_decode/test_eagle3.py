@@ -1803,7 +1803,17 @@ def test_build_draft_attn_metadata_reuses_target_metadata(device):
     md0 = proposer._build_draft_attn_metadata(
         chunk, step_idx=0, seq_lens_delta=0, num_rejected_np=None
     )
-    assert md0 == {"draft.attn.0": shared, "draft.attn.1": shared}
+    assert set(md0) == {"draft.attn.0", "draft.attn.1"}
+    assert md0["draft.attn.0"] is md0["draft.attn.1"]
+    step0_md = md0["draft.attn.0"]
+    # Step 0 uses the target's tensors. On TPU only request_distribution is
+    # swapped for a base copy of the same values (_with_base_request_distribution).
+    assert step0_md.block_tables is shared.block_tables
+    assert step0_md.seq_lens is shared.seq_lens
+    assert step0_md.query_start_loc is shared.query_start_loc
+    assert torch.equal(
+        step0_md.request_distribution.cpu(), shared.request_distribution.cpu()
+    )
 
     loop_input_deltas = []
     loop_step_attn_inputs = proposer._loop_step_attn_inputs
