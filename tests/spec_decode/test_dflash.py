@@ -1115,3 +1115,12 @@ def test_draft_forward_stays_mixed_without_a_matching_decode_tile(impls):
     assert proposer._draft_uses_decode_stage() is False
     _, rd = proposer._get_static_attn_tensors(3)
     assert rd.tolist() == [0, 0, 3]
+
+
+def test_draft_forward_stays_mixed_without_a_loaded_draft_model():
+    # Stage routing is an optimization: with no draft model loaded (e.g. a
+    # proposer driven directly in tests), the draft forward keeps MIXED.
+    proposer = _make_proposer()
+    assert proposer.draft_model is None
+    _, rd = proposer._get_static_attn_tensors(3)
+    assert rd.tolist() == [0, 0, 3]

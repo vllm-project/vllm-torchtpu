@@ -176,8 +176,10 @@ class DFlashProposer:
 
     def _draft_attn_layers(self) -> list[tuple[int, Any, PallasAttentionBackendImpl]]:
         """(layer index, attention layer, Pallas impl) for each draft layer
-        whose attention runs a Pallas RPA impl."""
-        assert self.draft_model is not None
+        whose attention runs a Pallas RPA impl. Empty before the draft model
+        is loaded, so the draft forward's stage routing falls back to MIXED."""
+        if self.draft_model is None:
+            return []
         layers = []
         for i, layer in enumerate(self.draft_model.model.layers):
             sub_attn = getattr(layer, "self_attn", None)
