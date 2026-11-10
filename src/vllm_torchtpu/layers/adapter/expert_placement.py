@@ -404,12 +404,39 @@ def _require() -> Placement:
     return placement
 
 
-# The table's facts by the names the MoE methods ask for them; neither needs a
-# table.
+# The table's facts by the names the few-token MoE kernel and the MoE methods
+# ask for them; all but has_copies and placed need a table.
 def has_copies() -> bool:
     """Whether the table gives the ranks copy slots after their primaries."""
     placement = current()
     return placement is not None and placement.copies_per_rank > 0
+
+
+def placed(name: str) -> bool:
+    """Whether the table places the layer a prefix or tensor name belongs to."""
+    return placed_ranks(name) is not None
+
+
+def shards() -> int:
+    return _require().shards
+
+
+def global_count() -> int:
+    return _require().experts
+
+
+def owned() -> int:
+    """Primary slots per rank, the slots the router and the other kernels see."""
+    return _require().per_rank
+
+
+def slots() -> int:
+    """Every slot a rank holds, primaries then copies."""
+    return _require().slots_per_rank
+
+
+def holder_tables(layer: int, rank: int) -> tuple[list[int], list[int], list[int]]:
+    return _require().holder_tables(layer, rank)
 
 
 def primary_experts(layer) -> int | None:
@@ -422,6 +449,10 @@ def primary_experts(layer) -> int | None:
         return None
     primaries = getattr(layer, PRIMARY_EXPERTS_ATTR, None)
     return int(layer.w13_weight.shape[0]) if primaries is None else int(primaries)
+
+
+def hot_order(layer: int) -> list[int]:
+    return _require().hot_order(layer)
 
 
 def fetch_filter_ids(name: str) -> frozenset[int] | None:
