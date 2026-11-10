@@ -33,6 +33,7 @@ from vllm_torchtpu.kernels.moe_lowtok.expert_parallel import (
     moe_lowtok_ep_serves,
     route_softmax_topk,
 )
+from vllm_torchtpu.kernels.moe_lowtok.kernel import vmem_required_bytes
 
 FP8 = jnp.float8_e4m3fn
 
@@ -77,25 +78,128 @@ def _operands(seed, tokens, experts, hidden, inter, topk):
     return (x, local, weights, *_weights(rng, experts, hidden, inter))
 
 
+@pytest.mark.parametrize("whole_expert", [False, True])
 @pytest.mark.parametrize("tokens", [1, 5, 32, 33])
 @pytest.mark.parametrize("shape", [(8, 512, 256, 4), (4, 256, 512, 2)])
-def test_matches_reference(tokens, shape):
+def test_matches_reference(whole_expert, tokens, shape):
     experts, hidden, inter, topk = shape
     ops = _operands(tokens * 7 + experts, tokens, experts, hidden, inter, topk)
-    got = np.asarray(moe_lowtok(*ops, interpret=_interpret()), np.float32)
+    got = np.asarray(
+        moe_lowtok(*ops, whole_expert=whole_expert, interpret=_interpret()),
+        np.float32,
+    )
     want = np.asarray(moe_lowtok_reference(*ops), np.float32)
     assert got.shape == (tokens, hidden)
     assert np.abs(want).max() > 0
     scale = np.abs(want).max()
-    np.testing.assert_allclose(got / scale, want / scale, atol=2e-2, rtol=0)
+    tol = 2e-2 if _interpret() else 3e-2
+    np.testing.assert_allclose(got / scale, want / scale, atol=tol, rtol=0)
 
 
-def test_no_local_expert_gives_zero():
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("whole_expert", [False, True])
+def test_tpu_whole_expert_matches_reference(whole_expert):
+    if jax.default_backend() != "tpu":
+        pytest.skip("requires TPU")
+    tokens, experts, hidden, inter, topk = 8, 8, 512, 256, 4
+    ops = _operands(41, tokens, experts, hidden, inter, topk)
+    got = np.asarray(
+        moe_lowtok(*ops, whole_expert=whole_expert, interpret=False),
+        np.float32,
+    )
+    want = np.asarray(moe_lowtok_reference(*ops), np.float32)
+    scale = np.abs(want).max()
+    np.testing.assert_allclose(got / scale, want / scale, atol=3e-2, rtol=0)
+
+
+@pytest.mark.parametrize("whole_expert", [False, True])
+def test_unrouted_nan_row_gives_zero(whole_expert):
+    x, ids, weights, w13, s13, w2, s2 = _operands(9, 4, 8, 512, 256, 4)
+    # Row 0 contains NaNs and routes nowhere locally while rows 1..3 hit local
+    # experts: 0 * NaN must not poison row 0's output.
+    x = x.at[0].set(jnp.nan)
+    ids = ids.at[0].set(-1)
+    ids = ids.at[1, 0].set(0)
+    got = np.asarray(
+        moe_lowtok(
+            x,
+            ids,
+            weights,
+            w13,
+            s13,
+            w2,
+            s2,
+            whole_expert=whole_expert,
+            interpret=_interpret(),
+        ),
+        np.float32,
+    )
+    assert np.all(got[0] == 0)
+    assert np.all(np.isfinite(got[1:]))
+
+
+@pytest.mark.parametrize("whole_expert", [False, True])
+def test_no_local_expert_gives_zero(whole_expert):
     x, ids, weights, w13, s13, w2, s2 = _operands(3, 4, 8, 512, 256, 4)
     got = moe_lowtok(
-        x, jnp.full_like(ids, -1), weights, w13, s13, w2, s2, interpret=_interpret()
+        x,
+        jnp.full_like(ids, -1),
+        weights,
+        w13,
+        s13,
+        w2,
+        s2,
+        whole_expert=whole_expert,
+        interpret=_interpret(),
     )
     assert np.all(np.asarray(got, np.float32) == 0)
+
+
+@pytest.mark.parametrize("hit_experts", [[0], [3, 5], [0, 1, 3, 5, 7]])
+def test_whole_expert_matches_split_stream(hit_experts):
+    tokens, experts, hidden, inter = 6, 8, 512, 256
+    rng = np.random.default_rng(19 + len(hit_experts))
+    x = jnp.asarray(
+        rng.standard_normal((tokens, hidden)).astype(np.float32), jnp.bfloat16
+    )
+    topk = len(hit_experts)
+    local_ids = jnp.broadcast_to(
+        jnp.asarray(hit_experts, dtype=jnp.int32), (tokens, topk)
+    )
+    weights = rng.random((tokens, topk)).astype(np.float32)
+    weights = jnp.asarray(weights / weights.sum(axis=1, keepdims=True), jnp.bfloat16)
+    w13, s13, w2, s2 = _weights(rng, experts, hidden, inter)
+    split_out = np.asarray(
+        moe_lowtok(
+            x,
+            local_ids,
+            weights,
+            w13,
+            s13,
+            w2,
+            s2,
+            whole_expert=False,
+            interpret=_interpret(),
+        ),
+        np.float32,
+    )
+    whole_out = np.asarray(
+        moe_lowtok(
+            x,
+            local_ids,
+            weights,
+            w13,
+            s13,
+            w2,
+            s2,
+            whole_expert=True,
+            interpret=_interpret(),
+        ),
+        np.float32,
+    )
+    scale = max(float(np.abs(split_out).max()), 1.0)
+    tol = 1e-6 if _interpret() else 5e-3
+    np.testing.assert_allclose(whole_out / scale, split_out / scale, atol=tol, rtol=0)
 
 
 def test_support_check():
@@ -110,10 +214,70 @@ def test_support_check():
     # Block-scaled weights: more than one scale per output channel.
     blocked = jnp.concatenate([s13, s13], axis=1)
     assert not can_use_moe_lowtok(x, w13, w2, blocked, s2, None, None, **supported)
-    # A gate|up width that does not split into two lane-aligned halves.
+    # Unaligned hidden width.
+    x_unaligned, _, _, w13_u, s13_u, w2_u, s2_u = _operands(0, 4, 8, 192, 256, 4)
+    assert not can_use_moe_lowtok(
+        x_unaligned, w13_u, w2_u, s13_u, s2_u, None, None, **supported
+    )
+    assert not can_use_moe_lowtok(
+        x_unaligned,
+        w13_u,
+        w2_u,
+        s13_u,
+        s2_u,
+        None,
+        None,
+        whole_expert=True,
+        **supported,
+    )
+    # A gate|up width that does not split into two lane-aligned halves:
+    # rejected by the split stream, accepted by whole_expert.
     _, _, _, w13_odd, s13_odd, w2_odd, s2_odd = _operands(0, 4, 8, 512, 128, 4)
     assert not can_use_moe_lowtok(
         x, w13_odd, w2_odd, s13_odd, s2_odd, None, None, **supported
+    )
+    assert can_use_moe_lowtok(
+        x,
+        w13_odd,
+        w2_odd,
+        s13_odd,
+        s2_odd,
+        None,
+        None,
+        whole_expert=True,
+        **supported,
+    )
+    # VMEM fit check: ids entry fits at its exact requirement while scores
+    # entry (which carries routing scratch) is refused at that same cap.
+    need_ids = vmem_required_bytes(32, 512, 256, 2, 512, whole_expert=True)
+    assert can_use_moe_lowtok(
+        x,
+        w13,
+        w2,
+        s13,
+        s2,
+        None,
+        None,
+        whole_expert=True,
+        scores=False,
+        vmem_limit_bytes=need_ids,
+        **supported,
+    )
+    assert not can_use_moe_lowtok(
+        x,
+        w13,
+        w2,
+        s13,
+        s2,
+        None,
+        None,
+        whole_expert=True,
+        scores=True,
+        vmem_limit_bytes=need_ids,
+        **supported,
+    )
+    assert not can_use_moe_lowtok(
+        x, w13, w2, s13, s2, None, None, vmem_limit_bytes=1024, **supported
     )
 
 
@@ -134,9 +298,13 @@ def _dense_moe_reference(x, gating, w13, s13, w2, s2, topk, renormalize):
     return moe_lowtok_reference(x, ids, weights, w13, s13, w2, s2)
 
 
+@pytest.mark.multichip
+@pytest.mark.parametrize("whole_expert", [False, True])
 @pytest.mark.parametrize("mesh_ep_ranks", [None, (2, 0, 3, 1)])
 @pytest.mark.parametrize("rows_per_rank", [1, 3])
-def test_expert_parallel_matches_dense_layer(mesh_ep_ranks, rows_per_rank):
+def test_expert_parallel_matches_dense_layer(
+    whole_expert, mesh_ep_ranks, rows_per_rank
+):
     """The all-gather, kernel and reduce-scatter return every rank's own rows
     of the full MoE layer, including a mesh whose order differs from the EP
     rank order."""
@@ -168,6 +336,7 @@ def test_expert_parallel_matches_dense_layer(mesh_ep_ranks, rows_per_rank):
         topk=topk,
         renormalize=True,
         mesh_ep_ranks=mesh_ep_ranks,
+        whole_expert=whole_expert,
         interpret=_interpret(),
     )
     got = np.asarray(got, np.float32)
@@ -182,7 +351,7 @@ def test_expert_parallel_selection():
     w13, s13, w2, s2 = _weights(rng, ep * local, hidden, inter)
     s13, s2 = s13.reshape(ep * local, -1), s2.reshape(ep * local, -1)
 
-    def serves(rows, max_tokens=16, groups=None, activation="silu"):
+    def serves(rows, max_tokens=16, groups=None, activation="silu", whole_expert=False):
         x = jax.ShapeDtypeStruct((rows, hidden), jnp.bfloat16)
         return moe_lowtok_ep_serves(
             x,
@@ -194,6 +363,7 @@ def test_expert_parallel_selection():
             max_tokens=max_tokens,
             activation=activation,
             token_replica_groups=groups,
+            whole_expert=whole_expert,
         )
 
     assert serves(16)
@@ -202,3 +372,118 @@ def test_expert_parallel_selection():
     assert not serves(16, max_tokens=0)  # off
     assert not serves(8, groups=((0, 1), (2, 3)))  # replicated rows
     assert not serves(8, activation="gelu")
+    # inter=128 (two_inter=256) requires whole_expert=True.
+    w13_odd, s13_odd, w2_odd, s2_odd = _weights(rng, ep * local, hidden, 128)
+    x8 = jax.ShapeDtypeStruct((8, hidden), jnp.bfloat16)
+    assert not moe_lowtok_ep_serves(
+        x8,
+        w13_odd,
+        w2_odd,
+        s13_odd.reshape(ep * local, -1),
+        s2_odd.reshape(ep * local, -1),
+        ep=ep,
+        max_tokens=16,
+        activation="silu",
+        token_replica_groups=None,
+        whole_expert=False,
+    )
+    assert moe_lowtok_ep_serves(
+        x8,
+        w13_odd,
+        w2_odd,
+        s13_odd.reshape(ep * local, -1),
+        s2_odd.reshape(ep * local, -1),
+        ep=ep,
+        max_tokens=16,
+        activation="silu",
+        token_replica_groups=None,
+        whole_expert=True,
+    )
+
+
+def test_whole_expert_executes_single_lane_half_intermediate():
+    """whole_expert=True executes inter=128 (two_inter=256) against reference."""
+    rng = np.random.default_rng(71)
+    tokens, hidden, inter, experts, topk = 9, 256, 128, 8, 3
+    x = jnp.asarray(
+        rng.standard_normal((tokens, hidden)).astype(np.float32), jnp.bfloat16
+    )
+    w13, s13, w2, s2 = _weights(rng, experts, hidden, inter)
+    ids = jnp.asarray(rng.integers(-1, experts, size=(tokens, topk), dtype=np.int32))
+    wts = jnp.asarray(rng.uniform(0.1, 1.0, size=(tokens, topk)).astype(np.float32))
+    want = moe_lowtok_reference(x, ids, wts, w13, s13, w2, s2)
+    got = np.asarray(
+        moe_lowtok(
+            x,
+            ids,
+            wts,
+            w13,
+            s13,
+            w2,
+            s2,
+            whole_expert=True,
+            interpret=_interpret(),
+        ),
+        np.float32,
+    )
+    scale = max(float(np.abs(want).max()), 1e-6)
+    np.testing.assert_allclose(got / scale, want / scale, atol=2e-2, rtol=0)
+    got_split = np.asarray(
+        moe_lowtok(
+            x,
+            ids,
+            wts,
+            w13,
+            s13,
+            w2,
+            s2,
+            whole_expert=False,
+            interpret=_interpret(),
+        ),
+        np.float32,
+    )
+    np.testing.assert_allclose(
+        got / scale,
+        got_split / scale,
+        atol=1e-6 if _interpret() else 5e-3,
+        rtol=0,
+    )
+
+
+def test_qwen35_397b_320_rows_fits_tpu7x_vmem_only_with_whole_expert():
+    """At 320 global rows on Qwen3.5-397B (hidden=4096, inter=1024), TPU v7x's
+    48 MiB budget (75% of 64 MiB) admits whole_expert=True and refuses split."""
+    from vllm_torchtpu.kernels.moe_lowtok.kernel import can_use_moe_lowtok
+
+    tpu7x_vmem_75pct = 48 * 1024 * 1024
+    x320 = jax.ShapeDtypeStruct((320, 4096), jnp.bfloat16)
+    w13 = jax.ShapeDtypeStruct((64, 4096, 2048), jnp.float8_e4m3fn)
+    w2 = jax.ShapeDtypeStruct((64, 1024, 4096), jnp.float8_e4m3fn)
+    s13 = jax.ShapeDtypeStruct((64, 2048), jnp.float32)
+    s2 = jax.ShapeDtypeStruct((64, 4096), jnp.float32)
+    assert not can_use_moe_lowtok(
+        x320,
+        w13,
+        w2,
+        s13,
+        s2,
+        None,
+        None,
+        activation="silu",
+        vmem_limit_bytes=tpu7x_vmem_75pct,
+        whole_expert=False,
+        scores=True,
+    )
+    assert can_use_moe_lowtok(
+        x320,
+        w13,
+        w2,
+        s13,
+        s2,
+        None,
+        None,
+        activation="silu",
+        vmem_limit_bytes=tpu7x_vmem_75pct,
+        whole_expert=True,
+        scores=True,
+    )

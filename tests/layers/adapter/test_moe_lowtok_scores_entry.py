@@ -96,6 +96,55 @@ def test_unsupported_activation_is_refused(scores_env):
     assert "kernel" in scores_entry.scores_entry_refusal(_layer(), "gelu", True)
 
 
+def test_cap_below_ep_size_or_replicated_tp_is_refused(scores_env, monkeypatch):
+    monkeypatch.setenv("TPU_MOE_LOWTOK_MAX_TOKENS", "4")
+    assert "ep_size" in scores_entry.scores_entry_refusal(_layer(), "silu", True)
+
+    monkeypatch.setenv("TPU_MOE_LOWTOK_MAX_TOKENS", "64")
+    rep_layer = _layer(
+        moe_config=SimpleNamespace(
+            ep_rank=2,
+            ep_size=EP,
+            moe_parallel_config=SimpleNamespace(
+                use_ep=True, is_sequence_parallel=False, tp_size=2
+            ),
+        )
+    )
+    assert "replicated" in scores_entry.scores_entry_refusal(rep_layer, "silu", True)
+
+
+def test_whole_expert_admits_single_lane_half_intermediate(scores_env, monkeypatch):
+    fp8 = torch.float8_e4m3fn
+    inter_128 = 128
+    layer = _layer(
+        w13_weight=torch.nn.Parameter(
+            torch.zeros(LOCAL, HIDDEN, 2 * inter_128, dtype=fp8), requires_grad=False
+        ),
+        w2_weight=torch.nn.Parameter(
+            torch.zeros(LOCAL, inter_128, HIDDEN, dtype=fp8), requires_grad=False
+        ),
+        w13_weight_scale_inv=torch.nn.Parameter(
+            torch.ones(LOCAL, 1, 1, 2 * inter_128, dtype=torch.float32),
+            requires_grad=False,
+        ),
+        w2_weight_scale_inv=torch.nn.Parameter(
+            torch.ones(LOCAL, 1, 1, HIDDEN, dtype=torch.float32), requires_grad=False
+        ),
+    )
+    monkeypatch.delenv("TPU_MOE_LOWTOK_WHOLE_EXPERT", raising=False)
+    assert "kernel" in scores_entry.scores_entry_refusal(layer, "silu", True)
+    assert scores_entry.arm(layer, "silu", adaptive=True) is None
+
+    monkeypatch.setenv("TPU_MOE_LOWTOK_WHOLE_EXPERT", "1")
+    assert scores_entry.scores_entry_refusal(layer, "silu", True) is None
+    tables = scores_entry.arm(layer, "silu", adaptive=True)
+    assert tables is not None
+
+    from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+
+    assert "TPU_MOE_LOWTOK_WHOLE_EXPERT" in TpuPlatform.additional_env_vars
+
+
 def test_off_is_a_no_op(monkeypatch):
     monkeypatch.delenv("TPU_MOE_LOWTOK_FROM_SCORES", raising=False)
     layer = _layer()

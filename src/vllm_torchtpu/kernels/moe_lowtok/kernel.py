@@ -52,8 +52,11 @@ MAX_LOCAL_EXPERTS = 128
 GATE_UP_ALIGNMENT = 4 * LANE
 VMEM_FRACTION = 0.75  # of the core's vector memory, read at trace time
 VMEM_MARGIN = 1.25  # over the declared scratch, for the compiler's own tiles
+COMPILER_VMEM_FLOOR = 512 * 1024  # minimum compiler tile slack on small shapes
 FP8 = jnp.float8_e4m3fn
 FP8_MAX = 448.0
+NEG = -3.0e38  # scores at or below it never win a selection pass
+HOT_SLOTS = 128  # the copied-expert tables' fixed length (-1 padded)
 
 
 def vmem_limit(fraction=VMEM_FRACTION):
@@ -61,19 +64,78 @@ def vmem_limit(fraction=VMEM_FRACTION):
     return int(pltpu.get_tpu_info().vmem_capacity_bytes * fraction)
 
 
-def vmem_budget(rows, hidden, inter, w13_parts, two_inter):
+def _try_tpu_info():
+    """Return active `TpuInfo` when a TPU target is available, else `None`."""
+    try:
+        return pltpu.get_tpu_info()
+    except (ValueError, RuntimeError):
+        return None
+
+
+def _try_vmem_limit(fraction=VMEM_FRACTION) -> int | None:
+    """Return `vmem_limit(fraction)` when a TPU target is active, else `None`."""
+    info = _try_tpu_info()
+    return None if info is None else int(info.vmem_capacity_bytes * fraction)
+
+
+def vmem_required_bytes(
+    rows,
+    hidden,
+    inter,
+    w13_parts,
+    two_inter,
+    *,
+    whole_expert=False,
+    scores=False,
+    nc=HOT_SLOTS,
+):
+    """Required VMEM bytes for scratch, operands, and compiler tile slack."""
+    if whole_expert:
+        weights = 2 * (hidden * two_inter + inter * hidden)
+        # [2, 1, cols] f32 refs pad sublane 1 to 8 in TPU VMEM.
+        scales = 2 * 8 * 4 * (two_inter + hidden)
+        accumulators = rows * 4 * hidden
+    else:
+        unit = w13_parts + 1
+        weights = unit * (hidden * 2 * (inter // w13_parts) + inter * hidden)
+        scales = unit * 8 * 4 * (2 * (inter // w13_parts) + hidden)
+        accumulators = rows * 4 * (two_inter + hidden)
+    # x in and out, quantized x, the routing table, and the hit and slot tables.
+    operands = rows * 2 * hidden * 2 + rows * hidden + rows * 4 * LANES + 4 * LANES * 8
+    if scores:
+        operands += rows * 4 * LANES + LANES * 2 * nc + 8 * 4 * nc + 2 * 8 * 4 * LANES
+    return (
+        int((weights + scales + accumulators + operands) * VMEM_MARGIN)
+        + COMPILER_VMEM_FLOOR
+    )
+
+
+def vmem_budget(
+    rows,
+    hidden,
+    inter,
+    w13_parts,
+    two_inter,
+    *,
+    whole_expert=False,
+    scores=False,
+    nc=HOT_SLOTS,
+):
     """Reserve the scratch and VMEM operands plus a compiler margin.
 
     A shape-dependent reservation leaves room for surrounding operations to
     prefetch their weights. The device-derived ceiling bounds the reservation.
     """
-    unit = w13_parts + 1
-    weights = unit * (hidden * 2 * (inter // w13_parts) + inter * hidden)
-    scales = unit * 4 * (2 * (inter // w13_parts) + hidden)
-    accumulators = rows * 4 * (two_inter + hidden)
-    # x in and out, the routing table, the hit and slot tables.
-    operands = rows * 2 * hidden * 2 + rows * 4 * LANES + 4 * LANES * 8
-    need = int((weights + scales + accumulators + operands) * VMEM_MARGIN)
+    need = vmem_required_bytes(
+        rows,
+        hidden,
+        inter,
+        w13_parts,
+        two_inter,
+        whole_expert=whole_expert,
+        scores=scores,
+        nc=nc,
+    )
     return min(need, vmem_limit())
 
 
@@ -324,11 +386,172 @@ def _stream(
                 axis=1,
                 keepdims=True,
             )
-            acc[...] += w * o
+            acc[...] += jnp.where(w != 0, w * o, 0.0)
 
         return advance(e_idx, part, 1)
 
     jax.lax.fori_loop(0, n_units, body, (jnp.int32(0), jnp.int32(0)))
+    out_ref[...] = acc[...].astype(out_ref.dtype)
+
+
+def _stream_whole_expert(
+    gid_of,
+    hits_s,
+    wtab_ref,
+    x_ref,
+    s13_hbm,
+    s2_hbm,
+    w13_hbm,
+    w2_hbm,
+    out_ref,
+    ids,
+    w13_buf,
+    w2_buf,
+    s13_buf,
+    s2_buf,
+    w13_sem,
+    w2_sem,
+    acc,
+    *,
+    n_experts,
+    inter,
+    copy_hbm=None,
+    choice=None,
+):
+    """Walk the hit experts with two-slot whole-expert ping-pong buffering.
+
+    Unlike `_stream`, each ring slot holds a full `w13` `[hidden, 2*inter]`
+    and `w2` `[inter, hidden]` expert block (`slots = 2`, `slot = e_idx % 2`).
+    Each hit expert issues contiguous 1-D DMAs for `w13`, `s13`, `w2`, and
+    `s2` and executes both projections in a single loop iteration without an
+    intermediate `h_acc` VMEM buffer.
+    """
+    rows = x_ref.shape[0]
+    lane = jax.lax.broadcasted_iota(jnp.int32, (rows, LANES), 1)
+
+    def collect(e, n):
+        h = hits_s[0, gid_of(e)]
+
+        @pl.when(h == 1)
+        def _():
+            ids[n] = e
+
+        return n + h
+
+    n_hit = jax.lax.fori_loop(0, n_experts, collect, jnp.int32(0))
+    n_primary = w13_hbm.shape[0]
+
+    def w13_copies(refs, expert, slot):
+        s13_src, _, w13_src, _ = refs
+        return (
+            pltpu.make_async_copy(
+                w13_src.at[expert], w13_buf.at[slot], w13_sem.at[slot]
+            ),
+            pltpu.make_async_copy(
+                s13_src.at[expert], s13_buf.at[slot], w13_sem.at[slot]
+            ),
+        )
+
+    def w2_copies(refs, expert, slot):
+        _, s2_src, _, w2_src = refs
+        return (
+            pltpu.make_async_copy(w2_src.at[expert], w2_buf.at[slot], w2_sem.at[slot]),
+            pltpu.make_async_copy(s2_src.at[expert], s2_buf.at[slot], w2_sem.at[slot]),
+        )
+
+    def for_expert_source(e_idx, fn):
+        expert = ids[e_idx]
+        primary = (s13_hbm, s2_hbm, w13_hbm, w2_hbm)
+        if copy_hbm is None:
+            fn(primary, expert)
+            return
+        in_primary = expert < n_primary
+
+        @pl.when(in_primary)
+        def _():
+            fn(primary, jnp.minimum(expert, n_primary - 1))
+
+        @pl.when(jnp.logical_not(in_primary))
+        def _():
+            fn(copy_hbm, jnp.maximum(expert - n_primary, 0))
+
+    def start_expert(e_idx, slot):
+        def _start(refs, expert):
+            for c in w13_copies(refs, expert, slot):
+                c.start()
+            for c in w2_copies(refs, expert, slot):
+                c.start()
+
+        for_expert_source(e_idx, _start)
+
+    def wait_w13(e_idx, slot):
+        def _wait(refs, expert):
+            for c in w13_copies(refs, expert, slot):
+                c.wait()
+
+        for_expert_source(e_idx, _wait)
+
+    def wait_w2(e_idx, slot):
+        def _wait(refs, expert):
+            for c in w2_copies(refs, expert, slot):
+                c.wait()
+
+        for_expert_source(e_idx, _wait)
+
+    acc[...] = jnp.zeros_like(acc)
+    x_q, x_s = _quantize_rows(x_ref[...].astype(jnp.float32))
+
+    @pl.when(n_hit > 0)
+    def _prime():
+        start_expert(jnp.int32(0), jnp.int32(0))
+
+    if choice is not None:
+        n_before = n_hit
+        n_hit = choice(n_hit)
+
+        @pl.when((n_before == 0) & (n_hit > 0))
+        def _prime_late():
+            start_expert(jnp.int32(0), jnp.int32(0))
+
+    def body(e_idx, _):
+        slot = jax.lax.rem(e_idx, jnp.int32(2))
+        next_slot = jnp.int32(1) - slot
+        expert = ids[e_idx]
+
+        @pl.when(e_idx + 1 < n_hit)
+        def _prefetch():
+            start_expert(e_idx + 1, next_slot)
+
+        wait_w13(e_idx, slot)
+        h = jax.lax.dot_general(
+            x_q,
+            w13_buf[slot],
+            (((1,), (0,)), ((), ())),
+            preferred_element_type=jnp.float32,
+        )
+        h = h * x_s * s13_buf[slot]
+        gate = h[:, :inter]
+        up = h[:, inter:]
+        a = gate * jax.nn.sigmoid(gate) * up
+        a_q, a_s = _quantize_rows(a)
+
+        wait_w2(e_idx, slot)
+        o = jax.lax.dot_general(
+            a_q,
+            w2_buf[slot],
+            (((1,), (0,)), ((), ())),
+            preferred_element_type=jnp.float32,
+        )
+        o = o * a_s * s2_buf[slot]
+        w = jnp.sum(
+            jnp.where(lane == gid_of(expert), wtab_ref[...], 0.0),
+            axis=1,
+            keepdims=True,
+        )
+        acc[...] += jnp.where(w != 0, w * o, 0.0)
+        return jnp.int32(0)
+
+    jax.lax.fori_loop(0, n_hit, body, jnp.int32(0))
     out_ref[...] = acc[...].astype(out_ref.dtype)
 
 
@@ -345,10 +568,28 @@ def _kernel_ids(
     *scratch,
     n_experts,
     inter,
-    w13_parts,
+    w13_parts=None,
+    whole_expert=False,
 ):
     """The ids entry: the routing table over local ids and the hit vector come
     from the caller; gid_ref is the identity over local ids."""
+    if whole_expert:
+        _stream_whole_expert(
+            lambda e: gid_ref[0, e],
+            hit_ref,
+            wtab_ref,
+            x_ref,
+            s13_hbm,
+            s2_hbm,
+            w13_hbm,
+            w2_hbm,
+            out_ref,
+            *scratch,
+            n_experts=n_experts,
+            inter=inter,
+        )
+        return
+    assert w13_parts is not None
     _stream(
         lambda e: gid_ref[0, e],
         hit_ref,
@@ -367,12 +608,22 @@ def _kernel_ids(
 
 
 def can_use_moe_lowtok(
-    hidden_states, w1, w2, w1_scale, w2_scale, w1_bias, w2_bias, *, activation
+    hidden_states,
+    w1,
+    w2,
+    w1_scale,
+    w2_scale,
+    w1_bias,
+    w2_bias,
+    *,
+    activation,
+    whole_expert: bool = False,
+    scores: bool = False,
+    vmem_limit_bytes: int | None = None,
 ):
     """Whether the kernel serves this layer: silu, fp8 weights with one scale
-    per output channel, bf16 activations, no expert bias, at most
-    MAX_LOCAL_EXPERTS local experts and a gate|up width that splits into two
-    lane-aligned halves."""
+    per output channel, bf16 activations, no expert bias, lane-aligned hidden
+    and gate|up widths, at most MAX_LOCAL_EXPERTS local experts, and VMEM fit."""
     if activation != "silu" or w1_bias is not None or w2_bias is not None:
         return False
     if w1_scale is None or w2_scale is None:
@@ -382,19 +633,51 @@ def can_use_moe_lowtok(
     if hidden_states.dtype != jnp.bfloat16 or w1.dtype != FP8 or w2.dtype != FP8:
         return False
     experts, hidden, two_inter = w1.shape
+    inter = two_inter // 2
+    if hidden <= 0 or hidden % LANE:
+        return False
     if hidden != hidden_states.shape[1] or w2.shape != (
         experts,
-        two_inter // 2,
+        inter,
         hidden,
     ):
         return False
-    if experts > MAX_LOCAL_EXPERTS or two_inter % GATE_UP_ALIGNMENT:
+    alignment = 2 * LANE if whole_expert else GATE_UP_ALIGNMENT
+    if not 0 < experts <= MAX_LOCAL_EXPERTS or two_inter <= 0 or two_inter % alignment:
         return False
     # One scale per output channel, with any singleton axes in between.
-    return w1_scale.size == experts * two_inter and w2_scale.size == experts * hidden
+    if w1_scale.size != experts * two_inter or w2_scale.size != experts * hidden:
+        return False
+    info = _try_tpu_info() if vmem_limit_bytes is None else None
+    if info is not None and not info.is_matmul_supported(FP8, FP8):
+        return False
+    limit = (
+        vmem_limit_bytes
+        if vmem_limit_bytes is not None
+        else (
+            int(info.vmem_capacity_bytes * VMEM_FRACTION) if info is not None else None
+        )
+    )
+    if limit is not None:
+        rows = -(-max(int(hidden_states.shape[0]), 1) // ROW_TILE) * ROW_TILE
+        w13_parts = 2 if (inter // 2) % LANE == 0 else 1
+        need = vmem_required_bytes(
+            rows,
+            hidden,
+            inter,
+            w13_parts,
+            two_inter,
+            whole_expert=whole_expert,
+            scores=scores,
+        )
+        if need > limit:
+            return False
+    return True
 
 
-@functools.partial(jax.jit, static_argnames=("vmem_limit_bytes", "interpret"))
+@functools.partial(
+    jax.jit, static_argnames=("vmem_limit_bytes", "whole_expert", "interpret")
+)
 def moe_lowtok(
     x,
     topk_ids_local,
@@ -405,6 +688,7 @@ def moe_lowtok(
     s2,
     *,
     vmem_limit_bytes=None,
+    whole_expert=False,
     interpret=False,
 ):
     """The shard's MoE output for a few tokens.
@@ -425,9 +709,18 @@ def moe_lowtok(
         raise ValueError(
             f"the routing table holds up to {LANES} experts per shard, not {n_experts}"
         )
-    if inter % LANE:
+    if hidden % LANE:
         raise ValueError(
-            f"the intermediate width {inter} must be a multiple of the lane tile"
+            f"the hidden width {hidden} must be a multiple of the lane tile"
+        )
+    if two_inter != 2 * inter or inter <= 0 or inter % LANE:
+        raise ValueError(
+            f"the gate-up width {two_inter} must equal 2 * inter with inter "
+            f"a multiple of {LANE}"
+        )
+    if w2.shape != (n_experts, inter, hidden):
+        raise ValueError(
+            f"expected w2 of shape {(n_experts, inter, hidden)}, got {w2.shape}"
         )
     w13_parts = 2 if (inter // 2) % LANE == 0 else 1
     rows = -(-tokens // ROW_TILE) * ROW_TILE
@@ -451,38 +744,66 @@ def moe_lowtok(
     vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     if vmem_limit_bytes is None and not interpret:
-        vmem_limit_bytes = vmem_budget(rows, hidden, inter, w13_parts, two_inter)
+        vmem_limit_bytes = vmem_budget(
+            rows,
+            hidden,
+            inter,
+            w13_parts,
+            two_inter,
+            whole_expert=whole_expert,
+            scores=False,
+        )
+    if whole_expert:
+        scratch_shapes = (
+            pltpu.SMEM((n_experts,), jnp.int32),
+            pltpu.VMEM((2, hidden, two_inter), FP8),
+            pltpu.VMEM((2, inter, hidden), FP8),
+            pltpu.VMEM((2, 1, two_inter), jnp.float32),
+            pltpu.VMEM((2, 1, hidden), jnp.float32),
+            pltpu.SemaphoreType.DMA((2,)),
+            pltpu.SemaphoreType.DMA((2,)),
+            pltpu.VMEM((rows, hidden), jnp.float32),
+        )
+        kernel_fn = functools.partial(
+            _kernel_ids,
+            n_experts=n_experts,
+            inter=inter,
+            whole_expert=True,
+        )
+    else:
+        scratch_shapes = (
+            pltpu.SMEM((n_experts,), jnp.int32),
+            pltpu.VMEM((w13_parts + 1, hidden, 2 * (inter // w13_parts)), FP8),
+            pltpu.VMEM((w13_parts + 1, inter, hidden), FP8),
+            pltpu.VMEM((w13_parts + 1, 1, 2 * (inter // w13_parts)), jnp.float32),
+            pltpu.VMEM((w13_parts + 1, 1, hidden), jnp.float32),
+            pltpu.SemaphoreType.DMA((w13_parts + 1,)),
+            pltpu.SemaphoreType.DMA((w13_parts + 1,)),
+            pltpu.VMEM((rows, two_inter), jnp.float32),
+            pltpu.VMEM((rows, hidden), jnp.float32),
+        )
+        kernel_fn = functools.partial(
+            _kernel_ids,
+            n_experts=n_experts,
+            inter=inter,
+            w13_parts=w13_parts,
+            whole_expert=False,
+        )
     out = pl.pallas_call(
-        functools.partial(
-            _kernel_ids, n_experts=n_experts, inter=inter, w13_parts=w13_parts
-        ),
+        kernel_fn,
         out_shape=jax.ShapeDtypeStruct((rows, hidden), x.dtype),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=2,
             in_specs=[vmem, vmem, hbm, hbm, hbm, hbm],
             out_specs=vmem,
-            scratch_shapes=(
-                pltpu.SMEM((n_experts,), jnp.int32),
-                pltpu.VMEM((w13_parts + 1, hidden, 2 * (inter // w13_parts)), FP8),
-                pltpu.VMEM((w13_parts + 1, inter, hidden), FP8),
-                pltpu.VMEM((w13_parts + 1, 1, 2 * (inter // w13_parts)), jnp.float32),
-                pltpu.VMEM((w13_parts + 1, 1, hidden), jnp.float32),
-                pltpu.SemaphoreType.DMA((w13_parts + 1,)),
-                pltpu.SemaphoreType.DMA((w13_parts + 1,)),
-                pltpu.VMEM((rows, two_inter), jnp.float32),
-                pltpu.VMEM((rows, hidden), jnp.float32),
-            ),
+            scratch_shapes=scratch_shapes,
             grid=(),
         ),
         compiler_params=pltpu.CompilerParams(vmem_limit_bytes=vmem_limit_bytes),
-        interpret=pltpu.InterpretParams() if interpret else False,
+        interpret=pltpu.InterpretParams(detect_races=True) if interpret else False,
         name="moe_lowtok",
     )(gid, hit, x_rows, wtab, s13, s2, w13, w2)
     return out[:tokens]
-
-
-NEG = -3.0e38  # scores at or below it never win a selection pass
-HOT_SLOTS = 128  # the copied-expert tables' fixed length (-1 padded)
 
 
 def _kernel_scores(
@@ -499,11 +820,12 @@ def _kernel_scores(
     *refs,
     n_experts,
     inter,
-    w13_parts,
+    w13_parts=None,
     topk,
     ranks,
     has_copies,
     offsets,
+    whole_expert=False,
 ):
     """The scores entry: the router's top-k runs here, then the assignment of
     every hit expert to one holder.
@@ -512,9 +834,9 @@ def _kernel_scores(
     (`offsets` = their (gid, hot, hprim, hcopy, slot) offsets); prim_ref /
     copy_ref [1, LANES] int32: the rank holding each expert's primary / copy
     (-1: none); hot1h_ref [LANES, NC] bf16: one-hot, 1 at (hot[i], i); x_hbm
-    [rows, hidden] (HBM): the rows, copied into VMEM under the selection;
-    scores_ref [rows, LANES] f32: the router's softmax. With copies, the copy
-    slots' (s13, s2, w13, w2) follow in refs.
+    [rows, hidden]: the rows (copied from HBM under selection); scores_ref
+    [rows, LANES] f32: the router's softmax. With copies, the copy slots'
+    (s13, s2, w13, w2) follow in refs.
 
     Single-holder experts are fixed, and their first weight units are fetched
     first. The hit copied experts are compacted into a short list on the
@@ -540,10 +862,10 @@ def _kernel_scores(
         xsem,
         *stream_scratch,
     ) = refs
-    rows = x_vmem.shape[0]
     # Copy the rows into VMEM while selection and assignment run.
     x_copy = pltpu.make_async_copy(x_hbm, x_vmem, xsem.at[0])
     x_copy.start()
+    rows = x_vmem.shape[0]
     lane = jax.lax.broadcasted_iota(jnp.int32, (rows, LANES), 1)
     o_gid, o_hot, o_hprim, o_hcopy, o_slot = offsets
     my_rank = tab_s[0]
@@ -578,6 +900,26 @@ def _kernel_scores(
 
     def stream(choice):
         x_copy.wait()
+        if whole_expert:
+            _stream_whole_expert(
+                lambda e: tab_s[o_gid + e],
+                hits_s,
+                wtab_ref,
+                x_vmem,
+                s13_hbm,
+                s2_hbm,
+                w13_hbm,
+                w2_hbm,
+                out_ref,
+                ids,
+                *stream_scratch,
+                n_experts=n_experts,
+                inter=inter,
+                copy_hbm=copy_hbm,
+                choice=choice,
+            )
+            return
+        assert w13_parts is not None
         _stream(
             lambda e: tab_s[o_gid + e],
             hits_s,
@@ -664,7 +1006,14 @@ def _kernel_scores(
 
 @functools.partial(
     jax.jit,
-    static_argnames=("topk", "ranks", "has_copies", "vmem_limit_bytes", "interpret"),
+    static_argnames=(
+        "topk",
+        "ranks",
+        "has_copies",
+        "vmem_limit_bytes",
+        "whole_expert",
+        "interpret",
+    ),
 )
 def moe_lowtok_scores(
     x,
@@ -683,6 +1032,7 @@ def moe_lowtok_scores(
     ranks,
     has_copies,
     vmem_limit_bytes=None,
+    whole_expert=False,
     interpret=False,
 ):
     """The shard's MoE output for a few tokens, with the router's top-k and
@@ -704,13 +1054,24 @@ def moe_lowtok_scores(
     inter = two_inter // 2
     if scores.shape[1] != LANES or prim.size != LANES or copy.size != LANES:
         raise ValueError(f"the routing table is {LANES} experts wide")
-    if inter % LANE:
+    if hidden % LANE:
         raise ValueError(
-            f"the intermediate width {inter} must be a multiple of the lane tile"
+            f"the hidden width {hidden} must be a multiple of the lane tile"
+        )
+    if two_inter != 2 * inter or inter <= 0 or inter % LANE:
+        raise ValueError(
+            f"the gate-up width {two_inter} must equal 2 * inter with inter "
+            f"a multiple of {LANE}"
+        )
+    if w2.shape != (n_primary, inter, hidden):
+        raise ValueError(
+            f"expected w2 of shape {(n_primary, inter, hidden)}, got {w2.shape}"
         )
     if has_copies != (copy_weights is not None):
         raise ValueError("copy weights come exactly with has_copies")
-    n_experts = n_primary + (copy_weights[0].shape[0] if has_copies else 0)
+    n_experts = n_primary + (
+        copy_weights[0].shape[0] if copy_weights is not None else 0
+    )
     nc = hot1h.shape[-1]
     if nc % LANE:
         raise ValueError(f"the hot table's length {nc} must be a multiple of {LANE}")
@@ -732,16 +1093,67 @@ def moe_lowtok_scores(
         )
 
     weights = (*scales(s13, s2, n_primary), w13, w2)
-    if has_copies:
+    if copy_weights is not None:
         cw13, cs13, cw2, cs2 = copy_weights
         weights += (*scales(cs13, cs2, cw13.shape[0]), cw13, cw2)
     vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     if vmem_limit_bytes is None and not interpret:
-        vmem_limit_bytes = vmem_budget(rows, hidden, inter, w13_parts, two_inter)
+        vmem_limit_bytes = vmem_budget(
+            rows,
+            hidden,
+            inter,
+            w13_parts,
+            two_inter,
+            whole_expert=whole_expert,
+            scores=True,
+            nc=nc,
+        )
     half_width = 2 * (inter // w13_parts)
-    out = pl.pallas_call(
-        functools.partial(
+    in_specs = [vmem, vmem, vmem, hbm, vmem] + [hbm] * len(weights)
+    common_scratch = (
+        pltpu.SMEM((n_experts,), jnp.int32),
+        pltpu.VMEM((rows, LANES), jnp.float32),
+        pltpu.VMEM((1, LANES), jnp.int32),
+        pltpu.SMEM((1, LANES), jnp.int32),
+        pltpu.VMEM((8, nc), jnp.int32),
+        pltpu.SMEM((8, nc), jnp.int32),
+        pltpu.SemaphoreType.DMA((3,)),
+        pltpu.VMEM((rows, hidden), x_rows.dtype),
+        pltpu.SemaphoreType.DMA((1,)),
+    )
+    if whole_expert:
+        scratch_shapes = common_scratch + (
+            pltpu.VMEM((2, hidden, two_inter), FP8),
+            pltpu.VMEM((2, inter, hidden), FP8),
+            pltpu.VMEM((2, 1, two_inter), jnp.float32),
+            pltpu.VMEM((2, 1, hidden), jnp.float32),
+            pltpu.SemaphoreType.DMA((2,)),
+            pltpu.SemaphoreType.DMA((2,)),
+            pltpu.VMEM((rows, hidden), jnp.float32),
+        )
+        kernel_fn = functools.partial(
+            _kernel_scores,
+            n_experts=n_experts,
+            inter=inter,
+            topk=topk,
+            ranks=ranks,
+            has_copies=has_copies,
+            offsets=tuple(offsets),
+            whole_expert=True,
+        )
+    else:
+        scratch_shapes = common_scratch + (
+            pltpu.VMEM((w13_parts + 1, hidden, half_width), FP8),
+            pltpu.VMEM((w13_parts + 1, inter, hidden), FP8),
+            pltpu.VMEM((w13_parts + 1, 1, half_width), jnp.float32),
+            pltpu.VMEM((w13_parts + 1, 1, hidden), jnp.float32),
+            pltpu.SemaphoreType.DMA((w13_parts + 1,)),
+            pltpu.SemaphoreType.DMA((w13_parts + 1,)),
+            pltpu.VMEM((rows, two_inter), jnp.float32),
+            pltpu.VMEM((rows, hidden), jnp.float32),
+        )
+        kernel_fn = functools.partial(
             _kernel_scores,
             n_experts=n_experts,
             inter=inter,
@@ -750,35 +1162,20 @@ def moe_lowtok_scores(
             ranks=ranks,
             has_copies=has_copies,
             offsets=tuple(offsets),
-        ),
+            whole_expert=False,
+        )
+    out = pl.pallas_call(
+        kernel_fn,
         out_shape=jax.ShapeDtypeStruct((rows, hidden), x.dtype),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=1,
-            in_specs=[vmem, vmem, vmem, hbm, vmem] + [hbm] * len(weights),
+            in_specs=in_specs,
             out_specs=vmem,
-            scratch_shapes=(
-                pltpu.SMEM((n_experts,), jnp.int32),
-                pltpu.VMEM((rows, LANES), jnp.float32),
-                pltpu.VMEM((1, LANES), jnp.int32),
-                pltpu.SMEM((1, LANES), jnp.int32),
-                pltpu.VMEM((8, nc), jnp.int32),
-                pltpu.SMEM((8, nc), jnp.int32),
-                pltpu.SemaphoreType.DMA((3,)),
-                pltpu.VMEM((rows, hidden), x_rows.dtype),
-                pltpu.SemaphoreType.DMA((1,)),
-                pltpu.VMEM((w13_parts + 1, hidden, half_width), FP8),
-                pltpu.VMEM((w13_parts + 1, inter, hidden), FP8),
-                pltpu.VMEM((w13_parts + 1, 1, half_width), jnp.float32),
-                pltpu.VMEM((w13_parts + 1, 1, hidden), jnp.float32),
-                pltpu.SemaphoreType.DMA((w13_parts + 1,)),
-                pltpu.SemaphoreType.DMA((w13_parts + 1,)),
-                pltpu.VMEM((rows, two_inter), jnp.float32),
-                pltpu.VMEM((rows, hidden), jnp.float32),
-            ),
+            scratch_shapes=scratch_shapes,
             grid=(),
         ),
         compiler_params=pltpu.CompilerParams(vmem_limit_bytes=vmem_limit_bytes),
-        interpret=pltpu.InterpretParams() if interpret else False,
+        interpret=pltpu.InterpretParams(detect_races=True) if interpret else False,
         name="moe_lowtok_scores",
     )(
         jnp.asarray(tables, jnp.int32).reshape(-1),
@@ -900,5 +1297,5 @@ def moe_lowtok_reference(x, topk_ids_local, topk_weights, w13, s13, w2, s2):
             * a_s
             * s2[e][None, :]
         )
-        out = out + w[:, None] * o
+        out = out + jnp.where(w[:, None] != 0, w[:, None] * o, 0.0)
     return out.astype(x.dtype)

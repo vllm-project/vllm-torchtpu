@@ -676,6 +676,7 @@ def moe_gmm(
         "onehot_moe_permute_threshold",
         "rhs_quant_dtype",
         "skip_padded_tokens",
+        "lowtok_whole_expert",
     ),
 )
 def fused_moe_func(
@@ -696,6 +697,7 @@ def fused_moe_func(
     onehot_moe_permute_threshold: int = 0,
     rhs_quant_dtype: jnp.dtype | None = None,
     skip_padded_tokens: bool = False,
+    lowtok_whole_expert: bool = False,
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
 
@@ -773,11 +775,19 @@ def fused_moe_func(
             w1_bias,
             w2_bias,
             activation=activation,
+            whole_expert=lowtok_whole_expert,
         )
     ):
         logger.info_once("Selected few-token MoE kernel (moe_lowtok)")
         return moe_lowtok(
-            hidden_states, topk_ids, topk_weights, w1, w1_scale, w2, w2_scale
+            hidden_states,
+            topk_ids,
+            topk_weights,
+            w1,
+            w1_scale,
+            w2,
+            w2_scale,
+            whole_expert=lowtok_whole_expert,
         )
 
     # Decode services also compile large prefill buckets. Apply the token

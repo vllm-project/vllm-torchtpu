@@ -99,19 +99,29 @@ def scores_entry_refusal(layer, activation: str, adaptive: bool) -> str | None:
     terms the adaptive op itself checks at prebuild (softmax scoring, no
     expert-selection bias, grouping, custom router or routed scaling) are
     not repeated here."""
-    if not envs.TPU_MOE_LOWTOK_MAX_TOKENS:
+    max_tokens = envs.TPU_MOE_LOWTOK_MAX_TOKENS
+    if not max_tokens:
         return "TPU_MOE_LOWTOK_MAX_TOKENS unset"
     if not adaptive:
         return "it runs in the adaptive fused EP op (MOE_FUSED_EP_KERNEL_IMPL)"
-    if not layer.moe_config.moe_parallel_config.use_ep:
+    parallel = layer.moe_config.moe_parallel_config
+    if not parallel.use_ep:
         return "no expert parallelism"
+    ep_size = int(layer.moe_config.ep_size)
+    if max_tokens < ep_size:
+        return f"TPU_MOE_LOWTOK_MAX_TOKENS ({max_tokens}) is below ep_size ({ep_size})"
+    if (
+        getattr(parallel, "is_sequence_parallel", None) is False
+        and getattr(parallel, "tp_size", 1) > 1
+    ):
+        return "replicated token groups across TP ranks are not supported"
     if int(layer.global_num_experts) != LANES:
         return f"{layer.global_num_experts} experts, not {LANES}"
     if not layer.renormalize:
         return "no renormalization of the top-k weights"
     hidden = layer.w13_weight.shape[1]
     if not can_use_moe_lowtok(
-        jax.ShapeDtypeStruct((1, hidden), jnp.bfloat16),
+        jax.ShapeDtypeStruct((max(ep_size, 1), hidden), jnp.bfloat16),
         _shape(layer.w13_weight),
         _shape(layer.w2_weight),
         _shape(layer.w13_weight_scale_inv),
@@ -119,8 +129,12 @@ def scores_entry_refusal(layer, activation: str, adaptive: bool) -> str | None:
         getattr(layer, "w13_bias", None),
         getattr(layer, "w2_bias", None),
         activation=activation,
+        whole_expert=envs.TPU_MOE_LOWTOK_WHOLE_EXPERT,
+        scores=True,
     ):
-        return "the kernel does not support this layer's weights or activation"
+        return (
+            "the kernel does not support this layer's weights, activation, or VMEM cap"
+        )
     return None
 
 

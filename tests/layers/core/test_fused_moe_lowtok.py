@@ -26,6 +26,7 @@ import numpy as np
 import pytest
 
 from vllm_torchtpu.kernels.moe_lowtok import kernel as lowtok_kernel
+from vllm_torchtpu.layers.adapter import fused_moe as fused_moe_adapter
 from vllm_torchtpu.layers.core import fused_moe_gmm
 
 FP8 = jnp.float8_e4m3fn
@@ -96,9 +97,12 @@ def _inputs(tokens, seed=0):
     )
 
 
-def test_selected_for_few_tokens_and_matches_reference(hooked, monkeypatch):
+@pytest.mark.parametrize("whole_expert", [False, True])
+def test_selected_for_few_tokens_and_matches_reference(
+    hooked, monkeypatch, whole_expert
+):
     monkeypatch.setattr(fused_moe_gmm, "_LOWTOK_MAX_TOKENS", 16)
-    args = _inputs(tokens=5)
+    args = _inputs(tokens=5) | {"lowtok_whole_expert": whole_expert}
     got = np.asarray(hooked(**args), np.float32)
 
     # This shard's experts are START .. START + LOCAL - 1; the rest are masked.
@@ -118,6 +122,42 @@ def test_selected_for_few_tokens_and_matches_reference(hooked, monkeypatch):
     )
     assert np.abs(want).max() > 0
     np.testing.assert_allclose(got, want, atol=2e-2 * np.abs(want).max(), rtol=0)
+
+
+def test_custom_op_cache_separates_lowtok_whole_expert(monkeypatch):
+    monkeypatch.setattr(fused_moe_adapter, "_fused_moe_kernel_cache", {})
+    built_partials = []
+
+    class _FakeOp:
+        def __init__(self, name, fn):
+            self.name = name
+            self.fn = fn
+
+        def register_fake(self, _):
+            pass
+
+    def fake_jax_op(name, fn):
+        built_partials.append(fn)
+        return _FakeOp(name, fn)
+
+    monkeypatch.setattr(fused_moe_adapter.pallas, "jax_op", fake_jax_op)
+    monkeypatch.setattr(fused_moe_adapter.envs, "TPU_MOE_LOWTOK_WHOLE_EXPERT", False)
+    op_split = fused_moe_adapter._get_fused_moe_custom_op(
+        topk=TOPK, activation="silu", use_ep=True
+    )
+    monkeypatch.setattr(fused_moe_adapter.envs, "TPU_MOE_LOWTOK_WHOLE_EXPERT", True)
+    op_whole = fused_moe_adapter._get_fused_moe_custom_op(
+        topk=TOPK, activation="silu", use_ep=True
+    )
+    assert op_split is not op_whole
+    assert built_partials[0].keywords["lowtok_whole_expert"] is False
+    assert built_partials[1].keywords["lowtok_whole_expert"] is True
+    assert (
+        fused_moe_adapter._get_fused_moe_custom_op(
+            topk=TOPK, activation="silu", use_ep=True
+        )
+        is op_whole
+    )
 
 
 @pytest.mark.parametrize(

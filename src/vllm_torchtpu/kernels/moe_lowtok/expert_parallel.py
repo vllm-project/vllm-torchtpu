@@ -42,7 +42,18 @@ def _local_shape(array, ep):
 
 
 def moe_lowtok_ep_serves(
-    x, w1, w2, w1_scale, w2_scale, *, ep, max_tokens, activation, token_replica_groups
+    x,
+    w1,
+    w2,
+    w1_scale,
+    w2_scale,
+    *,
+    ep,
+    max_tokens,
+    activation,
+    token_replica_groups,
+    whole_expert=False,
+    scores=False,
 ):
     """Whether the few-token path takes this call: at most `max_tokens` rows
     after the EP all-gather, one shard per token group (no replicated rows),
@@ -54,7 +65,7 @@ def moe_lowtok_ep_serves(
     if token_replica_groups is not None and len(token_replica_groups[0]) != 1:
         return False
     return can_use_moe_lowtok(
-        _local_shape(x, ep),
+        x,
         _local_shape(w1, ep),
         _local_shape(w2, ep),
         _local_shape(w1_scale, ep),
@@ -62,6 +73,8 @@ def moe_lowtok_ep_serves(
         None,
         None,
         activation=activation,
+        whole_expert=whole_expert,
+        scores=scores,
     )
 
 
@@ -88,6 +101,7 @@ def moe_lowtok_ep(
     topk,
     renormalize,
     mesh_ep_ranks=None,
+    whole_expert=False,
     interpret=False,
 ):
     """One MoE layer for a small step, sharded over the mesh's one axis.
@@ -108,7 +122,8 @@ def moe_lowtok_ep(
     )
 
     def local_fn(x_l, gate_l, rank_l, w1_l, w2_l, w1s_l, w2s_l):
-        rows = lax.all_gather(x_l, axis, axis=0, tiled=True)
+        padded_local = jnp.any(jnp.isnan(gate_l), axis=-1, keepdims=True)
+        rows = lax.all_gather(jnp.where(padded_local, 0, x_l), axis, axis=0, tiled=True)
         logits = lax.all_gather(gate_l, axis, axis=0, tiled=True)
         padded_row = jnp.any(jnp.isnan(logits), axis=-1, keepdims=True)
         safe_logits = jnp.where(padded_row, 0.0, logits)
@@ -125,6 +140,7 @@ def moe_lowtok_ep(
             w1s_l,
             w2_l,
             w2s_l,
+            whole_expert=whole_expert,
             interpret=interpret,
         )
         # Sum the shards' partials in float32 and round once.
@@ -166,6 +182,7 @@ def moe_lowtok_scores_ep(
     *,
     mesh,
     topk,
+    whole_expert=False,
     interpret=False,
 ):
     """`moe_lowtok_ep` with the router and the holder choice in the kernel
@@ -190,7 +207,7 @@ def moe_lowtok_scores_ep(
         safe_gate = jnp.where(padded, 0.0, gate_l.astype(jnp.float32))
         scores = jax.nn.softmax(safe_gate, axis=-1)
         scores = jnp.where(padded, 0.0, scores)
-        rows = lax.all_gather(x_l, axis, axis=0, tiled=True)
+        rows = lax.all_gather(jnp.where(padded, 0, x_l), axis, axis=0, tiled=True)
         scores = lax.all_gather(scores, axis, axis=0, tiled=True)
         if has_copies:
             cw1, cw2, cw1s, cw2s = copies_l
@@ -212,6 +229,7 @@ def moe_lowtok_scores_ep(
             topk=topk,
             ranks=ep,
             has_copies=has_copies,
+            whole_expert=whole_expert,
             interpret=interpret,
         )
         # Sum the shards' partials in float32 and round once.

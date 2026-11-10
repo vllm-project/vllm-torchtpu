@@ -83,6 +83,7 @@ if TYPE_CHECKING:
     TPU_MOE_LOWTOK_MAX_TOKENS: int = 0
     TPU_MOE_LOWTOK_FROM_SCORES: bool = False
     TPU_MOE_LOWTOK_SCORES_STRICT: bool = False
+    TPU_MOE_LOWTOK_WHOLE_EXPERT: bool = False
     USE_MOE_TP_DECODE_KERNEL: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
@@ -772,6 +773,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Refuse to start when TPU_MOE_LOWTOK_FROM_SCORES is set and a MoE layer
     # cannot be served by the scores entry (otherwise the refusal is logged).
     "TPU_MOE_LOWTOK_SCORES_STRICT": env_bool("TPU_MOE_LOWTOK_SCORES_STRICT"),
+    # Stream whole gate|up (w13) and down (w2) expert weights through a
+    # two-slot ping-pong VMEM ring in the few-token MoE kernel instead of
+    # splitting w13 into column halves and materializing h_acc in VMEM.
+    "TPU_MOE_LOWTOK_WHOLE_EXPERT": env_bool("TPU_MOE_LOWTOK_WHOLE_EXPERT"),
     # Serve eligible tensor-parallel MoE layers (sigmoid + correction-bias
     # top-k with renormalization, one shared expert, FP8 per-channel weights)
     # with one op that also covers the shared expert and the TP all-reduce:

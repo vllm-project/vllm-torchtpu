@@ -63,6 +63,10 @@ At startup, `vllm-torchtpu` reports set environment variables that neither vLLM 
 | `TPU_ATTN_MOE_OVERLAP` | `False` | Overlaps Qwen3.5 MoE post-attention norm and router gate with TP collectives on token buckets >= 8 MiB per rank. |
 | `TPU_MOE_ROUTER_TOPK` | `"rowmax"` | MoE router top-k kernel implementation (`"rowmax"` or standard top-k). |
 | `TPU_MOE_FP8_ALL_GATHER` | `False` | Performs MoE activation all-gather in `fp8` before expert computation. |
+| `TPU_MOE_LOWTOK_MAX_TOKENS` | `0` | Opt-in. Maximum hidden-state row count (after any EP all-gather) served by the few-token expert-parallel MoE Pallas kernel (`0` disables it). |
+| `TPU_MOE_LOWTOK_FROM_SCORES` | `False` | Opt-in. Runs the few-token MoE kernel's scores entry inside the adaptive fused EP op for steps up to `TPU_MOE_LOWTOK_MAX_TOKENS` rows, performing router top-k and copied-expert holder selection in-kernel. |
+| `TPU_MOE_LOWTOK_SCORES_STRICT` | `False` | Opt-in. Raises at startup when `TPU_MOE_LOWTOK_FROM_SCORES` is enabled and an MoE layer cannot be served by the scores entry. |
+| `TPU_MOE_LOWTOK_WHOLE_EXPERT` | `False` | Opt-in. Streams full gate-and-up (`w13`) and down (`w2`) expert weights through a two-slot ping-pong VMEM ring in the few-token MoE kernel (`TPU_MOE_LOWTOK_MAX_TOKENS`), replacing strided half-width `w13` DMAs and intermediate `h_acc` VMEM round-trips with contiguous whole-expert DMAs and one loop iteration per hit expert. |
 | `ENABLE_QUANTIZED_MATMUL_KERNEL` | `False` | Dispatches quantized linear layers to the custom Pallas quantized matmul kernel. |
 | `QUANTIZE_ON_LOAD_PREFIXES` | `[]` | Comma-separated dot-bounded module prefix names to quantize to FP8 on load (e.g., `"self_attn,shared_experts,layers.0.mlp"`), including `VocabParallelEmbedding` and `ParallelLMHead`. |
 | `REQUANTIZE_WEIGHT_DTYPE` | `"float8_e4m3fn"` | Target weight dtype for load-time linear weight requantization. |

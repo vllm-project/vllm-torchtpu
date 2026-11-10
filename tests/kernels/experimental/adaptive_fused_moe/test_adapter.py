@@ -249,3 +249,77 @@ def test_op_cache_separates_replica_groups_and_passes_them_to_kernel(monkeypatch
     gate = SimpleNamespace(astype=lambda _: "gate")
     functions[-1](1, 2, 3, 4, 5, gate, 6)
     assert kernel.call_args.kwargs["token_replica_groups"] == groups
+
+
+def test_op_cache_separates_lowtok_whole_expert_and_forwards_it(monkeypatch):
+    monkeypatch.setattr(bridge, "_OPS", {})
+    monkeypatch.setattr(bridge, "moe_lowtok_ep_serves", Mock(return_value=True))
+    lowtok_ep = Mock(return_value="lowtok_out")
+    lowtok_scores_ep = Mock(return_value="lowtok_scores_out")
+    monkeypatch.setattr(bridge, "moe_lowtok_ep", lowtok_ep)
+    monkeypatch.setattr(bridge, "moe_lowtok_scores_ep", lowtok_scores_ep)
+    functions = {}
+
+    def create(name, fn, **kwargs):
+        op = Mock(name=name)
+        functions[op] = fn
+        return op
+
+    monkeypatch.setattr(bridge, "jax_op", create)
+    mesh = Mock(shape={bridge.EP_AXIS_NAME: 4})
+    split_op = bridge._build_op(
+        mesh, 2, True, "silu", None, lowtok_max_tokens=16, lowtok_whole_expert=False
+    )
+    whole_op = bridge._build_op(
+        mesh, 2, True, "silu", None, lowtok_max_tokens=16, lowtok_whole_expert=True
+    )
+    assert split_op is not whole_op
+    assert (
+        bridge._build_op(
+            mesh, 2, True, "silu", None, lowtok_max_tokens=16, lowtok_whole_expert=True
+        )
+        is whole_op
+    )
+    assert functions[whole_op](1, 2, 3, 4, 5, 6, 7) == "lowtok_out"
+    assert lowtok_ep.call_args.kwargs["whole_expert"] is True
+    assert bridge.moe_lowtok_ep_serves.call_args.kwargs["whole_expert"] is True
+    assert bridge.moe_lowtok_ep_serves.call_args.kwargs["scores"] is False
+
+    scores_op = bridge._build_op(
+        mesh,
+        2,
+        True,
+        "silu",
+        None,
+        lowtok_max_tokens=16,
+        lowtok_scores=True,
+        lowtok_whole_expert=True,
+    )
+    gating = SimpleNamespace(shape=(4, bridge.LANES))
+    assert (
+        functions[scores_op](1, 2, 3, 4, 5, gating, *range(7, 17))
+        == "lowtok_scores_out"
+    )
+    assert lowtok_scores_ep.call_args.kwargs["whole_expert"] is True
+    assert bridge.moe_lowtok_ep_serves.call_args.kwargs["scores"] is True
+
+
+def test_disabled_lowtok_skips_serves_check(monkeypatch):
+    import importlib
+
+    package = importlib.import_module(
+        "vllm_torchtpu.kernels.experimental.adaptive_fused_moe"
+    )
+    monkeypatch.setattr(package, "adaptive_fused_moe", Mock(return_value="adaptive"))
+    serves = Mock(side_effect=AssertionError("should not check lowtok when disabled"))
+    monkeypatch.setattr(bridge, "moe_lowtok_ep_serves", serves)
+    monkeypatch.setattr(bridge, "_OPS", {})
+    functions = []
+    monkeypatch.setattr(
+        bridge, "jax_op", lambda name, fn, **kw: functions.append(fn) or Mock()
+    )
+    mesh = Mock(shape={bridge.EP_AXIS_NAME: 4})
+    bridge._build_op(mesh, 2, True, "silu", None, lowtok_max_tokens=0)
+    gate = SimpleNamespace(astype=lambda _: "gate")
+    assert functions[-1](1, 2, 3, 4, 5, gate, 6) == "adaptive"
+    serves.assert_not_called()

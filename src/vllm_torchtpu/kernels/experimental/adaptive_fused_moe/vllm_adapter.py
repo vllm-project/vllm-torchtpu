@@ -187,6 +187,7 @@ def prebuild_adaptive_fused_moe(
         lowtok_max_tokens=envs.TPU_MOE_LOWTOK_MAX_TOKENS,
         lowtok_scores=lowtok_scores,
         lowtok_scores_copies=lowtok_scores_copies,
+        lowtok_whole_expert=envs.TPU_MOE_LOWTOK_WHOLE_EXPERT,
     )
     logger.info_once(
         "Experimental adaptive fused MoE armed | format=%s W1=%d W2=%d "
@@ -434,6 +435,7 @@ def _build_op(
     lowtok_max_tokens: int = 0,
     lowtok_scores: bool = False,
     lowtok_scores_copies: bool = False,
+    lowtok_whole_expert: bool = False,
 ) -> torch.library.CustomOpDef:
     """The op for this closure, built once per distinct closure and reused.
 
@@ -459,6 +461,7 @@ def _build_op(
         lowtok_max_tokens,
         lowtok_scores,
         lowtok_scores_copies,
+        lowtok_whole_expert,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -480,16 +483,22 @@ def _build_op(
         gating: jax.Array,
         rank: jax.Array,
     ) -> jax.Array:
-        if weight_format == "fp8" and moe_lowtok_ep_serves(
-            x,
-            w1,
-            w2,
-            w1_scale,
-            w2_scale,
-            ep=mesh.shape[EP_AXIS_NAME],
-            max_tokens=lowtok_max_tokens,
-            activation=activation,
-            token_replica_groups=token_replica_groups,
+        if (
+            lowtok_max_tokens > 0
+            and weight_format == "fp8"
+            and moe_lowtok_ep_serves(
+                x,
+                w1,
+                w2,
+                w1_scale,
+                w2_scale,
+                ep=mesh.shape[EP_AXIS_NAME],
+                max_tokens=lowtok_max_tokens,
+                activation=activation,
+                token_replica_groups=token_replica_groups,
+                whole_expert=lowtok_whole_expert,
+                scores=False,
+            )
         ):
             logger.info_once("Adaptive fused MoE: small steps run moe_lowtok")
             return moe_lowtok_ep(
@@ -504,6 +513,7 @@ def _build_op(
                 topk=topk,
                 renormalize=renormalize,
                 mesh_ep_ranks=mesh_expert_order,
+                whole_expert=lowtok_whole_expert,
             )
         # The router's top-k selector writes into an f32 accumulator ref, so a
         # bf16 gate output -- which is what the model's gate matmul produces --
@@ -552,16 +562,22 @@ def _build_op(
         copy_w1_scale: jax.Array,
         copy_w2_scale: jax.Array,
     ) -> jax.Array:
-        if gating.shape[1] == LANES and moe_lowtok_ep_serves(
-            x,
-            w1,
-            w2,
-            w1_scale,
-            w2_scale,
-            ep=mesh.shape[EP_AXIS_NAME],
-            max_tokens=lowtok_max_tokens,
-            activation=activation,
-            token_replica_groups=token_replica_groups,
+        if (
+            lowtok_max_tokens > 0
+            and gating.shape[1] == LANES
+            and moe_lowtok_ep_serves(
+                x,
+                w1,
+                w2,
+                w1_scale,
+                w2_scale,
+                ep=mesh.shape[EP_AXIS_NAME],
+                max_tokens=lowtok_max_tokens,
+                activation=activation,
+                token_replica_groups=token_replica_groups,
+                whole_expert=lowtok_whole_expert,
+                scores=True,
+            )
         ):
             logger.info_once("Adaptive fused MoE: small steps run the scores entry")
             return moe_lowtok_scores_ep(
@@ -581,8 +597,35 @@ def _build_op(
                 else None,
                 mesh=mesh,
                 topk=topk,
+                whole_expert=lowtok_whole_expert,
             )
-        return moe(x, w1, w2, w1_scale, w2_scale, gating, rank)
+        masked_gating = jnp.where(
+            padding.reshape(-1, 1) != 0,
+            jnp.full_like(gating, jnp.nan, dtype=jnp.float32),
+            gating.astype(jnp.float32),
+        )
+        if lowtok_scores_copies:
+            return adaptive_kernel.adaptive_fused_moe(
+                x,
+                w1,
+                w2,
+                w1_scale,
+                w2_scale,
+                masked_gating,
+                rank=rank,
+                topk=topk,
+                renormalize=renormalize,
+                mesh=mesh,
+                capacity=_TILE_M,
+                block=None,
+                ragged_stride=None,
+                weight_format=host.WeightFormat(weight_format),
+                rhs_qb=rhs_qb,
+                act_fn=activation,
+                mesh_ep_ranks=mesh_expert_order,
+                token_replica_groups=token_replica_groups,
+            )
+        return moe(x, w1, w2, w1_scale, w2_scale, masked_gating, rank)
 
     spec = PartitionSpec(EP_AXIS_NAME)
     # Stock jax_op. It used to size its outputs from the export's avals, where

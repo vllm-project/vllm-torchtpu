@@ -76,8 +76,9 @@ def _contiguous_tables(rank, local):
     )
 
 
+@pytest.mark.parametrize("whole_expert", [False, True])
 @pytest.mark.parametrize("tokens", [1, 7, 33])
-def test_scores_entry_matches_router_then_ids_entry(tokens):
+def test_scores_entry_matches_router_then_ids_entry(whole_expert, tokens):
     """With no copies, routing in the kernel equals the router's selection
     fed to the ids entry."""
     rank, local = 3, 8
@@ -92,7 +93,17 @@ def test_scores_entry_matches_router_then_ids_entry(tokens):
     weights, ids = router_select_reference(scores, TOPK)
     local_ids = jnp.where(ids // local == rank, ids - rank * local, -1)
     want = np.asarray(
-        moe_lowtok(x, local_ids, weights, w13, s13, w2, s2, interpret=_interpret()),
+        moe_lowtok(
+            x,
+            local_ids,
+            weights,
+            w13,
+            s13,
+            w2,
+            s2,
+            whole_expert=whole_expert,
+            interpret=_interpret(),
+        ),
         np.float32,
     )
     tables, primary, copy, onehot = _contiguous_tables(rank, local)
@@ -110,6 +121,7 @@ def test_scores_entry_matches_router_then_ids_entry(tokens):
         topk=TOPK,
         ranks=LANES // local,
         has_copies=False,
+        whole_expert=whole_expert,
         interpret=_interpret(),
     )
     assert np.abs(want).max() > 0
@@ -164,9 +176,11 @@ def _dense_reference(x, scores, w13, s13, w2, s2):
     )
 
 
+@pytest.mark.multichip
+@pytest.mark.parametrize("whole_expert", [False, True])
 @pytest.mark.parametrize("with_copies", [False, True])
 def test_expert_parallel_scores_entry_matches_dense_layer(
-    tmp_path, monkeypatch, with_copies
+    tmp_path, monkeypatch, whole_expert, with_copies
 ):
     """Each hit expert is served by exactly one holder: the ranks' summed
     outputs equal the dense layer, and padded rows come back zero."""
@@ -188,6 +202,8 @@ def test_expert_parallel_scores_entry_matches_dense_layer(
         cores = [list(range(r * LOCAL, (r + 1) * LOCAL)) for r in range(EP)]
     padding = np.zeros(rows, np.int32)
     padding[rows_per_rank - 1 :: rows_per_rank] = 1  # each rank's last row
+    # Inject NaN into a padded row to verify NaN values do not poison outputs.
+    x = x.at[rows_per_rank - 1].set(jnp.nan)
     w13, s13, w2, s2 = _weights(rng, LANES)
 
     per_rank = [
@@ -215,6 +231,7 @@ def test_expert_parallel_scores_entry_matches_dense_layer(
         copy_weights,
         mesh=mesh,
         topk=TOPK,
+        whole_expert=whole_expert,
         interpret=_interpret(),
     )
     got = np.asarray(got, np.float32)
@@ -226,6 +243,165 @@ def test_expert_parallel_scores_entry_matches_dense_layer(
     np.testing.assert_allclose(
         got[valid] / scale, want[valid] / scale, atol=3e-2, rtol=0
     )
+
+
+@pytest.mark.parametrize("n_fixed_hits,n_copy_hits", [(0, 0), (0, 3), (1, 2)])
+def test_scores_whole_expert_copied_only_late_prime(
+    tmp_path, monkeypatch, n_fixed_hits, n_copy_hits
+):
+    """Cover holder-choice late priming and ring wraparound: empty (`0, 0`),
+    copied-only wraparound (`0, 3`), and mixed primary + copied wraparound
+    (`1, 2`)."""
+    rng = np.random.default_rng(77 + n_fixed_hits * 7 + n_copy_hits)
+    path, cores, _ = _copies_table(tmp_path, seed=11)
+    monkeypatch.setenv("TPU_EXPERT_PLACEMENT", path)
+    rank0_copies = cores[0][LOCAL:]
+    rank7_copies = set(cores[EP - 1][LOCAL:])
+    rank0_unshared = [e for e in cores[0][:LOCAL] if e not in rank7_copies]
+    rank1_fixed = [e for e in cores[1][:LOCAL] if e not in rank0_copies][:TOPK]
+    rank2_fixed = cores[2][:TOPK]
+
+    tokens = 4
+    x = jnp.asarray(
+        rng.standard_normal((tokens, HIDDEN)).astype(np.float32), jnp.bfloat16
+    )
+    logits = np.full((tokens, LANES), -30.0, dtype=np.float32)
+    if n_fixed_hits == 0 and n_copy_hits == 0:
+        logits[:, rank2_fixed] = 10.0
+    else:
+        # Load rank 1 with 4 fixed hits so rank 0 wins holder choice on its
+        # copy slots while staying strictly below rank 1's load.
+        logits[0, rank1_fixed] = 10.0
+        selected = (
+            rank0_unshared[:n_fixed_hits]
+            + rank0_copies[:n_copy_hits]
+            + rank2_fixed[: TOPK - n_fixed_hits - n_copy_hits]
+        )
+        for r in range(1, tokens):
+            logits[r, selected] = 10.0
+    scores = jax.nn.softmax(jnp.asarray(logits), axis=-1)
+
+    t0 = scores_entry.build_scores_tables("model.layers.0.mlp.experts", 0, EP)
+    w13, s13, w2, s2 = _weights(rng, LANES)
+    prim0 = np.asarray(cores[0][:LOCAL])
+    copy0 = np.asarray(cores[0][LOCAL:])
+    copy_weights = (w13[copy0], s13[copy0], w2[copy0], s2[copy0])
+
+    split_out = np.asarray(
+        moe_lowtok_scores(
+            x,
+            scores,
+            t0.tables,
+            t0.primary,
+            t0.copy,
+            t0.hot_onehot,
+            w13[prim0],
+            s13[prim0],
+            w2[prim0],
+            s2[prim0],
+            copy_weights,
+            topk=TOPK,
+            ranks=EP,
+            has_copies=True,
+            whole_expert=False,
+            interpret=_interpret(),
+        ),
+        np.float32,
+    )
+    whole_out = np.asarray(
+        moe_lowtok_scores(
+            x,
+            scores,
+            t0.tables,
+            t0.primary,
+            t0.copy,
+            t0.hot_onehot,
+            w13[prim0],
+            s13[prim0],
+            w2[prim0],
+            s2[prim0],
+            copy_weights,
+            topk=TOPK,
+            ranks=EP,
+            has_copies=True,
+            whole_expert=True,
+            interpret=_interpret(),
+        ),
+        np.float32,
+    )
+    if n_fixed_hits == 0 and n_copy_hits == 0:
+        assert np.all(split_out == 0)
+        assert np.all(whole_out == 0)
+        return
+    assert np.abs(split_out).max() > 0
+    scale = float(np.abs(split_out).max())
+    tol = 1e-6 if _interpret() else 5e-3
+    np.testing.assert_allclose(whole_out / scale, split_out / scale, atol=tol, rtol=0)
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("whole_expert", [False, True])
+def test_tpu_scores_entry_whole_expert(whole_expert):
+    if jax.default_backend() != "tpu":
+        pytest.skip("requires TPU")
+    rank, local, tokens = 3, 8, 8
+    rng = np.random.default_rng(53)
+    x = jnp.asarray(
+        rng.standard_normal((tokens, HIDDEN)).astype(np.float32), jnp.bfloat16
+    )
+    logits = rng.standard_normal((tokens, LANES)).astype(np.float32)
+    logits[:, rank * local : (rank + 1) * local] += 3.0
+    scores = jax.nn.softmax(jnp.asarray(logits), axis=-1)
+    w13, s13, w2, s2 = _weights(rng, local)
+    weights, ids = router_select_reference(scores, TOPK)
+    local_ids = jnp.where(ids // local == rank, ids - rank * local, -1)
+    want = np.asarray(
+        moe_lowtok(
+            x,
+            local_ids,
+            weights,
+            w13,
+            s13,
+            w2,
+            s2,
+            whole_expert=whole_expert,
+            interpret=False,
+        ),
+        np.float32,
+    )
+    tables, primary, copy, onehot = _contiguous_tables(rank, local)
+    got = np.asarray(
+        moe_lowtok_scores(
+            x,
+            scores,
+            tables,
+            primary,
+            copy,
+            onehot,
+            w13,
+            s13,
+            w2,
+            s2,
+            topk=TOPK,
+            ranks=LANES // local,
+            has_copies=False,
+            whole_expert=whole_expert,
+            interpret=False,
+        ),
+        np.float32,
+    )
+    scale = float(np.abs(want).max())
+    np.testing.assert_allclose(got / scale, want / scale, atol=1e-5, rtol=0)
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("n_fixed_hits,n_copy_hits", [(0, 0), (0, 3), (1, 2)])
+def test_tpu_scores_whole_expert_copied_hits(n_fixed_hits, n_copy_hits):
+    """Compiles and runs whole_expert=True with has_copies=True on TPU across
+    0-hit, copied-only late-prime, and mixed fixed+copy hit counts."""
+    if jax.default_backend() != "tpu":
+        pytest.skip("requires TPU")
+    test_scores_whole_expert_copied_only_late_prime(n_fixed_hits, n_copy_hits)
 
 
 def test_hot_tables_must_list_every_copy():

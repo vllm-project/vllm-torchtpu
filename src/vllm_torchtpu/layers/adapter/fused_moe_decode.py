@@ -120,6 +120,7 @@ def _gmm_layer(
     topk,
     shared_gated,
     routed_scale,
+    lowtok_whole_expert=False,
 ):
     """Above the cap: the layer as the runner computes it with the kernel off,
     shared expert + routed GMM MoE (scaled by routed_scale), all-reduced. Per
@@ -142,6 +143,7 @@ def _gmm_layer(
         onehot_moe_permute_threshold=resolve_onehot_permute_threshold(),
         rhs_quant_dtype=None,
         skip_padded_tokens=envs.TPU_MOE_SKIP_PADDED_TOKENS,
+        lowtok_whole_expert=lowtok_whole_expert,
     )
     if routed_scale != 1.0:
         routed = routed * routed_scale
@@ -185,6 +187,7 @@ def _layer(
     max_tokens,
     shared_gated=True,
     routed_scale=1.0,
+    lowtok_whole_expert=False,
 ):
     """Per-rank body of the op: the kernel up to `max_tokens`, GMM MoE above.
     An ungated layer still passes its placeholder shared_gate_weight operand
@@ -208,6 +211,7 @@ def _layer(
             topk=topk,
             shared_gated=shared_gated,
             routed_scale=routed_scale,
+            lowtok_whole_expert=lowtok_whole_expert,
         )
     # Trace-time, once per token bucket: the evidence that the kernel serves
     # this shape, and in which mode (the kernel's name carries it too).
@@ -255,6 +259,7 @@ def _build_op(
     shared_gated: bool = True,
     routed_scale: float = 1.0,
 ):
+    lowtok_whole_expert = bool(envs.TPU_MOE_LOWTOK_WHOLE_EXPERT)
     key = (
         id(mesh),
         n_ranks,
@@ -263,6 +268,7 @@ def _build_op(
         max_tokens,
         shared_gated,
         routed_scale,
+        lowtok_whole_expert,
     )
     op = _OPS.get(key)
     if op is not None:
@@ -276,6 +282,7 @@ def _build_op(
         max_tokens=max_tokens,
         shared_gated=shared_gated,
         routed_scale=routed_scale,
+        lowtok_whole_expert=lowtok_whole_expert,
     )
 
     # torch_tpu infers static arguments from annotations: every operand is a
