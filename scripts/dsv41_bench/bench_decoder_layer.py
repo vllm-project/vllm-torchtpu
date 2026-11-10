@@ -247,7 +247,7 @@ def reconcile_40_layer_step(
         call (`2 calls/layer = 0.418 ms/layer` in `tp`, `0.084 ms/layer` in `sp`).
       - Collective: `0.253 ms` (`tp` `all_reduce`) vs `0.107 + 0.091 = 0.198 ms` (`sp`
         `reduce_scatter + all_gather`), `2 calls/layer`.
-    - `bench_sparse_mla_swa.py`:
+    - `bench_sparse_mla_swa.py` (removed with the FP8 NoPE + RoPE cache):
       - `swa_only` (`L0, L1`): `0.282 ms/layer`.
       - Compressed `SparseMLA + SWA` (`L2..39`): `1.470 ms/layer` (`baseline`) ->
         `1.376 ms/layer` (`precompact`) -> `0.900 ms/layer` (`token_parallel`).
@@ -475,7 +475,7 @@ def reconcile_40_layer_decode_step(
     explicitly as an `[UNVERIFIED]` residual.
 
     Cited measurements at `num_seqs=16, kv_len=100000, TP=8`:
-    - `bench_sparse_mla_swa.py` (`tpu7x-8`):
+    - `bench_sparse_mla_swa.py` (`tpu7x-8`, removed with the FP8 NoPE + RoPE cache):
       - `q=1, T=16`: `swa_only = 0.5687 ms` (`min 0.5063 ms`); `all_precompact` (`38L`):
         `0.5268 ms/layer` (baseline) -> `0.4810 ms/layer` (dynamic
         `csa_gather` `num_row_subchunks=16`; rank0 `0.6236 -> 0.5784 ms/layer`).

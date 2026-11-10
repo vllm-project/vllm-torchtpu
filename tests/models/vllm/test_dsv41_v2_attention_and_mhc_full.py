@@ -1207,32 +1207,3 @@ class TestDeepseekV41AttentionMethods:
         attn.indexer = SimpleNamespace(indexer_op=mock_indexer_op_none)
         idx_none = attn._select_indices(scores, lengths, logical, 1)
         assert idx_none.shape == (1, 4)
-
-    def test_process_weights_after_loading(self, monkeypatch):
-        attn = object.__new__(v2_attn.DeepseekV41Attention)
-        torch.nn.Module.__init__(attn)
-        attn.attn_sink = torch.randn(8)
-        attn._full_attn_sink = torch.empty(8)
-        attn._init_local_q_weights = MagicMock()
-        attn._assert_o_proj_supported = MagicMock()
-        attn.wo_a = SimpleNamespace(
-            weight=SimpleNamespace(device=SimpleNamespace(type="cpu"))
-        )
-
-        monkeypatch.setattr(
-            "vllm_torchtpu.models.vllm.deepseek_v4.attention.VllmDeepseekV4MLAAttention.process_weights_after_loading",
-            lambda self, act: None,
-        )
-
-        # 1. tp_size == 1
-        monkeypatch.setattr(v2_attn, "get_tensor_model_parallel_world_size", lambda: 1)
-        attn.process_weights_after_loading(torch.bfloat16)
-        assert torch.equal(attn._full_attn_sink, attn.attn_sink.float())
-
-        # 2. tp_size > 1
-        monkeypatch.setattr(v2_attn, "get_tensor_model_parallel_world_size", lambda: 2)
-        monkeypatch.setattr(
-            v2_attn, "tensor_model_parallel_all_gather", lambda t, dim=0: t
-        )
-        attn.process_weights_after_loading(torch.bfloat16)
-        assert torch.equal(attn._full_attn_sink, attn.attn_sink.float())

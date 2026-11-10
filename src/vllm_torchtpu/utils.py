@@ -279,9 +279,6 @@ def tpu_bind_kv_cache(
         | None
     ) = None,
     native_cache_layouts: Mapping[str, tuple] | None = None,
-    native_rope_pools: (
-        Mapping[str, torch.Tensor | tuple[torch.Tensor, torch.Tensor]] | None
-    ) = None,
     native_scale_pools: (
         Mapping[str, torch.Tensor | tuple[torch.Tensor, torch.Tensor]] | None
     ) = None,
@@ -321,13 +318,6 @@ def tpu_bind_kv_cache(
                     raw_cache=raw,
                     layout=native_cache_layouts[layer_name],
                     scale_pool=native_scale_pools.get(layer_name),
-                )
-            elif native_rope_pools is not None:
-                layer.bind_kv_cache(
-                    kv_cache,
-                    raw_cache=raw,
-                    layout=native_cache_layouts[layer_name],
-                    rope_pool=native_rope_pools.get(layer_name),
                 )
             else:
                 layer.bind_kv_cache(

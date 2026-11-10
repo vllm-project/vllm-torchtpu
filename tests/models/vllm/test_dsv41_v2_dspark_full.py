@@ -25,9 +25,6 @@ import torch.nn as nn
 
 from vllm_torchtpu.models.vllm import register_models
 from vllm_torchtpu.models.vllm.deepseek_v41.v2 import (
-    attention as v2_attn,
-)
-from vllm_torchtpu.models.vllm.deepseek_v41.v2 import (
     attention_kernels as v2_kernels,
 )
 from vllm_torchtpu.models.vllm.deepseek_v41.v2 import (
@@ -36,7 +33,6 @@ from vllm_torchtpu.models.vllm.deepseek_v41.v2 import (
 from vllm_torchtpu.models.vllm.deepseek_v41.v2 import (
     model as v2_model,
 )
-from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import PagedCacheRows
 
 
 def test_dspark_model_registration():
@@ -178,91 +174,6 @@ def test_attend_window_width_over_512(monkeypatch: pytest.MonkeyPatch):
     out = v2_kernels._attend_window(q, pool, records, state, 1.0)
     assert attend_called is True
     assert out is state
-
-
-def test_prepare_tpu_non_causal_dspark_swa(monkeypatch: pytest.MonkeyPatch):
-    attn: Any = object.__new__(v2_attn.DeepseekV41Attention)
-    torch.nn.Module.__init__(attn)
-    attn.prefix = "swa_pfx"
-    attn.window_size = 512
-    attn._ced_decoder = False
-    attn._ced_global_from_encoder = False
-    attn._local_q_attn = False
-    attn.compressor = None
-    attn.indexer = None
-    attn.compress_ratio = 2
-    attn._config = {"index_topk": 4}
-    attn._max_model_len = 256
-    attn._fp8_kv = True
-    attn.n_local_heads = 2
-    attn.head_dim = 8
-    attn.scale = 0.25
-    attn.attn_sink = torch.zeros(2)
-    attn._swa_max_requests = 16
-    attn._precompact_records = False
-    attn._token_parallel_attn = False
-    attn._full_attn_sink = False
-    attn._tp_rank_1d = 0
-    attn.topk_indices_buffer = torch.full((16, 8), -1, dtype=torch.int32)
-    attn._rotate = lambda x, p: x
-    attn.wq_b = lambda qr: qr
-    attn.non_causal_multi_token_decode = True
-    attn.dspark_block_size = 16
-
-    cache_mock = MagicMock(spec=PagedCacheRows)
-    cache_mock.numel.return_value = 1024
-    cache_mock.shape = (64, 64, 512)
-    cache_mock.page_stride = 64
-    cache_mock.row_offset = 100
-    cache_mock.row_indices = lambda slots: 100 + slots
-    cache_mock.pages.return_value = torch.arange(16, dtype=torch.int32).unsqueeze(0)
-
-    attn.swa_cache_layer = SimpleNamespace(prefix="swa_pfx", kv_cache=cache_mock)
-    attn.kv_cache = cache_mock
-    attn._static_forward_context = {"swa_pfx": SimpleNamespace(kv_cache=cache_mock)}
-    attn.compressed_cache_prefix = "swa_pfx"
-
-    # 4 tokens in a draft block at positions [20, 21, 22, 23] with seq_len=24
-    positions = torch.tensor([20, 21, 22, 23], dtype=torch.long)
-    swa_md = SimpleNamespace(
-        seq_lens=torch.tensor([24], dtype=torch.int32),
-        query_start_loc=torch.tensor([0, 4], dtype=torch.int32),
-        block_tables=torch.arange(16, dtype=torch.int32).unsqueeze(0),
-        slot_mapping=torch.tensor([20, 21, 22, 23], dtype=torch.long),
-    )
-    ctx = SimpleNamespace(attn_metadata={"swa_pfx": swa_md}, additional_kwargs={})
-    monkeypatch.setattr(v2_attn, "get_forward_context", lambda: ctx)
-    monkeypatch.setattr(v2_attn, "_insert", lambda *a, **kw: None)
-
-    captured_records: list[torch.Tensor] = []
-
-    def fake_sparse_fp8_attn(q, swa_c, main_c, records, main_rec, *args, **kwargs):
-        captured_records.append(records.clone())
-        return torch.zeros_like(q)
-
-    monkeypatch.setattr(v2_attn, "sparse_fp8_attention", fake_sparse_fp8_attn)
-
-    hidden = torch.zeros((4, 16))
-    qr = torch.zeros((4, 16))
-    kv = torch.zeros((4, 16))
-    out = torch.zeros((4, 2, 8))
-
-    # Path A: uncached (no stage_attention_cache_scope)
-    attn._prepare_tpu(hidden, qr, kv, None, None, None, positions, out)
-    assert len(captured_records) == 1
-    rec_uncached = captured_records[0]
-    assert rec_uncached.shape == (4, 576)
-    # Token 0 (pos=20) attends up to pos=23 (end_pos=24) in non-causal mode!
-    assert int(rec_uncached[0, 23].item()) >= 0
-    assert int(rec_uncached[0, 24].item()) == -1
-
-    # Path B: with stage_attention_cache_scope
-    captured_records.clear()
-    with v2_attn.stage_attention_cache_scope():
-        attn._prepare_tpu(hidden, qr, kv, None, None, None, positions, out)
-    assert len(captured_records) == 1
-    rec_cached = captured_records[0]
-    assert torch.equal(rec_cached, rec_uncached)
 
 
 def test_ced_aux_hidden_states_propagation(monkeypatch: pytest.MonkeyPatch):
@@ -1257,101 +1168,6 @@ def test_v2_model_dspark_coverage(monkeypatch: pytest.MonkeyPatch):
         err_match = "does not support speculative method 'unsupported_method'"
         with pytest.raises(NotImplementedError, match=err_match):
             v2_model.DeepseekV41ForCausalLM.__init__(causal_obj, vllm_config=base_cfg)
-
-
-def test_v2_attention_dspark_coverage(monkeypatch: pytest.MonkeyPatch):
-    """Test changes in deepseek_v41/v2/attention.py: non_causal=False branches."""
-    attn: Any = object.__new__(v2_attn.DeepseekV41Attention)
-    torch.nn.Module.__init__(attn)
-    attn.prefix = "swa_pfx"
-    attn.window_size = 64
-    attn._ced_decoder = False
-    attn._ced_global_from_encoder = False
-    attn._local_q_attn = False
-    attn.compressor = None
-    attn.indexer = None
-    attn.compress_ratio = 2
-    attn._config = {"index_topk": 4}
-    attn._max_model_len = 256
-    attn._fp8_kv = True
-    attn.n_local_heads = 2
-    attn.head_dim = 8
-    attn.scale = 0.25
-    attn.attn_sink = torch.zeros(2)
-    attn._swa_max_requests = 16
-    attn._precompact_records = False
-    attn._token_parallel_attn = False
-    attn._full_attn_sink = False
-    attn._tp_rank_1d = 0
-    attn.topk_indices_buffer = torch.full((16, 8), -1, dtype=torch.int32)
-    attn._rotate = lambda x, p: x
-    attn.wq_b = lambda qr: qr
-    attn.non_causal_multi_token_decode = False  # non_causal = False!
-
-    cache_mock = MagicMock(spec=PagedCacheRows)
-    cache_mock.numel.return_value = 1024
-    cache_mock.shape = (64, 64, 512)
-    cache_mock.page_stride = 64
-    cache_mock.row_offset = 100
-    cache_mock.row_indices = lambda slots: 100 + slots
-    cache_mock.pages.return_value = torch.arange(16, dtype=torch.int32).unsqueeze(0)
-
-    attn.swa_cache_layer = SimpleNamespace(prefix="swa_pfx", kv_cache=cache_mock)
-    attn.kv_cache = cache_mock
-    attn._static_forward_context = {"swa_pfx": SimpleNamespace(kv_cache=cache_mock)}
-    attn.compressed_cache_prefix = "swa_pfx"
-
-    positions = torch.tensor([10, 11], dtype=torch.long)
-    swa_md = SimpleNamespace(
-        seq_lens=torch.tensor([12], dtype=torch.int32),
-        query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
-        block_tables=torch.arange(16, dtype=torch.int32).unsqueeze(0),
-        slot_mapping=torch.tensor([10, 11], dtype=torch.long),
-    )
-    ctx = SimpleNamespace(attn_metadata={"swa_pfx": swa_md}, additional_kwargs={})
-    monkeypatch.setattr(v2_attn, "get_forward_context", lambda: ctx)
-    monkeypatch.setattr(v2_attn, "_insert", lambda *a, **kw: None)
-    monkeypatch.setattr(
-        v2_attn, "sparse_fp8_attention", lambda *a, **kw: torch.zeros_like(a[0])
-    )
-
-    hidden = torch.zeros((2, 16))
-    qr = torch.zeros((2, 16))
-    kv = torch.zeros((2, 16))
-    out = torch.zeros((2, 2, 8))
-
-    # 1. Uncached path with non_causal=False -> hits lines 995-1001
-    attn._prepare_tpu(hidden, qr, kv, None, None, None, positions, out)
-
-    # 2. Stage cache miss path with non_causal=False -> hits lines 877-888
-    with v2_attn.stage_attention_cache_scope():
-        attn._prepare_tpu(hidden, qr, kv, None, None, None, positions, out)
-
-    # 3. Uncached path with non_causal=True but seq_lens.numel() == 0 ->
-    # hits line 979 else branch (995-1001)
-    attn.non_causal_multi_token_decode = True
-    swa_md_empty = SimpleNamespace(
-        seq_lens=torch.empty(0, dtype=torch.int32),
-        query_start_loc=torch.tensor([0], dtype=torch.int32),
-        block_tables=torch.empty((0, 0), dtype=torch.int32),
-        slot_mapping=torch.tensor([-1, -1], dtype=torch.long),
-    )
-    ctx.attn_metadata["swa_pfx"] = swa_md_empty
-    monkeypatch.setattr(
-        v2_attn, "_block_table", lambda md: torch.empty((0, 0), dtype=torch.int32)
-    )
-    monkeypatch.setattr(
-        v2_attn, "_cache_slots", lambda cache, md, pos: torch.tensor([-1, -1])
-    )
-    monkeypatch.setattr(
-        v2_attn, "_token_requests", lambda md, pos: torch.tensor([0, 0])
-    )
-    monkeypatch.setattr(
-        v2_attn,
-        "_row_slots",
-        lambda *a, **kw: torch.zeros((2, 64), dtype=torch.long),
-    )
-    attn._prepare_tpu(hidden, qr, kv, None, None, None, positions, out)
 
 
 def test_v2_attention_kernels_attend_window_union_path(

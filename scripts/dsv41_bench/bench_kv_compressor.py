@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Standalone micro-benchmark & verifier for DeepSeek-V4.1 KV Compressor & Engram.
 
-Exercises the V4.1 `v2` KV Compressor (`project`, `save_compress_norm`, FP8
-`encode_fp8_kv` + `PagedCacheRows.write`) and `ParallelEngramEmbedding`
+Exercises the V4.1 `v2` KV Compressor (`project`, `save_compress_norm`, CSA2
+FP8 `PagedCacheRows.write`) and `ParallelEngramEmbedding`
 (`cpu_offload=True` Host DRAM vs `cpu_offload=False` HBM) without starting a
 vLLM server.
 """
@@ -19,7 +19,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
 import torch
@@ -30,14 +29,11 @@ if str(_BENCH_DIR) not in sys.path:
 
 import common  # noqa: E402
 
-from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout  # noqa: E402
 from vllm_torchtpu.models.vllm.deepseek_v41.common.engram import (  # noqa: E402
     ParallelEngramEmbedding,
 )
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import (  # noqa: E402
-    NOPE_DIM,
     PagedCacheRows,
-    encode_fp8_kv,
     initialize_cache_ops,
 )
 
@@ -52,6 +48,7 @@ SUBOPS: tuple[str, ...] = (
 HIDDEN_SIZE = 5120
 KV_LORA_RANK = 512
 QK_ROPE_HEAD_DIM = 64
+NOPE_DIM = KV_LORA_RANK - QK_ROPE_HEAD_DIM  # 448
 COMPRESSOR_OUT_DIM = KV_LORA_RANK + QK_ROPE_HEAD_DIM  # 576
 ENGRAM_HEAD_DIM = 256
 ENGRAM_BLOCK_SIZE = 32
@@ -110,32 +107,18 @@ def _rope_ref(k_pe: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch
     return torch.cat((out1, out2), dim=-1).to(k_pe.dtype)
 
 
-def _encode_fp8_kv_numpy_ref(
+def _encode_csa2_numpy_ref(
     latent_bf16: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    arr = latent_bf16.detach().cpu().float().numpy().astype(np.float64)
-    n = arr.shape[0]
-    nope = arr[:, :NOPE_DIM]
-    amax = np.maximum(np.abs(nope).reshape(n, -1, 64).max(axis=1), 1e-4)
-    exponent = np.ceil(np.log2(amax / 448.0)).astype(np.int64)
-    q = (nope / np.tile(2.0**exponent, NOPE_DIM // 64)).astype(np.float32)
-    slab_bytes = np.concatenate(
-        (
-            q.astype(ml_dtypes.float8_e4m3fn).view(np.uint8),
-            (exponent + 127).astype(np.uint8),
-        ),
-        axis=-1,
-    )
-    latent_jnp = jnp.asarray(
-        latent_bf16.detach().cpu().float().numpy(), dtype=jnp.bfloat16
-    )
-    words_jnp, rope_jnp = encode_fp8_kv(latent_jnp)
-    got_slabs = np.asarray(csa_cache_layout.words_to_slabs(words_jnp)).reshape(n, 512)
-    np.testing.assert_array_equal(got_slabs, slab_bytes)
-    return (
-        torch.from_numpy(np.asarray(words_jnp, dtype=np.int32)),
-        torch.from_numpy(np.asarray(rope_jnp, dtype=np.int32)),
-    )
+    """CSA2 records: e4m3 of ``x / scale``, byte g of word lane = feature g*128+lane."""
+    arr = latent_bf16.detach().cpu().float().numpy()
+    # XLA folds `amax / 448` into a multiply by its reciprocal; match it bitwise.
+    amax = np.maximum(np.abs(arr).max(axis=1), np.float32(1e-4))
+    scales = (amax * np.float32(1 / 448)).astype(np.float32)
+    q = (arr / scales[:, None]).astype(ml_dtypes.float8_e4m3fn).view(np.uint8)
+    planes = q.reshape(-1, 4, 128).astype(np.uint32)
+    words = planes[:, 0] | planes[:, 1] << 8 | planes[:, 2] << 16 | planes[:, 3] << 24
+    return torch.from_numpy(words.view(np.int32)), torch.from_numpy(scales)
 
 
 def compute_engram_hbm_savings_bytes(tp_size: int = 8) -> dict[str, float]:
@@ -289,26 +272,26 @@ def run_write_fp8_only(
 
     raw_rows = total_slots
     raw = torch.zeros((raw_rows, 128), dtype=torch.int32, device=device)
-    rope = torch.zeros((raw_rows // 4, 128), dtype=torch.int32, device=device)
+    scale = torch.zeros((raw_rows,), dtype=torch.float32, device=device)
     layout = ((num_pages, page_size, 512), torch.uint8, page_size * 512, 0)
-    cache = PagedCacheRows(raw, layout, rope)
+    cache = PagedCacheRows(raw, layout, scale)
     slots = slots_cpu.to(device)
     values = values_cpu.to(device)
 
     def _op() -> tuple[torch.Tensor, torch.Tensor]:
         cache.write(slots, values)
-        _sync_if_tpu(device, (raw, rope))
-        return raw, rope
+        _sync_if_tpu(device, (raw, scale))
+        return raw, scale
 
     v_report: dict[str, Any] | None = None
     if verify:
         _op()
-        exp_words, exp_rope = _encode_fp8_kv_numpy_ref(values_cpu)
+        exp_words, exp_scales = _encode_csa2_numpy_ref(values_cpu)
         got_words = raw[:num_tokens].detach().cpu()
-        got_rope = rope.view(-1, 32)[:num_tokens].detach().cpu()
+        got_scales = scale[:num_tokens].detach().cpu()
         res = common.verify_outputs(
-            {"main_words": got_words, "rope_words": got_rope},
-            {"main_words": exp_words, "rope_words": exp_rope},
+            {"main_words": got_words, "scales": got_scales},
+            {"main_words": exp_words, "scales": exp_scales},
             common.EXACT,
             label="compressor.write_fp8_only",
         )
@@ -320,8 +303,8 @@ def run_write_fp8_only(
     lat_ms = _bench_ms(_op, warmup=warmup, iters=iters)
     est = common.RooflineEstimate(
         name="write_fp8_only",
-        flops=float(num_tokens * NOPE_DIM * 6),
-        hbm_bytes=float(num_tokens * (1024 + 512 + 128)),
+        flops=float(num_tokens * KV_LORA_RANK * 6),
+        hbm_bytes=float(num_tokens * (1024 + 512 + 4)),
     )
     return est.report(hw, lat_ms), v_report
 

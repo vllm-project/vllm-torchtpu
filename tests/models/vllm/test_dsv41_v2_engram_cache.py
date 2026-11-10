@@ -24,12 +24,6 @@ from vllm_torchtpu.models.vllm.deepseek_v41.common.engram import (
     _gather_engram_rows,
     _load_local_rows,
 )
-from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import (
-    SPARSECORE_MAX_POOL_BANKS,
-    SPARSECORE_MAX_POOL_BYTES,
-    reserve_rope_companion,
-    uses_fp8_rope_companion,
-)
 
 pytestmark = pytest.mark.usefixtures("cpu_engram_transfer")
 
@@ -610,100 +604,6 @@ def test_engram_sp_embed_and_forward(
 # ==============================================================================
 # 8. Tests for cache.py and envs.py
 # ==============================================================================
-
-
-def test_uses_fp8_rope_companion_architectures():
-    """Verify uses_fp8_rope_companion covers all architecture and dtype branches."""
-    # Architecture matches with fp8 cache
-    cfg_match = SimpleNamespace(
-        additional_config={},
-        engram_config=None,
-        model_config=SimpleNamespace(
-            hf_config=SimpleNamespace(architectures=["DeepseekV41ForCausalLM"])
-        ),
-        cache_config=SimpleNamespace(cache_dtype="fp8"),
-    )
-    assert uses_fp8_rope_companion(cfg_match) is True
-
-    # Architecture matches but cache_dtype is not fp8
-    cfg_non_fp8 = SimpleNamespace(
-        additional_config={},
-        engram_config=None,
-        model_config=SimpleNamespace(
-            hf_config=SimpleNamespace(architectures=["DeepseekV41ForCausalLM"])
-        ),
-        cache_config=SimpleNamespace(cache_dtype="bfloat16"),
-    )
-    assert uses_fp8_rope_companion(cfg_non_fp8) is False
-
-    # Architecture does not match
-    cfg_diff = SimpleNamespace(
-        additional_config={},
-        engram_config=None,
-        model_config=SimpleNamespace(
-            hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"])
-        ),
-        cache_config=SimpleNamespace(cache_dtype="fp8"),
-    )
-    assert uses_fp8_rope_companion(cfg_diff) is False
-
-    # Architectures is empty
-    cfg_empty = SimpleNamespace(
-        additional_config={},
-        engram_config=None,
-        model_config=SimpleNamespace(hf_config=SimpleNamespace(architectures=[])),
-        cache_config=SimpleNamespace(cache_dtype="fp8"),
-    )
-    assert uses_fp8_rope_companion(cfg_empty) is False
-
-    # Architectures is None (exercises `or []` branch)
-    cfg_none = SimpleNamespace(
-        additional_config={},
-        engram_config=None,
-        model_config=SimpleNamespace(hf_config=SimpleNamespace(architectures=None)),
-        cache_config=SimpleNamespace(cache_dtype="fp8"),
-    )
-    assert uses_fp8_rope_companion(cfg_none) is False
-
-
-def test_reserve_rope_companion_capping():
-    """Verify reserve_rope_companion non-V41 bypass and 16 GiB cap."""
-    cfg_non_v41 = SimpleNamespace(
-        additional_config={},
-        engram_config=None,
-        model_config=SimpleNamespace(
-            hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"])
-        ),
-        cache_config=SimpleNamespace(cache_dtype="fp8"),
-    )
-    assert reserve_rope_companion(cfg_non_v41, 20 << 30) == 20 << 30
-
-    cfg_v41 = SimpleNamespace(
-        additional_config={},
-        engram_config=None,
-        model_config=SimpleNamespace(
-            hf_config=SimpleNamespace(architectures=["DeepseekV41ForCausalLM"])
-        ),
-        cache_config=SimpleNamespace(cache_dtype="fp8"),
-    )
-    # Under limit: 10 GiB * 4 // 5 = 8 GiB < SPARSECORE_MAX_POOL_BYTES
-    avail_small = 10 << 30
-    assert reserve_rope_companion(cfg_v41, avail_small) == avail_small * 4 // 5
-
-    # Marginal overflow (20 GiB * 4 // 5 = 16 GiB < 1.2 * SPARSECORE_MAX_POOL_BYTES)
-    # stays clamped to 1 bank so OFFLOAD=0 does not split into 2 banks.
-    avail_offload0 = 20 << 30
-    assert reserve_rope_companion(cfg_v41, avail_offload0) == SPARSECORE_MAX_POOL_BYTES
-
-    # 2-bank range: 30 GiB * 4 // 5 = 24 GiB <= 2 * SPARSECORE_MAX_POOL_BYTES
-    avail_mid = 30 << 30
-    assert reserve_rope_companion(cfg_v41, avail_mid) == avail_mid * 4 // 5
-
-    # Over 2-bank limit: 50 GiB * 4 // 5 = 40 GiB > 2 * SPARSECORE_MAX_POOL_BYTES
-    avail_large = 50 << 30
-    capped = reserve_rope_companion(cfg_v41, avail_large)
-    assert capped == SPARSECORE_MAX_POOL_BANKS * SPARSECORE_MAX_POOL_BYTES
-    assert capped == 2 * ((16 << 30) - (64 << 20))
 
 
 @pytest.mark.parametrize(

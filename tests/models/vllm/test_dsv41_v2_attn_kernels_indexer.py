@@ -19,7 +19,6 @@ import pytest
 import torch
 from jax.sharding import Mesh
 
-from vllm_torchtpu.kernels.deepseek_v4.core_attention import sparse_mla
 from vllm_torchtpu.models.vllm.deepseek_v41.v2 import (
     attention_kernels,
     indexer_bf16,
@@ -29,9 +28,6 @@ from vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels import (
     _pad_compacted_records,
     initialize_paged_attention,
     paged_attention,
-    slice_token_parallel_attention_inputs,
-    sparse_fp8_attention,
-    sparse_fp8_attention_jax,
 )
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_bf16 import (
     initialize_indexer,
@@ -82,89 +78,6 @@ class TestPadCompactedRecordsAndFp8Attention:
         np.testing.assert_array_equal(np.asarray(padded[:, :3]), np.asarray(records))
         assert np.all(np.asarray(padded[:, 3:]) == -1)
 
-    def test_sparse_fp8_attention_jax_precompacted_and_union_gather_branches(self):
-        rng = np.random.default_rng(42)
-        q = jnp.asarray(rng.standard_normal((16, 8, 64)), dtype=jnp.bfloat16)
-        swa_pool = jnp.zeros((32, 128), dtype=jnp.int32)
-        main_pool = jnp.zeros((64 * 32, 128), dtype=jnp.int32)
-        rope_pool = jnp.zeros(((64 * 32) // 4, 32), dtype=jnp.int32)
-        swa_records = jnp.full((16, 64), 0, dtype=jnp.int32)
-        main_records = jnp.full((16, 64), 0, dtype=jnp.int32)
-        pages = jnp.zeros((2, 32), dtype=jnp.int32)
-        q_loc = jnp.array([0, 8, 16], dtype=jnp.int32)
-        sink = jnp.zeros((8, 64), dtype=jnp.float32)
-
-        fake_out = jnp.zeros((16, 8, 64), dtype=jnp.bfloat16)
-
-        with mock.patch.object(
-            sparse_mla, "sparse_ragged_paged_attention", return_value=fake_out
-        ) as mock_sparse:
-            out = sparse_fp8_attention_jax(
-                q,
-                swa_pool,
-                main_pool,
-                rope_pool,
-                swa_records,
-                main_records,
-                pages,
-                q_loc,
-                sink,
-                scale=0.1,
-                page_size=32,
-                precompacted=True,
-                union_gather=False,
-            )
-            assert out.shape == (16, 8, 64)
-            mock_sparse.assert_called_once()
-            # Verify compacted argument was padded to 128 columns
-            compacted_arg = mock_sparse.call_args[0][3]
-            assert compacted_arg.shape == (16, 128)
-
-        with mock.patch.object(
-            attention_kernels,
-            "sparse_ragged_paged_attention_union_gather",
-            return_value=fake_out,
-        ) as mock_union:
-            out2 = sparse_fp8_attention_jax(
-                q,
-                swa_pool,
-                main_pool,
-                rope_pool,
-                swa_records,
-                main_records,
-                pages,
-                q_loc,
-                sink,
-                scale=0.1,
-                page_size=32,
-                precompacted=False,
-                union_gather=True,
-                union_cap=2048,
-            )
-            assert out2.shape == (16, 8, 64)
-            mock_union.assert_called_once()
-            # Verify compacted argument had compact_records applied
-            compacted_arg = mock_union.call_args[0][3]
-            assert compacted_arg.shape == (16, 128)
-
-    def test_slice_token_parallel_attention_inputs(self):
-        swa = jnp.arange(64)[:, None]
-        main = (jnp.arange(64) * 2)[:, None]
-        q_loc = jnp.array([0, 16, 32, 48, 64], dtype=jnp.int32)
-        tp_rank = jnp.array([2], dtype=jnp.int32)
-        tp_size = 4
-        tokens = 64
-
-        s_loc, m_loc, q_sub = slice_token_parallel_attention_inputs(
-            swa, main, q_loc, tp_rank, tp_size, tokens
-        )
-        assert s_loc.shape == (16, 1)
-        assert m_loc.shape == (16, 1)
-        np.testing.assert_array_equal(np.asarray(s_loc[:, 0]), np.arange(32, 48))
-        np.testing.assert_array_equal(np.asarray(m_loc[:, 0]), np.arange(32, 48) * 2)
-        # q_loc clamped to [0, 16] with start=32
-        np.testing.assert_array_equal(np.asarray(q_sub), np.array([0, 0, 0, 16, 16]))
-
     def test_paged_attention_wrapper(self):
         mesh = Mesh(np.array(jax.devices()[:1]), ("tp",))
         with set_vllm_model_wrapper_context(mesh=mesh):
@@ -193,166 +106,6 @@ class TestPadCompactedRecordsAndFp8Attention:
             )
             assert res is q
             mock_op.assert_called_once()
-
-    def test_sparse_fp8_attention_wrapper_default_and_custom_args(self):
-        mesh = Mesh(np.array(jax.devices()[:1]), ("tp",))
-        with set_vllm_model_wrapper_context(mesh=mesh):
-            attention_kernels._attention_op = None
-            attention_kernels._fp8_attention_op = None
-            initialize_paged_attention()
-            assert attention_kernels._fp8_attention_op is not None
-
-        q = torch.zeros((16, 8, 64), dtype=torch.bfloat16)
-        mock_swa = mock.MagicMock()
-        mock_swa.raw = torch.zeros((32, 128), dtype=torch.int32)
-        mock_main = mock.MagicMock()
-        mock_main.raw = torch.zeros((64, 128), dtype=torch.int32)
-        mock_main.rope = torch.zeros((16, 32), dtype=torch.int32)
-        mock_main.shape = (64, 32)
-        swa_rec = torch.zeros((16, 64), dtype=torch.int32)
-        main_rec = torch.zeros((16, 64), dtype=torch.int32)
-        sink = torch.zeros((8, 64), dtype=torch.float32)
-
-        # 1) pages=None, full_sink=None, tp_rank=None
-        with mock.patch.object(
-            attention_kernels, "_fp8_attention_op", return_value=q
-        ) as mock_op:
-            res = sparse_fp8_attention(
-                q,
-                mock_swa,
-                mock_main,
-                swa_rec,
-                main_rec,
-                sink,
-                scale=0.1,
-                pages=None,
-                full_sink=None,
-                tp_rank=None,
-            )
-            assert res is q
-            args = mock_op.call_args[0]
-            # pages was defaulted to [1, 1]
-            assert args[6].shape == (1, 1)
-            # full_sink was defaulted to sink
-            assert args[9] is sink
-            # tp_rank was defaulted to zeros(1)
-            assert args[10].shape == (1,)
-
-        # 2) Explicit pages, full_sink, and tp_rank
-        pages = torch.zeros((2, 8), dtype=torch.int32)
-        starts = torch.tensor([0, 8, 16], dtype=torch.int32)
-        full_sink = torch.zeros((16, 64), dtype=torch.float32)
-        tp_rank = torch.tensor([3], dtype=torch.int32)
-
-        with mock.patch.object(
-            attention_kernels, "_fp8_attention_op", return_value=q
-        ) as mock_op:
-            res = sparse_fp8_attention(
-                q,
-                mock_swa,
-                mock_main,
-                swa_rec,
-                main_rec,
-                sink,
-                scale=0.1,
-                pages=pages,
-                starts=starts,
-                max_requests=4,
-                precompacted=True,
-                token_parallel=True,
-                full_sink=full_sink,
-                tp_rank=tp_rank,
-                union_gather=True,
-                union_cap=1024,
-            )
-            assert res is q
-            args = mock_op.call_args[0]
-            assert args[6] is not None
-            assert args[9] is full_sink
-            assert args[10].item() == 3
-            assert args[14] is True  # precompacted
-            assert args[15] is True  # token_parallel
-            assert args[16] is True  # union_gather
-            assert args[17] == 1024
-
-    def test_fp8_attention_inner_bodies_tp_and_non_tp(self):
-        import inspect
-
-        import vllm.distributed as vllm_dist
-
-        mesh = Mesh(np.array(jax.devices()[:1]), ("tp",))
-        mock_tp = mock.MagicMock()
-        mock_tp.device_group.size.return_value = 8
-
-        with (
-            set_vllm_model_wrapper_context(mesh=mesh),
-            mock.patch.object(vllm_dist, "get_tp_group", return_value=mock_tp),
-            mock.patch("torch_tpu._internal.pallas.get_pallas_mesh", return_value=mesh),
-        ):
-            attention_kernels._attention_op = None
-            attention_kernels._fp8_attention_op = None
-            initialize_paged_attention()
-            fp8_attn = inspect.unwrap(
-                attention_kernels._fp8_attention_op._init_fn.jit_fn
-            )
-
-            with (
-                mock.patch(
-                    "jax.shard_map",
-                    side_effect=lambda fn, **kwargs: lambda *args: fn(*args),
-                ),
-                mock.patch("jax.lax.all_to_all", side_effect=lambda x, **kwargs: x),
-                mock.patch.object(
-                    attention_kernels,
-                    "sparse_fp8_attention_jax",
-                    side_effect=lambda q, *args, **kwargs: q,
-                ),
-            ):
-                # 1. Test token-parallel body execution
-                res_tp = fp8_attn(
-                    jnp.zeros((1024, 64, 512)),
-                    jnp.zeros((1024, 512)),
-                    jnp.zeros((1024, 128)),
-                    jnp.zeros((256, 32)),
-                    jnp.zeros((1024, 64), dtype=jnp.int32),
-                    jnp.zeros((1024, 128), dtype=jnp.int32),
-                    jnp.zeros((1, 1), dtype=jnp.int32),
-                    jnp.zeros((2,), dtype=jnp.int32),
-                    jnp.zeros((64,)),
-                    jnp.zeros((64,)),
-                    jnp.zeros((1,), dtype=jnp.int32),
-                    0.125,
-                    16,
-                    None,
-                    False,
-                    True,
-                    False,
-                    4096,
-                )
-                assert res_tp.shape == (1024, 64, 512)
-
-                # 2. Test non-token-parallel body execution
-                res_non_tp = fp8_attn(
-                    jnp.zeros((128, 64, 512)),
-                    jnp.zeros((128, 512)),
-                    jnp.zeros((128, 128)),
-                    jnp.zeros((32, 32)),
-                    jnp.zeros((128, 64), dtype=jnp.int32),
-                    jnp.zeros((128, 128), dtype=jnp.int32),
-                    jnp.zeros((1, 1), dtype=jnp.int32),
-                    jnp.zeros((2,), dtype=jnp.int32),
-                    jnp.zeros((64,)),
-                    jnp.zeros((64,)),
-                    jnp.zeros((1,), dtype=jnp.int32),
-                    0.125,
-                    16,
-                    None,
-                    False,
-                    False,
-                    False,
-                    4096,
-                )
-                assert res_non_tp.shape == (128, 64, 512)
 
 
 class TestSelectIndicesJax:
