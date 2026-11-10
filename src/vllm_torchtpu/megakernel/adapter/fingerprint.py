@@ -114,7 +114,7 @@ def source_hash(module: ModuleType, *, source_root: str | None = None) -> str:
         raise _unhashable("zip", name)
     file = getattr(module, "__file__", None)
     path = getattr(module, "__path__", None)
-    if file is None or (path is not None and len(list(path)) != 1):
+    if file is None or (path is not None and len(path) != 1):
         raise _unhashable("namespace", name)
     fpath = Path(file)
     if not fpath.is_file():
