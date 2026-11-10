@@ -154,6 +154,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MK_COMPRESSED_UNIQUE_WRITE: bool = False
     VLLM_TPU_MK_HC_FP8: bool = False
     VLLM_TPU_MK_SCATTER_DEEP: bool = False
+    VLLM_TPU_MK_STACKED_MAMBA_OPERANDS: bool = False
     VLLM_TPU_MK_QSEL_ASYNC: bool = False
     VLLM_TPU_MK_WHOLE_L47: bool = False
     VLLM_TPU_MK_WHOLE_L45: bool = False
@@ -1077,6 +1078,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Whole-step GDN checkpoint scatter: 16 staging slots / 12 loads in flight from 64
     # checkpoints (the default deep ring starts at 144). Same pool bytes.
     "VLLM_TPU_MK_SCATTER_DEEP": env_bool("VLLM_TPU_MK_SCATTER_DEEP"),
+    # Whole-step megakernel with VLLM_TPU_STAGED_WALK_STACKED: the GDN layers' metadata go
+    # to the call as the walk's two stacks + a row index + the shared read offsets /
+    # query_start_loc / seq_lens (6 operands instead of 5 per GDN layer). Same values.
+    "VLLM_TPU_MK_STACKED_MAMBA_OPERANDS": env_bool("VLLM_TPU_MK_STACKED_MAMBA_OPERANDS"),
     # Whole-step QSA selection: the per-row id copies into SMEM and the new group's
     # loads / stores are issued together and waited once instead of in start-wait
     # pairs (distinct destinations; same bytes).

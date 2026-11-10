@@ -50,6 +50,11 @@ FIRST_LAYER, LAST_LAYER = 3, 47  # kernel covers model layers [FIRST_LAYER, LAST
 L_WHOLE = LAST_LAYER - FIRST_LAYER
 
 
+def stacked_mamba_operands() -> bool:
+    """VLLM_TPU_MK_STACKED_MAMBA_OPERANDS (needs the staged walk's stacks)."""
+    return bool(envs.VLLM_TPU_MK_STACKED_MAMBA_OPERANDS and envs.VLLM_TPU_STAGED_WALK_STACKED)
+
+
 def qsa_layer_cache(attn: Any) -> QSALayerCache:
     kw = getattr(attn, "_select_keywords", {}) or {}
     scales = (attn._k_scale_float, attn._v_scale_float) if attn.fp8_kv else (1.0, 1.0)
@@ -91,6 +96,7 @@ class _WholeKind:
             norm_eps=norm_eps,
             rotary_dim=rotary_dim,
             write=write,
+            stacked_meta=stacked_mamba_operands(),
         )
         self._calls: dict[int, Any] = {}
         self.tag = tag
@@ -319,7 +325,26 @@ class Qwen38WholeStep(nn.Module):
         assert self.kind is not None
         md: Any = get_forward_context().attn_metadata
         meta: list[torch.Tensor] = []
-        for i in self.gdn_ids:
+        if stacked_mamba_operands():
+            ms = [md[self.layers[i].linear_attn.prefix] for i in self.gdn_ids]
+            m0 = ms[0]
+            assert all(
+                m.mamba_state_stack is m0.mamba_state_stack
+                and m.mamba_ckpt_stack is m0.mamba_ckpt_stack
+                for m in ms
+            ), "whole-step GDN layers span more than one staged-walk class"
+            rows = torch.tensor(
+                [m.mamba_stack_row for m in ms], dtype=torch.int32, device=hidden.device
+            )
+            meta = [
+                m0.mamba_state_stack.to(torch.int32),
+                m0.mamba_ckpt_stack.to(torch.int32),
+                rows,
+                m0.mamba_slot_read_offsets.to(torch.int32),
+                m0.query_start_loc.to(torch.int32),
+                m0.seq_lens.to(torch.int32),
+            ]
+        for i in self.gdn_ids if not meta else ():
             m = md[self.layers[i].linear_attn.prefix]
             meta += [
                 mamba_state_of(m).to(torch.int32),
