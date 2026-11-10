@@ -1051,7 +1051,7 @@ def vocab_parallel_draft_owner(owner: torch.nn.Module) -> torch.nn.Module:
     )
 
     head = owner.lm_head
-    weight = getattr(head, "weight", None)
+    weight: Any = getattr(head, "weight", None)
     if (
         getattr(head, "_quant_mode", None) is not None
         or not isinstance(weight, torch.Tensor)
@@ -1138,7 +1138,7 @@ def keep_bf16_head_for_draft(head: torch.nn.Module) -> torch.nn.Module | None:
     """Keeps a BF16 twin of ``head`` for the draft before ``head`` is
     quantized in place. Returns the twin, or None when ``head`` has no BF16
     weight left to keep (already quantized)."""
-    weight = getattr(head, "weight", None)
+    weight: Any = getattr(head, "weight", None)
     if not isinstance(weight, torch.Tensor) or getattr(head, "_quant_mode", None):
         return None
     twin = bf16_head_twin(head)
@@ -1172,7 +1172,7 @@ def head_precision(head: object) -> str:
     desc = getattr(head, "_quant_desc", None)
     if desc:
         return str(desc)
-    weight = getattr(head, "weight", None)
+    weight: Any = getattr(head, "weight", None)
     if isinstance(weight, torch.Tensor):
         return str(weight.dtype).replace("torch.", "").replace("bfloat16", "bf16")
     return "unknown"
