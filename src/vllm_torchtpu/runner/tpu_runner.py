@@ -1467,10 +1467,18 @@ class TPUModelRunner(GPUModelRunner):
         self._greedy_head_owner: torch.nn.Module | None = None
 
         self._init_phased_profiling()
-        self._stage_timing = RunnerStageTiming(
-            profiler_rank,
-            enabled=self._kv_transfer_uses_stage_timing(self.vllm_config),
-        )
+        # TPU_RUNNER_STAGE_TIMING_MODE: auto (default: on whenever the KV connector has a
+        # TpuKVConnectorStats sink), on, or off. The timings feed KV-transfer telemetry only.
+        _st_mode = os.environ.get("TPU_RUNNER_STAGE_TIMING_MODE", "auto").strip().lower()
+        if _st_mode in ("on", "1", "true"):
+            _st_enabled = True
+        elif _st_mode in ("off", "0", "false"):
+            _st_enabled = False
+        else:
+            _st_enabled = self._kv_transfer_uses_stage_timing(self.vllm_config)
+        logger.info("Runner stage timing: %s (TPU_RUNNER_STAGE_TIMING_MODE=%s)",
+                    "on" if _st_enabled else "off", _st_mode)
+        self._stage_timing = RunnerStageTiming(profiler_rank, enabled=_st_enabled)
 
     @staticmethod
     def _kv_transfer_uses_stage_timing(vllm_config: Any) -> bool:
