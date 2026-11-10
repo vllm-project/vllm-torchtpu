@@ -8431,7 +8431,7 @@ class TPUModelRunner(GPUModelRunner):
                     )
                     dummy_u_cand = (
                         None
-                        if self._sampler_draws_in_graph()
+                        if getattr(self.device, "type", None) == "tpu"
                         else torch.zeros(
                             (num_reqs, num_packed_cand),
                             dtype=torch.float32,
@@ -8617,11 +8617,12 @@ class TPUModelRunner(GPUModelRunner):
                 if num_reqs >= min(num_tokens, self.max_num_reqs):
                     break
         pairs = _rotate_precompile_sweep(pairs, "rejection_sampler")
-        # As at runtime (_sample_spec_verify_chunk): the fused greedy verify
-        # runs on TPU with the stock rejection sampler.
-        fused_greedy_verify = getattr(
-            self.device, "type", None
-        ) == "tpu" and isinstance(self.rejection_sampler, RejectionSampler)
+        # As at serving time (_sample_spec_verify_chunk): the fused verify
+        # programs run on TPU with the stock rejection sampler, and draw their
+        # uniforms in-graph there.
+        warm_fused = getattr(self.device, "type", None) == "tpu" and isinstance(
+            self.rejection_sampler, RejectionSampler
+        )
         with self._precompile_timed("rejection_sampler"):
             # padded_logits_length-shaped inputs, rebuilt when the length
             # changes; dtypes mirror get_spec_decode_metadata so the graph is
@@ -8752,9 +8753,9 @@ class TPUModelRunner(GPUModelRunner):
                         topk_candidates=blocks,
                     )
                     synchronize_tensors(out)
+                if blocks and warm_fused:
                     # Fused bonus sampling + rejection over the candidate
                     # blocks (`_sample_spec_verify_chunk`'s non-greedy path).
-                    num_cand = blocks * CANDIDATE_BLOCK
                     warm_req_temps = torch.ones(
                         (num_reqs, 1),
                         dtype=self._hidden_states_dtype,
@@ -8770,15 +8771,8 @@ class TPUModelRunner(GPUModelRunner):
                         dtype=torch.float32,
                         device=self.device,
                     )
-                    warm_u_all = (
-                        None
-                        if self._sampler_draws_in_graph()
-                        else torch.zeros(
-                            (num_reqs + num_tokens, num_cand + 1),
-                            dtype=torch.float32,
-                            device=self.device,
-                        )
-                    )
+                    # Drawn in-graph, as at serving time on TPU.
+                    warm_u_all = None
                     out = self.rejection_sampler.fused_verify_and_sample_candidates(
                         logits=dummy_logits,
                         draft_token_ids=draft_token_ids,
@@ -8796,7 +8790,7 @@ class TPUModelRunner(GPUModelRunner):
                         topk_candidates=blocks,
                     )
                     synchronize_tensors(out)
-                if fused_greedy_verify:
+                if warm_fused:
                     # Fused greedy verify from logits (the all-greedy TPU path).
                     out = _fused_greedy_verify_from_logits(
                         dummy_logits,
@@ -8817,7 +8811,8 @@ class TPUModelRunner(GPUModelRunner):
                     )
                     synchronize_tensors(out)
                 if (
-                    self._greedy_head_owner is not None
+                    warm_fused
+                    and self._greedy_head_owner is not None
                     and envs.TPU_SAMPLER_TOPK_CANDIDATES > 0
                 ):
                     num_packed_cand = greedy_top_tokens.num_packed_candidates(
@@ -8843,15 +8838,8 @@ class TPUModelRunner(GPUModelRunner):
                         dtype=torch.float32,
                         device=self.device,
                     )
-                    warm_u_all_packed = (
-                        None
-                        if self._sampler_draws_in_graph()
-                        else torch.zeros(
-                            (num_reqs + num_tokens, num_packed_cand + 1),
-                            dtype=torch.float32,
-                            device=self.device,
-                        )
-                    )
+                    # Drawn in-graph, as at serving time on TPU.
+                    warm_u_all_packed = None
                     out = self.rejection_sampler.fused_verify_and_sample_candidates(
                         logits=dummy_packed_cand,
                         draft_token_ids=draft_token_ids,
@@ -8904,20 +8892,25 @@ class TPUModelRunner(GPUModelRunner):
             accept_u=warm_accept_u if self.rejection_sampler.synthetic_mode else None,
             target_argmax=target_argmax,
         )
-        out_fused = _fused_greedy_verify_from_top_tokens(
-            tokens,
-            bonus_logits_indices,
-            target_logits_indices,
-            draft_token_ids,
-            draft_lengths,
-            segment_ids,
-            group_indices,
-            self.speculative_config.num_speculative_tokens,
-            warm_accept_u if self.rejection_sampler.synthetic_mode else None,
-            self.rejection_sampler.synthetic_conditional_rates,
-            self.rejection_sampler.synthetic_mode,
-        )
-        synchronize_tensors([out, out_fused])
+        synchronize_tensors(out)
+        if getattr(self.device, "type", None) == "tpu" and isinstance(
+            self.rejection_sampler, RejectionSampler
+        ):
+            # The fused program _sample_spec_verify_chunk runs on TPU.
+            out_fused = _fused_greedy_verify_from_top_tokens(
+                tokens,
+                bonus_logits_indices,
+                target_logits_indices,
+                draft_token_ids,
+                draft_lengths,
+                segment_ids,
+                group_indices,
+                self.speculative_config.num_speculative_tokens,
+                warm_accept_u if self.rejection_sampler.synthetic_mode else None,
+                self.rejection_sampler.synthetic_conditional_rates,
+                self.rejection_sampler.synthetic_mode,
+            )
+            synchronize_tensors(out_fused)
 
     def _precompile_sampling_subgraphs(self) -> None:
         """Compile sampling-path subgraphs so their bottom-HBM reservations
