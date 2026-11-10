@@ -30,6 +30,9 @@ Runs on CPU; the projections are stand-ins in the processed runtime layouts.
 
 import contextlib
 import math
+import os
+import subprocess
+import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -932,23 +935,241 @@ def test_write_op_hands_the_writer_what_the_attention_impl_does():
 
 
 # ---------------------------------------------------------------------------
-# Two DCP ranks (needs two devices: XLA_FLAGS=--xla_force_host_platform_device_count=2)
+# Construction: the op registration and MtpKvOnlyModel
 # ---------------------------------------------------------------------------
+
+MTP_ATTN = "model.layers.78.mtp_block.self_attn.attn"
+
+
+class _RecordedJaxOp:
+    """What `pallas.jax_op` / `pcp_streaming_jax_op` were handed."""
+
+    def __init__(self, name, fn, **kwargs):
+        self.name, self.fn, self.kwargs = name, fn, kwargs
+        self.fake = None
+        self.calls = []
+
+    def register_fake(self, fake):
+        self.fake = fake
+
+    def __call__(self, *args):
+        self.calls.append(args)
+        return args[0] + 1, args[1] + 2, args[2] + 3
+
+
+def _record_jax_ops(monkeypatch):
+    built = []
+
+    def jax_op(name, fn, **kwargs):
+        built.append(_RecordedJaxOp(name, fn, **kwargs))
+        return built[-1]
+
+    monkeypatch.setattr(mla_op.pallas, "jax_op", jax_op)
+    monkeypatch.setattr(mla_op, "pcp_streaming_jax_op", jax_op)
+    return built
+
+
+def _op_wrapper(*, dcp_size=1, indexer_dcp_size=None, layout="tensorcore"):
+    """A wrapper whose MLA layer, backend impl and indexer op carry what
+    `MlaKvWriteOp.__init__` reads."""
+    w = _wrapper()
+    w.indexer = _indexer()
+    w.indexer_rope_emb = _rope()
+    indexer_op = mla_op.VllmTPUSparseAttnIndexer.__new__(
+        mla_op.VllmTPUSparseAttnIndexer
+    )
+    torch.nn.Module.__init__(indexer_op)
+    indexer_op.dcp_size = dcp_size if indexer_dcp_size is None else indexer_dcp_size
+    indexer_op.k_cache = SimpleNamespace(
+        prefix="mtp.indexer.k_cache", kv_cache=torch.zeros(4, dtype=torch.uint8)
+    )
+    w.indexer.indexer_op = indexer_op
+    w.mla_attn = SimpleNamespace(
+        layer_name=MTP_ATTN,
+        mla_kv_spec=_mla_specs(layout),
+        kv_cache_quantized_dtype=None,
+        kv_lora_rank=KV_LORA,
+        qk_rope_head_dim=ROPE,
+        impl=SimpleNamespace(
+            dcp_size=dcp_size,
+            dcp_interleave_size=8,
+            _get_kv_scales=lambda layer: (None, None, None),
+        ),
+    )
+    return w
 
 
 @pytest.mark.parametrize("layout", MLA_LAYOUTS)
-def test_write_caches_dcp_two_ranks_keep_their_own_rows(monkeypatch, layout):
+def test_write_op_registers_one_donating_op_around_the_writers(monkeypatch, layout):
+    """`__init__` registers one op that donates the three caches; the function
+    it registers is the unsharded writer pair (checked against the goldens)."""
+    import jax
+
+    from vllm_torchtpu.kernels.mla import kv_cache_utils
+
+    built = _record_jax_ops(monkeypatch)
+    monkeypatch.setattr(
+        mla_op,
+        "update_sparse_mla_kv_cache",
+        kv_cache_utils.update_sparse_mla_kv_cache_jax,
+    )
+    monkeypatch.setattr(mla_op.envs, "is_indexer_kv_cache_mode_explicit", lambda: True)
+    monkeypatch.setattr(mla_op.envs, "VLLM_TPU_INDEXER_KV_CACHE_MODE", "xla")
+    mesh = jax.sharding.Mesh(np.asarray(jax.local_devices()[:1]), ("x",))
+    op = mla_op.MlaKvWriteOp(_op_wrapper(layout=layout), mesh)
+    (jax_op,) = built
+    assert op.jax_op is jax_op
+    assert jax_op.name == "pallas::mla_kv_write_" + MTP_ATTN.replace(".", "_")
+    assert jax_op.kwargs == {"donate_argnums": (0, 1, 2)}
+    inp = _write_inputs(layout)
+    _assert_caches_equal(jax_op.fn(*_ordered(inp)), _golden(inp, dcp=False))
+    fake = jax_op.fake(torch.zeros(3), torch.zeros(4), torch.zeros(5), torch.zeros(1))
+    assert [t.shape[0] for t in fake] == [3, 4, 5]
+
+
+def test_write_op_under_dcp_registers_a_dcp_sharded_op(monkeypatch):
+    from jax.sharding import PartitionSpec as P
+
+    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import DCP_AXIS_NAME
+
+    built = _record_jax_ops(monkeypatch)
+    mesh = object()
+    monkeypatch.setattr(mla_op, "get_or_create_dcp_mesh", lambda axis_name: mesh)
+    op = mla_op.MlaKvWriteOp(_op_wrapper(dcp_size=2), mesh=None)
+    (jax_op,) = built
+    assert op.dcp_size == 2
+    assert jax_op.name == "pallas::mla_kv_write_dcp_" + MTP_ATTN.replace(".", "_")
+    ax = P(DCP_AXIS_NAME)
+    assert jax_op.kwargs == {
+        "donate_argnums": (0, 1, 2),
+        "mesh": mesh,
+        "input_partition_specs": (ax, ax, ax) + (P(),) * 9,
+        "output_partition_specs": (ax, ax, ax),
+    }
+    assert jax_op.fake is not None
+
+
+def test_write_op_refuses_disagreeing_dcp_sizes(monkeypatch):
+    built = _record_jax_ops(monkeypatch)
+    with pytest.raises(ValueError, match="disagree on the DCP size: 2 vs 1"):
+        mla_op.MlaKvWriteOp(_op_wrapper(dcp_size=2, indexer_dcp_size=1), mesh=None)
+    assert built == []
+
+
+def _kv_only_mtp():
+    """A supported MTP draft (as `_supported_mtp`) at the wrapper's hidden
+    size, with the MLA layer and caches `MlaKvWriteOp` reads."""
+    from vllm_torchtpu.layers.adapter.attention import PallasMLAttentionBackendImpl
+
+    w = _op_wrapper()
+    impl = PallasMLAttentionBackendImpl.__new__(PallasMLAttentionBackendImpl)
+    impl.dcp_size = 1
+    impl._get_kv_scales = lambda layer: (None, None, None)
+    w.mla_attn = SimpleNamespace(
+        layer_name="mtp.attn",
+        kv_cache_quantized_dtype=None,
+        kv_lora_rank=KV_LORA,
+        qk_rope_head_dim=ROPE,
+        impl=impl,
+    )
+    mtp, _ = _upstream_mtp(hidden=HIDDEN)
+    mtp.model.layers["78"].mtp_block.self_attn = _SelfAttn(w)
+    return mtp
+
+
+def _uncompiled_config():
+    return SimpleNamespace(
+        compilation_config=SimpleNamespace(mode=CompilationMode.NONE)
+    )
+
+
+def test_mtp_kv_only_model_builds_its_write_op_and_writes_every_row(monkeypatch):
+    """Built for real (compilation off, the op registration recorded): the
+    forward hands the op the latents of the MTP layer's attention input."""
+    built = _record_jax_ops(monkeypatch)
+    mtp = _kv_only_mtp()
+    model = mtp_kv_only.MtpKvOnlyModel(
+        vllm_config=_uncompiled_config(),
+        prefix="mtp_prefill_kv_only",
+        mtp=mtp,
+        mesh=None,
+    )
+    (jax_op,) = built
+    assert model.prefix == "mtp_prefill_kv_only"
+    assert isinstance(model._write, mla_op.MlaKvWriteOp)
+    w = mtp.model.layers["78"].mtp_block.self_attn.mla_attn
+    gen = torch.Generator().manual_seed(3)
+    input_ids = torch.randint(0, 64, (12,), generator=gen)
+    positions = torch.tensor([0, 1, 2, 3, 0, 1, 7, 8, 9, 10, 0, 5])
+    hidden = torch.randn(12, HIDDEN, generator=gen).bfloat16()
+    nope, rope = torch.zeros(3), torch.zeros(3)
+    with torch.no_grad(), _contexts((nope, rope), _md(10), _md(20)):
+        model(input_ids, positions, hidden)
+        _, attn_input = mtp_kv_only.mtp_layer_input(mtp, input_ids, positions, hidden)
+        kv_c, k_pe = w.kv_latents(positions, attn_input)
+        k_packed = w.indexer.k_packed(attn_input, positions, w.indexer_rope_emb)
+    (args,) = jax_op.calls
+    assert torch.equal(args[3], kv_c.view(-1, KV_LORA))
+    assert torch.equal(args[4], k_pe.view(-1, ROPE))
+    assert torch.equal(args[5], k_packed)
+
+
+def test_mtp_kv_only_model_refuses_an_unsupported_draft(monkeypatch):
+    built = _record_jax_ops(monkeypatch)
+    mtp = _kv_only_mtp()
+    mtp.model.layers["78"].mtp_block.self_attn.mla_attn.is_sparse = False
+    with pytest.raises(ValueError, match="not sparse"):
+        mtp_kv_only.MtpKvOnlyModel(vllm_config=_uncompiled_config(), mtp=mtp, mesh=None)
+    assert built == []
+
+
+# ---------------------------------------------------------------------------
+# Two DCP ranks, on a two-device CPU mesh in a subprocess (the CPU lane runs
+# this module on one device)
+# ---------------------------------------------------------------------------
+
+_TWO_RANK_WORKER_ENV = "MLA_KV_WRITE_TWO_RANK_WORKER"
+
+
+@pytest.mark.parametrize("layout", MLA_LAYOUTS)
+def test_write_caches_dcp_two_ranks_keep_their_own_rows(layout):
     """Each DCP rank writes exactly the rows it owns into its own shard: the
     shard_map specs and the rank (`cp_rank_as_data`) are what the per-rank
     golden says. The indexer half is `_cp_scatter_indexer_k` itself."""
+    flags = os.environ.get("XLA_FLAGS", "")
+    env = dict(
+        os.environ,
+        JAX_PLATFORMS="cpu",
+        XLA_FLAGS=f"{flags} --xla_force_host_platform_device_count=2",
+        **{_TWO_RANK_WORKER_ENV: "1"},
+    )
+    node = f"{__file__}::test_two_rank_worker[{layout}]"
+    proc = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", node],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-3000:]
+    assert "1 passed" in proc.stdout, proc.stdout[-3000:]
+
+
+if os.environ.get(_TWO_RANK_WORKER_ENV) == "1":
+
+    @pytest.mark.parametrize("layout", MLA_LAYOUTS)
+    def test_two_rank_worker(monkeypatch, layout):
+        _two_ranks_keep_their_own_rows(monkeypatch, layout)
+
+
+def _two_ranks_keep_their_own_rows(monkeypatch, layout):
     import jax
 
     from vllm_torchtpu.distributed.dcp import DCP_LANE_AXIS_NAME
     from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import DCP_AXIS_NAME
     from vllm_torchtpu.kernels.mla import kv_cache_utils
 
-    if len(jax.devices()) < 2:
-        pytest.skip("needs 2 devices")
+    assert len(jax.devices()) >= 2, jax.devices()
     monkeypatch.setattr(
         mla_op,
         "update_sparse_mla_kv_cache_dcp",

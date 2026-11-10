@@ -23,7 +23,6 @@ only through a causal read of caches every row writes first.
 import contextlib
 import dataclasses
 from types import SimpleNamespace
-from unittest import mock
 
 import numpy as np
 import pytest
@@ -32,26 +31,14 @@ import torch
 import vllm_torchtpu.spec_decode.eagle3 as e3
 from vllm_torchtpu import envs
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
-from vllm_torchtpu.spec_decode.eagle3 import DraftChunkInputs, Eagle3Proposer
+from vllm_torchtpu.spec_decode.eagle3 import DraftChunkInputs
+
+from .proposer_test_utils import make_proposer
 
 DRAFT_LAYER = "model.layers.78.mtp_block.self_attn.attn"
 HIDDEN = 4
 VOCAB = 32
 TOPK = 2
-
-
-def _make_proposer(method: str = "mtp") -> Eagle3Proposer:
-    speculative_config = SimpleNamespace(
-        draft_tensor_parallel_size=1, method=method, draft_model_config=None
-    )
-    vllm_config = SimpleNamespace(
-        speculative_config=speculative_config,
-        parallel_config=SimpleNamespace(tensor_parallel_size=1),
-    )
-    return Eagle3Proposer(
-        runner=mock.MagicMock(_pcp_enabled=False, _mtp_enabled=method == "mtp"),
-        vllm_config=vllm_config,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -61,7 +48,7 @@ def _make_proposer(method: str = "mtp") -> Eagle3Proposer:
 
 def _gating_proposer(monkeypatch, *, min_tokens=8, lockstep=False, target_md=True):
     monkeypatch.setattr(envs, "TPU_MTP_PREFILL_KV_ONLY_MIN_TOKENS", min_tokens)
-    proposer = _make_proposer()
+    proposer = make_proposer(method="mtp")
     proposer._mtp_kv_only_model = object()
     proposer._mtp_kv_only_min_tokens = min_tokens
     proposer._dp_lockstep_sharded = lambda: lockstep
@@ -99,7 +86,7 @@ BUCKETS = [16, 32, 64, 128, 1024, 4096]
 
 def _build_proposer(monkeypatch, *, min_tokens=1024, method="mtp"):
     monkeypatch.setattr(envs, "TPU_MTP_PREFILL_KV_ONLY_MIN_TOKENS", min_tokens)
-    proposer = _make_proposer(method)
+    proposer = make_proposer(method=method)
     proposer.draft_model = object()
     proposer.draft_vllm_config = SimpleNamespace(
         compilation_config=SimpleNamespace(compile_sizes=list(BUCKETS))
@@ -303,7 +290,7 @@ def _ctx(seq_lens, qsl, num_reqs, knr):
 
 @pytest.mark.parametrize("async_rejected", [False, True])
 def test_pass2_attn_metadata_is_one_query_per_request(async_rejected):
-    proposer = _make_proposer()
+    proposer = make_proposer(method="mtp")
     knr = 6
     proposer.runner = SimpleNamespace(
         num_reqs_max_model_len=knr, num_reqs_most_model_len=None, device="cpu"
@@ -342,7 +329,7 @@ def test_pass2_attn_metadata_is_one_query_per_request(async_rejected):
 
 
 def test_save_topk_snapshots_the_front_rows():
-    proposer = _make_proposer()
+    proposer = make_proposer(method="mtp")
     buf = torch.arange(24, dtype=torch.int32).reshape(6, 4)
     proposer._mtp_topk_buffers = [buf]
     (saved,) = proposer._mtp_save_topk(2)
@@ -683,7 +670,7 @@ def _run(
     world = _ToyWorld(len(specs), 24, prefix_lens)
     K = 3
 
-    proposer = _make_proposer()
+    proposer = make_proposer(method="mtp")
     proposer.speculative_config.num_speculative_tokens = K
     proposer.draft_vllm_config = object()
     proposer.runner = SimpleNamespace(
@@ -793,7 +780,7 @@ def test_chunk_loop_inputs_trims_a_padded_async_rejected_count():
     """Async: the rejected count arrives at the sampler's request-padding
     width, wider than kernel_num_reqs. The loop steps' copy is cut to knr, as
     `propose` cuts its own, so pass 2 and the loop steps see one shape."""
-    proposer = _make_proposer()
+    proposer = make_proposer(method="mtp")
     knr = 4
     proposer.runner = SimpleNamespace(
         num_reqs_max_model_len=knr, num_reqs_most_model_len=None, device="cpu"
@@ -815,9 +802,45 @@ def test_chunk_loop_inputs_trims_a_padded_async_rejected_count():
 
 def test_two_pass_step0_is_not_taken_below_the_gate(monkeypatch):
     monkeypatch.setattr(envs, "TPU_MTP_PREFILL_KV_ONLY_MIN_TOKENS", 32)
-    proposer = _make_proposer()
+    proposer = make_proposer(method="mtp")
     proposer._mtp_kv_only_model = object()
     proposer._mtp_kv_only_min_tokens = 32
     proposer._dp_lockstep_sharded = lambda: False
     proposer._target_draft_attn_metadata = lambda chunk: {DRAFT_LAYER: object()}
     assert proposer._use_kv_only_two_pass(object(), 16, 4) is False
+
+
+def test_precompile_draft_gather_rows_warms_every_shape_two_pass_can_take(
+    monkeypatch,
+):
+    """T: every token bucket at or above the gate; p: every loop bucket below
+    T. Nothing is warmed while the KV-only pass is not built."""
+    proposer = make_proposer(method="mtp")
+    proposer.runner = SimpleNamespace(
+        num_tokens_paddings=[16, 32, 64, 128, 1024, 4096],
+        max_num_reqs=32,
+        device=torch.device("cpu"),
+        uses_mrope=False,
+        _hidden_states_dtype=torch.bfloat16,
+        _precompile_timed=lambda name: contextlib.nullcontext(),
+    )
+    proposer._draft_hidden_size = lambda: 8
+    seen = []
+    proposer._draft_gather_rows = lambda x, pos, y, idx: seen.append(
+        (x.shape, pos.shape, y.shape, idx.shape)
+    )
+    monkeypatch.setattr(e3, "synchronize_tensors", lambda out: None)
+
+    proposer._precompile_draft_gather_rows()
+    assert seen == []
+
+    proposer._mtp_kv_only_model = object()
+    proposer._mtp_kv_only_min_tokens = 1024
+    proposer._precompile_draft_gather_rows()
+    assert [(x[0], idx[0]) for x, _, _, idx in seen] == [
+        (1024, 16),
+        (1024, 32),
+        (4096, 16),
+        (4096, 32),
+    ]
+    assert all(pos == x and y == (x[0], 8) for x, pos, y, _ in seen)
