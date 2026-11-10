@@ -18,28 +18,67 @@ TP-sharded token sequences.
 """
 
 from collections.abc import Sequence
+from typing import Any
 
 from vllm_torchtpu import envs
 
 _ACTIVE = False
 
+# Smallest step, in rows, that runs sequence-parallel. Below it the step keeps
+# its rows replicated over TP: slicing a few rows saves less in the MoE than the
+# extra all-gather and reduce-scatter cost. A layout measured to cross over at a
+# different row count gets an entry in _MIN_ROWS_BY_LAYOUT, keyed on
+# (data_parallel_size, tensor_parallel_size).
+DEFAULT_MIN_ROWS = 512
+_MIN_ROWS_BY_LAYOUT: dict[tuple[int, int], int] = {}
 
-def min_rows() -> int:
-    return int(envs.TPU_SP_MIN_ROWS or (257 if envs.TPU_MOE_SEQUENCE_PARALLEL else 0))
+
+def _layout(parallel_config: Any = None) -> tuple[int, int] | None:
+    """(data_parallel_size, tensor_parallel_size) of ``parallel_config``, or of
+    this process's initialized model-parallel groups; None when neither is
+    available (for example, before the workers set up their groups)."""
+    if parallel_config is not None:
+        return (
+            int(getattr(parallel_config, "data_parallel_size", 1)),
+            int(getattr(parallel_config, "tensor_parallel_size", 1)),
+        )
+    from vllm.distributed import parallel_state
+
+    if not parallel_state.model_parallel_is_initialized():
+        return None
+    return (
+        int(parallel_state.get_dp_group().world_size),
+        int(parallel_state.get_tp_group().world_size),
+    )
+
+
+def min_rows(parallel_config: Any = None) -> int:
+    """The row threshold for the layout of ``parallel_config``, or of this
+    process's model-parallel groups when it is None."""
+    layout = _layout(parallel_config)
+    if layout is None:
+        return DEFAULT_MIN_ROWS
+    return _MIN_ROWS_BY_LAYOUT.get(layout, DEFAULT_MIN_ROWS)
 
 
 def enabled() -> bool:
     """Whether sequence-parallel MoE is on at all (main #1463's switch).
 
-    TPU_SP_MIN_ROWS only sets the row threshold below which an SP step runs
-    replicated (see min_rows); it never turns SP on by itself.
+    The row threshold (see min_rows) only decides which steps of an enabled
+    model run sliced; it never turns SP on by itself.
     """
     return bool(envs.TPU_MOE_SEQUENCE_PARALLEL)
 
 
 def fp8_gather() -> bool:
-    """Whether the attention-side all-gather carries fp8 rows and scales."""
-    return int(envs.TPU_SP_FP8_GATHER or 0) > 0
+    """Whether the attention-side all-gather carries fp8 rows and scales.
+
+    Always true. It acts only on a sequence-parallel step, whose gathered rows
+    feed FP8 projections that quantize their input per row: quantizing each row
+    before the gather instead of after it gives the same inputs and moves about
+    half the bytes of a bf16 gather.
+    """
+    return True
 
 
 def step_is_sequence_parallel(full_num_tokens: int) -> bool:
