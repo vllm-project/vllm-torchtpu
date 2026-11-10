@@ -11,12 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Sort-free top-k expert selection for the MoE router (Pallas).
-
-``torch.topk`` lowers to a full ``stablehlo.sort`` of every expert plus a
-slice, so at 512 experts it runs a 45-stage bitonic network over three arrays
-to keep 10 values. This kernel selects the same 10 with ``k`` max-and-mask
-passes over one VMEM-resident block: ``O(k*N)`` instead of ``O(N*log^2 N)``.
+"""Fused MoE router scoring, group-limited top-k selection, and weight normalization.
 """
 
 import functools
@@ -47,17 +42,28 @@ def _select_kernel(x_ref, w_ref, i_ref, *, topk: int, n: int):
     whole row can be made of. Without it such a row would stay tied with the
     ``finfo.min`` mask and every pass would return column 0.
     """
-    x = jnp.where(x_ref[...] > NEG, x_ref[...], NEG)
-    masked = jnp.finfo(x.dtype).min
-    iota = jax.lax.broadcasted_iota(jnp.int32, x.shape, 1)
-    for j in range(topk):
-        m = jnp.max(x, axis=1, keepdims=True)
-        # Lowest column attaining the max; the rest fill with the last expert
-        # so the min never selects a phantom.
-        idx = jnp.min(jnp.where(x == m, iota, n - 1), axis=1)
-        w_ref[:, j] = m[:, 0]
-        i_ref[:, j] = idx.astype(jnp.int32)
-        x = jnp.where(iota == idx[:, None], masked, x)
+    x0 = jnp.where(x_ref[...] > NEG, x_ref[...], NEG)
+    masked = jnp.finfo(x0.dtype).min
+    iota = jax.lax.broadcasted_iota(jnp.int32, x0.shape, 1)
+    x = x0
+    if x.shape[0] <= 64:
+        # One index reduction per pass on the serial chain: argmax returns the
+        # lowest column attaining the max. The pass's value is the max of the
+        # same scores, a reduction off that chain.
+        for j in range(topk):
+            idx = jnp.argmax(x, axis=1).astype(jnp.int32)
+            w_ref[:, j] = jnp.max(x, axis=1)
+            i_ref[:, j] = idx
+            x = jnp.where(iota == idx[:, None], masked, x)
+    else:
+        # At >=128 rows, Mosaic's variadic argmax reduction spills VREGs, so
+        # two scalar reductions (max then min-index) are 2x faster.
+        for j in range(topk):
+            m = jnp.max(x, axis=1, keepdims=True)
+            idx = jnp.min(jnp.where(x == m, iota, n - 1), axis=1)
+            w_ref[:, j] = m[:, 0]
+            i_ref[:, j] = idx.astype(jnp.int32)
+            x = jnp.where(iota == idx[:, None], masked, x)
     # No score above the sentinel means no real maximum: keep the row
     # poisonous rather than letting renormalization make it plausible.
     w_ref[...] = jnp.where(w_ref[:, :1] <= NEG, jnp.nan, w_ref[...])

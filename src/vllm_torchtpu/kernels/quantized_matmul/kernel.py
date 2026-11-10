@@ -11,7 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Quantized matmul kernel."""
+"""Blockwise-quantized FP8/INT8 matrix multiplication Pallas kernels on TPU.
+
+Implements tiled activation-weight matmuls with sub-channel scale broadcast
+in VMEM for dense and shared-expert linear layers.
+"""
 
 import functools
 
@@ -43,8 +47,13 @@ def quantize_array(
     dtype_max = float(dtype_info.max)
 
     # TODO(kyuyeunk): Investigate performance gain from non xlu transpose.
-    scale = jnp.transpose(x_abs_max / dtype_max)
-    return (x / scale).astype(quant_dtype), scale.astype(jnp.float32)
+    scale = jnp.transpose(x_abs_max * (1.0 / dtype_max))
+    scale = jnp.where(scale == 0, 1.0, scale)
+    inv_scale = jnp.float32(1.0) / scale
+    x_s = x * inv_scale
+    if is_float:
+        x_s = jnp.clip(x_s, -dtype_max, dtype_max)
+    return x_s.astype(quant_dtype), scale.astype(jnp.float32)
 
 
 def get_vmem_limit(
