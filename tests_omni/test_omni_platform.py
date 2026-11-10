@@ -962,6 +962,104 @@ def _ltx2_denoise_ctx(conditioning_mask, batch=2, video_tokens=7, audio_tokens=3
     )
 
 
+class _LTX2SdpaAttention(torch.nn.Module):
+    """Plain SDPA in place of _LTX2ParallelAttention (no SP, no backend)."""
+
+    def __init__(self, *, softmax_scale, **kwargs):
+        super().__init__()
+        self.softmax_scale = softmax_scale
+
+    def forward(self, query, key, value, attn_metadata=None):
+        assert attn_metadata is None
+        out = torch.nn.functional.scaled_dot_product_attention(
+            query.transpose(1, 2),
+            key.transpose(1, 2),
+            value.transpose(1, 2),
+            scale=self.softmax_scale,
+        )
+        return out.transpose(1, 2)
+
+
+def test_ltx2_per_sample_timestep_matches_per_token_fp32(monkeypatch):
+    # A tiny real LTX2VideoTransformer3DModel (2 blocks, small dims) gives
+    # the same fp32 video and audio output for upstream's per-token (B, S)
+    # timestep and the patch's per-sample (B,) timestep. Only the attention
+    # kernel is replaced (plain SDPA); it does not see the timestep.
+    import vllm.distributed.parallel_state as vllm_ps
+    import vllm.model_executor.layers.linear as vllm_linear
+    import vllm.model_executor.parameter as vllm_param
+
+    tp_group = SimpleNamespace(
+        world_size=1, rank_in_group=0, is_first_rank=True, is_last_rank=True
+    )
+    monkeypatch.setattr(vllm_ps, "get_tp_group", lambda: tp_group)
+    for module in (vllm_ps, vllm_param, vllm_linear, ltx2_transformer):
+        monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: 1)
+        monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(ltx2_transformer, "_LTX2ParallelAttention", _LTX2SdpaAttention)
+
+    runtime_cls = ltx2_runtime.LTXRuntime
+    monkeypatch.setattr(
+        runtime_cls, "_denoise_timestep_kwargs", _UPSTREAM_DENOISE_TIMESTEP_KWARGS
+    )
+    monkeypatch.setattr(
+        runtime_cls, "_tpu_orig_denoise_timestep_kwargs", None, raising=False
+    )
+    monkeypatch.delattr(runtime_cls, "_tpu_orig_denoise_timestep_kwargs")
+    patches._patch_ltx2_per_sample_timestep()
+
+    torch.manual_seed(0)
+    heads, video_head_dim, audio_head_dim, caption = 2, 24, 12, 16
+    model = ltx2_transformer.LTX2VideoTransformer3DModel(
+        in_channels=8,
+        out_channels=8,
+        num_attention_heads=heads,
+        attention_head_dim=video_head_dim,
+        cross_attention_dim=heads * video_head_dim,
+        audio_in_channels=8,
+        audio_out_channels=8,
+        audio_num_attention_heads=heads,
+        audio_attention_head_dim=audio_head_dim,
+        audio_cross_attention_dim=heads * audio_head_dim,
+        num_layers=2,
+        caption_channels=caption,
+    ).eval()
+    with torch.no_grad():
+        for param in model.parameters():
+            param.normal_(0.0, 0.2)
+
+    batch, frames, height, width, audio_frames = 2, 2, 2, 3, 5
+    video_tokens = frames * height * width
+    runtime = runtime_cls.__new__(runtime_cls)
+    runtime.guidance_executor = ltx2_runtime.LTXGuidanceExecutor()
+    ctx = _ltx2_denoise_ctx(None, batch, video_tokens, audio_frames)
+    ts = torch.tensor([500.0, 250.0])
+    counts = {"video_token_count": video_tokens, "audio_token_count": audio_frames}
+    per_token = _UPSTREAM_DENOISE_TIMESTEP_KWARGS(runtime, ts, None, ctx, **counts)
+    per_sample = runtime._denoise_timestep_kwargs(ts, None, ctx, **counts)
+    assert per_token["timestep"].shape == (batch, video_tokens)
+    assert per_sample["timestep"].shape == (batch,)
+
+    inputs = {
+        "hidden_states": torch.randn(batch, video_tokens, 8),
+        "audio_hidden_states": torch.randn(batch, audio_frames, 8),
+        "encoder_hidden_states": torch.randn(batch, 4, caption),
+        "audio_encoder_hidden_states": torch.randn(batch, 4, caption),
+        "num_frames": frames,
+        "height": height,
+        "width": width,
+        "audio_num_frames": audio_frames,
+        "return_dict": False,
+    }
+    with torch.no_grad():
+        want = model(**inputs, **per_token)
+        got = model(**inputs, **per_sample)
+    assert len(got) == len(want) == 2
+    for got_out, want_out in zip(got, want, strict=True):
+        assert got_out.dtype == torch.float32
+        torch.testing.assert_close(got_out, want_out, rtol=1e-5, atol=1e-5)
+
+
 def test_ltx2_per_sample_timestep_patch(monkeypatch):
     runtime_cls = ltx2_runtime.LTXRuntime
     monkeypatch.setattr(
