@@ -871,3 +871,30 @@ def test_fused_candidate_blocks_cut_off_at_half_the_block_count(monkeypatch):
     with torch.compiler.set_stance("force_eager"):
         sampler.fused_verify_and_sample_candidates(**packed)
     assert widths == [32]
+
+
+def test_quantize_lm_head_is_w8a8_fp8_or_bf16_only():
+    gen = torch.Generator().manual_seed(3)
+    weight = torch.randn(64, 8, generator=gen)
+    hidden_states = torch.randn(6, 8, generator=gen)
+    # One clear winner per row, so FP8 rounding cannot change the argmax.
+    for row, token in enumerate((5, 17, 40, 63, 0, 33)):
+        weight[token] = hidden_states[row] * 4.0
+
+    head = greedy_top_tokens.quantize_lm_head(_HeadShard(weight, 0, 1, 0), "fp8")
+    assert head._quant_mode == "fp8"
+    assert head._w8a8_weight_kn.dtype == torch.float8_e4m3fn
+    assert torch.equal(
+        greedy_top_tokens.top_tokens(_Owner(head), hidden_states),
+        _full_logits_tokens(weight, hidden_states),
+    )
+
+    bf16 = greedy_top_tokens.quantize_lm_head(_HeadShard(weight, 0, 1, 0), "bf16")
+    assert bf16._quant_mode is None
+    assert not hasattr(bf16, "_w8a8_weight_kn")
+
+    # The draft head stays at the checkpoint's precision, so no other
+    # quantized head format exists.
+    for mode in ("fp4", "w4a8", "fp4_g128"):
+        with pytest.raises(ValueError, match="Unsupported LM-head quantization"):
+            greedy_top_tokens.quantize_lm_head(_HeadShard(weight, 0, 1, 0), mode)
