@@ -62,7 +62,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
     MultiKVConnectorStats,
 )
 from vllm.forward_context import set_forward_context
-from vllm_torchtpu.runner import decode_carry as _decode_carry
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.rotary_embedding import (
@@ -183,6 +182,7 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
 )
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.tpu_block_size_utils import unified_kv_layout_enabled
+from vllm_torchtpu.runner import decode_carry as _decode_carry
 from vllm_torchtpu.runner import (
     chunk_processors,
     greedy_top_tokens,
