@@ -484,3 +484,45 @@ def test_a_waiting_prefix_hit_counts_as_done_only_under_quadratic_cost():
     # A started request counts its computed tokens either way.
     assert plain._waiting_warmth(_req(2048, 8192)) == 2048
     assert quad._waiting_warmth(_req(2048, 8192)) == 2048
+
+
+# -- the IX validation entries ---------------------------------------------------
+
+
+def _point_entries():
+    import pathlib
+
+    import yaml
+
+    from vllm_torchtpu.models import qwen3_5
+
+    folder = pathlib.Path(qwen3_5.__file__).parent / "validation"
+    for path in sorted(folder.glob("p[0-9][0-9]-*.yaml")):
+        with path.open() as f:
+            yield path.stem, yaml.safe_load(f)
+
+
+def test_the_prefill_legs_run_what_the_record_jobs_ran():
+    from vllm_torchtpu.core import scheduler_options
+
+    seen = []
+    for name, entry in _point_entries():
+        cfg = SimpleNamespace(
+            additional_config=entry["legs"]["prefill"]["additional_config"]
+        )
+        opts = pp_scheduler_options.get(cfg)
+        assert opts.quadratic_cost and opts.prefix_aware, name
+        assert opts.paw_aging_tok_per_s == 3000.0, name
+        # Warmest-first promotion ran at #1 only.
+        point_one = entry["point"] == 1
+        assert scheduler_options.get(cfg).promote_warmest is point_one, name
+        # The leg gets this scheduler (no other scheduler class) with main's
+        # equal-cost chunking, which quadratic_cost needs.
+        prefill = entry["legs"]["prefill"]
+        assert "--scheduler-cls" not in prefill["serve_args"], name
+        for flag in ("TPU_PP_LONE_PROMPT_CHUNKS", "TPU_PP_EQUAL_COST_CHUNKS"):
+            assert (prefill.get("env") or {}).get(flag, "1") not in ("0", "false"), name
+        # The decode legs run PrefixAwareScheduler, not this scheduler.
+        assert "tpu_pp_scheduler" not in entry["legs"]["decode"]["additional_config"]
+        seen.append(entry["point"])
+    assert seen == [1, 5, 8, 10, 12]
