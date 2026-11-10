@@ -375,8 +375,13 @@ class MiniMaxM3SparseAttention(nn.Module):
                     f"DCP group of {get_dcp_world_size()} ranks, expected "
                     f"{self.dcp_size}."
                 )
+            spec = vllm_config.speculative_config
             self.msa_op = get_msa_dcp_op(
-                *msa_config, self.dcp_size, self.kv_head_replicas, fp4=self.fp4
+                *msa_config,
+                self.dcp_size,
+                self.kv_head_replicas,
+                fp4=self.fp4,
+                decode_rows=1 + (spec.num_speculative_tokens if spec else 0),
             )
             # A buffer, not a Python int, so the rank is a graph input and
             # every DCP rank compiles the same program (see get_msa_dcp_op).

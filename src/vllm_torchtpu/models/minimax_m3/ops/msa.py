@@ -24,7 +24,13 @@ from vllm.distributed import get_tp_group
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
-from vllm_torchtpu.models.minimax_m3.kernels import msa, msa_dcp, msa_fp4, msa_indexer
+from vllm_torchtpu.models.minimax_m3.kernels import (
+    msa,
+    msa_dcp,
+    msa_dcp_heads,
+    msa_fp4,
+    msa_indexer,
+)
 
 _KV_CACHE_ARG = 5
 _INDEX_CACHE_ARG = 6
@@ -464,9 +470,14 @@ def get_msa_dcp_op(
     dcp: int,
     kv_head_replicas: int = 1,
     fp4: bool = False,
+    decode_rows: int = 1,
 ) -> Callable[..., torch.Tensor]:
     """`get_msa_op` for a KV head's context split over ``dcp`` ranks
     (`kernels.msa_dcp`).
+
+    ``decode_rows`` is the most query rows of a decode request (1 + the
+    speculative tokens): with 4-bit caches and a group of several KV heads,
+    longer requests may attend head-parallel (`kernels.msa_dcp_heads`).
 
     With `fp4` (4-bit caches, one KV head per rank) the op also takes and
     updates the layer's ``scale_cache``.
@@ -498,7 +509,13 @@ def get_msa_dcp_op(
     kv_heads = max(1, dcp // kv_head_replicas)
     if fp4:
         return _get_msa_dcp_fp4_op(
-            sm_scale, topk, init_blocks, local_blocks, dcp, kv_head_replicas
+            sm_scale,
+            topk,
+            init_blocks,
+            local_blocks,
+            dcp,
+            kv_head_replicas,
+            decode_rows,
         )
 
     def _score_jax(
@@ -639,6 +656,7 @@ def _get_msa_dcp_fp4_op(
     local_blocks: int,
     dcp: int,
     kv_head_replicas: int,
+    decode_rows: int,
 ) -> Callable[..., torch.Tensor]:
     """`get_msa_dcp_op` for 4-bit caches."""
     kv_heads = max(1, dcp // kv_head_replicas)
@@ -737,6 +755,13 @@ def _get_msa_dcp_fp4_op(
 
     score_op.register_fake(_score_fake)
     attend_op.register_fake(_head_major_attend_fake)
+    heads_op = (
+        _get_msa_dcp_heads_op(
+            sm_scale, topk, dcp, kv_head_replicas, decode_rows, suffix
+        )
+        if kv_heads > 1
+        else None
+    )
 
     def op(
         q: torch.Tensor,
@@ -771,10 +796,22 @@ def _get_msa_dcp_fp4_op(
             dcp_rank,
             q.contiguous(),
         )
-        q_all = gather_query_heads(q, group)
         kv_cache.copy_(new_kv_cache)
         index_cache.copy_(new_index_cache)
         scale_cache.copy_(new_scale_cache)
+        if heads_op is not None:
+            return heads_op(
+                dcp_rank,
+                q,
+                kv_cache,
+                scale_cache,
+                candidates,
+                metadata.seq_lens,
+                metadata.block_tables,
+                metadata.query_start_loc,
+                metadata.request_distribution,
+            )
+        q_all = gather_query_heads(q, group)
         candidates = group.all_gather(candidates.unsqueeze(0), dim=0)
         out, lse = attend_op(
             q_all,
@@ -788,6 +825,82 @@ def _get_msa_dcp_fp4_op(
         )
         return merge_head_partials(out, lse, group, hadamard)
 
+    return op
+
+
+def _get_msa_dcp_heads_op(
+    sm_scale: float,
+    topk: int,
+    dcp: int,
+    kv_head_replicas: int,
+    decode_rows: int,
+    suffix: str,
+) -> Callable[..., torch.Tensor]:
+    """The attention half of the 4-bit DCP op over several KV heads, as one
+    SPMD op over the DCP mesh (`msa_dcp_heads.attend_and_merge`): its
+    collectives run inside the program, so a long step can pick its paths
+    and their sizes from the step's requests."""
+    from jax.sharding import NamedSharding, PartitionSpec
+
+    from vllm_torchtpu.distributed.dcp import DCP_AXIS_NAME, get_or_create_dcp_mesh
+
+    mesh = get_or_create_dcp_mesh()
+    sharded, replicated = PartitionSpec(DCP_AXIS_NAME), PartitionSpec()
+    specs = (sharded,) * 5 + (replicated,) * 4
+    body = jax.shard_map(
+        functools.partial(
+            msa_dcp_heads.attend_and_merge,
+            axis=DCP_AXIS_NAME,
+            dcp=dcp,
+            kv_head_replicas=kv_head_replicas,
+            sm_scale=sm_scale,
+            topk=topk,
+            decode_rows=decode_rows,
+            rs_out_precision=envs.TPU_DCP_RS_OUT_PRECISION,
+        ),
+        mesh=mesh,
+        in_specs=specs,
+        out_specs=sharded,
+        check_vma=False,
+    )
+
+    # torch_tpu reads the operand types from these annotations.
+    def _attend_jax(
+        dcp_rank: jax.Array,
+        q: jax.Array,
+        kv_cache: jax.Array,
+        scale_cache: jax.Array,
+        candidates: jax.Array,
+        seq_lens: jax.Array,
+        block_tables: jax.Array,
+        query_start_loc: jax.Array,
+        request_distribution: jax.Array,
+    ) -> jax.Array:
+        args = (
+            dcp_rank,
+            q,
+            kv_cache,
+            scale_cache,
+            candidates,
+            seq_lens,
+            block_tables,
+            query_start_loc,
+            request_distribution,
+        )
+        return body(
+            *(jax.device_put(a, NamedSharding(mesh, s)) for a, s in zip(args, specs))
+        )
+
+    # pyrefly: ignore[no-matching-overload]
+    op = pallas.jax_op(
+        f"pallas::minimax_m3_msa_dcp_heads_attend_{suffix}_r{decode_rows}",
+        _attend_jax,
+        mesh=mesh,
+        input_partition_specs=specs,
+        # A sequence, one spec per output (a bare spec reads as its axes).
+        output_partition_specs=(sharded,),
+    )
+    op.register_fake(lambda dcp_rank, q, *args: torch.empty_like(q))
     return op
 
 

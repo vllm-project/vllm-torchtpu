@@ -333,6 +333,8 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # K3 custom-op registration, sharding, and Attention Residual bridges.
     "vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
     "vllm_torchtpu/models/vllm/kimi_k3/layers.py",
+    # MiniMax-M3 MSA kernels, behind the custom ops of models/minimax_m3/ops.
+    "vllm_torchtpu/models/minimax_m3/kernels",
 )
 
 # vLLM-Omni diffusion code, dropped from the hashed set above. Diffusion
