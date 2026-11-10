@@ -13,8 +13,9 @@
 # limitations under the License.
 """The Qwen3.5 rule for kernel numerics and code paths: the quantize
 helpers' reciprocal scale, the grouped matmul's hand-streamed whole-expert
-slabs and its tuned FP8 MoE tiling and rhs-scale hoist for Qwen3.5, main's
-arithmetic and code for every other model."""
+slabs and its tuned FP8 MoE tiling and rhs-scale hoist, and the non-EP MoE's
+two-sort routing metadata for Qwen3.5, main's arithmetic and code for every
+other model."""
 
 from types import SimpleNamespace
 
@@ -22,6 +23,7 @@ import pytest
 
 from vllm_torchtpu.kernels.megablox import gmm_v2
 from vllm_torchtpu.kernels.quantized_matmul import util
+from vllm_torchtpu.layers.core import fused_moe_gmm
 from vllm_torchtpu.models.qwen3_5 import hooks
 
 pytestmark = pytest.mark.cpu_test
@@ -32,6 +34,7 @@ def _mains_default(monkeypatch):
     monkeypatch.setattr(util, "RECIPROCAL_SCALE", False)
     monkeypatch.setattr(gmm_v2, "RHS_STREAM", False)
     monkeypatch.setattr(gmm_v2, "TUNED_FP8_MOE", False)
+    monkeypatch.setattr(fused_moe_gmm, "NONEP_PERMUTE", "sorts")
 
 
 def _model(arch):
@@ -46,6 +49,7 @@ def test_qwen3_5_takes_the_reciprocal_scale_and_streamed_slabs():
     assert util.RECIPROCAL_SCALE is True
     assert gmm_v2.RHS_STREAM is True
     assert gmm_v2.TUNED_FP8_MOE is True
+    assert fused_moe_gmm.NONEP_PERMUTE == "two_sorts"
 
 
 @pytest.mark.parametrize("arch", ["DeepseekV3ForCausalLM", "Qwen3MoeForCausalLM"])
@@ -54,6 +58,7 @@ def test_other_models_keep_mains_arithmetic_and_code(arch):
     assert util.RECIPROCAL_SCALE is False
     assert gmm_v2.RHS_STREAM is False
     assert gmm_v2.TUNED_FP8_MOE is False
+    assert fused_moe_gmm.NONEP_PERMUTE == "sorts"
 
 
 def test_a_config_without_architectures_keeps_mains_arithmetic_and_code():
@@ -71,3 +76,4 @@ def test_waits_for_a_model_config():
     assert util.RECIPROCAL_SCALE is False
     assert gmm_v2.RHS_STREAM is False
     assert gmm_v2.TUNED_FP8_MOE is False
+    assert fused_moe_gmm.NONEP_PERMUTE == "sorts"
