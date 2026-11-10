@@ -50,6 +50,7 @@ with one XOR of the shard index.
 
 Hypercube and peer-to-peer remote DMA token exchange primitives across EP ranks.
 """
+
 import math
 
 import jax
@@ -59,8 +60,14 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from . import layout
-from .layout import (COLLECTIVE_ID_TRANSPORT, LANES, MESH_AXIS, ROW_BLOCK,
-                     SUBLANES, device_coords)
+from .layout import (
+    COLLECTIVE_ID_TRANSPORT,
+    LANES,
+    MESH_AXIS,
+    ROW_BLOCK,
+    SUBLANES,
+    device_coords,
+)
 from .rowquant import FP8, quantize_rows
 
 # The maximum supported mesh width.
@@ -77,11 +84,11 @@ MATE_TILE_SEMAPHORE = 0
 def check_width(num_shards):
     """Raises ValueError unless the mesh width is a power of two in
     [1, MAX_SHARDS]."""
-    if (num_shards < 1 or num_shards > MAX_SHARDS
-            or num_shards & (num_shards - 1)):
+    if num_shards < 1 or num_shards > MAX_SHARDS or num_shards & (num_shards - 1):
         raise ValueError(
             f"the pallas mode's transport takes a power-of-two mesh of 1 to "
-            f"{MAX_SHARDS} shards. This mesh has {num_shards} shards")
+            f"{MAX_SHARDS} shards. This mesh has {num_shards} shards"
+        )
 
 
 def dimensions(num_shards):
@@ -151,9 +158,12 @@ def arrivals(n, t, n_pieces, link):
     """Round t pieces landing on `link`, in landing order: (relative block,
     piece). The neighbour's relative addresses are this shard's with the
     link's bit flipped."""
-    return [(r ^ 1 << link, p)
-            for (sender_link, r, rng) in sends(n, t, n_pieces)
-            if sender_link == link for p in rng]
+    return [
+        (r ^ 1 << link, p)
+        for (sender_link, r, rng) in sends(n, t, n_pieces)
+        if sender_link == link
+        for p in rng
+    ]
 
 
 def landing_link(r, p, n_pieces):
@@ -168,20 +178,24 @@ class Exchange:
     """Every slice, peer and semaphore of one shard's part of the exchange,
     from the traced shard index."""
 
-    def __init__(self,
-                 gathered_rows,
-                 send_sem,
-                 receive_sems,
-                 shard,
-                 rows_per_shard,
-                 num_shards,
-                 mesh_axes=(MESH_AXIS, )):
+    def __init__(
+        self,
+        gathered_rows,
+        send_sem,
+        receive_sems,
+        shard,
+        rows_per_shard,
+        num_shards,
+        mesh_axes=(MESH_AXIS,),
+    ):
         self.mesh_axes = mesh_axes
         self.n = dimensions(num_shards)
         self.n_pieces = pieces(num_shards)
-        self.gathered_rows, self.send_sem, self.receive_sems = (gathered_rows,
-                                                                send_sem,
-                                                                receive_sems)
+        self.gathered_rows, self.send_sem, self.receive_sems = (
+            gathered_rows,
+            send_sem,
+            receive_sems,
+        )
         self.shard, self.rows = shard, rows_per_shard
         self.mate = shard ^ 1
         self.representative = shard & jnp.int32(-2)
@@ -189,7 +203,8 @@ class Exchange:
         if self.block_rows % self.n_pieces:
             raise ValueError(
                 f"{rows_per_shard} rows per shard do not split into "
-                f"{self.n_pieces} pieces per block")
+                f"{self.n_pieces} pieces per block"
+            )
         self.piece_rows = self.block_rows // self.n_pieces
 
     def peer(self, link):
@@ -206,8 +221,7 @@ class Exchange:
 
     def piece(self, relative, p):
         """The row slice of piece p of a relative shard's block."""
-        return pl.ds(
-            self.block_start(relative) + p * self.piece_rows, self.piece_rows)
+        return pl.ds(self.block_start(relative) + p * self.piece_rows, self.piece_rows)
 
     def round_sem(self, t, link):
         """The receive semaphore of round t on a link."""
@@ -225,7 +239,8 @@ class Exchange:
             send_sem=self.send_sem,
             recv_sem=sem,
             device_id=device_coords(peer, self.mesh_axes),
-            device_id_type=pl.DeviceIdType.MESH)
+            device_id_type=pl.DeviceIdType.MESH,
+        )
 
     def wait_landed(self, rows, sem):
         """Wait for `rows` of the gathered rows to land on `sem`. Under the
@@ -236,8 +251,9 @@ class Exchange:
         of mesh axes ... 0D mesh"). Other callers use the remote
         descriptor's receive wait."""
         if layout.SHARD_INDEX_OPERAND:
-            pltpu.make_async_copy(self.gathered_rows.at[rows],
-                                  self.gathered_rows.at[rows], sem).wait()
+            pltpu.make_async_copy(
+                self.gathered_rows.at[rows], self.gathered_rows.at[rows], sem
+            ).wait()
         else:
             self.remote_copy(rows, sem, self.mate).wait_recv()
 
@@ -275,8 +291,7 @@ class _Landed:
     def drain(self, t):
         """Waits for every piece of round t."""
         for link in range(self.x.n):
-            self.wait(t, link, len(arrivals(self.x.n, t, self.x.n_pieces,
-                                            link)))
+            self.wait(t, link, len(arrivals(self.x.n, t, self.x.n_pieces, link)))
 
 
 def issue_first_round(x):
@@ -288,8 +303,7 @@ def issue_first_round(x):
     def _():
         for link, r, rng in sends(x.n, 1, x.n_pieces):
             for p in rng:
-                x.remote_copy(x.piece(r, p), x.round_sem(1, link),
-                              x.peer(link)).start()
+                x.remote_copy(x.piece(r, p), x.round_sem(1, link), x.peer(link)).start()
 
 
 def forward_middle_rounds(x):
@@ -305,8 +319,9 @@ def forward_middle_rounds(x):
             for link, r, rng in sends(x.n, t, x.n_pieces):
                 for p in rng:
                     landed.ensure(t - 1, r, p)
-                    x.remote_copy(x.piece(r, p), x.round_sem(t, link),
-                                  x.peer(link)).start()
+                    x.remote_copy(
+                        x.piece(r, p), x.round_sem(t, link), x.peer(link)
+                    ).start()
             landed.drain(t - 1)
             for r in blocks_at(x.n, t - 1):
                 x.remote_copy(x.block(r), x.mate_sem(t - 1), x.mate).start()
@@ -327,8 +342,9 @@ def finish(x):
         for t in range(1, x.n + 1):
             for link, r, rng in sends(x.n, t, x.n_pieces):
                 for p in rng:
-                    x.remote_copy(x.piece(r, p), x.round_sem(t, link),
-                                  x.peer(link)).wait_send()
+                    x.remote_copy(
+                        x.piece(r, p), x.round_sem(t, link), x.peer(link)
+                    ).wait_send()
             for r in blocks_at(x.n, t):
                 x.remote_copy(x.block(r), x.mate_sem(t), x.mate).wait_send()
 
@@ -339,15 +355,17 @@ def finish(x):
                 x.wait_landed(x.block(r), x.mate_sem(t))
 
 
-def finish_call(gathered_rows,
-                send_sem,
-                receive_sems,
-                after,
-                *,
-                num_shards,
-                rows_per_shard,
-                mesh_axes=(MESH_AXIS, ),
-                shard_index=None):
+def finish_call(
+    gathered_rows,
+    send_sem,
+    receive_sems,
+    after,
+    *,
+    num_shards,
+    rows_per_shard,
+    mesh_axes=(MESH_AXIS,),
+    shard_index=None,
+):
     """The exchange's finish as a program of its own: waits the landing of
     every arrival on this shard and the mate copies, and returns a
     completion word ([1, LANES] int32, ones). The FFN kernel does this in
@@ -370,13 +388,16 @@ def finish_call(gathered_rows,
         rows_ref, send_ref, receive_ref, after_ref, done_ref = refs
         del after_ref  # an ordering operand
         finish(
-            Exchange(rows_ref,
-                     send_ref,
-                     receive_ref,
-                     shard,
-                     rows_per_shard,
-                     num_shards,
-                     mesh_axes=mesh_axes))
+            Exchange(
+                rows_ref,
+                send_ref,
+                receive_ref,
+                shard,
+                rows_per_shard,
+                num_shards,
+                mesh_axes=mesh_axes,
+            )
+        )
         done_ref[...] = jnp.ones((1, LANES), jnp.int32)
 
     hbm = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
@@ -385,25 +406,32 @@ def finish_call(gathered_rows,
     return pl.pallas_call(
         kernel,
         out_shape=jax.ShapeDtypeStruct((1, LANES), jnp.int32),
-        in_specs=([pl.BlockSpec(
-            memory_space=pltpu.SMEM)] if shard_index is not None else []) +
-        [hbm, sem, sem, hbm],
+        in_specs=(
+            [pl.BlockSpec(memory_space=pltpu.SMEM)] if shard_index is not None else []
+        )
+        + [hbm, sem, sem, hbm],
         out_specs=vmem,
-        compiler_params=pltpu.CompilerParams(
-            has_side_effects=layout.SIDE_EFFECTS),
+        compiler_params=pltpu.CompilerParams(has_side_effects=layout.SIDE_EFFECTS),
         name="fused_ep_transport_finish",
-    )(*(() if shard_index is None else (shard_index, )), gathered_rows,
-      send_sem, receive_sems, after)
+    )(
+        *(() if shard_index is None else (shard_index,)),
+        gathered_rows,
+        send_sem,
+        receive_sems,
+        after,
+    )
 
 
-def all_shards_barrier(num_shards, mesh_axes=(MESH_AXIS, )):
+def all_shards_barrier(num_shards, mesh_axes=(MESH_AXIS,)):
     """A barrier over every shard (peers are not only neighbours)."""
     barrier = pltpu.get_barrier_semaphore()
     for i in range(num_shards):
-        pl.semaphore_signal(barrier,
-                            inc=1,
-                            device_id=device_coords(jnp.int32(i), mesh_axes),
-                            device_id_type=pl.DeviceIdType.MESH)
+        pl.semaphore_signal(
+            barrier,
+            inc=1,
+            device_id=device_coords(jnp.int32(i), mesh_axes),
+            device_id_type=pl.DeviceIdType.MESH,
+        )
     pl.semaphore_wait(barrier, num_shards)
 
 
@@ -426,8 +454,7 @@ def message_rows(tokens_per_shard, pairs_per_shard, n_scales=1):
     quantization tile) holding that tile's tokens' scale words,
     plane-major; padded to whole (SUBLANES, LANES) tiles so each shard's
     block of the gathered rows is a tile-aligned slice."""
-    rows = scale_row_offset(
-        pairs_per_shard) + n_scales * quant_tiles(tokens_per_shard)
+    rows = scale_row_offset(pairs_per_shard) + n_scales * quant_tiles(tokens_per_shard)
     return -(-rows // SUBLANES) * SUBLANES
 
 
@@ -444,18 +471,20 @@ def quant_tiles(tokens_per_shard):
     return -(-tokens_per_shard // quant_tile_rows(tokens_per_shard))
 
 
-def start_transport(rows,
-                    routing_message,
-                    *,
-                    scale_base,
-                    num_shards,
-                    scale_dtype=jnp.float32,
-                    activation_block=0,
-                    elementwise=jnp.float32,
-                    mesh_axes=(MESH_AXIS, ),
-                    token_dtype=FP8,
-                    shard_index=None,
-                    valid_tokens=None):
+def start_transport(
+    rows,
+    routing_message,
+    *,
+    scale_base,
+    num_shards,
+    scale_dtype=jnp.float32,
+    activation_block=0,
+    elementwise=jnp.float32,
+    mesh_axes=(MESH_AXIS,),
+    token_dtype=FP8,
+    shard_index=None,
+    valid_tokens=None,
+):
     """Quantizes the shard's rows, issues the exchange, exchanges the
     messages.
 
@@ -498,7 +527,8 @@ def start_transport(rows,
     if tokens % ROW_BLOCK:
         raise ValueError(
             f"{tokens} tokens per shard is not a whole number of "
-            f"{ROW_BLOCK}-row blocks, the unit the exchange moves")
+            f"{ROW_BLOCK}-row blocks, the unit the exchange moves"
+        )
 
     def rows_of(i):
         """Rows of tile i: a whole tile, or what is left on the last one."""
@@ -506,9 +536,11 @@ def start_transport(rows,
 
     n_scales = scale_planes(hidden, activation_block)
     if scale_base + n_scales * n_tiles > n_message_rows:
-        raise ValueError(f"the routing message has {n_message_rows} rows and "
-                         f"the scales need rows {scale_base} to "
-                         f"{scale_base + n_scales * n_tiles}")
+        raise ValueError(
+            f"the routing message has {n_message_rows} rows and "
+            f"the scales need rows {scale_base} to "
+            f"{scale_base + n_scales * n_tiles}"
+        )
     # Streamed from HBM a tile at a time. Without the constraint XLA stages
     # the whole block in its alternate memory first.
     rows = pltpu.with_memory_space_constraint(rows, pltpu.MemorySpace.HBM)
@@ -525,40 +557,56 @@ def start_transport(rows,
             valid_tokens_ref, *refs = refs
         else:
             valid_tokens_ref = None
-        (rows_hbm, message_in, gathered_rows, send_sem, receive_sems,
-         routing_messages, rows_vmem, quantized_vmem, row_fetch_sems,
-         gathered_rows_write_sems, mate_send_sems, message_send_sem,
-         message_receive_sem, message_local_sem) = refs
-        exchange = Exchange(gathered_rows,
-                            send_sem,
-                            receive_sems,
-                            shard,
-                            tokens,
-                            num_shards,
-                            mesh_axes=mesh_axes)
+        (
+            rows_hbm,
+            message_in,
+            gathered_rows,
+            send_sem,
+            receive_sems,
+            routing_messages,
+            rows_vmem,
+            quantized_vmem,
+            row_fetch_sems,
+            gathered_rows_write_sems,
+            mate_send_sems,
+            message_send_sem,
+            message_receive_sem,
+            message_local_sem,
+        ) = refs
+        exchange = Exchange(
+            gathered_rows,
+            send_sem,
+            receive_sems,
+            shard,
+            tokens,
+            num_shards,
+            mesh_axes=mesh_axes,
+        )
         all_shards_barrier(num_shards, mesh_axes)
 
         def fetch_rows(i):
             return pltpu.make_async_copy(
                 rows_hbm.at[pl.ds(i * tile, rows_of(i))],
-                rows_vmem.at[i % 2,
-                             pl.ds(0, rows_of(i))], row_fetch_sems.at[i % 2])
+                rows_vmem.at[i % 2, pl.ds(0, rows_of(i))],
+                row_fetch_sems.at[i % 2],
+            )
 
         def write_gathered_rows(i):
             return pltpu.make_async_copy(
                 quantized_vmem.at[i % 2, pl.ds(0, rows_of(i))],
                 gathered_rows.at[pl.ds(shard * tokens + i * tile, rows_of(i))],
-                gathered_rows_write_sems.at[i % 2])
+                gathered_rows_write_sems.at[i % 2],
+            )
 
         def share_with_mate(i):
             return pltpu.make_async_remote_copy(
                 src_ref=quantized_vmem.at[i % 2, pl.ds(0, rows_of(i))],
-                dst_ref=gathered_rows.at[pl.ds(shard * tokens + i * tile,
-                                               rows_of(i))],
+                dst_ref=gathered_rows.at[pl.ds(shard * tokens + i * tile, rows_of(i))],
                 send_sem=mate_send_sems.at[i % 2],
                 recv_sem=receive_sems.at[MATE_TILE_SEMAPHORE],
                 device_id=device_coords(exchange.mate, mesh_axes),
-                device_id_type=pl.DeviceIdType.MESH)
+                device_id_type=pl.DeviceIdType.MESH,
+            )
 
         def send_message(peer):
             return pltpu.make_async_remote_copy(
@@ -567,7 +615,8 @@ def start_transport(rows,
                 send_sem=message_send_sem,
                 recv_sem=message_receive_sem,
                 device_id=device_coords(peer, mesh_axes),
-                device_id_type=pl.DeviceIdType.MESH)
+                device_id_type=pl.DeviceIdType.MESH,
+            )
 
         fetch_rows(0).start()
         for i in range(n_tiles):
@@ -577,44 +626,53 @@ def start_transport(rows,
             tile_rows_data = rows_vmem[i % 2]
             if valid_tokens_ref is not None:
                 row_idx = i * tile + lax.broadcasted_iota(
-                    jnp.int32, tile_rows_data.shape, 0)
-                tile_rows_data = jnp.where(row_idx < valid_tokens_ref[(0,) * valid_tokens_ref.ndim],
-                                           tile_rows_data,
-                                           jnp.zeros_like(tile_rows_data))
+                    jnp.int32, tile_rows_data.shape, 0
+                )
+                tile_rows_data = jnp.where(
+                    row_idx < valid_tokens_ref[(0,) * valid_tokens_ref.ndim],
+                    tile_rows_data,
+                    jnp.zeros_like(tile_rows_data),
+                )
             if jnp.dtype(token_dtype) == jnp.dtype(jnp.bfloat16):
                 # bf16 token rows: as they are, unit scales.
                 quantized = tile_rows_data.astype(jnp.bfloat16)
                 scale = jnp.ones((rows_of(i), n_scales), jnp.float32)
             else:
-                quantized, scale = quantize_rows(tile_rows_data,
-                                                 scale_dtype,
-                                                 block=activation_block,
-                                                 dtype=elementwise)
+                quantized, scale = quantize_rows(
+                    tile_rows_data,
+                    scale_dtype,
+                    block=activation_block,
+                    dtype=elementwise,
+                )
             if i >= 2:
                 write_gathered_rows(i - 2).wait()
                 if num_shards > 1:
                     share_with_mate(i - 2).wait_send()
-            quantized_vmem[i % 2] = quantized.reshape(tile, lane_blocks,
-                                                      MESSAGE_LANES)
+            quantized_vmem[i % 2] = quantized.reshape(tile, lane_blocks, MESSAGE_LANES)
             write_gathered_rows(i).start()
             if num_shards > 1:
                 share_with_mate(i).start()
             for plane in range(n_scales):
-                column = jnp.broadcast_to(scale[:, plane:plane + 1],
-                                          (tile, MESSAGE_LANES))
+                column = jnp.broadcast_to(
+                    scale[:, plane : plane + 1], (tile, MESSAGE_LANES)
+                )
                 if tile < QUANT_TILE_ROWS:
-                    column = jnp.concatenate([
-                        column,
-                        jnp.zeros((QUANT_TILE_ROWS - tile, MESSAGE_LANES),
-                                  column.dtype)
-                    ],
-                                             axis=0)
+                    column = jnp.concatenate(
+                        [
+                            column,
+                            jnp.zeros(
+                                (QUANT_TILE_ROWS - tile, MESSAGE_LANES), column.dtype
+                            ),
+                        ],
+                        axis=0,
+                    )
                 row = scale_base + plane * n_tiles + i
-                message_in[row:row + 1, :] = pltpu.bitcast(
-                    column.T[0:1, :], jnp.int32)
-        local_message = pltpu.make_async_copy(message_in,
-                                              routing_messages.at[shard],
-                                              message_local_sem)
+                message_in[row : row + 1, :] = pltpu.bitcast(
+                    column.T[0:1, :], jnp.int32
+                )
+        local_message = pltpu.make_async_copy(
+            message_in, routing_messages.at[shard], message_local_sem
+        )
         local_message.start()
         for i in range(1, num_shards):
             send_message((shard + i) & (num_shards - 1)).start()
@@ -625,19 +683,20 @@ def start_transport(rows,
         for i in range(n_tiles if num_shards > 1 else 0):
             if layout.SHARD_INDEX_OPERAND:
                 pltpu.make_async_copy(
-                    gathered_rows.at[pl.ds(shard * tokens + i * tile,
-                                           rows_of(i))],
-                    gathered_rows.at[pl.ds(shard * tokens + i * tile,
-                                           rows_of(i))],
-                    receive_sems.at[MATE_TILE_SEMAPHORE]).wait()
+                    gathered_rows.at[pl.ds(shard * tokens + i * tile, rows_of(i))],
+                    gathered_rows.at[pl.ds(shard * tokens + i * tile, rows_of(i))],
+                    receive_sems.at[MATE_TILE_SEMAPHORE],
+                ).wait()
             else:
                 share_with_mate(i).wait_recv()
         issue_first_round(exchange)
         for _ in range(1, num_shards):
             if layout.SHARD_INDEX_OPERAND:
-                pltpu.make_async_copy(routing_messages.at[shard],
-                                      routing_messages.at[shard],
-                                      message_receive_sem).wait()
+                pltpu.make_async_copy(
+                    routing_messages.at[shard],
+                    routing_messages.at[shard],
+                    message_receive_sem,
+                ).wait()
             else:
                 send_message(shard ^ 1).wait_recv()
         for _ in range(1, num_shards):
@@ -647,36 +706,38 @@ def start_transport(rows,
     hbm = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
     sem = pl.BlockSpec(memory_space=pltpu.SEMAPHORE)
     vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
-    smem_specs = ([pl.BlockSpec(memory_space=pltpu.SMEM)]
-                  if shard_index is not None else []) + (
-                      [pl.BlockSpec(memory_space=pltpu.SMEM)]
-                      if valid_tokens is not None else [])
-    smem_args = (() if shard_index is None else (shard_index, )) + (
-        () if valid_tokens is None else (valid_tokens, ))
+    smem_specs = (
+        [pl.BlockSpec(memory_space=pltpu.SMEM)] if shard_index is not None else []
+    ) + ([pl.BlockSpec(memory_space=pltpu.SMEM)] if valid_tokens is not None else [])
+    smem_args = (() if shard_index is None else (shard_index,)) + (
+        () if valid_tokens is None else (valid_tokens,)
+    )
     return pl.pallas_call(
         kernel,
-        out_shape=(jax.ShapeDtypeStruct(
-            (num_shards * tokens, lane_blocks, MESSAGE_LANES),
-            token_dtype), pltpu.SemaphoreType.DMA(
-                ()), pltpu.SemaphoreType.DMA(
-                    (receive_semaphores(num_shards), )),
-                   jax.ShapeDtypeStruct(
-                       (num_shards, n_message_rows, message_lanes),
-                       jnp.int32)),
+        out_shape=(
+            jax.ShapeDtypeStruct(
+                (num_shards * tokens, lane_blocks, MESSAGE_LANES), token_dtype
+            ),
+            pltpu.SemaphoreType.DMA(()),
+            pltpu.SemaphoreType.DMA((receive_semaphores(num_shards),)),
+            jax.ShapeDtypeStruct(
+                (num_shards, n_message_rows, message_lanes), jnp.int32
+            ),
+        ),
         in_specs=smem_specs + [hbm, vmem],
         out_specs=(hbm, sem, sem, hbm),
         scratch_shapes=[
             pltpu.VMEM((2, tile, hidden), rows.dtype),
             pltpu.VMEM((2, tile, lane_blocks, MESSAGE_LANES), token_dtype),
-            pltpu.SemaphoreType.DMA((2, )),
-            pltpu.SemaphoreType.DMA((2, )),
-            pltpu.SemaphoreType.DMA((2, )),
+            pltpu.SemaphoreType.DMA((2,)),
+            pltpu.SemaphoreType.DMA((2,)),
+            pltpu.SemaphoreType.DMA((2,)),
             pltpu.SemaphoreType.DMA,
             pltpu.SemaphoreType.DMA,
             pltpu.SemaphoreType.DMA,
         ],
         compiler_params=pltpu.CompilerParams(
-            collective_id=COLLECTIVE_ID_TRANSPORT,
-            has_side_effects=layout.SIDE_EFFECTS),
+            collective_id=COLLECTIVE_ID_TRANSPORT, has_side_effects=layout.SIDE_EFFECTS
+        ),
         name="fused_ep_transport_start",
     )(*smem_args, rows, routing_message)
