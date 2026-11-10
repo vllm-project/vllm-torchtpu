@@ -24,6 +24,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import vllm
+from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.models import qwen3_5, qwen3_5_mtp, qwen3_next, qwen3_next_mtp
 
 import vllm_torchtpu.envs as envs
@@ -714,3 +715,366 @@ def test_cat768_fp8_fusion_and_weight_deletion():
             dim=0,
         ).item()
         assert cos_moe > 0.999, f"cos_moe={cos_moe}"
+
+
+def _bf16_jnp(t: torch.Tensor):
+    import jax.numpy as jnp
+
+    return jnp.asarray(t.float().numpy(), dtype=jnp.bfloat16)
+
+
+def _gemma_norm(weight: torch.Tensor, eps: float = 1e-6) -> SimpleNamespace:
+    return SimpleNamespace(variance_epsilon=eps, weight=weight)
+
+
+@pytest.mark.parametrize("with_residual", [True, False])
+def test_fused_norm_quantize_rows_matches_norm_then_quantize(with_residual):
+    """The fused input-norm op (TPU_FUSE_PRE_ATTN_NORM_QUANT) returns the
+    residual sum and `quantize_rows` of the GemmaRMSNorm output."""
+    import jax.numpy as jnp
+
+    from vllm_torchtpu.layers.adapter import linear_common
+
+    torch.manual_seed(0)
+    eps = 1e-6
+    x = torch.randn(16, 256, dtype=torch.bfloat16)
+    residual = torch.randn(16, 256, dtype=torch.bfloat16)
+    weight = torch.randn(256) * 0.1
+    norm = _gemma_norm(weight, eps)
+    w_plus_one = jnp.asarray((1.0 + weight.float()).numpy())
+    if with_residual:
+        h_ref, res_ref = patch_mod._patched_gemma_rmsnorm_forward_native(
+            norm, x, residual
+        )
+        x_q, x_s, res_out = patch_mod._norm_quantize_rows_with_res_jax(
+            _bf16_jnp(x), _bf16_jnp(residual), w_plus_one, eps=eps
+        )
+        np.testing.assert_array_equal(
+            np.asarray(res_out, np.float32), res_ref.float().numpy()
+        )
+    else:
+        h_ref = patch_mod._patched_gemma_rmsnorm_forward_native(norm, x)
+        x_q, x_s = patch_mod._norm_quantize_rows_no_res_jax(
+            _bf16_jnp(x), w_plus_one, eps=eps
+        )
+    assert x_q.dtype == jnp.float8_e4m3fn and x_q.shape == (16, 256)
+    assert x_s.dtype == jnp.float32 and x_s.shape == (16, 1)
+    ref_q, ref_s = linear_common._quantize_rows_jax(_bf16_jnp(h_ref))
+    np.testing.assert_allclose(np.asarray(x_s), np.asarray(ref_s), rtol=1e-2)
+    deq = np.asarray(x_q, np.float32) * np.asarray(x_s)
+    np.testing.assert_allclose(deq, h_ref.float().numpy(), rtol=0.07, atol=1e-3)
+    assert np.mean(np.asarray(x_q, np.float32) == np.asarray(ref_q, np.float32)) > 0.99
+
+
+def test_fused_norm_gate_and_se_matches_norm_then_gate_and_se():
+    """The fused post-attention op (TPU_FUSE_POST_ATTN_NORM_MOE) is the
+    GemmaRMSNorm of the residual sum followed by `_fp8_gate_and_se_jax`."""
+    import jax.numpy as jnp
+
+    torch.manual_seed(0)
+    eps = 1e-6
+    hidden, n_gate, n_inter, rows = 256, 64, 32, 8
+    x = torch.randn(rows, hidden, dtype=torch.bfloat16)
+    residual = torch.randn(rows, hidden, dtype=torch.bfloat16)
+    weight = torch.randn(hidden) * 0.1
+    w_gate_gu = jnp.asarray(
+        (torch.randn(hidden, n_gate + 2 * n_inter) * 8).numpy(), jnp.float8_e4m3fn
+    )
+    s_gate_gu = jnp.full((n_gate + 2 * n_inter,), 0.01, jnp.float32)
+    w_se_gate = _bf16_jnp(torch.randn(hidden) * 0.02)
+    w_down = jnp.asarray((torch.randn(n_inter, hidden) * 8).numpy(), jnp.float8_e4m3fn)
+    s_down = jnp.full((hidden,), 0.01, jnp.float32)
+    w_plus_one = jnp.asarray((1.0 + weight.float()).numpy())
+
+    logits, se_out, h_bf16, res_out = patch_mod._norm_fp8_gate_and_se_jax(
+        _bf16_jnp(x),
+        _bf16_jnp(residual),
+        w_plus_one,
+        w_gate_gu,
+        s_gate_gu,
+        w_se_gate,
+        w_down,
+        s_down,
+        eps=eps,
+    )
+    h_ref, res_ref = patch_mod._patched_gemma_rmsnorm_forward_native(
+        _gemma_norm(weight, eps), x, residual
+    )
+    np.testing.assert_array_equal(np.asarray(res_out, np.float32), res_ref.float())
+    # The norm runs in JAX here and in torch there: one bf16 ulp at most.
+    np.testing.assert_allclose(
+        np.asarray(h_bf16, np.float32), h_ref.float().numpy(), rtol=2**-7, atol=1e-6
+    )
+    ref_logits, ref_se = patch_mod._fp8_gate_and_se_jax(
+        h_bf16, w_gate_gu, s_gate_gu, w_se_gate, w_down, s_down
+    )
+    np.testing.assert_array_equal(
+        np.asarray(logits, np.float32), np.asarray(ref_logits, np.float32)
+    )
+    np.testing.assert_array_equal(
+        np.asarray(se_out, np.float32), np.asarray(ref_se, np.float32)
+    )
+
+
+def _tpu_rows(dtype=torch.bfloat16) -> SimpleNamespace:
+    """What the fusion predicates read of a TPU activation."""
+    return SimpleNamespace(device=SimpleNamespace(type="tpu"), dtype=dtype)
+
+
+def test_pre_attn_norm_quant_fusion_predicate(monkeypatch):
+    """Sliced rows take the fused input norm whenever the layer is eligible;
+    replicated rows only where the pre-quantized rows are exact."""
+    _sequence_parallel(monkeypatch, fp8_gather=True)
+    monkeypatch.delenv("TPU_FUSE_PRE_ATTN_NORM_QUANT", raising=False)
+    fuses = patch_mod._fuses_pre_attn_norm_quant
+    layer = SimpleNamespace(_pre_norm_quant_eligible=True, _pre_norm_quant_exact=False)
+
+    assert fuses(layer, _tpu_rows(), True)
+    assert not fuses(layer, _tpu_rows(), False)
+    layer._pre_norm_quant_exact = True
+    assert fuses(layer, _tpu_rows(), False)
+
+    assert not fuses(layer, torch.zeros(2, 2, dtype=torch.bfloat16), True)
+    assert not fuses(layer, _tpu_rows(torch.float32), True)
+    assert not fuses(SimpleNamespace(), _tpu_rows(), True)
+    monkeypatch.setenv("TPU_FUSE_PRE_ATTN_NORM_QUANT", "0")
+    assert not fuses(layer, _tpu_rows(), True)
+    monkeypatch.delenv("TPU_FUSE_PRE_ATTN_NORM_QUANT")
+    _sequence_parallel(monkeypatch, fp8_gather=False)
+    assert not fuses(layer, _tpu_rows(), True)
+
+
+def test_post_attn_norm_moe_fusion_predicate(monkeypatch):
+    monkeypatch.delenv("TPU_FUSE_POST_ATTN_NORM_MOE", raising=False)
+    fuses = patch_mod._fuses_post_attn_norm_moe
+    norm = GemmaRMSNorm.__new__(GemmaRMSNorm)
+    layer = SimpleNamespace(
+        mlp=SimpleNamespace(_fused_gate_gu_fp8_weight=torch.zeros(1)),
+        post_attention_layernorm=norm,
+    )
+    assert fuses(layer, _tpu_rows())
+    assert not fuses(layer, torch.zeros(2, 2, dtype=torch.bfloat16))
+    assert not fuses(layer, _tpu_rows(torch.float32))
+    monkeypatch.setenv("TPU_FUSE_POST_ATTN_NORM_MOE", "off")
+    assert not fuses(layer, _tpu_rows())
+    monkeypatch.delenv("TPU_FUSE_POST_ATTN_NORM_MOE")
+    layer.mlp = SimpleNamespace()
+    assert not fuses(layer, _tpu_rows())
+    layer.mlp = SimpleNamespace(_fused_gate_gu_fp8_weight=torch.zeros(1))
+    layer.post_attention_layernorm = _gemma_norm(torch.zeros(4))
+    assert not fuses(layer, _tpu_rows())
+
+
+def _proj(dtype=torch.float8_e4m3fn, scale_shape=(4,)) -> SimpleNamespace:
+    return SimpleNamespace(
+        weight=torch.zeros(4, 4, dtype=dtype),
+        weight_scale=torch.ones(scale_shape),
+        quant_method=SimpleNamespace(apply_prequant=lambda *args: None),
+    )
+
+
+def test_mark_pre_attn_norm_quant():
+    """Eligible: a GemmaRMSNorm and an FP8 per-channel main projection. Exact:
+    every projection of the attention input is FP8 per-channel."""
+    norm = GemmaRMSNorm.__new__(GemmaRMSNorm)
+
+    def mark(layer):
+        patch_mod._mark_pre_attn_norm_quant(layer)
+        return layer._pre_norm_quant_eligible, layer._pre_norm_quant_exact
+
+    full = SimpleNamespace(
+        layer_type="full_attention",
+        input_layernorm=norm,
+        self_attn=SimpleNamespace(qkv_proj=_proj()),
+    )
+    assert mark(full) == (True, True)
+
+    def gdn(ba_dtype=torch.bfloat16, pcp=False):
+        return SimpleNamespace(
+            layer_type="linear_attention",
+            input_layernorm=norm,
+            linear_attn=SimpleNamespace(
+                in_proj_qkvz=_proj(),
+                in_proj_ba=_proj(ba_dtype),
+                _pcp_streaming_configured=pcp,
+            ),
+        )
+
+    # A bf16 in_proj_ba would see FP8-rounded replicated rows.
+    assert mark(gdn()) == (True, False)
+    assert mark(gdn(torch.float8_e4m3fn)) == (True, True)
+    # The pooled PCP forward ignores prequant.
+    assert mark(gdn(torch.float8_e4m3fn, pcp=True)) == (False, False)
+
+    full.self_attn.qkv_proj = _proj(scale_shape=(1, 4))
+    assert mark(full) == (False, False)
+    full.self_attn.qkv_proj = _proj()
+    full.input_layernorm = _gemma_norm(torch.zeros(4))
+    assert mark(full) == (False, False)
+
+
+class _CallableNorm:
+    """A norm stand-in the fused-path fakes below reproduce exactly."""
+
+    variance_epsilon = 1e-6
+
+    def __init__(self, scale: float):
+        self.weight = torch.zeros(64)
+        self.scale = scale
+
+    def __call__(self, x, residual=None):
+        if residual is None:
+            return x * self.scale
+        x = x + residual
+        return x * self.scale, x
+
+
+class _FusedMoeBlock:
+    """A MoE block with the fused gate/shared-expert weights; doubles rows."""
+
+    _fused_gate_se_checked = True
+    _fused_gate_gu_fp8_weight = torch.zeros(1)
+    _fused_gate_gu_fp8_scale = torch.zeros(1)
+    _fused_se_gate_weight = torch.zeros(1)
+    _fused_se_down_fp8_weight = torch.zeros(1)
+    _fused_se_down_fp8_scale = torch.zeros(1)
+
+    def __init__(self, calls):
+        self.calls = calls
+
+    def __call__(self, x, **kwargs):
+        self.calls.append(("unfused", kwargs))
+        return x * 2.0
+
+
+def _fused_norm_layer(attn_calls, mlp_calls):
+    class Layer:
+        use_attn_reduce_scatter_for_moe = True
+        layer_type = "linear_attention"
+        layer_scale = False
+        input_layernorm = _CallableNorm(1.05)
+        post_attention_layernorm = _CallableNorm(1.1)
+
+        def linear_attn(self, hidden_states, **kwargs):
+            attn_calls.append(kwargs)
+            return hidden_states.float() + 1.0
+
+    layer = Layer()
+    layer.mlp = _FusedMoeBlock(mlp_calls)
+    layer._tpu_sp_rank = torch.tensor([0], dtype=torch.int32)
+    return layer
+
+
+def _fake_fused_norm_ops(monkeypatch, moe_calls):
+    """CPU stand-ins for the fused norm ops matching `_CallableNorm`, with the
+    quantized rows kept in bf16 (as `quantize_rows` is faked)."""
+
+    def with_res(eps):
+        def op(x, residual, w_plus_one):
+            s = x + residual
+            return (s * 1.05).to(torch.bfloat16), torch.ones(x.shape[0], 1), s
+
+        return op
+
+    def no_res(eps):
+        return lambda x, w_plus_one: (
+            (x * 1.05).to(torch.bfloat16),
+            torch.ones(x.shape[0], 1),
+        )
+
+    def gate_se(eps):
+        def op(x, residual, w_plus_one, *weights):
+            assert len(weights) == 5
+            s = x + residual
+            h = s * 1.1
+            return h[:, :4], torch.zeros_like(h), h, s
+
+        return op
+
+    def moe_forward(mlp, h, already_sequence_parallel=False, *, prenorm_outputs):
+        moe_calls.append((already_sequence_parallel, prenorm_outputs))
+        return h * 2.0
+
+    monkeypatch.setattr(patch_mod, "_get_norm_quantize_rows_with_res_op", with_res)
+    monkeypatch.setattr(patch_mod, "_get_norm_quantize_rows_no_res_op", no_res)
+    monkeypatch.setattr(patch_mod, "_get_norm_fp8_gate_and_se_op", gate_se)
+    monkeypatch.setattr(patch_mod, "patched_sparse_moe_forward", moe_forward)
+
+
+@pytest.mark.parametrize("first_layer", [False, True])
+def test_patched_decoder_layer_forward_fused_norms_match_unfused(
+    monkeypatch, first_layer
+):
+    """With both fusions on, the SP layer keeps its row handling (gather the
+    slice into attention, or slice replicated rows after it) and its result;
+    attention gets the fused op's rows pre-quantized, and the MoE gets the
+    fused op's normed rows, router logits and shared expert."""
+    tp = 2
+    _fake_tp_collectives(monkeypatch, tp)
+    _sequence_parallel(monkeypatch, min_rows=0, fp8_gather=True)
+    monkeypatch.setattr(
+        patch_mod.linear_common,
+        "quantize_rows",
+        lambda x: (x.to(torch.bfloat16), torch.ones(x.shape[0], 1)),
+    )
+    num_tokens = 8
+    rows = num_tokens if first_layer else num_tokens // tp
+    # bf16 rows: the fakes stand in bf16 for fp8, so both paths stay exact.
+    hidden = torch.randn(rows, 64, dtype=torch.bfloat16)
+    residual = None if first_layer else torch.randn(rows, 64, dtype=torch.bfloat16)
+    positions = torch.arange(num_tokens)
+
+    attn_calls: list[dict[str, object]] = []
+    mlp_calls: list = []
+    unfused_h, unfused_r = patched_decoder_layer_forward(
+        _fused_norm_layer(attn_calls, mlp_calls), hidden, residual, positions
+    )
+    assert mlp_calls == [("unfused", {"already_sequence_parallel": True})]
+
+    moe_calls: list = []
+    fused_attn_calls: list[dict[str, object]] = []
+    _fake_fused_norm_ops(monkeypatch, moe_calls)
+    monkeypatch.setattr(patch_mod, "_fuses_pre_attn_norm_quant", lambda *a: True)
+    monkeypatch.setattr(patch_mod, "_fuses_post_attn_norm_moe", lambda *a: True)
+    fused_h, fused_r = patched_decoder_layer_forward(
+        _fused_norm_layer(fused_attn_calls, mlp_calls), hidden, residual, positions
+    )
+
+    torch.testing.assert_close(fused_h, unfused_h)
+    torch.testing.assert_close(fused_r, unfused_r)
+    assert fused_h.shape == (num_tokens // tp, 64)
+    (kwargs,) = fused_attn_calls
+    x_q, x_s = kwargs["prequant"]
+    assert x_q.shape == (num_tokens, 64) and x_s.shape == (num_tokens, 1)
+    ((already_sp, (logits, se_out)),) = moe_calls
+    assert already_sp is True
+    assert logits.shape == (num_tokens // tp, 4)
+    assert se_out.shape == (num_tokens // tp, 64)
+
+
+def test_patched_sparse_moe_forward_takes_prenorm_outputs(monkeypatch):
+    """`prenorm_outputs` replaces the fused gate/shared-expert op."""
+
+    def no_recompute(*args, **kwargs):
+        raise AssertionError("prenorm_outputs already holds the gate outputs")
+
+    monkeypatch.setattr(patch_mod, "compute_fused_gate_and_shared_expert", no_recompute)
+    seen = {}
+
+    def experts(hidden_states, router_logits):
+        seen["router_logits"] = router_logits
+        return hidden_states * 0.5
+
+    moe = SimpleNamespace(
+        _fused_gate_se_checked=True,
+        _fused_gate_se_weight=torch.zeros(1),
+        _fused_se_is_replicated=True,
+        tp_size=1,
+        experts=experts,
+    )
+    x = torch.randn(4, 8)
+    logits = torch.randn(4, 3)
+    se_out = torch.randn(4, 8)
+    out = patched_sparse_moe_forward(moe, x, prenorm_outputs=(logits, se_out))
+    torch.testing.assert_close(out, x * 0.5 + se_out)
+    assert seen["router_logits"] is logits

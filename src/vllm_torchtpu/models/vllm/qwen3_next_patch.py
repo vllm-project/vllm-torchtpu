@@ -48,12 +48,21 @@ every bucket:
   its rows replicated and all-reduces the attention output instead.
 - With TPU_SP_FP8_GATHER, the attention-side all-gather carries FP8 rows and
   their scales, which the attention projections consume as pre-quantized input.
+- TPU_FUSE_PRE_ATTN_NORM_QUANT (default on, with TPU_SP_FP8_GATHER) computes
+  the input norm and that row quantization as one op. Replicated rows take it
+  only where every projection of the attention input is FP8 per-channel, so
+  the pre-quantized rows give the result the projections compute themselves.
+- TPU_FUSE_POST_ATTN_NORM_MOE (default on) computes the post-attention norm,
+  the router logits and the shared expert as one op for a MoE layer with the
+  fused FP8 gate/shared-expert weights; the routed experts take its normed
+  rows.
 - The MTP drafter forward gathers its last-token rows right after attention on
   speculative step 0 (`step0_post_attn_gather_context`).
 """
 
 import contextlib
 import functools
+import gc
 from collections.abc import Callable
 from itertools import islice
 from typing import Any
@@ -515,6 +524,173 @@ def _get_fp8_gate_and_se_op() -> Callable:
     return _fp8_gate_and_se_op
 
 
+# Fused GemmaRMSNorm ops, one per norm epsilon (baked into the traced op).
+_norm_quantize_rows_with_res_ops: dict[float, Callable] = {}
+_norm_quantize_rows_no_res_ops: dict[float, Callable] = {}
+_norm_fp8_gate_and_se_ops: dict[float, Callable] = {}
+
+
+def _eps_op_tag(eps: float) -> str:
+    return f"{eps:.0e}".replace("-", "m").replace("+", "p").replace(".", "_")
+
+
+def _gemma_rms_norm_jax(
+    x: jax.Array, norm_w_plus_one: jax.Array, eps: float
+) -> jax.Array:
+    """`_patched_gemma_rmsnorm_forward_native` on bf16 rows, in JAX."""
+    x_f32 = x.astype(jnp.float32)
+    var = jnp.mean(jnp.square(x_f32), axis=-1, keepdims=True)
+    h_f32 = (
+        x_f32
+        * jax.lax.rsqrt(var + jnp.float32(eps))
+        * norm_w_plus_one.astype(jnp.float32)
+    )
+    return h_f32.astype(jnp.bfloat16)
+
+
+def _norm_quantize_rows_with_res_jax(
+    x: jax.Array,
+    residual: jax.Array,
+    norm_w_plus_one: jax.Array,
+    *,
+    eps: float,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    res_out = (x + residual.astype(x.dtype)).astype(jnp.bfloat16)
+    h_bf16 = _gemma_rms_norm_jax(res_out, norm_w_plus_one, eps)
+    x_q, x_s = linear_common._quantize_rows_jax(h_bf16)
+    return x_q, x_s, res_out
+
+
+def _norm_quantize_rows_no_res_jax(
+    x: jax.Array,
+    norm_w_plus_one: jax.Array,
+    *,
+    eps: float,
+) -> tuple[jax.Array, jax.Array]:
+    return linear_common._quantize_rows_jax(
+        _gemma_rms_norm_jax(x, norm_w_plus_one, eps)
+    )
+
+
+def _get_norm_quantize_rows_with_res_op(eps: float) -> Callable:
+    """GemmaRMSNorm(x + residual) and `linear_common.quantize_rows` of it as
+    one op: (rows fp8, scales [rows, 1] f32, residual out bf16)."""
+    key = float(eps)
+    op = _norm_quantize_rows_with_res_ops.get(key)
+    if op is None:
+        fn = functools.partial(_norm_quantize_rows_with_res_jax, eps=key)
+        op = pallas.jax_op(
+            f"pallas::qwen3_next_norm_quant_rows_res_{_eps_op_tag(key)}", fn
+        )
+
+        def _fake(
+            x: torch.Tensor,
+            residual: torch.Tensor,
+            norm_w_plus_one: torch.Tensor,
+        ):
+            del residual, norm_w_plus_one
+            return (
+                x.new_empty(x.shape, dtype=torch.float8_e4m3fn),
+                x.new_empty((x.shape[0], 1), dtype=torch.float32),
+                x.new_empty(x.shape, dtype=torch.bfloat16),
+            )
+
+        op.register_fake(_fake)
+        _norm_quantize_rows_with_res_ops[key] = op
+    return op
+
+
+def _get_norm_quantize_rows_no_res_op(eps: float) -> Callable:
+    """GemmaRMSNorm(x) and `linear_common.quantize_rows` of it as one op:
+    (rows fp8, scales [rows, 1] f32)."""
+    key = float(eps)
+    op = _norm_quantize_rows_no_res_ops.get(key)
+    if op is None:
+        fn = functools.partial(_norm_quantize_rows_no_res_jax, eps=key)
+        op = pallas.jax_op(
+            f"pallas::qwen3_next_norm_quant_rows_nores_{_eps_op_tag(key)}", fn
+        )
+
+        def _fake(
+            x: torch.Tensor,
+            norm_w_plus_one: torch.Tensor,
+        ):
+            del norm_w_plus_one
+            return (
+                x.new_empty(x.shape, dtype=torch.float8_e4m3fn),
+                x.new_empty((x.shape[0], 1), dtype=torch.float32),
+            )
+
+        op.register_fake(_fake)
+        _norm_quantize_rows_no_res_ops[key] = op
+    return op
+
+
+def _norm_fp8_gate_and_se_jax(
+    x: jax.Array,
+    residual: jax.Array,
+    norm_w_plus_one: jax.Array,
+    w_gate_gu_fp8: jax.Array,
+    s_gate_gu: jax.Array,
+    w_se_gate_bf16: jax.Array,
+    w_down_fp8: jax.Array,
+    s_down: jax.Array,
+    *,
+    eps: float,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    res_out = (x + residual.astype(x.dtype)).astype(jnp.bfloat16)
+    h_bf16 = _gemma_rms_norm_jax(res_out, norm_w_plus_one, eps)
+    logits, se_out = _fp8_gate_and_se_jax(
+        h_bf16, w_gate_gu_fp8, s_gate_gu, w_se_gate_bf16, w_down_fp8, s_down
+    )
+    return logits, se_out, h_bf16, res_out
+
+
+def _get_norm_fp8_gate_and_se_op(eps: float) -> Callable:
+    """GemmaRMSNorm(x + residual) and `_fp8_gate_and_se_jax` of it as one op:
+    (router logits, shared-expert output, normed rows, residual out)."""
+    key = float(eps)
+    op = _norm_fp8_gate_and_se_ops.get(key)
+    if op is None:
+        fn = functools.partial(_norm_fp8_gate_and_se_jax, eps=key)
+        op = pallas.jax_op(
+            f"pallas::qwen3_next_norm_fp8_gate_se_bf16_{_eps_op_tag(key)}", fn
+        )
+
+        def _fake(
+            x: torch.Tensor,
+            residual: torch.Tensor,
+            norm_w_plus_one: torch.Tensor,
+            w_gate_gu_fp8: torch.Tensor,
+            s_gate_gu: torch.Tensor,
+            w_se_gate_bf16: torch.Tensor,
+            w_down_fp8: torch.Tensor,
+            s_down: torch.Tensor,
+        ):
+            del residual, norm_w_plus_one, s_gate_gu, w_se_gate_bf16, s_down
+            n_tokens = x.shape[0]
+            n_inter = int(w_down_fp8.shape[0])
+            n_gate = int(w_gate_gu_fp8.shape[1]) - 2 * n_inter
+            hidden_dim = int(w_down_fp8.shape[1])
+            return (
+                x.new_empty((n_tokens, n_gate), dtype=torch.bfloat16),
+                x.new_empty((n_tokens, hidden_dim), dtype=torch.bfloat16),
+                x.new_empty((n_tokens, hidden_dim), dtype=torch.bfloat16),
+                x.new_empty((n_tokens, hidden_dim), dtype=torch.bfloat16),
+            )
+
+        op.register_fake(_fake)
+        _norm_fp8_gate_and_se_ops[key] = op
+    return op
+
+
+def _prebuild_norm_ops(eps: float) -> None:
+    """Build the fused norm ops for `eps` before any trace."""
+    _get_norm_quantize_rows_with_res_op(eps)
+    _get_norm_quantize_rows_no_res_op(eps)
+    _get_norm_fp8_gate_and_se_op(eps)
+
+
 def _cpu_fp8_gate_and_se(
     hidden_states: torch.Tensor,
     w_gate_gu_fp8: torch.Tensor,
@@ -789,7 +965,12 @@ def patched_sparse_moe_forward(
     self: Any,
     hidden_states: torch.Tensor,
     already_sequence_parallel: bool = False,
+    *,
+    prenorm_outputs: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> torch.Tensor:
+    """`prenorm_outputs`: (router logits, shared-expert output) of
+    `hidden_states`, already computed by the decoder layer's fused
+    post-attention norm (`_fused_post_attn_norm_moe`)."""
     if (
         not getattr(self, "_fused_gate_se_checked", False)
         and not torch.compiler.is_compiling()
@@ -808,9 +989,12 @@ def patched_sparse_moe_forward(
     is_sp = sequence_parallel.is_active()
     tp_size = getattr(self, "tp_size", 1)
 
-    router_logits, shared_output = compute_fused_gate_and_shared_expert(
-        self, hidden_states
-    )
+    if prenorm_outputs is not None:
+        router_logits, shared_output = prenorm_outputs
+    else:
+        router_logits, shared_output = compute_fused_gate_and_shared_expert(
+            self, hidden_states
+        )
     final_hidden_states = self.experts(
         hidden_states=hidden_states,
         router_logits=router_logits,
@@ -892,6 +1076,7 @@ def setup_qwen3_next_v6_after_loading(model: Any) -> None:
         if isinstance(module, GemmaRMSNorm):
             w_plus_one = 1.0 + module.weight.data.float()
             module._tpu_weight_plus_one = w_plus_one
+            _prebuild_norm_ops(float(getattr(module, "variance_epsilon", 1e-6)))
             if w_plus_one.device.type == "tpu":
                 hoisted_norm_tensors.append(w_plus_one)
         if isinstance(module, qwen3_next.Qwen3NextSparseMoeBlock):
@@ -925,12 +1110,66 @@ def setup_qwen3_next_v6_after_loading(model: Any) -> None:
                 linear_attn = getattr(module, "linear_attn", None)
                 if linear_attn is not None:
                     maybe_flip_gdn_in_proj_qkvz_weight(linear_attn)
+            _mark_pre_attn_norm_quant(module)
         elif hasattr(module, "in_proj_qkvz") and hasattr(
             module, "_pcp_streaming_configured"
         ):
             maybe_flip_gdn_in_proj_qkvz_weight(module)
     if hoisted_norm_tensors:
         synchronize_tensors(hoisted_norm_tensors)
+    # Reclaim what the weight rewrites above left behind before the KV cache
+    # is sized.
+    gc.collect()
+
+
+def _takes_prequant_rows(proj: Any) -> bool:
+    """Whether `proj` is an FP8 linear with per-channel scales whose
+    `apply_prequant` takes `linear_common.quantize_rows` rows, reproducing
+    what its plain forward computes from the bf16 rows."""
+    weight = getattr(proj, "weight", None)
+    weight_scale = getattr(proj, "weight_scale", None)
+    return bool(
+        isinstance(weight, torch.Tensor)
+        and weight.dtype == torch.float8_e4m3fn
+        and isinstance(weight_scale, torch.Tensor)
+        and weight_scale.ndim == 1
+        and hasattr(getattr(proj, "quant_method", None), "apply_prequant")
+    )
+
+
+def _mark_pre_attn_norm_quant(layer: Any) -> None:
+    """Record where `layer` may take TPU_FUSE_PRE_ATTN_NORM_QUANT.
+
+    `_pre_norm_quant_eligible`: the input norm is a GemmaRMSNorm and the
+    attention's main input projection takes pre-quantized rows, so the rows
+    quantized for the FP8 all-gather can come out of the fused op.
+    `_pre_norm_quant_exact`: every projection of the attention input does, so
+    replicated rows can take the fused op without changing what attention
+    computes (not so with a bf16 `in_proj_ba`, as in the Qwen3.5 FP8
+    checkpoints).
+    """
+    if getattr(layer, "layer_type", None) == "linear_attention":
+        attn = getattr(layer, "linear_attn", None)
+        main = "in_proj_qkvz"
+        names = ("in_proj_qkvz", "in_proj_qkv", "in_proj_z", "in_proj_ba")
+        # The pooled PCP forward reads hidden_states and drops `prequant`.
+        if getattr(attn, "_pcp_streaming_configured", False):
+            attn = None
+    else:
+        attn = getattr(layer, "self_attn", None)
+        main = "qkv_proj"
+        names = ("qkv_proj",)
+    eligible = bool(
+        attn is not None
+        and isinstance(getattr(layer, "input_layernorm", None), GemmaRMSNorm)
+        and _takes_prequant_rows(getattr(attn, main, None))
+    )
+    layer._pre_norm_quant_eligible = eligible
+    layer._pre_norm_quant_exact = eligible and all(
+        _takes_prequant_rows(proj)
+        for proj in (getattr(attn, name, None) for name in names)
+        if proj is not None
+    )
 
 
 def install_qwen3_next_v6_patches() -> None:
@@ -1011,6 +1250,92 @@ def _layer_scale(
     return hidden_states * (scale.to(hidden_states.dtype) + 1)
 
 
+def _norm_weight_plus_one(norm: Any) -> torch.Tensor:
+    w_plus_one = getattr(norm, "_tpu_weight_plus_one", None)
+    return 1.0 + norm.weight.float() if w_plus_one is None else w_plus_one
+
+
+def _fuses_pre_attn_norm_quant(
+    layer: Any, hidden_states: torch.Tensor, input_is_sliced: bool
+) -> bool:
+    """Whether the input norm and the per-row FP8 quantization of its output
+    run as one op (TPU_FUSE_PRE_ATTN_NORM_QUANT) feeding attention prequant.
+
+    Sliced rows are quantized for the FP8 all-gather anyway. Replicated rows
+    otherwise reach attention unquantized, so they take the fused op only
+    where that leaves attention's result unchanged (`_mark_pre_attn_norm_quant`).
+    """
+    return (
+        hidden_states.device.type == "tpu"
+        and hidden_states.dtype == torch.bfloat16
+        and sequence_parallel.fp8_gather()
+        and getattr(layer, "_pre_norm_quant_eligible", False)
+        and (input_is_sliced or getattr(layer, "_pre_norm_quant_exact", False))
+        and envs.TPU_FUSE_PRE_ATTN_NORM_QUANT
+    )
+
+
+def _norm_quantize_rows(
+    norm: Any, hidden_states: torch.Tensor, residual: torch.Tensor | None
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """`norm(hidden_states, residual)` then `linear_common.quantize_rows`, as
+    one op: (rows fp8, scales [rows, 1] f32, residual)."""
+    orig_shape = hidden_states.shape
+    x_2d = hidden_states.reshape(-1, orig_shape[-1])
+    w_plus_one = _norm_weight_plus_one(norm)
+    eps = float(getattr(norm, "variance_epsilon", 1e-6))
+    if residual is None:
+        x_q, x_s = _get_norm_quantize_rows_no_res_op(eps)(x_2d, w_plus_one)
+        return x_q, x_s, hidden_states
+    x_q, x_s, res_out = _get_norm_quantize_rows_with_res_op(eps)(
+        x_2d, residual.reshape(-1, orig_shape[-1]), w_plus_one
+    )
+    return x_q, x_s, res_out.view(orig_shape)
+
+
+def _fuses_post_attn_norm_moe(layer: Any, hidden_states: torch.Tensor) -> bool:
+    """Whether the post-attention norm, router gate and shared expert run as
+    one op (TPU_FUSE_POST_ATTN_NORM_MOE) ahead of the routed experts."""
+    return (
+        hidden_states.device.type == "tpu"
+        and hidden_states.dtype == torch.bfloat16
+        and getattr(layer.mlp, "_fused_gate_gu_fp8_weight", None) is not None
+        and isinstance(layer.post_attention_layernorm, GemmaRMSNorm)
+        and envs.TPU_FUSE_POST_ATTN_NORM_MOE
+    )
+
+
+def _fused_post_attn_norm_moe(
+    layer: Any, hidden_states: torch.Tensor, residual: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """`post_attention_layernorm` + `mlp`, with the norm, the router logits
+    and the shared expert computed by one op."""
+    mlp = layer.mlp
+    norm = layer.post_attention_layernorm
+    orig_shape = hidden_states.shape
+    hidden_dim = orig_shape[-1]
+    eps = float(getattr(norm, "variance_epsilon", 1e-6))
+    logits, se_out, h_bf16, res_out = _get_norm_fp8_gate_and_se_op(eps)(
+        hidden_states.reshape(-1, hidden_dim),
+        residual.reshape(-1, hidden_dim),
+        _norm_weight_plus_one(norm),
+        mlp._fused_gate_gu_fp8_weight,
+        mlp._fused_gate_gu_fp8_scale,
+        mlp._fused_se_gate_weight,
+        mlp._fused_se_down_fp8_weight,
+        mlp._fused_se_down_fp8_scale,
+    )
+    # The MoE block's own forward, called directly: only it reads the fused
+    # gate/shared-expert weights.
+    hidden_states = patched_sparse_moe_forward(
+        mlp,
+        h_bf16.view(orig_shape),
+        already_sequence_parallel=bool(layer.use_attn_reduce_scatter_for_moe),
+        prenorm_outputs=(logits, se_out),
+    )
+    return hidden_states, res_out.view(orig_shape)
+
+
 def patched_decoder_layer_forward(
     self,
     hidden_states: torch.Tensor,
@@ -1033,21 +1358,31 @@ def patched_decoder_layer_forward(
     if small_all_reduce_op._RANK is not None:
         positions = positions + (small_all_reduce_op._RANK * 0)[0]
 
-    if residual is None:
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-    else:
-        hidden_states, residual = self.input_layernorm(hidden_states, residual)
-
     prequant = None
-    if input_is_sliced and sequence_parallel.fp8_gather():
-        x_q, x_s = linear_common.quantize_rows(hidden_states)
-        x_q = tensor_model_parallel_all_gather(x_q, 0)
-        x_s = tensor_model_parallel_all_gather(x_s, 0)
+    if _fuses_pre_attn_norm_quant(self, hidden_states, input_is_sliced):
+        x_q, x_s, residual = _norm_quantize_rows(
+            self.input_layernorm, hidden_states, residual
+        )
+        if input_is_sliced:
+            x_q = tensor_model_parallel_all_gather(x_q, 0)
+            x_s = tensor_model_parallel_all_gather(x_s, 0)
         prequant = (x_q, x_s)
         hidden_states = x_q
-    elif input_is_sliced:
-        hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
+    else:
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+
+        if input_is_sliced and sequence_parallel.fp8_gather():
+            x_q, x_s = linear_common.quantize_rows(hidden_states)
+            x_q = tensor_model_parallel_all_gather(x_q, 0)
+            x_s = tensor_model_parallel_all_gather(x_s, 0)
+            prequant = (x_q, x_s)
+            hidden_states = x_q
+        elif input_is_sliced:
+            hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
     attn_kwargs: dict[str, Any] = {} if prequant is None else {"prequant": prequant}
 
     if self.layer_type == "linear_attention":
@@ -1080,14 +1415,25 @@ def patched_decoder_layer_forward(
             hidden_states = tensor_model_parallel_all_reduce(hidden_states)
 
     # Fully Connected
-    hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-    if self.use_attn_reduce_scatter_for_moe:
-        hidden_states = self.mlp(
-            hidden_states,
-            already_sequence_parallel=True,
+    if (
+        not getattr(self.mlp, "_fused_gate_se_checked", False)
+        and not torch.compiler.is_compiling()
+        and isinstance(self.mlp, qwen3_next.Qwen3NextSparseMoeBlock)
+    ):
+        maybe_setup_fused_gate_se(self.mlp)
+    if _fuses_post_attn_norm_moe(self, hidden_states):
+        hidden_states, residual = _fused_post_attn_norm_moe(
+            self, hidden_states, residual
         )
     else:
-        hidden_states = self.mlp(hidden_states)
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        if self.use_attn_reduce_scatter_for_moe:
+            hidden_states = self.mlp(
+                hidden_states,
+                already_sequence_parallel=True,
+            )
+        else:
+            hidden_states = self.mlp(hidden_states)
 
     if self.layer_scale:
         hidden_states = _layer_scale(
@@ -1240,8 +1586,6 @@ def maybe_patch_qwen3_next(*args: object, **kwargs: object) -> None:
     if envs.TPU_MOE_SEQUENCE_PARALLEL:
         from vllm.model_executor.models import qwen3_5
 
-        if sequence_parallel.fp8_gather():
-            linear_common.prebuild_prequant_ops()
         for layer_cls in (
             qwen3_next.Qwen3NextDecoderLayer,
             qwen3_5.Qwen3_5DecoderLayer,
@@ -1252,6 +1596,12 @@ def maybe_patch_qwen3_next(*args: object, **kwargs: object) -> None:
                 layer_cls.__init__ = _with_rank_tensor(layer_cls.__init__)
     elif not envs.TPU_MTP_STEP0_POST_ATTN_GATHER:
         return None
+
+    if sequence_parallel.fp8_gather():
+        # The FP8 all-gather's ops and the fused input norm + row quantization
+        # at the usual epsilon; the loader hook adds every norm's own epsilon.
+        linear_common.prebuild_prequant_ops()
+        _prebuild_norm_ops(1e-6)
 
     # The model, layer and drafter forwards agree on which steps slice their
     # rows, so they are installed together.
