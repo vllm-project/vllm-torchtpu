@@ -60,17 +60,18 @@ def test_cached_subtract_indices_upload_synchronously():
 
     src = SRC.read_text()
     i = src.index('            sub_cache = getattr(self, "_async_subtract_idx_cache"')
-    end = src.index("seq_idx_dev, pos_idx_dev = cached_sub", i) + len(
-        "seq_idx_dev, pos_idx_dev = cached_sub"
-    )
+    end_marker = "sub_cache[sub_key] = (seq_idx_dev, pos_idx_dev, qx_sub_mask)"
+    end = src.index(end_marker, i) + len(end_marker)
     block = src[i:end]
     assert "non_blocking=" not in block
     assert "_h2d_temp(" not in block
     assert "sub_cache.clear()" not in block
     assert "while len(sub_cache) >= 256:" in block
     assert "sub_cache.pop(next(iter(sub_cache)))" in block
-    assert "packed_sub_dev = torch.from_numpy(" in block
-    assert block.count(".to(self.device)") == 1
+    # Two base tensors, each uploaded synchronously on a miss.
+    assert "seq_idx_dev = torch.from_numpy(seq_idx_np).to(self.device)" in block
+    assert "pos_idx_dev = torch.from_numpy(pos_idx_np).to(self.device)" in block
+    assert block.count(".to(self.device)") == 2
 
     uploads = []
 
@@ -96,6 +97,8 @@ def test_cached_subtract_indices_upload_synchronously():
         ns = {
             "self": runner,
             "sub_key": sub_key,
+            "sub_pairs": sub_key[2],
+            "num_reqs": len(sub_key[2]),
             "target_num_reqs": 4,
             "padded_total_num_scheduled_tokens": 8,
             "np": np,
@@ -107,13 +110,13 @@ def test_cached_subtract_indices_upload_synchronously():
             assert ns["pos_idx_dev"].arr.tolist() == [0, 0, -1, -1, -1, 1, -1, -1]
 
     # 260 distinct keys: FIFO at 256 keeps the 256 most recent (never .clear()),
-    # each miss did 1 synchronous upload, and _h2d_keepalive was never touched.
+    # each miss did 2 synchronous uploads, and _h2d_keepalive was never touched.
     assert len(runner._async_subtract_idx_cache) == 256
     assert (4, 8, ((0, 2), (None, 3), (1, 1))) not in runner._async_subtract_idx_cache
     assert (4, 8, ((3, 2), (None, 3), (1, 1))) not in runner._async_subtract_idx_cache
     assert (4, 8, ((4, 2), (None, 3), (1, 1))) in runner._async_subtract_idx_cache
     assert (4, 8, ((259, 2), (None, 3), (1, 1))) in runner._async_subtract_idx_cache
-    assert len(uploads) == 260 and all(not nb for _, nb, _ in uploads)
+    assert len(uploads) == 2 * 260 and all(not nb for _, nb, _ in uploads)
     assert not hasattr(runner, "_h2d_keepalive")
 
 
