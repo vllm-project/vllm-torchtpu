@@ -57,6 +57,10 @@ PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY = (
 # owns the name) never change a compiled program.
 RUNNER_OPTIONS_SECTION = runner_options.SECTION
 
+# Host-only section: the scheduler options (`core.scheduler_options`) only
+# decide admission order and never change a compiled program.
+SCHEDULER_OPTIONS_SECTION = "tpu_scheduler"
+
 # Keys that never change the compiled graph: the diagnostics-only profiler
 # knobs above, which only steer profiling, and the host-only sections, each
 # imported from the module that reads it.
@@ -70,6 +74,7 @@ HASH_IGNORED_ADDITIONAL_CONFIG_KEYS = frozenset(
         RUNNER_OPTIONS_SECTION,
         WORKER_OPTIONS_SECTION,
         tpu_multiport_dp.SECTION,
+        SCHEDULER_OPTIONS_SECTION,
     }
 )
 

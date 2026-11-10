@@ -32,6 +32,7 @@ from vllm_torchtpu.runner.utils import (
     PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY,
     PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY,
     RUNNER_OPTIONS_SECTION,
+    SCHEDULER_OPTIONS_SECTION,
     WORKER_OPTIONS_SECTION,
 )
 
@@ -211,6 +212,7 @@ def test_ignored_keys_match_the_keys_the_runner_reads():
         RUNNER_OPTIONS_SECTION,
         WORKER_OPTIONS_SECTION,
         tpu_multiport_dp.SECTION,
+        SCHEDULER_OPTIONS_SECTION,
     } == HASH_IGNORED_ADDITIONAL_CONFIG_KEYS
 
 
@@ -237,5 +239,16 @@ def test_host_only_sections_do_not_change_the_hash(patched_compute_hash, section
         patched_compute_hash(
             _StubVllmConfig({"some_plugin_knob": 1, section: {"any_option": True}})
         )
+        == baseline
+    )
+
+
+def test_scheduler_section_does_not_change_the_hash(patched_compute_hash):
+    """The scheduler options only decide admission order, so changing them must
+    not force a recompile."""
+    baseline = patched_compute_hash(_StubVllmConfig({"some_plugin_knob": 1}))
+    section = {SCHEDULER_OPTIONS_SECTION: {"promote_warmest": False}}
+    assert (
+        patched_compute_hash(_StubVllmConfig({"some_plugin_knob": 1, **section}))
         == baseline
     )
