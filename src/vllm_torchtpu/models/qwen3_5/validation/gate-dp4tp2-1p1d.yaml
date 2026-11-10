@@ -37,7 +37,11 @@ arms:
   tradeoffs_off:
     additional_config: {}
   tradeoffs_on:
-    additional_config: {qwen3_5: {exp2_softmax: true, native_fp8_attention: true}}
+    additional_config:
+      qwen3_5:
+        exp2_softmax: true
+        native_fp8_attention: true
+        quantize_target_lm_head: true
 suite:
   gsm8k: {samples: 1319, chat_template_kwargs: {enable_thinking: true}, metric: strict-match}
   longbench: {}

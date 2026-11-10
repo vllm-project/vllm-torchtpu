@@ -46,8 +46,9 @@ that needs it:
 
 | Setting | Type | Default | What it does |
 | --- | --- | --- | --- |
+| `quantize_target_lm_head` | bool | `false` | Quantize the target model's LM head to W8A8 FP8 after loading; the MTP draft keeps a BF16 copy. A quality/speed trade-off, on in the trade-offs-on validation configurations. |
 
-No setting exists yet. Each change that adds one adds its row here.
+Each change that adds a setting adds its row here.
 
 ## Production Configs
 
