@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""TPU_FUSED_QK_NORM_ROPE: the fused projection against vLLM's eager
+"""The Qwen3.5 fused q/k norm + rope: the fused projection against vLLM's eager
 ``Qwen3NextAttention._project_qkv_gate`` on real norm and rope modules, and the
 op's row fork. The torch<->JAX op bridge runs the kernel in the Pallas
 interpreter on the host."""
@@ -171,7 +171,6 @@ def test_fused_projection_reads_the_hoisted_norm_weight():
 
 @pytest.fixture
 def patched(monkeypatch):
-    monkeypatch.setenv("TPU_FUSED_QK_NORM_ROPE", "1")
     monkeypatch.setattr(Qwen3NextAttention, "__init__", Qwen3NextAttention.__init__)
     monkeypatch.setattr(
         Qwen3NextAttention,
@@ -193,7 +192,7 @@ def patched(monkeypatch):
 def test_patch_forks_on_the_token_bucket(
     patched, monkeypatch, rows, min_rows, max_rows, enabled, uses_op, uses_kernel
 ):
-    monkeypatch.setenv("TPU_FUSED_QK_NORM_ROPE_MIN_ROWS", str(min_rows))
+    monkeypatch.setattr(fused, "MIN_ROWS", min_rows)
     monkeypatch.setattr(fused, "MAX_ROWS", max_rows)
     layer = _layer(fused_qk_norm_rope=enabled)
     q, k, v, gate = Qwen3NextAttention._project_qkv_gate(layer, *_inputs(rows))
@@ -203,11 +202,47 @@ def test_patch_forks_on_the_token_bucket(
     assert len(_HostOp.reference_calls) == int(uses_op and not uses_kernel)
 
 
-def test_patch_is_inert_with_the_flag_off(monkeypatch):
-    monkeypatch.setenv("TPU_FUSED_QK_NORM_ROPE", "0")
-    original = Qwen3NextAttention._project_qkv_gate
+@pytest.fixture
+def restore_attention(monkeypatch):
+    """Undo whatever a test installs on Qwen3NextAttention."""
+    monkeypatch.setattr(Qwen3NextAttention, "__init__", Qwen3NextAttention.__init__)
+    monkeypatch.setattr(
+        Qwen3NextAttention,
+        "_project_qkv_gate",
+        Qwen3NextAttention._project_qkv_gate,
+    )
+
+
+@pytest.mark.parametrize(
+    "architectures, installs",
+    [
+        (None, False),
+        (["Qwen3NextForCausalLM"], False),
+        (["Qwen3_5MoeForConditionalGeneration"], True),
+    ],
+)
+def test_the_rule_installs_the_patch_for_qwen3_5_only(
+    restore_attention, architectures, installs
+):
+    original_init = Qwen3NextAttention.__init__
+    original_project = Qwen3NextAttention._project_qkv_gate
+    model_config = (
+        None if architectures is None else SimpleNamespace(architectures=architectures)
+    )
+    result = fused.maybe_install_qk_norm_rope_patch(model_config)
+    # False keeps the patch eligible for the next lifecycle stage.
+    assert result is (None if installs else False)
+    assert (Qwen3NextAttention._project_qkv_gate is not original_project) is installs
+    assert (Qwen3NextAttention.__init__ is not original_init) is installs
+
+
+def test_install_wraps_the_attention_once(restore_attention):
     fused.install_qk_norm_rope_patch()
-    assert Qwen3NextAttention._project_qkv_gate is original
+    project = Qwen3NextAttention._project_qkv_gate
+    init = Qwen3NextAttention.__init__
+    fused.install_qk_norm_rope_patch()
+    assert Qwen3NextAttention._project_qkv_gate is project
+    assert Qwen3NextAttention.__init__ is init
 
 
 def _vllm_config(max_num_seqs, num_speculative_tokens):

@@ -11,9 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""TPU_GDN_FUSED_NORM_QUANT on a real GDN layer: what install accepts and
-refuses, and that the fused output projection matches RMSNormGated followed by
-the fp8 linear. The torch<->JAX op bridge runs the JAX functions on the host."""
+"""The fused GDN gated norm + FP8 quantization on a real GDN layer: what
+install and install_if_supported accept and refuse, and that the fused output
+projection matches RMSNormGated followed by the fp8 linear. The torch<->JAX op
+bridge runs the JAX functions on the host."""
 
 import functools
 
@@ -24,9 +25,9 @@ import pytest
 import torch
 from einops import rearrange
 
-from vllm_torchtpu.models.qwen3_5.kernels import gated_norm_quant as gnq
 from vllm_torchtpu.kernels.quantized_matmul.util import quantize_tensor
 from vllm_torchtpu.layers.adapter import linear_common
+from vllm_torchtpu.models.qwen3_5.kernels import gated_norm_quant as gnq
 from vllm_torchtpu.models.qwen3_5.kernels import gated_norm_quant_op
 
 pytestmark = pytest.mark.cpu_test
@@ -145,6 +146,39 @@ def test_install_refuses_an_unsupported_layer(
     with pytest.raises(NotImplementedError, match=reason):
         gated_norm_quant_op.install(torch.nn.ModuleList([attention]))
     assert not attention.fused_norm_quant
+
+
+@pytest.mark.parametrize(
+    "quantization, edit",
+    [
+        ("bf16", None),
+        ("fp8_channel", _block_scales),
+        ("fp8_channel", _sigmoid_gate),
+        ("fp8_channel", _bias),
+    ],
+)
+def test_install_if_supported_keeps_an_unsupported_layer_unfused(
+    make_gdn_attention, host_ops, quantization, edit
+):
+    attention = _loaded_gdn(make_gdn_attention, host_ops, quantization)
+    if edit is not None:
+        edit(attention)
+    assert (
+        gated_norm_quant_op.install_if_supported(torch.nn.ModuleList([attention])) == 0
+    )
+    assert not attention.fused_norm_quant
+
+
+def test_install_if_supported_routes_a_supported_model(make_gdn_attention, host_ops):
+    attention = _loaded_gdn(make_gdn_attention, host_ops)
+    assert (
+        gated_norm_quant_op.install_if_supported(torch.nn.ModuleList([attention])) == 1
+    )
+    assert attention.fused_norm_quant
+
+
+def test_install_if_supported_skips_a_model_without_gdn(host_ops):
+    assert gated_norm_quant_op.install_if_supported(torch.nn.Linear(2, 2)) == 0
 
 
 def test_install_refuses_a_model_without_gdn(host_ops):
