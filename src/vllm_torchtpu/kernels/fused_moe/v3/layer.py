@@ -29,6 +29,7 @@ weighted sum combine the arrivals.
 import dataclasses
 import math
 import threading
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -608,6 +609,9 @@ def _pallas_step(
             gathered_rows, pltpu.MemorySpace.HBM
         )
         reorder = config.reorder_chain
+        # Bound by the reorder_chain branch and read only under it.
+        fill: Any = None
+        used: Any = None
         if reorder:
             # Config.reorder_chain: the index-independent halves of the
             # sort's index (the live-row fill) and the gathered prefix are

@@ -47,6 +47,7 @@ result_rows="bf16" (and elementwise float32, where every compilation agrees).
 """
 
 import functools
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -456,6 +457,38 @@ def build_kernel(
     E = num_experts if num_experts is not None else G * D
 
     def kernel(*refs):
+        # Bound below only for the variants that use them (merged, fused,
+        # unpadded, skip_unrouted); Any, so the type checker neither narrows
+        # them to None nor reports them unbound.
+        me_ref: Any = None
+        nv_ref: Any = None
+        tab_ref: Any = None
+        misc_ref: Any = None
+        pos_ref: Any = None
+        mp_ref: Any = None
+        idx_ref: Any = None
+        wts_ref: Any = None
+        out_ref: Any = None
+        landing_ref: Any = None
+        landing_s_ref: Any = None
+        arrivals_ref: Any = None
+        coef_vmem: Any = None
+        sum_vmem: Any = None
+        idx_all: Any = None
+        mp_v: Any = None
+        tab_v: Any = None
+        pos_v: Any = None
+        misc_v: Any = None
+        tab_s: Any = None
+        pos_s: Any = None
+        misc_s: Any = None
+        order_s: Any = None
+        sem_idx_send: Any = None
+        sem_idx_recv: Any = None
+        sem_smem: Any = None
+        keep: Any = None
+        local_rows: Any = None
+        local_scales: Any = None
         it = iter(refs)
         if merged:
             me_ref = next(it)
@@ -466,7 +499,8 @@ def build_kernel(
             tab_ref, misc_ref = next(it), next(it)
             pos_ref = next(it) if fused else None
             mp_ref, x_ref = next(it), next(it)
-        wts_ref = next(it) if fused else None
+        if fused:
+            wts_ref = next(it)
         w1_ref, w2_ref, w1s_ref, w2s_ref = (next(it) for _ in range(4))
         if fused:
             out_ref = next(it)
@@ -490,7 +524,8 @@ def build_kernel(
             (idx_all, mp_v, tab_v, pos_v, misc_v, tab_s, pos_s, misc_s) = (
                 next(it) for _ in range(8)
             )
-        order_s = next(it) if skip_unrouted else None
+        if skip_unrouted:
+            order_s = next(it)
         (
             sem_w1,
             sem_w2,
@@ -995,7 +1030,7 @@ def dense_slots_moe(
             config, "dense_slots_skip_unrouted", False
         )
     wslots = WEIGHT_SLOTS or getattr(config, "dense_slots_weight_slots", 0) or 3
-    tables_program = (
+    tables_program: Any = (
         build_tables_kernel(
             num_shards=num_shards,
             tokens_per_shard=Tp,
