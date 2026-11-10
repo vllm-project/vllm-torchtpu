@@ -124,6 +124,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_DCP_FINE_PREFIX_SEQ_TAIL: bool = False
     VLLM_TPU_QSA_PREFILL_LEAN: bool = False
     VLLM_TPU_QSA_PREFILL_VPU: str = ""
+    VLLM_TPU_QSA_PREFILL_PAGE_COPIES: bool = False
     VLLM_TPU_QSA_PREFILL_UNION_WALK: int = 0
     VLLM_TPU_QSA_PREFILL_UNION_MIN_CONTEXT: int = 32768
     VLLM_TPU_QSA_PREFILL_UNION_CAP: int = 12288
@@ -922,6 +923,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # kv_head_offset layers, short contexts, small steps, the union walk's
     # shared fallback).
     "VLLM_TPU_QSA_PREFILL_VPU": env_str("VLLM_TPU_QSA_PREFILL_VPU", ""),
+    # qwen4_exp QSA sparse prefill: fetch each KV tile with one DMA per
+    # page-sized run instead of one per 128-row selection segment, when KV
+    # tiles and pages nest (TP8: 1024-row tiles over 512-row pages; DCP: one
+    # page per tile). Same rows, bit-identical.
+    "VLLM_TPU_QSA_PREFILL_PAGE_COPIES": env_bool("VLLM_TPU_QSA_PREFILL_PAGE_COPIES"),
     # Qwen4-exp QSA prefill: union-walk attention (qsa_union_dense.
     # union_walk_prefill) with query groups of this many rows (a divisor of 128,
     # at least 8; 0, the default, keeps the block-sparse kernel). Each group of
