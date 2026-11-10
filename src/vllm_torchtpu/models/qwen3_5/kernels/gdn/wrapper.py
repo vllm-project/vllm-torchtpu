@@ -134,8 +134,6 @@ def inner_kernel(
             real_sizes=real_sizes,
             conv_state_out_slot_ref=conv_state_out_slot_ref,
             carry_conv_scratch_ref=carry_conv_scratch_ref,
-            metadata_ref=metadata_ref,
-            p_id=p_id,
             cfg=cfg,
         )
     else:
@@ -249,28 +247,45 @@ def _lazy_conv_state(
     real_sizes: jax.Array,  # [1]
     conv_state_out_slot_ref: jax.Ref,
     carry_conv_scratch_ref: jax.Ref,
-    metadata_ref: memory_ref.MetadataRef,
-    p_id: jax.Array,
     cfg: config.GDNConfig,
 ) -> None:
     """Conv state of a PER_SEQ chunked tile from its compact rows: the static
-    tail on a full tile, the per-row masked select only on the partial last
-    tile of a sequence."""
+    tail on a full tile, the per-row masked select on a partial tile.
+
+    A partial tile is not always its sequence's last. An internal prefill
+    checkpoint ends a tile at its checkpoint row, and PCP splits tiles at
+    rank-slot boundaries, so a tile can be partial with more of its sequence
+    still to come. The next tile takes its conv lookback from
+    `carry_conv_scratch_ref`, so a partial tile carries the rows that end at
+    its last real token (`lazy_conv_carry_rows`), never the static tail past
+    it. Every tile leaves its final conv state in window position 0, as the
+    eager path does: the output ref also copies that position to a prefill
+    checkpoint block when the tile ends at one.
+    """
     chunk, kprev = cfg.chunk_size, cfg.prev_kernel_size
     rs = real_sizes[0]
-    is_last = metadata_ref.p_id_is_last_tile[p_id, 0]
     tail = lhs[chunk : chunk + kprev]
     carry_conv_scratch_ref[0] = tail
 
-    @pl.when(jnp.logical_and(is_last, rs == chunk))
+    @pl.when(rs == chunk)
     def _full():
         _store_conv_state_tile(conv_state_out_slot_ref, tail)
 
     @pl.when(rs < chunk)
     def _partial():
-        _store_conv_state_tile(
-            conv_state_out_slot_ref, compute_conv1d.conv_state_rows(lhs, rs, cfg)
-        )
+        rows = lazy_conv_carry_rows(lhs, rs, cfg)
+        carry_conv_scratch_ref[0] = rows
+        _store_conv_state_tile(conv_state_out_slot_ref, rows)
+
+
+def lazy_conv_carry_rows(
+    lhs: jax.Array, real_size: jax.Array, cfg: config.GDNConfig
+) -> jax.Array:
+    """Conv rows a lazily converted tile hands to the next tile of its
+    sequence: rows [real_size, real_size + prev_kernel_size) of `lhs`, the
+    inputs ending at the tile's last real token. Equals the static tail on a
+    full tile."""
+    return compute_conv1d.conv_state_rows(lhs, real_size, cfg)
 
 
 def outer_kernel(
