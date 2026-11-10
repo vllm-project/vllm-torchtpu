@@ -676,7 +676,7 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool, activation: str) 
         return
 
     idx = ep_mesh_index()
-    if not (0 <= idx < ep):
+    if idx is None or not (0 <= idx < ep):
         logger.warning_once(
             "Fused EP MoE not engaged: ep_mesh_index()=%d out of range [0, %d).",
             idx,
