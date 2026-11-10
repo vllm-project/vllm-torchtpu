@@ -379,7 +379,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     _bm_kernel: bool = False
     _bm_region: tuple[int, BlockMajorPoolLayout] | None = None
     _checkpoint_alignment: int | None = None
-    # Set by `gated_norm_quant_op.install` under TPU_GDN_FUSED_NORM_QUANT.
+    # Set by `gated_norm_quant_op.install` (the Qwen3.5 rule in the runner).
     fused_norm_quant: bool = False
 
     # Narrowed to the layer that _create_conv1d installs.
