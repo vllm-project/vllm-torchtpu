@@ -779,8 +779,23 @@ def fused_conv1d_gdn(
     if not prefill_only:
         out_act, out_states = call_kernel(states, None, config.GDNMode.BATCHED)
     if not batched_only:
-        out_act, out_states = call_kernel(out_states, out_act, config.GDNMode.PER_SEQ)
+        if out_act is not None:
+            # Skip the PER_SEQ call when the batch has no prefill or mixed
+            # sequence (decode-only steps).
+            out_act, out_states = jax.lax.cond(
+                distribution[0] < distribution[2],
+                lambda act_states: call_kernel(
+                    act_states[1], act_states[0], config.GDNMode.PER_SEQ
+                ),
+                lambda act_states: act_states,
+                (out_act, out_states),
+            )
+        else:
+            out_act, out_states = call_kernel(
+                out_states, out_act, config.GDNMode.PER_SEQ
+            )
 
+    assert out_act is not None
     out_act = out_act.reshape(padded_batch_size, -1)[:batch_size]
     # TODO(kyuyeunk): Ensure no reshape is needed and convert to assertion.
     if conv_state_shape is not None:
