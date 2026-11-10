@@ -45,7 +45,9 @@ DEFAULT_MIN_ROWS = 0
 _MIN_ROWS_BY_LAYOUT: dict[tuple[int, int], int] = {}
 
 
-def _layout(parallel_config: ParallelConfig | None = None) -> tuple[int, int] | None:
+def parallel_layout(
+    parallel_config: ParallelConfig | None = None,
+) -> tuple[int, int] | None:
     """(data_parallel_size, tensor_parallel_size) of ``parallel_config``, or of
     this process's initialized model-parallel groups; None when neither is
     available (for example, before the workers set up their groups)."""
@@ -65,7 +67,7 @@ def _layout(parallel_config: ParallelConfig | None = None) -> tuple[int, int] | 
 def min_rows(parallel_config: ParallelConfig | None = None) -> int:
     """The row threshold for the layout of ``parallel_config``, or of this
     process's model-parallel groups when it is None."""
-    layout = _layout(parallel_config)
+    layout = parallel_layout(parallel_config)
     if layout is None:
         return DEFAULT_MIN_ROWS
     return _MIN_ROWS_BY_LAYOUT.get(layout, DEFAULT_MIN_ROWS)
