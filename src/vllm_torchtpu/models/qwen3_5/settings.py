@@ -53,6 +53,23 @@ class Qwen35Settings:
     """The Qwen3.5 settings of one engine. Fields are added by the change that
     implements them; keep them sorted by name."""
 
+    exp2_softmax: bool = False
+    """Run the target model's batched RPA decode softmax in base 2: log2(e) is
+    folded into the score scale and the exponentials are exp2. Equal to the
+    base-e softmax in exact arithmetic; the folded scale adds one rounding, so
+    results differ in the last bits. A speed/precision trade-off, off by
+    default; the IX validation entries turn it on for decode legs, as the
+    submission did (TPU_RPA_DECODE_EXP2=1). Speculative draft layers never use
+    it."""
+
+    native_fp8_attention: bool = False
+    """Run the target model's batched RPA P.V matmul natively in fp8 with a
+    static operand scale (kernel mode "pvs") in the decode kernel and in the
+    prefill and mixed kernels. A speed/precision trade-off, off by default; the
+    IX validation entries turn it on, as the submission did
+    (TPU_RPA_NATIVE_FP8=pvs on decode legs, TPU_RPA_NATIVE_FP8_PREFILL=pvs on
+    prefill legs). Speculative draft layers never use it."""
+
 
 def _field_types() -> dict[str, Any]:
     hints = typing.get_type_hints(Qwen35Settings)

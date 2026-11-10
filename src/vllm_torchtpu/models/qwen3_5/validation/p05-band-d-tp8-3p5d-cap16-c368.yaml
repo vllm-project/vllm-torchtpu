@@ -133,6 +133,8 @@ legs:
       VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP: "1"
       VLLM_XLA_CHECK_RECOMPILATION: "0"
     additional_config:
+      qwen3_5:
+        native_fp8_attention: true
       tpu_compile:
         drop_global_state_guard: true
         fast_compiled_call: true
@@ -251,6 +253,9 @@ legs:
       VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP: "1"
       VLLM_XLA_CHECK_RECOMPILATION: "0"
     additional_config:
+      qwen3_5:
+        exp2_softmax: true
+        native_fp8_attention: true
       tpu_collectives: {small_all_reduce: true}
       tpu_compile:
         drop_global_state_guard: true

@@ -1785,6 +1785,22 @@ class PallasAttentionBackendImpl(AttentionImpl):
         return outputs
 
 
+def _qwen3_5_attention_modes(
+    vllm_config: VllmConfig,
+) -> native_fp8_scope.AttentionModes:
+    """The reduced-precision modes the Qwen3.5 settings ask of target layers
+    (off for any other model)."""
+    from vllm_torchtpu.models.qwen3_5 import settings as qwen3_5_settings
+
+    settings = qwen3_5_settings.get(vllm_config)
+    fp8 = "pvs" if settings.native_fp8_attention else ""
+    return native_fp8_scope.AttentionModes(
+        native_fp8=fp8,
+        native_fp8_prefill=fp8,
+        decode_exp2=settings.exp2_softmax,
+    )
+
+
 class PallasBatchedRPAAttentionBackendImpl(PallasAttentionBackendImpl):
     """Impl variant that dispatches to the batched RPA Pallas kernel."""
 
@@ -1799,6 +1815,8 @@ class PallasBatchedRPAAttentionBackendImpl(PallasAttentionBackendImpl):
         # head_dim 64 is rerouted to the hd64 kernel.
         if spec is not None and self.head_size != 64:
             self.decode_query_size = spec.num_speculative_tokens + 1
+        if vllm_config is not None and self.head_size != 64:
+            self.attention_modes = _qwen3_5_attention_modes(vllm_config)
         model_config = vllm_config.model_config if vllm_config is not None else None
         if self.tuned_tiles and model_config is not None and self.head_size != 64:
             self.decode_lanes = batched_rpa_decode.decode_lanes(
