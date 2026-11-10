@@ -43,6 +43,8 @@ from vllm.models.qwen4_exp.common.ngram_embedding import (
 )
 from vllm.models.qwen4_exp.common.ple import PLEVocabParallelEmbedding
 
+from vllm_torchtpu import envs
+
 try:
     from transformers import Qwen4ExpTextConfig
 except ImportError:
@@ -555,6 +557,16 @@ class Qwen4ExpPLELayer(nn.Module):
             )
             for _ in range(3)
         )
+        # VLLM_TPU_PLE_FUSED_GATE: the gate dot as one Pallas kernel (TPU only).
+        self.gate_dot = None
+        if envs.VLLM_TPU_PLE_FUSED_GATE:
+            from vllm_torchtpu.layers.adapter.custom_ops.ple_op import (
+                build_normalized_gate_dot_dispatch,
+            )
+
+            self.gate_dot = build_normalized_gate_dot_dispatch(
+                self.hc_count, config.hidden_size
+            )
         # Holds the checkpoint's [channels, 1, kernel] weight; forward runs the
         # conv with dilated_short_conv to carry state across steps.
         self.conv1d = nn.Conv1d(
@@ -618,12 +630,15 @@ class Qwen4ExpPLELayer(nn.Module):
         else:
             key, _ = self.key_proj(embeddings)
         value, _ = self.value_proj(embeddings)
-        streams = (self.hc_count, self.hidden_size)
-        key = self.norm_key(key).unflatten(-1, streams)
-        query = self.norm_query(hidden_states).unflatten(-1, streams)
-        # As in upstream's gate kernel, the products are rounded to the
-        # activation dtype and then summed in fp32.
-        dot = (key * query).float().sum(dim=-1, keepdim=True).to(key.dtype)
+        if self.gate_dot is not None:
+            dot = self.gate_dot(key, hidden_states, self.norm_key, self.norm_query)
+        else:
+            streams = (self.hc_count, self.hidden_size)
+            key = self.norm_key(key).unflatten(-1, streams)
+            query = self.norm_query(hidden_states).unflatten(-1, streams)
+            # As in upstream's gate kernel, the products are rounded to the
+            # activation dtype and then summed in fp32.
+            dot = (key * query).float().sum(dim=-1, keepdim=True).to(key.dtype)
         if sequence_parallel_tokens is not None:
             from . import sequence_parallel as sp
 
