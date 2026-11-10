@@ -381,6 +381,7 @@ class TpuGeneration:
     # True while no perf baselines have been measured on the generation: its
     # perf steps report their numbers without gating on another chip's.
     skip_perf_check: bool
+    test_suite: str
 
     def upload_env(self) -> dict[str, str]:
         return {
@@ -391,6 +392,7 @@ class TpuGeneration:
             "TPU_SOFT_FAIL": "true" if self.soft_fail else "false",
             "TPU_ACCELERATOR": self.accelerator_type,
             "TPU_SKIP_PERF_CHECK": "1" if self.skip_perf_check else "0",
+            "TPU_TEST_SUITE": self.test_suite,
         }
 
 
@@ -406,6 +408,7 @@ TPU_V7X = TpuGeneration(
     soft_fail=False,
     accelerator_type="tpu7x",
     skip_perf_check=False,
+    test_suite="tpu-ci",
 )
 TPU_V6E = TpuGeneration(
     name="v6e",
@@ -415,6 +418,7 @@ TPU_V6E = TpuGeneration(
     soft_fail=True,
     accelerator_type="v6e",
     skip_perf_check=True,
+    test_suite="tpu-v6e-ci",
 )
 # Pipeline files uploaded once per TPU generation in the listed order (last
 # shows/queues first in Buildkite). Files not listed here are uploaded once.

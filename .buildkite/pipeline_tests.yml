@@ -48,7 +48,7 @@ x-tpu-step-defaults: &tpu_step
     - .buildkite/kubernetes/run.sh bash -c 'bktec run || [ $$? -eq 5 ]'
 
 x-tests-plugin-defaults: &tests_plugin_defaults
-  suite-slug: tpu-ci
+  suite-slug: "${TPU_TEST_SUITE:-tpu-ci}"
   test-runner: pytest
   test-file-pattern: "tests/**/{test_*,*_test}.py"
   install-client: false
