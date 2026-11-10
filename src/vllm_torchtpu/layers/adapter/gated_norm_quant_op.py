@@ -19,7 +19,8 @@ projection runs :func:`output_projection`: one kernel produces the out-proj's
 fp8 rows and scales from the GDN output and the gate, and the fp8 matmul runs
 on them, instead of ``RMSNormGated`` followed by the fp8 linear.
 
-Custom-op registration and shape guards for fused post-GDN RMSNormGated + FP8 quantization.
+Custom-op registration and shape guards for fused post-GDN RMSNormGated +
+FP8 quantization.
 """
 
 from collections.abc import Callable
@@ -60,7 +61,7 @@ def _build_ops(eps: float) -> None:
 
         def fake_norm(o, z, w):
             return (
-                o.new_empty(o.shape, dtype=torch.float8_e4m3fn),
+                o.new_empty(z.shape, dtype=torch.float8_e4m3fn),
                 o.new_empty((o.shape[0], 1), dtype=torch.float32),
             )
 
@@ -92,9 +93,7 @@ def _build_ops(eps: float) -> None:
         )
 
         def fake_out_proj(o, z, w_norm, w_proj, w_scale):
-            return o.new_empty(
-                (o.shape[0], w_proj.shape[-1]), dtype=torch.bfloat16
-            )
+            return o.new_empty((o.shape[0], w_proj.shape[-1]), dtype=torch.bfloat16)
 
         proj_op.register_fake(fake_out_proj)
         _out_proj_ops[eps] = proj_op
@@ -165,11 +164,13 @@ def install(model: torch.nn.Module) -> int:
 def output_projection(
     layer: QwenGatedDeltaNetAttention, core_attn_out: torch.Tensor, z: torch.Tensor
 ) -> torch.Tensor:
-    """core_attn_out, z: [tokens, local v heads, head_v_dim]."""
+    """core_attn_out: [tokens, local v heads, head_v_dim]; z: 2D or 3D."""
     out_proj = layer.out_proj
+    if z.ndim == 3:
+        z = z.reshape(core_attn_out.shape[0], -1)
     output = _out_proj_ops[float(layer.norm.eps)](
         core_attn_out,
-        z.reshape(core_attn_out.shape),
+        z,
         layer.norm.weight,
         out_proj.weight,
         out_proj.weight_scale,

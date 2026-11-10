@@ -156,11 +156,16 @@ def test_fused_output_projection_matches_norm_then_linear(make_gdn_attention, ho
     core, z = _gdn_outputs(attention)
     want = attention._apply_output_projection(core, z, core.shape[0])
     gated_norm_quant_op.install(torch.nn.ModuleList([attention]))
-    got = attention._apply_output_projection(core, z, core.shape[0])
-    assert got.dtype == want.dtype
+    got_3d = attention._apply_output_projection(core, z, core.shape[0])
+    got_2d = attention._apply_output_projection(
+        core, z.reshape(core.shape[0], -1), core.shape[0]
+    )
+    assert got_3d.dtype == want.dtype
+    assert got_2d.dtype == want.dtype
     # The kernel rounds the normed rows to bf16 before quantizing, as
     # RMSNormGated returns them, so the fp8 rows and the result are the same.
-    torch.testing.assert_close(got, want, rtol=0, atol=0)
+    torch.testing.assert_close(got_3d, want, rtol=0, atol=0)
+    torch.testing.assert_close(got_2d, want, rtol=0, atol=0)
 
 
 def test_fused_output_projection_all_reduces_under_tp(
