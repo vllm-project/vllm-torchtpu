@@ -823,7 +823,6 @@ def rpa_kernel(
     q_offsets: jax.Array,
     kv_cache_lens: jax.Array,
     kv_new_lens: jax.Array,
-    page_indices: jax.Array,
     schedule_hbm: schedule.RpaSchedule,
     q_hbm: jax.Array,
     new_kv_hbm: jax.Array,
@@ -842,8 +841,6 @@ def rpa_kernel(
         q_offsets: [max_num_seqs]. Token offset for queries in each sequence.
         kv_cache_lens: [max_num_seqs]. Existing kv cache length of each sequence.
         kv_new_lens: [max_num_seqs]. New kv length of each sequence.
-        page_indices: [max_num_seqs * pages_per_seqs]. kv cache page table of each
-            sequence.
         schedule_hbm: Output of scheduler kernel. It informs which: 1. seqs 2. q
             block 3. kv block that should be processed at a given step.
         q_hbm: [max_num_tokens, num_q_heads_per_kv_heads, cdiv(num_kv_heads,
@@ -872,7 +869,6 @@ def rpa_kernel(
         q_offsets_ref: jax.Ref,
         kv_cache_lens_ref: jax.Ref,
         kv_new_lens_ref: jax.Ref,
-        page_indices_ref: jax.Ref,
         # Inputs.
         schedule_hbm_ref: schedule.RpaSchedule,
         q_hbm_ref: jax.Ref,
@@ -977,18 +973,8 @@ def rpa_kernel(
 
                 total_steps = num_steps + prefix_steps
                 kv_bound = kv_cache_alloc.bind(
-                    src_ref=(
-                        kv_cache_hbm_ref,
-                        new_kv_hbm_ref,
-                        schedule_ref,
-                        page_indices_ref,
-                    ),
-                    dst_ref=(
-                        kv_cache_hbm_ref,
-                        new_kv_hbm_ref,
-                        schedule_ref,
-                        page_indices_ref,
-                    ),
+                    src_ref=(kv_cache_hbm_ref, new_kv_hbm_ref, schedule_ref),
+                    dst_ref=(kv_cache_hbm_ref, new_kv_hbm_ref, schedule_ref),
                 )
                 q_bound = q_alloc.bind(src_ref=(q_hbm_ref, schedule_ref))
                 o_bound = o_alloc.bind(dst_ref=(o_hbm_ref, schedule_ref))
@@ -1053,7 +1039,6 @@ def rpa_kernel(
         q_offsets,
         kv_cache_lens,
         kv_new_lens,
-        page_indices,
     )
     num_scalar_prefetch = len(scalar_prefetches)
     num_active_scalers = len(scalar_prefetches)
@@ -1103,7 +1088,6 @@ def rpa_kernel(
         q_offsets,
         kv_cache_lens,
         kv_new_lens,
-        page_indices,
         schedule_hbm,
         q_hbm,
         new_kv_hbm,

@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for pure in-graph 1-D/2-D/3-D RoPE and M-RoPE export patching."""
+"""Unit tests for pure in-graph 1-D/2-D/3-D RoPE and M-RoPE patching."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from vllm_torchtpu.experimental.export import rope_patch
+from vllm_torchtpu import rope_patch
 
 _HEAD_SIZE = 64
 _NUM_HEADS = 4
@@ -371,3 +371,39 @@ def test_buffer_that_is_not_a_cos_sin_table_is_kept() -> None:
     module.register_buffer("cos_sin_cache", noise, persistent=False)
     assert rope_patch.patch_in_graph_rotary_embedding(module) == 0
     assert module.cos_sin_cache is noise
+
+
+class _PairedTableRope(nn.Module):
+    """Muse Spark's rotary: `cos`/`sin` tables of `max_len x d / 2`, by position."""
+
+    def __init__(self, head_dim: int, max_len: int, theta: float) -> None:
+        super().__init__()
+        inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2).float() / head_dim))
+        angles = torch.outer(torch.arange(max_len).float(), inv_freq)
+        self.register_buffer("cos", angles.cos(), persistent=False)
+        self.register_buffer("sin", angles.sin(), persistent=False)
+
+    def forward(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        cos = self.cos[positions].unsqueeze(1)
+        sin = self.sin[positions].unsqueeze(1)
+        real, imag = x.float().chunk(2, dim=-1)
+        return torch.cat((real * cos - imag * sin, real * sin + imag * cos), dim=-1)
+
+
+@pytest.mark.parametrize("theta", [10000.0, 500000.0])
+def test_paired_cos_sin_tables_are_computed_in_graph(theta: float) -> None:
+    rope = _PairedTableRope(64, 4096, theta)
+    x = torch.randn(5, 2, 64)
+    positions = torch.tensor([0, 1, 777, 2048, 4095])
+    expected = rope(x, positions)
+    assert rope_patch.patch_cos_sin_table_pairs(rope) == 1
+    assert "cos" not in rope._buffers and "sin" not in rope._buffers
+    torch.testing.assert_close(rope(x, positions), expected, rtol=0, atol=1e-5)
+
+
+def test_a_table_that_is_not_rope_stays_a_buffer() -> None:
+    module = nn.Module()
+    module.register_buffer("cos", torch.rand(16, 4))
+    module.register_buffer("sin", torch.rand(16, 4))
+    assert rope_patch.patch_cos_sin_table_pairs(module) == 0
+    assert "cos" in module._buffers

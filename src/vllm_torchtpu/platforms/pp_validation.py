@@ -18,17 +18,6 @@ from typing import Any
 from vllm_torchtpu.distributed.kv_transfer.connector_names import kv_connector_names
 
 
-def _legacy_ray_executor() -> bool:
-    import vllm.envs as vllm_envs
-
-    from vllm_torchtpu import envs
-
-    return (
-        envs.TPU_MULTIHOST_BACKEND == "ray"
-        and not vllm_envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND
-    )
-
-
 def _torch_tpu_builds_stage_meshes() -> bool:
     """Whether the installed torch_tpu builds a Pallas mesh over a pipeline
     stage's process group; its releases accept world-size meshes only."""
@@ -39,7 +28,7 @@ def _torch_tpu_builds_stage_meshes() -> bool:
 
 # The `layer_types` spellings vLLM counts as full-attention layers
 # (`_ATTENTION_LAYER_TYPES`,
-# https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/config/model.py#L111).
+# https://github.com/vllm-project/vllm/blob/v0.33.0/vllm/config/model.py#L112).
 # transformers v5.18 renamed deepseek_sparse_attention and
 # qwen_sparse_attention to indexed_attention
 # (https://github.com/huggingface/transformers/pull/48974); vLLM keeps all
@@ -92,7 +81,9 @@ def _stage_without_full_attention(vllm_config: Any) -> str | None:
 def validate_pipeline_parallel_config(vllm_config: Any) -> None:
     """Reject configurations the TPU pipeline-parallel path does not serve.
 
-    Raises NotImplementedError naming the unsupported feature.
+    Raises NotImplementedError naming the unsupported feature, and
+    ValueError for a ring hand-off depth below one or deeper than a
+    device's receive flags allow.
     """
     parallel_config = vllm_config.parallel_config
     if parallel_config.pipeline_parallel_size <= 1:
@@ -181,13 +172,27 @@ def validate_pipeline_parallel_config(vllm_config: Any) -> None:
             " Choose a pipeline size or VLLM_PP_LAYER_PARTITION that "
             "gives every stage a full-attention layer."
         )
-    elif _legacy_ray_executor():
-        # The pipeline's hand-off pushes go through the executor hook that
-        # the multiprocess executor and the Ray V2 executor share; the
-        # legacy Ray executor has no such hook.
-        unsupported = "the legacy Ray executor"
-        remedy = " Set VLLM_USE_RAY_V2_EXECUTOR_BACKEND=1."
     if unsupported is not None:
         raise NotImplementedError(
             f"Pipeline parallelism on TPU does not support {unsupported} yet.{remedy}"
+        )
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.distributed.pp_push import ring_handoff
+
+    if ring_handoff():
+        if envs.TPU_PP_RING_DEPTH < 1:
+            # A stage queues at most this many forwards for the next one; with
+            # none it could hand nothing on.
+            raise ValueError(
+                f"TPU_PP_RING_DEPTH must be at least 1, got {envs.TPU_PP_RING_DEPTH}."
+            )
+        # Counts the activations and, for a model whose layers share a top-k
+        # index table, that table; the ring checks again with the tensors
+        # the model hands on.
+        from vllm_torchtpu.distributed.pp_ring import check_ring_receives
+
+        hf_config = vllm_config.model_config.hf_text_config
+        carried = 2 if getattr(hf_config, "index_topk", None) is not None else 1
+        check_ring_receives(
+            parallel_config.pipeline_parallel_size, envs.TPU_PP_RING_DEPTH, carried
         )

@@ -82,8 +82,8 @@ VLLM_TARGET_DEVICE="empty" pip install \
 If you are developing or debugging vLLM core in tandem with `vllm-torchtpu`:
 
 ```bash
-# Clone matching vLLM version (e.g. v0.32.0)
-git clone --depth 1 --branch v0.32.0 https://github.com/vllm-project/vllm.git ../vllm
+# Clone matching vLLM version (e.g. v0.33.0)
+git clone --depth 1 --branch v0.33.0 https://github.com/vllm-project/vllm.git ../vllm
 
 # Install in editable mode without overwriting dependencies
 VLLM_TARGET_DEVICE="empty" uv pip install --no-deps -e ../vllm
@@ -186,9 +186,9 @@ We welcome the responsible use of AI tools to enhance engineering productivity, 
 
 ```text
 Signed-off-by: Your Name <your.email@example.com>
-Co-authored-by: Claude <claude@anthropic.com>
-Co-authored-by: GitHub Copilot <copilot@github.com>
-Co-authored-by: Antigravity <antigravity@google.com>
+Co-authored-by: Claude <noreply@anthropic.com>
+Co-authored-by: GitHub Copilot <noreply@github.com>
+Co-authored-by: Antigravity <noreply@google.com>
 ```
 
 ---

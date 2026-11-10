@@ -343,12 +343,20 @@ op = pallas.jax_op("pallas::quantized_matmul_kernel",
 
 ## 7. Diff discipline
 
-- **R-7.1** **Small, single-purpose PRs.** Kernel changes get their own PR.
-  Reviewers may refuse oversized diffs outright ("oversized" is reviewer
-  judgment, not a fixed line count); very large designs need an RFC/design
-  doc first. Stacked PRs cite their base explicitly.
+- **R-7.1** **Small, single-purpose PRs**
+  ([Small CLs](https://google.github.io/eng-practices/review/developer/small-cls.html)).
+  Small, focused PRs get faster, more thorough reviews, make bugs easier to
+  spot, conflict less, and are safer to revert. Aim for a soft target of ≤ 300
+  changed lines (excluding baselines and lockfiles) doing one self-contained
+  logical change. Carve-outs: pure deletions, atomic renames/moves with their
+  caller updates, tiny dependent follow-ups, and larger cohesive diffs where
+  splitting would be artificial may stay in one PR; reviewers may still ask to
+  split smaller multi-purpose diffs. Very large designs need an RFC/design doc
+  first. Each PR in a stack must pass tests on its own and cite its base PR
+  explicitly.
 - **R-7.2** **Refactor first, feature second.** Land the enabling refactor or
-  cleanup as its own PR before the feature/optimization PR that needs it.
+  cleanup as its own behavior-preserving PR before the feature/optimization PR
+  that needs it.
 - **R-7.3** **Do not include changes unrelated to the PR's purpose.** If a
   hunk is not needed for what the PR is about — reformatting of lines the
   change didn't touch, a rename done in passing, an unrelated typo fix —
@@ -462,6 +470,8 @@ Background material for the rules above.
   the entry points and registration hooks §2 and R-3.5 build on.
 - [Google Python Style Guide](https://google.github.io/styleguide/pyguide.html):
   the style baseline for R-1.1.
+- [Small CLs](https://google.github.io/eng-practices/review/developer/small-cls.html):
+  how and why to split changes into small, single-purpose PRs (R-7.1, R-7.2).
 - [optimization_best_practices.md](optimization_best_practices.md): PR
   discipline (PR-x), performance (P-x), and quantization (Q-x) rules, and its
   own reference list for TPU hardware and kernel material.
@@ -469,8 +479,8 @@ Background material for the rules above.
 ## Author checklist (run before sending a PR)
 
 1. **Scope** — duplicate-work check done, not busywork (R-7.8, R-7.9);
-   single purpose; kernel changes separated; refactor pre-landed; stacked
-   base cited; no drive-by reformatting. (R-7.x)
+   single purpose; refactor pre-landed; stacked base cited; no drive-by
+   reformatting. (R-7.x)
 2. **Reuse & placement** — nothing reimplements a vLLM / vllm-torchtpu /
    Pallas utility; code sits in the right directory per R-2.1; interface
    files thin; kernels dependency-free; no model-specific logic in shared

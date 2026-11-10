@@ -235,6 +235,7 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
     runner = SimpleNamespace(
         _megakernel=None,
         _pp_wave=None if pp_is_last else wave,
+        _dp_step_other_decode=False,
         _pp_is_first=True,
         _pp_is_last=pp_is_last,
         _pp_pending_scheduler_output=None,
@@ -251,6 +252,7 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
         phase_based_profiler=None,
         _is_async_drafter=False,
         _greedy_top_tokens_this_step=lambda: False,
+        _min_tokens_batch_state=lambda: {},
         vllm_config=SimpleNamespace(),
         maybe_setup_kv_connector=lambda *_args, **_kwargs: None,
         input_batch=SimpleNamespace(
@@ -292,12 +294,13 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
         ),
         compute_logits_from_hidden_states=lambda _hs: torch.zeros(1, 8),
         _attn_metadata_builder_ctx=SimpleNamespace(
-            mamba_state_indices=None, unified_mamba_state_indices=None
+            mamba_state_indices=None, unified_mamba_state_indices=None, seq_lens=None
         ),
         mamba_slot_read_offsets=None,
         speculative_config=None,
         _fence_spec_kv_under_token_copy=False,
         _is_dspark_pd_producer=False,
+        _adaptive_verification=None,
         _get_sampling_generator=lambda: None,
         _greedy_sample=lambda _logits: torch.tensor([7]),
         _update_mamba_slot_read_offsets=lambda *_args: None,
@@ -327,8 +330,11 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
     runner._prepare_inputs = prepare_inputs
     runner.forward_model = MagicMock(side_effect=[(out, None) for out in chunk_outputs])
     for name in (
+        "_any_decode",
+        "_readmit_trimmed_drafts",
         "maybe_wait_for_kv_save",
         "get_finished_kv_transfers",
+        "_build_kv_connector_output",
         "_sample_tokens_pp_intermediate_stage",
         "sample_tokens",
         "execute_model",

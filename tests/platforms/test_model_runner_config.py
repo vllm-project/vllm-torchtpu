@@ -17,7 +17,7 @@ from types import SimpleNamespace
 
 import pytest
 from vllm.config import CacheConfig, CompilationConfig, VllmConfig
-from vllm.config.compilation import CompilationMode
+from vllm.config.compilation import CompilationMode, CUDAGraphMode
 
 import vllm_torchtpu as plugin
 
@@ -47,6 +47,8 @@ def _config(device="tpu", method=None, pcp=1):
             method=method,
             enable_adaptive_verification=False,
             parallel_drafting=method in ("dflash", "dspark"),
+            draft_lm_head_quantization=None,
+            is_xpress=lambda: False,
             draft_model_config=SimpleNamespace(
                 architectures=["DFlashDraftModel"],
                 hf_config=SimpleNamespace(
@@ -86,6 +88,7 @@ def test_native_v1_validation_uses_tpu_capabilities(device, method, pcp, reason)
     "feature,reason",
     [
         ("adaptive", "adaptive draft verification"),
+        ("xpress", "xpress speculative decoding"),
         ("dflash2", r"(?:DFlash candidate-head drafts|dflash2 drafts)"),
         ("diffusion", "diffusion models"),
         ("batch_sharded", "batch-sharded sampling"),
@@ -95,16 +98,49 @@ def test_tpu_preserves_native_v1_rejections(feature, reason):
     config = _config(method="dflash", pcp=2)
     if feature == "adaptive":
         config.speculative_config.enable_adaptive_verification = True
+    elif feature == "xpress":
+        config.speculative_config.is_xpress = lambda: True
     elif feature == "dflash2":
         config.speculative_config.draft_model_config.architectures = [
             "DFlash2DraftModel"
         ]
     elif feature == "diffusion":
-        config.model_config = SimpleNamespace(is_diffusion=True)
+        config.model_config = SimpleNamespace(is_diffusion=True, architecture="")
     else:
         config.parallel_config.enable_batch_sharded_sampling = True
     with pytest.raises(ValueError, match=reason):
         config._validate_v1_model_runner()
+
+
+def _adaptive_dspark_config(device):
+    config = _config(device=device, method="dspark")
+    config.speculative_config.enable_adaptive_verification = True
+    config.lora_config = None
+    config.model_config = SimpleNamespace(
+        is_diffusion=False, enforce_eager=False, architecture=""
+    )
+    config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+    return config
+
+
+def test_tpu_runs_dspark_adaptive_verification():
+    config = _adaptive_dspark_config("tpu")
+    config._validate_v1_model_runner()
+    # TPU has no CUDA graphs; its own checks replace the native one.
+    config._validate_adaptive_verification()
+
+
+def test_non_tpu_keeps_native_adaptive_verification_checks():
+    config = _adaptive_dspark_config("cuda")
+    with pytest.raises(ValueError, match="full CUDA graphs"):
+        config._validate_adaptive_verification()
+
+
+def test_tpu_adaptive_verification_keeps_the_lora_check():
+    config = _adaptive_dspark_config("tpu")
+    config.lora_config = object()
+    with pytest.raises(ValueError, match="LoRA"):
+        config._validate_adaptive_verification()
 
 
 @pytest.mark.parametrize("has_triton", [False, True])
