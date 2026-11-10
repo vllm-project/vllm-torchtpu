@@ -149,20 +149,22 @@ def _spmd(q, kvs, scs, cands, meta, **kw):
 
 
 @pytest.mark.parametrize(
-    "q_lens,ctx_lens,num_tokens,min_tokens,max_call",
+    "q_lens,ctx_lens,num_tokens,min_tokens,max_call,width",
     [
         # Two decodes and two prefills: the prefills (9 + 4 logical blocks)
         # take two rounds of a 12-block buffer.
-        ([8, 8, 200, 100], [3000, 5000, 8800, 3900], 320, 64, 2048),
+        ([8, 8, 200, 100], [3000, 5000, 8800, 3900], 320, 64, 2048, 12),
         # Kernel calls of 48 rows: several windows per round, the last one
         # clamped back over rows already attended.
-        ([8, 8, 200, 100], [3000, 5000, 8800, 3900], 320, 64, 48),
+        ([8, 8, 200, 100], [3000, 5000, 8800, 3900], 320, 64, 48, 12),
+        # An odd block-table width: the replica-split buffer pads to 12.
+        ([8, 8, 200, 100], [3000, 5000, 8800, 3900], 320, 64, 2048, 11),
         # The same step below the head-parallel size: DCP attention only.
-        ([8, 8, 200, 100], [3000, 5000, 8800, 3900], 320, 1 << 20, 2048),
+        ([8, 8, 200, 100], [3000, 5000, 8800, 3900], 320, 1 << 20, 2048, 12),
     ],
 )
 def test_attend_and_merge_matches_dcp_reference(
-    q_lens, ctx_lens, num_tokens, min_tokens, max_call, monkeypatch
+    q_lens, ctx_lens, num_tokens, min_tokens, max_call, width, monkeypatch
 ):
     if len(jax.devices()) < DCP:
         pytest.skip(
@@ -170,7 +172,7 @@ def test_attend_and_merge_matches_dcp_reference(
         )
     monkeypatch.setattr(msa_attention, "MAX_TOKENS_PER_CALL", max_call)
     rng = np.random.default_rng(0)
-    step = _step(rng, q_lens, ctx_lens, 12, num_tokens)
+    step = _step(rng, q_lens, ctx_lens, width, num_tokens)
     *args, num_real = step
     want = _reference(*args)
     got = _spmd(*args, decode_rows=8, head_parallel_min_tokens=min_tokens)

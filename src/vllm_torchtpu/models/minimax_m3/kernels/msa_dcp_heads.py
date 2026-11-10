@@ -106,22 +106,47 @@ def _dcp_attend(
     return merge_partials(out, lse, axis, rs_out_precision=rs_out_precision)
 
 
-def _exchange_pages(kv_cache, scale_cache, pages, head_of_rank, head_width, axis):
-    """Every rank's ``pages`` of the KV head each rank owns: ``(kv [dcp *
-    L, S / 8, 4, 2 * D], scales [dcp * L, SCALE_ROWS, 128])``, slot ``src *
-    L + l`` holding rank ``src``'s page ``pages[l]``."""
+def _per_token(seq_id: jax.Array, table: jax.Array) -> jax.Array:
+    """``table[seq_id]`` for a per-request table, by a one-hot over the
+    requests: a gather of 8K tokens from a 64-entry table cost ~70 us."""
+    onehot = seq_id[:, None] == jnp.arange(table.shape[0], dtype=jnp.int32)
+    return jnp.sum(jnp.where(onehot, table[None, :].astype(jnp.int32), 0), axis=1)
+
+
+def _exchange_pages(kv_cache, scale_cache, pages, *, dcp, replicas, head_width, axis):
+    """Every rank's ``pages [L]`` of the KV head each rank owns:
+    ``(kv [L * dcp, S / 8, 4, 2 * D], scales [L * dcp, SCALE_ROWS, 128])``,
+    rank ``src``'s page ``pages[j * L / replicas + i]`` at slot ``(j * dcp +
+    src) * L / replicas + i``.
+
+    The ``replicas`` ranks of a KV head each receive a ``1 / replicas`` part
+    of the pages over the all-to-all and share them with an all-gather
+    inside the replica group (one chip's cores at c64)."""
     num_pages = pages.shape[0]
+    part = num_pages // replicas
     _, rows, packing, _ = kv_cache.shape
-    dcp = head_of_rank.shape[0]
-    kv = kv_cache[pages].reshape(num_pages, rows, packing, -1, head_width)
-    send = jnp.moveaxis(jnp.take(kv, head_of_rank, axis=3), 3, 0)
-    sc = scale_cache[pages]  # [L, R, 128]
-    kv_rows = jnp.stack([2 * head_of_rank, 2 * head_of_rank + 1], axis=1)  # [dcp, 2]
-    send_sc = jnp.moveaxis(jnp.take(sc, kv_rows, axis=1), 1, 0)  # [dcp, L, 2, 128]
+    heads = dcp // replicas
+    if kv_cache.shape[3] != heads * head_width:
+        raise ValueError(
+            f"cache rows {kv_cache.shape} do not hold {heads} KV heads of "
+            f"{head_width} columns"
+        )
+    kv = kv_cache[pages].reshape(replicas, part, rows, packing, heads, head_width)
+    # Destination rank d = h * replicas + j gets part j of head h.
+    send = jnp.moveaxis(kv, 4, 0).reshape(dcp, part, rows, packing, head_width)
+    sc = scale_cache[pages][:, : 2 * heads]  # K/V rows of every head
+    sc = sc.reshape(replicas, part, heads, 2, sc.shape[-1])
+    send_sc = jnp.moveaxis(sc, 2, 0).reshape(dcp, part, 2, sc.shape[-1])
     recv = jax.lax.all_to_all(send, axis, 0, 0, tiled=True)
     recv_sc = jax.lax.all_to_all(send_sc, axis, 0, 0, tiled=True)
-    recv = recv.reshape(dcp * num_pages, rows, packing, head_width)
-    recv_sc = recv_sc.reshape(dcp * num_pages, 2, recv_sc.shape[-1])
+    if replicas > 1:
+        groups = [list(range(h * replicas, (h + 1) * replicas)) for h in range(heads)]
+        recv = jax.lax.all_gather(recv, axis, axis_index_groups=groups, tiled=True)
+        recv_sc = jax.lax.all_gather(
+            recv_sc, axis, axis_index_groups=groups, tiled=True
+        )
+    recv = recv.reshape(num_pages * dcp, rows, packing, head_width)
+    recv_sc = recv_sc.reshape(num_pages * dcp, 2, recv_sc.shape[-1])
     recv_sc = jnp.pad(recv_sc, ((0, 0), (0, msa_fp4.SCALE_ROWS - 2), (0, 0)))
     return recv, recv_sc
 
@@ -135,6 +160,7 @@ def _head_parallel_attend(
     block_tables,
     cu,
     hp_req,
+    tokens,
     *,
     axis,
     rank,
@@ -146,26 +172,29 @@ def _head_parallel_attend(
 ):
     """Head-major ``[Hl, T, D]`` attention (rotated basis) of the rows of the
     requests in ``hp_req`` over their pages of this rank's KV head; other
-    rows are zero.
+    rows are zero. ``tokens`` is `msa.token_positions` of the step.
 
     Requests are attended in rounds of at most ``pages_per_seq`` logical
     blocks (one max-length request): each round exchanges one static page
     buffer and attends the round's rows in windows of one kernel call."""
+    del rank  # every rank runs the same exchange
     num_tokens, num_q_heads, head_dim = q.shape
     block_size = msa.page_size(kv_cache)
     max_num_seqs = seq_lens.shape[0]
     block_tables_2d = block_tables.reshape(max_num_seqs, -1)
-    buffer_pages = block_tables_2d.shape[1]  # logical blocks per round
+    capacity = block_tables_2d.shape[1]  # logical blocks per round
+    replicas = kv_head_replicas
+    part = -(-capacity // replicas)  # each replica's share of the buffer
+    buffer_pages = part * replicas
     num_heads = candidates.shape[1] // (2 * topk)
-    head_of_rank = jnp.arange(dcp, dtype=jnp.int32) // kv_head_replicas
 
     # This rank's KV head's candidates from every rank -> its selection.
-    per_rank = candidates.reshape(num_tokens, num_heads, 2 * topk)
-    send = jnp.take(per_rank, head_of_rank, axis=1).transpose(1, 0, 2)
+    per_rank = candidates.reshape(num_tokens, num_heads, 2 * topk).transpose(1, 0, 2)
+    send = jnp.repeat(per_rank, replicas, axis=0)  # rank d gets head d // replicas
     own = jax.lax.all_to_all(send, axis, 0, 0, tiled=True)  # [dcp, T, 2 * topk]
     selected = msa_dcp.merge_head_candidates(own, topk, interpret)[:, 0]  # [T, topk]
 
-    seq_id, pos, valid = msa.token_positions(num_tokens, seq_lens, cu)
+    seq_id, pos, valid = tokens
     seq_blocks = -(-seq_lens // (block_size * dcp))
     blocks = jnp.where(hp_req, seq_blocks, 0)
     seq_idx = jnp.arange(max_num_seqs, dtype=jnp.int32)
@@ -174,14 +203,19 @@ def _head_parallel_attend(
     window = min(num_tokens, msa_attention.MAX_TOKENS_PER_CALL)
     sel_block = jnp.maximum(selected, 0)
     own_block = pos // block_size
+    limit = pos % block_size + 1
 
-    def round_body(state):
-        first, acc = state
+    def slot(base, block):
+        # Logical block l = base + block // dcp of rank block % dcp.
+        logical = base + block // dcp
+        return ((logical // part) * dcp + block % dcp) * part + logical % part
+
+    def attend_round(first, acc, merge):
         csum = jnp.cumsum(jnp.where(seq_idx >= first, blocks, 0))
         # A request never exceeds the buffer (the block table's width); always
-        # admitting `first` keeps the loop moving if that ever broke.
+        # admitting `first` keeps the rounds moving if that ever broke.
         in_round = (
-            hp_req & (seq_idx >= first) & ((csum <= buffer_pages) | (seq_idx == first))
+            hp_req & (seq_idx >= first) & ((csum <= capacity) | (seq_idx == first))
         )
         base = csum - blocks  # the request's first logical block in the buffer
         total = jnp.max(jnp.where(in_round, csum, 0))
@@ -189,30 +223,31 @@ def _head_parallel_attend(
             jnp.where((seq_idx >= first) & ~in_round & hp_req, seq_idx, max_num_seqs)
         )
         # Buffer page s: logical block s - base[q] of request q.
-        slot = jnp.arange(buffer_pages, dtype=jnp.int32)
-        q_of = jnp.minimum(jnp.searchsorted(csum, slot, side="right"), max_num_seqs - 1)
-        j = jnp.clip(slot - base[q_of], 0, buffer_pages - 1)
-        pages = jnp.where(slot < total, block_tables_2d[q_of, j], 0)
+        page = jnp.arange(buffer_pages, dtype=jnp.int32)
+        q_of = jnp.minimum(jnp.searchsorted(csum, page, side="right"), max_num_seqs - 1)
+        j = jnp.clip(page - base[q_of], 0, capacity - 1)
+        pages = jnp.where(page < total, block_tables_2d[q_of, j], 0)
         kv, sc = _exchange_pages(
-            kv_cache, scale_cache, pages, head_of_rank, 2 * head_dim, axis
+            kv_cache,
+            scale_cache,
+            pages,
+            dcp=dcp,
+            replicas=replicas,
+            head_width=2 * head_dim,
+            axis=axis,
         )
 
-        mine = valid & in_round[seq_id]
-        tok_base = base[seq_id]
+        mine = valid & (_per_token(seq_id, in_round) > 0)
+        tok_base = _per_token(seq_id, base)
         keys = jnp.where(
-            mine[:, None] & (selected >= 0),
-            (sel_block % dcp) * buffer_pages + tok_base[:, None] + sel_block // dcp,
-            -1,
+            mine[:, None] & (selected >= 0), slot(tok_base[:, None], sel_block), -1
         )
-        local = jnp.where(
-            mine, (own_block % dcp) * buffer_pages + tok_base + own_block // dcp, -1
-        )
-        limit = pos % block_size + 1
+        local = jnp.where(mine, slot(tok_base, own_block), -1)
         lo = cu[jnp.min(jnp.where(in_round, seq_idx, max_num_seqs - 1))]
         hi = cu[jnp.max(jnp.where(in_round, seq_idx + 1, 0))]
 
-        def window_body(start, acc):
-            start = jnp.minimum(start, num_tokens - window)
+        def window_body(i, acc):
+            start = jnp.minimum(lo + i * window, num_tokens - window)
 
             def sl(x):
                 return jax.lax.dynamic_slice_in_dim(x, start, window, 0)
@@ -234,23 +269,29 @@ def _head_parallel_attend(
                 head_major=True,
                 interpret=interpret,
             )
-            old = jax.lax.dynamic_slice_in_dim(acc, start, window, 1)
-            keep = sl(mine)[None, :, None]
-            return jax.lax.dynamic_update_slice_in_dim(
-                acc, jnp.where(keep, out, old), start, 1
-            )
+            if merge:  # keep earlier rounds' rows
+                old = jax.lax.dynamic_slice_in_dim(acc, start, window, 1)
+                out = jnp.where(sl(mine)[None, :, None], out, old)
+            # Rows outside the round come back zero (no selected page).
+            return jax.lax.dynamic_update_slice_in_dim(acc, out, start, 1)
 
-        acc = jax.lax.fori_loop(
-            0,
-            -(-(hi - lo) // window),
-            lambda i, a: window_body(lo + i * window, a),
-            acc,
-        )
+        acc = jax.lax.fori_loop(0, -(-(hi - lo) // window), window_body, acc)
         return nxt, acc
 
     acc = jnp.zeros((num_q_heads, num_tokens, head_dim), q.dtype)
     first = jnp.min(jnp.where(hp_req, seq_idx, max_num_seqs))
-    _, acc = jax.lax.while_loop(lambda s: s[0] < max_num_seqs, round_body, (first, acc))
+    first, acc = attend_round(first, acc, merge=False)
+
+    # Further rounds sit under a cond: a while loop that reads the cache
+    # makes XLA copy the whole cache ahead of it (0.45 ms per layer at c64).
+    def more_rounds(state):
+        return jax.lax.while_loop(
+            lambda s: s[0] < max_num_seqs,
+            lambda s: attend_round(*s, merge=True),
+            state,
+        )
+
+    _, acc = jax.lax.cond(first < max_num_seqs, more_rounds, lambda s: s, (first, acc))
     return acc
 
 
@@ -276,9 +317,9 @@ def attend_and_merge(
     interpret: bool = False,
 ) -> jax.Array:
     """This rank's (``rank``, ``int32[1]``) attention output ``[T, Hl, D]``
-    (unrotated) for its
-    rotated query heads ``q [T, Hl, D]`` and its packed ``candidates [T, G *
-    2 * topk]`` (`msa_dcp.msa_write_and_candidates_dcp`); 4-bit caches.
+    (unrotated) for its rotated query heads ``q [T, Hl, D]`` and its packed
+    ``candidates [T, G * 2 * topk]`` (`msa_dcp.msa_write_and_candidates_dcp`);
+    4-bit caches.
     Runs inside a ``shard_map`` over `axis` (the DCP group)."""
     num_tokens = q.shape[0]
     # The rank is an input: torch_tpu's SPMD partitioner refuses the
@@ -325,6 +366,7 @@ def attend_and_merge(
         rs_out_precision=rs_out_precision,
         **common,
     )
+    tokens = msa.token_positions(num_tokens, seq_lens, cu_q_lens)
     hp_out = _head_parallel_attend(
         q,
         kv_cache,
@@ -334,13 +376,11 @@ def attend_and_merge(
         block_tables,
         cu_q_lens,
         hp_req,
+        tokens,
         kv_head_replicas=kv_head_replicas,
         **common,
     )
     hp_out = msa_fp4.unrotate_output(hp_out.transpose(1, 0, 2))
-
-    seq_id, _, valid = msa.token_positions(num_tokens, seq_lens, cu_q_lens)
-    tok = jnp.arange(num_tokens, dtype=jnp.int32)
-    compact = jnp.clip(cu_d[seq_id] + tok - cu_q_lens[seq_id], 0, rows - 1)
-    is_dcp = (valid & dcp_req[seq_id])[:, None, None]
-    return jnp.where(is_dcp, dcp_out[compact], hp_out)
+    # The decode rows go back to their places (the others are dropped).
+    dest = jnp.where(p < cu_d[-1], src_row, num_tokens)
+    return hp_out.at[dest].set(dcp_out, mode="drop")
