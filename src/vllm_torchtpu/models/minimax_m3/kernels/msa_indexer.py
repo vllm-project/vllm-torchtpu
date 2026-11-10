@@ -53,11 +53,11 @@ DEFAULT_SMALL_PAGES_PER_STEP = 128
 DEFAULT_KERNEL = "v3"
 # Rows per token-major query tile of the block_q class (see `block_scores`).
 _SMALL_TILE_Q = 64
-# Folded 4-bit pages are scored transposed (`_folded_chunk_maxima_t`), whose
+# Folded 4-bit and fp8 pages are scored transposed (`_chunk_maxima_t`), whose
 # cost grows with the tile's rows: by default 32 holds a decode request of 4
 # folded index heads x 8 (MTP) tokens; callers with one index head per rank
-# pass `folded_tile_q=8` (`msa.block_score_options`).
-_SMALL_TILE_Q_FOLDED = 32
+# pass `transposed_tile_q=8` (`msa.block_score_options`).
+_SMALL_TILE_Q_TRANSPOSED = 32
 # Large prefill tiles: v3's DMA ring, as the small class. v2's 32 BlockSpec
 # page inputs cost ~1,900 scalar bundles per 32-page step beside ~2,500 of
 # vector work (AOT); v3 is bit-identical and -17..-24% per indexer call at
@@ -217,11 +217,19 @@ def _page_tokens(rows_per_page: int, dtype) -> int:
 _PAGES_PER_CHUNK = 32
 # `_kernel_v3` issues the next group's descriptors during its first chunks.
 _DMA_ISSUE_CHUNKS = 2
-# Folded 4-bit tiles of up to this many rows score transposed
-# (`_folded_chunk_maxima_t`, maxima across lanes); larger ones score
-# token-major with the slot scales folded into the keys (maxima across
-# sublanes, as the other caches).
-_FOLDED_TRANSPOSED_MAX_ROWS = 64
+# Folded 4-bit and fp8 tiles of up to this many rows score transposed
+# (`_chunk_maxima_t`, maxima across lanes); larger ones score token-major
+# (maxima across sublanes), a folded page with its slot scales folded into
+# the keys.
+_TRANSPOSED_MAX_ROWS = 64
+
+
+def _scores_transposed(block_q: int, rows_per_page: int, dtype) -> bool:
+    """Whether `_kernel_v3` scores `block_q`-row tiles of these pages with
+    `_chunk_maxima_t`."""
+    fp8 = dtype == jnp.float8_e4m3fn and FP8_MXU_KEYS
+    folded = msa_fp4.scales_in_page(rows_per_page, dtype)
+    return (folded or fp8) and block_q <= _TRANSPOSED_MAX_ROWS
 
 
 def _paired_query(q: jax.Array) -> jax.Array:
@@ -262,13 +270,37 @@ def _chunk_maxima(q_pair, page_keys, num_pages) -> jax.Array:
     return jnp.concatenate([m[:, :block_q], m[:, block_q:]], axis=0)
 
 
-def _folded_chunk_maxima_t(q_pair, buf, first, chunk, live, issue) -> jax.Array:
-    """``[Bq, chunk]`` block maxima of the folded 4-bit pages
-    ``buf[first : first + chunk]`` with the scores computed transposed,
-    ``[2 Bq, tokens]``: the per-token scales are a lane vector (the page's
-    last word row), applied by a sublane broadcast, and the MXU result is
-    ``2 Bq`` rows rather than ``chunk * S / 2``. `issue(j)` runs among the
-    keys of page pair ``j``.
+# Keys enter the MXU as fp8 in the transposed path: fp8 caches as stored and
+# 4-bit keys converted exactly (|k| <= 8), half the bytes of bf16 keys per
+# transposed weight push, and no fp8 -> bf16 unpack (AOT, 128 pages at 8 rows:
+# fp8 2,171 -> 819 bundles, 4-bit 1,323 -> 1,008). Products and their f32
+# sums are those of bf16 keys.
+FP8_MXU_KEYS = True
+
+
+def _transposed_keys(buf, p, live, dtype, folded, masked):
+    """Page `p` of `buf` as ``[S, D]`` MXU keys: 4-bit keys unscaled, fp8 keys
+    of a page past the request's end (`masked`) zeroed, as stale VMEM may hold
+    NaN, which would reach the paired page's scores through the zero half of
+    the paired query."""
+    rows = buf.shape[1]
+    key_dtype = jnp.float8_e4m3fn if FP8_MXU_KEYS else jnp.bfloat16
+    if folded:
+        k = pltpu.bitcast(buf[p, : rows - 1], jnp.int4)
+    else:
+        w = buf[p]
+        k = pltpu.bitcast(jnp.where(p < live, w, 0) if masked else w, dtype)
+    return k if k.dtype == key_dtype else k.astype(key_dtype)
+
+
+def _chunk_maxima_t(
+    q_pair, buf, first, chunk, live, issue, *, dtype, folded
+) -> jax.Array:
+    """``[Bq, chunk]`` block maxima of the pages ``buf[first : first + chunk]``
+    with the scores computed transposed, ``[2 Bq, tokens]``: the MXU result
+    is ``2 Bq`` rows rather than ``chunk * S / 2``. A folded 4-bit page's
+    per-token scales are a lane vector (the page's last word row), applied by
+    a sublane broadcast. `issue(j)` runs among the keys of page pair ``j``.
     """
     rows = buf.shape[1]
     half = chunk // 2
@@ -278,11 +310,13 @@ def _folded_chunk_maxima_t(q_pair, buf, first, chunk, live, issue) -> jax.Array:
         issue(j)
         pair = []
         for side, p in enumerate((first + j, first + half + j)):
-            k = pltpu.bitcast(buf[p, : rows - 1], jnp.int4).astype(jnp.bfloat16)
-            pair.append(k)
-            s = pltpu.bitcast(buf[p, rows - 1 :], jnp.float32)  # [1, S]
-            # Stale VMEM past the request's end, unwritten slots: scale 0.
-            scale_rows[side].append(jnp.where(jnp.isfinite(s) & (p < live), s, 0.0))
+            # Only the right page of a pair can be past the end while its
+            # partner is not.
+            pair.append(_transposed_keys(buf, p, live, dtype, folded, side == 1))
+            if folded:
+                s = pltpu.bitcast(buf[p, rows - 1 :], jnp.float32)  # [1, S]
+                # Stale VMEM past the request's end, unwritten slots: scale 0.
+                scale_rows[side].append(jnp.where(jnp.isfinite(s) & (p < live), s, 0.0))
         keys.append(jnp.concatenate(pair, axis=1))
     page_size = keys[0].shape[0]
     s = jax.lax.dot_general(
@@ -291,9 +325,10 @@ def _folded_chunk_maxima_t(q_pair, buf, first, chunk, live, issue) -> jax.Array:
         (((1,), (1,)), ((), ())),
         preferred_element_type=jnp.float32,
     )  # [2 Bq, half * S]
-    left, right = (jnp.concatenate(r, axis=1) for r in scale_rows)
-    row = jax.lax.broadcasted_iota(jnp.int32, s.shape, 0)
-    s = s * jnp.where(row < block_q, left, right)
+    if folded:
+        left, right = (jnp.concatenate(r, axis=1) for r in scale_rows)
+        row = jax.lax.broadcasted_iota(jnp.int32, s.shape, 0)
+        s = s * jnp.where(row < block_q, left, right)
     m = jnp.max(s.reshape(2 * block_q, half, page_size), axis=2)  # [2 Bq, half]
     return jnp.concatenate([m[:block_q], m[block_q:]], axis=1)
 
@@ -335,7 +370,7 @@ def _kernel_v3(
     the group's pages are waited for first.
 
     A folded 4-bit page (`msa_fp4.scales_in_page`) is ``S / 8`` word rows of
-    int4 keys and one row of f32 slot scales (`_folded_chunk_maxima_t`).
+    int4 keys and one row of f32 slot scales (`_chunk_maxima_t`).
     """
     _, pages_per_step, rows, head_dim = buf.shape
     block_q = q_ref.shape[0]
@@ -399,9 +434,16 @@ def _kernel_v3(
                     1 - slot,
                 )
 
-        if folded and block_q <= _FOLDED_TRANSPOSED_MAX_ROWS:
-            m = _folded_chunk_maxima_t(
-                q_pair, buf.at[slot], first, chunk, live, issue
+        if _scores_transposed(block_q, rows, cache_ref.dtype):
+            m = _chunk_maxima_t(
+                q_pair,
+                buf.at[slot],
+                first,
+                chunk,
+                live,
+                issue,
+                dtype=cache_ref.dtype,
+                folded=folded,
             )  # [Bq, chunk]
             if transposed:
                 o_ref[:, pl.ds(first, chunk)] = m
@@ -759,7 +801,7 @@ def class_plan(
     large_kernel: str = DEFAULT_LARGE_KERNEL,
     scale_cache: jax.Array | None = None,
     scale_row: int | None = None,
-    folded_tile_q: int = _SMALL_TILE_Q_FOLDED,
+    transposed_tile_q: int = _SMALL_TILE_Q_TRANSPOSED,
     interpret: bool = False,
 ) -> _ClassPlan:
     """`block_scores`' tile classes, unscored (arguments as `block_scores`)."""
@@ -812,11 +854,13 @@ def class_plan(
     # (MTP) to 32 (folded index heads) rows, and a tile of up to 64 rows costs
     # the same as one of 8 (paired scores are 2 x tile lanes). A request of up
     # to block_q rows takes several tiles; none holds more than the batch.
-    folded = msa_fp4.is_fp4(index_cache) and scale_row is None
+    transposed = scale_row is None and _scores_transposed(
+        1, index_cache.shape[1], index_cache.dtype
+    )
     tile = (
         min(
             block_q,
-            folded_tile_q if folded else _SMALL_TILE_Q,
+            transposed_tile_q if transposed else _SMALL_TILE_Q,
             -(-num_tokens // _ROW_ALIGN) * _ROW_ALIGN,
         )
         if token_major
@@ -872,7 +916,7 @@ def class_plan(
         "kernel",
         "large_kernel",
         "scale_row",
-        "folded_tile_q",
+        "transposed_tile_q",
         "interpret",
     ),
 )
@@ -892,7 +936,7 @@ def block_scores(
     large_kernel: str = DEFAULT_LARGE_KERNEL,
     scale_cache: jax.Array | None = None,
     scale_row: int | None = None,
-    folded_tile_q: int = _SMALL_TILE_Q_FOLDED,
+    transposed_tile_q: int = _SMALL_TILE_Q_TRANSPOSED,
     interpret: bool = False,
 ) -> jax.Array:
     """Block-max index scores ``[T, 1, P]`` (``P`` padded to the page group).
@@ -935,7 +979,7 @@ def block_scores(
         large_kernel=large_kernel,
         scale_cache=scale_cache,
         scale_row=scale_row,
-        folded_tile_q=folded_tile_q,
+        transposed_tile_q=transposed_tile_q,
         interpret=interpret,
     )
     num_tokens = index_q.shape[0]

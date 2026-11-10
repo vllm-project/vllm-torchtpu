@@ -295,8 +295,8 @@ _DECODE_ROWS = 8
 
 def block_score_options(index_heads: int = 1) -> dict[str, int]:
     """The tile sizes the MSA forward scores blocks with, for query rows that
-    fold `index_heads` heads per token. A folded 4-bit decode tile holds one
-    request's rows: its transposed scoring costs per tile row, and 32-row
+    fold `index_heads` heads per token. A transposed (folded 4-bit or fp8)
+    decode tile holds one request's rows: its scoring costs per tile row, and 32-row
     tiles for one head's 8 rows ran the c48 / c64 DCP 2 decode indexer 7%
     slower, bit-identical results (bench j-74f8b992)."""
     return dict(
@@ -304,7 +304,7 @@ def block_score_options(index_heads: int = 1) -> dict[str, int]:
         large_block_q=msa_indexer.DEFAULT_LARGE_BLOCK_Q,
         pages_per_step=msa_indexer.DEFAULT_PAGES_PER_STEP,
         small_pages_per_step=msa_indexer.DEFAULT_SMALL_PAGES_PER_STEP,
-        folded_tile_q=min(_DECODE_ROWS * index_heads, msa_indexer.DEFAULT_BLOCK_Q),
+        transposed_tile_q=min(_DECODE_ROWS * index_heads, msa_indexer.DEFAULT_BLOCK_Q),
     )
 
 

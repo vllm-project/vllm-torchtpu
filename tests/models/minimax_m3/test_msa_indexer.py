@@ -202,10 +202,10 @@ def test_fp4_folded_matches_reference(
     q_lens, ctx_lens, pages_per_step, token_major, monkeypatch
 ):
     """4-bit index pages with their scales folded in (`msa_fp4`), kernel v3:
-    transposed scores (tiles up to `_FOLDED_TRANSPOSED_MAX_ROWS` rows) and
+    transposed scores (tiles up to `_TRANSPOSED_MAX_ROWS` rows) and
     token-major ones with the scales folded into the bf16 keys."""
     if token_major:
-        monkeypatch.setattr(msa_indexer, "_FOLDED_TRANSPOSED_MAX_ROWS", 0)
+        monkeypatch.setattr(msa_indexer, "_TRANSPOSED_MAX_ROWS", 0)
     rng = np.random.default_rng(len(q_lens) + pages_per_step)
     num_seqs = len(q_lens)
     num_real = sum(q_lens)
