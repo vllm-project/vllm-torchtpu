@@ -532,7 +532,10 @@ class Eagle3Proposer:
 
         try:
             owner = greedy_top_tokens.resolve_head_owner(
-                draft_model, self.runner._dp_lockstep_enabled()
+                draft_model,
+                greedy_top_tokens.draft_head_dp_lockstep(
+                    self.runner._dp_lockstep_enabled()
+                ),
             )
         except NotImplementedError:
             return

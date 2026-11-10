@@ -896,11 +896,24 @@ def target_head_dp_mode(dp_lockstep: bool, tp_size: int) -> str:
     always replay the stock one; collectives pair across ranks in emission
     order, so the target stays on the stock path there. The draft is not
     affected: its tokens are always a greedy argmax, and an idle engine's
-    dummy draft runs the same ``_draft_propose_token`` program.
+    dummy draft runs the same ``_draft_propose_token`` program
+    (see ``draft_head_dp_lockstep``).
     """
     if dp_lockstep and tp_size > 1:
         return "stock"
     return "fast"
+
+
+def draft_head_dp_lockstep(dp_lockstep: bool) -> bool:
+    """The ``dp_lockstep`` a draft head owner is resolved with.
+
+    Always False: the MTP/EAGLE draft head's argmax runs in
+    ``_draft_propose_token`` for busy engines and for an idle engine's
+    ``run_dp_dummy_draft`` alike, so every rank emits the same pair exchange
+    in the same order, whatever the requests' sampling params.
+    """
+    del dp_lockstep
+    return False
 
 
 def resolve_head_owner(model: torch.nn.Module, dp_lockstep: bool) -> torch.nn.Module:
