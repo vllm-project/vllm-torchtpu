@@ -244,6 +244,19 @@ def test_target_head_stays_stock_under_ep_dp_with_a_tp_head():
     assert greedy_top_tokens.target_head_dp_mode(True, 8) == "stock"
 
 
+def test_draft_head_resolves_under_ep_dp_lockstep():
+    # DP4 x TP2: the draft's argmax program is the same on busy and idle
+    # engines, so its head owner resolves where the target's would refuse.
+    owner = _Owner(_shards(torch.zeros(8, 2), 2)[0])
+    assert greedy_top_tokens.draft_head_dp_lockstep(True) is False
+    assert (
+        greedy_top_tokens.resolve_head_owner(
+            owner, greedy_top_tokens.draft_head_dp_lockstep(True)
+        )
+        is owner
+    )
+
+
 def test_resolve_head_owner_finds_the_nested_language_model():
     owner = _Owner(_shards(torch.zeros(8, 2), 2)[0])
     model = torch.nn.Module()
