@@ -19,6 +19,7 @@ import importlib
 import inspect
 import sys
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -75,8 +76,8 @@ PINNED_MTP_FORWARD_HASH = (
 # qwen3_5_mtp.py replaces this upstream drafter forward with a copy that
 # keeps its SP chunk before the MTP layer and all-gather after the final
 # norm, which is what lets tpu_platform admit MTP under SP.
-# maybe_patch_qwen3_next replaces it with patched_mtp_forward when either of
-# its flags is on.
+# maybe_patch_qwen3_next replaces it with patched_mtp_forward on a Qwen3.5
+# target.
 PINNED_QWEN3_5_MTP_FORWARD_HASH = (
     "af988ccd1ba49bf2953bb9858d7a2082c405d260d2ebb64413c6707c34a80d22"
 )
@@ -106,7 +107,26 @@ def restore_forwards(monkeypatch):
     for layer_cls in (qwen3_next.Qwen3NextDecoderLayer, qwen3_5.Qwen3_5DecoderLayer):
         if "__init__" in vars(layer_cls):
             monkeypatch.setattr(layer_cls, "__init__", layer_cls.__init__)
+    monkeypatch.setattr(
+        patch_mod.sequence_parallel,
+        "_FOLLOWS_STEP_FORM",
+        patch_mod.sequence_parallel._FOLLOWS_STEP_FORM,
+    )
     return monkeypatch
+
+
+# The model configs the Qwen3.5 rule tells apart.
+QWEN3_5 = SimpleNamespace(architectures=["Qwen3_5MoeForConditionalGeneration"])
+QWEN3_NEXT = SimpleNamespace(architectures=["Qwen3NextForCausalLM"])
+
+
+@pytest.fixture
+def v6_install(restore_forwards):
+    """Records whether the Qwen3.5 FP8 fusions are installed, without patching
+    the shared classes for the rest of the session."""
+    install = MagicMock()
+    restore_forwards.setattr(patch_mod, "install_qwen3_next_v6_patches", install)
+    return install
 
 
 def _sequence_parallel(monkeypatch, *, min_rows: int = 0, fp8_gather: bool = False):
@@ -492,13 +512,16 @@ def test_patched_mtp_forward_sequence_parallel(monkeypatch, with_step0_gather):
     assert out.shape == (num_tokens, 4)
 
 
-def test_forward_patch_skipped_with_flags_off(restore_forwards):
-    """With TPU_MOE_SEQUENCE_PARALLEL=0 and TPU_MTP_STEP0_POST_ATTN_GATHER=0,
-    the forwards remain the upstream objects."""
+def test_forward_patch_skipped_for_other_models_without_sp(
+    restore_forwards, v6_install
+):
+    """Another model on these classes (Qwen3-Next) without
+    TPU_MOE_SEQUENCE_PARALLEL=1 keeps the upstream forwards and gets no FP8
+    fusion, as on main."""
     restore_forwards.setattr(envs, "TPU_MOE_SEQUENCE_PARALLEL", False)
-    restore_forwards.setattr(envs, "TPU_MTP_STEP0_POST_ATTN_GATHER", False)
-    result = maybe_patch_qwen3_next()
+    result = maybe_patch_qwen3_next(QWEN3_NEXT)
     assert result is None
+    v6_install.assert_not_called()
     assert qwen3_next.Qwen3NextDecoderLayer.forward is UPSTREAM_DECODER_LAYER_FORWARD
     assert qwen3_next.Qwen3NextModel.forward is UPSTREAM_MODEL_FORWARD
     assert qwen3_next_mtp.Qwen3NextMultiTokenPredictor.forward is UPSTREAM_MTP_FORWARD
@@ -507,16 +530,43 @@ def test_forward_patch_skipped_with_flags_off(restore_forwards):
     )
 
 
-@pytest.mark.parametrize("sequence_parallel", [True, False])
-def test_forward_patch_applied(restore_forwards, sequence_parallel):
-    """With either flag on, the inherited Qwen3.5 forwards and the drafter
-    forwards are replaced."""
-    restore_forwards.setattr(envs, "TPU_MOE_SEQUENCE_PARALLEL", sequence_parallel)
-    restore_forwards.setattr(envs, "TPU_MTP_STEP0_POST_ATTN_GATHER", True)
-    restore_forwards.setattr(patch_mod.sequence_parallel, "fp8_gather", lambda: False)
+def test_forward_patch_waits_for_a_model_config(restore_forwards, v6_install):
+    """Without a model config the rule cannot tell Qwen3.5 from other models,
+    so it installs nothing and asks the registry to call it again."""
+    restore_forwards.setattr(envs, "TPU_MOE_SEQUENCE_PARALLEL", True)
+    assert maybe_patch_qwen3_next(None) is False
+    v6_install.assert_not_called()
+    assert qwen3_next.Qwen3NextDecoderLayer.forward is UPSTREAM_DECODER_LAYER_FORWARD
+    assert not patch_mod.sequence_parallel.follows_step_form()
 
-    result = maybe_patch_qwen3_next()
+
+def test_other_models_take_only_mains_sp_forwards(restore_forwards, v6_install):
+    """Under TPU_MOE_SEQUENCE_PARALLEL=1 another model gets the trace-stable
+    forwards (main's opt-in), without the FP8 fusions and without row gating:
+    every sequence-parallel step stays sliced."""
+    restore_forwards.setattr(envs, "TPU_MOE_SEQUENCE_PARALLEL", True)
+    restore_forwards.setattr(patch_mod.sequence_parallel, "fp8_gather", lambda: False)
+    restore_forwards.setattr(patch_mod.sequence_parallel, "_FOLLOWS_STEP_FORM", False)
+    assert maybe_patch_qwen3_next(QWEN3_NEXT) is None
+    v6_install.assert_not_called()
+    assert qwen3_next.Qwen3NextDecoderLayer.forward is patched_decoder_layer_forward
+    assert not patch_mod.sequence_parallel.follows_step_form()
+
+
+@pytest.mark.parametrize("sequence_parallel", [True, False])
+def test_forward_patch_applied(restore_forwards, v6_install, sequence_parallel):
+    """On a Qwen3.5 target the FP8 fusions are installed and the inherited
+    Qwen3.5 forwards and the drafter forwards are replaced, with or without
+    sequence parallelism (the MTP step-0 gather needs them); row gating
+    follows sequence parallelism."""
+    restore_forwards.setattr(envs, "TPU_MOE_SEQUENCE_PARALLEL", sequence_parallel)
+    restore_forwards.setattr(patch_mod.sequence_parallel, "fp8_gather", lambda: False)
+    restore_forwards.setattr(patch_mod.sequence_parallel, "_FOLLOWS_STEP_FORM", False)
+
+    result = maybe_patch_qwen3_next(QWEN3_5)
     assert result is None
+    v6_install.assert_called_once_with()
+    assert patch_mod.sequence_parallel.follows_step_form() is sequence_parallel
     assert qwen3_next.Qwen3NextDecoderLayer.forward is patched_decoder_layer_forward
     assert qwen3_next.Qwen3NextModel.forward is not UPSTREAM_MODEL_FORWARD
     assert qwen3_next_mtp.Qwen3NextMultiTokenPredictor.forward is patched_mtp_forward
@@ -527,18 +577,17 @@ def test_forward_patch_applied(restore_forwards, sequence_parallel):
     )
 
 
-def test_mtp_draft_module_import_keeps_patched_forward(restore_forwards):
+def test_mtp_draft_module_import_keeps_patched_forward(restore_forwards, v6_install):
     """Loading a Qwen3.5 MTP draft imports vllm_torchtpu.models.vllm.qwen3_5_mtp,
     whose module-level forward assignment must not replace patched_mtp_forward."""
     import vllm_torchtpu.models.vllm as tpu_models
 
     restore_forwards.setattr(envs, "TPU_MOE_SEQUENCE_PARALLEL", False)
-    restore_forwards.setattr(envs, "TPU_MTP_STEP0_POST_ATTN_GATHER", True)
     restore_forwards.setattr(patch_mod.sequence_parallel, "fp8_gather", lambda: False)
     restore_forwards.setattr(tpu_models, "qwen3_5_mtp", tpu_models.qwen3_5_mtp)
     restore_forwards.delitem(sys.modules, "vllm_torchtpu.models.vllm.qwen3_5_mtp")
 
-    maybe_patch_qwen3_next()
+    maybe_patch_qwen3_next(QWEN3_5)
     importlib.import_module("vllm_torchtpu.models.vllm.qwen3_5_mtp")
     assert qwen3_5_mtp.Qwen3_5MultiTokenPredictor.forward is patched_mtp_forward
 
@@ -747,7 +796,7 @@ def _gemma_norm(weight: torch.Tensor, eps: float = 1e-6) -> SimpleNamespace:
 
 @pytest.mark.parametrize("with_residual", [True, False])
 def test_fused_norm_quantize_rows_matches_norm_then_quantize(with_residual):
-    """The fused input-norm op (TPU_FUSE_PRE_ATTN_NORM_QUANT) returns the
+    """The fused input-norm op returns the
     residual sum and `quantize_rows` of the GemmaRMSNorm output."""
     import jax.numpy as jnp
 
@@ -785,7 +834,7 @@ def test_fused_norm_quantize_rows_matches_norm_then_quantize(with_residual):
 
 
 def test_fused_norm_gate_and_se_matches_norm_then_gate_and_se():
-    """The fused post-attention op (TPU_FUSE_POST_ATTN_NORM_MOE) is the
+    """The fused post-attention op is the
     GemmaRMSNorm of the residual sum followed by `_fp8_gate_and_se_jax`."""
     import jax.numpy as jnp
 
@@ -843,7 +892,6 @@ def test_pre_attn_norm_quant_fusion_predicate(monkeypatch):
     """Sliced rows take the fused input norm whenever the layer is eligible;
     replicated rows only where the pre-quantized rows are exact."""
     _sequence_parallel(monkeypatch, fp8_gather=True)
-    monkeypatch.delenv("TPU_FUSE_PRE_ATTN_NORM_QUANT", raising=False)
     fuses = patch_mod._fuses_pre_attn_norm_quant
     layer = SimpleNamespace(_pre_norm_quant_eligible=True, _pre_norm_quant_exact=False)
 
@@ -855,15 +903,11 @@ def test_pre_attn_norm_quant_fusion_predicate(monkeypatch):
     assert not fuses(layer, torch.zeros(2, 2, dtype=torch.bfloat16), True)
     assert not fuses(layer, _tpu_rows(torch.float32), True)
     assert not fuses(SimpleNamespace(), _tpu_rows(), True)
-    monkeypatch.setenv("TPU_FUSE_PRE_ATTN_NORM_QUANT", "0")
-    assert not fuses(layer, _tpu_rows(), True)
-    monkeypatch.delenv("TPU_FUSE_PRE_ATTN_NORM_QUANT")
     _sequence_parallel(monkeypatch, fp8_gather=False)
     assert not fuses(layer, _tpu_rows(), True)
 
 
 def test_post_attn_norm_moe_fusion_predicate(monkeypatch):
-    monkeypatch.delenv("TPU_FUSE_POST_ATTN_NORM_MOE", raising=False)
     fuses = patch_mod._fuses_post_attn_norm_moe
     norm = GemmaRMSNorm.__new__(GemmaRMSNorm)
     layer = SimpleNamespace(
@@ -873,9 +917,6 @@ def test_post_attn_norm_moe_fusion_predicate(monkeypatch):
     assert fuses(layer, _tpu_rows())
     assert not fuses(layer, torch.zeros(2, 2, dtype=torch.bfloat16))
     assert not fuses(layer, _tpu_rows(torch.float32))
-    monkeypatch.setenv("TPU_FUSE_POST_ATTN_NORM_MOE", "off")
-    assert not fuses(layer, _tpu_rows())
-    monkeypatch.delenv("TPU_FUSE_POST_ATTN_NORM_MOE")
     layer.mlp = SimpleNamespace()
     assert not fuses(layer, _tpu_rows())
     layer.mlp = SimpleNamespace(_fused_gate_gu_fp8_weight=torch.zeros(1))
