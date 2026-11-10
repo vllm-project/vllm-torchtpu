@@ -19,6 +19,7 @@ from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs, schedule
@@ -97,6 +98,16 @@ def test_schedule_overflow_is_dropped_not_written_out_of_bounds(monkeypatch):
         i32([ctx, 0, 0, 0]),
         i32([128, 0, 0, 0]),
         i32([0, 0, 1]),
+        jnp.arange(num_seqs * pages, dtype=jnp.int32),  # page_indices
         cfgs,
     )
     assert int(jax.device_get(out.actual_steps)[0]) == capacity
+    # The HBM schedule holds exactly the first `capacity` steps, in order: the
+    # overflowing chunks were dropped, not written over (or past) them.
+    batch = cfgs.batch_size
+    s_idx = np.asarray(jax.device_get(out.s_idx.data)).reshape(capacity, batch)
+    k_idx = np.asarray(jax.device_get(out.k_idx.data)).reshape(capacity, batch)
+    assert (s_idx == 0).all()
+    np.testing.assert_array_equal(
+        k_idx, np.arange(capacity * batch).reshape(capacity, batch)
+    )
