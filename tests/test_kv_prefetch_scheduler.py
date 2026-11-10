@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""TPU_SCHED_KV_PREFETCH_WAITING on the real vLLM scheduler loop.
+"""Decode KV prefetch on the real vLLM scheduler loop.
 
 These tests build a real PrefixAwareScheduler (stock Scheduler.schedule(),
 KVCacheManager and block pool) as a PD consumer whose connector loads every
@@ -106,12 +106,6 @@ with contextlib.suppress(ValueError):
     )
 
 
-@pytest.fixture(autouse=True)
-def _decode_env(monkeypatch):
-    monkeypatch.setenv("TPU_SCHED_KV_PREFETCH_RESERVE_BLOCKS", "8")
-    monkeypatch.delenv("TPU_SCHED_KV_PREFETCH_WAITING", raising=False)
-
-
 def _model_dir(tmp_path):
     d = tmp_path / "tiny-opt"
     d.mkdir(exist_ok=True)
@@ -135,9 +129,9 @@ def _model_dir(tmp_path):
     return str(d)
 
 
-def _make_sched(tmp_path, monkeypatch, prefetch=0, num_blocks=2000, role="kv_consumer"):
-    if prefetch:
-        monkeypatch.setenv("TPU_SCHED_KV_PREFETCH_WAITING", str(prefetch))
+def _make_sched(
+    tmp_path, monkeypatch, prefetch=0, num_blocks=2000, role="kv_consumer", reserve=8
+):
     vllm_config = VllmConfig(
         scheduler_config=SchedulerConfig(
             max_num_seqs=CAP,
@@ -177,13 +171,19 @@ def _make_sched(tmp_path, monkeypatch, prefetch=0, num_blocks=2000, role="kv_con
             )
         ],
     )
-    return PrefixAwareScheduler(
+    s = PrefixAwareScheduler(
         vllm_config=vllm_config,
         kv_cache_config=kv_cache_config,
         structured_output_manager=StructuredOutputManager(vllm_config),
         block_size=BLOCK,
         log_stats=True,
     )
+    # A KV consumer gets the default (8 held, 512 reserved blocks); the tests
+    # drive other depths and reserves through the same attributes.
+    if s._kv_prefetch_n:
+        s._kv_prefetch_n = prefetch
+    s._kv_prefetch_reserve = reserve
+    return s
 
 
 _none_hash_ready = False
@@ -402,8 +402,9 @@ def test_prefetch_respects_free_blocks_and_reserve(tmp_path, monkeypatch):
     # 4 running x 5 blocks (4 prompt + 1 decode) = 20 used. The stock
     # async-load reservation is 0 once every running prefill has finished.
     # With 50 blocks (49 usable): 29 free - prefetch reserve must fit 4 blocks.
-    monkeypatch.setenv("TPU_SCHED_KV_PREFETCH_RESERVE_BLOCKS", "64")
-    eng = _Engine(_make_sched(tmp_path, monkeypatch, prefetch=2, num_blocks=50))
+    eng = _Engine(
+        _make_sched(tmp_path, monkeypatch, prefetch=2, num_blocks=50, reserve=64)
+    )
     running = eng.fill_running()
     free_before = eng.free_blocks()
     eng.s.add_request(_req("w0"))
@@ -414,8 +415,9 @@ def test_prefetch_respects_free_blocks_and_reserve(tmp_path, monkeypatch):
     assert [r.request_id for r in eng.s.running] == running
     assert eng.free_blocks() >= free_before - CAP  # only running growth
 
-    monkeypatch.setenv("TPU_SCHED_KV_PREFETCH_RESERVE_BLOCKS", "0")
-    eng2 = _Engine(_make_sched(tmp_path, monkeypatch, prefetch=2, num_blocks=50))
+    eng2 = _Engine(
+        _make_sched(tmp_path, monkeypatch, prefetch=2, num_blocks=50, reserve=0)
+    )
     eng2.fill_running()
     eng2.s.add_request(_req("w0"))
     eng2.step()
@@ -510,3 +512,18 @@ def test_randomized_cap_bound_and_no_leaks(tmp_path, monkeypatch, prefetch):
     pool = eng.s.kv_cache_manager.block_pool
     assert pool.get_num_free_blocks() == pool.num_gpu_blocks - 1
     assert all(b.ref_cnt == 0 for b in pool.blocks)
+
+
+def test_a_kv_consumer_prefetches_by_default(tmp_path, monkeypatch):
+    s = PrefixAwareScheduler.__new__(PrefixAwareScheduler)
+    s._is_kv_consumer = True
+    s.connector = object()
+    s._init_kv_prefetch()
+    assert (s._kv_prefetch_n, s._kv_prefetch_reserve) == (8, 512)
+    s = PrefixAwareScheduler.__new__(PrefixAwareScheduler)
+    s._is_kv_consumer = True
+    s.connector = None
+    s._init_kv_prefetch()
+    assert s._kv_prefetch_n == 0
+    s = _make_sched(tmp_path, monkeypatch, role="kv_producer")
+    assert s._kv_prefetch_n == 0

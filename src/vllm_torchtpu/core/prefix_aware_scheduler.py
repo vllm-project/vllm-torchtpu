@@ -28,8 +28,12 @@ On a prefill/decode-disaggregated decode leg (a KV consumer) it also runs
 decoding requests ahead of partial prefills, promotes the warmest request of
 both waiting queues (``kv_holding_waiting`` and ``waiting``), memoises
 ``find_longest_cache_hit`` across steps, ships long prompts to the workers as
-packed int32 and trims re-sent token ids. Its helpers are shared with the
-pipeline-parallel prefill scheduler.
+packed int32 and trims re-sent token ids. A KV consumer also prefetches
+remote KV for waiting requests past a full running set and, with decode
+context parallelism, throttles how many remote loads it admits; a KV producer
+sorts the head of the waiting queue. Its helpers are shared with the
+pipeline-parallel prefill scheduler. Options: ``tpu_scheduler``
+(core/scheduler_options.py).
 
 Enable with:
     --scheduler-cls vllm_torchtpu.core.prefix_aware_scheduler.PrefixAwareScheduler
@@ -54,7 +58,7 @@ from vllm.v1.core.sched.request_queue import (
 )
 from vllm.v1.request import Request, RequestStatus
 
-from vllm_torchtpu.core import prefix_change_log
+from vllm_torchtpu.core import prefix_change_log, scheduler_options
 from vllm_torchtpu.core.packed_ids import pack_new_request_prompt_ids
 
 if TYPE_CHECKING:
@@ -174,6 +178,9 @@ class PrefixAwareScheduler(AsyncScheduler):
         )
         self._is_kv_producer = self._is_disagg and kv_role == "kv_producer"
         self._is_kv_consumer = self._is_disagg and not self._is_kv_producer
+        self._promote_warmest_switch = scheduler_options.get(
+            self.vllm_config
+        ).promote_warmest
         prefix_change_log.install_epoch()
         self._enable_memo_xstep()
         self._init_paw_sort()
@@ -190,6 +197,8 @@ class PrefixAwareScheduler(AsyncScheduler):
         )
 
     # ------------------------------------------------------------------
+    # Decode KV prefetch past a full running set (on for a KV consumer with
+    # a connector; N = _KV_PREFETCH_MAX_HELD).
     #
     # vLLM v0.31.0's waiting loop stops at ``len(running) >=
     # max_num_active_reqs`` before it asks the connector about the next
@@ -211,6 +220,7 @@ class PrefixAwareScheduler(AsyncScheduler):
     #   * a new load is refused once N requests are held (in
     #     ``_inflight_prefills`` and not RUNNING), and must otherwise fit in
     #     the free blocks minus the stock async-load reservation minus
+    #     _KV_PREFETCH_RESERVE_BLOCKS kept for the running set
     #     (_inflight_prefill_reserved_blocks).
     # Below the cap the loop is unchanged. When a slot frees, the stock loop
     # drains ``kv_holding_waiting`` first, so the oldest KV-ready prefetched
@@ -218,11 +228,17 @@ class PrefixAwareScheduler(AsyncScheduler):
     # their blocks through the stock WAITING_FOR_REMOTE_KVS path.
     # ------------------------------------------------------------------
     _KV_PREFETCH_LOG_INTERVAL_S = 60.0
+    # Requests held for a free slot at most, and blocks kept for the running
+    # set (every IX decode leg ran 8 and the 512 default).
+    _KV_PREFETCH_MAX_HELD = 8
+    _KV_PREFETCH_RESERVE_BLOCKS = 512
 
     def _init_kv_prefetch(self) -> None:
         consumer = bool(getattr(self, "_is_kv_consumer", False)) and (
             getattr(self, "connector", None) is not None
         )
+        self._kv_prefetch_n = self._KV_PREFETCH_MAX_HELD if consumer else 0
+        self._kv_prefetch_reserve = self._KV_PREFETCH_RESERVE_BLOCKS
         # Real admission cap while schedule() runs with prefetch on, else None.
         self._kv_prefetch_cap: int | None = None
         self._kv_prefetch_in_waiting = False
@@ -314,6 +330,7 @@ class PrefixAwareScheduler(AsyncScheduler):
         if len(self.running) > cap:
             logger.error(
                 "KV prefetch: running=%d exceeds max_num_active_reqs=%d; "
+                "turning KV prefetch off.",
                 len(self.running),
                 cap,
             )
@@ -337,18 +354,25 @@ class PrefixAwareScheduler(AsyncScheduler):
         )
 
     # ------------------------------------------------------------------
+    # Waiting-queue sort (on for a KV producer).
     #
     # ``_promote_warmest`` moves one request per queue to the head. With the
+    # sort on, ``schedule()`` also stable-sorts the first
+    # _PAW_SORT_WINDOW requests of ``waiting`` before the base
     # scheduler admits from it, so every admission of the step follows the
     # order. The key is the request's estimated uncached prompt tokens
     # (prompt minus local HBM hit minus a loadable external hit) minus
+    # the aging rate x seconds waited, which bounds how long a
     # large prompt can be overtaken. Requests that already hold computed
     # tokens or were preempted go first, and requests whose uncached tokens
     # do not fit the free HBM blocks go last, so they cannot stall the head.
     # ------------------------------------------------------------------
     _PAW_SORT_LOG_INTERVAL_S = 60.0
+    _PAW_SORT_WINDOW = 128
 
     def _init_paw_sort(self) -> None:
+        self._paw_sort = bool(getattr(self, "_is_kv_producer", False))
+        self._paw_sort_window = self._PAW_SORT_WINDOW
         self._paw_sort_steps = 0
         self._paw_sort_reordered = 0
         self._paw_sort_moved = 0
@@ -359,6 +383,7 @@ class PrefixAwareScheduler(AsyncScheduler):
                 "PrefixAwareScheduler: waiting-queue SRPF sort ACTIVE "
                 "(window=%d, aging_tok_per_s=%g)",
                 self._paw_sort_window,
+                self._get_paw_aging_rate(),
             )
 
     def _paw_sort_key(
@@ -368,6 +393,7 @@ class PrefixAwareScheduler(AsyncScheduler):
         free_blocks: int | None,
         free_blocks_for_ext: int | None,
     ) -> tuple[int, int, float, float]:
+        """Sort key of the waiting-queue sort; lower is admitted first."""
         local_warmth = self._prefix_warmth(request)
         num_tokens = int(request.num_tokens)
         hbm_cold_tokens = max(num_tokens - local_warmth, 0)
@@ -387,6 +413,7 @@ class PrefixAwareScheduler(AsyncScheduler):
             ext_warmth = 0
         uncached = max(num_tokens - local_warmth - ext_warmth, 0)
         arrival = float(getattr(request, "arrival_time", now) or now)
+        rate = self._get_paw_aging_rate()
         aged = uncached - rate * max(0.0, now - arrival)
         started = (
             getattr(request, "num_preemptions", 0) > 0
@@ -395,6 +422,7 @@ class PrefixAwareScheduler(AsyncScheduler):
         return (0 if fits_hbm else 1, 0 if started else 1, aged, arrival)
 
     def _sort_waiting_queue(self) -> None:
+        """Stable-sort the first _PAW_SORT_WINDOW waiting requests by
         ``_paw_sort_key`` in place."""
         queue = self.waiting
         if self.policy != SchedulingPolicy.FCFS or len(queue) < 2:
@@ -565,8 +593,10 @@ class PrefixAwareScheduler(AsyncScheduler):
         return cached
 
     def _promote_warmest_on(self) -> bool:
+        """``tpu_scheduler.promote_warmest`` (default on)."""
         on = getattr(self, "_promote_warmest_switch", None)
         if on is None:
+            on = True
             self._promote_warmest_switch = on
         return on
 
@@ -584,21 +614,40 @@ class PrefixAwareScheduler(AsyncScheduler):
             return reserved + self._kv_prefetch_reserve
         return reserved
 
+    # Decode admission throttle (a KV consumer with DCP > 1): refuse a new
+    # remote load while this many loads are in flight, or while running plus
+    # in-flight requests reach max_num_seqs plus the overprovision; otherwise
+    # reserve max(the reserved blocks, the per-sequence blocks x (running +
+    # in flight)). Every IX decode leg with DCP 4 ran these values.
+    _DECODE_MAX_STAGE3_INFLIGHT = 16
+    _DECODE_STAGE3_OVERPROVISION = 32
+    _DECODE_RESERVED_BLOCKS = 128
+    _DECODE_RESERVED_BLOCKS_PER_SEQ = 8
+
     def _decode_inflight_reserved_blocks(self) -> int:
+        """The stock async-load reservation, or, on a KV consumer with
+        DCP > 1, the decode admission throttle (constants above)."""
         base = int(super()._inflight_prefill_reserved_blocks() or 0)
         on = getattr(self, "_decode_throttle_switch", None)
         if on is None:
+            on = int(getattr(self, "dcp_world_size", 1) or 1) > 1
             self._decode_throttle_switch = on
         if not on or not getattr(self, "_is_kv_consumer", False):
             return base
         num_inflight = len(getattr(self, "_inflight_prefills", ()))
         num_running = len(getattr(self, "running", ()))
         max_running = int(getattr(self, "max_num_running_reqs", 32) or 32)
+        max_stage3_inflight = self._DECODE_MAX_STAGE3_INFLIGHT
+        stage3_overprovision = self._DECODE_STAGE3_OVERPROVISION
         if (max_stage3_inflight > 0 and num_inflight >= max_stage3_inflight) or (
             stage3_overprovision >= 0
             and (num_running + num_inflight) >= (max_running + stage3_overprovision)
         ):
             return 1 << 30
+        min_reserved = self._DECODE_RESERVED_BLOCKS
+        per_seq_reserved = self._DECODE_RESERVED_BLOCKS_PER_SEQ
+        return max(
+            base, max(min_reserved, per_seq_reserved * (num_running + num_inflight))
         )
 
     def _get_paw_aging_rate(self) -> float:
@@ -694,6 +743,8 @@ class PrefixAwareScheduler(AsyncScheduler):
                 self._sort_waiting_queue()
             except Exception:
                 logger.exception(
+                    "PrefixAwareScheduler: waiting-queue sort failed; turning "
+                    "the sort off."
                 )
                 self._paw_sort = False
         self._step_wait_event = None
@@ -705,12 +756,15 @@ class PrefixAwareScheduler(AsyncScheduler):
                 self._kv_prefetch_begin_step()
             except Exception:
                 logger.exception(
+                    "PrefixAwareScheduler: KV prefetch setup failed; turning "
+                    "KV prefetch off."
                 )
                 self._kv_prefetch_n = 0
                 self._kv_prefetch_end_step()
         try:
             # vLLM's Scheduler walks the waiting queues without a selection
             # hook, so the warmest-first promotion runs here, once per step.
+            # tpu_scheduler.promote_warmest=false skips it: FCFS admission.
             if self._promote_warmest_on():
                 self._select_waiting_queue_for_scheduling()
             out = super().schedule(*args, **kwargs)
@@ -880,7 +934,12 @@ class PrefixAwareScheduler(AsyncScheduler):
             and self._kv_prefetch_at_cap()
         ):
             # KV prefetch: this waiting request would join ``running`` without
-            # an async load, past the cap. 0 stops the stock waiting loop.
+            # an async load, past the cap. vLLM 0.33 requeues a request whose
+            # chunk comes out 0 and keeps scanning; putting the real cap back
+            # ends the scan, so nothing is pulled ahead of this request.
+            cap = self._kv_prefetch_cap
+            if cap is not None:
+                self.max_num_active_reqs = cap
             return 0
         reserved = super()._reserve_prefill_lookahead(
             request, num_computed_tokens, num_new_tokens

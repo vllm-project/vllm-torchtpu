@@ -29,6 +29,7 @@ from vllm_torchtpu.runner.utils import (
     HASH_IGNORED_ADDITIONAL_CONFIG_KEYS,
     PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY,
     PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY,
+    SCHEDULER_OPTIONS_SECTION,
 )
 
 KEY = PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY
@@ -200,4 +201,19 @@ def test_patch_is_idempotent(patched_compute_hash):
 
 
 def test_ignored_keys_match_the_keys_the_runner_reads():
-    assert {KEY, PREFILL_KEY} == HASH_IGNORED_ADDITIONAL_CONFIG_KEYS
+    assert {
+        KEY,
+        PREFILL_KEY,
+        SCHEDULER_OPTIONS_SECTION,
+    } == HASH_IGNORED_ADDITIONAL_CONFIG_KEYS
+
+
+def test_scheduler_section_does_not_change_the_hash(patched_compute_hash):
+    """The scheduler options only decide admission order, so changing them must
+    not force a recompile."""
+    baseline = patched_compute_hash(_StubVllmConfig({"some_plugin_knob": 1}))
+    section = {SCHEDULER_OPTIONS_SECTION: {"promote_warmest": False}}
+    assert (
+        patched_compute_hash(_StubVllmConfig({"some_plugin_knob": 1, **section}))
+        == baseline
+    )
