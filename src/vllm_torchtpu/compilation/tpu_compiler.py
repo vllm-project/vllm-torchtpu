@@ -821,7 +821,11 @@ class TpuCompilerAdaptor(CompilerInterface):
         live_deadline = start + max(0, vllm_envs.VLLM_ENGINE_READY_TIMEOUT_S)
         paths = self._peer_paths(key)
         while not paths and _peer_wait.timeout_s > 0.0:
-            failed = self._peer_failed(key, fingerprint)
+            failed = (
+                self._peer_failed(key, fingerprint)
+                if _peer_wait.owner_slot is None
+                else None
+            )
             if failed is not None:
                 logger.info(
                     "[TpuCompilerAdaptor] %s: its owner could not save it; "

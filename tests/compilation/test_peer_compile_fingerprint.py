@@ -67,11 +67,17 @@ def publish_advice(compiler, fingerprint, slot):
         pass
 
 
-def test_identical_graph_replays_after_delayed_owner(peer_compilers, monkeypatch):
+@pytest.mark.parametrize("failed_other", [False, True])
+def test_identical_graph_replays_after_delayed_owner(
+    peer_compilers, monkeypatch, failed_other
+):
     make, compile, compiled = peer_compilers
     owner, peer = make(0), make(1)
     other = make(2)
     publish_advice(other, tpu_compiler._graph_fingerprint(graph(2)), 2)
+    if failed_other:
+        wrapped, _ = tpu_compiler._ensure_tuple_output(graph())
+        other._mark_failed(KEY, tpu_compiler._graph_fingerprint(wrapped))
     started, release = threading.Event(), threading.Event()
     results, errors = {}, []
     original = owner._run_backend
