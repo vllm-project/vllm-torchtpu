@@ -148,7 +148,9 @@ def prebuild(vllm_config: Any) -> None:
     from vllm.distributed.parallel_state import get_dp_group, get_tp_group
 
     _CORES = mesh.shape[EP_AXIS_NAME]
-    _MESH_RANKS = tuple(int(r) for r in get_ep_group().ranks)
+    ep_group = get_ep_group()
+    assert ep_group is not None  # build_ep_mesh found the group
+    _MESH_RANKS = tuple(int(r) for r in ep_group.ranks)
     _RANK = torch.tensor([ep_mesh_index()], dtype=torch.int32, device="tpu")
     _AR_OP = _build_all_reduce(mesh)
     _RS_OP = _build_reduce_scatter(mesh)
