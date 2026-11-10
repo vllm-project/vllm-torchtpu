@@ -23,7 +23,11 @@ from vllm_torchtpu.kernels.experimental.moe_dense_expert import (
     can_use_dense_expert,
     dense_expert_moe,
 )
-from vllm_torchtpu.kernels.megablox.gmm_v2 import get_packing_factor, gmm_v2
+from vllm_torchtpu.kernels.megablox.gmm_v2 import (
+    get_packing_factor,
+    gmm_v2,
+    gmm_v2_mlp,
+)
 from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
     blockwise_onehot_unpermute,
     can_use_blockwise_onehot_unpermute,
@@ -205,6 +209,14 @@ def quantize_to_native_fp4_kmajor(
     return packed, scale
 
 
+def _is_fp4_weight(rhs: jax.Array) -> bool:
+    """Native fp4 (not a packed carrier) rhs."""
+    return (
+        jnp.issubdtype(rhs.dtype, jnp.floating)
+        and jax.dtypes.itemsize_bits(rhs.dtype) == 4
+    )
+
+
 def gmm_wrapper(
     lhs,
     rhs,
@@ -220,10 +232,7 @@ def gmm_wrapper(
     # fp4 weights: keep bf16 activations. Quantizing activations to fp8 collapses
     # fp4 accuracy (error compounds across MoE layers) with no decode speedup
     # (decode is weight-HBM-bound). fp8/int4 weights keep the default fp8 act.
-    is_fp4_weight = (
-        jnp.issubdtype(rhs.dtype, jnp.floating)
-        and jax.dtypes.itemsize_bits(rhs.dtype) == 4
-    )
+    is_fp4_weight = _is_fp4_weight(rhs)
     return gmm_v2(
         lhs=lhs,
         rhs=rhs,
@@ -524,34 +533,58 @@ def moe_gmm(
     """
     group_offset = jnp.array([0], dtype=jnp.int32)
 
-    gmm1_res = gmm_wrapper(
-        x,
-        w1,
-        w1_scale,
-        w1_bias,
-        group_sizes,
-        group_offset,
-        zero_initialize=False,
-        fuse_act=activation,
-        rhs_quant_dtype=rhs_quant_dtype,
-    )
-    packing_factor = get_packing_factor(w2.dtype, rhs_quant_dtype)
-    gmm1_res = gmm1_res[:, : w2.shape[1] * packing_factor]
-
     topk_weights = topk_weights_flat.reshape((num_tokens, topk))
     valid_mask = valid_mask_flat.reshape((num_tokens, topk))
 
-    gmm2_res = gmm_wrapper(
-        gmm1_res,
-        w2,
-        w2_scale,
-        w2_bias,
-        group_sizes,
-        group_offset,
-        zero_initialize=False,
-        preferred_element_type=x.dtype,
-        rhs_quant_dtype=rhs_quant_dtype,
-    )
+    if (
+        _is_fp4_weight(w1)
+        and _is_fp4_weight(w2)
+        and get_packing_factor(w1.dtype, rhs_quant_dtype) == 1
+        and get_packing_factor(w2.dtype, rhs_quant_dtype) == 1
+        and w1_bias is None
+        and w2_bias is None
+    ):
+        # One kernel for both gmms (gmm_v2_mlp): down's first weight block
+        # loads under gate_up's last step instead of after it. Packing
+        # factor 1 means rhs_quant_dtype carries nothing gmm_v2_mlp needs.
+        gmm2_res = gmm_v2_mlp(
+            x,
+            w1,
+            w2,
+            group_sizes,
+            rhs1_scale=w1_scale,
+            rhs2_scale=w2_scale,
+            group_offset=group_offset,
+            fuse_act=activation,
+            preferred_element_type=x.dtype,
+            maybe_quantize_lhs=False,
+        )
+    else:
+        gmm1_res = gmm_wrapper(
+            x,
+            w1,
+            w1_scale,
+            w1_bias,
+            group_sizes,
+            group_offset,
+            zero_initialize=False,
+            fuse_act=activation,
+            rhs_quant_dtype=rhs_quant_dtype,
+        )
+        packing_factor = get_packing_factor(w2.dtype, rhs_quant_dtype)
+        gmm1_res = gmm1_res[:, : w2.shape[1] * packing_factor]
+
+        gmm2_res = gmm_wrapper(
+            gmm1_res,
+            w2,
+            w2_scale,
+            w2_bias,
+            group_sizes,
+            group_offset,
+            zero_initialize=False,
+            preferred_element_type=x.dtype,
+            rhs_quant_dtype=rhs_quant_dtype,
+        )
     # The destination-major kernel packs source indices into 20 bits and
     # processes 16-lane SparseCore tiles.
     use_local_ragged_combine = (

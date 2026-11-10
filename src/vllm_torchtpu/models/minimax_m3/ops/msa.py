@@ -22,9 +22,9 @@ import torch
 from torch_tpu._internal import pallas
 from vllm.distributed import get_tp_group
 
-from vllm_torchtpu.distributed.dcp import split_group_heads as _split_group_heads
+from vllm_torchtpu import envs
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
-from vllm_torchtpu.models.minimax_m3.kernels import msa, msa_dcp, msa_indexer
+from vllm_torchtpu.models.minimax_m3.kernels import msa, msa_dcp, msa_fp4, msa_indexer
 
 _KV_CACHE_ARG = 5
 _INDEX_CACHE_ARG = 6
@@ -356,17 +356,103 @@ def get_msa_sharded_op(
     return op
 
 
-def split_group_heads(
-    gathered: torch.Tensor, dcp: int, q_heads: int, kv_head_replicas: int
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Split the DCP all-gather of every rank's ``[q | k | v | index_q]``
-    (``[T, dcp * (q_heads + 3), D]``, rank-major) into the group's query
-    heads ``[T, dcp * q_heads, D]`` and the ``k``/``v``/``index_q
-    [T, dcp // kv_head_replicas, D]`` of its KV heads (`dcp.split_group_heads`)."""
-    q_all, (k, v, index_q) = _split_group_heads(
-        gathered, dcp, q_heads, kv_head_replicas, per_kv_head=3
+def _head_major_attend_fake(q, *args):
+    """Shapes of a DCP attend op's head-major ``(out [H, T, D], lse [H, T])``
+    for token-major ``q [T, H, D]`` (`msa_dcp.msa_attend_dcp`)."""
+    num_tokens, num_heads, head_dim = q.shape
+    return (
+        torch.empty((num_heads, num_tokens, head_dim), dtype=q.dtype, device=q.device),
+        torch.empty((num_heads, num_tokens), dtype=torch.float32, device=q.device),
     )
-    return q_all, k, v, index_q
+
+
+def _rotate_heads(x: torch.Tensor, hadamard: torch.Tensor) -> torch.Tensor:
+    """``x @ H / n`` over the head dim, for the bf16 Sylvester ``hadamard``:
+    `msa_fp4.rotate_queries` (and, ``H`` being symmetric,
+    `msa_fp4.unrotate_output`), bit for bit (the bf16 dot accumulates in f32;
+    the scale is a power of two)."""
+    return torch.matmul(x, hadamard) * (1.0 / x.shape[-1])
+
+
+def gather_query_heads(q: torch.Tensor, group: Any) -> torch.Tensor:
+    """The DCP group's query heads ``[T, dcp * q_heads, D]``, gathered as
+    they leave the rope: any op on `q` before the gather (a head-major
+    transpose, a 4-bit rotation of this rank's heads) made XLA re-lay out
+    the qkv / rope fusions that produce it (+0.25-0.3 ms per layer at 8K
+    tokens, c48 / c64 twins j-4371707e, j-65bccede, j-c5c4bdfc); the
+    attention op rotates the gathered queries itself."""
+    return group.all_gather(q.contiguous(), dim=1)
+
+
+def merge_head_partials(
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    group: Any,
+    hadamard: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """`cp_mla_attention.merge_lse_partials_scatter_heads` for head-major
+    partials ``out [H, T, D]``, ``lse [H, T]``: the reduce-scatter keeps
+    this rank's heads along the leading axis, and only that ``1 / DCP``
+    share is transposed back to ``[T, H / DCP, D]`` (and, with a 4-bit
+    cache's `hadamard`, unrotated: the rotation is linear, so the merged sum
+    unrotates as its terms would, up to bf16 rounding order). The MSA merge
+    always reduce-scatters: `TPU_DCP_LSE_MERGE_A2A` (the MLA merge's
+    all-to-all for small steps) does not apply here."""
+    # The LSEs cross the all-gather token-major ([T, H], as the MLA merge
+    # sends them): gathered head-major they took 2x as long (c48 / c64
+    # twins, j-fe812c28, j-c5c4bdfc).
+    lse = lse.to(torch.float32).transpose(0, 1).contiguous()
+    lses = group.all_gather(lse.unsqueeze(0), dim=0)
+    weight = torch.exp(lse - torch.logsumexp(lses, dim=0)).transpose(0, 1)
+    weight = weight.unsqueeze(-1)
+    # where, not *: a zero-weight partial may be NaN (NaN * 0 = NaN).
+    weighted = out.to(torch.float32) * weight
+    weighted = torch.where(weight > 0, weighted, torch.zeros_like(weighted))
+    if envs.TPU_DCP_RS_OUT_PRECISION:
+        weighted = weighted.to(out.dtype)
+    merged = group.reduce_scatter(weighted.contiguous(), dim=0).to(out.dtype)
+    if hadamard is not None:
+        merged = _rotate_heads(merged, hadamard)
+    return merged.transpose(0, 1)
+
+
+def gather_group_heads(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    index_q: torch.Tensor,
+    group: Any,
+    dcp: int,
+    kv_head_replicas: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The DCP group's query heads ``[T, dcp * q_heads, D]``
+    (`gather_query_heads`) and its KV heads' ``k``/``v``/``index_q``
+    (`gather_group_kv`).
+
+    Two gathers: only the scoring op needs the K/V and index queries, and
+    the attention op needs the queries after it, so the query gather (8 of a
+    rank's 11 heads at DCP 8) can run while the scoring op computes instead
+    of before it, and needs no strided split of a combined gather."""
+    return gather_query_heads(q, group), *gather_group_kv(
+        k, v, index_q, group, dcp, kv_head_replicas
+    )
+
+
+def gather_group_kv(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    index_q: torch.Tensor,
+    group: Any,
+    dcp: int,
+    kv_head_replicas: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The ``k``/``v``/``index_q [T, dcp // kv_head_replicas, D]`` of the DCP
+    group's KV heads (rank ``i`` holds KV head ``i // kv_head_replicas``, so
+    every ``kv_head_replicas``-th rank supplies the next head)."""
+    num_tokens, _, head_dim = k.shape
+    per_rank = group.all_gather(torch.cat([k, v, index_q], dim=1).contiguous(), dim=1)
+    per_head = per_rank.view(num_tokens, dcp, 3, head_dim)[:, ::kv_head_replicas]
+    return tuple(per_head[:, :, i].contiguous() for i in range(3))
 
 
 @functools.cache
@@ -391,9 +477,9 @@ def get_msa_dcp_op(
     same program, and one compile and one cache entry serve all ranks.
 
     ``kv_head_replicas`` is the TP ranks per KV head. A DCP group wider than
-    that spans ``dcp // kv_head_replicas`` KV heads; one all-gather then also
-    brings every rank the group's new K/V and index queries (the GLM DCP
-    pattern: one gather in, the LSE merge and reduce-scatter out).
+    that spans ``dcp // kv_head_replicas`` KV heads; all-gathers then also
+    bring every rank the group's new K/V and index queries
+    (`gather_group_heads`), and the LSE merge and reduce-scatter go out.
 
     Two JAX ops: the first writes this rank's tokens and returns its local
     top-k candidates; an all-gather over the DCP group brings every rank all
@@ -403,10 +489,6 @@ def get_msa_dcp_op(
     MLA DCP path) combines the ranks' partials and keeps this rank's heads.
     """
     from vllm_torchtpu.distributed.dcp import get_dcp_group
-    from vllm_torchtpu.layers.adapter.cp_mla_attention import (
-        all_gather_heads,
-        merge_lse_partials_scatter_heads,
-    )
 
     if dcp % kv_head_replicas and kv_head_replicas % dcp:
         raise ValueError(
@@ -497,14 +579,8 @@ def get_msa_dcp_op(
             ),
         )
 
-    def _attend_fake(q, *args):
-        return (
-            torch.empty_like(q),
-            torch.empty(q.shape[:2], dtype=torch.float32, device=q.device),
-        )
-
     score_op.register_fake(_score_fake)
-    attend_op.register_fake(_attend_fake)
+    attend_op.register_fake(_head_major_attend_fake)
 
     def op(
         q: torch.Tensor,
@@ -521,15 +597,10 @@ def get_msa_dcp_op(
         group = get_dcp_group()
         assert group is not None, "DCP group is not initialized"
         if kv_heads == 1:
-            q_all = all_gather_heads(q)
+            q_all = gather_query_heads(q, group)
         else:
-            # One gather of [q | k | v | index_q] per rank; every
-            # kv_head_replicas-th rank contributes the K/V of the next head.
-            gathered = group.all_gather(
-                torch.cat([q, k, v, index_q], dim=1).contiguous(), dim=1
-            )
-            q_all, k, v, index_q = split_group_heads(
-                gathered, dcp, q.shape[1], kv_head_replicas
+            q_all, k, v, index_q = gather_group_heads(
+                q, k, v, index_q, group, dcp, kv_head_replicas
             )
         new_kv_cache, new_index_cache, candidates = score_op(
             k,
@@ -556,7 +627,7 @@ def get_msa_dcp_op(
             metadata.query_start_loc,
             dcp_rank,
         )
-        return merge_lse_partials_scatter_heads(out, lse)
+        return merge_head_partials(out, lse, group)
 
     return op
 
@@ -572,10 +643,6 @@ def _get_msa_dcp_fp4_op(
     """`get_msa_dcp_op` for 4-bit caches."""
     kv_heads = max(1, dcp // kv_head_replicas)
     from vllm_torchtpu.distributed.dcp import get_dcp_group
-    from vllm_torchtpu.layers.adapter.cp_mla_attention import (
-        all_gather_heads,
-        merge_lse_partials_scatter_heads,
-    )
 
     def _score_jax(
         k: jax.Array,
@@ -590,8 +657,13 @@ def _get_msa_dcp_fp4_op(
         query_start_loc: jax.Array,
         request_distribution: jax.Array,
         dcp_rank: jax.Array,
-    ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-        return msa_dcp.msa_write_and_candidates_dcp(
+        q: jax.Array,
+    ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+        # This rank's queries are rotated here, a 1 / DCP share of the
+        # group's heads: inside a JAX op the rotation leaves the rope
+        # fusions that produce q alone (a torch matmul on q re-laid them
+        # out, +0.3 ms per layer at 8K tokens, j-c5c4bdfc).
+        return *msa_dcp.msa_write_and_candidates_dcp(
             k,
             v,
             index_q,
@@ -608,7 +680,7 @@ def _get_msa_dcp_fp4_op(
             rank=dcp_rank,
             dcp=dcp,
             scale_cache=scale_cache,
-        )
+        ), msa_fp4.rotate_queries(q)
 
     def _attend_jax(
         q: jax.Array,
@@ -660,16 +732,11 @@ def _get_msa_dcp_fp4_op(
                 dtype=torch.float32,
                 device=k.device,
             ),
-        )
-
-    def _attend_fake(q, *args):
-        return (
-            torch.empty_like(q),
-            torch.empty(q.shape[:2], dtype=torch.float32, device=q.device),
+            torch.empty_like(args[-1]),
         )
 
     score_op.register_fake(_score_fake)
-    attend_op.register_fake(_attend_fake)
+    attend_op.register_fake(_head_major_attend_fake)
 
     def op(
         q: torch.Tensor,
@@ -683,20 +750,13 @@ def _get_msa_dcp_fp4_op(
         *,
         dcp_rank: torch.Tensor,
         scale_cache: torch.Tensor,
+        hadamard: torch.Tensor,
     ) -> torch.Tensor:
         group = get_dcp_group()
         assert group is not None, "DCP group is not initialized"
-        if kv_heads == 1:
-            q_all = all_gather_heads(q)
-        else:
-            # As `get_msa_dcp_op`: one gather of [q | k | v | index_q].
-            gathered = group.all_gather(
-                torch.cat([q, k, v, index_q], dim=1).contiguous(), dim=1
-            )
-            q_all, k, v, index_q = split_group_heads(
-                gathered, dcp, q.shape[1], kv_head_replicas
-            )
-        new_kv_cache, new_index_cache, new_scale_cache, candidates = score_op(
+        if kv_heads > 1:
+            k, v, index_q = gather_group_kv(k, v, index_q, group, dcp, kv_head_replicas)
+        new_kv_cache, new_index_cache, new_scale_cache, candidates, q = score_op(
             k,
             v,
             index_q,
@@ -709,7 +769,9 @@ def _get_msa_dcp_fp4_op(
             metadata.query_start_loc,
             metadata.request_distribution,
             dcp_rank,
+            q.contiguous(),
         )
+        q_all = gather_query_heads(q, group)
         kv_cache.copy_(new_kv_cache)
         index_cache.copy_(new_index_cache)
         scale_cache.copy_(new_scale_cache)
@@ -724,7 +786,7 @@ def _get_msa_dcp_fp4_op(
             metadata.query_start_loc,
             dcp_rank,
         )
-        return merge_lse_partials_scatter_heads(out, lse)
+        return merge_head_partials(out, lse, group, hadamard)
 
     return op
 
