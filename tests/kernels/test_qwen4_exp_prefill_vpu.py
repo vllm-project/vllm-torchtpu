@@ -152,3 +152,15 @@ def test_vpu_path(backend, monkeypatch, query_heads, kv_tile, k_scale, features,
     # flip at most a final BF16 bit of a few elements.
     assert vs_base < max(bound, 1e-2 if "16" in features or features == "1" else 4e-3)
     assert vs_dense < 0.01 + bound
+
+
+@pytest.mark.parametrize("features", ["", "1"])
+def test_page_copies_bitwise(backend, monkeypatch, features):
+    """VLLM_TPU_QSA_PREFILL_PAGE_COPIES moves the same rows in fewer DMAs."""
+    args, _, _, ratio = _case(7, 3, 1024, 1.0)
+    common = dict(query_heads=3, kv_tile=1024, k_scale=1.0, ratio=ratio)
+    monkeypatch.setenv("VLLM_TPU_QSA_PREFILL_PAGE_COPIES", "0")
+    base = _run(monkeypatch, features, args, **common)
+    monkeypatch.setenv("VLLM_TPU_QSA_PREFILL_PAGE_COPIES", "1")
+    actual = _run(monkeypatch, features, args, **common)
+    np.testing.assert_array_equal(actual, base)
