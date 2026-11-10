@@ -12,29 +12,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Source provenance: inferact/k3-megakernel@30c9ba966b src/vllm_torchtpu/megakernel/program.py
+# Source provenance: inferact/k3-megakernel@30c9ba966b
+# src/vllm_torchtpu/megakernel/program.py
 """The interface between vLLM's engine and a megakernel program.
 
 A program is a whole model as a handful of JAX/Pallas SPMD ops. It owns
 everything on the device -- weights, KV writes, recurrent state, sampling,
 speculation -- and the runner (``megakernel.runner``) owns the vLLM contract:
-request lifecycle, the KV connector, async output. They meet at
-:meth:`MegakernelProgram.step`, which takes a :class:`StepInput` (the step's
-scheduled requests as plain host data) and returns the tokens they produced.
+request lifecycle, the KV connector, async output. They meet at the program's
+``step`` method, which takes a :class:`StepInput` (the step's scheduled
+requests as plain host data) and returns a :class:`StepOutput` carrying the
+tokens they produced.
 
 No vLLM dependencies: the standalone tools drive programs through this
-interface exactly as serving does.
+interface.
 """
 
 from __future__ import annotations
 
 import dataclasses
-import zlib
-from collections.abc import Iterable, Mapping, Sequence
-from typing import Any, Protocol
+from typing import TYPE_CHECKING
 
-import numpy as np
-import torch
+if TYPE_CHECKING:
+    from collections.abc import Iterable, Sequence
+
+    import numpy as np
+    import torch
 
 
 @dataclasses.dataclass(frozen=True)
@@ -46,22 +49,12 @@ class SamplingSpec:
     top_k: int = 0  # <= 0: all tokens
     seed: int = 0
 
-    @classmethod
-    def from_sampling_params(cls, params: Any, req_id: str) -> SamplingSpec:
-        """Request ``req_id``'s vLLM ``SamplingParams``: greedy below vLLM's
-        sampling epsilon (1e-5), and an unseeded request seeded from its id
-        (the ops sample with a seeded generator, which every rank must agree
-        on)."""
-        return cls(
-            temperature=float(params.temperature) if params.temperature > 1e-5 else 0.0,
-            top_p=float(params.top_p),
-            top_k=int(params.top_k),
-            seed=int(params.seed)
-            if params.seed is not None
-            else zlib.crc32(req_id.encode()),
-        )
-
     def as_tuple(self) -> tuple[float, float, int, int]:
+        """Return ``(temperature, top_p, top_k, seed)`` as a plain 4-tuple.
+
+        Returns:
+            Tuple of ``(temperature, top_p, top_k, seed)``.
+        """
         return (self.temperature, self.top_p, self.top_k, self.seed)
 
 
@@ -70,8 +63,11 @@ GREEDY = SamplingSpec()
 
 @dataclasses.dataclass
 class RequestInput:
-    """One request of a step, as the runner's persistent batch holds it
-    (host data only)."""
+    """Host-side state for one request in the runner's persistent batch.
+
+    One request of a step, as the runner's persistent batch holds it
+    (host data only).
+    """
 
     req_id: str
     computed: int  # tokens in the KV cache before this step
@@ -83,6 +79,7 @@ class RequestInput:
     num_prompt_tokens: int
     # The request's block-table row in every KV cache group.
     block_tables: tuple[np.ndarray, ...]
+    # SamplingParams fields the ops implement beyond the defaults
     sampling: SamplingSpec = GREEDY
 
     @property
@@ -108,13 +105,14 @@ class KVGroup:
 
 @dataclasses.dataclass(frozen=True)
 class Capabilities:
-    """What a program supports, known from the configuration alone (the
-    platform checks requests against it before any program is loaded)."""
+    """Static program capabilities derived from the engine configuration.
+
+    What a program supports, known from the configuration alone (the
+    platform checks requests against it before any program is loaded).
+    """
 
     roles: frozenset[str]
-    sampling: frozenset[
-        str
-    ]  # SamplingParams fields the ops implement beyond the defaults
+    sampling: frozenset[str]
     speculation: str | None  # the speculation method drafted in the ops, if any
     num_speculative_tokens: int
     max_step_tokens: int  # the most tokens one step may schedule
@@ -122,9 +120,9 @@ class Capabilities:
     page_aligned_chunks: bool
     # applies the scheduler's copy-on-write block copies (prefix hits inside a block)
     block_copies: bool
-    # applies the grammar bitmask of vLLM structured outputs to the tokens the
-    # ops choose (the prefill declares it to accept the requests; it ignores
-    # the masks -- only the decode role's tokens are served)
+    # applies the grammar bitmask of vLLM structured outputs to the tokens the ops
+    # choose (the prefill declares it to accept the requests; it ignores the masks --
+    # only the decode role's tokens are served)
     structured_outputs: bool = False
 
 
@@ -147,29 +145,10 @@ class StepInput:
 
 @dataclasses.dataclass
 class StepOutput:
-    """The tokens a step produced: row ``i`` of ``tokens`` (device int32
-    ``[>= requests, width]``) holds request ``i``'s tokens, ``-1`` padded
-    (all ``-1`` for a request that produced none: a partial prefill chunk)."""
+    """Device int32 token matrix ``[>= requests, width]`` produced by one step.
+
+    Row ``i`` of ``tokens`` holds request ``i``'s tokens padded with ``-1``
+    (all ``-1`` for a partial prefill chunk that produced no output token).
+    """
 
     tokens: torch.Tensor
-
-
-class MegakernelProgram(Protocol):
-    """A model run as megakernel ops (see the module docstring)."""
-
-    def load_weights(self) -> None: ...
-
-    def bind_kv_caches(
-        self, caches: Mapping[str, torch.Tensor], groups: Sequence[KVGroup]
-    ) -> None:
-        """vLLM's allocated KV cache tensors by layer name and its KV cache
-        groups."""
-        ...
-
-    def warmup(self) -> None:
-        """Compile every op the program will run."""
-        ...
-
-    def step(self, step_input: StepInput) -> StepOutput:
-        """Run one step (see :class:`StepInput` and :class:`StepOutput`)."""
-        ...

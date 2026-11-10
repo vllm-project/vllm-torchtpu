@@ -27,15 +27,14 @@ and it changes no existing model, runner, or scheduler path.
 
 | Path | What it holds | RFC #2595 row | Stack PR |
 | --- | --- | --- | --- |
-| `config.py`, `layout.py` | kernel config, cache layout | B4 | 1/7 |
-| `common/` | 32-rank collectives, VMEM pool, memref reinterpret hook | A1 | 1/7 |
-| `runtime_shim/` | backend capabilities, torch bridge, compile and export cache | B1 | 1/7 |
-| `kernels/decode_megakernel.py`, `kernels/mla_dcp.py`, `kernels/paged.py`, `kernels/load.py` | decode megakernel, DCP MLA attention, paged serving step, weight layout | A1, A4 | 2/7 |
-| `kernels/prefill_megakernel.py`, `kernels/prefill_moe/`, `kernels/helpers.py` | sequence-parallel prefill kernels and prefill MoE | A2 | 3/7 |
-| `kernels/dspark*.py` | DSpark draft kernels | A3 | 4/7 |
-| `kernels/rank_loader.py`, `tools/preshard.py` | per-rank weight streaming and the offline preshard tool | A4 | 5/7 |
-| `program.py`, `decode*.py`, `prefill.py`, `pools.py`, `sampling.py`, `draft*.py` | the program: decode and prefill steps, pool binding, KDA slots, sampling, DSpark | B1 to B4 | 6/7 |
-| `tools/` (other files) | `check`, `bench`, and `coverage` tools for silicon bring-up | D3 | 7/7 |
+| `config.py`, `layout.py` | kernel config, cache layout | B4 | 1/6 |
+| `common/` | 32-rank collectives, VMEM pool, memref reinterpret hook | A1 | 1/6 |
+| `runtime_shim/` | backend capabilities, torch bridge, compile and export cache | B1 | 1/6 |
+| `kernels/decode_megakernel.py`, `kernels/mla_dcp.py`, `kernels/paged.py`, `kernels/load.py` | decode megakernel, DCP MLA attention, paged serving step, weight layout | A1, A4 | 2/6 |
+| `kernels/prefill_megakernel.py`, `kernels/prefill_moe/`, `kernels/helpers.py` | sequence-parallel prefill kernels and prefill MoE | A2 | 3/6 |
+| `kernels/dspark*.py` | DSpark draft kernels | A3 | 4/6 |
+| `kernels/rank_loader.py`, `tools/preshard.py` | per-rank weight streaming and the offline preshard tool | A4 | 5/6 |
+| `program.py`, `decode*.py`, `prefill.py`, `pools.py`, `sampling.py`, `draft*.py` | the program: decode and prefill steps, pool binding, KDA slots, sampling, DSpark | B1 to B4 | 6/6 |
 
 ## Provenance
 
@@ -62,7 +61,7 @@ paths. Each stack PR lists the files that carry further adaptations.
 
 ## Phase 1 scope
 
-In scope: RFC rows A1 to A4, B1 to B4, and D3.
+In scope: RFC rows A1 to A4, B1 to B4.
 
 Not in this package: the runner subclass, scheduler patches, and platform
 hooks (rows C1 to C3), and the KV connector fixes (row D1). Those land in
