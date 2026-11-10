@@ -41,7 +41,10 @@ def _make_proposer(
     draft_tp: int | None = 1, target_tp: int = 1, method: str = "eagle3"
 ) -> Eagle3Proposer:
     speculative_config = SimpleNamespace(
-        draft_tensor_parallel_size=draft_tp, method=method, draft_model_config=None
+        draft_tensor_parallel_size=draft_tp,
+        method=method,
+        draft_model_config=None,
+        num_speculative_tokens=1,
     )
     parallel_config = SimpleNamespace(
         tensor_parallel_size=target_tp, pipeline_parallel_size=1
@@ -1121,10 +1124,17 @@ def test_propose_empty_batch():
     )
 
 
-def _lockstep_draft_trace(monkeypatch, method, K, num_chunks, num_real):
+def _lockstep_draft_trace(
+    monkeypatch, method, K, num_chunks, num_real, *, step0_gather=False
+):
     """The draft programs one EP-DP lockstep rank emits in a step whose
     coordinated chunk bound is `num_chunks`: propose() with `num_real` real
-    chunks, or the idle-rank replay when it has none."""
+    chunks, or the idle-rank replay when it has none.
+
+    `step0_gather` installs the MTP step-0 post-attention gather on the draft,
+    with the separate loop-step program it gets when the fused loop is off,
+    and stubs `_forward_draft` on the class, since an instance stub turns the
+    gather off."""
     import vllm_torchtpu.spec_decode.eagle3 as e3
 
     monkeypatch.setattr(e3, "synchronize_tensors", lambda *a, **k: None)
@@ -1157,8 +1167,15 @@ def _lockstep_draft_trace(monkeypatch, method, K, num_chunks, num_real):
         trace.append(("combine", [tuple(a.shape) for a in aux]))
         return aux[0]
 
-    def forward(*, step_idx, num_tokens_padded, **_):
-        trace.append(("forward", step_idx, num_tokens_padded))
+    def forward(*, step_idx, num_tokens_padded, step0_gather_indices=None, **_):
+        trace.append(
+            (
+                "forward",
+                step_idx,
+                num_tokens_padded,
+                None if step0_gather_indices is None else step0_gather_indices.shape,
+            )
+        )
         hidden = torch.zeros((num_tokens_padded, 8))
         return hidden, hidden
 
@@ -1167,9 +1184,21 @@ def _lockstep_draft_trace(monkeypatch, method, K, num_chunks, num_real):
         return torch.zeros(hidden.shape[0], dtype=torch.int32)
 
     proposer._draft_combine_hidden_states = combine
-    proposer._forward_draft = forward
+    if step0_gather:
+        import vllm_torchtpu.models.vllm.qwen3_next_patch as qwen3_next_patch
+
+        monkeypatch.setenv("TPU_MTP_STEP0_POST_ATTN_GATHER", "1")
+        monkeypatch.setattr(
+            qwen3_next_patch, "is_step0_post_attn_gather_installed", lambda _m: True
+        )
+        monkeypatch.setattr(
+            Eagle3Proposer, "_forward_draft", lambda _self, **kw: forward(**kw)
+        )
+        proposer._mtp_loop_model = object()
+    else:
+        proposer._forward_draft = forward
     proposer._draft_propose_token = propose_token
-    proposer._draft_gather_carries = lambda h, pos, lh, _idx: (
+    proposer._draft_gather_carries = lambda h, pos, lh, _idx, *_: (
         h[:reqs],
         pos[:reqs],
         lh[:reqs],
@@ -1223,6 +1252,83 @@ def test_dp_lockstep_draft_trace_independent_of_real_chunk_count(
     for num_real in range(num_chunks):
         padded = _lockstep_draft_trace(monkeypatch, method, K, num_chunks, num_real)
         assert padded == full, f"{num_real} of {num_chunks} chunks real"
+
+
+@pytest.mark.parametrize("K", [1, 2, 3])
+@pytest.mark.parametrize("num_chunks", [1, 2, 3])
+def test_dp_lockstep_draft_trace_matches_with_mtp_step0_gather(
+    monkeypatch, K, num_chunks
+):
+    """An MTP draft with the step-0 post-attention gather installed still
+    emits one draft program sequence per lockstep step, however many chunks
+    are real: a real chunk's step 0 runs the plain forward over the
+    coordinated bucket, as the padding chunks and the idle-rank replay do,
+    and its MoE never runs over the gathered loop-bucket rows."""
+    full = _lockstep_draft_trace(
+        monkeypatch, "mtp", K, num_chunks, num_chunks, step0_gather=True
+    )
+    assert all(entry[3] is None for entry in full if entry[0] == "forward")
+    for num_real in range(num_chunks):
+        padded = _lockstep_draft_trace(
+            monkeypatch, "mtp", K, num_chunks, num_real, step0_gather=True
+        )
+        assert padded == full, f"{num_real} of {num_chunks} chunks real"
+
+
+@pytest.mark.parametrize("lockstep", [False, True])
+def test_mtp_step0_post_attn_gather_off_under_dp_lockstep(monkeypatch, lockstep):
+    """An installed step-0 gather runs on a MoE MTP draft unless EP-DP
+    lockstep pads its draft steps."""
+    import vllm_torchtpu.models.vllm.qwen3_next_patch as qwen3_next_patch
+
+    monkeypatch.setenv("TPU_MTP_STEP0_POST_ATTN_GATHER", "1")
+    monkeypatch.setattr(
+        qwen3_next_patch, "is_step0_post_attn_gather_installed", lambda _m: True
+    )
+    proposer = _make_proposer(draft_tp=1, method="mtp")
+    proposer._draft_has_moe_cache = True
+    proposer.draft_model = SimpleNamespace()
+    proposer.runner = SimpleNamespace(_dp_lockstep_enabled=lambda: lockstep)
+    chunk = SimpleNamespace(
+        sequence_layout_plan=SimpleNamespace(kind=SequenceLayoutKind.ALL)
+    )
+    assert proposer._use_mtp_step0_post_attn_gather(chunk) is (not lockstep)
+
+
+@pytest.mark.parametrize("lockstep", [False, True])
+def test_load_model_skips_step0_gather_loop_model_under_dp_lockstep(
+    monkeypatch, lockstep
+):
+    """load_model builds the step-0 gather's loop-step program only where the
+    gather can run, so under EP-DP lockstep steps 1..K-1 run the draft."""
+    monkeypatch.setenv("TPU_MTP_STEP0_POST_ATTN_GATHER", "1")
+    monkeypatch.setenv("VLLM_TPU_FUSED_DRAFT_LOOP", "0")
+    proposer = _make_proposer(draft_tp=1, target_tp=1, method="mtp")
+    proposer.speculative_config.num_speculative_tokens = 2
+    proposer.runner._dp_lockstep_enabled = lambda: lockstep
+    proposer._draft_has_moe_cache = True
+    draft, target = _make_vocab_models()
+
+    def load_draft_model(_target):
+        proposer.draft_model = draft
+
+    proposer._load_draft_model = load_draft_model
+    monkeypatch.setattr(
+        spec_decode_utils, "gather_sharded_weight", _fake_gather_sharded_weight
+    )
+    built = []
+    monkeypatch.setattr(
+        Eagle3Proposer,
+        "_build_mtp_step0_gather_loop_model",
+        lambda _self: built.append(True),
+    )
+
+    with mock.patch(
+        "vllm_torchtpu.spec_decode.eagle3.get_layers_from_vllm_config", return_value={}
+    ):
+        proposer.load_model(target)
+
+    assert built == ([] if lockstep else [True])
 
 
 def test_loop_bucket_follows_dp_step_max_reqs_under_sharded_lockstep():
