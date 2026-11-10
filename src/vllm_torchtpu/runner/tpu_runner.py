@@ -66,7 +66,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
     MultiKVConnectorStats,
 )
 from vllm.forward_context import set_forward_context
-from vllm_torchtpu.runner import decode_carry as _decode_carry
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.rotary_embedding import (
@@ -197,6 +196,7 @@ from vllm_torchtpu.runner import (
     spec_boundary_state,
     thinking_budget_tracker,
 )
+from vllm_torchtpu.runner import decode_carry as _decode_carry
 from vllm_torchtpu.runner import fast_forward_context as _ffc
 from vllm_torchtpu.runner import min_tokens as min_tokens_mask
 from vllm_torchtpu.runner import utils as runner_utils
