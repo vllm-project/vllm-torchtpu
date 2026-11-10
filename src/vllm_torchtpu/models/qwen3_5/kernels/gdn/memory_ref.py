@@ -351,19 +351,15 @@ class StateInBufferedRef(_GranuleStateRef):
         vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
         p_id = grid_indices[0]
 
-        dma_size = 0
+        # One wait per issued copy, mirroring copy_in's descriptors.
+        vmem_ref = granule_view(vmem_ref, vmem_ref.shape[:2])
         for idx in range(self.cfg.seq_tile_size):
             is_first_tile = self.metadata_ref.p_id_is_first_tile[p_id, idx]
             s_idx = self.metadata_ref.p_id_to_s_idx[p_id, idx]
             has_initial_state = self.metadata_ref.s_idx_has_initial_state[s_idx]
             should_read = jnp.logical_and(is_first_tile, has_initial_state)
-            dma_size += jnp.where(should_read, 1, 0)
-
-        # NOTE: With bounds checks disabled, the self-copy descriptor may
-        # nominally exceed the window row; it is never executed, only used
-        # to wait for the same number of bytes `copy_in` issued.
-        wait_ref = vmem_ref.at[0, pl.ds(0, dma_size)]
-        pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
+            wait_ref = vmem_ref.at[idx, pl.ds(0, jnp.where(should_read, 1, 0))]
+            pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
 
 
 @jax.tree_util.register_dataclass
@@ -444,20 +440,23 @@ class StateOutBufferedRef(_GranuleStateRef):
         vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
         p_id = grid_indices[0]
 
-        dma_size = 0
+        # One wait per issued copy, mirroring copy_out's descriptors. A single
+        # aggregate wait over seq_tile_size * window_size checkpoints slices
+        # past the window axis for a W > 1 verify window at T >= 2 and left
+        # nondeterministic checkpoints on reused double-buffered tiles.
+        vmem_ref = granule_view(vmem_ref, vmem_ref.shape[:2])
         for idx in range(self.cfg.seq_tile_size):
             is_last_tile = self.metadata_ref.p_id_is_last_tile[p_id, idx]
             r_size = self.metadata_ref.p_id_to_r_size[p_id, idx]
             num_ckpts = jnp.minimum(r_size, self.cfg.window_size)
-            dma_size += jnp.where(is_last_tile, num_ckpts, 0)
+            for t in range(self.cfg.window_size):
+                should_write = jnp.logical_and(is_last_tile, t < num_ckpts)
+                wait_ref = vmem_ref.at[pl.ds(idx, jnp.where(should_write, 1, 0)), t]
+                pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
             if self.metadata_ref.s_idx_to_prefill_ckpt_row is not None:
                 is_ckpt_tile = self.metadata_ref.is_prefill_ckpt_tile(p_id, idx)
-                dma_size += jnp.where(is_ckpt_tile, 1, 0)
-
-        # Each checkpoint moved one window row's worth of bytes; see
-        # StateInBufferedRef.wait_in for why this counts them on the typed tile.
-        wait_ref = vmem_ref.at[0, pl.ds(0, dma_size)]
-        pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
+                wait_ref = vmem_ref.at[pl.ds(idx, jnp.where(is_ckpt_tile, 1, 0)), 0]
+                pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
 
 
 def create_allocs(
