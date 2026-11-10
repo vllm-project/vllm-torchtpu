@@ -4259,10 +4259,12 @@ class TPUModelRunner(GPUModelRunner):
         )
 
     def _strip_prefill_only_padding(self, scheduler_output: "SchedulerOutput") -> int:
-        """Drop draft-placeholder rows that vLLM padded onto a final prompt token (prefill-only MTP).
+        """Drop draft-placeholder rows vLLM padded onto a final prompt token
+        (prefill-only MTP).
 
-        Applies only to a request whose placeholders are all -1 and whose step would cross the prompt by
-        exactly those rows. Returns how many requests were trimmed.
+        Applies only to a request whose placeholders are all -1 and whose step
+        would cross the prompt by exactly those rows. Returns how many requests
+        were trimmed.
         """
         spec = getattr(scheduler_output, "scheduled_spec_decode_tokens", None)
         if not spec:
@@ -4277,10 +4279,15 @@ class TPUModelRunner(GPUModelRunner):
         cached = getattr(scheduler_output, "scheduled_cached_reqs", None)
         if cached is not None:
             for req_id, computed in zip(
-                getattr(cached, "req_ids", ()) or (), getattr(cached, "num_computed_tokens", ()) or ()
+                getattr(cached, "req_ids", ()) or (),
+                getattr(cached, "num_computed_tokens", ()) or (),
             ):
                 idx = self.input_batch.req_id_to_index.get(req_id)
-                prompt = int(self.input_batch.num_prompt_tokens[idx]) if idx is not None else None
+                prompt = (
+                    int(self.input_batch.num_prompt_tokens[idx])
+                    if idx is not None
+                    else None
+                )
                 info[req_id] = (int(computed), prompt)
         trimmed = 0
         for req_id, drafts in list(spec.items()):
@@ -4296,9 +4303,13 @@ class TPUModelRunner(GPUModelRunner):
                 del spec[req_id]
                 trimmed += 1
                 logger.warning_once(
-                    "Prefill-only MTP: dropped %d draft-placeholder row(s) padded onto the final prompt "
-                    "token of request %s (num_computed_tokens=%d, num_prompt_tokens=%d).",
-                    len(drafts), req_id, computed, prompt,
+                    "Prefill-only MTP: dropped %d draft-placeholder row(s) padded "
+                    "onto the final prompt token of request %s "
+                    "(num_computed_tokens=%d, num_prompt_tokens=%d).",
+                    len(drafts),
+                    req_id,
+                    computed,
+                    prompt,
                 )
         return trimmed
 
