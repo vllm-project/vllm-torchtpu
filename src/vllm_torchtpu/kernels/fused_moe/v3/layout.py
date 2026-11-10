@@ -47,7 +47,7 @@ MESH_AXIS = "d"
 # outputs are consumed downstream (the finish program's `done` word gates the
 # combine's index), so the flag is not what keeps them alive; the bridge's
 # caller sets it False.
-SIDE_EFFECTS = True
+SIDE_EFFECTS: bool = True
 
 # Whether the shard's own index reaches the transport and shard-tables
 # programs as an operand (an int32 [1] in SMEM, from a [num_shards, 1] array
@@ -56,7 +56,7 @@ SIDE_EFFECTS = True
 # lowers to a partition-id that XLA's SPMD partitioner refuses ("partitionId
 # instruction is not supported for SPMD partitioning"), so the
 # bridge's caller sets it True and supplies the index as data.
-SHARD_INDEX_OPERAND = False
+SHARD_INDEX_OPERAND: bool = False
 
 
 def device_coords(peer, mesh_axes=(MESH_AXIS,)):
