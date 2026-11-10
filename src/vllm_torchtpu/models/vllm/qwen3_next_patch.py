@@ -11,13 +11,23 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Trace-stable sequence-parallel forwards and FP8 fusions for Qwen3Next and
-Qwen3.5 MoE.
+"""Trace-stable sequence-parallel forwards and FP8 fusions for Qwen3.5 MoE.
 
 vLLM's Qwen3.5 decoder layer and model inherit these forwards from the
 Qwen3Next classes, so the patch replaces them there.
 
-FP8 fusions, installed for every Qwen3Next / Qwen3.5 model:
+What `maybe_patch_qwen3_next` installs depends on the model (a Qwen3.5 rule):
+- A Qwen3.5 MoE target (`models/qwen3_5/settings.ARCHITECTURES`) gets the FP8
+  fusions below with their post-load setup, the patched forwards (the MTP
+  step-0 post-attention gather needs them even without sequence
+  parallelism), and, under TPU_MOE_SEQUENCE_PARALLEL=1, row gating
+  (`sequence_parallel.follow_step_form`).
+- Any other model on these classes (Qwen3-Next) gets only main's opt-in:
+  TPU_MOE_SEQUENCE_PARALLEL=1 installs the trace-stable forwards, whose
+  fusions stay inert without the Qwen3.5 setup, and every sequence-parallel
+  step stays sliced.
+
+FP8 fusions, installed for a Qwen3.5 target:
 - Fused attention output sigmoid-gate + per-token FP8 quantization
   (`pallas_sigmoid_gate_quant`) feeding the FP8 `o_proj`.
 - Pre-transposed GDN `in_proj_qkvz` FP8 weights
@@ -25,9 +35,8 @@ FP8 fusions, installed for every Qwen3Next / Qwen3.5 model:
 - 256-column-aligned FP8 router gate + shared_expert weights
   (`maybe_setup_fused_gate_se`).
 
-The sequence-parallel forwards, installed under TPU_MOE_SEQUENCE_PARALLEL=1,
-are copies of the upstream vLLM forwards restructured so torch.compile serves
-every bucket:
+The sequence-parallel forwards are copies of the upstream vLLM forwards
+restructured so torch.compile serves every bucket:
 - The model and the MTP drafter do not chunk their rows at entry. The first
   decoder layer (residual None) runs attention on the step's replicated rows;
   the reduce-scatter after attention leaves this rank's slice, and the
@@ -44,18 +53,19 @@ every bucket:
   structure (from bec1a1c91) compiles.
 - The pad before the reduce-scatter is eliminated: buckets divide by TP
   (`sequence_parallel.check_buckets`).
-- A step shorter than `sequence_parallel.min_rows()` (TPU_SP_MIN_ROWS) keeps
-  its rows replicated and all-reduces the attention output instead.
-- With TPU_SP_FP8_GATHER, the attention-side all-gather carries FP8 rows and
-  their scales, which the attention projections consume as pre-quantized input.
-- TPU_FUSE_PRE_ATTN_NORM_QUANT (default on, with TPU_SP_FP8_GATHER) computes
-  the input norm and that row quantization as one op. Replicated rows take it
-  only where every projection of the attention input is FP8 per-channel, so
-  the pre-quantized rows give the result the projections compute themselves.
-- TPU_FUSE_POST_ATTN_NORM_MOE (default on) computes the post-attention norm,
-  the router logits and the shared expert as one op for a MoE layer with the
-  fused FP8 gate/shared-expert weights; the routed experts take its normed
-  rows.
+- A step shorter than `sequence_parallel.min_rows()` keeps its rows
+  replicated and all-reduces the attention output instead (a Qwen3.5 target
+  only; the threshold is a per-layout table).
+- The attention-side all-gather carries FP8 rows and their scales
+  (`sequence_parallel.fp8_gather`), which the attention projections consume
+  as pre-quantized input (`apply_prequant`).
+- The fused pre-attention norm computes the input norm and that row
+  quantization as one op. Replicated rows take it only where every
+  projection of the attention input is FP8 per-channel, so the pre-quantized
+  rows give the result the projections compute themselves.
+- The fused post-attention norm computes the post-attention norm, the router
+  logits and the shared expert as one op for a MoE layer with the fused FP8
+  gate/shared-expert weights; the routed experts take its normed rows.
 - The MTP drafter forward gathers its last-token rows right after attention on
   speculative step 0 (`step0_post_attn_gather_context`).
 """
@@ -65,7 +75,7 @@ import functools
 import gc
 from collections.abc import Callable
 from itertools import islice
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import jax
 import jax.numpy as jnp
@@ -98,7 +108,11 @@ from vllm_torchtpu.layers.adapter.linear_common import (
     WEIGHT_FLIPPED_ATTR,
 )
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.models.qwen3_5 import settings as qwen3_5_settings
 from vllm_torchtpu.utils import synchronize_tensors
+
+if TYPE_CHECKING:
+    from vllm.config import ModelConfig
 
 logger = init_logger(__name__)
 
@@ -1160,7 +1174,7 @@ def _takes_prequant_rows(proj: Any) -> bool:
 
 
 def _mark_pre_attn_norm_quant(layer: Any) -> None:
-    """Record where `layer` may take TPU_FUSE_PRE_ATTN_NORM_QUANT.
+    """Record where `layer` may take the fused pre-attention norm + quantization.
 
     `_pre_norm_quant_eligible`: the input norm is a GemmaRMSNorm and the
     attention's main input projection takes pre-quantized rows, so the rows
@@ -1292,7 +1306,7 @@ def _fuses_pre_attn_norm_quant(
     layer: Any, hidden_states: torch.Tensor, input_is_sliced: bool
 ) -> bool:
     """Whether the input norm and the per-row FP8 quantization of its output
-    run as one op (TPU_FUSE_PRE_ATTN_NORM_QUANT) feeding attention prequant.
+    run as one op feeding attention prequant.
 
     Sliced rows are quantized for the FP8 all-gather anyway. Replicated rows
     otherwise reach attention unquantized, so they take the fused op only
@@ -1304,7 +1318,6 @@ def _fuses_pre_attn_norm_quant(
         and sequence_parallel.fp8_gather()
         and getattr(layer, "_pre_norm_quant_eligible", False)
         and (input_is_sliced or getattr(layer, "_pre_norm_quant_exact", False))
-        and envs.TPU_FUSE_PRE_ATTN_NORM_QUANT
     )
 
 
@@ -1328,13 +1341,12 @@ def _norm_quantize_rows(
 
 def _fuses_post_attn_norm_moe(layer: Any, hidden_states: torch.Tensor) -> bool:
     """Whether the post-attention norm, router gate and shared expert run as
-    one op (TPU_FUSE_POST_ATTN_NORM_MOE) ahead of the routed experts."""
+    one op ahead of the routed experts."""
     return (
         hidden_states.device.type == "tpu"
         and hidden_states.dtype == torch.bfloat16
         and getattr(layer.mlp, "_fused_gate_gu_fp8_weight", None) is not None
         and isinstance(layer.post_attention_layernorm, GemmaRMSNorm)
-        and envs.TPU_FUSE_POST_ATTN_NORM_MOE
     )
 
 
@@ -1614,17 +1626,29 @@ def _with_rank_tensor(original_init: Callable) -> Callable:
     return __init__
 
 
-def maybe_patch_qwen3_next(*args: object, **kwargs: object) -> None:
-    """Install the Qwen3Next / Qwen3.5 FP8 fusions, then the trace-stable
-    forwards when TPU_MOE_SEQUENCE_PARALLEL=1 or TPU_MTP_STEP0_POST_ATTN_GATHER=1.
+def maybe_patch_qwen3_next(model_config: "ModelConfig | None" = None) -> bool | None:
+    """Install the model patch for the engine's model (see the module
+    docstring): everything on a Qwen3.5 target; for any other model only the
+    trace-stable forwards, and only when TPU_MOE_SEQUENCE_PARALLEL=1.
 
     Off sequence-parallel the patched forwards match upstream except for the
-    MTP step-0 post-attention gather.
+    MTP step-0 post-attention gather. Returns False until a model config is
+    available, so the registry retries at the next lifecycle stage.
     """
-    install_qwen3_next_v6_patches()
+    if model_config is None:
+        return False
+    is_qwen3_5 = qwen3_5_settings.is_qwen3_5(model_config)
+    if is_qwen3_5:
+        install_qwen3_next_v6_patches()
+    elif not envs.TPU_MOE_SEQUENCE_PARALLEL:
+        return None
     from vllm.model_executor.models import qwen3_5_mtp
 
     if envs.TPU_MOE_SEQUENCE_PARALLEL:
+        if is_qwen3_5:
+            # The patched forwards slice a step's rows exactly when the runner
+            # marks it sequence-parallel, so small steps can run replicated.
+            sequence_parallel.follow_step_form()
         from vllm.model_executor.models import qwen3_5
 
         for layer_cls in (
@@ -1635,8 +1659,6 @@ def maybe_patch_qwen3_next(*args: object, **kwargs: object) -> None:
                 layer_cls.__init__, "_tpu_sp_rank_init", False
             ):
                 layer_cls.__init__ = _with_rank_tensor(layer_cls.__init__)
-    elif not envs.TPU_MTP_STEP0_POST_ATTN_GATHER:
-        return None
 
     if sequence_parallel.fp8_gather():
         # The FP8 all-gather's ops and the fused input norm + row quantization
