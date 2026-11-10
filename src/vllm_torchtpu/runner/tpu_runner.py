@@ -122,6 +122,7 @@ from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
 from vllm_torchtpu.layers.adapter import (
     dp_vocab_parallel,
     expert_placement,
+    gated_norm_quant_op,
     sequence_parallel,
     small_all_reduce_op,
     token_padding,
@@ -7262,6 +7263,8 @@ class TPUModelRunner(GPUModelRunner):
         )
         if self.is_pooling_model:
             self._resolve_static_pooler()
+        if envs.TPU_GDN_FUSED_NORM_QUANT:
+            gated_norm_quant_op.install(model)
         if self.parallel_config.pipeline_parallel_size > 1:
             # A sparse model's layers share one top-k index table, and under a
             # pipeline the layer that writes it and the layers that reuse it
