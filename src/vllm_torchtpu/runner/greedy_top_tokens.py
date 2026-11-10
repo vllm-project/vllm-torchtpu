@@ -1040,6 +1040,16 @@ def step_eligible(
     return True
 
 
+def topk_candidates_supported(owner: torch.nn.Module) -> bool:
+    """Whether ``owner``'s head can give packed top-32 candidates.
+
+    vLLM's LoRA wrapper forwards attribute lookups to the processor it wraps,
+    so ``get_topk_candidates`` would reach the base layer and drop the lm_head
+    LoRA delta; steps of such a model keep the full logits.
+    """
+    return not isinstance(owner.logits_processor, LogitsProcessorWithLoRA)
+
+
 def num_packed_candidates(owner: torch.nn.Module) -> int:
     """Total number of vocabulary-parallel candidates across TP ranks."""
     return LOCAL_TOPK_CANDIDATES * int(owner.lm_head.tp_size)

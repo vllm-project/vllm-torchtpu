@@ -10796,12 +10796,16 @@ class TPUModelRunner(GPUModelRunner):
         )
 
     def _topk_candidates_this_step(self) -> bool:
+        # As for the greedy top tokens, a request below min_tokens needs the
+        # full logits to mask its stops.
         return (
             self._greedy_head_owner is not None
             and envs.TPU_SAMPLER_TOPK_CANDIDATES > 0
+            and greedy_top_tokens.topk_candidates_supported(self._greedy_head_owner)
             and greedy_top_tokens.topk_candidates_step_eligible(
                 self.input_batch, self.requests
             )
+            and not self._min_tokens.any_in(self.input_batch.req_id_to_index)
         )
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
