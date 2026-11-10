@@ -121,6 +121,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_DCP_FINE_PREFIX: bool = False
     VLLM_TPU_QSA_DCP_FINE_PREFIX_SEQ_TAIL: bool = False
     VLLM_TPU_QSA_PREFILL_LEAN: bool = False
+    VLLM_TPU_QSA_PREFILL_PREFIX_PAGES: bool = False
     VLLM_TPU_QSA_MAIN_KV_DCP: int = 0
     VLLM_TPU_QSA_DCP_PREFILL_QUERY_BLOCK: int = 1024
     VLLM_TPU_QSA_DCP_PREFILL_QUERY_TILE: int = 256
@@ -844,6 +845,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # qwen4_exp QSA sparse prefill: skip the FP8 key finite/written guard,
     # which the score mask select already covers (bit-identical output).
     "VLLM_TPU_QSA_PREFILL_LEAN": env_bool("VLLM_TPU_QSA_PREFILL_LEAN"),
+    # qwen4_exp QSA sparse prefill: when a step's selections and causal lengths
+    # fit a page-table prefix, build the selection metadata (bitset, active
+    # tiles) over that prefix instead of max_model_len (bit-identical).
+    "VLLM_TPU_QSA_PREFILL_PREFIX_PAGES": env_bool("VLLM_TPU_QSA_PREFILL_PREFIX_PAGES"),
     # Main KV of the target QSA layers split over TP rank pairs that share a
     # KV head (2; 0/1 = off): each rank stores and attends half the tokens,
     # the pair's partial attention is LSE-combined.
