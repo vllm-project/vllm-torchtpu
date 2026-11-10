@@ -1046,6 +1046,7 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         self.assertAllClose(actual, expected, atol=0.2, rtol=0.2)
         self.assertTrue(_assert_cache_equal(actual_kvc, expected_kvc).item())
 
+    @parameterized.product(
     @parameterized.product(tuned_tiles=[False, True])
     def test_ragged_paged_attention_tuned_tiles(self, tuned_tiles):
         """The wrapper's own tiles, with and without the tuned rules, at a
