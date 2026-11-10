@@ -61,15 +61,12 @@ def register_tpu_platform() -> str:
 
 
 def _install_qx_fastcall() -> None:
-    """Installs the torch.compile hooks the QX_* variables enable."""
-    import os
+    """Installs the torch.compile hook that additional_config["tpu_compile"]
+    arms. It does nothing until the worker applies those options (all off by
+    default; see compilation/compile_options.py)."""
+    from vllm_torchtpu._qx_fastcall import install
 
-    fast = os.environ.get("QX_FAST_COMPILED_CALL", "1") == "1"
-    drop_global_state = os.environ.get("QX_TPU_DROP_GLOBAL_STATE_GUARD", "1") == "1"
-    if fast or drop_global_state:
-        from vllm_torchtpu._qx_fastcall import install
-
-        install(fast=fast, drop_global_state=drop_global_state)
+    install()
 
 
 # Every vLLM process imports this module to resolve its platform, and every
