@@ -23,6 +23,7 @@ from vllm.model_executor.models.config import (
     Qwen3_5ForConditionalGenerationConfig,
 )
 
+from vllm_torchtpu import additional_config_sections
 from vllm_torchtpu.models.qwen3_5 import settings
 from vllm_torchtpu.models.qwen3_5.hooks import TPUQwen35MoeConfig
 from vllm_torchtpu.models.vllm import register_models
@@ -257,12 +258,13 @@ def test_our_model_resolves_through_the_hook(restore_config_map):
     assert cfg.cache_config.kv_cache_memory_bytes == 33_500_000_000 + CREDIT_EP8
 
 
-@pytest.mark.parametrize(
-    "key", ["tpu_pp_scheduler", "tpu_scheduler", "tpu_multiport_dp", "tpu_typo"]
-)
+# Names no change will register: real section names (tpu_scheduler, ...) stop
+# being "unread" once their change lands in the same tree.
+@pytest.mark.parametrize("key", ["tpu_typo", "tpu_not_a_section"])
 def test_unread_tpu_section_fails_at_engine_start(key):
     """A tpu_* section no reader in this build claims would be ignored by
     vLLM; the hook refuses it and names the sections it reads."""
+    assert key not in additional_config_sections.KNOWN_SECTIONS
     with pytest.raises(ValueError, match=rf"section\(s\) \['{key}'\].*qwen3_5"):
         _run_hook(_vllm_config(additional={key: {"x": 1}}))
 
