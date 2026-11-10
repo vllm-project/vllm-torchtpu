@@ -14,12 +14,12 @@
 """Tests for the per-worker NUMA bind: it narrows the inherited CPU set to the
 chip's node and never widens it."""
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 
-from vllm_torchtpu import envs
-from vllm_torchtpu.worker import numa_bind
+from vllm_torchtpu.worker import numa_bind, worker_options
 
 _NODE1_CPUS = "56-111,168-223"
 
@@ -136,10 +136,60 @@ def test_parse_cpulist():
     assert numa_bind.parse_cpulist("0-3,8,10-11\n") == [0, 1, 2, 3, 8, 10, 11]
 
 
-@pytest.mark.parametrize("value, expected", [(None, True), ("1", True), ("0", False)])
-def test_env_flag_defaults_on(monkeypatch, value, expected):
-    if value is None:
-        monkeypatch.delenv("TPU_WORKER_NUMA_BIND", raising=False)
-    else:
-        monkeypatch.setenv("TPU_WORKER_NUMA_BIND", value)
-    assert envs.environment_variables["TPU_WORKER_NUMA_BIND"]() is expected
+def _worker(section, *, local_world_size=4, dp_local=None):
+    additional = {} if section is None else {"tpu_worker": section}
+    return SimpleNamespace(
+        vllm_config=SimpleNamespace(additional_config=additional),
+        parallel_config=SimpleNamespace(
+            local_world_size=local_world_size, data_parallel_size_local=dp_local
+        ),
+    )
+
+
+@pytest.mark.parametrize("section", [None, {}, {"numa_bind": False}])
+def test_bind_is_off_by_default(section):
+    from vllm_torchtpu.worker.tpu_worker import TPUWorker
+
+    with patch("vllm_torchtpu.worker.tpu_worker.bind_to_chip_numa_node") as bind:
+        TPUWorker._maybe_bind_numa(_worker(section), 3, dp_size=1)
+    bind.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "dp_size, dp_local, expected_ranks",
+    [
+        (1, None, 4),  # one engine: its local ranks
+        (2, 2, 8),  # two host-local DP engines share the host's chips
+        (4, None, 16),  # DP size stands in for an unset local DP size
+    ],
+)
+def test_bind_counts_the_hosts_workers(dp_size, dp_local, expected_ranks):
+    from vllm_torchtpu.worker.tpu_worker import TPUWorker
+
+    worker = _worker({"numa_bind": True}, dp_local=dp_local)
+    with patch("vllm_torchtpu.worker.tpu_worker.bind_to_chip_numa_node") as bind:
+        TPUWorker._maybe_bind_numa(worker, 3, dp_size=dp_size)
+    bind.assert_called_once_with(3, expected_ranks)
+
+
+@pytest.mark.parametrize(
+    "raw, message",
+    [
+        ({"numa_bind": 1}, "must be a bool"),
+        ({"numa": True}, "unknown keys"),
+        ("on", "must be a JSON object"),
+    ],
+)
+def test_worker_options_are_strict(raw, message):
+    with pytest.raises(ValueError, match=message):
+        worker_options.parse(raw)
+
+
+def test_worker_section_is_kept_out_of_the_compile_cache_key():
+    from vllm_torchtpu.runner.utils import (
+        HASH_IGNORED_ADDITIONAL_CONFIG_KEYS,
+        WORKER_OPTIONS_SECTION,
+    )
+
+    assert worker_options.SECTION == WORKER_OPTIONS_SECTION
+    assert WORKER_OPTIONS_SECTION in HASH_IGNORED_ADDITIONAL_CONFIG_KEYS

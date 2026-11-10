@@ -55,6 +55,7 @@ from vllm_torchtpu.layers.adapter.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.runner.tpu_pooling import compute_pooling_kv_cache_cap_bytes
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+from vllm_torchtpu.worker import worker_options
 from vllm_torchtpu.worker.numa_bind import bind_to_chip_numa_node
 from vllm_torchtpu.worker.runai_repull import ensure_runai_aux_files
 from vllm_torchtpu.worker.tpu_rank_binding import get_tpu_worker_binding
@@ -196,6 +197,16 @@ class TPUWorker(WorkerBase):
         self.cache_config.num_gpu_blocks = num_gpu_blocks
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
+    def _maybe_bind_numa(self, native_local_rank: int, dp_size: int) -> None:
+        """Bind this worker to its chip's NUMA node when
+        ``tpu_worker.numa_bind`` is on. The host's workers are this engine's
+        local ranks times its host-local DP engines."""
+        if not worker_options.get(self.vllm_config).numa_bind:
+            return
+        pc = self.parallel_config
+        dp_size_local = (pc.data_parallel_size_local or dp_size) if dp_size > 1 else 1
+        bind_to_chip_numa_node(native_local_rank, pc.local_world_size * dp_size_local)
+
     def init_device(self):
         # vLLM's MultiprocExecutor passes per-engine rank/local_rank as
         # constructor args. Native vLLM DP keeps those values local to the DP
@@ -226,13 +237,7 @@ class TPUWorker(WorkerBase):
         self.profile_rank = binding.rank
         self.profile_world_size = binding.world_size
         # Before the runtime starts, so its threads and buffers follow.
-        if envs.TPU_WORKER_NUMA_BIND:
-            dp_size_local = (
-                (pc.data_parallel_size_local or dp_size) if dp_size > 1 else 1
-            )
-            bind_to_chip_numa_node(
-                binding.native_local_rank, pc.local_world_size * dp_size_local
-            )
+        self._maybe_bind_numa(binding.native_local_rank, dp_size)
         if dp_size > 1:
             per_engine_world = pc.world_size
             dp_rank = binding.dp_rank
