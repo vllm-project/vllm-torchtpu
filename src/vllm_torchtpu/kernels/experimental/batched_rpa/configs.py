@@ -179,6 +179,7 @@ class ServingConfigs:
     attention_scope: AttentionScope = AttentionScope.FULL
     return_lse: bool = False
     skip_kv_update: bool = False
+    mask_invalid_v: bool | None = None
     # Run the DECODE kernel's matmuls natively in the fp8 KV dtype instead of
     # dequantizing K / V: "qk" quantizes q per (token, head) row, "pv"
     # quantizes the softmax weights per row, "qkpv" does both. A "2" after
@@ -186,6 +187,14 @@ class ServingConfigs:
     # residual halves stacked along the matmul rows (~bf16 accuracy for 2x
     # LHS rows). Empty: off.
     native_fp8: str = ""
+
+    def __post_init__(self):
+        if self.mask_invalid_v is None:
+            object.__setattr__(
+                self,
+                "mask_invalid_v",
+                self.kv_layout == KVLayout.SEQ_ALONG_LANE,
+            )
 
     def native_fp8_split(self, which: str) -> bool:
         """Whether the native fp8 `which` operand is split into hi/lo halves."""

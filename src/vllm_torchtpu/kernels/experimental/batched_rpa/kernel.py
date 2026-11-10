@@ -233,7 +233,7 @@ class StitchMetadata:
     bkv_sz_frm_new: list[jax.Array]
     new_kv_len_start: list[jax.Array]
     # CACHE_ONLY: rank-local end of the attended KV, relative to the block. The
-    # stitch and the in-place V zeroing both stop there.
+    # stitch stops there.
     local_k_end: list[jax.Array] | None = None
 
 
@@ -473,65 +473,6 @@ def _mask_unattended_v(
     return new_v, new_v_scale
 
 
-def _zero_unattended_v_lanes(
-    kv_in_vref: jax.Ref,
-    stitch_meta: StitchMetadata,
-    *,
-    cfgs: configs.RpaConfigs,
-):
-    """Zeroes, in VMEM, the V lanes at or past the last attended KV token.
-
-    SEQ_ALONG_LANE counterpart of `_mask_unattended_v`, for scopes without a
-    `local_k_start` (FULL and CACHE_ONLY), where every unattended token of a
-    lane lies in the suffix ``[hi, bkv_sz)``. The 128-lane column holding
-    ``hi`` is rewritten by `stitch_utils._stitch_decode_lane`, which zeroes
-    its lanes past the last valid token, so only the whole columns after it
-    are stored here, with zeros and without reading them. A full KV block
-    costs no vector work. The per-token v_scale rows sit in the same V head
-    rows and are zeroed with them.
-
-    Zeroing in place (rather than selecting on the loaded V) is safe for the KV
-    writeback: lanes past ``hi`` are past the sequence's end (or its
-    rank-local end), which the decode stitch already zero-fills on writeback.
-    It is also what makes the per-call zeroing of every KV VMEM buffer
-    unnecessary: lanes the step did not fetch can hold anything, and they are
-    exactly the lanes the stitch and this function zero.
-    """
-    num_lanes = pltpu.get_tpu_info().num_lanes
-    for b in range(cfgs.batch_size):
-        hi = stitch_meta.bkv_sz_frm_cache[b] + stitch_meta.bkv_sz_frm_new[b]
-        if stitch_meta.local_k_end is not None:
-            hi = jnp.minimum(hi, stitch_meta.local_k_end[b])
-        # Row r of `flat` is lane column (r % lanes_per_col) of u32 word row
-        # (r // lanes_per_col), as in `stitch_utils._stitch_decode_lane`.
-        flat = kv_in_vref.at[b].bitcast(jnp.uint32).reshape(-1, num_lanes)
-        zero_v_lanes_from(flat, hi, cfgs=cfgs)
-
-
-def zero_v_lanes_from(flat: jax.Ref, hi: jax.Array, *, cfgs: configs.RpaConfigs):
-    """Zeroes every V head's whole lane columns past the one holding `hi`.
-
-    `flat` is the lane's SEQ_ALONG_LANE buffer viewed as u32 [-1, num_lanes].
-    Lanes at or past `hi` in the column holding it are the stitch's to zero
-    (see `_zero_unattended_v_lanes`).
-    """
-    num_lanes = pltpu.get_tpu_info().num_lanes
-    lanes_per_col = cfgs.kv_vmem_lanes // num_lanes
-    n_cols = cfgs.bkv_sz // num_lanes
-    pack_dim = cfgs.aligned_kv_head_dim // cfgs.serve.packing_kv
-    zeros = jnp.zeros((pack_dim, num_lanes), jnp.uint32)
-
-    hi = jnp.clip(hi, 0, cfgs.bkv_sz).astype(jnp.int32)
-    first_full_col = pl.cdiv(hi, num_lanes)
-
-    for kv_head in range(cfgs.model.num_kv_heads):
-        base = (kv_head * 2 + 1) * pack_dim * lanes_per_col
-
-        @pl.loop(first_full_col, n_cols)
-        def _full_cols(c, base=base):
-            flat[pl.ds(base + c, pack_dim, lanes_per_col)] = zeros
-
-
 def block_fully_visible(
     step_meta: ComputeMetadata, cfgs: configs.RpaConfigs
 ) -> jax.Array | None:
@@ -642,18 +583,6 @@ def rpa_body(
 
         start_kv_writeback()
 
-        # Inside the fence, so these stores land before the K/V loads below.
-        # With `no_hazard_no_deps` nothing orders them against the stitch
-        # stores above, so they must not touch a lane the stitch writes with
-        # anything but zero: they only store zeros into whole columns past the
-        # one holding the last valid token, which the stitch rewrites itself,
-        # and never read. The writeback issued above ends with that column.
-        if (
-            _zeroes_v_in_place(cfgs)
-            and cfgs.block.bq_sz <= pltpu.get_tpu_info().num_lanes
-        ):
-            _zero_unattended_v_lanes(kv_in_vref, stitch_meta, cfgs=cfgs)
-
     start_next_fetch()
 
     # Step 2a: Fetch mask metadata after the fence to overlap with compute and
@@ -693,22 +622,6 @@ def rpa_body(
     @pl.when(jnp.logical_not(full))
     def _masked():
         run_step(apply_mask=True)
-
-
-def _zeroes_v_in_place(cfgs: configs.RpaConfigs) -> bool:
-    """Reports whether unattended V lanes are zeroed in VMEM, not on the loaded V.
-
-    SEQ_ALONG_LANE scopes without a `local_k_start` (FULL and CACHE_ONLY) keep
-    every unattended token of a lane in a suffix, which the decode path zeroes
-    with `_zero_unattended_v_lanes` and `stitch_utils._stitch_prefill_lane`
-    zeroes while stitching. Every other case masks the loaded V with
-    `_mask_unattended_v`.
-    """
-    return (
-        cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE
-        and cfgs.serve.attention_scope != configs.AttentionScope.NEW_TOKENS_ONLY
-        and cfgs.serve.dtype_kv != jnp.uint8
-    )
 
 
 def _rpa_step(
@@ -856,9 +769,9 @@ def _rpa_step(
     # matmul, and those rows can hold anything: page tails past the (rank-local)
     # KV length, lanes with no sequence, or unfetched VMEM. In the unified
     # hybrid pool a recycled page's tail still holds Mamba state bytes, many of
-    # which decode to fp8 NaN. SEQ_ALONG_LANE without a `local_k_start` zeroes
-    # them in VMEM instead, before this load (`_zeroes_v_in_place`).
-    if not _zeroes_v_in_place(cfgs):
+    # which decode to fp8 NaN. With `mask_invalid_v` the loads above already
+    # zeroed exactly these rows (`_compute_valid_kv_mask`, same predicate).
+    if not cfgs.serve.mask_invalid_v:
         v, v_scale = _mask_unattended_v(v, v_scale, stitch_meta, step_meta, cfgs=cfgs)
 
     # Step 3: Perform compute.
@@ -1178,7 +1091,7 @@ def rpa_kernel(
             # not NaNs, there will be no numeric concerns.
             #
             # Every step zeroes the V rows its lanes do not attend to
-            # (`_zero_unattended_v_lanes` / `_mask_unattended_v`), and NaNs in
+            # (`mask_invalid_v` or `_mask_unattended_v`), and NaNs in
             # unattended K only reach masked scores, which `jnp.where` replaces.
             # So the KV buffers (~27 MB of VMEM for decode, a fixed few us per
             # call) stay unzeroed unless TPU_RPA_ZERO_KV_VMEM=1.
@@ -1237,18 +1150,8 @@ def rpa_kernel(
 
                     total_steps = num_steps + prefix_steps
                     kv_bound = kv_cache_alloc.bind(
-                        src_ref=(
-                            kv_cache_hbm_ref,
-                            new_kv_hbm_ref,
-                            schedule_ref,
-                            page_indices_ref,
-                        ),
-                        dst_ref=(
-                            kv_cache_hbm_ref,
-                            new_kv_hbm_ref,
-                            schedule_ref,
-                            page_indices_ref,
-                        ),
+                        src_ref=(kv_cache_hbm_ref, new_kv_hbm_ref, schedule_ref),
+                        dst_ref=(kv_cache_hbm_ref, new_kv_hbm_ref, schedule_ref),
                     )
                     q_bound = q_alloc.bind(src_ref=(q_hbm_ref, schedule_ref))
                     o_bound = o_alloc.bind(dst_ref=(o_hbm_ref, schedule_ref))
