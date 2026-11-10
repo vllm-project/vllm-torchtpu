@@ -1005,6 +1005,57 @@ def test_cat768_fp8_fusion_and_weight_deletion():
         assert cos_moe > 0.999, f"cos_moe={cos_moe}"
 
 
+def test_the_shared_expert_gate_weight_takes_a_host_round_trip(monkeypatch):
+    """The fused shared-expert gate weight is copied through host memory: on
+    TPU an on-device copy of the [1, hidden] gate can alias the buffer behind
+    the [hidden] parameter, and a host round trip cannot. On the host the
+    round trip shows as the .cpu() of the [hidden] gate row; the fused weight
+    keeps the gate's values."""
+    torch.manual_seed(0)
+    hidden_dim, n_gate, n_inter = 512, 128, 64
+
+    def linear(name, weight, scale=None):
+        mod = nn.Module()
+        mod.register_parameter(name, nn.Parameter(weight, requires_grad=False))
+        if scale is not None:
+            mod.register_parameter(
+                "weight_scale", nn.Parameter(scale, requires_grad=False)
+            )
+            setattr(mod, WEIGHT_FLIPPED_ATTR, True)
+        mod.bias = None
+        return mod
+
+    def fp8(shape):
+        return (torch.randn(*shape) * 0.02).to(torch.float8_e4m3fn)
+
+    w_se_gate = torch.randn(1, hidden_dim, dtype=torch.bfloat16) * 0.02
+    moe = nn.Module()
+    moe.gate = linear("weight", torch.randn(n_gate, hidden_dim, dtype=torch.bfloat16))
+    moe.shared_expert = SimpleNamespace(
+        gate_up_proj=linear(
+            "weight", fp8((hidden_dim, 2 * n_inter)), torch.ones(2 * n_inter)
+        ),
+        down_proj=linear("weight", fp8((n_inter, hidden_dim)), torch.ones(hidden_dim)),
+        act_fn=F.silu,
+    )
+    moe.shared_expert_gate = linear("weight", w_se_gate.clone())
+
+    round_trips: list[tuple[int, ...]] = []
+    tensor_cpu = torch.Tensor.cpu
+
+    def cpu(self, *args, **kwargs):
+        if self.ndim == 1 and self.dtype == torch.bfloat16:
+            round_trips.append(tuple(self.shape))
+        return tensor_cpu(self, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "cpu", cpu)
+    assert maybe_setup_fused_gate_se(moe) is True
+    assert round_trips == [(hidden_dim,)]
+    torch.testing.assert_close(
+        moe._fused_se_gate_weight.data, w_se_gate.reshape(hidden_dim), rtol=0, atol=0
+    )
+
+
 def _bf16_jnp(t: torch.Tensor):
     import jax.numpy as jnp
 
