@@ -17,6 +17,7 @@ Bridge the torch gdn_attention_core op for gated deltanet attention TPU impl
 """
 
 import functools
+from types import ModuleType
 
 import jax
 import jax.numpy as jnp
@@ -25,6 +26,7 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
 from vllm import envs
 
+from vllm_torchtpu.gdn_pool_layout import QWEN_GDN_ARCHITECTURES
 from vllm_torchtpu.kernels.experimental.gdn_pcp_fused import (
     pcp_wrapper as gdn_pcp_fused_wrapper,
 )
@@ -36,6 +38,24 @@ from vllm_torchtpu.kernels.gdn.v3 import wrapper as gdn_v3_wrapper
 from vllm_torchtpu.utils import get_mesh_shape_product
 
 _GDN_TP_AXIS_NAME = "tp"
+
+
+def gdn_kernel_wrapper(architecture: str | None) -> ModuleType:
+    """Return the fused Conv1D-GDN v3 wrapper module that serves `architecture`.
+
+    The Qwen GDN architectures (`QWEN_GDN_ARCHITECTURES`) run the copy in
+    `models/qwen3_5/kernels/gdn`, which carries the Qwen3.5 GDN v3 changes.
+    Every other architecture, and a caller that passes no architecture, runs
+    the shared kernel in `kernels/gdn/v3` unchanged. This is the only place
+    that chooses between the two; the copy is imported only when chosen.
+    """
+    if architecture in QWEN_GDN_ARCHITECTURES:
+        from vllm_torchtpu.models.qwen3_5.kernels.gdn import (
+            wrapper as qwen3_5_gdn_wrapper,
+        )
+
+        return qwen3_5_gdn_wrapper
+    return gdn_v3_wrapper
 
 
 def _gdn_tp_axis_name(mesh: jax.sharding.Mesh) -> str | None:
@@ -73,6 +93,7 @@ def run_jax_gdn_attention(
     kernel_size: int,
     mesh: jax.sharding.Mesh,
     num_spec_tokens: int = 0,
+    architecture: str | None = None,
 ) -> tuple[tuple[jnp.ndarray, jnp.ndarray], jnp.ndarray]:
     """Runs the Jax GDN attention mechanism.
 
@@ -106,6 +127,8 @@ def run_jax_gdn_attention(
         d_v: Dimension of value.
         kernel_size: Convolution kernel size.
         mesh: The device mesh for distributed computation.
+        architecture: The model architecture; selects the kernel through
+          `gdn_kernel_wrapper`.
 
     Returns:
         A tuple containing:
@@ -147,7 +170,7 @@ def run_jax_gdn_attention(
     tp_size = get_mesh_shape_product(mesh, "model")
 
     p_run_jax_gdn_attention_local = functools.partial(
-        gdn_v3_wrapper.fused_conv1d_gdn,
+        gdn_kernel_wrapper(architecture).fused_conv1d_gdn,
         n_kq=n_kq // tp_size,
         n_v=n_v // tp_size,
         d_k=d_k,
@@ -848,6 +871,7 @@ def run_jax_gdn_attention_pooled_local(
     pool_block_tokens: int,
     recurrent_state_dtype: jnp.dtype = jnp.float32,
     num_spec_tokens: int = 0,
+    architecture: str | None = None,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """GDN attention over the unified block pool.
 
@@ -861,7 +885,7 @@ def run_jax_gdn_attention_pooled_local(
     pool_shape = recurrent_state.shape
     pool = _as_logical_block_pool(recurrent_state, pool_block_tokens)
 
-    pool, output = gdn_v3_wrapper.fused_conv1d_gdn(
+    pool, output = gdn_kernel_wrapper(architecture).fused_conv1d_gdn(
         mixed_qkv,
         b,
         a,
@@ -917,6 +941,7 @@ def run_jax_gdn_attention_pooled(
     num_spec_tokens: int = 0,
     prefill_ckpt_offsets: jnp.ndarray | None = None,
     prefill_ckpt_indices: jnp.ndarray | None = None,
+    architecture: str | None = None,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Runs GDN attention over the unified block pool, sharded on the mesh.
 
@@ -1026,6 +1051,7 @@ def run_jax_gdn_attention_pooled(
         pool_block_tokens=pool_block_tokens,
         num_spec_tokens=num_spec_tokens,
         recurrent_state_dtype=recurrent_state_dtype,
+        architecture=architecture,
     )
     mapped_fn = jax.shard_map(
         p_run_jax_gdn_attention_pooled_local,
