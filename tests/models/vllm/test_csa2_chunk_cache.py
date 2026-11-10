@@ -67,7 +67,6 @@ def test_swa_and_main_share_word_pool(monkeypatch, split):
         "cpu",
         KVCacheLayout.LBHNC,
         word_rows=True,
-        csa2_layers=frozenset(("main",)),
     )
     raw = materialized.native_raw_cache["swa"]
     assert raw is materialized.native_raw_cache["main"]

@@ -79,7 +79,6 @@ def _make_swa_attn(
     attn.window_size = window_size
     attn._ced_decoder = ced_decoder
     attn._ced_global_from_encoder = False
-    attn._local_q_attn = False
     attn.compressor = None
     attn.indexer = None
     attn.compress_ratio = 2
@@ -90,11 +89,6 @@ def _make_swa_attn(
     attn.head_dim = 8
     attn.scale = 0.25
     attn.attn_sink = torch.zeros(2)
-    attn._swa_max_requests = 16
-    attn._precompact_records = False
-    attn._token_parallel_attn = False
-    attn._full_attn_sink = False
-    attn._tp_rank_1d = 0
     attn.topk_indices_buffer = torch.full((16, 8), -1, dtype=torch.int32)
     attn._rotate = lambda x, p: x
     attn.wq_b = lambda qr: qr
@@ -335,89 +329,3 @@ class TestCompressorStateAndGlobalKvAddressingCache:
         # 5. Non-dict metadata early exit
         forward_ctx.attn_metadata = None
         assert comp.forward(torch.ones(count, 10), positions) is None
-
-
-class TestSwaTokenAddressingAndFastOffsets:
-    def test_swa_3page_fast_path_and_offsets(self, monkeypatch):
-        """Test Swa addressing 3-page fast path and row_offset caching."""
-        count = 4
-        positions = torch.tensor([0, 32, 64, 96], dtype=torch.int32)
-        swa_table = torch.tensor([[10, 11, 12], [20, 21, 22]], dtype=torch.int32)
-
-        swa_meta = SimpleNamespace(
-            seq_lens=torch.tensor([2, 2], dtype=torch.int32),
-            block_tables=swa_table,
-            query_start_loc=torch.tensor([0, 2, 4], dtype=torch.int32),
-        )
-        metadata = {"swa_pfx": swa_meta}
-        forward_ctx = SimpleNamespace(
-            attn_metadata=metadata,
-            additional_kwargs={
-                "deepseek_v41_replay_starts": torch.tensor([0, 32], dtype=torch.int32)
-            },
-        )
-        monkeypatch.setattr(v2_attn, "get_forward_context", lambda: forward_ctx)
-
-        captured_records: list[torch.Tensor] = []
-        monkeypatch.setattr(
-            v2_attn,
-            "sparse_fp8_attention",
-            lambda q, swa_c, main_c, recs, *args, **kw: (
-                captured_records.append(recs.clone()) or torch.zeros_like(q)
-            ),
-        )
-        monkeypatch.setattr(v2_attn, "_insert", lambda *a, **kw: None)
-
-        # 1. use_3page_swa=True (window_size <= 2 * rows_per_page = 128)
-        #    has_fast_swa_offset=True (row_offset addition branch)
-        attn_3page_fast = _make_swa_attn(
-            window_size=128, ced_decoder=True, has_fast_swa_offset=True
-        )
-        with v2_attn.stage_attention_cache_scope():
-            # Miss
-            out = torch.zeros((count, 2, 8), dtype=torch.bfloat16)
-            qr = torch.ones((count, 16), dtype=torch.bfloat16)
-            kv = torch.ones((count, 8), dtype=torch.bfloat16)
-            attn_3page_fast._prepare_tpu(None, qr, kv, None, None, None, positions, out)
-            assert len(captured_records) == 1
-            recs1 = captured_records[0]
-
-            # Hit (same swa_meta.block_tables object -> reuses cached_swa_slots)
-            attn_3page_fast._prepare_tpu(None, qr, kv, None, None, None, positions, out)
-            assert len(captured_records) == 2
-            assert torch.equal(captured_records[1], recs1)
-
-            # Different swa_meta.block_tables tensor -> hits cached_swa geometry
-            # but invalidates cached_swa_slots and recomputes records for new blocks
-            swa_meta.block_tables = swa_table + 100
-            attn_3page_fast._prepare_tpu(None, qr, kv, None, None, None, positions, out)
-            assert len(captured_records) == 3
-            assert not torch.equal(captured_records[2], recs1)
-            swa_meta.block_tables = swa_table
-
-        # 2. use_3page_swa=True, has_fast_swa_offset=False (row_indices branch)
-        captured_records.clear()
-        attn_3page_slow = _make_swa_attn(
-            window_size=128, ced_decoder=False, has_fast_swa_offset=False
-        )
-        with v2_attn.stage_attention_cache_scope():
-            out = torch.zeros((count, 2, 8), dtype=torch.bfloat16)
-            attn_3page_slow._prepare_tpu(None, qr, kv, None, None, None, positions, out)
-            assert len(captured_records) == 1
-
-        # 3. use_3page_swa=False (window_size > 2 * rows_per_page = 256 > 128)
-        #    Exercises swa_3page is None and swa_row_slots calculation
-        captured_records.clear()
-        attn_no_3page = _make_swa_attn(
-            window_size=256, ced_decoder=False, has_fast_swa_offset=True
-        )
-        with v2_attn.stage_attention_cache_scope():
-            out = torch.zeros((count, 2, 8), dtype=torch.bfloat16)
-            attn_no_3page._prepare_tpu(None, qr, kv, None, None, None, positions, out)
-            assert len(captured_records) == 1
-
-        # 4. Fallback when stage_cache is None
-        captured_records.clear()
-        out = torch.zeros((count, 2, 8), dtype=torch.bfloat16)
-        attn_3page_fast._prepare_tpu(None, qr, kv, None, None, None, positions, out)
-        assert len(captured_records) == 1

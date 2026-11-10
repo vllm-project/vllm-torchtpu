@@ -171,13 +171,11 @@ class IndexerCache(NativeCacheView, upstream.DeepseekV4IndexerCache):
     def kv_cache(self, cache):
         self._bound_cache = cache
 
-    def bind_kv_cache(
-        self, cache, *, raw_cache=None, layout=None, rope_pool=None, scale_pool=None
-    ):
+    def bind_kv_cache(self, cache, *, raw_cache=None, layout=None, scale_pool=None):
         if raw_cache is None or layout is None:
             raise ValueError("Index-K requires an explicit native owner/layout")
-        if rope_pool is not None or scale_pool is not None:
-            raise ValueError("Index-K owners cannot have RoPE or scale companions")
+        if scale_pool is not None:
+            raise ValueError("Index-K owners cannot have scale companions")
         cache_type = PackedFP8IndexCacheRows if self.packed_fp8 else IndexCacheRows
         bound = cache_type(raw_cache, layout)
         if isinstance(bound, PackedFP8IndexCacheRows):
