@@ -202,7 +202,9 @@ def test_replicated_sequence_parallel_rows_under_data_parallelism(
     result = getattr(communicator, method)(*tensors, is_sequence_parallel=True)
     if method == "combine":
         dp_group.reduce_scatter.assert_called_once_with(tensors[0], dim=0)
-        tp_group.all_reduce.assert_called_once_with(dp_group.reduce_scatter.return_value)
+        tp_group.all_reduce.assert_called_once_with(
+            dp_group.reduce_scatter.return_value
+        )
         assert result is tp_group.all_reduce.return_value
         dp_group.all_gather.assert_not_called()
     else:
