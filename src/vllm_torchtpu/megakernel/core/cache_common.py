@@ -192,7 +192,7 @@ def should_fuse_pool_io(
     ms = resolve_model_spec(model_spec)
     pb = require_pool_backend(ms)
     if fused_pool_io is None:
-        want_fused = bool(cache_exec(ex).fused_pool_io)
+        want_fused = cache_exec(ex).fused_pool_io
         explicit_true = want_fused
     elif isinstance(fused_pool_io, bool):
         want_fused = fused_pool_io
@@ -206,7 +206,7 @@ def should_fuse_pool_io(
             want_fused = False
             explicit_true = False
         elif s == "auto":
-            want_fused = bool(int(max_b_low) >= ex.B or int(min_b_hi) <= ex.B)
+            want_fused = max_b_low >= ex.B or min_b_hi <= ex.B
             explicit_true = False
         else:
             raise ValueError(

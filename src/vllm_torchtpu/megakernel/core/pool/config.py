@@ -98,14 +98,12 @@ class CacheExec:
 
     @property
     def FUSED(self) -> bool:
-        return bool(self.paged_kv and self.fused_pool_io)
+        return self.paged_kv and self.fused_pool_io
 
     @property
     def GPR(self) -> bool:
         """In-kernel recurrent gather on (after `pool_gather` resolves to `True`)."""
-        return bool(
-            self.paged_kv and not self.fused_pool_io and self.pool_gather is True
-        )
+        return self.paged_kv and not self.fused_pool_io and self.pool_gather is True
 
 
 DEFAULT_CACHE_EXEC = CacheExec()

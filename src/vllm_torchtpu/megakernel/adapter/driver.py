@@ -68,6 +68,7 @@ from vllm_torchtpu.megakernel.core.runtime.contract import (
     Bucket,
     Decline,
     EligibilityResult,
+    LayoutDecline,
     StepFn,
 )
 
@@ -122,7 +123,7 @@ def _get_pallas_mesh_fn() -> Any:
 def check_mesh_size(tp_size: int, mesh_size: int) -> EligibilityResult | None:
     """`mesh_size_mismatch` when the TP-rank mesh doesn't hold `tp_size`
     devices (`None` if it does). The chip and the TP size are `check_spec`'s."""
-    if int(mesh_size) != int(tp_size):
+    if mesh_size != tp_size:
         msg = (
             f"Megakernel TP-rank mesh has {mesh_size} devices, "
             f"expected {tp_size}; skipping."
@@ -161,7 +162,7 @@ def _build_tp_rank_mesh(r_cnt: int, fallback_mesh: Any = None) -> Any:
             raise MeshDecline(
                 EligibilityResult(False, "pallas_mesh_unavailable", msg)
             ) from exc
-        n_dev = int(pallas_mesh.devices.size)
+        n_dev = pallas_mesh.devices.size
         axes = tuple(pallas_mesh.axis_names)
         if n_dev != r_cnt or axes != ("tp",):
             msg = (
@@ -171,7 +172,7 @@ def _build_tp_rank_mesh(r_cnt: int, fallback_mesh: Any = None) -> Any:
             raise MeshDecline(EligibilityResult(False, "pallas_mesh_mismatch", msg))
         return pallas_mesh
     fb_devs = getattr(fallback_mesh, "devices", None)
-    if fb_devs is not None and int(fb_devs.size) == r_cnt:
+    if fb_devs is not None and fb_devs.size == r_cnt:
         if tuple(fallback_mesh.axis_names) == ("tp",):
             return fallback_mesh
         return jax.sharding.Mesh(np.asarray(fb_devs).reshape(-1), ("tp",))
@@ -185,8 +186,8 @@ def _local_tp_rank() -> int:
     except ImportError:
         dist = torch.distributed
         ok = dist.is_available() and dist.is_initialized()
-        return int(dist.get_rank()) if ok else 0
-    return int(get_tensor_model_parallel_rank())
+        return dist.get_rank() if ok else 0
+    return get_tensor_model_parallel_rank()
 
 
 _PROGRAM_METHODS = (
@@ -269,7 +270,7 @@ class ProgramDriver(StepRouting):
     ) -> None:
         self.program, self.view = program, view
         self._domain = domain
-        self.tp_rank = int(tp_rank)
+        self.tp_rank = tp_rank
         self._display_name = str(getattr(program, "display_name", "") or "megakernel")
         self.fingerprint = fingerprint
         self._codes = tuple(codes)
@@ -282,10 +283,8 @@ class ProgramDriver(StepRouting):
         self._inspect: Any = None
         self._inspect_runner: Any = None
         self.pool_layout_facts: Any = None
-        self.step_mix_tracker = _stats.StepMixTracker(period_s=float(stats_period_s))
-        self.ab_calibrator = _stats.MKABCalibrator(
-            enabled=bool(ab), period_s=float(stats_period_s)
-        )
+        self.step_mix_tracker = _stats.StepMixTracker(period_s=stats_period_s)
+        self.ab_calibrator = _stats.MKABCalibrator(enabled=ab, period_s=stats_period_s)
 
     # --- startup (steps 1-8) ------------------------------------------------
 
@@ -358,7 +357,7 @@ class ProgramDriver(StepRouting):
                 except MeshDecline as exc:
                     decline = exc.result
                 else:
-                    decline = check_mesh_size(tp_size, int(mesh.devices.size))
+                    decline = check_mesh_size(tp_size, mesh.devices.size)
         except BaseException:
             _vote_startup_failure(token, codes, domain, runner)
             raise
@@ -378,7 +377,7 @@ class ProgramDriver(StepRouting):
                 decline,
                 tp_rank=tp_rank,
                 display_name=name,
-                stats_period_s=float(cfg.stats_period_s),
+                stats_period_s=cfg.stats_period_s,
                 codes=codes,
                 domain=domain,
             )
@@ -387,8 +386,8 @@ class ProgramDriver(StepRouting):
             out,
             view=view,
             tp_rank=tp_rank,
-            stats_period_s=float(cfg.stats_period_s),
-            ab=bool(cfg.ab),
+            stats_period_s=cfg.stats_period_s,
+            ab=cfg.ab,
             fingerprint=fprint,
             codes=codes,
             backbone=_runner_backbone(runner),
@@ -413,7 +412,7 @@ class ProgramDriver(StepRouting):
         # Give each bucket its own code object: nested closures share `__code__`,
         # and Dynamo caches compiled graphs per code object, so all buckets
         # would otherwise compete for one entry's `cache_size_limit`.
-        name = f"step_t{int(bucket.T)}_b{int(bucket.B)}"
+        name = f"step_t{bucket.T}_b{bucket.B}"
         co = step.__code__.replace(co_name=name, co_qualname=name)
         fn = types.FunctionType(
             co, step.__globals__, name, step.__defaults__, step.__closure__
@@ -471,8 +470,10 @@ class ProgramDriver(StepRouting):
             try:
                 self.bind(runner)
             except MegakernelLayoutError as exc:
-                decline = getattr(exc, "result", None) or EligibilityResult(
-                    False, "cache_layout_incompatible", str(exc)
+                decline = (
+                    exc.result
+                    if isinstance(exc, LayoutDecline)
+                    else EligibilityResult(False, "cache_layout_incompatible", str(exc))
                 )
             except BaseException:
                 # This rank is raising: still vote, so the others decline
@@ -485,7 +486,7 @@ class ProgramDriver(StepRouting):
                 raise
             token = None
             if decline is None:
-                token = buckets_token(list(self._steps), salt=self.fingerprint)
+                token = buckets_token(self._steps, salt=self.fingerprint)
             group = agreement_group(self._domain, runner)
             decline = agree_on_decline(
                 decline, group=group, token=token, codes=self._codes

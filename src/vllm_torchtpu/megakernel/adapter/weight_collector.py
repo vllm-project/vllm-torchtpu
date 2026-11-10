@@ -101,9 +101,9 @@ def extract_ecopy_layer(
         if (
             layer_idx is not None
             and expert_placement.has_copies()
-            and int(expert_placement.slots()) == int(ew)
-            and int(expert_placement.global_count()) == int(g.E)
-            and int(expert_placement.shards()) == int(ex.R)
+            and expert_placement.slots() == ew
+            and expert_placement.global_count() == g.E
+            and expert_placement.shards() == ex.R
             and str(layer_idx) in expert_placement.data().get("layers", {})
         ):
             cores = expert_placement.cores(layer_idx)

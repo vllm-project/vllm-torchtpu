@@ -149,7 +149,7 @@ def _populate_qwen35_hf_state_dict(
         sd[fd.hf_name].copy_(t_w.to(sd[fd.hf_name].dtype))
         populated.add(fd.hf_name)
 
-    for lyr in range(int(g.L)):
+    for lyr in range(g.L):
         active: list[tuple[Any, int]] = []
         for nm in (pre_n, post_n):
             if nm is not None:
@@ -211,7 +211,7 @@ def _populate_qwen35_hf_state_dict(
                     )
                 )
 
-    unpopulated = sorted(set(sd.keys()) - populated)
+    unpopulated = sorted(sd.keys() - populated)
     if unpopulated:
         raise RuntimeError(
             f"Unpopulated HF state_dict parameters ({len(unpopulated)}): "
@@ -278,7 +278,7 @@ def qwen35_hf_oracle(
         torch.from_numpy(np.array(hidden, copy=True)).to(torch.bfloat16).unsqueeze(0)
     )
     with torch.no_grad():
-        if int(ex.T) > 1 or int(hidden.shape[0]) > 1:
+        if ex.T > 1 or hidden.shape[0] > 1:
             out_h = (
                 backbone(inputs_embeds=xs_th, use_cache=False)
                 .last_hidden_state[0]

@@ -31,27 +31,27 @@ class TorchStepMetaOps:
     """`StepMetaOps` primitives over `torch.Tensor` (Dynamo `fullgraph=True` safe)."""
 
     def shape(self, x: torch.Tensor) -> tuple[int, ...]:
-        return tuple(int(d) for d in x.shape)
+        return tuple(x.shape)
 
     def ndim(self, x: torch.Tensor) -> int:
-        return int(x.ndim)
+        return x.ndim
 
     def numel(self, x: torch.Tensor) -> int:
-        return int(x.numel())
+        return x.numel()
 
     def reshape(self, x: torch.Tensor, shape: tuple[int, ...]) -> torch.Tensor:
         return x.reshape(shape)
 
     def slice_or_pad_1d(self, x: torch.Tensor, target_len: int) -> torch.Tensor:
         x1 = x.reshape(-1)
-        n = int(x1.shape[0])
+        n = x1.shape[0]
         out = x1[:target_len] if n >= target_len else F.pad(x1, (0, target_len - n))
         return out.to(torch.int32)
 
     def slice_or_pad_2d(
         self, x: torch.Tensor, target_rows: int, target_cols: int
     ) -> torch.Tensor:
-        r, c = int(x.shape[0]), int(x.shape[1])
+        r, c = x.shape[0], x.shape[1]
         out = x[: min(r, target_rows), : min(c, target_cols)]
         pad_r, pad_c = max(0, target_rows - r), max(0, target_cols - c)
         if pad_r > 0 or pad_c > 0:
@@ -81,7 +81,7 @@ class TorchStepMetaOps:
     def expand_1d_to_2d(
         self, x_1d: torch.Tensor, cols: int, *, contiguous: bool = True
     ) -> torch.Tensor:
-        out = x_1d.unsqueeze(1).expand(int(x_1d.shape[0]), int(cols))
+        out = x_1d.unsqueeze(1).expand(x_1d.shape[0], cols)
         return out.contiguous() if contiguous else out
 
     def concat_cols(self, col0: torch.Tensor, col1: torch.Tensor) -> torch.Tensor:

@@ -119,9 +119,7 @@ def _inspect_step_detail(
 
 
 def _default_out_rows(b: int, token_paddings: Sequence[int]) -> int:
-    return next(
-        (int(p) for p in token_paddings if int(p) >= b), max(16, -(-b // 16) * 16)
-    )
+    return next((p for p in token_paddings if p >= b), max(16, -(-b // 16) * 16))
 
 
 def runner_shapes(
@@ -133,13 +131,13 @@ def runner_shapes(
     max_pages_per_seq: int,
 ) -> list[RunnerShape]:
     """The runner input shapes a bucket is warmed up with (one graph each)."""
-    T, B = int(bucket.T), int(bucket.B)
-    cols = max(T, max(1, int(ckpt_window)))
+    T, B = bucket.T, bucket.B
+    cols = max(T, max(1, ckpt_window))
     if token_paddings and req_block_pairs:
-        pads = [int(p) for p in token_paddings if int(p) >= B]
-        tok = pads[0] if pads else int(token_paddings[-1])
-        return [RunnerShape(tok, int(r), int(k), cols) for r, k in req_block_pairs]
-    return [RunnerShape(B, B // T, int(max_pages_per_seq), cols)]
+        pads = [p for p in token_paddings if p >= B]
+        tok = pads[0] if pads else token_paddings[-1]
+        return [RunnerShape(tok, r, k, cols) for r, k in req_block_pairs]
+    return [RunnerShape(B, B // T, max_pages_per_seq, cols)]
 
 
 def _log_step_mix(name: str, summary: Any) -> None:
@@ -267,7 +265,7 @@ class StepRouting:
     ) -> Any:
         """Run the step `can_run` decided (or decide now) on the program."""
         pending, self._pending = self._pending, None
-        n_tok = int(num_tokens if num_tokens is not None else input_ids.shape[0])
+        n_tok = num_tokens if num_tokens is not None else input_ids.shape[0]
         if pending is None:
             decision, fwd = None, self._forward_view(runner, n_tok)
             ctx = StepContext(input_ids, positions)
@@ -300,7 +298,7 @@ class StepRouting:
         ab_t0 = time.perf_counter() if self.ab_calibrator.enabled else None
         if use_mk:
             assert input_ids is not None and positions is not None
-            num_tok = int(positions.shape[-1])
+            num_tok = positions.shape[-1]
             out = self(input_ids, positions, num_tokens=num_tok, runner=runner)
             if ab_t0 is not None:
                 if getattr(getattr(runner, "device", None), "type", None) == "tpu":

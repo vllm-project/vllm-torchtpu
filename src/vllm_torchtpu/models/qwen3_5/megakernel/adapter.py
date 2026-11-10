@@ -113,12 +113,12 @@ def _unwrap(x: Any) -> Any:
 
 def parse_options(options: Mapping[str, Any]) -> dict[str, Any]:
     """This template's settings from the plugin `options` (unknown keys raise)."""
-    if bad := sorted(set(options) - OPTION_KEYS):
+    if bad := sorted(options.keys() - OPTION_KEYS):
         raise ValueError(
             f"Qwen35Program: unknown option {bad[0]!r}; known: {sorted(OPTION_KEYS)}"
         )
     register()  # profile names resolve through the library registry
-    return mk_rt.parse_runtime_config(dict(options))
+    return mk_rt.parse_runtime_config(options)
 
 
 _TORCH_STEP_META_OPS = TorchStepMetaOps()
@@ -196,10 +196,10 @@ def create(view: RunnerView, options: Mapping[str, Any]) -> Qwen35Program | Decl
     except ValueError as exc:
         return Decline("backbone_not_found", f"Megakernel: {exc}; skipping.")
     d_geom = mdef.derive_geometry()
-    exp_l, tot_e = int(d_geom.L), int(getattr(d_geom, "E", 0))
+    exp_l, tot_e = d_geom.L, d_geom.E
     prof = mk_rt.resolve_driver_profile(cfg["profile"], model_name=mdef.name)
     el = mk_rt.check_startup_eligibility(
-        num_layers=len(getattr(backbone, "layers", ())),
+        num_layers=len(backbone.layers),
         expected_num_layers=exp_l,
         unified_cache_layout=view.unified_kv_layout,
     )
@@ -207,9 +207,7 @@ def create(view: RunnerView, options: Mapping[str, Any]) -> Qwen35Program | Decl
         el = dataclasses.replace(el, message=UNALIGNED_LAYOUT_MESSAGE)
     if not el.eligible:
         return Decline(el.code, el.message, el.level)
-    loaded_ep = (
-        int(get_routed_experts(backbone.layers[0].mlp).w13_weight.shape[0]) < tot_e
-    )
+    loaded_ep = get_routed_experts(backbone.layers[0].mlp).w13_weight.shape[0] < tot_e
     mode = cfg["mode"] or ("ep" if loaded_ep else "tp")
     owned = mk_rt.explicit_profile_settings(cfg)
     b_policy = mk_rt.BucketPolicy.resolve(
@@ -217,8 +215,8 @@ def create(view: RunnerView, options: Mapping[str, Any]) -> Qwen35Program | Decl
         owned["buckets"],
         owned["verify_buckets"],
         speculative_tokens=view.speculative_tokens,
-        buckets_explicit=bool(cfg.get("buckets_explicit", False)),
-        verify_buckets_explicit=bool(cfg.get("verify_buckets_explicit", False)),
+        buckets_explicit=cfg["buckets_explicit"],
+        verify_buckets_explicit=cfg["verify_buckets_explicit"],
     )
     el_post = mk_rt.check_post_mesh_eligibility(
         tp_size=view.tp_size, bucket_policy=b_policy
@@ -238,7 +236,7 @@ def create(view: RunnerView, options: Mapping[str, Any]) -> Qwen35Program | Decl
         fused_pool_io_max_b=owned["fused_pool_io_max_b"],
         fused_pool_io_min_b_hi=owned["fused_pool_io_min_b_hi"],
         pool_gather=owned["pool_gather"],
-        compile_hlo_check=bool(cfg["compile_hlo_check"]),
+        compile_hlo_check=cfg["compile_hlo_check"],
     )
 
 
@@ -277,14 +275,14 @@ class Qwen35Program:
         self.model_def: type[ModelDef] = model_def
         self.model, self.backbone = model, find_backbone(model)
         self.embed_tokens = self.backbone.embed_tokens
-        self.tp_rank, self.mode = int(tp_rank), mode
+        self.tp_rank, self.mode = tp_rank, mode
         self._spec_arg, self._geom_arg = spec, geom
         self._base_exec_arg, self._weights_arg = base_exec, weights
         self._reshard_ep_to_tp, self._expert_placement = (
             reshard_ep_to_tp,
             expert_placement,
         )
-        model_name = str(getattr(spec, "name", "") or model_def.name)
+        model_name = getattr(spec, "name", "") or model_def.name
         self.display_name = model_def.display_name or model_name
         self._display_name = self.display_name
         p_kw = dict(
@@ -297,8 +295,8 @@ class Qwen35Program:
         self.profile: Profile = mk_rt.resolve_driver_profile(profile, **p_kw)
         self._compile_hlo_check = bool(compile_hlo_check)
         self.fused_pool_io: bool | str = self.profile.fused_pool_io
-        self.fused_pool_io_max_b = int(self.profile.fused_pool_io_max_b)
-        self.fused_pool_io_min_b_hi = int(self.profile.fused_pool_io_min_b_hi)
+        self.fused_pool_io_max_b = self.profile.fused_pool_io_max_b
+        self.fused_pool_io_min_b_hi = self.profile.fused_pool_io_min_b_hi
         self.pool_gather: bool | None = self.profile.pool_gather
         self.bucket_policy = mk_rt.BucketPolicy.resolve(
             self.profile, buckets, verify_buckets
@@ -347,7 +345,7 @@ class Qwen35Program:
     def _build_spec(self, mode: str, geom: Any = None) -> Any:
         if geom is None:
             e_slots = (
-                int(get_routed_experts(self.backbone.layers[0].mlp).w13_weight.shape[0])
+                get_routed_experts(self.backbone.layers[0].mlp).w13_weight.shape[0]
                 if mode == "ep"
                 else 0
             )
@@ -362,7 +360,7 @@ class Qwen35Program:
         """Build the spec and pack the weights (after the adapter's agreement:
         the EP->TP reshard all-gathers across ranks)."""
         self.mesh = mesh
-        r_cnt = int(mesh.devices.size)
+        r_cnt = mesh.devices.size
         spec = self._spec_arg
         self.spec = (
             spec if spec is not None else self._build_spec(self.mode, self._geom_arg)
@@ -466,8 +464,8 @@ class Qwen35Program:
             pools.append(raw)
 
         _need_layout(len(pools) == natt, f"expected {natt} pools, got {len(pools)}")
-        num_pages = int(pools[0].shape[0])
-        page_size = int(pools[0].shape[-1])
+        num_pages = pools[0].shape[0]
+        page_size = pools[0].shape[-1]
         kvh_expected = max(1, self.geom.NKV // self.base_exec.R)
         expected_shape = pinfo.expected_pool_shape(
             num_pages, kvh_expected, self.geom.HD, page_size
@@ -498,11 +496,7 @@ class Qwen35Program:
                 )
 
         self._check_pool_layout_facts(view, pools[0])
-        self.raw_pools, self.num_pages, self.page_size = (
-            pools,
-            num_pages,
-            int(pools[0].shape[-1]),
-        )
+        self.raw_pools, self.num_pages, self.page_size = pools, num_pages, page_size
         self._zero_roff_1d = torch.zeros(
             (1,), dtype=torch.int32, device=pools[0].device
         )
@@ -594,7 +588,7 @@ class Qwen35Program:
             ) from exc
         self._adopt_framework_conv_dtype(fw_facts.conv_dtype)
         mk_facts = mk_rt.facts_from_pool_layout(
-            self.spec.cache_backend.layout, int(self.base_exec.R)
+            self.spec.cache_backend.layout, self.base_exec.R
         )
         res = mk_rt.compare_layout_facts(mk_facts, fw_facts)
         if not res.eligible:
@@ -625,7 +619,7 @@ class Qwen35Program:
 
     def build(self, bucket: Bucket) -> Any:
         """Build the custom op and step function for `(bucket.T, bucket.B)`."""
-        tokens_per_seq, bucket_t = int(bucket.T), int(bucket.B)
+        tokens_per_seq, bucket_t = bucket.T, bucket.B
         b_kw = dict(
             bucket_t=bucket_t,
             tokens_per_seq=tokens_per_seq,
@@ -672,7 +666,7 @@ class Qwen35Program:
             self.mesh, self.spec, ex, op_name=op_name, donate_pools=True
         )
         m_rows, max_pages, embed = ex.M, self.max_pages_per_seq, self.embed_tokens
-        out_rows = int(bucket.out_rows) if bucket.out_rows is not None else m_rows
+        out_rows = bucket.out_rows if bucket.out_rows is not None else m_rows
 
         def _step_impl(
             input_ids: torch.Tensor,
@@ -754,7 +748,7 @@ class Qwen35Program:
 
     def check_compiled_ir(self, debug: Any, bucket: Bucket) -> None:
         """Validate `TpuCompileDebug.stablehlo_forward_text` pool donation."""
-        tokens_per_seq, bucket_t = int(bucket.T), int(bucket.B)
+        tokens_per_seq, bucket_t = bucket.T, bucket.B
         fwd_texts = getattr(debug, "stablehlo_forward_text", None) or ()
         if not fwd_texts or not any(str(t).strip() for t in fwd_texts):
             msg = (
@@ -765,7 +759,7 @@ class Qwen35Program:
             self._torchtpu_ir_error = msg
             raise RuntimeError(msg)
         ir_text = "\n".join(str(t) for t in fwd_texts)
-        kvh = max(1, int(self.raw_pools[0].shape[1]) // 2)
+        kvh = max(1, self.raw_pools[0].shape[1] // 2)
         pinfo = mk_rt.pool_schedule_info(self.spec)
         ir_kw = dict(
             num_pages=self.num_pages,
@@ -840,7 +834,7 @@ class Qwen35Program:
     def warmup_inputs(self, bucket: Bucket, shape: RunnerShape) -> WarmupCase | None:
         """Inputs for one warmup call, with the sentinel check if planned."""
         assert self._warmup_plan is not None and self.view is not None
-        T, b = int(bucket.T), int(bucket.B)
+        T, b = bucket.T, bucket.B
         s = self._warmup_plan.get((T, b, shape.tok_pad, shape.req_pad, shape.blk_pad))
         if s is None:
             return None
@@ -875,7 +869,7 @@ class Qwen35Program:
                 for _ in range(g_cnt)
             ]
             if c_cols > 1
-            else list(s_list)
+            else s_list
         )
         r_call = r_raw
 
@@ -1005,10 +999,7 @@ class Qwen35Program:
         mrope_ok = True
         if bs.eligible and bs.num_reqs > 0 and positions is not None:
             if positions.ndim == 2:
-                if (
-                    int(positions.shape[0]) != 3
-                    or int(positions.shape[1]) < active_rows
-                ):
+                if positions.shape[0] != 3 or positions.shape[1] < active_rows:
                     mrope_ok = False
                 else:
                     mrope_np = fwd.mrope_positions
@@ -1027,7 +1018,7 @@ class Qwen35Program:
             bs,
             self.bucket_policy,
             fwd.steps,
-            input_rows=int(input_ids.shape[0]),
+            input_rows=input_ids.shape[0],
             mrope_ok=mrope_ok,
         )
         if decision.eligible:
@@ -1061,7 +1052,7 @@ class Qwen35Program:
             step_fn = fwd.steps[(tokens_per_seq, bkt)]
 
         num_tok = fwd.num_tokens
-        out_rows = int(num_tok if num_tok is not None else input_ids.shape[0])
+        out_rows = num_tok if num_tok is not None else input_ids.shape[0]
         fb_1d = getattr(attn_md, "seq_lens", None)
         if fb_1d is None:
             fb_1d = torch.zeros(

@@ -245,13 +245,13 @@ def align_cache_exec(
 ) -> ExecSpec:
     """Align `base_exec.ctx` to `kv_blk` and bind paged KV cache geometry."""
     ex0 = profile.exec_for(base_exec, B=base_exec.B, T=1, g=geom)
-    kv_blk = int(ex0.resolved_tiles.module(GQAModule.name, GQATunables).kv_blk)
-    aligned_ctx = ((int(max_pages_per_seq) * int(page_size)) // kv_blk) * kv_blk
+    kv_blk = ex0.resolved_tiles.module(GQAModule.name, GQATunables).kv_blk
+    aligned_ctx = ((max_pages_per_seq * page_size) // kv_blk) * kv_blk
     return with_cache(
         dataclasses.replace(base_exec, ctx=max(base_exec.ctx, aligned_ctx)),
-        num_pages=int(num_pages),
-        page_size=int(page_size),
-        max_pages_per_seq=int(max_pages_per_seq),
+        num_pages=num_pages,
+        page_size=page_size,
+        max_pages_per_seq=max_pages_per_seq,
         paged_kv=True,
     )
 
@@ -270,11 +270,9 @@ def bucket_exec_spec(
     """Build per-bucket `(ExecSpec, use_fused_pool_io, use_pool_gather)`."""
     eff_fused = profile.fused_pool_io if fused_pool_io is None else fused_pool_io
     p_max, p_min = profile.fused_pool_io_max_b, profile.fused_pool_io_min_b_hi
-    max_b = int(p_max if fused_pool_io_max_b is None else fused_pool_io_max_b)
-    min_b = int(p_min if fused_pool_io_min_b_hi is None else fused_pool_io_min_b_hi)
-    ex_cand = profile.exec_for(
-        base_exec, B=int(bucket_t), T=int(tokens_per_seq), g=spec.config
-    )
+    max_b = p_max if fused_pool_io_max_b is None else fused_pool_io_max_b
+    min_b = p_min if fused_pool_io_min_b_hi is None else fused_pool_io_min_b_hi
+    ex_cand = profile.exec_for(base_exec, B=bucket_t, T=tokens_per_seq, g=spec.config)
     use_fused = should_fuse_pool_io(
         spec, ex_cand, fused_pool_io=eff_fused, max_b_low=max_b, min_b_hi=min_b
     )
@@ -285,4 +283,4 @@ def bucket_exec_spec(
         if (use_fused or pb is None)
         else should_use_pool_gather(spec, pb, ex_cand2, use_fused=use_fused)
     )
-    return with_cache(ex_cand2, pool_gather=use_gpr), bool(use_fused), bool(use_gpr)
+    return with_cache(ex_cand2, pool_gather=use_gpr), use_fused, use_gpr

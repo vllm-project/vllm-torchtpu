@@ -140,7 +140,7 @@ def check_plugin_spec(
             "'module:attr' string (e.g. '.adapter:create'), so importing the "
             "plugin loads no torch / jax / vLLM"
         )
-    codes = list(spec.decline_codes)
+    codes = spec.decline_codes
     if any(not isinstance(c, str) or not c or c == "other" for c in codes):
         raise AssertionError(f"SPEC {spec.name!r}: bad decline_codes {codes}")
     if len(set(codes)) != len(codes):
@@ -235,7 +235,7 @@ def run_cpu_e2e(
     with mock.patch.object(stepping, "get_forward_context", lambda: fwd_ctx):
         for ctx in _step_contexts(ctxs):
             hit, out = drv.try_forward(runner, ctx)
-            hits.append(bool(hit))
+            hits.append(hit)
             outputs.append(out)
     return CpuE2EResult(drv, runner, hits, outputs)
 

@@ -48,7 +48,7 @@ class PoolScheduleInfo:
         self, num_pages: int, kvh: int, hd: int, page_size: int
     ) -> tuple[int, int, int, int, int]:
         """Return the expected 5-D `(num_pages, 2*kvh, hd//4, 4, page_size)` shape."""
-        return (int(num_pages), 2 * int(kvh), int(hd) // 4, 4, int(page_size))
+        return (num_pages, 2 * kvh, hd // 4, 4, page_size)
 
 
 def pool_schedule_info(spec: ModelSpec) -> PoolScheduleInfo:
@@ -60,9 +60,9 @@ def pool_schedule_info(spec: ModelSpec) -> PoolScheduleInfo:
             f"MegakernelDriver: ModelSpec {getattr(spec, 'name', '')!r} has no pool "
             "backend layout"
         )
-    rec, npools = int(pb.recurrent_slots_per_pool), int(pb.num_pools)
-    pps, spp = int(lay.pages_per_slot), int(lay.slots_per_pool)
-    return PoolScheduleInfo(npools, rec, rec + 1, pps, spp, int(lay.rec_pages_per_slot))
+    rec, npools = pb.recurrent_slots_per_pool, pb.num_pools
+    pps, spp = lay.pages_per_slot, lay.slots_per_pool
+    return PoolScheduleInfo(npools, rec, rec + 1, pps, spp, lay.rec_pages_per_slot)
 
 
 def check_compile_hlo_mesh(mesh: Any, compile_hlo_check: bool) -> None:
@@ -112,8 +112,8 @@ def build_global_avals(
     ckpt_cols: int | None = None,
 ) -> list[_Sds]:
     """Construct global `jax.ShapeDtypeStruct` descriptors for HLO lowering/export."""
-    r_cnt, g = int(mesh.devices.size), spec.config
-    k_ckpt = int(ckpt_cols) if ckpt_cols is not None else ex.T
+    r_cnt, g = mesh.devices.size, spec.config
+    k_ckpt = ckpt_cols if ckpt_cols is not None else ex.T
     g_per_att = max(1, pool_schedule_info(spec).recurrent_slots_per_pool)
     sds = [
         _Sds((r_cnt * int(t.shape[0]), *t.shape[1:]), _any_dtype_to_jax(t.dtype))
@@ -121,9 +121,9 @@ def build_global_avals(
     ]
     return [
         _Sds((ex.B,), jnp.int32),
-        _Sds((r_cnt * ex.M, int(getattr(g, "H", 0))), jnp.bfloat16),
+        _Sds((r_cnt * ex.M, g.H), jnp.bfloat16),
         *sds,
-        _Sds((ex.NS, int(max_pages_per_seq)), jnp.int32),
+        _Sds((ex.NS, max_pages_per_seq), jnp.int32),
         _Sds((g_per_att, ex.NS, k_ckpt), jnp.int32),
         _Sds((g_per_att, ex.NS), jnp.int32),
     ]
@@ -142,7 +142,7 @@ def verify_pooled_step_hlo(
 ) -> tuple[bool, str]:
     """Lower or compile `make_flat_pooled_step` and verify pool donation in HLO."""
     devs = mesh.devices
-    has_real = bool(devs.size > 0 and isinstance(devs.flat[0], jax.Device))
+    has_real = devs.size > 0 and isinstance(devs.flat[0], jax.Device)
     if compile_hlo is True and not has_real:
         dev_t = type(devs.flat[0]).__name__ if devs.size > 0 else "empty"
         raise MegakernelConfigError(
@@ -150,8 +150,8 @@ def verify_pooled_step_hlo(
             f"(got {dev_t}); on virtual device meshes, XLA compilation is "
             "verified via verify_compiled_step_ir."
         )
-    auto_comp = bool(has_real and jax.default_backend() == "tpu" and not ex.interpret)
-    do_comp = auto_comp if compile_hlo is None else bool(compile_hlo)
+    auto_comp = has_real and jax.default_backend() == "tpu" and not ex.interpret
+    do_comp = auto_comp if compile_hlo is None else compile_hlo
     step_fn, in_sp, out_sp, don = cache.make_flat_pooled_step(
         mesh, spec, ex, donate_pools=True
     )
@@ -191,8 +191,6 @@ def verify_compiled_step_ir(
     hlo_text: str | None = None,
 ) -> tuple[bool, str]:
     """Verify that a compiled outer forward step donates and aliases all pools."""
-    num_pages, page_size = int(num_pages), int(page_size)
-    kvh, hd, num_pools = int(kvh), int(hd), int(num_pools)
     if not ir_text or not ir_text.strip():
         return False, "empty compiled IR"
     calls = ("stablehlo.custom_call", "mhlo.custom_call", "custom-call(")
@@ -261,7 +259,7 @@ def verify_ir_coverage(
     model_label: str = "",
 ) -> None:
     """Verify that every required warmed bucket passed the compiled-IR check."""
-    if not (req := ir_required_buckets(warmed, fused_io, is_eager=bool(is_eager))):
+    if not (req := ir_required_buckets(warmed, fused_io, is_eager=is_eager)):
         return
     if ir_error is not None:
         raise RuntimeError(ir_error)
@@ -313,8 +311,7 @@ def build_warmup_plan(
     is_eager: bool = False,
 ) -> tuple[list[WarmupStepPlan], list[tuple[int, int]], int]:
     """Build `(warmup_steps, warmed_buckets, n_save)` for `warmup()`."""
-    num_pages, max_pages_per_seq = int(num_pages), int(max_pages_per_seq)
-    ckpt_cols, is_eager = max(1, int(ckpt_window)), bool(is_eager)
+    ckpt_cols = max(1, ckpt_window)
     pinfo = pool_schedule_info(spec)
     pps, spp = pinfo.pages_per_slot, pinfo.slots_per_pool
     spv = spp * MTP_VERIFY_TOKENS
@@ -328,18 +325,18 @@ def build_warmup_plan(
     checked: set[tuple[int, bool, bool]] = set()
     warmed_buckets, steps = [], []
     for T, b in all_bkts:
-        bkt = (T, int(b))
+        bkt = (T, b)
         v_key = (T, bool(fio.get(bkt, False)), bool(gpr.get(bkt, False)))
         eager_skip = is_eager and not v_key[1]
         if eager_skip and v_key in checked:
             continue
         warmed_buckets.append(bkt)
         if runner_tok_pads and req_block_pairs:
-            pads = [int(p) for p in runner_tok_pads if int(p) >= int(b)]
-            tok_pad = pads[0] if pads else int(runner_tok_pads[-1])
-            shapes = [(tok_pad, int(r), int(k)) for r, k in req_block_pairs]
+            pads = [p for p in runner_tok_pads if p >= b]
+            tok_pad = pads[0] if pads else runner_tok_pads[-1]
+            shapes = [(tok_pad, r, k) for r, k in req_block_pairs]
         else:
-            shapes = [(int(b), int(b) // T, max_pages_per_seq)]
+            shapes = [(b, b // T, max_pages_per_seq)]
         for tok_pad, req_pad, blk_pad in shapes:
             if eager_skip and v_key in checked:
                 break
@@ -358,7 +355,7 @@ def build_warmup_plan(
                 sub_s, gdn_p0 = (T if disjoint else 0), pps * gdn_base
                 s_args = (v_key, kv_page, gdn_base, gdn_p0, sub_s, disjoint)
                 sent = SentinelVariantPlan(*s_args)
-            w_args = (T, int(b), tok_pad, req_pad, blk_pad, max(T, ckpt_cols), sent)
+            w_args = (T, b, tok_pad, req_pad, blk_pad, max(T, ckpt_cols), sent)
             steps.append(WarmupStepPlan(*w_args))
     return steps, warmed_buckets, n_save
 

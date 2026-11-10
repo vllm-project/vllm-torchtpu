@@ -125,7 +125,7 @@ class JaxStepMetaOps:
     def expand_1d_to_2d(self, x_1d: Any, cols: int, *, contiguous: bool = True) -> Any:
         del contiguous
         arr = jnp.asarray(x_1d).reshape(-1, 1)
-        return jnp.broadcast_to(arr, (int(arr.shape[0]), int(cols)))
+        return jnp.broadcast_to(arr, (arr.shape[0], cols))
 
     def concat_cols(self, col0: Any, col1: Any) -> Any:
         return jnp.concatenate(
@@ -167,10 +167,10 @@ def resolve_step_positions(
 ) -> Any:
     """Resolve flat per-token step positions from `positions` or `seq_lens`."""
     eff_ops = _JAX_STEP_META_OPS if ops is None else ops
-    T = int(tokens_per_seq)
-    active_rows = int(num_reqs) * T
+    T = tokens_per_seq
+    active_rows = num_reqs * T
     fb_1d = (
-        eff_ops.zeros_i32((max(1, int(num_reqs)),), like=like)
+        eff_ops.zeros_i32((max(1, num_reqs),), like=like)
         if seq_lens is None
         else seq_lens
     )
@@ -182,7 +182,7 @@ def resolve_step_positions(
         )
         if eff_ops.numel(pos_flat) >= active_rows:
             return pos_flat[:active_rows]
-    seq_l = eff_ops.slice_or_pad_1d(fb_1d, int(num_reqs))
+    seq_l = eff_ops.slice_or_pad_1d(fb_1d, num_reqs)
     if T > 1:
         offsets = eff_ops.reshape(eff_ops.arange_i32(1 - T, 1, like=like), (1, T))
         return eff_ops.reshape(
@@ -194,7 +194,7 @@ def resolve_step_positions(
 
 def check_ckpt_write_cols_distinct(ckpt_2d: Any, tokens_per_seq: int) -> None:
     """Raise `ValueError` if any active row lacks `T` distinct positive slots."""
-    T = int(tokens_per_seq)
+    T = tokens_per_seq
     if T <= 1:
         return
     rows = (
@@ -242,7 +242,7 @@ def pack_step_meta(
 ) -> StepMeta:
     """Pack `(ids_b, pos_b, pt_b, ckpt_b, roff_b)` for a bucket of `bucket_t` tokens."""
     eff_ops = _JAX_STEP_META_OPS if ops is None else ops
-    T, B = int(tokens_per_seq), int(bucket_t)
+    T, B = tokens_per_seq, bucket_t
     if B % T != 0:
         raise ValueError(f"bucket_t={B} must be divisible by tokens_per_seq={T}")
     nseq_bkt = B // T
@@ -311,9 +311,7 @@ def pack_step_meta(
             eff_ops.zeros_like_i32(ckpt_g),
         )
         if T > 1:
-            _assert_distinct_ckpt_cols_if_host(
-                ckpt_g, T, eff_ops, validate=bool(validate)
-            )
+            _assert_distinct_ckpt_cols_if_host(ckpt_g, T, eff_ops, validate=validate)
         roff_g = eff_ops.where(act_g, roff_g, eff_ops.zeros_like_i32(roff_g))
         ckpt_rows.append(ckpt_g)
         roff_rows.append(roff_g)

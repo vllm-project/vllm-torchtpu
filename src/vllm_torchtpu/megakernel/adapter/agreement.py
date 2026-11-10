@@ -18,7 +18,7 @@ driver that serves the stock path."""
 from __future__ import annotations
 
 import zlib
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from typing import Any
 
 import torch
@@ -62,7 +62,7 @@ def _decline_vote(
     if result is None:
         return 0
     code = result.code if result.code in codes else "other"
-    return list(codes).index(code) + 1
+    return codes.index(code) + 1
 
 
 def _tp_cpu_group() -> Any:
@@ -72,7 +72,7 @@ def _tp_cpu_group() -> Any:
     from vllm.distributed import get_tp_group
 
     tp_group = get_tp_group()
-    if int(tp_group.world_size) <= 1:
+    if tp_group.world_size <= 1:
         return None
     return tp_group.cpu_group
 
@@ -92,7 +92,7 @@ def _all_reduce_max(t: torch.Tensor, group: Any) -> None:
     torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MAX, group=group)
 
 
-def buckets_token(keys: Sequence[tuple[int, int]], salt: str = "") -> int:
+def buckets_token(keys: Iterable[tuple[int, int]], salt: str = "") -> int:
     """A rank-independent 32-bit digest of a set of `(T, B)` bucket keys
     (salted, e.g. with the plugin fingerprint)."""
     return zlib.crc32((salt + repr(sorted(keys))).encode("ascii"))
@@ -125,7 +125,7 @@ def agree_on_decline(
         group = _tp_cpu_group()
     if group is None:
         return local
-    tok = int(token or 0)
+    tok = 0 if token is None else token
     t = torch.tensor([_decline_vote(local, codes), tok, -tok], dtype=torch.int64)
     _all_reduce_max(t, group)
     vote, tok_max, tok_min = int(t[0]), int(t[1]), -int(t[2])
@@ -169,10 +169,10 @@ class DeclinedDriver:
         domain: str = DOMAIN_TP,
     ) -> None:
         self.decline = result
-        self.tp_rank, self._display_name = int(tp_rank), display_name
+        self.tp_rank, self._display_name = tp_rank, display_name
         self._codes = tuple(codes)
         self._domain = domain
-        self.step_mix_tracker = _stats.StepMixTracker(period_s=float(stats_period_s))
+        self.step_mix_tracker = _stats.StepMixTracker(period_s=stats_period_s)
         self._step_key = f"stock_{result.code}"
 
     def bind_and_warmup(self, runner: Any) -> None:

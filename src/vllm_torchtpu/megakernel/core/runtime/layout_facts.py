@@ -100,8 +100,8 @@ def facts_from_pool_layout(layout: PoolLayout, R: int) -> PoolLayoutFacts:
     qkv = layout.qkv_per_rank(R)
     return PoolLayoutFacts(
         page_dtype=dtype_name(jnp.dtype(layout.page_dtype)),
-        page_shape=tuple(int(d) for d in layout.kv_page_shape),
-        page_size=int(layout.page_size),
+        page_shape=layout.kv_page_shape,
+        page_size=layout.page_size,
         token_bytes=layout.page_bytes // layout.page_size,
         slot_tokens=layout.pages_per_slot * layout.page_size,
         ssm_dtype=dtype_name(jnp.dtype(layout.rec_dtype)),

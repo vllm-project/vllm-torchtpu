@@ -195,10 +195,10 @@ class RunnerView:
     @property
     def tp_rank(self) -> int:
         if self._tp_rank is not None:
-            return int(self._tp_rank)
+            return self._tp_rank
         from vllm.distributed import get_tensor_model_parallel_rank
 
-        return int(get_tensor_model_parallel_rank())
+        return get_tensor_model_parallel_rank()
 
     @property
     def speculative_tokens(self) -> int:

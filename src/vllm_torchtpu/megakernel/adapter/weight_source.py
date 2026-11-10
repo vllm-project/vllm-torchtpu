@@ -95,7 +95,7 @@ class TorchArrayOps:
         self, x: torch.Tensor, axis: int, start: int, stop: int
     ) -> torch.Tensor:
         ax = axis % x.ndim
-        if start == 0 and stop == int(x.shape[ax]):
+        if start == 0 and stop == x.shape[ax]:
             return x
         return x.narrow(ax, start, stop - start)
 
@@ -113,7 +113,7 @@ class TorchArrayOps:
     ) -> torch.Tensor:
         torch_pad: list[int] = []
         for before, after in reversed(pad_widths):
-            torch_pad.extend((int(before), int(after)))
+            torch_pad.extend((before, after))
         if not any(torch_pad):
             return x
         if x.dtype == torch.float8_e4m3fn:
@@ -165,7 +165,7 @@ def _orient_2d_kn(
     valid_n: set[int],
 ) -> torch.Tensor:
     """Orient a 2D weight tensor `w` to `[K, N]` layout, raising on ambiguity."""
-    r0, r1 = int(w.shape[0]), int(w.shape[1])
+    r0, r1 = w.shape[0], w.shape[1]
     if explicit_flip is True and r0 in valid_k and r1 in valid_n:
         return w
     if explicit_flip is False and r0 in valid_n and r1 in valid_k:
@@ -228,7 +228,7 @@ class VLLMWeightSource:
 
     def __init__(self, backbone: Any, g: Any) -> None:
         _need(
-            len(backbone.layers) == int(g.L),
+            len(backbone.layers) == g.L,
             f"expected {g.L} layers, got {len(backbone.layers)}",
         )
         self._backbone = backbone
@@ -311,7 +311,7 @@ class VLLMWeightSource:
                     "(weight_scale / weight_scale_inv)",
                 )
                 assert s_raw is not None
-                exp_e, exp_n = int(w.shape[0]), int(w.shape[-1])
+                exp_e, exp_n = w.shape[0], w.shape[-1]
                 _need(
                     s_raw.numel() == exp_e * exp_n,
                     f"Expert scale for {alias.source!r} has shape "
@@ -347,7 +347,7 @@ class VLLMWeightSource:
                     f"FP8 projection {alias.source!r} is missing weight_scale",
                 )
                 assert s_raw is not None
-                exp_n = int(w_kn.shape[1])
+                exp_n = w_kn.shape[1]
                 _need(
                     s_raw.numel() == exp_n,
                     f"FP8 weight_scale for {alias.source!r} has shape "
@@ -397,10 +397,10 @@ class VLLMWeightSource:
                             R=R,
                             tp_rank=tp_rank,
                         )[decl.name]
-                        t_shape = tuple(int(d) for d in res_slice.shape)
+                        t_shape = tuple(res_slice.shape)
                         sh_ax = decl.transform.shard_axis % len(decl.shape)
                         exp_shape = tuple(
-                            int(d) // R if ax == sh_ax else int(d)
+                            d // R if ax == sh_ax else d
                             for ax, d in enumerate(decl.shape)
                         )
                         _need(
@@ -409,7 +409,7 @@ class VLLMWeightSource:
                             f"{t_shape}, expected {exp_shape}",
                         )
                         return res_slice
-                    t_shape = tuple(int(d) for d in t.shape)
+                    t_shape = tuple(t.shape)
                     _need(
                         t_shape == decl.shape,
                         f"Model parameter {decl.name!r} has shape {t_shape}, "
