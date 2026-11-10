@@ -174,12 +174,18 @@ def _reference(inputs, logical, seqs, scope=_FULL, k_scale=1.0):
                 vis &= (pos[None, :] < ctx) & ((pos[None, :] // _PAGE) % cp == rank)
             elif scope == _NEW:
                 vis &= pos[None, :] >= ctx
+            s = jnp.einsum("nhd,td->nht", q[start + rows], k, precision="highest") * (
+                _D**-0.5
+            )
             s = jnp.where(vis[:, None, :], s, -jnp.inf)
             m = jnp.max(s, axis=-1, keepdims=True)
             m_safe = jnp.where(jnp.isfinite(m), m, 0.0)
             w = jnp.exp(s - m_safe)
             den = jnp.sum(w, axis=-1, keepdims=True)
             outs.append(
+                jnp.einsum(
+                    "nht,td->nhd", w / jnp.maximum(den, 1e-30), v, precision="highest"
+                )
             )
             lses.append((m_safe + jnp.log(jnp.maximum(den, 1e-30)))[..., 0])
             valid.append(jnp.any(vis, axis=-1))
@@ -227,9 +233,12 @@ def test_bq1024_matches_bq128_bkv128(monkeypatch):
     # covers at most two lane columns of new tokens, so bkv_sz must be capped
     inputs, logical, page_table = _setup(jnp.float8_e4m3fn, _SHORT)
     total = int(inputs["cu_q_lens"][-1])
+    blocks = configs.BlockSizes(bq_sz=128, bq_c_sz=64, bkv_sz=128, batch_size=2)
     out_1024, _ = _run(monkeypatch, inputs, diet=False)
     out_128, cache_128 = _run(monkeypatch, inputs, diet=False, prefill_blocks=blocks)
     np.testing.assert_allclose(
+        out_128[:total], _reference(inputs, logical, _SHORT)[0], **_TOL
+    )
     np.testing.assert_allclose(out_1024[:total], out_128[:total], atol=1e-2)
     _check_writeback(cache_128, inputs, logical, _SHORT, page_table)
 
@@ -267,6 +276,9 @@ def test_dcp_scopes_match_reference(monkeypatch, seqs, scope, cp):
     new, new_cache = _run(monkeypatch, inputs, diet=True, prefill_blocks=blocks)
     np.testing.assert_array_equal(new[:total], old[:total])
     np.testing.assert_array_equal(new_cache, old_cache)
+    np.testing.assert_allclose(
+        new[:total], _reference(inputs, logical, seqs)[0], **_TOL
+    )
 
 
 @pytest.mark.parametrize("cp", [1, 4], ids=["nocp", "dcp4"])
@@ -288,5 +300,6 @@ def test_vpu_diet_non_pow2_k_scale(monkeypatch):
     total = int(inputs["cu_q_lens"][-1])
     old, _ = _run(monkeypatch, inputs, diet=False, k_scale=0.37)
     new, _ = _run(monkeypatch, inputs, diet=True, k_scale=0.37)
+    np.testing.assert_allclose(
         new[:total], _reference(inputs, logical, _SHORT, k_scale=0.37)[0], **_TOL
     )
