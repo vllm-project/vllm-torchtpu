@@ -27,6 +27,7 @@ import numpy as np
 import pytest
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels.megablox import gmm_v2 as gmm_v2_module
 from vllm_torchtpu.kernels.megablox.gmm_v2 import (
     HYBRID_DEQUANT_AFTER_MATMUL_MAX_ROWS,
     TileSizes,
@@ -321,7 +322,7 @@ def test_gmm_fused_activation_matches_reference(fuse_act):
 
 @pytest.mark.tpu_test
 @pytest.mark.parametrize("fuse_act", [None, "swigluoai"])
-def test_gmm_fp4_hybrid_dequant_matches_reference(fuse_act):
+def test_gmm_fp4_hybrid_dequant_matches_reference(fuse_act, monkeypatch):
     """EP decode shape: an lhs sized for every route, few rows per local
     expert. Tiles ending at <= HYBRID_DEQUANT_AFTER_MATMUL_MAX_ROWS rows scale
     the block-128 partials, larger ones dequantize the weights first; the
@@ -385,21 +386,35 @@ def test_gmm_fp4_hybrid_dequant_matches_reference(fuse_act):
         raw_gate, raw_up = jnp.split(raw_expected, 2, axis=-1)
         expected = apply_act_fn(interleave_lane(raw_gate, raw_up), fuse_act)
 
-    actual = gmm_v2(
-        lhs,
-        rhs_q,
-        group_sizes,
-        rhs_scale=rhs_scale,
-        group_offset=group_offset,
-        maybe_quantize_lhs=False,
-        zero_initialize=False,
-        fuse_act=fuse_act,
-    )[:num_rows].astype(jnp.float32)
+    def run():
+        jax.clear_caches()  # gmm_v2 is jitted; its config is read at trace
+        return gmm_v2(
+            lhs,
+            rhs_q,
+            group_sizes,
+            rhs_scale=rhs_scale,
+            group_offset=group_offset,
+            maybe_quantize_lhs=False,
+            zero_initialize=False,
+            fuse_act=fuse_act,
+        )[:num_rows].astype(jnp.float32)
 
-    err = jnp.max(jnp.abs(actual - expected))
-    ref = jnp.max(jnp.abs(expected))
-    # bf16 output, and the before path rounds the scaled weight to bf16.
-    assert float(err) <= 1e-2 * float(ref), (float(err), float(ref))
+    actual = run()
+    monkeypatch.setattr(gmm_v2_module, "HYBRID_DEQUANT_AFTER_MATMUL_MAX_ROWS", 0)
+    before_only = run()
+    jax.clear_caches()
+
+    ref = float(jnp.max(jnp.abs(expected)))
+    err = float(jnp.max(jnp.abs(actual - expected)))
+    err_before_only = float(jnp.max(jnp.abs(before_only - expected)))
+    # The skinny tiles skip the bf16 rounding of the scaled weight, so they
+    # sit no further from the f32 reference than the before-matmul path.
+    assert err <= max(1.25 * err_before_only, 1e-3 * ref), (
+        err,
+        err_before_only,
+        ref,
+    )
+    assert err <= 2e-2 * ref, (err, ref)
 
 
 @pytest.mark.tpu_test
