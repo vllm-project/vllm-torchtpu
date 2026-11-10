@@ -73,8 +73,20 @@ def main():
     ap.add_argument("--slots", type=int, default=0, help="union attention ring slots (0: default)")
     ap.add_argument("--profile", default="", help="jax.profiler trace dir for --profile-iters calls")
     ap.add_argument("--profile-iters", type=int, default=5)
+    ap.add_argument("--trace-only", action="store_true",
+                    help="CPU check: interpret Pallas, lower the call once, no run")
+    ap.add_argument("--tail", action="store_true",
+                    help="VLLM_TPU_MK_WHOLE_L47: + the last QSA layer as a one-layer kernel")
     a = ap.parse_args()
     _apply_removals(a.remove)
+    if a.trace_only:
+        from jax.experimental import pallas as pl
+        from jax.experimental.pallas import tpu as pltpu
+
+        original = pl.pallas_call
+        pl.pallas_call = lambda *x, **k: original(*x, **{**k, "interpret": True})
+        chip = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+        pltpu.get_tpu_info = lambda: chip
     wsc.SHARD_INDEX, wsc.UNION_ATTN, wsc.LOOP_REQUESTS = a.shard, a.union, a.loop
     wsc.UNION_PHYS = a.phys
     if a.slots:
@@ -93,9 +105,10 @@ def main():
     L = a.L
     n_att = max(1, L // 4)
     n_gdn = L - n_att
+    n_qsa = n_att + int(a.tail)
     layers = [
         QSALayerCache(compressed_slot=o % 2, main_slot=(o + 1) % 2)
-        for o in range(n_att)
+        for o in range(n_qsa)
     ]
     pps = a.max_groups * 4 // 128
     for B in [int(b) for b in a.buckets.split(",")]:
@@ -108,7 +121,7 @@ def main():
         # Timing only: every QSA layer reads the same main / compressed pages of a
         # request
         # (a 90K-token context would otherwise need 11 x 1.4K blocks per request).
-        NB = 1 + nreq * (n_gdn * 4 + n_att + 2 * n_used) + 8
+        NB = 1 + nreq * (n_gdn * 4 + n_qsa + 2 * n_used) + 8
         layout = Qwen38GdnPoolLayout(
             pool_shape=(NB * 4, 128, 1, 4, 256), pool_dtype="float8_e4m3fn"
         )
@@ -123,6 +136,7 @@ def main():
             max_groups=a.max_groups,
             norm_eps=1e-6,
             rotary_dim=64,
+            tail=a.tail,
         )
         spec = wholestep_spec(
             g,
@@ -142,12 +156,20 @@ def main():
             hc_fp8=envs.VLLM_TPU_MK_HC_FP8,
         )
         ex = ExecSpec(R=R, B=B, T=4, ctx=128, tiles=segment_tiles(B))
-        _, info = kernel.make_step(mesh, spec, ex)
-        p, wsh = info["plan"], info["wshape"]
+        specs = [spec]
+        if a.tail:
+            specs.append(wholestep_spec(
+                g, R, L=1, first="qsa", pool_gdn=True, qsa=dict(budget=a.budget), step=True,
+                indexed=dict(max_groups=a.max_groups, pages_per_seq=pps, carrier="fp8",
+                             n_layers=1, **indexed_options()),
+                hc_fp8=envs.VLLM_TPU_MK_HC_FP8,
+            ))
         key = jax.random.PRNGKey(0)
 
         def rnd(shape, dtype):
             nonlocal key
+            if a.trace_only:
+                return jax.ShapeDtypeStruct(shape, dtype, sharding=tp)
             key, k = jax.random.split(key)
             if jnp.issubdtype(dtype, jnp.floating):
                 return jax.device_put(
@@ -157,12 +179,15 @@ def main():
             return jax.device_put(jnp.zeros(shape, dtype), tp)
 
         ws = []
-        for n in p.w_names:
-            s = wsh[n]
-            if kernel.is_tupled_weight(s):
-                ws += [rnd((R * x.shape[0],) + tuple(x.shape[1:]), x.dtype) for x in s]
-            else:
-                ws.append(rnd((R * s[0][0],) + tuple(s[0][1:]), s[1]))
+        for sp in specs:
+            _, info = kernel.make_step(mesh, sp, ex)
+            p, wsh = info["plan"], info["wshape"]
+            for n in p.w_names:
+                s = wsh[n]
+                if kernel.is_tupled_weight(s):
+                    ws += [rnd((R * x.shape[0],) + tuple(x.shape[1:]), x.dtype) for x in s]
+                else:
+                    ws.append(rnd((R * s[0][0],) + tuple(s[0][1:]), s[1]))
         rng = np.random.default_rng(0)
         # GDN ids are manager blocks (4 kernel blocks each), QSA ids are kernel blocks
         # (128 tokens): draw them from disjoint ranges of the kernel-granularity pool.
@@ -186,7 +211,7 @@ def main():
         for q in range(nreq):
             main[q, :n_used] = [next(free) for _ in range(n_used)]
             comp[q, :n_used] = [next(free) for _ in range(n_used)]
-        for _ in range(n_att):
+        for _ in range(n_qsa):
             ring = np.zeros((NR, 8), np.int32)
             for q in range(nreq):
                 ring[q, 0] = next(free)
@@ -203,13 +228,13 @@ def main():
         norms = [
             jnp.zeros((256,), jnp.bfloat16),
             jnp.zeros((128,), jnp.bfloat16),
-        ] * n_att
+        ] * n_qsa
         hidden = rnd((R * B, g.NHC * g.H), jnp.bfloat16)
         # Allocated sharded: a host-side zeros of the global pool does not fit.
         pool = jax.jit(
             lambda nb=NB: jnp.zeros((R * nb * 4, 128, 1, 4, 256), jnp.float8_e4m3fn),
             out_shardings=tp,
-        )()
+        )() if not a.trace_only else rnd((R * NB * 4, 128, 1, 4, 256), jnp.float8_e4m3fn)
         put = lambda x: jax.device_put(jnp.asarray(x), rep)  # noqa: E731
         args = [hidden, *ws, pool, *map(put, meta), *map(put, tabs), put(positions), put(qsl),
                 put(ctx), put(trig), *map(put, norms)]
@@ -218,6 +243,10 @@ def main():
         if main_kv_dcp() > 1:  # the QSA layers' dcp_rank buffer: tp rank % 2, one per rank
             args.append(jax.device_put(jnp.arange(R, dtype=jnp.int32) % main_kv_dcp(), tp))
         f = jax.jit(call, donate_argnums=donate)
+        if a.trace_only:
+            out = jax.eval_shape(f, *args)
+            print(f"B={B} L={L} tail={a.tail} traced: {[o.shape for o in out]}", flush=True)
+            continue
         t0 = time.time()
         res, pool = f(*args)
         jax.block_until_ready(res)
