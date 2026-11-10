@@ -498,6 +498,11 @@ def test_admission_uses_model_relations_instead_of_checkpoint_literals():
         num_hidden_layers=8,
         layer_types=["linear_attention", "indexed_attention"] * 4,
     )
+    text = cfg.model_config.hf_text_config
+    frequencies = int(text.head_dim * text.partial_rotary_factor) // 2
+    text.rope_parameters["mrope_section"] = [
+        len(range(axis, frequencies, 3)) for axis in range(3)
+    ]
     validate_config(cfg)
 
 
@@ -955,7 +960,7 @@ def test_decoder_zeroes_unwritten_padding_before_standard_moe():
     from vllm_torchtpu.models.vllm.qwen4_exp.model import Qwen4ExpDecoderLayer
 
     class Residual(nn.Module):
-        def mix(self, hidden):
+        def mix_packed(self, hidden):
             return hidden, None
 
         def combine(self, block, residual):

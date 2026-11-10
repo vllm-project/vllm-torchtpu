@@ -27,6 +27,7 @@ from vllm_torchtpu.gdn_pool_layout import POOLED_GDN_ARCHITECTURES
 from vllm_torchtpu.models.vllm import register_models
 from vllm_torchtpu.models.vllm.qwen4_exp import model as qwen4_model
 from vllm_torchtpu.models.vllm.qwen4_exp.config import (
+    PLEHostBackend,
     TPUQwen4ExpConfig,
     validate_config,
 )
@@ -137,6 +138,7 @@ def backbone():
             "decode_cu", torch.arange(17, dtype=torch.int32), persistent=False
         )
         result.hc_count = HC
+        result.ple_host_backend = PLEHostBackend.TORCH
         result.host_ple_index = None
         result.embed_tokens = nn.Embedding(VOCAB, HIDDEN)
         result.layers = nn.ModuleList()

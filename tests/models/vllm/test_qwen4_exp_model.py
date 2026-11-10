@@ -56,6 +56,10 @@ def test_rope_sharing_is_model_local_and_excludes_kv_state(monkeypatch, layer_ty
         num_hidden_layers=len(layer_types),
         layer_types=layer_types,
     )
+    frequencies = int(text.head_dim * text.partial_rotary_factor) // 2
+    text.rope_parameters["mrope_section"] = [
+        len(range(axis, frequencies, 3)) for axis in range(3)
+    ]
 
     # Keep real QSA buffers; replace unrelated GDN/MoE/PLE construction so this
     # ownership test requires neither a distributed group nor model weights.

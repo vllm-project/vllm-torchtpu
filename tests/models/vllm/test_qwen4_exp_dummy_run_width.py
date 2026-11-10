@@ -35,7 +35,7 @@ def _make_adapter(monkeypatch, captured, *, page_size, context_limit, tokens, re
     monkeypatch.setattr(
         inputs, "set_vllm_model_wrapper_context", lambda **kwargs: nullcontext()
     )
-    monkeypatch.setattr(inputs, "synchronize_tensors", lambda tensor: None)
+    monkeypatch.setattr(inputs, "synchronize_tensors", lambda tensor, wait=True: None)
 
     def forward(**kwargs):
         captured.update(kwargs)
@@ -44,6 +44,7 @@ def _make_adapter(monkeypatch, captured, *, page_size, context_limit, tokens, re
     runner = SimpleNamespace(
         device="cpu",
         _pp_is_first=True,
+        _dp_step_other_decode=False,
         supports_mm_inputs=False,
         _record_input_staging_fence=lambda: None,
         parallel_config=SimpleNamespace(tensor_parallel_size=1),
