@@ -36,10 +36,30 @@ Each change that turns one the points use into a setting or section adds it to
 the entries, so the entries describe how to run the points on the tree they
 are in. Run the decode megakernel off on this tree: it is not on `main` yet.
 
+Three serve arguments differ from the record jobs because `main`'s unified
+GDN state pool differs from the record tree's (vllm-torchtpu #1620):
+
+- `--mamba-ssm-cache-dtype bfloat16` on every leg. The record tree stored
+  the Qwen GDN SSM state in bf16 by default; `main` stores the declared
+  dtype (the checkpoint's float32) unless this flag asks for bf16. It is a
+  precision trade-off, so the gates run it in `tradeoffs_on` only.
+- `--block-size`: one block holds a request's whole GDN state on `main`
+  (conv state in float32, SSM state in the declared dtype), so a smaller
+  value is raised at startup. With the bf16 SSM state that is 2304 tokens on
+  the TP1 prefill legs (2048 SSM + 256 conv) and 1280 on the DP4 x TP2 decode
+  leg of #1 (1024 + 256); the record ran 2176 and 640. The TP8 decode legs
+  need 320 and keep the record's 640.
+- `TPU_GDN_CONV_QK_PAIR_LAYOUT` is not set: `main` moves the float32 conv
+  state segment by segment and its Raiden pool manifest refuses the QK
+  pair-blocked layout at startup.
+
 ## Reading a gate entry
 
 `legs` derive from the point named in `base_point`, with one replica each and
-the listed `serve_args_override`. `arms` differ only in `additional_config`;
-the changes that add the FP8 trade-off settings add them to `tradeoffs_on`.
+the listed `serve_args_override`. `arms` differ in `additional_config` and
+in the serve arguments `arm_serve_args_override` lists for each arm, applied
+over the legs': the changes that add the FP8 trade-off settings add them to
+`tradeoffs_on`, and the bf16 GDN SSM state (`--mamba-ssm-cache-dtype
+bfloat16`, which every point leg passes) is on in `tradeoffs_on` only.
 `references` are earlier gates at the same layout (GSM8K strict-match, 1,319
 samples, thinking on).

@@ -51,3 +51,11 @@ references:
   - {job: j-0cdcabb5, tree: 7b45f3df2, layout: "TP8 + DCP4 1P1D", gsm8k: "98.10%"}
   - {job: j-017298cb, tree: 8fd4dd025, layout: "TP8 1P1D", gsm8k: "97.73%"}
   - {job: j-9818f652, tree: infx-qwen35-agentx-disagg-candidate2, layout: "TP8 MK ep, thinking on", gsm8k: "97.88%"}
+# Serve arguments each arm sets over the legs'. The bf16 GDN SSM state is a
+# precision trade-off: tradeoffs_on runs it, tradeoffs_off keeps main's
+# default ("auto", the checkpoint's float32).
+arm_serve_args_override:
+  tradeoffs_off:
+    "--mamba-ssm-cache-dtype": "auto"
+  tradeoffs_on:
+    "--mamba-ssm-cache-dtype": "bfloat16"
