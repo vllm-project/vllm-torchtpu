@@ -458,6 +458,40 @@ def test_the_decode_tile_override_reaches_the_kernel():
     )
 
 
+def test_the_layout_decode_tile_reaches_the_kernel(monkeypatch):
+    """Without a caller override the layout's entry sets the decode tile: at
+    DP4 x TP2 the copy takes T = 1, elsewhere the tiler's pick."""
+    monkeypatch.setattr(tiling, "layout_decode_tile", lambda: 1)
+    assert "_b1_c4_w4" in _decode_call_params(decode_tile_size=4)
+    monkeypatch.setattr(tiling, "layout_decode_tile", lambda: 0)
+    assert "_b1_c4_w4" not in _decode_call_params(decode_tile_size=4)
+
+
+@pytest.mark.parametrize(
+    ("dp", "tp", "tile"), [(4, 2, 1), (1, 8, 0), (8, 1, 0), (2, 4, 0)]
+)
+def test_layout_decode_tile(monkeypatch, dp, tp, tile):
+    from types import SimpleNamespace
+
+    from vllm.distributed import parallel_state
+
+    monkeypatch.setattr(parallel_state, "model_parallel_is_initialized", lambda: True)
+    monkeypatch.setattr(
+        parallel_state, "get_dp_group", lambda: SimpleNamespace(world_size=dp)
+    )
+    monkeypatch.setattr(
+        parallel_state, "get_tp_group", lambda: SimpleNamespace(world_size=tp)
+    )
+    assert tiling.layout_decode_tile() == tile
+
+
+def test_layout_decode_tile_before_the_groups_exist(monkeypatch):
+    from vllm.distributed import parallel_state
+
+    monkeypatch.setattr(parallel_state, "model_parallel_is_initialized", lambda: False)
+    assert tiling.layout_decode_tile() == 0
+
+
 @pytest.mark.parametrize(
     ("n_kq", "n_v", "window", "fused"),
     [

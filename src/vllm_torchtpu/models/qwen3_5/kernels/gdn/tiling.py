@@ -475,6 +475,26 @@ def legacy_spec_batch_tile(batch_size: int) -> int:
     return 1 if batch_size <= 8 else (2 if batch_size <= 32 else 4)
 
 
+# The decode tile T per Qwen3.5 decode layout (data_parallel_size,
+# tensor_parallel_size), where a measured best tile differs from the tiler's
+# pick. (4, 2): the DP4 x TP2 decode legs ran T = 1.
+DECODE_TILE_BY_LAYOUT: dict[tuple[int, int], int] = {(4, 2): 1}
+
+
+def layout_decode_tile() -> int:
+    """DECODE_TILE_BY_LAYOUT's tile for this process's model-parallel layout;
+    0 (the tiler's pick) without an entry or before the groups exist."""
+    from vllm.distributed import parallel_state
+
+    if not parallel_state.model_parallel_is_initialized():
+        return 0
+    layout = (
+        int(parallel_state.get_dp_group().world_size),
+        int(parallel_state.get_tp_group().world_size),
+    )
+    return DECODE_TILE_BY_LAYOUT.get(layout, 0)
+
+
 def select_decode_tile_size(
     *,
     default_tile: int,
