@@ -85,6 +85,11 @@ def _split_labels(raw: str) -> tuple[str, ...]:
     return tuple(item for item in raw.split(",") if item)
 
 
+def _and_list(items: Sequence[str]) -> str:
+    """Join `items` as prose: "a", "a and b", "a, b and c"."""
+    return " and ".join(filter(None, (", ".join(items[:-1]), items[-1])))
+
+
 @dataclass(frozen=True)
 class BuildContext:
     """Immutable snapshot of the build environment read at startup."""
@@ -111,6 +116,8 @@ class BuildContext:
     ci_pr_push_cpu_only: bool = False
     ci_extras: tuple[str, ...] = ()
     mq_extras: tuple[str, ...] = ()
+    # A key of TPU_VERSIONS on a build started by hand, to run one generation.
+    tpu_version: str = ""
 
     @property
     def is_pr(self) -> bool:
@@ -277,6 +284,7 @@ class BuildContext:
             ci_precheck=ci_precheck,
             ci_pr_push_cpu_only=ci_pr_push_cpu_only,
             ci_extras=ci_extras,
+            tpu_version=env.get("TPU_VERSION", "").strip(),
         )
 
 
@@ -353,6 +361,78 @@ _PR_SUITES: dict[str, Suite] = {
 }
 
 
+@dataclass(frozen=True)
+class TpuGeneration:
+    """Upload-time variables passed to each pipeline file in TPU_GENERATION_FILES.
+
+    Defines a TPU generation's pod shapes, label/group name (for distinct GitHub
+    statuses), step key prefix (to avoid duplicate Buildkite keys), soft_fail
+    behavior, and perf accelerator type and gating.
+    """
+
+    name: str
+    shape_single: str
+    shape_multi: str
+    key_prefix: str
+    soft_fail: bool
+    # As tpu_info.get_chip_version reads it, which takes anything it does not
+    # know for TPU7x.
+    accelerator_type: str
+    # True while no perf baselines have been measured on the generation: its
+    # perf steps report their numbers without gating on another chip's.
+    skip_perf_check: bool
+
+    def upload_env(self) -> dict[str, str]:
+        return {
+            "TPU_GENERATION": self.name,
+            "KUBE_SHAPE_SINGLE": self.shape_single,
+            "KUBE_SHAPE_MULTI": self.shape_multi,
+            "TPU_KEY_PREFIX": self.key_prefix,
+            "TPU_SOFT_FAIL": "true" if self.soft_fail else "false",
+            "TPU_ACCELERATOR": self.accelerator_type,
+            "TPU_SKIP_PERF_CHECK": "1" if self.skip_perf_check else "0",
+        }
+
+
+# v7x keeps unprefixed step keys so depends_on and nightly_report references
+# stay unchanged; prefixing its labels is safe since branch protection only
+# requires the overall build status. v6e soft-fails while v7x-specific test
+# assumptions are audited, and skips the perf gate (whose baselines are v7x).
+TPU_V7X = TpuGeneration(
+    name="v7x",
+    shape_single="tpu7x-standard-1t/1x1x1",
+    shape_multi="tpu7x-standard-4t/2x2x1",
+    key_prefix="",
+    soft_fail=False,
+    accelerator_type="tpu7x",
+    skip_perf_check=False,
+)
+TPU_V6E = TpuGeneration(
+    name="v6e",
+    shape_single="ct6e-standard-1t/1x1",
+    shape_multi="ct6e-standard-8t/2x4",
+    key_prefix="tpu6e_",
+    soft_fail=True,
+    accelerator_type="v6e",
+    skip_perf_check=True,
+)
+# Pipeline files uploaded once per TPU generation in the listed order (last
+# shows/queues first in Buildkite). Files not listed here are uploaded once.
+TPU_GENERATION_FILES: Mapping[str, tuple[TpuGeneration, ...]] = {
+    ".buildkite/pipeline_tests.yml": (TPU_V6E, TPU_V7X),
+    ".buildkite/pipeline_integration.yml": (TPU_V6E, TPU_V7X),
+    ".buildkite/pipeline_perf.yml": (TPU_V6E, TPU_V7X),
+}
+# Lanes uploaded once whose own script (upload_models_and_features.sh) generates
+# per-generation groups and reads TPU_VERSION on nightly builds.
+SCRIPT_TPU_GENERATION_LANES: tuple[str, ...] = ("verify",)
+# What a build started by hand sets TPU_VERSION to, to run one generation of
+# the files above and of those lanes alone, by the names tpu-inference gives
+# them. The generation brings its shapes, so the build names no KUBE_SHAPE_*
+# of its own. Without TPU_VERSION every generation runs.
+TPU_VERSIONS: Mapping[str, TpuGeneration] = {"tpu6e": TPU_V6E, "tpu7x": TPU_V7X}
+
+
 def choose_suite(ctx: BuildContext) -> Suite:
     """Return the `Suite` for `ctx`; `CI_SUITE` takes precedence."""
     if ctx.suite_override:
@@ -374,6 +454,67 @@ def choose_suite(ctx: BuildContext) -> Suite:
             return _PR_SUITES["pr+perf"]
         return _PR_SUITES["pr"]
     return SUITES["full"] if ctx.nightly_env or ctx.is_release else SUITES["default"]
+
+
+def tpu_version_note(ctx: BuildContext, suite: Suite, *, nightly: bool) -> str | None:
+    """Check `ctx.tpu_version` against the build; return its annotation, if any.
+
+    TPU_VERSION runs one TPU generation alone, for a build started by hand:
+    each file in TPU_GENERATION_FILES goes up for it only (see upload_envs),
+    and a lane in SCRIPT_TPU_GENERATION_LANES sends up only its group.
+    Integration, scheduled, release and merge-queue builds run every
+    generation: LKG promotion and a merge must not pass on one generation, and
+    a schedule or a release checks them all. A nightly started by hand may run
+    one; the nightly report, which waits on every generation's steps, leaves
+    itself out (see pipeline_verify.yml). A build with no lane that follows
+    TPU_VERSION would ignore it, so it is refused too.
+    """
+    if not ctx.tpu_version:
+        return None
+    if ctx.tpu_version not in TPU_VERSIONS:
+        raise BootstrapError(
+            f"ERROR: TPU_VERSION is '{ctx.tpu_version}'; "
+            f"TPU versions are: {' '.join(TPU_VERSIONS)}"
+        )
+    if (
+        ctx.is_integration
+        or ctx.is_merge_queue
+        or ctx.is_release
+        or ctx.source == "schedule"
+        or ctx.tag
+    ):
+        raise BootstrapError(
+            "ERROR: TPU_VERSION runs one TPU generation; integration, scheduled, "
+            "release and merge-queue builds run every generation"
+        )
+    # A lane's script runs only on the nightly builds its steps run on.
+    in_build = [
+        lane
+        for stage in suite.stages
+        for lane in stage
+        if f".buildkite/pipeline_{lane}.yml" in TPU_GENERATION_FILES
+        or (nightly and lane in SCRIPT_TPU_GENERATION_LANES)
+    ]
+    if not in_build:
+        per_generation = [
+            *(
+                pathlib.Path(p).stem.removeprefix("pipeline_")
+                for p in TPU_GENERATION_FILES
+            ),
+            *SCRIPT_TPU_GENERATION_LANES,
+        ]
+        raise BootstrapError(
+            "ERROR: TPU_VERSION picks the TPU generation of the "
+            f"{_and_list(per_generation)} lanes, and this build runs none"
+        )
+    note = (
+        f"Runs only the TPU {TPU_VERSIONS[ctx.tpu_version].name} steps of the "
+        f"{_and_list(in_build)} lane{'s' if len(in_build) > 1 else ''} "
+        f"(`TPU_VERSION={ctx.tpu_version}`)."
+    )
+    if "verify" in in_build:
+        note += " The nightly report is left out: it needs every generation."
+    return note
 
 
 # Build kind -> (Buildkite job priority, Kueue workload priority class).
@@ -780,9 +921,15 @@ def upload_with_priority(
     pr_tpu_concurrency_group: str | None,
     pr_tpu_jobs_per_author: int = PR_TPU_JOBS_PER_AUTHOR,
     env: Mapping[str, str],
+    tpu_generation: str = "",
 ) -> None:
-    """Upload one pipeline YAML file with priority and optional PR TPU capping."""
-    print(f"--- :pipeline: Uploading {yaml_file} with priority {job_priority}")
+    """Upload one pipeline YAML file with priority and optional PR TPU capping.
+
+    `tpu_generation` names the TPU generation whose variables `env` carries,
+    for the log of a file that goes up once per generation.
+    """
+    upload = f"{yaml_file} for TPU {tpu_generation}" if tpu_generation else yaml_file
+    print(f"--- :pipeline: Uploading {upload} with priority {job_priority}")
     raw_yaml = (repo_root / yaml_file).read_text(encoding="utf-8")
     payload = prepare_upload_yaml(raw_yaml, job_priority=job_priority, nightly=nightly)
 
@@ -838,6 +985,22 @@ def upload_with_priority(
     _agent("pipeline", "upload", input_text=payload, env=env)
 
 
+def upload_envs(path: str, tpu_version: str = "") -> tuple[dict[str, str], ...]:
+    """Return the extra variables of each upload of `path`, in upload order.
+
+    A file in TPU_GENERATION_FILES goes up once per TPU generation, with that
+    generation's variables - or, when `tpu_version` (a key of TPU_VERSIONS)
+    names one, for that generation alone; any other file goes up once, with
+    none.
+    """
+    if path not in TPU_GENERATION_FILES:
+        return ({},)
+    generations = TPU_GENERATION_FILES[path]
+    if tpu_version:
+        generations = tuple(g for g in generations if g is TPU_VERSIONS[tpu_version])
+    return tuple(generation.upload_env() for generation in generations)
+
+
 def upload_stages(
     stages: Sequence[Sequence[str]],
     env: Mapping[str, str] | None = None,
@@ -850,6 +1013,8 @@ def upload_stages(
     The `wait` step gates `rest` on every step uploaded in `stages[0]` (including
     both Docker image builds in `pipeline_build.yml`, such as `-omni`, and all
     `pipeline_cpu.yml` checks); a retried uploader skips lanes it already uploaded.
+    A file in TPU_GENERATION_FILES goes up once per TPU generation, or only for
+    the one TPU_VERSION names.
     """
     for stage in stages:
         for lane in stage:
@@ -865,6 +1030,9 @@ def upload_stages(
     job_priority = int(_env_or(child_env, "JOB_PRIORITY", str(PRIORITIES["other"][0])))
     nightly = _env_or(child_env, "NIGHTLY", "0") == "1"
     concurrency_group = child_env.get("PR_TPU_CONCURRENCY_GROUP") or None
+    # Checked by run_bootstrap; a later stage's uploader inherits it from the
+    # build's environment.
+    tpu_version = child_env.get("TPU_VERSION", "").strip()
 
     # Buildkite inserts each `pipeline upload` right after the currently running
     # step (LIFO), so upload `wait` + the next-stage uploader first and then
@@ -929,25 +1097,32 @@ def upload_stages(
         )
 
     for lane in reversed(stages[0]):
-        meta_key = f"upload-stages:{stage_key}:{lane}"
-        if (
-            _agent(
-                "meta-data", "exists", meta_key, check=False, env=child_env
-            ).returncode
-            == 0
-        ):
-            print(f"Skipping {lane} (already uploaded for {stage_key})")
-            continue
         lane_file = f".buildkite/pipeline_{lane}.yml"
-        upload_with_priority(
-            lane_file,
-            repo_root=repo_root,
-            job_priority=job_priority,
-            nightly=nightly,
-            pr_tpu_concurrency_group=concurrency_group,
-            env=child_env,
-        )
-        _agent("meta-data", "set", meta_key, "1", env=child_env)
+        # A file in TPU_GENERATION_FILES goes up once per generation, each with
+        # its own record, so a retried uploader sends up only the ones it has
+        # not: Buildkite rejects a step key uploaded twice.
+        for extra_env in upload_envs(lane_file, tpu_version):
+            generation = extra_env.get("TPU_GENERATION", "")
+            upload = f"{lane}:{generation}" if generation else lane
+            meta_key = f"upload-stages:{stage_key}:{upload}"
+            if (
+                _agent(
+                    "meta-data", "exists", meta_key, check=False, env=child_env
+                ).returncode
+                == 0
+            ):
+                print(f"Skipping {upload} (already uploaded for {stage_key})")
+                continue
+            upload_with_priority(
+                lane_file,
+                repo_root=repo_root,
+                job_priority=job_priority,
+                nightly=nightly,
+                pr_tpu_concurrency_group=concurrency_group,
+                env={**child_env, **extra_env},
+                tpu_generation=generation,
+            )
+            _agent("meta-data", "set", meta_key, "1", env=child_env)
     return 0
 
 
@@ -1116,6 +1291,30 @@ def run_bootstrap(
         suite_note,
         env=child_env,
     )
+    try:
+        tpu_note = tpu_version_note(ctx, suite, nightly=nightly)
+    except BootstrapError as exc:
+        _agent(
+            "annotate",
+            "--style",
+            "error",
+            "--context",
+            "tpu-version",
+            str(exc),
+            env=child_env,
+        )
+        raise
+    if tpu_note is not None:
+        print(tpu_note)
+        _agent(
+            "annotate",
+            "--style",
+            "info",
+            "--context",
+            "tpu-version",
+            tpu_note,
+            env=child_env,
+        )
 
     # 5. Env exports (NIGHTLY, OMNI_IMAGE_SKIP, PR_TPU_CONCURRENCY_GROUP).
     if nightly:
