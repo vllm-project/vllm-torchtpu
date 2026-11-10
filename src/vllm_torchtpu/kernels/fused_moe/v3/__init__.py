@@ -14,11 +14,18 @@
 """The fused expert-parallel MoE kernel: fused_ep_moe, its Config, the
 weight formats, the VMEM accounting, and the layout facts a caller has to
 match."""
+
 from . import device, ffn, layer, layout, vmem
 from .config import Config
-from .formats import (PACKED_ROW_TILE, WEIGHT_BLOCK_DEFAULT,
-                      WEIGHT_FORMAT_NAMES, WEIGHT_FORMS, WeightFormat,
-                      weight_form, weight_format_of_dtype)
+from .formats import (
+    PACKED_ROW_TILE,
+    WEIGHT_BLOCK_DEFAULT,
+    WEIGHT_FORMAT_NAMES,
+    WEIGHT_FORMS,
+    WeightFormat,
+    weight_form,
+    weight_format_of_dtype,
+)
 from .layer import fused_ep_moe
 from .layout import LANES, MESH_AXIS, ROW_BLOCK
 from .routing_tables import ALIGNMENT_SLOT_FIELD, routing_block
