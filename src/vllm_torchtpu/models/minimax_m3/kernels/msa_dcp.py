@@ -54,6 +54,7 @@ from vllm_torchtpu.models.minimax_m3.kernels import (
     msa_fp4,
     msa_indexer,
     msa_select,
+    msa_write,
 )
 
 _NEG_INF = float("-inf")
@@ -297,7 +298,9 @@ def local_candidates(
     # its scan is a few us, and picking a width would cost more.
     widths = [num_cols]
     while widths[0] > _MIN_CANDIDATE_WIDTH and num_tokens > _MIN_CANDIDATE_TOKENS:
-        widths.insert(0, max(_MIN_CANDIDATE_WIDTH, 1 << (widths[0] - 1).bit_length() - 1))
+        widths.insert(
+            0, max(_MIN_CANDIDATE_WIDTH, 1 << (widths[0] - 1).bit_length() - 1)
+        )
     num_blocks = (num_tokens + pad) // block_rows
     if len(widths) == 1:
         row_widths = jnp.full((num_blocks,), num_cols, jnp.int32)
@@ -630,13 +633,6 @@ def msa_write_and_candidates_dcp(
         rank=rank,
         dcp=dcp,
     )
-    write = functools.partial(
-        msa.write_rows,
-        pages=pages,
-        pos=pos,
-        max_num_seqs=max_num_seqs,
-        interpret=interpret,
-    )
     fp4 = scale_cache is not None
     scale_row = msa_fp4.index_scale_row(num_heads) if fp4 else None
     if fp4:
@@ -647,7 +643,6 @@ def msa_write_and_candidates_dcp(
             k,
             v,
             index_k,
-            write,
             pages,
             pos,
             max_num_seqs=max_num_seqs,
@@ -656,8 +651,13 @@ def msa_write_and_candidates_dcp(
         index_q = msa_fp4.rotate_queries(index_q)
     else:
         kv_rows = jnp.concatenate([k, v], axis=-1).reshape(num_tokens, -1)
-        kv_cache = write(kv_cache, kv_rows)
-        index_cache = write(index_cache, index_k)
+        kv_cache, index_cache = msa.write_caches(
+            [msa_write.Rows(kv_cache, kv_rows), msa_write.Rows(index_cache, index_k)],
+            pages,
+            pos,
+            max_num_seqs=max_num_seqs,
+            interpret=interpret,
+        )
     local_lens = local_seq_lens(seq_lens, block_size=block_size, rank=rank, dcp=dcp)
     candidates = functools.partial(
         local_candidates,

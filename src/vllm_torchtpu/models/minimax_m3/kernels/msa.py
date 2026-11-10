@@ -20,8 +20,7 @@ blocks) into the selection, and keeps the ``topk`` best blocks. Attention then
 runs over the selected blocks only (`msa_attention.msa_sparse_attention`).
 """
 
-import functools
-from collections.abc import Callable
+from collections.abc import Sequence
 
 import jax
 import jax.numpy as jnp
@@ -93,6 +92,37 @@ def write_rows_xla(
     )
 
 
+def write_caches(
+    targets: Sequence[msa_write.Rows | msa_write.SlotValues],
+    pages: jax.Array,
+    pos: jax.Array,
+    *,
+    max_num_seqs: int | None = None,
+    interpret: bool = False,
+) -> list[jax.Array]:
+    """Write one row (or slot values) per token into each packed cache of
+    `targets` in one `msa_write.write_runs` call; only the pages that
+    receive rows are rewritten. A request's tokens must be consecutive with
+    consecutive positions. `max_num_seqs` bounds the requests in the batch
+    (default: one per token)."""
+    num_tokens = pages.shape[0]
+    block_size = page_size(targets[0].cache)
+    max_runs = msa_write.max_write_runs(
+        num_tokens,
+        num_tokens if max_num_seqs is None else max_num_seqs,
+        block_size,
+    )
+    targets = [
+        t
+        if isinstance(t, msa_write.SlotValues) or msa_fp4.is_fp4(t.cache)
+        else t._replace(rows=_cache_rows(t.cache, t.rows))
+        for t in targets
+    ]
+    return msa_write.write_runs(
+        targets, pages, pos % block_size, max_runs=max_runs, interpret=interpret
+    )
+
+
 def write_rows(
     cache: jax.Array,
     rows: jax.Array,
@@ -103,29 +133,16 @@ def write_rows(
     scales: jax.Array | None = None,
     interpret: bool = False,
 ) -> jax.Array:
-    """Write one row per token into a packed ``[pages, S / p, p, W]`` cache.
-
-    Only the pages that receive rows are rewritten (`msa_write`). A request's
-    tokens must be consecutive with consecutive positions. `max_num_seqs`
-    bounds the requests in the batch (default: one per token).
-    """
-    num_tokens = rows.shape[0]
-    max_runs = msa_write.max_write_runs(
-        num_tokens,
-        num_tokens if max_num_seqs is None else max_num_seqs,
-        page_size(cache),
-    )
-    fp4 = msa_fp4.is_fp4(cache)
-    return msa_write.write_rows(
-        cache,
-        rows if fp4 else _cache_rows(cache, rows),
+    """`write_caches` of one cache (`msa_write.Rows`: `scales` only for a
+    4-bit cache with folded scales)."""
+    bits = 4 if msa_fp4.is_fp4(cache) else None
+    return write_caches(
+        [msa_write.Rows(cache, rows, bits, scales)],
         pages,
-        pos % page_size(cache),
-        max_runs=max_runs,
-        bits=4 if fp4 else None,
+        pos,
+        max_num_seqs=max_num_seqs,
         interpret=interpret,
-        **({} if scales is None else {"scales": scales}),
-    )
+    )[0]
 
 
 def write_fp4(
@@ -135,7 +152,6 @@ def write_fp4(
     k: jax.Array,
     v: jax.Array,
     index_k: jax.Array,
-    write: Callable[[jax.Array, jax.Array], jax.Array],
     pages: jax.Array,
     pos: jax.Array,
     *,
@@ -143,32 +159,28 @@ def write_fp4(
     interpret: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Rotate, quantize and write one step's K/V (``[T, G, D]``) and index keys
-    (``[T, D]``) into 4-bit caches and their scale page (`msa_fp4`).
+    (``[T, D]``) into 4-bit caches and their scale page (`msa_fp4`), in one
+    `write_caches` call.
 
-    `write(cache, nibble_rows, scales=None)` writes 4-bit rows at the step's
-    slots (`write_rows` bound to `pages` and `pos`). Scale-page rows ``2h`` /
-    ``2h + 1`` hold the K / V scales of head ``h``; the index-key scales are
-    folded into the index pages' last word row (`msa_fp4.scales_in_page`).
+    Scale-page rows ``2h`` / ``2h + 1`` hold the K / V scales of head ``h``;
+    the index-key scales are folded into the index pages' last word row
+    (`msa_fp4.scales_in_page`).
     """
     num_tokens, num_heads, _ = k.shape
     k_nib, k_scale = msa_fp4.quantize(msa_fp4.rotate_keys(k))
     v_nib, v_scale = msa_fp4.quantize(msa_fp4.rotate_keys(v))
     i_nib, i_scale = msa_fp4.quantize(msa_fp4.rotate_keys(index_k))
-    kv_cache = write(
-        kv_cache, jnp.concatenate([k_nib, v_nib], axis=-1).reshape(num_tokens, -1)
-    )
-    index_cache = write(index_cache, i_nib, scales=i_scale)
+    kv_rows = jnp.concatenate([k_nib, v_nib], axis=-1).reshape(num_tokens, -1)
     scales = jnp.stack([k_scale, v_scale], axis=-1).reshape(num_tokens, -1)  # [T, 2G]
-    block_size = page_size(kv_cache)
-    max_runs = msa_write.max_write_runs(
-        num_tokens, num_tokens if max_num_seqs is None else max_num_seqs, block_size
-    )
-    scale_cache = msa_write.write_slot_scales(
-        scale_cache,
-        scales,
+    kv_cache, index_cache, scale_cache = write_caches(
+        [
+            msa_write.Rows(kv_cache, kv_rows, 4),
+            msa_write.Rows(index_cache, i_nib, 4, i_scale),
+            msa_write.SlotValues(scale_cache, scales),
+        ],
         pages,
-        pos % block_size,
-        max_runs=max_runs,
+        pos,
+        max_num_seqs=max_num_seqs,
         interpret=interpret,
     )
     return kv_cache, index_cache, scale_cache
@@ -359,9 +371,6 @@ def msa_forward(
     seq_id, pos, valid = token_positions(num_tokens, seq_lens, cu_q_lens)
     pages = _token_pages(block_tables_2d, seq_id, pos, valid, block_size)
 
-    write = functools.partial(
-        write_rows, pages=pages, pos=pos, max_num_seqs=max_num_seqs, interpret=interpret
-    )
     fp4 = scale_cache is not None
     scale_row = None
     if fp4:
@@ -372,7 +381,6 @@ def msa_forward(
             k,
             v,
             index_k,
-            write,
             pages,
             pos,
             max_num_seqs=max_num_seqs,
@@ -382,8 +390,16 @@ def msa_forward(
         q = msa_fp4.rotate_queries(q)
         index_q = msa_fp4.rotate_queries(index_q)
     else:
-        kv_cache = write(kv_cache, jnp.concatenate([k, v], axis=-1)[:, 0])
-        index_cache = write(index_cache, index_k)
+        kv_cache, index_cache = write_caches(
+            [
+                msa_write.Rows(kv_cache, jnp.concatenate([k, v], axis=-1)[:, 0]),
+                msa_write.Rows(index_cache, index_k),
+            ],
+            pages,
+            pos,
+            max_num_seqs=max_num_seqs,
+            interpret=interpret,
+        )
 
     scores = _block_scores(
         index_q,

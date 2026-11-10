@@ -46,7 +46,6 @@ def _batch(q_lens, ctx_lens, rng, pad_tokens):
     return jnp.asarray(pages), jnp.asarray(pos)
 
 
-@pytest.mark.parametrize("by_page", [False, True])
 @pytest.mark.parametrize("dtype", CACHE_DTYPES)
 @pytest.mark.parametrize("width", [128, 256])
 @pytest.mark.parametrize(
@@ -59,13 +58,7 @@ def _batch(q_lens, ctx_lens, rng, pad_tokens):
         ([], [], 3),  # nothing to write
     ],
 )
-def test_matches_xla_scatter(
-    q_lens, ctx_lens, pad_tokens, width, dtype, by_page, monkeypatch, request
-):
-    if by_page:  # the page path of prefill-sized writes
-        monkeypatch.setattr(msa_write, "_BY_TOKEN_MAX_TOKENS", 0)
-        jax.clear_caches()  # the writes read the threshold when traced
-        request.addfinalizer(jax.clear_caches)
+def test_matches_xla_scatter(q_lens, ctx_lens, pad_tokens, width, dtype):
     rng = np.random.default_rng(sum(q_lens) + width)
     num_tokens = sum(q_lens) + pad_tokens
     cache = pack(
@@ -106,7 +99,7 @@ def test_lowers_for_tpu(dtype):
         )
     text = lowered.as_text()
     assert "tpu_custom_call" in text
-    assert "minimax_m3_msa_write_rows" in text
+    assert "minimax_m3_msa_write_runs" in text
 
 
 @pytest.mark.parametrize("folded", [False, True])
@@ -118,11 +111,8 @@ def test_lowers_for_tpu(dtype):
         ([300], [70], 0),
     ],
 )
-def test_fp4_matches_page_writes(
-    q_lens, ctx_lens, pad_tokens, folded, monkeypatch, request
-):
-    """4-bit writes, token by token (small batches) and page by page, land the
-    same nibbles and folded scales."""
+def test_fp4_matches_scatter(q_lens, ctx_lens, pad_tokens, folded):
+    """4-bit writes land the nibbles and folded scales of the logical scatter."""
     rng = np.random.default_rng(sum(q_lens))
     num_tokens = sum(q_lens) + pad_tokens
     nib = jnp.asarray(rng.integers(0, 16, (NUM_PAGES, PAGE, PAGE)), jnp.uint8)
@@ -144,12 +134,6 @@ def test_fp4_matches_page_writes(
         )
 
     got = write()
-    monkeypatch.setattr(msa_write, "_BY_TOKEN_MAX_TOKENS", 0)
-    jax.clear_caches()  # the writes read the threshold when traced
-    request.addfinalizer(jax.clear_caches)  # no page-path trace outlives the test
-    expected = write()
-    np.testing.assert_array_equal(np.asarray(got), np.asarray(expected))
-    # The page writes are v24's; check them against the logical scatter too.
     want = np.asarray(nib).copy()
     keep = np.asarray(pages) < NUM_PAGES
     p, s = np.asarray(pages)[keep], np.asarray(pos)[keep] % PAGE
@@ -165,7 +149,7 @@ def test_fp4_matches_page_writes(
 
 @pytest.mark.parametrize("tokens", [8, 512])
 @pytest.mark.parametrize("folded", [False, True])
-def test_fp4_by_token_lowers_for_tpu(folded, tokens):
+def test_fp4_lowers_for_tpu(folded, tokens):
     args = (
         jax.ShapeDtypeStruct((4096, PAGE // 8 + folded, 4, PAGE), jnp.uint8),
         jax.ShapeDtypeStruct((tokens, PAGE), jnp.uint8),
@@ -193,10 +177,8 @@ def test_fp4_by_token_lowers_for_tpu(folded, tokens):
         ([300], [70], 0),
     ],
 )
-def test_slot_scales_match_xla_scatter(
-    q_lens, ctx_lens, pad_tokens, num_values, monkeypatch, request
-):
-    """Per-slot scale writes token by token equal the XLA scatter they replace."""
+def test_slot_scales_match_xla_scatter(q_lens, ctx_lens, pad_tokens, num_values):
+    """Per-slot scale writes equal the XLA scatter they replace."""
     rng = np.random.default_rng(sum(q_lens) + num_values)
     num_tokens = sum(q_lens) + pad_tokens
     cache = jnp.asarray(rng.random((NUM_PAGES, 8, PAGE)), jnp.float32)
@@ -210,17 +192,17 @@ def test_slot_scales_match_xla_scatter(
         )
 
     got = write()
-    monkeypatch.setattr(msa_write, "_BY_TOKEN_MAX_TOKENS", 0)
-    jax.clear_caches()  # the writes read the threshold when traced
-    request.addfinalizer(jax.clear_caches)  # no page-path trace outlives the test
-    expected = write()
-    np.testing.assert_array_equal(np.asarray(got), np.asarray(expected))
+    keep = np.asarray(pages) < NUM_PAGES
+    p, s = np.asarray(pages)[keep], np.asarray(pos)[keep] % PAGE
+    want = np.asarray(cache).copy()
+    want[p, :num_values, s] = np.asarray(values)[keep]
+    np.testing.assert_array_equal(np.asarray(got), want)
 
 
 @pytest.mark.parametrize("rows,num_values", [(8, 2), (16, 16)])
 def test_slot_scales_lower_for_tpu(rows, num_values):
     """Up to the largest batch the kernel takes, with 8 KV heads per rank."""
-    tokens = msa_write._BY_TOKEN_MAX_TOKENS
+    tokens = 8192
     args = (
         jax.ShapeDtypeStruct((4096, rows, PAGE), jnp.float32),
         jax.ShapeDtypeStruct((tokens, num_values), jnp.float32),
@@ -232,3 +214,55 @@ def test_slot_scales_lower_for_tpu(rows, num_values):
     with use_abstract_mesh(tpu7x):
         lowered = jax.jit(write).trace(*args).lower(lowering_platforms=("tpu",))
     assert "tpu_custom_call" in lowered.as_text()
+
+
+@pytest.mark.parametrize(
+    "q_lens,ctx_lens,pad_tokens",
+    [
+        ([1, 1, 1], [5, 130, 255], 2),
+        ([8, 8, 8], [124, 40, 250], 8),
+        ([300, 2], [70, 126], 1),
+    ],
+)
+def test_write_runs_targets_match_single_writes(q_lens, ctx_lens, pad_tokens):
+    """One call writing a layer's 4-bit K/V rows, folded index rows and slot
+    scales equals one call per cache."""
+    rng = np.random.default_rng(sum(q_lens) + 7)
+    num_tokens = sum(q_lens) + pad_tokens
+    kv = msa_fp4.pack_rows(
+        jnp.asarray(rng.integers(0, 16, (NUM_PAGES, PAGE, 2 * PAGE)), jnp.uint8)
+    )
+    index = msa_fp4.pack_rows(
+        jnp.asarray(rng.integers(0, 16, (NUM_PAGES, PAGE, PAGE)), jnp.uint8),
+        jnp.asarray(rng.random((NUM_PAGES, PAGE)), jnp.float32),
+    )
+    scale_cache = jnp.asarray(rng.random((NUM_PAGES, 8, PAGE)), jnp.float32)
+    kv_rows = jnp.asarray(rng.integers(0, 16, (num_tokens, 2 * PAGE)), jnp.uint8)
+    index_rows = jnp.asarray(rng.integers(0, 16, (num_tokens, PAGE)), jnp.uint8)
+    index_scales = jnp.asarray(rng.random(num_tokens), jnp.float32)
+    values = jnp.asarray(rng.random((num_tokens, 2)), jnp.float32)
+    pages, pos = _batch(q_lens, ctx_lens, rng, pad_tokens)
+    slots = pos % PAGE
+    max_runs = msa_write.max_write_runs(num_tokens, len(q_lens), PAGE)
+    write = functools.partial(msa_write.write_rows, max_runs=max_runs, interpret=True)
+
+    got = msa_write.write_runs(
+        [
+            msa_write.Rows(kv, kv_rows, 4),
+            msa_write.Rows(index, index_rows, 4, index_scales),
+            msa_write.SlotValues(scale_cache, values),
+        ],
+        pages,
+        slots,
+        max_runs=max_runs,
+        interpret=True,
+    )
+    expected = [
+        write(kv, kv_rows, pages, slots, bits=4),
+        write(index, index_rows, pages, slots, bits=4, scales=index_scales),
+        msa_write.write_slot_scales(
+            scale_cache, values, pages, slots, max_runs=max_runs, interpret=True
+        ),
+    ]
+    for g, e in zip(got, expected):
+        np.testing.assert_array_equal(np.asarray(g), np.asarray(e))
