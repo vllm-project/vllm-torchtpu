@@ -113,7 +113,11 @@ from vllm_torchtpu.gdn_pool_layout import (
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs as rpa_configs
 from vllm_torchtpu.kernels.experimental.batched_rpa import wrapper as rpa_batched
 from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
-from vllm_torchtpu.layers.adapter import dp_vocab_parallel, token_padding
+from vllm_torchtpu.layers.adapter import (
+    dp_vocab_parallel,
+    expert_placement,
+    token_padding,
+)
 from vllm_torchtpu.layers.adapter.attention import (
     KV_LAYOUT_BY_VLLM_LAYOUT,
     TPU_STR_DTYPE_TO_TORCH_DTYPE,
@@ -156,7 +160,7 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
 )
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.tpu_block_size_utils import unified_kv_layout_enabled
-from vllm_torchtpu.runner import greedy_top_tokens
+from vllm_torchtpu.runner import greedy_top_tokens, spec_boundary_state
 from vllm_torchtpu.runner import min_tokens as min_tokens_mask
 from vllm_torchtpu.runner import utils as runner_utils
 from vllm_torchtpu.runner.kernel_block_table import install_kernel_block_tables
@@ -235,6 +239,11 @@ class ExecuteModelState:
     # physical slot. The compact pool shares one slot tensor across groups
     # and so contributes a single-element list.
     mamba_state_indices_list: list[list[torch.Tensor] | None] = field(
+        default_factory=list
+    )
+    # Per chunk, the verify rows that may complete a mamba block this step,
+    # for the boundary-state copy after sampling; None when no row can.
+    mamba_boundary_plans: list[spec_boundary_state.SpecBoundaryPlan | None] = field(
         default_factory=list
     )
     # logits_list holds the greedy tokens ([rows, 1]), not logits
@@ -2122,37 +2131,7 @@ class TPUModelRunner(GPUModelRunner):
             if req_id not in live_req_ids:
                 del self._mamba_state_pos[req_id]
 
-        # Column stride of the mamba block tables, in logical (whole-sequence)
-        # tokens. Three block sizes meet here and only one is correct:
-        #   * self.block_size is the attention/scheduler size -- unrelated to
-        #     mamba tables, whose width is cdiv(max_model_len, mamba size) --
-        #     and a stale __init__-time snapshot besides (the executor
-        #     finalizes cache_config.block_size only after the runner is
-        #     constructed);
-        #   * the mamba groups' kv_cache_spec.block_size (the copy of
-        #     cache_config.mamba_block_size that get_kv_cache_spec bakes into
-        #     every MambaSpec, which then sizes these tables) is physical and
-        #     per-rank, and cannot be stale: specs are created only after the
-        #     platform finalizes block sizes;
-        #   * the scheduler appends a block id to a mamba row only once per
-        #     mamba_block_size * total_cp_world logical tokens, because the
-        #     PCP coordinator patch presents specs to the hybrid coordinator
-        #     at that granularity (_patch_vllm_hybrid_pcp_block_sizes). Mamba
-        #     state is never token-sharded across CP ranks; the cp factor
-        #     exists purely to mirror that allocation cadence.
-        # Every reader of these tables must divide logical token counts by
-        # the allocator's stride. This is the same derivation
-        # AttentionMetadataBuilder.target_block_size uses for its state-slot
-        # lookup -- spec block size times cp world -- so the two readers
-        # cannot diverge. A smaller divisor visits columns the scheduler
-        # never filled: beyond the row width it raises IndexError, within it
-        # the null block silently swallows the recurrent state.
-        try:
-            cp_world_size = get_pcp_group().world_size
-        except Exception:
-            cp_world_size = 1
-        assert self._mamba_state_block_size is not None
-        col_stride = self._mamba_state_block_size * cp_world_size
+        col_stride = self._mamba_column_stride()
         num_computed = self.input_batch.num_computed_tokens_cpu
         req_ids = self.input_batch.req_ids
         crossings: list[tuple[int, int, int]] = []
@@ -2389,6 +2368,40 @@ class TPUModelRunner(GPUModelRunner):
         new_owner_t = stage_h2d_upload(self, torch.tensor(new_owners, dtype=torch.bool))
         off = torch.where(new_owner_t, 0, off)
         return ckpt_t.gather(1, off.unsqueeze(1)).squeeze(1)
+
+    def _mamba_column_stride(self) -> int:
+        """Logical (whole-sequence) tokens per mamba block-table column, the
+        allocator's stride."""
+        # Three block sizes describe the mamba tables and only one is correct:
+        #   * self.block_size is the attention/scheduler size -- unrelated to
+        #     mamba tables, whose width is cdiv(max_model_len, mamba size) --
+        #     and a stale __init__-time snapshot besides (the executor
+        #     finalizes cache_config.block_size only after the runner is
+        #     constructed);
+        #   * the mamba groups' kv_cache_spec.block_size (the copy of
+        #     cache_config.mamba_block_size that get_kv_cache_spec bakes into
+        #     every MambaSpec, which then sizes these tables) is physical and
+        #     per-rank, and cannot be stale: specs are created only after the
+        #     platform finalizes block sizes;
+        #   * the scheduler appends a block id to a mamba row only once per
+        #     mamba_block_size * total_cp_world logical tokens, because the
+        #     PCP coordinator patch presents specs to the hybrid coordinator
+        #     at that granularity (_patch_vllm_hybrid_pcp_block_sizes). Mamba
+        #     state is never token-sharded across CP ranks; the cp factor
+        #     exists purely to mirror that allocation cadence.
+        # Every reader of these tables must divide logical token counts by
+        # the allocator's stride. This is the same derivation
+        # AttentionMetadataBuilder.target_block_size uses for its state-slot
+        # lookup -- spec block size times cp world -- so the two readers
+        # cannot diverge. A smaller divisor visits columns the scheduler
+        # never filled: beyond the row width it raises IndexError, within it
+        # the null block silently swallows the recurrent state.
+        try:
+            cp_world_size = get_pcp_group().world_size
+        except Exception:
+            cp_world_size = 1
+        assert self._mamba_state_block_size is not None
+        return self._mamba_state_block_size * cp_world_size
 
     def _flush_mamba_state_seed_copies(self) -> None:
         if not self._pending_mamba_state_copies:
@@ -4299,6 +4312,7 @@ class TPUModelRunner(GPUModelRunner):
         num_reqs_list = []
         spec_decode_metadata_list = []
         mamba_state_indices_list: list[list[torch.Tensor] | None] = []
+        mamba_boundary_plans: list[spec_boundary_state.SpecBoundaryPlan | None] = []
         draft_chunks: list[DraftChunkInputs] = []
         is_draft_model = self._is_async_drafter
         top_tokens = self._greedy_top_tokens_this_step()
@@ -4600,6 +4614,11 @@ class TPUModelRunner(GPUModelRunner):
                 # Unified pool: one state block per request per mamba group,
                 # captured by the group builders during metadata build.
                 mamba_state_indices_list.append(ctx.unified_mamba_state_indices)
+            mamba_boundary_plans.append(
+                spec_boundary_state.plan_copies(
+                    self, scheduler_output, start_index, num_reqs, ctx.seq_lens
+                )
+            )
             if is_draft_model:
                 assert isinstance(hidden_states, torch.Tensor)
                 # Capture this chunk's draft inputs while they are valid.
@@ -4643,6 +4662,7 @@ class TPUModelRunner(GPUModelRunner):
             spec_decode_metadata_list=spec_decode_metadata_list,
             draft_chunks=draft_chunks,
             mamba_state_indices_list=mamba_state_indices_list,
+            mamba_boundary_plans=mamba_boundary_plans,
             top_tokens=top_tokens,
             kv_save_nan_check=nan_check,
         )
@@ -4774,7 +4794,7 @@ class TPUModelRunner(GPUModelRunner):
         indices_per_group: list[torch.Tensor] | None,
         next_tokens: torch.Tensor | None,
         num_reqs: int,
-    ) -> None:
+    ) -> torch.Tensor | None:
         """Scatter this chunk's mamba read offsets into the slot-indexed buffer.
 
         Each entry holds one mamba group's base slot per batch position for
@@ -4788,10 +4808,11 @@ class TPUModelRunner(GPUModelRunner):
         output for verify chunks, and 0 for non-spec chunks (prefill / plain
         decode) — which also resets a group's offset after prefill. The next
         step's GDN kernel resumes each request from checkpoint `offset` of
-        its state block (the checkpoint of its last accepted token).
+        its state block (the checkpoint of its last accepted token). Returns
+        the offsets, one per batch position.
         """
         if self.mamba_slot_read_offsets is None or not indices_per_group:
-            return
+            return None
         offsets = torch.zeros(
             indices_per_group[0].shape[0],
             dtype=torch.int32,
@@ -4812,6 +4833,7 @@ class TPUModelRunner(GPUModelRunner):
             all_indices = torch.cat(indices_per_group, dim=0).long()
             all_offsets = offsets.repeat(len(indices_per_group))
             self.mamba_slot_read_offsets.index_put_((all_indices,), all_offsets)
+        return offsets
 
     def _mamba_state_index_groups(self) -> list[torch.Tensor] | None:
         """This chunk's mamba state slot/block ids, one tensor per group.
@@ -5235,6 +5257,7 @@ class TPUModelRunner(GPUModelRunner):
         mamba_idx_list = state.mamba_state_indices_list or [None] * len(
             state.logits_list
         )
+        boundary_plans = state.mamba_boundary_plans or [None] * len(state.logits_list)
         # Per-chunk device rejection outputs, kept for the async-spec
         # producer below.
         next_tokens_per_chunk: list[torch.Tensor] = []
@@ -5246,11 +5269,12 @@ class TPUModelRunner(GPUModelRunner):
         elif is_spec_step:
             cur_start_idx = 0
             all_greedy = self.input_batch.all_greedy
-            for logits, num_reqs, md, mamba_indices in zip(
+            for logits, num_reqs, md, mamba_indices, boundary_plan in zip(
                 state.logits_list,
                 state.num_reqs_list,
                 state.spec_decode_metadata_list,
                 mamba_idx_list,
+                boundary_plans,
             ):
                 cur_end_idx = cur_start_idx + num_reqs
                 if md is not None:
@@ -5270,9 +5294,10 @@ class TPUModelRunner(GPUModelRunner):
                     combined_selected_tokens.append(next_tokens)
                     combined_selected_tokens_real_lens.append(num_reqs)
                     next_tokens_per_chunk.append(next_tokens)
-                    self._update_mamba_slot_read_offsets(
+                    read_offsets = self._update_mamba_slot_read_offsets(
                         mamba_indices, next_tokens, num_reqs
                     )
+                    spec_boundary_state.copy_states(self, boundary_plan, read_offsets)
                     if needs_logprobs:
                         # Raw verify logits, one row per draft slot and bonus
                         # slot; each row paired with the token its slot chose.
@@ -5814,6 +5839,9 @@ class TPUModelRunner(GPUModelRunner):
         )
         self.vllm_config.quant_config = get_tpu_quantization_config(self.vllm_config)
 
+        # No placed layers or target depth left over from an earlier load.
+        expert_placement.reset_model_state()
+
         model_loader = get_model_loader(self.load_config)
         logger.info("Loading model from scratch...")
         with (
@@ -5900,6 +5928,10 @@ class TPUModelRunner(GPUModelRunner):
                         dtype=torch.float32,
                         device=self.device,
                     )
+
+        # After the drafter: every placed MoE layer, the drafter's too, must
+        # have had its router renumbered with its experts.
+        expert_placement.check_routers_permuted()
 
         # After the drafter, so its MTP layer is armed too.
         if envs.FUSED_MOE_DECODE_KERNEL:
@@ -7346,6 +7378,7 @@ class TPUModelRunner(GPUModelRunner):
             self._precompile_sampling_subgraphs()
             self._precompile_pooler_subgraphs()
             self._precompile_mamba_rollback_helpers()
+            self._precompile_spec_boundary_copies()
 
             # Precompile multimodal vision encoder graphs
             self.encoder_cudagraph_manager = maybe_create_mm_encoder_manager(
@@ -7730,6 +7763,33 @@ class TPUModelRunner(GPUModelRunner):
                 _rollback_offsets_seed_compiled(offsets, dst)
                 _rollback_offsets_migrate_compiled(offsets, src, dst)
                 n *= 4
+
+    def _precompile_spec_boundary_copies(self) -> None:
+        """Run the boundary copies at every entries shape
+        `spec_boundary_state.plan_copies` stages, for every batch-row count
+        of the sequence lengths, so serving compiles none of their graphs.
+        All-zero entries name no copy: the null block is copied onto itself.
+        """
+        if not spec_boundary_state.enabled(self):
+            return
+        shapes = {
+            spec_boundary_state.entries_shape(self, n)
+            for n in range(1, self.max_num_reqs + 1)
+        }
+        num_rows = {self.num_reqs_max_model_len, self.num_reqs_most_model_len}
+        block_size = self._mamba_column_stride()
+        with self._precompile_timed("mamba boundary-state copies"):
+            for rows in sorted(r for r in num_rows if r is not None):
+                seq_lens = torch.zeros(rows, dtype=torch.int32).to(self.device)
+                read_offsets = torch.zeros(rows, dtype=torch.int32).to(self.device)
+                for shape in sorted(shapes):
+                    entries = torch.zeros(shape, dtype=torch.int32).to(self.device)
+                    plan = spec_boundary_state.SpecBoundaryPlan(
+                        entries, seq_lens, block_size
+                    )
+                    spec_boundary_state.copy_states(self, plan, read_offsets)
+            for _, raws in self._mamba_copy_plan:
+                synchronize_tensors(raws)
 
     def _warmup_spec_decode(self) -> None:
         """Warm the real spec-decode dispatch so the first request doesn't recompile.

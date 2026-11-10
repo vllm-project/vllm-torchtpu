@@ -264,6 +264,21 @@ class TestTpuCompilerCache:
 
         assert dp1 != dp4
 
+    def test_tpu_hash_ignores_the_expert_placement(self):
+        """A placement permutes weights and router tables at load and leaves
+        every program as it was, so a placed server reuses the cache."""
+        from vllm_torchtpu.compilation.tpu_compiler import compute_tpu_compilation_hash
+
+        def placed(value):
+            with patch.dict(os.environ, {"TPU_EXPERT_PLACEMENT": value}):
+                return compute_tpu_compilation_hash(self._config())
+
+        with patch(
+            "vllm_torchtpu.compilation.tpu_compiler._iter_runtime_cache_key_files",
+            return_value=[],
+        ):
+            assert placed("") == placed("/tmp/placement.json")
+
     def test_runtime_hash_covers_custom_op_boundaries(self):
         from vllm_torchtpu.compilation import tpu_compiler
 
