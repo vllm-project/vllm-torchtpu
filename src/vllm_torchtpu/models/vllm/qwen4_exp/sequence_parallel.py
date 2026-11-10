@@ -124,6 +124,30 @@ def sequence_parallel_eligible(
     )
 
 
+def replicated_token_shard_eligible(
+    num_tokens: int, tp_size: int, max_num_seqs: int
+) -> bool:
+    """Whether a bucket outside the sequence-parallel graph takes the
+    replicated backbone with the token-sharded QSA indexer
+    (VLLM_TPU_QSA_PREFILL_REPLICATED_TOKEN_SHARD, ``Qwen4ExpBackboneRP``).
+
+    Each rank's shard must keep the ragged prefill indexer (more rows than
+    request slots), as the token-sharded op asserts. The router applies it
+    after ``sequence_parallel_eligible``.
+    """
+    if not (
+        envs.VLLM_TPU_QSA_PREFILL_REPLICATED_TOKEN_SHARD
+        and tp_size > 1
+        and not envs.VLLM_TPU_QSA_COMPRESSED_DCP
+    ):
+        return False
+    return (
+        num_tokens >= int(envs.VLLM_TPU_QSA_PREFILL_REPLICATED_TOKEN_SHARD_MIN_TOKENS)
+        and num_tokens % tp_size == 0
+        and num_tokens // tp_size > max_num_seqs
+    )
+
+
 def min_tokens(tp_size: int, rows: int = ROW_ALIGNMENT) -> int:
     """Smallest bucket of the sequence-parallel graph."""
     return max(
