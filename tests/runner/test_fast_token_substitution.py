@@ -86,3 +86,24 @@ def test_substitution_enabled_fast_path():
         # Direct slice returns next_tokens_tpu[:4] without calling kernel
         assert not mock_kernel.called
         assert torch.equal(out, torch.tensor([201, 202, 203, 204], dtype=torch.int32))
+
+
+def test_subst_extract_fused_matches_prefix_then_extract():
+    """VLLM_TPU_SUBST_EXTRACT_FUSED: one function returns the same input ids
+    as `_subst_prefix_impl` and the same drafts as `extract_draft_token_ids`."""
+    from vllm_torchtpu.runner.tpu_runner import (
+        _subst_prefix_extract_impl,
+        _subst_prefix_impl,
+    )
+    from vllm_torchtpu.runner.tpu_runner_async_output import extract_draft_token_ids
+
+    src = torch.arange(100, 164, dtype=torch.int32)
+    n = 8
+    logits_idx = torch.tensor([0, 1, 2, 3, 4, 5, 6, 7], dtype=torch.int32)
+    target_idx = torch.tensor([0, 1, 2, 4, 5, 6, 0, 0], dtype=torch.int32)
+    ids_ref = _subst_prefix_impl(src, n, torch.int32)
+    drafts_ref = extract_draft_token_ids(ids_ref, logits_idx, target_idx)
+    ids, drafts = _subst_prefix_extract_impl(src, n, torch.int32, logits_idx, target_idx)
+    assert ids.dtype == ids_ref.dtype and torch.equal(ids, ids_ref)
+    assert drafts.dtype == drafts_ref.dtype and torch.equal(drafts, drafts_ref)
+    assert ids.data_ptr() != src.data_ptr()
