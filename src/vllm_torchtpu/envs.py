@@ -241,6 +241,7 @@ if TYPE_CHECKING:
     VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP: bool = False
     VLLM_TPU_MAMBA_CHECKPOINT_RETENTION: bool = True
     VLLM_TPU_MAMBA_DECODE_CHECKPOINT: bool = True
+    VLLM_TPU_MAMBA_TAIL_FOLD: bool = False
     VLLM_TORCHTPU_IPC_KEY: str = ""
     TPU_SHARDED_LOAD_SYNC_EVERY: int = 512
     VLLM_TPU_MXFP4_DEVICE_DEQUANT: bool = True
@@ -1602,6 +1603,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_MAMBA_DECODE_CHECKPOINT": env_bool(
         "VLLM_TPU_MAMBA_DECODE_CHECKPOINT", default=True
     ),
+    # Qwen4Exp unified pool: finish a prefill in one chunk instead of
+    # splitting off the tokens past its last Mamba block boundary, and write
+    # the GDN / conv / PLE state at that boundary from inside the step
+    # (core/mamba_tail_fold.py). Engine core and workers.
+    "VLLM_TPU_MAMBA_TAIL_FOLD": env_bool("VLLM_TPU_MAMBA_TAIL_FOLD", default=False),
     # Secret for the KV-transfer IPC socket; "" derives one from the host.
     # Read raw, not through env_str: a secret's bytes must not be trimmed.
     "VLLM_TORCHTPU_IPC_KEY": lambda: os.getenv("VLLM_TORCHTPU_IPC_KEY", ""),
