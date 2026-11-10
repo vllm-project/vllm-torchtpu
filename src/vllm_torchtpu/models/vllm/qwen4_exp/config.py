@@ -21,6 +21,7 @@ import torch
 from vllm.config.engram import EngramConfig
 from vllm.config.utils import config, get_hash_factors, hash_factors
 from vllm.model_executor.models.config import (
+    HybridAttentionMambaModelConfig,
     Qwen4ExpForCausalLMConfig,
     Qwen4ExpForConditionalGenerationConfig,
     VerifyAndUpdateConfig,
@@ -159,6 +160,8 @@ class TPUQwen4ExpConfig(VerifyAndUpdateConfig):
             else Qwen4ExpForConditionalGenerationConfig
         )
         normalizer.verify_and_update_config(vllm_config)
+        # Admission runs before VllmConfig's generic hybrid normalization.
+        HybridAttentionMambaModelConfig.verify_and_update_config(vllm_config)
         # Resolve before admission, hashing and worker serialization so storage
         # allocation and forward dispatch use the same backend.
         if (backend := envs.VLLM_TPU_QWEN38_FLASH_PLE_HOST_BACKEND) is not None:

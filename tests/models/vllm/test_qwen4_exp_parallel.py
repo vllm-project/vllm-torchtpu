@@ -30,6 +30,7 @@ def config(tp=1, dp=8):
     text = q4exp_text_config()
     return NS(
         model_config=NS(
+            architecture="Qwen4ExpForConditionalGeneration",
             multimodal_config=None,
             hf_text_config=text,
             hf_config=PretrainedConfig.from_dict(
@@ -66,12 +67,15 @@ def config(tp=1, dp=8):
             mamba_ssm_cache_dtype="float32",
             block_size=128,
             enable_prefix_caching=False,
+            mamba_cache_mode="none",
+            mamba_block_size=None,
             kv_cache_memory_bytes=None,
         ),
         scheduler_config=NS(
             max_num_batched_tokens=128,
             max_num_seqs=64,
             async_scheduling=False,
+            enable_chunked_prefill=True,
             disable_hybrid_kv_cache_manager=False,
         ),
         speculative_config=None,

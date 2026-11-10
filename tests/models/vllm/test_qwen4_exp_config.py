@@ -315,8 +315,9 @@ def test_pd_requires_model_owned_fp8_and_geometric_parallelism(
 
 @pytest.mark.parametrize("role", ["kv_producer", "kv_consumer"])
 @pytest.mark.parametrize("expert_parallel", [False, True])
+@pytest.mark.parametrize("preset_align", [False, True])
 def test_real_config_hook_accepts_pd_with_aligned_apc_and_independent_expert_routing(
-    monkeypatch, role, expert_parallel
+    monkeypatch, role, expert_parallel, preset_align
 ):
     from types import SimpleNamespace
 
@@ -329,13 +330,15 @@ def test_real_config_hook_accepts_pd_with_aligned_apc_and_independent_expert_rou
     cfg.parallel_config.enable_expert_parallel = expert_parallel
     cfg.parallel_config.ubatch_size = 1
     cfg.model_config.multimodal_config = None
+    cache_options = {"mamba_cache_mode": "align"} if preset_align else {}
     cfg.cache_config = CacheConfig(
         block_size=128,
         cache_dtype="fp8_e4m3",
         enable_prefix_caching=True,
-        mamba_cache_mode="align",
         mamba_ssm_cache_dtype="bfloat16",
+        **cache_options,
     )
+    assert cfg.cache_config.mamba_cache_mode == ("align" if preset_align else "none")
     cfg.kv_transfer_config = SimpleNamespace(
         kv_connector="Qwen4ExpRaidenConnector",
         kv_connector_module_path=None,
@@ -348,6 +351,46 @@ def test_real_config_hook_accepts_pd_with_aligned_apc_and_independent_expert_rou
     cfg.speculative_config = object()
     with pytest.raises(ValueError, match="no MTP"):
         validate_config(cfg)
+
+
+@pytest.mark.parametrize("prefix", [False, True])
+@pytest.mark.parametrize("preset", ["none", "align"])
+@pytest.mark.parametrize("chunked", [False, True])
+def test_config_hook_derives_prefix_state_policy_before_admission(
+    prefix, preset, chunked
+):
+    from vllm.config import CacheConfig
+
+    from vllm_torchtpu.models.vllm.qwen4_exp.config import TPUQwen4ExpConfig
+
+    cfg = config()
+    cfg.parallel_config.ubatch_size = 1
+    cfg.scheduler_config.enable_chunked_prefill = chunked
+    cfg.cache_config = CacheConfig(
+        block_size=128,
+        enable_prefix_caching=prefix,
+        mamba_cache_mode=preset,
+        mamba_ssm_cache_dtype="bfloat16",
+    )
+    if prefix and not chunked:
+        with pytest.raises(AssertionError, match="Chunked prefill is required"):
+            TPUQwen4ExpConfig.verify_and_update_config(cfg)
+        return
+    TPUQwen4ExpConfig.verify_and_update_config(cfg)
+    expected = (
+        ("align", cfg.cache_config.block_size)
+        if prefix
+        else ("none", cfg.model_config.max_model_len)
+    )
+    assert (
+        cfg.cache_config.mamba_cache_mode,
+        cfg.cache_config.mamba_block_size,
+    ) == expected
+    TPUQwen4ExpConfig.verify_and_update_config(cfg)
+    assert (
+        cfg.cache_config.mamba_cache_mode,
+        cfg.cache_config.mamba_block_size,
+    ) == expected
 
 
 @pytest.mark.parametrize("value", [None, "auto", "0", "128", "256"])
