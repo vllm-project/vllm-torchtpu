@@ -123,7 +123,9 @@ def _build_tp_all_reduce(mesh, tp: int, form: str | None):
     from jax.sharding import Mesh
 
     n = mesh.shape[EP_AXIS_NAME]
-    mesh2 = Mesh(np.asarray(mesh.devices).reshape(n // tp, tp), axis_names=("dp_", "tp_"))
+    mesh2 = Mesh(
+        np.asarray(mesh.devices).reshape(n // tp, tp), axis_names=("dp_", "tp_")
+    )
     spec = PartitionSpec(("dp_", "tp_"))
 
     def body(block, rank):
@@ -165,8 +167,10 @@ def _tp_pairs_match_mesh(mesh_index: int, tp: int) -> bool:
     order = ep_rank_order()
     tp_ranks = tuple(int(r) for r in get_tp_group().ranks)
     block = mesh_index - mesh_index % tp
-    mine = order is not None and len(tp_ranks) == tp and all(
-        order[block + j] in tp_ranks for j in range(tp)
+    mine = (
+        order is not None
+        and len(tp_ranks) == tp
+        and all(order[block + j] in tp_ranks for j in range(tp))
     )
     group = get_ep_group()
     verdicts = [None] * group.world_size

@@ -261,9 +261,7 @@ def test_a_large_tp_pair_block_falls_back_and_reads_the_pair_rank(
     assert torch.isnan(op.all_reduce_or(x, PAIR, _fallback)).all()
 
 
-def test_a_forced_region_takes_the_tp_pair_kernel_above_the_cap(
-    armed, pair_armed
-):
+def test_a_forced_region_takes_the_tp_pair_kernel_above_the_cap(armed, pair_armed):
     x = _block(op.MAX_ROWS * 2)
     with op.force_small_all_reduce():
         assert op.all_reduce_or(x, PAIR, _fallback) is pair_armed.return_value
