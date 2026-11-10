@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""TPU_DRAFT_VOCAB_PARALLEL: the draft's BF16 greedy head split over all
+"""The vocab-parallel draft head: the draft's BF16 greedy head split over all
 DP x TP ranks returns, for every DP engine's rows, the full-logits argmax
 (ties to the lowest id), the same tokens as the per-TP-group head, and every
 rank issues the same collectives."""
@@ -297,18 +297,10 @@ def test_owner_gating(monkeypatch, caplog):
     assert vp.logits_processor is owner.logits_processor
 
 
-@pytest.mark.parametrize("value,expect", [(None, True), ("1", True), ("0", False), ("off", False)])
-def test_env_default_on_and_opt_out(monkeypatch, value, expect):
-    if value is None:
-        monkeypatch.delenv("TPU_DRAFT_VOCAB_PARALLEL", raising=False)
-    else:
-        monkeypatch.setenv("TPU_DRAFT_VOCAB_PARALLEL", value)
-    assert gtt.draft_vocab_parallel_enabled() is expect
-
-
 def _proposer(draft, lockstep, sharded=True, replicated=False):
     return SimpleNamespace(
         draft_model=draft,
+        vllm_config=None,
         runner=SimpleNamespace(_dp_lockstep_enabled=lambda: lockstep),
         _dp_lockstep_sharded=lambda: lockstep and sharded,
         _draft_replicated=replicated,
@@ -323,26 +315,20 @@ class _Draft(torch.nn.Module):
 
 
 @pytest.mark.parametrize(
-    "lockstep,sharded,replicated,env,expect_vp",
+    "lockstep,sharded,replicated,expect_vp",
     [
-        (True, True, False, None, True),
-        (True, True, False, "0", False),
-        (False, True, False, None, False),
-        (True, False, False, None, False),
-        (True, True, True, None, False),
+        (True, True, False, True),
+        (False, True, False, False),
+        (True, False, False, False),
+        (True, True, True, False),
     ],
 )
 def test_eagle3_uses_the_vocab_parallel_head_only_under_lockstep(
-    monkeypatch, lockstep, sharded, replicated, env, expect_vp
+    monkeypatch, lockstep, sharded, replicated, expect_vp
 ):
     from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
 
     monkeypatch.setenv("TPU_GREEDY_TOP_TOKENS", "1")
-    monkeypatch.delenv("TPU_DRAFT_LM_HEAD_QUANT", raising=False)
-    if env is None:
-        monkeypatch.delenv("TPU_DRAFT_VOCAB_PARALLEL", raising=False)
-    else:
-        monkeypatch.setenv("TPU_DRAFT_VOCAB_PARALLEL", env)
     shards = _tp_shards(torch.randn(64, 8).to(torch.bfloat16), 2, 4)
     _patch_groups(monkeypatch, 4, 2, 2, 1, None, None)
     draft = _Draft(shards[1])
