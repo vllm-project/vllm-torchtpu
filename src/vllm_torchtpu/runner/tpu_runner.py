@@ -113,7 +113,7 @@ from vllm_torchtpu.gdn_pool_layout import (
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs as rpa_configs
 from vllm_torchtpu.kernels.experimental.batched_rpa import wrapper as rpa_batched
 from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
-from vllm_torchtpu.layers.adapter import token_padding
+from vllm_torchtpu.layers.adapter import dp_vocab_parallel, token_padding
 from vllm_torchtpu.layers.adapter.attention import (
     KV_LAYOUT_BY_VLLM_LAYOUT,
     TPU_STR_DTYPE_TO_TORCH_DTYPE,
@@ -909,6 +909,9 @@ class TPUModelRunner(GPUModelRunner):
         # execute_dummy_batch: the coordinated (max-across-ranks) token
         # bucket and chunk count.
         self._dp_target_bucket: int | None = None
+        # Whether the lm_head is sharded over DP (TPU_DP_VOCAB_PARALLEL); set at
+        # model load.
+        self._dp_vocab_logits = False
         self._dp_step_num_chunks: int = 0
         self._dp_step_max_reqs: int = 0
         self._dp_step_has_encoder_inputs = False
@@ -3907,13 +3910,7 @@ class TPUModelRunner(GPUModelRunner):
             return input_ids, None
 
     def _dp_lockstep_enabled(self) -> bool:
-        # EP combine reduces partial expert outputs across DP engines; those
-        # ranks must enter the same collectives with matching token buckets.
-        # Non-EP DP engines remain independently schedulable.
-        return (
-            utils.get_dp_size(self.parallel_config) > 1
-            and self.parallel_config.enable_expert_parallel
-        )
+        return utils.dp_engines_in_lockstep(self.parallel_config)
 
     def _count_input_chunks(
         self, scheduler_output: "SchedulerOutput"
@@ -4541,7 +4538,7 @@ class TPUModelRunner(GPUModelRunner):
                             hidden_states, logits_indices
                         )
                     else:
-                        logits = self.compute_selected_logits(
+                        logits = self._logits_at_dp_vocab_rows(
                             hidden_states, logits_indices
                         )
                 elif top_tokens:
@@ -5793,6 +5790,16 @@ class TPUModelRunner(GPUModelRunner):
         self.model = model
         if self.lora_config is not None:
             self.model = self.load_lora_model(self.model, self.vllm_config, self.device)
+        self._dp_vocab_logits = dp_vocab_parallel.check_layers_sharded_over_dp(
+            self.model
+        )
+        # Only compute_selected_logits is padded to the DP-wide row count; a
+        # layout that selects the logits rows itself (context parallelism,
+        # which TPU_DP_VOCAB_PARALLEL turns off) would bypass the padding.
+        assert not (
+            self._dp_vocab_logits
+            and self.sequence_layout_planner.uses_selected_logits_hidden_states
+        ), "TPU_DP_VOCAB_PARALLEL does not support selected logits hidden states"
         if self.is_pooling_model:
             self._resolve_static_pooler()
         if self.parallel_config.pipeline_parallel_size > 1:
@@ -6357,7 +6364,11 @@ class TPUModelRunner(GPUModelRunner):
             if dp_lockstep:
                 # Idle DP engines must issue the same TP logits collective as
                 # busy engines before the next DP synchronization.
-                _idx = torch.zeros(num_reqs, dtype=torch.int32, device=out.device)
+                _idx = torch.zeros(
+                    self._dp_vocab_logits_rows() if self._dp_vocab_logits else num_reqs,
+                    dtype=torch.int32,
+                    device=out.device,
+                )
                 _ = self.compute_selected_logits(out, _idx)
             if not dp_lockstep:
                 synchronize_tensors(out)
@@ -8279,10 +8290,14 @@ class TPUModelRunner(GPUModelRunner):
                 num_computed_tokens=0,
                 lora_request=None,
             )
+            # The drafts each step proposes are verified by the next one, so
+            # every step asks for K of them (a dynamic speculative decoding
+            # schedule trims host drafts to num_spec_tokens_to_schedule).
             so = SchedulerOutput.make_empty()
             so.scheduled_new_reqs = [new_req]
             so.num_scheduled_tokens = {rid: P}
             so.total_num_scheduled_tokens = P
+            so.num_spec_tokens_to_schedule = K
             assert self.execute_model(so) is None
             self.sample_tokens(None)
             d = self.take_draft_token_ids()
@@ -8305,6 +8320,7 @@ class TPUModelRunner(GPUModelRunner):
                 so.scheduled_cached_reqs = creq
                 so.num_scheduled_tokens = {rid: 1 + K}
                 so.total_num_scheduled_tokens = 1 + K
+                so.num_spec_tokens_to_schedule = K
                 so.scheduled_spec_decode_tokens = {rid: [int(x) for x in list(cur)[:K]]}
                 assert self.execute_model(so) is None
                 self.sample_tokens(None)
@@ -8848,6 +8864,40 @@ class TPUModelRunner(GPUModelRunner):
             CANDIDATE_BLOCK,
         )
         return num_blocks
+
+    def _dp_vocab_logits_rows(self) -> int:
+        """The logits batch every DP rank pads to this step under
+        TPU_DP_VOCAB_PARALLEL: the request bucket of the DP-wide largest chunk,
+        which _dp_coordinated_step all-reduces on busy and idle ranks alike.
+        No chunk's padded request count exceeds it."""
+        return _get_padded_num_reqs_with_upper_limit(
+            self._dp_step_max_reqs, self.max_num_reqs
+        )
+
+    def _logits_at_dp_vocab_rows(
+        self, hidden_states: torch.Tensor, indices: torch.Tensor
+    ) -> torch.Tensor:
+        """`compute_selected_logits` with `indices` padded to the step's
+        TPU_DP_VOCAB_PARALLEL row count, and the logits sliced back after.
+
+        An lm_head sharded over DP runs collectives across DP engines, and
+        TorchTPU pairs those by program: every rank must enter the compiled
+        logits program with the same shapes. The pad and the slice run as
+        rank-local programs of their own, outside it.
+        """
+        if not self._dp_vocab_logits:
+            return self.compute_selected_logits(hidden_states, indices)
+        rows = self._dp_vocab_logits_rows()
+        num_rows = indices.shape[0]
+        if num_rows > rows:
+            raise ValueError(
+                f"logits batch of {num_rows} rows exceeds TPU_DP_VOCAB_PARALLEL's "
+                f"{rows}"
+            )
+        if num_rows == rows:
+            return self.compute_selected_logits(hidden_states, indices)
+        padded = torch.nn.functional.pad(indices, (0, rows - num_rows))
+        return self.compute_selected_logits(hidden_states, padded)[:num_rows]
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def compute_selected_logits(

@@ -40,6 +40,7 @@ At startup, `vllm-torchtpu` reports set environment variables that neither vLLM 
 | `TPU_PP_RING_DEPTH` | `2` | With `TPU_PP_HANDOFF=ring`, the forwards a stage may queue for sending before it waits for room; each device holds up to this many outgoing buffers and up to 7 landing buffers for receives posted ahead of their forwards, each `--max-num-batched-tokens` x hidden size in the model dtype, and that memory is reserved before the KV cache is sized. |
 | `TPU_PCP_TOPOLOGY_AWARE_MESH` | `True` | Orders Prefill Context Parallel (`PCP`) ranks along adjacent ICI torus neighbors to minimize ring hop count. |
 | `TPU_DCP_MLA_TOPK_CAP` | `0` | Caps top-k selection per Decode Context Parallel (`DCP`) rank in Sparse MLA (`0` disables cap). |
+| `TPU_DP_VOCAB_PARALLEL` | `False` | Opt-in. Shards the input embedding and lm_head over every DP x TP rank (the EP group) instead of each DP engine's TP group, cutting their HBM per device by DP x. Needs DP with expert parallelism; ignored, with a warning, under pipeline or context parallelism, speculative decoding, LoRA, pooling or multimodal models, or `TPU_GREEDY_TOP_TOKENS`. |
 | `TPU_DCP_LSE_MERGE_A2A` | `False` | Uses all-to-all LSE merge for Decode Context Parallelism when token count is below `TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS` (`64`). |
 | `TPU_TOKEN_BUCKET_EXTRA` | `[]` | Comma-separated list of additional token padding bucket sizes to precompile. |
 | `TPU_TOKEN_BUCKET_LINEAR` | `False` | Uses linearly spaced token compilation buckets instead of exponential buckets. |
