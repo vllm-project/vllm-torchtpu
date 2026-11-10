@@ -129,6 +129,33 @@ def _render_steps(path: str, env: Mapping[str, str]) -> list[dict[str, Any]]:
 _GENERATION_CHECK_RE = re.compile(r'"(\w+)" ([=!]=) "(v6e|v7x)"')
 # What a step's env says about the chip it runs on, which differs by upload.
 _GENERATION_ENV = frozenset({"SHAPE", "TPU_ACCELERATOR_TYPE", "SKIP_PERF_CHECK"})
+# The tests plugin options that differ by upload: the location prefix keeps
+# each generation's recorded durations apart in the Test Engine suite.
+_GENERATION_TESTS_PLUGIN_OPTIONS = frozenset({"location-prefix"})
+
+
+def _tests_plugin(step: dict[str, Any]) -> dict[str, Any] | None:
+    """The config of a rendered step's `tests` plugin, or None if it has none."""
+    for plugin in step.get("plugins", []):
+        for name, config in plugin.items():
+            if name.startswith("tests#"):
+                return config
+    return None
+
+
+def _same_plugin(plugin: dict[str, Any]) -> dict[str, Any]:
+    """A rendered `plugins` entry less the tests plugin options a generation
+    changes."""
+    same: dict[str, Any] = {}
+    for name, config in plugin.items():
+        if name.startswith("tests#"):
+            config = {
+                k: v
+                for k, v in config.items()
+                if k not in _GENERATION_TESTS_PLUGIN_OPTIONS
+            }
+        same[name] = config
+    return same
 
 
 def _left_out(step: dict[str, Any]) -> bool:
@@ -140,11 +167,14 @@ def _left_out(step: dict[str, Any]) -> bool:
 
 
 def _same_test(step: dict[str, Any]) -> dict[str, Any]:
-    # A step less what a generation changes: its names, chips, soft_fail, and
-    # the generation its `if` compares, which is checked on its own.
+    # A step less what a generation changes: its names, chips, soft_fail, the
+    # tests plugin's location prefix, and the generation its `if` compares,
+    # which is checked on its own.
     rest = {k: v for k, v in step.items() if k not in ("label", "key", "soft_fail")}
     if "env" in step:
         rest["env"] = {k: v for k, v in step["env"].items() if k not in _GENERATION_ENV}
+    if "plugins" in step:
+        rest["plugins"] = [_same_plugin(plugin) for plugin in step["plugins"]]
     if "if" in step:
         rest["if"] = _GENERATION_CHECK_RE.sub(r'"<gen>" \2 "\3"', step["if"])
     return rest
@@ -2349,6 +2379,15 @@ class TestBootstrapUnits(unittest.TestCase):
             {s["env"]["SHAPE"] for s in on["v6e"]},
             {bp.TPU_V6E.shape_single, bp.TPU_V6E.shape_multi},
         )
+        # Each generation's shards are planned on, and report, its own
+        # durations: the tests plugin prefixes its paths with the generation.
+        for gen, steps in on.items():
+            prefixes = {
+                plugin.get("location-prefix")
+                for plugin in map(_tests_plugin, steps)
+                if plugin is not None
+            }
+            self.assertEqual(prefixes, {f"{gen}/"}, gen)
 
         # Buildkite rejects a duplicate key, and GitHub names a commit status
         # after its step's label, so neither may repeat across the CPU checks
@@ -2358,6 +2397,10 @@ class TestBootstrapUnits(unittest.TestCase):
         for field in ("key", "label"):
             names = [s[field] for s in lane]
             self.assertEqual(len(names), len(set(names)), field)
+        # The CPU checks keep the unprefixed paths, apart from both generations.
+        for plugin in map(_tests_plugin, cpu):
+            if plugin is not None:
+                self.assertNotIn("location-prefix", plugin)
 
         # The tests-lane steps the nightly report waits on are CPU or v7x ones.
         verify = yaml.safe_load(

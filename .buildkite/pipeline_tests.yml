@@ -54,6 +54,13 @@ x-tests-plugin-defaults: &tests_plugin_defaults
   test-file-pattern: "tests/**/{test_*,*_test}.py"
   install-client: false
   oidc-lifetime: 7200
+  # bktec balances the shards on each test file's recorded duration, and the
+  # same file runs at a different speed on each generation. The prefix keeps
+  # each generation's durations apart within the suite: bktec adds it to the
+  # file paths it plans and uploads under (v6e/tests/..., v7x/tests/...) and
+  # strips it before running pytest. A new generation gets its own prefix from
+  # TPU_GENERATION.
+  location-prefix: "${TPU_GENERATION:-v7x}/"
 
 # The generation's shapes, from bootstrap.py; the defaults are v7x's, for an
 # upload of this file on its own. One chip is two devices on v7x (two
