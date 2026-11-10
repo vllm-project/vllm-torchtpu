@@ -127,13 +127,58 @@ def test_tp_mesh_without_torch_tpu_uses_runner_mesh_then_jax_devices(
     assert _ids(mesh) == [int(d.id) for d in devs[:4]]
 
 
+_TORCH_TPU_MODULES = ("torch_tpu", "torch_tpu._internal", "torch_tpu._internal.pallas")
+
+
+def _fake_torch_tpu(monkeypatch: pytest.MonkeyPatch, get_pallas_mesh: Any) -> None:
+    """An importable `torch_tpu` whose `_internal.pallas` has `get_pallas_mesh`
+    (every level is set, so a real, already imported `torch_tpu` is shadowed)."""
+    import sys
+    import types
+
+    for name in _TORCH_TPU_MODULES:
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    monkeypatch.setattr(
+        sys.modules["torch_tpu._internal.pallas"],
+        "get_pallas_mesh",
+        get_pallas_mesh,
+        raising=False,
+    )
+
+
+def _never_called(**_kwargs: Any) -> Any:
+    raise AssertionError("torch_tpu's get_pallas_mesh called off TPU")
+
+
 def test_get_pallas_mesh_fn_is_none_without_torch_tpu(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import sys
 
-    monkeypatch.setitem(sys.modules, "torch_tpu", None)
+    monkeypatch.setattr(driver_mod.jax, "default_backend", lambda: "tpu")
+    for name in _TORCH_TPU_MODULES:
+        monkeypatch.setitem(sys.modules, name, None)
     assert driver_mod._get_pallas_mesh_fn() is None
+
+
+def test_get_pallas_mesh_fn_is_torch_tpus_on_tpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _fake_torch_tpu(monkeypatch, _never_called)
+    monkeypatch.setattr(driver_mod.jax, "default_backend", lambda: "tpu")
+    assert driver_mod._get_pallas_mesh_fn() is _never_called
+
+
+def test_cpu_backend_ignores_an_installed_torch_tpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A CPU process (`JAX_PLATFORMS=cpu`, as CI's unit lane) with `torch_tpu`
+    installed builds its mesh from JAX's CPU devices, never torch_tpu's."""
+    assert jax.default_backend() == "cpu"
+    _fake_torch_tpu(monkeypatch, _never_called)
+    assert driver_mod._get_pallas_mesh_fn() is None
+    mesh = driver_mod._build_tp_rank_mesh(1)
+    assert tuple(mesh.axis_names) == ("tp",) and mesh.devices.size == 1
 
 
 class _FakeTPGroup:

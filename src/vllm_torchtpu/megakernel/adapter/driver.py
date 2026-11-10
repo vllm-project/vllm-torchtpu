@@ -112,7 +112,12 @@ _VLLM_STARTUP_MESSAGES: dict[str, str] = {
 
 
 def _get_pallas_mesh_fn() -> Any:
-    """Return `torch_tpu`'s `get_pallas_mesh`, or `None` without `torch_tpu`."""
+    """Return `torch_tpu`'s `get_pallas_mesh` when the megakernel runs on TPU
+    (JAX's default backend is `tpu`) and `torch_tpu` is installed; `None`
+    otherwise. A CPU process (`JAX_PLATFORMS=cpu`, e.g. CI's unit lane) may
+    have `torch_tpu` installed, but its steps run on JAX's CPU devices."""
+    if jax.default_backend() != "tpu":
+        return None
     try:
         from torch_tpu._internal.pallas import get_pallas_mesh
     except ImportError:
@@ -143,15 +148,15 @@ class MeshDecline(Exception):
 def _build_tp_rank_mesh(r_cnt: int, fallback_mesh: Any = None) -> Any:
     """Build an `r_cnt`-device JAX `Mesh` with axis `'tp'` in TP-rank order.
 
-    With `torch_tpu` this is always its Pallas mesh: `torch_tpu` binds
+    On TPU with `torch_tpu` this is always its Pallas mesh: `torch_tpu` binds
     partition `p` to TP rank `p` and requires every Pallas kernel in a program
     to share one device assignment, while the runner mesh may list the devices
     in another order (e.g. ICI ring order), which would send the megakernel's
     remote DMAs, addressed by mesh position, to the wrong peers. Raises
     `MeshDecline` (`pallas_mesh_unavailable` / `pallas_mesh_mismatch`) when
     `torch_tpu` is present but its mesh is unavailable or doesn't hold `r_cnt`
-    devices on axis `'tp'`. Without `torch_tpu` (CPU), the runner mesh is used,
-    then `jax.devices()`.
+    devices on axis `'tp'`. Off TPU, or without `torch_tpu`, the runner mesh
+    is used, then `jax.devices()`.
     """
     get_pallas_mesh = _get_pallas_mesh_fn()
     if get_pallas_mesh is not None:

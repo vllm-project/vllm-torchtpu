@@ -28,6 +28,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import jax
 import pytest
 import torch
 
@@ -180,6 +181,39 @@ def test_toy_plugin_serves_with_vllm_importable_and_no_tp_group(
     runner = _runner({"scale": 3.0})
     drv = driver_mod.ProgramDriver.maybe_create(runner)
     assert isinstance(drv, driver_mod.ProgramDriver) and drv.tp_rank == 0
+    runner._megakernel = drv
+    drv.bind_and_warmup(runner)
+    ids = torch.arange(3, dtype=torch.int32)
+    hit, out = drv.try_forward(runner, StepContext(ids, torch.zeros(3)))
+    assert hit and torch.equal(out, ids.float() * 3.0 + 4)
+
+
+def test_toy_plugin_serves_on_cpu_with_torch_tpu_installed(
+    toy: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CI's CPU lane: `torch_tpu` importable, `JAX_PLATFORMS=cpu`. The driver
+    builds its mesh from JAX's CPU devices (torch_tpu's Pallas mesh needs a
+    TPU process group) and serves."""
+    import types
+
+    assert jax.default_backend() == "cpu"
+
+    def get_pallas_mesh(**_kwargs: Any) -> Any:
+        raise AssertionError("torch_tpu's get_pallas_mesh called off TPU")
+
+    for name in ("torch_tpu", "torch_tpu._internal", "torch_tpu._internal.pallas"):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    monkeypatch.setattr(
+        sys.modules["torch_tpu._internal.pallas"],
+        "get_pallas_mesh",
+        get_pallas_mesh,
+        raising=False,
+    )
+    _no_group(monkeypatch)
+    _fwd_ctx(monkeypatch)
+    runner = _runner({"scale": 3.0})
+    drv = driver_mod.ProgramDriver.maybe_create(runner)
+    assert isinstance(drv, driver_mod.ProgramDriver) and drv.serving
     runner._megakernel = drv
     drv.bind_and_warmup(runner)
     ids = torch.arange(3, dtype=torch.int32)
