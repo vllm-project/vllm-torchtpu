@@ -377,14 +377,18 @@ def _update_read_offsets_verify_impl(
     read_offsets: torch.Tensor,
     stacked_groups: torch.Tensor,
     next_tokens: torch.Tensor,
-) -> None:
+) -> torch.Tensor:
     """Compute accepted-token read offsets on bucketed `next_tokens` [B, K+1]
     and scatter across all mamba groups `stacked_groups` ([width] or [G, width])
     in one program. When `B < width` (e.g. `next_tokens` padded to `padded_num_reqs`
     while `stacked_groups` is sized to `target_num_reqs`), pads `offsets` to
     `width` in-graph so no eager `F.pad` or view materialization runs outside
     compile. Padded tail positions carry slot 0 (the null block) and receive
-    offset 0."""
+    offset 0.
+
+    Returns the `[width]` offsets, one per batch position, for the
+    boundary-state copy (`spec_boundary_state.copy_states`), which reads only
+    the chunk's real rows."""
     if stacked_groups.ndim == 1:
         stacked_groups = stacked_groups.unsqueeze(0)
     width = stacked_groups.shape[1]
@@ -402,6 +406,7 @@ def _update_read_offsets_verify_impl(
         zero,
     )
     read_offsets.index_put_((all_indices,), all_offsets)
+    return offsets
 
 
 _tpu_compile = torch.compile(backend="tpu", fullgraph=True, dynamic=False)
@@ -476,13 +481,13 @@ def _update_read_offsets_verify(
     read_offsets: torch.Tensor,
     stacked_groups: torch.Tensor,
     next_tokens: torch.Tensor,
-) -> None:
+) -> torch.Tensor:
     fn = (
         _update_read_offsets_verify_compiled
         if read_offsets.device.type == "tpu"
         else _update_read_offsets_verify_impl
     )
-    fn(read_offsets, stacked_groups, next_tokens)
+    return fn(read_offsets, stacked_groups, next_tokens)
 
 
 def _reset_read_offsets(
