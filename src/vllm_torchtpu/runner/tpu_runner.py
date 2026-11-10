@@ -404,6 +404,87 @@ def _verify_fused_impl(
 _verify_fused_compiled = _static_shape_args(_tpu_compile(_verify_fused_impl))
 
 
+def _split_verify_uniforms(
+    u: torch.Tensor,
+    bonus_rows: int,
+    vocab: int,
+    accept_shape: tuple[int, ...],
+    recover_rows: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Split one flat uniform draw into the fused verify's bonus, accept and
+    recover uniforms, in the order `_sample_spec_verify_fused` draws them."""
+    n_bonus = bonus_rows * vocab
+    n_accept = math.prod(accept_shape)
+    bonus_u = u[:n_bonus].reshape(bonus_rows, vocab)
+    accept_u = u[n_bonus : n_bonus + n_accept].reshape(accept_shape)
+    recover_u = u[n_bonus + n_accept :].reshape(recover_rows, vocab)
+    return bonus_u, accept_u, recover_u
+
+
+def _verify_uniforms_count(
+    bonus_rows: int, vocab: int, accept_shape: tuple[int, ...], recover_rows: int
+) -> int:
+    return bonus_rows * vocab + math.prod(accept_shape) + recover_rows * vocab
+
+
+def _verify_fused_one_draw_impl(
+    logits: torch.Tensor,
+    bonus_logits_indices: torch.Tensor,
+    target_logits_indices: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
+    u: torch.Tensor,
+    draft_token_ids: torch.Tensor,
+    draft_lengths: torch.Tensor,
+    segment_ids: torch.Tensor,
+    group_indices: torch.Tensor,
+    synthetic_conditional_rates: torch.Tensor | None,
+    max_draft_tokens: int,
+    synthetic_mode: bool,
+    topk_candidates: int,
+    candidates_only: bool = False,
+    num_reqs: torch.Tensor | None = None,
+):
+    """`_verify_fused_impl` fed by one flat uniform draw
+    (VLLM_TPU_VERIFY_ONE_DRAW), split inside the program: the step issues one
+    eager uniform program instead of three, and the compiled call gets the
+    flat draw rather than views of it."""
+    bonus_u, accept_u, recover_u = _split_verify_uniforms(
+        u,
+        bonus_logits_indices.shape[0],
+        logits.shape[-1],
+        tuple(draft_token_ids.shape),
+        target_logits_indices.shape[0],
+    )
+    return _verify_fused_impl(
+        logits,
+        bonus_logits_indices,
+        target_logits_indices,
+        temperatures,
+        top_k,
+        top_p,
+        bonus_u,
+        accept_u,
+        recover_u,
+        draft_token_ids,
+        draft_lengths,
+        segment_ids,
+        group_indices,
+        synthetic_conditional_rates,
+        max_draft_tokens,
+        synthetic_mode,
+        topk_candidates,
+        candidates_only,
+        num_reqs,
+    )
+
+
+_verify_fused_one_draw_compiled = _static_shape_args(
+    _tpu_compile(_verify_fused_one_draw_impl)
+)
+
+
 def _reset_read_offsets(
     read_offsets: torch.Tensor,
     keep_dev: torch.Tensor,
@@ -1477,6 +1558,7 @@ class TPUModelRunner(GPUModelRunner):
         self.drafter = None
         self.rejection_sampler = None
         self._verify_fused_checks_left = envs.VLLM_TPU_VERIFY_FUSED_CHECK
+        self._verify_one_draw_logged = False
         self._verify_fused_checks_done = 0
         self._verify_fused_mismatches: torch.Tensor | None = None
         self._verify_fused_ro_mismatches: torch.Tensor | None = None
@@ -4981,24 +5063,57 @@ class TPUModelRunner(GPUModelRunner):
             cur_start_idx, cur_end_idx, None
         )
         host_phases.mark("vfy_params")
-        bonus_u = torch.rand(
-            (padded_num_reqs, vocab),
-            dtype=torch.float32,
-            device=logits.device,
-            generator=sampling_generator,
-        )
-        accept_u = torch.rand(
-            md.draft_token_ids.shape,
-            dtype=torch.float32,
-            device=logits.device,
-            generator=sampling_generator,
-        )
-        recover_u = torch.rand(
-            (md.target_logits_indices.shape[0], vocab),
-            dtype=torch.float32,
-            device=logits.device,
-            generator=sampling_generator,
-        )
+        one_draw = envs.VLLM_TPU_VERIFY_ONE_DRAW
+        flat_u = None
+        if one_draw:
+            # One flat draw in the separate draws' order, split inside the
+            # program (`_verify_fused_one_draw_impl`). The views below feed
+            # only the VERIFY_FUSED_CHECK reference.
+            accept_shape = tuple(md.draft_token_ids.shape)
+            recover_rows = md.target_logits_indices.shape[0]
+            flat_u = torch.rand(
+                (
+                    _verify_uniforms_count(
+                        padded_num_reqs, vocab, accept_shape, recover_rows
+                    ),
+                ),
+                dtype=torch.float32,
+                device=logits.device,
+                generator=sampling_generator,
+            )
+            bonus_u, accept_u, recover_u = _split_verify_uniforms(
+                flat_u, padded_num_reqs, vocab, accept_shape, recover_rows
+            )
+            if not getattr(self, "_verify_one_draw_logged", False):
+                self._verify_one_draw_logged = True
+                logger.info(
+                    "VERIFY_ONE_DRAW: one uniform draw of %d values per fused "
+                    "verify (rows %d, vocab %d, accept %s, recover rows %d)",
+                    flat_u.shape[0],
+                    padded_num_reqs,
+                    vocab,
+                    accept_shape,
+                    recover_rows,
+                )
+        else:
+            bonus_u = torch.rand(
+                (padded_num_reqs, vocab),
+                dtype=torch.float32,
+                device=logits.device,
+                generator=sampling_generator,
+            )
+            accept_u = torch.rand(
+                md.draft_token_ids.shape,
+                dtype=torch.float32,
+                device=logits.device,
+                generator=sampling_generator,
+            )
+            recover_u = torch.rand(
+                (md.target_logits_indices.shape[0], vocab),
+                dtype=torch.float32,
+                device=logits.device,
+                generator=sampling_generator,
+            )
         host_phases.mark("vfy_rand")
         args = (
             logits,
@@ -5020,6 +5135,17 @@ class TPUModelRunner(GPUModelRunner):
             topk_candidates,
             self._sampler_candidates_only(topk_candidates),
         )
+        if flat_u is not None:
+            call_args = (*args[:6], flat_u, *args[9:])
+
+            def verify(*extra):
+                return _verify_fused_one_draw_compiled(*call_args, *extra)
+
+        else:
+
+            def verify(*extra):
+                return _verify_fused_compiled(*args, *extra)
+
         ro_groups, ro_num_reqs = self._fused_read_offsets
         fold_ro = (
             envs.VLLM_TPU_VERIFY_FUSED_READ_OFFSETS
@@ -5029,9 +5155,7 @@ class TPUModelRunner(GPUModelRunner):
             and self.mamba_slot_read_offsets.device.type == "tpu"
         )
         if fold_ro:
-            out, row_offsets = _verify_fused_compiled(
-                *args, self._num_reqs_tensor(ro_num_reqs)
-            )
+            out, row_offsets = verify(self._num_reqs_tensor(ro_num_reqs))
             # Pad/truncate to the slot groups' width and scatter eagerly, instead
             # of a compiled program that mutates the slot buffer (and its aot
             # mutation epilogue). Padded rows' slots are the null block.
@@ -5067,7 +5191,7 @@ class TPUModelRunner(GPUModelRunner):
                     else self._verify_fused_ro_mismatches + ro_mism
                 )
         else:
-            out = _verify_fused_compiled(*args)
+            out = verify()
         if self._verify_fused_checks_left > 0:
             self._check_verify_fused(out, args)
         return out
@@ -7089,42 +7213,32 @@ class TPUModelRunner(GPUModelRunner):
             envs.VLLM_TPU_VERIFY_FUSED_READ_OFFSETS
             and self.mamba_slot_read_offsets is not None
         )
+        if envs.VLLM_TPU_VERIFY_ONE_DRAW:
+            # The flat-draw variant, at the flat length the step draws.
+            fn = _verify_fused_one_draw_compiled
+            uniforms: tuple[torch.Tensor, ...] = (
+                torch.zeros(
+                    _verify_uniforms_count(
+                        num_reqs,
+                        dummy_logits.shape[-1],
+                        tuple(draft_token_ids.shape),
+                        target_logits_indices.shape[0],
+                    ),
+                    dtype=torch.float32,
+                ).to(self.device),
+            )
+        else:
+            fn = _verify_fused_compiled
+            uniforms = (bonus_u, warm_accept_u, warm_recover_u)
         for topk_candidates in candidates:
-            if fold_ro:
-                synchronize_tensors(
-                    _verify_fused_compiled(
-                        dummy_logits,
-                        bonus_logits_indices,
-                        target_logits_indices,
-                        temps,
-                        top_k,
-                        top_p,
-                        bonus_u,
-                        warm_accept_u,
-                        warm_recover_u,
-                        draft_token_ids,
-                        draft_lengths,
-                        segment_ids,
-                        group_indices,
-                        self.rejection_sampler.synthetic_conditional_rates,
-                        self.speculative_config.num_speculative_tokens,
-                        self.rejection_sampler.synthetic_mode,
-                        topk_candidates,
-                        self._sampler_candidates_only(topk_candidates),
-                        self._num_reqs_tensor(1),
-                    )
-                )
-                continue
-            out = _verify_fused_compiled(
+            args = (
                 dummy_logits,
                 bonus_logits_indices,
                 target_logits_indices,
                 temps,
                 top_k,
                 top_p,
-                bonus_u,
-                warm_accept_u,
-                warm_recover_u,
+                *uniforms,
                 draft_token_ids,
                 draft_lengths,
                 segment_ids,
@@ -7135,7 +7249,62 @@ class TPUModelRunner(GPUModelRunner):
                 topk_candidates,
                 self._sampler_candidates_only(topk_candidates),
             )
-            synchronize_tensors(out)
+            if fold_ro:
+                synchronize_tensors(fn(*args, self._num_reqs_tensor(1)))
+                continue
+            synchronize_tensors(fn(*args))
+        if envs.VLLM_TPU_VERIFY_ONE_DRAW and not getattr(
+            self, "_verify_one_draw_stream_checked", False
+        ):
+            self._verify_one_draw_stream_checked = True
+            self._log_verify_one_draw_stream(
+                num_reqs,
+                dummy_logits.shape[-1],
+                tuple(draft_token_ids.shape),
+                target_logits_indices.shape[0],
+            )
+
+    def _log_verify_one_draw_stream(
+        self,
+        bonus_rows: int,
+        vocab: int,
+        accept_shape: tuple[int, ...],
+        recover_rows: int,
+    ) -> None:
+        """VLLM_TPU_VERIFY_ONE_DRAW: log once whether one flat draw reproduces
+        the three separate draws bit for bit on this backend (two scratch
+        generators, same seed; the serving generator is not touched). Equal:
+        the selected tokens match the three-draw path exactly. Not equal: the
+        same distribution, a different random stream."""
+        try:
+            seed = int(self.model_config.seed or 0)
+            g_sep = torch.Generator(device=self.device)
+            g_sep.manual_seed(seed)
+            g_one = torch.Generator(device=self.device)
+            g_one.manual_seed(seed)
+            sep = [
+                torch.rand(
+                    shape, dtype=torch.float32, device=self.device, generator=g_sep
+                ).reshape(-1)
+                for shape in ((bonus_rows, vocab), accept_shape, (recover_rows, vocab))
+            ]
+            one = torch.rand(
+                (_verify_uniforms_count(bonus_rows, vocab, accept_shape, recover_rows),),
+                dtype=torch.float32,
+                device=self.device,
+                generator=g_one,
+            )
+            equal = bool(torch.equal(torch.cat(sep).cpu(), one.cpu()))
+        except Exception as e:  # noqa: BLE001 - diagnostic only
+            logger.info("VERIFY_ONE_DRAW stream check unavailable: %r", e)
+            return
+        logger.info(
+            "VERIFY_ONE_DRAW stream check (rows %d, vocab %d): one draw %s the "
+            "three separate draws",
+            bonus_rows,
+            vocab,
+            "bit-equals" if equal else "DIFFERS from",
+        )
 
     def _precompile_top_token_verify(
         self,
