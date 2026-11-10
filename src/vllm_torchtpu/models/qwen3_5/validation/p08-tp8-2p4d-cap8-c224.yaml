@@ -254,6 +254,8 @@ legs:
       qwen3_5:
         exp2_softmax: true
         native_fp8_attention: true
+      tpu_collectives:
+        small_all_reduce: true
       tpu_compile:
         drop_global_state_guard: true
         fast_compiled_call: true
