@@ -26,7 +26,6 @@ import bisect
 import contextlib
 import copy
 import dataclasses
-import datetime
 import math
 import os
 import time
@@ -6916,23 +6915,24 @@ class TPUModelRunner(GPUModelRunner):
         # new_group), and torch_tpu's new_group waits a fixed 300 s for every
         # rank's store key. Ranks can finish streaming the target weights
         # further apart than that, so they meet first on the gloo group, whose
-        # timeout is the CPU distributed timeout (30 min under gloo), unless
-        # TPU_DRAFT_LOAD_BARRIER_TIMEOUT_S gives this barrier its own, longer
-        # than a weight load under model-store contention.
-        timeout_s = envs.TPU_DRAFT_LOAD_BARRIER_TIMEOUT_S
+        # timeout is the CPU distributed timeout (30 min under gloo unless
+        # --cpu-distributed-timeout-seconds raises it above a weight load under
+        # model-store contention). With it set, monitored_barrier also names
+        # the ranks that never arrived.
+        timeout = self.parallel_config.cpu_distributed_timeout
         start = time.perf_counter()
-        if timeout_s is None:
+        if timeout is None:
             logger.info("Rank %d waiting at the draft load barrier", world.rank)
             torch.distributed.barrier(group=world.cpu_group)
         else:
             logger.info(
                 "Rank %d waiting at the draft load barrier (timeout %d s)",
                 world.rank,
-                timeout_s,
+                timeout.total_seconds(),
             )
             torch.distributed.monitored_barrier(
                 group=world.cpu_group,
-                timeout=datetime.timedelta(seconds=timeout_s),
+                timeout=timeout,
                 wait_all_ranks=True,
             )
         logger.info(

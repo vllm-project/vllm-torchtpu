@@ -17,7 +17,6 @@
 import vllm_torchtpu.env_override  # noqa: F401  # isort: skip
 
 import ctypes
-import datetime
 import os
 import time
 from typing import Any, cast
@@ -452,14 +451,14 @@ class TPUWorker(WorkerBase):
         # a rank can still be streaming weights after that while its peers sit
         # in a CPU collective (the draft load barrier on prefill, the
         # all_gather_object of build_ep_mesh on decode), and the waiters die
-        # with "Timed out waiting 1800000ms". TPU_DIST_CPU_TIMEOUT_S sets the
-        # timeout of every CPU collective instead.
-        cpu_timeout_s = envs.TPU_DIST_CPU_TIMEOUT_S
+        # with "Timed out waiting 1800000ms". vLLM's
+        # --cpu-distributed-timeout-seconds sets the timeout of every CPU
+        # collective: vLLM's own groups read it, and the world group gets it
+        # here.
+        cpu_timeout = self.parallel_config.cpu_distributed_timeout
         init_kwargs: dict[str, Any] = {}
-        if cpu_timeout_s is not None:
-            if self.parallel_config.cpu_distributed_timeout_seconds is None:
-                self.parallel_config.cpu_distributed_timeout_seconds = cpu_timeout_s
-            init_kwargs["timeout"] = datetime.timedelta(seconds=cpu_timeout_s)
+        if cpu_timeout is not None:
+            init_kwargs["timeout"] = cpu_timeout
         with set_current_vllm_config(self.vllm_config):
             init_distributed_environment(
                 world_size=init_world,
