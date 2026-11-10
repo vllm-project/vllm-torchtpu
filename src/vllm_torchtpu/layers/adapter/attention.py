@@ -1788,6 +1788,44 @@ class PallasAttentionBackendImpl(AttentionImpl):
         return outputs
 
 
+def _qwen3_5_attention_modes(
+    vllm_config: VllmConfig,
+) -> native_fp8_scope.AttentionModes:
+    """The reduced-precision modes the Qwen3.5 settings ask of target layers
+    (off for any other model).
+
+    The settings act per PD leg, in the kernels the IX legs ran them in. On a
+    prefill leg (kv_role kv_producer), native_fp8_attention runs the P.V
+    matmul of the prefill and mixed kernels in fp8 and exp2_softmax does
+    nothing. On a decode leg (kv_consumer), native_fp8_attention runs the
+    decode kernel's P.V matmul in fp8 and exp2_softmax its softmax in base 2.
+    An engine that is neither refuses them.
+    """
+    from vllm_torchtpu.models.qwen3_5 import settings as qwen3_5_settings
+
+    settings = qwen3_5_settings.get(vllm_config)
+    if not (settings.native_fp8_attention or settings.exp2_softmax):
+        return native_fp8_scope.OFF
+    fp8 = (
+        batched_rpa_configs.NativeFp8(pv=batched_rpa_configs.Fp8Operand.STATIC)
+        if settings.native_fp8_attention
+        else batched_rpa_configs.NATIVE_FP8_OFF
+    )
+    transfer = vllm_config.kv_transfer_config
+    role = transfer.kv_role if transfer is not None else None
+    if role == "kv_producer":
+        return native_fp8_scope.AttentionModes(native_fp8_prefill=fp8)
+    if role == "kv_consumer":
+        return native_fp8_scope.AttentionModes(
+            native_fp8=fp8, decode_exp2=settings.exp2_softmax
+        )
+    raise ValueError(
+        "additional_config['qwen3_5'] native_fp8_attention and exp2_softmax "
+        "apply to a PD prefill leg (kv_role kv_producer) or decode leg "
+        f"(kv_consumer) only; this engine's kv_role is {role!r}"
+    )
+
+
 class PallasBatchedRPAAttentionBackendImpl(PallasAttentionBackendImpl):
     """Impl variant that dispatches to the batched RPA Pallas kernel."""
 
@@ -1811,6 +1849,8 @@ class PallasBatchedRPAAttentionBackendImpl(PallasAttentionBackendImpl):
                 kv_cache_dtype=self.kv_cache_quantized_dtype,
                 max_model_len=model_config.max_model_len,
             )
+        if vllm_config is not None and self.head_size != 64:
+            self.attention_modes = _qwen3_5_attention_modes(vllm_config)
 
 
 @register_backend(AttentionBackendEnum.FLASH_ATTN_MLA)
