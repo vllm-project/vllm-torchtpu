@@ -33,9 +33,11 @@ KNOWN_SECTIONS: frozenset[str] = frozenset(
         # keep-sorted start
         "qwen3_5",  # models/qwen3_5/settings.py
         "tpu_collectives",  # distributed/collectives_options.py
+        "tpu_frontend",  # frontend_options.py
         "tpu_multiport_dp",  # distributed/tpu_multiport_dp.py
         "tpu_online_fp8",  # layers/adapter/quantization/online_fp8.py
         "tpu_scheduler",  # core/scheduler_options.py
+        "tpu_worker",  # worker/worker_options.py
         # keep-sorted end
     }
 )

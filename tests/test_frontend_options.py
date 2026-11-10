@@ -128,3 +128,9 @@ def test_platform_hook_rejects_an_unknown_option(installed):
     with p1, p2, p3, pytest.raises(ValueError, match="unknown keys"):
         VllmConfig(additional_config={"tpu_frontend": {"tokenize_cache": True}})
     assert installed == []
+
+
+def test_section_is_registered():
+    from vllm_torchtpu import additional_config_sections
+
+    assert frontend_options.SECTION in additional_config_sections.KNOWN_SECTIONS
