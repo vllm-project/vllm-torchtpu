@@ -35,6 +35,7 @@ import torch
 from torch import nn
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.layers.core.attention_metadata import mamba_ckpt_of, mamba_state_of
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec
 from vllm_torchtpu.megakernel.models import qwen38
@@ -588,9 +589,9 @@ class Qwen38Segments(nn.Module):
         for i in layer_ids:
             md: Any = md_all[self.layers[i].linear_attn.prefix]
             meta += [
-                md.mamba_state_indices.to(torch.int32),
+                mamba_state_of(md).to(torch.int32),
                 md.mamba_slot_read_offsets.to(torch.int32),
-                md.mamba_ckpt_indices.to(torch.int32),
+                mamba_ckpt_of(md).to(torch.int32),
                 md.query_start_loc.to(torch.int32),
                 md.seq_lens.to(torch.int32),
             ]
@@ -1081,9 +1082,9 @@ class Qwen38SegmentDriver:
         NS, T = rows // T_VERIFY, T_VERIFY
         md_h0: Any = get_forward_context().attn_metadata
         md: Any = md_h0[layer.linear_attn.prefix]
-        st = md.mamba_state_indices.to(torch.int64)[:NS]
+        st = mamba_state_of(md).to(torch.int64)[:NS]
         off_tab = md.mamba_slot_read_offsets.to(torch.int64)
-        ck = md.mamba_ckpt_indices.to(torch.int64)[:NS, :T]
+        ck = mamba_ckpt_of(md).to(torch.int64)[:NS, :T]
         seq = md.seq_lens.to(torch.int32)[:NS]
         w = [getattr(segs, f"h0_{i}") for i in range(segs.n_hw[0])]
         with torch.no_grad():
@@ -1404,8 +1405,8 @@ class Qwen38SegmentDriver:
         meta = []
         for k, i in enumerate(gdn_ids):
             md: Any = md_all[segs.layers[i].linear_attn.prefix]
-            st = md.mamba_state_indices.to(torch.int64)[:NS]
-            ck = md.mamba_ckpt_indices.to(torch.int64)[:NS, :T]
+            st = mamba_state_of(md).to(torch.int64)[:NS]
+            ck = mamba_ckpt_of(md).to(torch.int64)[:NS, :T]
             base = 1 + k * CAP * T
             src += [
                 ck.reshape(-1),

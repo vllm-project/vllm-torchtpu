@@ -143,9 +143,8 @@ class StackedMambaAttentionMetadata(AttentionMetadata):
     """A mamba group's metadata whose state / checkpoint ids are one row of a
     walk-wide stack (VLLM_TPU_STAGED_WALK_STACKED).
 
-    `mamba_state_indices` / `mamba_ckpt_indices` read as
-    `mamba_state_stack[mamba_stack_row]` / `mamba_ckpt_stack[...]`, so a
-    consumer traced into the forward slices the row in-graph: the staged walk
+    `mamba_state_indices` / `mamba_ckpt_indices` are None; consumers read
+    `mamba_state_of(md)` / `mamba_ckpt_of(md)` (stack[row], in-graph): the staged walk
     returns 2 stacked outputs per block-geometry class instead of 2 per mamba
     group, with the same values. `mamba_state_stack` is `[G, num_reqs]` int32,
     `mamba_ckpt_stack` `[G, num_reqs, ckpt_window]` int32 (or None), rows in
@@ -159,29 +158,25 @@ class StackedMambaAttentionMetadata(AttentionMetadata):
     mamba_stack_row: int = 0
 
 
-def _stacked_field(name: str, stack: str):
-    own = "_own_" + name
-
-    def get(self):
-        v = getattr(self, own, None)
-        if v is None:
-            st = getattr(self, stack, None)
-            if st is not None:
-                return st[self.mamba_stack_row]
-        return v
-
-    def put(self, value):
-        object.__setattr__(self, own, value)
-
-    return property(get, put)
+def mamba_state_of(md: Any) -> Any:
+    """`md.mamba_state_indices`, or its row of the staged walk's stack
+    (VLLM_TPU_STAGED_WALK_STACKED). Call it inside the traced forward: vLLM's
+    compiled forward resolves metadata attributes as graph inputs, so the
+    stack enters whole and the row slice is an in-graph op (a slice taken
+    outside would reach the program as a view of the larger buffer, which
+    torch_tpu rejects with RuntimeProgramInputMismatch)."""
+    stack = getattr(md, "mamba_state_stack", None)
+    if stack is None:
+        return getattr(md, "mamba_state_indices", None)
+    return stack[md.mamba_stack_row]
 
 
-StackedMambaAttentionMetadata.mamba_state_indices = _stacked_field(  # type: ignore[assignment]
-    "mamba_state_indices", "mamba_state_stack"
-)
-StackedMambaAttentionMetadata.mamba_ckpt_indices = _stacked_field(  # type: ignore[assignment]
-    "mamba_ckpt_indices", "mamba_ckpt_stack"
-)
+def mamba_ckpt_of(md: Any) -> Any:
+    """`md.mamba_ckpt_indices`, or its row of the stack; see `mamba_state_of`."""
+    stack = getattr(md, "mamba_ckpt_stack", None)
+    if stack is None:
+        return getattr(md, "mamba_ckpt_indices", None)
+    return stack[md.mamba_stack_row]
 
 
 @dataclass(frozen=True)
