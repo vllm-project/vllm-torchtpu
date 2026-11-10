@@ -1196,6 +1196,18 @@ def compressed_kernel_pages(
     return (scaled + first).reshape(-1)
 
 
+def prefill_indexer_chunk(tokens: int) -> int | None:
+    """Token chunk of the ragged prefill indexer, or None for one call.
+
+    Default: 512 when it divides the step. VLLM_TPU_QSA_PREFILL_INDEXER_CHUNK
+    overrides it with any multiple of 8 that divides the step.
+    """
+    override = envs.VLLM_TPU_QSA_PREFILL_INDEXER_CHUNK
+    if override and override % 8 == 0 and tokens % override == 0:
+        return override
+    return 512 if tokens % 512 == 0 else None
+
+
 # Largest expanded kernel-page table the ragged prefill indexer prefetches
 # into SMEM (64 request slots at max_model_len 262144 fit; 96 do not).
 PREFILL_PAGE_TABLE_SMEM_BYTES = 512 * 1024
@@ -1346,7 +1358,7 @@ def _select_blocks(
         )
         num_decodes = decode_prefix(starts)
         seq_lens = context + query_lens
-        chunk_tokens = 512 if len(query) % 512 == 0 else None
+        chunk_tokens = prefill_indexer_chunk(len(query))
         # The scalar-prefetched kernel-page table holds every request slot's
         # whole row (slots x max_model_len / 128 pages). Past the SMEM budget
         # (e.g. 96 slots at 262144 tokens: 768 KiB) hand StreamIndex the
@@ -1372,8 +1384,8 @@ def _select_blocks(
             jnp.asarray([num_decodes, num_decodes, num_seqs], dtype=jnp.int32),
             k=block_topk,
             compression_ratio=ratio,
-            num_kv_pages_per_block=(256 // rows,) * 3,
-            num_queries_per_block=(1, 128, 128),
+            num_kv_pages_per_block=(envs.VLLM_TPU_QSA_PREFILL_INDEXER_BKV // rows,) * 3,
+            num_queries_per_block=(1,) + (envs.VLLM_TPU_QSA_PREFILL_INDEXER_BQ,) * 2,
             decode_req_batch_size=8,
             enable_early_exit=True,
             chunk_tokens=chunk_tokens,

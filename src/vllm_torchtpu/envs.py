@@ -150,6 +150,9 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_DECODE_POOL_PAGE_DMA: bool = False
     VLLM_TPU_QSA_INDEXER_SC_BOUNDED_COPY: bool = False
     VLLM_TPU_QSA_PREFILL_SC_BOUNDED_COPY: bool = False
+    VLLM_TPU_QSA_PREFILL_INDEXER_CHUNK: int = 0
+    VLLM_TPU_QSA_PREFILL_INDEXER_BQ: int = 128
+    VLLM_TPU_QSA_PREFILL_INDEXER_BKV: int = 256
     VLLM_TPU_QSA_DECODE_RPA_LANES: int = 8
     VLLM_TPU_QSA_DECODE_RPA_MAX_QUERIES: int = 0
     VLLM_TPU_QSA_FUSED_KV_WRITE: bool = False
@@ -816,6 +819,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Qwen4-exp prefill indexer: the same bounded SparseCore score copy for
     # prefill chunks (rows early in a prompt see a short context).
+    # Qwen4-exp ragged prefill indexer: score/select in chunks of this many
+    # tokens, overlapping chunk g's SparseCore top-k with chunk g+1's scoring.
+    # 0 (default) keeps 512-token chunks for steps that are a multiple of 512
+    # and one unchunked call otherwise. A value that does not divide the step
+    # (or is not a multiple of 8) falls back to the default. Per-row scores
+    # and winners do not depend on the chunking.
+    "VLLM_TPU_QSA_PREFILL_INDEXER_CHUNK": env_nonnegative_int(
+        "VLLM_TPU_QSA_PREFILL_INDEXER_CHUNK", 0
+    ),
+    # Qwen4-exp ragged prefill indexer tiles: queries per block of the prefill
+    # passes and compressed keys per KV block (a multiple of 256). Defaults
+    # 128 / 256 are the served tiles. Each score keeps its own expression, so
+    # the winners do not depend on the tiling. BKV=1024 also aligns the score
+    # row width to whole sublane tiles, so the SparseCore's 1-D view of the
+    # scores needs no relayout copy before the top-k.
+    "VLLM_TPU_QSA_PREFILL_INDEXER_BQ": env_nonnegative_int(
+        "VLLM_TPU_QSA_PREFILL_INDEXER_BQ", 128
+    ),
+    "VLLM_TPU_QSA_PREFILL_INDEXER_BKV": env_nonnegative_int(
+        "VLLM_TPU_QSA_PREFILL_INDEXER_BKV", 256
+    ),
     "VLLM_TPU_QSA_PREFILL_SC_BOUNDED_COPY": env_bool(
         "VLLM_TPU_QSA_PREFILL_SC_BOUNDED_COPY", default=False
     ),
