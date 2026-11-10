@@ -1161,13 +1161,14 @@ class TpuPlatform(Platform):
                 # RANK/LOCAL_RANK/WORLD_SIZE before vLLM distributed init.
                 os.environ["TORCH_TPU_DP_SIZE"] = str(dp_size)
                 # Single-host --data-parallel-multi-port-external-lb rank
-                # (opt-in, TPU_MULTIPORT_DP_LOCAL_SIZE): fixes the shared DP
-                # master port and slicebuilder list before the defaults below.
+                # (opt-in, additional_config["tpu_multiport_dp"]): fixes the
+                # shared DP master port and slicebuilder list before the
+                # defaults below.
                 from vllm_torchtpu.distributed.tpu_multiport_dp import (
                     prepare_multiport_dp_env,
                 )
 
-                multiport_dp = prepare_multiport_dp_env(parallel_config)
+                multiport_dp = prepare_multiport_dp_env(vllm_config)
                 os.environ.setdefault(
                     "TORCH_TPU_DP_MASTER_ADDR",
                     parallel_config.data_parallel_master_ip or "localhost",

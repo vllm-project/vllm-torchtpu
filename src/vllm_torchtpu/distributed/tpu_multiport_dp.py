@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """TPU support for vLLM's single-host multi-port DP launch.
 
 ``vllm serve --data-parallel-multi-port-external-lb`` starts a DPSupervisor
@@ -16,81 +28,121 @@ them into one N*TP torch_tpu world, they also need to agree on the slice
 bootstrap: one DP master port and one slicebuilder address list.
 
 vLLM builds no VllmConfig in the supervisor process, so no platform hook runs
-there. Each child therefore derives the shared values itself, deterministically
-from arguments that are identical in every child. This is opt-in:
-``TPU_MULTIPORT_DP_LOCAL_SIZE=<N>`` declares that the N ranks of a multi-port
-server share this host. Unset (0) changes nothing.
+there, and a child's arguments do not say that its siblings share its host.
+Each child therefore derives the shared values itself, deterministically from
+arguments that are identical in every child, once the server opts in with
+``--additional-config '{"tpu_multiport_dp": {"enabled": true}}'``: the
+``--data-parallel-size`` ranks of the multi-port server share this host. The
+supervisor copies its arguments, this option included, into every child. Off
+(the default) changes nothing.
 
 * ``prepare_multiport_dp_env`` (from ``TpuPlatform.check_and_update_config``,
   in each child API server): the vLLM DP group ports, the torch_tpu DP master
   port and the slicebuilder list for the whole N*TP slice; the cross-host
   rendezvous is not run.
-* ``device_control_env_var`` (from ``register_tpu_platform``, in every
-  process): the supervisor's ``--device-ids`` count TPU cores, not the chips
-  ``TPU_VISIBLE_CHIPS`` lists. Chip binding on this path is owned by the TPU
-  worker binding, so vLLM's device-control variable is not consulted, which
-  is what expert parallelism already does in ``check_and_update_config``.
+* ``resolve_device_ids`` (wraps vLLM's ``EngineArgs._resolve_device_ids``,
+  installed by the package's general plugin, which vLLM loads in
+  ``EngineArgs.__post_init__``): the supervisor's ``--device-ids``
+  count TPU cores, not the chips ``TPU_VISIBLE_CHIPS`` lists. Chip binding on
+  this path is owned by the TPU worker binding, so vLLM's device-control
+  variable is not consulted, which is what expert parallelism already does in
+  ``check_and_update_config``.
 * ``engine_core_kwargs`` (from ``_run_engine_core_with_tpu_patches``, in each
   engine core): ``local_dp_rank = dp_rank % N`` and
   ``data_parallel_size_local = N``, so workers bind chips by their real slot
   on the host.
 """
 
+import dataclasses
+import functools
+import json
 import os
+from collections.abc import Mapping
+from typing import Any
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
 
+# The --additional-config section. Launch topology only: each engine compiles
+# the same programs as under internal-LB DP, so runner/utils.py keeps it out of
+# the compile-cache key.
+SECTION = "tpu_multiport_dp"
+
 # vLLM's base Platform value; TpuPlatform.check_and_update_config switches to
 # it for expert parallelism.
 DEVICE_CONTROL_PLACEHOLDER = "VLLM_DEVICE_CONTROL_ENV_VAR_PLACEHOLDER"
 
 
-def local_dp_size() -> int:
-    """N from TPU_MULTIPORT_DP_LOCAL_SIZE; 0 means the feature is off."""
-    return envs.TPU_MULTIPORT_DP_LOCAL_SIZE
+@dataclasses.dataclass(frozen=True)
+class MultiportDpOptions:
+    """``additional_config["tpu_multiport_dp"]``."""
+
+    # The --data-parallel-size ranks of a --data-parallel-multi-port-external-lb
+    # server share this host.
+    enabled: bool = False
 
 
-def device_control_env_var(default: str) -> str:
-    """The platform's device-control variable under the opt-in, else default."""
-    return DEVICE_CONTROL_PLACEHOLDER if local_dp_size() > 0 else default
+def options(additional_config: Any) -> MultiportDpOptions:
+    """The parsed section; unknown keys and non-bool values raise ValueError."""
+    if isinstance(additional_config, str):
+        additional_config = json.loads(additional_config) if additional_config else {}
+    raw = (
+        additional_config.get(SECTION)
+        if isinstance(additional_config, Mapping)
+        else None
+    )
+    if raw is None:
+        return MultiportDpOptions()
+    if not isinstance(raw, Mapping):
+        raise ValueError(f"additional_config[{SECTION!r}] must be a JSON object")
+    known = {f.name for f in dataclasses.fields(MultiportDpOptions)}
+    unknown = sorted(str(k) for k in raw if k not in known)
+    if unknown:
+        raise ValueError(
+            f"Unknown key(s) {unknown} in additional_config[{SECTION!r}]; "
+            f"known keys: {sorted(known)}"
+        )
+    if "enabled" in raw and type(raw["enabled"]) is not bool:
+        raise ValueError(f"additional_config[{SECTION!r}]['enabled'] must be a bool")
+    return MultiportDpOptions(**dict(raw))
 
 
-def _validate(parallel_config, local_size: int) -> None:
-    dp_size = parallel_config.data_parallel_size
+def local_dp_size(vllm_config) -> int:
+    """The DP ranks that share this host under the option; 0 means off."""
+    if not options(getattr(vllm_config, "additional_config", None)).enabled:
+        return 0
+    return int(vllm_config.parallel_config.data_parallel_size)
+
+
+def _validate(parallel_config) -> None:
     if not parallel_config.data_parallel_external_lb:
         raise ValueError(
-            f"TPU_MULTIPORT_DP_LOCAL_SIZE={local_size} is set, but this server "
-            "is not a rank of --data-parallel-multi-port-external-lb "
-            "(data_parallel_external_lb is False). Unset it for internal or "
+            f"additional_config[{SECTION!r}] is enabled, but this server is not "
+            "a rank of --data-parallel-multi-port-external-lb "
+            "(data_parallel_external_lb is False). Turn it off for internal or "
             "hybrid DP load balancing."
-        )
-    if local_size != dp_size:
-        raise NotImplementedError(
-            f"TPU_MULTIPORT_DP_LOCAL_SIZE={local_size} must equal "
-            f"--data-parallel-size ({dp_size}): multi-port DP on TPU supports "
-            "only all DP ranks on one host."
         )
     if parallel_config.nnodes > 1:
         raise NotImplementedError(
-            "TPU_MULTIPORT_DP_LOCAL_SIZE does not support --nnodes > 1."
+            f"additional_config[{SECTION!r}] does not support --nnodes > 1: "
+            "multi-port DP on TPU supports only all DP ranks on one host."
         )
 
 
-def prepare_multiport_dp_env(parallel_config) -> bool:
+def prepare_multiport_dp_env(vllm_config) -> bool:
     """Set the shared slice bootstrap for one multi-port DP rank.
 
-    Returns False (and does nothing) unless TPU_MULTIPORT_DP_LOCAL_SIZE is
-    set. Must run before ``check_and_update_config`` defaults
-    TORCH_TPU_DP_MASTER_PORT, and in place of ``prepare_mp_multihost_dp_env``.
-    Idempotent per process.
+    Returns False (and does nothing) unless the option is enabled. Must run
+    before ``check_and_update_config`` defaults TORCH_TPU_DP_MASTER_PORT, and
+    in place of ``prepare_mp_multihost_dp_env``. Idempotent per process.
     """
-    local_size = local_dp_size()
+    local_size = local_dp_size(vllm_config)
     if local_size <= 0:
         return False
-    _validate(parallel_config, local_size)
+    parallel_config = vllm_config.parallel_config
+    _validate(parallel_config)
 
     # Every child picks its own random DP-init ports in ParallelConfig; the
     # engines' DP group would never form. Same fix and same ports as
@@ -134,15 +186,15 @@ def engine_core_kwargs(kwargs: dict) -> dict:
     """Give a multi-port engine core its real local DP rank and local size.
 
     ``kwargs`` are EngineCoreProc.run_engine_core's keyword arguments. Returns
-    them unchanged unless TPU_MULTIPORT_DP_LOCAL_SIZE is set and the engine is
-    an external-LB DP rank.
+    them unchanged unless the option is enabled and the engine is an
+    external-LB DP rank.
     """
-    local_size = local_dp_size()
-    if local_size <= 1:
-        return kwargs
     vllm_config = kwargs.get("vllm_config")
     parallel_config = getattr(vllm_config, "parallel_config", None)
     if parallel_config is None or not parallel_config.data_parallel_external_lb:
+        return kwargs
+    local_size = local_dp_size(vllm_config)
+    if local_size <= 1:
         return kwargs
     dp_rank = kwargs.get("dp_rank", 0)
     kwargs = dict(kwargs)
@@ -156,3 +208,31 @@ def engine_core_kwargs(kwargs: dict) -> dict:
         local_size,
     )
     return kwargs
+
+
+def resolve_device_ids(original, engine_args) -> Any:
+    """``EngineArgs._resolve_device_ids`` for a multi-port child: with the
+    option on, the platform stops consulting TPU_VISIBLE_CHIPS (as expert
+    parallelism does later in ``check_and_update_config``), so the
+    supervisor's core-indexed ``--device-ids`` pass vLLM's range check."""
+    if options(getattr(engine_args, "additional_config", None)).enabled:
+        from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+
+        TpuPlatform.device_control_env_var = DEVICE_CONTROL_PLACEHOLDER
+    return original(engine_args)
+
+
+def install_device_ids_patch() -> None:
+    """Wrap vLLM's EngineArgs._resolve_device_ids once per process."""
+    from vllm.engine.arg_utils import EngineArgs
+
+    if getattr(EngineArgs._resolve_device_ids, "_tpu_multiport_dp_patch", False):
+        return
+    original = EngineArgs._resolve_device_ids
+
+    @functools.wraps(original)
+    def _resolve_device_ids(self):
+        return resolve_device_ids(original, self)
+
+    _resolve_device_ids._tpu_multiport_dp_patch = True  # type: ignore[attr-defined]
+    EngineArgs._resolve_device_ids = _resolve_device_ids

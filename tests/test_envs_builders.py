@@ -261,7 +261,6 @@ def test_str_keeps_an_explicit_empty_value_distinct_from_unset(monkeypatch):
         ("DEBUG_TPU_LOCAL_RANK_OFFSET", 0),
         ("TORCH_TPU_BASE_PORT", 8070),
         ("TORCH_TPU_MP_RENDEZVOUS_PORT", None),
-        ("TPU_MULTIPORT_DP_LOCAL_SIZE", 0),
         ("TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT", ""),
         ("SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES", None),
     ],

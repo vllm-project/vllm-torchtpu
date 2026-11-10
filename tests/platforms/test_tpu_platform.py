@@ -493,11 +493,10 @@ class TestTpuPlatform:
     ):
         """A --data-parallel-multi-port-external-lb child (DP4 x TP2, rank 3)
         looks like one host of a four-host DP deployment. With
-        TPU_MULTIPORT_DP_LOCAL_SIZE it skips the cross-host rendezvous, sizes
+        additional_config["tpu_multiport_dp"] it skips the cross-host rendezvous, sizes
         the single-host bootstrap for the whole 8-device slice, and uses the
         deterministic DP master port every sibling derives."""
         for key in (
-            "TPU_MULTIPORT_DP_LOCAL_SIZE",
             "TORCH_TPU_DP_SIZE",
             "TORCH_TPU_DP_MASTER_ADDR",
             "TORCH_TPU_DP_MASTER_PORT",
@@ -505,8 +504,9 @@ class TestTpuPlatform:
         ):
             monkeypatch.setenv(key, os.environ.get(key, ""))
             monkeypatch.delenv(key)
-        if multiport:
-            monkeypatch.setenv("TPU_MULTIPORT_DP_LOCAL_SIZE", "4")
+        vllm_config.additional_config = (
+            {"tpu_multiport_dp": {"enabled": True}} if multiport else {}
+        )
         mock_multihost_dp.return_value = True
         pc = vllm_config.parallel_config
         pc.data_parallel_size = 4
@@ -529,7 +529,11 @@ class TestTpuPlatform:
                 f"localhost:{8070 + i}" for i in range(8)
             )
             assert pc._data_parallel_master_port_list == [
-                29650, 29651, 29652, 29653, 29654
+                29650,
+                29651,
+                29652,
+                29653,
+                29654,
             ]
         else:
             # Unchanged path: the multi-host DP bootstrap decides.
