@@ -23,6 +23,13 @@ from vllm_torchtpu.kernels.experimental.moe_dense_expert import (
     can_use_dense_expert,
     dense_expert_moe,
 )
+from vllm_torchtpu.kernels.experimental.moe_lowtok import (
+    can_use_moe_lowtok,
+    moe_lowtok,
+)
+from vllm_torchtpu.kernels.experimental.moe_lowtok import (
+    routing_table as moe_lowtok_routing_table,
+)
 from vllm_torchtpu.kernels.megablox.gmm_v2 import get_packing_factor, gmm_v2
 from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
     blockwise_onehot_unpermute,
@@ -93,6 +100,9 @@ _COUNTING_SORT_BLOCK = 512
 # Ragged permute keeps the packed sort so SparseCore gather overlap is
 # unchanged, and past one block the scatter costs more than that sort.
 _COUNTING_SORT_SCATTER_MAX_ROWS = _COUNTING_SORT_BLOCK
+_MOE_LOWTOK = envs.TPU_MOE_LOWTOK
+_MOE_LOWTOK_IDS = envs.TPU_MOE_LOWTOK_IDS
+_MOE_LOWTOK_MAX_TOKENS = envs.TPU_MOE_LOWTOK_MAX_TOKENS
 
 
 def resolve_onehot_permute_threshold() -> int:
@@ -673,6 +683,7 @@ def moe_gmm(
         "onehot_moe_permute_threshold",
         "rhs_quant_dtype",
         "skip_padded_tokens",
+        "num_primary_experts",
     ),
 )
 def fused_moe_func(
@@ -693,6 +704,7 @@ def fused_moe_func(
     onehot_moe_permute_threshold: int = 0,
     rhs_quant_dtype: jnp.dtype | None = None,
     skip_padded_tokens: bool = False,
+    num_primary_experts: int | None = None,
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
 
@@ -712,6 +724,13 @@ def fused_moe_func(
     weights. Currently, only INT4 logical weights packed inside INT32 or UINT32 carrier
     containers are supported. Weights must be packed along the contracting dimension
     (K-axis) in LSB-first order.
+
+    ``num_primary_experts`` bounds the shard's local interval when the weight
+    tensors hold more slots than the shard owns (an expert placement with copy
+    slots after the primaries, ``expert_placement``): without it the interval
+    is every local slot, and the next shard's first ids would be taken as
+    local and summed a second time. ``None`` (the default) is the full slot
+    count, the behaviour without a placement.
     """
 
     # Convert 3D scale [experts, blocks, N] to 4D [experts, blocks, 1, N]
@@ -746,11 +765,40 @@ def fused_moe_func(
         hidden_states = jnp.where(jnp.isfinite(hidden_states), hidden_states, 0)
         topk_weights = jnp.where(jnp.isfinite(topk_weights), topk_weights, 0)
 
+    owned = w1.shape[0]
     if use_ep and experts_start is not None:
+        owned = w1.shape[0] if num_primary_experts is None else num_primary_experts
+        if not 0 < owned <= w1.shape[0]:
+            raise ValueError("num_primary_experts must fit the local weight slots")
         local_ids = topk_ids - experts_start
-        valid = (local_ids >= 0) & (local_ids < w1.shape[0])
+        valid = (local_ids >= 0) & (local_ids < owned)
         topk_weights = jnp.where(valid, topk_weights, jnp.zeros_like(topk_weights))
         topk_ids = jnp.where(valid, local_ids, jnp.full_like(local_ids, -1))
+
+    if (
+        _MOE_LOWTOK
+        and _MOE_LOWTOK_IDS
+        and use_ep
+        and experts_start is not None
+        and 0 < num_tokens <= _MOE_LOWTOK_MAX_TOKENS
+        and can_use_moe_lowtok(
+            hidden_states,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            w1_bias,
+            w2_bias,
+            activation=activation,
+            rhs_quant_dtype=rhs_quant_dtype,
+        )
+    ):
+        logger.info_once(
+            "Selected experimental small-batch MoE (max tokens %d)",
+            _MOE_LOWTOK_MAX_TOKENS,
+        )
+        route = moe_lowtok_routing_table(topk_ids, topk_weights, owned)
+        return moe_lowtok(hidden_states, route, w1, w1_scale, w2, w2_scale)
 
     # Decode services also compile large prefill buckets. Apply the token
     # threshold before kernel admission so those buckets retain routed GMM.
@@ -768,7 +816,14 @@ def fused_moe_func(
     ):
         logger.info_once("Selected experimental dense-expert decode MoE")
         return dense_expert_moe(
-            hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids
+            hidden_states,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            topk_weights,
+            topk_ids,
+            num_primary_experts=owned,
         )
 
     (
@@ -782,7 +837,7 @@ def fused_moe_func(
         hidden_states,
         topk_ids,
         topk_weights,
-        local_num_experts=w1.shape[0],
+        local_num_experts=owned,
         topk=topk,
         use_ep=use_ep,
         use_sparse_core=use_sparse_core,
