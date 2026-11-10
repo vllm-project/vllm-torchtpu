@@ -172,7 +172,7 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             ScratchReq("qc_rk", pltpu.VMEM((nreq, 8, 256), F32)),
             ScratchReq("qc_rv", pltpu.VMEM((nreq, 8, 256), F32)),
             ScratchReq("qc_sga", pltpu.SMEM((ex.MB,), I32)),
-            ScratchReq("qc_sem", pltpu.SemaphoreType.DMA((3,))),
+            ScratchReq("qc_sem", pltpu.SemaphoreType.DMA((4,))),
             ScratchReq("qf_kr", pltpu.VMEM((ex.MB, g.HD), BF16)),
             ScratchReq("qc_ir", pltpu.VMEM((ex.MB, ix.IDX_DIM), BF16)),
             ScratchReq("qc_osem", pltpu.SemaphoreType.DMA((2,))),
@@ -361,13 +361,20 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         """Compressed key of request `q`'s group completed this step; writes its outputs."""
         ex, scr, g, T = ctx.ex, ctx.scr, ctx.g, ctx.ex.T
         c0 = ctx.extra[CTXQ][q]
-        for src, dst, i in (
-            (ctx.extra[RING].at[self.row_base(ctx, l) + q], scr["qc_ring"], 0),
-            (ctx.extra[ROPE_CK].at[q], scr["qc_rope"], 1),
-        ):
-            cp = pltpu.make_async_copy(src, dst, scr["qc_sem"].at[i])
+        loads = [
+            pltpu.make_async_copy(src, dst, scr["qc_sem"].at[i])
+            for src, dst, i in (
+                (ctx.extra[RING].at[self.row_base(ctx, l) + q], scr["qc_ring"], 0),
+                (ctx.extra[ROPE_CK].at[q], scr["qc_rope"], 1),
+            )
+        ]
+        for cp in loads:
             cp.start()
-            cp.wait()
+            if not self.async_dma:
+                cp.wait()
+        if self.async_dma:
+            for cp in loads:
+                cp.wait()
         ring = scr["qc_ring"][...].astype(F32)
         p3 = c0 + jax.lax.rem(3 - jax.lax.rem(c0, 4) + 4, 4)  # first position = 3 mod 4
         j0 = p3 - 3
@@ -400,10 +407,19 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             cur_rows = jnp.where(p_l == c0 + t, raw_q[t : t + 1], cur_rows)
         scr["qc_rnew"][...] = jnp.where(p_l >= c0, cur_rows, ring).astype(BF16)
         o = ctx.stream.sp.block_ord(l, self.name)
-        for src, dst in ((scr["qc_ck"], CK_NEW), (scr["qc_rnew"], RING_NEW)):
-            cp = pltpu.make_async_copy(src, ctx.O[dst].at[o, q], scr["qc_sem"].at[2])
+        stores = [
+            pltpu.make_async_copy(src, ctx.O[dst].at[o, q], scr["qc_sem"].at[2 + i])
+            if self.async_dma
+            else pltpu.make_async_copy(src, ctx.O[dst].at[o, q], scr["qc_sem"].at[2])
+            for i, (src, dst) in enumerate(((scr["qc_ck"], CK_NEW), (scr["qc_rnew"], RING_NEW)))
+        ]
+        for cp in stores:
             cp.start()
-            cp.wait()
+            if not self.async_dma:
+                cp.wait()
+        if self.async_dma:
+            for cp in stores:
+                cp.wait()
         return ck, p3 // 4
 
     @_scoped("qsa_recent")
@@ -577,27 +593,19 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                     jnp.zeros((1, 1), I32) + kept, K, consts,
                 )
                 scr["qi_id"][r] = self._cdcp_gid(ctx, pos) if cdcp else pos
-                cs = [
-                    pltpu.make_async_copy(
-                        scr["qi_id"].at[r],
-                        scr["qi_ids"].at[pl.ds(r, 1), pl.ds(0, K)],
-                        scr["qi_sem"].at[1],
-                    ),
-                    pltpu.make_async_copy(
-                        scr["qi_z"],
-                        scr["qi_ids"].at[pl.ds(r, 1), pl.ds(K, 128)],
-                        scr["qi_sem"].at[2],
-                    ),
-                ]
+                cs = self._ids_copies(ctx, r)
                 for c in cs:
                     c.start()
-                for c in cs:
-                    c.wait()
+                if not self.async_dma:
+                    for c in cs:
+                        c.wait()
                 scr["qi_kvl"][r] = 4 * kept
                 return carry
 
             with ctx.stream.sc("qsa_rowsel", 2):
                 jax.lax.fori_loop(lo, lo + n, row, 0)
+                if self.async_dma:
+                    self._wait_ids_copies(ctx, n)
             if self.union_attn:  # per-request call: rows [lo, lo + T) are request lo // T
                 KU, D = self._union_width(ex), max(self.dcp, 1)
                 with ctx.stream.sc("qsa_ucompact", 2):
@@ -737,6 +745,33 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                 c.start()
                 c.wait()
 
+    def _ids_copies(self, ctx: Any, r: Any) -> list:
+        """Row `r`'s pool-path ids (`qi_id`) and the zero tail into the SMEM table `qi_ids`."""
+        scr, K = ctx.scr, self.budget
+        return [
+            pltpu.make_async_copy(
+                scr["qi_id"].at[r],
+                scr["qi_ids"].at[pl.ds(r, 1), pl.ds(0, K)],
+                scr["qi_sem"].at[1],
+            ),
+            pltpu.make_async_copy(
+                scr["qi_z"],
+                scr["qi_ids"].at[pl.ds(r, 1), pl.ds(K, 128)],
+                scr["qi_sem"].at[2],
+            ),
+        ]
+
+    def _wait_ids_copies(self, ctx: Any, n: Any) -> None:
+        """`async_dma`: retire `n` rows' `_ids_copies` (equal-sized copies per semaphore; the
+        rows' destinations are distinct, so their order is unobservable)."""
+
+        def body(i: Any, carry: Any) -> Any:
+            for c in self._ids_copies(ctx, 0):
+                c.wait()
+            return carry
+
+        jax.lax.fori_loop(0, n, body, 0)
+
     @_scoped("qsa_selx")
     def _exchange_selection(self, ctx: Any) -> None:
         """All-gather the sharded indexer's per-row results: pool-path ids (`qi_id` and
@@ -773,25 +808,17 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             scr["qi_id"][r] = row[:, :K]
             scr["qi_kvl"][r] = jnp.sum(jnp.where(lane == K, row, 0))
             scr["qc_sga"][r] = jnp.sum(jnp.where(lane == K + 1, row, 0))
-            cs = [
-                pltpu.make_async_copy(
-                    scr["qi_id"].at[r],
-                    scr["qi_ids"].at[pl.ds(r, 1), pl.ds(0, K)],
-                    scr["qi_sem"].at[1],
-                ),
-                pltpu.make_async_copy(
-                    scr["qi_z"],
-                    scr["qi_ids"].at[pl.ds(r, 1), pl.ds(K, 128)],
-                    scr["qi_sem"].at[2],
-                ),
-            ]
+            cs = self._ids_copies(ctx, r)
             for c in cs:
                 c.start()
-            for c in cs:
-                c.wait()
+            if not self.async_dma:
+                for c in cs:
+                    c.wait()
             return carry
 
         jax.lax.fori_loop(0, MB, unpack, 0)
+        if self.async_dma:
+            self._wait_ids_copies(ctx, MB)
         if self.union_attn:
             self._exchange_unions(ctx)
 

@@ -150,6 +150,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MK_COMPRESSED_UNIQUE_WRITE: bool = False
     VLLM_TPU_MK_HC_FP8: bool = False
     VLLM_TPU_MK_SCATTER_DEEP: bool = False
+    VLLM_TPU_MK_QSEL_ASYNC: bool = False
     VLLM_TPU_MK_WHOLE_L47: bool = False
     VLLM_TPU_HC_PREFILL_UP_T: bool = False
     VLLM_TPU_HC_PREFILL_COMBINE_MIX: bool = False
@@ -1033,6 +1034,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Whole-step GDN checkpoint scatter: 16 staging slots / 12 loads in flight from 64
     # checkpoints (the default deep ring starts at 144). Same pool bytes.
     "VLLM_TPU_MK_SCATTER_DEEP": env_bool("VLLM_TPU_MK_SCATTER_DEEP"),
+    # Whole-step QSA selection: the per-row id copies into SMEM and the new group's
+    # loads / stores are issued together and waited once instead of in start-wait
+    # pairs (distinct destinations; same bytes).
+    "VLLM_TPU_MK_QSEL_ASYNC": env_bool("VLLM_TPU_MK_QSEL_ASYNC"),
     # Whole-step megakernel: also run the last QSA layer (model layer 47) in the whole-step
     # call, as a one-layer kernel after layers 3..46, its step tokens written with theirs;
     # the stock L47 attention core and last segment kernel are skipped.
