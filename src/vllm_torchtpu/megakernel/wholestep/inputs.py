@@ -388,7 +388,7 @@ def add_indexer_inputs(
 
     R, T, M = ex.R, ex.T, ex.M
     nreq = M // T
-    n_att = len(att_layers(g, L))
+    n_att = len(att_layers(g, L, d.get("first", "gdn")))
     k = jax.random.split(jax.random.PRNGKey(key + 7), 4)
     idx_w = (jax.random.normal(k[0], (n_att, g.H, 5 * IDX_DIM), F32) * 0.06).astype(
         BF16
@@ -559,7 +559,7 @@ def add_step_inputs(
     from .indexer import IDX_DIM
 
     nreq = ex.M // ex.T
-    n_att = len(att_layers(g, L))
+    n_att = len(att_layers(g, L, d.get("first", "gdn")))
     k = jax.random.split(jax.random.PRNGKey(key + 11), 2)
     ctxq = np.array([ctx[q % len(ctx)] for q in range(nreq)], np.int32)
     ring = jax.random.normal(k[0], (nreq, 8, IDX_DIM), F32).astype(BF16)

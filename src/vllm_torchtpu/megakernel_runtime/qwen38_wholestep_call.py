@@ -177,7 +177,13 @@ def build_wholestep_call(
     write: bool = True,
     interpret: bool = False,
     tiles: Tiles | None = None,
+    tail: bool = False,
 ) -> tuple[Any, tuple, tuple, tuple]:
+    """`tail` (VLLM_TPU_MK_WHOLE_L47): the last QSA layer (model layer 47) runs as a
+    second, one-layer kernel (`wholestep_spec(L=1)`) right after the `L`-layer one, in
+    this function; `qsa_layers`, the tables and the norms then carry it last, and its
+    step tokens go through the same cache writer as the other QSA layers. Weights:
+    the `L`-layer kernel's, then the tail kernel's."""
     R = mesh.size
     T = T_VERIFY
     # VLLM_TPU_MK_SCOPES=N: per-phase named scopes in the kernel (profiling only).
@@ -186,26 +192,31 @@ def build_wholestep_call(
         R=R, B=B, T=T, ctx=128, tiles=wholestep_tiles(B, max_groups) if tiles is None else tiles,
         interpret=interpret, debug=DebugOptions(scopes=scopes),
     )
-    n_att = L // g.att_every
+    n_att = L // g.att_every  # QSA layers in the L-layer kernel
     n_gdn = L - n_att
-    assert len(qsa_layers) == n_att, (len(qsa_layers), n_att)
+    n_qsa = n_att + int(tail)  # QSA layers written by this call
+    assert len(qsa_layers) == n_qsa, (len(qsa_layers), n_qsa)
     pps = max_groups * 4 // 128
-    spec = wholestep_spec(
-        g,
-        R,
-        L=L,
-        first="qsa",
-        pool_gdn=True,
-        qsa=dict(budget=budget),
-        step=True,
-        indexed=dict(
-            max_groups=max_groups,
-            pages_per_seq=pps,
-            carrier="fp8",
-            n_layers=n_att,
-            **indexed_options(),
-        ),
-    )
+
+    def spec_for(layers: int, n_layers: int):
+        return wholestep_spec(
+            g,
+            R,
+            L=layers,
+            first="qsa",
+            pool_gdn=True,
+            qsa=dict(budget=budget),
+            step=True,
+            indexed=dict(
+                max_groups=max_groups,
+                pages_per_seq=pps,
+                carrier="fp8",
+                n_layers=n_layers,
+                **indexed_options(),
+            ),
+        )
+
+    spec = spec_for(L, n_att)
     stats = union_stats_on()
     fn, k_specs, _, n_w = make_flat_segment_step(
         mesh,
@@ -222,16 +233,29 @@ def build_wholestep_call(
     # torch_tpu boundary (q32/q40: all copied operands are 4-D, no 3-D one is).
     from vllm_torchtpu.megakernel import kernel
 
-    _, info = kernel.make_step(mesh, spec, ex)
-    targets: list[tuple[int, ...] | None] = []
-    for name in info["plan"].w_names:
-        sh = info["wshape"][name]
-        if kernel.is_tupled_weight(sh):
-            targets += [None] * len(sh)
-        else:
-            targets.append((R * sh[0][0],) + tuple(sh[0][1:]))
+    def weight_targets(sp: Any) -> list[tuple[int, ...] | None]:
+        _, info = kernel.make_step(mesh, sp, ex)
+        out: list[tuple[int, ...] | None] = []
+        for name in info["plan"].w_names:
+            sh = info["wshape"][name]
+            if kernel.is_tupled_weight(sh):
+                out += [None] * len(sh)
+            else:
+                out.append((R * sh[0][0],) + tuple(sh[0][1:]))
+        return out
+
+    targets = weight_targets(spec)
     x_specs = k_specs[2 : 2 + len(fn.extra_names)]
     hbm = {x for x, s in zip(fn.extra_names, x_specs) if s == tp}
+    if tail:  # model layer 47: QSA + MoE, no GDN layer
+        fn_t, k_specs_t, _, n_w_t = make_flat_segment_step(
+            mesh, spec_for(1, 1), ex, extra_outs=(KV_NEW, KR_NEW, IR_NEW)
+        )
+        targets_t = weight_targets(spec_for(1, 1))
+        x_specs_t = k_specs_t[2 : 2 + len(fn_t.extra_names)]
+        hbm |= {x for x, s in zip(fn_t.extra_names, x_specs_t) if s == tp}
+    else:
+        n_w_t, targets_t = 0, []
 
     pad = jax.shard_map(
         lambda h: jnp.pad(h, ((0, M - B), (0, 0))),
@@ -245,7 +269,7 @@ def build_wholestep_call(
     )
     pos0 = jnp.zeros((B,), jnp.int32)
     n_meta = GDN_META * n_gdn
-    n_tab = QSA_TABLES * n_att
+    n_tab = QSA_TABLES * n_qsa
     slots = [(lay.main_slot, lay.compressed_slot) for lay in qsa_layers]
     scales = (qsa_layers[0].k_scale, qsa_layers[0].v_scale)
     assert all((lay.k_scale, lay.v_scale) == scales for lay in qsa_layers), (
@@ -268,14 +292,14 @@ def build_wholestep_call(
     )
     out_specs_in = tuple(tp if n in hbm else rep for n in names)
 
-    def per_rank_inputs(pool, tables_flat, positions, starts, context, trig):
+    def per_rank_inputs(pool, tables_flat, positions, starts, context, trig, lo=0, hi=n_att):
         tables = [
             tuple(tables_flat[i : i + QSA_TABLES]) for i in range(0, n_tab, QSA_TABLES)
-        ]
+        ][lo:hi]
         d = qsa_step_inputs(
             pool,
             tables,
-            slots,
+            slots[lo:hi],
             trig,
             positions,
             starts,
@@ -297,20 +321,33 @@ def build_wholestep_call(
         out_specs=out_specs_in,
         check_vma=False,
     )
+    inputs_t = jax.shard_map(
+        lambda *a: per_rank_inputs(*a, lo=n_att, hi=n_qsa),
+        mesh=mesh,
+        in_specs=(tp, rep, rep, rep, rep, rep),
+        out_specs=out_specs_in,
+        check_vma=False,
+    )
 
     dcp_size = main_kv_dcp()
 
     def per_rank_writes(pool, conv_ck, rec_ck, wb, kv, kr, ir, tables_flat, positions, starts,
-                        context, trig, norms_flat, *rank):
+                        context, trig, norms_flat, *rest):
+        if tail:  # the tail kernel's rows: layer n_att of this call's QSA layers
+            kv_t, kr_t, ir_t, *rank = rest
+            kv, kr, ir = (jnp.concatenate([a, b[:1]]) for a, b in
+                          ((kv, kv_t), (kr, kr_t), (ir, ir_t)))
+        else:
+            rank = rest
         pool = scatter_gdn_ckpts_fast(pool, conv_ck, rec_ck, wb, layout=layout, interpret=interpret)
         if not write:
             return pool
         Bq = len(positions)
         rows = [
             (kr[o, :Bq], kv[o, :Bq, kv.shape[-1] // 2 :], ir[o, :Bq])
-            for o in range(n_att)
+            for o in range(n_qsa)
         ]
-        norms = [tuple(norms_flat[2 * o : 2 * o + 2]) for o in range(n_att)]
+        norms = [tuple(norms_flat[2 * o : 2 * o + 2]) for o in range(n_qsa)]
         tables = [tuple(tables_flat[i : i + QSA_TABLES]) for i in range(0, n_tab, QSA_TABLES)]
         # Main-KV DCP: this rank's pair rank, the QSA layers' `dcp_rank` buffer (int32 [1] per
         # rank; `axis_index` lowers to a partition id, which the served SPMD compile refuses).
@@ -325,6 +362,7 @@ def build_wholestep_call(
         per_rank_writes,
         mesh=mesh,
         in_specs=(tp, tp, tp, rep, tp, tp, tp, rep, rep, rep, rep, rep, rep)
+        + ((tp, tp, tp) if tail else ())
         + ((tp,) if dcp_size > 1 else ()),
         out_specs=tp,
         check_vma=False,
@@ -336,27 +374,36 @@ def build_wholestep_call(
             x if t is None or tuple(x.shape) == t else x.reshape(t)
             for x, t in zip(args[1 : 1 + n_w], targets, strict=True)
         ]
-        i = 1 + n_w
+        w_t = [
+            x if t is None or tuple(x.shape) == t else x.reshape(t)
+            for x, t in zip(args[1 + n_w : 1 + n_w + n_w_t], targets_t, strict=True)
+        ]
+        i = 1 + n_w + n_w_t
         pool = args[i]
         meta = args[i + 1 : i + 1 + n_meta]
         i += 1 + n_meta
         tables = args[i : i + n_tab]
         i += n_tab
         positions, starts, context, trig = args[i : i + 4]
-        norms = args[i + 4 : i + 4 + 2 * n_att]  # per QSA layer: k_norm, index k_norm (cache writer)
-        rank = args[i + 4 + 2 * n_att :]  # main-KV DCP: the pair rank, int32 [1] per rank
+        norms = args[i + 4 : i + 4 + 2 * n_qsa]  # per QSA layer: k_norm, index k_norm (cache writer)
+        rank = args[i + 4 + 2 * n_qsa :]  # main-KV DCP: the pair rank, int32 [1] per rank
         x = pad(hidden)
         rb, wb, hi = gdn_blocks(meta, NS, write)
         xs = dict(zip(names, inputs(pool, tables, positions, starts, context, trig)))
         xs.update(gdn_pool=pool, gdn_rb=rb, gdn_hi=hi.astype(jnp.int32))
         outs = fn(pos0, x, *(xs[k] for k in fn.extra_names), *w)
         res, conv_ck, rec_ck, kv, kr, ir = outs[:6]
+        extra: tuple = ()
+        if tail:  # the pool is read-only in both kernels; every write follows them
+            xt = dict(zip(names, inputs_t(pool, tables, positions, starts, context, trig)))
+            outs_t = fn_t(pos0, res, *(xt[k] for k in fn_t.extra_names), *w_t)
+            res, extra = outs_t[0], tuple(outs_t[1:4])
         pool = writes(pool, conv_ck, rec_ck, wb, kv, kr, ir, tables, positions, starts, context,
-                      trig, norms, *rank)
+                      trig, norms, *extra, *rank)
         return (unpad(res), pool, outs[6]) if stats else (unpad(res), pool)
 
     in_specs = (
-        (tp,) + (tp,) * n_w + (tp,) + (rep,) * n_meta + (rep,) * n_tab + (rep,) * 4
-        + (rep,) * (2 * n_att) + ((tp,) if dcp_size > 1 else ())
+        (tp,) + (tp,) * (n_w + n_w_t) + (tp,) + (rep,) * n_meta + (rep,) * n_tab + (rep,) * 4
+        + (rep,) * (2 * n_qsa) + ((tp,) if dcp_size > 1 else ())
     )
-    return call, in_specs, (tp, tp, tp) if stats else (tp, tp), (1 + n_w,)
+    return call, in_specs, (tp, tp, tp) if stats else (tp, tp), (1 + n_w + n_w_t,)

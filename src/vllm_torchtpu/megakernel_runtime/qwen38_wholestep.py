@@ -35,6 +35,7 @@ from typing import Any
 import torch
 from torch import nn
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.megakernel.wholestep.qsa_full_c import UNION_STATS_REQS
 
@@ -77,8 +78,10 @@ class _WholeKind:
         rotary_dim: int,
         write: bool,
         tag: str,
+        tail: bool = False,
     ) -> None:
         self.mesh, self.g, self.layout, self.qsa = mesh, g, layout, qsa
+        self.tail = tail
         self.kw = dict(
             budget=budget,
             max_groups=max_groups,
@@ -101,7 +104,7 @@ class _WholeKind:
                 # Torch sees each rank's shard (w08: a buffer sized for all ranks failed
                 # the
                 # copy, [11, 16, 1, 128] -> [88, 16, 1, 128]); bucket-independent.
-                shape = (len(qsa), UNION_STATS_REQS, 1, 128)
+                shape = (len(qsa) - int(tail), UNION_STATS_REQS, 1, 128)
                 out.append(hidden.new_empty(shape, dtype=torch.int32))
             return out
 
@@ -121,6 +124,7 @@ class _WholeKind:
                 self.qsa,
                 L=L_WHOLE,
                 tiles=wholestep_tiles(B, self.kw["max_groups"]),
+                tail=self.tail,
                 **self.kw,
             )
             typed = make_typed_step_wrapper(
@@ -154,6 +158,7 @@ class Qwen38WholeStep(nn.Module):
         write: bool = True,
         tag: str = "whole",
         hold: str = "buffer",
+        tail: bool | None = None,
     ) -> None:
         super().__init__()
         from vllm_torchtpu.megakernel.exec_spec import ExecSpec
@@ -164,29 +169,42 @@ class Qwen38WholeStep(nn.Module):
         self.g, self.mesh, self.buckets = g, mesh, buckets
         self.layers = list(model.model.layers)  # plain list: the model owns its layers
         ids = list(range(FIRST_LAYER, LAST_LAYER))
-        self.qsa_ids = [i for i in ids if self.layers[i].layer_type == "full_attention"]
+        # `tail` (VLLM_TPU_MK_WHOLE_L47): model layer LAST_LAYER (the last QSA layer) as a
+        # one-layer kernel in the same call; its operands follow the main kernel's.
+        self.tail = envs.VLLM_TPU_MK_WHOLE_L47 if tail is None else tail
+        if self.tail:
+            assert self.layers[LAST_LAYER].layer_type == "full_attention", LAST_LAYER
+            assert LAST_LAYER == len(self.layers) - 1, (LAST_LAYER, len(self.layers))
+        tail_ids = [LAST_LAYER] if self.tail else []
+        self.qsa_ids = [
+            i for i in ids + tail_ids if self.layers[i].layer_type == "full_attention"
+        ]
         self.gdn_ids = [
             i for i in ids if self.layers[i].layer_type == "linear_attention"
         ]
         R = mesh.size
-        n_att = len(self.qsa_ids)
+        n_att = len(self.qsa_ids) - len(tail_ids)
         pps = max_groups * 4 // 128
-        spec = wholestep_spec(
-            g,
-            R,
-            L=L_WHOLE,
-            first="qsa",
-            pool_gdn=True,
-            qsa=dict(budget=budget),
-            step=True,
-            indexed=dict(
-                max_groups=max_groups,
-                pages_per_seq=pps,
-                carrier="fp8",
-                n_layers=n_att,
-                **indexed_options(),
-            ),
-        )
+
+        def spec_for(layers: int, n_layers: int) -> Any:
+            return wholestep_spec(
+                g,
+                R,
+                L=layers,
+                first="qsa",
+                pool_gdn=True,
+                qsa=dict(budget=budget),
+                step=True,
+                indexed=dict(
+                    max_groups=max_groups,
+                    pages_per_seq=pps,
+                    carrier="fp8",
+                    n_layers=n_layers,
+                    **indexed_options(),
+                ),
+            )
+
+        spec = spec_for(L_WHOLE, n_att)
         ex = ExecSpec(
             R=R,
             B=buckets[0],
@@ -195,6 +213,8 @@ class Qwen38WholeStep(nn.Module):
             tiles=wholestep_tiles(buckets[0], max_groups),
         )
         ops = pack_wholestep_operands(model, g, spec, ex, ids)
+        if self.tail:
+            ops += pack_wholestep_operands(model, g, spec_for(1, 1), ex, tail_ids)
         # Host round-trip of the small packed operands (operand_hold): w08r c1's
         # whole-step
         # steps ran 18 per-call execute_as_strided programs more than stock (+0.85
@@ -244,7 +264,7 @@ class Qwen38WholeStep(nn.Module):
         # requests.
         self.union_stats = (
             torch.zeros(
-                (len(self.qsa_ids), UNION_STATS_REQS, 1, 128),
+                (len(self.qsa_ids) - int(self.tail), UNION_STATS_REQS, 1, 128),
                 dtype=torch.int32,
                 device=pool.device,
             )
@@ -262,6 +282,7 @@ class Qwen38WholeStep(nn.Module):
             rotary_dim=self.rotary_dim,
             write=self.write,
             tag=self.tag,
+            tail=self.tail,
         )
         self.kind.pool_index = self.n_w
 
@@ -322,7 +343,7 @@ class Qwen38WholeStep(nn.Module):
         if self.union_stats is None:
             return
         self._stat_calls = calls
-        s = self.union_stats[: len(self.qsa_ids), :, 0, :4].to("cpu").to(torch.int64)
+        s = self.union_stats[:, :, 0, :4].to("cpu").to(torch.int64)
         union, total, mx, rows = s[..., 0], s[..., 1], s[..., 2], s[..., 3]
         live = (union > 0) & (rows > 1)
         if not bool(live.any()):

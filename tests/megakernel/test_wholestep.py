@@ -1009,3 +1009,44 @@ def test_compaction_exclusive_prefix_matches_reference(S):
             axis=1,
         )
         assert not np.array_equal(np.asarray(bad)[0], want_p)
+
+
+def test_last_layer_step_with_per_layer_metadata_matches_reference():
+    """Model layer 47 alone (`L = 1`, `first="qsa"`) at the served stage-C packing: the
+    whole-step tail call that folds the last QSA layer (VLLM_TPU_MK_WHOLE_L47)."""
+    R, T, Lt = 2, 4, 1
+    ex = ExecSpec(R=R, B=2 * T, T=T, ctx=128, interpret=True, tiles=_TILES)
+    d = wi.random_wholestep_inputs(
+        29, G, ex, Lt, budget=BUDGET, n_pages=PAGES, identical_experts=True, first="qsa"
+    )
+    d = wi.add_indexer_inputs(29, G, ex, d, Lt, max_groups=MAX_GROUPS, ctx=CTX_C)
+    d = wi.add_step_inputs(29, G, ex, d, Lt, ctx=CTX_C)
+    d = wi.add_per_layer(29, G, ex, d, Lt)
+    d = wi.add_carrier(29, d)
+    ref, _ = wi.wholestep_reference(G, ex, d, Lt)
+    d.pop("_step_out")
+    idx = dict(
+        max_groups=MAX_GROUPS,
+        pages_per_seq=d["mtab"].shape[-1],
+        carrier="bf16",
+        chunk_pages=32,
+        n_layers=1,
+    )
+    spec = wholestep_spec(
+        G, R, L=Lt, qsa=dict(budget=BUDGET), step=True, indexed=idx, first="qsa"
+    )
+    w_mk, states = wi.pack_wholestep(spec, G, ex, d, Lt)
+    mesh = Mesh(np.array(jax.devices()[:R]), ("tp",))
+    pos_mk, hid_mk, w_mk, st_mk = shard_step_inputs(
+        mesh, ex, d["inp"].pos, d["inp"].x, w_mk, states
+    )
+    step, _ = kernel.make_step(mesh, spec, ex)
+    _, outs = step(pos_mk, hid_mk, w_mk, st_mk, *wi.extras_c(d, mesh, R))
+    res = np.asarray(outs[RESIDUAL_OUT].reshape(R, ex.M, -1)[:, : ex.B], np.float32)
+    refn = np.asarray(ref, np.float32)
+    assert float(np.std(refn - np.asarray(d["inp"].x[: ex.B], np.float32))) > 0.01
+    _assert_within_budget(res[:, T : 2 * T], refn[T : 2 * T], layers=Lt)
+    scale, k = float(np.abs(refn).mean()), np.sqrt(2 * Lt / 8)
+    for r in range(R):
+        dd = np.abs(res[r, :T] - refn[:T])
+        assert dd.mean() < 3e-2 * k * scale, (r, dd.mean() / scale)

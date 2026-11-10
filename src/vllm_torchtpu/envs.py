@@ -125,6 +125,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_COMPRESSED_DCP: bool = False
     VLLM_TPU_QSA_DCP_SHARD_MERGE: bool = False
     VLLM_TPU_QSA_COMPRESSED_PAIR_SHIFT: bool = False
+    VLLM_TPU_MK_WHOLE_L47: bool = False
     VLLM_TPU_HC_PREFILL_UP_T: bool = False
     VLLM_TPU_HC_PREFILL_COMBINE_MIX: bool = False
     VLLM_TPU_HC_PREFILL_WIDE_TILE: int = 0
@@ -851,6 +852,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # groups of the token) instead of a gather; a lax.cond falls back to the
     # gather when a written row's offset is out of range (bit-identical pool).
     "VLLM_TPU_QSA_COMPRESSED_PAIR_SHIFT": env_bool("VLLM_TPU_QSA_COMPRESSED_PAIR_SHIFT"),
+    # Whole-step megakernel: also run the last QSA layer (model layer 47) in the whole-step
+    # call, as a one-layer kernel after layers 3..46, its step tokens written with theirs;
+    # the stock L47 attention core and last segment kernel are skipped.
+    "VLLM_TPU_MK_WHOLE_L47": env_bool("VLLM_TPU_MK_WHOLE_L47"),
     # Prefill HC full mix: take the up projection as its [low rank, width]
     # transpose. The checkpoint weight is held column-major, so the transpose
     # is a bitcast and the per-call relayout copy before the kernel goes away
