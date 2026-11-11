@@ -3084,10 +3084,7 @@ class Eagle3Proposer:
             force_small_ar = (
                 not rows_sliced
                 and hasattr(self.runner, "max_num_reqs")
-                and (
-                    self._loop_bucket(self.runner.max_num_reqs)
-                    <= small_all_reduce_op.MAX_ROWS
-                )
+                and self._max_loop_bucket() <= small_all_reduce_op.MAX_ROWS
             )
         else:
             if hasattr(self.runner, "_token_padding_update"):
@@ -3254,6 +3251,11 @@ class Eagle3Proposer:
         runner = self.runner
         if self._dp_lockstep_sharded():
             num_reqs = dp_lockstep_num_reqs(runner._dp_step_max_reqs, num_reqs)
+        return self._padded_loop_bucket(num_reqs)
+
+    def _padded_loop_bucket(self, num_reqs: int) -> int:
+        """The loop bucket of num_reqs requests, without a step's DP bound."""
+        runner = self.runner
         req_paddings = getattr(runner, "num_reqs_paddings", None)
         min_p = req_paddings[0] if req_paddings else 1
         num_reqs = max(num_reqs, min_p)
@@ -3261,6 +3263,27 @@ class Eagle3Proposer:
         index = bisect.bisect_left(paddings, num_reqs)
         assert index < len(paddings)
         return paddings[index]
+
+    def _max_loop_bucket(self) -> int:
+        """The largest loop bucket any step can take, that of max_num_reqs.
+        Under EP-DP lockstep _loop_bucket follows one step's DP-wide bound,
+        which can be smaller, so the bucket is taken without it there."""
+        if not self._dp_lockstep_sharded():
+            return self._loop_bucket(self.runner.max_num_reqs)
+        return self._padded_loop_bucket(self.runner.max_num_reqs)
+
+    def _reachable_loop_buckets(self, num_reqs: int) -> set[int]:
+        """Every loop bucket a chunk of num_reqs requests can take while serving.
+
+        Off EP-DP lockstep that is _loop_bucket(num_reqs). Under lockstep the
+        bucket follows the step's DP-wide largest chunk (_dp_coordinated_step),
+        which can hold any count from num_reqs to max_num_reqs. A warm-up runs
+        before any step has set that bound, so it lists them all.
+        """
+        if not self._dp_lockstep_sharded():
+            return {self._loop_bucket(num_reqs)}
+        top = max(num_reqs, self.runner.max_num_reqs)
+        return {self._padded_loop_bucket(n) for n in range(max(num_reqs, 1), top + 1)}
 
     def _precompile_combine_hidden_states(self) -> None:
         if self.speculative_config.method == "mtp":
@@ -3313,17 +3336,24 @@ class Eagle3Proposer:
             and num_reqs_most is not None
         ):
             knr_buckets.add(num_reqs_most)
+        # Every (request bucket, loop bucket) pair serving can reach; under
+        # EP-DP lockstep a chunk's loop bucket follows the step's DP-wide bound.
         req_loop_pairs = sorted(
             {
                 (
                     runner.num_reqs_paddings[
                         bisect.bisect_left(runner.num_reqs_paddings, r)
                     ],
-                    self._loop_bucket(r),
+                    p,
                 )
                 for r in range(1, runner.max_num_reqs + 1)
+                for p in self._reachable_loop_buckets(r)
             }
-            | {(B, self._loop_bucket(B)) for B in runner.num_reqs_paddings}
+            | {
+                (B, p)
+                for B in runner.num_reqs_paddings
+                for p in self._reachable_loop_buckets(B)
+            }
         )
         loop_p_buckets = sorted(
             {t for t in runner.num_tokens_paddings if t <= max_loop_bucket}

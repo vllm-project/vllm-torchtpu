@@ -3654,3 +3654,81 @@ def test_propose_takes_step0_gather_indices_from_the_prep():
     assert proposer._step0_pad_len == 0
     assert proposer._last_step0_gather_indices is None
     assert drafts == [[7], [20]]
+
+
+def _seed_precompile_pairs(monkeypatch, *, lockstep, dp_step_max_reqs):
+    """Run _precompile_draft_seed with its compiled programs replaced by
+    recorders, and return the (request bucket, loop bucket) pairs it warms the
+    async draft-input prep at. Loop buckets: 1-2 requests -> 2, 3-4 -> 4,
+    5-8 -> 8."""
+    import vllm_torchtpu.spec_decode.eagle3 as e3
+
+    proposer = _make_proposer(draft_tp=1)
+    proposer.runner = SimpleNamespace(
+        num_tokens_paddings=[2, 4, 8, 16, 32],
+        num_reqs_paddings=[2, 4, 8],
+        max_num_reqs=8,
+        num_reqs_max_model_len=8,
+        most_model_len=None,
+        uses_mrope=False,
+        device=torch.device("cpu"),
+        # No step has run at warm-up; _dp_coordinated_step has not set it.
+        _dp_step_max_reqs=dp_step_max_reqs,
+        _precompile_timed=lambda name: contextlib.nullcontext(),
+    )
+    monkeypatch.setattr(proposer, "_dp_lockstep_sharded", lambda: lockstep)
+    monkeypatch.setattr(e3, "synchronize_tensors", lambda *a, **k: None)
+    pairs = set()
+
+    def async_prep(ids, next_tokens, draft_lengths, qsl, pad_req_idx, *rest):
+        pairs.add((next_tokens.shape[0], pad_req_idx.shape[0]))
+        return ()
+
+    monkeypatch.setattr(proposer, "_draft_async_prepare_inputs", async_prep)
+    for name in (
+        "_draft_seed_input_ids",
+        "_draft_loop_seq_lens",
+        "_draft_add_delta",
+        "_draft_stack_tokens",
+    ):
+        monkeypatch.setattr(proposer, name, lambda *a, **k: ())
+    proposer._precompile_draft_seed()
+    return pairs
+
+
+@pytest.mark.parametrize("dp_step_max_reqs", [0, 1])
+def test_seed_precompile_under_lockstep_warms_every_reachable_loop_bucket(
+    monkeypatch, dp_step_max_reqs
+):
+    """Under EP-DP lockstep a chunk's loop bucket follows the step's DP-wide
+    largest chunk, so a chunk of r requests can take the bucket of any count
+    from r to max_num_reqs. The warm-up runs before any step has set that
+    bound, so it must list those buckets rather than ask _loop_bucket, whose
+    per-step assert would refuse 2 requests against a bound of 1."""
+    pairs = _seed_precompile_pairs(
+        monkeypatch, lockstep=True, dp_step_max_reqs=dp_step_max_reqs
+    )
+    assert pairs == {(2, 2), (2, 4), (2, 8), (4, 4), (4, 8), (8, 8)}
+
+
+def test_seed_precompile_off_lockstep_warms_each_count_at_its_loop_bucket(
+    monkeypatch,
+):
+    pairs = _seed_precompile_pairs(monkeypatch, lockstep=False, dp_step_max_reqs=0)
+    assert pairs == {(2, 2), (4, 4), (8, 8)}
+
+
+def test_max_loop_bucket_is_static_under_lockstep():
+    """The largest loop bucket does not depend on one step's DP bound, while
+    _loop_bucket keeps main's per-step assert."""
+    proposer = _make_proposer(draft_tp=1)
+    proposer.runner = SimpleNamespace(
+        num_tokens_paddings=[2, 4, 8, 16, 32],
+        num_reqs_paddings=[2, 4, 8],
+        max_num_reqs=8,
+        _dp_step_max_reqs=1,
+    )
+    proposer._dp_lockstep_sharded = lambda: True
+    assert proposer._max_loop_bucket() == 8
+    with pytest.raises(AssertionError, match="DP-coordinated per-chunk bound is 1"):
+        proposer._loop_bucket(2)
