@@ -1310,7 +1310,8 @@ def test_ep_combine_dense_stays_served_on_the_one_hot_path(monkeypatch):
 # --- TPU_MOE_NONEP_DISPATCH_CHUNKS (expert-range chunked dispatch) ------------------------------
 
 
-def _chunk_case(monkeypatch, *, gather="sc_padded", chunks=1, fused=True, tokens=640, sizes_skew=False):
+def _chunk_case(monkeypatch, *, gather="sc_padded", chunks=1, fused=True, tokens=640, sizes_skew=False, permute="sorts",
+                presorted=False):
     """fused_moe_func on the non-EP SparseCore path with stand-ins: the gather returns whole 2,048-row blocks, the
     fused MLP honours out_buffer/out_row_offset (rows outside the call's groups keep the buffer), the combine is v3's
     reference. Records gather and MLP calls."""
@@ -1367,7 +1368,8 @@ def _chunk_case(monkeypatch, *, gather="sc_padded", chunks=1, fused=True, tokens
         inside = (rows >= out_row_offset) & (rows < out_row_offset + n)
         return jnp.where(inside[:, None], full[src_rows], out_buffer)
 
-    def combine(rows, rev, wts, valid, reduce_group_size, x_packed=False):
+    def combine(rows, rev, wts, valid, reduce_group_size, x_packed=False, **kw):
+        seen.setdefault("combine_kw", []).append(dict(kw))
         return _fallback_implementation(unpack_halves(rows) if x_packed else rows, rev, wts, valid,
                                         reduce_group_size)
 
@@ -1389,7 +1391,8 @@ def _chunk_case(monkeypatch, *, gather="sc_padded", chunks=1, fused=True, tokens
     out = fused_moe_gmm.fused_moe_func.__wrapped__(
         x, w1, w2, s1, s2, None, None, w, ids, topk=topk, activation="silu", use_ep=False, use_sparse_core=True,
         nonep_gather=gather, nonep_fused_mlp=fused, nonep_gmm_experts_per_visit=2, nonep_gmm_bucket=64,
-        nonep_combine_packed=True, nonep_dispatch_chunks=chunks)
+        nonep_combine_packed=True, nonep_dispatch_chunks=chunks, nonep_permute=permute,
+        **({"combine_presorted": True} if presorted else {}))
     return out, seen
 
 
@@ -1406,6 +1409,21 @@ def test_chunked_dispatch_is_bitwise_the_one_chunk_path(monkeypatch, gather, chu
         lo, hi = k * 16 // chunks, (k + 1) * 16 // chunks
         assert c["experts"] is None or (lo <= c["experts"][0] and c["experts"][1] < hi), (k, c)
     assert all(g["copy_mode"] == ("dma" if gather == "sc_fp8" else "vector") for g in seen["gather"])
+    np.testing.assert_array_equal(_bits(out), _bits(ref))
+
+
+@pytest.mark.parametrize("permute", ["packed", "packed_onehot"])
+@pytest.mark.parametrize("chunks", [1, 2])
+@pytest.mark.parametrize("skew", [False, True])
+def test_packed_sorts_and_presorted_combine_stack_with_chunked_dispatch(monkeypatch, permute, chunks, skew):
+    """P-MOE-6 CP1 stack (PP8): T10-MOE's packed routing sorts (M2) and presorted combine flag (M3) together with the
+    chunked dispatch give the served one-chunk, three-sort output bits; 2,560 routes is above the single-sort cap and
+    below M2's 65,536 packing limit. The chunk remap of the revert indices must use M2's inverse permutation."""
+    ref, _ = _chunk_case(monkeypatch, gather="sc_fp8", chunks=1, sizes_skew=skew)
+    out, seen = _chunk_case(monkeypatch, gather="sc_fp8", chunks=chunks, sizes_skew=skew, permute=permute,
+                            presorted=True)
+    assert len(seen["gather"]) == chunks and len(seen["mlp"]) == chunks, seen
+    assert seen["combine_kw"] and all(k.get("presorted") == "check" for k in seen["combine_kw"]), seen["combine_kw"]
     np.testing.assert_array_equal(_bits(out), _bits(ref))
 
 
