@@ -15,10 +15,10 @@
 
 The dense one-hot forms (``fused_moe_gmm``) multiply over every routed slot,
 but under EP only the expert-sorted prefix of local slots (about 1/EP of them)
-holds work. These kernels take the prefix length as a scalar and run the
-smallest power-of-two multiple of 128 slots that covers it, building the
-one-hot from the inverse sort permutation (``argsort_revert_indices``) laid
-out [topk, tokens], which both kernels share.
+holds work. These kernels take the prefix length as a scalar: the permute
+runs the 128-slot blocks that cover it, the combine the smallest power-of-two
+multiple of 128 slots. Both build the one-hot from the inverse sort
+permutation (``argsort_revert_indices``) laid out [topk, tokens].
 """
 
 import functools
@@ -37,12 +37,11 @@ _COL_CHUNKS = (3072, 1536, 1024, 512)
 
 
 def _vmem_bytes(num_tokens: int, num_slots: int, hidden_size: int, chunk: int) -> int:
-    onehot = num_slots * num_tokens * 2
-    # Permute: resident hidden block + double-buffered output column chunks.
-    permute = num_tokens * hidden_size * 2 + 2 * num_slots * chunk * 2
-    # Combine: double-buffered input and output column chunks.
-    combine = 2 * (num_slots + num_tokens) * chunk * 2
-    return onehot + max(permute, combine)
+    # Permute: resident hidden block + double-buffered 128-slot output blocks.
+    permute = (num_tokens + 2 * _SLOT_BLOCK) * hidden_size * 2
+    # Combine: one-hot scratch + double-buffered input and output column chunks.
+    combine = num_slots * num_tokens * 2 + 2 * (num_slots + num_tokens) * chunk * 2
+    return max(permute, combine)
 
 
 def _col_chunk(num_tokens: int, num_slots: int, hidden_size: int) -> int | None:
@@ -87,37 +86,35 @@ def _run_capped(valid_ref, num_slots: int, branch) -> None:
     lax.switch(idx, [functools.partial(branch, c) for c in caps])
 
 
-def _permute_kernel(valid_ref, revert_t_ref, hidden_ref, out_hbm_ref, onehot_ref):
+def _permute_kernel(valid_ref, revert_t_ref, hidden_ref, out_hbm_ref):
     topk, num_tokens = revert_t_ref.shape
     num_slots, hidden_size = out_hbm_ref.shape
-    chunk = _col_chunk(num_tokens, num_slots, hidden_size)
+    # 0 * NaN == NaN: a non-finite token would reach every slot. x * 0 is 0
+    # exactly for finite x (Mosaic's isfinite takes f32 only).
+    hidden = hidden_ref[...]
+    hidden_ref[...] = jnp.where(hidden * 0 == 0, hidden, jnp.zeros_like(hidden))
 
-    def branch(cap):
-        for s0 in range(0, cap, _SLOT_BLOCK):
-            slots = lax.broadcasted_iota(jnp.int32, (_SLOT_BLOCK, num_tokens), 0) + s0
-            onehot = jnp.zeros((_SLOT_BLOCK, num_tokens), jnp.float32)
-            for k in range(topk):
-                onehot += (revert_t_ref[k : k + 1, :] == slots).astype(jnp.float32)
-            onehot_ref[s0 : s0 + _SLOT_BLOCK, :] = onehot.astype(onehot_ref.dtype)
+    def body(out_ref):
+        slots = lax.broadcasted_iota(jnp.int32, (_SLOT_BLOCK, num_tokens), 0)
+        slots += pl.program_id(0) * _SLOT_BLOCK
+        onehot = jnp.zeros((_SLOT_BLOCK, num_tokens), jnp.float32)
+        for k in range(topk):
+            onehot += (revert_t_ref[k : k + 1, :] == slots).astype(jnp.float32)
+        out_ref[...] = jnp.dot(
+            onehot.astype(hidden_ref.dtype),
+            hidden_ref[...],
+            preferred_element_type=jnp.float32,
+        ).astype(out_ref.dtype)
 
-        def body(out_ref):
-            cols = pl.ds(pl.multiple_of(pl.program_id(0) * chunk, chunk), chunk)
-            # 0 * NaN == NaN: a non-finite token would reach every slot. x * 0
-            # is 0 exactly for finite x (Mosaic's isfinite takes f32 only).
-            hidden = hidden_ref[:, cols]
-            hidden = jnp.where(hidden * 0 == 0, hidden, jnp.zeros_like(hidden))
-            out_ref[...] = jnp.dot(
-                onehot_ref[:cap, :], hidden, preferred_element_type=jnp.float32
-            ).astype(out_ref.dtype)
-
-        pltpu.emit_pipeline(
-            body,
-            grid=(hidden_size // chunk,),
-            in_specs=(),
-            out_specs=(pl.BlockSpec((cap, chunk), lambda c: (0, c)),),
-        )(out_hbm_ref)
-
-    _run_capped(valid_ref, num_slots, branch)
+    # One 128-slot block at a time up to the valid prefix: power-of-two caps
+    # (as the combine takes) ran up to 2x the blocks here.
+    valid = jnp.clip(valid_ref[0], 0, num_slots)
+    pltpu.emit_pipeline(
+        body,
+        grid=(jnp.maximum(1, pl.cdiv(valid, _SLOT_BLOCK)),),
+        in_specs=(),
+        out_specs=(pl.BlockSpec((_SLOT_BLOCK, hidden_size), lambda b: (b, 0)),),
+    )(out_hbm_ref)
 
 
 @jax.jit
@@ -129,8 +126,8 @@ def bounded_onehot_permute(
     """Routed buffer [tokens * topk, hidden]: slot s holds its token's row,
     with non-finite values zeroed.
 
-    Only the smallest power-of-two multiple of 128 slots covering
-    ``valid_count`` is written; the GMM never reads past the valid prefix.
+    Only the 128-slot blocks covering ``valid_count`` are written; the GMM
+    never reads past the valid prefix.
     """
     num_tokens, hidden_size = hidden.shape
     num_slots = argsort_revert_indices.size
@@ -148,7 +145,6 @@ def bounded_onehot_permute(
                 pl.BlockSpec(memory_space=pltpu.VMEM),
             ],
             out_specs=hbm,
-            scratch_shapes=[pltpu.VMEM((num_slots, num_tokens), hidden.dtype)],
         ),
         compiler_params=pltpu.CompilerParams(
             vmem_limit_bytes=int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.9),
