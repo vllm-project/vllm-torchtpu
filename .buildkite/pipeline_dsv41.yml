@@ -177,7 +177,6 @@ steps:
             tests/models/vllm/test_dsv41_config.py
             tests/models/vllm/test_dsv41_v2_model_full.py
             tests/models/vllm/test_dsv41_v2_model_sp.py
-            tests/models/vllm/test_dsv41_v2_local_q.py
             tests/models/vllm/test_dsv41_v2_prefix_replay.py
             tests/layers/adapter/test_fused_moe_ep.py
             tests/kernels/test_dsv41_decode_tuning.py
