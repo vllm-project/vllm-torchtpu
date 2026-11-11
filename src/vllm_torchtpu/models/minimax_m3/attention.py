@@ -39,6 +39,7 @@ from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 from vllm_torchtpu.layers.adapter.attention import PallasMLAttentionBackend
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.owned_kv_cache import TpuOwnedKVCache
+from vllm_torchtpu.models.minimax_m3 import kernel_toggles
 from vllm_torchtpu.models.minimax_m3.kernels import msa_dcp, msa_fp4
 from vllm_torchtpu.models.minimax_m3.ops.msa import (
     get_msa_dcp_op,
@@ -399,6 +400,7 @@ class MiniMaxM3SparseAttention(nn.Module):
         # the index keys (`kernels.msa` index-cache sharding).
         msa_dcp.TILE_SELECT_ENABLED = tile_select_enabled(get_current_vllm_config())
         msa_dcp.LIVE_SELECT_ENABLED = live_select_enabled(get_current_vllm_config())
+        kernel_toggles.apply()
         shard = shard_index_cache_enabled(get_current_vllm_config())
         self.index_shards = tp_size if shard else 1
         if self.index_shards > 1 and tp_size != config.num_key_value_heads:

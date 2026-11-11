@@ -82,6 +82,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_SPLIT_MIN_TOKENS: int = 0
     TPU_MINIMAX_M3_SPLIT_ATTENTION_FIRST: bool = True
     TPU_MINIMAX_M3_DCP_HEADS_ATTEND: bool = False
+    TPU_MINIMAX_M3_MSA_UNSTABLE_SORT: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
@@ -762,6 +763,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # query gather or partial merge; `msa_dcp_heads`). r6; default off.
     "TPU_MINIMAX_M3_DCP_HEADS_ATTEND": env_bool(
         "TPU_MINIMAX_M3_DCP_HEADS_ATTEND", default=False
+    ),
+    # MiniMax M3 MSA prefill attention: build the tiles' page unions with
+    # unstable sorts (no iota tie-breaker; bit-identical unions). r6.
+    "TPU_MINIMAX_M3_MSA_UNSTABLE_SORT": env_bool(
+        "TPU_MINIMAX_M3_MSA_UNSTABLE_SORT", default=False
     ),
     # SparseCore MoE gather-reduce (combine) kernel version used by
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and
