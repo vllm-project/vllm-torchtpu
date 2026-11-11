@@ -100,7 +100,13 @@ def registered(monkeypatch):
         out.append((name, wrapped_fn))
         return _FakeOp()
 
-    monkeypatch.setattr(attention.pallas, "jax_op", fake_jax_op)
+    # Only attention's own binding: a module first imported during the test
+    # (one that builds a pallas op at import) must keep the real jax_op.
+    # attention also reads pallas.pallas (the dtype maps), which stays real.
+    real = attention.pallas
+    monkeypatch.setattr(
+        attention, "pallas", SimpleNamespace(jax_op=fake_jax_op, pallas=real.pallas)
+    )
     return out
 
 
