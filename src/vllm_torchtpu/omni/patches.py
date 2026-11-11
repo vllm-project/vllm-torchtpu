@@ -23,7 +23,7 @@ patch_registry.py.
 """
 
 from functools import cache as run_once
-from typing import Any
+from typing import Any, cast
 
 import torch
 
@@ -783,7 +783,7 @@ _ACTIVE_INIT_MP_DEVICE_ORDER: bool | None = None
 
 def _query_local_tpu_device_id() -> int:
     """PJRT device ID of this rank's TPU."""
-    return int(torch.tpu.get_local_device_attributes()["id"])
+    return int(cast(Any, torch).tpu.get_local_device_attributes()["id"])
 
 
 def _resolve_device_ids_by_rank(world_size: int) -> tuple[list[int], list[int]] | None:
