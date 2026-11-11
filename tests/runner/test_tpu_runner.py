@@ -3752,30 +3752,33 @@ def test_skipping_topk_topp_is_exact_at_the_default_sampling_params(dtype):
     """At top_k == 0 and top_p == 1.0 (RL rollouts sample with top_k=-1 and
     top_p=1) the no-top-k/top-p path samples exactly the tokens of the full
     path; with top-k set, skipping would change them (negative control)."""
-    torch.manual_seed(0)
+    gen = torch.Generator().manual_seed(0)
     runner = SimpleNamespace()
     runner._apply_temperature = TPUModelRunner._apply_temperature.__get__(runner)
     sample_fn = TPUModelRunner.sample_from_logits.__wrapped__
     num_reqs, vocab = 16, 4096
-    logits = (torch.randn(num_reqs, vocab) * 4).to(dtype)
-    temperatures = torch.ones((num_reqs, 1), dtype=dtype)
-    temperatures[:2] = 0.0  # Greedy rows keep their argmax either way.
+    logits = (torch.randn(num_reqs, vocab, generator=gen) * 4).to(dtype)
+    # Greedy rows (0.0) keep their argmax either way; the others sample at
+    # unit and non-unit temperatures.
+    temperatures = torch.tensor(
+        [[0.0], [0.7], [1.0], [1.3]] * (num_reqs // 4), dtype=dtype
+    )
     top_k = torch.zeros((num_reqs, 1), dtype=torch.int32)
     top_p = torch.ones((num_reqs, 1), dtype=torch.float32)
 
     scaled = runner._apply_temperature(logits, temperatures)
     assert torch.equal(apply_top_k_top_p(scaled, top_k, top_p, 0), scaled)
     for _ in range(4):
-        u = torch.rand((num_reqs, vocab), dtype=torch.float32)
+        u = torch.rand((num_reqs, vocab), dtype=torch.float32, generator=gen)
         full = sample_fn(runner, logits, temperatures, u, top_k, top_p)
         skip = sample_fn(
             runner, logits, temperatures, u, top_k, top_p, apply_topk_topp=False
         )
         assert torch.equal(full, skip)
 
-    flat_logits = (torch.randn(num_reqs, vocab) * 0.1).to(dtype)
+    flat_logits = (torch.randn(num_reqs, vocab, generator=gen) * 0.1).to(dtype)
     top_5 = torch.full((num_reqs, 1), 5, dtype=torch.int32)
-    u = torch.rand((num_reqs, vocab), dtype=torch.float32)
+    u = torch.rand((num_reqs, vocab), dtype=torch.float32, generator=gen)
     ones = torch.ones((num_reqs, 1), dtype=dtype)
     # Ties at the 5th value are allowed too.
     fifth = flat_logits.float().topk(5, dim=-1).values[:, -1:]
