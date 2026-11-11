@@ -35,9 +35,8 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.kernels.experimental.batched_rpa import (configs, hadamard,
-                                                            kernel, schedule,
-                                                            utils)
+from vllm_torchtpu.kernels.experimental.batched_rpa import (configs, kernel,
+                                                            schedule, utils)
 
 
 def prepare_inputs(
@@ -50,7 +49,6 @@ def prepare_inputs(
     v_scale: jax.Array | None = None,
     kv_layout: configs.KVLayout = configs.KVLayout.SEQ_ALONG_LANE,
     page_size: int = 128,
-    use_hadamard: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
 
   total_q_tokens, actual_num_q_heads, actual_q_head_dim = q.shape
@@ -84,71 +82,32 @@ def prepare_inputs(
   else:
     aligned_kv_head_dim = utils.align_to(actual_kv_head_dim, num_lanes)
 
-  if use_hadamard and actual_q_head_dim != aligned_q_head_dim:
-    raise NotImplementedError(
-        "Hadamard rotation requires head_dim to be lane-aligned (a "
-        f"power of two >= 128), got head_dim={actual_q_head_dim}.")
-
-  # When use_hadamard is set, Q is rotated by the same normalized Hadamard
-  # matrix that K was rotated with before quantization; QK^T is then exactly
-  # preserved. The fused Pallas kernel performs the relayout below and the
-  # rotation in a single HBM pass; when its shape requirements don't hold we
-  # fall back to relayout + a separate rotation matmul.
-  q_row_bytes = (actual_num_kv_heads * num_q_heads_per_kv_head *
-                 actual_q_head_dim * jnp.dtype(q.dtype).itemsize)
-  hadamard_t_blk = (
-      hadamard.pick_t_block(total_q_tokens, q_row_bytes)
-      if use_hadamard else None)
-  use_fused_q_rotate = (
-      use_hadamard
-      and hadamard_t_blk is not None
-      and aligned_num_q_heads_per_kv_head == num_q_heads_per_kv_head)
-
   # queries: (T, H, D) -> (T, H_kv, G, D)
-  if use_fused_q_rotate:
-    o_hbm_alias_q_hbm = hadamard.rotate_q_relayout(
-        q.reshape(
-            total_q_tokens,
-            actual_num_kv_heads,
-            num_q_heads_per_kv_head,
-            actual_q_head_dim,
-        ),
-        hadamard_t_blk,
-    ).reshape(
-        actual_num_kv_heads,
-        total_q_tokens,
-        aligned_num_q_heads_per_kv_head // q_packing,
-        q_packing,
-        aligned_q_head_dim,
-    )
-  else:
-    o_hbm_alias_q_hbm = (
-        jnp.pad(
-            q.reshape(
-                total_q_tokens,
-                actual_num_kv_heads,
-                num_q_heads_per_kv_head,
-                actual_q_head_dim,
-            ),
-            (
-                (0, 0),
-                (0, 0),
-                (0, aligned_num_q_heads_per_kv_head - num_q_heads_per_kv_head),
-                (0, aligned_q_head_dim - actual_q_head_dim),
-            ),
-            constant_values=0,
-        )
-        .reshape(
-            total_q_tokens,
-            actual_num_kv_heads,
-            aligned_num_q_heads_per_kv_head // q_packing,
-            q_packing,
-            aligned_q_head_dim,
-        )
-        .swapaxes(0, 1)
-    )
-    if use_hadamard:
-      o_hbm_alias_q_hbm = hadamard.apply_hadamard(o_hbm_alias_q_hbm)
+  o_hbm_alias_q_hbm = (
+      jnp.pad(
+          q.reshape(
+              total_q_tokens,
+              actual_num_kv_heads,
+              num_q_heads_per_kv_head,
+              actual_q_head_dim,
+          ),
+          (
+              (0, 0),
+              (0, 0),
+              (0, aligned_num_q_heads_per_kv_head - num_q_heads_per_kv_head),
+              (0, aligned_q_head_dim - actual_q_head_dim),
+          ),
+          constant_values=0,
+      )
+      .reshape(
+          total_q_tokens,
+          actual_num_kv_heads,
+          aligned_num_q_heads_per_kv_head // q_packing,
+          q_packing,
+          aligned_q_head_dim,
+      )
+      .swapaxes(0, 1)
+  )
 
   # Pad keys and values head_dim
   actual_num_kv_heads_x2 = actual_num_kv_heads * 2
@@ -565,7 +524,6 @@ def _ragged_paged_attention_inner(
     use_causal_mask: bool = True,
     skip_kv_update: bool = False,
     kv_layout: configs.KVLayout = configs.KVLayout.SEQ_ALONG_LANE,
-    hadamard_mode: str | None = None,
 ) -> tuple[jax.Array, jax.Array]:
   """Perform batched ragged paged attention.
 
@@ -604,15 +562,6 @@ def _ragged_paged_attention_inner(
     debug_mode: Not used.
     out_dtype: Dtype of output. Defaults to dtype of queries.
     use_causal_mask: Not used.
-    hadamard_mode: Hadamard rotation mode matching how keys/values were
-      quantized (see hadamard.py and quantize_kv_fp4_per_token). None: no
-      rotation. "k": keys (new and cached) are stored rotated by the
-      normalized Hadamard matrix along head_dim; queries are rotated by the
-      same matrix before the kernel. "kv": values are additionally stored
-      rotated and the attention output is un-rotated afterwards. The Pallas
-      attention kernel itself is unchanged in every mode; the caller must
-      pass `keys`/`values` (and any cached KV) already rotated as the mode
-      requires.
 
   Returns:
     out: [max_num_tokens, num_q_heads, head_dim]. Output of self attention.
@@ -635,16 +584,6 @@ def _ragged_paged_attention_inner(
     mask_value = jnp.finfo(out_dtype).min
   if vmem_limit_bytes is None:
     vmem_limit_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
-
-  if hadamard_mode not in (None, "k", "kv"):
-    raise ValueError(
-        f"Unsupported hadamard_mode: {hadamard_mode!r} "
-        "(expected None, 'k' or 'kv').")
-  # When hadamard_mode is set, K (and V for mode "kv") in the cache are
-  # stored rotated by H along head_dim. prepare_inputs below rotates Q by the
-  # same H, which preserves QK^T exactly (H is orthonormal), so the Pallas
-  # kernel needs no changes. For mode "kv" the PV output comes out rotated
-  # and is un-rotated after the kernel at the bottom of this function.
 
   max_num_seqs = kv_lens.shape[0]
   kv_packing = utils.get_dtype_packing(kv_cache.dtype)
@@ -705,7 +644,6 @@ def _ragged_paged_attention_inner(
       v_scale_tensor,
       kv_layout=kv_layout,
       page_size=page_size,
-      use_hadamard=hadamard_mode is not None,
   )
 
   default_decode, default_prefill = calculate_block_sizes(
@@ -765,32 +703,10 @@ def _ragged_paged_attention_inner(
   o_hbm = prepare_outputs(o_hbm_alias_q_hbm)
   # after: [kv_heads, max_tokens, q_per_kv, d]
 
+  # slice back to original shape if padded
   num_q_heads_per_kv_head = num_q_heads // num_kv_heads
-  aligned_q_per_kv = o_hbm.shape[2]
-  aligned_out_head_dim = o_hbm.shape[3]
-
-  # For mode "kv": P @ (V H) == (P V) H, and H is involutory, so one more
-  # application of H recovers the un-rotated attention output. The fused
-  # Pallas kernel merges this rotation with the head-major -> token-major
-  # relayout below. Mode "k" leaves V un-rotated, so the output needs no
-  # rotation at all.
-  unrotate_out = hadamard_mode == "kv"
-  o_row_bytes = (num_kv_heads * aligned_q_per_kv * aligned_out_head_dim *
-                 jnp.dtype(o_hbm.dtype).itemsize)
-  hadamard_t_blk = (
-      hadamard.pick_t_block(o_hbm.shape[1], o_row_bytes)
-      if unrotate_out else None)
-  if (unrotate_out and hadamard_t_blk is not None
-      and aligned_q_per_kv == num_q_heads_per_kv_head
-      and aligned_out_head_dim == head_dim):
-    o_hbm = hadamard.rotate_o_relayout(o_hbm, hadamard_t_blk)
-    o_hbm = o_hbm.reshape(queries.shape)
-  else:
-    # slice back to original shape if padded
-    o_hbm = o_hbm[:, :, :num_q_heads_per_kv_head, :head_dim]
-    o_hbm = o_hbm.swapaxes(1, 0).reshape(queries.shape)
-    if unrotate_out:
-      o_hbm = hadamard.apply_hadamard(o_hbm)
+  o_hbm = o_hbm[:, :, :num_q_heads_per_kv_head, :head_dim]
+  o_hbm = o_hbm.swapaxes(1, 0).reshape(queries.shape)
 
   return o_hbm, kv_cache
 
@@ -818,7 +734,6 @@ _ragged_paged_attention_standard = jax.jit(
         "use_causal_mask",
         "skip_kv_update",
         "kv_layout",
-        "hadamard_mode",
     ),
     donate_argnames=("queries", "keys", "values", "kv_cache"),
 )
@@ -846,7 +761,6 @@ _ragged_paged_attention_per_token = jax.jit(
         "use_causal_mask",
         "skip_kv_update",
         "kv_layout",
-        "hadamard_mode",
     ),
     donate_argnames=("queries", "keys", "values", "kv_cache"),
 )
@@ -884,7 +798,6 @@ def ragged_paged_attention(
     use_causal_mask: bool = True,
     skip_kv_update: bool = False,
     kv_layout: configs.KVLayout = configs.KVLayout.SEQ_ALONG_LANE,
-    hadamard_mode: str | None = None,
 ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
   fn = (
       _ragged_paged_attention_per_token
@@ -920,5 +833,4 @@ def ragged_paged_attention(
       use_causal_mask=use_causal_mask,
       skip_kv_update=skip_kv_update,
       kv_layout=kv_layout,
-      hadamard_mode=hadamard_mode,
   )

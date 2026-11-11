@@ -313,7 +313,6 @@ def sharded_ragged_paged_attention(
     v_scale_tensor: jax.Array | None = None,
     use_per_token_scale: bool | None = None,
     per_token_scale_dtype: jnp.dtype | None = None,
-    hadamard_mode: str | None = None,
     skip_kv_update: bool = False,
     rpa_func: Callable = ragged_paged_attention,
     soft_cap: float | None = None,
@@ -322,11 +321,6 @@ def sharded_ragged_paged_attention(
     use_causal_mask: bool = True,
 ):
     """Shards along KV heads."""
-
-    if hadamard_mode is not None and rpa_func is not ragged_paged_attention_batched:
-        raise NotImplementedError(
-            "Hadamard-transform KV cache quantization is only supported by "
-            "the batched RPA kernel (--attention-backend CUSTOM).")
 
     qkv_spec = P(None, "model", None)
     use_hd64 = q.shape[-1] == 64
@@ -349,10 +343,6 @@ def sharded_ragged_paged_attention(
     args = (q, k, v, kv_cache, kv_lens, page_indices, cu_q_lens, distribution)
 
     if use_hd64:
-        if hadamard_mode is not None:
-            raise NotImplementedError(
-                "Hadamard-transform KV cache quantization is not supported "
-                "for head_dim==64 (hd64 kernel).")
         # Batched RPA has no hd64 variant; head_dim==64 always uses default.
         func = functools.partial(ragged_paged_attention_hd64,
                                  strict_sliding_window=True)
@@ -397,11 +387,6 @@ def sharded_ragged_paged_attention(
         if attention_chunk_size is not None:
             block_kwargs["p_block_sizes"] = _capped(
                 rpa_default.RpaCase.PREFILL)
-
-    # Only forwarded when set: the default/hd64 kernels don't take the kwarg
-    # (Hadamard rotation is a batched-RPA-only feature, checked above).
-    if hadamard_mode is not None:
-        block_kwargs["hadamard_mode"] = hadamard_mode
 
     def _ragged_paged_attention(*args):
         return func(
@@ -450,7 +435,6 @@ def attention(
     v_scale_tensor: jax.Array | None = None,
     use_per_token_scale: bool | None = None,
     per_token_scale_dtype: jnp.dtype | None = None,
-    hadamard_mode: str | None = None,
     sinks: jax.Array | None = None,
     skip_kv_update: bool = False,
     rpa_func: Callable = ragged_paged_attention,
@@ -501,7 +485,6 @@ def attention(
         v_scale_tensor=v_scale_tensor,
         use_per_token_scale=use_per_token_scale,
         per_token_scale_dtype=per_token_scale_dtype,
-        hadamard_mode=hadamard_mode,
         skip_kv_update=skip_kv_update,
         rpa_func=rpa_func,
         soft_cap=soft_cap,

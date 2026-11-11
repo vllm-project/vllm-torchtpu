@@ -62,7 +62,6 @@ if TYPE_CHECKING:
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     USE_BATCHED_RPA_SEQ_ON_LANE: bool = False
     USE_BATCHED_RPA_LONGCTX: bool = False
-    TPU_KV_CACHE_QUANT_HADAMARD: str = "0"
 
 
 def env_with_choices(
@@ -300,25 +299,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     env_with_choices("TPU_KV_CACHE_PER_TOKEN_SCALE_DTYPE",
                      "bfloat16",
                      ["bfloat16", "bf16", "float32", "fp32"],
-                     case_sensitive=False),
-
-    # Applies a Hadamard rotation along head_dim before per-token FP4 KV
-    # cache quantization (with the matching Q rotation inside the batched RPA
-    # wrapper). Spreads per-channel outliers across the head dimension so
-    # low-bit quantization loses less accuracy. Requires
-    # kv_cache_dtype="nvfp4" and the batched RPA backend
-    # (--attention-backend CUSTOM). Modes:
-    #   "0"/"false": disabled (default).
-    #   "1"/"true"/"k": rotate K only. Keys carry the RoPE per-channel
-    #     outliers that hurt FP4; values are well served by plain per-token
-    #     scaling. Needs no rotation of the attention output, so the latency
-    #     cost is a single fused Q-rotation (<5% of the RPA wrapper).
-    #   "kv": additionally rotate V and un-rotate the attention output.
-    #     Slightly more accurate when V also has outlier channels, at ~1-3%
-    #     extra wrapper latency.
-    "TPU_KV_CACHE_QUANT_HADAMARD":
-    env_with_choices("TPU_KV_CACHE_QUANT_HADAMARD",
-                     "0", ["0", "1", "false", "true", "k", "kv"],
                      case_sensitive=False),
 
     # Selects the #193 SparseCore MoE token-movement path. When 0, the EP
