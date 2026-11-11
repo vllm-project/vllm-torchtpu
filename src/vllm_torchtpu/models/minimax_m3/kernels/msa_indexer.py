@@ -394,7 +394,7 @@ def _kernel_v3(
         entry = work_ref[w]
         seq = tile_seq_ref[entry >> _TILE_SHIFT] & _SEQ_MASK
         first = (entry & _GROUP_MASK) * pages_per_step
-        return seq * pages_per_seq + first, jnp.maximum(seq_pages_ref[seq] - first, 1)
+        return seq * pages_per_seq + first, jnp.maximum(seq_pages_ref[seq] - first, 0)
 
     def copy(base, g, slot):
         col = g
@@ -649,8 +649,10 @@ def _class_scores(
         jnp.clip(tile_row0, 0, num_tokens // _ROW_ALIGN * _ROW_ALIGN) << _ROW_SHIFT
     ) | tile_seq
 
-    # Work list: every page group of every tile's request.
-    seq_pages = -(-seq_lens // page_size)
+    # Work list: every page group of every tile's request. Requests of other
+    # classes have no pages: the one step of an empty class copies and
+    # scores nothing (a decode step's large class, `msa_dcp`).
+    seq_pages = jnp.where(seq_in_class, -(-seq_lens // page_size), 0)
     groups_per_tile = jnp.where(
         jnp.arange(max_tiles) < num_tiles,
         jnp.maximum(-(-lookup(seq_pages, tile_seq) // pages_per_step), 1),
@@ -816,6 +818,12 @@ def is_prefill_step(num_tokens: int, max_num_seqs: int) -> bool:
     return num_tokens > max_num_seqs * _SMALL_TILE_Q
 
 
+def may_hold_large(num_rows: int, block_q: int = DEFAULT_BLOCK_Q) -> bool:
+    """Whether a step of `num_rows` query rows may hold a request of the
+    large tile class (more than `block_q` rows)."""
+    return num_rows > block_q
+
+
 def class_plan(
     index_q: jax.Array,
     index_cache: jax.Array,
@@ -871,7 +879,11 @@ def class_plan(
         q_pad=max(block_q, large_block_q),
     )
     # Large requests have more than block_q tokens each.
-    max_large = min(max_num_seqs, num_tokens // (block_q + 1))
+    max_large = (
+        min(max_num_seqs, num_tokens // (block_q + 1))
+        if may_hold_large(num_tokens, block_q)
+        else 0
+    )
     # Kernel v3 reads 4-bit pages with folded scales only.
     unfolded_fp4 = scale_row is not None
     small_kernel = "v2" if kernel == "v3" and unfolded_fp4 else kernel

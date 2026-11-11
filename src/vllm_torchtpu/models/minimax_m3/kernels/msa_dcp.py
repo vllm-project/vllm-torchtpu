@@ -348,6 +348,11 @@ def local_candidates(
         needed = -(-(last_pos // block_size + 1) // dcp)
         w = jnp.asarray(widths, jnp.int32)
         row_widths = jnp.min(jnp.where(w >= needed[:, None], w, num_cols), axis=1)
+    if live_rows is not None:
+        # Width 0 matches no kernel body: a block past the live rows (the one
+        # block the grid keeps for an empty class) only moves its blocks.
+        first_row = jnp.arange(num_blocks, dtype=jnp.int32) * block_rows
+        row_widths = jnp.where(first_row < live_rows, row_widths, 0)
     transposed = block_rows % _TRANSPOSED_ROWS == 0
     if transposed:
         kernel = functools.partial(_candidates_kernel_t, pretransposed=pretransposed)
@@ -620,6 +625,18 @@ def _class_candidates(
     )
 
 
+def _picks_per_class(num_rows: int, max_num_seqs: int) -> bool:
+    """Whether a step of `num_rows` index-query rows picks per tile class
+    (`_class_candidates`): any step with room for a large (prefill) request.
+    A decode step's empty large class then costs two near-empty kernel
+    steps, where `msa_indexer.block_scores`' conditional over it waited
+    ~7.5 us per layer after its token-order gather of the scores (c48 / c64
+    decode twins, j-c22c589e, j-c4bfc418)."""
+    return msa_indexer.is_prefill_step(
+        num_rows, max_num_seqs
+    ) or msa_indexer.may_hold_large(num_rows)
+
+
 def msa_write_and_candidates_dcp(
     k: jax.Array,
     v: jax.Array,
@@ -705,7 +722,7 @@ def msa_write_and_candidates_dcp(
         dcp=dcp,
         interpret=interpret,
     )
-    if msa_indexer.is_prefill_step(num_heads * num_tokens, max_num_seqs):
+    if _picks_per_class(num_heads * num_tokens, max_num_seqs):
         packed = _class_candidates(
             index_q,
             index_cache,
