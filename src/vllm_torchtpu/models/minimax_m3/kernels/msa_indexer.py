@@ -491,6 +491,27 @@ def _kernel_v3(
 
 _KERNELS = {"v1": _kernel_v1, "v2": _kernel_v2}
 
+# r6 (opt-in): per-request table lookups by a one-hot instead of a gather
+# (`lookup`). Set from TPU_MINIMAX_M3_MSA_ONEHOT_LOOKUP by the attention
+# layer.
+ONEHOT_LOOKUP = False
+
+
+def lookup(table: jax.Array, index: jax.Array) -> jax.Array:
+    """``table[index]`` for a small per-request table and in-range `index`.
+
+    With `ONEHOT_LOOKUP`, by a one-hot over its entries (an out-of-range
+    index reads 0): XLA lowers a gather from a small table to a compare chain
+    over one scalar operand per entry, ~0.6 us each (a [T] lookup into 64
+    requests' table: ~72 us, c64 decode twin j-0a66fa2e). Otherwise the
+    gather."""
+    if not ONEHOT_LOOKUP:
+        return table[index]
+    onehot = index[..., None] == jnp.arange(table.shape[0], dtype=index.dtype)
+    if table.dtype == jnp.bool_:
+        return jnp.any(onehot & table, axis=-1)
+    return jnp.sum(jnp.where(onehot, table, 0), axis=-1, dtype=table.dtype)
+
 
 def _tiles(cu_q_lens: jax.Array, seq_in_class: jax.Array, block_q: int, max_tiles: int):
     """Query tiles of one tile class.
@@ -513,7 +534,9 @@ def _tiles(cu_q_lens: jax.Array, seq_in_class: jax.Array, block_q: int, max_tile
         max_num_seqs - 1,
     )
     first_tile = tile_ends - tiles_per_seq
-    tile_row0 = start[tile_seq] + (tile - first_tile[tile_seq]) * block_q
+    tile_row0 = (
+        lookup(start, tile_seq) + (tile - lookup(first_tile, tile_seq)) * block_q
+    )
     return tile_seq, tile_row0, first_tile, start, tile_ends[-1]
 
 
@@ -592,7 +615,7 @@ def _class_scores(
     seq_pages = -(-seq_lens // page_size)
     groups_per_tile = jnp.where(
         jnp.arange(max_tiles) < num_tiles,
-        jnp.maximum(-(-seq_pages[tile_seq] // pages_per_step), 1),
+        jnp.maximum(-(-lookup(seq_pages, tile_seq) // pages_per_step), 1),
         0,
     )
     group_ends = jnp.cumsum(groups_per_tile)
@@ -726,8 +749,8 @@ def _class_scores(
         ),
         max_num_seqs - 1,
     )
-    offset = tok - tile_start[seq]
-    col = (first_tile[seq] + offset // block_q) * block_q + offset % block_q
+    offset = tok - lookup(tile_start, seq)
+    col = (lookup(first_tile, seq) + offset // block_q) * block_q + offset % block_q
     col = jnp.clip(col, 0, max_tiles * block_q - 1)
     return ClassScores(
         scores_t, col, tile_seq, tile_row0, num_tiles, first_tile, tile_start
@@ -983,7 +1006,7 @@ def block_scores(
         )
         # One gather over both classes' columns (XLA fuses the concatenate
         # into it) instead of a transposing gather per class and a select.
-        col = jnp.where(is_large[seq], small_t.shape[1] + large_col, small_col)
+        col = jnp.where(lookup(is_large, seq), small_t.shape[1] + large_col, small_col)
         small_t, large = (
             jnp.pad(x, ((0, pages - x.shape[0]), (0, 0))) for x in (small_t, large)
         )

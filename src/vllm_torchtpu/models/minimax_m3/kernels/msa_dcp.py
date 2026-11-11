@@ -1049,14 +1049,18 @@ def _class_candidates(
         )
         picks.append(pack_candidates(s, b))
         # Each head's and token's column in this class (`_class_scores`).
-        start = scored.tile_start[seq_of_token][None]
+        start = msa_indexer.lookup(scored.tile_start, seq_of_token)[None]
         off = rows - start
-        col = (scored.first_tile[seq_of_token][None] + off // block_q) * block_q
+        col = (
+            msa_indexer.lookup(scored.first_tile, seq_of_token)[None] + off // block_q
+        ) * block_q
         cols.append(jnp.clip(col + off % block_q, 0, picks[-1].shape[0] - 1))
     # A head's and token's picks: its large-class column if its request is
     # large, else its small-class one.
     col = jnp.where(
-        plan.is_large[seq_of_token][None], picks[0].shape[0] + cols[1], cols[0]
+        msa_indexer.lookup(plan.is_large, seq_of_token)[None],
+        picks[0].shape[0] + cols[1],
+        cols[0],
     )
     packed = jnp.concatenate(picks, axis=0)[col.reshape(-1)]  # [G * T, 2 * topk]
     return (

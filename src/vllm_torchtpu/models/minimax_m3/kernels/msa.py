@@ -45,8 +45,9 @@ def token_positions(
         cu_q_lens[1:], tok, side="right", method="compare_all"
     ).astype(jnp.int32)
     seq_id = jnp.minimum(seq_id, seq_lens.shape[0] - 1)
-    q_len = cu_q_lens[seq_id + 1] - cu_q_lens[seq_id]
-    pos = seq_lens[seq_id] - q_len + (tok - cu_q_lens[seq_id])
+    start = msa_indexer.lookup(cu_q_lens, seq_id)
+    q_len = msa_indexer.lookup(cu_q_lens, seq_id + 1) - start
+    pos = msa_indexer.lookup(seq_lens, seq_id) - q_len + (tok - start)
     valid = tok < cu_q_lens[-1]
     return seq_id, jnp.where(valid, pos, 0), valid
 

@@ -20,7 +20,11 @@ default paths), and an enabled one logs once per process with its env name.
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.models.minimax_m3.kernels import msa_attention, msa_dcp
+from vllm_torchtpu.models.minimax_m3.kernels import (
+    msa_attention,
+    msa_dcp,
+    msa_indexer,
+)
 
 logger = init_logger(__name__)
 
@@ -38,3 +42,4 @@ def _set(env_name: str, module, attr: str) -> None:
 def apply() -> None:
     _set("TPU_MINIMAX_M3_MSA_UNSTABLE_SORT", msa_attention, "UNSTABLE_UNION_SORT")
     _set("TPU_MINIMAX_M3_DCP_FINE_SCAN_WIDTHS", msa_dcp, "FINE_SCAN_WIDTHS")
+    _set("TPU_MINIMAX_M3_MSA_ONEHOT_LOOKUP", msa_indexer, "ONEHOT_LOOKUP")
