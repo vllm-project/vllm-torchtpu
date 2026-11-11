@@ -54,6 +54,11 @@ Why the padding happens outside: TorchTPU pairs a collective across ranks by
 program, so every rank must run the identical program around it. A row count
 that differs between ranks, or a rank-dependent pad inside the program, hangs
 (eager) or mismatches (compiled) the collectives.
+
+On the TPU7x
+TensorCore collective path, rank-local metadata or lazy constant inputs fused
+into eager embedding can deadlock. Materialize its flat input and output
+without waiting to isolate that program; compiled embedding stays in the graph.
 """
 
 from typing import TYPE_CHECKING
@@ -200,6 +205,11 @@ def embedding_forward(
 
     dp, tp = _groups()
     ids = input_.reshape(-1)
+    eager_tpu = not torch.compiler.is_compiling() and ids.device.type == "tpu"
+    if eager_tpu:
+        # Keep lazy input construction and caller metadata outside the
+        # collective program, which must match on busy and idle ranks.
+        utils.synchronize_tensors(ids, wait=False)
     if dp.world_size > 1:
         ids = dp.all_gather(ids, dim=0)
     masked, mask = vpe.get_masked_input_and_mask(
@@ -211,6 +221,8 @@ def embedding_forward(
         out = dp.reduce_scatter(out, dim=0)
     if tp.world_size > 1:
         out = tp.all_reduce(out)
+    if eager_tpu:
+        utils.synchronize_tensors(out, wait=False)
     return out.view(*input_.shape, out.shape[-1])
 
 
