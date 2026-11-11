@@ -193,16 +193,10 @@ spec:
                   value: "17179869184"
                 - name: TPU_P2P_WAIT_PULL_TIMEOUT
                   value: "600"
-                - name: TPU_KV_SHM_POOL_GB
-                  value: "8"
                 - name: TPU_KV_TRANSFER_PORT
                   value: "9100"
-                - name: TPU_SIDE_CHANNEL_PORT
-                  value: "9600"
                 - name: TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE
                   value: "disabled"
-                - name: TPU_KV_TRANSFER_NAMESPACE
-                  value: "gke_prefill"
                 - name: TPU_RAIDEN_JOB_NAME
                   value: "prefill"
                 - name: TPU_RAIDEN_ENGINE_ID
@@ -400,16 +394,10 @@ spec:
                   value: "17179869184"
                 - name: TPU_P2P_WAIT_PULL_TIMEOUT
                   value: "600"
-                - name: TPU_KV_SHM_POOL_GB
-                  value: "8"
                 - name: TPU_KV_TRANSFER_PORT
                   value: "9100"
-                - name: TPU_SIDE_CHANNEL_PORT
-                  value: "9600"
                 - name: TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE
                   value: "disabled"
-                - name: TPU_KV_TRANSFER_NAMESPACE
-                  value: "gke_decode"
                 - name: TPU_RAIDEN_JOB_NAME
                   value: "decode"
                 - name: TPU_RAIDEN_ENGINE_ID

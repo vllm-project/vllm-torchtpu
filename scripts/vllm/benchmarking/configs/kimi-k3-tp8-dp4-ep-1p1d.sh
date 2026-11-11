@@ -70,14 +70,11 @@ export TPU_RAIDEN_DST_SHARDS="$TENSOR_PARALLELISM"
 # Decode keeps a local prefix hit and pulls the suffix alone.
 export TPU_RAIDEN_PREFIX_AWARE_LOAD=1
 export TPU_KV_TRANSFER_PORT=9100
-export TPU_SIDE_CHANNEL_PORT=9600
-export TPU_KV_SHM_POOL_GB=8
 export TPU_PREMAPPED_BUFFER_SIZE=17179869184
 export VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S:-14400}"
 # The rest of what #1271 was validated with.
 export TPU_MOE_HIERARCHICAL_EP=1
 export TPU_LATENT_PROJ_INTRA_CHIP_TP=1
-export TPU_RAIDEN_TRANSFER_NUM_SLOTS=1
 export TPU_PARALLEL_PRECOMPILE=1
 export TPU_P2P_WAIT_PULL_TIMEOUT=900
 export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=10800
@@ -86,7 +83,6 @@ export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=10800
 case "${K3_1P1D_ROLE:-}" in
     prefill)
         _kv_role=kv_producer
-        export TPU_KV_TRANSFER_NAMESPACE=k3_prefill
         export TPU_RAIDEN_ENGINE_ID=k3-prefill-engine
         export TPU_RAIDEN_JOB_NAME=prefill
         export TPU_RAIDEN_RESHARD_PORT_BASE=27000
@@ -94,7 +90,6 @@ case "${K3_1P1D_ROLE:-}" in
         ;;
     decode)
         _kv_role=kv_consumer
-        export TPU_KV_TRANSFER_NAMESPACE=k3_decode
         export TPU_RAIDEN_ENGINE_ID=k3-decode-engine
         export TPU_RAIDEN_JOB_NAME=decode
         export TPU_RAIDEN_RESHARD_PORT_BASE=28000
