@@ -9571,7 +9571,10 @@ class TPUModelRunner(GPUModelRunner):
             self.num_blocks_per_most_len_req = pages
         self._attention_capacity.clear()
         self._decode_device_cache_key = None
-        self._steady_decode_cache.invalidate()
+        # __init__ calls this before the steady-decode cache exists (it is created later in __init__).
+        steady_cache = self.__dict__.get("_steady_decode_cache")
+        if steady_cache is not None:
+            steady_cache.invalidate()
 
     def may_reinitialize_input_batch(
         self,
