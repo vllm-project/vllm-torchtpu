@@ -236,3 +236,35 @@ def test_patch_is_idempotent(patched):
     init = cls.__init__
     _patch_vllm_qsa_dcp_fine_prefix_hits()
     assert cls.__init__ is init
+
+
+@pytest.mark.parametrize("opt_in", [False, True])
+def test_kv_connector_needs_opt_in(monkeypatch, opt_in):
+    # A KV connector (the Raiden host tier) turns the fine hits off unless
+    # VLLM_TPU_QSA_DCP_FINE_PREFIX_CONNECTOR=1.
+    import types
+
+    import vllm.config
+
+    connector_config = types.SimpleNamespace(
+        kv_transfer_config=types.SimpleNamespace(kv_connector="TPURaidenOffloadingConnector")
+    )
+    monkeypatch.setattr(
+        vllm.config, "get_current_vllm_config_or_none", lambda: connector_config
+    )
+    cls = kv_cache_coordinator.HybridKVCacheCoordinator
+    monkeypatch.setattr(cls, "__init__", inspect.unwrap(cls.__init__))
+    monkeypatch.setattr(cls, "_tpu_qsa_dcp_fine_prefix_patch", False, raising=False)
+    monkeypatch.setattr(KVCacheManager, "free", inspect.unwrap(KVCacheManager.free))
+    _patch_vllm_qsa_dcp_fine_prefix_hits()
+    _flags(monkeypatch, dcp=2, fine=True)
+    monkeypatch.setenv("VLLM_TPU_QSA_DCP_FINE_PREFIX_CONNECTOR", "1" if opt_in else "0")
+    manager = _manager(2)
+    assert manager.coordinator.enable_partial_hash_hits == opt_in
+    if opt_in:
+        boundary = 3 * B
+        _run(manager, _request("a", list(range(boundary + 8))))
+        hit, copies = _run(
+            manager, _request("b", _shared_then_diverge(boundary + 4, boundary + 40))
+        )
+        assert hit == boundary and len(copies) == 1

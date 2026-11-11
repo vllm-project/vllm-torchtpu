@@ -122,6 +122,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_PREFILL_BF16_MXU: bool = False
     VLLM_TPU_QSA_DCP_FINE_PREFIX: bool = False
     VLLM_TPU_QSA_DCP_FINE_PREFIX_SEQ_TAIL: bool = False
+    VLLM_TPU_QSA_DCP_FINE_PREFIX_CONNECTOR: bool = False
     VLLM_TPU_QSA_PREFILL_LEAN: bool = False
     VLLM_TPU_QSA_PREFILL_VPU: str = ""
     VLLM_TPU_QSA_PREFILL_PAGE_COPIES: bool = False
@@ -906,6 +907,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # previous output), not only at the prompt's last boundary.
     "VLLM_TPU_QSA_DCP_FINE_PREFIX_SEQ_TAIL": env_bool(
         "VLLM_TPU_QSA_DCP_FINE_PREFIX_SEQ_TAIL"
+    ),
+    # With it: keep VLLM_TPU_QSA_DCP_FINE_PREFIX on when the KV connector is a
+    # CPU offloading one (the Raiden host tier). A host lookup runs only after
+    # a chunk-aligned HBM hit (_patch_vllm_offload_fine_prefix_alignment).
+    # Off: any KV connector turns the fine hits off (hits round to D*B).
+    "VLLM_TPU_QSA_DCP_FINE_PREFIX_CONNECTOR": env_bool(
+        "VLLM_TPU_QSA_DCP_FINE_PREFIX_CONNECTOR"
     ),
     # qwen4_exp QSA sparse prefill: skip the FP8 key finite/written guard,
     # which the score mask select already covers (bit-identical output).
