@@ -56,10 +56,13 @@ from vllm_torchtpu.kernels.fused_moe.v2.host import (
     weight_format_of_dtype,
 )
 from vllm_torchtpu.kernels.fused_moe.v2.kernel import (
+    SCALE_SLAB_WINDOW,
+    build_act_scale_slab,
     build_combine_kernel,
     build_fused_ep_moe_kernel,
     combine_step_tokens,
     rowquant_fp8,
+    scale_slab_fits,
 )
 from vllm_torchtpu.kernels.fused_moe.v2.router_ops import pallas_select
 from vllm_torchtpu.kernels.fused_moe.v2.token_parallel import (
@@ -501,9 +504,15 @@ def fused_ep_moe_v2(
     # pins the chip; the form is in the key as well so a caller that forces
     # it (a test, an A/B) never gets the other form's cached body.
     slab_by_set = slab_scatter_by_set()
+    # Whether the activation-scale slab is a lookup through the token-gather
+    # table (build_act_scale_slab) rather than a scatter: wherever the rows
+    # are quantized and their per-token scales fit in SMEM. In the cache key
+    # for the same reason as the scatter form.
+    scale_by_lookup = bool(form.quantized_activations and scale_slab_fits(T))
     logger.info_once(
-        "fused_ep_moe_v2: slab tables built with a scatter-%s",
+        "fused_ep_moe_v2: slab tables built with a scatter-%s; scale slab by %s",
         "set" if slab_by_set else "add",
+        "lookup" if scale_by_lookup else "scatter",
     )
 
     layout = _exchange_layout(t_local, topk, e_total, form.quantized_activations)
@@ -701,6 +710,10 @@ def fused_ep_moe_v2(
             rows=slab_row,
             by_set=slab_by_set,
         )
+        # The table in mesh order, which is the order the routing payload --
+        # and so the per-token row scales the scale slab looks up through it --
+        # was gathered in, whatever order q_g was.
+        token_gather_mesh = token_gather
         if gather_positions is not None:
             # The rows were gathered in another order than the mesh's, so
             # token t -- row t % t_local of shard t // t_local -- sits in the
@@ -716,8 +729,16 @@ def fused_ep_moe_v2(
         # scatter (rather than enlarging its destination) so the off-shard
         # sentinel remains out of range and cannot write a live padding row.
         token_gather = jnp.pad(token_gather, (0, token_gather_window_rows(capacity)))
-        # The activation row scale, scattered onto the slab row each routed
-        # pair computes on. It exists only where the rows were quantized.
+        expert_rows, slab_base = shard_expert_slabs(routing, me, e_total=e_total, ep=ep)
+        # The activation row scale of each slab row: the scale of the token
+        # the row computes. It exists only where the rows were quantized.
+        #
+        # Where the per-token scales fit in SMEM it is a lookup through the
+        # token-gather table over the shard's live rows (build_act_scale_slab):
+        # the same bits on every row a pair lands on, at a fraction of the
+        # scatter below, which walks every routed pair of every shard. The
+        # lookup reads the mesh-order table, since the scales are in mesh
+        # order.
         #
         # The slab is built flat and handed over in the dense lane-block
         # view, which is the same bytes in the same order and so costs
@@ -731,7 +752,23 @@ def fused_ep_moe_v2(
         # rebase sent past the end lands on one of them instead of being
         # dropped; nothing reads them, and the slab's own rows are the same
         # either way.
-        if form.quantized_activations:
+        if scale_by_lookup:
+            scale_rows = act_scale_slab_rows(ragged_stride)
+            view_rows = scale_rows * HIDDEN_LANE_BLOCK
+            table_rows = align_up(ragged_stride, SCALE_SLAB_WINDOW)
+            slab_bits = build_act_scale_slab(
+                n_tokens=T,
+                table_rows=table_rows,
+                out_rows=align_up(view_rows, SCALE_SLAB_WINDOW),
+            )(
+                expert_rows.sum(),
+                jnp.pad(token_gather_mesh, (0, table_rows - ragged_stride)),
+                cast(jax.Array, scale_bits_g),
+            )
+            scale_slab = lax.bitcast_convert_type(
+                slab_bits[:view_rows], jnp.float32
+            ).reshape(scale_rows, HIDDEN_LANE_BLOCK)
+        elif form.quantized_activations:
             scale_bits = jnp.repeat(cast(jax.Array, scale_bits_g), topk)
             scale_rows = act_scale_slab_rows(ragged_stride)
             scale_slab = lax.bitcast_convert_type(
@@ -745,7 +782,6 @@ def fused_ep_moe_v2(
             ).reshape(scale_rows, HIDDEN_LANE_BLOCK)
         else:
             scale_slab = None
-        expert_rows, slab_base = shard_expert_slabs(routing, me, e_total=e_total, ep=ep)
         recv_rows = align_up(t_local * topk + (ROWBLK - 1) * e_total, ROWBLK)
         # The bias tables are per expert and per output channel on every
         # weight format, so they take one layout: [G, N].
@@ -970,6 +1006,7 @@ def fused_ep_moe_v2(
         stage,
         gather_positions,
         slab_by_set,
+        scale_by_lookup,
     )
     body, out_specs = {
         "fused": (local_fn, P(ax)),

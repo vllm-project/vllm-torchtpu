@@ -2374,3 +2374,126 @@ def build_combine_kernel(**kwargs):
                 fn = _build_combine_kernel(**kwargs)
                 _COMBINE_CACHE[key] = fn
     return fn
+
+
+# The activation-scale slab, built by lookup rather than by scatter.
+#
+# The slab holds one f32 per slab row: the row scale of the token the row
+# computes. The XLA form scatters every routed pair's scale onto its slab row,
+# and every shard does that for ALL T * topk pairs, though only the ~1/ep that
+# land on it are kept; on a chip whose compiler leaves the scatter on the
+# TensorCore (TPU8i), that is the single largest piece of glue around the
+# kernel. Once the token-gather table exists, the slab is a lookup through it:
+# row r gets scale[token_gather[r]]. A shard's live rows are one contiguous
+# range, [0, sum of its experts' rows), so the lookup walks only those -- about
+# T * topk / ep rows rather than T * topk pairs -- on the scalar core, with the
+# per-token scales resident in SMEM. XLA's own gather costs more than the
+# scatter it would replace on TPU8i, which is why this is a kernel.
+SCALE_SLAB_WINDOW = 512
+# SMEM the per-token scale table may take. Above it the layer keeps the scatter.
+SCALE_SLAB_MAX_TABLE_BYTES = 512 * 1024
+
+
+def scale_slab_fits(n_tokens):
+    """Whether the lookup form's per-token table fits its SMEM budget."""
+    return n_tokens * 4 <= SCALE_SLAB_MAX_TABLE_BYTES
+
+
+def _build_act_scale_slab(*, n_tokens, table_rows, out_rows):
+    """The lookup that fills the scale slab; see SCALE_SLAB_WINDOW above.
+
+    Operands: the live row count [1] (scalar prefetch), the token-gather table
+    [table_rows] i32, the per-token scale bits [n_tokens] i32 and a zero slab
+    [out_rows] i32 that the result aliases, so rows past the live range keep
+    the zero the scatter form leaves there. Rows inside the live range that no
+    pair landed on (the ROWBLK padding of each run) read token 0's scale where
+    the scatter leaves 0; the kernel never commits those rows.
+    """
+    W = SCALE_SLAB_WINDOW
+    if table_rows % W or out_rows % W:
+        raise ValueError(
+            f"the token-gather table ({table_rows} rows) and the slab "
+            f"({out_rows} rows) must be whole {W}-row windows"
+        )
+
+    def kernel(
+        live_ref, tg_hbm, scale_hbm, zero_hbm, out_hbm, scale_sm, tok_sm, val_sm, sem
+    ):
+        del zero_hbm  # aliased by out_hbm
+        cp = pltpu.make_async_copy(scale_hbm, scale_sm, sem)
+        cp.start()
+        cp.wait()
+        live = live_ref[0]
+
+        def window(i, carry):
+            start = pl.multiple_of(i * W, W)
+            fetch = pltpu.make_async_copy(tg_hbm.at[pl.ds(start, W)], tok_sm, sem)
+            fetch.start()
+            fetch.wait()
+            n = jnp.minimum(jnp.int32(W), live - start)
+
+            def lookup(j, c):
+                val_sm[j] = scale_sm[tok_sm[j]]
+                return c
+
+            def clear(j, c):
+                val_sm[j] = jnp.int32(0)
+                return c
+
+            lax.fori_loop(0, n, lookup, jnp.int32(0))
+            lax.fori_loop(n, W, clear, jnp.int32(0))
+            store = pltpu.make_async_copy(val_sm, out_hbm.at[pl.ds(start, W)], sem)
+            store.start()
+            store.wait()
+            return carry
+
+        lax.fori_loop(0, pl.cdiv(live, W), window, jnp.int32(0))
+
+    hbm = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
+    call = pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            in_specs=[hbm, hbm, hbm],
+            out_specs=hbm,
+            scratch_shapes=(
+                pltpu.SMEM((n_tokens,), jnp.int32),
+                pltpu.SMEM((W,), jnp.int32),
+                pltpu.SMEM((W,), jnp.int32),
+                pltpu.SemaphoreType.DMA,
+            ),
+            grid=(),
+        ),
+        out_shape=jax.ShapeDtypeStruct((out_rows,), jnp.int32),
+        # Operand 3 counts the scalar prefetch: (live, table, scales, zeros).
+        input_output_aliases={3: 0},
+        compiler_params=pltpu.CompilerParams(disable_bounds_checks=True),
+        name=f"fused_ep_moe_v2_scale_slab_t{n_tokens}",
+    )
+
+    def fn(live_rows, token_gather, scale_bits):
+        return call(
+            live_rows.astype(jnp.int32).reshape(1),
+            token_gather.astype(jnp.int32),
+            scale_bits.astype(jnp.int32),
+            jnp.zeros((out_rows,), jnp.int32),
+        )
+
+    return fn
+
+
+_SCALE_SLAB_CACHE = {}
+_SCALE_SLAB_CACHE_LOCK = threading.Lock()
+
+
+def build_act_scale_slab(**kwargs):
+    """Memoizing front door; see build_fused_ep_moe_kernel for why."""
+    key = tuple(sorted((k, str(v)) for k, v in kwargs.items()))
+    fn = _SCALE_SLAB_CACHE.get(key)
+    if fn is None:
+        with _SCALE_SLAB_CACHE_LOCK:
+            fn = _SCALE_SLAB_CACHE.get(key)
+            if fn is None:
+                fn = _build_act_scale_slab(**kwargs)
+                _SCALE_SLAB_CACHE[key] = fn
+    return fn
