@@ -1136,6 +1136,7 @@ class TPUModelRunner(GPUModelRunner):
         # Dedicated RNG for non-greedy sampling, to keep the draws consistent
         # across a replica's TP ranks (else they diverge -> collective hang).
         self._sampling_generator: torch.Generator | None = None
+        self._spec_glue_logged: set[str] = set()
         # JAX Mesh for shard_map ops in TPU kernels. Real DP is vLLM
         # multi-engine DP, so this per-worker mesh only has a model axis.
         self.mesh = self._create_mesh_for_parallelism()
@@ -2942,6 +2943,20 @@ class TPUModelRunner(GPUModelRunner):
         # Bucketed drafters keep the sampler's padded rows (an exact-count slice
         # would compile a program per request count); others keep exact rows.
         bucketed = getattr(getattr(self, "drafter", None), "bucketed_drafts", False)
+        if (
+            envs.TPU_SPEC_GLUE_FUSION
+            and len(next_tokens_per_chunk) == 1
+            and state.spec_decode_metadata_list[0] is not None
+        ):
+            fused = self._fused_spec_substitution(
+                drafts_per_chunk[0],
+                next_tokens_per_chunk[0],
+                state.num_reqs_list[0],
+                state.spec_decode_metadata_list[0],
+                bucketed,
+            )
+            if fused is not None:
+                return fused
         next_tokens_tpu_chunks: list[torch.Tensor] = []
         next_token_indices: dict[int, int] = {}
         num_rejected_chunks: list[torch.Tensor] = []
@@ -2994,6 +3009,42 @@ class TPUModelRunner(GPUModelRunner):
             num_draft_per_req,
         )
 
+    def _spec_glue_rejected_len(self) -> int:
+        """Fixed length of the parked rejected count under
+        TPU_SPEC_GLUE_FUSION, so the next step's subtract program depends only
+        on (padded num_reqs, padded num_tokens)."""
+        return max(self.num_reqs_paddings)
+
+    def _fused_spec_substitution(self, drafts_chunk, nt_chunk, num_reqs, md, bucketed):
+        """`_assemble_async_spec_substitution` for a single verify chunk as one
+        compiled program (TPU_SPEC_GLUE_FUSION); None when the chunk does not
+        fit the fixed rejected-count length."""
+        from vllm_torchtpu.runner.tpu_runner_async_output import (
+            spec_substitution_glue,
+        )
+
+        assert self.speculative_config is not None
+        rows = nt_chunk.shape[0] if bucketed else num_reqs
+        rejected_len = self._spec_glue_rejected_len()
+        if rows > rejected_len:
+            return None
+        self._log_spec_glue_once("TPU_SPEC_GLUE_FUSION")
+        src_len = self.max_num_reqs * (
+            1 + self.speculative_config.num_speculative_tokens
+        )
+        src, spec_num_rejected = spec_substitution_glue(
+            nt_chunk,
+            drafts_chunk,
+            md.draft_lengths,
+            rows,
+            None if bucketed else num_reqs,
+            src_len,
+            rejected_len,
+        )
+        num_draft_per_req = {r: int(md.draft_lengths_cpu[r]) for r in range(num_reqs)}
+        next_token_indices = {r: r for r in range(num_reqs)}
+        return [src], next_token_indices, spec_num_rejected, num_draft_per_req
+
     def _assemble_async_prefill_bootstrap(
         self, drafts, combined_selected_tokens, combined_real_lens
     ):
@@ -3032,8 +3083,17 @@ class TPUModelRunner(GPUModelRunner):
                 [bonus.to(drafts_chunk.dtype), drafts_chunk], dim=1
             )  # [chunk_padded_num_reqs, 1+K] = [bonus, draft_1..K]
             next_tokens_tpu_chunks.append(src.reshape(-1))
+            zeros_len = chunk_padded_num_reqs
+            if (
+                envs.TPU_SPEC_GLUE_FUSION
+                and len(combined_real_lens) == 1
+                and chunk_padded_num_reqs <= self._spec_glue_rejected_len()
+            ):
+                # Same fixed length as the fused verify path, so the next
+                # step's subtract program sees one rejected-count shape.
+                zeros_len = self._spec_glue_rejected_len()
             num_rejected_chunks.append(
-                torch.zeros(chunk_padded_num_reqs, dtype=torch.int32, device=src.device)
+                torch.zeros(zeros_len, dtype=torch.int32, device=src.device)
             )
             for r in range(n):
                 next_token_indices[req_offset + r] = padded_req_offset + r
@@ -3300,7 +3360,13 @@ class TPUModelRunner(GPUModelRunner):
         ):
             from vllm_torchtpu.runner.tpu_runner_async_output import (
                 subtract_num_rejected_tokens,
+                subtract_num_rejected_tokens_compiled,
             )
+
+            subtract = subtract_num_rejected_tokens
+            if envs.TPU_SPEC_GLUE_FUSION:
+                self._log_spec_glue_once("TPU_SPEC_GLUE_FUSION")
+                subtract = subtract_num_rejected_tokens_compiled
 
             seq_idx_np = np.full(target_num_reqs, -1, dtype=np.int32)
             pos_idx_np = np.full(padded_total_num_scheduled_tokens, -1, dtype=np.int32)
@@ -3313,7 +3379,7 @@ class TPUModelRunner(GPUModelRunner):
                     seq_idx_np[i] = pos
                     pos_idx_np[acc : acc + n_sched] = pos
                 acc += n_sched
-            seq_lens, self.position_ids = subtract_num_rejected_tokens(
+            seq_lens, self.position_ids = subtract(
                 seq_lens,
                 self.position_ids,
                 self._pre_async_results.spec_decode_num_rejected_tokens,
@@ -4502,6 +4568,11 @@ class TPUModelRunner(GPUModelRunner):
             gen.manual_seed(int(self.model_config.seed or 0))
             self._sampling_generator = gen
         return self._sampling_generator
+
+    def _log_spec_glue_once(self, flag: str) -> None:
+        if flag not in self._spec_glue_logged:
+            self._spec_glue_logged.add(flag)
+            logger.info("%s=1: spec-decode glue path active", flag)
 
     @torch.no_grad()
     def _update_mamba_slot_read_offsets(
@@ -7023,6 +7094,59 @@ class TPUModelRunner(GPUModelRunner):
             )
             synchronize_tensors(out)
 
+    def _precompile_spec_glue(self) -> None:
+        """The two TPU_SPEC_GLUE_FUSION programs at every bucket the runtime
+        can produce: the substitution source + rejected count per padded
+        request count, and the next step's subtract per (padded num_reqs,
+        padded num_tokens)."""
+        if not (
+            envs.TPU_SPEC_GLUE_FUSION
+            and self.scheduler_config.async_scheduling
+            and self.speculative_config is not None
+        ):
+            return
+        from vllm_torchtpu.runner.tpu_runner_async_output import (
+            spec_substitution_glue,
+            subtract_num_rejected_tokens_compiled,
+        )
+
+        k = self.speculative_config.num_speculative_tokens
+        rejected_len = self._spec_glue_rejected_len()
+        src_len = self.max_num_reqs * (1 + k)
+        with self._precompile_timed("spec_glue"):
+            for rows in self.num_reqs_paddings:
+                next_tokens = torch.zeros((rows, 1 + k), dtype=torch.int32).to(
+                    self.device
+                )
+                num_draft = torch.zeros(rows, dtype=torch.int32).to(self.device)
+                for dtype in (torch.int64, torch.int32):
+                    drafts = torch.zeros((rows, k), dtype=dtype).to(self.device)
+                    out = spec_substitution_glue(
+                        next_tokens, drafts, num_draft, rows, None, src_len, rejected_len
+                    )
+                    synchronize_tensors(out)
+            num_rejected = torch.zeros(rejected_len, dtype=torch.int32).to(self.device)
+            for num_tokens in self.num_tokens_paddings:
+                positions = torch.zeros(num_tokens, dtype=self.positions_cpu.dtype).to(
+                    self.device
+                )
+                pos_idx = torch.full((num_tokens,), -1, dtype=torch.int32).to(
+                    self.device
+                )
+                for num_reqs in self.num_reqs_paddings:
+                    if num_reqs > num_tokens:
+                        break
+                    seq_lens = torch.zeros(num_reqs, dtype=self.seq_lens_cpu.dtype).to(
+                        self.device
+                    )
+                    seq_idx = torch.full((num_reqs,), -1, dtype=torch.int32).to(
+                        self.device
+                    )
+                    out = subtract_num_rejected_tokens_compiled(
+                        seq_lens, positions, num_rejected, seq_idx, pos_idx
+                    )
+                    synchronize_tensors(out)
+
     def _precompile_top_token_verify(
         self,
         num_tokens: int,
@@ -7230,6 +7354,7 @@ class TPUModelRunner(GPUModelRunner):
                 self._async_drafter.precompile()
                 self._precompile_rejection_sampler()
                 self._precompile_spec_logprobs()
+                self._precompile_spec_glue()
                 # The isolated precompiles above emit standalone fused
                 # programs; the real per-step propose+verify+sampling
                 # dispatch fuses them differently, so the first real
