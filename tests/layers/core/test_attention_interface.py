@@ -38,6 +38,7 @@ import numpy as np
 import pytest
 from absl.testing import parameterized
 
+from vllm_torchtpu.kernels.mla import kv_cache_utils
 from vllm_torchtpu.kernels.mla.kv_cache_utils import (
     KVCacheLayout,
     KVCacheType,
@@ -62,6 +63,9 @@ ROPE_SPEC = SparseMLAKVCacheSpec.create(
 )
 ROPE_SC_SPEC = SparseMLAKVCacheSpec.create(
     KVCacheType.ROPE, KVCacheLayout.SPARSECORE, 16, 32, ROPE_DIM, KV_PACKING
+)
+NOPE_SC_SPEC = SparseMLAKVCacheSpec.create(
+    KVCacheType.NOPE, KVCacheLayout.SPARSECORE, 16, 32, LKV_DIM, KV_PACKING
 )
 
 
@@ -431,3 +435,90 @@ def test_split_q_plumbing(dcp: bool, split_q: bool, num_heads: int, expect_split
         assert mock_warn.call_args.args[3] == (num_heads, ROPE_DIM)
     else:
         mock_warn.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "token_bytes, value_bytes", [(LKV_DIM, LKV_DIM), (64, ROPE_DIM), (128, ROPE_DIM)]
+)
+def test_pack_lane_dense_matches_pack_tokens(token_bytes, value_bytes):
+    """The 128-lane pack of the in-gather KV write holds `pack_tokens`' words,
+    then zeros: nope, packed 64 B rope and padded 128 B rope tokens."""
+    rng = np.random.default_rng(token_bytes)
+    values = jnp.asarray(rng.integers(0, 256, (20, value_bytes), np.uint8))
+    want = np.asarray(kv_cache_utils.pack_tokens(values, token_bytes))
+    got = np.asarray(attention_interface._pack_lane_dense(values, token_bytes))
+    assert got.shape == (20, 128)
+    np.testing.assert_array_equal(got[:, : want.shape[1]], want)
+    assert not got[:, want.shape[1] :].any()
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("kv_write_in_gather", [False, True])
+def test_dcp_kv_write_in_gather_plumbing(kv_write_in_gather: bool):
+    """With TPU_MLA_KV_WRITE_IN_GATHER on a fused-prep decode bucket, the DCP
+    entry point skips the cache writer, hands the kernel this rank's packed
+    rows and returns the caches the kernel returns. Off, the writer runs and
+    the kernel gets no `kv_write`."""
+    dcp_size, tokens, topk = 2, 4, 1024
+    devices = jax.local_devices()
+    if len(devices) < dcp_size:
+        pytest.skip(f"needs {dcp_size} local devices, got {len(devices)}")
+    mesh = jax.sharding.Mesh(np.array(devices[:dcp_size]), ("dcp",))
+    recorded = []
+
+    def fake_kernel(q, kv_nope, kv_rope, *args, **kwargs):
+        del args
+        recorded.append(kwargs["kv_write"])
+        lse = jnp.zeros((q.shape[0], q.shape[1]), jnp.float32)
+        if kwargs["kv_write"] is None:
+            return q, lse
+        return q, lse, kv_nope + 1, kv_rope + 1
+
+    writer = mock.Mock(side_effect=lambda nope, rope, *a, **kw: (nope, rope))
+    envs = attention_interface.envs
+    with (
+        mock.patch.object(envs, "TPU_DCP_MLA_TOPK_CAP", 512),
+        mock.patch.object(envs, "TPU_DCP_MLA_MASK_IN_KERNEL", True),
+        mock.patch.object(envs, "TPU_DCP_MLA_FUSED_PREP", True),
+        mock.patch.object(envs, "TPU_MLA_KV_WRITE_IN_GATHER", kv_write_in_gather),
+        mock.patch.object(
+            attention_interface.sparse_mla_kernel,
+            "sparse_ragged_paged_attention",
+            side_effect=fake_kernel,
+        ),
+        mock.patch.object(
+            attention_interface, "update_sparse_mla_kv_cache_dcp", writer
+        ),
+    ):
+        nope, rope, _, _ = attention_interface.sparse_mla_attention_dcp(
+            jnp.ones((tokens, 2, LKV_DIM), jnp.bfloat16),
+            jnp.ones((tokens, 2, ROPE_DIM), jnp.bfloat16),
+            jnp.zeros((tokens, LKV_DIM), jnp.float8_e4m3fn),
+            jnp.zeros((tokens, ROPE_DIM), jnp.float8_e4m3fn),
+            jnp.zeros(
+                (dcp_size * NOPE_SC_SPEC.shape[0], *NOPE_SC_SPEC.shape[1:]), jnp.uint32
+            ),
+            jnp.zeros(
+                (dcp_size * ROPE_SC_SPEC.shape[0], *ROPE_SC_SPEC.shape[1:]), jnp.uint32
+            ),
+            jnp.full((dcp_size * tokens, topk), -1, jnp.int32),
+            jnp.full((1,), tokens, jnp.int32),
+            jnp.zeros((4,), jnp.int32),
+            jnp.array([0, tokens], jnp.int32),
+            jnp.array([0, 0, 1], jnp.int32),
+            mesh,
+            NOPE_SC_SPEC,
+            ROPE_SC_SPEC,
+            dcp_axis_name="dcp",
+            dcp_size=dcp_size,
+            interleave_size=4,
+        )
+
+    assert writer.called != kv_write_in_gather
+    (kv_write,) = recorded
+    if not kv_write_in_gather:
+        assert kv_write is None
+        assert not np.asarray(nope).any()
+        return
+    assert kv_write.shape == (3 * 16, 128) and kv_write.dtype == jnp.uint32
+    assert (np.asarray(nope) == 1).all() and (np.asarray(rope) == 1).all()
