@@ -1000,6 +1000,34 @@ class Qwen38SegmentDriver:
             return self._contexts(runner, "model_mk_segments")
         return _StackedContexts(fast)
 
+    def _whole_contexts(self, runner: Any) -> Any:
+        """`_contexts(runner, "model_mk_whole")` for the per-step whole-step call.
+
+        VLLM_TPU_PREFLAT_FWD_ARGS: the two context factories (model tag, config)
+        are resolved once, as `_serve_contexts` does for the segment program,
+        instead of per-step imports, attribute lookups and an ExitStack. Same
+        contexts, entered and exited in the same order around every call."""
+        if not envs.VLLM_TPU_PREFLAT_FWD_ARGS or getattr(self, "noaot", False):
+            return self._contexts(runner, "model_mk_whole")
+        cfg = (
+            getattr(self, "whole_cfg", None)
+            or getattr(self, "cfg", None)
+            or runner.vllm_config
+        )
+        fast = self.__dict__.get("_whole_ctx")
+        if fast is None or fast[0] is not cfg:
+            from vllm.compilation.backends import set_model_tag
+            from vllm.config import set_current_vllm_config
+
+            fast = self._whole_ctx = (
+                cfg,
+                (
+                    lambda: set_model_tag("model_mk_whole"),
+                    lambda: set_current_vllm_config(cfg),
+                ),
+            )
+        return _StackedContexts(fast[1])
+
     def bind_and_warmup(self, runner: Any) -> None:
         from vllm_torchtpu.models.vllm.qwen4_exp.model import Qwen4ExpSegmentModel
 
@@ -2344,7 +2372,7 @@ class Qwen38SegmentDriver:
                 self._count("drafts_whole", n_req * (T_VERIFY - 1))
                 self._note(f"whole_b{rows}")
                 assert self.whole_program is not None
-                with self._contexts(runner, "model_mk_whole"):
+                with self._whole_contexts(runner):
                     out = self.whole_program(
                         input_ids=input_ids, positions=positions, **kw
                     )
