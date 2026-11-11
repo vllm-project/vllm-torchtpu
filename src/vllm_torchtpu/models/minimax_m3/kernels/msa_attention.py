@@ -357,8 +357,11 @@ _KERNELS = {"v1": _kernel_v1, "v2": _kernel_v2}
 
 
 # `_work_list` builds small batches' unions from dense compares when the
-# pairwise array (tiles x union^2) is at most this.
-_DENSE_WORK_LIST_ELEMS = 1 << 20
+# pairwise array (tiles x union^2) is at most this. Past it two row sorts
+# cost less: 4 heads x 64 decode tiles of 8 tokens (c64 b56, 2^20 elements
+# per call) took 31.5 us per layer dense against 17.6 sorted (twins
+# j-8b8e2662, j-dcfd577a).
+_DENSE_WORK_LIST_ELEMS = 1 << 18
 
 
 def _dense_unions(per_tile: jax.Array) -> jax.Array:
