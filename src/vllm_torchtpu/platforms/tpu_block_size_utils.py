@@ -65,18 +65,6 @@ def unified_kv_layout_enabled(vllm_config: "VllmConfig") -> bool:
     )
 
 
-_TPU_CACHE_DTYPE_TO_TORCH_DTYPE = {
-    "half": torch.half,
-    "bfloat16": torch.bfloat16,
-    "float": torch.float,
-    "fp8": torch.float8_e4m3fn,
-    "fp8_e4m3": torch.float8_e4m3fn,
-    "fp8_e5m2": torch.float8_e5m2,
-    "fp8_ds_mla": torch.uint8,
-    "int8": torch.int8,
-    "uint8": torch.uint8,
-}
-
 _SLOT_ALIGNMENT_BYTES = 16
 
 
@@ -109,7 +97,11 @@ def _resolve_tpu_cache_dtype(vllm_config: VllmConfig) -> torch.dtype:
     if isinstance(cache_dtype, torch.dtype):
         return cache_dtype
 
-    dtype = _TPU_CACHE_DTYPE_TO_TORCH_DTYPE.get(cache_dtype.lower().strip())
+    # Local import: vllm_torchtpu.layers imports vLLM's config, which loads
+    # the platform, and tpu_platform imports this module.
+    from vllm_torchtpu.layers.core.model_kv_cache_dtypes import TPU_KV_CACHE_DTYPES
+
+    dtype = TPU_KV_CACHE_DTYPES.get(cache_dtype.lower().strip())
     if dtype is None:
         raise ValueError(f"Unsupported TPU KV cache dtype: {cache_dtype}")
     return dtype
