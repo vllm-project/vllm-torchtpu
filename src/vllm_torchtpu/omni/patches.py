@@ -26,7 +26,7 @@ import contextvars
 import functools
 import os
 from functools import cache as run_once
-from typing import Any
+from typing import Any, cast
 
 import torch
 
@@ -254,7 +254,7 @@ def _ensure_extra_repeated_blocks(model: torch.nn.Module) -> None:
         return
     missing = [name for name in extras if name not in current]
     if missing:
-        model._repeated_blocks = [*current, *missing]
+        cast(Any, model)._repeated_blocks = [*current, *missing]
 
 
 def _region_forward_attr(block: torch.nn.Module) -> str:
