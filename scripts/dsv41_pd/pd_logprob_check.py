@@ -38,6 +38,7 @@ for n in args.tokens:
     def fresh(m):
         global cursor
         s = corpus[cursor: cursor + m * 3]
+        assert len(s) == m * 3, f'corpus exhausted at offset {cursor} (len {len(corpus)})'
         cursor += m * 3 + 1000
         return s
     # ref vs pd on one fresh prompt; ref on rank 1 of D, pd pinned to rank 0.
