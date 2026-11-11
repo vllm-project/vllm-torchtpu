@@ -304,6 +304,49 @@ def subtract_num_rejected_tokens(
     return seq_lens, positions
 
 
+def _fit_rows(t: torch.Tensor, rows: int) -> torch.Tensor:
+    """`t` with its leading dim sliced or zero-padded to ``rows``."""
+    n = t.shape[0]
+    if n == rows:
+        return t
+    if n > rows:
+        return t[:rows]
+    pad = [0] * (2 * (t.dim() - 1)) + [0, rows - n]
+    return torch.nn.functional.pad(t, pad)
+
+
+def _spec_substitution_glue_impl(
+    next_tokens: torch.Tensor,
+    drafts: torch.Tensor,
+    num_draft: torch.Tensor,
+    rows: int,
+    num_reqs: int | None,
+    src_len: int,
+    rejected_len: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """One chunk's async spec substitution source and rejected count, as the
+    eager `fit_rows` + `assemble_spec_next_tokens` + `compute_num_rejected`
+    sequence computes them, with the source zero-padded to ``src_len`` and the
+    rejected count zero-padded to ``rejected_len`` (neither tail is read)."""
+    src = assemble_spec_next_tokens(next_tokens, _fit_rows(drafts, rows), num_reqs)
+    if src.shape[0] < src_len:
+        src = torch.nn.functional.pad(src, (0, src_len - src.shape[0]))
+    num_rejected = compute_num_rejected(next_tokens, _fit_rows(num_draft, rows))
+    if num_rejected.shape[0] < rejected_len:
+        num_rejected = torch.nn.functional.pad(
+            num_rejected, (0, rejected_len - num_rejected.shape[0])
+        )
+    return src, num_rejected
+
+
+spec_substitution_glue = torch.compile(backend="tpu", fullgraph=True, dynamic=False)(
+    _spec_substitution_glue_impl
+)
+subtract_num_rejected_tokens_compiled = torch.compile(
+    backend="tpu", fullgraph=True, dynamic=False
+)(subtract_num_rejected_tokens)
+
+
 def extract_draft_token_ids(
     input_ids: torch.Tensor,
     logits_indices: torch.Tensor,
