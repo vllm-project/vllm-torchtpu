@@ -74,6 +74,11 @@ class _MtpFusedLoop(nn.Module):
             if getattr(inner, "mk_draft", None) is not None and envs.VLLM_TPU_MK_DRAFT_LOOP
             else None
         )
+        if mk_step is not None and not mk_draft_rows_ok(inner, int(input_ids.shape[0]), 1):
+            # Compile ranges past the draft kernel's rows (prefill-sized token budgets,
+            # up to 8192) trace the stock steps: the kernel is never built at those
+            # sizes (VMEM), and served whole-step steps never reach them.
+            mk_step = None
         for i in range(self.num_steps):
             if i > 0:
                 positions = positions + 1
@@ -103,6 +108,16 @@ class _MtpFusedLoop(nn.Module):
             )
             tokens.append(input_ids)
         return tuple(tokens)
+
+
+def mk_draft_rows_ok(inner: Any, rows: int, rows_per_request: int) -> bool:
+    """VLLM_TPU_MK_DRAFT: the draft kernel takes this traced row count (`max_rows` of
+    the attached MkDraft per T); larger compile ranges use the stock draft step."""
+    mk = getattr(inner, "mk_draft", None)
+    if mk is None:
+        return False
+    cap = getattr(mk, "max_rows", {}).get(rows_per_request, 0)
+    return 0 < rows <= cap
 
 
 def build_mtp_fused_loop(
@@ -151,9 +166,23 @@ class _MkDraftStep0(nn.Module):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        carry, tokens = self.mtp.mk_draft_step(  # type: ignore[attr-defined]
-            input_ids, positions, hidden_states, self.rows_per_request
-        )
+        if mk_draft_rows_ok(
+            getattr(self.mtp, "model", None), int(input_ids.shape[0]), self.rows_per_request
+        ):
+            carry, tokens = self.mtp.mk_draft_step(  # type: ignore[attr-defined]
+                input_ids, positions, hidden_states, self.rows_per_request
+            )
+        else:
+            # Compile sizes past the kernel's rows (never served: step 0 runs on the MK
+            # only after a whole-step target forward): the stock draft step.
+            out = type(self.mtp).forward(
+                self.mtp, input_ids, positions, hidden_states, intermediate_tensors,
+                inputs_embeds, spec_step_idx=0,
+            )
+            if isinstance(out, (list, tuple)) and len(out) == 1:
+                out = out[0]
+            last, carry = out if isinstance(out, (list, tuple)) else (out, out)
+            tokens = self.mtp.compute_logits(last).argmax(dim=-1).to(torch.int32)
         rows = draft_rows.clamp_min(0)
         return (
             torch.index_select(carry, 0, rows),
