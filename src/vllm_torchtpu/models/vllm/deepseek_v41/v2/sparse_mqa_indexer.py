@@ -13,18 +13,6 @@ if TYPE_CHECKING:
     from vllm.models.deepseek_v41.attention import DeepseekV4IndexerCache
 
 
-def quantize_query(
-    q: torch.Tensor,
-    positions: torch.Tensor,
-    cos_sin: torch.Tensor,
-    weights: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Rotate Q, quantize each head and fold its scale into FP32 weights."""
-    operation = indexer_fp8._query_op
-    assert operation is not None
-    return operation(q, positions, cos_sin, weights)
-
-
 class SparseMQAIndexer(torch.nn.Module):
     """Score full or candidate context after the model writes the K cache."""
 

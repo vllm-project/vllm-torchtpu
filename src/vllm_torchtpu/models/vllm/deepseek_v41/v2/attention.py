@@ -29,7 +29,7 @@ from vllm_torchtpu.layers.adapter.linear_common import (
 from vllm_torchtpu.layers.core import table_lookup
 from vllm_torchtpu.utils import synchronize_tensors
 
-from . import csa2_adapter, preprocess_ops
+from . import csa2_adapter, indexer_fp8, preprocess_ops
 from .attention_kernels import (
     gathered_kv_cache_scope,
     paged_attention,
@@ -50,7 +50,7 @@ from .ops import (
     rotary,
 )
 from .projection_rope import initialize_projection_rope
-from .sparse_mqa_indexer import SparseMQAIndexer, quantize_query
+from .sparse_mqa_indexer import SparseMQAIndexer
 
 logger = init_logger(__name__)
 
@@ -411,6 +411,25 @@ class DeepseekV41Indexer(upstream.DeepseekV4Indexer):
 
     attn_cls = staticmethod(_sparse_mqa_indexer)
 
+    def forward_q(self, qr, qr_scale, indexer_weights, positions, rotary_emb):
+        """Upstream's query build: wq_b, then fused RoPE and per-head FP8 quant.
+
+        ``rotary_emb`` may be the cos/sin table itself, so callers can pass the
+        compact serving table (`compact_rope_caches`). The head scale is folded
+        into the FP32 weights, hence no separate query scale.
+        """
+        assert qr_scale is None
+        table = (
+            rotary_emb
+            if isinstance(rotary_emb, torch.Tensor)
+            else rotary_emb.cos_sin_cache
+        )
+        q = _value(self.wq_b(qr)).reshape(-1, self.n_head, self.head_dim)
+        operation = indexer_fp8._query_op
+        assert operation is not None
+        q, weights = operation(q, positions, table, indexer_weights)
+        return q, None, weights
+
 
 class AttentionBackend(compressor_upstream.CompressorBackend):
     @staticmethod
@@ -435,7 +454,6 @@ class SWACache(NativeCacheView, DeepseekV4SWACache):
         kwargs["bounded_replay"] = prefix_replay_enabled(get_current_vllm_config())
         # FP8 applies to the compressed main KV only; SWA rows stay BF16.
         kwargs["dtype"] = torch.bfloat16
-        kwargs["backend_cls"] = AttentionBackend
         super().__init__(*args, **kwargs)
 
     def get_kv_cache_spec(self, vllm_config):
@@ -1860,11 +1878,8 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             qr_part, weights_part, candidates_part = qr, weights, candidates
 
         if qr_part.device.type != "cpu":
-            projected = _value(indexer.wq_b(qr_part)).reshape(
-                -1, indexer.n_head, indexer.head_dim
-            )
-            q_part, weights_part = quantize_query(
-                projected, positions_part, self._tpu_rope_cache, weights_part
+            q_part, _, weights_part = indexer.forward_q(
+                qr_part, None, weights_part, positions_part, self._tpu_rope_cache
             )
         else:
             q_part, q_scale = quantize_fp8_activation(
