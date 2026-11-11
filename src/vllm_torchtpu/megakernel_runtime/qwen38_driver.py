@@ -54,6 +54,24 @@ from .qwen38_weights import head_groups, pack_segment_operands, segment_layers
 
 logger = init_logger(__name__)
 
+
+class MegakernelSetupError(RuntimeError):
+    """A requested megakernel part failed to set up or to run (fatal by default)."""
+
+
+def _mk_fail(msg: str, exc: BaseException | None = None) -> None:
+    """A requested megakernel part failed. Fatal unless VLLM_TPU_MK_ALLOW_FALLBACK=1:
+    a silent stock fallback after a partial attach served garbage (za8d GSM8K 0.004),
+    so by default the server dies with this error instead."""
+    if not envs.VLLM_TPU_MK_ALLOW_FALLBACK:
+        raise MegakernelSetupError(
+            f"{msg} (set VLLM_TPU_MK_ALLOW_FALLBACK=1 to fall back to the stock path)"
+        ) from exc
+    if exc is not None:
+        logger.exception("%s; VLLM_TPU_MK_ALLOW_FALLBACK=1: falling back", msg)
+    else:
+        logger.warning("%s; VLLM_TPU_MK_ALLOW_FALLBACK=1: falling back", msg)
+
 # With the C1 tiles the kernel beats stock through 64 rows (mk/kernel_work/
 # mk-row-slope/report.md vs mk/stock-segment-vs-rows.md); 64 is the margin case.
 # 24 and 48 are serving token buckets too (TPU_TOKEN_BUCKET_EXTRA); without them
@@ -1715,9 +1733,9 @@ class Qwen38SegmentDriver:
                 whole.n_w,
                 self.whole_hold,
             )
-        except Exception:
-            logger.exception("Qwen3.8 whole-step: setup failed; segment program only")
+        except Exception as exc:
             self.whole_program = None
+            _mk_fail("Qwen3.8 whole-step: setup failed; segment program only", exc)
 
     def _attach_whole_shadow(self, runner: Any, whole: Any) -> None:
         """`wholecheck=N`: the whole-step program again, writing no GDN checkpoints (shadow
@@ -1975,6 +1993,11 @@ class Qwen38SegmentDriver:
                 "disabled" if self.whole_program is None else "on, nothing eligible",
                 dict(sorted(self.stats.items())),
             )
+            if self.whole_program is None:  # disabled, not merely nothing eligible
+                _mk_fail(
+                    "Qwen3.8 whole-step SELF-CHECK FAILED: whole=1 but the whole-step "
+                    "program is disabled"
+                )
         else:
             logger.info(
                 "Qwen3.8 whole-step self-check: %d whole-step calls in the first %d "
@@ -1994,6 +2017,16 @@ class Qwen38SegmentDriver:
         except Exception:
             return False
 
+    def _detach_draft_kernels(self, runner: Any) -> None:
+        """Drop the MTP tail / MK draft from the draft model: they must not run once the
+        target megakernel is off."""
+        draft = getattr(getattr(runner, "drafter", None), "draft_model", None)
+        inner = getattr(draft, "model", None)
+        for name in ("mk_tail", "mk_draft"):
+            if getattr(inner, name, None) is not None:
+                setattr(inner, name, None)
+                logger.warning("Qwen3.8 megakernel off: %s detached from the draft", name)
+
     def _attach_mk_draft(self, runner: Any) -> None:
         """VLLM_TPU_MK_DRAFT: the MTP draft's step 0 (and loop steps, VLLM_TPU_MK_DRAFT_LOOP)
         as one whole-step kernel call each (`qwen38_draft.MkDraft`): draft layer, final
@@ -2005,14 +2038,14 @@ class Qwen38SegmentDriver:
 
         whole = getattr(self, "whole_module", None)
         if whole is None or self.whole_program is None:
-            logger.warning("Qwen3.8 MK draft: needs the whole-step program")
+            _mk_fail("Qwen3.8 MK draft: needs the whole-step program")
             return
         if not envs.VLLM_TPU_FUSED_DRAFT_LOOP:
-            logger.warning("Qwen3.8 MK draft: needs the fused draft loop")
+            _mk_fail("Qwen3.8 MK draft: needs the fused draft loop")
             return
         draft = getattr(getattr(runner, "drafter", None), "draft_model", None)
         if not isinstance(draft, Qwen4ExpMTP):
-            logger.warning("Qwen3.8 MK draft: no Qwen4ExpMTP draft model (%s)", type(draft))
+            _mk_fail(f"Qwen3.8 MK draft: no Qwen4ExpMTP draft model ({type(draft)})")
             return
         try:
             mk = MkDraft(
@@ -2020,8 +2053,8 @@ class Qwen38SegmentDriver:
                 budget=whole.budget, max_groups=whole.max_groups,
                 norm_eps=whole.norm_eps, rotary_dim=whole.rotary_dim,
             )
-        except Exception:
-            logger.exception("Qwen3.8 MK draft: setup failed; draft stays stock")
+        except Exception as exc:
+            _mk_fail("Qwen3.8 MK draft: setup failed; draft stays stock", exc)
             return
         object.__setattr__(mk, "count", self._count)  # mk_draft_step0 / stock_step0
         draft.model.mk_draft = mk
@@ -2070,8 +2103,8 @@ class Qwen38SegmentDriver:
                 min(max(self.buckets), KERNEL_ROWS),
             )
             tail = MtpTail(draft, self.g, self.mesh, kind, self.buckets)
-        except Exception:
-            logger.exception("Qwen3.8 MTP tail: packing failed; draft stays stock")
+        except Exception as exc:
+            _mk_fail("Qwen3.8 MTP tail: packing failed; draft stays stock", exc)
             return
         draft.model.mk_tail = tail
         logger.info(
@@ -2389,13 +2422,14 @@ class Qwen38SegmentDriver:
             else:
                 with self._serve_contexts(runner):
                     out = self.program(input_ids=input_ids, positions=positions, **kw)
-        except Exception:
-            # Fail closed: one failure disables the megakernel for this server;
-            # this step and all later ones run the stock model.
-            logger.exception(
-                "Qwen3.8 megakernel failed; disabling it, stock path from now on"
-            )
+        except Exception as exc:
+            # One failure disables the megakernel for this server. Fatal by default;
+            # with VLLM_TPU_MK_ALLOW_FALLBACK=1 this step and all later ones run the
+            # stock model, and the draft-side kernels (MTP tail, MK draft) are detached
+            # too so no megakernel part runs on its own.
             self.program = self.shadow = self.whole_program = None
+            self._detach_draft_kernels(runner)
+            _mk_fail("Qwen3.8 megakernel failed; disabling it, stock path from now on", exc)
             return False, None
         if isinstance(out, (list, tuple)):
             out = tuple(out)
