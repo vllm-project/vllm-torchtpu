@@ -271,6 +271,11 @@ _TPU_COMPILE_ENV_IGNORED = {
     "TPU_RAIDEN_JOB_NAME",
     "TPU_RAIDEN_TRANSFER_PARALLELISM",
     "TPU_RAIDEN_TRANSFER_STREAMS",
+    # Store-mode reshard/dispatch service addresses only. The advertised host
+    # is the per-pod IP, so it must stay out of a key shared across pods.
+    "TPU_RAIDEN_ADVERTISE_HOST",
+    "TPU_RAIDEN_RESHARD_PORT_BASE",
+    "TPU_RAIDEN_STORE_DISPATCH_PORT_BASE",
     "TPU_WORKER_ID",
     "VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE",
     "VLLM_XLA_CHECK_RECOMPILATION",
@@ -353,6 +358,10 @@ _TPU_COMPILE_ENV_IGNORED = {
     "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT",
     # Only changes LIBTPU_INIT_ARGS, which is hashed on its own.
     "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES",
+    # A static expert placement permutes expert weights and router tables at
+    # load (layers/adapter/expert_placement.py); every program is the unplaced
+    # model's, so a placed server reuses its compile cache.
+    "TPU_EXPERT_PLACEMENT",
     # Pooling: the static pooler is a separate backend="tpu" helper outside the
     # backbone graph, and the KV cap reaches the hash through num_gpu_blocks.
     "VLLM_TPU_STATIC_POOLER",

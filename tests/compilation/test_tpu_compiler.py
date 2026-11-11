@@ -147,6 +147,22 @@ class TestTpuCompilerCache:
 
         assert unprofiled == phased
 
+    def test_tpu_hash_ignores_the_raiden_advertise_host(self):
+        """The advertised host is the pod IP: hashing it gives every pod its
+        own compile cache, so a cache restored from an earlier pod misses."""
+        from vllm_torchtpu.compilation.tpu_compiler import compute_tpu_compilation_hash
+
+        with patch(
+            "vllm_torchtpu.compilation.tpu_compiler._iter_runtime_cache_key_files",
+            return_value=[],
+        ):
+            with patch.dict(os.environ, {"TPU_RAIDEN_ADVERTISE_HOST": "10.0.0.1"}):
+                first_pod = compute_tpu_compilation_hash(self._config())
+            with patch.dict(os.environ, {"TPU_RAIDEN_ADVERTISE_HOST": "10.0.0.2"}):
+                second_pod = compute_tpu_compilation_hash(self._config())
+
+        assert first_pod == second_pod
+
     def test_tpu_hash_ignores_reload_compiled_executable_switch(self):
         """Reloading newly compiled executables strips host-only metadata
         without changing the serialized executable bytes or disk cache key."""
@@ -272,6 +288,21 @@ class TestTpuCompilerCache:
 
         assert dp1 != dp4
 
+    def test_tpu_hash_ignores_the_expert_placement(self):
+        """A placement permutes weights and router tables at load and leaves
+        every program as it was, so a placed server reuses the cache."""
+        from vllm_torchtpu.compilation.tpu_compiler import compute_tpu_compilation_hash
+
+        def placed(value):
+            with patch.dict(os.environ, {"TPU_EXPERT_PLACEMENT": value}):
+                return compute_tpu_compilation_hash(self._config())
+
+        with patch(
+            "vllm_torchtpu.compilation.tpu_compiler._iter_runtime_cache_key_files",
+            return_value=[],
+        ):
+            assert placed("") == placed("/tmp/placement.json")
+
     def test_runtime_hash_covers_custom_op_boundaries(self):
         from vllm_torchtpu.compilation import tpu_compiler
 
@@ -372,6 +403,9 @@ class TestTpuCompilerCache:
             "TPU_RAIDEN_TEST_REGISTRATION_DELAY_S",
             "TPU_RAIDEN_TRANSFER_NUM_SLOTS",
             "TPU_RAIDEN_TRANSFER_STREAMS",
+            "TPU_RAIDEN_ADVERTISE_HOST",
+            "TPU_RAIDEN_RESHARD_PORT_BASE",
+            "TPU_RAIDEN_STORE_DISPATCH_PORT_BASE",
             "TPU_SIDE_CHANNEL_PORT",
             "TPU_USE_RAIDEN_CONNECTOR",
             "DEBUG_TPU_LOCAL_RANK_OFFSET",

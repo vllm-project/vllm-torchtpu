@@ -81,6 +81,7 @@ def _fake_runner(method, is_async, verify, propose, fence=False):
             num_reqs_list=[1],
             spec_decode_metadata_list=[object() if verify else None],
             mamba_state_indices_list=None,
+            mamba_boundary_plans=None,
             pooler_output_list=[],
             top_tokens=False,
             kv_save_nan_check=None,
