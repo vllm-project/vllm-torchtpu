@@ -378,6 +378,8 @@ if TYPE_CHECKING:
     VLLM_TPU_SAMPLER_CANDIDATES_ONLY: bool = False
     VLLM_TPU_GDN_MIXED_TILE_POW2: bool = False
     VLLM_TPU_SPEC_BOUNDARY_STATE_COPY: bool = False
+    VLLM_TPU_GDN_V3_WINDOW_VERIFY: bool = False
+    VLLM_TPU_GDN_V3_SINGLE_LAUNCH: bool = False
     VLLM_TPU_CANDIDATE_SAMPLING: bool = False
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
     VLLM_TPU_STATIC_POOLER: bool = True
@@ -2286,6 +2288,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_SPEC_BOUNDARY_STATE_COPY": env_bool(
         "VLLM_TPU_SPEC_BOUNDARY_STATE_COPY"
     ),
+    # GDN v3 pooled verify windows (MTP, BATCHED tiles of 2+ tokens): run
+    # kernels/gdn/v3/window_tile.py, one window position and one value head
+    # at a time on dense [dim / 128, 128] activations, instead of
+    # wrapper.inner_kernel's whole-state arrays (PR #2821 d8340b973). Same
+    # outputs and checkpoint bytes; pools window_tile does not support keep
+    # inner_kernel.
+    "VLLM_TPU_GDN_V3_WINDOW_VERIFY": env_bool("VLLM_TPU_GDN_V3_WINDOW_VERIFY"),
+    # GDN v3 pooled calls: run the BATCHED and the PER_SEQ segments in one
+    # kernel instead of two, so a decode/verify-only step launches no empty
+    # PER_SEQ kernel (PR #2821 d8340b973). Same outputs and pool bytes.
+    "VLLM_TPU_GDN_V3_SINGLE_LAUNCH": env_bool("VLLM_TPU_GDN_V3_SINGLE_LAUNCH"),
     # Non-greedy MTP verify steps whose requests all keep top_k <= 48 (or are
     # greedy) keep each rank's LM-head vocab shard instead of all-gathering
     # the logits: one program takes each shard's 64 largest logits per row,
