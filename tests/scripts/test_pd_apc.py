@@ -24,8 +24,9 @@ APC = load("check_pd_apc", ROOT / "examples/disagg/check_pd_apc.py")
 
 
 class Engines:
-    def __init__(self, fault=None):
+    def __init__(self, fault=None, *, lookahead=0):
         self.fault = fault
+        self.lookahead = lookahead
         self.cache = {role: [set(), set()] for role in ("P", "D")}
         self.counts = {role: [[0, 0, 0], [0, 0, 0]] for role in ("P", "D")}
 
@@ -92,9 +93,9 @@ class Engines:
             stored = self.cache[name][routed]
             hit = max(
                 (
-                    len(key)
-                    for key in stored
-                    if len(key) < len(prefix) and prefix[: len(key)] == key
+                    count
+                    for count, key in stored
+                    if count < len(prefix) and prompt[: len(key)] == key
                 ),
                 default=0,
             )
@@ -105,8 +106,15 @@ class Engines:
             queries[1] += hit
             if name == "D" and self.fault != "recompute":
                 queries[2] += max(len(prompt) - 1 - hit, 0)
-            for count in range(4, len(prefix) + 1, 4):
-                stored.add(prefix[:count])
+            max_cached = (len(prefix) // 4) * 4
+            if name == "D" and self.lookahead:
+                # MTP/PD consumer only materializes terminal aligned Mamba state.
+                counts = (max_cached,) if max_cached >= 4 else ()
+            else:
+                counts = range(4, len(prefix) + 1, 4)
+            for count in counts:
+                if count + self.lookahead <= len(prompt):
+                    stored.add((count, prompt[: count + self.lookahead]))
             local_hits.append(hit)
         tokens = [(sum(prompt) + rank + i) % 97 for i in range(APC.OUTPUT_TOKENS)]
         if self.fault == "drift" and local_hits[1]:
@@ -128,8 +136,11 @@ class Engines:
         )
 
 
-def test_complete_cold_role_warm_branch_and_interleaved_matrix(tmp_path):
-    summary = APC.run("P", "D", "proxy", "model", 2, tmp_path, call=Engines())
+@pytest.mark.parametrize("lookahead", [0, 1])
+def test_complete_cold_role_warm_branch_and_interleaved_matrix(tmp_path, lookahead):
+    summary = APC.run(
+        "P", "D", "proxy", "model", 2, tmp_path, call=Engines(lookahead=lookahead)
+    )
     assert summary["passed"] and summary["completed"] == summary["expected"] == 44
     assert summary["failed"] == 0
     for rank in range(2):

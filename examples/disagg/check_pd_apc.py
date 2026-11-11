@@ -309,11 +309,11 @@ def run(
                 ]
                 for tag, seed in zip(("A", "B"), seeds)
             }
+            # Keep prompt A's boundary token so 1-token MTP lookahead block
+            # hashes at 2 * alignment also match on multi-turn continuations.
             prompts["branch"] = (
-                prompts["A"][: 2 * alignment]
-                + (seeds[1] * math.ceil((alignment + 1) / len(seeds[1])))[
-                    : alignment + 1
-                ]
+                prompts["A"][: 2 * alignment + 1]
+                + (seeds[1] * math.ceil(alignment / len(seeds[1])))[:alignment]
             )
             reference = {}
             for tag, prompt in prompts.items():
