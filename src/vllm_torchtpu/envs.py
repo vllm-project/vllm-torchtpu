@@ -917,7 +917,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # written guards only on the diagonal KV tile; exact), qk16 (one BF16 QK
     # MXU pass; exact when the score scale is a power of two), pv16 (BF16
     # probabilities into the PV dot; bit-identical on v7x, where Mosaic
-    # already runs the FP32 dot as one BF16 pass).
+    # already runs the FP32 dot as one BF16 pass); not in "1": qkfirst (the
+    # next query subtile's QK issued before this one's softmax and PV;
+    # bit-identical; -5% kernel on TP8 512-row blocks, no-op on 256-row).
     # Precedence: VLLM_TPU_QSA_PREFILL_UNION_WALK replaces the block-sparse
     # kernel where it applies; this flag acts on every remaining call (DCP,
     # kv_head_offset layers, short contexts, small steps, the union walk's
