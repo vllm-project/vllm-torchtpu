@@ -363,6 +363,7 @@ if TYPE_CHECKING:
     VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE: bool = False
     VLLM_TPU_BLOCK_TABLE_PACK_DELTA: bool = False
     VLLM_TPU_TOKEN_PADDING_REUSE: bool = False
+    VLLM_TPU_PREFLAT_FWD_ARGS: bool = False
     VLLM_TPU_FAST_METADATA_BUILD: bool = False
     VLLM_TPU_AOT_SKIP_GUARD_CHECK: bool = False
     VLLM_TPU_STAGE_TIMING_ONLY_WITH_SINK: bool = False
@@ -2205,6 +2206,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Skip the token-padding mask's synchronous H2D when its rows are the same
     # as the last write (layers/adapter/token_padding.py).
     "VLLM_TPU_TOKEN_PADDING_REUSE": env_bool("VLLM_TPU_TOKEN_PADDING_REUSE"),
+    # Steady-decode forward plumbing per padded bucket: the token-padding mask
+    # becomes one owned device buffer per (valid, padded) rows key, swapped in
+    # instead of rebuilt and copied synchronously each step, and the whole-step
+    # megakernel call's contexts are resolved once (token_padding.py,
+    # qwen38_driver.py). Same values, same graph inputs.
+    "VLLM_TPU_PREFLAT_FWD_ARGS": env_bool("VLLM_TPU_PREFLAT_FWD_ARGS"),
     # Staged metadata walk: build every group's AttentionMetadata inline instead
     # of one builder call per group (tpu_runner._build_attention_metadata_staged).
     "VLLM_TPU_FAST_METADATA_BUILD": env_bool("VLLM_TPU_FAST_METADATA_BUILD"),
