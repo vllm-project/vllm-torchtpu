@@ -67,6 +67,7 @@ from .tags import (
     class_tag,
     dsv4_group_tag,
     layer_tag,
+    split_layer_tag,
 )
 
 if TYPE_CHECKING:
@@ -1401,6 +1402,34 @@ def dsv4_compressed_kv_layer_name(state_cache_name: str) -> str:
     return base + ".k_cache" if base.endswith(".indexer") else base
 
 
+# Packed FP8 Index-K record (128 FP8 channels + a 4-byte scale) and the
+# 512-byte int32[128] owner rows its transposed pages are laid out in.
+DSV41_PACKED_FP8_INDEX_RECORD_BYTES = 132
+DSV41_OWNER_ROW_BYTES = 512
+
+
+def _check_dsv4_group_block_counts(manifest: PoolManifest) -> None:
+    """Pools read through one block table must agree on the block count.
+
+    DSv4 pool tags carry their KV cache group (``.g<N>``) and every group's
+    pages travel with that group's own block table. Most groups share the
+    vLLM BlockPool's global block-id space, but a group may own a private
+    pool (DeepSeek-V4.1 CSA2 SWA: window-sized, its block IDs are the owner's
+    physical pages), so the count is required to be uniform per group.
+    """
+    counts: dict[str, set[int]] = {}
+    for pool in manifest.pools:
+        base, _ = split_layer_tag(pool.tag)
+        group = base.rsplit(".g", 1)[1] if ".g" in base else ""
+        counts.setdefault(group, set()).add(pool.num_blocks)
+    for group, block_counts in counts.items():
+        if len(block_counts) != 1:
+            raise ManifestError(
+                f"pools of group {group or '?'} disagree on num_blocks: "
+                f"{sorted(block_counts)}"
+            )
+
+
 def _dsv4_row_region(*, row_bytes: int, num_rows: int) -> tuple[RegionSpec, ...]:
     """One dense region of whole packed rows covering the full page."""
     return (
@@ -1724,6 +1753,41 @@ def _build_dsv41_pool_manifest(
                 tag_base = f"{base}.r{tokens_per_state}"
 
             storage_index = storages.index_for(raw)
+            if tag_base == TAG_DSV4_SWA and _element_size(raw) != 4:
+                # DeepSeek-V4.1 private CSA2 SWA pool: its own BF16 [pages,
+                # rows, width] owner (not a view of the shared int32 word
+                # pool, whose SWA pages are plane-major below) that XLA tiles ((8, 128), (2, 1)), so neither a
+                # token row nor a plane is a byte range of the page. Pages
+                # travel whole: a raw page copy is exact whatever the tiling,
+                # and the rows past a partial tail page are rewritten by the
+                # receiver before its window reads them.
+                page_bytes = rows * row_bytes
+                if stride_bytes < page_bytes:
+                    raise ManifestError(
+                        f"DSv4.1 SWA cache {layer_name} page stride {stride_bytes} "
+                        f"is smaller than its {page_bytes}-byte page"
+                    )
+                _claim_range(
+                    group_index,
+                    storage_index,
+                    offset_bytes,
+                    page_bytes,
+                    stride_bytes,
+                    layer_name,
+                )
+                pools.append(
+                    PoolEntry(
+                        tag=dsv4_group_tag(tag_base, group_index),
+                        layer_name=layer_name,
+                        storage_index=storage_index,
+                        base_offset_bytes=offset_bytes,
+                        block_stride_bytes=stride_bytes,
+                        num_blocks=num_blocks,
+                        regions=_dsv4_row_region(row_bytes=page_bytes, num_rows=1),
+                        dtype_tag=_dtype_tag(raw),
+                    )
+                )
+                continue
             if tag_base == TAG_DSV4_SWA and _swa_plane_major(layer_name):
                 # Plane-major page: [plane 0: rows x 512 B][plane 1: rows x 512 B].
                 # Token t lives at row t of each plane, so each plane is its own
@@ -1765,16 +1829,46 @@ def _build_dsv41_pool_manifest(
                         )
                     )
                 continue
+            packed_fp8_index = (
+                layer_name.endswith(DSV4_INDEXER_CACHE_SUFFIX)
+                and itemsize == 1
+                and row_bytes == DSV41_PACKED_FP8_INDEX_RECORD_BYTES
+            )
+            if packed_fp8_index:
+                # Packed FP8 Index-K (upstream indexer_cache.PackedFP8IndexCacheRows):
+                # a page of `rows` 132-byte records is stored transposed in
+                # ceil(rows * 132 / 512) whole 512-byte owner rows, so no row
+                # prefix of the page is a prefix of its tokens. The page travels
+                # whole as one unit; a partial tail page ships its unused record
+                # slots too, which the receiver's freshly allocated page ignores.
+                owner_row_bytes = DSV41_OWNER_ROW_BYTES
+                page_bytes = -(-rows * row_bytes // owner_row_bytes) * owner_row_bytes
+                if (
+                    offset_bytes % owner_row_bytes
+                    or stride_bytes % owner_row_bytes
+                    or (stride_bytes < page_bytes)
+                ):
+                    raise ManifestError(
+                        f"DSv4.1 packed FP8 Index-K cache {layer_name} pages must "
+                        f"be whole {owner_row_bytes}-byte owner rows: rows={rows}, "
+                        f"page_bytes={page_bytes}, offset={offset_bytes}, "
+                        f"stride={stride_bytes}"
+                    )
+                live_bytes = page_bytes
+            else:
+                live_bytes = rows * row_bytes
             _claim_range(
                 group_index,
                 storage_index,
                 offset_bytes,
-                rows * row_bytes,
+                live_bytes,
                 stride_bytes,
                 layer_name,
             )
             unit_rows, unit_bytes = rows, row_bytes
-            if layer_name.endswith(DSV4_INDEXER_CACHE_SUFFIX):
+            if packed_fp8_index:
+                unit_rows, unit_bytes = 1, live_bytes
+            elif layer_name.endswith(DSV4_INDEXER_CACHE_SUFFIX):
                 # Halfplane Index-K packs two records into each int32[128]
                 # owner row (low/high 16 bits of every word), so a record is
                 # not a byte range of its own: half a row carries half the
@@ -1869,9 +1963,7 @@ def _build_dsv41_pool_manifest(
     manifest = PoolManifest(
         binding=BINDING_ALIASED_RAW, storages=storages.storages, pools=pools
     )
-    block_counts = {pool.num_blocks for pool in manifest.pools}
-    if len(block_counts) != 1:
-        raise ManifestError(f"pools disagree on num_blocks: {sorted(block_counts)}")
+    _check_dsv4_group_block_counts(manifest)
     manifest.geometry_by_tag()
     return manifest
 
@@ -1988,8 +2080,6 @@ def build_dsv4_pool_manifest(
         )
 
     manifest = PoolManifest(binding=binding, storages=storages.storages, pools=pools)
-    block_counts = {pool.num_blocks for pool in manifest.pools}
-    if len(block_counts) != 1:
-        raise ManifestError(f"pools disagree on num_blocks: {sorted(block_counts)}")
+    _check_dsv4_group_block_counts(manifest)
     manifest.geometry_by_tag()  # raises on per-tag geometry divergence
     return manifest

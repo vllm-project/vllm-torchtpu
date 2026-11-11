@@ -385,3 +385,78 @@ def test_index_k_pages_travel_as_whole_halfplane_owner_rows():
     # row 1 holds record 2 in its low halfplanes.
     base = pool.base_offset_bytes + pool.block_stride_bytes
     assert _live_byte_ranges(pool, 1, 6, 256) == [(base, base + 2 * 512)]
+
+
+PRIVATE_SWA_PAGES = 7
+
+
+def _build_private_swa():
+    """The CSA2 SWA cache in its own window-sized BF16 pool (DeepseekV41SWAManager)."""
+    named, groups, raw, materialized = _materialization()
+    swa_owner = torch.zeros((PRIVATE_SWA_PAGES, 32, 512), dtype=torch.bfloat16)
+    materialized.native_cache_layouts[SWA] = (
+        (PRIVATE_SWA_PAGES, 32, 512),
+        torch.bfloat16,
+        32 * 512 * 2,
+        0,
+    )
+    materialized.native_raw_cache[SWA] = swa_owner
+    return rpm.build_dsv4_pool_manifest(
+        named_kv_caches=named,
+        kv_cache_groups=groups,
+        raw_tensors=[*raw, swa_owner],
+        dsv41_materialized_kv=materialized,
+    )
+
+
+def test_private_swa_pool_moves_whole_pages_with_its_own_block_count():
+    manifest = _build_private_swa()
+    swa = _pool(manifest, "dsv4.swa.g0")
+    page = 32 * 512 * 2
+    assert swa.num_blocks == PRIVATE_SWA_PAGES
+    assert swa.storage_index != _pool(manifest, "dsv4.csa.nope.r2.g1").storage_index
+    assert (swa.regions[0].unit_bytes, swa.regions[0].num_units) == (page, 1)
+    # The XLA tiling interleaves rows inside the page, so even a partial page
+    # ships whole.
+    assert _live_byte_ranges(swa, 3, 5, 32) == [(3 * page, 4 * page)]
+    # The other groups keep the shared pool's block count.
+    assert _pool(manifest, "dsv4.csa.nope.r2.g1").num_blocks == NUM_BLOCKS
+
+
+def test_block_counts_must_agree_within_a_group_only():
+    def manifest(*pools):
+        return types.SimpleNamespace(
+            pools=[types.SimpleNamespace(tag=t, num_blocks=n) for t, n in pools]
+        )
+
+    rpm._check_dsv4_group_block_counts(
+        manifest(("dsv4.swa.g0", 7), ("dsv4.csa.nope.r2.g1", 4))
+    )
+    with pytest.raises(rpm.ManifestError, match="group 1 disagree"):
+        rpm._check_dsv4_group_block_counts(
+            manifest(("dsv4.csa.nope.r2.g1", 4), ("dsv4.csa.rope.scale.r2.g1", 5))
+        )
+
+
+def test_packed_fp8_index_pages_move_as_whole_owner_rows():
+    named, groups, raw, materialized = _materialization()
+    records = 64
+    materialized.native_cache_layouts[IDX] = (
+        (NUM_BLOCKS, records, rpm.DSV41_PACKED_FP8_INDEX_RECORD_BYTES),
+        torch.uint8,
+        PAGE_BYTES,
+        0,
+    )
+    manifest = rpm.build_dsv4_pool_manifest(
+        named_kv_caches=named,
+        kv_cache_groups=groups,
+        raw_tensors=raw,
+        dsv41_materialized_kv=materialized,
+    )
+    idx = _pool(manifest, "dsv4.idx.r2.g3")
+    page = -(-records * 132 // 512) * 512
+    assert (idx.regions[0].unit_bytes, idx.regions[0].num_units) == (page, 1)
+    assert idx.live_bytes_per_block == page
+    assert _live_byte_ranges(idx, 2, 3, 256) == [
+        (2 * PAGE_BYTES, 2 * PAGE_BYTES + page)
+    ]
