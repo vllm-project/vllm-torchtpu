@@ -653,58 +653,56 @@ def _patch_ltx2_split_rope() -> None:
     logger.info("Applied TPU patch: cached LTX-2 split RoPE on the q/k layout.")
 
 
+_CONV_OUT_LANE_PADDING_PATCHED = "_tpu_conv_out_lane_padding_patched"
+
+# TPU vector lane width: the padded conv_out produces this many output channels.
+_TPU_LANE_WIDTH = 128
+
+
 def _patch_wan_vae_conv_out_lane_padding() -> None:
     # TODO: Remove once TPU conv3d lowers 3-channel outputs at full lane bandwidth.
-    try:
-        from diffusers.models.autoencoders.autoencoder_kl_wan import WanCausalConv3d
-    except ImportError:
+    #
+    # The patch overrides only WanCausalConv3d._conv_forward, which upstream
+    # WanCausalConv3d.forward reaches through nn.Conv3d.forward after its
+    # causal padding and cache_x handling, so those stay upstream's code.
+    # 3-channel convs (the decoder conv_out) run with weight and bias
+    # zero-padded to _TPU_LANE_WIDTH output channels, and the extra channels
+    # are sliced off. Other convs call the original _conv_forward unchanged.
+    from diffusers.models.autoencoders.autoencoder_kl_wan import WanCausalConv3d
+
+    orig_conv_forward = WanCausalConv3d._conv_forward
+    if getattr(orig_conv_forward, _CONV_OUT_LANE_PADDING_PATCHED, False):
         return
 
-    orig_forward = getattr(
-        WanCausalConv3d, "_tpu_orig_forward", WanCausalConv3d.forward
-    )
-    WanCausalConv3d._tpu_orig_forward = orig_forward
-    padded_channels = 128
-
-    def _padded_forward(
-        self: Any, x: torch.Tensor, cache_x: Any = None
+    def _lane_dense_conv_forward(
+        self: Any,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None,
     ) -> torch.Tensor:
         if self.out_channels != 3:
-            return orig_forward(self, x, cache_x=cache_x)
-        weight = self.weight
-        if getattr(self, "_padded_weight_src", None) != (
-            weight.data_ptr(),
-            weight.dtype,
-        ):
-            pad_rows = padded_channels - weight.shape[0]
-            self._padded_weight = torch.cat(
+            return orig_conv_forward(self, input, weight, bias)
+        weight_src = (weight.data_ptr(), weight.dtype)
+        if self._tpu_padded_weight_src != weight_src:
+            pad_rows = _TPU_LANE_WIDTH - weight.shape[0]
+            self._tpu_padded_weight = torch.cat(
                 [weight, weight.new_zeros((pad_rows, *weight.shape[1:]))], dim=0
             )
-            self._padded_bias = (
+            self._tpu_padded_bias = (
                 None
-                if self.bias is None
-                else torch.cat([self.bias, self.bias.new_zeros(pad_rows)], dim=0)
+                if bias is None
+                else torch.cat([bias, bias.new_zeros(pad_rows)], dim=0)
             )
-            self._padded_weight_src = (weight.data_ptr(), weight.dtype)
-        # Apply the same causal padding as WanCausalConv3d.forward.
-        padding = list(self._padding)
-        if cache_x is not None and self._padding[4] > 0:
-            cache_x = cache_x.to(x.device)
-            x = torch.cat([cache_x, x], dim=2)
-            padding[4] -= cache_x.shape[2]
-        x = torch.nn.functional.pad(x, padding)
-        out = torch.nn.functional.conv3d(
-            x,
-            self._padded_weight,
-            self._padded_bias,
-            stride=self.stride,
-            padding=self.padding,
-            dilation=self.dilation,
-            groups=self.groups,
+            self._tpu_padded_weight_src = weight_src
+        out = orig_conv_forward(
+            self, input, self._tpu_padded_weight, self._tpu_padded_bias
         )
-        return out[:, :3]
+        return out[:, : self.out_channels]
 
-    WanCausalConv3d.forward = _padded_forward
+    setattr(_lane_dense_conv_forward, _CONV_OUT_LANE_PADDING_PATCHED, True)
+    # Known initial value for the per-module cache key; instances shadow it.
+    WanCausalConv3d._tpu_padded_weight_src = None
+    WanCausalConv3d._conv_forward = _lane_dense_conv_forward
     logger.info(
         "Applied TPU patch: lane-dense output padding for the Wan VAE conv_out."
     )
