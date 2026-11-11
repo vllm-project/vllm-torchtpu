@@ -6166,9 +6166,24 @@ class TPUModelRunner(GPUModelRunner):
         with KV blocks.
         """
         return utils.HbmReserves(
-            kv_connector=utils.estimate_kv_connector_hbm_reserve(self.vllm_config),
+            kv_connector=utils.estimate_kv_connector_hbm_reserve(self.vllm_config)
+            + self._raiden_staging_hbm_reserve_bytes(),
             lora_slot_write=self.lora_slot_write_hbm_bytes(),
             pp_handoff=self.pp_handoff_hbm_reserve_bytes(),
+        )
+
+    def _raiden_staging_hbm_reserve_bytes(self) -> int:
+        """The Raiden offload staging rows (`offload.raiden_staging`), which
+        its connector allocates in register_kv_caches, after the profile."""
+        from vllm_torchtpu.offload.raiden_staging import (
+            runner_staging_hbm_reserve_bytes,
+            staging_extra_config,
+        )
+
+        if staging_extra_config(self.vllm_config) is None:
+            return 0
+        return runner_staging_hbm_reserve_bytes(
+            self.vllm_config, self.get_kv_cache_spec()
         )
 
     def _initialize_pallas_kernels(self):
