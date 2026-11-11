@@ -562,6 +562,7 @@ def _class_candidates(
     interpret: bool,
     scale_cache: jax.Array | None,
     scale_row: int | None,
+    large_if_any: bool = False,
 ) -> jax.Array:
     """Packed candidates ``[T, G * 2 * topk]`` (`pack_candidates` per head,
     head-major) of a prefill-sized step: each `msa_indexer` tile class picks
@@ -596,11 +597,13 @@ def _class_candidates(
     q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
     max_num_seqs = q_lens.shape[0]
     seq_of_token = jnp.minimum(seq_id, max_num_seqs - 1)
-    picks, cols = [], []
-    for scored, block_q, transposed in (
-        (plan.small(), plan.small_block_q, not plan.token_major),
-        (plan.large(), plan.large_block_q, True),
-    ):
+
+    def class_picks(scored, block_q, transposed):
+        """The class's packed picks ``[G * T, 2 * topk]`` at every head's and
+        token's column in it (rows of the other class's tokens are unset):
+        one row gather per class, not one from the classes' concatenation,
+        which copied every row of both (~5.7 us per layer in the c64 decode
+        twin, j-0db341fb)."""
         # A column's query row sits at offset o of its request's folded rows,
         # token o mod q_len of it: position = len - q_len + o mod q_len.
         per_tile = functools.partial(msa_indexer.lookup, index=scored.tile_seq)
@@ -616,26 +619,32 @@ def _class_candidates(
             col_pos,
             live_rows=scored.num_tiles * block_q,
         )
-        picks.append((s, b))
         # Each head's and token's column in this class (`_class_scores`).
         start = msa_indexer.lookup(scored.tile_start, seq_of_token)[None]
         off = rows - start
         col = (
             msa_indexer.lookup(scored.first_tile, seq_of_token)[None] + off // block_q
         ) * block_q
-        cols.append(jnp.clip(col + off % block_q, 0, s.shape[0] - 1).reshape(-1))
-    # A head's and token's picks: its large-class column if its request is
-    # large, else its small-class one. Each class's picks are gathered
-    # before they are packed: packing the classes' picks and gathering from
-    # their concatenation copied every row of both ([15296, 32] f32, ~4 us
-    # per layer in the c64 decode twin, j-0db341fb).
+        col = jnp.clip(col + off % block_q, 0, s.shape[0] - 1).reshape(-1)
+        return pack_candidates(s, b)[col]
+
+    small = class_picks(plan.small(), plan.small_block_q, not plan.token_major)
+
+    def large():
+        return class_picks(plan.large(), plan.large_block_q, True)
+
+    if large_if_any:
+        # A decode step rarely holds a large request: its empty large class
+        # still cost ~18 us per layer of kernels and buffers (c48 decode
+        # twin, j-53eaa9bc).
+        large_picks = jax.lax.cond(jnp.any(plan.is_large), large, lambda: small)
+    else:
+        large_picks = large()
+    # A head's and token's picks: its large-class ones if its request is
+    # large, else its small-class ones.
     is_large = msa_indexer.lookup(plan.is_large, seq_of_token)[None]
     is_large = jnp.broadcast_to(is_large, (num_heads, num_tokens)).reshape(-1, 1)
-    (s_small, b_small), (s_large, b_large) = picks
-    packed = pack_candidates(
-        jnp.where(is_large, s_large[cols[1]], s_small[cols[0]]),
-        jnp.where(is_large, b_large[cols[1]], b_small[cols[0]]),
-    )  # [G * T, 2 * topk]
+    packed = jnp.where(is_large, large_picks, small)  # [G * T, 2 * topk]
     return (
         packed.reshape(num_heads, num_tokens, -1)
         .transpose(1, 0, 2)
@@ -754,6 +763,9 @@ def msa_write_and_candidates_dcp(
             interpret=interpret,
             scale_cache=scale_cache,
             scale_row=scale_row,
+            large_if_any=not msa_indexer.is_prefill_step(
+                num_heads * num_tokens, max_num_seqs
+            ),
         )
         if fp4:
             return kv_cache, index_cache, scale_cache, packed
