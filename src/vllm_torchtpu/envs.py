@@ -304,6 +304,7 @@ if TYPE_CHECKING:
     VLLM_TPU_HOST_PHASES: int = 0
     VLLM_TPU_PROMPT_IDS_NDARRAY: bool = False
     VLLM_TPU_PAW_SKIP_FULL: bool = False
+    VLLM_TPU_PROMPT_IDS_NDARRAY_EARLY: bool = False
     VLLM_TPU_SERIALIZE_COPY_WAIT: bool = False
     VLLM_TPU_PINNED_TOKEN_COPY: bool = False
     VLLM_TPU_SAMPLING_PARAMS_REUSE: bool = False
@@ -1925,6 +1926,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # unpickle plus a list->numpy copy into token_ids_cpu on the admit step's
     # critical path (core/prefix_aware_scheduler.py). Same token values.
     "VLLM_TPU_PROMPT_IDS_NDARRAY": env_bool("VLLM_TPU_PROMPT_IDS_NDARRAY"),
+    # With VLLM_TPU_PROMPT_IDS_NDARRAY: build that int32 ndarray in the engine
+    # core's input thread (EngineCore.preprocess_add_request, next to the
+    # block hashing) instead of in Scheduler.add_request on the busy loop.
+    # The ~2-3 ms list->ndarray copy of a ~100K-token prompt then overlaps
+    # the busy loop's wait for the device instead of delaying the next
+    # schedule() (the admit step's pre-prefill host gap). Same token values.
+    "VLLM_TPU_PROMPT_IDS_NDARRAY_EARLY": env_bool(
+        "VLLM_TPU_PROMPT_IDS_NDARRAY_EARLY"
+    ),
     # PrefixAwareScheduler: skip the warmth scoring (one prefix-cache lookup
     # per waiting request, every step) when no seat is free and the whole
     # queue fits the window; the admission order is unchanged.

@@ -284,3 +284,67 @@ def test_skip_full_skips_scoring_only_when_no_seat_is_free():
     s.running = [object()]
     s._promote_warmest(s.waiting)
     assert [r.request_id for r in s.waiting] == ["warm", "cold"]
+
+
+def _shipped_payload(s, ids, early):
+    """Pickled scheduler-output payload of one new request, with the prompt
+    converted in the input thread (``early``) or in ``add_request``."""
+    import pickle
+
+    request = SimpleNamespace(request_id="r", prompt_token_ids=ids)
+    if early:
+        from vllm_torchtpu.core.prefix_aware_scheduler import prompt_ids_to_ndarray
+
+        prompt_ids_to_ndarray(request)
+        converted = request._prompt_ids_np
+    with patch.object(AsyncScheduler, "add_request", return_value=None):
+        s.add_request(request)
+    if early:
+        assert request._prompt_ids_np is converted  # add_request reused it
+    s.requests = {"r": request}
+    new_r = SimpleNamespace(req_id="r", prompt_token_ids=ids)
+    out = SimpleNamespace(scheduled_new_reqs=[new_r])
+    with patch.object(AsyncScheduler, "schedule", return_value=out):
+        s.schedule()
+    return pickle.dumps(new_r.prompt_token_ids)
+
+
+def test_prompt_ids_ndarray_early_ships_identical_payload():
+    s = _make_scheduler([], {})
+    s._prompt_np = True
+    ids = [5, 7, 2**31 - 1, 0] * 1000
+    assert _shipped_payload(s, list(ids), early=True) == _shipped_payload(
+        s, list(ids), early=False
+    )
+
+
+def test_prompt_ids_ndarray_early_patch_wraps_preprocess(monkeypatch):
+    import numpy as np
+    from vllm.v1.engine.core import EngineCore
+
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.core import prefix_aware_scheduler as paw
+
+    ids = [3, 1, 4, 1, 5]
+    request = SimpleNamespace(request_id="r", prompt_token_ids=ids)
+
+    def fake_preprocess(self, req):
+        return request, 0
+
+    monkeypatch.setattr(EngineCore, "preprocess_add_request", fake_preprocess)
+    # Off (either flag unset): no patch.
+    monkeypatch.setattr(envs, "VLLM_TPU_PROMPT_IDS_NDARRAY", True, raising=False)
+    monkeypatch.setattr(envs, "VLLM_TPU_PROMPT_IDS_NDARRAY_EARLY", False, raising=False)
+    paw.patch_prompt_ids_ndarray_early()
+    assert EngineCore.preprocess_add_request is fake_preprocess
+    # On: the input-thread hook converts once; a second patch call is a no-op.
+    monkeypatch.setattr(envs, "VLLM_TPU_PROMPT_IDS_NDARRAY_EARLY", True, raising=False)
+    paw.patch_prompt_ids_ndarray_early()
+    patched = EngineCore.preprocess_add_request
+    assert patched is not fake_preprocess
+    paw.patch_prompt_ids_ndarray_early()
+    assert EngineCore.preprocess_add_request is patched
+    out = EngineCore.preprocess_add_request(None, object())
+    assert out == (request, 0)
+    np.testing.assert_array_equal(request._prompt_ids_np, np.asarray(ids, np.int32))
+    assert request.prompt_token_ids is ids
