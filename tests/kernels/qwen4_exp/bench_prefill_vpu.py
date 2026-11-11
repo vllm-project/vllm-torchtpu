@@ -54,6 +54,8 @@ VARIANTS = {
     # Suffix _pc: VLLM_TPU_QSA_PREFILL_PAGE_COPIES=1.
     "base_pc": "",
     "vpu1_pc": "1",
+    # Phase 3 MXU scheduling (bit-identical), on top of vpu1 + page copies.
+    "vpuF_pc": "mask,qk16,pv16,qkfirst",
 }
 
 
@@ -90,6 +92,21 @@ def make_inputs(rows, context, query_heads, query_block, dcp_world, seed=0):
     raw = jax.random.normal(k2, (physical, PAGE, 1, 4, DIM), jnp.float32)
     raw = raw * jnp.asarray([1.5, 0.5, 1.5, 0.5], jnp.float32)[None, None, None, :, None]
     cache = raw.astype(jnp.float8_e4m3fn)
+    if os.environ.get("BENCH_POISON") == "1":
+        # NaN-poison every row no request has written: the unmapped physical
+        # pages and the rows past the context in the last mapped page.
+        written = np.zeros((physical, PAGE), bool)
+        for index, page in enumerate(table_row):
+            first = index * entry
+            # Under DCP an entry spans dcp_world pages and a rank holds one;
+            # keep the most any rank can have written (rank 0's page).
+            live = min(PAGE, max(0, context - first))
+            written[page, :live] = True
+        cache = jnp.where(
+            jnp.asarray(written)[:, :, None, None, None],
+            cache,
+            jnp.asarray(jnp.nan, jnp.float8_e4m3fn),
+        )
     return (
         query,
         jnp.asarray(blocks),

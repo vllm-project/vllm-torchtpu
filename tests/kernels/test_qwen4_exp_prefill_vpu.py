@@ -164,3 +164,14 @@ def test_page_copies_bitwise(backend, monkeypatch, features):
     monkeypatch.setenv("VLLM_TPU_QSA_PREFILL_PAGE_COPIES", "1")
     actual = _run(monkeypatch, features, args, **common)
     np.testing.assert_array_equal(actual, base)
+
+
+@pytest.mark.parametrize("extra", ["qkfirst"])
+def test_mxu_schedule_bitwise(backend, monkeypatch, extra):
+    """qkfirst reorders the same QK products: bit-identical to "1"."""
+    args, _, _, ratio = _case(11, 3, 1024, 1.0)
+    common = dict(query_heads=3, kv_tile=1024, k_scale=1.0, ratio=ratio)
+    monkeypatch.setenv("VLLM_TPU_QSA_PREFILL_PAGE_COPIES", "1")
+    base = _run(monkeypatch, "1", args, **common)
+    actual = _run(monkeypatch, "mask,qk16,pv16," + extra, args, **common)
+    np.testing.assert_array_equal(actual, base)

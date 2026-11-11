@@ -32,7 +32,7 @@ PAIRED_PAGE_MAX_QUERY_ROWS = 256 * 24
 PAIRED_KV_TILES = (256, 512, 1024)
 
 # VLLM_TPU_QSA_PREFILL_VPU features (see envs.py) and the set "1" selects.
-VPU_FEATURES = ("mask", "qk16", "pv16")
+VPU_FEATURES = ("mask", "qk16", "pv16", "qkfirst")
 VPU_DEFAULT = ("mask", "qk16", "pv16")
 
 
@@ -768,52 +768,77 @@ def _kernel(
             if pv16:
                 value = value.astype(jnp.bfloat16)
             key_values.append((key, value))
-        for query_tile_index in range(num_query_tiles):
+        rows = query_tile * q_heads_per_kv
+        source = q16_vpu if "qk16" in vpu else q
+
+        def qk(query_tile_index, head, key):
+            start = query_tile_index * query_tile
+            query = source[head, :, start : start + query_tile].reshape(
+                rows, head_dim
+            )
+            return lax.dot(
+                query,
+                key,
+                dimension_numbers=(([1], [1]), ([], [])),
+                preferred_element_type=jnp.float32,
+            )
+
+        # qkfirst: issue the next (subtile, head)'s QK before this one's
+        # softmax and PV, so the QK matmuls do not queue behind them. One
+        # unit of lookahead keeps at most two score tiles live (VMEM).
+        units = [
+            (query_tile_index, head)
+            for query_tile_index in range(num_query_tiles)
+            for head in range(len(key_values))
+        ]
+        early = {}
+
+        def issue(index):
+            if index < len(units) and units[index] not in early:
+                query_tile_index, head = units[index]
+                early[units[index]] = qk(query_tile_index, head, key_values[head][0])
+
+        for index, (query_tile_index, head) in enumerate(units):
+            key, value = key_values[head]
             start = query_tile_index * query_tile
             tile_visible = visible[start : start + query_tile]
-            for head, (key, value) in enumerate(key_values):
-                m = max_ref[query_tile_index, head, :]
-                mass = mass_ref[query_tile_index, head, :]
-                acc = accumulator_ref[query_tile_index, head, :, :]
-                rows = query_tile * q_heads_per_kv
-                source = q16_vpu if "qk16" in vpu else q
-                query = source[head, :, start : start + query_tile].reshape(
-                    rows, head_dim
-                )
-                score = lax.dot(
-                    query,
-                    key,
-                    dimension_numbers=(([1], [1]), ([], [])),
-                    preferred_element_type=jnp.float32,
-                )
-                if "qk16" in vpu and not scale_folded:
-                    score = score * score_scale
-                row_visible = jnp.broadcast_to(
-                    tile_visible[None, :, :],
-                    (q_heads_per_kv, query_tile, kv_tile),
-                ).reshape(rows, kv_tile)
-                score = jnp.where(row_visible, score, -jnp.inf)
-                next_m = jnp.maximum(m, jnp.max(score, axis=1))
-                finite_m = jnp.where(jnp.isneginf(next_m), 0.0, next_m)
-                alpha = jnp.where(jnp.isneginf(next_m), 1.0, jnp.exp(m - next_m))
-                prob = jnp.exp(score - finite_m[:, None])
-                prob_sum = jnp.sum(prob, axis=1)
-                if pv16:
-                    # Mosaic already feeds an FP32 dot to the MXU as one BF16
-                    # pass (bit-identical on v7x); casting here only skips the
-                    # FP32 operand relayout.
-                    prob = prob.astype(jnp.bfloat16)
-                weighted = lax.dot(
-                    prob,
-                    value,
-                    dimension_numbers=(([1], [0]), ([], [])),
-                    preferred_element_type=jnp.float32,
-                )
-                max_ref[query_tile_index, head, :] = next_m
-                mass_ref[query_tile_index, head, :] = mass * alpha + prob_sum
-                accumulator_ref[query_tile_index, head, :, :] = (
-                    acc * alpha[:, None] + weighted
-                )
+            m = max_ref[query_tile_index, head, :]
+            mass = mass_ref[query_tile_index, head, :]
+            acc = accumulator_ref[query_tile_index, head, :, :]
+            if "qkfirst" in vpu:
+                issue(index)
+                issue(index + 1)
+                score = early.pop(units[index])
+            else:
+                score = qk(query_tile_index, head, key)
+            if "qk16" in vpu and not scale_folded:
+                score = score * score_scale
+            row_visible = jnp.broadcast_to(
+                tile_visible[None, :, :],
+                (q_heads_per_kv, query_tile, kv_tile),
+            ).reshape(rows, kv_tile)
+            score = jnp.where(row_visible, score, -jnp.inf)
+            next_m = jnp.maximum(m, jnp.max(score, axis=1))
+            finite_m = jnp.where(jnp.isneginf(next_m), 0.0, next_m)
+            alpha = jnp.where(jnp.isneginf(next_m), 1.0, jnp.exp(m - next_m))
+            prob = jnp.exp(score - finite_m[:, None])
+            prob_sum = jnp.sum(prob, axis=1)
+            if pv16:
+                # Mosaic already feeds an FP32 dot to the MXU as one BF16
+                # pass (bit-identical on v7x); casting here only skips the
+                # FP32 operand relayout.
+                prob = prob.astype(jnp.bfloat16)
+            weighted = lax.dot(
+                prob,
+                value,
+                dimension_numbers=(([1], [0]), ([], [])),
+                preferred_element_type=jnp.float32,
+            )
+            max_ref[query_tile_index, head, :] = next_m
+            mass_ref[query_tile_index, head, :] = mass * alpha + prob_sum
+            accumulator_ref[query_tile_index, head, :, :] = (
+                acc * alpha[:, None] + weighted
+            )
 
     if vpu:
         min_length = min_length_ref[block]
