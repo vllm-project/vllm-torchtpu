@@ -764,9 +764,11 @@ class Qwen4ExpBackbone(nn.Module):
         if (
             not envs.VLLM_TPU_MK_PLE_TRIM
             or emb.tp_size == 1
-            or not emb.reduce_results
-            or emb.parallel_group is not None
-            or emb.use_fused_embedding
+            # Served VocabParallelEmbedding may lack these fields (AttributeError
+            # inside the whole-step trace disabled the MK): missing -> separate collectives.
+            or getattr(emb, "reduce_results", None) is not True
+            or getattr(emb, "parallel_group", None) is not None
+            or getattr(emb, "use_fused_embedding", False)
             or emb.weight.dtype != torch.bfloat16
             # Measured (v7x, 8 ranks): one merged all-reduce wins at 4 rows
             # (19 -> 11 us) and loses from 16 rows on (36 -> 45 us).
