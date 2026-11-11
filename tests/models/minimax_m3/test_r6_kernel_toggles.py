@@ -224,3 +224,53 @@ def test_lse_r6_kernel_matches_default(monkeypatch, dtype, block_q):
         atol=2e-2,
     )
     np.testing.assert_allclose(np.asarray(got[1]), np.asarray(want[1]), atol=1e-3)
+
+
+def test_dcp_heads_slot_layout():
+    """`msa_dcp_heads` reads v3's `to_slots` candidates: per head and per
+    row they are the head's packed candidates (bit patterns)."""
+    from vllm_torchtpu.models.minimax_m3.kernels import msa_dcp, msa_dcp_heads
+
+    rng = np.random.default_rng(23)
+    num_tokens, heads, topk = 12, 2, 4
+    scores = rng.standard_normal((num_tokens, heads, topk)).astype(np.float32)
+    blocks = rng.integers(-1, 50, (num_tokens, heads, topk)).astype(np.float32)
+    packed = np.concatenate([scores, blocks], axis=-1).reshape(num_tokens, -1)
+    slots = msa_dcp.to_slots(jnp.asarray(packed), topk)
+    per_head = np.asarray(msa_dcp_heads.slots_per_head(slots, heads))
+    assert per_head.shape == (heads, num_tokens, 2 * topk)
+    np.testing.assert_array_equal(
+        per_head[..., :topk], scores.transpose(1, 0, 2).view(np.int32)
+    )
+    np.testing.assert_array_equal(
+        per_head[..., topk:], blocks.transpose(1, 0, 2).astype(np.int32)
+    )
+    rows = jnp.asarray([3, 0, 7], jnp.int32)
+    picked = msa_dcp_heads.slot_rows(slots, rows, heads)
+    want = msa_dcp.to_slots(jnp.asarray(packed[np.asarray(rows)]), topk)
+    np.testing.assert_array_equal(np.asarray(picked), np.asarray(want))
+
+
+def test_dcp_heads_merge_own_matches_merge_candidates():
+    """`merge_own` on per-token int32 slots selects what `merge_candidates`
+    selects from the same packed f32 candidates."""
+    from vllm_torchtpu.models.minimax_m3.kernels import msa_dcp, msa_dcp_heads
+
+    rng = np.random.default_rng(29)
+    dcp, num_tokens, topk = 4, 16, 8
+    scores = rng.integers(-3, 4, (dcp, num_tokens, topk)).astype(np.float32)
+    blocks = np.stack(
+        [
+            np.stack([rng.permutation(64)[:topk] * dcp + r for _ in range(num_tokens)])
+            for r in range(dcp)
+        ]
+    ).astype(np.float32)
+    # Each rank's list in pick order: score descending, ties to the lower block.
+    order = np.lexsort((blocks, -scores), axis=-1)
+    scores = np.take_along_axis(scores, order, -1)
+    blocks = np.take_along_axis(blocks, order, -1)
+    packed = np.concatenate([scores, blocks], axis=-1)  # [dcp, T, 2K]
+    want = np.asarray(msa_dcp.merge_candidates(jnp.asarray(packed), topk))
+    own = jnp.stack([msa_dcp.to_slots(jnp.asarray(p), topk).T for p in packed])
+    got = np.asarray(msa_dcp_heads.merge_own(own, topk, interpret=True))
+    np.testing.assert_array_equal(got, want)

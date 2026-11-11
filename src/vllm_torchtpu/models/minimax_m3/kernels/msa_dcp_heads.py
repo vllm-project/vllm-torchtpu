@@ -154,6 +154,29 @@ def _exchange_pages(kv_cache, scale_cache, pages, *, dcp, replicas, head_width, 
     return recv, recv_sc
 
 
+def slots_per_head(candidates: jax.Array, heads: int) -> jax.Array:
+    """`msa_dcp.to_slots` slots ``[2 * topk, T * G]`` (column ``t * G + h``)
+    -> per head ``[G, T, 2 * topk]``."""
+    slots = candidates.shape[0]
+    return candidates.reshape(slots, -1, heads).transpose(2, 1, 0)
+
+
+def slot_rows(candidates: jax.Array, rows: jax.Array, heads: int) -> jax.Array:
+    """The slots of tokens ``rows`` (``[R]``): ``[2 * topk, R * G]``."""
+    slots = candidates.shape[0]
+    picked = candidates.reshape(slots, -1, heads)[:, rows]
+    return picked.reshape(slots, rows.shape[0] * heads)
+
+
+def merge_own(own: jax.Array, topk: int, interpret: bool = False) -> jax.Array:
+    """Selection ``[T, topk]`` of one KV head from every rank's per-token
+    slots ``own [dcp, T, 2 * topk]`` (`merge_head_candidates` takes them
+    as ``[dcp, 2 * topk, T]``)."""
+    return msa_dcp.merge_head_candidates(
+        own.transpose(0, 2, 1), topk, interpret=interpret
+    )[:, 0]
+
+
 def _own_selection(candidates, *, dcp, replicas, topk, axis, interpret):
     """The selection ``[T, topk]`` of this rank's KV head, from every rank's
     candidate slots ``candidates [2 * topk, T * G]`` (`msa_dcp.to_slots`,
@@ -162,20 +185,16 @@ def _own_selection(candidates, *, dcp, replicas, topk, axis, interpret):
     of that share) and the replicas all-gather the merged selections, which
     are 1/8 the candidates' bytes."""
     heads = dcp // replicas
-    num_tokens = candidates.shape[1] // heads
+    per_head = slots_per_head(candidates, heads)
+    num_tokens = per_head.shape[1]
     split = replicas if num_tokens % replicas == 0 else 1
     part = num_tokens // split
-    # Column t * G + h of the slots -> [G, T, 2 * topk].
-    per_head = candidates.reshape(2 * topk, num_tokens, heads).transpose(2, 1, 0)
     # Destination rank d = h * replicas + j gets head h's tokens of share j
     # (every share, when the tokens do not split).
     send = per_head.reshape(heads, split, part, 2 * topk)
     send = jnp.repeat(send, replicas // split, axis=1).reshape(dcp, part, 2 * topk)
     own = jax.lax.all_to_all(send, axis, 0, 0, tiled=True)  # [dcp, T / split, 2K]
-    # Back to the slots layout `merge_head_candidates` takes: [dcp, 2K, T / split].
-    selected = msa_dcp.merge_head_candidates(
-        own.transpose(0, 2, 1), topk, interpret=interpret
-    )[:, 0]
+    selected = merge_own(own, topk, interpret)
     if split > 1:
         groups = [list(range(h * replicas, (h + 1) * replicas)) for h in range(heads)]
         selected = jax.lax.all_gather(
@@ -390,14 +409,11 @@ def attend_and_merge(
     p = jnp.arange(rows, dtype=jnp.int32)
     req = jnp.minimum(jnp.searchsorted(cu_d[1:], p, side="right"), max_num_seqs - 1)
     src_row = jnp.where(p < cu_d[-1], cu_q_lens[req] + p - cu_d[req], 0)
-    slots = candidates.shape[0]
-    heads = candidates.shape[1] // num_tokens
-    dcp_candidates = candidates.reshape(slots, num_tokens, heads)[:, src_row]
     dcp_out = _dcp_attend(
         q[src_row],
         kv_cache,
         scale_cache,
-        dcp_candidates.reshape(slots, rows * heads),
+        slot_rows(candidates, src_row, candidates.shape[1] // num_tokens),
         seq_lens,
         block_tables,
         cu_d,
