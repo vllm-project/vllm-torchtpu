@@ -727,6 +727,30 @@ def test_forward_patch_skipped_for_other_models_without_sp(
     )
 
 
+@pytest.mark.parametrize("sequence_parallel", [False, True])
+def test_a_config_without_architectures_gets_mains_behaviour(
+    restore_forwards, v6_install, sequence_parallel
+):
+    """A config that does not name its architectures (a stand-in such as the
+    patch registry's tests pass) is not a Qwen3.5 target: the patch installs
+    what main installs and nothing of the Qwen3.5 rule."""
+    restore_forwards.setattr(envs, "TPU_MOE_SEQUENCE_PARALLEL", sequence_parallel)
+    restore_forwards.setattr(patch_mod.sequence_parallel, "_FOLLOWS_STEP_FORM", False)
+    stand_in = SimpleNamespace(hf_config=SimpleNamespace(model_type="llama"))
+    assert maybe_patch_qwen3_next(stand_in) is None
+    v6_install.assert_not_called()
+    assert not patch_mod.sequence_parallel.follows_step_form()
+    expected = (
+        (entry_chunk_decoder_layer_forward, entry_chunk_model_forward)
+        if sequence_parallel
+        else (UPSTREAM_DECODER_LAYER_FORWARD, UPSTREAM_MODEL_FORWARD)
+    )
+    assert (
+        qwen3_next.Qwen3NextDecoderLayer.forward,
+        qwen3_next.Qwen3NextModel.forward,
+    ) == expected
+
+
 def test_forward_patch_waits_for_a_model_config(restore_forwards, v6_install):
     """Without a model config the rule cannot tell Qwen3.5 from other models,
     so it installs nothing and asks the registry to call it again."""
