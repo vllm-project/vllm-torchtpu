@@ -73,6 +73,7 @@ def _make_runner(
     runner._pp_is_first = True
     runner._pp_is_last = True
     runner._pp_handoff = None
+    runner._adaptive_verification = None
     runner.scheduler_config = SimpleNamespace(async_scheduling=False)
     runner.parallel_config = SimpleNamespace(
         prefill_context_parallel_size=pcp_size,
@@ -153,6 +154,9 @@ def _make_runner(
     # Affine checkpoint addressing (no per-checkpoint blocks) in these tests.
     runner._mamba_ckpt_window = 1
     runner._unified_kv_layout = False
+    # No GDN internal prefill checkpoints in these layout tests.
+    runner._prefill_ckpt_units = None
+    runner._prefill_ckpt_zero_offsets = {}
     # Default to layer-major KV cache (None bundle) for PCP integration layout tests.
     runner._kv_cache_bundle = None
     # Bind the real seed-copy collector; an empty copy plan makes it a no-op

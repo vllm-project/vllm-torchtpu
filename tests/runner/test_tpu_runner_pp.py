@@ -44,6 +44,7 @@ def _runner(**attrs):
         "_pp_take_topk_indices",
         "_pp_outgoing_tensors",
         "_sample_tokens_pp_intermediate_stage",
+        "_build_kv_connector_output",
         "sample_tokens",
     ):
         setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
@@ -353,6 +354,8 @@ class TestBufferedStepPosting:
             _count_input_chunks=lambda _so: (2, 1),
             _any_decode=lambda _so: False,
             _dp_coordinated_step=lambda *_a, **_kw: (None, 2),
+            _adaptive_verification=None,
+            _readmit_trimmed_drafts=lambda *_a: None,
             _pp_handoff=handoff,
             _pp_is_first=first,
             _pp_forward_rows=lambda _so: [32, 16],

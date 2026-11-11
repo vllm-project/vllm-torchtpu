@@ -16,17 +16,6 @@
 from typing import Any
 
 
-def _legacy_ray_executor() -> bool:
-    import vllm.envs as vllm_envs
-
-    from vllm_torchtpu import envs
-
-    return (
-        envs.TPU_MULTIHOST_BACKEND == "ray"
-        and not vllm_envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND
-    )
-
-
 def _torch_tpu_builds_stage_meshes() -> bool:
     """Whether the installed torch_tpu builds a Pallas mesh over a pipeline
     stage's process group; its releases accept world-size meshes only."""
@@ -37,7 +26,7 @@ def _torch_tpu_builds_stage_meshes() -> bool:
 
 # The `layer_types` spellings vLLM counts as full-attention layers
 # (`_ATTENTION_LAYER_TYPES`,
-# https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/config/model.py#L111).
+# https://github.com/vllm-project/vllm/blob/v0.33.0/vllm/config/model.py#L112).
 # transformers v5.18 renamed deepseek_sparse_attention and
 # qwen_sparse_attention to indexed_attention
 # (https://github.com/huggingface/transformers/pull/48974); vLLM keeps all
@@ -190,12 +179,6 @@ def validate_pipeline_parallel_config(vllm_config: Any) -> None:
             " Choose a pipeline size or VLLM_PP_LAYER_PARTITION that "
             "gives every stage a full-attention layer."
         )
-    elif _legacy_ray_executor():
-        # The pipeline's engine side, the draft-token hook, patches the
-        # executor class that the multiprocess and Ray V2 executors share;
-        # the legacy Ray executor is not one.
-        unsupported = "the legacy Ray executor"
-        remedy = " Set VLLM_USE_RAY_V2_EXECUTOR_BACKEND=1."
     if unsupported is not None:
         raise NotImplementedError(
             f"Pipeline parallelism on TPU does not support {unsupported} yet.{remedy}"

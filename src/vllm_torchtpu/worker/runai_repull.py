@@ -20,12 +20,10 @@ into a local cache dir and rewrites ``model_config.model`` /
 (``ModelConfig.maybe_pull_model_tokenizer_for_runai``). That runs once,
 on the head host; ``__post_init__`` is not re-run when the config is
 shipped to workers. On a multi-host slice the remote ranks therefore
-arrive in one of two states, neither of which has the files locally:
-
-* Ray V2 executor: the head's config as-is — ``model`` is a local dir
-  that exists only on the head host, ``model_weights`` is the URI.
-* Ray V1 executor (``ray_distributed_executor.py``): the URI restored
-  into ``model`` and ``model_weights`` cleared, i.e. the pre-pull state.
+receive the head's config as-is: ``model`` is a local dir that exists
+only on the head host, and ``model_weights`` is the URI. A config that
+still holds the URI in ``model`` (the pre-pull state) has no local files
+either.
 
 Why only some models notice: most architectures never read that path
 again on a worker, so stock-config models served from GCS (the GLM
@@ -45,9 +43,7 @@ serializes the ranks sharing a host: one pulls, the rest wait and skip.
 Why here and not upstream: the gap is in vLLM's multi-host worker
 handoff, but it is reached only through this plugin's executors on a
 pinned vLLM, and this repo already patches the object-storage load path
-(``model_loader_patches.py``). The V1 executor restores the URI for
-remote nodes on the assumption that each worker re-pulls; this module is
-what makes that assumption hold. It is a no-op unless the model comes
+(``model_loader_patches.py``). It is a no-op unless the model comes
 from object storage (``is_runai_obj_uri`` on ``model_weights``/``model``),
 so models served from local disk or the HF hub are untouched. The
 observable trace on an affected rank is one ``[runai-repull] pulling aux
@@ -104,11 +100,11 @@ def ensure_runai_aux_files(model_config) -> None:
     # isinstance guards: both fields are str on a real ModelConfig; tests
     # drive TPUWorker with MagicMock configs, which must stay a no-op.
     if isinstance(model_weights, str) and is_runai_obj_uri(model_weights):
-        # Ray V2: rewritten on the head; the local dir may be missing here.
+        # Rewritten on the head; the local dir may be missing here.
         uri = model_weights
         rewritten = True
     elif isinstance(model, str) and is_runai_obj_uri(model):
-        # Ray V1: pre-pull state, nobody has pulled on this host yet.
+        # Pre-pull state, nobody has pulled on this host yet.
         uri = model
         rewritten = False
     else:
@@ -136,7 +132,7 @@ def ensure_runai_aux_files(model_config) -> None:
             os.makedirs(model_config.model, exist_ok=True)
             _touch(os.path.join(model_config.model, PULLING_SENTINEL), uri)
         model_config.maybe_pull_model_tokenizer_for_runai(uri, tokenizer)
-        # Without the V2 rewrite the dir is only known after the pull.
+        # Without the head's rewrite the dir is only known after the pull.
         if not rewritten:
             _touch(os.path.join(model_config.model, PULLING_SENTINEL), uri)
         _touch(os.path.join(model_config.model, COMPLETE_SENTINEL), uri)

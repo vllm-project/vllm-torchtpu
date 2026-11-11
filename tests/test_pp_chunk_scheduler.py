@@ -14,6 +14,7 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 from vllm.v1.core.sched.scheduler import Scheduler
 
 from vllm_torchtpu.core.pp_chunk_scheduler import (
@@ -380,3 +381,36 @@ def test_engine_core_patch_is_skipped_without_dynamic_chunks(monkeypatch):
     monkeypatch.setattr(engine_core, "EngineCore", FakeCore)
     patch_engine_core_for_pp_chunks(_config(cls=None))
     assert not hasattr(FakeCore, "_tpu_pp_chunks_patch")
+
+
+@pytest.mark.parametrize(("checkpoint_blocks", "chunk"), [(True, 8191), (False, 3072)])
+def test_an_unclipped_mtp_prompt_runs_whole_with_internal_checkpoints(
+    monkeypatch, checkpoint_blocks, chunk
+):
+    from vllm_torchtpu import _patch_vllm_mamba_split_scheduler_block_size
+
+    monkeypatch.setattr(
+        Scheduler, "_mamba_block_aligned_split", Scheduler._mamba_block_aligned_split
+    )
+    _patch_vllm_mamba_split_scheduler_block_size()
+    # PP4xPCP8, --block-size 384, MTP: what the base split reads.
+    scheduler = _scheduler(mamba_split=True, granularity=4096)
+    scheduler.cache_config = SimpleNamespace(block_size=384)
+    scheduler.block_size = 3072
+    scheduler.hash_block_size = 3072
+    scheduler.use_eagle = True
+    scheduler.use_eagle_block_drop = True
+    scheduler.num_hash_lookahead_tokens = 0
+    scheduler.max_num_scheduled_tokens = 16384
+    scheduler.scheduler_config = SimpleNamespace(long_prefill_token_threshold=16384)
+    scheduler.mamba_has_prefill_checkpoint_blocks = checkpoint_blocks
+    scheduler.mamba_prefill_checkpoint_alignment = 64 if checkpoint_blocks else None
+    scheduler.mamba_partial_cache_hit = False
+    scheduler.mamba_shared_prefix_checkpoint = False
+    request = _request(0, 8191)
+    request.shared_prefix_boundary = 0
+
+    # The chunk limits pass the whole prompt; the base split decides the rest.
+    assert scheduler._mamba_block_aligned_split(request, 8191) == chunk
+    assert scheduler._clips == 0
+    assert scheduler._step_prefill_tokens == chunk
