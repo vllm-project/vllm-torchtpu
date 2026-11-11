@@ -121,6 +121,25 @@ def test_write_fp4_stores_rotated_quantized_rows_and_scales():
     assert np.isnan(ix_s[3, :126]).all()  # untouched slots of a written page
 
 
+def test_cache_specs_match_allocated_shapes():
+    import torch
+
+    from vllm_torchtpu.models.minimax_m3.experimental import attention as attn
+
+    for cls_args, expected in [
+        ((256, torch.uint8, "l.attn"), (7, 16, 4, 256)),
+        ((128, torch.uint8, "l.attn.index_cache"), (7, 17, 4, 128)),
+    ]:
+        cache = object.__new__(attn.MiniMaxM3Cache)
+        cache.row_width, cache.dtype, cache.prefix = cls_args
+        cache.scales_in_page = cache.prefix.endswith("index_cache")
+        cache.token_shards, cache.block_size = 1, 128
+        assert cache.kv_cache_shape(7) == expected
+    scale = object.__new__(attn.MiniMaxM3ScaleCache)
+    scale.block_size, scale.row_width = 128, msa_fp4.scale_rows(4)
+    assert scale.kv_cache_shape(7) == (7, 8, 128)
+
+
 def test_write_fp4_multi_head_rows_and_scale_rows():
     """G = 4 KV heads per rank (DCP wider than a head's replicas): rows
     [K_0 | V_0 | ... | K_3 | V_3], scale rows 2h / 2h + 1, index scales in
