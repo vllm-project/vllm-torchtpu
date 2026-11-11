@@ -47,6 +47,25 @@ from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
 
+# Checkpoint quant methods that model directories register for themselves.
+_MODEL_QUANT_CONFIGS: dict[str, type[VllmQuantConfig]] = {}
+
+
+def register_tpu_quant_config(
+    quant_method: str, config_cls: type[VllmQuantConfig]
+) -> None:
+    """Serve checkpoints declaring `quant_method` with `config_cls`."""
+    from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+
+    registered = _MODEL_QUANT_CONFIGS.setdefault(quant_method, config_cls)
+    if registered is not config_cls:
+        raise ValueError(
+            f"TPU quant method {quant_method!r} is already served by "
+            f"{registered.__name__}."
+        )
+    if quant_method not in TpuPlatform.supported_quantization:
+        TpuPlatform.supported_quantization.append(quant_method)
+
 
 def get_tpu_quantization_config(
     vllm_config: VllmConfig,
@@ -79,6 +98,7 @@ def get_tpu_quantization_config(
         # TODO: Add more quantization methods as needed
         # quant_methods.AWQ: VllmAWQConfig,
     }
+    method_to_config.update(_MODEL_QUANT_CONFIGS)
 
     if model_config.quantization not in method_to_config:
         raise NotImplementedError(
