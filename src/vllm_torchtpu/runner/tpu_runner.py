@@ -6129,6 +6129,11 @@ class TPUModelRunner(GPUModelRunner):
 
             draft = self._async_drafter.draft_model if self._is_async_drafter else None
             arm(self.model, draft)
+        # Off unless additional_config sets tp_pallas_all_reduce_max_bytes.
+        # Collective (a self-test over the TP group), so after the model load.
+        from vllm_torchtpu.distributed import pallas_all_reduce
+
+        pallas_all_reduce.arm_from_config(self.vllm_config, self.device)
 
     def load_lora_model(
         self,
