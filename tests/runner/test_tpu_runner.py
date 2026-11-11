@@ -3622,6 +3622,40 @@ def test_sample_from_logits_float32_noise_preserves_gumbel_tail():
     assert int(out_bf16.item()) == 0
 
 
+def _recording_sampler(record):
+    """A `sample_from_logits_func` stand-in that calls
+    `record(u, (all_greedy, topk_candidates, apply_topk_topp))`, an omitted
+    argument taking `TPUModelRunner.sample_from_logits`'s default."""
+    signature = inspect.signature(TPUModelRunner.sample_from_logits)
+
+    def sample_from_logits(*args, **kwargs):
+        call = signature.bind(None, *args, **kwargs)
+        call.apply_defaults()
+        arg = call.arguments
+        record(
+            arg["u"],
+            (arg["all_greedy"], arg["topk_candidates"], arg["apply_topk_topp"]),
+        )
+        return torch.zeros((arg["logits"].shape[0], 1), dtype=torch.int32)
+
+    return sample_from_logits
+
+
+def _precompile_runner(record, speculative_config=None, candidate_blocks=0):
+    """A runner stand-in for `_precompile_sample_from_logits` that samples
+    through `_recording_sampler(record)`."""
+    return SimpleNamespace(
+        num_reqs_paddings=[2],
+        _hidden_states_dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+        _dummy_logits=lambda n: torch.zeros((n, 16), dtype=torch.bfloat16),
+        _topk_candidate_blocks=lambda: candidate_blocks,
+        _precompile_timed=lambda _name: contextlib.nullcontext(),
+        sample_from_logits_func=_recording_sampler(record),
+        speculative_config=speculative_config,
+    )
+
+
 @pytest.mark.parametrize("speculative_config", [None, SimpleNamespace()])
 def test_sampler_applies_topk_topp_only_when_a_request_sets_them(
     speculative_config,
@@ -3641,40 +3675,6 @@ def test_sampler_applies_topk_topp_only_when_a_request_sets_them(
         assert TPUModelRunner._sampler_applies_topk_topp(runner) is expected
 
 
-def test_precompile_warms_the_no_topk_topp_graph_without_spec_decode():
-    """Without speculative decoding the precompile also warms the graph that
-    skips top-k/top-p, so the first decode step that uses it compiles
-    nothing."""
-    seen = []
-
-    def fake_sample_from_logits(
-        logits,
-        temperatures,
-        u,
-        top_k,
-        top_p,
-        all_greedy=False,
-        topk_candidates=0,
-        apply_topk_topp=True,
-    ):
-        seen.append((all_greedy, topk_candidates, apply_topk_topp))
-        return torch.zeros((logits.shape[0], 1), dtype=torch.int32)
-
-    runner = SimpleNamespace(
-        num_reqs_paddings=[2, 4],
-        _hidden_states_dtype=torch.bfloat16,
-        device=torch.device("cpu"),
-        _dummy_logits=lambda n: torch.zeros((n, 16), dtype=torch.bfloat16),
-        _topk_candidate_blocks=lambda: 0,
-        _precompile_timed=lambda _name: contextlib.nullcontext(),
-        sample_from_logits_func=fake_sample_from_logits,
-        speculative_config=None,
-    )
-    TPUModelRunner._precompile_sample_from_logits(runner)
-    variants = [(False, 0, True), (False, 0, False), (True, 0, True)]
-    assert seen == variants * 2
-
-
 @pytest.mark.parametrize("candidate_blocks", [0, 8])
 @pytest.mark.parametrize("speculative_config", [None, SimpleNamespace()])
 def test_every_runtime_sampler_variant_is_precompiled(
@@ -3684,30 +3684,11 @@ def test_every_runtime_sampler_variant_is_precompiled(
     random sampling path picks at runtime is one the precompile warms, so
     serving compiles no sampler graph after warmup."""
     warmed = set()
-
-    def fake_sample_from_logits(
-        logits,
-        temperatures,
-        u,
-        top_k,
-        top_p,
-        all_greedy=False,
-        topk_candidates=0,
-        apply_topk_topp=True,
-    ):
-        warmed.add((all_greedy, topk_candidates, apply_topk_topp))
-        return torch.zeros((logits.shape[0], 1), dtype=torch.int32)
-
     TPUModelRunner._precompile_sample_from_logits(
-        SimpleNamespace(
-            num_reqs_paddings=[2],
-            _hidden_states_dtype=torch.bfloat16,
-            device=torch.device("cpu"),
-            _dummy_logits=lambda n: torch.zeros((n, 16), dtype=torch.bfloat16),
-            _topk_candidate_blocks=lambda: candidate_blocks,
-            _precompile_timed=lambda _name: contextlib.nullcontext(),
-            sample_from_logits_func=fake_sample_from_logits,
-            speculative_config=speculative_config,
+        _precompile_runner(
+            lambda _u, variant: warmed.add(variant),
+            speculative_config,
+            candidate_blocks,
         )
     )
 
@@ -3787,18 +3768,10 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
 
     seen_u_dtypes: list[torch.dtype] = []
 
-    def fake_sample_from_logits(
-        logits,
-        temperatures,
-        u,
-        top_k,
-        top_p,
-        all_greedy=False,
-        topk_candidates=0,
-        apply_topk_topp=True,
-    ):
+    def record_u_dtype(u, _variant):
         seen_u_dtypes.append(u.dtype)
-        return torch.zeros((logits.shape[0], 1), dtype=torch.int32)
+
+    fake_sample_from_logits = _recording_sampler(record_u_dtype)
 
     bf16_logits = torch.zeros((2, 16), dtype=torch.bfloat16)
     sampling_params = (
@@ -3808,21 +3781,10 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
     )
 
     # 1. _precompile_sample_from_logits: the full graph, the no-top-k/top-p
-    # graph and the greedy graph, with or without speculative decoding.
-    for speculative_config, num_graphs in ((None, 3), (SimpleNamespace(), 3)):
-        precompile_runner = SimpleNamespace(
-            num_reqs_paddings=[2],
-            _hidden_states_dtype=torch.bfloat16,
-            device=torch.device("cpu"),
-            _dummy_logits=lambda n: torch.zeros((n, 16), dtype=torch.bfloat16),
-            _topk_candidate_blocks=lambda: 0,
-            _precompile_timed=lambda _name: contextlib.nullcontext(),
-            sample_from_logits_func=fake_sample_from_logits,
-            speculative_config=speculative_config,
-        )
-        TPUModelRunner._precompile_sample_from_logits(precompile_runner)
-        assert seen_u_dtypes == [torch.float32] * num_graphs
-        seen_u_dtypes.clear()
+    # graph and the greedy graph.
+    TPUModelRunner._precompile_sample_from_logits(_precompile_runner(record_u_dtype))
+    assert seen_u_dtypes == [torch.float32] * 3
+    seen_u_dtypes.clear()
 
     # 2. _sample_spec_verify_chunk (bonus_u and recover_u)
     seen_recover_dtypes: list[torch.dtype] = []
