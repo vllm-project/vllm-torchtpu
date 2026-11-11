@@ -52,7 +52,10 @@ from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
 )
 from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
 from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
-from vllm_torchtpu.layers.adapter.sample.top_k_top_p import apply_top_k_top_p
+from vllm_torchtpu.layers.adapter.sample.top_k_top_p import (
+    apply_top_k_top_p,
+    random_sampler_variants,
+)
 from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadata,
     AttentionMetadataBuilder,
@@ -3682,7 +3685,8 @@ def test_every_runtime_sampler_variant_is_precompiled(
 ):
     """Every (all_greedy, topk_candidates, apply_topk_topp) graph that the
     random sampling path picks at runtime is one the precompile warms, so
-    serving compiles no sampler graph after warmup."""
+    serving compiles no sampler graph after warmup. The runtime picks from
+    random_sampler_variants, which both precompiles warm."""
     warmed = set()
     TPUModelRunner._precompile_sample_from_logits(
         _precompile_runner(
@@ -3691,6 +3695,10 @@ def test_every_runtime_sampler_variant_is_precompiled(
             candidate_blocks,
         )
     )
+    variants = {
+        (False, *variant) for variant in random_sampler_variants(candidate_blocks)
+    }
+    assert variants <= warmed
 
     for top_k, top_p in (
         ([0, 0], [1.0, 1.0]),
@@ -3714,7 +3722,7 @@ def test_every_runtime_sampler_variant_is_precompiled(
                 TPUModelRunner._sampler_topk_candidates(runner, 0, 2, grammar_output),
                 TPUModelRunner._sampler_applies_topk_topp(runner),
             )
-            assert variant in warmed, (top_k, top_p, grammar_output, variant)
+            assert variant in variants, (top_k, top_p, grammar_output, variant)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])

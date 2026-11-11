@@ -138,6 +138,10 @@ from vllm_torchtpu.layers.adapter.sample.rejection_sampler import RejectionSampl
 from vllm_torchtpu.layers.adapter.sample.top_k_top_p import (
     CANDIDATE_BLOCK,
     apply_top_k_top_p,
+    random_sampler_variants,
+    select_topk_candidates,
+    should_apply_top_k_top_p,
+    topk_candidate_blocks,
 )
 from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadata,
@@ -6832,12 +6836,17 @@ class TPUModelRunner(GPUModelRunner):
                 dummy_top_p = torch.ones((num_reqs, 1), dtype=torch.float32).to(
                     self.device
                 )
-                # (all_greedy, topk_candidates, apply_topk_topp): the random
-                # path has a no-top-k/top-p graph next to the full one
-                # (_sampler_applies_topk_topp).
-                variants = [(False, 0, True), (False, 0, False), (True, 0, True)]
-                if blocks := self._topk_candidate_blocks():
-                    variants.append((False, blocks, True))
+                # (all_greedy, topk_candidates, apply_topk_topp): each graph the
+                # random path picks from (random_sampler_variants; per step,
+                # _sampler_topk_candidates and _sampler_applies_topk_topp
+                # choose), then the all-greedy one (_greedy_sample).
+                variants = [
+                    (False, *variant)
+                    for variant in random_sampler_variants(
+                        self._topk_candidate_blocks()
+                    )
+                ]
+                variants.append((True, 0, True))
                 for all_greedy, topk_candidates, apply_topk_topp in variants:
                     out = self.sample_from_logits_func(
                         dummy_logits,
@@ -7067,41 +7076,11 @@ class TPUModelRunner(GPUModelRunner):
                     (num_tokens, self.vocab_size),
                     dtype=torch.float32,
                 ).to(self.device)
-                out = self.rejection_sampler(
-                    draft_token_ids=draft_token_ids,
-                    num_draft_tokens=draft_lengths,
-                    target_logits=target_logits_ng,
-                    bonus_token_ids=bonus_token_ids,
-                    segment_ids=segment_ids,
-                    group_indices=group_indices,
-                    max_draft_tokens=k,
-                    temperatures=warm_temps,
-                    top_k=warm_top_k,
-                    top_p=warm_top_p,
-                    accept_u=warm_accept_u,
-                    recover_u=warm_recover_u,
-                    do_sampling=True,
-                )
-                synchronize_tensors(out)
-                # Same path without top-k/top-p (no request sets them).
-                out = self.rejection_sampler(
-                    draft_token_ids=draft_token_ids,
-                    num_draft_tokens=draft_lengths,
-                    target_logits=target_logits_ng,
-                    bonus_token_ids=bonus_token_ids,
-                    segment_ids=segment_ids,
-                    group_indices=group_indices,
-                    max_draft_tokens=k,
-                    temperatures=warm_temps,
-                    top_k=warm_top_k,
-                    top_p=warm_top_p,
-                    accept_u=warm_accept_u,
-                    recover_u=warm_recover_u,
-                    do_sampling=True,
-                    apply_topk_topp=False,
-                )
-                synchronize_tensors(out)
-                if blocks := self._topk_candidate_blocks():
+                # Each graph the random path picks from, as in
+                # _precompile_sample_from_logits.
+                for topk_candidates, apply_topk_topp in random_sampler_variants(
+                    self._topk_candidate_blocks()
+                ):
                     out = self.rejection_sampler(
                         draft_token_ids=draft_token_ids,
                         num_draft_tokens=draft_lengths,
@@ -7116,7 +7095,8 @@ class TPUModelRunner(GPUModelRunner):
                         accept_u=warm_accept_u,
                         recover_u=warm_recover_u,
                         do_sampling=True,
-                        topk_candidates=blocks,
+                        topk_candidates=topk_candidates,
+                        apply_topk_topp=apply_topk_topp,
                     )
                     synchronize_tensors(out)
                 logger.info(
@@ -8823,24 +8803,15 @@ class TPUModelRunner(GPUModelRunner):
         )
 
     def _topk_candidate_blocks(self) -> int:
-        """Returns TPU_SAMPLER_TOPK_CANDIDATES if the vocab allows it, else 0."""
-        num_blocks = envs.TPU_SAMPLER_TOPK_CANDIDATES
-        if (
-            num_blocks <= 0
-            or self.vocab_size % CANDIDATE_BLOCK != 0
-            or num_blocks > self.vocab_size // CANDIDATE_BLOCK
-        ):
-            return 0
-        return num_blocks
+        """`topk_candidate_blocks` for TPU_SAMPLER_TOPK_CANDIDATES and this
+        model's vocabulary."""
+        return topk_candidate_blocks(envs.TPU_SAMPLER_TOPK_CANDIDATES, self.vocab_size)
 
     def _sampler_applies_topk_topp(self) -> bool:
-        """False when no running request sets top-k or top-p.
-
-        Skipping `apply_top_k_top_p` is then bit-exact: every row reaches the
-        sampler with top_k == 0 and top_p == 1.0, where its `torch.where`
-        calls return the unmasked logits unchanged.
-        """
-        return not (self.input_batch.no_top_k and self.input_batch.no_top_p)
+        """`should_apply_top_k_top_p` for the running requests."""
+        return should_apply_top_k_top_p(
+            self.input_batch.no_top_k, self.input_batch.no_top_p
+        )
 
     def _sampler_topk_candidates(
         self,
@@ -8848,22 +8819,18 @@ class TPUModelRunner(GPUModelRunner):
         cur_end_idx: int,
         grammar_output: object | None,
     ) -> int:
-        """Returns candidate blocks for this chunk's top-k sampling, or 0.
-
-        Candidates match the full-vocab result only when every active request
-        keeps 1 <= top_k <= num_blocks // 2 and no grammar mask applies.
-        """
-        num_blocks = self._topk_candidate_blocks()
-        if num_blocks == 0 or grammar_output is not None:
-            return 0
-        top_k = self.input_batch.top_k_cpu_tensor[cur_start_idx:cur_end_idx]
-        if not bool(((top_k >= 1) & (top_k <= num_blocks // 2)).all()):
-            return 0
-        logger.info_once(
-            "Sampler top-k filters vocab to %d candidate blocks of %d logits.",
-            num_blocks,
-            CANDIDATE_BLOCK,
+        """`select_topk_candidates` for this chunk's requests."""
+        num_blocks = select_topk_candidates(
+            self.input_batch.top_k_cpu_tensor[cur_start_idx:cur_end_idx],
+            self._topk_candidate_blocks(),
+            grammar_output is not None,
         )
+        if num_blocks:
+            logger.info_once(
+                "Sampler top-k filters vocab to %d candidate blocks of %d logits.",
+                num_blocks,
+                CANDIDATE_BLOCK,
+            )
         return num_blocks
 
     def _dp_vocab_logits_rows(self) -> int:
