@@ -21,8 +21,9 @@ before they are recorded. These tests pin the decision and the geometry
 configs of each layout, over KV cache configs planned as vLLM plans them.
 """
 
+from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -41,6 +42,7 @@ from vllm.v1.kv_cache_interface import (
 from tests.offload.test_offloading_config_build_patch import (
     _kv_cache_config as _qwen_hybrid_kv_cache_config,
 )
+from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
 from vllm_torchtpu.offload import raiden_store
 
 NUM_BLOCKS = 4
@@ -247,18 +249,35 @@ _MULTI_SHAPES_LAYOUTS = (
 # `resolve_kernel_geometry` on each multi-shape layout:
 # layout -> (worker config's geometry, flattened scheduler config's geometry).
 # The geometry is (kernel block, per-block shapes, KV dtypes, device block).
-# The MiniMax M3 workers fail: their DSpark drafter K/V leaves are
-# FullAttentionSpec, which the per-array path does not register yet (#3137).
-# The scheduler's config keeps one leaf per group, so its shape set is the
-# first leaf's (#3688 makes it cover every leaf).
+# A full-attention leaf (the MiniMax M3 DSpark drafter's K/V layers, one fp8
+# KV head of 128) adds its backend page, K/V padded from two rows to four,
+# and its page bytes; it comes from the recorded specs, so the scheduler
+# sees it too. The scheduler's config keeps one MLA leaf per group, so its
+# MLA shapes are the first leaf's (#3688 makes them cover every leaf).
+_DRAFTER = (128, 1, 4, 128, 32768)
 _EXPECTED_GEOMETRY = {
     "minimax_m3_int4": (
-        AssertionError,
-        (128, {(128, 1, 512)}, {torch.uint8}, 128),
+        (
+            128,
+            {(128, 1, 512), (128, 1, 68), (128, 1, 8), _DRAFTER},
+            {torch.uint8, torch.float32, torch.float8_e4m3fn},
+            128,
+        ),
+        (
+            128,
+            {(128, 1, 512), _DRAFTER},
+            {torch.uint8, torch.float8_e4m3fn},
+            128,
+        ),
     ),
     "minimax_m3_fp8": (
-        AssertionError,
-        (128, {(128, 1, 1024)}, {torch.float8_e4m3fn}, 128),
+        (
+            128,
+            {(128, 1, 1024), (128, 1, 128), _DRAFTER},
+            {torch.float8_e4m3fn},
+            128,
+        ),
+        (128, {(128, 1, 1024), _DRAFTER}, {torch.float8_e4m3fn}, 128),
     ),
     "deepseek_v4": (
         (256, {(64, 1, 584), (64, 1, 132), (2, 1, 1024)}, {torch.uint8}, 256),
@@ -317,12 +336,16 @@ def test_geometry_on_worker_and_flattened_scheduler_config(layout):
     worker = _LAYOUTS[layout]
     scheduler = generate_scheduler_kv_cache_config([worker])
     raiden_store.record_all_ranks_leaf_kv_cache_specs([worker] * 8)
-    for config, expected in zip(
-        (worker, scheduler), _EXPECTED_GEOMETRY[layout], strict=True
+    with (
+        # The TPU full-attention backend, as the drafter's layers select it.
+        patch(
+            "vllm.v1.attention.selector.get_attn_backend",
+            return_value=PallasAttentionBackend,
+        ),
+        patch("vllm.config.set_current_vllm_config", return_value=nullcontext()),
     ):
-        if isinstance(expected, type):
-            with pytest.raises(expected):
-                raiden_store.resolve_kernel_geometry(SimpleNamespace(), config)
-        else:
-            geometry = raiden_store.resolve_kernel_geometry(SimpleNamespace(), config)
-            assert geometry == expected
+        worker_geometry = raiden_store.resolve_kernel_geometry(MagicMock(), worker)
+        scheduler_geometry = raiden_store.resolve_kernel_geometry(
+            MagicMock(), scheduler
+        )
+    assert (worker_geometry, scheduler_geometry) == _EXPECTED_GEOMETRY[layout]
