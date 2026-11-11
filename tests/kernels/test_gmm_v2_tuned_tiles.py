@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""TPU_GMM_V2_TUNED_TILES tile choice at the MoE shapes (CPU, tpu7x info)."""
+"""moe_gmm_tuned_tiles tile choice at the MoE shapes (CPU, tpu7x info)."""
 
 from types import SimpleNamespace
 
@@ -19,7 +19,6 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.megablox import gmm_v2 as G
 
 H, I, E = 6144, 3072, 16
@@ -46,12 +45,14 @@ def tpu7x(monkeypatch):
     )
     path = G.skinny_gmm_path()
     G.set_skinny_gmm_path("fp8_feed_wide")
+    tuned = G.tuned_tiles_enabled()
     yield
     G.set_skinny_gmm_path(path)
+    G.set_tuned_tiles(tuned)
 
 
 def _tiles(size_m, tuned, monkeypatch):
-    monkeypatch.setattr(envs, "TPU_GMM_V2_TUNED_TILES", tuned, raising=False)
+    G.set_tuned_tiles(tuned)
     sds = jax.ShapeDtypeStruct
     lhs = sds((size_m, H), jnp.bfloat16)
     w13 = sds((E, H, 2 * I), jnp.float4_e2m1fn)
@@ -114,3 +115,38 @@ def test_other_skinny_paths_untouched(tpu7x, monkeypatch, path):
     G.set_skinny_gmm_path(path)
     for size_m in (128, 1024, 8192):
         assert _tiles(size_m, True, monkeypatch) == _tiles(size_m, False, monkeypatch)
+
+
+# What TPU_GMM_V2_TUNED_TILES=1 (the env switch this key replaced) chose, per
+# size_m: (gate_up tile_m, bucket_base, tile_n, depth), down unchanged
+# except the prefill bucket_base.
+ENV_SWITCH_TILES = {
+    32: ((32, 16, 1536, 2), (32, 16, 6144, 3)),
+    192: ((32, 16, 1536, 2), (32, 16, 6144, 3)),
+    1024: ((32, 16, 3072, 2), (32, 16, 6144, 3)),
+    2048: ((32, 16, 3072, 2), (32, 16, 6144, 3)),
+    4096: ((256, 128, 1536, 3), (256, 128, 6144, 3)),
+    8192: ((256, 128, 1536, 3), (256, 128, 6144, 3)),
+    32768: ((256, 128, 1536, 3), (256, 128, 6144, 3)),
+}
+
+
+@pytest.mark.parametrize("size_m", sorted(ENV_SWITCH_TILES))
+def test_key_reproduces_env_switch(tpu7x, monkeypatch, size_m):
+    t1, t2 = _tiles(size_m, True, monkeypatch)
+    got = tuple(
+        (t.tile_m, t.bucket_base, t.tile_n, t.rhs_buffer_count) for t in (t1, t2)
+    )
+    assert got == ENV_SWITCH_TILES[size_m]
+
+
+def test_additional_config_key():
+    assert G.TUNED_TILES_KEY == "moe_gmm_tuned_tiles"
+    before = G.tuned_tiles_enabled()
+    try:
+        G.set_tuned_tiles(True)
+        assert G.tuned_tiles_enabled() is True
+        G.set_tuned_tiles(False)
+        assert G.tuned_tiles_enabled() is False
+    finally:
+        G.set_tuned_tiles(before)

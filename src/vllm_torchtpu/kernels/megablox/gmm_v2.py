@@ -25,7 +25,6 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -204,6 +203,23 @@ def set_skinny_gmm_path(path: str) -> None:
 
 def skinny_gmm_path() -> str:
     return _skinny_gmm_path
+
+
+# Tiles measured for fp4 (block-128) MoE weights with bf16 activations on the
+# fp8_feed_wide path (`tuned_tiles`). Set with
+# --additional-config '{"moe_gmm_tuned_tiles": true}' (`set_tuned_tiles`),
+# before the model's first trace.
+TUNED_TILES_KEY = "moe_gmm_tuned_tiles"
+_tuned_tiles = False
+
+
+def set_tuned_tiles(enabled: bool) -> None:
+    global _tuned_tiles
+    _tuned_tiles = bool(enabled)
+
+
+def tuned_tiles_enabled() -> bool:
+    return _tuned_tiles
 
 
 # Define data classes.
@@ -1422,7 +1438,7 @@ def calculate_tiling(
         bucket_base=bucket_base,
         buckets=buckets,
     )
-    if envs.TPU_GMM_V2_TUNED_TILES:
+    if _tuned_tiles:
         tiles = tuned_tiles(
             tiles, dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, fuse_act
         )
@@ -1449,7 +1465,7 @@ def tuned_tiles(
     vmem_limit_bytes: int,
     fuse_act: str | None,
 ) -> TileSizes:
-    """TPU_GMM_V2_TUNED_TILES: retile fp4-rhs, bf16-lhs calls.
+    """moe_gmm_tuned_tiles: retile fp4-rhs, bf16-lhs calls.
 
     Only the pipeline depth, tile_n and the bucket sizes change. tile_k stays
     whole and a row's MXU feed (fp8 at <= FP8_RHS_MAX_BUCKET_M rows, else bf16
@@ -1495,7 +1511,7 @@ def tuned_tiles(
     else:
         return tiles
     logger.info_once(
-        "TPU_GMM_V2_TUNED_TILES=1: gmm_v2 retiled (first: size_m %d, %s -> %s)",
+        "moe_gmm_tuned_tiles: gmm_v2 retiled (first: size_m %d, %s -> %s)",
         dims.size_m,
         tiles,
         new,

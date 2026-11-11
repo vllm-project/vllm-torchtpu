@@ -5908,6 +5908,11 @@ class TPUModelRunner(GPUModelRunner):
                 "MoE gmm_v2 fp8 decode tiles on (additional_config "
                 "moe_gmm_fp8_decode_tiles)"
             )
+        if isinstance(additional, dict) and "moe_gmm_tuned_tiles" in additional:
+            from vllm_torchtpu.kernels.megablox import gmm_v2
+
+            gmm_v2.set_tuned_tiles(additional["moe_gmm_tuned_tiles"])
+            logger.info("MoE gmm tuned tiles: %s", gmm_v2.tuned_tiles_enabled())
         if isinstance(additional, dict) and "msa_index_int4_fp8" in additional:
             from vllm_torchtpu.models.minimax_m3.kernels import msa_indexer
 
