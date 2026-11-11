@@ -139,3 +139,17 @@ def test_gate_arms_turn_the_base_points_trade_offs_off_and_on(path):
     for key in on_in_base:
         assert off.get(key) is False, f"tradeoffs_off leaves {key} on"
         assert on.get(key) is True, f"tradeoffs_on does not keep {key} on"
+
+
+@pytest.mark.parametrize("path", GATES, ids=lambda p: p.stem)
+def test_gate_arms_switch_the_fp8_target_lm_head(path):
+    """The point legs quantize the target LM head, and an arm's
+    additional_config merges over them, so the off arm sets it off again."""
+    arms = _load(path)["arms"]
+
+    def quantized(arm):
+        section = arms[arm]["additional_config"].get(settings.SECTION, {})
+        return section.get("quantize_target_lm_head")
+
+    assert quantized("tradeoffs_on") is True
+    assert quantized("tradeoffs_off") is False
