@@ -19,6 +19,8 @@ candidates are stacked as the all-gather would, each attends, and the partials
 are merged by log-sum-exp as `ops.msa.merge_head_partials` does.
 """
 
+import os
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -32,6 +34,9 @@ BLOCK = 128
 DCP = 2
 TOPK = 16
 Q_HEADS = 16  # the DCP group's query heads of its one KV head
+# Compiled Pallas on a TPU (real step sizes) instead of interpret mode on CPU.
+ON_TPU = os.environ.get("MSA_SPLIT_TEST_TPU") == "1"
+INTERPRET = not ON_TPU
 
 
 def _forward(caches, step, *, num_reqs, dtype):
@@ -44,7 +49,7 @@ def _forward(caches, step, *, num_reqs, dtype):
         kv, idx, cand = msa_dcp.msa_write_and_candidates_dcp(
             k, v, iq, ik, kv, idx, seq_lens, block_tables, qsl, dist,
             topk=TOPK, init_blocks=0, local_blocks=1, rank=r, dcp=DCP,
-            interpret=True,
+            interpret=INTERPRET,
         )
         new_caches.append((kv, idx))
         cands.append(cand)
@@ -53,7 +58,7 @@ def _forward(caches, step, *, num_reqs, dtype):
     for r in range(DCP):
         out, lse = msa_dcp.msa_attend_dcp(
             q, new_caches[r][0], cands, seq_lens, block_tables, qsl,
-            sm_scale=D**-0.5, topk=TOPK, rank=r, dcp=DCP, interpret=True,
+            sm_scale=D**-0.5, topk=TOPK, rank=r, dcp=DCP, interpret=INTERPRET,
         )
         outs.append(out.astype(jnp.float32))
         lses.append(lse.astype(jnp.float32))
@@ -64,48 +69,69 @@ def _forward(caches, step, *, num_reqs, dtype):
     return merged.transpose(1, 0, 2), new_caches
 
 
-def _case(dtype, q_lens, ctx_lens, num_pages=128, seed=0):
+def _case(dtype, q_lens, ctx_lens, max_seqs=8, seed=0, pad=0):
     rng = np.random.default_rng(seed)
-    t = sum(q_lens)
-    max_seqs = 8
-    pages_per_seq = 32  # logical DCP blocks of DCP * BLOCK tokens: 8192 tokens
+    t_real = sum(q_lens)
+    t = t_real + pad  # padded bucket rows, as the runner sends them
+    blocks = [-(-(c + q) // (DCP * BLOCK)) for c, q in zip(ctx_lens, q_lens)]
+    pages_per_seq = max(16, -(-max(blocks) // 16) * 16)
+    num_pages = sum(blocks) + 8
     seq_lens = np.zeros(max_seqs, np.int32)
-    qsl = np.full(max_seqs + 1, t, np.int32)
+    qsl = np.full(max_seqs + 1, t_real, np.int32)  # tail filled with the last value
     qsl[0] = 0
     for i, (ql, cl) in enumerate(zip(q_lens, ctx_lens)):
         seq_lens[i] = cl + ql
         qsl[i + 1] = qsl[i] + ql
-    assert max(c + q for c, q in zip(ctx_lens, q_lens)) <= pages_per_seq * DCP * BLOCK
-    # Distinct pages within each request (requests may share; each only
-    # touches its own rows).
-    block_tables = np.concatenate(
-        [rng.permutation(num_pages)[:pages_per_seq] for _ in range(max_seqs)]
-    ).astype(np.int32)
+    # Every request its own pages; unused entries point at a spare page.
+    perm = rng.permutation(num_pages)
+    block_tables = np.full((max_seqs, pages_per_seq), perm[-1], np.int32)
+    used = 0
+    for i, b in enumerate(blocks):
+        block_tables[i, :b] = perm[used : used + b]
+        used += b
+    block_tables = block_tables.reshape(-1)
     packing = 32 // (8 * jnp.dtype(dtype).itemsize)
 
     def cache(width):
-        x = rng.standard_normal((num_pages, BLOCK // packing, packing, width))
+        x = rng.standard_normal((num_pages, BLOCK // packing, packing, width), np.float32)
         return jnp.asarray(x * 0.5, dtype)
 
     caches = [(cache(2 * D), cache(D)) for _ in range(DCP)]
-    f = lambda *s: jnp.asarray(rng.standard_normal(s) * 0.5, jnp.bfloat16)  # noqa: E731
+    f = lambda *s: jnp.asarray(rng.standard_normal(s, np.float32) * 0.5, jnp.bfloat16)  # noqa: E731
     step = (f(t, Q_HEADS, D), f(t, 1, D), f(t, 1, D), f(t, 1, D), f(t, D),
             jnp.asarray(seq_lens), jnp.asarray(block_tables), jnp.asarray(qsl))
     return caches, step, len(q_lens)
 
 
+# (q_lens, ctx_lens, max_seqs[, padding rows])
+CASES = [
+    # decode-sized rows, a chunk straddling the split, a fresh prompt
+    ([8, 760, 512], [3000, 2500, 0], 8),
+    # one long chunk over a long context (the usual 8K split step)
+    ([1024], [5000], 8),
+    # padded bucket: verify windows + a chunk, 324 padding rows after the real tokens
+    ([8, 8, 684], [3000, 2600, 4000], 8, 324),
+]
+if ON_TPU:
+    CASES += [
+        # served shapes (max_num_seqs 32): 8192-token step, 30 verify windows of
+        # 8 rows beside a 7952-token chunk over a long context
+        ([8] * 30 + [7952], [20000 + 1000 * i for i in range(30)] + [100000], 32),
+        # 4096-token step: halves of 2048 take the decode-sized scoring path
+        ([8] * 8 + [4032], [30000] * 8 + [60000], 32),
+        # one 8192-token chunk over 120K
+        ([8192], [120000], 32),
+        # two prompts side by side, the split inside the second
+        ([3000, 5192], [0, 40000], 32),
+    ]
+
+
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float8_e4m3fn])
-@pytest.mark.parametrize(
-    "q_lens,ctx_lens",
-    [
-        # decode-sized rows, a chunk straddling the split, a fresh prompt
-        ([8, 760, 512], [3000, 2500, 0]),
-        # one long chunk over a long context (the usual 8K split step)
-        ([1024], [5000]),
-    ],
-)
-def test_halves_equal_whole(dtype, q_lens, ctx_lens):
-    caches, step, n = _case(dtype, q_lens, ctx_lens)
+@pytest.mark.parametrize("case", CASES)
+def test_halves_equal_whole(dtype, case):
+    q_lens, ctx_lens, max_seqs, *pad = case
+    caches, step, n = _case(dtype, q_lens, ctx_lens, max_seqs, pad=pad[0] if pad else 0)
+    t_real = sum(q_lens)
     whole, whole_caches = _forward(caches, step, num_reqs=n, dtype=dtype)
 
     q, k, v, iq, ik, seq_lens, block_tables, qsl = step
@@ -121,7 +147,7 @@ def test_halves_equal_whole(dtype, q_lens, ctx_lens):
     for (wk, wi), (hk, hi) in zip(whole_caches, half_caches):
         np.testing.assert_array_equal(np.asarray(wk, np.float32), np.asarray(hk, np.float32))
         np.testing.assert_array_equal(np.asarray(wi, np.float32), np.asarray(hi, np.float32))
-    err = np.abs(np.asarray(halves) - np.asarray(whole))
+    err = np.abs(np.asarray(halves)[:t_real] - np.asarray(whole)[:t_real])
     rows = np.where(err.max(axis=(1, 2)) > 2e-2)[0]
     assert rows.size == 0, (
         f"{rows.size}/{t} rows differ (first {rows[:8]}, max {err.max():.3g}); "
