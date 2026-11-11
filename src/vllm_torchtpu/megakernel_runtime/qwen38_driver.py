@@ -2232,7 +2232,15 @@ class Qwen38SegmentDriver:
 
     def _note(self, key: str) -> None:
         self.stats[key] = self.stats.get(key, 0) + 1
-        n = sum(self.stats.values())
+        if envs.VLLM_TPU_MK_TRYFWD_LEAN:
+            # Running total: `stats` is only written here, so this equals
+            # sum(stats.values()). Re-seeded from the dict whenever it is unset.
+            n = self.__dict__.get("_note_n")
+            n = sum(self.stats.values()) if n is None else n + 1
+            self._note_n = n
+        else:
+            self._note_n = None
+            n = sum(self.stats.values())
         # Powers of two early, then every STEP_MIX_EVERY steps, so the mix can be joined
         # in
         # time to the serving metrics (AL windows) over a whole run.
@@ -2298,11 +2306,14 @@ class Qwen38SegmentDriver:
         if rows not in self.buckets or n_req * T_VERIFY > rows:
             self._note(f"stock_rows{rows}_n{n_req}")
             return False, None
-        if (
-            self.whole_program is not None
-            and self.whole_above == "stock"
-            and not self._whole_eligible(runner, n_req, rows)
-        ):
+        lean = envs.VLLM_TPU_MK_TRYFWD_LEAN
+        # VLLM_TPU_MK_TRYFWD_LEAN: the eligibility of this step, computed at most once
+        # (None = not computed yet). Nothing between here and the call changes its
+        # inputs (rows, n_req, the runner's host token counts).
+        eligible: bool | None = None
+        if self.whole_program is not None and self.whole_above == "stock":
+            eligible = self._whole_eligible(runner, n_req, rows)
+        if eligible is False:
             # Above `wholerows` or past `wholecap`: stock, not the segment program,
             # which only
             # compiles (all its buckets, mid-serving) on its first call (w05 j-84f89805:
@@ -2381,7 +2392,14 @@ class Qwen38SegmentDriver:
         if first_warm:
             self._tp_barrier("before the first (compiling) call")
         try:
-            check_real = bool(getattr(runner, "warmup_done", False)) and _real_traffic(kw, runner, n_req)
+            if lean:
+                # The real-traffic gate only matters to the shadow check below.
+                check_real = False
+                if self.check_left > 0 and self.shadow is not None:
+                    warm = bool(getattr(runner, "warmup_done", False))
+                    check_real = warm and _real_traffic(kw, runner, n_req)
+            else:
+                check_real = bool(getattr(runner, "warmup_done", False)) and _real_traffic(kw, runner, n_req)
             if (
                 self.check_left > 0
                 and self.shadow is not None
@@ -2405,7 +2423,11 @@ class Qwen38SegmentDriver:
                 self.wholecheck_warm.add(rows)
                 self._note(f"wholecheck_b{rows}" if real else f"wholecheck_warm_b{rows}")
                 out = self._whole_shadow_step(runner, input_ids, positions, kw, rows, real, n_req)
-            elif self._whole_eligible(runner, n_req, rows):
+            elif (
+                eligible
+                if lean and eligible is not None
+                else self._whole_eligible(runner, n_req, rows)
+            ):
                 self.whole_calls += 1
                 self._count("drafts_whole", n_req * (T_VERIFY - 1))
                 self._note(f"whole_b{rows}")
