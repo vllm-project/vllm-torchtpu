@@ -29,6 +29,7 @@ groups are lane-aligned either way and come out token-major.
 """
 
 import functools
+import os
 from collections.abc import Callable
 from typing import NamedTuple
 
@@ -37,6 +38,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.minimax_m3.kernels import msa_fp4
 from vllm_torchtpu.models.minimax_m3.kernels.packed_page import (
     check_page_dtype,
@@ -70,6 +72,29 @@ _SEQ_MASK = (1 << _ROW_SHIFT) - 1
 # f32 query rows are read at element offsets that are multiples of the sublane tile.
 _ROW_ALIGN = 8
 _GROUP_MASK = (1 << _TILE_SHIFT) - 1
+
+logger = init_logger(__name__)
+
+# TPU_MINIMAX_M3_INDEXER_V2=1: kernel v3 scores with fp8 queries as well as
+# fp8 keys, so the MXU runs fp8 x fp8 (twice the bf16 rate) instead of
+# widening the keys to bf16. Each query row is scaled so its largest |q| is
+# _FP8_Q_MAX before the cast, and its maxima are scaled back: a positive
+# per-row scale keeps the order of the row's page scores, and the scaled-back
+# scores stay comparable across rows and heads (`merge_head_candidates`).
+# Not bit-identical to the bf16 queries: the query rounds to 3 mantissa bits.
+INDEXER_V2_ENV = "TPU_MINIMAX_M3_INDEXER_V2"
+_FP8_Q_MAX = 256.0
+
+
+def fp8_queries_enabled() -> bool:
+    return os.environ.get(INDEXER_V2_ENV, "0") == "1"
+
+
+if fp8_queries_enabled():
+    logger.info(
+        "%s=1: MSA indexer prefill block scores use fp8 queries (fp8 x fp8 MXU).",
+        INDEXER_V2_ENV,
+    )
 
 
 def _kernel_v1(
@@ -246,14 +271,16 @@ def _paired_query(q: jax.Array) -> jax.Array:
     )
 
 
-def _chunk_maxima(q_pair, page_keys, num_pages) -> jax.Array:
+def _chunk_maxima(q_pair, page_keys, num_pages, scale_cols=None) -> jax.Array:
     """``[num_pages, Bq]`` block maxima of `num_pages` pages against a query
     tile given as `_paired_query`.
 
     Pages ``j`` and ``h + j`` (``h = num_pages / 2``) share one MXU row,
     ``[k_j | k_h+j] @ q_pair^T``: both are scored with one contraction of
     ``2 D``, the MXU depth at D = 128. `page_keys(j)` is page ``j``'s bf16
-    ``[S, D]`` keys.
+    ``[S, D]`` keys (or fp8 keys with an fp8 `q_pair`). `scale_cols`
+    (``[S, num_pages]`` f32, unscaled 4-bit keys) scales each key's score
+    after the dot.
     """
     half = num_pages // 2
     block_q = q_pair.shape[0] // 2
@@ -268,6 +295,13 @@ def _chunk_maxima(q_pair, page_keys, num_pages) -> jax.Array:
         (((1,), (1,)), ((), ())),
         preferred_element_type=jnp.float32,
     )  # [half * S, 2 Bq]
+    if scale_cols is not None:
+        left, right = (
+            jnp.concatenate([scale_cols[:, p : p + 1] for p in pages], axis=0)
+            for pages in (range(half), range(half, num_pages))
+        )  # [half * S, 1] each: page j's and page half + j's token scales
+        col = jax.lax.broadcasted_iota(jnp.int32, s.shape, 1)
+        s = s * jnp.where(col < block_q, left, right)
     m = jnp.max(s.reshape(half, page_size, 2 * block_q), axis=1)
     return jnp.concatenate([m[:, :block_q], m[:, block_q:]], axis=0)
 
@@ -360,6 +394,7 @@ def _kernel_v3(
     sems,  # DMA semaphores [R], one per ring slot
     *,
     transposed=False,
+    fp8_q=False,
 ):
     """`_kernel_v2` with the pages fetched by a hand-written DMA ring of
     `_RING_SLOTS` groups: one scalar address per page and no copy for pages
@@ -444,7 +479,15 @@ def _kernel_v3(
 
     base, live = group(step)
     next_base, next_live = ahead_group(step + ahead)
-    q_pair = _paired_query(q_ref[...].astype(jnp.bfloat16))
+    if fp8_q:
+        q = q_ref[...].astype(jnp.float32)
+        amax = jnp.max(jnp.abs(q), axis=1, keepdims=True)  # [Bq, 1]
+        amax = jnp.where(amax > 0, amax, 1.0)
+        q_pair = _paired_query((q * (_FP8_Q_MAX / amax)).astype(jnp.float8_e4m3fn))
+        row_scale = amax * (1.0 / _FP8_Q_MAX)  # [Bq, 1]
+    else:
+        q_pair = _paired_query(q_ref[...].astype(jnp.bfloat16))
+        row_scale = None
     num_chunks = pages_per_step // chunk
     # The ahead group's descriptors, spread over the first chunks' page pairs
     # (in one chunk they crowd its scalar slots, in all chunks they issue
@@ -476,6 +519,8 @@ def _kernel_v3(
                 dtype=cache_ref.dtype,
                 folded=folded,
             )  # [Bq, chunk]
+            if row_scale is not None:
+                m = m * row_scale
             if transposed:
                 o_ref[:, pl.ds(first, chunk)] = m
             else:
@@ -496,20 +541,29 @@ def _kernel_v3(
             page = first + jax.lax.broadcasted_iota(jnp.int32, scale_rows.shape, 0)
             scale_cols = jnp.where(
                 jnp.isfinite(scale_rows) & (page < live), scale_rows, 0.0
-            ).T.astype(jnp.bfloat16)  # [S, chunk]
+            ).T  # [S, chunk]
+            if not fp8_q:
+                scale_cols = scale_cols.astype(jnp.bfloat16)
 
         def page_keys(j):
             issue(j)
             if folded:
                 k = pltpu.bitcast(buf[slot, first + j, : rows - 1], jnp.int4)
+                if fp8_q:  # exact (|k| <= 8); scaled after the dot
+                    return k.astype(jnp.float8_e4m3fn)
                 return k.astype(jnp.bfloat16) * scale_cols[:, j : j + 1]
             # A page past the request's end was never copied: its stale words
             # may be NaN or inf, which would reach its pair's score through
             # the zero half of q_pair.
             w = jnp.where(first + j < live, buf[slot, first + j], 0)
-            return pltpu.bitcast(w, cache_ref.dtype).astype(jnp.bfloat16)
+            k = pltpu.bitcast(w, cache_ref.dtype)
+            return k if fp8_q else k.astype(jnp.bfloat16)
 
-        m = _chunk_maxima(q_pair, page_keys, chunk)
+        m = _chunk_maxima(
+            q_pair, page_keys, chunk, scale_cols if folded and fp8_q else None
+        )
+        if row_scale is not None:
+            m = m * row_scale.T
         if transposed:
             o_ref[:, pl.ds(first, chunk)] = m.T
         else:
@@ -614,6 +668,7 @@ def _class_scores(
     scale_cache=None,
     scale_row=None,
     q_pad=None,
+    fp8_q=False,
 ):
     """Transposed scores ``[P, tiles * block_q]`` of one tile class, and the
     column of each token (`ClassScores`); `token_major` (kernel v3) returns
@@ -741,7 +796,12 @@ def _class_scores(
                 f"got {pages_per_step}"
             )
         scores_t = pl.pallas_call(
-            functools.partial(_kernel_v3, transposed=token_major),
+            functools.partial(
+                _kernel_v3,
+                transposed=token_major,
+                # fp8 x fp8 only for fp8 / 4-bit pages (keys exact in fp8).
+                fp8_q=fp8_q and index_cache.dtype in (jnp.float8_e4m3fn, jnp.uint8),
+            ),
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=4,
                 grid=grid_spec.grid,
@@ -834,6 +894,7 @@ def class_plan(
     scale_row: int | None = None,
     transposed_tile_q: int = _SMALL_TILE_Q_TRANSPOSED,
     interpret: bool = False,
+    fp8_q: bool = False,
 ) -> _ClassPlan:
     """`block_scores`' tile classes, unscored (arguments as `block_scores`)."""
     num_tokens, num_heads, _ = index_q.shape
@@ -923,6 +984,9 @@ def class_plan(
         + 1,
         pages_per_step=pages_per_step,
         kernel=large_kernel,
+        # fp8 queries on the prefill tiles only: the decode tiles are bound by
+        # the key stream into the MXU, not its rate, and gain nothing.
+        fp8_q=fp8_q,
     )
     pages_per_seq = block_tables.shape[0] // max_num_seqs
     return _ClassPlan(
@@ -949,6 +1013,7 @@ def class_plan(
         "scale_row",
         "transposed_tile_q",
         "interpret",
+        "fp8_q",
     ),
 )
 def block_scores(
@@ -969,6 +1034,7 @@ def block_scores(
     scale_row: int | None = None,
     transposed_tile_q: int = _SMALL_TILE_Q_TRANSPOSED,
     interpret: bool = False,
+    fp8_q: bool | None = None,
 ) -> jax.Array:
     """Block-max index scores ``[T, 1, P]`` (``P`` padded to the page group).
 
@@ -992,6 +1058,8 @@ def block_scores(
         scales (`msa_fp4.scales_in_page`),
         the ``[pages, 8, 128]`` f32 scale cache and the row of the index-key
         scales. `index_q` must then be rotated (`msa_fp4.rotate_queries`).
+      fp8_q: kernel v3 scores fp8 / 4-bit pages with fp8 queries
+        (`INDEXER_V2_ENV`); None reads the env at trace time.
     Pages past a token's own page hold scores of keys it must not see, and
     pages past its request's last page are not written; callers mask both.
     """
@@ -1012,6 +1080,7 @@ def block_scores(
         scale_row=scale_row,
         transposed_tile_q=transposed_tile_q,
         interpret=interpret,
+        fp8_q=fp8_queries_enabled() if fp8_q is None else fp8_q,
     )
     num_tokens = index_q.shape[0]
     max_num_seqs = seq_lens.shape[0]
