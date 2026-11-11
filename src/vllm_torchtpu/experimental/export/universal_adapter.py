@@ -85,27 +85,29 @@ def make_attention_metadata(
     )
 
 
-def _model_config_value(model_cfg: Any, accessor: str) -> Any:
-    """Calls `model_cfg.<accessor>()` if vLLM's ModelConfig provides it."""
-    fn = getattr(model_cfg, accessor, None)
-    return fn() if callable(fn) else None
+# KV blocks of an export that neither vLLM's memory profiling nor the user sized.
+_UNPROFILED_NUM_BLOCKS = 512
 
 
-def _extract_hf_field(hf_config: Any, *keys: str, default: Any = None) -> Any:
-    """Reads the first present attribute or dict entry from `hf_config`."""
-    if hf_config is None:
-        return default
-    text_cfg = getattr(hf_config, "text_config", None)
-    for target in (hf_config, text_cfg):
-        if target is None:
-            continue
-        for k in keys:
-            if isinstance(target, dict) and k in target and target[k] is not None:
-                return target[k]
-            val = getattr(target, k, None)
-            if val is not None:
-                return val
-    return default
+def _eos_token_id(model_cfg: Any) -> int:
+    """The first EOS token id the checkpoint's config.json declares.
+
+    Falls back to generation_config.json, the only place some checkpoints (e.g.
+    MiniMax-M3.1) declare it.
+    """
+    eos = model_cfg.hf_config.eos_token_id
+    if eos is None:
+        eos = model_cfg.hf_text_config.eos_token_id
+    if eos is None:
+        eos = model_cfg.try_get_generation_config().get("eos_token_id")
+    if isinstance(eos, (list, tuple)):
+        eos = eos[0] if eos else None
+    if eos is None:
+        raise ValueError(
+            f"{model_cfg.model}: neither config.json nor generation_config.json "
+            "declares eos_token_id; add it to the checkpoint's config.json"
+        )
+    return int(eos)
 
 
 def _min_smem_page_size(
@@ -117,10 +119,10 @@ def _min_smem_page_size(
     once the model is loaded; the exporter builds its config before that, so
     it takes the already-resolved values rather than a full `VllmConfig`.
     """
-    if int(getattr(parallel_cfg, "prefill_context_parallel_size", 1) or 1) > 1:
+    if parallel_cfg.prefill_context_parallel_size > 1:
         return 1
     max_pages_per_req = 1024 * 1024 // 2 // max_num_seqs // 4
-    dcp = int(getattr(parallel_cfg, "decode_context_parallel_size", 1) or 1)
+    dcp = parallel_cfg.decode_context_parallel_size
     local_max_model_len = -(-max_model_len // dcp)
     min_page = -(-local_max_model_len // max_pages_per_req)
     return 1 << (min_page - 1).bit_length()
@@ -139,15 +141,9 @@ def _kernel_block_size(vllm_config: Any, block_size: int) -> int:
     """
     from vllm.model_executor.layers.attention import Attention
 
-    ctx = getattr(
-        getattr(vllm_config, "compilation_config", None), "static_forward_context", {}
-    )
+    ctx = vllm_config.compilation_config.static_forward_context
     backends = list(
-        {
-            layer.attn_backend
-            for layer in (ctx or {}).values()
-            if isinstance(layer, Attention) and getattr(layer, "attn_backend", None)
-        }
+        {layer.attn_backend for layer in ctx.values() if isinstance(layer, Attention)}
     )
     if not backends:
         return block_size
@@ -164,8 +160,8 @@ def check_supported_parallelism(parallel_cfg: Any) -> tuple[int, int]:
 
     Takes a `ParallelConfig` or the parsed CLI arguments.
     """
-    dp_size = int(getattr(parallel_cfg, "data_parallel_size", 1) or 1)
-    pp_size = int(getattr(parallel_cfg, "pipeline_parallel_size", 1) or 1)
+    dp_size = parallel_cfg.data_parallel_size
+    pp_size = parallel_cfg.pipeline_parallel_size
     if (dp_size, pp_size) != (1, 1):
         raise NotImplementedError(
             f"export supports only data/pipeline parallel size 1, got "
@@ -247,97 +243,45 @@ def build_export_config_from_vllm(
     max_verify_tokens: int = 0,
     num_speculative_tokens: int = 0,
 ) -> api.TextOnlyLLMExportConfig:
-    """Derives a `TextOnlyLLMExportConfig` from a `VllmConfig` (or mock config).
+    """Derives a `TextOnlyLLMExportConfig` from a `VllmConfig`.
 
     With `max_verify_tokens`, `vllm_config`'s speculative config is the one that
     makes vLLM keep that many recurrent checkpoints
     (`verify_window_speculative_config`), and `num_speculative_tokens` is what the
     export's drafter proposes, if any.
     """
-    model_cfg = getattr(vllm_config, "model_config", None)
-    cache_cfg = getattr(vllm_config, "cache_config", None)
-    sched_cfg = getattr(vllm_config, "scheduler_config", None)
-    parallel_cfg = getattr(vllm_config, "parallel_config", None)
-    comp_cfg = getattr(vllm_config, "compilation_config", None)
-    hf_cfg = getattr(model_cfg, "hf_config", None)
+    model_cfg = vllm_config.model_config
+    cache_cfg = vllm_config.cache_config
+    parallel_cfg = vllm_config.parallel_config
 
-    resolved_model_name = (
-        model_name
-        or getattr(model_cfg, "model", None)
-        or _extract_hf_field(hf_cfg, "_name_or_path", "model_type", default="model")
-    )
-    resolved_hf_dir = resolve_hf_checkpoint_dir(
-        hf_checkpoint_dir or getattr(model_cfg, "model", None)
-    )
+    resolved_model_name = model_name or model_cfg.model
+    resolved_hf_dir = resolve_hf_checkpoint_dir(hf_checkpoint_dir or model_cfg.model)
 
-    tp_size = int(getattr(parallel_cfg, "tensor_parallel_size", 1) or 1)
+    tp_size = parallel_cfg.tensor_parallel_size
     dp_size, pp_size = check_supported_parallelism(parallel_cfg)
 
     if target_tpu is None:
         target_tpu = _detect_target_tpu()
 
-    vocab_size = int(
-        (
-            getattr(model_cfg, "get_vocab_size", lambda: None)()
-            if hasattr(model_cfg, "get_vocab_size")
-            else None
-        )
-        or _extract_hf_field(hf_cfg, "vocab_size", default=151936)
-    )
-    hidden_size = int(
-        (
-            getattr(model_cfg, "get_hidden_size", lambda: None)()
-            if hasattr(model_cfg, "get_hidden_size")
-            else None
-        )
-        or _extract_hf_field(hf_cfg, "hidden_size", default=1024)
-    )
     # vLLM's ModelConfig resolves fields a checkpoint declares per layer (e.g.
     # Gemma 4's KV heads and head_dim), which transformers refuses to read as
-    # one global value, so its accessors come before the raw HF fields.
-    num_layers = int(
-        _model_config_value(model_cfg, "get_total_num_hidden_layers")
-        or _extract_hf_field(
-            hf_cfg, "num_hidden_layers", "num_layers", "n_layer", default=28
-        )
+    # one global value.
+    vocab_size = model_cfg.get_vocab_size()
+    hidden_size = model_cfg.get_hidden_size()
+    num_layers = model_cfg.get_total_num_hidden_layers()
+    num_q_heads = model_cfg.hf_text_config.num_attention_heads
+    num_kv_heads = model_cfg.get_total_num_kv_heads()
+    head_dim = model_cfg.get_head_size()
+    block_size = cache_cfg.block_size
+    # Both are unset until vLLM profiles memory, which the export does not; a
+    # device export resizes the pool to HBM afterwards (`fit_num_blocks_to_hbm`).
+    num_blocks = (
+        cache_cfg.num_gpu_blocks
+        or cache_cfg.num_gpu_blocks_override
+        or _UNPROFILED_NUM_BLOCKS
     )
-    num_q_heads = int(
-        _extract_hf_field(
-            hf_cfg, "num_attention_heads", "num_heads", "n_head", default=16
-        )
-    )
-    num_kv_heads = int(
-        _model_config_value(model_cfg, "get_total_num_kv_heads")
-        or _extract_hf_field(
-            hf_cfg,
-            "num_key_value_heads",
-            "num_kv_heads",
-            default=num_q_heads,
-        )
-    )
-    head_dim = int(
-        (
-            getattr(model_cfg, "get_head_size", lambda: None)()
-            if hasattr(model_cfg, "get_head_size")
-            else None
-        )
-        or _extract_hf_field(
-            hf_cfg,
-            "head_dim",
-            default=max(1, hidden_size // max(1, num_q_heads)),
-        )
-    )
-    block_size = int(getattr(cache_cfg, "block_size", 16) or 16)
-    num_blocks = int(
-        getattr(cache_cfg, "num_gpu_blocks", None)
-        or getattr(cache_cfg, "num_gpu_blocks_override", None)
-        or 512
-    )
-    max_num_seqs = int(getattr(sched_cfg, "max_num_seqs", 64) or 64)
-    max_model_len = int(
-        getattr(model_cfg, "max_model_len", None)
-        or _extract_hf_field(hf_cfg, "max_position_embeddings", default=2048)
-    )
+    max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+    max_model_len = model_cfg.max_model_len
     block_size = max(
         block_size, _min_smem_page_size(parallel_cfg, max_num_seqs, max_model_len)
     )
@@ -345,17 +289,12 @@ def build_export_config_from_vllm(
     num_blocks *= block_size // kernel_block_size
     block_size = kernel_block_size
 
-    raw_eos = _extract_hf_field(hf_cfg, "eos_token_id", default=151645)
-    if isinstance(raw_eos, (list, tuple)):
-        eos_token_id = int(raw_eos[0]) if raw_eos else 151645
-    else:
-        eos_token_id = int(raw_eos)
+    eos_token_id = _eos_token_id(model_cfg)
 
-    raw_dtype = getattr(model_cfg, "dtype", None) or "bf16"
-    dtype_str = tpu_lowering.dtype_name(raw_dtype)
+    dtype_str = tpu_lowering.dtype_name(model_cfg.dtype)
 
     if token_buckets is None:
-        comp_sizes = getattr(comp_cfg, "compile_sizes", None)
+        comp_sizes = vllm_config.compilation_config.compile_sizes
         if comp_sizes:
             token_buckets = tuple(sorted(int(s) for s in comp_sizes))
         else:
@@ -367,7 +306,7 @@ def build_export_config_from_vllm(
         # A speculative step runs the LM head on every request's verify rows, its
         # drafts and the token after them, as vLLM's sampler does; they are some of
         # the step's tokens, so no more than its largest token bucket.
-        spec = getattr(vllm_config, "speculative_config", None)
+        spec = vllm_config.speculative_config
         drafted = num_speculative_tokens
         if spec is not None and not max_verify_tokens:
             drafted = spec.num_speculative_tokens
@@ -379,13 +318,6 @@ def build_export_config_from_vllm(
         req_buckets = default_req_buckets(rows)
     else:
         req_buckets = tuple(int(r) for r in req_buckets)
-
-    rope_scaling = _extract_hf_field(
-        hf_cfg, "rope_scaling", "rope_parameters", default=None
-    )
-    uses_mrope = bool(getattr(model_cfg, "uses_mrope", False)) or (
-        isinstance(rope_scaling, Mapping) and "mrope_section" in rope_scaling
-    )
 
     return api.TextOnlyLLMExportConfig(
         model_name=str(resolved_model_name),
@@ -411,7 +343,7 @@ def build_export_config_from_vllm(
         req_buckets=req_buckets,
         emit_byte_tokenizer=False,
         hf_checkpoint_dir=str(resolved_hf_dir) if resolved_hf_dir else None,
-        uses_mrope=uses_mrope,
+        uses_mrope=model_cfg.uses_mrope,
         max_verify_tokens=max_verify_tokens,
     )
 
@@ -513,9 +445,8 @@ def load_vllm_model(vllm_config: Any, *, load_format: str) -> nn.Module:
     from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 
     vllm_config.load_config.load_format = load_format
-    if getattr(vllm_config, "device_config", None) is not None:
-        with contextlib.suppress(Exception):
-            vllm_config.device_config.device = torch.device("tpu")
+    with contextlib.suppress(Exception):
+        vllm_config.device_config.device = torch.device("tpu")
 
     with set_current_vllm_config(vllm_config):
         if not dist.is_initialized():
@@ -592,8 +523,8 @@ def _load_mtp_draft(vllm_config: Any, target: nn.Module) -> nn.Module | None:
     from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
     from vllm.model_executor.model_loader import get_model_loader
 
-    spec = getattr(vllm_config, "speculative_config", None)
-    if spec is None or getattr(spec, "method", None) != "mtp":
+    spec = vllm_config.speculative_config
+    if spec is None or spec.method != "mtp":
         return None
     target_attn_layer_names = set(
         get_layers_from_vllm_config(vllm_config, AttentionLayerBase)  # type: ignore[type-abstract]
