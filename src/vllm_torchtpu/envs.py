@@ -118,6 +118,8 @@ if TYPE_CHECKING:
     TPU_MOE_TP_DECODE_SPLIT_META: bool = True
     TPU_MOE_TP_DECODE_SHARED_META: bool = True
     USE_MOE_TP_DECODE_NVFP4_KERNEL: bool = False
+    FUSED_MOE_PREFILL_NVFP4_KERNEL: bool = False
+    FUSED_MOE_PREFILL_NVFP4_ACT_MODE: str = "w4a16"
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
@@ -1208,6 +1210,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # TPU_MOE_SKIP_PADDED_TOKENS=1. Remove once the path is the default for
     # these layers or is folded into moe_tp_decode.
     "USE_MOE_TP_DECODE_NVFP4_KERNEL": env_bool("USE_MOE_TP_DECODE_NVFP4_KERNEL"),
+    # With USE_MOE_TP_DECODE_NVFP4_KERNEL: serve mixed / prefill buckets at or
+    # above the mode's measured crossover (2048 tokens for w4a16, 512 for w4a8)
+    # on admitted NVFP4 TP or EP x TP MoE layers with fused_moe_prefill_nvfp4
+    # (Stage A) inside the same jax_op instead of the GMM + shared-expert TP
+    # chain plus psum. Default off.
+    "FUSED_MOE_PREFILL_NVFP4_KERNEL": env_bool("FUSED_MOE_PREFILL_NVFP4_KERNEL"),
+    # Activation mode for fused_moe_prefill_nvfp4 when
+    # FUSED_MOE_PREFILL_NVFP4_KERNEL=1: "w4a16" (default, BF16 activations and
+    # BF16 x BF16 MXU dots at >= 2048 tokens) or "w4a8" (per-row FP8
+    # activations and FP8 x FP8 MXU dots at >= 512 tokens).
+    "FUSED_MOE_PREFILL_NVFP4_ACT_MODE": env_with_choices(
+        "FUSED_MOE_PREFILL_NVFP4_ACT_MODE", "w4a16", ["w4a16", "w4a8"]
+    ),
     # SparseCore MoE gather-reduce (combine) kernel version used by
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and
     # "v3" selects the destination-major prototype.
