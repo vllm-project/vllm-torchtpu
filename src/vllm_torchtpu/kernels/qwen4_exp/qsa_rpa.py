@@ -621,11 +621,24 @@ def _prefill_attention(
         raise ValueError(
             "VLLM_TPU_QSA_PREFILL_UNION_WALK must be a divisor of 128, at least 8"
         )
+    # VLLM_TPU_QSA_PREFILL_UNION_DCP: the union walk also serves main-KV DCP's
+    # (out, lse) partials (bit-scan walk only; either paired KV slot).
+    union_dcp = bool(
+        union_group
+        and dcp is not None
+        and return_lse
+        and envs.VLLM_TPU_QSA_PREFILL_UNION_DCP
+        and kv_heads == 1
+        and kv_head_offset in (0, 1)
+        and not envs.VLLM_TPU_QSA_PREFILL_UNION_LISTED
+        and not envs.VLLM_TPU_QSA_PREFILL_UNION_RUN_TABLES
+        and not envs.VLLM_TPU_QSA_PREFILL_UNION_GATHERED
+        and not envs.VLLM_TPU_QSA_PREFILL_UNION_COMPACT_REQS
+        and not envs.VLLM_TPU_QSA_PREFILL_UNION_SHARE_BITS
+    )
     if (
         union_group
-        and dcp is None
-        and not return_lse
-        and kv_head_offset == 0
+        and (union_dcp or (dcp is None and not return_lse and kv_head_offset == 0))
         and ratio == 4
         and cache.dtype == jnp.float8_e4m3fn
         and cache.shape[1] % 128 == 0
@@ -667,7 +680,49 @@ def _prefill_attention(
             compact_reqs=envs.VLLM_TPU_QSA_PREFILL_UNION_COMPACT_REQS,
             compact_copy_method=envs.VLLM_TPU_QSA_PREFILL_UNION_COMPACT_COPY,
             sc_bitset=envs.VLLM_TPU_QSA_PREFILL_UNION_SC_BITSET,
+            **(
+                {"dcp": dcp, "return_lse": True, "kv_head_offset": kv_head_offset}
+                if union_dcp
+                else {}
+            ),
         )
+    return block_sparse_prefill(
+        query,
+        gate,
+        blocks,
+        lengths,
+        table,
+        cache,
+        starts,
+        kv_heads=kv_heads,
+        ratio=ratio,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        kv_head_offset=kv_head_offset,
+        dcp=dcp,
+        return_lse=return_lse,
+    )
+
+
+def block_sparse_prefill(
+    query,
+    gate,
+    blocks,
+    lengths,
+    table,
+    cache,
+    starts,
+    *,
+    kv_heads,
+    ratio,
+    k_scale=1.0,
+    v_scale=1.0,
+    kv_head_offset=0,
+    dcp=None,
+    return_lse=False,
+):
+    """``_prefill_attention``'s block-sparse call (served tiles, DCP tiles under
+    ``dcp``); also the DCP union walk's fallback."""
     from vllm_torchtpu.kernels.qwen4_exp.block_sparse_gqa_prefill import (
         block_sparse_gqa_attention,
     )
