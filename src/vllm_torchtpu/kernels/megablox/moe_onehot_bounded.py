@@ -42,7 +42,10 @@ def _vmem_bytes(num_tokens: int, num_slots: int, chunk: int) -> int:
 
 
 def _col_chunk(num_tokens: int, num_slots: int, hidden_size: int) -> int | None:
-    budget = pltpu.get_tpu_info().vmem_capacity_bytes * 0.8
+    try:
+        budget = pltpu.get_tpu_info().vmem_capacity_bytes * 0.8
+    except ValueError:  # not a TPU (CPU tests)
+        return None
     return next(
         (
             c
@@ -93,8 +96,11 @@ def _permute_kernel(valid_ref, revert_t_ref, hidden_hbm_ref, out_hbm_ref, onehot
             onehot_ref[s0 : s0 + _SLOT_BLOCK, :] = onehot.astype(onehot_ref.dtype)
 
         def body(hidden_ref, out_ref):
+            # 0 * NaN == NaN: a non-finite token would reach every slot.
+            hidden = hidden_ref[...]
+            hidden = jnp.where(jnp.isfinite(hidden), hidden, jnp.zeros_like(hidden))
             out_ref[...] = jnp.dot(
-                onehot_ref[:cap, :], hidden_ref[...], preferred_element_type=jnp.float32
+                onehot_ref[:cap, :], hidden, preferred_element_type=jnp.float32
             ).astype(out_ref.dtype)
 
         pltpu.emit_pipeline(
@@ -113,7 +119,8 @@ def bounded_onehot_permute(
     argsort_revert_indices: jax.Array,  # int32[tokens * topk]
     valid_count: jax.Array,  # int32[1]
 ) -> jax.Array:
-    """Routed buffer [tokens * topk, hidden]: slot s holds its token's row.
+    """Routed buffer [tokens * topk, hidden]: slot s holds its token's row,
+    with non-finite values zeroed.
 
     Only the smallest power-of-two multiple of 128 slots covering
     ``valid_count`` is written; the GMM never reads past the valid prefix.
