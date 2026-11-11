@@ -127,6 +127,7 @@ if TYPE_CHECKING:
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_SPEC_STATIC_VERIFY: bool = True
     TPU_SPEC_GLUE_FUSION: bool = False
+    TPU_SPEC_SYNTHETIC_INGRAPH_RNG: bool = False
     TPU_DCP_INDEXER_A2A_MERGE: bool = False
     TPU_DCP_INDEXER_A2A_MIN_TOKENS: int = 64
     TPU_STREAMIDX_SMALL_BUCKET_BQ: int | None = None
@@ -945,6 +946,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # single-chunk verify step (fit, assemble, count, pads) as one compiled
     # program instead of the eager op sequence. Integer ops; same values.
     "TPU_SPEC_GLUE_FUSION": env_bool("TPU_SPEC_GLUE_FUSION", default=False),
+    # Under synthetic rejection with the fused verify sampler
+    # (spec_verify_fused_sampler), draw its three uniform tensors inside the
+    # compiled verify program from a device counter (keyed counter-based hash,
+    # 24-bit uniforms like torch.rand) instead of three eager torch.rand calls.
+    # Same distribution, different random stream. Real acceptance keeps the
+    # sampling generator's draws.
+    "TPU_SPEC_SYNTHETIC_INGRAPH_RNG": env_bool(
+        "TPU_SPEC_SYNTHETIC_INGRAPH_RNG", default=False
+    ),
     # Merge the DCP indexer candidates with an all-to-all over the token axis
     # instead of an all-gather over the candidate axis. Same result.
     "TPU_DCP_INDEXER_A2A_MERGE": env_bool("TPU_DCP_INDEXER_A2A_MERGE", default=False),

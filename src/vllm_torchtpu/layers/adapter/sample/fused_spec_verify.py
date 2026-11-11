@@ -28,6 +28,7 @@ from typing import Any
 
 import torch
 
+from vllm_torchtpu.layers.adapter.sample.counter_uniform import counter_uniform
 from vllm_torchtpu.layers.adapter.sample.rejection_sampler import (
     _random_rejection_sample_with_segment_impl,
 )
@@ -79,8 +80,7 @@ def sample_rows(
     return torch.argmax(final_logits, dim=-1, keepdim=True)
 
 
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-def spec_verify_sample_fused(
+def _spec_verify_sample_fused_impl(
     logits: torch.Tensor,
     bonus_logits_indices: torch.Tensor,
     target_logits_indices: torch.Tensor,
@@ -145,3 +145,65 @@ def spec_verify_sample_fused(
         None,
         apply_top_k,
     )
+
+
+spec_verify_sample_fused = torch.compile(backend="tpu", fullgraph=True, dynamic=False)(
+    _spec_verify_sample_fused_impl
+)
+
+
+def _spec_verify_sample_fused_rng_impl(
+    logits: torch.Tensor,
+    bonus_logits_indices: torch.Tensor,
+    target_logits_indices: torch.Tensor,
+    draft_token_ids: torch.Tensor,
+    num_draft_tokens: torch.Tensor,
+    segment_ids: torch.Tensor,
+    group_indices: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
+    rng_counter: torch.Tensor,
+    synthetic_conditional_rates: torch.Tensor | None,
+    synthetic_mode: bool,
+    max_draft_tokens: int,
+    topk_candidates: int = 0,
+    apply_topk_topp: bool = True,
+    apply_top_k: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """`spec_verify_sample_fused` with its three uniform tensors drawn in the
+    graph from ``rng_counter`` (counters c, c + 1, c + 2, in the eager draw
+    order), so they are never written to HBM. Also returns c + 3."""
+    num_reqs = bonus_logits_indices.shape[0]
+    num_tokens = target_logits_indices.shape[0]
+    vocab = logits.shape[-1]
+    bonus_u = counter_uniform((num_reqs, vocab), rng_counter)
+    accept_u = counter_uniform(tuple(draft_token_ids.shape), rng_counter + 1)
+    recover_u = counter_uniform((num_tokens, vocab), rng_counter + 2)
+    out = _spec_verify_sample_fused_impl(
+        logits,
+        bonus_logits_indices,
+        target_logits_indices,
+        draft_token_ids,
+        num_draft_tokens,
+        segment_ids,
+        group_indices,
+        temperatures,
+        top_k,
+        top_p,
+        bonus_u,
+        accept_u,
+        recover_u,
+        synthetic_conditional_rates,
+        synthetic_mode,
+        max_draft_tokens,
+        topk_candidates,
+        apply_topk_topp,
+        apply_top_k,
+    )
+    return out, rng_counter + 3
+
+
+spec_verify_sample_fused_rng = torch.compile(
+    backend="tpu", fullgraph=True, dynamic=False
+)(_spec_verify_sample_fused_rng_impl)
