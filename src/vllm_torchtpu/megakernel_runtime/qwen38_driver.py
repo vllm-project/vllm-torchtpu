@@ -2199,6 +2199,9 @@ class Qwen38SegmentDriver:
         model_kwargs: Any = None,
     ) -> tuple[bool, Any]:
         self.calls_total = getattr(self, "calls_total", 0) + 1
+        # VLLM_TPU_MK_DRAFT: draft step 0 takes its MK call only after a whole-step
+        # target forward (a uniform verify step).
+        runner._mk_whole_step = False
         if inputs_embeds is not None or intermediate_tensors is not None:
             # Counted like every other stock route, so a bypass shows in the mix.
             self._note(
@@ -2341,6 +2344,7 @@ class Qwen38SegmentDriver:
                     out = self.whole_program(
                         input_ids=input_ids, positions=positions, **kw
                     )
+                runner._mk_whole_step = True
                 from . import qwen38_wholestep_call as wsc
 
                 if (
