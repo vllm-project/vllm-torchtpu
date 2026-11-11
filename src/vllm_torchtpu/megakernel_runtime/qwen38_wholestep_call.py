@@ -236,9 +236,11 @@ def build_wholestep_call(
     T = T_VERIFY
     # VLLM_TPU_MK_SCOPES=N: per-phase named scopes in the kernel (profiling only).
     scopes = int(os.environ.get("VLLM_TPU_MK_SCOPES", "0") or 0)
+    # VLLM_TPU_MK_DEBUG_SKIP=experts,comm,...: phase ablation (benchmarks only; wrong outputs).
+    skip = frozenset(x for x in os.environ.get("VLLM_TPU_MK_DEBUG_SKIP", "").split(",") if x)
     ex = ExecSpec(
         R=R, B=B, T=T, ctx=128, tiles=wholestep_tiles(B, max_groups) if tiles is None else tiles,
-        interpret=interpret, debug=DebugOptions(scopes=scopes),
+        interpret=interpret, debug=DebugOptions(scopes=scopes, skip=skip),
     )
     # QSA layers in the L-layer kernel (first="qsa": a partial last cycle is its QSA
     # layer, VLLM_TPU_MK_WHOLE_L45).
