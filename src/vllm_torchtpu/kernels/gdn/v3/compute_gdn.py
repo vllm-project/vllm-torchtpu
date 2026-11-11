@@ -114,10 +114,6 @@ def chunked_gdn_per_seq(
 ) -> tuple[jax.Array, jax.Array]:
     """Perform chunked GDN over input [num_heads, chunk, head_dim]."""
 
-    # NOTE: Repeat along non lane/sublane dim is free.
-    q_repeat = jnp.repeat(q_large, cfg.v_per_kq_head, axis=0)
-    k_repeat = jnp.repeat(k_large, cfg.v_per_kq_head, axis=0)
-
     # Compute cumulative sum of decay.
     # [1, 1, num_v_heads]
     g_cum_sum_list = [gating_log[:, :1]]
@@ -171,51 +167,47 @@ def chunked_gdn_per_seq(
     # [num_v_heads, chunk, chunk]
     t_inv = invert_triangular_matrix(t, block_size=cfg.triangular_block_size)
 
-    # [num_v_heads, chunk, kq_head_dim]
-    k_gating = k_repeat * gating_forward
-    # NOTE: If v_head_dim < mxu size, concatenating them will help increase mxu
-    # utilization. Also, if v_head_dim is multiple of lane size, concat / split
-    # along lane dim is free - making this optimization strictly beneficial.
-    # [num_v_heads, chunk, v_head_dim + kq_head_dim]
-    merged_v_k = jnp.concat([v_large, k_gating], axis=-1)
-    merged_uw = jax.lax.dot(
-        t_inv,
-        merged_v_k,
-        dimension_numbers=(((2,), (1,)), ((0,), (0,))),
-        preferred_element_type=jnp.float32,
-    ).astype(cfg.dtypes.compute)
-
-    # [num_v_heads, chunk, v_head_dim]
-    u, w = jnp.split(merged_uw, [cfg.v_head_dim], axis=-1)
-
-    # [num_v_heads, chunk, kq_head_dim]
-    q_large_gating = q_repeat * gating_forward
-    # NOTE: Concatenate lhs with same rhs to leverage weight
-    # stationary architecture.
+    # State-first KQ-head-factored projection: contract unscaled [K; Q] against
+    # state_prev before the triangular solve, so the solve has a single
+    # 128-column right-hand side and W is never formed.
+    # [num_kq_heads, 2 * chunk, kq_head_dim]
+    merged_kq = jnp.concat([k_large, q_large], axis=1)
     # [num_v_heads, 2 * chunk, kq_head_dim]
-    merged_w_q = jnp.concat([w, q_large_gating], axis=1)
+    merged_kq_rep = jnp.repeat(merged_kq, cfg.v_per_kq_head, axis=0)
     # [num_v_heads, 2 * chunk, v_head_dim]
-    merged_ws_out_updated = jax.lax.dot(
-        merged_w_q,
+    kq_state = jax.lax.dot(
+        merged_kq_rep,
         state_prev,
         dimension_numbers=(((2,), (1,)), ((0,), (0,))),
         preferred_element_type=jnp.float32,
     )
 
-    # NOTE: Splitting along non sublane/lane dim is free.
-    ws, out_updated = jnp.split(merged_ws_out_updated, 2, axis=1)
-    ws = ws.astype(cfg.dtypes.compute)
-
     # [num_v_heads, chunk, v_head_dim]
-    u_ws = (u - ws) * beta_large
+    k_state, q_state = jnp.split(kq_state, 2, axis=1)
+    out_updated = q_state * gating_forward
 
-    # [num_v_heads, chunk, kq_head_dim]
-    k_repeat_gating = k_repeat * gating_backward
+    # Form unscaled innovation residual v_diff = V - gf * (K @ S_prev), apply
+    # the column-scaled T^-1, and post-multiply by beta_large.
+    # [num_v_heads, chunk, v_head_dim]
+    v_diff = (v_large - k_state * gating_forward).astype(cfg.dtypes.compute)
+    u_ws = (
+        jax.lax.dot(
+            t_inv,
+            v_diff,
+            dimension_numbers=(((2,), (1,)), ((0,), (0,))),
+            preferred_element_type=jnp.float32,
+        ).astype(cfg.dtypes.compute)
+        * beta_large
+    )
 
-    # [num_v_heads, kq_head_dim, v_head_dim]
+    # Absorb gating_backward into u_ws so the unscaled K (transposed once per KQ
+    # head) is shared by all of its V heads.
+    # [num_v_heads, chunk, v_head_dim]
+    u_ws_gated = u_ws * gating_backward
+    k_rep = jnp.repeat(k_large, cfg.v_per_kq_head, axis=0)
     state_new = jax.lax.dot(
-        k_repeat_gating,
-        u_ws,
+        k_rep,
+        u_ws_gated,
         dimension_numbers=(((1,), (1,)), ((0,), (0,))),
         preferred_element_type=jnp.float32,
     )
