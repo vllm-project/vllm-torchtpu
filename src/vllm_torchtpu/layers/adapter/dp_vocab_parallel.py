@@ -100,8 +100,12 @@ def _ineligible_reason(vllm_config: "VllmConfig") -> str | None:
         return "pipeline parallelism is on"
     if pc.prefill_context_parallel_size > 1 or pc.decode_context_parallel_size > 1:
         return "context parallelism is on"
-    if vllm_config.speculative_config is not None:
-        return "speculative decoding is on (its logits batches exceed max_num_reqs)"
+    spec = vllm_config.speculative_config
+    if spec is not None:
+        if spec.method != "mtp":
+            return "only MTP speculative decoding is covered"
+        if spec.draft_tensor_parallel_size not in (None, pc.tensor_parallel_size):
+            return "the draft and target need the same TP layout for DP vocab sharing"
     if vllm_config.lora_config is not None:
         return "LoRA is on"
     if vllm_config.model_config.runner_type == "pooling":
@@ -109,7 +113,8 @@ def _ineligible_reason(vllm_config: "VllmConfig") -> str | None:
             "pooling models compute no logits, so busy engines would skip the "
             "lm_head collectives that idle engines run"
         )
-    if vllm_config.model_config.is_multimodal_model:
+    mm = vllm_config.model_config.multimodal_config
+    if mm is not None and not mm.language_model_only:
         # TODO: multimodal models embed outside the compiled forward, around
         # rank-local merges; enable once a multimodal DP + EP test covers it.
         return "multimodal models are not covered yet"

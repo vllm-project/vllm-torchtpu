@@ -241,6 +241,7 @@ class Eagle3Proposer:
         self._draft_tp_matches_target = draft_tp == target_tp
         # Lazily resolved by _draft_has_moe once the draft model exists.
         self._draft_has_moe_cache: bool | None = None
+        self._dp_vocab_layers = False
         logger.info(
             "%s draft parallelism: %s (draft_tp=%s).",
             self.speculative_config.method,
@@ -349,6 +350,12 @@ class Eagle3Proposer:
             self._draft_replicated,
             self._draft_tp_matches_target,
             materialize_if_mismatched=False,
+        )
+        from vllm_torchtpu.layers.adapter import dp_vocab_parallel
+
+        self._dp_vocab_layers = (
+            envs.TPU_DP_VOCAB_PARALLEL
+            and dp_vocab_parallel.check_layers_sharded_over_dp(self.draft_model)
         )
         if self.speculative_config.method == "eagle3":
             # Lazy + guarded: only eagle3 needs this vLLM internal, so a wrong vLLM
@@ -2255,15 +2262,18 @@ class Eagle3Proposer:
         """True when the draft emits cross-DP collectives under EP-DP lockstep.
 
         Those collectives are part of the cross-rank collective program, so
-        every rank must execute the same collective trace. Two ways the draft
+        every rank must execute the same collective trace. The draft
         can emit them: it is TP-SHARDED (its TP collectives ride the same
         program), or it carries expert-parallel MoE layers, whose experts span
         the DP group even when the draft is TP-replicated (draft_tp=1). A
-        replicated, MoE-free draft is entirely local and needs none of this.
+        replicated draft may also use DP vocabulary parallel layers. Each
+        of these paths requires idle ranks to execute the same collective trace.
         """
         if not self.runner._dp_lockstep_enabled():
             return False
-        return not self._draft_replicated or self._draft_has_moe()
+        return (
+            not self._draft_replicated or self._draft_has_moe() or self._dp_vocab_layers
+        )
 
     def _loop_bucket(self, num_reqs: int) -> int:
         """Loop-phase token bucket p (carries, lm-head gathers, loop forwards)."""

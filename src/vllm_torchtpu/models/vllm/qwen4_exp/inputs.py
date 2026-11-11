@@ -411,20 +411,34 @@ class Qwen4ExpAdapter:
             # Bound idle prefill work so newly arrived requests do not trail
             # other DP ranks by several chunks. Keep decode asynchronous.
             wait_for_output = not dp_lockstep or not runner._dp_step_other_decode
-            if dp_lockstep and runner.parallel_config.tensor_parallel_size > 1:
-                # Match the generic runner's idle-DP protocol. The LM head
-                # has a TP collective even when this DP has no live tokens;
-                # omitting it leaves busy DP engines waiting on their logits.
+            if dp_lockstep and (
+                runner._dp_vocab_logits
+                or runner.parallel_config.tensor_parallel_size > 1
+            ):
+                # Match the busy rank's LM-head collectives. DP vocabulary
+                # sharding requires this even when tensor parallelism is one.
                 indices = torch.zeros(
-                    metadata.query_start_loc.shape[0] - 1,
+                    runner._dp_vocab_logits_rows()
+                    if runner._dp_vocab_logits
+                    else metadata.query_start_loc.shape[0] - 1,
                     dtype=torch.int32,
                     device=out.device,
                 )
-                logits = runner.compute_selected_logits(out, indices)
+                logits = (
+                    runner._compute_dp_vocab_logits(out, indices)
+                    if runner._dp_vocab_logits
+                    else runner.compute_selected_logits(out, indices)
+                )
                 if wait_for_output:
                     synchronize_tensors(logits)
+                elif runner._dp_vocab_logits:
+                    # No caller consumes dummy logits; enqueue the collective
+                    # before the subsequent draft, without blocking decode.
+                    synchronize_tensors(logits, wait=False)
             else:
                 synchronize_tensors(out, wait=wait_for_output)
+        # Draft execution belongs to the later speculative-decode warmup,
+        # after target profiling and backbone compilation have completed.
         runner._hidden_states_dtype = out.dtype
         return (
             (time.perf_counter() - started) * 1000

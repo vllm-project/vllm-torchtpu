@@ -2048,7 +2048,8 @@ def _patch_vllm_vocab_parallel_embedding() -> None:
                     arg["padding_size"],
                 )
             if dp_vocab_group is not None:
-                kwargs["parallel_group"] = dp_vocab_group
+                call.arguments["parallel_group"] = dp_vocab_group
+                args, kwargs = call.args[1:], call.kwargs
         original_init(self, *args, **kwargs)
         if dp_vocab_group is not None:
             setattr(self, dp_vocab_parallel.DP_VOCAB_ATTR, True)

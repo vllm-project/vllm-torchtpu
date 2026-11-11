@@ -4596,9 +4596,12 @@ class TPUModelRunner(GPUModelRunner):
                         sample_hidden_states
                     )
                 else:
-                    logits = self.compute_logits_from_hidden_states(
-                        sample_hidden_states
-                    )
+                    if self._dp_vocab_logits:
+                        logits = self._compute_dp_vocab_logits(sample_hidden_states)
+                    else:
+                        logits = self.compute_logits_from_hidden_states(
+                            sample_hidden_states
+                        )
 
             logits_list.append(logits)
             num_reqs_list.append(num_reqs)
@@ -5946,14 +5949,14 @@ class TPUModelRunner(GPUModelRunner):
                         device=self.device,
                     )
 
-        # After the drafter: every placed MoE layer, the drafter's too, must
-        # have had its router renumbered with its experts.
-        expert_placement.check_routers_permuted()
-
             if self.model_adapter is not None:
                 self.model_adapter.bind_model(
                     self.model, self._async_drafter.draft_model
                 )
+
+        # After the drafter: every placed MoE layer, the drafter's too, must
+        # have had its router renumbered with its experts.
+        expert_placement.check_routers_permuted()
 
         # After the drafter, so its MTP layer is armed too.
         if envs.FUSED_MOE_DECODE_KERNEL:
@@ -6477,7 +6480,10 @@ class TPUModelRunner(GPUModelRunner):
                     dtype=torch.int32,
                     device=out.device,
                 )
-                _ = self.compute_selected_logits(out, _idx)
+                if self._dp_vocab_logits and self.speculative_config is not None:
+                    _ = self._compute_dp_vocab_logits(out, _idx)
+                else:
+                    _ = self.compute_selected_logits(out, _idx)
             if not dp_lockstep:
                 synchronize_tensors(out)
             elapsed_ms = (time.perf_counter() - started) * 1000.0
@@ -6786,6 +6792,8 @@ class TPUModelRunner(GPUModelRunner):
         ).to(self.device)
 
     def _precompile_compute_selected_logits(self) -> None:
+        if self._dp_vocab_logits and self.speculative_config is not None:
+            return  # All ranks use the same compact logits program, including idle.
         hsize = self.model_config.get_hidden_size()
         with self._precompile_timed("compute_selected_logits"):
             for num_tokens in self.num_tokens_paddings:
@@ -6806,7 +6814,10 @@ class TPUModelRunner(GPUModelRunner):
     def _precompile_compute_logits_from_hidden_states(self) -> None:
         hsize = self.model_config.get_hidden_size()
         with self._precompile_timed("compute_logits_from_hidden_states"):
-            for num_reqs in self.num_reqs_paddings:
+            rows = set(self.num_reqs_paddings)
+            if self._dp_vocab_logits:
+                rows.update(self._verify_logits_paddings())
+            for num_reqs in sorted(rows):
                 dummy_hidden = torch.zeros(
                     (num_reqs, hsize),
                     dtype=self._hidden_states_dtype,
@@ -7266,9 +7277,12 @@ class TPUModelRunner(GPUModelRunner):
             # Only the last stage holds the lm_head and samples.
             return
         self._precompile_compute_selected_logits()
-        if _get_sequence_layout_planner_for_runner(
-            self
-        ).uses_selected_logits_hidden_states:
+        if (
+            self._dp_vocab_logits
+            or _get_sequence_layout_planner_for_runner(
+                self
+            ).uses_selected_logits_hidden_states
+        ):
             self._precompile_compute_logits_from_hidden_states()
         self._precompile_compute_top_tokens()
         self._precompile_structured_decoding()
@@ -9013,13 +9027,14 @@ class TPUModelRunner(GPUModelRunner):
         return num_blocks
 
     def _dp_vocab_logits_rows(self) -> int:
-        """The logits batch every DP rank pads to this step under
-        TPU_DP_VOCAB_PARALLEL: the request bucket of the DP-wide largest chunk,
-        which _dp_coordinated_step all-reduces on busy and idle ranks alike.
-        No chunk's padded request count exceeds it."""
-        return _get_padded_num_reqs_with_upper_limit(
+        requests = _get_padded_num_reqs_with_upper_limit(
             self._dp_step_max_reqs, self.max_num_reqs
         )
+        if self.speculative_config is None or self._mtp_prefill_only:
+            return requests
+        capacity = requests * (1 + self.speculative_config.num_speculative_tokens)
+        capacity = min(capacity, self.num_tokens_paddings[-1])
+        return max(requests, _get_padded_token_len(self.num_tokens_paddings, capacity))
 
     def _logits_at_dp_vocab_rows(
         self, hidden_states: torch.Tensor, indices: torch.Tensor
@@ -9034,6 +9049,8 @@ class TPUModelRunner(GPUModelRunner):
         """
         if not self._dp_vocab_logits:
             return self.compute_selected_logits(hidden_states, indices)
+        if self.speculative_config is not None:
+            return self._compute_dp_vocab_logits(hidden_states, indices)
         rows = self._dp_vocab_logits_rows()
         num_rows = indices.shape[0]
         if num_rows > rows:
@@ -9045,6 +9062,21 @@ class TPUModelRunner(GPUModelRunner):
             return self.compute_selected_logits(hidden_states, indices)
         padded = torch.nn.functional.pad(indices, (0, rows - num_rows))
         return self.compute_selected_logits(hidden_states, padded)[:num_rows]
+
+    def _compute_dp_vocab_logits(
+        self, hidden: torch.Tensor, indices: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        # Selection/padding stay outside the collective program: busy, idle and
+        # verify ranks may have different source shapes but must call one graph.
+        selected = hidden if indices is None else torch.index_select(hidden, 0, indices)
+        rows = self._dp_vocab_logits_rows()
+        count = selected.shape[0]
+        if count > rows:
+            raise ValueError(
+                f"DP vocab logits has {count} rows, coordinated capacity {rows}"
+            )
+        selected = torch.nn.functional.pad(selected, (0, 0, 0, rows - count))
+        return self.compute_logits_from_hidden_states(selected)[:count]
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def compute_selected_logits(

@@ -351,10 +351,21 @@ def test_tp_only_lm_head_keeps_the_stock_path():
 
 
 def _config(
-    dp=4, ep=True, pp=1, pcp=1, dcp=1, spec=None, lora=None, runner="generate", mm=False
+    dp=4,
+    ep=True,
+    pp=1,
+    pcp=1,
+    dcp=1,
+    spec=None,
+    lora=None,
+    runner="generate",
+    mm=False,
+    tp=2,
+    language_model_only=False,
 ):
     pc = SimpleNamespace(
         data_parallel_size=dp,
+        tensor_parallel_size=tp,
         enable_expert_parallel=ep,
         pipeline_parallel_size=pp,
         prefill_context_parallel_size=pcp,
@@ -365,7 +376,12 @@ def _config(
         speculative_config=spec,
         lora_config=lora,
         model_config=SimpleNamespace(
-            runner_type=runner, get_vocab_size=lambda: VOCAB, is_multimodal_model=mm
+            runner_type=runner,
+            get_vocab_size=lambda: VOCAB,
+            is_multimodal_model=mm,
+            multimodal_config=SimpleNamespace(language_model_only=language_model_only)
+            if mm
+            else None,
         ),
     )
 
@@ -409,7 +425,20 @@ def _group_for(
         pytest.param({"config": _config(pp=2)}, None, id="pipeline_parallelism"),
         pytest.param({"config": _config(pcp=2)}, None, id="prefill_context_parallel"),
         pytest.param({"config": _config(dcp=2)}, None, id="decode_context_parallel"),
-        pytest.param({"config": _config(spec=object())}, None, id="spec_decoding"),
+        pytest.param(
+            {"config": _config(spec=SimpleNamespace(method="eagle3"))},
+            None,
+            id="other_spec_decoding",
+        ),
+        pytest.param(
+            {
+                "config": _config(
+                    spec=SimpleNamespace(method="mtp", draft_tensor_parallel_size=1)
+                )
+            },
+            None,
+            id="mtp_mismatched_tp",
+        ),
         pytest.param({"config": _config(lora=object())}, None, id="lora"),
         pytest.param({"config": _config(runner="pooling")}, None, id="pooling_model"),
         pytest.param({"config": _config(mm=True)}, None, id="multimodal_model"),
@@ -496,3 +525,17 @@ def test_patched_init_skips_the_dp_check_with_the_flag_off(monkeypatch):
         layer = VocabParallelEmbedding(VOCAB, HIDDEN, params_dtype=torch.float32)
     group_for.assert_not_called()
     assert not getattr(layer, dp_vocab_parallel.DP_VOCAB_ATTR, False)
+
+
+@pytest.mark.parametrize("draft_tp", [None, 2])
+def test_mtp_with_matching_tp_layout_is_eligible(monkeypatch, draft_tp):
+    spec = SimpleNamespace(method="mtp", draft_tensor_parallel_size=draft_tp)
+    ep, group = _group_for(monkeypatch, config=_config(spec=spec))
+    assert group is ep
+
+
+def test_text_only_multimodal_checkpoint_is_eligible(monkeypatch):
+    ep, group = _group_for(
+        monkeypatch, config=_config(mm=True, language_model_only=True)
+    )
+    assert group is ep

@@ -1171,12 +1171,15 @@ def test_dp_lockstep_draft_trace_independent_of_real_chunk_count(
         assert padded == full, f"{num_real} of {num_chunks} chunks real"
 
 
-def test_loop_bucket_follows_dp_step_max_reqs_under_sharded_lockstep():
+@pytest.mark.parametrize("vocab_only", [False, True])
+def test_loop_bucket_follows_dp_step_max_reqs_under_sharded_lockstep(vocab_only):
     """Sharded EP-DP lockstep sizes the loop bucket from the step's DP-wide max
     per-chunk request count, not max_num_reqs; the replicated draft keeps the
     per-chunk bucket."""
-    proposer = _make_proposer(draft_tp=2, target_tp=2)
+    proposer = _make_proposer(draft_tp=1 if vocab_only else 2, target_tp=2)
+    proposer._dp_vocab_layers = vocab_only
     proposer.runner = SimpleNamespace(
+        _mtp_prefill_only=False,
         num_tokens_paddings=[16, 32, 64, 128],
         max_num_reqs=128,
         _dp_step_max_reqs=10,
@@ -1193,7 +1196,9 @@ def test_loop_bucket_follows_dp_step_max_reqs_under_sharded_lockstep():
 
     rep = _make_proposer(draft_tp=1, target_tp=2)
     rep.runner = SimpleNamespace(
-        num_tokens_paddings=[16, 32, 64, 128], _dp_lockstep_enabled=lambda: False
+        _mtp_prefill_only=False,
+        num_tokens_paddings=[16, 32, 64, 128],
+        _dp_lockstep_enabled=lambda: False,
     )
     assert rep._loop_bucket(1) == 16
     assert rep._loop_bucket(33) == 64
@@ -3215,3 +3220,19 @@ def test_native_mtp_wide_carry_token_alignment(device, k, asynchronous):
                 seen[step][1][:2], hidden.cpu()[selected] + 1000 * step
             )
             assert seen[step][2][:2].tolist() == [i + step for i in selected]
+
+
+@pytest.mark.parametrize("dp_vocab", [False, True])
+def test_draft_greedy_tokens_use_regular_logits(dp_vocab):
+    import inspect
+
+    proposer = _make_proposer(method="mtp")
+    proposer._dp_vocab_layers = dp_vocab
+    logits = torch.tensor([[1.0, 2.0, 0.0], [3.0, 0.0, 2.0]])
+    proposer.draft_model = SimpleNamespace(
+        compute_logits=mock.Mock(return_value=logits),
+    )
+    hidden = torch.zeros(2, 4)
+    got = inspect.unwrap(Eagle3Proposer._draft_propose_token)(proposer, hidden)
+    assert torch.equal(got, logits.argmax(-1).to(torch.int32))
+    proposer.draft_model.compute_logits.assert_called_once_with(hidden)

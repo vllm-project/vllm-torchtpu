@@ -78,6 +78,46 @@ def _warmup_requests():
     return defaultdict(lambda: SimpleNamespace(output_token_ids=[]))
 
 
+@pytest.mark.parametrize("k", [0, 1, 3, 5])
+@pytest.mark.parametrize("requests", [1, 8, 9, 32])
+def test_dp_vocab_verify_rows_cover_request_and_token_padding(k, requests):
+    runner = SimpleNamespace(
+        _dp_step_max_reqs=requests,
+        max_num_reqs=32,
+        num_tokens_paddings=[16, 32, 64, 128, 256, 512],
+        speculative_config=SimpleNamespace(num_speculative_tokens=k) if k else None,
+        _mtp_prefill_only=False,
+    )
+    rows = TPUModelRunner._dp_vocab_logits_rows(runner)
+    assert rows >= requests * (k + 1)
+    assert rows in ([8, 16, 32] if not k else runner.num_tokens_paddings)
+
+
+@pytest.mark.parametrize("indices", [None, torch.tensor([7, 1, 4])])
+def test_dp_vocab_rank_local_selection_uses_one_padded_head(indices):
+    hidden = torch.arange(24, dtype=torch.float32).view(8, 3)
+    expected = hidden if indices is None else hidden[indices]
+    calls = []
+
+    def project(x):
+        calls.append(x.clone())
+        return x * 2
+
+    runner = SimpleNamespace(
+        _dp_vocab_logits_rows=lambda: 32, compute_logits_from_hidden_states=project
+    )
+    out = TPUModelRunner._compute_dp_vocab_logits(runner, hidden, indices)
+    torch.testing.assert_close(out, expected * 2)
+    assert calls[0].shape == (32, 3)
+    assert torch.count_nonzero(calls[0][len(expected) :]) == 0
+
+
+def test_dp_vocab_cannot_truncate_verify_logits():
+    runner = SimpleNamespace(_dp_vocab_logits_rows=lambda: 8)
+    with pytest.raises(ValueError, match="coordinated capacity"):
+        TPUModelRunner._compute_dp_vocab_logits(runner, torch.zeros(32, 4))
+
+
 def test_idle_dp_rank_encodes_before_decoder_pairing():
     order = []
     runner = SimpleNamespace(
@@ -2195,6 +2235,7 @@ class TestInitializeAttentionKernelsThreshold:
         runner = MagicMock(spec=TPUModelRunner)
         runner._attention_kernels_initialized = False
         runner.model = None
+        runner.model_adapter = None
         runner.mesh = MagicMock()
         runner.vllm_config = MagicMock()
         runner.reorder_batch_threshold = 1
@@ -2269,6 +2310,19 @@ class TestInitializeAttentionKernelsThreshold:
 
     def test_no_pallas_layers(self):
         runner, layers = self._make_runner({})
+        self._run(runner, layers)
+        assert runner.reorder_batch_threshold == 1
+
+    @pytest.mark.parametrize("width", [3, 4, 5])
+    def test_model_owned_qsa_includes_verify_in_decode_prefix(self, width):
+        runner, layers = self._make_runner({})
+        runner.model_adapter = SimpleNamespace(decode_query_size=width)
+        self._run(runner, layers)
+        assert runner.reorder_batch_threshold == width
+
+    def test_model_owned_width_does_not_widen_other_attention(self):
+        runner, layers = self._make_runner({"narrow": 1})
+        runner.model_adapter = SimpleNamespace(decode_query_size=5)
         self._run(runner, layers)
         assert runner.reorder_batch_threshold == 1
 
@@ -2875,6 +2929,7 @@ def _dummy_run_stand_in(monkeypatch, forward_model):
         maybe_select_dummy_loras=lambda *a, **kw: contextlib.nullcontext(),
         _dp_num_tokens_across_dp=lambda n: None,
         forward_model=forward_model,
+        speculative_config=None,
         compute_selected_logits=lambda out, idx: out,
         _dp_vocab_logits=False,
     )
@@ -4049,6 +4104,7 @@ class TestLogitsAtDpVocabRows:
         and returns their rows of `hidden * 10`."""
         runner = SimpleNamespace(
             _dp_vocab_logits=on,
+            speculative_config=None,
             _dp_step_max_reqs=step_max_reqs,
             max_num_reqs=max_num_reqs,
             seen=[],

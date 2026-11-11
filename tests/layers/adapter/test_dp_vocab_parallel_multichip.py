@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""TPU_DP_VOCAB_PARALLEL over real collectives (DP 4 x TP 2 on one host).
+"""TPU_DP_VOCAB_PARALLEL on one host: DP8/TP1 and DP4/TP2.
 
 `test_dp_vocab_parallel.py` pins the arithmetic against threaded stand-ins for
 the groups; this pins what only hardware can answer: the embedding and the
@@ -36,7 +36,6 @@ import pytest
 pytestmark = [pytest.mark.multichip, pytest.mark.spawns_tpu_workers]
 
 WORLD_SIZE = 8
-DP, TP = 4, 2
 VOCAB = 1000  # pads to 1024: 8 shards of 128
 HIDDEN = 256
 TOKENS = 24
@@ -46,7 +45,7 @@ ROWS = 16
 LAUNCH_TIMEOUT_SECONDS = 480
 
 
-def _worker_command(result_dir: Path) -> list[str]:
+def _worker_command(result_dir: Path, tp_size: int) -> list[str]:
     return [
         sys.executable,
         "-m",
@@ -58,6 +57,8 @@ def _worker_command(result_dir: Path) -> list[str]:
         "--worker",
         "--result-dir",
         str(result_dir),
+        "--tp-size",
+        str(tp_size),
     ]
 
 
@@ -91,7 +92,9 @@ def _prepare_worker_env() -> dict[str, str]:
     return env
 
 
-def _check(rank: int) -> dict:
+def _check(rank: int, tp_size: int) -> dict:
+    from types import SimpleNamespace
+
     import torch
     from vllm.config import VllmConfig, set_current_vllm_config
     from vllm.distributed.parallel_state import (
@@ -106,6 +109,7 @@ def _check(rank: int) -> dict:
     from vllm_torchtpu import _patch_vllm_vocab_parallel_embedding
     from vllm_torchtpu.layers.adapter import dp_vocab_parallel as dvp
 
+    TP, DP = tp_size, WORLD_SIZE // tp_size
     _patch_vllm_vocab_parallel_embedding()
     world = get_world_group()
     backend = torch.distributed.get_backend(world.device_group)
@@ -134,6 +138,8 @@ def _check(rank: int) -> dict:
     hidden = [
         torch.randn(ROWS, HIDDEN, generator=gen).to(torch.bfloat16) for _ in range(DP)
     ]
+    for x in hidden:
+        x[0] = 0  # Equal logits across vocab shards must choose global token 0.
 
     out: dict = {}
     # Stock layers through the TPU vocab patch, handed the serving-layout EP group.
@@ -179,10 +185,49 @@ def _check(rank: int) -> dict:
         except Exception as exc:  # noqa: BLE001 - reported to the parent
             traceback.print_exc()
             out[f"{how}/error"] = repr(exc)
+    out["weight_rows"] = [embed.weight.shape[0], head.weight.shape[0]]
+    out["expected_weight_rows"] = embed.num_embeddings_padded // WORLD_SIZE
+
+    # One target verify (K+1 rows/request), then K draft projections, with
+    # rank-local request counts and an idle engine entering the same head.
+    from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+    full_weight = table.to("tpu")
+    native_head = torch.compile(
+        lambda h: h @ full_weight.T, backend="tpu", fullgraph=True, dynamic=False
+    )
+    fl = torch.compile(run_logits, backend="tpu", fullgraph=True, dynamic=False)
+
+    rows = ROWS * 4
+    request_count = dp_rank % (ROWS + 1)
+    verify = hidden[dp_rank].repeat_interleave(4, dim=0).to("tpu")
+    runner = SimpleNamespace(
+        _dp_vocab_logits_rows=lambda: rows, compute_logits_from_hidden_states=fl
+    )
+    # Dummy ranks retain rows so the collective result is actually consumed.
+    indices = (
+        torch.arange(request_count * 4, device="tpu", dtype=torch.int32)
+        if request_count
+        else torch.zeros(rows, device="tpu", dtype=torch.int32)
+    )
+    got = TPUModelRunner._compute_dp_vocab_logits(runner, verify, indices).cpu()
+    want = native_head(verify).cpu()[indices.cpu().long()]
+    torch.testing.assert_close(got, want, rtol=2**-7, atol=2**-7)
+    out["verify_rows"] = len(got)
+
+    h = hidden[dp_rank].to("tpu")
+    matches = []
+    for _ in range(3):
+        expected = native_head(h).argmax(-1).cpu()
+        tokens = fl(h).argmax(-1)
+        actual = tokens.cpu()
+        matches.append(bool(torch.equal(actual, expected)))
+        h = run_embed(tokens.to(torch.int64))
+    out["mtp_draft_greedy_matches"] = matches
     return out
 
 
-def _run_worker(result_dir: Path) -> None:
+def _run_worker(result_dir: Path, tp_size: int) -> None:
     import torch
     import torch_tpu  # noqa: F401
     from torch import distributed as dist
@@ -204,7 +249,7 @@ def _run_worker(result_dir: Path) -> None:
             distributed_init_method="env://",
             backend="tpu_dist",
         )
-        result["check"] = _check(rank)
+        result["check"] = _check(rank, tp_size)
     except BaseException as exc:  # noqa: BLE001 - reported to the parent
         traceback.print_exc()
         result["error"] = repr(exc)
@@ -221,9 +266,9 @@ def _run_worker(result_dir: Path) -> None:
         raise SystemExit(1)
 
 
-def _launch(result_dir: Path) -> subprocess.CompletedProcess[str]:
+def _launch(result_dir: Path, tp_size: int) -> subprocess.CompletedProcess[str]:
     process = subprocess.Popen(
-        _worker_command(result_dir),
+        _worker_command(result_dir, tp_size),
         cwd=Path(__file__).resolve().parents[3],
         env=_prepare_worker_env(),
         stdout=subprocess.PIPE,
@@ -246,10 +291,11 @@ def _launch(result_dir: Path) -> subprocess.CompletedProcess[str]:
     return subprocess.CompletedProcess(process.args, process.returncode, output, "")
 
 
-def test_dp_vocab_parallel_on_real_collectives(tmp_path):
+@pytest.mark.parametrize("tp_size", [1, 2])
+def test_dp_vocab_parallel_on_real_collectives(tmp_path, tp_size):
     result_dir = tmp_path / "dp_vocab"
     result_dir.mkdir()
-    completed = _launch(result_dir)
+    completed = _launch(result_dir, tp_size)
     results = []
     for rank in range(WORLD_SIZE):
         path = result_dir / f"rank_{rank}.json"
@@ -262,6 +308,8 @@ def test_dp_vocab_parallel_on_real_collectives(tmp_path):
     assert not errors, (errors, (completed.stdout or "")[-4000:])
     for r in results:
         check = r["check"]
+        assert check["weight_rows"] == [check["expected_weight_rows"]] * 2
+        assert all(check["mtp_draft_greedy_matches"]), (r["rank"], check)
         for how in ("eager", "compiled"):
             assert f"{how}/error" not in check, (r["rank"], check)
             assert check[f"embed/{how}"]["max_abs_err"] == 0.0, (r["rank"], check)
@@ -281,6 +329,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--worker", action="store_true")
     parser.add_argument("--result-dir", type=Path, required=True)
+    parser.add_argument("--tp-size", type=int, default=2)
     args = parser.parse_args()
     if args.worker:
-        _run_worker(args.result_dir)
+        _run_worker(args.result_dir, args.tp_size)

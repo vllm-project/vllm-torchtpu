@@ -201,9 +201,11 @@ def test_old_model_has_no_adapter():
 
 
 @pytest.mark.parametrize("tp", [1, 2])
+@pytest.mark.parametrize("dp_vocab", [False, True])
 @pytest.mark.parametrize("other_decode", [False, True])
+@pytest.mark.parametrize("mtp", [False, True])
 def test_profile_binds_state_and_uses_serving_dtypes_and_full_work(
-    monkeypatch, tp, other_decode
+    monkeypatch, tp, dp_vocab, other_decode, mtp
 ):
     from contextlib import nullcontext
 
@@ -214,6 +216,8 @@ def test_profile_binds_state_and_uses_serving_dtypes_and_full_work(
     monkeypatch.setenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", "1")
     captured = {}
     logits = Mock(return_value=torch.zeros((8, 1)))
+    dp_logits = Mock(return_value=torch.zeros((8, 1)))
+    logits_rows = 8 * (4 if mtp else 1)
 
     def context(metadata, *args, **kwargs):
         captured["metadata"] = metadata
@@ -230,7 +234,10 @@ def test_profile_binds_state_and_uses_serving_dtypes_and_full_work(
     )
     sync = Mock()
     monkeypatch.setattr(inputs, "synchronize_tensors", sync)
+    spec = NS(num_speculative_tokens=3) if mtp else None
     runner = NS(
+        speculative_config=spec,
+        drafter=Mock(),
         device="cpu",
         _pp_is_first=True,
         supports_mm_inputs=False,
@@ -241,11 +248,14 @@ def test_profile_binds_state_and_uses_serving_dtypes_and_full_work(
             num_reqs=0, token_ids_cpu_tensor=torch.zeros((8, 4096), dtype=torch.int32)
         ),
         max_model_len=4096,
-        vllm_config=NS(),
+        vllm_config=NS(speculative_config=spec),
         mesh=None,
         _dp_num_tokens_across_dp=lambda n: torch.full((8,), n, dtype=torch.int32),
         forward_model=forward,
         compute_selected_logits=logits,
+        _dp_vocab_logits=dp_vocab,
+        _dp_vocab_logits_rows=lambda: logits_rows,
+        _compute_dp_vocab_logits=dp_logits,
         _dp_step_other_decode=other_decode,
     )
     runner.model_config = NS(hf_text_config=q4exp_text_config())
@@ -262,6 +272,7 @@ def test_profile_binds_state_and_uses_serving_dtypes_and_full_work(
     )
     runner.most_model_len = 384
     adapter.dummy_run(128, 8, num_blocks=3, use_max_model_len=False)
+    runner.drafter._forward_draft.assert_not_called()
     assert sync.call_count == 1 and sync.call_args.kwargs.get("wait", True)
     sync.reset_mock()
     kwargs = captured["model_kwargs"]
@@ -279,6 +290,7 @@ def test_profile_binds_state_and_uses_serving_dtypes_and_full_work(
     assert kwargs["ngram_context"].tolist() == [[248044, 248044]] * 8
     assert "ple_raw_embeddings" not in kwargs
     logits.assert_not_called()
+    dp_logits.assert_not_called()
     runner.input_batch.num_reqs = 1
     with pytest.raises(AssertionError, match="no live requests"):
         adapter.dummy_run(128, 8)
@@ -291,7 +303,20 @@ def test_profile_binds_state_and_uses_serving_dtypes_and_full_work(
     adapter.dummy_run(128, 8, num_blocks=3, use_max_model_len=False, dp_lockstep=True)
     # Idle TP groups must also issue the LM-head collective before returning
     # to DP coordination, or busy ranks cannot materialize their sample.
-    if tp > 1:
+    if dp_vocab:
+        # Even TP1 must pair DP vocab collectives, including async submission.
+        dp_logits.assert_called_once()
+        logits.assert_not_called()
+        hidden, indices = dp_logits.call_args.args
+        assert hidden.shape == (128, 2560)
+        assert indices.shape == (logits_rows,) and indices.dtype == torch.int32
+        assert not indices.any()
+        if other_decode:
+            sync.assert_called_once_with(dp_logits.return_value, wait=False)
+        else:
+            sync.assert_called_once_with(dp_logits.return_value)
+    elif tp > 1:
+        dp_logits.assert_not_called()
         if other_decode:
             sync.assert_not_called()
         else:
@@ -370,6 +395,7 @@ def test_native_kwargs_match_warmup_profile_and_idle(monkeypatch, tokens, live_c
     runner._record_input_staging_fence = Mock()
     runner.parallel_config.tensor_parallel_size = 1
     runner._dp_step_other_decode = False
+    runner._dp_vocab_logits = False
     runner.scheduler_config.max_num_seqs = cfg.scheduler_config.max_num_seqs
     runner._dp_num_tokens_across_dp = lambda n: torch.full((8,), n, dtype=torch.int32)
     runner.max_model_len = cfg.model_config.max_model_len
