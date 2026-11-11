@@ -2820,6 +2820,12 @@ class TPUModelRunner(GPUModelRunner):
         """
         if plan is None:
             return
+        logger.info_once(
+            "VLLM_TPU_SPEC_BOUNDARY_STATE_COPY: verify step copied boundary "
+            "GDN states into %d mamba groups (block size %d)",
+            len(self._mamba_copy_plan),
+            plan.block_size,
+        )
         num_valid = (
             (next_tokens.index_select(0, plan.rows) != INVALID_TOKEN_ID)
             .sum(dim=1)
