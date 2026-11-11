@@ -484,9 +484,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Store GDN's in_proj_qkvz in the matmul's (k, n) layout, like every other
     # linear, instead of vLLM's [n_out, n_in]. On the per-block FP8 path (gmm_v2)
-    # the kept layout costs a full weight copy every step. Ignored with prefill
-    # context parallelism, whose pooled op reads the weight raw as
-    # [n_out, n_in]. The experimental AOT export rejects it at TP > 1: its
+    # the kept layout costs a full weight copy every step. Ignored when PCP runs
+    # with a combined in_proj_qkvz and cp_kv_cache_interleave_size in
+    # {16, 32, 64, 128, 256} (fused pooled PCP prefill), whose kernel reads the
+    # weight raw as [n_out, n_in]. The experimental AOT export rejects it at
+    # TP > 1: its
     # weight mapper assumes the vLLM layout for this weight. Opt-in while the
     # (k, n) layout is verified only on the per-block FP8 path; once the BF16,
     # checkpoint-FP8 and per-channel paths are verified and the export mapper

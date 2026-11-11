@@ -31,7 +31,8 @@ making the consumer consistent rather than by exempting the layer:
                    teaching it (k, n) means reworking index maps and re-tuning
                    block sizes under a VMEM budget, so the layer keeps the old
                    layout. TPU_GDN_QKVZ_KERNEL_LAYOUT flips it like the rest
-                   when PCP is off. This is the one remaining marker.
+                   when fused pooled PCP prefill is not active. This is the one
+                   remaining marker.
 """
 
 import torch
