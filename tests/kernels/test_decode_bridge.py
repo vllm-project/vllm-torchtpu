@@ -110,7 +110,7 @@ def test_swa_bridge_preserves_dynamic_token_dimension(monkeypatch):
             )
 
     arrays = (
-        torch.zeros((512, 64, 512), dtype=torch.bfloat16),
+        torch.zeros((512 * 128, 128), dtype=torch.int32),
         torch.ones((48, 1539), dtype=torch.int32),
         torch.arange(49, dtype=torch.int32) * 6,
         torch.arange(288, dtype=torch.int32),
