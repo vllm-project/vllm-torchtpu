@@ -516,7 +516,11 @@ def _ragged_paged_attention_kernel_loop(
 
         if not skip_kv_mask:
             mask = mask_and(mask, k_span < effective_kv_len_int)
-            v = jnp.where(v_span < effective_kv_len_int, v, 0.0)
+            v_valid = v_span < effective_kv_len_int
+            if sliding_window is not None:
+                v_pos = processed_kv_len + lax.broadcasted_iota(jnp.int32, v.shape, 0)
+                v_valid = mask_and(v_valid, v_pos + sliding_window > processed_q_len)
+            v = jnp.where(v_valid, v, 0.0)
 
         if sliding_window is not None:
             mask = mask_and(mask, q_span < k_span + sliding_window)

@@ -13,6 +13,7 @@
 # limitations under the License.
 """Tests for batched RPA config and block size calculations across TPU generations."""
 
+import dataclasses
 from unittest.mock import MagicMock, patch
 
 import jax.numpy as jnp
@@ -82,3 +83,95 @@ def test_calculate_block_sizes_generation(
         )
         assert decode_blocks.bq_sz >= decode_blocks.bq_c_sz >= expected_bq_c_min
         assert prefill_blocks.bq_sz >= prefill_blocks.bq_c_sz >= expected_bq_c_min
+
+
+@pytest.mark.parametrize(
+    "sliding_window, capped_decode_bkv",
+    [(1024, 512), (128, 256), (None, None)],  # 256: the first block searched
+)
+def test_sliding_decode_block_cap_applies_only_to_sliding_decode(
+    sliding_window, capped_decode_bkv
+):
+    model_cfg = configs.ModelConfigs(
+        num_q_heads=4,
+        num_kv_heads=2,
+        head_dim=256,
+        sliding_window=sliding_window,
+        mask_value=-1e9,
+    )
+    serve_cfg = configs.ServingConfigs(
+        num_seqs=64,
+        page_size=256,
+        total_q_tokens=16,
+        num_page_indices=64 * 640,
+        dtype_q=jnp.bfloat16,
+        dtype_kv=jnp.float8_e4m3fn,
+        dtype_out=jnp.bfloat16,
+    )
+    vmem_limit = 64 * 1024 * 1024
+    with patch(
+        "jax.experimental.pallas.tpu.get_tpu_info",
+        return_value=_create_mock_tpu_info(7, chip_version="v7x", mxu_column_size=256),
+    ):
+        default = wrapper.calculate_block_sizes(model_cfg, serve_cfg, vmem_limit)
+        capped = wrapper.calculate_block_sizes(
+            model_cfg, serve_cfg, vmem_limit, cap_sliding_decode_block=True
+        )
+    assert default[0].bkv_sz > 512
+    expected_decode_bkv = capped_decode_bkv or default[0].bkv_sz
+    assert capped[0] == dataclasses.replace(default[0], bkv_sz=expected_decode_bkv)
+    assert capped[1] == default[1]
+
+
+def test_rpa_configs_cpu_fallback_without_tpu():
+    model_cfg = configs.ModelConfigs(
+        num_q_heads=8,
+        num_kv_heads=2,
+        head_dim=256,
+        sliding_window=None,
+        mask_value=-1e9,
+    )
+    serve_cfg = configs.ServingConfigs(
+        num_seqs=16,
+        page_size=256,
+        total_q_tokens=256,
+        num_page_indices=64,
+        dtype_q=jnp.bfloat16,
+        dtype_kv=jnp.float8_e4m3fn,
+        dtype_out=jnp.bfloat16,
+    )
+    block_cfg = configs.BlockSizes(bq_sz=256, bq_c_sz=256, bkv_sz=256, batch_size=2)
+    with (
+        patch(
+            "jax.experimental.pallas.tpu.get_tpu_info",
+            side_effect=RuntimeError("No TPU runtime on CPU host"),
+        ) as mock_get_info,
+        patch(
+            "jax.experimental.pallas.tpu.get_tpu_info_for_chip",
+            side_effect=ValueError("Unknown chip on CPU fallback"),
+        ),
+    ):
+        rpa_cfg = configs.RpaConfigs(
+            model=model_cfg,
+            serve=serve_cfg,
+            block=block_cfg,
+            mode=configs.RpaCase.MIXED,
+            vmem_limit_bytes=64 * 1024 * 1024,
+        )
+        mock_get_info.assert_not_called()
+        assert rpa_cfg.max_steps_ub > 0
+        assert rpa_cfg.aligned_q_head_dim == 256
+        assert rpa_cfg.aligned_kv_head_dim == 256
+        assert rpa_cfg.kv_token_align == 1
+        assert rpa_cfg.lm_scratch_shape[-1] == 128
+        assert rpa_cfg.lse_vmem_shape[-1] == 128
+        hnd_cfg = configs.RpaConfigs(
+            model=model_cfg,
+            serve=dataclasses.replace(
+                serve_cfg, kv_layout=configs.KVLayout.SEQ_ALONG_LANE
+            ),
+            block=block_cfg,
+            mode=configs.RpaCase.MIXED,
+            vmem_limit_bytes=64 * 1024 * 1024,
+        )
+        assert hnd_cfg.kv_token_align == 128

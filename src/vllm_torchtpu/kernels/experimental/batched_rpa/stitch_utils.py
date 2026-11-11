@@ -105,9 +105,7 @@ def _stitch_prefill_lane(
     cfgs: configs.RpaConfigs,
 ):
     """O(N) Prefill Path: Roll the entire new tokens buffer into place."""
-    total_head_words = (
-        cfgs.model.num_kv_heads * 2 * cfgs.aligned_kv_head_dim // cfgs.serve.packing_kv
-    )
+    total_head_words = cfgs.kv_rows
     num_sublanes = pltpu.get_tpu_info().num_sublanes
     words_per_sublane = total_head_words // num_sublanes
     vmem_u32_reshaped = vmem_u32_ref.reshape(words_per_sublane, num_sublanes, v_len)
@@ -148,12 +146,7 @@ def store_new_kv_lane(
 
     else:
         merged_cache_u32 = stitch_result
-        total_head_words = (
-            cfgs.model.num_kv_heads
-            * 2
-            * cfgs.aligned_kv_head_dim
-            // cfgs.serve.packing_kv
-        )
+        total_head_words = cfgs.kv_rows
         num_sublanes = pltpu.get_tpu_info().num_sublanes
         words_per_sublane = total_head_words // num_sublanes
         vmem_u32_reshaped = vmem_u32_ref.reshape(words_per_sublane, num_sublanes, v_len)

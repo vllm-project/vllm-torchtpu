@@ -19,9 +19,20 @@ import math
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
-from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.experimental.batched_rpa import utils
+from vllm_torchtpu.tpu_info import get_host_safe_tpu_info
+
+_DEFAULT_NUM_LANES = 128
+_DEFAULT_NUM_SUBLANES = 8
+_DEFAULT_SMEM_BYTES = 1024 * 1024
+
+
+def _tpu_hw() -> tuple[int, int, int]:
+    info = get_host_safe_tpu_info()
+    if info is None:
+        return _DEFAULT_NUM_LANES, _DEFAULT_NUM_SUBLANES, _DEFAULT_SMEM_BYTES
+    return info.num_lanes, info.num_sublanes, info.smem_capacity_bytes
 
 
 @dataclasses.dataclass(frozen=True)
@@ -174,6 +185,11 @@ class ServingConfigs:
     return_lse: bool = False
     skip_kv_update: bool = False
     mask_invalid_v: bool | None = None
+    skip_empty_launch: bool = False
+    fp8_compute: bool = False
+    unmasked_interior: bool = False
+    shared_kv_rotary_dims: int = 0
+    skip_masked_kv_zero_fill: bool = False
 
     def __post_init__(self):
         if self.mask_invalid_v is None:
@@ -181,6 +197,11 @@ class ServingConfigs:
                 self,
                 "mask_invalid_v",
                 self.kv_layout == KVLayout.SEQ_ALONG_LANE,
+            )
+        if self.skip_masked_kv_zero_fill and not self.mask_invalid_v:
+            raise ValueError(
+                "skip_masked_kv_zero_fill needs mask_invalid_v: without it the "
+                "PV matmul reads the KV window's unwritten rows."
             )
 
     @property
@@ -224,6 +245,17 @@ class RpaConfigs:
     serve: ServingConfigs
     mode: RpaCase
     vmem_limit_bytes: int
+
+    def __post_init__(self):
+        if (
+            self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE
+            and self.block.bkv_sz % self.serve.page_size
+        ):
+            raise ValueError(
+                f"SEQ_ALONG_LANE KV blocks must be whole pages: bkv_sz "
+                f"{self.block.bkv_sz} is not a multiple of page_size "
+                f"{self.serve.page_size}."
+            )
 
     # Expose block sizes for ease of use.
 
@@ -274,8 +306,9 @@ class RpaConfigs:
         word_size_bytes = 4
         fixed_bytes *= word_size_bytes
 
+        num_lanes, _, smem_capacity_bytes = _tpu_hw()
         smem_limit_bytes = (
-            pltpu.get_tpu_info().smem_capacity_bytes - 32 * 1024
+            smem_capacity_bytes - 32 * 1024
         ) * self.serve.smem_fraction_limit_for_schedule_generation
         available_bytes = smem_limit_bytes - fixed_bytes
 
@@ -295,7 +328,6 @@ class RpaConfigs:
 
         max_steps_ub = available_bytes // bytes_per_step
 
-        num_lanes = pltpu.get_tpu_info().num_lanes
         max_steps_ub = max(1, max_steps_ub // num_lanes) * num_lanes
         return int(max_steps_ub)
 
@@ -316,7 +348,7 @@ class RpaConfigs:
     def page_window_slot_len(self) -> int:
         """SMEM entries per window slot: lane-aligned, plus a lane group of slack
         when the window itself is not."""
-        num_lanes = pltpu.get_tpu_info().num_lanes
+        num_lanes, _, _ = _tpu_hw()
         entries = self.page_window_entries
         return utils.align_to(entries, num_lanes) + (
             num_lanes if entries % num_lanes else 0
@@ -350,14 +382,13 @@ class RpaConfigs:
 
     @property
     def aligned_q_head_dim(self) -> int:
-        num_lanes = pltpu.get_tpu_info().num_lanes
+        num_lanes, _, _ = _tpu_hw()
         return utils.align_to(self.model.head_dim, num_lanes)
 
     # Actual head dimension used for compute, does not include scale factors.
     @property
     def compute_kv_head_dim(self) -> int:
-        num_lanes = pltpu.get_tpu_info().num_lanes
-        num_sublanes = pltpu.get_tpu_info().num_sublanes
+        num_lanes, num_sublanes, _ = _tpu_hw()
         kv_packing = utils.get_dtype_packing(self.serve.dtype_kv)
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
             return utils.align_to(self.model.head_dim, num_sublanes * kv_packing)
@@ -367,8 +398,7 @@ class RpaConfigs:
     # per_token_scale is enabled.
     @property
     def aligned_kv_head_dim(self) -> int:
-        num_lanes = pltpu.get_tpu_info().num_lanes
-        num_sublanes = pltpu.get_tpu_info().num_sublanes
+        num_lanes, num_sublanes, _ = _tpu_hw()
         kv_packing = utils.get_dtype_packing(self.serve.dtype_kv)
 
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
@@ -408,7 +438,19 @@ class RpaConfigs:
         return self.mode == RpaCase.DECODE
 
     @property
+    def kv_rows(self) -> int:
+        """Packed 32-bit rows per token that SEQ_ALONG_LANE pages hold and the
+        kernel moves: every head's K and V, or a shared-KV page's value and
+        rotated key rows."""
+        rows = self.aligned_kv_head_dim // self.serve.packing_kv
+        if self.serve.shared_kv_rotary_dims:
+            return rows + 2 * self.serve.shared_kv_rotary_dims // self.serve.packing_kv
+        return self.model.num_kv_heads * 2 * rows
+
+    @property
     def kv_bytes_per_token(self) -> int:
+        if self.serve.shared_kv_rotary_dims:
+            return self.kv_rows * 4
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
             num_elements = self.model.num_kv_heads * 2 * self.aligned_kv_head_dim
         else:
@@ -417,55 +459,43 @@ class RpaConfigs:
         kv_dtype_bytes = utils.get_dtype_bits(self.serve.dtype_kv)
         return int(num_elements * kv_dtype_bytes) >> 3  # 8 bits per byte
 
+    def _q_like_bytes_per_token(self, dtype: jnp.dtype) -> int:
+        elems = (
+            self.model.num_kv_heads
+            * self.aligned_num_q_heads_per_kv_head
+            * self.aligned_q_head_dim
+        )
+        return int(elems * utils.get_dtype_bits(dtype)) >> 3
+
     @property
     def q_bytes_per_token(self) -> int:
-        q_dtype_bytes = utils.get_dtype_bits(self.serve.dtype_q)
-        return (
-            int(
-                self.model.num_kv_heads
-                * self.aligned_num_q_heads_per_kv_head
-                * self.aligned_q_head_dim
-                * q_dtype_bytes
-            )
-            >> 3
-        )
+        return self._q_like_bytes_per_token(self.serve.dtype_q)
 
     @property
     def o_bytes_per_token(self) -> int:
-        out_dtype_bytes = utils.get_dtype_bits(self.serve.dtype_out)
-        return (
-            int(
-                self.model.num_kv_heads
-                * self.aligned_num_q_heads_per_kv_head
-                * self.aligned_q_head_dim
-                * out_dtype_bytes
-            )
-            >> 3
-        )
+        return self._q_like_bytes_per_token(self.serve.dtype_out)
 
-    @property
-    def q_vmem_shape(self):
-        q_per_kv_packing = self.aligned_num_q_heads_per_kv_head // self.serve.packing_q
+    def _q_like_vmem_shape(self, packing: int):
         return (
             self.block.batch_size,
             self.model.num_kv_heads,
             self.block.bq_sz,
-            q_per_kv_packing,
-            self.serve.packing_q,
+            self.aligned_num_q_heads_per_kv_head // packing,
+            packing,
             self.aligned_q_head_dim,
         )
 
     @property
-    def kv_token_align(self) -> int:
-        """DMA token granularity: the 128-lane tile for SEQ_ALONG_LANE, else 1.
+    def q_vmem_shape(self):
+        return self._q_like_vmem_shape(self.serve.packing_q)
 
-        SEQ_ALONG_LANE packs tokens along the lane dim, so every DMA token count
-        must be a multiple of the 128-lane tile. HEAD_ALONG_SUBLANE puts tokens on
-        the sublane dim, where single tokens are addressable.
-        """
-        if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
-            return pltpu.get_tpu_info().num_lanes
-        return 1
+    @property
+    def o_vmem_shape(self):
+        return self._q_like_vmem_shape(utils.get_dtype_packing(self.serve.dtype_out))
+
+    @property
+    def kv_token_align(self) -> int:
+        return _tpu_hw()[0] if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE else 1
 
     @property
     def kv_vmem_lanes(self) -> int:
@@ -480,6 +510,14 @@ class RpaConfigs:
 
     @property
     def kv_vmem_shape(self):
+        if self.serve.shared_kv_rotary_dims:
+            return (
+                self.block.batch_size,
+                1,
+                self.kv_rows,
+                self.serve.packing_kv,
+                self.kv_vmem_lanes,
+            )
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
             return (
                 self.block.batch_size,
@@ -509,7 +547,7 @@ class RpaConfigs:
 
     @property
     def lm_scratch_shape(self):
-        num_lanes = pltpu.get_tpu_info().num_lanes
+        num_lanes, _, _ = _tpu_hw()
         return (
             self.model.num_kv_heads,
             self.block.bq_sz * self.aligned_num_q_heads_per_kv_head,
@@ -518,7 +556,7 @@ class RpaConfigs:
 
     @property
     def lse_vmem_shape(self):
-        num_lanes = pltpu.get_tpu_info().num_lanes
+        num_lanes, _, _ = _tpu_hw()
         q_per_kv_packing = self.aligned_num_q_heads_per_kv_head // self.serve.packing_q
         return (
             self.block.batch_size,

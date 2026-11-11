@@ -1249,6 +1249,7 @@ class TpuPlatform(Platform):
         )
 
         check_attention_backend_config(vllm_config)
+        _validate_prefill_first_scheduler_config(vllm_config)
 
         if envs.DP_SCHED_ENABLED and parallel_config.data_parallel_size > 1:
             dp_sched_cls = "vllm_torchtpu.core.tpu_scheduler.TpuDpScheduler"
@@ -1492,6 +1493,61 @@ def _get_linear_token_paddings(max_token_size: int, longest_pass: int) -> list[i
             len(paddings),
         )
     return paddings
+
+
+def _validate_prefill_first_scheduler_config(vllm_config: VllmConfig) -> None:
+    sched_cfg = vllm_config.scheduler_config
+    sched_cls = sched_cfg.scheduler_cls
+    if sched_cls is None:
+        return
+    from vllm_torchtpu.core.experimental.prefill_first_scheduler import (
+        DEFAULT_SOLO_OVER_TOKENS,
+        SCHEDULER_CLS,
+        PrefillFirstScheduler,
+    )
+
+    is_prefill_first = sched_cls == SCHEDULER_CLS or (
+        isinstance(sched_cls, type) and issubclass(sched_cls, PrefillFirstScheduler)
+    )
+    if not is_prefill_first:
+        return
+    par_cfg = vllm_config.parallel_config
+    dp_size = par_cfg.data_parallel_size
+    if dp_size > 1:
+        raise ValueError(
+            "PrefillFirstScheduler does not support data parallelism "
+            f"(data_parallel_size={dp_size}): independent per-rank solo steps "
+            "deadlock cross-DP collectives."
+        )
+    if getattr(par_cfg, "pipeline_parallel_size", 1) > 1:
+        raise ValueError("PrefillFirstScheduler does not support pipeline parallelism.")
+    if (
+        getattr(par_cfg, "prefill_context_parallel_size", 1) > 1
+        or getattr(par_cfg, "decode_context_parallel_size", 1) > 1
+    ):
+        raise ValueError(
+            "PrefillFirstScheduler does not support standalone PCP or DCP."
+        )
+    if getattr(vllm_config, "lora_config", None) is not None:
+        raise ValueError("PrefillFirstScheduler does not support LoRA.")
+    if getattr(vllm_config, "speculative_config", None) is not None:
+        raise ValueError("PrefillFirstScheduler does not support speculative decoding.")
+    if getattr(vllm_config, "kv_transfer_config", None) is not None:
+        raise ValueError(
+            "PrefillFirstScheduler does not support KV transfer connectors."
+        )
+    max_batched = getattr(sched_cfg, "max_num_batched_tokens", None)
+    if isinstance(max_batched, int) and max_batched <= DEFAULT_SOLO_OVER_TOKENS:
+        raise ValueError(
+            f"PrefillFirstScheduler requires max_num_batched_tokens ({max_batched}) "
+            f"> solo_over_tokens ({DEFAULT_SOLO_OVER_TOKENS})."
+        )
+    threshold = getattr(sched_cfg, "long_prefill_token_threshold", 0)
+    if isinstance(threshold, int) and threshold > 0:
+        raise ValueError(
+            "PrefillFirstScheduler requires long_prefill_token_threshold == 0, "
+            f"got {threshold}."
+        )
 
 
 def _configure_pipeline_chunks(vllm_config: VllmConfig) -> None:

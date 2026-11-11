@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import dataclasses
+import functools
 from collections.abc import Callable
 from typing import cast
 
@@ -67,6 +68,7 @@ def strided_load_bkv(
             dtype=cfgs.serve.dtype_kv,
         )
         if valid_mask is not None:
+            k = jnp.where(valid_mask, k, jnp.zeros_like(k))
             v = jnp.where(valid_mask, v, jnp.zeros_like(v))
         return [(k, v)]
 
@@ -82,6 +84,30 @@ def strided_load_bkv(
     )
 
 
+def shared_kv_head(
+    kv_in_vref: jax.Ref,
+    b_idx: int,
+    valid: jax.Array | None,
+    *,
+    cfgs: configs.RpaConfigs,
+) -> tuple[jax.Array, jax.Array]:
+    """Assemble `(key, value)` `[head_dim, bkv]` from lane `b_idx` shared-KV block."""
+    words = kv_in_vref.at[b_idx, 0].bitcast(jnp.uint32).reshape(-1, cfgs.kv_vmem_lanes)
+    rows = cfgs.compute_kv_head_dim // cfgs.serve.packing_kv
+    rot = cfgs.serve.shared_kv_rotary_dims // cfgs.serve.packing_kv
+    half = rows // 2
+    v_u32 = utils.strided_load(words, 0, rows, 1)[:, : cfgs.bkv_sz]
+    r_u32 = utils.strided_load(words, rows, 2 * rot, 1)[:, : cfgs.bkv_sz]
+    if valid is not None:
+        v_u32 = jnp.where(valid, v_u32, jnp.zeros_like(v_u32))
+        r_u32 = jnp.where(valid[: 2 * rot], r_u32, jnp.zeros_like(r_u32))
+    k_u32 = jnp.concatenate(
+        [r_u32[:rot], v_u32[rot:half], r_u32[rot:], v_u32[half + rot :]], axis=0
+    )
+    dtype = cfgs.serve.dtype_kv
+    return pltpu.bitcast(k_u32, dtype), pltpu.bitcast(v_u32, dtype)
+
+
 def calculate_and_store_out(
     step_idx: jax.Array,
     schedule_ref: schedule.RpaSchedule,
@@ -92,6 +118,7 @@ def calculate_and_store_out(
     lse_o_vref: jax.Ref | None,
     *,
     cfgs: configs.RpaConfigs,
+    carry_refs: tuple[jax.Ref, jax.Ref] | None = None,
 ):
     def _accum(b_idx: int | jax.Array, batch_acc: jax.Array, batch_l: jax.Array):
         batch_l = utils.broadcast_minor(batch_l, batch_acc.shape)
@@ -102,7 +129,7 @@ def calculate_and_store_out(
         ):
             result = lax.div(batch_acc, batch_l)
         else:
-            result = batch_acc * pl.reciprocal(batch_l, approx=True)
+            result = batch_acc * pltpu.reciprocal(batch_l, approx=True)
         out = result.astype(cfgs.serve.dtype_out)
 
         o_u32_vref = o_vref.at[b_idx].bitcast(jnp.uint32)
@@ -134,9 +161,23 @@ def calculate_and_store_out(
         # tune `fuse_accum` for your use case.
         for b in range(cfgs.batch_size):
             is_last_k = schedule_ref.is_last_k[step_idx, b] == 1
+            accum_named_call = jax.named_call(_accum, name=f"accum_{b}")
+            if carry_refs is not None and b == cfgs.batch_size - 1:
+                acc_ref, l_ref = carry_refs
+
+                def _accum_carry(
+                    *,
+                    fn=accum_named_call,
+                    lane=b,
+                    a_ref=acc_ref,
+                    s_ref=l_ref,
+                ):
+                    fn(lane, a_ref[...], s_ref[...])
+
+                jax.lax.cond(is_last_k, _accum_carry, lambda: None)
+                continue
             acc_val = acc_list[b]
             l_val = l_list[b]
-            accum_named_call = jax.named_call(_accum, name=f"accum_{b}")
             jax.lax.cond(
                 is_last_k, accum_named_call, lambda *_: None, b, acc_val, l_val
             )
@@ -241,6 +282,7 @@ def _compute_valid_kv_mask(
     b_idx: int,
     stitch_meta: StitchMetadata,
     step_meta: ComputeMetadata,
+    sliding_window: int | None = None,
 ) -> jax.Array:
     """Builds a boolean mask for valid token slices before PV."""
     # PV reduces over the whole tile: zero probabilities do not isolate NaNs
@@ -248,6 +290,8 @@ def _compute_valid_kv_mask(
     valid = token < (
         stitch_meta.bkv_sz_frm_cache[b_idx] + stitch_meta.bkv_sz_frm_new[b_idx]
     )
+    if sliding_window is not None:
+        valid &= token >= (1 - sliding_window - step_meta.causal_offset[b_idx])
     if step_meta.local_k_start is not None:
         valid &= token >= step_meta.local_k_start[b_idx]
     if step_meta.local_k_end is not None:
@@ -499,6 +543,69 @@ def rpa_body(
         cfgs=cfgs,
     )
 
+    attend = functools.partial(
+        _attend_and_store,
+        step,
+        q_vref,
+        kv_in_vref,
+        o_vref,
+        lse_o_vref,
+        schedule_ref,
+        m_scratch_ref,
+        l_scratch_ref,
+        acc_scratch_ref,
+        stitch_meta=stitch_meta,
+        step_meta=step_meta,
+        cfgs=cfgs,
+    )
+    if cfgs.mode == configs.RpaCase.MIXED and cfgs.serve.unmasked_interior:
+        needs_mask = step_needs_mask(step, schedule_ref, step_meta, cfgs=cfgs)
+        pl.when(needs_mask)(functools.partial(attend, masked=True))
+        pl.when(jnp.logical_not(needs_mask))(functools.partial(attend, masked=False))
+    else:
+        attend(masked=True)
+
+
+def step_needs_mask(
+    step: jax.Array,
+    schedule_ref: schedule.RpaSchedule,
+    step_meta: ComputeMetadata,
+    *,
+    cfgs: configs.RpaConfigs,
+) -> jax.Array:
+    """Whether `generate_mask` masks out any (query, key) pair of the step."""
+    needs = []
+    for b_idx in range(cfgs.batch_size):
+        offset = step_meta.causal_offset[b_idx]
+        lane = jnp.logical_or(
+            offset > 1 - cfgs.bkv_sz, schedule_ref.s_idx[step, b_idx] == -1
+        )
+        if (sliding_window := cfgs.model.sliding_window) is not None:
+            lane = jnp.logical_or(lane, offset <= cfgs.bq_sz - 1 - sliding_window)
+        if step_meta.local_k_start is not None:
+            lane = jnp.logical_or(lane, step_meta.local_k_start[b_idx] > 0)
+        if step_meta.local_k_end is not None:
+            lane = jnp.logical_or(lane, step_meta.local_k_end[b_idx] < cfgs.bkv_sz)
+        needs.append(lane)
+    return functools.reduce(jnp.logical_or, needs)
+
+
+def _attend_and_store(
+    step: jax.Array,
+    q_vref: jax.Ref,
+    kv_in_vref: jax.Ref,
+    o_vref: jax.Ref,
+    lse_o_vref: jax.Ref | None,
+    schedule_ref: schedule.RpaSchedule,
+    m_scratch_ref: jax.Ref,
+    l_scratch_ref: jax.Ref,
+    acc_scratch_ref: jax.Ref,
+    *,
+    stitch_meta: StitchMetadata,
+    step_meta: ComputeMetadata,
+    cfgs: configs.RpaConfigs,
+    masked: bool,
+):
     # Step 2b: Fetch inputs.
     q_p = cfgs.aligned_num_q_heads_per_kv_head // cfgs.serve.packing_q
     q_ref = q_vref.bitcast(jnp.uint32).reshape(-1, cfgs.aligned_q_head_dim)
@@ -524,19 +631,28 @@ def rpa_body(
     k_b = []
     v_b = []
 
+    sliding_window = cfgs.model.sliding_window
+    mask_v = bool(cfgs.serve.mask_invalid_v) or sliding_window is not None
     if cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
         pack_dim = cfgs.aligned_kv_head_dim // cfgs.serve.packing_kv
         token = (
             lax.broadcasted_iota(jnp.int32, (pack_dim, cfgs.bkv_sz), 1)
-            if cfgs.serve.mask_invalid_v
+            if mask_v
             else None
         )
         for b_idx in range(cfgs.batch_size):
             valid = (
-                _compute_valid_kv_mask(token, b_idx, stitch_meta, step_meta)
+                _compute_valid_kv_mask(
+                    token, b_idx, stitch_meta, step_meta, sliding_window
+                )
                 if token is not None
                 else None
             )
+            if cfgs.serve.shared_kv_rotary_dims:
+                k_head, v_head = shared_kv_head(kv_in_vref, b_idx, valid, cfgs=cfgs)
+                k_b.append(k_head[None])
+                v_b.append(v_head[None])
+                continue
             ks = []
             vs = []
             for kv_head in range(cfgs.model.num_kv_heads):
@@ -552,7 +668,12 @@ def rpa_body(
                 v_head_u32 = utils.strided_load(v_head_ref, 0, pack_dim, 1)
                 if valid is not None:
                     # HND packs channels of one token together. Mask the words
-                    # before unpacking, including any co-located V scale channels.
+                    # before unpacking, including any co-located scale channels.
+                    k_head_u32 = jnp.where(
+                        valid,
+                        k_head_u32[:, : cfgs.bkv_sz],
+                        jnp.zeros_like(k_head_u32[:, : cfgs.bkv_sz]),
+                    )
                     v_head_u32 = jnp.where(
                         valid,
                         v_head_u32[:, : cfgs.bkv_sz],
@@ -576,14 +697,16 @@ def rpa_body(
             k_b.append(jnp.stack(ks, axis=0))
             v_b.append(jnp.stack(vs, axis=0))
     else:
-        token = None
-        if cfgs.serve.mask_invalid_v:
-            token = lax.broadcasted_iota(
-                jnp.int32, (cfgs.bkv_sz, cfgs.aligned_kv_head_dim), 0
-            )
+        token = (
+            lax.broadcasted_iota(jnp.int32, (cfgs.bkv_sz, cfgs.aligned_kv_head_dim), 0)
+            if mask_v
+            else None
+        )
         for b_idx in range(cfgs.batch_size):
             valid = (
-                _compute_valid_kv_mask(token, b_idx, stitch_meta, step_meta)
+                _compute_valid_kv_mask(
+                    token, b_idx, stitch_meta, step_meta, sliding_window
+                )
                 if token is not None
                 else None
             )
@@ -631,16 +754,20 @@ def rpa_body(
         q_end = bq_end * cfgs.aligned_num_q_heads_per_kv_head
         q_slice = slice(q_start, q_end)
 
-        custom_mask = generate_mask(
-            shape=(
-                cfgs.batch_size,
-                cfgs.model.num_kv_heads,
-                q_end - q_start,
-                cfgs.bkv_sz,
-            ),
-            bq_start=bq_start,
-            step_meta=step_meta,
-            cfgs=cfgs,
+        custom_mask = (
+            generate_mask(
+                shape=(
+                    cfgs.batch_size,
+                    cfgs.model.num_kv_heads,
+                    q_end - q_start,
+                    cfgs.bkv_sz,
+                ),
+                bq_start=bq_start,
+                step_meta=step_meta,
+                cfgs=cfgs,
+            )
+            if masked
+            else None
         )
 
         p, alpha_list, m_next, l_next, m_carry, l_carry = (
@@ -651,7 +778,7 @@ def rpa_body(
                 m_val[:, q_slice],
                 l_val[:, q_slice],
                 schedule_ref.is_last_k,
-                custom_mask=custom_mask,
+                custom_mask=cast(list[jax.Array] | None, custom_mask),
                 cfgs=cfgs,
                 bq_start=bq_start,
                 k_scale=k_scale,
@@ -709,6 +836,7 @@ def rpa_body(
         o_vref,
         lse_o_vref,
         cfgs=cfgs,
+        carry_refs=(acc_scratch_ref, l_scratch_ref) if cfgs.serve.fp8_compute else None,
     )
 
 
@@ -717,6 +845,7 @@ def rpa_body(
 
 def create_allocs(
     kv_cache_hbm_ref: jax.Ref,
+    q_hbm_ref: jax.Ref,
     o_hbm_ref: jax.Ref,
     lse_hbm_ref: jax.Ref | None,
     cfgs: configs.RpaConfigs,
@@ -744,7 +873,7 @@ def create_allocs(
         pipeline_mode=pl.Buffered(buffer_count=in_slots, use_lookahead=False),
     )
     o_spec = pl.BlockSpec(
-        block_shape=cfgs.q_vmem_shape,
+        block_shape=cfgs.o_vmem_shape,
         memory_space=pltpu.VMEM,
         index_map=lambda i: (i,),
         pipeline_mode=pl.Buffered(buffer_count=out_slots, use_lookahead=False),
@@ -764,7 +893,7 @@ def create_allocs(
     )
     q_alloc = bref_override.BatchingQRef.input(
         spec=q_spec,
-        dtype_or_type=o_hbm_ref,
+        dtype_or_type=q_hbm_ref,
         buffer_count=in_slots,
         use_lookahead=False,
         cfgs=cfgs,
@@ -831,6 +960,7 @@ def rpa_kernel(
     *,
     cfgs: configs.RpaConfigs,
     computer_cls: type[schedule.BaseMetadataComputer] = schedule.BaseMetadataComputer,
+    q_fetch_hbm: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array | None]:
     """Perform batched ragged paged attention with scheduler data.
 
@@ -875,6 +1005,7 @@ def rpa_kernel(
         new_kv_hbm_ref: jax.Ref,
         kv_cache_hbm_ref: jax.Ref,
         lse_hbm_ref: jax.Ref | None,
+        q_fetch_hbm_ref: jax.Ref | None,
         # Outputs.
         o_hbm_ref: jax.Ref,
         o_kv_cache_hbm_ref: jax.Ref,
@@ -883,9 +1014,11 @@ def rpa_kernel(
         del o_kv_cache_hbm_ref
         if o_lse_hbm_ref is not None:
             del o_lse_hbm_ref
+        if q_fetch_hbm_ref is None:
+            q_fetch_hbm_ref = q_hbm_ref
 
         q_alloc, kv_cache_alloc, o_alloc, lse_alloc = create_allocs(
-            kv_cache_hbm_ref, q_hbm_ref, lse_hbm_ref, cfgs
+            kv_cache_hbm_ref, q_fetch_hbm_ref, q_hbm_ref, lse_hbm_ref, cfgs
         )
 
         actual_steps = schedule_hbm_ref.actual_steps[0]
@@ -939,8 +1072,10 @@ def rpa_kernel(
                 -1, num_lanes
             )
 
-            # Explicitly zero out scratches and Q/KV buffers.
-            for ref in (scratches[1], scratches[2], q_ref_flat, kv_ref_flat):
+            zeroed = [scratches[1], scratches[2], q_ref_flat]
+            if not (cfgs.serve.skip_masked_kv_zero_fill and cfgs.fuse_accum):
+                zeroed.append(kv_ref_flat)
+            for ref in zeroed:
                 ref[...] = jnp.zeros_like(ref)
 
             def execute_schedule_chunk(start_step, num_steps):
@@ -976,7 +1111,7 @@ def rpa_kernel(
                     src_ref=(kv_cache_hbm_ref, new_kv_hbm_ref, schedule_ref),
                     dst_ref=(kv_cache_hbm_ref, new_kv_hbm_ref, schedule_ref),
                 )
-                q_bound = q_alloc.bind(src_ref=(q_hbm_ref, schedule_ref))
+                q_bound = q_alloc.bind(src_ref=(q_fetch_hbm_ref, schedule_ref))
                 o_bound = o_alloc.bind(dst_ref=(o_hbm_ref, schedule_ref))
                 lse_bound = (
                     lse_alloc.bind(dst_ref=(lse_hbm_ref, schedule_ref))
@@ -1032,7 +1167,10 @@ def rpa_kernel(
 
                 execute_schedule_chunk(start, size)
 
-        _run()
+        if cfgs.serve.skip_empty_launch:
+            pl.when(actual_steps > 0)(_run)
+        else:
+            _run()
 
     scalar_prefetches = (
         cu_q_lens,
@@ -1066,6 +1204,11 @@ def rpa_kernel(
                 pl.BlockSpec(memory_space=pltpu.HBM),  # new_kv_hbm_ref
                 pl.BlockSpec(memory_space=pltpu.HBM),  # kv_cache_hbm_ref
                 pl.BlockSpec(memory_space=pltpu.HBM) if return_lse else None,
+                (
+                    pl.BlockSpec(memory_space=pltpu.HBM)  # q_fetch_hbm_ref
+                    if q_fetch_hbm is not None
+                    else None
+                ),
             ],
             out_specs=[
                 pl.BlockSpec(memory_space=pltpu.HBM),  # aliased_o_hbm_ref
@@ -1093,4 +1236,5 @@ def rpa_kernel(
         new_kv_hbm,
         kv_cache_hbm,
         lse_hbm if return_lse else None,
+        q_fetch_hbm,
     )

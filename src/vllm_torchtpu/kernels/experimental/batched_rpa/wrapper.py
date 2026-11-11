@@ -13,7 +13,10 @@
 # limitations under the License.
 """Wrapper for RPA kernel to match expected interface."""
 
-from typing import cast
+import dataclasses
+import functools
+import math
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -23,6 +26,7 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu.kernels.experimental.batched_rpa import (
     configs,
     kernel,
+    output_quant,
     schedule,
     schedule_cp,
     utils,
@@ -39,6 +43,7 @@ def prepare_inputs(
     v_scale: jax.Array | None = None,
     kv_layout: configs.KVLayout = configs.KVLayout.HEAD_ALONG_SUBLANE,
     page_size: int = 128,
+    shared_kv_rotary_dims: int = 0,
 ) -> tuple[jax.Array, jax.Array]:
     total_q_tokens, actual_num_q_heads, actual_q_head_dim = q.shape
     _, actual_num_kv_heads, actual_kv_head_dim = k.shape
@@ -99,6 +104,19 @@ def prepare_inputs(
     # Pad keys and values head_dim
     actual_num_kv_heads_x2 = actual_num_kv_heads * 2
     num_kv_heads_x2_aligned = utils.align_to(actual_num_kv_heads_x2, kv_packing)
+
+    if shared_kv_rotary_dims:
+        validate_shared_kv(
+            shared_kv_rotary_dims,
+            actual_num_kv_heads,
+            actual_kv_head_dim,
+            kv_layout,
+            use_per_token_scale=k_scale is not None,
+        )
+        half, r = actual_kv_head_dim // 2, shared_kv_rotary_dims
+        rotated = jnp.concatenate([k[..., :r], k[..., half : half + r]], axis=-1)
+        rotated = jnp.pad(rotated, ((0, 0), (0, 0), (0, actual_kv_head_dim - 2 * r)))
+        k, v = v, rotated
 
     if k_scale is not None and v_scale is not None:
         k_scale = k_scale.reshape(total_q_tokens, actual_num_kv_heads)
@@ -167,6 +185,72 @@ def prepare_inputs(
     return o_hbm_alias_q_hbm, new_kv_hbm
 
 
+def validate_shared_kv(
+    rotary_dims: int,
+    num_kv_heads: int,
+    head_dim: int,
+    kv_layout: configs.KVLayout,
+    use_per_token_scale: bool = False,
+) -> None:
+    """Raises unless shared-KV pages (`shared_kv_rotary_dims`) can hold
+    this layer's KV."""
+    packing_rows = 4 * pltpu.get_tpu_info().num_sublanes  # fp8 rows per tile
+    if kv_layout != configs.KVLayout.SEQ_ALONG_LANE or num_kv_heads != 1:
+        raise ValueError(
+            "shared_kv_rotary_dims needs SEQ_ALONG_LANE pages of one KV head, "
+            f"got {kv_layout} with {num_kv_heads} KV heads."
+        )
+    if use_per_token_scale:
+        raise ValueError("shared_kv_rotary_dims does not support per-token scales.")
+    if rotary_dims % packing_rows or (head_dim // 2) % packing_rows:
+        raise ValueError(
+            f"shared_kv_rotary_dims ({rotary_dims}) and half of head_dim "
+            f"({head_dim // 2}) must be whole {packing_rows}-row tiles."
+        )
+    if not 0 < rotary_dims <= head_dim // 2:
+        raise ValueError(
+            f"shared_kv_rotary_dims {rotary_dims} is not in (0, {head_dim // 2}]."
+        )
+
+
+def validate_fp8_compute(
+    kv_dtype: jnp.dtype,
+    num_q_heads: int,
+    num_kv_heads: int,
+    q_scale: float | None,
+    return_lse: bool,
+    use_per_token_scale: bool = False,
+) -> None:
+    """Raises unless `fp8_compute` can run for this call."""
+    kv_dtype = jnp.dtype(kv_dtype)
+    if not (
+        jnp.issubdtype(kv_dtype, jnp.floating) and utils.get_dtype_bits(kv_dtype) == 8
+    ):
+        raise ValueError(f"fp8_compute needs an fp8 KV cache, got {kv_dtype}.")
+    packing = utils.get_dtype_packing(kv_dtype)
+    if (num_q_heads // num_kv_heads) % packing:
+        raise ValueError(
+            "fp8_compute needs the query heads per KV head "
+            f"({num_q_heads // num_kv_heads}) to be a multiple of {packing}."
+        )
+    if q_scale is not None:
+        raise ValueError("fp8_compute quantizes queries at scale 1.0; got q_scale.")
+    if return_lse:
+        raise ValueError("fp8_compute does not support return_lse.")
+    if use_per_token_scale:
+        raise ValueError("fp8_compute does not support per-token KV scales.")
+
+
+def quantize_queries(q_hbm: jax.Array, dtype: jnp.dtype) -> jax.Array:
+    """Casts the prepared queries to `dtype`, saturating, at a scale of 1.0."""
+    kv_heads, tokens, q_per_kv_packed, q_packing, head_dim = q_hbm.shape
+    packing = utils.get_dtype_packing(dtype)
+    info = jnp.finfo(dtype)
+    q = q_hbm.reshape(kv_heads, tokens, q_per_kv_packed * q_packing, head_dim)
+    q = jnp.clip(q, float(info.min), float(info.max)).astype(dtype)
+    return q.reshape(kv_heads, tokens, -1, packing, head_dim)
+
+
 def prepare_outputs(out: jax.Array) -> jax.Array:
     kv_heads, max_tokens, q_per_kv_packed, q_packing, d = out.shape
     return out.reshape(kv_heads, max_tokens, q_per_kv_packed * q_packing, d)
@@ -223,11 +307,15 @@ def _is_sfs(tpu_info) -> bool:
     )
 
 
+_MAX_BKV_SZ = 4096
+
+
 def calculate_block_sizes(
     model_cfgs: configs.ModelConfigs,
     serve_cfgs: configs.ServingConfigs,
     vmem_limit_bytes: int,
     decode_query_size: int = 1,
+    cap_sliding_decode_block: bool = False,
 ) -> tuple[configs.BlockSizes, configs.BlockSizes]:
     """Calculate optimal block size for decode and prefill."""
 
@@ -270,107 +358,60 @@ def calculate_block_sizes(
         aligned_kv_head_dim_val = utils.align_to(model_cfgs.head_dim, num_lanes)
 
     def calculate_vmem_usage(batch_size: int, bq_sz: int, bkv_sz: int) -> int:
-        """Given tile size, calculate VMEM usage of the kernel."""
-
-        # Step 1: Calculate buffer sizes.
-
-        # Calculate size bq & bkv arrays for a single buffer.
         bq_array_size = bq_sz * aligned_num_q_heads * aligned_head_dim
-        vmem_bkv_sz = bkv_sz
-        if serve_cfgs.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
-            # Allocate extra buffer to perform lane stitching. Must match
-            # RpaConfigs.kv_vmem_lanes.
-            vmem_bkv_sz += 2 * num_lanes
+        vmem_bkv_sz = bkv_sz + (
+            2 * num_lanes
+            if serve_cfgs.kv_layout == configs.KVLayout.SEQ_ALONG_LANE
+            else 0
+        )
         bkv_array_size = vmem_bkv_sz * aligned_num_kv_heads_x2 * aligned_kv_head_dim_val
-
-        # Get output buffer size as well - which has same size as query size.
-        bo_array_size = bq_array_size
-
-        # Convert to bytes.
-        bq_bytes = bq_array_size * q_bytes
-        bkv_bytes = bkv_array_size * kv_bytes
-        bo_bytes = bo_array_size * out_bytes
-
-        # Account for multiple buffers. These counts are fixed by the pipeline; see
-        # `configs.NUM_INPUT_SLOTS` / `configs.NUM_OUTPUT_SLOTS`.
-        bq_bytes *= configs.NUM_INPUT_SLOTS
-        bkv_bytes *= configs.NUM_INPUT_SLOTS
-        bo_bytes *= configs.NUM_OUTPUT_SLOTS
-
-        # Sum up all buffer memory usage (scales are co-located inside bkv_bytes).
-        buffer_bytes = bq_bytes + bkv_bytes + bo_bytes
-
+        if serve_cfgs.shared_kv_rotary_dims:
+            bkv_array_size = vmem_bkv_sz * (
+                model_cfgs.head_dim + 2 * serve_cfgs.shared_kv_rotary_dims
+            )
+        buffer_bytes = (
+            bq_array_size * q_bytes * configs.NUM_INPUT_SLOTS
+            + bkv_array_size * kv_bytes * configs.NUM_INPUT_SLOTS
+            + bq_array_size * out_bytes * configs.NUM_OUTPUT_SLOTS
+        )
         if serve_cfgs.return_lse:
-            lse_array_size = bq_sz * aligned_num_q_heads * num_lanes
-            lse_bytes = lse_array_size * out_bytes * 2
-            buffer_bytes += lse_bytes
+            buffer_bytes += bq_sz * aligned_num_q_heads * num_lanes * out_bytes * 2
 
-        # Step 2: Calculate worst case memory usage during computation.
-
-        # Calculate the size of loaded bq and bkv size.
-        loaded_bq_size = bq_sz * model_cfgs.num_q_heads * aligned_head_dim
-        loaded_bkv_size = bkv_sz * model_cfgs.num_kv_heads * aligned_head_dim
-
-        # Calculate peak memory requirement of otuput - which is attention weight.
-        qk_size = bq_sz * bkv_sz * model_cfgs.num_q_heads
-
-        # Convert to bytes.
-        loaded_bq_bytes = loaded_bq_size * q_bytes
-        compute_kv_bytes = kv_bytes
-        loaded_bkv_bytes = loaded_bkv_size * compute_kv_bytes
-        qk_bytes = qk_size * out_bytes
-
-        # Calculate VMEM contribution of active unpacked scale arrays during
-        # compute. Note: since flash_attention consumes quantized k/v directly
-        # along with our active k_scale and v_scale tensors (no upfront dequantized
-        # intermediate copy), we only need to account for unpacked k_scale + v_scale
-        # during compute.
+        loaded_bq_bytes = bq_sz * model_cfgs.num_q_heads * aligned_head_dim * q_bytes
+        loaded_bkv_bytes = (
+            bkv_sz * model_cfgs.num_kv_heads * aligned_head_dim * kv_bytes
+        )
+        qk_bytes = bq_sz * bkv_sz * model_cfgs.num_q_heads * out_bytes
         loaded_scale_bytes = 0
         if serve_cfgs.per_token_scale:
             assert serve_cfgs.per_token_scale_dtype is not None
-            scale_bits = jax.dtypes.itemsize_bits(serve_cfgs.per_token_scale_dtype)
-            scale_bytes = scale_bits // 8
-            # Active k_scale and v_scale each have shape (num_kv_heads, bkv_sz)
+            scale_bytes = (
+                jax.dtypes.itemsize_bits(serve_cfgs.per_token_scale_dtype) // 8
+            )
             loaded_scale_bytes = 2 * bkv_sz * model_cfgs.num_kv_heads * scale_bytes
 
         # Sum up all compute memory usage.
         compute_bytes = (
             loaded_bq_bytes + loaded_bkv_bytes + qk_bytes + loaded_scale_bytes
         )
-
-        # Step 3: Sum up all memory usage.
-        total_bytes = buffer_bytes + compute_bytes
-
-        # Account for batch size.
-        total_bytes *= batch_size
-
-        # Online-softmax scratch (m, l, and the output accumulator)
+        total_bytes = (buffer_bytes + compute_bytes) * batch_size
         lm_array_size = (
             model_cfgs.num_kv_heads * bq_sz * aligned_num_q_heads_per_kv_head
         )
-        acc_array_size = (
-            model_cfgs.num_kv_heads * bq_sz * aligned_num_q_heads_per_kv_head
-        )
-        # m and l scratches share the same shape.
-        scratch_bytes = (2 * lm_array_size + acc_array_size) * out_bytes
-        total_bytes += scratch_bytes
-
-        return total_bytes
+        return total_bytes + 3 * lm_array_size * out_bytes
 
     def calculate_compute_buffer_time(
         batch_size: int, bq_c_sz: int, bkv_sz: int
     ) -> int:
-        """Calculate computational complexity of a single compute block."""
-
-        num_k_rows = pl.cdiv(bkv_sz, mxu_column_size)
-        num_k_cols = pl.cdiv(model_cfgs.head_dim, mxu_column_size)
-        num_k = num_k_rows * num_k_cols
-        num_muls = bq_c_sz * num_k * model_cfgs.num_q_heads
-
-        return batch_size * num_muls
+        num_k = pl.cdiv(bkv_sz, mxu_column_size) * pl.cdiv(
+            model_cfgs.head_dim, mxu_column_size
+        )
+        return batch_size * bq_c_sz * num_k * model_cfgs.num_q_heads
 
     def find_best_block_sizes(
-        max_batch_size: int, fixed_bq_sz: int | None = None
+        max_batch_size: int,
+        fixed_bq_sz: int | None = None,
+        max_bkv_sz: int = _MAX_BKV_SZ,
     ) -> configs.BlockSizes:
         """Loop through different block sizes to find the most optimal one."""
 
@@ -385,11 +426,8 @@ def calculate_block_sizes(
             # TODO(kyuyeunk): Reduce granularity to lane size.
             bkv_default = utils.align_to(bkv_default, serve_cfgs.page_size)
         bkv_sz = bkv_stride = bkv_default
-        if fixed_bq_sz is None:
-            bq_sz = bq_stride = bkv_sz
-        else:
-            bq_sz = fixed_bq_sz
-            bq_stride = 0
+        bq_sz = bkv_sz if fixed_bq_sz is None else fixed_bq_sz
+        bq_stride = bkv_sz if fixed_bq_sz is None else 0
         batch_size = max_batch_size
 
         # Step 1: Lower batch_size if even the smallest bq and bkv size can trigger
@@ -415,7 +453,7 @@ def calculate_block_sizes(
         while (
             calculate_vmem_usage(batch_size, bq_sz, bkv_sz) < capped_vmem_limit_bytes
             and bkv_sz <= max_seq_len
-            and bkv_sz <= 4096  # TEMP PATCH
+            and bkv_sz <= max_bkv_sz
         ):
             # Unless bq is a fixed value, we want to ensure bq size is the same as bkv
             # size. When using causal masking, if bq size is larger than bkv size,
@@ -439,20 +477,9 @@ def calculate_block_sizes(
 
         # Threshold value based on hardware generation and precision.
         tpu_info = pltpu.get_tpu_info()
-
-        is_8bit = jnp.dtype(serve_cfgs.dtype_q).itemsize == 1
-
-        match tpu_info.generation:
-            case 8 if _is_sfs(tpu_info):
-                threshold = 800
-            case 7:
-                threshold = 1500
-            case _:
-                threshold = 1500
-
-        if is_8bit:
-            flops_ratio = tpu_info.fp8_ops_per_second // tpu_info.bf16_ops_per_second
-            threshold *= flops_ratio
+        threshold = 800 if (tpu_info.generation == 8 and _is_sfs(tpu_info)) else 1500
+        if jnp.dtype(serve_cfgs.dtype_q).itemsize == 1:
+            threshold *= tpu_info.fp8_ops_per_second // tpu_info.bf16_ops_per_second
         num_bq_c = 1
         last_valid_bq_c_sz = bq_c_sz = bq_sz
         bq_c_rem = 0
@@ -473,14 +500,91 @@ def calculate_block_sizes(
             batch_size=batch_size,
         )
 
-    # Fixed value based on experimental results.
-    decode_batch_size = 8
-    prefill_batch_size = 2
+    decode_max_bkv_sz = _MAX_BKV_SZ
+    if cap_sliding_decode_block and model_cfgs.sliding_window is not None:
+        decode_max_bkv_sz = min(decode_max_bkv_sz, model_cfgs.sliding_window // 2)
+    return (
+        find_best_block_sizes(8, decode_query_size, decode_max_bkv_sz),
+        find_best_block_sizes(2),
+    )
 
-    decode_block_sizes = find_best_block_sizes(decode_batch_size, decode_query_size)
-    prefill_block_sizes = find_best_block_sizes(prefill_batch_size)
 
-    return decode_block_sizes, prefill_block_sizes
+FP8_PREFILL_KV_BLOCK = 512
+FP8_PREFILL_CHUNK_ROWS = 256
+FP8_PREFILL_STEP_ROWS = 8192
+FP8_PREFILL_BUFFER_VMEM_FRACTION = 0.8
+
+
+def fp8_prefill_block_sizes(
+    model_cfgs: configs.ModelConfigs,
+    serve_cfgs: configs.ServingConfigs,
+    vmem_limit_bytes: int,
+) -> configs.BlockSizes:
+    """Mixed-kernel block sizes for `fp8_compute`."""
+    if model_cfgs.head_dim < 256:
+        return calculate_block_sizes(model_cfgs, serve_cfgs, vmem_limit_bytes)[1]
+    rows_per_token = utils.align_to(
+        model_cfgs.num_q_heads_per_kv_head, serve_cfgs.packing_q
+    )
+    bq_c = max(1, FP8_PREFILL_CHUNK_ROWS // rows_per_token)
+    bkv = FP8_PREFILL_KV_BLOCK
+    if serve_cfgs.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
+        bkv = utils.align_to(bkv, serve_cfgs.page_size)
+    bq = FP8_PREFILL_STEP_ROWS // (rows_per_token * model_cfgs.num_kv_heads)
+    bq = utils.align_to(max(bq, bq_c), bq_c)
+    while True:
+        blocks = configs.BlockSizes(bq_sz=bq, bq_c_sz=bq_c, bkv_sz=bkv, batch_size=1)
+        cfgs = configs.RpaConfigs(
+            block=blocks,
+            model=model_cfgs,
+            serve=serve_cfgs,
+            mode=configs.RpaCase.MIXED,
+            vmem_limit_bytes=vmem_limit_bytes,
+        )
+        if (
+            fp8_prefill_vmem_bytes(cfgs)
+            <= FP8_PREFILL_BUFFER_VMEM_FRACTION * vmem_limit_bytes
+        ):
+            return blocks
+        if bq == bq_c:
+            raise ValueError(
+                f"fp8_compute: no query block fits {vmem_limit_bytes} bytes of VMEM "
+                f"for {model_cfgs}."
+            )
+        bq = utils.align_to(max(bq // 2, bq_c), bq_c)
+
+
+def schedule_size_multiplier(cfgs: configs.RpaConfigs, num_q_tokens: int) -> int:
+    """Return HBM schedule multiplier covering all steps of one call."""
+    kv_blocks = pl.cdiv(cfgs.serve.pages_per_seq * cfgs.serve.page_size, cfgs.bkv_sz)
+    if cfgs.model.sliding_window is not None:
+        kv_blocks = min(
+            kv_blocks, pl.cdiv(cfgs.model.sliding_window + cfgs.bq_sz, cfgs.bkv_sz) + 1
+        )
+    q_blocks = pl.cdiv(num_q_tokens, cfgs.bq_sz) + cfgs.serve.num_seqs
+    if cfgs.mode == configs.RpaCase.DECODE:
+        q_blocks = min(
+            q_blocks,
+            cfgs.serve.num_seqs * pl.cdiv(cfgs.serve.decode_query_size, cfgs.bq_sz),
+        )
+    steps = pl.cdiv(q_blocks * kv_blocks, cfgs.batch_size) + cfgs.max_steps_ub
+    return max(cfgs.max_schedule_size_multiplier, pl.cdiv(steps, cfgs.max_steps_ub))
+
+
+def fp8_prefill_vmem_bytes(cfgs: configs.RpaConfigs) -> int:
+    """VMEM of the mixed kernel's pipeline buffers and softmax scratch."""
+
+    def nbytes(shape, dtype):
+        return math.prod(shape) * utils.get_dtype_bits(dtype) // 8
+
+    serve = cfgs.serve
+    return (
+        configs.NUM_INPUT_SLOTS * nbytes(cfgs.q_vmem_shape, serve.dtype_q)
+        + configs.NUM_INPUT_SLOTS * nbytes(cfgs.kv_vmem_shape, serve.dtype_kv)
+        + configs.NUM_OUTPUT_SLOTS * nbytes(cfgs.o_vmem_shape, serve.dtype_out)
+        + 2 * nbytes(cfgs.lm_scratch_shape, serve.dtype_out)
+        + nbytes(cfgs.acc_scratch_shape, serve.dtype_out)
+    )
 
 
 @jax.jit(
@@ -509,6 +613,14 @@ def calculate_block_sizes(
         "attention_scope",
         "return_lse",
         "mask_invalid_v",
+        "skip_empty_launch",
+        "cap_sliding_decode_block",
+        "fp8_compute",
+        "fence_output",
+        "unmasked_interior",
+        "output_quant_dtype",
+        "shared_kv_rotary_dims",
+        "skip_masked_kv_zero_fill",
     ),
     # Donation of transient inputs can fail for some runtime buffer layouts in
     # the experimental tuning path. Keep donation only for kv_cache, which is
@@ -552,77 +664,17 @@ def ragged_paged_attention(
     attention_scope: configs.AttentionScope = configs.AttentionScope.FULL,
     return_lse: bool = False,
     mask_invalid_v: bool | None = None,
-) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
-    """Perform batched ragged paged attention.
-
-    Args:
-        queries: [max_num_tokens, num_q_heads, head_dim]. Output of q projection.
-        keys: [max_num_tokens, num_kv_heads, head_dim]. Output of k projection.
-        values: [max_num_tokens, num_kv_heads, head_dim]. Output of v projection.
-        kv_cache: [num_pages, page_size, cdiv(num_kv_heads * 2, kv_packing),
-            kv_packing, head_dim]. Stores existing kv cache data where k & vs are
-            concatenated along num kv heads dim.
-        kv_lens: [max_num_seqs]. Existing kv cache length of each sequence.
-        page_indices: [max_num_seqs * pages_per_seqs]. kv cache page table of each
-            sequence.
-        cu_q_lens: [max_num_seqs + 1]. Cumulative sum of each sequence's query
-            length. queries[a:b], keys[a:b], and values[a:b] where a=cu_q_lens[i] and
-            b=cu_q_lens[i+1] represents q/k/v of sequence i.
-        distribution: [3]. Cumulative sum of number of decode, prefill, and mixed
-            sequences (cumulative end indices for decode, prefill-only, and mixed).
-            The prefill-only segment is handled by the mixed kernel call.
-            distribution[2] represents total number of sequences.
-        sm_scale: Softmax scale value.
-        sliding_window: Size of sliding window (also known as local attention). kvs
-            outside of the window is not fetched from hbm and masked out during
-            computation.
-        soft_cap: Cap values of softmax inputs.
-        mask_value: Value to use for causal masking. Defaults to smallest
-            representable value of the activation dtype.
-        use_per_token_scale: Whether to use per-token quantization.
-        per_token_scale_dtype: Dtype of per-token scale. Defaults to None.
-        q_scale: Quantization scale value of queries.
-        k_scale: Per-tensor quantization scale value of keys.
-        v_scale: Per-tensor quantization scale value of values.
-        dynamic_k_scale: Per-token quantization scale value of keys.
-        dynamic_v_scale: Per-token quantization scale value of values.
-        chunk_prefill_size: Not used.
-        decode_block_sizes: Kernel block size to use during decode.
-        prefill_block_sizes: Kernel block size to use during prefill.
-        vmem_limit_bytes: VMEM size limit of the kernel. Defaults to maximum VMEM
-            size of the hardware.
-        debug_mode: Not used.
-        out_dtype: Dtype of output. Defaults to dtype of queries.
-        use_causal_mask: Not used.
-        skip_kv_update: If True, don't write keys/values back to kv_cache
-            (KV-share). All kv, including this step's tokens, is read from kv_cache.
-        update_kv_cache: If set, overrides skip_kv_update (update_kv_cache=False
-            is the same as skip_kv_update=True). None (default) uses skip_kv_update.
-        decode_query_size: Number of query tokens in decode (1 by default, can be
-            higher in case of speculative decoding).
-        cp_group_size: Size of the context parallelism (CP) group. KV cache is
-            sharded across devices in this group. Defaults to None.
-        cp_rank: Rank of the current device within the CP group, which determine
-            the token ownership. Defaults to None.
-        attention_scope: Which KV positions to attend to. FULL attends all
-            positions, CACHE_ONLY skips new tokens, NEW_TOKENS_ONLY skips cached
-            tokens. Defaults to FULL.
-        return_lse: If True, return log-sum-exp (lse) values along with the
-            output. Defaults to False.
-        mask_invalid_v: If True, zero out invalid V token slices before the pv
-            matmul so NaNs in unused VMEM or shared new-KV pages cannot propagate via
-            0.0 * NaN. Defaults to None (True for SEQ_ALONG_LANE, False for
-            HEAD_ALONG_SUBLANE).
-
-    Returns:
-        out: [max_num_tokens, num_q_heads, head_dim]. Output of self attention.
-        new_kv_cache: [num_pages, page_size, cdiv(num_kv_heads * 2, kv_packing),
-            kv_packing, head_dim]. Result of new kv cache where k & vs are
-            concatenated along num kv heads dim.
-        lse (only when return_lse=True): [max_num_tokens, num_q_heads].
-            Log-sum-exp values (m + log(l)) for each query token and head,
-            needed for merging partial attention results in CP.
-    """
+    skip_empty_launch: bool = False,
+    cap_sliding_decode_block: bool = False,
+    fp8_compute: bool = False,
+    fence_output: bool = False,
+    unmasked_interior: bool = False,
+    output_quant_dtype: jnp.dtype | None = None,
+    shared_kv_rotary_dims: int = 0,
+    skip_masked_kv_zero_fill: bool = False,
+    prepared_inputs: tuple[jax.Array, ...] | None = None,
+) -> tuple[Any, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
+    """Run batched ragged paged attention and update ``kv_cache``."""
 
     if not use_causal_mask:
         raise ValueError("Only causal attention is supported.")
@@ -699,26 +751,93 @@ def ragged_paged_attention(
         return_lse=return_lse,
         skip_kv_update=skip_kv_update,
         mask_invalid_v=mask_invalid_v,
+        skip_empty_launch=skip_empty_launch,
+        unmasked_interior=unmasked_interior,
+        shared_kv_rotary_dims=shared_kv_rotary_dims,
+        skip_masked_kv_zero_fill=skip_masked_kv_zero_fill,
     )
+    if shared_kv_rotary_dims:
+        validate_shared_kv(
+            shared_kv_rotary_dims,
+            num_kv_heads,
+            head_dim,
+            kv_layout,
+            use_per_token_scale,
+        )
+        if cp_group_size is not None or return_lse:
+            raise ValueError(
+                "shared_kv_rotary_dims supports neither CP nor LSE output."
+            )
+    if output_quant_dtype is not None and (return_lse or cp_group_size is not None):
+        raise ValueError("output_quant_dtype supports neither LSE output nor CP.")
 
-    q_hbm, new_kv_hbm = prepare_inputs(
-        queries,
-        keys,
-        values,
-        queries.dtype,
-        kv_cache.dtype,
-        k_scale_tensor,
-        v_scale_tensor,
+    prepare = functools.partial(
+        prepare_inputs,
+        q_dtype=queries.dtype,
+        kv_dtype=kv_cache.dtype,
+        k_scale=k_scale_tensor,
+        v_scale=v_scale_tensor,
         kv_layout=kv_layout,
         page_size=page_size,
+        shared_kv_rotary_dims=shared_kv_rotary_dims,
     )
+    prepared_q_fetch = None
+    if prepared_inputs is None:
+        q_hbm, new_kv_hbm = prepare(queries, keys, values)
+    else:
+        expected = [
+            (a.shape, a.dtype) for a in jax.eval_shape(prepare, queries, keys, values)
+        ]
+        got = [(a.shape, a.dtype) for a in prepared_inputs[:2]]
+        if got != expected or len(prepared_inputs) > 3:
+            raise ValueError(f"prepared_inputs {got} != prepare_inputs {expected}")
+        q_hbm, new_kv_hbm = prepared_inputs[:2]
+        if len(prepared_inputs) == 3:
+            prepared_q_fetch = prepared_inputs[2]
 
     default_decode, default_prefill = calculate_block_sizes(
         model_cfgs,
         serve_cfgs,
         vmem_limit_bytes,
         decode_query_size=decode_query_size,
+        cap_sliding_decode_block=cap_sliding_decode_block,
     )
+
+    mixed_serve_cfgs = serve_cfgs
+    q_fetch_hbm = None
+    if prepared_q_fetch is not None and not fp8_compute:
+        raise ValueError("prepared FP8 queries are for the fp8_compute kernel.")
+    if fp8_compute:
+        validate_fp8_compute(
+            kv_cache.dtype,
+            num_q_heads,
+            num_kv_heads,
+            q_scale,
+            return_lse,
+            use_per_token_scale,
+        )
+        mixed_serve_cfgs = dataclasses.replace(
+            serve_cfgs, dtype_q=kv_cache.dtype, fp8_compute=True
+        )
+        if prepared_q_fetch is None:
+            q_fetch_hbm = quantize_queries(q_hbm, kv_cache.dtype)
+        else:
+            want = jax.eval_shape(
+                functools.partial(quantize_queries, dtype=kv_cache.dtype), q_hbm
+            )
+            got = (prepared_q_fetch.shape, prepared_q_fetch.dtype)
+            if got != (want.shape, want.dtype):
+                raise ValueError(
+                    f"prepared FP8 queries {got} are not quantize_queries' "
+                    f"{(want.shape, want.dtype)}"
+                )
+            q_fetch_hbm = prepared_q_fetch
+        default_prefill = fp8_prefill_block_sizes(
+            model_cfgs,
+            mixed_serve_cfgs,
+            vmem_limit_bytes,
+        )
+
     # Pre-allocate LSE buffer.
     lse_hbm_init: jax.Array | None = None
     if return_lse:
@@ -755,14 +874,12 @@ def ragged_paged_attention(
             kv_cache_lens = global_kv_cache_lens
         kv_new_lens = jnp.zeros_like(q_lens)
         q_offsets = kv_cache_lens
-    elif attention_scope == configs.AttentionScope.NEW_TOKENS_ONLY:
+    else:
         kv_cache_lens = global_kv_cache_lens
         kv_new_lens = q_lens
         q_offsets = global_kv_cache_lens
-    else:  # FULL
-        kv_cache_lens = global_kv_cache_lens
-        kv_new_lens = q_lens
-        q_offsets = global_kv_cache_lens
+
+    branch_on_empty_segment = queries.shape[0] <= max_num_seqs * decode_query_size
 
     def run_rpa_kernel(
         mode: configs.RpaCase,
@@ -772,16 +889,26 @@ def ragged_paged_attention(
     ):
         if mode == configs.RpaCase.DECODE:
             effective_blocks = decode_block_sizes or default_decode
+            mode_serve_cfgs = serve_cfgs
         else:
             effective_blocks = prefill_block_sizes or default_prefill
+            mode_serve_cfgs = mixed_serve_cfgs
 
         cfgs = configs.RpaConfigs(
             block=effective_blocks,
             model=model_cfgs,
-            serve=serve_cfgs,
+            serve=mode_serve_cfgs,
             vmem_limit_bytes=vmem_limit_bytes,
             mode=mode,
         )
+        multiplier = schedule_size_multiplier(cfgs, queries.shape[0])
+        if multiplier != cfgs.max_schedule_size_multiplier:
+            cfgs = dataclasses.replace(
+                cfgs,
+                serve=dataclasses.replace(
+                    cfgs.serve, max_schedule_size_multiplier=multiplier
+                ),
+            )
         cfgs.validate_inputs(
             q=queries,
             k=keys,
@@ -811,25 +938,33 @@ def ragged_paged_attention(
             computer_cls=computer_cls,
             extra_scalars=extra_scalars,
         )
-        result = kernel.rpa_kernel(
-            cu_q_lens,
-            q_offsets,
-            kv_cache_lens,
-            kv_new_lens,
-            schedule_hbm,
-            o_hbm_alias_q_hbm,
-            new_kv_hbm,
-            kv_cache,
-            lse_hbm_in,
-            cfgs=cfgs,
-            computer_cls=computer_cls,
-        )
-        if return_lse:
+
+        def launch(operands):
+            o_in, kv_in, lse_in = operands
+            result = kernel.rpa_kernel(
+                cu_q_lens,
+                q_offsets,
+                kv_cache_lens,
+                kv_new_lens,
+                schedule_hbm,
+                o_in,
+                new_kv_hbm,
+                kv_in,
+                lse_in,
+                cfgs=cfgs,
+                computer_cls=computer_cls,
+                q_fetch_hbm=q_fetch_hbm if mode == configs.RpaCase.MIXED else None,
+            )
             o_out, kv_out, lse_out = result
-        else:
-            o_out, kv_out, _ = result
-            lse_out = None
-        return o_out, kv_out, lse_out
+            return o_out, kv_out, lse_out if return_lse else None
+
+        operands = (o_hbm_alias_q_hbm, kv_cache, lse_hbm_in)
+        if not (skip_empty_launch and branch_on_empty_segment):
+            return launch(operands)
+        seq_start, seq_end = cfgs.seq_range(distribution)
+        return jax.lax.cond(
+            jnp.greater(seq_end, seq_start), launch, lambda ops: ops, operands
+        )
 
     o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
         configs.RpaCase.DECODE, q_hbm, kv_cache, lse_hbm_init
@@ -837,6 +972,14 @@ def ragged_paged_attention(
     o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
         configs.RpaCase.MIXED, o_hbm_alias_q_hbm, kv_cache, lse_hbm
     )
+    if output_quant_dtype is not None:
+        quantized = output_quant.quantize_head_major_output(
+            o_hbm_alias_q_hbm,
+            num_q_heads_per_kv_head=num_q_heads // num_kv_heads,
+            head_dim=head_dim,
+            quant_dtype=output_quant_dtype,
+        )
+        return quantized, kv_cache
 
     # before: [kv_heads, max_tokens, q_per_kv // q_packing, q_packing, d]
     o_hbm = prepare_outputs(o_hbm_alias_q_hbm)
@@ -846,6 +989,9 @@ def ragged_paged_attention(
     num_q_heads_per_kv_head = num_q_heads // num_kv_heads
     o_hbm = o_hbm[:, :, :num_q_heads_per_kv_head, :head_dim]
     o_hbm = o_hbm.swapaxes(1, 0).reshape(queries.shape)
+    if fence_output:
+        # Prevent XLA from fusing downstream ops into the RPA output buffer.
+        o_hbm = jax.lax.optimization_barrier(o_hbm)
 
     if not return_lse:
         return o_hbm, kv_cache

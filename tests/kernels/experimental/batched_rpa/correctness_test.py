@@ -223,6 +223,8 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         nan_kv_seq_idx: int | None = None,
         nan_new_seq_idx: int | None = None,
         mask_invalid_v: bool | None = None,
+        fp8_compute: bool = False,
+        rpa_kwargs: dict | None = None,
     ):
         if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
             # Tokens live on the lane dim, so page_size must be a multiple of 128.
@@ -354,6 +356,15 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             *jax.tree.map(lambda x: x.copy(), args),
             **kwargs,
         )
+        if fp8_compute:
+            expected_fp8_q, _ = ref_ragged_paged_attention(
+                *jax.tree.map(lambda x: x.copy(), args),
+                **{**kwargs, "q_scale": 1.0},
+            )
+            num_decode_tokens = int(cu_q_lens[distribution[0]])
+            expected = jnp.concatenate(
+                [expected[:num_decode_tokens], expected_fp8_q[num_decode_tokens:]]
+            )
 
         rpa_kv_cache = kv_cache
         num_sublanes = pltpu.get_tpu_info().num_sublanes
@@ -416,6 +427,8 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             kv_layout=kv_layout,
             decode_query_size=decode_query_size,
             mask_invalid_v=mask_invalid_v,
+            fp8_compute=fp8_compute,
+            **(rpa_kwargs or {}),
         )
         output = output[: cu_q_lens[distribution[-1]]]
 
@@ -607,6 +620,131 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             q_scale=q_scale,
             k_scale=k_scale,
             v_scale=v_scale,
+        )
+
+    @parameterized.product(
+        kv_layout=[
+            configs.KVLayout.HEAD_ALONG_SUBLANE,
+            configs.KVLayout.SEQ_ALONG_LANE,
+        ],
+        head_dim=[128, 512],
+        sliding_window=[None, 128],
+    )
+    def test_ragged_paged_attention_fp8_compute(
+        self, kv_layout, head_dim, sliding_window
+    ):
+        if not jtu.is_device_tpu_at_least(version=7):
+            self.skipTest("Expect TPU7x+ (fp8 MXU)")
+        seq_lens = [
+            (1, 300),
+            (1, 77),
+            (192, 328),
+            (128, 180),
+            (64, 255),
+            (256, 1500),
+            (128, 2100),
+        ]
+        self._test_ragged_paged_attention(
+            seq_lens,
+            (32, 8),
+            head_dim,
+            256,
+            jnp.bfloat16,
+            jnp.float8_e4m3fn,
+            1000,
+            sliding_window=sliding_window,
+            kv_layout=kv_layout,
+            distribution=jnp.array([2, 2, len(seq_lens)], dtype=jnp.int32),
+            fp8_compute=True,
+        )
+
+    @parameterized.product(
+        sliding_window=[None, 128],
+        k_scale=[None, 0.75],
+        rpa_kwargs=[{"unmasked_interior": True}],
+    )
+    def test_ragged_paged_attention_fp8_compute_options(
+        self, sliding_window, k_scale, rpa_kwargs
+    ):
+        if not jtu.is_device_tpu_at_least(version=7):
+            self.skipTest("Expect TPU7x+ (fp8 MXU)")
+        seq_lens = [(1, 300), (1, 77), (192, 328), (256, 1500), (128, 2100)]
+        self._test_ragged_paged_attention(
+            seq_lens,
+            (32, 8),
+            512,
+            256,
+            jnp.bfloat16,
+            jnp.float8_e4m3fn,
+            1000,
+            sliding_window=sliding_window,
+            k_scale=k_scale,
+            kv_layout=configs.KVLayout.HEAD_ALONG_SUBLANE,
+            distribution=jnp.array([2, 2, len(seq_lens)], dtype=jnp.int32),
+            fp8_compute=True,
+            rpa_kwargs=rpa_kwargs,
+        )
+
+    @parameterized.product(
+        sliding_window=[None, 5, 128],
+        rpa_kwargs=[{"unmasked_interior": True}],
+    )
+    def test_ragged_paged_attention_bf16_options(self, sliding_window, rpa_kwargs):
+        seq_lens = [(1, 300), (80, 300), (40, 560), (96, 96)]
+        self._test_ragged_paged_attention(
+            seq_lens,
+            (4, 2),
+            128,
+            16,
+            jnp.bfloat16,
+            jnp.bfloat16,
+            1000,
+            sliding_window=sliding_window,
+            kv_layout=configs.KVLayout.HEAD_ALONG_SUBLANE,
+            distribution=jnp.array([1, 1, len(seq_lens)], dtype=jnp.int32),
+            rpa_kwargs=rpa_kwargs,
+        )
+
+    def test_ragged_paged_attention_skip_empty_and_masked_nan_tail(self):
+        decode_seqs = [(1, 300), (1, 180), (1, 511)]
+        self._test_ragged_paged_attention(
+            decode_seqs,
+            (8, 2),
+            128,
+            128,
+            jnp.bfloat16,
+            jnp.bfloat16,
+            64,
+            bq_sz=1,
+            bq_csz=1,
+            bkv_sz=256,
+            kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
+            distribution=jnp.array([len(decode_seqs)] * 3, dtype=jnp.int32),
+            nan_kv_seq_idx=0,
+            mask_invalid_v=True,
+            rpa_kwargs={
+                "skip_empty_launch": True,
+                "skip_masked_kv_zero_fill": True,
+                "fence_output": True,
+            },
+        )
+        mixed_seqs = [(96, 700), (64, 180)]
+        self._test_ragged_paged_attention(
+            mixed_seqs,
+            (4, 2),
+            128,
+            128,
+            jnp.bfloat16,
+            jnp.bfloat16,
+            64,
+            kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
+            distribution=jnp.array([0, 0, len(mixed_seqs)], dtype=jnp.int32),
+            rpa_kwargs={
+                "skip_empty_launch": True,
+                "skip_masked_kv_zero_fill": True,
+                "unmasked_interior": True,
+                "fence_output": True,
+            },
         )
 
     @parameterized.product(

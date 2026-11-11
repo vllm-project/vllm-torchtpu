@@ -2741,3 +2741,37 @@ def test_get_kv_cache_spec_propagates_is_draft_layer_cpu(monkeypatch):
     kv_cache_specs = KVCacheManager(stub).get_kv_cache_spec()
     assert kv_cache_specs["target.0"].is_draft is False
     assert kv_cache_specs["draft.0"].is_draft is True
+
+
+@pytest.mark.parametrize(
+    ("backend_name", "head_size", "expect_hnd_hint"),
+    [
+        ("CUSTOM", 256, True),
+        ("CUSTOM", 64, False),
+        ("PALLAS", 256, False),
+    ],
+)
+def test_warn_if_kv_cache_is_padded_hnd_hint(
+    monkeypatch, backend_name, head_size, expect_hnd_hint
+):
+    from vllm_torchtpu.runner import kv_cache_manager as kcm
+
+    messages: list[str] = []
+    monkeypatch.setattr(
+        kcm.logger,
+        "warning_once",
+        lambda msg, *args: messages.append(msg % args),
+    )
+
+    class _Backend:
+        @staticmethod
+        def get_kv_cache_shape(num_blocks, block_size, _nkv, hdim, _dtype="auto"):
+            return (num_blocks, block_size, 4, hdim)
+
+        @staticmethod
+        def get_name():
+            return backend_name
+
+    kcm._warn_if_kv_cache_is_padded(_Backend, 256, 1, head_size, torch.float8_e4m3fn)
+    assert len(messages) == 1
+    assert ("VLLM_KV_CACHE_LAYOUT=HND" in messages[0]) is expect_hnd_hint

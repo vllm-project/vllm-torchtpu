@@ -156,6 +156,28 @@ def sparse_mla_page_size_bytes(
     )
 
 
+def get_layer_kv_page_size_bytes(
+    attn_module: AttentionLayerBase,
+    backend: type[_TpuKVCacheBackend],
+    block_size: int,
+    kv_cache_dtype: torch.dtype,
+) -> int:
+    """Return a layer's physical TPU KV page bytes."""
+    if isinstance(attn_module, MLAAttention):
+        sparse = sparse_mla_page_size_bytes(attn_module, block_size, kv_cache_dtype)
+        if sparse is not None:
+            return sparse
+        return backend.get_kv_cache_page_size_bytes(
+            block_size, 1, attn_module.head_size, kv_cache_dtype
+        )
+    num_kv_heads = getattr(attn_module, "num_kv_heads", 1)
+    head_size = getattr(attn_module, "head_size", None)
+    assert isinstance(head_size, int)
+    return backend.get_kv_cache_page_size_bytes(
+        block_size, num_kv_heads, head_size, kv_cache_dtype
+    )
+
+
 def check_kv_caches_cover_block_ids(
     kv_caches: dict[str, torch.Tensor],
     kv_cache_tensors: Iterable[KVCacheTensor],
@@ -208,18 +230,25 @@ def _warn_if_kv_cache_is_padded(
     unpadded = block_size * 2 * num_kv_heads * head_size * dtype.itemsize
     if actual == unpadded:
         return
+    hnd = (
+        " Under the default NHD layout, VLLM_KV_CACHE_LAYOUT=HND avoids the K/V "
+        "padding."
+        if backend.get_name() == "CUSTOM" and head_size != 64
+        else ""
+    )
     logger.warning_once(
         "KV cache pages are %.2fx larger than num_kv_heads=%d at "
         "head_size=%d with dtype %s requires: the %s layout pads head_size to "
         "a whole 128-lane register and the K/V vectors to a whole 32-bit word, "
         "so HBM use exceeds a shape-and-dtype estimate. Where head_size is a "
         "multiple of 128, lowering tensor parallelism (more KV heads per rank) "
-        "or enabling attention data parallelism avoids it.",
+        "or enabling attention data parallelism avoids it.%s",
         actual / unpadded,
         num_kv_heads,
         head_size,
         dtype,
         backend.get_name(),
+        hnd,
     )
 
 
@@ -387,12 +416,10 @@ class KVCacheManager:
                     page_size_padded = (
                         self.runner._hybrid_uniform_page_size_bytes
                         if self.runner._hybrid_uniform_page_size_bytes is not None
-                        else cast(
-                            "type[_TpuKVCacheBackend]", backend_cls
-                        ).get_kv_cache_page_size_bytes(
+                        else get_layer_kv_page_size_bytes(
+                            attn_module,
+                            cast("type[_TpuKVCacheBackend]", backend_cls),
                             block_size,
-                            attn_module.num_kv_heads,
-                            attn_module.head_size,
                             self.runner.kv_cache_dtype,
                         )
                     )
@@ -759,10 +786,10 @@ class KVCacheManager:
             if isinstance(m, Attention):
                 assert backend_cls is not None
                 attn_page_sizes.add(
-                    backend_cls.get_kv_cache_page_size_bytes(
+                    get_layer_kv_page_size_bytes(
+                        m,
+                        backend_cls,
                         block_size,
-                        m.num_kv_heads,
-                        m.head_size,
                         self.runner.kv_cache_dtype,
                     )
                 )
@@ -827,11 +854,6 @@ class KVCacheManager:
             return
 
         first_attn_module = attn_modules[0]
-        num_kv_heads = (
-            first_attn_module.num_kv_heads
-            if isinstance(first_attn_module, Attention)
-            else 1
-        )
         attention_backend = cast(
             "type[_TpuKVCacheBackend] | None",
             TpuPlatform._find_non_ssm_backend(self.runner.vllm_config),
@@ -840,18 +862,10 @@ class KVCacheManager:
         if block_size is None:
             block_size = self.runner.vllm_config.cache_config.block_size
         assert block_size is not None
-        attn_page_size_bytes = (
-            sparse_mla_page_size_bytes(
-                first_attn_module,
-                block_size,
-                self.runner.kv_cache_dtype,
-            )
-            if isinstance(first_attn_module, MLAAttention)
-            else None
-        ) or attention_backend.get_kv_cache_page_size_bytes(
+        attn_page_size_bytes = get_layer_kv_page_size_bytes(
+            first_attn_module,
+            attention_backend,
             block_size,
-            num_kv_heads,
-            first_attn_module.head_size,
             self.runner.kv_cache_dtype,
         )
 
