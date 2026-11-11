@@ -113,24 +113,36 @@ COMPILE_SIZES="${COMPILE_SIZES:-1,${MAX_NUM_BATCHED_TOKENS}}"
 # HBM holds a dozen prompts; the smoke empties it before every recall.
 NUM_GPU_BLOCKS_OVERRIDE="${NUM_GPU_BLOCKS_OVERRIDE:-64}"
 
-# Tier sizing, in offloaded blocks: one 680-token block across the 8 ranks is
-# ~167 MB (64 GiB buys 411). Both pools floor their budget to whole blocks,
-# so each budget is half a block over the count it aims for; the smoke reads
-# the counts the boot logs report and fails if they leave it no margin.
-#   tier 0: 40 blocks, swept from under 20% free back to 40% free.
-#   tier 1: 48 blocks, swept from under 30% free back to 40% free. Its low
+# Prompts are PROMPT_BLOCKS 680-token blocks long, but each takes
+# PROMPT_STORE_BLOCKS offloaded blocks. K3 has four KV cache groups of
+# 680-token blocks, MLA attention and three KDA groups. The connector stores
+# the attention block of every chunk but only the last state of each KDA
+# group, so a prompt of n blocks takes n + 3 (measured on this rig: 2 blocks
+# take 5, 4 take 7). The runner checks this against the groups the engine
+# logs.
+PROMPTS="${PROMPTS:-28}"
+PROMPT_BLOCKS="${PROMPT_BLOCKS:-4}"
+PROMPT_STORE_BLOCKS="${PROMPT_STORE_BLOCKS:-7}"
+# Tier sizing, in prompts. An offloaded block is the same in both pools: 24
+# block arrays of 870400 bytes on each of the 8 ranks. Both pools floor
+# their budget to whole blocks, so each budget is half a block over the
+# count it aims for; the smoke reads the counts the boot logs report and
+# fails if they leave it no margin.
+#   tier 0: 10 prompts, swept from under 20% free back to 40% free.
+#   tier 1: 12 prompts, swept from under 30% free back to 40% free. Its low
 #           watermark leaves more free blocks than one tier-0 demotion
 #           batch, so a batch lands before the woken sweep has run.
-CPU_BYTES_TO_USE="${CPU_BYTES_TO_USE:-6763500000}"
-NODE_DRAM_BUDGET_BYTES="${NODE_DRAM_BUDGET_BYTES:-8099500000}"
+BLOCK_BYTES=$((24 * 870400 * 8))
+TIER0_PROMPTS=10
+TIER1_PROMPTS=12
+CPU_BYTES_TO_USE="${CPU_BYTES_TO_USE:-$(((2 * TIER0_PROMPTS * PROMPT_STORE_BLOCKS + 1) * BLOCK_BYTES / 2))}"
+NODE_DRAM_BUDGET_BYTES="${NODE_DRAM_BUDGET_BYTES:-$(((2 * TIER1_PROMPTS * PROMPT_STORE_BLOCKS + 1) * BLOCK_BYTES / 2))}"
 TIER0_LOW_WATERMARK="${TIER0_LOW_WATERMARK:-0.2}"
 TIER0_HIGH_WATERMARK="${TIER0_HIGH_WATERMARK:-0.4}"
 TIER1_LOW_WATERMARK="${TIER1_LOW_WATERMARK:-0.3}"
 TIER1_HIGH_WATERMARK="${TIER1_HIGH_WATERMARK:-0.4}"
 NODE_EVICT_SWEEP="${NODE_EVICT_SWEEP:-true}"
 NODE_EVICT_SWEEP_PERIOD="${NODE_EVICT_SWEEP_PERIOD:-1h}"
-PROMPTS="${PROMPTS:-28}"
-PROMPT_BLOCKS="${PROMPT_BLOCKS:-4}"
 
 mkdir -p "${LOG_DIR}"
 echo "ports: server=${PORT} registry=${REGISTRY_PORT}\
@@ -301,6 +313,18 @@ if [[ "${HIT_BLOCK_SIZE}" -ne "${MAX_NUM_BATCHED_TOKENS}" ]]; then
   fail "the engine chose a ${HIT_BLOCK_SIZE}-token block but prefill chunks are \
 ${MAX_NUM_BATCHED_TOKENS} tokens; rerun with MAX_NUM_BATCHED_TOKENS=${HIT_BLOCK_SIZE}"
 fi
+read -r MAMBA_GROUPS OTHER_GROUPS < <(
+  sed -nE 's/.*group\[([0-9]+)\]: spec=([A-Za-z]+).*/\1 \2/p' "${LOG_DIR}/server.log" \
+    | sort -u \
+    | awk '{ if ($2 == "MambaSpec") m++; else o++ } END { print m + 0, o + 0 }')
+if [[ $((MAMBA_GROUPS + OTHER_GROUPS)) -gt 0 ]]; then
+  store_blocks=$((PROMPT_BLOCKS * OTHER_GROUPS + MAMBA_GROUPS))
+  [[ "${store_blocks}" -eq "${PROMPT_STORE_BLOCKS}" ]] || fail "the engine logs \
+${OTHER_GROUPS} attention and ${MAMBA_GROUPS} KDA cache groups, so a prompt takes \
+${store_blocks} offloaded blocks, not PROMPT_STORE_BLOCKS=${PROMPT_STORE_BLOCKS}"
+else
+  echo "the engine logged no KV cache groups; trusting PROMPT_STORE_BLOCKS=${PROMPT_STORE_BLOCKS}"
+fi
 TIER0_BLOCKS="$(sed -nE \
   's/.*KVCacheStore up: .*\(([0-9]+) offloaded blocks x [0-9]+\).*/\1/p' \
   "${LOG_DIR}/server.log" | head -1)"
@@ -327,6 +351,7 @@ python3 "${script_dir}/smoke_gpc_tier1_eviction.py" \
   --hit-block-size "${HIT_BLOCK_SIZE}" \
   --prompts "${PROMPTS}" \
   --prompt-blocks "${PROMPT_BLOCKS}" \
+  --prompt-store-blocks "${PROMPT_STORE_BLOCKS}" \
   --tier0-blocks "${TIER0_BLOCKS}" \
   --tier0-low "${TIER0_LOW_WATERMARK}" \
   --tier0-high "${TIER0_HIGH_WATERMARK}" \
@@ -335,10 +360,8 @@ python3 "${script_dir}/smoke_gpc_tier1_eviction.py" \
   --tier1-high "${TIER1_HIGH_WATERMARK}" \
   2>&1 | tee "${LOG_DIR}/smoke.log" || smoke_rc=$?
 
-# Post-mortem for triage; never gating. A refused demotion is the
-# signature of a tier 1 that does not make room.
-echo "--- demotions tier 1 declined: $(grep -c "declined a demotion batch" \
-  "${LOG_DIR}/server.log" || true)"
+# Post-mortem for triage; never gating. Raiden's INFO lines do not reach
+# server.log, so only its sweep warnings show here.
 grep -E "Evict sweep" "${LOG_DIR}/server.log" | tail -10 || true
 echo "--- store_node.log tail"
 tail -30 "${LOG_DIR}/store_node.log" || true

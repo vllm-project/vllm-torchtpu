@@ -16,9 +16,11 @@
 
 The runner sizes tier 0 (the replica's own host pool) and tier 1 (a host
 store node) to a handful of prompts each and passes their real block counts
-and sweep watermarks here. Every prompt offloads exactly --prompt-blocks
-whole blocks. From those numbers this works out where each prompt must be
-once seeding has settled. Ranks count back from the newest prompt (rank 0):
+and sweep watermarks here. Every prompt is --prompt-blocks hit blocks long
+and takes --prompt-store-blocks offloaded blocks in either tier, which the
+runner explains. From those numbers this works out where each prompt must
+be once seeding has settled. Ranks count back from the newest prompt (rank
+0):
 
   tier 0   the newest prompts: C0 - ceil(hi0 * C0) blocks just after a
            sweep, up to C0 - ceil(lo0 * C0) just before the next.
@@ -108,7 +110,7 @@ class Layout:
     newest prompt, and the seeding point of the prompt-0 checkpoint."""
 
     def __init__(self, args: argparse.Namespace):
-        b = args.prompt_blocks
+        b = args.prompt_store_blocks
         c0, c1 = args.tier0_blocks, args.tier1_blocks
         self.u0_min = c0 - math.ceil(args.tier0_high * c0)
         self.u0_max = c0 - math.ceil(args.tier0_low * c0)
@@ -127,7 +129,7 @@ class Layout:
         self.dropped = [1, 2, 3]
 
     def problems(self, args: argparse.Namespace) -> list[str]:
-        b, n = args.prompt_blocks, args.prompts
+        b, n = args.prompt_store_blocks, args.prompts
         out = []
         if len(self.landed) < 3:
             out.append(
@@ -164,6 +166,7 @@ def main() -> int:
     parser.add_argument("--hit-block-size", type=int, required=True)
     parser.add_argument("--prompts", type=int, default=28)
     parser.add_argument("--prompt-blocks", type=int, default=4)
+    parser.add_argument("--prompt-store-blocks", type=int, required=True)
     parser.add_argument("--tier0-blocks", type=int, required=True)
     parser.add_argument("--tier0-low", type=float, required=True)
     parser.add_argument("--tier0-high", type=float, required=True)
@@ -193,7 +196,8 @@ def main() -> int:
     print(
         f"tier 0: {args.tier0_blocks} blocks, holds {lay.u0_min}-{lay.u0_max}; "
         f"tier 1: {args.tier1_blocks} blocks, holds {lay.u1_min}-{lay.u1_max}; "
-        f"{args.prompt_blocks} blocks ({plen} tokens) per prompt"
+        f"{args.prompt_store_blocks} offloaded blocks per prompt of "
+        f"{args.prompt_blocks} hit blocks ({plen} tokens)"
     )
     print(
         f"{args.prompts} prompts; checkpoint after {lay.checkpoint}; landed "
