@@ -54,6 +54,8 @@ _CI_MERGE_BOT_LOGIN = "github-actions[bot]"
 # fails rather than drop the requested extras.
 _MQ_EXTRAS_ATTEMPTS = 3
 _MQ_EXTRAS_RETRY_SECONDS = 10
+# History depths tried, in order, until a PR's merge-base with its base is found.
+_PR_FETCH_DEPTHS = (20, 200, 1000)
 _LABEL_EXTRAS = {"run-perf-eval": "perf-eval", "run-full-ci": "nightly-suite"}
 _PR_SUITE_LABELS = ("skip-tpu-ci", *_LABEL_EXTRAS)
 _VALID_CI_EXTRAS = frozenset(_LABEL_EXTRAS.values())
@@ -542,7 +544,7 @@ def _git(
         cwd=cwd,
         env=env,
         stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL if args[:1] == ("diff",) else None,
+        stderr=subprocess.DEVNULL if args[:1] in (("diff",), ("merge-base",)) else None,
         text=True,
         check=check,
     )
@@ -597,22 +599,33 @@ def _changed_files(ctx: BuildContext, *, env: Mapping[str, str]) -> list[str]:
         return []
     if ctx.is_pr:
         print(f"PR detected. Target branch: {ctx.pr_base_branch}")
-        if (
-            _git(
-                "fetch",
-                "origin",
-                ctx.pr_base_branch,
-                "--depth=20",
-                "--quiet",
-                env=env,
-            ).returncode
-            != 0
-        ):
-            print("Base fetch failed")
-        _git("fetch", "origin", ctx.commit, "--depth=20", "--quiet", env=env)
-        if files := _diff_names(
-            [f"origin/{ctx.pr_base_branch}...{ctx.commit}"], env=env
-        ):
+        base_ref = f"origin/{ctx.pr_base_branch}"
+        # A shallow fetch misses the merge-base of a PR that is many commits
+        # behind its base, and `base...commit` then fails. Fetch deeper until
+        # git finds it. Without a merge-base, run everything: diffing only the
+        # head commit would treat a multi-commit PR whose last commit is
+        # docs-only as a docs-only change.
+        for depth in _PR_FETCH_DEPTHS:
+            if (
+                _git(
+                    "fetch",
+                    "origin",
+                    ctx.pr_base_branch,
+                    f"--depth={depth}",
+                    "--quiet",
+                    env=env,
+                ).returncode
+                != 0
+            ):
+                print("Base fetch failed")
+            _git("fetch", "origin", ctx.commit, f"--depth={depth}", "--quiet", env=env)
+            if _git("merge-base", base_ref, ctx.commit, env=env).returncode == 0:
+                break
+            print(f"No merge-base with {base_ref} at depth {depth}")
+        else:
+            print(f"No merge-base with {base_ref}; running the full build")
+            return []
+        if files := _diff_names([f"{base_ref}...{ctx.commit}"], env=env):
             return files
         tree = _git(
             "diff-tree",
