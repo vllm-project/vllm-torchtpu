@@ -35,7 +35,11 @@ arms:
   # Arm sections are deep-merged over each leg's (README.md), so tradeoffs_off
   # sets every trade-off the base point turns on back to false.
   tradeoffs_off:
-    additional_config: {qwen3_5: {exp2_softmax: false, native_fp8_attention: false}}
+    additional_config:
+      qwen3_5:
+        exp2_softmax: false
+        native_fp8_attention: false
+        quantize_target_lm_head: false
   tradeoffs_on:
     additional_config:
       qwen3_5:
