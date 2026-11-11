@@ -727,6 +727,83 @@ class GDNChunkedComputeTest(parameterized.TestCase):
         self.assertEqual(unpacked.shape, x.shape)
         self.assertEqual(float(jnp.max(jnp.abs(unpacked - x))), 0.0)
 
+    @parameterized.named_parameters(
+        dict(testcase_name="b2", chunk=32, block_size=2),
+        dict(testcase_name="b4", chunk=32, block_size=4),
+        dict(testcase_name="b8", chunk=32, block_size=8),
+        dict(testcase_name="b16", chunk=32, block_size=16),
+        dict(testcase_name="non_multiple_b8", chunk=23, block_size=8),
+        dict(testcase_name="non_multiple_b16", chunk=23, block_size=16),
+    )
+    def test_solve_triangular_rhs_matches_linalg_solve(
+        self, chunk: int, block_size: int
+    ):
+        """solve_triangular_rhs on L matches the exact solve of (I + L) x = rhs."""
+        k0, k1 = jax.random.split(jax.random.key(67))
+        num_heads, d_v = 8, 128
+        raw = jax.random.normal(k0, (num_heads, chunk, chunk), dtype=jnp.float32)
+        strict_lower = jnp.tril(raw * 0.05, k=-1)
+        t = strict_lower + jnp.eye(chunk, dtype=jnp.float32)[None, :, :]
+        rhs = jax.random.normal(k1, (num_heads, chunk, d_v), dtype=jnp.float32)
+
+        with jax.default_matmul_precision("float32"):
+            solved = compute_gdn.solve_triangular_rhs(
+                strict_lower, rhs, block_size=block_size
+            )
+            ref = jnp.linalg.solve(t, rhs)
+
+        self.assertEqual(solved.shape, rhs.shape)
+        self.assertLess(float(jnp.max(jnp.abs(solved - ref))), 1e-5)
+
+    def test_gdn_triangular_block_size_floor(self):
+        """GDN keeps an 8-sublane block floor (16 at <= 8 heads); KDA unchanged."""
+        f32_dtype = jnp.dtype(jnp.float32)
+        dtypes = config.Dtypes(
+            act_in=f32_dtype,
+            act_out=f32_dtype,
+            compute=f32_dtype,
+            recurrent_state=f32_dtype,
+            conv_state=f32_dtype,
+        )
+        for n_v, expected_gdn, expected_kda in (
+            (8, 16, 16),
+            (16, 8, 8),
+            (24, 8, 8),
+            (32, 8, 8),
+            (40, 8, 4),
+            (64, 8, 4),
+            (128, 8, 4),
+        ):
+            n_kq = max(1, n_v // 8)
+            dim = 2 * n_kq * 128 + n_v * 128
+            gdn_cfg = config.GDNConfig(
+                mode=config.GDNMode.PER_SEQ,
+                dtypes=dtypes,
+                batch_size=128,
+                dim_size=dim,
+                kernel_size=4,
+                tile_size=128,
+                num_kq_heads=n_kq,
+                num_v_heads=n_v,
+                kq_head_dim=128,
+                v_head_dim=128,
+            )
+            kda_cfg = config.GDNConfig(
+                mode=config.GDNMode.PER_SEQ,
+                dtypes=dtypes,
+                batch_size=128,
+                dim_size=dim,
+                kernel_size=4,
+                tile_size=128,
+                num_kq_heads=n_kq,
+                num_v_heads=n_v,
+                kq_head_dim=128,
+                v_head_dim=128,
+                attention_mode=config.AttentionMode.KDA,
+            )
+            self.assertEqual(gdn_cfg.triangular_block_size, expected_gdn, msg=f"{n_v=}")
+            self.assertEqual(kda_cfg.triangular_block_size, expected_kda, msg=f"{n_v=}")
+
 
 @pytest.mark.tpu_test
 class GDNAttentionTest(parameterized.TestCase):
