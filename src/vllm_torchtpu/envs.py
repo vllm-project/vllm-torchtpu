@@ -768,7 +768,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "TPU_MINIMAX_M3_MSA_DECODE_V2_MAX_TOKENS", 512
     ),
     # Tuning overrides of the decode kernel, "key=value,..." (bq, pps,
-    # widths as 1-2-4-8, tps, t 0/1, scale small/big, dense 0/1 work-list
+    # widths as 1-2-4-8, tps, t 0/1, scale small/big, translate 0/1, dense 0/1 work-list
     # unions). Empty = defaults.
     "TPU_MINIMAX_M3_MSA_DECODE_V2_CFG": lambda: os.getenv(
         "TPU_MINIMAX_M3_MSA_DECODE_V2_CFG", ""

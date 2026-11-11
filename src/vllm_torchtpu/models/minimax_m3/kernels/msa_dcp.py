@@ -854,6 +854,8 @@ def decode_v2_options() -> dict:
             opts["scale_mode"] = value
         elif key == "dense":
             opts["dense"] = value == "1"
+        elif key == "translate":
+            opts["translate"] = value == "1"
         else:
             raise ValueError(f"TPU_MINIMAX_M3_MSA_DECODE_V2_CFG: unknown key {key!r}")
     return opts

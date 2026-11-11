@@ -75,6 +75,7 @@ def _kernel(
     widths: tuple[int, ...],
     transposed: bool,
     scale_mode: str,
+    translated: bool,
 ):
     tail = refs[len(refs) - (9 if fp4 else 7) :]
     o_ref, lse_ref, m_ref, l_ref, acc_ref, buf_ref, sem_ref = tail[:7]
@@ -111,7 +112,9 @@ def _kernel(
         head = tile_of(meta) // tiles_per_head
 
         def start(g, carry):
-            page = page_table_ref[work_page_ref[base + g]]
+            page = work_page_ref[base + g]
+            if not translated:
+                page = page_table_ref[page]
             for copy in page_copies(slot, g, page, head):
                 copy.start()
             return carry
@@ -342,6 +345,7 @@ def _work(selected, block_q, pages_per_step, tiles_per_step, dense):
         "transposed",
         "scale_mode",
         "dense",
+        "translate",
         "interpret",
     ),
 )
@@ -362,6 +366,7 @@ def msa_decode_attention_lse(
     transposed: bool = False,
     scale_mode: str = "small",
     dense: bool | None = None,
+    translate: bool = True,
     interpret: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """`msa_attention_lse.msa_sparse_attention_lse_heads(..., head_major=True)`
@@ -371,7 +376,9 @@ def msa_decode_attention_lse(
     lse [G * Hg, T] f32)``; a token with no visible slot gets 0 and -inf.
 
     A 4-bit cache takes its `scale_cache` (KV head ``h``'s K / V scales in
-    scale-page rows ``2h`` / ``2h + 1``)."""
+    scale-page rows ``2h`` / ``2h + 1``). With `translate`, keys become
+    physical pages in XLA before the work list; else the kernel looks them
+    up in the scalar-prefetched `page_table`."""
     num_tokens, num_q_heads, head_dim = q.shape
     num_kv_heads, topk = selected.shape[1:]
     num_heads = num_q_heads // num_kv_heads
@@ -379,6 +386,17 @@ def msa_decode_attention_lse(
     msa_attention.check_cache(kv_cache, scale_cache)
     if kv_cache.shape[3] < 2 * head_dim * num_kv_heads:
         raise ValueError(f"cache rows {kv_cache.shape} miss {num_kv_heads} KV heads")
+    if translate:
+        # Page keys -> physical pages here, one small gather, so the kernel
+        # needs no scalar-prefetched page table (max_num_seqs x pages per
+        # sequence words copied to SMEM before every call).
+        selected = jnp.where(
+            selected >= 0, jnp.take(page_table, jnp.maximum(selected, 0)), -1
+        )
+        local_page = jnp.where(
+            local_page >= 0, jnp.take(page_table, jnp.maximum(local_page, 0)), -1
+        )
+        page_table = jnp.zeros((1,), jnp.int32)
     pad = -num_tokens % block_q
     padded = num_tokens + pad
     q = jnp.pad(q, ((0, pad), (0, 0), (0, 0))).transpose(1, 0, 2)  # [G*Hg, Tp, D]
@@ -480,6 +498,7 @@ def msa_decode_attention_lse(
             widths=tuple(widths),
             transposed=transposed,
             scale_mode=scale_mode,
+            translated=translate,
         ),
         grid_spec=grid_spec,
         out_shape=[
