@@ -46,6 +46,7 @@ Core mechanisms:
 from __future__ import annotations
 
 import os
+import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -180,6 +181,69 @@ class RaidenOffloadingWorkerMetadata(OffloadingWorkerMetadata):
         )
 
 
+_V1_UNLIMITED = 1 << 62   # cgroup v1 reports "no limit" as a page-rounded 2**63 - 1
+
+
+def _own_cgroup_paths(proc_cgroup: str) -> tuple[str | None, str | None]:
+    """This process's cgroup path for v2 (``0::<path>``) and for the v1 memory controller (``N:...memory...:<path>``)."""
+    v2 = v1 = None
+    try:
+        with open(proc_cgroup) as f:
+            for line in f:
+                parts = line.rstrip("\n").split(":", 2)
+                if len(parts) != 3:
+                    continue
+                hier, controllers, path = parts
+                if hier == "0" and controllers == "":
+                    v2 = path
+                elif "memory" in controllers.split(","):
+                    v1 = path
+    except OSError:
+        pass
+    return v2, v1
+
+
+def _cgroup_memory(
+    root: str = "/sys/fs/cgroup", proc_cgroup: str = "/proc/self/cgroup"
+) -> dict[str, int | str | None]:
+    """The container's memory: current, peak and limit bytes, and the files they came from (``source``).
+
+    Tried in order, first readable usage wins:
+      v2 at this process's own cgroup (``<root><path>/memory.{current,peak,max}``; a container that sees the host
+      hierarchy, as CP3's serving container appears to, has no ``memory.*`` files at the root), then v2 at the root
+      (a namespaced container), then v1 at the own path and at the root
+      (``<root>/memory[<path>]/memory.{usage_in_bytes,max_usage_in_bytes,limit_in_bytes}``).
+    "No limit" (v2 ``max``, v1 >= 2**62) reads as None. Nothing readable: all None, ``source`` = "none".
+    """
+
+    def read(path: str) -> int | None:
+        try:
+            with open(path) as f:
+                return int(f.read().strip())
+        except (OSError, ValueError):
+            return None
+
+    v2, v1 = _own_cgroup_paths(proc_cgroup)
+    cands: list[tuple[str, str, tuple[str, str, str]]] = []
+    v2_files = ("memory.current", "memory.peak", "memory.max")
+    v1_files = ("memory.usage_in_bytes", "memory.max_usage_in_bytes", "memory.limit_in_bytes")
+    if v2 and v2 != "/":
+        cands.append(("v2:own", root + v2, v2_files))
+    cands.append(("v2:root", root, v2_files))
+    if v1 and v1 != "/":
+        cands.append(("v1:own", f"{root}/memory{v1}", v1_files))
+    cands.append(("v1:root", f"{root}/memory", v1_files))
+    for source, base, (cur_f, peak_f, max_f) in cands:
+        current = read(f"{base}/{cur_f}")
+        if current is None:
+            continue
+        limit = read(f"{base}/{max_f}")
+        if limit is not None and source.startswith("v1") and limit >= _V1_UNLIMITED:
+            limit = None
+        return {"current": current, "peak": read(f"{base}/{peak_f}"), "max": limit, "source": source}
+    return {"current": None, "peak": None, "max": None, "source": "none"}
+
+
 @dataclass
 class _ParkedStore:
     """A store job parked until every worker rank acknowledges the device fence."""
@@ -206,6 +270,41 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         assert isinstance(self.manager, RaidenOffloadingManager)
         self._raiden_manager: RaidenOffloadingManager = self.manager
         self._fence_pending: dict[int, _ParkedStore] = {}
+
+    # Cumulative host-tier counters, logged every VLLM_TPU_OFFLOAD_TELEMETRY_S
+    # seconds (60 by default; <= 0 turns the line off) with the container's
+    # memory, so a serving log shows the tier working and its host footprint.
+    # Created lazily: tests build this scheduler without __init__.
+    _TELEMETRY_KEYS = (
+        "loads", "load_keys", "loads_done", "failed_load_blocks",
+        "stores", "store_keys", "stores_done", "stores_cancelled",
+    )
+
+    @property
+    def telemetry(self) -> dict[str, int]:
+        return self.__dict__.setdefault(
+            "_telemetry", dict.fromkeys(self._TELEMETRY_KEYS, 0)
+        )
+
+    def telemetry_line(self) -> str:
+        mem = _cgroup_memory()
+        gib = lambda v: "n/a" if v is None else f"{v / 1024**3:.1f}GiB"
+        counters = " ".join(f"{k}={v}" for k, v in self.telemetry.items())
+        return (
+            f"offload-tier telemetry: {counters} fence_pending={len(self._fence_pending)} "
+            f"mem_current={gib(mem['current'])} mem_peak={gib(mem['peak'])} "
+            f"mem_max={gib(mem['max'])} mem_src={mem['source']}"
+        )
+
+    def _maybe_log_telemetry(self) -> None:
+        period = float(os.environ.get("VLLM_TPU_OFFLOAD_TELEMETRY_S", "60"))
+        if period <= 0:
+            return
+        now = time.monotonic()
+        next_at = self.__dict__.setdefault("_telemetry_next", now + period)
+        if now >= next_at:
+            self.__dict__["_telemetry_next"] = now + period
+            logger.info("%s", self.telemetry_line())
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
@@ -249,6 +348,8 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 job.req_id,
                 pinned=src_spec.pinned,
             )
+            self.telemetry["loads"] += 1
+            self.telemetry["load_keys"] += len(src_spec.keys)
 
         # Handle jobs_to_flush (source blocks are about to be recycled):
         # - Cancel fence-pending stores before they start.
@@ -263,6 +364,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             parked = self._fence_pending.pop(job_id, None)
             if parked is not None:
                 manager.on_store_job_cancelled(parked.keys)
+                self.telemetry["stores_cancelled"] += 1
                 finished_store_ids.append(job_id)
                 # Avoid useless TPU sync if created and cancelled in the same step.
                 new_fence_ids.discard(job_id)
@@ -279,10 +381,16 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         for finished_job in list(drained) + manager.poll_finished_jobs():
             if finished_job.op == AdmissionOp.STORE:
                 finished_store_ids.append(finished_job.job_id)
+                self.telemetry["stores_done"] += 1
             else:
                 assert finished_job.req_id is not None
                 finished_loads[finished_job.job_id] = finished_job.req_id
                 failed_load_block_ids.extend(finished_job.failed_device_block_ids)
+                self.telemetry["loads_done"] += 1
+                self.telemetry["failed_load_blocks"] += len(
+                    finished_job.failed_device_block_ids
+                )
+        self._maybe_log_telemetry()
 
         # Return empty load_jobs/store_jobs: workers act as passive DMA endpoints.
         return RaidenOffloadingConnectorMetadata(
@@ -311,6 +419,8 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                     self._raiden_manager.submit_store_job(
                         job_id, parked.keys, parked.device_block_ids
                     )
+                    self.telemetry["stores"] += 1
+                    self.telemetry["store_keys"] += len(parked.keys)
         super().update_connector_output(connector_output)
 
 
