@@ -24,12 +24,19 @@ prioritizes requests with the fewest uncached prompt tokens. It modifies only
 the admission ordering; memory management, eviction, and preemption policies
 remain untouched.
 
+Warmest-first alone starves long cold prompts: while warmer requests keep
+arriving they never reach the front, their session stalls, and its cached
+prefix ages out. A request that has waited `paw_max_wait_s` seconds (additional
+config, default 0 = off) is promoted ahead of every normal request,
+oldest first.
+
 Enable with:
     --scheduler-cls vllm_torchtpu.core.prefix_aware_scheduler.PrefixAwareScheduler
 """
 
+import time
 from itertools import islice
-from typing import cast
+from typing import Any, cast
 
 from vllm.logger import init_logger
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
@@ -40,13 +47,20 @@ from vllm.v1.core.sched.request_queue import (
 )
 from vllm.v1.request import Request
 
+from vllm_torchtpu.runner.utils import PAW_MAX_WAIT_S_KEY
+
 logger = init_logger("vllm." + __name__)
 
 _LOG_EVERY = 1000
 
 # Priority tiers: lower values admit earlier.
 _TIER_PREEMPTED = 1
-_TIER_NORMAL = 2
+_TIER_AGED = 2
+_TIER_NORMAL = 3
+
+# Seconds a request may wait before it is promoted ahead of warmer requests
+# (additional_config PAW_MAX_WAIT_S_KEY; 0 disables aging).
+DEFAULT_PAW_MAX_WAIT_S = 0.0
 
 
 class PrefixAwareScheduler(AsyncScheduler):
@@ -55,14 +69,23 @@ class PrefixAwareScheduler(AsyncScheduler):
     #: Lookahead window of ready requests to evaluate for cached prefix length.
     WINDOW = 64
 
+    # Class-level defaults so partially constructed instances (tests) work.
+    _paw_max_wait_s: float = DEFAULT_PAW_MAX_WAIT_S
+    _paw_aged: int = 0
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._paw_n = 0
         self._paw_cold_tokens = 0
         self._paw_prompt_tokens = 0
         self._paw_scoring_broken = False
+        self._paw_max_wait_s = _max_wait_from_config(getattr(self, "vllm_config", None))
 
-        logger.info("PrefixAwareScheduler ACTIVE (window=%d)", self.WINDOW)
+        logger.info(
+            "PrefixAwareScheduler ACTIVE (window=%d, max_wait=%.0fs)",
+            self.WINDOW,
+            self._paw_max_wait_s,
+        )
 
     def _prefix_warmth(self, request: Request) -> int:
         """Prompt tokens of ``request`` resident in the KV cache."""
@@ -90,8 +113,18 @@ class PrefixAwareScheduler(AsyncScheduler):
         """Return (sort_key, warmth). Lower sort_key is admitted first."""
         warmth = self._prefix_warmth(request)
         cold_tokens = float(request.num_tokens - warmth)
-        tier = _TIER_PREEMPTED if request.num_preemptions > 0 else _TIER_NORMAL
+        if request.num_preemptions > 0:
+            tier = _TIER_PREEMPTED
+        elif self._is_aged(request):
+            # Oldest first among aged requests, whatever their warmth.
+            return (_TIER_AGED, 0.0, request.arrival_time), warmth
+        else:
+            tier = _TIER_NORMAL
         return (tier, cold_tokens, request.arrival_time), warmth
+
+    def _is_aged(self, request: Request) -> bool:
+        max_wait = self._paw_max_wait_s
+        return max_wait > 0 and time.time() - request.arrival_time >= max_wait
 
     def _select_waiting_queue_for_scheduling(self) -> RequestQueue | None:
         queue = getattr(self, "kv_holding_waiting", None) or getattr(
@@ -118,6 +151,8 @@ class PrefixAwareScheduler(AsyncScheduler):
         head = window[0]
         scored = [(self._rank_and_warmth(r), r) for r in window]
         (best_rank, best_warmth), best = min(scored, key=lambda t: t[0][0])
+        if best_rank[0] == _TIER_AGED:
+            self._paw_aged += 1
 
         if best is not head and best_rank < scored[0][0][0]:
             # Only FCFS reaches here (see the early return above).
@@ -131,9 +166,32 @@ class PrefixAwareScheduler(AsyncScheduler):
         if self._paw_n % _LOG_EVERY == 0:
             logger.info(
                 "warmest-first: n=%d mean_cold_tokens=%.0f "
-                "cold_frac=%.3f queue_depth=%d",
+                "cold_frac=%.3f queue_depth=%d aged=%d",
                 self._paw_n,
                 self._paw_cold_tokens / self._paw_n,
                 self._paw_cold_tokens / max(self._paw_prompt_tokens, 1),
                 len(queue),
+                self._paw_aged,
             )
+
+
+def _max_wait_from_config(vllm_config: Any) -> float:
+    """`paw_max_wait_s` from `--additional-config` (default 0 = off)."""
+    additional = getattr(vllm_config, "additional_config", None)
+    raw = (
+        additional.get(PAW_MAX_WAIT_S_KEY, DEFAULT_PAW_MAX_WAIT_S)
+        if isinstance(additional, dict)
+        else DEFAULT_PAW_MAX_WAIT_S
+    )
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"additional_config[{PAW_MAX_WAIT_S_KEY!r}] must be a number of "
+            f"seconds, got {raw!r}"
+        ) from None
+    if value < 0:
+        raise ValueError(
+            f"additional_config[{PAW_MAX_WAIT_S_KEY!r}] must be >= 0, got {value}"
+        )
+    return value
