@@ -626,10 +626,14 @@ def test_worker_views_the_merged_pool_by_scheduler_block():
         worker.shutdown()
 
 
-def test_register_kv_caches_canonicalizes_the_merged_pool():
+def test_register_kv_caches_canonicalizes_the_merged_pool(monkeypatch):
+    from vllm_torchtpu.offload import raiden_store
     from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingConnector
 
     cfg = layer_outermost_config(num_blocks=4)
+    # Workers record their per-layer specs before the offloading spec is built.
+    monkeypatch.setattr(raiden_store, "_all_ranks_leaf_kv_cache_specs", None)
+    raiden_store.record_all_ranks_leaf_kv_cache_specs([cfg])
     out = materialize_kv_cache_tensors(
         kv_cache_config=cfg,
         attn_groups=_attn_groups(cfg),
@@ -643,7 +647,8 @@ def test_register_kv_caches_canonicalizes_the_merged_pool():
         connector_worker=SimpleNamespace(
             kv_cache_config=cfg,
             _init_worker=lambda canonical: captured.setdefault("c", canonical),
-        )
+        ),
+        _vllm_config=None,  # single-shape layout: the K/V leaf check returns early
     )
     TPURaidenOffloadingConnector.register_kv_caches(fake, out.kv_caches)
     canonical = captured["c"]

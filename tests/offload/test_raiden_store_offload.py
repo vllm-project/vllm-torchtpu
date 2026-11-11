@@ -56,6 +56,7 @@ physical TPU hardware or native C++ wheels:
      ends where it holds the recurrent state, and is 0 without it.
 """
 
+import contextlib
 import enum
 import os
 import sys
@@ -66,6 +67,7 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import torch
 from vllm.v1.kv_offload.base import (
     GPULoadStoreSpec,
     Locality,
@@ -2975,6 +2977,629 @@ class TestHybridGeometry(unittest.TestCase):
         selector.assert_called_once()
 
 
+@contextlib.contextmanager
+def _full_attention_backend_patches(backend=None, dense_backend=None):
+    """Resolve the TPU full-attention backend without a platform.
+
+    `dense_backend` stands for the runner's plain `Attention` backend
+    (`TpuPlatform._find_dense_attention_backend`) in a worker; None is the
+    engine core, which selects `backend` as a drafter's K/V layer selects it.
+    """
+    from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
+
+    with (
+        patch(
+            "vllm_torchtpu.platforms.tpu_platform.TpuPlatform."
+            "_find_dense_attention_backend",
+            return_value=dense_backend,
+        ),
+        patch(
+            "vllm.v1.attention.selector.get_attn_backend",
+            return_value=backend or PallasAttentionBackend,
+        ) as selector,
+        patch(
+            "vllm.config.set_current_vllm_config",
+            return_value=contextlib.nullcontext(),
+        ),
+    ):
+        yield selector
+
+
+class TestMultiShapesGeometry(unittest.TestCase):
+    """Per-array geometry for multi-shape KV layouts (MLA + drafter K/V)."""
+
+    @staticmethod
+    def _mla(block_size=256, head_size=576, dtype=torch.bfloat16):
+        from vllm.v1.kv_cache_interface import MLAAttentionSpec
+
+        return MLAAttentionSpec(
+            block_size=block_size, num_kv_heads=1, head_size=head_size, dtype=dtype
+        )
+
+    @staticmethod
+    def _full(
+        block_size=256,
+        num_kv_heads=8,
+        head_size=128,
+        head_size_v=None,
+        dtype=torch.float16,
+        page_size_padded=None,
+    ):
+        from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+        return FullAttentionSpec(
+            block_size=block_size,
+            num_kv_heads=num_kv_heads,
+            head_size=head_size,
+            head_size_v=head_size if head_size_v is None else head_size_v,
+            dtype=dtype,
+            page_size_padded=page_size_padded,
+        )
+
+    @staticmethod
+    def _resolve(*group_specs, recorded=None, through_kernel_geometry=False):
+        """Resolve `group_specs` as one worker's groups; the recorded
+        per-layer specs default to that worker's. `through_kernel_geometry`
+        goes through `resolve_kernel_geometry`, which decides the path."""
+        from vllm_torchtpu.offload import raiden_store as rs
+
+        resolve = (
+            rs.resolve_kernel_geometry
+            if through_kernel_geometry
+            else rs._resolve_multi_shapes_kv_geometry
+        )
+
+        kv_cache_config = SimpleNamespace(
+            kv_cache_groups=[SimpleNamespace(kv_cache_spec=s) for s in group_specs]
+        )
+        if recorded is None:
+            recorded = tuple(
+                leaf for s in group_specs for leaf in rs.iter_leaf_kv_cache_specs(s)
+            )
+        with (
+            patch.object(rs, "_all_ranks_leaf_kv_cache_specs", recorded),
+            _full_attention_backend_patches(),
+        ):
+            return resolve(MagicMock(), kv_cache_config)
+
+    @staticmethod
+    def _leaf_shape(leaf, backend=None):
+        from vllm_torchtpu.offload.raiden_store import multi_shapes_leaf_block_shape
+
+        with _full_attention_backend_patches(backend):
+            return multi_shapes_leaf_block_shape(MagicMock(), leaf)
+
+    def test_leaf_block_shapes(self):
+        from vllm.v1.kv_cache_interface import SlidingWindowMLASpec
+
+        mla = self._mla()
+        self.assertEqual(self._leaf_shape(mla), (mla.num_states, 1, 576))
+        # The backend page (8 KV heads x K/V packed two per fp16 sublane)
+        # and the page bytes.
+        self.assertEqual(self._leaf_shape(self._full()), (256, 8, 2, 128, 1048576))
+        swa_mla = SlidingWindowMLASpec(
+            block_size=64,
+            num_kv_heads=1,
+            head_size=576,
+            dtype=torch.bfloat16,
+            sliding_window=128,
+        )
+        self.assertIsNone(self._leaf_shape(swa_mla))
+
+    def test_full_attention_leaf_hashes_the_padded_backend_page(self):
+        # fp8 packs four values per sublane, so one KV head's K and V (two
+        # rows) are padded to four: the page is twice the logical bytes.
+        fp8 = self._full(block_size=128, num_kv_heads=1, dtype=torch.float8_e4m3fn)
+        self.assertEqual(fp8.page_size_bytes, 32768)
+        self.assertEqual(self._leaf_shape(fp8), (128, 1, 4, 128, 32768))
+        # The runner pads every attention spec to the largest page; the
+        # padded page size is part of the geometry too.
+        padded = self._full(
+            block_size=128,
+            num_kv_heads=1,
+            dtype=torch.float8_e4m3fn,
+            page_size_padded=65536,
+        )
+        self.assertEqual(self._leaf_shape(padded), (128, 1, 4, 128, 65536))
+
+    def test_full_attention_leaf_follows_the_backend_page_layout(self):
+        # A backend whose page is head-major (LBHNC batched RPA) gives a
+        # different geometry for the same spec.
+        backend = MagicMock()
+        backend.is_ssm.return_value = False
+        backend.get_kv_cache_shape.return_value = (1, 8, 256, 2, 128)
+        self.assertEqual(
+            self._leaf_shape(self._full(), backend=backend),
+            (8, 256, 2, 128, 1048576),
+        )
+
+    def test_mixed_mla_and_full_attention(self):
+        # MLA latents next to indexer keys (two MLA geometries) make the
+        # layout multi-shape; the drafter K/V leaf joins its shape set.
+        mla, indexer = self._mla(), self._mla(head_size=128)
+        block_size, shapes, dtypes, device_block = self._resolve(
+            mla, indexer, self._full(), through_kernel_geometry=True
+        )
+        self.assertEqual((block_size, device_block), (256, 256))
+        self.assertEqual(
+            shapes,
+            {
+                (mla.num_states, 1, 576),
+                (indexer.num_states, 1, 128),
+                (256, 8, 2, 128, 1048576),
+            },
+        )
+        self.assertEqual(dtypes, {torch.bfloat16, torch.float16})
+
+    def test_one_mla_geometry_with_a_drafter_is_not_multi_shape(self):
+        # The limit of `has_multi_shapes_kv_caches`: it counts MLA-family
+        # geometries only, so one MLA geometry and a drafter K/V leaf
+        # (DeepSeek-V3 + EAGLE) stay on the single-shape path, as on main.
+        from vllm_torchtpu.offload import raiden_store as rs
+
+        with patch.object(
+            rs, "_all_ranks_leaf_kv_cache_specs", (self._mla(), self._full())
+        ):
+            self.assertFalse(rs.has_multi_shapes_kv_caches())
+
+    def test_full_attention_leaves_come_from_the_recorded_specs(self):
+        from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
+
+        # The scheduler's config keeps the group's first leaf (MLA); the
+        # drafter K/V leaf reaches the geometry from the recorded specs.
+        mla, indexer, full = self._mla(), self._mla(head_size=128), self._full()
+        group = UniformTypeKVCacheSpecs(
+            block_size=256,
+            kv_cache_specs={"attn": mla, "indexer": indexer, "draft": full},
+        )
+        recorded = (mla, indexer, full) * 4
+        worker = self._resolve(group, recorded=recorded, through_kernel_geometry=True)
+        scheduler = self._resolve(mla, recorded=recorded, through_kernel_geometry=True)
+        self.assertIn((256, 8, 2, 128, 1048576), worker[1])
+        # The scheduler misses the indexer leaf (#3688), not the drafter's.
+        self.assertEqual(scheduler[1], worker[1] - {(indexer.num_states, 1, 128)})
+        # A drafter with other KV heads changes the scheduler's geometry.
+        other = self._resolve(
+            mla,
+            recorded=(mla, indexer, self._full(num_kv_heads=4)),
+            through_kernel_geometry=True,
+        )
+        self.assertNotEqual(other[1], scheduler[1])
+
+    def test_worker_hashes_the_runner_backend_page(self):
+        # In a worker whose first attention layer is MLA,
+        # `_find_non_ssm_backend` (first in layer order) is the MLA backend,
+        # while the runner lays out the drafter's K/V with the backend of the
+        # first plain `Attention` layer. The hash takes the runner's; the
+        # selector is for the engine core only.
+        from vllm_torchtpu.layers.adapter.attention import (
+            PallasAttentionBackend,
+            PallasMLAttentionBackend,
+        )
+        from vllm_torchtpu.offload.raiden_store import multi_shapes_leaf_block_shape
+
+        fp8 = self._full(block_size=128, num_kv_heads=1, dtype=torch.float8_e4m3fn)
+        draft_layer = MagicMock()
+        draft_layer.get_attn_backend.return_value = PallasAttentionBackend
+        with (
+            patch(
+                "vllm_torchtpu.platforms.tpu_platform.TpuPlatform."
+                "_find_non_ssm_backends",
+                return_value=[PallasMLAttentionBackend],
+            ),
+            patch(
+                "vllm.config.get_layers_from_vllm_config",
+                return_value={"draft.layers.0.attn": draft_layer},
+            ),
+            patch(
+                "vllm.v1.attention.selector.get_attn_backend",
+                side_effect=AssertionError("selector used in a worker"),
+            ),
+            patch(
+                "vllm.config.set_current_vllm_config",
+                return_value=contextlib.nullcontext(),
+            ),
+        ):
+            shape = multi_shapes_leaf_block_shape(MagicMock(), fp8)
+        mla_page = PallasMLAttentionBackend.get_kv_cache_shape(
+            1, 128, 1, 128, torch.float8_e4m3fn
+        )[1:]
+        self.assertNotEqual(tuple(mla_page), shape[:-1])
+        self.assertEqual(shape, (128, 1, 4, 128, 32768))
+
+    def test_engine_core_selects_the_kv_leaf_backend_as_its_layer(self):
+        # Without a model, the K/V leaf's backend is selected as a drafter's
+        # plain `Attention` layer selects it: not MLA, its own head size and
+        # sliding window.
+        import dataclasses
+
+        from vllm_torchtpu.offload.raiden_store import multi_shapes_leaf_block_shape
+
+        swa = dataclasses.replace(self._full(head_size=64), sliding_window=4096)
+        with _full_attention_backend_patches() as selector:
+            multi_shapes_leaf_block_shape(MagicMock(), swa)
+        kwargs = selector.call_args.kwargs
+        self.assertEqual(
+            (kwargs["head_size"], kwargs["use_mla"], kwargs["has_sliding_window"]),
+            (64, False, True),
+        )
+
+    def test_mla_only_layout_resolves_as_before(self):
+        mla_a, mla_b = self._mla(head_size=576), self._mla(head_size=512)
+        block_size, shapes, dtypes, device_block = self._resolve(mla_a, mla_b)
+        self.assertEqual((block_size, device_block), (256, 256))
+        self.assertEqual(
+            shapes, {(mla_a.num_states, 1, 576), (mla_b.num_states, 1, 512)}
+        )
+        self.assertEqual(dtypes, {torch.bfloat16})
+
+    def test_rejects_unequal_kv_widths(self):
+        with self.assertRaisesRegex(NotImplementedError, "equal K/V widths"):
+            self._resolve(self._mla(), self._full(head_size_v=64))
+
+    def test_rejects_non_full_attention_leaf(self):
+        from vllm.v1.kv_cache_interface import SlidingWindowSpec
+
+        swa = SlidingWindowSpec(
+            block_size=256,
+            num_kv_heads=8,
+            head_size=128,
+            dtype=torch.bfloat16,
+            sliding_window=128,
+        )
+        with self.assertRaisesRegex(NotImplementedError, "SlidingWindowSpec"):
+            self._resolve(self._mla(), swa)
+
+    def test_rejects_anchors_with_different_block_sizes(self):
+        with self.assertRaisesRegex(ValueError, "disagree on block size"):
+            self._resolve(self._mla(block_size=256), self._full(block_size=128))
+
+    def test_rejects_layout_without_full_attention_anchor(self):
+        from vllm.v1.kv_cache_interface import SlidingWindowMLASpec
+
+        swa_mla = SlidingWindowMLASpec(
+            block_size=64,
+            num_kv_heads=1,
+            head_size=576,
+            dtype=torch.bfloat16,
+            sliding_window=128,
+        )
+        with self.assertRaisesRegex(ValueError, "no full-attention layer"):
+            self._resolve(swa_mla)
+
+
+class TestMultiShapesFullAttentionLeaf(unittest.TestCase):
+    """TPURaidenStoreOffloadingSpec and RaidenStoreOffloadingWorker over a
+    multi-shape group holding MLA caches and a drafter's FullAttentionSpec
+    K/V layers, planned as vLLM plans the KV cache and allocated as the TPU
+    runner allocates it."""
+
+    BLOCK_SIZE = 128
+    NUM_BLOCKS = 4
+    DTYPE = torch.bfloat16
+    # Pages of the MLA latent (576), the indexer keys (128) and the drafter
+    # K/V layer, padded as the TPU backends pad them.
+    PAGES = (163840, 32768, 65536)
+
+    def _worker_config(self, draft_layers=1):
+        from vllm.v1.kv_cache_interface import (
+            FullAttentionSpec,
+            MLAAttentionSpec,
+            UniformTypeKVCacheSpecs,
+        )
+
+        from tests.offload.test_multi_shapes_kv import NUM_BLOCKS, _config
+        from vllm_torchtpu.layers.adapter.attention import (
+            PallasAttentionBackend,
+            PallasMLAttentionBackend,
+        )
+
+        assert self.NUM_BLOCKS == NUM_BLOCKS
+        block, dtype = self.BLOCK_SIZE, self.DTYPE
+
+        def mla(head_size):
+            # Page padded as the TPU runner pads MLA pages.
+            return MLAAttentionSpec(
+                block_size=block,
+                num_kv_heads=1,
+                head_size=head_size,
+                dtype=dtype,
+                page_size_padded=PallasMLAttentionBackend.get_kv_cache_page_size_bytes(
+                    block, 1, head_size, dtype
+                ),
+            )
+
+        leaves = {"layers.0.attn": mla(576), "layers.0.indexer": mla(128)}
+        for i in range(draft_layers):
+            leaves[f"draft.layers.{i}.attn"] = FullAttentionSpec(
+                block_size=block,
+                num_kv_heads=1,
+                head_size=128,
+                dtype=dtype,
+                page_size_padded=PallasAttentionBackend.get_kv_cache_page_size_bytes(
+                    block, 1, 128, dtype
+                ),
+            )
+        pages = tuple(leaf.page_size_bytes for leaf in leaves.values())
+        assert pages == self.PAGES + self.PAGES[-1:] * (draft_layers - 1)
+        return _config(
+            [
+                (
+                    ",".join(leaves),
+                    UniformTypeKVCacheSpecs(block_size=block, kv_cache_specs=leaves),
+                )
+            ]
+        )
+
+    def _spec(
+        self, kv_cache_config, recorded_configs, world_size=4, speculative_config=None
+    ):
+        from vllm_torchtpu.offload import raiden_store as rs
+
+        with (
+            patch.object(rs, "_all_ranks_leaf_kv_cache_specs", None),
+            _full_attention_backend_patches(),
+        ):
+            rs.record_all_ranks_leaf_kv_cache_specs(recorded_configs)
+            return _build_spec(
+                {"cpu_bytes_to_use": 1 << 30},
+                tp_size=world_size,
+                kv_cache_config=kv_cache_config,
+                worker_kv_bytes_per_block=rs._worker_kv_bytes_per_block(
+                    kv_cache_config
+                ),
+                tokens_per_block=self.BLOCK_SIZE,
+                patch_geometry=False,
+                speculative_config=speculative_config,
+            )
+
+    def test_vllm_planned_tensors_hold_every_leaf_page(self):
+        from vllm_torchtpu.offload import raiden_store as rs
+
+        worker_config = self._worker_config()
+        self.assertEqual(
+            {t.size for t in worker_config.kv_cache_tensors},
+            {self.NUM_BLOCKS * sum(self.PAGES)},
+        )
+        self.assertEqual(rs._worker_kv_bytes_per_block(worker_config), 262144)
+
+    def test_spec_builds_in_scheduler_and_workers(self):
+        from vllm.v1.core.kv_cache_utils import generate_scheduler_kv_cache_config
+
+        worker_config = self._worker_config()
+        scheduler_config = generate_scheduler_kv_cache_config([worker_config])
+        # The worker config's own bytes (all three pages), not the first
+        # leaf's: 1 GiB / (4 ranks x 262144 bytes).
+        capacity = (1 << 30) // (4 * 262144)
+        namespaces = {}
+        for name, kv_cache_config in (
+            ("worker", worker_config),
+            ("scheduler", scheduler_config),
+        ):
+            spec = self._spec(kv_cache_config, [worker_config] * 4)
+            self.assertEqual(spec.device_block_size_factor, 1)
+            self.assertEqual(spec.offload_logical_blocks_capacity, capacity)
+            self.assertEqual(spec.kernel_physical_blocks_capacity, capacity)
+            namespaces[name] = spec.key_namespace
+        self.assertEqual(capacity, 1024)
+        self.assertEqual(len(namespaces["scheduler"]), 16)
+
+    def test_drafter_geometry_reaches_the_scheduler_namespace(self):
+        import dataclasses
+
+        from vllm.v1.core.kv_cache_utils import generate_scheduler_kv_cache_config
+        from vllm.v1.kv_cache_interface import KVCacheGroupSpec
+
+        from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
+
+        worker_config = self._worker_config()
+        scheduler_config = generate_scheduler_kv_cache_config([worker_config])
+        group = worker_config.kv_cache_groups[0]
+        leaves = dict(group.kv_cache_spec.kv_cache_specs)
+        draft = leaves["draft.layers.0.attn"]
+        # A drafter with twice the KV heads (pages padded as the backend
+        # pads them): the scheduler's config, the group's first MLA leaf and
+        # the tensors, is unchanged.
+        leaves["draft.layers.0.attn"] = dataclasses.replace(
+            draft,
+            num_kv_heads=2,
+            page_size_padded=PallasAttentionBackend.get_kv_cache_page_size_bytes(
+                self.BLOCK_SIZE, 2, 128, self.DTYPE
+            ),
+        )
+        other_worker = dataclasses.replace(
+            worker_config,
+            kv_cache_groups=[
+                KVCacheGroupSpec(
+                    group.layer_names,
+                    dataclasses.replace(group.kv_cache_spec, kv_cache_specs=leaves),
+                )
+            ],
+        )
+        self.assertEqual(
+            generate_scheduler_kv_cache_config([other_worker]), scheduler_config
+        )
+        before = self._spec(scheduler_config, [worker_config] * 4)
+        after = self._spec(scheduler_config, [other_worker] * 4)
+        self.assertNotEqual(before.key_namespace, after.key_namespace)
+
+    def _register(self, worker_config, dense_backend=None, arrays=()):
+        """Allocate `worker_config` as the TPU runner does (`arrays` replaces
+        the arrays of some layers by name), register it with the connector
+        and build the worker; returns the canonical caches, the runner's
+        arrays and the registered tensors."""
+        from vllm.v1.kv_cache_interface import MLAAttentionSpec
+
+        from vllm_torchtpu.layers.adapter.attention import (
+            PallasAttentionBackend,
+            PallasMLAttentionBackend,
+        )
+        from vllm_torchtpu.offload import raiden_store as rs
+        from vllm_torchtpu.offload.raiden_connector import (
+            TPURaidenOffloadingConnector,
+        )
+
+        leaves = worker_config.kv_cache_groups[0].kv_cache_spec.kv_cache_specs
+        kv_caches = {}
+        for name, leaf in leaves.items():
+            backend = (
+                PallasMLAttentionBackend
+                if isinstance(leaf, MLAAttentionSpec)
+                else PallasAttentionBackend
+            )
+            shape = backend.get_kv_cache_shape(
+                self.NUM_BLOCKS,
+                leaf.block_size,
+                leaf.num_kv_heads,
+                leaf.head_size,
+                leaf.dtype,
+            )
+            kv_caches[name] = torch.zeros(shape, dtype=leaf.dtype)
+
+        kv_caches.update(arrays)
+
+        captured = []
+        connector = SimpleNamespace(
+            connector_worker=SimpleNamespace(
+                kv_cache_config=worker_config, _init_worker=captured.append
+            ),
+            _vllm_config=MagicMock(),
+        )
+        registered = []
+        with (
+            patch.object(
+                rs.RaidenStoreOffloadingWorker,
+                "_init_registration",
+                lambda self, tensors, *args: registered.append(tensors),
+            ),
+            patch.object(rs, "_all_ranks_leaf_kv_cache_specs", None),
+            _full_attention_backend_patches(dense_backend=dense_backend),
+        ):
+            rs.record_all_ranks_leaf_kv_cache_specs([worker_config] * 4)
+            TPURaidenOffloadingConnector.register_kv_caches(connector, kv_caches)
+            (canonical,) = captured
+            rs.RaidenStoreOffloadingWorker(
+                canonical,
+                vllm_config=MagicMock(),
+                kv_cache_config=worker_config,
+                host_blocks_to_allocate=8,
+                controller_address="127.0.0.1:1",
+                rank=0,
+            )
+        return canonical, kv_caches, registered
+
+    def test_worker_registers_each_array_including_the_full_attention_leaf(self):
+        from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
+
+        canonical, kv_caches, registered = self._register(
+            self._worker_config(), dense_backend=PallasAttentionBackend
+        )
+        (device_tensors,) = registered
+        self.assertEqual(
+            [tuple(t.shape) for t in device_tensors],
+            [(self.NUM_BLOCKS, page) for page in self.PAGES],
+        )
+        self.assertEqual(
+            [t.untyped_storage().data_ptr() for t in device_tensors],
+            [cache.untyped_storage().data_ptr() for cache in kv_caches.values()],
+        )
+        self.assertEqual(sum(t.page_size_bytes for t in canonical.tensors), 262144)
+
+    def test_worker_rejects_a_kv_page_no_array_holds(self):
+        # A hashed K/V page from a backend other than the one that allocated
+        # the arrays (here twice the bytes) does not match the layer's array.
+        backend = MagicMock()
+        backend.is_ssm.return_value = False
+        backend.get_kv_cache_shape.return_value = (1, 128, 1, 4, 128)
+        with self.assertRaisesRegex(
+            AssertionError, "'draft.layers.0.attn' has a 65536-byte array page"
+        ):
+            self._register(self._worker_config(), dense_backend=backend)
+
+    def test_worker_rejects_a_kv_page_only_another_layer_holds(self):
+        # The hashed drafter page (5 rows: 163840 bytes) is the bytes of the
+        # MLA latent array, not of the drafter's own 65536-byte array.
+        backend = MagicMock()
+        backend.is_ssm.return_value = False
+        backend.get_kv_cache_shape.return_value = (1, 128, 1, 5, 128)
+        self.assertEqual(128 * 5 * 128 * self.DTYPE.itemsize, self.PAGES[0])
+        with self.assertRaisesRegex(
+            AssertionError,
+            "'draft.layers.0.attn' has a 65536-byte array page, not the "
+            "163840-byte page",
+        ):
+            self._register(self._worker_config(), dense_backend=backend)
+
+    def test_worker_checks_each_kv_layer_against_its_own_array(self):
+        from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
+
+        # Two drafter layers: both arrays hold the hashed 65536-byte page.
+        config = self._worker_config(draft_layers=2)
+        self._register(config, dense_backend=PallasAttentionBackend)
+        # Layer 0's array has the indexer's page; layer 1's array still has
+        # the hashed bytes, which must not stand in for layer 0's.
+        wrong = torch.zeros(self.NUM_BLOCKS, self.PAGES[1], dtype=torch.int8)
+        with self.assertRaisesRegex(
+            AssertionError,
+            "'draft.layers.0.attn' has a 32768-byte array page, not the "
+            "65536-byte page",
+        ):
+            self._register(
+                config,
+                dense_backend=PallasAttentionBackend,
+                arrays={"draft.layers.0.attn": wrong},
+            )
+
+    def test_drafter_depth_reaches_the_namespace(self):
+        from vllm.v1.core.kv_cache_utils import generate_scheduler_kv_cache_config
+
+        from vllm_torchtpu.offload import raiden_store as rs
+
+        # Two drafters of one K/V geometry and different depths have the
+        # same shape set and tensor count; the per-geometry leaf counts tell
+        # them apart.
+        one, two = self._worker_config(), self._worker_config(draft_layers=2)
+        self.assertEqual(len(one.kv_cache_tensors), len(two.kv_cache_tensors))
+        shapes, counts = [], []
+        for config in (one, two):
+            with (
+                patch.object(rs, "_all_ranks_leaf_kv_cache_specs", None),
+                _full_attention_backend_patches(),
+            ):
+                rs.record_all_ranks_leaf_kv_cache_specs([config] * 4)
+                shapes.append(rs.resolve_kernel_geometry(MagicMock(), config)[1])
+                counts.append(rs.multi_shapes_kv_leaf_counts(MagicMock()))
+        self.assertEqual(shapes[0], shapes[1])
+        # One count per rank and drafter layer.
+        self.assertEqual([c for _, c in counts[0]], [4])
+        self.assertEqual([c for _, c in counts[1]], [8])
+        namespaces = [
+            self._spec(generate_scheduler_kv_cache_config([c]), [c] * 4).key_namespace
+            for c in (one, two)
+        ]
+        self.assertNotEqual(namespaces[0], namespaces[1])
+
+    def test_drafter_model_reaches_the_namespace(self):
+        from vllm.v1.core.kv_cache_utils import generate_scheduler_kv_cache_config
+
+        worker_config = self._worker_config()
+        scheduler_config = generate_scheduler_kv_cache_config([worker_config])
+
+        def namespace(model, revision=None):
+            drafter = SimpleNamespace(model=model, revision=revision)
+            return self._spec(
+                scheduler_config, [worker_config] * 4, speculative_config=drafter
+            ).key_namespace
+
+        base = namespace("org/draft-a")
+        self.assertEqual(base, namespace("org/draft-a"))
+        self.assertNotEqual(base, namespace("org/draft-b"))
+        self.assertNotEqual(base, namespace("org/draft-a", revision="v2"))
+        self.assertNotEqual(
+            base, self._spec(scheduler_config, [worker_config] * 4).key_namespace
+        )
+
+
 class TestRaidenStoreWorkerStub(unittest.TestCase):
     def test_submit_paths_fail_loudly(self):
         from vllm_torchtpu.offload.raiden_store import RaidenStoreOffloadingWorker
@@ -3232,11 +3857,18 @@ def _build_spec(
     dp_index=None,
     groups=None,
     kv_cache_groups=None,
+    kv_cache_config=None,
+    worker_kv_bytes_per_block=4096,
+    tokens_per_block=64,
+    patch_geometry=True,
+    speculative_config=None,
 ):
-    """A real TPURaidenStoreOffloadingSpec over stub configs, with kernel
-    geometry, the block-major contract, and the namespace patched out. Under
-    pipeline parallelism the spec needs the recorded all-ranks bytes, so
-    every worker is recorded at the stub's 4096 bytes per block."""
+    """A real TPURaidenStoreOffloadingSpec over stub configs. With
+    `patch_geometry`, kernel geometry, the block-major contract, and the
+    namespace are patched out; without it they are resolved from
+    `kv_cache_config`. Under pipeline parallelism the spec needs the recorded
+    all-ranks bytes, so every worker is recorded at the stub's 4096 bytes per
+    block."""
     from vllm_torchtpu.offload import raiden_store as rs
 
     if pp_size == 1:
@@ -3248,8 +3880,9 @@ def _build_spec(
     config = SimpleNamespace(
         extra_config={"cpu_bytes_to_use": 1 << 20, **extra_config},
         enable_kv_cache_events=False,
-        groups=groups or [SimpleNamespace(group_id=0, tokens_per_block=64)],
-        cache=SimpleNamespace(tokens_per_hash=64, blocks_per_chunk=1),
+        groups=groups
+        or [SimpleNamespace(group_id=0, tokens_per_block=tokens_per_block)],
+        cache=SimpleNamespace(tokens_per_hash=tokens_per_block, blocks_per_chunk=1),
         parallel=SimpleNamespace(
             tp_size=tp_size,
             pp_size=pp_size,
@@ -3257,13 +3890,17 @@ def _build_spec(
             dcp_size=1,
             world_size=tp_size * pp_size * pcp_size,
         ),
-        worker_kv_bytes_per_block=4096,
+        worker_kv_bytes_per_block=worker_kv_bytes_per_block,
         engine_id="engine",
     )
     vllm_config = MagicMock()
     vllm_config.kv_events_config.enable_kv_cache_events = False
     vllm_config.model_config.is_hybrid = False
     vllm_config.model_config.model = "org/model"
+    vllm_config.model_config.revision = None
+    vllm_config.model_config.quantization = None
+    vllm_config.cache_config.prefix_caching_hash_algo = "sha256"
+    vllm_config.speculative_config = speculative_config
     vllm_config.parallel_config.data_parallel_rank = (
         (0 if dp_rank_local is None else dp_rank_local) if dp_rank is None else dp_rank
     )
@@ -3271,19 +3908,27 @@ def _build_spec(
     vllm_config.parallel_config.data_parallel_index = (
         vllm_config.parallel_config.data_parallel_rank if dp_index is None else dp_index
     )
-    kv_cache_config = SimpleNamespace(
-        kv_cache_groups=kv_cache_groups or [SimpleNamespace(kv_cache_spec=object())],
-        kv_cache_tensors=[object()],
-    )
-    with (
-        patch.object(
-            rs,
-            "resolve_kernel_geometry",
-            return_value=(16, (16, 2, 2, 8), "bfloat16", 64),
-        ),
-        patch.object(rs, "resolve_block_major_contract", return_value=None),
-        patch.object(rs, "derive_offload_namespace", return_value=b"\0" * 16),
-    ):
+    if kv_cache_config is None:
+        kv_cache_config = SimpleNamespace(
+            kv_cache_groups=kv_cache_groups
+            or [SimpleNamespace(kv_cache_spec=object())],
+            kv_cache_tensors=[object()],
+        )
+    with contextlib.ExitStack() as stack:
+        if patch_geometry:
+            stack.enter_context(
+                patch.object(
+                    rs,
+                    "resolve_kernel_geometry",
+                    return_value=(16, (16, 2, 2, 8), "bfloat16", 64),
+                )
+            )
+            stack.enter_context(
+                patch.object(rs, "resolve_block_major_contract", return_value=None)
+            )
+            stack.enter_context(
+                patch.object(rs, "derive_offload_namespace", return_value=b"\0" * 16)
+            )
         return rs.TPURaidenStoreOffloadingSpec(config, vllm_config, kv_cache_config)
 
 
