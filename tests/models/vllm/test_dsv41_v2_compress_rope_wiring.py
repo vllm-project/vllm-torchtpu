@@ -209,12 +209,6 @@ def test_encoder_global_kv_uses_fused_compressor(monkeypatch):
     attn._write_csa2_global_kv.assert_called_once_with(hidden, positions)
 
 
-def test_csa2_main_cache_rejects_latent_writes():
-    main = _cache(512, torch.uint8, scale=True)
-    with pytest.raises(NotImplementedError, match="fused compressor"):
-        main.write(torch.tensor([0, 1]), torch.zeros(2, 512, dtype=torch.bfloat16))
-
-
 @pytest.mark.parametrize("ratio,banks", [(1, 0), (2, 1), (2, 2)])
 def test_empty_real_bridge_and_fake_contract(ratio, banks):
     fn = preprocess_ops._compress_bridge(ratio, banks, 1e-6)

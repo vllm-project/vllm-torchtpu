@@ -58,6 +58,10 @@ else:
 
 logger = init_logger(__name__)
 
+# Compressed-cache block size for DeepSeek-V4.1 v2; see
+# `update_block_size_for_backend`.
+DEEPSEEK_V41_V2_BLOCK_SIZE = 256
+
 # Every map below is keyed on the number of devices in the slice, which is
 # what world_size counts and what the slice builder sizes its worker address
 # list against. How that key relates to the topology string differs by
@@ -688,9 +692,16 @@ class TpuPlatform(Platform):
             else PallasAttentionBackend
         )
         supported = [layout.name for layout in backend.supported_kv_cache_layouts()]
-        if (
-            vllm_config.model_config is not None
-            and "DeepseekV4ForCausalLM" in vllm_config.model_config.architectures
+        architectures = (
+            vllm_config.model_config.architectures
+            if vllm_config.model_config is not None
+            else []
+        )
+        if "DeepseekV4ForCausalLM" in architectures or (
+            # V4.1 v2 packs its cache groups block-outer, so several SWA
+            # layers share one group and block table instead of one group each.
+            "DeepseekV41ForCausalLM" in architectures
+            and envs.TPU_DEEPSEEK_V41_IMPL == "v2"
         ):
             supported = ["BLHNC"]
         layout = resolve_kv_cache_layout(vllm_config, [supported])
@@ -1047,8 +1058,25 @@ class TpuPlatform(Platform):
         ):
             # V4.1 uses upstream cache geometry; its TPU kernels currently
             # accept 16-token pages rather than the dense RPA page constraint.
+            # v2 fixes SWA at 64-token pages and packs groups block-outer, so
+            # its compressed caches take 256-token blocks (as on GPU): a
+            # 480 KiB main+indexer block then holds 6-7 SWA layers per group.
+            # Smaller blocks pack fewer SWA layers per group (one at 64 and
+            # below) and, below 64, shrink the main KV that each
+            # SWA-page-sized block carries.
+            v2 = envs.TPU_DEEPSEEK_V41_IMPL == "v2"
             if not cache_config.user_specified_block_size:
-                cache_config.block_size = 16
+                cache_config.block_size = DEEPSEEK_V41_V2_BLOCK_SIZE if v2 else 16
+            elif v2 and cache_config.block_size < DEEPSEEK_V41_V2_BLOCK_SIZE:
+                logger.warning(
+                    "DeepSeek-V4.1 v2 with --block-size %d packs fewer SWA layers "
+                    "per KV cache group than %d (one at 64 and below)%s.",
+                    cache_config.block_size,
+                    DEEPSEEK_V41_V2_BLOCK_SIZE,
+                    ", and below 64 it also wastes main KV capacity"
+                    if cache_config.block_size < 64
+                    else "",
+                )
             return
         backend_cls = cast(
             "type[_TpuAttentionBackend] | None", cls._find_non_ssm_backend(vllm_config)

@@ -3,12 +3,9 @@
 
 Covers all modified lines and branches in
 `vllm_torchtpu.models.vllm.deepseek_v41.v2.attention`:
-- Buffer registration: `_tp_rank_1d`, `_full_attn_sink`,
-  `_precompact_records`, `_token_parallel_attn`
-- `_swa_max_requests` configuration across scheduler capacities (<=4 vs >4)
-- Post-loading weight synchronization under TP=1 vs TP>1
+- CSA2 selection for FP8 KV at any TP size; fused preprocessing only at TP1
 - Cache index selection (`_all_indices_fit`, tiled, untiled, non-source)
-- Attention dispatch routing (`sparse_fp8_attention` vs `paged_attention`)
+- BF16 `paged_attention` dispatch
 """
 
 from types import SimpleNamespace
@@ -36,8 +33,13 @@ def _make_dummy_vllm_config(max_num_seqs=4, max_model_len=4096):
     )
 
 
-def test_dsv41_attention_init_buffers_and_flags_fp8(monkeypatch):
-    """Test __init__ buffer registration and flags when FP8 KV is enabled."""
+@pytest.mark.parametrize(
+    "tp,heads,fused", [(1, 64, True), (2, 32, False), (8, 8, False)]
+)
+def test_dsv41_attention_init_fp8_selects_csa2_at_every_tp(
+    monkeypatch, tp, heads, fused
+):
+    """FP8 KV always uses CSA2 records; only TP1 64-head layers fuse preprocessing."""
 
     def fake_upstream_init(self, vllm_config, *args, **kwargs):
         torch.nn.Module.__init__(self)
@@ -45,30 +47,43 @@ def test_dsv41_attention_init_buffers_and_flags_fp8(monkeypatch):
         self.rotary_emb = SimpleNamespace(
             cos_sin_cache=torch.zeros(128, 64, dtype=torch.float32)
         )
-        self.attn_sink = torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=torch.float32)
+        self.attn_sink = torch.zeros(heads, dtype=torch.float32)
+        self.swa_cache_layer = SimpleNamespace()
+        self.indexer = None
+        self.compress_ratio = 0
+        self.head_dim = 512
+        self.window_size = 128
+        self.n_local_heads = heads
 
     monkeypatch.setattr(
         v2_attn.upstream.DeepseekV4Attention, "__init__", fake_upstream_init
     )
-    monkeypatch.setattr(v2_attn, "get_tensor_model_parallel_rank", lambda: 3)
-    monkeypatch.setattr(v2_attn, "get_tensor_model_parallel_world_size", lambda: 8)
+    monkeypatch.setattr(v2_attn, "get_tensor_model_parallel_rank", lambda: tp - 1)
+    monkeypatch.setattr(v2_attn, "get_tensor_model_parallel_world_size", lambda: tp)
 
-    cfg = _make_dummy_vllm_config(max_num_seqs=4)
-    attn = v2_attn.DeepseekV41Attention(cfg)
-
-    # Invariant: _tp_rank_1d is a 1D tensor of shape (1,) holding TP rank
-    assert attn._tp_rank_1d.shape == (1,)
-    assert attn._tp_rank_1d.item() == 3
-
-    # Invariant: _full_attn_sink holds repeated sink heads for tp_size ranks
-    assert attn._full_attn_sink.shape == (8 * 4,)
-    torch.testing.assert_close(attn._full_attn_sink[:4], attn.attn_sink)
-
-    # Invariant: FP8 KV enables precompact records and token-parallel attention
+    attn = v2_attn.DeepseekV41Attention(_make_dummy_vllm_config(max_num_seqs=4))
     assert attn._fp8_kv is True
-    assert attn._precompact_records is True
-    assert attn._token_parallel_attn is True
-    assert attn._swa_max_requests == 4
+    assert attn._csa2 is True
+    assert attn.swa_cache_layer._tpu_swa_words is True
+    assert attn._fused_preprocess is fused
+    assert attn._tp_rank.item() == tp - 1
+
+
+def test_dsv41_attention_init_fp8_rejects_unsupported_heads(monkeypatch):
+    def fake_upstream_init(self, vllm_config, *args, **kwargs):
+        torch.nn.Module.__init__(self)
+        self.kv_cache_torch_dtype = torch.float8_e4m3fn
+        self.swa_cache_layer = SimpleNamespace()
+        self.head_dim = 512
+        self.window_size = 128
+        self.n_local_heads = 4
+
+    monkeypatch.setattr(
+        v2_attn.upstream.DeepseekV4Attention, "__init__", fake_upstream_init
+    )
+    monkeypatch.setattr(v2_attn, "get_tensor_model_parallel_world_size", lambda: 16)
+    with pytest.raises(NotImplementedError, match="CSA2"):
+        v2_attn.DeepseekV41Attention(_make_dummy_vllm_config())
 
 
 @pytest.mark.parametrize("speculative_tokens", [None, 0, 3, 5])
@@ -102,14 +117,10 @@ def test_dsv41_attention_init_buffers_and_flags_bfloat16(
     attn = v2_attn.DeepseekV41Attention(cfg)
     assert attn._swa_query_group_size == (speculative_tokens or 0) + 1
 
-    # Invariant: BF16 disables precompact_records and token_parallel_attn
+    # BF16 KV keeps the plain paged path.
     assert attn._fp8_kv is False
-    assert attn._precompact_records is False
-    assert attn._token_parallel_attn is False
-
-    # Invariant: max_num_seqs > 4 disables SWA patch (_swa_max_requests is None)
-    assert attn._swa_max_requests is None
-    assert attn._full_attn_sink.shape == (2,)
+    assert attn._csa2 is False
+    assert attn._fused_preprocess is False
 
 
 def test_dsv41_attention_init_unsupported_dtype(monkeypatch):
@@ -129,353 +140,6 @@ def test_dsv41_attention_init_unsupported_dtype(monkeypatch):
         match="TPU V4.1 supports --kv-cache-dtype auto, bfloat16 or fp8",
     ):
         v2_attn.DeepseekV41Attention(cfg)
-
-
-def test_process_weights_after_loading_tp_size_1(monkeypatch):
-    """Test process_weights_after_loading copies directly when tp_size == 1."""
-    import sys
-    from types import ModuleType
-
-    mock_mod = ModuleType("vllm_torchtpu.models.vllm.deepseek_v4.attention")
-    mock_base = type(
-        "VllmDeepseekV4MLAAttention",
-        (),
-        {"process_weights_after_loading": staticmethod(lambda self, act_dtype: None)},
-    )
-    mock_mod.VllmDeepseekV4MLAAttention = mock_base
-    monkeypatch.setitem(
-        sys.modules, "vllm_torchtpu.models.vllm.deepseek_v4.attention", mock_mod
-    )
-
-    attn = object.__new__(v2_attn.DeepseekV41Attention)
-    torch.nn.Module.__init__(attn)
-
-    attn.attn_sink = torch.tensor([1.0, 2.0, 3.0], dtype=torch.bfloat16)
-    full_sink = torch.zeros(3, dtype=torch.float32)
-    attn.register_buffer("_full_attn_sink", full_sink, persistent=False)
-    attn.wo_a = SimpleNamespace(weight=SimpleNamespace(device=torch.device("cpu")))
-
-    monkeypatch.setattr(attn, "_assert_o_proj_supported", lambda: None)
-    monkeypatch.setattr(v2_attn, "get_tensor_model_parallel_world_size", lambda: 1)
-
-    attn.process_weights_after_loading(torch.bfloat16)
-    torch.testing.assert_close(attn._full_attn_sink, attn.attn_sink.float())
-
-
-def test_process_weights_after_loading_tp_size_multi(monkeypatch):
-    """Test process_weights_after_loading uses all-gather when tp_size > 1."""
-    import sys
-    from types import ModuleType
-
-    mock_mod = ModuleType("vllm_torchtpu.models.vllm.deepseek_v4.attention")
-    mock_base = type(
-        "VllmDeepseekV4MLAAttention",
-        (),
-        {"process_weights_after_loading": staticmethod(lambda self, act_dtype: None)},
-    )
-    mock_mod.VllmDeepseekV4MLAAttention = mock_base
-    monkeypatch.setitem(
-        sys.modules, "vllm_torchtpu.models.vllm.deepseek_v4.attention", mock_mod
-    )
-
-    attn = object.__new__(v2_attn.DeepseekV41Attention)
-    torch.nn.Module.__init__(attn)
-
-    attn.attn_sink = torch.tensor([1.0, 2.0], dtype=torch.bfloat16)
-    full_sink = torch.zeros(4, dtype=torch.float32)
-    attn.register_buffer("_full_attn_sink", full_sink, persistent=False)
-
-    # Mock device as tpu to trigger o_proj_op registration branch
-    attn.wo_a = SimpleNamespace(
-        weight=SimpleNamespace(device=SimpleNamespace(type="tpu"))
-    )
-
-    called_o_proj = []
-    monkeypatch.setattr(
-        v2_attn.DeepseekV41Attention,
-        "o_proj_op",
-        property(lambda self: called_o_proj.append(True)),
-    )
-
-    monkeypatch.setattr(attn, "_assert_o_proj_supported", lambda: None)
-    monkeypatch.setattr(v2_attn, "get_tensor_model_parallel_world_size", lambda: 2)
-
-    def fake_all_gather(tensor, dim=0):
-        assert dim == 0
-        return torch.cat([tensor, tensor * 10], dim=0)
-
-    monkeypatch.setattr(v2_attn, "tensor_model_parallel_all_gather", fake_all_gather)
-
-    attn.process_weights_after_loading(torch.bfloat16)
-
-    # Invariant: gathered tensor of size 4 is copied to _full_attn_sink
-    expected = torch.tensor([1.0, 2.0, 10.0, 20.0], dtype=torch.float32)
-    torch.testing.assert_close(attn._full_attn_sink, expected)
-    assert len(called_o_proj) == 1
-
-
-def test_prepare_tpu_indexer_all_indices_fit_masking(monkeypatch):
-    """Test _all_indices_fit masks (logical >= lengths) | (swa_slots < 0) to -1."""
-    attn = object.__new__(v2_attn.DeepseekV41Attention)
-    torch.nn.Module.__init__(attn)
-
-    count = 4
-    capacity = 8
-    attn.compress_ratio = 2
-    attn._max_model_len = capacity * attn.compress_ratio
-    attn.indexer = SimpleNamespace()
-    monkeypatch.setattr(
-        v2_attn.DeepseekV41Attention,
-        "_all_indices_fit",
-        property(lambda self: True),
-    )
-    attn._fp8_kv = True
-    attn.window_size = 64
-    attn.n_local_heads = 2
-    attn.head_dim = 16
-    attn.scale = 0.25
-    attn._ced_decoder = False
-    attn._ced_global_from_encoder = True
-    attn.compressor = None
-    attn.compressed_cache_prefix = "comp_kv"
-
-    attn.topk_indices_buffer = torch.full((count, 16), -1, dtype=torch.int32)
-    attn.attn_sink = torch.zeros(4, dtype=torch.float32)
-    attn.register_buffer(
-        "_full_attn_sink", torch.zeros(8, dtype=torch.float32), persistent=False
-    )
-    attn.register_buffer(
-        "_tp_rank_1d", torch.tensor([0], dtype=torch.int32), persistent=False
-    )
-    attn._precompact_records = True
-    attn._token_parallel_attn = True
-    attn._swa_max_requests = 4
-
-    positions = torch.tensor([1, 5, 9, 3], dtype=torch.int32)
-    swa_slots = torch.tensor(
-        [0, 1, -1, 2], dtype=torch.int32
-    )  # token 2 is padding (-1)
-
-    # Cache setup
-    fake_swa_cache = MagicMock(spec=PagedCacheRows)
-    fake_swa_cache.numel.return_value = 100
-    fake_swa_cache.row_indices = lambda slots: slots.int()
-    attn.swa_cache_layer = SimpleNamespace(prefix="swa_kv", kv_cache=fake_swa_cache)
-
-    fake_comp_cache = MagicMock(spec=PagedCacheRows)
-    fake_comp_cache.pages.return_value = torch.zeros((4, 2), dtype=torch.int32)
-    attn._static_forward_context = {
-        "comp_kv": SimpleNamespace(kv_cache=fake_comp_cache)
-    }
-
-    metadata = {
-        "swa_kv": SimpleNamespace(
-            block_table=torch.zeros((2, 4), dtype=torch.int32), query_start_loc=None
-        ),
-        "comp_kv": SimpleNamespace(
-            block_table=torch.zeros((2, 4), dtype=torch.int32),
-            query_start_loc=torch.tensor([0, 4]),
-        ),
-    }
-
-    forward_ctx = SimpleNamespace(attn_metadata=metadata, additional_kwargs={})
-    monkeypatch.setattr(v2_attn, "get_forward_context", lambda: forward_ctx)
-    monkeypatch.setattr(v2_attn, "_block_table", lambda meta: meta.block_table)
-    monkeypatch.setattr(v2_attn, "_cache_slots", lambda cache, meta, pos: swa_slots)
-    monkeypatch.setattr(
-        v2_attn,
-        "_token_requests",
-        lambda meta, pos: torch.zeros(count, dtype=torch.int32),
-    )
-    monkeypatch.setattr(
-        v2_attn,
-        "_row_slots",
-        lambda cache, table, reqs, log: torch.zeros_like(log, dtype=torch.int64),
-    )
-    monkeypatch.setattr(v2_attn, "_insert", lambda cache, slots, val, mask: None)
-    attn.wq_b = lambda qr: qr
-    attn._rotate = lambda x, pos: x
-
-    sparse_fp8_called = []
-
-    def fake_sparse_fp8_attn(
-        q,
-        swa_cache,
-        main_cache,
-        records,
-        main_records,
-        sink,
-        scale,
-        pages,
-        starts,
-        max_reqs,
-        precompacted,
-        token_parallel,
-        full_sink,
-        tp_rank,
-    ):
-        sparse_fp8_called.append(
-            {
-                "precompacted": precompacted,
-                "token_parallel": token_parallel,
-                "main_records": main_records.clone(),
-                "full_sink": full_sink,
-                "tp_rank": tp_rank,
-            }
-        )
-        return torch.ones(
-            count, attn.n_local_heads, attn.head_dim, dtype=torch.bfloat16
-        )
-
-    monkeypatch.setattr(v2_attn, "sparse_fp8_attention", fake_sparse_fp8_attn)
-
-    qr = torch.randn(count, attn.n_local_heads * attn.head_dim)
-    kv = torch.randn(count, attn.n_local_heads * attn.head_dim)
-    output = torch.zeros(count, attn.n_local_heads, attn.head_dim, dtype=torch.bfloat16)
-
-    v2_attn.DeepseekV41Attention._prepare_tpu(
-        attn, None, qr, kv, None, None, None, positions, output
-    )
-
-    assert len(sparse_fp8_called) == 1
-    call = sparse_fp8_called[0]
-    assert call["precompacted"] is True
-    assert call["token_parallel"] is True
-    assert call["tp_rank"].item() == 0
-
-    # Verify _all_indices_fit mask logic:
-    # Token 2 (index 2) had swa_slots == -1, so all its main_records must be -1
-    assert (call["main_records"][2] == -1).all()
-
-    # Token 0 had length=1, so only index 0 can be valid (>= length must be -1)
-    assert call["main_records"][0, 0] == 0
-    assert (call["main_records"][0, 1:capacity] == -1).all()
-
-    # Output masked: swa_slots < 0 row (token 2) must be zeroed in output
-    assert (output[2] == 0).all()
-    assert (output[0] == 1).all()
-
-
-def test_prepare_tpu_non_source_layer_buffer_reuse(monkeypatch):
-    """Test non-source layers (indexer is None) reuse topk_indices_buffer directly."""
-    attn = object.__new__(v2_attn.DeepseekV41Attention)
-    torch.nn.Module.__init__(attn)
-
-    count = 2
-    capacity = 4
-    attn.compress_ratio = 1
-    attn._max_model_len = capacity
-    attn.indexer = None  # Non-source layer!
-    attn._fp8_kv = True
-    attn.window_size = 64
-    attn.n_local_heads = 2
-    attn.head_dim = 16
-    attn.scale = 0.25
-    attn._ced_decoder = False
-    attn._ced_global_from_encoder = True
-    attn.compressor = None
-    attn.compressed_cache_prefix = "comp_kv"
-
-    # Pre-populate topk_indices_buffer as written by a previous source layer
-    buf = torch.full((count, 8), -1, dtype=torch.int32)
-    buf[0, :3] = torch.tensor([10, 20, 30])
-    buf[1, :2] = torch.tensor([5, 15])
-    attn.topk_indices_buffer = buf
-
-    attn.attn_sink = torch.zeros(4, dtype=torch.float32)
-    attn.register_buffer(
-        "_full_attn_sink", torch.zeros(4, dtype=torch.float32), persistent=False
-    )
-    attn.register_buffer(
-        "_tp_rank_1d", torch.tensor([0], dtype=torch.int32), persistent=False
-    )
-    attn._precompact_records = True
-    attn._token_parallel_attn = True
-    attn._swa_max_requests = None
-
-    positions = torch.tensor([50, 60], dtype=torch.int32)
-    swa_slots = torch.tensor([0, 1], dtype=torch.int32)
-
-    fake_swa_cache = MagicMock(spec=PagedCacheRows)
-    fake_swa_cache.numel.return_value = 100
-    fake_swa_cache.row_indices = lambda slots: slots.int()
-    attn.swa_cache_layer = SimpleNamespace(prefix="swa_kv", kv_cache=fake_swa_cache)
-
-    fake_comp_cache = MagicMock(spec=PagedCacheRows)
-    fake_comp_cache.pages.return_value = torch.zeros((2, 2), dtype=torch.int32)
-    attn._static_forward_context = {
-        "comp_kv": SimpleNamespace(kv_cache=fake_comp_cache)
-    }
-
-    metadata = {
-        "swa_kv": SimpleNamespace(
-            block_table=torch.zeros((2, 4), dtype=torch.int32), query_start_loc=None
-        ),
-        "comp_kv": SimpleNamespace(
-            block_table=torch.zeros((2, 4), dtype=torch.int32),
-            query_start_loc=torch.tensor([0, 2]),
-        ),
-    }
-
-    forward_ctx = SimpleNamespace(attn_metadata=metadata, additional_kwargs={})
-    monkeypatch.setattr(v2_attn, "get_forward_context", lambda: forward_ctx)
-    monkeypatch.setattr(v2_attn, "_block_table", lambda meta: meta.block_table)
-    monkeypatch.setattr(v2_attn, "_cache_slots", lambda cache, meta, pos: swa_slots)
-    monkeypatch.setattr(
-        v2_attn,
-        "_token_requests",
-        lambda meta, pos: torch.zeros(count, dtype=torch.int32),
-    )
-    monkeypatch.setattr(
-        v2_attn,
-        "_row_slots",
-        lambda cache, table, reqs, log: torch.zeros_like(log, dtype=torch.int64),
-    )
-    monkeypatch.setattr(v2_attn, "_insert", lambda cache, slots, val, mask: None)
-    attn.wq_b = lambda qr: qr
-    attn._rotate = lambda x, pos: x
-
-    captured_records = []
-
-    def fake_sparse_fp8(
-        q,
-        swa_cache,
-        main_cache,
-        records,
-        main_records,
-        sink,
-        scale,
-        pages,
-        starts,
-        max_reqs,
-        precompacted,
-        token_parallel,
-        full_sink,
-        tp_rank,
-    ):
-        captured_records.append(main_records)
-        return torch.zeros(
-            count, attn.n_local_heads, attn.head_dim, dtype=torch.bfloat16
-        )
-
-    monkeypatch.setattr(v2_attn, "sparse_fp8_attention", fake_sparse_fp8)
-
-    qr = torch.randn(count, attn.n_local_heads * attn.head_dim)
-    kv = torch.randn(count, attn.n_local_heads * attn.head_dim)
-    output = torch.zeros(count, attn.n_local_heads, attn.head_dim, dtype=torch.bfloat16)
-
-    v2_attn.DeepseekV41Attention._prepare_tpu(
-        attn, None, qr, kv, None, None, None, positions, output
-    )
-
-    # Invariant: main_records matches topk_indices_buffer sliced to capacity (4)
-    assert len(captured_records) == 1
-    recs = captured_records[0]
-    torch.testing.assert_close(
-        recs[0, :3], torch.tensor([10, 20, 30], dtype=torch.int32)
-    )
-    assert recs[0, 3] == -1
-    torch.testing.assert_close(recs[1, :2], torch.tensor([5, 15], dtype=torch.int32))
 
 
 @pytest.mark.parametrize("query_group_size", [1, 4, 6])
@@ -504,14 +168,6 @@ def test_prepare_tpu_tiled_paged_attention_dispatch_bfloat16(
 
     attn.topk_indices_buffer = torch.full((count, 4), 0, dtype=torch.int32)
     attn.attn_sink = torch.zeros(4, dtype=torch.float32)
-    attn.register_buffer(
-        "_full_attn_sink", torch.zeros(4, dtype=torch.float32), persistent=False
-    )
-    attn.register_buffer(
-        "_tp_rank_1d", torch.tensor([0], dtype=torch.int32), persistent=False
-    )
-    attn._precompact_records = False
-    attn._token_parallel_attn = False
 
     positions = torch.tensor([10, 20], dtype=torch.int32)
     swa_slots = torch.tensor([0, 1], dtype=torch.int32)
@@ -666,14 +322,6 @@ def test_prepare_tpu_indexer_not_all_indices_fit_both_branches(monkeypatch):
     attn.compressed_cache_prefix = "comp_kv"
     attn.topk_indices_buffer = torch.zeros((count, 8), dtype=torch.int32)
     attn.attn_sink = torch.zeros(4, dtype=torch.float32)
-    attn.register_buffer(
-        "_full_attn_sink", torch.zeros(4, dtype=torch.float32), persistent=False
-    )
-    attn.register_buffer(
-        "_tp_rank_1d", torch.tensor([0], dtype=torch.int32), persistent=False
-    )
-    attn._precompact_records = False
-    attn._token_parallel_attn = False
 
     indexer_mock = SimpleNamespace(
         wq_b=lambda qr: qr,

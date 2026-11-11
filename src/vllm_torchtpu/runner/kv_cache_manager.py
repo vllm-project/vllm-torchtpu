@@ -1368,7 +1368,6 @@ class KVCacheManager:
         kv_caches: dict[str, torch.Tensor] = {}
         native_raw_cache = None
         native_cache_layouts = None
-        native_rope_pools = None
         native_scale_pools = None
         if use_upstream_allocator:
             if envs.TPU_DEEPSEEK_V41_IMPL == "v2":
@@ -1381,15 +1380,7 @@ class KVCacheManager:
                     self.runner.device,
                     self.runner.cache_config.get_resolved_kv_cache_layout(),
                     word_rows=True,
-                    csa2_layers=frozenset(
-                        name
-                        for name, module in (
-                            self.runner.vllm_config.compilation_config.static_forward_context.items()  # noqa: E501
-                        )
-                        if getattr(module, "_csa2", False) is True
-                    ),
                 )
-                native_rope_pools = materialized.rope_pools
                 native_scale_pools = materialized.scale_pools
             else:
                 materialized = self.ds_v4.initialize_v41(
@@ -1759,9 +1750,23 @@ class KVCacheManager:
             self.runner.kv_caches,
             native_raw_cache=native_raw_cache,
             native_cache_layouts=native_cache_layouts,
-            native_rope_pools=native_rope_pools,
             native_scale_pools=native_scale_pools,
         )
+        # DSv4.1 fused compressors specialize on each layer's bound page
+        # geometry, which block-outer groups make layer-specific.
+        compilation_config = self.runner.vllm_config.compilation_config
+        forward_context = compilation_config.static_forward_context
+        bound_layouts = [
+            module
+            for module in forward_context.values()
+            if callable(getattr(module, "bind_compressor_layout", None))
+        ]
+        if bound_layouts:
+            with set_vllm_model_wrapper_context(
+                mesh=self.runner.mesh, vllm_config=self.runner.vllm_config
+            ):
+                for module in bound_layouts:
+                    module.bind_compressor_layout()
 
         # Pre-build and cache bundled RPA kernels across all attention layers before
         # torch.compile tracing.

@@ -31,7 +31,9 @@ def supports_sorted_fp8(
             records.shape == (keys.shape[0],) and records.dtype == jnp.int32,
             f"records {records.dtype}{list(records.shape)} for {keys.shape[0]} keys",
         ),
-        (page_size == 256, f"index page size {page_size}, kernel 256"),
+        # 128-record pages (block-outer layouts at --block-size 256) make each
+        # page one owner row wide; the write is bitwise the native writer's.
+        (page_size in (128, 256), f"index page size {page_size}, kernel 128/256"),
         (
             len(banks) == 2
             and all(

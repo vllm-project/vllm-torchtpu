@@ -243,6 +243,42 @@ def _metadata(
     )
 
 
+def _metadata_tables(
+    tables: tuple[jax.Array, ...],
+    starts: jax.Array,
+    positions: jax.Array,
+    minimum: jax.Array,
+    page_size: int,
+    page_stride: int,
+    non_causal: bool,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """``_metadata`` for G [R,W] block tables at row offset 0, in one program.
+
+    The tables stay separate inputs: stacking them would copy every full
+    table each stage. Only the page lookups depend on the table; XLA shares
+    the request, window and bound computation across the G calls.
+    """
+    results = [
+        _metadata(
+            table, starts, positions, minimum, page_size, page_stride, 0, non_causal
+        )
+        for table in tables
+    ]
+    metadata = jnp.stack([result[0] for result in results])
+    records = jnp.stack([result[2] for result in results])
+    return metadata, results[0][1], records
+
+
+def _fake_metadata_tables(tables, starts, positions, minimum, page_size, *_):
+    columns = (positions.shape[0] + 128 + page_size - 1) // page_size + 1
+    requests = tables[0].shape[0]
+    return (
+        tables[0].new_empty((len(tables), requests, 2 + columns)),
+        tables[0].new_empty((requests, 2)),
+        positions.new_empty((len(tables), positions.shape[0])),
+    )
+
+
 def _fake_metadata(table, starts, positions, minimum, page_size, *_):
     columns = (positions.shape[0] + 128 + page_size - 1) // page_size + 1
     return (
@@ -259,9 +295,11 @@ def _prepare_publish_swa(
     positions: jax.Array,
     minimum: jax.Array,
     values: jax.Array,
+    page_stride: int,
+    row_offset: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     metadata, bounds, records = _metadata(
-        table, starts, positions, minimum, 64, 64, 0, False
+        table, starts, positions, minimum, 64, page_stride, row_offset, False
     )
     owner = write_swa_word_pool(raw, records, values, page_size=64)
     return owner, metadata, bounds, records
@@ -275,20 +313,22 @@ def _prepare_publish_swa_banked(
     positions: jax.Array,
     minimum: jax.Array,
     values: jax.Array,
+    page_stride: int,
+    row_offset: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     metadata, bounds, records = _metadata(
-        table, starts, positions, minimum, 64, 64, 0, False
+        table, starts, positions, minimum, 64, page_stride, row_offset, False
     )
     owner = write_swa_word_pool((raw, high), records, values, page_size=64)
     return *owner, metadata, bounds, records
 
 
-def _fake_prepare_publish_swa(raw, table, starts, positions, minimum, values):
+def _fake_prepare_publish_swa(raw, table, starts, positions, minimum, values, *_):
     return torch.empty_like(raw), *_fake_metadata(table, starts, positions, minimum, 64)
 
 
 def _fake_prepare_publish_swa_banked(
-    raw, high, table, starts, positions, minimum, values
+    raw, high, table, starts, positions, minimum, values, *_
 ):
     return (
         torch.empty_like(raw),
@@ -352,15 +392,21 @@ def initialize_csa2_ops() -> None:
     definitions = (
         ("metadata", _metadata, (P(),) * 4 + (None,) * 4, _fake_metadata),
         (
+            "metadata_tables",
+            _metadata_tables,
+            (P(),) * 4 + (None,) * 3,
+            _fake_metadata_tables,
+        ),
+        (
             "prepare_publish_swa",
             _prepare_publish_swa,
-            (P(),) * 6,
+            (P(),) * 6 + (None,) * 2,
             _fake_prepare_publish_swa,
         ),
         (
             "prepare_publish_swa_banked",
             _prepare_publish_swa_banked,
-            (P(),) * 7,
+            (P(),) * 7 + (None,) * 2,
             _fake_prepare_publish_swa_banked,
         ),
         (
@@ -422,6 +468,7 @@ def initialize_csa2_ops() -> None:
         "prepare_publish_swa": 4,
         "prepare_publish_swa_banked": 5,
         "metadata": 3,
+        "metadata_tables": 3,
         "publish_main": 2,
         "publish_main_banked": 4,
         "publish_swa_banked": 2,
@@ -637,6 +684,27 @@ def prepare_swa(
     )
 
 
+def prepare_swa_tables(
+    tables: tuple[torch.Tensor, ...],
+    starts: torch.Tensor,
+    positions: torch.Tensor,
+    minimum: torch.Tensor,
+    cache: "PagedCacheRows",
+    non_causal: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``prepare_swa`` for G [R,W] tables at row offset 0: [G,...] metadata
+    and records, with the table-independent bounds shared."""
+    return _ops["metadata_tables"](
+        tuple(table.int() for table in tables),
+        starts.int(),
+        positions.int(),
+        minimum.int(),
+        cache.shape[1],
+        cache.page_stride,
+        non_causal,
+    )
+
+
 def prepare_publish_swa(
     table: torch.Tensor,
     starts: torch.Tensor,
@@ -646,7 +714,15 @@ def prepare_publish_swa(
     values: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Publish into the shared word pool while creating the shared metadata."""
-    args = (table.int(), starts.int(), positions.int(), minimum.int(), values)
+    args = (
+        table.int(),
+        starts.int(),
+        positions.int(),
+        minimum.int(),
+        values,
+        cache.page_stride,
+        cache.row_offset,
+    )
     if cache.raw_hi is None:
         raw, metadata, bounds, records = _ops["prepare_publish_swa"](cache.raw, *args)
         cache.raw.copy_(raw)

@@ -43,6 +43,7 @@ COMPRESSOR_ADDRESS_TOKENS = frozenset({288})
 INDEXER_TOKENS = frozenset({128, 256, 288, 384, 512})
 MHC_TOKENS = frozenset({288})
 CACHE_UNPACK_RECORDS = frozenset({12288, 36864})
+SWA_PACK_TOKENS = frozenset({96, 192, 288})
 # (tokens, requests): the region builds token x request matrices.
 MAIN_RECORD_BATCHES = frozenset({(96, 16), (192, 32), (288, 32), (288, 48)})
 # The main-record kernel's one-hot gather costs O(T * requests * columns);
@@ -220,6 +221,74 @@ def _half_vmem() -> pltpu.CompilerParams:
     return pltpu.CompilerParams(
         vmem_limit_bytes=pltpu.get_tpu_info().vmem_capacity_bytes // 2
     )
+
+
+def pack_matrix(records, values, *, base, capacity, padded):
+    n = values.shape[0]
+    local = jnp.where(
+        (max(base, 64) <= records.T) & (base + capacity > records.T),
+        records.T - base,
+        capacity,
+    )
+    idx = jnp.arange(n, dtype=jnp.int32)[:, None]
+    ranks = jnp.sum(
+        (local > local.T) | ((local == local.T) & (idx > idx.T)), axis=1, keepdims=True
+    )
+    permutation = idx == ranks.T
+    ids = jnp.sum(jnp.where(permutation, local.T, 0), axis=1, keepdims=True)
+    next_ids = jnp.concatenate((ids[1:], jnp.full((1, 1), capacity, jnp.int32)), axis=0)
+    pairs = ids // 2
+    boundary = (ids < capacity) & (
+        jnp.concatenate(
+            (jnp.ones((1, 1), jnp.int32), (pairs[1:] != pairs[:-1]).astype(jnp.int32)),
+            axis=0,
+        )
+        != 0
+    )
+    even = ids % 2 == 0
+    odd = (~even) | (next_ids // 2 == pairs)
+    value_bits = lax.bitcast_convert_type(values, jnp.uint16).astype(jnp.uint32)
+    bits = jnp.dot(
+        permutation.astype(jnp.float32),
+        value_bits.astype(jnp.float32),
+        precision=lax.Precision.HIGHEST,
+    ).astype(jnp.uint32)
+    next_bits = jnp.concatenate((bits[1:], jnp.zeros((1, 512), jnp.uint32)), axis=0)
+    low = jnp.where(even, bits, jnp.uint32(0))
+    high = jnp.where(odd, jnp.where(even, next_bits, bits), jnp.uint32(0))
+    words = lax.bitcast_convert_type(low | (high << 16), jnp.int32)
+    masks = jnp.where(even, jnp.int32(65535), jnp.int32(0)) | jnp.where(
+        odd, jnp.int32(-65536), jnp.int32(0)
+    )
+    return (
+        jnp.pad(
+            jnp.where(boundary, pairs, -1),
+            ((0, padded - n), (0, 0)),
+            constant_values=-1,
+        ),
+        jnp.broadcast_to(jnp.pad(masks, ((0, padded - n), (0, 0))), (padded, 512)),
+        jnp.pad(words, ((0, padded - n), (0, 0))),
+    )
+
+
+def swa_word_pool_pack(records, values, *, capacity, padded, interpret=False):
+    """Sort and pair SWA records for the word-pool publisher in one TC region.
+
+    Returns 128-word physical row ids (four per token pair, -1 when skipped),
+    the packed words and their BF16-half masks, padded to ``4 * padded`` rows.
+    """
+
+    def body(records, values):
+        return pack_matrix(records, values, base=0, capacity=capacity, padded=padded)
+
+    inputs = (records[None, :], values)
+    pairs, masks, words = fuse_function(
+        body, inputs, name="decode_swa_sort_pack", interpret=interpret
+    )(*inputs)
+    physical = jnp.where(
+        pairs >= 0, pairs * 4 + jnp.arange(4, dtype=jnp.int32)[None, :], -1
+    )
+    return physical.reshape(-1), words.reshape(-1, 128), masks.reshape(-1, 128)
 
 
 def main_records_call(xs, *, page_size):

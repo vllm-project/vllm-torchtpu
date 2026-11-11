@@ -25,7 +25,8 @@ def test_compressor_admission_fullgraph(monkeypatch, caplog, capacity, mode, reg
     monkeypatch.setattr(prep, "_mode_used", False)
     monkeypatch.setattr(prep, "_reported", set())
     torch._dynamo.reset()
-    owner = SimpleNamespace(window_size=128)
+    # A layer before `bind_compressor_layout` checks against the default layout.
+    owner = SimpleNamespace(window_size=128, _compressor_layout_fields=None)
 
     class Cache:
         def __init__(self, shape, stride, offset=0):
@@ -101,6 +102,9 @@ def test_swa_bridge_preserves_dynamic_token_dimension(monkeypatch):
         def __init__(self, raw):
             self.raw = raw
             self.raw_hi = None
+            # Second SWA page of a block-outer 512 KiB block.
+            self.page_stride = 512
+            self.row_offset = 64
 
     class Bridge(torch.nn.Module):
         def forward(self, raw, table, starts, positions, minimum, values):
