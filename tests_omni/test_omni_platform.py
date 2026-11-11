@@ -13,6 +13,8 @@
 # limitations under the License.
 import math
 import os
+import subprocess
+import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -70,11 +72,6 @@ from vllm_torchtpu.omni.rope import (
     wan_self_attention_fused,
 )
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
-
-if "--xla_force_host_platform_device_count" not in os.environ.get("XLA_FLAGS", ""):
-    os.environ["XLA_FLAGS"] = (
-        f"{os.environ.get('XLA_FLAGS', '')} --xla_force_host_platform_device_count=8"
-    ).strip()
 
 pytestmark = pytest.mark.omni
 
@@ -968,6 +965,56 @@ def _non_ring_reference_bshd(q, k, v, scale):
     return jnp.einsum("bhqk,bkhd->bqhd", probs, v_rep).astype(q.dtype)
 
 
+_HOST_DEVICE_COUNT_FLAG = "--xla_force_host_platform_device_count"
+
+
+def _cpu_devices_or_rerun(request, count):
+    """Returns ``count`` JAX CPU devices, or None once a child run passed.
+
+    XLA reads the host device count only when JAX starts, so this process
+    cannot raise it after the fact. With too few CPU devices, the test is
+    rerun in a child process whose XLA_FLAGS set it (and whose JAX uses CPU
+    only); the env of this process is not changed.
+    """
+    import jax
+
+    devices = jax.devices("cpu")
+    if len(devices) >= count:
+        return devices[:count]
+    xla_flags = os.environ.get("XLA_FLAGS", "")
+    if (
+        os.environ.get("JAX_PLATFORMS") == "cpu"
+        and _HOST_DEVICE_COUNT_FLAG in xla_flags
+    ):
+        pytest.skip(f"Requires {count} CPU devices")
+    kept = [t for t in xla_flags.split() if not t.startswith(_HOST_DEVICE_COUNT_FLAG)]
+    env = {
+        **os.environ,
+        "JAX_PLATFORMS": "cpu",
+        "XLA_FLAGS": " ".join([*kept, f"{_HOST_DEVICE_COUNT_FLAG}=8"]),
+    }
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            f"{request.node.path}::{request.node.name}",
+        ],
+        cwd=request.config.rootpath,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0 and "1 passed" in proc.stdout, (
+        f"{proc.stdout}\n{proc.stderr}"
+    )
+    return None
+
+
 def test_ring_lse_helpers_match_single_pass():
     import jax
     import jax.numpy as jnp
@@ -1020,7 +1067,7 @@ def test_ring_lse_helpers_match_single_pass():
 
 
 @pytest.mark.parametrize("ring_size,h_q,h_kv", [(1, 4, 4), (2, 4, 4), (4, 4, 2)])
-def test_ring_flash_attention_bhsd_matches_non_ring(ring_size, h_q, h_kv):
+def test_ring_flash_attention_bhsd_matches_non_ring(request, ring_size, h_q, h_kv):
     import jax
     import jax.numpy as jnp
     import numpy as np
@@ -1031,9 +1078,9 @@ def test_ring_flash_attention_bhsd_matches_non_ring(ring_size, h_q, h_kv):
         ring_flash_attention_bhsd,
     )
 
-    cpu_devices = jax.devices("cpu")[:ring_size]
-    if len(cpu_devices) < ring_size:
-        pytest.skip(f"Requires {ring_size} CPU devices")
+    cpu_devices = _cpu_devices_or_rerun(request, ring_size)
+    if cpu_devices is None:
+        return
     mesh = Mesh(np.array(cpu_devices), ("ring",))
     b, s_per_rank, d = 2, 16, 16
     s_total = s_per_rank * ring_size
@@ -1096,7 +1143,7 @@ def test_ring_flash_attention_bhsd_matches_non_ring(ring_size, h_q, h_kv):
     ],
 )
 def test_ring_ulysses_2d_matches_non_ring_reference(
-    cfg_size, ring_size, uly_size, h_q, h_kv
+    request, cfg_size, ring_size, uly_size, h_q, h_kv
 ):
     import jax
     import jax.numpy as jnp
@@ -1109,9 +1156,9 @@ def test_ring_ulysses_2d_matches_non_ring_reference(
     )
 
     n_dev = cfg_size * ring_size * uly_size
-    cpu_devices = jax.devices("cpu")[:n_dev]
-    if len(cpu_devices) < n_dev:
-        pytest.skip(f"Requires {n_dev} CPU devices")
+    cpu_devices = _cpu_devices_or_rerun(request, n_dev)
+    if cpu_devices is None:
+        return
     mesh = Mesh(
         np.array(cpu_devices).reshape(cfg_size, ring_size, uly_size),
         ("batch", "ring", "uly"),
@@ -1366,16 +1413,22 @@ def test_ring_attention_patch_and_dispatch(monkeypatch):
     assert calls == [(1, 2, 2, False, 0.25)]
 
     # 3. Fallbacks: causal=True, float32, attn_mask, joint_query, or SDPA pref.
+    # Each one logs why it left the TPU ring kernel.
     calls.clear()
-    assert runner.run_attention(q, k, v, causal=True) == "native_ring"
-    assert runner.run_attention(q.float(), k.float(), v.float()) == "native_ring"
-    masked_meta = SimpleNamespace(attn_mask=torch.ones(1, 16, dtype=torch.bool))
-    assert runner.run_attention(q, k, v, attn_metadata=masked_meta) == "native_ring"
-    joint_meta = SimpleNamespace(joint_query=q, extra={})
-    assert layer._forward_impl(q, k, v, attn_metadata=joint_meta) == "native_ring"
-    sdpa_runner = RingParallelAttention(sp_group, attn_backend_pref="TPU_SDPA")
-    assert sdpa_runner.run_attention(q, k, v) == "native_ring"
+    with patch.object(patches.logger, "warning_once") as mock_warn:
+        assert runner.run_attention(q, k, v, causal=True) == "native_ring"
+        assert runner.run_attention(q.float(), k.float(), v.float()) == "native_ring"
+        masked_meta = SimpleNamespace(attn_mask=torch.ones(1, 16, dtype=torch.bool))
+        assert runner.run_attention(q, k, v, attn_metadata=masked_meta) == "native_ring"
+        joint_meta = SimpleNamespace(joint_query=q, extra={})
+        assert layer._forward_impl(q, k, v, attn_metadata=joint_meta) == "native_ring"
+        sdpa_runner = RingParallelAttention(sp_group, attn_backend_pref="TPU_SDPA")
+        assert sdpa_runner.run_attention(q, k, v) == "native_ring"
     assert calls == []
+    warned = [str(c.args[0]) for c in mock_warn.call_args_list]
+    # joint_meta logs twice: the fused path, then the 1-D ring runner.
+    assert sum("does not fit the TPU Pallas ring kernel" in w for w in warned) == 5
+    assert sum("cannot fuse Ulysses" in w for w in warned) == 1
 
     # 4. Non-divisible GQA heads raise ValueError in tpu_ring_flash_attention.
     with pytest.raises(ValueError, match="num_heads"):
@@ -1578,10 +1631,10 @@ def test_same_cfg_lane_check_raises():
         clear_ring_cfg_validation_state()
 
 
-def test_resolve_device_ids_by_rank_collective_fallback(
+def test_resolve_device_ids_by_rank_raises_on_failed_query(
     monkeypatch, _restore_parallel_state_device_order
 ):
-    """Rank-local device-ID failure still enters all_gather_object on all ranks."""
+    """A rank-local device-ID failure enters all_gather_object, then raises."""
     from typing import Any
 
     from vllm_omni.diffusion.distributed import parallel_state
@@ -1595,8 +1648,9 @@ def test_resolve_device_ids_by_rank_collective_fallback(
     fake_world_group = SimpleNamespace(cpu_group="fake_cpu_pg")
     monkeypatch.setattr(parallel_state, "get_world_group", lambda: fake_world_group)
 
-    # 1. Rank 2 fails local TPU device-ID query; all 4 ranks still participate in
-    # all_gather_object, warn, and fall back consistently to unpermuted groups.
+    # 1. Rank 2 fails its local TPU device-ID query; all 4 ranks still enter
+    # all_gather_object, then every rank raises instead of falling back to
+    # rank-ordered groups.
     per_rank_attrs: dict[int, Any] = {
         0: {"id": 0},
         1: {"id": 2},
@@ -1624,11 +1678,15 @@ def test_resolve_device_ids_by_rank_collective_fallback(
     monkeypatch.setattr("torch.distributed.all_gather_object", _fake_all_gather_object)
 
     rg = parallel_state.RankGenerator(1, 2, 1, 2, 1, order="tp-sp-pp-cfg-dp")
-    with patch.object(omni_patches.logger, "warning") as mock_warn:
-        results_by_rank = []
-        for r in range(4):
-            current_rank["val"] = r
-            results_by_rank.append(rg.get_ranks("sp"))
+    for r in range(4):
+        current_rank["val"] = r
+        with pytest.raises(RuntimeError, match="get_local_device_attributes") as exc:
+            rg.get_ranks("sp")
+        assert "[0, 2, None, 3]" in str(exc.value)
+        if r == 2:
+            assert "device query failed on rank 2" in str(exc.value.__cause__)
+        else:
+            assert exc.value.__cause__ is None
 
     assert gather_participating_ranks == [
         (0, 0, "fake_cpu_pg"),
@@ -1636,20 +1694,18 @@ def test_resolve_device_ids_by_rank_collective_fallback(
         (2, None, "fake_cpu_pg"),
         (3, 3, "fake_cpu_pg"),
     ]
-    assert mock_warn.call_count == 4
-    assert results_by_rank == [[[0, 1], [2, 3]]] * 4
     assert omni_patches._CACHED_DEVICE_ID_ORDER is None
 
-    # 2. Duplicate/non-permutation device IDs also warn and fall back on every rank.
+    # 2. Duplicate (non-permutation) device IDs also raise on every rank.
     expected_gathered = [0, 1, 1, 3]
     per_rank_attrs[2] = {"id": 1}
     gather_participating_ranks.clear()
-    with patch.object(omni_patches.logger, "warning") as mock_warn_dup:
-        for r in range(4):
-            current_rank["val"] = r
-            assert omni_patches._resolve_device_ids_by_rank(4) is None
+    for r in range(4):
+        current_rank["val"] = r
+        with pytest.raises(RuntimeError, match="not a permutation") as dup_exc:
+            omni_patches._resolve_device_ids_by_rank(4)
+        assert "[0, 1, 1, 3]" in str(dup_exc.value)
     assert len(gather_participating_ranks) == 4
-    assert mock_warn_dup.call_count == 4
     assert omni_patches._CACHED_DEVICE_ID_ORDER is None
 
     # 3. Valid permutation resolves and caches device-ordered ranks across ranks.
@@ -1730,11 +1786,12 @@ def _call_set_device_multi_rank(monkeypatch, world_size: int = 4) -> None:
         OmniTpuPlatform.set_device(None)
 
 
-def test_set_device_offload_dense_all_to_all_ring_degree_one(
-    monkeypatch, _restore_diffusion_ring_degree_state
+@pytest.mark.parametrize("ring_degree", [1, 2])
+def test_set_device_offload_dense_all_to_all_any_ring_degree(
+    monkeypatch, _restore_diffusion_ring_degree_state, ring_degree
 ):
     flag = "--xla_tpu_enable_sparse_core_collective_offload_dense_all_to_all"
-    OmniTpuPlatform._diffusion_ring_degree = 1
+    OmniTpuPlatform._diffusion_ring_degree = ring_degree
 
     monkeypatch.setenv("LIBTPU_INIT_ARGS", "--xla_foo=1")
     _call_set_device_multi_rank(monkeypatch)
@@ -1743,28 +1800,6 @@ def test_set_device_offload_dense_all_to_all_ring_degree_one(
     monkeypatch.delenv("LIBTPU_INIT_ARGS", raising=False)
     _call_set_device_multi_rank(monkeypatch)
     assert os.environ["LIBTPU_INIT_ARGS"] == f"{flag}=true"
-
-
-def test_set_device_skips_offload_dense_all_to_all_for_ring_degree_two(
-    monkeypatch, _restore_diffusion_ring_degree_state
-):
-    flag = "--xla_tpu_enable_sparse_core_collective_offload_dense_all_to_all"
-    OmniTpuPlatform._diffusion_ring_degree = 2
-
-    monkeypatch.setenv("LIBTPU_INIT_ARGS", "--xla_foo=1")
-    with patch("vllm_torchtpu.omni.platform.logger.info") as mock_info:
-        _call_set_device_multi_rank(monkeypatch)
-    assert os.environ["LIBTPU_INIT_ARGS"] == "--xla_foo=1"
-    assert flag not in os.environ["LIBTPU_INIT_ARGS"]
-    assert any(
-        "ring_degree=%d" in str(call.args[0]) and call.args[1] == 2
-        for call in mock_info.call_args_list
-        if len(call.args) >= 2
-    )
-
-    monkeypatch.delenv("LIBTPU_INIT_ARGS", raising=False)
-    _call_set_device_multi_rank(monkeypatch)
-    assert "LIBTPU_INIT_ARGS" not in os.environ
 
 
 @pytest.mark.parametrize("explicit_val", ["true", "false"])
@@ -1814,7 +1849,7 @@ def test_get_diffusion_worker_cls_wraps_init_device_idempotently(
     diffusion_worker_cls.init_device(fake_worker_ring2)
     assert OmniTpuPlatform._diffusion_ring_degree == 2
     assert observed_in_orig == [2]
-    assert os.environ["LIBTPU_INIT_ARGS"] == "--xla_foo=1"
+    assert os.environ["LIBTPU_INIT_ARGS"] == f"--xla_foo=1 {flag}=true"
 
     # Defensive fallbacks: None, 0, "0", missing configs -> 1.
     for fake_worker in (
@@ -1938,6 +1973,87 @@ def test_init_device_ring_degree_one_leaves_parallel_state_unpatched(
     assert observed_groups["ulysses_rank"] == 2
     assert observed_groups["ring_rank"] == 0
     assert get_ring_cfg_validation_state() is None
+
+
+def test_sp_init_ring_degree_two_uses_device_ordered_sp_group(
+    monkeypatch,
+    _restore_parallel_state_device_order,
+):
+    import vllm_torchtpu.omni.patches as omni_patches
+    from vllm_torchtpu.omni.attention import compute_device_id_group_layout
+
+    parallel_state, group_coordinator = _restore_parallel_state_device_order
+    device_ids = [0, 1, 4, 5, 6, 7, 2, 3]
+    layout = compute_device_id_group_layout(
+        device_ids, cfg_size=2, ring_size=2, uly_size=2
+    )
+    current_rank = {"val": 0}
+
+    def _fake_orig_sp_init(
+        self, group_ranks, local_rank, torch_distributed_backend, **kwargs
+    ):
+        # Upstream reads the c10d sub-group ranks, which follow sorted global
+        # ranks; poison them so the test sees whether the patch rewrote them.
+        self.rank = current_rank["val"]
+        self.ranks = next(g for g in group_ranks if self.rank in g)
+        self.ulysses_world_size = 2
+        self.ring_world_size = 2
+        self.allgather_world_size = 1
+        self.ulysses_rank = -1
+        self.ring_rank = -1
+
+    observed: dict[int, tuple[list[int], list[int], int, int]] = {}
+
+    def _fake_orig_init_mp(**kwargs):
+        gen = parallel_state.RankGenerator(
+            kwargs["tensor_parallel_size"],
+            kwargs["ulysses_degree"] * kwargs["ring_degree"],
+            kwargs["pipeline_parallel_size"],
+            kwargs["cfg_parallel_size"],
+            1,
+            order="tp-sp-pp-cfg-dp",
+        )
+        sp_groups = gen.get_ranks("sp")
+        assert sp_groups == layout["sp_groups"] == [[0, 1, 6, 7], [2, 3, 4, 5]]
+        for rank in range(8):
+            current_rank["val"] = rank
+            fake_sp = object.__new__(group_coordinator.SequenceParallelGroupCoordinator)
+            group_coordinator.SequenceParallelGroupCoordinator.__init__(
+                fake_sp,
+                sp_groups,
+                0,
+                "gloo",
+                ulysses_group="u",
+                ring_group="r",
+                allgather_group="ag",
+            )
+            observed[rank] = (
+                fake_sp.ulysses_ranks,
+                fake_sp.ring_ranks,
+                fake_sp.ulysses_rank,
+                fake_sp.ring_rank,
+            )
+
+    parallel_state._initialize_model_parallel = _fake_orig_init_mp
+    group_coordinator.SequenceParallelGroupCoordinator.__init__ = _fake_orig_sp_init
+    omni_patches._patch_parallel_state_device_order()
+    monkeypatch.setattr(omni_patches, "_DEVICE_IDS_BY_RANK_OVERRIDE", device_ids)
+
+    parallel_state.initialize_model_parallel(
+        cfg_parallel_size=2, ring_degree=2, ulysses_degree=2
+    )
+
+    # SP group [0, 1, 6, 7]: Ulysses pairs are consecutive, ring pairs stride 2.
+    assert observed[0] == ([0, 1], [0, 6], 0, 0)
+    assert observed[1] == ([0, 1], [1, 7], 1, 0)
+    assert observed[6] == ([6, 7], [0, 6], 0, 1)
+    assert observed[7] == ([6, 7], [1, 7], 1, 1)
+    assert observed[4] == ([4, 5], [2, 4], 0, 1)
+    for rank, (uly_ranks, ring_ranks, uly_idx, ring_idx) in observed.items():
+        assert uly_ranks in layout["ulysses_groups"]
+        assert ring_ranks in layout["ring_groups"]
+        assert uly_ranks[uly_idx] == rank
+        assert ring_ranks[ring_idx] == rank
 
 
 def test_init_device_ring_degree_two_installs_device_order_patch_once(
