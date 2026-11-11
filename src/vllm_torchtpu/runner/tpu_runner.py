@@ -2210,6 +2210,18 @@ class TPUModelRunner(GPUModelRunner):
         self._mamba_spec_blocks = min(
             (int(spec.num_speculative_blocks) for spec in mamba_specs), default=0
         )
+        # The scheduler's fold guard turns the fold off when the prefix-match
+        # unit is not the fold unit (e.g. --prefix-match-unit 64); the
+        # manager then reserves no scratch column, so the worker must not
+        # write one either.
+        if (
+            envs.VLLM_TPU_MAMBA_TAIL_FOLD_NOBOUNDARY
+            and self._mamba_spec_blocks
+            and state_block_size is not None
+        ):
+            unit = self.cache_config.prefix_match_unit or state_block_size
+            if unit != fold_unit(state_block_size):
+                self._mamba_spec_blocks = 0
         if self._mamba_tail_fold:
             try:
                 cp_world_size = get_pcp_group().world_size
