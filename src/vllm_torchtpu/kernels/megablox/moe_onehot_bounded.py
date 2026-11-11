@@ -36,9 +36,13 @@ _SLOT_BLOCK = 128
 _COL_CHUNKS = (3072, 1536, 1024, 512)
 
 
-def _vmem_bytes(num_tokens: int, num_slots: int, chunk: int) -> int:
-    # One-hot scratch + double-buffered bf16 in and out column chunks.
-    return num_slots * num_tokens * 2 + 2 * (num_slots + num_tokens) * chunk * 2
+def _vmem_bytes(num_tokens: int, num_slots: int, hidden_size: int, chunk: int) -> int:
+    onehot = num_slots * num_tokens * 2
+    # Permute: resident hidden block + double-buffered output column chunks.
+    permute = num_tokens * hidden_size * 2 + 2 * num_slots * chunk * 2
+    # Combine: double-buffered input and output column chunks.
+    combine = 2 * (num_slots + num_tokens) * chunk * 2
+    return onehot + max(permute, combine)
 
 
 def _col_chunk(num_tokens: int, num_slots: int, hidden_size: int) -> int | None:
@@ -50,7 +54,8 @@ def _col_chunk(num_tokens: int, num_slots: int, hidden_size: int) -> int | None:
         (
             c
             for c in _COL_CHUNKS
-            if hidden_size % c == 0 and _vmem_bytes(num_tokens, num_slots, c) <= budget
+            if hidden_size % c == 0
+            and _vmem_bytes(num_tokens, num_slots, hidden_size, c) <= budget
         ),
         None,
     )
@@ -82,7 +87,7 @@ def _run_capped(valid_ref, num_slots: int, branch) -> None:
     lax.switch(idx, [functools.partial(branch, c) for c in caps])
 
 
-def _permute_kernel(valid_ref, revert_t_ref, hidden_hbm_ref, out_hbm_ref, onehot_ref):
+def _permute_kernel(valid_ref, revert_t_ref, hidden_ref, out_hbm_ref, onehot_ref):
     topk, num_tokens = revert_t_ref.shape
     num_slots, hidden_size = out_hbm_ref.shape
     chunk = _col_chunk(num_tokens, num_slots, hidden_size)
@@ -95,10 +100,11 @@ def _permute_kernel(valid_ref, revert_t_ref, hidden_hbm_ref, out_hbm_ref, onehot
                 onehot += (revert_t_ref[k : k + 1, :] == slots).astype(jnp.float32)
             onehot_ref[s0 : s0 + _SLOT_BLOCK, :] = onehot.astype(onehot_ref.dtype)
 
-        def body(hidden_ref, out_ref):
+        def body(out_ref):
+            cols = pl.ds(pl.multiple_of(pl.program_id(0) * chunk, chunk), chunk)
             # 0 * NaN == NaN: a non-finite token would reach every slot. x * 0
             # is 0 exactly for finite x (Mosaic's isfinite takes f32 only).
-            hidden = hidden_ref[...]
+            hidden = hidden_ref[:, cols]
             hidden = jnp.where(hidden * 0 == 0, hidden, jnp.zeros_like(hidden))
             out_ref[...] = jnp.dot(
                 onehot_ref[:cap, :], hidden, preferred_element_type=jnp.float32
@@ -107,9 +113,9 @@ def _permute_kernel(valid_ref, revert_t_ref, hidden_hbm_ref, out_hbm_ref, onehot
         pltpu.emit_pipeline(
             body,
             grid=(hidden_size // chunk,),
-            in_specs=(pl.BlockSpec((num_tokens, chunk), lambda c: (0, c)),),
+            in_specs=(),
             out_specs=(pl.BlockSpec((cap, chunk), lambda c: (0, c)),),
-        )(hidden_hbm_ref, out_hbm_ref)
+        )(out_hbm_ref)
 
     _run_capped(valid_ref, num_slots, branch)
 
@@ -135,7 +141,12 @@ def bounded_onehot_permute(
         out_shape=jax.ShapeDtypeStruct((num_slots, hidden_size), hidden.dtype),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=1,
-            in_specs=[pl.BlockSpec(memory_space=pltpu.VMEM), hbm],
+            # The whole hidden block sits in VMEM: streaming its column chunks
+            # from HBM ran 2x slower inside the served graph than alone.
+            in_specs=[
+                pl.BlockSpec(memory_space=pltpu.VMEM),
+                pl.BlockSpec(memory_space=pltpu.VMEM),
+            ],
             out_specs=hbm,
             scratch_shapes=[pltpu.VMEM((num_slots, num_tokens), hidden.dtype)],
         ),
