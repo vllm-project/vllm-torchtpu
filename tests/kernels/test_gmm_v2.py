@@ -87,6 +87,24 @@ def test_apply_act_fn_dispatches_situ(monkeypatch, linear_beta):
     _assert_allclose(actual, expected)
 
 
+def test_apply_act_fn_silu_rounds_intermediates_to_bfloat16(monkeypatch):
+    monkeypatch.setattr(
+        "vllm_torchtpu.kernels.megablox.gmm_v2.pltpu.get_tpu_info",
+        lambda: SimpleNamespace(num_lanes=1),
+    )
+    gate = jnp.asarray([-1.2345679, 0.33333334, 2.7182817], dtype=jnp.float32)
+    up = jnp.asarray([1.1111112, -0.7654321, 3.1415927], dtype=jnp.float32)
+    gate_bf16 = gate.astype(jnp.bfloat16)
+    up_bf16 = up.astype(jnp.bfloat16)
+    expected = (
+        jax.nn.silu(gate_bf16.astype(jnp.float32)).astype(jnp.bfloat16) * up_bf16
+    ).astype(jnp.float32)
+
+    actual = apply_act_fn(interleave_lane(gate, up), "silu")
+    assert actual.dtype == jnp.float32
+    np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+
+
 def get_group_sizes(batch_size: int, num_groups: int) -> jax.Array:
     distribution = jax.random.uniform(
         jax.random.key(0), (num_groups - 1,), dtype=jnp.float32
