@@ -656,6 +656,7 @@ def compact_pooled_qsa_step(
     k_norm_multiplier: jax.Array | None = None,
     decode_cu: jax.Array | None = None,
     scheduling_group_namespace: int = 0,
+    ring_capacity: int | None = None,
     *,
     topk_backend: TopKBackend | None = None,
     sc_min_context: int | None = None,
@@ -682,13 +683,17 @@ def compact_pooled_qsa_step(
     ring_ids = ring_ids.reshape(len(context), -1)[:, 0]
     # Keep request metadata independent of layer-specific page IDs so XLA can
     # share RPA schedules across layers.
+    capacity = compress_ratio if ring_capacity is None else ring_capacity
     active = starts[1:] > starts[:-1]
+    if capacity > compress_ratio:
+        # Idle draft ranks replay collectives without writing the null page.
+        active = active & (ring_ids > 0)
     slots = jnp.where(active, jnp.arange(len(ring_ids), dtype=jnp.int32), -1)
     req, logical, valid = _token_metadata(len(qgate), starts, context, slots)
 
     index_dim = niq.shape[0]
     # The persistent ring/tag ABI pads request rows to eight logical lanes.
-    ring_rows = pl.cdiv(compress_ratio, 8) * 8
+    ring_rows = pl.cdiv(capacity, 8) * 8
     tag_fields = (positions.shape[0] if positions.ndim == 2 else 1) + 1
 
     def read_index_state(owner):
@@ -705,7 +710,8 @@ def compact_pooled_qsa_step(
     preparation_group = None
     early_raw = index_qk[:, -index_dim:]
     if (
-        enable_sc_preparation
+        capacity == compress_ratio
+        and enable_sc_preparation
         and scheduling_group_namespace > 0
         and use_prefill_index_preparation(
             early_raw, compress_ratio, requests=len(context)
@@ -798,7 +804,7 @@ def compact_pooled_qsa_step(
         )
     # Retain the write dependency across the two owners.
     main_pool, index_pool = jax.lax.optimization_barrier((main_pool, index_pool))
-    fused_state = use_decode_state_fusion(
+    fused_state = capacity == compress_ratio and use_decode_state_fusion(
         raw,
         index_pool,
         requests=len(context),
@@ -858,6 +864,7 @@ def compact_pooled_qsa_step(
             norm_eps,
             rotary_dim,
             rope_axes,
+            ring_capacity=capacity,
             pooled_values=early_pooled,
         )
         pending_state = (ring, tags)

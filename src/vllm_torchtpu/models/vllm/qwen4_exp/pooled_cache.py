@@ -19,8 +19,8 @@ import torch
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.v1.core.kv_cache_planning import (
     check_enough_kv_cache_memory,
+    get_global_kv_cache_groups,
     get_kv_cache_config_from_groups,
-    get_kv_cache_groups,
 )
 from vllm.v1.core.kv_cache_utils import (
     resolve_cache_hit_alignment_tokens,
@@ -50,7 +50,7 @@ logger = init_logger(__name__)
 
 
 class Qwen4ExpPooledCache:
-    def __init__(self, runner, model):
+    def __init__(self, runner, model, draft_model=None):
         require_unified_pool()
         self.runner = runner
         self.model = None if model is None else model.get_language_model()
@@ -58,6 +58,7 @@ class Qwen4ExpPooledCache:
         self._budgeted_pages: int | None = None
         self._capacity_ceiling: int | None = None
         self.materialized = None
+        self.draft_model = draft_model
 
     def get_specs(self, available_memory: int | None = None):
         cfg = self.runner.vllm_config
@@ -77,7 +78,7 @@ class Qwen4ExpPooledCache:
             self.layout.block_size if cache.enable_prefix_caching else None
         )
         cache.mamba_page_size_padded = self.layout.page_bytes
-        self.groups = get_kv_cache_groups(cfg, self.specs)
+        self.groups = get_global_kv_cache_groups(cfg, [self.specs])
         if available_memory is not None and self._budgeted_pages is None:
             previous_override = cache.num_gpu_blocks_override
             cache.num_gpu_blocks_override = self.requested_blocks
@@ -196,8 +197,17 @@ class Qwen4ExpPooledCache:
         )
         caches = self.materialized.kv_caches
         assert self.model is not None, "Bind a native language model before allocation"
-        for i, layer in enumerate(self.model.model.layers):
-            prefix = f"model.layers.{i}"
+        owners = [
+            (f"model.layers.{i}", layer)
+            for i, layer in enumerate(self.model.model.layers)
+        ]
+        if runner.vllm_config.speculative_config is not None:
+            assert self.draft_model is not None, "MTP weights must precede profiling"
+            owners.extend(
+                (f"mtp.layers.{self.model.config.num_hidden_layers + i}", layer)
+                for i, layer in enumerate(self.draft_model.model.layers)
+            )
+        for prefix, layer in owners:
             if layer.layer_type == "linear_attention":
                 layer.linear_attn.kv_cache = tuple(caches[prefix + ".linear_attn"])
             else:
@@ -273,6 +283,10 @@ class Qwen4ExpPooledCache:
             runner._mamba_copy_plan = []
             runner._mamba_state_block_size = None
             runner._pool_block_split = 1
+        if runner.vllm_config.speculative_config is not None:
+            runner.mamba_slot_read_offsets = torch.zeros(
+                config.num_blocks, dtype=torch.int32, device=runner.device
+            )
         if runner._mamba_copy_plan:
             runner._precompile_mamba_state_seed_copies()
         if not runner.enforce_eager:
@@ -291,6 +305,17 @@ class Qwen4ExpPooledCache:
             if use_max_model_len
             else self.runner.most_model_len
         )
+        # Match the serving runner's two views of one six-element upload.
+        # Aliasing these fields to the SAME three-element tensor specializes
+        # the compiled graph to one distribution. Verify then incorrectly
+        # uses RPA's prefill segment for GDN/PLE and never writes checkpoints.
+        mamba_distribution = None
+        if self.runner.vllm_config.speculative_config is not None:
+            distribution = torch.cat(
+                (metadata.request_distribution, metadata.request_distribution)
+            )
+            metadata = replace(metadata, request_distribution=distribution[:3])
+            mamba_distribution = distribution[3:]
         result = {}
         next_page = 1
         for group in self.groups:
@@ -298,7 +323,7 @@ class Qwen4ExpPooledCache:
             state = isinstance(spec, MambaSpec)
             ring = isinstance(spec, CircularBufferSpec)
             columns = (
-                1
+                1 + spec.num_speculative_blocks
                 if state
                 else get_block_table_width(
                     spec.max_num_blocks_per_req(self.runner.vllm_config, context_limit),
@@ -316,7 +341,19 @@ class Qwen4ExpPooledCache:
             item = replace(
                 metadata,
                 block_tables=table.reshape(-1),
-                mamba_state_indices=table[:, 0] if state else None,
+                # Match the independent, contiguous gathers produced by the
+                # serving metadata walk. A strided column view can specialize
+                # AOT input aliasing and make later request rows read padding.
+                mamba_state_indices=table[:, 0].clone() if state else None,
+                mamba_ckpt_indices=table.clone() if state and columns > 1 else None,
+                mamba_slot_read_offsets=(
+                    torch.zeros(
+                        self.pages, dtype=torch.int32, device=self.runner.device
+                    )
+                    if state and self.runner.vllm_config.speculative_config is not None
+                    else None
+                ),
+                mamba_request_distribution=mamba_distribution if state else None,
             )
             result.update({name: item for name in group.layer_names})
         assert next_page <= self.pages, "dummy owner pages exceed the planned pool"

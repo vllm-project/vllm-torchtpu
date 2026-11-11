@@ -239,3 +239,76 @@ def test_get_output_attaches_spec_logprobs():
         1,
     ]
     assert out.logprobs.slice_request(2, 1).logprobs[:, 0].tolist() == [-6.0]
+
+
+@pytest.mark.parametrize(
+    "on_tpu", [False, pytest.param(True, marks=pytest.mark.tpu_test)]
+)
+@pytest.mark.parametrize("completed", [False, True])
+@pytest.mark.parametrize("k", [0, 1, 2, 3, 4])
+def test_pending_sampled_tokens_update_reordered_snapshot(device, on_tpu, completed, k):
+    from unittest.mock import Mock
+
+    from vllm_torchtpu.runner.tpu_runner_async_output import AsyncPreResults
+
+    target = device if on_tpu else torch.device("cpu")
+    if on_tpu:
+        assert target.type == "tpu"
+    current = {"b": 0, "new": 1, "rewound": 2, "a": 3, "prefill": 4}
+    lengths = np.array([k + 1, 7, 2, 5 + k + 1, 9], dtype=np.int32)
+    for accepted in range(k + 1):
+        other_accepted = k - accepted
+        first = torch.full((4, k + 1), -1, dtype=torch.int32)
+        first[0, :accepted] = torch.arange(100, 100 + accepted)
+        first[0, accepted] = 900
+        first[1:] = 777  # Discarded prefill sample, finished request and padding.
+        second = torch.full_like(first, 888)
+        second[0] = -1
+        second[0, :other_accepted] = torch.arange(200, 200 + other_accepted)
+        second[0, other_accepted] = 901
+        values = [first, second]
+        chunks = [v.to(target) for v in values]
+        copies = [v.clone() if completed else torch.full_like(v, -999) for v in values]
+        event = Mock()
+        event.synchronize.side_effect = AssertionError("history must not wait for D2H")
+        copy = AsyncTPUCopyState(
+            chunks_cpu=copies,
+            chunk_real_lens=[3, 3],
+            copy_ready_event=event,
+            chunks_tpu=None if completed else chunks,
+            completed=completed,
+        )
+        previous = AsyncPreResults(
+            req_ids=["a", "prefill", "finished", "b", "absent", "rewound"],
+            next_tokens_tpu=torch.full(
+                (8 * (k + 1),), 999, dtype=torch.int32, device=target
+            ),
+            request_seq_lens=[
+                (i, None, 0, req)
+                for i, req in enumerate(
+                    ["a", "prefill", "finished", "b", "absent", "rewound"]
+                )
+                if req != "prefill"
+            ],
+            discard_sampled_tokens_req_indices=[1],
+            req_id_to_index_copy={"a": 0, "b": 4, "finished": 2, "absent": 5},
+            copy_state=copy,
+            num_draft_per_req={i: k for i in range(6)} if k else None,
+        )
+        host = torch.arange(5 * 24, dtype=torch.int32).reshape(5, 24)
+        host[3, 5 : 5 + k + 1] = -1
+        host[0, : k + 1] = -1
+        expected = host.clone()
+        expected[3, 5 : 5 + accepted + 1] = first[0, : accepted + 1]
+        expected[0, : other_accepted + 1] = second[0, : other_accepted + 1]
+        snapshot = host.to(target, copy=True)
+        previous.update_token_ids(snapshot, current, lengths)
+        torch.testing.assert_close(snapshot.cpu(), expected, rtol=0, atol=0)
+        assert (host[3, 5 : 5 + k + 1] == -1).all()
+        for actual, original in zip(chunks, values):
+            torch.testing.assert_close(actual.cpu(), original, rtol=0, atol=0)
+        event.synchronize.assert_not_called()
+        # The existing invalidation mapping also covers a fully retired batch.
+        previous.req_id_to_index_copy.clear()
+        previous.update_token_ids(snapshot, current, lengths)
+        torch.testing.assert_close(snapshot.cpu(), expected, rtol=0, atol=0)

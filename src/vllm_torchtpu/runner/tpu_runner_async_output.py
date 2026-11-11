@@ -176,6 +176,60 @@ class AsyncPreResults:
     # absent entry (None for an entirely non-spec result).
     num_draft_per_req: dict[int, int] | None = None
 
+    def update_token_ids(
+        self,
+        token_ids: torch.Tensor,
+        req_id_to_index: dict[str, int],
+        num_tokens_no_spec: np.ndarray,
+    ) -> None:
+        """Overlay pending accepted outputs on a reordered token snapshot."""
+        if self.copy_state is None or not self.req_id_to_index_copy:
+            return
+        chunks = self.copy_state.chunks_tpu
+        if chunks is None:
+            # wait() releases device sources only after D2H completes.
+            chunks = self.copy_state.chunks_cpu
+        destinations = {}
+        for old_row, _, _, req_id in self.request_seq_lens:
+            if req_id not in self.req_id_to_index_copy or req_id not in req_id_to_index:
+                continue
+            row = req_id_to_index[req_id]
+            drafts = (
+                self.num_draft_per_req.get(old_row, 0) if self.num_draft_per_req else 0
+            )
+            destinations[old_row] = (row, int(num_tokens_no_spec[row]) - 1 - drafts)
+        if not destinations:
+            return
+        flat = token_ids.view(-1)
+        width = token_ids.shape[1]
+        offset = 0
+        for chunk, count in zip(chunks, self.copy_state.chunk_real_lens):
+            rows = torch.full((chunk.shape[0],), -1, dtype=torch.int64, device="cpu")
+            starts = torch.zeros_like(rows)
+            for i in range(count):
+                if offset + i in destinations:
+                    rows[i], starts[i] = destinations[offset + i]
+            offset += count
+            rows, starts = (
+                t.to(token_ids.device, non_blocking=True) for t in (rows, starts)
+            )
+            sampled = chunk.to(token_ids.device, non_blocking=True).reshape(
+                chunk.shape[0], -1
+            )
+            columns = starts[:, None] + torch.arange(
+                sampled.shape[1], device=token_ids.device
+            )
+            valid = (
+                (rows[:, None] >= 0)
+                & (sampled != INVALID_TOKEN_ID)
+                & (columns >= 0)
+                & (columns < width)
+            )
+            indices = rows.clamp(min=0)[:, None] * width + columns.clamp(0, width - 1)
+            # Zero deltas let padding share indices without overwriting a live write.
+            delta = torch.where(valid, sampled.to(flat.dtype) - flat[indices], 0)
+            flat.index_add_(0, indices.reshape(-1), delta.reshape(-1))
+
     def wait_for_copy(self) -> torch.Tensor | None:
         if self.copy_state is None:
             return None

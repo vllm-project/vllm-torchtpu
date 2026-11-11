@@ -146,18 +146,23 @@ def _indexer_updates(
     rotary_dim,
     rope_axes=None,
     *,
+    ring_capacity: int | None = None,
     pooled_values: jax.Array | None = None,
 ):
     count = len(raw)
     req, logical, valid = _token_metadata(count, starts, context, slots)
     safe_slots = jnp.maximum(slots, 0)
     ratio = compress_ratio
+    capacity = ratio if ring_capacity is None else ring_capacity
+    assert ratio <= capacity <= ring.shape[1]
     group_start = logical // ratio * ratio
     from .tuned_block_sizes import use_prefill_index_preparation
 
     if pooled_values is not None:
         pooled = pooled_values
-    elif use_prefill_index_preparation(raw, ratio, requests=len(context)):
+    elif capacity == ratio and use_prefill_index_preparation(
+        raw, ratio, requests=len(context)
+    ):
         from .index_pool_prepare import pool_index_groups
 
         pooled = pool_index_groups(
@@ -173,7 +178,7 @@ def _indexer_updates(
         members = group_start[:, None] + jnp.arange(ratio)[None]
         chunk_indices = starts[req, None] + members - context[req, None]
         current = raw[jnp.clip(chunk_indices, 0, count - 1)]
-        previous = ring[safe_slots[req, None], members % ratio]
+        previous = ring[safe_slots[req, None], members % capacity]
         previous = jnp.where((context[req] > 0)[:, None, None], previous, 0)
         joined = jnp.where(
             (chunk_indices >= starts[req, None])[..., None], current, previous
@@ -185,7 +190,7 @@ def _indexer_updates(
     axes = token_positions.shape[1]
     if tags.shape[-1] != axes + 1:
         raise ValueError("Indexer tags do not match the position-axis state ABI")
-    old_position = tags[safe_slots[req], group_start % ratio, :axes]
+    old_position = tags[safe_slots[req], group_start % capacity, :axes]
     first_position = jnp.where(
         (first_index >= starts[req])[:, None],
         token_positions[jnp.clip(first_index, 0, count - 1)],
@@ -205,13 +210,13 @@ def _indexer_updates(
     lengths = starts[1:] - starts[:-1]
     end = context + lengths
     lanes = jnp.arange(ring.shape[1])[None]
-    last = end[:, None] - 1 - ((end[:, None] - 1 - lanes) % ratio)
+    last = end[:, None] - 1 - ((end[:, None] - 1 - lanes) % capacity)
     local = starts[:-1, None] + last - context[:, None]
     old_ring = ring[safe_slots]
     old_tags = tags[safe_slots]
     old_ring = jnp.where((context > 0)[:, None, None], old_ring, 0)
     old_tags = jnp.where((context > 0)[:, None, None], old_tags, -1)
-    new_lane = (lanes < ratio) & (last >= context[:, None]) & (last < end[:, None])
+    new_lane = (lanes < capacity) & (last >= context[:, None]) & (last < end[:, None])
     rr = jnp.where(new_lane[..., None], raw[jnp.clip(local, 0, count - 1)], old_ring)
     pp = token_positions[jnp.clip(local, 0, count - 1)]
     tag_pairs = jnp.concatenate([pp, jnp.zeros((*pp.shape[:-1], 1), pp.dtype)], -1)

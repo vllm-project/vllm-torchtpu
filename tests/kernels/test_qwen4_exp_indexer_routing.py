@@ -549,8 +549,12 @@ def test_production_compact_factory_exposes_compiler_owned_namespace(monkeypatch
     args = tuple(
         graph.placeholder(arg.name) for arg in schema.arguments[:namespace_index]
     )
-    first = graph.call_function(op._opoverload, args)
-    second = graph.call_function(op._opoverload, args)
+    kwargs = {
+        arg.name: graph.placeholder(arg.name)
+        for arg in schema.arguments[namespace_index + 1 :]
+    }
+    first = graph.call_function(op._opoverload, args, kwargs)
+    second = graph.call_function(op._opoverload, args, kwargs)
     graph.output((first, second))
     module = torch.fx.GraphModule({}, graph)
     _bind_scheduling_group_namespaces(module)
@@ -559,6 +563,8 @@ def test_production_compact_factory_exposes_compiler_owned_namespace(monkeypatch
         for n in module.graph.nodes
         if n.op == "call_function"
     ] == [1, 2]
+    assert first.kwargs["ring_capacity"] is kwargs["ring_capacity"]
+    assert second.kwargs["ring_capacity"] is kwargs["ring_capacity"]
 
 
 @pytest.mark.parametrize("mode", ["default", "injected", "explicit"])

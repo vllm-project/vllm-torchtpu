@@ -4621,6 +4621,21 @@ class TPUModelRunner(GPUModelRunner):
             )
             if is_draft_model:
                 assert isinstance(hidden_states, torch.Tensor)
+                from vllm_torchtpu.spec_decode.utils import MTPHiddenStateProvider
+
+                draft_hidden = hidden_states
+                if (
+                    self.speculative_config is not None
+                    and self.speculative_config.method == "mtp"
+                    and isinstance(cast(object, self.model), MTPHiddenStateProvider)
+                ):
+                    # Own a snapshot for each chunk, independent of the next
+                    # target invocation and its reusable output buffers.
+                    draft_hidden = (
+                        cast(MTPHiddenStateProvider, self.model)
+                        .get_mtp_target_hidden_states()
+                        .clone()
+                    )
                 # Capture this chunk's draft inputs while they are valid.
                 draft_chunk = DraftChunkInputs(
                     input_ids=(
@@ -4636,7 +4651,7 @@ class TPUModelRunner(GPUModelRunner):
                     aux_hidden_states=(
                         aux_hidden_states if aux_hidden_states is not None else []
                     ),
-                    hidden_states=hidden_states,
+                    hidden_states=draft_hidden,
                     draft_lengths=(
                         spec_decode_metadata.draft_lengths
                         if spec_decode_metadata is not None
@@ -5879,8 +5894,6 @@ class TPUModelRunner(GPUModelRunner):
             if self._pp_topk_buffer is not None:
                 # -1 is "no token": a row of it attends to nothing.
                 self._pp_topk_buffer.fill_(-1)
-        if self.model_adapter is not None:
-            self.model_adapter.bind_model(model)
         if envs.TPU_ROPE_CACHE_TRUNCATE:
             self._truncate_rope_caches(self.model)
         if envs.TPU_ROPE_CACHE_ROW_MAJOR:
@@ -5895,6 +5908,10 @@ class TPUModelRunner(GPUModelRunner):
             self._greedy_head_owner = greedy_top_tokens.resolve_head_owner(
                 self.model, self._dp_lockstep_enabled()
             )
+
+        # Prefill-only draft validation reads the target adapter's cache specs.
+        if self.model_adapter is not None:
+            self.model_adapter.bind_model(self.model)
 
         # If using eagle3/mtp or dflash speculative decoding, load the draft model and
         # share the target's embeddings / LM head (if the draft requires it).
@@ -5932,6 +5949,11 @@ class TPUModelRunner(GPUModelRunner):
         # After the drafter: every placed MoE layer, the drafter's too, must
         # have had its router renumbered with its experts.
         expert_placement.check_routers_permuted()
+
+            if self.model_adapter is not None:
+                self.model_adapter.bind_model(
+                    self.model, self._async_drafter.draft_model
+                )
 
         # After the drafter, so its MTP layer is armed too.
         if envs.FUSED_MOE_DECODE_KERNEL:

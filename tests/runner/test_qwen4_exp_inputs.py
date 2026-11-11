@@ -66,6 +66,7 @@ def test_reordered_history_slots_and_group_tables_are_independent(
         mamba_state_indices=torch.tensor([7, 2, 0], dtype=torch.int32),
     )
     runner = NS(
+        speculative_config=None,
         device="cpu",
         _pp_is_first=True,
         supports_mm_inputs=False,
@@ -125,6 +126,7 @@ def test_reordered_history_slots_and_group_tables_are_independent(
         host_ple_index=0 if offload else None,
         ple_host_backend="torch",
         decode_cu=None,
+        capture_mtp_hidden=False,
         layers=[layer],
         hc_count=1,
         embed_tokens=Mock(return_value=hidden),
@@ -415,6 +417,7 @@ def test_async_history_reads_committed_prefix_after_reorder_and_row_reuse():
     )
     order = torch.tensor([1, 2, 0])
     runner = NS(
+        speculative_config=None,
         device="cpu",
         _pp_is_first=True,
         supports_mm_inputs=False,
@@ -445,6 +448,7 @@ def test_empty_request_snapshot_preserves_padded_input_contract(
 ):
     monkeypatch.setenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", "1")
     runner = NS(
+        speculative_config=None,
         device="cpu",
         _pp_is_first=True,
         supports_mm_inputs=False,
@@ -537,6 +541,7 @@ def test_step_snapshot_is_bounded_and_shared_across_chunks(ngram_size, has_ple):
     store = torch.arange(6 * 128, dtype=torch.int32).reshape(6, 128)
     context = [0, 1, 9, 4, 17]
     runner = NS(
+        speculative_config=None,
         device="cpu",
         _pp_is_first=True,
         supports_mm_inputs=False,
@@ -739,3 +744,92 @@ def test_real_runner_chunks_and_async_input_hash(monkeypatch, ngram_size):
     for row, req in enumerate(batch.req_ids):
         if req in ("req1", "req2", "req4"):
             assert source[row, computed[row]] == -1
+
+
+@pytest.mark.parametrize("pending", [False, True])
+@pytest.mark.parametrize(
+    "k,accepted", [(k, m) for k in range(1, 5) for m in range(k + 1)]
+)
+def test_ngram_context_reads_sampler_commits_from_snapshot(
+    monkeypatch, pending, k, accepted
+):
+    import numpy as np
+
+    from tests.runner.test_qwen4_exp_pool import pool_config
+    from vllm_torchtpu.runner.tpu_runner_async_output import (
+        AsyncPreResults,
+        AsyncTPUCopyState,
+    )
+
+    monkeypatch.setenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", "1")
+    cfg = pool_config()
+    cfg.model_config.hf_text_config.ngram_size = 3
+    host = torch.full((3, 16), -1, dtype=torch.int32)
+    host[0, :3] = torch.tensor([10, 11, 12])
+    host[1].fill_(80)
+    host[2, :4] = torch.tensor([1, 2, 3, 4])
+    cpu_context = np.array([3 + k, 0, 4 + k])
+    sampled = torch.full((2, k + 1), -1, dtype=torch.int32)
+    sampled[0, : accepted + 1] = torch.arange(50, 51 + accepted)
+    sampled[1] = torch.arange(60, 61 + k)
+    event = Mock()
+    event.synchronize.side_effect = AssertionError("history must not wait for D2H")
+    previous = AsyncPreResults(
+        req_ids=["a", "b"],
+        next_tokens_tpu=sampled,
+        request_seq_lens=[(0, None, 0, "a"), (1, None, 0, "b")],
+        discard_sampled_tokens_req_indices=[],
+        req_id_to_index_copy={"a": 0, "b": 1},
+        num_draft_per_req={0: k, 1: k},
+        copy_state=AsyncTPUCopyState(
+            chunks_cpu=[torch.full_like(sampled, -999) if pending else sampled],
+            chunks_tpu=[sampled] if pending else None,
+            chunk_real_lens=[2],
+            copy_ready_event=event,
+            completed=not pending,
+        ),
+    )
+    runner = NS(
+        speculative_config=NS(num_speculative_tokens=k),
+        vllm_config=cfg,
+        model_config=cfg.model_config,
+        cache_config=cfg.cache_config,
+        device=torch.device("cpu"),
+        input_batch=NS(
+            num_reqs=3,
+            num_computed_tokens_cpu=cpu_context,
+            token_ids_cpu_tensor=host,
+            req_id_to_index={"b": 0, "new": 1, "a": 2},
+            num_tokens_no_spec=np.array([4 + k, 2, 5 + k]),
+        ),
+        _pre_async_results=previous,
+        _attn_metadata_builder_ctx=NS(
+            query_start_loc=torch.tensor([0, 1, 2, 3]),
+            seq_lens=torch.tensor([4 + k, 1, 5 + accepted]),
+        ),
+    )
+    adapter = Qwen4ExpAdapter(runner)
+    before = host.clone()
+    snapshot = adapter.begin_step()
+    torch.testing.assert_close(host, before)
+    assert snapshot[0].shape == (3, 2 + k)
+    # The next schedule may mutate host input staging before this chunk runs.
+    host.fill_(999)
+    cpu_context.fill(999)
+    history = adapter.prepare_inputs(
+        ModelInputSnapshot(
+            snapshot,
+            0,
+            3,
+            3,
+            {},
+            torch.zeros(3, dtype=torch.int32),
+        )
+    )["ngram_context"]
+    expected = [
+        ([10, 11, 12] + list(range(60, 60 + k)))[-2:],
+        [248044, 248044],
+        ([1, 2, 3, 4] + list(range(50, 50 + accepted)))[-2:],
+    ]
+    assert history.tolist() == expected
+    event.synchronize.assert_not_called()

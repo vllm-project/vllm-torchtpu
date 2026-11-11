@@ -61,6 +61,9 @@ def pooled_short_conv(
     starts: jax.Array,
     ids: jax.Array,
     initial: jax.Array,
+    checkpoint_indices: jax.Array | None = None,
+    read_offsets: jax.Array | None = None,
+    request_distribution: jax.Array | None = None,
     *,
     dilation: int,
     state_len: int,
@@ -68,9 +71,17 @@ def pooled_short_conv(
     if x.shape[0] == 0 or len(ids) == 0:
         return pool, jnp.zeros_like(x)
     channels = x.shape[-1]
+    read_ids = ids
+    speculative_window_size = 1
+    if checkpoint_indices is not None:
+        assert read_offsets is not None and request_distribution is not None
+        speculative_window_size = checkpoint_indices.shape[1]
+        read_ids = checkpoint_indices[
+            jnp.arange(len(ids)), read_offsets[jnp.maximum(ids, 0)]
+        ]
     history = (
         read_region(
-            pool, ids, elements=state_len * channels, dtype=jnp.bfloat16
+            pool, read_ids, elements=state_len * channels, dtype=jnp.bfloat16
         ).reshape(len(ids), state_len, channels)
         if state_len
         else jnp.zeros((len(ids), 0, channels), jnp.bfloat16)
@@ -85,9 +96,25 @@ def pooled_short_conv(
         slots,
         initial,
         dilation=dilation,
+        speculative_window_size=speculative_window_size,
+        request_distribution=request_distribution,
     )
     if state_len:
-        pool = write_region(
-            pool, updated.reshape(len(ids), -1), jnp.where(active, ids, 0)
-        )
+        if checkpoint_indices is None:
+            pool = write_region(
+                pool, updated.reshape(len(ids), -1), jnp.where(active, ids, 0)
+            )
+        else:
+            assert request_distribution is not None
+            lengths = starts[1:] - starts[:-1]
+            counts = jnp.where(
+                jnp.arange(len(ids)) < request_distribution[0], lengths, 1
+            )
+            valid = jnp.arange(speculative_window_size)[None, :] < counts[:, None]
+            destinations = jnp.where(valid & active[:, None], checkpoint_indices, 0)
+            pool = write_region(
+                pool,
+                updated.reshape(-1, state_len * channels),
+                destinations.reshape(-1),
+            )
     return pool, output

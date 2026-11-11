@@ -139,25 +139,30 @@ def test_draft_tp_defaults_to_target_tp():
     assert proposer._draft_replicated is False
 
 
+def _load_vocab_draft(proposer, draft, target, monkeypatch, attn_layers=None):
+    def load_draft_model(_target):
+        proposer.draft_model = draft
+
+    monkeypatch.setattr(proposer, "_load_draft_model", load_draft_model)
+    monkeypatch.setattr(
+        spec_decode_utils, "gather_sharded_weight", _fake_gather_sharded_weight
+    )
+    with mock.patch(
+        "vllm_torchtpu.spec_decode.eagle3.get_layers_from_vllm_config",
+        side_effect=[{}, attn_layers or {}],
+    ):
+        proposer.load_model(target)
+
+
 @pytest.mark.parametrize("draft_tp,target_tp", [(1, 1), (1, 8), (8, 8)])
 def test_load_model_vocab_weights_follow_tp_layout(draft_tp, target_tp, monkeypatch):
     proposer = _make_proposer(draft_tp=draft_tp, target_tp=target_tp, method="mtp")
     draft, target = _make_vocab_models()
     draft_head = draft.lm_head
     original_gather_logits = draft.logits_processor._gather_logits
-
-    def load_draft_model(_target):
-        proposer.draft_model = draft
-
-    proposer._load_draft_model = load_draft_model
-    monkeypatch.setattr(
-        spec_decode_utils, "gather_sharded_weight", _fake_gather_sharded_weight
-    )
-
-    with mock.patch(
-        "vllm_torchtpu.spec_decode.eagle3.get_layers_from_vllm_config", return_value={}
-    ):
-        proposer.load_model(target)
+    _load_vocab_draft(proposer, draft, target, monkeypatch)
+    assert proposer._mtp_hc_mult == 1
+    assert proposer._draft_attn_layer_names == set()
 
     if draft_tp == target_tp:
         assert draft.model.embed_tokens is target.model.embed_tokens
@@ -174,6 +179,67 @@ def test_load_model_vocab_weights_follow_tp_layout(draft_tp, target_tp, monkeypa
         assert draft.logits_processor._gather_logits(logits) is logits
     else:
         assert draft.logits_processor._gather_logits is original_gather_logits
+
+
+def test_load_model_registers_draft_auxiliary_cache_names(monkeypatch):
+    proposer = _make_proposer(method="mtp")
+    draft, target = _make_vocab_models()
+    layers = {
+        "draft.attn": SimpleNamespace(
+            get_auxiliary_cache_specs=lambda: {"compressed": None, "ring": None}
+        )
+    }
+    _load_vocab_draft(proposer, draft, target, monkeypatch, layers)
+    assert proposer._draft_attn_layer_names == {
+        "draft.attn",
+        "draft.attn.compressed",
+        "draft.attn.ring",
+    }
+    assert proposer._mtp_hc_mult == 1
+
+
+@pytest.mark.parametrize("hc_mult", [1, 4])
+def test_load_model_mtp_provider_sets_carry_width(monkeypatch, hc_mult):
+    proposer = _make_proposer(method="mtp")
+    draft, target = _make_vocab_models()
+    draft.config = SimpleNamespace(hidden_size=2)
+    target.get_mtp_target_hidden_states = lambda: torch.empty(0, 2 * hc_mult)
+    proposer.speculative_config.draft_model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(hc_mult=hc_mult)
+    )
+    _load_vocab_draft(proposer, draft, target, monkeypatch)
+    assert proposer._draft_hidden_size() == 2
+    assert proposer._draft_input_hidden_size() == 2 * hc_mult
+    assert proposer._draft_combine_input_size() == 2 * hc_mult
+    assert proposer._draft_attn_layer_names == set()
+
+
+@pytest.mark.parametrize("hc_mult", [None, 4])
+@pytest.mark.parametrize("use_aux", [False, True])
+def test_eagle3_provider_target_keeps_eagle_hidden_width(monkeypatch, hc_mult, use_aux):
+    proposer = _make_proposer(method="eagle3")
+    draft, target = _make_vocab_models()
+    draft.config = SimpleNamespace(hidden_size=2)
+    draft.model.use_aux_hidden_state = use_aux
+    draft.model.fc_input_size = 6
+    target.get_mtp_target_hidden_states = lambda: torch.empty(0, 8)
+    target.supports_eagle3 = True
+    target.has_own_lm_head = False
+    target.has_own_embed_tokens = False
+    target.get_eagle3_default_aux_hidden_state_layers = lambda: (1, 2, 3)
+    target.set_aux_hidden_state_layers = mock.Mock()
+    hf_config = SimpleNamespace()
+    if hc_mult is not None:
+        hf_config.hc_mult = hc_mult
+    proposer.speculative_config.draft_model_config = SimpleNamespace(
+        hf_config=hf_config
+    )
+    _load_vocab_draft(proposer, draft, target, monkeypatch)
+    target.set_aux_hidden_state_layers.assert_called_once_with((1, 2, 3))
+    assert proposer._mtp_hc_mult == 1
+    assert proposer._draft_hidden_size() == 2
+    assert proposer._draft_input_hidden_size() == 2
+    assert proposer._draft_combine_input_size() == (6 if use_aux else 2)
 
 
 @pytest.mark.parametrize("draft_tp", [2, 4])
@@ -1194,7 +1260,8 @@ def test_run_dp_dummy_draft_sharded_replays_propose_trace(monkeypatch):
     assert tok_shapes == [(16, 8)] * 6
 
 
-def test_run_dp_dummy_draft_mtp_replays_no_combine(monkeypatch):
+@pytest.mark.parametrize("carry_size", [8, 32])
+def test_run_dp_dummy_draft_mtp_replays_no_combine(monkeypatch, carry_size):
     """An MTP draft has no combine_hidden_states, so the replay must not
     emit one.
 
@@ -1228,6 +1295,7 @@ def test_run_dp_dummy_draft_mtp_replays_no_combine(monkeypatch):
         model=SimpleNamespace(use_aux_hidden_state=False),
     )
     proposer._draft_has_moe_cache = True
+    proposer._mtp_hc_mult = carry_size // 8
 
     fwd, tok_shapes = [], []
 
@@ -1249,6 +1317,7 @@ def test_run_dp_dummy_draft_mtp_replays_no_combine(monkeypatch):
     assert [f["num_tokens_padded"] for f in fwd] == [64, 64, 16, 16, 16, 16]
     assert [f["step_idx"] for f in fwd] == [0, 0, 1, 1, 2, 2]
     assert tok_shapes == [(16, 8)] * 6
+    assert all(f["target_hidden_states"].shape[-1] == carry_size for f in fwd)
 
 
 def test_run_dp_dummy_draft_loop_bucket_below_num_reqs_max_model_len(monkeypatch):
@@ -3057,3 +3126,92 @@ def test_mtp_draft_borrows_target_head_before_loading_weights(
     assert seen["names"] == expected
     assert processed == [proposer.draft_model]
     assert "load_weights" not in proposer.draft_model.__dict__
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("k", [1, 2, 3, 4])
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_native_mtp_wide_carry_token_alignment(device, k, asynchronous):
+    # Each case owns a different stub model; isolate Dynamo identity guards.
+    torch.compiler.reset()
+    proposer = _make_proposer(draft_tp=1, method="mtp")
+    proposer.speculative_config.num_speculative_tokens = k
+    proposer.runner = SimpleNamespace(
+        _mtp_prefill_only=False,
+        input_batch=SimpleNamespace(num_reqs=2, req_ids=["a", "b"]),
+        requests={},
+        max_num_reqs=16,
+        num_reqs_max_model_len=16,
+        num_reqs_most_model_len=16,
+        num_tokens_paddings=[16],
+        device=device,
+        uses_mrope=False,
+        _dp_lockstep_enabled=lambda: False,
+    )
+
+    class WideDraft:
+        config = SimpleNamespace(hidden_size=8)
+        model = SimpleNamespace(use_aux_hidden_state=False)
+
+        def compute_logits(self, hidden, spec_step_idx=0):
+            assert hidden.shape[-1] == 8
+            return torch.zeros((hidden.shape[0], 4), device=hidden.device)
+
+    proposer.draft_model = WideDraft()
+    proposer._mtp_hc_mult = 4
+    hidden = torch.arange(16 * 32, dtype=torch.float32, device=device).reshape(16, 32)
+    ids = torch.arange(16, dtype=torch.int32, device=device)
+    positions = torch.arange(16, dtype=torch.int32, device=device)
+    starts = np.array([0, k + 1, 2 * (k + 1)] + [2 * (k + 1)] * 14, np.int32)
+    chunk = _make_chunk(
+        input_ids=ids,
+        position_ids=positions,
+        query_start_loc_np=starts,
+        start_index=0,
+        num_reqs=2,
+        device=device,
+        hidden_states=hidden,
+        draft_lengths=torch.tensor([k, k] + [0] * 14, dtype=torch.int32, device=device),
+        attn_ctx=SimpleNamespace(
+            use_max_model_len=True, query_start_loc=torch.from_numpy(starts).to(device)
+        ),
+    )
+    proposer.draft_chunks = [chunk]
+    seen = []
+
+    def forward(**kwargs):
+        carry = kwargs["target_hidden_states"]
+        seen.append((kwargs["input_ids"].cpu(), carry.cpu(), kwargs["positions"].cpu()))
+        assert carry.shape[-1] == 32
+        return carry[:, :8], carry + 1000
+
+    proposer._forward_draft = forward
+    for accepted in range(k + 1):
+        seen.clear()
+        sampled = [[0] * accepted + [900], [0] * k + [901]]
+        nt = torch.full((8, k + 1), -1, dtype=torch.int32, device=device)
+        nt[0, : accepted + 1] = torch.tensor(
+            sampled[0], dtype=torch.int32, device=device
+        )
+        nt[1] = torch.tensor(sampled[1], dtype=torch.int32, device=device)
+        actual = proposer.propose(
+            sampled_token_ids=None if asynchronous else sampled,
+            discard_sampled_tokens_req_indices=[],
+            num_rejected_tokens_np=None
+            if asynchronous
+            else np.array([k - accepted, 0]),
+            scheduler_output=SimpleNamespace(
+                num_scheduled_tokens={"a": k + 1, "b": k + 1},
+                scheduled_spec_decode_tokens={"a": [0] * k, "b": [0] * k},
+            ),
+            next_tokens_per_chunk=[nt] if asynchronous else None,
+        )
+        assert actual == [[0] * k, [0] * k]
+        selected = [accepted, 2 * k + 1]
+        assert seen[0][0][selected].tolist() == [900, 901]
+        torch.testing.assert_close(seen[0][1], hidden.cpu())
+        for step in range(1, k):
+            torch.testing.assert_close(
+                seen[step][1][:2], hidden.cpu()[selected] + 1000 * step
+            )
+            assert seen[step][2][:2].tolist() == [i + step for i in selected]

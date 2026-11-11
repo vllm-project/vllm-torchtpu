@@ -13,8 +13,10 @@
 # limitations under the License.
 """Native pool allocation, prefix alignment and state ownership contracts."""
 
+import contextlib
 import math
 from types import SimpleNamespace as NS
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -66,8 +68,123 @@ def pool_config(tp=1, kv="fp8_e4m3", ssm="bfloat16"):
         ),
         scheduler_config=NS(disable_hybrid_kv_cache_manager=False, max_num_seqs=8),
         speculative_config=None,
+        num_prefill_lookahead_tokens=0,
         kv_transfer_config=None,
     )
+
+
+def test_load_model_binds_target_then_draft_for_mtp(monkeypatch):
+    """Check pool binding with an admitted ordinary MTP configuration."""
+    from tests.models.vllm.test_qwen4_exp_parallel import config as model_config
+    from vllm_torchtpu.models.vllm.qwen4_exp.config import validate_config
+    from vllm_torchtpu.runner import tpu_runner
+    from vllm_torchtpu.spec_decode import eagle3
+
+    monkeypatch.setenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", "1")
+    monkeypatch.setattr(
+        tpu_runner.torch, "device", Mock(return_value=torch.device("cpu"))
+    )
+    for name in (
+        "TPU_ROPE_CACHE_TRUNCATE",
+        "TPU_ROPE_CACHE_ROW_MAJOR",
+        "TPU_MOE_HASH_TABLE_ROW_MAJOR",
+        "TPU_GREEDY_TOP_TOKENS",
+        "FUSED_MOE_DECODE_KERNEL",
+        "TPU_MOE_SKIP_PADDED_TOKENS",
+        "USE_MOE_TP_DECODE_KERNEL",
+    ):
+        monkeypatch.setattr(tpu_runner.envs, name, False)
+    config = model_config()
+    config.attention_config = AttentionConfig()
+    config.cache_config = pool_config().cache_config
+    config.model_config.architecture = "Qwen4ExpForCausalLM"
+    config.model_config.supports_kv_cache_grouping = False
+    config.num_prefill_lookahead_tokens = 1
+    config.cache_config.enable_prefix_caching = False
+    config.cache_config.mamba_cache_mode = "none"
+    config.speculative_config = NS(
+        method="mtp",
+        num_speculative_tokens=2,
+        draft_tensor_parallel_size=1,
+        draft_model_config=None,
+        use_eagle=lambda: True,
+        use_eagle_block_drop=lambda: False,
+    )
+    validate_config(config)
+    target, draft = torch.nn.Module(), torch.nn.Module()
+    target.get_language_model = lambda: target
+    for model in (target, draft):
+        model.model = torch.nn.Module()
+        model.model.embed_tokens = torch.nn.Embedding(3, 2)
+        model.model.embed_tokens.org_vocab_size = 3
+        model.lm_head = torch.nn.Linear(2, 3, bias=False)
+    draft.logits_processor = NS(_gather_logits=lambda logits: logits)
+    runner = NS(
+        vllm_config=config,
+        model_config=config.model_config,
+        parallel_config=config.parallel_config,
+        cache_config=config.cache_config,
+        device_config=NS(),
+        load_config=NS(),
+        lora_config=None,
+        mesh=None,
+        is_pooling_model=False,
+        _is_async_drafter=True,
+        _pcp_enabled=False,
+        _mtp_enabled=True,
+        _mtp_prefill_only=False,
+        _pp_is_last=True,
+        _relayout_tables=Mock(),
+        _initialize_pallas_kernels=Mock(),
+        _refresh_smem_request_caps=Mock(),
+    )
+    runner.kv_cache_manager = NS()
+    proposer = eagle3.Eagle3Proposer(runner, config)
+    runner.drafter = runner._async_drafter = proposer
+    cache_during_load = []
+
+    def load_draft(_target):
+        cache_during_load.append(runner.model_adapter.cache)
+        proposer.draft_model = draft
+
+    monkeypatch.setattr(proposer, "_load_draft_model", load_draft)
+    draft_name = (
+        f"mtp.layers.{config.model_config.hf_text_config.num_hidden_layers}.self_attn"
+    )
+    layers = iter([{}, {draft_name: NS()}])
+    monkeypatch.setattr(
+        eagle3, "get_layers_from_vllm_config", lambda *args: next(layers)
+    )
+    monkeypatch.setattr(tpu_runner, "get_tpu_quantization_config", lambda cfg: None)
+    monkeypatch.setattr(
+        tpu_runner,
+        "get_model_loader",
+        lambda cfg: NS(load_model=lambda **kwargs: target),
+    )
+    monkeypatch.setattr(tpu_runner, "validate_online_fp8", lambda *args: None)
+    monkeypatch.setattr(
+        tpu_runner,
+        "set_vllm_model_wrapper_context",
+        lambda **kwargs: contextlib.nullcontext(),
+    )
+    monkeypatch.setattr(
+        tpu_runner, "set_current_vllm_config", lambda cfg: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(
+        "vllm_torchtpu.model_loader_patches.evict_loaded_weights_page_cache",
+        lambda: None,
+    )
+
+    tpu_runner.TPUModelRunner.load_model(runner)
+
+    (target_cache,) = cache_during_load
+    assert target_cache.model is target
+    assert target_cache.draft_model is None
+    assert draft_name in target_cache.get_specs()
+    assert runner.model_adapter.cache.draft_model is draft
+    assert runner.model_adapter.cache.get_specs() == target_cache.get_specs()
+    assert runner.model_adapter.cache.materialized is None
+    assert proposer._draft_attn_layer_names == {draft_name}
 
 
 @pytest.mark.parametrize("mode", ["align", "none"])
@@ -95,7 +212,7 @@ def test_pool_initialize_builds_mamba_plan_from_materialized_layers(monkeypatch,
     config = KVCacheConfig(num_blocks=4, kv_cache_tensors=[], kv_cache_groups=groups)
     runner = NS(
         device=torch.device("cpu"),
-        vllm_config=NS(),
+        vllm_config=NS(speculative_config=None),
         cache_config=NS(mamba_cache_mode=mode),
         enforce_eager=True,
         _pool_block_split=1,
@@ -261,8 +378,9 @@ def test_pool_warmup_tables_match_native_ring_padding():
             assert torch.count_nonzero(table) == 1
 
 
+@pytest.mark.parametrize("k", [0, 2])
 @pytest.mark.parametrize("symbolic", [False, True])
-def test_pooled_ops_register_and_dispatch_without_allocating_a_device(symbolic):
+def test_pooled_ops_register_and_dispatch_without_allocating_a_device(symbolic, k):
     """Direct JAX tests miss schema/fake dispatch failures during model boot."""
     from torch._subclasses.fake_tensor import FakeTensorMode
     from torch.fx.experimental.symbolic_shapes import ShapeEnv
@@ -293,6 +411,9 @@ def test_pooled_ops_register_and_dispatch_without_allocating_a_device(symbolic):
             ids(3),
             ids(2),
             torch.empty((2,), dtype=torch.bool, device="cpu"),
+            ids(2, k + 1) if k else None,
+            ids(pool.shape[0]) if k else None,
+            ids(3) if k else None,
         )
         assert output.shape == (8, 10240)
         qgate = mode.from_tensor(qgate_cpu, static_shapes=not symbolic)
@@ -330,3 +451,41 @@ def test_pooled_ops_register_and_dispatch_without_allocating_a_device(symbolic):
         assert output.shape == (8, 6144)
         assert selected.shape == (8, 2051)
         assert selected.dtype == torch.int32
+
+
+@pytest.mark.parametrize("k", [1, 2, 4, 5])
+def test_mtp_prefix_cache_uses_draft_attention_for_block_drop(k):
+    from vllm.v1.core.kv_cache_planning import get_global_kv_cache_groups
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    from vllm_torchtpu.models.vllm.qwen4_exp.model import Qwen4ExpForCausalLM
+
+    cfg = pool_config()
+    cfg.num_prefill_lookahead_tokens = 1
+    cfg.model_config.architectures = [Qwen4ExpForCausalLM.__name__]
+    cfg.model_config.registry = NS(
+        resolve_model_cls=lambda *args: (Qwen4ExpForCausalLM, None)
+    )
+    cfg.speculative_config = NS(
+        method="mtp",
+        num_speculative_tokens=k,
+        use_eagle=lambda: True,
+        use_eagle_block_drop=lambda: True,
+    )
+    layout, specs = pooled_cache_specs(cfg)
+    cfg.cache_config.block_size = layout.block_size
+    cfg.cache_config.mamba_block_size = layout.block_size
+    groups = get_global_kv_cache_groups(cfg, [specs])
+    draft = f"mtp.layers.{cfg.model_config.hf_text_config.num_hidden_layers}.self_attn"
+    assert {name for name, spec in specs.items() if spec.is_draft} == {draft}
+    drop_groups = [group for group in groups if group.is_eagle_group]
+    assert len(drop_groups) == 1
+    assert draft in drop_groups[0].layer_names
+    assert draft + ".raw_ring" not in drop_groups[0].layer_names
+    assert draft + ".compressed_k" not in specs
+    assert layout.index_rows >= layout.block_size // 4
+    for spec in specs.values():
+        if isinstance(spec, MambaSpec):
+            assert spec.num_speculative_blocks == k
+            assert spec.mamba_cache_mode == "align"
+            assert spec.block_size == layout.block_size

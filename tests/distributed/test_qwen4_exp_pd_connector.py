@@ -622,6 +622,7 @@ def _registered_qwen_pool(
         setattr(cache_config.model_config.hf_text_config, key, value)
     cache = Qwen4ExpPooledCache.__new__(Qwen4ExpPooledCache)
     cache.native_config, cache.materialized = config, materialized
+    cache.draft_model = None
     cache.layout, cache.specs = pooled_cache_specs(cache_config)
     if state_shape_change:
         for name, spec in cache.specs.items():

@@ -37,7 +37,9 @@ class ModelInputSnapshot:
 
 
 class ModelAdapter(Protocol):
-    def bind_model(self, model): ...
+    def bind_model(
+        self, model: torch.nn.Module, draft_model: torch.nn.Module | None = None
+    ) -> None: ...
 
     def begin_step(self) -> Any: ...
 

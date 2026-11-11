@@ -67,10 +67,10 @@ class Qwen4ExpAdapter:
     def block_size(self) -> int:
         return self.runner.cache_config.block_size
 
-    def bind_model(self, model):
+    def bind_model(self, model, draft_model=None):
         from .pooled_cache import Qwen4ExpPooledCache
 
-        self.cache = Qwen4ExpPooledCache(self.runner, model)
+        self.cache = Qwen4ExpPooledCache(self.runner, model, draft_model)
 
     def get_kv_cache_spec(self):
         assert self.cache is not None
@@ -81,24 +81,35 @@ class Qwen4ExpAdapter:
         return self.cache.initialize(config)
 
     def begin_step(self):
-        # Reordering is complete. The pending async sample is the current input,
-        # substituted on device; predecessors below num_computed are committed.
         batch = self.runner.input_batch
         count = batch.num_reqs if self.config.ple_layer_ids else 0
+        spec = self.runner.speculative_config
+        num_speculative_tokens = spec.num_speculative_tokens if spec is not None else 0
+        width = self.config.ngram_size - 1 + num_speculative_tokens
         context = torch.as_tensor(
             batch.num_computed_tokens_cpu[:count], dtype=torch.int64
         )
+        # Include the possible rejected suffix while keeping transfer bounded
+        # by history width. The actual context is corrected on device below.
         history = ngram_context_from_store(
             batch.token_ids_cpu_tensor,
             torch.arange(count, dtype=torch.int64),
             context,
             self.config.eos_token_id,
-            self.config.ngram_size,
-        )
-        # Gather owns its CPU storage, so later commits/reuse cannot mutate this
-        # step's snapshot while its nonblocking transfer or later chunks run.
-        self.ngram_context = history.to(self.runner.device, non_blocking=True)
-        return self.ngram_context
+            width + 1,
+        ).to(self.runner.device, non_blocking=True)
+        if num_speculative_tokens and count:
+            previous = self.runner._pre_async_results
+            if previous is not None:
+                previous.update_token_ids(
+                    history,
+                    batch.req_id_to_index,
+                    batch.num_tokens_no_spec[:count] - context.numpy() + width,
+                )
+        self.ngram_context = history
+        if num_speculative_tokens:
+            return history, context.to(self.runner.device, non_blocking=True, copy=True)
+        return history
 
     def prepare_inputs(self, snapshot):
         runner = self.runner
@@ -107,13 +118,26 @@ class Qwen4ExpAdapter:
         rows = starts.shape[0] - 1
         context = (ctx.seq_lens - (starts[1:] - starts[:-1])).to(torch.int64)
         valid_rows = torch.arange(rows, device=runner.device) < snapshot.num_requests
-        ngram_context = snapshot.step_context
+        spec = runner.speculative_config
+        predicted_context = None
+        if spec is not None:
+            ngram_context, predicted_context = snapshot.step_context
+        else:
+            ngram_context = snapshot.step_context
         if ngram_context.shape[0]:
             row_ids = (
                 torch.arange(rows, dtype=torch.int64, device=runner.device)
                 + snapshot.row_start
             ).clamp(max=ngram_context.shape[0] - 1)
             history = ngram_context[row_ids]
+            if spec is not None:
+                assert predicted_context is not None
+                columns = (
+                    (context - predicted_context[row_ids])[:, None]
+                    + spec.num_speculative_tokens
+                    + torch.arange(self.config.ngram_size - 1, device=runner.device)
+                )
+                history = history.gather(1, columns.clamp(0, history.shape[1] - 1))
             history = torch.where(
                 valid_rows[:, None], history, self.config.eos_token_id
             )

@@ -54,6 +54,7 @@ def launch_config(monkeypatch, instance, *, offload=True, engram=None, backend=N
         model_config=model,
         engram_config=engram,
         instance_id=instance,
+        speculative_config=None,
         parallel_config=NS(data_parallel_size=8, tensor_parallel_size=1),
         scheduler_config=NS(max_num_seqs=8),
         compilation_config=NS(splitting_ops=None),

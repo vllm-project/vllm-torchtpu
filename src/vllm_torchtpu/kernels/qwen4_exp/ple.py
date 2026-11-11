@@ -104,6 +104,8 @@ def short_conv(
     has_initial_states,
     *,
     dilation: int,
+    speculative_window_size: int = 1,
+    request_distribution: jax.Array | None = None,
 ):
     """Dilated convolution with BF16 history [requests,state_len,C].
 
@@ -111,10 +113,18 @@ def short_conv(
     at zero. Active requests use identity row indices; -1 marks padding.
     History stores normalized gated values. Output is SiLU-activated BF16.
     The caller masks idle writes when storing the returned request-owned rows.
+
+    Speculative verification returns one history checkpoint per input position
+    for decode requests, with shape [requests, window, state_len, channels].
+    Prefill requests retain their final history; the caller masks idle writes.
     """
+    if speculative_window_size > 1:
+        assert request_distribution is not None
     token_count, channels = x.shape
     requests = state_indices.shape[0]
     if token_count == 0 or requests == 0:
+        if speculative_window_size > 1:
+            history = jnp.repeat(history[:, None], speculative_window_size, axis=1)
         return jnp.zeros_like(x), history
     starts = query_start_loc.astype(jnp.int32)
     slots = state_indices.astype(jnp.int32)
@@ -164,14 +174,25 @@ def short_conv(
     output = jnp.where(valid[:, None], output, 0)
 
     if state_len == 0:
+        if speculative_window_size > 1:
+            history = jnp.repeat(history[:, None], speculative_window_size, axis=1)
         return output, history
 
     lengths = starts[1:] - starts[:-1]
-    positions = lengths[:, None] - state_len + jnp.arange(state_len)[None, :]
+    ends = lengths[:, None]
+    if speculative_window_size > 1:
+        assert request_distribution is not None
+        steps = jnp.arange(speculative_window_size, dtype=jnp.int32)[None, :] + 1
+        ends = jnp.where(
+            jnp.arange(requests)[:, None] < request_distribution[0],
+            jnp.minimum(steps, ends),
+            ends,
+        )
+    positions = ends[..., None] - state_len + jnp.arange(state_len)[None, None, :]
     past = history[
-        safe_slots[:, None], jnp.clip(positions + state_len, 0, state_len - 1)
+        safe_slots[:, None, None], jnp.clip(positions + state_len, 0, state_len - 1)
     ]
-    past = jnp.where(has_initial_states[:, None, None], past, 0)
-    current = x[jnp.clip(starts[:-1, None] + positions, 0, token_count - 1)]
+    past = jnp.where(has_initial_states[:, None, None, None], past, 0)
+    current = x[jnp.clip(starts[:-1, None, None] + positions, 0, token_count - 1)]
     updated = jnp.where((positions >= 0)[..., None], current, past)
-    return output, updated
+    return output, updated if speculative_window_size > 1 else updated[:, 0]

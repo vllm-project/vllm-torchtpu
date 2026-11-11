@@ -128,11 +128,41 @@ def build_pooled_short_conv_op(dilation, state_len):
     )
 
     @op.register_fake
-    def fake(x, weight, pool, starts, ids, initial):
+    def fake(
+        x,
+        weight,
+        pool,
+        starts,
+        ids,
+        initial,
+        checkpoint_indices=None,
+        read_offsets=None,
+        request_distribution=None,
+    ):
         return torch.empty_like(pool), torch.empty_like(x)
 
-    def run(x, weight, pool, starts, ids, initial):
-        updated, output = op(x, weight, pool, starts, ids, initial)
+    def run(
+        x,
+        weight,
+        pool,
+        starts,
+        ids,
+        initial,
+        checkpoint_indices=None,
+        read_offsets=None,
+        request_distribution=None,
+    ):
+        updated, output = op(
+            x,
+            weight,
+            pool,
+            starts,
+            ids,
+            initial,
+            checkpoint_indices,
+            read_offsets,
+            request_distribution,
+        )
         pool.copy_(updated)
         return output
 

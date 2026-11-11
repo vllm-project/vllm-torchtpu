@@ -15,10 +15,12 @@
 
 from collections.abc import Callable, Iterable
 from functools import partial
+from typing import cast
 
 import torch
 from transformers import Qwen4ExpTextConfig
 from vllm.distributed import GroupCoordinator
+from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
@@ -26,6 +28,7 @@ from vllm_torchtpu.layers.adapter.custom_ops.ple_op import (
     build_host_lookup_ops,
     build_pooled_short_conv_op,
 )
+from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 
 from .parallel import PLEParallel
 from .ple import PLEInputs, Qwen4ExpPLELayer, token_requests
@@ -52,6 +55,7 @@ class Qwen4ExpPooledPLE(Qwen4ExpPLELayer):
         cpu_offload: bool = False,
         shared: SharedPLEOptions | None = None,
         native_host_dma: bool = False,
+        num_speculative_tokens: int = 0,
     ) -> None:
         if (table_group.rank_in_group, table_group.world_size) != (
             parallel.rank,
@@ -86,6 +90,7 @@ class Qwen4ExpPooledPLE(Qwen4ExpPLELayer):
         self.cache_owners: tuple[torch.Tensor, ...] = ()
         self._loaded: set[str] = set()
         self._finalized = False
+        self.num_speculative_tokens = num_speculative_tokens
         self._conv: Callable[..., torch.Tensor] | None = None
 
     @property
@@ -225,6 +230,19 @@ class Qwen4ExpPooledPLE(Qwen4ExpPLELayer):
         if state_indices.shape[0] == 0:
             return torch.zeros_like(hidden_states)
         gated = self.gated_values(hidden_states, self.storage.decode(raw))
+        state_kwargs = {}
+        if self.num_speculative_tokens > 0:
+            metadata = cast(
+                dict[str, AttentionMetadata], get_forward_context().attn_metadata
+            )[self.prefix]
+            assert metadata.mamba_ckpt_indices is not None
+            assert metadata.mamba_slot_read_offsets is not None
+            assert metadata.mamba_request_distribution is not None
+            state_kwargs = dict(
+                checkpoint_indices=metadata.mamba_ckpt_indices,
+                read_offsets=metadata.mamba_slot_read_offsets,
+                request_distribution=metadata.mamba_request_distribution,
+            )
         conv = self._conv(
             self.norm_conv(gated),
             self.conv1d.weight[:, 0],
@@ -232,6 +250,7 @@ class Qwen4ExpPooledPLE(Qwen4ExpPLELayer):
             inputs.query_start_loc,
             state_indices,
             has_initial_states,
+            **state_kwargs,
         )
         request, _ = token_requests(inputs.query_start_loc, hidden_states.shape[0])
         valid = (

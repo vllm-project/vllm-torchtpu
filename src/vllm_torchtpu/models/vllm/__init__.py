@@ -28,6 +28,7 @@ _QWEN4_EXP_MODEL = "vllm_torchtpu.models.vllm.qwen4_exp.model:Qwen4ExpForCausalL
 _QWEN4_EXP_MM_MODEL = (
     "vllm_torchtpu.models.vllm.qwen4_exp.multimodal:Qwen4ExpForConditionalGeneration"
 )
+_QWEN4_EXP_MTP_MODEL = "vllm_torchtpu.models.vllm.qwen4_exp.mtp:Qwen4ExpMTP"
 
 
 class _TPUKimiK3Config(VerifyAndUpdateConfig):
@@ -63,6 +64,7 @@ def register_models() -> None:
     ModelRegistry.register_model(
         "Qwen4ExpForConditionalGeneration", _QWEN4_EXP_MM_MODEL
     )
+    ModelRegistry.register_model("Qwen4ExpMTP", _QWEN4_EXP_MTP_MODEL)
     MODELS_CONFIG_MAP["KimiK3ForConditionalGeneration"] = _TPUKimiK3Config
     MODELS_CONFIG_MAP["Qwen4ExpForCausalLM"] = TPUQwen4ExpConfig
     MODELS_CONFIG_MAP["Qwen4ExpForConditionalGeneration"] = TPUQwen4ExpConfig

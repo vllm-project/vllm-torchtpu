@@ -77,7 +77,12 @@ def test_native_qsa_and_ple_lift_initial_dense_model_limits():
 @pytest.mark.parametrize(
     "section,field,value,message",
     [
-        (None, "speculative_config", SimpleNamespace(method="mtp"), "MTP"),
+        (
+            None,
+            "speculative_config",
+            SimpleNamespace(method="eagle3", num_speculative_tokens=2),
+            "method=mtp",
+        ),
         ("parallel_config", "pipeline_parallel_size", 2, "PP/CP1"),
         ("parallel_config", "prefill_context_parallel_size", 2, "PP/CP1"),
         ("parallel_config", "decode_context_parallel_size", 2, "PP/CP1"),
@@ -138,8 +143,9 @@ def backbone():
             "decode_cu", torch.arange(17, dtype=torch.int32), persistent=False
         )
         result.hc_count = HC
-        result.ple_host_backend = PLEHostBackend.TORCH
+        result.capture_mtp_hidden = False
         result.host_ple_index = None
+        result.ple_host_backend = PLEHostBackend.TORCH
         result.embed_tokens = nn.Embedding(VOCAB, HIDDEN)
         result.layers = nn.ModuleList()
         for kind in ("linear_attention", "indexed_attention"):

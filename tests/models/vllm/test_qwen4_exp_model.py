@@ -94,6 +94,7 @@ def test_rope_sharing_is_model_local_and_excludes_kv_state(monkeypatch, layer_ty
                 NS(
                     model_config=NS(hf_text_config=text, max_model_len=length),
                     additional_config={},
+                    speculative_config=None,
                 )
             )
             for length in (128, 256)
@@ -131,7 +132,11 @@ def test_qwen_decoder_uses_registered_gdn_layer(monkeypatch):
     from vllm_torchtpu.models.vllm.qwen4_exp import model
 
     text = q4exp_text_config(ple_layer_ids=[], layer_types=["linear_attention"])
-    cfg = NS(model_config=NS(hf_text_config=text), additional_config={})
+    cfg = NS(
+        model_config=NS(hf_text_config=text),
+        additional_config={},
+        speculative_config=None,
+    )
     attention = Mock(return_value=nn.Identity())
     monkeypatch.setattr(
         model, "get_tp_group", lambda: NS(rank_in_group=0, world_size=1)
@@ -204,7 +209,11 @@ def test_model_hc_reads_typed_debug_override(
         ple_layer_ids=[],
         layer_types=["linear_attention"],
     )
-    cfg = NS(model_config=NS(hf_text_config=text), additional_config={})
+    cfg = NS(
+        model_config=NS(hf_text_config=text),
+        additional_config={},
+        speculative_config=None,
+    )
     with torch.device("meta"):
         backbone = model.Qwen4ExpBackbone(cfg)
     x, block = route_inputs(1024)

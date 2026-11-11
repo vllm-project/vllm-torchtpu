@@ -85,13 +85,24 @@ def make_rope_cache(max_positions: int, *, rotary_dim: int, theta: float):
 QSA_BLOCK_SIZE = 128
 
 
-def get_qsa_cache_specs(config, tp_size, cache_dtype):
+def qsa_ring_capacity(compress_ratio: int, num_speculative_tokens: int) -> int:
+    """Preserve the open group while speculative suffixes overwrite the ring.
+
+    Matches vLLM QSAKeyStateCache.get_kv_cache_spec at v0.31.0.
+    """
+    return compress_ratio * (
+        (compress_ratio + num_speculative_tokens + compress_ratio - 1) // compress_ratio
+    )
+
+
+def get_qsa_cache_specs(config, tp_size, cache_dtype, ring_capacity=None):
     """Pure planner contract; model admission validates this geometry once."""
     fp8 = cache_dtype in ("fp8", "fp8_e4m3")
     head_dim = int(config.head_dim)
     index_dim = int(config.indexer_head_dim)
     ratio = int(config.indexer_compress_ratio)
-    ring_rows = (ratio + 7) // 8 * 8
+    capacity = ratio if ring_capacity is None else ring_capacity
+    ring_rows = (capacity + 7) // 8 * 8
     # 8192 B/slot covers the observed T(2,128)/T(8,128) tag layouts for
     # 2..65 slots. Retain that placement allowance and budget larger raw
     # payloads explicitly; actual TPU allocation remains independently checked.
@@ -119,7 +130,7 @@ def get_qsa_cache_specs(config, tp_size, cache_dtype):
             tokens_per_state=ratio,
         ),
         "raw_ring": CircularBufferSpec(
-            block_size=ratio,
+            block_size=capacity,
             num_kv_heads=1,
             head_size=index_dim + 8 // 2,
             head_size_v=0,
@@ -238,6 +249,7 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         prefix: str = "",
         topk_backend: TopKBackend | None = None,
         topk_backend_key: str | None = None,
+        num_speculative_tokens: int = 0,
     ):
         super().__init__()
         validate_qsa_geometry(config, tp_size=tp_size, cache_dtype=cache_dtype)
@@ -266,6 +278,9 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             self.num_kv_heads * self.head_dim,
             self.num_kv_heads * self.head_dim,
             (self.index_n_heads + 1) * self.index_head_dim,
+        )
+        self.ring_capacity = qsa_ring_capacity(
+            self.compress_ratio, num_speculative_tokens
         )
         with torch.device(device or "cpu"), set_default_torch_dtype(torch.bfloat16):
             # Keep Q independent so its MXU work can overlap asynchronous
@@ -345,7 +360,15 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         self.cache_owners = (main_pool, index_pool)
 
     def get_kv_cache_spec(self, vllm_config):
-        return get_qsa_cache_specs(self.config, self.tp_size, self.cache_dtype)[0]
+        return get_qsa_cache_specs(
+            self.config, self.tp_size, self.cache_dtype, self.ring_capacity
+        )[0]
+
+    def get_auxiliary_cache_specs(self):
+        _, auxiliary = get_qsa_cache_specs(
+            self.config, self.tp_size, self.cache_dtype, self.ring_capacity
+        )
+        return {"raw_ring": auxiliary["raw_ring"]}
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         parameters = dict(self.named_parameters())
@@ -548,6 +571,7 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             cast(torch.Tensor, per_layer[self.prefix].block_tables),
             cast(torch.Tensor, per_layer[self.prefix].request_distribution),
             k_norm_multiplier=self.k_norm_multiplier,
+            ring_capacity=self.ring_capacity,
             decode_cu=metadata.decode_cu,
             output_weight=self.output_weight_tiles if projected else None,
             residual=residual,

@@ -53,9 +53,11 @@ def test_native_groups_last_blocks_and_real_capacity(
         cache_config=cc,
         scheduler_config=NS(disable_hybrid_kv_cache_manager=False, max_num_seqs=seqs),
         speculative_config=None,
+        num_prefill_lookahead_tokens=0,
         kv_transfer_config=None,
         model_config=NS(
             max_model_len=context,
+            supports_kv_cache_grouping=False,
             dtype=torch.bfloat16,
             hf_text_config=q4exp_text_config(),
         ),
@@ -196,6 +198,7 @@ def test_gdn_planner_matches_existing_adapter(monkeypatch, tp, ssm_dtype):
     # This is the post-normalization configuration consumed by both the
     # planner and adapter. BF16 is also checked to catch a forced FP32 SSM.
     cfg = NS(
+        speculative_config=None,
         model_config=NS(
             dtype=torch.bfloat16,
             architecture="Qwen4ExpForCausalLM",

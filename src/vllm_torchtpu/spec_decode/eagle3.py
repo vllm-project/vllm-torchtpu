@@ -218,6 +218,7 @@ class Eagle3Proposer:
         speculative_config = vllm_config.speculative_config
         assert speculative_config is not None
         self.speculative_config = speculative_config
+        self._mtp_hc_mult = 1
         draft_tp = self.speculative_config.draft_tensor_parallel_size
         target_tp = self.vllm_config.parallel_config.tensor_parallel_size
         # Default to (draft_tp == target tp) when unset. vLLM's
@@ -319,6 +320,24 @@ class Eagle3Proposer:
         if self.runner._mtp_prefill_only:
             self._validate_prefill_only_draft_model(draft_attn_layer_names)
         self._validate_dsa_draft(all_attn_layers, draft_attn_layer_names)
+
+        from vllm_torchtpu.spec_decode.utils import (
+            AuxiliaryKVCacheProvider,
+            MTPHiddenStateProvider,
+        )
+
+        for name in tuple(draft_attn_layer_names):
+            layer = all_attn_layers[name]
+            if isinstance(layer, AuxiliaryKVCacheProvider):
+                draft_attn_layer_names.update(
+                    name + "." + role for role in layer.get_auxiliary_cache_specs()
+                )
+        if self.speculative_config.method == "mtp" and isinstance(
+            target_model, MTPHiddenStateProvider
+        ):
+            self._mtp_hc_mult = (
+                self.speculative_config.draft_model_config.hf_config.hc_mult
+            )
 
         assert self.draft_model is not None
         maybe_share_embeddings(
@@ -2189,6 +2208,9 @@ class Eagle3Proposer:
             )
         return hidden_size
 
+    def _draft_input_hidden_size(self) -> int:
+        return self._draft_hidden_size() * self._mtp_hc_mult
+
     def _draft_uses_aux_hidden_state(self) -> bool:
         """Whether this draft checkpoint feeds combine_hidden_states the
         concatenation of several target aux hidden-state layers.
@@ -2208,7 +2230,7 @@ class Eagle3Proposer:
         if self._draft_uses_aux_hidden_state():
             assert self.draft_model is not None
             return self.draft_model.model.fc_input_size
-        return self._draft_hidden_size()
+        return self._draft_input_hidden_size()
 
     def _draft_has_moe(self) -> bool:
         """Whether the draft model carries MoE layers.
@@ -2387,7 +2409,7 @@ class Eagle3Proposer:
             else token_positions
         )
         target_hidden_states = torch.zeros(
-            (bucket, self._draft_hidden_size()),
+            (bucket, self._draft_input_hidden_size()),
             dtype=runner._hidden_states_dtype,
             device=runner.device,
         )
@@ -2465,7 +2487,7 @@ class Eagle3Proposer:
                 device=runner.device,
             ),
             loop_hidden=torch.zeros(
-                (p, draft_hidden), dtype=dtype, device=runner.device
+                (p, self._draft_input_hidden_size()), dtype=dtype, device=runner.device
             ),
             # Loop-step metadata mirrors propose()'s per-chunk loop tensors.
             loop_query_start_loc=torch.from_numpy(

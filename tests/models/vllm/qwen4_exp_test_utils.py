@@ -114,6 +114,14 @@ _TEXT_CONFIG = {
         "indexed_attention",
     ],
     "attention_bias": False,
+    "mtp_num_hidden_layers": 1,
+    "mtp": {
+        "num_hidden_layers": 1,
+        "layer_types": ["full_attention"],
+        "mtp_use_hidden_state_from_layer": None,
+        "rope_theta": 10000000,
+    },
+    "mtp_use_dedicated_embeddings": False,
 }
 
 
@@ -133,6 +141,7 @@ def qsa_test_pools(model, pages, *, block_size=128):
     from vllm_torchtpu.models.vllm.qwen4_exp.pool_layout import pooled_cache_specs
 
     cfg = SimpleNamespace(
+        speculative_config=None,
         model_config=SimpleNamespace(
             hf_text_config=model.config, dtype=torch.bfloat16, max_model_len=8192
         ),

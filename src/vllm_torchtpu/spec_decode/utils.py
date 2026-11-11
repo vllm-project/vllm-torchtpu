@@ -13,7 +13,7 @@
 # limitations under the License.
 import contextlib
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
 import numpy as np
 import torch
@@ -38,6 +38,7 @@ logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from vllm.model_executor.models.interfaces import SupportsMultiModal
+    from vllm.v1.kv_cache_interface import KVCacheSpec
 
     from vllm_torchtpu.layers.core.attention_metadata import (
         AttentionMetadataBuilderContext,
@@ -48,6 +49,16 @@ _DEFAULT_DRAFT_SEQUENCE_LAYOUT_PLAN = AllSequenceLayoutPlanner().prepare_dummy(
     num_reqs=0,
     kv_cache_initialized=False,
 )
+
+
+@runtime_checkable
+class AuxiliaryKVCacheProvider(Protocol):
+    def get_auxiliary_cache_specs(self) -> dict[str, "KVCacheSpec"]: ...
+
+
+@runtime_checkable
+class MTPHiddenStateProvider(Protocol):
+    def get_mtp_target_hidden_states(self) -> torch.Tensor: ...
 
 
 def fit_rows(t: torch.Tensor, rows: int, value: int = 0) -> torch.Tensor:

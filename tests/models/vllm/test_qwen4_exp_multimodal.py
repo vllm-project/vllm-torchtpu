@@ -15,6 +15,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 from torch import nn
 from vllm.model_executor.models import ModelRegistry
@@ -27,6 +28,7 @@ from vllm_torchtpu.models.vllm.qwen4_exp.multimodal import (
 )
 from vllm_torchtpu.models.vllm.qwen4_exp.pooled_cache import Qwen4ExpPooledCache
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+from vllm_torchtpu.spec_decode.utils import MTPHiddenStateProvider
 
 
 class NativeText(nn.Module):
@@ -95,6 +97,32 @@ def test_forward_preserves_native_embeddings_and_intermediate_contract(monkeypat
     assert seen[-1][0] is ids and seen[-1][1] is positions
     assert seen[-1][2] is embeds
     assert seen[-1][3] == {"intermediate_tensors": intermediate}
+
+
+def test_conditional_preserves_mtp_hidden_state_contract_across_forwards():
+    class Backbone(nn.Module):
+        capture_mtp_hidden = True
+
+        def forward(self, ids, positions, inputs_embeds=None, **kwargs):
+            return inputs_embeds, inputs_embeds.repeat(1, 4)
+
+    target = Qwen4ExpForCausalLM.__new__(Qwen4ExpForCausalLM)
+    nn.Module.__init__(target)
+    target.model = Backbone()
+    target._mtp_target_hidden_states = None
+    model = wrapper()
+    model.language_model = target
+    assert isinstance(model, MTPHiddenStateProvider)
+    with pytest.raises(AssertionError):
+        model.get_mtp_target_hidden_states()
+
+    ids, positions = torch.arange(3), torch.arange(3).expand(3, -1)
+    for value in (1.0, 2.0):
+        embeds = torch.full((3, 8), value)
+        assert model(ids, positions, inputs_embeds=embeds) is embeds
+        carry = model.get_mtp_target_hidden_states()
+        assert carry is target.get_mtp_target_hidden_states()
+        torch.testing.assert_close(carry, embeds.repeat(1, 4), rtol=0, atol=0)
 
 
 def test_runner_retains_raw_ids_while_merging_visual_embeddings():

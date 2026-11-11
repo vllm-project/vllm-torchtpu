@@ -23,8 +23,8 @@ from transformers import PretrainedConfig
 from vllm.config import CompilationConfig, VllmConfig
 from vllm.model_executor.models import ModelRegistry
 from vllm.v1.core.kv_cache_planning import (
+    get_global_kv_cache_groups,
     get_kv_cache_config_from_groups,
-    get_kv_cache_groups,
 )
 from vllm.v1.core.kv_cache_utils import (
     resolve_cache_hit_alignment_tokens,
@@ -70,6 +70,7 @@ def configuration(prefix, dtype, tp, requested, dim):
         ),
         architecture="Qwen4ExpForCausalLM",
         is_hybrid=True,
+        supports_kv_cache_grouping=cfg.model_config.supports_kv_cache_grouping,
         dtype=torch.bfloat16,
         max_model_len=512,
         hf_text_config=q4exp_text_config(
@@ -121,6 +122,7 @@ def worker_and_adapter(cfg, events):
     )
     owners = []
     model = NS(
+        config=cfg.model_config.hf_text_config,
         model=NS(
             layers=[
                 NS(
@@ -134,16 +136,30 @@ def worker_and_adapter(cfg, events):
                     ple=None,
                 ),
             ]
-        )
+        ),
     )
     model.get_language_model = lambda: model
     events.append("load")
-    adapter.bind_model(model)
+    draft = None
+    if cfg.speculative_config is not None:
+        draft = NS(
+            model=NS(
+                layers=[
+                    NS(
+                        layer_type="indexed_attention",
+                        self_attn=NS(bind_pool=lambda *pools: owners.extend(pools)),
+                        ple=None,
+                    )
+                ]
+            )
+        )
+    adapter.bind_model(model, draft)
     worker = TPUWorker.__new__(TPUWorker)
     worker.vllm_config, worker.model_runner = cfg, runner
     return worker, adapter, owners
 
 
+@pytest.mark.parametrize("k", [0, 3])
 @pytest.mark.parametrize(
     "prefix,dtype,tp,requested,dim",
     [
@@ -154,7 +170,7 @@ def worker_and_adapter(cfg, events):
     ],
 )
 def test_load_negotiate_specs_profile_scheduler_with_independent_configs(
-    monkeypatch, prefix, dtype, tp, requested, dim
+    monkeypatch, prefix, dtype, tp, requested, dim, k
 ):
     monkeypatch.setenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", "1")
     monkeypatch.setattr(
@@ -168,6 +184,14 @@ def test_load_negotiate_specs_profile_scheduler_with_independent_configs(
     monkeypatch.setattr(pooled_cache, "get_tp_group", lambda: NS(cpu_group="tp"))
     monkeypatch.setattr(torch.distributed, "all_reduce", lambda *_args, **_kwargs: None)
     driver = configuration(prefix, dtype, tp, requested, dim)
+    if k:
+        driver.speculative_config = NS(
+            method="mtp",
+            num_speculative_tokens=k,
+            use_eagle=lambda: True,
+            use_eagle_block_drop=lambda: True,
+        )
+        driver.num_prefill_lookahead_tokens = 1
     events, workers, adapters, owner_lists = [], [], [], []
     actual_specs = pooled_cache.pooled_cache_specs
 
@@ -236,7 +260,7 @@ def test_load_negotiate_specs_profile_scheduler_with_independent_configs(
         )
         events.append("profile")
         cache.allocate()
-        assert len(owners) == 3 and owners[-1] is not owners[-2]
+        assert len(owners) == (5 if k else 3) and owners[-1] is not owners[-2]
         assert cache.materialized is not None
         raw_bytes = []
         for index, value in enumerate(cache.materialized.raw_tensors):
@@ -245,7 +269,11 @@ def test_load_negotiate_specs_profile_scheduler_with_independent_configs(
             value.view(torch.uint8).fill_(0x81 + index)
             raw_bytes.append(value.view(torch.uint8).clone())
         events.append("scheduler")
-        groups = get_kv_cache_groups(driver, per_worker.copy())
+        groups = get_global_kv_cache_groups(driver, [per_worker.copy()])
+        for group in groups:
+            assert group.is_eagle_group == any(
+                per_worker[name].is_draft for name in group.layer_names
+            )
         plan = get_kv_cache_config_from_groups(
             driver,
             groups,

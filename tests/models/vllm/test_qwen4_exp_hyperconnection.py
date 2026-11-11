@@ -789,12 +789,14 @@ class _StandInBlock(nn.Module):
 
 
 @TPU
-def test_hc_decode_prefill_subgraph_parameter_order():
+@pytest.mark.parametrize("full_tile", [128, 0])
+def test_hc_decode_prefill_subgraph_parameter_order(full_tile):
     """Bucket handover requires the split graph's ordered inputs to agree."""
     from torch.fx.passes.split_module import split_module
 
+    sizes = (16, 128) if full_tile else (16, 128, 8192)
     with torch.device("cpu"):
-        hc, x, _ = owner_fixture(tokens=128)
+        hc, x, _ = owner_fixture(tokens=max(sizes), full_tile=full_tile)
         block = _StandInBlock(137, hc.hidden_size)
     hc, block = hc.to("tpu"), block.to("tpu")
     signatures = []
@@ -811,15 +813,15 @@ def test_hc_decode_prefill_subgraph_parameter_order():
         mixed, state = hc.mix_packed(hyper_input)
         return hc.combine(block(mixed), state)
 
-    run = torch.compile(entry, backend=backend, fullgraph=True, dynamic=False)
+    run = torch.compile(entry, backend=backend, fullgraph=True, dynamic=not full_tile)
     with torch.inference_mode():
-        for tokens in (16, 128):
+        for tokens in sizes:
             value = x[:tokens].to("tpu")
             actual = run(value)
             expected = entry(value)
             np.testing.assert_array_equal(_words(actual), _words(expected))
-    assert len(signatures) == 2
-    assert signatures[0] == signatures[1]
+    assert len(signatures) == (2 if full_tile else 1)
+    assert all(signature == signatures[0] for signature in signatures)
 
 
 @pytest.mark.parametrize("state_kind", ["tuple", "packed", "broadcast"])

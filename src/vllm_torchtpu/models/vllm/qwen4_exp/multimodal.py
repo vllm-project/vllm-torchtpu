@@ -114,6 +114,9 @@ class Qwen4ExpForConditionalGeneration(Qwen3_5ForConditionalGeneration, HasInner
     def get_language_model(self) -> Qwen4ExpForCausalLM:
         return self.language_model
 
+    def get_mtp_target_hidden_states(self) -> torch.Tensor:
+        return self.get_language_model().get_mtp_target_hidden_states()
+
     def forward(
         self,
         input_ids: torch.Tensor,

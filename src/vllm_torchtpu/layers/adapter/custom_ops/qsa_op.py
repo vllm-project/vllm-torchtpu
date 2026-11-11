@@ -125,6 +125,7 @@ def _build_compact_pooled_qsa_op(
         k_norm_multiplier=None,
         decode_cu=None,
         scheduling_group_namespace=0,
+        ring_capacity: int | None = None,
     ):
         return (
             torch.empty_like(pool),
@@ -171,6 +172,7 @@ def _build_compact_pooled_qsa_op(
         k_norm_multiplier: torch.Tensor | None = None,
         decode_cu: torch.Tensor | None = None,
         scheduling_group_namespace: int = 0,
+        ring_capacity: int | None = None,
     ):
         # The native QSA kernels consume positions and request/page metadata as int32.
         positions = positions.to(torch.int32)
@@ -214,6 +216,7 @@ def _build_compact_pooled_qsa_op(
             k_norm_multiplier,
             decode_cu,
             scheduling_group_namespace,
+            ring_capacity,
         )
         pool.copy_(updated)
         index_pool.copy_(index_updated)

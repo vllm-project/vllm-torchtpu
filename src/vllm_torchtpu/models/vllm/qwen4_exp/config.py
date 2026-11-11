@@ -15,6 +15,7 @@
 
 import math
 from collections.abc import Mapping
+from dataclasses import replace
 from enum import StrEnum
 
 import torch
@@ -97,6 +98,11 @@ def gdn_cache_spec(cfg):
             ssm_dtype,
         ),
         mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
+        num_speculative_blocks=(
+            cfg.speculative_config.num_speculative_tokens
+            if cfg.speculative_config is not None
+            else 0
+        ),
     )
 
 
@@ -106,11 +112,21 @@ def native_cache_specs(cfg) -> dict[str, KVCacheSpec]:
     from vllm.v1.kv_cache_interface import MambaSpec
 
     from .ple_geometry import ple_state_shape
-    from .qsa import get_qsa_cache_specs
+    from .qsa import get_qsa_cache_specs, qsa_ring_capacity
 
     t = cfg.model_config.hf_text_config
+    num_speculative_tokens = (
+        cfg.speculative_config.num_speculative_tokens
+        if cfg.speculative_config is not None
+        else 0
+    )
     main, auxiliary = get_qsa_cache_specs(
-        t, cfg.parallel_config.tensor_parallel_size, cfg.cache_config.cache_dtype
+        t,
+        cfg.parallel_config.tensor_parallel_size,
+        cfg.cache_config.cache_dtype,
+        ring_capacity=qsa_ring_capacity(
+            t.indexer_compress_ratio, num_speculative_tokens
+        ),
     )
     specs: dict[str, KVCacheSpec] = {}
     for index, layer_type in enumerate(t.layer_types):
@@ -132,7 +148,14 @@ def native_cache_specs(cfg) -> dict[str, KVCacheSpec]:
                 dtypes=(torch.bfloat16,),
                 tp_replicated=True,
                 mamba_type=MambaAttentionBackendEnum.SHORT_CONV,
+                num_speculative_blocks=num_speculative_tokens,
             )
+    if num_speculative_tokens:
+        prefix = f"mtp.layers.{t.num_hidden_layers}.self_attn"
+        specs.update({prefix + "." + role: spec for role, spec in auxiliary.items()})
+        # Only cacheable draft attention takes the speculative block drop;
+        # recurrent raw-ring state keeps its committed checkpoint.
+        specs[prefix] = replace(main, is_draft=True)
     return specs
 
 
@@ -209,6 +232,8 @@ class TPUQwen4ExpConfig(VerifyAndUpdateConfig):
 
 
 def validate_config(cfg):
+    if cfg.kv_transfer_config is not None and cfg.speculative_config is not None:
+        raise ValueError("Qwen4Exp PD requires no MTP")
     m, p, c, s = (
         cfg.model_config,
         cfg.parallel_config,
@@ -384,13 +409,35 @@ def validate_config(cfg):
         raise ValueError("Qwen4Exp context capacity must be positive")
     if (
         s.disable_hybrid_kv_cache_manager
-        or cfg.speculative_config is not None
         or cfg.lora_config is not None
         or c.kv_cache_memory_bytes is not None
     ):
-        raise ValueError(
-            "Qwen4Exp TPU requires profiled hybrid caches, and no MTP/LoRA"
-        )
+        raise ValueError("Qwen4Exp TPU requires profiled hybrid caches, and no LoRA")
+    if cfg.speculative_config is not None:
+        if cfg.speculative_config.method != "mtp" or envs.VLLM_TPU_FUSED_DRAFT_LOOP:
+            raise ValueError(
+                "Qwen4Exp MTP requires method=mtp, unified pool, fused draft loop off"
+            )
+        if cfg.speculative_config.draft_tensor_parallel_size not in (
+            None,
+            p.tensor_parallel_size,
+        ):
+            raise ValueError(
+                "Qwen4Exp MTP requires draft_tensor_parallel_size to match the "
+                "target tensor_parallel_size; independent draft TP is unsupported"
+            )
+        if (
+            t.mtp_num_hidden_layers != 1
+            or t.mtp["layer_types"] != ["full_attention"]
+            or t.mtp["mtp_use_hidden_state_from_layer"] is not None
+            or t.mtp_use_dedicated_embeddings
+        ):
+            raise ValueError(
+                "Qwen4Exp MTP requires one full-attention MTP layer, "
+                "final target hidden and shared embeddings"
+            )
+        if not 0 < t.mtp["rope_theta"] < math.inf:
+            raise ValueError("Qwen4Exp MTP requires a finite positive draft RoPE theta")
     transfer = cfg.kv_transfer_config
     if transfer is not None:
         connector_module = "vllm_torchtpu.models.vllm.qwen4_exp.pd_connector"
