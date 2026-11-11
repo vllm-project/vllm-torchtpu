@@ -1072,3 +1072,40 @@ def patch_expert_placement_routers() -> None:
         typing.Any, process_weights_after_loading
     )._tpu_renumbers_expert_routers = True
     base_loader.process_weights_after_loading = process_weights_after_loading
+
+
+def patch_attn_out_projection_tags() -> None:
+    """Tag attention `o_proj` layers with their head layout after loading.
+
+    The FP8 linear method uses the tag to quantize the attention output in
+    the head-major layout the attention kernel writes, instead of after the
+    relayout to `[tokens, heads * head_dim]` (see `kernels/attn_out_fp8.py`).
+    Every model a loader builds passes through here, so no model needs code
+    of its own.
+    """
+    from vllm.model_executor.model_loader import base_loader
+
+    orig_process = base_loader.process_weights_after_loading
+    if getattr(orig_process, "_tpu_tags_attn_out_projections", False):
+        return
+
+    @functools.wraps(orig_process)
+    def process_weights_after_loading(model, model_config, target_device):
+        from vllm_torchtpu.layers.adapter.linear_common import (
+            tag_attn_out_projections,
+        )
+
+        result = orig_process(model, model_config, target_device)
+        tagged = tag_attn_out_projections(model)
+        if tagged:
+            logger.info(
+                "Tagged %d attention o_proj layers for the fused "
+                "attention-output FP8 quantization.",
+                tagged,
+            )
+        return result
+
+    typing.cast(
+        typing.Any, process_weights_after_loading
+    )._tpu_tags_attn_out_projections = True
+    base_loader.process_weights_after_loading = process_weights_after_loading
