@@ -1,0 +1,79 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Diff-aware PR test selection: which PR TPU steps a change needs.
+#
+# bootstrap.py maps every file a PR (or main merge-queue entry) changes to the
+# steps below it needs, and takes the union over the files. A file no rule
+# matches needs every step, so anything unlisted runs the full build. Steps
+# not listed under `selectable_steps` always run. The mode comes from the
+# CI_DIFF_AWARE_MODE pipeline variable (off | shadow | phase1 | phase2;
+# unset means shadow): shadow only records what would be skipped.
+#
+# This file is read by .buildkite/scripts/select_pr_tests.py, which parses it
+# without PyYAML: keep to plain mappings and lists of strings.
+# tests/scripts/test_select_pr_tests.py checks it against the pipeline files.
+
+# The PR TPU steps the selector may mark `skip:`, by lane.
+selectable_steps:
+  tests:
+    - unit_tests_general_pr
+    - unit_tests_multichip_pr
+    - unit_tests_spec_decode_pr
+    - unit_tests_spec_decode_multichip_pr
+    - unit_tests_omni_pr
+  integration:
+    - integration_qwen35_pcp4_dp4_disagg_correctness
+    - integration_qwen35_pcp4_2tp2dp_disagg_correctness
+    - integration_qwen35_pcp4tp1_tp4dcp2_disagg_correctness
+    - presubmit_disagg_single_host
+    - integration_qwen35_apc_correctness
+    - integration_qwen35_gpc_global_dram_pool
+    - integration_compilation_cache_e2e
+    - integration_k3_pruned75_apc_offload_correctness
+    - vllm_torchtpu_multihost_presubmit
+    - integration_qwen35_pcp8_2tp4dp_disagg_correctness
+    - integration_qwen35_gpc_correctness
+
+# Files no PR TPU step reads: they need only the CPU checks, which always run.
+# An entry ending in `/` matches everything under it.
+cpu_only:
+  - mkdocs.yml
+  - .github/
+  - .buildkite/release/
+  - .buildkite/pipeline_coverage.yml
+  - .buildkite/pipeline_dev.yml
+  - .buildkite/pipeline_nightly_image.yml
+
+# Integration scripts run by exactly these steps. The scripts and manifests
+# they call are not listed, so a change to those runs the full build.
+integration_scripts:
+  scripts/vllm/integration/run_qwen35_p4d2_disagg_correctness.sh:
+    - integration_qwen35_pcp4_dp4_disagg_correctness
+  scripts/vllm/integration/run_qwen35_pcp4_2tp2dp_disagg_correctness.sh:
+    - integration_qwen35_pcp4_2tp2dp_disagg_correctness
+  scripts/vllm/integration/run_qwen35_pcp_tp_dcp_disagg_correctness.sh:
+    - integration_qwen35_pcp4tp1_tp4dcp2_disagg_correctness
+  scripts/vllm/integration/run_qwen35_apc_correctness.sh:
+    - integration_qwen35_apc_correctness
+  scripts/vllm/integration/run_qwen35_gpc_global_dram_pool.sh:
+    - integration_qwen35_gpc_global_dram_pool
+  scripts/vllm/integration/run_compilation_cache_e2e.sh:
+    - integration_compilation_cache_e2e
+  scripts/vllm/integration/run_k3_pruned75_apc_offload_correctness.sh:
+    - integration_k3_pruned75_apc_offload_correctness
+
+# Per-folder rules, each owned by that folder's code owners and the CI owners.
+# Listing a file here is what makes it active.
+component_configs: []

@@ -38,6 +38,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 
 import cap_pr_tpu_concurrency
+import select_pr_tests
 
 _SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 _REPO_ROOT = _SCRIPT_DIR.parents[1]
@@ -56,6 +57,9 @@ _MQ_EXTRAS_ATTEMPTS = 3
 _MQ_EXTRAS_RETRY_SECONDS = 10
 # History depths tried, in order, until a PR's merge-base with its base is found.
 _PR_FETCH_DEPTHS = (20, 200, 1000)
+# Step key -> skip reason (JSON) that diff-aware selection hands from
+# `run_bootstrap` to the uploads of every stage.
+_DIFF_AWARE_SKIP_ENV = "CI_DIFF_AWARE_SKIP"
 _LABEL_EXTRAS = {"run-perf-eval": "perf-eval", "run-full-ci": "nightly-suite"}
 _PR_SUITE_LABELS = ("skip-tpu-ci", *_LABEL_EXTRAS)
 _VALID_CI_EXTRAS = frozenset(_LABEL_EXTRAS.values())
@@ -552,7 +556,9 @@ def _git(
 
 def _diff_names(*diff_specs: Sequence[str], env: Mapping[str, str]) -> list[str]:
     for args in diff_specs:
-        diff = _git("diff", "--name-only", *args, env=env)
+        # --no-renames lists a moved file's old path too, so moving a file out
+        # of shared code still counts as a change to shared code.
+        diff = _git("diff", "--name-only", "--no-renames", *args, env=env)
         if diff.returncode == 0 and (
             files := [line for line in diff.stdout.splitlines() if line]
         ):
@@ -784,6 +790,26 @@ def _merge_queue_pr_extras(
     return latest_extras, latest_actor, None
 
 
+def _diff_aware_skips(env: Mapping[str, str]) -> dict[str, str]:
+    """Step key -> skip reason that `run_bootstrap` chose, from the environment."""
+    raw = env.get(_DIFF_AWARE_SKIP_ENV, "")
+    if not raw:
+        return {}
+    try:
+        skips = json.loads(raw)
+    except ValueError:
+        skips = None
+    if not isinstance(skips, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in skips.items()
+    ):
+        print(
+            f"WARNING: ignoring malformed {_DIFF_AWARE_SKIP_ENV}; skipping nothing",
+            file=sys.stderr,
+        )
+        return {}
+    return skips
+
+
 def upload_with_priority(
     yaml_file: str,
     *,
@@ -794,16 +820,20 @@ def upload_with_priority(
     pr_tpu_jobs_per_author: int = PR_TPU_JOBS_PER_AUTHOR,
     env: Mapping[str, str],
 ) -> None:
-    """Upload one pipeline YAML file with priority and optional PR TPU capping."""
+    """Upload one pipeline YAML file with priority, diff-aware skips, and
+    optional PR TPU capping."""
     print(f"--- :pipeline: Uploading {yaml_file} with priority {job_priority}")
     raw_yaml = (repo_root / yaml_file).read_text(encoding="utf-8")
     payload = prepare_upload_yaml(raw_yaml, job_priority=job_priority, nightly=nightly)
+    skips = {} if nightly else _diff_aware_skips(env)
 
-    # A pull-request build's TPU steps go in its author's concurrency group. The
-    # file is read once by the agent via --dry-run (anchors and interpolation
-    # resolved), the group is added, and the result is uploaded as is. If any of
-    # that fails the file goes up uncapped rather than failing the build.
-    if pr_tpu_concurrency_group:
+    # A pull-request build's TPU steps go in its author's concurrency group, and
+    # steps diff-aware selection does not need are marked `skip:`. The file is
+    # read once by the agent via --dry-run (anchors and interpolation
+    # resolved), the steps are changed, and the result is uploaded as is. If
+    # any of that fails the file goes up unchanged rather than failing the
+    # build.
+    if pr_tpu_concurrency_group or skips:
         dry_run = _agent(
             "pipeline",
             "upload",
@@ -822,15 +852,18 @@ def upload_with_priority(
                         "expected JSON object from --dry-run, "
                         f"got {type(pipeline).__name__}"
                     )
-                cap_pr_tpu_concurrency.cap(
-                    pipeline.get("steps") or [],
-                    pr_tpu_concurrency_group,
-                    pr_tpu_jobs_per_author,
-                )
-                capped = json.dumps(pipeline) + "\n"
+                steps = pipeline.get("steps") or []
+                if skips:
+                    marked = select_pr_tests.mark_skipped(steps, skips)
+                    print(f"Diff-aware selection skipped {marked} step(s)")
+                if pr_tpu_concurrency_group:
+                    cap_pr_tpu_concurrency.cap(
+                        steps, pr_tpu_concurrency_group, pr_tpu_jobs_per_author
+                    )
+                adjusted = json.dumps(pipeline) + "\n"
             except Exception as exc:
                 print(
-                    f"WARNING: failed to cap TPU concurrency for {yaml_file}: {exc}",
+                    f"WARNING: failed to adjust the steps of {yaml_file}: {exc}",
                     file=sys.stderr,
                 )
             else:
@@ -838,13 +871,16 @@ def upload_with_priority(
                     "pipeline",
                     "upload",
                     "--no-interpolation",
-                    input_text=capped,
+                    input_text=adjusted,
                     env=env,
                 )
                 return
         print(
             f"WARNING: could not put {yaml_file} in {pr_tpu_concurrency_group}; "
-            "uploading it uncapped",
+            "uploading it uncapped"
+            if not skips
+            else f"WARNING: could not apply diff-aware skips to {yaml_file}; "
+            "uploading it unchanged",
             file=sys.stderr,
         )
 
@@ -909,6 +945,7 @@ def upload_stages(
                 "JOB_PRIORITY",
                 "NIGHTLY",
                 "PR_TPU_CONCURRENCY_GROUP",
+                _DIFF_AWARE_SKIP_ENV,
             )
             if child_env.get(k)
         }
@@ -967,6 +1004,64 @@ def upload_stages(
 # ---------------------------------------------------------------------------
 # Entry points
 # ---------------------------------------------------------------------------
+
+
+def _diff_aware_selection(
+    ctx: BuildContext,
+    suite: Suite,
+    changed_files: Sequence[str],
+    *,
+    env: Mapping[str, str],
+    repo_root: pathlib.Path,
+) -> select_pr_tests.Selection | None:
+    """Run diff-aware test selection for a plain PR or main merge-queue build.
+
+    Records the result (meta-data `diff-aware`, plus an annotation when
+    anything would be skipped) and returns it; returns None when the build is
+    not eligible, the mode is off, or selection fails (every step then runs).
+    """
+    if suite is not _PR_SUITES["pr"] or not changed_files:
+        return None
+    if not (ctx.is_pr or ctx.is_merge_queue):
+        return None
+    raw_mode = env.get("CI_DIFF_AWARE_MODE", "")
+    mode = select_pr_tests.parse_mode(raw_mode)
+    if mode == "off":
+        return None
+    print("--- :mag: Diff-aware test selection")
+    if raw_mode.strip() and raw_mode.strip().lower() != mode:
+        print(f"CI_DIFF_AWARE_MODE={raw_mode!r} is not a mode; using {mode}")
+    try:
+        config = select_pr_tests.load_config(repo_root)
+        selection = select_pr_tests.select(
+            changed_files, config, mode=mode, repo_root=repo_root
+        )
+    except Exception as exc:  # never fail or narrow a build on a selector bug
+        note = f"Diff-aware test selection failed; running every step: {exc}"
+        print(f"WARNING: {note}", file=sys.stderr)
+        _agent(
+            "annotate", "--style", "warning", "--context", "diff-aware", note, env=env
+        )
+        return None
+    print(selection.summary())
+    _agent(
+        "meta-data",
+        "set",
+        "diff-aware",
+        json.dumps(selection.record(), sort_keys=True),
+        env=env,
+    )
+    if selection.would_skip:
+        _agent(
+            "annotate",
+            "--style",
+            "info",
+            "--context",
+            "diff-aware",
+            selection.summary(),
+            env=env,
+        )
+    return selection
 
 
 def run_bootstrap(
@@ -1130,7 +1225,14 @@ def run_bootstrap(
         env=child_env,
     )
 
-    # 5. Env exports (NIGHTLY, OMNI_IMAGE_SKIP, PR_TPU_CONCURRENCY_GROUP).
+    # 5. Diff-aware test selection, then env exports (NIGHTLY, OMNI_IMAGE_SKIP,
+    # CI_DIFF_AWARE_SKIP, PR_TPU_CONCURRENCY_GROUP).
+    selection = _diff_aware_selection(
+        ctx, suite, changed_files, env=child_env, repo_root=repo_root
+    )
+    child_env.pop(_DIFF_AWARE_SKIP_ENV, None)  # only this build's selection counts
+    if selection is not None and (skips := selection.skip_reasons()):
+        child_env[_DIFF_AWARE_SKIP_ENV] = json.dumps(skips, sort_keys=True)
     if nightly:
         child_env["NIGHTLY"] = "1"
     # pipeline_build.yml skips the -omni image build when this is non-empty.
@@ -1141,6 +1243,8 @@ def run_bootstrap(
         if has_tests
         else "Only the tests lane uses the -omni image; this build has none."
     )
+    if selection is not None and not child_env["OMNI_IMAGE_SKIP"]:
+        child_env["OMNI_IMAGE_SKIP"] = selection.omni_image_skip
     # Key the concurrency group on the commit author's email: every webhook
     # build carries it, whereas BUILDKITE_BUILD_CREATOR_EMAIL is missing when
     # the GitHub account is not linked to a Buildkite user.
