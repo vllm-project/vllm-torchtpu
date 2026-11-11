@@ -218,7 +218,8 @@ def check_fallback(case, setenv, extra):
     for r in range(D):
         u = run_rank(case, r, setenv, True, extra)
         s = run_rank(case, r, setenv, False, extra)
-        assert np.array_equal(u[0], s[0]) and np.array_equal(u[1], s[1]), f"rank {r} fallback differs"
+        assert np.array_equal(u[0], s[0]) and np.array_equal(u[1], s[1]), (
+            f"rank {r} fallback differs: out {diff_report(u[0], s[0])} lse {diff_report(u[1], s[1])}")
         reports[f"fallback_bitwise{r}"] = True
     return reports
 
