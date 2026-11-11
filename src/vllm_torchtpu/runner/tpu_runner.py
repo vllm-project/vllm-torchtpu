@@ -1208,6 +1208,9 @@ class TPUModelRunner(GPUModelRunner):
         # Dedicated RNG for non-greedy sampling, to keep the draws consistent
         # across a replica's TP ranks (else they diverge -> collective hang).
         self._sampling_generator: torch.Generator | None = None
+        # Device counter of the fused verify's in-graph uniforms
+        # (TPU_SPEC_SYNTHETIC_INGRAPH_RNG); seeded like the generator.
+        self._synthetic_rng_counter: torch.Tensor | None = None
         self._spec_glue_logged: set[str] = set()
         # JAX Mesh for shard_map ops in TPU kernels. Real DP is vLLM
         # multi-engine DP, so this per-worker mesh only has a model axis.
@@ -4603,6 +4606,20 @@ class TPUModelRunner(GPUModelRunner):
             self._sampling_generator = gen
         return self._sampling_generator
 
+    def _get_synthetic_rng_counter(self) -> torch.Tensor:
+        """The device int32 counter of the fused verify's in-graph uniforms,
+        created on first use from ``model_config.seed`` (the same value on
+        every worker, so a replica's TP ranks draw alike)."""
+        if self._synthetic_rng_counter is None:
+            from vllm_torchtpu.layers.adapter.sample.counter_uniform import (
+                initial_counter,
+            )
+
+            self._synthetic_rng_counter = torch.tensor(
+                initial_counter(int(self.model_config.seed or 0)), dtype=torch.int32
+            ).to(self.device)
+        return self._synthetic_rng_counter
+
     def _log_spec_glue_once(self, flag: str) -> None:
         if flag not in self._spec_glue_logged:
             self._spec_glue_logged.add(flag)
@@ -5041,6 +5058,33 @@ class TPUModelRunner(GPUModelRunner):
         topk_candidates = self._sampler_topk_candidates(
             cur_start_idx, cur_end_idx, None
         )
+        if (
+            envs.TPU_SPEC_SYNTHETIC_INGRAPH_RNG
+            and self.rejection_sampler.synthetic_mode
+        ):
+            self._log_spec_glue_once("TPU_SPEC_SYNTHETIC_INGRAPH_RNG")
+            out, self._synthetic_rng_counter = (
+                fused_spec_verify.spec_verify_sample_fused_rng(
+                    logits,
+                    md.bonus_logits_indices,
+                    md.target_logits_indices,
+                    md.draft_token_ids,
+                    md.draft_lengths,
+                    md.segment_ids,
+                    md.group_indices,
+                    req_temperatures,
+                    req_top_k,
+                    req_top_p,
+                    self._get_synthetic_rng_counter(),
+                    self.rejection_sampler.synthetic_conditional_rates,
+                    self.rejection_sampler.synthetic_mode,
+                    self.speculative_config.num_speculative_tokens,
+                    topk_candidates=topk_candidates,
+                    apply_topk_topp=self._sampler_applies_topk_topp(),
+                    apply_top_k=self._sampler_applies_top_k(),
+                )
+            )
+            return out
         draw = functools.partial(
             torch.rand,
             dtype=torch.float32,
@@ -7274,6 +7318,34 @@ class TPUModelRunner(GPUModelRunner):
         variants = [(True, True, 0), (False, True, 0), (True, False, 0)]
         if blocks := self._topk_candidate_blocks():
             variants.append((True, True, blocks))
+        if (
+            envs.TPU_SPEC_SYNTHETIC_INGRAPH_RNG
+            and self.rejection_sampler.synthetic_mode
+        ):
+            # A dummy counter: warming must not advance the serving one.
+            counter = torch.zeros((), dtype=torch.int32).to(device)
+            for apply_topk_topp, apply_top_k, topk_candidates in variants:
+                out, _ = fused_spec_verify.spec_verify_sample_fused_rng(
+                    dummy_logits,
+                    bonus_logits_indices,
+                    target_logits_indices,
+                    draft_token_ids,
+                    draft_lengths,
+                    segment_ids,
+                    group_indices,
+                    temps,
+                    top_k,
+                    top_p,
+                    counter,
+                    self.rejection_sampler.synthetic_conditional_rates,
+                    self.rejection_sampler.synthetic_mode,
+                    self.speculative_config.num_speculative_tokens,
+                    topk_candidates=topk_candidates,
+                    apply_topk_topp=apply_topk_topp,
+                    apply_top_k=apply_top_k,
+                )
+                synchronize_tensors(out)
+            return
         for apply_topk_topp, apply_top_k, topk_candidates in variants:
             out = fused_spec_verify.spec_verify_sample_fused(
                 dummy_logits,
