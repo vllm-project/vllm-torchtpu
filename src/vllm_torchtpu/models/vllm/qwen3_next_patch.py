@@ -1607,6 +1607,15 @@ def patched_mtp_forward(
     return hidden_states
 
 
+def _is_qwen3_5_target(model_config: Any) -> bool:
+    """``settings.is_qwen3_5`` for a config that names its architectures. A
+    config without the attribute (the stand-ins callers hand the patch
+    registry) is not a Qwen3.5 target and gets main's behaviour."""
+    if getattr(model_config, "architectures", None) is None:
+        return False
+    return qwen3_5_settings.is_qwen3_5(model_config)
+
+
 def _with_rank_tensor(original_init: Callable) -> Callable:
     @functools.wraps(original_init)
     def __init__(self, *args, **kwargs):
@@ -1782,7 +1791,7 @@ def maybe_patch_qwen3_next(model_config: "ModelConfig | None" = None) -> bool | 
     """
     if model_config is None:
         return False
-    is_qwen3_5 = qwen3_5_settings.is_qwen3_5(model_config)
+    is_qwen3_5 = _is_qwen3_5_target(model_config)
     if not is_qwen3_5:
         if envs.TPU_MOE_SEQUENCE_PARALLEL:
             qwen3_next.Qwen3NextDecoderLayer.forward = entry_chunk_decoder_layer_forward
