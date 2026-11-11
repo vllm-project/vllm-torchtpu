@@ -226,6 +226,7 @@ def test_manifest_preserves_lifecycle_dependencies():
         "patch_disable_eagle_block_drop",
         "patch_mamba_checkpoint_retention",
         "patch_mamba_state_lru",
+        "patch_mamba_root_checkpoint",
         "patch_mamba_tail_fold",
         "_patch_vllm_merge_multimodal_embeddings",
     ]

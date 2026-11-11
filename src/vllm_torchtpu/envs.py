@@ -290,6 +290,8 @@ if TYPE_CHECKING:
     VLLM_TPU_MAMBA_TAIL_FOLD_DCP: bool = False
     VLLM_TPU_MAMBA_TAIL_FOLD_NOBOUNDARY: bool = False
     VLLM_TPU_MAMBA_LRU_BUDGET: int = 0
+    VLLM_TPU_MAMBA_ROOT_CHECKPOINT: bool = False
+    VLLM_TPU_MAMBA_ROOT_CHECKPOINT_MARKER: str = ""
     VLLM_TORCHTPU_IPC_KEY: str = ""
     TPU_SHARDED_LOAD_SYNC_EVERY: int = 512
     VLLM_TPU_MXFP4_DEVICE_DEQUANT: bool = True
@@ -1935,6 +1937,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # needed is released, and vice versa (core/mamba_state_lru.py). 0 = off.
     # Host-only.
     "VLLM_TPU_MAMBA_LRU_BUDGET": env_int("VLLM_TPU_MAMBA_LRU_BUDGET", 0),
+    # Scheduler: checkpoint the Mamba state where a prompt's first user
+    # message ends (before the first "<|im_start|>assistant") and keep that
+    # checkpoint warm, so a fork that re-sends the parent's context as one
+    # message can resume there (core/mamba_root_checkpoint.py). Host-only.
+    "VLLM_TPU_MAMBA_ROOT_CHECKPOINT": env_bool(
+        "VLLM_TPU_MAMBA_ROOT_CHECKPOINT", default=False
+    ),
+    # "<im_start id>,<assistant id>,<im_end id>"; "" resolves them from the
+    # tokenizer.
+    "VLLM_TPU_MAMBA_ROOT_CHECKPOINT_MARKER": env_str(
+        "VLLM_TPU_MAMBA_ROOT_CHECKPOINT_MARKER", ""
+    ),
     # Secret for the KV-transfer IPC socket; "" derives one from the host.
     # Read raw, not through env_str: a secret's bytes must not be trimmed.
     "VLLM_TORCHTPU_IPC_KEY": lambda: os.getenv("VLLM_TORCHTPU_IPC_KEY", ""),

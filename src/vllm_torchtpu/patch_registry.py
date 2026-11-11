@@ -110,6 +110,10 @@ PATCHES = (
         _ENGINE,
     ),
     Patch("vllm_torchtpu.core.mamba_state_lru:patch_mamba_state_lru", _ENGINE),
+    Patch(
+        "vllm_torchtpu.core.mamba_root_checkpoint:patch_mamba_root_checkpoint",
+        _ENGINE,
+    ),
     # Outermost split wrapper: counts what the wrapped split folds.
     Patch("vllm_torchtpu.core.mamba_tail_fold:patch_mamba_tail_fold", _ENGINE),
     # Victim host-tier policy hooks (inert unless the policy is on), after the
