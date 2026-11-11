@@ -429,7 +429,7 @@ class DFlashProposer:
         power of two apart above 8 x the step, so a bucket pads at most
         ~12.5 % and their count grows with log2 of the chunk."""
         step = envs.TPU_DRAFT_BUCKET_STEP
-        max_draft_tokens = -(-self._max_chunk_reqs() * self.block_size // 8) * 8
+        max_draft_tokens = self._max_chunk_reqs() * self.block_size
         buckets = []
         bucket = _FINE_DRAFT_BUCKETS_FROM
         while bucket < max_draft_tokens:

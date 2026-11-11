@@ -960,7 +960,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ranks: an all-to-all of the LM head shards instead of an all-gather of
     # the full logits, each rank samples its block, the tokens are gathered.
     # Needs the model's compute_logits_shard; same tokens.
-    "TPU_SPEC_SYNTHETIC_ROW_SPLIT": env_bool("TPU_SPEC_SYNTHETIC_ROW_SPLIT", default=True),
+    "TPU_SPEC_SYNTHETIC_ROW_SPLIT": env_bool(
+        "TPU_SPEC_SYNTHETIC_ROW_SPLIT", default=True
+    ),
     # Merge the DCP indexer candidates with an all-to-all over the token axis
     # instead of an all-gather over the candidate axis. Same result.
     "TPU_DCP_INDEXER_A2A_MERGE": env_bool("TPU_DCP_INDEXER_A2A_MERGE", default=False),
