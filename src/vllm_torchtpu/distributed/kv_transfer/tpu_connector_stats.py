@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from typing import Any, cast
 
 import numpy as np
-from prometheus_client import Counter, Gauge, Histogram
+from prometheus_client import Gauge
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
     KVConnectorPromMetrics,
@@ -76,26 +76,6 @@ class TpuKVConnectorStats(KVConnectorStats):
             # Empty container init, no data is passed in.
             self.reset()
 
-    def record_d2h_transfer(self, d2h_transfer_time):
-        """Record a D2H transfer operation."""
-        self.data["d2h_transfer_time"].append(d2h_transfer_time)
-
-    def record_h2d_transfer(self, h2d_transfer_time):
-        """Record a H2D transfer operation."""
-        self.data["h2d_transfer_time"].append(h2d_transfer_time)
-
-    def record_kv_pull(self, kv_pull_time):
-        """Record a KV pull operation."""
-        self.data["kv_pull_time"].append(kv_pull_time)
-
-    def record_mb_transferred(self, mb_transferred):
-        """Record a successful KV transfer operation."""
-        self.data["mb_transferred"].append(mb_transferred)
-
-    def record_failed_transfer(self):
-        """Record a failed KV transfer operation."""
-        self.data["num_failed_transfers"].append(1)
-
     def record_prefill_queue_length(self, prefill_queue_length: int):
         """Record the prefill (send) queue length."""
         self.data["prefill_queue_length"].append(prefill_queue_length)
@@ -115,11 +95,6 @@ class TpuKVConnectorStats(KVConnectorStats):
     def reset(self):
         # Must be serializable
         self.data: dict[str, list[float | int | tuple[str, str, float]]] = {
-            "d2h_transfer_time": [],
-            "h2d_transfer_time": [],
-            "kv_pull_time": [],
-            "mb_transferred": [],
-            "num_failed_transfers": [],
             "prefill_queue_length": [],
             "decode_queue_length": [],
             "runner_cpu_issue_seconds": [],
@@ -142,50 +117,9 @@ class TpuKVConnectorStats(KVConnectorStats):
         return self
 
     def reduce(self) -> dict[str, int | float]:
-        d2h_transfer_time = np.asarray(self.data["d2h_transfer_time"])
-        h2d_transfer_time = np.asarray(self.data["h2d_transfer_time"])
-        kv_pull_time = np.asarray(self.data["kv_pull_time"])
-        mb_transferred = np.asarray(self.data["mb_transferred"])
         prefill_queue_length = np.asarray(self.data.get("prefill_queue_length", []))
         decode_queue_length = np.asarray(self.data.get("decode_queue_length", []))
-
-        total_mb = mb_transferred.sum()
-        avg_mb = (
-            total_mb / self.num_successful_transfers
-            if self.num_successful_transfers > 0
-            else 0
-        )
-
-        total_time_seconds = kv_pull_time.sum() / 1e3
-        throughput_mb_s = total_mb / total_time_seconds if total_time_seconds > 0 else 0
-
         return {
-            "Avg D2H transfer time (ms)": round(d2h_transfer_time.mean(), 3)
-            if d2h_transfer_time.size > 0
-            else 0.0,
-            "P90 D2H transfer time (ms)": round(
-                np.percentile(d2h_transfer_time, 90).item(), 3
-            )
-            if d2h_transfer_time.size > 0
-            else 0.0,
-            "Avg H2D transfer time (ms)": round(h2d_transfer_time.mean(), 3)
-            if h2d_transfer_time.size > 0
-            else 0.0,
-            "P90 H2D transfer time (ms)": round(
-                np.percentile(h2d_transfer_time, 90).item(), 3
-            )
-            if h2d_transfer_time.size > 0
-            else 0.0,
-            "Num successful transfers": self.num_successful_transfers,
-            "Num failed transfers": self.data["num_failed_transfers"],
-            "Avg KV pull time (ms)": round(kv_pull_time.mean(), 3)
-            if kv_pull_time.size > 0
-            else 0.0,
-            "P90 KV pull time (ms)": round(np.percentile(kv_pull_time, 90).item(), 3)
-            if kv_pull_time.size > 0
-            else 0.0,
-            "Avg MB per transfer": round(avg_mb, 3),
-            "Throughput (MB/s)": round(throughput_mb_s, 3),
             "Prefill queue length": int(prefill_queue_length.max())
             if prefill_queue_length.size > 0
             else 0,
@@ -199,10 +133,6 @@ class TpuKVConnectorStats(KVConnectorStats):
             return True
         return not any(self.data.values())
 
-    @property
-    def num_successful_transfers(self) -> int:
-        return len(self.data["mb_transferred"])
-
 
 class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
     def __init__(
@@ -214,72 +144,6 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
     ):
         super().__init__(vllm_config, metric_types, labelnames, per_engine_labelvalues)
 
-        # Buckets for time-based metrics in milliseconds
-        buckets = [
-            1.0,
-            10.0,
-            100.0,
-            250.0,
-            500.0,
-            750.0,
-            1000.0,
-            2500.0,
-            5000.0,
-            7500.0,
-            10000.0,
-            25000.0,
-            50000.0,
-        ]
-        tpu_histogram_d2h_transfer_time = self._histogram_cls(
-            name="vllm:tpu_d2h_transfer_time_ms",
-            documentation="Histogram of D2H transfer duration for "
-            "TPU KV Cache transfers.",
-            buckets=buckets,
-            labelnames=labelnames,
-        )
-        self.tpu_histogram_d2h_transfer_time = create_metric_per_engine(
-            tpu_histogram_d2h_transfer_time, self.per_engine_labelvalues
-        )
-        tpu_histogram_h2d_transfer_time = self._histogram_cls(
-            name="vllm:tpu_h2d_transfer_time_ms",
-            documentation="Histogram of H2D transfer duration for "
-            "TPU KV Cache transfers.",
-            buckets=buckets,
-            labelnames=labelnames,
-        )
-        self.tpu_histogram_h2d_transfer_time = create_metric_per_engine(
-            tpu_histogram_h2d_transfer_time, self.per_engine_labelvalues
-        )
-        tpu_histogram_kv_pull_time = self._histogram_cls(
-            name="vllm:tpu_kv_pull_time_ms",
-            documentation="Histogram of KV pull duration for TPU KV Cache transfers.",
-            buckets=buckets,
-            labelnames=labelnames,
-        )
-        self.tpu_histogram_kv_pull_time = create_metric_per_engine(
-            tpu_histogram_kv_pull_time, self.per_engine_labelvalues
-        )
-        # Buckets for data transferred
-        buckets = [
-            32,
-            64,
-            128,
-            256,
-            512,
-            1024,
-            2048,
-            4096,
-        ]
-        tpu_histogram_kv_megabytes_transferred = self._histogram_cls(
-            name="vllm:tpu_kv_megabytes_transferred",
-            documentation="Histogram of megabytes transferred per "
-            "TPU KV Cache transfers.",
-            buckets=buckets,
-            labelnames=labelnames,
-        )
-        self.tpu_histogram_kv_megabytes_transferred = create_metric_per_engine(
-            tpu_histogram_kv_megabytes_transferred, self.per_engine_labelvalues
-        )
         runner_labels = [*labelnames, "rank", "stage"]
         self.runner_cpu_issue = self._histogram_cls(
             name="vllm:tpu_runner_cpu_issue_seconds",
@@ -295,15 +159,6 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
             buckets=RUNNER_TIMING_BUCKETS_SECONDS,
             labelnames=runner_labels,
         )
-        counter_tpu_num_failed_transfers = self._counter_cls(
-            name="vllm:tpu_num_failed_transfers",
-            documentation="Number of failed TPU KV Cache transfers.",
-            labelnames=labelnames,
-        )
-        self.counter_tpu_num_failed_transfers = create_metric_per_engine(
-            counter_tpu_num_failed_transfers, self.per_engine_labelvalues
-        )
-
         gauge_tpu_prefill_queue_length = self._gauge_cls(
             name="vllm:tpu_prefill_kv_queue_length",
             documentation="Current length of the TPU KV transfer prefill queue.",
@@ -402,32 +257,6 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
             self.runner_device_elapsed.labels(*engine_labels, rank, stage).observe(
                 seconds
             )
-
-        for prom_obj, list_item_key in zip(
-            [
-                self.tpu_histogram_d2h_transfer_time,
-                self.tpu_histogram_h2d_transfer_time,
-                self.tpu_histogram_kv_pull_time,
-                self.tpu_histogram_kv_megabytes_transferred,
-            ],
-            [
-                "d2h_transfer_time",
-                "h2d_transfer_time",
-                "kv_pull_time",
-                "mb_transferred",
-            ],
-        ):
-            for list_item in transfer_stats_data.get(list_item_key, []):
-                cast(Histogram, prom_obj[engine_idx]).observe(list_item)
-
-        for counter_obj, counter_item_key in zip(
-            [
-                self.counter_tpu_num_failed_transfers,
-            ],
-            ["num_failed_transfers"],
-        ):
-            for list_item in transfer_stats_data.get(counter_item_key, []):
-                cast(Counter, counter_obj[engine_idx]).inc(list_item)
 
         for gauge_obj, gauge_item_key in zip(
             [
