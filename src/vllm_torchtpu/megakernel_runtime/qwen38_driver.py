@@ -1995,6 +1995,7 @@ class Qwen38SegmentDriver:
         except Exception:
             logger.exception("Qwen3.8 MK draft: setup failed; draft stays stock")
             return
+        object.__setattr__(mk, "count", self._count)  # mk_draft_step0 / stock_step0
         draft.model.mk_draft = mk
         logger.info(
             "Qwen3.8 MK draft attached: draft layer + mixer + lm_head + greedy pick per "
@@ -2171,7 +2172,9 @@ class Qwen38SegmentDriver:
         # time to the serving metrics (AL windows) over a whole run.
         if (n & (n - 1) == 0 and n >= 64) or n % STEP_MIX_EVERY == 0:
             logger.info(
-                "qwen38 megakernel step mix: %s", dict(sorted(self.stats.items()))
+                "qwen38 megakernel step mix: %s counters %s",
+                dict(sorted(self.stats.items())),
+                dict(sorted(getattr(self, "counters", {}).items())),
             )
         if STEP_MIX_INTERVAL_S:
             import time
