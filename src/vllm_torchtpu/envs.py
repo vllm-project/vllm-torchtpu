@@ -89,6 +89,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_INDEXER_FP8_TRANSPOSED: bool = False
     TPU_MINIMAX_M3_MSA_LSE_R6: bool = False
     TPU_MINIMAX_M3_DSPARK_SPLIT_FC: bool = False
+    TPU_DRAFT_HIDE_NOOP_KV_CONNECTOR: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
@@ -809,6 +810,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # each draft qkv_proj, when the weights are plain flipped matrices. r6.
     "TPU_MINIMAX_M3_DSPARK_SPLIT_FC": env_bool(
         "TPU_MINIMAX_M3_DSPARK_SPLIT_FC", default=False
+    ),
+    # DFlash/DSpark draft forwards: hide the KV connector when its per-layer
+    # hooks are OffloadingConnector's no-ops, so serving (connector bound)
+    # hits the precompiled draft programs instead of retracing per bucket.
+    # r6; v3's skip_draft_kv unbinding applies either way.
+    "TPU_DRAFT_HIDE_NOOP_KV_CONNECTOR": env_bool(
+        "TPU_DRAFT_HIDE_NOOP_KV_CONNECTOR", default=False
     ),
     # SparseCore MoE gather-reduce (combine) kernel version used by
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and
