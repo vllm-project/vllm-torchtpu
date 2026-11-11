@@ -305,6 +305,8 @@ def _rank0_pcp_plan() -> SequenceLayoutPlan:
 
 
 class _CarryAggregationAfterGatherPlan:
+    kind = SequenceLayoutKind.PARTIAL
+
     def __init__(self, events):
         self._events = events
 
@@ -320,6 +322,7 @@ class _CarryAggregationAfterGatherPlan:
 def test_prepare_draft_inputs(device):
     proposer = _make_proposer(draft_tp=1)
     proposer.runner = SimpleNamespace(
+        _mtp_prefill_only=False,
         input_batch=SimpleNamespace(req_ids=["r0", "r1"]),
         device=device,
         requests={},
@@ -372,6 +375,7 @@ def test_prepare_draft_inputs_chunk_offset(device):
     rejection counts by the chunk's offset."""
     proposer = _make_proposer(draft_tp=1)
     proposer.runner = SimpleNamespace(
+        _mtp_prefill_only=False,
         input_batch=SimpleNamespace(req_ids=["r0", "r1", "r2", "r3"]),
         device=device,
         requests={},
@@ -423,6 +427,7 @@ def test_prepare_draft_inputs_pcp_mtp_seeds_request_major_then_localizes(
     draft input and gather values cross the chunk-local PCP layout boundary."""
     proposer = _make_proposer(draft_tp=1, method="mtp")
     proposer.runner = SimpleNamespace(
+        _mtp_prefill_only=False,
         input_batch=SimpleNamespace(req_ids=["r0", "r1"]),
         device=device,
         requests={},
@@ -492,6 +497,7 @@ def test_prepare_draft_inputs_all_layout_keeps_device_seed_gathers(device, monke
 
     proposer = _make_proposer(draft_tp=1, method="mtp")
     proposer.runner = SimpleNamespace(
+        _mtp_prefill_only=False,
         input_batch=SimpleNamespace(req_ids=["r0", "r1"]),
         device=device,
         requests={},
@@ -539,6 +545,7 @@ def test_propose_delegates_carry_aggregation_after_gather():
     proposer = _make_proposer(draft_tp=1, method="mtp")
     proposer.speculative_config.num_speculative_tokens = 1
     proposer.runner = SimpleNamespace(
+        _mtp_prefill_only=False,
         input_batch=SimpleNamespace(num_reqs=2, req_ids=["r0", "r1"]),
         device=device,
         requests={},
@@ -569,10 +576,16 @@ def test_propose_delegates_carry_aggregation_after_gather():
         torch.tensor([-1, 2], dtype=torch.int64, device=device),
         np.zeros(2, dtype=np.int32),
     )
-    proposer._forward_draft = lambda **_kwargs: (
-        torch.tensor([[99.0], [7.0], [20.0]], device=device),
-        torch.zeros((3, 1), device=device),
-    )
+
+    def forward(**kwargs):
+        # Partial layouts need ownership masks, not a valid-token prefix.
+        assert kwargs["num_valid_tokens"] == 3
+        return (
+            torch.tensor([[99.0], [7.0], [20.0]], device=device),
+            torch.zeros((3, 1), device=device),
+        )
+
+    proposer._forward_draft = forward
 
     def record_gather(hidden, positions, last_hidden, gather_indices):
         events.append("gather")
@@ -603,6 +616,7 @@ def test_prepare_draft_inputs_async_device(device):
     output — matching the host path fed the equivalent num_rejected."""
     proposer = _make_proposer(draft_tp=1)
     proposer.runner = SimpleNamespace(
+        _mtp_prefill_only=False,
         input_batch=SimpleNamespace(req_ids=["r0", "r1"]),
         device=device,
         requests={},
@@ -673,6 +687,7 @@ def test_prepare_draft_inputs_async_device_keeps_padded_width(device, discard):
     token, and the padding rows repeat that token, not its sampled one."""
     proposer = _make_proposer(draft_tp=1)
     proposer.runner = SimpleNamespace(
+        _mtp_prefill_only=False,
         input_batch=SimpleNamespace(req_ids=["r0", "r1"]),
         device=device,
         requests={
@@ -754,6 +769,7 @@ def test_propose(num_speculative_tokens, chunk_sizes, return_device, device):
     proposer = _make_proposer(draft_tp=1)
     proposer.speculative_config.num_speculative_tokens = num_speculative_tokens
     proposer.runner = SimpleNamespace(
+        _mtp_prefill_only=False,
         input_batch=SimpleNamespace(num_reqs=num_reqs),
         max_num_reqs=16,
         num_reqs_max_model_len=16,
@@ -899,6 +915,7 @@ def test_propose_without_aux_hidden_state(device):
     proposer = _make_proposer(draft_tp=1)
     proposer.speculative_config.num_speculative_tokens = 1
     proposer.runner = SimpleNamespace(
+        _mtp_prefill_only=False,
         input_batch=SimpleNamespace(num_reqs=1),
         max_num_reqs=16,
         num_reqs_max_model_len=16,
@@ -973,13 +990,17 @@ def test_propose_without_aux_hidden_state(device):
 
 def test_propose_empty_batch():
     proposer = _make_proposer(draft_tp=1)
-    proposer.runner = SimpleNamespace(input_batch=SimpleNamespace(num_reqs=0))
+    proposer.runner = SimpleNamespace(
+        _mtp_prefill_only=False, input_batch=SimpleNamespace(num_reqs=0)
+    )
     assert (
         proposer.propose([], [], None, SimpleNamespace(num_scheduled_tokens={})) == []
     )
 
 
-def _lockstep_draft_trace(monkeypatch, method, K, num_chunks, num_real):
+def _lockstep_draft_trace(
+    monkeypatch, method, K, num_chunks, num_real, *, prefill_only=False
+):
     """The draft programs one EP-DP lockstep rank emits in a step whose
     coordinated chunk bound is `num_chunks`: propose() with `num_real` real
     chunks, or the idle-rank replay when it has none."""
@@ -991,6 +1012,7 @@ def _lockstep_draft_trace(monkeypatch, method, K, num_chunks, num_real):
     proposer.speculative_config.num_speculative_tokens = K
     proposer._draft_has_moe_cache = True
     proposer.runner = SimpleNamespace(
+        _mtp_prefill_only=prefill_only,
         input_batch=SimpleNamespace(num_reqs=num_real * reqs),
         _dp_target_bucket=bucket,
         _dp_step_max_reqs=reqs,
@@ -1123,6 +1145,7 @@ def test_run_dp_dummy_draft_sharded_replays_propose_trace(monkeypatch):
     proposer = _make_proposer(draft_tp=2, target_tp=2)
     proposer.speculative_config.num_speculative_tokens = 3
     proposer.runner = SimpleNamespace(
+        _mtp_prefill_only=False,
         _dp_target_bucket=64,
         _dp_step_max_reqs=16,
         num_reqs_max_model_len=16,
@@ -1187,6 +1210,7 @@ def test_run_dp_dummy_draft_mtp_replays_no_combine(monkeypatch):
     proposer = _make_proposer(draft_tp=1, target_tp=1, method="qwen3_next_mtp")
     proposer.speculative_config.num_speculative_tokens = 3
     proposer.runner = SimpleNamespace(
+        _mtp_prefill_only=False,
         _dp_target_bucket=64,
         _dp_step_max_reqs=16,
         num_reqs_max_model_len=16,
@@ -1293,6 +1317,7 @@ def test_run_dp_dummy_draft_positions_match_draft_graph_rank(monkeypatch, uses_m
     proposer = _make_proposer(draft_tp=1, target_tp=1, method="qwen3_next_mtp")
     proposer.speculative_config.num_speculative_tokens = 3
     proposer.runner = SimpleNamespace(
+        _mtp_prefill_only=False,
         _dp_target_bucket=64,
         _dp_step_max_reqs=16,
         num_reqs_max_model_len=16,
@@ -1422,7 +1447,10 @@ def test_build_draft_attn_metadata_loop_cache(device):
 
 
 @pytest.mark.tpu_test
-def test_build_draft_attn_metadata_propagates_chunk_layout_descriptor(device):
+@pytest.mark.parametrize("initialized", [False, True])
+def test_build_draft_attn_metadata_propagates_chunk_layout_descriptor(
+    device, initialized
+):
     """Rebuilding draft metadata must preserve the target chunk's PCP
     descriptor; defaulting it to ALL selects an incompatible attention path."""
     from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
@@ -1439,6 +1467,8 @@ def test_build_draft_attn_metadata_propagates_chunk_layout_descriptor(device):
         _attn_metadata_builder_ctx=None,
         empty_slot_mappings={},
     )
+    if not initialized:
+        del runner._attn_metadata_builder_ctx
     proposer.runner = runner
     captured_descriptors = []
 
@@ -1482,6 +1512,9 @@ def test_build_draft_attn_metadata_propagates_chunk_layout_descriptor(device):
     )
 
     assert captured_descriptors == [descriptor]
+    assert runner._attn_metadata_builder_ctx is (
+        None if initialized else chunk.attn_ctx
+    )
 
 
 def _target_md_chunk(device, attn_metadata, position_ids_override=None):
@@ -1692,7 +1725,7 @@ def test_load_draft_model_saves_and_wraps_with_draft_config(monkeypatch):
     import vllm_torchtpu.spec_decode.eagle3 as e3
 
     proposer = _make_proposer(draft_tp=1, method="mtp")
-    proposer.runner = SimpleNamespace(mesh=object())
+    proposer.runner = SimpleNamespace(_mtp_prefill_only=False, mesh=object())
     proposer.vllm_config.load_config = object()
     proposer.vllm_config.compilation_config = SimpleNamespace(
         inductor_compile_config={}
@@ -1738,6 +1771,7 @@ def test_forward_draft_uses_saved_draft_config_in_both_contexts(monkeypatch, dev
     draft_config = object()
     proposer.draft_vllm_config = draft_config
     proposer.runner = SimpleNamespace(
+        _mtp_prefill_only=False,
         mesh=object(),
         _dp_num_tokens_across_dp=lambda n: n,
         num_tokens_paddings=[16],
@@ -1771,6 +1805,7 @@ def test_forward_draft_uses_saved_draft_config_in_both_contexts(monkeypatch, dev
         input_ids=torch.zeros(3, dtype=torch.int32, device=device),
         positions=torch.arange(3, dtype=torch.int32, device=device),
         target_hidden_states=hidden,
+        num_valid_tokens=3,
         step_idx=0,
         seq_lens_delta=0,
         num_rejected_np=None,
@@ -1791,14 +1826,14 @@ def test_prefill_only_mtp_draft_cache_specs_require_full_attention():
         block_size=16, num_kv_heads=1, head_size=128, dtype=torch.bfloat16
     )
     proposer.runner = SimpleNamespace(
-        get_kv_cache_spec=lambda: {"draft.attn": full_spec}
+        _mtp_prefill_only=False, get_kv_cache_spec=lambda: {"draft.attn": full_spec}
     )
 
     proposer._validate_prefill_only_draft_model(draft_attn_layer_names)
 
     mamba_spec = MambaSpec(block_size=1, shapes=((1, 4, 8),), dtypes=(torch.bfloat16,))
     proposer.runner = SimpleNamespace(
-        get_kv_cache_spec=lambda: {"draft.attn": mamba_spec}
+        _mtp_prefill_only=False, get_kv_cache_spec=lambda: {"draft.attn": mamba_spec}
     )
     with pytest.raises(NotImplementedError, match="FullAttentionSpec.*draft.attn"):
         proposer._validate_prefill_only_draft_model(draft_attn_layer_names)
@@ -1810,7 +1845,9 @@ def test_build_draft_attn_metadata_cache_cleared_per_propose(device):
     for a recycled chunk id — the cache is cleared at propose entry."""
     proposer = _make_proposer(draft_tp=1)
     proposer._draft_md_cache[12345] = ("stale", None)
-    proposer.runner = SimpleNamespace(input_batch=SimpleNamespace(num_reqs=0))
+    proposer.runner = SimpleNamespace(
+        _mtp_prefill_only=False, input_batch=SimpleNamespace(num_reqs=0)
+    )
     assert proposer.propose([], [], None, None) == []
     assert proposer._draft_md_cache == {}
 
@@ -1962,6 +1999,7 @@ def test_propose_index_share_order_across_two_chunks():
     proposer = _make_proposer(draft_tp=1, method="mtp")
     proposer.speculative_config.num_speculative_tokens = K
     proposer.runner = SimpleNamespace(
+        _mtp_prefill_only=False,
         input_batch=SimpleNamespace(num_reqs=4, req_ids=["r0", "r1", "r2", "r3"]),
         device=device,
         requests={},
@@ -2060,6 +2098,7 @@ def test_propose_index_share_survives_dp_padding_first_pass(monkeypatch):
     proposer.speculative_config.num_speculative_tokens = K
     proposer._draft_has_moe_cache = True
     proposer.runner = SimpleNamespace(
+        _mtp_prefill_only=False,
         input_batch=SimpleNamespace(num_reqs=2, req_ids=["r0", "r1"]),
         device=device,
         num_tokens_paddings=[2, 4, 8],
@@ -2321,7 +2360,10 @@ def _forward_draft_harness(monkeypatch):
     proposer = _make_proposer(draft_tp=1, method="mtp")
     proposer.draft_vllm_config = object()
     proposer.runner = SimpleNamespace(
-        mesh=object(), _dp_num_tokens_across_dp=lambda n: n, num_tokens_paddings=[2]
+        _mtp_prefill_only=False,
+        mesh=object(),
+        _dp_num_tokens_across_dp=lambda n: n,
+        num_tokens_paddings=[2],
     )
     proposer._build_draft_attn_metadata = lambda **_kwargs: {}
 
@@ -2338,12 +2380,169 @@ def _forward_draft_harness(monkeypatch):
             input_ids=torch.zeros(2, dtype=torch.int32),
             positions=torch.zeros(2, dtype=torch.int32),
             target_hidden_states=torch.zeros((2, 2)),
+            num_valid_tokens=2,
             step_idx=step_idx,
             seq_lens_delta=step_idx,
             num_rejected_np=None,
         )
 
     return proposer, run
+
+
+@pytest.mark.parametrize("method", ["mtp", "eagle3"])
+@pytest.mark.parametrize("lockstep", [False, True])
+@pytest.mark.parametrize("return_device", [False, True])
+@pytest.mark.parametrize(
+    "device_type", ["cpu", pytest.param("tpu", marks=pytest.mark.tpu_test)]
+)
+def test_propose_refreshes_padding_for_unequal_chunks_and_idle(
+    monkeypatch, method, lockstep, return_device, device_type
+):
+    import vllm_torchtpu.spec_decode.eagle3 as e3
+    from vllm_torchtpu.layers.adapter import token_padding
+    from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+    device = torch.device(device_type)
+    state = token_padding.TokenPaddingState.create(64, device)
+    monkeypatch.setattr(token_padding, "_padding_state", state)
+    monkeypatch.setattr(e3.envs, "TPU_MOE_SKIP_PADDED_TOKENS", True)
+    monkeypatch.setattr(e3, "synchronize_tensors", lambda *a, **k: None)
+    proposer, _ = _forward_draft_harness(monkeypatch)
+    proposer.speculative_config.method = method
+    proposer.speculative_config.num_speculative_tokens = 4
+    proposer._draft_has_moe_cache = True
+    runner = proposer.runner
+    runner.input_batch = SimpleNamespace(num_reqs=18)
+    runner.num_tokens_paddings = [16, 32, 64]
+    runner.max_num_reqs = runner.num_reqs_max_model_len = 32
+    runner.num_reqs_most_model_len = 32
+    runner.device, runner.uses_mrope = device, False
+    runner._hidden_states_dtype = torch.float32
+    runner._dp_lockstep_enabled = lambda: lockstep
+    runner._dp_target_bucket, runner._dp_step_num_chunks = 64, 3
+    runner._dp_step_max_reqs = 18
+    runner._token_padding_state = state
+    observed = []
+
+    class Draft:
+        config = SimpleNamespace(hidden_size=2)
+        model = SimpleNamespace(use_aux_hidden_state=False)
+
+        def combine_hidden_states(self, hidden):
+            return hidden
+
+        def __call__(self, input_ids, **kwargs):
+            ids = torch.zeros((input_ids.shape[0], 2), dtype=torch.int32, device=device)
+            scores = torch.ones(ids.shape, device=device)
+            _, weights = token_padding.zero_routing_weights_for_padding(
+                ids, scores, is_local_tensor=True
+            )
+            logits = token_padding.mask_router_logits_for_padding(scores)
+            observed.append((weights.cpu(), logits.cpu()))
+            return weights, weights
+
+    proposer.draft_model = Draft()
+    chunks = []
+    for start, nr, length, padded in [
+        (0, 16, 4, 64),
+        (16, 2, 2, 64 if lockstep else 16),
+    ]:
+        chunks.append(
+            _make_chunk(
+                input_ids=torch.zeros(padded, dtype=torch.int32, device=device),
+                position_ids=torch.arange(padded, dtype=torch.int32, device=device),
+                query_start_loc_np=np.arange(nr + 1, dtype=np.int32) * length,
+                start_index=start,
+                num_reqs=nr,
+                hidden=2,
+                device=device,
+                hidden_states=torch.zeros((padded, 2), device=device),
+                attn_ctx=SimpleNamespace(use_max_model_len=True),
+            )
+        )
+        # The real target update leaves the shared mask describing the last chunk.
+        runner._last_sequence_layout_plan = SimpleNamespace(
+            kind=SequenceLayoutKind.ALL, local_num_tokens=nr * length
+        )
+        TPUModelRunner._token_padding_update(runner, padded)
+    proposer.draft_chunks = chunks
+
+    def prepare(chunk, *args, **kwargs):
+        indices = torch.from_numpy(chunk.query_start_loc_np[1:] - 1).to(device)
+        p = proposer._loop_bucket(chunk.num_reqs)
+        indices = torch.nn.functional.pad(indices, (0, p - chunk.num_reqs))
+        return chunk.input_ids, chunk.position_ids, indices, None
+
+    proposer._prepare_draft_inputs = prepare
+    proposer._draft_gather_carries = lambda h, pos, lh, idx: (h[idx], pos[idx], lh[idx])
+    proposer._draft_propose_token = lambda hidden: hidden[:, 0].to(torch.int32)
+    result = proposer.propose(
+        sampled_token_ids=None if return_device else [[1]] * 18,
+        discard_sampled_tokens_req_indices=[],
+        num_rejected_tokens_np=None,
+        scheduler_output=SimpleNamespace(num_scheduled_tokens={}),
+        return_device=return_device,
+        next_tokens_per_chunk=[None, None] if return_device else None,
+    )
+    expected = [(64, 64), (4, 64 if lockstep else 16)]
+    if lockstep:
+        expected.append((0, 64))
+    for _ in range(3):
+        expected.extend([(16, 32 if lockstep else 16), (2, 32 if lockstep else 16)])
+        if lockstep:
+            expected.append((0, 32))
+    if lockstep:
+        # A fully idle rank uses the same forward entry, including loop steps.
+        proposer.run_dp_dummy_draft(1)
+        expected.extend([(0, 64)] + [(0, 32)] * 3)
+    assert len(observed) == len(expected)
+    for (weights, logits), (valid, padded) in zip(observed, expected):
+        routed = (torch.arange(padded) < valid)[:, None].expand(padded, 2)
+        torch.testing.assert_close(weights, routed.float())
+        assert torch.equal(torch.isnan(logits), ~routed)
+    tokens = result.cpu().tolist() if return_device else result
+    assert tokens == [[1] * 4] * 18
+
+
+@pytest.mark.parametrize("warm", [False, True])
+def test_fused_draft_loop_refreshes_request_padding(monkeypatch, warm):
+    from vllm_torchtpu.layers.adapter import token_padding
+
+    state = token_padding.TokenPaddingState.create(64, "cpu")
+    monkeypatch.setattr(token_padding, "_padding_state", state)
+    token_padding.mark_padding(64, 64)
+    proposer, _ = _forward_draft_harness(monkeypatch)
+    proposer._mtp_fused_loop_warm = warm
+    seq_lens = torch.ones(16, dtype=torch.int32)
+    proposer._build_draft_attn_metadata = lambda **kw: {
+        "draft": SimpleNamespace(seq_lens=seq_lens)
+    }
+    observed = []
+
+    def fused(input_ids, positions, hidden, lengths):
+        _, weights = token_padding.zero_routing_weights_for_padding(
+            torch.zeros((16, 2), dtype=torch.int32),
+            torch.ones((16, 2)),
+            is_local_tensor=True,
+        )
+        observed.append(weights)
+        return (input_ids,)
+
+    proposer._mtp_fused_loop = fused
+    proposer._run_mtp_fused_loop(
+        chunk=SimpleNamespace(num_reqs=2),
+        input_ids=torch.zeros(16, dtype=torch.int32),
+        positions=torch.zeros(16, dtype=torch.int32),
+        hidden_states=torch.zeros(16, 2),
+        num_rejected_np=None,
+        num_rejected_dev=None,
+        loop_query_start_loc=torch.zeros(17, dtype=torch.int32),
+        loop_request_distribution=torch.zeros(3, dtype=torch.int32),
+    )
+    assert len(observed) == (1 if warm else 2)
+    for weights in observed:
+        torch.testing.assert_close(weights[:2], torch.ones((2, 2)))
+        assert not torch.count_nonzero(weights[2:])
 
 
 def test_forward_draft_without_index_share_runs_the_draft_at_every_step(monkeypatch):
@@ -2766,7 +2965,7 @@ def test_mtp_draft_borrows_target_head_before_loading_weights(
     import vllm_torchtpu.spec_decode.eagle3 as e3
 
     proposer = _make_proposer(draft_tp=1, method="mtp")
-    proposer.runner = SimpleNamespace(mesh=object())
+    proposer.runner = SimpleNamespace(_mtp_prefill_only=False, mesh=object())
     proposer.vllm_config.load_config = SimpleNamespace(device=None)
     proposer.vllm_config.device_config = SimpleNamespace(device="cpu")
     proposer.vllm_config.compilation_config = SimpleNamespace(

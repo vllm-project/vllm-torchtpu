@@ -30,6 +30,7 @@ from vllm.model_executor.model_loader import get_model_loader
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.layers.adapter import token_padding
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
     fixed_moe_collection_chunks,
 )
@@ -37,6 +38,7 @@ from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadata,
     AttentionMetadataBuilderContext,
 )
+from vllm_torchtpu.layers.core.sequence_layout import SequenceLayoutKind
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
@@ -653,6 +655,7 @@ class Eagle3Proposer:
         self._draft_md_cache.pop(id(chunk), None)
 
         num_tokens = input_ids.shape[0]
+        token_padding.mark_padding(chunk.num_reqs, num_tokens)
         with (
             set_model_tag("eagle_head"),
             set_forward_context(
@@ -1313,6 +1316,12 @@ class Eagle3Proposer:
                 step_idx=0,
                 seq_lens_delta=0,
                 num_rejected_np=rejected_np_per_chunk[ci],
+                num_valid_tokens=(
+                    int(chunk.query_start_loc_np[chunk.num_reqs])
+                    if chunk.sequence_layout_plan.kind is SequenceLayoutKind.ALL
+                    # Match target padding: partial layouts need per-row ownership.
+                    else input_ids.shape[0]
+                ),
                 num_tokens_padded=input_ids.shape[0],
             )
             # [p, h] / [p] carries + first-pass draft token, computed in compiled
@@ -1442,6 +1451,7 @@ class Eagle3Proposer:
                     step_idx=step,
                     seq_lens_delta=(step if self.advance_draft_positions else 0),
                     num_rejected_np=rejected_np_per_chunk[ci],
+                    num_valid_tokens=chunk.num_reqs,
                     num_tokens_padded=padded_nr_per_chunk[ci],
                     num_rejected_dev=rejected_dev_per_chunk[ci],
                     loop_query_start_loc=loop_qsl_per_chunk[ci],
@@ -1985,7 +1995,8 @@ class Eagle3Proposer:
             if runner._has_mamba_state
             else None
         )
-        saved_ctx = runner._attn_metadata_builder_ctx
+        # An idle DP rank may draft before its first target metadata build.
+        saved_ctx = getattr(runner, "_attn_metadata_builder_ctx", chunk_ctx)
         runner._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
             num_reqs=num_reqs,
             start_index=chunk.start_index,
@@ -2082,6 +2093,7 @@ class Eagle3Proposer:
         step_idx: int,
         seq_lens_delta: int,
         num_rejected_np: np.ndarray | None,
+        num_valid_tokens: int,
         num_tokens_padded: int | None = None,
         num_rejected_dev: torch.Tensor | None = None,
         loop_query_start_loc: torch.Tensor | None = None,
@@ -2099,6 +2111,8 @@ class Eagle3Proposer:
         )
 
         num_tokens = input_ids.shape[0]
+        # Target chunks and draft steps share this mask but have different rows.
+        token_padding.mark_padding(num_valid_tokens, num_tokens)
 
         kwargs: dict[str, torch.Tensor | int] = {
             "input_ids": input_ids,
@@ -2483,6 +2497,7 @@ class Eagle3Proposer:
                 step_idx=0,
                 seq_lens_delta=0,
                 num_rejected_np=None,
+                num_valid_tokens=0,
                 num_tokens_padded=dummy.bucket,
             )
             lm_head_input = dummy.first_pass_carry
@@ -2503,6 +2518,7 @@ class Eagle3Proposer:
                 # metadata program the peer ranks' propose emits.
                 seq_lens_delta=(step if self.advance_draft_positions else 0),
                 num_rejected_np=None,
+                num_valid_tokens=0,
                 num_tokens_padded=dummy.loop_bucket,
                 loop_query_start_loc=dummy.loop_query_start_loc,
                 loop_request_distribution=dummy.loop_request_distribution,
