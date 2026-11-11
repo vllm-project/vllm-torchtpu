@@ -3031,6 +3031,71 @@ class TestRaidenStoreWorkerStub(unittest.TestCase):
         self.assertEqual(len(kcm_calls), 1)
         self.assertEqual(worker._mgr, "registered-manager")
 
+    def _registering_worker(self):
+        import threading
+
+        from vllm_torchtpu.offload.raiden_store import RaidenStoreOffloadingWorker
+
+        worker = object.__new__(RaidenStoreOffloadingWorker)
+        worker._device_tensors = []
+        worker._host_blocks_to_allocate = 4
+        worker._controller_address = "127.0.0.1:28800"
+        worker._rank = 0
+        worker._mgr = None
+        worker._backend_configs = []
+        worker._stop_registration = threading.Event()
+        return worker
+
+    def test_register_loop_stops_after_host_pinning_failure(self):
+        # A second KVCacheManager after a failed host pinning segfaults the
+        # worker, so the loop must not retry it.
+        from vllm_torchtpu.offload import raiden_store as raiden_store_module
+
+        worker = self._registering_worker()
+        calls: list[dict[str, object]] = []
+
+        def failing_manager(**kwargs: object) -> str:
+            calls.append(kwargs)
+            raise RuntimeError(
+                "Host allocator failed for size: 298254336, error: "
+                "INTERNAL: DmaMap failed: "
+            )
+
+        with (
+            patch.object(worker, "_controller_reachable", return_value=True),
+            patch.object(worker._stop_registration, "wait", return_value=False),
+            _fake_tpu_sync(FAKE_STORAGE_IMPL, kv_cache_manager_cls=failing_manager),
+            patch.object(raiden_store_module.logger, "error") as log_error,
+        ):
+            worker._register_loop()
+
+        self.assertEqual(len(calls), 1)
+        self.assertIsNone(worker._mgr)
+        log_error.assert_called_once()
+        self.assertIn("cannot pin its host KV pool", log_error.call_args.args[0])
+
+    def test_register_loop_retries_other_registration_errors(self):
+        worker = self._registering_worker()
+        results: list[object] = [
+            RuntimeError("Failed to register worker with controller"),
+            "registered-manager",
+        ]
+
+        def flaky_manager(**kwargs: object) -> object:
+            result = results.pop(0)
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        with (
+            patch.object(worker, "_controller_reachable", return_value=True),
+            patch.object(worker._stop_registration, "wait", return_value=False),
+            _fake_tpu_sync(FAKE_STORAGE_IMPL, kv_cache_manager_cls=flaky_manager),
+        ):
+            worker._register_loop()
+
+        self.assertEqual(worker._mgr, "registered-manager")
+
     def test_get_ephemeral_port_range_parses_procfs_and_falls_back(self):
         from vllm_torchtpu.offload.raiden_store import (
             _DEFAULT_EPHEMERAL_PORT_RANGE,
