@@ -38,7 +38,8 @@
 # regression.
 #
 # The model and serve line are run_k3_pruned75_apc_offload_correctness.sh's;
-# the registry and store node are run_qwen35_gpc_global_dram_pool.sh's.
+# the registry and store node are run_qwen35_gpc_global_dram_pool.sh's, and
+# both runners share gpc_control_plane.sh.
 #
 #   MODEL=/path/to/Kimi-K3-pruned75 ./run_k3_pruned75_gpc_tier1_eviction.sh
 set -euo pipefail
@@ -66,30 +67,14 @@ RUN_ROOT="${RUN_ROOT:-${TMPDIR:-/tmp}/k3_pruned75_gpc_tier1_eviction_ci}"
 LOG_DIR="${LOG_DIR:-${RUN_ROOT}/logs}"
 BIND_HOST="${BIND_HOST:-127.0.0.1}"
 STARTUP_TIMEOUT_S="${STARTUP_TIMEOUT_S:-3600}"
-
-# First free port at or above $1, probed the way the servers bind it (see
-# run_qwen35_gpc_global_dram_pool.sh).
-pick_port() {
-  python3 - "$1" <<'PY'
-import socket
-import sys
-
-base = int(sys.argv[1])
-dualstack = socket.has_dualstack_ipv6()
-family = socket.AF_INET6 if dualstack else socket.AF_INET
-for port in range(base, base + 100):
-    try:
-        probe = socket.create_server(("", port), family=family,
-                                     dualstack_ipv6=dualstack)
-    except OSError:
-        continue
-    probe.close()
-    print(port)
-    break
-else:
-    raise SystemExit(f"no port free in [{base}, {base + 100})")
-PY
-}
+GPC_LOG_DIR="${LOG_DIR}"
+REGISTRY_PID=""
+NODE_PID=""
+SERVER_PID=""
+# pick_port, stop_gpc_processes, check_control_plane, wait_port: the same
+# control-plane helpers as run_qwen35_gpc_global_dram_pool.sh.
+# shellcheck source=scripts/vllm/integration/gpc_control_plane.sh
+source "${script_dir}/gpc_control_plane.sh"
 
 PORT="${PORT:-$(pick_port 8200)}" || fail "no free port for the vLLM server"
 REGISTRY_PORT="${REGISTRY_PORT:-$(pick_port 22500)}" \
@@ -173,18 +158,10 @@ global_registry_server --port="${REGISTRY_PORT}" \
   >"${LOG_DIR}/registry.log" 2>&1 &
 REGISTRY_PID=$!
 
-SERVER_PID=""
-NODE_PID=""
 # shellcheck disable=SC2317  # invoked via the EXIT trap
 cleanup() {
-  local pid
-  for pid in "${SERVER_PID}" "${NODE_PID}" "${REGISTRY_PID}"; do
-    if [[ -n "${pid}" ]]; then kill -TERM "${pid}" 2>/dev/null || true; fi
-  done
-  sleep 5
-  for pid in "${SERVER_PID}" "${NODE_PID}" "${REGISTRY_PID}"; do
-    if [[ -n "${pid}" ]]; then kill -KILL "${pid}" 2>/dev/null || true; fi
-  done
+  # K3 at TP8 takes longer than the default 2 s to exit on TERM.
+  stop_gpc_processes 5
   # Retitled workers outlive the parent and keep /dev/vfio open. Match the
   # comm name: a -f pattern would also match this script's command line.
   pkill -TERM '^VLLM' 2>/dev/null || true
@@ -192,31 +169,6 @@ cleanup() {
   pkill -KILL '^VLLM' 2>/dev/null || true
 }
 trap cleanup EXIT
-
-check_control_plane() {
-  kill -0 "${REGISTRY_PID}" 2>/dev/null || {
-    tail -50 "${LOG_DIR}/registry.log" || true
-    fail "global_registry_server exited"
-  }
-  if [[ -n "${NODE_PID}" ]]; then
-    kill -0 "${NODE_PID}" 2>/dev/null || {
-      tail -50 "${LOG_DIR}/store_node.log" || true
-      fail "kv_cache_host_store_node_main exited"
-    }
-  fi
-}
-
-wait_port() {
-  local port="$1" what="$2" timeout="${3:-60}" waited=0
-  until (exec 3<>"/dev/tcp/${BIND_HOST}/${port}") 2>/dev/null; do
-    check_control_plane
-    [[ "${waited}" -lt "${timeout}" ]] \
-      || fail "${what} (${BIND_HOST}:${port}) not reachable after ${waited}s"
-    sleep 1
-    waited=$((waited + 1))
-  done
-  echo "${what} port ${port} reachable"
-}
 
 wait_port "${REGISTRY_PORT}" "global registry"
 
@@ -317,14 +269,15 @@ read -r MAMBA_GROUPS OTHER_GROUPS < <(
   sed -nE 's/.*group\[([0-9]+)\]: spec=([A-Za-z]+).*/\1 \2/p' "${LOG_DIR}/server.log" \
     | sort -u \
     | awk '{ if ($2 == "MambaSpec") m++; else o++ } END { print m + 0, o + 0 }')
-if [[ $((MAMBA_GROUPS + OTHER_GROUPS)) -gt 0 ]]; then
-  store_blocks=$((PROMPT_BLOCKS * OTHER_GROUPS + MAMBA_GROUPS))
-  [[ "${store_blocks}" -eq "${PROMPT_STORE_BLOCKS}" ]] || fail "the engine logs \
+# The KV cache manager always logs one group[i] line per group, so none
+# means the log format changed; the tier sizing cannot be checked then.
+[[ $((MAMBA_GROUPS + OTHER_GROUPS)) -gt 0 ]] || fail "the engine logged no KV \
+cache groups, so PROMPT_STORE_BLOCKS=${PROMPT_STORE_BLOCKS} cannot be checked \
+(see ${LOG_DIR}/server.log)"
+store_blocks=$((PROMPT_BLOCKS * OTHER_GROUPS + MAMBA_GROUPS))
+[[ "${store_blocks}" -eq "${PROMPT_STORE_BLOCKS}" ]] || fail "the engine logs \
 ${OTHER_GROUPS} attention and ${MAMBA_GROUPS} KDA cache groups, so a prompt takes \
 ${store_blocks} offloaded blocks, not PROMPT_STORE_BLOCKS=${PROMPT_STORE_BLOCKS}"
-else
-  echo "the engine logged no KV cache groups; trusting PROMPT_STORE_BLOCKS=${PROMPT_STORE_BLOCKS}"
-fi
 TIER0_BLOCKS="$(sed -nE \
   's/.*KVCacheStore up: .*\(([0-9]+) offloaded blocks x [0-9]+\).*/\1/p' \
   "${LOG_DIR}/server.log" | head -1)"
