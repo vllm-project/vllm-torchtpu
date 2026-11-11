@@ -38,6 +38,7 @@ from jax.sharding import PartitionSpec as P
 import os
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.megakernel.exec_spec import DebugOptions, ExecSpec, Tiles
 from vllm_torchtpu.megakernel.ops import F32, REC
 from vllm_torchtpu.megakernel.models.qwen38_step import make_flat_segment_step
@@ -141,6 +142,16 @@ def _apply_tile_overrides(t: Tiles, over: dict[str, Any]) -> Tiles:
     return t.with_blocks(blocks) if blocks else t
 
 
+logger = init_logger(__name__)
+_WARNED: set[str] = set()
+
+
+def _warn_once(msg: str) -> None:
+    if msg not in _WARNED:
+        _WARNED.add(msg)
+        logger.warning(msg)
+
+
 def wholestep_tiles(B: int, max_groups: int = 0) -> Tiles:
     """`_wholestep_tiles`; with main-KV DCP-2 up to 32 rows the expert ring drops one more 2 MiB
     slot: the pair exchange buffers and the doubled-head union attention put b32 (f32 state)
@@ -235,8 +246,18 @@ def build_wholestep_call(
     T = T_VERIFY
     # VLLM_TPU_MK_SCOPES=N: per-phase named scopes in the kernel (profiling only).
     scopes = int(os.environ.get("VLLM_TPU_MK_SCOPES", "0") or 0)
+    tiles = wholestep_tiles(B, max_groups) if tiles is None else tiles
+    if tiles.rel_fetch and L % g.att_every:
+        # rel_fetch's trace-time refill plan assumes whole layer cycles: with a partial last
+        # cycle (VLLM_TPU_MK_WHOLE_L45) the kernel never returns (exos j-21fd3315: L=45 b4
+        # hung in BlockUntilReady for 900 s; L=44 + tail with rel_fetch runs, bitwise).
+        _warn_once(
+            "Qwen3.8 whole-step: rel_fetch dropped for L=%d (partial layer cycle); "
+            "VLLM_TPU_MK_BUCKET_TUNE needs VLLM_TPU_MK_WHOLE_L47, not L45" % L
+        )
+        tiles = dataclasses.replace(tiles, rel_fetch=False)
     ex = ExecSpec(
-        R=R, B=B, T=T, ctx=128, tiles=wholestep_tiles(B, max_groups) if tiles is None else tiles,
+        R=R, B=B, T=T, ctx=128, tiles=tiles,
         interpret=interpret, debug=DebugOptions(scopes=scopes),
     )
     # QSA layers in the L-layer kernel (first="qsa": a partial last cycle is its QSA
