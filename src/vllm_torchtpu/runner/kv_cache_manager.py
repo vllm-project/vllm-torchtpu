@@ -80,6 +80,7 @@ from vllm_torchtpu.kv_cache_materializer import (
     materialize_shared_attention_cache,
 )
 from vllm_torchtpu.kv_cache_spec_normalizer import (
+    _is_deepseek_v32_indexer_spec,
     normalize_kv_cache_specs_for_tpu,
     resolve_subpage_packing_block_size,
 )
@@ -90,6 +91,7 @@ from vllm_torchtpu.layers.adapter.attention import (
     VllmTPUDeepseekV32IndexerBackend,
 )
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadataBuilder
+from vllm_torchtpu.layers.core.owned_kv_cache import TpuOwnedKVCache
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
@@ -373,6 +375,10 @@ class KVCacheManager:
         # Sparse MLA layers sized from their allocated (nope, rope) specs,
         # which the normalizer's dense MLA page formula does not model.
         sparse_mla_layers: set[str] = set()
+        # Per-block shapes of model-owned caches that allocate their own exact
+        # shape (`TpuOwnedKVCache.kv_cache_shape`); their specs are exact as
+        # given and are budgeted from these shapes.
+        owned_block_shapes: dict[str, tuple[int, ...]] = {}
         for layer_name, attn_module in layers.items():
             # Linear Attention path
             if isinstance(attn_module, MambaBase):
@@ -549,6 +555,23 @@ class KVCacheManager:
                 kv_cache_spec[layer_name] = attn_module.get_kv_cache_spec(
                     self.runner.vllm_config
                 )
+            elif isinstance(attn_module, TpuOwnedKVCache):
+                spec = attn_module.get_kv_cache_spec(self.runner.vllm_config)
+                if spec is not None:
+                    kv_cache_spec[layer_name] = spec
+                    owned_block_shape = attn_module.kv_cache_shape(1)
+                    if owned_block_shape is not None:
+                        owned_block_shapes[layer_name] = self._checked_owned_shape(
+                            layer_name, spec, tuple(owned_block_shape)
+                        )
+                    elif _is_deepseek_v32_indexer_spec(spec):
+                        # The normalizer would budget this page with the DSA
+                        # indexer backend, the allocator with the MLA one.
+                        raise ValueError(
+                            f"{layer_name}: an integer MLAAttentionSpec on a "
+                            "TpuOwnedKVCache needs kv_cache_shape(), so its "
+                            "budget and its allocation agree"
+                        )
             else:
                 continue
 
@@ -597,11 +620,12 @@ class KVCacheManager:
                         "has its own KVCacheSpec."
                     )
 
+        self._check_owned_groups(kv_cache_spec, owned_block_shapes)
         kv_cache_spec = normalize_kv_cache_specs_for_tpu(
             kv_cache_spec,
             self.runner.kv_cache_dtype,
             enable_unified_kv_layout=self.runner._unified_kv_layout,
-            exempt_layers=ds_v4_layers | sparse_mla_layers,
+            exempt_layers=ds_v4_layers | sparse_mla_layers | set(owned_block_shapes),
             attention_backend=cast("type[PallasAttentionBackend] | None", backend_cls),
             pin_page_size=not subpage_packing,
         )
@@ -615,15 +639,69 @@ class KVCacheManager:
         ):
             assert backend_cls is not None
             kv_cache_spec = self._pad_native_attention_regions(
-                kv_cache_spec, cast("type[_TpuKVCacheBackend]", backend_cls)
+                kv_cache_spec,
+                cast("type[_TpuKVCacheBackend]", backend_cls),
+                owned_block_shapes,
             )
         return kv_cache_spec
+
+    def _checked_owned_shape(
+        self, layer_name: str, spec: KVCacheSpec, shape: tuple[int, ...]
+    ) -> tuple[int, ...]:
+        """Validate a `TpuOwnedKVCache.kv_cache_shape` against its spec.
+
+        Only MLA-family specs honor an owned shape at allocation, the unified
+        pool does not honor it, and the spec's page must hold exactly one
+        block of the shape (vLLM budgets HBM from the page size).
+        """
+        if not isinstance(spec, MLAAttentionSpec):
+            raise ValueError(
+                f"{layer_name}: kv_cache_shape() is supported only with an "
+                f"MLAAttentionSpec, got {type(spec).__name__}"
+            )
+        if self.runner._unified_kv_layout:
+            raise ValueError(
+                f"{layer_name}: kv_cache_shape() is not supported with the "
+                "unified KV block pool"
+            )
+        shape_bytes = math.prod(shape) * spec.dtype.itemsize
+        if shape_bytes != spec.page_size_bytes:
+            raise ValueError(
+                f"{layer_name}: kv_cache_shape(1) {shape} holds {shape_bytes} "
+                f"bytes but its spec's page holds {spec.page_size_bytes}"
+            )
+        return shape
+
+    @staticmethod
+    def _check_owned_groups(
+        kv_cache_spec: dict[str, KVCacheSpec],
+        owned_block_shapes: dict[str, tuple[int, ...]],
+    ) -> None:
+        """Layers with equal specs share a KV cache group, so any layer whose
+        spec equals an owned layer's spec must own the same shape (on every
+        path, not only where native regions are padded)."""
+        for owner, shape in owned_block_shapes.items():
+            for name, spec in kv_cache_spec.items():
+                if spec == kv_cache_spec[owner] and (
+                    owned_block_shapes.get(name) != shape
+                ):
+                    raise ValueError(
+                        f"{name} has the same KV cache spec as the model-owned "
+                        f"cache {owner} (shape {shape}) but owns "
+                        f"{owned_block_shapes.get(name)}; layers sharing a group "
+                        "must own the same shape"
+                    )
 
     def _pad_native_attention_regions(
         self,
         kv_cache_specs: dict[str, KVCacheSpec],
         backend_cls: type[_TpuKVCacheBackend],
+        owned_block_shapes: dict[str, tuple[int, ...]] | None = None,
     ) -> dict[str, KVCacheSpec]:
+        """`owned_block_shapes`: per-block shapes of model-owned caches
+        (`TpuOwnedKVCache.kv_cache_shape`), budgeted as allocated rather than
+        through the backend's shape for their spec."""
+        owned_block_shapes = owned_block_shapes or {}
         if can_share_attention_cache(list(kv_cache_specs.values()), backend_cls):
             return kv_cache_specs
         # Layouts that cannot share a packed pool need separate native arrays;
@@ -644,9 +722,31 @@ class KVCacheManager:
                 if isinstance(spec, MLAAttentionSpec)
                 else backend_cls
             )
-            shape = tuple(
-                backend.get_kv_cache_shape(
-                    1, spec.block_size, spec.num_kv_heads, spec.head_size, spec.dtype
+            owned = {
+                owned_block_shapes[n]
+                for n in group.layer_names
+                if n in owned_block_shapes
+            }
+            if owned and (
+                len(owned) > 1
+                or any(n not in owned_block_shapes for n in group.layer_names)
+            ):
+                raise ValueError(
+                    "every layer of a KV cache group with a model-owned cache "
+                    f"must own the same shape; group {group.layer_names} has "
+                    f"owned shapes {sorted(owned)}"
+                )
+            shape = (
+                next(iter(owned))
+                if owned
+                else tuple(
+                    backend.get_kv_cache_shape(
+                        1,
+                        spec.block_size,
+                        spec.num_kv_heads,
+                        spec.head_size,
+                        spec.dtype,
+                    )
                 )
             )
             native_pages[shape, spec.dtype] = math.prod(shape) * spec.dtype.itemsize
@@ -2015,12 +2115,31 @@ class KVCacheManager:
                         if isinstance(attn_module, DeepseekV32IndexerCache)
                         else PallasMLAttentionBackend
                     )
-                    kv_cache_shape = mla_backend_cls.get_kv_cache_shape(
-                        num_blocks,
-                        kv_cache_spec.block_size,
-                        kv_cache_spec.num_kv_heads,
-                        kv_cache_spec.head_size,
-                        kv_cache_spec.dtype,
+                    owned_shape = (
+                        attn_module.kv_cache_shape(num_blocks)
+                        if isinstance(attn_module, TpuOwnedKVCache)
+                        else None
+                    )
+                    if owned_shape is not None:
+                        assert isinstance(attn_module, TpuOwnedKVCache)
+                        one_block = attn_module.kv_cache_shape(1)
+                        assert one_block is not None, layer_name
+                        block_shape = tuple(one_block)
+                        assert tuple(owned_shape) == (num_blocks, *block_shape[1:]), (
+                            f"{layer_name}: kv_cache_shape({num_blocks})="
+                            f"{tuple(owned_shape)}, expected leading dim "
+                            f"{num_blocks} and block shape {block_shape}"
+                        )
+                    kv_cache_shape = (
+                        owned_shape
+                        if owned_shape is not None
+                        else mla_backend_cls.get_kv_cache_shape(
+                            num_blocks,
+                            kv_cache_spec.block_size,
+                            kv_cache_spec.num_kv_heads,
+                            kv_cache_spec.head_size,
+                            kv_cache_spec.dtype,
+                        )
                     )
                     dtype = kv_cache_spec.dtype
                     kv_caches[layer_name] = allocate_attention_region(
