@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     TPU_MLA_SPARSE_SPLIT_Q: bool = False
     TPU_DCP_MLA_MASK_IN_KERNEL: bool = False
     TPU_DCP_MLA_FUSED_PREP: bool = False
+    TPU_MLA_KV_WRITE_IN_GATHER: bool = False
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
     TPU_NAME: str | None = None
@@ -487,6 +488,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # indices and the SparseCore gather's live bound in one Pallas call.
     # Same gathered rows.
     "TPU_DCP_MLA_FUSED_PREP": env_bool("TPU_DCP_MLA_FUSED_PREP", default=False),
+    # With TPU_DCP_MLA_FUSED_PREP, decode buckets: the SparseCore gather that
+    # feeds the attention kernel writes the step's KV rows into both caches
+    # before it gathers, instead of a separate cache writer. Same bytes.
+    "TPU_MLA_KV_WRITE_IN_GATHER": env_bool("TPU_MLA_KV_WRITE_IN_GATHER", default=False),
     # QK pair-blocked GDN conv layout for Raiden transfers.  Not supported
     # with the unified GDN state pool: its kernel reads segment-major
     # [Q | K | V] conv rows, so the pool manifest rejects this flag.  Must

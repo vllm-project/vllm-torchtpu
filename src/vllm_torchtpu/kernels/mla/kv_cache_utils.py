@@ -310,6 +310,31 @@ def get_dst_rows(
     return _dst_rows(page, slot, page_size)
 
 
+def get_dcp_dst_rows(
+    num_tokens: int,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    query_start_loc: jax.Array,
+    dcp_rank: jax.Array,
+    *,
+    nope_spec: SparseMLAKVCacheSpec,
+    dcp_size: int,
+    interleave_size: int,
+) -> jax.Array:
+    """`get_dst_rows` for a DCP shard: `SKIP_ROW` for rows another rank owns."""
+    page, slot = _get_dcp_page_and_slot(
+        num_tokens,
+        seq_lens,
+        block_tables,
+        query_start_loc,
+        dcp_rank,
+        nope_spec=nope_spec,
+        dcp_size=dcp_size,
+        interleave_size=interleave_size,
+    )
+    return _dst_rows(page, slot, nope_spec.page_size)
+
+
 def _dst_rows(page: jax.Array, slot: jax.Array, page_size: int) -> jax.Array:
     """(page, slot) -> flattened row, `SKIP_ROW` wherever `page` is `OOB_PAGE`."""
     return jnp.where(page < OOB_PAGE, page * page_size + slot, SKIP_ROW)

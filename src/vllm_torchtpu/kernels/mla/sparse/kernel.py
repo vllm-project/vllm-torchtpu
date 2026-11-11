@@ -1365,7 +1365,8 @@ def sparse_ragged_paged_attention(
     lse_lane_dense: bool = False,
     lse_mask_empty: bool = False,
     fused_window_prep: bool = False,
-) -> jax.Array | tuple[jax.Array, jax.Array]:
+    kv_write: jax.Array | None = None,
+) -> jax.Array | tuple[jax.Array, ...]:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
     Args:
@@ -1438,10 +1439,14 @@ def sparse_ragged_paged_attention(
         indices and the gather's live bound in one Pallas call
         (`prepare_capped_window_fused`). Same gathered rows. Requires
         `lse_mask_empty` (kv_len 0 rows are handed to the kernel as-is).
+      kv_write: With `fused_window_prep`, this step's new tokens as
+        `native_sc_gather.pack_write_rows` packs them. The SparseCore gather
+        writes them into both caches in place before it gathers.
 
     Returns:
       The output of attention, or `(output, lse)` when `return_lse` is set.
-      `lse` is f32[max_num_tokens, actual_num_q_heads].
+      `lse` is f32[max_num_tokens, actual_num_q_heads]. With `kv_write`, the
+      updated `(cache_kv_nope, cache_kv_rope)` follow.
     """
     if cache_layout not in (TENSORCORE_CACHE_LAYOUT, SPARSECORE_CACHE_LAYOUT):
         raise ValueError(
@@ -1576,6 +1581,8 @@ def sparse_ragged_paged_attention(
     )
     if fused_prep and not lse_mask_empty:
         raise ValueError("fused_window_prep requires lse_mask_empty")
+    if kv_write is not None and not fused_prep:
+        raise ValueError("kv_write requires the fused window prep (one gather)")
     if fused_prep:
         assert topk_cap is not None
         # Only the attention kernel reads kv_lens here: the fused prep counts
@@ -1695,7 +1702,10 @@ def sparse_ragged_paged_attention(
             q_pe=q_pe,
             lse_lane_dense=lse_lane_dense,
             lse_mask_empty=lse_mask_empty,
+            kv_write=kv_write,
         )
+        if kv_write is not None:
+            result, (cache_kv_nope, cache_kv_rope) = result
         if return_lse:
             q, lse = result
         else:
@@ -1703,11 +1713,12 @@ def sparse_ragged_paged_attention(
 
     # [max_num_tokens, actual_num_q_heads, actual_head_dim]
     out = prepare_outputs(q, actual_num_q_heads, actual_head_dim)
+    caches = () if kv_write is None else (cache_kv_nope, cache_kv_rope)
     if return_lse:
         if lse_lane_dense:
-            return out, cast(jax.Array, lse)[:, :actual_num_q_heads]
-        return out, cast(jax.Array, lse)[:, :actual_num_q_heads, 0]
-    return out
+            return out, cast(jax.Array, lse)[:, :actual_num_q_heads], *caches
+        return out, cast(jax.Array, lse)[:, :actual_num_q_heads, 0], *caches
+    return (out, *caches) if caches else out
 
 
 def prepare_gather_indices(
@@ -1798,6 +1809,7 @@ def sparse_attention_chunk(
     q_pe: jax.Array | None = None,
     lse_lane_dense: bool = False,
     lse_mask_empty: bool = False,
+    kv_write: jax.Array | None = None,
 ):
     """Gathers and attends query rows `[start_pos, min(end_pos, token_end))`.
 
@@ -1822,7 +1834,11 @@ def sparse_attention_chunk(
     `prepare_capped_window_fused`): `window_indices` is its 128-lane form and
     carries the gather's live bound, already computed, in the tile after the
     rows. `lse_mask_empty`: kv_len 0 tokens get lse -inf in-kernel.
+    `kv_write` (with `gather_live_in_indices`): the gather first writes this
+    step's packed tokens into both caches; returns `(result, (nope, rope))`.
     """
+    if kv_write is not None and not gather_live_in_indices:
+        raise ValueError("kv_write requires the fused window prep's gather")
     return_lse = lse is not None
     if topk_override is not None:
         topk = topk_override
@@ -2070,19 +2086,21 @@ def sparse_attention_chunk(
                 .transpose(1, 0, 2)
                 .reshape(capped_windows * chunk_size, topk_cap)
             )
-        gathered_nope_buffer, gathered_rope_buffer = (
-            native_sc_gather.dsa_gather_native_sc(
-                cache_kv_nope,
-                cache_kv_rope,
-                window_indices,
-                out_size=chunk_size * topk,
-                atoms_per_batch=gather_atoms,
-                wait_mode=sparsecore_gather_wait_mode,
-                serve_pipelined=sparsecore_gather_pipelined,
-                live_multiple=kernel_batch_size * topk_cap,
-                **live_kwargs,
-            )
+        gathered = native_sc_gather.dsa_gather_native_sc(
+            cache_kv_nope,
+            cache_kv_rope,
+            window_indices,
+            out_size=chunk_size * topk,
+            atoms_per_batch=gather_atoms,
+            wait_mode=sparsecore_gather_wait_mode,
+            serve_pipelined=sparsecore_gather_pipelined,
+            live_multiple=kernel_batch_size * topk_cap,
+            kv_write=kv_write,
+            **live_kwargs,
         )
+        gathered_nope_buffer, gathered_rope_buffer = gathered[:2]
+        if kv_write is not None:
+            cache_kv_nope, cache_kv_rope = gathered[2:]
         gathered_nope_buffer = gathered_nope_buffer.reshape(
             capped_windows * chunk_size, topk_cap, 128
         )
@@ -2136,7 +2154,7 @@ def sparse_attention_chunk(
     # We treat each query token as a one independent sequence, attend to their
     # respective gathered kv tokens in the `gathered_kv_buffer`.
     # -1 in topk_indices is padded elements at the end of each row.
-    return run_mla_kernel(
+    result = run_mla_kernel(
         q,
         gathered_nope_buffer,
         gathered_rope_buffer,
@@ -2146,3 +2164,6 @@ def sparse_attention_chunk(
         kernel_batch_size=kernel_batch_size,
         lse=lse,
     )
+    if kv_write is not None:
+        return result, (cache_kv_nope, cache_kv_rope)
+    return result
