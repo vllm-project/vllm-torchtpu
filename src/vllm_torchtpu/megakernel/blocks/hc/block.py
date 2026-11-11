@@ -294,5 +294,10 @@ class HCSublayer(Block):
 
 def _res_bf16(ctx: Any) -> Any:
     """Stage the residual as BF16 in `scr['xb']` (free after the last layer)."""
-    ctx.scr["xb"][...] = ctx.scr["res"][...].astype(BF16)
+    MB, c = ctx.ex.MB, ctx.ex.resolved_tiles.io_chunk
+    if c and MB % c == 0:  # row chunks (`Tiles.io_chunk`): smaller spill area
+        for r0 in range(0, MB, c):
+            ctx.scr["xb"][r0 : r0 + c] = ctx.scr["res"][r0 : r0 + c].astype(BF16)
+    else:
+        ctx.scr["xb"][...] = ctx.scr["res"][...].astype(BF16)
     return ctx.scr["xb"]

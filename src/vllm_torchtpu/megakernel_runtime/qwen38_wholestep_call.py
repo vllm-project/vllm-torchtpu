@@ -169,6 +169,7 @@ def wholestep_tiles(B: int, max_groups: int = 0) -> Tiles:
     # VLLM_TPU_MK_BUCKET_TUNE: per-bucket core / block knobs (BUCKET_TUNE, by row bucket).
     if envs.VLLM_TPU_MK_BUCKET_TUNE:
         t = _apply_tile_overrides(t, BUCKET_TUNE.get(B, {}))
+    t = _vmem_cuts(t, B)
     # VLLM_TPU_MK_TILES="nbd=14,rel_fetch=1,gdn.gdn_bufs=3" (bench sweeps): any core field or
     # `<block>.<field>` tunable.
     over = os.environ.get("VLLM_TPU_MK_TILES", "")
@@ -182,6 +183,51 @@ def wholestep_tiles(B: int, max_groups: int = 0) -> Tiles:
         nbe, nbd = (int(x) for x in rings.split(":"))
         t = dataclasses.replace(t, nbe=nbe, nbd=nbd)
     return t
+
+
+def _vmem_cuts(t: Tiles, B: int) -> Tiles:
+    """VLLM_TPU_MK_VMEM_CUTS="io,chunk,acc,lean,vmem64,ring" from VLLM_TPU_MK_VMEM_CUT_ROWS
+    rows up (default 33): VMEM cuts that keep every output bitwise (~/q38f/d1/VMEM_C.md).
+    `io`: hidden input / output in HBM (`Tiles.hbm_io`, -2 x [M, H] bf16 windows);
+    `chunk`: the whole-[MB, H] residual load / final norm / residual staging in 16-row
+    chunks (`Tiles.io_chunk`, -1 x [MB, H] f32 of register-allocator spill); `acc`: the
+    dense accumulator at the blocks' widths (`Tiles.acc_fit`, [MB, 2560] instead of
+    [MB, 10240] f32); `lean`: no unused GDN `pg_raw*` staging under the chunk gather
+    (`Tiles.lean_scratch`, -0.75 MiB); `vmem64`: Mosaic scoped limit 62 -> 64 MiB (the
+    compile still checks the 63.94M device capacity); `ring`: `VMEM_CUT_RINGS`."""
+    cuts = {x for x in os.environ.get("VLLM_TPU_MK_VMEM_CUTS", "").split(",") if x}
+    if not cuts or B < int(os.environ.get("VLLM_TPU_MK_VMEM_CUT_ROWS", "33")):
+        return t
+    upd: dict[str, Any] = {}
+    if "io" in cuts:
+        upd["hbm_io"] = True
+    if "chunk" in cuts:
+        upd["io_chunk"] = 16
+    if "acc" in cuts:
+        upd["acc_fit"] = True
+    if "lean" in cuts:
+        upd["lean_scratch"] = True
+    if "vmem64" in cuts:
+        upd["vmem_mib"] = 64
+    # Spend the freed VMEM on the expert ring (measured without main-KV DCP, whose pair
+    # buffers already cost one slot up to 32 rows).
+    if "ring" in cuts and B in VMEM_CUT_RINGS and not (main_kv_dcp() > 1 and B <= 32):
+        upd["nbe"], upd["nbd"] = VMEM_CUT_RINGS[B]
+    return dataclasses.replace(t, **upd)
+
+
+# (expert, dense) ring slots per bucket with the VMEM cuts on (`ring` in
+# VLLM_TPU_MK_VMEM_CUTS, with io,chunk,acc,lean,vmem64; AOT tpu7x compile at L=5,
+# ~/q38f/d1/VMEM_C.md): the 12-slot expert ring back above 16 rows (stock 6). Device
+# margin (of 63.94M): b32 2.2 MiB at (12, 7) (0.16 at (12, 8)), b48 > 2, b64 0.6,
+# b96 ~0.6 at 9 slots (10: +1.4 over). b24 / b32 only with VLLM_TPU_MK_VMEM_CUT_ROWS <= 24.
+VMEM_CUT_RINGS: dict[int, tuple[int, int]] = {
+    24: (12, 8),
+    32: (12, 7),
+    48: (12, 4),
+    64: (12, 4),
+    96: (9, 3),
+}
 
 
 def _wholestep_tiles(B: int, max_groups: int = 0) -> Tiles:
