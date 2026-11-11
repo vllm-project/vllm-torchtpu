@@ -597,6 +597,8 @@ def _plain_step_runner(num_output, logits, req_id="r0"):
             req_ids=["r0"],
             req_id_to_index={"r0": 0},
             all_greedy=True,
+            no_top_k=True,
+            no_top_p=True,
             num_tokens_no_spec=[1],
             token_ids_cpu=np.zeros((1, 8), dtype=np.int32),
         ),
