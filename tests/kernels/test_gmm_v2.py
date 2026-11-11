@@ -421,10 +421,10 @@ def test_gmm_fp4_hybrid_dequant_matches_reference(fuse_act, monkeypatch):
 @pytest.mark.tpu_test
 @pytest.mark.parametrize("size_m", [128, 512, 2048])
 def test_gmm_fp8_feed_wide_keeps_fp8_tiles(size_m, monkeypatch):
-    """Decode MoE shape whose tile_m growth VMEM stops at 64 rows: under
-    "fp8_feed_wide" it keeps the fp8 32-row tiles, and each row's output is
-    bitwise the one it gets from an lhs small enough for "fp8_feed"'s own
-    fp8 tiles (64 rows)."""
+    """Decode MoE shape whose tile_m grows past FP8_RHS_MAX_BUCKET_M under
+    "fp8_feed": "fp8_feed_wide" keeps the fp8 32-row tiles, and each row's
+    output is bitwise the one it gets from an lhs small enough for
+    "fp8_feed"'s own fp8 tiles (64 rows)."""
     _require_tpu()
 
     in_size, out_size, block_size = 6144, 6144, 128

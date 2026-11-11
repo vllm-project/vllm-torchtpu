@@ -1362,20 +1362,21 @@ def calculate_tiling(
     # rows, and rows cost MXU time on the fp8 rhs feed: use fp8-sized tiles in
     # two buckets. Two such tiles cost what one bf16 tile does, and more
     # buckets would bloat the program (each bucket is a copy of the body).
-    # "fp8_feed_wide" takes them even when VMEM stopped the growth: a tile_m
-    # above FP8_RHS_MAX_BUCKET_M would otherwise drop every bucket to the bf16
-    # dequantize-before-matmul path.
+    # "fp8_feed_wide" takes them up to FP8_RHS_WIDE_MAX_M rows whether or not
+    # tile_m grew: a grown tile_m (buckets of bucket_base 64) or one that VMEM
+    # held at 64 would otherwise drop every bucket above FP8_RHS_MAX_BUCKET_M
+    # to the bf16 dequantize-before-matmul path.
     sublane = _get_lhs_sublane_size(lhs_cfgs.dtype, dims.size_m)
-    if (
-        bucket_base == tile_m
-        and (
-            dims.size_m < 2 * tile_m  # growth stopped by size_m, not VMEM
-            or (
-                _skinny_gmm_path == "fp8_feed_wide"
-                and dims.size_m <= FP8_RHS_WIDE_MAX_M
-            )
+    if fp8_rhs_feed_dtype(lhs_cfgs, rhs_cfgs) is not None and (
+        (
+            bucket_base == tile_m
+            and dims.size_m < 2 * tile_m  # growth stopped by size_m, not VMEM
         )
-        and fp8_rhs_feed_dtype(lhs_cfgs, rhs_cfgs) is not None
+        or (
+            _skinny_gmm_path == "fp8_feed_wide"
+            and buckets is None
+            and dims.size_m <= FP8_RHS_WIDE_MAX_M
+        )
     ):
         if tile_m > FP8_RHS_MAX_BUCKET_M and tile_m % FP8_RHS_TILE_M == 0:
             tile_m = bucket_base = FP8_RHS_TILE_M
