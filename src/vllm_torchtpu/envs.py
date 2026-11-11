@@ -133,6 +133,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_PREFILL_UNION_SHARE_BITS: bool = False
     VLLM_TPU_QSA_PREFILL_UNION_ALPHA: float = 0.0
     VLLM_TPU_QSA_PREFILL_UNION_QK16: bool = False
+    VLLM_TPU_QSA_PREFILL_UNION_QK_AHEAD: bool = False
     VLLM_TPU_QSA_PREFILL_UNION_RUN_TABLES: bool = False
     VLLM_TPU_QSA_PREFILL_UNION_LAZY_SHARE: bool = False
     VLLM_TPU_QSA_PREFILL_UNION_SC_BITSET: bool = False
@@ -969,6 +970,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_TPU_QSA_PREFILL_UNION_ALPHA": env_float("VLLM_TPU_QSA_PREFILL_UNION_ALPHA", 0.0),
     "VLLM_TPU_QSA_PREFILL_UNION_QK16": env_bool("VLLM_TPU_QSA_PREFILL_UNION_QK16"),
+    # qwen4_exp QSA union walk: issue the odd KV tile's QK before the even
+    # tile's softmax and PV in each tile pair, so the QK matmul does not queue
+    # behind them. Same products, same order: bit-identical. Default off.
+    "VLLM_TPU_QSA_PREFILL_UNION_QK_AHEAD": env_bool(
+        "VLLM_TPU_QSA_PREFILL_UNION_QK_AHEAD"
+    ),
     # RUN_TABLES (with LISTED; parked): the walk issued from SparseCore run tables.
     "VLLM_TPU_QSA_PREFILL_UNION_RUN_TABLES": env_bool(
         "VLLM_TPU_QSA_PREFILL_UNION_RUN_TABLES"

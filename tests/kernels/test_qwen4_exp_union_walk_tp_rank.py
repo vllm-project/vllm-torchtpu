@@ -46,6 +46,7 @@ def kernels(monkeypatch):
         "VLLM_TPU_QSA_PREFILL_UNION_KV_TILE",
         "VLLM_TPU_QSA_PREFILL_LEAN",
         "VLLM_TPU_QSA_PREFILL_PREFIX_PAGES",
+        "VLLM_TPU_QSA_PREFILL_UNION_QK_AHEAD",
     ):
         monkeypatch.delenv(name, raising=False)
     yield
@@ -204,3 +205,16 @@ def test_tp_rank_dispatch(kernels, monkeypatch):
     want = _walk(step, kv_tile=512, min_context=1000)
     np.testing.assert_array_equal(_bits(on), _bits(want))
     assert not np.array_equal(_bits(on), _bits(off))
+
+
+@pytest.mark.parametrize("qk16", [False, True])
+def test_tp_rank_walk_qk_ahead_bitwise(kernels, monkeypatch, qk16):
+    """VLLM_TPU_QSA_PREFILL_UNION_QK_AHEAD only reorders the tile pair's work."""
+    step = _step(17)
+    monkeypatch.setenv("VLLM_TPU_QSA_PREFILL_UNION_QK_AHEAD", "0")
+    jax.clear_caches()
+    base = _walk(step, qk16=qk16)
+    monkeypatch.setenv("VLLM_TPU_QSA_PREFILL_UNION_QK_AHEAD", "1")
+    jax.clear_caches()
+    ahead = _walk(step, qk16=qk16)
+    np.testing.assert_array_equal(_bits(ahead), _bits(base))
