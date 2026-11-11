@@ -30,7 +30,15 @@ from vllm_torchtpu.models.vllm.qwen4_exp.pool_allocation import materialize_pool
 from vllm_torchtpu.models.vllm.qwen4_exp.pool_layout import pooled_cache_specs
 
 
-def live_pool(tp=1, device="cpu", num_blocks=64, ssm="bfloat16", k=0, **text_overrides):
+def live_pool(
+    tp=1,
+    device="cpu",
+    num_blocks=64,
+    ssm="bfloat16",
+    k=0,
+    apc=False,
+    **text_overrides,
+):
     cfg = pool_config(tp=tp, ssm=ssm)
     cfg.speculative_config = (
         SimpleNamespace(
@@ -47,8 +55,8 @@ def live_pool(tp=1, device="cpu", num_blocks=64, ssm="bfloat16", k=0, **text_ove
     cfg.model_config.hf_text_config.rope_parameters.pop("mrope_interleaved", None)
     for key, value in text_overrides.items():
         setattr(cfg.model_config.hf_text_config, key, value)
-    cfg.cache_config.enable_prefix_caching = False
-    cfg.cache_config.mamba_cache_mode = "none"
+    cfg.cache_config.enable_prefix_caching = apc
+    cfg.cache_config.mamba_cache_mode = "align" if apc else "none"
     layout, specs = pooled_cache_specs(cfg)
     expected_ssm = torch.float32 if ssm == "float32" else torch.bfloat16
     assert all(
@@ -57,7 +65,9 @@ def live_pool(tp=1, device="cpu", num_blocks=64, ssm="bfloat16", k=0, **text_ove
         if name.endswith(".linear_attn")
     )
     cfg.cache_config.block_size = layout.block_size
-    cfg.cache_config.mamba_block_size = cfg.model_config.max_model_len
+    cfg.cache_config.mamba_block_size = (
+        layout.block_size if apc else cfg.model_config.max_model_len
+    )
     groups = get_kv_cache_groups(cfg, specs)
     config = get_kv_cache_config_from_groups(
         cfg, groups, num_blocks * layout.page_bytes

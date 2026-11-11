@@ -250,3 +250,28 @@ def test_mtp_wire_uses_one_state_page_without_changing_allocation(k):
         tables[3] = list(range(6, 7 + k))
         with pytest.raises(ValueError, match="needs 1 pages"):
             handoff_block_ids(plan, tables, committed_tokens=129, computed_tokens=129)
+
+
+@pytest.mark.parametrize("k", [1, 3])
+def test_mtp_aligned_apc_state_groups_keep_one_wire_page_and_reject_mode_all(k):
+    groups = cache_groups()
+    for i in (3, 4):
+        groups[i] = replace(
+            groups[i],
+            kv_cache_spec=replace(
+                groups[i].kv_cache_spec,
+                mamba_cache_mode="align",
+                num_speculative_blocks=k,
+            ),
+        )
+    plan = build_transfer_groups(groups)
+    assert [g.checkpointed for g in plan] == [False, False, False, True, True]
+    assert [g.request_state_pages for g in plan] == [1, 1, 1, k + 1, k + 1]
+    assert [g.page_count(257) for g in plan] == [3, 3, 1, 1, 1]
+    bad_groups = list(groups)
+    bad_groups[3] = replace(
+        bad_groups[3],
+        kv_cache_spec=replace(bad_groups[3].kv_cache_spec, mamba_cache_mode="all"),
+    )
+    with pytest.raises(NotImplementedError, match="mamba_cache_mode 'none' or 'align'"):
+        build_transfer_groups(bad_groups)

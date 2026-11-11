@@ -439,12 +439,11 @@ def validate_config(cfg):
     transfer = cfg.kv_transfer_config
     if transfer is not None:
         if cfg.speculative_config is not None and (
-            c.enable_prefix_caching
-            or p.prefill_context_parallel_size != 1
+            p.prefill_context_parallel_size != 1
             or p.decode_context_parallel_size != 1
             or p.pipeline_parallel_size != 1
         ):
-            raise ValueError("Qwen4Exp MTP PD requires CP1/PP1 and APC off")
+            raise ValueError("Qwen4Exp MTP PD requires CP1/PP1")
         connector_module = "vllm_torchtpu.models.vllm.qwen4_exp.pd_connector"
         if (
             transfer.kv_connector != "Qwen4ExpRaidenConnector"

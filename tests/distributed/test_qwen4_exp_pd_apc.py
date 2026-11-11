@@ -555,3 +555,433 @@ def test_loaded_state_reaches_actual_next_forward_without_overwriting_cached_sta
         assert torch.equal(buffers[gid][selected.item()], source_words)
         for bid, old in preserved[gid]:
             assert torch.equal(buffers[gid][bid], old)
+
+
+def _mtp_plan(monkeypatch, k: int):
+    from vllm_torchtpu import _patch_vllm_qwen4_raiden_lookahead_hashes
+
+    patched.__wrapped__(monkeypatch)
+    _patch_vllm_qwen4_raiden_lookahead_hashes()
+    for name, value in dict(
+        TPU_KV_RESHARD_TRANSPORT="raiden",
+        TPU_RAIDEN_PREFIX_AWARE_LOAD="1",
+        TPU_RAIDEN_CONTROLLER_ADDRESS="source.test:27000",
+        TPU_RAIDEN_TRANSFER_PARALLELISM="1",
+        TPU_RAIDEN_ENGINE_ID="source-engine",
+        TPU_RAIDEN_JOB_NAME="source",
+        TPU_RAIDEN_QWEN35_ADMISSION="0",
+        TPU_RAIDEN_KIMIK3_ADMISSION="0",
+        TPU_RAIDEN_GLM_ADMISSION="0",
+        TPU_RAIDEN_DSV4_ADMISSION="0",
+        TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL="1",
+    ).items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr(tpu_connector.dist_utils, "get_kv_ips", lambda: "127.0.0.1")
+    monkeypatch.setattr(tpu_connector.dist_utils, "get_kv_ports", lambda: 9100)
+    cfg = pool_config()
+    cfg.model_config.hf_text_config.layer_types = [
+        "linear_attention",
+        "indexed_attention",
+    ]
+    cfg.model_config.hf_text_config.num_hidden_layers = 2
+    cfg.model_config.hf_text_config.ple_layer_ids = [1]
+    cfg.speculative_config = SimpleNamespace(
+        method="mtp",
+        num_speculative_tokens=k,
+        draft_tensor_parallel_size=1,
+        use_eagle=lambda: True,
+        use_multi_module_mtp=lambda: False,
+        use_eagle_block_drop=lambda: True,
+        disable_lookahead_block_hashes=False,
+    )
+    layout, specs = pooled_cache_specs(cfg)
+    cfg.cache_config.block_size = cfg.cache_config.mamba_block_size = layout.block_size
+    draft_names = {name for name, spec in specs.items() if spec.is_draft}
+    groups = get_kv_cache_groups(cfg, specs)
+    for group in groups:
+        group.is_eagle_group = not draft_names.isdisjoint(group.layer_names)
+    pages = 1 + 3 * sum(
+        group.kv_cache_spec.max_num_blocks_per_req(cfg, 4 * layout.block_size)
+        for group in groups
+    )
+    plan = get_kv_cache_config_from_groups(
+        cfg, groups, pages * layout.page_bytes * max(len(g.layer_names) for g in groups)
+    )
+    scheduler_block, hash_block = resolve_kv_cache_block_sizes(plan, cfg)
+    plan.hash_block_size = hash_block
+    plan.cache_hit_alignment_tokens = resolve_cache_hit_alignment_tokens(
+        plan, cfg, scheduler_block, hash_block
+    )
+    return SimpleNamespace(
+        cfg=cfg,
+        layout=layout,
+        plan=plan,
+        block=scheduler_block,
+        hash=hash_block,
+        k=k,
+    )
+
+
+def _mtp_engine(mtp_plan, *, producer: bool):
+    cfg = _make_vllm_config(
+        is_producer=producer, block_size=mtp_plan.block, enable_prefix_caching=True
+    )
+    cfg.cache_config = mtp_plan.cfg.cache_config
+    cfg.kv_transfer_config.kv_connector = "Qwen4ExpRaidenConnector"
+    cfg.kv_transfer_config.kv_role = "kv_producer" if producer else "kv_consumer"
+    cfg.kv_transfer_config.is_kv_consumer = not producer
+    cfg.speculative_config = mtp_plan.cfg.speculative_config
+    cfg.num_prefill_lookahead_tokens = 1
+    cfg.num_hash_lookahead_tokens = 1
+    connector = Qwen4ExpRaidenConnector(cfg, KVConnectorRole.SCHEDULER, mtp_plan.plan)
+    assert connector.connector_scheduler is not None
+    return connector
+
+
+def _mtp_manager(mtp_plan):
+    init_none_hash(sha256)
+    return KVCacheManager(
+        mtp_plan.plan,
+        max_model_len=mtp_plan.cfg.model_config.max_model_len,
+        scheduler_block_size=mtp_plan.block,
+        hash_block_size=mtp_plan.hash,
+        enable_caching=True,
+        use_eagle=False,
+        num_hash_lookahead_tokens=1,
+        num_prefill_lookahead=1,
+    )
+
+
+def _mtp_request(mtp_plan, name: str, length: int, tokens: list[int] | None = None):
+    return Request(
+        name,
+        [i % 113 for i in range(length)] if tokens is None else list(tokens),
+        SamplingParams(max_tokens=1),
+        None,
+        block_hasher=get_request_block_hasher(
+            mtp_plan.hash, sha256, num_hash_lookahead_tokens=1
+        ),
+    )
+
+
+def _prime_mtp(mtp_plan, cache, length: int):
+    req = _mtp_request(mtp_plan, "prime-mtp", length + 1)
+    scheduler = SimpleNamespace(
+        cache_config=mtp_plan.cfg.cache_config,
+        block_size=mtp_plan.block,
+        hash_block_size=mtp_plan.hash,
+        use_eagle_block_drop=False,
+        num_hash_lookahead_tokens=1,
+        mamba_partial_cache_hit=False,
+        mamba_has_prefill_checkpoint_blocks=False,
+        mamba_shared_prefix_checkpoint=False,
+    )
+    assert Scheduler._mamba_block_aligned_split(scheduler, req, length + 1) == length
+    assert (
+        cache.allocate_slots(req, length, num_lookahead_tokens=mtp_plan.k) is not None
+    )
+    req.num_computed_tokens = length
+    cache.cache_blocks(req, length)
+    cache.new_step_starts()
+    cache.free(req)
+
+
+@pytest.mark.parametrize("producer_k", [1, 3])
+@pytest.mark.parametrize("warm", [False, True])
+def test_mtp_apc_asymmetric_handoff_uses_lookahead_hashes_and_skip_bytes(
+    monkeypatch, producer_k, warm
+):
+    from vllm.v1.core.sched.output import SchedulerOutput
+
+    from vllm_torchtpu.distributed.kv_transfer.tpu_connector import _Stage3PendingSubmit
+
+    p_plan = _mtp_plan(monkeypatch, producer_k)
+    d_plan = _mtp_plan(monkeypatch, 3)
+    assert p_plan.block == d_plan.block
+    p_groups = build_transfer_groups(p_plan.plan.kv_cache_groups)
+    d_groups = build_transfer_groups(d_plan.plan.kv_cache_groups)
+    assert [(g.extent, g.block_size, g.checkpointed) for g in p_groups] == [
+        (g.extent, g.block_size, g.checkpointed) for g in d_groups
+    ]
+
+    # Producer side: multi-chunk aligned prefill retains draft_prompt_seeds and
+    # boundary lookahead hashes until finish, ignoring throwaway sampled output.
+    p_cache = _mtp_manager(p_plan)
+    producer = _mtp_engine(p_plan, producer=True)
+    src_req = _mtp_request(p_plan, "source-mtp", 3 * p_plan.block + 1)
+    expected_tail = src_req.prompt_token_ids[-1]
+    expected_p_hashes = list(src_req.block_hashes)
+    assert len(expected_p_hashes) == 3
+    producer.on_new_request(src_req)
+    assert src_req.num_prompt_tokens == 3 * p_plan.block
+    assert src_req.block_hashes == expected_p_hashes
+    for _ in range(3):
+        assert p_cache.allocate_slots(src_req, p_plan.block) is not None
+        src_req.num_computed_tokens += p_plan.block
+        sched_out = SchedulerOutput.make_empty()
+        sched_out.num_scheduled_tokens = {src_req.request_id: p_plan.block}
+        meta = producer.build_connector_meta(sched_out)
+        assert meta.draft_prompt_seeds == {src_req.request_id: expected_tail}
+    src_req.append_output_token_ids((expected_tail + 7) % 113)
+    assert src_req.block_hashes == expected_p_hashes
+    p_cache.cache_blocks(src_req, 3 * p_plan.block)
+    src_req.status = RequestStatus.FINISHED_LENGTH_CAPPED
+    p_tables = p_cache.get_block_ids_for_computed_tokens(
+        src_req.request_id, 3 * p_plan.block
+    )
+    delay, xfer_params = producer.request_finished_all_groups(src_req, p_tables)
+    assert delay and xfer_params is not None
+    assert xfer_params["num_tokens"] == 3 * p_plan.block
+    assert "qwen_mtp_prompt_digest" in xfer_params
+    send = producer.connector_scheduler.reqs_to_send[src_req.request_id]
+    assert send.group_block_ids is not None
+    for gid, group in enumerate(p_plan.plan.kv_cache_groups):
+        if isinstance(group.kv_cache_spec, MambaSpec):
+            assert len(p_tables[gid]) == 3 + producer_k
+            assert send.group_block_ids[gid] == [p_tables[gid][2]]
+
+    d_cache = _mtp_manager(d_plan)
+    if warm:
+        _prime_mtp(d_plan, d_cache, 2 * d_plan.block)
+        # Exact repeat of 2*B + 1 hits 2*B locally on D (release_only, 0 external).
+        full_hit_req = _mtp_request(d_plan, "full-hit-mtp", 2 * d_plan.block + 1)
+        _, full_count, _ = d_cache.get_computed_blocks(full_hit_req)
+        assert full_count == 2 * d_plan.block
+        # Diverging at token 2*B misses block 1 since draft KV used token 2*B.
+        div_tokens = [i % 113 for i in range(3 * d_plan.block + 1)]
+        div_tokens[2 * d_plan.block] = (div_tokens[2 * d_plan.block] + 1) % 113
+        divergent_req = _mtp_request(
+            d_plan, "divergent-mtp", len(div_tokens), tokens=div_tokens
+        )
+        assert d_cache.get_computed_blocks(divergent_req)[1] == 0
+
+    consumer = _mtp_engine(d_plan, producer=False)
+
+    # Tail mismatch is rejected even when prefix blocks are warm in D's APC.
+    tampered = _mtp_request(d_plan, "tampered-mtp", 3 * d_plan.block + 1)
+    tampered.prompt_token_ids[-1] = (expected_tail + 1) % 113
+    tampered.kv_transfer_params = dict(xfer_params)
+    consumer.on_new_request(tampered)
+    assert consumer.get_num_new_matched_tokens(tampered, 0) == (0, False)
+    release = consumer.connector_scheduler.reqs_to_load[tampered.request_id]
+    assert release.release_only and not release.report_completion
+    consumer.build_connector_meta(SchedulerOutput.make_empty())
+
+    # Continuation sharing [0 .. 2*B] reuses 2*B locally and pulls 1*B suffix.
+    dst_req = _mtp_request(d_plan, "dest-mtp", 3 * d_plan.block + 1)
+    dst_req.kv_transfer_params = dict(xfer_params)
+    consumer.on_new_request(dst_req)
+    hits, count, _ = d_cache.get_computed_blocks(dst_req)
+    assert count == (2 * d_plan.block if warm else 0)
+    external, async_load = consumer.get_num_new_matched_tokens(dst_req, count)
+    assert (external, async_load) == (3 * d_plan.block - count, True)
+    assert (
+        d_cache.allocate_slots(
+            dst_req,
+            0,
+            count,
+            hits,
+            num_external_computed_tokens=external,
+            delay_cache_blocks=True,
+        )
+        is not None
+    )
+    owned = d_cache.get_blocks(dst_req.request_id)
+    before = tuple(tuple(row) for row in owned.get_block_ids())
+    consumer.update_state_after_alloc(dst_req, owned, external)
+    load = consumer.connector_scheduler.reqs_to_load[dst_req.request_id]
+    assert load.skip_tokens == count and load.group_block_ids is not None
+    for group in d_groups:
+        if group.extent is TransferExtent.REQUEST_STATE:
+            col = (
+                (3 * d_plan.block - 1) // group.block_size if group.checkpointed else 0
+            )
+            if group.checkpointed:
+                assert len(before[group.group_index]) == col + 1 + d_plan.k
+            assert load.group_block_ids[group.group_index] == [
+                before[group.group_index][col]
+            ]
+
+    materialized = materialize_pool(
+        d_plan.cfg, d_plan.plan, d_plan.layout, torch.device("cpu")
+    )
+    manifest = build_transfer_manifest(
+        d_plan.plan, materialized, index_tag_fields=d_plan.layout.index_tag_fields
+    )
+    worker = qwen_worker(monkeypatch, producer=False)
+    worker._qwen_page_plan = QwenPagePlan(d_groups, manifest)
+    worker.vllm_config.model_config.max_model_len = 4 * d_plan.block
+    hints = worker._raiden_staging_blocks_per_pool(
+        manifest, d_plan.plan.kv_cache_groups
+    )
+    touched = {}
+    for pool, group_index in worker._page_plan().pool_groups():
+        touched.setdefault(pool.storage_index, set()).update(
+            load.group_block_ids[group_index]
+        )
+    assert all(
+        hint >= len(touched[pool.storage_index])
+        for pool, hint in zip(manifest.pools, hints)
+    )
+    tags, ids, counts = worker._stage3_grouped_destination_pages(load, 3 * d_plan.block)
+    clips = worker._stage3_grouped_skip_bytes(load)
+    token_groups_seen = 0
+    offset = 0
+    for (pool, gid), tag, size, clip in zip(
+        worker._page_plan().pool_groups(), tags, counts, clips
+    ):
+        assert tag == pool.tag
+        actual = ids[offset : offset + size]
+        offset += size
+        group = d_groups[gid]
+        if group.extent is TransferExtent.TOKEN_PAGES:
+            token_groups_seen += 1
+            assert actual == list(before[gid][count // group.block_size :])
+            assert not set(actual).intersection(
+                before[gid][: count // group.block_size]
+            )
+            assert clip == (count // group.block_size) * pool.block_stride_bytes
+        else:
+            assert len(actual) == 1 and clip == 0
+    # Both target self_attn and draft mtp.self_attn skip warm prefix bytes.
+    assert token_groups_seen >= 2
+    worker._stage3_source_facades["source.test:27000"] = (
+        worker._raiden_controller_facade
+    )
+    monkeypatch.setattr(worker, "_stage3_source_work_units", lambda _: ["source"])
+    monkeypatch.setattr(worker, "_raiden_hbm_memory_type", lambda: "HBM")
+    pending = _Stage3PendingSubmit(
+        req_meta=load,
+        source_req_id="source-mtp",
+        destination_req_id=dst_req.request_id,
+        uuid=int(xfer_params["uuid"]),
+        num_tokens=3 * d_plan.block,
+        local_blocks=load.local_block_ids,
+        dst_controller_address="destination.test:28000",
+        dst_units=["destination"],
+        defer_deadline=None,
+        first_attempt_s=time.perf_counter(),
+    )
+    task = worker._stage_stage3_submit_task(pending, synchronous=True)
+    assert task is not None
+    if warm:
+        assert task.call_kwargs["dst_skip_bytes"] == clips
+    else:
+        assert "dst_skip_bytes" not in task.call_kwargs
+
+
+@pytest.mark.parametrize("inline", [False, True])
+@pytest.mark.parametrize("delta", [-1, 0, 1])
+@pytest.mark.parametrize("warm", [False, True])
+def test_mtp_apc_loaded_state_seeds_spec_window_and_clears_recycled_read_offset(
+    monkeypatch, inline, delta, warm
+):
+    from vllm.v1.attention.backends.utils import mamba_get_block_table_tensor
+
+    from tests.runner.test_mamba_state_seed_copies import _collect, _make_self, _sched
+
+    n = _mtp_plan(monkeypatch, 3)
+    cache = _mtp_manager(n)
+    if warm:
+        _prime_mtp(n, cache, n.block)
+    req = _mtp_request(n, "mtp-next-forward", 2 * n.block + delta + 1)
+    hits, count, _ = cache.get_computed_blocks(req)
+    assert count == (n.block if warm else 0)
+    published = 2 * n.block + delta
+    monkeypatch.setattr(
+        tpu_connector.dist_utils, "get_raiden_inline_load", lambda: inline
+    )
+    consumer = _mtp_engine(n, producer=False)
+    from vllm_torchtpu.models.vllm.qwen4_exp.pd_connector import _prompt_digest
+
+    req.kv_transfer_params = dict(
+        req_id="source",
+        uuid=197,
+        num_tokens=published,
+        src_controller_address="source.test:27000",
+        src_job_name="source",
+        src_engine_id="source-engine",
+        src_data_replica_idx=0,
+        src_parallelism=1,
+        dst_tp_size=1,
+        dst_dcp_size=1,
+        qwen_mtp_prompt_digest=_prompt_digest(req.prompt_token_ids),
+    )
+    consumer.on_new_request(req)
+    assert consumer.get_num_new_matched_tokens(req, count) == (
+        published - count,
+        not inline,
+    )
+    assert (
+        cache.allocate_slots(
+            req,
+            int(inline),
+            count,
+            hits,
+            num_lookahead_tokens=n.k if inline else 0,
+            num_external_computed_tokens=published - count,
+            delay_cache_blocks=True,
+        )
+        is not None
+    )
+    consumer.update_state_after_alloc(
+        req, cache.get_blocks(req.request_id), published - count
+    )
+    load = consumer.connector_scheduler.reqs_to_load[req.request_id]
+    assert load.group_block_ids is not None
+    state_groups = [
+        (i, group.kv_cache_spec)
+        for i, group in enumerate(n.plan.kv_cache_groups)
+        if isinstance(group.kv_cache_spec, MambaSpec)
+    ]
+    source_words = torch.tensor([197, published, -71, 0x12345678], dtype=torch.int32)
+    buffers = {}
+    preserved = {}
+    read_offsets = torch.zeros(n.plan.num_blocks + 8, dtype=torch.int32)
+    for gid, _ in state_groups:
+        raw = torch.arange((n.plan.num_blocks + 8) * 4, dtype=torch.int32).reshape(
+            -1, 4
+        )
+        cached = [block.block_id for block in hits.blocks[gid] if not block.is_null]
+        preserved[gid] = [(bid, raw[bid].clone()) for bid in cached]
+        destination = load.group_block_ids[gid][0]
+        assert destination not in cached
+        raw[destination] = source_words
+        # Simulate a recycled block retaining a non-zero MTP read offset.
+        read_offsets[destination] = 2
+        buffers[gid] = raw
+    req.num_computed_tokens = published
+    if not inline:
+        assert cache.allocate_slots(req, 1, num_lookahead_tokens=n.k) is not None
+    tables = cache.get_blocks(req.request_id).get_block_ids()
+    runner, _ = _make_self(
+        [req.request_id],
+        [published],
+        [[tables[gid]] for gid, _ in state_groups],
+        state_block_size=n.block,
+        num_cols=max(len(tables[gid]) for gid, _ in state_groups) + 2,
+        ckpt_window=1 + n.k,
+        read_offsets=read_offsets,
+    )
+    # First D forward: new owner must ignore stale recycled read_offset=2.
+    runner._mamba_offset_seeded.clear()
+    runner._mamba_copy_plan = [
+        (i + 1, [buffers[gid]]) for i, (gid, _) in enumerate(state_groups)
+    ]
+    _collect(runner, _sched({req.request_id: 1}))
+    for raws, src, dst in runner._pending_mamba_state_copies:
+        for raw in raws:
+            raw[dst.long()] = raw[src.long()]
+    for gid, spec in state_groups:
+        selected = mamba_get_block_table_tensor(
+            torch.tensor([tables[gid]], dtype=torch.int32),
+            torch.tensor([published + 1], dtype=torch.int32),
+            spec,
+            "align",
+        )
+        ckpt0 = int(selected[0, 0].item())
+        assert torch.equal(buffers[gid][ckpt0], source_words)
+        if delta == 0:
+            assert int(read_offsets[ckpt0].item()) == 0
+        for bid, old in preserved[gid]:
+            assert torch.equal(buffers[gid][bid], old)

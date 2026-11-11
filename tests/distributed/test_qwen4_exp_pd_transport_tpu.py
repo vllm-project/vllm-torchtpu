@@ -88,11 +88,13 @@ def _run_role(role: str, exchange: Path) -> None:
 
     settings = _receive(exchange / "test-config.json")
     ssm_dtype = settings["ssm_dtype"]
+    apc = settings.get("apc", False)
+    skip_blocks = settings.get("skip_blocks", 0)
     k = settings["producer_k" if role == "prefill" else "consumer_k"]
     source_capacity = 256 if settings["producer_k"] else 128
     capacity = source_capacity if role == "prefill" else source_capacity * 5 // 4
     config, materialized = live_pool(
-        device="tpu", num_blocks=capacity, ssm=ssm_dtype, k=k
+        device="tpu", num_blocks=capacity, ssm=ssm_dtype, k=k, apc=apc
     )
     manifest = build_transfer_manifest(config, materialized)
     source_bytes, before = [], []
@@ -160,7 +162,8 @@ def _run_role(role: str, exchange: Path) -> None:
     worker.tp_rank = 0
     worker.tp_size = 1
     worker._qwen_page_plan = QwenPagePlan(groups, manifest)
-    num_tokens = 129
+    skip_tokens = skip_blocks * page_tokens
+    num_tokens = (skip_blocks + 1) * page_tokens + 1 if apc else 129
     source_tables, dest_tables = [], []
     cursor = 1
     for group in worker._qwen_page_plan.groups:
@@ -180,10 +183,11 @@ def _run_role(role: str, exchange: Path) -> None:
         src_data_replica_idx=0,
         local_block_ids=dest_tables[0],
         group_block_ids=dest_tables,
-        skip_tokens=0,
+        skip_tokens=skip_tokens,
         src_parallelism=1,
     )
     tags, blocks, counts = worker._stage3_grouped_destination_pages(load, num_tokens)
+    clips = worker._stage3_grouped_skip_bytes(load)
     assert len(tags) == len(manifest.pools) == len(materialized.kv_caches)
     if role == "prefill":
         send = SendMeta(
@@ -251,6 +255,7 @@ def _run_role(role: str, exchange: Path) -> None:
                 num_tokens=num_tokens,
                 transfer_pool_tags=tags,
                 dst_block_counts=counts,
+                **(dict(dst_skip_bytes=clips) if any(clips) else {}),
             )
             is True
         )
@@ -266,8 +271,14 @@ def _run_role(role: str, exchange: Path) -> None:
     moved = 0
     for pool, group_index in worker._qwen_page_plan.pool_groups():
         stride = pool.block_stride_bytes
+        group = worker._qwen_page_plan.groups[group_index]
+        skipped = (
+            skip_tokens // group.block_size
+            if group.extent is TransferExtent.TOKEN_PAGES
+            else 0
+        )
         for src_page, dst_page in zip(
-            source_tables[group_index], dest_tables[group_index]
+            source_tables[group_index][skipped:], dest_tables[group_index][skipped:]
         ):
             if role == "decode":
                 expected[pool.storage_index][
@@ -300,16 +311,32 @@ def _run_role(role: str, exchange: Path) -> None:
     _receive(exchange / f"{peer_role}-done.json")
 
 
-@pytest.mark.parametrize("ssm_dtype", ["bfloat16", "float32"])
-@pytest.mark.parametrize("producer_k,consumer_k", [(0, 0), (3, 3), (1, 3)])
+@pytest.mark.parametrize(
+    "ssm_dtype,producer_k,consumer_k,apc,skip_blocks",
+    [
+        ("bfloat16", 0, 0, False, 0),
+        ("float32", 0, 0, False, 0),
+        ("bfloat16", 3, 3, False, 0),
+        ("float32", 3, 3, False, 0),
+        ("bfloat16", 1, 3, False, 0),
+        ("float32", 1, 3, False, 0),
+        ("bfloat16", 1, 3, True, 1),
+    ],
+)
 def test_qwen_all_owner_pages_over_native_reshard(
-    tmp_path, ssm_dtype, producer_k, consumer_k
+    tmp_path, ssm_dtype, producer_k, consumer_k, apc, skip_blocks
 ):
     from tests.distributed.tpu_test_utils import prepare_tpu_environment
 
     _publish(
         tmp_path / "test-config.json",
-        dict(ssm_dtype=ssm_dtype, producer_k=producer_k, consumer_k=consumer_k),
+        dict(
+            ssm_dtype=ssm_dtype,
+            producer_k=producer_k,
+            consumer_k=consumer_k,
+            apc=apc,
+            skip_blocks=skip_blocks,
+        ),
     )
     roles = ("prefill", "decode")
     with patch.dict(os.environ):

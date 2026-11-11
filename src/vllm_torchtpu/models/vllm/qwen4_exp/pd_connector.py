@@ -106,9 +106,8 @@ class Qwen4ExpRaidenConnector(TPURaidenConnector):
             parallel.prefill_context_parallel_size != 1
             or parallel.decode_context_parallel_size != 1
             or parallel.pipeline_parallel_size != 1
-            or vllm_config.cache_config.enable_prefix_caching
         ):
-            raise NotImplementedError("Qwen MTP PD requires CP1/PP1 and APC off")
+            raise NotImplementedError("Qwen MTP PD requires CP1/PP1")
         self._draft_prompt_seeds: dict[str, int] = {}
         super().__init__(vllm_config, role, kv_cache_config)
         if (

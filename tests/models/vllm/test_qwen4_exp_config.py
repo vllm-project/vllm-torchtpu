@@ -356,7 +356,9 @@ def test_real_config_hook_accepts_pd_with_aligned_apc_and_independent_expert_rou
     cfg.speculative_config = SimpleNamespace(
         method="mtp", num_speculative_tokens=3, draft_tensor_parallel_size=1
     )
-    with pytest.raises(ValueError, match="MTP PD requires CP1/PP1 and APC off"):
+    validate_config(cfg)
+    cfg.cache_config.mamba_cache_mode = "none"
+    with pytest.raises(ValueError, match="mamba_cache_mode='align'"):
         validate_config(cfg)
 
 

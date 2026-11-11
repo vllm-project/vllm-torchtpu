@@ -98,10 +98,12 @@ def build_transfer_groups(
         if any(
             isinstance(spec, MambaSpec)
             and spec.num_speculative_blocks
-            and spec.mamba_cache_mode != "none"
+            and spec.mamba_cache_mode not in ("none", "align")
             for spec in specs
         ):
-            raise NotImplementedError("Qwen MTP PD request state requires APC off")
+            raise NotImplementedError(
+                "Qwen MTP PD request state requires mamba_cache_mode 'none' or 'align'"
+            )
         result.append(
             TransferGroup(
                 index,

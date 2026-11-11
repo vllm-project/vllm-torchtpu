@@ -1304,24 +1304,125 @@ def test_actual_mtp_cache_contract_binds_wire_scales_and_encoding(monkeypatch, c
     }
 
 
-@pytest.mark.parametrize("option", ["pcp", "dcp", "pp", "apc"])
+@pytest.mark.parametrize("option", ["pcp", "dcp", "pp"])
 def test_mtp_pd_rejects_unimplemented_state_lifecycles(option):
     cfg = _make_vllm_config()
     cfg.kv_transfer_config.kv_role = "kv_producer"
     cfg.speculative_config = SimpleNamespace(method="mtp", num_speculative_tokens=3)
-    if option == "apc":
-        cfg.cache_config.enable_prefix_caching = True
-    else:
-        field = {
-            "pcp": "prefill_context_parallel_size",
-            "dcp": "decode_context_parallel_size",
-            "pp": "pipeline_parallel_size",
-        }[option]
-        setattr(cfg.parallel_config, field, 2)
-    with pytest.raises(
-        NotImplementedError, match="MTP PD requires CP1/PP1 and APC off"
-    ):
+    field = {
+        "pcp": "prefill_context_parallel_size",
+        "dcp": "decode_context_parallel_size",
+        "pp": "pipeline_parallel_size",
+    }[option]
+    setattr(cfg.parallel_config, field, 2)
+    with pytest.raises(NotImplementedError, match="MTP PD requires CP1/PP1"):
         connector(cfg, k=3)
+
+
+@pytest.mark.parametrize("k", [1, 3])
+def test_mtp_pd_apc_checkpointed_state_page_validates_spec_scratch_bounds(
+    monkeypatch, k
+):
+    from vllm_torchtpu.distributed.kv_transfer.tpu_connector import _Stage3TransferGroup
+
+    monkeypatch.setenv("TPU_RAIDEN_PREFIX_AWARE_LOAD", "1")
+    for producer, spec_k in ((True, 1), (False, k)):
+        cfg = _make_vllm_config(is_producer=producer, enable_prefix_caching=True)
+        cfg.kv_transfer_config.kv_role = "kv_producer" if producer else "kv_consumer"
+        cfg.kv_transfer_config.is_kv_consumer = not producer
+        cfg.cache_config.mamba_cache_mode = "align"
+        cfg.speculative_config = SimpleNamespace(
+            method="mtp", num_speculative_tokens=spec_k
+        )
+        groups = cache_groups()
+        for idx in (3, 4):
+            groups[idx] = replace(
+                groups[idx],
+                kv_cache_spec=replace(
+                    groups[idx].kv_cache_spec,
+                    mamba_cache_mode="align",
+                    num_speculative_blocks=spec_k,
+                ),
+            )
+        plan = KVCacheConfig(
+            num_blocks=64,
+            kv_cache_tensors=[],
+            kv_cache_groups=groups,
+            cache_hit_alignment_tokens=128,
+        )
+        admitted = Qwen4ExpRaidenConnector(cfg, KVConnectorRole.SCHEDULER, plan)
+        assert admitted._stage3_transfer_groups[3].checkpointed
+        assert admitted._stage3_transfer_groups[3].request_state_pages == 1 + spec_k
+    monkeypatch.setenv("TPU_RAIDEN_PREFIX_AWARE_LOAD", "0")
+    cfg_bad = _make_vllm_config(is_producer=False, enable_prefix_caching=True)
+    cfg_bad.kv_transfer_config.kv_role = "kv_consumer"
+    cfg_bad.kv_transfer_config.is_kv_consumer = True
+    cfg_bad.cache_config.mamba_cache_mode = "align"
+    cfg_bad.speculative_config = SimpleNamespace(method="mtp", num_speculative_tokens=k)
+    with pytest.raises(ValueError, match="Stage-3 prefix-aware loads"):
+        Qwen4ExpRaidenConnector(cfg_bad, KVConnectorRole.SCHEDULER, plan)
+
+    group = _Stage3TransferGroup(
+        cache_group_index=3,
+        page_tokens=128,
+        request_state=True,
+        checkpointed=True,
+        request_state_pages=1 + k,
+    )
+    scratch = list(range(20, 20 + k))
+    assert group.committed_state_page([0, 17, *scratch], 256) == 17
+    with pytest.raises(ValueError, match="absent from its table"):
+        group.committed_state_page([0, 17, *scratch[:-1]], 256)
+    with pytest.raises(ValueError, match="null or invalid page ID"):
+        group.committed_state_page([0, 0, *scratch], 256)
+
+
+def test_producer_prompt_truncation_refreshes_boundary_block_hashes():
+    from vllm.sampling_params import SamplingParams
+    from vllm.utils.hashing import sha256
+    from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+    from vllm.v1.request import Request
+
+    init_none_hash(sha256)
+    # Legacy hashes (num_hash_lookahead_tokens == 0): trim uncomputed boundary block.
+    legacy_hasher = get_request_block_hasher(4, sha256, num_hash_lookahead_tokens=0)
+    legacy_obj = mtp_connector(k=1)
+    legacy_obj.connector_scheduler.vllm_config.num_hash_lookahead_tokens = 0
+    req = Request(
+        "boundary-legacy",
+        [10, 11, 12, 13, 20, 21, 22, 23],
+        SamplingParams(max_tokens=1),
+        None,
+        block_hasher=legacy_hasher,
+    )
+    original_second_hash = req.block_hashes[1]
+    assert len(req.block_hashes) == 2
+    legacy_obj.on_new_request(req)
+    assert req.num_prompt_tokens == 7
+    assert len(req.block_hashes) == 1
+    req.append_output_token_ids(99)
+    assert len(req.block_hashes) == 2
+    assert req.block_hashes[1] != original_second_hash
+
+    # Lookahead hashes (num_hash_lookahead_tokens == 1): keep the exact boundary
+    # hash covering the popped draft seed token and ignore throwaway sampled output.
+    lookahead_hasher = get_request_block_hasher(4, sha256, num_hash_lookahead_tokens=1)
+    lookahead_obj = mtp_connector(k=1)
+    lookahead_obj.connector_scheduler.vllm_config.num_hash_lookahead_tokens = 1
+    mtp_req = Request(
+        "boundary-lookahead",
+        [10, 11, 12, 13, 20, 21, 22, 23, 77],
+        SamplingParams(max_tokens=1),
+        None,
+        block_hasher=lookahead_hasher,
+    )
+    expected_hashes = list(mtp_req.block_hashes)
+    assert len(expected_hashes) == 2
+    lookahead_obj.on_new_request(mtp_req)
+    assert mtp_req.num_prompt_tokens == 8
+    assert mtp_req.block_hashes == expected_hashes
+    mtp_req.append_output_token_ids(999)
+    assert mtp_req.block_hashes == expected_hashes
 
 
 @pytest.mark.parametrize("k", [0, 1, 3])
