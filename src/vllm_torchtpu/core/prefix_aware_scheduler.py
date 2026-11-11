@@ -703,7 +703,11 @@ class PrefixAwareScheduler(AsyncScheduler):
     def schedule(self, *args, **kwargs):
         from vllm_torchtpu.runner import host_trims
 
-        host_trims.on_scheduler_step(self.vllm_config)
+        # Only with an engine config: the hook's first call configures
+        # process-wide state, and a scheduler built without one has none.
+        vllm_config = getattr(self, "vllm_config", None)
+        if vllm_config is not None:
+            host_trims.on_scheduler_step(vllm_config)
 
         connector = getattr(self, "connector", None)
         if connector is not None:
