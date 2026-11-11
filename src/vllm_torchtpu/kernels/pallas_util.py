@@ -49,6 +49,15 @@ def next_power_of_2(x: int) -> int:
     return 1 << (x - 1).bit_length()
 
 
+def align_second_minor_sublanes(rows: int, dtype) -> int:
+    """Align `shape[-2]` to Mosaic's TPU VMEM sublane tile for `dtype`."""
+    assert rows > 0
+    packing = get_dtype_packing(dtype)
+    full_tile = 8 * packing
+    tile = full_tile if rows >= full_tile else max(packing, next_power_of_2(rows))
+    return align_to(rows, tile)
+
+
 def get_tpu_version() -> int:
     """Return the numeric TPU generation, or `-1` if not on TPU."""
     kind = jax.devices()[0].device_kind

@@ -21,18 +21,24 @@ from jax import lax
 from vllm_torchtpu.kernels.pallas_util import broadcast_minor
 
 
-def _mask_and(mask, new_mask):
-    if mask is None:
-        return new_mask
-    return jnp.logical_and(mask, new_mask)
+def mask_v_tile(v, *, processed_kv_len, effective_kv_len, span_int_ty):
+    """Zero out value rows at or past `effective_kv_len` across 128-lane folds."""
+    assert v.ndim == 2 and v.shape[1] % 128 == 0
+    v_span_128 = jnp.asarray(
+        processed_kv_len, dtype=span_int_ty
+    ) + lax.broadcasted_iota(span_int_ty, (v.shape[0], 128), 0)
+    v_valid = broadcast_minor(
+        v_span_128 < jnp.asarray(effective_kv_len, dtype=span_int_ty), v.shape
+    )
+    return jnp.where(v_valid, v, 0.0)
 
 
 def flash_attention_step1_qk_softmax(
     q,
     k,
-    v,
-    l_ref,
-    m_ref,
+    v=None,
+    l_ref=None,
+    m_ref=None,
     *,
     processed_q_len,
     processed_kv_len,
@@ -42,19 +48,23 @@ def flash_attention_step1_qk_softmax(
     out_dtype,
     mask_value,
     span_int_ty=jnp.int32,
+    max_kv_len: int | None = None,
     use_causal_mask: bool = True,
     skip_kv_mask: bool = False,
     sliding_window: int | None = None,
     soft_cap: float | None = None,
     q_scale: float | None = None,
     k_scale: float | None = None,
+    k_norm_row=None,
 ):
     """Compute FlashAttention-2 `Q @ K^T`, masking, online rowmax/softmax, and `l/m`.
 
     Args:
       q: Query tile of shape `[actual_bq_csz * num_q_heads_per_kv_head, head_dim]`.
       k: Key tile of shape `[bkv_csz, head_dim]`.
-      v: Value tile of shape `[bkv_csz, head_dim]`.
+      v: Optional value tile of shape `[bkv_csz, head_dim]`. When `None` (e.g.
+        when the caller masks `v` once outside an inner `bq_start` loop), `v`
+        masking is skipped and `None` is returned in its place.
       l_ref: Online softmax row-sum ref of shape
         `[actual_bq_csz * num_q_heads_per_kv_head, 128]`.
       m_ref: Online softmax row-max ref of shape
@@ -63,29 +73,37 @@ def flash_attention_step1_qk_softmax(
       processed_kv_len: Starting sequence position of the current KV sub-tile.
       effective_kv_len: Effective sequence KV length for valid-token masking.
       num_q_heads_per_kv_head: Padded number of query heads per KV head.
-      sm_scale: Softmax scale applied to `Q @ K^T`.
+      sm_scale: Softmax scale applied to `Q @ K^T` in `float32` before casting.
       out_dtype: Accumulator/softmax dtype (`float32` or `bfloat16`).
       mask_value: Fill value for masked attention scores.
       span_int_ty: Integer dtype (`int16` or `int32`) used for Q/KV index spans.
+      max_kv_len: Optional upper bound (`pages_per_seq * page_size`) on `kv_len`;
+        skips the sliding-window comparison when `sliding_window >= max_kv_len`.
       use_causal_mask: Whether to apply causal masking (`q_span >= k_span`).
       skip_kv_mask: Whether to skip `< effective_kv_len` masking on K and V.
-      sliding_window: Optional sliding-window length (`q_span < k_span + sw`).
+      sliding_window: Optional sliding-window length (`(q_span - k_span) < sw`).
       soft_cap: Optional logit soft-capping threshold.
       q_scale: Optional query quantization scale.
       k_scale: Optional key quantization scale.
+      k_norm_row: Optional per-token key norm factor of shape `[1, bkv_csz]`
+        multiplied in `float32` alongside `sm_scale`.
 
     Returns:
       `(p, v, exp_m_diff)` where `p` has shape `[q_rows, bkv_csz]`, `v` is the
-      (optionally tail-zeroed) value tile `[bkv_csz, head_dim]`, and `exp_m_diff`
-      has shape `[q_rows, 128]`.
+      (optionally tail-zeroed) value tile or `None`, and `exp_m_diff` has shape
+      `[q_rows, 128]`.
     """
+    assert l_ref is not None and m_ref is not None
     assert q.ndim == 2
     assert q.shape[0] % num_q_heads_per_kv_head == 0
     q_rows, head_dim = q.shape
     assert k.ndim == 2 and k.shape[1] == head_dim
     bkv_csz = k.shape[0]
-    assert v.shape == (bkv_csz, head_dim)
-    assert k.dtype == v.dtype
+    if v is not None:
+        assert v.shape == (bkv_csz, head_dim)
+        assert k.dtype == v.dtype
+    if k_norm_row is not None:
+        assert k_norm_row.shape == (1, bkv_csz)
     assert l_ref.shape == (q_rows, 128)
     assert m_ref.shape == (q_rows, 128)
 
@@ -96,8 +114,10 @@ def flash_attention_step1_qk_softmax(
             q = jnp.clip(q, min=float(info.min), max=float(info.max))
         q = q.astype(k.dtype)
 
-    s = jnp.matmul(q, k.T, preferred_element_type=jnp.float32).astype(out_dtype)
-    s *= sm_scale
+    s_f32 = jnp.matmul(q, k.T, preferred_element_type=jnp.float32)
+    s = (
+        s_f32 * (k_norm_row * sm_scale if k_norm_row is not None else sm_scale)
+    ).astype(out_dtype)
     if k_scale is not None:
         s *= k_scale
     if q_scale is not None:
@@ -105,24 +125,35 @@ def flash_attention_step1_qk_softmax(
     if soft_cap is not None:
         s = soft_cap * jnp.tanh(s / soft_cap)
 
-    processed_q_int = jnp.asarray(processed_q_len, dtype=span_int_ty)
-    processed_kv_int = jnp.asarray(processed_kv_len, dtype=span_int_ty)
-    effective_kv_int = jnp.asarray(effective_kv_len, dtype=span_int_ty)
-    q_span = processed_q_int + (
-        lax.broadcasted_iota(jnp.int32, s.shape, 0) // num_q_heads_per_kv_head
-    ).astype(span_int_ty)
-    k_span = processed_kv_int + lax.broadcasted_iota(span_int_ty, s.shape, 1)
-    v_span = processed_kv_int + lax.broadcasted_iota(span_int_ty, v.shape, 0)
-
+    apply_sliding_window = (
+        sliding_window is not None
+        and (max_kv_len is None or sliding_window < max_kv_len)
+        and sliding_window <= jnp.iinfo(span_int_ty).max
+    )
     mask = None
-    if use_causal_mask:
-        assert not skip_kv_mask
-        mask = _mask_and(mask, q_span >= k_span)
-    if not skip_kv_mask:
-        mask = _mask_and(mask, k_span < effective_kv_int)
-        v = jnp.where(v_span < effective_kv_int, v, 0.0)
-    if sliding_window is not None:
-        mask = _mask_and(mask, q_span < k_span + sliding_window)
+    if not skip_kv_mask or use_causal_mask or apply_sliding_window:
+        processed_kv_int = jnp.asarray(processed_kv_len, dtype=span_int_ty)
+        effective_kv_int = jnp.asarray(effective_kv_len, dtype=span_int_ty)
+        k_span = processed_kv_int + lax.broadcasted_iota(span_int_ty, s.shape, 1)
+        if not skip_kv_mask:
+            mask = k_span < effective_kv_int
+            if v is not None:
+                v_span = processed_kv_int + lax.broadcasted_iota(
+                    span_int_ty, v.shape, 0
+                )
+                v = jnp.where(v_span < effective_kv_int, v, 0.0)
+        if use_causal_mask or apply_sliding_window:
+            q_span = jnp.asarray(processed_q_len, dtype=span_int_ty) + (
+                lax.broadcasted_iota(jnp.int32, s.shape, 0) // num_q_heads_per_kv_head
+            ).astype(span_int_ty)
+            if use_causal_mask:
+                assert not skip_kv_mask
+                causal = q_span >= k_span
+                mask = causal if mask is None else jnp.logical_and(mask, causal)
+            if apply_sliding_window:
+                assert sliding_window is not None
+                sw = (q_span - k_span) < sliding_window
+                mask = sw if mask is None else jnp.logical_and(mask, sw)
     if mask is not None:
         s = jnp.where(mask, s, cast(float, mask_value))
 
@@ -134,8 +165,7 @@ def flash_attention_step1_qk_softmax(
 
     p_rowsum = jnp.sum(p, axis=1, keepdims=True, dtype=out_dtype)
     exp_m_diff = jnp.exp(m_prev - m_curr)
-    l_prev = l_ref[...]
-    l_ref[...] = exp_m_diff * l_prev + p_rowsum
+    l_ref[...] = exp_m_diff * l_ref[...] + p_rowsum
     return p, v, exp_m_diff
 
 

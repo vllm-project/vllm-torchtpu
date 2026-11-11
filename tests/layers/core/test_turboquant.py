@@ -25,6 +25,7 @@ from vllm.model_executor.layers.quantization.turboquant.config import (
     TurboQuantConfig,
 )
 
+from tests.kernels.rpa_v3_test_utils import make_tq_layout_and_tables
 from vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel import (
     ref_ragged_paged_attention,
 )
@@ -38,17 +39,10 @@ def _bf16_round_np(x: np.ndarray) -> np.ndarray:
     return (((u32 + 0x7FFF + ((u32 >> 16) & 1)) >> 16) << 16).view(np.float32)
 
 
-def _layout_and_tables(preset: str, head_dim: int):
-    cfg = TurboQuantConfig.from_cache_dtype(preset, head_dim)
-    layout = tq.TQLayout.from_tq_config(cfg)
-    centroids = get_centroids(head_dim, cfg.centroid_bits).numpy()
-    return layout, tq.make_tables(layout, centroids)
-
-
 def test_tq_layout_validation():
     """TQLayout rejects unsupported head_dim and page_size values with ValueError."""
-    fp8_layout, _ = _layout_and_tables("turboquant_k8v4", 128)
-    mse_layout, _ = _layout_and_tables("turboquant_4bit_nc", 128)
+    fp8_layout, _ = make_tq_layout_and_tables("turboquant_k8v4", 128)
+    mse_layout, _ = make_tq_layout_and_tables("turboquant_4bit_nc", 128)
 
     assert fp8_layout.supported_page_sizes == (16, 32, 64)
     assert mse_layout.supported_page_sizes == (16, 64)
@@ -90,7 +84,7 @@ def test_tq_layout_validation():
 )
 def test_vreg_pack_update_dequant_roundtrip(preset, page_size, head_dim):
     """Quantize -> pack -> VREG page update -> VREG dequant approximates Q.K and V."""
-    layout, tables = _layout_and_tables(preset, head_dim)
+    layout, tables = make_tq_layout_and_tables(preset, head_dim)
     page_words = layout.page_words_128(page_size)
     assert page_words % 8 == 0
     assert layout.page_size_from_words_128(page_words) == page_size
@@ -190,7 +184,7 @@ def test_tq_ragged_paged_attention_and_skip_update(preset, head_dim):
     """Prefill + decode attention approximates exact RPA and respects skip_kv_update."""
     page_size, num_pages = 16, 12
     num_q_heads, num_kv_heads = 4, 2
-    layout, tables = _layout_and_tables(preset, head_dim)
+    layout, tables = make_tq_layout_and_tables(preset, head_dim)
     rng = np.random.default_rng(7)
     sm_scale = head_dim**-0.5
 
@@ -213,7 +207,7 @@ def test_tq_ragged_paged_attention_and_skip_update(preset, head_dim):
     page_words = layout.page_words_128(page_size)
     tq_cache = jnp.zeros((num_pages, num_kv_heads, page_words, 128), jnp.uint8)
     with jax.default_matmul_precision("float32"):
-        tq_cache, _ = tq.tq_ragged_paged_attention(
+        tq_cache, _ = tq.ref_tq_ragged_paged_attention(
             hq,
             hk,
             hv,
@@ -228,7 +222,7 @@ def test_tq_ragged_paged_attention_and_skip_update(preset, head_dim):
             sm_scale=sm_scale,
         )
         # Verify skip_kv_update=True leaves cache bitwise identical.
-        unchanged_cache, _ = tq.tq_ragged_paged_attention(
+        unchanged_cache, _ = tq.ref_tq_ragged_paged_attention(
             q,
             k,
             v,
@@ -245,7 +239,7 @@ def test_tq_ragged_paged_attention_and_skip_update(preset, head_dim):
         )
         np.testing.assert_array_equal(np.asarray(unchanged_cache), np.asarray(tq_cache))
 
-        tq_cache, tq_out = tq.tq_ragged_paged_attention(
+        tq_cache, tq_out = tq.ref_tq_ragged_paged_attention(
             q,
             k,
             v,
@@ -287,3 +281,63 @@ def test_tq_ragged_paged_attention_and_skip_update(preset, head_dim):
     # Unallocated pages in the pool must remain all-zero.
     untouched = [p for p in range(num_pages) if p not in {2, 5, 1, 4}]
     assert not np.any(np.asarray(tq_cache)[untouched])
+
+
+@pytest.mark.parametrize("preset", ["turboquant_k8v4", "turboquant_4bit_nc"])
+def test_tq_hook_caching_across_equal_tables(preset: str) -> None:
+    """Verify equal `TQTables` and `make_tables` calls reuse identical static hooks."""
+    cfg = TurboQuantConfig.from_cache_dtype(preset, 128)
+    layout = tq.TQLayout.from_tq_config(cfg)
+    centroids = get_centroids(128, cfg.centroid_bits).numpy()
+    t1 = tq.make_tables(layout, centroids)
+    t2 = tq.make_tables(layout, centroids.copy())
+    t3 = tq.TQTables(
+        hadamard=t1.hadamard.copy(),
+        centroids=t1.centroids.copy(),
+        midpoints=t1.midpoints.copy(),
+    )
+    assert t1 is t2 and t1 == t3 and hash(t1) == hash(t3)
+
+    d1 = tq._get_tq_dequant_page_fn(layout, t1)
+    d2 = tq._get_tq_dequant_page_fn(layout, t3)
+    u1, u2 = tq._get_tq_update_page_fn(layout), tq._get_tq_update_page_fn(layout)
+    assert d1 is d2 and hash(d1) == hash(d2)
+    assert u1 is u2 and hash(u1) == hash(u2)
+
+
+@pytest.mark.parametrize("preset", ["turboquant_k8v4", "turboquant_4bit_nc"])
+def test_tq_ragged_paged_attention_input_validation(preset: str) -> None:
+    """Verify upfront Q/K/V, `kv_cache` dtype/rank, and `layer_idx` checks."""
+    layout, tables = make_tq_layout_and_tables(preset, 128)
+    q = jnp.zeros((4, 4, 128), jnp.bfloat16)
+    k = jnp.zeros((4, 2, 128), jnp.bfloat16)
+    pw = layout.page_words_128(16)
+    c4 = jnp.zeros((4, 2, pw, 128), jnp.uint8)
+    c5 = jnp.zeros((4, 3, 2, pw, 128), jnp.uint8)
+    meta = (
+        jnp.array([4], jnp.int32),
+        jnp.array([0], jnp.int32),
+        jnp.array([0, 4], jnp.int32),
+        jnp.array([0, 1, 1], jnp.int32),
+    )
+    base = dict(layout=layout, tables=tables, sm_scale=1.0)
+
+    with pytest.raises(ValueError, match="share one dtype"):
+        tq.tq_ragged_paged_attention(q, k, k.astype(jnp.float32), c4, *meta, **base)
+    with pytest.raises(ValueError, match="floating-point"):
+        tq.tq_ragged_paged_attention(
+            q.astype(jnp.int32),
+            k.astype(jnp.int32),
+            k.astype(jnp.int32),
+            c4,
+            *meta,
+            **base,
+        )
+    with pytest.raises(ValueError, match="uint8 TurboQuant kv_cache"):
+        tq.tq_ragged_paged_attention(
+            q, k, k, c5.astype(jnp.bfloat16), *meta, layer_idx=jnp.int32(0), **base
+        )
+    with pytest.raises(ValueError, match="layer_idx must be None"):
+        tq.tq_ragged_paged_attention(q, k, k, c4, *meta, layer_idx=jnp.int32(0), **base)
+    with pytest.raises(ValueError, match="layer_idx is required"):
+        tq.tq_ragged_paged_attention(q, k, k, c5, *meta, **base)

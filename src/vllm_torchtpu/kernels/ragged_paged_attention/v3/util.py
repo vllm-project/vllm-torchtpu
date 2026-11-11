@@ -20,6 +20,7 @@ import jax
 import jax.numpy as jnp
 
 from vllm_torchtpu.kernels.pallas_util import (
+    align_to,
     cdiv,
     get_dtype_packing,
     get_tpu_version,
@@ -46,14 +47,15 @@ class RpaCase(Enum):
             RpaCase.MIXED: "m",
         }[self]
 
-    def get_range(self, distribution):
+    def get_range(self, distribution, *, has_prefill_pass: bool = True):
         assert distribution.shape == (3,)
         if self == RpaCase.DECODE:
             return 0, distribution[0]
         if self == RpaCase.PREFILL:
             return distribution[0], distribution[1]
         if self == RpaCase.MIXED:
-            return distribution[1], distribution[2]
+            start = distribution[1] if has_prefill_pass else distribution[0]
+            return start, distribution[2]
         raise ValueError(f"Unsupported RPA case: {self}")
 
 
@@ -61,13 +63,14 @@ def get_span_int_dtype(
     q_dtype,
     pages_per_seq: int,
     page_size: int,
+    bkv_csz: int = 1,
     *,
     tpu_version: int | None = None,
 ):
-    """Return `int16` if `pages_per_seq * page_size` fits on TPU v6+, else `int32`."""
+    """Return `int16` if the `bkv_csz`-aligned KV span fits on TPU v6+, else `int32`."""
     if tpu_version is None:
         tpu_version = get_tpu_version()
-    max_kv_len = pages_per_seq * page_size
+    max_kv_len = align_to(pages_per_seq * page_size, bkv_csz)
     if (
         get_dtype_packing(q_dtype) != 1
         and tpu_version >= 6

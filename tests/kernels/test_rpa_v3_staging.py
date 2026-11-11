@@ -24,6 +24,7 @@ import numpy as np
 import pytest
 from jax.experimental.pallas import tpu as pltpu
 
+from tests.kernels.rpa_v3_test_utils import require_tpu
 from vllm_torchtpu.kernels import pallas_util
 from vllm_torchtpu.kernels.ragged_paged_attention.v3 import (
     flash_attention,
@@ -33,15 +34,6 @@ from vllm_torchtpu.kernels.ragged_paged_attention.v3 import (
     pipeline,
     util,
 )
-
-
-def _require_tpu() -> None:
-    try:
-        backend = jax.default_backend()
-    except Exception as exc:
-        pytest.fail(f"JAX TPU backend failed to initialize: {exc}")
-    if backend != "tpu":
-        pytest.fail(f"Expected JAX TPU backend, got {backend}.")
 
 
 @pytest.mark.parametrize("target_cols", [128, 256, 384])
@@ -66,58 +58,70 @@ def test_has_bank_conflicts(stride: int, expected: bool) -> None:
 
 
 @pytest.mark.parametrize(
-    ("dtype_name", "pages_per_seq", "page_size", "tpu_version", "want_i16"),
+    ("dtype_name", "pages_per_seq", "page_size", "bkv_csz", "tpu_version", "want_i16"),
     [
-        ("bfloat16", 2047, 16, 6, True),
+        ("bfloat16", 2047, 16, 16, 6, True),
         # 2048 * 16 == 32768 > int16.max (32767) -> must select int32.
-        ("bfloat16", 2048, 16, 6, False),
-        ("bfloat16", 2049, 16, 7, False),
-        ("float32", 64, 16, 7, False),
-        ("bfloat16", 64, 16, 5, False),
-        ("bfloat16", 64, 16, -1, False),
+        ("bfloat16", 2048, 16, 16, 6, False),
+        # Non-power-of-two bkv_csz pushes align_to(32752, 48) = 32784 > 32767.
+        ("bfloat16", 2047, 16, 48, 6, False),
+        ("bfloat16", 2049, 16, 16, 7, False),
+        ("float32", 64, 16, 16, 7, False),
+        ("bfloat16", 64, 16, 16, 5, False),
+        ("bfloat16", 64, 16, 16, -1, False),
     ],
 )
 def test_get_span_int_dtype(
     dtype_name: str,
     pages_per_seq: int,
     page_size: int,
+    bkv_csz: int,
     tpu_version: int,
     want_i16: bool,
 ) -> None:
     q_dtype = getattr(jnp, dtype_name)
     got = util.get_span_int_dtype(
-        q_dtype, pages_per_seq, page_size, tpu_version=tpu_version
+        q_dtype, pages_per_seq, page_size, bkv_csz, tpu_version=tpu_version
     )
     assert got == (jnp.int16 if want_i16 else jnp.int32)
 
 
 @pytest.mark.parametrize(
-    ("case_name", "expected"),
+    ("case_name", "has_prefill", "expected"),
     [
-        ("DECODE", (0, 2)),
-        ("PREFILL", (2, 5)),
-        ("MIXED", (5, 7)),
+        ("DECODE", True, (0, 2)),
+        ("PREFILL", True, (2, 5)),
+        ("MIXED", True, (5, 7)),
+        ("MIXED", False, (2, 7)),
     ],
 )
-def test_rpa_case_get_range(case_name: str, expected: tuple[int, int]) -> None:
+def test_rpa_case_get_range(
+    case_name: str, has_prefill: bool, expected: tuple[int, int]
+) -> None:
     dist = jnp.array([2, 5, 7], dtype=jnp.int32)
-    lo, hi = getattr(util.RpaCase, case_name).get_range(dist)
+    lo, hi = getattr(util.RpaCase, case_name).get_range(
+        dist, has_prefill_pass=has_prefill
+    )
     assert (int(lo), int(hi)) == expected
 
 
 def test_vmem_estimates_match_scratch_shapes() -> None:
     n_kv, n_q_per_kv, head_dim, bq_sz, bkv_sz = 4, 4, 128, 16, 64
-    got_v3 = kernel.get_vmem_estimate_bytes(
+    got_f32 = kernel.get_vmem_estimate_bytes(
         n_kv, n_q_per_kv, head_dim, bq_sz, bkv_sz, jnp.bfloat16, jnp.bfloat16
     )
-    # n_kv=4 -> bkv_stride = 4 + 1 = 5 (bank-conflict padded).
-    want_v3 = (
-        2 * bkv_sz * 5 * 2 * head_dim * 2
-        + 2 * (2 * n_kv * bq_sz * n_q_per_kv * head_dim * 2)
-        + 2 * (n_kv * bq_sz * n_q_per_kv * 128 * 4)
-        + (n_kv * bq_sz * n_q_per_kv * head_dim * 4)
+    got_bf16 = kernel.get_vmem_estimate_bytes(
+        n_kv,
+        n_q_per_kv,
+        head_dim,
+        bq_sz,
+        bkv_sz,
+        jnp.bfloat16,
+        jnp.bfloat16,
+        out_dtype=jnp.bfloat16,
     )
-    assert got_v3 == want_v3
+    scratch_elems = n_kv * bq_sz * n_q_per_kv * (2 * 128 + head_dim)
+    assert got_f32 - got_bf16 == scratch_elems * 2
 
     got_hd64 = kernel_hd64.get_vmem_estimate_bytes(
         n_kv, n_q_per_kv, 64, bq_sz, bkv_sz, jnp.bfloat16, jnp.bfloat16
@@ -272,10 +276,20 @@ def test_get_next_bkv_ids(
 
 
 @pytest.mark.parametrize(
-    ("span_dtype_name", "processed_q", "tile_starts", "effective_kv", "sliding_window"),
+    (
+        "span_dtype_name",
+        "processed_q",
+        "tile_starts",
+        "effective_kv",
+        "sliding_window",
+        "use_k_norm",
+    ),
     [
-        ("int32", 4, (0, 4), 6, None),
-        ("int16", 1024, (894, 898), 902, 128),
+        ("int32", 4, (0, 4), 6, None, False),
+        # High int16 indices where k_span + sliding_window > 32767 would wrap in int16.
+        ("int16", 31998, (27900, 28672), 28676, 4096, False),
+        # Exercises v=None + mask_v_tile + per-token k_norm_row scaling.
+        ("int32", 4, (0, 4), 6, None, True),
     ],
 )
 def test_flash_attention_steps_cpu(
@@ -284,15 +298,22 @@ def test_flash_attention_steps_cpu(
     tile_starts: tuple[int, int],
     effective_kv: int,
     sliding_window: int | None,
+    use_k_norm: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(pltpu, "get_tpu_info", lambda: SimpleNamespace(num_lanes=128))
     rng = np.random.default_rng(0)
-    nq_per_kv, q_tokens, bkv_csz, head_dim = 2, 2, 4, 128
+    nq_per_kv, q_tokens, bkv_csz, head_dim = 2, 2, 4, 256
     q_rows = q_tokens * nq_per_kv
     q = jnp.asarray(rng.standard_normal((q_rows, head_dim), dtype=np.float32))
     ks = [
         jnp.asarray(rng.standard_normal((bkv_csz, head_dim), dtype=np.float32))
+        for _ in tile_starts
+    ]
+    k_norms = [
+        jnp.asarray(rng.uniform(0.5, 2.0, size=(1, bkv_csz)).astype(np.float32))
+        if use_k_norm
+        else None
         for _ in tile_starts
     ]
     vs = [
@@ -306,11 +327,14 @@ def test_flash_attention_steps_cpu(
     mask_val = float(jnp.finfo(jnp.float32).min)
 
     with jax.default_matmul_precision("float32"):
-        for t_start, k_tile, v_tile in zip(tile_starts, ks, vs, strict=True):
+        for t_start, k_tile, k_norm, v_tile in zip(
+            tile_starts, ks, k_norms, vs, strict=True
+        ):
+            v_in = None if use_k_norm else v_tile
             p, v_masked, exp_m_diff = flash_attention.flash_attention_step1_qk_softmax(
                 q,
                 k_tile,
-                v_tile,
+                v_in,
                 l_ref,
                 m_ref,
                 processed_q_len=processed_q,
@@ -322,13 +346,26 @@ def test_flash_attention_steps_cpu(
                 mask_value=mask_val,
                 span_int_ty=span_ty,
                 sliding_window=sliding_window,
+                k_norm_row=k_norm,
             )
+            if use_k_norm:
+                assert v_masked is None
+                v_masked = flash_attention.mask_v_tile(
+                    v_tile,
+                    processed_kv_len=t_start,
+                    effective_kv_len=effective_kv,
+                    span_int_ty=span_ty,
+                )
             flash_attention.flash_attention_step2_pv(
                 p, v_masked, exp_m_diff, o_ref, out_dtype=jnp.float32
             )
 
     got = np.asarray(o_ref[...] / l_ref[:, :1])
-    k_all = np.concatenate([np.asarray(x) for x in ks], axis=0)
+    k_scaled = [
+        np.asarray(k_t) * (1.0 if kn is None else np.asarray(kn).T)
+        for k_t, kn in zip(ks, k_norms, strict=True)
+    ]
+    k_all = np.concatenate(k_scaled, axis=0)
     v_all = np.concatenate([np.asarray(x) for x in vs], axis=0)
     k_pos = np.concatenate(
         [np.arange(s, s + bkv_csz) for s in tile_starts], axis=0
@@ -337,7 +374,7 @@ def test_flash_attention_steps_cpu(
     scores = (np.asarray(q) @ k_all.T) * 0.125
     valid = (k_pos[None, :] < effective_kv) & (q_pos >= k_pos[None, :])
     if sliding_window is not None:
-        valid &= q_pos < k_pos[None, :] + sliding_window
+        valid &= (q_pos - k_pos[None, :]) < sliding_window
     scores = np.where(valid, scores, mask_val)
     probs = np.exp(scores - scores.max(axis=-1, keepdims=True))
     probs /= probs.sum(axis=-1, keepdims=True)
@@ -461,7 +498,7 @@ _PARITY_CASES = (
 @pytest.mark.tpu_test
 @pytest.mark.parametrize("case", _PARITY_CASES, ids=lambda c: c.name)
 def test_rpa_v3_kernel_parity(case: _ParityCase) -> None:
-    _require_tpu()
+    require_tpu()
     rng = np.random.default_rng(42)
     page_size = 16
     num_kv_heads, num_q_heads = 2, 8

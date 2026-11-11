@@ -29,6 +29,9 @@ class BkvStepContext(NamedTuple):
 
     bq_sem_idx: Any
     bkv_sem_idx: Any
+    bkv_idx: Any
+    offset: Any
+    kv_q_gap: Any
     processed_q_len: Any
     processed_kv_len: Any
     effective_kv_len: Any
@@ -98,6 +101,7 @@ def run_rpa_sequence_pipeline(
     bq_csz: int,
     use_causal_mask: bool = True,
     sliding_window: int | None = None,
+    flush_sliding_window_kv_updates: bool = False,
     static_q_len: int | None = None,
     debug_mode: bool = False,
 ) -> None:
@@ -199,6 +203,12 @@ def run_rpa_sequence_pipeline(
                 if sliding_window is None
                 else jnp.maximum(processed_q_len - sliding_window, 0) // bkv_sz
             )
+            next_bq_start_bkv_idx = (
+                0
+                if sliding_window is None
+                else jnp.maximum(processed_q_len + actual_bq_sz - sliding_window, 0)
+                // bkv_sz
+            )
             effective_kv_len = (
                 jnp.minimum(kv_len, processed_q_len + actual_bq_sz)
                 if use_causal_mask
@@ -262,8 +272,15 @@ def run_rpa_sequence_pipeline(
                 )
 
                 # Start updating bkv to kv cache if applicable.
-                # Only needed in last bq loop.
-                @pl.when(jnp.logical_and(update_sz > 0, bq_idx == num_bq - 1))
+                is_last_bkv_visit = (
+                    jnp.logical_or(
+                        bq_idx == num_bq - 1, bkv_idx < next_bq_start_bkv_idx
+                    )
+                    if (flush_sliding_window_kv_updates and sliding_window is not None)
+                    else (bq_idx == num_bq - 1)
+                )
+
+                @pl.when(jnp.logical_and(update_sz > 0, is_last_bkv_visit))
                 def update_cur_bkv_to_cache():
                     kv_update_ring.start(seq_idx, bkv_sem_idx, offset, update_sz)
 
@@ -281,6 +298,9 @@ def run_rpa_sequence_pipeline(
                     BkvStepContext(
                         bq_sem_idx=bq_sem_idx,
                         bkv_sem_idx=bkv_sem_idx,
+                        bkv_idx=bkv_idx,
+                        offset=offset,
+                        kv_q_gap=kv_q_gap,
                         processed_q_len=processed_q_len,
                         processed_kv_len=processed_kv_len,
                         effective_kv_len=effective_kv_len,

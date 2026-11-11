@@ -198,6 +198,8 @@ def get_vmem_estimate_bytes(
     bkv_sz,
     q_dtype,
     kv_dtype,
+    *,
+    out_dtype=jnp.float32,
 ):
     q_packing = get_dtype_packing(q_dtype)
     kv_packing = get_dtype_packing(kv_dtype)
@@ -208,7 +210,7 @@ def get_vmem_estimate_bytes(
         q_dtype=q_dtype,
         kv_tail_shape=(kv_packing, head_dim),
         kv_dtype=kv_dtype,
-        out_dtype=jnp.float32,
+        out_dtype=out_dtype,
         actual_num_kv_heads=actual_num_kv_heads,
         num_q_heads_per_kv_head=num_q_heads_per_kv_head,
         head_dim=head_dim,
@@ -613,17 +615,15 @@ def merge_kv(
     return kv
 
 
-def prepare_inputs(
+def prepare_q(
     q: jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_head_dim],
-    k: jax.Array,  # [max_num_tokens, actual_num_kv_heads, actual_head_dim],
-    v: jax.Array,  # [max_num_tokens, actual_num_kv_heads, actual_head_dim],
+    actual_num_kv_heads: int,
     *,
     fuse_non_tiling_axis_swap: bool | None = None,
 ):
     if fuse_non_tiling_axis_swap is None:
         fuse_non_tiling_axis_swap = envs.USE_RPA_PIPELINED_DMA_STAGING
     max_num_tokens, actual_num_q_heads, actual_head_dim = q.shape
-    actual_num_kv_heads = k.shape[1]
     assert actual_num_q_heads % actual_num_kv_heads == 0
     actual_num_q_heads_per_kv_head = actual_num_q_heads // actual_num_kv_heads
     q_packing = get_dtype_packing(q.dtype)
@@ -653,15 +653,26 @@ def prepare_inputs(
     if not fuse_non_tiling_axis_swap:  # noqa: SIM108 (one comment per path)
         # Legacy path: Separate query axis swap emitting
         # xlu.transpose (Transpose::Execute).
-        q = q_reshaped.swapaxes(0, 1)
-    else:
-        # Fused DMA layout path: Leave query in token-major layout
-        # [max_num_tokens, actual_num_kv_heads, ...] and carry axis permutation
-        # directly in Pallas strided DMA descriptors.
-        q = q_reshaped
+        return q_reshaped.swapaxes(0, 1)
+    # Fused DMA layout path: Leave query in token-major layout
+    # [max_num_tokens, actual_num_kv_heads, ...] and carry axis permutation
+    # directly in Pallas strided DMA descriptors.
+    return q_reshaped
+
+
+def prepare_inputs(
+    q: jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_head_dim],
+    k: jax.Array,  # [max_num_tokens, actual_num_kv_heads, actual_head_dim],
+    v: jax.Array,  # [max_num_tokens, actual_num_kv_heads, actual_head_dim],
+    *,
+    fuse_non_tiling_axis_swap: bool | None = None,
+):
+    q_prepared = prepare_q(
+        q, k.shape[1], fuse_non_tiling_axis_swap=fuse_non_tiling_axis_swap
+    )
     # TODO(kyuyeunk, chengjiyao): Add kv quantization here.
     kv = merge_kv(k, v)
-    return q, kv
+    return q_prepared, kv
 
 
 def prepare_outputs(
