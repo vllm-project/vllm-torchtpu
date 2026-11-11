@@ -224,7 +224,7 @@ class Qwen38WholeStep(nn.Module):
             tiles=wholestep_tiles(buckets[0], max_groups),
         )
         ops = pack_wholestep_operands(model, g, spec, ex, ids)
-        if self.tail:
+        if self.tail and not self.fused:  # L45 packs LAST_LAYER in the main kernel (no tail kernel)
             ops += pack_wholestep_operands(model, g, spec_for(1, 1), ex, tail_ids)
         if envs.VLLM_TPU_MK_HC_FP8:
             logger.info(
