@@ -1313,7 +1313,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 tables = _swa_group_tables(metadata, swa_table.shape)
                 if len(tables) > 1 and any(t is swa.block_tables for t in tables):
                     batched, bounds, records = csa2_adapter.prepare_swa_tables(
-                        torch.stack([t.reshape(swa_table.shape) for t in tables]),
+                        tuple(t.reshape(swa_table.shape) for t in tables),
                         swa.query_start_loc,
                         positions,
                         minimum,

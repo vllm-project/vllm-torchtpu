@@ -403,7 +403,7 @@ def test_metadata_tables_matches_per_table_metadata(seed, non_causal):
     args = tuple(jnp.asarray(x) for x in (starts, positions, minimum))
 
     metadata, bounds, records = csa2_adapter._metadata_tables(
-        jnp.asarray(tables), *args, page, stride, non_causal
+        tuple(jnp.asarray(t) for t in tables), *args, page, stride, non_causal
     )
     for g in range(groups):
         want = prepare_swa_metadata(

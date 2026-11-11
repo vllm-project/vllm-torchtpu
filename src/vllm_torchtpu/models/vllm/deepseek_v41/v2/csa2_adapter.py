@@ -244,7 +244,7 @@ def _metadata(
 
 
 def _metadata_tables(
-    tables: jax.Array,
+    tables: tuple[jax.Array, ...],
     starts: jax.Array,
     positions: jax.Array,
     minimum: jax.Array,
@@ -252,25 +252,30 @@ def _metadata_tables(
     page_stride: int,
     non_causal: bool,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """``_metadata`` for [G,R,W] block tables at row offset 0, in one program.
+    """``_metadata`` for G [R,W] block tables at row offset 0, in one program.
 
-    Only the page lookups depend on the table; vmap keeps the request,
-    window and bound computation unbatched, so it runs once for all tables.
+    The tables stay separate inputs: stacking them would copy every full
+    table each stage. Only the page lookups depend on the table; XLA shares
+    the request, window and bound computation across the G calls.
     """
-    metadata, bounds, records = jax.vmap(
-        lambda table: _metadata(
+    results = [
+        _metadata(
             table, starts, positions, minimum, page_size, page_stride, 0, non_causal
         )
-    )(tables)
-    return metadata, bounds[0], records
+        for table in tables
+    ]
+    metadata = jnp.stack([result[0] for result in results])
+    records = jnp.stack([result[2] for result in results])
+    return metadata, results[0][1], records
 
 
 def _fake_metadata_tables(tables, starts, positions, minimum, page_size, *_):
     columns = (positions.shape[0] + 128 + page_size - 1) // page_size + 1
+    requests = tables[0].shape[0]
     return (
-        tables.new_empty((tables.shape[0], tables.shape[1], 2 + columns)),
-        tables.new_empty((tables.shape[1], 2)),
-        positions.new_empty((tables.shape[0], positions.shape[0])),
+        tables[0].new_empty((len(tables), requests, 2 + columns)),
+        tables[0].new_empty((requests, 2)),
+        positions.new_empty((len(tables), positions.shape[0])),
     )
 
 
@@ -680,17 +685,17 @@ def prepare_swa(
 
 
 def prepare_swa_tables(
-    tables: torch.Tensor,
+    tables: tuple[torch.Tensor, ...],
     starts: torch.Tensor,
     positions: torch.Tensor,
     minimum: torch.Tensor,
     cache: "PagedCacheRows",
     non_causal: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """``prepare_swa`` for [G,R,W] tables at row offset 0: [G,...] metadata
+    """``prepare_swa`` for G [R,W] tables at row offset 0: [G,...] metadata
     and records, with the table-independent bounds shared."""
     return _ops["metadata_tables"](
-        tables.int(),
+        tuple(table.int() for table in tables),
         starts.int(),
         positions.int(),
         minimum.int(),
