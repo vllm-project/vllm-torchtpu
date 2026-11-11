@@ -64,3 +64,26 @@ def register_models() -> None:
     MODELS_CONFIG_MAP["Qwen4ExpForCausalLM"] = TPUQwen4ExpConfig
     MODELS_CONFIG_MAP["Qwen4ExpForConditionalGeneration"] = TPUQwen4ExpConfig
     MODELS_CONFIG_MAP["Qwen2ForCausalLM"] = _TPUQwen2Config
+    register_model_directories()
+
+
+def register_model_directories() -> None:
+    """Call `register()` of every model directory under `vllm_torchtpu.models`.
+
+    A model directory (`models/<model>/`, see its README) registers its own
+    architectures, config hooks, quant methods and KV cache dtypes, so adding
+    a model does not edit this file. Its `__init__` must stay import-free:
+    this runs at plugin load in every process, before vLLM selects a model.
+    """
+    import importlib
+    import pkgutil
+
+    import vllm_torchtpu.models as models
+
+    for module in sorted(pkgutil.iter_modules(models.__path__), key=lambda m: m.name):
+        if not module.ispkg or module.name == "vllm":
+            continue
+        package = importlib.import_module(f"{models.__name__}.{module.name}")
+        register = getattr(package, "register", None)
+        if callable(register):
+            register()
