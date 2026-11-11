@@ -44,13 +44,16 @@ DEFAULT_BLOCK_Q = 16
 # an 8-token verify group then fills a tile alone instead of sharing a
 # 16-token tile (and its page union) with the next request. Twin, c64 verify
 # (32 req x 8 tokens): 416 -> 350 us per call (j-cae78264 vs j-2c36aed7);
-# prefill chunks keep 16 (8 is 7% slower there, j-3eb5e8aa).
+# non-DCP prefill chunks keep 16 (8 is 7% slower there, j-3eb5e8aa).
 SMALL_BATCH_TOKENS = 1024
-# Prefill / mixed-step tiles of the LSE kernel (`msa_attention_lse`, DCP and
-# head-parallel calls): a page's fixed per-visit cost (DMA, unpacking) spreads
-# over twice the rows, and neighbouring tokens share most of their pages.
-# Served c4 xprof, every 8192-token call of one capture timed at 8/16/32-token
-# tiles on the same selections (j-4396c8a5): 11.8 / 7.7 / 5.5 ms in total.
+# Prefill / mixed-step tiles of the DCP LSE calls over 8/16-bit caches: a
+# page's fixed per-visit cost (DMA, unpacking) spreads over twice the rows, and
+# neighbouring tokens share most of their pages. Served c4 xprof, every
+# 8192-token call of one capture timed at 8/16/32-token tiles on the same
+# selections (j-4396c8a5): 11.8 / 7.7 / 5.5 ms in total; twin c4 mixed step
+# 332.8 -> 328.0 ms (j-e1f0a4fa). 4-bit caches keep 16: twin c48 mixed
+# 352.3 -> 363.6 ms (j-c9516e2e), no served measurement. Outputs change by
+# accumulation order only.
 PREFILL_BLOCK_Q = 32
 SMALL_BATCH_BLOCK_Q = 8
 DEFAULT_PAGES_PER_STEP = 16

@@ -874,6 +874,8 @@ def msa_attend_dcp(
         block_q=(
             msa_attention.SMALL_BATCH_BLOCK_Q
             if small
+            else msa_attention.DEFAULT_BLOCK_Q
+            if scale_cache is not None
             else msa_attention.PREFILL_BLOCK_Q
         ),
         pages_per_step=(
