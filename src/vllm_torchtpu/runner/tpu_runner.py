@@ -157,6 +157,7 @@ from vllm_torchtpu.runner.mm_encoder_manager import (
     maybe_create_mm_encoder_manager,
 )
 from vllm_torchtpu.runner.mm_video_chunking import chunked_video_encoding
+from vllm_torchtpu.runner.owned_args import static_shape_args_owned
 from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpecDecodeMetadata,
     SpeculativeDecodingManager,
@@ -764,8 +765,13 @@ _subst_prefix_extract_compiled = _static_shape_args(
 
 # VLLM_TPU_SUBST_STATIC_ARGS: the input ids reaching the async substitution can
 # carry the forward's dynamic-dim stamp, so the same shape compiled a second
-# time mid-run (~10 live compiles per run, ~70 ms each); strip it.
-_substitute_placeholder_token_static = _static_shape_args(_substitute_placeholder_token)
+# time mid-run (~10 live compiles per run, ~70 ms each); strip it. Stripped
+# with an owned alias (not `_static_shape_args`'s `a[:]` view): the program
+# mutates the ids in place, and the caller gets its own input tensor back, so
+# the forward receives exactly the object it gets with the flag off.
+_substitute_placeholder_token_static = static_shape_args_owned(
+    _substitute_placeholder_token
+)
 
 
 def _subtract_num_rejected_tokens_compiled(*args):
