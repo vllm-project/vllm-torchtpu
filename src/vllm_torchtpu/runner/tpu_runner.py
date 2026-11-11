@@ -130,8 +130,11 @@ from vllm_torchtpu.layers.adapter.quantization import get_tpu_quantization_confi
 from vllm_torchtpu.layers.adapter.quantization.online_fp8 import validate_online_fp8
 from vllm_torchtpu.layers.adapter.sample.rejection_sampler import (
     RejectionSampler,
+    initial_rng_counter,
     synthetic_sample_and_assemble,
+    synthetic_sample_and_assemble_rng,
     synthetic_verify_rows,
+    synthetic_verify_rows_rng,
 )
 from vllm_torchtpu.layers.adapter.sample.top_k_top_p import (
     CANDIDATE_BLOCK,
@@ -1136,6 +1139,9 @@ class TPUModelRunner(GPUModelRunner):
         # Dedicated RNG for non-greedy sampling, to keep the draws consistent
         # across a replica's TP ranks (else they diverge -> collective hang).
         self._sampling_generator: torch.Generator | None = None
+        # Device counter of the synthetic verify's in-graph uniforms
+        # (TPU_SPEC_SYNTHETIC_INGRAPH_RNG); seeded like the generator.
+        self._synthetic_rng_counter: torch.Tensor | None = None
         self._spec_glue_logged: set[str] = set()
         # JAX Mesh for shard_map ops in TPU kernels. Real DP is vLLM
         # multi-engine DP, so this per-worker mesh only has a model axis.
@@ -4569,6 +4575,17 @@ class TPUModelRunner(GPUModelRunner):
             self._sampling_generator = gen
         return self._sampling_generator
 
+    def _get_synthetic_rng_counter(self) -> torch.Tensor:
+        """The device int32 counter of the synthetic verify's in-graph
+        uniforms, created on first use from ``model_config.seed`` (the same
+        value on every worker, so a replica's TP ranks draw alike)."""
+        if self._synthetic_rng_counter is None:
+            self._synthetic_rng_counter = torch.tensor(
+                initial_rng_counter(int(self.model_config.seed or 0)),
+                dtype=torch.int32,
+            ).to(self.device)
+        return self._synthetic_rng_counter
+
     def _log_spec_glue_once(self, flag: str) -> None:
         if flag not in self._spec_glue_logged:
             self._spec_glue_logged.add(flag)
@@ -4823,6 +4840,23 @@ class TPUModelRunner(GPUModelRunner):
         assert md.draft_token_ids is not None
         assert self.rejection_sampler is not None
         assert self.rejection_sampler.synthetic_conditional_rates is not None
+        if envs.TPU_SPEC_SYNTHETIC_INGRAPH_RNG:
+            self._log_spec_glue_once("TPU_SPEC_SYNTHETIC_INGRAPH_RNG")
+            accepted_count, rows, recover_draft, self._synthetic_rng_counter = (
+                synthetic_verify_rows_rng(
+                    md.draft_token_ids,
+                    md.draft_lengths,
+                    md.segment_ids,
+                    md.group_indices,
+                    md.target_logits_indices,
+                    md.bonus_logits_indices,
+                    md.final_logits_indices,
+                    self._get_synthetic_rng_counter(),
+                    self.rejection_sampler.synthetic_conditional_rates,
+                )
+            )
+            md.synthetic_verify = (accepted_count, recover_draft)
+            return rows
         accept_u = torch.rand(
             md.draft_token_ids.shape,
             dtype=torch.float32,
@@ -4859,6 +4893,27 @@ class TPUModelRunner(GPUModelRunner):
         temperatures, top_k, top_p = self._build_padded_sampling_params(
             cur_start_idx, cur_end_idx, logits
         )
+        if envs.TPU_SPEC_SYNTHETIC_INGRAPH_RNG:
+            out, self._synthetic_rng_counter = synthetic_sample_and_assemble_rng(
+                logits,
+                recover_draft,
+                accepted_count,
+                temperatures,
+                top_k,
+                top_p,
+                self._get_synthetic_rng_counter(),
+                md.draft_token_ids,
+                md.draft_lengths,
+                md.segment_ids,
+                md.group_indices,
+                self.speculative_config.num_speculative_tokens,
+                topk_candidates=self._sampler_topk_candidates(
+                    cur_start_idx, cur_end_idx, None
+                ),
+                apply_topk_topp=self._sampler_applies_topk_topp(),
+                apply_top_k=self._sampler_applies_top_k(),
+            )
+            return out
         recover_u = torch.rand_like(
             logits, dtype=torch.float32, generator=sampling_generator
         )
@@ -7076,6 +7131,38 @@ class TPUModelRunner(GPUModelRunner):
         ]
         if blocks := self._topk_candidate_blocks():
             variants.append({"topk_candidates": blocks})
+        if envs.TPU_SPEC_SYNTHETIC_INGRAPH_RNG:
+            # A dummy counter: warming must not advance the serving one.
+            counter = torch.zeros((), dtype=torch.int32).to(self.device)
+            accepted_count, _, recover_draft, _ = synthetic_verify_rows_rng(
+                draft_token_ids,
+                draft_lengths,
+                segment_ids,
+                group_indices,
+                target_logits_indices,
+                bonus_logits_indices,
+                target_logits_indices,
+                counter,
+                self.rejection_sampler.synthetic_conditional_rates,
+            )
+            for variant in variants:
+                out, _ = synthetic_sample_and_assemble_rng(
+                    logits,
+                    recover_draft,
+                    accepted_count,
+                    temps,
+                    top_k,
+                    top_p,
+                    counter,
+                    draft_token_ids,
+                    draft_lengths,
+                    segment_ids,
+                    group_indices,
+                    self.speculative_config.num_speculative_tokens,
+                    **variant,
+                )
+                synchronize_tensors(out)
+            return
         for variant in variants:
             out = synthetic_sample_and_assemble(
                 logits,

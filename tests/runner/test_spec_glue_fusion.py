@@ -11,12 +11,27 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""TPU_SPEC_GLUE_FUSION: the glue programs must give the eager sequence's
-values bit for bit."""
+"""TPU_SPEC_GLUE_FUSION and TPU_SPEC_SYNTHETIC_INGRAPH_RNG.
 
+The glue programs must give the eager sequence's values bit for bit. The
+in-graph uniforms must be U[0, 1) at torch.rand's resolution, and the
+synthetic accepts and recovered tokens drawn from them must follow the same
+distributions as with torch.rand.
+"""
+
+import numpy as np
 import pytest
 import torch
+from vllm.v1.spec_decode.utils import unconditional_to_conditional_rates
 
+from vllm_torchtpu.layers.adapter.sample.rejection_sampler import (
+    _synthetic_sample_and_assemble_impl,
+    _synthetic_sample_and_assemble_rng_impl,
+    _synthetic_verify_rows_impl,
+    _synthetic_verify_rows_rng_impl,
+    counter_uniform,
+    initial_rng_counter,
+)
 from vllm_torchtpu.runner.tpu_runner_async_output import (
     INVALID_TOKEN_ID,
     _spec_substitution_glue_impl,
@@ -125,3 +140,152 @@ def test_subtract_with_padded_rejected_bitwise(device, num_reqs, num_tokens, src
         for a, b in zip(out, ref):
             assert a.dtype == b.dtype
             assert torch.equal(a.cpu(), b.cpu())
+
+
+def _uniforms(device, shape, counters):
+    return torch.stack(
+        [
+            counter_uniform(shape, torch.tensor(c, dtype=torch.int32, device=device))
+            for c in counters
+        ]
+    ).cpu()
+
+
+def test_counter_uniform_is_uniform(device):
+    c0 = initial_rng_counter(0)
+    u = _uniforms(device, (4096,), range(c0, c0 + 64)).double()
+    assert u.dtype == torch.float64 and u.min() >= 0.0 and u.max() < 1.0
+    # torch.rand's resolution: multiples of 2**-24.
+    assert torch.equal(u * 2**24, torch.round(u * 2**24))
+    n = u.numel()
+    assert abs(u.mean().item() - 0.5) < 5 * (1 / 12 / n) ** 0.5
+    assert abs(u.var().item() - 1 / 12) < 0.002
+    # 256-bin chi-square, 255 dof: mean 255, sd ~22.6.
+    hist = torch.histc(u.float(), bins=256, min=0.0, max=1.0)
+    exp = n / 256
+    chi2 = (((hist - exp) ** 2) / exp).sum().item()
+    assert chi2 < 255 + 6 * 22.6
+    # No correlation between neighbouring elements nor successive counters.
+    flat = u.view(64, 4096)
+    lag1 = np.corrcoef(flat[:, :-1].flatten(), flat[:, 1:].flatten())[0, 1]
+    step = np.corrcoef(flat[:-1].flatten(), flat[1:].flatten())[0, 1]
+    assert abs(lag1) < 0.01 and abs(step) < 0.01
+    # Words of one draw are distinct (bijective hash).
+    words = (u[0] * 2**24).long()
+    assert words.unique().numel() > 0.999 * words.numel()
+
+
+def test_counter_uniform_deterministic(device):
+    c = torch.tensor(12345, dtype=torch.int32, device=device)
+    a = counter_uniform((3, 5), c).cpu()
+    b = counter_uniform((3, 5), c).cpu()
+    assert torch.equal(a, b)
+    d = counter_uniform((3, 5), c + 1).cpu()
+    assert not torch.equal(a, d)
+    # The first elements do not depend on the requested shape.
+    assert torch.equal(counter_uniform((15,), c).cpu(), a.flatten())
+
+
+def _verify_inputs(num_reqs, k, device):
+    total = num_reqs * k
+    draft = torch.randint(0, 1000, (total,), dtype=torch.int32)
+    seg = torch.arange(num_reqs, dtype=torch.int64).repeat_interleave(k)
+    grp = torch.arange(k, dtype=torch.int32).repeat(num_reqs)
+    target_idx = torch.arange(total, dtype=torch.int32) + seg.to(torch.int32)
+    bonus_idx = (torch.arange(num_reqs, dtype=torch.int32) + 1) * (k + 1) - 1
+    final_idx = torch.arange(num_reqs * (k + 1), dtype=torch.int32)
+    lens = torch.full((num_reqs,), k, dtype=torch.int32)
+    return [t.to(device) for t in (draft, lens, seg, grp, target_idx, bonus_idx, final_idx)]
+
+
+def test_synthetic_accepts_follow_schedule(device):
+    """In-graph accept_u gives the acceptance-length distribution of the
+    synthetic schedule (same as torch.rand would)."""
+    k, num_reqs, steps = 7, 64, 200
+    # Rates of a mean acceptance length about 4.04 (1 + sum = 4.04).
+    uncond = [0.82, 0.66, 0.5, 0.38, 0.29, 0.22, 0.17]
+    rates = torch.tensor(
+        unconditional_to_conditional_rates(uncond), dtype=torch.float32, device=device
+    )
+    inputs = _verify_inputs(num_reqs, k, device)
+    counter = torch.tensor(initial_rng_counter(0), dtype=torch.int32, device=device)
+    rng_fn = _synthetic_verify_rows_rng_impl
+    if _on_tpu(device):
+        from vllm_torchtpu.layers.adapter.sample.rejection_sampler import (
+            synthetic_verify_rows_rng,
+        )
+
+        rng_fn = synthetic_verify_rows_rng
+    counts = []
+    for _ in range(steps):
+        acc, rows, rec, nxt = rng_fn(*inputs, counter, rates)
+        # Same decisions as the eager function on the same uniforms.
+        u = counter_uniform(tuple(inputs[0].shape), counter)
+        ref = _synthetic_verify_rows_impl(*inputs, u, rates)
+        for a, b in zip((acc, rows, rec), ref):
+            assert torch.equal(a.cpu(), b.cpu())
+        assert int(nxt.cpu()) == int(counter.cpu()) + 1
+        counter = nxt
+        counts.append(acc.cpu())
+    counts = torch.cat(counts).double()
+    n = counts.numel()
+    for j in range(1, k + 1):
+        p = (counts >= j).double().mean().item()
+        sd = (uncond[j - 1] * (1 - uncond[j - 1]) / n) ** 0.5
+        assert abs(p - uncond[j - 1]) < 5 * sd, (j, p, uncond[j - 1])
+    assert abs(1 + counts.mean().item() - (1 + sum(uncond))) < 0.05
+
+
+def test_synthetic_recovery_distribution(device):
+    """In-graph recover_u samples the target with the rejected draft
+    removed, and the full target on bonus rows."""
+    k, num_reqs, vocab, steps = 7, 16, 32, 400
+    torch.manual_seed(0)
+    base = torch.randn(vocab) * 1.5
+    logits = base.repeat(num_reqs, 1)
+    rejected = torch.full((num_reqs,), 3, dtype=torch.int64)
+    rejected[num_reqs // 2 :] = -1  # bonus rows
+    acc = torch.full((num_reqs,), 2, dtype=torch.int64)
+    temps = torch.ones((num_reqs, 1))
+    top_k = torch.zeros((num_reqs, 1), dtype=torch.int32)
+    top_p = torch.ones((num_reqs, 1))
+    draft = torch.randint(0, vocab, (num_reqs * k,), dtype=torch.int32)
+    seg = torch.arange(num_reqs, dtype=torch.int64).repeat_interleave(k)
+    grp = torch.arange(k, dtype=torch.int32).repeat(num_reqs)
+    lens = torch.full((num_reqs,), k, dtype=torch.int32)
+    args = [t.to(device) for t in (logits, rejected, acc, temps, top_k, top_p)]
+    tail = [t.to(device) for t in (draft, lens, seg, grp)]
+    counter = torch.tensor(7, dtype=torch.int32, device=device)
+    fn = _synthetic_sample_and_assemble_rng_impl
+    if _on_tpu(device):
+        from vllm_torchtpu.layers.adapter.sample.rejection_sampler import (
+            synthetic_sample_and_assemble_rng,
+        )
+
+        fn = synthetic_sample_and_assemble_rng
+    rej_hist = torch.zeros(vocab)
+    bonus_hist = torch.zeros(vocab)
+    for _ in range(steps):
+        out, nxt = fn(*args, counter, *tail, k, apply_topk_topp=False)
+        u = counter_uniform((num_reqs, vocab), counter)
+        ref = _synthetic_sample_and_assemble_impl(
+            *args, u, *tail, k, apply_topk_topp=False
+        )
+        assert torch.equal(out.cpu(), ref.cpu())
+        counter = nxt
+        sampled = out[:, 2].cpu().long()
+        half = num_reqs // 2
+        rej_hist += torch.bincount(sampled[:half], minlength=vocab).float()
+        bonus_hist += torch.bincount(sampled[half:], minlength=vocab).float()
+    p = torch.softmax(base, dim=-1)
+    p_rej = p.clone()
+    p_rej[3] = 0
+    p_rej /= p_rej.sum()
+    assert rej_hist[3] == 0
+    for hist, probs in ((rej_hist, p_rej), (bonus_hist, p)):
+        n = hist.sum()
+        exp = probs * n
+        mask = exp > 5
+        chi2 = (((hist[mask] - exp[mask]) ** 2) / exp[mask]).sum().item()
+        dof = int(mask.sum()) - 1
+        assert chi2 < dof + 6 * (2 * dof) ** 0.5, (chi2, dof)
