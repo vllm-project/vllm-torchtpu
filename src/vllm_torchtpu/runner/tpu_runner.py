@@ -6929,21 +6929,37 @@ class TPUModelRunner(GPUModelRunner):
 
     def _precompile_compute_selected_logits(self) -> None:
         hsize = self.model_config.get_hidden_size()
+        spec_lens = self._spec_logits_lengths()
         with self._precompile_timed("compute_selected_logits"):
             for num_tokens in self.num_tokens_paddings:
                 dummy_hidden = torch.zeros(
                     (num_tokens, hsize),
                     dtype=self._hidden_states_dtype,
                 ).to(self.device)
+                lengths = []
                 for num_reqs in self.num_reqs_paddings:
-                    indices = torch.zeros(num_reqs, dtype=torch.int32).to(self.device)
+                    lengths.append(num_reqs)
+                    if num_reqs >= min(num_tokens, self.max_num_reqs):
+                        break
+                # A verify step selects one row per verified token.
+                lengths += [n for n in spec_lens if n <= num_tokens]
+                for num_rows in sorted(set(lengths)):
+                    indices = torch.zeros(num_rows, dtype=torch.int32).to(self.device)
                     out = self.compute_selected_logits(dummy_hidden, indices)
                     synchronize_tensors(out)
                     logger.info(
-                        "  -- num_tokens: %d, num_seqs: %d", num_tokens, num_reqs
+                        "  -- num_tokens: %d, num_seqs: %d", num_tokens, num_rows
                     )
-                    if num_reqs >= min(num_tokens, self.max_num_reqs):
-                        break
+
+    def _spec_logits_lengths(self) -> list[int]:
+        """Verify-logits row counts a spec step selects (`padded_logits_length`):
+        the token buckets up to a full batch of 1 + K verify windows."""
+        if self.speculative_config is None:
+            return []
+        K = self.speculative_config.num_speculative_tokens
+        pads = list(self.num_tokens_paddings)
+        most = _get_padded_token_len(pads, min(self.max_num_reqs * (1 + K), pads[-1]))
+        return [n for n in pads if n <= most]
 
     def _precompile_compute_logits_from_hidden_states(self) -> None:
         hsize = self.model_config.get_hidden_size()
