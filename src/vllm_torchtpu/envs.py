@@ -31,6 +31,8 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_MASK_IN_KERNEL: bool = False
     TPU_DCP_MLA_FUSED_PREP: bool = False
     TPU_MLA_KV_WRITE_IN_GATHER: bool = False
+    TPU_DCP_MLA_MIXED_LIVE: bool = False
+    TPU_DCP_MLA_MIXED_LIVE_WIDTHS: str = ""
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
     TPU_NAME: str | None = None
@@ -492,6 +494,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # feeds the attention kernel writes the step's KV rows into both caches
     # before it gathers, instead of a separate cache writer. Same bytes.
     "TPU_MLA_KV_WRITE_IN_GATHER": env_bool("TPU_MLA_KV_WRITE_IN_GATHER", default=False),
+    # DCP sparse MLA, buckets of more than 32 tokens: gather and attend only
+    # the 64-row blocks of the first top-k window that hold live rows of each
+    # attention grid step. Same outputs.
+    "TPU_DCP_MLA_MIXED_LIVE": env_bool("TPU_DCP_MLA_MIXED_LIVE", default=False),
+    # With TPU_DCP_MLA_MIXED_LIVE: ascending row widths below the top-k cap,
+    # multiples of 128 (e.g. "256,384"). A grid step whose live rows fit a
+    # width runs its attention body on that many rows. Same outputs.
+    "TPU_DCP_MLA_MIXED_LIVE_WIDTHS": env_str("TPU_DCP_MLA_MIXED_LIVE_WIDTHS", ""),
     # QK pair-blocked GDN conv layout for Raiden transfers.  Not supported
     # with the unified GDN state pool: its kernel reads segment-major
     # [Q | K | V] conv rows, so the pool manifest rejects this flag.  Must

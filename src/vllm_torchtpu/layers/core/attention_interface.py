@@ -1329,6 +1329,10 @@ def sparse_mla_attention_dcp(
             lse_mask_empty=mask_in_kernel,
             fused_window_prep=fused_prep,
             kv_write=kv_write,
+            mixed_live_gather=envs.TPU_DCP_MLA_MIXED_LIVE,
+            mixed_live_widths=tuple(
+                int(w) for w in envs.TPU_DCP_MLA_MIXED_LIVE_WIDTHS.split(",") if w
+            ),
             **chunk_kwargs,
             **split_kwargs,
         )
