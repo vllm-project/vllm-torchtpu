@@ -468,9 +468,11 @@ def attend_pages(
         def copies(req, dst):
             """(condition or None for always, copy) pairs fetching a request's
             pages and query rows."""
+            # A padding request (no query tokens) fetches and computes nothing.
+            live = qlen_ref[req] > 0
             pages = [
                 (
-                    None,
+                    live,
                     pltpu.make_async_copy(
                         kv_hbm.at[pages_ref[req * num_cols + c]],
                         buf.at[dst, c],
@@ -549,69 +551,73 @@ def attend_pages(
         def _():
             run(rows_out(r - 2, slot), "wait")
 
-        cache_len = cache_ref[r]
-        col = jax.lax.broadcasted_iota(jnp.int32, (1, keys), 1)
-        row_k = jax.lax.broadcasted_iota(jnp.int32, (keys, 1), 0)
-        k_pos = jnp.zeros((1, keys), jnp.int32)
-        k_pos_col = jnp.zeros((keys, 1), jnp.int32)
-        for c in range(num_cols):
-            base = blocks_ref[r * num_cols + c] * page_size - c * page_size
-            k_pos = jnp.where(col // page_size == c, col + base, k_pos)
-            k_pos_col = jnp.where(row_k // page_size == c, row_k + base, k_pos_col)
-        q_tok = jax.lax.broadcasted_iota(jnp.int32, (rows, 1), 0) // group
-        visible = (
-            (k_pos < cache_len)
-            & (cache_len + q_tok - k_pos < sliding_window)
-            & (q_tok < qlen_ref[r])
-        )
-        cached = k_pos_col < cache_len
-        # One additive mask per request, shared by every KV head. Masked keys
-        # must hold finite values (the cache is zero-initialised and writes
-        # clip): an add, unlike a select, would carry a NaN score through.
-        bias = jnp.where(visible, 0.0, _NEG_INF)
-        # Moves a [rows, 1] column to a [1, rows] row (sublanes to lanes).
-        diag = jax.lax.broadcasted_iota(
-            jnp.int32, (rows, rows), 0
-        ) == jax.lax.broadcasted_iota(jnp.int32, (rows, rows), 1)
-        # [L * S * words, width] u32: row (token, word), each word `packing`
-        # K/V entries (K and V of head h at 2h, 2h + 1), lowest bits first.
-        kv_u32 = buf.at[slot].bitcast(jnp.uint32).reshape(keys * words, width)
-        loaded = {}
-
-        def load_word(w):
-            if w not in loaded:
-                loaded[w] = (
-                    kv_u32[pl.ds(w, keys, stride=words)] if words > 1 else kv_u32[...]
-                )
-            return loaded[w]
-
-        for g in range(kv_heads):
-            k_word, k_slot = divmod(2 * g, packing)
-            v_word, v_slot = divmod(2 * g + 1, packing)
-            k = unpack(load_word(k_word), k_slot)[:, :head_dim].astype(mxu_dtype)
-            v = unpack(load_word(v_word), v_slot)[:, :head_dim].astype(jnp.float32)
-            v = jnp.where(cached, v, 0.0)
-            # [Q, X, D] -> [Q * X, D]: row q * X + x is token q, head g * X + x.
-            qv = q_buf[slot, :, g * group : (g + 1) * group, :].reshape(rows, head_dim)
-            s = jax.lax.dot_general(
-                qv.astype(mxu_dtype),
-                k,
-                (((1,), (1,)), ((), ())),
-                preferred_element_type=jnp.float32,
+        def attend():
+            cache_len = cache_ref[r]
+            col = jax.lax.broadcasted_iota(jnp.int32, (1, keys), 1)
+            row_k = jax.lax.broadcasted_iota(jnp.int32, (keys, 1), 0)
+            k_pos = jnp.zeros((1, keys), jnp.int32)
+            k_pos_col = jnp.zeros((keys, 1), jnp.int32)
+            for c in range(num_cols):
+                base = blocks_ref[r * num_cols + c] * page_size - c * page_size
+                k_pos = jnp.where(col // page_size == c, col + base, k_pos)
+                k_pos_col = jnp.where(row_k // page_size == c, row_k + base, k_pos_col)
+            q_tok = jax.lax.broadcasted_iota(jnp.int32, (rows, 1), 0) // group
+            visible = (
+                (k_pos < cache_len)
+                & (cache_len + q_tok - k_pos < sliding_window)
+                & (q_tok < qlen_ref[r])
             )
-            s = s * k_mult + bias
-            m = jnp.max(s, axis=-1, keepdims=True)
-            m_safe = jnp.where(m > _NEG_INF, m, 0.0)
-            p = jnp.exp(s - m_safe)
-            denom = jnp.sum(p, axis=-1, keepdims=True)
-            safe = jnp.where(denom > 0, denom, 1.0)
-            out = jnp.dot(p, v, preferred_element_type=jnp.float32)
-            out = out * (v_mult / safe)
-            o_buf[slot, :, g * group : (g + 1) * group, :] = out.reshape(
-                q_block, group, head_dim
-            ).astype(o_buf.dtype)
-            lse = jnp.where(denom > 0, m_safe + jnp.log(safe), _NEG_INF)
-            lse_ref[0, g] = jnp.sum(jnp.where(diag, lse, 0.0), axis=0, keepdims=True)
+            cached = k_pos_col < cache_len
+            # One additive mask per request, shared by every KV head. Masked keys
+            # must hold finite values (the cache is zero-initialised and writes
+            # clip): an add, unlike a select, would carry a NaN score through.
+            bias = jnp.where(visible, 0.0, _NEG_INF)
+            # Moves a [rows, 1] column to a [1, rows] row (sublanes to lanes).
+            diag = jax.lax.broadcasted_iota(
+                jnp.int32, (rows, rows), 0
+            ) == jax.lax.broadcasted_iota(jnp.int32, (rows, rows), 1)
+            # [L * S * words, width] u32: row (token, word), each word `packing`
+            # K/V entries (K and V of head h at 2h, 2h + 1), lowest bits first.
+            kv_u32 = buf.at[slot].bitcast(jnp.uint32).reshape(keys * words, width)
+            loaded = {}
+
+            def load_word(w):
+                if w not in loaded:
+                    loaded[w] = (
+                        kv_u32[pl.ds(w, keys, stride=words)] if words > 1 else kv_u32[...]
+                    )
+                return loaded[w]
+
+            for g in range(kv_heads):
+                k_word, k_slot = divmod(2 * g, packing)
+                v_word, v_slot = divmod(2 * g + 1, packing)
+                k = unpack(load_word(k_word), k_slot)[:, :head_dim].astype(mxu_dtype)
+                v = unpack(load_word(v_word), v_slot)[:, :head_dim].astype(jnp.float32)
+                v = jnp.where(cached, v, 0.0)
+                # [Q, X, D] -> [Q * X, D]: row q * X + x is token q, head g * X + x.
+                qv = q_buf[slot, :, g * group : (g + 1) * group, :].reshape(rows, head_dim)
+                s = jax.lax.dot_general(
+                    qv.astype(mxu_dtype),
+                    k,
+                    (((1,), (1,)), ((), ())),
+                    preferred_element_type=jnp.float32,
+                )
+                s = s * k_mult + bias
+                m = jnp.max(s, axis=-1, keepdims=True)
+                m_safe = jnp.where(m > _NEG_INF, m, 0.0)
+                p = jnp.exp(s - m_safe)
+                denom = jnp.sum(p, axis=-1, keepdims=True)
+                safe = jnp.where(denom > 0, denom, 1.0)
+                out = jnp.dot(p, v, preferred_element_type=jnp.float32)
+                out = out * (v_mult / safe)
+                o_buf[slot, :, g * group : (g + 1) * group, :] = out.reshape(
+                    q_block, group, head_dim
+                ).astype(o_buf.dtype)
+                lse = jnp.where(denom > 0, m_safe + jnp.log(safe), _NEG_INF)
+                lse_ref[0, g] = jnp.sum(jnp.where(diag, lse, 0.0), axis=0, keepdims=True)
+
+        pl.when(qlen_ref[r] > 0)(attend)
+
         # The rows go out while the next requests compute; a slot's copies are
         # waited for before it is refilled, the last two at the end.
         run(rows_out(r, slot), "start")
