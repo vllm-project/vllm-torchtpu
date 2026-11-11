@@ -273,7 +273,9 @@ def union_bits_plan(blocks, lengths, *, group, union_cap, groups_cap, ratio=4, b
     lengths of ``union_plan``: rank of the row's tail id times the ratio plus
     ``length % ratio``; one [T] gather pair). ``group`` must divide 128.
     Same id contract as ``union_plan_nosort``. ``bitset``: "tensorcore" (``bsp._selection_bitset``) or
-    "sparsecore" (``qsa_union_sc_gather.union_sc_bits``, the same bits, off the TensorCore; TPU only).
+    "sparsecore" (``qsa_union_sc_gather.union_sc_bits``, the same bits, off the TensorCore; TPU only), or
+    "sparsecore_plan" (``union_sc_bits(plan_layout=True)``: the SparseCore kernel writes this layout itself, so there is
+    no regroup; lanes 0..group-1 are the same bits, lanes group..127 are unwritten and must not be read; TPU only).
     """
     tokens, k = blocks.shape
     if tokens % group or _LANES % group:
@@ -293,6 +295,14 @@ def union_bits_plan(blocks, lengths, *, group, union_cap, groups_cap, ratio=4, b
         ubits = lax.reduce(
             lax.bitcast_convert_type(bits[:, :, :group], jnp.uint32), np.uint32(0), lax.bitwise_or, (2,)
         )
+    elif bitset == "sparsecore_plan":
+        from vllm_torchtpu.kernels.qwen4_exp.qsa_union_sc_gather import union_sc_bits
+
+        bits = union_sc_bits(sel, bit_lengths, ratio=ratio, groups=groups_cap, words=words, group=group,
+                             plan_layout=True)
+        ubits = lax.reduce(
+            lax.bitcast_convert_type(bits[:, :, :group], jnp.uint32), np.uint32(0), lax.bitwise_or, (2,)
+        )
     elif bitset == "tensorcore":
         packed = bsp._selection_bitset(
             jnp.pad(sel, ((0, padded - tokens), (0, 0)), constant_values=-1),
@@ -308,7 +318,7 @@ def union_bits_plan(blocks, lengths, *, group, union_cap, groups_cap, ratio=4, b
         bits = split.transpose(0, 2, 1, 3).reshape(nblocks * segments, words, group)[:ngroups]
         bits = jnp.pad(bits, ((0, 0), (0, 0), (0, _LANES - group)))
     else:
-        raise ValueError("bitset: 'tensorcore' or 'sparsecore'")
+        raise ValueError("bitset: 'tensorcore', 'sparsecore' or 'sparsecore_plan'")
 
     counts = lax.population_count(ubits).astype(jnp.int32)
     inclusive = jnp.cumsum(counts, axis=1, dtype=jnp.int32)

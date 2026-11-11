@@ -1313,6 +1313,59 @@ def _bits_kernel(sel_hbm, len_hbm, out_hbm, *, items, k, words, ratio, groups, w
         )(sel_hbm, len_hbm, out_hbm)
 
 
+def plan_block(item, nslab):
+    """Slab ``item``'s block of the plan layout [G * words, 128] in (words, 16) blocks: (its group, its slab).
+
+    Slab ``s`` of group ``g`` holds the group's rows ``16 s .. 16 s + 15``, which the plan keeps on lanes ``16 s ..``
+    of rows ``g * words .. (g + 1) * words - 1``. ``nslab`` = group // 16, a power of two."""
+    return lax.shift_right_logical(item, _log2(nslab)), jnp.bitwise_and(item, nslab - 1)
+
+
+def plan_cell(index):
+    """``bits_slab``'s flat word-major offset ``word * 16 + lane`` -> its (word, lane) cell of a (words, 16) block."""
+    return lax.shift_right_logical(index, _log2(LANES)), jnp.bitwise_and(index, LANES - 1)
+
+
+class PlanOps(ScOps):
+    """``ScOps`` with ``bits_slab``'s output a 2-D (words, 16) block (the plan-layout kernel's): its flat offsets are
+    mapped by ``plan_cell``. Loads, gathers and loops are ``ScOps``'s (their refs stay 1-D)."""
+
+    @staticmethod
+    def store(ref, at, x):
+        ref[plan_cell(at)[0], :] = x
+
+    @staticmethod
+    def addupdate_scatter(ref, index, x, mask):
+        plsc.addupdate_scatter(ref, list(plan_cell(index)), x, mask=mask)
+
+
+def _bits_plan_kernel(sel_hbm, len_hbm, out_hbm, *, items, k, words, ratio, groups, workers, nslab):
+    """``_bits_kernel`` writing the plan layout: each slab's (words, 16) block goes to its group's rows at lanes
+    ``16 s`` of the [G * words, 128] output (a strided write, 64 B per word row); lanes >= group are never written."""
+    worker = lax.axis_index(("core", "subcore"))
+    per = -(-items // workers)
+    first = worker * per
+    count = jnp.clip(items - first, 0, per)
+
+    def step(sel_b, len_b, out_b):
+        bits_slab(PlanOps, sel_b, len_b, out_b, k=k, words=words, ratio=ratio, groups=groups)
+
+    def block(i):
+        return (first + i,)
+
+    def plan(i):
+        return plan_block(first + i, nslab)
+
+    @pl.when(count > 0)
+    def _():
+        pltpu.emit_pipeline(
+            step,
+            grid=(count,),
+            in_specs=(pl.BlockSpec((LANES * k,), block), pl.BlockSpec((LANES,), block)),
+            out_specs=pl.BlockSpec((words, LANES), plan),
+        )(sel_hbm, len_hbm, out_hbm)
+
+
 def bits_slabs_to_plan(flat, *, tokens, group, words):
     """[items * words * 16] slab-major SparseCore output -> ``union_bits_plan``'s ``bits`` [T // group, words, 128]."""
     nslab = group // LANES
@@ -1320,13 +1373,17 @@ def bits_slabs_to_plan(flat, *, tokens, group, words):
     return jnp.pad(bits.reshape(tokens // group, words, group), ((0, 0), (0, 0), (0, 128 - group)))
 
 
-def union_sc_bits(sel, bit_lengths, *, ratio, groups, words, group):
+def union_sc_bits(sel, bit_lengths, *, ratio, groups, words, group, plan_layout=False):
     """SparseCore build of ``union_bits_plan``'s ``bits``: int32[T // group, words, 128], bit for bit.
 
     ``sel`` int32[T, k] (the plan's selections: invalid entries -1, ids below ``groups``), ``bit_lengths`` int32[T]
     (the plan's lengths, tail dropped where the tail is already selected). One work item per 16-row slab, a
     contiguous run of items per vector subcore; the slab-major output is regrouped by XLA as the TensorCore plan
     regroups its own.
+
+    ``plan_layout``: the kernel writes the plan layout itself (``_bits_plan_kernel``: a [T // group * words, 128]
+    output in the SparseCore tiling, which XLA bitcasts to the TensorCore's (8, 128) tiles; no regroup). Lanes 0..group-1
+    are the same bits; lanes group..127 are left unwritten (unspecified), so a reader must take ``[..., :group]``.
     """
     tokens, k = sel.shape
     if group % LANES or 128 % group or tokens % group:
@@ -1340,6 +1397,21 @@ def union_sc_bits(sel, bit_lengths, *, ratio, groups, words, group):
     sc = _sc_geometry()
     workers = sc.num_cores * sc.num_subcores
     items = tokens // LANES
+    if plan_layout:
+        bits = core_map_helper.kernel(
+            functools.partial(_bits_plan_kernel, items=items, k=k, words=words, ratio=ratio, groups=groups,
+                              workers=workers, nslab=group // LANES),
+            out_type=jax.ShapeDtypeStruct((tokens // group * words, 128), jnp.int32),
+            mesh=_mesh(sc),
+            scratch_types=(),
+            # The SparseCore tiling: the (words, 16) VMEM block is not padded to 128 lanes (the TensorCore tiling
+            # pads it past the VMEM budget), and the output's [N, 128] SparseCore layout is a bitcast of the
+            # TensorCore's (8, 128) tiles (deviceless compile, M).
+            compiler_params=pltpu.CompilerParams(disable_bounds_checks=True, needs_layout_passes=False,
+                                                 use_tc_tiling_on_sc=False),
+            name=f"qsa_union_sc_bits_plan_k{k}_w{words}",
+        )(sel.astype(jnp.int32).reshape(-1), bit_lengths.astype(jnp.int32))
+        return bits.reshape(tokens // group, words, 128)
     flat = core_map_helper.kernel(
         functools.partial(_bits_kernel, items=items, k=k, words=words, ratio=ratio, groups=groups, workers=workers),
         out_type=jax.ShapeDtypeStruct((items * words * LANES,), jnp.int32),

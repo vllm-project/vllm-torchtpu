@@ -1123,6 +1123,114 @@ def test_sc_bitset_dispatch(kernels, monkeypatch):
     assert calls[0]["sc_bitset"] is True, calls
 
 
+# --- the SparseCore bitset writing the plan layout (sc_bits_plan; emulated off TPU) -----------------------------------
+
+
+def _sc_gather_stand_in(seen):
+    """union_sc_gather's contract off TPU (bitset group g + bits_group_offset; union_gather_reference's layout). It
+    reads every lane of each bitset row, as the SparseCore gather does, so lanes >= group reach the gathered lines."""
+    def stand_in(pool, bits, rows, ids, *, ratio, line_matmul, usize=None, kv_tile=None, **kw):
+        n, offset = rows.shape[0], kw.get("bits_group_offset", 0)
+        seen.append(dict(bgroups=bits.shape[0], ngroups=n, offset=offset))
+        if not 0 <= offset <= bits.shape[0] - n:
+            raise ValueError("bits_group_offset outside the bitset")
+        return ud.union_gather_reference(pool, bits[offset:offset + n], rows, ids, ratio=ratio,
+                                         line_matmul=line_matmul)
+
+    return stand_in
+
+
+@pytest.mark.parametrize("layout,gathered,in_place", [(SPARE, None, False), (A64, "reference", False),
+                                                      (A64, "sparsecore", True), (WORST, "sparsecore", False)])
+def test_sc_bits_plan_prefill_is_the_walk(kernels, monkeypatch, layout, gathered, in_place):
+    """sc_bitset + sc_bits_plan: the walk, the gathered walk and the in-place SparseCore-gathered walk on the
+    plan-layout bitset (emulated; lanes >= group hold garbage, as the kernel leaves them) are the TensorCore-bitset walk
+    bit for bit, so no reader uses those lanes; and the plan-layout build is what the plan calls."""
+    import test_qwen4_exp_union_sc_gather as tsc
+    from vllm_torchtpu.kernels.qwen4_exp import qsa_union_sc_gather as sg
+
+    rows, cached = layout
+    step = _packed_step(171 + len(rows) + int(in_place), rows, cached, tokens=2048)
+    opts = dict(group=64)
+    if gathered:
+        opts.update(listed="reference", gathered="reference", gather_chunks=3)
+    walk = _walk(step, **opts)
+    calls, seen = [], []
+    monkeypatch.setattr(sg, "union_sc_bits", tsc._bits_plan_callback(calls))
+    monkeypatch.setattr(sg, "union_sc_gather", _sc_gather_stand_in(seen))
+    jax.clear_caches()
+    opts.update(sc_bitset=True, sc_bits_plan=True)
+    if gathered:
+        opts.update(gathered=gathered)
+    if in_place:
+        opts.update(in_place=True)
+    np.testing.assert_array_equal(_bits(_walk(step, **opts)), _bits(walk))
+    assert calls and all(c.get("plan_layout") is True and c["group"] == 64 for c in calls), calls
+    assert bool(seen) == (gathered == "sparsecore"), seen
+    if in_place:
+        assert any(s["offset"] > 0 for s in seen), seen
+
+
+def test_sc_bits_plan_compact_and_fallback(kernels, monkeypatch):
+    """sc_bits_plan with the compact pool, lazy share and in_place (FR10's set, the SparseCore gather stood in): the
+    walk is the TensorCore-bitset walk bit for bit; an over-cap step's fallback (the served call on the plan's bits,
+    ``_served_block_bits`` / ``_compact_bits``) is the served call bit for bit."""
+    import test_qwen4_exp_union_sc_gather as tsc
+    from vllm_torchtpu.kernels.qwen4_exp import qsa_union_sc_gather as sg
+
+    rows, cached = A64
+    step = _packed_step(173, rows, cached)
+    opts = dict(group=64, listed="reference", gathered="reference", gather_chunks=3, share_bits=True, lazy_share=True,
+                compact_reqs=4)
+    want = _walk(step, **opts)
+    calls = []
+    monkeypatch.setattr(sg, "union_sc_bits", tsc._bits_plan_callback(calls))
+    monkeypatch.setattr(sg, "union_sc_gather", _sc_gather_stand_in([]))
+    plan = dict(opts, gathered="sparsecore", in_place=True, sc_bitset=True, sc_bits_plan=True)
+    jax.clear_caches()
+    np.testing.assert_array_equal(_bits(_walk(step, **plan)), _bits(want))
+    jax.clear_caches()
+    np.testing.assert_array_equal(_bits(_walk(step, **dict(plan, union_cap=32))), _bits(_served(step)))
+    assert calls and all(c.get("plan_layout") is True for c in calls), calls
+
+
+def test_sc_bits_plan_dispatch(kernels, monkeypatch):
+    """VLLM_TPU_QSA_PREFILL_UNION_SC_BITS_PLAN=1 reaches union_walk_prefill as sc_bits_plan=True, and with SC_BITSET the
+    plan calls the plan-layout build; unset, the kwarg is absent; without SC_BITSET it is ignored (the TensorCore bitset,
+    no SparseCore build)."""
+    rows, cached = A64
+    step = _packed_step(179, rows, cached)
+    for name, value in (("VLLM_TPU_QSA_PREFILL_UNION_WALK", "64"), ("VLLM_TPU_QSA_PREFILL_UNION_MIN_CONTEXT", "0"),
+                        ("VLLM_TPU_QSA_PREFILL_UNION_SC_BITSET", "1")):
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv("VLLM_TPU_QSA_PREFILL_UNION_SC_BITS_PLAN", raising=False)
+    import test_qwen4_exp_union_sc_gather as tsc
+    from vllm_torchtpu.kernels.qwen4_exp import qsa_union_sc_gather as sg
+
+    built = []
+    monkeypatch.setattr(sg, "union_sc_bits", tsc._bits_plan_callback(built))
+    calls = _spy(monkeypatch)
+    want = _dispatch(step)
+    assert calls and "sc_bits_plan" not in calls[0] and built and all("plan_layout" not in b for b in built), (calls,
+                                                                                                             built)
+    monkeypatch.setenv("VLLM_TPU_QSA_PREFILL_UNION_SC_BITS_PLAN", "1")
+    calls.clear()
+    built.clear()
+    jax.clear_caches()
+    got = _dispatch(step)
+    assert calls and calls[0].get("sc_bits_plan") is True and calls[0]["sc_bitset"] is True, calls
+    assert built and all(b.get("plan_layout") is True for b in built), built
+    np.testing.assert_array_equal(_bits(got), _bits(want))
+    monkeypatch.delenv("VLLM_TPU_QSA_PREFILL_UNION_SC_BITSET")
+    calls.clear()
+    built.clear()
+    jax.clear_caches()
+    got = _dispatch(step)
+    assert calls and calls[0].get("sc_bits_plan") is True and calls[0]["sc_bitset"] is False, calls
+    assert built == [], built
+    np.testing.assert_array_equal(_bits(got), _bits(want))
+
+
 def test_full_stack_dispatch(kernels, monkeypatch):
     """The int-2 flags (G64, listed, share_bits, alpha 0.9, cap 16,384, qk16) reach union_walk_prefill and give the
     direct call's bits; without alpha and qk16 the stack is the plain G64 walk bit for bit (qk16 itself is gated

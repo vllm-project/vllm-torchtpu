@@ -856,6 +856,7 @@ def _prefill_attention(
             compact_copy_method=envs.VLLM_TPU_QSA_PREFILL_UNION_COMPACT_COPY,
             sc_bitset=envs.VLLM_TPU_QSA_PREFILL_UNION_SC_BITSET,
             **({"in_place": True} if envs.VLLM_TPU_QSA_PREFILL_UNION_IN_PLACE else {}),
+            **({"sc_bits_plan": True} if envs.VLLM_TPU_QSA_PREFILL_UNION_SC_BITS_PLAN else {}),
         )
     from vllm_torchtpu.kernels.qwen4_exp.block_sparse_gqa_prefill import (
         block_sparse_gqa_attention,

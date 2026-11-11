@@ -1851,7 +1851,7 @@ def union_walk_prefill(query, gate, blocks, lengths, table, cache, starts, *, kv
                        lean, walk_runs=0, union_alpha=0.0, share_bits=False, qk16=False, listed=None,
                        run_tables=False, max_run=8, lazy_share=False, gathered=None, gather_chunks=4,
                        gather_growth=1.0, compact_reqs=0, compact_copy_method="vmem", sc_bitset=False,
-                       in_place=False):
+                       in_place=False, sc_bits_plan=False):
     """D2 union-walk attention for a packed prefill step; ``(gated bf16 output, cache)``.
 
     Same contract as ``block_sparse_gqa_attention`` without ``return_lse``.
@@ -1916,6 +1916,10 @@ def union_walk_prefill(query, gate, blocks, lengths, table, cache, starts, *, kv
 
     ``in_place`` (with ``gathered="sparsecore"``): each gather/walk chunk reads the plan's bits, queries and lengths in
     place instead of from sliced copies (``_gathered_chunks``); bitwise the sliced form.
+
+    ``sc_bits_plan`` (with ``sc_bitset``; ignored without it): the SparseCore bitset kernel writes the plan layout itself
+    (``union_bits_plan(bitset="sparsecore_plan")``), so no TensorCore regroup; the group's lanes are the same bits and
+    lanes >= group are unwritten (every reader takes ``[:group]`` / ``[:query_block]``); bitwise the walk.
 
     ``qk16``: ``union_walk_kernel``'s single-pass BF16 QK (exact operands;
     power-of-two score scales only). Bitwise identity with the FP32 dot
@@ -2005,7 +2009,8 @@ def union_walk_prefill(query, gate, blocks, lengths, table, cache, starts, *, kv
         aligned_query, aligned_blocks, aligned_lengths, aligned_table = layout
         bits, ubits, usize, vlengths = union_bits_plan(
             aligned_blocks, aligned_lengths, group=group, union_cap=union_cap,
-            groups_cap=groups_cap, ratio=ratio, bitset="sparsecore" if sc_bitset else "tensorcore",
+            groups_cap=groups_cap, ratio=ratio,
+            bitset=("sparsecore_plan" if sc_bits_plan else "sparsecore") if sc_bitset else "tensorcore",
         )
         fits = jnp.max(usize) <= union_cap
         if union_alpha:
