@@ -2159,6 +2159,9 @@ class TPUModelRunner(GPUModelRunner):
             memo = self.__dict__.setdefault("_mamba_indices_memo", {})
             hit = memo.get(target_num_reqs)
             if hit is not None and hit[0] == slots:
+                logger.info_once(
+                    "VLLM_TPU_MAMBA_INDICES_REUSE: reused the mamba slot upload"
+                )
                 return hit[1]
         # Per-call buffer: draft steps rebuild this between fences, so a
         # shared scratch could be refilled while an upload is in flight.
@@ -9084,6 +9087,9 @@ class TPUModelRunner(GPUModelRunner):
             memo = self.__dict__.setdefault("_sampling_params_memo", {})
             hit = memo.get(slot)
             if hit is not None and hit[0] == values:
+                logger.info_once(
+                    "VLLM_TPU_SAMPLING_PARAMS_MEMO: reused the padded sampling tensors"
+                )
                 return hit[1]
             out = TPUModelRunner._padded_sampling_params_uncached(
                 self, cur_start_idx, cur_end_idx, padded_num_reqs, dtype, device
