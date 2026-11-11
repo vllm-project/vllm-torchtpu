@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from vllm_torchtpu import patch_registry
+
 # Imported for their registration side effects; the out-of-tree
 # RowParallelLinear in `linear` only affects layers built after the import, so
 # this module must be imported before any model is constructed.
@@ -21,5 +23,6 @@ from vllm_torchtpu.tokenizers import register_tokenizers
 
 
 def register_layers() -> None:
+    patch_registry.apply("plugin_load")
     register_models()
     register_tokenizers()

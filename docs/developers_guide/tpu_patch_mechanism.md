@@ -10,6 +10,7 @@ call `apply(stage, model_config=...)` to apply them.
 | Stage | Entry point | Use |
 | --- | --- | --- |
 | `import` | `env_override.py`, after early environment setup | Import-time prerequisites, currently the JAX Pallas lowering patch. |
+| `plugin_load` | `vllm_torchtpu.layers.register_layers` (vLLM general plugin), in every process before it builds a `VllmConfig` | vLLM config-validation patches that must be in place before the API server validates the parallel config, e.g. `_patch_vllm_gqa_dcp_limit`. |
 | `platform_activation` | `TpuPlatform.check_and_update_config` | Shared TPU patches and model-specific patches with `vllm_config.model_config`. |
 | `engine_core` | `_run_engine_core_with_tpu_patches` | Scheduler, KV-cache, offloading, and multimodal patches before the original engine-core entry point. |
 | `worker_init` | `TPUWorker.__init__`, before `WorkerBase.__init__` | Shared patches in each worker, including spawned workers. |

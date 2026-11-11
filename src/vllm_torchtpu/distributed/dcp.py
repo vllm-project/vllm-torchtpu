@@ -22,6 +22,7 @@ mesh_utils.py.
 
 from __future__ import annotations
 
+import copy
 from typing import Any
 
 from vllm_torchtpu.distributed.mesh_utils import CpGroupLayout, get_cp_group_layout
@@ -163,3 +164,88 @@ def get_or_create_dcp_mesh(axis_name: str | None = None) -> Any:
     )
     _MESH_CACHE[cache_key] = mesh
     return mesh
+
+
+# Architectures whose attention runs DCP groups wider than a KV head's TP
+# replicas (each rank then stores several KV heads for its share of the
+# blocks). vLLM caps GQA DCP at tensor_parallel_size // num_kv_heads.
+_KV_HEAD_SPANNING_DCP_ARCHITECTURES: set[str] = set()
+
+
+def register_kv_head_spanning_dcp_architectures(*architectures: str) -> None:
+    """Declare that these architectures support DCP up to the TP size.
+
+    `_patch_vllm_gqa_dcp_limit` (the "plugin_load" stage of
+    `patch_registry.PATCHES`) then lets their DCP exceed vLLM's GQA cap.
+
+    Stock vLLM still sizes and reads the KV cache with one KV head per rank
+    (`ModelConfig.get_num_kv_heads`, `layers/adapter/cp_attention.py`), so the
+    caller must own the attention kernel and the `KVCacheSpec` of every layer
+    that uses the wider DCP group: each rank stores ``dcp // (tp //
+    num_kv_heads)`` KV heads per page. A page then holds that many times the
+    bytes, and a scheduler block holds ``block_size * dcp`` tokens, so the
+    HBM held by a request's partly filled last block (the tail) grows too.
+    """
+    _KV_HEAD_SPANNING_DCP_ARCHITECTURES.update(architectures)
+
+
+def _patch_vllm_gqa_dcp_limit() -> None:
+    """Let registered GQA architectures run DCP wider than a KV head's
+    replicas.
+
+    `ModelConfig.verify_with_parallel_config` rejects GQA DCP beyond
+    ``tensor_parallel_size // num_kv_heads``: a stock attention backend keeps
+    one KV head per rank. For a registered architecture, the wider DCP must
+    divide the TP size and be a multiple of that cap, so that each DCP group
+    holds whole KV heads; vLLM's check then runs with DCP clamped to the cap,
+    so its other checks still apply. The method only reads `parallel_config`,
+    so running it on a shallow copy loses no writes. Unregistered
+    architectures keep vLLM's check unchanged.
+    """
+    from vllm.config.model import ModelConfig
+
+    if getattr(
+        ModelConfig.verify_with_parallel_config, "_tpu_gqa_dcp_limit_patch", False
+    ):
+        return
+
+    original = ModelConfig.verify_with_parallel_config
+
+    def verify_with_parallel_config(self, parallel_config):
+        dcp = parallel_config.decode_context_parallel_size
+        if (
+            dcp > 1
+            and not self.use_mla
+            and any(
+                a in _KV_HEAD_SPANNING_DCP_ARCHITECTURES for a in self.architectures
+            )
+        ):
+            tp = parallel_config.tensor_parallel_size
+            num_kv_heads = self.get_total_num_kv_heads()
+            cap = tp // max(1, num_kv_heads)
+            if cap >= 1 and dcp > cap:
+                if tp % dcp != 0 or dcp % cap != 0:
+                    raise ValueError(
+                        f"`--decode-context-parallel-size` ({dcp}) must divide "
+                        f"`--tensor-parallel-size` ({tp}) and be a multiple of "
+                        f"its replicas per KV head ({tp} // {num_kv_heads} = "
+                        f"{cap}) for {self.architectures}, so that each DCP "
+                        "group holds whole KV heads."
+                    )
+                logger.info_once(
+                    "GQA DCP %d spans KV heads for %s (TP %d, %d KV heads); "
+                    "vLLM's check runs with DCP %d.",
+                    dcp,
+                    ", ".join(self.architectures),
+                    tp,
+                    num_kv_heads,
+                    cap,
+                )
+                clamped = copy.copy(parallel_config)
+                clamped.decode_context_parallel_size = cap
+                return original(self, clamped)
+        return original(self, parallel_config)
+
+    verify_with_parallel_config._tpu_gqa_dcp_limit_patch = True  # type: ignore[attr-defined]
+    ModelConfig.verify_with_parallel_config = verify_with_parallel_config
+    logger.info("Applied TPU patch: GQA DCP up to the TP size for registered models.")
