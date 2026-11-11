@@ -663,7 +663,15 @@ def _walk_kernel(
     listed_lines_ref=None,
     runs_refs=None,
     run_sizes=(),
+    kv_head_offset: int = 0,
+    lse_ref=None,
 ):
+    # kv_head_offset: skip that many KV heads of each cache row (the second
+    #   layer of a paired main KV page reads slots [K1, V1]), as in the
+    #   block-sparse kernel.
+    # lse_ref (per-group walk only): also write each row's natural-log sum of
+    #   the scaled scores ([group, query heads], -inf for a row with no key),
+    #   the block-sparse kernel's ``return_lse`` contract.
     # runs_refs (step 4, with listed_lines_ref): (counts in HBM, entries in HBM,
     #   their SMEM copies, DMA semaphore); per tile, the union's pool-contiguous
     #   runs cut into pieces of ``run_sizes`` groups (largest first), one list per
@@ -1098,7 +1106,7 @@ def _walk_kernel(
         decode_scope = sc("decode")
         decode_scope.__enter__()
         key_values = []
-        for key, value in split_kv(kv_ref)[:kv_heads]:
+        for key, value in split_kv(kv_ref)[kv_head_offset : kv_head_offset + kv_heads]:
             key = key.astype(jnp.bfloat16 if qk16 else jnp.float32)  # FP8 E4M3 is exact in BF16
             value = value.astype(jnp.float32)
             if not lean:
@@ -1204,6 +1212,14 @@ def _walk_kernel(
             .transpose(1, 0, 2)
         )
     output_ref[...] = jnp.concatenate(heads, axis=1).astype(output_ref.dtype)
+    if lse_ref is not None:
+        lses = []
+        for head in range(kv_heads):
+            m = max_ref[0, head, :]
+            mass = mass_ref[0, head, :]
+            lse = jnp.where(mass > 0, m + jnp.log(jnp.where(mass > 0, mass, 1)), -jnp.inf)
+            lses.append(lse.reshape(q_heads_per_kv, query_block).T)
+        lse_ref[...] = jnp.concatenate(lses, axis=1)
 
 
 def _walk_kernel_per_group(
@@ -1217,11 +1233,8 @@ def _walk_kernel_per_group(
     physw_hbm_ref,
     cache_ref,
     output_ref,
-    ubits_ref,
-    list_sem,
-    physw_ref,
-    physw_sem,
-    *scratch,
+    *refs,
+    return_lse: bool = False,
     **options,
 ):
     """``_walk_kernel`` (fast walk) with one page row per query group.
@@ -1229,12 +1242,15 @@ def _walk_kernel_per_group(
     A packed step holds several requests, so the per-word pool bases differ
     between query groups: they come from HBM, one ``words_padded`` row per
     group, staged into SMEM at block start instead of one scalar-prefetched
-    table for the whole grid.
+    table for the whole grid. With ``return_lse`` the LSE output ref follows
+    ``output_ref``.
     """
+    lse_ref, refs = (refs[0], refs[1:]) if return_lse else (None, refs)
+    ubits_ref, list_sem, physw_ref, physw_sem, *scratch = refs
     _walk_kernel(
         tiles_ref, usize_ref, None, debruijn_ref, physw_ref, query_ref, bits_ref, lengths_ref,
         ubits_hbm_ref, cache_ref, output_ref, ubits_ref, list_sem, *scratch,
-        physw_hbm_ref=physw_hbm_ref, physw_sem=physw_sem, **options,
+        physw_hbm_ref=physw_hbm_ref, physw_sem=physw_sem, lse_ref=lse_ref, **options,
     )
 
 
@@ -1541,8 +1557,15 @@ def _word_bases(page_rows, *, words, page_size, word_tokens):
 def union_walk_kernel(query, bits, ubits, usize, vlengths, pool, page_table_row, *, group,
                       union_cap, kv_tile, ratio=4, k_scale=1.0, v_scale=1.0, lean=False,
                       scan_list=False, line_matmul=False, fast_walk=False, scopes=0, walk_runs=0,
-                      qk16=False, gathered=None, listed=None, listed_lines=None, run_tables=None):
+                      qk16=False, gathered=None, listed=None, listed_lines=None, run_tables=None,
+                      kv_head_offset=0, return_lse=False):
     """The walking kernel alone, on a precomputed ``union_bits_plan`` (ungated bf16 output).
+
+    ``kv_head_offset``: skip that many KV heads of each cache row (a paired
+    page's second layer), as ``block_sparse_gqa_prefill``'s.
+    ``return_lse`` (per-group page rows, plain fast walk only): return
+    ``(output f32, lse [T, query heads])``, ``lse`` the natural-log sum of the
+    scaled scores (-inf for a row with no key).
 
     ``gathered`` (SparseCore union gather, step 1): ``(gathered KV, gathered
     lines)`` from ``union_gather_reference`` (or the SparseCore kernels, same
@@ -1574,6 +1597,12 @@ def union_walk_kernel(query, bits, ubits, usize, vlengths, pool, page_table_row,
         raise ValueError("gathered tiles replace the fast walk (no walk_runs, no scan_list)")
     if listed is not None and (walk_runs or scan_list or not fast_walk or gathered is not None):
         raise ValueError("a listed walk replaces the fast walk's bit scan (no walk_runs, scan_list or gathered)")
+    if kv_head_offset and (kv_head_offset < 0 or (kv_head_offset + (2 if query.shape[1] == 24 else 1)) * 2
+                           > pool.shape[2] * pool.shape[3]):
+        raise ValueError("KV head offset exceeds the cache row's head slots")
+    if return_lse and (page_table_row.ndim != 2 or not fast_walk or listed is not None or gathered is not None
+                       or run_tables is not None or scan_list):
+        raise ValueError("return_lse needs the plain fast walk on per-group page rows")
     if run_tables is not None and page_table_row.ndim == 2:
         page_table_row = page_table_row[0]  # unused by the kernel: the run tables carry absolute pool rows
     if listed_lines is not None and ((listed is None and run_tables is None) or page_table_row.ndim == 2):
@@ -1603,7 +1632,7 @@ def union_walk_kernel(query, bits, ubits, usize, vlengths, pool, page_table_row,
             query, bits, ubits, tiles, usize, vlengths, pool, page_table_row, group=group,
             kv_tile=kv_tile, ratio=ratio, k_scale=k_scale, v_scale=v_scale, lean=lean,
             line_matmul=line_matmul, words_padded=words_padded, walk_runs=walk_runs, qk16=qk16,
-            listed=listed, cap_tiles=cap_tiles,
+            listed=listed, cap_tiles=cap_tiles, kv_head_offset=kv_head_offset, return_lse=return_lse,
         )
     # Pool row of each word's first token (a word never straddles a page here).
     word_start = jnp.arange(words, dtype=jnp.int32) * word_tokens
@@ -1641,25 +1670,27 @@ def union_walk_kernel(query, bits, ubits, usize, vlengths, pool, page_table_row,
             k_scale=k_scale, v_scale=v_scale, words=words, words_padded=words_padded,
             page_size=page_size, lean=lean, scan_list=scan_list, line_matmul=line_matmul,
             fast_walk=fast_walk, scopes=scopes, walk_runs=walk_runs, qk16=qk16,
+            kv_head_offset=kv_head_offset,
         ) if gathered is None and listed is None and run_tables is None else functools.partial(
             _walk_kernel_run_tables, ratio=ratio, kv_tile=kv_tile, head_dim=head_dim, sm_scale=head_dim**-0.5,
             packing=packing, kv_heads=kv_heads, q_heads_per_kv=q_heads_per_kv, query_block=group,
             k_scale=k_scale, v_scale=v_scale, words=words, words_padded=words_padded,
             page_size=page_size, lean=lean, line_matmul=line_matmul, fast_walk=True, scopes=scopes, qk16=qk16,
-            gathered_cap_tiles=cap_tiles, run_sizes=run_sizes,
+            gathered_cap_tiles=cap_tiles, run_sizes=run_sizes, kv_head_offset=kv_head_offset,
         ) if run_tables is not None else functools.partial(
             _walk_kernel_listed if listed_lines is None else _walk_kernel_listed_lines, ratio=ratio, kv_tile=kv_tile, head_dim=head_dim, sm_scale=head_dim**-0.5,
             packing=packing, kv_heads=kv_heads, q_heads_per_kv=q_heads_per_kv, query_block=group,
             k_scale=k_scale, v_scale=v_scale, words=words, words_padded=words_padded,
             page_size=page_size, lean=lean, line_matmul=line_matmul, fast_walk=True, scopes=scopes, qk16=qk16,
             **({"gathered_cap_tiles": cap_tiles} if listed_lines is not None else {}),
+            kv_head_offset=kv_head_offset,
         ) if gathered is None else functools.partial(
             _walk_kernel_gathered, ratio=ratio, kv_tile=kv_tile, head_dim=head_dim,
             sm_scale=head_dim**-0.5, packing=packing, kv_heads=kv_heads,
             q_heads_per_kv=q_heads_per_kv, query_block=group, k_scale=k_scale, v_scale=v_scale,
             words=words, words_padded=words_padded, page_size=page_size, lean=lean,
             line_matmul=line_matmul, fast_walk=True, scopes=scopes, qk16=qk16,
-            gathered_cap_tiles=cap_tiles,
+            gathered_cap_tiles=cap_tiles, kv_head_offset=kv_head_offset,
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=5,
@@ -1720,7 +1751,8 @@ def union_walk_kernel(query, bits, ubits, usize, vlengths, pool, page_table_row,
 
 def _union_walk_kernel_per_group(query, bits, ubits, tiles, usize, vlengths, pool, page_rows, *,
                                  group, kv_tile, ratio, k_scale, v_scale, lean, line_matmul,
-                                 words_padded, walk_runs=0, qk16=False, listed=None, cap_tiles=0):
+                                 words_padded, walk_runs=0, qk16=False, listed=None, cap_tiles=0,
+                                 kv_head_offset=0, return_lse=False):
     """``union_walk_kernel``'s fast walk with ``page_rows[g]`` as query group g's page row."""
     tokens, query_heads, head_dim = query.shape
     pages, page_size, head_axis, packing, cache_dim = pool.shape
@@ -1734,6 +1766,9 @@ def _union_walk_kernel_per_group(query, bits, ubits, tiles, usize, vlengths, poo
     physw = _word_bases(page_rows, words=words, page_size=page_size, word_tokens=32 * ratio)
     physw = jnp.pad(physw, ((0, 0), (0, words_padded - words))).reshape(-1)
     ids_extra, ids_scratch, ids_args = _listed_operands(listed, ngroups, cap_tiles * (kv_tile // ratio))
+    if return_lse and listed is not None:
+        raise ValueError("return_lse needs the plain per-group walk")
+    out_spec = pl.BlockSpec((group, query_heads, head_dim), lambda b, *_: (b, 0, 0))
     return pl.pallas_call(
         functools.partial(
             _walk_kernel_per_group if listed is None else _walk_kernel_per_group_listed, ratio=ratio, kv_tile=kv_tile, head_dim=head_dim,
@@ -1741,6 +1776,7 @@ def _union_walk_kernel_per_group(query, bits, ubits, tiles, usize, vlengths, poo
             q_heads_per_kv=q_heads_per_kv, query_block=group, k_scale=k_scale, v_scale=v_scale,
             words=words, words_padded=words_padded, page_size=page_size, lean=lean,
             line_matmul=line_matmul, fast_walk=True, walk_runs=walk_runs, qk16=qk16,
+            kv_head_offset=kv_head_offset, **({"return_lse": True} if return_lse else {}),
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=3,
@@ -1753,7 +1789,8 @@ def _union_walk_kernel_per_group(query, bits, ubits, tiles, usize, vlengths, poo
                 pl.BlockSpec(memory_space=pltpu.HBM),
                 pl.BlockSpec(memory_space=pltpu.HBM),
             ] + ids_extra,
-            out_specs=pl.BlockSpec((group, query_heads, head_dim), lambda b, *_: (b, 0, 0)),
+            out_specs=[out_spec, pl.BlockSpec((group, query_heads), lambda b, *_: (b, 0))]
+            if return_lse else out_spec,
             scratch_shapes=[
                 pltpu.SMEM((words_padded,), jnp.int32),
                 pltpu.SemaphoreType.DMA,
@@ -1778,10 +1815,13 @@ def _union_walk_kernel_per_group(query, bits, ubits, tiles, usize, vlengths, poo
             * 1024**2,
             disable_bounds_checks=True,
         ),
-        out_shape=jax.ShapeDtypeStruct(query.shape, jnp.bfloat16),
+        out_shape=[jax.ShapeDtypeStruct(query.shape, jnp.float32),
+                   jax.ShapeDtypeStruct((tokens, query_heads), jnp.float32)]
+        if return_lse else jax.ShapeDtypeStruct(query.shape, jnp.bfloat16),
         name=f"qsa_union_walk_g{group}_kv{kv_tile}" + ("_lean" if lean else "")
         + ("_mm" if line_matmul else "") + "_fast_pg" + (f"_runs{walk_runs}" if walk_runs else "")
-        + ("_listed" if listed is not None else ""),
+        + ("_listed" if listed is not None else "") + (f"_h{kv_head_offset}" if kv_head_offset else "")
+        + ("_lse" if return_lse else ""),
     )(
         tiles,
         usize.astype(jnp.int32),
@@ -1855,8 +1895,8 @@ def union_walk_attention(query, gate, blocks, lengths, pool, page_table_row, *, 
 
 
 def _served_prefill(query, gate, blocks, lengths, table, cache, starts, *, kv_heads, ratio,
-                    k_scale, v_scale):
-    """The call ``qsa_rpa._prefill_attention`` makes without DCP, KV head offset or LSE."""
+                    k_scale, v_scale, kv_head_offset=0):
+    """The call ``qsa_rpa._prefill_attention`` makes without DCP or LSE."""
     query_block, kv_tile, query_tile = get_sparse_prefill_tiles(
         query, cache, kv_heads=kv_heads, ratio=ratio, with_query_tile=True
     )
@@ -1864,17 +1904,63 @@ def _served_prefill(query, gate, blocks, lengths, table, cache, starts, *, kv_he
         query, gate, blocks, lengths, table, cache, starts, kv_heads=kv_heads, ratio=ratio,
         query_block=query_block, kv_tile=kv_tile, k_scale=k_scale, v_scale=v_scale,
         **({"query_tile": query_tile} if query_tile else {}),
+        **({"kv_head_offset": kv_head_offset} if kv_head_offset else {}),
     )
+
+
+def dcp_local_selection(blocks, lengths, dcp, *, page_size, ratio):
+    """(blocks, lengths) of a DCP rank's owned keys in its local token numbering.
+
+    ``dcp = (rank int32[1], world)``: a page-table entry covers ``world *
+    page_size`` global tokens and the rank owns global token ``t`` when
+    ``(t // page_size) % world == rank``, held in the entry's page at row
+    ``t % page_size`` (``block_sparse_gqa_prefill``'s DCP contract). Owned
+    tokens numbered in order, ``local(t) = (t // (world * page_size)) *
+    page_size + t % page_size``, are exactly the rows of the rank's local page
+    table, so the walk runs unchanged on the local ids with the local table.
+
+    Selected groups the rank does not own become -1. A length becomes the
+    count of owned tokens below it: its partial tail group stays partial
+    (same ``length % ratio``) when the rank owns the tail's page, else the
+    local length is page aligned and no tail is added. A live row the rank
+    owns no key of gets local length 0 (no key: output 0, LSE -inf, as the
+    block-sparse kernel's owned walk gives it).
+    """
+    rank, world = dcp
+    rank = jnp.asarray(rank, jnp.int32).reshape(-1)[0]
+    span = page_size * world
+    tokens = blocks * ratio
+    owned = (blocks >= 0) & ((tokens // page_size) % world == rank)
+    local = (tokens // span) * page_size + tokens % page_size
+    local_blocks = jnp.where(owned, local // ratio, -1).astype(blocks.dtype)
+    local_lengths = (lengths // span) * page_size + jnp.clip(
+        lengths % span - rank * page_size, 0, page_size
+    )
+    return local_blocks, jnp.where(lengths > 0, local_lengths, 0).astype(lengths.dtype)
 
 
 def union_walk_prefill(query, gate, blocks, lengths, table, cache, starts, *, kv_heads, ratio,
                        k_scale=1.0, v_scale=1.0, group=128, kv_tile=1024, union_cap, min_context,
                        lean, walk_runs=0, union_alpha=0.0, share_bits=False, qk16=False, listed=None,
                        run_tables=False, max_run=8, lazy_share=False, gathered=None, gather_chunks=4,
-                       gather_growth=1.0, compact_reqs=0, compact_copy_method="vmem", sc_bitset=False):
+                       gather_growth=1.0, compact_reqs=0, compact_copy_method="vmem", sc_bitset=False,
+                       kv_head_offset=0, dcp=None, return_lse=False, served=None):
     """D2 union-walk attention for a packed prefill step; ``(gated bf16 output, cache)``.
 
-    Same contract as ``block_sparse_gqa_attention`` without ``return_lse``.
+    Same contract as ``block_sparse_gqa_attention``. With ``return_lse`` it
+    returns ``(out f32 normalized and not gated, lse [T, query heads], cache)``.
+
+    ``kv_head_offset``: the paired page's second layer (cache row slots
+    [K1, V1]); the plan and the walk are unchanged, only the slots read.
+    ``dcp = (rank int32[1], world)`` (needs ``return_lse``): the walk over this
+    rank's owned keys only (``dcp_local_selection``), with the LSE the DCP
+    combine merges. The plan, the walk and the cap/alpha fallback test run on
+    the local ids; the min-context route uses the global lengths.
+    ``kv_head_offset``, ``dcp`` and ``return_lse`` take the plain walk only
+    (no listed, gathered, run tables, compact pool or shared bits).
+    ``served`` (optional): the fallback call, returning exactly what this
+    function returns (``qsa_rpa._prefill_attention`` passes its block-sparse
+    call, so the fallback keeps its DCP tiles); default ``_served_prefill``.
     ``table`` holds one page row per query row and ``starts`` the request
     boundaries. As in its ``run_with_padding``, each request starts on a
     ``group``-row boundary of an aligned layout (padding rows have length 0),
@@ -1969,8 +2055,25 @@ def union_walk_prefill(query, gate, blocks, lengths, table, cache, starts, *, kv
     if gathered and (listed is None or run_tables or int(gather_chunks) < 1 or not float(gather_growth) >= 1.0):
         raise ValueError("gathered needs listed='reference' or 'sparsecore' (the list), no run_tables, chunks >= 1, "
                          "growth >= 1")
+    if dcp is not None and not return_lse:
+        raise ValueError("the DCP union walk returns the LSE the DCP combine needs (return_lse)")
+    extended = bool(kv_head_offset or dcp is not None or return_lse)
+    if extended and (listed or gathered or run_tables or compact_reqs):
+        raise ValueError("kv_head_offset / dcp / return_lse take the plain walk (no listed, gathered, run "
+                         "tables or compact pool)")
+    if extended:
+        share_bits = lazy_share = False
+    global_lengths = lengths
+    if served is None:
+        if dcp is not None or return_lse:
+            raise ValueError("a DCP / LSE union walk needs its served fallback call")
+        served = functools.partial(
+            _served_prefill, query, gate, blocks, lengths, table, cache, starts, kv_heads=kv_heads,
+            ratio=ratio, k_scale=k_scale, v_scale=v_scale, kv_head_offset=kv_head_offset,
+        )
+    if dcp is not None:
+        blocks, lengths = dcp_local_selection(blocks, lengths, dcp, page_size=page_size, ratio=ratio)
     groups_cap = table.shape[1] * page_size // ratio
-    served_options = dict(kv_heads=kv_heads, ratio=ratio, k_scale=k_scale, v_scale=v_scale)
     # Trace-time record for the host-side D2 engagement count (VLLM_TPU_QSA_PREFILL_UNION_COUNT): the walk is
     # compiled into programs for steps of this many rows, with this minimum context. Host state, no graph change.
     _WALK_TRACED[int(tokens)] = int(min_context)
@@ -2083,6 +2186,7 @@ def union_walk_prefill(query, gate, blocks, lengths, table, cache, starts, *, kv
                 aligned_query, bits, ubits, usize, vlengths, cache, page_rows, group=group,
                 union_cap=union_cap, kv_tile=kv_tile, ratio=ratio, k_scale=k_scale,
                 v_scale=v_scale, lean=lean, fast_walk=True, walk_runs=walk_runs, qk16=qk16, listed=ids,
+                kv_head_offset=kv_head_offset, return_lse=return_lse,
             )
 
         def listing(rows_of_groups):
@@ -2150,11 +2254,17 @@ def union_walk_prefill(query, gate, blocks, lengths, table, cache, starts, *, kv
             raw = lax.cond(fits, kernel, served_aligned)
             # Either branch produced this step's ungated output: no outer fallback needed.
             return (raw if back is None else raw[back]), jnp.ones((), bool)
-        raw = lax.cond(fits, kernel, lambda: jnp.zeros(aligned_query.shape, jnp.bfloat16))
-        return (raw if back is None else raw[back]), fits
+        raw = lax.cond(fits, kernel, functools.partial(empty, aligned_query.shape[0]))
+        return (raw if back is None else jax.tree.map(lambda x: x[back], raw)), fits
+
+    def empty(rows):
+        if return_lse:
+            return (jnp.zeros((rows, *query.shape[1:]), jnp.float32),
+                    jnp.zeros((rows, query_heads), jnp.float32))
+        return jnp.zeros((rows, *query.shape[1:]), jnp.bfloat16)
 
     def skip():
-        return jnp.zeros(query.shape, jnp.bfloat16), jnp.zeros((), bool)
+        return empty(tokens), jnp.zeros((), bool)
 
     branches = [functools.partial(walk, n) for n in sizes]
     route = jnp.sum(offsets[-1] > jnp.asarray(sizes[:-1], jnp.int32))
@@ -2162,8 +2272,12 @@ def union_walk_prefill(query, gate, blocks, lengths, table, cache, starts, *, kv
         branches.insert(0, functools.partial(walk, None))
         route = jnp.where(jnp.all(real % align == 0), 0, route + 1)
     branches.append(skip)
-    route = jnp.where(jnp.max(lengths) >= min_context, route, len(branches) - 1)
+    route = jnp.where(jnp.max(global_lengths) >= min_context, route, len(branches) - 1)
     raw, fits = lax.switch(route, branches)
+    live = global_lengths > 0
+    if return_lse:
+        out, lse = lax.cond(fits, lambda: raw, lambda: tuple(served()[:2]))
+        return jnp.where(live[:, None, None], out, 0), jnp.where(live[:, None], lse, -jnp.inf), cache
 
     def walked():
         return bf16(
@@ -2171,13 +2285,12 @@ def union_walk_prefill(query, gate, blocks, lengths, table, cache, starts, *, kv
             * bf16(jax.nn.sigmoid(gate.astype(jnp.float32))).astype(jnp.float32)
         )
 
-    def served():
-        output, _ = _served_prefill(query, gate, blocks, lengths, table, cache, starts,
-                                    **served_options)
+    def served_output():
+        output, _ = served()
         return output
 
-    output = lax.cond(fits, walked, served)
-    return jnp.where((lengths > 0)[:, None, None], output, 0), cache
+    output = lax.cond(fits, walked, served_output)
+    return jnp.where(live[:, None, None], output, 0), cache
 
 
 # ---------------------------------------------------------------------------

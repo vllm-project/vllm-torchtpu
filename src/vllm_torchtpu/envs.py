@@ -143,6 +143,8 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_PREFILL_UNION_GATHER_GROWTH: float = 1.0
     VLLM_TPU_QSA_PREFILL_UNION_COMPACT_REQS: int = 0
     VLLM_TPU_QSA_PREFILL_UNION_COMPACT_COPY: str = "vmem"
+    VLLM_TPU_QSA_PREFILL_UNION_OFFSET: bool = False
+    VLLM_TPU_QSA_PREFILL_UNION_DCP: bool = False
     VLLM_TPU_QSA_PREFILL_PREFIX_PAGES: bool = False
     VLLM_TPU_QSA_MAIN_KV_DCP: int = 0
     VLLM_TPU_QSA_DCP_PREFILL_QUERY_BLOCK: int = 1024
@@ -1032,6 +1034,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_QSA_PREFILL_UNION_COMPACT_COPY": env_str(
         "VLLM_TPU_QSA_PREFILL_UNION_COMPACT_COPY", "vmem"
     ),
+    # OFFSET (with UNION_WALK): also take the union walk on a paired main KV
+    # page's second layer (kv_head_offset=1, cache row slots [K1, V1]); off,
+    # those layers keep the block-sparse kernel. Plain walk only (no LISTED /
+    # GATHERED / RUN_TABLES / COMPACT_REQS; SHARE_BITS is ignored there).
+    "VLLM_TPU_QSA_PREFILL_UNION_OFFSET": env_bool("VLLM_TPU_QSA_PREFILL_UNION_OFFSET"),
+    # DCP (with UNION_WALK): also take the union walk under main-KV DCP, over
+    # this rank's owned keys (local ids, qsa_union_dense.dcp_local_selection),
+    # returning the LSE the DCP combine merges; the cap / alpha fallback is the
+    # owned-page block-sparse call. Same restrictions as OFFSET.
+    "VLLM_TPU_QSA_PREFILL_UNION_DCP": env_bool("VLLM_TPU_QSA_PREFILL_UNION_DCP"),
     # qwen4_exp QSA (unsharded indexer path): when every row's completed groups
     # fit the top-k budget, take all visible groups and skip the StreamIndex
     # scoring call (the sharded path already does). Same selected set; the

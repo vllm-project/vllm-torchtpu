@@ -546,11 +546,74 @@ def _prefill_attention(
         raise ValueError(
             "VLLM_TPU_QSA_PREFILL_UNION_WALK must be a divisor of 128, at least 8"
         )
+
+    def block_sparse():
+        from vllm_torchtpu.kernels.qwen4_exp.block_sparse_gqa_prefill import (
+            block_sparse_gqa_attention,
+        )
+        from vllm_torchtpu.kernels.qwen4_exp.prefill_tiles import (
+            get_sparse_prefill_tiles,
+        )
+
+        query_block, kv_tile, query_tile = get_sparse_prefill_tiles(
+            query, cache, kv_heads=kv_heads, ratio=ratio, with_query_tile=True
+        )
+        if dcp is not None:
+            # One KV tile per owned page: the kernel walks this rank's pages only. The owned walk
+            # streams half the pages per query block, so a wider query block amortises them:
+            # 1024 / 256 (6 gathered heads) is bit-identical and 6-11% faster than 512 / 128 at an
+            # 8K chunk over 90K-130K contexts (j-bdd87f65, j-7bedee35).
+            kv_tile = cache.shape[1]
+            if envs.VLLM_TPU_QSA_DCP_PREFILL_QUERY_BLOCK:
+                query_block = envs.VLLM_TPU_QSA_DCP_PREFILL_QUERY_BLOCK
+                query_tile = envs.VLLM_TPU_QSA_DCP_PREFILL_QUERY_TILE or None
+            if query_block % 128 or query_block * query.shape[1] > 256 * 24:
+                query_block, query_tile = 256, None
+            if query_tile and query_block % query_tile:
+                query_tile = None
+        return block_sparse_gqa_attention(
+            query,
+            gate,
+            blocks,
+            lengths,
+            table,
+            cache,
+            starts,
+            kv_heads=kv_heads,
+            ratio=ratio,
+            query_block=query_block,
+            kv_tile=kv_tile,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            **({"kv_head_offset": kv_head_offset} if kv_head_offset else {}),
+            **({"query_tile": query_tile} if query_tile else {}),
+            **({"dcp": dcp} if dcp is not None else {}),
+            **({"return_lse": True} if return_lse else {}),
+        )
+
+    plain_walk = not (
+        envs.VLLM_TPU_QSA_PREFILL_UNION_LISTED
+        or envs.VLLM_TPU_QSA_PREFILL_UNION_GATHERED
+        or envs.VLLM_TPU_QSA_PREFILL_UNION_RUN_TABLES
+        or envs.VLLM_TPU_QSA_PREFILL_UNION_COMPACT_REQS
+    )
     if (
         union_group
-        and dcp is None
-        and not return_lse
-        and kv_head_offset == 0
+        # VLLM_TPU_QSA_PREFILL_UNION_DCP: DCP (with its LSE) on the plain walk.
+        and (
+            (dcp is None and not return_lse)
+            or (
+                envs.VLLM_TPU_QSA_PREFILL_UNION_DCP
+                and plain_walk
+                and dcp is not None
+                and return_lse
+            )
+        )
+        # VLLM_TPU_QSA_PREFILL_UNION_OFFSET: a paired page's second layer.
+        and (
+            kv_head_offset == 0
+            or (envs.VLLM_TPU_QSA_PREFILL_UNION_OFFSET and plain_walk and kv_head_offset == 1)
+        )
         and ratio == 4
         and cache.dtype == jnp.float8_e4m3fn
         and cache.shape[1] % 128 == 0
@@ -592,49 +655,12 @@ def _prefill_attention(
             compact_reqs=envs.VLLM_TPU_QSA_PREFILL_UNION_COMPACT_REQS,
             compact_copy_method=envs.VLLM_TPU_QSA_PREFILL_UNION_COMPACT_COPY,
             sc_bitset=envs.VLLM_TPU_QSA_PREFILL_UNION_SC_BITSET,
+            kv_head_offset=kv_head_offset,
+            dcp=dcp,
+            return_lse=return_lse,
+            served=block_sparse,
         )
-    from vllm_torchtpu.kernels.qwen4_exp.block_sparse_gqa_prefill import (
-        block_sparse_gqa_attention,
-    )
-    from vllm_torchtpu.kernels.qwen4_exp.prefill_tiles import (
-        get_sparse_prefill_tiles,
-    )
-
-    query_block, kv_tile, query_tile = get_sparse_prefill_tiles(
-        query, cache, kv_heads=kv_heads, ratio=ratio, with_query_tile=True
-    )
-    if dcp is not None:
-        # One KV tile per owned page: the kernel walks this rank's pages only. The owned walk
-        # streams half the pages per query block, so a wider query block amortises them:
-        # 1024 / 256 (6 gathered heads) is bit-identical and 6-11% faster than 512 / 128 at an
-        # 8K chunk over 90K-130K contexts (j-bdd87f65, j-7bedee35).
-        kv_tile = cache.shape[1]
-        if envs.VLLM_TPU_QSA_DCP_PREFILL_QUERY_BLOCK:
-            query_block = envs.VLLM_TPU_QSA_DCP_PREFILL_QUERY_BLOCK
-            query_tile = envs.VLLM_TPU_QSA_DCP_PREFILL_QUERY_TILE or None
-        if query_block % 128 or query_block * query.shape[1] > 256 * 24:
-            query_block, query_tile = 256, None
-        if query_tile and query_block % query_tile:
-            query_tile = None
-    return block_sparse_gqa_attention(
-        query,
-        gate,
-        blocks,
-        lengths,
-        table,
-        cache,
-        starts,
-        kv_heads=kv_heads,
-        ratio=ratio,
-        query_block=query_block,
-        kv_tile=kv_tile,
-        k_scale=k_scale,
-        v_scale=v_scale,
-        **({"kv_head_offset": kv_head_offset} if kv_head_offset else {}),
-        **({"query_tile": query_tile} if query_tile else {}),
-        **({"dcp": dcp} if dcp is not None else {}),
-        **({"return_lse": True} if return_lse else {}),
-    )
+    return block_sparse()
 
 
 def _with_lse_channel(attend):
