@@ -168,6 +168,10 @@ def test_config_pins_block_size_to_sparse_block(cache_dtype, indexer_kv_dtype) -
         # 4-bit MSA caches are the model's choice, not a --kv-cache-dtype name.
         (dict(cache_dtype="int4_per_token_head"), NotImplementedError),
         (dict(cache_dtype="fp8", indexer_kv_dtype="bf16"), NotImplementedError),
+        (
+            dict(speculative_config=SimpleNamespace(method="eagle3")),
+            NotImplementedError,
+        ),
         (dict(block_size=64, user_specified_block_size=True), ValueError),
         (dict(indexer_kv_dtype="fp8"), NotImplementedError),
         (dict(prefill_context_parallel_size=2), NotImplementedError),
@@ -230,6 +234,23 @@ def test_config_dcp_keeps_whole_blocks_per_rank(interleave, dcp) -> None:
         cp_kv_cache_interleave_size=interleave,
     )
     TPUMiniMaxM3Config.verify_and_update_config(config)
+    assert config.parallel_config.cp_kv_cache_interleave_size == 128
+
+
+def test_config_dcp_accepts_dspark(monkeypatch) -> None:
+    import vllm_torchtpu.models.minimax_m3.experimental.dspark as dspark_mod
+
+    seen = []
+    monkeypatch.setattr(dspark_mod, "configure_dspark_draft", seen.append)
+    speculative_config = SimpleNamespace(method="dspark")
+    config = _hook_config(
+        tensor_parallel_size=8,
+        decode_context_parallel_size=2,
+        speculative_config=speculative_config,
+        disable_hybrid_kv_cache_manager=True,
+    )
+    TPUMiniMaxM3Config.verify_and_update_config(config)
+    assert seen == [speculative_config]
     assert config.parallel_config.cp_kv_cache_interleave_size == 128
 
 

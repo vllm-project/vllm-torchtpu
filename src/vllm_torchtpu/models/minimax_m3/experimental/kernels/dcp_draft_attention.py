@@ -238,6 +238,183 @@ def write_runs(
     )(num_runs[None], run_page, run_lo, run_hi, run_tok0, rows, kv_cache)
 
 
+# Rank-rows write of the context K/V (`store_context_kv_rank_rows` in
+# experimental/dspark.py): each rank packs its share of the token rows, the
+# group all-gathers them and every rank copies the rows of its own blocks.
+
+
+def pack_rows(
+    key: jax.Array,
+    value: jax.Array,
+    page_shape,
+    dtype,
+    *,
+    k_scale: float | None = None,
+    v_scale: float | None = None,
+) -> jax.Array:
+    """``[T, G, D]`` K and V -> cache rows ``[T, 2G' / p, p, D]`` in the cache
+    dtype, the bytes `write_kv` stores for them."""
+    return merge_rows(
+        _quantize(key, dtype, k_scale), _quantize(value, dtype, v_scale), page_shape
+    )
+
+
+def max_owned_runs(num_tokens: int, max_seqs: int, page_size: int, dcp: int) -> int:
+    """Bound on the runs of `owned_runs`. A request of ``q`` tokens touches at
+    most ``(q - 1) // page_size + 2`` blocks, of which at most
+    ``q // (dcp * page_size) + 2`` are one rank's; each owned block is one run."""
+    return max(1, min(num_tokens, num_tokens // (dcp * page_size) + 2 * max_seqs))
+
+
+def owned_runs(
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    cu_q_lens: jax.Array,
+    *,
+    num_tokens: int,
+    num_pages: int,
+    page_size: int,
+    dcp: int,
+    rank: jax.Array,
+    max_runs: int,
+):
+    """The tokens `write_kv` keeps on `rank`, as runs: maximal spans of
+    consecutive tokens writing consecutive slots of one page.
+
+    Returns ``(num_runs [1], tok0, page, slot, length)`` (each ``[max_runs]``).
+    Pages are resolved as `write_kv`'s ``.at[page, slot].set(mode="drop")``
+    resolves them: negative pages wrap once, pages outside the cache drop.
+    Built from cumulative sums and binary searches, without a scatter.
+    """
+    max_seqs = seq_lens.shape[0]
+    tables = block_tables.reshape(max_seqs, -1)
+    seq, pos, valid = _token_layout(seq_lens, cu_q_lens, num_tokens)
+    block = pos // page_size
+    mine = valid & (block % dcp == rank)
+    page = jnp.where(mine, tables[seq, block // dcp], num_pages)
+    page = jnp.where(page < 0, page + num_pages, page)
+    keep = (page >= 0) & (page < num_pages)
+    slot = pos % page_size
+    cont = keep[1:] & keep[:-1] & (page[1:] == page[:-1]) & (slot[1:] == slot[:-1] + 1)
+    no = jnp.zeros((1,), jnp.bool_)
+    start = keep & ~jnp.concatenate([no, cont])
+    end = keep & ~jnp.concatenate([cont, no])
+    starts = jnp.cumsum(start.astype(jnp.int32))
+    ends = jnp.cumsum(end.astype(jnp.int32))
+    nth = jnp.arange(1, max_runs + 1, dtype=jnp.int32)
+    tok0 = jnp.searchsorted(starts, nth, side="left").astype(jnp.int32)
+    last = jnp.searchsorted(ends, nth, side="left").astype(jnp.int32)
+    first = jnp.minimum(tok0, num_tokens - 1)
+    num_runs = jnp.minimum(starts[-1], max_runs)
+    return (
+        num_runs[None].astype(jnp.int32),
+        tok0,
+        page[first].astype(jnp.int32),
+        slot[first].astype(jnp.int32),
+        (last - tok0 + 1).astype(jnp.int32),
+    )
+
+
+# Runs whose DMAs are in flight before the oldest is waited on.
+_DMA_LAG = 8
+
+
+def _copy_runs_kernel(
+    num_runs_ref,
+    tok0_ref,
+    page_ref,
+    slot_ref,
+    len_ref,  # scalar prefetch
+    rows_hbm,  # [T, 2G' / p, p, D]
+    cache_hbm,  # aliased with o_hbm
+    o_hbm,  # [pages, S, 2G' / p, p, D]
+    sems,  # one DMA semaphore per copy size
+    *,
+    sizes: tuple[int, ...],
+):
+    del cache_hbm
+
+    def copies(i, method):
+        tok, page, slot, n = tok0_ref[i], page_ref[i], slot_ref[i], len_ref[i]
+        for c, size in enumerate(sizes):
+            # A run of n rows is copied as the power-of-two pieces of n,
+            # largest first; this piece starts after the larger ones.
+            off = n - n % (2 * size)
+            copy = pltpu.make_async_copy(
+                rows_hbm.at[pl.ds(tok + off, size)],
+                o_hbm.at[page, pl.ds(slot + off, size)],
+                sems.at[c],
+            )
+            pl.when(n % (2 * size) >= size)(getattr(copy, method))
+
+    num_runs = num_runs_ref[0]
+
+    def body(i, carry):
+        copies(i, "start")
+        pl.when(i >= _DMA_LAG)(lambda: copies(i - _DMA_LAG, "wait"))
+        return carry
+
+    jax.lax.fori_loop(0, num_runs, body, 0)
+
+    def drain(i, carry):
+        copies(i, "wait")
+        return carry
+
+    jax.lax.fori_loop(jnp.maximum(num_runs - _DMA_LAG, 0), num_runs, drain, 0)
+
+
+def write_owned_rows(
+    kv_cache: jax.Array,
+    rows: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    cu_q_lens: jax.Array,
+    *,
+    dcp: int,
+    rank: jax.Array,
+    interpret: bool = False,
+) -> jax.Array:
+    """`write_kv` from packed rows (``[T, 2G' / p, p, D]``, `pack_rows`, one
+    per token): copy only this rank's tokens into their pages, one DMA per
+    power-of-two piece of each run, over the aliased cache. The bytes are
+    copied as they are, so the cache equals `write_kv`'s whenever the kept
+    tokens' (page, slot) are distinct, as real metadata's are."""
+    num_tokens = rows.shape[0]
+    num_pages, page_size = kv_cache.shape[:2]
+    max_runs = max_owned_runs(num_tokens, seq_lens.shape[0], page_size, dcp)
+    runs = owned_runs(
+        seq_lens,
+        block_tables,
+        cu_q_lens,
+        num_tokens=num_tokens,
+        num_pages=num_pages,
+        page_size=page_size,
+        dcp=dcp,
+        rank=rank,
+        max_runs=max_runs,
+    )
+    # A run is at most min(page_size, T) rows: its power-of-two pieces.
+    sizes = tuple(
+        1 << b for b in reversed(range(min(page_size, num_tokens).bit_length()))
+    )
+    hbm = pl.BlockSpec(memory_space=pl.ANY)
+    return pl.pallas_call(
+        functools.partial(_copy_runs_kernel, sizes=sizes),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=5,
+            grid=(1,),
+            in_specs=[hbm, hbm],
+            out_specs=hbm,
+            scratch_shapes=[pltpu.SemaphoreType.DMA((len(sizes),))],
+        ),
+        out_shape=jax.ShapeDtypeStruct(kv_cache.shape, kv_cache.dtype),
+        # Operand 6 = the cache (after 5 scalar-prefetch operands and the rows).
+        input_output_aliases={6: 0},
+        interpret=interpret,
+        name="dcp_draft_write_owned_rows",
+    )(*runs, rows.astype(kv_cache.dtype), kv_cache)
+
+
 def gather_pages(
     kv_cache: jax.Array, pages: jax.Array, *, interpret: bool = False
 ) -> jax.Array:
