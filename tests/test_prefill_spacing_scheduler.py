@@ -71,11 +71,14 @@ def test_running_chunks_and_waiting_window_go_shortest_first(model_config):
     scheduler, hasher = _scheduler(model_config, max_num_batched_tokens=64)
     for name, n, seed in (("w48", 48, 1), ("w16", 16, 2), ("w32", 32, 3)):
         scheduler.add_request(_request(name, n, hasher, seed=seed))
+    paw_step = scheduler._paw_step
     assert scheduler.schedule().num_scheduled_tokens == {
         "w16": 16,
         "w32": 32,
         "w48": 16,
     }
+    # The external-warmth refresh clock still advances once per step.
+    assert scheduler._paw_step == paw_step + 1
 
 
 def test_waiting_prompt_longer_than_the_chunk_gets_no_reserve(model_config):

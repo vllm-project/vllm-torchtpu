@@ -32,7 +32,9 @@ warmest-first admission, each step this scheduler:
   ``VLLM_TPU_PREFILL_SPACING_FRAC`` times that kind of step's measured time in
   decode-only steps, and defers all prefill while the debt is positive and
   requests decode (KV loads still start). Step times are moving averages of
-  the time between consecutive ``update_from_output`` calls per kind of step.
+  the time between consecutive ``update_from_output`` calls per kind of step,
+  timed only while the next step is already queued (async scheduling), so no
+  chunk is spaced until a long-chunk step has been timed.
 
 Select with ``--scheduler-cls``
 ``vllm_torchtpu.core.prefill_spacing_scheduler.PrefillSpacingScheduler``.
@@ -107,10 +109,18 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
         self._window_cold = []
         if self.policy != SchedulingPolicy.FCFS or not queue:
             return
+        # Upkeep PrefixAwareScheduler._promote_warmest does: probe refresh
+        # clock and the external-warmth cache pruned to the live window.
+        self._paw_step += 1
         window = list(islice(queue, self.WINDOW))
         scored = sorted(
             ((self._rank_and_warmth(r), r) for r in window), key=lambda t: t[0][0]
         )
+        cache = self._paw_external_cache
+        if cache and len(cache) > 4 * self.WINDOW:
+            live = {r.request_id for r in window}
+            for req_id in [k for k in cache if k not in live]:
+                del cache[req_id]
         ordered = [r for _, r in scored]
         if ordered != window:
             queue.remove_requests(window)
@@ -178,16 +188,18 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
         # Scheduler.schedule() calls this on every request it is about to
         # schedule, after its budget limits, so the RUNNING pass's tokens are
         # counted here and a chunk with a reserve is cut to what it leaves.
-        num_new_tokens = super()._reserve_prefill_lookahead(
-            request, num_computed_tokens, num_new_tokens
-        )
-        if not self._in_schedule or request.status != RequestStatus.RUNNING:
-            return num_new_tokens
-        reserve = self._reserve.get(request.request_id, 0)
+        # The cut goes first so the base rule keeping a chunk end out of the
+        # prefill lookahead still holds for the cut chunk.
+        running = self._in_schedule and request.status == RequestStatus.RUNNING
+        reserve = self._reserve.get(request.request_id, 0) if running else 0
         if reserve:
             left = self.max_num_scheduled_tokens - self._running_tokens - reserve
             num_new_tokens = max(min(num_new_tokens, left), 0)
-        self._running_tokens += num_new_tokens
+        num_new_tokens = super()._reserve_prefill_lookahead(
+            request, num_computed_tokens, num_new_tokens
+        )
+        if running:
+            self._running_tokens += num_new_tokens
         return num_new_tokens
 
     def _update_starved(
