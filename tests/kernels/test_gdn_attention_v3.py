@@ -668,6 +668,49 @@ class GDNRecurrentDecodeFusionTest(parameterized.TestCase):
             )
 
 
+class GDNChunkedComputeTest(parameterized.TestCase):
+    def test_chunked_gdn_per_seq_shared_kq_heads_matches_recurrent_ref(self):
+        n_kq, n_v, chunk, d = 2, 16, 16, 128
+        k0, k1, k2, k3, k4, k5 = jax.random.split(jax.random.key(41), 6)
+        q = compute_gdn.l2_norm(jax.random.normal(k0, (n_kq, chunk, d))) * (d**-0.5)
+        k = compute_gdn.l2_norm(jax.random.normal(k1, (n_kq, chunk, d)))
+        v = jax.random.normal(k2, (n_v, chunk, d))
+        gating_log = -jnp.abs(jax.random.normal(k3, (1, chunk, n_v))) * 0.1
+        beta = jax.nn.sigmoid(jax.random.normal(k4, (1, chunk, n_v)))
+        state_prev = jax.random.normal(k5, (n_v, d, d))
+        f32 = jnp.dtype(jnp.float32)
+        cfg = config.GDNConfig(
+            mode=config.GDNMode.PER_SEQ,
+            dtypes=config.Dtypes(f32, f32, f32, f32, f32),
+            batch_size=chunk,
+            dim_size=(2 * n_kq + n_v) * d,
+            kernel_size=4,
+            tile_size=chunk,
+            num_kq_heads=n_kq,
+            num_v_heads=n_v,
+            kq_head_dim=d,
+            v_head_dim=d,
+        )
+
+        with jax.default_matmul_precision("float32"):
+            out, state = compute_gdn.chunked_gdn_per_seq(
+                q, k, v, gating_log, beta, state_prev, cfg
+            )
+            ref_out, ref_state = compute_gdn.recurrent_gdn_per_seq(
+                q[:, :, None],
+                k[:, :, None],
+                k[:, :, :, None],
+                v[:, :, None],
+                jnp.exp(gating_log.swapaxes(0, 2))[..., None],
+                beta.swapaxes(0, 2)[..., None],
+                state_prev,
+                cfg,
+            )
+
+        np.testing.assert_allclose(out, ref_out.swapaxes(0, 1), rtol=1e-5, atol=1e-5)
+        np.testing.assert_allclose(state, ref_state[0], rtol=1e-5, atol=1e-5)
+
+
 @pytest.mark.tpu_test
 class GDNAttentionTest(parameterized.TestCase):
     @parameterized.named_parameters(
