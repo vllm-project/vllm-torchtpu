@@ -26,6 +26,7 @@ from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model_loader
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.dcp import get_dcp_group
 from vllm_torchtpu.layers.adapter import token_padding
 from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackendImpl
@@ -53,6 +54,9 @@ if TYPE_CHECKING:
     from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 logger = init_logger(__name__)
+
+# Draft buckets of TPU_DRAFT_BUCKET_STEP start above this many tokens.
+_FINE_DRAFT_BUCKETS_FROM = 64
 
 
 @contextlib.contextmanager
@@ -411,6 +415,12 @@ class DFlashProposer:
         max_draft_tokens = self._max_chunk_reqs() * self.block_size
         while paddings[-1] < max_draft_tokens:
             paddings.append(min(paddings[-1] * 2, max_draft_tokens))
+        step = envs.TPU_DRAFT_BUCKET_STEP
+        if step:
+            # Every row of a padded draft costs: its matmuls, TP all-reduces,
+            # LM head and window attention all scale with the bucket.
+            fine = range(_FINE_DRAFT_BUCKETS_FROM + step, max_draft_tokens + step, step)
+            paddings = sorted(set(paddings).union(fine))
         return paddings
 
     def _get_padded_len(self, target_len: int) -> int:
