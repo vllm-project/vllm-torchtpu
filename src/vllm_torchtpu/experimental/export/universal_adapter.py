@@ -1553,6 +1553,31 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
                 return None
         return per_layer
 
+    def attention_decode_query_size(self) -> int:
+        """The longest query, in tokens, the attention kernel runs as a decode.
+
+        `TPUModelRunner._initialize_attention_kernels` sets
+        `reorder_batch_threshold` to the narrowest decode stage of its Pallas
+        attention layers, target and draft alike, and the step puts every
+        leading request with a query at most that long in the decode segment
+        of `req_dist`. 1 without Pallas attention layers.
+        """
+        try:
+            from vllm_torchtpu.layers.adapter.attention import (
+                PallasAttentionBackendImpl,
+            )
+        except Exception:
+            return 1
+        impls = (getattr(m, "impl", None) for _, m in self._all_attention_layers())
+        return min(
+            (
+                int(impl.decode_query_size)
+                for impl in impls
+                if isinstance(impl, PallasAttentionBackendImpl)
+            ),
+            default=1,
+        )
+
     def extra_user_inputs(self) -> list[tuple[str, tuple[int, ...]]]:
         """Control inputs beyond the standard six that `forward` takes.
 

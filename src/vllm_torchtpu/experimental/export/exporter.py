@@ -393,8 +393,13 @@ def _io_entry(
 
 def _req_dist_len(model: api.ExportableTextOnlyLLM) -> int:
     """Elements of `req_dist`: 3 for the attention kernel, and 3 more for the
-    recurrent kernels of a speculating recurrent model, whose windowed segment
-    also takes the verify windows that attention runs as mixed sequences."""
+    recurrent kernels of a speculating recurrent model.
+
+    The attention kernel's decode segment takes every leading request whose
+    query is at most `attention_decode_query_size` tokens, single-token decodes
+    and verify windows alike; longer queries and prefill chunks are mixed. The
+    recurrent kernels' windowed segment takes each verify window as one
+    segment."""
     recurrent = any(n == "mamba_state_indices" for n, _ in _extra_user_inputs(model))
     return 6 if recurrent and model.export_config.recurrent_window > 1 else 3
 
@@ -606,6 +611,18 @@ def _extra_user_inputs(
     """
     extra_fn = getattr(model, "extra_user_inputs", None)
     return list(extra_fn()) if callable(extra_fn) else []
+
+
+def _attention_decode_query_size(model: api.ExportableTextOnlyLLM) -> int:
+    """The longest query, in tokens, in the decode segment of `req_dist`.
+
+    The model's `attention_decode_query_size()`, or 1 for a model without one.
+    """
+    size_fn = getattr(model, "attention_decode_query_size", None)
+    size = int(size_fn()) if callable(size_fn) else 1
+    if size < 1:
+        raise ValueError(f"attention_decode_query_size must be >= 1, got {size}")
+    return size
 
 
 def _recurrent_serving_config(model: api.ExportableTextOnlyLLM) -> dict[str, int]:
@@ -1526,6 +1543,7 @@ def export(
         "tensor_parallel_size": tp_size,
         "pipeline_parallel_size": pp_size,
         "data_parallel_size": dp_size,
+        "attention_decode_query_size": _attention_decode_query_size(model),
         **_emit_model_companion_files(cfg, output_dir),
         # How a checkpoint of this artifact is stored (Zarr v2 arrays in OCDBT).
         "checkpoint_config": {"format": checkpoint.CHECKPOINT_FORMAT},
