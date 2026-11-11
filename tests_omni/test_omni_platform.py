@@ -408,10 +408,13 @@ def test_tpu_sdpa_attention_backend():
     assert res_gqa.shape == (1, 16, 8, 16)
 
 
-@pytest.mark.parametrize("mask_kind", ["2d", "b11k"])
+@pytest.mark.parametrize("mask_kind", ["2d", "b11k", "b11k_additive"])
 def test_tpu_sdpa_masked_calls_use_math_backend(monkeypatch, mask_kind):
-    # torch_tpu's default SDPA lowering is wrong with an attn_mask, so masked
-    # calls must run under sdpa_kernel(MATH); unmasked calls must not.
+    # torch_tpu 0.2.0's default SDPA lowering misreads a mask of size 1 along
+    # the query dim (google-pytorch/torch_tpu#5677), so masked calls must run
+    # under sdpa_kernel(MATH); unmasked calls must not. b11k_additive is a
+    # float mask in the query dtype, for which vLLM-Omni's SDPAImpl does not
+    # select MATH itself.
     from vllm_torchtpu.omni import attention as omni_attention
 
     backends = []
@@ -429,6 +432,8 @@ def test_tpu_sdpa_masked_calls_use_math_backend(monkeypatch, mask_kind):
     keep = torch.arange(6) < 5
     keep_2d = keep[None, :].expand(2, -1)
     mask = keep_2d if mask_kind == "2d" else keep_2d[:, None, None, :]
+    if mask_kind == "b11k_additive":
+        mask = torch.zeros(mask.shape, dtype=query.dtype).masked_fill(~mask, -10000.0)
 
     impl.forward(query, key, value)
     impl.forward(query, key, value, SimpleNamespace(attn_mask=None))

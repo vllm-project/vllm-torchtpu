@@ -39,6 +39,10 @@ from vllm_torchtpu.omni.attention import TpuFlashAttentionImpl, TpuSDPAImpl
 
 pytestmark = [pytest.mark.omni]
 
+# assert_parity's numeric-mismatch messages. Must-fail controls match on them so
+# that other AssertionErrors, such as a shape mismatch, do not satisfy them.
+NUMERIC_MISMATCH_PATTERN = r"relative L2 error|max absolute error"
+
 # (TPU fp32, TPU bf16) limits vs the float64 CPU reference, ~3% above the worst
 # observed value across the parametrized attention impls. Production runs every
 # component in the configured dtype (--dtype bfloat16 or float32).
@@ -50,11 +54,12 @@ GQA_ATTN_MAX_REL_L2 = (3.1e-3, 4.1e-3)
 GQA_ATTN_MAX_ABS = (7.2e-3, 1.3e-2)
 LONG_SEQ_ATTN_MAX_REL_L2 = (3.5e-3, 5.4e-3)
 LONG_SEQ_ATTN_MAX_ABS = (6.9e-4, 2.2e-3)
-# Masked calls run TpuSDPAImpl on the math SDPA backend; torch_tpu's default SDPA
-# lowering returns wrong values for any attn_mask (fp32 rel_l2 0.60, bf16 NaN).
+# Masked calls run TpuSDPAImpl under sdpa_kernel(MATH); torch_tpu 0.2.0's default
+# SDPA lowering misreads a mask of size 1 along the query dim
+# (google-pytorch/torch_tpu#5677: fp32 rel_l2 0.60, bf16 NaN).
 MASKED_ATTN_MAX_REL_L2 = (3.6e-3, 4.5e-3)
 MASKED_ATTN_MAX_ABS = (8.0e-3, 6.4e-3)
-# Masked TpuSDPAImpl at the LTX-2 Ulysses key-padding shapes, bf16 only.
+# Masked attention over MASKED_SDPA_CASES, bf16 only.
 MASKED_SDPA_BF16_MAX_REL_L2 = 4.6e-3
 MASKED_SDPA_BF16_MAX_ABS = 1.6e-2
 ROPE_MAX_REL_L2 = (3.9e-8, 2.3e-3)
@@ -68,6 +73,25 @@ DTYPES = pytest.mark.parametrize(
     "dtype, limit_index",
     [(torch.float32, 0), (torch.bfloat16, 1)],
     ids=["fp32", "bf16"],
+)
+
+# Every mask here has size 1 along the query dim, the layout torch_tpu 0.2.0's
+# default SDPA lowering misreads (google-pytorch/torch_tpu#5677).
+MASKED_SDPA_CASES = pytest.mark.parametrize(
+    "batch_size, q_len, kv_len, valid_len, mask_kind",
+    [
+        (1, 128, 128, 126, "2d"),
+        (2, 128, 128, 126, "b11k"),
+        # LTX-2.3 audio_to_video_attn under Ulysses 4: a local video shard
+        # against SP-padded audio keys (126 -> 128).
+        (2, 1536, 128, 126, "b11k"),
+        # A mask that keeps every key.
+        (2, 1536, 128, 128, "b11k"),
+        # Additive masks in the query dtype. vLLM-Omni's SDPAImpl only selects
+        # the math backend itself when the mask dtype differs from the query's.
+        (2, 1536, 128, 126, "b11k_additive"),
+        (2, 128, 128, 126, "bh1k_additive"),
+    ],
 )
 
 
@@ -104,6 +128,36 @@ def _masked_attention_inputs(
     mask[:, -16:] = False
     query, key, value = (torch.randn(shape, dtype=dtype) for _ in range(3))
     return query, key, value, mask
+
+
+def _masked_sdpa_case(
+    batch_size: int, q_len: int, kv_len: int, valid_len: int, mask_kind: str
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """CPU bf16 [B, S, H, D] query, key, value, an attn_mask and its key mask.
+
+    The key mask is the [B, S_kv] bool mask keeping the first valid_len keys.
+    mask_kind names the attn_mask layout that carries it: "2d" is [B, K] bool,
+    "b11k" is [B, 1, 1, K] bool, and "b11k_additive" and "bh1k_additive" are
+    [B, 1, 1, K] and [B, H, 1, K] bf16, 0 for a kept key and -10000 otherwise.
+    """
+    torch.manual_seed(7)
+    num_heads, head_size = 32, 64
+    query = torch.randn(batch_size, q_len, num_heads, head_size, dtype=torch.bfloat16)
+    key, value = (
+        torch.randn(batch_size, kv_len, num_heads, head_size, dtype=torch.bfloat16)
+        for _ in range(2)
+    )
+    keep = (torch.arange(kv_len) < valid_len)[None, :].expand(batch_size, -1)
+    if mask_kind == "2d":
+        return query, key, value, keep, keep
+    mask = keep[:, None, None, :]
+    if mask_kind == "bh1k_additive":
+        mask = mask.expand(-1, num_heads, -1, -1)
+    if mask_kind in ("b11k_additive", "bh1k_additive"):
+        mask = torch.zeros(mask.shape, dtype=torch.bfloat16).masked_fill(
+            ~mask, -10000.0
+        )
+    return query, key, value, mask, keep
 
 
 class TestFluxTpuSDPAAttention:
@@ -308,62 +362,92 @@ class TestFluxTpuSDPAAttention:
             max_abs=LONG_SEQ_ATTN_MAX_ABS[limit_index],
         )
 
-    @pytest.mark.parametrize(
-        "batch_size,q_len,kv_len,valid_len,mask_kind",
-        [
-            (1, 128, 128, 126, "2d"),
-            (2, 128, 128, 126, "b11k"),
-            # LTX-2.3 audio_to_video_attn under Ulysses 4: a local video
-            # shard against SP-padded audio keys (126 -> 128).
-            (2, 1536, 128, 126, "b11k"),
-            (2, 1536, 128, 128, "b11k"),
-        ],
-    )
+    @MASKED_SDPA_CASES
+    @pytest.mark.parametrize("impl_cls", [TpuSDPAImpl, TpuFlashAttentionImpl])
     def test_masked_sdpa_numeric_parity_on_tpu(
-        self, batch_size, q_len, kv_len, valid_len, mask_kind
+        self, impl_cls, batch_size, q_len, kv_len, valid_len, mask_kind
     ):
-        """Masked TpuSDPAImpl matches a float64 masked reference on TPU.
+        """Masked attention matches a float64 masked reference on TPU.
 
-        torch_tpu's default SDPA lowering returned max abs errors of ~2 (and
-        sometimes NaN) for any attn_mask, which blanked LTX-2.3 video and
-        turned its audio into NaN under Ulysses.
+        TpuFlashAttentionImpl, the production default, sends masked calls to
+        TpuSDPAImpl.forward, which pins them to the math SDPA backend.
         """
-        torch.manual_seed(7)
-        num_heads, head_size = 32, 64
-        scale = 1.0 / math.sqrt(head_size)
-        impl = TpuSDPAImpl(
-            num_heads=num_heads, head_size=head_size, softmax_scale=scale
+        query_cpu, key_cpu, value_cpu, mask_cpu, keep = _masked_sdpa_case(
+            batch_size, q_len, kv_len, valid_len, mask_kind
         )
-        query_cpu = torch.randn(
-            batch_size, q_len, num_heads, head_size, dtype=torch.bfloat16
+        scale = 1.0 / math.sqrt(query_cpu.shape[-1])
+        impl = impl_cls(
+            num_heads=query_cpu.shape[2],
+            head_size=query_cpu.shape[3],
+            softmax_scale=scale,
         )
-        key_cpu = torch.randn(
-            batch_size, kv_len, num_heads, head_size, dtype=torch.bfloat16
+        q_tpu, k_tpu, v_tpu = (t.to("tpu") for t in (query_cpu, key_cpu, value_cpu))
+        ref_out = _sdpa_reference(query_cpu, key_cpu, value_cpu, scale, key_mask=keep)
+        name = (
+            f"masked {impl_cls.__name__} {mask_kind} b{batch_size} q{q_len} kv{kv_len}"
         )
-        value_cpu = torch.randn(
-            batch_size, kv_len, num_heads, head_size, dtype=torch.bfloat16
-        )
-        keep = torch.arange(kv_len) < valid_len
-        keep_2d = keep[None, :].expand(batch_size, -1)
-        mask_cpu = keep_2d if mask_kind == "2d" else keep_2d[:, None, None, :]
 
-        ref_out = _sdpa_reference(
-            query_cpu, key_cpu, value_cpu, scale, key_mask=keep_2d
-        )
         tpu_out = impl.forward(
-            query_cpu.to("tpu"),
-            key_cpu.to("tpu"),
-            value_cpu.to("tpu"),
-            SimpleNamespace(attn_mask=mask_cpu.to("tpu")),
+            q_tpu, k_tpu, v_tpu, SimpleNamespace(attn_mask=mask_cpu.to("tpu"))
         ).cpu()
         assert torch.all(torch.isfinite(tpu_out))
         assert_parity(
             tpu_out,
             ref_out,
-            name=f"masked TpuSDPAImpl {mask_kind} b{batch_size} q{q_len} kv{kv_len}",
+            name=name,
             max_rel_l2=MASKED_SDPA_BF16_MAX_REL_L2,
             max_abs=MASKED_SDPA_BF16_MAX_ABS,
         )
+
+        if valid_len < kv_len:
+            # Must-fail control: without the mask the padded keys are attended to.
+            unmasked_out = impl.forward(q_tpu, k_tpu, v_tpu).cpu()
+            with pytest.raises(AssertionError, match=NUMERIC_MISMATCH_PATTERN):
+                assert_parity(
+                    unmasked_out,
+                    ref_out,
+                    name=f"{name}, mask dropped",
+                    max_rel_l2=MASKED_SDPA_BF16_MAX_REL_L2,
+                    max_abs=MASKED_SDPA_BF16_MAX_ABS,
+                )
+
+    @MASKED_SDPA_CASES
+    def test_torch_tpu_still_misreads_query_broadcast_attn_mask(
+        self, batch_size, q_len, kv_len, valid_len, mask_kind
+    ):
+        """Canary for google-pytorch/torch_tpu#5677, the bug behind the math pin.
+
+        Runs each masked case as TpuSDPAImpl.forward did before the pin, on
+        torch_tpu's default SDPA lowering. When this fails, torch_tpu reads a
+        mask of size 1 along the query dim correctly: remove the pin in
+        TpuSDPAImpl.forward and this canary.
+        """
+        query_cpu, key_cpu, value_cpu, mask_cpu, keep = _masked_sdpa_case(
+            batch_size, q_len, kv_len, valid_len, mask_kind
+        )
+        scale = 1.0 / math.sqrt(query_cpu.shape[-1])
+        impl = TpuSDPAImpl(
+            num_heads=query_cpu.shape[2],
+            head_size=query_cpu.shape[3],
+            softmax_scale=scale,
+        )
+        ref_out = _sdpa_reference(query_cpu, key_cpu, value_cpu, scale, key_mask=keep)
+
+        unpinned_out = impl._forward_impl(
+            query_cpu.to("tpu"),
+            key_cpu.to("tpu"),
+            value_cpu.to("tpu"),
+            SimpleNamespace(attn_mask=mask_cpu.to("tpu")),
+            mask_mode="broadcast_k",
+        ).cpu()
+        with pytest.raises(AssertionError, match=NUMERIC_MISMATCH_PATTERN):
+            assert_parity(
+                unpinned_out,
+                ref_out,
+                name=f"unpinned TpuSDPAImpl {mask_kind} b{batch_size} q{q_len}",
+                max_rel_l2=MASKED_SDPA_BF16_MAX_REL_L2,
+                max_abs=MASKED_SDPA_BF16_MAX_ABS,
+            )
 
     @DTYPES
     def test_flux_masked_attention_falls_back_to_sdpa_on_tpu(

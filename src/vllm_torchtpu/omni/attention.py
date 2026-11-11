@@ -17,9 +17,11 @@
 bf16 attention through a Pallas flash kernel tuned for diffusion
 sequence lengths. Masked, causal, or non-bf16 calls fall back with a
 one-time warning to ``TpuSDPAImpl`` (PyTorch SDPA). ``TpuSDPAImpl`` runs
-masked calls on the math SDPA backend.
+masked calls under ``sdpa_kernel(SDPBackend.MATH)``, which on torch_tpu
+selects the StableHLO SDPA lowering.
 """
 
+from contextlib import nullcontext
 from functools import cache as run_once
 from typing import Any
 
@@ -45,26 +47,31 @@ class TpuSDPAImpl(SDPAImpl):
         value: torch.Tensor,
         attn_metadata: Any | None = None,
     ) -> torch.Tensor:
-        if getattr(attn_metadata, "attn_mask", None) is None:
-            return self._forward_impl(
-                query, key, value, attn_metadata, mask_mode="broadcast_k"
-            )
         # ---------------------------------------------------------------------
-        # TODO: Remove the math-backend pin once torch_tpu's default
-        # scaled_dot_product_attention lowering honours attn_mask.
+        # TODO: Remove the math-backend pin, and its canary
+        # test_torch_tpu_still_misreads_query_broadcast_attn_mask, once the
+        # pinned torch_tpu release has the fix for
+        # google-pytorch/torch_tpu#5677 (on torch_tpu main, not in 0.2.0).
         #
-        # Problem: with any attn_mask (bool or float, e.g. a (B, 1, 1, K) key
-        #   padding mask), the default lowering is wrong: max abs error ~2
-        #   against a float64 reference, even for a mask that keeps every key,
-        #   and NaN for some shapes. The math backend matches the reference.
-        # Effect: LTX-2 under Ulysses pads the audio latents to a multiple of
-        #   the SP size and sends a key-padding mask to audio self-attention
-        #   and audio-to-video attention. At per-rank batch >= 2 (LTX-2.3
-        #   multi-guidance at CFG-parallel 2) audio-to-video attention
-        #   produced a NaN row, so the video came out blank and the audio
-        #   NaN; at batch 1 the audio was finite but wrong.
+        # Problem: torch_tpu 0.2.0's default SDPA lowering, its flash kernel,
+        #   misreads an attn_mask of size 1 along the query dim, such as a
+        #   (B, 1, 1, K) or (B, H, 1, K) key-padding mask, bool or additive.
+        #   The output is wrong even for a mask that keeps every key, and NaN
+        #   for some shapes. A mask with a full query dim is read correctly.
+        # Fix: masked calls run under sdpa_kernel(SDPBackend.MATH), which on
+        #   torch_tpu selects the StableHLO SDPA lowering, not ATen math. It
+        #   builds the full (B, H, Q, K) score tensor, so it is slower than
+        #   the flash kernel on long sequences.
+        # Effect: masked calls match a float64 reference. Before, LTX-2 under
+        #   Ulysses, which pads the audio latents to a multiple of the SP size
+        #   and sends a key-padding mask to audio self-attention and
+        #   audio-to-video attention, got a NaN row from audio-to-video
+        #   attention at per-rank batch >= 2 (LTX-2.3 multi-guidance at
+        #   CFG-parallel 2): blank video and NaN audio. At batch 1 the audio
+        #   was finite but wrong.
         # ---------------------------------------------------------------------
-        with sdpa_kernel(SDPBackend.MATH):
+        masked = attn_metadata is not None and attn_metadata.attn_mask is not None
+        with sdpa_kernel(SDPBackend.MATH) if masked else nullcontext():
             return self._forward_impl(
                 query, key, value, attn_metadata, mask_mode="broadcast_k"
             )
