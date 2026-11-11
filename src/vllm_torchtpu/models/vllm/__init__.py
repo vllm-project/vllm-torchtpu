@@ -11,8 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import importlib
+import pkgutil
+
 from vllm.model_executor.models.config import VerifyAndUpdateConfig
 
+import vllm_torchtpu.models as models
 from vllm_torchtpu.gqa_head_padding import update_gqa_head_padding_config
 
 _KIMI_MODEL = "vllm_torchtpu.models.vllm.kimi_k3:KimiLinearForCausalLM"
@@ -64,3 +68,24 @@ def register_models() -> None:
     MODELS_CONFIG_MAP["Qwen4ExpForCausalLM"] = TPUQwen4ExpConfig
     MODELS_CONFIG_MAP["Qwen4ExpForConditionalGeneration"] = TPUQwen4ExpConfig
     MODELS_CONFIG_MAP["Qwen2ForCausalLM"] = _TPUQwen2Config
+    register_model_directories()
+
+
+def register_model_directories() -> None:
+    """Call `register()` of every model directory under `vllm_torchtpu.models`.
+
+    A model directory (`models/<model>/`) registers its own architectures,
+    config hooks, quant methods and KV cache dtypes, so adding a model does not
+    edit this file. Its `__init__` must stay import-free: this runs at plugin
+    load in every process, before vLLM selects a model. A package that does
+    not define a callable `register()` is an error, not a silent skip.
+    """
+    for module in sorted(pkgutil.iter_modules(models.__path__), key=lambda m: m.name):
+        if not module.ispkg or module.name == "vllm":
+            continue
+        name = f"{models.__name__}.{module.name}"
+        package = importlib.import_module(name)
+        register = package.__dict__.get("register")
+        if not callable(register):
+            raise TypeError(f"model directory {name} must define a callable register()")
+        register()
