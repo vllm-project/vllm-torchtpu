@@ -1,0 +1,99 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+steps:
+  - label: "${TPU_VERSION:-tpu6e} Unit tests for Qwen/Qwen3-4B"
+    key: "${TPU_VERSION:-tpu6e}_Qwen_Qwen3-4B_UnitTest"
+    agents:
+      queue: "kube"
+    plugins:
+      - kubernetes:
+          podTemplate: tpu-launcher
+    soft_fail: true
+    commands:
+      - |
+        SHAPE=${MODEL_SHAPE_SINGLE} .buildkite/kubernetes/run.sh \
+          bash -c 'SKIP_JAX_PRECOMPILE=1 VLLM_XLA_CHECK_RECOMPILATION=0 python examples/offline_inference.py --model Qwen/Qwen3-4B --tensor-parallel-size ${TENSOR_PARALLEL_SIZE_SINGLE:-1} --max-model-len 2048 --max-num-batched-tokens 256 --max-num-seqs 256 --chat-template-kwargs="{\"enable_thinking\": false}"'
+
+  - label: "${TPU_VERSION:-tpu6e} Record unit test result for Qwen/Qwen3-4B"
+    key: "${TPU_VERSION:-tpu6e}_record_Qwen_Qwen3-4B_UnitTest"
+    depends_on: "${TPU_VERSION:-tpu6e}_Qwen_Qwen3-4B_UnitTest"
+    env:
+      CI_TPU_VERSION: "${TPU_VERSION:-tpu6e}"
+      CI_TARGET: "Qwen/Qwen3-4B"
+      CI_STAGE: "UnitTest"
+      CI_CATEGORY: "text-only"
+    agents:
+      queue: cpu
+    commands:
+      - |
+        .buildkite/scripts/record_step_result.sh ${TPU_VERSION:-tpu6e}_Qwen_Qwen3-4B_UnitTest
+
+  - label: "${TPU_VERSION:-tpu6e} Accuracy for Qwen/Qwen3-4B"
+    key: "${TPU_VERSION:-tpu6e}_Qwen_Qwen3-4B_Accuracy"
+    depends_on: "${TPU_VERSION:-tpu6e}_record_Qwen_Qwen3-4B_UnitTest"
+    agents:
+      queue: "kube"
+    plugins:
+      - kubernetes:
+          podTemplate: tpu-launcher
+    soft_fail: true
+    # TODO: replace the 0 thresholds with values measured on vtt. The
+    # tpu-inference job (a different accuracy script) gated at 0.85.
+    commands:
+      - |
+        SHAPE=${MODEL_SHAPE_SINGLE} .buildkite/kubernetes/run.sh bash tests/e2e/check_lm_eval.sh --model_name "Qwen/Qwen3-4B" --tensor_parallel_size ${TENSOR_PARALLEL_SIZE_SINGLE:-1} --max_model_len 4096 --max_num_batched_tokens 4096 --max_gen_toks 2048 --enable_expert_parallel 0 --flex_threshold 0 --strict_threshold 0 --limit 100 --enable_thinking false
+
+  - label: "${TPU_VERSION:-tpu6e} Record integration test result for Qwen/Qwen3-4B"
+    key: "${TPU_VERSION:-tpu6e}_record_Qwen_Qwen3-4B_Accuracy"
+    depends_on: "${TPU_VERSION:-tpu6e}_Qwen_Qwen3-4B_Accuracy"
+    env:
+      CI_TPU_VERSION: "${TPU_VERSION:-tpu6e}"
+      CI_TARGET: "Qwen/Qwen3-4B"
+      CI_STAGE: "Accuracy/Correctness"
+      CI_CATEGORY: "text-only"
+    agents:
+      queue: cpu
+    commands:
+      - |
+        .buildkite/scripts/record_step_result.sh ${TPU_VERSION:-tpu6e}_Qwen_Qwen3-4B_Accuracy
+
+  - label: "${TPU_VERSION:-tpu6e} Performance benchmarks for Qwen/Qwen3-4B"
+    key: "${TPU_VERSION:-tpu6e}_Qwen_Qwen3-4B_Benchmark"
+    depends_on: "${TPU_VERSION:-tpu6e}_record_Qwen_Qwen3-4B_Accuracy"
+    agents:
+      queue: "kube"
+    plugins:
+      - kubernetes:
+          podTemplate: tpu-launcher
+    soft_fail: true
+    # TODO: replace the 0 throughput limits with values measured on vtt, per
+    # TPU generation if v6e and v7x differ.
+    commands:
+      - |
+        SHAPE=${MODEL_SHAPE_SINGLE} .buildkite/kubernetes/run.sh bash tests/e2e/benchmarking/bm_qwen3_coder.sh --model Qwen/Qwen3-4B --tp ${TENSOR_PARALLEL_SIZE_SINGLE:-1} --req_tput_limit 0 --output_token_tput_limit 0 --total_token_tput_limit 0 --input_len 1024 --output_len 1024 --num_prompts 64 --timeout 30
+
+  - label: "${TPU_VERSION:-tpu6e} Record performance benchmark result for Qwen/Qwen3-4B"
+    key: "${TPU_VERSION:-tpu6e}_record_Qwen_Qwen3-4B_Benchmark"
+    depends_on: "${TPU_VERSION:-tpu6e}_Qwen_Qwen3-4B_Benchmark"
+    env:
+      CI_TPU_VERSION: "${TPU_VERSION:-tpu6e}"
+      CI_TARGET: "Qwen/Qwen3-4B"
+      CI_STAGE: "Benchmark"
+      CI_CATEGORY: "text-only"
+    agents:
+      queue: cpu
+    commands:
+      - |
+        .buildkite/scripts/record_step_result.sh ${TPU_VERSION:-tpu6e}_Qwen_Qwen3-4B_Benchmark
