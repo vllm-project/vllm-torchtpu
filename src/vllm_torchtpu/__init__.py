@@ -1638,10 +1638,11 @@ def _patch_vllm_same_step_prefix_hits() -> None:
 def _order_pages_by_size(groups: list) -> list:
     """Place each group's pages largest first inside a block-outer block.
 
-    Upstream packs a group's pages in registration order. Every page size of a
-    V4.1 group is a power of two and the block stride is a multiple of the
-    largest one, so largest-first puts every page on a multiple of its own size:
-    CSA2's whole-page SWA and main-record addressing then holds in every block.
+    Upstream packs a group's pages in registration order. Main KV and SWA pages
+    are powers of two, so largest-first puts each on a multiple of its own size
+    within the block; the block stride is whole 64 KiB SWA pages. CSA2 reads
+    main KV through the block stride (`prepare_main_records`) and SWA in whole
+    pages. Indexer pages (132-byte records, 512-byte aligned) come last.
     """
     import dataclasses
 

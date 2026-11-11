@@ -22,7 +22,6 @@ from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
-    replace_as,
 )
 from vllm.v1.kv_cache_layout import KVCacheLayout
 from vllm.v1.worker.utils import allocate_kv_cache
@@ -32,9 +31,6 @@ from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import (
     BLOCK_STRIDE_ALIGNMENT,
     SWA_PAGE_BYTES,
     SWA_PAGE_TOKENS,
-)
-from vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_cache import (
-    PackedFP8IndexerSpec,
 )
 
 pytestmark = pytest.mark.cpu_test
@@ -64,18 +60,16 @@ def _specs():
                 model_version="deepseek_v4",
                 block_stride_alignment=align,
             )
-            specs[f"{prefix}.indexer.k_cache"] = replace_as(
-                MLAAttentionSpec(
-                    block_size=COMPRESSED_BLOCK,
-                    num_kv_heads=1,
-                    head_size=132,
-                    dtype=torch.uint8,
-                    tokens_per_state=ratio,
-                    alignment=512,
-                    model_version="deepseek_v4",
-                    block_stride_alignment=align,
-                ),
-                PackedFP8IndexerSpec,
+            # Upstream's indexer spec: 132-byte records, 512-byte alignment.
+            specs[f"{prefix}.indexer.k_cache"] = MLAAttentionSpec(
+                block_size=COMPRESSED_BLOCK,
+                num_kv_heads=1,
+                head_size=132,
+                dtype=torch.uint8,
+                tokens_per_state=ratio,
+                alignment=512,
+                model_version="deepseek_v4",
+                block_stride_alignment=align,
             )
             if ratio == 2:
                 specs[f"{prefix}.compressor.state_cache"] = CircularBufferSpec(
@@ -145,7 +139,7 @@ def test_swa_layers_share_block_outer_groups():
     assert {g.kv_cache_spec.block_size for g in swa} == {SWA_PAGE_TOKENS}
 
 
-def test_pages_largest_first_are_aligned_to_their_own_size():
+def test_pages_largest_first_keep_their_addressing_alignment():
     config = _config()
     specs = _specs()
     groups = _order_pages_by_size(get_kv_cache_groups(config, specs))
@@ -159,13 +153,17 @@ def test_pages_largest_first_are_aligned_to_their_own_size():
         item = view.element_size()
         stride = view.stride(0) * item
         offset = view.storage_offset() * item % stride
-        # The spec page, padded for the indexer's 132-byte records.
-        page = specs[name].page_size_bytes
         strides.add(stride)
-        assert offset % page == 0, (name, offset, page)
+        if _kind(name) == "k_cache":
+            # `PackedFP8Layout` addresses indexer pages in 512-byte owner rows.
+            assert offset % 512 == 0, (name, offset)
+        else:
+            # Largest first keeps main and SWA pages on their own size.
+            page = specs[name].page_size_bytes
+            assert offset % page == 0, (name, offset, page)
         offsets[_kind(name), view.shape[2]].add(offset // 1024)
-    # 480 KiB of main + indexer pages, rounded to whole SWA pages.
-    assert strides == {8 * SWA_PAGE_BYTES}
+    # The 7-layer SWA group (448 KiB): main KV is addressed by block stride.
+    assert strides == {7 * SWA_PAGE_BYTES}
     assert offsets["self_attn", 256] == {0}
     assert offsets["self_attn", 128] == {128, 192, 256}
 

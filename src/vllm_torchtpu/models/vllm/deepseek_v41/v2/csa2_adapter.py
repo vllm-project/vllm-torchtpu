@@ -176,6 +176,8 @@ def _gather_attend(
     metadata: jax.Array,
     bounds: jax.Array,
     main_page_size: int,
+    main_page_stride: int,
+    main_row_offset: int,
     swa_page_size: int,
     ratio: int,
     scale: float,
@@ -187,6 +189,8 @@ def _gather_attend(
         pages,
         main_starts,
         page_size=main_page_size,
+        page_stride=main_page_stride,
+        row_offset=main_row_offset,
         onehot_requests=envs.TPU_ONEHOT_TABLE_LOOKUP,
     )
     output, words, scales = csa2_pipeline(
@@ -406,7 +410,7 @@ def initialize_csa2_ops() -> None:
         (
             "gather_attend",
             _gather_attend,
-            (P(),) * 16 + (None,) * 6,
+            (P(),) * 16 + (None,) * 8,
             _fake_gather_attend,
         ),
         (
@@ -546,11 +550,14 @@ def attention(
             main.total_rows // page_size, dtype=torch.int32, device=records.device
         )[None, :]
         main_starts = torch.stack((starts[0] * 0, starts[-1]))
+        page_stride, row_offset = page_size, 0
     else:
+        # ``pages`` is the block table; the kernel applies the layer's stride.
         page_size = main.shape[1]
+        page_stride, row_offset = main.page_stride, main.row_offset
     assert main_starts is not None and main.scale is not None
     cache = attention_kernels._active_gathered_kv
-    layout = ("csa2", page_size)
+    layout = ("csa2", page_size, page_stride, row_offset)
     gathered = cache.get(main, records, layout) if cache is not None else None
     if gathered is None:
         output, words, scales, counts = _ops["gather_attend"](
@@ -571,6 +578,8 @@ def attention(
             metadata.int(),
             bounds.int(),
             page_size,
+            page_stride,
+            row_offset,
             swa.shape[1],
             ratio,
             scale,

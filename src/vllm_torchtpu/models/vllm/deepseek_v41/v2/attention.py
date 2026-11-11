@@ -1644,8 +1644,11 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                             else None
                         )
                         if pages is None:
-                            pages = main_cache.pages(_block_table(source_meta))
-                            if stage_cache is not None and pages is not None:
+                            # CSA2 applies the layer's page stride and offset
+                            # (`prepare_main_records`), so the block stride
+                            # need not be a whole number of main pages.
+                            pages = _block_table(source_meta)
+                            if stage_cache is not None:
                                 stage_cache[pages_key] = pages
                     else:
                         pages = None

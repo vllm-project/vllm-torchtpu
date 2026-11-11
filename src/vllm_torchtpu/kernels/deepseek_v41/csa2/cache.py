@@ -598,24 +598,34 @@ def prepare_swa_metadata(
     return metadata, jnp.stack((left, right), axis=1), records.astype(jnp.int32)
 
 
-@functools.partial(jax.jit, static_argnames=("page_size", "onehot_requests"))
+@functools.partial(
+    jax.jit,
+    static_argnames=("page_size", "page_stride", "row_offset", "onehot_requests"),
+)
 def prepare_main_records(
     selected: jax.Array,
     physical_pages: jax.Array,
     starts: jax.Array,
     *,
     page_size: int,
+    page_stride: int | None = None,
+    row_offset: int = 0,
     onehot_requests: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Resolve already-compacted logical selections; preserve stage gather reuse.
 
-    Page IDs address contiguous records in concatenated physical banks. Caller
+    Page IDs address contiguous records in concatenated physical banks: page
+    ``p`` starts at record ``row_offset + p * page_stride`` (default: whole
+    pages), so a block table addresses a block-outer layer directly. Caller
     guarantees all nonnegative selections are in range and form a valid prefix.
     Returns fixed [T,512] physical IDs and authoritative [T] valid-prefix counts.
     This operation belongs to the first gather for a source/index group only.
     """
     if selected.ndim != 2 or selected.shape[1] > 512 or page_size < 1:
         raise ValueError("CSA2 main selection width must be at most 512")
+    stride = page_size if page_stride is None else page_stride
+    if stride < page_size or row_offset < 0:
+        raise ValueError("CSA2 main pages must not overlap")
     from vllm_torchtpu.kernels.experimental import decode_preparation as prep
 
     if prep.admit(
@@ -633,7 +643,9 @@ def prepare_main_records(
         buckets=prep.MAIN_RECORD_BATCHES,
     ):
         inputs = (selected, physical_pages, starts)
-        return prep.main_records_call(inputs, page_size=page_size)(*inputs)
+        return prep.main_records_call(
+            inputs, page_size=page_size, page_stride=stride, row_offset=row_offset
+        )(*inputs)
     tokens, width = selected.shape
     req = _requests(starts, tokens, onehot=onehot_requests)
     valid = (selected >= 0) & (jnp.arange(tokens)[:, None] < starts[-1])
@@ -652,6 +664,6 @@ def prepare_main_records(
         )[:, :width]
     else:
         pages = physical_pages[req[:, None], logical // page_size]
-    records = jnp.where(valid, pages * page_size + logical % page_size, -1)
+    records = jnp.where(valid, pages * stride + row_offset + logical % page_size, -1)
     records = jnp.pad(records, ((0, 0), (0, 512 - width)), constant_values=-1)
     return records.astype(jnp.int32), jnp.sum(valid, axis=1, dtype=jnp.int32)

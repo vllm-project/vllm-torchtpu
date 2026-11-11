@@ -291,11 +291,12 @@ def swa_word_pool_pack(records, values, *, capacity, padded, interpret=False):
     return physical.reshape(-1), words.reshape(-1, 128), masks.reshape(-1, 128)
 
 
-def main_records_call(xs, *, page_size):
+def main_records_call(xs, *, page_size, page_stride=None, row_offset=0):
     selected, pages, starts = xs
     t, k = selected.shape
     requests, pps = pages.shape
     padded_pps = (pps + 127) // 128 * 128
+    stride = page_size if page_stride is None else page_stride
 
     def body(sel, table, boundaries):
         token = jnp.arange(t, dtype=jnp.int32)
@@ -321,7 +322,9 @@ def main_records_call(xs, *, page_size):
             chunk = window[:, c * 128 : (c + 1) * 128]
             value = take_along(chunk, jnp.clip(local, 0, 127), axis=1)
             physical = jnp.where((local >= 0) & (local < 128), value, physical)
-        records = jnp.where(valid, physical * page_size + logical % page_size, -1)
+        records = jnp.where(
+            valid, physical * stride + row_offset + logical % page_size, -1
+        )
         return records, jnp.sum(valid, axis=1, keepdims=True, dtype=jnp.int32).T
 
     fused = fuse_function(body, xs, name="dsv41_main_records_matrix")
