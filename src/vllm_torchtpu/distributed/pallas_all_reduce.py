@@ -59,7 +59,9 @@ class _Armed:
     ranks: tuple[int, ...]
     op: Any
     rank: torch.Tensor  # this rank's mesh index, int32 [1, 1]
-    op_after: Any  # op(x, rank, after): starts once `after` exists
+    # op(x, rank, after): starts once `after` exists. Only built for the
+    # MiniMax-M3 token-half split (TPU_MINIMAX_M3_SPLIT_MIN_TOKENS), else None.
+    op_after: Any
 
 
 _ARMED: _Armed | None = None
@@ -200,7 +202,11 @@ def arm(hidden: int, device: torch.device) -> bool:
         ranks=tuple(int(r) for r in tp.ranks),
         op=op,
         rank=rank,
-        op_after=_make_op(mesh, max_bytes, ordered=True),
+        op_after=(
+            _make_op(mesh, max_bytes, ordered=True)
+            if envs.TPU_MINIMAX_M3_SPLIT_MIN_TOKENS
+            else None
+        ),
     )
     logger.info(
         "tp_all_reduce: armed over %d ranks (mesh index %d), Pallas up to %d B views",
@@ -228,6 +234,6 @@ def all_reduce(
     # Every size goes to the op, which decides on the static size inside: a
     # branch here would give the model's Dynamo traces different graphs (and
     # inputs) per bucket, which shape_variants refuses to hand buckets between.
-    if after is None:
+    if after is None or armed.op_after is None:
         return armed.op(x, armed.rank)
     return armed.op_after(x, armed.rank, after)
