@@ -401,3 +401,19 @@ def test_tile_select_compiles_for_tpu7x(monkeypatch, dcp, heads, num_tokens, cac
         assert not _bf16_scatters(text)
         assert lowered.out_info[2].shape == (2 * TOPK, num_tokens * heads)
         assert lowered.compile() is not None
+
+
+def test_tile_select_toggle():
+    from types import SimpleNamespace
+
+    from vllm_torchtpu.models.minimax_m3.experimental import attention
+
+    assert not msa_dcp.TILE_SELECT_ENABLED
+    assert not attention.tile_select_enabled(SimpleNamespace(additional_config={}))
+    assert not attention.tile_select_enabled(SimpleNamespace(additional_config=None))
+    on = SimpleNamespace(additional_config={attention.TILE_SELECT_KEY: True})
+    assert attention.tile_select_enabled(on)
+    with pytest.raises(ValueError):
+        attention.tile_select_enabled(
+            SimpleNamespace(additional_config={attention.TILE_SELECT_KEY: "yes"})
+        )
