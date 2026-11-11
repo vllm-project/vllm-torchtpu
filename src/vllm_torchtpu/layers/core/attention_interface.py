@@ -1224,13 +1224,24 @@ def sparse_mla_attention_dcp(
             interleave_size=interleave_size,
         )
 
-        # A rank owning none of a token's top-k still has to be handed one
-        # valid entry: the kernel derives `kv_len` from the `-1` tail and
-        # requires `kv_len >= 1`. Position 0 always exists, so it is the
-        # cheapest dummy; the softmax it produces is real but meaningless, and
-        # `owns` below is what keeps it out of the merge.
-        owns = jnp.any(topk_idx >= 0, axis=-1)
-        topk_idx = topk_idx.at[:, 0].set(jnp.where(owns, topk_idx[:, 0], jnp.int32(0)))
+        # Decode buckets with TPU_DCP_MLA_MASK_IN_KERNEL: the kernel takes the
+        # true kv_len (0 = this rank owns none of the token's top-k) and writes
+        # that token's lse as -inf itself, so none of the glue below runs.
+        mask_in_kernel = (
+            envs.TPU_DCP_MLA_MASK_IN_KERNEL
+            and topk_idx.shape[0] <= sparse_mla_kernel.FUSED_PREP_MAX_TOKENS
+        )
+        fused_prep = mask_in_kernel and envs.TPU_DCP_MLA_FUSED_PREP
+        if not mask_in_kernel:
+            # A rank owning none of a token's top-k still has to be handed one
+            # valid entry: the kernel derives `kv_len` from the `-1` tail and
+            # requires `kv_len >= 1`. Position 0 always exists, so it is the
+            # cheapest dummy; the softmax it produces is real but meaningless,
+            # and `owns` below is what keeps it out of the merge.
+            owns = jnp.any(topk_idx >= 0, axis=-1)
+            topk_idx = topk_idx.at[:, 0].set(
+                jnp.where(owns, topk_idx[:, 0], jnp.int32(0))
+            )
 
         # Split q: the kernel joins q_nope and q_pe in VMEM (no padded
         # [T, H, 640] concat). The merge below needs the lse, so it also comes
@@ -1272,10 +1283,13 @@ def sparse_mla_attention_dcp(
             # Ranks own ~topk/dcp of each row: a static top-k width with an
             # exact in-kernel overflow pass for the rows that need more.
             topk_cap=topk_cap,
+            lse_mask_empty=mask_in_kernel,
+            fused_window_prep=fused_prep,
             **chunk_kwargs,
             **split_kwargs,
         )
-        lse = jnp.where(owns[:, None], lse, -jnp.inf)
+        if not mask_in_kernel:
+            lse = jnp.where(owns[:, None], lse, -jnp.inf)
         # Drop the rope tail: only the nope part is the MLA value (P @ latent).
         return (kv_cache_nope, kv_cache_rope, output[..., : ql_nope.shape[-1]], lse)
 

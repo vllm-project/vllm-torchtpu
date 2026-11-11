@@ -28,6 +28,8 @@ if TYPE_CHECKING:
     TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS: int = 64
     TPU_DCP_RS_OUT_PRECISION: bool = True
     TPU_MLA_SPARSE_SPLIT_Q: bool = False
+    TPU_DCP_MLA_MASK_IN_KERNEL: bool = False
+    TPU_DCP_MLA_FUSED_PREP: bool = False
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
     TPU_NAME: str | None = None
@@ -477,6 +479,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # lane-padded tiles cost a broadcast init, a relayout copy and padded
     # copies through the LSE merge. Bit-identical outputs.
     "TPU_MLA_SPARSE_SPLIT_Q": env_bool("TPU_MLA_SPARSE_SPLIT_Q", default=False),
+    # DCP sparse MLA, decode buckets (<= 32 tokens): the kernel writes lse
+    # -inf and output 0 for a token whose top-k this rank does not own, so no
+    # dummy key or owns mask is needed. Same merge result.
+    "TPU_DCP_MLA_MASK_IN_KERNEL": env_bool("TPU_DCP_MLA_MASK_IN_KERNEL", default=False),
+    # With TPU_DCP_MLA_MASK_IN_KERNEL, decode buckets: build the capped window
+    # indices and the SparseCore gather's live bound in one Pallas call.
+    # Same gathered rows.
+    "TPU_DCP_MLA_FUSED_PREP": env_bool("TPU_DCP_MLA_FUSED_PREP", default=False),
     # QK pair-blocked GDN conv layout for Raiden transfers.  Not supported
     # with the unified GDN state pool: its kernel reads segment-major
     # [Q | K | V] conv rows, so the pool manifest rejects this flag.  Must
