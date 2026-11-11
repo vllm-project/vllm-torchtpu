@@ -45,7 +45,6 @@ export TPU_ACCELERATOR_TYPE=tpu7x
 export TPU_BACKEND_TYPE=jax
 export TPU_HOST_BOUNDS=1,1,1
 export TPU_KV_RESHARD_TRANSPORT=raiden
-export TPU_KV_SHM_POOL_GB=8
 export TPU_KV_TRANSFER_PORT=9100
 export TPU_P2P_WAIT_PULL_TIMEOUT=600
 export TPU_PREMAPPED_BUFFER_SIZE=17179869184
@@ -54,7 +53,6 @@ export TPU_PROCESS_PORT=''
 export TPU_RAIDEN_QWEN35_ADMISSION=1
 export TPU_RAIDEN_RESHARD_IMPL=store
 export TPU_RAIDEN_TRANSFER_PARALLELISM=8
-export TPU_SIDE_CHANNEL_PORT=9600
 export TPU_TOPOLOGY=2x2x1
 export TPU_USE_RAIDEN_KV_CACHE_MANAGER=1
 export TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1
@@ -71,14 +69,12 @@ export XLA_PYTHON_CLIENT_PREALLOCATE=false
 # Identity and ports, which must differ so the two do not collide.
 case "$role" in
   prefill)
-    export TPU_KV_TRANSFER_NAMESPACE=gke_prefill
     export TPU_RAIDEN_ENGINE_ID=gke-prefill-engine
     export TPU_RAIDEN_JOB_NAME=prefill
     export TPU_RAIDEN_RESHARD_PORT_BASE=27000
     export TPU_RAIDEN_STORE_DISPATCH_PORT_BASE=27100
     ;;
   decode)
-    export TPU_KV_TRANSFER_NAMESPACE=gke_decode
     export TPU_RAIDEN_ENGINE_ID=gke-decode-engine
     export TPU_RAIDEN_JOB_NAME=decode
     export TPU_RAIDEN_RESHARD_PORT_BASE=28000

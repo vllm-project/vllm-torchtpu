@@ -93,9 +93,9 @@ export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS="${VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS:
 #     RAY_LOG_TO_STDERR -- the recipe blanks inherited multihost variables for
 #     a 2x2x1 JobSet pod. This rig is one process on one v7x-8 host, and the
 #     recipe's 2x2x1 topology would be the wrong shape to assert here.
-#   TPU_KV_SHM_POOL_GB / TPU_KV_PIN_SHM / TPU_PREMAPPED_BUFFER_* -- tuning for
-#     the disagg connector's shm staging pool, a different pool from the
-#     offload store's cpu_bytes_to_use below.
+#   TPU_PREMAPPED_BUFFER_* -- tuning for the disagg connector's DMA-mapped
+#     host buffer pool, a different pool from the offload store's
+#     cpu_bytes_to_use below.
 
 # Rig plumbing, from run_dsv4_offload_correctness.sh: the compile and timeout
 # settings the offload connector has been exercised under, a fixed hash seed,

@@ -37,7 +37,6 @@ readonly DEFAULT_PREFILL_CONTROLLER_PORT=27000
 readonly DEFAULT_DECODE_CONTROLLER_PORT=28000
 readonly DEFAULT_KV_PORT=14579
 readonly DEFAULT_TRANSFER_PORT=9100
-readonly DEFAULT_SIDE_CHANNEL_PORT=9600
 # Decode topology / FA cache layout. The defaults keep the golden PCP8 -> DP8
 # token-major pair byte-identical.
 readonly DEFAULT_DECODE_DP=8
@@ -131,7 +130,6 @@ Advanced port overrides:
   --decode-controller-port PORT    Default: 28000
   --kv-port PORT                   vLLM connector metadata port (14579)
   --transfer-port PORT             Raiden control-port base (9100)
-  --side-channel-port PORT         Connector side-channel base (9600)
 
 Both machines need an 8-chip TPU host, the exact model snapshot, and matching
 installed vllm, vllm-torchtpu, torch-tpu, and tpu-sync-torch environments.
@@ -346,9 +344,8 @@ check_role_environment() {
   local controller_port="$6"
   local kv_port="$7"
   local transfer_port="$8"
-  local side_channel_port="$9"
-  local model="${10}"
-  local decode_dp="${11}"
+  local model="$9"
+  local decode_dp="${10}"
 
   command -v setsid >/dev/null 2>&1 || die "setsid is required on the ${role} host"
   setsid --help 2>&1 | grep -q -- '--wait' \
@@ -369,7 +366,7 @@ check_role_environment() {
 
   "${python_bin}" - "${role}" "${role_dir}" "${expected_vllm_version}" \
     "${api_port}" "${controller_port}" "${kv_port}" "${transfer_port}" \
-    "${side_channel_port}" "${model}" "${decode_dp}" <<'PY'
+    "${model}" "${decode_dp}" <<'PY'
 import contextlib
 import hashlib
 import importlib.metadata
@@ -380,7 +377,7 @@ import pathlib
 import socket
 import sys
 
-role, role_dir, expected, api_port, controller_port, kv_port, transfer_port, side_port, model, decode_dp = sys.argv[1:]
+role, role_dir, expected, api_port, controller_port, kv_port, transfer_port, model, decode_dp = sys.argv[1:]
 
 # TPU/plugin imports emit useful diagnostics. Keep the report on stdout valid
 # JSON by routing those diagnostics to the preflight stderr artifact.
@@ -411,9 +408,8 @@ probe.unlink()
 
 ports = [int(api_port), int(controller_port), int(kv_port)]
 # Stage-3 uses one even control port for each of eight source/destination
-# ranks. Keep the legacy side-channel range clear as well.
+# ranks.
 ports.extend(int(transfer_port) + 2 * rank for rank in range(8))
-ports.extend(int(side_port) + rank for rank in range(8))
 # Store mode binds one reshard service (controller_port + dp_rank) and one
 # dispatch controller (controller_port + 100 + dp_rank) per engine: one on
 # prefill, decode_dp on decode.
@@ -546,7 +542,6 @@ configure_role_environment() {
   local run_id="$4"
   local role_dir="$5"
   local transfer_port="$6"
-  local side_channel_port="$7"
   local controller_address
   local namespace="${run_id//[^a-zA-Z0-9_]/_}_${role}"
 
@@ -608,9 +603,7 @@ configure_role_environment() {
   export TPU_PREMAPPED_BUFFER_SIZE="${TPU_PREMAPPED_BUFFER_SIZE:-17179869184}"
 
   export TPU_P2P_WAIT_PULL_TIMEOUT=600
-  export TPU_KV_SHM_POOL_GB=8
   export TPU_KV_TRANSFER_PORT="${transfer_port}"
-  export TPU_SIDE_CHANNEL_PORT="${side_channel_port}"
 
   unset VLLM_DISABLE_COMPILE_CACHE VLLM_CACHE_ROOT TORCHINDUCTOR_CACHE_DIR
   unset VLLM_XLA_CACHE_PATH TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT
@@ -629,7 +622,6 @@ configure_role_environment() {
   export TPU_VISIBLE_CHIPS=0,1,2,3,4,5,6,7
   export TPU_CHIPS_PER_HOST_BOUNDS=1,8,1
   unset DEBUG_TPU_LOCAL_RANK_OFFSET
-  export TPU_KV_TRANSFER_NAMESPACE="${namespace}"
   export TPU_RAIDEN_JOB_NAME="${role}"
   export TPU_RAIDEN_ENGINE_ID="${run_id}-${role}-engine"
 
@@ -684,8 +676,7 @@ run_role_server() {
   local controller_port="$9"
   local kv_port="${10}"
   local transfer_port="${11}"
-  local side_channel_port="${12}"
-  local expected_vllm_version="${13}"
+  local expected_vllm_version="${12}"
   local controller_pid="" controller_ticks="" controller_pgid=""
   local server_pid="" server_ticks="" server_pgid=""
   local controller_address prefill_compilation_config decode_compilation_config
@@ -863,7 +854,7 @@ PY
   fi
 
   configure_role_environment "${role}" "${role_host}" "${controller_port}" \
-    "${run_id}" "${role_dir}" "${transfer_port}" "${side_channel_port}"
+    "${run_id}" "${role_dir}" "${transfer_port}"
   controller_address="$(host_port "${role_host}" "${controller_port}")"
   [[ "${TPU_RAIDEN_CONTROLLER_ADDRESS}" == "${controller_address}" ]] \
     || die "internal controller address mismatch"
@@ -1827,7 +1818,6 @@ PREFILL_CONTROLLER_PORT="${DEFAULT_PREFILL_CONTROLLER_PORT}"
 DECODE_CONTROLLER_PORT="${DEFAULT_DECODE_CONTROLLER_PORT}"
 KV_PORT="${DEFAULT_KV_PORT}"
 TRANSFER_PORT="${DEFAULT_TRANSFER_PORT}"
-SIDE_CHANNEL_PORT="${DEFAULT_SIDE_CHANNEL_PORT}"
 PREFLIGHT_ONLY=0
 PERFORMANCE_GATE=1
 KEEP_CACHE=0
@@ -1865,7 +1855,6 @@ while (($#)); do
     --decode-controller-port) DECODE_CONTROLLER_PORT="${2:?missing value for $1}"; shift 2 ;;
     --kv-port) KV_PORT="${2:?missing value for $1}"; shift 2 ;;
     --transfer-port) TRANSFER_PORT="${2:?missing value for $1}"; shift 2 ;;
-    --side-channel-port) SIDE_CHANNEL_PORT="${2:?missing value for $1}"; shift 2 ;;
     --ssh-option) SSH_OPTIONS+=(-o "${2:?missing value for $1}"); shift 2 ;;
     --reshard-controller-impl) RESHARD_CONTROLLER_IMPL="${2:?missing value for $1}"; shift 2 ;;
     # Forwarded to the internal roles verbatim; empty means "no sidecar"
@@ -1898,7 +1887,7 @@ while (($#)); do
 done
 
 for port_name in PREFILL_API_PORT DECODE_API_PORT PREFILL_CONTROLLER_PORT \
-                 DECODE_CONTROLLER_PORT KV_PORT TRANSFER_PORT SIDE_CHANNEL_PORT; do
+                 DECODE_CONTROLLER_PORT KV_PORT TRANSFER_PORT; do
   validate_port "${port_name}" "${!port_name}"
 done
 is_positive_integer "${STARTUP_TIMEOUT}" || die "startup timeout must be positive"
@@ -1970,13 +1959,12 @@ if [[ -n "${INTERNAL_ROLE}" ]]; then
         check_role_environment "${ROLE_PYTHON}" "${ROLE_KIND}" "${ROLE_DIR}" \
           "${EXPECTED_VLLM_VERSION}" "${role_api_port}" \
           "${role_controller_port}" "${KV_PORT}" "${TRANSFER_PORT}" \
-          "${SIDE_CHANNEL_PORT}" "${MODEL}" "${DECODE_DP}"
+          "${MODEL}" "${DECODE_DP}"
       else
         run_role_server "${ROLE_KIND}" "${ROLE_PYTHON}" "${ROLE_HOST}" \
           "${ROLE_DIR}" "${RUN_ID}" "${MODEL}" "${SERVED_MODEL}" \
           "${role_api_port}" "${role_controller_port}" "${KV_PORT}" \
-          "${TRANSFER_PORT}" "${SIDE_CHANNEL_PORT}" \
-          "${EXPECTED_VLLM_VERSION}"
+          "${TRANSFER_PORT}" "${EXPECTED_VLLM_VERSION}"
       fi
       exit 0
       ;;
@@ -2026,7 +2014,6 @@ remote_args_common=(
   --decode-controller-port "${DECODE_CONTROLLER_PORT}"
   --kv-port "${KV_PORT}"
   --transfer-port "${TRANSFER_PORT}"
-  --side-channel-port "${SIDE_CHANNEL_PORT}"
   --reshard-controller-impl "${RESHARD_CONTROLLER_IMPL}"
 )
 local_args_common=(
@@ -2047,7 +2034,6 @@ local_args_common=(
   --decode-controller-port "${DECODE_CONTROLLER_PORT}"
   --kv-port "${KV_PORT}"
   --transfer-port "${TRANSFER_PORT}"
-  --side-channel-port "${SIDE_CHANNEL_PORT}"
   --reshard-controller-impl "${RESHARD_CONTROLLER_IMPL}"
 )
 for _role_env in ${ROLE_ENVS[@]+"${ROLE_ENVS[@]}"}; do
