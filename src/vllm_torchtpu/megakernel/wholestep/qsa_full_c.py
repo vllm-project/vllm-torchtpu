@@ -662,6 +662,7 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                 else:
                     pl.when(jnp.logical_not(last))(lambda: self._cdcp_credit(ctx))
 
+        n_loop = self._n_live(ctx) if self.skip_idle else nreq
         if self.loop_requests:
             for q in range(nreq):  # static stores into the request-major copies
                 scr["qc_irq"][q] = raw[q * T : (q + 1) * T]
@@ -673,7 +674,9 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                 def own() -> None:
                     score_merge(
                         q, scr["qi_q"][q].astype(BF16), ck, gc, jax.lax.rem(q, npr) == 0,
-                        (jax.lax.rem(q, npr) == npr - 1) | (q == nreq - 1),
+                        # The last request of a run stops the key prefetch (`n_loop`: the
+                        # last live one under `skip_idle`).
+                        (jax.lax.rem(q, npr) == npr - 1) | (q == n_loop - 1),
                     )
 
                 if self.shard_index:
@@ -683,7 +686,7 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                 self._recent_tile(ctx, l, q)
                 return carry
 
-            jax.lax.fori_loop(0, nreq, req, 0)
+            jax.lax.fori_loop(0, n_loop, req, 0)
             if self.shard_index:
                 self._exchange_selection(ctx)
         elif self.shard_index:
@@ -859,6 +862,14 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
 
         jax.lax.fori_loop(0, nreq, unpack, 0)
 
+    def _n_live(self, ctx: Any) -> Any:
+        """`skip_idle`: requests up to the last one with a context (live requests come
+        first; an idle request slot has context 0)."""
+        n = jnp.int32(0)
+        for q in range(ctx.ex.MB // ctx.ex.T):
+            n = jnp.where(ctx.extra[CTXQ][q] > 0, q + 1, n)
+        return n
+
     def _recent_ok(self, ctx: Any, r: Any, s: Any) -> Any:
         """Row `r`'s valid recent-tile slots `s`: causal, its partial group, and `g_a`
         when
@@ -989,7 +1000,8 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                     outs[h] = jnp.where(rows == r, res[t][h : h + 1], outs[h])
             return tuple(outs)
 
-        return list(jax.lax.fori_loop(0, nreq, req, zeros))
+        n_loop = self._n_live(ctx) if self.skip_idle else nreq
+        return list(jax.lax.fori_loop(0, n_loop, req, zeros))
 
     def _dcp_pair(self, ctx: Any, src: Any, dst: Any, i: int) -> None:
         """`src` -> the pair rank's `dst` (and its `src` -> ours), waited on both sides."""

@@ -90,13 +90,17 @@ def main():
     ap.add_argument("--served-flags", action="store_true",
                     help="shard / union / loop indexer modes (the served whole-step's)")
     ap.add_argument("--profile", default="", help="trace dir: device time per call + top ops")
+    ap.add_argument("--skip-idle", type=int, default=1, help="skip idle request slots (served loop)")
     ap.add_argument("--trace-only", action="store_true")
     ap.add_argument("--interpret", action="store_true")
     a = ap.parse_args()
-    if a.served_flags:
-        from vllm_torchtpu.megakernel.wholestep import qsa_full_c as wsc
+    if a.served_flags:  # VLLM_TPU_MEGAKERNEL=...,wholeshard=1,wholeunion=1,wholeloop=1
+        from vllm_torchtpu.megakernel_runtime import qwen38_wholestep_call as wsc
 
         wsc.SHARD_INDEX = wsc.UNION_ATTN = wsc.LOOP_REQUESTS = True
+    import vllm_torchtpu.megakernel_runtime.qwen38_draft as qd
+
+    qd.SKIP_IDLE = bool(a.skip_idle)
     if a.interpret or a.trace_only:
         from jax.experimental import pallas as pl
         from jax.experimental.pallas import tpu as pltpu

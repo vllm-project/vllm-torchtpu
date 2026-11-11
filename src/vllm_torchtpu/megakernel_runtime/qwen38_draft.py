@@ -60,10 +60,15 @@ from .qwen38_wholestep_inputs import qsa_step_inputs
 logger = init_logger(__name__)
 
 STEP0_T, LOOP_T = 4, 1  # query rows per request: draft step 0 (verify rows), loop steps
+# Skip idle request slots in the served request loop (`QSAFullIndexedBlock.skip_idle`).
+SKIP_IDLE = True
 
 
 def draft_spec(g: Any, R: int, *, budget: int, max_groups: int, vocab_shard: int) -> Any:
-    """The one-layer draft-step kernel spec (BF16 HC: the draft keeps its precision)."""
+    """The one-layer draft-step kernel spec (BF16 HC: the draft keeps its precision).
+    With the served request loop, idle request slots are skipped (`skip_idle`: at one
+    row per request a 16-row tile holds 16 request slots)."""
+    opts = indexed_options()
     return wholestep_spec(
         g,
         R,
@@ -77,7 +82,8 @@ def draft_spec(g: Any, R: int, *, budget: int, max_groups: int, vocab_shard: int
             pages_per_seq=max_groups * 4 // 128,
             carrier="fp8",
             n_layers=1,
-            **indexed_options(),
+            skip_idle=SKIP_IDLE and bool(opts.get("loop_requests")),
+            **opts,
         ),
         tail=dict(vocab_shard=vocab_shard),
         hc_fp8=False,
