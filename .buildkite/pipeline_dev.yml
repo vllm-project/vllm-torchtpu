@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Throwaway: validates the nightly k3-pruned75-gpc-tier1-eviction step. Not for merge.
+# Throwaway: validates the nightly k3-pruned75-gpc-tier1-eviction step after
+# review fixes. Not for merge.
 
 steps:
   - label: ":docker: Build and Push Dev Image"
@@ -44,7 +45,7 @@ steps:
     commands:
       - .buildkite/kubernetes/run.sh bash ./scripts/vllm/integration/run_k3_pruned75_gpc_tier1_eviction.sh
 
-  - label: "k3-pruned75-gpc-tier1-eviction (node sweep off: expect fail)"
+  - label: "k3-pruned75-gpc-tier1-eviction (node sweep off: smoke must fail)"
     key: tier1_evict_sweep_off
     depends_on: build_docker
     timeout_in_minutes: 300
@@ -60,4 +61,8 @@ steps:
       RUN_ROOT: "perf_eval_results/k3_tier1_evict_sweep_off"
       SERVED_MODEL_NAME: "mgoin/Kimi-K3-pruned75"
     commands:
-      - .buildkite/kubernetes/run.sh env NODE_EVICT_SWEEP=false bash ./scripts/vllm/integration/run_k3_pruned75_gpc_tier1_eviction.sh
+      # Passes only if the smoke ran and failed its gates, so a correct
+      # result is green.
+      - |
+        .buildkite/kubernetes/run.sh env NODE_EVICT_SWEEP=false bash ./scripts/vllm/integration/run_k3_pruned75_gpc_tier1_eviction.sh 2>&1 | tee control.log || true
+        grep -q 'RESULT: FAIL' control.log && grep -q 'K3_GPC_TIER1_EVICT_FAIL: smoke failed' control.log && echo 'control failed its gates, as expected'
