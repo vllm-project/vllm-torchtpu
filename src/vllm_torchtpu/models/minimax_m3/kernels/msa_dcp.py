@@ -836,7 +836,8 @@ def use_decode_v2(num_tokens: int) -> bool:
 
 
 def decode_v2_options() -> dict:
-    """`msa_decode_attention_lse` options from TPU_MINIMAX_M3_MSA_DECODE_V2_CFG."""
+    """`msa_decode_attention_lse` options from TPU_MINIMAX_M3_MSA_DECODE_V2_CFG
+    (defaults: 8-token tiles; 16-token tiles measured faster at c64 DCP4)."""
     opts = {}
     for item in filter(None, envs.TPU_MINIMAX_M3_MSA_DECODE_V2_CFG.split(",")):
         key, value = item.split("=")

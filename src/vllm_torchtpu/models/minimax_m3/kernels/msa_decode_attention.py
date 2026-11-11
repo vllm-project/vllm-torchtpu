@@ -366,7 +366,7 @@ def msa_decode_attention_lse(
     transposed: bool = False,
     scale_mode: str = "small",
     dense: bool | None = None,
-    translate: bool = True,
+    translate: bool = False,
     interpret: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """`msa_attention_lse.msa_sparse_attention_lse_heads(..., head_major=True)`
