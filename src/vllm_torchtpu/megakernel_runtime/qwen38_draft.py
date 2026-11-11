@@ -299,6 +299,9 @@ class MkDraft(nn.Module):
             draft, g, spec, ex, [0], tail=(mtp_model.hyper_connection_mixer, lm, V)
         )
         self.n_w = len(ops)
+        # Largest traced row count per T the kernel is built for (set by the driver from
+        # the whole-step buckets); compile ranges above it trace the stock draft step.
+        object.__setattr__(self, "max_rows", {STEP0_T: 0, LOOP_T: 0})
         for i, t in enumerate(ops):
             self.register_buffer(f"w_{i}", t, persistent=False)
         object.__setattr__(self, "pool", pool)

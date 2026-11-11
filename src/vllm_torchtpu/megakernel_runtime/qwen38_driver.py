@@ -228,6 +228,7 @@ def _cpu_proxy(m: Any, memo: dict | None = None) -> Any:
 NO_DONATE = False
 # Largest whole-step bucket: its VMEM plan fits up to 96 rows (`wholestep_tiles`).
 WHOLE_MAX_ROWS = 96
+MK_DRAFT_LOOP_MAX_ROWS = 16  # T=1 draft kernel rows measured on TPU (j-d06a37a7)
 # Model steps after warmup (verify steps; any step once disabled) by which a `whole=1`
 # server must have made a whole-step call.
 WHOLE_SELF_CHECK_STEPS = 200
@@ -2057,6 +2058,11 @@ class Qwen38SegmentDriver:
             _mk_fail("Qwen3.8 MK draft: setup failed; draft stays stock", exc)
             return
         object.__setattr__(mk, "count", self._count)  # mk_draft_step0 / stock_step0
+        # Rows the draft kernel is built for: step 0 runs after whole-step target steps
+        # (<= the whole-step rows); loop steps take one row per request, measured up to
+        # 16 requests (T=1, VMEM). Larger compile ranges trace the stock draft.
+        whole_rows = min(WHOLE_MAX_ROWS, self.whole_max_rows)
+        mk.max_rows.update({4: whole_rows, 1: min(MK_DRAFT_LOOP_MAX_ROWS, whole_rows)})
         draft.model.mk_draft = mk
         logger.info(
             "Qwen3.8 MK draft attached: draft layer + mixer + lm_head + greedy pick per "
