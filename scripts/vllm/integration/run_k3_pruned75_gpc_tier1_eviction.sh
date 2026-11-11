@@ -120,7 +120,7 @@ NUM_GPU_BLOCKS_OVERRIDE="${NUM_GPU_BLOCKS_OVERRIDE:-64}"
 # group, so a prompt of n blocks takes n + 3 (measured on this rig: 2 blocks
 # take 5, 4 take 7). The runner checks this against the groups the engine
 # logs.
-PROMPTS="${PROMPTS:-28}"
+PROMPTS="${PROMPTS:-30}"
 PROMPT_BLOCKS="${PROMPT_BLOCKS:-4}"
 PROMPT_STORE_BLOCKS="${PROMPT_STORE_BLOCKS:-7}"
 # Tier sizing, in prompts. An offloaded block is the same in both pools: 24
@@ -129,12 +129,12 @@ PROMPT_STORE_BLOCKS="${PROMPT_STORE_BLOCKS:-7}"
 # count it aims for; the smoke reads the counts the boot logs report and
 # fails if they leave it no margin.
 #   tier 0: 10 prompts, swept from under 20% free back to 40% free.
-#   tier 1: 12 prompts, swept from under 30% free back to 40% free. Its low
+#   tier 1: 14 prompts, swept from under 30% free back to 40% free. Its low
 #           watermark leaves more free blocks than one tier-0 demotion
 #           batch, so a batch lands before the woken sweep has run.
 BLOCK_BYTES=$((24 * 870400 * 8))
 TIER0_PROMPTS=10
-TIER1_PROMPTS=12
+TIER1_PROMPTS=14
 CPU_BYTES_TO_USE="${CPU_BYTES_TO_USE:-$(((2 * TIER0_PROMPTS * PROMPT_STORE_BLOCKS + 1) * BLOCK_BYTES / 2))}"
 NODE_DRAM_BUDGET_BYTES="${NODE_DRAM_BUDGET_BYTES:-$(((2 * TIER1_PROMPTS * PROMPT_STORE_BLOCKS + 1) * BLOCK_BYTES / 2))}"
 TIER0_LOW_WATERMARK="${TIER0_LOW_WATERMARK:-0.2}"
@@ -252,7 +252,7 @@ KVT='{"kv_connector":"TPURaidenOffloadingConnector","kv_connector_module_path":"
   export VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S:-${STARTUP_TIMEOUT_S}}"
   export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS="${VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS:-1800}"
   export RAIDEN_EXPECTED_WORKERS_TIMEOUT_S="${RAIDEN_EXPECTED_WORKERS_TIMEOUT_S:-900}"
-  # Tier 0's monitor and demotion sweep, on short periods so a 28-prompt
+  # Tier 0's monitor and demotion sweep, on short periods so a 30-prompt
   # stream turns both tiers over in minutes.
   export RAIDEN_ENABLE_STORE_MONITOR=1
   export RAIDEN_ENABLE_EVICT_SWEEP=1

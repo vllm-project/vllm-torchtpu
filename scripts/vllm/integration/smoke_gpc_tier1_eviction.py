@@ -116,9 +116,12 @@ class Layout:
         self.u0_max = c0 - math.ceil(args.tier0_low * c0)
         self.u1_min = c1 - math.ceil(args.tier1_high * c1)
         self.u1_max = c1 - math.ceil(args.tier1_low * c1)
-        # Wholly below tier 0, and wholly within what tier 1 still holds.
+        # Wholly below tier 0, and wholly within what tier 1 still holds, with
+        # a prompt to spare: the blocks of one prompt do not all leave a tier
+        # in the same sweep, and the hardware run that used no spare lost the
+        # oldest prompt this predicted.
         self.first_landed = math.ceil(self.u0_max / b)
-        self.last_landed = (self.u0_min + self.u1_min) // b - 1
+        self.last_landed = (self.u0_min + self.u1_min) // b - 2
         # Wholly beyond both tiers.
         self.first_gone = math.ceil((self.u0_max + self.u1_max) / b)
         # Prompts seeded before recalling prompt 0: one past what tier 0 can
@@ -164,7 +167,7 @@ def main() -> int:
     parser.add_argument("--base", required=True, help="http://host:port")
     parser.add_argument("--model", required=True)
     parser.add_argument("--hit-block-size", type=int, required=True)
-    parser.add_argument("--prompts", type=int, default=28)
+    parser.add_argument("--prompts", type=int, default=30)
     parser.add_argument("--prompt-blocks", type=int, default=4)
     parser.add_argument("--prompt-store-blocks", type=int, required=True)
     parser.add_argument("--tier0-blocks", type=int, required=True)
