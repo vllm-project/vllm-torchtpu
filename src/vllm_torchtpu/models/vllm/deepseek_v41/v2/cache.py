@@ -16,9 +16,16 @@ ROW_BYTES = ROW_WORDS * 4
 # CSA2 reads and publishes BF16 SWA in 64-token word-pool pages (64 KiB).
 SWA_PAGE_TOKENS = 64
 SWA_PAGE_BYTES = SWA_PAGE_TOKENS * 512 * 2
-# Block-outer blocks are a whole number of SWA pages, so every page of every
-# cache group stays page-aligned under one shared block stride.
-BLOCK_STRIDE_ALIGNMENT = SWA_PAGE_BYTES
+
+
+def block_stride_alignment(block_size: int) -> int:
+    """Block stride unit declared by every V4.1 cache spec.
+
+    CSA2 addresses SWA pages and ratio-1 FP8 main pages (one 512-byte record
+    per token) in whole pages, so the shared block stride is a multiple of
+    both. One value for every spec keeps the cache groups mergeable.
+    """
+    return math.lcm(SWA_PAGE_BYTES, block_size * ROW_BYTES)
 
 
 # TPU7x SparseCore hardware addressing limit: a single HBM tensor passed to

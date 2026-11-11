@@ -8,7 +8,6 @@ import torch
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.logger import init_logger
 from vllm.models.deepseek_v41 import attention as upstream
-from vllm.v1.kv_cache_interface import MLAAttentionSpec, replace_as
 
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8.cache import (
     PackedFP8Layout,
@@ -16,13 +15,16 @@ from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8.cache import (
 
 from . import indexer_fp8
 from .cache import (
-    BLOCK_STRIDE_ALIGNMENT,
     NativeCacheView,
     PagedCacheRows,
     RawCachePool,
+    block_stride_alignment,
 )
 
 logger = init_logger(__name__)
+
+# Eight 512-byte owner rows: one int32 [8, 128] tile.
+INDEX_PAGE_ALIGNMENT = 4096
 
 
 def indexer_uses_fp4(config: VllmConfig) -> bool:
@@ -115,24 +117,6 @@ class PackedFP8IndexCacheRows(PagedCacheRows):
             bank.copy_(value)
 
 
-class PackedFP8IndexerSpec(MLAAttentionSpec):
-    """Keep 132-byte records compatible with hybrid power-of-two pages."""
-
-    def __post_init__(self):
-        record_bytes = 1 << (self.state_content_size_bytes - 1).bit_length()
-        min_states = max(1, (self.alignment or 1) // record_bytes)
-        object.__setattr__(
-            self, "block_size", max(self.block_size, min_states * self.tokens_per_state)
-        )
-        super().__post_init__()
-        size = max(self.alignment or 1, self.real_page_size_bytes)
-        object.__setattr__(self, "page_size_padded", 1 << (size - 1).bit_length())
-
-    @classmethod
-    def merge(cls, specs):
-        return dataclasses.replace(super().merge(specs), alignment=specs[0].alignment)
-
-
 class IndexerCache(NativeCacheView, upstream.DeepseekV4IndexerCache):
     """Upstream's 132-byte FP8 index record in transposed native pages."""
 
@@ -149,11 +133,16 @@ class IndexerCache(NativeCacheView, upstream.DeepseekV4IndexerCache):
         indexer_fp8.initialize_fp8_indexer()
 
     def get_kv_cache_spec(self, vllm_config):
-        spec = dataclasses.replace(
+        # Upstream's spec with whole 8-row (4 KiB) pages: `PackedFP8Layout`
+        # addresses pages in 512-byte owner rows, and every page then starts
+        # on an int32 tile boundary, as the indexer kernels were tuned.
+        return dataclasses.replace(
             super().get_kv_cache_spec(vllm_config),
-            block_stride_alignment=BLOCK_STRIDE_ALIGNMENT,
+            alignment=INDEX_PAGE_ALIGNMENT,
+            block_stride_alignment=block_stride_alignment(
+                vllm_config.cache_config.block_size
+            ),
         )
-        return replace_as(spec, PackedFP8IndexerSpec)
 
     @property
     def kv_cache(self):

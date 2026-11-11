@@ -35,10 +35,10 @@ from .attention_kernels import (
     paged_attention,
 )
 from .cache import (
-    BLOCK_STRIDE_ALIGNMENT,
     SWA_PAGE_TOKENS,
     NativeCacheView,
     PagedCacheRows,
+    block_stride_alignment,
     write_cache,
 )
 from .ced import prefix_replay_enabled
@@ -218,7 +218,9 @@ class CompressorStateCache(NativeCacheView, compressor_upstream.CompressorStateC
     def get_kv_cache_spec(self, vllm_config):
         return dataclasses.replace(
             super().get_kv_cache_spec(vllm_config),
-            block_stride_alignment=BLOCK_STRIDE_ALIGNMENT,
+            block_stride_alignment=block_stride_alignment(
+                vllm_config.cache_config.block_size
+            ),
         )
 
 
@@ -439,7 +441,9 @@ class SWACache(NativeCacheView, DeepseekV4SWACache):
     def get_kv_cache_spec(self, vllm_config):
         return dataclasses.replace(
             super().get_kv_cache_spec(vllm_config),
-            block_stride_alignment=BLOCK_STRIDE_ALIGNMENT,
+            block_stride_alignment=block_stride_alignment(
+                vllm_config.cache_config.block_size
+            ),
         )
 
 
@@ -606,7 +610,12 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         spec = super().get_kv_cache_spec(vllm_config)
         if spec is None:
             return spec
-        spec = dataclasses.replace(spec, block_stride_alignment=BLOCK_STRIDE_ALIGNMENT)
+        spec = dataclasses.replace(
+            spec,
+            block_stride_alignment=block_stride_alignment(
+                vllm_config.cache_config.block_size
+            ),
+        )
         if not self._fp8_kv:
             return spec
         return dataclasses.replace(spec, dtype=torch.uint8, page_size_padded=None)
