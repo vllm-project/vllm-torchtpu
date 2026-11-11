@@ -40,6 +40,10 @@ from vllm_torchtpu.layers.core.sequence_layout import (
     SequenceLayoutDescriptor,
     SequenceLayoutKind,
 )
+from vllm_torchtpu.runner.steady_decode_metadata import (
+    SteadyWalkProducts,
+    mamba_offsets_stable,
+)
 
 
 def attention_block_table_width(
@@ -261,6 +265,11 @@ class AttentionMetadataBuilderContext:
     # (state_indices, ckpt_indices | None) from the single
     # `_staged_walk_products_compiled` program; None -> per-group fallback.
     staged_mamba_products: dict | None = None
+    # VLLM_TPU_STEADY_DECODE_METADATA (target walks of steady-decode
+    # candidates only): `walk_seq_bounds` of this chunk's device seq_lens, and
+    # whether the step repeats the previous one (runner/steady_decode_metadata.py).
+    steady_walk_bounds: tuple | None = None
+    steady_hit: bool = False
 
 
 def _staged_walk_products(
@@ -888,6 +897,7 @@ def stage_block_table_uploads(
         table_geom,
         staged_dev,
         reused_key,
+        stage_key,
     )
 
 
@@ -1031,6 +1041,7 @@ def _issue_walk_products(
     table_geom,
     staged_dev,
     reused_key=None,
+    stage_key=None,
 ):
     # One compiled program splits the staged tensor into per-group tables
     # and derives every unified-pool mamba group's state/checkpoint indices
@@ -1077,7 +1088,43 @@ def _issue_walk_products(
         and mamba_geom
     )
     cached = runner.__dict__.get("_block_table_stage_tables")
+    # VLLM_TPU_STEADY_DECODE_METADATA: a steady-decode target walk over an
+    # outright reused upload whose rows all stay in their mamba blocks yields
+    # exactly the previous walk's products; reuse them and skip the program.
+    steady_bounds = ctx.steady_walk_bounds
+    steady_geom = None
+    steady_prev = None
+    if steady_bounds is not None and mamba_geom:
+        steady_geom = (
+            tuple(table_geom),
+            tuple(mamba_geom),
+            ctx.mamba_ckpt_window,
+            stacked,
+            bool(envs.VLLM_TPU_STAGED_WALK_CLASS_GATHER),
+            tuple(gid for gid, _, _ in entries),
+        )
+        steady_prev = runner.__dict__.get("_steady_walk_products")
+    steady_cache = runner.__dict__.get("_steady_decode_cache")
+    if steady_geom is not None and steady_cache is not None:
+        steady_cache.walks += 1
     if (
+        steady_prev is not None
+        and ctx.steady_hit
+        and reused_key is not None
+        and steady_prev.stage_key == reused_key
+        and steady_prev.geometry == steady_geom
+        and mamba_offsets_stable(steady_prev.bounds, steady_bounds, mamba_geom)
+    ):
+        ctx.staged_block_tables = steady_prev.staged_block_tables
+        products = steady_prev.products
+        n_tables = steady_prev.n_tables
+        # Each step's bounds overlap the previous one's offsets, so chaining
+        # them keeps every reused step equal to the walk that ran.
+        steady_prev.bounds = steady_bounds
+        if steady_cache is not None:
+            steady_cache.walk_skips += 1
+        steady_geom = None
+    elif (
         reused_key is not None
         and mamba_geom
         and cached is not None
@@ -1103,6 +1150,21 @@ def _issue_walk_products(
             elif mamba_geom:
                 # Dummy runs warm the tables-free variant serving reuses.
                 walk(*args, False, envs.VLLM_TPU_STAGED_WALK_CLASS_GATHER, stacked)
+    if steady_geom is not None:
+        # The walk ran: seed the next steady-decode step.
+        key = reused_key if reused_key is not None else stage_key
+        runner._steady_walk_products = (
+            None
+            if key is None
+            else SteadyWalkProducts(
+                stage_key=key,
+                geometry=steady_geom,
+                bounds=steady_bounds,
+                staged_block_tables=ctx.staged_block_tables,
+                products=products,
+                n_tables=n_tables,
+            )
+        )
     n_mamba = len(mamba_geom)
     if stacked:
         # Same class grouping (and order) as `_staged_walk_products`.

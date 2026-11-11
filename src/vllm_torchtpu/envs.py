@@ -365,6 +365,7 @@ if TYPE_CHECKING:
     VLLM_TPU_TOKEN_PADDING_REUSE: bool = False
     VLLM_TPU_PREFLAT_FWD_ARGS: bool = False
     VLLM_TPU_FAST_METADATA_BUILD: bool = False
+    VLLM_TPU_STEADY_DECODE_METADATA: bool = False
     VLLM_TPU_AOT_SKIP_GUARD_CHECK: bool = False
     VLLM_TPU_STAGE_TIMING_ONLY_WITH_SINK: bool = False
     VLLM_TPU_STAGED_WALK_CLASS_GATHER: bool = False
@@ -2215,6 +2216,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Staged metadata walk: build every group's AttentionMetadata inline instead
     # of one builder call per group (tpu_runner._build_attention_metadata_staged).
     "VLLM_TPU_FAST_METADATA_BUILD": env_bool("VLLM_TPU_FAST_METADATA_BUILD"),
+    # Steady decode (same requests, order and per-request token counts as the
+    # previous step, no prefill piece): reuse the previous step's batch-shape
+    # host arrays and index uploads, build the staged walk inline, and keep the
+    # walk's mamba indices while no request can cross a mamba block
+    # (runner/steady_decode_metadata.py). Any other step rebuilds as before.
+    "VLLM_TPU_STEADY_DECODE_METADATA": env_bool("VLLM_TPU_STEADY_DECODE_METADATA"),
     # Freshly AOT-compiled models skip the per-call Dynamo guard check when
     # vLLM does not evaluate guards (as it already does for cached artifacts).
     "VLLM_TPU_AOT_SKIP_GUARD_CHECK": env_bool("VLLM_TPU_AOT_SKIP_GUARD_CHECK"),
