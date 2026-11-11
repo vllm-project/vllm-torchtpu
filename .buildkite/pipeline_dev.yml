@@ -12,227 +12,52 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Dev pipeline for vllm-torchtpu-dev.
-# Demo/sample steps showing how to run one-off experiments on TPU.
-# Copy and adapt any step below for your own test.
-#
-# WHY THIS EXISTS
-# ───────────────
-# vllm-torchtpu-ci runs the full suite (~build + unit tests + integration +
-# perf) on every push, which is slow and shared. This pipeline uploads ONLY the
-# steps on YOUR branch, so a single test costs one image build + one job.
-#
-# HOW TO TRIGGER
-# ──────────────
-# Option A — Buildkite UI:
-#   https://buildkite.com/vllm/vllm-torchtpu-dev → "New Build",
-#   set branch to your branch, "Create Build".
-#
-# Option B — Buildkite API (needs BUILDKITE_API_TOKEN in your env):
-#   curl -s -X POST \
-#     -H "Authorization: Bearer $BUILDKITE_API_TOKEN" \
-#     -H "Content-Type: application/json" \
-#     "https://api.buildkite.com/v2/organizations/vllm/pipelines/vllm-torchtpu-dev/builds" \
-#     -d "{\"commit\": \"$(git rev-parse HEAD)\", \"branch\": \"$(git rev-parse --abbrev-ref HEAD)\", \"message\": \"my test\"}"
-#
-# HOW TO CUSTOMIZE
-# ────────────────
-# 1. On your branch, edit this file — start from whichever demo is closest.
-# 2. Delete the steps you don't need (each one costs a TPU slot).
-# 3. Trigger the pipeline — only your branch's copy of this file is used, so
-#    you can leave it modified indefinitely without affecting anyone else.
-#
-# NOTES
-# ─────
-# * The build step tags the image with $BUILDKITE_COMMIT and every TPU step
-#   pulls that exact tag, so all steps must depend_on `build_docker`.
-# * .buildkite/kubernetes/run.sh runs your command in a pod from that image, at
-#   /workspace/vllm-torchtpu — a COPY of the repo at this commit, not the
-#   agent's checkout. Reference paths like `examples/...` / `tests/...`
-#   relative to the repo root.
-# * SHAPE picks the slice: tpu7x-standard-1t/1x1x1 (1 chip) or
-#   tpu7x-standard-4t/2x2x1 (4 chips). Multi-host slices go through
-#   .buildkite/kubernetes/run_multihost.sh instead.
-# * Set ARTIFACTS_DIR (e.g. perf_eval_results) and write under it; everything
-#   there is uploaded as the step's artifacts.
-#
-# LANES
-# ─────
-# A build that sets K3_PD_CONFIG runs the Kimi-K3 megakernel AgentX lane at the
-# end of this file, and none of the demos.
+# Throwaway: validates the nightly k3-pruned75-gpc-tier1-eviction step. Not for merge.
 
 steps:
-
-  # -----------------------------------------------------------------
-  # Build step (required by every demo below)
-  # Builds docker/Dockerfile --target dev and pushes it tagged with this
-  # commit. Same script the CI pipeline_build.yml uses. A commit whose image
-  # is already in the registry reuses it (CI_IMAGE_REBUILD=1 builds anyway),
-  # and a build that sets CI_IMAGE=<image> uses that image as it is.
-  # -----------------------------------------------------------------
   - label: ":docker: Build and Push Dev Image"
     key: build_docker
     agents:
       queue: cpu_64_core
     commands:
       - bash .buildkite/scripts/setup_docker_env.sh
-    # The torch-tpu virtual registry sometimes 404s a wheel it serves moments
-    # later, and a build that fails that way passes on a later try. Twice
-    # rather than pipeline_build.yml's once: a failed image build here fails
-    # the whole run, Kimi-K3 pair included.
-    retry: &image_build_retry
+    retry:
       automatic:
         - exit_status: 1
           limit: 2
 
-  # -----------------------------------------------------------------
-  # Demo 1: offline_inference.py
-  # The simplest pattern — run a Python script inside the image.
-  # Starting point for any offline batch-inference experiment.
-  # -----------------------------------------------------------------
-  - label: "[demo] offline_inference.py (Qwen3-0.6B)"
-    key: demo_offline_inference
-    if: 'build.env("K3_PD_CONFIG") == null'
+  - label: "k3-pruned75-gpc-tier1-eviction (node sweep on: expect pass)"
+    key: tier1_evict_sweep_on
     depends_on: build_docker
+    timeout_in_minutes: 300
     agents:
       queue: "kube"
     plugins:
       - kubernetes:
           podTemplate: tpu-launcher
     env:
-      SHAPE: "tpu7x-standard-1t/1x1x1"
-    commands:
-      - |
-        # Customize --model / --max-model-len / --max-tokens as needed.
-        # Add --tensor_parallel_size=N for TP/EP runs, and set SHAPE to
-        # tpu7x-standard-4t/2x2x1 when it needs more than one chip.
-        .buildkite/kubernetes/run.sh bash -c '
-          python3 examples/offline_inference.py \
-            --model Qwen/Qwen3-0.6B \
-            --max-model-len 256 \
-            --max-num-batched-tokens 256 \
-            --max-tokens 32'
-
-  # -----------------------------------------------------------------
-  # Demo 2: run one specific unit test
-  # The fastest way to iterate on a single test instead of waiting for the
-  # full "Unit Tests - General (PR)" job in CI.
-  # -----------------------------------------------------------------
-  - label: "[demo] pytest one file"
-    key: demo_pytest
-    if: 'build.env("K3_PD_CONFIG") == null'
-    depends_on: build_docker
-    agents:
-      queue: "kube"
-    plugins:
-      - kubernetes:
-          podTemplate: tpu-launcher
-    env:
-      SHAPE: "tpu7x-standard-1t/1x1x1"
-    commands:
-      - |
-        # Swap in your own file / -k selector. `-m 'not nightly'` mirrors what
-        # CI runs on PRs; drop it to include nightly-marked tests.
-        .buildkite/kubernetes/run.sh bash -c '
-          pytest -sv --timeout=600 -m "not nightly" \
-            tests/runner/test_tpu_runner.py'
-
-  # -----------------------------------------------------------------
-  # Demo 3: repeat a test N times (flake hunting / A-B rate comparison)
-  # Use Buildkite's matrix instead of copy-pasting the step N times —
-  # {{matrix}} interpolates into the label so each parallel job is uniquely
-  # named. To prove "commit X caused a flake", run this at X and at X^ and
-  # compare the pass RATES, not a single run.
-  # -----------------------------------------------------------------
-  - label: "[demo] stress: pytest one file (run {{matrix}})"
-    key: demo_stress
-    if: 'build.env("K3_PD_CONFIG") == null'
-    depends_on: build_docker
-    agents:
-      queue: "kube"
-    plugins:
-      - kubernetes:
-          podTemplate: tpu-launcher
-    env:
-      SHAPE: "tpu7x-standard-1t/1x1x1"
-    matrix: ["1", "2", "3", "4", "5"]
-    commands:
-      - |
-        .buildkite/kubernetes/run.sh bash -c '
-          pytest -sv --timeout=600 -m "not nightly" \
-            tests/runner/test_tpu_runner.py'
-
-  # -----------------------------------------------------------------
-  # Kimi-K3 megakernel AgentX, on a build that sets K3_PD_CONFIG
-  # One recipe point of the "Kimi-K3 on TPU7x: 1P1D prefill/decode recipes"
-  # doc (configs/kimi-k3-megakernel/) on the AgentX 1P1D pair
-  # (kimi-k3-agentx-1p1d.yaml) - TP32 per role on two tpu7x 2x2x4 slices,
-  # served with --nnodes by k3_1p1d.sh - replayed by the pair's client through
-  # vllm-router. The engines run an image built from another branch; the
-  # client and the pair's scripts come from this build's commit. Build env:
-  #   K3_PD_CONFIG     the point: kimi-k3-megakernel/p1-c1 ...
-  #                    kimi-k3-megakernel/p7-c16 (p6, p7 experimental), or a
-  #                    pruned point of the doc's Oct 13 set,
-  #                    kimi-k3-megakernel-1013/a-c1 ... kimi-k3-megakernel-1013/h-c48,
-  #                    or a point of its Oct 16 set,
-  #                    kimi-k3-megakernel-1016/p1-c1 ... kimi-k3-megakernel-1016/p9-c48
-  #   K3_ENGINE_REF    the ref of this repository the engine image is built
-  #                    from: a branch name, a tag, a full 40-character commit
-  #                    SHA (not a short one, which cannot be fetched) or
-  #                    refs/pull/<N>/head; default
-  #                    inferact/megakernel-integration-1016
-  #   K3_ENGINE_IMAGE  an engine image to use as it is, instead of building one
-  #   CI_IMAGE         the same for the client's image (Build and Push Dev
-  #                    Image), e.g. to rerun a point on an earlier build's
-  #                    images
-  # One point per build, since each needs its own decode server. Point 1 took
-  # ~45 min from admission. The step passes even when every request fails,
-  # because the client exits 0 after writing what it has: read "requests ok"
-  # in summary.md.
-  # -----------------------------------------------------------------
-  # Publishes K3_ENGINE_IMAGE, which common.sh hands the manifest.
-  - label: ":docker: Build Kimi-K3 megakernel engine image"
-    key: k3_engine_image
-    if: 'build.env("K3_PD_CONFIG") != null'
-    agents:
-      queue: cpu_64_core
-    commands:
-      - bash .buildkite/scripts/build_k3_engine_image.sh
-    retry: *image_build_retry
-
-  - label: ":tpu: Perf: Kimi-K3 AgentX 1P1D ${K3_PD_CONFIG} (TPU v7x 2x2x4 x2)"
-    key: k3_mk_agentx_1p1d
-    if: 'build.env("K3_PD_CONFIG") != null'
-    depends_on:
-      - build_docker
-      - k3_engine_image
-    # No concurrency group, so two pairs can run at once on the four 2x2x4
-    # slice pools. Kueue admits a pair's 32 chips together and JobSet gives
-    # each role a slice of its own, so two pairs cannot split slices. A second
-    # pair borrows 32 chips from the tpu7x cohort when they are idle (the
-    # lending queues never reclaim) and otherwise waits in Kueue, for up to the
-    # launcher's queue_max_seconds. The nightly pairs in pipeline_perf.yml
-    # keep their group, so they still run one at a time among themselves.
-    timeout_in_minutes: 1440
-    env:
-      # The kube launcher uploads whatever the workload leaves here as the
-      # step's artifacts, as pipeline_perf.yml declares it.
+      SHAPE: "tpu7x-standard-4t/2x2x1"
+      TPU_ACCELERATOR_TYPE: "tpu7x"
       ARTIFACTS_DIR: "perf_eval_results"
-      # bootstrap_dev.sh leaves dev builds unclassed (Kueue priority 0), the
-      # same standing as scheduled nightlies and behind CI. Setting integration
-      # (30) keeps this 32-chip dev experiment strictly below post-merge (100,
-      # main / merge queue) and pre-merge (50, pull requests) so it never blocks
-      # or evicts CI, while still letting the 2x2x4 ClusterQueue reclaim lent
-      # quota from lower-priority unclassed (0) and low (-100) workloads.
-      WORKLOAD_PRIORITY: "integration"
+      RUN_ROOT: "perf_eval_results/k3_tier1_evict_sweep_on"
+      SERVED_MODEL_NAME: "mgoin/Kimi-K3-pruned75"
+    commands:
+      - .buildkite/kubernetes/run.sh bash ./scripts/vllm/integration/run_k3_pruned75_gpc_tier1_eviction.sh
+
+  - label: "k3-pruned75-gpc-tier1-eviction (node sweep off: expect fail)"
+    key: tier1_evict_sweep_off
+    depends_on: build_docker
+    timeout_in_minutes: 300
     agents:
       queue: "kube"
     plugins:
       - kubernetes:
           podTemplate: tpu-launcher
+    env:
+      SHAPE: "tpu7x-standard-4t/2x2x1"
+      TPU_ACCELERATOR_TYPE: "tpu7x"
+      ARTIFACTS_DIR: "perf_eval_results"
+      RUN_ROOT: "perf_eval_results/k3_tier1_evict_sweep_off"
+      SERVED_MODEL_NAME: "mgoin/Kimi-K3-pruned75"
     commands:
-      # A misspelt point fails here rather than in eight pods after admission.
-      - |
-        test -f "scripts/vllm/benchmarking/configs/$${K3_PD_CONFIG}.sh" \
-          || { echo "no such config: $${K3_PD_CONFIG}" >&2; exit 2; }
-      - .buildkite/kubernetes/run_multihost.sh --manifest kimi-k3-agentx-1p1d.yaml
+      - .buildkite/kubernetes/run.sh env NODE_EVICT_SWEEP=false bash ./scripts/vllm/integration/run_k3_pruned75_gpc_tier1_eviction.sh
