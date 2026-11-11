@@ -112,9 +112,8 @@ def load_draft_model(vllm_config: Any, target: Any, mesh: Any) -> nn.Module | No
         normalize_draft_config,
     )
 
-    spec = getattr(vllm_config, "speculative_config", None)
-    method = getattr(spec, "method", None)
-    if spec is None or method not in VLLM_DRAFT_MODEL_METHODS:
+    spec = vllm_config.speculative_config
+    if spec is None or spec.method not in VLLM_DRAFT_MODEL_METHODS:
         return None
     dflash_config = normalize_draft_config(spec.draft_model_config.hf_config)
     target_layer_ids = list(dflash_config.get("target_layer_ids", []))
@@ -166,7 +165,7 @@ def load_draft_model(vllm_config: Any, target: Any, mesh: Any) -> nn.Module | No
     for name in set(all_layers) - target_layer_names:
         all_layers[name].is_draft_layer = True  # type: ignore[attr-defined]
 
-    dspark = method == "dspark"
+    dspark = spec.method == "dspark"
     if dspark:
         for attr in ("compute_draft_logits", "markov_embed", "markov_bias"):
             if not hasattr(draft, attr):
