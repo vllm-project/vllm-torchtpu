@@ -25,6 +25,7 @@ from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbeddingWan
 from vllm_omni.diffusion.models.ltx2 import (
     ltx2_components,
+    ltx2_denoise,
     ltx2_runtime,
     ltx2_transformer,
 )
@@ -86,6 +87,101 @@ def test_register_omni_tpu_platform(monkeypatch):
 
     monkeypatch.setattr("vllm_torchtpu.omni.get_num_chips", lambda: 8)
     assert register_omni_tpu_platform() == "vllm_torchtpu.omni.platform.OmniTpuPlatform"
+
+
+def test_ltx2_host_sigma_schedule_patch_dispatch():
+    calls = {}
+
+    def fake_prepare(pipeline, request_inputs, **kwargs):
+        calls["device"] = kwargs["device"]
+        return "audio_scheduler", "adapter", "timesteps"
+
+    def fake_run(pipeline, state, timesteps, step):
+        calls["timesteps"] = timesteps
+        return state
+
+    platform = MagicMock()
+    sync = ltx2_runtime.LTXRuntime._synchronize_guidance_parallel_step_output
+    with (
+        patch.object(ltx2_denoise, "prepare_scheduler_stage", fake_prepare),
+        patch.object(ltx2_denoise.LTXDenoiseExecutor, "run", staticmethod(fake_run)),
+        patch.object(
+            ltx2_runtime.LTXRuntime,
+            "_synchronize_guidance_parallel_step_output",
+            getattr(sync, "__wrapped__", sync),
+        ),
+        patch.object(ltx2_runtime, "current_omni_platform", platform),
+        patch.object(ltx2_runtime, "get_guidance_parallel_world_size", return_value=2),
+    ):
+        patches._patch_ltx2_host_sigma_schedule()
+        pipeline = SimpleNamespace(device=torch.device("meta"))
+        assert ltx2_denoise.prepare_scheduler_stage(
+            pipeline, None, device=pipeline.device, sigmas=None
+        ) == ("audio_scheduler", "adapter", "timesteps")
+        assert calls["device"] == torch.device("cpu")
+
+        state = object()
+        host_timesteps = torch.linspace(1000.0, 0.0, 5)[:-1]
+        run = ltx2_denoise.LTXDenoiseExecutor.run
+        assert run(pipeline, state, host_timesteps, None) is state
+        assert [t.device.type for t in calls["timesteps"]] == ["meta"] * 4
+
+        latents = (torch.randn(3, 2).t(), torch.randn(5, 4).t())
+        step_output = ltx2_runtime.LTXRuntime._synchronize_guidance_parallel_step_output
+        out = step_output(None, latents, guidance_parallel_ready=True)
+        assert all(t.is_contiguous() for t in out)
+        assert all(torch.equal(a, b) for a, b in zip(out, latents, strict=True))
+        assert step_output(None, latents, guidance_parallel_ready=False) is latents
+        platform.synchronize.assert_not_called()
+
+
+@pytest.mark.parametrize("official", [True, False])
+def test_ltx2_host_sigma_schedule_matches_upstream(official):
+    from diffusers import FlowMatchEulerDiscreteScheduler
+
+    prepare = ltx2_denoise.prepare_scheduler_stage
+    upstream = getattr(prepare, "__wrapped__", prepare)
+    run = ltx2_denoise.LTXDenoiseExecutor.run
+    sync = ltx2_runtime.LTXRuntime._synchronize_guidance_parallel_step_output
+
+    def schedule(fn, device):
+        pipeline = SimpleNamespace(
+            scheduler=FlowMatchEulerDiscreteScheduler(), device=torch.device("cpu")
+        )
+        audio_scheduler, _, timesteps = fn(
+            pipeline,
+            SimpleNamespace(num_inference_steps=8),
+            device=device,
+            sigmas=None,
+            timesteps=None,
+            latent_num_frames=2,
+            latent_height=4,
+            latent_width=4,
+            use_official_sigma_schedule=official,
+        )
+        return timesteps, pipeline.scheduler.sigmas, audio_scheduler.sigmas
+
+    with (
+        patch.object(ltx2_denoise, "prepare_scheduler_stage", upstream),
+        patch.object(
+            ltx2_denoise.LTXDenoiseExecutor,
+            "run",
+            staticmethod(getattr(run, "__wrapped__", run)),
+        ),
+        patch.object(
+            ltx2_runtime.LTXRuntime,
+            "_synchronize_guidance_parallel_step_output",
+            getattr(sync, "__wrapped__", sync),
+        ),
+    ):
+        patches._patch_ltx2_host_sigma_schedule()
+        # A meta device would leak into any tensor the patch fails to keep
+        # on the host.
+        host = schedule(ltx2_denoise.prepare_scheduler_stage, torch.device("meta"))
+    reference = schedule(upstream, torch.device("cpu"))
+    for got, want in zip(host, reference, strict=True):
+        assert got.device.type == "cpu"
+        assert torch.equal(got, want)
 
 
 def test_vllm_platform_accepts_omni_knobs():

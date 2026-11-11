@@ -84,6 +84,7 @@ def apply_omni_model_specific_patches() -> None:
     _patch_wan_fresh_timestep()
     _patch_sdpa_fallback_dispatch()
     _patch_ltx2_vocoder_cpu_init()
+    _patch_ltx2_host_sigma_schedule()
 
 
 def _patch_diffusion_ipc_cpu_pack() -> None:
@@ -645,3 +646,87 @@ def _patch_ltx2_split_rope() -> None:
     rope_cls.forward = _cached_rope_forward
     ltx2_transformer.apply_split_rotary_emb = _apply_split_rotary_emb
     logger.info("Applied TPU patch: cached LTX-2 split RoPE on the q/k layout.")
+
+
+_LTX2_HOST_SIGMA_PATCHED = "_tpu_ltx2_host_sigma_patched"
+
+
+def _patch_ltx2_host_sigma_schedule() -> None:
+    # -------------------------------------------------------------------------
+    # TODO: Remove this patch once torch_tpu reads device scalars without
+    # draining the queue, or vLLM-Omni's LTX runtime keeps its sigma schedule
+    # on the host.
+    #
+    # prepare_scheduler_stage builds the LTX sigma schedule and timesteps on
+    # the pipeline device. Every denoise step indexes it
+    # (scheduler.sigmas[index]) for the x0/velocity conversions and the Euler
+    # update, and velocity_from_x0 calls .item() on the video and the audio
+    # sigma, so each step drains the device queue twice before the host can
+    # queue the next one. The loop also hands device views of the timesteps
+    # to the transformer, and torch_tpu bakes each view's offset into the
+    # graphs that read it. Building the schedule on the host makes those
+    # scalars free; each timestep reaches the device as its own buffer.
+    #
+    # Under CFG parallelism LTXRuntime also synchronizes the device after
+    # every step, against CUDA stream races between the guidance all-gather
+    # and the next step. TPU collectives run in program order, so only the
+    # .contiguous() half of that step is kept.
+    # -------------------------------------------------------------------------
+    import functools
+
+    from vllm_omni.diffusion.models.ltx2 import ltx2_denoise, ltx2_runtime
+
+    host = torch.device("cpu")
+    executor_cls = ltx2_denoise.LTXDenoiseExecutor
+    runtime_cls = ltx2_runtime.LTXRuntime
+
+    orig_prepare = ltx2_denoise.prepare_scheduler_stage
+    if not getattr(orig_prepare, _LTX2_HOST_SIGMA_PATCHED, False):
+
+        @functools.wraps(orig_prepare)
+        def _host_prepare_scheduler_stage(
+            pipeline: Any, request_inputs: Any, **kwargs: Any
+        ) -> Any:
+            kwargs["device"] = host
+            return orig_prepare(pipeline, request_inputs, **kwargs)
+
+        setattr(_host_prepare_scheduler_stage, _LTX2_HOST_SIGMA_PATCHED, True)
+        ltx2_denoise.prepare_scheduler_stage = _host_prepare_scheduler_stage
+
+    orig_run = executor_cls.run
+    if not getattr(orig_run, _LTX2_HOST_SIGMA_PATCHED, False):
+
+        @functools.wraps(orig_run)
+        def _device_timesteps_run(
+            pipeline: Any, state: Any, timesteps: Any, step: Any
+        ) -> Any:
+            device = pipeline.device
+            timesteps = tuple(
+                t.to(device) if isinstance(t, torch.Tensor) else t for t in timesteps
+            )
+            return orig_run(pipeline, state, timesteps, step)
+
+        setattr(_device_timesteps_run, _LTX2_HOST_SIGMA_PATCHED, True)
+        executor_cls.run = staticmethod(_device_timesteps_run)
+
+    orig_sync = runtime_cls._synchronize_guidance_parallel_step_output
+    if not getattr(orig_sync, _LTX2_HOST_SIGMA_PATCHED, False):
+
+        @functools.wraps(orig_sync)
+        def _contiguous_guidance_step_output(
+            self: Any,
+            latents: tuple[torch.Tensor, ...],
+            guidance_parallel_ready: bool,
+        ) -> tuple[torch.Tensor, ...]:
+            if not (
+                guidance_parallel_ready
+                and ltx2_runtime.get_guidance_parallel_world_size() > 1
+            ):
+                return latents
+            return tuple(tensor.contiguous() for tensor in latents)
+
+        setattr(_contiguous_guidance_step_output, _LTX2_HOST_SIGMA_PATCHED, True)
+        runtime_cls._synchronize_guidance_parallel_step_output = (
+            _contiguous_guidance_step_output
+        )
+    logger.info("Applied TPU patch: host-resident LTX-2 sigma schedule.")
