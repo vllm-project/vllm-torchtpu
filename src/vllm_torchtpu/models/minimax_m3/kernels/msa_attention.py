@@ -395,7 +395,12 @@ def _sorted_unions(per_tile: jax.Array) -> jax.Array:
     return sort(jnp.where(dup, _NO_PAGE, s))
 
 
-def _work_list(selected: jax.Array, block_q: int, pages_per_step: int):
+def _work_list(
+    selected: jax.Array,
+    block_q: int,
+    pages_per_step: int,
+    dense: bool | None = None,
+):
     """Each tile's sorted page union, cut into groups of `pages_per_step`.
 
     Returns the unions as ``[tiles * groups_per_tile * pages_per_step]``
@@ -404,7 +409,9 @@ def _work_list(selected: jax.Array, block_q: int, pages_per_step: int):
     present slots are the first ones). The kernel reads its group's pages in
     the unions directly, so no [groups, pages_per_step] gather builds a
     per-group list (a SparseCore offload of ~65 us per 2,048-token call in
-    the c4 prefill twin, j-3c651507).
+    the c4 prefill twin, j-3c651507). `dense` forces (or forbids) the
+    dense-compare unions; by default they are used up to
+    `_DENSE_WORK_LIST_ELEMS`.
     """
     num_tokens, topk = selected.shape
     num_tiles = num_tokens // block_q
@@ -412,7 +419,9 @@ def _work_list(selected: jax.Array, block_q: int, pages_per_step: int):
     per_tile = jnp.where(selected < 0, _NO_PAGE, selected).reshape(
         num_tiles, union_size
     )
-    if num_tiles * union_size**2 <= _DENSE_WORK_LIST_ELEMS:
+    if dense is None:
+        dense = num_tiles * union_size**2 <= _DENSE_WORK_LIST_ELEMS
+    if dense:
         union = _dense_unions(per_tile)
     else:
         union = _sorted_unions(per_tile)

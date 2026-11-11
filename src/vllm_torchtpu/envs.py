@@ -81,6 +81,9 @@ if TYPE_CHECKING:
     TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES: int = 0
     TPU_MINIMAX_M3_SPLIT_MIN_TOKENS: int = 0
     TPU_MINIMAX_M3_SPLIT_ATTENTION_FIRST: bool = True
+    TPU_MINIMAX_M3_MSA_DECODE_V2: bool = False
+    TPU_MINIMAX_M3_MSA_DECODE_V2_MAX_TOKENS: int = 512
+    TPU_MINIMAX_M3_MSA_DECODE_V2_CFG: str = ""
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
@@ -753,6 +756,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # faster at c16/c48, slower at c4 (batch-1 mixed steps).
     "TPU_MINIMAX_M3_SPLIT_ATTENTION_FIRST": env_bool(
         "TPU_MINIMAX_M3_SPLIT_ATTENTION_FIRST", default=True
+    ),
+    # MiniMax M3 DCP attend: batches of at most
+    # TPU_MINIMAX_M3_MSA_DECODE_V2_MAX_TOKENS tokens run the decode MSA
+    # attention kernel (`msa_decode_attention`: one 8-token tile per verify
+    # group, rows on lanes, every KV head in one call). Off by default.
+    "TPU_MINIMAX_M3_MSA_DECODE_V2": env_bool(
+        "TPU_MINIMAX_M3_MSA_DECODE_V2", default=False
+    ),
+    "TPU_MINIMAX_M3_MSA_DECODE_V2_MAX_TOKENS": env_int(
+        "TPU_MINIMAX_M3_MSA_DECODE_V2_MAX_TOKENS", 512
+    ),
+    # Tuning overrides of the decode kernel, "key=value,..." (bq, pps,
+    # widths as 1-2-4-8, tps, t 0/1, scale small/big, dense 0/1 work-list
+    # unions). Empty = defaults.
+    "TPU_MINIMAX_M3_MSA_DECODE_V2_CFG": lambda: os.getenv(
+        "TPU_MINIMAX_M3_MSA_DECODE_V2_CFG", ""
     ),
     # SparseCore MoE gather-reduce (combine) kernel version used by
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and

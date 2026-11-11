@@ -47,9 +47,12 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu import envs
+from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.minimax_m3.kernels import (
     msa,
     msa_attention,
+    msa_decode_attention,
     msa_attention_lse,
     msa_fp4,
     msa_indexer,
@@ -57,7 +60,10 @@ from vllm_torchtpu.models.minimax_m3.kernels import (
     msa_write,
 )
 
+logger = init_logger(__name__)
+
 _NEG_INF = float("-inf")
+_DECODE_V2_LOGGED = False
 # The narrowest column count `local_candidates` scans (a vreg's lanes), and
 # the fewest tokens for which it picks a width per row block.
 _MIN_CANDIDATE_WIDTH = 128
@@ -793,6 +799,82 @@ def msa_attend_dcp(
     lse [G * Hg, T] f32)``: the LSE merge reduce-scatters heads along the
     leading axis (`ops.msa.merge_head_partials`).
     """
+    selected = merge_head_candidates(candidates, topk, interpret)  # [T, G, topk]
+    return attend_selected(
+        q,
+        kv_cache,
+        selected,
+        seq_lens,
+        block_tables,
+        cu_q_lens,
+        sm_scale=sm_scale,
+        rank=rank,
+        dcp=dcp,
+        scale_cache=scale_cache,
+        interpret=interpret,
+    )
+
+
+def use_decode_v2(num_tokens: int) -> bool:
+    """Whether a DCP attend of `num_tokens` tokens runs `msa_decode_attention`
+    (TPU_MINIMAX_M3_MSA_DECODE_V2, batches up to its MAX_TOKENS)."""
+    global _DECODE_V2_LOGGED
+    if not envs.TPU_MINIMAX_M3_MSA_DECODE_V2:
+        return False
+    if num_tokens > envs.TPU_MINIMAX_M3_MSA_DECODE_V2_MAX_TOKENS:
+        return False
+    if not _DECODE_V2_LOGGED:
+        _DECODE_V2_LOGGED = True
+        logger.info(
+            "TPU_MINIMAX_M3_MSA_DECODE_V2=1: MSA decode attention kernel v2 for "
+            "DCP attend batches of <= %d tokens (first: %d tokens, options %s)",
+            envs.TPU_MINIMAX_M3_MSA_DECODE_V2_MAX_TOKENS,
+            num_tokens,
+            decode_v2_options(),
+        )
+    return True
+
+
+def decode_v2_options() -> dict:
+    """`msa_decode_attention_lse` options from TPU_MINIMAX_M3_MSA_DECODE_V2_CFG."""
+    opts = {}
+    for item in filter(None, envs.TPU_MINIMAX_M3_MSA_DECODE_V2_CFG.split(",")):
+        key, value = item.split("=")
+        if key == "bq":
+            opts["block_q"] = int(value)
+        elif key == "pps":
+            opts["pages_per_step"] = int(value)
+        elif key == "widths":
+            opts["widths"] = tuple(int(x) for x in value.split("-") if x)
+        elif key == "tps":
+            opts["tiles_per_step"] = int(value)
+        elif key == "t":
+            opts["transposed"] = value == "1"
+        elif key == "scale":
+            opts["scale_mode"] = value
+        elif key == "dense":
+            opts["dense"] = value == "1"
+        else:
+            raise ValueError(f"TPU_MINIMAX_M3_MSA_DECODE_V2_CFG: unknown key {key!r}")
+    return opts
+
+
+def attend_selected(
+    q: jax.Array,
+    kv_cache: jax.Array,
+    selected: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    cu_q_lens: jax.Array,
+    *,
+    sm_scale: float,
+    rank: int | jax.Array,
+    dcp: int,
+    scale_cache: jax.Array | None = None,
+    interpret: bool = False,
+) -> tuple[jax.Array, jax.Array]:
+    """`msa_attend_dcp` from the merged selection ``selected [T, G, topk]``
+    (global block ids, ``-1`` padded)."""
     num_tokens = q.shape[0]
     rank = rank_array(rank)[0]
     block_size = msa.page_size(kv_cache)
@@ -800,7 +882,6 @@ def msa_attend_dcp(
     block_tables_2d = block_tables.reshape(max_num_seqs, -1)
     pages_per_seq = block_tables_2d.shape[1]
     seq_id, pos, valid = msa.token_positions(num_tokens, seq_lens, cu_q_lens)
-    selected = merge_head_candidates(candidates, topk, interpret)  # [T, G, topk]
     num_heads = selected.shape[1]
     own_block = pos // block_size
     local_key = jnp.where(
@@ -823,6 +904,17 @@ def msa_attend_dcp(
         interpret=interpret,
     )
     args = (local_key, pos % block_size + 1, block_tables.reshape(-1))
+    if use_decode_v2(num_tokens):
+        return msa_decode_attention.msa_decode_attention_lse(
+            q,
+            kv_cache,
+            keys,
+            *args,
+            sm_scale=sm_scale,
+            scale_cache=scale_cache,
+            interpret=interpret,
+            **decode_v2_options(),
+        )
     if scale_cache is not None:
         if num_heads == 1:
             return msa_attention_lse.msa_sparse_attention_lse(
