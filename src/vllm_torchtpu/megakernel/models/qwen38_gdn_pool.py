@@ -212,17 +212,20 @@ class Qwen38PoolGDN(Qwen38GDN):
         scr = dict(super().scratch(g, ex, plan))
         lay = self.lin_in_layout(g, ex)
         f8 = jnp.float8_e4m3fn
+        gp = plan.block_params[self.name]
+        # `Tiles.lean_scratch`: the chunk gather (`ssm=False`) never stages SSM rows in
+        # `pg_raw*` (6 x 128 KiB unused).
+        raw = not (ex.resolved_tiles.lean_scratch and _chunk_gather(gp, ex))
         # One whole ref per staged block: a typed view of a sliced ref is not
         # supported everywhere, a view of a whole scratch ref is.
         for b in range(2):
-            for j in range(SSM_BLOCKS):
+            for j in range(SSM_BLOCKS if raw else 0):
                 scr[f"pg_raw{b}{j}"] = pltpu.VMEM((SSM_ROWS, 1, 4, 256), f8)
             scr[f"pg_craw{b}"] = pltpu.VMEM((CONV_ROWS, 1, 4, 256), f8)
         scr.update(
             pg_sem=pltpu.SemaphoreType.DMA((2, SSM_BLOCKS + 1)),
             pg_conv=pltpu.VMEM((ex.NS, rup(3 + ex.T, 8), lay.QKV), F32),
         )
-        gp = plan.block_params[self.name]
         if _chunk_gather(gp, ex):
             # Per ring slot and request of a chunk: the state's FP8 pool rows.
             for sv in range(gp.NRB):

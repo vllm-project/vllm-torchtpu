@@ -50,6 +50,32 @@ from vllm_torchtpu.megakernel_runtime.qwen38_wholestep_call import (
 )
 
 
+def _install_ledger() -> None:
+    """Wrap `kernel.build_scratch`: print the planned VMEM scratch of every kernel built."""
+    import math
+
+    from vllm_torchtpu.megakernel import kernel as _k
+
+    orig = _k.build_scratch
+
+    def wrapped(model_spec, ex, *args, **kw):
+        cp, scratch = orig(model_spec, ex, *args, **kw)
+        rows = sorted(
+            ((math.prod(sh) * jnp.dtype(dt).itemsize, k, sh, jnp.dtype(dt).name)
+             for k, (sh, dt) in cp.vmem_shapes.items()), reverse=True)
+        t = ex.tiles
+        print(f"LEDGER B={ex.B} MB={ex.MB} nbe={t.nbe} nbd={t.nbd} total="
+              f"{cp.vmem_bytes / 2**20:.3f} MiB ({len(rows)} buffers)", flush=True)
+        for b in model_spec.all_blocks():
+            print(f"LEDGER   widths {b.name} {type(b).__name__} {b.shared_widths(model_spec.config, ex)}",
+                  flush=True)
+        for sz, k, sh, dt in rows:
+            print(f"LEDGER   {sz / 2**20:8.3f} {k} {sh} {dt} {cp.phase_map.get(k, '')}", flush=True)
+        return cp, scratch
+
+    _k.build_scratch = wrapped
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--buckets", default="4,8,16")
@@ -86,8 +112,12 @@ def main():
                     "and print OK or the compile error (e.g. the scoped VMEM OOM)")
     ap.add_argument("--tail", action="store_true",
                     help="VLLM_TPU_MK_WHOLE_L47: + the last QSA layer as a one-layer kernel")
+    ap.add_argument("--ledger", action="store_true",
+                    help="print each kernel's planned VMEM scratch (name, shape, dtype, MiB, phase)")
     a = ap.parse_args()
     _apply_removals(a.remove)
+    if a.ledger:
+        _install_ledger()
     if a.trace_only:
         from jax.experimental import pallas as pl
         from jax.experimental.pallas import tpu as pltpu

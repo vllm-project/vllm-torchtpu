@@ -323,6 +323,8 @@ def build_scratch(
     }
     if p.dynamic_kinds:
         scratch["esem"] = pltpu.SemaphoreType.DMA((NBE,))
+    if tiles.hbm_io:  # hidden input / output DMAs (`kernel.build`)
+        scratch["hio_sem"] = pltpu.SemaphoreType.DMA(())
 
     if RSAG:
         scratch["ag_send"] = pltpu.VMEM((2, AR_R, CW), BF16)
