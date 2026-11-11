@@ -143,6 +143,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_PREFILL_UNION_GATHER_GROWTH: float = 1.0
     VLLM_TPU_QSA_PREFILL_UNION_COMPACT_REQS: int = 0
     VLLM_TPU_QSA_PREFILL_UNION_COMPACT_COPY: str = "vmem"
+    VLLM_TPU_QSA_PREFILL_UNION_DCP: bool = False
     VLLM_TPU_QSA_PREFILL_PREFIX_PAGES: bool = False
     VLLM_TPU_QSA_MAIN_KV_DCP: int = 0
     VLLM_TPU_QSA_DCP_PREFILL_QUERY_BLOCK: int = 1024
@@ -1051,6 +1052,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_QSA_PREFILL_UNION_COMPACT_COPY": env_str(
         "VLLM_TPU_QSA_PREFILL_UNION_COMPACT_COPY", "vmem"
     ),
+    # DCP (with VLLM_TPU_QSA_PREFILL_UNION_WALK; default off): under main-KV
+    # DCP (VLLM_TPU_QSA_MAIN_KV_DCP) the union walk also serves the prefill's
+    # (out, lse) partials over this rank's owned groups, on either paired main
+    # KV slot, instead of the DCP block-sparse kernel (which stays its
+    # short-context / cap / alpha fallback). Bit-scan walk only: with LISTED,
+    # RUN_TABLES, GATHERED, COMPACT_REQS or SHARE_BITS set, DCP keeps the
+    # block-sparse kernel. Not bitwise against it (union-order online
+    # softmax, equal precision).
+    "VLLM_TPU_QSA_PREFILL_UNION_DCP": env_bool("VLLM_TPU_QSA_PREFILL_UNION_DCP"),
     # qwen4_exp QSA (unsharded indexer path): when every row's completed groups
     # fit the top-k budget, take all visible groups and skip the StreamIndex
     # scoring call (the sharded path already does). Same selected set; the
