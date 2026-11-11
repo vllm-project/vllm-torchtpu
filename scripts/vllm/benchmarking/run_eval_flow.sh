@@ -399,18 +399,39 @@ run_agentx_perf() {
     local conc_list="${AGENTX_CONC_LIST:-}"
     local model_prefix="${AGENTX_MODEL_PREFIX:-}"
     local precision="${AGENTX_PRECISION:-}"
+    local chips="${AGENTX_CHIPS:-}"
     if [ -z "$conc_list" ] || [ -z "$model_prefix" ] || [ -z "$precision" ]; then
         echo "::error::agentx suite requires AGENTX_CONC_LIST, AGENTX_MODEL_PREFIX, and AGENTX_PRECISION in $CONFIG_NAME.sh or env."
         fail=1
         return
     fi
-    local chips="${AGENTX_CHIPS:-$(( CONFIG_TP * CONFIG_DP ))}"
+    case "$chips" in
+        ''|*[!0-9]*|0)
+            echo "::error::agentx suite requires AGENTX_CHIPS=<physical_chips> (physical chips, not TP x DP ranks)."
+            fail=1
+            return
+            ;;
+    esac
+    # shellcheck source=/dev/null
+    source "$SCRIPT_DIR/../benchmark/inferencex/sweep_lib.sh"
+    local ep=1
+    if [ "${CONFIG_ENABLE_EP:-false}" = "true" ]; then
+        ep=$(( CONFIG_TP * CONFIG_DP ))
+    fi
+    local disagg="${AGENTX_DISAGG:-0}"
+    if [ "${CONFIG_IS_1P1D:-0}" = "1" ]; then
+        disagg=1
+    fi
+    ix_export_topology "$CONFIG_TP" "$CONFIG_DP" "$ep" "$disagg"
     local agentx_args=(
         --server-url "$BASE_URL"
         --conc-list "${conc_list// /,}"
         --chips "$chips"
+        --model "$MODEL"
+        --label "agentx_${CONFIG_NAME}"
         --model-prefix "$model_prefix"
         --precision "$precision"
+        --gsm8k-limit "${AGENTX_GSM8K_LIMIT:-0}"
         --results-dir "$RESULTS_DIR/agentx"
     )
     if [ -n "${AGENTX_REFERENCE_ROW:-}" ]; then
@@ -421,6 +442,9 @@ run_agentx_perf() {
     fi
     if [ -n "${AGENTX_DURATION:-}" ]; then
         agentx_args+=(--duration "$AGENTX_DURATION")
+    fi
+    if [ -n "${AGENTX_FAST:-}" ]; then
+        agentx_args+=(--fast "$AGENTX_FAST")
     fi
     echo "Running InferenceX AgentX suite against $BASE_URL..."
     bash "$SCRIPT_DIR/../benchmark/inferencex/agentx_client.sh" "${agentx_args[@]}" || {
@@ -435,10 +459,17 @@ if [ ! -f "$CONFIG_FILE" ]; then
     exit 1
 fi
 
+# Disaggregated 1P1D configs branch on K3_1P1D_ROLE; default to decode when
+# running client-only against an external endpoint so sourcing succeeds.
+if [ "$START_SERVER" = "0" ] && [ -z "${K3_1P1D_ROLE:-}" ]; then
+    export K3_1P1D_ROLE="decode"
+fi
+
 # Read config-declared suite defaults in an isolated subshell before launching.
 eval "$(
-    SCRIPT_DIR="$SCRIPT_DIR" bash -c '
+    SCRIPT_DIR="$SCRIPT_DIR" K3_1P1D_ROLE="${K3_1P1D_ROLE:-}" bash -c '
         LM_EVAL_TASKS="mmlu_llama mmlu_pro"
+        ENABLE_EP="false"
         EVAL_SUITES="${EVAL_SUITES:-}"
         PERF_SUITES="${PERF_SUITES:-}"
         JSON_SCHEMA_TASK_CONFIG="${JSON_SCHEMA_TASK_CONFIG:-}"
@@ -449,10 +480,19 @@ eval "$(
         AGENTX_REFERENCE_ROW="${AGENTX_REFERENCE_ROW:-}"
         AGENTX_SPEC_METHOD="${AGENTX_SPEC_METHOD:-}"
         AGENTX_DURATION="${AGENTX_DURATION:-}"
+        AGENTX_FAST="${AGENTX_FAST:-}"
+        AGENTX_GSM8K_LIMIT="${AGENTX_GSM8K_LIMIT:-}"
+        AGENTX_DISAGG="${AGENTX_DISAGG:-}"
         source "$1"
-        for var in LM_EVAL_TASKS EVAL_SUITES PERF_SUITES JSON_SCHEMA_TASK_CONFIG \
+        CONFIG_ENABLE_EP="$ENABLE_EP"
+        CONFIG_IS_1P1D=0
+        if [ -n "${TPU_KV_TRANSFER_NAMESPACE:-}" ]; then
+            CONFIG_IS_1P1D=1
+        fi
+        for var in LM_EVAL_TASKS CONFIG_ENABLE_EP CONFIG_IS_1P1D EVAL_SUITES PERF_SUITES JSON_SCHEMA_TASK_CONFIG \
             AGENTX_CONC_LIST AGENTX_MODEL_PREFIX AGENTX_PRECISION AGENTX_CHIPS \
-            AGENTX_REFERENCE_ROW AGENTX_SPEC_METHOD AGENTX_DURATION; do
+            AGENTX_REFERENCE_ROW AGENTX_SPEC_METHOD AGENTX_DURATION AGENTX_FAST \
+            AGENTX_GSM8K_LIMIT AGENTX_DISAGG; do
             printf "%s=%q\n" "$var" "${!var}"
         done
     ' _ "$CONFIG_FILE"
@@ -488,6 +528,17 @@ fi
 
 if [ "$RUN_BENCH_SERVE" = "0" ]; then
     SKIP_PERF_CHECK=1
+fi
+
+# Fail before any server boot: tokens per dollar divides by physical chips,
+# and TP x DP counts ranks (two per chip on v7x), so there is no safe default.
+if [ "$RUN_AGENTX" = "1" ]; then
+    case "${AGENTX_CHIPS:-}" in
+        ''|*[!0-9]*|0)
+            echo "::error::agentx suite requires AGENTX_CHIPS=<physical_chips> (physical chips, not TP x DP ranks)."
+            exit 1
+            ;;
+    esac
 fi
 
 # Resolve selected accuracy suites.
@@ -643,7 +694,7 @@ python3 scripts/vllm/benchmarking/upload_results.py "${UPLOAD_ARGS[@]}" || echo 
 
 # Opt-in per step, and under the same guard as the database upload, so a PR's
 # numbers never reach the dashboard. SHAPE's topology is the slice's chips.
-if [ "${UPLOAD_TO_VLLM_CI:-0}" = "1" ] && [ "$SKIP_BENCHMARK" = "0" ] && [[ " ${UPLOAD_ARGS[*]} " != *" --skip-db-upload "* ]]; then
+if [ "${UPLOAD_TO_VLLM_CI:-0}" = "1" ] && [ "$RUN_BENCH_SERVE" = "1" ] && [[ " ${UPLOAD_ARGS[*]} " != *" --skip-db-upload "* ]]; then
     echo "=== Publishing to the ci.vllm.ai Performance tab ==="
     topology="${SHAPE:-}"
     topology="${topology#*/}"

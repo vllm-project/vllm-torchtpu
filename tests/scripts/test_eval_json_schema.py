@@ -422,3 +422,31 @@ def test_run_eval_flow_base_url_and_suite_flags(tmp_path, mock_openai_server):
     assert out_file.exists()
     data = json.loads(out_file.read_text())
     assert data["results"]["json_schema"]["acc,none"] == 1.0
+    assert (results_dir / "eval_check_json_schema.md").exists()
+    assert "PASS: all evaluated tasks within tolerance." in proc.stdout
+
+    # Disaggregated 1P1D config with --base-url and missing AGENTX_CHIPS fails cleanly
+    # on physical-chip validation (while sourcing K3_1P1D_ROLE=decode without error).
+    proc_agentx = subprocess.run(
+        [
+            "bash",
+            str(_BENCH_DIR / "run_eval_flow.sh"),
+            "--config",
+            "kimi-k3-tp8-dp4-ep-agentx",
+            "--base-url",
+            base_url,
+            "--perf-suites",
+            "agentx",
+            "--eval-suites",
+            "none",
+            "--results-dir",
+            str(tmp_path / "agentx_missing_chips"),
+            "--skip-db-upload",
+        ],
+        cwd=str(_REPO_ROOT),
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert proc_agentx.returncode == 1
+    assert "AGENTX_CHIPS=<physical_chips>" in proc_agentx.stdout
