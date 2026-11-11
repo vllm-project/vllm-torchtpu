@@ -55,6 +55,7 @@ from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
 from vllm_torchtpu.layers.adapter.sample.top_k_top_p import (
     apply_top_k_top_p,
     random_sampler_variants,
+    topk_candidate_blocks,
 )
 from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadata,
@@ -3644,15 +3645,22 @@ def _recording_sampler(record):
     return sample_from_logits
 
 
+# A real vocabulary size: 1,940 whole CANDIDATE_BLOCKs.
+_VOCAB_SIZE = 248320
+
+
 def _precompile_runner(record, speculative_config=None, candidate_blocks=0):
     """A runner stand-in for `_precompile_sample_from_logits` that samples
-    through `_recording_sampler(record)`."""
+    through `_recording_sampler(record)`. `candidate_blocks` stands for
+    TPU_SAMPLER_TOPK_CANDIDATES, gated on `_VOCAB_SIZE`."""
     return SimpleNamespace(
         num_reqs_paddings=[2],
         _hidden_states_dtype=torch.bfloat16,
         device=torch.device("cpu"),
         _dummy_logits=lambda n: torch.zeros((n, 16), dtype=torch.bfloat16),
-        _topk_candidate_blocks=lambda: candidate_blocks,
+        _topk_candidate_blocks=lambda: topk_candidate_blocks(
+            candidate_blocks, _VOCAB_SIZE
+        ),
         _precompile_timed=lambda _name: contextlib.nullcontext(),
         sample_from_logits_func=_recording_sampler(record),
         speculative_config=speculative_config,
@@ -3683,10 +3691,11 @@ def test_sampler_applies_topk_topp_only_when_a_request_sets_them(
 def test_every_runtime_sampler_variant_is_precompiled(
     speculative_config, candidate_blocks
 ):
-    """Every (all_greedy, topk_candidates, apply_topk_topp) graph that the
-    random sampling path picks at runtime is one the precompile warms, so
-    serving compiles no sampler graph after warmup. The runtime picks from
-    random_sampler_variants, which both precompiles warm."""
+    """Every (all_greedy, topk_candidates, apply_topk_topp) graph that
+    sampling picks at runtime, random or all-greedy, is one the precompile
+    warms, so serving compiles no sampler graph after warmup. The random path
+    picks from random_sampler_variants, which both precompiles warm."""
+    num_blocks = topk_candidate_blocks(candidate_blocks, _VOCAB_SIZE)
     warmed = set()
     TPUModelRunner._precompile_sample_from_logits(
         _precompile_runner(
@@ -3695,24 +3704,25 @@ def test_every_runtime_sampler_variant_is_precompiled(
             candidate_blocks,
         )
     )
-    variants = {
-        (False, *variant) for variant in random_sampler_variants(candidate_blocks)
-    }
+    variants = {(False, *variant) for variant in random_sampler_variants(num_blocks)}
     assert variants <= warmed
 
+    # vLLM's InputBatch stores vocab_size as the top_k of a request that does
+    # not set it.
+    unset = _VOCAB_SIZE
     for top_k, top_p in (
-        ([0, 0], [1.0, 1.0]),
-        ([0, 0], [0.9, 1.0]),
+        ([unset, unset], [1.0, 1.0]),
+        ([unset, unset], [0.9, 1.0]),
         ([2, 2], [1.0, 1.0]),
-        ([2, 0], [1.0, 1.0]),
+        ([2, unset], [1.0, 1.0]),
         ([100, 2], [0.9, 0.9]),
     ):
         runner = SimpleNamespace(
             speculative_config=speculative_config,
-            _topk_candidate_blocks=lambda: candidate_blocks,
+            _topk_candidate_blocks=lambda: num_blocks,
             input_batch=SimpleNamespace(
                 top_k_cpu_tensor=torch.tensor(top_k, dtype=torch.int32),
-                no_top_k=not any(top_k),
+                no_top_k=all(k == unset for k in top_k),
                 no_top_p=all(p == 1.0 for p in top_p),
             ),
         )
@@ -3723,6 +3733,18 @@ def test_every_runtime_sampler_variant_is_precompiled(
                 TPUModelRunner._sampler_applies_topk_topp(runner),
             )
             assert variant in variants, (top_k, top_p, grammar_output, variant)
+
+    # All-greedy batches sample through _greedy_sample.
+    greedy = []
+    TPUModelRunner._greedy_sample(
+        SimpleNamespace(
+            sample_from_logits_func=_recording_sampler(
+                lambda _u, variant: greedy.append(variant)
+            )
+        ),
+        torch.zeros((2, 16), dtype=torch.bfloat16),
+    )
+    assert len(greedy) == 1 and greedy[0] in warmed, greedy
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
