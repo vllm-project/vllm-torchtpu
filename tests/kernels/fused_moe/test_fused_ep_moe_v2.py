@@ -621,11 +621,13 @@ def test_slab_scatter_set_and_add_are_bit_exact(
 
     The chip picks the form (host.slab_tables_on_tensorcore); forcing each one
     here runs both on whatever chip this is, so the form this chip does NOT
-    pick is checked as well. The two forced builds must lower to different
-    programs, so the agreement is not vacuous: were the form ever dropped from
-    the layer's shard_map cache key, the second build would reuse the first
-    one's body and fail here.
+    pick is checked as well. The scale slab is held on its scatter path, where
+    the form applies, rather than the lookup the layer prefers. The two forced
+    builds must lower to different programs, so the agreement is not vacuous:
+    were the form ever dropped from the layer's shard_map cache key, the second
+    build would reuse the first one's body and fail here.
     """
+    monkeypatch.setattr(layer, "scale_slab_fits", lambda _n: False)
     mesh = _mesh()
     if shared_weights is not None:
         w1, w2, w1_scale, w2_scale = request.getfixturevalue(shared_weights)
@@ -674,6 +676,63 @@ def test_slab_scatter_set_and_add_are_bit_exact(
         outs[by_set] = np.asarray(run(*args))
     assert programs[True] != programs[False]
     np.testing.assert_array_equal(outs[True], outs[False])
+
+
+@pytest.mark.parametrize("sharded_plan", [False, True], ids=["replicated", "sharded"])
+@pytest.mark.parametrize(
+    "shape",
+    [
+        pytest.param(dict(SMALL), id="small"),
+        pytest.param(dict(PROD, tokens=PROD_TOKENS[0]), id="prod_t2048"),
+        pytest.param(dict(PROD, tokens=PROD_TOKENS[1]), id="prod_t16384"),
+    ],
+)
+def test_scale_slab_lookup_and_scatter_are_bit_exact(monkeypatch, sharded_plan, shape):
+    """The scale slab built by lookup gives the layer the scatter's output.
+
+    The lookup leaves token 0's scale on the ROWBLK padding rows where the
+    scatter leaves zero; the kernel commits neither, so the output is the
+    same bits. The scatter form is forced by declaring the scales too large
+    for SMEM; the TensorCore builds are forced on, so the lookup runs on a
+    chip whose SparseCore would otherwise keep the scatter-add.
+    """
+    monkeypatch.setattr(layer, "slab_tables_on_tensorcore", lambda: True)
+    mesh = _mesh()
+    w1, w2, w1_scale, w2_scale = _make_weights(
+        mesh,
+        50,
+        hidden=shape["hidden"],
+        inter=shape["inter"],
+        e_total=shape["e_total"],
+        weight_format=WeightFormat.FP8,
+    )
+    x, gating = _make_inputs(
+        mesh,
+        51,
+        tokens=shape["tokens"],
+        hidden=shape["hidden"],
+        e_total=shape["e_total"],
+    )
+    outs = []
+    for fits in (True, False):
+        monkeypatch.setattr(layer, "scale_slab_fits", lambda _n, fits=fits: fits)
+        outs.append(
+            fused_ep_moe_v2(
+                x,
+                w1,
+                w2,
+                w1_scale,
+                w2_scale,
+                gating,
+                topk=shape["topk"],
+                renormalize=True,
+                mesh=mesh,
+                capacity=CAPACITY,
+                weight_format=WeightFormat.FP8,
+                sharded_plan=sharded_plan,
+            )
+        )
+    np.testing.assert_array_equal(np.asarray(outs[0]), np.asarray(outs[1]))
 
 
 @pytest.mark.parametrize("wire_dtype", [FP8, jnp.bfloat16], ids=["fp8", "bf16"])
