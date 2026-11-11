@@ -725,7 +725,6 @@ def _patch_ltx2_per_sample_timestep() -> None:
 
 
 _LTX2_V2A_LOCAL_KV_PATCHED = "_tpu_ltx2_v2a_local_kv_patched"
-_LTX2_V2A_DECLINE_LOGGED = "_tpu_ltx2_v2a_decline_logged"
 
 
 def _patch_ltx2_v2a_local_kv_attn() -> None:
@@ -751,18 +750,6 @@ def _patch_ltx2_v2a_local_kv_attn() -> None:
         return
     orig_forward_impl = attn_cls._forward_impl
 
-    def _log_v2a_local_kv_declined(attn_metadata: Any | None) -> None:
-        # Log the first decline so a lost speedup is visible in perf runs.
-        if getattr(attn_cls, _LTX2_V2A_DECLINE_LOGGED, False):
-            return
-        setattr(attn_cls, _LTX2_V2A_DECLINE_LOGGED, True)
-        has_mask = getattr(attn_metadata, "attn_mask", None) is not None
-        logger.info(
-            "LTX-2 video-to-audio local-KV merge not used (attn_mask set: %s); "
-            "using the upstream all-to-all path.",
-            has_mask,
-        )
-
     def _v2a_forward_impl(
         self: Any,
         query: torch.Tensor,
@@ -774,9 +761,10 @@ def _patch_ltx2_v2a_local_kv_attn() -> None:
             strategy = self._get_active_parallel_strategy()
             if strategy.name == "ltx2_video_to_audio":
                 sp_group = parallel_state.get_sp_group()
-                if ltx2_v2a.can_run_ltx2_v2a_local_kv(
+                reason = ltx2_v2a.ltx2_v2a_local_kv_decline_reason(
                     self, query, key, value, attn_metadata, sp_group
-                ):
+                )
+                if reason is None:
                     return ltx2_v2a.ltx2_v2a_local_kv_attention(
                         query,
                         key,
@@ -785,7 +773,13 @@ def _patch_ltx2_v2a_local_kv_attn() -> None:
                         ulysses_pg=sp_group.ulysses_group,
                         use_sync=self.use_sync,
                     )
-                _log_v2a_local_kv_declined(attn_metadata)
+                # Log each distinct decline once so a lost speedup is visible
+                # in perf runs.
+                logger.info_once(
+                    "LTX-2 video-to-audio local-KV merge not used (%s); "
+                    "using the upstream all-to-all path.",
+                    reason,
+                )
         return orig_forward_impl(self, query, key, value, attn_metadata)
 
     setattr(_v2a_forward_impl, _LTX2_V2A_LOCAL_KV_PATCHED, True)

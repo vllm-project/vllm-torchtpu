@@ -36,33 +36,45 @@ import torch.nn.functional as F
 DEFAULT_MAX_SCORE_ELEMENTS = 16_777_216
 
 
-def can_run_ltx2_v2a_local_kv(
+def ltx2_v2a_local_kv_decline_reason(
     attn_layer: Any,
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
     attn_metadata: Any | None,
     sp_group: Any,
-) -> bool:
-    """Whether ``_LTX2ParallelAttention`` can merge V2A over local K/V."""
-    if (
-        getattr(attn_layer, "ltx_sp_mode", None) != "video_to_audio"
-        or getattr(attn_layer, "_has_custom_attention", False)
-        or getattr(attn_layer, "causal", False)
-        or attn_layer.is_paged_kv_active()
-    ):
-        return False
+) -> str | None:
+    """Why ``_LTX2ParallelAttention`` cannot merge V2A over local K/V.
+
+    Returns ``None`` when the local-KV merge can run. The caller has already
+    checked that ``attn_layer.ltx_sp_mode == "video_to_audio"``.
+    """
+    if attn_layer._has_custom_attention:
+        return "custom attention backend"
+    if attn_layer.causal:
+        return "causal=True"
+    if attn_layer.is_paged_kv_active():
+        return "paged KV cache active"
     if sp_group.ring_world_size != 1 or sp_group.ulysses_world_size <= 1:
-        return False
+        return (
+            f"ring_world_size={sp_group.ring_world_size}, "
+            f"ulysses_world_size={sp_group.ulysses_world_size} "
+            "(requires ring 1 and Ulysses > 1)"
+        )
     if (
         query.ndim != 4
         or key.ndim != 4
         or value.ndim != 4
         or key.shape != value.shape
         or query.dtype != key.dtype
+        or query.dtype != value.dtype
         or query.dtype not in (torch.bfloat16, torch.float16, torch.float32)
     ):
-        return False
+        return (
+            f"query {tuple(query.shape)} {query.dtype}, key {tuple(key.shape)} "
+            f"{key.dtype}, value {tuple(value.shape)} {value.dtype} (requires "
+            "4-D q/k/v of one bf16/f16/f32 dtype and k/v of one shape)"
+        )
     bsz, s_q, q_heads, head_dim = query.shape
     k_bsz, s_kv, kv_heads, k_dim = key.shape
     world_size = sp_group.ulysses_world_size
@@ -78,14 +90,19 @@ def can_run_ltx2_v2a_local_kv(
         or q_heads % world_size != 0
         or kv_heads % world_size != 0
     ):
-        return False
+        return (
+            f"query {tuple(query.shape)}, key {tuple(key.shape)} on "
+            f"ulysses_world_size={world_size} (requires matching batch and head "
+            "dim, and q/kv heads divisible by kv heads and by the Ulysses size)"
+        )
     eff_meta = attn_layer._with_kv_cache_dtype(attn_metadata)
     if eff_meta is not None:
         if eff_meta.attn_mask is not None:
-            return False
-        if eff_meta.extra.get("kv_cache_dtype") not in (None, "float"):
-            return False
-    return True
+            return "attn_mask set"
+        kv_cache_dtype = eff_meta.extra.get("kv_cache_dtype")
+        if kv_cache_dtype not in (None, "float"):
+            return f"kv_cache_dtype={kv_cache_dtype}"
+    return None
 
 
 def _local_unnormalized_attention(

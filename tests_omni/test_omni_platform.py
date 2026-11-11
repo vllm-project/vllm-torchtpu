@@ -1251,6 +1251,8 @@ def test_ltx2_v2a_local_kv_matches_global_attention(
 def test_ltx2_v2a_patch_dispatch_and_fallbacks(monkeypatch):
     from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 
+    from vllm_torchtpu.omni import ltx2_v2a
+
     patches._patch_ltx2_v2a_local_kv_attn()
     attn_cls = ltx2_transformer._LTX2ParallelAttention
     # Idempotent re-apply
@@ -1259,9 +1261,6 @@ def test_ltx2_v2a_patch_dispatch_and_fallbacks(monkeypatch):
     assert attn_cls._forward_impl is installed
     decline_log = MagicMock()
     monkeypatch.setattr(patches, "logger", decline_log)
-    monkeypatch.setattr(
-        attn_cls, patches._LTX2_V2A_DECLINE_LOGGED, False, raising=False
-    )
 
     fake_pg = SimpleNamespace(world_size=2)
     sp_group = SimpleNamespace(
@@ -1306,7 +1305,7 @@ def test_ltx2_v2a_patch_dispatch_and_fallbacks(monkeypatch):
     )
     out = layer._forward_impl(q, k, v, None)
     assert len(called_local) == 1 and out.shape == q.shape
-    assert decline_log.info.call_count == 0
+    assert decline_log.info_once.call_count == 0
 
     # Masked metadata falls back to upstream _forward_impl -> strategy / local attn.
     fallback_calls = []
@@ -1320,18 +1319,38 @@ def test_ltx2_v2a_patch_dispatch_and_fallbacks(monkeypatch):
     masked_meta = AttentionMetadata(attn_mask=torch.ones(1, 6, dtype=torch.bool))
     layer._forward_impl(q, k, v, masked_meta)
     assert len(called_local) == 1 and len(fallback_calls) == 1
-    # The decline is logged once at info level, not on every call.
+    # Each decline goes through logger.info_once with its reason, which logs
+    # every distinct reason once.
     layer._forward_impl(q, k, v, masked_meta)
     assert len(fallback_calls) == 2
-    assert decline_log.info.call_count == 1
-    assert decline_log.info.call_args.args[1] is True
+    assert decline_log.info_once.call_count == 2
+    assert decline_log.info_once.call_args.args[1] == "attn_mask set"
+    assert decline_log.info.call_count == 0
+
+    # A different decline (ring > 1, checked before the mask) is reported
+    # with its own reason.
+    sp_group.ring_world_size = 2
+    layer._forward_impl(q, k, v, masked_meta)
+    assert len(called_local) == 1 and len(fallback_calls) == 3
+    assert decline_log.info_once.call_args.args[1].startswith("ring_world_size=2,")
+    sp_group.ring_world_size = 1
+
+    # A value dtype that differs from the query dtype is declined.
+    reason = ltx2_v2a.ltx2_v2a_local_kv_decline_reason(
+        layer, q, k, v.float(), None, sp_group
+    )
+    assert reason is not None and "value" in reason
+    assert (
+        ltx2_v2a.ltx2_v2a_local_kv_decline_reason(layer, q, k, v, None, sp_group)
+        is None
+    )
 
     # Non-v2a mode falls back untouched.
     layer.ltx_sp_mode = "video_self"
     layer._get_active_parallel_strategy = lambda: layer._no_parallel_strategy
     layer._forward_impl(q, k, v, None)
-    assert len(called_local) == 1 and len(fallback_calls) == 3
-    assert decline_log.info.call_count == 1
+    assert len(called_local) == 1 and len(fallback_calls) == 4
+    assert decline_log.info_once.call_count == 3
 
 
 def test_ltx2_sp_plan_leaves_per_sample_timestep_unsplit(monkeypatch):
