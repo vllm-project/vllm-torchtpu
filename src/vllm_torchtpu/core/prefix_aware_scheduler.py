@@ -28,6 +28,7 @@ Enable with:
     --scheduler-cls vllm_torchtpu.core.prefix_aware_scheduler.PrefixAwareScheduler
 """
 
+import threading
 import time
 from itertools import islice
 from typing import cast
@@ -85,10 +86,19 @@ def patch_prompt_ids_ndarray_early() -> None:
         return
     original = EngineCore.preprocess_add_request
 
+    first = [True]
+
     def preprocess_add_request(self, request):
         out = original(self, request)
         try:
             prompt_ids_to_ndarray(out[0])
+            if first[0] and getattr(out[0], "_prompt_ids_np", None) is not None:
+                first[0] = False
+                logger.info(
+                    "PROMPT_IDS_NDARRAY_EARLY first conversion: %d ids on thread %s",
+                    len(out[0]._prompt_ids_np),
+                    threading.current_thread().name,
+                )
         except Exception:  # never fail a request over an optimization
             logger.exception("PROMPT_IDS_NDARRAY_EARLY: conversion failed")
         return out
