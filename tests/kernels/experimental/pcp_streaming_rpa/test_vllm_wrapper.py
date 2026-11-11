@@ -25,8 +25,6 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.pcp_layout import (
     build_pcp_rank_major_token_order,
 )
 
-pytestmark = pytest.mark.multichip
-
 
 def _build_expected_pcp_writeback_mapping(
     q_lens: np.ndarray,
