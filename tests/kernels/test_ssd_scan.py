@@ -11,7 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Correctness tests for Mamba-2 Selective State Space (SSD) scan kernels."""
+"""Correctness tests for Mamba-2 and Mamba-3 Selective State Space (SSD) scan."""
+
+from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
@@ -24,6 +26,7 @@ from vllm_torchtpu.kernels.ssd_scan import (
     chunk_state_pallas,
     ssd_minimal_discrete_hybrid,
 )
+from vllm_torchtpu.kernels.ssd_scan import ssd_scan as ssd_scan_mod
 from vllm_torchtpu.kernels.ssd_scan.ssd_scan import (
     _segsum_jax,
     _select_head_block_size,
@@ -38,11 +41,15 @@ def ssd_sequential_reference(
     last_chunk_indices: jax.Array,
     initial_states: jax.Array | None = None,
     reset_mask: jax.Array | None = None,
+    *,
+    strict_causal: bool = False,
+    mimo_rank: int = 1,
 ) -> tuple[jax.Array, jax.Array]:
     """Independent per-token sequential SSM recurrence reference in NumPy.
 
-    Computes `h_t = exp(A_t) * h_{t-1} + x_t * B_t^T` and `y_t = h_t @ C_t`
-    step by step in float32 without using `_segsum_jax` or chunked scan.
+    Supports both Mamba-2 inclusive readout (`strict_causal=False`, `mimo_rank=1`)
+    and Mamba-3 strict-causal readout (`strict_causal=True`, SISO or MIMO rank R)
+    without calling `_segsum_jax` or chunked scan.
     """
     x_np = np.asarray(X_c.astype(jnp.float32), dtype=np.float32)
     a_np = np.asarray(A_c.astype(jnp.float32), dtype=np.float32)
@@ -52,6 +59,7 @@ def ssd_sequential_reference(
     n_chunks, n_heads, block_len, d_head = x_np.shape
     n_groups = b_np.shape[1]
     d_state = b_np.shape[-1]
+    n_tok = block_len // mimo_rank
     if n_groups < n_heads:
         repeats = n_heads // n_groups
         b_np = np.repeat(b_np, repeats, axis=1)
@@ -82,10 +90,29 @@ def ssd_sequential_reference(
                 safe_seq = min(seq_idx, init_np.shape[0] - 1)
                 h = init_np[safe_seq].copy()
             seq_idx += 1
-        for t in range(block_len):
-            decay = np.exp(a_np[c, :, t])[:, None, None]
-            h = decay * h + x_np[c, :, t, :, None] * b_np[c, :, t, None, :]
-            y_out[c, :, t, :] = np.einsum("hpn,hn->hp", h, c_np[c, :, t, :])
+        for tok in range(n_tok):
+            r_start = tok * mimo_rank
+            r_end = r_start + mimo_rank
+            if a_np.shape[-1] == n_tok:
+                log_decay = a_np[c, :, tok]
+            else:
+                log_decay = np.sum(a_np[c, :, r_start:r_end], axis=-1)
+            h = np.exp(log_decay)[:, None, None] * h
+
+            if strict_causal:
+                for r_idx in range(r_start, r_end):
+                    y_out[c, :, r_idx, :] = np.einsum(
+                        "hpn,hn->hp", h, c_np[c, :, r_idx, :]
+                    )
+                for r_idx in range(r_start, r_end):
+                    h = h + x_np[c, :, r_idx, :, None] * b_np[c, :, r_idx, None, :]
+            else:
+                for r_idx in range(r_start, r_end):
+                    h = h + x_np[c, :, r_idx, :, None] * b_np[c, :, r_idx, None, :]
+                for r_idx in range(r_start, r_end):
+                    y_out[c, :, r_idx, :] = np.einsum(
+                        "hpn,hn->hp", h, c_np[c, :, r_idx, :]
+                    )
         states_outgoing[c] = h.copy()
 
     safe_idx = np.maximum(np.asarray(last_chunk_indices, dtype=np.int64), 0)
@@ -152,6 +179,55 @@ def test_segsum_jax_against_naive_loop():
                 expected[b, i, j] = np.sum(x_np[b, j + 1 : i + 1])
 
     np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6)
+
+
+def test_segsum_jax_strict_causal_and_mimo_rank():
+    x = jnp.array(
+        [
+            [-0.5, -1.25, -0.75, -2.0],
+            [-0.1, -0.2, -0.3, -0.4],
+        ],
+        dtype=jnp.float32,
+    )
+    strict = np.asarray(jnp.exp(_segsum_jax(x, strict_causal=True)))
+    x_np = np.asarray(x)
+    for b in range(2):
+        for i in range(4):
+            for j in range(4):
+                if i <= j:
+                    assert strict[b, i, j] == 0.0
+                else:
+                    expected_val = float(np.exp(np.sum(x_np[b, j + 1 : i + 1])))
+                    np.testing.assert_allclose(
+                        strict[b, i, j], expected_val, rtol=1e-6, atol=1e-6
+                    )
+
+    # MIMO rank=2 over 3 tokens (T=6), decay placed at sub-channel 0 of each token
+    a_tok = np.array([[-0.3, -0.7, -1.1]], dtype=np.float32)
+    a_exp = np.zeros((1, 3, 2), dtype=np.float32)
+    a_exp[:, :, 0] = a_tok
+    L_mimo = np.asarray(
+        jnp.exp(
+            _segsum_jax(
+                jnp.asarray(a_exp.reshape(1, 6)), strict_causal=True, mimo_rank=2
+            )
+        )
+    )
+    for l_tok in range(3):
+        for s_tok in range(3):
+            block = L_mimo[0, l_tok * 2 : (l_tok + 1) * 2, s_tok * 2 : (s_tok + 1) * 2]
+            if l_tok <= s_tok:
+                np.testing.assert_array_equal(block, np.zeros((2, 2), dtype=np.float32))
+            else:
+                expected_decay = float(np.exp(np.sum(a_tok[0, s_tok + 1 : l_tok + 1])))
+                np.testing.assert_allclose(
+                    block, np.full((2, 2), expected_decay), rtol=1e-6, atol=1e-6
+                )
+
+    with pytest.raises(ValueError, match="Expected mimo_rank >= 1"):
+        _segsum_jax(x, mimo_rank=0)
+    with pytest.raises(ValueError, match="divisible by mimo_rank"):
+        _segsum_jax(x, mimo_rank=3)
 
 
 def test_ssd_scan_validates_input_shapes():
@@ -225,6 +301,24 @@ def test_ssd_scan_validates_input_shapes():
             C_c,
             last_chunk_indices,
             reset_mask=jnp.ones((n_chunks + 1,), dtype=bool),
+            interpret=True,
+        )
+    with pytest.raises(ValueError, match="Expected mimo_rank >= 1"):
+        ssd_minimal_discrete_hybrid(
+            X_c, A_c, B_c, C_c, last_chunk_indices, mimo_rank=0, interpret=True
+        )
+    with pytest.raises(ValueError, match="divisible by mimo_rank"):
+        ssd_minimal_discrete_hybrid(
+            X_c, A_c, B_c, C_c, last_chunk_indices, mimo_rank=3, interpret=True
+        )
+    with pytest.raises(ValueError, match="Expected A_c shape in"):
+        ssd_minimal_discrete_hybrid(
+            X_c,
+            jnp.zeros((n_chunks, n_heads, 3), dtype=jnp.float32),
+            B_c,
+            C_c,
+            last_chunk_indices,
+            mimo_rank=4,
             interpret=True,
         )
 
@@ -358,14 +452,26 @@ def test_ssd_scan_grouped_bc_projections(
 
 def test_ssd_scan_defaults_start_one_sequence_from_zero_state():
     X_c, A_c, B_c, C_c, last_chunk_indices, _, _ = _make_ssd_inputs(1, 64, 16, 4, 16, 8)
-    y_ref, final_state_ref = ssd_sequential_reference(
-        X_c, A_c, B_c, C_c, last_chunk_indices
-    )
-    y, final_state = ssd_minimal_discrete_hybrid(
-        X_c, A_c, B_c, C_c, last_chunk_indices, interpret=True
-    )
-    np.testing.assert_allclose(y, y_ref, rtol=1e-4, atol=1e-4)
-    np.testing.assert_allclose(final_state, final_state_ref, rtol=1e-4, atol=1e-4)
+    for strict_causal in (False, True):
+        y_ref, final_state_ref = ssd_sequential_reference(
+            X_c,
+            A_c,
+            B_c,
+            C_c,
+            last_chunk_indices,
+            strict_causal=strict_causal,
+        )
+        y, final_state = ssd_minimal_discrete_hybrid(
+            X_c,
+            A_c,
+            B_c,
+            C_c,
+            last_chunk_indices,
+            strict_causal=strict_causal,
+            interpret=True,
+        )
+        np.testing.assert_allclose(y, y_ref, rtol=1e-4, atol=1e-4)
+        np.testing.assert_allclose(final_state, final_state_ref, rtol=1e-4, atol=1e-4)
 
 
 def test_ssd_scan_ragged_tail_padding_sentinels_and_checkpoints():
@@ -373,9 +479,6 @@ def test_ssd_scan_ragged_tail_padding_sentinels_and_checkpoints():
     multi-sequence resets, `-1` sentinels, and intermediate checkpoint gathering.
     """
     block_len, n_heads, n_groups, d_head, d_state = 8, 6, 2, 8, 8
-    # 3 sequences with unequal token lengths: 5 tokens (1 chunk, 3 padded tail
-    # tokens), 19 tokens (3 chunks, 5 padded tail tokens), and 16 tokens (2 full
-    # chunks). Total chunks = 1 + 3 + 2 = 6.
     seq_token_lens = [5, 19, 16]
     seq_chunk_counts = [(L + block_len - 1) // block_len for L in seq_token_lens]
     n_chunks = sum(seq_chunk_counts)
@@ -410,9 +513,6 @@ def test_ssd_scan_ragged_tail_padding_sentinels_and_checkpoints():
         k5, (len(seq_token_lens), n_heads, d_head, d_state), dtype=jnp.float32
     )
 
-    # Zero out padded tail positions (`A_c = 0.0`, `X_c = 0.0`) in each sequence's
-    # final chunk so outgoing chunk states equal the exact state at the last
-    # unpadded token of each sequence.
     reset_mask = np.zeros((n_chunks,), dtype=bool)
     seq_last_chunks: list[int] = []
     chunk_cursor = 0
@@ -432,11 +532,8 @@ def test_ssd_scan_ragged_tail_padding_sentinels_and_checkpoints():
     C_c = jnp.asarray(C_raw)
     reset_mask_jax = jnp.asarray(reset_mask)
 
-    # Include intermediate chunk checkpoints (`1`, `2`), final sequence chunks
-    # (`0`, `3`, `5`), and `-1` inactive padding sentinels.
     checkpoint_and_final_indices = jnp.array([0, 1, 2, 3, 5, -1, -1], dtype=jnp.int32)
 
-    # 1. With per-sequence `initial_states`:
     y_init, states_init = ssd_minimal_discrete_hybrid(
         X_c,
         A_c,
@@ -458,11 +555,8 @@ def test_ssd_scan_ragged_tail_padding_sentinels_and_checkpoints():
     )
     np.testing.assert_allclose(y_init, y_init_ref, rtol=1e-4, atol=1e-4)
     np.testing.assert_allclose(states_init, states_init_ref, rtol=1e-4, atol=1e-4)
-    # `-1` sentinels clamp to chunk `0`, not `n_chunks - 1` (`5`).
     np.testing.assert_allclose(states_init[-1], states_init[0], rtol=1e-6, atol=1e-6)
 
-    # Also verify sequence-order indexing when `initial_states` is padded to a
-    # request bucket whose leading dim happens to equal `n_chunks` (`6`).
     init_states_padded = jnp.pad(
         init_states,
         ((0, n_chunks - len(seq_token_lens)), (0, 0), (0, 0), (0, 0)),
@@ -481,8 +575,6 @@ def test_ssd_scan_ragged_tail_padding_sentinels_and_checkpoints():
     np.testing.assert_allclose(y_pad_init, y_init_ref, rtol=1e-4, atol=1e-4)
     np.testing.assert_allclose(states_pad_init, states_init_ref, rtol=1e-4, atol=1e-4)
 
-    # Verify that sequence 0's final chunk state (`chunk 0`) matches running
-    # only the 5 real tokens of sequence 0 (proving tail padding preserved state).
     b_rep = np.repeat(B_raw, n_heads // n_groups, axis=1)
     h_seq0 = np.asarray(init_states[0], dtype=np.float32).copy()
     for t in range(seq_token_lens[0]):
@@ -492,7 +584,6 @@ def test_ssd_scan_ragged_tail_padding_sentinels_and_checkpoints():
         )
     np.testing.assert_allclose(states_init[0], h_seq0, rtol=1e-4, atol=1e-4)
 
-    # 2. Multi-sequence resets with `initial_states=None`:
     last_only = jnp.asarray(seq_last_chunks, dtype=jnp.int32)
     y_zero, states_zero = ssd_minimal_discrete_hybrid(
         X_c,
@@ -536,11 +627,9 @@ def test_ssd_scan_vmem_derived_head_block_and_mosaic_lowering():
     )
 
     with jax.sharding.use_abstract_mesh(mesh_16m):
-        # Large tile on 16 MiB VMEM scales `head_block` down to fit within budget.
         hb_16m = _select_head_block_size(
             64, 64, 512, 128, 256, include_decay_tile=True, interpret=False
         )
-        # Grouped projection (`n_heads=12, n_groups=2`) picks divisor of `12 // 2 = 6`.
         hb_grouped = _select_head_block_size(
             12, 2, 64, 64, 128, include_decay_tile=True, interpret=False
         )
@@ -553,8 +642,6 @@ def test_ssd_scan_vmem_derived_head_block_and_mosaic_lowering():
     assert hb_grouped == 6
     assert hb_128m > hb_16m
 
-    # Verify full TPU Mosaic lowering via `jax.export` for grouped
-    # `n_heads=12, n_groups=2`.
     with jax.sharding.use_abstract_mesh(mesh_128m):
         jitted = jax.jit(ssd_minimal_discrete_hybrid)
         exported = export.export(jitted, platforms=("tpu",))(
@@ -568,6 +655,162 @@ def test_ssd_scan_vmem_derived_head_block_and_mosaic_lowering():
         )
         assert "ssd_chunk_state_pallas" in exported.mlir_module()
         assert "ssd_chunk_scan_pallas" in exported.mlir_module()
+
+
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+@pytest.mark.parametrize("mimo_rank", [1, 4])
+@pytest.mark.parametrize("per_token_a", [True, False])
+def test_ssd_scan_strict_causal_siso_and_mimo_correctness(
+    dtype, mimo_rank: int, per_token_a: bool
+):
+    if mimo_rank == 1 and not per_token_a:
+        pytest.skip("mimo_rank=1 has identical per-token and block_len A_c shape")
+
+    seq_chunk_counts = [1, 3, 2]
+    n_chunks = sum(seq_chunk_counts)
+    n_tok = 8
+    block_len = n_tok * mimo_rank
+    n_heads, d_head, d_state = 4, 16, 8
+
+    rng = jax.random.key(101 + mimo_rank)
+    k1, k2, k3, k4, k5 = jax.random.split(rng, 5)
+
+    X_c = jax.random.normal(k1, (n_chunks, n_heads, block_len, d_head), dtype=dtype)
+    A_tok = (
+        -jax.nn.softplus(
+            jax.random.normal(k2, (n_chunks, n_heads, n_tok), dtype=jnp.float32)
+        )
+        * 0.15
+    )
+    if per_token_a or mimo_rank == 1:
+        A_c = A_tok
+    else:
+        weights = jnp.linspace(0.1, 0.4, mimo_rank, dtype=jnp.float32)
+        weights = weights / jnp.sum(weights)
+        A_c = (A_tok[..., None] * weights).reshape(n_chunks, n_heads, block_len)
+
+    B_c = jax.random.normal(k3, (n_chunks, n_heads, block_len, d_state), dtype=dtype)
+    C_c = jax.random.normal(k4, (n_chunks, n_heads, block_len, d_state), dtype=dtype)
+    initial_states = jax.random.normal(
+        k5, (len(seq_chunk_counts), n_heads, d_head, d_state), dtype=jnp.float32
+    )
+
+    reset_mask = np.zeros((n_chunks,), dtype=bool)
+    last_chunks = []
+    cursor = 0
+    for count in seq_chunk_counts:
+        reset_mask[cursor] = True
+        last_chunks.append(cursor + count - 1)
+        cursor += count
+    last_chunks.append(-1)  # inactive padded sequence slot
+    last_chunk_indices = jnp.array(last_chunks, dtype=jnp.int32)
+    reset_mask_jax = jnp.array(reset_mask)
+
+    y_ref, final_state_ref = ssd_sequential_reference(
+        X_c,
+        A_c,
+        B_c,
+        C_c,
+        last_chunk_indices,
+        initial_states,
+        reset_mask_jax,
+        strict_causal=True,
+        mimo_rank=mimo_rank,
+    )
+    y_hybrid, final_state_hybrid = ssd_minimal_discrete_hybrid(
+        X_c,
+        A_c,
+        B_c,
+        C_c,
+        last_chunk_indices,
+        initial_states,
+        reset_mask_jax,
+        strict_causal=True,
+        mimo_rank=mimo_rank,
+        interpret=True,
+    )
+
+    assert y_hybrid.dtype == dtype
+    assert final_state_hybrid.dtype == jnp.float32
+    np.testing.assert_allclose(
+        np.asarray(final_state_hybrid[: len(seq_chunk_counts)]),
+        np.asarray(final_state_ref[: len(seq_chunk_counts)]),
+        rtol=1e-4,
+        atol=1e-4,
+    )
+    tol = 2e-2 if dtype == jnp.bfloat16 else 1e-4
+    np.testing.assert_allclose(
+        np.asarray(y_hybrid.astype(jnp.float32)),
+        np.asarray(y_ref.astype(jnp.float32)),
+        rtol=tol,
+        atol=tol,
+    )
+
+
+def test_ssd_scan_tokamax_seam_dispatch(monkeypatch):
+    X_c, A_c, B_c, C_c, last_chunk_indices, initial_states, reset_mask = (
+        _make_ssd_inputs(2, 16, 8, 2, 8, 8, dtype=jnp.float32)
+    )
+    calls: list[dict[str, object]] = []
+
+    def _fake_tokamax_ssd(
+        x_arg,
+        a_arg,
+        b_arg,
+        c_arg,
+        last_arg,
+        init_arg=None,
+        reset_arg=None,
+        *,
+        strict_causal: bool = False,
+        mimo_rank: int = 1,
+        interpret: bool = False,
+    ):
+        calls.append(
+            {
+                "strict_causal": strict_causal,
+                "mimo_rank": mimo_rank,
+                "interpret": interpret,
+            }
+        )
+        return jnp.full_like(x_arg, 9.0), jnp.full(
+            (last_arg.shape[0], x_arg.shape[1], x_arg.shape[3], b_arg.shape[3]),
+            5.0,
+            dtype=jnp.float32,
+        )
+
+    monkeypatch.setattr(ssd_scan_mod, "_tokamax_ssd_scan", _fake_tokamax_ssd)
+    monkeypatch.setattr(ssd_scan_mod, "USE_TOKAMAX", False)
+    y_native, _ = ssd_minimal_discrete_hybrid(
+        X_c,
+        A_c,
+        B_c,
+        C_c,
+        last_chunk_indices,
+        initial_states,
+        reset_mask,
+        interpret=True,
+    )
+    assert len(calls) == 0
+    assert not jnp.all(y_native == 9.0)
+
+    monkeypatch.setattr(ssd_scan_mod, "USE_TOKAMAX", True)
+    y_tok, s_tok = ssd_minimal_discrete_hybrid(
+        X_c,
+        A_c[:, :, ::2],
+        B_c,
+        C_c,
+        last_chunk_indices,
+        initial_states,
+        reset_mask,
+        strict_causal=True,
+        mimo_rank=2,
+        interpret=True,
+    )
+    assert len(calls) == 1
+    assert calls[0] == {"strict_causal": True, "mimo_rank": 2, "interpret": True}
+    assert jnp.all(y_tok == 9.0)
+    assert jnp.all(s_tok == 5.0)
 
 
 @pytest.mark.parametrize(
@@ -642,6 +885,8 @@ def test_ssd_scan_bfloat16_inputs_preserve_float32_state_carry(
 
 
 @pytest.mark.tpu_test
+@pytest.mark.parametrize("strict_causal", [False, True])
+@pytest.mark.parametrize("mimo_rank", [1, 4])
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
 @pytest.mark.parametrize(
     ("batch", "seqlen", "block_len", "n_heads", "n_groups", "d_head", "d_state"),
@@ -653,6 +898,8 @@ def test_ssd_scan_bfloat16_inputs_preserve_float32_state_carry(
     ],
 )
 def test_ssd_scan_correctness_tpu(
+    strict_causal: bool,
+    mimo_rank: int,
     dtype,
     batch: int,
     seqlen: int,
@@ -662,6 +909,8 @@ def test_ssd_scan_correctness_tpu(
     d_head: int,
     d_state: int,
 ):
+    if mimo_rank > 1 and not strict_causal:
+        pytest.skip("MIMO mode is used with strict_causal=True")
     X_c, A_c, B_c, C_c, last_chunk_indices, initial_states, reset_mask = (
         _make_ssd_inputs(
             batch,
@@ -674,13 +923,34 @@ def test_ssd_scan_correctness_tpu(
             dtype=dtype,
         )
     )
+    if mimo_rank > 1:
+        A_c = A_c[:, :, ::mimo_rank]
 
     y_ref, final_state_ref = ssd_sequential_reference(
-        X_c, A_c, B_c, C_c, last_chunk_indices, initial_states, reset_mask
+        X_c,
+        A_c,
+        B_c,
+        C_c,
+        last_chunk_indices,
+        initial_states,
+        reset_mask,
+        strict_causal=strict_causal,
+        mimo_rank=mimo_rank,
     )
-    jitted_ssd = jax.jit(ssd_minimal_discrete_hybrid)
+    jitted_ssd = jax.jit(
+        ssd_minimal_discrete_hybrid,
+        static_argnames=("strict_causal", "mimo_rank"),
+    )
     y_hybrid, final_state_hybrid = jitted_ssd(
-        X_c, A_c, B_c, C_c, last_chunk_indices, initial_states, reset_mask
+        X_c,
+        A_c,
+        B_c,
+        C_c,
+        last_chunk_indices,
+        initial_states,
+        reset_mask,
+        strict_causal=strict_causal,
+        mimo_rank=mimo_rank,
     )
 
     assert y_hybrid.dtype == dtype
