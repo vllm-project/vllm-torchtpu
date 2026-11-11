@@ -42,6 +42,11 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
 from vllm_torchtpu.spec_decode.utils import fit_rows
 
 
+# The runner raises this to 1024 (one dynamic=False graph per bucket); these
+# tests also compile one graph per parametrized shape.
+torch._dynamo.config.recompile_limit = 64
+
+
 @pytest.fixture
 def device():
     """TPU when torch_tpu has one, else CPU (these tests also mean something
