@@ -271,7 +271,7 @@ class MMEncoderManager(EncoderCudaGraphManager):
             if step < len(batches):
                 assert mm_kwargs is not None
                 indices, _ = batches[step]
-                kwargs = self._select_items(mm_kwargs, indices)
+                kwargs, _ = self._select_items(mm_kwargs, indices)
                 output = self._run_budget_graph(
                     kwargs, budget, allow_eager_fallback=False
                 )

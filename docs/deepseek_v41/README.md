@@ -29,6 +29,7 @@ enum has no TPU fused-EP entry. Leave `--moe-backend=auto` for this model.
 | --- | --- | --- |
 | `deepseek_v41.execution` | `full`, `ced` | `full` |
 | `deepseek_v41.moe` | `gmm`, `fused_ep_w4a8` | `gmm` |
+| `deepseek_v41.expert_layout` | a shipped layout name, a path or a `gs://` URI | unset (the checkpoint's contiguous expert blocks) |
 | `engram_config.cpu_offload` | `false`, `true` | `false` (legacy TPU default) |
 
 `fused_ep_w4a8` explicitly selects FP4 weights with FP8 activations; selecting
@@ -38,6 +39,26 @@ height tuning. The old enable flags and deployment token threshold cannot
 silently move it to GMM. Unsupported weight/mesh/hardware contracts stop loading
 with an error; the generic `gmm` choice remains available. Other models retain
 their existing MoE admission behavior.
+
+`expert_layout` selects a static expert layout for the fused EP kernel
+(`src/vllm_torchtpu/expert_placement.py`): a JSON table naming, per MoE
+layer, which global experts each EP rank holds and in what slot order, with
+spare slots holding replicas of hot experts so that the slowest device of
+the lockstep step carries close to the mean device's rows. Every copy holds
+the same bytes and the kernel maps a token's selected experts to slots after
+top-k, so each token's output is bit-identical to the unplaced model; only
+where the matmuls run moves. It requires `moe=fused_ep_w4a8`, linear expert
+placement, no vLLM EPLB and no hierarchical EP; the layout's file digest
+enters the compile hash. Shipped layouts live under
+`src/vllm_torchtpu/expert_placements/` and are solved from a routing tap with
+`scripts/dsv41_bench/expert_layout/solve_layout.py` (DeepInfer's policy with
+a one-copy-per-rank constraint) and vetted with `check_layout.py`:
+`dsv41_flash_dp32_c768` (32 ranks x 13 slots, DSpark draft 5) for DP32 at
+24 requests per rank, `dsv41_flash_dp8_c384_r1` (49 slots) and
+`dsv41_flash_dp8_c384_perm` (48, a permutation) for the single-host
+qualification. `TPU_EXPERT_PLACEMENT=<name|path>` is the harness alias for a
+launcher whose `--additional-config` is fixed; it fills the field in when the
+policy left it out and conflicts with a policy that set a different one.
 
 `ced` deliberately approximates decoder SWA state and is not numerically
 equivalent to a full decoder pass for long prompts. It processes all encoder

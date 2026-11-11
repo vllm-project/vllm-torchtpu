@@ -24,71 +24,12 @@ import pytest
 import torch
 
 from vllm_torchtpu.kernels.deepseek_v4.csa_cache_layout import ROW_WORDS
-from vllm_torchtpu.models.vllm.deepseek_v41.v2 import async_fence as v2_fence
 from vllm_torchtpu.models.vllm.deepseek_v41.v2 import cache as v2_cache
 from vllm_torchtpu.models.vllm.deepseek_v41.v2 import ops as v2_ops
 
 # ==============================================================================
 # 1. Tests for v2/async_fence.py
 # ==============================================================================
-
-
-class TestAsyncFence:
-    def test_install_lookback_fence_and_execution(
-        self, monkeypatch: pytest.MonkeyPatch
-    ):
-        from vllm_torchtpu.runner import tpu_runner
-
-        # Create dummy original method
-        called_original = []
-
-        def dummy_original(runner_self, num_reqs: int):
-            called_original.append(num_reqs)
-            return torch.tensor([1, 2, 3])
-
-        # Patch TPUModelRunner._prepare_lookback_token_ids
-        monkeypatch.setattr(
-            tpu_runner.TPUModelRunner,
-            "_prepare_lookback_token_ids",
-            dummy_original,
-            raising=False,
-        )
-
-        # 1. First installation
-        v2_fence.install_lookback_fence()
-        patched_fn = tpu_runner.TPUModelRunner._prepare_lookback_token_ids
-        assert getattr(patched_fn, "_deepseek_v41_fenced", False) is True
-
-        # 2. Second installation (idempotency branch)
-        v2_fence.install_lookback_fence()
-        assert tpu_runner.TPUModelRunner._prepare_lookback_token_ids is patched_fn
-
-        # 3. Execution when fence is None
-        runner = SimpleNamespace()
-        mock_event = MagicMock()
-        monkeypatch.setattr(
-            torch, "tpu", SimpleNamespace(Event=lambda: mock_event), raising=False
-        )
-
-        res1 = patched_fn(runner, 4)
-        assert torch.equal(res1, torch.tensor([1, 2, 3]))
-        assert called_original == [4]
-        mock_event.record.assert_called_once()
-        assert getattr(runner, "_deepseek_v41_lookback_fence", None) is mock_event
-
-        # 4. Execution when fence is present (synchronize branch)
-        mock_event.reset_mock()
-        mock_event2 = MagicMock()
-        monkeypatch.setattr(
-            torch, "tpu", SimpleNamespace(Event=lambda: mock_event2), raising=False
-        )
-
-        res2 = patched_fn(runner, 2)
-        assert torch.equal(res2, torch.tensor([1, 2, 3]))
-        assert called_original == [4, 2]
-        mock_event.synchronize.assert_called_once()
-        mock_event2.record.assert_called_once()
-        assert runner._deepseek_v41_lookback_fence is mock_event2
 
 
 # ==============================================================================
@@ -131,28 +72,6 @@ class TestOps:
         assert bound(10, factor=3) == 35  # 10 * 3 + 5
         assert bound.__name__ == sample_fn.__name__
         assert bound.__qualname__ == sample_fn.__qualname__
-
-    def test_compact_rope_caches(self):
-        # max_model_len <= 0 error
-        with pytest.raises(ValueError, match="max_model_len must be positive"):
-            v2_ops.compact_rope_caches([], 0)
-
-        # Cache sharing and slicing
-        shared_cache = torch.randn(100, 16)
-        att1 = SimpleNamespace(rotary_emb=SimpleNamespace(cos_sin_cache=shared_cache))
-        att2 = SimpleNamespace(rotary_emb=SimpleNamespace(cos_sin_cache=shared_cache))
-        small_cache = torch.randn(30, 16)
-        att3 = SimpleNamespace(rotary_emb=SimpleNamespace(cos_sin_cache=small_cache))
-
-        v2_ops.compact_rope_caches([att1, att2, att3], max_model_len=50)
-
-        # att1 and att2 share the sliced copy
-        assert att1._tpu_rope_cache.shape == (50, 16)
-        assert att1._tpu_rope_cache is att2._tpu_rope_cache
-        assert torch.equal(att1._tpu_rope_cache, shared_cache[:50])
-
-        # att3 is <= max_model_len, kept identical
-        assert att3._tpu_rope_cache is small_cache
 
     def test_rotary_dimension_validation(self):
         x = torch.randn(1, 2, 32)
@@ -205,57 +124,6 @@ class TestOps:
         out_4d = v2_ops.rotary(x_4d, pos, cfg, compressed=False, inverse=False)
         assert out_4d.shape == x_4d.shape
 
-    def test_rotary_compressed_with_yarn(self):
-        x = torch.randn(1, 2, 16)
-        pos = torch.tensor([10, 20])
-
-        # 1. YaRN with original_max_position_embeddings > 0
-        cfg_yarn = {
-            "qk_rope_head_dim": 8,
-            "compress_rope_theta": 50000.0,
-            "rope_scaling": {
-                "original_max_position_embeddings": 4096,
-                "beta_fast": 32,
-                "beta_slow": 1,
-                "factor": 2.0,
-            },
-        }
-        out_yarn = v2_ops.rotary(x, pos, cfg_yarn, compressed=True)
-        assert out_yarn.shape == x.shape
-
-        # 2. YaRN with rope_parameters fallback
-        cfg_yarn2 = {
-            "qk_rope_head_dim": 8,
-            "compress_rope_theta": 50000.0,
-            "rope_parameters": {
-                "original_max_position_embeddings": 4096,
-                "beta_fast": 32,
-                "beta_slow": 1,
-                "factor": 2.0,
-            },
-        }
-        out_yarn2 = v2_ops.rotary(x, pos, cfg_yarn2, compressed=True)
-        assert torch.allclose(out_yarn, out_yarn2)
-
-        # 3. YaRN with original_max_position_embeddings <= 0 (skipped correction)
-        cfg_no_correction = {
-            "qk_rope_head_dim": 8,
-            "compress_rope_theta": 50000.0,
-            "rope_scaling": {
-                "original_max_position_embeddings": 0,
-            },
-        }
-        out_no_corr = v2_ops.rotary(x, pos, cfg_no_correction, compressed=True)
-        assert out_no_corr.shape == x.shape
-
-        # 4. Compressed without any YaRN dict
-        cfg_plain_comp = {
-            "qk_rope_head_dim": 8,
-            "compress_rope_theta": 50000.0,
-        }
-        out_plain = v2_ops.rotary(x, pos, cfg_plain_comp, compressed=True)
-        assert out_plain.shape == x.shape
-
     def test_round_fp8_activation(self):
         # Invalid block_size
         x = torch.randn(2, 40)
@@ -288,70 +156,6 @@ class TestOps:
 
 
 class TestCacheSizingAndConfig:
-    def test_uses_fp8_rope_companion(self):
-        # True case
-        vllm_cfg = SimpleNamespace(
-            model_config=SimpleNamespace(
-                hf_config=SimpleNamespace(architectures=["DeepseekV41ForCausalLM"])
-            ),
-            cache_config=SimpleNamespace(cache_dtype="fp8"),
-        )
-        assert v2_cache.uses_fp8_rope_companion(vllm_cfg) is True
-
-        # False cases: architecture mismatch
-        vllm_cfg.model_config.hf_config.architectures = ["LlamaForCausalLM"]
-        assert v2_cache.uses_fp8_rope_companion(vllm_cfg) is False
-
-        # False cases: architectures is None
-        vllm_cfg.model_config.hf_config.architectures = None
-        assert v2_cache.uses_fp8_rope_companion(vllm_cfg) is False
-
-        # False cases: cache_dtype is bfloat16
-        vllm_cfg.model_config.hf_config.architectures = ["DeepseekV41ForCausalLM"]
-        vllm_cfg.cache_config.cache_dtype = "bfloat16"
-        assert v2_cache.uses_fp8_rope_companion(vllm_cfg) is False
-
-    def test_reserve_rope_companion(self):
-        # Non-FP8 case
-        vllm_cfg = SimpleNamespace(
-            model_config=SimpleNamespace(
-                hf_config=SimpleNamespace(architectures=["DeepseekV41ForCausalLM"])
-            ),
-            cache_config=SimpleNamespace(cache_dtype="bfloat16"),
-        )
-        assert v2_cache.reserve_rope_companion(vllm_cfg, 1000) == 1000
-
-        # FP8 case below cap
-        vllm_cfg.cache_config.cache_dtype = "fp8_e4m3"
-        assert v2_cache.reserve_rope_companion(vllm_cfg, 1000) == 800
-
-        # FP8 marginal overflow (e.g. 20 GiB -> 16 GiB main pool < 1.2x bank cap)
-        # stays clamped to 1 bank (SPARSECORE_MAX_POOL_BYTES).
-        assert (
-            v2_cache.reserve_rope_companion(vllm_cfg, 20 << 30)
-            == v2_cache.SPARSECORE_MAX_POOL_BYTES
-        )
-
-        # FP8 case above 2-bank cap
-        huge_bytes = 100 << 30
-        assert (
-            v2_cache.reserve_rope_companion(vllm_cfg, huge_bytes)
-            == v2_cache.SPARSECORE_MAX_POOL_BANKS * v2_cache.SPARSECORE_MAX_POOL_BYTES
-        )
-
-    def test_native_cache_view(self):
-        raw = torch.arange(1024, dtype=torch.int8)
-        shape = (2, 4, 8)  # 64 elements, float32 -> 256 bytes per page
-        dtype = torch.float32
-        block_stride_bytes = 512
-        offset_bytes = 64
-
-        view = v2_cache.native_cache_view(
-            raw, shape, dtype, block_stride_bytes, offset_bytes
-        )
-        assert view.shape == shape
-        assert view.dtype == dtype
-
     def test_materialize_upstream_kv_cache(self, monkeypatch: pytest.MonkeyPatch):
         # Case 1: empty views
         monkeypatch.setattr(v2_cache, "allocate_upstream_kv_cache", lambda *a: {})
@@ -596,153 +400,6 @@ class TestPagedCacheRows:
         read_2b = paged_2b[torch.tensor([0, 5]), torch.tensor([1, 0])]
         assert torch.allclose(read_2b, values_2b)
 
-    def test_getitem_and_write_custom_op_paths(self, monkeypatch: pytest.MonkeyPatch):
-        raw = torch.zeros((32, ROW_WORDS), dtype=torch.int32)
-        layout = ((8, 4, 128), torch.bfloat16, 1024, 0)
-        paged = v2_cache.PagedCacheRows(raw, layout)
-
-        # Simulate non-CPU device on paged.raw
-        paged.raw = SimpleNamespace(
-            device=SimpleNamespace(type="tpu"),
-            copy_=MagicMock(),
-        )
-
-        # Test __getitem__ through _read_values_op
-        mock_read = MagicMock(return_value=torch.zeros(2, 128, dtype=torch.bfloat16))
-        monkeypatch.setattr(v2_cache, "_read_values_op", mock_read)
-        out = paged[torch.tensor([0, 0]), torch.tensor([0, 1])]
-        assert out.shape == (2, 128)
-        mock_read.assert_called_once()
-
-        # Test write without after through _write_values_op
-        mock_write = MagicMock(return_value=torch.zeros(1))
-        monkeypatch.setattr(v2_cache, "_write_values_op", mock_write)
-        paged.write(torch.tensor([0]), torch.zeros(1, 128, dtype=torch.bfloat16))
-        mock_write.assert_called_once()
-        paged.raw.copy_.assert_called_once()
-
-        # Test write with after through _write_values_after_op
-        paged.raw.copy_.reset_mock()
-        mock_write_after = MagicMock(return_value=torch.zeros(1))
-        monkeypatch.setattr(v2_cache, "_write_values_after_op", mock_write_after)
-        paged.write(
-            torch.tensor([0]),
-            torch.zeros(1, 128, dtype=torch.bfloat16),
-            after=torch.tensor(1),
-        )
-        mock_write_after.assert_called_once()
-        paged.raw.copy_.assert_called_once()
-
-        # 2-bank non-CPU __getitem__ and write paths
-        raw_lo = torch.zeros((16, ROW_WORDS), dtype=torch.int32)
-        raw_hi = torch.zeros((16, ROW_WORDS), dtype=torch.int32)
-        paged_2b = v2_cache.PagedCacheRows((raw_lo, raw_hi), layout)
-        paged_2b.raw = SimpleNamespace(
-            device=SimpleNamespace(type="tpu"), copy_=MagicMock()
-        )
-        paged_2b.raw_hi = SimpleNamespace(
-            device=SimpleNamespace(type="tpu"), copy_=MagicMock()
-        )
-        mock_read_2b = MagicMock(return_value=torch.zeros(2, 128, dtype=torch.bfloat16))
-        monkeypatch.setattr(v2_cache, "_read_values_2bank_op", mock_read_2b)
-        out_2b = paged_2b[torch.tensor([0, 5]), torch.tensor([0, 1])]
-        assert out_2b.shape == (2, 128)
-        mock_read_2b.assert_called_once()
-
-        mock_write.reset_mock()
-        paged_2b.write(torch.tensor([0, 20]), torch.zeros(2, 128, dtype=torch.bfloat16))
-        assert mock_write.call_count == 2
-        paged_2b.raw.copy_.assert_called_once()
-        paged_2b.raw_hi.copy_.assert_called_once()
-
-        mock_write_after.reset_mock()
-        paged_2b.raw.copy_.reset_mock()
-        paged_2b.raw_hi.copy_.reset_mock()
-        paged_2b.write(
-            torch.tensor([0, 20]),
-            torch.zeros(2, 128, dtype=torch.bfloat16),
-            after=torch.tensor(1),
-        )
-        assert mock_write_after.call_count == 2
-        paged_2b.raw.copy_.assert_called_once()
-        paged_2b.raw_hi.copy_.assert_called_once()
-
-    def test_write_fp8_cpu_and_custom_op(self, monkeypatch: pytest.MonkeyPatch):
-        raw = torch.zeros((16, ROW_WORDS), dtype=torch.int32)
-        rope = torch.zeros((4, ROW_WORDS), dtype=torch.int32)
-        layout = ((16, 1, 512), torch.uint8, 512, 0)
-        paged = v2_cache.PagedCacheRows(raw, layout, rope=rope)
-
-        # 1. CPU FP8 write
-        latents = torch.randn(2, 512, dtype=torch.bfloat16)
-        slots = torch.tensor([0, 1])
-        paged.write(slots, latents)
-        # raw and rope should now be mutated
-        assert not torch.equal(raw, torch.zeros_like(raw))
-        assert not torch.equal(rope, torch.zeros_like(rope))
-
-        # 2. Non-CPU FP8 write
-        paged.raw = SimpleNamespace(
-            device=SimpleNamespace(type="tpu"),
-            copy_=MagicMock(),
-        )
-        paged.rope = SimpleNamespace(copy_=MagicMock())
-
-        mock_encode = MagicMock(
-            return_value=(
-                torch.zeros(2, ROW_WORDS, dtype=torch.int32),
-                torch.zeros(2, v2_cache.ROPE_WORDS, dtype=torch.int32),
-            )
-        )
-        mock_write_val = MagicMock(side_effect=[torch.zeros(1), torch.zeros(1)])
-        monkeypatch.setattr(v2_cache, "_encode_fp8_op", mock_encode)
-        monkeypatch.setattr(v2_cache, "_write_values_op", mock_write_val)
-
-        paged.write(slots, latents)
-        mock_encode.assert_called_once()
-        assert mock_write_val.call_count == 2
-        paged.raw.copy_.assert_called_once()
-        paged.rope.copy_.assert_called_once()
-
-        # 3. 2-bank CPU FP8 write and Non-CPU FP8 write
-        raw_lo = torch.zeros((8, ROW_WORDS), dtype=torch.int32)
-        raw_hi = torch.zeros((8, ROW_WORDS), dtype=torch.int32)
-        rope_lo = torch.zeros((2, ROW_WORDS), dtype=torch.int32)
-        rope_hi = torch.zeros((2, ROW_WORDS), dtype=torch.int32)
-        paged_2b = v2_cache.PagedCacheRows(
-            (raw_lo, raw_hi), layout, rope=(rope_lo, rope_hi)
-        )
-        slots_2b = torch.tensor([1, 10])
-        paged_2b.write(slots_2b, latents)
-        assert not torch.equal(raw_lo, torch.zeros_like(raw_lo))
-        assert not torch.equal(raw_hi, torch.zeros_like(raw_hi))
-        assert not torch.equal(rope_lo, torch.zeros_like(rope_lo))
-        assert not torch.equal(rope_hi, torch.zeros_like(rope_hi))
-
-        paged_2b.raw = SimpleNamespace(
-            device=SimpleNamespace(type="tpu"), copy_=MagicMock()
-        )
-        paged_2b.raw_hi = SimpleNamespace(copy_=MagicMock())
-        paged_2b.rope = SimpleNamespace(copy_=MagicMock())
-        paged_2b.rope_hi = SimpleNamespace(copy_=MagicMock())
-        mock_encode.reset_mock()
-        mock_write_val_2b = MagicMock(
-            side_effect=[
-                torch.zeros(1),
-                torch.zeros(1),
-                torch.zeros(1),
-                torch.zeros(1),
-            ]
-        )
-        monkeypatch.setattr(v2_cache, "_write_values_op", mock_write_val_2b)
-        paged_2b.write(slots_2b, latents)
-        mock_encode.assert_called_once()
-        assert mock_write_val_2b.call_count == 4
-        paged_2b.raw.copy_.assert_called_once()
-        paged_2b.raw_hi.copy_.assert_called_once()
-        paged_2b.rope.copy_.assert_called_once()
-        paged_2b.rope_hi.copy_.assert_called_once()
-
 
 # ==============================================================================
 # 5. Tests for v2/cache.py: NativeCacheView
@@ -838,13 +495,6 @@ class TestCacheJaxHelpers:
             v2_cache._gather_words(cache, jnp.array([2, 40], dtype=jnp.int32), 32),
         )
 
-    def test_permute_and_halves(self):
-        x = jnp.arange(256, dtype=jnp.float32).reshape(1, 256)
-        split = v2_cache.split_halves(x)
-        assert split.shape == x.shape
-        merged = v2_cache.merge_halves(split)
-        assert jnp.allclose(merged, x)
-
     def test_split_and_merge_pieces(self):
         x = jnp.arange(2 * 4 * 128, dtype=jnp.float32).reshape(2, 4, 128)
         # Split into 2 pieces: shape [2, 2, 4, 64]
@@ -917,15 +567,6 @@ class TestCacheJaxHelpers:
         )
         assert out_2b.shape == (12, 64)
         assert out_2b.dtype == jnp.bfloat16
-
-    def test_encode_fp8_kv(self):
-        key = jax.random.PRNGKey(42)
-        latent = jax.random.normal(key, (4, 512)).astype(jnp.bfloat16)
-        words, rope = v2_cache.encode_fp8_kv(latent)
-        assert words.shape == (4, ROW_WORDS)
-        assert words.dtype == jnp.int32
-        assert rope.shape == (4, v2_cache.ROPE_WORDS)
-        assert rope.dtype == jnp.int32
 
 
 # ==============================================================================

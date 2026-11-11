@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Publish audited DP8 throughput to the step's native GitHub check."""
+"""Publish audited DSV4.1 throughput to the step's native GitHub check."""
 
 import json
 import math
@@ -26,6 +26,16 @@ def render_summary(root: Path, commit: str) -> str:
         for i in range(1, rounds + 1)
     ]
     scenario = fixed["scenario"]
+    if scenario["dp_size"] == 16:
+        audit = json.loads((root / "multihost-audit.json").read_text())
+        if (
+            not audit["completed"]
+            or audit["commit"] != commit
+            or audit["rounds"] != rounds
+            or audit["ranks"] != list(range(16))
+            or len(set(audit["hosts"])) != 2
+        ):
+            raise ValueError("DP16 requires a complete two-host audit")
     if any(r["warmup"] or r["scenario"] != scenario for r in reports):
         raise ValueError("Expected formal rounds from one benchmark scenario")
     if scenario["name"] == "decode":

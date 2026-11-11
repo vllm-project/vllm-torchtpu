@@ -11,6 +11,9 @@ from vllm.v1.worker.utils import allocate_kv_cache as allocate_upstream_kv_cache
 from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v4.csa_cache_layout import ROW_WORDS
 from vllm_torchtpu.kernels.deepseek_v41 import index_key_layout
+from vllm_torchtpu.kernels.deepseek_v41.tile_scatter import tile_scatter
+
+from .swa_cache import DeepseekV41SWASpec, swa_pool_bytes
 
 ROW_BYTES = ROW_WORDS * 4
 # DSV4 FP8 NoPE record: 448 e4m3 values, then one e8m0 scale per lane of a
@@ -94,6 +97,109 @@ def native_cache_view(raw, shape, dtype, block_stride_bytes, offset_bytes):
     return pages[:, page_offset : page_offset + page_bytes].view(dtype).reshape(shape)
 
 
+def _materialize_native_swa(
+    config, device, views, swa_specs, csa2_layers
+) -> MaterializedNativeKVCache:
+    """Give each SWA layer its private-pool owner; other regions keep word rows.
+
+    SWA block IDs index the layer's `pool_capacity` BF16 pages directly. All
+    other layers share one int32 word-row owner per allocator region.
+    """
+    from vllm_torchtpu.kv_cache_materializer import layer_to_pool_index
+
+    fp8_layers = {
+        name
+        for name, view in views.items()
+        if view.dtype == torch.uint8 and view.shape[-1] == ROW_BYTES
+    }
+    if csa2_layers.intersection(views) != fp8_layers:
+        raise ValueError("Native SWA allocation requires CSA2 for all FP8 consumers")
+    swa_layers = set(swa_specs)
+    regions = layer_to_pool_index(config)
+    groups: dict[tuple, list[str]] = {}
+    for name, view in views.items():
+        if view.ndim != 4 or view.shape[1] != 1 or view.shape[0] != config.num_blocks:
+            raise ValueError("Native cache requires [blocks,1,page_size,features]")
+        geometry = tuple(view.shape[2:]) if name in swa_layers else None
+        groups.setdefault(
+            (name if name in swa_layers else regions[name], geometry), []
+        ).append(name)
+    result = MaterializedNativeKVCache({}, [])
+    for (_, geometry), names in groups.items():
+        page_bytes = max(
+            views[name][0].numel() * views[name].element_size() for name in names
+        )
+        if geometry is not None:
+            if geometry[-1] != 512 or any(
+                views[name].dtype != torch.bfloat16 for name in names
+            ):
+                raise ValueError("Native SWA requires BF16 [pages,page_size,512]")
+        elif page_bytes % ROW_BYTES:
+            raise ValueError("Native word pool pages must align to 512 bytes")
+        num_blocks = (
+            swa_specs[names[0]].pool_capacity
+            if geometry is not None
+            else config.num_blocks
+        )
+        blocks_per_bank = SPARSECORE_MAX_POOL_BYTES // page_bytes
+        if blocks_per_bank < 1 or num_blocks > 2 * blocks_per_bank:
+            raise ValueError("Native cache exceeds the two-bank addressing limit")
+        counts = [min(num_blocks, blocks_per_bank)]
+        if num_blocks > blocks_per_bank:
+            counts.append(num_blocks - blocks_per_bank)
+        banks = [
+            torch.zeros(
+                (count, *geometry)
+                if geometry is not None
+                else (count * page_bytes // ROW_BYTES, ROW_WORDS),
+                dtype=torch.bfloat16 if geometry is not None else torch.int32,
+                device=device,
+            )
+            for count in counts
+        ]
+        owner = banks[0] if len(banks) == 1 else (banks[0], banks[1])
+        result.raw_tensors.extend(banks)
+        scale = None
+        if fp8_layers.intersection(names):
+            scales = [
+                torch.zeros(bank.shape[0], dtype=torch.float32, device=device)
+                for bank in banks
+            ]
+            scale = scales[0] if len(scales) == 1 else (scales[0], scales[1])
+            result.raw_tensors.extend(scales)
+        for name in names:
+            view = views[name]
+            shape = (num_blocks, *view.shape[2:])
+            result.native_raw_cache[name] = owner
+            result.native_cache_layouts[name] = (shape, view.dtype, page_bytes, 0)
+            if geometry is not None:
+                cache = banks[0][:1, None] if len(banks) == 2 else banks[0][:, None]
+            else:
+                cache = native_cache_view(
+                    banks[0].view(torch.int8).flatten(),
+                    (1 if len(banks) == 2 else view.shape[0], *view.shape[1:]),
+                    view.dtype,
+                    page_bytes,
+                    0,
+                )
+            result.kv_caches[name] = cache.expand((num_blocks, *view.shape[1:]))
+            if name in fp8_layers:
+                assert scale is not None
+                result.scale_pools[name] = scale
+    # Scales use the existing companion reservation. Word owners fit the
+    # scheduler's allocation; SWA owners fit the worker's pool reservation.
+    owners = {
+        id(bank): bank
+        for raw in result.native_raw_cache.values()
+        for bank in (raw if isinstance(raw, tuple) else (raw,))
+    }
+    budget = max(tensor.size for tensor in config.kv_cache_tensors)
+    budget += swa_pool_bytes(swa_specs)
+    if sum(bank.nbytes for bank in owners.values()) > budget:
+        raise ValueError("Native cache owners exceed the KV and SWA pool budget")
+    return result
+
+
 def materialize_upstream_kv_cache(
     kv_cache_config,
     device,
@@ -109,6 +215,16 @@ def materialize_upstream_kv_cache(
     views = allocate_upstream_kv_cache(kv_cache_config, torch.device("meta"), layout)
     if not views:
         return MaterializedNativeKVCache({}, [])
+    swa_specs = {
+        name: group.kv_cache_spec
+        for group in kv_cache_config.kv_cache_groups
+        if isinstance(group.kv_cache_spec, DeepseekV41SWASpec)
+        for name in group.layer_names
+    }
+    if swa_specs:
+        return _materialize_native_swa(
+            kv_cache_config, device, views, swa_specs, csa2_layers
+        )
     sizes = {tensor.size for tensor in kv_cache_config.kv_cache_tensors}
     assert len(sizes) == 1
     backing_bytes = sizes.pop()
@@ -206,7 +322,13 @@ def materialize_upstream_kv_cache(
             )
     # FP8 NoPE layers (uint8 records) keep RoPE in a companion with one
     # 32-word slot per pool row, budgeted by `reserve_rope_companion`.
-    fp8_layers = [name for name, view in views.items() if view.dtype == torch.uint8]
+    # Main KV uses 512-byte records. The indexer has its own 132-byte FP8
+    # record (including scale), so it must not receive a RoPE companion.
+    fp8_layers = [
+        name
+        for name, view in views.items()
+        if view.dtype == torch.uint8 and view.shape[-1] == ROW_BYTES
+    ]
     rope_pools: dict[str, RawCachePool] = {}
     scale_pools: dict[str, RawCachePool] = {}
     # Follow the attention modules' resolved mode, not the global preference:
@@ -284,6 +406,7 @@ _read_values_2bank_op = None
 _read_index_values_op = None
 _read_index_values_2bank_op = None
 _write_op = None
+_write_tiles_op = None
 _write_values_op = None
 _write_values_after_op = None
 _encode_fp8_op = None
@@ -298,9 +421,8 @@ class _CacheBinding(Protocol):
 class PagedCacheRows:
     """Map upstream pages to physical record indices, as in DSV4.
 
-    The shared owner stays in DSV4's native int32[..., 128] layout. Only
-    gathered records are reinterpreted. Byte geometry is converted once to
-    record units, before any device arithmetic or int32 index conversion.
+    CSA2 SWA owners are BF16 pages; other owners use int32[..., 128] rows.
+    Byte geometry is converted once to record units before device arithmetic.
     """
 
     def __init__(
@@ -309,10 +431,8 @@ class PagedCacheRows:
         layout,
         rope=None,
         scale=None,
-        swa_words=False,
     ):
         self.scale, self.scale_hi = scale if isinstance(scale, tuple) else (scale, None)
-        self.swa_words = swa_words
         if isinstance(raw, tuple):
             if len(raw) != 2:
                 raise ValueError("Split native cache requires exactly two banks")
@@ -328,7 +448,21 @@ class PagedCacheRows:
         self.shape, self.dtype, stride_bytes, offset_bytes = layout
         self.row_bytes = math.prod(self.shape[2:]) * self.dtype.itemsize
         banks = (self.raw,) if self.raw_hi is None else (self.raw, self.raw_hi)
-        if any(
+        self.native_swa = self.raw.dtype == torch.bfloat16
+        if self.native_swa:
+            if (
+                self.dtype != torch.bfloat16
+                or self.shape[2:] != (512,)
+                or stride_bytes != self.shape[1] * self.row_bytes
+                or offset_bytes != 0
+                or sum(bank.shape[0] for bank in banks) != self.shape[0]
+                or any(
+                    bank.dtype != torch.bfloat16 or bank.shape[1:] != self.shape[1:]
+                    for bank in banks
+                )
+            ):
+                raise ValueError("Native SWA owners require compact BF16 pages")
+        elif any(
             bank.dtype != torch.int32 or bank.ndim != 2 or bank.shape[1] != ROW_WORDS
             for bank in banks
         ):
@@ -369,6 +503,8 @@ class PagedCacheRows:
         total_bytes = self.raw.nbytes + (
             0 if self.raw_hi is None else self.raw_hi.nbytes
         )
+        if self.native_swa:
+            self.total_rows = total_bytes // self.row_bytes
         if (
             max(self.total_rows, total_bytes // self.row_bytes)
             > torch.iinfo(torch.int32).max
@@ -388,14 +524,6 @@ class PagedCacheRows:
                 for b, s in zip(banks, scale_banks)
             ):
                 raise ValueError("CSA2 scales must match each physical main owner")
-        if self.swa_words and (
-            self.dtype != torch.bfloat16
-            or self.row_bytes != 1024
-            or self.row_offset % self.shape[1]
-            or self.page_stride % self.shape[1]
-            or any(bank.shape[0] % (2 * self.shape[1]) for bank in banks)
-        ):
-            raise ValueError("CSA2 SWA owners must preserve whole plane-major pages")
 
     def numel(self):
         return math.prod(self.shape)
@@ -413,6 +541,8 @@ class PagedCacheRows:
         Page ``p`` is raw rows ``[p * shape[1], (p + 1) * shape[1])``, and its
         RoPE companion rows ``[p * shape[1] / 4, ...)``.
         """
+        if self.native_swa:
+            return block_table
         rows = self.shape[1]
         if (
             rows % 4
@@ -435,6 +565,17 @@ class PagedCacheRows:
     def __getitem__(self, indices):
         blocks, rows = indices
         records = self.row_indices(blocks * self.shape[1] + rows)
+        if self.native_swa:
+            low = self.raw.flatten(0, 1)
+            if self.raw_hi is None:
+                return low[records.long()]
+            high = self.raw_hi.flatten(0, 1)
+            in_high = records >= self.bank_records
+            return torch.where(
+                in_high[..., None],
+                high[(records - self.bank_records).masked_fill(~in_high, 0).long()],
+                low[records.masked_fill(in_high, 0).long()],
+            )
         if self.raw.device.type == "cpu":
             pool = self.raw.view(torch.int8).reshape(-1, self.row_bytes)
             if self.raw_hi is None:
@@ -477,7 +618,7 @@ class PagedCacheRows:
     def write(self, slots, values, after=None):
         """``after`` (optional) must be computed before the in-place write."""
         records = self.row_indices(slots.clamp(min=0)).masked_fill(slots < 0, -1)
-        if self.swa_words:
+        if self.native_swa:
             if after is not None:
                 raise NotImplementedError(
                     "CSA2 SWA publication does not accept deferred-write dependencies"
@@ -532,10 +673,9 @@ class PagedCacheRows:
     def _write_fp8(self, records, values):
         """Quantize BF16 latents into NoPE rows and their RoPE companion slots."""
         if self.scale is not None:
-            from .csa2_adapter import publish_main
-
-            publish_main(self, records, values.to(torch.bfloat16).reshape(-1, 512))
-            return
+            raise NotImplementedError(
+                "CSA2 main records are published only by the fused compressor"
+            )
         assert self.rope is not None
         if self.raw.device.type == "cpu":
             import numpy as np
@@ -696,7 +836,6 @@ class NativeCacheView:
                 self._tpu_cache_layout,
                 getattr(self, "_tpu_rope_pool", None),
                 getattr(self, "_tpu_scale_pool", None),
-                getattr(self, "_tpu_swa_words", False),
             )
         return self._bound_cache
 
@@ -733,6 +872,10 @@ def _scatter_rows(cache: jax.Array, slots: jax.Array, values: jax.Array) -> jax.
     rows = cache.reshape((-1, *values.shape[1:]))
     slots = jnp.where(slots >= 0, slots, rows.shape[0])
     return rows.at[slots].set(values, mode="drop").reshape(cache.shape)
+
+
+def _has_hi_bank(cache) -> bool:
+    return "raw_hi" in getattr(cache, "__dict__", {}) and cache.raw_hi is not None
 
 
 def _cache_num_rows(cache: jax.Array | tuple[jax.Array, jax.Array]) -> int:
@@ -913,9 +1056,17 @@ def gather_cache_pieces(
     rows = (records[None] + jnp.arange(chunks, dtype=records.dtype)[:, None]).reshape(
         -1
     )
-    even, odd = _split_words(
-        _gather_raw_rows(cache, rows).reshape(chunks, records.size, ROW_WORDS)
-    )
+    words = _gather_raw_rows(cache, rows).reshape(chunks, records.size, ROW_WORDS)
+    from vllm_torchtpu.kernels.experimental import decode_preparation as prep
+
+    if prep.admit(
+        "cache_unpack",
+        None if chunks == 2 else f"{chunks} word rows per record, kernel 2",
+        tokens=records.size,
+        buckets=prep.CACHE_UNPACK_RECORDS,
+    ):
+        return prep.unpack_cache_words(words)
+    even, odd = _split_words(words)
     return jnp.stack([even, odd], axis=1).reshape(2 * chunks, records.size, ROW_WORDS)
 
 
@@ -1078,6 +1229,7 @@ def initialize_cache_ops():
 
     initialize_csa2_ops()
     global _read_values_op, _read_values_2bank_op, _write_op, _write_values_op
+    global _write_tiles_op
     global _encode_fp8_op, _write_values_after_op
     global _write_index_values_op, _write_index_values_after_op
     global _read_index_values_op, _read_index_values_2bank_op
@@ -1184,6 +1336,20 @@ def initialize_cache_ops():
     )
     _write_op.register_fake(lambda cache, slots, values: torch.empty_like(cache))
     mesh = get_vllm_model_wrapper_context().mesh
+    _write_tiles_op = pallas.jax_op(
+        "pallas::dsv41v2_cache_write_tiles",
+        jax.shard_map(
+            tile_scatter,
+            mesh=mesh,
+            in_specs=(P(), P(), P()),
+            out_specs=P(),
+            check_vma=False,
+        ),
+        donate_argnums=(0,),
+        mesh=get_pallas_op_mesh(),
+        input_partition_specs=cast(tuple[tuple[str, ...], ...], (P(), P(), P())),
+    )
+    _write_tiles_op.register_fake(lambda cache, slots, values: torch.empty_like(cache))
     # Pallas DMA runs independently on each device's replicated cache.
     # Mosaic calls require explicit manual partitioning on a multi-device mesh.
     write_values = jax.shard_map(
@@ -1300,6 +1466,14 @@ def write_cache(cache, slots, values, valid, after=None):
         cache.copy_(_write_op(cache, slots.int(), values))
 
 
+def write_cache_slots(cache, slots, values):
+    """`write_cache` for int32 ``slots`` already holding -1 where invalid."""
+    assert slots.dtype == torch.int32 and cache.device.type != "cpu"
+    assert _write_op is not None and _write_tiles_op is not None
+    op = _write_tiles_op if envs.TPU_DEEPSEEK_V41_ENGRAM_TILE_SCATTER else _write_op
+    cache.copy_(op(cache, slots, values))
+
+
 def merge_sub_rows(
     cache: jax.Array, records: jax.Array, values: jax.Array
 ) -> tuple[jax.Array, jax.Array]:
@@ -1356,6 +1530,18 @@ def _pack_bf16_words(values: jax.Array) -> jax.Array:
     )
 
 
+def _sparse_core_rows() -> bool:
+    """Whole-row TPU writes run on SparseCore when the chip has one."""
+    from jax.experimental.pallas import tpu as pltpu
+
+    # Check the device, not only the backend name: host-traced TPU branches
+    # have no TPU device kind to query.
+    return (
+        jax.devices()[0].platform == "tpu"
+        and pltpu.get_tpu_info().sparse_core is not None
+    )
+
+
 def scatter_cache_values(
     cache: jax.Array,
     records: jax.Array,
@@ -1363,9 +1549,10 @@ def scatter_cache_values(
 ) -> jax.Array:
     """Write unique physical records, preserving the shared owner and padding.
 
-    Full word rows use DSV4-style aliased DMA. Sub-row writes use independent
-    (row, lane) coordinates, so two records sharing a row cannot overwrite
-    each other through concurrent read/modify/write of the entire word row.
+    Full word rows use aliased row DMAs, on SparseCore when available, else a
+    TensorCore kernel. Sub-row writes use independent (row, lane) coordinates,
+    so two records sharing a row cannot overwrite each other through
+    concurrent read/modify/write of the entire word row.
     """
     import jax.numpy as jnp
 
@@ -1429,6 +1616,17 @@ def scatter_cache_values(
     from jax.experimental.pallas import tpu as pltpu
 
     chunks = width // ROW_WORDS
+    if _sparse_core_rows():
+        from vllm_torchtpu.kernels.deepseek_v41.cache_write import write_cache_rows
+
+        # Record r owns word rows [r * chunks, (r + 1) * chunks).
+        valid = (records >= 0) & (records < cache.shape[0] // chunks)
+        rows = jnp.where(
+            valid[:, None],
+            records[:, None] * chunks + jnp.arange(chunks, dtype=jnp.int32),
+            -1,
+        )
+        return write_cache_rows(cache, rows.reshape(-1), words.reshape(-1, ROW_WORDS))
     # Records per grid step whose row DMAs are in flight together. A serial
     # start/wait per 512 B row is DMA-latency bound.
     block = 64

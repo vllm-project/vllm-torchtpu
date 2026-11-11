@@ -46,19 +46,24 @@
 # ─────
 # * The build step tags the image with $BUILDKITE_COMMIT and every TPU step
 #   pulls that exact tag, so all steps must depend_on `build_docker`.
-# * run_in_docker.sh runs your command inside the image at
-#   /root/torchtpu-vllm — that is a COPY of the repo at this commit, not the
+# * .buildkite/kubernetes/run.sh runs your command in a pod from that image, at
+#   /workspace/vllm-torchtpu — a COPY of the repo at this commit, not the
 #   agent's checkout. Reference paths like `examples/...` / `tests/...`
 #   relative to the repo root.
-# * Anything written to /perf_eval_results inside the container is copied back
-#   out and uploaded as a Buildkite artifact.
+# * SHAPE picks the slice: tpu7x-standard-1t/1x1x1 (1 chip) or
+#   tpu7x-standard-4t/2x2x1 (4 chips). Multi-host slices go through
+#   .buildkite/kubernetes/run_multihost.sh instead.
+# * Set ARTIFACTS_DIR (e.g. perf_eval_results) and write under it; everything
+#   there is uploaded as the step's artifacts.
 
 steps:
 
   # -----------------------------------------------------------------
   # Build step (required by every demo below)
   # Builds docker/Dockerfile --target dev and pushes it tagged with this
-  # commit. Same script the CI pipeline_build.yml uses.
+  # commit. Same script the CI pipeline_build.yml uses. A commit whose image
+  # is already in the registry reuses it (CI_IMAGE_REBUILD=1 builds anyway),
+  # and a build that sets CI_IMAGE=<image> uses that image as it is.
   # -----------------------------------------------------------------
   - label: ":docker: Build and Push Dev Image"
     key: build_docker
@@ -66,6 +71,14 @@ steps:
       queue: cpu_64_core
     commands:
       - bash .buildkite/scripts/setup_docker_env.sh
+    # The torch-tpu virtual registry sometimes 404s a wheel it serves moments
+    # later, and a build that fails that way passes on a later try. Twice
+    # rather than pipeline_build.yml's once: a failed image build here fails
+    # the whole run.
+    retry: &image_build_retry
+      automatic:
+        - exit_status: 1
+          limit: 2
 
   # -----------------------------------------------------------------
   # Demo 1: offline_inference.py
@@ -76,13 +89,18 @@ steps:
     key: demo_offline_inference
     depends_on: build_docker
     agents:
-      queue: tpu_v7x_2_queue
+      queue: "kube"
+    plugins:
+      - kubernetes:
+          podTemplate: tpu-launcher
+    env:
+      SHAPE: "tpu7x-standard-1t/1x1x1"
     commands:
       - |
         # Customize --model / --max-model-len / --max-tokens as needed.
-        # Add --tensor_parallel_size=N for TP/EP runs, and move the step to
-        # tpu_v7x_8_queue / tpu_v7x_16_queue when it needs more than 2 chips.
-        .buildkite/scripts/run_in_docker.sh bash -c '
+        # Add --tensor_parallel_size=N for TP/EP runs, and set SHAPE to
+        # tpu7x-standard-4t/2x2x1 when it needs more than one chip.
+        .buildkite/kubernetes/run.sh bash -c '
           python3 examples/offline_inference.py \
             --model Qwen/Qwen3-0.6B \
             --max-model-len 256 \
@@ -98,12 +116,17 @@ steps:
     key: demo_pytest
     depends_on: build_docker
     agents:
-      queue: tpu_v7x_2_queue
+      queue: "kube"
+    plugins:
+      - kubernetes:
+          podTemplate: tpu-launcher
+    env:
+      SHAPE: "tpu7x-standard-1t/1x1x1"
     commands:
       - |
         # Swap in your own file / -k selector. `-m 'not nightly'` mirrors what
         # CI runs on PRs; drop it to include nightly-marked tests.
-        .buildkite/scripts/run_in_docker.sh bash -c '
+        .buildkite/kubernetes/run.sh bash -c '
           pytest -sv --timeout=600 -m "not nightly" \
             tests/runner/test_tpu_runner.py'
 
@@ -118,10 +141,15 @@ steps:
     key: demo_stress
     depends_on: build_docker
     agents:
-      queue: tpu_v7x_2_queue
+      queue: "kube"
+    plugins:
+      - kubernetes:
+          podTemplate: tpu-launcher
+    env:
+      SHAPE: "tpu7x-standard-1t/1x1x1"
     matrix: ["1", "2", "3", "4", "5"]
     commands:
       - |
-        .buildkite/scripts/run_in_docker.sh bash -c '
+        .buildkite/kubernetes/run.sh bash -c '
           pytest -sv --timeout=600 -m "not nightly" \
             tests/runner/test_tpu_runner.py'

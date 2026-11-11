@@ -1571,23 +1571,31 @@ def _patch_vllm_same_step_prefix_hits() -> None:
     unwritten and attends over stale KV. Identical prompts admitted together
     (n > 1 sampling, a repeated prompt) then decode garbage.
 
-    Blocks hashed during the current `schedule()` therefore count as misses,
-    and a request that would have hit one recomputes that prefix itself.
-    From the next `schedule()` on they hit normally: the worker runs the
-    steps' forwards in order, so the step that fills a block has run before
-    any later step reads it, with or without async scheduling.
+    Blocks hashed during the current step therefore count as misses, and a
+    request that would have hit one recomputes that prefix itself. From the
+    next step on they hit normally: the worker runs the steps' forwards in
+    order, so the step that fills a block has run before any later step reads
+    it, with or without async scheduling. That relies on blocks being hashed
+    only in the step whose forward fills them, which is what `allocate_slots`
+    does: it caches up to the tokens computed so far plus this step's new
+    tokens, never caches lookahead slots, and defers anything filled later
+    under `delay_cache_blocks`.
+
+    The set is cleared at `KVCacheManager.new_step_starts`, which
+    `Scheduler.schedule` calls once per step before any lookup or allocation,
+    and which an engine driving `KVCacheManager` directly calls each step too.
     """
     import functools
 
     from vllm.v1.core.block_pool import BlockPool
-    from vllm.v1.core.sched.scheduler import Scheduler
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
 
     if getattr(BlockPool.get_cached_block, "_tpu_same_step_prefix_hit_patch", False):
         return
 
     original_insert_block_hash = BlockPool._insert_block_hash
     original_get_cached_block = BlockPool.get_cached_block
-    original_schedule = Scheduler.schedule
+    original_new_step_starts = KVCacheManager.new_step_starts
 
     def unwritten_block_ids(pool) -> set[int]:
         return pool.__dict__.setdefault("_tpu_unwritten_block_ids", set())
@@ -1611,20 +1619,58 @@ def _patch_vllm_same_step_prefix_hits() -> None:
             return None
         return blocks
 
-    @functools.wraps(original_schedule)
-    def schedule(self, *args, **kwargs):
-        unwritten_block_ids(self.kv_cache_manager.block_pool).clear()
-        return original_schedule(self, *args, **kwargs)
+    @functools.wraps(original_new_step_starts)
+    def new_step_starts(self, *args, **kwargs):
+        unwritten_block_ids(self.block_pool).clear()
+        return original_new_step_starts(self, *args, **kwargs)
 
-    for wrapper in (_insert_block_hash, get_cached_block, schedule):
+    for wrapper in (_insert_block_hash, get_cached_block, new_step_starts):
         wrapper._tpu_same_step_prefix_hit_patch = True
     BlockPool._insert_block_hash = _insert_block_hash
     BlockPool.get_cached_block = get_cached_block
-    Scheduler.schedule = schedule
+    KVCacheManager.new_step_starts = new_step_starts
     logger.info(
         "Applied TPU patch: no prefix-cache hits on blocks the "
         "current step has not written."
     )
+
+
+def _patch_vllm_merge_dsv41_swa_groups() -> None:
+    """Give identical DeepSeek-V4.1 SWA layers one KV cache group.
+
+    Upstream grouping assumes every group draws from one shared page pool and
+    so leaves each SWA layer in its own group. The scheduler then walks every
+    SWA manager for every request on every step, although the private pools
+    make those managers issue the same ids. See `swa_cache.merge_swa_groups`.
+    """
+    import functools
+    import sys
+
+    from vllm.v1.core import kv_cache_utils
+
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2.swa_cache import (
+        merge_swa_groups,
+    )
+
+    patched = kv_cache_utils.get_kv_cache_configs
+    if not getattr(patched, "_tpu_merge_swa_groups_patch", False):
+        original = patched
+
+        @functools.wraps(original)
+        def patched(vllm_config, kv_cache_specs, available_memory):
+            configs = original(vllm_config, kv_cache_specs, available_memory)
+            return [merge_swa_groups(config) for config in configs]
+
+        # pyrefly: ignore[missing-attribute]
+        patched._tpu_merge_swa_groups_patch = True
+        kv_cache_utils.get_kv_cache_configs = patched
+        logger.info("Applied TPU patch: one KV cache group per DeepSeek-V4.1 SWA spec.")
+    # EngineCore imports the function directly and may be imported after the
+    # first application, so rebind it on every refresh.
+    core = sys.modules.get("vllm.v1.engine.core")
+    if core is not None and hasattr(core, "get_kv_cache_configs"):
+        # pyrefly: ignore[missing-attribute]
+        core.get_kv_cache_configs = patched
 
 
 def _patch_vllm_vocab_parallel_embedding() -> None:

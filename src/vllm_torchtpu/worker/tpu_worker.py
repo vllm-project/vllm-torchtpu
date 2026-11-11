@@ -31,7 +31,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 import vllm_torchtpu.distributed.utils as dist_utils
-from vllm_torchtpu import envs, profiler_trace, utils
+from vllm_torchtpu import envs, gc_policy, profiler_trace, utils
 from vllm_torchtpu.distributed.pcp_rank_order import pcp_topology_order
 from vllm_torchtpu.layers.adapter.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
 from vllm_torchtpu.logger import init_logger
@@ -478,7 +478,16 @@ class TPUWorker(WorkerBase):
         from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import (
             reserve_rope_companion,
         )
+        from vllm_torchtpu.models.vllm.deepseek_v41.v2.swa_cache import (
+            swa_pool_bytes,
+        )
 
+        swa_bytes = swa_pool_bytes(self.model_runner.get_kv_cache_spec())
+        available -= swa_bytes
+        if available <= 0:
+            raise ValueError("KV budget cannot hold the DeepSeek-V4.1 SWA pools")
+        if swa_bytes:
+            logger.info("DeepSeek-V4.1 SWA pool reservation: %d bytes", swa_bytes)
         return reserve_rope_companion(
             self.vllm_config,
             available,
@@ -734,9 +743,18 @@ class TPUWorker(WorkerBase):
         if self.speculative_config is not None:
             set_torch_threads_for_runtime()
         self.model_runner.capture_model()
+        # Dynamic expert re-layout (TPU_MOE_EPLB_DYNAMIC): armed on every rank
+        # at this same point, after the weights and the compiled programs are
+        # in place; None keeps the static layout.
+        from vllm_torchtpu import expert_relayout
+
+        self.model_runner._expert_relayout = expert_relayout.arm_for_runner(
+            self.model_runner
+        )
         compilation_time = time.perf_counter() - start
         self.compilation_config.compilation_time = compilation_time
         set_torch_threads_for_runtime()
+        gc_policy.arm_after_warmup()
         return CompilationTimes(language_model=compilation_time, encoder=0.0)
 
     def reload_kernels(self, modules: list[str] | None = None) -> dict:

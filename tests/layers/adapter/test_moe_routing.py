@@ -272,3 +272,17 @@ def test_gather_expert_scores_ignores_nonfinite_unselected_scores():
     scores = torch.tensor([[0.5, float("nan"), float("inf"), 0.25]])
     got = moe_routing._gather_expert_scores(scores, torch.tensor([[3, 0]]))
     assert torch.equal(got, torch.tensor([[0.25, 0.5]]))
+
+
+def test_route_selects_each_row_with_its_score_bias(monkeypatch):
+    import torch
+
+    monkeypatch.setattr(moe_routing, "_ROUTER_TOPK", "sort")
+    layer = _routing_layer(topk=1, renormalize=False)
+    bias = torch.tensor([[10.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 10.0]])
+    weights, ids = moe_routing.route(
+        layer, torch.ones(2, 4), torch.zeros(2, 4), score_bias=bias
+    )
+    # Each row selects with its own bias; the weights are the unbiased scores.
+    assert ids.tolist() == [[0], [3]]
+    torch.testing.assert_close(weights, torch.full((2, 1), 0.25))

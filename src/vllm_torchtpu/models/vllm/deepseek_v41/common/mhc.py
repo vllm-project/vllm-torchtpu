@@ -167,7 +167,24 @@ def _packed_mixes(x: jax.Array, weight: jax.Array, mixes: int) -> jax.Array:
     )
 
 
-def _flat_pre_sums(flat, weight, previous_pre, mixes, tile):
+def _admit_balanced_pre(tokens, mult, dim, dtype) -> bool:
+    """The balanced Pallas pre path: one 96-row tile grid plus padded gates."""
+    from vllm_torchtpu.kernels.experimental import decode_preparation as prep
+
+    return prep.admit(
+        "mhc_pre",
+        prep.first_problem(
+            (mult == 4, f"hc_mult {mult}, kernel 4 (balanced pairwise sum)"),
+            (dtype == jnp.bfloat16, f"residual dtype {dtype}"),
+            (dim % 128 == 0, f"hidden size {dim} is not lane aligned"),
+        ),
+        tokens=tokens,
+        buckets=prep.MHC_TOKENS,
+        report=False,
+    )
+
+
+def _flat_pre_sums(flat, weight, previous_pre, mixes, tile, *, balanced=False):
     """One pass over ``flat [T, M*D]``: mix logits, square sums, collapse."""
     from jax.experimental import pallas as pl
     from jax.experimental.pallas import tpu as pltpu
@@ -183,7 +200,12 @@ def _flat_pre_sums(flat, weight, previous_pre, mixes, tile):
             x = x_ref[:, m * dim : (m + 1) * dim].astype(jnp.float32)
             terms.append(pre[:, m : m + 1] * x)
             sums.append(jnp.sum(x * x, axis=1, keepdims=True))
-        value_ref[...] = functools.reduce(jnp.add, terms).astype(value_ref.dtype)
+        value = (
+            (terms[0] + terms[2]) + (terms[1] + terms[3])
+            if balanced
+            else functools.reduce(jnp.add, terms)
+        )
+        value_ref[...] = value.astype(value_ref.dtype)
         square_ref[...] = functools.reduce(jnp.add, sums)
         parts = jnp.dot(x_ref[...], w_ref[...], preferred_element_type=jnp.float32)
         mix_ref[...] = (
@@ -293,6 +315,29 @@ def delayed_pre_flat_jax(
     dim = width // mult
     constants = (rms_eps, pre_eps, sinkhorn_eps, post_multiplier, repeats)
     mixes = mult * (mult + 2)
+    if _admit_balanced_pre(tokens, mult, dim, flat.dtype):
+        from vllm_torchtpu.kernels.deepseek_v41.mhc.shifted_post_pre_rms import (
+            _pre_gates as gate_kernel,
+        )
+
+        weight = fn if fn.dtype == jnp.bfloat16 else _pack_mix_weight(fn)
+        mix, square, value = _flat_pre_sums(
+            flat, weight, previous_pre, mixes, 96, balanced=True
+        )
+        pad = -tokens % 128
+        new_pre, post, comb = gate_kernel(
+            jnp.pad(mix.T, ((0, 0), (0, pad))),
+            jnp.pad(square.T, ((0, 0), (0, pad))),
+            scale,
+            base,
+            hidden_size=dim,
+            rms_eps=rms_eps,
+            hc_pre_eps=pre_eps,
+            hc_sinkhorn_eps=sinkhorn_eps,
+            hc_post_mult_value=post_multiplier,
+            sinkhorn_repeat=repeats,
+        )
+        return post[:tokens, :, None], comb[:tokens], value, new_pre[:tokens]
     if 3 * mixes > 128 or (
         tokens not in (64, 96, 128, 256) and (tokens < 1024 or tokens % 64 != 0)
     ):
@@ -661,6 +706,56 @@ def post(x, residual, post_layer_mix, comb_res_mix):
 
 def collapse(x, pre_mix):
     return (x.float() * pre_mix.unsqueeze(-1)).sum(-2).to(x.dtype)
+
+
+_flat_collapse_op = None
+
+
+def _flat_collapse_jax(flat: jax.Array, previous_pre: jax.Array) -> jax.Array:
+    return _collapse_flat(flat, previous_pre).astype(flat.dtype)
+
+
+def initialize_flat_collapse():
+    """Register the op behind ``flat_collapse``; models that use it call this."""
+    global _flat_collapse_op
+    if _flat_collapse_op is not None:
+        return
+    from jax.sharding import PartitionSpec as P
+    from torch_tpu._internal import pallas
+
+    from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+        get_pallas_op_mesh,
+    )
+
+    _flat_collapse_op = pallas.jax_op(
+        "pallas::deepseek_v41_flat_collapse",
+        _flat_collapse_jax,
+        mesh=get_pallas_op_mesh(),
+        input_partition_specs=cast(tuple[tuple[str, ...], ...], (P(), P())),
+    )
+    _flat_collapse_op.register_fake(
+        lambda flat, pre: flat.new_empty((flat.shape[0], flat.shape[1] // pre.shape[1]))
+    )
+
+
+def flat_collapse(x, pre_mix):
+    """``collapse`` without XLA's FP32 ``[T, 4, D]`` relayout copy.
+
+    On TPU the ``[T, 4, D]`` view costs a ``T(4,128)`` relayout of the whole
+    FP32 residual before the reduce; ``_collapse_flat`` sums column slices of
+    the flat input instead. Other devices, stream counts or dtypes, or an
+    unregistered op, keep ``collapse``.
+    """
+    if (
+        _flat_collapse_op is not None
+        and x.device.type == "tpu"
+        and x.dim() == 3
+        and x.shape[1] == 4
+        and x.dtype == torch.bfloat16
+        and pre_mix.dtype == torch.float32
+    ):
+        return _flat_collapse_op(x.flatten(1), pre_mix)
+    return collapse(x, pre_mix)
 
 
 def _default_pre_mix(residual: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:

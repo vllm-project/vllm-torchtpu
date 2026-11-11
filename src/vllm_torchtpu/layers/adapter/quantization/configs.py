@@ -177,6 +177,9 @@ class VllmQuantConfig:
         assert self.vllm_config is not None
         use_ep = self.vllm_config.parallel_config.enable_expert_parallel
         moe_config.moe_parallel_config.use_ep = use_ep
+        from vllm_torchtpu import expert_placement
+
+        expert_placement.apply_to_layer(layer)
         return moe_config
 
     @property

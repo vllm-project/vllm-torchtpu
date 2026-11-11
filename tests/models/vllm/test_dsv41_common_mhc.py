@@ -158,6 +158,7 @@ def test_xla_path_matches_torch_reference(tokens, packed):
         (256, 256),
         (1024, 256),
         (128, 5120),
+        (288, 5120),  # balanced decode path (decode_preparation MHC_TOKENS)
     ],
 )
 def test_pallas_path_matches_torch_reference(tokens, dim, packed):
@@ -165,6 +166,43 @@ def test_pallas_path_matches_torch_reference(tokens, dim, packed):
         pytest.skip("Pallas TPU kernel needs TPU hardware")
     _check(tokens, dim, packed)
     _check_post_pre(tokens, dim, packed)
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_balanced_pre_matches_native_path(monkeypatch, packed):
+    """T288 balanced Pallas pre vs the XLA path taken under fusion ``off``.
+
+    The balanced collapse sums ``(t0 + t2) + (t1 + t3)`` and the gates come
+    from ``_pre_gates``, so agreement is within tolerance, not bitwise.
+    """
+    if jax.default_backend() != "tpu":
+        pytest.skip("Pallas TPU kernel needs TPU hardware")
+    from vllm_torchtpu.kernels.experimental import decode_preparation as prep
+
+    tokens, dim = 288, 5120
+    residual, fn, scale, base, previous_pre = _inputs(tokens, dim, seed=3)
+    weight = mhc.pack_mix_weight(fn) if packed else fn
+    args = (
+        _jax(residual.flatten(1)),
+        _jax(weight),
+        _jax(scale),
+        _jax(base),
+        _jax(previous_pre),
+        *CONSTANTS,
+    )
+    monkeypatch.setattr(prep, "_mode_used", False)
+    monkeypatch.setattr(prep, "_mode", prep.FusionMode.AUTO)
+    assert mhc._admit_balanced_pre(tokens, MULT, dim, jnp.bfloat16)
+    fused = mhc.delayed_pre_flat_jax(*args)
+    monkeypatch.setattr(prep, "_mode", prep.FusionMode.OFF)
+    assert not mhc._admit_balanced_pre(tokens, MULT, dim, jnp.bfloat16)
+    native = mhc.delayed_pre_flat_jax(*args)
+    post, comb, value, new_pre = fused
+    for g, w in ((post, native[0]), (comb, native[1]), (new_pre, native[3])):
+        np.testing.assert_allclose(_np(g), _np(w), rtol=GATE_RTOL, atol=GATE_ATOL)
+    np.testing.assert_allclose(
+        _np(value), _np(native[2]), rtol=BF16_RTOL, atol=BF16_ATOL
+    )
 
 
 @pytest.mark.cpu_test

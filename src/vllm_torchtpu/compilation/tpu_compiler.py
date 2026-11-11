@@ -27,7 +27,7 @@ from vllm.compilation.compiler_interface import CompilerInterface
 from vllm.config import VllmConfig
 from vllm.config.utils import Range
 
-from vllm_torchtpu import envs, utils
+from vllm_torchtpu import envs, expert_placement, utils
 from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.compilation.host_memory import reclaim_after_compile
 from vllm_torchtpu.logger import init_logger
@@ -154,6 +154,11 @@ _TPU_COMPILE_ENV_IGNORED = {
     "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT",
     # Only changes LIBTPU_INIT_ARGS, which is hashed on its own.
     "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES",
+    # Host-side Dynamic EPLB controller/mover tuning knobs; only
+    # TPU_MOE_EPLB_DYNAMIC alters the compiled program.
+    "TPU_MOE_EPLB_WINDOW_STEPS",
+    "TPU_MOE_EPLB_MIN_GAIN",
+    "TPU_MOE_EPLB_MOVER_STEP_BUDGET_MB",
 }
 
 _NATIVE_TPU_COMPILE_ENV_VARS = (
@@ -176,6 +181,7 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # torch custom-op boundary Dynamo cannot see through, and the kernel they
     # export is chosen from their source, so an edit here has to invalidate
     # the compiled executables like any other kernel change.
+    "vllm_torchtpu/expert_placement.py",
     "vllm_torchtpu/layers/adapter/fused_moe_ep.py",
     # Still listed: on this base `pp_shift.py` is a second caller, so the
     # module stays even though the fused EP op no longer needs it.
@@ -283,6 +289,9 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
         "libtpu": importlib_metadata.version("libtpu"),
         "env": _tpu_compile_env_factors(),
         "native_env": {name: os.getenv(name) for name in _NATIVE_TPU_COMPILE_ENV_VARS},
+        # The policy field or env var is only the layout's name; its contents set
+        # the expert map, the fetch set and the slot count of every placed layer.
+        "expert_placement": expert_placement.content_hash(vllm_config),
         "parallel": {
             "effective_data_parallel_size": utils.get_dp_size(
                 vllm_config.parallel_config
@@ -317,7 +326,12 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
         # row-major ({1,0}); artifacts compiled against the old {0,1} tables
         # fail at launch with RuntimeProgramInputMismatch. Bump this tag
         # whenever a load-time relayout changes a parameter layout.
-        "param_layouts": {"rope_tables": "row_major"},
+        # `rope_pairs`: TPU_ROPE_PAIRED_ROWS adds the two-row-packed
+        # `_tpu_rope_pairs` parameter, so toggling it changes the signature.
+        "param_layouts": {
+            "rope_tables": "row_major",
+            "rope_pairs": bool(envs.TPU_ROPE_PAIRED_ROWS),
+        },
     }
 
     repo_root = Path(__file__).resolve().parents[2]

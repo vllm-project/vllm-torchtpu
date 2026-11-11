@@ -11,6 +11,8 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
 )
 
+from vllm_torchtpu.layers.core import table_lookup
+
 INVALID_TOKEN_ID = -1
 
 
@@ -298,6 +300,96 @@ def subtract_num_rejected_tokens(
         pos_subtract = pos_subtract.unsqueeze(0)
     positions = positions - pos_subtract
     return seq_lens, positions
+
+
+def _take_rejected(num_rejected: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+    """``num_rejected[indices]``, zero where ``indices`` is -1."""
+    looked_up = table_lookup.take(num_rejected, indices.clamp(min=0))
+    return torch.where(indices >= 0, looked_up, num_rejected.new_zeros(()))
+
+
+def _subtract_num_rejected_tokens_lookup(
+    seq_lens: torch.Tensor,
+    positions: torch.Tensor,
+    num_rejected: torch.Tensor,
+    seq_lens_subtract_indices: torch.Tensor,
+    positions_subtract_indices: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    pos_subtract = _take_rejected(num_rejected, positions_subtract_indices)
+    if positions.ndim == 2:
+        pos_subtract = pos_subtract.unsqueeze(0)
+    return (
+        seq_lens - _take_rejected(num_rejected, seq_lens_subtract_indices),
+        positions - pos_subtract,
+    )
+
+
+def _spec_chunk_next_inputs(
+    next_tokens: torch.Tensor,
+    drafts: torch.Tensor,
+    num_draft: torch.Tensor,
+    rows: int,
+    num_reqs: int | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from vllm_torchtpu.spec_decode.utils import fit_rows
+
+    src = assemble_spec_next_tokens(next_tokens, fit_rows(drafts, rows), num_reqs)
+    num_rejected = compute_num_rejected(next_tokens, fit_rows(num_draft, rows))
+    return src, num_rejected
+
+
+_tpu_compile = torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+_subtract_num_rejected_tokens_lookup_compiled = _tpu_compile(
+    _subtract_num_rejected_tokens_lookup
+)
+_spec_chunk_next_inputs_compiled = _tpu_compile(_spec_chunk_next_inputs)
+
+
+def subtract_num_rejected_tokens_fused(
+    seq_lens: torch.Tensor,
+    positions: torch.Tensor,
+    num_rejected: torch.Tensor,
+    seq_lens_subtract_indices: torch.Tensor,
+    positions_subtract_indices: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """`subtract_num_rejected_tokens`, bit-identical, as one program on TPU.
+
+    Eagerly it is a program per op, and its gathers from the per-request table
+    lower to scalar select chains (see layers/core/table_lookup.py).
+    """
+    fn = (
+        _subtract_num_rejected_tokens_lookup_compiled
+        if seq_lens.device.type == "tpu"
+        else _subtract_num_rejected_tokens_lookup
+    )
+    return fn(
+        seq_lens,
+        positions,
+        num_rejected,
+        seq_lens_subtract_indices,
+        positions_subtract_indices,
+    )
+
+
+def spec_chunk_next_inputs(
+    next_tokens: torch.Tensor,
+    drafts: torch.Tensor,
+    num_draft: torch.Tensor,
+    rows: int,
+    num_reqs: int | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """One chunk's substitution source and rejected counts, as one program on TPU.
+
+    Equals ``assemble_spec_next_tokens(next_tokens, fit_rows(drafts, rows),
+    num_reqs)`` and ``compute_num_rejected(next_tokens, fit_rows(num_draft,
+    rows))``.
+    """
+    fn = (
+        _spec_chunk_next_inputs_compiled
+        if next_tokens.device.type == "tpu"
+        else _spec_chunk_next_inputs
+    )
+    return fn(next_tokens, drafts, num_draft, rows, num_reqs)
 
 
 def extract_draft_token_ids(

@@ -65,8 +65,8 @@ from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBa
 from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4Config, Mxfp4MoEMethod
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
 
-from vllm_torchtpu import envs
-from vllm_torchtpu.layers.adapter import moe_routing
+from vllm_torchtpu import envs, expert_placement
+from vllm_torchtpu.layers.adapter import expert_load, moe_routing
 from vllm_torchtpu.layers.adapter.fused_moe import (
     TpuMoEActivationMixin,
     fused_moe_gmm,
@@ -327,6 +327,7 @@ class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
         x: torch.Tensor,
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
+        score_bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Forward pass using GMM kernel."""
         layer = cast("TpuRoutedExperts", layer)
@@ -342,7 +343,7 @@ class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
         # input_ids is forwarded for DeepSeek-V4 hash routing; mxfp4 is the only
         # method that supplies it, matching the pre-consolidation behavior.
         topk_weights, topk_ids = moe_routing.route(
-            layer, x, router_logits, input_ids=input_ids
+            layer, x, router_logits, input_ids=input_ids, score_bias=score_bias
         )
 
         kwargs = {
@@ -499,6 +500,10 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
                 else None
             ),
             policy=FusedEPPolicy.REQUIRED if self.fused_ep else FusedEPPolicy.LEGACY,
+            # DeepseekV41MoE mirrors bias_vl onto vision layers; the forward
+            # below then hands the kernel one bias row per token.
+            row_score_bias=getattr(layer, "bias_vl", None) is not None,
+            shared_limit=self._shared_limit(layer),
         )
         if self.fused_ep and op is None:
             raise ValueError(
@@ -506,6 +511,24 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
                 "see the admission reason above, or select moe=gmm"
             )
         return op
+
+    @staticmethod
+    def _shared_limit(layer) -> float | None:
+        """The shared expert's swiglu limit when it runs inside the MoE op.
+
+        DeepSeek-V4 hands the routed and the shared experts one limit, so the
+        routed layer's is the shared expert's; the runner checks it again
+        against the shared module before every call.
+        """
+        if (
+            envs.MOE_FUSED_EP_KERNEL_IMPL != "push"
+            or not envs.MOE_FUSED_EP_PUSH_SHARED_EXPERT
+        ):
+            return None
+        limit = getattr(layer, "swiglu_limit", None)
+        if limit is None:
+            raise ValueError("MOE_FUSED_EP_PUSH_SHARED_EXPERT needs a swiglu limit")
+        return float(limit)
 
     def _resolve_tpu_activation(self, layer) -> str:
         # This variant runs the clamped kernel, so the string is not
@@ -525,6 +548,10 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        if expert_placement.apply_to_layer(layer):
+            # A layout with spare slots gives this rank more experts than the
+            # linear split; the loader fills them through the rewritten map.
+            num_experts = layer.local_num_experts
         Mxfp4MoEMethod.create_weights(
             self,
             layer,
@@ -688,6 +715,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
 
         from vllm_torchtpu.layers.adapter.fused_moe_ep import (
             FUSED_MOE_EP_OP_ATTR,
+            FUSED_MOE_EP_SHARED_LIMIT_ATTR,
             fused_moe_ep_unsupported_reason,
             register_score_bias_buffer,
         )
@@ -760,6 +788,12 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             )
 
         setattr(self, FUSED_MOE_EP_OP_ATTR, op)
+        setattr(
+            self,
+            FUSED_MOE_EP_SHARED_LIMIT_ATTR,
+            None if op is None else self._shared_limit(layer),
+        )
+        expert_placement.check_layer_served(layer, fused_armed=op is not None)
         if op is not None:
             reason = fused_moe_ep_unsupported_reason(
                 layer,
@@ -795,6 +829,11 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
                 w2_scale,
                 persistent=False,
             )
+            if expert_placement.expert_slot_table(layer) is not None:
+                # The kernel's e_total is this rank's slots times the EP width.
+                expert_load.register(
+                    layer, physical=layer.w13_weight.shape[0] * layer.moe_config.ep_size
+                )
             logger.info_once(
                 "DeepSeek-V4 MXFP4 fused EP W4A8 enabled: block-%d, "
                 "row-padded flat scales",
@@ -807,6 +846,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         x: torch.Tensor,
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
+        score_bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         from vllm_torchtpu.layers.adapter.fused_moe_ep import (
             fused_moe_ep,
@@ -816,11 +856,16 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         )
 
         layer = cast("TpuRoutedExperts", layer)
+        rows = router_logits.shape[0]
         if fused_moe_ep_supported(self):
+            if self.shared_expert_limit is not None:
+                raise RuntimeError(
+                    "this layer's fused EP op computes the shared expert too; "
+                    "the MoE runner calls forward_monolithic_with_shared_expert"
+                )
             # This rank's own tokens in and out: the kernel scores, selects,
-            # dispatches, runs both matmuls and combines inside one program,
-            # so `input_ids` has no reader here -- hash-routed layers are
-            # refused at admission and take the branch below instead.
+            # dispatches, runs both matmuls and combines inside one program.
+            # `input_ids` select hash-routed and image rows.
             return fused_moe_ep(
                 self,
                 x,
@@ -829,7 +874,76 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
                 layer._tpu_fused_w13_scale,
                 layer._tpu_fused_w2_scale,
                 router_logits,
-                score_bias_operand(layer),
+                _with_image_bias(layer, score_bias_operand(layer), input_ids, rows),
                 hash_topk_ids_operand(layer, input_ids),
+                expert_placement.expert_slot_table(layer),
+                expert_load.operand(layer),
             )
-        return super()._forward_monolithic_tpu(layer, x, router_logits, input_ids)
+        return super()._forward_monolithic_tpu(
+            layer,
+            x,
+            router_logits,
+            input_ids,
+            score_bias=_with_image_bias(
+                layer, layer.e_score_correction_bias, input_ids, rows
+            ),
+        )
+
+    @property
+    def shared_expert_limit(self) -> float | None:
+        """The swiglu limit of the shared expert this layer's op computes, or
+        None when the op does not take the shared expert."""
+        from vllm_torchtpu.layers.adapter.fused_moe_ep import (
+            FUSED_MOE_EP_SHARED_LIMIT_ATTR,
+        )
+
+        return getattr(self, FUSED_MOE_EP_SHARED_LIMIT_ATTR, None)
+
+    def forward_monolithic_with_shared_expert(
+        self,
+        layer: RoutedExperts,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None,
+        shared_expert: tuple[torch.Tensor, ...],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """(routed, shared) from the one op: `_forward_monolithic_tpu`'s
+        routed experts, plus the shared expert (w13, s13, w2, s2) on `x`."""
+        from vllm_torchtpu.layers.adapter.fused_moe_ep import (
+            fused_moe_ep,
+            hash_topk_ids_operand,
+            score_bias_operand,
+        )
+
+        layer = cast("TpuRoutedExperts", layer)
+        rows = router_logits.shape[0]
+        return fused_moe_ep(
+            self,
+            x,
+            layer.w13_weight,
+            layer.w2_weight,
+            layer._tpu_fused_w13_scale,
+            layer._tpu_fused_w2_scale,
+            router_logits,
+            _with_image_bias(layer, score_bias_operand(layer), input_ids, rows),
+            hash_topk_ids_operand(layer, input_ids),
+            expert_placement.expert_slot_table(layer),
+            expert_load.operand(layer),
+            shared_expert=shared_expert,
+        )
+
+
+def _with_image_bias(layer, bias, input_ids, rows):
+    """`bias` per routed row, `bias_vl` on DeepSeek-V4.1 image rows.
+
+    DeepseekV41MoE mirrors bias_vl onto vision layers; image tokens select
+    with it, as upstream's router does. Other layers keep `bias` as is.
+    `rows` is the router logits' row count: this rank's own tokens, which
+    `input_ids` must match.
+    """
+    bias_vl = getattr(layer, "bias_vl", None)
+    if bias_vl is None:
+        return bias
+    ids = input_ids.reshape(rows, 1)
+    image = (ids >= layer.image_sentinel_lo) & (ids < layer.image_sentinel_hi)
+    return torch.where(image, bias_vl.float(), bias.float())

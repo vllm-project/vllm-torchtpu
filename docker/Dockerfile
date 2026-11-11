@@ -12,9 +12,10 @@ FROM python:3.12-slim-bookworm AS base
 
 # curl for health checks, git so uv can clone the vllm source dependency, the
 # toolchain for packages that build from source, and libgoogle-perftools4 for
-# the tcmalloc allocator enabled below. build-essential already pulls in gcc,
-# g++, make and libc6-dev.
-RUN apt-get update && apt-get install -y curl git build-essential cmake ninja-build libgoogle-perftools4 && rm -rf /var/lib/apt/lists/*
+# the tcmalloc allocator enabled below. libibverbs1 is required by tpu-sync's
+# native raw-transfer extension. build-essential already pulls in gcc, g++,
+# make and libc6-dev.
+RUN apt-get update && apt-get install -y curl git build-essential cmake ninja-build libgoogle-perftools4 libibverbs1 && rm -rf /var/lib/apt/lists/*
 
 # tcmalloc for every derived image. Set after the install above, so that
 # intermediate steps do not fail preloading a library that is not there yet.

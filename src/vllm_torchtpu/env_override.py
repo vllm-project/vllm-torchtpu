@@ -197,6 +197,14 @@ if _sc_offload_bytes is not None:
         if not _user_has_flag(_flag_name):
             _libtpu_extra_args.append(f"{_flag_name}={_sc_offload_bytes}")
 
+# --xla_tpu_enable_deduplicated_calls=false: at DP16 C768 the decode step's
+# 20-layer decoder program calls ~244 shared functions per layer, more code than
+# the instruction region holds, so every layer waits on code loads (~1 ms/step).
+if envs.TPU_INLINE_DEDUPLICATED_CALLS and not _user_has_flag(
+    "--xla_tpu_enable_deduplicated_calls"
+):
+    _libtpu_extra_args.append("--xla_tpu_enable_deduplicated_calls=false")
+
 if _libtpu_extra_args:
     _assembled = " ".join(_libtpu_extra_args)
     if _existing_libtpu_args:

@@ -32,6 +32,7 @@ def _make_dummy_vllm_config(max_num_seqs=4, max_model_len=4096):
             max_model_len=max_model_len,
         ),
         scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
+        speculative_config=None,
     )
 
 
@@ -70,7 +71,10 @@ def test_dsv41_attention_init_buffers_and_flags_fp8(monkeypatch):
     assert attn._swa_max_requests == 4
 
 
-def test_dsv41_attention_init_buffers_and_flags_bfloat16(monkeypatch):
+@pytest.mark.parametrize("speculative_tokens", [None, 0, 3, 5])
+def test_dsv41_attention_init_buffers_and_flags_bfloat16(
+    monkeypatch, speculative_tokens
+):
     """Test __init__ buffer registration and flag setting when BF16 KV cache is used."""
 
     def fake_upstream_init(self, vllm_config, *args, **kwargs):
@@ -80,6 +84,9 @@ def test_dsv41_attention_init_buffers_and_flags_bfloat16(monkeypatch):
             cos_sin_cache=torch.zeros(64, 64, dtype=torch.float32)
         )
         self.attn_sink = torch.tensor([0.5, 1.5], dtype=torch.float32)
+        self.swa_cache_layer = SimpleNamespace()
+        self.indexer = None
+        self.compress_ratio = 0
 
     monkeypatch.setattr(
         v2_attn.upstream.DeepseekV4Attention, "__init__", fake_upstream_init
@@ -88,7 +95,12 @@ def test_dsv41_attention_init_buffers_and_flags_bfloat16(monkeypatch):
     monkeypatch.setattr(v2_attn, "get_tensor_model_parallel_world_size", lambda: 1)
 
     cfg = _make_dummy_vllm_config(max_num_seqs=8)
+    if speculative_tokens is not None:
+        cfg.speculative_config = SimpleNamespace(
+            num_speculative_tokens=speculative_tokens
+        )
     attn = v2_attn.DeepseekV41Attention(cfg)
+    assert attn._swa_query_group_size == (speculative_tokens or 0) + 1
 
     # Invariant: BF16 disables precompact_records and token_parallel_attn
     assert attn._fp8_kv is False
@@ -466,7 +478,10 @@ def test_prepare_tpu_non_source_layer_buffer_reuse(monkeypatch):
     torch.testing.assert_close(recs[1, :2], torch.tensor([5, 15], dtype=torch.int32))
 
 
-def test_prepare_tpu_tiled_paged_attention_dispatch_bfloat16(monkeypatch):
+@pytest.mark.parametrize("query_group_size", [1, 4, 6])
+def test_prepare_tpu_tiled_paged_attention_dispatch_bfloat16(
+    monkeypatch, query_group_size
+):
     """Test BF16 tiled path dispatches to paged_attention."""
     attn = object.__new__(v2_attn.DeepseekV41Attention)
     torch.nn.Module.__init__(attn)
@@ -477,6 +492,7 @@ def test_prepare_tpu_tiled_paged_attention_dispatch_bfloat16(monkeypatch):
     attn._max_model_len = capacity
     attn.indexer = None
     attn._fp8_kv = False  # BF16!
+    attn._swa_query_group_size = query_group_size
     attn.window_size = 64
     attn.n_local_heads = 2
     attn.head_dim = 16
@@ -536,8 +552,10 @@ def test_prepare_tpu_tiled_paged_attention_dispatch_bfloat16(monkeypatch):
 
     paged_attn_called = []
 
-    def fake_paged_attn(q, swa_cache, main_cache, records, main_records, sink, scale):
-        paged_attn_called.append(True)
+    def fake_paged_attn(
+        q, swa_cache, main_cache, records, main_records, sink, scale, group_size
+    ):
+        paged_attn_called.append(group_size)
         return torch.zeros(
             count, attn.n_local_heads, attn.head_dim, dtype=torch.bfloat16
         )
@@ -552,7 +570,7 @@ def test_prepare_tpu_tiled_paged_attention_dispatch_bfloat16(monkeypatch):
         attn, None, qr, kv, None, None, None, positions, output
     )
 
-    assert len(paged_attn_called) == 1
+    assert paged_attn_called == [query_group_size]
 
 
 def test_prepare_tpu_untiled_fp8_kv_raises_not_implemented(monkeypatch):

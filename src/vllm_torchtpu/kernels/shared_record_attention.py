@@ -5,13 +5,20 @@ Compiler scheduling may hoist PV pops; final LLO must establish actual overlap.
 Each request has identical mathematics to onepass; no acceptance-path change.
 """
 
+import functools
+
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 
-def _kernel(records, q, kv, sink, out):
+def _kernel(*refs, masked):
+    # Optional per-token validity (SMEM scalar prefetch, [requests * 5]):
+    # kernel row j * 64 + h of a request is its token j, head h; rows of an
+    # invalid token are written as 0.
+    token_valid = refs[0] if masked else None
+    records, q, kv, sink, out = refs[1:] if masked else refs
     aq = [
         jax.empty_ref(
             jax.ShapeDtypeStruct((320, 256), jnp.float32), memory_space=pltpu.ACC(m)
@@ -66,13 +73,28 @@ def _kernel(records, q, kv, sink, out):
                 .astype(jnp.float32)
                 for h in range(2)
             ]
+            if token_valid is not None:
+                token = jax.lax.broadcasted_iota(jnp.int32, (320, 1), 0) // 64
+                base = (pl.program_id(0) * 2 + r) * 5
+                keep = jnp.zeros((320, 1), jnp.bool_)
+                for j in range(5):
+                    keep = keep | ((token == j) & (token_valid[base + j] != 0))
+                halves = [jnp.where(keep, h, 0.0) for h in halves]
             packed = pltpu.pack_elementwise(halves, packed_dtype=jnp.bfloat16)
             out[r, :, pl.ds(m * 256, 256)] = pltpu.bitcast(packed.T, jnp.bfloat16).T
 
 
 def shared_record_attention(
-    records: jax.Array, pieces: jax.Array, gathered: jax.Array, sink: jax.Array
+    records: jax.Array,
+    pieces: jax.Array,
+    gathered: jax.Array,
+    sink: jax.Array,
+    token_valid: jax.Array | None = None,
 ) -> jax.Array:
+    """``token_valid`` (``[requests * 5]`` int32, optional) zeroes the output
+    rows of the tokens it marks 0 inside the kernel's write-back, replacing a
+    separate full-output mask pass (~13 us per DSpark draft layer). It is a
+    scalar prefetch, so it adds no per-step VMEM DMA."""
     requests = records.shape[0]
     assert requests > 0 and requests % 2 == 0
     assert records.shape == (requests, 1, 256) and records.dtype == jnp.int32
@@ -80,6 +102,10 @@ def shared_record_attention(
     assert gathered.shape == (4, requests, 192, 128)
     assert pieces.dtype == gathered.dtype == jnp.bfloat16
     assert sink.shape == (320, 1)
+    masked = token_valid is not None
+    if masked:
+        assert token_valid.shape == (requests * 5,)
+        assert token_valid.dtype == jnp.int32
 
     def spec(shape, fn):
         return pl.BlockSpec(
@@ -87,10 +113,10 @@ def shared_record_attention(
         )
 
     return pl.pallas_call(
-        _kernel,
+        functools.partial(_kernel, masked=masked),
         out_shape=jax.ShapeDtypeStruct((requests, 320, 512), jnp.bfloat16),
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=0,
+            num_scalar_prefetch=1 if masked else 0,
             grid=(requests // 2,),
             in_specs=(
                 spec((2, 1, 256), lambda i, *_: (i, jnp.int32(0), jnp.int32(0))),
@@ -114,4 +140,4 @@ def shared_record_attention(
         ),
         compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
         name="dspark_swa_onepass_pair",
-    )(records, pieces, gathered, sink)
+    )(*((token_valid,) if masked else ()), records, pieces, gathered, sink)

@@ -153,11 +153,15 @@ def test_dp_draft_decision_includes_ready_peers_and_idle_ranks(peer_needs_draft)
     runner = SimpleNamespace(
         _dp_lockstep_enabled=lambda: True,
         num_tokens_paddings=[128, 2048],
+        _expert_relayout=None,
+        _dp_step_index=0,
     )
 
     def reduce(tensor, **kwargs):
-        assert tensor.tolist() == [0, 0, 0, 0, 0]
-        tensor.copy_(torch.tensor([2048, 2, 1, 0, int(peer_needs_draft)]))
+        assert tensor.tolist() == [0] * 10
+        tensor.copy_(
+            torch.tensor([2048, 2, 1, 0, int(peer_needs_draft), 0, 0, 0, 0, 0])
+        )
 
     with (
         patch("vllm.distributed.parallel_state.get_dp_group") as group,
@@ -170,6 +174,38 @@ def test_dp_draft_decision_includes_ready_peers_and_idle_ranks(peer_needs_draft)
     assert result == (2048, 2)
     assert runner._draft_proposals_needed is peer_needs_draft
     collective.assert_called_once()
+
+
+def test_dp_step_carries_the_relayout_fields_and_calls_the_controller():
+    seen = []
+
+    class Controller:
+        def fields(self):
+            return (0x5A5A, -0x5A5A, -3)
+
+        def on_step(self, step, reduced, phase):
+            seen.append((step, reduced, phase))
+
+    runner = SimpleNamespace(
+        _dp_lockstep_enabled=lambda: True,
+        num_tokens_paddings=[128, 2048],
+        _expert_relayout=Controller(),
+        _dp_step_index=41,
+        max_num_reqs=1,
+    )
+
+    def reduce(tensor, **kwargs):
+        assert tensor.tolist()[5:] == [0x5A5A, -0x5A5A, -3, 0, 0]
+        tensor.copy_(torch.tensor([128, 1, 1, 0, 1, 0x5A5A, -0x5A5A, -2, -128, -1]))
+
+    with (
+        patch("vllm.distributed.parallel_state.get_dp_group") as group,
+        patch.object(torch.distributed, "all_reduce", side_effect=reduce),
+    ):
+        group.return_value.cpu_group = "cpu-group"
+        TPUModelRunner._dp_coordinated_step(runner, 0, 0)
+    assert runner._dp_step_index == 42
+    assert seen == [(42, (0x5A5A, -0x5A5A, -2), "decode")]
 
 
 def test_non_lockstep_partial_prefill_skips_proposals():
@@ -317,6 +353,52 @@ def test_spec_warmup_clamps_circular_buffer_group_blocks():
     req1 = executed[1].scheduled_new_reqs[0]
     assert req0.block_ids == (list(range(1, 10)), [1])
     assert req1.block_ids == (list(range(10, 19)), [10])
+
+
+def test_spec_warmup_keeps_swa_pool_block_ids_in_range():
+    executed = []
+    attn_group = SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=256))
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2.swa_cache import (
+        DeepseekV41SWASpec,
+    )
+
+    # The SWA pool owns 5 pages (page 0 is null); its IDs are local.
+    swa_spec = DeepseekV41SWASpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.bfloat16,
+        sliding_window=128,
+        max_num_seqs=1,
+        max_in_flight_tokens=256,
+    )
+    pages = swa_spec.pool_capacity
+    assert pages == 5
+    swa_group = SimpleNamespace(kv_cache_spec=swa_spec)
+    runner = SimpleNamespace(
+        max_model_len=8192,
+        max_num_tokens=2048,
+        speculative_config=SimpleNamespace(num_speculative_tokens=5),
+        kv_cache_config=SimpleNamespace(
+            num_blocks=100,
+            kv_cache_groups=[attn_group, swa_group],
+        ),
+        execute_model=MagicMock(side_effect=lambda so: executed.append(so) and None),
+        sample_tokens=MagicMock(),
+        take_draft_token_ids=MagicMock(return_value=None),
+        _warmup_spec_decode_cleanup=MagicMock(return_value=True),
+    )
+
+    assert TPUModelRunner._warmup_one_spec_request(runner, 2048, idx=0) is True
+    shared, private = executed[0].scheduled_new_reqs[0].block_ids
+    assert shared == list(range(1, 10))
+    assert all(1 <= block < pages for block in private) and len(private) == 9
+
+    executed.clear()
+    TPUModelRunner._warmup_spec_batch(runner, R=2, P=2048, greedy=True)
+    for so in executed:
+        for request in so.scheduled_new_reqs:
+            assert all(1 <= block < pages for block in request.block_ids[1])
 
 
 def _sub_indices(req_id_to_index_copy, req_ids, num_scheduled, spec_k=None):
@@ -2624,11 +2706,6 @@ def test_init_num_reqs_caps_deepseek_v41_v2_vs_rpa(monkeypatch):
     assert runner.num_reqs_max_model_len == 64
     assert runner.num_reqs_most_model_len == 64
 
-    monkeypatch.setenv("TPU_DEEPSEEK_V41_IMPL", "v1")
-    runner._init_num_reqs_caps()
-    assert runner.num_reqs_max_model_len == 20
-    assert runner.num_reqs_most_model_len == 23
-
     runner.most_model_len = None
     runner.model_config = SimpleNamespace(
         hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"])
@@ -2748,3 +2825,22 @@ def test_bucketed_drafts_preserve_real_request_offsets_across_chunks(verify):
     assert source[indices[1]].tolist() == [8, 22, 22]
     assert rejected.tolist() == ([2, 0, 0, 0, 0, 0] if verify else [0] * 6)
     assert counts == ({0: 2} if verify else {0: 0, 1: 0})
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("raw_tokens", [False, True])
+def test_multimodal_model_inputs_keep_raw_token_ids_when_required(raw_tokens):
+    input_ids = torch.arange(4)
+    embeds = torch.zeros(4, 2)
+    runner = SimpleNamespace(
+        supports_mm_inputs=True,
+        model=SimpleNamespace(
+            requires_raw_input_tokens=raw_tokens,
+            embed_input_ids=lambda ids, multimodal_embeddings, is_multimodal: embeds,
+        ),
+    )
+
+    ids, inputs_embeds = TPUModelRunner._get_model_inputs(runner, input_ids, None)
+
+    assert inputs_embeds is embeds
+    assert ids is (input_ids if raw_tokens else None)

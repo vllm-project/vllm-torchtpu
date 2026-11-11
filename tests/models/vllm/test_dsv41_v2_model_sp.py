@@ -286,6 +286,9 @@ def test_prepare_engram_full_path(monkeypatch: pytest.MonkeyPatch):
         def ensure_cache(self) -> bool:
             return True
 
+        def fuses_dead_masks(self, input_ids: torch.Tensor) -> bool:
+            return False
+
         def dummy_hashes(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
             return torch.zeros((x.shape[0], 3, 1)), torch.ones(
                 x.shape[0], dtype=torch.bool
@@ -423,7 +426,7 @@ def test_ced_dispatches_encoder_before_host_bucket_coordination(monkeypatch):
     mix = torch.ones(4, 4).as_subclass(TpuTensor)
     auxiliary = torch.ones(4, 16).as_subclass(TpuTensor)
 
-    def encoder(*args):
+    def encoder(*args, **kwargs):
         order.append("encoder")
         return hidden, mix, [auxiliary]
 
@@ -647,6 +650,7 @@ def test_forward_stage_decoder_and_encoder_paths(monkeypatch: pytest.MonkeyPatch
     )
     monkeypatch.setattr(v2_model, "post", lambda h, *a: h)
     monkeypatch.setattr(v2_model, "collapse", lambda h, pm: h)
+    monkeypatch.setattr(v2_model, "flat_collapse", lambda h, pm: h)
 
     out_dec = v2_model.DeepseekV41Model._forward_stage(
         model,
@@ -777,6 +781,7 @@ def test_forward_stage_pipeline_parallel_and_aux_hidden_states(
     monkeypatch.setattr(v2_model.upstream, "sp_padding_mask", lambda mask, h: mask)
     monkeypatch.setattr(v2_model, "post", lambda h, *a: h)
     monkeypatch.setattr(v2_model, "collapse", lambda h, pm: h)
+    monkeypatch.setattr(v2_model, "flat_collapse", lambda h, pm: h)
 
     inter_tensors = {
         "hidden_states": torch.ones((4, 16), dtype=torch.bfloat16),
@@ -916,6 +921,7 @@ def test_model_init_validation_and_ced_setup(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(v2_model, "initialize_delayed_mhc", lambda: None)
     monkeypatch.setattr(v2_model, "initialize_shifted_mhc", lambda: None)
     monkeypatch.setattr(v2_model, "initialize_mhc_post", lambda: None)
+    monkeypatch.setattr(v2_model, "initialize_flat_collapse", lambda: None)
     monkeypatch.setattr(v2_model, "initialize_paged_attention", lambda: None)
     monkeypatch.setattr(v2_model, "initialize_indexer", lambda: None)
     monkeypatch.setattr(v2_model, "compact_rope_caches", lambda *a: None)
@@ -1109,7 +1115,7 @@ def test_split_encoder_stages_tail_engram_after_head_dispatch(monkeypatch):
     order = []
     carry = tuple(torch.ones(4, 16).as_subclass(TpuTensor) for _ in range(5))
 
-    def head(*args):
+    def head(*args, **kwargs):
         order.append("head")
         return carry
 
@@ -1162,6 +1168,157 @@ def test_split_encoder_stages_tail_engram_after_head_dispatch(monkeypatch):
         (14, 20),
         "tail",
     ]
+
+
+class _TpuTensor(torch.Tensor):
+    @property
+    def device(self):
+        return SimpleNamespace(type="tpu")
+
+
+def test_split_encoder_downloads_deferred_hashes_after_head_dispatch(monkeypatch):
+    # A deferred device hash is downloaded only after the head is enqueued,
+    # and the downloaded hashes feed both later Engram segments.
+    order = []
+    carry = tuple(torch.ones(4, 16).as_subclass(_TpuTensor) for _ in range(5))
+    pending, gathered = object(), object()
+
+    def stage(name):
+        def call(*args, **kwargs):
+            order.append(name)
+            return "encoded" if name == "tail" else carry
+
+        return call
+
+    def download(hashes):
+        assert hashes is pending
+        order.append("download")
+        return gathered
+
+    def stage_engram(start, end, hashes):
+        assert hashes is gathered
+        order.append((start, end))
+
+    monkeypatch.setattr(
+        v2_model, "synchronize_tensors", lambda tensors, wait: order.append("dispatch")
+    )
+    model = _model_stub(
+        start_layer=0,
+        _engram_first_split_layer=1,
+        _engram_split_layer=14,
+        _ced_boundary=20,
+        _engram_prepared_outside_stage=True,
+        encoder_head_stage=stage("head"),
+        encoder_middle_stage=stage("middle"),
+        encoder_tail_stage=stage("tail"),
+        _pending_engram_hashes=pending,
+        _gathered_engram_hashes=None,
+        _gather_engram_hashes=download,
+        _stage_engram_layers=stage_engram,
+    )
+    out = v2_model.DeepseekV41Model._forward_split_encoder(
+        model, torch.arange(4), torch.arange(4), None, None, None
+    )
+    assert out == "encoded"
+    assert order == [
+        "head",
+        "dispatch",
+        "download",
+        (1, 14),
+        "middle",
+        "dispatch",
+        (14, 20),
+        "tail",
+    ]
+    assert model._pending_engram_hashes is None
+
+
+def test_defers_hash_download_only_before_an_engram_free_head():
+    device_hashes = torch.zeros(4, 3, 1).as_subclass(_TpuTensor)
+    model = _model_stub(
+        start_layer=0,
+        _engram_first_split_layer=2,
+        _engram_split_layer=4,
+        engram_dp_shared_memory=True,
+        layers=[SimpleNamespace(engram=None) for _ in range(6)],
+        _has_cpu_offloaded_engram=lambda: True,
+    )
+    defers = model._defers_hash_download
+    assert defers(device_hashes, "encoder")
+    # Host (prefill) hashes and unsplit stages keep the eager download.
+    assert not defers(torch.zeros(4, 3, 1), "encoder")
+    assert not defers(device_hashes, "full")
+    # A DP-sharded table gathers hashes with a collective every replica joins.
+    model.engram_dp_shared_memory = False
+    assert not defers(device_hashes, "encoder")
+    model.engram_dp_shared_memory = True
+    # A head layer with Engram needs the hashes before it runs.
+    model.layers[1] = SimpleNamespace(engram=object())
+    assert not defers(device_hashes, "encoder")
+    model.layers[1] = SimpleNamespace(engram=None)
+    model._engram_split_layer = None
+    assert not defers(device_hashes, "encoder")
+
+
+def test_prepare_engram_enqueues_deferred_device_hashes(monkeypatch):
+    device_hashes = torch.ones(4, 3, 1, dtype=torch.int32).as_subclass(_TpuTensor)
+
+    class Hash:
+        use_slot_cache = False
+        swa_cache_module = SimpleNamespace(kv_cache=None)
+
+        def ensure_cache(self):
+            return True
+
+        def fuses_dead_masks(self, input_ids: torch.Tensor) -> bool:
+            return False
+
+        def __call__(self, *args):
+            return device_hashes
+
+    def no_download(hashes):
+        raise AssertionError("the head must dispatch before the hash download")
+
+    meta = SimpleNamespace(
+        seq_lens=torch.tensor([4]), query_start_loc=torch.tensor([0, 4])
+    )
+    ctx = SimpleNamespace(attn_metadata={"swa": meta})
+    monkeypatch.setattr(v2_model.upstream, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(v2_model.upstream, "get_forward_context", lambda: ctx)
+    monkeypatch.setattr(
+        v2_model.upstream,
+        "image_sentinel_mask",
+        lambda t: torch.zeros(t.shape, dtype=torch.bool),
+    )
+    monkeypatch.setattr(v2_model, "_cache_slots", lambda *a: None)
+    monkeypatch.setattr(v2_model, "_block_table", lambda *a: None)
+    synced = []
+    monkeypatch.setattr(
+        v2_model,
+        "synchronize_tensors",
+        lambda tensors, wait: synced.append((tensors, wait)),
+    )
+    model = _model_stub(
+        engram_hash=Hash(),
+        engram_swa_prefix="swa",
+        engram_dp_shared_memory=True,
+        start_layer=0,
+        end_layer=6,
+        _engram_first_split_layer=2,
+        _engram_split_layer=4,
+        layers=[SimpleNamespace(engram=None) for _ in range(6)],
+        _has_cpu_offloaded_engram=lambda: True,
+        _host_hash_inputs=lambda *args: None,
+        _hash_download=SimpleNamespace(copy_to_host=no_download),
+    )
+    ids = torch.arange(4, dtype=torch.int32)
+    hashes, mask = v2_model.DeepseekV41Model._prepare_engram(
+        model, ids, ids, torch.zeros((1, 4), dtype=torch.int32), stage="encoder"
+    )
+    assert hashes is device_hashes and mask is not None
+    assert model._pending_engram_hashes is device_hashes
+    assert len(synced) == 1
+    assert synced[0][0][0] is device_hashes and synced[0][1] is False
 
 
 @pytest.mark.parametrize("rows", [1, 5, 288, 2048])
@@ -1285,7 +1442,7 @@ def test_early_split_enqueues_before_host_lookup(monkeypatch):
     carry = tuple(torch.ones(2, 4).as_subclass(TpuTensor) for _ in range(5))
 
     def stage(name):
-        def call(*args):
+        def call(*args, **kwargs):
             order.append(name)
             return carry
 
@@ -1329,3 +1486,81 @@ def test_early_split_enqueues_before_host_lookup(monkeypatch):
         "l14 lookup",
         "tail",
     ]
+
+
+@pytest.mark.parametrize(
+    ("host_layers", "hbm_layers", "tail", "first"),
+    [
+        ((1, 4), (), 4, 1),
+        # Layer 1 served from HBM: no early split, the tail split stays.
+        ((1, 4), (1,), 4, None),
+        ((1, 4), (1, 4), None, None),
+    ],
+)
+def test_engram_split_skips_hbm_lookup_layers(host_layers, hbm_layers, tail, first):
+    model = _model_stub(
+        start_layer=0,
+        _ced_boundary=6,
+        _tp_size=1,
+        use_sequence_parallel=False,
+        aux_hidden_state_layers=(),
+        layers=[
+            SimpleNamespace(
+                engram=SimpleNamespace(
+                    embed_tokens=SimpleNamespace(host_offload=True),
+                    uses_hbm_lookup=i in hbm_layers,
+                )
+                if i in host_layers
+                else None
+            )
+            for i in range(7)
+        ],
+    )
+    model._engram_split_layer = model._select_engram_split_layer()
+    assert model._engram_split_layer == tail
+    assert model._select_engram_first_split_layer() == first
+
+
+def test_tail_only_split_stages_tail_engram_after_head_dispatch(monkeypatch):
+    # Layer 1 on HBM: the head runs layers [0, 14) and only layer 14's host
+    # staging remains, still after the head is enqueued.
+    order = []
+    carry = tuple(torch.ones(4, 16).as_subclass(_TpuTensor) for _ in range(5))
+    hashes = object()
+
+    def stage(name):
+        def call(*args, **kwargs):
+            order.append(name)
+            return "encoded" if name == "tail" else carry
+
+        return call
+
+    def stage_engram(start, end, gathered):
+        assert gathered is hashes
+        order.append((start, end))
+
+    def no_middle(*args):
+        raise AssertionError("no middle stage without an early split")
+
+    monkeypatch.setattr(
+        v2_model, "synchronize_tensors", lambda tensors, wait: order.append("dispatch")
+    )
+    model = _model_stub(
+        start_layer=0,
+        _engram_first_split_layer=None,
+        _engram_split_layer=14,
+        _ced_boundary=20,
+        _engram_prepared_outside_stage=True,
+        encoder_head_stage=stage("head"),
+        encoder_middle_stage=no_middle,
+        encoder_tail_stage=stage("tail"),
+        _pending_engram_hashes=None,
+        _gathered_engram_hashes=hashes,
+        _stage_engram_layers=stage_engram,
+        _record_engram_consumers=lambda *args: None,
+    )
+    out = v2_model.DeepseekV41Model._forward_split_encoder(
+        model, torch.arange(4), torch.arange(4), None, None, None
+    )
+    assert out == "encoded"
+    assert order == ["head", "dispatch", (14, 20), "tail"]

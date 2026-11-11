@@ -8,6 +8,7 @@ tp=${TP:-1}
 dp=${DP:-8}
 chunk=${CHUNK:-2048}
 max_seqs=${MAX_SEQS:-1}
+engram_config=${ENGRAM_CONFIG:-'{"cpu_offload":true}'}
 export TPU_RECLAIM_COMPILE_MEMORY="${TPU_RECLAIM_COMPILE_MEMORY:-1}"
 export OMP_NUM_THREADS=1 NEW_MODEL_DESIGN=1 MODEL_IMPL_TYPE=vllm VLLM_TARGET_DEVICE=tpu
 export VLLM_USE_BREAKABLE_CUDAGRAPH=0 VLLM_USE_AOT_COMPILE=0
@@ -18,6 +19,11 @@ export LIBTPU_INIT_ARGS='--xla_tpu_sparse_core_all_gather_offload_min_size_in_by
 if [[ "${MOE_FUSED_EP_PREPROCESS_BACKEND:-native}" == topology ]]; then
   export LIBTPU_INIT_ARGS="$LIBTPU_INIT_ARGS --xla_mosaic_unsafe_allow_multicore_remote_dma=true"
 fi
+# Extra compiler flags under test, comma-separated so they pass through
+# whitespace-split environment plumbing (e.g. "--flag_a=true,--flag_b=1").
+if [[ -n "${DSV41_EXTRA_LIBTPU_ARGS:-}" ]]; then
+  export LIBTPU_INIT_ARGS="$LIBTPU_INIT_ARGS ${DSV41_EXTRA_LIBTPU_ARGS//,/ }"
+fi
 export VLLM_SERVER_DEV_MODE=1
 # Cache roots, when supplied, must be keyed by source/runtime/topology/buckets.
 server_args=(--gpu-memory-utilization 0.85)
@@ -27,19 +33,25 @@ fi
 if [[ -n "${MAX_MODEL_LEN:-}" ]]; then
   server_args+=(--max-model-len "$MAX_MODEL_LEN")
 fi
+# One API server: with the default of one per DP rank, every server pulls
+# config.json from object storage into the same unlocked cache directory, and
+# a concurrent reader can parse a still-empty file.
+api_args=(--api-server-count 1)
+if [[ "${HEADLESS:-0}" == 1 ]]; then
+  api_args=(--headless)
+fi
 exec vllm serve "$model" \
   --tokenizer "$model_path" \
   --load-format runai_streamer --served-model-name deepseek-v41 \
   --host "${HOST:-127.0.0.1}" --port "${PORT:-8000}" \
-  --tensor-parallel-size "$tp" --data-parallel-size "$dp" \
+  --tensor-parallel-size "$tp" --data-parallel-size "$dp" "${api_args[@]}" \
   --enable-expert-parallel --enable-ep-weight-filter --language-model-only \
   --async-scheduling --enable-prefix-caching --kv-cache-dtype fp8 \
   --attention-config '{"indexer_kv_dtype":"fp8"}' \
-  --engram-config '{"cpu_offload":true}' \
+  --engram-config "$engram_config" \
   --additional-config '{"deepseek_v41":{"execution":"ced","moe":"fused_ep_w4a8"}}' \
-  --block-size 16 \
+  --block-size 64 \
   --max-num-batched-tokens "$chunk" --max-num-seqs "$max_seqs" \
   "${server_args[@]}" \
-  --compilation-config "{\"compile_sizes\":[128,256,$chunk]}" \
   --speculative-config "{\"method\":\"dspark\",\"num_speculative_tokens\":5,\"model\":\"$model\"}" \
   "$@"

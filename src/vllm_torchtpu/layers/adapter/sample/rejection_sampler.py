@@ -19,6 +19,7 @@ import torch
 from vllm.v1.spec_decode.utils import unconditional_to_conditional_rates
 
 from vllm_torchtpu.layers.adapter.sample.top_k_top_p import apply_top_k_top_p
+from vllm_torchtpu.layers.core import table_lookup
 
 if TYPE_CHECKING:
     from vllm.config.speculative import SpeculativeConfig
@@ -197,6 +198,39 @@ class RejectionSampler:
             self.synthetic_mode,
         )
 
+    def greedy_from_head_ids(
+        self,
+        draft_token_ids: torch.Tensor,
+        num_draft_tokens: torch.Tensor,
+        head_token_ids: torch.Tensor,
+        bonus_indices: torch.Tensor,
+        target_indices: torch.Tensor,
+        segment_ids: torch.Tensor,
+        group_indices: torch.Tensor,
+        max_draft_tokens: int,
+        accept_u: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """``greedy_from_token_ids`` on the fused greedy head's per-row IDs.
+
+        Selecting the bonus and target rows runs in the same compiled program
+        as the validation, instead of as a separate program before it.
+        """
+        if self.synthetic_mode and accept_u is None:
+            raise ValueError("Synthetic rejection sampling requires accept_u.")
+        return _greedy_rejection_sample_from_head_ids(
+            draft_token_ids,
+            head_token_ids,
+            bonus_indices,
+            target_indices,
+            num_draft_tokens,
+            segment_ids,
+            group_indices,
+            max_draft_tokens,
+            accept_u,
+            self.synthetic_conditional_rates,
+            self.synthetic_mode,
+        )
+
 
 def _get_segment_info(num_draft_tokens: torch.Tensor, total_tokens: int):
     """Helper to create segment IDs and per-segment indices."""
@@ -245,6 +279,34 @@ def _greedy_rejection_sample_with_segment(
         torch.argmax(target_logits, dim=-1).to(torch.int32),
         num_draft_tokens,
         bonus_token_ids,
+        segment_ids,
+        group_indices,
+        max_draft_tokens,
+        accept_u,
+        synthetic_conditional_rates,
+        synthetic_mode,
+    )
+
+
+@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+def _greedy_rejection_sample_from_head_ids(
+    draft_token_ids: torch.Tensor,
+    head_token_ids: torch.Tensor,
+    bonus_indices: torch.Tensor,
+    target_indices: torch.Tensor,
+    num_draft_tokens: torch.Tensor,
+    segment_ids: torch.Tensor,
+    group_indices: torch.Tensor,
+    max_draft_tokens: int,
+    accept_u: torch.Tensor | None,
+    synthetic_conditional_rates: torch.Tensor | None,
+    synthetic_mode: bool,
+) -> torch.Tensor:
+    return _greedy_rejection_sample_from_token_ids(
+        draft_token_ids,
+        torch.index_select(head_token_ids, 0, target_indices),
+        num_draft_tokens,
+        torch.index_select(head_token_ids, 0, bonus_indices),
         segment_ids,
         group_indices,
         max_draft_tokens,
@@ -321,7 +383,9 @@ def _greedy_rejection_sample_from_token_ids(
     if total_tokens > 0:
         # Clamp padding segment sentinels for a safe gather.
         safe_segment_ids = segment_ids.clamp(min=0, max=batch_size - 1)
-        first_mismatch_idx_broadcast = first_mismatch_idx_per_segment[safe_segment_ids]
+        first_mismatch_idx_broadcast = table_lookup.take(
+            first_mismatch_idx_per_segment, safe_segment_ids
+        )
 
         before_mismatch = valid_slot_mask & (
             group_indices < first_mismatch_idx_broadcast

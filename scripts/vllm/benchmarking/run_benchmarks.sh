@@ -116,8 +116,8 @@ fi
 MODEL=""
 # Optional gs:// (or s3://) checkpoint URI. When set, the server streams
 # weights from object storage via --load-format runai_streamer and serves
-# under the MODEL name (for hosts without an attached disk, e.g.
-# tpu_v7x_16_queue). Clients keep using MODEL. Env-overridable so CI can
+# under the MODEL name (for hosts without the checkpoint on local disk).
+# Clients keep using MODEL. Env-overridable so CI can
 # resolve the snapshot path at runtime.
 MODEL_URI="${MODEL_URI:-}"
 TENSOR_PARALLELISM=1

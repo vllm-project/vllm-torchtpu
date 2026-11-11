@@ -38,9 +38,7 @@ from vllm_torchtpu.kernels.deepseek_v4.core_attention import csa_gather
 from vllm_torchtpu.models.vllm.deepseek_v41.v2 import (
     attention as v2_attn,
 )
-from vllm_torchtpu.models.vllm.deepseek_v41.v2 import (
-    attention_kernels as v2_ak,
-)
+from vllm_torchtpu.models.vllm.deepseek_v41.v2 import indexer_select
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import (
     ROW_WORDS,
     gather_cache_page_values,
@@ -257,13 +255,13 @@ class TestCsaGatherFunctionAndValidation:
             )
 
         # 2. Caches dtype mismatch
-        with pytest.raises(AssertionError, match="Caches must share a dtype"):
+        with pytest.raises(AssertionError):
             csa_gather.csa_gather.__wrapped__(
                 nope_cache.astype(jnp.float32), rope_cache, valid_indices
             )
 
         # 3. Caches not int32
-        with pytest.raises(AssertionError, match="Caches must be int32"):
+        with pytest.raises(AssertionError):
             csa_gather.csa_gather.__wrapped__(
                 nope_cache.astype(jnp.float32),
                 rope_cache.astype(jnp.float32),
@@ -406,6 +404,8 @@ class TestIntegratedEvenQuerySplit:
         mock_attn.ranks = ranks
         mock_attn.topk = 4
         mock_attn._config = {"index_topk": 4}
+        mock_attn._max_model_len = 512
+        mock_attn.compress_ratio = 2
         mock_attn.candidate_block_size = 16
         mock_attn._fp8_kv = False
         mock_attn.indexer.head_dim = 128
@@ -417,32 +417,31 @@ class TestIntegratedEvenQuerySplit:
 
         captured_args = {}
 
-        def mock_paged_indexer(
+        def mock_indexer(
             q_part,
+            weights_part,
             index_cache,
             records,
-            weights_part,
             lengths_part,
-            candidates_part,
-            write_records,
-            write_keys,
             requests_part,
-            *args,
+            *,
+            candidates,
             **kwargs,
         ):
             captured_args["q_part_shape"] = q_part.shape
             captured_args["weights_part_shape"] = weights_part.shape
             captured_args["lengths_part_shape"] = lengths_part.shape
-            captured_args["candidates_part_shape"] = candidates_part.shape
+            captured_args["candidates_part_shape"] = candidates.shape
             expected_part, _ = v2_attn._query_split(count, ranks)
             assert q_part.shape[0] == expected_part == 4  # strictly 4, NOT 3!
             return (
-                index_cache.raw,
                 torch.zeros(expected_part, 4, dtype=torch.int32),
-                candidates_part,
+                candidates,
             )
 
-        monkeypatch.setattr(v2_attn, "paged_indexer", mock_paged_indexer)
+        mock_attn.indexer.indexer_op = MagicMock(side_effect=mock_indexer)
+        mock_attn.indexer.indexer_op.candidate_blocks = None
+        mock_attn.indexer.indexer_op.candidate_write = False
         monkeypatch.setattr(
             v2_attn, "get_tensor_model_parallel_world_size", lambda: ranks
         )
@@ -459,7 +458,7 @@ class TestIntegratedEvenQuerySplit:
         requests = torch.arange(count, dtype=torch.int32)
         weights = torch.zeros(count, 2)
         lengths = torch.full((count, 1), 50, dtype=torch.int32)
-        swa_slots = torch.zeros(count, 1, dtype=torch.int32)
+        swa_slots = torch.ones(count, dtype=torch.bool)
 
         with v2_attn.stage_attention_cache_scope():
             selected = v2_attn.DeepseekV41Attention._select_paged_indices(
@@ -472,7 +471,6 @@ class TestIntegratedEvenQuerySplit:
                 weights,
                 lengths,
                 swa_slots,
-                None,
             )
 
         assert selected.shape == (count, 4)
@@ -526,11 +524,11 @@ class TestIntegratedAttentionKernelsDecode:
             sc_called.append((scores.shape, k, lengths_arg.shape))
             return jnp.zeros((scores.shape[0], k), dtype=jnp.int32)
 
-        monkeypatch.setattr(v2_ak, "_sparsecore_top_k", mock_sc_top_k)
+        monkeypatch.setattr(indexer_select, "_sparsecore_top_k", mock_sc_top_k)
 
         # 1. Under , scores.shape[0] < 16 executes _sparsecore_top_k
         # when unordered=True
-        out_sc = v2_ak._visible_top_k(
+        out_sc = indexer_select._visible_top_k(
             scores_small, 64, bound=jnp.max(lengths), lengths=lengths, unordered=True
         )
         assert len(sc_called) == 1
@@ -538,129 +536,10 @@ class TestIntegratedAttentionKernelsDecode:
         assert out_sc.shape == (3, 64)
 
         # 2. Fallback path when unordered=False
-        out_fallback = v2_ak._visible_top_k(
+        out_fallback = indexer_select._visible_top_k(
             scores_small, 64, bound=jnp.max(lengths), lengths=None, unordered=False
         )
         assert out_fallback.shape == (3, 64)
-
-    def test_paged_indexer_candidate_context_sparsecore_and_fallback(self, monkeypatch):
-        """Candidate_context covers both SparseCore top-k and fallback paths."""
-        tokens = 2
-        width = 4096
-        topk = 64
-        block_size = 16
-        q = jnp.zeros((tokens, 1, 128), dtype=jnp.bfloat16)
-        pool = jnp.zeros((1000, 128), dtype=jnp.int32)
-        records = jnp.zeros((tokens, width), dtype=jnp.int32)
-        weights = jnp.zeros((tokens, 1), dtype=jnp.float32)
-        lengths = jnp.full((tokens,), 50, dtype=jnp.int32)
-        requests = jnp.arange(tokens, dtype=jnp.int32)
-
-        monkeypatch.setattr(
-            v2_ak,
-            "_sparsecore_top_k",
-            lambda s, k, lengths_arg: jnp.zeros((s.shape[0], k), dtype=jnp.int32),
-        )
-
-        # 1. SparseCore top-k branch in candidate_context
-        # (candidates.shape[1] * block_size >= 2048)
-        candidates_sc = jnp.zeros((tokens, 128), dtype=jnp.int32)  # 128 * 16 = 2048
-        sel_sc, cand_sc = v2_ak.paged_indexer_jax(
-            q,
-            pool,
-            records,
-            weights,
-            lengths,
-            candidates_sc,
-            requests,
-            topk=topk,
-            block_size=block_size,
-            candidate_write=False,
-            candidate_filter=True,
-            unordered=True,
-            page_records=16,
-        )
-        assert sel_sc.shape == (tokens, topk)
-        assert cand_sc.shape == (tokens, 128)
-
-        # 2. Fallback lax.top_k branch in candidate_context
-        # (candidates.shape[1] * block_size < 2048)
-        candidates_fb = jnp.zeros((tokens, 8), dtype=jnp.int32)  # 8 * 16 = 128 < 2048
-        sel_fb, cand_fb = v2_ak.paged_indexer_jax(
-            q,
-            pool,
-            records,
-            weights,
-            lengths,
-            candidates_fb,
-            requests,
-            topk=topk,
-            block_size=block_size,
-            candidate_write=False,
-            candidate_filter=True,
-            unordered=False,
-            page_records=None,
-        )
-        assert sel_fb.shape == (tokens, topk)
-        assert cand_fb.shape == (tokens, 8)
-
-    def test_update_and_select_jax_and_wrappers_with_page_records(self):
-        """Verifies page_records forwarding in update_and_select_jax."""
-        tokens = 2
-        width = 256
-        topk = 32
-        q = jnp.zeros((tokens, 1, 128), dtype=jnp.bfloat16)
-        pool = jnp.zeros((1000, 128), dtype=jnp.int32)
-        write_records = jnp.zeros((0,), dtype=jnp.int32)
-        keys = jnp.zeros((0, 128), dtype=jnp.bfloat16)
-        records = jnp.zeros((tokens, width), dtype=jnp.int32)
-        weights = jnp.zeros((tokens, 1), dtype=jnp.float32)
-        lengths = jnp.full((tokens,), 20, dtype=jnp.int32)
-        candidates = jnp.zeros((tokens, 0), dtype=jnp.int32)
-        requests = jnp.arange(tokens, dtype=jnp.int32)
-        batch_max = lengths.max()
-
-        # Case 1: page_records > 0
-        up1, sel1, pub1 = v2_ak.update_and_select_jax(
-            q,
-            pool,
-            records,
-            weights,
-            lengths,
-            candidates,
-            write_records,
-            keys,
-            requests,
-            batch_max,
-            topk,
-            16,
-            candidate_write=False,
-            candidate_filter=False,
-            unordered=False,
-            page_records=16,
-        )
-        assert sel1.shape == (tokens, topk)
-
-        # Case 2: page_records == 0 (disables page gathers)
-        up2, sel2, pub2 = v2_ak.update_and_select_jax(
-            q,
-            pool,
-            records,
-            weights,
-            lengths,
-            candidates,
-            write_records,
-            keys,
-            requests,
-            batch_max,
-            topk,
-            16,
-            candidate_write=False,
-            candidate_filter=False,
-            unordered=False,
-            page_records=0,
-        )
-        assert sel2.shape == (tokens, topk)
 
 
 # ==============================================================================

@@ -20,7 +20,7 @@ op is built, and the one path that does build stops at `_build_op`.
 """
 
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import jax.numpy as jnp
 import numpy as np
@@ -1109,10 +1109,14 @@ def test_explicit_policy_keeps_hardware_and_placement_checks():
 
 
 @pytest.mark.parametrize("required", [False, True])
-def test_mxfp4_explicit_backend_never_silently_changes_to_gmm(required):
+def test_mxfp4_explicit_backend_never_silently_changes_to_gmm(required, monkeypatch):
     from vllm_torchtpu.layers.adapter.quantization.mxfp4 import (
         VllmDeepseekV4Mxfp4MoEMethod,
     )
+
+    # The subject is the REQUIRED policy's error; the in-op shared expert
+    # (on by default on this measurement branch) adds its own prebuild step.
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_SHARED_EXPERT", False)
 
     method = object.__new__(VllmDeepseekV4Mxfp4MoEMethod)
     method.fused_ep = required
@@ -1127,3 +1131,429 @@ def test_mxfp4_explicit_backend_never_silently_changes_to_gmm(required):
         else:
             assert method._prebuild_w4a8(layer, "silu", w13, w2, 512) is None
             build.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Static expert layout: a placed layer holds `slots` experts per shard and
+# keeps `global_num_experts` logical; the slot table rides as one more
+# replicated operand of the op.
+
+
+def _placed_layer(slots=5, experts_logical=8, **overrides):
+    """A layer `expert_placement.apply_to_layer` placed: `slots` local slots
+    over `_STUB_EP` shards of `experts_logical` logical experts."""
+    layer = _layer(experts=slots, global_num_experts=experts_logical, **overrides)
+    table = torch.full((experts_logical, 2), -1, dtype=torch.int32)
+    table[:, 0] = torch.arange(experts_logical)
+    table[0, 1] = experts_logical  # expert 0 twice: slots 0 and the spare
+    table[1, 1] = experts_logical + slots  # expert 1 twice: the other spare
+    layer._tpu_expert_slot = table
+    return layer
+
+
+def test_a_placed_layer_arms_with_more_slots_than_the_linear_split():
+    calls = []
+
+    def build_op(*args, **kwargs):
+        calls.append((args, kwargs))
+        return "op"
+
+    with patch.object(bridge.expert_placement, "physical_experts", return_value=10):
+        assert _prebuild(_placed_layer(), build_op=build_op) == "op"
+    assert calls[0][1]["has_expert_slot"] is True
+
+
+def test_an_unplaced_layer_does_not_declare_the_slot_operand():
+    calls = []
+
+    def build_op(*args, **kwargs):
+        calls.append((args, kwargs))
+        return "op"
+
+    assert _prebuild(_layer(), build_op=build_op) == "op"
+    assert calls[0][1]["has_expert_slot"] is False
+
+
+@pytest.mark.parametrize("physical", [8, 12])
+def test_a_placed_layer_whose_slots_do_not_match_its_layout_is_refused(physical):
+    with patch.object(
+        bridge.expert_placement, "physical_experts", return_value=physical
+    ):
+        assert _prebuild(_placed_layer()) is None
+
+
+def test_a_slot_table_for_another_expert_count_is_refused():
+    layer = _placed_layer()
+    layer._tpu_expert_slot = torch.zeros((9, 2), dtype=torch.int32)
+    with patch.object(bridge.expert_placement, "physical_experts", return_value=10):
+        assert _prebuild(layer) is None
+
+
+def test_op_key_tells_placed_and_unplaced_closures_apart():
+    with (
+        patch.object(bridge, "jax_op") as jax_op,
+        patch.dict(bridge._OPS, {}, clear=True),
+    ):
+        jax_op.side_effect = lambda *a, **k: MagicMock(register_fake=lambda f: None)
+        common = (
+            "mesh",
+            2,
+            True,
+            "silu",
+            None,
+            False,
+            "fp8",
+            None,
+            "softmax",
+            False,
+            1.0,
+            False,
+        )
+        with patch(
+            "vllm_torchtpu.compilation.moe_preprocessing.prepare_moe_preprocessing",
+            return_value=None,
+        ):
+            a = bridge._build_op(*common, has_expert_slot=False)
+            b = bridge._build_op(*common, has_expert_slot=True)
+            again = bridge._build_op(*common, has_expert_slot=True)
+    assert a is not b and b is again
+    # The placed closure declares one more replicated operand.
+    specs = [c.kwargs["input_partition_specs"] for c in jax_op.call_args_list]
+    assert len(specs[0]) == 7 and len(specs[1]) == 8
+    assert specs[1][-1] == bridge.PartitionSpec()
+    names = [c.args[1].__name__ for c in jax_op.call_args_list]
+    assert names == ["moe", "moe_with_expert_slot"]
+
+
+def test_forward_passes_the_slot_table_after_the_routing_operands():
+    op = MagicMock(return_value="out")
+    owner = SimpleNamespace(**{bridge.FUSED_MOE_EP_OP_ATTR: op})
+    w1 = torch.zeros(2, 4, 8, dtype=torch.float8_e4m3fn)
+    w2 = torch.zeros(2, 4, 4, dtype=torch.float8_e4m3fn)
+    s1 = torch.ones(2, 1, 1, 8)
+    s2 = torch.ones(2, 1, 1, 4)
+    x = torch.zeros(3, 4)
+    logits = torch.zeros(3, 4)
+    bias = torch.zeros(4)
+    table = torch.zeros(4, 2, dtype=torch.int32)
+    with patch.object(bridge, "_RANK_BUFFER", "rank"):
+        bridge.fused_moe_ep(owner, x, w1, w2, s1, s2, logits, bias, None, table)
+    args = op.call_args.args
+    assert args[-3] == "rank" and args[-2] is bias and args[-1] is table
+
+
+# ---------------------------------------------------------------------------
+# Routed-row accumulator (layers/adapter/expert_load.py): one more replicated,
+# donated operand and a second output.
+
+
+def test_op_with_the_load_accumulator_donates_it_and_returns_two_outputs():
+    with (
+        patch.object(bridge, "jax_op") as jax_op,
+        patch.dict(bridge._OPS, {}, clear=True),
+    ):
+        jax_op.side_effect = lambda *a, **k: MagicMock(register_fake=lambda f: None)
+        common = (
+            "mesh",
+            2,
+            True,
+            "silu",
+            None,
+            False,
+            "fp8",
+            None,
+            "softmax",
+            True,
+            1.0,
+            False,
+        )
+        with patch(
+            "vllm_torchtpu.compilation.moe_preprocessing.prepare_moe_preprocessing",
+            return_value=None,
+        ):
+            bridge._build_op(*common, has_expert_slot=True, has_expert_load=True)
+            bridge._build_op(*common, has_expert_slot=True, has_expert_load=False)
+    with_load, without = jax_op.call_args_list
+    # x, w1, w2, w1_scale, w2_scale, gating, rank, score_bias, expert_slot, expert_load
+    assert with_load.kwargs["donate_argnums"] == (9,)
+    assert len(with_load.kwargs["input_partition_specs"]) == 10
+    assert with_load.kwargs["output_partition_specs"] == (
+        bridge.PartitionSpec(bridge.EP_AXIS_NAME),
+        bridge.PartitionSpec(),
+    )
+    assert with_load.args[1].__name__ == "moe_with_score_bias_expert_slot_expert_load"
+    # torch_tpu derives the op schema from the annotations: two outputs here,
+    # one for the placed-only closure.
+    import inspect
+
+    assert inspect.signature(with_load.args[1]).return_annotation == tuple[
+        jnp.ndarray, jnp.ndarray
+    ] or (
+        inspect.signature(with_load.args[1]).return_annotation
+        == tuple[bridge.jax.Array, bridge.jax.Array]
+    )
+    assert inspect.signature(without.args[1]).return_annotation is bridge.jax.Array
+    assert without.kwargs["donate_argnums"] is None
+    assert without.kwargs["output_partition_specs"] == bridge.PartitionSpec(
+        bridge.EP_AXIS_NAME
+    )
+
+
+def test_forward_writes_the_returned_accumulator_back():
+    load = torch.zeros(8, dtype=torch.int32)
+    updated = torch.arange(8, dtype=torch.int32)
+    op = MagicMock(return_value=("out", updated))
+    owner = SimpleNamespace(**{bridge.FUSED_MOE_EP_OP_ATTR: op})
+    w1 = torch.zeros(2, 4, 8, dtype=torch.float8_e4m3fn)
+    w2 = torch.zeros(2, 4, 4, dtype=torch.float8_e4m3fn)
+    s1 = torch.ones(2, 1, 1, 8)
+    s2 = torch.ones(2, 1, 1, 4)
+    with patch.object(bridge, "_RANK_BUFFER", "rank"):
+        out = bridge.fused_moe_ep(
+            owner,
+            torch.zeros(3, 4),
+            w1,
+            w2,
+            s1,
+            s2,
+            torch.zeros(3, 4),
+            None,
+            None,
+            None,
+            load,
+        )
+    assert out == "out"
+    assert op.call_args.args[-1] is load
+    assert load.tolist() == list(range(8))
+
+
+def test_placed_hash_layer_arms_with_hash_ids_slot_table_and_load():
+    with (
+        patch.object(bridge, "jax_op") as jax_op,
+        patch.dict(bridge._OPS, {}, clear=True),
+    ):
+        jax_op.side_effect = lambda *a, **k: MagicMock(register_fake=lambda f: None)
+        common = (
+            "mesh",
+            2,
+            True,
+            "silu",
+            None,
+            False,
+            "fp8",
+            None,
+            "softmax",
+            False,
+            1.0,
+            True,
+        )
+        with patch(
+            "vllm_torchtpu.compilation.moe_preprocessing.prepare_moe_preprocessing",
+            return_value=None,
+        ):
+            bridge._build_op(*common, has_expert_slot=True, has_expert_load=True)
+            bridge._build_op(*common, has_expert_slot=True, has_expert_load=False)
+    with_load, without = jax_op.call_args_list
+    assert with_load.args[1].__name__ == "moe_with_hash_ids_expert_slot_expert_load"
+    assert without.args[1].__name__ == "moe_with_hash_ids_expert_slot"
+    assert with_load.kwargs["donate_argnums"] == (9,)
+    assert len(with_load.kwargs["input_partition_specs"]) == 10
+    assert len(without.kwargs["input_partition_specs"]) == 9
+
+
+@pytest.mark.parametrize("impl", ["push", "v2"])
+def test_build_op_picks_the_push_layer_and_passes_its_knobs(monkeypatch, impl):
+    """MOE_FUSED_EP_KERNEL_IMPL=push builds the op around fused_ep_moe_push,
+    with its knobs read from envs here (never inside kernels/) and passed as
+    arguments; v2 gets none of them."""
+    from unittest.mock import Mock
+
+    from vllm_torchtpu.kernels.experimental import push_fused_moe
+    from vllm_torchtpu.kernels.fused_moe import v2
+
+    monkeypatch.setattr(bridge, "_OPS", {})
+    closures = []
+
+    def build(name, fn, **kwargs):
+        closures.append(fn)
+        return Mock()
+
+    monkeypatch.setattr(bridge, "jax_op", build)
+    v2_kernel = Mock(side_effect=lambda x, *args, **kwargs: x)
+    push_kernel = Mock(side_effect=lambda x, *args, **kwargs: x)
+    monkeypatch.setattr(v2, "fused_ep_moe_v2", v2_kernel)
+    monkeypatch.setattr(push_fused_moe, "fused_ep_moe_push", push_kernel)
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_KERNEL_IMPL", impl)
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_SC_PREPUSH", 3)
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_TC_EXCHANGE", True)
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE", 4)
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_TAIL_BARRIER", False)
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_ONEHOT_SLOTS", True)
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_HBM_STAGING", True)
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_DISPATCH_AHEAD", 25)
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_MATMUL_SCALE_REPEAT", True)
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_EXCHANGE_ROW_GATHER", True)
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_BF16_SORT_COUNTS", True)
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_SLIM_PREPUSH_BARRIER", True)
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_FUSED_DISPATCH_META", True)
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_TABLE_KERNEL", True)
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_EXCHANGE_TABLES", True)
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_KERNEL_PLAN_TABLES", True)
+    bridge._build_op(None, 2, True, "silu", None, False)
+    x = jnp.ones((8, 8), dtype=jnp.bfloat16)
+    operands = (
+        x,
+        None,
+        None,
+        None,
+        None,
+        jnp.zeros((8, 4)),
+        jnp.zeros((1, 1), dtype=jnp.int32),
+    )
+    assert closures[0](*operands) is x
+    if impl == "push":
+        v2_kernel.assert_not_called()
+        forwarded = push_kernel.call_args.kwargs
+        assert forwarded["sc_prepush"] == 3
+        assert forwarded["tc_exchange"] is True
+        assert forwarded["height_rungs_override"] == 4
+        assert forwarded["tail_barrier"] is False
+        assert forwarded["onehot_slots"] is True
+        assert forwarded["hbm_staging"] is True
+        assert forwarded["dispatch_ahead"] == 25
+        assert forwarded["matmul_scale_repeat"] is True
+        assert forwarded["exchange_row_gather"] is True
+        assert forwarded["bf16_sort_counts"] is True
+        assert forwarded["slim_prepush_barrier"] is True
+        assert forwarded["fused_dispatch_meta"] is True
+        assert forwarded["table_kernel"] is True
+        assert forwarded["exchange_tables"] is True
+        assert forwarded["kernel_plan_tables"] is True
+    else:
+        push_kernel.assert_not_called()
+        forwarded = v2_kernel.call_args.kwargs
+        for knob in (
+            "sc_prepush",
+            "tc_exchange",
+            "height_rungs_override",
+            "tail_barrier",
+            "onehot_slots",
+            "hbm_staging",
+            "dispatch_ahead",
+            "matmul_scale_repeat",
+            "exchange_row_gather",
+            "bf16_sort_counts",
+            "slim_prepush_barrier",
+            "fused_dispatch_meta",
+            "table_kernel",
+            "exchange_tables",
+            "kernel_plan_tables",
+        ):
+            assert knob not in forwarded
+
+
+def test_shared_expert_operands_reach_the_push_layer(monkeypatch):
+    """A shared limit adds four replicated operands, hands them to the push
+    layer as `shared_expert`, and keys its own op."""
+    from vllm_torchtpu.kernels.experimental import push_fused_moe
+
+    monkeypatch.setenv("MOE_FUSED_EP_KERNEL_IMPL", "push")
+    monkeypatch.setattr(bridge, "_OPS", {})
+    built = []
+
+    def build(name, fn, **kwargs):
+        built.append((fn, kwargs))
+        return MagicMock()
+
+    monkeypatch.setattr(bridge, "jax_op", build)
+    kernel = MagicMock(side_effect=lambda x, *a, **kw: (x, x))
+    monkeypatch.setattr(push_fused_moe, "fused_ep_moe_push", kernel)
+    args = (None, 2, True, "silu", None, True)
+    plain = bridge._build_op(*args)
+    shared = bridge._build_op(*args, shared_limit=10.0)
+    assert shared is not plain
+    fn, kwargs = built[-1]
+    assert kwargs["input_partition_specs"][-4:] == (bridge.PartitionSpec(),) * 4
+    # Two outputs, two specs: one spec fails Dynamo's output pytree at compile.
+    out_specs = kwargs["output_partition_specs"]
+    assert isinstance(out_specs, tuple) and len(out_specs) == 2
+    x = jnp.ones((8, 8), dtype=jnp.bfloat16)
+    weights = tuple(jnp.full((2,), i, jnp.float32) for i in range(4))
+    operands = (x, None, None, None, None, jnp.zeros((8, 4)), jnp.zeros((1, 1)))
+    fn(*operands, *weights)
+    forwarded = kernel.call_args.kwargs
+    assert forwarded["shared_limit"] == 10.0
+    for got, want in zip(forwarded["shared_expert"], weights, strict=True):
+        assert got is want
+
+
+@pytest.mark.parametrize(
+    "impl,shared_limit", [(None, None), ("v2", None), ("push", 10.0)]
+)
+@pytest.mark.parametrize("enabled", [False, True])
+def test_mxfp4_prebuild_only_fuses_shared_expert_for_push(
+    monkeypatch, impl, shared_limit, enabled
+):
+    """V2 serving keeps its standalone shared expert with the push flag enabled."""
+    from vllm_torchtpu.layers.adapter.quantization.mxfp4 import (
+        VllmDeepseekV4Mxfp4MoEMethod,
+    )
+
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_KERNEL_IMPL", impl)
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_SHARED_EXPERT", enabled)
+    method = object.__new__(VllmDeepseekV4Mxfp4MoEMethod)
+    method.fused_ep = True
+    layer = _layer(renormalize=True, swiglu_limit=10.0)
+    w13 = torch.empty((4, 512, 1024), device="meta")
+    w2 = torch.empty((4, 512, 512), device="meta")
+    with patch.object(bridge, "prebuild_fused_moe_ep", return_value="op") as build:
+        assert method._prebuild_w4a8(layer, "silu", w13, w2, 512) == "op"
+    assert build.call_args.kwargs["shared_limit"] == (shared_limit if enabled else None)
+
+
+def test_shared_expert_needs_the_push_kernel(monkeypatch):
+    monkeypatch.setenv("MOE_FUSED_EP_KERNEL_IMPL", "v2")
+    monkeypatch.setattr(bridge, "_OPS", {})
+    monkeypatch.setattr(bridge, "jax_op", lambda *a, **kw: MagicMock())
+    with pytest.raises(ValueError, match="push"):
+        bridge._build_op(None, 2, True, "silu", None, True, shared_limit=10.0)
+
+
+def _runner_with_shared(limit, shared_limit=10.0):
+    routed = SimpleNamespace()
+    calls = []
+
+    def forward(layer, x, logits, input_ids, shared):
+        calls.append(shared)
+        return "routed", "shared"
+
+    routed.quant_method = SimpleNamespace(
+        shared_expert_limit=limit, forward_monolithic_with_shared_expert=forward
+    )
+    mlp = SimpleNamespace(
+        fused_operands=lambda: ("w13", "s13", "w2", "s2", shared_limit)
+    )
+    runner = SimpleNamespace(
+        _quant_method=routed.quant_method, routed_experts=routed, _tpu_shared_mlp=mlp
+    )
+    return runner, calls
+
+
+def test_runner_takes_the_shared_expert_from_the_fused_op():
+    runner, calls = _runner_with_shared(10.0)
+    hidden = torch.zeros(2, 4)
+    out = VllmMoERunner._apply_quant_method(runner, hidden, torch.zeros(2, 3), hidden)
+    assert out == ("shared", "routed")
+    assert calls == [("w13", "s13", "w2", "s2")]
+
+
+def test_runner_refuses_a_shared_expert_the_op_was_not_built_for():
+    runner, _ = _runner_with_shared(10.0, shared_limit=7.0)
+    hidden = torch.zeros(2, 4)
+    with pytest.raises(ValueError, match="swiglu limit"):
+        VllmMoERunner._apply_quant_method(runner, hidden, torch.zeros(2, 3), hidden)
+    runner, _ = _runner_with_shared(10.0)
+    with pytest.raises(NotImplementedError):
+        VllmMoERunner._apply_quant_method(
+            runner, hidden, torch.zeros(2, 3), hidden.clone()
+        )

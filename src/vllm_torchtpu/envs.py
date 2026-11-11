@@ -8,11 +8,34 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_CED: bool = False
+    TPU_DEEPSEEK_V41_CED_IDENTITY_REPLAY: bool = True
+    TPU_DEEPSEEK_V41_ENGRAM_FUSED_HASH: bool = True
+    TPU_DEEPSEEK_V41_ENGRAM_MASKS_IN_HASH: bool = True
+    TPU_DEEPSEEK_V41_ENGRAM_INT32_SLOT_WRITE: bool = True
+    TPU_DEEPSEEK_V41_ENGRAM_TILE_SCATTER: bool = True
+    TPU_DEEPSEEK_V41_ENGRAM_FUSED_PREP: bool = True
     TPU_DEEPSEEK_V41_IMPL: str = "v2"
     TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD: bool = False
+    TPU_DEEPSEEK_V41_ENGRAM_HBM: str = "auto"
+    TPU_DEEPSEEK_V41_DECODE_FUSION: str = "auto"
+    TPU_DEEPSEEK_V41_INDEXER_ISSUE_DEPTH: int | None = 8
+    TPU_DEEPSEEK_V41_REUSE_WINDOW_STARTS: bool = True
+    TPU_DEEPSEEK_V41_MHC_RESIDENT_GATES: bool = True
+    TPU_DEEPSEEK_V41_MHC_EARLY_PREP: bool = True
+    TPU_DEEPSEEK_V41_MHC_SHIFTED_T16: bool = True
+    TPU_DEEPSEEK_V41_DSPARK_PALLAS_LOGITS: bool = True
+    TPU_DEEPSEEK_V41_BLOCKED_ROPE_GATHER: bool = True
+    TPU_DEEPSEEK_V41_QB_ROPE_EXACT_ROWS: bool = True
+    TPU_DEEPSEEK_V41_CSA2_DEEP_GATHER: bool = True
     TPU_K3_SP_PREFILL: bool = False
     TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD: bool = True
+    TPU_ONEHOT_TABLE_LOOKUP: bool = True
+    TPU_INLINE_DEDUPLICATED_CALLS: bool = True
     TPU_VERIFY_INCREMENTAL_BLOCK_TABLE: bool = False
+    TPU_ROPE_PAIRED_ROWS: bool = True
+    TPU_BLOCK_TABLE_DELTA_BUCKETS: bool = True
+    TPU_FUSED_SPEC_NEXT_INPUTS: bool = True
+    TPU_DSPARK_DRAFT_MOE_TUNING: bool = True
     LIBTPU_INIT_ARGS: str = ""
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
@@ -81,6 +104,29 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_PREPROCESS_BACKEND: str = "native"
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
+    TPU_MOE_EPLB_DYNAMIC: bool = False
+    TPU_MOE_EPLB_WINDOW_STEPS: int = 16
+    TPU_MOE_EPLB_MIN_GAIN: float = 0.005
+    TPU_MOE_EPLB_MOVER_STEP_BUDGET_MB: int = 256
+    MOE_FUSED_EP_PUSH_SC_PREPUSH: int = 2
+    MOE_FUSED_EP_PUSH_TC_EXCHANGE: bool = False
+    MOE_FUSED_EP_PUSH_TAIL_BARRIER: bool = False
+    MOE_FUSED_EP_PUSH_ONEHOT_SLOTS: bool = True
+    MOE_FUSED_EP_PUSH_HBM_STAGING: bool = True
+    MOE_FUSED_EP_PUSH_DISPATCH_AHEAD: int = 25
+    MOE_FUSED_EP_PUSH_MATMUL_SCALE_REPEAT: bool = True
+    MOE_FUSED_EP_PUSH_EXCHANGE_ROW_GATHER: bool = True
+    MOE_FUSED_EP_PUSH_BF16_SORT_COUNTS: bool = True
+    MOE_FUSED_EP_PUSH_SLIM_PREPUSH_BARRIER: bool = True
+    MOE_FUSED_EP_PUSH_FUSED_DISPATCH_META: bool = True
+    MOE_FUSED_EP_PUSH_TABLE_KERNEL: bool = True
+    MOE_FUSED_EP_PUSH_EXCHANGE_TABLES: bool = True
+    MOE_FUSED_EP_PUSH_KERNEL_PLAN_TABLES: bool = True
+    MOE_FUSED_EP_PUSH_SHARED_EXPERT: bool = True
+    MOE_FUSED_EP_PUSH_LIGHT_PREPUSH: int = 2
+    MOE_FUSED_EP_PUSH_SINGLE_BARRIER: bool = True
+    MOE_FUSED_EP_PUSH_EARLY_SCALE_SCATTER: int = 2
+    TPU_EXPERT_PLACEMENT: str = ""
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_PP_DYNAMIC_CHUNKS: bool = True
@@ -150,6 +196,9 @@ if TYPE_CHECKING:
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
+    TPU_GC_POLICY: str = "freeze"
+    TPU_GC_COLLECT_EVERY: int = 500
+    TPU_GC_TRACE: bool = False
 
 
 def env_with_choices(
@@ -340,15 +389,19 @@ def env_optional_int(env_name: str) -> Callable[[], int | None]:
     return _get_optional_int_env
 
 
-def env_positive_int_or_none(env_name: str) -> Callable[[], int | None]:
+def env_positive_int_or_none(
+    env_name: str, default: int | None = None
+) -> Callable[[], int | None]:
     """Optional size knob that must be greater than zero when it is set.
 
-    Unset or empty reads as ``None``, meaning the feature is off.
+    Unset or empty reads as ``default`` (``None`` means the feature is off).
     """
     parse_int = env_optional_int(env_name)
 
     def _get_positive_int_or_none_env() -> int | None:
         value = parse_int()
+        if value is None:
+            value = default
         if value is not None and value <= 0:
             raise ValueError(f"Invalid value '{value}' for {env_name}: must be > 0.")
         return value
@@ -361,8 +414,47 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Decoder SWA bounded replay is approximate. Keep full-forward as the
     # default/reference until matched model-quality and performance validation.
     "TPU_DEEPSEEK_V41_CED": env_bool("TPU_DEEPSEEK_V41_CED"),
+    # CED: when the decoder replays every row in place (steady decode), pass
+    # the encoder outputs straight to the decoder stage and return its output
+    # as is, instead of eager gathers and an index_copy scatter by the
+    # identity (v2/model.py). Outputs are unchanged.
+    "TPU_DEEPSEEK_V41_CED_IDENTITY_REPLAY": env_bool(
+        "TPU_DEEPSEEK_V41_CED_IDENTITY_REPLAY", default=True
+    ),
+    # Engram n-gram hash on device as one fused program with exact 64-bit
+    # arithmetic on uint32 pairs (kernels/engram_hash.py), instead of the
+    # eager int64 torch ops XLA emulates op by op. Hash ids are unchanged.
+    "TPU_DEEPSEEK_V41_ENGRAM_FUSED_HASH": env_bool(
+        "TPU_DEEPSEEK_V41_ENGRAM_FUSED_HASH", default=True
+    ),
+    # With the fused Engram hash, derive the image-sentinel dead masks of the
+    # input and lookback ids inside the slot-cache write and the hash program
+    # instead of in two eager compare programs ahead of them. Same integers
+    # (bit-exact). Requires TPU_DEEPSEEK_V41_ENGRAM_FUSED_HASH. Default off.
+    "TPU_DEEPSEEK_V41_ENGRAM_MASKS_IN_HASH": env_bool(
+        "TPU_DEEPSEEK_V41_ENGRAM_MASKS_IN_HASH", default=True
+    ),
+    # Engram slot-cache write: derive the slots and map the token ids in int32,
+    # one compiled program each (v2/engram.py), instead of eager int64 torch
+    # ops. Same slots, same cache contents.
+    "TPU_DEEPSEEK_V41_ENGRAM_INT32_SLOT_WRITE": env_bool(
+        "TPU_DEEPSEEK_V41_ENGRAM_INT32_SLOT_WRITE", default=True
+    ),
+    # With the int32 slot write: scatter into the slot cache by 128-entry tile
+    # read-modify-writes (kernels/deepseek_v41/tile_scatter.py), costing per
+    # touched tile instead of XLA's pass over the whole cache. Same contents.
+    "TPU_DEEPSEEK_V41_ENGRAM_TILE_SCATTER": env_bool(
+        "TPU_DEEPSEEK_V41_ENGRAM_TILE_SCATTER", default=True
+    ),
+    # With the fused hash, masks in hash and the int32 slot write: issue the
+    # decode Engram slot derivation, slot write, hash and keep mask as one op
+    # call (kernels/engram_hash.py engram_prep) instead of five, to cut host
+    # dispatch time ahead of the encoder. Same hashes and cache contents.
+    "TPU_DEEPSEEK_V41_ENGRAM_FUSED_PREP": env_bool(
+        "TPU_DEEPSEEK_V41_ENGRAM_FUSED_PREP", default=True
+    ),
     # Deprecated aliases, resolved by the DSV41 serving-policy verifier.
-    # Serving supports v2; v1 remains only as a standalone reference.
+    # v1 was removed; the verifier rejects it with a clear message.
     "TPU_DEEPSEEK_V41_IMPL": env_with_choices(
         "TPU_DEEPSEEK_V41_IMPL", "v2", ["v1", "v2"]
     ),
@@ -372,6 +464,88 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD": env_bool(
         "TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD", default=False
     ),
+    # With Engram CPU offload and head-sharded host tables (dp_shared_memory
+    # off, or its /dev/shm fallback), serve Engram layers from an HBM copy of
+    # each rank's host head shard, looked up on device across the node-local
+    # DP group (common/engram_hbm.py), instead of the per-step host gather and
+    # gloo exchange. DP-shared host tables need no exchange and keep the host
+    # path. "first": only the first Engram layer (layer 1, which only layer 0
+    # can hide; later layers keep the host path, overlapped with the layers
+    # before them); "all": every Engram layer; "off": keep all layers on the
+    # host path; "auto" (default): "first" when the EP group has >= 16 ranks,
+    # else "off". Each HBM layer costs ~11.8 GiB per rank at 8 ranks per node.
+    "TPU_DEEPSEEK_V41_ENGRAM_HBM": env_with_choices(
+        "TPU_DEEPSEEK_V41_ENGRAM_HBM",
+        "auto",
+        ["auto", "off", "first", "all"],
+        case_sensitive=False,
+    ),
+    # DSv4.1 decode preparation region fusions (decode_preparation.admit).
+    # "auto" (default): fuse measured decode buckets and log one warning per
+    # unsupported decode-sized region; "off": always take the native paths
+    # (A/B baseline); "require": raise when a decode-sized region cannot fuse.
+    "TPU_DEEPSEEK_V41_DECODE_FUSION": env_with_choices(
+        "TPU_DEEPSEEK_V41_DECODE_FUSION",
+        "auto",
+        ["auto", "off", "require"],
+        case_sensitive=False,
+    ),
+    # Packed FP8 dense indexer scorer: fragments in flight between the QK
+    # matmul and the head reduction (unset: the tuned 10). Scheduling only:
+    # the head-sum split stays keyed to the tuned depth (bit-exact).
+    "TPU_DEEPSEEK_V41_INDEXER_ISSUE_DEPTH": env_positive_int_or_none(
+        "TPU_DEEPSEEK_V41_INDEXER_ISSUE_DEPTH", default=8
+    ),
+    # CED decode: reuse the per-request SWA window-starts device tensor while
+    # the replay starts are unchanged, instead of building and uploading it in
+    # every step's host path ahead of the encoder. Same values (bit-exact).
+    # Default off until measured.
+    "TPU_DEEPSEEK_V41_REUSE_WINDOW_STARTS": env_bool(
+        "TPU_DEEPSEEK_V41_REUSE_WINDOW_STARTS", default=True
+    ),
+    # Shifted mHC: emit the next layer's gates T tokens wide (not padded to a
+    # multiple of 128) and read them as compiler-managed VMEM inputs, so the
+    # gates pass between layers without slice/transpose ops. Layout only;
+    # outputs are unchanged.
+    "TPU_DEEPSEEK_V41_MHC_RESIDENT_GATES": env_bool(
+        "TPU_DEEPSEEK_V41_MHC_RESIDENT_GATES", default=True
+    ),
+    # Shifted mHC: build the first tile's gate coefficients while the first
+    # activation tiles are still in flight (scheduling only; outputs unchanged).
+    "TPU_DEEPSEEK_V41_MHC_EARLY_PREP": env_bool(
+        "TPU_DEEPSEEK_V41_MHC_EARLY_PREP", default=True
+    ),
+    # Shifted mHC: also run token counts that are a multiple of 16 but not 32
+    # (the DSpark drafter's 240 rows) through the fused kernel, with 16-token
+    # mix groups, instead of the unfused post + delayed-pre fallback. Changes
+    # only the drafter's rounding.
+    "TPU_DEEPSEEK_V41_MHC_SHIFTED_T16": env_bool(
+        "TPU_DEEPSEEK_V41_MHC_SHIFTED_T16", default=True
+    ),
+    # DSpark decode sampler: compute the drafter's BF16 base logits with the
+    # Pallas full-K head (kernels/logits_head.py) instead of the XLA dot.
+    # Changes only the draft logits' rounding (FP32 accumulation order).
+    "TPU_DEEPSEEK_V41_DSPARK_PALLAS_LOGITS": env_bool(
+        "TPU_DEEPSEEK_V41_DSPARK_PALLAS_LOGITS", default=True
+    ),
+    # Gather RoPE table rows (attention preprocessing, CSA2 inverse RoPE) as
+    # 256-row gathers when a step has 257..1024 rows
+    # (`rope_gather.by_row_blocks`). Data movement only; outputs unchanged.
+    "TPU_DEEPSEEK_V41_BLOCKED_ROPE_GATHER": env_bool(
+        "TPU_DEEPSEEK_V41_BLOCKED_ROPE_GATHER", default=True
+    ),
+    # Fused Q-B/RoPE at token counts that are not a multiple of 32 (the DSpark
+    # drafter's 240 rows): write only the real rows instead of slicing a padded
+    # [256, 64, 512] result. Same values (bit-exact).
+    "TPU_DEEPSEEK_V41_QB_ROPE_EXACT_ROWS": env_bool(
+        "TPU_DEEPSEEK_V41_QB_ROPE_EXACT_ROWS", default=True
+    ),
+    # CSA2 SparseCore word/scale gather: three staging slots in flight and
+    # DMA-zeroed invalid rows instead of two slots cleared by vector stores
+    # (csa2/cache.py). Gathered rows are unchanged.
+    "TPU_DEEPSEEK_V41_CSA2_DEEP_GATHER": env_bool(
+        "TPU_DEEPSEEK_V41_CSA2_DEEP_GATHER", default=True
+    ),
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL": env_bool("TPU_K3_SP_PREFILL", default=False),
     # Keep the staged block tables on device between steps and upload only
@@ -380,10 +554,46 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD": env_bool(
         "TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD", default=True
     ),
+    # Look up per-request tables (query starts, sequence lengths, window
+    # starts) by token as a one-hot sum instead of a gather or a bucketize
+    # (`layers/core/table_lookup.py`). Integer-exact.
+    "TPU_ONEHOT_TABLE_LOOKUP": env_bool("TPU_ONEHOT_TABLE_LOOKUP", default=True),
+    # Compile without libtpu's deduplicated calls (--xla_tpu_enable_deduplicated_calls=
+    # false). With them, a program of many identical layers calls shared functions
+    # from every layer; when one layer's functions exceed the instruction region,
+    # each layer reloads its code (env_override.py). Code layout only.
+    "TPU_INLINE_DEDUPLICATED_CALLS": env_bool(
+        "TPU_INLINE_DEDUPLICATED_CALLS", default=True
+    ),
     # Debug: on every incremental step, rebuild the full packed table on the
     # host and check it against the device-resident copy (raises on mismatch).
     "TPU_VERIFY_INCREMENTAL_BLOCK_TABLE": env_bool(
         "TPU_VERIFY_INCREMENTAL_BLOCK_TABLE", default=False
+    ),
+    # Pad each block-table delta upload to 64, 512 or 8192 entries, whichever
+    # first holds it, instead of always 8192 (layers/core/block_table_delta.py).
+    # Same table contents; the device scatter's cost follows the padded length.
+    "TPU_BLOCK_TABLE_DELTA_BUCKETS": env_bool(
+        "TPU_BLOCK_TABLE_DELTA_BUCKETS", default=True
+    ),
+    # Async spec decode: build the next step's substitution source and rejected
+    # counts, and correct seq_lens/positions by them, each as one compiled
+    # program with vector table lookups instead of a program per eager op
+    # (runner/tpu_runner_async_output.py). Integer-exact.
+    "TPU_FUSED_SPEC_NEXT_INPUTS": env_bool("TPU_FUSED_SPEC_NEXT_INPUTS", default=True),
+    # Also keep each 64-wide FP32 RoPE table packed two rows per 128-lane row
+    # (`_tpu_rope_pairs`, runner.utils.relayout_rope_tables) and gather the
+    # per-step rows from it: a full-lane gather instead of a half-lane one.
+    # Costs one extra copy of the compact table in HBM. Bit-exact.
+    "TPU_ROPE_PAIRED_ROWS": env_bool("TPU_ROPE_PAIRED_ROWS", default=True),
+    # DSpark draft layers under MOE_FUSED_EP_KERNEL_IMPL=push: build their
+    # fused EP op with sc_prepush=1 and two tile-height rungs instead of the
+    # process-wide MOE_FUSED_EP_PUSH_SC_PREPUSH / ..._HEIGHT_RUNGS_OVERRIDE.
+    # Target layers are untouched. EP16 draft shape on 2x v7x hosts
+    # (t_local=240, topk=3, 8 local experts): 161.8 -> 135.8 us per layer
+    # (kernel + exposed SparseCore wait), output bit-identical.
+    "TPU_DSPARK_DRAFT_MOE_TUNING": env_bool(
+        "TPU_DSPARK_DRAFT_MOE_TUNING", default=True
     ),
     # QK pair-blocked pooled GDN conv layout: full-width states interleave
     # Q and K row-pairs per tap so a TP-rank shard's first conv token maps
@@ -641,6 +851,32 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # weight-bandwidth bound and the per-device expert load is badly
     # imbalanced. See K3_HIERARCHICAL_EP_PLAN.md.
     "TPU_MOE_HIERARCHICAL_EP": env_bool("TPU_MOE_HIERARCHICAL_EP"),
+    # A static expert layout for the fused EP MoE kernel (expert_placement.py):
+    # a shipped layout's name, a path or a gs:// URI naming, per MoE layer,
+    # which global experts each EP rank holds and in what slot order, with
+    # spare slots holding replicas. Harness alias of
+    # additional_config.deepseek_v41.expert_layout. Empty: the checkpoint's
+    # contiguous blocks.
+    "TPU_EXPERT_PLACEMENT": env_str("TPU_EXPERT_PLACEMENT", ""),
+    # Dynamic expert re-layout (expert_relayout.py): on every clean window of
+    # WINDOW_STEPS coordinated steps, re-solve the layout from the kernel's
+    # load counts, re-lay a layer only when its slowest rank's rows drop by at
+    # least MIN_GAIN (relative), and copy the moved experts into the staging
+    # slots with tpu-sync raw transfers, at most STEP_BUDGET_MB of DMA per
+    # step. Initialized automatically with contiguous blocks + 1 redundant
+    # slot + 2 staging slots per rank when enabled.
+    # NOTE: Enabling this feature requires a tpu-sync-torch build with
+    # major_slice_bytes and FP4 (float4_e2m1fn_x2) raw-transfer support;
+    # otherwise leave this feature disabled (default off).
+    "TPU_MOE_EPLB_DYNAMIC": env_bool("TPU_MOE_EPLB_DYNAMIC"),
+    # Clean decode steps per load window before triggering a re-layout solve.
+    "TPU_MOE_EPLB_WINDOW_STEPS": env_nonnegative_int("TPU_MOE_EPLB_WINDOW_STEPS", 16),
+    # Minimum relative reduction in slowest-rank load required to adopt a plan.
+    "TPU_MOE_EPLB_MIN_GAIN": env_float("TPU_MOE_EPLB_MIN_GAIN", 0.005),
+    # Per-step H2D DMA budget in MiB for staging moved expert slabs (0 = unbounded).
+    "TPU_MOE_EPLB_MOVER_STEP_BUDGET_MB": env_nonnegative_int(
+        "TPU_MOE_EPLB_MOVER_STEP_BUDGET_MB", 256
+    ),
     # MoE router top-k implementation: "rowmax" (default) is the sort-free
     # k-pass selection, "sort" is torch.topk, kept as an escape hatch.
     "TPU_MOE_ROUTER_TOPK": env_with_choices(
@@ -658,8 +894,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Explicit implementation selection also enables fused EP. When unset,
     # preserve the legacy enable flag and v2 behavior. Adaptive owns its
     # admission, automatically supports FP4 and never falls back to GMM.
+    # "push" is v2 with the activation all-gather replaced by point-to-point
+    # push dispatch (kernels/experimental/push_fused_moe), same admission.
     "MOE_FUSED_EP_KERNEL_IMPL": env_with_choices(
-        "MOE_FUSED_EP_KERNEL_IMPL", None, ["v2", "adaptive"]
+        "MOE_FUSED_EP_KERNEL_IMPL", None, ["v2", "adaptive", "push"]
     ),
     # Opt in to NVFP4 W4A8 in fused EP MoE v2. Requires the fused EP switch
     # above; defaults off so enabling fused EP alone preserves NVFP4 W4A16.
@@ -686,6 +924,100 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # kernel.
     "MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE": lambda: int(
         os.getenv("MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE", "0") or 0
+    ),
+    # MOE_FUSED_EP_KERNEL_IMPL=push: how many destination expert-visit
+    # positions the SparseCore pushes before the TensorCore MoE kernel starts
+    # (clamped to [1, experts per shard]); the kernel pushes the rest.
+    "MOE_FUSED_EP_PUSH_SC_PREPUSH": env_int("MOE_FUSED_EP_PUSH_SC_PREPUSH", 2),
+    # MOE_FUSED_EP_KERNEL_IMPL=push: run the routing-metadata exchange as a
+    # TensorCore remote-DMA kernel instead of XLA's (SparseCore-offloaded)
+    # all-gather, keeping it off the SparseCore queue.
+    "MOE_FUSED_EP_PUSH_TC_EXCHANGE": env_bool("MOE_FUSED_EP_PUSH_TC_EXCHANGE"),
+    # MOE_FUSED_EP_KERNEL_IMPL=push: keep the all-pairs barrier the expert
+    # kernel runs after its transport drain. 0 drops it; the drain's exact
+    # counts already cover every write a peer makes during the call.
+    "MOE_FUSED_EP_PUSH_TAIL_BARRIER": env_bool(
+        "MOE_FUSED_EP_PUSH_TAIL_BARRIER", default=False
+    ),
+    # MOE_FUSED_EP_KERNEL_IMPL=push with an expert layout: map each selected
+    # expert to its replica slot with a one-hot matmul instead of two gathers.
+    "MOE_FUSED_EP_PUSH_ONEHOT_SLOTS": env_bool(
+        "MOE_FUSED_EP_PUSH_ONEHOT_SLOTS", default=True
+    ),
+    # MOE_FUSED_EP_KERNEL_IMPL=push: ship the expert kernel's result tiles
+    # through its HBM contribution slab instead of straight from VMEM, so the
+    # remote pushes do not hold a VMEM staging slot while the fabric drains.
+    "MOE_FUSED_EP_PUSH_HBM_STAGING": env_bool(
+        "MOE_FUSED_EP_PUSH_HBM_STAGING", default=True
+    ),
+    # MOE_FUSED_EP_KERNEL_IMPL=push: how many visit positions the expert
+    # kernel's own dispatch pushes run ahead of its compute (>= 1); the experts
+    # per shard or more pushes every position right after the head barrier.
+    "MOE_FUSED_EP_PUSH_DISPATCH_AHEAD": env_int("MOE_FUSED_EP_PUSH_DISPATCH_AHEAD", 25),
+    # MOE_FUSED_EP_KERNEL_IMPL=push: build the scale slab's per-pair row
+    # scales with a one-hot matmul instead of jnp.repeat.
+    "MOE_FUSED_EP_PUSH_MATMUL_SCALE_REPEAT": env_bool(
+        "MOE_FUSED_EP_PUSH_MATMUL_SCALE_REPEAT", default=True
+    ),
+    # MOE_FUSED_EP_KERNEL_IMPL=push with MOE_FUSED_EP_PUSH_TC_EXCHANGE=1: the
+    # routing-exchange kernel also copies the expert-sorted activation rows
+    # while it waits on its peers.
+    "MOE_FUSED_EP_PUSH_EXCHANGE_ROW_GATHER": env_bool(
+        "MOE_FUSED_EP_PUSH_EXCHANGE_ROW_GATHER", default=True
+    ),
+    # MOE_FUSED_EP_KERNEL_IMPL=push: find the expert-sorted token order with
+    # two single-pass bf16 matmuls instead of a cumsum and a HIGHEST matmul.
+    "MOE_FUSED_EP_PUSH_BF16_SORT_COUNTS": env_bool(
+        "MOE_FUSED_EP_PUSH_BF16_SORT_COUNTS", default=True
+    ),
+    # MOE_FUSED_EP_KERNEL_IMPL=push: keep the run tables out of the barrier
+    # that orders the SparseCore pre-push ahead of the routing plan.
+    "MOE_FUSED_EP_PUSH_SLIM_PREPUSH_BARRIER": env_bool(
+        "MOE_FUSED_EP_PUSH_SLIM_PREPUSH_BARRIER", default=True
+    ),
+    # MOE_FUSED_EP_KERNEL_IMPL=push: build the pre-push counts and the
+    # kernel's remote-row count with the dispatch segments, in fewer ops.
+    "MOE_FUSED_EP_PUSH_FUSED_DISPATCH_META": env_bool(
+        "MOE_FUSED_EP_PUSH_FUSED_DISPATCH_META", default=True
+    ),
+    # MOE_FUSED_EP_KERNEL_IMPL=push: build the dispatch and shard tables in
+    # one TensorCore kernel (plan_kernel.py) instead of ~50 XLA ops.
+    "MOE_FUSED_EP_PUSH_TABLE_KERNEL": env_bool(
+        "MOE_FUSED_EP_PUSH_TABLE_KERNEL", default=True
+    ),
+    # With TABLE_KERNEL=1 and EXCHANGE_ROW_GATHER=1: build the tables inside
+    # the routing-exchange kernel while its row copies finish.
+    "MOE_FUSED_EP_PUSH_EXCHANGE_TABLES": env_bool(
+        "MOE_FUSED_EP_PUSH_EXCHANGE_TABLES", default=True
+    ),
+    # With TABLE_KERNEL=1: the routing plan's small tables come from the
+    # table kernel too; XLA keeps only the per-pair lookups.
+    "MOE_FUSED_EP_PUSH_KERNEL_PLAN_TABLES": env_bool(
+        "MOE_FUSED_EP_PUSH_KERNEL_PLAN_TABLES", default=True
+    ),
+    # MOE_FUSED_EP_KERNEL_IMPL=push with TABLE_KERNEL=1: the SparseCore
+    # pre-push carries the lightest experts instead of the heaviest; the rest
+    # most rows first (1) or rising to the heaviest and falling back (2).
+    # Layers with fewer than 16 local slots keep the default order.
+    "MOE_FUSED_EP_PUSH_LIGHT_PREPUSH": env_int("MOE_FUSED_EP_PUSH_LIGHT_PREPUSH", 2),
+    # MOE_FUSED_EP_KERNEL_IMPL=push: the expert kernel and the TensorCore
+    # routing exchange open with one all-pairs barrier phase instead of two.
+    "MOE_FUSED_EP_PUSH_SINGLE_BARRIER": env_bool(
+        "MOE_FUSED_EP_PUSH_SINGLE_BARRIER", default=True
+    ),
+    # MOE_FUSED_EP_KERNEL_IMPL=push with the in-op shared expert: the
+    # activation scale-slab scatter (a SparseCore offload) is not held behind
+    # the shared expert (1), nor behind the SparseCore pre-push (2), so it can
+    # run while the TensorCore computes the shared expert.
+    "MOE_FUSED_EP_PUSH_EARLY_SCALE_SCATTER": env_int(
+        "MOE_FUSED_EP_PUSH_EARLY_SCALE_SCATTER", 2
+    ),
+    # MOE_FUSED_EP_KERNEL_IMPL=push: run the layer's FP8 shared expert as one
+    # kernel (kernels/quantized_matmul/shared_expert.py) inside the MoE op,
+    # issued after the SparseCore pre-push and ahead of the expert kernel, so
+    # the TensorCore computes it while the pre-push is in flight.
+    "MOE_FUSED_EP_PUSH_SHARED_EXPERT": env_bool(
+        "MOE_FUSED_EP_PUSH_SHARED_EXPERT", default=True
     ),
     # Shard Kimi K3's latent-MoE down/up projections across the cores of a
     # chip instead of replicating them. They are unquantized [7168, 3584] and
@@ -909,6 +1241,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MM_ENCODER_FRAME_CHUNK_PATCH_SIZE": env_nonnegative_int(
         "MM_ENCODER_FRAME_CHUNK_PATCH_SIZE", 0
     ),
+    # How the Python cyclic collector is run while serving (gc_policy.py).
+    # 'freeze' takes the post-warmup heap out of its reach and replaces
+    # automatic collection with one explicit collection every
+    # TPU_GC_COLLECT_EVERY DP-coordinated steps, which every rank reaches
+    # together; 0 never collects. 'default' leaves CPython's own cadence.
+    "TPU_GC_POLICY": env_with_choices("TPU_GC_POLICY", "freeze", ["default", "freeze"]),
+    "TPU_GC_COLLECT_EVERY": env_nonnegative_int("TPU_GC_COLLECT_EVERY", 500),
+    # Log every cyclic collection of 2 ms or more in the model runner and the
+    # engine core (generation, duration, wall-clock ns), to line stalls up
+    # with collections in the step records. Independent of TPU_GC_POLICY.
+    "TPU_GC_TRACE": env_bool("TPU_GC_TRACE", default=False),
 }
 
 

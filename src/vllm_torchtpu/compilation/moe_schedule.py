@@ -5,6 +5,7 @@ Graph-only protobuf fields follow openxla/xla's xla/service/hlo.proto.
 Unknown fields (including layouts and backend configs) round-trip unchanged.
 """
 
+import gc
 import heapq
 import json
 import threading
@@ -154,6 +155,112 @@ def _sort(comp: Any, sequence: Any, priority_ids: dict[int, int]) -> None:
         sequence.instruction_ids.extend(n.id for n in ordered)
 
 
+# Ops a metadata wait cannot usefully hold: free, collective or control flow.
+_NOT_FILLERS = {
+    "parameter",
+    "constant",
+    "get-tuple-element",
+    "bitcast",
+    "tuple",
+    "all-gather",
+    "all-reduce",
+    "all-to-all",
+    "collective-permute",
+    "reduce-scatter",
+    "send",
+    "recv",
+    "infeed",
+    "outfeed",
+    "call",
+    "conditional",
+    "while",
+}
+
+
+def _reach(seeds: list[int], edges: dict[int, list[int]]) -> set[int]:
+    seen: set[int] = set()
+    stack = list(seeds)
+    while stack:
+        n = stack.pop()
+        if n not in seen:
+            seen.add(n)
+            stack.extend(edges[n])
+    return seen
+
+
+def _fill_metadata_waits(
+    by_id: dict[int, Any],
+    layers: list[tuple[Any, Any, Any]],
+    kernels: list[Any],
+    positions: dict[int, int],
+) -> bool:
+    """Run each layer's metadata-independent TensorCore work inside its wait.
+
+    The TensorCore otherwise idles in the metadata all-gather's done while
+    work that never reads it (in decode, the shared expert's gate/up, the next
+    sublayer's mHC mixing and the local half of the routing plan) waits until
+    after it. Candidates follow the previous MoE kernel, so later layers'
+    position-only work stays put. Work after this kernel or after any
+    completion, and inputs of submissions that do not depend on this layer,
+    keep their place; the first layer of a graph has no bound and is skipped.
+    """
+    inputs = {
+        n: [*node.operand_ids, *node.control_predecessor_ids]
+        for n, node in by_id.items()
+    }
+    users: dict[int, list[int]] = {n: [] for n in by_id}
+    for n, deps in inputs.items():
+        for d in deps:
+            users[d].append(n)
+    changed = False
+    for kernel, metadata_start, metadata_done in layers:
+        # Recomputed per layer: earlier layers' edges are part of the graph.
+        needed = _reach([metadata_start.id], inputs)
+        earlier = [k for k in kernels if k.id in needed]
+        if not earlier:
+            continue
+        previous = max(earlier, key=lambda k: positions[k.id])
+        after = _reach(
+            [kernel.id]
+            + [
+                n
+                for n, node in by_id.items()
+                if node.opcode.endswith("-done") and n not in needed
+            ],
+            users,
+        )
+        feeding = _reach(
+            [
+                n
+                for n, node in by_id.items()
+                if node.opcode.endswith(("-start", "-update"))
+                and n not in needed
+                and n not in after
+            ],
+            inputs,
+        )
+        fillers = [
+            n
+            for n in _reach([previous.id], users)
+            if n not in needed
+            and n not in after
+            and n not in feeding
+            and by_id[n].opcode not in _NOT_FILLERS
+            and not by_id[n].opcode.endswith(("-start", "-update", "-done"))
+        ]
+        # A filler is neither needed by the submission nor reachable from the
+        # completion, so neither edge closes a cycle.
+        for n in fillers:
+            for before, after_id in ((metadata_start.id, n), (n, metadata_done.id)):
+                node = by_id[after_id]
+                if before not in node.control_predecessor_ids:
+                    node.control_predecessor_ids.append(before)
+                    inputs[after_id].append(before)
+                    users[before].append(after_id)
+                    changed = True
+    return changed
+
+
 def _pin_sparse_core(node: Any, core_id: int) -> bool:
     """Pin an existing SC offload before scheduling, preserving other settings."""
     if not node.backend_config:
@@ -194,10 +301,9 @@ def rewrite_moe_schedule(blob: bytes) -> bytes | None:
                 sequence.instruction_ids if sequence is not None else list(by_id)
             )
         }
-        # Order preceding multi-SC completions before advancing an AG.
+        # Order independent multi-SC completions before advancing an AG.
         # Independent offloads otherwise can straddle the split-SC submissions
         # and stall libtpu's resource-aware scheduler in a full serving graph.
-        instruction_positions = {n: i for i, n in enumerate(by_id)}
         multicore_done = []
         for node in comp.instructions:
             if node.opcode != "async-done" or len(node.operand_ids) != 1:
@@ -211,6 +317,8 @@ def rewrite_moe_schedule(blob: bytes) -> bytes | None:
                 multicore_done.append(node)
         priorities: dict[int, int] = {}
         comp_changed = False
+        kernels: list[Any] = []
+        layers: list[tuple[Any, Any, Any]] = []
 
         def edge(before: Any, after: Any, by_id=by_id) -> bool:
             nonlocal comp_changed, changed
@@ -228,6 +336,7 @@ def rewrite_moe_schedule(blob: bytes) -> bytes | None:
                 or len(kernel.operand_ids) < 17
             ):
                 continue
+            kernels.append(kernel)
             activation = _nearest(
                 by_id[kernel.operand_ids[11]],
                 by_id,
@@ -246,6 +355,7 @@ def rewrite_moe_schedule(blob: bytes) -> bytes | None:
             metadata_start = by_id[metadata_done.operand_ids[0]]
             if metadata_start.opcode not in ("async-start", "async-update"):
                 continue
+            layers.append((kernel, metadata_start, metadata_done))
             scatter = _nearest(
                 by_id[kernel.operand_ids[10]],
                 by_id,
@@ -257,11 +367,9 @@ def rewrite_moe_schedule(blob: bytes) -> bytes | None:
                     comp_changed = changed = True
             activation_deps = _ancestors(activation, by_id)
             for done in multicore_done:
-                if (
-                    instruction_positions[done.id]
-                    < instruction_positions[activation.id]
-                    and done.id not in activation_deps
-                ):
+                # Serialized instruction order is not execution order. edge()
+                # rejects downstream completions that would create a cycle.
+                if done.id not in activation_deps:
                     edge(done, activation)
             activation_deps = _ancestors(activation, by_id)
             # Only this metadata producer's router nodes; prior layers and
@@ -292,9 +400,42 @@ def rewrite_moe_schedule(blob: bytes) -> bytes | None:
                     priorities[n] = min(
                         priorities.get(n, positions[n]), positions[metadata_done.id]
                     )
+        if _fill_metadata_waits(by_id, layers, kernels, positions):
+            comp_changed = changed = True
         if comp_changed:
             _sort(comp, sequence, priorities)
     return module.SerializeToString() if changed else None
+
+
+_gc_lock = threading.Lock()
+_gc_depth = 0
+_gc_was_enabled = False
+
+
+def rewrite_moe_schedule_without_gc(blob: bytes) -> bytes | None:
+    """Run the rewrite with automatic cyclic GC deferred.
+
+    XLA invokes this pass synchronously on torch_tpu compile threads, which
+    are forbidden from touching thread-local context state. Parsing the HLO
+    allocates enough to trigger a collection, and that collection can free an
+    unrelated TPU tensor held in a reference cycle; torch_tpu 0.2.0's storage
+    deleter then reads the eager mode and aborts with
+    ``Check failed: allow_context_state_access``. Depth counting keeps GC off
+    until the last of several concurrent compile threads leaves.
+    """
+    global _gc_depth, _gc_was_enabled
+    with _gc_lock:
+        if _gc_depth == 0:
+            _gc_was_enabled = gc.isenabled()
+            gc.disable()
+        _gc_depth += 1
+    try:
+        return rewrite_moe_schedule(blob)
+    finally:
+        with _gc_lock:
+            _gc_depth -= 1
+            if _gc_depth == 0 and _gc_was_enabled:
+                gc.enable()
 
 
 _install_lock = threading.Lock()
@@ -307,7 +448,7 @@ def install_moe_schedule() -> None:
     with _install_lock:
         if not _installed:
             xla.register_hlo_module_transformation(
-                rewrite_moe_schedule,
+                rewrite_moe_schedule_without_gc,
                 name="split_sc_moe_schedule",
                 platforms="tpu",
                 stage=xla.PipelineStage.PRE_SCHEDULER,

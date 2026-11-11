@@ -947,7 +947,12 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         layer = cast("TpuRoutedExperts", layer)
         assert not self.moe.has_bias, "TPU FP8 MoE path does not support bias."
 
-        self._use_adaptive_fused_moe = envs.MOE_FUSED_EP_KERNEL_IMPL == "adaptive"
+        from vllm_torchtpu import expert_placement
+
+        self._use_adaptive_fused_moe = (
+            envs.MOE_FUSED_EP_KERNEL_IMPL == "adaptive"
+            and expert_placement.expert_slot_table(layer) is None
+        )
         activation_str = self._set_tpu_activation(layer)
 
         is_fp8_serialized = self.quant_config.is_checkpoint_fp8_serialized
@@ -1097,6 +1102,8 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         # survived here for as long as this path served only such models; a
         # `noaux_tc` router carries the bias and does not. The nvfp4 and mxfp4
         # methods already pass it.
+        from vllm_torchtpu import expert_placement
+        from vllm_torchtpu.layers.adapter import expert_load
         from vllm_torchtpu.layers.adapter.fused_moe_ep import (
             fused_moe_ep,
             fused_moe_ep_supported,
@@ -1113,6 +1120,8 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 layer.w2_weight_scale_inv,
                 router_logits,
                 score_bias_operand(layer),
+                expert_slot=expert_placement.expert_slot_table(layer),
+                expert_load=expert_load.operand(layer),
             )
         # Step 1: Routing
         # Quantization-independent routing decision (simulation override ->

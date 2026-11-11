@@ -153,3 +153,97 @@ def test_legacy_engram_conflict_is_rejected(monkeypatch):
     monkeypatch.setenv("TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD", "0")
     with pytest.raises(ValueError, match="conflicts with --engram-config"):
         verify_and_update_config(config())
+
+
+# ---------------------------------------------------------------------------
+# expert_layout: a static expert layout for the fused EP path.
+
+
+@pytest.fixture
+def layout_file(tmp_path):
+    path = tmp_path / "layout.json"
+    path.write_text(
+        json.dumps(
+            {
+                "experts": 8,
+                "shards": 2,
+                "layers": {"3": [[7, 0, 5, 2, 3], [1, 6, 3, 4, 7]]},
+            }
+        )
+    )
+    return str(path)
+
+
+def test_expert_layout_round_trips_into_the_config_hash_input(layout_file):
+    cfg = config(execution="ced", moe="fused_ep_w4a8", expert_layout=layout_file)
+    verify_and_update_config(cfg)
+    assert cfg.additional_config["deepseek_v41"]["expert_layout"] == layout_file
+    assert DeepseekV41Config.from_vllm_config(cfg).expert_layout == layout_file
+    plain = config(execution="ced", moe="fused_ep_w4a8")
+    verify_and_update_config(plain)
+    assert "expert_layout" not in plain.additional_config["deepseek_v41"]
+    assert json.dumps(cfg.additional_config, sort_keys=True) != json.dumps(
+        plain.additional_config, sort_keys=True
+    )
+
+
+def test_expert_layout_requires_the_fused_ep_backend(layout_file):
+    with pytest.raises(ValueError, match="fused_ep_w4a8"):
+        verify_and_update_config(config(moe="gmm", expert_layout=layout_file))
+
+
+def test_expert_layout_refuses_eplb_and_non_linear_placement(layout_file):
+    cfg = config(moe="fused_ep_w4a8", expert_layout=layout_file)
+    cfg.parallel_config.enable_eplb = True
+    with pytest.raises(ValueError, match="EPLB"):
+        verify_and_update_config(cfg)
+    cfg.parallel_config.enable_eplb = False
+    cfg.parallel_config.expert_placement_strategy = "round_robin"
+    with pytest.raises(ValueError, match="linear"):
+        verify_and_update_config(cfg)
+
+
+def test_expert_layout_refuses_hierarchical_ep(layout_file, monkeypatch):
+    monkeypatch.setenv("TPU_MOE_HIERARCHICAL_EP", "1")
+    with pytest.raises(ValueError, match="HIERARCHICAL"):
+        verify_and_update_config(config(moe="fused_ep_w4a8", expert_layout=layout_file))
+
+
+def test_expert_layout_must_name_a_readable_table(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        verify_and_update_config(
+            config(moe="fused_ep_w4a8", expert_layout="no_such_shipped_layout")
+        )
+    bad = tmp_path / "bad.json"
+    bad.write_text(
+        json.dumps({"experts": 8, "shards": 2, "layers": {"3": [[0, 1], [2, 3]]}})
+    )
+    with pytest.raises(ValueError, match="at least 4"):
+        verify_and_update_config(config(moe="fused_ep_w4a8", expert_layout=str(bad)))
+
+
+def test_expert_layout_rejects_a_non_string():
+    with pytest.raises(TypeError):
+        verify_and_update_config(config(moe="fused_ep_w4a8", expert_layout=3))
+
+
+def test_legacy_placement_env_is_an_alias_and_may_not_conflict(
+    layout_file, monkeypatch
+):
+    monkeypatch.setenv("TPU_EXPERT_PLACEMENT", layout_file)
+    cfg = config()
+    del cfg.additional_config["deepseek_v41"]
+    monkeypatch.setenv("USE_MOE_FUSED_EP_KERNEL", "1")
+    monkeypatch.setenv("MOE_FUSED_EP_ENABLE_W4A8", "1")
+    verify_and_update_config(cfg)
+    assert DeepseekV41Config.from_vllm_config(cfg).expert_layout == layout_file
+    # A typed policy that left the field out takes the alias (the harness's
+    # launcher fixes --additional-config and passes switches as env).
+    filled = config(execution="ced", moe="fused_ep_w4a8")
+    verify_and_update_config(filled)
+    assert filled.additional_config["deepseek_v41"]["expert_layout"] == layout_file
+    # One that set a different layout conflicts with it.
+    with pytest.raises(ValueError, match="TPU_EXPERT_PLACEMENT conflicts"):
+        verify_and_update_config(
+            config(moe="fused_ep_w4a8", expert_layout="dsv41_flash_dp8_c384_perm")
+        )

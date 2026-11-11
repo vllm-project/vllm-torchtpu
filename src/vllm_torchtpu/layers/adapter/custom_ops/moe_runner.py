@@ -13,6 +13,7 @@
 # limitations under the License.
 """Out-of-tree (OOT) MoE runner: the TPU side of vLLM's MoE forward path."""
 
+import inspect
 from collections.abc import Callable
 
 from vllm.distributed.parallel_state import get_dp_group, get_ep_group
@@ -48,6 +49,60 @@ class VllmMoERunner(MoERunner):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._take_over_moe_quant_config_init()
+        # The shared expert module itself, for a fused EP op that computes it
+        # (MOE_FUSED_EP_PUSH_SHARED_EXPERT). Not registered as a submodule:
+        # the model already owns it, under its own parameter names.
+        bound = inspect.signature(MoERunner.__init__).bind(self, *args, **kwargs)
+        object.__setattr__(
+            self, "_tpu_shared_mlp", bound.arguments.get("shared_experts")
+        )
+
+    def _apply_quant_method(
+        self,
+        hidden_states,
+        router_logits,
+        shared_experts_input,
+        input_ids=None,
+        shared_experts_overlapping=False,
+    ):
+        # A fused EP op built with the shared expert inside computes both
+        # outputs; the runner then must not run the shared expert again.
+        limit = getattr(self._quant_method, "shared_expert_limit", None)
+        if limit is None:
+            return super()._apply_quant_method(
+                hidden_states,
+                router_logits,
+                shared_experts_input,
+                input_ids,
+                shared_experts_overlapping,
+            )
+        mlp = self._tpu_shared_mlp
+        if mlp is None or shared_experts_overlapping:
+            raise RuntimeError(
+                "the fused EP op of this layer computes a shared expert, but "
+                "the runner has none to give it or runs it on another stream"
+            )
+        if shared_experts_input is not hidden_states:
+            raise NotImplementedError(
+                "the in-op shared expert reads the routed experts' input; this "
+                "layer transforms or pads one of them"
+            )
+        *shared, shared_limit = mlp.fused_operands()
+        if shared_limit != limit:
+            raise ValueError(
+                f"the fused EP op was built for swiglu limit {limit}, the shared "
+                f"expert has {shared_limit}"
+            )
+        routed, shared_out = (
+            self.routed_experts.quant_method.forward_monolithic_with_shared_expert(
+                self.routed_experts,
+                hidden_states,
+                router_logits,
+                input_ids,
+                tuple(shared),
+            )
+        )
+        return shared_out, routed
 
     def _take_over_moe_quant_config_init(self) -> None:
         routed_experts = self.routed_experts

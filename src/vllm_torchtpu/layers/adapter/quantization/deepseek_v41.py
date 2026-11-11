@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 
 from vllm.distributed.parallel_state import get_ep_group
 from vllm.model_executor.layers.quantization import register_quantization_config
+from vllm.model_executor.models.utils import extract_layer_index
 from vllm.models.deepseek_v4.nvidia import model as v4_upstream
 from vllm.models.deepseek_v41.nvidia.model import DeepseekV4MoE
 
@@ -48,7 +49,11 @@ class VllmDeepseekV41Fp8Config(VllmDeepseekV4Fp8Config):
 class DeepseekV41MoE(DeepseekV4MoE):
     def __init__(self, vllm_config, *args, **kwargs):
         if vllm_config.parallel_config.enable_eplb:
-            raise NotImplementedError("V4.1 TPU MoE does not support EPLB")
+            raise NotImplementedError(
+                "V4.1 TPU MoE does not support EPLB (vLLM's dynamic rebalancing); "
+                "a static expert layout with replica slots is selected with "
+                "additional_config.deepseek_v41.expert_layout instead"
+            )
         if vllm_config.kernel_config.moe_backend in v4_upstream.MEGA_MOE_BACKENDS:
             raise NotImplementedError("V4.1 TPU requires the native V4 MoE backend")
         factory = v4_upstream.FusedMoEFactory
@@ -64,6 +69,27 @@ class DeepseekV41MoE(DeepseekV4MoE):
             FusedMoEFactory=v4_factory,
         ):
             super().__init__(vllm_config, *args, **kwargs)
+        # Only upstream's router gets bias_vl; mirror it onto the experts for
+        # `VllmDeepseekV4Mxfp4MoEMethod`, which builds the per-token score
+        # bias for both MoE backends, as DeepseekV4MoE does with its hash
+        # table. The DSpark loader maps draft layers' bias_vl to their gate
+        # bias, so theirs is never loaded. A language-only server sees no
+        # images, so it keeps the one-row score bias.
+        if self.gate.bias_vl is None:
+            return
+        model_config = vllm_config.model_config
+        mm_config = model_config.multimodal_config
+        if (
+            not (mm_config is not None and mm_config.language_model_only)
+            and extract_layer_index(self.prefix)
+            < model_config.hf_config.num_hidden_layers
+        ):
+            experts = self.experts.routed_experts
+            lo = self.image_sentinel_lo
+            object.__setattr__(experts, "bias_vl", self.gate.bias_vl)
+            object.__setattr__(experts, "image_sentinel_lo", lo)
+            # Upstream's router matches the five sentinel ids from lo.
+            object.__setattr__(experts, "image_sentinel_hi", lo + 5)
 
     def forward(self, hidden_states, input_ids=None, mega_gate_metadata=None):
         if (

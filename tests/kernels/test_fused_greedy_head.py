@@ -156,3 +156,16 @@ def test_fused_greedy_head_cpu_reference(device, monkeypatch):
     device_weight[1279, 0] = 0
     updated = compiled(hidden.to(device)).cpu()
     assert updated[0].item() == 1280
+
+
+@pytest.mark.cpu_test
+def test_greedy_head_uses_multimodal_language_model(monkeypatch):
+    monkeypatch.setattr(envs, "TPU_GREEDY_HEAD_BACKEND", "auto")
+    monkeypatch.setattr(kernel, "get_device_name", lambda: "TPU v7")
+    runner = _runner(torch.empty(129280, 5120, dtype=torch.bfloat16, device="meta"))
+    language_model = runner.model
+    runner.model = SimpleNamespace(
+        supports_multimodal=True, get_language_model=lambda: language_model
+    )
+    TPUModelRunner._init_fused_greedy_head(runner)
+    assert runner._fused_greedy_head.weight is language_model.lm_head.weight

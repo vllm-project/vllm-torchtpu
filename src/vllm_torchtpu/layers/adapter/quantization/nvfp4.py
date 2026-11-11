@@ -383,7 +383,12 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
             "TPU NVFP4 MoE expects gated (act_and_mul) experts with a "
             "[gate; up] w13 layout and a per-w1/w3 global scale [E, 2]."
         )
-        self._use_adaptive_fused_moe = envs.MOE_FUSED_EP_KERNEL_IMPL == "adaptive"
+        from vllm_torchtpu import expert_placement
+
+        self._use_adaptive_fused_moe = (
+            envs.MOE_FUSED_EP_KERNEL_IMPL == "adaptive"
+            and expert_placement.expert_slot_table(layer) is None
+        )
         activation_str = self._set_tpu_activation(layer)
 
         # --- fuse E4M3 block scale * FP32 per-tensor global -> FP32 block scale.
@@ -528,6 +533,8 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
                 layer._tpu_fused_w2_scale,
                 router_logits,
             )
+        from vllm_torchtpu import expert_placement
+        from vllm_torchtpu.layers.adapter import expert_load
         from vllm_torchtpu.layers.adapter.fused_moe_ep import (
             fused_moe_ep,
             fused_moe_ep_supported,
@@ -544,6 +551,8 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
                 layer._tpu_fused_w2_scale,
                 router_logits,
                 score_bias_operand(layer),
+                expert_slot=expert_placement.expert_slot_table(layer),
+                expert_load=expert_load.operand(layer),
             )
 
         # Quantization-independent routing decision (simulation override ->

@@ -26,8 +26,10 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("TPU_SKIP_MDS_QUERY", "true")
 
 from vllm.config import CompilationMode
+from vllm.models.deepseek_v41.nvidia import vl_model as upstream_vl
 
 from vllm_torchtpu.layers.core.sequence_layout import SequenceLayoutKind
+from vllm_torchtpu.models.vllm import register_models
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.ced import DecoderReplayPlan
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram import (
     HOST_ENGRAM_KEY,
@@ -42,6 +44,7 @@ from vllm_torchtpu.models.vllm.deepseek_v41.v2.model import (
     DeepseekV41ForCausalLM,
     DeepseekV41FullStage,
     DeepseekV41Model,
+    DeepseekV41VLForCausalLM,
     _ced_config,
     _StageBase,
     _use_sequence_parallel,
@@ -441,7 +444,9 @@ class TestStageClasses:
             1, 2, intermediate_tensors=3, inputs_embeds=4, lookback_token_ids=5
         )
         assert res == "full_res"
-        owner._forward_stage.assert_called_once_with(1, 2, 3, 4, 5, stage="full")
+        owner._forward_stage.assert_called_once_with(
+            1, 2, 3, 4, 5, stage="full", engram_hashes=None
+        )
 
     def test_encoder_stage_forward(self) -> None:
         owner = SimpleNamespace(_forward_stage=MagicMock(return_value="enc_res"))
@@ -453,7 +458,9 @@ class TestStageClasses:
             1, 2, intermediate_tensors=3, inputs_embeds=4, lookback_token_ids=5
         )
         assert res == "enc_res"
-        owner._forward_stage.assert_called_once_with(1, 2, 3, 4, 5, stage="encoder")
+        owner._forward_stage.assert_called_once_with(
+            1, 2, 3, 4, 5, stage="encoder", engram_hashes=None
+        )
 
     def test_decoder_stage_forward(self) -> None:
         owner = SimpleNamespace(_forward_stage=MagicMock(return_value="dec_res"))
@@ -1061,6 +1068,59 @@ class TestModelForward:
             model.forward(torch.tensor([1, 2, 3, 4]), torch.tensor([0, 1, 2, 3]))
             mock_sync.assert_called_once()
 
+    @pytest.mark.parametrize("identity_switch", [False, True])
+    def test_forward_ced_identity_replay_matches_gather_and_scatter(
+        self, monkeypatch, identity_switch
+    ) -> None:
+        # A plan that replays every row in place: with the switch the stages
+        # exchange the tensors directly, without it they gather and scatter by
+        # the identity. Both must return the same values and decoder inputs.
+        monkeypatch.setenv(
+            "TPU_DEEPSEEK_V41_CED_IDENTITY_REPLAY", "1" if identity_switch else "0"
+        )
+        model = self._create_model(ced_enabled=True, sp_enabled=False)
+        hidden = torch.arange(4 * 64, dtype=torch.float32).reshape(4, 64)
+        pre_mix = -hidden
+        model.encoder_stage = MagicMock(return_value=(hidden, pre_mix))
+        plan = DecoderReplayPlan(
+            indices=(0, 1, 2, 3),
+            padded_num_tokens=4,
+            query_start_loc=(0, 2, 4),
+            replay_starts=(0, 1),
+        )
+        model.decoder_stage = MagicMock(
+            side_effect=lambda ids, positions, inputs_embeds, encoder_pre_mix: (
+                inputs_embeds * 2 + encoder_pre_mix + positions[:, None]
+            )
+        )
+        meta_entry = _FakeAttnMeta(
+            input_positions=None,
+            query_start_loc=None,
+            seq_lens=torch.tensor([2, 2]),
+        )
+        mock_ctx = _FakeForwardCtx(attn_metadata={"layer_0": meta_entry})
+        ids, positions = torch.tensor([1, 2, 3, 4]), torch.tensor([5, 6, 7, 8])
+        with (
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.get_forward_context",
+                return_value=mock_ctx,
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.plan_decoder_replay",
+                return_value=plan,
+            ),
+        ):
+            res = model.forward(ids, positions)
+        torch.testing.assert_close(
+            res, hidden * 2 + pre_mix + positions[:, None], rtol=0, atol=0
+        )
+        args, kwargs = model.decoder_stage.call_args
+        torch.testing.assert_close(args[0], ids, rtol=0, atol=0)
+        torch.testing.assert_close(args[1], positions, rtol=0, atol=0)
+        torch.testing.assert_close(kwargs["inputs_embeds"], hidden, rtol=0, atol=0)
+        torch.testing.assert_close(kwargs["encoder_pre_mix"], pre_mix, rtol=0, atol=0)
+        assert (kwargs["inputs_embeds"] is hidden) == identity_switch
+
 
 # ==============================================================================
 # 8. Tests for DeepseekV41Model._forward_stage
@@ -1134,6 +1194,10 @@ class TestModelForwardStage:
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.collapse",
                 side_effect=lambda h, pm: h,
             ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.flat_collapse",
+                side_effect=lambda h, pm: h,
+            ),
         ):
             mock_pp.return_value = SimpleNamespace(
                 is_first_rank=True, is_last_rank=True
@@ -1161,6 +1225,10 @@ class TestModelForwardStage:
             ),
             patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.collapse",
+                side_effect=lambda h, pm: h,
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.flat_collapse",
                 side_effect=lambda h, pm: h,
             ),
         ):
@@ -1208,6 +1276,10 @@ class TestModelForwardStage:
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.collapse",
                 side_effect=lambda h, pm: h,
             ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.flat_collapse",
+                side_effect=lambda h, pm: h,
+            ),
         ):
             mock_pp.return_value = SimpleNamespace(
                 is_first_rank=False, is_last_rank=False
@@ -1239,6 +1311,10 @@ class TestModelForwardStage:
             ),
             patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.collapse",
+                side_effect=lambda h, pm: h,
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.flat_collapse",
                 side_effect=lambda h, pm: h,
             ),
         ):
@@ -1295,6 +1371,10 @@ class TestModelForwardStage:
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.collapse",
                 side_effect=lambda h, pm: h,
             ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.flat_collapse",
+                side_effect=lambda h, pm: h,
+            ),
         ):
             model._forward_stage(inp, pos, None, stage="full")
             mock_pad_mask.assert_called_once()
@@ -1338,6 +1418,10 @@ class TestModelForwardStage:
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.collapse",
                 side_effect=lambda h, pm: h,
             ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.flat_collapse",
+                side_effect=lambda h, pm: h,
+            ),
         ):
             res = model._forward_stage(inp, pos, None, stage="full")
             # When layer is None after the loop, post(...) should NOT be called
@@ -1379,6 +1463,10 @@ class TestModelForwardStage:
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.collapse",
                 side_effect=lambda h, pm: h,
             ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.flat_collapse",
+                side_effect=lambda h, pm: h,
+            ),
         ):
             mock_pp.return_value = SimpleNamespace(
                 is_first_rank=True, is_last_rank=True
@@ -1413,6 +1501,10 @@ class TestModelForwardStage:
             ),
             patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.collapse",
+                side_effect=lambda h, pm: h,
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.flat_collapse",
                 side_effect=lambda h, pm: h,
             ),
         ):
@@ -1508,6 +1600,9 @@ class TestModelInitAndWeights:
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_mhc_post"
             ),
             patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_flat_collapse"
+            ),
+            patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_paged_attention"
             ),
             patch("vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_indexer"),
@@ -1545,6 +1640,9 @@ class TestModelInitAndWeights:
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_mhc_post"
             ),
             patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_flat_collapse"
+            ),
+            patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_paged_attention"
             ),
             patch("vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_indexer"),
@@ -1577,6 +1675,9 @@ class TestModelInitAndWeights:
             ),
             patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_mhc_post"
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_flat_collapse"
             ),
             patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_paged_attention"
@@ -1623,6 +1724,9 @@ class TestModelInitAndWeights:
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_mhc_post"
             ),
             patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_flat_collapse"
+            ),
+            patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_paged_attention"
             ),
             patch("vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_indexer"),
@@ -1662,6 +1766,9 @@ class TestModelInitAndWeights:
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_mhc_post"
             ),
             patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_flat_collapse"
+            ),
+            patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_paged_attention"
             ),
             patch("vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_indexer"),
@@ -1693,6 +1800,9 @@ class TestModelInitAndWeights:
             ),
             patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_mhc_post"
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_flat_collapse"
             ),
             patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_paged_attention"
@@ -1734,6 +1844,9 @@ class TestModelInitAndWeights:
             ),
             patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_mhc_post"
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_flat_collapse"
             ),
             patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_paged_attention"
@@ -1939,9 +2052,11 @@ def test_dp_embeddings_materialized_before_stage(monkeypatch, dp_size, supplied)
         assert values[0] is embeddings and wait is False
         events.append("enqueue")
 
-    def stage(tokens, pos, intermediate, inputs_embeds, history):
+    def stage(tokens, pos, intermediate, inputs_embeds, history, engram_hashes=None):
         assert tokens is ids and pos is positions and history is lookback
         assert intermediate is None
+        # No HBM Engram layer here, so no hashes are handed to the stage.
+        assert engram_hashes is None
         assert inputs_embeds is (embeddings if supplied or dp_size > 1 else None)
         events.append("stage")
         return inputs_embeds
@@ -1966,3 +2081,98 @@ def test_dp_embeddings_materialized_before_stage(monkeypatch, dp_size, supplied)
     assert events == (
         ["lookup", "enqueue", "stage"] if dp_size > 1 and not supplied else ["stage"]
     )
+
+
+@pytest.mark.cpu_test
+def test_v41_architecture_registers_vision_wrapper():
+    with patch("vllm.model_executor.models.ModelRegistry.register_model") as register:
+        register_models()
+    calls = {call.args[0]: call.args[1] for call in register.call_args_list}
+    assert calls["DeepseekV41ForCausalLM"] == (
+        "vllm_torchtpu.models.vllm.deepseek_v41.v2.model:DeepseekV41VLForCausalLM"
+    )
+
+
+@pytest.mark.cpu_test
+def test_vision_wrapper_builds_tpu_language_model_with_scale_inv(monkeypatch):
+    seen = {}
+
+    def upstream_init(self, *, vllm_config, prefix=""):
+        torch.nn.Module.__init__(self)
+        seen["language_model_cls"] = upstream_vl.DeepseekV41LLMForCausalLM
+        seen["scale_name"] = upstream_vl._linear_scale_param_name(vllm_config, "fp4")
+
+    monkeypatch.setattr(upstream_vl.DeepseekV41ForCausalLM, "__init__", upstream_init)
+    original = upstream_vl.DeepseekV41LLMForCausalLM
+
+    DeepseekV41VLForCausalLM(vllm_config=SimpleNamespace())
+
+    assert seen == {
+        "language_model_cls": DeepseekV41ForCausalLM,
+        "scale_name": "weight_scale_inv",
+    }
+    assert upstream_vl.DeepseekV41LLMForCausalLM is original
+
+
+@pytest.mark.cpu_test
+def test_vision_wrapper_encoder_cudagraph_config_skips_cuda_backend_gate():
+    model = DeepseekV41VLForCausalLM.__new__(DeepseekV41VLForCausalLM)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(hidden_size=8)
+
+    config = model.get_encoder_cudagraph_config()
+
+    assert config.modalities == ["image"]
+    assert config.out_hidden_size == 8
+    assert "cu_seqlens" in config.buffer_keys
+    assert "cu_seqlens" not in config.padding_logics
+
+
+@pytest.mark.cpu_test
+def test_vision_wrapper_streams_language_weights_in_one_delegation(monkeypatch):
+    from vllm.model_executor.models.utils import WeightsMapper
+
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import model as v2_model
+
+    pulled = []
+
+    def checkpoint():
+        for name in ("layers.0.w", "vision.w", "layers.1.w", "aligner.w"):
+            pulled.append(name)
+            yield name, torch.zeros(1)
+
+    calls = []
+
+    class LanguageModel(torch.nn.Module):
+        def load_weights(self, weights):
+            assert not isinstance(weights, list)
+            names = []
+            for name, _ in weights:
+                # Lazy: each weight is consumed as soon as it is read.
+                assert pulled[-1].endswith(name.removeprefix("model."))
+                names.append(name)
+            calls.append(names)
+            return set(names)
+
+    tower = MagicMock()
+    tower.return_value.load_weights.side_effect = lambda w: {n for n, _ in w}
+    monkeypatch.setattr(v2_model, "AutoWeightsLoader", tower)
+
+    model = DeepseekV41VLForCausalLM.__new__(DeepseekV41VLForCausalLM)
+    torch.nn.Module.__init__(model)
+    model.language_model = LanguageModel()
+    model.hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_prefix={"layers.": "language_model.model.layers."}
+    )
+
+    loaded = model.load_weights(checkpoint())
+
+    assert calls == [["model.layers.0.w", "model.layers.1.w"]]
+    tower.return_value.load_weights.assert_called_once()
+    assert loaded == {
+        "language_model.model.layers.0.w",
+        "language_model.model.layers.1.w",
+        "vision.w",
+        "aligner.w",
+    }
+    assert model._weights_finalized

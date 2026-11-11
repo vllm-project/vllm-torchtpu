@@ -27,7 +27,10 @@ from vllm.model_executor.models.qwen3_dspark import (
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.models.deepseek_v41.nvidia import model as upstream
 
+from vllm_torchtpu import envs
+from vllm_torchtpu.layers.adapter.fused_moe_ep import mark_dspark_draft_moe
 from vllm_torchtpu.layers.adapter.quantization.deepseek_v41 import DeepseekV41MoE
+from vllm_torchtpu.layers.core import table_lookup
 from vllm_torchtpu.logger import init_logger
 
 from ..common.mhc import (
@@ -44,9 +47,10 @@ from .attention import (
     _token_requests,
     stage_attention_cache_scope,
 )
-from .attention_kernels import initialize_indexer, initialize_paged_attention
+from .attention_kernels import initialize_paged_attention
 from .cache import initialize_cache_ops
 from .engram import Engram, NgramHashState
+from .indexer_bf16 import initialize_indexer
 from .model import DeepseekV41DecoderLayer
 from .ops import compact_rope_caches, device_hooks
 
@@ -88,17 +92,27 @@ def _remap_dspark_name(name: str, *, enable_confidence_head: bool = True) -> str
     return f"model.layers.{stage}.{rest}"
 
 
+def _context_kv(
+    attn: DeepseekV41Attention, x: torch.Tensor, positions: torch.Tensor
+) -> torch.Tensor:
+    """One draft layer's normalized, rotated context KV rows."""
+    if attn._fused_preprocess:
+        # KV only: skips the qr columns, their norm and projection.
+        return attn._qa_kv_norm_rope(x, positions, emit_qr=False)
+    _, _, kv = attn._split_qkv_and_norm(attn._fused_wqa_wkv_gemm(x))
+    return attn._rotate(kv, positions)
+
+
 def _insert_context_kv(
     attn: DeepseekV41Attention,
     kv: torch.Tensor,
     positions: torch.Tensor,
     metadata,
 ) -> None:
-    """Rotate and write normalized context KV rows into one draft layer's SWA cache."""
+    """Write rotated context KV rows into one draft layer's SWA cache."""
     swa_cache = attn.swa_cache_layer.kv_cache
     if metadata is None or not swa_cache.numel():
         return
-    kv = attn._rotate(kv, positions)
     if isinstance(metadata, torch.Tensor):
         swa_slots = metadata
         swa_valid = swa_slots >= 0
@@ -108,7 +122,11 @@ def _insert_context_kv(
             requests = _token_requests(metadata, positions).clamp(
                 max=metadata.seq_lens.shape[0] - 1
             )
-            offsets = positions - metadata.seq_lens[requests] + attn.window_size
+            offsets = (
+                positions
+                - table_lookup.take(metadata.seq_lens, requests)
+                + attn.window_size
+            )
             swa_valid = (swa_slots >= 0) & (offsets >= 0) & (offsets < attn.window_size)
         else:
             swa_valid = swa_slots >= 0
@@ -205,6 +223,7 @@ class DSparkDeepseekV41Model(nn.Module):
                 raise ValueError("CSA2 supports DSpark blocks of at most 64 queries")
             layer.attn.non_causal_multi_token_decode = True
             layer.attn.dspark_block_size = int(dspark_block_size)
+            mark_dspark_draft_moe(layer.ffn.experts)
 
         compact_rope_caches(
             (layer.attn for layer in self.layers),
@@ -266,10 +285,10 @@ class DSparkDeepseekV41Model(nn.Module):
             main_x = target_hidden_states
         for i, layer in enumerate(cast(Iterable[DeepseekV41DecoderLayer], self.layers)):
             attn = layer.attn
-            qr_kv = attn._fused_wqa_wkv_gemm(main_x)
-            _, _, kv = attn._split_qkv_and_norm(qr_kv)
             layer_md = None if metadata is None else metadata[i]
-            _insert_context_kv(attn, kv, positions, layer_md)
+            _insert_context_kv(
+                attn, _context_kv(attn, main_x, positions), positions, layer_md
+            )
         return main_x
 
     def forward(
@@ -374,9 +393,10 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
         None means the proposer retains its ordinary logits/Markov path.
         The returned sampler may also return None for an unsupported bucket.
         """
-        from .dspark_sampling import initialize_samples
+        from .dspark_sampling import initialize_logits_head, initialize_samples
 
         self._decode_samples = None
+        self._decode_logits = None
         if not (tp_size == 1 and sample_from_anchor and block_size == 5):
             return None
         assert self.lm_head is not None
@@ -392,6 +412,8 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
         ):
             return None
         self._decode_samples = initialize_samples()
+        if envs.TPU_DEEPSEEK_V41_DSPARK_PALLAS_LOGITS:
+            self._decode_logits = initialize_logits_head()
         return self._sample_decode
 
     def _sample_decode(
@@ -404,7 +426,13 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
         ):
             return None
         slot_hidden = hidden.view(48, 5, 5120).transpose(0, 1).reshape(240, 5120)
-        logits = self.compute_logits(slot_hidden)
+        if self._decode_logits is not None:
+            assert self.lm_head is not None
+            logits = self._decode_logits(
+                self.model.norm(slot_hidden), self.lm_head.weight
+            )
+        else:
+            logits = self.compute_logits(slot_hidden)
         if logits.shape != (240, 129280) or logits.dtype != torch.bfloat16:
             return None
         markov = self.model.markov_head

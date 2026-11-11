@@ -360,6 +360,14 @@ def _register_tpu_kv_connectors() -> None:
 
 
 class TpuPlatform(Platform):
+    @classmethod
+    def register_custom_kv_cache_specs(cls, vllm_config) -> None:
+        from vllm_torchtpu.models.vllm.deepseek_v41.v2.swa_cache import (
+            register_swa_specs,
+        )
+
+        register_swa_specs()
+
     # Registered via the `vllm.platform_plugins` entry point in pyproject.toml.
     _enum = PlatformEnum.OOT
     device_name: str = "tpu"
@@ -404,8 +412,30 @@ class TpuPlatform(Platform):
         "TPU_MOE_ROUTER_TOPK",
         "MOE_FUSED_EP_V2_SHARDED_PLAN",
         "MOE_FUSED_EP_PREPROCESS_BACKEND",
+        "TPU_MOE_EPLB_DYNAMIC",
+        "TPU_MOE_EPLB_WINDOW_STEPS",
+        "TPU_MOE_EPLB_MIN_GAIN",
+        "TPU_MOE_EPLB_MOVER_STEP_BUDGET_MB",
         "MOE_FUSED_EP_ENABLE_W4A8",
         "MOE_FUSED_EP_KERNEL_IMPL",
+        "MOE_FUSED_EP_PUSH_SC_PREPUSH",
+        "MOE_FUSED_EP_PUSH_TC_EXCHANGE",
+        "MOE_FUSED_EP_PUSH_TAIL_BARRIER",
+        "MOE_FUSED_EP_PUSH_ONEHOT_SLOTS",
+        "MOE_FUSED_EP_PUSH_HBM_STAGING",
+        "MOE_FUSED_EP_PUSH_DISPATCH_AHEAD",
+        "MOE_FUSED_EP_PUSH_MATMUL_SCALE_REPEAT",
+        "MOE_FUSED_EP_PUSH_EXCHANGE_ROW_GATHER",
+        "MOE_FUSED_EP_PUSH_BF16_SORT_COUNTS",
+        "MOE_FUSED_EP_PUSH_SLIM_PREPUSH_BARRIER",
+        "MOE_FUSED_EP_PUSH_FUSED_DISPATCH_META",
+        "MOE_FUSED_EP_PUSH_TABLE_KERNEL",
+        "MOE_FUSED_EP_PUSH_EXCHANGE_TABLES",
+        "MOE_FUSED_EP_PUSH_KERNEL_PLAN_TABLES",
+        "MOE_FUSED_EP_PUSH_SHARED_EXPERT",
+        "MOE_FUSED_EP_PUSH_LIGHT_PREPUSH",
+        "MOE_FUSED_EP_PUSH_SINGLE_BARRIER",
+        "MOE_FUSED_EP_PUSH_EARLY_SCALE_SCATTER",
     ]
 
     # The "Platform" base class has import_kernels() that tries to import

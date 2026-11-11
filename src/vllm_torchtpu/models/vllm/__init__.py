@@ -43,7 +43,10 @@ def register_models() -> None:
     ModelRegistry.register_model("KimiK3ForConditionalGeneration", _KIMI_K3_MODEL)
     ModelRegistry.register_model("DeepseekV4ForCausalLM", _DSV4_MODEL)
     ModelRegistry.register_model(
-        "DeepseekV41ForCausalLM", f"{v41_model}:DeepseekV41ForCausalLM"
+        # Like upstream, one entry serves text and vision;
+        # --language-model-only stubs out the tower.
+        "DeepseekV41ForCausalLM",
+        f"{v41_model}:DeepseekV41VLForCausalLM",
     )
     ModelRegistry.register_model("K3DSparkModel", _K3_DSPARK_MODEL)
     ModelRegistry.register_model("DSparkDraftModel", _DSV4_DSPARK_MODEL)

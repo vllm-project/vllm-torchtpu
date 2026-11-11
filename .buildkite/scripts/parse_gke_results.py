@@ -78,6 +78,9 @@ def parse_and_upload(file_path, record_id, dry_run=False) -> bool:
             # Build configuration & workload payload
             config_dict = {
                 "code_hash": os.getenv("BUILDKITE_COMMIT") or "N/A",
+                # The build number, the key upload_results.py rows carry too;
+                # the launcher forwards BUILDKITE_* into every pod.
+                "job_reference": os.getenv("BUILDKITE_BUILD_NUMBER") or "N/A",
                 "image": os.getenv("DOCKER_IMAGE") or "latest",
                 "created_by": os.getenv("CREATED_BY") or "buildkite",
                 "device_type": os.getenv("TPU_VERSION") or "tpu7x",

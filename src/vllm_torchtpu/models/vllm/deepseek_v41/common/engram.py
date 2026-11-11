@@ -5,23 +5,31 @@ subclasses ``NgramHashState`` to bind its own slot-cache write op and, when
 its SWA cache module differs, the cache lifetime in ``ensure_cache``.
 """
 
+import functools
 import mmap
 import tempfile
 from contextlib import ExitStack
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
 
+import jax
 import numpy as np
 import torch
 from vllm.config import get_current_vllm_config_or_none
 from vllm.models.deepseek_v41.common import engram as upstream
+from vllm.models.deepseek_v41.common.mm_preprocess import (
+    IMAGE_SENTINEL_BASE_ID,
+    image_sentinel_mask,
+)
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.kernels.engram_hash import engram_hash, engram_prep, hash_tables
 from vllm_torchtpu.layers.adapter.custom_ops.packed_suffix_op import packed_suffix
 from vllm_torchtpu.layers.adapter.upstream_bindings import (
     bind_device_ops,
     device_hooks,
 )
+from vllm_torchtpu.layers.core import table_lookup
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.model_loader_patches import register_row_slice
 
@@ -46,6 +54,19 @@ class NgramHashState(upstream.NgramHashState):
         valid: torch.Tensor,
     ) -> None:
         """Write mapped token ids into the slot cache; bound per implementation."""
+        raise NotImplementedError
+
+    def write_token_ids(
+        self,
+        cache: torch.Tensor,
+        slots: torch.Tensor,
+        input_ids: torch.Tensor,
+        dead_mask: torch.Tensor | None,
+    ) -> None:
+        """Map ``input_ids`` and write them at int32 ``slots`` (-1: skip).
+
+        A None ``dead_mask`` means image-sentinel ids, derived in the write.
+        """
         raise NotImplementedError
 
     def ensure_cache(self) -> bool:
@@ -89,13 +110,27 @@ class NgramHashState(upstream.NgramHashState):
             )
         if slot_mapping is not None:
             slot_mapping = slot_mapping[:count]
+        # None masks: derive them from the ids where each is consumed, so no
+        # shared mask program runs ahead of this call (fused hash only).
+        masks_from_ids = dead_mask is None
+        if masks_from_ids != (lookback_dead_mask is None) or (
+            masks_from_ids and not self.fuses_dead_masks(input_ids)
+        ):
+            raise ValueError("Engram dead masks may be omitted only together, fused")
         if self.use_slot_cache:
             assert self._cache is not None and slot_mapping is not None
-            mapped = self.token_map[input_ids.long()].masked_fill(
-                dead_mask, upstream.DEAD_ID
-            )
-            valid = slot_mapping >= 0
-            self.write_cache(self._cache, slot_mapping, mapped, valid)
+            if (
+                envs.TPU_DEEPSEEK_V41_ENGRAM_INT32_SLOT_WRITE
+                and input_ids.device.type != "cpu"
+            ):
+                self.write_token_ids(self._cache, slot_mapping, input_ids, dead_mask)
+            else:
+                mapped = self.token_map[input_ids.long()].masked_fill(
+                    image_sentinel_mask(input_ids) if masks_from_ids else dead_mask,
+                    upstream.DEAD_ID,
+                )
+                valid = slot_mapping >= 0
+                self.write_cache(self._cache, slot_mapping, mapped, valid)
 
         def fallback(past, reqs, window):
             if not self.use_slot_cache:
@@ -110,6 +145,16 @@ class NgramHashState(upstream.NgramHashState):
             )
             return self._cache[slots]
 
+        if self.uses_fused_hash(input_ids):
+            return self._fused_hash(
+                input_ids,
+                positions,
+                query_start_loc,
+                dead_mask,
+                lookback_token_ids,
+                lookback_dead_mask,
+                block_table,
+            )
         tables = (self.token_map, self.multipliers, self.primes, self.offsets)
         return self._hash(
             tables,
@@ -120,6 +165,120 @@ class NgramHashState(upstream.NgramHashState):
             lookback_token_ids,
             lookback_dead_mask,
             fallback,
+        )
+
+    def uses_fused_hash(self, input_ids: torch.Tensor) -> bool:
+        return (
+            envs.TPU_DEEPSEEK_V41_ENGRAM_FUSED_HASH and input_ids.device.type != "cpu"
+        )
+
+    def fuses_dead_masks(self, input_ids: torch.Tensor) -> bool:
+        """Whether ``forward`` takes None dead masks (ENGRAM_MASKS_IN_HASH)."""
+        return envs.TPU_DEEPSEEK_V41_ENGRAM_MASKS_IN_HASH and self.uses_fused_hash(
+            input_ids
+        )
+
+    def _fused_hash_tables(self) -> tuple[int, tuple[torch.Tensor, ...]]:
+        """(pad id, device limbs/primes/offsets), built once."""
+        fused = getattr(self, "_fused_tables", None)
+        if fused is None:
+            pad_id = int(self.pad_id)
+            token_map, multipliers, primes, offsets = (
+                np.asarray(t.to("cpu"), dtype=np.int64)
+                for t in (self.token_map, self.multipliers, self.primes, self.offsets)
+            )
+            limbs, primes, offsets = hash_tables(
+                token_map, multipliers, primes, offsets, pad_id
+            )
+            device = self.token_map.device
+            tables = tuple(
+                torch.from_numpy(t).to(device) for t in (limbs, primes, offsets)
+            )
+            fused = self._fused_tables = (pad_id, tables)
+        return fused
+
+    def fused_prep(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        lookback_token_ids: torch.Tensor,
+        block_tables: torch.Tensor,
+        num_reqs: int,
+        rows_per_page: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Slot write and hash of a decode step in one op call: (hashes, keep).
+
+        Equals ``forward`` with the slots of the v2 ``engram_cache_slots``,
+        dead masks derived from the ids (ENGRAM_MASKS_IN_HASH) and the int32
+        slot write, plus ``~image_sentinel_mask(input_ids)``. One op call
+        instead of five separately dispatched programs.
+        """
+        assert self.use_slot_cache and self._cache is not None
+        assert self._cache.numel() < 2**31 and rows_per_page == self.block_size
+        pad_id, tables = self._fused_hash_tables()
+        cache, hashes, keep = _fused_prep_op()(
+            self.token_map,
+            *tables,
+            self._cache,
+            input_ids,
+            positions,
+            query_start_loc,
+            lookback_token_ids,
+            block_tables,
+            num_reqs,
+            self.lookback_depth,
+            self.block_size,
+            pad_id,
+            upstream.DEAD_ID,
+            IMAGE_SENTINEL_BASE_ID,
+            bool(envs.TPU_DEEPSEEK_V41_ENGRAM_TILE_SCATTER),
+        )
+        self._cache.copy_(cache)
+        return hashes, keep
+
+    def _fused_hash(
+        self,
+        input_ids,
+        positions,
+        query_start_loc,
+        dead_mask,
+        lookback_token_ids,
+        lookback_dead_mask,
+        block_table,
+    ):
+        """``_hash`` as one fused program (kernels/engram_hash.py)."""
+        pad_id, tables = self._fused_hash_tables()
+        use_cache = bool(self.use_slot_cache)
+        if use_cache:
+            assert self._cache is not None and block_table is not None
+            cache, table, block_size = self._cache, block_table, self.block_size
+        else:
+            # Unused operands; the static use_cache drops their reads.
+            cache, table, block_size = input_ids, lookback_token_ids, 1
+        input_ids, lookback_token_ids = input_ids.int(), lookback_token_ids.int()
+        sentinel = -1
+        if dead_mask is None:
+            # The op derives both masks from the ids; the mask operands are unread.
+            sentinel = IMAGE_SENTINEL_BASE_ID
+            dead_mask, lookback_dead_mask = input_ids, lookback_token_ids
+        return _fused_hash_op()(
+            self.token_map,
+            *tables,
+            input_ids,
+            positions.int(),
+            query_start_loc.int(),
+            dead_mask,
+            lookback_token_ids,
+            lookback_dead_mask,
+            cache,
+            table.int(),
+            self.lookback_depth,
+            block_size,
+            pad_id,
+            upstream.DEAD_ID,
+            use_cache,
+            sentinel,
         )
 
     def hash_on_host(
@@ -210,10 +369,10 @@ class NgramHashState(upstream.NgramHashState):
         _, ngram = multipliers.shape
         dev = input_ids.device
         rows = torch.arange(count, device=dev)
-        reqs = torch.bucketize(rows, query_start_loc[1:], right=True).clamp(
+        reqs = table_lookup.bucketize_right(rows, query_start_loc[1:]).clamp(
             max=lookback_token_ids.shape[0] - 1
         )
-        starts = query_start_loc[reqs].long().clamp(max=count - 1)
+        starts = table_lookup.take(query_start_loc, reqs).long().clamp(max=count - 1)
         chunk_positions = positions[starts]
         shifts = torch.arange(ngram, device=dev)
         past = positions[:, None] - shifts
@@ -233,10 +392,26 @@ class NgramHashState(upstream.NgramHashState):
             lookback_dead_mask, upstream.DEAD_ID
         )
         window = mapped_lookback[reqs_col, cols]
+        if self.lookback_depth >= ngram - 1:
+            # The fallback is read only where ~in_chunk: then past is
+            # chunk_position - 1 - cols with cols < ngram - 1 <= lookback_depth,
+            # so every row reads one of its request's lookback_depth slots.
+            # Read those [requests, lookback_depth] slots once instead of one
+            # per (token, shift); rows that discard the fallback differ only
+            # in the discarded value.
+            num_reqs = lookback_token_ids.shape[0]
+            req_ids = torch.arange(num_reqs, device=dev)
+            # Request r's first row; a slice, not a per-request gather.
+            first = query_start_loc[:num_reqs]
+            req_past = positions[first.long().clamp(max=count - 1)][:, None] - (
+                1 + torch.arange(self.lookback_depth, device=dev)
+            )
+            table = fallback(req_past, req_ids[:, None], req_past.to(window.dtype))
+            missing = table[reqs_col, cols]
+        else:
+            missing = fallback(past, reqs_col, window)
         source = torch.where(
-            in_chunk,
-            batch,
-            torch.where(known, window, fallback(past, reqs_col, window)),
+            in_chunk, batch, torch.where(known, window, missing)
         ).long()
         blocked = ((past < 0) | (source == upstream.DEAD_ID)).cumsum(dim=1) > 0
         source = source.masked_fill(blocked, self.pad_id)
@@ -251,6 +426,175 @@ class NgramHashState(upstream.NgramHashState):
             None, :, :
         ]
         return hashed.to(torch.int32)
+
+
+_FUSED_HASH_OP = None
+
+
+def _fused_hash_op():
+    """Torch op for ``engram_hash``: 12 arrays, then 6 static arguments."""
+    global _FUSED_HASH_OP
+    if _FUSED_HASH_OP is None:
+        from jax.sharding import PartitionSpec as P
+        from torch_tpu._internal import pallas
+
+        from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+            get_pallas_op_mesh,
+        )
+
+        # jax_op requires every argument named and annotated.
+        def call(
+            token_map: jax.Array,
+            limbs: jax.Array,
+            primes: jax.Array,
+            offsets: jax.Array,
+            input_ids: jax.Array,
+            positions: jax.Array,
+            query_start_loc: jax.Array,
+            dead_mask: jax.Array,
+            lookback_token_ids: jax.Array,
+            lookback_dead_mask: jax.Array,
+            cache: jax.Array,
+            block_table: jax.Array,
+            lookback_depth: int,
+            block_size: int,
+            pad_id: int,
+            dead_id: int,
+            use_cache: bool,
+            sentinel: int,
+        ) -> jax.Array:
+            return engram_hash(
+                token_map,
+                limbs,
+                primes,
+                offsets,
+                input_ids,
+                positions,
+                query_start_loc,
+                dead_mask,
+                lookback_token_ids,
+                lookback_dead_mask,
+                cache,
+                block_table,
+                lookback_depth=lookback_depth,
+                block_size=block_size,
+                pad_id=pad_id,
+                dead_id=dead_id,
+                use_cache=use_cache,
+                sentinel=None if sentinel < 0 else sentinel,
+            )
+
+        op = pallas.jax_op(
+            "pallas::dsv41_engram_fused_hash",
+            call,
+            mesh=get_pallas_op_mesh(),
+            input_partition_specs=cast(
+                tuple[tuple[str, ...], ...], (P(),) * 12 + (None,) * 6
+            ),
+        )
+        op.register_fake(
+            lambda token_map,
+            limbs,
+            primes,
+            offsets,
+            input_ids,
+            *_: input_ids.new_empty(
+                (input_ids.shape[0], limbs.shape[0], offsets.shape[1]),
+                dtype=torch.int32,
+            )
+        )
+        _FUSED_HASH_OP = op
+    return _FUSED_HASH_OP
+
+
+_FUSED_PREP_OP = None
+
+
+def _fused_prep_op():
+    """Torch op for ``engram_prep``: 10 arrays (the cache donated), 7 statics."""
+    global _FUSED_PREP_OP
+    if _FUSED_PREP_OP is None:
+        from jax.sharding import PartitionSpec as P
+        from torch_tpu._internal import pallas
+
+        from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+            get_pallas_op_mesh,
+            get_vllm_model_wrapper_context,
+        )
+
+        mesh = get_vllm_model_wrapper_context().mesh
+
+        def call(
+            token_map: jax.Array,
+            limbs: jax.Array,
+            primes: jax.Array,
+            offsets: jax.Array,
+            cache: jax.Array,
+            input_ids: jax.Array,
+            positions: jax.Array,
+            query_start_loc: jax.Array,
+            lookback_token_ids: jax.Array,
+            block_tables: jax.Array,
+            num_reqs: int,
+            lookback_depth: int,
+            block_size: int,
+            pad_id: int,
+            dead_id: int,
+            sentinel: int,
+            tiles: bool,
+        ) -> tuple[jax.Array, jax.Array, jax.Array]:
+            prep = functools.partial(
+                engram_prep,
+                num_reqs=num_reqs,
+                lookback_depth=lookback_depth,
+                block_size=block_size,
+                pad_id=pad_id,
+                dead_id=dead_id,
+                sentinel=sentinel,
+                tiles=tiles,
+            )
+            # The tile scatter is a Pallas call: manual partitioning, one
+            # replica per device.
+            return jax.shard_map(
+                prep,
+                mesh=mesh,
+                in_specs=(P(),) * 10,
+                out_specs=(P(), P(), P()),
+                check_vma=False,
+            )(
+                token_map,
+                limbs,
+                primes,
+                offsets,
+                cache,
+                input_ids,
+                positions,
+                query_start_loc,
+                lookback_token_ids,
+                block_tables,
+            )
+
+        op = pallas.jax_op(
+            "pallas::dsv41_engram_fused_prep",
+            call,
+            donate_argnums=(4,),
+            mesh=get_pallas_op_mesh(),
+            input_partition_specs=cast(
+                tuple[tuple[str, ...], ...], (P(),) * 10 + (None,) * 7
+            ),
+        )
+        op.register_fake(
+            lambda token_map, limbs, primes, offsets, cache, input_ids, *_: (
+                torch.empty_like(cache),
+                input_ids.new_empty(
+                    (input_ids.shape[0], limbs.shape[0], offsets.shape[1]),
+                    dtype=torch.int32,
+                ),
+                torch.empty_like(input_ids, dtype=torch.bool),
+            )
+        )
+        _FUSED_PREP_OP = op
+    return _FUSED_PREP_OP
 
 
 def _load_local_rows(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
@@ -583,7 +927,8 @@ def _gather_engram_rows(rows, dim):
 class Engram(upstream.Engram):
     """Inherit projections, staging and collective head gather from upstream."""
 
-    embed = bind_device_ops(
+    # Upstream's embed with the TPU row gather; ``embed`` adds the HBM path.
+    _device_embed = bind_device_ops(
         upstream.Engram.embed, tensor_model_parallel_all_gather=_gather_engram_rows
     )
 
@@ -626,6 +971,12 @@ class Engram(upstream.Engram):
         self._staged_views_by_tokens: dict[int, torch.Tensor] = {}
         self._prepared_uploads: dict[int, list[PreparedEngramUpload]] | None = None
         self._active_upload: PreparedEngramUpload | None = None
+        # TPU_DEEPSEEK_V41_ENGRAM_HBM state (``engram_hbm``), set on first use.
+        self._uses_hbm: bool | None = None
+        self._hbm_table: tuple | None = None
+        # The lookup op, built with the table (it builds the EP mesh, a
+        # collective that must not run first inside a trace).
+        self._hbm_op = None
         if getattr(self.embed_tokens, "host_offload", False):
             # Host DRAM tables: the host only gathers raw FP8 bytes and scale
             # bytes (a memcpy-bound index_select); dequantization runs inside
@@ -738,6 +1089,9 @@ class Engram(upstream.Engram):
         if self._staged_raw is None:
             super().prepare_embeddings(hash_ids)
             return
+        if self.uses_hbm_lookup:
+            # Rows are looked up inside the compiled stage (``embed``).
+            return
         dp_size = self.embed_tokens.dp_size
         num_tokens, remainder = divmod(hash_ids.shape[0], dp_size)
         if remainder or num_tokens > self._host_raw.shape[0]:
@@ -792,6 +1146,96 @@ class Engram(upstream.Engram):
         upload.copy_from(host_words[: raw_words + scale_words])
         self.activate_prepared_embeddings(num_tokens, upload)
 
+    @property
+    def uses_hbm_lookup(self) -> bool:
+        """``TPU_DEEPSEEK_V41_ENGRAM_HBM``: rows come from the HBM copy of the host
+        head shard through ``engram_hbm`` instead of the host exchange.
+        Decided once, after staging and the EP group exist."""
+        if self._uses_hbm is None:
+            from .engram_hbm import should_use_hbm_lookup
+
+            self._uses_hbm = should_use_hbm_lookup(
+                staged_raw=self._staged_raw,
+                dp_size=int(self.embed_tokens.dp_size),
+                layer_hash_index=int(self.layer_hash_index),
+            )
+        return self._uses_hbm
+
+    def upload_hbm_table(self):
+        """Copy this rank's host head shard to HBM once; returns
+        (table, scales, shard metadata, rows per rank)."""
+        if self._hbm_table is not None:
+            return self._hbm_table
+        from vllm_torchtpu.distributed.ep_mesh import ep_mesh_index
+
+        from .engram_hbm import build_lookup_op, gather_shard_meta, upload_table
+
+        emb = self.embed_tokens
+        weight, scales = emb._storage()
+        meta = gather_shard_meta(
+            int(emb.head_start),
+            int(emb.vocab_start_idx),
+            int(emb.vocab_end_idx),
+            int(weight.shape[0]),
+        )
+        rows = max(m[3] for m in meta)
+        device = cast(torch.Tensor, self._staged_raw).device
+        table, table_scales = upload_table(weight, scales, device, rows)
+        self._hbm_table = (table, table_scales, meta, rows)
+        # Buffers, so the compiled stage that calls the lookup takes them as
+        # module state; non-persistent, so they never enter the state dict.
+        self.register_buffer("_hbm_raw_table", table, persistent=False)
+        self.register_buffer("_hbm_scale_table", table_scales, persistent=False)
+        self.register_buffer(
+            "_hbm_rank_index",
+            torch.tensor(
+                [[cast(int, ep_mesh_index())]], dtype=torch.int32, device=device
+            ),
+            persistent=False,
+        )
+        self._hbm_op = build_lookup_op(
+            int(self.layer_hash_index),
+            int(emb.n_hash_cols),
+            int(emb.part_n_hash_cols),
+            rows,
+            int(self._host_raw.shape[-1]),
+            int(emb.block_size),
+            int(emb.dp_size),
+            meta,
+        )
+        logger.info(
+            "[DSV41] Engram HBM table: layer=%d rows/rank=%d bytes=%d",
+            self.layer_hash_index,
+            rows,
+            table.numel() + table_scales.numel(),
+        )
+        return self._hbm_table
+
+    def _hbm_lookup(self, hash_ids: torch.Tensor) -> torch.Tensor:
+        """This step's rows, looked up from HBM inside the compiled stage.
+
+        ``hash_ids`` [T, C] are the real device hashes the model passes into
+        the stage. Under DP+EP lockstep every rank runs the same token bucket,
+        so ``T`` is already the DP-wide size the lookup's collectives need.
+        """
+        assert self._hbm_op is not None, "upload_hbm_table() runs at load"
+        return self._hbm_op(
+            hash_ids.to(torch.int32),
+            self._hbm_raw_table,
+            self._hbm_scale_table,
+            self._hbm_rank_index,
+        )
+
+    def _rows_for(self, hash_ids: torch.Tensor) -> torch.Tensor:
+        if self._staged_raw is not None and self.uses_hbm_lookup:
+            return self._hbm_lookup(hash_ids)
+        return self._ready_rows(hash_ids.shape[0])
+
+    def embed(self, hash_ids: torch.Tensor) -> torch.Tensor:
+        if self._staged_raw is not None and self.uses_hbm_lookup:
+            return self._hbm_lookup(hash_ids)[:, : self.embed_tokens.n_hash_cols]
+        return self._device_embed(hash_ids)
+
     def _ready_rows(self, num_tokens: int) -> torch.Tensor:
         if self._staged_raw is None:
             return super()._ready_rows(num_tokens)
@@ -821,7 +1265,7 @@ class Engram(upstream.Engram):
         token-axis all-gather yields ``[tp, T_pad, local_heads, dim]`` whose
         rank-major head order matches upstream's non-SP ``dim=1`` gather.
         """
-        rows = self._ready_rows(hash_ids.shape[0])
+        rows = self._rows_for(hash_ids)
         cols = self.embed_tokens.n_hash_cols
         tp = self.embed_tokens.tp_size
         num_tokens = rows.shape[0]

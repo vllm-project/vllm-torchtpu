@@ -157,14 +157,13 @@ def test_failed_dma_preserves_pending_handle(transport):
     assert slot.pending is pending
 
 
-@pytest.mark.parametrize("version", ["v1", "v2"])
-def test_model_records_device_consumers_before_slot_reuse(transport, version):
+def test_model_records_device_consumers_before_slot_reuse(transport):
     module, events, _ = transport
     slot = module.PreparedEngramUpload(4, torch.device("cpu"))
     slot.acquire().fill_(17)
     slot.start()
     slot.activate()
-    tree = ast.parse((SOURCE / version / "model.py").read_text())
+    tree = ast.parse((SOURCE / "v2" / "model.py").read_text())
     cls = next(
         node for node in tree.body if getattr(node, "name", None) == "DeepseekV41Model"
     )
@@ -248,6 +247,49 @@ def test_download_reuses_host_storage_but_rebinds_each_device_producer(transport
     assert len({id(event[2]) for event in bindings}) == 1
     assert len(set(outputs)) == 1
     assert bindings[0][2].size_bytes == 3 * 2 * 128 * 4
+
+
+@pytest.mark.parametrize("tokens", [1, 128, 288])
+def test_download_reorders_tiles_into_reused_logical_storage(transport, tokens):
+    # Token-minor tiles need a reordering copy; it lands in storage reused by
+    # every download of the bucket and matches the logical hashes exactly.
+    module, _, layout = transport
+    shape, value = (tokens, 2, 8), ([0, 2, 1], [[8, 128]], 32)
+    layout.get_device_layout_if_materialized = lambda _: value
+    physical, permutation, padded = module._hash_layout(
+        shape, ([0, 2, 1], [[8, 128]], 0)
+    )
+    inverse = sorted(range(len(permutation)), key=permutation.__getitem__)
+
+    def d2h(self):
+        logical = torch.full(padded, -1, dtype=torch.int32)
+        logical[:tokens, :2, :8] = self.device.data
+        permuted = [physical[dim] for dim in permutation]
+        words = logical.view(permuted).permute(inverse).contiguous()
+        self.host.view(torch.int32)[: words.numel()].copy_(words.flatten())
+
+    transfer = module.EngramHashDownload.copy_to_host.__globals__["raw_transfer"]
+    transfer.PreparedTorchRawTransfer.d2h = d2h
+
+    class DeviceTensor:
+        device = torch.device("xla:0")
+        dtype = torch.int32
+
+        def __init__(self, values):
+            self.data, self.shape = values, values.shape
+
+        def numel(self):
+            return self.data.numel()
+
+    download = module.EngramHashDownload()
+    outputs = []
+    for step in range(3):
+        expected = torch.arange(math.prod(shape), dtype=torch.int32).view(shape)
+        expected = expected * 7 + step
+        actual = download.copy_to_host(DeviceTensor(expected))
+        assert torch.equal(actual, expected)
+        outputs.append(actual.data_ptr())
+    assert len(set(outputs)) == 1
 
 
 @pytest.mark.parametrize("tokens", [1, 128, 288])
