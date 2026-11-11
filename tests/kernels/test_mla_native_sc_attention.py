@@ -832,6 +832,184 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
         )
         self.assertFalse(np.array_equal(bits(bad)[row], bits(ref)[row]))
 
+    @parameterized.product(
+        (
+            {"query_tokens": 64, "seq_q": (4, 4, 49)},
+            {"query_tokens": 512, "seq_q": (4, 4, 300)},
+            {"query_tokens": 1024, "seq_q": (4, 4, 1000)},
+        ),
+        overflow=(False, True),
+    )
+    def test_mixed_live_gather_bit_identical(self, query_tokens, seq_q, overflow):
+        """TPU_DCP_MLA_MIXED_LIVE (+ _WIDTHS): mixed buckets gather and attend
+        only each grid step's live atom blocks (and size the body to them);
+        every owning real row matches the token-major path bit for bit."""
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("SparseCore cache-layout attention requires a TPU")
+        rng = np.random.default_rng(20261011 + query_tokens + int(overflow))
+        problem, topk_glued, owns, counts, page_table, cu_q_lens, distribution = (
+            self._split_q_lse_case(query_tokens, seq_q, rng)
+        )
+        if not overflow:
+            # DCP16-like ownership: ~128 live rows per token, no overflow, so
+            # the live-group layout is taken on every chunk.
+            counts = np.clip(rng.normal(128, 30, size=query_tokens), 0, 400).astype(int)
+            counts[0] = 0
+            live = np.arange(2048)[None, :] < counts[:, None]
+            topk_glued = jnp.where(jnp.asarray(live), problem["topk"], -1)
+            owns = jnp.any(topk_glued >= 0, axis=-1)
+            topk_glued = topk_glued.at[:, 0].set(
+                jnp.where(owns, topk_glued[:, 0], jnp.int32(0))
+            )
+        q_nope = problem["q"][..., :NOPE_DIM]
+        q_pe = problem["q"][..., NOPE_DIM:]
+        real_tokens = int(sum(seq_q))
+
+        def run(topk_in, **kw):
+            out, lse = sparse_mla.sparse_ragged_paged_attention(
+                q_nope,
+                problem["sparsecore_nope"],
+                problem["sparsecore_rope"],
+                topk_in,
+                page_table,
+                cu_q_lens,
+                distribution,
+                sm_scale=0.125,
+                k_scale=0.75,
+                return_lse=True,
+                cache_layout=sparse_mla.SPARSECORE_CACHE_LAYOUT,
+                gather_and_attention_chunk_size=256,
+                topk_cap=512,
+                small_chunk_batch_size=4,
+                small_chunk_tokens=32,
+                q_pe=q_pe,
+                lse_lane_dense=True,
+                **kw,
+            )
+            return out[..., :NOPE_DIM], lse
+
+        def bits(x):
+            return np.asarray(jax.lax.bitcast_convert_type(x, jnp.uint16))
+
+        ref, ref_lse = jax.block_until_ready(run(topk_glued))
+        own = np.asarray(owns)[:real_tokens]
+        for kw in (
+            {"mixed_live_gather": True},
+            {"mixed_live_gather": True, "mixed_live_widths": (256,)},
+            {"mixed_live_gather": True, "mixed_live_widths": (128, 256)},
+        ):
+            out, lse = jax.block_until_ready(run(topk_glued, **kw))
+            np.testing.assert_array_equal(
+                bits(out)[:real_tokens][own],
+                bits(ref)[:real_tokens][own],
+                err_msg=str(kw),
+            )
+            np.testing.assert_array_equal(
+                np.asarray(lse)[:real_tokens][own].view(np.uint32),
+                np.asarray(ref_lse)[:real_tokens][own].view(np.uint32),
+                err_msg=str(kw),
+            )
+        # Positive control: one moved live entry of the longest row moves it.
+        row = int(np.argmax(np.where(own, counts[:real_tokens], -1)))
+        moved = topk_glued.at[row, 0].set((topk_glued[row, 0] + 1) % 8192)
+        bad, _ = jax.block_until_ready(run(moved, mixed_live_gather=True))
+        self.assertFalse(np.array_equal(bits(bad)[row], bits(ref)[row]))
+
+    @parameterized.parameters((512, 300), (1024, 1000), (1024, 77))
+    def test_capped_window_live_matches_reference(self, num_tokens, real):
+        """`prepare_capped_window_live`: per chunk, window 0 is a permutation of
+        `prepare_capped_window_indices`'s (16-token x 64-slot) blocks with
+        group g's live blocks at off(g) + a; windows >= 1 are unchanged."""
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("Mosaic kernel requires a TPU")
+        rng = np.random.default_rng(num_tokens + real)
+        page_size, total_pages, pps, topk, cap, chunk, bz = (
+            256,
+            2085,
+            256,
+            2048,
+            512,
+            256,
+            16,
+        )
+        page_table = jnp.asarray(rng.integers(0, total_pages, size=8 * pps), jnp.int32)
+        cu_q_lens = jnp.asarray([0] + [real] * 8, jnp.int32)
+        token_end = jnp.int32(real)
+        for counts in (
+            rng.integers(1, 300, size=num_tokens),
+            np.r_[rng.integers(1, 300, size=num_tokens - 1), 1500],
+        ):
+            counts[real - 1] = max(counts[real - 1], 1)
+            logical = rng.integers(0, pps * page_size, size=(num_tokens, topk))
+            topk_idx = jnp.asarray(
+                np.where(np.arange(topk)[None] < counts[:, None], logical, -1),
+                jnp.int32,
+            )
+            kv = jnp.sum(topk_idx != -1, axis=-1)
+            lw = sparse_mla.capped_live_windows(
+                kv,
+                token_end,
+                chunk_size=chunk,
+                kernel_batch_size=bz,
+                topk_cap=cap,
+                num_windows=topk // cap,
+            )
+            tab, num_live = sparse_mla.live_group_table(
+                kv,
+                token_end,
+                chunk_size=chunk,
+                kernel_batch_size=bz,
+                topk_cap=cap,
+                num_windows=topk // cap,
+            )
+            rows = sparse_mla.prepare_capped_window_live(
+                topk_idx,
+                page_table,
+                cu_q_lens,
+                lw,
+                tab,
+                chunk_size=chunk,
+                kernel_batch_size=bz,
+                topk_cap=cap,
+                page_size=page_size,
+                total_num_pages=total_pages,
+            )
+            want = sparse_mla.prepare_capped_window_indices(
+                topk_idx,
+                page_table,
+                cu_q_lens,
+                lw,
+                chunk_size=chunk,
+                topk_cap=cap,
+                page_size=page_size,
+                total_num_pages=total_pages,
+            )
+            lw, tab, num_live = int(lw), np.asarray(tab), np.asarray(num_live)
+            nc, gpc, ng = num_tokens // chunk, chunk // bz, num_tokens // bz
+            got = np.asarray(rows).reshape(nc, 4, chunk * cap)
+            ref = np.asarray(want).reshape(nc, 4, chunk, cap)
+            for c in range(nc):
+                np.testing.assert_array_equal(
+                    got[c, 1:lw].reshape(-1), ref[c, 1:lw].reshape(-1)
+                )
+                blocks = got[c, 0].reshape(gpc * 8, bz * 64)
+                ref_blocks = ref[c, 0].reshape(gpc, bz, 8, 64).transpose(0, 2, 1, 3)
+                ref_blocks = ref_blocks.reshape(gpc * 8, bz * 64)
+                self.assertEqual(
+                    sorted(map(bytes, blocks)), sorted(map(bytes, ref_blocks))
+                )
+                for tb in range(gpc):
+                    g = c * gpc + tb
+                    a_live, off = int(tab[g]), int(tab[ng + g])
+                    for a in range(a_live):
+                        np.testing.assert_array_equal(
+                            blocks[off + a], ref_blocks[tb * 8 + a]
+                        )
+                if lw == 1:
+                    self.assertEqual(
+                        num_live[c], tab[c * gpc : (c + 1) * gpc].sum() * bz * 64
+                    )
+
     @parameterized.parameters((16, 4, 1), (32, 4, 1), (32, 16, 16))
     def test_fused_window_prep_matches_reference(self, num_tokens, bz, atoms):
         """`prepare_capped_window_fused` rows == `prepare_capped_window_indices`
