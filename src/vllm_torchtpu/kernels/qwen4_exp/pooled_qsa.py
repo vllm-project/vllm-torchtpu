@@ -704,8 +704,11 @@ def compact_pooled_qsa_step(
     early_pooled = None
     preparation_group = None
     early_raw = index_qk[:, -index_dim:]
+    from vllm_torchtpu.kernels.qwen4_exp.engine_policy import qsa_tc_only
+
     if (
         enable_sc_preparation
+        and not qsa_tc_only()
         and scheduling_group_namespace > 0
         and use_prefill_index_preparation(
             early_raw, compress_ratio, requests=len(context)

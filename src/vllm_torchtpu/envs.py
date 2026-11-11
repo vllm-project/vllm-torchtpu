@@ -52,6 +52,7 @@ if TYPE_CHECKING:
     VLLM_TPU_HC_PREFILL_TILE: int | None = None
     VLLM_TPU_HC_PACKED_MIX: bool = True
     VLLM_TPU_QSA_SC_MIN_CONTEXT: int | None = None
+    VLLM_TPU_QSA_TC_ONLY: bool = False
     MOE_REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
     TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: bool | None = None
@@ -458,6 +459,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_QSA_SC_MIN_CONTEXT": env_positive_int_or_none(
         "VLLM_TPU_QSA_SC_MIN_CONTEXT"
     ),
+    # Local SC-vs-TC experiment (kernels/qwen4_exp/engine_policy.py): keep QSA
+    # top-k, index-key preparation and prefill attention off the SparseCore.
+    "VLLM_TPU_QSA_TC_ONLY": env_bool("VLLM_TPU_QSA_TC_ONLY", default=False),
     # HC debug override: auto/unset uses the kernel policy, 0 uses Torch,
     # positive multiples of 128 override tile/profitability for both components.
     "VLLM_TPU_HC_PREFILL_TILE": env_nonnegative_int_or_auto("VLLM_TPU_HC_PREFILL_TILE"),

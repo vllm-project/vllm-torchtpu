@@ -24,8 +24,8 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import streamindex_topk
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.topk_backend import (
     TopKBackend,
 )
+from vllm_torchtpu.kernels.qwen4_exp.engine_policy import default_qsa_topk_backend
 from vllm_torchtpu.kernels.qwen4_exp.indexer_components import qsa_indexing
-from vllm_torchtpu.kernels.qwen4_exp.resident_topk import QwenSparseCoreTopK
 from vllm_torchtpu.kernels.qwen4_exp.tuned_block_sizes import (
     get_decode_index_key_packing,
     get_decode_index_pages,
@@ -192,7 +192,8 @@ def select_index_blocks(
     )
     default_backend = topk_backend is None
     if default_backend:
-        topk_backend = QwenSparseCoreTopK()
+        # SparseCore unless the engine policy selects a TensorCore selector.
+        topk_backend = default_qsa_topk_backend()
     page_size = cache.shape[1] * 2
     query_width = query.shape[-1]
     query = jnp.pad(query, ((0, 0), (0, 0), (0, cache.shape[-1] - query_width)))

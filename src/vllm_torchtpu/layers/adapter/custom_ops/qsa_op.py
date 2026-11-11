@@ -21,6 +21,7 @@ from torch_tpu._internal import pallas
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.topk_backend import TopKBackend
+from vllm_torchtpu.kernels.qwen4_exp.engine_policy import qsa_tc_only
 from vllm_torchtpu.kernels.qwen4_exp.pooled_qsa import (
     compact_pooled_qsa_step,
 )
@@ -59,7 +60,12 @@ def build_compact_pooled_qsa_op(
     """
     sc_min_context = envs.environment_variables["VLLM_TPU_QSA_SC_MIN_CONTEXT"]()
     return _build_compact_pooled_qsa_op(
-        topk_backend, topk_backend_key, project_output, sc_min_context, rope_axes
+        topk_backend,
+        topk_backend_key,
+        project_output,
+        sc_min_context,
+        rope_axes,
+        qsa_tc_only(),
     )
 
 
@@ -70,8 +76,13 @@ def _build_compact_pooled_qsa_op(
     project_output: bool,
     sc_min_context: int | None,
     rope_axes: tuple[int, ...] | None,
+    tc_only: bool = False,
 ):
     kind = "compact_pooled_qsa_projected_v2" if project_output else "compact_pooled_qsa"
+    if tc_only:
+        # TC-only QSA compiles a different graph; give it its own persisted
+        # identity so it never reuses a stock cache entry.
+        kind += "_tconly"
     if sc_min_context is not None:
         suffix = hashlib.sha256(str(sc_min_context).encode("utf-8")).hexdigest()
         kind += f"_sc_min_context_{suffix}"

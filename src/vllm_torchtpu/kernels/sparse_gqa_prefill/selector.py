@@ -171,6 +171,12 @@ def select_prefill(
         )
         return result, jnp.int32(4)
 
+    from vllm_torchtpu.kernels.qwen4_exp.engine_policy import qsa_tc_only
+
+    if qsa_tc_only():
+        # Same path a chip without a SparseCore takes: no SC cost model or gather.
+        return original(None)
+
     if (
         len(query) % query_block
         or type(k_scale) not in (int, float)
