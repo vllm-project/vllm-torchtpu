@@ -31,8 +31,8 @@ lives on rank ``b % dcp``, whole, and every block-level step stays local:
 2. `msa_attend_dcp`: each rank merges the candidates into that selection,
    attends every query head of the KV head over the selected blocks it
    holds and returns the partial output with its log-sum-exp; the caller
-   merges the ranks' partials (`ops.msa.exchange_merge_partials`, or
-   `ops.msa.merge_head_partials` over several KV heads).
+   merges the ranks' partials (`attend_and_merge` runs both, or
+   `ops.msa.merge_head_partials` merges over several KV heads).
 
 A DCP group wider than a KV head's TP replicas (e.g. DCP 8 at TP 8 with 4
 KV heads) spans ``G = dcp / replicas`` KV heads: every rank then stores all
@@ -343,8 +343,9 @@ def local_candidates(
     if num_tokens < block_rows:
         s = jnp.pad(s, ((0, 0), (0, pad)) if pretransposed else ((0, pad), (0, 0)))
     # Else the last row block reads past the scores: its padding rows pick
-    # from garbage and are dropped (a pad copied every score, ~17 us per
-    # layer for the c48 mixed step's small tiles, j-c22c589e).
+    # from garbage and are dropped, as the kernels reduce within a row only
+    # (a pad copied every score, ~17 us per layer for the c48 mixed step's
+    # small tiles, j-c22c589e).
     p = jnp.pad(pos, (0, pad))[:, None]
     # Static scan widths (`_scan_widths`, one kernel body each); each row
     # block takes the narrowest one holding every block its rows see (a
@@ -841,7 +842,7 @@ def msa_attend_dcp(
     the partial head-major, as the kernel writes it, ``(out [G * Hg, T, D],
     lse [G * Hg, T] f32)``: the LSE merge reduce-scatters heads along the
     leading axis (`ops.msa.merge_head_partials`), or the merge's all-to-all
-    sends each rank its block (`ops.msa.exchange_merge_partials`).
+    sends each rank its block (`attend_and_merge`).
     """
     num_tokens = q.shape[1 if q_head_major else 0]
     rank = rank_array(rank)[0]

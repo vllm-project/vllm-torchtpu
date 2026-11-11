@@ -601,9 +601,6 @@ def get_msa_dcp_op(
         _score_jax,
         donate_argnums=(_SHARD_KV_CACHE_ARG, _SHARD_INDEX_CACHE_ARG),
     )
-    attend_op = pallas.jax_op(
-        f"pallas::minimax_m3_msa_dcp_attend_{suffix}", _attend_jax
-    )
 
     def _score_fake(k, v, index_q, index_k, kv_cache, index_cache, *args):
         return (
@@ -617,12 +614,16 @@ def get_msa_dcp_op(
         )
 
     score_op.register_fake(_score_fake)
-    attend_op.register_fake(_head_major_attend_fake)
-    attend_merge_op = (
-        _get_msa_dcp_attend_merge_op(sm_scale, topk, dcp, False, suffix)
-        if kv_heads == 1
-        else None
-    )
+    if kv_heads == 1:
+        attend_merge_op = _get_msa_dcp_attend_merge_op(
+            sm_scale, topk, dcp, False, suffix
+        )
+    else:
+        attend_merge_op = None
+        attend_op = pallas.jax_op(
+            f"pallas::minimax_m3_msa_dcp_attend_{suffix}", _attend_jax
+        )
+        attend_op.register_fake(_head_major_attend_fake)
 
     def op(
         q: torch.Tensor,
