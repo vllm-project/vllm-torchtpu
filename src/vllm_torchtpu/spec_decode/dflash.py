@@ -1074,6 +1074,18 @@ class DFlashProposer:
         """
         assert self.draft_model is not None
         self_model = self.draft_model.model
+        # Only opt into TPU-specific hooks; upstream methods with a similar
+        # name may call GPU custom ops. Other drafts use the TPU path below.
+        tpu_precompute = getattr(
+            self.draft_model, "tpu_precompute_and_store_context_kv", None
+        )
+        if (
+            callable(tpu_precompute)
+            and getattr(self.draft_model, "tpu_context_kv_takes_aux_list", False)
+            and isinstance(hidden_states, (list, tuple))
+        ):
+            # The drafter concatenates (or slices first, then concatenates).
+            return tpu_precompute(list(hidden_states), positions, draft_md_tuple)
         if isinstance(hidden_states, (list, tuple)):
             target_hidden = (
                 hidden_states[0]
@@ -1083,11 +1095,6 @@ class DFlashProposer:
         else:
             target_hidden = hidden_states
 
-        # Only opt into TPU-specific hooks; upstream methods with a similar
-        # name may call GPU custom ops. Other drafts use the TPU path below.
-        tpu_precompute = getattr(
-            self.draft_model, "tpu_precompute_and_store_context_kv", None
-        )
         if callable(tpu_precompute):
             return tpu_precompute(target_hidden, positions, draft_md_tuple)
         if getattr(type(self.draft_model), "owns_context_kv", False):
