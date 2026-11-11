@@ -22,8 +22,11 @@ through the whole-step cache writer, after the kernel (the pool is read-only ins
 
 Returns the residual after the layer (the next step's hidden carry, as the stock
 `Qwen4ExpMTP.forward` second output) and the greedy tokens (the stock
-`compute_logits(...).argmax(-1)`). The draft's weights keep their shipped precision:
-the HC mix weights stay BF16 (`hc_fp8=False`), the experts as checkpointed.
+`compute_logits(...).argmax(-1)`, picked on BF16-rounded logits as the stock lm_head
+returns them). The draft's weights keep their checkpoint precision: routed experts are
+the loaded FP8 tensors and scales (aliased, no copy), attention / HC / shared expert /
+router / lm_head the loaded BF16 tensors; `hc_fp8=False` keeps VLLM_TPU_MK_HC_FP8 off
+the draft.
 """
 
 from __future__ import annotations
@@ -262,7 +265,7 @@ class MkDraft(nn.Module):
     """The draft layer + final mixer + lm_head + greedy pick as one op per step.
 
     Owns the packed draft operands (one set, shared by the step-0 and loop kinds: the
-    weights do not depend on `T`). `step(...)` mirrors `Qwen4ExpMTP.forward` followed
+    weights do not depend on `T`), each at its checkpoint dtype. `step(...)` mirrors `Qwen4ExpMTP.forward` followed
     by `compute_logits(...).argmax(-1)`.
     """
 

@@ -105,6 +105,9 @@ class GreedyHead(Block):
         for name, c0, width in vocab_chunks(self.vocab_shard, vocab_chunk_width(ex)):
             with ctx.stream.segment(lazy=False):
                 logits = ctx.stream.dmatmul(name, scr["xb"], width)  # [MB, width] f32
+            # The stock lm_head (unquantized BF16 linear) returns BF16 logits and the
+            # greedy pick is their argmax: pick on the same BF16-rounded values.
+            logits = logits.astype(BF16).astype(F32)
             col = jax.lax.broadcasted_iota(I32, logits.shape, 1) + c0
             if c0 + width > self.vocab_shard:  # padded columns never win
                 logits = jnp.where(col < self.vocab_shard, logits, -jnp.inf)
