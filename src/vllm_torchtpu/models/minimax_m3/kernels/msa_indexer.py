@@ -225,14 +225,14 @@ _FOLDED_TRANSPOSED_MAX_ROWS = 64
 # r6 (opt-in): fp8 index caches also score transposed (`_fp8_chunk_maxima_t`)
 # for tiles of up to `_FOLDED_TRANSPOSED_MAX_ROWS` rows, their keys fed to
 # the MXU as fp8 as stored (no fp8 -> bf16 unpack; AOT, 128 pages at 8
-# rows: 2,171 -> 819 bundles). Set from TPU_MINIMAX_M3_INDEXER_FP8_TRANSPOSED
+# rows: 2,171 -> 819 bundles). Set from key minimax_indexer_fp8_transposed
 # by the attention layer.
 FP8_TRANSPOSED = False
 # r6 (opt-in): `_kernel_v3`'s DMA ring holds 3 page groups (issuing 2 steps
 # ahead; with one group ahead each step waited out its pages' DMA latency,
 # ~1.3 us per step at 64 or 128 pages), alternate pages go to the second DMA
 # queue, and a group's pages are waited for with one wait per set bit of its
-# page count. Set from TPU_MINIMAX_M3_INDEXER_DMA_RING3 by the attention
+# page count. Set from key minimax_indexer_dma_ring3 by the attention
 # layer.
 DMA_RING3 = False
 _RING3_SLOTS = 3
@@ -585,7 +585,7 @@ def _kernel_v3(
 _KERNELS = {"v1": _kernel_v1, "v2": _kernel_v2}
 
 # r6 (opt-in): per-request table lookups by a one-hot instead of a gather
-# (`lookup`). Set from TPU_MINIMAX_M3_MSA_ONEHOT_LOOKUP by the attention
+# (`lookup`). Set from key minimax_msa_onehot_lookup by the attention
 # layer.
 ONEHOT_LOOKUP = False
 

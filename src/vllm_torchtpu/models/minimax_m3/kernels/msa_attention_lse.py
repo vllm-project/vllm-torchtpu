@@ -42,7 +42,7 @@ _LOG2_E = math.log2(math.e)
 # Opt-in: run r6's kernel (`msa_attention_lse_r6`: several tiles per grid
 # step, a deeper 4-bit page prefetch ring, transposed scores for 8/16-bit
 # pages) instead of this one (12-page step width, per-call 4-bit page
-# cache). Set from TPU_MINIMAX_M3_MSA_LSE_R6 by the attention layer.
+# cache). Set from key minimax_msa_lse_r6 by the attention layer.
 R6_KERNEL = False
 _LN_2 = math.log(2.0)
 # Slots of the per-call page cache of 4-bit caches (`_kernel`): 256 x 20 KB

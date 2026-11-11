@@ -400,7 +400,7 @@ def _sorted_unions(per_tile: jax.Array) -> jax.Array:
 
 
 # r6: sort the page unions without a stability tie-breaker (bit-identical
-# unions). Set from TPU_MINIMAX_M3_MSA_UNSTABLE_SORT by the attention layer.
+# unions). Set from key minimax_msa_unstable_sort by the attention layer.
 UNSTABLE_UNION_SORT = False
 
 

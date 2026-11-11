@@ -45,6 +45,7 @@ from vllm_torchtpu.models.minimax_m3.attention import MiniMaxM3SparseAttention
 from vllm_torchtpu.models.minimax_m3.moe import MiniMaxM3MLP, MiniMaxM3MoE
 from vllm_torchtpu.models.minimax_m3.quant import CT_TO_MODELOPT_EXPERT_SUFFIX
 from vllm_torchtpu.models.minimax_m3.split import join_seq_lens, split_query_layout
+from vllm_torchtpu.opt_in_config import option
 
 logger = init_logger(__name__)
 
@@ -88,7 +89,9 @@ class MiniMaxM3DecoderLayer(nn.Module):
         config = vllm_config.model_config.hf_text_config
         quant_config = vllm_config.quant_config
         # With the split on, forward does every residual all-reduce itself.
-        self.split_min_tokens = envs.TPU_MINIMAX_M3_SPLIT_MIN_TOKENS
+        additional = vllm_config.additional_config
+        self.split_min_tokens = option(additional, "minimax_split_min_tokens")
+        self.split_attention_first = option(additional, "minimax_split_attention_first")
         reduce_results = not self.split_min_tokens
         self.self_attn = MiniMaxM3SparseAttention(
             config,
@@ -114,9 +117,9 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 moe_config, "skip_final_all_reduce", False
             ):
                 raise ValueError(
-                    "TPU_MINIMAX_M3_SPLIT_MIN_TOKENS needs a MoE that leaves its "
-                    "all-reduce to the model (no all2all, sequence-parallel or "
-                    "zero-expert MoE)."
+                    "additional_config.minimax_split_min_tokens needs a MoE that "
+                    "leaves its all-reduce to the model (no all2all, "
+                    "sequence-parallel or zero-expert MoE)."
                 )
         else:
             self.mlp = MiniMaxM3MLP(
@@ -171,7 +174,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
         """
         attn, res = [], []
         for i, h in enumerate(hidden_states):
-            if attn and envs.TPU_MINIMAX_M3_SPLIT_ATTENTION_FIRST:
+            if attn and self.split_attention_first:
                 # The second half waits for the first half's attention, which
                 # then runs while the second half's previous all-reduce is
                 # still on the SparseCore.
@@ -276,16 +279,19 @@ class MiniMaxM3Model(nn.Module):
         # residual added, before the next norm) are also returned; set by
         # the DSpark drafter before the first trace.
         self.aux_hidden_state_layers: tuple[int, ...] = ()
-        self.split_min_tokens = envs.TPU_MINIMAX_M3_SPLIT_MIN_TOKENS
+        self.split_min_tokens = option(
+            vllm_config.additional_config, "minimax_split_min_tokens"
+        )
         if 0 < self.split_min_tokens < 2 * _AFTER_ROWS:
             raise ValueError(
-                f"TPU_MINIMAX_M3_SPLIT_MIN_TOKENS must be 0 or at least "
+                f"additional_config.minimax_split_min_tokens must be 0 or at least "
                 f"{2 * _AFTER_ROWS}, got {self.split_min_tokens}."
             )
         if self.split_min_tokens and envs.TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES <= 0:
             logger.warning(
-                "TPU_MINIMAX_M3_SPLIT_MIN_TOKENS without the Pallas all-reduce "
-                "(TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES=0): the halves' all-reduces "
+                "additional_config.minimax_split_min_tokens without the Pallas "
+                "all-reduce (TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES=0): the halves' "
+                "all-reduces "
                 "are unordered and XLA may combine them."
             )
 

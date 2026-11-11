@@ -153,6 +153,7 @@ from vllm_torchtpu.lora.lora_manager import TPUWorkerLoRAManager
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
 )
+from vllm_torchtpu.opt_in_config import option
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.tpu_block_size_utils import unified_kv_layout_enabled
 from vllm_torchtpu.runner import greedy_top_tokens
@@ -1483,6 +1484,9 @@ class TPUModelRunner(GPUModelRunner):
             # default.
             self._fused_spec_sampler = fused_spec_verify.fused_sampler_enabled(
                 self.vllm_config.additional_config
+            )
+            self._synthetic_one_row_verify = option(
+                self.vllm_config.additional_config, "spec_synthetic_one_row_verify"
             )
             if self.speculative_config.method == "ngram":
                 self.drafter = NgramProposer(self.vllm_config)
@@ -4816,7 +4820,7 @@ class TPUModelRunner(GPUModelRunner):
         synthetic rejection sampling with nothing that needs every verify
         row's logits (grammar masks, logprobs, min_tokens masks)."""
         return (
-            envs.TPU_SPEC_SYNTHETIC_ONE_ROW_VERIFY
+            getattr(self, "_synthetic_one_row_verify", False)
             and self.rejection_sampler is not None
             and self.rejection_sampler.synthetic_mode
             and not scheduler_output.has_structured_output_requests
@@ -5799,11 +5803,14 @@ class TPUModelRunner(GPUModelRunner):
 
             gmm_v2.set_skinny_gmm_path(additional["moe_skinny_gmm"])
             logger.info("MoE skinny gmm path: %s", gmm_v2.skinny_gmm_path())
-        if envs.TPU_GMM_FP8_DECODE_TILES:
+        if option(additional, "moe_gmm_fp8_decode_tiles"):
             from vllm_torchtpu.kernels.megablox import gmm_v2
 
             gmm_v2.set_fp8_decode_tiles(True)
-            logger.info("MoE gmm_v2 fp8 decode tiles on (TPU_GMM_FP8_DECODE_TILES)")
+            logger.info(
+                "MoE gmm_v2 fp8 decode tiles on (additional_config "
+                "moe_gmm_fp8_decode_tiles)"
+            )
         if isinstance(additional, dict) and "msa_index_int4_fp8" in additional:
             from vllm_torchtpu.models.minimax_m3.kernels import msa_indexer
 
@@ -5922,7 +5929,15 @@ class TPUModelRunner(GPUModelRunner):
         if envs.TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES > 0:
             from vllm_torchtpu.distributed import pallas_all_reduce
 
-            pallas_all_reduce.arm(self.model_config.get_hidden_size(), self.device)
+            pallas_all_reduce.arm(
+                self.model_config.get_hidden_size(),
+                self.device,
+                ordered=bool(
+                    option(
+                        self.vllm_config.additional_config, "minimax_split_min_tokens"
+                    )
+                ),
+            )
 
             # One small-AR path at a time: the env path (at the device
             # communicator) replaces additional_config
@@ -7277,7 +7292,7 @@ class TPUModelRunner(GPUModelRunner):
                         warm_recover_u,
                     )
                 if (
-                    envs.TPU_SPEC_SYNTHETIC_ONE_ROW_VERIFY
+                    getattr(self, "_synthetic_one_row_verify", False)
                     and self.rejection_sampler.synthetic_mode
                 ):
                     self._precompile_synthetic_verify(
@@ -8075,7 +8090,10 @@ class TPUModelRunner(GPUModelRunner):
                         greedy=True,
                         short=True,
                         mixed=True,
-                        sweep_token_buckets=envs.TPU_SPEC_WARMUP_SWEEP_TOKEN_BUCKETS,
+                        sweep_token_buckets=option(
+                            self.vllm_config.additional_config,
+                            "spec_warmup_sweep_token_buckets",
+                        ),
                     )
                     self._warmup_spec_batch(
                         int(R), P_small, greedy=False, short=True, mixed=True

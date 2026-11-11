@@ -35,6 +35,10 @@ from vllm_torchtpu.models.minimax_m3.kernels import (
 
 logger = init_logger(__name__)
 
+# Set from additional_config minimax_dcp_heads_attend by the attention layer
+# (`kernel_toggles.apply`) before the DCP op is built.
+DCP_HEADS_ATTEND = False
+
 _KV_CACHE_ARG = 5
 _INDEX_CACHE_ARG = 6
 _SHARD_KV_CACHE_ARG = 4
@@ -761,19 +765,20 @@ def _get_msa_dcp_fp4_op(
 
     score_op.register_fake(_score_fake)
     attend_op.register_fake(_head_major_attend_fake)
-    # Opt-in (TPU_MINIMAX_M3_DCP_HEADS_ATTEND): long steps attend their
-    # prefill requests head-parallel (`kernels.msa_dcp_heads`).
+    # Opt-in (additional_config minimax_dcp_heads_attend, `DCP_HEADS_ATTEND`):
+    # long steps attend their prefill requests head-parallel
+    # (`kernels.msa_dcp_heads`).
     heads_op = (
         _get_msa_dcp_heads_op(
             sm_scale, topk, dcp, kv_head_replicas, decode_rows, suffix
         )
-        if kv_heads > 1 and envs.TPU_MINIMAX_M3_DCP_HEADS_ATTEND
+        if kv_heads > 1 and DCP_HEADS_ATTEND
         else None
     )
     if heads_op is not None:
         logger.info(
             "MSA DCP: head-parallel attention of long steps on "
-            "(TPU_MINIMAX_M3_DCP_HEADS_ATTEND, %d KV heads, decode rows %d)",
+            "(minimax_dcp_heads_attend, %d KV heads, decode rows %d)",
             kv_heads,
             decode_rows,
         )

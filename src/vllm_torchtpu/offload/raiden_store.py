@@ -126,6 +126,7 @@ from vllm_torchtpu.offload.raiden_staging import (
     STAGING_BLOCKS_KEY,
     parse_staging_blocks,
 )
+from vllm_torchtpu.opt_in_config import option
 
 if TYPE_CHECKING:
     import torch
@@ -446,13 +447,6 @@ class FinishedJob:
     failed_device_block_ids: list[int] = field(default_factory=list)
 
 
-def _host_order_dma() -> bool:
-    """TPU_RAIDEN_HOST_ORDER_DMA (r6, default off): order local loads by host
-    block and stores by device block, so runs consecutive on both sides move
-    as one copy (`_dma_order`)."""
-    return envs.TPU_RAIDEN_HOST_ORDER_DMA
-
-
 def _dma_order(
     sub_hashes: list[bytes], device_ids: list[int], host_ids: list[int]
 ) -> tuple[list[bytes], list[int]]:
@@ -513,6 +507,10 @@ class RaidenOffloadingManager(OffloadingManager):
         # `build_store_storage_backend_config`. Empty keeps the store DRAM-only.
         secondary_backend_configs: Sequence[object] = (),
         dp_rank: int = 0,
+        # additional_config raiden_host_order_dma (r6, default off): order
+        # local loads by host block and stores by device block, so runs
+        # consecutive on both sides move as one copy (`_dma_order`).
+        host_order_dma: bool = False,
         # Test overrides: allow injecting mock store instance and type bindings.
         store: Any = None,
         store_types: Any = None,
@@ -527,6 +525,7 @@ class RaidenOffloadingManager(OffloadingManager):
             )
         self._capacity_keys = offload_logical_blocks_capacity
         self._device_block_size_factor = device_block_size_factor
+        self._host_order_dma = host_order_dma
         self._key_namespace = key_namespace
         # Cross-instance sharing: publishing blocks to the global registry
         # requires a peer-reachable store_server_ip.
@@ -988,7 +987,7 @@ class RaidenOffloadingManager(OffloadingManager):
                 return RaidenLoadStoreSpec(keys, pinned=False)
             idx = resolved_to
         self._pending_remote_slices.update(remote_slices)
-        if not _host_order_dma():
+        if not self._host_order_dma:
             return RaidenLoadStoreSpec(keys)
         return RaidenLoadStoreSpec(
             keys,
@@ -1140,7 +1139,7 @@ class RaidenOffloadingManager(OffloadingManager):
         # Device-block order: the store hands out host blocks in insert order,
         # so a run of consecutive device blocks lands on consecutive host
         # blocks and moves as one copy (see `_dma_order`).
-        if keys and _host_order_dma():
+        if keys and self._host_order_dma:
             device_block_ids, keys = map(
                 list, zip(*sorted(zip(device_block_ids, keys), key=lambda p: p[0]))
             )
@@ -3013,6 +3012,9 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                 key_namespace=self.key_namespace,
                 secondary_backend_configs=secondary_backend_configs,
                 dp_rank=self.dp_rank,
+                host_order_dma=bool(
+                    option(self.vllm_config.additional_config, "raiden_host_order_dma")
+                ),
             )
         return self._manager
 

@@ -79,19 +79,6 @@ if TYPE_CHECKING:
     TPU_MOE_COUNTING_SORT: bool = True
     USE_MOE_TP_DECODE_KERNEL: bool = False
     TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES: int = 0
-    TPU_MINIMAX_M3_SPLIT_MIN_TOKENS: int = 0
-    TPU_MINIMAX_M3_SPLIT_ATTENTION_FIRST: bool = True
-    TPU_MINIMAX_M3_DCP_HEADS_ATTEND: bool = False
-    TPU_MINIMAX_M3_MSA_UNSTABLE_SORT: bool = False
-    TPU_MINIMAX_M3_DCP_FINE_SCAN_WIDTHS: bool = False
-    TPU_MINIMAX_M3_MSA_ONEHOT_LOOKUP: bool = False
-    TPU_MINIMAX_M3_INDEXER_DMA_RING3: bool = False
-    TPU_MINIMAX_M3_INDEXER_FP8_TRANSPOSED: bool = False
-    TPU_MINIMAX_M3_MSA_LSE_R6: bool = False
-    TPU_MINIMAX_M3_DSPARK_SPLIT_FC: bool = False
-    TPU_DRAFT_HIDE_NOOP_KV_CONNECTOR: bool = False
-    TPU_RAIDEN_HOST_ORDER_DMA: bool = False
-    TPU_GMM_FP8_DECODE_TILES: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
@@ -139,8 +126,6 @@ if TYPE_CHECKING:
     TPU_PRECOMPILE_TRACE_FIRST: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_SPEC_STATIC_VERIFY: bool = True
-    TPU_SPEC_SYNTHETIC_ONE_ROW_VERIFY: bool = False
-    TPU_SPEC_WARMUP_SWEEP_TOKEN_BUCKETS: bool = False
     TPU_DCP_INDEXER_A2A_MERGE: bool = False
     TPU_DCP_INDEXER_A2A_MIN_TOKENS: int = 64
     TPU_STREAMIDX_SMALL_BUCKET_BQ: int | None = None
@@ -756,80 +741,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES": env_int(
         "TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES", 0
     ),
-    # MiniMax M3: steps of at least this many tokens run every layer on the
-    # step's two token halves, so one half's residual all-reduces overlap the
-    # other half's attention and FFN. 0 (default) = off.
-    "TPU_MINIMAX_M3_SPLIT_MIN_TOKENS": env_int("TPU_MINIMAX_M3_SPLIT_MIN_TOKENS", 0),
-    # With the split on, the second half's layer input waits for the first
-    # half's attention (so it overlaps the previous all-reduce). Measured
-    # faster at c16/c48, slower at c4 (batch-1 mixed steps).
-    "TPU_MINIMAX_M3_SPLIT_ATTENTION_FIRST": env_bool(
-        "TPU_MINIMAX_M3_SPLIT_ATTENTION_FIRST", default=True
-    ),
-    # MiniMax M3, 4-bit DCP caches over several KV heads per rank group: steps
-    # of >= 2048 tokens attend their prefill requests head-parallel (each
-    # rank fetches its KV head's pages and attends its own query heads, no
-    # query gather or partial merge; `msa_dcp_heads`). r6; default off.
-    "TPU_MINIMAX_M3_DCP_HEADS_ATTEND": env_bool(
-        "TPU_MINIMAX_M3_DCP_HEADS_ATTEND", default=False
-    ),
-    # MiniMax M3 MSA prefill attention: build the tiles' page unions with
-    # unstable sorts (no iota tie-breaker; bit-identical unions). r6.
-    "TPU_MINIMAX_M3_MSA_UNSTABLE_SORT": env_bool(
-        "TPU_MINIMAX_M3_MSA_UNSTABLE_SORT", default=False
-    ),
-    # MiniMax M3 DCP prefill candidates: scan widths in steps of 32/128
-    # columns instead of powers of two, picks stored per pick and looped past
-    # 512 columns (same picks). r6.
-    "TPU_MINIMAX_M3_DCP_FINE_SCAN_WIDTHS": env_bool(
-        "TPU_MINIMAX_M3_DCP_FINE_SCAN_WIDTHS", default=False
-    ),
-    # MiniMax M3 MSA glue: per-request table lookups (token positions, tile
-    # tables, class columns) by a one-hot over the requests instead of a
-    # gather, which XLA lowers to a compare chain. r6.
-    "TPU_MINIMAX_M3_MSA_ONEHOT_LOOKUP": env_bool(
-        "TPU_MINIMAX_M3_MSA_ONEHOT_LOOKUP", default=False
-    ),
-    # MiniMax M3 indexer kernel v3: a 3-group DMA ring (2 groups ahead),
-    # alternate pages on the second DMA queue, one wait per set bit of the
-    # group's page count. Same scores. r6.
-    "TPU_MINIMAX_M3_INDEXER_DMA_RING3": env_bool(
-        "TPU_MINIMAX_M3_INDEXER_DMA_RING3", default=False
-    ),
-    # MiniMax M3 indexer kernel v3: fp8 index caches score small tiles
-    # (<= 64 rows) transposed with fp8 MXU keys, as the folded 4-bit caches
-    # do. r6. Check bitwise against the default before relying on it.
-    "TPU_MINIMAX_M3_INDEXER_FP8_TRANSPOSED": env_bool(
-        "TPU_MINIMAX_M3_INDEXER_FP8_TRANSPOSED", default=False
-    ),
-    # MiniMax M3 MSA attention (DCP lse kernel): r6's kernel instead of v3's
-    # (`msa_attention_lse_r6`: 4 tiles per grid step, a 3-group 4-bit page
-    # prefetch ring, transposed scores for 8/16-bit full tiles; no 12-page
-    # width, no 4-bit page cache). Not bit-identical on 8/16-bit caches.
-    "TPU_MINIMAX_M3_MSA_LSE_R6": env_bool("TPU_MINIMAX_M3_MSA_LSE_R6", default=False),
-    # MiniMax M3 DSpark drafter context K/V: fc's replicated weight split by
-    # columns over the TP ranks (+ all-gather), and only the K/V columns of
-    # each draft qkv_proj, when the weights are plain flipped matrices. r6.
-    "TPU_MINIMAX_M3_DSPARK_SPLIT_FC": env_bool(
-        "TPU_MINIMAX_M3_DSPARK_SPLIT_FC", default=False
-    ),
-    # DFlash/DSpark draft forwards: hide the KV connector when its per-layer
-    # hooks are OffloadingConnector's no-ops, so serving (connector bound)
-    # hits the precompiled draft programs instead of retracing per bucket.
-    # r6; v3's skip_draft_kv unbinding applies either way.
-    "TPU_DRAFT_HIDE_NOOP_KV_CONNECTOR": env_bool(
-        "TPU_DRAFT_HIDE_NOOP_KV_CONNECTOR", default=False
-    ),
-    # Raiden KV offload: local loads in host-block order (and the load's fresh
-    # device blocks permuted to match), stores in device-block order, so
-    # consecutive runs move as one copy per KV array. r6. The block pool's
-    # consecutive-run allocation (`contiguous_alloc`) is the connector's
-    # extra_config key contiguous_alloc_scan_factor (default 1 = off; r6: 3).
-    "TPU_RAIDEN_HOST_ORDER_DMA": env_bool("TPU_RAIDEN_HOST_ORDER_DMA", default=False),
-    # gmm_v2: decode-sized MoE buffers take r6's decode tiles (tile_m 128 in
-    # buckets 16/32/48/128, or fp8-sized tiles up to 512 rows) ahead of the
-    # skinny paths (fp8_feed_wide etc.), and kernel_mlp fuses them. r6.
-    "TPU_GMM_FP8_DECODE_TILES": env_bool("TPU_GMM_FP8_DECODE_TILES", default=False),
     # SparseCore MoE gather-reduce (combine) kernel version used by
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and
     # "v3" selects the destination-major prototype.
@@ -1029,20 +940,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # effect for models whose ops implement that pass (DeepSeek-V4); 0 keeps
     # every verify window on the mixed pass.
     "TPU_SPEC_STATIC_VERIFY": env_bool("TPU_SPEC_STATIC_VERIFY", default=True),
-    # Under synthetic rejection sampling, decide acceptance before the LM head
-    # and compute logits and sample on one row per request (its first
-    # rejected slot or its bonus slot) instead of every verify row. r6
-    # (default on there); default off here.
-    "TPU_SPEC_SYNTHETIC_ONE_ROW_VERIFY": env_bool(
-        "TPU_SPEC_SYNTHETIC_ONE_ROW_VERIFY", default=False
-    ),
-    # Spec-decode warm-up: run the greedy mixed nr=R step at every token bucket
-    # below the full budget too, so the (token bucket, logits rows) programs
-    # serving's partial prefill chunks reach are compiled before serving. r6
-    # (always on there); default off here (longer warm-up).
-    "TPU_SPEC_WARMUP_SWEEP_TOKEN_BUCKETS": env_bool(
-        "TPU_SPEC_WARMUP_SWEEP_TOKEN_BUCKETS", default=False
-    ),
     # Merge the DCP indexer candidates with an all-to-all over the token axis
     # instead of an all-gather over the candidate axis. Same result.
     "TPU_DCP_INDEXER_A2A_MERGE": env_bool("TPU_DCP_INDEXER_A2A_MERGE", default=False),

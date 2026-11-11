@@ -400,7 +400,7 @@ class MiniMaxM3SparseAttention(nn.Module):
         # the index keys (`kernels.msa` index-cache sharding).
         msa_dcp.TILE_SELECT_ENABLED = tile_select_enabled(get_current_vllm_config())
         msa_dcp.LIVE_SELECT_ENABLED = live_select_enabled(get_current_vllm_config())
-        kernel_toggles.apply()
+        kernel_toggles.apply(get_current_vllm_config().additional_config)
         shard = shard_index_cache_enabled(get_current_vllm_config())
         self.index_shards = tp_size if shard else 1
         if self.index_shards > 1 and tp_size != config.num_key_value_heads:

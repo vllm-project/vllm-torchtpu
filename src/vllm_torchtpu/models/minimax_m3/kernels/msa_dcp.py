@@ -272,7 +272,7 @@ _PICK_UNROLL = 2
 # Past this width the scan widths step by half of it (bounding the
 # kernel's bodies: 20 at 4,096 columns).
 _COARSE_WIDTH_FROM = 1024
-# Set from TPU_MINIMAX_M3_DCP_FINE_SCAN_WIDTHS by the attention layer.
+# Set from key minimax_dcp_fine_scan_widths by the attention layer.
 FINE_SCAN_WIDTHS = False
 
 

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """r6's `msa_attention_lse` kernel, kept whole as an opt-in alternative to
-`msa_attention_lse` (TPU_MINIMAX_M3_MSA_LSE_R6, `msa_attention_lse.R6_KERNEL`
+`msa_attention_lse` (key minimax_msa_lse_r6, `msa_attention_lse.R6_KERNEL`
 dispatches here): several tiles per grid step (`TILES_PER_STEP`), a 3-group
 4-bit page prefetch ring (`_FP4_PREFETCH`), and transposed scores for 8/16-bit
 pages of full-size tiles (`attend_t`, not bit-identical to the default

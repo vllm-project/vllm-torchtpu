@@ -177,7 +177,7 @@ _skinny_gmm_path = "fp8_feed"
 # FP8_DECODE_BUCKETS (fp8 feed up to FP8_RHS_MAX_BUCKET_M rows, one bf16
 # bucket for the rest), or fp8-sized tiles up to FP8_SMALL_DECODE_MAX_M rows,
 # ahead of the skinny paths above; kernel_mlp fuses such tiles. Set with
-# TPU_GMM_FP8_DECODE_TILES before the model's first trace.
+# key moe_gmm_fp8_decode_tiles before the model's first trace.
 FP8_DECODE_TILE_M = 128
 FP8_DECODE_BUCKETS = (16, 32, 48, FP8_DECODE_TILE_M)
 FP8_DECODE_MAX_M = 2048

@@ -57,7 +57,6 @@ from vllm.model_executor.models.qwen3_dspark import (
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.transformers_utils.configs.minimax_m3 import MiniMaxM3TextConfig
 
-from vllm_torchtpu import envs
 from vllm_torchtpu.layers.adapter import cp_draft_attention
 from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
 from vllm_torchtpu.layers.adapter.quantization.unquantized import (
@@ -70,6 +69,7 @@ from vllm_torchtpu.models.minimax_m3.quant import (
     QUANT_METHOD,
     MiniMaxM3Mxfp8LinearMethod,
 )
+from vllm_torchtpu.opt_in_config import option
 from vllm_torchtpu.spec_decode.vocab_parallel_argmax import (
     MAX_VOCAB_FOR_FLOAT_IDS,
     reduce_shard_argmax_pairs,
@@ -323,6 +323,11 @@ class MiniMaxM3DSparkDecoderLayer(DFlashQwen3DecoderLayer):
         self.post_attention_layernorm = GemmaRMSNorm(hidden_size, eps=eps)
 
 
+# Set from additional_config minimax_dspark_split_fc by MiniMaxM3DSparkModel
+# before the first trace (`_column_parallel`, `_context_kv`).
+SPLIT_FC = False
+
+
 def _flipped_weight(linear: nn.Module, dtype: torch.dtype) -> torch.Tensor | None:
     """The ``[n_in, n_out]`` weight of a bias-free linear whose apply is a
     plain ``matmul(x, weight)`` (unquantized, or MXFP8 dequantized to
@@ -340,10 +345,10 @@ def _flipped_weight(linear: nn.Module, dtype: torch.dtype) -> torch.Tensor | Non
 
 
 def _column_parallel(linear: nn.Module, x: torch.Tensor) -> torch.Tensor:
-    """``linear(x)`` for a TP-replicated linear: with
-    TPU_MINIMAX_M3_DSPARK_SPLIT_FC (r6), each rank computes 1/tp of the output
+    """``linear(x)`` for a TP-replicated linear: with additional_config
+    minimax_dspark_split_fc (r6), each rank computes 1/tp of the output
     columns, reading 1/tp of the weight, then the ranks all-gather."""
-    if not envs.TPU_MINIMAX_M3_DSPARK_SPLIT_FC:
+    if not SPLIT_FC:
         return linear(x)
     weight = _flipped_weight(linear, x.dtype)
     tp = get_tensor_model_parallel_world_size()
@@ -359,18 +364,24 @@ def _context_kv(attn: nn.Module, context: torch.Tensor):
     """A draft layer's K and V of the context tokens. Only the qkv_proj's K/V
     columns when its weight is a plain matrix: the Q columns would be
     discarded (1024 of this rank's 1280 for MiniMax-M3's draft at TP8).
-    Only with TPU_MINIMAX_M3_DSPARK_SPLIT_FC (r6); else the whole qkv_proj."""
-    weight = (
-        _flipped_weight(attn.qkv_proj, context.dtype)
-        if envs.TPU_MINIMAX_M3_DSPARK_SPLIT_FC
-        else None
-    )
+    Only with additional_config minimax_dspark_split_fc (r6); else the whole
+    qkv_proj."""
+    weight = _flipped_weight(attn.qkv_proj, context.dtype) if SPLIT_FC else None
     if weight is None:
         qkv, _ = attn.qkv_proj(context)
         kv = qkv[:, attn.q_size :]
     else:
         kv = torch.matmul(context, weight[:, attn.q_size :])
     return kv.split([attn.kv_size, attn.kv_size], dim=-1)
+
+
+def set_split_fc(additional_config) -> None:
+    global SPLIT_FC
+    SPLIT_FC = bool(option(additional_config, "minimax_dspark_split_fc"))
+    if SPLIT_FC:
+        logger.info(
+            "MiniMax-M3 DSpark split fc on: additional_config.minimax_dspark_split_fc"
+        )
 
 
 class MiniMaxM3DSparkModel(Qwen3DSparkModel):
@@ -389,6 +400,7 @@ class MiniMaxM3DSparkModel(Qwen3DSparkModel):
         hidden_size, eps = self.config.hidden_size, self.config.rms_norm_eps
         self.hidden_norm = GemmaRMSNorm(hidden_size, eps=eps)
         self.norm = GemmaRMSNorm(hidden_size, eps=eps)
+        set_split_fc(vllm_config.additional_config)
 
     # Set by `prepare_rank_rows_context_kv` (sharded draft DCP only).
     rank_rows_context_kv: dict | None = None
