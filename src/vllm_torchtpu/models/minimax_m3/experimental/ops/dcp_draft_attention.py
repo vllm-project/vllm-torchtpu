@@ -19,6 +19,11 @@ on every rank) writes its context K/V with `write_with_dcp` and attends with
 sliding-window flash attention over the rank's owned pages, an LSE merge
 across the group, and the query block's own attention merged by LSE. The
 JAX / Pallas kernels are in `experimental/kernels/dcp_draft_attention.py`.
+
+`MiniMaxDraftDcpAttention` is the `DraftDcpAttention` (layers/core hook)
+that the MiniMax DSpark drafter supplies for its sliding-window layers; its
+``pack`` / ``write_rows`` ops and `gather_rows` serve the drafter's
+rank-rows context K/V write (`store_context_kv_rank_rows`).
 """
 
 import functools
@@ -34,7 +39,9 @@ from vllm_torchtpu.models.minimax_m3.experimental.kernels.dcp_draft_attention im
     attend_block,
     attend_cached_flash,
     merge,
+    pack_rows,
     write_kv,
+    write_owned_rows,
 )
 
 # ---------------------------------------------------------------------------
@@ -76,6 +83,61 @@ def build_ops(
         ),
         block=_block_op(max_query_len, sm_scale, causal),
     )
+
+
+@functools.cache
+def _pack_op(k_scale: float | None, v_scale: float | None):
+    def _pack(kv_cache: jax.Array, key: jax.Array, value: jax.Array) -> jax.Array:
+        # The cache only gives the row shape and dtype.
+        return pack_rows(
+            key,
+            value,
+            kv_cache.shape[2:],
+            kv_cache.dtype,
+            k_scale=k_scale,
+            v_scale=v_scale,
+        )
+
+    name = (
+        "pallas::minimax_m3_dcp_draft_pack"
+        f"_k{_name_float(k_scale)}_v{_name_float(v_scale)}"
+    )
+    op = pallas.jax_op(name, _pack)
+    op.register_fake(
+        lambda kv_cache, key, *args: torch.empty(
+            (key.shape[0], *kv_cache.shape[2:]), dtype=kv_cache.dtype, device=key.device
+        )
+    )
+    return op
+
+
+@functools.cache
+def _write_rows_op(dcp: int):
+    def _write_rows(
+        kv_cache: jax.Array,
+        rows: jax.Array,
+        seq_lens: jax.Array,
+        block_tables: jax.Array,
+        query_start_loc: jax.Array,
+        dcp_rank: jax.Array,
+    ) -> jax.Array:
+        return write_owned_rows(
+            kv_cache,
+            rows,
+            seq_lens,
+            block_tables,
+            query_start_loc,
+            dcp=dcp,
+            rank=dcp_rank[0],
+        )
+
+    op = pallas.jax_op(
+        f"pallas::minimax_m3_dcp_draft_write_rows_d{dcp}",
+        _write_rows,
+        donate_argnums=(0,),
+    )
+    op.register_fake(lambda kv_cache, *args: torch.empty_like(kv_cache))
+    return op
 
 
 @functools.cache
@@ -282,3 +344,94 @@ def forward_with_dcp(
         ctx_out,
         ctx_lse,
     )
+
+
+def gather_rows(rows: torch.Tensor, group: Any) -> torch.Tensor:
+    """All-gather packed rows ``[n, ...]`` over the DCP group (rank-major),
+    moved as 32-bit words (rows are whole 128-lane words)."""
+    flat = rows.contiguous().reshape(rows.shape[0], -1)
+    if flat.dtype.itemsize == 1:
+        flat = flat.view(torch.uint8)
+    words = flat.view(torch.int32)
+    gathered = group.all_gather(words, dim=0)
+    return gathered.view(flat.dtype).view(rows.dtype).view(-1, *rows.shape[1:])
+
+
+class MiniMaxDraftDcpAttention:
+    """`DraftDcpAttention` of one MiniMax DSpark sliding-window draft layer
+    whose KV is DCP-sharded like the target's.
+
+    Builds the layer's ops at construction (load time, outside any compiled
+    forward; see `build_ops`), plus the ``pack`` / ``write_rows`` ops of the
+    rank-rows context write. ``k_scale`` / ``v_scale`` are the layer's KV
+    scales when the cache is quantized, else None.
+    """
+
+    def __init__(
+        self,
+        *,
+        dcp: int,
+        kv_head_replicas: int,
+        max_query_len: int,
+        sliding_window: int,
+        sm_scale: float,
+        causal: bool,
+        k_scale: float | None,
+        v_scale: float | None,
+    ) -> None:
+        self.dcp = dcp
+        self.kv_head_replicas = kv_head_replicas
+        self.k_scale = k_scale
+        self.v_scale = v_scale
+        self.ops = build_ops(
+            dcp=dcp,
+            kv_heads=max(1, dcp // kv_head_replicas),
+            max_query_len=max_query_len,
+            sliding_window=sliding_window,
+            sm_scale=sm_scale,
+            causal=causal,
+            k_scale=k_scale,
+            v_scale=v_scale,
+        )
+        self.ops.update(pack=_pack_op(k_scale, v_scale), write_rows=_write_rows_op(dcp))
+
+    def write(
+        self,
+        layer: Any,  # the Attention layer (its draft_dcp_rank buffer)
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: Any,
+    ) -> None:
+        write_with_dcp(
+            key=key,
+            value=value,
+            kv_cache=kv_cache,
+            attn_metadata=attn_metadata,
+            dcp_rank=layer.draft_dcp_rank,
+            dcp=self.dcp,
+            kv_head_replicas=self.kv_head_replicas,
+            ops=self.ops,
+        )
+
+    def forward(
+        self,
+        layer: Any,  # the Attention layer (its draft_dcp_rank buffer)
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: Any,
+    ) -> torch.Tensor:
+        return forward_with_dcp(
+            query=query,
+            key=key,
+            value=value,
+            kv_cache=kv_cache,
+            attn_metadata=attn_metadata,
+            dcp_rank=layer.draft_dcp_rank,
+            dcp=self.dcp,
+            k_scale=self.k_scale,
+            v_scale=self.v_scale,
+            ops=self.ops,
+        )
