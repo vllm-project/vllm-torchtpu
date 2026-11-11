@@ -333,6 +333,8 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # K3 custom-op registration, sharding, and Attention Residual bridges.
     "vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
     "vllm_torchtpu/models/vllm/kimi_k3/layers.py",
+    # MiniMax-M3 MSA kernels, behind the custom ops of models/minimax_m3/ops.
+    "vllm_torchtpu/models/minimax_m3/kernels",
 )
 
 # vLLM-Omni diffusion code, dropped from the hashed set above. Diffusion
@@ -453,9 +455,16 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
         # measurement that diverges by a few blocks across ranks (the executor
         # aligns the value actually used to min()); hashing it would split
         # ranks into separate cache dirs and force asymmetric recompiles.
+        # gpu_memory_utilization only matters through that block count, so it
+        # is hashed only while the count is unresolved: two utilizations that
+        # resolve to the same pool share one cache.
         "kv_cache": {
-            "gpu_memory_utilization": cache_config.gpu_memory_utilization,
             "num_gpu_blocks": cache_config.num_gpu_blocks,
+            **(
+                {"gpu_memory_utilization": cache_config.gpu_memory_utilization}
+                if cache_config.num_gpu_blocks is None
+                else {}
+            ),
         },
         "scheduler": {
             "max_model_len": vllm_config.model_config.max_model_len,

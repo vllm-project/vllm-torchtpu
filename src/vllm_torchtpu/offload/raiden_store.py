@@ -83,12 +83,18 @@ import os
 import socket
 import threading
 import time
+from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, cast
 
 from vllm.config import VllmConfig
-from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec, KVCacheConfig
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheSpec,
+)
 from vllm.v1.kv_offload.base import (
     CanonicalKVCaches,
     LoadStoreSpec,
@@ -160,6 +166,7 @@ def _get_ephemeral_port_range(
 # recorded from the per-worker KV cache configs before the offloading spec is
 # built (see ``_patch_vllm_offload_all_ranks_kv_bytes``). None until recorded.
 _all_ranks_kv_bytes_per_block: int | None = None
+_all_ranks_draft_kv_bytes_per_block: int | None = None
 
 
 def _worker_kv_bytes_per_block(kv_cache_config: Any) -> int:
@@ -183,6 +190,113 @@ def _worker_kv_bytes_per_block(kv_cache_config: Any) -> int:
     )
 
 
+_CGROUP_DIR = "/sys/fs/cgroup"
+# Headroom kept below the cgroup limit for the page cache, kernel memory and
+# growth after registration.
+_HOST_POOL_CGROUP_MARGIN = 0.03
+
+
+def _read_cgroup_memory(cgroup_dir: str = _CGROUP_DIR) -> tuple[int, int] | None:
+    """(memory.max, non-reclaimable bytes in use) of this cgroup (v2), or None.
+
+    Non-reclaimable = anon + shmem from memory.stat: process heaps and tmpfs
+    (/dev/shm compile caches) cannot be dropped to make room for pinned pages,
+    while the page cache (e.g. checkpoint reads) can.
+    """
+    try:
+        with open(os.path.join(cgroup_dir, "memory.max")) as f:
+            raw_max = f.read().strip()
+        if raw_max == "max":
+            return None
+        limit = int(raw_max)
+        stats: dict[str, int] = {}
+        with open(os.path.join(cgroup_dir, "memory.stat")) as f:
+            for line in f:
+                key, _, value = line.partition(" ")
+                if key in ("anon", "shmem"):
+                    stats[key] = int(value)
+    except (OSError, ValueError):
+        return None
+    if len(stats) != 2:
+        return None
+    return limit, stats["anon"] + stats["shmem"]
+
+
+def check_host_pool_fits_cgroup(pool_bytes: int, cgroup_dir: str = _CGROUP_DIR) -> None:
+    """Raise if pinning `pool_bytes` more would exceed the container limit.
+
+    Logs the figures either way; does nothing when the cgroup is unreadable or
+    unlimited.
+    """
+    memory = _read_cgroup_memory(cgroup_dir)
+    if memory is None:
+        return
+    limit, in_use = memory
+    budget = int(limit * (1 - _HOST_POOL_CGROUP_MARGIN))
+    gib = float(1 << 30)
+    logger.info(
+        "TPURaidenOffloadingConnector: host pool %.1f GiB to pin; container "
+        "limit %.1f GiB, non-reclaimable in use (anon+shmem) %.1f GiB",
+        pool_bytes / gib,
+        limit / gib,
+        in_use / gib,
+    )
+    if in_use + pool_bytes > budget:
+        raise ValueError(
+            "TPURaidenOffloadingConnector: the host pool does not fit the "
+            f"container: pinning {pool_bytes / gib:.1f} GiB on top of "
+            f"{in_use / gib:.1f} GiB non-reclaimable (anon+shmem) exceeds "
+            f"{budget / gib:.1f} GiB ({1 - _HOST_POOL_CGROUP_MARGIN:.0%} of the "
+            f"{limit / gib:.1f} GiB limit); lower cpu_bytes_to_use "
+            "(--kv-offloading-size)"
+        )
+
+
+def draft_kv_layer_names(kv_cache_config: Any) -> set[str]:
+    """Layers holding a speculative drafter's K/V in a multi-shape KV group.
+
+    With the hybrid manager off, a sliding-window drafter's layers (DSpark)
+    are promoted to `FullAttentionSpec` that keeps its `sliding_window`, and
+    join the target's MLA caches in one `UniformTypeKVCacheSpecs` group. Those
+    leaves -- non-MLA full attention with a window, next to MLA leaves -- are
+    what `skip_draft_kv` leaves out of the host store. The rule only reads
+    specs; the operator asserts by setting `skip_draft_kv` that such layers
+    are the drafter's (a target sliding-window layer must not be skipped).
+    """
+    from vllm.v1.kv_cache_interface import MLAAttentionSpec, UniformTypeKVCacheSpecs
+
+    names: set[str] = set()
+    for group in getattr(kv_cache_config, "kv_cache_groups", None) or ():
+        spec = group.kv_cache_spec
+        if not isinstance(spec, UniformTypeKVCacheSpecs):
+            continue
+        leaves = spec.kv_cache_specs
+        if not any(isinstance(leaf, MLAAttentionSpec) for leaf in leaves.values()):
+            continue
+        for name, leaf in leaves.items():
+            if (
+                isinstance(leaf, FullAttentionSpec)
+                and not isinstance(leaf, MLAAttentionSpec)
+                and getattr(leaf, "sliding_window", None) is not None
+            ):
+                names.add(name)
+    return names
+
+
+def _worker_draft_kv_bytes_per_block(kv_cache_config: Any) -> int:
+    """One worker's bytes per block in `draft_kv_layer_names` leaves."""
+    if kv_cache_config.num_blocks <= 0:
+        return 0
+    names = draft_kv_layer_names(kv_cache_config)
+    if not names:
+        return 0
+    total = 0
+    for group in kv_cache_config.kv_cache_groups:
+        leaves = getattr(group.kv_cache_spec, "kv_cache_specs", None) or {}
+        total += sum(leaves[name].page_size_bytes for name in names if name in leaves)
+    return total
+
+
 def record_all_ranks_kv_bytes_per_block(kv_cache_configs: Sequence[Any]) -> int:
     """Sum the per-worker bytes per block over all workers and remember it.
 
@@ -192,14 +306,23 @@ def record_all_ranks_kv_bytes_per_block(kv_cache_configs: Sequence[Any]) -> int:
     over the per-worker configs is what one worker's figure times the world
     size cannot give.
     """
-    global _all_ranks_kv_bytes_per_block
+    global _all_ranks_kv_bytes_per_block, _all_ranks_draft_kv_bytes_per_block
     total = sum(_worker_kv_bytes_per_block(cfg) for cfg in kv_cache_configs)
     _all_ranks_kv_bytes_per_block = total
+    _all_ranks_draft_kv_bytes_per_block = sum(
+        _worker_draft_kv_bytes_per_block(cfg) for cfg in kv_cache_configs
+    )
     return total
 
 
 def all_ranks_kv_bytes_per_block() -> int | None:
     return _all_ranks_kv_bytes_per_block
+
+
+def all_ranks_draft_kv_bytes_per_block() -> int | None:
+    """The drafter's share of `all_ranks_kv_bytes_per_block` (see
+    `draft_kv_layer_names`), recorded from the same per-worker configs."""
+    return _all_ranks_draft_kv_bytes_per_block
 
 
 def iter_leaf_kv_cache_specs(kv_cache_spec):
@@ -216,11 +339,17 @@ def iter_leaf_kv_cache_specs(kv_cache_spec):
 def has_multi_shapes_kv_caches(vllm_config: VllmConfig) -> bool:
     """Whether this model's KV cache consists of multiple tensors
     of different shapes.
+
+    Model packages declare such architectures through
+    `multi_shapes_kv.register_multi_shapes_kv_architectures`.
     """
-    return vllm_config.model_config.architecture in (
+    from vllm_torchtpu.offload.multi_shapes_kv import is_multi_shapes_kv_architecture
+
+    architecture = vllm_config.model_config.architecture
+    return architecture in (
         "DeepseekV4ForCausalLM",
         "GlmMoeDsaForCausalLM",
-    )
+    ) or is_multi_shapes_kv_architecture(architecture)
 
 
 class RaidenLoadStoreSpec(LoadStoreSpec):
@@ -234,9 +363,17 @@ class RaidenLoadStoreSpec(LoadStoreSpec):
     allowing vLLM to recompute the blocks.
     """
 
-    def __init__(self, keys: list[OffloadKey], pinned: bool = True):
+    def __init__(
+        self,
+        keys: list[OffloadKey],
+        pinned: bool = True,
+        host_block_ids: list[int] | None = None,
+    ):
         self.keys = keys
         self.pinned = pinned
+        # Loads only: the host block of each sub-hash of `keys` (expanded, in
+        # order), -1 for one not in the local host pool; None if unknown.
+        self.host_block_ids = host_block_ids
 
     def __repr__(self) -> str:
         return (
@@ -303,6 +440,41 @@ class FinishedJob:
     success: bool
     req_id: str | None = None
     failed_device_block_ids: list[int] = field(default_factory=list)
+
+
+def _dma_order(
+    sub_hashes: list[bytes], device_ids: list[int], host_ids: list[int]
+) -> tuple[list[bytes], list[int]]:
+    """Order a local load's (sub-hash, device block) pairs by host block.
+
+    Raiden moves a run of pairs consecutive on both host and device as one
+    copy per KV array, and every other pair as a copy of its own; each copy
+    holds the core's in-order DMA/launch queue, so a scattered 100k-token load
+    parks every kernel behind it ~30x longer than a contiguous one. The pairs
+    are independent, so their order in one call is free.
+    """
+    order = sorted(range(len(sub_hashes)), key=host_ids.__getitem__)
+    return [sub_hashes[i] for i in order], [device_ids[i] for i in order]
+
+
+@dataclass
+class _ReadBatch:
+    """The arguments of one read_remote call, index-aligned: the sub-hashes,
+    the slices naming where each lives, and each one's destination block."""
+
+    hashes: list[bytes] = field(default_factory=list)
+    slices: list[object] = field(default_factory=list)
+    device_ids: list[int] = field(default_factory=list)
+
+    def add(self, sub_hash: bytes, block: object, device_id: int) -> None:
+        self.hashes.append(sub_hash)
+        self.slices.append(block)
+        self.device_ids.append(device_id)
+
+    def extend(self, other: _ReadBatch) -> None:
+        self.hashes.extend(other.hashes)
+        self.slices.extend(other.slices)
+        self.device_ids.extend(other.device_ids)
 
 
 class RaidenOffloadingManager(OffloadingManager):
@@ -669,6 +841,28 @@ class RaidenOffloadingManager(OffloadingManager):
             self._remote_slices.update(remote_slices)
         return LookupResult.HIT
 
+    def count_resident_prefix(self, keys: Sequence[OffloadKey]) -> int:
+        """Number of leading `keys` whose bytes are (or are being saved) on host.
+
+        For admission ranking only (`ExternalPrefixProbe`): one unpinned probe,
+        so it leaves no pins, no LRU reorder and no per-request state. A save
+        in flight counts as resident, as `lookup` would answer HIT_PENDING.
+        Peer and storage-tier entries are not counted.
+        """
+        if not keys:
+            return 0
+        sub_hashes = self._expand_keys(list(keys))
+        resident = 0
+        for sub_hash, block in self._probe(sub_hashes):
+            status = block.status
+            if status in (self._block_status.HOST, self._block_status.HOST_AND_HBM) or (
+                status == self._block_status.HBM and sub_hash in self._hash_to_admission
+            ):
+                resident += 1
+            else:
+                break
+        return resident // self._device_block_size_factor
+
     def touch(self, keys, req_context: ReqContext) -> None:
         # A lookup pins what it finds and releasing drops the entry back at
         # the Most Recently Used position, so probe-then-release is the touch:
@@ -726,6 +920,7 @@ class RaidenOffloadingManager(OffloadingManager):
         # left the host pool after `lookup` — it is read from storage.
         remote_slices: dict[bytes, object] = {}
         local_hashes: list[bytes] = []
+        host_block_of: dict[bytes, int] = {}
         idx = 0
         while idx < len(sub_hashes):
             matched = self._store.lookup(sub_hashes[idx:])
@@ -738,6 +933,10 @@ class RaidenOffloadingManager(OffloadingManager):
                 len(matched),
             )
             local_hashes.extend(sub_hash for sub_hash, _ in matched[:local_run])
+            host_block_of.update(
+                (sub_hash, block.host_block_id)
+                for sub_hash, block in matched[:local_run]
+            )
             idx += local_run
             if idx == len(sub_hashes):
                 break
@@ -778,7 +977,10 @@ class RaidenOffloadingManager(OffloadingManager):
                 return RaidenLoadStoreSpec(keys, pinned=False)
             idx = resolved_to
         self._pending_remote_slices.update(remote_slices)
-        return RaidenLoadStoreSpec(keys)
+        return RaidenLoadStoreSpec(
+            keys,
+            host_block_ids=[host_block_of.get(sub_hash, -1) for sub_hash in sub_hashes],
+        )
 
     def prepare_store(self, keys, req_context: ReqContext) -> PrepareStoreOutput | None:
         # The Raiden directory is the sole authority on what is stored: probe
@@ -922,6 +1124,13 @@ class RaidenOffloadingManager(OffloadingManager):
         account for fails the job closed (rollback + recompute).
         """
         assert len(keys) == len(device_block_ids), (len(keys), len(device_block_ids))
+        # Device-block order: the store hands out host blocks in insert order,
+        # so a run of consecutive device blocks lands on consecutive host
+        # blocks and moves as one copy (see `_dma_order`).
+        if keys:
+            device_block_ids, keys = map(
+                list, zip(*sorted(zip(device_block_ids, keys), key=lambda p: p[0]))
+            )
         # A live load (a peer or storage-tier read) owns these sub-hashes in
         # `_hash_to_admission`; admitting them would steal its completions.
         held_keys = {
@@ -1033,8 +1242,12 @@ class RaidenOffloadingManager(OffloadingManager):
         device_block_ids: list[int],
         req_id: str,
         pinned: bool = True,
+        host_block_ids: Sequence[int] | None = None,
     ) -> None:
-        """Launch a load job; entries were pinned in prepare_load."""
+        """Launch a load job; entries were pinned in prepare_load.
+
+        `host_block_ids` (from the spec `prepare_load` returned) orders the
+        local transfer for `_dma_order`."""
         assert len(keys) == len(device_block_ids), (len(keys), len(device_block_ids))
         if not pinned:
             # prepare_load lost the pin race; nothing is held, so fail the
@@ -1056,30 +1269,40 @@ class RaidenOffloadingManager(OffloadingManager):
         # pinned in the local host pool. The slice is the only record of a peer
         # block — read_remote writes nothing to the local directory, so no live
         # probe could rediscover it. Only the BYTES are non-local: every
-        # destination is one of this instance's HBM blocks. The two destination
+        # destination is one of this instance's HBM blocks. The destination
         # lists are disjoint subsequences of `device_ids`, each preserving its
         # batch's hash-to-block pairing, because load() and read_remote() both
-        # require block_hashes[i] to line up with device_block_ids[i]. One
-        # read_remote call takes a peer's slices and storage slices together.
-        remote_hashes: list[bytes] = []
-        remote_slices: list[object] = []
-        dst_device_ids_for_remote: list[int] = []
+        # require block_hashes[i] to line up with device_block_ids[i].
+        peer_batches: defaultdict[object, _ReadBatch] = defaultdict(_ReadBatch)
+        storage_batch = _ReadBatch()
         local_hashes: list[bytes] = []
         dst_device_ids_for_local: list[int] = []
-        for sub_hash, dev_id in zip(sub_hashes, device_ids):
-            block = self._pending_remote_slices.pop(sub_hash, None)
-            if block is not None:
-                remote_hashes.append(sub_hash)
-                remote_slices.append(block)
-                dst_device_ids_for_remote.append(dev_id)
-            else:
+        local_host_ids: list[int] = []
+        for i, (sub_hash, dev_id) in enumerate(zip(sub_hashes, device_ids)):
+            block: Any = self._pending_remote_slices.pop(sub_hash, None)
+            if block is None:
                 local_hashes.append(sub_hash)
                 dst_device_ids_for_local.append(dev_id)
+                local_host_ids.append(host_block_ids[i] if host_block_ids else -1)
+            elif block.status == self._block_status.REMOTE:
+                peer_batches[block.raiden_id].add(sub_hash, block, dev_id)
+            else:  # SHARED_STORAGE
+                storage_batch.add(sub_hash, block, dev_id)
+        # One read_remote call takes a single peer's slices; storage slices
+        # may join any call, so they go with the first peer's, or alone when
+        # no peer is involved.
+        remote_batches = list(peer_batches.values())
+        if storage_batch.hashes:
+            if remote_batches:
+                remote_batches[0].extend(storage_batch)
+            else:
+                remote_batches.append(storage_batch)
+        remote_hashes = [h for batch in remote_batches for h in batch.hashes]
 
         def _fail_launch(
             what: str, failed_hashes: list[bytes], in_flight: list[bytes]
         ) -> None:
-            # failed_hashes is the batch whose launch failed.
+            # failed_hashes: the refused batch and every batch not yet launched.
             logger.error(
                 "TPURaidenOffloadingConnector: load job %d (req %s): %s launch failed "
                 "(%d local, %d remote sub-blocks)",
@@ -1102,11 +1325,13 @@ class RaidenOffloadingManager(OffloadingManager):
                 failed_sub_hashes=list(failed_hashes),
             )
             if in_flight:
-                # The other launch already succeeded: the job must stay
-                # non-terminal until its transfer resolves, then the
-                # finalizer runs the failure cleanup exactly once.
+                # Earlier launches succeeded: the job must stay non-terminal
+                # until their transfers resolve, then the finalizer runs the
+                # failure cleanup exactly once. Like a launched job, it holds
+                # every sub-hash the finalizer will release, launched or not,
+                # so no other job admits one in the meantime.
                 self._admissions[job_id] = admission
-                for sub_hash in in_flight:
+                for sub_hash in sub_hashes:
                     self._hash_to_admission[sub_hash] = admission
                 return
             # Nothing in flight: immediately terminal. The finalizer keeps
@@ -1116,16 +1341,28 @@ class RaidenOffloadingManager(OffloadingManager):
             # matching a polled failure.
             self._finalize(admission)
 
+        if host_block_ids and local_hashes:
+            local_hashes, dst_device_ids_for_local = _dma_order(
+                local_hashes, dst_device_ids_for_local, local_host_ids
+            )
         if local_hashes and not self._store.load(
             local_hashes, dst_device_ids_for_local
         ):
             _fail_launch("load()", local_hashes, [])
             return
-        if remote_hashes and not self._store.read_remote(
-            remote_hashes, remote_slices, dst_device_ids_for_remote
-        ):
-            _fail_launch("read_remote()", remote_hashes, local_hashes)
-            return
+        in_flight = list(local_hashes)
+        for batch in remote_batches:
+            if not self._store.read_remote(
+                batch.hashes, batch.slices, batch.device_ids
+            ):
+                launched = set(in_flight)
+                _fail_launch(
+                    "read_remote()",
+                    [h for h in remote_hashes if h not in launched],
+                    in_flight,
+                )
+                return
+            in_flight.extend(batch.hashes)
         admission = Admission(
             job_id=job_id,
             op=AdmissionOp.LOAD,
@@ -1429,6 +1666,7 @@ def derive_offload_namespace(
     cp_geometry: tuple[int, ...] = (),
     block_major_contract: BlockMajorContract | None = None,
     offloaded_group_ids: tuple[int, ...] | None = None,
+    skip_draft_kv: bool = False,
 ) -> bytes:
     """Derive a deterministic compatibility namespace prefixed to every store and
     registry key.
@@ -1494,6 +1732,9 @@ def derive_offload_namespace(
         # a group never stores its keys, so a peer expecting them would miss
         # on every block.
         material_fields += ("tpu-raiden-offload-ns3-groups", offloaded_group_ids)
+    if skip_draft_kv:
+        # Host blocks without the drafter's arrays are a different layout.
+        material_fields += ("tpu-raiden-offload-ns4-skip-draft-kv",)
     material = repr(material_fields)
     return hashlib.sha256(material.encode()).digest()[:16]
 
@@ -1507,38 +1748,70 @@ def is_multi_shapes_geometry(per_block_shape: object) -> bool:
     return isinstance(per_block_shape, (set, frozenset))
 
 
+def multi_shapes_leaf_block_shape(leaf: KVCacheSpec) -> tuple[int, ...] | None:
+    """Per-block shape one leaf spec adds to a multi-shape KV layout.
+
+    - MLA cache: ``(num_states, num_kv_heads, head_size)``, one row per token.
+    - Any other full-attention cache (a speculative drafter's K/V layers):
+      ``(block_size, 2, num_kv_heads, head_size)``. The TPU attention backends
+      allocate K and V fused in one array whose leading dimension is the
+      block, so the leaf is still one array registered as whole pages; its
+      padded page size is `leaf.page_size_bytes`.
+    - Sliding-window MLA caches (DSv4) add no shape: they ride on the MLA
+      anchor block.
+
+    Raises AssertionError for a leaf the per-array path cannot register.
+    """
+    from vllm.v1.kv_cache_interface import MLAAttentionSpec, SlidingWindowMLASpec
+
+    if isinstance(leaf, SlidingWindowMLASpec):
+        return None
+    if isinstance(leaf, MLAAttentionSpec):
+        return (leaf.num_states, leaf.num_kv_heads, leaf.head_size)
+    assert isinstance(leaf, FullAttentionSpec), (
+        "TPURaidenOffloadingConnector: a multi-shape KV layout supports "
+        "MLA-family and full-attention layers only; got "
+        f"{type(leaf).__name__} (a sliding-window layer needs "
+        "--disable-hybrid-kv-cache-manager to share the full-attention group)"
+    )
+    assert leaf.head_size_v == leaf.head_size, (
+        "TPURaidenOffloadingConnector: a full-attention leaf in a multi-shape "
+        f"KV layout needs equal K/V widths; got head_size={leaf.head_size}, "
+        f"head_size_v={leaf.head_size_v}"
+    )
+    return (leaf.block_size, 2, leaf.num_kv_heads, leaf.head_size)
+
+
 def _resolve_multi_shapes_kv_geometry(
     kv_cache_config: KVCacheConfig,
 ) -> tuple[int, set[tuple[int, ...]], set[object], int]:
-    from vllm.v1.kv_cache_interface import MLAAttentionSpec, SlidingWindowMLASpec
-
-    groups = kv_cache_config.kv_cache_groups
-    for group in groups:
-        for leaf in iter_leaf_kv_cache_specs(group.kv_cache_spec):
-            assert isinstance(leaf, (MLAAttentionSpec, SlidingWindowMLASpec)), (
-                "TPURaidenOffloadingConnector: an aliased KV "
-                "layout has only MLA-family layers; got "
-                f"{type(leaf).__name__}"
-            )
-
-    mla_leaves = [
+    leaves = [
         leaf
-        for group in groups
+        for group in kv_cache_config.kv_cache_groups
         for leaf in iter_leaf_kv_cache_specs(group.kv_cache_spec)
-        if isinstance(leaf, MLAAttentionSpec)
     ]
-    assert mla_leaves
-    anchor_block_sizes = sorted({leaf.block_size for leaf in mla_leaves})
-    assert len(anchor_block_sizes) == 1
-    block_size = anchor_block_sizes[0]
-
-    # One entry per full-attention MLA cache.
+    # One entry per full-attention cache (MLA or K/V); validates every leaf.
     per_block_shapes: set[tuple[int, ...]] = set()
     kv_dtypes: set[object] = set()
-    for leaf in mla_leaves:
-        shape = (leaf.num_states, leaf.num_kv_heads, leaf.head_size)
-        per_block_shapes.add(shape)
-        kv_dtypes.add(leaf.dtype)
+    for leaf in leaves:
+        shape = multi_shapes_leaf_block_shape(leaf)
+        if shape is not None:
+            per_block_shapes.add(shape)
+            kv_dtypes.add(leaf.dtype)
+
+    # Full-attention leaves (MLA ones included) anchor the block size; the
+    # scheduler sees one of them per group, the workers all of them.
+    anchors = [leaf for leaf in leaves if isinstance(leaf, FullAttentionSpec)]
+    assert anchors, (
+        "TPURaidenOffloadingConnector: a multi-shape KV layout has no "
+        "full-attention layer"
+    )
+    anchor_block_sizes = sorted({leaf.block_size for leaf in anchors})
+    assert len(anchor_block_sizes) == 1, (
+        "TPURaidenOffloadingConnector: full-attention layers of a multi-shape "
+        f"KV layout disagree on block size: {anchor_block_sizes}"
+    )
+    block_size = anchor_block_sizes[0]
     return block_size, per_block_shapes, kv_dtypes, block_size
 
 
@@ -1675,6 +1948,19 @@ def resolve_kernel_geometry(
             spec0.block_size,
         )
     return kernel_block_size, per_block_shape, spec0.dtype, spec0.block_size
+
+
+def is_host_pinning_failure(exc: BaseException) -> bool:
+    """Whether a Raiden KVCacheManager construction failed to pin (DMA-map)
+    its host pool, as opposed to a controller hiccup worth retrying.
+
+    Raiden reports it as a RuntimeError naming the host allocator or the
+    DmaMap call; there is no exception type for it.
+    """
+    message = str(exc)
+    return isinstance(exc, RuntimeError) and (
+        "Host allocator failed" in message or "DmaMap failed" in message
+    )
 
 
 class RaidenStoreOffloadingWorker(OffloadingWorker):
@@ -1866,10 +2152,11 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
         """Background registration: wait for the controller server to come up
         (it is created scheduler-side after this worker), then register.
 
-        Retries with backoff until it succeeds or shutdown() stops it. The
-        verdict lives scheduler-side: KVCacheStore construction blocks until
-        every rank has registered and fails engine startup on timeout, so
-        this loop only has to keep trying, never to give up or escalate.
+        Retries with backoff until it succeeds or shutdown() stops it, except
+        after a host pinning failure (`is_host_pinning_failure`), which a
+        retry turns into a segfault. The verdict lives scheduler-side:
+        KVCacheStore construction blocks until every rank has registered and
+        fails engine startup on timeout, so this loop never escalates.
         """
         delay = 0.5
         next_note = time.monotonic() + 30.0
@@ -1907,7 +2194,25 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
                         ", storage tier on" if self._backend_configs else "",
                     )
                     return
-                except Exception:
+                except Exception as exc:
+                    if is_host_pinning_failure(exc):
+                        # Raiden could not pin the host pool. Constructing
+                        # another KVCacheManager in this process after that
+                        # segfaults the worker (and can fault the TPU), which
+                        # hides this error, so stop here; the scheduler's
+                        # construction barrier then fails engine startup.
+                        logger.error(
+                            "TPURaidenOffloadingConnector: rank %d cannot pin "
+                            "its host KV pool (%d host kernel blocks): %s. "
+                            "Raiden pins and DMA-maps its host buffers; the "
+                            "recipes where it works run the server container "
+                            "privileged with IPC_LOCK. Check the container's "
+                            "securityContext. Not retrying.",
+                            self._rank,
+                            self._host_blocks_to_allocate,
+                            exc,
+                        )
+                        return
                     # A persistent failure escalates via the
                     # scheduler's construction barrier timeout.
                     logger.warning(
@@ -2470,6 +2775,32 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
             bytes_per_block_all_ranks = (
                 config.worker_kv_bytes_per_block * self.world_size
             )
+        # skip_draft_kv: keep the speculative drafter's K/V out of the host
+        # store. Its layers are sliding-window, so after a host hit only its
+        # last window is missing and the cost is draft acceptance on that
+        # request; the target output is unaffected. Workers skip registering
+        # those arrays (TPURaidenOffloadingConnector.register_kv_caches), so
+        # the host bytes per block shrink by the same amount on every rank.
+        self.skip_draft_kv = _parse_storage_flag(
+            self.extra_config.get("skip_draft_kv"),
+            default=False,
+            what="kv_connector_extra_config.skip_draft_kv",
+        )
+        if self.skip_draft_kv:
+            if vllm_config.speculative_config is None:
+                raise ValueError(
+                    "TPURaidenOffloadingConnector: skip_draft_kv needs a "
+                    "speculative drafter (--speculative-config)"
+                )
+            draft_bytes = all_ranks_draft_kv_bytes_per_block()
+            if not draft_bytes or all_ranks_kv_bytes_per_block() is None:
+                raise ValueError(
+                    "TPURaidenOffloadingConnector: skip_draft_kv found no "
+                    "drafter K/V layers in a multi-shape KV group (needs "
+                    "sliding-window drafter layers promoted to full attention "
+                    "by --disable-hybrid-kv-cache-manager next to MLA caches)"
+                )
+            bytes_per_block_all_ranks -= draft_bytes
         assert bytes_per_block_all_ranks > 0
         self.offload_logical_blocks_capacity = int(
             int(cpu_bytes_to_use) // bytes_per_block_all_ranks
@@ -2480,6 +2811,16 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
         )
         self.kernel_physical_blocks_capacity = (
             self.offload_logical_blocks_capacity * self.device_block_size_factor
+        )
+        # The workers pin the whole host pool when they register, which is
+        # after warmup -- when compile caches and worker heaps are at their
+        # peak. A pool that does not fit gets the container OOM-killed with no
+        # trace, so check it here (the scheduler builds its spec right before
+        # waiting for those registrations) and fail with the numbers instead.
+        # Per engine: under DP another engine's pool may already be pinned and
+        # counted in use, so counting it again could refuse a pool that fits.
+        check_host_pool_fits_cgroup(
+            self.offload_logical_blocks_capacity * bytes_per_block_all_ranks
         )
 
         # Cross-instance KV sharing: configured via extra_config. Setting
@@ -2510,6 +2851,7 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
             cp_geometry=cp_geometry,
             block_major_contract=self.block_major_contract,
             offloaded_group_ids=tuple(group.group_id for group in config.groups),
+            skip_draft_kv=self.skip_draft_kv,
         )
 
         # Shared-memory host pools (RAIDEN_SHM_KEY) are currently unsupported.

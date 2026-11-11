@@ -48,13 +48,18 @@ Core mechanisms:
 
 from __future__ import annotations
 
+import dataclasses
 import os
+import time
+from collections import Counter, OrderedDict
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
 from vllm.config import VllmConfig
+from vllm.distributed.kv_transfer.kv_connector.utils import yield_req_data
 from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorRole
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
@@ -77,6 +82,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker import (
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
     OffloadingConnector,
 )
+from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.kv_offload.base import (
@@ -85,16 +91,20 @@ from vllm.v1.kv_offload.base import (
     CanonicalKVCacheTensor,
     GPULoadStoreSpec,
     OffloadKey,
+    make_offload_key,
 )
 from vllm.v1.outputs import KVConnectorOutput
+from vllm.v1.request import Request
 
 from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.offload import contiguous_alloc
 from vllm_torchtpu.offload.raiden_store import (
     AdmissionOp,
     RaidenLoadStoreSpec,
     RaidenOffloadingManager,
     TPURaidenStoreOffloadingSpec,
+    draft_kv_layer_names,
 )
 
 if TYPE_CHECKING:
@@ -195,12 +205,67 @@ class _ParkedStore:
     acks: int = 0
 
 
+@dataclass(frozen=True)
+class WriteBackPolicy:
+    """``kv_connector_extra_config["store_policy"]`` in write-back mode.
+
+    The default policy writes every computed chunk through to the host, so
+    the host tier mostly mirrors HBM. Write-back stores a finished request's
+    chunks only when they near eviction: once one of their blocks is within
+    ``window_blocks`` of the head of the free queue (the next blocks to be
+    reused), at most ``max_requests_per_step`` requests per step.
+    """
+
+    window_blocks: int = 1024
+    max_requests_per_step: int = 8
+
+    @classmethod
+    def from_extra_config(cls, extra_config: Mapping) -> WriteBackPolicy | None:
+        """``None`` for the default write-through policy."""
+        policy = extra_config.get("store_policy")
+        if policy is None or policy == "write_through":
+            return None
+        if policy == "write_back":
+            policy = {"mode": "write_back"}
+        if not isinstance(policy, Mapping) or policy.get("mode") != "write_back":
+            raise ValueError(
+                f"store_policy must be 'write_through', 'write_back' or "
+                f"{{'mode': 'write_back', ...}}, got {policy!r}"
+            )
+        options = {k: v for k, v in policy.items() if k != "mode"}
+        unknown = set(options) - {f.name for f in dataclasses.fields(cls)}
+        if unknown:
+            raise ValueError(f"unknown store_policy options: {sorted(unknown)}")
+        written = cls(**options)
+        if written.window_blocks <= 0 or written.max_requests_per_step <= 0:
+            raise ValueError(f"store_policy options must be positive: {policy!r}")
+        return written
+
+
+def _allocated_block_ids(scheduler_output: SchedulerOutput) -> set[int]:
+    """Blocks this step allocates, by the rule of `_update_req_states`
+    (which computes the same set inside the base build_connector_meta)."""
+    allocated: set[int] = set()
+    for _, new_block_id_groups, _ in yield_req_data(scheduler_output):
+        for group in new_block_id_groups or ():
+            allocated.update(bid for bid in group if bid != 0)
+    for copy in scheduler_output.kv_cache_block_copies or ():
+        allocated.add(copy.dst_block_id)
+    return allocated
+
+
 class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
     """Scheduler for the store-backed offload path.
 
     Strips per-rank transfer jobs and orchestrates the store engine directly
     via RaidenOffloadingManager.
     """
+
+    # Write-through unless the connector config asks for write-back
+    # (class defaults also cover instances built without __init__).
+    _write_back: WriteBackPolicy | None = None
+    _block_pool = None
+    _contiguous_alloc_scan_factor = 3
 
     def __init__(
         self,
@@ -212,10 +277,166 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         assert isinstance(self.manager, RaidenOffloadingManager)
         self._raiden_manager: RaidenOffloadingManager = self.manager
         self._fence_pending: dict[int, _ParkedStore] = {}
+        extra_config = getattr(spec, "extra_config", None) or {}
+        self._write_back = WriteBackPolicy.from_extra_config(extra_config)
+        # How deep into the oldest free blocks an allocation of n blocks may
+        # look for consecutive ids (`contiguous_alloc`); <= 1 turns it off.
+        self._contiguous_alloc_scan_factor = int(
+            extra_config.get("contiguous_alloc_scan_factor", 3)
+        )
+        # Write-back state: finished requests whose chunks are not stored yet
+        # (their finish is deferred), the blocks each one would store, and
+        # each such block's owners (shared prefix blocks have several).
+        self._block_pool = None
+        self._wb_blocks: OrderedDict[str, set[int]] = OrderedDict()
+        self._wb_owners: dict[int, set[str]] = {}
+        self.wb_counters: Counter[str] = Counter()
+
+    def attach_block_pool(self, block_pool) -> None:
+        """`EvictionAwareConnector`: the scheduler's block pool, whose free
+        queue tells write-back which finished requests near eviction. Its
+        fresh blocks come out as consecutive runs (`contiguous_alloc`)."""
+        self._block_pool = block_pool
+        # No deeper than the write-back window looks for requests to flush, so
+        # a held request's blocks are reused no earlier than write-back can see
+        # them coming (one it has not flushed yet is dropped, as before).
+        contiguous_alloc.install(
+            block_pool,
+            scan_factor=self._contiguous_alloc_scan_factor,
+            max_scan=(
+                self._write_back.window_blocks
+                if self._write_back
+                else WriteBackPolicy.window_blocks
+            ),
+        )
+
+    def _wb_unregister(self, req_id: str) -> None:
+        for bid in self._wb_blocks.pop(req_id, ()):
+            owners = self._wb_owners.get(bid)
+            if owners is not None:
+                owners.discard(req_id)
+                if not owners:
+                    del self._wb_owners[bid]
+
+    def _wb_drop(self, req_id: str) -> None:
+        """Finish a held request without storing it (a block was reused)."""
+        self._wb_unregister(req_id)
+        req_status = self._req_status.get(req_id)
+        if req_status is None:
+            return
+        self.wb_counters["dropped_requests"] += 1
+        req_status.finished_signaled = True
+        self.manager.on_request_finished(req_status.req_context)
+        if not req_status.transfer_jobs:
+            del self._req_status[req_id]
+
+    def _wb_register(self, req_id: str) -> bool:
+        """Hold a finished request for write-back; False if it has nothing
+        left to store."""
+        req_status = self._req_status.get(req_id)
+        if req_status is None:
+            return False
+        blocks_per_chunk = self.config.blocks_per_chunk
+        blocks: set[int] = set()
+        for group_state in req_status.group_states:
+            # Only blocks of keyed (full) chunks can be stored; the partial
+            # tail block has no hash, so the pool reuses it first.
+            start = group_state.next_stored_chunk_idx * blocks_per_chunk
+            end = len(group_state.offload_keys) * blocks_per_chunk
+            blocks.update(b for b in group_state.block_ids[start:end] if b != 0)
+        if not blocks:
+            return False
+        self._wb_blocks[req_id] = blocks
+        for bid in blocks:
+            self._wb_owners.setdefault(bid, set()).add(req_id)
+        return True
+
+    def _wb_near_eviction(self) -> list[str]:
+        """Held requests with a block among the next ``window_blocks`` the
+        free queue hands out, oldest first, at most ``max_requests_per_step``.
+        Without a block pool, every held request (store at finish)."""
+        policy = self._write_back
+        assert policy is not None
+        if self._block_pool is None:
+            return list(self._wb_blocks)
+        queue = self._block_pool.free_block_queue
+        picked: dict[str, None] = {}
+        block = queue.fake_free_list_head.next_free_block
+        for _ in range(policy.window_blocks):
+            if block is None or block is queue.fake_free_list_tail:
+                break
+            for req_id in self._wb_owners.get(block.block_id, ()):
+                picked.setdefault(req_id)
+            if len(picked) >= policy.max_requests_per_step:
+                break
+            block = block.next_free_block
+        return list(picked)[: policy.max_requests_per_step]
+
+    def _maybe_log_write_back(self, interval_s: float = 30.0) -> None:
+        """One log line per interval. Not on the KV Transfer stats line: the
+        Prometheus logger asserts every stats key is registered, and with
+        no ``spec_name`` in the connector config its spec lookup resolves to
+        the CPU spec, so names added by this spec would not be registered.
+        ``allocated_blocks / steps`` (blocks handed out per step, i.e. the
+        eviction rate at steady state) is what ``window_blocks`` should
+        cover for a few steps."""
+        now = time.monotonic()
+        last = getattr(self, "_wb_last_log", None)
+        if last is None:
+            self._wb_last_log = now
+            return
+        if now - last < interval_s:
+            return
+        c = self.wb_counters
+        logger.info(
+            "KV write-back: %d steps, %.1f blocks allocated/step, %d requests "
+            "stored, %d dropped (blocks reused before the flush), %d held "
+            "(%d blocks; free and still cached: holding defers only the "
+            "connector's finish, never the blocks)",
+            c["steps"],
+            c["allocated_blocks"] / max(c["steps"], 1),
+            c["flushed_requests"],
+            c["dropped_requests"],
+            c["held_requests"],
+            len(self._wb_owners),
+        )
+        held = c["held_requests"]
+        c.clear()
+        c["held_requests"] = held
+        self._wb_last_log = now
+
+    def _write_back_output(self, scheduler_output: SchedulerOutput) -> SchedulerOutput:
+        """The scheduler output the base sees in write-back mode: no running
+        request stores (no write-through), newly finished requests are held
+        (their finish deferred), and held requests near eviction finish now,
+        so the base stores them through its normal finish path."""
+        allocated = _allocated_block_ids(scheduler_output)
+        self.wb_counters["steps"] += 1
+        self.wb_counters["allocated_blocks"] += len(allocated)
+        finished = set(scheduler_output.finished_req_ids or ())
+        passed = {r for r in finished if not self._wb_register(r)}
+        # After registering: a request that finished last step may already
+        # have a block reused by this step's allocation.
+        reused = allocated & self._wb_owners.keys()
+        for req_id in {r for bid in reused for r in self._wb_owners.get(bid, ())}:
+            self._wb_drop(req_id)
+        flush = self._wb_near_eviction()
+        for req_id in flush:
+            self._wb_unregister(req_id)
+        self.wb_counters["flushed_requests"] += len(flush)
+        self.wb_counters["held_requests"] = len(self._wb_blocks)
+        self._maybe_log_write_back()
+        return dataclasses.replace(
+            scheduler_output,
+            finished_req_ids=passed | set(flush),
+            num_scheduled_tokens={},
+        )
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
+        if self._write_back is not None:
+            scheduler_output = self._write_back_output(scheduler_output)
         meta = super().build_connector_meta(scheduler_output)
         assert isinstance(meta, OffloadingConnectorMetadata)
 
@@ -254,6 +475,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 device_block_ids,
                 job.req_id,
                 pinned=src_spec.pinned,
+                host_block_ids=src_spec.host_block_ids,
             )
 
         # Handle jobs_to_flush (source blocks are about to be recycled):
@@ -302,6 +524,99 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             finished_load_jobs=finished_loads,
             failed_load_req_ids=failed_load_req_ids,
         )
+
+    def update_state_after_alloc(
+        self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int
+    ) -> None:
+        super().update_state_after_alloc(request, blocks, num_external_tokens)
+        if num_external_tokens:
+            self._align_load_blocks_to_host_order(request, blocks)
+
+    def _align_load_blocks_to_host_order(
+        self, request: Request, blocks: KVCacheBlocks
+    ) -> None:
+        """Give the load's fresh blocks to its keys in host-block order.
+
+        A load moves fastest into device blocks that ascend with the host
+        blocks it reads (`raiden_store._dma_order`). The blocks the scheduler
+        just allocated for the load hold nothing yet, so which key lands in
+        which of them is free: sort them, and hand the lowest one to the key
+        with the lowest host block. The request's block list is permuted in
+        place, so its block table and later prefix caching follow: `blocks`
+        must wrap the KV cache manager's own lists, as the scheduler's
+        `get_blocks()` does on the async-load path this connector takes.
+        """
+        req_status = self._req_status.get(request.request_id)
+        if req_status is None or len(req_status.transfer_jobs) != 1:
+            return
+        job = self._current_batch_load_jobs.get(next(iter(req_status.transfer_jobs)))
+        if job is None or len(self.config.kv_group_configs) != 1:
+            return
+        src_spec, dst_spec = job.src_spec, job.dst_spec
+        assert isinstance(src_spec, RaidenLoadStoreSpec)
+        num_blocks = len(dst_spec.block_ids)
+        host_ids = src_spec.host_block_ids
+        if not src_spec.pinned or not host_ids or num_blocks < 2:
+            return
+        if len(src_spec.keys) != num_blocks or len(host_ids) % num_blocks:
+            return
+        if min(host_ids) < 0:
+            return  # some bytes come from a peer or the storage tier
+        # Every key expands to the same number of sub-hashes, which travel
+        # together: order keys by their first one. Any assignment of the fresh
+        # blocks is correct; the order only decides how well the copy coalesces.
+        key_host_ids = host_ids[:: len(host_ids) // num_blocks]
+        start = dst_spec.block_indices[0]
+        group_blocks = blocks.blocks[self.config.kv_group_configs[0].group_idx]
+        fresh = group_blocks[start : start + num_blocks]
+        if [b.block_id for b in fresh] != dst_spec.block_ids.tolist() or any(
+            b.block_hash is not None or b.ref_cnt != 1 for b in fresh
+        ):
+            return
+        by_host = sorted(range(num_blocks), key=key_host_ids.__getitem__)
+        block_at = dict(zip(by_host, sorted(fresh, key=lambda b: b.block_id)))
+        aligned = [block_at[pos] for pos in range(num_blocks)]
+        group_blocks[start : start + num_blocks] = aligned
+        dst_spec.block_ids = np.array(
+            [b.block_id for b in aligned], dtype=dst_spec.block_ids.dtype
+        )
+
+    def peek_external_prefix_tokens(
+        self, request: Request, num_local_tokens: int
+    ) -> int:
+        """Prompt tokens past `num_local_tokens` resident in the host store.
+
+        Side-effect free (see `ExternalPrefixProbe`). Prefix groups only: if a
+        sliding-window group is offloaded the estimate is 0, since its hit is
+        a suffix window that this probe does not model.
+        """
+        if request.skip_reading_prefix_cache:
+            return 0
+        block_hashes = request.block_hashes
+        limit = max(request.num_tokens - 1, 0)
+        hit_end: int | None = None
+        for group_config in self.config.kv_group_configs:
+            if group_config.is_eagle_group:
+                continue
+            if group_config.sliding_window_size_in_chunks is not None:
+                return 0
+            tokens_per_chunk = group_config.tokens_per_chunk
+            hashes_per_chunk = group_config.hashes_per_chunk
+            start_chunk = num_local_tokens // tokens_per_chunk
+            keys = [
+                make_offload_key(block_hashes[idx], group_config.group_idx)
+                for idx in range(
+                    (start_chunk + 1) * hashes_per_chunk - 1,
+                    len(block_hashes),
+                    hashes_per_chunk,
+                )
+            ]
+            num_chunks = self._raiden_manager.count_resident_prefix(keys)
+            group_end = (start_chunk + num_chunks) * tokens_per_chunk
+            hit_end = group_end if hit_end is None else min(hit_end, group_end)
+        if hit_end is None:
+            return 0
+        return max(0, min(hit_end, limit) - num_local_tokens)
 
     def update_connector_output(self, connector_output: KVConnectorOutput):
         meta = connector_output.kv_connector_worker_meta
@@ -389,6 +704,7 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         spec = TPURaidenStoreOffloadingSpec(
             offloading_config, vllm_config, kv_cache_config
         )
+        self._skip_draft_kv = spec.skip_draft_kv
 
         # pyrefly: ignore[bad-override-mutable-attribute]
         self.connector_scheduler: TPURaidenOffloadingScheduler | None = None
@@ -430,6 +746,22 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
             return self.connector_scheduler.take_events()
         return []
 
+    def attach_block_pool(self, block_pool) -> None:
+        """`EvictionAwareConnector`: hand the block pool to the scheduler side
+        (write-back reads its free queue)."""
+        if self.connector_scheduler is not None:
+            self.connector_scheduler.attach_block_pool(block_pool)
+
+    def peek_external_prefix_tokens(
+        self, request: Request, num_local_tokens: int
+    ) -> int:
+        """`ExternalPrefixProbe`: host-resident prompt tokens past the local hit."""
+        if self.connector_scheduler is None:
+            return 0
+        return self.connector_scheduler.peek_external_prefix_tokens(
+            request, num_local_tokens
+        )
+
     # -- worker-side hooks -------------------------------------------------
     def register_kv_caches(
         self, kv_caches: Mapping[str, torch.Tensor | list[torch.Tensor]]
@@ -442,10 +774,20 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         each as an `int8` byte view.
         """
         assert self.connector_worker is not None
-        num_blocks = self.connector_worker.kv_cache_config.num_blocks
+        kv_cache_config = self.connector_worker.kv_cache_config
+        num_blocks = kv_cache_config.num_blocks
+
+        # skip_draft_kv: the drafter's arrays stay out of the host store (the
+        # spec already sized the host pool without them).
+        skipped_layers = (
+            draft_kv_layer_names(kv_cache_config)
+            if getattr(self, "_skip_draft_kv", False)
+            else set()
+        )
 
         pool_storages: dict[int, tuple[torch.UntypedStorage, torch.device]] = {}
-        for layer_kv_cache in kv_caches.values():
+        skipped_storages: set[int] = set()
+        for layer_name, layer_kv_cache in kv_caches.items():
             state_tensors = (
                 [layer_kv_cache]
                 if isinstance(layer_kv_cache, torch.Tensor)
@@ -453,7 +795,19 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
             )
             for tensor in state_tensors:
                 storage = tensor.untyped_storage()
+                if layer_name in skipped_layers:
+                    skipped_storages.add(storage.data_ptr())
+                    continue
                 pool_storages.setdefault(storage.data_ptr(), (storage, tensor.device))
+        shared = skipped_storages & pool_storages.keys()
+        assert not shared, (
+            "TPURaidenOffloadingConnector: skip_draft_kv needs the drafter's K/V "
+            "in arrays of their own; it shares storage with offloaded layers"
+        )
+        assert not skipped_layers or skipped_storages, (
+            "TPURaidenOffloadingConnector: skip_draft_kv found drafter layers "
+            f"{sorted(skipped_layers)} in the KV config but none in kv_caches"
+        )
 
         pool_tensors: list[CanonicalKVCacheTensor] = []
         for storage, device in pool_storages.values():
