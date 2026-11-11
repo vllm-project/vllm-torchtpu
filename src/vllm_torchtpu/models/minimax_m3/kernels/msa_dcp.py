@@ -979,6 +979,20 @@ def merge_partials(
     )(lse.astype(jnp.float32), parts, *([hadamard] if rotated else []))
 
 
+def _gather_heads(q: jax.Array, rank: jax.Array, axis: str, dcp: int) -> jax.Array:
+    """The group's head-major query heads ``[dcp * Hl, T, D]`` from this
+    rank's ``q [Hl, T, D]``. A pair swaps its halves by one collective
+    permute: XLA's all-gather of the 16 MB c4 / c16 queries took 158 us per
+    layer in the twin (j-094494a7), a permute plus the concatenation ~51 us
+    on the same core pair in a standalone bench (j-a7bf7869; all-gather ~90)."""
+    if dcp != 2:
+        return jax.lax.all_gather(q, axis, axis=0, tiled=True)
+    other = jax.lax.ppermute(q, axis, [(0, 1), (1, 0)])
+    # [q, other, q] from row `rank * Hl` is the pair's heads in rank order.
+    both = jnp.concatenate([q, other, q])
+    return jax.lax.dynamic_slice_in_dim(both, rank * q.shape[0], 2 * q.shape[0])
+
+
 def attend_and_merge(
     rank: jax.Array,
     q: jax.Array,
@@ -1006,10 +1020,11 @@ def attend_and_merge(
     over the group's heads, and each rank's head block of the partial and
     its LSEs go to their owner by all-to-all for `merge_partials`. As XLA
     collectives in one program they move the head-major buffers as laid out;
-    torch's all-gather / all-to-all of them cost 157 us / ~890 us per layer
-    at 8K tokens (c4 twin, j-c60806bf)."""
+    torch's all-to-all of them cost ~890 us per layer at 8K tokens (c4 twin,
+    j-c60806bf)."""
     num_heads, num_tokens, head_dim = q.shape
-    q_all = jax.lax.all_gather(q, axis, axis=0, tiled=True)
+    rank = rank_array(rank)[0]
+    q_all = _gather_heads(q, rank, axis, dcp)
     cand_all = jax.lax.all_gather(candidates, axis, axis=0)
     out, lse = msa_attend_dcp(
         q_all,
